@@ -19,6 +19,8 @@
 
 #include "p50_endpoint.h"
 #include "p50_fd_handoff.h"
+#include "p50_input_fd_attachment.h"
+#include "p50_input_lifecycle.h"
 #include "p50_local_transport.h"
 
 #include <boost/asio/awaitable.hpp>
@@ -36,6 +38,7 @@ struct RuntimeConfig {
     EndpointCaps endpoint_caps{};
     P50ServerEndpointConfig endpoint_config{};
     size_t max_live_handoffs = 1;
+    size_t max_input_lifecycle_replays = 8192;
 };
 
 enum class RuntimeStatus : uint8_t {
@@ -77,7 +80,15 @@ public:
     // The returned cursor owns its immutable backing and can be materialized
     // by the bounded control worker after this call returns.
     std::optional<InputCursor> attach_input_on_owner(
-        InputRecordKey key, std::chrono::steady_clock::time_point deadline) noexcept;
+        InputFdRequest request,
+        std::chrono::steady_clock::time_point deadline) noexcept;
+    void finish_input_attachment_on_owner(
+        InputFdRequest request, bool authorized,
+        std::chrono::steady_clock::time_point deadline) noexcept;
+    [[nodiscard]] std::optional<InputLifecycleApplyStatus>
+    apply_input_lifecycle_on_owner(
+        InputLifecycleRequest request,
+        std::chrono::steady_clock::time_point deadline) noexcept;
 
     void stop() noexcept;
     [[nodiscard]] bool stopped() const noexcept { return stop_requested_.load(); }
@@ -107,6 +118,7 @@ private:
     void release_active_control() noexcept;
 
     RuntimeConfig config_;
+    InputLifecycleRegistry input_lifecycle_;
     boost::asio::io_context context_;
     std::unique_ptr<P50ServerEndpoint> endpoint_;
     EndpointWorkGuard endpoint_work_guard_;

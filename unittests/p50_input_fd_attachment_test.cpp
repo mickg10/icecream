@@ -1,6 +1,7 @@
 #include "cache/p50_input_fd_attachment.h"
 
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -88,6 +89,17 @@ int current_uid() {
     return static_cast<int>(::geteuid());
 }
 
+void delay_materialization() noexcept {
+    std::this_thread::sleep_for(std::chrono::milliseconds(75));
+}
+
+std::atomic<unsigned> materialization_hook_calls{0};
+
+void delay_readonly_reopen() noexcept {
+    if (materialization_hook_calls.fetch_add(1, std::memory_order_relaxed) == 1)
+        std::this_thread::sleep_for(std::chrono::milliseconds(75));
+}
+
 }  // namespace
 
 int main() {
@@ -116,29 +128,43 @@ int main() {
     require(listener >= 0 && listen_status == icecc::p50::local::Status::Ok,
             "AF_UNIX listener setup failed");
     const local::Identity identity{17, 23};
+    const InputLeaseOwner owner{71, 73, 79};
     const local::CredentialExpectation peer{
         static_cast<uint64_t>(current_uid()), std::nullopt, std::nullopt};
     InputFdAttachmentService service(
         [&store](InputRecordKey requested) { return store.attach(requested); });
 
-    std::array<InputFdAttachmentResult, 3> server_results{};
+    std::array<InputFdAttachmentResult, 5> server_results{};
     std::thread server([&] {
-        for (auto& server_result : server_results) {
+        for (size_t index = 0; index != server_results.size(); ++index) {
+            InputFdAttachmentResult& server_result = server_results[index];
             local::Status accept_status = local::Status::InvalidArgument;
             local::Connection connection = local::accept_unix(listener, &accept_status);
             if (!connection.valid()) {
                 server_result.status = InputFdAttachmentStatus::Disconnected;
                 continue;
             }
+            if (index == 3)
+                test_set_input_materialization_progress_hook(
+                    delay_materialization);
+            if (index == 4) {
+                materialization_hook_calls.store(0, std::memory_order_relaxed);
+                test_set_input_materialization_progress_hook(
+                    delay_readonly_reopen);
+            }
             server_result = service.serve(
                 connection, identity, peer,
-                std::chrono::steady_clock::now() + std::chrono::seconds(5));
+                std::chrono::steady_clock::now() +
+                    (index >= 3 ? std::chrono::milliseconds(20)
+                                : std::chrono::seconds(5)));
+            if (index >= 3)
+                test_set_input_materialization_progress_hook(nullptr);
         }
     });
 
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     InputFdAttachmentResult first = InputFdAttachmentClient::attach(
-        socket_path, InputFdRequest{identity, key, 1}, peer, deadline);
+        socket_path, InputFdRequest{identity, key, owner, 1}, peer, deadline);
     require(first.status == InputFdAttachmentStatus::Accepted && first.fd.valid(),
             "first exact attachment failed");
     const int first_status_flags = ::fcntl(first.fd.get(), F_GETFL);
@@ -155,7 +181,7 @@ int main() {
             "first descriptor did not start at byte zero");
 
     InputFdAttachmentResult second = InputFdAttachmentClient::attach(
-        socket_path, InputFdRequest{identity, key, 2}, peer,
+        socket_path, InputFdRequest{identity, key, owner, 2}, peer,
         std::chrono::steady_clock::now() + std::chrono::seconds(5));
     require(second.status == InputFdAttachmentStatus::Accepted && second.fd.valid(),
             "second exact attachment failed");
@@ -167,15 +193,27 @@ int main() {
 
     const InputRecordKey missing{guid, TuSeq{10}};
     InputFdAttachmentResult missing_result = InputFdAttachmentClient::attach(
-        socket_path, InputFdRequest{identity, missing, 3}, peer,
+        socket_path, InputFdRequest{identity, missing, owner, 3}, peer,
         std::chrono::steady_clock::now() + std::chrono::seconds(5));
     require(!missing_result.fd.valid() &&
                 (missing_result.status == InputFdAttachmentStatus::Disconnected ||
                  missing_result.status == InputFdAttachmentStatus::UnknownRecord),
             "missing record did not fail closed");
 
+    InputFdAttachmentResult slow = InputFdAttachmentClient::attach(
+        socket_path, InputFdRequest{identity, key, owner, 4}, peer,
+        std::chrono::steady_clock::now() + std::chrono::seconds(5));
+    require(!slow.fd.valid(),
+            "mid-materialization deadline unexpectedly handed off a descriptor");
+
+    InputFdAttachmentResult reopen_slow = InputFdAttachmentClient::attach(
+        socket_path, InputFdRequest{identity, key, owner, 5}, peer,
+        std::chrono::steady_clock::now() + std::chrono::seconds(5));
+    require(!reopen_slow.fd.valid(),
+            "read-only reopen deadline unexpectedly handed off a descriptor");
+
     InputFdAttachmentResult expired = InputFdAttachmentClient::attach(
-        socket_path, InputFdRequest{identity, key, 4}, peer,
+        socket_path, InputFdRequest{identity, key, owner, 6}, peer,
         std::chrono::steady_clock::now() - std::chrono::milliseconds(1));
     require(!expired.fd.valid() && expired.status == InputFdAttachmentStatus::Timeout,
             "expired absolute deadline did not fail closed");
@@ -185,6 +223,10 @@ int main() {
     std::filesystem::remove_all(runtime, error);
     require(server_results[2].status == InputFdAttachmentStatus::UnknownRecord,
             "service did not reject the missing exact key");
+    require(server_results[3].status == InputFdAttachmentStatus::Timeout,
+            "materialization ignored its absolute deadline");
+    require(server_results[4].status == InputFdAttachmentStatus::Timeout,
+            "read-only reopen lost its absolute-timeout classification");
 
     return 0;
 }

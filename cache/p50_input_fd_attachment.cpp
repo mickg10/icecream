@@ -31,9 +31,15 @@ constexpr bool kSealedMemfdBuildSupport = true;
 constexpr bool kSealedMemfdBuildSupport = false;
 #endif
 
+constexpr size_t kMaterializationChunkBytes = 64u * 1024u;
+
+#if defined(ICECC_P50_INPUT_FD_ATTACHMENT_TEST_HOOKS)
+InputMaterializationProgressTestHook materialization_progress_test_hook = nullptr;
+#endif
+
 std::vector<uint8_t> encode_request(const InputFdRequest& request) {
     return local::encode_control_operation(local::make_input_fd_attachment_operation(
-        request.identity, request.key, request.request_id));
+        request.identity, request.key, request.owner, request.request_id));
 }
 
 bool decode_request(std::span<const uint8_t> wire, local::Identity identity,
@@ -41,9 +47,11 @@ bool decode_request(std::span<const uint8_t> wire, local::Identity identity,
     local::ControlOperation operation;
     if (!local::decode_control_operation(wire, operation) ||
         operation.kind != local::ControlOperationKind::InputFdAttachment ||
-        operation.identity != identity || !operation.input.has_value())
+        operation.identity != identity || !operation.input.has_value() ||
+        !operation.owner.has_value())
         return false;
     request.key = *operation.input;
+    request.owner = *operation.owner;
     request.request_id = operation.request_id;
     request.identity = identity;
     return true;
@@ -96,11 +104,20 @@ InputFdAttachmentStatus status_for_handoff(local::FdHandoffStatus status) noexce
     }
 }
 
-bool write_complete(int fd, std::span<const uint8_t> bytes) noexcept {
+bool write_complete(
+    int fd, std::span<const uint8_t> bytes,
+    std::chrono::steady_clock::time_point deadline,
+    InputFdAttachmentStatus& status) noexcept {
     size_t offset = 0;
     while (offset != bytes.size()) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            status = InputFdAttachmentStatus::Timeout;
+            return false;
+        }
+        const size_t chunk =
+            std::min(kMaterializationChunkBytes, bytes.size() - offset);
         const ssize_t count = ::write(fd, bytes.data() + offset,
-                                      bytes.size() - offset);
+                                      chunk);
         if (count > 0) {
             offset += static_cast<size_t>(count);
             continue;
@@ -112,7 +129,10 @@ bool write_complete(int fd, std::span<const uint8_t> bytes) noexcept {
     return true;
 }
 
-int make_sealed_memfd(std::span<const uint8_t> bytes) noexcept {
+int make_sealed_memfd(
+    std::span<const uint8_t> bytes,
+    std::chrono::steady_clock::time_point deadline,
+    InputFdAttachmentStatus& status) noexcept {
 #if defined(__linux__) && defined(SYS_memfd_create) && defined(MFD_CLOEXEC) && \
     defined(MFD_ALLOW_SEALING) && defined(F_ADD_SEALS) && defined(F_GET_SEALS) && \
     defined(F_SEAL_SEAL) && defined(F_SEAL_SHRINK) && defined(F_SEAL_GROW) && \
@@ -121,8 +141,16 @@ int make_sealed_memfd(std::span<const uint8_t> bytes) noexcept {
         SYS_memfd_create, "icecc-p50-input", MFD_CLOEXEC | MFD_ALLOW_SEALING));
     if (fd < 0)
         return -1;
-    if (!write_complete(fd, bytes) ||
-        ::lseek(fd, 0, SEEK_SET) != 0 ||
+    if (!write_complete(fd, bytes, deadline, status)) {
+        ::close(fd);
+        return -1;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+        status = InputFdAttachmentStatus::Timeout;
+        ::close(fd);
+        return -1;
+    }
+    if (::lseek(fd, 0, SEEK_SET) != 0 ||
         ::fcntl(fd, F_ADD_SEALS,
                 F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE) < 0) {
         ::close(fd);
@@ -140,17 +168,30 @@ int make_sealed_memfd(std::span<const uint8_t> bytes) noexcept {
         ::close(fd);
         return -1;
     }
+    if (std::chrono::steady_clock::now() >= deadline) {
+        status = InputFdAttachmentStatus::Timeout;
+        ::close(fd);
+        return -1;
+    }
     return fd;
 #else
     (void)bytes;
+    (void)deadline;
+    (void)status;
     return -1;
 #endif
 }
 
-int reopen_readonly_memfd(int writable_fd, size_t exact_size) noexcept {
+int reopen_readonly_memfd(
+    int writable_fd, size_t exact_size,
+    std::chrono::steady_clock::time_point deadline,
+    InputFdAttachmentStatus& status) noexcept {
 #if defined(__linux__)
-    if (writable_fd < 0)
+    if (writable_fd < 0 || std::chrono::steady_clock::now() >= deadline) {
+        if (writable_fd >= 0)
+            status = InputFdAttachmentStatus::Timeout;
         return -1;
+    }
     char proc_path[64]{};
     const int length = std::snprintf(proc_path, sizeof(proc_path),
                                      "/proc/self/fd/%d", writable_fd);
@@ -159,6 +200,15 @@ int reopen_readonly_memfd(int writable_fd, size_t exact_size) noexcept {
     const int readonly_fd = ::open(proc_path, O_RDONLY | O_CLOEXEC);
     if (readonly_fd < 0)
         return -1;
+#if defined(ICECC_P50_INPUT_FD_ATTACHMENT_TEST_HOOKS)
+    if (materialization_progress_test_hook != nullptr)
+        materialization_progress_test_hook();
+#endif
+    if (std::chrono::steady_clock::now() >= deadline) {
+        status = InputFdAttachmentStatus::Timeout;
+        (void)::close(readonly_fd);
+        return -1;
+    }
     const int status_flags = ::fcntl(readonly_fd, F_GETFL);
     const int descriptor_flags = ::fcntl(readonly_fd, F_GETFD);
     struct stat info{};
@@ -170,49 +220,90 @@ int reopen_readonly_memfd(int writable_fd, size_t exact_size) noexcept {
         (void)::close(readonly_fd);
         return -1;
     }
+    if (std::chrono::steady_clock::now() >= deadline) {
+        status = InputFdAttachmentStatus::Timeout;
+        (void)::close(readonly_fd);
+        return -1;
+    }
     return readonly_fd;
 #else
     (void)writable_fd;
     (void)exact_size;
+    (void)deadline;
+    (void)status;
     return -1;
 #endif
 }
 
 int materialize(InputCursor cursor, size_t max_bytes,
+                std::chrono::steady_clock::time_point deadline,
                 InputFdAttachmentStatus& status) noexcept {
     try {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            status = InputFdAttachmentStatus::Timeout;
+            return -1;
+        }
         const size_t remaining = cursor.remaining();
         if (remaining > max_bytes) {
             status = InputFdAttachmentStatus::MaterializationFailed;
             return -1;
         }
         std::vector<uint8_t> bytes;
-        bytes.resize(remaining);
-        size_t offset = 0;
-        while (offset != bytes.size()) {
+        bytes.reserve(remaining);
+        if (std::chrono::steady_clock::now() >= deadline) {
+            status = InputFdAttachmentStatus::Timeout;
+            return -1;
+        }
+        icecc::Digest128Builder digest;
+        while (bytes.size() != remaining) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                status = InputFdAttachmentStatus::Timeout;
+                return -1;
+            }
+#if defined(ICECC_P50_INPUT_FD_ATTACHMENT_TEST_HOOKS)
+            if (materialization_progress_test_hook != nullptr)
+                materialization_progress_test_hook();
+#endif
+            const size_t offset = bytes.size();
+            const size_t chunk =
+                std::min(kMaterializationChunkBytes, remaining - offset);
+            bytes.resize(offset + chunk);
             const size_t count =
-                cursor.read(std::span<uint8_t>(bytes).subspan(offset));
-            if (count == 0 || count > bytes.size() - offset) {
+                cursor.read(std::span<uint8_t>(bytes).subspan(offset, chunk));
+            if (count == 0 || count > chunk) {
                 status = InputFdAttachmentStatus::MaterializationFailed;
                 return -1;
             }
-            offset += count;
+            bytes.resize(offset + count);
+            digest.append(std::span<const uint8_t>(bytes).subspan(offset, count));
         }
-        if (cursor.raw_digest() != icecc::digest128(bytes)) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            status = InputFdAttachmentStatus::Timeout;
+            return -1;
+        }
+        if (cursor.raw_digest() != digest.finish()) {
             status = InputFdAttachmentStatus::MaterializationFailed;
             return -1;
         }
-        const int writable_fd = make_sealed_memfd(bytes);
+        if (std::chrono::steady_clock::now() >= deadline) {
+            status = InputFdAttachmentStatus::Timeout;
+            return -1;
+        }
+        const int writable_fd = make_sealed_memfd(bytes, deadline, status);
         if (writable_fd < 0)
-            status = kSealedMemfdBuildSupport
-                         ? InputFdAttachmentStatus::MaterializationFailed
-                         : InputFdAttachmentStatus::UnsupportedPlatform;
+            status = status == InputFdAttachmentStatus::Timeout
+                         ? status
+                         : kSealedMemfdBuildSupport
+                               ? InputFdAttachmentStatus::MaterializationFailed
+                               : InputFdAttachmentStatus::UnsupportedPlatform;
         if (writable_fd < 0)
             return -1;
-        const int readonly_fd = reopen_readonly_memfd(writable_fd, bytes.size());
+        const int readonly_fd = reopen_readonly_memfd(
+            writable_fd, bytes.size(), deadline, status);
         (void)::close(writable_fd);
         if (readonly_fd < 0) {
-            status = InputFdAttachmentStatus::MaterializationFailed;
+            if (status != InputFdAttachmentStatus::Timeout)
+                status = InputFdAttachmentStatus::MaterializationFailed;
             return -1;
         }
         return readonly_fd;
@@ -334,7 +425,7 @@ InputFdAttachmentResult InputFdAttachmentService::serve_request(
     if (!connection.valid() || expected_identity.generation == 0 ||
         expected_identity.attempt == 0 || !expected_peer.specified() ||
         request.identity != expected_identity || request.key.c_store_guid == CStoreGuid{} ||
-        request.request_id == 0)
+        !input_lease_owner_valid(request.owner) || request.request_id == 0)
         return rejected(InputFdAttachmentStatus::InvalidArgument);
     if (connection.verify_peer_credentials(expected_peer) != local::Status::Ok)
         return rejected(InputFdAttachmentStatus::PeerUnauthenticated);
@@ -355,7 +446,7 @@ InputFdAttachmentResult InputFdAttachmentService::serve_request(
     InputFdAttachmentStatus materialization_status =
         InputFdAttachmentStatus::MaterializationFailed;
     const int fd = materialize(std::move(cursor), max_materialized_bytes_,
-                               materialization_status);
+                               deadline, materialization_status);
     if (fd < 0)
         return rejected(materialization_status);
     if (std::chrono::steady_clock::now() >= deadline) {
@@ -378,7 +469,8 @@ InputFdAttachmentResult InputFdAttachmentClient::attach(
     const local::CredentialExpectation& expected_peer,
     std::chrono::steady_clock::time_point deadline) noexcept {
     if (request.identity.generation == 0 || request.identity.attempt == 0 ||
-        request.key.c_store_guid == CStoreGuid{} || request.request_id == 0 ||
+        request.key.c_store_guid == CStoreGuid{} ||
+        !input_lease_owner_valid(request.owner) || request.request_id == 0 ||
         !expected_peer.specified())
         return rejected(InputFdAttachmentStatus::InvalidArgument);
     local::Status status = local::Status::InvalidArgument;
@@ -428,8 +520,16 @@ InputFdAttachmentResult InputFdAttachmentClient::attach(
             ::lseek(fd.get(), 0, SEEK_SET) != 0)
             return rejected(InputFdAttachmentStatus::HandoffFailed);
         result.fd = InputFd(fd.release());
+        result.lease = request;
     }
     return result;
 }
+
+#if defined(ICECC_P50_INPUT_FD_ATTACHMENT_TEST_HOOKS)
+void test_set_input_materialization_progress_hook(
+    InputMaterializationProgressTestHook hook) noexcept {
+    materialization_progress_test_hook = hook;
+}
+#endif
 
 }  // namespace icecc::p50

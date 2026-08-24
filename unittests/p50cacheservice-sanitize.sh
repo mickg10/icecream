@@ -43,6 +43,7 @@ fi
     "$test_srcdir/../cache/p50_cache_service.cpp" \
     "$build_dir/../cache/libp50endpoint.a" \
     "$build_dir/../cache/libp50inputfd.a" \
+    "$build_dir/../cache/libp50inputlifecycle.a" \
     "$build_dir/../cache/libprotocol50.a" \
     "$build_dir/../cache/libp50localtransport.a" \
     "$build_dir/../services/.libs/libicecc.a" \

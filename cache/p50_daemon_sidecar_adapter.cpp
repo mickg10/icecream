@@ -86,9 +86,13 @@ bool DaemonSidecarAdapter::valid_config(const Config& config) noexcept
         !bounded_positive(config.handoff_timeout) ||
         !bounded_positive(config.input_attachment_timeout) ||
         !bounded_positive(config.shutdown_timeout) ||
-        !bounded_positive(config.restart_window) || config.max_restarts == 0 ||
+        !bounded_positive(config.restart_window) ||
+        !bounded_positive(config.input_lifecycle_timeout) ||
+        config.max_restarts == 0 ||
         config.max_restarts > 100000 || config.max_attempts_per_recovery == 0 ||
         config.max_attempts_per_recovery > 100000 ||
+        config.max_pending_input_lifecycle == 0 ||
+        config.max_pending_input_lifecycle > 100000 ||
         (config.drop_uid.has_value() != config.drop_gid.has_value()))
         return false;
     // The current local connector deliberately requires private pathname
@@ -118,11 +122,12 @@ bool DaemonSidecarAdapter::authenticated() const noexcept
 }
 
 InputFdAttachmentResult DaemonSidecarAdapter::attach_input(
-    InputRecordKey key, uint64_t request_id) noexcept
+    InputRecordKey key, InputLeaseOwner owner, uint64_t request_id) noexcept
 {
     InputFdAttachmentResult rejected_result;
     rejected_result.status = InputFdAttachmentStatus::InvalidArgument;
-    if (key.c_store_guid == CStoreGuid{} || request_id == 0)
+    if (key.c_store_guid == CStoreGuid{} ||
+        !input_lease_owner_valid(owner) || request_id == 0)
         return rejected_result;
 
     rejected_result.status = InputFdAttachmentStatus::Disconnected;
@@ -137,9 +142,230 @@ InputFdAttachmentResult DaemonSidecarAdapter::attach_input(
         static_cast<uint64_t>(supervisor_->child_pid())};
     const auto deadline = std::chrono::steady_clock::now() +
                           config_.input_attachment_timeout;
-    return InputFdAttachmentClient::attach(
-        socket_path_, InputFdRequest{identity, key, request_id}, expected,
-        deadline);
+    const InputFdRequest request{identity, key, owner, request_id};
+    InputFdAttachmentResult result = InputFdAttachmentClient::attach(
+        socket_path_, request, expected, deadline);
+    // Even a failed materialization/FD exchange names the exact store attempt
+    // against which teardown must later settle or retry the job observation.
+    result.lease = request;
+    return result;
+}
+
+bool DaemonSidecarAdapter::next_input_lifecycle_operation(
+    uint64_t& operation_id) noexcept
+{
+    if (next_input_lifecycle_operation_id_ == 0) {
+        fail(AdapterError::InputLifecycleOperationExhausted);
+        return false;
+    }
+    operation_id = next_input_lifecycle_operation_id_;
+    if (next_input_lifecycle_operation_id_ == std::numeric_limits<uint64_t>::max())
+        next_input_lifecycle_operation_id_ = 0;
+    else
+        ++next_input_lifecycle_operation_id_;
+    return true;
+}
+
+InputLifecycleResult DaemonSidecarAdapter::apply_input_lifecycle(
+    const InputFdRequest& lease, InputLifecycleAction action) noexcept
+{
+    InputLifecycleRequest request;
+    request.identity = lease.identity;
+    request.key = lease.key;
+    request.owner = lease.owner;
+    request.action = action;
+    if (lease.identity.generation != config_.generation ||
+        lease.identity.attempt == 0 || lease.key.c_store_guid == CStoreGuid{} ||
+        !input_lease_owner_valid(lease.owner) || lease.request_id == 0 ||
+        !input_lifecycle_action_valid(action))
+        return InputLifecycleResult{InputLifecycleStatus::InvalidArgument, request};
+
+    if (lease.identity.attempt != attempt_) {
+        const InputLifecycleStatus status = lease.identity.attempt < attempt_
+                                                ? InputLifecycleStatus::StoreReplaced
+                                                : InputLifecycleStatus::StaleIdentity;
+        return InputLifecycleResult{status, request};
+    }
+
+    const auto same_operation = [&](const InputLifecycleRequest& candidate) {
+        return candidate.identity == request.identity &&
+               candidate.key == request.key && candidate.owner == request.owner &&
+               candidate.action == request.action;
+    };
+    const auto completed = std::find_if(completed_input_lifecycle_.begin(),
+                                        completed_input_lifecycle_.end(),
+                                        same_operation);
+    if (completed != completed_input_lifecycle_.end())
+        return InputLifecycleResult{InputLifecycleStatus::AlreadyApplied,
+                                    *completed};
+    const auto pending = std::find_if(pending_input_lifecycle_.begin(),
+                                      pending_input_lifecycle_.end(),
+                                      same_operation);
+    if (pending != pending_input_lifecycle_.end())
+        return InputLifecycleResult{InputLifecycleStatus::Disconnected,
+                                    *pending};
+    if (!next_input_lifecycle_operation(request.operation_id)) {
+        retire_input_lifecycle_relationship(
+            AdapterError::InputLifecycleOperationExhausted);
+        return InputLifecycleResult{InputLifecycleStatus::StoreReplaced,
+                                    request};
+    }
+
+    InputLifecycleResult result{InputLifecycleStatus::Disconnected, request};
+    if (state_ == AdapterState::Ready && supervisor_ != nullptr &&
+        supervisor_->state() == sidecar::State::Ready &&
+        supervisor_->child_pid() > 1 && runtime_nodes_valid()) {
+        const local::CredentialExpectation expected{
+            config_.expected_service_uid, config_.expected_service_gid,
+            static_cast<uint64_t>(supervisor_->child_pid())};
+        result = InputLifecycleClient::apply(
+            socket_path_, request, expected,
+            std::chrono::steady_clock::now() +
+                config_.input_lifecycle_timeout);
+    }
+    if (result.status == InputLifecycleStatus::Applied ||
+        result.status == InputLifecycleStatus::AlreadyApplied) {
+        if (!remember_completed_input_lifecycle(request)) {
+            retire_input_lifecycle_relationship(
+                AdapterError::InputLifecycleCapacity);
+            result.status = InputLifecycleStatus::StoreReplaced;
+        }
+    } else if (result.status == InputLifecycleStatus::CapacityExceeded) {
+        retire_input_lifecycle_relationship(
+            AdapterError::InputLifecycleCapacity);
+        result.status = InputLifecycleStatus::StoreReplaced;
+    } else if (result.status == InputLifecycleStatus::MalformedResponse ||
+               result.status == InputLifecycleStatus::ConflictingReplay ||
+               result.status == InputLifecycleStatus::PeerUnauthenticated ||
+               result.status == InputLifecycleStatus::StaleIdentity ||
+               result.status == InputLifecycleStatus::InvalidArgument ||
+               result.status == InputLifecycleStatus::Rejected ||
+               result.status == InputLifecycleStatus::StoreReplaced) {
+        retire_input_lifecycle_relationship(
+            AdapterError::InputLifecycleProtocol);
+        result.status = InputLifecycleStatus::StoreReplaced;
+    } else if (result.status == InputLifecycleStatus::Timeout ||
+               result.status == InputLifecycleStatus::Disconnected ||
+               result.status == InputLifecycleStatus::HandshakeFailed) {
+        if (pending_input_lifecycle_.size() >=
+            config_.max_pending_input_lifecycle) {
+            retire_input_lifecycle_relationship(
+                AdapterError::InputLifecycleCapacity);
+            return InputLifecycleResult{
+                InputLifecycleStatus::StoreReplaced, request};
+        }
+        try {
+            pending_input_lifecycle_.push_back(request);
+        } catch (...) {
+            retire_input_lifecycle_relationship(
+                AdapterError::InputLifecycleCapacity);
+            return InputLifecycleResult{
+                InputLifecycleStatus::StoreReplaced, request};
+        }
+    }
+    return result;
+}
+
+bool DaemonSidecarAdapter::remember_completed_input_lifecycle(
+    const InputLifecycleRequest& request) noexcept
+{
+    try {
+        // Completed semantic deduplication is a bounded convenience on top of
+        // the sidecar's exact operation replay table.  Evict the oldest proof
+        // instead of forcing a healthy store restart after a fixed TU count.
+        if (completed_input_lifecycle_.size() >=
+            config_.max_pending_input_lifecycle)
+            completed_input_lifecycle_.erase(
+                completed_input_lifecycle_.begin());
+        completed_input_lifecycle_.push_back(request);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+void DaemonSidecarAdapter::retire_input_lifecycle_relationship(
+    AdapterError error) noexcept
+{
+    // If a lifecycle command cannot be durably applied or retained for exact
+    // retry, synchronously destroy the named store incarnation.  Destruction
+    // is the fail-closed reclaim proof: no command is dropped while its
+    // InputRecord could remain attachable, and no stale command is rebound to
+    // the replacement attempt.
+    fail(error);
+    disable_relationship();
+    if (supervisor_ != nullptr)
+        supervisor_->shutdown();
+    dispatcher_.reset();
+    supervisor_.reset();
+    cleanup_attempt_node();
+    pending_input_lifecycle_.clear();
+    completed_input_lifecycle_.clear();
+    advertisement::Update withdrawal;
+    apply_observation(withdrawal);
+    append_update(pending_advertisement_update_, withdrawal);
+}
+
+bool DaemonSidecarAdapter::drain_input_lifecycle() noexcept
+{
+    for (auto position = pending_input_lifecycle_.begin();
+         position != pending_input_lifecycle_.end();) {
+        if (position->identity.generation != config_.generation ||
+            position->identity.attempt < attempt_) {
+            // A proven replacement destroyed the old store.  Already-issued
+            // sealed compiler descriptors remain independent; no stale command
+            // is ever rebound to the new sidecar.
+            position = pending_input_lifecycle_.erase(position);
+            continue;
+        }
+        if (position->identity.attempt != attempt_ ||
+            state_ != AdapterState::Ready || supervisor_ == nullptr ||
+            supervisor_->state() != sidecar::State::Ready ||
+            supervisor_->child_pid() <= 1 || !runtime_nodes_valid()) {
+            ++position;
+            continue;
+        }
+        const local::CredentialExpectation expected{
+            config_.expected_service_uid, config_.expected_service_gid,
+            static_cast<uint64_t>(supervisor_->child_pid())};
+        const InputLifecycleResult result = InputLifecycleClient::apply(
+            socket_path_, *position, expected,
+            std::chrono::steady_clock::now() +
+                config_.input_lifecycle_timeout);
+        if (result.status == InputLifecycleStatus::Applied ||
+            result.status == InputLifecycleStatus::AlreadyApplied) {
+            if (!remember_completed_input_lifecycle(*position)) {
+                retire_input_lifecycle_relationship(
+                    AdapterError::InputLifecycleCapacity);
+                return false;
+            }
+            position = pending_input_lifecycle_.erase(position);
+        } else if (result.status == InputLifecycleStatus::Timeout ||
+                   result.status == InputLifecycleStatus::Disconnected ||
+                   result.status == InputLifecycleStatus::HandshakeFailed) {
+            ++position;
+        } else {
+            if (result.status == InputLifecycleStatus::CapacityExceeded)
+                retire_input_lifecycle_relationship(
+                    AdapterError::InputLifecycleCapacity);
+            else if (result.status == InputLifecycleStatus::MalformedResponse ||
+                     result.status == InputLifecycleStatus::ConflictingReplay ||
+                     result.status == InputLifecycleStatus::PeerUnauthenticated ||
+                     result.status == InputLifecycleStatus::StaleIdentity ||
+                     result.status == InputLifecycleStatus::InvalidArgument ||
+                     result.status == InputLifecycleStatus::Rejected ||
+                     result.status == InputLifecycleStatus::StoreReplaced)
+                retire_input_lifecycle_relationship(
+                    AdapterError::InputLifecycleProtocol);
+            if (supervisor_ == nullptr)
+                return false;
+            position = pending_input_lifecycle_.erase(position);
+        }
+        // poll() must never spend one timeout budget per queued lease.  Retry at
+        // most one current-incarnation command on each service-loop turn.
+        return true;
+    }
+    return true;
 }
 
 bool DaemonSidecarAdapter::next_attempt() noexcept
@@ -289,6 +515,8 @@ bool DaemonSidecarAdapter::begin_attempt(bool /*recovery*/) noexcept
                  : AdapterError::StalePath);
         return false;
     }
+    next_input_lifecycle_operation_id_ = 1;
+    completed_input_lifecycle_.clear();
 
     try {
         sidecar::Config supervisor_config;
@@ -339,6 +567,8 @@ bool DaemonSidecarAdapter::begin_attempt(bool /*recovery*/) noexcept
         }
         state_ = AdapterState::Ready;
         last_error_ = AdapterError::None;
+        if (!drain_input_lifecycle())
+            return false;
         return true;
     } catch (...) {
         fail(AdapterError::StartupFailure);
@@ -399,6 +629,13 @@ void DaemonSidecarAdapter::append_update(advertisement::Update& destination,
         destination.error = source.error;
 }
 
+void DaemonSidecarAdapter::append_pending_advertisement_update(
+    advertisement::Update& destination) noexcept
+{
+    append_update(destination, pending_advertisement_update_);
+    pending_advertisement_update_ = advertisement::Update{};
+}
+
 void DaemonSidecarAdapter::apply_observation(advertisement::Update& update) noexcept
 {
     const bool exact_listener = public_listener_.bound &&
@@ -452,6 +689,7 @@ bool DaemonSidecarAdapter::recover(advertisement::Update& update) noexcept
 bool DaemonSidecarAdapter::start(advertisement::Update* result) noexcept
 {
     advertisement::Update update;
+    append_pending_advertisement_update(update);
     if (!valid_config(config_)) {
         fail(AdapterError::InvalidConfiguration);
         apply_observation(update);
@@ -492,6 +730,7 @@ bool DaemonSidecarAdapter::start(advertisement::Update* result) noexcept
 bool DaemonSidecarAdapter::poll(advertisement::Update* result) noexcept
 {
     advertisement::Update update;
+    append_pending_advertisement_update(update);
     if (state_ == AdapterState::Stopped) {
         apply_observation(update);
         if (result != nullptr)
@@ -565,6 +804,8 @@ bool DaemonSidecarAdapter::poll(advertisement::Update* result) noexcept
     } else {
         apply_observation(update);
     }
+    if (!drain_input_lifecycle())
+        apply_observation(update);
     if (result != nullptr)
         *result = update;
     return controller_.snapshot().present();
@@ -580,6 +821,7 @@ void DaemonSidecarAdapter::fail(AdapterError error) noexcept
 void DaemonSidecarAdapter::shutdown(advertisement::Update* result) noexcept
 {
     advertisement::Update update;
+    append_pending_advertisement_update(update);
     if (state_ == AdapterState::ShuttingDown) {
         if (result != nullptr)
             *result = update;
@@ -595,6 +837,8 @@ void DaemonSidecarAdapter::shutdown(advertisement::Update* result) noexcept
         supervisor_.reset();
     }
     cleanup_attempt_node();
+    pending_input_lifecycle_.clear();
+    completed_input_lifecycle_.clear();
     // Advance the controller and return the ordered withdrawal so the Login
     // owner cannot retain stale presence after sidecar ownership has ended.
     append_update(update, controller_.observe(advertisement::Observation{

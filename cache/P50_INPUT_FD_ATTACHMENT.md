@@ -6,12 +6,20 @@ selector or an end-to-end compiler mode.
 
 The client connects to a private AF_UNIX endpoint under one absolute
 `steady_clock` deadline, verifies the service credentials, and performs the
-existing local-transport identity handshake. Its exact version-1 `DATA`
+existing local-transport identity handshake. Its exact version-2 `DATA`
 operation envelope identifies `InputFdAttachment`, the local identity,
-128-bit `CStoreGuid`, `TuSeq`, and nonzero request ID. The service checks the
+128-bit `CStoreGuid`, `TuSeq`, full assignment owner, and nonzero request ID.
+The earlier 56-byte version-1 shape remains parseable only for an explicit
+ownerless mixed-version refusal; it cannot authorize a compiler. The service checks the
 same identity and queues `P50ServerEndpoint::attach_input` on the sidecar's
 endpoint-owner io_context; materialization happens on the bounded control
 worker after the independently-owned cursor is returned.
+
+The one absolute attachment deadline covers lookup, materialization, sealing,
+read-only reopen, and SCM_RIGHTS acknowledgement. Cursor copy, incremental
+digest validation, and memfd writes advance in at most 64 KiB chunks with a
+deadline check between chunks; a timeout authorizes no descriptor and releases
+the pending owner reservation.
 
 Before any descriptor is passed over SCM_RIGHTS, the service drains the
 immutable cursor into a complete Linux sealed memfd, verifies its digest and

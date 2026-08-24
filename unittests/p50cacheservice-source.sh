@@ -18,7 +18,7 @@ gate() {
         grep -F 'active_control_cancel_fd_.store' "$file" >/dev/null &&
         grep -F 'context_.post([this]' "$file" >/dev/null &&
         grep -F 'runtime_config.f_store_guid = f_store_guid_for_identity' "$file" >/dev/null &&
-        grep -F 'endpoint_owner_thread_([this]' "$file" >/dev/null &&
+        grep -F 'endpoint_owner_thread_ = std::thread([this]' "$file" >/dev/null &&
         grep -F 'endpoint_work_guard_.reset()' "$file" >/dev/null &&
         grep -F 'endpoint_owner_thread_.join()' "$file" >/dev/null &&
         grep -F 'SidecarRuntime::run_endpoint_on_owner' "$file" >/dev/null &&
@@ -85,7 +85,7 @@ mutant_dir=$(mktemp -d "${TMPDIR:-/tmp}/p50cacheservice-source.XXXXXX")
 trap 'rm -rf "$mutant_dir"' EXIT HUP INT TERM
 
 for pattern in \
-    'endpoint_owner_thread_([this]' \
+    'endpoint_owner_thread_ = std::thread([this]' \
     'endpoint_work_guard_.reset()' \
     'endpoint_owner_thread_.join()' \
     'SidecarRuntime::run_endpoint_on_owner' \

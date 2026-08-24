@@ -21,11 +21,12 @@ trap 'rm -f "$out"' EXIT HUP INT TERM
     "$top_src/unittests/p50_daemon_sidecar_adapter_test.cpp" \
     "$top_src/cache/p50_daemon_sidecar_adapter.cpp" \
     "$top_src/cache/p50_daemon_cache_dispatch.cpp" \
+    "$top_src/cache/p50_input_fd_attachment.cpp" \
+    "$top_src/cache/p50_input_lifecycle.cpp" \
     "$top_src/cache/p50_fd_handoff.cpp" \
     "$top_src/cache/p50_local_transport.cpp" \
     "$top_src/cache/p50_sidecar_supervisor.cpp" \
     "$top_src/cache/p50_ready_advertisement.cpp" \
-    "$top_build/cache/libp50inputfd.a" \
     "$top_build/cache/libprotocol50.a" \
     "$top_build/services/.libs/libicecc.a" -llzo2 \
     ${ICECC_TEST_LIBZSTD_LIBS:--lzstd} \

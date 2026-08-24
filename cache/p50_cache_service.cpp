@@ -50,6 +50,22 @@ constexpr size_t kMaxControlWorkers = 4;
 volatile sig_atomic_t g_stop_requested = 0;
 volatile sig_atomic_t g_signal_wake_fd = -1;
 
+bool queued_control_data(int fd) noexcept {
+#if defined(MSG_DONTWAIT)
+    pollfd descriptor{fd, POLLIN, 0};
+    const int ready = ::poll(&descriptor, 1, 0);
+    if (ready <= 0 || (descriptor.revents & POLLIN) == 0)
+        return false;
+    uint8_t byte = 0;
+    const ssize_t count =
+        ::recv(fd, &byte, sizeof(byte), MSG_PEEK | MSG_DONTWAIT);
+    return count > 0;
+#else
+    (void)fd;
+    return true;
+#endif
+}
+
 void request_stop(int) noexcept {
     // The handler performs only async-signal-safe operations.  All C++ state
     // transitions, including SidecarRuntime::stop(), happen on the normal
@@ -419,21 +435,63 @@ bool handle_connection(local::Connection connection, const Options& options,
             (void)runtime.run_one(connection, expected, deadline);
             return true;
         }
-        if (operation.kind != local::ControlOperationKind::InputFdAttachment ||
-            !operation.input.has_value())
+        if (!operation.input.has_value() || !operation.owner.has_value())
             return true;
 
-        // Input lookup is posted to the endpoint owner.  The resulting cursor
-        // is independent and is materialized on this bounded control worker.
-        InputFdAttachmentService attachment(
-            [&runtime, deadline](InputRecordKey key) {
-                std::optional<InputCursor> cursor =
-                    runtime.attach_input_on_owner(key, deadline);
-                return cursor.has_value() ? std::move(*cursor) : InputCursor{};
-            });
-        (void)attachment.serve_request(
-            connection, options.identity, options.expected_peer,
-            InputFdRequest{options.identity, *operation.input, operation.request_id}, deadline);
+        if (operation.kind == local::ControlOperationKind::InputFdAttachment) {
+            const InputFdRequest request{options.identity, *operation.input,
+                                         *operation.owner,
+                                         operation.request_id};
+            // Input lookup and attempt reservation are serialized on the
+            // endpoint owner.  Materialization remains on this bounded worker;
+            // only an ACKed descriptor commits compiler authorization.
+            InputFdAttachmentService attachment(
+                [&runtime, deadline, request](InputRecordKey key) {
+                    if (key != request.key)
+                        return InputCursor{};
+                    std::optional<InputCursor> cursor =
+                        runtime.attach_input_on_owner(request, deadline);
+                    return cursor.has_value() ? std::move(*cursor) : InputCursor{};
+                });
+            const InputFdAttachmentResult result = attachment.serve_request(
+                connection, options.identity, options.expected_peer, request,
+                deadline);
+            runtime.finish_input_attachment_on_owner(
+                request, result.status == InputFdAttachmentStatus::Accepted,
+                deadline);
+            return true;
+        }
+
+        if (operation.kind != local::ControlOperationKind::InputLifecycle)
+            return true;
+        if (operation.lifecycle_result.has_value() ||
+            queued_control_data(connection.native_handle()))
+            return true;
+        const InputLifecycleRequest request{
+            options.identity, *operation.input, *operation.owner,
+            operation.request_id, operation.lifecycle_action};
+        const std::optional<InputLifecycleApplyStatus> result =
+            runtime.apply_input_lifecycle_on_owner(request, deadline);
+        if (!result.has_value())
+            return true;
+        const std::vector<uint8_t> response_payload =
+            local::encode_control_operation(
+                local::make_input_lifecycle_reply_operation(request, *result));
+        if (response_payload.empty())
+            return true;
+        const local::Frame response{local::kProtocolVersion,
+                                    local::MessageType::Data,
+                                    options.identity, response_payload};
+        if (connection.send_until(response, deadline) != local::Status::Ok)
+            return true;
+        local::Frame acknowledgement;
+        if (connection.receive_until(acknowledgement, deadline) !=
+                local::Status::Ok ||
+            acknowledgement.type != local::MessageType::Goodbye ||
+            !acknowledgement.payload.empty() ||
+            local::validate_identity(acknowledgement, options.identity) !=
+                local::Status::Ok)
+            return true;
         return true;
     } catch (...) {
         return true;
@@ -460,6 +518,10 @@ RuntimeConfig validate_runtime_config(RuntimeConfig config) {
         throw std::invalid_argument("sidecar runtime requires a nonzero F_STORE_GUID");
     if (config.max_live_handoffs != 1)
         throw std::invalid_argument("sidecar runtime supports exactly one live handoff");
+    if (config.endpoint_config.owner_limits.max_retained_input_records == 0 ||
+        config.max_input_lifecycle_replays == 0)
+        throw std::invalid_argument(
+            "sidecar runtime input lifecycle limits must be nonzero");
     return config;
 }
 
@@ -467,11 +529,36 @@ RuntimeConfig validate_runtime_config(RuntimeConfig config) {
 
 SidecarRuntime::SidecarRuntime(RuntimeConfig config)
     : config_(validate_runtime_config(std::move(config))),
-      endpoint_(std::make_unique<P50ServerEndpoint>(
-          config_.f_store_guid, config_.endpoint_caps, nullptr, nullptr,
-          config_.endpoint_config)),
-      endpoint_work_guard_(asio::make_work_guard(context_)),
-      endpoint_owner_thread_([this] { endpoint_owner_loop(); }) {}
+      input_lifecycle_(
+          config_.endpoint_config.owner_limits.max_retained_input_records,
+          config_.max_input_lifecycle_replays),
+      endpoint_work_guard_(asio::make_work_guard(context_)) {
+    InputJobStateSelector configured_selector =
+        std::move(config_.endpoint_config.input_job_state);
+    config_.endpoint_config.input_job_state =
+        [this, configured_selector = std::move(configured_selector)](
+            CStoreGuid guid, const TxBegin& begin, const TxCommit& commit,
+            std::span<const uint8_t> exact) {
+            const InputRecordKey key{guid, begin.tu_seq};
+            const InputJobState configured_state =
+                configured_selector
+                    ? configured_selector(guid, begin, commit, exact)
+                    : InputJobState::Open;
+            const InputLifecycleCommitDecision decision =
+                input_lifecycle_.prepare_route_commit(key);
+            if (decision == InputLifecycleCommitDecision::CapacityExceeded)
+                throw std::length_error(
+                    "bounded input lifecycle table exhausted before commit");
+            if (decision == InputLifecycleCommitDecision::Closed ||
+                configured_state == InputJobState::Closed)
+                return InputJobState::Closed;
+            return InputJobState::Open;
+        };
+    endpoint_ = std::make_unique<P50ServerEndpoint>(
+        config_.f_store_guid, config_.endpoint_caps, nullptr, nullptr,
+        config_.endpoint_config);
+    endpoint_owner_thread_ = std::thread([this] { endpoint_owner_loop(); });
+}
 
 SidecarRuntime::~SidecarRuntime() {
     stop();
@@ -542,6 +629,20 @@ boost::asio::awaitable<void> SidecarRuntime::run_endpoint_on_owner(
         live_sessions_.store(1, std::memory_order_release);
         const ServerRunResult endpoint_result =
             co_await endpoint_->run_adopted(std::move(*socket), std::move(endpoint_control));
+        if (endpoint_result.candidate_input.has_value() &&
+            !endpoint_result.completed_input.has_value())
+            input_lifecycle_.abort_route_commit(*endpoint_result.candidate_input);
+        if (endpoint_result.completed_input.has_value()) {
+            if (endpoint_result.committed_input.has_value() &&
+                endpoint_result.committed_input != endpoint_result.completed_input)
+                throw std::logic_error(
+                    "retained InputRecord witness differs from completed route input");
+            const bool retained = endpoint_result.committed_input.has_value();
+            if (!input_lifecycle_.observe_route_commit(
+                    *endpoint_result.completed_input, retained))
+                throw std::logic_error(
+                    "completed input route could not settle lifecycle ownership");
+        }
         release_active_socket();
         live_sessions_.store(endpoint_->live_session_count(), std::memory_order_release);
         owner_result.endpoint = endpoint_result;
@@ -678,20 +779,33 @@ RuntimeResult SidecarRuntime::run_one(
 }
 
 std::optional<InputCursor> SidecarRuntime::attach_input_on_owner(
-    InputRecordKey key, std::chrono::steady_clock::time_point deadline) noexcept {
+    InputFdRequest request,
+    std::chrono::steady_clock::time_point deadline) noexcept {
     if (stop_requested_.load(std::memory_order_acquire) ||
         std::chrono::steady_clock::now() >= deadline)
         return std::nullopt;
     auto completion = std::make_shared<std::promise<std::optional<InputCursor>>>();
     std::future<std::optional<InputCursor>> result = completion->get_future();
     try {
-        asio::post(context_, [this, key, completion] {
-            if (stop_requested_.load(std::memory_order_acquire)) {
+        asio::post(context_, [this, request, deadline, completion] {
+            if (stop_requested_.load(std::memory_order_acquire) ||
+                std::chrono::steady_clock::now() >= deadline) {
                 completion->set_value(std::nullopt);
                 return;
             }
             try {
-                completion->set_value(endpoint_->attach_input(key));
+                if (!input_lifecycle_.begin_attachment(
+                        request.key, request.owner, request.request_id)) {
+                    completion->set_value(std::nullopt);
+                    return;
+                }
+                try {
+                    completion->set_value(endpoint_->attach_input(request.key));
+                } catch (...) {
+                    input_lifecycle_.finish_attachment(
+                        request.key, request.owner, request.request_id, false);
+                    throw;
+                }
             } catch (...) {
                 completion->set_value(std::nullopt);
             }
@@ -706,6 +820,78 @@ std::optional<InputCursor> SidecarRuntime::attach_input_on_owner(
             std::chrono::steady_clock::now() >= deadline)
             return std::nullopt;
     }
+}
+
+void SidecarRuntime::finish_input_attachment_on_owner(
+    InputFdRequest request, bool authorized,
+    std::chrono::steady_clock::time_point deadline) noexcept {
+    if (stop_requested_.load(std::memory_order_acquire))
+        return;
+    auto completion = std::make_shared<std::promise<void>>();
+    std::future<void> result = completion->get_future();
+    try {
+        asio::post(context_, [this, request, authorized, completion] {
+            input_lifecycle_.finish_attachment(
+                request.key, request.owner, request.request_id, authorized);
+            try {
+                endpoint_->collect_input_garbage();
+            } catch (...) {
+            }
+            completion->set_value();
+        });
+    } catch (...) {
+        return;
+    }
+    while (result.wait_for(std::chrono::milliseconds(2)) !=
+           std::future_status::ready) {
+        if (stop_requested_.load(std::memory_order_acquire) ||
+            std::chrono::steady_clock::now() >= deadline)
+            return;
+    }
+}
+
+std::optional<InputLifecycleApplyStatus>
+SidecarRuntime::apply_input_lifecycle_on_owner(
+    InputLifecycleRequest request,
+    std::chrono::steady_clock::time_point deadline) noexcept {
+    if (stop_requested_.load(std::memory_order_acquire) ||
+        std::chrono::steady_clock::now() >= deadline)
+        return std::nullopt;
+    auto completion =
+        std::make_shared<std::promise<InputLifecycleApplyStatus>>();
+    std::future<InputLifecycleApplyStatus> result = completion->get_future();
+    try {
+        asio::post(context_, [this, request, completion] {
+            InputLifecycleApplyResult decision =
+                input_lifecycle_.begin_apply(request);
+            if (decision.status != InputLifecycleApplyStatus::Applied) {
+                completion->set_value(decision.status);
+                return;
+            }
+            bool mutated = true;
+            try {
+                if (decision.close_record)
+                    endpoint_->close_input_job(request.key);
+                if (decision.collect_record)
+                    endpoint_->collect_input_garbage();
+            } catch (...) {
+                mutated = false;
+            }
+            input_lifecycle_.finish_apply(request, mutated);
+            completion->set_value(
+                mutated ? InputLifecycleApplyStatus::Applied
+                        : InputLifecycleApplyStatus::UnknownRecord);
+        });
+    } catch (...) {
+        return std::nullopt;
+    }
+    while (result.wait_for(std::chrono::milliseconds(2)) !=
+           std::future_status::ready) {
+        if (stop_requested_.load(std::memory_order_acquire) ||
+            std::chrono::steady_clock::now() >= deadline)
+            return std::nullopt;
+    }
+    return result.get();
 }
 
 void SidecarRuntime::cancel_active_control() noexcept {

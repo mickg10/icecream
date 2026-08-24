@@ -45,6 +45,9 @@ enum class AdapterError : uint8_t {
     AuthenticationFailure,
     ListenerFailure,
     ShutdownFailure,
+    InputLifecycleCapacity,
+    InputLifecycleOperationExhausted,
+    InputLifecycleProtocol,
 };
 
 struct Config {
@@ -72,10 +75,12 @@ struct Config {
     std::chrono::milliseconds connect_timeout{1000};
     std::chrono::milliseconds handoff_timeout{250};
     std::chrono::milliseconds input_attachment_timeout{5000};
+    std::chrono::milliseconds input_lifecycle_timeout{250};
     std::chrono::milliseconds shutdown_timeout{1000};
     std::chrono::milliseconds restart_window{10000};
     uint32_t max_restarts = 3;
     uint32_t max_attempts_per_recovery = 16;
+    size_t max_pending_input_lifecycle = 4096;
 };
 
 struct PublicListenerObservation {
@@ -132,7 +137,19 @@ public:
     // InputRecord.  It neither consumes nor replaces the dispatcher relationship
     // used by CACHE_SESSION.  Every failure is descriptor-less and fail-closed.
     [[nodiscard]] InputFdAttachmentResult attach_input(
-        InputRecordKey key, uint64_t request_id) noexcept;
+        InputRecordKey key, InputLeaseOwner owner,
+        uint64_t request_id) noexcept;
+
+    // Attempt teardown and terminal logical-job settlement are deliberately
+    // distinct.  A failed operation is retained in the adapter's bounded retry
+    // queue; replacement of the named sidecar incarnation reclaims it without
+    // sending a stale command to the new store.
+    [[nodiscard]] InputLifecycleResult apply_input_lifecycle(
+        const InputFdRequest& lease,
+        InputLifecycleAction action) noexcept;
+    [[nodiscard]] size_t pending_input_lifecycle_count() const noexcept {
+        return pending_input_lifecycle_.size();
+    }
 
 #if defined(ICECC_P50_DAEMON_SIDECAR_ADAPTER_TEST_HOOKS)
     // Compile-time-only fault injection for otherwise unreachable uint64_t
@@ -144,6 +161,9 @@ public:
         prior_supervisor_post_ready_exits_ = prior;
         prior_counter_observed_ = prior_observed;
     }
+    void test_force_input_lifecycle_operation(uint64_t value) noexcept {
+        next_input_lifecycle_operation_id_ = value;
+    }
 #endif
 
 private:
@@ -153,6 +173,11 @@ private:
     bool collect_counter_delta() noexcept;
     bool reserve_outer_restart() noexcept;
     bool next_attempt() noexcept;
+    bool next_input_lifecycle_operation(uint64_t& operation_id) noexcept;
+    [[nodiscard]] bool drain_input_lifecycle() noexcept;
+    [[nodiscard]] bool remember_completed_input_lifecycle(
+        const InputLifecycleRequest& request) noexcept;
+    void retire_input_lifecycle_relationship(AdapterError error) noexcept;
     bool make_attempt_node() noexcept;
     bool capture_socket_node() noexcept;
     bool runtime_nodes_valid() const noexcept;
@@ -161,6 +186,8 @@ private:
     void apply_observation(advertisement::Update& update) noexcept;
     static void append_update(advertisement::Update& destination,
                               const advertisement::Update& source) noexcept;
+    void append_pending_advertisement_update(
+        advertisement::Update& destination) noexcept;
     void fail(AdapterError error) noexcept;
 
     Config config_;
@@ -177,11 +204,15 @@ private:
     dev_t socket_device_ = 0;
     ino_t socket_inode_ = 0;
     uint64_t attempt_ = 0;
+    uint64_t next_input_lifecycle_operation_id_ = 1;
     uint64_t cumulative_post_ready_exits_ = 0;
     uint64_t prior_supervisor_post_ready_exits_ = 0;
     bool prior_counter_observed_ = false;
     bool counter_failed_ = false;
     std::vector<std::chrono::steady_clock::time_point> restart_times_;
+    std::vector<InputLifecycleRequest> pending_input_lifecycle_;
+    std::vector<InputLifecycleRequest> completed_input_lifecycle_;
+    advertisement::Update pending_advertisement_update_{};
 };
 
 } // namespace icecc::p50::daemon

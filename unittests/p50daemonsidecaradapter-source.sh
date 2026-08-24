@@ -9,10 +9,10 @@ cxx=${ICECC_TEST_CXX:-c++}
 standard=${ICECC_TEST_CXX_STANDARD_FLAG:--std=c++20}
 src="$top_src/cache/p50_daemon_sidecar_adapter.cpp"
 header="$top_src/cache/p50_daemon_sidecar_adapter.h"
-test_binary="$unit_build/p50daemonsidecaradapter"
+test_source="$top_src/unittests/p50_daemon_sidecar_adapter_test.cpp"
 
-test -x "$service" && test -x "$test_binary" || {
-    echo 'FAIL: adapter source gate requires the built service and runtime test' >&2
+test -x "$service" || {
+    echo 'FAIL: adapter source gate requires the built service' >&2
     exit 1
 }
 
@@ -49,25 +49,57 @@ production_object="$tmp_root/production.o"
     -I"$top_src/client" -I"$top_src/services" \
     ${ICECC_TEST_CPPFLAGS:-} ${ICECC_TEST_BOOST_CPPFLAGS:-} \
     -UICECC_P50_DAEMON_SIDECAR_ADAPTER_TEST_HOOKS -c "$src" -o "$production_object"
-if nm -C "$production_object" | grep -E 'test_force_attempt|test_force_counter_state' >/dev/null ||
+if nm -C "$production_object" | grep -E 'test_force_attempt|test_force_counter_state|test_force_input_lifecycle_operation' >/dev/null ||
    strings "$production_object" | grep -F 'ICECC_P50_DAEMON_SIDECAR_ADAPTER_TEST_HOOKS' >/dev/null; then
     echo 'FAIL: production adapter contains a test-only hook' >&2
     exit 1
 fi
 echo 'ok - production adapter contains no test-only hook'
 
-ICECC_TEST_CACHE_SERVICE="$service" "$test_binary"
-echo 'ok - linked service/SCM_RIGHTS lifecycle baseline passes'
-
-test_object="$unit_build/p50daemonsidecaradapter-p50_daemon_sidecar_adapter_test.o"
-dispatch_object="$unit_build/p50daemonsidecaradapter-p50_daemon_cache_dispatch.o"
-handoff_object="$unit_build/p50daemonsidecaradapter-p50_fd_handoff.o"
-for object in "$test_object" "$dispatch_object" "$handoff_object"; do
-    test -f "$object" || {
-        echo "FAIL: missing adapter mutant dependency $object" >&2
-        exit 1
-    }
+test_object="$tmp_root/test.o"
+dispatch_object="$tmp_root/dispatch.o"
+handoff_object="$tmp_root/handoff.o"
+attachment_object="$tmp_root/input_fd_attachment.o"
+lifecycle_object="$tmp_root/p50_input_lifecycle.o"
+for source_and_object in \
+    "$top_src/cache/p50_daemon_cache_dispatch.cpp:$dispatch_object" \
+    "$top_src/cache/p50_fd_handoff.cpp:$handoff_object" \
+    "$top_src/cache/p50_input_fd_attachment.cpp:$attachment_object" \
+    "$top_src/cache/p50_input_lifecycle.cpp:$lifecycle_object"; do
+    source=${source_and_object%%:*}
+    object=${source_and_object#*:}
+    "$cxx" "$standard" -Wall -Wextra -Werror -pthread -DHAVE_CONFIG_H \
+        -I"$top_build" -I"$top_src" -I"$top_src/cache" \
+        -I"$top_src/client" -I"$top_src/services" \
+        ${ICECC_TEST_CPPFLAGS:-} ${ICECC_TEST_BOOST_CPPFLAGS:-} \
+        -c "$source" -o "$object"
 done
+"$cxx" "$standard" -Wall -Wextra -Werror -pthread -DHAVE_CONFIG_H \
+    -DICECC_P50_DAEMON_SIDECAR_ADAPTER_TEST_HOOKS \
+    -I"$top_build" -I"$top_src" -I"$top_src/cache" \
+    -I"$top_src/client" -I"$top_src/services" \
+    ${ICECC_TEST_CPPFLAGS:-} ${ICECC_TEST_BOOST_CPPFLAGS:-} \
+    -c "$test_source" -o "$test_object"
+
+link_binary() {
+    adapter_object=$1
+    binary=$2
+    "$cxx" "$standard" -pthread ${ICECC_TEST_LDFLAGS:-} \
+        "$test_object" "$dispatch_object" "$handoff_object" \
+        "$attachment_object" "$lifecycle_object" "$adapter_object" \
+        "$top_build/cache/libp50readyadvertisement.a" \
+        "$top_build/cache/libp50sidecarsupervisor.a" \
+        "$top_build/cache/libp50localtransport.a" \
+        "$top_build/cache/libprotocol50.a" \
+        "$top_build/services/.libs/libicecc.a" -llzo2 \
+        ${ICECC_TEST_LIBZSTD_LIBS:--lzstd} \
+        ${ICECC_TEST_XXHASH_LIBS:--lxxhash} -o "$binary"
+}
+
+baseline="$tmp_root/baseline"
+link_binary "$production_object" "$baseline"
+ICECC_TEST_CACHE_SERVICE="$service" timeout 60s "$baseline"
+echo 'ok - current-source linked service/SCM_RIGHTS lifecycle baseline passes'
 
 compile_and_expect_red() {
     label=$1
@@ -80,16 +112,7 @@ compile_and_expect_red() {
         -I"$top_src/client" -I"$top_src/services" \
         ${ICECC_TEST_CPPFLAGS:-} ${ICECC_TEST_BOOST_CPPFLAGS:-} \
         -c "$mutant" -o "$object"
-    "$cxx" "$standard" -pthread ${ICECC_TEST_LDFLAGS:-} \
-        "$test_object" "$dispatch_object" "$handoff_object" "$object" \
-        "$top_build/cache/libp50readyadvertisement.a" \
-        "$top_build/cache/libp50sidecarsupervisor.a" \
-        "$top_build/cache/libp50localtransport.a" \
-        "$top_build/cache/libp50inputfd.a" \
-        "$top_build/cache/libprotocol50.a" \
-        "$top_build/services/.libs/libicecc.a" -llzo2 \
-        ${ICECC_TEST_LIBZSTD_LIBS:--lzstd} \
-        ${ICECC_TEST_XXHASH_LIBS:--lxxhash} -o "$binary"
+    link_binary "$object" "$binary"
     set +e
     ICECC_TEST_CACHE_SERVICE="$service" timeout 60s "$binary" >"$log" 2>&1
     status=$?

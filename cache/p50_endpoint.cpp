@@ -1415,8 +1415,11 @@ struct P50ServerEndpoint::Impl {
                ZstdTuDialogue::State::BodyClosed;
     }
 
-    TxCommit materialize_and_commit(const Session& session, TxBegin& committed_begin,
-                                    std::optional<InputRecordKey>& committed_input) {
+    TxCommit materialize_and_commit(
+        const Session& session, TxBegin& committed_begin,
+        std::optional<InputRecordKey>& candidate_input,
+        std::optional<InputRecordKey>& completed_input,
+        std::optional<InputRecordKey>& committed_input) {
         Namespace& space = require(session);
         if (!space.route || !space.route->pending)
             throw std::logic_error("F endpoint has no active transaction");
@@ -1437,17 +1440,19 @@ struct P50ServerEndpoint::Impl {
                                                   pending.begin.rel_seq, pending.begin.tu_seq,
                                                   pending.begin.transaction_digest)};
         Revision& revision = require_revision_advance(*session.c_guid);
+        const InputRecordKey input_key{*session.c_guid, pending.begin.tu_seq};
+        candidate_input = input_key;
         const InputJobState job_state = config.input_job_state
                                             ? config.input_job_state(*session.c_guid,
                                                                      pending.begin, commit, exact)
                                             : InputJobState::Open;
-        const InputRecordKey input_key{*session.c_guid, pending.begin.tu_seq};
         const InputPublishResult publication =
             job_state == InputJobState::Open
                 ? input_records.publish(*session.c_guid, pending.begin, commit,
                                         std::move(exact))
                 : input_records.observe_closed_job_commit(
                       *session.c_guid, pending.begin, commit, exact);
+        completed_input = input_key;
         if (job_state == InputJobState::Open &&
             publication != InputPublishResult::NotRetainedJobClosed &&
             input_records.job_open(input_key)) {
@@ -2035,6 +2040,8 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
         TxBegin committed_begin;
         const TxCommit commit =
             impl_->materialize_and_commit(session, committed_begin,
+                                          result.candidate_input,
+                                          result.completed_input,
                                           result.committed_input);
         co_await async_write_message(
             socket, commit, selection.limits.max_frame_payload,

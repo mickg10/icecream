@@ -5,6 +5,8 @@ TESTS += p50daemonsidecaradapter-sanitize.sh
 TESTS += p50daemonpositive-source.sh p50daemonpositive-run.sh
 TESTS += p50inputfd-source.sh p50inputfd-sanitize.sh
 TESTS += p50inputfd
+TESTS += p50inputlifecycle-source.sh p50inputlifecycle-sanitize.sh
+TESTS += p50inputlifecycle
 TESTS += p50compilebinding
 TESTS += p50compilee2e-source.sh p50compilee2e-run.sh
 
@@ -74,6 +76,7 @@ digest128bench_LDADD = ../services/libicecc.la
 check_PROGRAMS = testargs lockexec backpressure schedpolicy utf8test statewritertest schedbp daemonlogin daemonbatch cachehandoffdaemon daemoncachedispatch p50daemoncachedispatch p49daemon p49scheduler connectivity fastesttest hallflowtest jobidalloctest inputpump compilerinput p49assignment p50assignment p50cacheadvertisement p50cachesession p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50inputrecordreopen p50inputattachment p50endpoint p50localtransport p50sidecarsupervisor p50readyadvertisement p50cacheservice p50fdhandoff digest128bench p50zstdsender p50compilebinding
 check_PROGRAMS += p50daemonsidecaradapter p50daemonpositive
 check_PROGRAMS += p50inputfd
+check_PROGRAMS += p50inputlifecycle
 testargs_SOURCES = args.cpp
 p50wire_SOURCES = p50_wire_test.cpp
 p50slice0_SOURCES = \
@@ -88,9 +91,16 @@ p50inputfd_SOURCES = p50_input_fd_attachment_test.cpp \
 	../cache/p50_input_fd_attachment.cpp ../cache/p50_input_record.cpp \
 	../cache/p50_local_transport.cpp ../cache/p50_fd_handoff.cpp \
 	../cache/protocol50.cpp
+p50inputfd_CPPFLAGS = $(AM_CPPFLAGS) -DICECC_P50_INPUT_FD_ATTACHMENT_TEST_HOOKS
 p50inputfd_CXXFLAGS = -pthread
 p50inputfd_LDFLAGS = -pthread
 p50inputfd_LDADD = ../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS)
+p50inputlifecycle_SOURCES = p50_input_lifecycle_test.cpp
+p50inputlifecycle_CXXFLAGS = -pthread
+p50inputlifecycle_LDFLAGS = -pthread
+p50inputlifecycle_LDADD = ../cache/libp50inputlifecycle.a \
+	../cache/libprotocol50.a ../cache/libp50localtransport.a \
+	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS)
 p50endpoint_SOURCES = p50_endpoint_test.cpp
 p50zstdsender_SOURCES = p50_zstd_sender_test.cpp
 p50zstdsender_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
@@ -112,12 +122,14 @@ p50daemonsidecaradapter_CPPFLAGS = $(AM_CPPFLAGS) \
 p50daemonsidecaradapter_CXXFLAGS = -pthread
 p50daemonsidecaradapter_LDFLAGS = -pthread
 p50daemonsidecaradapter_LDADD = ../cache/libp50daemonsidecaradapter.a \
-	../cache/libp50inputfd.a ../cache/libprotocol50.a \
+	../cache/libp50inputfd.a ../cache/libp50inputlifecycle.a \
+	../cache/libprotocol50.a \
 	../cache/libp50readyadvertisement.a ../cache/libp50sidecarsupervisor.a \
 	../cache/libp50localtransport.a ../services/libicecc.la \
 	$(LIBZSTD_LIBS) $(XXHASH_LIBS)
 p50daemonsidecaradapter_DEPENDENCIES = \
 	../cache/libp50daemonsidecaradapter.a ../cache/libp50inputfd.a \
+	../cache/libp50inputlifecycle.a \
 	../cache/libprotocol50.a ../cache/libp50readyadvertisement.a \
 	../cache/libp50sidecarsupervisor.a ../cache/libp50localtransport.a \
 	../services/libicecc.la ../cache/icecc-cache-service
@@ -202,10 +214,11 @@ p50cacheservice_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS) -DICECC_P50_CACHE_SE
 p50cacheservice_CXXFLAGS = -pthread
 p50cacheservice_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 p50cacheservice_LDADD = ../cache/libp50endpoint.a ../cache/libp50inputfd.a \
+	../cache/libp50inputlifecycle.a \
 	../cache/libprotocol50.a ../cache/libp50localtransport.a \
 	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 p50cacheservice_DEPENDENCIES = ../cache/icecc-cache-service \
-	../cache/libp50inputfd.a readyclose_shim.so
+	../cache/libp50inputfd.a ../cache/libp50inputlifecycle.a readyclose_shim.so
 p50fdhandoff_SOURCES = p50fdhandoff.cpp ../cache/p50_fd_handoff.cpp \
 	../cache/p50_local_transport.cpp
 p50fdhandoff_CPPFLAGS = $(AM_CPPFLAGS) -DICECC_P50_FD_HANDOFF_TEST_HOOKS
@@ -238,7 +251,7 @@ connectivity_DEPENDENCIES = conn_shim.so
 CLEANFILES = sndbuf_shim.so conn_shim.so readyclose_shim.so schedbp-scheduler-*.log
 EXTRA_DIST = sndbuf_shim.c conn_shim.c readyclose_shim.c connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh p50assignment-remote.sh daemonlogin-run.sh daemonbatch-run.sh cachehandoffdaemon-run.sh daemoncachedispatch-run.sh p49daemon-run.sh p49scheduler-run.sh boost-prefix-scope.sh
 
-EXTRA_DIST += p50_trace_check.sh p50assignment-source.sh p50cacheadvertisement-source.sh p50cachesession-source.sh p50daemoncachedispatch-source.sh p50daemoncachedispatch-sanitize.sh p50localtransport-source.sh p50localtransport-sanitize.sh p50sidecarsupervisor-source.sh p50inputattachment-source.sh p50inputattachment-mutants.sh p50_input_attachment_sanitize.sh p50readyadvertisement-source.sh p50readyadvertisement-mutants.sh p50endpoint-source.sh p50fdhandoff-source.sh p50cacheservice-source.sh p50cacheservice-sanitize.sh p50fdhandoff-sanitize.sh p50inputfd-source.sh p50inputfd-sanitize.sh packagebuilderdeps.sh p50daemonpositive-source.sh p50daemonpositive-run.sh p50zstdsender-source.sh
+EXTRA_DIST += p50_trace_check.sh p50assignment-source.sh p50cacheadvertisement-source.sh p50cachesession-source.sh p50daemoncachedispatch-source.sh p50daemoncachedispatch-sanitize.sh p50localtransport-source.sh p50localtransport-sanitize.sh p50sidecarsupervisor-source.sh p50inputattachment-source.sh p50inputattachment-mutants.sh p50_input_attachment_sanitize.sh p50readyadvertisement-source.sh p50readyadvertisement-mutants.sh p50endpoint-source.sh p50fdhandoff-source.sh p50cacheservice-source.sh p50cacheservice-sanitize.sh p50fdhandoff-sanitize.sh p50inputfd-source.sh p50inputfd-sanitize.sh p50inputlifecycle-source.sh p50inputlifecycle-sanitize.sh packagebuilderdeps.sh p50daemonpositive-source.sh p50daemonpositive-run.sh p50zstdsender-source.sh
 EXTRA_DIST += p50compilee2e-source.sh p50compilee2e-run.sh
 
 # Make the tests also print the test log if they fail.

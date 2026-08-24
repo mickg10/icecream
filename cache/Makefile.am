@@ -1,11 +1,12 @@
 noinst_LIBRARIES = libprotocol50.a libp50endpoint.a libp50localtransport.a \
 	libp50sidecarsupervisor.a libp50readyadvertisement.a \
-	libp50daemonsidecaradapter.a libp50inputfd.a
+	libp50daemonsidecaradapter.a libp50inputfd.a libp50inputlifecycle.a
 
 sbin_PROGRAMS = icecc-cache-service
 
 icecc_cache_service_SOURCES = p50_cache_service.cpp p50_cache_service.h
-icecc_cache_service_LDADD = libp50endpoint.a libp50inputfd.a libprotocol50.a \
+icecc_cache_service_LDADD = libp50endpoint.a libp50inputfd.a \
+	libp50inputlifecycle.a libprotocol50.a \
 	libp50localtransport.a ../services/libicecc.la \
 	$(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 icecc_cache_service_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
@@ -34,6 +35,8 @@ libp50localtransport_a_SOURCES = p50_local_transport.cpp p50_local_transport.h \
 	p50_fd_handoff.cpp p50_fd_handoff.h
 libp50inputfd_a_SOURCES = p50_input_fd_attachment.cpp p50_input_fd_attachment.h
 libp50inputfd_a_CPPFLAGS = $(AM_CPPFLAGS)
+libp50inputlifecycle_a_SOURCES = p50_input_lifecycle.cpp p50_input_lifecycle.h
+libp50inputlifecycle_a_CPPFLAGS = $(AM_CPPFLAGS)
 libp50sidecarsupervisor_a_SOURCES = p50_sidecar_supervisor.cpp p50_sidecar_supervisor.h
 libp50readyadvertisement_a_SOURCES = p50_ready_advertisement.cpp \
 	p50_ready_advertisement.h
@@ -147,6 +150,7 @@ EXTRA_DIST = \
 	P50_DAEMON_CACHE_DISPATCH.md \
 	P50_DAEMON_SIDECAR_ADAPTER.md \
 	P50_INPUT_FD_ATTACHMENT.md \
+	P50_INPUT_LIFECYCLE.md \
 	formal/README.md
 
 check-local:

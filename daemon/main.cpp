@@ -87,6 +87,7 @@
 #include <map>
 #include <memory>
 #include <new>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <algorithm>
@@ -521,6 +522,13 @@ public:
         uint32_t cacheProfileMask;
     };
 
+    enum class P50InputLeaseState : uint8_t {
+        None = 0,
+        Active,
+        AttemptSettled,
+        TerminalSettled,
+    };
+
     Client() {
         created_ts = time(nullptr);
         created_msec = monotonic_msec();
@@ -546,6 +554,7 @@ public:
         channel = nullptr;
         job = nullptr;
         p50_input_fd = -1;
+        p50_input_lease_state = P50InputLeaseState::None;
         cacheHandoff = CacheHandoff{};
         usecsmsg = nullptr;
         deferred_getcs = nullptr;
@@ -655,6 +664,12 @@ public:
     // populated only after an exact authenticated sidecar attachment and is
     // transferred exactly once to handle_connection(); legacy jobs keep -1.
     int p50_input_fd;
+    // The descriptor above can move into the compiler child, but this exact
+    // logical-owner observation remains in the daemon parent until teardown.
+    // An ordinary disconnect/cancel settles only the assignment attempt; a
+    // terminal close is legal only after an explicit result disposition.
+    std::optional<icecc::p50::InputFdRequest> p50_input_lease;
+    P50InputLeaseState p50_input_lease_state;
     CacheHandoff cacheHandoff;   // S2: see the struct's own comment above
     int client_id;
     uint32_t niceness; // nice priority (0-20), for PENDING_USE_CS
@@ -1246,6 +1261,9 @@ struct Daemon {
     bool handle_activity(Client *client) __attribute_warn_unused_result__;
     bool handle_file_chunk_env(Client *client, Msg *msg) __attribute_warn_unused_result__;
     void handle_end(Client *client, int exitcode);
+    void settle_p50_input(Client *client,
+                          icecc::p50::InputLifecycleAction action,
+                          const char *reason) noexcept;
     int scheduler_get_internals() __attribute_warn_unused_result__;
     void clear_children();
     int scheduler_use_cs(UseCSMsg *msg) __attribute_warn_unused_result__;
@@ -6965,17 +6983,56 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
     }
     if (job->usesP50Input()) {
         const CompileInputIdentity &input = job->compileInputIdentity();
+        const bool exact_assignment_input =
+            job->hasAssignmentIdentity() &&
+            input.attempt_id == job->assignmentNonce() &&
+            input.request_id == job->assignmentNonce();
+        if (!exact_assignment_input || client->p50_input_fd >= 0 ||
+            client->p50_input_lease.has_value() ||
+            client->p50_input_lease_state !=
+                Client::P50InputLeaseState::None) {
+            // CompileInputIdentity::validPresent() proves only syntactic
+            // presence.  Compiler admission additionally binds its attempt
+            // and replay request to this exact scheduler assignment.  Refuse
+            // an impossible second CompileFile before it can reserve another
+            // sidecar owner.
+            log_warning() << "P50 compiler input owner mismatch/reuse for job "
+                          << job->jobID() << endl;
+            if (client->status != Client::CLIENTWORK)
+                finish_assignment_claim(job->jobID());
+            delete job;
+            (void)client->channel->send_msg(EndMsg());
+            handle_end(client, 146);
+            return false;
+        }
         icecc::p50::InputRecordKey key;
         key.c_store_guid.bytes = input.c_store_guid;
         key.tu_seq = icecc::p50::TuSeq{input.tu_seq};
+        const icecc::p50::InputLeaseOwner owner{
+            job->jobID(), job->assignmentEpoch(), job->assignmentNonce()};
 
         icecc::p50::InputFdAttachmentResult attachment;
         if (client->channel->protocol == PROTOCOL_VERSION_CACHE_ADVERTISEMENT &&
             cache_adapter != nullptr) {
-            attachment = cache_adapter->attach_input(key, input.request_id);
+            attachment = cache_adapter->attach_input(
+                key, owner, input.request_id);
         }
+        if (attachment.lease.has_value()) {
+            // Retain the exact sidecar-incarnation observation before testing
+            // the descriptor outcome.  A failed/lost handoff can still have
+            // bound an owner in the sidecar and therefore needs attempt
+            // settlement during the rejection teardown below.
+            client->p50_input_lease = attachment.lease;
+            client->p50_input_lease_state =
+                Client::P50InputLeaseState::Active;
+        }
+        const bool exact_returned_lease =
+            attachment.lease.has_value() &&
+            attachment.lease->key == key &&
+            attachment.lease->owner == owner &&
+            attachment.lease->request_id == input.request_id;
         if (attachment.status != icecc::p50::InputFdAttachmentStatus::Accepted ||
-            !attachment.fd.valid()) {
+            !attachment.fd.valid() || !exact_returned_lease) {
             log_warning() << "P50 compiler input attachment failed closed for job "
                           << job->jobID() << " ("
                           << icecc::p50::input_fd_attachment_status_name(
@@ -6988,18 +7045,11 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
             handle_end(client, 146);
             return false;
         }
-        if (client->p50_input_fd >= 0) {
-            // A client has exactly one in-flight CompileFile.  Refuse any
-            // impossible replacement rather than leaking or mixing cursors.
-            if (client->status != Client::CLIENTWORK)
-                finish_assignment_claim(job->jobID());
-            delete job;
-            (void)client->channel->send_msg(EndMsg());
-            handle_end(client, 146);
-            return false;
-        }
         client->p50_input_fd = attachment.fd.release();
-    } else if (client->p50_input_fd >= 0) {
+    } else if (client->p50_input_fd >= 0 ||
+               client->p50_input_lease.has_value() ||
+               client->p50_input_lease_state !=
+                   Client::P50InputLeaseState::None) {
         // Canonical legacy selection can never inherit a prior P50 cursor.
         if (client->status != Client::CLIENTWORK)
             finish_assignment_claim(job->jobID());
@@ -7035,6 +7085,68 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
     }
 
     return true;
+}
+
+void Daemon::settle_p50_input(
+    Client *client, icecc::p50::InputLifecycleAction action,
+    const char *reason) noexcept
+{
+    if (client == nullptr ||
+        client->p50_input_lease_state !=
+            Client::P50InputLeaseState::Active)
+        return;
+
+    const bool terminal =
+        action == icecc::p50::InputLifecycleAction::CloseAcceptedJob ||
+        action == icecc::p50::InputLifecycleAction::CancelJob;
+    client->p50_input_lease_state = terminal
+        ? Client::P50InputLeaseState::TerminalSettled
+        : Client::P50InputLeaseState::AttemptSettled;
+
+    if (!client->p50_input_lease.has_value()) {
+        log_error() << "P50 input lease state lost before settlement for client "
+                    << client->client_id << endl;
+        return;
+    }
+
+    const icecc::p50::InputFdRequest lease =
+        *client->p50_input_lease;
+    client->p50_input_lease.reset();
+    if (cache_adapter == nullptr) {
+        // Adapter shutdown destroys its sidecar/store incarnation.  There is
+        // no successor store to which this old observation may be rebound.
+        log_info() << "P50 input settlement observed after sidecar shutdown for job "
+                   << lease.owner.logical_job << " ("
+                   << (reason ? reason : "unspecified") << ")" << endl;
+        return;
+    }
+
+    const icecc::p50::InputLifecycleResult result =
+        cache_adapter->apply_input_lifecycle(lease, action);
+    trace() << "P50 input settlement job " << lease.owner.logical_job
+            << " action " << static_cast<unsigned int>(action)
+            << " status "
+            << icecc::p50::input_lifecycle_status_name(result.status)
+            << " reason " << (reason ? reason : "unspecified") << endl;
+
+    switch (result.status) {
+    case icecc::p50::InputLifecycleStatus::Applied:
+    case icecc::p50::InputLifecycleStatus::AlreadyApplied:
+    case icecc::p50::InputLifecycleStatus::StoreReplaced:
+    case icecc::p50::InputLifecycleStatus::UnknownRecord:
+    case icecc::p50::InputLifecycleStatus::Timeout:
+    case icecc::p50::InputLifecycleStatus::Disconnected:
+    case icecc::p50::InputLifecycleStatus::HandshakeFailed:
+        // Transport failures are retained by the adapter's bounded retry
+        // queue; replacement proves the named old store no longer exists.
+        break;
+    default:
+        log_warning() << "P50 input settlement failed closed for job "
+                      << lease.owner.logical_job << " ("
+                      << icecc::p50::input_lifecycle_status_name(result.status)
+                      << ")" << endl;
+        break;
+    }
 }
 
 bool Daemon::handle_verify_env(Client *client, VerifyEnvMsg *msg)
@@ -7074,6 +7186,11 @@ void Daemon::handle_end(Client *client, int exitcode)
     trace() << "handle_end " << client->dump() << endl;
     trace() << dump_internals() << endl;
 #endif
+    // A normal disconnect, worker failure, scheduler loss, or retry says only
+    // that this assignment attempt is over.  It must not terminally close the
+    // logical job; an explicit result disposition does that before handle_end.
+    settle_p50_input(client, icecc::p50::InputLifecycleAction::CancelAttempt,
+                     "handle_end");
     remember_finished_job(client, exitcode);
     if (client->job && (client->status == Client::TOCOMPILE
                         || client->status == Client::WAITFORCHILD)) {

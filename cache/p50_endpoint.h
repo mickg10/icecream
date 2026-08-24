@@ -238,6 +238,11 @@ struct ServerRunResult {
     ServerRunStatus status = ServerRunStatus::Disconnected;
     uint64_t session_serial = 0;
     std::optional<CStoreGuid> c_store_guid;
+    // candidate_input is set before the job-state selector. completed_input is
+    // set only after exact publication/closed-commit validation succeeds.
+    // committed_input remains the narrower compiler-attachable witness.
+    std::optional<InputRecordKey> candidate_input;
+    std::optional<InputRecordKey> completed_input;
     std::optional<InputRecordKey> committed_input;
     std::optional<ErrorMessage> terminal_error;
 };

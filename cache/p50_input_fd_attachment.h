@@ -1,6 +1,7 @@
 #pragma once
 
 #include "p50_fd_handoff.h"
+#include "p50_input_lifecycle.h"
 #include "p50_input_record.h"
 #include "p50_local_transport.h"
 
@@ -9,6 +10,7 @@
 #include <cstdint>
 #include <compare>
 #include <functional>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -20,6 +22,7 @@ namespace icecc::p50 {
 struct InputFdRequest {
     local::Identity identity{};
     InputRecordKey key{};
+    InputLeaseOwner owner{};
     uint64_t request_id = 0;
     auto operator<=>(const InputFdRequest&) const = default;
 };
@@ -80,6 +83,11 @@ struct InputFdAttachmentResult {
     InputFdAttachmentStatus status = InputFdAttachmentStatus::InvalidArgument;
     local::FdHandoffResult handoff{};
     InputFd fd{};
+    // The exact sidecar-incarnation/key/request tuple against which an
+    // accepted compiler cursor was authorized.  The daemon retains this
+    // observation independently of the transferred descriptor so teardown
+    // can close the logical InputRecord lease on the same owner.
+    std::optional<InputFdRequest> lease;
 };
 
 // A service instance is used on the P50 endpoint owner thread.  The callback
@@ -132,5 +140,14 @@ public:
         const local::CredentialExpectation& expected_peer,
         std::chrono::steady_clock::time_point deadline) noexcept;
 };
+
+#if defined(ICECC_P50_INPUT_FD_ATTACHMENT_TEST_HOOKS)
+// Test-only progress seam used to prove the absolute deadline is checked
+// during, not merely around, chunked materialization. Production objects do
+// not declare or emit this symbol.
+using InputMaterializationProgressTestHook = void (*)() noexcept;
+void test_set_input_materialization_progress_hook(
+    InputMaterializationProgressTestHook hook) noexcept;
+#endif
 
 }  // namespace icecc::p50

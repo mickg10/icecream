@@ -397,8 +397,50 @@ int main()
     saturation.shutdown();
     saturation_guard.adapter = nullptr;
 
+    // Exhausting the per-incarnation lifecycle operation namespace cannot
+    // drop a close against a still-live store.  The exact sidecar is destroyed
+    // synchronously, its public snapshot becomes absent immediately, and the
+    // next poll publishes the ordered absent->replacement-present edge.
+    auto lifecycle_config = config;
+    lifecycle_config.generation = 8;
+    icecc::p50::daemon::DaemonSidecarAdapter lifecycle(lifecycle_config);
+    AdapterGuard lifecycle_guard{&lifecycle};
+    lifecycle.observe_public_listener(true, lifecycle_config.public_listener_port);
+    if (!lifecycle.start(&update))
+        return 38;
+    const std::string lifecycle_path = lifecycle.socket_path();
+    const std::string lifecycle_directory =
+        lifecycle_path.substr(0, lifecycle_path.find_last_of('/'));
+    const icecc::p50::InputFdRequest lease{
+        {lifecycle_config.generation, lifecycle.attempt()},
+        {icecc::p50::Id128::from_u64(0x5008), icecc::p50::TuSeq{8}},
+        {8001, 8002, 8003}, 8003};
+    lifecycle.test_force_input_lifecycle_operation(
+        std::numeric_limits<uint64_t>::max());
+    (void)lifecycle.apply_input_lifecycle(
+        lease, icecc::p50::InputLifecycleAction::CancelAttempt);
+    const icecc::p50::InputLifecycleResult exhausted =
+        lifecycle.apply_input_lifecycle(
+            lease, icecc::p50::InputLifecycleAction::CancelJob);
+    if (exhausted.status != icecc::p50::InputLifecycleStatus::StoreReplaced ||
+        lifecycle.state() != icecc::p50::daemon::AdapterState::Absent ||
+        lifecycle.last_error() !=
+            icecc::p50::daemon::AdapterError::InputLifecycleOperationExhausted ||
+        lifecycle.supervisor() != nullptr ||
+        !lifecycle.advertisement_snapshot().absent() ||
+        lifecycle.pending_input_lifecycle_count() != 0 ||
+        ::access(lifecycle_path.c_str(), F_OK) == 0 ||
+        ::access(lifecycle_directory.c_str(), F_OK) == 0)
+        return 39;
+    if (!lifecycle.poll(&update) || update.count != 2 ||
+        !update.transitions[0].absent() ||
+        !update.transitions[1].present())
+        return 40;
+    lifecycle.shutdown();
+    lifecycle_guard.adapter = nullptr;
+
     if (::rmdir(directory) != 0)
-        return 37;
+        return 41;
     directory_guard.path = nullptr;
     std::puts("p50 daemon sidecar adapter: ok");
     return 0;
