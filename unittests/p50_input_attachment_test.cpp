@@ -154,6 +154,8 @@ void test_commit_ready_ack_replay_and_reclaim() {
     core.collect_garbage();
     require(core.record_count() == 0 && core.retained_bytes() == 0,
             "closed input was not reclaimed after cursor release");
+    require(core.owner_count() == 0,
+            "already-observed committed owner was not reclaimed");
 }
 
 void test_owner_replacement_and_stale_identity() {
@@ -191,6 +193,40 @@ void test_owner_replacement_and_stale_identity() {
     core.cancel(replacement, key);
 }
 
+void test_replacement_before_commit_publishes_ready() {
+    const CStoreGuid guid = Id128::from_u64(20);
+    const InputRecordKey key{guid, TuSeq{20}};
+    const InputAttempt first{2001, 1};
+    const InputAttempt replacement{2001, 2};
+    const std::vector<uint8_t> input = bytes(48, 20);
+    const ExactTransaction tx = transaction_for(key.tu_seq, input);
+    InputAttachmentCore core(2, 4096, 2);
+
+    core.retry(first, replacement.attempt_id, key);
+    require(core.owner_count() == 1 && core.record_count() == 0,
+            "pre-commit replacement created bytes or duplicate owners");
+    require_throws<std::logic_error>(
+        [&] { (void)core.commit_open(first, guid, tx.begin, tx.commit, input); },
+        "replaced attempt committed input after ownership moved");
+    require(core.commit_open(replacement, guid, tx.begin, tx.commit, input) ==
+                InputPublishResult::Published,
+            "replacement-before-commit did not publish exact input");
+    require(core.pending_ready_count() == 1,
+            "replacement-before-commit retained compiler-invisible bytes");
+    const InputAttachmentRequest request{key, replacement, 201};
+    const InputAttachmentReply reply = core.request(request);
+    require(reply.status == InputAttachmentStatus::Ready && reply.event_id != 0,
+            "replacement-before-commit did not publish canonical Ready");
+    InputCursor cursor = core.attach(request, reply);
+    require(drain(cursor) == input,
+            "replacement-before-commit cursor lost exact bytes");
+    core.cancel(replacement, key);
+    cursor = InputCursor{};
+    core.collect_garbage();
+    require(core.owner_count() == 0,
+            "replacement-before-commit owner did not reclaim");
+}
+
 void test_closed_before_commit_and_table_exhaustion() {
     const CStoreGuid guid = Id128::from_u64(3);
     const InputAttempt owner{303, 1};
@@ -204,6 +240,8 @@ void test_closed_before_commit_and_table_exhaustion() {
             "closed-before-commit retained input or emitted ready");
     require(core.pending_ready_count() == 0 && core.record_count() == 0,
             "closed-before-commit changed attachment state");
+    require(core.owner_count() == 0,
+            "observed cancel-before-commit tombstone was not reclaimed");
 
     const InputAttempt open_a{304, 1};
     const InputRecordKey key_a{guid, TuSeq{4}};
@@ -270,6 +308,14 @@ void test_same_key_conflict_and_duplicate_attachment() {
                                    conflicting_tx.commit, conflicting);
         },
         "same key accepted different exact bytes");
+    const ExactTransaction metadata_conflict =
+        transaction_for(key.tu_seq, input, RelSeq{9});
+    require_throws<std::logic_error>(
+        [&] {
+            (void)core.commit_open(owner, guid, metadata_conflict.begin,
+                                   metadata_conflict.commit, input);
+        },
+        "same key and bytes accepted different transaction metadata");
 
     const InputAttachmentRequest first{key, owner, 81};
     const InputAttachmentReply first_reply = core.request(first);
@@ -369,7 +415,8 @@ void test_ack_pruning_and_owner_bound() {
     core.cancel(owner, key);
     cursor = InputCursor{};
     core.collect_garbage();
-    core.release_closed_owner(owner, key);
+    require(core.owner_count() == 0,
+            "committed closed owner required a redundant explicit release");
 
     const InputAttempt closed_a{1002, 1};
     const InputAttempt closed_b{1003, 1};
@@ -383,6 +430,70 @@ void test_ack_pruning_and_owner_bound() {
         "owner table exceeded its explicit bound");
     core.release_closed_owner(closed_a, key_a);
     core.cancel({1004, 1}, {guid, TuSeq{15}});
+}
+
+void test_cross_request_ack_prunes_all_observations() {
+    const CStoreGuid guid = Id128::from_u64(21);
+    const InputAttempt owner{2101, 1};
+    const InputRecordKey key{guid, TuSeq{21}};
+    const std::vector<uint8_t> input = bytes(40, 21);
+    const ExactTransaction tx = transaction_for(key.tu_seq, input);
+    InputAttachmentCore core(2, 4096, 2, 2);
+    (void)core.commit_open(owner, guid, tx.begin, tx.commit, input);
+
+    const InputAttachmentRequest first{key, owner, 211};
+    const InputAttachmentRequest second{key, owner, 212};
+    const InputAttachmentReply first_reply = core.request(first);
+    const InputAttachmentReply second_reply = core.request(second);
+    require(first_reply.event_id == second_reply.event_id &&
+                core.replay_entry_count() == 2,
+            "two request observations did not fill the replay table");
+    require(core.acknowledge(second, second_reply) ==
+                InputAttachmentAckResult::Accepted,
+            "noncanonical exact request ACK was rejected");
+    require(core.request(first).acknowledged,
+            "one event ACK did not update its older canonical observation");
+
+    const InputAttachmentRequest third{key, owner, 213};
+    const InputAttachmentReply third_reply = core.request(third);
+    require(third_reply.status == InputAttachmentStatus::ReadyReplay &&
+                core.replay_entry_count() == 1,
+            "ACKed observations were not pruned before the next request");
+    InputCursor cursor = core.attach(first, core.request(first));
+    require(drain(cursor) == input,
+            "pruning invalidated canonical late attachment authorization");
+    core.cancel(owner, key);
+}
+
+void test_unknown_closed_callbacks_do_not_create_owners() {
+    const CStoreGuid guid = Id128::from_u64(22);
+    const InputAttempt owner{2201, 1};
+    const InputRecordKey key{guid, TuSeq{22}};
+    const std::vector<uint8_t> input = bytes(24, 22);
+    const ExactTransaction tx = transaction_for(key.tu_seq, input);
+    InputAttachmentCore core(2, 4096, 2, 2, 1);
+
+    require_throws<std::out_of_range>(
+        [&] {
+            (void)core.observe_closed_commit(owner, guid, tx.begin,
+                                             tx.commit, input);
+        },
+        "unknown closed commit callback was accepted");
+    require(core.owner_count() == 0,
+            "unknown closed commit callback poisoned owner capacity");
+    require_throws<std::out_of_range>(
+        [&] { core.release_closed_owner(owner, key); },
+        "unknown closed owner release was accepted");
+    require(core.owner_count() == 0,
+            "unknown release callback poisoned owner capacity");
+
+    const InputAttempt valid{2202, 1};
+    core.cancel(valid, key);
+    require(core.owner_count() == 1,
+            "invalid callbacks exhausted the bounded owner table");
+    core.release_closed_owner(valid, key);
+    require(core.owner_count() == 0,
+            "valid closed owner did not release after invalid callbacks");
 }
 
 void test_generation_and_late_closed_commit() {
@@ -484,11 +595,14 @@ void test_transactional_failure_seams_and_event_overflow() {
 int main() {
     test_commit_ready_ack_replay_and_reclaim();
     test_owner_replacement_and_stale_identity();
+    test_replacement_before_commit_publishes_ready();
     test_closed_before_commit_and_table_exhaustion();
     test_wrong_guid_tu_owner_and_perturbation();
     test_same_key_conflict_and_duplicate_attachment();
     test_cancel_and_replacement_replay_recovery();
     test_ack_pruning_and_owner_bound();
+    test_cross_request_ack_prunes_all_observations();
+    test_unknown_closed_callbacks_do_not_create_owners();
     test_generation_and_late_closed_commit();
 #ifdef P50_ATTACHMENT_TEST_SEAMS
     test_transactional_failure_seams_and_event_overflow();

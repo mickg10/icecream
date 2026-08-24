@@ -98,6 +98,17 @@ InputAttachmentCore::Lifecycle& InputAttachmentCore::owner_for(
     return inserted_position->second;
 }
 
+InputAttachmentCore::Lifecycle& InputAttachmentCore::existing_owner_for(
+    InputRecordKey key, InputAttempt owner) {
+    require_generation(owner);
+    const auto position = lifecycles_.find(key);
+    if (position == lifecycles_.end())
+        throw std::out_of_range("attachment named no logical job");
+    if (position->second.logical_job != owner.logical_job)
+        throw std::logic_error("attachment named another logical job");
+    return position->second;
+}
+
 const InputAttachmentCore::Lifecycle& InputAttachmentCore::owner_for(
     InputRecordKey key, InputAttempt owner) const {
     require_generation(owner);
@@ -135,13 +146,46 @@ InputPublishResult InputAttachmentCore::commit_open(
                 "InputRecord key is owned by another logical job");
         if (state.current_attempt != owner.attempt_id)
             throw std::logic_error("stale attempt cannot commit InputRecord");
-        if (state.closed)
-            return records_.observe_closed_job_commit(
-                c_store_guid, begin, commit, exact_input);
-        // InputRecordStore validates exact identity before accepting an
-        // existing duplicate; no attachment state changes on failure.
-        return records_.publish(c_store_guid, begin, commit,
-                                std::move(exact_input));
+        if (state.closed) {
+            const InputPublishResult result =
+                records_.observe_closed_job_commit(
+                    c_store_guid, begin, commit, exact_input);
+            // This was the late commit for which the closed tombstone was
+            // retained.  Mark it observed only after exact validation, then
+            // release a record-free owner immediately.
+            state.closed_commit_observed = true;
+            collect_lifecycles();
+            return result;
+        }
+        if (state.ready) {
+            // InputRecordStore validates exact identity before accepting an
+            // existing duplicate; no attachment state changes on failure.
+            return records_.publish(c_store_guid, begin, commit,
+                                    std::move(exact_input));
+        }
+
+        // Attempt replacement may legitimately precede the route commit.  In
+        // that case owner_for() already created the canonical lifecycle but
+        // no record/Ready event exists yet.  Publication must complete the
+        // same transaction as a first commit rather than silently retaining
+        // compiler-invisible bytes.
+        if (records_.contains(key))
+            throw std::logic_error(
+                "InputRecord exists without its canonical Ready event");
+        if (next_event_id_ == 0)
+            throw std::overflow_error("input-ready event ID exhausted");
+        if (!can_admit_ready())
+            throw std::length_error("pending input-ready table exhausted");
+        const InputPublishResult result = records_.publish(
+            c_store_guid, begin, commit, std::move(exact_input));
+        if (result != InputPublishResult::Published)
+            throw std::logic_error(
+                "pre-created lifecycle unexpectedly found an InputRecord");
+        state.ready = ReadyEvent{key, next_event_id_, begin.raw_bytes,
+                                 begin.raw_digest};
+        state.ready_pending = true;
+        ++next_event_id_;
+        return result;
     }
 
     if (next_event_id_ == 0)
@@ -304,9 +348,15 @@ InputAttachmentAckResult InputAttachmentCore::acknowledge(
         return InputAttachmentAckResult::Rejected;
 
     state.attachment_reply.acknowledged = true;
-    if (stored != replies_.end()) {
-        stored->second.acknowledged = true;
-        stored->second.reply.acknowledged = true;
+    // Every request for the current key observes the same canonical event.
+    // Once any exact reply is ACKed, mark all of those bounded observations
+    // acknowledged so pruning cannot strand an older request ID forever.
+    for (auto& position : replies_) {
+        if (position.first.key == request.key &&
+            position.second.reply.event_id == reply.event_id) {
+            position.second.acknowledged = true;
+            position.second.reply.acknowledged = true;
+        }
     }
     if (reply.status == InputAttachmentStatus::Ready)
         state.ready_pending = false;
@@ -351,8 +401,13 @@ void InputAttachmentCore::cancel(InputAttempt owner, InputRecordKey key) {
     state.closed = true;
     state.ready_pending = false;
     purge_replies(key);
-    if (records_.contains(key))
+    if (records_.contains(key)) {
+        // A retained record proves its route commit was already observed;
+        // after cursor-backed record reclamation no additional tombstone is
+        // needed for this owner.
+        state.closed_commit_observed = true;
         records_.close_job(key);
+    }
 }
 
 void InputAttachmentCore::replace_attempt(InputAttempt old_owner,
@@ -398,7 +453,7 @@ InputPublishResult InputAttachmentCore::observe_closed_commit(
     require_generation(owner);
     const InputRecordKey key{c_store_guid, begin.tu_seq};
     validate_key(key);
-    Lifecycle& state = owner_for(key, owner);
+    Lifecycle& state = existing_owner_for(key, owner);
     if (state.current_attempt != owner.attempt_id)
         throw std::logic_error("stale attempt cannot observe closed commit");
     if (!state.closed)
@@ -414,7 +469,7 @@ void InputAttachmentCore::release_closed_owner(InputAttempt owner,
                                                 InputRecordKey key) {
     validate_attempt(owner);
     validate_key(key);
-    Lifecycle& state = owner_for(key, owner);
+    Lifecycle& state = existing_owner_for(key, owner);
     if (state.current_attempt != owner.attempt_id || !state.closed)
         throw std::logic_error("only the current closed owner can be released");
     if (records_.contains(key))

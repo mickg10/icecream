@@ -4,22 +4,24 @@
 set -eu
 
 root=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
-build=${TMPDIR:-/tmp}/icecc-p50-input-attachment-sanitize
-rm -rf "$build"
-mkdir -p "$build"
+build=$(mktemp -d "${TMPDIR:-/tmp}/icecc-p50-input-attachment-sanitize.XXXXXX")
+trap 'rm -rf "$build"' EXIT HUP INT TERM
 
-: "${CXX:=g++}"
-flags="-std=c++23 -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined,leak -DP50_ATTACHMENT_TEST_SEAMS"
-XXHASH_CFLAGS=${XXHASH_CFLAGS:-}
-XXHASH_LIBS=${XXHASH_LIBS:--lxxhash}
-libs="-lzstd $XXHASH_LIBS"
-"$CXX" $flags -I"$root" -I"$root/services" \
-    $XXHASH_CFLAGS \
+cxx=${CXX:-${ICECC_TEST_CXX:-g++}}
+standard=${ICECC_TEST_CXX_STANDARD_FLAG:--std=c++23}
+cppflags=${ICECC_TEST_CPPFLAGS:-}
+ldflags=${ICECC_TEST_LDFLAGS:-}
+xxhash_cflags=${XXHASH_CFLAGS:-${ICECC_TEST_XXHASH_CFLAGS:-}}
+xxhash_libs=${XXHASH_LIBS:-${ICECC_TEST_XXHASH_LIBS:--lxxhash}}
+zstd_libs=${ICECC_TEST_LIBZSTD_LIBS:--lzstd}
+"$cxx" "$standard" -O1 -g -fno-omit-frame-pointer \
+    -fsanitize=address,undefined,leak -DP50_ATTACHMENT_TEST_SEAMS \
+    $cppflags $xxhash_cflags -I"$root" -I"$root/services" \
     "$root/unittests/p50_input_attachment_test.cpp" \
     "$root/cache/p50_input_attachment.cpp" \
     "$root/cache/p50_input_record.cpp" \
     "$root/cache/protocol50.cpp" "$root/services/digest128.cpp" \
-    -o "$build/p50_input_attachment_test" $libs
+    $ldflags -o "$build/p50_input_attachment_test" $zstd_libs $xxhash_libs
 ASAN_OPTIONS=${ASAN_OPTIONS:-detect_leaks=1:halt_on_error=1} \
 UBSAN_OPTIONS=${UBSAN_OPTIONS:-halt_on_error=1} \
     "$build/p50_input_attachment_test"

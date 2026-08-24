@@ -22,7 +22,9 @@ transport seams.
 * Replacement changes only the current attempt owner. It neither republishes
   input nor emits another ready event. Requests, ACKs, and attachments from
   the old attempt are stale and cannot affect the replacement; stale replay
-  observations are purged so a retry cannot exhaust the bounded table.
+  observations are purged so a retry cannot exhaust the bounded table. If
+  replacement precedes the route commit, the replacement owner's later exact
+  commit atomically installs both the record and its one Ready event.
 * `attach()` delegates to `InputRecordStore::attach()`, yielding one
   independent byte-zero cursor per logical attempt. A second attach for that
   attempt is rejected. Closing/cancelling blocks new attachments but does not
@@ -33,6 +35,12 @@ transport seams.
   validation, capacity, allocation, and event-ID failures cannot leave a
   partially retained record or owner. Closed owner tombstones remain until a
   late commit is observed or the route owner explicitly releases them.
+  Unknown closed-commit/release callbacks never create tombstones. ACKing any
+  exact request for an event marks all bounded observations of that event
+  prunable, preventing an older request ID from pinning replay capacity.
+* An existing `(C_STORE_GUID,TU_SEQ)` must match the complete canonical
+  `TxBegin` and `TxCommit`, not only raw bytes/digest. Identical source bytes
+  with different route/profile/transaction metadata are a fatal key conflict.
 * `clear()` advances the store generation. Every commit, request, ACK, attach,
   cancel, and replacement carries that generation, so pre-restart callbacks
   cannot mutate a reused `(C_STORE_GUID, TU_SEQ)` key.

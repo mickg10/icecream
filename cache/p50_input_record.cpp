@@ -71,9 +71,10 @@ void InputRecordStore::validate_commit(
 }
 
 void InputRecordStore::validate_existing(
-    const Entry& entry, const TxBegin& begin,
+    const Entry& entry, const TxBegin& begin, const TxCommit& commit,
     std::span<const uint8_t> exact_input) {
-    if (entry.raw_bytes != begin.raw_bytes ||
+    if (entry.begin != begin || entry.commit != commit ||
+        entry.raw_bytes != begin.raw_bytes ||
         entry.raw_digest != begin.raw_digest ||
         !entry.backing ||
         entry.backing->size() != exact_input.size() ||
@@ -93,7 +94,7 @@ InputPublishResult InputRecordStore::publish(
     const InputRecordKey key{c_store_guid, begin.tu_seq};
     const auto existing = records_.find(key);
     if (existing != records_.end()) {
-        validate_existing(existing->second, begin, exact_input);
+        validate_existing(existing->second, begin, commit, exact_input);
         if (!existing->second.logical_job_open)
             throw std::logic_error(
                 "open logical job named an already-closed InputRecord");
@@ -109,7 +110,8 @@ InputPublishResult InputRecordStore::publish(
         std::make_shared<std::vector<uint8_t>>(std::move(exact_input));
     std::shared_ptr<const std::vector<uint8_t>> backing =
         std::move(mutable_backing);
-    Entry entry{begin.raw_bytes, begin.raw_digest, std::move(backing), true};
+    Entry entry{begin.raw_bytes, begin.raw_digest, begin, commit,
+                std::move(backing), true};
     const auto [position, inserted] = records_.emplace(key, std::move(entry));
     (void)position;
     if (!inserted)
@@ -130,7 +132,7 @@ InputPublishResult InputRecordStore::observe_closed_job_commit(
     if (existing == records_.end())
         return InputPublishResult::NotRetainedJobClosed;
 
-    validate_existing(existing->second, begin, exact_input);
+    validate_existing(existing->second, begin, commit, exact_input);
     existing->second.logical_job_open = false;
     return InputPublishResult::Existing;
 }

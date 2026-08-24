@@ -141,6 +141,8 @@ private:
     struct Entry {
         uint64_t raw_bytes = 0;
         Digest128 raw_digest{};
+        TxBegin begin{};
+        TxCommit commit{};
         std::shared_ptr<const std::vector<uint8_t>> backing;
         bool logical_job_open = true;
     };
@@ -150,6 +152,7 @@ private:
                                 std::span<const uint8_t> exact_input);
     static void validate_existing(const Entry& entry,
                                   const TxBegin& begin,
+                                  const TxCommit& commit,
                                   std::span<const uint8_t> exact_input);
 
     size_t max_records_ = 0;

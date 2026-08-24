@@ -193,6 +193,7 @@ private:
     static void validate_request(const InputAttachmentRequest& request);
     static void validate_key(InputRecordKey key);
     Lifecycle& owner_for(InputRecordKey key, InputAttempt owner);
+    Lifecycle& existing_owner_for(InputRecordKey key, InputAttempt owner);
     const Lifecycle& owner_for(InputRecordKey key,
                                InputAttempt owner) const;
     void require_current(InputRecordKey key, InputAttempt owner) const;
