@@ -28,6 +28,8 @@ gate() {
         grep -F 'FdHandoffReceiver receiver' "$file" >/dev/null &&
         grep -F 'receiver.receive_and_ack' "$file" >/dev/null &&
         grep -F 'receiver.take_adopted_fd' "$file" >/dev/null &&
+        grep -F 'pollfd descriptor{connection.native_handle(), POLLIN, 0}' "$file" >/dev/null &&
+        grep -F 'send_cache_session_ready(adopted.get(), deadline)' "$file" >/dev/null &&
         grep -F 'P50ServerEndpoint::adopt_connected_fd' "$file" >/dev/null &&
         grep -F 'endpoint_->run_adopted' "$file" >/dev/null &&
         grep -F 'busy_.test_and_set' "$file" >/dev/null &&
@@ -60,6 +62,9 @@ grep -F 'cancel_active_io' "$endpoint" "$src/cache/p50_endpoint.h" >/dev/null
 grep -F 'test_runtime_store_identity_fences_attempt' "$test_file" >/dev/null
 grep -F 'test_runtime_stop_interrupts_control_wait' "$test_file" >/dev/null
 grep -F 'test_runtime_stop_interrupts_active_endpoint' "$test_file" >/dev/null
+grep -F 'authenticated_idle_dispatcher_persists' "$test_file" >/dev/null
+grep -F 'first_ready_seen.load' "$test_file" >/dev/null
+grep -F 'second_ready_seen.load' "$test_file" >/dev/null
 grep -F 'signal_interrupts_control_wait(SIGTERM)' "$test_file" >/dev/null
 grep -F 'signal_interrupts_control_wait(SIGINT)' "$test_file" >/dev/null
 grep -F 'second_control.sender' "$test_file" >/dev/null
@@ -85,6 +90,8 @@ for pattern in \
     'endpoint_owner_thread_.join()' \
     'SidecarRuntime::run_endpoint_on_owner' \
     'run_endpoint_on_owner(dispatch_fd' \
+    'pollfd descriptor{connection.native_handle(), POLLIN, 0}' \
+    'send_cache_session_ready(adopted.get(), deadline)' \
     'context_.run()'; do
     mutant="$mutant_dir/mutant.cpp"
     awk -v needle="$pattern" 'index($0, needle) == 0' "$impl" >"$mutant"

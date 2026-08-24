@@ -4,8 +4,8 @@
 continues to own the public TCP listener and transfers one clean-boundary
 cache-session descriptor over the private authenticated AF_UNIX relationship.
 The service does not create a public listener and does not own login or
-advertisement state; public advertisement remains `0/0/0` in this mechanism
-slice.
+advertisement state.  The daemon adapter alone projects either the fully
+validated public endpoint or `0/0/0` from the supervised service state.
 
 ## Invocation
 
@@ -55,13 +55,24 @@ means an authenticated idle dispatcher or one active CacheWire session cannot
 consume the slot needed by a compiler-input attachment; excess connections
 are closed. Each connection must pass peer-credential verification and one
 exact `Hello` from `Daemon` with the configured nonzero generation and attempt;
-the service returns one `HelloAck` from `Sidecar`. The next frame must be an
-exact, versioned `Data` operation envelope. `CacheSession` admits exactly one
+the service returns one `HelloAck` from `Sidecar`.  That authenticated
+relationship may remain idle for its daemon-owned lifetime; idleness is not an
+operation timeout, and a stop-cancellable non-consuming poll preserves frame
+boundaries.  Once readable, the next frame and handoff share a fresh bounded
+operation budget and must be an exact, versioned `Data` operation envelope.
+`CacheSession` admits exactly one
 handoff for its nonzero request id; `InputFdAttachment` resolves the committed
 record and then admits one compiler FD handoff. Wrong operation, identity,
 attempt, request id, missing or extra descriptors, truncation, trailing data,
 disconnect, timeout, adoption failure, and shutdown are fail-closed and close
 all owned descriptors.
+
+After accepting the CacheSession descriptor through SCM_RIGHTS, the service
+writes the exact raw network-order token `50 f0 00 01` on that descriptor
+before starting `P50ServerEndpoint::run_adopted`.  This socket token is distinct
+from the process-launch `READY\n` pipe message above: it proves sidecar
+ownership to C, carries no identity, shares the operation deadline, and any
+send failure closes without starting CacheWire.
 
 After one adopted dialogue returns, the same `SidecarRuntime` may process the
 next authenticated control connection and request id. Endpoint session leases,
@@ -71,8 +82,9 @@ state owner.
 
 The generic `p50_fd_handoff` helper remains a separate ownership primitive. It
 does not know the ordinary-link codec, create a listener, or advertise an
-endpoint. This S2 mechanism slice contains no daemon integration, nonzero
-advertisement, or production login transition.
+endpoint.  Production daemon integration and advertisement remain outside
+this service in `DaemonSidecarAdapter`; this process owns only authenticated
+control, descriptor adoption, CacheWire reduction, and compiler-input lookup.
 
 Shutdown compares the open listener's `fstat` device/inode with the pathname's
 `lstat` device/inode before unlinking. A replacement node is never removed.

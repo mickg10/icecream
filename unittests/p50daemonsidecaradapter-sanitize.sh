@@ -25,8 +25,11 @@ trap 'rm -f "$out"' EXIT HUP INT TERM
     "$top_src/cache/p50_local_transport.cpp" \
     "$top_src/cache/p50_sidecar_supervisor.cpp" \
     "$top_src/cache/p50_ready_advertisement.cpp" \
+    "$top_build/cache/libp50inputfd.a" \
+    "$top_build/cache/libprotocol50.a" \
     "$top_build/services/.libs/libicecc.a" -llzo2 \
-    ${ICECC_TEST_LIBZSTD_LIBS:--lzstd} ${ICECC_TEST_LDFLAGS:-} \
+    ${ICECC_TEST_LIBZSTD_LIBS:--lzstd} \
+    ${ICECC_TEST_XXHASH_LIBS:--lxxhash} ${ICECC_TEST_LDFLAGS:-} \
     -o "$out"
 
 ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \

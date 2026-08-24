@@ -21,6 +21,8 @@ require_count() {
 
 require_count 1 'CACHE_SESSION = 0x50f00000' services/comm.h \
     'collision-resistant Protocol-50 discriminator is present'
+require_count 1 'CACHE_SESSION_READY_MAGIC = UINT32_C(0x50f00001)' services/comm.h \
+    'fixed raw sidecar-ownership READY token is present'
 require_count 1 'if (protocol == PROTOCOL_VERSION) {' services/comm.cpp \
     'decoder admits CACHE_SESSION only at exactly Protocol 50'
 require_count 1 'return negotiated_protocol == PROTOCOL_VERSION;' services/comm.h \
@@ -31,14 +33,24 @@ require_count 1 'if (!cache_session_release_armed || fd < 0 || protocol != PROTO
     services/comm.cpp 'release is message-specific and exact-protocol gated'
 require_count 1 '|| inofs != intogo || msgtogo != 0 || !pending_frame_ends.empty()) {' \
     services/comm.cpp 'buffered input and pending output barriers are explicit'
-require_count 1 'const int released_fd = fd;' services/comm.cpp \
-    'ownership is captured before transfer'
+require_count 2 'const int released_fd = fd;' services/comm.cpp \
+    'ownership is captured before both directional transfers'
 require_count 1 'const ssize_t result = recv(fd, &byte, sizeof(byte), MSG_PEEK | MSG_DONTWAIT);' \
     services/comm.cpp 'kernel-queued input is checked without consumption'
-require_count 2 '    fd = -1;' services/comm.cpp \
-    'ownership is cleared after transfer so the destructor cannot close it'
+require_count 3 '    fd = -1;' services/comm.cpp \
+    'destructor and both transfers clear descriptor ownership explicitly'
 require_count 4 'cache_session_release_armed = false;' services/comm.cpp \
     'construction, parser use, transfer, and outbound send clear the one-shot arm'
+require_count 1 'const uint32_t ready = htonl(CACHE_SESSION_READY_MAGIC);' services/comm.cpp \
+    'sidecar READY is encoded in exact network order'
+require_count 1 'ntohl(ready) != CACHE_SESSION_READY_MAGIC' services/comm.cpp \
+    'client validates the exact READY fixture before release'
+require_count 1 'const bool armed = cache_session_send_release_armed;' services/comm.cpp \
+    'client consumes the one-shot send arm on every READY attempt'
+require_count 1 'release_fd_after_cache_session_ready(deadline)' client/remote.cpp \
+    'production client waits for sidecar ownership before CacheWire'
+require_count 1 'send_cache_session_ready(adopted.get(), deadline)' \
+    cache/p50_cache_service.cpp 'production sidecar publishes READY on the adopted descriptor'
 
 if grep -n 'CACHE_SESSION.*[Pp]ayload\|C_GUID' "$src/services/comm.h" \
         | grep -v 'CacheWire' >/dev/null 2>&1; then

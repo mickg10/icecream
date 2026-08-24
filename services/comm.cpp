@@ -43,7 +43,9 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string>
+#include <chrono>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <utility>
 #include <assert.h>
@@ -982,6 +984,74 @@ static bool connect_async(int remote_fd, struct sockaddr *remote_addr, size_t re
     return true;
 }
 
+static int poll_milliseconds_until(
+    std::chrono::steady_clock::time_point deadline)
+{
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline)
+        return 0;
+    const auto remaining = deadline - now;
+    auto milliseconds =
+        std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
+    if (milliseconds < remaining)
+        ++milliseconds;
+    if (milliseconds.count() > std::numeric_limits<int>::max())
+        return std::numeric_limits<int>::max();
+    return std::max(1, static_cast<int>(milliseconds.count()));
+}
+
+static bool connect_until(int remote_fd, struct sockaddr *remote_addr,
+                          size_t remote_size,
+                          std::chrono::steady_clock::time_point deadline)
+{
+    const int original_flags = fcntl(remote_fd, F_GETFL);
+    if (original_flags < 0 ||
+        fcntl(remote_fd, F_SETFL, original_flags | O_NONBLOCK) < 0) {
+        (void)close(remote_fd);
+        return false;
+    }
+
+    int status = connect(remote_fd, remote_addr, remote_size);
+    if (status < 0 && errno != EINPROGRESS && errno != EAGAIN) {
+        (void)close(remote_fd);
+        return false;
+    }
+
+    while (status < 0) {
+        const int timeout = poll_milliseconds_until(deadline);
+        if (timeout == 0) {
+            (void)close(remote_fd);
+            return false;
+        }
+        pollfd descriptor{remote_fd, POLLOUT, 0};
+        const int ready = poll(&descriptor, 1, timeout);
+        if (ready < 0 && errno == EINTR)
+            continue;
+        if (ready <= 0 ||
+            (descriptor.revents & (POLLOUT | POLLERR | POLLHUP)) == 0) {
+            (void)close(remote_fd);
+            return false;
+        }
+        int socket_error = 0;
+        socklen_t socket_error_size = sizeof(socket_error);
+        if (getsockopt(remote_fd, SOL_SOCKET, SO_ERROR, &socket_error,
+                       &socket_error_size) != 0 || socket_error != 0) {
+            if (socket_error != 0)
+                errno = socket_error;
+            (void)close(remote_fd);
+            return false;
+        }
+        status = 0;
+    }
+
+    if (std::chrono::steady_clock::now() >= deadline ||
+        fcntl(remote_fd, F_SETFL, original_flags) < 0) {
+        (void)close(remote_fd);
+        return false;
+    }
+    return true;
+}
+
 MsgChannel *Service::createChannel(const string &hostname, unsigned short p, int timeout)
 {
     int remote_fd;
@@ -1011,6 +1081,30 @@ MsgChannel *Service::createChannel(const string &hostname, unsigned short p, int
 
     trace() << "connected to " << hostname << endl;
     return createChannel(remote_fd, (struct sockaddr *)&remote_addr, sizeof(remote_addr));
+}
+
+MsgChannel *Service::createChannelUntil(
+    const string &hostname, unsigned short p,
+    std::chrono::steady_clock::time_point deadline)
+{
+    int remote_fd;
+    struct sockaddr_in remote_addr;
+    if (std::chrono::steady_clock::now() >= deadline ||
+        (remote_fd = prepare_connect(hostname, p, remote_addr)) < 0)
+        return nullptr;
+    if (std::chrono::steady_clock::now() >= deadline ||
+        !connect_until(remote_fd, reinterpret_cast<struct sockaddr *>(&remote_addr),
+                       sizeof(remote_addr), deadline))
+        return nullptr;
+
+    MsgChannel *channel = new MsgChannel(
+        remote_fd, reinterpret_cast<struct sockaddr *>(&remote_addr),
+        sizeof(remote_addr), false);
+    if (!channel->wait_for_protocol_until(deadline)) {
+        delete channel;
+        channel = nullptr;
+    }
+    return channel;
 }
 
 MsgChannel *Service::createChannel(const string &socket_path)
@@ -1258,6 +1352,33 @@ bool MsgChannel::wait_for_protocol()
     }
 
     return true;
+}
+
+bool MsgChannel::wait_for_protocol_until(
+    std::chrono::steady_clock::time_point deadline)
+{
+    if (protocol == 0 || instate == ERROR)
+        return false;
+
+    while (instate == NEED_PROTO) {
+        const int timeout = poll_milliseconds_until(deadline);
+        if (timeout == 0) {
+            set_error(true);
+            return false;
+        }
+        pollfd descriptor{fd, POLLIN, 0};
+        const int ready = poll(&descriptor, 1, timeout);
+        if (ready < 0 && errno == EINTR)
+            continue;
+        if (ready <= 0 ||
+            (descriptor.revents & (POLLIN | POLLERR | POLLHUP)) == 0) {
+            set_error(true);
+            return false;
+        }
+        if (!read_a_bit() || eof)
+            return false;
+    }
+    return std::chrono::steady_clock::now() < deadline;
 }
 
 void MsgChannel::setBulkTransfer()
@@ -1568,24 +1689,113 @@ int MsgChannel::release_fd_if_input_empty()
     return released_fd;
 }
 
-int MsgChannel::release_fd_after_cache_session_send()
+bool send_cache_session_ready(
+    int fd, std::chrono::steady_clock::time_point deadline) noexcept
 {
-    if (!cache_session_send_release_armed || fd < 0 ||
-        protocol != PROTOCOL_VERSION || eof || instate == ERROR ||
-        instate != NEED_LEN || inofs != intogo || msgtogo != 0 ||
-        !pending_frame_ends.empty()) {
-        return -1;
-    }
+    if (fd < 0)
+        return false;
 
-    unsigned char byte = 0;
-    const ssize_t result = recv(fd, &byte, sizeof(byte),
+    const uint32_t ready = htonl(CACHE_SESSION_READY_MAGIC);
+    const auto *bytes = reinterpret_cast<const unsigned char *>(&ready);
+    int send_flags = MSG_DONTWAIT;
+#ifdef MSG_NOSIGNAL
+    send_flags |= MSG_NOSIGNAL;
+#endif
+    size_t offset = 0;
+    while (offset != sizeof(ready)) {
+        if (std::chrono::steady_clock::now() >= deadline)
+            return false;
+        const ssize_t result =
+            send(fd, bytes + offset, sizeof(ready) - offset, send_flags);
+        if (result > 0) {
+            offset += static_cast<size_t>(result);
+            continue;
+        }
+        if (result == 0)
+            return false;
+        if (errno == EINTR)
+            continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK)
+            return false;
+
+        const int timeout = poll_milliseconds_until(deadline);
+        if (timeout == 0)
+            return false;
+        pollfd descriptor{fd, POLLOUT, 0};
+        const int ready_count = poll(&descriptor, 1, timeout);
+        if (ready_count < 0 && errno == EINTR)
+            continue;
+        if (ready_count <= 0 ||
+            (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0 ||
+            (descriptor.revents & POLLOUT) == 0)
+            return false;
+    }
+    return std::chrono::steady_clock::now() <= deadline;
+}
+
+static bool receive_cache_session_ready(
+    int fd, std::chrono::steady_clock::time_point deadline) noexcept
+{
+    uint32_t ready = 0;
+    auto *bytes = reinterpret_cast<unsigned char *>(&ready);
+    size_t offset = 0;
+    while (offset != sizeof(ready)) {
+        if (std::chrono::steady_clock::now() >= deadline)
+            return false;
+        const ssize_t result = recv(fd, bytes + offset, sizeof(ready) - offset,
+                                    MSG_DONTWAIT);
+        if (result > 0) {
+            offset += static_cast<size_t>(result);
+            continue;
+        }
+        if (result == 0)
+            return false;
+        if (errno == EINTR)
+            continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK)
+            return false;
+
+        const int timeout = poll_milliseconds_until(deadline);
+        if (timeout == 0)
+            return false;
+        pollfd descriptor{fd, POLLIN, 0};
+        const int ready_count = poll(&descriptor, 1, timeout);
+        if (ready_count < 0 && errno == EINTR)
+            continue;
+        if (ready_count <= 0 || (descriptor.revents & POLLNVAL) != 0 ||
+            (descriptor.revents & (POLLIN | POLLERR | POLLHUP)) == 0)
+            return false;
+    }
+    if (std::chrono::steady_clock::now() > deadline ||
+        ntohl(ready) != CACHE_SESSION_READY_MAGIC)
+        return false;
+
+    /* READY is the entire F->C transition boundary.  Refuse EOF or any
+       sidecar/CacheWire byte already queued behind it. */
+    unsigned char extra = 0;
+    const ssize_t peeked = recv(fd, &extra, sizeof(extra),
                                 MSG_PEEK | MSG_DONTWAIT);
-    if (result >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+    if (peeked >= 0)
+        return false;
+    return errno == EAGAIN || errno == EWOULDBLOCK;
+}
+
+int MsgChannel::release_fd_after_cache_session_ready(
+    std::chrono::steady_clock::time_point deadline)
+{
+    /* Calling this seam is one-shot even when READY is malformed, late, or
+       absent.  A failed caller still owns the descriptor so normal teardown
+       closes it, but it can never reinterpret later bytes as a fresh READY. */
+    const bool armed = cache_session_send_release_armed;
+    cache_session_send_release_armed = false;
+    if (!armed || fd < 0 || protocol != PROTOCOL_VERSION || eof ||
+        instate == ERROR || instate != NEED_LEN || inofs != intogo ||
+        msgtogo != 0 || !pending_frame_ends.empty() ||
+        !receive_cache_session_ready(fd, deadline))
         return -1;
 
     const int released_fd = fd;
     fd = -1;
-    cache_session_send_release_armed = false;
     return released_fd;
 }
 

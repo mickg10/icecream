@@ -34,6 +34,7 @@
 #include <netinet/tcp.h>
 
 #include "job.h"
+#include <chrono>
 #include <deque>
 #include <optional>
 #include <stdint.h>
@@ -296,6 +297,16 @@ const int NODE_FEATURE_ENV_ZSTD = ( 1 << 1 );
    facing output qualifies that value as CacheWire v1. */
 const uint32_t CACHE_WIRE_PROTOCOL_V1 = 50;
 
+/* Raw four-byte transition witness sent by the F sidecar only after it has
+   accepted ownership of the detached ordinary socket.  This is not an
+   ordinary framed message and carries no CacheWire identity. */
+inline constexpr uint32_t CACHE_SESSION_READY_MAGIC = UINT32_C(0x50f00001);
+
+/* Send the exact network-order CACHE_SESSION_READY_MAGIC under one absolute
+   steady-clock deadline.  The caller retains descriptor ownership. */
+bool send_cache_session_ready(
+    int fd, std::chrono::steady_clock::time_point deadline) noexcept;
+
 /* Stable CacheWire profile bits.  P29/ZSTD_TU/GRZ are existing protocol
    labels.  Z3_LONG and Z3_SHARED_LONG reserve the two simple streaming
    profiles without making either codec implemented or negotiable. */
@@ -413,10 +424,12 @@ public:
        return -1 without reading or dropping input. */
     int release_fd_if_input_empty();
 
-    /* Transfer a client-side descriptor only after a successfully flushed
-       Protocol-50 CACHE_SESSION send at an otherwise idle ordinary boundary.
-       This is the mirror ownership seam used before CacheWire starts. */
-    int release_fd_after_cache_session_send();
+    /* After a successfully flushed Protocol-50 CACHE_SESSION, wait under the
+       caller's unchanged absolute deadline for the exact raw sidecar READY
+       witness.  Only then transfer the client descriptor.  Every call consumes
+       the one-shot send arm, including refusal and timeout paths. */
+    int release_fd_after_cache_session_ready(
+        std::chrono::steady_clock::time_point deadline);
 
     /* Bytes which remain inside the frame currently being decoded.  This is
        deliberately frame-bounded rather than based on buffered input: a
@@ -552,6 +565,8 @@ protected:
     MsgChannel(int _fd, struct sockaddr *, socklen_t, bool text = false);
 
     bool wait_for_protocol();
+    bool wait_for_protocol_until(
+        std::chrono::steady_clock::time_point deadline);
     // returns false if there was an error sending something; send_flags is a
     // combination of SendFlags bits (SendBlocking / SendDeferrable matter here)
     bool flush_writebuf(int send_flags);
@@ -617,6 +632,11 @@ class Service
 {
 public:
     static MsgChannel *createChannel(const std::string &host, unsigned short p, int timeout);
+    // Absolute-deadline variant used by the P50 CACHE_SESSION factory.  The
+    // connect and ordinary protocol negotiation share one unchanged budget.
+    static MsgChannel *createChannelUntil(
+        const std::string &host, unsigned short p,
+        std::chrono::steady_clock::time_point deadline);
     static MsgChannel *createChannel(const std::string &domain_socket);
     static MsgChannel *createChannel(int remote_fd, struct sockaddr *, socklen_t);
 };

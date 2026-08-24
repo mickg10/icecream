@@ -38,6 +38,10 @@ command -v g++ >/dev/null 2>&1 || {
     echo "SKIP: g++ is required for the C1F1 compile" >&2
     exit 77
 }
+command -v bash >/dev/null 2>&1 || {
+    echo "SKIP: bash is required for the generated icecc-create-env tool" >&2
+    exit 77
+}
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/p50compilee2e.XXXXXX")
 cleanup() {
@@ -47,14 +51,20 @@ cleanup() {
     wait "${client_pid:-}" 2>/dev/null || :
     wait "${worker_pid:-}" 2>/dev/null || :
     wait "${sched_pid:-}" 2>/dev/null || :
-    rm -rf "$work"
+    if test "${ICECC_P50_C1F1_KEEP_WORK:-0}" = 1; then
+        echo "INFO: preserving P50 C1F1 workdir $work" >&2
+    else
+        rm -rf "$work"
+    fi
 }
 trap cleanup EXIT HUP INT TERM
 
-mkdir -p "$work/envs-f" "$work/envs-c" "$work/src" "$work/out" \
-    "$work/cache-runtime-f"
+mkdir -p "$work/envs-f" "$work/envs-c" "$work/toolchain" "$work/src" "$work/out" \
+    "$work/cache-runtime-f" "$work/home"
 chmod 1777 "$work/envs-f" "$work/envs-c"
-chmod 0700 "$work/cache-runtime-f"
+chmod 0700 "$work/cache-runtime-f" "$work/home"
+HOME="$work/home"
+export HOME
 port_sched=$((22000 + ($$ % 1000)))
 port_worker=$((23000 + ($$ % 1000)))
 network="p50c1f1-$$"
@@ -67,17 +77,17 @@ printf '%s\n' \
 
 # The environment is made by the real icecc tool, then shipped to the real F
 # daemon. This is deliberately not replaced by the host compiler PATH.
-(cd "$work/envs-c" && timeout "$timeout_s" \
-    "$build/client/icecc-create-env" "$(command -v g++)" \
+(cd "$work/toolchain" && timeout "$timeout_s" \
+    bash "$build/client/icecc-create-env" "$(command -v g++)" \
     >"$work/create-env.log" 2>&1)
-envtar=$(find "$work/envs-c" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)
+envtar=$(find "$work/toolchain" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)
 test -n "$envtar" || {
     echo "FAIL: real icecc-create-env produced no compiler environment" >&2
     exit 1
 }
 
 "$build/scheduler/icecc-scheduler" -p "$port_sched" -n "$network" \
-    -l "$work/scheduler.log" -vvv &
+    --assignment-fence-mode strict-nonce -l "$work/scheduler.log" -vvv &
 sched_pid=$!
 sleep 1
 kill -0 "$sched_pid" 2>/dev/null || {
@@ -87,7 +97,7 @@ kill -0 "$sched_pid" 2>/dev/null || {
 
 # This is the only F. The daemon itself must supervise and expose the actual
 # cache service required by the P50 path; the harness never starts a fake peer.
-ICECC_VERSION="$envtar" ICECC_P50_C1F1_REQUIRED=1 \
+ICECC_TEST_SOCKET="$work/worker.sock" ICECC_P50_C1F1_REQUIRED=1 \
     "$build/daemon/iceccd" -p "$port_worker" -m 1 \
     -s "127.0.0.1:$port_sched" -n "$network" -N p50-f \
     -b "$work/envs-f" -l "$work/f.log" -vvv \
@@ -95,8 +105,7 @@ ICECC_VERSION="$envtar" ICECC_P50_C1F1_REQUIRED=1 \
     --cache-runtime-dir "$work/cache-runtime-f" &
 worker_pid=$!
 
-ICECC_TEST_SOCKET="$work/client.sock" ICECC_VERSION="$envtar" \
-    ICECC_P50_C1F1_REQUIRED=1 \
+ICECC_TEST_SOCKET="$work/client.sock" ICECC_P50_C1F1_REQUIRED=1 \
     "$build/daemon/iceccd" --no-remote -m 0 \
     -s "127.0.0.1:$port_sched" -n "$network" -N p50-c \
     -b "$work/envs-c" -l "$work/c.log" -vvv &
@@ -132,7 +141,8 @@ test -n "$service_pid" || {
 remote_obj="$work/out/remote.o"
 local_obj="$work/out/local.o"
 ICECC_TEST_SOCKET="$work/client.sock" ICECC_TEST_REMOTEBUILD=1 \
-    ICECC_P50_C1F1_REQUIRED=1 ICECC_PREFERRED_HOST=p50-f \
+    ICECC_VERSION="$envtar" ICECC_P50_C1F1_REQUIRED=1 \
+    ICECC_PREFERRED_HOST=p50-f \
     ICECC_DEBUG=debug ICECC_LOGFILE="$work/client-compile.log" \
     timeout "$timeout_s" "$build/client/icecc" g++ -std=c++17 -O2 -c \
     "$work/src/main.cpp" -o "$remote_obj"
@@ -144,16 +154,18 @@ cmp -s "$remote_obj" "$local_obj" || {
 }
 
 # Positive evidence is mandatory. Absence of a local marker is not enough:
-# the route must identify ZSTD_TU and cache-session handoff, and may not report
-# legacy FileChunk output on either side.
+# the route must identify ZSTD_TU and cache-session handoff.  Legacy FileChunk
+# remains correct for environment upload and object return, so the negative
+# evidence below is deliberately limited to the source-stream and local/client
+# fallback markers.
 grep -E 'ZSTD_TU|CACHE_SESSION' "$work/client-compile.log" "$work/c.log" \
     "$work/f.log" >/dev/null || {
     echo "FAIL: no positive ZSTD_TU/CACHE_SESSION wire evidence" >&2
     exit 1
 }
-if grep -E 'FileChunkMsg|legacy.*chunk|building myself|local build forced' \
+if grep -E 'write_fd_to_server from cpp|write_fd_to_server preprocessed|building myself|building_local|local build forced|client_exception|fallback_local' \
     "$work/client-compile.log" "$work/c.log" "$work/f.log" >/dev/null 2>&1; then
-    echo "FAIL: compile path used legacy FileChunk/local fallback" >&2
+    echo "FAIL: compile path used legacy source streaming or local/client fallback" >&2
     exit 1
 fi
 

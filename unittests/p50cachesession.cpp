@@ -9,6 +9,7 @@
 
 #include <array>
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -62,6 +63,8 @@ using Bytes = std::vector<unsigned char>;
 
 static constexpr std::array<unsigned char, 8> kCacheSessionFixture{
     0x00, 0x00, 0x00, 0x04, 0x50, 0xf0, 0x00, 0x00};
+static constexpr std::array<unsigned char, 4> kCacheSessionReadyFixture{
+    0x50, 0xf0, 0x00, 0x01};
 static constexpr std::array<unsigned char, 8> kPingFixture{
     0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x42};
 
@@ -131,20 +134,40 @@ static void test_outbound_transfer_and_exact_once()
     const int client_fd = pair.left->fd;
     REQUIRE(pair.left->send_msg(CacheSessionMsg()),
             "client flushes the exact P50 CACHE_SESSION boundary");
-    const int released_client =
-        pair.left->release_fd_after_cache_session_send();
-    REQUIRE(released_client == client_fd && pair.left->fd == -1,
-            "flushed outbound CACHE_SESSION transfers the client descriptor");
-    REQUIRE(pair.left->release_fd_after_cache_session_send() == -1,
-            "outbound descriptor transfer is one-shot");
 
-    Msg *decoded = pair.right->get_msg(2, true);
-    REQUIRE(decoded && *decoded == Msg::CACHE_SESSION,
-            "server decodes the boundary after client ownership moved");
-    delete decoded;
-    const int released_server = pair.right->release_fd_if_input_empty();
-    REQUIRE(released_server >= 0,
-            "server independently proves its inbound clean boundary");
+    int released_server = -1;
+    bool server_decoded = false;
+    bool no_early_cachewire = false;
+    bool ready_sent = false;
+    std::thread sidecar([&] {
+        Msg *decoded = pair.right->get_msg(2, true);
+        server_decoded = decoded && *decoded == Msg::CACHE_SESSION;
+        delete decoded;
+        released_server = pair.right->release_fd_if_input_empty();
+        if (released_server < 0)
+            return;
+        unsigned char byte = 0;
+        const ssize_t early = recv(released_server, &byte, sizeof(byte),
+                                   MSG_PEEK | MSG_DONTWAIT);
+        no_early_cachewire =
+            early < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
+        ready_sent = send_cache_session_ready(
+            released_server,
+            std::chrono::steady_clock::now() + std::chrono::seconds(1));
+    });
+    const int released_client =
+        pair.left->release_fd_after_cache_session_ready(
+            std::chrono::steady_clock::now() + std::chrono::seconds(2));
+    sidecar.join();
+    REQUIRE(server_decoded && released_server >= 0 && ready_sent,
+            "F decodes, owns, and acknowledges the exact detached descriptor");
+    REQUIRE(no_early_cachewire,
+            "client emits no CacheWire byte before the sidecar READY witness");
+    REQUIRE(released_client == client_fd && pair.left->fd == -1,
+            "exact sidecar READY transfers the client descriptor");
+    REQUIRE(pair.left->release_fd_after_cache_session_ready(
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(10)) == -1,
+            "outbound descriptor transfer is one-shot");
 
     delete pair.left;
     pair.left = nullptr;
@@ -167,12 +190,14 @@ static void test_outbound_release_barriers()
         REQUIRE(pair.left->send_msg(CacheSessionMsg(), MsgChannel::SendBulkOnly),
                 "test queues an outbound CACHE_SESSION without flushing");
         const int owned = pair.left->fd;
-        REQUIRE(pair.left->release_fd_after_cache_session_send() == -1 &&
+        REQUIRE(pair.left->release_fd_after_cache_session_ready(
+                    std::chrono::steady_clock::now() + std::chrono::milliseconds(10)) == -1 &&
                     pair.left->fd == owned,
                 "queued outbound bytes never arm descriptor release");
         REQUIRE(pair.left->flush_pending(),
                 "queued outbound CACHE_SESSION can drain normally");
-        REQUIRE(pair.left->release_fd_after_cache_session_send() == -1,
+        REQUIRE(pair.left->release_fd_after_cache_session_ready(
+                    std::chrono::steady_clock::now() + std::chrono::milliseconds(10)) == -1,
                 "a later generic flush cannot resurrect the send arm");
     }
     {
@@ -181,7 +206,8 @@ static void test_outbound_release_barriers()
                 "test queues an earlier ordinary frame");
         REQUIRE(!pair.left->send_msg(CacheSessionMsg()),
                 "CACHE_SESSION is refused behind earlier queued output");
-        REQUIRE(pair.left->release_fd_after_cache_session_send() == -1,
+        REQUIRE(pair.left->release_fd_after_cache_session_ready(
+                    std::chrono::steady_clock::now() + std::chrono::milliseconds(10)) == -1,
                 "refused mixed output retains descriptor ownership");
     }
     {
@@ -190,7 +216,8 @@ static void test_outbound_release_barriers()
                 "test arms outbound release before a parser use");
         REQUIRE(pair.left->get_msg(0, true) == nullptr,
                 "a nonblocking receive attempt observes no reply");
-        REQUIRE(pair.left->release_fd_after_cache_session_send() == -1,
+        REQUIRE(pair.left->release_fd_after_cache_session_ready(
+                    std::chrono::steady_clock::now() + std::chrono::milliseconds(10)) == -1,
                 "any later receive attempt clears the outbound arm");
     }
     {
@@ -198,9 +225,152 @@ static void test_outbound_release_barriers()
         REQUIRE(pair.left->send_msg(CacheSessionMsg()),
                 "test arms outbound release before peer EOF");
         shutdown(pair.right->fd, SHUT_WR);
-        REQUIRE(pair.left->release_fd_after_cache_session_send() == -1,
+        REQUIRE(pair.left->release_fd_after_cache_session_ready(
+                    std::chrono::steady_clock::now() + std::chrono::milliseconds(100)) == -1,
                 "peer EOF blocks outbound descriptor release");
     }
+}
+
+static void test_ready_wire_and_failure_boundaries()
+{
+    {
+        int sockets[2] = {-1, -1};
+        REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0,
+                "READY fixture socketpair is available");
+        REQUIRE(send_cache_session_ready(
+                    sockets[0], std::chrono::steady_clock::now() + std::chrono::seconds(1)),
+                "sidecar sends the fixed READY transition token");
+        std::array<unsigned char, 4> observed{};
+        REQUIRE(recv(sockets[1], observed.data(), observed.size(), 0) ==
+                    static_cast<ssize_t>(observed.size()) &&
+                    observed == kCacheSessionReadyFixture,
+                "READY has the exact raw network-order wire fixture");
+        close(sockets[0]);
+        close(sockets[1]);
+    }
+    {
+        int sockets[2] = {-1, -1};
+        REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0,
+                "closed-peer READY socketpair is available");
+        close(sockets[1]);
+        REQUIRE(!send_cache_session_ready(
+                    sockets[0], std::chrono::steady_clock::now() + std::chrono::seconds(1)),
+                "READY send fails without SIGPIPE when the client is gone");
+        close(sockets[0]);
+    }
+    {
+        Pair pair = make_pair(50);
+        REQUIRE(pair.left->send_msg(CacheSessionMsg()),
+                "missing-READY row flushes CACHE_SESSION");
+        Msg *decoded = pair.right->get_msg(2, true);
+        delete decoded;
+        const int sidecar_fd = pair.right->release_fd_if_input_empty();
+        const int owned = pair.left->fd;
+        const auto started = std::chrono::steady_clock::now();
+        REQUIRE(pair.left->release_fd_after_cache_session_ready(
+                    started + std::chrono::milliseconds(30)) == -1 &&
+                    pair.left->fd == owned &&
+                    std::chrono::steady_clock::now() - started <
+                        std::chrono::milliseconds(250),
+                "missing READY fails by the unchanged absolute deadline and retains ownership");
+        REQUIRE(send_cache_session_ready(
+                    sidecar_fd,
+                    std::chrono::steady_clock::now() + std::chrono::seconds(1)),
+                "late READY can still be placed on the failed connection");
+        REQUIRE(pair.left->release_fd_after_cache_session_ready(
+                    std::chrono::steady_clock::now() + std::chrono::milliseconds(100)) == -1 &&
+                    pair.left->fd == owned,
+                "late READY cannot resurrect the consumed one-shot arm");
+        close(sidecar_fd);
+    }
+    {
+        Pair pair = make_pair(50);
+        REQUIRE(pair.left->send_msg(CacheSessionMsg()),
+                "wrong-READY row flushes CACHE_SESSION");
+        Msg *decoded = pair.right->get_msg(2, true);
+        delete decoded;
+        const int sidecar_fd = pair.right->release_fd_if_input_empty();
+        uint32_t wrong = htonl(CACHE_SESSION_READY_MAGIC ^ UINT32_C(1));
+        send_bytes(sidecar_fd,
+                   Bytes(reinterpret_cast<unsigned char *>(&wrong),
+                         reinterpret_cast<unsigned char *>(&wrong) + sizeof(wrong)));
+        const int owned = pair.left->fd;
+        REQUIRE(pair.left->release_fd_after_cache_session_ready(
+                    std::chrono::steady_clock::now() + std::chrono::seconds(1)) == -1 &&
+                    pair.left->fd == owned,
+                "wrong READY value fails closed and retains client ownership");
+        close(sidecar_fd);
+    }
+    {
+        Pair pair = make_pair(50);
+        REQUIRE(pair.left->send_msg(CacheSessionMsg()),
+                "partial-READY row flushes CACHE_SESSION");
+        Msg *decoded = pair.right->get_msg(2, true);
+        delete decoded;
+        const int sidecar_fd = pair.right->release_fd_if_input_empty();
+        send_bytes(sidecar_fd, Bytes(kCacheSessionReadyFixture.begin(),
+                                     kCacheSessionReadyFixture.begin() + 2));
+        const int owned = pair.left->fd;
+        REQUIRE(pair.left->release_fd_after_cache_session_ready(
+                    std::chrono::steady_clock::now() + std::chrono::milliseconds(30)) == -1 &&
+                    pair.left->fd == owned,
+                "partial READY is bounded, consumed once, and fails closed");
+        close(sidecar_fd);
+    }
+    {
+        Pair pair = make_pair(50);
+        REQUIRE(pair.left->send_msg(CacheSessionMsg()),
+                "READY-read-ahead row flushes CACHE_SESSION");
+        Msg *decoded = pair.right->get_msg(2, true);
+        delete decoded;
+        const int sidecar_fd = pair.right->release_fd_if_input_empty();
+        Bytes joined(kCacheSessionReadyFixture.begin(), kCacheSessionReadyFixture.end());
+        joined.push_back(0xaa);
+        send_bytes(sidecar_fd, joined);
+        const int owned = pair.left->fd;
+        REQUIRE(pair.left->release_fd_after_cache_session_ready(
+                    std::chrono::steady_clock::now() + std::chrono::seconds(1)) == -1 &&
+                    pair.left->fd == owned,
+                "a byte behind READY blocks transition into CacheWire");
+        close(sidecar_fd);
+    }
+}
+
+static void test_absolute_deadline_protocol_negotiation()
+{
+    const int listener = socket(AF_INET, SOCK_STREAM, 0);
+    if (listener < 0) std::exit(2);
+    int reuse = 1;
+    setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    if (bind(listener, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0 ||
+        listen(listener, 1) != 0)
+        std::exit(2);
+    socklen_t address_size = sizeof(address);
+    if (getsockname(listener, reinterpret_cast<sockaddr *>(&address),
+                    &address_size) != 0)
+        std::exit(2);
+
+    std::thread stalled_peer([listener] {
+        const int accepted = accept(listener, nullptr, nullptr);
+        if (accepted >= 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            close(accepted);
+        }
+        close(listener);
+    });
+    const auto started = std::chrono::steady_clock::now();
+    MsgChannel *channel = Service::createChannelUntil(
+        "127.0.0.1", ntohs(address.sin_port),
+        started + std::chrono::milliseconds(40));
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    REQUIRE(channel == nullptr && elapsed < std::chrono::milliseconds(150),
+            "absolute channel deadline bounds ordinary protocol negotiation");
+    delete channel;
+    stalled_peer.join();
 }
 
 static void test_other_message_refusal_and_arm_clear()
@@ -414,10 +584,13 @@ static void test_eof_and_pending_output_barriers()
 int main()
 {
     static_assert(Msg::CACHE_SESSION == UINT32_C(0x50f00000));
+    static_assert(CACHE_SESSION_READY_MAGIC == UINT32_C(0x50f00001));
     static_assert(Msg::PING == UINT32_C(0x00000042));
     test_successful_transfer_and_exact_once();
     test_outbound_transfer_and_exact_once();
     test_outbound_release_barriers();
+    test_ready_wire_and_failure_boundaries();
+    test_absolute_deadline_protocol_negotiation();
     test_other_message_refusal_and_arm_clear();
     test_protocol_gate_and_legacy_bytes();
     test_split_frame_reads();

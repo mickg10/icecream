@@ -5,8 +5,9 @@ noinst_LIBRARIES = libprotocol50.a libp50endpoint.a libp50localtransport.a \
 sbin_PROGRAMS = icecc-cache-service
 
 icecc_cache_service_SOURCES = p50_cache_service.cpp p50_cache_service.h
-icecc_cache_service_LDADD = libp50endpoint.a libprotocol50.a libp50localtransport.a \
-	../services/libicecc.la $(LIBZSTD_LIBS) $(BOOST_LIBS)
+icecc_cache_service_LDADD = libp50endpoint.a libp50inputfd.a libprotocol50.a \
+	libp50localtransport.a ../services/libicecc.la \
+	$(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 icecc_cache_service_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 icecc_cache_service_CXXFLAGS = -O2 -Werror -pthread
 icecc_cache_service_LDFLAGS = $(BOOST_LDFLAGS) -pthread

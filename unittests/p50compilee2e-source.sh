@@ -40,12 +40,17 @@ contract() {
     # P50 route must fail the requested test, never silently use FileChunk.
     require_text "$root/client/remote.cpp" 'ICECC_P50_C1F1_REQUIRED' || return 1
     require_text "$root/daemon/workit.cpp" 'ICECC_P50_C1F1_REQUIRED' || return 1
+    require_text "$root/client/remote.cpp" 'P50ZstdSourceSender sender' || return 1
+    require_text "$root/client/remote.cpp" 'job.setCompileInputIdentity(*identity)' || return 1
+    require_text "$root/client/Makefile.am" 'libp50zstdsender.a' || return 1
     require_text "$root/client/Makefile.am" 'libprotocol50.a' || return 1
 
     # The service and exact bounded codec are part of the executable topology,
     # rather than a fake socket peer supplied by this test.
     require_text "$root/cache/Makefile.am" 'icecc-cache-service' || return 1
-    require_text "$root/cache/p50_cache_service.cpp" 'ZstdTuDialogue' || return 1
+    require_text "$root/cache/Makefile.am" 'libp50inputfd.a' || return 1
+    require_text "$root/cache/p50_cache_service.cpp" \
+        'std::make_unique<P50ServerEndpoint>' || return 1
 }
 
 # Keep primitive P50 evidence visible in this test. These assertions prevent
@@ -83,6 +88,11 @@ for pair in \
     "daemon/workit.cpp|ZSTD_TU" \
     "client/remote.cpp|ICECC_P50_C1F1_REQUIRED" \
     "daemon/workit.cpp|ICECC_P50_C1F1_REQUIRED" \
+    "client/remote.cpp|P50ZstdSourceSender sender" \
+    "client/remote.cpp|job.setCompileInputIdentity(*identity)" \
+    "client/Makefile.am|libp50zstdsender.a" \
+    "cache/Makefile.am|libp50inputfd.a" \
+    "cache/p50_cache_service.cpp|std::make_unique<P50ServerEndpoint>" \
     "client/Makefile.am|libprotocol50.a"; do
     file=${pair%%|*}
     needle=${pair#*|}

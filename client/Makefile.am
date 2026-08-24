@@ -18,7 +18,14 @@ icecc_SOURCES = \
 	main.cpp 
 icecc_LDADD = \
 	libclient.a \
-	../services/libicecc.la
+	libp50zstdsender.a \
+	../cache/libp50endpoint.a \
+	../cache/libprotocol50.a \
+	../services/libicecc.la \
+	$(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
+icecc_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
+icecc_CXXFLAGS = -pthread
+icecc_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 
 noinst_HEADERS = \
 	argv.h \
@@ -30,6 +37,7 @@ AM_CPPFLAGS = \
 	-DPLIBDIR=\"$(pkglibexecdir)\" \
 	-I$(top_srcdir)/services \
 	-I$(top_srcdir)/
+libclient_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 
 libp50zstdsender_a_SOURCES = p50_zstd_sender.cpp p50_zstd_sender.h \
 	p50_compile_binding.cpp p50_compile_binding.h

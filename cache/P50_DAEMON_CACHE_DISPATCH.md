@@ -20,8 +20,10 @@ the HELLO/HELLO_ACK exchange itself against the constructor-bound identity.
 The caller cannot replace that identity.  Stale identity, disconnect,
 duplicate, timeout, malformed ACK, or sidecar restart therefore fails closed.
 No cache bytes are read by this adapter, no second listener is created, and
-Login advertisement remains the existing `0/0/0` until a separate reviewed
-READY integration.
+Login advertisement remains owned by the production sidecar adapter.  It is
+nonzero only while the exact supervised child, private socket inode, peer
+credentials, HELLO identity, and public-listener observation are all current;
+otherwise the daemon immediately projects `0/0/0`.
 
 After HELLO/HELLO_ACK, dispatch sends an exact version-1 `Data` operation
 envelope identifying `CacheSession`, the bound identity, and request id. Only
@@ -35,10 +37,11 @@ ACK receive uses `Connection::receive_until()` with that exact unchanged
 deadline, so a delayed ACK cannot restart the budget.  One-writer `Busy` and
 SIGPIPE protections remain in force.
 
-The positive real-daemon sidecar path is **not wired yet**.  The daemon starts
-with the controller unavailable because the lifecycle-only
-supervisor/service checkpoint intentionally does not yet expose a live
-connection to this object.  A later adapter may connect the private socket,
-verify OS peer credentials, and call `attach_authenticated()`; the method
-itself proves the current sidecar identity before retaining the relationship,
-without changing ordinary-link parsing or ownership rules.
+The positive path is wired through `DaemonSidecarAdapter`: real `iceccd`
+launches the installed service, captures its exact READY/socket identity,
+authenticates the dispatcher, advertises the public listener endpoint, and
+routes decoded `CACHE_SESSION` here.  After SCM_RIGHTS is accepted, the
+sidecar writes raw `50 f0 00 01` on the adopted ordinary descriptor; the
+client waits for that witness before emitting CacheWire.  The one-shot control
+relationship is then re-established for the next request without changing
+ordinary-link parsing or ownership rules.

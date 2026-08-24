@@ -696,6 +696,11 @@ int main(int argc, char **argv)
                 log_error() << "local build forced by remote exception: " << error.what() << endl;
             else
                 log_warning() << "local build forced by remote exception: " << error.what() << endl;
+            if (getenv("ICECC_P50_C1F1_REQUIRED") != nullptr) {
+                log_error() << "strict all-P50 run refuses local retry" << endl;
+                delete local_daemon;
+                return EXIT_DISTCC_FAILED;
+            }
             local = true;
             set_local_reason("remote_exception_" + std::to_string(error.errorCode));
         }
@@ -706,6 +711,12 @@ int main(int argc, char **argv)
             } else {
                 log_error() << "got exception " << error.what() << " (this should be an exception!)" <<
                             endl;
+            }
+
+            if (getenv("ICECC_P50_C1F1_REQUIRED") != nullptr) {
+                log_error() << "strict all-P50 run refuses client-error fallback" << endl;
+                delete local_daemon;
+                return EXIT_DISTCC_FAILED;
             }
 
 #if 0
@@ -732,6 +743,11 @@ int main(int argc, char **argv)
     }
 
     if (local) {
+        if (getenv("ICECC_P50_C1F1_REQUIRED") != nullptr) {
+            log_error() << "strict all-P50 run refuses a local-only selection" << endl;
+            delete local_daemon;
+            return EXIT_DISTCC_FAILED;
+        }
         log_block b("building_local");
         struct rusage ru;
         Msg *startme = nullptr;

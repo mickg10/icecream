@@ -54,8 +54,18 @@
 #include "md5.h"
 #include "util.h"
 #include "input_pump.h"
+#include "p50_compile_binding.h"
 #include "services/util.h"
 #include "pipes.h"
+
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/use_future.hpp>
+
+#include <atomic>
+#include <chrono>
+#include <future>
+#include <memory>
 
 #ifndef O_LARGEFILE
 #define O_LARGEFILE 0
@@ -71,6 +81,153 @@ struct CharBufferDeleter {
         free(buf);
     }
 };
+
+class TempSourceFile
+{
+public:
+    explicit TempSourceFile(char *path) noexcept
+        : path_(path)
+    {
+    }
+
+    ~TempSourceFile()
+    {
+        if (path_ != nullptr) {
+            if (linked_)
+                (void)::unlink(path_);
+            free(path_);
+        }
+    }
+
+    TempSourceFile(const TempSourceFile &) = delete;
+    TempSourceFile &operator=(const TempSourceFile &) = delete;
+
+    const char *path() const noexcept { return path_; }
+
+    bool unlink_now() noexcept
+    {
+        if (!linked_)
+            return true;
+        if (::unlink(path_) != 0)
+            return false;
+        linked_ = false;
+        return true;
+    }
+
+private:
+    char *path_ = nullptr;
+    bool linked_ = true;
+};
+
+icecc::p50::OwnedSourceFd prepare_complete_p50_source(
+    CompileJob &job, const char *preproc_file, int &cpp_status)
+{
+    cpp_status = 0;
+    if (preproc_file != nullptr) {
+        const int fd = ::open(preproc_file, O_RDONLY | O_CLOEXEC);
+        if (fd < 0)
+            throw client_error(11, "Error 11 - unable to open preprocessed file");
+        return icecc::p50::OwnedSourceFd(fd);
+    }
+
+    char *temporary_path = nullptr;
+    if (dcc_make_tmpnam("icecc-p50", ".ix", &temporary_path, 0) != 0 ||
+        temporary_path == nullptr)
+        throw client_error(10, "Error 10 - unable to create preprocessor output");
+    TempSourceFile temporary(temporary_path);
+    int write_fd = ::open(temporary.path(), O_WRONLY | O_TRUNC | O_CLOEXEC);
+    if (write_fd < 0)
+        throw client_error(10, "Error 10 - unable to open preprocessor output");
+
+    const pid_t cpp_pid = call_cpp(job, write_fd);
+    if (cpp_pid == -1) {
+        (void)::close(write_fd); // call_cpp closes it only after a successful fork.
+        throw client_error(18, "Error 18 - (fork error?)");
+    }
+
+    int wait_status = 255;
+    pid_t waited;
+    do {
+        waited = ::waitpid(cpp_pid, &wait_status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited != cpp_pid)
+        throw client_error(18, "Error 18 - unable to wait for local cpp");
+
+    cpp_status = shell_exit_status(wait_status);
+    if (cpp_status != 0) {
+        log_warning() << "call_cpp process failed with exit status "
+                      << cpp_status << std::endl;
+        if (!compiler_is_clang(job) && compiler_only_rewrite_includes(job))
+            throw remote_error(
+                103,
+                "Error 103 - local cpp invocation failed, trying to recompile locally");
+        return icecc::p50::OwnedSourceFd(-1);
+    }
+
+    const int read_fd = ::open(temporary.path(), O_RDONLY | O_CLOEXEC);
+    if (read_fd < 0)
+        throw client_error(11, "Error 11 - unable to reopen preprocessed file");
+    if (!temporary.unlink_now()) {
+        (void)::close(read_fd);
+        throw client_error(11, "Error 11 - unable to unlink preprocessed file");
+    }
+    return icecc::p50::OwnedSourceFd(read_fd);
+}
+
+icecc::p50::CStoreGuid compile_c_store_guid(const CompileJob &job)
+{
+    static std::atomic<uint64_t> invocation_serial{1};
+    const uint64_t serial = invocation_serial.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t ticks = static_cast<uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    const uint64_t process_nonce =
+        (static_cast<uint64_t>(static_cast<uint32_t>(::getpid())) << 32) ^ ticks;
+    return icecc::p50::derive_compile_c_store_guid(job, process_nonce, serial);
+}
+
+int detach_p50_cache_session(
+    const std::string &hostname, uint32_t port,
+    std::chrono::steady_clock::time_point deadline) noexcept
+{
+    try {
+        std::unique_ptr<MsgChannel> channel(Service::createChannelUntil(
+            hostname, static_cast<unsigned short>(port), deadline));
+        if (!channel || channel->protocol != PROTOCOL_VERSION_CACHE_ADVERTISEMENT ||
+            std::chrono::steady_clock::now() >= deadline)
+            return -1;
+        if (!channel->send_msg(CacheSessionMsg(), MsgChannel::SendNonBlocking))
+            return -1;
+        return channel->release_fd_after_cache_session_ready(deadline);
+    } catch (...) {
+        return -1;
+    }
+}
+
+icecc::p50::ZstdSourceTransferResult transfer_p50_source(
+    const CompileJob &job, const UseCSMsg &assignment,
+    icecc::p50::CStoreGuid c_store_guid,
+    icecc::p50::OwnedSourceFd source)
+{
+    icecc::p50::ZstdSourceTransferConfig config;
+    config.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    config.maximum_duration = std::chrono::seconds(120);
+    icecc::p50::P50ZstdSourceSender sender(
+        c_store_guid, icecc::p50::compile_prepare_request(job), config);
+    const std::string hostname = assignment.hostname;
+    const uint32_t port = assignment.cache_endpoint_port;
+    icecc::p50::ConnectedFdFactory connection =
+        [hostname, port](std::chrono::steady_clock::time_point deadline) {
+            return detach_p50_cache_session(hostname, port, deadline);
+        };
+
+    boost::asio::io_context context;
+    std::future<icecc::p50::ZstdSourceTransferResult> future =
+        boost::asio::co_spawn(
+            context, sender.transfer(std::move(connection), std::move(source)),
+            boost::asio::use_future);
+    context.run();
+    return future.get();
+}
 
 }
 
@@ -376,8 +533,9 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
             throw client_error(2, "Error 2 - no server found at " + hostname);
         }
 
-        // R6 deliberately selects only the existing wire path.  A future
-        // attachment mode can replace this selection after its product gates.
+        // Environment transfer always stays on the ordinary legacy stream.
+        // Source selection happens only after this phase and then remains one
+        // whole-job mode: FileChunk or P50 ZSTD_TU, never both.
         LegacyRemoteSink input_sink(cserver);
 
         if (!got_env) {
@@ -396,6 +554,7 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                 log_error() << "can't lock for local cpp" << endl;
                 return EXIT_DISTCC_FAILED;
             }
+            HostUnlock environment_unlock;
 
             if (!cserver->send_msg(msg)) {
                 throw client_error(6, "Error 6 - send environment to remote failed");
@@ -461,84 +620,127 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
             job.appendFlag( job.language() == CompileJob::Lang_OBJC ? "objective-c" : "objective-c++", Arg_Remote );
         }
 
-        if (!dcc_lock_host()) {
-            log_error() << "can't lock for local cpp" << endl;
-            return EXIT_DISTCC_FAILED;
-        }
-
-        CompileFileMsg compile_file(&job);
         {
-            log_block b("send compile_file");
+            const bool p50_input = icecc::p50::p50_zstd_compile_admissible(
+                *usecs, cserver->protocol);
+            if (getenv("ICECC_P50_C1F1_REQUIRED") != nullptr && !p50_input)
+                throw remote_error(
+                    105,
+                    "Error 105 - strict all-P50 assignment has no ZSTD_TU cache handoff");
 
-            if (!cserver->send_msg(compile_file)) {
-                log_warning() << "write of job failed" << endl;
-                throw client_error(9, "Error 9 - error sending file to remote");
+            if (!dcc_lock_host()) {
+                log_error() << "can't lock for local cpp" << endl;
+                return EXIT_DISTCC_FAILED;
             }
+            HostUnlock input_unlock;
+
+            if (p50_input) {
+                int cpp_status = 0;
+                icecc::p50::OwnedSourceFd source =
+                    prepare_complete_p50_source(job, preproc_file, cpp_status);
+                if (!source) {
+                    delete cserver;
+                    cserver = nullptr;
+                    return cpp_status;
+                }
+
+                const icecc::p50::CStoreGuid c_store_guid =
+                    compile_c_store_guid(job);
+                const icecc::p50::ZstdSourceTransferResult transfer =
+                    transfer_p50_source(job, *usecs, c_store_guid,
+                                        std::move(source));
+                const std::optional<CompileInputIdentity> identity =
+                    icecc::p50::bind_compile_input(job, c_store_guid, transfer);
+                if (!identity.has_value()) {
+                    log_warning() << "ZSTD_TU cache source transfer failed closed (status "
+                                  << static_cast<unsigned>(transfer.status)
+                                  << ", attempts "
+                                  << static_cast<unsigned>(transfer.attempts)
+                                  << ")" << endl;
+                    throw remote_error(
+                        106,
+                        "Error 106 - P50 cache source transfer did not commit exactly");
+                }
+                job.setCompileInputIdentity(*identity);
+                trace() << "ZSTD_TU source committed for P50 CompileFile: "
+                        << identity->raw_bytes << " exact bytes, TU sequence "
+                        << identity->tu_seq << endl;
+            } else {
+                job.clearCompileInputIdentity();
+            }
+
+            CompileFileMsg compile_file(&job);
+            {
+                log_block b("send compile_file");
+
+                if (!cserver->send_msg(compile_file)) {
+                    log_warning() << "write of job failed" << endl;
+                    throw client_error(9, "Error 9 - error sending file to remote");
+                }
+            }
+
+            if (!p50_input && !preproc_file) {
+                int sockets[2];
+
+                if (create_large_pipe(sockets) != 0) {
+                    log_perror("build_remote_in pipe");
+                    /* for all possible cases, this is something severe */
+                    throw client_error(32, "Error 18 - (fork error?)");
+                }
+
+                /* This will fork, and return the pid of the child.  It will not
+                   return for the child itself.  If it returns normally it will have
+                   closed the write fd, i.e. sockets[1].  */
+                pid_t cpp_pid = call_cpp(job, sockets[1], sockets[0]);
+
+                if (cpp_pid == -1) {
+                    throw client_error(18, "Error 18 - (fork error?)");
+                }
+
+                try {
+                    log_block bl2("write_fd_to_server from cpp");
+                    input_sink.send_fd(sockets[0]);
+                } catch (...) {
+                    kill(cpp_pid, SIGTERM);
+                    throw;
+                }
+
+                log_block wait_cpp("wait for cpp");
+
+                while (waitpid(cpp_pid, &status, 0) < 0 && errno == EINTR) {}
+
+                if (shell_exit_status(status) != 0) {   // failure
+                    delete cserver;
+                    cserver = nullptr;
+                    log_warning() << "call_cpp process failed with exit status " << shell_exit_status(status) << endl;
+                    // GCC's -fdirectives-only has a number of cases that it doesn't handle properly,
+                    // so if in such mode preparing the source fails, try again recompiling locally.
+                    // This will cause double error in case it is a real error, but it'll build successfully if
+                    // it was just -fdirectives-only being broken. In other cases fail directly, Clang's
+                    // -frewrite-includes is much more reliable than -fdirectives-only, so is GCC's plain -E.
+                    if( !compiler_is_clang(job) && compiler_only_rewrite_includes(job))
+                        throw remote_error(103, "Error 103 - local cpp invocation failed, trying to recompile locally");
+                    else
+                        return shell_exit_status(status);
+                }
+            } else if (!p50_input) {
+                int cpp_fd = open(preproc_file, O_RDONLY | O_CLOEXEC);
+
+                if (cpp_fd < 0) {
+                    throw client_error(11, "Error 11 - unable to open preprocessed file");
+                }
+
+                log_block cpp_block("write_fd_to_server preprocessed");
+                input_sink.send_fd(cpp_fd);
+            }
+
+            if (!p50_input && !input_sink.send_end()) {
+                log_warning() << "write of end failed" << endl;
+                throw client_error(12, "Error 12 - failed to send file to remote");
+            }
+
+            dcc_unlock();
         }
-
-        if (!preproc_file) {
-            int sockets[2];
-
-            if (create_large_pipe(sockets) != 0) {
-                log_perror("build_remote_in pipe");
-                /* for all possible cases, this is something severe */
-                throw client_error(32, "Error 18 - (fork error?)");
-            }
-
-            HostUnlock hostUnlock; // automatic dcc_unlock()
-
-            /* This will fork, and return the pid of the child.  It will not
-               return for the child itself.  If it returns normally it will have
-               closed the write fd, i.e. sockets[1].  */
-            pid_t cpp_pid = call_cpp(job, sockets[1], sockets[0]);
-
-            if (cpp_pid == -1) {
-                throw client_error(18, "Error 18 - (fork error?)");
-            }
-
-            try {
-                log_block bl2("write_fd_to_server from cpp");
-                input_sink.send_fd(sockets[0]);
-            } catch (...) {
-                kill(cpp_pid, SIGTERM);
-                throw;
-            }
-
-            log_block wait_cpp("wait for cpp");
-
-            while (waitpid(cpp_pid, &status, 0) < 0 && errno == EINTR) {}
-
-            if (shell_exit_status(status) != 0) {   // failure
-                delete cserver;
-                cserver = nullptr;
-                log_warning() << "call_cpp process failed with exit status " << shell_exit_status(status) << endl;
-                // GCC's -fdirectives-only has a number of cases that it doesn't handle properly,
-                // so if in such mode preparing the source fails, try again recompiling locally.
-                // This will cause double error in case it is a real error, but it'll build successfully if
-                // it was just -fdirectives-only being broken. In other cases fail directly, Clang's
-                // -frewrite-includes is much more reliable than -fdirectives-only, so is GCC's plain -E.
-                if( !compiler_is_clang(job) && compiler_only_rewrite_includes(job))
-                    throw remote_error(103, "Error 103 - local cpp invocation failed, trying to recompile locally");
-                else
-                    return shell_exit_status(status);
-            }
-        } else {
-            int cpp_fd = open(preproc_file, O_RDONLY);
-
-            if (cpp_fd < 0) {
-                throw client_error(11, "Error 11 - unable to open preprocessed file");
-            }
-
-            log_block cpp_block("write_fd_to_server preprocessed");
-            input_sink.send_fd(cpp_fd);
-        }
-
-        if (!input_sink.send_end()) {
-            log_warning() << "write of end failed" << endl;
-            throw client_error(12, "Error 12 - failed to send file to remote");
-        }
-
-        dcc_unlock();
 
         Msg *msg;
         {

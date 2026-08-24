@@ -1,6 +1,7 @@
 #include "p50_cache_service.h"
 #include "p50_control_operation.h"
 #include "p50_input_fd_attachment.h"
+#include "services/comm.h"
 
 #include <charconv>
 #include <cerrno>
@@ -380,6 +381,27 @@ bool handle_connection(local::Connection connection, const Options& options,
         if (connection.send(ack) != local::Status::Ok)
             return true;
 
+        /* HELLO authenticates a persistent daemon relationship.  Idleness is
+           not an operation timeout: wait without consuming frame bytes in
+           short stop-cancellable poll slices, then give the complete operation
+           and handoff one fresh bounded budget. */
+        for (;;) {
+            if (g_stop_requested != 0)
+                return true;
+            pollfd descriptor{connection.native_handle(), POLLIN, 0};
+            const int ready = ::poll(&descriptor, 1, kPollMilliseconds);
+            if (ready < 0 && errno == EINTR)
+                continue;
+            if (ready < 0 || (ready > 0 && (descriptor.revents & POLLNVAL) != 0))
+                return true;
+            if (ready == 0)
+                continue;
+            if ((descriptor.revents & POLLIN) != 0)
+                break;
+            if ((descriptor.revents & (POLLERR | POLLHUP)) != 0)
+                return true;
+        }
+
         const auto deadline = std::chrono::steady_clock::now() +
                               std::chrono::milliseconds{kHandshakeMilliseconds};
         local::Frame operation_frame;
@@ -610,6 +632,14 @@ RuntimeResult SidecarRuntime::run_one(
     if (stop_requested_.load(std::memory_order_acquire)) {
         result.status = RuntimeStatus::Stopped;
         result.handoff.status = local::FdHandoffStatus::Disconnected;
+        return result;
+    }
+
+    /* The client must not emit one CacheWire byte until this exact descriptor
+       is owned by the sidecar.  Publish that transition on the adopted socket
+       itself; failure closes locally and never starts the endpoint. */
+    if (!send_cache_session_ready(adopted.get(), deadline)) {
+        result.status = RuntimeStatus::AdoptionFailed;
         return result;
     }
 

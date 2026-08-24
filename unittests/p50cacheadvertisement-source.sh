@@ -30,9 +30,9 @@ require_absent() {
     echo "ok - $label"
 }
 
-require_count 4 'IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, c)' \
+require_count 6 'IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, c)' \
     services/comm.cpp \
-    'Login and UseCS codecs (S2 handoff) each gate both read and write at protocol 50'
+    'Login, UseCS, and CompileFile P50 tails each gate both read and write at protocol 50'
 require_count 1 'current_message_end = intogo_old + inmsglen' \
     services/comm.cpp 'decoder records the current frame boundary'
 require_count 1 'if (c->current_message_bytes_remaining() < 3 * sizeof(uint32_t)) {' \
@@ -53,8 +53,8 @@ require_count 1 'const bool absent = cache_endpoint_port == 0' \
     services/comm.cpp 'Login payload has a canonical whole-absence branch'
 require_count 1 '&& (cache_profile_mask & ~CACHE_ADVERTISABLE_PROFILE_MASK) == 0' \
     services/comm.cpp 'Login rejects every non-runnable or unknown profile bit'
-require_count 3 'apply_inert_cache_advertisement' daemon/main.cpp \
-    'real daemon applies canonical absence at definition, login, and reannouncement'
+require_count 3 'apply_cache_advertisement' daemon/main.cpp \
+    'real daemon applies the canonical sidecar snapshot at definition, login, and shutdown reannouncement'
 require_count 2 'cs->setCacheAdvertisement(m->cache_endpoint_port, m->cache_protocol,' \
     scheduler/scheduler.cpp 'scheduler retains initial and replacement Login snapshots'
 require_count 2 'it->cacheEndpointPort()' scheduler/scheduler.cpp \
@@ -163,12 +163,22 @@ require_count 1 'inline bool usecs_cache_handoff_admissible' services/comm.h \
 require_count 1 'if (usecs_cache_handoff_admissible(*msg)) {' daemon/main.cpp \
     'scheduler_use_cs retains the cache handoff only via that helper'
 
+# M3 now consumes the post-selection UseCS projection.  The exact selected
+# assignment is the sole client authority: remote.cpp admits it once, connects
+# to that same selected hostname, commits ZSTD_TU before CompileFile, and binds
+# the resulting immutable selector.  The endpoint triple still may not leak
+# backwards into scheduler scoring or the generic compiler-input reader.
+require_count 1 'p50_zstd_compile_admissible(' client/remote.cpp \
+    'the production client has one exact P50 source-mode admission site'
+require_count 1 'assignment.cache_endpoint_port' client/remote.cpp \
+    'the cache connection reads the selected UseCS endpoint exactly once'
+require_count 1 'job.setCompileInputIdentity(*identity);' client/remote.cpp \
+    'a validated committed InputRecord binds CompileFile before it is sent'
 require_absent \
     'cache_endpoint_port|cacheProtocol\(|cacheProfileMask|CACHE_PROFILE_Z3_(LONG|SHARED_LONG)' \
-    'advertisement did not enter assignment, client attachment, or compiler input' \
-    "$src/services/job.h" "$src/client/remote.cpp" \
+    'cache endpoint metadata remains absent from scheduler scoring and generic input readers' \
     "$src/daemon/compiler_input.cpp" "$src/daemon/compiler_input.h" \
-    "$src/daemon/workit.cpp" "$src/scheduler/job.cpp" "$src/scheduler/job.h"
+    "$src/scheduler/job.cpp" "$src/scheduler/job.h"
 
 require_absent 'z3_long|z3_shared_long|Z3_LONG|Z3_SHARED_LONG' \
     'declared streaming labels have no codec implementation' \
@@ -183,4 +193,4 @@ if grep -R -n 'z3_shared_long_b1' "$src/services" "$src/cache" \
 fi
 echo 'ok - z3_shared_long_b1 remains experiment-only'
 
-echo 'PASS: inert cache advertisement remains Login-only and non-selecting'
+echo 'PASS: Login cache advertisement remains non-selecting and M3 uses only the exact assignment handoff'

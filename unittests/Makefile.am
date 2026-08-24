@@ -42,7 +42,11 @@ SH_LOG_COMPILER = $(SHELL)
 
 AM_CPPFLAGS = -I$(top_srcdir)/client -I$(top_srcdir)/services -I$(top_srcdir)/ \
 	$(LIBZSTD_CFLAGS)
-testargs_LDADD = ../client/libclient.a ../services/libicecc.la
+P50_CLIENT_LINK_LIBS = ../client/libp50zstdsender.a \
+	../cache/libp50endpoint.a ../cache/libprotocol50.a \
+	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
+testargs_LDFLAGS = $(BOOST_LDFLAGS) -pthread
+testargs_LDADD = ../client/libclient.a $(P50_CLIENT_LINK_LIBS)
 p50wire_LDADD = ../cache/libprotocol50.a ../services/libicecc.la
 p50slice0_LDADD = ../cache/libprotocol50.a ../services/libicecc.la
 p50zstd_LDADD = ../cache/libprotocol50.a ../services/libicecc.la $(LIBZSTD_LIBS)
@@ -122,7 +126,8 @@ p50daemonpositive_LDADD = ../services/libicecc.la
 p50daemonpositive_DEPENDENCIES = ../daemon/iceccd ../cache/icecc-cache-service
 digest128bench_SOURCES = digest128_bench.cpp
 lockexec_SOURCES = lockexec.cpp
-lockexec_LDADD = ../client/libclient.a ../services/libicecc.la
+lockexec_LDFLAGS = $(BOOST_LDFLAGS) -pthread
+lockexec_LDADD = ../client/libclient.a $(P50_CLIENT_LINK_LIBS)
 
 schedpolicy_SOURCES = schedpolicy.cpp
 
@@ -196,10 +201,11 @@ p50cacheservice_SOURCES = p50cacheservice.cpp ../cache/p50_cache_service.cpp
 p50cacheservice_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS) -DICECC_P50_CACHE_SERVICE_NO_MAIN
 p50cacheservice_CXXFLAGS = -pthread
 p50cacheservice_LDFLAGS = $(BOOST_LDFLAGS) -pthread
-p50cacheservice_LDADD = ../cache/libp50endpoint.a ../cache/libprotocol50.a \
-	../cache/libp50localtransport.a ../services/libicecc.la \
-	$(LIBZSTD_LIBS) $(BOOST_LIBS)
-p50cacheservice_DEPENDENCIES = ../cache/icecc-cache-service readyclose_shim.so
+p50cacheservice_LDADD = ../cache/libp50endpoint.a ../cache/libp50inputfd.a \
+	../cache/libprotocol50.a ../cache/libp50localtransport.a \
+	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
+p50cacheservice_DEPENDENCIES = ../cache/icecc-cache-service \
+	../cache/libp50inputfd.a readyclose_shim.so
 p50fdhandoff_SOURCES = p50fdhandoff.cpp ../cache/p50_fd_handoff.cpp \
 	../cache/p50_local_transport.cpp
 p50fdhandoff_CPPFLAGS = $(AM_CPPFLAGS) -DICECC_P50_FD_HANDOFF_TEST_HOOKS
@@ -207,8 +213,8 @@ p50fdhandoff_CXXFLAGS = -pthread
 p50fdhandoff_LDFLAGS = -pthread
 inputpump_SOURCES = input_pump_test.cpp
 inputpump_CXXFLAGS = -pthread
-inputpump_LDFLAGS = -pthread
-inputpump_LDADD = ../client/libclient.a ../services/libicecc.la
+inputpump_LDFLAGS = $(BOOST_LDFLAGS) -pthread
+inputpump_LDADD = ../client/libclient.a $(P50_CLIENT_LINK_LIBS)
 compilerinput_SOURCES = compiler_input_test.cpp ../daemon/compiler_input.cpp
 compilerinput_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)/daemon
 compilerinput_CXXFLAGS = -pthread

@@ -1,4 +1,6 @@
 #include "../cache/p50_cache_service.h"
+#include "../cache/p50_control_operation.h"
+#include "comm.h"
 
 #include <array>
 #include <cerrno>
@@ -338,6 +340,45 @@ void signal_interrupts_control_wait(int signal) {
     CHECK(::rmdir(template_path) == 0);
 }
 
+void authenticated_idle_dispatcher_persists() {
+    char template_path[] = "/tmp/icecc-cache-service-idle-XXXXXX";
+    const int directory_fd = ::mkstemp(template_path);
+    CHECK(directory_fd >= 0);
+    CHECK(::close(directory_fd) == 0);
+    CHECK(::unlink(template_path) == 0);
+    CHECK(::mkdir(template_path, 0700) == 0);
+    Child child = launch(template_path);
+    auto connection = connect_to(template_path);
+    CHECK(connection.send(local::make_hello(local::PeerRole::Daemon, {7, 1})) ==
+          local::Status::Ok);
+    local::Frame ack;
+    CHECK(connection.receive_with_timeout(ack, 1000) == local::Status::Ok);
+    CHECK(local::validate_handshake(ack, local::MessageType::HelloAck,
+                                    local::PeerRole::Sidecar, {7, 1}) == local::Status::Ok);
+
+    // This deliberately exceeds the former per-operation 500 ms timeout.
+    // A persistent authenticated dispatcher must remain clean and open.
+    std::this_thread::sleep_for(std::chrono::milliseconds(700));
+    unsigned char byte = 0;
+    const ssize_t idle = ::recv(connection.native_handle(), &byte, sizeof(byte),
+                                MSG_PEEK | MSG_DONTWAIT);
+    CHECK(idle < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+
+    local::Frame operation{local::kProtocolVersion, local::MessageType::Data,
+                           {7, 1}, local::encode_control_operation(
+                                       local::make_cache_session_operation({7, 1}, 1))};
+    CHECK(connection.send(operation) == local::Status::Ok);
+    connection = local::Connection(-1);
+
+    CHECK(::kill(child.pid, SIGTERM) == 0);
+    int status = 0;
+    CHECK(::waitpid(child.pid, &status, 0) == child.pid);
+    child.pid = -1;
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(::access((std::string(template_path) + "/service.sock").c_str(), F_OK) != 0);
+    CHECK(::rmdir(template_path) == 0);
+}
+
 void replacement_node_is_not_removed() {
     char template_path[] = "/tmp/icecc-cache-service-test-XXXXXX";
     const int directory_fd = ::mkstemp(template_path);
@@ -655,9 +696,67 @@ int loopback_listener(uint16_t& port) {
     return listener;
 }
 
+int connect_after_sidecar_ready(uint16_t port) {
+    const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return -1;
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(port);
+    if (::connect(fd, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0) {
+        (void)::close(fd);
+        return -1;
+    }
+
+    uint32_t wire_ready = 0;
+    auto* bytes = reinterpret_cast<uint8_t*>(&wire_ready);
+    size_t offset = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (offset != sizeof(wire_ready)) {
+        const ssize_t received = ::recv(fd, bytes + offset,
+                                        sizeof(wire_ready) - offset, MSG_DONTWAIT);
+        if (received > 0) {
+            offset += static_cast<size_t>(received);
+            continue;
+        }
+        if (received == 0 ||
+            (received < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)) {
+            (void)::close(fd);
+            return -1;
+        }
+        if (received < 0 && errno == EINTR)
+            continue;
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            (void)::close(fd);
+            return -1;
+        }
+        const auto remaining = deadline - now;
+        auto milliseconds =
+            std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
+        if (milliseconds < remaining)
+            ++milliseconds;
+        pollfd descriptor{fd, POLLIN, 0};
+        const int ready = ::poll(&descriptor, 1,
+                                 static_cast<int>(milliseconds.count()));
+        if (ready < 0 && errno == EINTR)
+            continue;
+        if (ready <= 0 || (descriptor.revents & POLLNVAL) != 0 ||
+            (descriptor.revents & (POLLIN | POLLERR | POLLHUP)) == 0) {
+            (void)::close(fd);
+            return -1;
+        }
+    }
+    if (ntohl(wire_ready) != CACHE_SESSION_READY_MAGIC) {
+        (void)::close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 void test_runtime_zstd_tu_af_unix_loopback() {
     namespace asio = boost::asio;
-    using tcp = asio::ip::tcp;
     const std::vector<uint8_t> input = [] {
         std::vector<uint8_t> value;
         value.reserve(8192);
@@ -691,12 +790,14 @@ void test_runtime_zstd_tu_af_unix_loopback() {
     uint16_t port = 0;
     const int listener = loopback_listener(port);
     asio::io_context client_context;
-    const tcp::endpoint remote(asio::ip::address_v4::loopback(), port);
     std::future<ClientRunResult> client_result;
+    std::atomic<bool> first_ready_seen{false};
     std::thread client_thread([&] {
         const PreparedTuHandle prepared = authority->prepare({1, 1}, input);
-        client_result =
-            asio::co_spawn(client_context, client.run(remote, prepared), asio::use_future);
+        const int fd = connect_after_sidecar_ready(port);
+        first_ready_seen.store(fd >= 0, std::memory_order_release);
+        client_result = asio::co_spawn(
+            client_context, client.run_adopted_fd(fd, prepared), asio::use_future);
         client_context.run();
     });
 
@@ -729,6 +830,7 @@ void test_runtime_zstd_tu_af_unix_loopback() {
     CHECK(runtime_result.status == service::RuntimeStatus::Completed);
     CHECK(runtime_result.endpoint.has_value() &&
           runtime_result.endpoint->status == ServerRunStatus::Completed);
+    CHECK(first_ready_seen.load(std::memory_order_acquire));
     CHECK(client_value.status == ClientRunStatus::Committed);
     CHECK(observed == input);
     CHECK(runtime.live_handoff_count() == 0 && runtime.live_session_count() == 0);
@@ -748,12 +850,14 @@ void test_runtime_zstd_tu_af_unix_loopback() {
     uint16_t second_port = 0;
     const int second_listener = loopback_listener(second_port);
     asio::io_context second_client_context;
-    const tcp::endpoint second_remote(asio::ip::address_v4::loopback(), second_port);
     std::future<ClientRunResult> second_client_result;
+    std::atomic<bool> second_ready_seen{false};
     std::thread second_client_thread([&] {
         const PreparedTuHandle prepared = second_authority->prepare({2, 2}, second_input);
+        const int fd = connect_after_sidecar_ready(second_port);
+        second_ready_seen.store(fd >= 0, std::memory_order_release);
         second_client_result = asio::co_spawn(second_client_context,
-                                              second_client.run(second_remote, prepared),
+                                              second_client.run_adopted_fd(fd, prepared),
                                               asio::use_future);
         second_client_context.run();
     });
@@ -782,6 +886,7 @@ void test_runtime_zstd_tu_af_unix_loopback() {
     CHECK(second_runtime_result.status == service::RuntimeStatus::Completed);
     CHECK(second_runtime_result.endpoint.has_value() &&
           second_runtime_result.endpoint->status == ServerRunStatus::Completed);
+    CHECK(second_ready_seen.load(std::memory_order_acquire));
     CHECK(second_client_value.status == ClientRunStatus::Committed);
     CHECK(observed == second_input);
     CHECK(runtime.live_handoff_count() == 0 && runtime.live_session_count() == 0);
@@ -974,6 +1079,7 @@ int main() {
         exercise_root_contract_then_drop_test_process();
         signal_interrupts_control_wait(SIGTERM);
         signal_interrupts_control_wait(SIGINT);
+        authenticated_idle_dispatcher_persists();
         replacement_node_is_not_removed();
         peer_credentials_are_required();
         rejects_identity_role_and_malformed();

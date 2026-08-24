@@ -85,8 +85,11 @@ compile_and_expect_red() {
         "$top_build/cache/libp50readyadvertisement.a" \
         "$top_build/cache/libp50sidecarsupervisor.a" \
         "$top_build/cache/libp50localtransport.a" \
+        "$top_build/cache/libp50inputfd.a" \
+        "$top_build/cache/libprotocol50.a" \
         "$top_build/services/.libs/libicecc.a" -llzo2 \
-        ${ICECC_TEST_LIBZSTD_LIBS:--lzstd} -o "$binary"
+        ${ICECC_TEST_LIBZSTD_LIBS:--lzstd} \
+        ${ICECC_TEST_XXHASH_LIBS:--lxxhash} -o "$binary"
     set +e
     ICECC_TEST_CACHE_SERVICE="$service" timeout 60s "$binary" >"$log" 2>&1
     status=$?

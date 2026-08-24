@@ -27,7 +27,7 @@ if grep -E -n 'FileChunkMsg|FileChunk' "$header" "$source" >/dev/null; then
 fi
 
 # Deletion-sensitive checks: each of these gates a distinct fail-closed edge.
-test "$(grep -F -c 'request.request_id != 0' "$source")" -eq 1
+test "$(grep -F -c 'request.request_id == 0' "$source")" -eq 2
 test "$(grep -F -c 'expected_peer.specified()' "$source")" -ge 1
 test "$(grep -F -c 'make_sealed_memfd' "$source")" -ge 1
 test "$(grep -F -c 'status_for_handoff' "$source")" -ge 1
