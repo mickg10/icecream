@@ -3,6 +3,7 @@ sbin_PROGRAMS = iceccd
 iceccd_SOURCES = \
 	main.cpp \
 	serve.cpp \
+	p50_completion_record.cpp \
 	compiler_input.cpp \
 	workit.cpp \
 	../cache/p50_daemon_cache_dispatch.cpp \
@@ -36,6 +37,7 @@ AM_LIBTOOLFLAGS = --silent
 
 noinst_HEADERS = \
 	compiler_input.h \
+	p50_completion_record.h \
 	statewriter.h \
 	environment.h \
 	load.h \
