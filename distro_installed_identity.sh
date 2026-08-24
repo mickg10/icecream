@@ -81,6 +81,12 @@ case "${4:-}" in
 esac
 
 SRC=$(CDPATH= cd -- "$SRC" && pwd)
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+FACTS_VALIDATOR="$SCRIPT_DIR/s1b_validate_installed_facts.py"
+[ -f "$FACTS_VALIDATOR" ] || {
+    echo "FAIL: $DISTRO installed facts validator is absent: $FACTS_VALIDATOR" >&2
+    exit 1
+}
 
 # One-time SRC timestamp normalization. A dist tarball extracted over an SSH
 # `cat | tar -x` pipe can land with scrambled mtimes; automake's Makefile.in
@@ -116,30 +122,33 @@ fact() { printf '%s\t%s\n' "$1" "$2" >> "$FACTS"; }
 # -- Fail-closed verifier helpers. One owner for pass/fail: every artifact
 # assertion below goes through exactly one of these, each fails IMMEDIATELY
 # and NAMES the artifact/check that failed; the script only ever reaches
-# its final "PASS" line if every single one of these passed. --
+# its final "PASS" line if every single one of these passed. POSIX sh has no
+# portable local variables, so every helper owns a unique variable prefix;
+# otherwise a nested verifier can silently overwrite record_artifact's label
+# and corrupt the fact-key ledger. --
 require_file() {
-    label=$1 path=$2
-    if [ ! -e "$path" ]; then
-        echo "FAIL: $DISTRO $label: $path does not exist" >&2
+    rf_label=$1 rf_path=$2
+    if [ ! -e "$rf_path" ]; then
+        echo "FAIL: $DISTRO $rf_label: $rf_path does not exist" >&2
         exit 1
     fi
-    if [ ! -s "$path" ]; then
-        echo "FAIL: $DISTRO $label: $path exists but is empty" >&2
+    if [ ! -s "$rf_path" ]; then
+        echo "FAIL: $DISTRO $rf_label: $rf_path exists but is empty" >&2
         exit 1
     fi
 }
 require_exact() {
-    label=$1 actual=$2 expected=$3
-    if [ "$actual" != "$expected" ]; then
-        echo "FAIL: $DISTRO $label expected exactly '$expected', got '$actual'" >&2
+    re_label=$1 re_actual=$2 re_expected=$3
+    if [ "$re_actual" != "$re_expected" ]; then
+        echo "FAIL: $DISTRO $re_label expected exactly '$re_expected', got '$re_actual'" >&2
         exit 1
     fi
 }
 require_prefix() {
-    label=$1 actual=$2 prefix=$3
-    case "$actual" in
-        "$prefix"*) ;;
-        *) echo "FAIL: $DISTRO $label expected to start with '$prefix', got '$actual'" >&2
+    rp_label=$1 rp_actual=$2 rp_prefix=$3
+    case "$rp_actual" in
+        "$rp_prefix"*) ;;
+        *) echo "FAIL: $DISTRO $rp_label expected to start with '$rp_prefix', got '$rp_actual'" >&2
            exit 1 ;;
     esac
 }
@@ -148,25 +157,25 @@ require_count1() {
     # be exactly 1 (not "at least one, take the first and ignore the
     # rest" -- a second, competing line must be a failure, not silently
     # dropped by e.g. `| head -1`).
-    label=$1 count=$2 context=$3
-    if [ "$count" != "1" ]; then
-        echo "FAIL: $DISTRO $label: expected exactly 1 matching $context, found $count" >&2
+    rc_label=$1 rc_count=$2 rc_context=$3
+    if [ "$rc_count" != "1" ]; then
+        echo "FAIL: $DISTRO $rc_label: expected exactly 1 matching $rc_context, found $rc_count" >&2
         exit 1
     fi
 }
 require_sha256_format() {
-    label=$1 sha=$2
-    if ! echo "$sha" | grep -qE '^[0-9a-f]{64}$'; then
-        echo "FAIL: $DISTRO $label: '$sha' is not exactly 64 lowercase hex characters" >&2
+    rs_label=$1 rs_sha=$2
+    if ! echo "$rs_sha" | grep -qE '^[0-9a-f]{64}$'; then
+        echo "FAIL: $DISTRO $rs_label: '$rs_sha' is not exactly 64 lowercase hex characters" >&2
         exit 1
     fi
 }
 read_or() {
-    path=$1 fallback=$2
-    if value=$(cat "$path" 2>/dev/null); then
-        printf '%s' "$value"
+    ro_path=$1 ro_fallback=$2
+    if ro_value=$(cat "$ro_path" 2>/dev/null); then
+        printf '%s' "$ro_value"
     else
-        printf '%s' "$fallback"
+        printf '%s' "$ro_fallback"
     fi
 }
 presence() {
@@ -187,35 +196,36 @@ record_artifact() {
     # records mode/size/sha256 facts (sha256 format-validated), and
     # appends a manifest entry. Returns the sha256 on stdout for callers
     # that also want to assert an exact/prefix identity on it.
-    label=$1 path=$2 type=$3 identity=$4
-    require_file "$label" "$path"
-    mode=$(stat -c %a "$path")
-    size=$(stat -c %s "$path")
-    sha=$(sha256sum "$path" | awk '{print $1}')
-    case "$label" in
+    ra_label=$1 ra_path=$2 ra_type=$3 ra_identity=$4
+    require_file "$ra_label" "$ra_path"
+    ra_mode=$(stat -c %a "$ra_path")
+    ra_size=$(stat -c %s "$ra_path")
+    ra_sha=$(sha256sum "$ra_path" | awk '{print $1}')
+    case "$ra_label" in
         installed_icecc|installed_icecc_create_env|installed_iceccd|installed_scheduler)
-            expected_mode=755
+            ra_expected_mode=755
             ;;
         *)
-            expected_mode=644
+            ra_expected_mode=644
             ;;
     esac
-    require_exact "${label}_mode" "$mode" "$expected_mode"
-    require_sha256_format "${label}_sha256" "$sha"
-    fact "${label}_mode" "$mode"
-    fact "${label}_size" "$size"
-    fact "${label}_sha256" "$sha"
-    manifest_entries="${manifest_entries}{\"path\":\"${path#"$WORK"/}\",\"type\":\"$type\",\"mode\":\"$mode\",\"size\":$size,\"sha256\":\"$sha\",\"identity\":\"$identity\"}
+    require_exact "${ra_label}_mode" "$ra_mode" "$ra_expected_mode"
+    require_sha256_format "${ra_label}_sha256" "$ra_sha"
+    fact "${ra_label}_mode" "$ra_mode"
+    fact "${ra_label}_size" "$ra_size"
+    fact "${ra_label}_sha256" "$ra_sha"
+    manifest_entries="${manifest_entries}{\"path\":\"${ra_path#"$WORK"/}\",\"type\":\"$ra_type\",\"mode\":\"$ra_mode\",\"size\":$ra_size,\"sha256\":\"$ra_sha\",\"identity\":\"$ra_identity\"}
 "
 }
 write_manifest() {
-    MANIFEST="$WORK/installed-manifest-$RUN_SUFFIX.json"
-    printf '%s' "$manifest_entries" | sort > "$MANIFEST.lines"
-    { printf '[\n'; sed '$!s/$/,/' "$MANIFEST.lines" | sed 's/^/  /'; printf ']\n'; } > "$MANIFEST"
-    rm -f "$MANIFEST.lines"
-    fact installed_manifest_path "$MANIFEST"
-    require_file installed_manifest_file "$MANIFEST"
-    python3 - "$MANIFEST" <<'PY'
+    wm_manifest="$WORK/installed-manifest-$RUN_SUFFIX.json"
+    wm_lines="$wm_manifest.lines"
+    printf '%s' "$manifest_entries" | sort > "$wm_lines"
+    { printf '[\n'; sed '$!s/$/,/' "$wm_lines" | sed 's/^/  /'; printf ']\n'; } > "$wm_manifest"
+    rm -f "$wm_lines"
+    fact installed_manifest_path "$wm_manifest"
+    require_file installed_manifest_file "$wm_manifest"
+    python3 - "$wm_manifest" <<'PY'
 import json
 import re
 import sys
@@ -265,9 +275,10 @@ for row in rows:
         raise SystemExit(f"installed manifest malformed sha256 for {row['path']}")
 print("INSTALLED-MANIFEST-SCHEMA=PASS")
 PY
-    manifest_sha=$(sha256sum "$MANIFEST" | awk '{print $1}')
-    require_sha256_format installed_manifest_sha256 "$manifest_sha"
-    fact installed_manifest_sha256 "$manifest_sha"
+    wm_sha=$(sha256sum "$wm_manifest" | awk '{print $1}')
+    require_sha256_format installed_manifest_sha256 "$wm_sha"
+    fact installed_manifest_sha256 "$wm_sha"
+    python3 "$FACTS_VALIDATOR" "$FACTS"
 }
 
 case "$DISTRO" in
@@ -605,7 +616,7 @@ elif [ "$MODE" = corrupt-control ]; then
                 chmod 755 /destdir/usr/local/sbin/icecc-scheduler
                 ;;
             icecc-scheduler-competing)
-                printf '#!/bin/sh\necho "ICECREAM scheduler 1.5.90"\necho "ICECREAM scheduler 1.5.89"\n' > /destdir/usr/local/sbin/icecc-scheduler
+                printf '%s\n' '#!/bin/sh' 'echo ICECREAM scheduler 1.5.90' 'echo ICECREAM scheduler 1.5.89' > /destdir/usr/local/sbin/icecc-scheduler
                 chmod 755 /destdir/usr/local/sbin/icecc-scheduler
                 ;;
             libicecc.a)
@@ -790,7 +801,7 @@ if ! grep -qE '^installed_icecc_identity_check[[:space:]]+PASS' "$FACTS"; then
     exit 1
 fi
 if [ "$MODE" = normal ]; then
-    # require_file (called on $MANIFEST inside write_manifest) is a pure
+    # require_file (called on write_manifest's generated manifest) is a pure
     # gate and never itself writes a fact -- installed_manifest_path is
     # the fact write_manifest actually records, so that's what's checked
     # here (checking for a never-written key would make this always fail).
