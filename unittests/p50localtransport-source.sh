@@ -13,7 +13,8 @@ bounded_writer_source() {
     grep -F 'Status write_all_until' "$1" >/dev/null &&
         grep -F 'Status Connection::send_until' "$1" >/dev/null &&
         grep -F 'write_all_until(fd_, encoded, deadline)' "$1" >/dev/null &&
-        grep -F 'Status::Timeout' "$1" >/dev/null
+        grep -F 'Status::Timeout' "$1" >/dev/null &&
+        grep -F 'MSG_DONTWAIT' "$1" >/dev/null
 }
 if ! bounded_writer_source "$transport"; then
     echo 'FAIL: production bounded writer is missing' >&2
@@ -28,6 +29,39 @@ if bounded_writer_source "$send_mutant"; then
     exit 1
 fi
 echo 'ok - bounded writer deletion/bypass mutant is rejected'
+
+bounded_reader_source() {
+    grep -F 'Status Connection::receive_until' "$1" >/dev/null &&
+        grep -F 'read_frame_until(fd_, frame, deadline)' "$1" >/dev/null &&
+        grep -F 'Status::Timeout' "$1" >/dev/null
+}
+if ! bounded_reader_source "$transport"; then
+    echo 'FAIL: production bounded reader is missing' >&2
+    exit 1
+fi
+receive_mutant=$(mktemp "${TMPDIR:-/tmp}/p50localtransport-receive-mutant.XXXXXX")
+trap 'rm -f "$send_mutant" "$receive_mutant"' EXIT HUP INT TERM
+sed 's/read_frame_until(fd_, frame, deadline)/read_frame(fd_, frame)/' \
+    "$transport" >"$receive_mutant"
+if bounded_reader_source "$receive_mutant"; then
+    echo 'FAIL: bounded reader deletion/bypass mutant was accepted' >&2
+    exit 1
+fi
+echo 'ok - bounded reader deletion/bypass mutant is rejected'
+
+# A bounded operation must use per-call MSG_DONTWAIT and never toggle the
+# shared open-file-description status flags.  Keep the terminal poll checks
+# explicit so a POLLERR/POLLHUP/POLLNVAL deletion mutant is visible in review.
+if grep -F 'F_SETFL' "$transport" >/dev/null; then
+    echo 'FAIL: bounded transport mutates shared O_NONBLOCK state' >&2
+    exit 1
+fi
+grep -F 'wait_for_io' "$transport" >/dev/null
+grep -F '(POLLERR | POLLNVAL)' "$transport" >/dev/null
+grep -F '(POLLERR | POLLHUP | POLLNVAL)' "$transport" >/dev/null
+grep -F 'events & POLLOUT' "$transport" >/dev/null
+grep -F 'POLLHUP' "$transport" >/dev/null
+echo 'ok - bounded transport preserves shared flags and rejects terminal poll state'
 
 listener_body() {
     sed -n '/^static int listen_unix_impl/,/^Connection connect_unix/p' "$1"

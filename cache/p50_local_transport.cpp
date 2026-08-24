@@ -62,6 +62,70 @@ bool valid_type(uint16_t type) {
            type <= static_cast<uint16_t>(MessageType::Goodbye);
 }
 
+enum class WaitResult {
+    Ready,
+    Timeout,
+    Error,
+};
+
+// Wait using the absolute deadline without changing the descriptor's shared
+// file-status flags.  A millisecond floor is avoided: when less than one
+// millisecond remains, poll(2) with zero performs a readiness probe and the
+// loop checks the real steady-clock deadline again.  This keeps a 100us
+// deadline from becoming a one-millisecond deadline.  We also never add a
+// rounding constant to a duration, which keeps time_point::max() and other
+// very large deadlines free of signed overflow.
+WaitResult wait_for_io(int fd, short events,
+                       std::chrono::steady_clock::time_point deadline) noexcept {
+    if (fd < 0)
+        return WaitResult::Error;
+
+    for (;;) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline)
+            return WaitResult::Timeout;
+
+        const auto remaining = deadline - now;
+        int poll_timeout = 0;
+        const auto max_poll_duration =
+            std::chrono::milliseconds(std::numeric_limits<int>::max());
+        if (remaining >= max_poll_duration) {
+            poll_timeout = std::numeric_limits<int>::max();
+        } else {
+            const auto whole_milliseconds =
+                std::chrono::duration_cast<std::chrono::milliseconds>(remaining).count();
+            // A sub-millisecond remainder must be probed without sleeping.
+            poll_timeout = whole_milliseconds <= 0
+                               ? 0
+                               : static_cast<int>(whole_milliseconds);
+        }
+
+        struct pollfd descriptor{fd, events, 0};
+        const int ready = ::poll(&descriptor, 1, poll_timeout);
+        if (ready < 0) {
+            if (errno == EINTR)
+                continue;
+            return WaitResult::Error;
+        }
+        if (ready == 0)
+            continue;
+
+        // Output readiness must never mask a terminal/error condition.  For
+        // input, POLLHUP is retained only when POLLIN is also present so the
+        // nonblocking recv can classify a clean EOF or a partial frame.
+        if ((events & POLLOUT) != 0 &&
+            (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
+            return WaitResult::Error;
+        if ((descriptor.revents & (POLLERR | POLLNVAL)) != 0)
+            return WaitResult::Error;
+        if ((descriptor.revents & events) != 0)
+            return WaitResult::Ready;
+        if ((events & POLLIN) != 0 && (descriptor.revents & POLLHUP) != 0)
+            return WaitResult::Ready;
+        return WaitResult::Error;
+    }
+}
+
 Status read_exact(int fd, std::span<uint8_t> out, bool clean_eof) {
     size_t done = 0;
     while (done != out.size()) {
@@ -80,31 +144,26 @@ Status read_exact(int fd, std::span<uint8_t> out, bool clean_eof) {
 
 Status read_exact_until(int fd, std::span<uint8_t> out, bool clean_eof,
                         std::chrono::steady_clock::time_point deadline) {
+#if !defined(MSG_DONTWAIT)
+    // The bounded API cannot safely emulate per-call nonblocking I/O by
+    // toggling O_NONBLOCK: that flag belongs to the shared open file
+    // description and would race a concurrent reader.  Fail closed on a
+    // platform without MSG_DONTWAIT rather than changing reader semantics.
+    (void)fd;
+    (void)out;
+    (void)clean_eof;
+    (void)deadline;
+    return Status::IoError;
+#else
     size_t done = 0;
     while (done != out.size()) {
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline)
+        const WaitResult waited = wait_for_io(fd, POLLIN, deadline);
+        if (waited == WaitResult::Timeout)
+            return Status::Timeout;
+        if (waited == WaitResult::Error)
             return Status::IoError;
-        const auto remaining_us =
-            std::chrono::duration_cast<std::chrono::microseconds>(deadline - now).count();
-        const long long rounded_ms = (remaining_us + 999) / 1000;
-        const int poll_ms = static_cast<int>(
-            std::clamp<long long>(rounded_ms, 1, std::numeric_limits<int>::max()));
-        struct pollfd descriptor{fd, POLLIN | POLLERR | POLLHUP, 0};
-        const int ready = ::poll(&descriptor, 1, poll_ms);
-        if (ready == 0)
-            return Status::IoError;
-        if (ready < 0) {
-            if (errno == EINTR)
-                continue;
-            return Status::IoError;
-        }
-        int receive_flags = 0;
-#if defined(MSG_DONTWAIT)
-        receive_flags = MSG_DONTWAIT;
-#endif
         const ssize_t count =
-            ::recv(fd, out.data() + done, out.size() - done, receive_flags);
+            ::recv(fd, out.data() + done, out.size() - done, MSG_DONTWAIT);
         if (count == 0)
             return done == 0 && clean_eof ? Status::CleanEof : Status::Truncated;
         if (count < 0) {
@@ -115,6 +174,7 @@ Status read_exact_until(int fd, std::span<uint8_t> out, bool clean_eof,
         done += static_cast<size_t>(count);
     }
     return Status::Ok;
+#endif
 }
 
 Status write_all(int fd, std::span<const uint8_t> bytes) {
@@ -137,70 +197,27 @@ Status write_all(int fd, std::span<const uint8_t> bytes) {
     return Status::Ok;
 }
 
-bool set_file_status_flags(int fd, int wanted) noexcept {
-    for (;;) {
-        if (::fcntl(fd, F_SETFL, wanted) == 0)
-            return true;
-        if (errno != EINTR)
-            return false;
-    }
-}
-
 Status write_all_until(int fd, std::span<const uint8_t> bytes,
                        std::chrono::steady_clock::time_point deadline) noexcept {
-    int original_flags = -1;
-    for (;;) {
-        original_flags = ::fcntl(fd, F_GETFL);
-        if (original_flags >= 0 || errno != EINTR)
-            break;
-    }
-    if (original_flags < 0)
-        return Status::IoError;
-
-    // Set O_NONBLOCK for the duration of this operation, so a successful poll
-    // can never be followed by a blocking send of a larger frame (including
-    // on targets without MSG_DONTWAIT).  The descriptor's original status
-    // flags are restored before returning.
-    const bool changed_nonblocking = (original_flags & O_NONBLOCK) == 0;
-    if (changed_nonblocking && !set_file_status_flags(fd, original_flags | O_NONBLOCK))
-        return Status::IoError;
-
-    Status result = Status::Ok;
+#if !defined(MSG_DONTWAIT)
+    // See read_exact_until: per-call bounded I/O must not mutate O_NONBLOCK on
+    // a descriptor shared with another Connection or another thread.
+    (void)fd;
+    (void)bytes;
+    (void)deadline;
+    return Status::IoError;
+#else
     size_t done = 0;
     while (done != bytes.size()) {
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline) {
-            result = Status::Timeout;
-            break;
-        }
-        const auto remaining_us =
-            std::chrono::duration_cast<std::chrono::microseconds>(deadline - now).count();
-        const long long rounded_ms = (remaining_us + 999) / 1000;
-        const int poll_ms = static_cast<int>(
-            std::clamp<long long>(rounded_ms, 1, std::numeric_limits<int>::max()));
-        struct pollfd descriptor{fd, POLLOUT | POLLERR | POLLHUP, 0};
-        const int ready = ::poll(&descriptor, 1, poll_ms);
-        if (ready == 0) {
-            result = Status::Timeout;
-            break;
-        }
-        if (ready < 0) {
-            if (errno == EINTR)
-                continue;
-            result = Status::IoError;
-            break;
-        }
-        if ((descriptor.revents & POLLOUT) == 0) {
-            result = Status::IoError;
-            break;
-        }
+        const WaitResult waited = wait_for_io(fd, POLLOUT, deadline);
+        if (waited == WaitResult::Timeout)
+            return Status::Timeout;
+        if (waited == WaitResult::Error)
+            return Status::IoError;
 
-        int send_flags = 0;
+        int send_flags = MSG_DONTWAIT;
 #if defined(MSG_NOSIGNAL)
         send_flags |= MSG_NOSIGNAL;
-#endif
-#if defined(MSG_DONTWAIT)
-        send_flags |= MSG_DONTWAIT;
 #endif
         const ssize_t count = ::send(fd, bytes.data() + done, bytes.size() - done, send_flags);
         if (count > 0) {
@@ -209,16 +226,11 @@ Status write_all_until(int fd, std::span<const uint8_t> bytes,
         }
         if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
             continue;
-        result = Status::IoError;
-        break;
+        return Status::IoError;
     }
 
-    if (result == Status::Ok && std::chrono::steady_clock::now() > deadline)
-        result = Status::Timeout;
-    if (changed_nonblocking && !set_file_status_flags(fd, original_flags) &&
-        result == Status::Ok)
-        result = Status::IoError;
-    return result;
+    return std::chrono::steady_clock::now() >= deadline ? Status::Timeout : Status::Ok;
+#endif
 }
 
 bool set_cloexec(int fd) {
@@ -483,7 +495,7 @@ Status Connection::receive_with_timeout(Frame& frame, int timeout_ms) noexcept {
     try {
         const auto deadline =
             std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-        return read_frame_until(fd_, frame, deadline);
+        return receive_until(frame, deadline);
     } catch (...) {
         return Status::IoError;
     }
@@ -563,6 +575,17 @@ Status Connection::send_until(const Frame& frame,
     }
     writing_.clear(std::memory_order_release);
     return status;
+}
+
+Status Connection::receive_until(Frame& frame,
+                                 std::chrono::steady_clock::time_point deadline) noexcept {
+    if (fd_ < 0)
+        return status_;
+    try {
+        return read_frame_until(fd_, frame, deadline);
+    } catch (...) {
+        return Status::IoError;
+    }
 }
 
 Status Connection::receive(Frame& frame) noexcept {

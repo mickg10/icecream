@@ -1,7 +1,5 @@
 #include "p50_daemon_cache_dispatch.h"
 
-#include <algorithm>
-#include <climits>
 #include <limits>
 
 #include "comm.h"
@@ -44,15 +42,8 @@ bool CacheSessionDispatcher::attach_authenticated(local::Connection connection,
         local::Status::Ok) {
         return false;
     }
-    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-        deadline - std::chrono::steady_clock::now());
-    if (remaining.count() <= 0)
-        return false;
-    const int receive_timeout = static_cast<int>(std::min<long long>(
-        remaining.count(), static_cast<long long>(INT_MAX)));
     local::Frame acknowledgement;
-    if (connection.receive_with_timeout(acknowledgement,
-                                        receive_timeout) !=
+    if (connection.receive_until(acknowledgement, deadline) !=
             local::Status::Ok ||
         local::validate_handshake(acknowledgement,
                                   local::MessageType::HelloAck,

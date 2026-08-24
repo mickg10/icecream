@@ -8,6 +8,7 @@
 
 #include <array>
 #include <cassert>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -53,6 +54,35 @@ bool replace_listener_path_after_bind(const char* path) noexcept {
 Frame data_frame() {
     return Frame{kProtocolVersion, MessageType::Data, Identity{17, 42},
                  {0, 1, 2, 3, 4, 5}};
+}
+
+bool saturate_socket(int fd, size_t* bytes_filled = nullptr) {
+    const int original_flags = ::fcntl(fd, F_GETFL);
+    if (original_flags < 0 || ::fcntl(fd, F_SETFL, original_flags | O_NONBLOCK) != 0)
+        return false;
+
+    std::array<unsigned char, 64 * 1024> bytes{};
+    size_t total = 0;
+    bool saturated = false;
+    for (;;) {
+        int send_flags = 0;
+#if defined(MSG_NOSIGNAL)
+        send_flags |= MSG_NOSIGNAL;
+#endif
+        const ssize_t count = ::send(fd, bytes.data(), bytes.size(), send_flags);
+        if (count > 0) {
+            total += static_cast<size_t>(count);
+            continue;
+        }
+        if (count < 0 && errno == EINTR)
+            continue;
+        saturated = count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
+        break;
+    }
+    const bool restored = ::fcntl(fd, F_SETFL, original_flags) == 0;
+    if (bytes_filled != nullptr)
+        *bytes_filled = total;
+    return saturated && restored;
 }
 
 std::array<uint8_t, kFrameHeaderSize> oversize_header() {
@@ -134,6 +164,7 @@ void bounded_send_is_wall_time_limited() {
     int send_buffer = 1024;
     CHECK(::setsockopt(sockets[0], SOL_SOCKET, SO_SNDBUF, &send_buffer,
                        sizeof(send_buffer)) == 0);
+    CHECK(saturate_socket(sockets[0]));
     Connection writer(sockets[0]);
     CHECK(writer.valid());
 
@@ -154,6 +185,7 @@ void bounded_send_is_wall_time_limited() {
     CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, concurrent_sockets) == 0);
     CHECK(::setsockopt(concurrent_sockets[0], SOL_SOCKET, SO_SNDBUF, &send_buffer,
                        sizeof(send_buffer)) == 0);
+    CHECK(saturate_socket(concurrent_sockets[0]));
     Connection concurrent_writer(concurrent_sockets[0]);
     CHECK(concurrent_writer.valid());
     std::atomic<bool> started{false};
@@ -185,6 +217,156 @@ void bounded_send_is_wall_time_limited() {
     CHECK(read_frame(successful_sockets[1], received) == Status::Ok);
     CHECK(received == data_frame());
     ::close(successful_sockets[1]);
+}
+
+void absolute_deadline_edges() {
+    int sockets[2] = {-1, -1};
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    int send_buffer = 1024;
+    CHECK(::setsockopt(sockets[0], SOL_SOCKET, SO_SNDBUF, &send_buffer,
+                       sizeof(send_buffer)) == 0);
+    CHECK(saturate_socket(sockets[0]));
+    Connection writer(sockets[0]);
+    Frame large = data_frame();
+    large.payload.assign(kMaxFramePayload, 0xa5);
+
+    const auto short_start = std::chrono::steady_clock::now();
+    CHECK(writer.send_until(large, short_start + std::chrono::microseconds(100)) ==
+          Status::Timeout);
+    const auto short_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - short_start).count();
+    // This is deliberately below the old ceil-to-one-millisecond behavior;
+    // leave a little scheduler slack while still detecting a millisecond
+    // floor on an otherwise idle test host.
+    CHECK(short_elapsed < 1000);
+    ::close(sockets[1]);
+
+    int max_sockets[2] = {-1, -1};
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, max_sockets) == 0);
+    CHECK(::setsockopt(max_sockets[0], SOL_SOCKET, SO_SNDBUF, &send_buffer,
+                       sizeof(send_buffer)) == 0);
+    CHECK(saturate_socket(max_sockets[0]));
+    Connection max_writer(max_sockets[0]);
+    std::thread close_peer([peer = max_sockets[1]] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        ::close(peer);
+    });
+    const auto max_start = std::chrono::steady_clock::now();
+    CHECK(max_writer.send_until(large, std::chrono::steady_clock::time_point::max()) ==
+          Status::IoError);
+    close_peer.join();
+    const auto max_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - max_start).count();
+    CHECK(max_elapsed < 500);
+}
+
+void concurrent_reader_during_bounded_send() {
+    int sockets[2] = {-1, -1};
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    int send_buffer = 1024;
+    CHECK(::setsockopt(sockets[0], SOL_SOCKET, SO_SNDBUF, &send_buffer,
+                       sizeof(send_buffer)) == 0);
+    CHECK(saturate_socket(sockets[0]));
+    Connection writer(sockets[0]);
+    Frame large = data_frame();
+    large.payload.assign(kMaxFramePayload, 0x5a);
+    Status send_status = Status::InvalidArgument;
+    std::thread sender([&] {
+        send_status = writer.send_until(
+            large, std::chrono::steady_clock::now() + std::chrono::milliseconds(140));
+    });
+    while (!writer.writing_.test(std::memory_order_acquire))
+        std::this_thread::yield();
+    // Ensure the bounded writer is in its wait before starting a blocking
+    // receive on the same Connection/open file description.
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+    Frame received;
+    Status receive_status = Status::InvalidArgument;
+    std::thread reader([&] { receive_status = writer.receive(received); });
+    const auto bytes = encode_frame(data_frame());
+    std::thread peer_sender([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        size_t done = 0;
+        while (done != bytes.size()) {
+            int send_flags = 0;
+#if defined(MSG_NOSIGNAL)
+            send_flags |= MSG_NOSIGNAL;
+#endif
+            const ssize_t count = ::send(sockets[1], bytes.data() + done,
+                                         bytes.size() - done, send_flags);
+            if (count > 0) {
+                done += static_cast<size_t>(count);
+            } else if (count < 0 && errno == EINTR) {
+                continue;
+            } else {
+                break;
+            }
+        }
+    });
+    reader.join();
+    peer_sender.join();
+    sender.join();
+    CHECK(receive_status == Status::Ok);
+    CHECK(received == data_frame());
+    CHECK(send_status == Status::Timeout);
+    CHECK((::fcntl(writer.fd_, F_GETFL) & O_NONBLOCK) == 0);
+    ::close(sockets[1]);
+}
+
+void absolute_receive_budget_and_terminal_teardown() {
+    int sockets[2] = {-1, -1};
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    Connection reader(sockets[1]);
+    const auto bytes = encode_frame(data_frame());
+    CHECK(::send(sockets[0], bytes.data(), kFrameHeaderSize, MSG_NOSIGNAL) ==
+          static_cast<ssize_t>(kFrameHeaderSize));
+    std::thread delayed_payload([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+        ::send(sockets[0], bytes.data() + kFrameHeaderSize,
+               bytes.size() - kFrameHeaderSize, MSG_NOSIGNAL);
+    });
+    Frame ignored;
+    const auto deadline_start = std::chrono::steady_clock::now();
+    CHECK(reader.receive_until(ignored, deadline_start + std::chrono::milliseconds(70)) ==
+          Status::Timeout);
+    delayed_payload.join();
+    const auto deadline_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - deadline_start).count();
+    CHECK(deadline_elapsed < 400);
+    ::close(sockets[0]);
+
+    int partial_sockets[2] = {-1, -1};
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, partial_sockets) == 0);
+    Connection partial_reader(partial_sockets[1]);
+    CHECK(::send(partial_sockets[0], bytes.data(), kFrameHeaderSize + 1,
+                 MSG_NOSIGNAL) == static_cast<ssize_t>(kFrameHeaderSize + 1));
+    ::close(partial_sockets[0]);
+    CHECK(partial_reader.receive_until(
+              ignored, std::chrono::steady_clock::now() + std::chrono::seconds(1)) ==
+          Status::Truncated);
+}
+
+void terminal_poll_errors_and_sigpipe_safety() {
+    int sockets[2] = {-1, -1};
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    Connection writer(sockets[0]);
+    ::close(sockets[1]);
+    const auto start = std::chrono::steady_clock::now();
+    CHECK(writer.send_until(data_frame(), start + std::chrono::seconds(1)) == Status::IoError);
+    CHECK(std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now() - start)
+              .count() < 200);
+
+    int invalid_sockets[2] = {-1, -1};
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, invalid_sockets) == 0);
+    Connection invalid(invalid_sockets[0]);
+    ::close(invalid.fd_);
+    CHECK(invalid.send_until(data_frame(),
+                             std::chrono::steady_clock::now() + std::chrono::seconds(1)) ==
+          Status::IoError);
+    invalid.fd_ = -1;
+    ::close(invalid_sockets[1]);
 }
 
 void handshake_identity() {
@@ -367,6 +549,10 @@ int main() {
         framing_and_limits();
         single_writer_busy_is_load_bearing();
         bounded_send_is_wall_time_limited();
+        absolute_deadline_edges();
+        concurrent_reader_during_bounded_send();
+        absolute_receive_budget_and_terminal_teardown();
+        terminal_poll_errors_and_sigpipe_safety();
         handshake_identity();
         truncated_read();
         credentials();

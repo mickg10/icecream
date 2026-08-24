@@ -16,7 +16,8 @@ grep -F 'decoded_type != kCacheSession' "$impl" >/dev/null
 grep -F 'peer_credentials_verified' "$impl" >/dev/null
 grep -F 'validate_handshake' "$impl" >/dev/null
 grep -F 'connection.send_until' "$impl" >/dev/null
-grep -F 'connection.receive_with_timeout' "$impl" >/dev/null
+grep -F 'connection.receive_until' "$impl" >/dev/null
+grep -F 'const auto deadline' "$impl" >/dev/null
 grep -F 'identity != identity_' "$impl" >/dev/null
 grep -F 'next_request_id_++' "$impl" >/dev/null
 grep -F 'disable();' "$impl" >/dev/null
@@ -48,7 +49,7 @@ done
 
 bounded_hello_source() {
     grep -F 'connection.send_until' "$1" >/dev/null &&
-        grep -F 'connection.receive_with_timeout' "$1" >/dev/null &&
+        grep -F 'connection.receive_until' "$1" >/dev/null &&
         grep -F 'validate_handshake' "$1" >/dev/null
 }
 if ! bounded_hello_source "$impl"; then
@@ -67,9 +68,27 @@ if bounded_hello_source "$mutant"; then
 fi
 echo 'ok - HELLO bounded-send deletion/bypass mutant is rejected'
 
-# This lane must not silently acquire endpoint or cache-service ownership.
-if git -C "$src" diff --name-only | grep -E 'p50_(cache_service|endpoint)'; then
+# This lane must not silently acquire endpoint or cache-service ownership.  The
+# archive gate is intentionally independent of Git: exact source archives do
+# not have a repository metadata directory, and a failing `git diff` pipeline
+# there used to produce noisy false evidence.  Scan every production wiring
+# file directly for forbidden ownership references instead.
+source_boundary_clean() {
+    for file in "$impl" "$header" "$daemon" "$makefile" "$test"; do
+        if grep -nE 'p50_(cache_service|endpoint)([.]cpp|[.]h|[[:space:]])' \
+            "$file" >/dev/null; then
+            return 1
+        fi
+    done
+}
+if ! source_boundary_clean; then
     echo 'FAIL: daemon cache-dispatch lane edited service/endpoint sources' >&2
     exit 1
 fi
+echo 'ok - daemon cache-dispatch source boundary holds without Git metadata'
+
+grep -F '(POLLERR | POLLNVAL)' "$src/cache/p50_local_transport.cpp" >/dev/null
+grep -F 'events & POLLOUT' "$src/cache/p50_local_transport.cpp" >/dev/null
+grep -F 'POLLHUP' "$src/cache/p50_local_transport.cpp" >/dev/null
+echo 'ok - transport terminal poll conditions are explicit'
 echo 'ok - daemon cache-dispatch source and mutant gates hold'

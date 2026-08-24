@@ -4,9 +4,11 @@
 #include "../cache/p50_daemon_cache_dispatch.h"
 #include "comm.h"
 
+#include <algorithm>
 #include <array>
 #include <arpa/inet.h>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -106,22 +108,31 @@ bool attach_current(CacheSessionDispatcher &dispatcher,
                                                              identity));
 }
 
-bool saturate_nonreading_peer(int fd) {
+bool saturate_nonreading_peer(int fd, size_t* bytes_filled = nullptr) {
     int send_buffer = 1024;
     if (::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer)) != 0)
         return false;
-    const int flags = ::fcntl(fd, F_GETFL);
-    if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0)
+    const int original_flags = ::fcntl(fd, F_GETFL);
+    if (original_flags < 0 || ::fcntl(fd, F_SETFL, original_flags | O_NONBLOCK) != 0)
         return false;
     std::array<unsigned char, 64 * 1024> bytes{};
+    size_t total = 0;
+    bool saturated = false;
     for (;;) {
         const ssize_t count = ::send(fd, bytes.data(), bytes.size(), MSG_NOSIGNAL);
-        if (count > 0)
+        if (count > 0) {
+            total += static_cast<size_t>(count);
             continue;
+        }
         if (count < 0 && errno == EINTR)
             continue;
-        return count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
+        saturated = count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
+        break;
     }
+    const bool restored = ::fcntl(fd, F_SETFL, original_flags) == 0;
+    if (bytes_filled != nullptr)
+        *bytes_filled = total;
+    return saturated && restored;
 }
 
 void send_cache_session(MsgChannel *sender) {
@@ -157,6 +168,64 @@ int main() {
               "saturated non-reading sidecar cannot complete HELLO");
         CHECK(elapsed >= 150 && elapsed <= 900,
               "HELLO send timeout remains within its absolute wall-time bound");
+    }
+
+    /* The HELLO writer and ACK reader share one absolute deadline.  Delay
+       draining a saturated outbound socket before acknowledging: a restarted
+       relative receive budget would accept this exchange after 250ms, while
+       the unchanged deadline must fail at the original bound. */
+    {
+        int side_fds[2] = {-1, -1};
+        CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, side_fds) == 0,
+              "shared HELLO deadline socketpair created");
+        size_t saturated_bytes = 0;
+        CHECK(saturate_nonreading_peer(side_fds[0], &saturated_bytes),
+              "shared HELLO deadline peer is saturated");
+        Connection daemon_side(side_fds[0]);
+        Connection receiver_side(side_fds[1]);
+        authenticate(daemon_side);
+        CacheSessionDispatcher dispatcher(Identity{6, 11});
+        bool hello_valid = false;
+        Status acknowledgement_status = Status::InvalidArgument;
+        std::thread sidecar([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            std::array<unsigned char, 4096> discarded{};
+            size_t remaining = saturated_bytes;
+            while (remaining != 0) {
+                const ssize_t count = ::recv(
+                    side_fds[1], discarded.data(),
+                    std::min(remaining, discarded.size()), 0);
+                if (count > 0) {
+                    remaining -= static_cast<size_t>(count);
+                } else if (count < 0 && errno == EINTR) {
+                    continue;
+                } else {
+                    return;
+                }
+            }
+            Frame hello;
+            hello_valid = receiver_side.receive_with_timeout(hello, 100) == Status::Ok &&
+                          icecc::p50::local::validate_handshake(
+                              hello, MessageType::Hello, PeerRole::Daemon,
+                              Identity{6, 11}) == Status::Ok;
+            std::this_thread::sleep_for(std::chrono::milliseconds(180));
+            acknowledgement_status = receiver_side.send(
+                icecc::p50::local::make_hello_ack(PeerRole::Sidecar,
+                                                  Identity{6, 11}));
+        });
+        const auto start = std::chrono::steady_clock::now();
+        const bool attached = dispatcher.attach_authenticated(
+            std::move(daemon_side), Identity{6, 11});
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        sidecar.join();
+        CHECK(!attached && !dispatcher.available(),
+              "delayed ACK cannot renew the original HELLO budget");
+        CHECK(hello_valid, "delayed-ACK sidecar received the HELLO after drain");
+        CHECK(acknowledgement_status != Status::Ok,
+              "delayed ACK observes the daemon-side deadline teardown");
+        CHECK(elapsed >= 190 && elapsed <= 650,
+              "HELLO send and ACK receive share one bounded wall-time budget");
     }
 
     {

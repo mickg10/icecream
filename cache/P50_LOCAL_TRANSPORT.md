@@ -37,13 +37,17 @@ platforms with neither fail closed.
 writer.  It encodes the complete frame before writing and carries one absolute
 `steady_clock` deadline across every partial write.  Polling plus nonblocking
 writes prevents a writable hint from turning into a blocking send; timeout
-returns `Status::Timeout`, preserves the one-writer gate, and restores the
-descriptor's original status flags.  SIGPIPE protection remains the same as
-the ordinary writer.
+returns `Status::Timeout` and preserves the one-writer gate.  Per-call
+`MSG_DONTWAIT` avoids mutating `O_NONBLOCK` on the shared open file
+description; platforms without that primitive fail closed.  Poll error and
+hangup bits are checked before output readiness, and SIGPIPE protection
+remains the same as the ordinary writer.
 
-The connection also exposes peer verification and a finite-time framed receive
-without exposing a borrowed descriptor.  This lets a synchronous control
-owner wake and close a stalled relationship during signal-driven shutdown.
+The connection also exposes peer verification and both
+`receive_with_timeout()` and `receive_until()` framed receives without
+exposing a borrowed descriptor.  The absolute form covers the complete header
+and payload under one unchanged deadline, allowing a synchronous control owner
+to wake and close a stalled relationship during signal-driven shutdown.
 
 Socket paths must be absolute, contain no embedded NUL, and reside in a
 directory owned by the effective user with exact mode `0700`.  The listener

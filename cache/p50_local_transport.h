@@ -129,6 +129,12 @@ public:
     // write to drain and never releases the one-writer gate early.
     Status send_until(const Frame& frame,
                       std::chrono::steady_clock::time_point deadline) noexcept;
+
+    // Reads one complete encoded frame under the supplied absolute deadline.
+    // The same deadline covers both the fixed header and the payload, so a
+    // peer cannot extend the operation by sending a partial frame slowly.
+    Status receive_until(Frame& frame,
+                         std::chrono::steady_clock::time_point deadline) noexcept;
     Status receive(Frame& frame) noexcept;
 
 private:

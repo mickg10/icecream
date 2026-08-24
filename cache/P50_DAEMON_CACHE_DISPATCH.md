@@ -25,8 +25,9 @@ READY integration.
 
 The HELLO send uses `Connection::send_until()` over one absolute wall-time
 budget for the complete encoded frame, including partial writes.  Its bounded
-ACK receive consumes only the remaining portion of that same handshake
-budget, while one-writer `Busy` and SIGPIPE protections remain in force.
+ACK receive uses `Connection::receive_until()` with that exact unchanged
+deadline, so a delayed ACK cannot restart the budget.  One-writer `Busy` and
+SIGPIPE protections remain in force.
 
 The positive real-daemon sidecar path is **not wired yet**.  The daemon starts
 with the controller unavailable because the lifecycle-only
