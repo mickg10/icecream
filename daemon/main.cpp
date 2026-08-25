@@ -111,6 +111,8 @@
 #include "getifaddrs.h"
 #include "p50_daemon_sidecar_adapter.h"
 #include "p50_completion_record.h"
+#include "p50_daemon_cache_dispatch.h"
+#include "p50_input_wait.h"
 
 static std::string pidFilePath;
 static volatile sig_atomic_t exit_main_loop = 0;
@@ -483,6 +485,9 @@ public:
      *          and await the finish of it
      * TOINSTALL: We're receiving an environment transfer and wait for it to complete.
      * WAITINSTALL: Client is waiting for the environment transfer unpacking child to finish.
+     * WAITP50INPUT: Protocol-50 CompileFile arm was accepted; wait for the
+     *               exact ready envelope and sealed source FD before queueing
+     *               a compiler.
      * TOCOMPILE: We're supposed to compile it ourselves
      * WAITFORCS: Client asked for a CS and we asked the scheduler - waiting for its answer
      * WAITCOMPILE: Client got a CS and will ask him now (it's not me)
@@ -490,7 +495,7 @@ public:
      * WAITFORCHILD: Client is waiting for the compile job to finish.
      * WAITCREATEENV: We're waiting for icecc-create-env to finish.
      */
-    enum Status { UNKNOWN, GOTNATIVE, PENDING_USE_CS, JOBDONE, LINKJOB, TOINSTALL, WAITINSTALL, TOCOMPILE,
+    enum Status { UNKNOWN, GOTNATIVE, PENDING_USE_CS, JOBDONE, LINKJOB, TOINSTALL, WAITINSTALL, WAITP50INPUT, TOCOMPILE,
                   WAITFORCS, FORWARDING_USE_CS, WAITCOMPILE, CLIENTWORK, WAITFORCHILD, WAITCREATEENV,
                   LASTSTATE = WAITCREATEENV
                 } status;
@@ -580,6 +585,25 @@ public:
         status_why = why ? why : "";
     }
 
+    // These are the only legal F-daemon transitions for the two-phase P50
+    // source seam.  The production private-listener adapter is intentionally
+    // a later transplant; keeping the reducer here prevents future callers
+    // from bypassing WAITP50INPUT and queueing a compiler early.
+    bool arm_p50_source(const icecc::p50::P50SourceArm& source_arm) {
+        if (!p50_input_wait.arm_input(source_arm))
+            return false;
+        set_status(WAITP50INPUT, "p50: source arm ACKed; waiting for exact input");
+        return true;
+    }
+
+    bool accept_p50_input(const icecc::p50::P50InputReady& ready, int sealed_fd) {
+        if (status != WAITP50INPUT ||
+            !p50_input_wait.accept_ready(ready, sealed_fd))
+            return false;
+        set_status(TOCOMPILE, "p50: exact ready/sealed input attached");
+        return true;
+    }
+
     static string status_str(Status status) {
         switch (status) {
         case UNKNOWN:
@@ -596,6 +620,8 @@ public:
             return "toinstall";
         case WAITINSTALL:
             return "waitinstall";
+        case WAITP50INPUT:
+            return "waitp50input";
         case TOCOMPILE:
             return "tocompile";
         case WAITFORCS:
@@ -710,6 +736,10 @@ public:
     string timing_mode;
     bool local_preprocess;
     bool running_preprocess;
+    // F-side Protocol-50 wait owner.  The future attachment adapter must call
+    // arm_input()/accept_ready(); it must never set TOCOMPILE directly for an
+    // armed P50 job.
+    icecc::p50::daemon::P50InputWaitState p50_input_wait;
 
     string dump() const {
         uint64_t age_msec = monotonic_msec() - status_since_msec;
@@ -3269,6 +3299,7 @@ bool Daemon::should_track_client_job(const Client *client)
     case Client::JOBDONE:
     case Client::LINKJOB:
     case Client::TOCOMPILE:
+    case Client::WAITP50INPUT:
     case Client::WAITFORCS:
     case Client::FORWARDING_USE_CS:
     case Client::WAITCOMPILE:
@@ -5388,6 +5419,7 @@ std::string Daemon::dump_state_json() const
         case Client::WAITCOMPILE:
         case Client::CLIENTWORK:
         case Client::TOCOMPILE:
+        case Client::WAITP50INPUT:
         case Client::WAITFORCHILD:
         case Client::TOINSTALL:
         case Client::WAITINSTALL:
@@ -6129,6 +6161,7 @@ bool Daemon::handle_transfer_env(Client *client, EnvTransferMsg *emsg)
     assert(client->status != Client::TOINSTALL &&
            client->status != Client::WAITINSTALL &&
            client->status != Client::TOCOMPILE &&
+           client->status != Client::WAITP50INPUT &&
            client->status != Client::WAITCOMPILE);
     assert(client->pipe_from_child < 0);
     assert(client->pipe_to_child < 0);
@@ -6367,6 +6400,7 @@ void Daemon::check_cache_size(const string &new_env)
 
                 for (Clients::const_iterator it2 = clients.begin(); it2 != clients.end(); ++it2)  {
                     if (it2->second->status == Client::TOCOMPILE
+                            || it2->second->status == Client::WAITP50INPUT
                             || it2->second->status == Client::TOINSTALL
                             || it2->second->status == Client::WAITINSTALL
                             || it2->second->status == Client::WAITFORCHILD) {
@@ -7291,8 +7325,12 @@ void Daemon::handle_end(Client *client, int exitcode)
                      "handle_end");
     remember_finished_job(client, exitcode);
     if (client->job && (client->status == Client::TOCOMPILE
+                        || client->status == Client::WAITP50INPUT
                         || client->status == Client::WAITFORCHILD)) {
         finish_assignment_claim(client->job->jobID());
+    }
+    if (client->status == Client::WAITP50INPUT) {
+        client->p50_input_wait.close();
     }
     fd2client.erase(client->channel->fd);
 
@@ -7357,7 +7395,8 @@ void Daemon::handle_end(Client *client, int exitcode)
         int job_id = client->job_id;
         bool use_client_id = false;
 
-        if (client->status == Client::TOCOMPILE) {
+        if (client->status == Client::TOCOMPILE ||
+            client->status == Client::WAITP50INPUT) {
             job_id = client->job->jobID();
         }
 
@@ -7383,6 +7422,7 @@ void Daemon::handle_end(Client *client, int exitcode)
 
             switch (client->status) {
             case Client::TOCOMPILE:
+            case Client::WAITP50INPUT:
                 flag = JobDoneMsg::FROM_SERVER;
                 break;
             case Client::UNKNOWN:
@@ -8088,7 +8128,8 @@ void Daemon::answer_client_requests()
         assert(client);
         int current_status = client->status;
         bool ignore_channel = current_status == Client::WAITFORCHILD ||
-                              current_status == Client::WAITINSTALL;
+                              current_status == Client::WAITINSTALL ||
+                              current_status == Client::WAITP50INPUT;
 
         /* when the remote host is full with work, the wait time for it to free up and
            fork a child to compile could be long. If the input is ready to read, we will read
@@ -8117,7 +8158,8 @@ void Daemon::answer_client_requests()
                    select_channel = true is wrong. */
                 current_status = client->status;
                 const bool now_ignore = current_status == Client::WAITFORCHILD
-                                        || current_status == Client::WAITINSTALL;
+                                        || current_status == Client::WAITINSTALL
+                                        || current_status == Client::WAITP50INPUT;
                 select_channel = (current_status == Client::TOCOMPILE) || !now_ignore;
                 if (c->has_msg()) {
                     buffered_client_pending = true;   /* more parsed bytes remain */
@@ -8369,6 +8411,7 @@ void Daemon::answer_client_requests()
                         }
 
                         if (client->status == Client::TOCOMPILE
+                                || client->status == Client::WAITP50INPUT
                                 || client->status == Client::WAITFORCHILD
                                 || client->status == Client::WAITINSTALL) {
                             break;
@@ -8408,9 +8451,18 @@ void Daemon::answer_client_requests()
                            if we didn't read it now, the client would be blocked and timed out */
                         c->read_a_bit();
                     }
+                    else if (client->status == Client::WAITP50INPUT)
+                    {
+                        // The ordinary link is deliberately not consumed
+                        // while the private exact-ready attachment is pending.
+                        // In particular, no legacy FileChunk/END fallback may
+                        // race the WAITP50INPUT -> TOCOMPILE transition.
+                    }
                     else
                     {
-                        assert(client->status != Client::TOCOMPILE && client->status != Client::WAITINSTALL);
+                        assert(client->status != Client::TOCOMPILE &&
+                               client->status != Client::WAITP50INPUT &&
+                               client->status != Client::WAITINSTALL);
 
                         while (!c->read_a_bit() || c->has_msg()) {
                             const bool alive = handle_activity(client);
@@ -8427,6 +8479,7 @@ void Daemon::answer_client_requests()
                             }
 
                             if (client->status == Client::TOCOMPILE
+                                || client->status == Client::WAITP50INPUT
                                 || client->status == Client::WAITFORCHILD
                                 || client->status == Client::WAITINSTALL) {
                                 break;

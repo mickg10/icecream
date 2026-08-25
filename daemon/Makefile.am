@@ -7,6 +7,8 @@ iceccd_SOURCES = \
 	compiler_input.cpp \
 	workit.cpp \
 	../cache/p50_daemon_cache_dispatch.cpp \
+	../cache/p50_source_identity.cpp \
+	../cache/p50_input_wait.cpp \
 	environment.cpp \
 	load.cpp \
 	file_util.cpp \

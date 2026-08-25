@@ -25,7 +25,11 @@ libprotocol50_a_SOURCES = \
 	p50_input_record.cpp \
 	p50_input_record.h \
 	p50_input_attachment.cpp \
-	p50_input_attachment.h
+	p50_input_attachment.h \
+	p50_source_identity.cpp \
+	p50_source_identity.h \
+	p50_input_wait.cpp \
+	p50_input_wait.h
 
 AM_CPPFLAGS = -I$(top_srcdir) $(LIBZSTD_CFLAGS)
 libp50endpoint_a_SOURCES = p50_endpoint.cpp p50_endpoint.h
@@ -151,6 +155,7 @@ EXTRA_DIST = \
 	P50_DAEMON_SIDECAR_ADAPTER.md \
 	P50_INPUT_FD_ATTACHMENT.md \
 	P50_INPUT_LIFECYCLE.md \
+	P50_SOURCE_ARM.md \
 	formal/README.md
 
 check-local:
