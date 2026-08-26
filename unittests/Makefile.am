@@ -250,7 +250,7 @@ p50connectionprovenance_SOURCES = p50_connection_provenance_test.cpp ../daemon/c
 p50connectionprovenance_CPPFLAGS = $(AM_CPPFLAGS) -DICECC_CONNECTION_PROVENANCE_TEST_HOOKS
 p50sourcearm_SOURCES = p50_source_arm_wait_test.cpp \
 	../cache/p50_source_identity.cpp ../cache/p50_input_wait.cpp
-p50sourcearm_CPPFLAGS = $(AM_CPPFLAGS)
+p50sourcearm_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)/cache
 p50sourcearm_CXXFLAGS = -pthread
 p50sourcearm_LDFLAGS = -pthread
 p50sourcearm_LDADD = ../services/libicecc.la
