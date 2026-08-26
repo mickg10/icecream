@@ -16,6 +16,7 @@
 #include <sys/syscall.h>
 #endif
 #include <signal.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -39,7 +40,8 @@ constexpr int kMaxFallbackFd = 8192;
 constexpr size_t kMaxProcFdBytes = 1u << 20;
 constexpr size_t kMaxProcFdReads = 256;
 constexpr int kMaxEintrRetries = 8;
-constexpr uint32_t kExecGroupMarker = 0x50355047u; // "P5PG"
+constexpr uint32_t kExecSessionMarker = 0x50355353u; // "P5SS"
+constexpr uint8_t kLaunchPermission = 0x50u;
 constexpr int64_t kMaxConfiguredMilliseconds = 7LL * 24 * 60 * 60 * 1000;
 constexpr uint32_t kMaxConfiguredAttempts = 1u << 20;
 
@@ -65,8 +67,34 @@ bool write_errno_record(int fd, int error) noexcept {
     return write_record(fd, &error, sizeof(error));
 }
 
-bool write_group_marker(int fd) noexcept {
-    return write_record(fd, &kExecGroupMarker, sizeof(kExecGroupMarker));
+bool write_session_marker(int fd) noexcept {
+    return write_record(fd, &kExecSessionMarker, sizeof(kExecSessionMarker));
+}
+
+bool read_launch_permission(int fd) noexcept {
+    uint8_t permission = 0;
+    int interrupted = 0;
+    for (;;) {
+        const ssize_t result = ::read(fd, &permission, sizeof(permission));
+        if (result == static_cast<ssize_t>(sizeof(permission)))
+            return permission == kLaunchPermission;
+        if (result < 0 && errno == EINTR && interrupted++ != kMaxEintrRetries)
+            continue;
+        return false;
+    }
+}
+
+bool send_launch_permission(int fd) noexcept {
+    int interrupted = 0;
+    for (;;) {
+        const ssize_t result = ::send(fd, &kLaunchPermission,
+                                      sizeof(kLaunchPermission), MSG_NOSIGNAL);
+        if (result == static_cast<ssize_t>(sizeof(kLaunchPermission)))
+            return true;
+        if (result < 0 && errno == EINTR && interrupted++ != kMaxEintrRetries)
+            continue;
+        return false;
+    }
 }
 
 template <typename Integer>
@@ -108,6 +136,24 @@ bool make_pipe(int fds[2]) noexcept {
     if (!set_cloexec(fds[0], true) || !set_cloexec(fds[1], true)) {
         ::close(fds[0]);
         ::close(fds[1]);
+        fds[0] = fds[1] = -1;
+        return false;
+    }
+    return true;
+}
+
+bool make_launch_gate(int fds[2]) noexcept {
+#if defined(SOCK_CLOEXEC)
+    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds) == 0)
+        return true;
+    if (errno != EINVAL)
+        return false;
+#endif
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0)
+        return false;
+    if (!set_cloexec(fds[0], true) || !set_cloexec(fds[1], true)) {
+        (void)::close(fds[0]);
+        (void)::close(fds[1]);
         fds[0] = fds[1] = -1;
         return false;
     }
@@ -774,6 +820,71 @@ SignalResult signal_child_handle(int pidfd, int signal) noexcept {
 #endif
 }
 
+bool exact_child_handles_supported() noexcept {
+    const int self_handle = open_child_handle(::getpid());
+    if (self_handle < 0)
+        return false;
+    const SignalResult result = signal_child_handle(self_handle, 0);
+    (void)::close(self_handle);
+    return result == SignalResult::Sent;
+}
+
+enum class ChildAnchorResult : uint8_t {
+    Stopped,
+    Exited,
+    Failed,
+};
+
+ChildAnchorResult stop_child_handle(
+    int pidfd, pid_t expected_child,
+    std::chrono::milliseconds timeout) noexcept {
+#if defined(__linux__) && defined(WNOWAIT)
+    if (pidfd < 0 || expected_child <= 1)
+        return ChildAnchorResult::Failed;
+    const SignalResult stopped = signal_child_handle(pidfd, SIGSTOP);
+    if (stopped == SignalResult::Gone)
+        return ChildAnchorResult::Exited;
+    if (stopped != SignalResult::Sent)
+        return ChildAnchorResult::Failed;
+
+    // Linux assigns idtype value 3 to P_PIDFD.  Use the value explicitly so
+    // this exact-handle path still builds against libc headers predating the
+    // spelling while requiring a kernel that already passed pidfd probes.
+    constexpr idtype_t kPidfdIdType = static_cast<idtype_t>(3);
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    for (;;) {
+        siginfo_t information{};
+        const int result = ::waitid(kPidfdIdType, static_cast<id_t>(pidfd),
+                                    &information,
+                                    WSTOPPED | WEXITED | WNOHANG | WNOWAIT);
+        if (result == 0 && information.si_pid == expected_child) {
+            if (information.si_code == CLD_STOPPED)
+                return ChildAnchorResult::Stopped;
+            if (information.si_code == CLD_EXITED ||
+                information.si_code == CLD_KILLED ||
+                information.si_code == CLD_DUMPED)
+                return ChildAnchorResult::Exited;
+            return ChildAnchorResult::Failed;
+        }
+        if (result < 0) {
+            if (errno == EINTR)
+                continue;
+            // ECHILD includes an external reap.  That destroys the numeric
+            // process-group anchor, so it is never treated as safe absence.
+            return ChildAnchorResult::Failed;
+        }
+        if (std::chrono::steady_clock::now() >= deadline)
+            return ChildAnchorResult::Failed;
+        (void)::poll(nullptr, 0, 1);
+    }
+#else
+    (void)pidfd;
+    (void)expected_child;
+    (void)timeout;
+    return ChildAnchorResult::Failed;
+#endif
+}
+
 bool child_handle_has_exited(int pidfd) noexcept {
     if (pidfd < 0)
         return false;
@@ -867,6 +978,19 @@ bool child_is_in_group(pid_t child, pid_t process_group) noexcept {
     }
 }
 
+bool child_owns_session(pid_t child) noexcept {
+    if (child <= 1)
+        return false;
+    int interrupted = 0;
+    for (;;) {
+        const pid_t session = ::getsid(child);
+        if (session >= 0)
+            return session == child && child_is_in_group(child, child);
+        if (errno != EINTR || interrupted++ == kMaxEintrRetries)
+            return false;
+    }
+}
+
 bool Supervisor::child_has_exited_exact(pid_t expected_child) const noexcept {
     if (expected_child < 0 || expected_child != child_pid_)
         return true;
@@ -875,112 +999,88 @@ bool Supervisor::child_has_exited_exact(pid_t expected_child) const noexcept {
     return child_has_exited(expected_child);
 }
 
-bool Supervisor::wait_for_exit(std::chrono::milliseconds timeout) noexcept {
-    if (child_pid_ < 0)
-        return true;
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    for (;;) {
-        if (child_has_exited_exact(child_pid_))
-            return true;
-        if (std::chrono::steady_clock::now() >= deadline)
-            return false;
-        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-            deadline - std::chrono::steady_clock::now());
-        const int sleep_ms = static_cast<int>(std::clamp<long long>(
-            remaining.count(), 1, kPollSliceMilliseconds));
-        (void)::poll(nullptr, 0, sleep_ms);
-    }
-}
-
 bool Supervisor::terminate_group() noexcept {
-    bool grouped = process_group_owned_ && process_group_ > 1;
-    pid_t process_group = grouped ? process_group_ : -1;
-    bool group_identity_invalidated = false;
-    if (grouped && child_pid_ >= 0 && !child_is_in_group(child_pid_, process_group)) {
-        // A service that moved itself out of the owned group invalidates our
-        // group identity.  Refuse to signal the stale numeric PGID; direct-PID
-        // teardown remains safe and the ownership bit is cleared.
-        grouped = false;
-        process_group = -1;
+    const pid_t expected_child = child_pid_;
+    const pid_t expected_group = process_group_;
+    const bool claimed_group = process_group_owned_ && expected_group > 1;
+
+    if (expected_child < 0) {
+        // Once the exact leader owner has disappeared, a numeric PGID can no
+        // longer authorize a signal.  An unclaimed residue is harmless; a
+        // claimed residue is uncertain and forbids cleanup/restart.
+        const bool clean = !claimed_group;
         process_group_ = -1;
         process_group_owned_ = false;
-        group_identity_invalidated = true;
-    }
-    if (child_pid_ < 0 && !grouped) {
-        // A PGID without the ownership bit is diagnostic residue only.  Never
-        // signal it: the numeric ID may already belong to an unrelated group.
-        process_group_ = -1;
-        process_group_owned_ = false;
-        return !group_identity_invalidated;
+        close_if_open(child_pidfd_);
+        return clean;
     }
 
-    const SignalResult group_term = grouped ? signal_target(-process_group, SIGTERM)
-                                             : SignalResult::Gone;
-    // Never signal child_pid_ numerically.  A pidfd remains bound to the
-    // original task even if another SIGCHLD owner reaped it and the number was
-    // reused.  Without that exact handle, group signalling may continue only
-    // while the process-group identity remains proven; direct teardown fails
-    // closed.
-    const SignalResult direct_term = child_pid_ >= 0
-                                         ? signal_child_handle(child_pidfd_, SIGTERM)
-                                         : SignalResult::Gone;
-    (void)group_term;
-    (void)direct_term;
+    const ChildAnchorResult anchor = stop_child_handle(
+        child_pidfd_, expected_child, config_.shutdown_timeout);
+    const bool group_anchored =
+        anchor == ChildAnchorResult::Stopped && claimed_group &&
+        child_is_in_group(expected_child, expected_group);
 
-    // A blocking reap is permitted only after the child has been observed
-    // exited or a signal result established that it cannot remain running.
-    bool direct_exited = child_pid_ < 0;
-    if (!direct_exited)
-        direct_exited = wait_for_exit(config_.shutdown_timeout);
-
-    const bool group_alive = grouped && group_exists(process_group);
-    const bool need_kill = !direct_exited || group_alive;
-    SignalResult group_kill = SignalResult::Gone;
-    SignalResult direct_kill = SignalResult::Gone;
-    if (need_kill) {
-        if (grouped)
-            group_kill = signal_target(-process_group, SIGKILL);
-        // Always signal the direct PID as well.  A child can voluntarily move
-        // itself after launch, and a group-only success must not strand it.
-        if (child_pid_ >= 0)
-            direct_kill = signal_child_handle(child_pidfd_, SIGKILL);
-        const bool kill_established = signal_established(group_kill) ||
-                                      signal_established(direct_kill);
-        if (kill_established)
+    if (!group_anchored) {
+        // Never send a nonzero signal to an unanchored numeric PGID.  The
+        // pidfd can still terminate the exact direct child.  A normal
+        // one-process service can be proved gone by group absence afterward;
+        // surviving helpers or a reused group force DegradedLegacy and leak
+        // the unique lease rather than risking an unrelated process.
+        const SignalResult direct_kill = signal_child_handle(child_pidfd_, SIGKILL);
+        // Linux may report pidfd_send_signal success for an unreaped zombie;
+        // that establishes teardown but is not a forced kill of a live task.
+        if (anchor != ChildAnchorResult::Exited &&
+            direct_kill == SignalResult::Sent)
             increment_saturating(counters_.forced_kills);
-        if (child_pid_ >= 0 && (signal_established(direct_kill) || direct_exited))
+        if (signal_established(direct_kill) ||
+            child_handle_has_exited(child_pidfd_))
             reap_blocking();
-    } else if (child_pid_ >= 0) {
-        // wait_for_exit() observed an exited child without reaping it.  Keep
-        // the group leader's PID alive as a zombie until group teardown has
-        // completed; this closes the PGID-reuse window.
-        reap_blocking();
+        const bool direct_dead = child_pid_ < 0;
+        const bool group_dead = !claimed_group || !group_exists(expected_group);
+        process_group_ = -1;
+        process_group_owned_ = false;
+        close_if_open(child_pidfd_);
+        return direct_dead && group_dead;
     }
 
-    bool group_dead = !grouped;
-    if (grouped) {
-        const auto deadline = std::chrono::steady_clock::now() +
-                              config_.shutdown_timeout;
-        for (;;) {
-            if (!group_exists(process_group)) {
-                group_dead = true;
-                break;
-            }
-            if (std::chrono::steady_clock::now() >= deadline)
-                break;
-            (void)::poll(nullptr, 0, 1);
+    // SIGSTOP plus waitid(P_PIDFD, WSTOPPED|WNOWAIT) keeps the exact leader
+    // alive and unreapable while the numeric group is used.  Helpers receive a
+    // bounded TERM grace period; the stopped leader retains TERM pending and
+    // anchors the PGID until the group KILL has been issued.
+    (void)signal_target(-expected_group, SIGTERM);
+    const auto grace_deadline = std::chrono::steady_clock::now() +
+                                config_.shutdown_timeout;
+    while (std::chrono::steady_clock::now() < grace_deadline)
+        (void)::poll(nullptr, 0, 1);
+
+    const SignalResult group_kill = signal_target(-expected_group, SIGKILL);
+    const SignalResult direct_kill = signal_child_handle(child_pidfd_, SIGKILL);
+    const bool kill_established = signal_established(group_kill) ||
+                                  signal_established(direct_kill);
+    if (group_kill == SignalResult::Sent || direct_kill == SignalResult::Sent)
+        increment_saturating(counters_.forced_kills);
+    if (kill_established || child_handle_has_exited(child_pidfd_))
+        reap_blocking();
+
+    bool group_dead = false;
+    const auto group_deadline = std::chrono::steady_clock::now() +
+                                config_.shutdown_timeout;
+    for (;;) {
+        if (!group_exists(expected_group)) {
+            group_dead = true;
+            break;
         }
+        if (std::chrono::steady_clock::now() >= group_deadline)
+            break;
+        (void)::poll(nullptr, 0, 1);
     }
 
     const bool direct_dead = child_pid_ < 0;
-    // If all signal attempts were interrupted/failed, do not turn an unknown
-    // liveness result into an unbounded wait.  The ownership bit is cleared so
-    // a later launch/destructor cannot accidentally target a reused PGID.  The
-    // false return prevents lease cleanup or a replacement launch from using
-    // that uncertainty as proof of death.
     process_group_ = -1;
     process_group_owned_ = false;
-    return direct_dead && group_dead && !group_identity_invalidated;
+    close_if_open(child_pidfd_);
+    return direct_dead && group_dead;
 }
 
 bool Supervisor::terminate_child() noexcept {
@@ -1064,11 +1164,15 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
     }
     int ready_pipe[2] = {-1, -1};
     int exec_pipe[2] = {-1, -1};
-    if (!make_pipe(ready_pipe) || !make_pipe(exec_pipe)) {
+    int launch_gate[2] = {-1, -1};
+    if (!make_pipe(ready_pipe) || !make_pipe(exec_pipe) ||
+        !make_launch_gate(launch_gate)) {
         close_if_open(ready_pipe[0]);
         close_if_open(ready_pipe[1]);
         close_if_open(exec_pipe[0]);
         close_if_open(exec_pipe[1]);
+        close_if_open(launch_gate[0]);
+        close_if_open(launch_gate[1]);
         classify(Failure::Exec);
         cleanup_lease(pending_lease_);
         return false;
@@ -1078,6 +1182,8 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
         close_if_open(ready_pipe[1]);
         close_if_open(exec_pipe[0]);
         close_if_open(exec_pipe[1]);
+        close_if_open(launch_gate[0]);
+        close_if_open(launch_gate[1]);
         classify(Failure::Exec);
         cleanup_lease(pending_lease_);
         return false;
@@ -1149,12 +1255,22 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
         // execve succeeded, while a short errno record means it failed.
         close_if_open(ready_pipe[0]);
         close_if_open(exec_pipe[0]);
-        if (::setpgid(0, 0) != 0) {
+        close_if_open(launch_gate[1]);
+        // The child cannot execute, exit, or create descendants until the
+        // parent has acquired its exact pidfd.  EOF is a fail-closed refusal.
+        const bool permitted = read_launch_permission(launch_gate[0]);
+        close_if_open(launch_gate[0]);
+        if (!permitted)
+            _exit(127);
+        // A fresh session makes this launch's process group non-joinable by
+        // unrelated siblings in the daemon's session.  Descendants inherit
+        // it unless they deliberately detach themselves.
+        if (::setsid() < 0) {
             const int error = errno;
             (void)write_errno_record(exec_pipe[1], error);
             _exit(127);
         }
-        if (!write_group_marker(exec_pipe[1]))
+        if (!write_session_marker(exec_pipe[1]))
             _exit(127);
         if (!mark_child_fds_cloexec(ambient_fd_limit)) {
             const int error = errno == 0 ? EMFILE : errno;
@@ -1173,41 +1289,45 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
     }
     close_if_open(ready_pipe[1]);
     close_if_open(exec_pipe[1]);
+    close_if_open(launch_gate[0]);
     if (pid < 0) {
         close_if_open(ready_pipe[0]);
         close_if_open(exec_pipe[0]);
+        close_if_open(launch_gate[1]);
         classify(Failure::Exec);
         cleanup_lease(pending_lease_);
         return false;
     }
 
-    // Acquire the exact task reference before any wait/reap path can run.
-    // pidfd_open is intentionally best-effort for non-Linux portability; a
-    // missing handle never permits a later numeric-PID fallback.
+    // The child is blocked on launch_gate, so it cannot disappear before this
+    // exact handle is acquired.  Failure closes the gate and the child exits
+    // itself; no numeric-PID signal or unowned process is permitted.
     const int pidfd = open_child_handle(pid);
-
-    // The child sets its own group before exec; this parent-side call closes
-    // the fork/exec race on platforms where the child reaches exec quickly.
-    bool parent_group_proven = false;
-    for (int attempt = 0; attempt != kMaxEintrRetries; ++attempt) {
-        if (::setpgid(pid, pid) == 0)
-            parent_group_proven = true;
-        if (parent_group_proven)
-            break;
-        if (errno != EINTR)
-            break;
-    }
-    if (!parent_group_proven && errno == EACCES)
-        parent_group_proven = true; // child-side setpgid completed before exec
-
     child_pid_ = pid;
     child_pidfd_ = pidfd;
-    process_group_ = parent_group_proven ? pid : -1;
-    process_group_owned_ = parent_group_proven;
+    process_group_ = -1;
+    process_group_owned_ = false;
     ready_read_ = ready_pipe[0];
     exec_read_ = exec_pipe[0];
     increment_saturating(counters_.launches);
     state_ = State::Starting;
+    if (pidfd < 0) {
+        close_if_open(launch_gate[1]);
+        close_pipes();
+        reap_blocking();
+        classify(Failure::Exec);
+        cleanup_lease(pending_lease_);
+        return false;
+    }
+    if (!send_launch_permission(launch_gate[1])) {
+        close_if_open(launch_gate[1]);
+        close_pipes();
+        reap_blocking();
+        classify(Failure::Exec);
+        cleanup_lease(pending_lease_);
+        return false;
+    }
+    close_if_open(launch_gate[1]);
     if (wait_for_ready())
         return true;
     close_pipes();
@@ -1260,11 +1380,24 @@ bool Supervisor::wait_for_ready() noexcept {
                         if (exec_status_bytes >= sizeof(uint32_t)) {
                             uint32_t marker = 0;
                             std::memcpy(&marker, exec_status.data(), sizeof(marker));
-                            if (marker != kExecGroupMarker) {
+                            if (marker != kExecSessionMarker) {
                                 classify(Failure::Exec);
                                 return false;
                             }
                             if (!process_group_owned_) {
+                                // The private marker follows successful
+                                // setsid().  While the exact child is live,
+                                // independently confirm SID==PGID==PID.  If it
+                                // crossed the exit edge during the check, the
+                                // authenticated marker still records the
+                                // claimed group, but teardown may never signal
+                                // it without a live STOP anchor.
+                                if (!child_handle_has_exited(child_pidfd_) &&
+                                    !child_owns_session(expected_child) &&
+                                    !child_handle_has_exited(child_pidfd_)) {
+                                    classify(Failure::Exec);
+                                    return false;
+                                }
                                 process_group_ = expected_child;
                                 process_group_owned_ = expected_child > 1;
                             } else if (process_group_ != expected_child) {
@@ -1379,9 +1512,9 @@ bool Supervisor::wait_for_ready() noexcept {
         }
 
         if (child_pid_ >= 0 && child_has_exited_exact(expected_child)) {
-            // Keep the exited child unreaped until terminate_group() has
-            // signaled its owned PGID.  The zombie PID prevents a reused PGID
-            // from being mistaken for this launch's group.
+            // Keep the exited child unreaped for exact-handle classification.
+            // terminate_group() will never signal its numeric PGID because an
+            // exited leader cannot supply the required live STOP anchor.
             if (invalid_ready)
                 continue;
             // A child may exit immediately after writing a complete READY
@@ -1406,6 +1539,15 @@ bool Supervisor::start() noexcept {
     if (state_ == State::DegradedLegacy)
         return false;
     if (!valid_config(config_)) {
+        classify(Failure::InvalidConfiguration);
+        state_ = State::DegradedLegacy;
+        return false;
+    }
+    // Structured supervision depends on an exact task handle.  Probe both
+    // pidfd_open and pidfd_send_signal before creating a child; an unsupported
+    // kernel/platform remains legacy-usable but never launches a process that
+    // would later require unsafe numeric-PID/PGID fallback teardown.
+    if (!exact_child_handles_supported()) {
         classify(Failure::InvalidConfiguration);
         state_ = State::DegradedLegacy;
         return false;

@@ -23,11 +23,35 @@ lease_gate() {
         grep -F 'SYS_pidfd_open' "$candidate_impl" >/dev/null &&
         grep -F 'SYS_pidfd_send_signal' "$candidate_impl" >/dev/null &&
         grep -F 'int child_pidfd_ = -1;' "$candidate_header" >/dev/null &&
-        grep -F 'signal_child_handle(child_pidfd_, SIGTERM)' \
+        grep -F 'exact_child_handles_supported()' \
+            "$candidate_impl" >/dev/null &&
+        grep -F 'read_launch_permission(launch_gate[0])' \
+            "$candidate_impl" >/dev/null &&
+        grep -F 'make_launch_gate(launch_gate)' \
+            "$candidate_impl" >/dev/null &&
+        grep -F 'send_launch_permission(launch_gate[1])' \
+            "$candidate_impl" >/dev/null &&
+        grep -F 'MSG_NOSIGNAL' "$candidate_impl" >/dev/null &&
+        grep -F 'if (pidfd < 0)' "$candidate_impl" >/dev/null &&
+        grep -F '::setsid()' "$candidate_impl" >/dev/null &&
+        grep -F 'write_session_marker(exec_pipe[1])' \
+            "$candidate_impl" >/dev/null &&
+        grep -F 'marker != kExecSessionMarker' \
+            "$candidate_impl" >/dev/null &&
+        grep -F 'child_owns_session(expected_child)' \
+            "$candidate_impl" >/dev/null &&
+        grep -F 'stop_child_handle(' "$candidate_impl" >/dev/null &&
+        grep -F 'signal_child_handle(pidfd, SIGSTOP)' \
+            "$candidate_impl" >/dev/null &&
+        grep -F 'constexpr idtype_t kPidfdIdType' \
+            "$candidate_impl" >/dev/null &&
+        grep -F 'WSTOPPED | WEXITED | WNOHANG | WNOWAIT' \
+            "$candidate_impl" >/dev/null &&
+        grep -F 'anchor == ChildAnchorResult::Stopped' \
+            "$candidate_impl" >/dev/null &&
+        grep -F 'child_is_in_group(expected_child, expected_group)' \
             "$candidate_impl" >/dev/null &&
         grep -F 'signal_child_handle(child_pidfd_, SIGKILL)' \
-            "$candidate_impl" >/dev/null &&
-        grep -F 'return child_handle_has_exited(child_pidfd_);' \
             "$candidate_impl" >/dev/null &&
         grep -F 'const bool proven_dead = terminate_child();' \
             "$candidate_impl" >/dev/null &&
@@ -36,7 +60,7 @@ lease_gate() {
         grep -F 'RENAME_NOREPLACE' "$candidate_impl" >/dev/null &&
         grep -F 'AT_SYMLINK_NOFOLLOW' "$candidate_impl" >/dev/null &&
         grep -F 'capture_and_remove_at' "$candidate_impl" >/dev/null &&
-        grep -F 'return direct_dead && group_dead && !group_identity_invalidated;' \
+        grep -F 'return direct_dead && group_dead;' \
             "$candidate_impl" >/dev/null
 }
 
@@ -52,7 +76,7 @@ grep -F 'std::chrono::steady_clock' "$impl" >/dev/null
 grep -F 'access(config.executable.c_str(), X_OK)' "$impl" >/dev/null
 grep -F 'execve' "$impl" >/dev/null
 grep -F 'write_errno_record' "$impl" >/dev/null
-grep -F 'write_group_marker' "$impl" >/dev/null
+grep -F 'write_session_marker' "$impl" >/dev/null
 grep -F 'mark_child_fds_cloexec' "$impl" >/dev/null
 grep -F 'close_range' "$impl" >/dev/null
 grep -F 'ICECC_P50_FORCE_FD_FALLBACK' "$impl" >/dev/null
@@ -66,7 +90,13 @@ grep -F 'getpgid' "$impl" >/dev/null
 grep -F 'move-group' "$src/unittests/p50_sidecar_supervisor_test.cpp" >/dev/null
 grep -F 'reaped/reused numeric PID' \
     "$src/unittests/p50_sidecar_supervisor_test.cpp" >/dev/null
-grep -F 'setpgid' "$impl" >/dev/null
+grep -F 'shutdown_owns_process_group_against_external_reaper' \
+    "$src/unittests/p50_sidecar_supervisor_test.cpp" >/dev/null
+grep -F 'pre_ready_exited_leader_refuses_unanchored_group_signal' \
+    "$src/unittests/p50_sidecar_supervisor_test.cpp" >/dev/null
+grep -F 'session_leader_refuses_group_escape' \
+    "$src/unittests/p50_sidecar_supervisor_test.cpp" >/dev/null
+grep -F 'setsid' "$impl" >/dev/null
 grep -F 'process_group_owned_' "$impl" "$header" >/dev/null
 grep -F 'process_group_ = -1' "$impl" >/dev/null
 grep -F 'increment_saturating' "$impl" >/dev/null
@@ -103,6 +133,14 @@ if grep -E 'signal_target\(child_pid_|kill\(child_pid_' "$impl" >/dev/null; then
     echo 'FAIL: supervisor directly signals a reusable numeric child PID' >&2
     exit 1
 fi
+if grep -F 'signal_child_handle(child_pidfd_, SIGTERM)' "$impl" >/dev/null; then
+    echo 'FAIL: exact leader must remain STOP-anchored until numeric group use ends' >&2
+    exit 1
+fi
+if grep -F 'setpgid' "$impl" >/dev/null; then
+    echo 'FAIL: supervisor regressed from a private session to a joinable daemon-session group' >&2
+    exit 1
+fi
 
 # The component must remain detached from advertisement and daemon ownership.
 if grep -E 'daemon/main|apply_inert_cache_advertisement|LoginMsg|endpoint_port' "$impl" "$header" >/dev/null; then
@@ -116,9 +154,9 @@ mutant_ready=$(mktemp "${TMPDIR:-/tmp}/p50sidecarsupervisor-ready-mutant.XXXXXX"
 mutant_dir=$(mktemp -d "${TMPDIR:-/tmp}/p50sidecarsupervisor-lease-mutants.XXXXXX")
 trap 'rm -f "$mutant" "$mutant_fds" "$mutant_ready"; rm -rf "$mutant_dir"' \
     EXIT HUP INT TERM
-sed 's/bool grouped = process_group_owned_ && process_group_ > 1;/bool grouped = false;/' \
+sed 's/const bool claimed_group = process_group_owned_ && expected_group > 1;/const bool claimed_group = false;/' \
     "$impl" >"$mutant"
-if grep -F 'process_group_owned_ && process_group_ > 1' "$mutant" >/dev/null; then
+if grep -F 'process_group_owned_ && expected_group > 1' "$mutant" >/dev/null; then
     echo 'FAIL: process-group ownership guard mutant was not formed' >&2
     exit 1
 fi
@@ -144,12 +182,26 @@ for pattern in \
     'child_has_exited_exact(expected_child)' \
     'SYS_pidfd_open' \
     'SYS_pidfd_send_signal' \
-    'signal_child_handle(child_pidfd_, SIGTERM)' \
+    'exact_child_handles_supported()' \
+    'read_launch_permission(launch_gate[0])' \
+    'make_launch_gate(launch_gate)' \
+    'send_launch_permission(launch_gate[1])' \
+    'MSG_NOSIGNAL' \
+    'if (pidfd < 0)' \
+    '::setsid()' \
+    'write_session_marker(exec_pipe[1])' \
+    'marker != kExecSessionMarker' \
+    'child_owns_session(expected_child)' \
+    'stop_child_handle(' \
+    'signal_child_handle(pidfd, SIGSTOP)' \
+    'constexpr idtype_t kPidfdIdType' \
+    'WSTOPPED | WEXITED | WNOHANG | WNOWAIT' \
+    'anchor == ChildAnchorResult::Stopped' \
+    'child_is_in_group(expected_child, expected_group)' \
     'signal_child_handle(child_pidfd_, SIGKILL)' \
-    'return child_handle_has_exited(child_pidfd_);' \
     'const bool proven_dead = terminate_child();' \
     'if (proven_dead) {' \
-    'return direct_dead && group_dead && !group_identity_invalidated;'; do
+    'return direct_dead && group_dead;'; do
     lease_mutant="$mutant_dir/impl.cpp"
     awk -v needle="$pattern" 'index($0, needle) == 0' "$impl" >"$lease_mutant"
     if lease_gate "$lease_mutant" "$header"; then

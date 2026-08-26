@@ -19,6 +19,7 @@
 #endif
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -172,13 +173,17 @@ int fake_child(const char* mode) {
         return pause();
     }
     if (std::string(mode) == "pre-ready-grandchild") {
-        // Exit before READY after forking a TERM-ignoring helper.  The parent
-        // supervisor must retain and tear down the owned PGID even though the
-        // direct child is reaped by the readiness state machine.
+        // Exit before READY after forking a TERM-ignoring helper.  Once the
+        // leader is exited it cannot be STOP-anchored, so the supervisor must
+        // fail closed without signalling its now-unanchored numeric PGID.
         const pid_t helper = ::fork();
         if (helper < 0)
             return 96;
         if (helper == 0) {
+            // Keep the READY writer open briefly so the direct leader becomes
+            // an exited, unreaped child before the parent observes EOF.  This
+            // deterministically exercises the no-live-anchor branch.
+            ::usleep(50000);
             ::close(fd);
             (void)::signal(SIGTERM, SIG_IGN);
             (void)::pause();
@@ -227,7 +232,11 @@ int fake_child(const char* mode) {
         if (group_text == nullptr)
             return 106;
         const long group = std::strtol(group_text, nullptr, 10);
-        if (group <= 1 || ::setpgid(0, static_cast<pid_t>(group)) != 0)
+        // The supervisor launched us as a session leader.  Joining a sibling
+        // group from the daemon's original session must be kernel-refused.
+        errno = 0;
+        if (group <= 1 || ::setpgid(0, static_cast<pid_t>(group)) == 0 ||
+            errno != EPERM)
             return 107;
     }
     if (std::string(mode) == "sentinel") {
@@ -521,6 +530,7 @@ void ready_and_shutdown() {
     CHECK(supervisor.counters().launches == 1);
     CHECK(supervisor.child_pid() > 0);
     CHECK(supervisor.process_group_id() == supervisor.child_pid());
+    CHECK(::getsid(supervisor.child_pid()) == supervisor.child_pid());
     CHECK(!supervisor.has_private_fds());
     const pid_t pid = supervisor.child_pid();
     supervisor.shutdown();
@@ -614,7 +624,7 @@ void empty_ready_eof_from_live_child_is_bounded() {
     CHECK(supervisor.process_group_id() < 0);
 }
 
-void pre_ready_group_is_reaped_across_retries() {
+void pre_ready_exited_leader_refuses_unanchored_group_signal() {
     char pid_path[] = "/tmp/icecc-sidecar-pre-ready-helper-XXXXXX";
     const int path_fd = ::mkstemp(pid_path);
     CHECK(path_fd >= 0);
@@ -630,51 +640,40 @@ void pre_ready_group_is_reaped_across_retries() {
     CHECK(!supervisor.start());
     (void)::alarm(0);
     CHECK(supervisor.state() == State::DegradedLegacy);
-    CHECK(supervisor.counters().launches == 2);
-    CHECK(supervisor.counters().forced_kills >= 2);
+    CHECK(supervisor.counters().launches == 1);
+    CHECK(supervisor.counters().forced_kills == 0);
     CHECK(supervisor.process_group_id() < 0);
     CHECK(supervisor.child_pid() < 0);
     CHECK(!supervisor.has_private_fds());
     CHECK(::unsetenv("ICECC_GRANDCHILD_PID_FILE") == 0);
 
-    std::vector<pid_t> helpers;
-    for (int attempt = 0; attempt != 50 && helpers.size() < 2; ++attempt) {
+    pid_t helper = -1;
+    for (int attempt = 0; attempt != 50 && helper < 0; ++attempt) {
         const int fd = ::open(pid_path, O_RDONLY);
         if (fd >= 0) {
-            char text[128]{};
+            char text[32]{};
             const ssize_t bytes = ::read(fd, text, sizeof(text) - 1);
             ::close(fd);
-            if (bytes > 0) {
-                char* cursor = text;
-                char* end = text + bytes;
-                while (cursor < end) {
-                    char* next = nullptr;
-                    const long value = std::strtol(cursor, &next, 10);
-                    if (next == cursor)
-                        break;
-                    if (value > 1 && value <= std::numeric_limits<pid_t>::max()) {
-                        const pid_t helper = static_cast<pid_t>(value);
-                        if (std::find(helpers.begin(), helpers.end(), helper) == helpers.end())
-                            helpers.push_back(helper);
-                    }
-                    cursor = next;
-                }
-            }
+            if (bytes > 0)
+                helper = static_cast<pid_t>(std::strtol(text, nullptr, 10));
         }
-        if (helpers.size() < 2)
+        if (helper < 0)
             ::usleep(5000);
     }
-    CHECK(helpers.size() == 2);
-    for (const pid_t helper : helpers) {
-        bool gone = false;
-        for (int attempt = 0; attempt != 100 && !gone; ++attempt) {
-            errno = 0;
-            gone = ::kill(helper, 0) < 0 && errno == ESRCH;
-            if (!gone)
-                ::usleep(5000);
-        }
-        CHECK(gone);
+    CHECK(helper > 1);
+    // Surviving proves teardown did not signal a numeric group after losing
+    // its exact live-leader anchor.  The test owns this deliberately leaked
+    // helper and performs the external/manual recovery promised by the API.
+    CHECK(::kill(helper, 0) == 0);
+    CHECK(::kill(helper, SIGKILL) == 0 || errno == ESRCH);
+    bool gone = false;
+    for (int attempt = 0; attempt != 100 && !gone; ++attempt) {
+        errno = 0;
+        gone = ::kill(helper, 0) < 0 && errno == ESRCH;
+        if (!gone)
+            ::usleep(5000);
     }
+    CHECK(gone);
     CHECK(::unlink(pid_path) == 0);
 }
 
@@ -729,7 +728,7 @@ void forced_fd_fallback_handles_high_ambient_fd() {
 }
 #endif
 
-void moved_child_refuses_stale_group_signal() {
+void session_leader_refuses_group_escape() {
     char helper_path[] = "/tmp/icecc-sidecar-moved-helper-XXXXXX";
     const int helper_file = ::mkstemp(helper_path);
     CHECK(helper_file >= 0);
@@ -753,21 +752,15 @@ void moved_child_refuses_stale_group_signal() {
     CHECK(exact_child > 1);
     CHECK(supervisor.process_group_id() > 1);
     CHECK(supervisor.process_group_id() != sentinel);
+    CHECK(::getsid(exact_child) == exact_child);
     supervisor.shutdown();
     (void)::alarm(0);
     CHECK(::unsetenv("ICECC_MOVE_TO_PGID") == 0);
     CHECK(::unsetenv("ICECC_MOVED_HELPER_PID_FILE") == 0);
 
-#if defined(__linux__) && defined(SYS_pidfd_open) && defined(SYS_pidfd_send_signal)
-    // The group mismatch deliberately invalidates both numeric identities.
-    // Direct teardown is nevertheless safe because pidfd_send_signal targets
-    // the original task, never a reaped/reused numeric PID.  Overall status
-    // remains degraded because the abandoned original group is not proven
-    // dead and therefore cannot authorize lease cleanup or replacement.
     CHECK(supervisor.child_pid() < 0);
-    CHECK(supervisor.state() == State::DegradedLegacy);
+    CHECK(supervisor.state() == State::Stopped);
     CHECK(!supervisor.has_private_fds());
-#endif
 
     pid_t helper = -1;
     const int read_file = ::open(helper_path, O_RDONLY);
@@ -778,9 +771,6 @@ void moved_child_refuses_stale_group_signal() {
     CHECK(helper_bytes > 0);
     helper = static_cast<pid_t>(std::strtol(helper_text, nullptr, 10));
     CHECK(helper > 1);
-    errno = 0;
-    CHECK(::kill(helper, 0) == 0);
-    CHECK(::kill(helper, SIGKILL) == 0 || errno == ESRCH);
     bool helper_gone = false;
     for (int attempt = 0; attempt != 100; ++attempt) {
         errno = 0;
@@ -790,6 +780,8 @@ void moved_child_refuses_stale_group_signal() {
         }
         ::usleep(5000);
     }
+    if (!helper_gone)
+        (void)::kill(helper, SIGKILL);
     CHECK(helper_gone);
     CHECK(::unlink(helper_path) == 0);
 
@@ -801,7 +793,7 @@ void moved_child_refuses_stale_group_signal() {
         ;
 }
 
-void shutdown_owns_process_group() {
+void shutdown_owns_process_group_against_external_reaper() {
     char pid_path[] = "/tmp/icecc-sidecar-helper-XXXXXX";
     const int path_fd = ::mkstemp(pid_path);
     CHECK(path_fd >= 0);
@@ -826,7 +818,23 @@ void shutdown_owns_process_group() {
             ::usleep(5000);
     }
     CHECK(helper > 1);
+    const pid_t exact_child = supervisor.child_pid();
+    CHECK(exact_child > 1);
+    pid_t reaped = -2;
+    int reap_error = 0;
+    std::thread competing_reaper([&]() {
+        int status = 0;
+        errno = 0;
+        reaped = ::waitpid(exact_child, &status, 0);
+        reap_error = errno;
+    });
+    // Let the competing owner enter waitpid.  It cannot reap the live leader;
+    // shutdown must STOP-anchor it before using the numeric group, so no
+    // reaped/reused numeric PID can turn that group signal into a new target.
+    ::usleep(5000);
     supervisor.shutdown();
+    competing_reaper.join();
+    CHECK(reaped == exact_child || (reaped < 0 && reap_error == ECHILD));
     bool gone = false;
     for (int attempt = 0; attempt != 40 && !gone; ++attempt) {
         if (::kill(helper, 0) < 0 && errno == ESRCH)
@@ -895,14 +903,14 @@ int main(int argc, char** argv) {
         invalid_ready_is_bounded();
         exact_ready_close_protocol();
         empty_ready_eof_from_live_child_is_bounded();
-        pre_ready_group_is_reaped_across_retries();
+        pre_ready_exited_leader_refuses_unanchored_group_signal();
         ambient_fd_is_not_inherited();
 #if defined(ICECC_P50_FORCE_FD_FALLBACK)
         forced_fd_fallback_is_bounded_and_excludes_ambient_fd();
         forced_fd_fallback_handles_high_ambient_fd();
 #endif
-        moved_child_refuses_stale_group_signal();
-        shutdown_owns_process_group();
+        session_leader_refuses_group_escape();
+        shutdown_owns_process_group_against_external_reaper();
         restart_window_ages_without_unbounded_call();
         bounded_recovery_attempts();
     } catch (const std::exception& error) {

@@ -198,8 +198,9 @@ public:
     // DegradedLegacy.  Returns true only while the child is ready.
     bool poll() noexcept;
 
-    // TERM, bounded wait, KILL if needed, and mandatory reap.  It is safe to
-    // call repeatedly and closes every supervisor-owned descriptor.
+    // Exact-handle STOP anchor, bounded group TERM, group/direct KILL, and
+    // mandatory reap.  It is safe to call repeatedly and closes every
+    // supervisor-owned descriptor.
     void shutdown() noexcept;
 
     [[nodiscard]] State state() const noexcept { return state_; }
@@ -227,7 +228,6 @@ private:
     void classify(Failure failure) noexcept;
     void close_pipes() noexcept;
     void reap_blocking() noexcept;
-    bool wait_for_exit(std::chrono::milliseconds timeout) noexcept;
     bool child_has_exited_exact(pid_t expected_child) const noexcept;
     bool terminate_child() noexcept;
     bool terminate_group() noexcept;
@@ -240,9 +240,9 @@ private:
     Counters counters_{};
     pid_t child_pid_ = -1;
     // On Linux this is an exact reference to the forked task.  It is used for
-    // every direct signal so a reaped and reused numeric PID can never become
-    // a teardown target.  Platforms without pidfd retain process-group
-    // teardown, but fail closed if that group identity is invalidated.
+    // every direct signal and to STOP/observe the live group leader before a
+    // numeric PGID may be signalled.  A platform without the exact pidfd APIs
+    // fails before launch; there is no numeric PID or unanchored-PGID fallback.
     int child_pidfd_ = -1;
     pid_t process_group_ = -1;
     bool process_group_owned_ = false;

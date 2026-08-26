@@ -10,14 +10,18 @@ reimplementing process ownership.
 
 `Config::executable` must be an absolute regular executable path. Arguments are
 passed directly as `argv` to `execve`; no shell or `PATH` lookup is performed.
-The supervisor creates two private pipes before `fork`: the child inherits only
-the READY write end, and receives its number in
-`ICECC_CACHE_SERVICE_READY_FD`. That descriptor is explicitly made inheritable
-in the child; all other supervisor descriptors are `FD_CLOEXEC`. Before that
-step the child writes a private process-group proof marker to the second pipe.
-The marker is followed by an `errno` record only when setup or `execve` fails;
-marker-plus-EOF therefore proves both child-side group setup and successful
-exec.
+The supervisor creates READY and exec-status pipes plus a one-byte private
+`socketpair` launch gate before `fork`. The child cannot leave the launch gate until the parent has acquired
+its exact pidfd; closing the gate makes it exit without executing user code.
+After permission, the child creates a fresh session, writes a private session
+proof marker, and continues toward `execve`. The child receives the READY write
+descriptor number in `ICECC_CACHE_SERVICE_READY_FD`; that descriptor alone is
+made inheritable, while the launch gate is closed and every other supervisor
+descriptor remains `FD_CLOEXEC`. The marker is followed by an `errno` record
+only when setup or `execve` fails. Parent-side gate sends use `MSG_NOSIGNAL`,
+so an externally killed child cannot turn the safety handshake into a daemon
+`SIGPIPE`; parent close/death instead gives the child EOF. Marker-plus-EOF proves both
+child-side `setsid` and successful exec.
 
 Without a configured lease root, the child must write exactly `READY\n` to the
 READY descriptor and then close it. With a lease root, the structured READY-v2
@@ -39,9 +43,9 @@ ambient descriptors close-on-exec. `ENOSYS`, `EINVAL`, and `EPERM` use a
 bounded raw `/proc/self/fd` enumeration instead of an `OPEN_MAX` scan; targets
 without that Linux primitive use a deliberately bounded `fcntl` fallback and
 fail closed if its limit cannot be used. Only the READY descriptor is then
-made inheritable. The child is placed in its own process group (with a
-parent-side race-closing `setpgid`), so helper processes inherit the group and
-cannot be orphaned by direct-child shutdown.
+made inheritable. The child is a session leader with SID=PGID=PID, which the
+parent revalidates while it is live. Helpers inherit that private group, and
+unrelated daemon-session siblings cannot join it.
 
 The readiness and shutdown bounds may be zero for an immediate bound; the
 restart window must be positive so even a crashing child cannot create an
@@ -83,26 +87,28 @@ PID/credentials, and listener identity.
 
 ## Shutdown
 
-`shutdown()` sends `SIGTERM` to the owned process group and, on Linux, to the
-exact `pidfd` acquired immediately after `fork`. It waits at most
-`shutdown_timeout`, then sends `SIGKILL` through the same two independently
-bound authorities and performs a blocking `waitpid` only after exit or a kill
-result is established. The direct child is never signalled through its numeric
-PID: a SIGCHLD owner may have reaped it and that number may already identify an
-unrelated process. Platforms without `pidfd_send_signal` retain proven
-process-group teardown but fail closed instead of falling back to a direct
-numeric signal.
+Structured launch is available only when `pidfd_open` and
+`pidfd_send_signal` are usable; an unsupported platform fails before `fork`.
+At shutdown the supervisor first sends `SIGSTOP` through the exact pidfd and
+observes that same child as stopped with `waitid(P_PIDFD, ... WNOWAIT)`. Only
+that live, unreapable leader plus an exact `getpgid` match authorizes a
+nonzero signal to the numeric process group. Helpers receive a bounded
+`SIGTERM` grace period while the stopped leader anchors the PGID, after which
+the group and exact child receive `SIGKILL`. A blocking `waitpid` follows only
+after exit or a kill result is established. The direct child is never
+signalled through its numeric PID.
 
 Cleanup authority is returned internally only after both direct and group
 absence are proved. The process-group path uses the raw `kill` syscall, so a
 libc wrapper returning persistent `EINTR` cannot strand descendants. Every
-owned descriptor, including the pidfd, is closed. Exit is observed without
-reaping first, keeping the group leader's zombie PID in place until group
-signalling finishes and preventing a PGID reuse race. Group ownership is
-explicit and cleared on every teardown path; an unowned/stale numeric PGID is
-never signalled. If a service moves out of the owned group, that group identity
-is invalidated. The exact pidfd may safely terminate the original child, but
-the uncertain old group still forces `DegradedLegacy`, deliberately leaks its
-unique lease, and forbids a replacement launch.
+owned descriptor, including the pidfd, is closed. A competing SIGCHLD reaper
+cannot reap a stopped live leader, so it cannot open a PGID-reuse window before
+the group KILL. Group ownership is explicit and cleared on every teardown
+path; an unowned/stale numeric PGID is never signalled. If the leader already
+exited, was externally reaped, moved out of the group, or cannot be stopped and
+observed exactly, the supervisor uses only the pidfd for direct-child teardown.
+Any surviving or uncertain old group then forces `DegradedLegacy`, deliberately
+leaks its unique lease, and forbids a replacement launch rather than risking an
+unrelated process group.
 The API is synchronous and intentionally leaves listener ownership and network
 integration to a later reviewed slice.
