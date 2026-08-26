@@ -29,7 +29,8 @@ libprotocol50_a_SOURCES = \
 	p50_source_identity.cpp \
 	p50_source_identity.h \
 	p50_input_wait.cpp \
-	p50_input_wait.h
+	p50_input_wait.h \
+	p50_incarnation_identity.h
 
 AM_CPPFLAGS = -I$(top_srcdir) $(LIBZSTD_CFLAGS)
 libp50endpoint_a_SOURCES = p50_endpoint.cpp p50_endpoint.h

@@ -98,9 +98,11 @@ Update Controller::observe(const Observation& observation) noexcept
     }
 
     const bool ready = observation.supervisor_state == sidecar::State::Ready;
-    const bool authenticated = observation.private_relationship_authenticated;
+    // Readiness is a property of the current supervised listener lease.  A
+    // transient per-TU private relationship does not exist while idle and is
+    // therefore neither advertisement authority nor a readiness prerequisite.
     const bool advertise = observation.public_listener_bound && ready
-        && authenticated && observation.current_lease_matches;
+        && observation.current_lease_matches;
     const Snapshot target = advertise
         ? present_snapshot(observation.public_listener_port)
         : kAbsent;

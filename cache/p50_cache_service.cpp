@@ -3,6 +3,7 @@
 #include "p50_input_fd_attachment.h"
 #include "services/comm.h"
 
+#include <array>
 #include <charconv>
 #include <cerrno>
 #include <cstdlib>
@@ -14,6 +15,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <span>
 #include <grp.h>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
@@ -27,6 +29,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "services/digest128.h"
+#include "p50_incarnation_identity.h"
 
 #include <utility>
 #include <future>
@@ -39,6 +42,18 @@ namespace {
 namespace asio = boost::asio;
 
 constexpr std::string_view kReadyEnvironment = "ICECC_CACHE_SERVICE_READY_FD";
+constexpr std::string_view kReadyFormatEnvironment =
+    "ICECC_CACHE_SERVICE_READY_FORMAT";
+constexpr std::string_view kExpectedGenerationEnvironment =
+    "ICECC_CACHE_SERVICE_EXPECTED_GENERATION";
+constexpr std::string_view kExpectedAttemptEnvironment =
+    "ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT";
+constexpr std::string_view kExpectedFStoreGuidEnvironment =
+    "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID";
+constexpr std::string_view kExpectedSocketEnvironment =
+    "ICECC_CACHE_SERVICE_EXPECTED_SOCKET";
+constexpr std::string_view kExpectedSocketDigestEnvironment =
+    "ICECC_CACHE_SERVICE_EXPECTED_SOCKET_DIGEST";
 constexpr std::string_view kReadyMessage = "READY\n";
 constexpr int kPollMilliseconds = 100;
 constexpr int kHandshakeMilliseconds = 500;
@@ -254,6 +269,76 @@ bool parse_ready_fd(OwnedFd& ready) noexcept {
     return true;
 }
 
+std::string bytes_hex(std::span<const uint8_t> bytes);
+
+struct StructuredLaunch {
+    bool active = false;
+    local::Identity identity{};
+    FStoreGuid f_store_guid{};
+    std::string socket_path;
+    icecc::Digest128 socket_path_digest{};
+};
+
+bool read_structured_launch(StructuredLaunch& launch) noexcept {
+    try {
+        constexpr std::array<std::string_view, 6> names{
+            kReadyFormatEnvironment,
+            kExpectedGenerationEnvironment,
+            kExpectedAttemptEnvironment,
+            kExpectedFStoreGuidEnvironment,
+            kExpectedSocketEnvironment,
+            kExpectedSocketDigestEnvironment,
+        };
+        std::array<const char*, names.size()> values{};
+        size_t present = 0;
+        for (size_t index = 0; index != names.size(); ++index) {
+            values[index] = ::getenv(names[index].data());
+            if (values[index] != nullptr)
+                ++present;
+        }
+        if (present == 0) {
+            launch = StructuredLaunch{};
+            return true;
+        }
+        // One inherited or manually supplied fragment must never silently
+        // select a partly structured launch.  The supervisor scrubs all six
+        // names and publishes the complete immutable tuple together.
+        if (present != names.size())
+            return false;
+        const std::string_view format(values[0]);
+        const std::string_view generation_text(values[1]);
+        const std::string_view attempt_text(values[2]);
+        const std::string_view expected_guid(values[3]);
+        const std::string_view expected_socket(values[4]);
+        const std::string_view expected_digest(values[5]);
+        uint64_t generation = 0;
+        uint64_t attempt = 0;
+        if (format != "2" || !parse_uint(generation_text, generation) ||
+            !parse_uint(attempt_text, attempt) || generation == 0 || attempt == 0 ||
+            generation == std::numeric_limits<uint64_t>::max() ||
+            attempt == std::numeric_limits<uint64_t>::max() ||
+            expected_socket.empty() || expected_socket.front() != '/' ||
+            expected_socket.size() > local::kMaxUnixPath ||
+            expected_socket.find_first_of(" \t\r\n") != std::string_view::npos)
+            return false;
+        const local::Identity identity{generation, attempt};
+        const FStoreGuid guid = f_store_guid_for_incarnation(identity);
+        const icecc::Digest128 digest = icecc::digest128(expected_socket);
+        if (expected_guid != bytes_hex(std::span<const uint8_t>(
+                                 guid.bytes.data(), guid.bytes.size())) ||
+            expected_digest != icecc::digest128_hex(digest))
+            return false;
+        launch.active = true;
+        launch.identity = identity;
+        launch.f_store_guid = guid;
+        launch.socket_path.assign(expected_socket);
+        launch.socket_path_digest = digest;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 bool write_exact(int fd, std::string_view bytes, int* failure_errno = nullptr) noexcept {
     size_t written = 0;
     while (written != bytes.size()) {
@@ -417,7 +502,7 @@ struct ListenerIdentity {
 };
 
 bool write_ready_lease(int fd, const Options& options, const ListenerIdentity& listener) noexcept {
-    const FStoreGuid guid = f_store_guid_for_identity(options.identity);
+    const FStoreGuid guid = f_store_guid_for_incarnation(options.identity);
     const std::string digest = digest128_hex(digest128(options.socket_path));
     const std::string message =
         "READY v2 generation=" + std::to_string(options.identity.generation) +
@@ -426,8 +511,8 @@ bool write_ready_lease(int fd, const Options& options, const ListenerIdentity& l
         " F_STORE_GUID=" + bytes_hex(std::span<const uint8_t>(guid.bytes.data(),
                                                                  guid.bytes.size())) +
         " PATH=" + options.socket_path + " DIGEST=" + digest +
-        " DEV=" + std::to_string(static_cast<unsigned long long>(listener.listener_device)) +
-        " INO=" + std::to_string(static_cast<unsigned long long>(listener.listener_inode)) +
+        " DEV=" + std::to_string(static_cast<unsigned long long>(listener.pathname_device)) +
+        " INO=" + std::to_string(static_cast<unsigned long long>(listener.pathname_inode)) +
         "\n";
     return write_exact(fd, message);
 }
@@ -581,14 +666,7 @@ bool handle_connection(local::Connection connection, const Options& options,
 } // namespace
 
 FStoreGuid f_store_guid_for_identity(local::Identity identity) noexcept {
-    FStoreGuid result{};
-    for (size_t index = 0; index != sizeof(identity.generation); ++index)
-        result.bytes[index] = static_cast<uint8_t>(identity.generation >>
-                                                   (56u - static_cast<unsigned>(index) * 8u));
-    for (size_t index = 0; index != sizeof(identity.attempt); ++index)
-        result.bytes[sizeof(identity.generation) + index] = static_cast<uint8_t>(
-            identity.attempt >> (56u - static_cast<unsigned>(index) * 8u));
-    return result;
+    return f_store_guid_for_incarnation(identity);
 }
 
 namespace {
@@ -1112,9 +1190,13 @@ int run(const Options& options) noexcept {
     // default is ignored whenever the structured lease contract is active;
     // this prevents accidental static-path reuse across restart/controller
     // recreation.
-    if (const char* expected_socket = ::getenv("ICECC_CACHE_SERVICE_EXPECTED_SOCKET");
-        expected_socket != nullptr && *expected_socket != '\0')
-        effective_options.socket_path = expected_socket;
+    StructuredLaunch structured_launch;
+    if (!read_structured_launch(structured_launch))
+        return 2;
+    if (structured_launch.active) {
+        effective_options.identity = structured_launch.identity;
+        effective_options.socket_path = structured_launch.socket_path;
+    }
     OwnedFd ready;
     if (!parse_ready_fd(ready))
         return 2;
@@ -1144,7 +1226,10 @@ int run(const Options& options) noexcept {
     // The store identity is explicit runtime state, derived only from the
     // already authenticated service generation.  A production launcher can
     // construct SidecarRuntime directly with its durable store GUID.
-    runtime_config.f_store_guid = f_store_guid_for_identity(effective_options.identity);
+    runtime_config.f_store_guid = structured_launch.active
+                                      ? structured_launch.f_store_guid
+                                      : f_store_guid_for_incarnation(
+                                            effective_options.identity);
     std::unique_ptr<SidecarRuntime> runtime;
     try {
         runtime = std::make_unique<SidecarRuntime>(std::move(runtime_config));
@@ -1152,7 +1237,7 @@ int run(const Options& options) noexcept {
         cleanup_listener(listener, effective_options.socket_path, identity);
         return 2;
     }
-    const bool structured_ready = ::getenv("ICECC_CACHE_SERVICE_READY_FORMAT") != nullptr;
+    const bool structured_ready = structured_launch.active;
     if (g_stop_requested != 0 ||
         !(structured_ready ? write_ready_lease(ready.fd, effective_options, identity)
                            : write_ready(ready.fd))) {

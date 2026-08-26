@@ -6,6 +6,38 @@ src=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
 impl="$src/cache/p50_sidecar_supervisor.cpp"
 header="$src/cache/p50_sidecar_supervisor.h"
 
+lease_gate() {
+    candidate_impl=$1
+    candidate_header=$2
+    grep -F 'class LaunchIdentityAllocator' "$candidate_header" >/dev/null &&
+        grep -F 'std::shared_ptr<LaunchIdentityAllocator> launch_identities' \
+            "$candidate_header" >/dev/null &&
+        grep -F 'LaunchIdentityAllocator::allocate()' "$candidate_impl" >/dev/null &&
+        grep -F 'config_.launch_identities->allocate()' "$candidate_impl" >/dev/null &&
+        grep -F 'std::string_view(ready).substr(0, prefix_bytes)' \
+            "$candidate_impl" >/dev/null &&
+        grep -F 'prefix.substr(0, prefix_bytes)' "$candidate_impl" >/dev/null &&
+        grep -F 'kReadyLeaseLivenessBarrierMilliseconds' \
+            "$candidate_impl" >/dev/null &&
+        grep -F 'child_has_exited_exact(expected_child)' "$candidate_impl" >/dev/null &&
+        grep -F 'SYS_pidfd_open' "$candidate_impl" >/dev/null &&
+        grep -F 'SYS_pidfd_send_signal' "$candidate_impl" >/dev/null &&
+        grep -F 'int child_pidfd_ = -1;' "$candidate_header" >/dev/null &&
+        grep -F 'signal_child_handle(child_pidfd_, SIGTERM)' \
+            "$candidate_impl" >/dev/null &&
+        grep -F 'signal_child_handle(child_pidfd_, SIGKILL)' \
+            "$candidate_impl" >/dev/null &&
+        grep -F 'return child_handle_has_exited(child_pidfd_);' \
+            "$candidate_impl" >/dev/null &&
+        grep -F 'const bool proven_dead = terminate_child();' \
+            "$candidate_impl" >/dev/null &&
+        grep -F 'if (proven_dead) {' "$candidate_impl" >/dev/null &&
+        grep -F 'return direct_dead && group_dead && !group_identity_invalidated;' \
+            "$candidate_impl" >/dev/null
+}
+
+lease_gate "$impl" "$header"
+
 grep -F 'kReadyFdEnvironment' "$impl" >/dev/null
 grep -F 'READY\n' "$impl" >/dev/null
 grep -F 'State::DegradedLegacy' "$impl" >/dev/null
@@ -28,6 +60,8 @@ grep -F 'WNOWAIT' "$impl" >/dev/null
 grep -F 'child_has_exited' "$impl" >/dev/null
 grep -F 'getpgid' "$impl" >/dev/null
 grep -F 'move-group' "$src/unittests/p50_sidecar_supervisor_test.cpp" >/dev/null
+grep -F 'reaped/reused numeric PID' \
+    "$src/unittests/p50_sidecar_supervisor_test.cpp" >/dev/null
 grep -F 'setpgid' "$impl" >/dev/null
 grep -F 'process_group_owned_' "$impl" "$header" >/dev/null
 grep -F 'process_group_ = -1' "$impl" >/dev/null
@@ -41,6 +75,13 @@ grep -F 'socket_path_digest' "$impl" "$header" >/dev/null
 grep -F 'cleanup_lease' "$impl" >/dev/null
 grep -F 'rmdir' "$impl" >/dev/null
 
+# A stale numeric PID must never be a direct signal target.  Group signalling
+# remains separately guarded by the proven PGID ownership fence.
+if grep -E 'signal_target\(child_pid_|kill\(child_pid_' "$impl" >/dev/null; then
+    echo 'FAIL: supervisor directly signals a reusable numeric child PID' >&2
+    exit 1
+fi
+
 # The component must remain detached from advertisement and daemon ownership.
 if grep -E 'daemon/main|apply_inert_cache_advertisement|LoginMsg|endpoint_port' "$impl" "$header" >/dev/null; then
     echo 'FAIL: supervisor gained daemon or advertisement integration' >&2
@@ -50,7 +91,9 @@ fi
 mutant=$(mktemp "${TMPDIR:-/tmp}/p50sidecarsupervisor-mutant.XXXXXX")
 mutant_fds=$(mktemp "${TMPDIR:-/tmp}/p50sidecarsupervisor-fd-mutant.XXXXXX")
 mutant_ready=$(mktemp "${TMPDIR:-/tmp}/p50sidecarsupervisor-ready-mutant.XXXXXX")
-trap 'rm -f "$mutant" "$mutant_fds" "$mutant_ready"' EXIT HUP INT TERM
+mutant_dir=$(mktemp -d "${TMPDIR:-/tmp}/p50sidecarsupervisor-lease-mutants.XXXXXX")
+trap 'rm -f "$mutant" "$mutant_fds" "$mutant_ready"; rm -rf "$mutant_dir"' \
+    EXIT HUP INT TERM
 sed 's/bool grouped = process_group_owned_ && process_group_ > 1;/bool grouped = false;/' \
     "$impl" >"$mutant"
 if grep -F 'process_group_owned_ && process_group_ > 1' "$mutant" >/dev/null; then
@@ -67,4 +110,41 @@ if grep -F 'ready.size() != kReadyMessageSize' "$mutant_ready" >/dev/null; then
     echo 'FAIL: exact-READY deletion mutant was not formed' >&2
     exit 1
 fi
+
+# Every new incarnation/lease fence is load-bearing. Deleting any one exact
+# source anchor must make the focused source gate red.
+for pattern in \
+    'LaunchIdentityAllocator::allocate()' \
+    'config_.launch_identities->allocate()' \
+    'std::string_view(ready).substr(0, prefix_bytes)' \
+    'prefix.substr(0, prefix_bytes)' \
+    'kReadyLeaseLivenessBarrierMilliseconds' \
+    'child_has_exited_exact(expected_child)' \
+    'SYS_pidfd_open' \
+    'SYS_pidfd_send_signal' \
+    'signal_child_handle(child_pidfd_, SIGTERM)' \
+    'signal_child_handle(child_pidfd_, SIGKILL)' \
+    'return child_handle_has_exited(child_pidfd_);' \
+    'const bool proven_dead = terminate_child();' \
+    'if (proven_dead) {' \
+    'return direct_dead && group_dead && !group_identity_invalidated;'; do
+    lease_mutant="$mutant_dir/impl.cpp"
+    awk -v needle="$pattern" 'index($0, needle) == 0' "$impl" >"$lease_mutant"
+    if lease_gate "$lease_mutant" "$header"; then
+        echo "FAIL: supervisor lease deletion mutant survived: $pattern" >&2
+        exit 1
+    fi
+done
+
+for pattern in \
+    'class LaunchIdentityAllocator' \
+    'std::shared_ptr<LaunchIdentityAllocator> launch_identities' \
+    'int child_pidfd_ = -1;'; do
+    lease_mutant="$mutant_dir/header.h"
+    awk -v needle="$pattern" 'index($0, needle) == 0' "$header" >"$lease_mutant"
+    if lease_gate "$impl" "$lease_mutant"; then
+        echo "FAIL: supervisor allocator deletion mutant survived: $pattern" >&2
+        exit 1
+    fi
+done
 echo 'ok - sidecar supervisor source gates hold'

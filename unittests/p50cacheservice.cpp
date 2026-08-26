@@ -1,6 +1,7 @@
 #include "../cache/p50_cache_service.h"
 #include "../cache/p50_control_operation.h"
 #include "comm.h"
+#include "../services/digest128.h"
 
 #include <array>
 #include <cerrno>
@@ -83,6 +84,43 @@ bool send_byte_no_signal(int fd, uint8_t byte) {
         if (result < 0 && errno == EINTR)
             continue;
         return false;
+    }
+}
+
+std::string hex_id(const FStoreGuid& value) {
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string result(value.bytes.size() * 2, '0');
+    for (size_t index = 0; index != value.bytes.size(); ++index) {
+        result[index * 2] = digits[value.bytes[index] >> 4];
+        result[index * 2 + 1] = digits[value.bytes[index] & 0x0f];
+    }
+    return result;
+}
+
+void clear_structured_launch_environment() {
+    for (const char* name : {
+             "ICECC_CACHE_SERVICE_READY_FORMAT",
+             "ICECC_CACHE_SERVICE_EXPECTED_GENERATION",
+             "ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT",
+             "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID",
+             "ICECC_CACHE_SERVICE_EXPECTED_SOCKET",
+             "ICECC_CACHE_SERVICE_EXPECTED_SOCKET_DIGEST",
+         })
+        (void)::unsetenv(name);
+}
+
+std::string read_bounded_to_eof(int fd) {
+    std::string result;
+    for (;;) {
+        struct pollfd descriptor{fd, POLLIN | POLLHUP | POLLERR, 0};
+        CHECK(::poll(&descriptor, 1, 2000) > 0);
+        char bytes[256]{};
+        const ssize_t count = ::read(fd, bytes, sizeof(bytes));
+        if (count == 0)
+            return result;
+        CHECK(count > 0);
+        result.append(bytes, static_cast<size_t>(count));
+        CHECK(result.size() <= 2048);
     }
 }
 
@@ -593,6 +631,98 @@ void test_runtime_store_identity_fences_attempt() {
     CHECK(restarted != new_generation);
 }
 
+void structured_launch_is_complete_and_fail_closed() {
+    char template_path[] = "/tmp/icecc-cache-structured-XXXXXX";
+    CHECK(::mkdtemp(template_path) != nullptr);
+    CHECK(::chmod(template_path, 0700) == 0);
+    const std::string root = template_path;
+    const std::string expected_socket = root + "/incarnation.sock";
+    const std::string stale_socket = root + "/static.sock";
+    constexpr local::Identity expected_identity{91, 7};
+    const std::string generation = std::to_string(expected_identity.generation);
+    const std::string attempt = std::to_string(expected_identity.attempt);
+    const std::string guid =
+        hex_id(service::f_store_guid_for_identity(expected_identity));
+    const std::string digest =
+        icecc::digest128_hex(icecc::digest128(expected_socket));
+    const std::string uid = std::to_string(static_cast<uint64_t>(::getuid()));
+    const std::string gid = std::to_string(static_cast<uint64_t>(::getgid()));
+    const std::string executable = service_path();
+
+    int ready[2] = {-1, -1};
+    CHECK(::pipe(ready) == 0);
+    const std::string ready_fd = std::to_string(ready[1]);
+    const pid_t pid = ::fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        (void)::close(ready[0]);
+        clear_structured_launch_environment();
+        (void)::setenv("ICECC_CACHE_SERVICE_READY_FD", ready_fd.c_str(), 1);
+        (void)::setenv("ICECC_CACHE_SERVICE_READY_FORMAT", "2", 1);
+        (void)::setenv("ICECC_CACHE_SERVICE_EXPECTED_GENERATION", generation.c_str(), 1);
+        (void)::setenv("ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT", attempt.c_str(), 1);
+        (void)::setenv("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID", guid.c_str(), 1);
+        (void)::setenv("ICECC_CACHE_SERVICE_EXPECTED_SOCKET", expected_socket.c_str(), 1);
+        (void)::setenv("ICECC_CACHE_SERVICE_EXPECTED_SOCKET_DIGEST", digest.c_str(), 1);
+        ::execl(executable.c_str(), executable.c_str(), "--socket", stale_socket.c_str(),
+                "--peer-uid", uid.c_str(), "--peer-gid", gid.c_str(), "--generation",
+                "1", "--attempt", "1", static_cast<char*>(nullptr));
+        _exit(127);
+    }
+    (void)::close(ready[1]);
+    const std::string ready_message = read_bounded_to_eof(ready[0]);
+    (void)::close(ready[0]);
+    CHECK(ready_message.rfind("READY v2 generation=91 attempt=7 pid=", 0) == 0);
+    CHECK(ready_message.find(" F_STORE_GUID=" + guid) != std::string::npos);
+    CHECK(ready_message.find(" PATH=" + expected_socket) != std::string::npos);
+    CHECK(ready_message.find(" DIGEST=" + digest) != std::string::npos);
+    CHECK(ready_message.ends_with("\n"));
+    CHECK(::access(stale_socket.c_str(), F_OK) != 0);
+    struct stat socket_info{};
+    CHECK(::lstat(expected_socket.c_str(), &socket_info) == 0 &&
+          S_ISSOCK(socket_info.st_mode) && (socket_info.st_mode & 07777) == 0600);
+    local::Status connect_status = local::Status::Ok;
+    local::Connection connection = local::connect_unix(expected_socket, &connect_status);
+    CHECK(connection.valid() && connect_status == local::Status::Ok);
+    CHECK(connection.send(local::make_hello(local::PeerRole::Daemon,
+                                            expected_identity)) == local::Status::Ok);
+    local::Frame acknowledgement;
+    CHECK(connection.receive_with_timeout(acknowledgement, 1000) == local::Status::Ok);
+    CHECK(local::validate_handshake(acknowledgement, local::MessageType::HelloAck,
+                                    local::PeerRole::Sidecar,
+                                    expected_identity) == local::Status::Ok);
+    CHECK(::kill(pid, SIGTERM) == 0);
+    int status = 0;
+    CHECK(::waitpid(pid, &status, 0) == pid);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(::access(expected_socket.c_str(), F_OK) != 0);
+
+    int partial_ready[2] = {-1, -1};
+    CHECK(::pipe(partial_ready) == 0);
+    const std::string partial_fd = std::to_string(partial_ready[1]);
+    const pid_t partial = ::fork();
+    CHECK(partial >= 0);
+    if (partial == 0) {
+        (void)::close(partial_ready[0]);
+        clear_structured_launch_environment();
+        (void)::setenv("ICECC_CACHE_SERVICE_READY_FD", partial_fd.c_str(), 1);
+        (void)::setenv("ICECC_CACHE_SERVICE_READY_FORMAT", "2", 1);
+        ::execl(executable.c_str(), executable.c_str(), "--socket", stale_socket.c_str(),
+                "--peer-uid", uid.c_str(), "--peer-gid", gid.c_str(), "--generation",
+                "1", "--attempt", "1", static_cast<char*>(nullptr));
+        _exit(127);
+    }
+    (void)::close(partial_ready[1]);
+    CHECK(read_bounded_to_eof(partial_ready[0]).empty());
+    (void)::close(partial_ready[0]);
+    status = 0;
+    CHECK(::waitpid(partial, &status, 0) == partial);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 2);
+    CHECK(::access(stale_socket.c_str(), F_OK) != 0);
+    CHECK(::access(expected_socket.c_str(), F_OK) != 0);
+    CHECK(::rmdir(root.c_str()) == 0);
+}
+
 void test_runtime_stop_interrupts_control_wait() {
     service::SidecarRuntime runtime(test_runtime_config());
     RuntimeCase pair = authenticated_runtime_pair();
@@ -1086,6 +1216,7 @@ int main() {
         slowloris_deadline_is_total_and_listener_recovers();
         frame_header_and_payload_share_one_deadline();
         test_runtime_store_identity_fences_attempt();
+        structured_launch_is_complete_and_fail_closed();
         test_runtime_identity_disconnect_and_endpoint_failure();
         test_runtime_stop_interrupts_control_wait();
         test_runtime_zstd_tu_af_unix_loopback();

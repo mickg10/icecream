@@ -1,7 +1,10 @@
 #include "../cache/p50_sidecar_supervisor.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cerrno>
+#include <cstring>
+#include <dirent.h>
 #include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
@@ -10,6 +13,11 @@
 #include <stdexcept>
 #include <string>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
@@ -45,10 +53,82 @@ int ready_fd() {
     return value == nullptr ? -1 : std::atoi(value);
 }
 
+const char* required_environment(const char* name) {
+    const char* value = std::getenv(name);
+    return value != nullptr && *value != '\0' ? value : nullptr;
+}
+
+int structured_listener(const char* path) {
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    const size_t size = std::strlen(path);
+    if (size == 0 || size >= sizeof(address.sun_path))
+        return -1;
+    std::memcpy(address.sun_path, path, size + 1);
+    const int listener = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (listener < 0)
+        return -1;
+    const socklen_t length = static_cast<socklen_t>(
+        offsetof(sockaddr_un, sun_path) + size + 1);
+    if (::bind(listener, reinterpret_cast<const sockaddr*>(&address), length) != 0 ||
+        ::chmod(path, 0600) != 0 || ::listen(listener, 4) != 0) {
+        (void)::close(listener);
+        return -1;
+    }
+    return listener;
+}
+
+int structured_child(const std::string& mode, int fd) {
+    const char* format = required_environment("ICECC_CACHE_SERVICE_READY_FORMAT");
+    const char* generation =
+        required_environment("ICECC_CACHE_SERVICE_EXPECTED_GENERATION");
+    const char* attempt = required_environment("ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT");
+    const char* guid =
+        required_environment("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID");
+    const char* path = required_environment("ICECC_CACHE_SERVICE_EXPECTED_SOCKET");
+    const char* digest =
+        required_environment("ICECC_CACHE_SERVICE_EXPECTED_SOCKET_DIGEST");
+    if (format == nullptr || std::string(format) != "2" || generation == nullptr ||
+        attempt == nullptr || guid == nullptr || path == nullptr || digest == nullptr)
+        return 108;
+    const int listener = structured_listener(path);
+    if (listener < 0)
+        return 109;
+    struct stat pathname{};
+    if (::lstat(path, &pathname) != 0) {
+        (void)::close(listener);
+        return 110;
+    }
+    const long long published_pid = static_cast<long long>(::getpid()) +
+                                    (mode == "structured-wrong-pid" ? 1 : 0);
+    const std::string ready =
+        "READY v2 generation=" + std::string(generation) + " attempt=" + attempt +
+        " pid=" + std::to_string(published_pid) + " F_STORE_GUID=" + guid +
+        " PATH=" + path + " DIGEST=" + digest +
+        " DEV=" + std::to_string(static_cast<unsigned long long>(pathname.st_dev)) +
+        " INO=" + std::to_string(static_cast<unsigned long long>(pathname.st_ino)) +
+        "\n";
+    if (!write_all(fd, ready.data(), ready.size())) {
+        (void)::close(listener);
+        return 111;
+    }
+    (void)::close(fd);
+    if (mode == "structured-exit") {
+        (void)::close(listener);
+        return 0;
+    }
+    (void)::signal(SIGTERM, SIG_IGN);
+    const int result = ::pause();
+    (void)::close(listener);
+    return result;
+}
+
 int fake_child(const char* mode) {
     const int fd = ready_fd();
     if (fd < 0)
         return 90;
+    if (std::string(mode).rfind("structured-", 0) == 0)
+        return structured_child(mode, fd);
     if (std::string(mode) == "timeout" || std::string(mode) == "pre-exit")
         return std::string(mode) == "pre-exit" ? 23 : pause();
     if (std::string(mode) == "partial") {
@@ -203,6 +283,48 @@ Config fake_config(const char* mode, uint32_t max_restarts = 0) {
     return config;
 }
 
+std::string make_private_root() {
+    char pattern[] = "/tmp/icecc-sidecar-lease-XXXXXX";
+    char* root = ::mkdtemp(pattern);
+    CHECK(root != nullptr);
+    CHECK(::chmod(root, 0700) == 0);
+    return root;
+}
+
+void remove_test_lease_root(const std::string& root) {
+    DIR* directory = ::opendir(root.c_str());
+    CHECK(directory != nullptr);
+    for (;;) {
+        errno = 0;
+        dirent* entry = ::readdir(directory);
+        if (entry == nullptr) {
+            CHECK(errno == 0);
+            break;
+        }
+        if (std::string(entry->d_name) == "." || std::string(entry->d_name) == "..")
+            continue;
+        const std::string lease_directory = root + "/" + entry->d_name;
+        const std::string socket = lease_directory + "/cache.sock";
+        struct stat info{};
+        if (::lstat(socket.c_str(), &info) == 0) {
+            CHECK(S_ISSOCK(info.st_mode));
+            CHECK(::unlink(socket.c_str()) == 0);
+        }
+        CHECK(::rmdir(lease_directory.c_str()) == 0);
+    }
+    CHECK(::closedir(directory) == 0);
+    CHECK(::rmdir(root.c_str()) == 0);
+}
+
+Config structured_config(const char* mode, const std::string& root,
+                         const std::shared_ptr<LaunchIdentityAllocator>& allocator,
+                         uint32_t max_restarts = 3) {
+    Config config = fake_config(mode, max_restarts);
+    config.lease_root = root;
+    config.launch_identities = allocator;
+    return config;
+}
+
 void validation_and_exec_failure() {
     Config invalid;
     CHECK(!Supervisor::valid_config(invalid));
@@ -217,6 +339,12 @@ void validation_and_exec_failure() {
     invalid.max_attempts_per_recovery = 16;
     invalid.max_restarts = std::numeric_limits<uint32_t>::max();
     CHECK(!Supervisor::valid_config(invalid));
+
+    const std::string lease_root = make_private_root();
+    Config missing_allocator = fake_config("structured-live");
+    missing_allocator.lease_root = lease_root;
+    CHECK(!Supervisor::valid_config(missing_allocator));
+    CHECK(::rmdir(lease_root.c_str()) == 0);
 
     // This is a regular executable, so configuration validation succeeds;
     // execve then reports ENOENT for its deliberately missing interpreter.
@@ -239,6 +367,83 @@ void validation_and_exec_failure() {
     CHECK(supervisor.counters().launches == 1);
     CHECK(!supervisor.has_private_fds());
     CHECK(::unlink(path) == 0);
+}
+
+void structured_lease_rotates_across_restart_and_controller_recreation() {
+    const std::string root = make_private_root();
+    auto allocator = std::make_shared<LaunchIdentityAllocator>(71, 1);
+    Config config = structured_config("structured-live", root, allocator, 4);
+    Supervisor first(config);
+    CHECK(first.start());
+    CHECK(first.current_lease().has_value());
+    const ReadyLease lease1 = *first.current_lease();
+    CHECK(lease1.valid());
+    CHECK((lease1.identity == icecc::p50::local::Identity{71, 1}));
+    CHECK(lease1.f_store_guid ==
+          icecc::p50::f_store_guid_for_incarnation(lease1.identity));
+    CHECK(::kill(first.child_pid(), SIGKILL) == 0);
+    bool restarted = false;
+    for (int attempt = 0; attempt != 100 && !restarted; ++attempt) {
+        restarted = first.poll() && first.current_lease().has_value() &&
+                    first.current_lease()->identity.attempt == 2;
+        if (!restarted)
+            ::usleep(5000);
+    }
+    CHECK(restarted);
+    const ReadyLease lease2 = *first.current_lease();
+    CHECK(lease2.valid());
+    CHECK((lease2.identity == icecc::p50::local::Identity{71, 2}));
+    CHECK(lease2.f_store_guid ==
+          icecc::p50::f_store_guid_for_incarnation(lease2.identity));
+    CHECK(lease2.f_store_guid != lease1.f_store_guid);
+    CHECK(lease2.private_directory != lease1.private_directory);
+    CHECK(lease2.socket_path != lease1.socket_path);
+    first.shutdown();
+
+    Supervisor replacement(structured_config("structured-live", root, allocator));
+    CHECK(replacement.start());
+    CHECK(replacement.current_lease().has_value());
+    CHECK((replacement.current_lease()->identity ==
+           icecc::p50::local::Identity{71, 3}));
+    CHECK(replacement.current_lease()->f_store_guid ==
+          icecc::p50::f_store_guid_for_incarnation(
+              replacement.current_lease()->identity));
+    replacement.shutdown();
+    CHECK(::rmdir(root.c_str()) == 0);
+}
+
+void structured_dead_or_malformed_ready_is_never_current() {
+    for (const char* mode : {"structured-exit", "structured-wrong-pid"}) {
+        const std::string root = make_private_root();
+        auto allocator = std::make_shared<LaunchIdentityAllocator>(81, 1);
+        Config config = structured_config(mode, root, allocator, 0);
+        config.max_attempts_per_recovery = 1;
+        Supervisor supervisor(config);
+        CHECK(!supervisor.start());
+        CHECK(!supervisor.current_lease().has_value());
+        CHECK(supervisor.state() == State::DegradedLegacy);
+        CHECK(supervisor.counters().pre_ready_exits +
+                  supervisor.counters().invalid_ready_messages >=
+              1);
+        remove_test_lease_root(root);
+    }
+}
+
+void launch_allocator_refuses_reserved_and_exhausted_identities() {
+    LaunchIdentityAllocator zero_generation(0, 1);
+    CHECK(!zero_generation.allocate().has_value());
+    LaunchIdentityAllocator max_generation(std::numeric_limits<uint64_t>::max(), 1);
+    CHECK(!max_generation.allocate().has_value());
+    LaunchIdentityAllocator zero_attempt(1, 0);
+    CHECK(!zero_attempt.allocate().has_value());
+    LaunchIdentityAllocator max_attempt(1, std::numeric_limits<uint64_t>::max());
+    CHECK(!max_attempt.allocate().has_value());
+    LaunchIdentityAllocator last_usable(9,
+                                        std::numeric_limits<uint64_t>::max() - 1);
+    const auto allocated = last_usable.allocate();
+    CHECK(allocated.has_value());
+    CHECK(allocated->identity.attempt == std::numeric_limits<uint64_t>::max() - 1);
+    CHECK(!last_usable.allocate().has_value());
 }
 
 void ready_and_shutdown() {
@@ -477,12 +682,25 @@ void moved_child_refuses_stale_group_signal() {
     Supervisor supervisor(fake_config("move-group"));
     (void)::alarm(5);
     CHECK(supervisor.start());
+    const pid_t exact_child = supervisor.child_pid();
+    CHECK(exact_child > 1);
     CHECK(supervisor.process_group_id() > 1);
     CHECK(supervisor.process_group_id() != sentinel);
     supervisor.shutdown();
     (void)::alarm(0);
     CHECK(::unsetenv("ICECC_MOVE_TO_PGID") == 0);
     CHECK(::unsetenv("ICECC_MOVED_HELPER_PID_FILE") == 0);
+
+#if defined(__linux__) && defined(SYS_pidfd_open) && defined(SYS_pidfd_send_signal)
+    // The group mismatch deliberately invalidates both numeric identities.
+    // Direct teardown is nevertheless safe because pidfd_send_signal targets
+    // the original task, never a reaped/reused numeric PID.  Overall status
+    // remains degraded because the abandoned original group is not proven
+    // dead and therefore cannot authorize lease cleanup or replacement.
+    CHECK(supervisor.child_pid() < 0);
+    CHECK(supervisor.state() == State::DegradedLegacy);
+    CHECK(!supervisor.has_private_fds());
+#endif
 
     pid_t helper = -1;
     const int read_file = ::open(helper_path, O_RDONLY);
@@ -599,6 +817,9 @@ int main(int argc, char** argv) {
         return fake_child(argv[2]);
     try {
         validation_and_exec_failure();
+        launch_allocator_refuses_reserved_and_exhausted_identities();
+        structured_lease_rotates_across_restart_and_controller_recreation();
+        structured_dead_or_malformed_ready_is_never_current();
         ready_and_shutdown();
         timeout_and_pre_ready_exit_are_distinct();
         repeated_post_ready_crashes_exhaust_budget();

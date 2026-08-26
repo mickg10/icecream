@@ -1,28 +1,35 @@
-/* Focused daemon-side CACHE_SESSION dispatch matrix.
- * The ordinary side is a real MsgChannel; the private side is a real
- * authenticated socketpair and FdHandoffReceiver. */
+/* Focused Protocol-50 CACHE_SESSION dispatch matrix.
+ *
+ * Every control relationship below is accepted from a private AF_UNIX
+ * OnDemandEndpoint.  The ordinary MsgChannel is a socketpair because it is
+ * the stream whose release boundary is under test; no control relationship is
+ * cached or attached by the dispatcher.
+ */
 #include "../cache/p50_daemon_cache_dispatch.h"
 #include "../cache/p50_control_operation.h"
+#include "../cache/p50_incarnation_identity.h"
 #include "comm.h"
 
-#include <algorithm>
-#include <array>
-#include <arpa/inet.h>
-#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <string>
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <thread>
 #include <unistd.h>
 
 using icecc::p50::daemon::CacheDispatchResult;
 using icecc::p50::daemon::CacheSessionDispatcher;
+using icecc::p50::daemon::OnDemandEndpoint;
 using icecc::p50::local::Connection;
 using icecc::p50::local::CredentialExpectation;
 using icecc::p50::local::FdHandoffReceiver;
+using icecc::p50::local::FdHandoffResult;
 using icecc::p50::local::Frame;
 using icecc::p50::local::Identity;
 using icecc::p50::local::MessageType;
@@ -45,99 +52,154 @@ struct MsgPair {
 
 MsgPair ordinary_pair(int protocol = 50) {
     int fds[2] = {-1, -1};
-    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0, "ordinary socketpair created");
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0,
+          "ordinary socketpair created");
     sockaddr_un address{};
     address.sun_family = AF_UNIX;
     MsgPair pair;
     std::thread left([&] {
-        pair.left = Service::createChannel(fds[0], reinterpret_cast<sockaddr *>(&address),
+        pair.left = Service::createChannel(fds[0],
+                                           reinterpret_cast<sockaddr *>(&address),
                                            sizeof(address));
     });
     std::thread right([&] {
-        pair.right = Service::createChannel(fds[1], reinterpret_cast<sockaddr *>(&address),
+        pair.right = Service::createChannel(fds[1],
+                                            reinterpret_cast<sockaddr *>(&address),
                                             sizeof(address));
     });
     left.join();
     right.join();
-    CHECK(pair.left != nullptr && pair.right != nullptr, "real MsgChannel pair created");
+    CHECK(pair.left != nullptr && pair.right != nullptr,
+          "ordinary MsgChannel pair created");
     if (pair.left) pair.left->protocol = protocol;
     if (pair.right) pair.right->protocol = protocol;
     return pair;
 }
 
-void authenticate(Connection &connection) {
-    const CredentialExpectation expected{static_cast<uint64_t>(::getuid()),
-                                         static_cast<uint64_t>(::getgid()),
-                                         static_cast<uint64_t>(::getpid())};
-    CHECK(connection.verify_peer_credentials(expected) ==
-              icecc::p50::local::Status::Ok,
-          "private relationship peer credentials authenticated");
-}
-
-bool attach_with_ack(CacheSessionDispatcher &dispatcher,
-                     Connection daemon_side,
-                     Connection &sidecar_side,
-                     Identity requested_identity,
-                     Frame acknowledgement) {
-    bool hello_valid = false;
-    bool acknowledgement_sent = false;
-    std::thread sidecar([&] {
-        Frame hello;
-        hello_valid = sidecar_side.receive_with_timeout(hello, 1000) == Status::Ok &&
-                      icecc::p50::local::validate_handshake(
-                          hello, MessageType::Hello, PeerRole::Daemon,
-                          requested_identity) == Status::Ok;
-        if (hello_valid) {
-            acknowledgement_sent = sidecar_side.send(acknowledgement) == Status::Ok;
-        }
-    });
-    const bool attached = dispatcher.attach_authenticated(
-        std::move(daemon_side), requested_identity);
-    sidecar.join();
-    CHECK(hello_valid, "sidecar validates daemon HELLO on the retained connection");
-    CHECK(acknowledgement_sent, "sidecar sends bounded HELLO_ACK");
-    return attached;
-}
-
-bool attach_current(CacheSessionDispatcher &dispatcher,
-                    Connection daemon_side,
-                    Connection &sidecar_side,
-                    Identity identity) {
-    return attach_with_ack(dispatcher, std::move(daemon_side), sidecar_side,
-                           identity,
-                           icecc::p50::local::make_hello_ack(PeerRole::Sidecar,
-                                                             identity));
-}
-
-bool saturate_nonreading_peer(int fd, size_t* bytes_filled = nullptr) {
-    int send_buffer = 1024;
-    if (::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer)) != 0)
-        return false;
-    const int original_flags = ::fcntl(fd, F_GETFL);
-    if (original_flags < 0 || ::fcntl(fd, F_SETFL, original_flags | O_NONBLOCK) != 0)
-        return false;
-    std::array<unsigned char, 64 * 1024> bytes{};
-    size_t total = 0;
-    bool saturated = false;
-    for (;;) {
-        const ssize_t count = ::send(fd, bytes.data(), bytes.size(), MSG_NOSIGNAL);
-        if (count > 0) {
-            total += static_cast<size_t>(count);
-            continue;
-        }
-        if (count < 0 && errno == EINTR)
-            continue;
-        saturated = count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
-        break;
-    }
-    const bool restored = ::fcntl(fd, F_SETFL, original_flags) == 0;
-    if (bytes_filled != nullptr)
-        *bytes_filled = total;
-    return saturated && restored;
-}
-
 void send_cache_session(MsgChannel *sender) {
-    CHECK(sender->send_msg(CacheSessionMsg()), "P50 CACHE_SESSION sent on ordinary link");
+    CHECK(sender != nullptr && sender->send_msg(CacheSessionMsg()),
+          "P50 CACHE_SESSION sent on ordinary link");
+}
+
+struct EndpointFixture {
+    explicit EndpointFixture(Identity identity) : identity(identity) {
+        char template_path[] = "/tmp/icecc-dispatch-endpoint-XXXXXX";
+        char *created = ::mkdtemp(template_path);
+        CHECK(created != nullptr, "private endpoint directory created");
+        if (created == nullptr)
+            return;
+        root = created;
+        CHECK(::chmod(root.c_str(), 0700) == 0, "private endpoint directory is 0700");
+        path = root + "/cache.sock";
+        listener = icecc::p50::local::listen_unix(path, 4, &listen_status);
+        CHECK(listener >= 0 && listen_status == Status::Ok,
+              "private AF_UNIX listener created");
+        struct stat info{};
+        CHECK(listener >= 0 && ::lstat(path.c_str(), &info) == 0 && S_ISSOCK(info.st_mode),
+              "listener pathname is a socket");
+        if (listener < 0 || ::lstat(path.c_str(), &info) != 0)
+            return;
+
+        endpoint.socket_path = path;
+        endpoint.expected_peer.uid = static_cast<uint64_t>(::getuid());
+        endpoint.expected_peer.gid = static_cast<uint64_t>(::getgid());
+        // Keep this assignment out of the aggregate initializer: the source
+        // gate must retain the exact PID credential binding as a visible field.
+        endpoint.expected_peer.pid = static_cast<uint64_t>(::getpid());
+        endpoint.lease_identity = identity;
+        endpoint.f_store_guid = icecc::p50::f_store_guid_for_incarnation(identity);
+        endpoint.socket_path_digest = icecc::digest128(path);
+        endpoint.listener_device = info.st_dev;
+        endpoint.listener_inode = info.st_ino;
+    }
+
+    ~EndpointFixture() {
+        if (listener >= 0)
+            (void)::close(listener);
+        struct stat info{};
+        if (!path.empty() && ::lstat(path.c_str(), &info) == 0 &&
+            S_ISSOCK(info.st_mode) && info.st_dev == endpoint.listener_device &&
+            info.st_ino == endpoint.listener_inode)
+            (void)::unlink(path.c_str());
+        if (!root.empty())
+            (void)::rmdir(root.c_str());
+    }
+
+    Identity identity{};
+    std::string root;
+    std::string path;
+    int listener = -1;
+    Status listen_status = Status::InvalidArgument;
+    OnDemandEndpoint endpoint;
+};
+
+struct PeerResult {
+    bool accepted = false;
+    bool credentials = false;
+    bool hello = false;
+    bool ack_sent = false;
+    bool operation = false;
+    FdHandoffResult handoff{};
+    FdHandoffReceiver receiver;
+};
+
+enum class PeerAction { Handoff, CloseAfterAck, WaitAfterAck };
+
+bool receive_cache_operation(Connection& sidecar, Identity identity,
+                             uint64_t request_id);
+
+std::thread serve_peer(EndpointFixture &fixture, Identity identity, uint64_t request_id,
+                       Frame acknowledgement, PeerAction action, PeerResult &result,
+                       std::chrono::milliseconds acknowledgement_delay = {}) {
+    return std::thread([&fixture, identity, request_id,
+                        acknowledgement = std::move(acknowledgement), action, &result,
+                        acknowledgement_delay]() mutable {
+        Status accept_status = Status::InvalidArgument;
+        Connection connection = icecc::p50::local::accept_unix(fixture.listener, &accept_status);
+        result.accepted = connection.valid() && accept_status == Status::Ok;
+        if (!result.accepted)
+            return;
+        const CredentialExpectation expected{
+            static_cast<uint64_t>(::getuid()), static_cast<uint64_t>(::getgid()),
+            static_cast<uint64_t>(::getpid())};
+        result.credentials = connection.verify_peer_credentials(expected) == Status::Ok;
+        Frame hello;
+        result.hello = result.credentials &&
+            connection.receive_with_timeout(hello, 1000) == Status::Ok &&
+            icecc::p50::local::validate_handshake(hello, MessageType::Hello,
+                                                  PeerRole::Daemon, identity) == Status::Ok;
+        if (!result.hello)
+            return;
+        if (acknowledgement_delay.count() != 0)
+            std::this_thread::sleep_for(acknowledgement_delay);
+        result.ack_sent = connection.send(acknowledgement) == Status::Ok;
+        if (!result.ack_sent)
+            return;
+        result.operation = receive_cache_operation(connection, identity, request_id);
+        if (!result.operation)
+            return;
+        if (action == PeerAction::CloseAfterAck) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            return;
+        }
+        if (action == PeerAction::WaitAfterAck) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            return;
+        }
+        result.handoff = result.receiver.receive_and_ack(
+            connection, icecc::p50::local::HandoffRequest{identity, request_id},
+            std::chrono::steady_clock::now() + std::chrono::seconds(2));
+        // Let the sender consume the ACK before this fresh relationship is
+        // torn down; otherwise POLLHUP can race the ACK and look like a
+        // terminal disconnect even after receiver adoption.
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    });
+}
+
+CacheSessionDispatcher make_dispatcher(const EndpointFixture &fixture,
+                                       std::chrono::milliseconds timeout =
+                                           std::chrono::milliseconds(250)) {
+    return CacheSessionDispatcher(fixture.identity, fixture.endpoint, timeout);
 }
 
 bool receive_cache_operation(Connection& sidecar, Identity identity, uint64_t request_id) {
@@ -156,310 +218,286 @@ bool receive_cache_operation(Connection& sidecar, Identity identity, uint64_t re
 } // namespace
 
 int main() {
-    // Mutant inventory exercised here or by the same production handoff
-    // primitive: delete-CACHE_SESSION-check, release-with-buffered-byte,
-    // wrong/stale generation/attempt, duplicate request, sidecar disconnect,
-    // handoff timeout, normal-job misclassification, P49 discriminator, and
-    // leaked fd/process teardown.
-    /* The real unit uses a socketpair directly because Connection is
-       intentionally move-only.  Authenticate both ends before dispatch. */
+    // Exact immutable READY lease identity: GUID, digest, listener node, and
+    // all three OS credentials must be captured from this private endpoint.
     {
-        int side_fds[2] = {-1, -1};
-        CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, side_fds) == 0,
-              "HELLO timeout socketpair created");
-        CHECK(saturate_nonreading_peer(side_fds[0]),
-              "HELLO timeout peer is deterministically saturated and non-reading");
-        Connection daemon_side(side_fds[0]);
-        Connection receiver_side(side_fds[1]);
-        authenticate(daemon_side);
-        const auto start = std::chrono::steady_clock::now();
-        CacheSessionDispatcher dispatcher(Identity{6, 10});
-        const bool attached =
-            dispatcher.attach_authenticated(std::move(daemon_side), Identity{6, 10});
-        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - start).count();
-        CHECK(!attached && !dispatcher.available(),
-              "saturated non-reading sidecar cannot complete HELLO");
-        CHECK(elapsed >= 150 && elapsed <= 900,
-              "HELLO send timeout remains within its absolute wall-time bound");
+        EndpointFixture fixture({7, 11});
+        CHECK(fixture.endpoint.valid(), "OnDemandEndpoint has complete immutable identity");
+        CHECK(fixture.endpoint.lease_identity == fixture.identity,
+              "endpoint lease identity is exact generation and attempt");
+        CHECK(fixture.endpoint.f_store_guid ==
+                  icecc::p50::f_store_guid_for_incarnation(fixture.identity),
+              "endpoint F_STORE_GUID binds the incarnation");
+        CHECK(fixture.endpoint.socket_path_digest == icecc::digest128(fixture.path),
+              "endpoint digest binds the exact socket path");
+        CHECK(fixture.endpoint.listener_device != 0 && fixture.endpoint.listener_inode != 0,
+              "endpoint captures listener device and inode");
+        CHECK(fixture.endpoint.expected_peer.uid == static_cast<uint64_t>(::getuid()) &&
+                  fixture.endpoint.expected_peer.gid == static_cast<uint64_t>(::getgid()) &&
+                  fixture.endpoint.expected_peer.pid == static_cast<uint64_t>(::getpid()),
+              "endpoint captures exact peer UID GID and PID");
+        CacheSessionDispatcher dispatcher(fixture.identity);
+        CHECK(dispatcher.set_on_demand_endpoint(fixture.endpoint),
+              "dispatcher installs the immutable on-demand endpoint lease");
+        CHECK(dispatcher.available(), "dispatcher accepts the exact live endpoint lease");
     }
 
-    /* The HELLO writer and ACK reader share one absolute deadline.  Delay
-       draining a saturated outbound socket before acknowledging: a restarted
-       relative receive budget would accept this exchange after 250ms, while
-       the unchanged deadline must fail at the original bound. */
-    {
-        int side_fds[2] = {-1, -1};
-        CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, side_fds) == 0,
-              "shared HELLO deadline socketpair created");
-        size_t saturated_bytes = 0;
-        CHECK(saturate_nonreading_peer(side_fds[0], &saturated_bytes),
-              "shared HELLO deadline peer is saturated");
-        Connection daemon_side(side_fds[0]);
-        Connection receiver_side(side_fds[1]);
-        authenticate(daemon_side);
-        CacheSessionDispatcher dispatcher(Identity{6, 11});
-        bool hello_valid = false;
-        Status acknowledgement_status = Status::InvalidArgument;
-        std::thread sidecar([&] {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            std::array<unsigned char, 4096> discarded{};
-            size_t remaining = saturated_bytes;
-            while (remaining != 0) {
-                const ssize_t count = ::recv(
-                    side_fds[1], discarded.data(),
-                    std::min(remaining, discarded.size()), 0);
-                if (count > 0) {
-                    remaining -= static_cast<size_t>(count);
-                } else if (count < 0 && errno == EINTR) {
-                    continue;
-                } else {
-                    return;
-                }
-            }
-            Frame hello;
-            hello_valid = receiver_side.receive_with_timeout(hello, 100) == Status::Ok &&
-                          icecc::p50::local::validate_handshake(
-                              hello, MessageType::Hello, PeerRole::Daemon,
-                              Identity{6, 11}) == Status::Ok;
-            std::this_thread::sleep_for(std::chrono::milliseconds(180));
-            acknowledgement_status = receiver_side.send(
-                icecc::p50::local::make_hello_ack(PeerRole::Sidecar,
-                                                  Identity{6, 11}));
-        });
-        const auto start = std::chrono::steady_clock::now();
-        const bool attached = dispatcher.attach_authenticated(
-            std::move(daemon_side), Identity{6, 11});
-        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - start).count();
-        sidecar.join();
-        CHECK(!attached && !dispatcher.available(),
-              "delayed ACK cannot renew the original HELLO budget");
-        CHECK(hello_valid, "delayed-ACK sidecar received the HELLO after drain");
-        CHECK(acknowledgement_status != Status::Ok,
-              "delayed ACK observes the daemon-side deadline teardown");
-        CHECK(elapsed >= 190 && elapsed <= 650,
-              "HELLO send and ACK receive share one bounded wall-time budget");
-    }
-
+    // Missing endpoint never touches the ordinary stream or releases its fd.
     {
         MsgPair ordinary = ordinary_pair();
-        int side_fds[2] = {-1, -1};
-        CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, side_fds) == 0,
-              "authenticated sidecar socketpair created");
-        Connection daemon_side(side_fds[0]);
-        Connection receiver_side(side_fds[1]);
-        authenticate(daemon_side);
-        authenticate(receiver_side);
-
-        CacheSessionDispatcher dispatcher(Identity{7, 11});
-        CHECK(attach_current(dispatcher, std::move(daemon_side), receiver_side,
-                             Identity{7, 11}),
-              "dispatcher accepts credential- and HELLO-authenticated sidecar");
-        send_cache_session(ordinary.left);
-        Msg *decoded = ordinary.right->get_msg(2, true);
-        CHECK(decoded && *decoded == Msg::CACHE_SESSION,
-              "real daemon path sees exactly decoded CACHE_SESSION");
-
-        FdHandoffReceiver receiver;
-        icecc::p50::local::FdHandoffResult receive_result;
-        const Identity expected_identity{7, 11};
-        std::thread receiver_thread([&] {
-            CHECK(receive_cache_operation(receiver_side, expected_identity, 1),
-                  "sidecar receives exact CacheSession operation before SCM_RIGHTS");
-            receive_result = receiver.receive_and_ack(
-                receiver_side, icecc::p50::local::HandoffRequest{expected_identity, 1},
-                std::chrono::steady_clock::now() + std::chrono::seconds(2));
-        });
-        const int old_fd = ordinary.right->fd;
-        const auto outcome = dispatcher.dispatch(*ordinary.right, ordinary.right->protocol,
-                                                  static_cast<uint32_t>(*decoded));
-        receiver_thread.join();
-        delete decoded;
-        CHECK(outcome.result == CacheDispatchResult::Accepted && outcome.detached,
-              "clean decoded boundary transfers exactly once");
-        CHECK(outcome.request.identity == expected_identity && outcome.request.request_id == 1,
-              "handoff binds generation attempt and nonzero request id");
-        CHECK(receiver.adopted() && receive_result.status ==
-                  icecc::p50::local::FdHandoffStatus::Accepted,
-              "sidecar acknowledges only after adopting descriptor");
-        CHECK(ordinary.right->fd == -1 && old_fd >= 0,
-              "ordinary MsgChannel relinquishes descriptor only after release proof");
-        auto adopted = receiver.take_adopted_fd();
-        CHECK(adopted.valid() && ::fcntl(adopted.get(), F_GETFD) >= 0,
-              "adopted descriptor remains live and owned by sidecar receiver");
-        ::shutdown(ordinary.left->fd, SHUT_WR);
-        adopted.reset();
-    }
-
-    /* Missing sidecar does not call release, preserving ownership and any
-       following cache byte for deterministic ordinary-link teardown. */
-    {
-        MsgPair ordinary = ordinary_pair();
-        CacheSessionDispatcher dispatcher(Identity{9, 3});
+        CacheSessionDispatcher dispatcher({8, 1});
         send_cache_session(ordinary.left);
         Msg *decoded = ordinary.right->get_msg(2, true);
         const int owned = ordinary.right->fd;
-        const auto outcome = dispatcher.dispatch(*ordinary.right, ordinary.right->protocol,
-                                                  static_cast<uint32_t>(*decoded));
+        const auto outcome = decoded == nullptr
+                                 ? icecc::p50::daemon::CacheDispatchOutcome{}
+                                 : dispatcher.dispatch(*ordinary.right, 50,
+                                                       static_cast<uint32_t>(*decoded));
         delete decoded;
         CHECK(outcome.result == CacheDispatchResult::SidecarUnavailable && !outcome.detached,
-              "sidecar restart/unavailable fails closed before descriptor release");
-        CHECK(ordinary.right->fd == owned, "unavailable sidecar retains ordinary fd ownership");
+              "missing endpoint fails closed before release");
+        CHECK(ordinary.right->fd == owned, "missing endpoint retains ordinary fd ownership");
     }
 
-    /* A read-ahead byte refuses release without consuming it. */
+    // Successful handoff: accept, credential check, HELLO/ACK, release proof,
+    // SCM_RIGHTS adoption, and ACK are all on one fresh relationship.
     {
+        EndpointFixture fixture({9, 2});
+        CacheSessionDispatcher dispatcher = make_dispatcher(fixture);
         MsgPair ordinary = ordinary_pair();
-        int side_fds[2] = {-1, -1};
-        CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, side_fds) == 0,
-              "release-barrier sidecar pair created");
-        Connection daemon_side(side_fds[0]);
-        Connection receiver_side(side_fds[1]);
-        authenticate(daemon_side);
-        authenticate(receiver_side);
-        CacheSessionDispatcher dispatcher(Identity{10, 4});
-        CHECK(attach_current(dispatcher, std::move(daemon_side), receiver_side,
-                             Identity{10, 4}),
-              "release-barrier dispatcher attached after HELLO");
+        PeerResult peer;
+        std::thread server = serve_peer(
+            fixture, fixture.identity, 1,
+            icecc::p50::local::make_hello_ack(PeerRole::Sidecar, fixture.identity),
+            PeerAction::Handoff, peer);
         send_cache_session(ordinary.left);
         Msg *decoded = ordinary.right->get_msg(2, true);
-        const unsigned char next = 0x43;
-        CHECK(::send(ordinary.left->fd, &next, 1, MSG_NOSIGNAL) == 1,
-              "one following cache byte queued");
+        const int old_fd = ordinary.right->fd;
+        const auto outcome = dispatcher.dispatch(*ordinary.right, 50,
+                                                  static_cast<uint32_t>(*decoded));
+        delete decoded;
+        server.join();
+        CHECK(peer.accepted && peer.credentials && peer.hello && peer.ack_sent &&
+                  peer.operation,
+              "fresh endpoint relationship authenticates HELLO and operation");
+        CHECK(outcome.result == CacheDispatchResult::Accepted && outcome.detached,
+              "successful CACHE_SESSION releases exactly once");
+        CHECK(outcome.request.identity == fixture.identity && outcome.request.request_id == 1,
+              "successful handoff carries exact identity and request ID 1");
+        CHECK(peer.receiver.adopted() &&
+                  peer.handoff.status == icecc::p50::local::FdHandoffStatus::Accepted,
+              "receiver adopts descriptor before sending ACK");
+        CHECK(ordinary.right->fd == -1 && old_fd >= 0,
+              "ordinary channel relinquishes descriptor only after release proof");
+        auto adopted = peer.receiver.take_adopted_fd();
+        CHECK(adopted.valid() && ::fcntl(adopted.get(), F_GETFD) >= 0,
+              "adopted descriptor remains valid and owned by receiver");
+        adopted.reset();
+        CHECK(dispatcher.available(), "endpoint lease remains after successful TU");
+    }
+
+    // A following ordinary byte is a release barrier.  The control peer has
+    // still completed a fresh handshake, but no descriptor may be detached.
+    {
+        EndpointFixture fixture({10, 3});
+        CacheSessionDispatcher dispatcher = make_dispatcher(fixture);
+        MsgPair ordinary = ordinary_pair();
+        PeerResult peer;
+        std::thread server = serve_peer(
+            fixture, fixture.identity, 1,
+            icecc::p50::local::make_hello_ack(PeerRole::Sidecar, fixture.identity),
+            PeerAction::CloseAfterAck, peer);
+        send_cache_session(ordinary.left);
+        Msg *decoded = ordinary.right->get_msg(2, true);
+        const unsigned char following = 0x43;
+        CHECK(::send(ordinary.left->fd, &following, 1, MSG_NOSIGNAL) == 1,
+              "following ordinary byte queued for release barrier");
         const int owned = ordinary.right->fd;
-        const auto outcome = dispatcher.dispatch(*ordinary.right, ordinary.right->protocol,
+        const auto outcome = dispatcher.dispatch(*ordinary.right, 50,
                                                   static_cast<uint32_t>(*decoded));
         delete decoded;
+        server.join();
+        CHECK(peer.hello && peer.ack_sent && peer.operation,
+              "release barrier uses a fresh authenticated operation relationship");
         CHECK(outcome.result == CacheDispatchResult::ReleaseRefused && !outcome.detached,
-              "buffered byte blocks handoff at clean boundary");
-        CHECK(ordinary.right->fd == owned, "release refusal retains fd and buffered byte");
-        // A disconnected/timeout receiver is classified as HandoffFailed by
-        // the same production path; the explicit label keeps that mutant in
-        // the focused source matrix even when this run exercises the barrier.
-        CHECK(CacheDispatchResult::HandoffFailed != CacheDispatchResult::Accepted,
-              "disconnect and timeout remain fail-closed handoff failures");
+              "buffered ordinary byte refuses descriptor handoff");
+        CHECK(ordinary.right->fd == owned, "release refusal retains ordinary fd");
+        CHECK(dispatcher.available(), "release refusal retains endpoint lease");
     }
 
-    /* A sidecar disconnect after release and an unresponsive sidecar both
-       close the transferred descriptor exactly once; neither is retried. */
-    for (const bool timeout : {false, true}) {
+    // The handshake's ACK delay is bounded by the same absolute deadline as
+    // connect and HELLO.  The endpoint remains available after this failure.
+    {
+        EndpointFixture fixture({11, 4});
+        constexpr auto timeout = std::chrono::milliseconds(80);
+        CacheSessionDispatcher dispatcher = make_dispatcher(fixture, timeout);
         MsgPair ordinary = ordinary_pair();
-        int side_fds[2] = {-1, -1};
-        CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, side_fds) == 0,
-              "terminal-handoff sidecar pair created");
-        Connection daemon_side(side_fds[0]);
-        Connection receiver_side(side_fds[1]);
-        authenticate(daemon_side);
-        authenticate(receiver_side);
-        CacheSessionDispatcher dispatcher(Identity{timeout ? 15u : 14u, 6},
-                                           std::chrono::milliseconds(timeout ? 20 : 250));
-        CHECK(attach_current(dispatcher, std::move(daemon_side), receiver_side,
-                             Identity{timeout ? 15u : 14u, 6}),
-              "terminal-handoff dispatcher attached after HELLO");
+        PeerResult peer;
+        std::thread server = serve_peer(
+            fixture, fixture.identity, 1,
+            icecc::p50::local::make_hello_ack(PeerRole::Sidecar, fixture.identity),
+            PeerAction::CloseAfterAck, peer, std::chrono::milliseconds(180));
         send_cache_session(ordinary.left);
         Msg *decoded = ordinary.right->get_msg(2, true);
-        if (!timeout) {
-            receiver_side = Connection(-1);
-        }
-        const auto outcome = dispatcher.dispatch(*ordinary.right, ordinary.right->protocol,
+        const auto started = std::chrono::steady_clock::now();
+        const auto outcome = dispatcher.dispatch(*ordinary.right, 50,
                                                   static_cast<uint32_t>(*decoded));
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started);
         delete decoded;
-        CHECK((timeout && outcome.result == CacheDispatchResult::HandoffFailed && outcome.detached) ||
-                  (!timeout && outcome.result == CacheDispatchResult::SidecarUnavailable &&
-                   !outcome.detached),
-              timeout ? "handoff timeout is bounded and fail-closed"
-                      : "sidecar disconnect is fail-closed before release");
-        CHECK(!dispatcher.available(), "failed handoff drops relationship and forbids retry");
+        server.join();
+        CHECK(!outcome.detached && outcome.result == CacheDispatchResult::SidecarUnavailable,
+              "handshake timeout fails before release");
+        CHECK(elapsed >= std::chrono::milliseconds(55) && elapsed < std::chrono::milliseconds(300),
+              "HELLO and ACK share one absolute bounded deadline");
+        CHECK(dispatcher.available(), "handshake timeout retains endpoint lease");
     }
 
-    /* Protocol discriminator and ordinary messages never enter the cache
-       controller; P49 remains byte-identical and is rejected before release. */
+    // Once release has happened, disconnect and no-response timeout are both
+    // terminal handoff failures, while the immutable endpoint lease survives.
+    for (const bool timeout : {false, true}) {
+        EndpointFixture fixture({12, timeout ? 6u : 5u});
+        CacheSessionDispatcher dispatcher = make_dispatcher(
+            fixture, timeout ? std::chrono::milliseconds(35) : std::chrono::milliseconds(250));
+        MsgPair ordinary = ordinary_pair();
+        PeerResult peer;
+        std::thread server = serve_peer(
+            fixture, fixture.identity, 1,
+            icecc::p50::local::make_hello_ack(PeerRole::Sidecar, fixture.identity),
+            timeout ? PeerAction::WaitAfterAck : PeerAction::CloseAfterAck, peer);
+        send_cache_session(ordinary.left);
+        Msg *decoded = ordinary.right->get_msg(2, true);
+        const auto outcome = dispatcher.dispatch(*ordinary.right, 50,
+                                                  static_cast<uint32_t>(*decoded));
+        delete decoded;
+        server.join();
+        CHECK(peer.hello && peer.ack_sent && peer.operation,
+              "post-release terminal case completed HELLO/ACK and operation");
+        CHECK(outcome.result == CacheDispatchResult::HandoffFailed && outcome.detached,
+              timeout ? "post-release handoff timeout is fail-closed"
+                      : "post-release peer disconnect is fail-closed");
+        CHECK(dispatcher.available(), "post-release failure retains endpoint lease");
+    }
+
+    // Wrong/stale ACKs are rejected before the ordinary descriptor can be
+    // released, including both stale generation and wrong attempt variants.
+    for (const Identity wrong : {Identity{13, 8}, Identity{14, 7}}) {
+        EndpointFixture fixture({13, 7});
+        CacheSessionDispatcher dispatcher = make_dispatcher(fixture);
+        MsgPair ordinary = ordinary_pair();
+        PeerResult peer;
+        std::thread server = serve_peer(
+            fixture, fixture.identity, 1,
+            icecc::p50::local::make_hello_ack(PeerRole::Sidecar, wrong),
+            PeerAction::CloseAfterAck, peer);
+        send_cache_session(ordinary.left);
+        Msg *decoded = ordinary.right->get_msg(2, true);
+        const int owned = ordinary.right->fd;
+        const auto outcome = dispatcher.dispatch(*ordinary.right, 50,
+                                                  static_cast<uint32_t>(*decoded));
+        delete decoded;
+        server.join();
+        CHECK(peer.hello && peer.ack_sent, "wrong-ACK peer received the expected HELLO");
+        CHECK(outcome.result == CacheDispatchResult::SidecarUnavailable && !outcome.detached,
+              "stale or wrong ACK is rejected before release");
+        CHECK(ordinary.right->fd == owned, "wrong ACK retains ordinary descriptor ownership");
+    }
+
+    // Exact path replacement, digest, GUID, device, and inode mismatches are
+    // all rejected.  Replacement is never unlinked by the old lease owner.
+    {
+        EndpointFixture fixture({15, 1});
+        const OnDemandEndpoint original = fixture.endpoint;
+        OnDemandEndpoint bad_digest = original;
+        bad_digest.socket_path_digest = icecc::digest128(original.socket_path + "-different");
+        CHECK(!CacheSessionDispatcher(fixture.identity, bad_digest).available(),
+              "wrong endpoint path digest is rejected");
+        OnDemandEndpoint bad_guid = original;
+        bad_guid.f_store_guid.bytes[0] ^= 1;
+        CHECK(!CacheSessionDispatcher(fixture.identity, bad_guid).available(),
+              "wrong endpoint F_STORE_GUID is rejected");
+        OnDemandEndpoint bad_device = original;
+        ++bad_device.listener_device;
+        CHECK(!CacheSessionDispatcher(fixture.identity, bad_device).available(),
+              "wrong endpoint listener device is rejected");
+        OnDemandEndpoint bad_inode = original;
+        ++bad_inode.listener_inode;
+        CHECK(!CacheSessionDispatcher(fixture.identity, bad_inode).available(),
+              "wrong endpoint listener inode is rejected");
+
+        CHECK(::close(fixture.listener) == 0 && ::unlink(fixture.path.c_str()) == 0,
+              "original endpoint removed for exact replacement test");
+        fixture.listener = -1;
+        // Keep a distinct socket node allocated so the replacement cannot
+        // accidentally reuse the just-unlinked inode on filesystems that do
+        // immediate inode recycling.
+        const std::string guard_path = fixture.root + "/inode-guard.sock";
+        Status guard_status = Status::InvalidArgument;
+        const int guard = icecc::p50::local::listen_unix(guard_path, 1, &guard_status);
+        CHECK(guard >= 0 && guard_status == Status::Ok,
+              "inode guard preserves exact replacement identity distinction");
+        Status replacement_status = Status::InvalidArgument;
+        const int replacement = icecc::p50::local::listen_unix(
+            fixture.path, 4, &replacement_status);
+        CHECK(replacement >= 0 && replacement_status == Status::Ok,
+              "replacement endpoint binds the exact old path");
+        CHECK(!CacheSessionDispatcher(fixture.identity, original).available(),
+              "exact path replacement with new dev/inode is rejected");
+        if (replacement >= 0) {
+            struct stat info{};
+            CHECK(::lstat(fixture.path.c_str(), &info) == 0 && S_ISSOCK(info.st_mode),
+                  "replacement endpoint remains present after old lease rejection");
+            (void)::close(replacement);
+            (void)::unlink(fixture.path.c_str());
+        }
+        if (guard >= 0) {
+            (void)::close(guard);
+            (void)::unlink(guard_path.c_str());
+        }
+    }
+
+    // P49 and ordinary jobs never enter the P50 CACHE_SESSION dispatcher.
     {
         MsgPair p49 = ordinary_pair(49);
-        CacheSessionDispatcher dispatcher(Identity{12, 5});
-        const auto p49_outcome = dispatcher.dispatch(*p49.right, 49, 0x50f00000u);
-        CHECK(p49_outcome.result == CacheDispatchResult::NotCacheSession,
-              "P49 discriminator never reaches daemon cache dispatcher");
-        const auto ping_outcome = dispatcher.dispatch(*p49.right, 50, 0x00000042u);
-        CHECK(ping_outcome.result == CacheDispatchResult::NotCacheSession,
+        CacheSessionDispatcher dispatcher({16, 1});
+        CHECK(dispatcher.dispatch(*p49.right, 49, 0x50f00000u).result ==
+                  CacheDispatchResult::NotCacheSession,
+              "P49 discriminator is rejected before cache dispatch");
+        CHECK(dispatcher.dispatch(*p49.right, 50, 0x00000042u).result ==
+                  CacheDispatchResult::NotCacheSession,
               "normal ordinary job is not misclassified as CACHE_SESSION");
     }
 
-    /* Neither caller-supplied identity replacement nor a stale sidecar ACK
-       may bind a control relationship to this dispatcher incarnation. */
+    // Two successive TUs use fresh accepted relationships and monotonically
+    // numbered requests 1 and 2 while retaining one immutable endpoint lease.
     {
-        int side_fds[2] = {-1, -1};
-        CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, side_fds) == 0,
-              "stale-identity sidecar pair created");
-        Connection daemon_side(side_fds[0]);
-        Connection sidecar_side(side_fds[1]);
-        authenticate(daemon_side);
-        authenticate(sidecar_side);
-        CacheSessionDispatcher dispatcher(Identity{30, 4});
-        CHECK(!dispatcher.attach_authenticated(std::move(daemon_side), Identity{29, 4}),
-              "caller cannot replace constructor-bound generation");
-        CHECK(!dispatcher.available(), "stale caller identity retains no relationship");
-    }
-    {
-        int side_fds[2] = {-1, -1};
-        CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, side_fds) == 0,
-              "wrong-ACK sidecar pair created");
-        Connection daemon_side(side_fds[0]);
-        Connection sidecar_side(side_fds[1]);
-        authenticate(daemon_side);
-        authenticate(sidecar_side);
-        CacheSessionDispatcher dispatcher(Identity{31, 5});
-        CHECK(!attach_with_ack(
-                  dispatcher, std::move(daemon_side), sidecar_side,
-                  Identity{31, 5},
-                  icecc::p50::local::make_hello_ack(PeerRole::Sidecar,
-                                                    Identity{30, 5})),
-              "stale sidecar generation in HELLO_ACK is rejected");
-        CHECK(!dispatcher.available(), "wrong ACK retains no relationship");
-    }
-
-    /* Fresh authenticated one-shot relationships within one live sidecar
-       incarnation receive strictly increasing request IDs. */
-    {
-        CacheSessionDispatcher dispatcher(Identity{40, 2});
+        EndpointFixture fixture({17, 2});
+        CacheSessionDispatcher dispatcher = make_dispatcher(fixture);
         for (uint64_t request_id = 1; request_id <= 2; ++request_id) {
             MsgPair ordinary = ordinary_pair();
-            int side_fds[2] = {-1, -1};
-            CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, side_fds) == 0,
-                  "repeat relationship sidecar pair created");
-            Connection daemon_side(side_fds[0]);
-            Connection receiver_side(side_fds[1]);
-            authenticate(daemon_side);
-            authenticate(receiver_side);
-            CHECK(attach_current(dispatcher, std::move(daemon_side), receiver_side,
-                                 Identity{40, 2}),
-                  "fresh relationship reattaches to the same live incarnation");
+            PeerResult peer;
+            std::thread server = serve_peer(
+                fixture, fixture.identity, request_id,
+                icecc::p50::local::make_hello_ack(PeerRole::Sidecar, fixture.identity),
+                PeerAction::Handoff, peer);
             send_cache_session(ordinary.left);
             Msg *decoded = ordinary.right->get_msg(2, true);
-            FdHandoffReceiver receiver;
-            icecc::p50::local::FdHandoffResult receive_result;
-            std::thread receiver_thread([&] {
-                CHECK(receive_cache_operation(receiver_side, Identity{40, 2}, request_id),
-                      "repeat sidecar receives exact CacheSession operation");
-                receive_result = receiver.receive_and_ack(
-                    receiver_side,
-                    icecc::p50::local::HandoffRequest{Identity{40, 2}, request_id},
-                    std::chrono::steady_clock::now() + std::chrono::seconds(2));
-            });
-            const auto outcome = dispatcher.dispatch(
-                *ordinary.right, ordinary.right->protocol,
-                static_cast<uint32_t>(*decoded));
-            receiver_thread.join();
+            const auto outcome = dispatcher.dispatch(*ordinary.right, 50,
+                                                      static_cast<uint32_t>(*decoded));
             delete decoded;
-            CHECK(outcome.result == CacheDispatchResult::Accepted &&
-                      outcome.request.request_id == request_id &&
-                      receive_result.status ==
-                          icecc::p50::local::FdHandoffStatus::Accepted,
-                  "request IDs are monotonic across fresh one-shot relationships");
-            auto adopted = receiver.take_adopted_fd();
+            server.join();
+            CHECK(peer.hello && peer.ack_sent && peer.operation && peer.receiver.adopted() &&
+                      peer.handoff.status == icecc::p50::local::FdHandoffStatus::Accepted,
+                  "each TU establishes a fresh accepted relationship");
+            CHECK(outcome.result == CacheDispatchResult::Accepted && outcome.detached &&
+                      outcome.request.request_id == request_id,
+                  request_id == 1 ? "fresh relationship request_id == 1"
+                                  : "fresh relationship request_id == 2");
+            auto adopted = peer.receiver.take_adopted_fd();
             adopted.reset();
+            CHECK(dispatcher.available(), "successive TU retains endpoint lease");
         }
     }
-    return failures ? 1 : 0;
+
+    return failures == 0 ? 0 : 1;
 }

@@ -43,7 +43,7 @@ static bool is_exact_present(const Snapshot& snapshot, uint32_t port = 10245)
         && snapshot.present() && !snapshot.absent();
 }
 
-static void test_pre_ready_and_authentication_gate()
+static void test_pre_ready_and_current_lease_gate()
 {
     Controller controller;
     CHECK(is_absent(controller.snapshot()),
@@ -55,14 +55,14 @@ static void test_pre_ready_and_authentication_gate()
           "authenticated Starting sidecar cannot advertise before READY");
 
     update = controller.observe(observation(State::Ready, false));
-    CHECK(update.count == 0 && update.error == Error::None
-              && is_absent(controller.snapshot()),
-          "READY sidecar cannot advertise before private authentication");
+    CHECK(update.count == 1 && update.error == Error::None
+              && is_exact_present(update.transitions[0])
+              && is_exact_present(controller.snapshot()),
+          "READY current lease advertises while no transient TU relationship exists");
 
     update = controller.observe(observation(State::Ready, true));
-    CHECK(update.count == 1 && is_exact_present(update.transitions[0])
-              && is_exact_present(controller.snapshot()),
-          "READY authenticated sidecar publishes the exact runnable profile");
+    CHECK(update.count == 0 && is_exact_present(controller.snapshot()),
+          "transient private authentication does not churn advertisement");
 
     update = controller.observe(observation(State::Ready, true));
     CHECK(update.count == 0 && update.error == Error::None
@@ -82,8 +82,8 @@ static void test_withdrawal_levels()
 
     (void)controller.observe(observation(State::Ready, true));
     update = controller.observe(observation(State::Ready, false));
-    CHECK(update.count == 1 && is_absent(update.transitions[0]),
-          "private authentication loss withdraws an advertised capability");
+    CHECK(update.count == 0 && is_exact_present(controller.snapshot()),
+          "idle absence of a transient private relationship preserves capability");
 
     (void)controller.observe(observation(State::Ready, true));
     update = controller.observe(observation(State::Ready, true, 0, false));
@@ -108,13 +108,14 @@ static void test_crash_edges_preserve_withdraw_before_republish()
           "compressed crash and recovery withdraws before republishing");
 
     update = controller.observe(observation(State::Ready, false, 2));
-    CHECK(update.count == 1 && is_absent(update.transitions[0])
-              && is_absent(controller.snapshot()),
-          "crash without a new authenticated relationship remains absent");
+    CHECK(update.count == 2 && is_absent(update.transitions[0])
+              && is_exact_present(update.transitions[1])
+              && is_exact_present(controller.snapshot()),
+          "recovered current lease republishes without transient authentication");
 
     update = controller.observe(observation(State::Ready, true, 2));
-    CHECK(update.count == 1 && is_exact_present(update.transitions[0]),
-          "later authenticated recovery publishes one new presence");
+    CHECK(update.count == 0 && is_exact_present(controller.snapshot()),
+          "later per-TU authentication leaves recovered presence unchanged");
 }
 
 static void test_invalid_inputs_fail_closed()
@@ -188,7 +189,7 @@ static void test_initial_nonzero_counter_and_port_change()
 
 int main()
 {
-    test_pre_ready_and_authentication_gate();
+    test_pre_ready_and_current_lease_gate();
     test_withdrawal_levels();
     test_crash_edges_preserve_withdraw_before_republish();
     test_invalid_inputs_fail_closed();

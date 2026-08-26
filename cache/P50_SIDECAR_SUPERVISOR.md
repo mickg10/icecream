@@ -1,9 +1,9 @@
 # Protocol-50 sidecar supervisor
 
-`p50_sidecar_supervisor` is a lifecycle-only process boundary for the future
-`icecc-cache-service` sidecar. It does not open a listener, attach to a daemon,
-select a scheduler owner, or alter the Login advertisement (which remains
-`0/0/0`). A future daemon adapter can consume the state and counters without
+`p50_sidecar_supervisor` is the lifecycle and private-incarnation boundary for
+the `icecc-cache-service` sidecar. It does not open a listener, attach to a
+daemon, select a scheduler owner, or alter the Login advertisement. A daemon
+adapter consumes its state, counters, and immutable current READY lease without
 reimplementing process ownership.
 
 ## Child contract
@@ -19,10 +19,12 @@ The marker is followed by an `errno` record only when setup or `execve` fails;
 marker-plus-EOF therefore proves both child-side group setup and successful
 exec.
 
-The child must write exactly `READY\n` to the READY descriptor. Readiness is
-then close it. The parent accepts readiness only after EOF and only when the
-complete byte sequence is exactly those six bytes; partial, extra, delayed,
-or never-closed messages are rejected or time out. Readiness is bounded by
+Without a configured lease root, the child must write exactly `READY\n` to the
+READY descriptor and then close it. With a lease root, the structured READY-v2
+contract below replaces that legacy six-byte message. The parent accepts
+readiness only after EOF and only when the complete selected frame is exact;
+partial, extra, delayed, or never-closed messages are rejected or time out.
+Readiness is bounded by
 `Config::readiness_timeout`; exec failures, pre-READY exits, malformed READY
 data, and timeouts have separate counters. A ready child is observed through
 `poll()`. Post-READY exits consume restart attempts from a fixed
@@ -47,37 +49,60 @@ unbounded retry loop.
 
 ## Current READY lease
 
-When `Config::lease_root`, `identity`, and `f_store_guid` are supplied, every
-launch creates a fresh `mkdtemp` directory named with the generation and
-attempt, plus a unique suffix.  The child receives the exact socket path and
-path digest through its environment and must close the bounded structured
-frame:
+When `Config::lease_root` and a shared `Config::launch_identities` allocator are
+supplied, every launch consumes a fresh nonzero attempt from that allocator and
+derives its `F_STORE_GUID` canonically from `(generation, attempt)`. The
+allocator is deliberately owned outside `Supervisor`, so restart and complete
+controller/Supervisor recreation cannot reset or reuse an attempt. Exhaustion
+fails closed rather than wrapping.
+
+Each launch creates a fresh `mkdtemp` directory named with the generation and
+attempt plus a unique suffix. The supervisor scrubs and then publishes the
+complete six-field structured environment tuple: READY format, generation,
+attempt, expected F-store GUID, exact socket path, and path digest. The service
+rejects a partial tuple. It must close this bounded structured frame:
 
 ```text
 READY v2 generation=N attempt=N pid=N F_STORE_GUID=... PATH=/... DIGEST=... DEV=N INO=N
 ```
 
-The supervisor accepts the lease only when all fields match the expected
-incarnation and PID, the path digest recomputes, and `lstat` proves the exact
-0600 socket node and advertised device/inode.  Cleanup occurs only after the
-owned process group is terminal and re-lstats both exact identities; a
-replacement pathname or inode is never blindly unlinked.  `current_lease()`
-is the sole lease observation for a daemon adapter, and a dispatcher may use
-only that matching path.
+The supervisor accepts the lease only when all fields match the allocated
+incarnation and direct PID, the GUID and path digest recompute, and pathname
+`lstat` proves the exact 0600 socket node and advertised device/inode. After
+READY EOF it crosses a small bounded scheduling barrier and rechecks that the
+direct child is still live before promoting the lease. An immediately dying
+publisher therefore never becomes current.
+
+Cleanup occurs only after direct-child and owned-process-group death are both
+proved, and then re-lstats both exact identities; a replacement pathname or
+inode is never blindly unlinked. If death is uncertain, the unique path is
+deliberately leaked for external recovery and no replacement launch is
+authorized. `current_lease()` is the sole lease observation for a daemon
+adapter, and a dispatcher may use only that matching path, GUID, incarnation,
+PID/credentials, and listener identity.
 
 ## Shutdown
 
-`shutdown()` sends `SIGTERM` to the owned process group and direct PID, waits at
-most `shutdown_timeout`, then sends `SIGKILL` to both and performs a blocking
-`waitpid` only after exit or a kill result is established. On Linux the signal
-path uses the raw `kill` syscall, so a libc wrapper returning persistent
-`EINTR` cannot strand descendants. Every owned pipe is closed and the direct
-child is reaped, including when the child or a helper ignores TERM. Exit is
-observed without reaping first, keeping the group leader's zombie PID in place
-until group signaling finishes and preventing a PGID reuse race. Group
-ownership is explicit and cleared on every teardown path; an unowned/stale
-numeric PGID is never signaled. If a service moves its direct PID out of the
-owned group, the supervisor refuses that stale group ID and falls back to
-direct-PID teardown.
+`shutdown()` sends `SIGTERM` to the owned process group and, on Linux, to the
+exact `pidfd` acquired immediately after `fork`. It waits at most
+`shutdown_timeout`, then sends `SIGKILL` through the same two independently
+bound authorities and performs a blocking `waitpid` only after exit or a kill
+result is established. The direct child is never signalled through its numeric
+PID: a SIGCHLD owner may have reaped it and that number may already identify an
+unrelated process. Platforms without `pidfd_send_signal` retain proven
+process-group teardown but fail closed instead of falling back to a direct
+numeric signal.
+
+Cleanup authority is returned internally only after both direct and group
+absence are proved. The process-group path uses the raw `kill` syscall, so a
+libc wrapper returning persistent `EINTR` cannot strand descendants. Every
+owned descriptor, including the pidfd, is closed. Exit is observed without
+reaping first, keeping the group leader's zombie PID in place until group
+signalling finishes and preventing a PGID reuse race. Group ownership is
+explicit and cleared on every teardown path; an unowned/stale numeric PGID is
+never signalled. If a service moves out of the owned group, that group identity
+is invalidated. The exact pidfd may safely terminate the original child, but
+the uncertain old group still forces `DegradedLegacy`, deliberately leaks its
+unique lease, and forbids a replacement launch.
 The API is synchronous and intentionally leaves listener ownership and network
 integration to a later reviewed slice.

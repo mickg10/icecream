@@ -33,6 +33,7 @@ constexpr char kReadyMessage[] = "READY\n";
 constexpr size_t kReadyMessageSize = sizeof(kReadyMessage) - 1;
 constexpr size_t kMaxReadyBytes = 1024;
 constexpr int kPollSliceMilliseconds = 20;
+constexpr int kReadyLeaseLivenessBarrierMilliseconds = 5;
 constexpr int kMaxFallbackFd = 8192;
 constexpr size_t kMaxProcFdBytes = 1u << 20;
 constexpr size_t kMaxProcFdReads = 256;
@@ -299,9 +300,9 @@ bool command_is_valid(const Config& config) noexcept {
     if (config.lease_root.empty())
         return true;
     struct stat root{};
-    return config.identity.generation != 0 && config.identity.attempt != 0 &&
-           config.f_store_guid != FStoreGuid{} && config.lease_root.front() == '/' &&
+    return config.launch_identities != nullptr && config.lease_root.front() == '/' &&
            config.lease_root.size() <= local::kMaxUnixPath &&
+           config.lease_root.find_first_of(" \t\r\n") == std::string::npos &&
            ::lstat(config.lease_root.c_str(), &root) == 0 && S_ISDIR(root.st_mode) &&
            root.st_uid == ::geteuid() && (root.st_mode & 07777) == 0700;
 }
@@ -343,7 +344,8 @@ bool parse_ready_lease(std::string_view wire, const ReadyLease& expected,
         return false;
     const auto value_for = [&fields](std::string_view key) -> std::string_view {
         for (size_t i = 2; i != fields.size(); ++i)
-            if (fields[i].substr(0, key.size() + 1) == key &&
+            if (fields[i].size() > key.size() &&
+                fields[i].substr(0, key.size()) == key &&
                 fields[i][key.size()] == '=')
                 return fields[i].substr(key.size() + 1);
         return {};
@@ -430,13 +432,44 @@ Supervisor::Supervisor(Config config) : config_(std::move(config)) {}
 
 Supervisor::~Supervisor() { shutdown(); }
 
+LaunchIdentityAllocator::LaunchIdentityAllocator(uint64_t generation,
+                                                 uint64_t first_attempt) noexcept
+    : generation_(generation), next_attempt_(first_attempt) {
+    // Zero is reserved by the wire contract.  MAX is also rejected rather
+    // than permitting an allocation whose successor would wrap and become
+    // indistinguishable from an uninitialized allocator.
+    if (generation_ == 0 || generation_ == std::numeric_limits<uint64_t>::max() ||
+        next_attempt_ == 0 || next_attempt_ == std::numeric_limits<uint64_t>::max()) {
+        generation_ = 0;
+        next_attempt_ = 0;
+    }
+}
+
+std::optional<LaunchIncarnation> LaunchIdentityAllocator::allocate() noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (generation_ == 0 || next_attempt_ == 0 ||
+        next_attempt_ == std::numeric_limits<uint64_t>::max())
+        return std::nullopt;
+    const local::Identity identity{generation_, next_attempt_++};
+    LaunchIncarnation incarnation{identity, f_store_guid_for_incarnation(identity)};
+    if (!incarnation.valid())
+        return std::nullopt;
+    return incarnation;
+}
+
 bool Supervisor::prepare_lease() noexcept {
     if (config_.lease_root.empty())
         return true;
     try {
+        if (config_.launch_identities == nullptr)
+            return false;
+        const std::optional<LaunchIncarnation> incarnation =
+            config_.launch_identities->allocate();
+        if (!incarnation.has_value())
+            return false;
         std::string pattern = config_.lease_root + "/g" +
-                              std::to_string(config_.identity.generation) + "-a" +
-                              std::to_string(config_.identity.attempt) + "-XXXXXX";
+                              std::to_string(incarnation->identity.generation) + "-a" +
+                              std::to_string(incarnation->identity.attempt) + "-XXXXXX";
         std::vector<char> mutable_pattern(pattern.begin(), pattern.end());
         mutable_pattern.push_back('\0');
         char* directory = ::mkdtemp(mutable_pattern.data());
@@ -449,8 +482,8 @@ bool Supervisor::prepare_lease() noexcept {
             return false;
         }
         ReadyLease lease;
-        lease.identity = config_.identity;
-        lease.f_store_guid = config_.f_store_guid;
+        lease.identity = incarnation->identity;
+        lease.f_store_guid = incarnation->f_store_guid;
         lease.private_directory = directory;
         lease.socket_path = lease.private_directory + "/cache.sock";
         if (lease.socket_path.size() > local::kMaxUnixPath) {
@@ -508,12 +541,17 @@ void Supervisor::close_pipes() noexcept {
 }
 
 bool Supervisor::has_private_fds() const noexcept {
+    // This public lifecycle observation predates pidfd and intentionally
+    // reports only the readiness/exec channels: a Ready supervisor has closed
+    // both even though it retains its internal exact child handle.
     return ready_read_ >= 0 || exec_read_ >= 0;
 }
 
 void Supervisor::reap_blocking() noexcept {
-    if (child_pid_ < 0)
+    if (child_pid_ < 0) {
+        close_if_open(child_pidfd_);
         return;
+    }
     int status = 0;
     for (;;) {
         const pid_t result = ::waitpid(child_pid_, &status, 0);
@@ -525,6 +563,7 @@ void Supervisor::reap_blocking() noexcept {
         break;
     }
     child_pid_ = -1;
+    close_if_open(child_pidfd_);
 }
 
 enum class SignalResult : uint8_t {
@@ -532,6 +571,73 @@ enum class SignalResult : uint8_t {
     Gone,
     Failed,
 };
+
+int open_child_handle(pid_t child) noexcept {
+#if defined(__linux__) && defined(SYS_pidfd_open)
+    int interrupted = 0;
+    for (;;) {
+        const long result = ::syscall(SYS_pidfd_open, child, 0u);
+        if (result >= 0 && result <= std::numeric_limits<int>::max()) {
+            const int fd = static_cast<int>(result);
+            if (set_cloexec(fd, true))
+                return fd;
+            const int error = errno;
+            (void)::close(fd);
+            errno = error;
+            return -1;
+        }
+        if (result >= 0) {
+            (void)::close(static_cast<int>(result));
+            errno = EOVERFLOW;
+            return -1;
+        }
+        if (errno != EINTR || interrupted++ == kMaxEintrRetries)
+            return -1;
+    }
+#else
+    (void)child;
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+SignalResult signal_child_handle(int pidfd, int signal) noexcept {
+#if defined(__linux__) && defined(SYS_pidfd_send_signal)
+    if (pidfd < 0)
+        return SignalResult::Failed;
+    int interrupted = 0;
+    for (;;) {
+        const long result = ::syscall(SYS_pidfd_send_signal, pidfd, signal,
+                                      nullptr, 0u);
+        if (result == 0)
+            return SignalResult::Sent;
+        if (errno == ESRCH)
+            return SignalResult::Gone;
+        if (errno != EINTR || interrupted++ == kMaxEintrRetries)
+            return SignalResult::Failed;
+    }
+#else
+    (void)pidfd;
+    (void)signal;
+    return SignalResult::Failed;
+#endif
+}
+
+bool child_handle_has_exited(int pidfd) noexcept {
+    if (pidfd < 0)
+        return false;
+    struct pollfd descriptor{pidfd, POLLIN | POLLHUP, 0};
+    int interrupted = 0;
+    for (;;) {
+        const int result = ::poll(&descriptor, 1, 0);
+        if (result > 0)
+            return (descriptor.revents & (POLLIN | POLLHUP)) != 0;
+        if (result == 0)
+            return false;
+        if (errno != EINTR || interrupted++ == kMaxEintrRetries)
+            return false;
+    }
+}
 
 SignalResult signal_target(pid_t target, int signal) noexcept {
     if (target == 0 || target == std::numeric_limits<pid_t>::min())
@@ -599,15 +705,23 @@ bool child_is_in_group(pid_t child, pid_t process_group) noexcept {
         const pid_t observed = ::getpgid(child);
         if (observed >= 0)
             return observed == process_group;
-        // ECHILD/ESRCH can mean another owner reaped the direct child before
-        // teardown.  The exec marker still proves this PGID was ours; retain
-        // the group signal so its helpers are not orphaned.  A reused live PID
-        // is handled by the observed-PGID mismatch above.
+        // ESRCH can mean another owner reaped the direct child.  Its numeric
+        // PID and former PGID may already have been reused, so absence is not
+        // proof that either numeric identity is still ours.  Fail closed and
+        // leave the unique lease for manual recovery.
         if (errno == ESRCH)
-            return true;
+            return false;
         if (errno != EINTR || interrupted++ == kMaxEintrRetries)
             return false;
     }
+}
+
+bool Supervisor::child_has_exited_exact(pid_t expected_child) const noexcept {
+    if (expected_child < 0 || expected_child != child_pid_)
+        return true;
+    if (child_pidfd_ >= 0)
+        return child_handle_has_exited(child_pidfd_);
+    return child_has_exited(expected_child);
 }
 
 bool Supervisor::wait_for_exit(std::chrono::milliseconds timeout) noexcept {
@@ -615,7 +729,7 @@ bool Supervisor::wait_for_exit(std::chrono::milliseconds timeout) noexcept {
         return true;
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     for (;;) {
-        if (child_has_exited(child_pid_))
+        if (child_has_exited_exact(child_pid_))
             return true;
         if (std::chrono::steady_clock::now() >= deadline)
             return false;
@@ -627,9 +741,10 @@ bool Supervisor::wait_for_exit(std::chrono::milliseconds timeout) noexcept {
     }
 }
 
-void Supervisor::terminate_group() noexcept {
+bool Supervisor::terminate_group() noexcept {
     bool grouped = process_group_owned_ && process_group_ > 1;
     pid_t process_group = grouped ? process_group_ : -1;
+    bool group_identity_invalidated = false;
     if (grouped && child_pid_ >= 0 && !child_is_in_group(child_pid_, process_group)) {
         // A service that moved itself out of the owned group invalidates our
         // group identity.  Refuse to signal the stale numeric PGID; direct-PID
@@ -638,19 +753,25 @@ void Supervisor::terminate_group() noexcept {
         process_group = -1;
         process_group_ = -1;
         process_group_owned_ = false;
+        group_identity_invalidated = true;
     }
     if (child_pid_ < 0 && !grouped) {
         // A PGID without the ownership bit is diagnostic residue only.  Never
         // signal it: the numeric ID may already belong to an unrelated group.
         process_group_ = -1;
         process_group_owned_ = false;
-        return;
+        return !group_identity_invalidated;
     }
 
     const SignalResult group_term = grouped ? signal_target(-process_group, SIGTERM)
                                              : SignalResult::Gone;
+    // Never signal child_pid_ numerically.  A pidfd remains bound to the
+    // original task even if another SIGCHLD owner reaped it and the number was
+    // reused.  Without that exact handle, group signalling may continue only
+    // while the process-group identity remains proven; direct teardown fails
+    // closed.
     const SignalResult direct_term = child_pid_ >= 0
-                                         ? signal_target(child_pid_, SIGTERM)
+                                         ? signal_child_handle(child_pidfd_, SIGTERM)
                                          : SignalResult::Gone;
     (void)group_term;
     (void)direct_term;
@@ -671,7 +792,7 @@ void Supervisor::terminate_group() noexcept {
         // Always signal the direct PID as well.  A child can voluntarily move
         // itself after launch, and a group-only success must not strand it.
         if (child_pid_ >= 0)
-            direct_kill = signal_target(child_pid_, SIGKILL);
+            direct_kill = signal_child_handle(child_pidfd_, SIGKILL);
         const bool kill_established = signal_established(group_kill) ||
                                       signal_established(direct_kill);
         if (kill_established)
@@ -685,15 +806,34 @@ void Supervisor::terminate_group() noexcept {
         reap_blocking();
     }
 
+    bool group_dead = !grouped;
+    if (grouped) {
+        const auto deadline = std::chrono::steady_clock::now() +
+                              config_.shutdown_timeout;
+        for (;;) {
+            if (!group_exists(process_group)) {
+                group_dead = true;
+                break;
+            }
+            if (std::chrono::steady_clock::now() >= deadline)
+                break;
+            (void)::poll(nullptr, 0, 1);
+        }
+    }
+
+    const bool direct_dead = child_pid_ < 0;
     // If all signal attempts were interrupted/failed, do not turn an unknown
     // liveness result into an unbounded wait.  The ownership bit is cleared so
-    // a later launch/destructor cannot accidentally target a reused PGID.
+    // a later launch/destructor cannot accidentally target a reused PGID.  The
+    // false return prevents lease cleanup or a replacement launch from using
+    // that uncertainty as proof of death.
     process_group_ = -1;
     process_group_owned_ = false;
+    return direct_dead && group_dead && !group_identity_invalidated;
 }
 
-void Supervisor::terminate_child() noexcept {
-    terminate_group();
+bool Supervisor::terminate_child() noexcept {
+    return terminate_group();
 }
 
 /*
@@ -709,12 +849,28 @@ void Supervisor::shutdown() noexcept {
     }
     increment_saturating(counters_.shutdowns);
     state_ = State::Stopping;
-    terminate_child();
-    cleanup_lease(current_lease_);
-    cleanup_lease(pending_lease_);
+    const bool proven_dead = terminate_child();
+    if (proven_dead) {
+        cleanup_lease(current_lease_);
+        cleanup_lease(pending_lease_);
+    } else {
+        // Dropping metadata is safer than unlinking a path whose process group
+        // may still be live.  The unique directory is intentionally leaked for
+        // external/manual recovery rather than reused by another incarnation.
+        current_lease_.reset();
+        pending_lease_.reset();
+    }
     close_pipes();
-    state_ = State::Stopped;
-    last_failure_ = Failure::None;
+    // Closing the exact task reference cannot affect the child.  Do it even
+    // on an uncertain final path so Supervisor destruction never leaks an FD.
+    close_if_open(child_pidfd_);
+    if (proven_dead) {
+        state_ = State::Stopped;
+        last_failure_ = Failure::None;
+    } else {
+        state_ = State::DegradedLegacy;
+        last_failure_ = Failure::RestartExhausted;
+    }
 }
 
 bool Supervisor::reserve_restart() noexcept {
@@ -736,8 +892,13 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
     // its helpers remain in the owned process group.  Teardown must therefore
     // precede creation of every retry's pipes and may never overwrite the old
     // PGID with the new child's PID.
-    if (child_pid_ >= 0 || process_group_owned_)
-        terminate_group();
+    if ((child_pid_ >= 0 || process_group_owned_) && !terminate_group()) {
+        last_failure_ = Failure::RestartExhausted;
+        state_ = State::DegradedLegacy;
+        current_lease_.reset();
+        pending_lease_.reset();
+        return false;
+    }
     close_pipes();
     if (!process_group_owned_)
         process_group_ = -1;
@@ -758,6 +919,7 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
         close_if_open(exec_pipe[0]);
         close_if_open(exec_pipe[1]);
         classify(Failure::Exec);
+        cleanup_lease(pending_lease_);
         return false;
     }
     if (!set_nonblocking(ready_pipe[0]) || !set_nonblocking(exec_pipe[0])) {
@@ -766,6 +928,7 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
         close_if_open(exec_pipe[0]);
         close_if_open(exec_pipe[1]);
         classify(Failure::Exec);
+        cleanup_lease(pending_lease_);
         return false;
     }
 
@@ -867,6 +1030,11 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
         return false;
     }
 
+    // Acquire the exact task reference before any wait/reap path can run.
+    // pidfd_open is intentionally best-effort for non-Linux portability; a
+    // missing handle never permits a later numeric-PID fallback.
+    const int pidfd = open_child_handle(pid);
+
     // The child sets its own group before exec; this parent-side call closes
     // the fork/exec race on platforms where the child reaches exec quickly.
     bool parent_group_proven = false;
@@ -882,6 +1050,7 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
         parent_group_proven = true; // child-side setpgid completed before exec
 
     child_pid_ = pid;
+    child_pidfd_ = pidfd;
     process_group_ = parent_group_proven ? pid : -1;
     process_group_owned_ = parent_group_proven;
     ready_read_ = ready_pipe[0];
@@ -891,8 +1060,17 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
     if (wait_for_ready())
         return true;
     close_pipes();
-    terminate_child();
-    cleanup_lease(pending_lease_);
+    const bool proven_dead = terminate_child();
+    if (proven_dead) {
+        cleanup_lease(pending_lease_);
+    } else {
+        pending_lease_.reset();
+        // An uncertain former group is a terminal incarnation fence, even if
+        // the exact direct child was safely reaped through its pidfd.  A retry
+        // must not create a replacement beside possibly surviving helpers.
+        last_failure_ = Failure::RestartExhausted;
+        state_ = State::DegradedLegacy;
+    }
     return false;
 }
 
@@ -975,9 +1153,11 @@ bool Supervisor::wait_for_ready() noexcept {
                         const std::string_view prefix = pending_lease_.has_value()
                                                             ? std::string_view("READY v2 ")
                                                             : std::string_view(kReadyMessage);
+                        const size_t prefix_bytes =
+                            std::min(ready.size(), prefix.size());
                         if (ready.size() > kMaxReadyBytes ||
-                            ready.compare(0, std::min(ready.size(), prefix.size()), prefix,
-                                         std::min(ready.size(), prefix.size())) != 0) {
+                            std::string_view(ready).substr(0, prefix_bytes) !=
+                                prefix.substr(0, prefix_bytes)) {
                             // Keep draining the exec-status side long enough
                             // to observe the group proof before cleanup.  A
                             // malformed READY frame must not erase evidence
@@ -1022,6 +1202,21 @@ bool Supervisor::wait_for_ready() noexcept {
                 classify(Failure::InvalidReady);
                 return false;
             }
+            // A structured READY frame is a lease on a live incarnation, not
+            // a tombstone proving that a child once bound the path.  Refuse a
+            // child which exited after publishing READY but before promotion;
+            // poll() must never expose its stale pathname as current.
+            if (pending_lease_.has_value()) {
+                // EOF can be observed a few instructions before an immediately
+                // exiting child becomes waitable.  Give that terminal edge one
+                // small bounded scheduling barrier, then require the launch to
+                // remain live before publishing its lease.
+                (void)::poll(nullptr, 0, kReadyLeaseLivenessBarrierMilliseconds);
+                if (child_has_exited_exact(expected_child)) {
+                    classify(Failure::PreReadyExit);
+                    return false;
+                }
+            }
             close_pipes();
             if (pending_lease_.has_value()) {
                 current_lease_ = std::move(pending_lease_);
@@ -1032,7 +1227,7 @@ bool Supervisor::wait_for_ready() noexcept {
             return true;
         }
 
-        if (child_pid_ >= 0 && child_has_exited(expected_child)) {
+        if (child_pid_ >= 0 && child_has_exited_exact(expected_child)) {
             // Keep the exited child unreaped until terminate_group() has
             // signaled its owned PGID.  The zombie PID prevents a reused PGID
             // from being mistaken for this launch's group.
@@ -1064,8 +1259,11 @@ bool Supervisor::start() noexcept {
         state_ = State::DegradedLegacy;
         return false;
     }
-    if (child_pid_ >= 0 || has_private_fds())
+    if (child_pid_ >= 0 || has_private_fds()) {
         shutdown();
+        if (state_ == State::DegradedLegacy || child_pid_ >= 0)
+            return false;
+    }
     state_ = State::Starting;
     bool restart = false;
     for (uint32_t attempt = 0; attempt != config_.max_attempts_per_recovery; ++attempt) {
@@ -1096,16 +1294,30 @@ bool Supervisor::poll() noexcept {
     if (state_ != State::Ready)
         return false;
     if (child_pid_ < 0) {
-        terminate_group();
-        cleanup_lease(current_lease_);
+        const bool proven_dead = terminate_group();
+        if (proven_dead)
+            cleanup_lease(current_lease_);
+        else {
+            current_lease_.reset();
+            state_ = State::DegradedLegacy;
+            last_failure_ = Failure::RestartExhausted;
+            return false;
+        }
         close_pipes();
         classify(Failure::PostReadyExit);
         return restart_after_failure();
     }
-    if (!child_has_exited(child_pid_))
+    if (!child_has_exited_exact(child_pid_))
         return true;
-    terminate_group();
-    cleanup_lease(current_lease_);
+    const bool proven_dead = terminate_group();
+    if (proven_dead)
+        cleanup_lease(current_lease_);
+    else {
+        current_lease_.reset();
+        state_ = State::DegradedLegacy;
+        last_failure_ = Failure::RestartExhausted;
+        return false;
+    }
     close_pipes();
     classify(Failure::PostReadyExit);
     return restart_after_failure();

@@ -232,6 +232,30 @@ int connect_once(int fd, const sockaddr* address, socklen_t address_length) noex
     return ::connect(fd, address, address_length);
 }
 
+int socket_nonblocking_cloexec() {
+#if defined(SOCK_CLOEXEC) && defined(SOCK_NONBLOCK)
+    // O_NONBLOCK belongs to the shared open-file description.  Establish it
+    // atomically at socket creation for the on-demand connector rather than
+    // toggling a descriptor that may already have another owner.  Platforms
+    // without the atomic socket flags fail closed for this bounded API.
+    const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (fd < 0)
+        return -1;
+    const int descriptor_flags = ::fcntl(fd, F_GETFD);
+    const int status_flags = ::fcntl(fd, F_GETFL);
+    if (descriptor_flags < 0 || (descriptor_flags & FD_CLOEXEC) == 0 ||
+        status_flags < 0 || (status_flags & O_NONBLOCK) == 0) {
+        ::close(fd);
+        errno = EIO;
+        return -1;
+    }
+    return fd;
+#else
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
 int accept_cloexec(int listener_fd) {
     int fd = -1;
 #if defined(__linux__) && defined(SOCK_CLOEXEC)
@@ -749,15 +773,14 @@ Connection connect_unix_until(const std::string& path,
             set_status(Status::InvalidPath, status);
             return Connection(-1);
         }
-        const int fd = socket_cloexec();
+        const int fd = socket_nonblocking_cloexec();
         if (fd < 0) {
             set_status(Status::IoError, status);
             return Connection(-1);
         }
 
         const int original_flags = ::fcntl(fd, F_GETFL);
-        if (original_flags < 0 ||
-            ::fcntl(fd, F_SETFL, original_flags | O_NONBLOCK) != 0) {
+        if (original_flags < 0 || (original_flags & O_NONBLOCK) == 0) {
             ::close(fd);
             set_status(Status::IoError, status);
             return Connection(-1);
@@ -802,7 +825,6 @@ Connection connect_unix_until(const std::string& path,
             set_status(Status::IoError, status);
             return Connection(-1);
         }
-
         int socket_error = 0;
         socklen_t socket_error_length = sizeof(socket_error);
         if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error,

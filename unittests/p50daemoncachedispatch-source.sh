@@ -13,17 +13,36 @@ real_test="$src/unittests/daemoncachedispatch.cpp"
 
 grep -F 'release_fd_if_input_empty' "$impl" >/dev/null
 grep -F 'decoded_type != kCacheSession' "$impl" >/dev/null
-grep -F 'peer_credentials_verified' "$impl" >/dev/null
+grep -F 'verify_peer_credentials' "$impl" >/dev/null
 grep -F 'validate_handshake' "$impl" >/dev/null
-grep -F 'connection.send_until' "$impl" >/dev/null
-grep -F 'connection.receive_until' "$impl" >/dev/null
+grep -F 'relationship.send_until' "$impl" >/dev/null
+grep -F 'relationship.receive_until' "$impl" >/dev/null
 grep -F 'connect_unix_until' "$impl" >/dev/null
-grep -F 'expected_peer.pid' "$header" >/dev/null
+grep -F 'expected_peer.pid' "$test" >/dev/null
 grep -F 'on_demand_' "$impl" >/dev/null
 grep -F 'const auto deadline' "$impl" >/dev/null
 grep -F 'identity != identity_' "$impl" >/dev/null
 grep -F 'next_request_id_++' "$impl" >/dev/null
 grep -F 'disable();' "$impl" >/dev/null
+
+# The dispatcher owns only an immutable on-demand lease.  A cached control
+# relationship or the removed attach API would bypass fresh accept,
+# credentials, HELLO/ACK, and one-shot handoff ownership.
+for file in "$impl" "$header" "$test"; do
+    if grep -nE 'attach_authenticated|sidecar_' "$file" >/dev/null; then
+        echo "FAIL: cached relationship/attach API remains in $file" >&2
+        exit 1
+    fi
+done
+for needle in \
+    'OnDemandEndpoint' 'set_on_demand_endpoint' 'fresh endpoint relationship' \
+    'fresh accepted relationship' 'endpoint lease' 'path replacement' \
+    'wrong endpoint path digest' 'wrong endpoint F_STORE_GUID' \
+    'wrong endpoint listener device' 'wrong endpoint listener inode' \
+    'post-release peer disconnect' 'post-release handoff timeout' \
+    'request_id == 1' 'request_id == 2'; do
+    grep -F "$needle" "$test" >/dev/null
+done
 grep -F 'handle_cache_session' "$daemon" >/dev/null
 grep -F 'cache_advertisement_snapshot().present()' "$daemon" >/dev/null
 grep -F 'dispatcher->dispatch' "$daemon" >/dev/null
@@ -52,16 +71,14 @@ grep -F 'CACHE_SESSION and failed closed boundedly' "$real_test" >/dev/null
 # ownership teardown).
 for needle in \
     'ReleaseRefused' 'SidecarUnavailable' 'HandoffFailed' 'detached' \
-    'request_id == 1' 'buffered byte blocks handoff' \
-    'wrong/stale generation/attempt' 'duplicate request' \
-    'sidecar disconnect' 'handoff timeout' 'P49 discriminator' \
-    'normal-job misclassification' 'leaked fd/process'; do
+    'buffered ordinary byte' 'stale or wrong ACK' 'post-release' \
+    'P49 discriminator' 'normal ordinary job' 'fresh relationship'; do
     grep -F "$needle" "$test" >/dev/null
 done
 
 bounded_hello_source() {
-    grep -F 'connection.send_until' "$1" >/dev/null &&
-        grep -F 'connection.receive_until' "$1" >/dev/null &&
+    grep -F 'relationship.send_until' "$1" >/dev/null &&
+        grep -F 'relationship.receive_until' "$1" >/dev/null &&
         grep -F 'validate_handshake' "$1" >/dev/null
 }
 if ! bounded_hello_source "$impl"; then
@@ -73,7 +90,7 @@ fi
 # runtime matrix separately proves the saturated non-reading peer timeout.
 mutant=$(mktemp "${TMPDIR:-/tmp}/p50daemoncachedispatch-hello-mutant.XXXXXX")
 trap 'rm -f "$mutant"' EXIT HUP INT TERM
-sed 's/connection\.send_until(/connection.send(/' "$impl" >"$mutant"
+sed 's/relationship\.send_until(/relationship.send(/' "$impl" >"$mutant"
 if bounded_hello_source "$mutant"; then
     echo 'FAIL: HELLO bounded-send deletion/bypass mutant was accepted' >&2
     exit 1

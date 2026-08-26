@@ -11,13 +11,18 @@ test_file="$src/unittests/p50cacheservice.cpp"
 
 gate() {
     file=$1
-    grep -F 'f_store_guid_for_identity' "$file" >/dev/null &&
-        grep -F 'result.bytes[sizeof(identity.generation) + index]' "$file" >/dev/null &&
+    grep -F 'f_store_guid_for_incarnation' "$file" >/dev/null &&
+        grep -F 'return f_store_guid_for_incarnation(identity)' "$file" >/dev/null &&
+        grep -F 'read_structured_launch' "$file" >/dev/null &&
+        grep -F 'present != names.size()' "$file" >/dev/null &&
+        grep -F 'format != "2"' "$file" >/dev/null &&
+        grep -F 'expected_guid != bytes_hex' "$file" >/dev/null &&
+        grep -F 'expected_digest != icecc::digest128_hex(digest)' "$file" >/dev/null &&
         grep -F 'g_signal_wake_fd = wake_fd' "$file" >/dev/null &&
         grep -F 'const ssize_t ignored = ::write' "$file" >/dev/null &&
         grep -F 'active_control_cancel_fd_.store' "$file" >/dev/null &&
         grep -F 'context_.post([this]' "$file" >/dev/null &&
-        grep -F 'runtime_config.f_store_guid = f_store_guid_for_identity' "$file" >/dev/null &&
+        grep -F 'runtime_config.f_store_guid = structured_launch.active' "$file" >/dev/null &&
         grep -F 'endpoint_owner_thread_ = std::thread([this]' "$file" >/dev/null &&
         grep -F 'endpoint_work_guard_.reset()' "$file" >/dev/null &&
         grep -F 'endpoint_owner_thread_.join()' "$file" >/dev/null &&
@@ -68,6 +73,10 @@ grep -F 'second_ready_seen.load' "$test_file" >/dev/null
 grep -F 'signal_interrupts_control_wait(SIGTERM)' "$test_file" >/dev/null
 grep -F 'signal_interrupts_control_wait(SIGINT)' "$test_file" >/dev/null
 grep -F 'second_control.sender' "$test_file" >/dev/null
+grep -F 'structured_launch_is_complete_and_fail_closed' "$test_file" >/dev/null
+grep -F 'READY v2 generation=91 attempt=7 pid=' "$test_file" >/dev/null
+grep -F 'ICECC_CACHE_SERVICE_EXPECTED_GENERATION' "$test_file" >/dev/null
+grep -F 'WIFEXITED(status) && WEXITSTATUS(status) == 2' "$test_file" >/dev/null
 grep -F 'READY\n' "$doc" >/dev/null
 grep -F 'generation and attempt' "$doc" >/dev/null
 grep -F '0/0/0' "$doc" >/dev/null
@@ -102,12 +111,16 @@ for pattern in \
 done
 
 for pattern in \
-    'result.bytes[sizeof(identity.generation) + index]' \
+    'return f_store_guid_for_incarnation(identity)' \
+    'present != names.size()' \
+    'format != "2"' \
+    'expected_guid != bytes_hex' \
+    'expected_digest != icecc::digest128_hex(digest)' \
     'g_signal_wake_fd = wake_fd' \
     'const ssize_t ignored = ::write' \
     'active_control_cancel_fd_.store' \
     'context_.post([this]' \
-    'runtime_config.f_store_guid = f_store_guid_for_identity'; do
+    'runtime_config.f_store_guid = structured_launch.active'; do
     mutant="$mutant_dir/mutant.cpp"
     awk -v needle="$pattern" 'index($0, needle) == 0' "$impl" >"$mutant"
     if gate "$mutant"; then

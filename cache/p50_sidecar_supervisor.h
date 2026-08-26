@@ -9,12 +9,15 @@
 
 #include <chrono>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <optional>
 #include <vector>
 
 #include "p50_local_transport.h"
+#include "p50_incarnation_identity.h"
 #include "protocol50.h"
 
 #include <sys/types.h>
@@ -47,6 +50,32 @@ enum class Failure : uint8_t {
     RestartExhausted,
 };
 
+struct LaunchIncarnation {
+    local::Identity identity{};
+    FStoreGuid f_store_guid{};
+
+    [[nodiscard]] bool valid() const noexcept {
+        return identity.generation != 0 && identity.attempt != 0 &&
+               f_store_guid != FStoreGuid{} &&
+               f_store_guid == f_store_guid_for_incarnation(identity);
+    }
+};
+
+// This allocator is deliberately owned outside Supervisor and may be shared
+// by replacement Supervisor/controller objects inside one iceccd.  That is
+// the fence which prevents a controller recreation from reusing either a
+// launch attempt or F_STORE_GUID.
+class LaunchIdentityAllocator {
+public:
+    LaunchIdentityAllocator(uint64_t generation, uint64_t first_attempt = 1) noexcept;
+    std::optional<LaunchIncarnation> allocate() noexcept;
+
+private:
+    std::mutex mutex_;
+    uint64_t generation_ = 0;
+    uint64_t next_attempt_ = 0;
+};
+
 struct Config {
     // An absolute executable path is required.  Arguments are passed directly
     // to execve; no shell is involved.  The executable itself is argv[0].
@@ -65,8 +94,7 @@ struct Config {
     // directory and must publish a structured READY lease.  The directory is
     // never reused between launches or Supervisor recreations.
     std::string lease_root;
-    local::Identity identity{};
-    FStoreGuid f_store_guid{};
+    std::shared_ptr<LaunchIdentityAllocator> launch_identities;
 };
 
 struct ReadyLease {
@@ -157,8 +185,9 @@ private:
     void close_pipes() noexcept;
     void reap_blocking() noexcept;
     bool wait_for_exit(std::chrono::milliseconds timeout) noexcept;
-    void terminate_child() noexcept;
-    void terminate_group() noexcept;
+    bool child_has_exited_exact(pid_t expected_child) const noexcept;
+    bool terminate_child() noexcept;
+    bool terminate_group() noexcept;
     bool prepare_lease() noexcept;
     void cleanup_lease(std::optional<ReadyLease>& lease) noexcept;
 
@@ -167,6 +196,11 @@ private:
     Failure last_failure_ = Failure::None;
     Counters counters_{};
     pid_t child_pid_ = -1;
+    // On Linux this is an exact reference to the forked task.  It is used for
+    // every direct signal so a reaped and reused numeric PID can never become
+    // a teardown target.  Platforms without pidfd retain process-group
+    // teardown, but fail closed if that group identity is invalidated.
+    int child_pidfd_ = -1;
     pid_t process_group_ = -1;
     bool process_group_owned_ = false;
     int ready_read_ = -1;

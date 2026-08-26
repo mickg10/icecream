@@ -20,10 +20,13 @@ require() {
 
 require 'observation.supervisor_state == sidecar::State::Ready' "$impl" \
     'presence is gated on exact supervisor READY'
-require 'observation.private_relationship_authenticated' "$impl" \
-    'presence is gated on authenticated private HELLO/ACK'
 require 'observation.current_lease_matches' "$impl" \
     'presence is gated on the current immutable READY lease'
+if grep -F '&& observation.private_relationship_authenticated' "$impl" >/dev/null; then
+    echo 'FAIL: transient per-TU authentication became advertisement authority' >&2
+    exit 1
+fi
+echo 'ok - transient per-TU authentication is not advertisement authority'
 require 'crashed && current_.present()' "$impl" \
     'a post-READY crash forces withdrawal before recovery'
 require 'CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU' "$impl" \
@@ -38,6 +41,8 @@ require 'std::array<Snapshot, 2>' "$header" \
     'one observation has a statically bounded transition batch'
 require 'compressed crash and recovery withdraws before republishing' "$test" \
     'behavioral suite covers the two-transition crash edge'
+require 'READY current lease advertises while no transient TU relationship exists' "$test" \
+    'behavioral suite covers idle current-lease advertisement'
 require 'same-counter READY recovery at saturation remains failed closed' "$test" \
     'behavioral suite covers the saturated same-counter crash ambiguity'
 

@@ -13,9 +13,12 @@ The controller publishes only two kinds of snapshots:
 
 Presence requires all of the following in one observation: the daemon's
 public listener is bound to a valid TCP port, the supervisor is exactly
-`Ready`, and the private sidecar relationship has completed authenticated
-HELLO/ACK.  Starting, stopped, degraded, unauthenticated, or listener-loss
-observations withdraw the capability.
+`Ready`, and its immutable current READY lease still names the exact live
+sidecar incarnation. Starting, stopped, degraded, stale-lease, or listener-loss
+observations withdraw the capability. A transient authenticated private
+relationship is deliberately not advertisement authority: the product opens a
+fresh one-shot relationship for each TU, so idle time between TUs must not
+withdraw an otherwise live capability.
 
 `cumulative_post_ready_exits` is a monotonic incarnation edge owned by the
 daemon adapter.  It remains cumulative when the adapter destroys one
@@ -30,8 +33,9 @@ absence before any recovered presence, even when crash and recovery were
 compressed into one adapter poll.  A counter regression, saturation, or
 invalid bound port fails closed.
 
-This checkpoint intentionally leaves Login inert.  The production adapter
+This checkpoint intentionally leaves Login wiring inert. The production adapter
 must apply each returned transition in order and reannounce it to every live
 scheduler connection.  It must also recreate a supervisor with an incremented
-attempt for each sidecar incarnation while retaining the checked cumulative
+attempt for each sidecar incarnation, retain the shared launch-identity
+allocator across controller recreation, and retain the checked cumulative
 post-READY-exit count.

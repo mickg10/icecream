@@ -44,12 +44,12 @@ PY
 compile_and_kill ready-gate \
     'const bool ready = observation.supervisor_state == sidecar::State::Ready;' \
     'const bool ready = true;'
-compile_and_kill authentication-gate \
-    'const bool authenticated = observation.private_relationship_authenticated;' \
-    'const bool authenticated = true;'
+compile_and_kill transient-auth-reintroduced \
+    '&& observation.current_lease_matches;' \
+    '&& observation.current_lease_matches && observation.private_relationship_authenticated;'
 compile_and_kill current-lease-gate \
-    '&& authenticated && observation.current_lease_matches;' \
-    '&& authenticated && true;'
+    '&& observation.current_lease_matches;' \
+    '&& true;'
 compile_and_kill crash-withdrawal \
     'if (crashed && current_.present()) {' \
     'if ((static_cast<void>(crashed), false) && current_.present()) {'
