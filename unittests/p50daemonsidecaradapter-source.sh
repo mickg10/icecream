@@ -16,13 +16,16 @@ test -x "$service" || {
     exit 1
 }
 
-grep -F 'connect_unix_until' "$src" >/dev/null
+grep -F 'current_lease()' "$src" >/dev/null
+grep -F 'set_on_demand_endpoint' "$src" >/dev/null
+grep -F 'launch_identities' "$src" >/dev/null
+grep -F 'lease_root' "$src" >/dev/null
 grep -F 'cumulative_post_ready_exits_' "$src" >/dev/null
 grep -F 'prior_supervisor_post_ready_exits_' "$src" >/dev/null
 grep -F 'runtime_nodes_valid()' "$src" >/dev/null
 grep -F 'socket_info.st_dev == socket_device_' "$src" >/dev/null
 grep -F 'socket_info.st_ino == socket_inode_' "$src" >/dev/null
-grep -F 'directory_info.st_ino == attempt_directory_inode_' "$src" >/dev/null
+grep -F 'directory_info.st_ino != attempt_directory_inode_' "$src" >/dev/null
 grep -F 'append_update(update, controller_.observe' "$src" >/dev/null
 grep -F 'max_restarts = 0' "$src" >/dev/null
 grep -F 'observe_public_listener' "$header" >/dev/null
@@ -31,8 +34,8 @@ if grep -E 'daemon/main\.cpp|signal\(|sigaction\(|listen_unix\(' "$src" "$header
     echo 'FAIL: adapter acquired daemon-main, signal-handler, or public-listener ownership' >&2
     exit 1
 fi
-if test "$(grep -Fc '(void)::unlink(socket_path_.c_str());' "$src")" -ne 1; then
-    echo 'FAIL: exact inode-bound stale-socket cleanup is missing or duplicated' >&2
+if grep -F 'unlink(socket_path_.c_str())' "$src" >/dev/null; then
+    echo 'FAIL: adapter bypasses Supervisor exact lease cleanup' >&2
     exit 1
 fi
 

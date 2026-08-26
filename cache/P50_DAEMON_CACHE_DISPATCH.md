@@ -62,8 +62,12 @@ authenticated operation relationship, while every incarnation edge withdraws
 the old lease.  After SCM_RIGHTS is accepted, the sidecar writes raw
 `50 f0 00 01` on the adopted ordinary descriptor; the client waits for that
 witness before emitting CacheWire.
+The Supervisor remains the sole prebound-listener and exact lease-cleanup
+owner; a missing or replaced lease withdraws advertisement and fails closed.
 
-This slice ends after the ordinary descriptor handoff. The reviewed
-handoff-offer/trailing-byte barrier, `ATTACHMENT_PHASE_OPEN`, `WAITP50INPUT`,
-and reverse sealed-input FD delivery are separate required production phases
-and must not be inferred from an accepted generic handoff ACK.
+This slice still ends at committed-input FD admission.  The reviewed
+handoff-offer/source-arm exchange, `ATTACHMENT_PHASE_OPEN` into the real
+`WAITP50INPUT` client lifecycle, and reverse sealed-input retry reducer are
+explicit HOLDs: the existing CompileInputIdentity does not carry a complete
+`P50SourceArm` (selected-F authority and source mode are absent), so production
+code must not synthesize those fields or claim the WAITP50INPUT transition.

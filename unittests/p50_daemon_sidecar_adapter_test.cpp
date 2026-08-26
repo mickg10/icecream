@@ -327,8 +327,10 @@ int main()
     privacy_guard.adapter = nullptr;
 
     // Replacing the captured attempt directory must never make shutdown
-    // remove the replacement.  Test-owned cleanup removes only the old,
-    // already-dead service socket after proving that refusal.
+    // remove the replacement.  Supervisor cleanup also refuses the moved
+    // lease because its pathname no longer names the captured directory;
+    // test-owned cleanup removes that isolated old directory only after the
+    // refusal has been observed.
     auto replacement_config = config;
     replacement_config.generation = 4;
     icecc::p50::daemon::DaemonSidecarAdapter replacement(replacement_config);
@@ -350,10 +352,15 @@ int main()
         exact_node(captured_directory, 0700, true, ::geteuid(), ::getegid());
     const bool replacement_removed = !replacement_preserved ||
                                      ::rmdir(captured_directory.c_str()) == 0;
+    const bool old_socket_preserved =
+        ::access((moved_directory + "/cache.sock").c_str(), F_OK) == 0;
+    const bool old_directory_preserved =
+        exact_node(moved_directory, 0700, true, ::geteuid(), ::getegid());
     const bool old_socket_removed =
-        ::unlink((moved_directory + "/control.sock").c_str()) == 0;
+        ::unlink((moved_directory + "/cache.sock").c_str()) == 0;
     const bool old_directory_removed = ::rmdir(moved_directory.c_str()) == 0;
     if (!replacement_preserved || !replacement_removed ||
+        !old_socket_preserved || !old_directory_preserved ||
         !old_socket_removed || !old_directory_removed)
         return 31;
 

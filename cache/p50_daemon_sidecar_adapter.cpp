@@ -10,7 +10,6 @@
 namespace icecc::p50::daemon {
 namespace {
 
-constexpr int kPrivateDirectoryMode = 0700;
 constexpr int64_t kMaximumTimeoutMilliseconds = 24 * 60 * 60 * 1000;
 
 bool bounded_positive(std::chrono::milliseconds value) noexcept
@@ -57,6 +56,12 @@ bool owned_attempt_directory(const std::string& path, const Config& config) noex
 DaemonSidecarAdapter::DaemonSidecarAdapter(Config config) noexcept
     : config_(std::move(config))
 {
+    try {
+        launch_identities_ = std::make_shared<sidecar::LaunchIdentityAllocator>(
+            config_.generation, 1);
+    } catch (...) {
+        launch_identities_.reset();
+    }
 }
 
 DaemonSidecarAdapter::~DaemonSidecarAdapter()
@@ -66,9 +71,14 @@ DaemonSidecarAdapter::~DaemonSidecarAdapter()
 
 bool DaemonSidecarAdapter::valid_config(const Config& config) noexcept
 {
-    if (!sidecar::Supervisor::valid_config(sidecar::Config{
-            config.executable, {}, config.readiness_timeout,
-            config.shutdown_timeout, config.restart_window, 0, 1}) ||
+    sidecar::Config supervisor_config;
+    supervisor_config.executable = config.executable;
+    supervisor_config.readiness_timeout = config.readiness_timeout;
+    supervisor_config.shutdown_timeout = config.shutdown_timeout;
+    supervisor_config.restart_window = config.restart_window;
+    supervisor_config.max_restarts = 0;
+    supervisor_config.max_attempts_per_recovery = 1;
+    if (!sidecar::Supervisor::valid_config(supervisor_config) ||
         config.executable.empty() || config.executable.front() != '/' ||
         config.runtime_directory.empty() ||
         config.runtime_directory.front() != '/' || has_nul(config.runtime_directory) ||
@@ -368,16 +378,6 @@ bool DaemonSidecarAdapter::drain_input_lifecycle() noexcept
     return true;
 }
 
-bool DaemonSidecarAdapter::next_attempt() noexcept
-{
-    if (attempt_ == std::numeric_limits<uint64_t>::max()) {
-        fail(AdapterError::AttemptOverflow);
-        return false;
-    }
-    ++attempt_;
-    return true;
-}
-
 bool DaemonSidecarAdapter::runtime_nodes_valid() const noexcept
 {
     if (!private_directory(config_) || attempt_directory_.empty() || socket_path_.empty())
@@ -400,76 +400,11 @@ bool DaemonSidecarAdapter::runtime_nodes_valid() const noexcept
            socket_info.st_ino == socket_inode_;
 }
 
-bool DaemonSidecarAdapter::capture_socket_node() noexcept
-{
-    struct stat socket_info{};
-    if (::lstat(socket_path_.c_str(), &socket_info) != 0 ||
-        !S_ISSOCK(socket_info.st_mode) ||
-        socket_info.st_uid != config_.expected_service_uid ||
-        socket_info.st_gid != config_.expected_service_gid ||
-        (socket_info.st_mode & 07777) != 0600)
-        return false;
-    socket_device_ = socket_info.st_dev;
-    socket_inode_ = socket_info.st_ino;
-    return true;
-}
-
-bool DaemonSidecarAdapter::make_attempt_node() noexcept
-{
-    const std::string stem = config_.runtime_directory + "/s2-g" +
-                             std::to_string(config_.generation) + "-a" +
-                             std::to_string(attempt_);
-    const std::string socket = stem + "/control.sock";
-    if (stem.size() >= 240 || socket.size() > local::kMaxUnixPath)
-        return false;
-    // EEXIST is deliberately a hard failure: an old process may have been
-    // SIGKILLed while retaining a listener node, and that identity is stale.
-    if (::mkdir(stem.c_str(), kPrivateDirectoryMode) != 0)
-        return false;
-    struct stat directory_info{};
-    if (!owned_attempt_directory(stem, config_) ||
-        ::lstat(stem.c_str(), &directory_info) != 0) {
-        (void)::rmdir(stem.c_str());
-        return false;
-    }
-    attempt_directory_ = stem;
-    attempt_directory_device_ = directory_info.st_dev;
-    attempt_directory_inode_ = directory_info.st_ino;
-    socket_path_ = socket;
-    return true;
-}
-
 void DaemonSidecarAdapter::cleanup_attempt_node() noexcept
 {
-    if (attempt_directory_.empty()) {
-        socket_path_.clear();
-        attempt_directory_device_ = 0;
-        attempt_directory_inode_ = 0;
-        socket_device_ = 0;
-        socket_inode_ = 0;
-        return;
-    }
-    // A graceful service removes its own listener.  After SIGKILL, the
-    // supervisor has established child/group death before reaching here, so
-    // remove only the exact socket inode captured from this exact attempt.
-    // A replacement pathname or directory is never touched.
-    struct stat directory_info{};
-    const bool same_directory = owned_attempt_directory(attempt_directory_, config_) &&
-        ::lstat(attempt_directory_.c_str(), &directory_info) == 0 &&
-        directory_info.st_dev == attempt_directory_device_ &&
-        directory_info.st_ino == attempt_directory_inode_;
-    if (same_directory) {
-        struct stat socket_info{};
-        if (::lstat(socket_path_.c_str(), &socket_info) == 0 &&
-            S_ISSOCK(socket_info.st_mode) &&
-            socket_info.st_dev == socket_device_ &&
-            socket_info.st_ino == socket_inode_ &&
-            socket_info.st_uid == config_.expected_service_uid &&
-            socket_info.st_gid == config_.expected_service_gid &&
-            (socket_info.st_mode & 07777) == 0600)
-            (void)::unlink(socket_path_.c_str());
-        (void)::rmdir(attempt_directory_.c_str());
-    }
+    // Structured Supervisor owns the exact lease directory/socket and performs
+    // identity-checked cleanup after child/group teardown.  The adapter only
+    // drops its observation; it never unlinks a path by name.
     attempt_directory_.clear();
     socket_path_.clear();
     attempt_directory_device_ = 0;
@@ -487,32 +422,46 @@ void DaemonSidecarAdapter::disable_relationship() noexcept
 bool DaemonSidecarAdapter::attach_current() noexcept
 {
     if (supervisor_ == nullptr || supervisor_->state() != sidecar::State::Ready ||
-        supervisor_->child_pid() <= 1 || socket_path_.empty())
+        supervisor_->child_pid() <= 1 || socket_path_.empty() ||
+        !supervisor_->current_lease().has_value())
         return false;
-    local::Status status = local::Status::Ok;
-    const auto deadline = std::chrono::steady_clock::now() + config_.connect_timeout;
-    local::Connection connection =
-        local::connect_unix_until(socket_path_, deadline, &status);
-    if (!connection.valid() || status != local::Status::Ok)
+    const sidecar::ReadyLease& lease = *supervisor_->current_lease();
+    if (!lease.valid() || lease.identity.generation != config_.generation)
         return false;
-    const local::CredentialExpectation expected{
+    OnDemandEndpoint endpoint;
+    endpoint.socket_path = lease.socket_path;
+    endpoint.expected_peer = local::CredentialExpectation{
         config_.expected_service_uid, config_.expected_service_gid,
         static_cast<uint64_t>(supervisor_->child_pid())};
-    if (connection.verify_peer_credentials(expected) != local::Status::Ok)
+    endpoint.lease_identity = lease.identity;
+    endpoint.c_store_guid = lease.c_store_guid;
+    endpoint.f_store_guid = lease.f_store_guid;
+    endpoint.socket_path_digest = lease.socket_path_digest;
+    endpoint.listener_device = lease.listener_device;
+    endpoint.listener_inode = lease.listener_inode;
+    if (!endpoint.valid() || !endpoint.current_path_matches())
         return false;
+    socket_path_ = lease.socket_path;
+    attempt_directory_ = lease.private_directory;
+    attempt_directory_device_ = lease.directory_device;
+    attempt_directory_inode_ = lease.directory_inode;
+    socket_device_ = lease.listener_device;
+    socket_inode_ = lease.listener_inode;
+    attempt_ = lease.identity.attempt;
     if (dispatcher_ == nullptr ||
-        !dispatcher_->attach_authenticated(
-            std::move(connection), local::Identity{config_.generation, attempt_}))
+        !dispatcher_->set_on_demand_endpoint(std::move(endpoint)))
         return false;
     return true;
 }
 
 bool DaemonSidecarAdapter::begin_attempt(bool /*recovery*/) noexcept
 {
-    if (!next_attempt() || !make_attempt_node()) {
-        fail(last_error_ == AdapterError::AttemptOverflow
-                 ? last_error_
-                 : AdapterError::StalePath);
+    if (attempt_ == std::numeric_limits<uint64_t>::max()) {
+        fail(AdapterError::AttemptOverflow);
+        return false;
+    }
+    if (launch_identities_ == nullptr) {
+        fail(AdapterError::StartupFailure);
         return false;
     }
     next_input_lifecycle_operation_id_ = 1;
@@ -522,15 +471,10 @@ bool DaemonSidecarAdapter::begin_attempt(bool /*recovery*/) noexcept
         sidecar::Config supervisor_config;
         supervisor_config.executable = config_.executable;
         supervisor_config.arguments = {
-            "--socket", socket_path_, "--peer-uid", std::to_string(config_.expected_daemon_uid),
-            "--peer-gid", std::to_string(config_.expected_daemon_gid), "--generation",
-            std::to_string(config_.generation), "--attempt", std::to_string(attempt_)};
-        if (config_.drop_uid.has_value()) {
-            supervisor_config.arguments.push_back("--drop-uid");
-            supervisor_config.arguments.push_back(std::to_string(*config_.drop_uid));
-            supervisor_config.arguments.push_back("--drop-gid");
-            supervisor_config.arguments.push_back(std::to_string(*config_.drop_gid));
-        }
+            "--peer-uid", std::to_string(config_.expected_daemon_uid),
+            "--peer-gid", std::to_string(config_.expected_daemon_gid)};
+        supervisor_config.lease_root = config_.runtime_directory;
+        supervisor_config.launch_identities = launch_identities_;
         supervisor_config.readiness_timeout = config_.readiness_timeout;
         supervisor_config.shutdown_timeout = config_.shutdown_timeout;
         supervisor_config.restart_window = config_.restart_window;
@@ -545,13 +489,22 @@ bool DaemonSidecarAdapter::begin_attempt(bool /*recovery*/) noexcept
             cleanup_attempt_node();
             return false;
         }
-        if (!capture_socket_node()) {
+        if (!supervisor_->current_lease().has_value() ||
+            !supervisor_->current_lease()->valid()) {
             fail(AdapterError::RuntimeNodeFailure);
             supervisor_->shutdown();
             supervisor_.reset();
             cleanup_attempt_node();
             return false;
         }
+        const sidecar::ReadyLease& lease = *supervisor_->current_lease();
+        socket_path_ = lease.socket_path;
+        attempt_directory_ = lease.private_directory;
+        attempt_directory_device_ = lease.directory_device;
+        attempt_directory_inode_ = lease.directory_inode;
+        socket_device_ = lease.listener_device;
+        socket_inode_ = lease.listener_inode;
+        attempt_ = lease.identity.attempt;
         prior_supervisor_post_ready_exits_ = supervisor_->counters().post_ready_exits;
         prior_counter_observed_ = true;
         dispatcher_ = std::make_unique<CacheSessionDispatcher>(
@@ -648,6 +601,9 @@ void DaemonSidecarAdapter::apply_observation(advertisement::Update& update) noex
                                        : sidecar::State::Stopped;
     observation.private_relationship_authenticated =
         authenticated() && runtime_nodes_valid();
+    observation.current_lease_matches =
+        supervisor_ != nullptr && supervisor_->current_lease().has_value() &&
+        supervisor_->current_lease()->valid() && runtime_nodes_valid();
     observation.cumulative_post_ready_exits = cumulative_post_ready_exits_;
     const advertisement::Update observed = controller_.observe(observation);
     append_update(update, observed);

@@ -1,7 +1,6 @@
 noinst_LIBRARIES = libprotocol50.a libp50endpoint.a libp50localtransport.a \
-	libp50sidecarsupervisor.a libp50readyadvertisement.a \
-	libp50daemonsidecaradapter.a libp50inputfd.a libp50inputlifecycle.a \
-	libp50roleowner.a
+	libp50sidecarsupervisor.a libp50readyadvertisement.a libp50roleowner.a \
+	libp50daemonsidecaradapter.a libp50inputfd.a libp50inputlifecycle.a
 
 sbin_PROGRAMS = icecc-cache-service
 

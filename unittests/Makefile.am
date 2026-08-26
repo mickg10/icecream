@@ -316,6 +316,7 @@ EXTRA_DIST += p50reversefdretry-source.sh p50reversefdretry-mutants.sh \
 	p50_reverse_fd_retry_sanitize.sh
 EXTRA_DIST += p50s2restartreplay-source.sh p50_s2_restart_replay_sanitize.sh
 EXTRA_DIST += p50sidecarsupervisor-sanitize.sh
+EXTRA_DIST += p50daemonsidecaradapter-source.sh p50daemonsidecaradapter-sanitize.sh
 EXTRA_DIST += p50compilee2e-source.sh p50compilee2e-run.sh
 EXTRA_DIST += p50completionflow-source.py
 EXTRA_DIST += p50completionrecord-sanitize.sh

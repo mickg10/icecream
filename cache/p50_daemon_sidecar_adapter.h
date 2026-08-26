@@ -172,14 +172,11 @@ private:
     bool recover(advertisement::Update& update) noexcept;
     bool collect_counter_delta() noexcept;
     bool reserve_outer_restart() noexcept;
-    bool next_attempt() noexcept;
     bool next_input_lifecycle_operation(uint64_t& operation_id) noexcept;
     [[nodiscard]] bool drain_input_lifecycle() noexcept;
     [[nodiscard]] bool remember_completed_input_lifecycle(
         const InputLifecycleRequest& request) noexcept;
     void retire_input_lifecycle_relationship(AdapterError error) noexcept;
-    bool make_attempt_node() noexcept;
-    bool capture_socket_node() noexcept;
     bool runtime_nodes_valid() const noexcept;
     void cleanup_attempt_node() noexcept;
     void disable_relationship() noexcept;
@@ -195,6 +192,7 @@ private:
     AdapterError last_error_ = AdapterError::None;
     PublicListenerObservation public_listener_{};
     std::unique_ptr<sidecar::Supervisor> supervisor_;
+    std::shared_ptr<sidecar::LaunchIdentityAllocator> launch_identities_;
     std::unique_ptr<CacheSessionDispatcher> dispatcher_;
     advertisement::Controller controller_;
     std::string socket_path_;

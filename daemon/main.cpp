@@ -4762,7 +4762,11 @@ bool Daemon::configure_cache_adapter() noexcept
         icecc::p50::daemon::Config config;
         config.executable = cache_service_executable;
         config.runtime_directory = cache_runtime_directory;
-        config.generation = fresh_cache_sidecar_generation();
+        // The daemon-local namespace is already immutable and nonzero.  It is
+        // never serialized as a steady_clock value and remains stable across
+        // supervised sidecar retries while the launch allocator advances the
+        // attempt component.
+        config.generation = daemon_generation;
         config.expected_daemon_uid = static_cast<uint64_t>(::geteuid());
         config.expected_daemon_gid = static_cast<uint64_t>(::getegid());
         config.expected_service_uid = config.expected_daemon_uid;
