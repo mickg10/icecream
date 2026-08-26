@@ -102,9 +102,11 @@ void clear_structured_launch_environment() {
              "ICECC_CACHE_SERVICE_READY_FORMAT",
              "ICECC_CACHE_SERVICE_EXPECTED_GENERATION",
              "ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT",
+             "ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID",
              "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID",
              "ICECC_CACHE_SERVICE_EXPECTED_SOCKET",
              "ICECC_CACHE_SERVICE_EXPECTED_SOCKET_DIGEST",
+             "ICECC_CACHE_SERVICE_LISTENER_FD",
          })
         (void)::unsetenv(name);
 }
@@ -643,11 +645,20 @@ void structured_launch_is_complete_and_fail_closed() {
     const std::string attempt = std::to_string(expected_identity.attempt);
     const std::string guid =
         hex_id(service::f_store_guid_for_identity(expected_identity));
+    const std::string c_guid =
+        hex_id(service::c_store_guid_for_identity(expected_identity));
     const std::string digest =
         icecc::digest128_hex(icecc::digest128(expected_socket));
     const std::string uid = std::to_string(static_cast<uint64_t>(::getuid()));
     const std::string gid = std::to_string(static_cast<uint64_t>(::getgid()));
     const std::string executable = service_path();
+    local::Status prebound_status = local::Status::Ok;
+    const int prebound_listener =
+        local::listen_unix(expected_socket, 1, &prebound_status);
+    CHECK(prebound_listener >= 0 && prebound_status == local::Status::Ok);
+    const int prebound_flags = ::fcntl(prebound_listener, F_GETFD);
+    CHECK(prebound_flags >= 0);
+    CHECK(::fcntl(prebound_listener, F_SETFD, prebound_flags & ~FD_CLOEXEC) == 0);
 
     int ready[2] = {-1, -1};
     CHECK(::pipe(ready) == 0);
@@ -661,18 +672,23 @@ void structured_launch_is_complete_and_fail_closed() {
         (void)::setenv("ICECC_CACHE_SERVICE_READY_FORMAT", "2", 1);
         (void)::setenv("ICECC_CACHE_SERVICE_EXPECTED_GENERATION", generation.c_str(), 1);
         (void)::setenv("ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT", attempt.c_str(), 1);
+        (void)::setenv("ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID", c_guid.c_str(), 1);
         (void)::setenv("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID", guid.c_str(), 1);
         (void)::setenv("ICECC_CACHE_SERVICE_EXPECTED_SOCKET", expected_socket.c_str(), 1);
         (void)::setenv("ICECC_CACHE_SERVICE_EXPECTED_SOCKET_DIGEST", digest.c_str(), 1);
+        const std::string listener_fd = std::to_string(prebound_listener);
+        (void)::setenv("ICECC_CACHE_SERVICE_LISTENER_FD", listener_fd.c_str(), 1);
         ::execl(executable.c_str(), executable.c_str(), "--socket", stale_socket.c_str(),
                 "--peer-uid", uid.c_str(), "--peer-gid", gid.c_str(), "--generation",
                 "1", "--attempt", "1", static_cast<char*>(nullptr));
         _exit(127);
     }
     (void)::close(ready[1]);
+    CHECK(::close(prebound_listener) == 0);
     const std::string ready_message = read_bounded_to_eof(ready[0]);
     (void)::close(ready[0]);
     CHECK(ready_message.rfind("READY v2 generation=91 attempt=7 pid=", 0) == 0);
+    CHECK(ready_message.find(" C_STORE_GUID=" + c_guid) != std::string::npos);
     CHECK(ready_message.find(" F_STORE_GUID=" + guid) != std::string::npos);
     CHECK(ready_message.find(" PATH=" + expected_socket) != std::string::npos);
     CHECK(ready_message.find(" DIGEST=" + digest) != std::string::npos);
@@ -695,7 +711,8 @@ void structured_launch_is_complete_and_fail_closed() {
     int status = 0;
     CHECK(::waitpid(pid, &status, 0) == pid);
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
-    CHECK(::access(expected_socket.c_str(), F_OK) != 0);
+    CHECK(::access(expected_socket.c_str(), F_OK) == 0);
+    CHECK(::unlink(expected_socket.c_str()) == 0);
 
     int partial_ready[2] = {-1, -1};
     CHECK(::pipe(partial_ready) == 0);

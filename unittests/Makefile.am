@@ -21,6 +21,7 @@ TESTS += p50_completion_record
 TESTS += p50completionflow-source.py
 TESTS += p50completionrecord-sanitize.sh
 TESTS += p50completionflow-run.sh
+TESTS += p50roleowner p50tworole-source.sh
 
 AM_TESTS_ENVIRONMENT = \
 	ICECC_TEST_BUILDDIR='$(abs_builddir)'; export ICECC_TEST_BUILDDIR; \
@@ -82,6 +83,9 @@ p50sidecarsupervisor_SOURCES = p50_sidecar_supervisor_test.cpp
 p50sidecarsupervisor_CXXFLAGS = -pthread
 p50sidecarsupervisor_LDFLAGS = -pthread
 p50sidecarsupervisor_LDADD = ../cache/libp50sidecarsupervisor.a ../services/libicecc.la
+p50roleowner_SOURCES = p50_role_owner_test.cpp ../cache/p50_role_owner.cpp
+p50roleowner_CXXFLAGS = -pthread
+p50roleowner_LDFLAGS = -pthread
 p50readyadvertisement_LDADD = ../cache/libp50readyadvertisement.a
 digest128bench_LDADD = ../services/libicecc.la
 
@@ -96,6 +100,7 @@ testargs_SOURCES = args.cpp
 check_PROGRAMS += p50sourcearm p50phaseopen
 check_PROGRAMS += p50reversefdretry
 check_PROGRAMS += p50s2restartreplay
+check_PROGRAMS += p50roleowner
 p50wire_SOURCES = p50_wire_test.cpp
 p50slice0_SOURCES = \
 	p50_slice0_test.cpp
@@ -314,6 +319,7 @@ EXTRA_DIST += p50compilee2e-source.sh p50compilee2e-run.sh
 EXTRA_DIST += p50completionflow-source.py
 EXTRA_DIST += p50completionrecord-sanitize.sh
 EXTRA_DIST += p50completionflow-run.sh
+EXTRA_DIST += p50tworole-source.sh
 
 # Make the tests also print the test log if they fail.
 check: export VERBOSE=1

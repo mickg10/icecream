@@ -18,7 +18,12 @@ constexpr uint32_t kCacheSession = 0x50f00000u;
 
 bool OnDemandEndpoint::valid() const noexcept {
     return !socket_path.empty() && lease_identity.generation != 0 &&
-           lease_identity.attempt != 0 && f_store_guid != FStoreGuid{} &&
+           lease_identity.attempt != 0 &&
+           (c_store_guid == CStoreGuid{} ||
+            (c_store_guid != f_store_guid &&
+             c_store_guid == c_store_guid_for_incarnation(lease_identity))) &&
+           f_store_guid != FStoreGuid{} &&
+           c_store_guid == c_store_guid_for_incarnation(lease_identity) &&
            f_store_guid == f_store_guid_for_incarnation(lease_identity) &&
            socket_path_digest != icecc::Digest128{} && listener_device != 0 &&
            listener_inode != 0 && expected_peer.uid.has_value() &&

@@ -1,6 +1,7 @@
 noinst_LIBRARIES = libprotocol50.a libp50endpoint.a libp50localtransport.a \
 	libp50sidecarsupervisor.a libp50readyadvertisement.a \
-	libp50daemonsidecaradapter.a libp50inputfd.a libp50inputlifecycle.a
+	libp50daemonsidecaradapter.a libp50inputfd.a libp50inputlifecycle.a \
+	libp50roleowner.a
 
 sbin_PROGRAMS = icecc-cache-service
 
@@ -51,6 +52,7 @@ libp50readyadvertisement_a_SOURCES = p50_ready_advertisement.cpp \
 libp50daemonsidecaradapter_a_SOURCES = p50_daemon_sidecar_adapter.cpp \
 	p50_daemon_sidecar_adapter.h
 libp50daemonsidecaradapter_a_CPPFLAGS = $(AM_CPPFLAGS)
+libp50roleowner_a_SOURCES = p50_role_owner.cpp p50_role_owner.h
 
 EXTRA_DIST = \
 	p50_control_operation.h \
@@ -163,6 +165,7 @@ EXTRA_DIST = \
 	P50_DAEMON_PHASE_REVERSE_WIRING.md \
 	P50_S2_RESTART_REPLAY.md \
 	P50_SOURCE_ARM.md \
+	P50_PREBOUND_TWO_ROLE.md \
 	formal/README.md
 
 check-local:

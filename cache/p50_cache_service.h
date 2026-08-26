@@ -34,6 +34,7 @@ namespace icecc::p50::service {
 // TCP link and passes that connected descriptor over the private control
 // relationship.
 struct RuntimeConfig {
+    CStoreGuid c_store_guid{};
     FStoreGuid f_store_guid{};
     EndpointCaps endpoint_caps{};
     P50ServerEndpointConfig endpoint_config{};
@@ -61,6 +62,7 @@ struct RuntimeResult {
 // so a restart with the same generation but a new attempt cannot reopen the
 // previous empty store by accident.
 FStoreGuid f_store_guid_for_identity(local::Identity identity) noexcept;
+CStoreGuid c_store_guid_for_identity(local::Identity identity) noexcept;
 
 // One owner/reader for one authenticated control connection and one adopted
 // endpoint session.  The endpoint object and its mutable store remain on the

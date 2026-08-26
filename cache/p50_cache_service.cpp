@@ -42,6 +42,7 @@ namespace {
 namespace asio = boost::asio;
 
 constexpr std::string_view kReadyEnvironment = "ICECC_CACHE_SERVICE_READY_FD";
+constexpr std::string_view kListenerEnvironment = "ICECC_CACHE_SERVICE_LISTENER_FD";
 constexpr std::string_view kReadyFormatEnvironment =
     "ICECC_CACHE_SERVICE_READY_FORMAT";
 constexpr std::string_view kExpectedGenerationEnvironment =
@@ -50,6 +51,8 @@ constexpr std::string_view kExpectedAttemptEnvironment =
     "ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT";
 constexpr std::string_view kExpectedFStoreGuidEnvironment =
     "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID";
+constexpr std::string_view kExpectedCStoreGuidEnvironment =
+    "ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID";
 constexpr std::string_view kExpectedSocketEnvironment =
     "ICECC_CACHE_SERVICE_EXPECTED_SOCKET";
 constexpr std::string_view kExpectedSocketDigestEnvironment =
@@ -269,11 +272,26 @@ bool parse_ready_fd(OwnedFd& ready) noexcept {
     return true;
 }
 
+bool parse_listener_fd(OwnedFd& listener) noexcept {
+    const char* raw = ::getenv(kListenerEnvironment.data());
+    if (raw == nullptr || *raw == '\0')
+        return false;
+    int fd = -1;
+    if (!parse_int(raw, fd) || fd < 3 || ::fcntl(fd, F_GETFD) < 0)
+        return false;
+    struct stat info{};
+    if (::fstat(fd, &info) != 0 || !S_ISSOCK(info.st_mode))
+        return false;
+    listener.fd = fd;
+    return true;
+}
+
 std::string bytes_hex(std::span<const uint8_t> bytes);
 
 struct StructuredLaunch {
     bool active = false;
     local::Identity identity{};
+    CStoreGuid c_store_guid{};
     FStoreGuid f_store_guid{};
     std::string socket_path;
     icecc::Digest128 socket_path_digest{};
@@ -281,11 +299,12 @@ struct StructuredLaunch {
 
 bool read_structured_launch(StructuredLaunch& launch) noexcept {
     try {
-        constexpr std::array<std::string_view, 6> names{
+        constexpr std::array<std::string_view, 7> names{
             kReadyFormatEnvironment,
             kExpectedGenerationEnvironment,
             kExpectedAttemptEnvironment,
             kExpectedFStoreGuidEnvironment,
+            kExpectedCStoreGuidEnvironment,
             kExpectedSocketEnvironment,
             kExpectedSocketDigestEnvironment,
         };
@@ -309,8 +328,9 @@ bool read_structured_launch(StructuredLaunch& launch) noexcept {
         const std::string_view generation_text(values[1]);
         const std::string_view attempt_text(values[2]);
         const std::string_view expected_guid(values[3]);
-        const std::string_view expected_socket(values[4]);
-        const std::string_view expected_digest(values[5]);
+        const std::string_view expected_c_guid(values[4]);
+        const std::string_view expected_socket(values[5]);
+        const std::string_view expected_digest(values[6]);
         uint64_t generation = 0;
         uint64_t attempt = 0;
         if (format != "2" || !parse_uint(generation_text, generation) ||
@@ -322,14 +342,18 @@ bool read_structured_launch(StructuredLaunch& launch) noexcept {
             expected_socket.find_first_of(" \t\r\n") != std::string_view::npos)
             return false;
         const local::Identity identity{generation, attempt};
+        const CStoreGuid c_guid = c_store_guid_for_incarnation(identity);
         const FStoreGuid guid = f_store_guid_for_incarnation(identity);
         const icecc::Digest128 digest = icecc::digest128(expected_socket);
         if (expected_guid != bytes_hex(std::span<const uint8_t>(
                                  guid.bytes.data(), guid.bytes.size())) ||
+            expected_c_guid != bytes_hex(std::span<const uint8_t>(
+                                  c_guid.bytes.data(), c_guid.bytes.size()))) ||
             expected_digest != icecc::digest128_hex(digest))
             return false;
         launch.active = true;
         launch.identity = identity;
+        launch.c_store_guid = c_guid;
         launch.f_store_guid = guid;
         launch.socket_path.assign(expected_socket);
         launch.socket_path_digest = digest;
@@ -502,17 +526,22 @@ struct ListenerIdentity {
 };
 
 bool write_ready_lease(int fd, const Options& options, const ListenerIdentity& listener) noexcept {
+    const CStoreGuid c_guid = c_store_guid_for_incarnation(options.identity);
     const FStoreGuid guid = f_store_guid_for_incarnation(options.identity);
     const std::string digest = digest128_hex(digest128(options.socket_path));
     const std::string message =
         "READY v2 generation=" + std::to_string(options.identity.generation) +
         " attempt=" + std::to_string(options.identity.attempt) +
         " pid=" + std::to_string(static_cast<long long>(::getpid())) +
+        " C_STORE_GUID=" + bytes_hex(std::span<const uint8_t>(c_guid.bytes.data(),
+                                                                  c_guid.bytes.size())) +
         " F_STORE_GUID=" + bytes_hex(std::span<const uint8_t>(guid.bytes.data(),
                                                                  guid.bytes.size())) +
         " PATH=" + options.socket_path + " DIGEST=" + digest +
-        " DEV=" + std::to_string(static_cast<unsigned long long>(listener.pathname_device)) +
-        " INO=" + std::to_string(static_cast<unsigned long long>(listener.pathname_inode)) +
+        " DEV=" + std::to_string(static_cast<unsigned long long>(
+            listener.pathname_device != 0 ? listener.pathname_device : listener.listener_device)) +
+        " INO=" + std::to_string(static_cast<unsigned long long>(
+            listener.pathname_inode != 0 ? listener.pathname_inode : listener.listener_inode)) +
         "\n";
     return write_exact(fd, message);
 }
@@ -531,7 +560,20 @@ bool capture_listener_identity(int fd, const std::string& path,
     return true;
 }
 
-void cleanup_listener(int fd, const std::string& path, const ListenerIdentity& identity) noexcept {
+bool capture_prebound_listener_identity(int fd, ListenerIdentity& identity) noexcept {
+    struct stat info{};
+    if (::fstat(fd, &info) != 0 || !S_ISSOCK(info.st_mode) || info.st_dev == 0 ||
+        info.st_ino == 0)
+        return false;
+    identity.listener_device = info.st_dev;
+    identity.listener_inode = info.st_ino;
+    return true;
+}
+
+void cleanup_listener(int fd, const std::string& path, const ListenerIdentity& identity,
+                      bool prebound) noexcept {
+    if (prebound)
+        return;
     struct stat listener{};
     struct stat pathname{};
     // Compare the still-open listener with the pathname before unlinking.
@@ -665,6 +707,10 @@ bool handle_connection(local::Connection connection, const Options& options,
 
 } // namespace
 
+CStoreGuid c_store_guid_for_identity(local::Identity identity) noexcept {
+    return c_store_guid_for_incarnation(identity);
+}
+
 FStoreGuid f_store_guid_for_identity(local::Identity identity) noexcept {
     return f_store_guid_for_incarnation(identity);
 }
@@ -680,6 +726,15 @@ RuntimeConfig validate_runtime_config(RuntimeConfig config) {
         config.max_input_lifecycle_replays == 0)
         throw std::invalid_argument(
             "sidecar runtime input lifecycle limits must be nonzero");
+    // Keep direct library callers source-compatible with the earlier
+    // prototype. Supervised structured launches always provide both GUIDs.
+    if (config.c_store_guid == CStoreGuid{}) {
+        config.c_store_guid = CStoreGuid::from_u64(0x4353545200000001ULL);
+        if (config.c_store_guid == config.f_store_guid)
+            config.c_store_guid.bytes[15] ^= 0x01;
+    }
+    if (config.c_store_guid == config.f_store_guid)
+        throw std::invalid_argument("sidecar runtime requires distinct C/F store GUIDs");
     return config;
 }
 
@@ -1212,14 +1267,23 @@ int run(const Options& options) noexcept {
         return 2;
 
     local::Status listen_status = local::Status::Ok;
-    const int listener = local::listen_unix(effective_options.socket_path, effective_options.backlog,
-                                            &listen_status);
-    if (listener < 0)
-        return 2;
-    OwnedFd listener_owner(listener);
+    OwnedFd listener_owner;
+    const bool prebound = structured_launch.active;
+    if (prebound) {
+        if (!parse_listener_fd(listener_owner))
+            return 2;
+    } else {
+        const int listener = local::listen_unix(effective_options.socket_path,
+                                                effective_options.backlog, &listen_status);
+        if (listener < 0)
+            return 2;
+        listener_owner.fd = listener;
+    }
+    const int listener = listener_owner.fd;
     ListenerIdentity identity{};
-    if (!capture_listener_identity(listener, effective_options.socket_path, identity)) {
-        cleanup_listener(listener, effective_options.socket_path, identity);
+    if (!(prebound ? capture_prebound_listener_identity(listener, identity)
+                   : capture_listener_identity(listener, effective_options.socket_path, identity))) {
+        cleanup_listener(listener, effective_options.socket_path, identity, prebound);
         return 2;
     }
     RuntimeConfig runtime_config;
@@ -1230,18 +1294,22 @@ int run(const Options& options) noexcept {
                                       ? structured_launch.f_store_guid
                                       : f_store_guid_for_incarnation(
                                             effective_options.identity);
+    runtime_config.c_store_guid = structured_launch.active
+                                      ? structured_launch.c_store_guid
+                                      : c_store_guid_for_incarnation(
+                                            effective_options.identity);
     std::unique_ptr<SidecarRuntime> runtime;
     try {
         runtime = std::make_unique<SidecarRuntime>(std::move(runtime_config));
     } catch (...) {
-        cleanup_listener(listener, effective_options.socket_path, identity);
+        cleanup_listener(listener, effective_options.socket_path, identity, prebound);
         return 2;
     }
     const bool structured_ready = structured_launch.active;
     if (g_stop_requested != 0 ||
         !(structured_ready ? write_ready_lease(ready.fd, effective_options, identity)
                            : write_ready(ready.fd))) {
-        cleanup_listener(listener, effective_options.socket_path, identity);
+        cleanup_listener(listener, effective_options.socket_path, identity, prebound);
         return 2;
     }
     (void)::close(ready.fd);
@@ -1354,7 +1422,7 @@ int run(const Options& options) noexcept {
     }
     workers.clear();
 
-    cleanup_listener(listener, effective_options.socket_path, identity);
+    cleanup_listener(listener, effective_options.socket_path, identity, prebound);
     return 0;
 }
 

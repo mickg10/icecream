@@ -86,17 +86,28 @@ int structured_child(const std::string& mode, int fd) {
     const char* attempt = required_environment("ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT");
     const char* guid =
         required_environment("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID");
+    const char* c_guid =
+        required_environment("ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID");
     const char* path = required_environment("ICECC_CACHE_SERVICE_EXPECTED_SOCKET");
     const char* digest =
         required_environment("ICECC_CACHE_SERVICE_EXPECTED_SOCKET_DIGEST");
     if (format == nullptr || std::string(format) != "2" || generation == nullptr ||
-        attempt == nullptr || guid == nullptr || path == nullptr || digest == nullptr)
+        attempt == nullptr || guid == nullptr || c_guid == nullptr || path == nullptr ||
+        digest == nullptr)
         return 108;
-    const int listener = structured_listener(path);
+    int listener = -1;
+    bool inherited = false;
+    if (const char* raw_listener = ::getenv("ICECC_CACHE_SERVICE_LISTENER_FD");
+        raw_listener != nullptr) {
+        listener = std::atoi(raw_listener);
+        inherited = listener >= 0;
+    }
+    if (listener < 0)
+        listener = structured_listener(path);
     if (listener < 0)
         return 109;
     struct stat pathname{};
-    if (::lstat(path, &pathname) != 0) {
+    if ((!inherited && ::lstat(path, &pathname) != 0) || ::fstat(listener, &pathname) != 0) {
         (void)::close(listener);
         return 110;
     }
@@ -104,7 +115,8 @@ int structured_child(const std::string& mode, int fd) {
                                     (mode == "structured-wrong-pid" ? 1 : 0);
     const std::string ready =
         "READY v2 generation=" + std::string(generation) + " attempt=" + attempt +
-        " pid=" + std::to_string(published_pid) + " F_STORE_GUID=" + guid +
+        " pid=" + std::to_string(published_pid) + " C_STORE_GUID=" + c_guid +
+        " F_STORE_GUID=" + guid +
         " PATH=" + path + " DIGEST=" + digest +
         " DEV=" + std::to_string(static_cast<unsigned long long>(pathname.st_dev)) +
         " INO=" + std::to_string(static_cast<unsigned long long>(pathname.st_ino)) +

@@ -375,7 +375,7 @@ bool parse_ready_lease(std::string_view wire, const ReadyLease& expected,
     if (wire.size() < 10 || wire.back() != '\n' || wire.find('\0') != std::string_view::npos)
         return false;
     wire.remove_suffix(1);
-    std::array<std::string_view, 10> fields{};
+    std::array<std::string_view, 11> fields{};
     size_t begin = 0;
     for (size_t index = 0; index != fields.size(); ++index) {
         if (begin >= wire.size())
@@ -399,10 +399,12 @@ bool parse_ready_lease(std::string_view wire, const ReadyLease& expected,
     }
     if (begin != wire.size())
         return false;
-    static constexpr std::array<std::string_view, 8> keys = {
-        "generation", "attempt", "pid", "F_STORE_GUID",
+    if (fields[0] != "READY" || fields[1] != "v2")
+        return false;
+    static constexpr std::array<std::string_view, 9> keys = {
+        "generation", "attempt", "pid", "C_STORE_GUID", "F_STORE_GUID",
         "PATH", "DIGEST", "DEV", "INO"};
-    std::array<std::string_view, 8> values{};
+    std::array<std::string_view, 9> values{};
     for (size_t index = 0; index != keys.size(); ++index) {
         const std::string_view field = fields[index + 2];
         const size_t equals = field.find('=');
@@ -412,16 +414,17 @@ bool parse_ready_lease(std::string_view wire, const ReadyLease& expected,
         values[index] = field.substr(equals + 1);
     }
     uint64_t generation = 0, attempt = 0, pid = 0, device = 0, inode = 0;
-    if (fields[0] != "READY" || fields[1] != "v2" ||
-        !parse_uint64(values[0], generation) || !parse_uint64(values[1], attempt) ||
-        !parse_uint64(values[2], pid) || !parse_uint64(values[6], device) ||
-        !parse_uint64(values[7], inode) || pid != static_cast<uint64_t>(child) ||
+    if (!parse_uint64(values[0], generation) || !parse_uint64(values[1], attempt) ||
+        !parse_uint64(values[2], pid) || !parse_uint64(values[7], device) ||
+        !parse_uint64(values[8], inode) || pid != static_cast<uint64_t>(child) ||
         generation != expected.identity.generation || attempt != expected.identity.attempt ||
         device == 0 || inode == 0 ||
         values[3] != bytes_hex(std::span<const uint8_t>(
+            expected.c_store_guid.bytes.data(), expected.c_store_guid.bytes.size())) ||
+        values[4] != bytes_hex(std::span<const uint8_t>(
             expected.f_store_guid.bytes.data(), expected.f_store_guid.bytes.size())) ||
-        values[4] != expected.socket_path ||
-        values[5] != digest128_hex(expected.socket_path_digest))
+        values[5] != expected.socket_path ||
+        values[6] != digest128_hex(expected.socket_path_digest))
         return false;
     struct stat socket_info{};
     if (::lstat(expected.socket_path.c_str(), &socket_info) != 0 ||
@@ -657,7 +660,8 @@ std::optional<LaunchIncarnation> LaunchIdentityAllocator::allocate() noexcept {
         next_attempt_ == std::numeric_limits<uint64_t>::max())
         return std::nullopt;
     const local::Identity identity{generation_, next_attempt_++};
-    LaunchIncarnation incarnation{identity, f_store_guid_for_incarnation(identity)};
+    LaunchIncarnation incarnation{identity, c_store_guid_for_incarnation(identity),
+                                  f_store_guid_for_incarnation(identity)};
     if (!incarnation.valid())
         return std::nullopt;
     return incarnation;
@@ -689,6 +693,7 @@ bool Supervisor::prepare_lease() noexcept {
         }
         ReadyLease lease;
         lease.identity = incarnation->identity;
+        lease.c_store_guid = incarnation->c_store_guid;
         lease.f_store_guid = incarnation->f_store_guid;
         lease.private_directory = directory;
         lease.socket_path = lease.private_directory + "/cache.sock";
@@ -699,9 +704,30 @@ bool Supervisor::prepare_lease() noexcept {
         lease.socket_path_digest = digest128(lease.socket_path);
         lease.directory_device = directory_info.st_dev;
         lease.directory_inode = directory_info.st_ino;
+        local::Status listener_status = local::Status::Ok;
+        pending_listener_fd_ = local::listen_unix(lease.socket_path, 1, &listener_status);
+        if (pending_listener_fd_ < 0 || listener_status != local::Status::Ok) {
+            close_if_open(pending_listener_fd_);
+            (void)::unlink(lease.socket_path.c_str());
+            (void)::rmdir(directory);
+            return false;
+        }
+        struct stat listener_info{};
+        if (::fstat(pending_listener_fd_, &listener_info) != 0 ||
+            !S_ISSOCK(listener_info.st_mode) || listener_info.st_dev == 0 ||
+            listener_info.st_ino == 0) {
+            close_if_open(pending_listener_fd_);
+            (void)::unlink(lease.socket_path.c_str());
+            (void)::rmdir(directory);
+            return false;
+        }
+        lease.listener_device = listener_info.st_dev;
+        lease.listener_inode = listener_info.st_ino;
         pending_lease_ = std::move(lease);
         return true;
     } catch (...) {
+        close_if_open(pending_listener_fd_);
+        cleanup_lease(pending_lease_);
         return false;
     }
 }
@@ -1116,13 +1142,15 @@ bool Supervisor::terminate_child() noexcept {
  * the direct-child reap and becoming an orphan of the daemon.
  */
 void Supervisor::shutdown() noexcept {
-    if (child_pid_ < 0 && !process_group_owned_ && !has_private_fds()) {
+    if (child_pid_ < 0 && !process_group_owned_ && !has_private_fds() &&
+        pending_listener_fd_ < 0) {
         if (state_ != State::DegradedLegacy)
             state_ = State::Stopped;
         return;
     }
     increment_saturating(counters_.shutdowns);
     state_ = State::Stopping;
+    close_if_open(pending_listener_fd_);
     const bool proven_dead = terminate_child();
     if (proven_dead) {
         cleanup_lease(current_lease_);
@@ -1170,6 +1198,7 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
         last_failure_ = Failure::RestartExhausted;
         state_ = State::DegradedLegacy;
         current_lease_.reset();
+        close_if_open(pending_listener_fd_);
         pending_lease_.reset();
         return false;
     }
@@ -1197,6 +1226,7 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
         close_if_open(launch_gate[0]);
         close_if_open(launch_gate[1]);
         classify(Failure::Exec);
+        close_if_open(pending_listener_fd_);
         cleanup_lease(pending_lease_);
         return false;
     }
@@ -1208,6 +1238,7 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
         close_if_open(launch_gate[0]);
         close_if_open(launch_gate[1]);
         classify(Failure::Exec);
+        close_if_open(pending_listener_fd_);
         cleanup_lease(pending_lease_);
         return false;
     }
@@ -1220,9 +1251,11 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
     for (char** entry = environ; entry != nullptr && *entry != nullptr; ++entry) {
         const std::string value(*entry);
         const bool managed = value.rfind(std::string(kReadyFdEnvironment) + "=", 0) == 0 ||
+                             value.rfind(std::string(kListenerFdEnvironment) + "=", 0) == 0 ||
                              value.rfind("ICECC_CACHE_SERVICE_READY_FORMAT=", 0) == 0 ||
                              value.rfind("ICECC_CACHE_SERVICE_EXPECTED_GENERATION=", 0) == 0 ||
                              value.rfind("ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT=", 0) == 0 ||
+                             value.rfind("ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID=", 0) == 0 ||
                              value.rfind("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID=", 0) == 0 ||
                              value.rfind("ICECC_CACHE_SERVICE_EXPECTED_SOCKET=", 0) == 0 ||
                              value.rfind("ICECC_CACHE_SERVICE_EXPECTED_SOCKET_DIGEST=", 0) == 0;
@@ -1238,6 +1271,8 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
     if (!replaced)
         environment_storage.push_back(ready_env);
     if (pending_lease_.has_value()) {
+        environment_storage.push_back(std::string(kListenerFdEnvironment) + "=" +
+                                      std::to_string(pending_listener_fd_));
         environment_storage.push_back("ICECC_CACHE_SERVICE_READY_FORMAT=2");
         environment_storage.push_back("ICECC_CACHE_SERVICE_EXPECTED_GENERATION=" +
                                       std::to_string(pending_lease_->identity.generation));
@@ -1247,6 +1282,10 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
                                       bytes_hex(std::span<const uint8_t>(
                                           pending_lease_->f_store_guid.bytes.data(),
                                           pending_lease_->f_store_guid.bytes.size())));
+        environment_storage.push_back("ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID=" +
+                                      bytes_hex(std::span<const uint8_t>(
+                                          pending_lease_->c_store_guid.bytes.data(),
+                                          pending_lease_->c_store_guid.bytes.size())));
         environment_storage.push_back("ICECC_CACHE_SERVICE_EXPECTED_SOCKET=" +
                                       pending_lease_->socket_path);
         environment_storage.push_back("ICECC_CACHE_SERVICE_EXPECTED_SOCKET_DIGEST=" +
@@ -1270,6 +1309,7 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
     // close_range(CLOSE_RANGE_CLOEXEC); the fallback is only entered when
     // that syscall is unavailable.
     const int ambient_fd_limit = fallback_fd_limit();
+    const int inherited_listener_fd = pending_listener_fd_;
 
     const pid_t pid = ::fork();
     if (pid == 0) {
@@ -1305,6 +1345,12 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
             (void)write_errno_record(exec_pipe[1], error);
             _exit(127);
         }
+        if (inherited_listener_fd >= 0 &&
+            !set_cloexec(inherited_listener_fd, false)) {
+            const int error = errno == 0 ? EBADF : errno;
+            (void)write_errno_record(exec_pipe[1], error);
+            _exit(127);
+        }
         ::execve(config_.executable.c_str(), argv.data(), environment.data());
         const int error = errno;
         (void)write_errno_record(exec_pipe[1], error);
@@ -1313,6 +1359,9 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
     close_if_open(ready_pipe[1]);
     close_if_open(exec_pipe[1]);
     close_if_open(launch_gate[0]);
+    // The daemon's copy must not remain a second listener owner.  The child
+    // has the only non-CLOEXEC copy after the pre-exec boundary.
+    close_if_open(pending_listener_fd_);
     if (pid < 0) {
         close_if_open(ready_pipe[0]);
         close_if_open(exec_pipe[0]);

@@ -26,14 +26,15 @@ closed.
 
 The service refuses uid or gid zero. A privileged launcher must provide both
 nonzero `--drop-uid` and `--drop-gid`; the process clears supplementary groups,
-sets gid then uid, and proves real/effective/saved ids before binding.
+sets gid then uid, and proves real/effective/saved ids before adopting the
+pre-bound listener.
 
 The installed F-store GUID is the complete authenticated incarnation:
 generation and attempt are encoded independently. Consequently a restart
 with the same generation and a new attempt cannot reopen the prior empty-store
 identity.
 
-Under the supervisor, six environment fields form one immutable all-or-none
+Under the supervisor, seven environment fields form one immutable all-or-none
 launch tuple:
 
 ```
@@ -41,25 +42,34 @@ ICECC_CACHE_SERVICE_READY_FORMAT=2
 ICECC_CACHE_SERVICE_EXPECTED_GENERATION=...
 ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT=...
 ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID=...
+ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID=...
 ICECC_CACHE_SERVICE_EXPECTED_SOCKET=...
 ICECC_CACHE_SERVICE_EXPECTED_SOCKET_DIGEST=...
 ```
 
 Any partial tuple, reserved/wrapping identity, noncanonical GUID, path, or
-digest exits before binding. A complete valid tuple overrides stale
+digest exits before listener adoption. A complete valid tuple overrides stale
 command-line identity/path values; the supervisor, not a static CLI pathname,
 owns the incarnation. The service uses that effective identity throughout
 runtime and request handling.
 
+The supervisor creates the private `0700` lease directory and binds the unique
+AF_UNIX listener before `fork()`. It passes the descriptor as
+`ICECC_CACHE_SERVICE_LISTENER_FD`; the child clears `CLOEXEC` on that one
+descriptor, drops privileges, and adopts it with `fstat(2)`. Structured mode
+never calls `bind(2)` or unlinks the pathname. The parent performs
+identity-checked deletion after the supervised process group is proven dead.
+
 ## Readiness, signal shutdown, and control
 
 `ICECC_CACHE_SERVICE_READY_FD` is mandatory and names an already-open decimal
-descriptor. After privilege checks, bind, listen, and pathname identity capture
-complete, the service writes legacy `READY\n` only for the standalone form. A
-structured supervisor launch writes the exact READY-v2 generation, attempt,
-PID, F-store GUID, path, digest, and pathname `lstat` device/inode frame. A
-short/interrupted/failing write exits nonzero and performs identity-checked
-listener cleanup; no earlier failure emits readiness.
+descriptor. After privilege checks and listener identity capture complete, the
+service writes legacy `READY\n` only for the standalone form. A structured
+supervisor launch writes the exact READY-v2 generation, attempt, PID,
+domain-separated nonzero C/F store GUIDs, path, digest, and listener
+device/inode frame. A short/interrupted/failing write exits nonzero; the
+supervisor owns structured pathname cleanup and no earlier failure emits
+readiness.
 
 SIGTERM and SIGINT handlers perform only the async-signal-safe action of
 setting a flag and writing a byte to an internal nonblocking wake pipe. The

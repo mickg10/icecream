@@ -54,6 +54,7 @@ struct OnDemandEndpoint {
     std::string socket_path;
     local::CredentialExpectation expected_peer;
     local::Identity lease_identity{};
+    CStoreGuid c_store_guid{};
     FStoreGuid f_store_guid{};
     icecc::Digest128 socket_path_digest{};
     dev_t listener_device = 0;

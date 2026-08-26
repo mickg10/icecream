@@ -63,6 +63,8 @@ inline bool canonical_absolute_lease_path(std::string_view path) noexcept {
 // the only descriptor deliberately cleared in the pre-exec child.
 inline constexpr std::string_view kReadyFdEnvironment =
     "ICECC_CACHE_SERVICE_READY_FD";
+inline constexpr std::string_view kListenerFdEnvironment =
+    "ICECC_CACHE_SERVICE_LISTENER_FD";
 
 enum class State : uint8_t {
     Stopped = 0,
@@ -85,12 +87,15 @@ enum class Failure : uint8_t {
 
 struct LaunchIncarnation {
     local::Identity identity{};
+    CStoreGuid c_store_guid{};
     FStoreGuid f_store_guid{};
 
     [[nodiscard]] bool valid() const noexcept {
         return identity.generation != 0 && identity.attempt != 0 &&
-               f_store_guid != FStoreGuid{} &&
-               f_store_guid == f_store_guid_for_incarnation(identity);
+        c_store_guid != CStoreGuid{} && f_store_guid != FStoreGuid{} &&
+        c_store_guid != f_store_guid &&
+        c_store_guid == c_store_guid_for_incarnation(identity) &&
+        f_store_guid == f_store_guid_for_incarnation(identity);
     }
 };
 
@@ -133,6 +138,7 @@ struct Config {
 struct ReadyLease {
     local::Identity identity{};
     pid_t pid = -1;
+    CStoreGuid c_store_guid{};
     FStoreGuid f_store_guid{};
     std::string private_directory;
     std::string socket_path;
@@ -144,7 +150,9 @@ struct ReadyLease {
 
     [[nodiscard]] bool valid() const noexcept {
         if (identity.generation == 0 || identity.attempt == 0 || pid <= 1 ||
+            c_store_guid != c_store_guid_for_incarnation(identity) ||
             f_store_guid != f_store_guid_for_incarnation(identity) ||
+            c_store_guid == f_store_guid ||
             !detail::canonical_absolute_lease_path(private_directory) ||
             private_directory.size() + sizeof("/cache.sock") - 1 > local::kMaxUnixPath ||
             socket_path.size() != private_directory.size() + sizeof("/cache.sock") - 1 ||
@@ -251,6 +259,9 @@ private:
     std::vector<std::chrono::steady_clock::time_point> restart_times_;
     std::optional<ReadyLease> pending_lease_;
     std::optional<ReadyLease> current_lease_;
+    // The daemon owns this pre-bound listener until fork; the child receives
+    // the sole CLOEXEC-cleared copy and adopts it after dropping privileges.
+    int pending_listener_fd_ = -1;
 };
 
 } // namespace icecc::p50::sidecar
