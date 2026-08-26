@@ -9,19 +9,19 @@ set:
 * a P50 job may add exactly one accepted sealed source descriptor, bound to its
   nonzero `InputFdRequest::request_id` DeliveryId through a move-only,
   owner-minted `ForkSourceLease`; a numeric DeliveryId is never authority;
-  the lease explicitly separates its borrowed handoff FD from an independent
-  owned proof duplicate. Move-assignment and destruction retire only the owned
-  proof; the caller-owned handoff number is never closed by the lease. Proof
-  retirement revalidates immutable file identity before closing and abandons a
-  closed/reused proof number rather than risking an unrelated close;
+  the lease explicitly separates its borrowed handoff FD from a private proof
+  and control pair. Move-assignment and destruction retire only those private
+  handles; the caller-owned handoff number is never closed by the lease. The
+  test seam's proof observation slot is caller-owned and may be replaced at
+  any time, including with a same-OFD `dup3` handoff;
 * source handoffs are sealed immutable memfds: unsealed mutable regular files
   are rejected at mint, so a same-size content mutation cannot pass the
   mint-to-sweep identity checks.  The owned proof is reopened as a distinct
   kernel open-file description and paired with a hidden control handle;
-  Linux `kcmp(KCMP_FILE)` proves that the proof slot still names that OFD
-  before retirement.  If the caller closes the proof and `dup3`s the borrowed
-  handoff into its old number, retirement fails closed and never closes the
-  caller's replacement;
+  Linux `kcmp(KCMP_FILE)` proves the private proof/control pair and proves
+  that neither private handle shares an OFD with the borrowed handoff at mint.
+  If `kcmp` is unavailable or denied during retirement, both private handles
+  are still retired while the caller's numeric-slot replacement is untouched;
 * every keep descriptor is distinct, owned by this process, of the expected
   type (FIFO, connected stream socket, regular file), with the statistics pipe
   write-only, client socket read/write, source read-only, and all channels

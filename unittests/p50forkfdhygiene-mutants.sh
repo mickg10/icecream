@@ -14,7 +14,8 @@ proof_dir=
 mutable_dir=
 mutant_dir=
 alias_dir=
-trap 'rm -f "$mutant"; rm -rf "$mutant_dir" "$identity_dir" "$move_dir" "$proof_dir" "$mutable_dir" "$alias_dir"' EXIT HUP INT TERM
+kcmp_dir=
+trap 'rm -f "$mutant"; rm -rf "$mutant_dir" "$identity_dir" "$move_dir" "$proof_dir" "$mutable_dir" "$alias_dir" "$kcmp_dir"' EXIT HUP INT TERM
 
 # A real runtime mutant changes the accepted source DeliveryId while the
 # owner still authorizes 77.  The mutant must fail before any sweep runs.
@@ -74,12 +75,13 @@ if "$move_dir/test" >/dev/null 2>&1; then
 fi
 rm -rf "$move_dir"
 
-# A true retirement mutant closes a reused proof-FD number without checking
-# its kernel open-file description.  The executable owner/lease proof-reuse rows must catch
-# that double-close/unrelated-close hazard.
+# A true retirement-ownership mutant exposes the private proof handle as the
+# caller-reusable numeric slot.  The executable owner/lease proof-reuse rows
+# must catch the resulting close of a caller replacement.
 proof_dir=$(mktemp -d "${TMPDIR:-/tmp}/p50forkfdhygiene-proof-mutant.XXXXXX")
 mkdir -p "$proof_dir/daemon" "$proof_dir/unittests"
-sed 's/same_open_file_description(proof, control)/true/' \
+sed -e 's/return owner\.proof_slot_fd_;/return owner.owned_proof_fd_;/' \
+    -e 's/return lease\.proof_slot_fd_;/return lease.owned_proof_fd_;/' \
     "$source" >"$proof_dir/daemon/p50_fork_fd_hygiene.cpp"
 cp "$header" "$proof_dir/daemon/p50_fork_fd_hygiene.h"
 cp "$test" "$proof_dir/unittests/p50_fork_fd_hygiene_test.cpp"
@@ -93,13 +95,34 @@ if "$proof_dir/test" >/dev/null 2>&1; then
 fi
 rm -rf "$proof_dir"
 
+# A true error-mode mutant restores the rejected behavior: a failed kcmp
+# suppresses proof retirement.  The ENOSYS/EPERM/EINTR executable rows must
+# observe the resulting private-handle leak.
+kcmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/p50forkfdhygiene-kcmp-mutant.XXXXXX")
+mkdir -p "$kcmp_dir/daemon" "$kcmp_dir/unittests"
+sed 's/const bool proof_closed = proof < 0 || close_exact(proof);/const bool proof_closed = proof < 0 || (proved \&\& close_exact(proof));/' \
+    "$source" >"$kcmp_dir/daemon/p50_fork_fd_hygiene.cpp"
+cp "$header" "$kcmp_dir/daemon/p50_fork_fd_hygiene.h"
+cp "$test" "$kcmp_dir/unittests/p50_fork_fd_hygiene_test.cpp"
+"$cxx" "$standard" -Wall -Wextra -Werror \
+    -DICECC_P50_FORK_FD_HYGIENE_TEST_HOOKS -I"$kcmp_dir" \
+    "$kcmp_dir/unittests/p50_fork_fd_hygiene_test.cpp" \
+    "$kcmp_dir/daemon/p50_fork_fd_hygiene.cpp" -o "$kcmp_dir/test"
+if "$kcmp_dir/test" >/dev/null 2>&1; then
+    echo 'FAIL: kcmp unavailable/denied retirement mutant survived' >&2
+    exit 1
+fi
+rm -rf "$kcmp_dir"
+
 # The mint boundary must reject an owner proof whose integer slot aliases the
 # borrowed handoff.  Removing that explicit check transfers the handoff into
 # the lease and its destructor closes the caller-owned descriptor; the alias
 # regression makes this true mutant fail at runtime.
 alias_dir=$(mktemp -d "${TMPDIR:-/tmp}/p50forkfdhygiene-alias-mutant.XXXXXX")
 mkdir -p "$alias_dir/daemon" "$alias_dir/unittests"
-sed 's/owner\.owned_proof_fd_ == fd/false/' \
+sed -e 's/owner\.owned_proof_fd_ == fd/false/' \
+    -e 's/proof_handoff != OpenFileComparison::Different/static_cast<int>(proof_handoff) + ::getpid() >= 0/' \
+    -e 's/control_handoff != OpenFileComparison::Different/static_cast<int>(control_handoff) + ::getpid() >= 0/' \
     "$source" >"$alias_dir/daemon/p50_fork_fd_hygiene.cpp"
 cp "$header" "$alias_dir/daemon/p50_fork_fd_hygiene.h"
 cp "$test" "$alias_dir/unittests/p50_fork_fd_hygiene_test.cpp"

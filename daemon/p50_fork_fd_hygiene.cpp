@@ -26,6 +26,10 @@ namespace icecc::p50::forkfd {
 
 namespace {
 
+#if defined(ICECC_P50_FORK_FD_HYGIENE_TEST_HOOKS)
+TestHooks hooks;
+#endif
+
 bool close_exact(int fd) noexcept {
     for (;;) {
         if (::close(fd) == 0)
@@ -87,18 +91,40 @@ bool source_identity_matches(int fd, const SourceIdentity& expected) noexcept {
 // can close the proof number and dup3() the borrowed handoff into that slot,
 // producing the same immutable file identity.  Unsupported or denied kcmp is
 // deliberately a failure, because retiring an unproven descriptor is unsafe.
-bool same_open_file_description(int left, int right) noexcept {
+enum class OpenFileComparison : uint8_t { Same, Different, Unavailable };
+
+OpenFileComparison compare_open_file_description(int left, int right) noexcept {
 #if defined(__linux__) && defined(SYS_kcmp)
     if (left < 0 || right < 0)
-        return false;
+        return OpenFileComparison::Unavailable;
+#if defined(ICECC_P50_FORK_FD_HYGIENE_TEST_HOOKS)
+    if (hooks.force_kcmp_errno != 0) {
+        if (hooks.force_kcmp_after_calls > 0)
+            --hooks.force_kcmp_after_calls;
+        else {
+            errno = hooks.force_kcmp_errno;
+            return OpenFileComparison::Unavailable;
+        }
+    }
+#endif
     errno = 0;
-    return ::syscall(SYS_kcmp, static_cast<long>(::getpid()),
-                     static_cast<long>(::getpid()), 0, left, right) == 0;
+    const long result = ::syscall(SYS_kcmp, static_cast<long>(::getpid()),
+                                  static_cast<long>(::getpid()), 0, left, right);
+    if (result == 0)
+        return OpenFileComparison::Same;
+    if (errno == ENOSYS || errno == EPERM || errno == EINTR)
+        return OpenFileComparison::Unavailable;
+    return OpenFileComparison::Different;
 #else
     (void)left;
     (void)right;
-    return false;
+    return OpenFileComparison::Unavailable;
 #endif
+}
+
+bool same_open_file_description(int left, int right) noexcept {
+    return compare_open_file_description(left, right) ==
+           OpenFileComparison::Same;
 }
 
 // Open /proc/self/fd rather than F_DUPFD: the former creates a new open-file
@@ -128,29 +154,35 @@ int open_independent_readonly(int fd) noexcept {
 }
 #endif
 
-// Retire only after proving that the proof number still names the OFD held by
-// the hidden control handle and that it still has the expected identity.
-// Forget both integer slots first.  On any mismatch, close only the hidden
-// control handle and leave the caller-owned proof-slot replacement untouched.
+// The proof and control handles passed here are private ownership handles.
+// They are never exposed as a caller-reusable numeric slot.  Consequently a
+// failed kcmp (including ENOSYS/EPERM/EINTR) cannot justify touching any
+// caller descriptor, but it is still safe and mandatory to retire both
+// private handles.  Do not clear the slots before close: a close failure must
+// leave the still-owned number available for a later destructor/assignment.
 bool retire_owned_proof(int* proof_fd, int* control_fd,
                         const SourceIdentity& expected) noexcept {
-    if (proof_fd == nullptr || control_fd == nullptr || *proof_fd < 0 ||
-        *control_fd < 0 || *proof_fd == *control_fd)
+    if (proof_fd == nullptr || control_fd == nullptr)
         return false;
     const int proof = *proof_fd;
     const int control = *control_fd;
-    *proof_fd = -1;
-    *control_fd = -1;
-
-    const bool proved = same_open_file_description(proof, control) &&
+    if (proof >= 0 && proof == control) {
+        const bool closed = close_exact(proof);
+        if (closed)
+            *proof_fd = *control_fd = -1;
+        return false;
+    }
+    const bool proved = proof >= 0 && control >= 0 &&
+                        compare_open_file_description(proof, control) ==
+                            OpenFileComparison::Same &&
                         source_identity_matches(proof, expected);
-    bool retired = false;
-    if (proved)
-        retired = close_exact(proof);
-    // The control handle is never exposed to the delivery caller.  It is safe
-    // to retire it even when the public proof number was externally replaced.
-    const bool control_closed = close_exact(control);
-    return proved && retired && control_closed;
+    const bool proof_closed = proof < 0 || close_exact(proof);
+    if (proof < 0 || proof_closed)
+        *proof_fd = -1;
+    const bool control_closed = control < 0 || close_exact(control);
+    if (control < 0 || control_closed)
+        *control_fd = -1;
+    return proved && proof_closed && control_closed;
 }
 
 #if defined(ICECC_P50_FORK_FD_HYGIENE_TEST_HOOKS)
@@ -183,22 +215,26 @@ DeliveryOwnerToken::DeliveryOwnerToken(int expected_fd,
                                        uint64_t expected_delivery_id,
                                        int owned_proof_fd, int control_fd,
                                        SourceIdentity identity,
-                                       uint64_t owner_cookie) noexcept
+                                       uint64_t owner_cookie,
+                                       int proof_slot_fd) noexcept
     : expected_fd_(expected_fd), expected_delivery_id_(expected_delivery_id),
       owned_proof_fd_(owned_proof_fd), control_fd_(control_fd),
-      identity_(identity), owner_cookie_(owner_cookie) {}
+      proof_slot_fd_(proof_slot_fd), identity_(identity),
+      owner_cookie_(owner_cookie) {}
 
 DeliveryOwnerToken::DeliveryOwnerToken(DeliveryOwnerToken&& other) noexcept
     : expected_fd_(other.expected_fd_),
       expected_delivery_id_(other.expected_delivery_id_),
       owned_proof_fd_(other.owned_proof_fd_),
       control_fd_(other.control_fd_),
+      proof_slot_fd_(other.proof_slot_fd_),
       identity_(other.identity_),
       owner_cookie_(other.owner_cookie_) {
     other.expected_fd_ = -1;
     other.expected_delivery_id_ = 0;
     other.owned_proof_fd_ = -1;
     other.control_fd_ = -1;
+    other.proof_slot_fd_ = -1;
     other.identity_ = SourceIdentity{};
     other.owner_cookie_ = 0;
 }
@@ -210,12 +246,14 @@ DeliveryOwnerToken& DeliveryOwnerToken::operator=(DeliveryOwnerToken&& other) no
         expected_delivery_id_ = other.expected_delivery_id_;
         owned_proof_fd_ = other.owned_proof_fd_;
         control_fd_ = other.control_fd_;
+        proof_slot_fd_ = other.proof_slot_fd_;
         identity_ = other.identity_;
         owner_cookie_ = other.owner_cookie_;
         other.expected_fd_ = -1;
         other.expected_delivery_id_ = 0;
         other.owned_proof_fd_ = -1;
         other.control_fd_ = -1;
+        other.proof_slot_fd_ = -1;
         other.identity_ = SourceIdentity{};
         other.owner_cookie_ = 0;
     }
@@ -229,10 +267,11 @@ DeliveryOwnerToken::~DeliveryOwnerToken() {
 ForkSourceLease::ForkSourceLease(int fd, uint64_t delivery_id, int expected_fd,
                                  uint64_t expected_delivery_id, int owner_fd,
                                  int control_fd, SourceIdentity identity,
-                                 uint64_t owner_cookie) noexcept
+                                 uint64_t owner_cookie,
+                                 int proof_slot_fd) noexcept
     : borrowed_handoff_fd_(fd), delivery_id_(delivery_id), expected_fd_(expected_fd),
       expected_delivery_id_(expected_delivery_id), owned_proof_fd_(owner_fd),
-      control_fd_(control_fd),
+      control_fd_(control_fd), proof_slot_fd_(proof_slot_fd),
       identity_(identity), owner_cookie_(owner_cookie) {}
 
 ForkSourceLease::ForkSourceLease(ForkSourceLease&& other) noexcept
@@ -241,6 +280,7 @@ ForkSourceLease::ForkSourceLease(ForkSourceLease&& other) noexcept
       expected_delivery_id_(other.expected_delivery_id_),
       owned_proof_fd_(other.owned_proof_fd_),
       control_fd_(other.control_fd_),
+      proof_slot_fd_(other.proof_slot_fd_),
       identity_(other.identity_),
       owner_cookie_(other.owner_cookie_) {
     other.borrowed_handoff_fd_ = -1;
@@ -249,6 +289,7 @@ ForkSourceLease::ForkSourceLease(ForkSourceLease&& other) noexcept
     other.expected_delivery_id_ = 0;
     other.owned_proof_fd_ = -1;
     other.control_fd_ = -1;
+    other.proof_slot_fd_ = -1;
     other.identity_ = SourceIdentity{};
     other.owner_cookie_ = 0;
 }
@@ -264,6 +305,7 @@ ForkSourceLease& ForkSourceLease::operator=(ForkSourceLease&& other) noexcept {
         expected_delivery_id_ = other.expected_delivery_id_;
         owned_proof_fd_ = other.owned_proof_fd_;
         control_fd_ = other.control_fd_;
+        proof_slot_fd_ = other.proof_slot_fd_;
         identity_ = other.identity_;
         owner_cookie_ = other.owner_cookie_;
         other.borrowed_handoff_fd_ = -1;
@@ -272,6 +314,7 @@ ForkSourceLease& ForkSourceLease::operator=(ForkSourceLease&& other) noexcept {
         other.expected_delivery_id_ = 0;
         other.owned_proof_fd_ = -1;
         other.control_fd_ = -1;
+        other.proof_slot_fd_ = -1;
         other.identity_ = SourceIdentity{};
         other.owner_cookie_ = 0;
     }
@@ -295,23 +338,34 @@ bool ForkSourceLease::identity_matches_current() const noexcept {
 std::optional<ForkSourceLease>
 mint_fork_source_lease(DeliveryOwnerToken&& owner, int fd,
                        uint64_t delivery_id) noexcept {
+    const OpenFileComparison proof_control =
+        compare_open_file_description(owner.owned_proof_fd_, owner.control_fd_);
+    const OpenFileComparison proof_handoff =
+        compare_open_file_description(owner.owned_proof_fd_, fd);
+    const OpenFileComparison control_handoff =
+        compare_open_file_description(owner.control_fd_, fd);
     if (owner.owner_cookie_ == 0 || owner.expected_fd_ < 0 ||
         owner.owned_proof_fd_ < 0 || owner.control_fd_ < 0 ||
-        owner.owned_proof_fd_ == fd || !owner.identity_.valid() ||
+        owner.owned_proof_fd_ == owner.control_fd_ ||
+        owner.owned_proof_fd_ == fd || owner.control_fd_ == fd ||
+        !owner.identity_.valid() ||
         owner.expected_delivery_id_ == 0 || fd != owner.expected_fd_ ||
         delivery_id != owner.expected_delivery_id_ ||
-        !same_open_file_description(owner.owned_proof_fd_, owner.control_fd_) ||
+        proof_control != OpenFileComparison::Same ||
+        proof_handoff != OpenFileComparison::Different ||
+        control_handoff != OpenFileComparison::Different ||
         !source_identity_matches(owner.owned_proof_fd_, owner.identity_) ||
         !source_identity_matches(fd, owner.identity_))
         return std::nullopt;
     ForkSourceLease result(fd, delivery_id, owner.expected_fd_,
                            owner.expected_delivery_id_, owner.owned_proof_fd_,
                            owner.control_fd_, owner.identity_,
-                           owner.owner_cookie_);
+                           owner.owner_cookie_, owner.proof_slot_fd_);
     owner.expected_fd_ = -1;
     owner.expected_delivery_id_ = 0;
     owner.owned_proof_fd_ = -1;
     owner.control_fd_ = -1;
+    owner.proof_slot_fd_ = -1;
     owner.identity_ = SourceIdentity{};
     owner.owner_cookie_ = 0;
     return result;
@@ -323,10 +377,6 @@ constexpr int kFirstNonstandardFd = STDERR_FILENO + 1;
 constexpr size_t kMaxEnumeratedFds = 65536;
 constexpr size_t kMaxProcReads = 4096;
 constexpr size_t kMaxProcBytes = size_t{16} << 20;
-#if defined(ICECC_P50_FORK_FD_HYGIENE_TEST_HOOKS)
-TestHooks hooks;
-#endif
-
 bool injected_proc_failure() noexcept {
 #if defined(ICECC_P50_FORK_FD_HYGIENE_TEST_HOOKS)
     return hooks.force_proc_failure;
@@ -718,25 +768,30 @@ test_make_delivery_owner(int expected_fd, uint64_t expected_delivery_id) noexcep
         return std::nullopt;
     const int owner_fd = open_independent_readonly(expected_fd);
     const int control_fd = owner_fd >= 0 ? duplicate_owner_fd(owner_fd) : -1;
-    if (owner_fd < 0 || control_fd < 0 ||
+    const int proof_slot_fd = owner_fd >= 0 ? open_independent_readonly(expected_fd) : -1;
+    if (owner_fd < 0 || control_fd < 0 || proof_slot_fd < 0 ||
         !same_open_file_description(owner_fd, control_fd) ||
+        same_open_file_description(owner_fd, proof_slot_fd) ||
         !source_identity_matches(owner_fd, identity)) {
         if (owner_fd >= 0)
             (void)::close(owner_fd);
         if (control_fd >= 0)
             (void)::close(control_fd);
+        if (proof_slot_fd >= 0)
+            (void)::close(proof_slot_fd);
         return std::nullopt;
     }
     return DeliveryOwnerToken(expected_fd, expected_delivery_id, owner_fd,
-                              control_fd, identity, kTestOwnerCookie);
+                              control_fd, identity, kTestOwnerCookie,
+                              proof_slot_fd);
 }
 
 int test_delivery_owner_proof_fd(const DeliveryOwnerToken& owner) noexcept {
-    return owner.owned_proof_fd_;
+    return owner.proof_slot_fd_;
 }
 
 int test_fork_source_lease_proof_fd(const ForkSourceLease& lease) noexcept {
-    return lease.owned_proof_fd_;
+    return lease.proof_slot_fd_;
 }
 
 std::optional<DeliveryOwnerToken>
@@ -755,6 +810,32 @@ test_make_delivery_owner_alias(int expected_fd,
     if (control < 0)
         return std::nullopt;
     owner->owned_proof_fd_ = expected_fd;
+    owner->control_fd_ = control;
+    return owner;
+}
+
+std::optional<DeliveryOwnerToken>
+test_make_delivery_owner_control_alias(int expected_fd,
+                                       uint64_t expected_delivery_id) noexcept {
+    auto owner = test_make_delivery_owner(expected_fd, expected_delivery_id);
+    if (!owner.has_value())
+        return std::nullopt;
+    const int old_proof = owner->owned_proof_fd_;
+    const int old_control = owner->control_fd_;
+    if (old_proof >= 0)
+        (void)::close(old_proof);
+    if (old_control >= 0)
+        (void)::close(old_control);
+    const int proof = open_independent_readonly(expected_fd);
+    const int control = duplicate_owner_fd(expected_fd);
+    if (proof < 0 || control < 0) {
+        if (proof >= 0)
+            (void)::close(proof);
+        if (control >= 0)
+            (void)::close(control);
+        return std::nullopt;
+    }
+    owner->owned_proof_fd_ = proof;
     owner->control_fd_ = control;
     return owner;
 }

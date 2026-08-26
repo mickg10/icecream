@@ -46,7 +46,7 @@ public:
 private:
     DeliveryOwnerToken(int expected_fd, uint64_t expected_delivery_id,
                        int owned_proof_fd, int control_fd, SourceIdentity identity,
-                       uint64_t owner_cookie) noexcept;
+                       uint64_t owner_cookie, int proof_slot_fd = -1) noexcept;
     int expected_fd_ = -1;
     uint64_t expected_delivery_id_ = 0;
     // This duplicate is owned by the token.  The delivery handoff itself is
@@ -57,6 +57,11 @@ private:
     // control handle lets retirement compare the actual kernel OFD and fail
     // closed before touching a replacement.
     int control_fd_ = -1;
+    // Test-only observation slot.  It is deliberately not an ownership
+    // handle: a delivery caller may close and reuse this number, including
+    // with dup3() of the borrowed handoff.  The private proof/control pair
+    // below remains the sole retirement authority.
+    int proof_slot_fd_ = -1;
     SourceIdentity identity_{};
     uint64_t owner_cookie_ = 0;
 
@@ -66,6 +71,9 @@ private:
     friend std::optional<DeliveryOwnerToken>
     test_make_delivery_owner_alias(int expected_fd,
                                    uint64_t expected_delivery_id) noexcept;
+    friend std::optional<DeliveryOwnerToken>
+    test_make_delivery_owner_control_alias(int expected_fd,
+                                            uint64_t expected_delivery_id) noexcept;
     friend void test_disarm_delivery_owner(DeliveryOwnerToken&) noexcept;
     friend std::optional<ForkSourceLease>
     mint_fork_source_lease(DeliveryOwnerToken&& owner, int fd,
@@ -105,7 +113,7 @@ private:
     ForkSourceLease(int fd, uint64_t delivery_id, int expected_fd,
                     uint64_t expected_delivery_id, int owned_proof_fd,
                     int control_fd, SourceIdentity identity,
-                    uint64_t owner_cookie) noexcept;
+                    uint64_t owner_cookie, int proof_slot_fd = -1) noexcept;
     // The handoff descriptor is borrowed from the delivery caller.  A lease
     // may validate it and keep its number, but must never close it (including
     // when move-assignment replaces this lease).
@@ -117,6 +125,9 @@ private:
     // descriptor its destructor may retire.
     int owned_proof_fd_ = -1;
     int control_fd_ = -1;
+    // See DeliveryOwnerToken::proof_slot_fd_.  This slot is never closed by
+    // lease retirement or move/destruction.
+    int proof_slot_fd_ = -1;
     SourceIdentity identity_{};
     uint64_t owner_cookie_ = 0;
 
@@ -171,6 +182,13 @@ struct TestHooks {
     bool force_proc_failure = false;
     bool force_parse_failure = false;
     bool force_proc_close_ebadf = false;
+    // If non-zero, make the test-only kcmp seam fail with this errno.  The
+    // production path has no fallback for OFD comparison; retirement must
+    // nevertheless dispose of its private ownership handles safely.
+    int force_kcmp_errno = 0;
+    // Number of successful comparison calls to permit before injecting the
+    // errno above.  This lets fork tests reach retirement after validation.
+    int force_kcmp_after_calls = 0;
     int fail_close_fd = -1;
 };
 
@@ -184,6 +202,9 @@ int test_fork_source_lease_proof_fd(const ForkSourceLease&) noexcept;
 std::optional<DeliveryOwnerToken>
 test_make_delivery_owner_alias(int expected_fd,
                                uint64_t expected_delivery_id) noexcept;
+std::optional<DeliveryOwnerToken>
+test_make_delivery_owner_control_alias(int expected_fd,
+                                       uint64_t expected_delivery_id) noexcept;
 void test_disarm_delivery_owner(DeliveryOwnerToken&) noexcept;
 #endif
 

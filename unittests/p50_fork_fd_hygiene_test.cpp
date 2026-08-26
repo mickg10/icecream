@@ -356,24 +356,31 @@ void test_same_number_replacement_and_transfer() {
 
     Inventory transfer_inventory = make_inventory(true);
     const size_t before = open_fd_count();
+    int transfer_slot = -1;
     {
         auto transfer_owner = icecc::p50::forkfd::test_make_delivery_owner(
             transfer_inventory.source, kAcceptedDeliveryId);
         require(transfer_owner.has_value(), "transfer owner token was not minted");
         const size_t after_owner = open_fd_count();
-        require(after_owner == before + 2,
-                "owner token did not retain proof and control handles");
+        require(after_owner == before + 3,
+                "owner token did not retain private handles and proof slot");
         auto transfer_lease = icecc::p50::forkfd::mint_fork_source_lease(
             std::move(*transfer_owner), transfer_inventory.source,
             kAcceptedDeliveryId);
         require(transfer_lease.has_value(), "transfer lease was not minted");
         require(open_fd_count() == after_owner,
                 "mint changed descriptor ownership count unexpectedly");
+        transfer_slot = icecc::p50::forkfd::test_fork_source_lease_proof_fd(
+            *transfer_lease);
     }
-    require(open_fd_count() == before,
-            "lease destruction leaked or double-closed its proof descriptor");
+    require(open_fd_count() == before + 1,
+            "lease destruction leaked or double-closed its private handles");
     require(::fcntl(transfer_inventory.source, F_GETFD) >= 0,
             "lease incorrectly closed the handoff descriptor");
+    require(transfer_slot >= 0 && ::close(transfer_slot) == 0,
+            "caller-owned proof slot was not released by the test owner");
+    require(open_fd_count() == before,
+            "caller-owned proof slot cleanup was not exact");
 #endif
 }
 
@@ -478,14 +485,37 @@ void test_move_assignment_and_proof_reuse() {
     auto alias_owner = icecc::p50::forkfd::test_make_delivery_owner_alias(
         inventory.source, kAcceptedDeliveryId);
     require(alias_owner.has_value(), "alias owner token was not fabricated");
+    const int alias_slot =
+        icecc::p50::forkfd::test_delivery_owner_proof_fd(*alias_owner);
     auto alias_lease = icecc::p50::forkfd::mint_fork_source_lease(
         std::move(*alias_owner), inventory.source, kAcceptedDeliveryId);
     require(!alias_lease.has_value(),
             "mint accepted owned proof FD equal to borrowed handoff FD");
     if (alias_owner.has_value())
         icecc::p50::forkfd::test_disarm_delivery_owner(*alias_owner);
+    require(alias_slot >= 0 && ::close(alias_slot) == 0,
+            "alias proof slot cleanup failed");
     require(::fcntl(inventory.source, F_GETFD) >= 0,
             "alias-boundary rejection damaged the caller handoff");
+
+    auto control_alias_owner =
+        icecc::p50::forkfd::test_make_delivery_owner_control_alias(
+            inventory.source, kAcceptedDeliveryId);
+    require(control_alias_owner.has_value(),
+            "control-alias owner token was not fabricated");
+    const int control_alias_slot =
+        icecc::p50::forkfd::test_delivery_owner_proof_fd(*control_alias_owner);
+    auto control_alias_lease = icecc::p50::forkfd::mint_fork_source_lease(
+        std::move(*control_alias_owner), inventory.source,
+        kAcceptedDeliveryId);
+    require(!control_alias_lease.has_value(),
+            "mint accepted private control sharing the borrowed OFD");
+    if (control_alias_owner.has_value())
+        icecc::p50::forkfd::test_disarm_delivery_owner(*control_alias_owner);
+    require(control_alias_slot >= 0 && ::close(control_alias_slot) == 0,
+            "control-alias proof slot cleanup failed");
+    require(::fcntl(inventory.source, F_GETFD) >= 0,
+            "control-alias rejection damaged the caller handoff");
 #endif
 }
 
@@ -536,6 +566,124 @@ void test_fallback_and_injected_failures() {
             "/proc directory EBADF close failure was ignored");
 }
 
+void test_kcmp_errors_retire_private_handles() {
+#if defined(__linux__)
+    for (const int error : {ENOSYS, EPERM, EINTR}) {
+        Inventory inventory = make_inventory(true);
+        const size_t before = open_fd_count();
+
+        auto owner = icecc::p50::forkfd::test_make_delivery_owner(
+            inventory.source, kAcceptedDeliveryId);
+        require(owner.has_value(), "kcmp-error owner token was not minted");
+        const int owner_slot =
+            icecc::p50::forkfd::test_delivery_owner_proof_fd(*owner);
+        require(owner_slot >= 0, "owner proof observation slot was not minted");
+        auto hooks = icecc::p50::forkfd::TestHooks{};
+        hooks.force_kcmp_errno = error;
+        icecc::p50::forkfd::set_test_hooks(hooks);
+        owner.reset();
+        // The private proof/control pair is gone; the caller-owned slot is
+        // deliberately still live and must be cleaned by its caller.
+        require(::fcntl(owner_slot, F_GETFD) >= 0,
+                "kcmp-error token retirement closed caller proof slot");
+        require(open_fd_count() == before + 1,
+                "kcmp-error token retirement leaked a private descriptor");
+        require(::close(owner_slot) == 0, "owner proof slot cleanup failed");
+
+        icecc::p50::forkfd::reset_test_hooks();
+        auto lease_owner = icecc::p50::forkfd::test_make_delivery_owner(
+            inventory.source, kAcceptedDeliveryId);
+        require(lease_owner.has_value(), "kcmp-error lease owner was not minted");
+        // Hooks are reset for the mint boundary: injected kcmp failures must
+        // exercise retirement, not make the admission check ambiguous.
+        auto lease = icecc::p50::forkfd::mint_fork_source_lease(
+            std::move(*lease_owner), inventory.source, kAcceptedDeliveryId);
+        require(lease.has_value(), "kcmp-error lease was not minted");
+        const int lease_slot =
+            icecc::p50::forkfd::test_fork_source_lease_proof_fd(*lease);
+        hooks.force_kcmp_errno = error;
+        icecc::p50::forkfd::set_test_hooks(hooks);
+        lease.reset();
+        require(::fcntl(lease_slot, F_GETFD) >= 0,
+                "kcmp-error lease retirement closed caller proof slot");
+        require(open_fd_count() == before + 1,
+                "kcmp-error lease retirement leaked a private descriptor");
+        require(::close(lease_slot) == 0, "lease proof slot cleanup failed");
+
+        // Move-assignment has the same retirement obligation as destruction.
+        // Both caller-owned slots survive while the private handles are
+        // retired under the injected comparison failure.
+        icecc::p50::forkfd::reset_test_hooks();
+        auto move_owner_a = icecc::p50::forkfd::test_make_delivery_owner(
+            inventory.source, kAcceptedDeliveryId);
+        auto move_owner_b = icecc::p50::forkfd::test_make_delivery_owner(
+            inventory.source, kAcceptedDeliveryId);
+        require(move_owner_a.has_value() && move_owner_b.has_value(),
+                "kcmp-error move owners were not minted");
+        const int move_slot_a =
+            icecc::p50::forkfd::test_delivery_owner_proof_fd(*move_owner_a);
+        const int move_slot_b =
+            icecc::p50::forkfd::test_delivery_owner_proof_fd(*move_owner_b);
+        hooks.force_kcmp_errno = error;
+        icecc::p50::forkfd::set_test_hooks(hooks);
+        *move_owner_a = std::move(*move_owner_b);
+        require(::fcntl(move_slot_a, F_GETFD) >= 0 &&
+                    ::fcntl(move_slot_b, F_GETFD) >= 0,
+                "kcmp-error token move closed caller proof slot");
+        move_owner_a.reset();
+        require(::fcntl(move_slot_a, F_GETFD) >= 0 &&
+                    ::fcntl(move_slot_b, F_GETFD) >= 0,
+                "kcmp-error moved token closed caller proof slot");
+        require(::close(move_slot_a) == 0 && ::close(move_slot_b) == 0,
+                "kcmp-error token move slot cleanup failed");
+
+        icecc::p50::forkfd::reset_test_hooks();
+        auto move_lease_owner_a = icecc::p50::forkfd::test_make_delivery_owner(
+            inventory.source, kAcceptedDeliveryId);
+        auto move_lease_owner_b = icecc::p50::forkfd::test_make_delivery_owner(
+            inventory.source, kAcceptedDeliveryId);
+        require(move_lease_owner_a.has_value() && move_lease_owner_b.has_value(),
+                "kcmp-error move lease owners were not minted");
+        auto move_lease_a = icecc::p50::forkfd::mint_fork_source_lease(
+            std::move(*move_lease_owner_a), inventory.source,
+            kAcceptedDeliveryId);
+        auto move_lease_b = icecc::p50::forkfd::mint_fork_source_lease(
+            std::move(*move_lease_owner_b), inventory.source,
+            kAcceptedDeliveryId);
+        require(move_lease_a.has_value() && move_lease_b.has_value(),
+                "kcmp-error move leases were not minted");
+        const int move_lease_slot_a =
+            icecc::p50::forkfd::test_fork_source_lease_proof_fd(*move_lease_a);
+        const int move_lease_slot_b =
+            icecc::p50::forkfd::test_fork_source_lease_proof_fd(*move_lease_b);
+        hooks.force_kcmp_errno = error;
+        icecc::p50::forkfd::set_test_hooks(hooks);
+        *move_lease_a = std::move(*move_lease_b);
+        require(::fcntl(move_lease_slot_a, F_GETFD) >= 0 &&
+                    ::fcntl(move_lease_slot_b, F_GETFD) >= 0,
+                "kcmp-error lease move closed caller proof slot");
+        move_lease_a.reset();
+        require(::fcntl(move_lease_slot_a, F_GETFD) >= 0 &&
+                    ::fcntl(move_lease_slot_b, F_GETFD) >= 0,
+                "kcmp-error moved lease closed caller proof slot");
+        require(::close(move_lease_slot_a) == 0 &&
+                    ::close(move_lease_slot_b) == 0,
+                "kcmp-error lease move slot cleanup failed");
+
+        icecc::p50::forkfd::reset_test_hooks();
+
+        // A child sweep reaches retirement only after its keep-set validation;
+        // the post-validation injection exercises the actual fork path.
+        Inventory fork_inventory = make_inventory(true);
+        hooks.force_kcmp_errno = error;
+        hooks.force_kcmp_after_calls = 1;
+        require(run_child(fork_inventory, true, false, hooks) ==
+                    100 + static_cast<int>(Failure::CloseFailure),
+                "fork retirement did not fail closed on injected kcmp error");
+    }
+#endif
+}
+
 } // namespace
 
 int main() {
@@ -545,6 +693,7 @@ int main() {
     test_same_number_replacement_and_transfer();
     test_move_assignment_and_proof_reuse();
     test_fallback_and_injected_failures();
+    test_kcmp_errors_retire_private_handles();
     std::cout << "ok - exact first-fork descriptor hygiene\n";
     return 0;
 }
