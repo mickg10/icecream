@@ -108,7 +108,12 @@ int structured_child(const std::string& mode, int fd) {
         " DEV=" + std::to_string(static_cast<unsigned long long>(pathname.st_dev)) +
         " INO=" + std::to_string(static_cast<unsigned long long>(pathname.st_ino)) +
         "\n";
-    if (!write_all(fd, ready.data(), ready.size())) {
+    std::string wire = ready;
+    if (mode == "structured-trailing-space")
+        wire.insert(wire.size() - 1, 1, ' ');
+    else if (mode == "structured-double-space")
+        wire.insert(5, 1, ' ');
+    if (!write_all(fd, wire.data(), wire.size())) {
         (void)::close(listener);
         return 111;
     }
@@ -278,6 +283,12 @@ Config fake_config(const char* mode, uint32_t max_restarts = 0) {
     config.arguments = {"--fake-child", mode};
     config.readiness_timeout = std::chrono::milliseconds(150);
     config.shutdown_timeout = std::chrono::milliseconds(60);
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_UNDEFINED__)
+    // Sanitizer startup and fork/exec instrumentation can exceed the normal
+    // lifecycle budget; the assertions below still exercise bounded cleanup.
+    config.readiness_timeout = std::chrono::milliseconds(1000);
+    config.shutdown_timeout = std::chrono::milliseconds(150);
+#endif
     config.restart_window = std::chrono::milliseconds(500);
     config.max_restarts = max_restarts;
     return config;
@@ -378,6 +389,15 @@ void structured_lease_rotates_across_restart_and_controller_recreation() {
     CHECK(first.current_lease().has_value());
     const ReadyLease lease1 = *first.current_lease();
     CHECK(lease1.valid());
+    ReadyLease noncanonical = lease1;
+    noncanonical.f_store_guid.bytes[0] ^= 1;
+    CHECK(!noncanonical.valid());
+    noncanonical = lease1;
+    noncanonical.socket_path_digest.bytes[0] ^= 1;
+    CHECK(!noncanonical.valid());
+    noncanonical = lease1;
+    noncanonical.private_directory += "/../alias";
+    CHECK(!noncanonical.valid());
     CHECK((lease1.identity == icecc::p50::local::Identity{71, 1}));
     CHECK(lease1.f_store_guid ==
           icecc::p50::f_store_guid_for_incarnation(lease1.identity));
@@ -413,7 +433,8 @@ void structured_lease_rotates_across_restart_and_controller_recreation() {
 }
 
 void structured_dead_or_malformed_ready_is_never_current() {
-    for (const char* mode : {"structured-exit", "structured-wrong-pid"}) {
+    for (const char* mode : {"structured-exit", "structured-wrong-pid",
+                             "structured-trailing-space", "structured-double-space"}) {
         const std::string root = make_private_root();
         auto allocator = std::make_shared<LaunchIdentityAllocator>(81, 1);
         Config config = structured_config(mode, root, allocator, 0);
@@ -427,6 +448,52 @@ void structured_dead_or_malformed_ready_is_never_current() {
               1);
         remove_test_lease_root(root);
     }
+}
+
+void cleanup_never_deletes_replaced_socket() {
+    const std::string root = make_private_root();
+    auto allocator = std::make_shared<LaunchIdentityAllocator>(91, 1);
+    Supervisor supervisor(structured_config("structured-live", root, allocator));
+    CHECK(supervisor.start());
+    const ReadyLease lease = *supervisor.current_lease();
+    CHECK(::unlink(lease.socket_path.c_str()) == 0);
+    const int replacement = structured_listener(lease.socket_path.c_str());
+    CHECK(replacement >= 0);
+    supervisor.shutdown();
+
+    struct stat replacement_info{};
+    CHECK(::lstat(lease.socket_path.c_str(), &replacement_info) == 0);
+    CHECK(S_ISSOCK(replacement_info.st_mode));
+    CHECK(replacement_info.st_ino != lease.listener_inode);
+    struct stat directory_info{};
+    CHECK(::lstat(lease.private_directory.c_str(), &directory_info) == 0);
+    CHECK(directory_info.st_ino == lease.directory_inode);
+    CHECK(::close(replacement) == 0);
+    CHECK(::unlink(lease.socket_path.c_str()) == 0);
+    CHECK(::rmdir(lease.private_directory.c_str()) == 0);
+    CHECK(::rmdir(root.c_str()) == 0);
+}
+
+void cleanup_never_deletes_replaced_directory() {
+    const std::string root = make_private_root();
+    auto allocator = std::make_shared<LaunchIdentityAllocator>(92, 1);
+    Supervisor supervisor(structured_config("structured-live", root, allocator));
+    CHECK(supervisor.start());
+    const ReadyLease lease = *supervisor.current_lease();
+    const std::string moved = root + "/moved-lease";
+    CHECK(::rename(lease.private_directory.c_str(), moved.c_str()) == 0);
+    CHECK(::mkdir(lease.private_directory.c_str(), 0700) == 0);
+    supervisor.shutdown();
+
+    struct stat replacement_info{};
+    CHECK(::lstat(lease.private_directory.c_str(), &replacement_info) == 0);
+    CHECK(S_ISDIR(replacement_info.st_mode));
+    CHECK(replacement_info.st_ino != lease.directory_inode);
+    CHECK(::rmdir(lease.private_directory.c_str()) == 0);
+    const std::string moved_socket = moved + "/cache.sock";
+    CHECK(::unlink(moved_socket.c_str()) == 0);
+    CHECK(::rmdir(moved.c_str()) == 0);
+    CHECK(::rmdir(root.c_str()) == 0);
 }
 
 void launch_allocator_refuses_reserved_and_exhausted_identities() {
@@ -820,6 +887,8 @@ int main(int argc, char** argv) {
         launch_allocator_refuses_reserved_and_exhausted_identities();
         structured_lease_rotates_across_restart_and_controller_recreation();
         structured_dead_or_malformed_ready_is_never_current();
+        cleanup_never_deletes_replaced_socket();
+        cleanup_never_deletes_replaced_directory();
         ready_and_shutdown();
         timeout_and_pre_ready_exit_are_distinct();
         repeated_post_ready_crashes_exhaust_budget();

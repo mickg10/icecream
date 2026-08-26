@@ -32,6 +32,10 @@ lease_gate() {
         grep -F 'const bool proven_dead = terminate_child();' \
             "$candidate_impl" >/dev/null &&
         grep -F 'if (proven_dead) {' "$candidate_impl" >/dev/null &&
+        grep -F 'SYS_renameat2' "$candidate_impl" >/dev/null &&
+        grep -F 'RENAME_NOREPLACE' "$candidate_impl" >/dev/null &&
+        grep -F 'AT_SYMLINK_NOFOLLOW' "$candidate_impl" >/dev/null &&
+        grep -F 'capture_and_remove_at' "$candidate_impl" >/dev/null &&
         grep -F 'return direct_dead && group_dead && !group_identity_invalidated;' \
             "$candidate_impl" >/dev/null
 }
@@ -74,6 +78,24 @@ grep -F 'listener_device' "$impl" "$header" >/dev/null
 grep -F 'socket_path_digest' "$impl" "$header" >/dev/null
 grep -F 'cleanup_lease' "$impl" >/dev/null
 grep -F 'rmdir' "$impl" >/dev/null
+grep -F 'SYS_renameat2' "$impl" >/dev/null
+grep -F 'RENAME_NOREPLACE' "$impl" >/dev/null
+grep -F 'fstatat' "$impl" >/dev/null
+grep -F 'AT_SYMLINK_NOFOLLOW' "$impl" >/dev/null
+grep -F 'capture_and_remove_at' "$impl" >/dev/null
+grep -F 'canonical_absolute_lease_path' "$header" "$impl" >/dev/null
+grep -F 'directory_device == 0' "$header" >/dev/null
+grep -F 'socket_path_digest != digest128(socket_path)' "$header" >/dev/null
+grep -F 'cleanup_never_deletes_replaced_socket' \
+    "$src/unittests/p50_sidecar_supervisor_test.cpp" >/dev/null
+grep -F 'cleanup_never_deletes_replaced_directory' \
+    "$src/unittests/p50_sidecar_supervisor_test.cpp" >/dev/null
+grep -F 'structured-trailing-space' \
+    "$src/unittests/p50_sidecar_supervisor_test.cpp" >/dev/null
+if grep -E 'lstat\(lease->|unlink\(lease->|rmdir\(lease->' "$impl" >/dev/null; then
+    echo 'FAIL: lease cleanup regressed to pathname lstat/unlink/rmdir' >&2
+    exit 1
+fi
 
 # A stale numeric PID must never be a direct signal target.  Group signalling
 # remains separately guarded by the proven PGID ownership fence.
@@ -132,6 +154,31 @@ for pattern in \
     awk -v needle="$pattern" 'index($0, needle) == 0' "$impl" >"$lease_mutant"
     if lease_gate "$lease_mutant" "$header"; then
         echo "FAIL: supervisor lease deletion mutant survived: $pattern" >&2
+        exit 1
+    fi
+done
+
+# Deletion-sensitive source mutants must not remove the atomic capture fence.
+for pattern in \
+    'SYS_renameat2' \
+    'RENAME_NOREPLACE' \
+    'AT_SYMLINK_NOFOLLOW' \
+    'capture_and_remove_at'; do
+    atomic_mutant="$mutant_dir/atomic-${pattern##*/}.cpp"
+    grep -vF "$pattern" "$impl" >"$atomic_mutant"
+    if lease_gate "$atomic_mutant" "$header"; then
+        echo "FAIL: atomic lease deletion mutant survived: $pattern" >&2
+        exit 1
+    fi
+done
+
+for pattern in \
+    'directory_device == 0' \
+    'socket_path_digest != digest128(socket_path)'; do
+    atomic_header_mutant="$mutant_dir/atomic-${pattern##*/}.h"
+    grep -vF "$pattern" "$header" >"$atomic_header_mutant"
+    if grep -F "$pattern" "$atomic_header_mutant" >/dev/null; then
+        echo "FAIL: canonical lease deletion mutant was not formed: $pattern" >&2
         exit 1
     fi
 done

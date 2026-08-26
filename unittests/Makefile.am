@@ -3,6 +3,7 @@ TESTS += p50sourcearm p50sourcearm-source.sh
 TESTS += p50phaseopen p50phaseopen-source.sh
 TESTS += p50reversefdretry p50reversefdretry-source.sh
 TESTS += p50reversefdretry-mutants.sh p50_reverse_fd_retry_sanitize.sh
+TESTS += p50sidecarsupervisor-sanitize.sh
 TESTS += p50daemonsidecaradapter
 TESTS += p50daemonsidecaradapter-source.sh
 TESTS += p50daemonsidecaradapter-sanitize.sh
@@ -293,6 +294,7 @@ EXTRA_DIST += p50_trace_check.sh p50assignment-source.sh p50cacheadvertisement-s
 EXTRA_DIST += p50sourcearm-source.sh p50phaseopen-source.sh
 EXTRA_DIST += p50reversefdretry-source.sh p50reversefdretry-mutants.sh \
 	p50_reverse_fd_retry_sanitize.sh
+EXTRA_DIST += p50sidecarsupervisor-sanitize.sh
 EXTRA_DIST += p50compilee2e-source.sh p50compilee2e-run.sh
 EXTRA_DIST += p50completionflow-source.py
 EXTRA_DIST += p50completionrecord-sanitize.sh

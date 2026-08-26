@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <climits>
@@ -310,7 +311,7 @@ bool command_is_valid(const Config& config) noexcept {
 std::string bytes_hex(std::span<const uint8_t> bytes);
 
 bool parse_uint64(std::string_view text, uint64_t& value) noexcept {
-    if (text.empty())
+    if (text.empty() || (text.size() > 1 && text.front() == '0'))
         return false;
     value = 0;
     for (const char character : text) {
@@ -329,42 +330,52 @@ bool parse_ready_lease(std::string_view wire, const ReadyLease& expected,
         return false;
     wire.remove_suffix(1);
     std::array<std::string_view, 10> fields{};
-    size_t count = 0;
-    while (!wire.empty() && count != fields.size()) {
-        const size_t space = wire.find(' ');
-        fields[count++] = wire.substr(0, space);
-        if (space == std::string_view::npos) {
-            wire = {};
+    size_t begin = 0;
+    for (size_t index = 0; index != fields.size(); ++index) {
+        if (begin >= wire.size())
+            return false;
+        const size_t end = wire.find(' ', begin);
+        fields[index] = wire.substr(begin, end == std::string_view::npos
+                                             ? wire.size() - begin
+                                             : end - begin);
+        if (fields[index].empty())
+            return false;
+        if (end == std::string_view::npos) {
+            if (index + 1 != fields.size())
+                return false;
+            begin = wire.size();
             break;
         }
-        wire.remove_prefix(space + 1);
+        if (index + 1 == fields.size() || end + 1 >= wire.size() ||
+            wire[end + 1] == ' ')
+            return false;
+        begin = end + 1;
     }
-    if (count != fields.size() || !wire.empty() || fields[0] != "READY" ||
-        fields[1] != "v2")
+    if (begin != wire.size())
         return false;
-    const auto value_for = [&fields](std::string_view key) -> std::string_view {
-        for (size_t i = 2; i != fields.size(); ++i)
-            if (fields[i].size() > key.size() &&
-                fields[i].substr(0, key.size()) == key &&
-                fields[i][key.size()] == '=')
-                return fields[i].substr(key.size() + 1);
-        return {};
-    };
+    static constexpr std::array<std::string_view, 8> keys = {
+        "generation", "attempt", "pid", "F_STORE_GUID",
+        "PATH", "DIGEST", "DEV", "INO"};
+    std::array<std::string_view, 8> values{};
+    for (size_t index = 0; index != keys.size(); ++index) {
+        const std::string_view field = fields[index + 2];
+        const size_t equals = field.find('=');
+        if (equals != keys[index].size() ||
+            field.substr(0, equals) != keys[index] || equals + 1 >= field.size())
+            return false;
+        values[index] = field.substr(equals + 1);
+    }
     uint64_t generation = 0, attempt = 0, pid = 0, device = 0, inode = 0;
-    const std::string_view generation_text = value_for("generation");
-    const std::string_view attempt_text = value_for("attempt");
-    const std::string_view pid_text = value_for("pid");
-    const std::string_view device_text = value_for("DEV");
-    const std::string_view inode_text = value_for("INO");
-    if (!parse_uint64(generation_text, generation) || !parse_uint64(attempt_text, attempt) ||
-        !parse_uint64(pid_text, pid) || !parse_uint64(device_text, device) ||
-        !parse_uint64(inode_text, inode) || pid != static_cast<uint64_t>(child) ||
+    if (fields[0] != "READY" || fields[1] != "v2" ||
+        !parse_uint64(values[0], generation) || !parse_uint64(values[1], attempt) ||
+        !parse_uint64(values[2], pid) || !parse_uint64(values[6], device) ||
+        !parse_uint64(values[7], inode) || pid != static_cast<uint64_t>(child) ||
         generation != expected.identity.generation || attempt != expected.identity.attempt ||
         device == 0 || inode == 0 ||
-        value_for("F_STORE_GUID") != bytes_hex(std::span<const uint8_t>(
+        values[3] != bytes_hex(std::span<const uint8_t>(
             expected.f_store_guid.bytes.data(), expected.f_store_guid.bytes.size())) ||
-        value_for("PATH") != expected.socket_path ||
-        value_for("DIGEST") != digest128_hex(expected.socket_path_digest))
+        values[4] != expected.socket_path ||
+        values[5] != digest128_hex(expected.socket_path_digest))
         return false;
     struct stat socket_info{};
     if (::lstat(expected.socket_path.c_str(), &socket_info) != 0 ||
@@ -376,7 +387,7 @@ bool parse_ready_lease(std::string_view wire, const ReadyLease& expected,
     actual.pid = child;
     actual.listener_device = static_cast<dev_t>(device);
     actual.listener_inode = static_cast<ino_t>(inode);
-    return true;
+    return actual.valid();
 }
 
 std::string bytes_hex(std::span<const uint8_t> bytes) {
@@ -399,6 +410,155 @@ void close_if_open(int& fd) noexcept {
         (void)ignored;
     }
     fd = -1;
+}
+
+// renameat2(RENAME_NOREPLACE) is the capture primitive for lease teardown.
+// A pathname is first moved out of the owner's namespace, then its captured
+// inode is verified before removal.  If the entry changed, restoration is
+// attempted only with NOREPLACE; a concurrent replacement therefore causes a
+// deliberate leak rather than deletion of an unrelated object.
+bool capture_and_remove_at(int parent_fd, std::string_view name,
+                           const struct stat& expected, bool directory) noexcept {
+#if defined(__linux__) && defined(SYS_renameat2)
+    constexpr unsigned int kRenameNoReplace = 1u;
+    static std::atomic<uint64_t> sequence{1};
+    try {
+        const std::string source(name);
+        struct stat before{};
+        if (::fstatat(parent_fd, source.c_str(), &before, AT_SYMLINK_NOFOLLOW) != 0)
+            return errno == ENOENT;
+        const mode_t expected_type = expected.st_mode & S_IFMT;
+        if ((before.st_mode & S_IFMT) != expected_type || before.st_dev != expected.st_dev ||
+            before.st_ino != expected.st_ino)
+            return false;
+        std::string captured;
+        bool captured_entry = false;
+        for (unsigned attempt = 0; attempt != 32; ++attempt) {
+            captured = ".icecc-lease-capture-" + std::to_string(::getpid()) + "-" +
+                       std::to_string(sequence.fetch_add(1, std::memory_order_relaxed));
+            const long renamed = ::syscall(SYS_renameat2, parent_fd,
+                                           source.c_str(), parent_fd,
+                                           captured.c_str(), kRenameNoReplace);
+            if (renamed == 0) {
+                captured_entry = true;
+                break;
+            }
+            if (errno == EEXIST)
+                continue;
+            // ENOSYS/EINVAL (and denied syscall policies) are deliberately
+            // not replaced with unlink/rmdir fallbacks: unsupported atomic
+            // capture means the only safe result is to leak the lease.
+            if (errno == ENOENT)
+                return true;
+            return false;
+        }
+        if (!captured_entry)
+            return false;
+        struct stat captured_info{};
+        if (::fstatat(parent_fd, captured.c_str(), &captured_info,
+                      AT_SYMLINK_NOFOLLOW) != 0 ||
+            (captured_info.st_mode & S_IFMT) != expected_type ||
+            captured_info.st_dev != expected.st_dev ||
+            captured_info.st_ino != expected.st_ino) {
+            // The capture was not ours.  Restore only when the original name
+            // is still vacant; otherwise leave the unique capture behind.
+            (void)::syscall(SYS_renameat2, parent_fd, captured.c_str(), parent_fd,
+                            source.c_str(), kRenameNoReplace);
+            return false;
+        }
+        const int remove_flags = directory ? AT_REMOVEDIR : 0;
+        if (::unlinkat(parent_fd, captured.c_str(), remove_flags) == 0 || errno == ENOENT)
+            return true;
+        // Removal failed (for example, a non-empty directory).  Preserve the
+        // object and restore it only if doing so cannot overwrite a newcomer.
+        (void)::syscall(SYS_renameat2, parent_fd, captured.c_str(), parent_fd,
+                        source.c_str(), kRenameNoReplace);
+    } catch (...) {
+        // Cleanup is noexcept and must never turn allocation failure into a
+        // blind pathname deletion.
+        return false;
+    }
+    return false;
+#else
+    (void)parent_fd;
+    (void)name;
+    (void)expected;
+    (void)directory;
+    return false;
+#endif
+}
+
+bool split_parent_path(std::string_view path, std::string& parent,
+                       std::string& basename) noexcept {
+    try {
+        const size_t slash = path.rfind('/');
+        if (slash == std::string_view::npos || slash + 1 >= path.size())
+            return false;
+        parent = slash == 0 ? "/" : std::string(path.substr(0, slash));
+        basename = path.substr(slash + 1);
+        return !basename.empty() && basename.find('/') == std::string::npos;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool cleanup_lease_paths(const ReadyLease& lease) noexcept {
+    if (!detail::canonical_absolute_lease_path(lease.private_directory) ||
+        lease.directory_device == 0 || lease.directory_inode == 0 ||
+        lease.private_directory.size() + sizeof("/cache.sock") - 1 > local::kMaxUnixPath ||
+        lease.socket_path.size() != lease.private_directory.size() + sizeof("/cache.sock") - 1 ||
+        lease.socket_path.compare(0, lease.private_directory.size(), lease.private_directory) != 0 ||
+        lease.socket_path[lease.private_directory.size()] != '/' ||
+        lease.socket_path.compare(lease.private_directory.size() + 1,
+                                  sizeof("cache.sock") - 1, "cache.sock") != 0)
+        return false;
+
+    const int lease_fd = ::open(lease.private_directory.c_str(),
+                                O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (lease_fd < 0)
+        return false;
+    struct stat directory_info{};
+    const bool directory_matches = ::fstat(lease_fd, &directory_info) == 0 &&
+                                    S_ISDIR(directory_info.st_mode) &&
+                                    directory_info.st_dev == lease.directory_device &&
+                                    directory_info.st_ino == lease.directory_inode;
+    if (!directory_matches) {
+        (void)::close(lease_fd);
+        return false;
+    }
+
+    bool socket_removed = true;
+    if (lease.listener_device != 0 || lease.listener_inode != 0) {
+        if (lease.listener_device == 0 || lease.listener_inode == 0) {
+            (void)::close(lease_fd);
+            return false;
+        }
+        struct stat socket_expected{};
+        socket_expected.st_mode = S_IFSOCK;
+        socket_expected.st_dev = lease.listener_device;
+        socket_expected.st_ino = lease.listener_inode;
+        socket_removed = capture_and_remove_at(lease_fd, "cache.sock", socket_expected, false);
+    }
+    (void)::close(lease_fd);
+    if (!socket_removed)
+        return false;
+
+    std::string parent;
+    std::string basename;
+    if (!split_parent_path(lease.private_directory, parent, basename))
+        return false;
+    const int parent_fd = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC |
+                                                       O_NOFOLLOW);
+    if (parent_fd < 0)
+        return false;
+    struct stat directory_expected{};
+    directory_expected.st_mode = S_IFDIR;
+    directory_expected.st_dev = lease.directory_device;
+    directory_expected.st_ino = lease.directory_inode;
+    const bool directory_removed =
+        capture_and_remove_at(parent_fd, basename, directory_expected, true);
+    (void)::close(parent_fd);
+    return directory_removed;
 }
 
 } // namespace
@@ -503,19 +663,10 @@ bool Supervisor::prepare_lease() noexcept {
 void Supervisor::cleanup_lease(std::optional<ReadyLease>& lease) noexcept {
     if (!lease.has_value())
         return;
-    // Cleanup is intentionally identity based.  A replacement pathname or
-    // inode is left for its owner; this is the deletion/mutant boundary that
-    // prevents blind unlink after SIGKILL or controller recreation.
-    struct stat socket_info{};
-    if (::lstat(lease->socket_path.c_str(), &socket_info) == 0 &&
-        S_ISSOCK(socket_info.st_mode) && socket_info.st_dev == lease->listener_device &&
-        socket_info.st_ino == lease->listener_inode)
-        (void)::unlink(lease->socket_path.c_str());
-    struct stat directory_info{};
-    if (::lstat(lease->private_directory.c_str(), &directory_info) == 0 &&
-        S_ISDIR(directory_info.st_mode) && directory_info.st_dev == lease->directory_device &&
-        directory_info.st_ino == lease->directory_inode)
-        (void)::rmdir(lease->private_directory.c_str());
+    // A replacement pathname or inode is left for its owner.  Unsupported
+    // atomic capture, a changed parent, and any failed restore all fail closed
+    // as a leak; this function never falls back to lstat->unlink/rmdir.
+    (void)cleanup_lease_paths(*lease);
     lease.reset();
 }
 

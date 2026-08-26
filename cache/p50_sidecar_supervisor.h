@@ -25,6 +25,39 @@
 
 namespace icecc::p50::sidecar {
 
+namespace detail {
+
+// Lease paths are generated below one private, absolute root.  Keep the
+// representation lexical and unambiguous: cleanup operates with dirfds, but
+// this check is also the fence against a path alias being accepted as lease
+// metadata.
+inline bool canonical_absolute_lease_path(std::string_view path) noexcept {
+    if (path.empty() || path.front() != '/' || path.size() > local::kMaxUnixPath ||
+        path.back() == '/' || path.find('\0') != std::string_view::npos)
+        return false;
+    size_t begin = 1;
+    while (begin < path.size()) {
+        const size_t end = path.find('/', begin);
+        const size_t length = end == std::string_view::npos ? path.size() - begin
+                                                              : end - begin;
+        if (length == 0 || (length == 1 && path[begin] == '.') ||
+            (length == 2 && path[begin] == '.' && path[begin + 1] == '.'))
+            return false;
+        for (size_t index = begin; index != begin + length; ++index) {
+            const char character = path[index];
+            if (character == ' ' || character == '\t' || character == '\n' ||
+                character == '\r')
+                return false;
+        }
+        if (end == std::string_view::npos)
+            break;
+        begin = end + 1;
+    }
+    return true;
+}
+
+} // namespace detail
+
 // The supervisor gives the child this inherited descriptor through the
 // environment.  The descriptor itself is private, CLOEXEC in the parent, and
 // the only descriptor deliberately cleared in the pre-exec child.
@@ -110,9 +143,19 @@ struct ReadyLease {
     ino_t directory_inode = 0;
 
     [[nodiscard]] bool valid() const noexcept {
-        return identity.generation != 0 && identity.attempt != 0 && pid > 1 &&
-               f_store_guid != FStoreGuid{} && !private_directory.empty() &&
-               !socket_path.empty() && listener_device != 0 && listener_inode != 0;
+        if (identity.generation == 0 || identity.attempt == 0 || pid <= 1 ||
+            f_store_guid != f_store_guid_for_incarnation(identity) ||
+            !detail::canonical_absolute_lease_path(private_directory) ||
+            private_directory.size() + sizeof("/cache.sock") - 1 > local::kMaxUnixPath ||
+            socket_path.size() != private_directory.size() + sizeof("/cache.sock") - 1 ||
+            socket_path.compare(0, private_directory.size(), private_directory) != 0 ||
+            socket_path[private_directory.size()] != '/' ||
+            socket_path.compare(private_directory.size() + 1, sizeof("cache.sock") - 1,
+                                "cache.sock") != 0 ||
+            socket_path_digest != digest128(socket_path) || listener_device == 0 ||
+            listener_inode == 0 || directory_device == 0 || directory_inode == 0)
+            return false;
+        return true;
     }
 };
 
