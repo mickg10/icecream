@@ -23,6 +23,11 @@ enum class DaemonControlStatus : uint8_t {
     Truncated, ControlTruncated, ExtraFd, MissingFd, TrailingData,
 };
 
+enum class DaemonControlFdOwnership : uint8_t {
+    Borrowed = 0,
+    Owned,
+};
+
 struct DaemonControlLimits {
     size_t syscalls_per_turn = 4;
     size_t bytes_per_turn = 4096;
@@ -43,6 +48,7 @@ public:
     DaemonControlStatus begin(const std::string& path,
                               const ControlOperation& operation,
                               int transfer_fd,
+                              const CredentialExpectation& credentials,
                               std::chrono::steady_clock::time_point deadline,
                               DaemonControlLimits limits = {}) noexcept;
 
@@ -52,8 +58,10 @@ public:
     DaemonControlStatus begin_connected(int nonblocking_fd,
                                         const ControlOperation& operation,
                                         int transfer_fd,
+                                        const CredentialExpectation& credentials,
                                         std::chrono::steady_clock::time_point deadline,
-                                        DaemonControlLimits limits = {}) noexcept;
+                                        DaemonControlLimits limits,
+                                        DaemonControlFdOwnership ownership) noexcept;
 
     [[nodiscard]] short desired_events() const noexcept;
     DaemonControlStatus advance(std::chrono::steady_clock::time_point now,
@@ -63,12 +71,18 @@ public:
     [[nodiscard]] bool done() const noexcept { return status_ != DaemonControlStatus::InProgress; }
     [[nodiscard]] bool rights_sent() const noexcept { return rights_sent_; }
     [[nodiscard]] bool peer_queried() const noexcept { return peer_queried_; }
+    [[nodiscard]] size_t last_advance_syscalls() const noexcept { return last_calls_; }
+    [[nodiscard]] size_t last_advance_bytes() const noexcept { return last_bytes_; }
+    [[nodiscard]] bool deadline_expired(std::chrono::steady_clock::time_point now) const noexcept {
+        return status_ == DaemonControlStatus::InProgress && now >= deadline_;
+    }
     [[nodiscard]] int native_handle() const noexcept { return fd_; }
     [[nodiscard]] const std::optional<PeerCredential>& peer() const noexcept { return peer_; }
 
 private:
     enum class Phase : uint8_t { None, Connecting, WriteHello, ReadHelloAck,
-                                 WriteControl, WriteHandoff, ReadAck };
+                                 CheckHelloAckTrailing, WriteControl, WriteHandoff,
+                                 ReadAck, CheckAckTrailing };
     void fail(DaemonControlStatus status) noexcept;
     void close_fd() noexcept;
     bool query_peer() noexcept;
@@ -77,6 +91,8 @@ private:
     bool write_handoff(size_t& calls, size_t& budget) noexcept;
     bool read_frame(size_t& calls, size_t& budget) noexcept;
     bool read_ack(size_t& calls, size_t& budget) noexcept;
+    bool check_stream_trailing(Phase next_phase, size_t& calls,
+                               size_t& budget) noexcept;
     bool validate_ack() noexcept;
 
     int fd_ = -1;
@@ -88,6 +104,7 @@ private:
     DaemonControlStatus status_ = DaemonControlStatus::Idle;
     std::chrono::steady_clock::time_point deadline_{};
     DaemonControlLimits limits_{};
+    CredentialExpectation credentials_{};
     ControlOperation operation_{};
     std::vector<uint8_t> hello_;
     std::vector<uint8_t> control_;
@@ -97,6 +114,8 @@ private:
     size_t frame_expected_ = 0;
     size_t offset_ = 0;
     size_t ack_offset_ = 0;
+    size_t last_calls_ = 0;
+    size_t last_bytes_ = 0;
     std::optional<PeerCredential> peer_;
 };
 
@@ -114,7 +133,8 @@ public:
     DaemonControlStatus begin_connected(int nonblocking_fd,
                                         const ControlOperation& expected,
                                         std::chrono::steady_clock::time_point deadline,
-                                        DaemonControlLimits limits = {}) noexcept;
+                                        DaemonControlLimits limits,
+                                        DaemonControlFdOwnership ownership) noexcept;
     [[nodiscard]] short desired_events() const noexcept;
     DaemonControlStatus advance(std::chrono::steady_clock::time_point now,
                                 short revents) noexcept;
@@ -122,20 +142,29 @@ public:
     [[nodiscard]] int take_fd() noexcept;
     [[nodiscard]] DaemonControlStatus status() const noexcept { return status_; }
     [[nodiscard]] bool rights_validated() const noexcept { return accepted_fd_ >= 0; }
+    [[nodiscard]] size_t last_advance_syscalls() const noexcept { return last_calls_; }
+    [[nodiscard]] size_t last_advance_bytes() const noexcept { return last_bytes_; }
+    [[nodiscard]] size_t wire_bytes_received() const noexcept { return offset_; }
+    [[nodiscard]] bool deadline_expired(std::chrono::steady_clock::time_point now) const noexcept {
+        return status_ == DaemonControlStatus::InProgress && now >= deadline_;
+    }
 
 private:
     void close_all() noexcept;
     void fail(DaemonControlStatus status) noexcept;
     bool validate_wire() noexcept;
+    bool check_trailing(size_t& calls, size_t& budget) noexcept;
 
     int fd_ = -1;
     int accepted_fd_ = -1;
     bool own_fd_ = false;
     bool have_rights_ = false;
+    bool trailing_checked_ = false;
     size_t fd_count_ = 0;
     size_t offset_ = 0;
     size_t ack_offset_ = 0;
-    size_t calls_ = 0;
+    size_t last_calls_ = 0;
+    size_t last_bytes_ = 0;
     std::chrono::steady_clock::time_point deadline_{};
     DaemonControlLimits limits_{};
     ControlOperation expected_{};
@@ -147,14 +176,24 @@ private:
 // operation and advances each ready operation once before revisiting one.
 class DaemonControlPollAdapter {
 public:
-    void add(DaemonControlOperation* operation) noexcept;
+    using Registration = uint64_t;
+
+    // Registration is explicitly borrowed: the owner must call remove()
+    // before destroying the operation.  The adapter never owns or deletes it.
+    Registration add(DaemonControlOperation& operation) noexcept;
+    bool remove(Registration registration) noexcept;
     [[nodiscard]] size_t size() const noexcept { return operations_.size(); }
     size_t advance_ready(std::chrono::steady_clock::time_point now,
                          const std::vector<short>& revents) noexcept;
 
 private:
-    std::vector<DaemonControlOperation*> operations_;
+    struct Entry {
+        Registration registration = 0;
+        DaemonControlOperation* operation = nullptr;
+    };
+    std::vector<Entry> operations_;
     size_t cursor_ = 0;
+    Registration next_registration_ = 1;
 };
 
 const char* daemon_control_status_name(DaemonControlStatus status) noexcept;
