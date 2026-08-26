@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <cstdlib>
+#include <dirent.h>
 #include <fcntl.h>
 #include <iostream>
 #include <optional>
@@ -97,6 +98,26 @@ Inventory make_inventory(bool with_source) {
     return result;
 }
 
+int make_readonly_source(int minimum) {
+    char path[] = "/tmp/icecc-fork-fd-replacement-XXXXXX";
+    const int writable = ::mkstemp(path);
+    require(writable >= 0, "replacement mkstemp failed");
+    require(::close(writable) == 0, "replacement writable close failed");
+    const int readonly = ::open(path, O_RDONLY | O_CLOEXEC);
+    (void)::unlink(path);
+    return move_high(readonly, minimum);
+}
+
+size_t open_fd_count() {
+    DIR* directory = ::opendir("/proc/self/fd");
+    require(directory != nullptr, "could not enumerate test descriptors");
+    size_t count = 0;
+    while (::readdir(directory) != nullptr)
+        ++count;
+    require(::closedir(directory) == 0, "could not close test descriptor inventory");
+    return count;
+}
+
 KeepSet keeps(const Inventory& inventory, bool with_source) {
     KeepSet result{inventory.stat_write, inventory.client_child, std::nullopt,
                    with_source, with_source
@@ -113,7 +134,7 @@ KeepSet keeps(const Inventory& inventory, bool with_source) {
     return result;
 }
 
-int child_sweep(const KeepSet& keep, int unrelated, int listener, bool await_eof,
+int child_sweep(KeepSet& keep, int unrelated, int listener, bool await_eof,
                 std::optional<icecc::p50::forkfd::TestHooks> hooks = std::nullopt) {
     if (hooks.has_value())
         icecc::p50::forkfd::set_test_hooks(*hooks);
@@ -147,10 +168,11 @@ int run_child(const Inventory& inventory, bool with_source, bool await_eof,
               std::optional<icecc::p50::forkfd::TestHooks> hooks = std::nullopt) {
     const pid_t pid = ::fork();
     require(pid >= 0, "fork failed");
-    if (pid == 0)
-        child_sweep(keeps(inventory, with_source),
-                    with_source ? inventory.unrelated : inventory.source,
+    if (pid == 0) {
+        KeepSet keep = keeps(inventory, with_source);
+        child_sweep(keep, with_source ? inventory.unrelated : inventory.source,
                     inventory.listener, await_eof, hooks);
+    }
     // The child must retain the client socket long enough to observe the
     // ordinary client OP_CANCEL/EOF, while its inherited peer is not part of
     // its keep set. Closing the parent peer makes that event deterministic.
@@ -223,17 +245,6 @@ void test_validation() {
                 Failure::InvalidKeepSet,
             "source lease was detached from its expected FD");
 
-    auto wrong_type_owner = icecc::p50::forkfd::test_make_delivery_owner(
-        inventory.stat_read, kAcceptedDeliveryId);
-    require(wrong_type_owner.has_value(), "wrong-type owner token was not minted");
-    auto wrong_type_lease = icecc::p50::forkfd::mint_fork_source_lease(
-        std::move(*wrong_type_owner), inventory.stat_read, kAcceptedDeliveryId);
-    require(wrong_type_lease.has_value(), "wrong-type source lease was not minted");
-    KeepSet wrong_type{inventory.stat_write, inventory.client_child,
-                       std::move(wrong_type_lease), true, inventory.stat_read};
-    require(icecc::p50::forkfd::sweep(wrong_type).failure == Failure::TypeFailure,
-            "non-regular source was accepted");
-
     KeepSet wrong_stat_direction{inventory.stat_read, inventory.client_child,
                                  std::nullopt, false, std::nullopt};
     require(icecc::p50::forkfd::sweep(wrong_stat_direction).failure ==
@@ -279,6 +290,84 @@ void test_validation() {
                 Failure::OwnershipFailure,
             "writable source descriptor was accepted");
     (void)::close(high_writable);
+}
+
+void test_same_number_replacement_and_transfer() {
+#if defined(__linux__)
+    Inventory inventory = make_inventory(true);
+    const int original_backup = ::fcntl(inventory.source, F_DUPFD_CLOEXEC, 48);
+    require(original_backup >= 0, "could not back up source descriptor");
+    const int replacement = make_readonly_source(49);
+
+    auto owner = icecc::p50::forkfd::test_make_delivery_owner(
+        inventory.source, kAcceptedDeliveryId);
+    require(owner.has_value(), "replacement owner token was not minted");
+    require(::dup3(replacement, inventory.source, O_CLOEXEC) == inventory.source,
+            "same-number dup3 replacement failed");
+    require(!icecc::p50::forkfd::mint_fork_source_lease(
+                 std::move(*owner), inventory.source, kAcceptedDeliveryId)
+                 .has_value(),
+            "same-number regular-file replacement passed mint");
+    require(::dup3(original_backup, inventory.source, O_CLOEXEC) ==
+                inventory.source,
+            "could not restore source after mint replacement");
+
+    owner = icecc::p50::forkfd::test_make_delivery_owner(
+        inventory.source, kAcceptedDeliveryId);
+    require(owner.has_value(), "second replacement owner token was not minted");
+    auto lease = icecc::p50::forkfd::mint_fork_source_lease(
+        std::move(*owner), inventory.source, kAcceptedDeliveryId);
+    require(lease.has_value(), "valid lease before replacement was rejected");
+    KeepSet replaced_after_mint{inventory.stat_write, inventory.client_child,
+                                std::move(lease), true, inventory.source};
+    require(::dup3(replacement, inventory.source, O_CLOEXEC) == inventory.source,
+            "same-number post-mint replacement failed");
+    require(icecc::p50::forkfd::sweep(replaced_after_mint).failure ==
+                Failure::InvalidKeepSet,
+            "same-number replacement bypassed sweep identity revalidation");
+    require(::dup3(original_backup, inventory.source, O_CLOEXEC) ==
+                inventory.source,
+            "could not restore source after post-mint replacement");
+
+    owner = icecc::p50::forkfd::test_make_delivery_owner(
+        inventory.source, kAcceptedDeliveryId);
+    require(owner.has_value(), "close/reopen owner token was not minted");
+    const int reopen = make_readonly_source(50);
+    require(::close(inventory.source) == 0, "source close before reopen failed");
+    require(::dup3(reopen, inventory.source, O_CLOEXEC) == inventory.source,
+            "close/reopen same-number replacement failed");
+    (void)::close(reopen);
+    require(!icecc::p50::forkfd::mint_fork_source_lease(
+                 std::move(*owner), inventory.source, kAcceptedDeliveryId)
+                 .has_value(),
+            "close/reopen same-number replacement passed mint");
+    require(::dup3(original_backup, inventory.source, O_CLOEXEC) ==
+                inventory.source,
+            "could not restore source after close/reopen");
+    (void)::close(original_backup);
+    (void)::close(replacement);
+
+    Inventory transfer_inventory = make_inventory(true);
+    const size_t before = open_fd_count();
+    {
+        auto transfer_owner = icecc::p50::forkfd::test_make_delivery_owner(
+            transfer_inventory.source, kAcceptedDeliveryId);
+        require(transfer_owner.has_value(), "transfer owner token was not minted");
+        const size_t after_owner = open_fd_count();
+        require(after_owner == before + 1,
+                "owner token did not retain exactly one independent duplicate");
+        auto transfer_lease = icecc::p50::forkfd::mint_fork_source_lease(
+            std::move(*transfer_owner), transfer_inventory.source,
+            kAcceptedDeliveryId);
+        require(transfer_lease.has_value(), "transfer lease was not minted");
+        require(open_fd_count() == after_owner,
+                "mint changed descriptor ownership count unexpectedly");
+    }
+    require(open_fd_count() == before,
+            "lease destruction leaked or double-closed its proof descriptor");
+    require(::fcntl(transfer_inventory.source, F_GETFD) >= 0,
+            "lease incorrectly closed the handoff descriptor");
+#endif
 }
 
 void test_fallback_and_injected_failures() {
@@ -334,6 +423,7 @@ int main() {
     test_real_sweep_and_residue();
     test_exact_two_and_source_omission();
     test_validation();
+    test_same_number_replacement_and_transfer();
     test_fallback_and_injected_failures();
     std::cout << "ok - exact first-fork descriptor hygiene\n";
     return 0;

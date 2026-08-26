@@ -261,9 +261,7 @@ int handle_connection(const string &basedir, CompileJob *job,
         if ((-1 == close(socket[1])) && (errno != EBADF)){
             log_perror("close failure");
         }
-        if (owned_compiler_input_fd >= 0 &&
-            (!compiler_input_source.has_value() ||
-             compiler_input_source->fd() != owned_compiler_input_fd)) {
+        if (owned_compiler_input_fd >= 0) {
             (void)close(owned_compiler_input_fd);
         }
         owned_compiler_input_fd = -1;

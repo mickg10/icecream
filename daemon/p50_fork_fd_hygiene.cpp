@@ -23,48 +23,148 @@
 
 namespace icecc::p50::forkfd {
 
+namespace {
+
+bool close_exact(int fd) noexcept {
+    for (;;) {
+        if (::close(fd) == 0)
+            return true;
+        if (errno == EINTR)
+            continue;
+        return false;
+    }
+}
+
+bool capture_source_identity(int fd, SourceIdentity* identity) noexcept {
+    if (identity == nullptr)
+        return false;
+    struct stat info{};
+    if (::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) || info.st_size < 0)
+        return false;
+    SourceIdentity captured;
+    captured.device = static_cast<uint64_t>(info.st_dev);
+    captured.inode = static_cast<uint64_t>(info.st_ino);
+    captured.mode = static_cast<uint64_t>(info.st_mode);
+    captured.size = static_cast<uint64_t>(info.st_size);
+#if defined(F_GET_SEALS)
+    errno = 0;
+    const int seals = ::fcntl(fd, F_GET_SEALS);
+    if (seals >= 0) {
+        captured.has_seals = true;
+        captured.seals = static_cast<uint64_t>(seals);
+    } else if (errno != EINVAL) {
+        return false;
+    }
+#endif
+    *identity = captured;
+    return captured.valid();
+}
+
+bool source_identity_equal(const SourceIdentity& left,
+                           const SourceIdentity& right) noexcept {
+    return left.valid() && right.valid() && left.device == right.device &&
+           left.inode == right.inode && left.mode == right.mode &&
+           left.size == right.size && left.has_seals == right.has_seals &&
+           (!left.has_seals || left.seals == right.seals);
+}
+
+bool source_identity_matches(int fd, const SourceIdentity& expected) noexcept {
+    SourceIdentity actual;
+    if (!capture_source_identity(fd, &actual))
+        return false;
+    return source_identity_equal(actual, expected);
+}
+
+#if defined(ICECC_P50_FORK_FD_HYGIENE_TEST_HOOKS)
+int duplicate_owner_fd(int fd) noexcept {
+#if defined(F_DUPFD_CLOEXEC)
+    const int duplicate = ::fcntl(fd, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+#else
+    const int duplicate = ::fcntl(fd, F_DUPFD, STDERR_FILENO + 1);
+#endif
+    if (duplicate < 0)
+        return -1;
+#if !defined(F_DUPFD_CLOEXEC)
+    const int flags = ::fcntl(duplicate, F_GETFD);
+    if (flags < 0 || ::fcntl(duplicate, F_SETFD, flags | FD_CLOEXEC) != 0) {
+        (void)::close(duplicate);
+        return -1;
+    }
+#endif
+    return duplicate;
+}
+#endif
+
+#if defined(ICECC_P50_FORK_FD_HYGIENE_TEST_HOOKS)
+constexpr uint64_t kTestOwnerCookie = UINT64_C(0x9d5f31a7c2e84b61);
+#endif
+
+} // namespace
+
 DeliveryOwnerToken::DeliveryOwnerToken(int expected_fd,
                                        uint64_t expected_delivery_id,
+                                       int owner_fd, SourceIdentity identity,
                                        uint64_t owner_cookie) noexcept
     : expected_fd_(expected_fd), expected_delivery_id_(expected_delivery_id),
-      owner_cookie_(owner_cookie) {}
+      owner_fd_(owner_fd), identity_(identity), owner_cookie_(owner_cookie) {}
 
 DeliveryOwnerToken::DeliveryOwnerToken(DeliveryOwnerToken&& other) noexcept
     : expected_fd_(other.expected_fd_),
       expected_delivery_id_(other.expected_delivery_id_),
+      owner_fd_(other.owner_fd_),
+      identity_(other.identity_),
       owner_cookie_(other.owner_cookie_) {
     other.expected_fd_ = -1;
     other.expected_delivery_id_ = 0;
+    other.owner_fd_ = -1;
+    other.identity_ = SourceIdentity{};
     other.owner_cookie_ = 0;
 }
 
 DeliveryOwnerToken& DeliveryOwnerToken::operator=(DeliveryOwnerToken&& other) noexcept {
     if (this != &other) {
+        if (owner_fd_ >= 0)
+            (void)::close(owner_fd_);
         expected_fd_ = other.expected_fd_;
         expected_delivery_id_ = other.expected_delivery_id_;
+        owner_fd_ = other.owner_fd_;
+        identity_ = other.identity_;
         owner_cookie_ = other.owner_cookie_;
         other.expected_fd_ = -1;
         other.expected_delivery_id_ = 0;
+        other.owner_fd_ = -1;
+        other.identity_ = SourceIdentity{};
         other.owner_cookie_ = 0;
     }
     return *this;
 }
 
+DeliveryOwnerToken::~DeliveryOwnerToken() {
+    if (owner_fd_ >= 0)
+        (void)::close(owner_fd_);
+}
+
 ForkSourceLease::ForkSourceLease(int fd, uint64_t delivery_id, int expected_fd,
-                                 uint64_t expected_delivery_id,
+                                 uint64_t expected_delivery_id, int owner_fd,
+                                 SourceIdentity identity,
                                  uint64_t owner_cookie) noexcept
     : fd_(fd), delivery_id_(delivery_id), expected_fd_(expected_fd),
-      expected_delivery_id_(expected_delivery_id), owner_cookie_(owner_cookie) {}
+      expected_delivery_id_(expected_delivery_id), owner_fd_(owner_fd),
+      identity_(identity), owner_cookie_(owner_cookie) {}
 
 ForkSourceLease::ForkSourceLease(ForkSourceLease&& other) noexcept
     : fd_(other.fd_), delivery_id_(other.delivery_id_),
       expected_fd_(other.expected_fd_),
       expected_delivery_id_(other.expected_delivery_id_),
+      owner_fd_(other.owner_fd_),
+      identity_(other.identity_),
       owner_cookie_(other.owner_cookie_) {
     other.fd_ = -1;
     other.delivery_id_ = 0;
     other.expected_fd_ = -1;
     other.expected_delivery_id_ = 0;
+    other.owner_fd_ = -1;
+    other.identity_ = SourceIdentity{};
     other.owner_cookie_ = 0;
 }
 
@@ -76,32 +176,60 @@ ForkSourceLease& ForkSourceLease::operator=(ForkSourceLease&& other) noexcept {
         delivery_id_ = other.delivery_id_;
         expected_fd_ = other.expected_fd_;
         expected_delivery_id_ = other.expected_delivery_id_;
+        owner_fd_ = other.owner_fd_;
+        identity_ = other.identity_;
         owner_cookie_ = other.owner_cookie_;
         other.fd_ = -1;
         other.delivery_id_ = 0;
         other.expected_fd_ = -1;
         other.expected_delivery_id_ = 0;
+        other.owner_fd_ = -1;
+        other.identity_ = SourceIdentity{};
         other.owner_cookie_ = 0;
     }
     return *this;
 }
 
 ForkSourceLease::~ForkSourceLease() {
-    if (fd_ >= 0)
-        (void)::close(fd_);
+    if (owner_fd_ >= 0)
+        (void)::close(owner_fd_);
+}
+
+bool ForkSourceLease::retire_identity_proof() noexcept {
+    if (owner_fd_ < 0)
+        return false;
+    const int proof = owner_fd_;
+    if (close_exact(proof)) {
+        owner_fd_ = -1;
+        return true;
+    }
+    if (errno == EBADF)
+        owner_fd_ = -1;
+    return false;
+}
+
+bool ForkSourceLease::identity_matches_current() const noexcept {
+    return valid() && source_identity_matches(owner_fd_, identity_) &&
+           source_identity_matches(fd_, identity_);
 }
 
 std::optional<ForkSourceLease>
 mint_fork_source_lease(DeliveryOwnerToken&& owner, int fd,
                        uint64_t delivery_id) noexcept {
     if (owner.owner_cookie_ == 0 || owner.expected_fd_ < 0 ||
+        owner.owner_fd_ < 0 || !owner.identity_.valid() ||
         owner.expected_delivery_id_ == 0 || fd != owner.expected_fd_ ||
-        delivery_id != owner.expected_delivery_id_)
+        delivery_id != owner.expected_delivery_id_ ||
+        !source_identity_matches(owner.owner_fd_, owner.identity_) ||
+        !source_identity_matches(fd, owner.identity_))
         return std::nullopt;
     ForkSourceLease result(fd, delivery_id, owner.expected_fd_,
-                           owner.expected_delivery_id_, owner.owner_cookie_);
+                           owner.expected_delivery_id_, owner.owner_fd_,
+                           owner.identity_, owner.owner_cookie_);
     owner.expected_fd_ = -1;
     owner.expected_delivery_id_ = 0;
+    owner.owner_fd_ = -1;
+    owner.identity_ = SourceIdentity{};
     owner.owner_cookie_ = 0;
     return result;
 }
@@ -112,8 +240,6 @@ constexpr int kFirstNonstandardFd = STDERR_FILENO + 1;
 constexpr size_t kMaxEnumeratedFds = 65536;
 constexpr size_t kMaxProcReads = 4096;
 constexpr size_t kMaxProcBytes = size_t{16} << 20;
-constexpr uint64_t kTestOwnerCookie = UINT64_C(0x9d5f31a7c2e84b61);
-
 #if defined(ICECC_P50_FORK_FD_HYGIENE_TEST_HOOKS)
 TestHooks hooks;
 #endif
@@ -174,7 +300,7 @@ Failure validate_keep_set(const KeepSet& keep) noexcept {
     if (keep.source_required != keep.source.has_value())
         return Failure::InvalidKeepSet;
     if (keep.source.has_value()) {
-        if (!keep.source->valid() ||
+        if (!keep.source->valid() || !keep.source->identity_matches_current() ||
             keep.source->fd() < kFirstNonstandardFd ||
             keep.source->delivery_id() == 0 ||
             keep.source->fd() == keep.stat_pipe_fd ||
@@ -463,10 +589,12 @@ Result bounded_fallback(const KeepSet& keep) noexcept {
 
 } // namespace
 
-Result sweep(const KeepSet& keep) noexcept {
+Result sweep(KeepSet& keep) noexcept {
     const Failure validation = validate_keep_set(keep);
     if (validation != Failure::None)
         return {validation, 0};
+    if (keep.source.has_value() && !keep.source->retire_identity_proof())
+        return {Failure::CloseFailure, 0};
 
 #if defined(__linux__)
     const Result range = close_range_sweep(keep);
@@ -502,8 +630,17 @@ std::optional<DeliveryOwnerToken>
 test_make_delivery_owner(int expected_fd, uint64_t expected_delivery_id) noexcept {
     if (expected_fd < 0 || expected_delivery_id == 0)
         return std::nullopt;
-    return DeliveryOwnerToken(expected_fd, expected_delivery_id,
-                              kTestOwnerCookie);
+    SourceIdentity identity;
+    if (!capture_source_identity(expected_fd, &identity))
+        return std::nullopt;
+    const int owner_fd = duplicate_owner_fd(expected_fd);
+    if (owner_fd < 0 || !source_identity_matches(owner_fd, identity)) {
+        if (owner_fd >= 0)
+            (void)::close(owner_fd);
+        return std::nullopt;
+    }
+    return DeliveryOwnerToken(expected_fd, expected_delivery_id, owner_fd,
+                              identity, kTestOwnerCookie);
 }
 #endif
 

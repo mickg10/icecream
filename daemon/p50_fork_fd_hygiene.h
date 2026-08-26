@@ -12,7 +12,22 @@
 
 namespace icecc::p50::forkfd {
 
+struct SourceIdentity {
+    uint64_t device = 0;
+    uint64_t inode = 0;
+    uint64_t mode = 0;
+    uint64_t size = 0;
+    uint64_t seals = 0;
+    bool has_seals = false;
+
+    [[nodiscard]] bool valid() const noexcept {
+        return device != 0 && inode != 0 && mode != 0;
+    }
+};
+
 class ForkSourceLease;
+struct KeepSet;
+struct Result;
 
 // This token is minted by the delivery owner, not by the fork seam.  Its
 // constructor is private so an arbitrary fd/nonzero-id pair cannot be made
@@ -26,13 +41,16 @@ public:
     DeliveryOwnerToken& operator=(const DeliveryOwnerToken&) = delete;
     DeliveryOwnerToken(DeliveryOwnerToken&& other) noexcept;
     DeliveryOwnerToken& operator=(DeliveryOwnerToken&& other) noexcept;
-    ~DeliveryOwnerToken() = default;
+    ~DeliveryOwnerToken();
 
 private:
     DeliveryOwnerToken(int expected_fd, uint64_t expected_delivery_id,
+                       int owner_fd, SourceIdentity identity,
                        uint64_t owner_cookie) noexcept;
     int expected_fd_ = -1;
     uint64_t expected_delivery_id_ = 0;
+    int owner_fd_ = -1;
+    SourceIdentity identity_{};
     uint64_t owner_cookie_ = 0;
 
     friend std::optional<DeliveryOwnerToken>
@@ -66,21 +84,29 @@ public:
     [[nodiscard]] uint64_t delivery_id() const noexcept { return delivery_id_; }
     [[nodiscard]] bool valid() const noexcept {
         return fd_ >= 0 && delivery_id_ != 0 && owner_cookie_ != 0 &&
+               owner_fd_ >= 0 && identity_.valid() &&
                fd_ == expected_fd_ && delivery_id_ == expected_delivery_id_;
     }
+    [[nodiscard]] bool identity_matches_current() const noexcept;
 
 private:
     ForkSourceLease(int fd, uint64_t delivery_id, int expected_fd,
-                    uint64_t expected_delivery_id, uint64_t owner_cookie) noexcept;
+                    uint64_t expected_delivery_id, int owner_fd,
+                    SourceIdentity identity, uint64_t owner_cookie) noexcept;
     int fd_ = -1;
     uint64_t delivery_id_ = 0;
     int expected_fd_ = -1;
     uint64_t expected_delivery_id_ = 0;
+    int owner_fd_ = -1;
+    SourceIdentity identity_{};
     uint64_t owner_cookie_ = 0;
+
+    bool retire_identity_proof() noexcept;
 
     friend std::optional<ForkSourceLease>
     mint_fork_source_lease(DeliveryOwnerToken&& owner, int fd,
                            uint64_t delivery_id) noexcept;
+    friend Result sweep(KeepSet& keep) noexcept;
 };
 
 // The only public construction seam is deliberately fed by an opaque token
@@ -112,7 +138,7 @@ struct Result {
     [[nodiscard]] bool ok() const noexcept { return failure == Failure::None; }
 };
 
-[[nodiscard]] Result sweep(const KeepSet& keep) noexcept;
+[[nodiscard]] Result sweep(KeepSet& keep) noexcept;
 [[nodiscard]] const char* failure_name(Failure failure) noexcept;
 
 #if defined(ICECC_P50_FORK_FD_HYGIENE_TEST_HOOKS)

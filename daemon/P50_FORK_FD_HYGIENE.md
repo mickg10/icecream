@@ -9,6 +9,8 @@ set:
 * a P50 job may add exactly one accepted sealed source descriptor, bound to its
   nonzero `InputFdRequest::request_id` DeliveryId through a move-only,
   owner-minted `ForkSourceLease`; a numeric DeliveryId is never authority;
+  the lease retains an independent owning proof duplicate while the exact
+  handoff FD remains owned by the delivery caller and must be the same number;
 * every keep descriptor is distinct, owned by this process, of the expected
   type (FIFO, connected stream socket, regular file), with the statistics pipe
   write-only, client socket read/write, source read-only, and all channels
