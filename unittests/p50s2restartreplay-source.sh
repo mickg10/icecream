@@ -54,7 +54,7 @@ for pattern in \
     'void case_phase_replay()' \
     'void case_adoption_lost_ack_and_reverse_replay()' \
     'CHECK(ledger.transition_count() == 1' \
-    'CHECK(ledger.transition_count() == 1'; do
+    'ledger.fork_count() == 1'; do
     mutant="$mutant_dir/${pattern##*/}.cpp"
     grep -vF "$pattern" "$test_file" >"$mutant"
     if gate "$mutant"; then
