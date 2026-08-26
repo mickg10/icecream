@@ -140,12 +140,14 @@ int structured_fake_child(int fd) {
     const char* format = environment("ICECC_CACHE_SERVICE_READY_FORMAT");
     const char* generation = environment("ICECC_CACHE_SERVICE_EXPECTED_GENERATION");
     const char* attempt = environment("ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT");
+    const char* store_generation =
+        environment("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION");
     const char* c_guid = environment("ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID");
     const char* f_guid = environment("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID");
     const char* path = environment("ICECC_CACHE_SERVICE_EXPECTED_SOCKET");
     const char* digest = environment("ICECC_CACHE_SERVICE_EXPECTED_SOCKET_DIGEST");
     if (format == nullptr || std::string_view(format) != "2" || generation == nullptr ||
-        attempt == nullptr || c_guid == nullptr || f_guid == nullptr || path == nullptr ||
+        attempt == nullptr || store_generation == nullptr || c_guid == nullptr || f_guid == nullptr || path == nullptr ||
         digest == nullptr || !valid_nonzero_guid_hex(c_guid) ||
         !valid_nonzero_guid_hex(f_guid) || std::string_view(c_guid) == f_guid)
         return 90;
@@ -172,6 +174,8 @@ int structured_fake_child(int fd) {
     }
     const std::string ready =
         "READY v2 generation=" + std::string(generation) + " attempt=" + attempt +
+        " F_STORE_GENERATION=" + std::string(store_generation) +
+        " DERIVATION_VERSION=1" +
         " pid=" + std::to_string(static_cast<long long>(::getpid())) +
         " C_STORE_GUID=" + c_guid + " F_STORE_GUID=" + f_guid +
         " PATH=" + path + " DIGEST=" + digest +

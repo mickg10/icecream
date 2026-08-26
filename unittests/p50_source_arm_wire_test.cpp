@@ -245,6 +245,27 @@ void test_rejects_malformed_and_legacy()
             "source-arm decoder rejects trailing payload bytes");
     delete trailing_decoded;
 
+    Pair malformed_pair = make_pair(PROTOCOL_VERSION);
+    REQUIRE(::send(malformed_pair.left->fd, trailing.data(), trailing.size(), 0) ==
+                ssize_t(trailing.size()),
+            "malformed source-arm frame reaches the decoder");
+    Msg *malformed_message = malformed_pair.right->get_msg(2, true);
+    uint32_t invalid_wire_id = 0;
+    uint64_t invalid_epoch = 0;
+    uint64_t invalid_nonce = 0;
+    const bool retained_identity =
+        malformed_pair.right->take_invalid_p50_source_arm_identity(
+            &invalid_wire_id, &invalid_epoch, &invalid_nonce);
+    REQUIRE(malformed_message == nullptr && retained_identity &&
+                invalid_wire_id == request.arm.wire_job_id &&
+                invalid_epoch == request.arm.assignment_epoch &&
+                invalid_nonce == request.arm.assignment_nonce,
+            "malformed source-arm preserves only its exact assignment triple");
+    REQUIRE(!malformed_pair.right->take_invalid_p50_source_arm_identity(
+                &invalid_wire_id, &invalid_epoch, &invalid_nonce),
+            "malformed source-arm assignment triple is one-shot");
+    delete malformed_message;
+
     Bytes ack_trailing = encode_frame(armed(request.arm));
     REQUIRE(!ack_trailing.empty(), "valid armed ACK fixture exists for mutation");
     const uint32_t ack_body = frame_body_size(ack_trailing);

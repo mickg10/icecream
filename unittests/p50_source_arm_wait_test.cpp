@@ -13,6 +13,7 @@ using icecc::p50::FStoreGuid;
 using icecc::p50::Id128;
 using icecc::p50::P50InputReady;
 using icecc::p50::P50SourceArm;
+using ::P50SourceArmFields;
 using icecc::p50::TuSeq;
 using icecc::p50::daemon::P50InputWaitState;
 using icecc::p50::daemon::P50SourceArmGate;
@@ -62,6 +63,29 @@ P50InputReady ready_for(const P50SourceArm& source_arm) {
     result.attachment_store_generation = 59;
     result.attachment_request_id = source_arm.source_request_id;
     result.ready_event_id = 67;
+    return result;
+}
+
+P50SourceArmFields canonical_arm() {
+    P50SourceArmFields result;
+    const P50SourceArm source = arm();
+    result.wire_job_id = source.wire_job_id;
+    result.assignment_epoch = source.assignment_epoch;
+    result.assignment_nonce = source.assignment_nonce;
+    result.selected_f_host = source.selected_f_host;
+    result.selected_f_ordinary_port = source.selected_f_ordinary_port;
+    result.selected_f_cache_port = source.selected_f_cache_port;
+    result.cache_protocol = source.cache_protocol;
+    result.cache_profile = source.cache_profile;
+    result.logical_job = source.logical_job;
+    result.compiler_attempt = source.attempt_id;
+    result.c_store_generation = source.c_store_generation;
+    result.c_store_derivation_version = icecc::p50::kStoreIdentityDerivationVersion;
+    result.c_store_guid = source.c_store_guid.bytes;
+    result.source_request_id = source.source_request_id;
+    result.source_mode = source.source_mode;
+    result.c_control_generation = 101;
+    result.c_control_attempt = 103;
     return result;
 }
 
@@ -119,6 +143,26 @@ void wait_state() {
     const P50InputReady ready = ready_for(source_arm);
     P50InputWaitState state;
     require(state.arm_input(source_arm), "WAITP50INPUT arm was rejected");
+
+    P50InputWaitState canonical_state;
+    const P50SourceArmFields complete = canonical_arm();
+    require(canonical_state.arm_input(complete),
+            "canonical WAITP50INPUT arm was rejected");
+    P50SourceArmFields dropped = complete;
+    dropped.c_control_generation++;
+    int canonical_fds[2] = {-1, -1};
+    require(::pipe(canonical_fds) == 0, "canonical pipe setup failed");
+    require(!canonical_state.accept_ready(dropped, ready, canonical_fds[0]),
+            "canonical WAIT accepted a changed C control generation");
+    dropped = complete;
+    dropped.c_control_attempt++;
+    require(!canonical_state.accept_ready(dropped, ready, canonical_fds[0]),
+            "canonical WAIT accepted a changed C control attempt");
+    require(canonical_state.accept_ready(complete, ready, canonical_fds[0]),
+            "canonical WAIT rejected the complete arm");
+    require(canonical_state.take_for_fork() == canonical_fds[0],
+            "canonical WAIT did not retain the sealed FD");
+    ::close(canonical_fds[1]);
     require(state.state() == P50InputWaitState::State::WaitP50Input,
             "arm did not enter WAITP50INPUT");
     require(!state.can_fork() && state.take_for_fork() == -1,

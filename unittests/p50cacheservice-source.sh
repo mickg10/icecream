@@ -27,6 +27,7 @@ for pair in \
     "$impl|have_f_store_guid" \
     "$impl|structured_launch.c_store_guid" \
     "$impl|structured_launch.f_store_guid" \
+    "$impl|structured_launch.f_store_generation" \
     "$impl|store_identity_root_from_f_guid" \
     "$impl|c_guid != c_store_guid_for_root(root)" \
     "$impl|guid != f_store_guid_for_root(root)" \
@@ -36,7 +37,7 @@ for pair in \
     "$header|RuntimeConfig" \
     "$test_file|legacy_store_identity_launches" \
     "$test_file|test_runtime_store_identity_is_explicit_and_role_tagged" \
-    "$test_file|READY v2 generation=91 attempt=7 DERIVATION_VERSION=1" \
+    "$test_file|READY v2 generation=91 attempt=7 F_STORE_GENERATION=191 DERIVATION_VERSION=1" \
     "$doc|CSPRNG"; do
     file=${pair%%|*}; pattern=${pair#*|}
     require "$file" "$pattern"

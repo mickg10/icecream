@@ -1,6 +1,7 @@
 #pragma once
 
 #include "p50_source_identity.h"
+#include "../services/comm.h"
 
 namespace icecc::p50::daemon {
 
@@ -45,10 +46,16 @@ public:
     // Installs WAITP50INPUT and returns true only for a complete arm.  The
     // caller sends P50_INPUT_ARMED only after this returns true.
     bool arm_input(const P50SourceArm& arm) noexcept;
+    bool arm_input(const P50SourceArmFields& arm) noexcept;
 
     // Takes ownership of sealed_fd only after all exact-ready checks pass.
     // Failure leaves the existing wait state and caller ownership unchanged.
     bool accept_ready(const P50InputReady& ready, int sealed_fd) noexcept;
+    // Canonical production path.  The complete arm is supplied at the
+    // attachment boundary so C control generation/attempt cannot be lost in
+    // the legacy P50SourceArm wire shape.
+    bool accept_ready(const P50SourceArmFields& arm,
+                      const P50InputReady& ready, int sealed_fd) noexcept;
 
     // Transfers the one sealed FD to the compiler worker and makes a second
     // fork impossible.  Returns -1 unless an exact ready attachment arrived.
@@ -63,6 +70,7 @@ private:
 
     State state_ = State::Idle;
     P50SourceArm arm_{};
+    std::optional<P50SourceArmFields> canonical_arm_;
     P50InputReady ready_{};
     int sealed_fd_ = -1;
 };

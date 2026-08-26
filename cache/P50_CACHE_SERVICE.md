@@ -15,7 +15,7 @@ The command-line form remains an explicit standalone/test fallback:
 icecc-cache-service \
   --socket /run/user/4103/icecc/cache-service.sock \
   --peer-uid 4103 --peer-gid 3513 \
-  --generation 7 --attempt 1
+  --generation 7 --attempt 1 --f-store-generation 7
 ```
 
 The socket path is absolute, its existing parent is owned by the effective
@@ -31,18 +31,20 @@ pre-bound listener.
 
 The installed F-store GUID is the role-tagged projection of a fresh
 CSPRNG-backed StoreIdentity root (C is root||0 and F is root||1; neither is
-derived from the local generation/attempt identity):
-generation and attempt are encoded independently. Consequently a restart
-with the same generation and a new attempt cannot reopen the prior empty-store
-identity.
+derived from the local generation/attempt identity). Control generation,
+control attempt, and F-store generation are encoded separately. Consequently,
+a restart with the same control generation and a new attempt cannot reopen the
+prior empty-store identity.
 
-Under the supervisor, seven environment fields form one immutable all-or-none
-launch tuple:
+Under the supervisor, nine identity environment fields form one immutable
+all-or-none launch tuple:
 
 ```
 ICECC_CACHE_SERVICE_READY_FORMAT=2
 ICECC_CACHE_SERVICE_EXPECTED_GENERATION=...
 ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT=...
+ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION=...
+ICECC_CACHE_SERVICE_EXPECTED_DERIVATION_VERSION=1
 ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID=...
 ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID=...
 ICECC_CACHE_SERVICE_EXPECTED_SOCKET=...

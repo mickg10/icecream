@@ -25,6 +25,13 @@ cppflags=${ICECC_TEST_CPPFLAGS:-${CPPFLAGS:-}}
 ldflags=${ICECC_TEST_LDFLAGS:-${LDFLAGS:-}}
 libs=${ICECC_TEST_LIBS:-${LIBS:-}}
 sanitize_flags=${ICECC_TEST_SANITIZE_FLAGS:--fsanitize=address,undefined,leak}
+lzo_lib=${ICECC_TEST_LZO_LIBS:-}
+if [ -z "$lzo_lib" ] && [ -f /lib/x86_64-linux-gnu/liblzo2.so.2 ]; then
+    lzo_lib=/lib/x86_64-linux-gnu/liblzo2.so.2
+fi
+if [ -z "$lzo_lib" ]; then
+    lzo_lib=-llzo2
+fi
 mkdir -p "$build_dir"
 binary=$(mktemp "$build_dir/p50s2restartreplay-sanitize.XXXXXX")
 cleanup() { rm -f -- "$binary"; }
@@ -40,6 +47,7 @@ trap cleanup EXIT HUP INT TERM
     "$test_srcdir/../cache/p50_local_transport.cpp" \
     "$test_srcdir/../cache/p50_phase_open.cpp" \
     "$test_srcdir/../cache/p50_source_identity.cpp" \
-    $ldflags "$services_lib" $libs -o "$binary"
+    $ldflags "$services_lib" ${ICECC_TEST_LIBZSTD_LIBS:--lzstd} \
+    ${ICECC_TEST_XXHASH_LIBS:--lxxhash} $lzo_lib -ldl $libs -o "$binary"
 ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 "$binary"
 echo 'PASS: bounded S2 restart/replay ASan/UBSan/LSan gate passed'

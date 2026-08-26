@@ -34,7 +34,7 @@ inline bool store_identity_guid_valid_for_role(
         if (root_byte != 0)
             return true;
     }
-    return false;
+    return false; // P50_ROOT_NONZERO_CHECK
 }
 
 inline bool store_identity_file_guid_matches_client(

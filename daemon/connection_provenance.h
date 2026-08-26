@@ -44,6 +44,11 @@ struct ConnectionProvenance {
     ListenerKind listener = ListenerKind::TcpRemote;
     PeerCredentials peer{};
 
+    // Source-arm ownership is a value lease.  Comparing the complete
+    // accept-time tuple prevents a later fd/client reuse from inheriting an
+    // old ordinary-wrapper authorization.
+    bool operator==(const ConnectionProvenance&) const = default;
+
     bool cache_eligible() const noexcept {
         return lease.valid() && listener == ListenerKind::UnixLocal && peer.complete();
     }

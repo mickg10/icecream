@@ -30,6 +30,13 @@ dep_ldflags=
 if test -n "$dep_libdir"; then
     dep_ldflags="-L$dep_libdir"
 fi
+lzo_lib=${ICECC_TEST_LZO_LIBS:-}
+if test -z "$lzo_lib" && test -f /lib/x86_64-linux-gnu/liblzo2.so.2; then
+    lzo_lib=/lib/x86_64-linux-gnu/liblzo2.so.2
+fi
+if test -z "$lzo_lib"; then
+    lzo_lib=-llzo2
+fi
 
 "$cxx" "$standard" $cxxflags $cppflags \
     $boost_cppflags ${ICECC_TEST_LIBZSTD_CFLAGS:-} \
@@ -48,7 +55,7 @@ fi
     "$build_dir/../cache/libp50localtransport.a" \
     "$build_dir/../services/.libs/libicecc.a" \
     $dep_ldflags ${ICECC_TEST_LIBZSTD_LIBS:--lzstd} \
-    ${ICECC_TEST_XXHASH_LIBS:--lxxhash} -ldl $libs -o "$binary"
+    ${ICECC_TEST_XXHASH_LIBS:--lxxhash} $lzo_lib -ldl $libs -o "$binary"
 
 ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
 UBSAN_OPTIONS=halt_on_error=1 \

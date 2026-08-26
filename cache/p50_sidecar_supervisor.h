@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdint>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -88,14 +89,23 @@ enum class Failure : uint8_t {
 
 struct LaunchIncarnation {
     local::Identity identity{};
+    // F-store generation is an incarnation authority distinct from the
+    // daemon control generation.  It advances for every sidecar allocation,
+    // including replacement under one daemon generation.
+    uint64_t store_generation = 0;
     StoreIdentityRoot store_root{};
     CStoreGuid c_store_guid{};
     FStoreGuid f_store_guid{};
 
     [[nodiscard]] bool valid() const noexcept {
         return identity.generation != 0 && identity.attempt != 0 &&
-        store_root.valid() && c_store_guid != CStoreGuid{} &&
-        f_store_guid != FStoreGuid{} && c_store_guid != f_store_guid &&
+        store_generation != 0 && store_generation != std::numeric_limits<uint64_t>::max() &&
+        store_root.valid() &&
+        store_identity_guid_valid_for_role(c_store_guid.bytes,
+                                           kStoreIdentityClientRole) &&
+        store_identity_guid_valid_for_role(f_store_guid.bytes,
+                                           kStoreIdentityFileRole) &&
+        c_store_guid != f_store_guid &&
         c_store_guid == c_store_guid_for_root(store_root) &&
         f_store_guid == f_store_guid_for_root(store_root);
     }
@@ -116,6 +126,7 @@ private:
     std::mutex mutex_;
     uint64_t generation_ = 0;
     uint64_t next_attempt_ = 0;
+    uint64_t next_store_generation_ = 0;
     StoreIdentityEntropyProvider entropy_provider_ = nullptr;
     std::deque<StoreIdentityRoot> recent_roots_;
 };
@@ -143,6 +154,7 @@ struct Config {
 
 struct ReadyLease {
     local::Identity identity{};
+    uint64_t store_generation = 0;
     pid_t pid = -1;
     StoreIdentityRoot store_root{};
     uint64_t store_derivation_version = 0;
@@ -157,9 +169,15 @@ struct ReadyLease {
     ino_t directory_inode = 0;
 
     [[nodiscard]] bool valid() const noexcept {
-        if (identity.generation == 0 || identity.attempt == 0 || pid <= 1 ||
+        if (identity.generation == 0 || identity.attempt == 0 ||
+            store_generation == 0 || store_generation == std::numeric_limits<uint64_t>::max() ||
+            pid <= 1 ||
             !store_root.valid() ||
             store_derivation_version != kStoreIdentityDerivationVersion ||
+            !store_identity_guid_valid_for_role(c_store_guid.bytes,
+                                                kStoreIdentityClientRole) ||
+            !store_identity_guid_valid_for_role(f_store_guid.bytes,
+                                                kStoreIdentityFileRole) ||
             c_store_guid != c_store_guid_for_root(store_root) ||
             f_store_guid != f_store_guid_for_root(store_root) ||
             c_store_guid == f_store_guid ||

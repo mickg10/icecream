@@ -22,7 +22,11 @@ grep -F 'expected_peer.pid' "$test" >/dev/null
 grep -F 'on_demand_' "$impl" >/dev/null
 grep -F 'const auto deadline' "$impl" >/dev/null
 grep -F 'identity != identity_' "$impl" >/dev/null
-grep -F 'c_store_guid != CStoreGuid{}' "$impl" >/dev/null
+grep -F 'store_identity_guid_valid_for_role(c_store_guid.bytes' "$impl" >/dev/null
+grep -F 'kStoreIdentityClientRole' "$impl" >/dev/null
+grep -F 'store_identity_guid_valid_for_role(f_store_guid.bytes' "$impl" >/dev/null
+grep -F 'kStoreIdentityFileRole' "$impl" >/dev/null
+grep -F 'c_store_guid != f_store_guid' "$impl" >/dev/null
 grep -F 'next_request_id_++' "$impl" >/dev/null
 grep -F 'disable();' "$impl" >/dev/null
 grep -Fx '    if (!on_demand_->current_path_matches())' "$impl" >/dev/null

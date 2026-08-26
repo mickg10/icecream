@@ -1228,6 +1228,9 @@ MsgChannel::MsgChannel(int _fd, struct sockaddr *_a, socklen_t _l, bool text)
     text_based = text;
     cache_session_release_armed = false;
     cache_session_send_release_armed = false;
+    invalid_p50_source_arm_wire_id = 0;
+    invalid_p50_source_arm_epoch = 0;
+    invalid_p50_source_arm_nonce = 0;
     set_error_recursion = false;
     maximum_remote_protocol = -1;
 
@@ -1476,6 +1479,14 @@ Msg *MsgChannel::get_msg(int timeout, bool eofAllowed)
        attempting another receive is itself the next parser use. */
     cache_session_release_armed = false;
     cache_session_send_release_armed = false;
+    // set_error() probes one optional STATUS_TEXT frame by recursively
+    // calling get_msg(). Keep a malformed arm's exact triple across that
+    // internal probe; a later external decode starts a fresh identity slot.
+    if (!set_error_recursion) {
+        invalid_p50_source_arm_wire_id = 0;
+        invalid_p50_source_arm_epoch = 0;
+        invalid_p50_source_arm_nonce = 0;
+    }
 
     if (!wait_for_msg(timeout)) {
         // trace() << "!wait_for_msg()\n";
@@ -1660,6 +1671,16 @@ Msg *MsgChannel::get_msg(int timeout, bool eofAllowed)
     m->fill_from_channel(this);
 
     if (!m->valid_payload()) {
+        if (type == Msg::P50_SOURCE_ARM) {
+            const auto *arm = dynamic_cast<const P50SourceArmMsg *>(m);
+            if (arm != nullptr && arm->arm.wire_job_id != 0 &&
+                arm->arm.assignment_epoch != 0 &&
+                arm->arm.assignment_nonce != 0) {
+                invalid_p50_source_arm_wire_id = arm->arm.wire_job_id;
+                invalid_p50_source_arm_epoch = arm->arm.assignment_epoch;
+                invalid_p50_source_arm_nonce = arm->arm.assignment_nonce;
+            }
+        }
         log_error() << "invalid message payload (" << m->to_string() << ")" << endl;
         delete m;
         set_error();
@@ -1684,6 +1705,24 @@ Msg *MsgChannel::get_msg(int timeout, bool eofAllowed)
     }
 
     return m;
+}
+
+bool MsgChannel::take_invalid_p50_source_arm_identity(
+    uint32_t *wire_id, uint64_t *epoch, uint64_t *nonce) noexcept
+{
+    if (wire_id == nullptr || epoch == nullptr || nonce == nullptr ||
+        invalid_p50_source_arm_wire_id == 0 ||
+        invalid_p50_source_arm_epoch == 0 ||
+        invalid_p50_source_arm_nonce == 0) {
+        return false;
+    }
+    *wire_id = invalid_p50_source_arm_wire_id;
+    *epoch = invalid_p50_source_arm_epoch;
+    *nonce = invalid_p50_source_arm_nonce;
+    invalid_p50_source_arm_wire_id = 0;
+    invalid_p50_source_arm_epoch = 0;
+    invalid_p50_source_arm_nonce = 0;
+    return true;
 }
 
 int MsgChannel::release_fd_if_input_empty()

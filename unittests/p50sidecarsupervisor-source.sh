@@ -105,6 +105,8 @@ grep -F 'max_attempts_per_recovery' "$impl" "$header" >/dev/null
 grep -F 'mkdtemp' "$impl" >/dev/null
 grep -F 'parse_ready_lease' "$impl" >/dev/null
 grep -F 'F_STORE_GUID' "$impl" "$header" >/dev/null
+grep -F 'store_generation' "$impl" "$header" >/dev/null
+grep -F 'F_STORE_GENERATION' "$impl" >/dev/null
 grep -F 'listener_device' "$impl" "$header" >/dev/null
 grep -F 'pathname_info' "$impl" >/dev/null
 grep -F 'lstat(lease.socket_path.c_str()' "$impl" >/dev/null

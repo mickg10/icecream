@@ -444,6 +444,14 @@ public:
     // Will warn in log if EOF and !eofAllowed.
     Msg *get_msg(int timeout = 10, bool eofAllowed = false);
 
+    // A malformed P50_SOURCE_ARM is never returned as a message, but its
+    // first exact assignment triple is retained long enough for the daemon's
+    // event loop to settle only that named scheduler owner. Endpoint, store,
+    // and control fields from an invalid frame are never exposed.
+    bool take_invalid_p50_source_arm_identity(uint32_t *wire_id,
+                                              uint64_t *epoch,
+                                              uint64_t *nonce) noexcept;
+
     /* Transfer the still-owned ordinary-link descriptor after the one
        immediately preceding decode returned CACHE_SESSION.  A successful
        transfer returns the descriptor and sets fd to -1; all refusal paths
@@ -647,6 +655,10 @@ protected:
     // Armed only by a fully flushed outbound CACHE_SESSION with no earlier
     // queued frame. Any later send/receive clears it permanently.
     bool cache_session_send_release_armed;
+
+    uint32_t invalid_p50_source_arm_wire_id = 0;
+    uint64_t invalid_p50_source_arm_epoch = 0;
+    uint64_t invalid_p50_source_arm_nonce = 0;
 
 private:
     friend class Service;

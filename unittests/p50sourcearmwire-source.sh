@@ -43,6 +43,9 @@ grep -F 'Protocol 49' "$test" >/dev/null
 grep -F 'WIRE-AUDIT three-bucket classification' "$test" >/dev/null
 grep -F 'stable Protocol-50 fixture bytes' "$test" >/dev/null
 grep -F 'independent F sidecar StoreIdentity root is accepted' "$test" >/dev/null
+grep -F 'malformed source-arm preserves only its exact assignment triple' "$test" >/dev/null
+grep -F 'malformed source-arm assignment triple is one-shot' "$test" >/dev/null
+grep -F 'take_invalid_p50_source_arm_identity' "$header" "$impl" >/dev/null
 test "$(grep -c '^[[:space:]]*p50_store_identity_wire\.h' "$makefile")" -eq 1
 if sed -n '/^ice_HEADERS =/,/^$/p' "$makefile" | grep -F 'p50_store_identity_wire.h' >/dev/null && \
    sed -n '/^noinst_HEADERS =/,/^$/p' "$makefile" | grep -F 'p50_store_identity_wire.h' >/dev/null; then
@@ -70,10 +73,17 @@ fi
 
 # Removing the exact trailing-byte check must be visible to this gate.
 mutant=$(mktemp "${TMPDIR:-/tmp}/p50sourcearmwire-mutant.XXXXXX")
-trap 'rm -f "$mutant"' EXIT HUP INT TERM
+identity_mutant=$(mktemp "${TMPDIR:-/tmp}/p50sourcearmwire-identity-mutant.XXXXXX")
+trap 'rm -f "$mutant" "$identity_mutant"' EXIT HUP INT TERM
 sed 's/channel->current_message_bytes_remaining() != 0/false/' "$impl" > "$mutant"
 if grep -F 'channel->current_message_bytes_remaining() != 0' "$mutant" >/dev/null; then
     echo 'FAIL: trailing-byte deletion mutant was accepted' >&2
+    exit 1
+fi
+
+sed 's/type == Msg::P50_SOURCE_ARM/false/' "$impl" > "$identity_mutant"
+if grep -F 'type == Msg::P50_SOURCE_ARM' "$identity_mutant" >/dev/null; then
+    echo 'FAIL: malformed-arm assignment capture deletion mutant was accepted' >&2
     exit 1
 fi
 echo 'ok - source-arm ordinary-wire deletion contract holds'

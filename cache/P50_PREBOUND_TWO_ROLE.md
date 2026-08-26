@@ -13,7 +13,7 @@ Structured `READY v2` contains one generation/attempt/PID/listener identity
 and both nonzero, unequal domain-separated GUIDs:
 
 ```
-READY v2 generation=... attempt=... pid=... C_STORE_GUID=... F_STORE_GUID=... PATH=... DIGEST=... DEV=... INO=...
+READY v2 generation=... attempt=... F_STORE_GENERATION=... DERIVATION_VERSION=1 pid=... C_STORE_GUID=... F_STORE_GUID=... PATH=... DIGEST=... DEV=... INO=...
 ```
 
 `ClientRoleOwner` and `ServerRoleOwner` are deliberately small pre-adoption

@@ -163,6 +163,7 @@ private:
 struct Options {
     std::string socket_path;
     local::Identity identity{};
+    uint64_t f_store_generation = 0;
     uint64_t store_derivation_version = 0;
     CStoreGuid c_store_guid{};
     FStoreGuid f_store_guid{};

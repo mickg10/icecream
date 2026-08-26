@@ -54,21 +54,23 @@ unbounded retry loop.
 ## Current READY lease
 
 When `Config::lease_root` and a shared `Config::launch_identities` allocator are
-supplied, every launch consumes a fresh nonzero attempt from that allocator and
-derives its `F_STORE_GUID` canonically from `(generation, attempt)`. The
-allocator is deliberately owned outside `Supervisor`, so restart and complete
+supplied, every launch consumes a fresh nonzero control attempt, an independent
+nonzero F-store generation, and a fresh CSPRNG-backed StoreIdentity root. The
+role GUIDs are canonical projections of that root; they are never derived from
+the control generation or attempt. The allocator is deliberately owned outside
+`Supervisor`, so restart and complete
 controller/Supervisor recreation cannot reset or reuse an attempt. Exhaustion
 fails closed rather than wrapping.
 
 Each launch creates a fresh `mkdtemp` directory named with the generation and
 attempt plus a unique suffix. The supervisor scrubs and then publishes the
-complete six-field structured environment tuple: READY format, generation,
-attempt, StoreIdentity derivation version, expected C/F store GUIDs, exact socket
-path, and path digest. The service
-rejects a partial tuple. It must close this bounded structured frame:
+complete nine-field structured identity tuple: READY format, control generation,
+control attempt, F-store generation, StoreIdentity derivation version, expected
+C/F store GUIDs, exact socket path, and path digest. The service rejects a
+partial tuple. It must close this bounded structured frame:
 
 ```text
-READY v2 generation=N attempt=N DERIVATION_VERSION=1 pid=N C_STORE_GUID=... F_STORE_GUID=... PATH=/... DIGEST=... DEV=N INO=N
+READY v2 generation=N attempt=N F_STORE_GENERATION=N DERIVATION_VERSION=1 pid=N C_STORE_GUID=... F_STORE_GUID=... PATH=/... DIGEST=... DEV=N INO=N
 ```
 
 The supervisor accepts the lease only when all fields match the allocated

@@ -51,4 +51,5 @@ noinst_HEADERS = \
 	serve.h \
 	workit.h \
 	file_util.h \
-	connection_provenance.h
+	connection_provenance.h \
+	p50_source_arm_wait_lease.h

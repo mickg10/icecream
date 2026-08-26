@@ -114,6 +114,7 @@
 #include "p50_daemon_cache_dispatch.h"
 #include "p50_input_wait.h"
 #include "connection_provenance.h"
+#include "p50_source_arm_wait_lease.h"
 
 static std::string pidFilePath;
 static volatile sig_atomic_t exit_main_loop = 0;
@@ -128,6 +129,31 @@ static uint64_t monotonic_msec()
 {
     using namespace std::chrono;
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+// The wire carries only this bounded relative budget.  Each F client retains
+// an absolute steady-clock deadline; ordinary traffic, replay, and a renewed
+// sidecar lease never extend it.
+static constexpr uint64_t kP50SourceArmBudgetMsec = 60000;
+
+static uint64_t p50_source_arm_budget_msec() noexcept
+{
+    uint64_t budget = kP50SourceArmBudgetMsec;
+    // Tests may shorten the wait to exercise the silent-expiry sweep.  The
+    // override is accepted only under ICECC_TESTS and remains inside the
+    // same nonzero wire bound; production has one fixed 60-second budget.
+    if (getenv("ICECC_TESTS") != nullptr) {
+        const char *text = getenv("ICECC_TEST_P50_SOURCE_BUDGET_MSEC");
+        if (text != nullptr && *text != '\0') {
+            char *end = nullptr;
+            const unsigned long long parsed = strtoull(text, &end, 10);
+            if (end != text && *end == '\0' && parsed != 0 &&
+                parsed <= P50SourceArmedFields::MaxSourceBudgetMsec) {
+                budget = static_cast<uint64_t>(parsed);
+            }
+        }
+    }
+    return budget;
 }
 
 static uint64_t fresh_cache_sidecar_generation() noexcept
@@ -616,6 +642,17 @@ public:
         return true;
     }
 
+    bool accept_p50_input(const P50SourceArmFields& fields,
+                          const icecc::p50::P50InputReady& ready,
+                          int sealed_fd) {
+        if (status != WAITP50INPUT || !p50_source_arm_fields.has_value() ||
+            *p50_source_arm_fields != fields ||
+            !p50_input_wait.accept_ready(fields, ready, sealed_fd))
+            return false;
+        set_status(TOCOMPILE, "p50: exact canonical ready/sealed input attached");
+        return true;
+    }
+
     static string status_str(Status status) {
         switch (status) {
         case UNKNOWN:
@@ -755,6 +792,117 @@ public:
     // arm_input()/accept_ready(); it must never set TOCOMPILE directly for an
     // armed P50 job.
     icecc::p50::daemon::P50InputWaitState p50_input_wait;
+
+    // Complete ordinary-wire source-arm ownership.  The compact reducer
+    // projection above is only a state gate; these values are the authority
+    // used for later CompileFile matching and teardown settlement.
+    std::optional<P50SourceArmFields> p50_source_arm_fields;
+    std::optional<icecc::p50::sidecar::ReadyLease> p50_source_f_lease;
+    // Retain the complete ACK, not just a compact lease projection.  The
+    // later cache-session join must be derivable from the canonical arm plus
+    // every F-side ACK fact without consulting a second mutable table.
+    std::optional<P50SourceArmedMsg> p50_source_armed_ack;
+    // Preserve the exact F generation alongside the immutable ReadyLease so
+    // a later cache-session join cannot substitute a replacement generation.
+    uint64_t p50_source_f_store_generation = 0;
+    ConnectionProvenance p50_source_arm_provenance;
+    uint64_t p50_source_deadline_msec = 0;
+    bool p50_source_compile_pending = false;
+
+    bool arm_p50_source(const P50SourceArmFields& fields,
+                        const icecc::p50::sidecar::ReadyLease& lease,
+                        uint64_t observation,
+                        uint64_t source_deadline_msec) {
+        const uint64_t now = monotonic_msec();
+        if (status != UNKNOWN || p50_source_arm_fields.has_value() ||
+            !fields.valid() || !lease.valid() || observation == 0 ||
+            lease.identity.generation == 0 ||
+            source_deadline_msec <= now ||
+            source_deadline_msec - now > P50SourceArmedFields::MaxSourceBudgetMsec ||
+            fields.c_store_derivation_version != lease.store_derivation_version ||
+            !connection_provenance.lease.valid()) {
+            return false;
+        }
+
+        if (!p50_input_wait.arm_input(fields)) {
+            return false;
+        }
+
+        // Install the exact owner and move to WAIT before emitting ACK.  A
+        // peer that observes the ACK can therefore never race an unowned
+        // attachment or a missing deadline.
+        p50_source_arm_fields = fields;
+        p50_source_f_lease = lease;
+        p50_source_f_store_generation = lease.store_generation;
+        p50_source_arm_provenance = connection_provenance;
+        p50_source_deadline_msec = source_deadline_msec;
+        p50_source_compile_pending = false;
+        set_status(WAITP50INPUT,
+                   "p50: exact source arm installed; waiting for input");
+
+        const uint64_t remaining = source_deadline_msec - monotonic_msec();
+        if (remaining == 0 || remaining > P50SourceArmedFields::MaxSourceBudgetMsec) {
+            p50_input_wait.close();
+            return false;
+        }
+        const P50SourceArmedMsg acknowledgement(
+            fields, lease.identity.generation, lease.identity.attempt,
+            p50_source_f_store_generation, lease.f_store_guid.bytes,
+            lease.store_derivation_version, observation,
+            static_cast<uint32_t>(remaining));
+        p50_source_armed_ack = acknowledgement;
+        if (!channel || !channel->send_msg(acknowledgement)) {
+            p50_input_wait.close();
+            return false;
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool source_budget_live() const noexcept {
+        return p50_source_deadline_msec != 0 &&
+               monotonic_msec() < p50_source_deadline_msec;
+    }
+
+    [[nodiscard]] bool source_wrapper_provenance_valid() const noexcept {
+        if (!connection_provenance.lease.valid())
+            return false;
+        if (connection_provenance.listener == ListenerKind::UnixLocal)
+            return connection_provenance.peer.complete();
+        return connection_provenance.listener == ListenerKind::TcpRemote ||
+               connection_provenance.listener == ListenerKind::TcpLoopback;
+    }
+
+    [[nodiscard]] bool source_arm_matches_compile_claim(
+        const CompileJob& candidate) const {
+        if (!p50_source_arm_fields.has_value() ||
+            !p50_source_armed_ack.has_value() ||
+            !p50_source_armed_ack->valid_payload() || !source_budget_live() ||
+            p50_source_arm_provenance != connection_provenance ||
+            !candidate.hasAssignmentIdentity() || candidate.jobID() == 0 ||
+            candidate.jobID() != p50_source_arm_fields->wire_job_id ||
+            candidate.assignmentEpoch() != p50_source_arm_fields->assignment_epoch ||
+            candidate.assignmentNonce() != p50_source_arm_fields->assignment_nonce ||
+            !candidate.usesP50Input()) {
+            return false;
+        }
+        const CompileInputIdentity& input = candidate.compileInputIdentity();
+        const P50SourceArmedMsg& acknowledgement = *p50_source_armed_ack;
+        const bool ack_matches_lease = p50_source_f_lease.has_value() &&
+            acknowledgement.arm == *p50_source_arm_fields &&
+            acknowledgement.f_control_generation ==
+                p50_source_f_lease->identity.generation &&
+            acknowledgement.f_control_attempt ==
+                p50_source_f_lease->identity.attempt &&
+            acknowledgement.f_store_generation == p50_source_f_store_generation &&
+            acknowledgement.f_store_guid == p50_source_f_lease->f_store_guid.bytes &&
+            acknowledgement.f_store_derivation_version ==
+                p50_source_f_lease->store_derivation_version;
+        return ack_matches_lease &&
+               input.profile == CompileInputIdentity::ZstdTuProfile &&
+               input.c_store_guid == p50_source_arm_fields->c_store_guid &&
+               input.attempt_id == p50_source_arm_fields->compiler_attempt &&
+               input.request_id == p50_source_arm_fields->source_request_id;
+    }
 
     string dump() const {
         uint64_t age_msec = monotonic_msec() - status_since_msec;
@@ -1206,6 +1354,7 @@ struct Daemon {
     // the supervised sidecar and its authenticated private relationship.
     std::unique_ptr<icecc::p50::daemon::DaemonSidecarAdapter> cache_adapter;
     bool cache_adapter_start_attempted;
+    uint64_t next_p50_arm_observation_id;
     icecc::p50::advertisement::Snapshot scheduler_cache_snapshot;
     bool scheduler_cache_snapshot_valid;
     // Positive sidecar operation is opt-in until the installed service path
@@ -1254,6 +1403,7 @@ struct Daemon {
         next_scheduler_connect = 0;
         cache_size = 0;
         cache_adapter_start_attempted = false;
+        next_p50_arm_observation_id = 1;
         scheduler_cache_snapshot = {};
         scheduler_cache_snapshot_valid = false;
         noremote = false;
@@ -1315,12 +1465,17 @@ struct Daemon {
     bool finish_get_native_env(Client *client, string env_key);
     void handle_old_request();
     bool handle_compile_file(Client *client, Msg *msg) __attribute_warn_unused_result__;
+    bool handle_p50_source_arm(Client *client, P50SourceArmMsg *msg)
+        __attribute_warn_unused_result__;
     bool handle_activity(Client *client) __attribute_warn_unused_result__;
     bool handle_file_chunk_env(Client *client, Msg *msg) __attribute_warn_unused_result__;
     void handle_end(Client *client, int exitcode);
     void settle_p50_input(Client *client,
                           icecc::p50::InputLifecycleAction action,
                           const char *reason) noexcept;
+    bool expire_p50_source_waiters() __attribute_warn_unused_result__;
+    bool invalidate_p50_source_waiters_for_lease() __attribute_warn_unused_result__;
+    uint64_t next_p50_source_deadline_msec() const noexcept;
     int scheduler_get_internals() __attribute_warn_unused_result__;
     void clear_children();
     int scheduler_use_cs(UseCSMsg *msg) __attribute_warn_unused_result__;
@@ -4624,6 +4779,70 @@ static void close_assignment_transport_session()
     }
 }
 
+/* P50_SOURCE_ARM is an assignment claim, not an advisory endpoint hint.  It
+   may consume only the exact Reserved record for the active scheduler epoch;
+   a later CompileFile from this same Client is idempotent and must not reopen
+   Reserved or increment the claim counter. */
+static bool authorize_source_arm_claim(const P50SourceArmFields& arm,
+                                       uint32_t claimant)
+{
+    if (!scheduler_session_active || assignment_table_exhausted ||
+        assignment_fence_mode == ConfCSMsg::Legacy || arm.wire_job_id == 0 ||
+        arm.assignment_epoch == 0 || arm.assignment_nonce == 0 ||
+        arm.assignment_epoch != assignment_scheduler_epoch) {
+        return false;
+    }
+
+    auto live = live_assignments.find(arm.wire_job_id);
+    if (live == live_assignments.end()) {
+        return false;
+    }
+    WorkerAssignment& record = live->second;
+    if (record.key.epoch != arm.assignment_epoch ||
+        record.key.nonce != arm.assignment_nonce ||
+        record.phase != WorkerAssignment::Reserved) {
+        return false;
+    }
+    record.phase = WorkerAssignment::Claimed;
+    record.claimant = claimant;
+    ++assignment_claims;
+    return true;
+}
+
+/* A rejected source frame still needs a scheduler-authoritative disposition
+   when it names one exact live assignment.  Once the complete triple matches,
+   consume Reserved as the worker's observed claim (or accept the same
+   claimant's already-claimed record), bind the token to Client, and let the
+   normal FROM_SERVER JobDone path settle it exactly once.  A random/stale
+   triple is never allowed to settle another wire id. */
+static bool bind_source_assignment_for_settlement(
+    const P50SourceArmFields& arm, uint32_t claimant)
+{
+    if (!scheduler_session_active || assignment_table_exhausted ||
+        assignment_fence_mode == ConfCSMsg::Legacy || arm.wire_job_id == 0 ||
+        arm.assignment_epoch == 0 || arm.assignment_nonce == 0 ||
+        arm.assignment_epoch != assignment_scheduler_epoch) {
+        return false;
+    }
+    auto live = live_assignments.find(arm.wire_job_id);
+    if (live == live_assignments.end()) {
+        return false;
+    }
+    WorkerAssignment& record = live->second;
+    if (record.key.epoch != arm.assignment_epoch ||
+        record.key.nonce != arm.assignment_nonce) {
+        return false;
+    }
+    if (record.phase == WorkerAssignment::Reserved) {
+        record.phase = WorkerAssignment::Claimed;
+        record.claimant = claimant;
+        ++assignment_claims;
+        return true;
+    }
+    return record.phase == WorkerAssignment::Claimed &&
+           record.claimant == claimant;
+}
+
 static bool authorize_assignment_claim(const CompileJob &job, uint32_t claimant)
 {
     const uint32_t wire_id = job.jobID();
@@ -4649,6 +4868,14 @@ static bool authorize_assignment_claim(const CompileJob &job, uint32_t claimant)
         const bool identity_matches = full_identity
             && record.key.epoch == job.assignmentEpoch()
             && record.key.nonce == job.assignmentNonce();
+        if (record.key.epoch == assignment_scheduler_epoch
+                && record.phase == WorkerAssignment::Claimed
+                && record.claimant == claimant && identity_matches) {
+            /* P50_SOURCE_ARM already claimed this exact assignment for this
+               Client.  CompileFile proves the same claimant but does not
+               consume a second dispatch credit or reopen the record. */
+            return true;
+        }
         const bool legacy_compat_claim = !full_identity
             && assignment_fence_mode != ConfCSMsg::StrictNonce;
         if (record.key.epoch != assignment_scheduler_epoch
@@ -4809,6 +5036,100 @@ bool Daemon::configure_cache_adapter() noexcept
     }
 }
 
+uint64_t Daemon::next_p50_source_deadline_msec() const noexcept
+{
+    uint64_t earliest = 0;
+    for (const auto& entry : fd2client) {
+        const Client *client = entry.second;
+        if (client == nullptr || client->status != Client::WAITP50INPUT ||
+            !client->p50_source_arm_fields.has_value() ||
+            client->p50_source_deadline_msec == 0) {
+            continue;
+        }
+        if (earliest == 0 || client->p50_source_deadline_msec < earliest) {
+            earliest = client->p50_source_deadline_msec;
+        }
+    }
+    return earliest;
+}
+
+bool Daemon::expire_p50_source_waiters()
+{
+    const uint64_t now = monotonic_msec();
+    vector<Client*> expired;
+    expired.reserve(fd2client.size());
+    for (const auto& entry : fd2client) {
+        Client *client = entry.second;
+        if (client != nullptr && client->status == Client::WAITP50INPUT &&
+            client->p50_source_arm_fields.has_value() &&
+            client->p50_source_deadline_msec != 0 &&
+            now >= client->p50_source_deadline_msec) {
+            expired.push_back(client);
+        }
+    }
+
+    for (Client *client : expired) {
+        // The map membership check makes this safe when an earlier expiry
+        // settlement caused scheduler-loss cleanup to erase the client.
+        if (client == nullptr || client->channel == nullptr ||
+            clients.find(client->channel) == clients.end()) {
+            continue;
+        }
+        log_warning() << "P50 source arm deadline expired for client "
+                      << client->client_id << endl;
+        handle_end(client, 149);
+        if (finish_scheduler_loss_if_needed()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Daemon::invalidate_p50_source_waiters_for_lease()
+{
+    bool current_ready = scheduler_session_active && scheduler != nullptr &&
+                         cache_adapter != nullptr &&
+                         cache_advertisement_snapshot().present() &&
+                         cache_adapter->supervisor() != nullptr &&
+                         cache_adapter->supervisor()->current_lease().has_value() &&
+                         cache_adapter->supervisor()->current_lease()->valid();
+    const icecc::p50::sidecar::ReadyLease *current_lease = nullptr;
+    if (current_ready) {
+        current_lease = &*cache_adapter->supervisor()->current_lease();
+    }
+
+    vector<Client*> stale;
+    stale.reserve(fd2client.size());
+    for (const auto& entry : fd2client) {
+        Client *client = entry.second;
+        if (client == nullptr || client->status != Client::WAITP50INPUT ||
+            !client->p50_source_arm_fields.has_value()) {
+            continue;
+        }
+        const bool owner_current = current_ready && current_lease != nullptr &&
+            client->p50_source_f_lease.has_value() &&
+            !icecc::p50::daemon::p50_wait_owner_replaced(
+                *client->p50_source_f_lease, *current_lease);
+        if (!owner_current) {
+            stale.push_back(client);
+        }
+    }
+
+    for (Client *client : stale) {
+        if (client == nullptr || client->channel == nullptr ||
+            clients.find(client->channel) == clients.end()) {
+            continue;
+        }
+        log_warning() << "withdrawing P50 source owner after F lease withdrawal/replacement for client "
+                      << client->client_id << endl;
+        handle_end(client, 151);
+        if (finish_scheduler_loss_if_needed()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void Daemon::poll_cache_adapter() noexcept
 {
     if (cache_adapter == nullptr)
@@ -4822,8 +5143,12 @@ void Daemon::poll_cache_adapter() noexcept
 
     // Never start a service, authenticate a private relationship, or publish
     // presence during a mere scheduler LOGIN_ATTEMPT.
-    if (!scheduler_session_active || scheduler == nullptr)
+    if (!scheduler_session_active || scheduler == nullptr) {
+        if (invalidate_p50_source_waiters_for_lease()) {
+            return;
+        }
         return;
+    }
 
     icecc::p50::advertisement::Update update;
     if (!cache_adapter_start_attempted) {
@@ -4831,6 +5156,13 @@ void Daemon::poll_cache_adapter() noexcept
         (void)cache_adapter->start(&update);
     } else {
         (void)cache_adapter->poll(&update);
+    }
+
+    // A sidecar withdrawal/replacement is an ownership boundary.  Invalidate
+    // old WAIT owners before publishing any replacement advertisement or
+    // admitting a new source arm in the next event-loop phase.
+    if (invalidate_p50_source_waiters_for_lease()) {
+        return;
     }
 
     // Preserve the Controller's exact order.  In particular, a crash and
@@ -4854,6 +5186,10 @@ void Daemon::shutdown_cache_adapter() noexcept
 {
     if (cache_adapter == nullptr)
         return;
+
+    if (invalidate_p50_source_waiters_for_lease()) {
+        log_warning() << "scheduler loss while invalidating P50 source owners" << endl;
+    }
 
     icecc::p50::advertisement::Update update;
     cache_adapter->shutdown(&update);
@@ -7118,6 +7454,53 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
     CompileJob *job = dynamic_cast<CompileFileMsg *>(msg)->takeJob();
     assert(client);
     assert(job);
+
+    if (client->p50_source_arm_fields.has_value()) {
+        // A later CompileFile is the same assignment claimant, not a second
+        // source arm.  Revalidate the retained F lease at the admission
+        // boundary because a replacement can be observed between poll turns.
+        const bool current_lease =
+            cache_adapter != nullptr &&
+            cache_advertisement_snapshot().present() &&
+            cache_adapter->supervisor() != nullptr &&
+            cache_adapter->supervisor()->current_lease().has_value() &&
+            client->p50_source_f_lease.has_value() &&
+            icecc::p50::daemon::p50_ready_lease_observation_equal(
+                *client->p50_source_f_lease,
+                *cache_adapter->supervisor()->current_lease());
+        const bool current_store_generation = current_lease &&
+            client->p50_source_f_store_generation != 0 &&
+            client->p50_source_f_store_generation ==
+                cache_adapter->supervisor()->current_lease()->store_generation;
+        const bool exact_claim = current_lease &&
+            current_store_generation &&
+            client->source_arm_matches_compile_claim(*job) &&
+            authorize_assignment_claim(*job,
+                                        static_cast<uint32_t>(client->client_id));
+        if (!exact_claim || client->job != nullptr ||
+            client->p50_source_compile_pending) {
+            log_warning() << "P50 CompileFile did not match one live source owner for job "
+                          << job->jobID() << endl;
+            delete job;
+            (void)client->channel->send_msg(EndMsg());
+            handle_end(client, 150);
+            return false;
+        }
+
+        // Retain the exact job as pending state.  This deliberately does not
+        // attach a sidecar fd, consume FileChunk, enter TOCOMPILE, or fork;
+        // positive InputReady/private transport remains a later slice.
+        client->job = job;
+        client->p50_source_compile_pending = true;
+        if (client->command_line.empty()) {
+            client->command_line = command_line_from_compile_job(job);
+        }
+        client->last_known_job_id = job->jobID();
+        trace() << "P50 CompileFile retained pending exact source owner for job "
+                << job->jobID() << endl;
+        return true;
+    }
+
     if (client->status != Client::CLIENTWORK
             && !authorize_assignment_claim(*job, client->client_id)) {
         /* Authorization is resolved before the job is attached to a client,
@@ -7372,10 +7755,26 @@ void Daemon::handle_end(Client *client, int exitcode)
                         || client->status == Client::WAITP50INPUT
                         || client->status == Client::WAITFORCHILD)) {
         finish_assignment_claim(client->job->jobID());
+    } else if (client->p50_source_arm_fields.has_value() &&
+               (client->job_id != 0 ||
+                client->p50_source_arm_fields->wire_job_id != 0)) {
+        // Source-arm ownership precedes CompileFile, so the exact scheduler
+        // wire id may be carried by Client rather than a CompileJob.  Close
+        // that claim before deleting the ordinary wrapper.
+        finish_assignment_claim(client->job_id != 0
+                                    ? client->job_id
+                                    : client->p50_source_arm_fields->wire_job_id);
     }
     if (client->status == Client::WAITP50INPUT) {
         client->p50_input_wait.close();
     }
+    client->p50_source_arm_fields.reset();
+    client->p50_source_f_lease.reset();
+    client->p50_source_armed_ack.reset();
+    client->p50_source_f_store_generation = 0;
+    client->p50_source_arm_provenance = ConnectionProvenance{};
+    client->p50_source_deadline_msec = 0;
+    client->p50_source_compile_pending = false;
     // Remove the value lease before erasing/deleting its Client and channel.
     // Delayed callbacks therefore cannot be rescued by fd or allocator
     // address reuse; repeated teardown is intentionally harmless.
@@ -7448,7 +7847,10 @@ void Daemon::handle_end(Client *client, int exitcode)
 
         if (client->status == Client::TOCOMPILE ||
             client->status == Client::WAITP50INPUT) {
-            job_id = client->job->jobID();
+            // A source arm owns the exact wire id before CompileFile creates a
+            // CompileJob.  Never dereference a missing job during HUP,
+            // deadline, or sidecar-replacement teardown.
+            job_id = client->job ? client->job->jobID() : client->job_id;
         }
 
         if (client->status == Client::WAITFORCS && client->getcs_published) {
@@ -7993,6 +8395,123 @@ bool Daemon::handle_cache_session(Client *client, Msg *msg)
     return false;
 }
 
+bool Daemon::handle_p50_source_arm(Client *client, P50SourceArmMsg *msg)
+{
+    if (client == nullptr) {
+        return false;
+    }
+
+    // poll_cache_adapter() may withdraw an older lease and synchronously tear
+    // down this very wrapper if this is a replay arriving at the replacement
+    // boundary.  Retain only the channel key across that call; never inspect
+    // a possibly deleted Client afterward.
+    MsgChannel *client_channel = client->channel;
+
+    // Refresh the supervisor immediately before admission.  This closes the
+    // gap where the sidecar could have exited/replaced after the loop's
+    // pre-poll call but before this ordinary wrapper frame was handled.
+    poll_cache_adapter();
+    if (finish_scheduler_loss_if_needed() ||
+        client_channel == nullptr || clients.find(client_channel) == clients.end()) {
+        return false;
+    }
+
+    /* A valid exact triple is the only identity on which a rejection may
+       settle a scheduler assignment.  A malformed frame is otherwise
+       untrusted input; if this is a later malformed/replayed frame, the
+       already-retained owner supplies the exact token. */
+    auto reject = [&](const P50SourceArmFields *identity, int exitcode) {
+        const P50SourceArmFields *settlement_identity = identity;
+        // Once this wrapper owns a live arm, every later rejection belongs to
+        // that immutable token.  Do not let a malformed/replayed frame name a
+        // second live PREPARE and strand the retained owner when this client
+        // is torn down.
+        if (client->p50_source_arm_fields) {
+            settlement_identity = &*client->p50_source_arm_fields;
+        }
+        if (settlement_identity != nullptr &&
+            bind_source_assignment_for_settlement(
+                *settlement_identity, static_cast<uint32_t>(client->client_id))) {
+            client->job_id = settlement_identity->wire_job_id;
+            client->last_known_job_id = settlement_identity->wire_job_id;
+            client->set_status(Client::WAITP50INPUT,
+                               "p50: rejected source arm settled exactly");
+            finish_assignment_claim(settlement_identity->wire_job_id);
+        }
+        if (client->channel) {
+            (void)client->channel->send_msg(EndMsg());
+        }
+        handle_end(client, exitcode);
+        return false;
+    };
+
+    if (msg == nullptr || !msg->valid_payload()) {
+        return reject(nullptr, 147);
+    }
+
+    const P50SourceArmFields& arm = msg->arm;
+    if (client->status != Client::UNKNOWN ||
+        client->p50_source_arm_fields.has_value() ||
+        !client->source_wrapper_provenance_valid() ||
+        cache_adapter == nullptr || !scheduler_session_active ||
+        !cache_advertisement_snapshot().present()) {
+        return reject(&arm, 147);
+    }
+
+    auto *supervisor = cache_adapter->supervisor();
+    if (supervisor == nullptr || !supervisor->current_lease().has_value() ||
+        !supervisor->current_lease()->valid()) {
+        return reject(&arm, 147);
+    }
+    const auto& lease = *supervisor->current_lease();
+    const auto snapshot = cache_advertisement_snapshot();
+
+    // This ordinary connection is the selected F wrapper link.  Its host,
+    // ordinary listener, advertised endpoint, protocol, and selected profile
+    // must all agree with the one current F advertisement.  In particular,
+    // profile membership is a mask test; a profile value is never compared
+    // to a capability mask as if the latter were scalar identity.
+    if (arm.selected_f_host != remote_name ||
+        arm.selected_f_ordinary_port != static_cast<uint32_t>(daemon_port) ||
+        arm.selected_f_cache_port != snapshot.endpoint_port ||
+        arm.cache_protocol != snapshot.protocol ||
+        arm.cache_profile != CACHE_PROFILE_ZSTD_TU ||
+        (snapshot.profile_mask & arm.cache_profile) == 0 ||
+        arm.c_store_derivation_version != lease.store_derivation_version ||
+        icecc::p50::store_identity_file_guid_matches_client(
+            arm.c_store_guid, lease.f_store_guid.bytes)) {
+        return reject(&arm, 147);
+    }
+
+    // Claim PREPARE before installing and acknowledging WAIT.  The token is
+    // bound before any ACK bytes leave the ordinary wrapper connection, so a
+    // disconnect/HUP/expiry can use the same exact scheduler JobDone path.
+    if (!authorize_source_arm_claim(
+            arm, static_cast<uint32_t>(client->client_id))) {
+        return reject(&arm, 147);
+    }
+    client->job_id = arm.wire_job_id;
+    client->last_known_job_id = arm.wire_job_id;
+    client->set_status(Client::WAITP50INPUT,
+                       "p50: source assignment claimed before ACK");
+
+    if (next_p50_arm_observation_id == 0 ||
+        next_p50_arm_observation_id == UINT64_MAX) {
+        finish_assignment_claim(arm.wire_job_id);
+        return reject(&arm, 147);
+    }
+    const uint64_t observation = next_p50_arm_observation_id++;
+    const uint64_t now = monotonic_msec();
+    const uint64_t budget_msec = p50_source_arm_budget_msec();
+    if (budget_msec == 0 || now > UINT64_MAX - budget_msec ||
+        !client->arm_p50_source(
+            arm, lease, observation, now + budget_msec)) {
+        finish_assignment_claim(arm.wire_job_id);
+        return reject(&arm, 147);
+    }
+    return true;
+}
+
 bool Daemon::handle_activity(Client *client)
 {
     assert(client->status != Client::TOCOMPILE && client->status != Client::WAITINSTALL);
@@ -8000,7 +8519,69 @@ bool Daemon::handle_activity(Client *client)
     Msg *msg = client->channel->get_msg(0, true);
 
     if (!msg) {
+        // get_msg() rejects malformed P50_SOURCE_ARM frames before exposing a
+        // Msg, but preserves a complete assignment triple when the frame
+        // carried one.  Settle that exact owner before closing; a later
+        // malformed/replayed frame on an already-armed client falls back to
+        // its retained owner token.  Partial/random identities remain unable
+        // to settle anything.
+        uint32_t invalid_wire_id = 0;
+        uint64_t invalid_epoch = 0;
+        uint64_t invalid_nonce = 0;
+        bool exact_invalid_owner = false;
+        const bool retained_source_owner = client->p50_source_arm_fields.has_value();
+        if (retained_source_owner) {
+            // A malformed/replayed frame on an armed wrapper cannot redirect
+            // teardown to another assignment.  The retained full owner is
+            // the only scheduler token this connection may settle.
+            const P50SourceArmFields& retained = *client->p50_source_arm_fields;
+            exact_invalid_owner = bind_source_assignment_for_settlement(
+                retained, static_cast<uint32_t>(client->client_id));
+            if (exact_invalid_owner) {
+                client->job_id = retained.wire_job_id;
+                client->last_known_job_id = retained.wire_job_id;
+            }
+            (void)client->channel->take_invalid_p50_source_arm_identity(
+                &invalid_wire_id, &invalid_epoch, &invalid_nonce);
+        } else if (client->channel->take_invalid_p50_source_arm_identity(
+                       &invalid_wire_id, &invalid_epoch, &invalid_nonce)) {
+            P50SourceArmFields identity;
+            identity.wire_job_id = invalid_wire_id;
+            identity.assignment_epoch = invalid_epoch;
+            identity.assignment_nonce = invalid_nonce;
+            exact_invalid_owner = bind_source_assignment_for_settlement(
+                identity, static_cast<uint32_t>(client->client_id));
+            if (exact_invalid_owner) {
+                client->job_id = invalid_wire_id;
+                client->last_known_job_id = invalid_wire_id;
+            }
+        }
+        if (exact_invalid_owner) {
+            client->set_status(Client::WAITP50INPUT,
+                               "p50: malformed frame settled exact owner");
+            finish_assignment_claim(client->job_id);
+        }
         handle_end(client, 118);
+        return false;
+    }
+
+    // Recheck the one absolute F-local deadline before every later ordinary
+    // message.  No CompileFile/arm replay can renew this nonrenewable lease.
+    if (client->p50_source_arm_fields.has_value() &&
+        !client->source_budget_live()) {
+        delete msg;
+        handle_end(client, 149);
+        return false;
+    }
+
+    // An armed wrapper is not a legacy CACHE_SESSION handoff channel.  Keep
+    // the positive private dispatcher unreachable until the exact later
+    // InputReady transport is specified; this frame still settles the one
+    // retained scheduler owner through the normal teardown path.
+    if (client->status == Client::WAITP50INPUT && *msg == Msg::CACHE_SESSION) {
+        delete msg;
+        (void)client->channel->send_msg(EndMsg());
+        handle_end(client, 152);
         return false;
     }
 
@@ -8044,6 +8625,10 @@ bool Daemon::handle_activity(Client *client)
     case Msg::CACHE_SESSION:
         ret = handle_cache_session(client, msg);
         break;
+    case Msg::P50_SOURCE_ARM:
+        ret = handle_p50_source_arm(client,
+                                    dynamic_cast<P50SourceArmMsg *>(msg));
+        break;
     case Msg::VERIFY_ENV:
         ret = handle_verify_env(client, dynamic_cast<VerifyEnvMsg *>(msg));
         break;
@@ -8074,6 +8659,13 @@ void Daemon::answer_client_requests()
                << " (" << max_kids << ")" << endl;
 
 #endif
+
+    // Deadlines are owned by this event loop, not by fd readiness.  Sweep
+    // before constructing pollfds so a silent peer is closed even when no
+    // descriptor event is pending.
+    if (expire_p50_source_waiters()) {
+        return;
+    }
 
     /* Reap zombies BY REGISTERED PID: an anonymous waitpid(-1) consumed
        whichever child was waitable -- including ones another lifecycle
@@ -8192,8 +8784,7 @@ void Daemon::answer_client_requests()
         assert(client);
         int current_status = client->status;
         bool ignore_channel = current_status == Client::WAITFORCHILD ||
-                              current_status == Client::WAITINSTALL ||
-                              current_status == Client::WAITP50INPUT;
+                              current_status == Client::WAITINSTALL;
 
         /* when the remote host is full with work, the wait time for it to free up and
            fork a child to compile could be long. If the input is ready to read, we will read
@@ -8222,8 +8813,7 @@ void Daemon::answer_client_requests()
                    select_channel = true is wrong. */
                 current_status = client->status;
                 const bool now_ignore = current_status == Client::WAITFORCHILD
-                                        || current_status == Client::WAITINSTALL
-                                        || current_status == Client::WAITP50INPUT;
+                                        || current_status == Client::WAITINSTALL;
                 select_channel = (current_status == Client::TOCOMPILE) || !now_ignore;
                 if (c->has_msg()) {
                     buffered_client_pending = true;   /* more parsed bytes remain */
@@ -8233,7 +8823,9 @@ void Daemon::answer_client_requests()
 
         if (select_channel) {
             pfd.fd = i;
-            pfd.events = POLLIN;
+            pfd.events = current_status == Client::WAITP50INPUT
+                ? (POLLIN | POLLHUP | POLLERR)
+                : POLLIN;
             pollfds.push_back(pfd);
         }
 
@@ -8314,6 +8906,21 @@ void Daemon::answer_client_requests()
         }
     }
 
+    // A live source owner has one nonrenewable absolute deadline.  Cap poll
+    // by the earliest such owner so traffic cannot make the loop sleep past
+    // expiry; the explicit sweep above/after poll performs the actual close.
+    const uint64_t source_deadline_msec = next_p50_source_deadline_msec();
+    if (source_deadline_msec != 0) {
+        const uint64_t now = monotonic_msec();
+        const int to_source_deadline = source_deadline_msec > now
+            ? static_cast<int>(std::min<uint64_t>(
+                  source_deadline_msec - now, std::numeric_limits<int>::max()))
+            : 0;
+        if (poll_timeout_msec < 0 || to_source_deadline < poll_timeout_msec) {
+            poll_timeout_msec = to_source_deadline;
+        }
+    }
+
     /* G4 (16:47#1): bytes already parsed into a channel buffer won't re-trigger
        fd readiness -- process the remainder on a zero-timeout pass. */
     if (buffered_client_pending) {
@@ -8326,6 +8933,12 @@ void Daemon::answer_client_requests()
         log_perror("poll");
         close_scheduler();
         finish_scheduler_loss_if_needed();
+        return;
+    }
+    // Poll may return zero for the capped deadline, or may return another fd
+    // at the same instant.  Re-run the exact owner sweep before touching any
+    // revents so an expired owner cannot consume a late frame.
+    if (expire_p50_source_waiters()) {
         return;
     }
     // Reset debug if needed, but only if we aren't waiting for any child processes to finish,
@@ -8525,7 +9138,10 @@ void Daemon::answer_client_requests()
                     }
                 }
 
-                if (pollfd_is_set(pollfds, i, POLLIN)) {
+                const bool client_event = client->status == Client::WAITP50INPUT
+                    ? pollfd_is_set(pollfds, i, POLLIN | POLLHUP | POLLERR)
+                    : pollfd_is_set(pollfds, i, POLLIN);
+                if (client_event) {
                     if( client->status == Client::TOCOMPILE )
                     {
                         /* read as the preprocessed input is ready but don't process it and leave it to the child
@@ -8534,10 +9150,22 @@ void Daemon::answer_client_requests()
                     }
                     else if (client->status == Client::WAITP50INPUT)
                     {
-                        // The ordinary link is deliberately not consumed
-                        // while the private exact-ready attachment is pending.
-                        // In particular, no legacy FileChunk/END fallback may
-                        // race the WAITP50INPUT -> TOCOMPILE transition.
+                        // WAIT remains registered for POLLIN/HUP/ERR.  Consume
+                        // framed ordinary messages only through handle_activity:
+                        // exact later CompileFile is retained pending, while
+                        // legacy FileChunk, repeated/wrong arms, and EOF/HUP
+                        // settle the exact owner and close.  No bytes are
+                        // reinterpreted as compiler input and no fork occurs.
+                        while (!c->read_a_bit() || c->has_msg()) {
+                            const bool alive = handle_activity(client);
+                            if (finish_scheduler_loss_if_needed()) {
+                                return;
+                            }
+                            if (!alive)
+                                break;
+                            if (client->status != Client::WAITP50INPUT)
+                                break;
+                        }
                     }
                     else
                     {

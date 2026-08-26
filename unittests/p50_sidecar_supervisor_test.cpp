@@ -99,6 +99,8 @@ int structured_child(const std::string& mode, int fd) {
     const char* generation =
         required_environment("ICECC_CACHE_SERVICE_EXPECTED_GENERATION");
     const char* attempt = required_environment("ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT");
+    const char* store_generation =
+        required_environment("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION");
     const char* derivation =
         required_environment("ICECC_CACHE_SERVICE_EXPECTED_DERIVATION_VERSION");
     const char* guid =
@@ -109,7 +111,7 @@ int structured_child(const std::string& mode, int fd) {
     const char* digest =
         required_environment("ICECC_CACHE_SERVICE_EXPECTED_SOCKET_DIGEST");
     if (format == nullptr || std::string(format) != "2" || generation == nullptr ||
-        attempt == nullptr || derivation == nullptr || guid == nullptr ||
+        attempt == nullptr || store_generation == nullptr || derivation == nullptr || guid == nullptr ||
         c_guid == nullptr || path == nullptr || digest == nullptr)
         return 108;
     int listener = -1;
@@ -132,6 +134,7 @@ int structured_child(const std::string& mode, int fd) {
                                     (mode == "structured-wrong-pid" ? 1 : 0);
     const std::string ready =
         "READY v2 generation=" + std::string(generation) + " attempt=" + attempt +
+        " F_STORE_GENERATION=" + store_generation +
         " DERIVATION_VERSION=" + derivation +
         " pid=" + std::to_string(published_pid) + " C_STORE_GUID=" + c_guid +
         " F_STORE_GUID=" + guid +
@@ -454,6 +457,8 @@ void structured_lease_rotates_across_restart_and_controller_recreation() {
     const ReadyLease lease2 = *first.current_lease();
     CHECK(lease2.valid());
     CHECK((lease2.identity == icecc::p50::local::Identity{71, 2}));
+    CHECK(lease2.identity.generation == lease1.identity.generation);
+    CHECK(lease2.store_generation != lease1.store_generation);
     CHECK(lease2.store_root.valid());
     CHECK(lease2.store_derivation_version == icecc::p50::kStoreIdentityDerivationVersion);
     CHECK(lease2.f_store_guid ==

@@ -375,7 +375,7 @@ bool parse_ready_lease(std::string_view wire, const ReadyLease& expected,
     if (wire.size() < 10 || wire.back() != '\n' || wire.find('\0') != std::string_view::npos)
         return false;
     wire.remove_suffix(1);
-    std::array<std::string_view, 12> fields{};
+    std::array<std::string_view, 13> fields{};
     size_t begin = 0;
     for (size_t index = 0; index != fields.size(); ++index) {
         if (begin >= wire.size())
@@ -401,10 +401,10 @@ bool parse_ready_lease(std::string_view wire, const ReadyLease& expected,
         return false;
     if (fields[0] != "READY" || fields[1] != "v2")
         return false;
-    static constexpr std::array<std::string_view, 10> keys = {
-        "generation", "attempt", "DERIVATION_VERSION", "pid", "C_STORE_GUID",
-        "F_STORE_GUID", "PATH", "DIGEST", "DEV", "INO"};
-    std::array<std::string_view, 10> values{};
+    static constexpr std::array<std::string_view, 11> keys = {
+        "generation", "attempt", "F_STORE_GENERATION", "DERIVATION_VERSION", "pid",
+        "C_STORE_GUID", "F_STORE_GUID", "PATH", "DIGEST", "DEV", "INO"};
+    std::array<std::string_view, 11> values{};
     for (size_t index = 0; index != keys.size(); ++index) {
         const std::string_view field = fields[index + 2];
         const size_t equals = field.find('=');
@@ -413,26 +413,28 @@ bool parse_ready_lease(std::string_view wire, const ReadyLease& expected,
             return false;
         values[index] = field.substr(equals + 1);
     }
-    uint64_t generation = 0, attempt = 0, derivation_version = 0, pid = 0, device = 0,
-             inode = 0;
+    uint64_t generation = 0, attempt = 0, store_generation = 0,
+             derivation_version = 0, pid = 0, device = 0, inode = 0;
     const bool scalar_ok = parse_uint64(values[0], generation) &&
                            parse_uint64(values[1], attempt) &&
-                           parse_uint64(values[2], derivation_version) &&
-                           parse_uint64(values[3], pid) &&
-                           parse_uint64(values[8], device) &&
-                           parse_uint64(values[9], inode);
+                           parse_uint64(values[2], store_generation) &&
+                           parse_uint64(values[3], derivation_version) &&
+                           parse_uint64(values[4], pid) &&
+                           parse_uint64(values[9], device) &&
+                           parse_uint64(values[10], inode);
     const bool identity_ok = pid == static_cast<uint64_t>(child) &&
+                             store_generation == expected.store_generation &&
                              derivation_version == kStoreIdentityDerivationVersion &&
                              generation == expected.identity.generation &&
                              attempt == expected.identity.attempt && device != 0 && inode != 0;
-    const bool guid_ok = values[4] == bytes_hex(std::span<const uint8_t>(
+    const bool guid_ok = values[5] == bytes_hex(std::span<const uint8_t>(
                                       expected.c_store_guid.bytes.data(),
                                       expected.c_store_guid.bytes.size())) &&
-                         values[5] == bytes_hex(std::span<const uint8_t>(
+                         values[6] == bytes_hex(std::span<const uint8_t>(
                                       expected.f_store_guid.bytes.data(),
                                       expected.f_store_guid.bytes.size()));
-    const bool path_ok = values[6] == expected.socket_path &&
-                         values[7] == digest128_hex(expected.socket_path_digest);
+    const bool path_ok = values[7] == expected.socket_path &&
+                         values[8] == digest128_hex(expected.socket_path_digest);
     if (!scalar_ok || !identity_ok || !guid_ok || !path_ok)
         return false;
     struct stat socket_info{};
@@ -444,6 +446,7 @@ bool parse_ready_lease(std::string_view wire, const ReadyLease& expected,
         return false;
     actual = expected;
     actual.pid = child;
+    actual.store_generation = store_generation;
     actual.store_derivation_version = derivation_version;
     actual.listener_device = static_cast<dev_t>(device);
     actual.listener_inode = static_cast<ino_t>(inode);
@@ -671,23 +674,30 @@ LaunchIdentityAllocator::LaunchIdentityAllocator(uint64_t generation,
                                                  uint64_t first_attempt,
                                                  StoreIdentityEntropyProvider entropy_provider) noexcept
     : generation_(generation), next_attempt_(first_attempt),
+      next_store_generation_(generation),
       entropy_provider_(entropy_provider) {
     // Zero is reserved by the wire contract.  MAX is also rejected rather
     // than permitting an allocation whose successor would wrap and become
     // indistinguishable from an uninitialized allocator.
     if (generation_ == 0 || generation_ == std::numeric_limits<uint64_t>::max() ||
-        next_attempt_ == 0 || next_attempt_ == std::numeric_limits<uint64_t>::max()) {
+        next_attempt_ == 0 || next_attempt_ == std::numeric_limits<uint64_t>::max() ||
+        next_store_generation_ == 0 ||
+        next_store_generation_ == std::numeric_limits<uint64_t>::max()) {
         generation_ = 0;
         next_attempt_ = 0;
+        next_store_generation_ = 0;
     }
 }
 
 std::optional<LaunchIncarnation> LaunchIdentityAllocator::allocate() noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     if (generation_ == 0 || next_attempt_ == 0 ||
-        next_attempt_ == std::numeric_limits<uint64_t>::max())
+        next_attempt_ == std::numeric_limits<uint64_t>::max() ||
+        next_store_generation_ == 0 ||
+        next_store_generation_ == std::numeric_limits<uint64_t>::max())
         return std::nullopt;
     const local::Identity identity{generation_, next_attempt_++};
+    const uint64_t store_generation = next_store_generation_++;
     constexpr size_t kMaxRootRetries = 8;
     for (size_t retry = 0; retry != kMaxRootRetries; ++retry) {
         StoreIdentityRoot root{};
@@ -706,7 +716,8 @@ std::optional<LaunchIncarnation> LaunchIdentityAllocator::allocate() noexcept {
         constexpr size_t kMaxDuplicateHistory = 128;
         if (recent_roots_.size() > kMaxDuplicateHistory)
             recent_roots_.pop_front();
-        LaunchIncarnation incarnation{identity, root, c_store_guid_for_root(root),
+        LaunchIncarnation incarnation{identity, store_generation, root,
+                                      c_store_guid_for_root(root),
                                       f_store_guid_for_root(root)};
         if (incarnation.valid())
             return incarnation;
@@ -742,6 +753,7 @@ bool Supervisor::prepare_lease() noexcept {
         }
         ReadyLease lease;
         lease.identity = incarnation->identity;
+        lease.store_generation = incarnation->store_generation;
         lease.store_root = incarnation->store_root;
         lease.store_derivation_version = kStoreIdentityDerivationVersion;
         lease.c_store_guid = incarnation->c_store_guid;
@@ -1321,6 +1333,7 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
                              value.rfind("ICECC_CACHE_SERVICE_READY_FORMAT=", 0) == 0 ||
                              value.rfind("ICECC_CACHE_SERVICE_EXPECTED_GENERATION=", 0) == 0 ||
                              value.rfind("ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT=", 0) == 0 ||
+                             value.rfind("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION=", 0) == 0 ||
                              value.rfind("ICECC_CACHE_SERVICE_EXPECTED_DERIVATION_VERSION=", 0) == 0 ||
                              value.rfind("ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID=", 0) == 0 ||
                              value.rfind("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID=", 0) == 0 ||
@@ -1345,6 +1358,8 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
                                       std::to_string(pending_lease_->identity.generation));
         environment_storage.push_back("ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT=" +
                                       std::to_string(pending_lease_->identity.attempt));
+        environment_storage.push_back("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION=" +
+                                      std::to_string(pending_lease_->store_generation));
         environment_storage.push_back("ICECC_CACHE_SERVICE_EXPECTED_DERIVATION_VERSION=" +
                                       std::to_string(kStoreIdentityDerivationVersion));
         environment_storage.push_back("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID=" +
@@ -1376,6 +1391,8 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
         argv_storage.push_back(std::to_string(pending_lease_->identity.generation));
         argv_storage.push_back("--attempt");
         argv_storage.push_back(std::to_string(pending_lease_->identity.attempt));
+        argv_storage.push_back("--f-store-generation");
+        argv_storage.push_back(std::to_string(pending_lease_->store_generation));
         argv_storage.push_back("--store-derivation-version");
         argv_storage.push_back(std::to_string(kStoreIdentityDerivationVersion));
         argv_storage.push_back("--c-store-guid");

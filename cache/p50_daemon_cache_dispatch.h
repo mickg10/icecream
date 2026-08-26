@@ -55,6 +55,7 @@ struct OnDemandEndpoint {
     std::string socket_path;
     local::CredentialExpectation expected_peer;
     local::Identity lease_identity{};
+    uint64_t f_store_generation = 0;
     StoreIdentityRoot store_root{};
     uint64_t store_derivation_version = 0;
     CStoreGuid c_store_guid{};

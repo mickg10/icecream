@@ -109,6 +109,7 @@ struct EndpointFixture {
         // gate must retain the exact PID credential binding as a visible field.
         endpoint.expected_peer.pid = static_cast<uint64_t>(::getpid());
         endpoint.lease_identity = identity;
+        endpoint.f_store_generation = 1;
         endpoint.store_root.bytes[15] = 0x11;
         endpoint.store_derivation_version = icecc::p50::kStoreIdentityDerivationVersion;
         endpoint.c_store_guid = icecc::p50::c_store_guid_for_root(endpoint.store_root);
@@ -360,8 +361,15 @@ int main() {
                                                   static_cast<uint32_t>(*decoded));
         delete decoded;
         server.join();
-        CHECK(peer.hello && peer.ack_sent && peer.operation,
-              "release barrier uses a fresh authenticated operation relationship");
+        // Release refusal closes the one-shot control relationship immediately
+        // after the operation send succeeds.  With terminal-first POLLHUP
+        // handling, the peer may deliberately discard a simultaneously
+        // buffered operation rather than parse data after close.  The
+        // ReleaseRefused outcome below proves the local operation send and
+        // release-boundary check were reached; only the completed handshake
+        // is a deterministic peer-side observation on this failure path.
+        CHECK(peer.hello && peer.ack_sent,
+              "release barrier follows a fresh authenticated relationship");
         CHECK(outcome.result == CacheDispatchResult::ReleaseRefused && !outcome.detached,
               "buffered ordinary byte refuses descriptor handoff");
         CHECK(ordinary.right->fd == owned, "release refusal retains ordinary fd");

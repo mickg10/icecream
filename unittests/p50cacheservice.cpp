@@ -102,6 +102,7 @@ void clear_structured_launch_environment() {
              "ICECC_CACHE_SERVICE_READY_FORMAT",
              "ICECC_CACHE_SERVICE_EXPECTED_GENERATION",
              "ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT",
+             "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION",
              "ICECC_CACHE_SERVICE_EXPECTED_DERIVATION_VERSION",
              "ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID",
              "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID",
@@ -739,6 +740,7 @@ void structured_launch_is_complete_and_fail_closed() {
         (void)::setenv("ICECC_CACHE_SERVICE_READY_FORMAT", "2", 1);
         (void)::setenv("ICECC_CACHE_SERVICE_EXPECTED_GENERATION", generation.c_str(), 1);
         (void)::setenv("ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT", attempt.c_str(), 1);
+        (void)::setenv("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION", "191", 1);
         (void)::setenv("ICECC_CACHE_SERVICE_EXPECTED_DERIVATION_VERSION", "1", 1);
         (void)::setenv("ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID", c_guid.c_str(), 1);
         (void)::setenv("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID", guid.c_str(), 1);
@@ -748,7 +750,7 @@ void structured_launch_is_complete_and_fail_closed() {
         (void)::setenv("ICECC_CACHE_SERVICE_LISTENER_FD", listener_fd.c_str(), 1);
         ::execl(executable.c_str(), executable.c_str(), "--socket", expected_socket.c_str(),
                 "--peer-uid", uid.c_str(), "--peer-gid", gid.c_str(), "--generation",
-                generation.c_str(), "--attempt", attempt.c_str(),
+                generation.c_str(), "--attempt", attempt.c_str(), "--f-store-generation", "191",
                 "--store-derivation-version", "1", "--c-store-guid", c_guid.c_str(),
                 "--f-store-guid", guid.c_str(), static_cast<char*>(nullptr));
         _exit(127);
@@ -757,7 +759,7 @@ void structured_launch_is_complete_and_fail_closed() {
     CHECK(::close(prebound_listener) == 0);
     const std::string ready_message = read_bounded_to_eof(ready[0]);
     (void)::close(ready[0]);
-    CHECK(ready_message.rfind("READY v2 generation=91 attempt=7 DERIVATION_VERSION=1 pid=", 0) == 0);
+    CHECK(ready_message.rfind("READY v2 generation=91 attempt=7 F_STORE_GENERATION=191 DERIVATION_VERSION=1 pid=", 0) == 0);
     CHECK(ready_message.find(" C_STORE_GUID=" + c_guid) != std::string::npos);
     CHECK(ready_message.find(" F_STORE_GUID=" + guid) != std::string::npos);
     CHECK(ready_message.find(" PATH=" + expected_socket) != std::string::npos);
