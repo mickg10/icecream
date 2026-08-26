@@ -38,7 +38,7 @@ grep -F 'trailing payload bytes' "$test" >/dev/null
 grep -F 'Protocol 49' "$test" >/dev/null
 grep -F 'WIRE-AUDIT three-bucket classification' "$test" >/dev/null
 grep -F 'stable Protocol-50 fixture bytes' "$test" >/dev/null
-grep -F 'unrelated same-role root' "$test" >/dev/null
+grep -F 'independent F sidecar StoreIdentity root is accepted' "$test" >/dev/null
 test "$(grep -c '^[[:space:]]*p50_store_identity_wire\.h' "$makefile")" -eq 1
 if sed -n '/^ice_HEADERS =/,/^$/p' "$makefile" | grep -F 'p50_store_identity_wire.h' >/dev/null && \
    sed -n '/^noinst_HEADERS =/,/^$/p' "$makefile" | grep -F 'p50_store_identity_wire.h' >/dev/null; then
@@ -46,6 +46,14 @@ if sed -n '/^ice_HEADERS =/,/^$/p' "$makefile" | grep -F 'p50_store_identity_wir
     exit 1
 fi
 sed -n '/^ice_HEADERS =/,/^$/p' "$makefile" | grep -F 'p50_store_identity_wire.h' >/dev/null
+
+# C and F operations run under independent supervised sidecar incarnations.
+# The ACK validates F's role/version and exact echo; it must not invent a
+# cross-host shared StoreIdentity root by joining F_GUID to C_GUID.
+if grep -F 'store_identity_file_guid_matches_client' "$impl" >/dev/null; then
+    echo 'FAIL: source ACK incorrectly joins independent C/F StoreIdentity roots' >&2
+    exit 1
+fi
 
 # The ACK must not transmit or model raw CSPRNG entropy/root state.
 if grep -F 'f_store_identity_root' "$header" "$impl" "$identity" "$test" >/dev/null; then

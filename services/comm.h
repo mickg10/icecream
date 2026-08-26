@@ -860,8 +860,10 @@ private:
 
 /* Exact F acknowledgement.  It echoes every arm field and adds the current
  * F control launch, StoreIdentity-derived F GUID/version, and a fresh
- * nonzero observation.  The CSPRNG root is deliberately never sent or
- * logged; the receiver checks the fixed F role bit on the derived GUID. */
+ * nonzero observation.  C and F are independent supervised sidecar
+ * incarnations: each GUID must have its own fixed role bit, but the ACK must
+ * never pretend that F's CSPRNG root is derived from C's root.  Raw roots are
+ * deliberately never sent or logged. */
 class P50SourceArmedMsg : public Msg
 {
 public:

@@ -2659,8 +2659,9 @@ bool P50SourceArmedMsg::valid_payload() const
 {
     return wire_payload_valid && arm.valid() && f_control_generation != 0 &&
            f_control_attempt != 0 && p50_nonzero(f_store_guid) &&
-           icecc::p50::store_identity_file_guid_matches_client(
-               arm.c_store_guid, f_store_guid) &&
+           (f_store_guid[icecc::p50::kStoreIdentityRoleByte] &
+            icecc::p50::kStoreIdentityRoleMask) ==
+               icecc::p50::kStoreIdentityFileRole &&
            f_store_derivation_version == icecc::p50::kStoreIdentityDerivationVersion &&
            arm_observation_id != 0;
 }

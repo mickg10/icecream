@@ -124,7 +124,8 @@ P50SourceArmFields arm()
 P50SourceArmedMsg armed(const P50SourceArmFields &source_arm)
 {
     std::array<uint8_t, 16> f_guid{};
-    f_guid = source_arm.c_store_guid;
+    for (size_t i = 0; i != f_guid.size(); ++i)
+        f_guid[i] = static_cast<uint8_t>(0xd0 + i);
     f_guid[icecc::p50::kStoreIdentityRoleByte] |=
         icecc::p50::kStoreIdentityFileRole;
     return P50SourceArmedMsg(source_arm, UINT64_C(0x8182838485868788),
@@ -196,7 +197,7 @@ void test_roundtrip_and_exact_echo()
                 "0000000000000001404142434445464748494a4b4c4d4e4f515253545556"
                 "575800000001"
                 "616263646566676871727374757677788182838485868788919293949596"
-                "9798c04142434445464748494a4b4c4d4e4f0000000000000001"
+                "9798d0d1d2d3d4d5d6d7d8d9dadbdcdddedf0000000000000001"
                 "a1a2a3a4a5a6a7a8"),
             "armed ACK stable Protocol-50 fixture bytes remain unchanged");
     Msg *reply_base = decode_frame(reply_wire);
@@ -300,8 +301,8 @@ void test_ack_conflict()
             "ACK with a C/F GUID alias cannot authorize the arm");
     wrong = armed(request.arm);
     wrong.f_store_guid[1] ^= 1;
-    REQUIRE(!wrong.acknowledges(request),
-            "ACK with an unrelated same-role root cannot authorize the arm");
+    REQUIRE(wrong.acknowledges(request),
+            "independent F sidecar StoreIdentity root is accepted");
 }
 
 } // namespace
