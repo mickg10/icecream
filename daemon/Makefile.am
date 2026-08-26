@@ -4,6 +4,7 @@ iceccd_SOURCES = \
 	main.cpp \
 	connection_provenance.cpp \
 	serve.cpp \
+	p50_fork_fd_hygiene.cpp \
 	p50_task_count.cpp \
 	p50_completion_record.cpp \
 	compiler_input.cpp \
@@ -40,10 +41,12 @@ AM_CPPFLAGS = \
 	$(LIBARCHIVE_CFLAGS)
 
 AM_LIBTOOLFLAGS = --silent
+EXTRA_DIST = P50_FORK_FD_HYGIENE.md
 
 noinst_HEADERS = \
 	compiler_input.h \
 	p50_task_count.h \
+	p50_fork_fd_hygiene.h \
 	p50_completion_record.h \
 	statewriter.h \
 	environment.h \

@@ -7300,10 +7300,19 @@ void Daemon::handle_old_request()
             string envforjob = job->targetPlatform() + "/" + job->environmentVersion();
             received_environments[envforjob].last_use = time(nullptr);
             const int compiler_input_fd = client->p50_input_fd;
+            const uint64_t compiler_input_delivery_id =
+                client->p50_input_lease.has_value()
+                    ? client->p50_input_lease->request_id : 0;
             client->p50_input_fd = -1;
+            /* The completed ControlOperation is owned by the cache adapter
+               and is not retained in Client.  If a future positive bridge
+               stores one here, it MUST erase it before this TOCOMPILE/fork
+               edge.  That bridge is intentionally HOLD; this bounded daemon
+               path accepts only the exact lease request_id + source fd pair. */
             pid = handle_connection(envbasedir, job, client->channel, sock,
                                     mem_limit, user_uid, user_gid,
-                                    compiler_input_fd);
+                                    compiler_input_fd,
+                                    compiler_input_delivery_id);
             trace() << "handle connection returned " << pid << endl;
 
             if (pid > 0) {

@@ -34,7 +34,6 @@
 #include <cassert>
 
 #include <sys/stat.h>
-#include <dirent.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #ifdef HAVE_SIGNAL_H
@@ -57,6 +56,7 @@
 #include "file_util.h"
 #include "p50_completion_record.h"
 #include "p50_task_count.h"
+#include "p50_fork_fd_hygiene.h"
 
 #include <sys/time.h>
 
@@ -168,44 +168,41 @@ static void emit_p50_completion_and_close(
 /**
  * Read a request, run the compiler, and send a response.
  **/
-void close_unneeded_fds_in_child(std::initializer_list<int> keep_fds)
+static void report_fork_hygiene_failure(int& out_fd, CompileJob* job,
+                                        icecc::p50::forkfd::Failure failure) noexcept
 {
-    DIR *dir = opendir("/proc/self/fd");
-    if (!dir) {
-        return;   // best effort; nothing to do if /proc is unavailable
+    log_error() << "compile child descriptor hygiene refused before reset_debug/work_it: "
+                << icecc::p50::forkfd::failure_name(failure) << endl;
+    unsigned int stats[8] = {};
+    stats[JobStatistics::exit_code] = EXIT_IO_ERROR;
+    if (job != nullptr && job->usesP50Input()) {
+        emit_p50_completion_and_close(
+            out_fd, *job, stats, EXIT_IO_ERROR,
+            icecc::p50::P50CompletionDisposition::AttemptCancelOnly);
+        return;
     }
-    const int dir_fd = dirfd(dir);
-    std::vector<int> to_close;
-    while (struct dirent *e = readdir(dir)) {
-        char *end = nullptr;
-        const long fd = strtol(e->d_name, &end, 10);
-        if (!end || *end || fd <= STDERR_FILENO) {
+    const char* bytes = reinterpret_cast<const char*>(stats);
+    size_t left = sizeof(stats);
+    while (left != 0) {
+        const ssize_t written = ::write(out_fd, bytes, left);
+        if (written > 0) {
+            bytes += written;
+            left -= static_cast<size_t>(written);
             continue;
         }
-        if (int(fd) == dir_fd) {
+        if (written < 0 && errno == EINTR)
             continue;
-        }
-        bool keep = false;
-        for (int k : keep_fds) {
-            if (int(fd) == k) {
-                keep = true;
-                break;
-            }
-        }
-        if (!keep) {
-            to_close.push_back(int(fd));
-        }
+        break;
     }
-    closedir(dir);
-    for (int fd : to_close) {
-        close(fd);
-    }
+    if (out_fd >= 0)
+        (void)::close(out_fd);
+    out_fd = -1;
 }
 
 int handle_connection(const string &basedir, CompileJob *job,
                       MsgChannel *client, int &out_fd,
                       unsigned int mem_limit, uid_t user_uid, gid_t user_gid,
-                      int compiler_input_fd)
+                      int compiler_input_fd, uint64_t compiler_input_delivery_id)
 {
     int owned_compiler_input_fd = compiler_input_fd;
     if (job != nullptr && job->usesP50Input()) {
@@ -288,15 +285,31 @@ int handle_connection(const string &basedir, CompileJob *job,
        The sweep also runs BEFORE reset_debug(): it necessarily closes the
        inherited log descriptor, and reset_debug() reopens the log file
        afterwards so the child keeps logging on a descriptor it owns.  */
-    close_unneeded_fds_in_child(
-        {socket[1], client->fd, owned_compiler_input_fd});
+    out_fd = socket[1];
+    const bool p50_input = job != nullptr && job->usesP50Input();
+    icecc::p50::forkfd::KeepSet keep{
+        socket[1], client->fd, std::nullopt};
+    if (p50_input && owned_compiler_input_fd >= 0) {
+        keep.source = icecc::p50::forkfd::AcceptedSource{
+            owned_compiler_input_fd, compiler_input_delivery_id};
+    } else if (p50_input || owned_compiler_input_fd >= 0 ||
+               compiler_input_delivery_id != 0) {
+        // A P50 job must carry both source halves, while a legacy job must
+        // carry neither.  Deliberately manufacture an invalid third entry so
+        // sweep() reports this to the parent before reset_debug/work_it.
+        keep.source = icecc::p50::forkfd::AcceptedSource{-1,
+                                                          compiler_input_delivery_id};
+    }
+    const auto hygiene = icecc::p50::forkfd::sweep(keep);
+    if (!hygiene.ok()) {
+        report_fork_hygiene_failure(out_fd, job, hygiene.failure);
+        _exit(EXIT_IO_ERROR);
+    }
 
     reset_debug();
     if ((-1 == close(socket[0])) && (errno != EBADF)){
         log_perror("close failed");
     }
-    out_fd = socket[1];
-
     /* internal communication channel, don't inherit to gcc */
     fcntl(out_fd, F_SETFD, FD_CLOEXEC);
 
