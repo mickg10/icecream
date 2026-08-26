@@ -3,6 +3,8 @@ TESTS += p50sourcearm p50sourcearm-source.sh
 TESTS += p50phaseopen p50phaseopen-source.sh
 TESTS += p50reversefdretry p50reversefdretry-source.sh
 TESTS += p50reversefdretry-mutants.sh p50_reverse_fd_retry_sanitize.sh
+TESTS += p50s2restartreplay p50s2restartreplay-source.sh
+TESTS += p50_s2_restart_replay_sanitize.sh
 TESTS += p50sidecarsupervisor-sanitize.sh
 TESTS += p50connectionprovenance
 TESTS += p50daemonsidecaradapter
@@ -93,6 +95,7 @@ check_PROGRAMS += p50connectionprovenance
 testargs_SOURCES = args.cpp
 check_PROGRAMS += p50sourcearm p50phaseopen
 check_PROGRAMS += p50reversefdretry
+check_PROGRAMS += p50s2restartreplay
 p50wire_SOURCES = p50_wire_test.cpp
 p50slice0_SOURCES = \
 	p50_slice0_test.cpp
@@ -252,6 +255,13 @@ p50reversefdretry_CXXFLAGS = -pthread
 p50reversefdretry_LDFLAGS = -pthread
 p50reversefdretry_LDADD = ../cache/libp50localtransport.a ../cache/libprotocol50.a \
 	../services/libicecc.la
+p50s2restartreplay_SOURCES = p50_s2_restart_replay_test.cpp
+p50s2restartreplay_CPPFLAGS = $(AM_CPPFLAGS)
+p50s2restartreplay_CXXFLAGS = -pthread
+p50s2restartreplay_LDFLAGS = -pthread
+p50s2restartreplay_LDADD = ../cache/libp50sidecarsupervisor.a \
+	../cache/libp50localtransport.a ../cache/libprotocol50.a \
+	../services/libicecc.la
 p50cacheservice_SOURCES = p50cacheservice.cpp ../cache/p50_cache_service.cpp
 p50cacheservice_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS) -DICECC_P50_CACHE_SERVICE_NO_MAIN
 p50cacheservice_CXXFLAGS = -pthread
@@ -298,6 +308,7 @@ EXTRA_DIST += p50_trace_check.sh p50assignment-source.sh p50cacheadvertisement-s
 EXTRA_DIST += p50sourcearm-source.sh p50phaseopen-source.sh
 EXTRA_DIST += p50reversefdretry-source.sh p50reversefdretry-mutants.sh \
 	p50_reverse_fd_retry_sanitize.sh
+EXTRA_DIST += p50s2restartreplay-source.sh p50_s2_restart_replay_sanitize.sh
 EXTRA_DIST += p50sidecarsupervisor-sanitize.sh
 EXTRA_DIST += p50compilee2e-source.sh p50compilee2e-run.sh
 EXTRA_DIST += p50completionflow-source.py
