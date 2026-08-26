@@ -45,6 +45,7 @@ libp50endpoint_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 
 libp50localtransport_a_SOURCES = p50_local_transport.cpp p50_local_transport.h \
 	p50_fd_handoff.cpp p50_fd_handoff.h \
+	p50_daemon_control.cpp p50_daemon_control.h \
 	p50_reverse_fd_retry.cpp p50_reverse_fd_retry.h
 libp50inputfd_a_SOURCES = p50_input_fd_attachment.cpp p50_input_fd_attachment.h
 libp50inputfd_a_CPPFLAGS = $(AM_CPPFLAGS)
@@ -65,6 +66,8 @@ libp50sessionjoin_a_CPPFLAGS = $(AM_CPPFLAGS)
 
 EXTRA_DIST = \
 	p50_control_operation.h \
+	p50_daemon_control.h \
+	p50_daemon_control.cpp \
 	README.md \
 	P48_P50_CONVERGENCE.md \
 	KEY_LAYOUT_V1_CENSUS.md \
