@@ -1,5 +1,5 @@
 noinst_LIBRARIES = libprotocol50.a libp50endpoint.a libp50localtransport.a \
-	libp50sidecarsupervisor.a libp50readyadvertisement.a libp50roleowner.a \
+	libp50sidecarsupervisor.a libp50sidecarlifecycle.a libp50readyadvertisement.a libp50roleowner.a \
 	libp50daemonsidecaradapter.a libp50inputfd.a libp50inputlifecycle.a \
 	libp50sessionjoin.a
 
@@ -51,6 +51,8 @@ libp50inputfd_a_CPPFLAGS = $(AM_CPPFLAGS)
 libp50inputlifecycle_a_SOURCES = p50_input_lifecycle.cpp p50_input_lifecycle.h
 libp50inputlifecycle_a_CPPFLAGS = $(AM_CPPFLAGS)
 libp50sidecarsupervisor_a_SOURCES = p50_sidecar_supervisor.cpp p50_sidecar_supervisor.h
+libp50sidecarlifecycle_a_SOURCES = p50_sidecar_lifecycle.cpp p50_sidecar_lifecycle.h
+libp50sidecarlifecycle_a_CPPFLAGS = $(AM_CPPFLAGS)
 libp50readyadvertisement_a_SOURCES = p50_ready_advertisement.cpp \
 	p50_ready_advertisement.h
 libp50daemonsidecaradapter_a_SOURCES = p50_daemon_sidecar_adapter.cpp \
@@ -162,6 +164,7 @@ EXTRA_DIST = \
 	P50_CACHE_SESSION.md \
 	P50_SIDECAR_SUPERVISOR.md \
 	p50_sidecar_supervisor.h \
+	P50_SIDECAR_LIFECYCLE.md \
 	P50_READY_ADVERTISEMENT.md \
 	P50_CACHE_SERVICE.md \
 	P50_FD_HANDOFF.md \

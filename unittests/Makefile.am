@@ -13,6 +13,7 @@ TESTS += p50reversefdretry-mutants.sh p50_reverse_fd_retry_sanitize.sh
 TESTS += p50s2restartreplay p50s2restartreplay-source.sh
 TESTS += p50_s2_restart_replay_sanitize.sh
 TESTS += p50sidecarsupervisor-sanitize.sh
+TESTS += p50sidecarlifecycle p50sidecarlifecycle-source.sh p50sidecarlifecycle-mutants.sh p50sidecarlifecycle-sanitize.sh
 TESTS += p50connectionprovenance
 TESTS += p50daemonsidecaradapter
 TESTS += p50daemonsidecaradapter-source.sh
@@ -97,6 +98,12 @@ p50sidecarsupervisor_CXXFLAGS = -pthread
 p50sidecarsupervisor_LDFLAGS = -pthread
 p50sidecarsupervisor_LDADD = ../cache/libp50sidecarsupervisor.a \
 	../cache/libp50localtransport.a ../services/libicecc.la
+p50sidecarlifecycle_SOURCES = p50_sidecar_lifecycle_test.cpp
+p50sidecarlifecycle_CXXFLAGS = -pthread
+p50sidecarlifecycle_LDFLAGS = -pthread
+p50sidecarlifecycle_LDADD = ../cache/libp50sidecarlifecycle.a \
+	../cache/libp50sidecarsupervisor.a ../cache/libp50localtransport.a \
+	../services/libicecc.la
 p50roleowner_SOURCES = p50_role_owner_test.cpp ../cache/p50_role_owner.cpp
 p50roleowner_CXXFLAGS = -pthread
 p50roleowner_LDFLAGS = -pthread
@@ -134,6 +141,7 @@ check_PROGRAMS += p50s2restartreplay
 check_PROGRAMS += p50roleowner
 check_PROGRAMS += p50sessionjoin
 check_PROGRAMS += p50cachesessionwire
+check_PROGRAMS += p50sidecarlifecycle
 p50wire_SOURCES = p50_wire_test.cpp
 p50sourceingress_SOURCES = p50_source_ingress_test.cpp
 p50sourceingress_CXXFLAGS = -pthread
@@ -378,7 +386,8 @@ EXTRA_DIST += p50sourceingress-source.sh p50sourceingress-sanitize.sh
 EXTRA_DIST += p50reversefdretry-source.sh p50reversefdretry-mutants.sh \
 	p50_reverse_fd_retry_sanitize.sh
 EXTRA_DIST += p50s2restartreplay-source.sh p50_s2_restart_replay_sanitize.sh
-EXTRA_DIST += p50sidecarsupervisor-sanitize.sh
+EXTRA_DIST += p50sidecarsupervisor-sanitize.sh p50sidecarlifecycle-source.sh \
+	p50sidecarlifecycle-mutants.sh p50sidecarlifecycle-sanitize.sh
 EXTRA_DIST += p50daemonsidecaradapter-source.sh p50daemonsidecaradapter-sanitize.sh
 EXTRA_DIST += p50profile-source.sh p50_profile_sanitize.sh
 EXTRA_DIST += p50compilee2e-source.sh p50compilee2e-run.sh
