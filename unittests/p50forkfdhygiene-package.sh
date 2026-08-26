@@ -17,7 +17,8 @@ for path in \
     unittests/p50forkfdhygiene-source.sh \
     unittests/p50forkfdhygiene-mutants.sh \
     unittests/p50_fork_fd_hygiene_sanitize.sh \
-    unittests/p50forkfdhygiene-oot.sh; do
+    unittests/p50forkfdhygiene-oot.sh \
+    unittests/p50forkfdhygiene-package.sh; do
     tar -tf "$archive" | grep -Fx "$path" >/dev/null || {
         echo "FAIL: package archive omits $path" >&2
         exit 1

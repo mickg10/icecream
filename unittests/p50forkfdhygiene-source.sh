@@ -16,18 +16,30 @@ if grep -F 'CLOSE_RANGE_CLOEXEC' "$source" >/dev/null; then
     exit 1
 fi
 grep -F 'force_proc_failure' "$source" >/dev/null
+grep -F 'force_proc_close_ebadf' "$source" >/dev/null
 grep -F 'Failure::EnumerationFailure' "$source" >/dev/null
 grep -F 'Failure::ParseFailure' "$source" >/dev/null
 grep -F 'Failure::CloseFailure' "$source" >/dev/null
-grep -F 'delivery_id' "$header" >/dev/null
+grep -F 'ForkSourceLease' "$header" >/dev/null
+grep -F 'mint_fork_source_lease' "$header" >/dev/null
+grep -F 'source_required' "$header" >/dev/null
 grep -F 'FD_CLOEXEC' "$source" >/dev/null
+grep -F 'O_WRONLY' "$source" >/dev/null
+grep -F 'O_RDWR' "$source" >/dev/null
+grep -F 'SO_TYPE' "$source" >/dev/null
+grep -F 'getpeername' "$source" >/dev/null
+if grep -F 'errno != EBADF' "$source" >/dev/null; then
+    echo 'FAIL: /proc close EBADF is still ignored' >&2
+    exit 1
+fi
 if grep -F 'close_unneeded_fds_in_child' "$serve" >/dev/null; then
     echo 'FAIL: best-effort close helper survived in production serve path' >&2
     exit 1
 fi
 grep -F 'forkfd::sweep' "$serve" >/dev/null
 grep -F 'before reset_debug/work_it' "$serve" >/dev/null
-grep -F 'compiler_input_delivery_id' "$main" >/dev/null
+grep -F 'compiler_input_source' "$serve" >/dev/null
+grep -F 'ForkSourceLease' "$main" "$serve" >/dev/null
 grep -F 'it MUST erase it before this TOCOMPILE/fork' "$main" >/dev/null
 grep -F 'explicitly HOLD' "$doc" >/dev/null
 grep -F 'p50_fork_fd_hygiene.cpp' "$makefile" >/dev/null

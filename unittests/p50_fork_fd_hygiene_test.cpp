@@ -12,11 +12,15 @@
 #include <sys/wait.h>
 #include <netinet/in.h>
 #include <unistd.h>
+#include <utility>
 
-using icecc::p50::forkfd::AcceptedSource;
+using icecc::p50::forkfd::DeliveryOwnerToken;
 using icecc::p50::forkfd::Failure;
+using icecc::p50::forkfd::ForkSourceLease;
 using icecc::p50::forkfd::KeepSet;
 using icecc::p50::forkfd::Result;
+
+constexpr uint64_t kAcceptedDeliveryId = 77;
 
 namespace {
 
@@ -94,9 +98,18 @@ Inventory make_inventory(bool with_source) {
 }
 
 KeepSet keeps(const Inventory& inventory, bool with_source) {
-    KeepSet result{inventory.stat_write, inventory.client_child, std::nullopt};
-    if (with_source)
-        result.source = AcceptedSource{inventory.source, 77};
+    KeepSet result{inventory.stat_write, inventory.client_child, std::nullopt,
+                   with_source, with_source
+                       ? std::optional<int>(inventory.source) : std::nullopt};
+    if (with_source) {
+        auto owner = icecc::p50::forkfd::test_make_delivery_owner(
+            inventory.source, 77);
+        require(owner.has_value(), "delivery owner token was not minted");
+        auto lease = icecc::p50::forkfd::mint_fork_source_lease(
+            std::move(*owner), inventory.source, kAcceptedDeliveryId);
+        require(lease.has_value(), "exact source lease was not minted");
+        result.source = std::move(*lease);
+    }
     return result;
 }
 
@@ -113,7 +126,7 @@ int child_sweep(const KeepSet& keep, int unrelated, int listener, bool await_eof
         ::fcntl(keep.client_fd, F_GETFD) < 0 ||
         (::fcntl(keep.client_fd, F_GETFD) & FD_CLOEXEC) == 0)
         code |= 1;
-    if (keep.source.has_value() && ::fcntl(keep.source->fd, F_GETFD) < 0)
+    if (keep.source.has_value() && ::fcntl(keep.source->fd(), F_GETFD) < 0)
         code |= 2;
     if (::fcntl(unrelated, F_GETFD) >= 0)
         code |= 4;
@@ -170,21 +183,102 @@ void test_exact_two_and_source_omission() {
 
 void test_validation() {
     Inventory inventory = make_inventory(true);
-    KeepSet duplicate{inventory.stat_write, inventory.stat_write, std::nullopt};
+    KeepSet duplicate{inventory.stat_write, inventory.stat_write, std::nullopt,
+                      false, std::nullopt};
     require(icecc::p50::forkfd::sweep(duplicate).failure == Failure::InvalidKeepSet,
             "duplicate keep set was accepted");
-    KeepSet missing{inventory.stat_write, inventory.client_child,
-                    AcceptedSource{-1, 77}};
+    KeepSet missing{inventory.stat_write, inventory.client_child, std::nullopt,
+                    true, inventory.source};
     require(icecc::p50::forkfd::sweep(missing).failure == Failure::InvalidKeepSet,
-            "source DeliveryId without source FD was accepted");
-    KeepSet no_id{inventory.stat_write, inventory.client_child,
-                  AcceptedSource{inventory.source, 0}};
-    require(icecc::p50::forkfd::sweep(no_id).failure == Failure::InvalidKeepSet,
-            "source FD without DeliveryId was accepted");
+            "P50 source omission was accepted");
+
+    auto wrong_id_owner = icecc::p50::forkfd::test_make_delivery_owner(
+        inventory.source, kAcceptedDeliveryId);
+    require(wrong_id_owner.has_value(), "wrong-id owner token was not minted");
+    require(!icecc::p50::forkfd::mint_fork_source_lease(
+                 std::move(*wrong_id_owner), inventory.source,
+                 kAcceptedDeliveryId + 1)
+                 .has_value(),
+            "mismatched DeliveryId was accepted by owner seam");
+
+    auto wrong_fd_owner = icecc::p50::forkfd::test_make_delivery_owner(
+        inventory.source, kAcceptedDeliveryId);
+    require(wrong_fd_owner.has_value(), "wrong-fd owner token was not minted");
+    require(!icecc::p50::forkfd::mint_fork_source_lease(
+                 std::move(*wrong_fd_owner), inventory.unrelated,
+                 kAcceptedDeliveryId)
+                 .has_value(),
+            "source-FD substitution was accepted by owner seam");
+
+    auto valid_owner = icecc::p50::forkfd::test_make_delivery_owner(
+        inventory.source, kAcceptedDeliveryId);
+    require(valid_owner.has_value(), "valid owner token was not minted");
+    auto valid_lease = icecc::p50::forkfd::mint_fork_source_lease(
+        std::move(*valid_owner), inventory.source, kAcceptedDeliveryId);
+    require(valid_lease.has_value(), "valid source lease was not minted");
+    KeepSet mismatched_expected_fd{
+        inventory.stat_write, inventory.client_child, std::move(valid_lease),
+        true, inventory.unrelated};
+    require(icecc::p50::forkfd::sweep(mismatched_expected_fd).failure ==
+                Failure::InvalidKeepSet,
+            "source lease was detached from its expected FD");
+
+    auto wrong_type_owner = icecc::p50::forkfd::test_make_delivery_owner(
+        inventory.stat_read, kAcceptedDeliveryId);
+    require(wrong_type_owner.has_value(), "wrong-type owner token was not minted");
+    auto wrong_type_lease = icecc::p50::forkfd::mint_fork_source_lease(
+        std::move(*wrong_type_owner), inventory.stat_read, kAcceptedDeliveryId);
+    require(wrong_type_lease.has_value(), "wrong-type source lease was not minted");
     KeepSet wrong_type{inventory.stat_write, inventory.client_child,
-                       AcceptedSource{inventory.stat_read, 77}};
+                       std::move(wrong_type_lease), true, inventory.stat_read};
     require(icecc::p50::forkfd::sweep(wrong_type).failure == Failure::TypeFailure,
             "non-regular source was accepted");
+
+    KeepSet wrong_stat_direction{inventory.stat_read, inventory.client_child,
+                                 std::nullopt, false, std::nullopt};
+    require(icecc::p50::forkfd::sweep(wrong_stat_direction).failure ==
+                Failure::OwnershipFailure,
+            "statistics pipe read end was accepted");
+
+    const int unconnected = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    require(unconnected >= 0, "unconnected socket failed");
+    const int high_unconnected = move_high(unconnected, 45);
+    KeepSet wrong_client{inventory.stat_write, high_unconnected, std::nullopt,
+                         false, std::nullopt};
+    require(icecc::p50::forkfd::sweep(wrong_client).failure ==
+                Failure::OwnershipFailure,
+            "unconnected client socket was accepted");
+    (void)::close(high_unconnected);
+
+    int datagram[2] = {-1, -1};
+    require(::socketpair(AF_UNIX, SOCK_DGRAM, 0, datagram) == 0,
+            "datagram socketpair failed");
+    const int high_datagram = move_high(datagram[1], 46);
+    KeepSet wrong_socket_type{inventory.stat_write, high_datagram,
+                              std::nullopt, false, std::nullopt};
+    require(icecc::p50::forkfd::sweep(wrong_socket_type).failure ==
+                Failure::TypeFailure,
+            "non-stream client socket was accepted");
+    (void)::close(datagram[0]);
+    (void)::close(high_datagram);
+
+    char path[] = "/tmp/icecc-fork-fd-writable-XXXXXX";
+    const int writable = ::mkstemp(path);
+    require(writable >= 0, "writable source mkstemp failed");
+    (void)::unlink(path);
+    const int high_writable = move_high(writable, 47);
+    auto writable_owner = icecc::p50::forkfd::test_make_delivery_owner(
+        high_writable, kAcceptedDeliveryId);
+    require(writable_owner.has_value(), "writable owner token was not minted");
+    auto writable_lease = icecc::p50::forkfd::mint_fork_source_lease(
+        std::move(*writable_owner), high_writable, kAcceptedDeliveryId);
+    require(writable_lease.has_value(), "writable source lease was not minted");
+    KeepSet writable_source{inventory.stat_write, inventory.client_child,
+                            std::move(writable_lease), true, high_writable};
+    require(icecc::p50::forkfd::sweep(writable_source).failure ==
+                Failure::OwnershipFailure,
+            "writable source descriptor was accepted");
+    (void)::close(high_writable);
 }
 
 void test_fallback_and_injected_failures() {
@@ -224,6 +318,14 @@ void test_fallback_and_injected_failures() {
     require(run_child(parse_failure, true, false, parse) ==
                 100 + static_cast<int>(Failure::ParseFailure),
             "proc parse failure was not explicit");
+
+    Inventory proc_close_failure = make_inventory(true);
+    icecc::p50::forkfd::TestHooks proc_close;
+    proc_close.force_close_range_unsupported = true;
+    proc_close.force_proc_close_ebadf = true;
+    require(run_child(proc_close_failure, true, false, proc_close) ==
+                100 + static_cast<int>(Failure::CloseFailure),
+            "/proc directory EBADF close failure was ignored");
 }
 
 } // namespace

@@ -26,6 +26,9 @@
 
 #include <string>
 #include <cstdint>
+#include <optional>
+
+#include "p50_fork_fd_hygiene.h"
 
 class CompileJob;
 class MsgChannel;
@@ -36,6 +39,7 @@ int handle_connection(const std::string &basedir, CompileJob *job,
                       MsgChannel *serv, int & out_fd,
                       unsigned int mem_limit, uid_t user_uid, gid_t user_gid,
                       int compiler_input_fd = -1,
-                      uint64_t compiler_input_delivery_id = 0);
+                      std::optional<icecc::p50::forkfd::ForkSourceLease>
+                          compiler_input_source = std::nullopt);
 
 #endif

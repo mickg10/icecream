@@ -8,8 +8,10 @@
 #include <cstdint>
 #include <fcntl.h>
 #include <limits>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <utility>
 
 #if defined(__linux__)
 #  include <sys/syscall.h>
@@ -20,12 +22,97 @@
 #endif
 
 namespace icecc::p50::forkfd {
+
+DeliveryOwnerToken::DeliveryOwnerToken(int expected_fd,
+                                       uint64_t expected_delivery_id,
+                                       uint64_t owner_cookie) noexcept
+    : expected_fd_(expected_fd), expected_delivery_id_(expected_delivery_id),
+      owner_cookie_(owner_cookie) {}
+
+DeliveryOwnerToken::DeliveryOwnerToken(DeliveryOwnerToken&& other) noexcept
+    : expected_fd_(other.expected_fd_),
+      expected_delivery_id_(other.expected_delivery_id_),
+      owner_cookie_(other.owner_cookie_) {
+    other.expected_fd_ = -1;
+    other.expected_delivery_id_ = 0;
+    other.owner_cookie_ = 0;
+}
+
+DeliveryOwnerToken& DeliveryOwnerToken::operator=(DeliveryOwnerToken&& other) noexcept {
+    if (this != &other) {
+        expected_fd_ = other.expected_fd_;
+        expected_delivery_id_ = other.expected_delivery_id_;
+        owner_cookie_ = other.owner_cookie_;
+        other.expected_fd_ = -1;
+        other.expected_delivery_id_ = 0;
+        other.owner_cookie_ = 0;
+    }
+    return *this;
+}
+
+ForkSourceLease::ForkSourceLease(int fd, uint64_t delivery_id, int expected_fd,
+                                 uint64_t expected_delivery_id,
+                                 uint64_t owner_cookie) noexcept
+    : fd_(fd), delivery_id_(delivery_id), expected_fd_(expected_fd),
+      expected_delivery_id_(expected_delivery_id), owner_cookie_(owner_cookie) {}
+
+ForkSourceLease::ForkSourceLease(ForkSourceLease&& other) noexcept
+    : fd_(other.fd_), delivery_id_(other.delivery_id_),
+      expected_fd_(other.expected_fd_),
+      expected_delivery_id_(other.expected_delivery_id_),
+      owner_cookie_(other.owner_cookie_) {
+    other.fd_ = -1;
+    other.delivery_id_ = 0;
+    other.expected_fd_ = -1;
+    other.expected_delivery_id_ = 0;
+    other.owner_cookie_ = 0;
+}
+
+ForkSourceLease& ForkSourceLease::operator=(ForkSourceLease&& other) noexcept {
+    if (this != &other) {
+        if (fd_ >= 0)
+            (void)::close(fd_);
+        fd_ = other.fd_;
+        delivery_id_ = other.delivery_id_;
+        expected_fd_ = other.expected_fd_;
+        expected_delivery_id_ = other.expected_delivery_id_;
+        owner_cookie_ = other.owner_cookie_;
+        other.fd_ = -1;
+        other.delivery_id_ = 0;
+        other.expected_fd_ = -1;
+        other.expected_delivery_id_ = 0;
+        other.owner_cookie_ = 0;
+    }
+    return *this;
+}
+
+ForkSourceLease::~ForkSourceLease() {
+    if (fd_ >= 0)
+        (void)::close(fd_);
+}
+
+std::optional<ForkSourceLease>
+mint_fork_source_lease(DeliveryOwnerToken&& owner, int fd,
+                       uint64_t delivery_id) noexcept {
+    if (owner.owner_cookie_ == 0 || owner.expected_fd_ < 0 ||
+        owner.expected_delivery_id_ == 0 || fd != owner.expected_fd_ ||
+        delivery_id != owner.expected_delivery_id_)
+        return std::nullopt;
+    ForkSourceLease result(fd, delivery_id, owner.expected_fd_,
+                           owner.expected_delivery_id_, owner.owner_cookie_);
+    owner.expected_fd_ = -1;
+    owner.expected_delivery_id_ = 0;
+    owner.owner_cookie_ = 0;
+    return result;
+}
+
 namespace {
 
 constexpr int kFirstNonstandardFd = STDERR_FILENO + 1;
 constexpr size_t kMaxEnumeratedFds = 65536;
 constexpr size_t kMaxProcReads = 4096;
 constexpr size_t kMaxProcBytes = size_t{16} << 20;
+constexpr uint64_t kTestOwnerCookie = UINT64_C(0x9d5f31a7c2e84b61);
 
 #if defined(ICECC_P50_FORK_FD_HYGIENE_TEST_HOOKS)
 TestHooks hooks;
@@ -76,7 +163,7 @@ bool set_cloexec(int fd) noexcept {
 bool is_kept(int fd, const KeepSet& keep) noexcept {
     if (fd == keep.stat_pipe_fd || fd == keep.client_fd)
         return true;
-    return keep.source.has_value() && fd == keep.source->fd;
+    return keep.source.has_value() && fd == keep.source->fd();
 }
 
 Failure validate_keep_set(const KeepSet& keep) noexcept {
@@ -84,17 +171,25 @@ Failure validate_keep_set(const KeepSet& keep) noexcept {
         keep.client_fd < kFirstNonstandardFd ||
         keep.stat_pipe_fd == keep.client_fd)
         return Failure::InvalidKeepSet;
+    if (keep.source_required != keep.source.has_value())
+        return Failure::InvalidKeepSet;
     if (keep.source.has_value()) {
-        if (keep.source->fd < kFirstNonstandardFd ||
-            keep.source->delivery_id == 0 ||
-            keep.source->fd == keep.stat_pipe_fd ||
-            keep.source->fd == keep.client_fd)
+        if (!keep.source->valid() ||
+            keep.source->fd() < kFirstNonstandardFd ||
+            keep.source->delivery_id() == 0 ||
+            keep.source->fd() == keep.stat_pipe_fd ||
+            keep.source->fd() == keep.client_fd)
             return Failure::InvalidKeepSet;
+        if (keep.expected_source_fd.has_value() &&
+            keep.source->fd() != *keep.expected_source_fd)
+            return Failure::InvalidKeepSet;
+    } else if (keep.expected_source_fd.has_value()) {
+        return Failure::InvalidKeepSet;
     }
 
     const std::array<int, 3> fds = {
         keep.stat_pipe_fd, keep.client_fd,
-        keep.source.has_value() ? keep.source->fd : -1};
+        keep.source.has_value() ? keep.source->fd() : -1};
     for (const int fd : fds) {
         if (fd < 0)
             continue;
@@ -107,16 +202,34 @@ Failure validate_keep_set(const KeepSet& keep) noexcept {
         return Failure::OwnershipFailure;
     if (!S_ISFIFO(stat_pipe_info.st_mode))
         return Failure::TypeFailure;
+    const int stat_flags = ::fcntl(keep.stat_pipe_fd, F_GETFL);
+    if (stat_flags < 0)
+        return Failure::OwnershipFailure;
+    if ((stat_flags & O_ACCMODE) != O_WRONLY)
+        return Failure::OwnershipFailure;
 
     struct stat client_info{};
     if (::fstat(keep.client_fd, &client_info) != 0)
         return Failure::OwnershipFailure;
     if (!S_ISSOCK(client_info.st_mode))
         return Failure::TypeFailure;
+    const int client_flags = ::fcntl(keep.client_fd, F_GETFL);
+    if (client_flags < 0 || (client_flags & O_ACCMODE) != O_RDWR)
+        return Failure::OwnershipFailure;
+    int client_type = 0;
+    socklen_t client_type_size = sizeof(client_type);
+    if (::getsockopt(keep.client_fd, SOL_SOCKET, SO_TYPE, &client_type,
+                     &client_type_size) != 0 || client_type != SOCK_STREAM)
+        return Failure::TypeFailure;
+    sockaddr_storage peer{};
+    socklen_t peer_size = sizeof(peer);
+    if (::getpeername(keep.client_fd, reinterpret_cast<sockaddr*>(&peer),
+                      &peer_size) != 0)
+        return Failure::OwnershipFailure;
 
     if (keep.source.has_value()) {
         struct stat source_info{};
-        if (::fstat(keep.source->fd, &source_info) != 0)
+        if (::fstat(keep.source->fd(), &source_info) != 0)
             return Failure::OwnershipFailure;
         if (!S_ISREG(source_info.st_mode))
             return Failure::TypeFailure;
@@ -124,12 +237,12 @@ Failure validate_keep_set(const KeepSet& keep) noexcept {
         // The attachment producer promises an immutable, CLOEXEC snapshot.
         // Do not turn an unexpected ordinary inherited fd into an accepted
         // source merely because it happens to be a regular file.
-        const int flags = ::fcntl(keep.source->fd, F_GETFD);
+        const int flags = ::fcntl(keep.source->fd(), F_GETFD);
         if (flags < 0)
             return Failure::OwnershipFailure;
         if ((flags & FD_CLOEXEC) == 0)
             return Failure::OwnershipFailure;
-        const int access = ::fcntl(keep.source->fd, F_GETFL);
+        const int access = ::fcntl(keep.source->fd(), F_GETFL);
         if (access < 0 || (access & O_ACCMODE) != O_RDONLY)
             return Failure::OwnershipFailure;
     }
@@ -245,8 +358,25 @@ Result proc_fallback(const KeepSet& keep) noexcept {
         if (failure != Failure::None)
             break;
     }
-    if (::close(proc_fd) != 0 && errno != EBADF && failure == Failure::None)
-        failure = Failure::EnumerationFailure;
+    bool proc_closed = false;
+#if defined(ICECC_P50_FORK_FD_HYGIENE_TEST_HOOKS)
+    if (hooks.force_proc_close_ebadf) {
+        errno = EBADF;
+    } else
+#endif
+    {
+        for (;;) {
+            if (::close(proc_fd) == 0) {
+                proc_closed = true;
+                break;
+            }
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+    }
+    if (!proc_closed && failure == Failure::None)
+        failure = Failure::CloseFailure;
     if (failure != Failure::None)
         return {failure, 0};
 
@@ -274,7 +404,7 @@ Result close_range_sweep(const KeepSet& keep) noexcept {
     std::array<unsigned int, 3> kept = {
         static_cast<unsigned int>(keep.stat_pipe_fd),
         static_cast<unsigned int>(keep.client_fd),
-        keep.source.has_value() ? static_cast<unsigned int>(keep.source->fd) : 0};
+        keep.source.has_value() ? static_cast<unsigned int>(keep.source->fd()) : 0};
     const size_t kept_count = keep.source.has_value() ? 3 : 2;
     std::sort(kept.begin(), kept.begin() + kept_count);
     unsigned int first = kFirstNonstandardFd;
@@ -367,6 +497,14 @@ const char* failure_name(Failure failure) noexcept {
 #if defined(ICECC_P50_FORK_FD_HYGIENE_TEST_HOOKS)
 void set_test_hooks(TestHooks value) noexcept { hooks = value; }
 void reset_test_hooks() noexcept { hooks = TestHooks{}; }
+
+std::optional<DeliveryOwnerToken>
+test_make_delivery_owner(int expected_fd, uint64_t expected_delivery_id) noexcept {
+    if (expected_fd < 0 || expected_delivery_id == 0)
+        return std::nullopt;
+    return DeliveryOwnerToken(expected_fd, expected_delivery_id,
+                              kTestOwnerCookie);
+}
 #endif
 
 } // namespace icecc::p50::forkfd

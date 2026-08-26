@@ -202,7 +202,9 @@ static void report_fork_hygiene_failure(int& out_fd, CompileJob* job,
 int handle_connection(const string &basedir, CompileJob *job,
                       MsgChannel *client, int &out_fd,
                       unsigned int mem_limit, uid_t user_uid, gid_t user_gid,
-                      int compiler_input_fd, uint64_t compiler_input_delivery_id)
+                      int compiler_input_fd,
+                      std::optional<icecc::p50::forkfd::ForkSourceLease>
+                          compiler_input_source)
 {
     int owned_compiler_input_fd = compiler_input_fd;
     if (job != nullptr && job->usesP50Input()) {
@@ -259,10 +261,12 @@ int handle_connection(const string &basedir, CompileJob *job,
         if ((-1 == close(socket[1])) && (errno != EBADF)){
             log_perror("close failure");
         }
-        if (owned_compiler_input_fd >= 0) {
+        if (owned_compiler_input_fd >= 0 &&
+            (!compiler_input_source.has_value() ||
+             compiler_input_source->fd() != owned_compiler_input_fd)) {
             (void)close(owned_compiler_input_fd);
-            owned_compiler_input_fd = -1;
         }
+        owned_compiler_input_fd = -1;
         out_fd = socket[0];
         fcntl(out_fd, F_SETFD, FD_CLOEXEC);
         return pid;
@@ -288,18 +292,12 @@ int handle_connection(const string &basedir, CompileJob *job,
     out_fd = socket[1];
     const bool p50_input = job != nullptr && job->usesP50Input();
     icecc::p50::forkfd::KeepSet keep{
-        socket[1], client->fd, std::nullopt};
-    if (p50_input && owned_compiler_input_fd >= 0) {
-        keep.source = icecc::p50::forkfd::AcceptedSource{
-            owned_compiler_input_fd, compiler_input_delivery_id};
-    } else if (p50_input || owned_compiler_input_fd >= 0 ||
-               compiler_input_delivery_id != 0) {
-        // A P50 job must carry both source halves, while a legacy job must
-        // carry neither.  Deliberately manufacture an invalid third entry so
-        // sweep() reports this to the parent before reset_debug/work_it.
-        keep.source = icecc::p50::forkfd::AcceptedSource{-1,
-                                                          compiler_input_delivery_id};
-    }
+        socket[1], client->fd, std::move(compiler_input_source),
+        p50_input || owned_compiler_input_fd >= 0,
+        owned_compiler_input_fd >= 0
+            ? std::optional<int>(owned_compiler_input_fd) : std::nullopt};
+    if (!p50_input && keep.source.has_value())
+        keep.source_required = false; // source present on legacy is invalid
     const auto hygiene = icecc::p50::forkfd::sweep(keep);
     if (!hygiene.ok()) {
         report_fork_hygiene_failure(out_fd, job, hygiene.failure);
