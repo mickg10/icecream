@@ -82,7 +82,8 @@ p50localtransport_LDFLAGS = -pthread
 p50sidecarsupervisor_SOURCES = p50_sidecar_supervisor_test.cpp
 p50sidecarsupervisor_CXXFLAGS = -pthread
 p50sidecarsupervisor_LDFLAGS = -pthread
-p50sidecarsupervisor_LDADD = ../cache/libp50sidecarsupervisor.a ../services/libicecc.la
+p50sidecarsupervisor_LDADD = ../cache/libp50sidecarsupervisor.a \
+	../cache/libp50localtransport.a ../services/libicecc.la
 p50roleowner_SOURCES = p50_role_owner_test.cpp ../cache/p50_role_owner.cpp
 p50roleowner_CXXFLAGS = -pthread
 p50roleowner_LDFLAGS = -pthread

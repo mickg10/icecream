@@ -414,21 +414,28 @@ bool parse_ready_lease(std::string_view wire, const ReadyLease& expected,
         values[index] = field.substr(equals + 1);
     }
     uint64_t generation = 0, attempt = 0, pid = 0, device = 0, inode = 0;
-    if (!parse_uint64(values[0], generation) || !parse_uint64(values[1], attempt) ||
-        !parse_uint64(values[2], pid) || !parse_uint64(values[7], device) ||
-        !parse_uint64(values[8], inode) || pid != static_cast<uint64_t>(child) ||
-        generation != expected.identity.generation || attempt != expected.identity.attempt ||
-        device == 0 || inode == 0 ||
-        values[3] != bytes_hex(std::span<const uint8_t>(
-            expected.c_store_guid.bytes.data(), expected.c_store_guid.bytes.size())) ||
-        values[4] != bytes_hex(std::span<const uint8_t>(
-            expected.f_store_guid.bytes.data(), expected.f_store_guid.bytes.size())) ||
-        values[5] != expected.socket_path ||
-        values[6] != digest128_hex(expected.socket_path_digest))
+    const bool scalar_ok = parse_uint64(values[0], generation) &&
+                           parse_uint64(values[1], attempt) &&
+                           parse_uint64(values[2], pid) &&
+                           parse_uint64(values[7], device) &&
+                           parse_uint64(values[8], inode);
+    const bool identity_ok = pid == static_cast<uint64_t>(child) &&
+                             generation == expected.identity.generation &&
+                             attempt == expected.identity.attempt && device != 0 && inode != 0;
+    const bool guid_ok = values[3] == bytes_hex(std::span<const uint8_t>(
+                                      expected.c_store_guid.bytes.data(),
+                                      expected.c_store_guid.bytes.size())) &&
+                         values[4] == bytes_hex(std::span<const uint8_t>(
+                                      expected.f_store_guid.bytes.data(),
+                                      expected.f_store_guid.bytes.size()));
+    const bool path_ok = values[5] == expected.socket_path &&
+                         values[6] == digest128_hex(expected.socket_path_digest);
+    if (!scalar_ok || !identity_ok || !guid_ok || !path_ok)
         return false;
     struct stat socket_info{};
     if (::lstat(expected.socket_path.c_str(), &socket_info) != 0 ||
-        !S_ISSOCK(socket_info.st_mode) || socket_info.st_dev != static_cast<dev_t>(device) ||
+        !S_ISSOCK(socket_info.st_mode) ||
+        socket_info.st_dev != static_cast<dev_t>(device) ||
         socket_info.st_ino != static_cast<ino_t>(inode) ||
         socket_info.st_uid != ::geteuid() || (socket_info.st_mode & 07777) != 0600)
         return false;

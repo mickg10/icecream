@@ -96,18 +96,18 @@ int structured_child(const std::string& mode, int fd) {
         digest == nullptr)
         return 108;
     int listener = -1;
-    bool inherited = false;
     if (const char* raw_listener = ::getenv("ICECC_CACHE_SERVICE_LISTENER_FD");
         raw_listener != nullptr) {
         listener = std::atoi(raw_listener);
-        inherited = listener >= 0;
     }
     if (listener < 0)
         listener = structured_listener(path);
     if (listener < 0)
         return 109;
     struct stat pathname{};
-    if ((!inherited && ::lstat(path, &pathname) != 0) || ::fstat(listener, &pathname) != 0) {
+    struct stat listener_info{};
+    if (::lstat(path, &pathname) != 0 || ::fstat(listener, &listener_info) != 0 ||
+        !S_ISSOCK(listener_info.st_mode)) {
         (void)::close(listener);
         return 110;
     }

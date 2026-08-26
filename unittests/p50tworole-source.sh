@@ -30,9 +30,9 @@ grep -F 'return;' "$service" >/dev/null
 
 mutant=$(mktemp "${TMPDIR:-/tmp}/p50tworole-mutant.XXXXXX")
 trap 'rm -f "$mutant"' EXIT HUP INT TERM
-sed 's/const bool prebound = structured_launch.active && ::getenv(kListenerEnvironment.data()) != nullptr;/const bool prebound = false;/' \
+sed 's/const bool prebound = structured_launch.active;/const bool prebound = false;/' \
     "$service" >"$mutant"
-if grep -F 'const bool prebound = structured_launch.active && ::getenv(kListenerEnvironment.data()) != nullptr;' "$mutant" >/dev/null; then
+if grep -F 'const bool prebound = structured_launch.active;' "$mutant" >/dev/null; then
     echo 'FAIL: pre-bound deletion mutant was not formed' >&2
     exit 1
 fi

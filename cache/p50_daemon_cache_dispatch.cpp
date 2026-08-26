@@ -23,7 +23,6 @@ bool OnDemandEndpoint::valid() const noexcept {
             (c_store_guid != f_store_guid &&
              c_store_guid == c_store_guid_for_incarnation(lease_identity))) &&
            f_store_guid != FStoreGuid{} &&
-           c_store_guid == c_store_guid_for_incarnation(lease_identity) &&
            f_store_guid == f_store_guid_for_incarnation(lease_identity) &&
            socket_path_digest != icecc::Digest128{} && listener_device != 0 &&
            listener_inode != 0 && expected_peer.uid.has_value() &&

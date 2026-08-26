@@ -320,8 +320,8 @@ bool read_structured_launch(StructuredLaunch& launch) noexcept {
             return true;
         }
         // One inherited or manually supplied fragment must never silently
-        // select a partly structured launch.  The supervisor scrubs all six
-        // names and publishes the complete immutable tuple together.
+        // select a partly structured launch. The supervisor scrubs all
+        // managed names and publishes the complete immutable tuple together.
         if (present != names.size())
             return false;
         const std::string_view format(values[0]);
@@ -348,7 +348,7 @@ bool read_structured_launch(StructuredLaunch& launch) noexcept {
         if (expected_guid != bytes_hex(std::span<const uint8_t>(
                                  guid.bytes.data(), guid.bytes.size())) ||
             expected_c_guid != bytes_hex(std::span<const uint8_t>(
-                                  c_guid.bytes.data(), c_guid.bytes.size()))) ||
+                                  c_guid.bytes.data(), c_guid.bytes.size())) ||
             expected_digest != icecc::digest128_hex(digest))
             return false;
         launch.active = true;
@@ -560,13 +560,18 @@ bool capture_listener_identity(int fd, const std::string& path,
     return true;
 }
 
-bool capture_prebound_listener_identity(int fd, ListenerIdentity& identity) noexcept {
+bool capture_prebound_listener_identity(int fd, const std::string& path,
+                                        ListenerIdentity& identity) noexcept {
     struct stat info{};
+    struct stat pathname{};
     if (::fstat(fd, &info) != 0 || !S_ISSOCK(info.st_mode) || info.st_dev == 0 ||
-        info.st_ino == 0)
+        info.st_ino == 0 || ::lstat(path.c_str(), &pathname) != 0 ||
+        !S_ISSOCK(pathname.st_mode) || pathname.st_dev == 0 || pathname.st_ino == 0)
         return false;
     identity.listener_device = info.st_dev;
     identity.listener_inode = info.st_ino;
+    identity.pathname_device = pathname.st_dev;
+    identity.pathname_inode = pathname.st_ino;
     return true;
 }
 
@@ -1263,16 +1268,25 @@ int run(const Options& options) noexcept {
     if (!signals.install(wake.write.fd))
         return 2;
 
-    if (!drop_and_prove(effective_options))
-        return 2;
-
     local::Status listen_status = local::Status::Ok;
     OwnedFd listener_owner;
     const bool prebound = structured_launch.active;
+    ListenerIdentity identity{};
     if (prebound) {
         if (!parse_listener_fd(listener_owner))
             return 2;
-    } else {
+        const int listener = listener_owner.fd;
+        // Capture pathname identity before dropping privileges: the lease
+        // directory is intentionally 0700 and may not be searchable by the
+        // service UID. The inherited listener remains owned by this process
+        // and is used only after drop_and_prove() succeeds.
+        if (!capture_prebound_listener_identity(listener, effective_options.socket_path,
+                                                identity))
+            return 2;
+    }
+    if (!drop_and_prove(effective_options))
+        return 2;
+    if (!prebound) {
         const int listener = local::listen_unix(effective_options.socket_path,
                                                 effective_options.backlog, &listen_status);
         if (listener < 0)
@@ -1280,9 +1294,8 @@ int run(const Options& options) noexcept {
         listener_owner.fd = listener;
     }
     const int listener = listener_owner.fd;
-    ListenerIdentity identity{};
-    if (!(prebound ? capture_prebound_listener_identity(listener, identity)
-                   : capture_listener_identity(listener, effective_options.socket_path, identity))) {
+    if (!prebound && !capture_listener_identity(listener, effective_options.socket_path,
+                                                identity)) {
         cleanup_listener(listener, effective_options.socket_path, identity, prebound);
         return 2;
     }
