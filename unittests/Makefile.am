@@ -401,6 +401,9 @@ EXTRA_DIST += p50completionrecord-sanitize.sh
 EXTRA_DIST += p50completionflow-run.sh
 EXTRA_DIST += p50tworole-source.sh
 EXTRA_DIST += p50daemontaskcount-source.sh
+EXTRA_DIST += p50forkfdhygiene-source.sh p50forkfdhygiene-mutants.sh \
+	p50_fork_fd_hygiene_sanitize.sh p50forkfdhygiene-oot.sh \
+	p50forkfdhygiene-package.sh
 EXTRA_DIST += p50cachesessionjoin-source.sh p50cachesessionjoin-mutants.sh \
 	p50cachesessionjoin-sanitize.sh
 EXTRA_DIST += p50cachesessionwire-source.sh p50cachesessionwire-mutants.sh \

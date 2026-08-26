@@ -16,7 +16,12 @@ set:
   closed/reused proof number rather than risking an unrelated close;
 * source handoffs are sealed immutable memfds: unsealed mutable regular files
   are rejected at mint, so a same-size content mutation cannot pass the
-  mint-to-sweep identity checks;
+  mint-to-sweep identity checks.  The owned proof is reopened as a distinct
+  kernel open-file description and paired with a hidden control handle;
+  Linux `kcmp(KCMP_FILE)` proves that the proof slot still names that OFD
+  before retirement.  If the caller closes the proof and `dup3`s the borrowed
+  handoff into its old number, retirement fails closed and never closes the
+  caller's replacement;
 * every keep descriptor is distinct, owned by this process, of the expected
   type (FIFO, connected stream socket, regular file), with the statistics pipe
   write-only, client socket read/write, source read-only, and all channels

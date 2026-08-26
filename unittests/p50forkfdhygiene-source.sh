@@ -33,8 +33,13 @@ grep -F 'st_dev' "$source" >/dev/null
 grep -F 'st_ino' "$source" >/dev/null
 grep -F 'F_GET_SEALS' "$source" >/dev/null
 grep -F 'source_identity_matches' "$source" >/dev/null
+grep -F 'same_open_file_description' "$source" >/dev/null
+grep -F 'open_independent_readonly' "$source" >/dev/null
+grep -F 'owned_proof_fd_ == fd' "$source" >/dev/null
 grep -F 'dup3' "$test" >/dev/null
 grep -F 'original_backup' "$test" >/dev/null
+grep -F 'same-open-file replacement' "$test" >/dev/null
+grep -F 'test_make_delivery_owner_alias' "$test" >/dev/null
 grep -F 'O_WRONLY' "$source" >/dev/null
 grep -F 'O_RDWR' "$source" >/dev/null
 grep -F 'SO_TYPE' "$source" >/dev/null

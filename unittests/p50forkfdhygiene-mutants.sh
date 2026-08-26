@@ -13,7 +13,8 @@ move_dir=
 proof_dir=
 mutable_dir=
 mutant_dir=
-trap 'rm -f "$mutant"; rm -rf "$mutant_dir" "$identity_dir" "$move_dir" "$proof_dir" "$mutable_dir"' EXIT HUP INT TERM
+alias_dir=
+trap 'rm -f "$mutant"; rm -rf "$mutant_dir" "$identity_dir" "$move_dir" "$proof_dir" "$mutable_dir" "$alias_dir"' EXIT HUP INT TERM
 
 # A real runtime mutant changes the accepted source DeliveryId while the
 # owner still authorizes 77.  The mutant must fail before any sweep runs.
@@ -74,11 +75,11 @@ fi
 rm -rf "$move_dir"
 
 # A true retirement mutant closes a reused proof-FD number without checking
-# its file identity.  The executable owner/lease proof-reuse rows must catch
+# its kernel open-file description.  The executable owner/lease proof-reuse rows must catch
 # that double-close/unrelated-close hazard.
 proof_dir=$(mktemp -d "${TMPDIR:-/tmp}/p50forkfdhygiene-proof-mutant.XXXXXX")
 mkdir -p "$proof_dir/daemon" "$proof_dir/unittests"
-sed 's/if (!source_identity_matches(proof, expected))/if ((void)expected, false)/' \
+sed 's/same_open_file_description(proof, control)/true/' \
     "$source" >"$proof_dir/daemon/p50_fork_fd_hygiene.cpp"
 cp "$header" "$proof_dir/daemon/p50_fork_fd_hygiene.h"
 cp "$test" "$proof_dir/unittests/p50_fork_fd_hygiene_test.cpp"
@@ -91,6 +92,26 @@ if "$proof_dir/test" >/dev/null 2>&1; then
     exit 1
 fi
 rm -rf "$proof_dir"
+
+# The mint boundary must reject an owner proof whose integer slot aliases the
+# borrowed handoff.  Removing that explicit check transfers the handoff into
+# the lease and its destructor closes the caller-owned descriptor; the alias
+# regression makes this true mutant fail at runtime.
+alias_dir=$(mktemp -d "${TMPDIR:-/tmp}/p50forkfdhygiene-alias-mutant.XXXXXX")
+mkdir -p "$alias_dir/daemon" "$alias_dir/unittests"
+sed 's/owner\.owned_proof_fd_ == fd/false/' \
+    "$source" >"$alias_dir/daemon/p50_fork_fd_hygiene.cpp"
+cp "$header" "$alias_dir/daemon/p50_fork_fd_hygiene.h"
+cp "$test" "$alias_dir/unittests/p50_fork_fd_hygiene_test.cpp"
+"$cxx" "$standard" -Wall -Wextra -Werror \
+    -DICECC_P50_FORK_FD_HYGIENE_TEST_HOOKS -I"$alias_dir" \
+    "$alias_dir/unittests/p50_fork_fd_hygiene_test.cpp" \
+    "$alias_dir/daemon/p50_fork_fd_hygiene.cpp" -o "$alias_dir/test"
+if "$alias_dir/test" >/dev/null 2>&1; then
+    echo 'FAIL: owned-proof/handoff alias mutant survived' >&2
+    exit 1
+fi
+rm -rf "$alias_dir"
 
 # A true immutability mutant accepts an unsealed regular file by treating a
 # failed F_GET_SEALS as if all seals were present.  The mint-time rejection

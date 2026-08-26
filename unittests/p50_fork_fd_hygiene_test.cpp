@@ -361,8 +361,8 @@ void test_same_number_replacement_and_transfer() {
             transfer_inventory.source, kAcceptedDeliveryId);
         require(transfer_owner.has_value(), "transfer owner token was not minted");
         const size_t after_owner = open_fd_count();
-        require(after_owner == before + 1,
-                "owner token did not retain exactly one independent duplicate");
+        require(after_owner == before + 2,
+                "owner token did not retain proof and control handles");
         auto transfer_lease = icecc::p50::forkfd::mint_fork_source_lease(
             std::move(*transfer_owner), transfer_inventory.source,
             kAcceptedDeliveryId);
@@ -421,6 +421,22 @@ void test_move_assignment_and_proof_reuse() {
             "owner destructor closed an unrelated reused proof FD");
     (void)::close(proof);
 
+    auto token_replacement = icecc::p50::forkfd::test_make_delivery_owner(
+        inventory.source, kAcceptedDeliveryId);
+    require(token_replacement.has_value(),
+            "token same-open-file replacement owner was not minted");
+    const int token_replacement_proof =
+        icecc::p50::forkfd::test_delivery_owner_proof_fd(*token_replacement);
+    require(::close(token_replacement_proof) == 0,
+            "token proof close before same-open-file replacement failed");
+    require(::dup3(inventory.source, token_replacement_proof, O_CLOEXEC) ==
+                token_replacement_proof,
+            "token same-open-file proof replacement failed");
+    token_replacement.reset();
+    require(::fcntl(token_replacement_proof, F_GETFD) >= 0,
+            "token destructor closed caller-owned same-open-file replacement");
+    (void)::close(token_replacement_proof);
+
     auto lease_owner = icecc::p50::forkfd::test_make_delivery_owner(
         inventory.source, kAcceptedDeliveryId);
     require(lease_owner.has_value(), "proof-reuse lease owner was not minted");
@@ -437,6 +453,39 @@ void test_move_assignment_and_proof_reuse() {
     require(::fcntl(lease_proof, F_GETFD) >= 0,
             "lease destructor closed an unrelated reused proof FD");
     (void)::close(lease_proof);
+
+    auto lease_replacement_owner = icecc::p50::forkfd::test_make_delivery_owner(
+        inventory.source, kAcceptedDeliveryId);
+    require(lease_replacement_owner.has_value(),
+            "lease same-open-file replacement owner was not minted");
+    auto lease_replacement_lease = icecc::p50::forkfd::mint_fork_source_lease(
+        std::move(*lease_replacement_owner), inventory.source,
+        kAcceptedDeliveryId);
+    require(lease_replacement_lease.has_value(),
+            "lease same-open-file replacement lease was not minted");
+    const int lease_replacement_proof =
+        icecc::p50::forkfd::test_fork_source_lease_proof_fd(*lease_replacement_lease);
+    require(::close(lease_replacement_proof) == 0,
+            "lease proof close before same-open-file replacement failed");
+    require(::dup3(inventory.source, lease_replacement_proof, O_CLOEXEC) ==
+                lease_replacement_proof,
+            "lease same-open-file proof replacement failed");
+    lease_replacement_lease.reset();
+    require(::fcntl(lease_replacement_proof, F_GETFD) >= 0,
+            "lease destructor closed caller-owned same-open-file replacement");
+    (void)::close(lease_replacement_proof);
+
+    auto alias_owner = icecc::p50::forkfd::test_make_delivery_owner_alias(
+        inventory.source, kAcceptedDeliveryId);
+    require(alias_owner.has_value(), "alias owner token was not fabricated");
+    auto alias_lease = icecc::p50::forkfd::mint_fork_source_lease(
+        std::move(*alias_owner), inventory.source, kAcceptedDeliveryId);
+    require(!alias_lease.has_value(),
+            "mint accepted owned proof FD equal to borrowed handoff FD");
+    if (alias_owner.has_value())
+        icecc::p50::forkfd::test_disarm_delivery_owner(*alias_owner);
+    require(::fcntl(inventory.source, F_GETFD) >= 0,
+            "alias-boundary rejection damaged the caller handoff");
 #endif
 }
 

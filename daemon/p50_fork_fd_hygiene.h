@@ -45,19 +45,28 @@ public:
 
 private:
     DeliveryOwnerToken(int expected_fd, uint64_t expected_delivery_id,
-                       int owned_proof_fd, SourceIdentity identity,
+                       int owned_proof_fd, int control_fd, SourceIdentity identity,
                        uint64_t owner_cookie) noexcept;
     int expected_fd_ = -1;
     uint64_t expected_delivery_id_ = 0;
     // This duplicate is owned by the token.  The delivery handoff itself is
     // never stored here and is therefore never closed by token destruction.
     int owned_proof_fd_ = -1;
+    // A second, hidden handle to the proof's open-file description.  The
+    // proof descriptor number can be closed and reused by its caller; this
+    // control handle lets retirement compare the actual kernel OFD and fail
+    // closed before touching a replacement.
+    int control_fd_ = -1;
     SourceIdentity identity_{};
     uint64_t owner_cookie_ = 0;
 
     friend std::optional<DeliveryOwnerToken>
     test_make_delivery_owner(int expected_fd, uint64_t expected_delivery_id) noexcept;
     friend int test_delivery_owner_proof_fd(const DeliveryOwnerToken&) noexcept;
+    friend std::optional<DeliveryOwnerToken>
+    test_make_delivery_owner_alias(int expected_fd,
+                                   uint64_t expected_delivery_id) noexcept;
+    friend void test_disarm_delivery_owner(DeliveryOwnerToken&) noexcept;
     friend std::optional<ForkSourceLease>
     mint_fork_source_lease(DeliveryOwnerToken&& owner, int fd,
                            uint64_t delivery_id) noexcept;
@@ -87,7 +96,7 @@ public:
     [[nodiscard]] uint64_t delivery_id() const noexcept { return delivery_id_; }
     [[nodiscard]] bool valid() const noexcept {
         return borrowed_handoff_fd_ >= 0 && delivery_id_ != 0 && owner_cookie_ != 0 &&
-               owned_proof_fd_ >= 0 && identity_.valid() &&
+               owned_proof_fd_ >= 0 && control_fd_ >= 0 && identity_.valid() &&
                borrowed_handoff_fd_ == expected_fd_ && delivery_id_ == expected_delivery_id_;
     }
     [[nodiscard]] bool identity_matches_current() const noexcept;
@@ -95,7 +104,8 @@ public:
 private:
     ForkSourceLease(int fd, uint64_t delivery_id, int expected_fd,
                     uint64_t expected_delivery_id, int owned_proof_fd,
-                    SourceIdentity identity, uint64_t owner_cookie) noexcept;
+                    int control_fd, SourceIdentity identity,
+                    uint64_t owner_cookie) noexcept;
     // The handoff descriptor is borrowed from the delivery caller.  A lease
     // may validate it and keep its number, but must never close it (including
     // when move-assignment replaces this lease).
@@ -106,6 +116,7 @@ private:
     // This independent duplicate is owned by the lease and is the only
     // descriptor its destructor may retire.
     int owned_proof_fd_ = -1;
+    int control_fd_ = -1;
     SourceIdentity identity_{};
     uint64_t owner_cookie_ = 0;
 
@@ -170,6 +181,10 @@ std::optional<DeliveryOwnerToken>
 test_make_delivery_owner(int expected_fd, uint64_t expected_delivery_id) noexcept;
 int test_delivery_owner_proof_fd(const DeliveryOwnerToken&) noexcept;
 int test_fork_source_lease_proof_fd(const ForkSourceLease&) noexcept;
+std::optional<DeliveryOwnerToken>
+test_make_delivery_owner_alias(int expected_fd,
+                               uint64_t expected_delivery_id) noexcept;
+void test_disarm_delivery_owner(DeliveryOwnerToken&) noexcept;
 #endif
 
 } // namespace icecc::p50::forkfd
