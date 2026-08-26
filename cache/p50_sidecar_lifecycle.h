@@ -61,18 +61,57 @@ enum class GroupObservation : uint8_t { Unknown = 0, Present, Gone };
 
 // A numeric PGID and an ESRCH probe are not a non-reusable kill authority:
 // zombies can keep the number present and a later process group can reuse it.
-// The daemon may supply this opaque lease only when another authority has
-// proved that the group identity cannot be reused for this incarnation.  The
-// reducer never creates or infers one; without it teardown fails closed.
-struct KillDomainLease {
-    uint64_t domain_id = 0;
-    uint64_t generation = 0;
-    bool non_reusable = false;
+// Only a KillDomainVerifier can issue this opaque capability after another
+// authority has proved that the group identity cannot be reused. The reducer
+// never creates or infers one; without it teardown fails closed.
+class KillDomainLease {
+public:
+    KillDomainLease() = default;
+    [[nodiscard]] bool valid() const noexcept { return capability_ != nullptr; }
 
-    [[nodiscard]] bool valid() const noexcept {
-        return domain_id != 0 && generation != 0 && non_reusable;
-    }
+private:
+    struct Capability {
+        uint64_t serial = 0;
+        pid_t pid = -1;
+        pid_t pgid = -1;
+    };
+    explicit KillDomainLease(std::shared_ptr<const Capability> capability) noexcept
+        : capability_(std::move(capability)) {}
+    std::shared_ptr<const Capability> capability_;
+    friend class KillDomainVerifier;
     friend bool operator==(const KillDomainLease&, const KillDomainLease&) = default;
+};
+
+struct LifecycleObservation;
+
+// The production default is deliberately rejecting.  A platform adapter may
+// derive from this interface and issue a lease only after creating a private,
+// per-attempt kernel-backed cgroup-v2 leaf and proving its lifetime.  A caller
+// cannot manufacture a valid lease from PID/PGID/boolean observations: the
+// capability and serial are private to this authority.
+class KillDomainVerifier {
+public:
+    virtual ~KillDomainVerifier() = default;
+    [[nodiscard]] virtual std::optional<KillDomainLease> capture(
+        pid_t pid, pid_t pgid) noexcept = 0;
+    [[nodiscard]] virtual bool proves_absent(
+        const KillDomainLease& lease, pid_t pid, pid_t pgid,
+        const LifecycleObservation& observation) const noexcept = 0;
+
+protected:
+    static KillDomainLease issue(pid_t pid, pid_t pgid,
+                                 uint64_t serial) noexcept;
+};
+
+class RejectingKillDomainVerifier final : public KillDomainVerifier {
+public:
+    std::optional<KillDomainLease> capture(pid_t, pid_t) noexcept override {
+        return std::nullopt;
+    }
+    bool proves_absent(const KillDomainLease&, pid_t, pid_t,
+                      const LifecycleObservation&) const noexcept override {
+        return false;
+    }
 };
 
 // All facts in this structure are supplied by the daemon's already-running
@@ -86,6 +125,8 @@ struct LifecycleObservation {
     std::optional<ReadyLease> ready_lease;
     uint64_t store_generation = 0;
     GroupObservation group = GroupObservation::Unknown;
+    // Retained as an observation-only compatibility field.  The reducer never
+    // treats this caller-provided value as authority.
     KillDomainLease group_domain{};
     pid_t pid = -1;
     pid_t observed_pgid = -1;
@@ -168,6 +209,7 @@ struct SidecarLifecycleConfig {
     std::chrono::milliseconds kill_timeout{1000};
     uint32_t max_attempts = 3;
     std::shared_ptr<LaunchIdentityAllocator> identities;
+    std::shared_ptr<KillDomainVerifier> kill_domain_verifier;
 };
 
 class SidecarLifecycle {
@@ -243,6 +285,7 @@ private:
     bool legacy_requested_ = false;
     bool group_proof_required_ = false;
     std::optional<KillDomainLease> group_domain_;
+    std::shared_ptr<KillDomainVerifier> kill_domain_verifier_;
     std::string ready_buffer_;
     std::chrono::steady_clock::time_point deadline_{};
     std::chrono::steady_clock::time_point teardown_deadline_{};
@@ -288,10 +331,6 @@ public:
                                 dev_t listener_device = 0,
                                 ino_t listener_inode = 0) noexcept;
 
-    // Compatibility seam for callers that already hold a lifecycle.  It
-    // stores only a weak mailbox, never a raw lifecycle pointer; callers may
-    // retire it with unregister_owner().
-    bool register_owner(pid_t pid, pid_t pgid, SidecarLifecycle& owner) noexcept;
     bool unregister_owner(pid_t pid, ReaperOwnerKey owner) noexcept;
     bool observe_child_reaped(pid_t pid, ReaperOwnerKey owner, int status,
                               bool echild = false) noexcept;
@@ -314,11 +353,16 @@ private:
         size_t slot = 0;
     };
     struct SharedState {
+        static constexpr size_t kMaximumOwners = 256;
         std::mutex mutex;
         std::unordered_map<pid_t, Entry> owners;
         std::vector<pid_t> slots;
-        std::vector<size_t> free_slots;
         size_t cursor = 0;
+
+        SharedState() {
+            owners.reserve(kMaximumOwners);
+            slots.reserve(kMaximumOwners);
+        }
     };
     std::shared_ptr<SharedState> state_;
 };

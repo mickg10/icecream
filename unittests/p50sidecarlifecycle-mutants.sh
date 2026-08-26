@@ -5,12 +5,12 @@ build="${ICECC_TEST_BUILDDIR:-$(pwd)}"
 cxx="${ICECC_TEST_CXX:-c++}"
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/p50-sidecar-lifecycle-mutant.XXXXXX")"
 trap 'rm -r -- "$tmp"' EXIT HUP INT TERM
-for mutant_name in pgid store-generation stale-ready listener-node teardown-deadline legacy-direct owner-key group-domain; do
+for mutant_name in pgid store-generation stale-ready listener-node teardown-deadline legacy-direct owner-key group-domain fabricated-lease over-capacity discarded-registration socket-substitution; do
     cp "$root/cache/p50_sidecar_lifecycle.cpp" "$tmp/mutant.cpp"
     # These are semantic deletion mutants; the runtime witness must redden
     # each one rather than merely matching source text.
     if test "$mutant_name" = pgid; then
-        sed -i 's/observation\.observed_pgid == process_group_/true/' "$tmp/mutant.cpp"
+        sed -i 's/process_group_, observation);/observation.observed_pgid, observation);/' "$tmp/mutant.cpp"
     elif test "$mutant_name" = store-generation; then
         sed -i 's/observation\.store_generation != identity_->store_generation/false/' "$tmp/mutant.cpp"
     elif test "$mutant_name" = stale-ready; then
@@ -23,9 +23,16 @@ for mutant_name in pgid store-generation stale-ready listener-node teardown-dead
     elif test "$mutant_name" = legacy-direct; then
         sed -i '0,/if (state_ != LifecycleState::TerminatingGrace/s//if (false \&\& state_ != LifecycleState::TerminatingGrace/' "$tmp/mutant.cpp"
     elif test "$mutant_name" = group-domain; then
-        sed -i 's/group_domain_->valid()/true/' "$tmp/mutant.cpp"
-        sed -i 's/observation.group_domain.valid()/true/' "$tmp/mutant.cpp"
-        sed -i 's/observation.group_domain == \*group_domain_/true/' "$tmp/mutant.cpp"
+        perl -0pi -e 's@bool SidecarLifecycle::exact_group_absent\(\n    const LifecycleObservation& observation\) const noexcept \{.*?\n\}@bool SidecarLifecycle::exact_group_absent(\n    const LifecycleObservation& observation) const noexcept {\n    return leader_reaped_ && observation.group == GroupObservation::Gone &&\n           observation.observed_pgid == process_group_;\n}@s' "$tmp/mutant.cpp"
+    elif test "$mutant_name" = fabricated-lease; then
+        perl -0pi -e 's/group_domain_ = kill_domain_verifier_->capture\(child_pid_,\s*process_group_\);/group_domain_ = observation.group_domain;/s' "$tmp/mutant.cpp"
+    elif test "$mutant_name" = over-capacity; then
+        sed -i 's/state_->owners.size() >= SharedState::kMaximumOwners/false/g' "$tmp/mutant.cpp"
+        sed -i 's/state_->slots.size() >= SharedState::kMaximumOwners/false/g' "$tmp/mutant.cpp"
+    elif test "$mutant_name" = discarded-registration; then
+        sed -i '0,/state_->owners.erase(iterator);/s//if (false) state_->owners.erase(iterator);/' "$tmp/mutant.cpp"
+    elif test "$mutant_name" = socket-substitution; then
+        sed -i '/if (::lstat(lease.socket_path.c_str(), \&listener) != 0 ||/,/listener.st_ino != lease.listener_inode)/c\    if (false) {' "$tmp/mutant.cpp"
     else
         sed -i 's/event\.owner != owner_key()/false/' "$tmp/mutant.cpp"
     fi

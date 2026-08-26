@@ -3,10 +3,17 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <vector>
 
 using namespace icecc::p50;
 using namespace icecc::p50::sidecar;
@@ -37,7 +44,46 @@ std::shared_ptr<LaunchIdentityAllocator> allocator(uint64_t generation) {
                                                      deterministic_entropy);
 }
 
+class TestKillDomainVerifier final : public KillDomainVerifier {
+public:
+    std::optional<KillDomainLease> capture(pid_t pid, pid_t pgid) noexcept override {
+        return issue(pid, pgid, ++serial_);
+    }
+    bool proves_absent(const KillDomainLease&, pid_t, pid_t pgid,
+                       const LifecycleObservation& observation) const noexcept override {
+        return observation.group == GroupObservation::Gone &&
+               observation.observed_pgid == pgid;
+    }
+
+private:
+    uint64_t serial_ = 0;
+};
+
+void create_socket_node(const std::string& directory, const std::string& path) {
+    std::error_code error;
+    std::filesystem::create_directories(directory, error);
+    CHECK(!error, "create UNIX listener directory witness");
+    (void)::unlink(path.c_str());
+    const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    CHECK(fd >= 0, "create UNIX listener witness");
+    struct sockaddr_un address {};
+    address.sun_family = AF_UNIX;
+    std::snprintf(address.sun_path, sizeof(address.sun_path), "%s", path.c_str());
+    CHECK(::bind(fd, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0,
+          "bind UNIX listener witness");
+    (void)::close(fd);
+}
+
+void remove_socket_node(const LifecycleIdentity& identity) {
+    (void)::unlink((identity.private_directory + "/cache.sock").c_str());
+}
+
 ReadyLease ready_for(const LifecycleIdentity& identity, pid_t pid) {
+    create_socket_node(identity.private_directory,
+                       identity.private_directory + "/cache.sock");
+    struct stat node {};
+    CHECK(::lstat((identity.private_directory + "/cache.sock").c_str(), &node) == 0,
+          "stat UNIX listener witness");
     ReadyLease lease;
     lease.identity = identity.control;
     lease.pid = pid;
@@ -48,10 +94,10 @@ ReadyLease ready_for(const LifecycleIdentity& identity, pid_t pid) {
     lease.private_directory = identity.private_directory;
     lease.socket_path = identity.private_directory + "/cache.sock";
     lease.socket_path_digest = icecc::digest128(lease.socket_path);
-    lease.listener_device = 1;
-    lease.listener_inode = 2;
-    lease.directory_device = 1;
-    lease.directory_inode = 3;
+    lease.listener_device = node.st_dev;
+    lease.listener_inode = node.st_ino;
+    lease.directory_device = node.st_dev;
+    lease.directory_inode = node.st_ino;
     return lease;
 }
 
@@ -69,7 +115,6 @@ std::string hex_guid(const Id128& value) {
 LifecycleObservation forked(pid_t pid) {
     LifecycleObservation observation;
     observation.exec = ExecObservation::Succeeded;
-    observation.group_domain = KillDomainLease{static_cast<uint64_t>(pid), 1, true};
     observation.pid = pid;
     observation.observed_pgid = pid;
     return observation;
@@ -106,6 +151,7 @@ void test_lifecycle() {
     config.grace_timeout = std::chrono::milliseconds(10);
     config.kill_timeout = std::chrono::milliseconds(10);
     config.identities = allocator(config.control_generation);
+    config.kill_domain_verifier = std::make_shared<TestKillDomainVerifier>();
     SidecarLifecycle lifecycle(config);
     CHECK(SidecarLifecycle::valid_config(config), "valid lifecycle configuration");
 
@@ -156,11 +202,33 @@ void test_lifecycle() {
     const dev_t first_device = complete.ready_lease->listener_device;
     const ino_t first_inode = complete.ready_lease->listener_inode;
 
+    // A fabricated DEV/INO tuple cannot turn a different current pathname
+    // node into a READY lease: publication performs its own lstat/type proof.
+    SidecarLifecycle socket_substitution(config);
+    (void)socket_substitution.begin(t0);
+    move_to_forked(socket_substitution, 320, t0);
+    const auto socket_identity = *socket_substitution.identity();
+    LifecycleObservation forged_ready;
+    forged_ready.ready = ReadyObservation::Complete;
+    forged_ready.store_generation = socket_identity.store_generation;
+    auto forged_lease = ready_for(socket_identity, 320);
+    ++forged_lease.listener_inode;
+    forged_ready.ready_lease = forged_lease;
+    CHECK(socket_substitution.advance(t0, forged_ready).action ==
+              LifecycleAction::Withdraw,
+          "socket substitution cannot publish from caller-supplied inode");
+
     CentralChildReaperRegistry reaper;
-    CHECK(reaper.register_owner(321, 321, lifecycle), "central registry owns one pid");
-    CHECK(!reaper.register_owner(321, 321, lifecycle), "one PID has one owner");
+    auto lifecycle_registration = reaper.register_owner(
+        321, 321, lifecycle.owner_key(), lifecycle.reap_mailbox());
+    CHECK(lifecycle_registration.valid(), "central registry owns one pid");
+    CHECK(!reaper.register_owner(321, 321, lifecycle.owner_key(),
+                                 lifecycle.reap_mailbox()).valid(),
+          "one PID has one owner");
     SidecarLifecycle sentinel(config);
-    CHECK(reaper.register_owner(322, 322, sentinel), "central registry accepts sentinel owner");
+    auto sentinel_registration = reaper.register_owner(
+        322, 322, sentinel.owner_key(), sentinel.reap_mailbox());
+    CHECK(sentinel_registration.valid(), "central registry accepts sentinel owner");
     CHECK(reaper.next_unobserved_pid().value_or(-1) == 321,
           "central reaper starts at the first owner");
     CHECK(reaper.next_unobserved_pid().value_or(-1) == 322,
@@ -169,6 +237,24 @@ void test_lifecycle() {
     CHECK(!reaper.observe_child_reaped(321, 0, true), "duplicate reap is rejected");
     CHECK(reaper.next_unobserved_pid().value_or(-1) == 322,
           "observed owner is deleted from the fairness set");
+
+    CentralChildReaperRegistry capacity_registry;
+    std::vector<CentralChildReaperRegistry::Registration> registrations;
+    registrations.reserve(256);
+    for (size_t index = 0; index != 256; ++index) {
+        const pid_t pid = static_cast<pid_t>(10000 + index);
+        auto token = capacity_registry.register_owner(
+            pid, pid, ReaperOwnerKey{static_cast<uint64_t>(pid), 1},
+            lifecycle.reap_mailbox());
+        CHECK(token.valid(), "registry accepts an owner below its fixed cap");
+        registrations.push_back(std::move(token));
+    }
+    CHECK(capacity_registry.size() == 256 &&
+              !capacity_registry
+                   .register_owner(20000, 20000, ReaperOwnerKey{20000, 1},
+                                    lifecycle.reap_mailbox())
+                   .valid(),
+          "registry rejects the owner above its fixed total cap");
 
     ReapMailbox bounded_mailbox;
     bool mailbox_full = true;
@@ -188,7 +274,6 @@ void test_lifecycle() {
     CHECK(term.action == LifecycleAction::SendTerm, "TERM is a separate outer-loop action");
     LifecycleObservation wrong_group;
     wrong_group.group = GroupObservation::Gone;
-    wrong_group.group_domain = KillDomainLease{321, 1, true};
     wrong_group.observed_pgid = 999;
     wrong_group.path_absent = true;
     wrong_group.observed_path = first.private_directory;
@@ -204,6 +289,7 @@ void test_lifecycle() {
     group_gone.observed_pgid = 321;
     group_gone.observed_device = first_device;
     group_gone.observed_inode = first_inode;
+    remove_socket_node(*lifecycle.identity());
     CHECK(lifecycle.advance(t0 + std::chrono::milliseconds(11), group_gone).action == LifecycleAction::None &&
               lifecycle.state() == LifecycleState::ReapAndGroupCheck,
           "leader reap is insufficient until exact PGID ESRCH");
@@ -226,7 +312,9 @@ void test_lifecycle() {
     // or surviving helper can keep the number present, and a later group can
     // reuse it after reap; an absent/mismatched external lease must fail
     // closed rather than authorize a replacement.
-    SidecarLifecycle ambiguous_group(config);
+    SidecarLifecycleConfig rejecting_config = config;
+    rejecting_config.kill_domain_verifier.reset();
+    SidecarLifecycle ambiguous_group(rejecting_config);
     (void)ambiguous_group.begin(t0);
     move_to_ready(ambiguous_group, 350, t0);
     LifecycleObservation ambiguous_request;
@@ -244,6 +332,7 @@ void test_lifecycle() {
     numeric_gone.observed_path = ambiguous_group.identity()->private_directory;
     numeric_gone.observed_device = ambiguous_group.identity()->listener_device;
     numeric_gone.observed_inode = ambiguous_group.identity()->listener_inode;
+    remove_socket_node(*ambiguous_group.identity());
     // Deliberately no valid group_domain: this is exactly the zombie/reuse
     // ambiguity that numeric kill(-pgid, 0) cannot resolve.
     CHECK(ambiguous_group.advance(t0 + std::chrono::milliseconds(10), numeric_gone).action ==
@@ -255,7 +344,7 @@ void test_lifecycle() {
               !ambiguous_group.current_ready_lease().has_value(),
           "zombie/reused PGID ambiguity fails closed with capacity withheld");
 
-    SidecarLifecycle reused_group(config);
+    SidecarLifecycle reused_group(rejecting_config);
     (void)reused_group.begin(t0);
     move_to_ready(reused_group, 351, t0);
     CHECK(reused_group.advance(t0, ambiguous_request).action == LifecycleAction::Withdraw &&
@@ -268,7 +357,6 @@ void test_lifecycle() {
     mismatched_domain.observed_path = reused_group.identity()->private_directory;
     mismatched_domain.observed_device = reused_group.identity()->listener_device;
     mismatched_domain.observed_inode = reused_group.identity()->listener_inode;
-    mismatched_domain.group_domain = KillDomainLease{9999, 7, true};
     CHECK(reused_group.advance(t0 + std::chrono::milliseconds(10), mismatched_domain).action ==
               LifecycleAction::SendKill &&
               reused_group.advance(t0 + std::chrono::milliseconds(20), mismatched_domain).action ==
@@ -421,12 +509,12 @@ void test_lifecycle() {
           "legacy teardown records leader reap");
     LifecycleObservation legacy_gone;
     legacy_gone.group = GroupObservation::Gone;
-    legacy_gone.group_domain = KillDomainLease{501, 1, true};
     legacy_gone.observed_pgid = 501;
     legacy_gone.path_absent = true;
     legacy_gone.observed_path = legacy_lifecycle.identity()->private_directory;
     legacy_gone.observed_device = legacy_lifecycle.current_ready_lease()->listener_device;
     legacy_gone.observed_inode = legacy_lifecycle.current_ready_lease()->listener_inode;
+    remove_socket_node(*legacy_lifecycle.identity());
     (void)legacy_lifecycle.advance(t0 + std::chrono::milliseconds(10), legacy_gone);
     CHECK(legacy_lifecycle.advance(t0 + std::chrono::milliseconds(10), legacy_gone).action ==
               LifecycleAction::EnterDegradedLegacy &&

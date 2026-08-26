@@ -12,9 +12,18 @@ grep -q 'FailedClosed' "$src"
 grep -q 'teardown_deadline_' "$src"
 grep -q 'listener_device' "$src"
 grep -q 'kScanQuota' "$src"
+grep -q 'kMaximumOwners' "$hdr"
+grep -q 'owners.size() >= SharedState::kMaximumOwners' "$src"
 grep -q 'ReapMailbox' "$src"
 grep -q 'KillDomainLease' "$hdr"
 grep -q 'group_domain_' "$src"
+grep -q 'RejectingKillDomainVerifier' "$hdr"
+grep -q 'kill_domain_verifier_->capture' "$src"
+grep -q 'lstat(lease.socket_path' "$src"
+if grep -Eq 'bool register_owner\([^;]*SidecarLifecycle' "$hdr"; then
+    echo 'discarding compatibility registration overload remains' >&2
+    exit 1
+fi
 if grep -Eq 'SidecarLifecycle[[:space:]]*\*' "$src" "$hdr"; then
     echo 'lifecycle registry contains a raw owner pointer' >&2
     exit 1

@@ -16,7 +16,13 @@ exactly one owner and forwards one reap observation. ECHILD or leader reaping
 is only leader knowledge; retry and replacement require the exact expected
 PGID to be proven ESRCH, bound to a non-reusable external `KillDomainLease`,
 and the exact private path to be absent. Numeric PGID/ESRCH alone is rejected
-because zombie helpers and PGID reuse make it ambiguous.
+because zombie helpers and PGID reuse make it ambiguous. The reducer never
+accepts caller fields as kill authority: `KillDomainLease` is a private
+capability issued by an injected `KillDomainVerifier`, whose production
+default rejects every capture and absence proof. A Linux cgroup-v2 adapter may
+opt in only after creating a private per-attempt leaf and proving
+`cgroup.kill` plus `cgroup.events` exhaustion without reusable numeric PGID
+authority.
 
 Each attempt consumes a fresh `LaunchIdentityAllocator` attempt and store root,
 with fresh C/F role GUIDs and a fresh private path.  The control generation is
@@ -24,15 +30,20 @@ immutable, while `store_generation` is an explicitly separate field and may
 remain 1 across a fresh store namespace. READY is published only after the
 complete lease validates against this identity, and publication is rejected
 after any waitable/reap, identity-loss, replacement, or teardown observation.
-The lease captures the listener's device/inode; teardown compares that exact
-old node, so a new socket at the same pathname cannot satisfy old-incarnation
-absence. Teardown clears the current lease before returning the Withdraw action,
+The lease captures the listener's device/inode; READY publication itself
+performs `lstat()` and requires a current AF_UNIX node with the exact
+device/inode, and teardown re-lstats the exact socket pathname. A new socket at
+the same pathname therefore cannot satisfy old-incarnation absence. Teardown
+clears the current lease before returning the Withdraw action,
 so advertisement, C eligibility, and control operations are withdrawn before
 TERM/KILL. One absolute deadline covers TERM, KILL, group absence, reap, and
 path proof; residue at the deadline becomes `FailedClosed` with capacity
 withheld. `request_legacy` uses the same proof-driven teardown before entering
 `DegradedLegacy`; without an externally supplied non-reusable kill-domain lease
-it also fails closed and never claims a replacement-safe teardown.
+it also fails closed and never claims a replacement-safe teardown. The central
+registry has a fixed total owner capacity and its RAII registration token
+retires a row without allocation; the old compatibility overload that
+discarded this token does not exist.
 
 This is an integration seam, not a claim that `iceccd` has been converted to
 the event-loop reducer.  Positive CACHE_SESSION/private-FD settlement,

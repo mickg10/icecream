@@ -6,6 +6,8 @@
 #include <limits>
 #include <string>
 #include <utility>
+#include <cerrno>
+#include <sys/stat.h>
 
 namespace icecc::p50::sidecar {
 namespace {
@@ -71,6 +73,21 @@ std::string identity_path(std::string_view root, const StoreIdentityRoot& store,
 std::atomic<uint64_t> g_next_owner_id{1};
 
 } // namespace
+
+KillDomainLease KillDomainVerifier::issue(pid_t pid, pid_t pgid,
+                                          uint64_t serial) noexcept {
+    if (pid <= 1 || pgid <= 1 || pid != pgid || serial == 0)
+        return {};
+    try {
+        auto capability = std::make_shared<KillDomainLease::Capability>();
+        capability->serial = serial;
+        capability->pid = pid;
+        capability->pgid = pgid;
+        return KillDomainLease(std::move(capability));
+    } catch (...) {
+        return {};
+    }
+}
 
 bool ReapMailbox::enqueue(ReapEvent event) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -138,6 +155,15 @@ SidecarLifecycle::SidecarLifecycle(SidecarLifecycleConfig config) noexcept
         reap_mailbox_ = std::make_shared<ReapMailbox>();
     } catch (...) {
         reap_mailbox_.reset();
+    }
+    if (!config_.kill_domain_verifier) {
+        try {
+            kill_domain_verifier_ = std::make_shared<RejectingKillDomainVerifier>();
+        } catch (...) {
+            kill_domain_verifier_.reset();
+        }
+    } else {
+        kill_domain_verifier_ = config_.kill_domain_verifier;
     }
 }
 
@@ -276,6 +302,12 @@ bool SidecarLifecycle::accept_ready(const LifecycleObservation& observation) noe
         (identity_->listener_inode != 0 &&
          identity_->listener_inode != lease.listener_inode))
         return false;
+    struct stat listener {};
+    if (::lstat(lease.socket_path.c_str(), &listener) != 0 ||
+        !S_ISSOCK(listener.st_mode) ||
+        listener.st_dev != lease.listener_device ||
+        listener.st_ino != lease.listener_inode)
+        return false;
     // Capture the exact old node before publication.  Teardown must later
     // prove that this node, not a replacement at the same pathname, vanished.
     identity_->listener_device = lease.listener_device;
@@ -291,10 +323,9 @@ bool SidecarLifecycle::exact_group_absent(
     // outer loop must bind the observation to an independently owned,
     // non-reusable kill-domain lease captured for this exact fork.
     return leader_reaped_ && group_domain_.has_value() &&
-           group_domain_->valid() && observation.group_domain.valid() &&
-           observation.group_domain == *group_domain_ && process_group_ > 1 &&
-           observation.observed_pgid == process_group_ &&
-           observation.group == GroupObservation::Gone;
+           group_domain_->valid() && kill_domain_verifier_ &&
+           kill_domain_verifier_->proves_absent(*group_domain_, child_pid_,
+                                                process_group_, observation);
 }
 
 bool SidecarLifecycle::exact_path_absent(
@@ -306,6 +337,15 @@ bool SidecarLifecycle::exact_path_absent(
         return false;
     if (identity_->listener_device == 0 || identity_->listener_inode == 0)
         return observation.observed_device == 0 && observation.observed_inode == 0;
+    // The observation is only a scheduling hint.  Revalidate the actual
+    // pathname in this reducer so a replacement socket at the same name can
+    // never satisfy an old incarnation's teardown proof.
+    const std::string socket_path = identity_->private_directory + "/cache.sock";
+    struct stat current {};
+    if (::lstat(socket_path.c_str(), &current) == 0)
+        return false;
+    if (errno != ENOENT)
+        return false;
     return observation.observed_device == identity_->listener_device &&
            observation.observed_inode == identity_->listener_inode;
 }
@@ -401,8 +441,12 @@ LifecycleActionResult SidecarLifecycle::advance(
             child_pid_ = observation.pid;
             process_group_ = observation.observed_pgid;
             group_proof_required_ = true;
-            if (observation.group_domain.valid())
-                group_domain_ = observation.group_domain;
+            // Never accept the caller's tuple/bool as authority.  The
+            // configured verifier must capture a private capability for this
+            // exact fork; production's default verifier always refuses.
+            if (kill_domain_verifier_)
+                group_domain_ = kill_domain_verifier_->capture(child_pid_,
+                                                                process_group_);
             state_ = LifecycleState::ForkedAwaitExecAndReady;
             deadline_ = now + config_.exec_timeout;
         }
@@ -569,12 +613,6 @@ void CentralChildReaperRegistry::Registration::reset() noexcept {
         const size_t slot = iterator->second.slot;
         if (slot < state_->slots.size()) {
             state_->slots[slot] = -1;
-            try {
-                state_->free_slots.push_back(slot);
-            } catch (...) {
-                // The hole remains discoverable by register_owner's bounded
-                // registration-time scan.  Destruction must stay noexcept.
-            }
         }
         state_->owners.erase(iterator);
         if (!state_->slots.empty())
@@ -594,26 +632,22 @@ CentralChildReaperRegistry::register_owner(
         mailbox.expired())
         return {};
     std::lock_guard<std::mutex> lock(state_->mutex);
-    if (state_->owners.find(pid) != state_->owners.end())
+    if (state_->owners.find(pid) != state_->owners.end() ||
+        state_->owners.size() >= SharedState::kMaximumOwners)
         return {};
     size_t slot = 0;
     bool reused = false;
     try {
-        if (!state_->free_slots.empty()) {
-            slot = state_->free_slots.back();
-            state_->free_slots.pop_back();
+        const auto hole = std::find(state_->slots.begin(), state_->slots.end(), -1);
+        if (hole != state_->slots.end()) {
+            slot = static_cast<size_t>(hole - state_->slots.begin());
             reused = true;
             state_->slots[slot] = pid;
         } else {
-            const auto hole = std::find(state_->slots.begin(), state_->slots.end(), -1);
-            if (hole != state_->slots.end()) {
-                slot = static_cast<size_t>(hole - state_->slots.begin());
-                reused = true;
-                state_->slots[slot] = pid;
-            } else {
-                slot = state_->slots.size();
-                state_->slots.push_back(pid);
-            }
+            if (state_->slots.size() >= SharedState::kMaximumOwners)
+                return {};
+            slot = state_->slots.size();
+            state_->slots.push_back(pid);
         }
         state_->owners.emplace(pid, Entry{pgid, owner, std::move(mailbox),
                                           listener_device, listener_inode, false,
@@ -622,32 +656,12 @@ CentralChildReaperRegistry::register_owner(
         state_->owners.erase(pid);
         if (reused) {
             state_->slots[slot] = -1;
-            try {
-                state_->free_slots.push_back(slot);
-            } catch (...) {
-                // The slot remains a reusable hole for the next registration.
-            }
         } else if (slot < state_->slots.size()) {
             state_->slots.pop_back();
         }
         return {};
     }
     return Registration(state_, pid, owner);
-}
-
-bool CentralChildReaperRegistry::register_owner(pid_t pid, pid_t pgid,
-                                                SidecarLifecycle& owner) noexcept {
-    const auto lease = owner.current_ready_lease();
-    const dev_t device = lease.has_value() ? lease->listener_device : 0;
-    const ino_t inode = lease.has_value() ? lease->listener_inode : 0;
-    Registration registration = register_owner(pid, pgid, owner.owner_key(),
-                                                owner.reap_mailbox(), device, inode);
-    if (!registration.valid())
-        return false;
-    // This compatibility overload is deliberately persistent; the caller
-    // must call unregister_owner().  It still retains only a weak mailbox.
-    registration.state_.reset();
-    return true;
 }
 
 bool CentralChildReaperRegistry::unregister_owner(pid_t pid,
@@ -661,7 +675,6 @@ bool CentralChildReaperRegistry::unregister_owner(pid_t pid,
     const size_t slot = iterator->second.slot;
     if (slot < state_->slots.size()) {
         state_->slots[slot] = -1;
-        state_->free_slots.push_back(slot);
     }
     state_->owners.erase(iterator);
     if (!state_->slots.empty())
@@ -686,12 +699,6 @@ bool CentralChildReaperRegistry::observe_child_reaped(
             const size_t slot = iterator->second.slot;
             if (slot < state_->slots.size()) {
                 state_->slots[slot] = -1;
-                try {
-                    state_->free_slots.push_back(slot);
-                } catch (...) {
-                    // A reusable hole is sufficient if bookkeeping storage
-                    // is exhausted while retiring a destroyed owner.
-                }
             }
             state_->owners.erase(iterator);
             return false;
