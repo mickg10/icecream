@@ -206,6 +206,43 @@ struct OwnedFd {
     OwnedFd& operator=(const OwnedFd&) = delete;
 };
 
+bool make_completion_pipe(int descriptors[2]) noexcept {
+    descriptors[0] = -1;
+    descriptors[1] = -1;
+    if (::pipe(descriptors) != 0)
+        return false;
+    for (int index = 0; index != 2; ++index) {
+        const int descriptor = descriptors[index];
+        const int flags = ::fcntl(descriptor, F_GETFD);
+        if (flags < 0 || ::fcntl(descriptor, F_SETFD, flags | FD_CLOEXEC) < 0) {
+            (void)::close(descriptors[0]);
+            (void)::close(descriptors[1]);
+            descriptors[0] = descriptors[1] = -1;
+            return false;
+        }
+    }
+    return true;
+}
+
+struct CompletionWake {
+    int fd = -1;
+    ~CompletionWake() {
+        if (fd < 0)
+            return;
+        const uint8_t wake = 1;
+        for (;;) {
+            const ssize_t written = ::write(fd, &wake, sizeof(wake));
+            if (written == static_cast<ssize_t>(sizeof(wake)) ||
+                (written < 0 && errno == EPIPE))
+                break;
+            if (written < 0 && errno == EINTR)
+                continue;
+            break;
+        }
+        (void)::close(fd);
+    }
+};
+
 struct WakePipe {
     OwnedFd read;
     OwnedFd write;
@@ -815,9 +852,10 @@ RuntimeConfig validate_runtime_config(RuntimeConfig config) {
     if (config.max_live_handoffs != 1)
         throw std::invalid_argument("sidecar runtime supports exactly one live handoff");
     if (config.endpoint_config.owner_limits.max_retained_input_records == 0 ||
-        config.max_input_lifecycle_replays == 0)
+        config.max_input_lifecycle_replays == 0 ||
+        config.cancellation_grace <= std::chrono::milliseconds::zero())
         throw std::invalid_argument(
-            "sidecar runtime input lifecycle limits must be nonzero");
+            "sidecar runtime bounds must be nonzero");
     if (config.c_store_guid == CStoreGuid{})
         throw std::invalid_argument("sidecar runtime requires a nonzero C_STORE_GUID");
     if (config.c_store_guid == config.f_store_guid)
@@ -869,6 +907,8 @@ SidecarRuntime::~SidecarRuntime() {
 
 void SidecarRuntime::endpoint_owner_loop() noexcept {
     try {
+        if (config_.owner_failure)
+            config_.owner_failure();
         context_.run();
     } catch (...) {
         // Every endpoint coroutine converts its own failure into a result. If
@@ -881,7 +921,8 @@ void SidecarRuntime::endpoint_owner_loop() noexcept {
 
 boost::asio::awaitable<void> SidecarRuntime::run_endpoint_on_owner(
     int adopted_fd, EndpointIoControl endpoint_control,
-    std::promise<EndpointOwnerResult> completion) {
+    std::promise<EndpointOwnerResult> completion, int completion_wake_fd) {
+    CompletionWake completion_wake{completion_wake_fd};
     int owned_fd = adopted_fd;
     try {
         EndpointOwnerResult owner_result;
@@ -927,6 +968,15 @@ boost::asio::awaitable<void> SidecarRuntime::run_endpoint_on_owner(
         }
 
         live_sessions_.store(1, std::memory_order_release);
+        if (config_.owner_failure_after_live) {
+            // Post outside this guarded coroutine: the injected exception must
+            // escape the owner executor while run_adopted is suspended on the
+            // live session, not be converted into an ordinary endpoint result.
+            context_.post([this] {
+                if (config_.owner_failure_after_live)
+                    config_.owner_failure_after_live();
+            });
+        }
         const ServerRunResult endpoint_result =
             co_await endpoint_->run_adopted(std::move(*socket), std::move(endpoint_control));
         if (endpoint_result.candidate_input.has_value() &&
@@ -973,7 +1023,8 @@ boost::asio::awaitable<void> SidecarRuntime::run_endpoint_on_owner(
 
 RuntimeResult SidecarRuntime::run_one(
     local::Connection& control, const local::HandoffRequest& expected,
-    std::chrono::steady_clock::time_point deadline, EndpointIoControl endpoint_control) {
+    std::chrono::steady_clock::time_point deadline, EndpointIoControl endpoint_control,
+    local::ControlBindingPlaceholder binding_placeholder) {
     RuntimeResult result;
     if (stop_requested_.load(std::memory_order_acquire)) {
         result.status = RuntimeStatus::Stopped;
@@ -1004,6 +1055,10 @@ RuntimeResult SidecarRuntime::run_one(
         return result;
     }
     active_control_cancel_fd_.store(control_cancel_fd, std::memory_order_release);
+    struct ActiveControlGuard {
+        SidecarRuntime& runtime;
+        ~ActiveControlGuard() { runtime.close_active_control(); }
+    } active_control_guard{*this};
     // Close/shutdown from stop() can race this setup only by setting the
     // stop flag first.  Re-check after publication so a signal arriving in
     // this narrow window is still converted into a normal cancellation.
@@ -1016,7 +1071,6 @@ RuntimeResult SidecarRuntime::run_one(
 
     local::FdHandoffReceiver receiver;
     result.handoff = receiver.receive_and_ack(control, expected, deadline);
-    release_active_control();
     if (result.handoff.status != local::FdHandoffStatus::Accepted) {
         result.status = stop_requested_.load(std::memory_order_acquire)
                            ? RuntimeStatus::Stopped
@@ -1047,32 +1101,192 @@ RuntimeResult SidecarRuntime::run_one(
     const int adopted_fd = adopted.release();
     std::promise<EndpointOwnerResult> completion;
     std::future<EndpointOwnerResult> completion_result = completion.get_future();
+    int completion_pipe[2] = {-1, -1};
+    if (!make_completion_pipe(completion_pipe)) {
+        (void)::close(adopted_fd);
+        result.status = RuntimeStatus::EndpointFailed;
+        return result;
+    }
     int dispatch_fd = adopted_fd;
     try {
         asio::co_spawn(context_,
                        run_endpoint_on_owner(dispatch_fd, std::move(endpoint_control),
-                                             std::move(completion)),
+                                             std::move(completion), completion_pipe[1]),
                        asio::detached);
         dispatch_fd = -1;
+        completion_pipe[1] = -1;
     } catch (...) {
         if (dispatch_fd >= 0)
             (void)::close(dispatch_fd);
+        (void)::close(completion_pipe[0]);
+        (void)::close(completion_pipe[1]);
         result.status = RuntimeStatus::EndpointFailed;
         return result;
     }
 
+    RuntimeCancellationReason cancellation = RuntimeCancellationReason::None;
+    std::chrono::steady_clock::time_point quiescence_deadline = deadline;
+    const auto cancellation_trigger_now = std::chrono::steady_clock::now();
+    const auto cancellation_trigger_deadline =
+        deadline - cancellation_trigger_now > config_.cancellation_grace
+            ? deadline - config_.cancellation_grace
+            : cancellation_trigger_now;
+    const auto request_cancellation = [&](RuntimeCancellationReason reason) {
+        if (stop_requested_.load(std::memory_order_acquire) &&
+            reason != RuntimeCancellationReason::Requested)
+            reason = RuntimeCancellationReason::Stopped;
+        if (cancellation == RuntimeCancellationReason::None) {
+            cancellation = reason;
+            const auto now = std::chrono::steady_clock::now();
+            quiescence_deadline = std::min(
+                deadline, now + config_.cancellation_grace);
+            cancel_active_socket();
+        }
+    };
+    const auto fail_stop = [&]() noexcept {
+        if (config_.fail_stop)
+            config_.fail_stop();
+        // A policy that returns cannot make it safe to return from run_one:
+        // the owner coroutine may still be executing against this runtime.
+        // The installed sidecar therefore has a bounded supervised fail-stop
+        // even when no test policy was injected.
+        std::_Exit(125);
+    };
+    const auto poll_timeout = [&]() {
+        const auto remaining = (cancellation == RuntimeCancellationReason::None
+                                    ? cancellation_trigger_deadline
+                                    : quiescence_deadline) -
+                               std::chrono::steady_clock::now();
+        if (remaining <= std::chrono::steady_clock::duration::zero())
+            return 0;
+        auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
+        if (milliseconds < remaining)
+            ++milliseconds;
+        return static_cast<int>(std::min<int64_t>(milliseconds.count(),
+                                                  std::numeric_limits<int>::max()));
+    };
     for (;;) {
-        if (completion_result.wait_for(std::chrono::milliseconds(100)) ==
+        if (completion_result.wait_for(std::chrono::milliseconds(0)) ==
             std::future_status::ready)
             break;
         if (endpoint_owner_failed_.load(std::memory_order_acquire)) {
-            result.status = RuntimeStatus::EndpointFailed;
-            return result;
+            (void)::close(completion_pipe[0]);
+            // The executor reported an escaped owner-context failure.  Do
+            // not return while its coroutine/session registration might still
+            // reference this runtime; the supervised sidecar fail-stop is the
+            // only bounded safe outcome for this ownership violation.
+            fail_stop();
         }
+        if (cancellation != RuntimeCancellationReason::None &&
+            std::chrono::steady_clock::now() >= quiescence_deadline)
+            fail_stop();
+        if (cancellation == RuntimeCancellationReason::None) {
+            uint8_t probe = 0;
+            const ssize_t peeked = ::recv(control.native_handle(), &probe, 1,
+                                          MSG_PEEK | MSG_DONTWAIT);
+            if (peeked == 0) {
+                request_cancellation(RuntimeCancellationReason::ControlEof);
+                continue;
+            }
+        }
+        if (cancellation == RuntimeCancellationReason::None &&
+            std::chrono::steady_clock::now() >= cancellation_trigger_deadline) {
+            request_cancellation(RuntimeCancellationReason::Deadline);
+            continue;
+        }
+        pollfd descriptors[2] = {
+            {cancellation == RuntimeCancellationReason::None ? control.native_handle() : -1,
+             static_cast<short>(cancellation == RuntimeCancellationReason::None
+                                    ? (POLLIN | POLLERR | POLLHUP)
+                                    : 0),
+             0},
+            {completion_pipe[0], POLLIN | POLLERR | POLLHUP, 0},
+        };
+        const int ready = ::poll(descriptors, 2, poll_timeout());
+        if (ready < 0) {
+            if (errno == EINTR)
+                continue;
+            request_cancellation(RuntimeCancellationReason::ControlEof);
+            continue;
+        }
+        if (cancellation == RuntimeCancellationReason::None &&
+            (descriptors[0].revents & (POLLERR | POLLHUP)) != 0 &&
+            (descriptors[0].revents & POLLIN) == 0) {
+            request_cancellation(RuntimeCancellationReason::ControlEof);
+        } else if (cancellation == RuntimeCancellationReason::None &&
+                   (descriptors[0].revents & POLLIN) != 0) {
+            local::Frame cancel_frame;
+            const local::Status status = control.receive_until(cancel_frame, deadline);
+            if (status == local::Status::CleanEof || status == local::Status::Truncated) {
+                request_cancellation(RuntimeCancellationReason::ControlEof);
+            } else if (status == local::Status::Timeout) {
+                // Some stream implementations report a peer shutdown as
+                // readable without surfacing HUP through the framed reader.
+                // Re-check the borrowed control descriptor before classifying
+                // that wakeup as the cumulative operation deadline.
+                uint8_t probe = 0;
+                const ssize_t peeked = ::recv(control.native_handle(), &probe, 1,
+                                              MSG_PEEK | MSG_DONTWAIT);
+                if (peeked == 0)
+                    request_cancellation(RuntimeCancellationReason::ControlEof);
+                else
+                    request_cancellation(RuntimeCancellationReason::Deadline);
+            } else if (status != local::Status::Ok) {
+                // Once the authenticated handoff is complete, any transport
+                // status other than the explicit EOF/truncation/timeout cases
+                // is an operation-terminal protocol failure.  Returning to
+                // the endpoint with an unclassified frame would leave the
+                // operation ambiguous.
+                uint8_t probe = 0;
+                const ssize_t peeked = ::recv(control.native_handle(), &probe, 1,
+                                              MSG_PEEK | MSG_DONTWAIT);
+                request_cancellation(peeked == 0
+                                         ? RuntimeCancellationReason::ControlEof
+                                         : RuntimeCancellationReason::Malformed);
+            } else if (cancel_frame.type != local::MessageType::Data) {
+                request_cancellation(RuntimeCancellationReason::Malformed);
+            } else {
+                local::ControlOperation cancel_operation;
+                if (!local::decode_control_operation(cancel_frame.payload, cancel_operation)) {
+                    request_cancellation(RuntimeCancellationReason::Malformed);
+                } else if (cancel_operation.kind == local::ControlOperationKind::OperationCancel &&
+                           cancel_frame.identity == expected.identity &&
+                           cancel_operation.identity == expected.identity &&
+                           cancel_operation.cancel_target_role ==
+                               local::ControlCancelTargetRole::FSession &&
+                           cancel_operation.sender_role ==
+                               local::ControlOperationRole::Daemon &&
+                           cancel_operation.request_id == expected.request_id &&
+                           cancel_operation.binding_placeholder == binding_placeholder) {
+                    switch (cancel_operation.cancellation_reason) {
+                    case local::ControlCancellationReason::Requested:
+                        request_cancellation(RuntimeCancellationReason::Requested);
+                        break;
+                    case local::ControlCancellationReason::Deadline:
+                        request_cancellation(RuntimeCancellationReason::Deadline);
+                        break;
+                    case local::ControlCancellationReason::ControlEof:
+                        request_cancellation(RuntimeCancellationReason::ControlEof);
+                        break;
+                    }
+                }
+            }
+        }
+        if ((descriptors[1].revents & (POLLIN | POLLERR | POLLHUP)) != 0 &&
+            completion_result.wait_for(std::chrono::milliseconds(0)) ==
+                std::future_status::ready)
+            break;
     }
+    (void)::close(completion_pipe[0]);
     const EndpointOwnerResult owner_result = completion_result.get();
     result.status = owner_result.status;
     result.endpoint = owner_result.endpoint;
+    result.cancellation = cancellation;
+    if (cancellation != RuntimeCancellationReason::None) {
+        result.status = cancellation == RuntimeCancellationReason::Stopped
+                            ? RuntimeStatus::Stopped
+                            : RuntimeStatus::Cancelled;
+    }
     if (result.status == RuntimeStatus::EndpointFailed)
         live_sessions_.store(0, std::memory_order_release);
     return result;
@@ -1208,7 +1422,7 @@ void SidecarRuntime::cancel_active_control() noexcept {
     }
 }
 
-void SidecarRuntime::release_active_control() noexcept {
+void SidecarRuntime::close_active_control() noexcept {
     const int fd = active_control_cancel_fd_.exchange(-1, std::memory_order_acq_rel);
     if (fd >= 0)
         (void)::close(fd);

@@ -13,12 +13,14 @@
 #include <chrono>
 #include <atomic>
 #include <future>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 #include <thread>
 
 #include "p50_endpoint.h"
+#include "p50_control_operation.h"
 #include "p50_fd_handoff.h"
 #include "p50_input_fd_attachment.h"
 #include "p50_input_lifecycle.h"
@@ -41,6 +43,22 @@ struct RuntimeConfig {
     P50ServerEndpointConfig endpoint_config{};
     size_t max_live_handoffs = 1;
     size_t max_input_lifecycle_replays = 8192;
+    std::chrono::milliseconds cancellation_grace{100};
+    // Test/supervision seam: an injected owner failure is handled exactly like
+    // an unexpected exception escaping the endpoint executor.  Production
+    // callers leave this unset.
+    std::function<void()> owner_failure;
+    // Test-only seam: when set, the callback is posted after the endpoint has
+    // published one live session and yielded into its adopted dialogue.  A
+    // throwing callback escapes the owner executor (rather than the guarded
+    // endpoint coroutine), proving the supervised fail-stop while a live
+    // coroutine still owns endpoint state.  Production callers leave unset.
+    std::function<void()> owner_failure_after_live;
+    // Called on the control worker when the endpoint owner has not quiesced
+    // by the original cumulative sidecar deadline.  Returning is not safe:
+    // the owner coroutine may still reference this runtime, so run_one()
+    // invokes the injectable policy and then unconditionally _Exit()s.
+    std::function<void()> fail_stop;
 };
 
 enum class RuntimeStatus : uint8_t {
@@ -50,12 +68,23 @@ enum class RuntimeStatus : uint8_t {
     Stopped,
     Busy,
     EndpointFailed,
+    Cancelled,
+};
+
+enum class RuntimeCancellationReason : uint8_t {
+    None = 0,
+    Requested,
+    ControlEof,
+    Deadline,
+    Stopped,
+    Malformed,
 };
 
 struct RuntimeResult {
     RuntimeStatus status = RuntimeStatus::HandoffRejected;
     local::FdHandoffResult handoff{};
     std::optional<ServerRunResult> endpoint;
+    RuntimeCancellationReason cancellation = RuntimeCancellationReason::None;
 };
 
 // One owner/reader for one authenticated control connection and one adopted
@@ -70,7 +99,11 @@ public:
 
     RuntimeResult run_one(local::Connection& control, const local::HandoffRequest& expected,
                           std::chrono::steady_clock::time_point deadline,
-                          EndpointIoControl endpoint_control = {});
+                          EndpointIoControl endpoint_control = {},
+                          // The all-zero placeholder is intentionally not an
+                          // S2 claim: exact nonzero session binding and
+                          // daemon OP_CANCEL/C_SOURCE emission remain HOLD.
+                          local::ControlBindingPlaceholder binding_placeholder = {});
 
     // Queue the mutable endpoint lookup on the endpoint owner's io_context.
     // The returned cursor owns its immutable backing and can be materialized
@@ -105,13 +138,13 @@ private:
 
     boost::asio::awaitable<void> run_endpoint_on_owner(
         int adopted_fd, EndpointIoControl endpoint_control,
-        std::promise<EndpointOwnerResult> completion);
+        std::promise<EndpointOwnerResult> completion, int completion_wake_fd);
     void endpoint_owner_loop() noexcept;
 
     void cancel_active_socket() noexcept;
     void release_active_socket() noexcept;
     void cancel_active_control() noexcept;
-    void release_active_control() noexcept;
+    void close_active_control() noexcept;
 
     RuntimeConfig config_;
     InputLifecycleRegistry input_lifecycle_;

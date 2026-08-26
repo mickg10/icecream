@@ -625,6 +625,8 @@ struct RuntimeCase {
     local::Connection receiver;
 };
 
+int loopback_listener(uint16_t& port);
+
 RuntimeCase authenticated_runtime_pair() {
     int sockets[2] = {-1, -1};
     CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
@@ -633,6 +635,25 @@ RuntimeCase authenticated_runtime_pair() {
     CHECK(pair.sender.verify_peer_credentials(expected) == local::Status::Ok);
     CHECK(pair.receiver.verify_peer_credentials(expected) == local::Status::Ok);
     return pair;
+}
+
+void send_operation_cancel(local::Connection& sender, local::Identity identity,
+                           uint64_t request_id,
+                           local::ControlCancelTargetRole target_role =
+                               local::ControlCancelTargetRole::FSession,
+                           local::ControlCancellationReason reason =
+                               local::ControlCancellationReason::Requested,
+                           local::ControlBindingPlaceholder binding = {},
+                           local::ControlOperationRole sender_role =
+                               local::ControlOperationRole::Daemon) {
+    const auto payload = local::encode_control_operation(
+        local::make_operation_cancel_operation(identity, target_role, request_id, reason,
+                                               binding, sender_role));
+    CHECK(payload.size() == local::kOperationCancelOperationBytes);
+    const local::Frame frame{local::kProtocolVersion, local::MessageType::Data,
+                             identity, payload};
+    CHECK(sender.send_until(frame, std::chrono::steady_clock::now() +
+                                      std::chrono::seconds(2)) == local::Status::Ok);
 }
 
 service::RuntimeConfig test_runtime_config() {
@@ -808,6 +829,214 @@ void test_runtime_stop_interrupts_control_wait() {
     CHECK(runtime_result.status == service::RuntimeStatus::Stopped);
     CHECK(runtime_result.handoff.status == local::FdHandoffStatus::Disconnected);
     CHECK(runtime.live_handoff_count() == 0 && runtime.live_session_count() == 0);
+}
+
+service::RuntimeResult run_raw_cancel_case(bool partial_dialogue,
+                                           bool close_control,
+                                           bool deadline_case,
+                                           bool malformed_case = false) {
+    service::RuntimeConfig runtime_config = test_runtime_config();
+    if (deadline_case)
+        runtime_config.cancellation_grace = std::chrono::milliseconds(20);
+    service::SidecarRuntime runtime(std::move(runtime_config));
+    RuntimeCase control = authenticated_runtime_pair();
+    uint16_t port = 0;
+    const int listener = loopback_listener(port);
+    const int peer = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    CHECK(peer >= 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(port);
+    CHECK(::connect(peer, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0);
+    const int accepted = ::accept(listener, nullptr, nullptr);
+    CHECK(accepted >= 0);
+    CHECK(::close(listener) == 0);
+    const local::HandoffRequest request{{7, 1}, deadline_case ? 4u : 1u};
+    service::RuntimeResult result;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          (deadline_case ? std::chrono::milliseconds(80)
+                                         : std::chrono::seconds(5));
+    std::thread worker([&] { result = runtime.run_one(control.receiver, request, deadline); });
+    local::FdHandoffSender sender{local::HandoffFd(accepted)};
+    CHECK(sender.send(control.sender, request,
+                      std::chrono::steady_clock::now() + std::chrono::seconds(2))
+              .status == local::FdHandoffStatus::Accepted);
+    const auto live_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (runtime.live_session_count() == 0 && std::chrono::steady_clock::now() < live_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    CHECK(runtime.live_session_count() == 1);
+    if (malformed_case) {
+        const local::Frame malformed{local::kProtocolVersion, local::MessageType::Data,
+                                     request.identity, {0xff}};
+        CHECK(control.sender.send_until(
+                  malformed, std::chrono::steady_clock::now() + std::chrono::seconds(2)) ==
+              local::Status::Ok);
+    } else if (partial_dialogue) {
+        CHECK(send_byte_no_signal(peer, 0));
+    }
+    if (close_control) {
+        CHECK(::shutdown(control.sender.native_handle(), SHUT_RDWR) == 0);
+        control.sender = local::Connection(-1);
+    } else if (!deadline_case) {
+        send_operation_cancel(control.sender, request.identity, request.request_id);
+    }
+    worker.join();
+    CHECK(::close(peer) == 0);
+    return result;
+}
+
+void test_operation_cancel_prebyte_mid_dialogue_eof_deadline() {
+    const service::RuntimeResult prebyte = run_raw_cancel_case(false, false, false);
+    CHECK(prebyte.status == service::RuntimeStatus::Cancelled &&
+          prebyte.cancellation == service::RuntimeCancellationReason::Requested &&
+          prebyte.endpoint.has_value() && !prebyte.endpoint->committed_input.has_value());
+    const service::RuntimeResult mid_dialogue = run_raw_cancel_case(true, false, false);
+    CHECK(mid_dialogue.status == service::RuntimeStatus::Cancelled &&
+          mid_dialogue.cancellation == service::RuntimeCancellationReason::Requested);
+    const service::RuntimeResult eof = run_raw_cancel_case(false, true, false);
+    CHECK(eof.status == service::RuntimeStatus::Cancelled &&
+          eof.cancellation == service::RuntimeCancellationReason::ControlEof);
+    const service::RuntimeResult malformed = run_raw_cancel_case(false, false, false, true);
+    CHECK(malformed.status == service::RuntimeStatus::Cancelled &&
+          malformed.cancellation == service::RuntimeCancellationReason::Malformed);
+    const service::RuntimeResult deadline = run_raw_cancel_case(false, false, true);
+    CHECK(deadline.status == service::RuntimeStatus::Cancelled &&
+          deadline.cancellation == service::RuntimeCancellationReason::Deadline);
+}
+
+void test_runtime_cancel_fail_stop_subprocess(bool owner_failure_case = false,
+                                              bool live_owner_failure_case = false) {
+    int marker[2] = {-1, -1};
+    int live_marker[2] = {-1, -1};
+    CHECK(::pipe(marker) == 0);
+    CHECK(::pipe(live_marker) == 0);
+    const auto child_started = std::chrono::steady_clock::now();
+    const pid_t child = ::fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        (void)::close(marker[0]);
+        (void)::close(live_marker[0]);
+        auto child_abort = [] { _exit(126); };
+        service::RuntimeConfig config = test_runtime_config();
+        const int marker_fd = marker[1];
+        config.cancellation_grace = std::chrono::milliseconds(80);
+        if (owner_failure_case) {
+            config.owner_failure = [] {
+                throw std::runtime_error("injected endpoint owner failure");
+            };
+        }
+        if (live_owner_failure_case) {
+            const int live_marker_fd = live_marker[1];
+            config.owner_failure_after_live = [live_marker_fd] {
+                const uint8_t byte = 1;
+                const ssize_t ignored = ::write(live_marker_fd, &byte, sizeof(byte));
+                (void)ignored;
+                throw std::runtime_error("injected live endpoint owner failure");
+            };
+        }
+        config.fail_stop = [marker_fd] {
+            const uint8_t byte = 1;
+            const ssize_t ignored = ::write(marker_fd, &byte, sizeof(byte));
+            (void)ignored;
+            _exit(125);
+        };
+        service::SidecarRuntime runtime(std::move(config));
+        RuntimeCase control = authenticated_runtime_pair();
+        uint16_t port = 0;
+        const int listener = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (listener < 0)
+            child_abort();
+        int reuse = 1;
+        if (::setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) != 0)
+            child_abort();
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = 0;
+        if (::bind(listener, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0)
+            child_abort();
+        if (::listen(listener, 1) != 0)
+            child_abort();
+        socklen_t address_length = sizeof(address);
+        if (::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &address_length) != 0)
+            child_abort();
+        port = ntohs(address.sin_port);
+        const int peer = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (peer < 0)
+            child_abort();
+        address.sin_port = htons(port);
+        if (::connect(peer, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0)
+            child_abort();
+        const int accepted = ::accept(listener, nullptr, nullptr);
+        if (accepted < 0)
+            child_abort();
+        (void)::close(listener);
+        EndpointIoControl endpoint_control;
+        if (!owner_failure_case && !live_owner_failure_case) {
+            endpoint_control.before_completion_check = [](CompletionStamp&) {
+                for (;;)
+                    std::this_thread::yield();
+            };
+        }
+        const local::HandoffRequest request{{7, 1}, 88};
+        service::RuntimeResult result;
+        std::thread worker([&] {
+            result = runtime.run_one(
+                control.receiver, request,
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(150),
+                std::move(endpoint_control));
+        });
+        local::FdHandoffSender sender{local::HandoffFd(accepted)};
+        if (sender.send(control.sender, request,
+                        std::chrono::steady_clock::now() + std::chrono::seconds(2))
+                .status != local::FdHandoffStatus::Accepted)
+            child_abort();
+        const auto live_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        if (!owner_failure_case && !live_owner_failure_case) {
+            while (runtime.live_session_count() == 0 &&
+                   std::chrono::steady_clock::now() < live_deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if (runtime.live_session_count() != 1)
+                child_abort();
+            send_operation_cancel(control.sender, request.identity, request.request_id);
+        }
+        worker.join();
+        (void)result;
+        (void)::close(peer);
+        child_abort();
+    }
+    (void)::close(marker[1]);
+    (void)::close(live_marker[1]);
+    bool live_callback_seen = false;
+    if (live_owner_failure_case) {
+        struct pollfd live_marker_ready{live_marker[0], POLLIN | POLLHUP, 0};
+        live_callback_seen = ::poll(&live_marker_ready, 1, 2000) > 0;
+        uint8_t byte = 0;
+        live_callback_seen = live_callback_seen &&
+                             ::read(live_marker[0], &byte, sizeof(byte)) == 1 && byte == 1;
+    }
+    (void)::close(live_marker[0]);
+    struct pollfd marker_ready{marker[0], POLLIN | POLLHUP, 0};
+    CHECK(::poll(&marker_ready, 1, 2000) > 0);
+    CHECK(std::chrono::steady_clock::now() - child_started <
+          std::chrono::milliseconds(900));
+    uint8_t byte = 0;
+    CHECK(::read(marker[0], &byte, sizeof(byte)) == 1 && byte == 1);
+    (void)::close(marker[0]);
+    int status = 0;
+    CHECK(::waitpid(child, &status, 0) == child);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 125);
+    if (live_owner_failure_case)
+        CHECK(live_callback_seen);
+}
+
+void test_runtime_owner_failure_fail_stop_subprocess() {
+    test_runtime_cancel_fail_stop_subprocess(true);
+}
+
+void test_runtime_live_owner_failure_fail_stop_subprocess() {
+    test_runtime_cancel_fail_stop_subprocess(false, true);
 }
 
 void test_runtime_identity_disconnect_and_endpoint_failure() {
@@ -1015,6 +1244,21 @@ void test_runtime_zstd_tu_af_unix_loopback() {
     local::FdHandoffSender sender{local::HandoffFd(accepted)};
     const local::FdHandoffResult sender_result = sender.send(
         control.sender, request, std::chrono::steady_clock::now() + std::chrono::seconds(3));
+    // Stale, wrong-role, wrong-binding, and cross-operation cancellation
+    // frames are consumed but must not affect the active dialogue.
+    send_operation_cancel(control.sender, request.identity, request.request_id + 99);
+    send_operation_cancel(control.sender, request.identity, request.request_id,
+                          local::ControlCancelTargetRole::CSource);
+    send_operation_cancel(control.sender, request.identity, request.request_id,
+                          local::ControlCancelTargetRole::FSession,
+                          local::ControlCancellationReason::Requested, {},
+                          local::ControlOperationRole::Sidecar);
+    local::ControlBindingPlaceholder wrong_binding{};
+    wrong_binding[0] = 1;
+    send_operation_cancel(control.sender, request.identity, request.request_id,
+                          local::ControlCancelTargetRole::FSession,
+                          local::ControlCancellationReason::Requested, wrong_binding);
+    send_operation_cancel(control.sender, {7, 99}, request.request_id);
     const auto first_done_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
     while (!first_runtime_finished.load(std::memory_order_acquire) &&
            std::chrono::steady_clock::now() < first_done_deadline)
@@ -1090,6 +1334,81 @@ void test_runtime_zstd_tu_af_unix_loopback() {
     CHECK(first_owner_id == second_owner_id);
     CHECK(first_owner_id != first_caller_id);
     CHECK(second_owner_id != second_caller_id);
+}
+
+void test_operation_cancel_commit_race_preserves_witness() {
+    namespace asio = boost::asio;
+    std::vector<uint8_t> input(8192);
+    for (size_t index = 0; index != input.size(); ++index)
+        input[index] = static_cast<uint8_t>((index * 17u + 3u) & 0xffu);
+    service::RuntimeConfig config = test_runtime_config();
+    config.endpoint_config.input_job_state = [](CStoreGuid, const TxBegin&, const TxCommit&,
+                                                std::span<const uint8_t>) {
+        return InputJobState::Open;
+    };
+    service::SidecarRuntime runtime(std::move(config));
+    RuntimeCase control = authenticated_runtime_pair();
+    const local::HandoffRequest request{{7, 1}, 17};
+    auto authority = std::make_shared<P50PreparationAuthority>(Id128::from_u64(9123));
+    P50ClientEndpoint client(authority);
+    uint16_t port = 0;
+    const int listener = loopback_listener(port);
+    asio::io_context client_context;
+    std::future<ClientRunResult> client_result;
+    std::atomic<bool> commit_check_seen{false};
+    std::atomic<bool> release_commit_check{false};
+    EndpointIoControl endpoint_control;
+    endpoint_control.before_completion_check = [&](CompletionStamp& stamp) {
+        if (stamp.operation != AsyncOperationKind::WriteFragment ||
+            !stamp.transaction_bound)
+            return;
+        commit_check_seen.store(true, std::memory_order_release);
+        while (!release_commit_check.load(std::memory_order_acquire))
+            std::this_thread::yield();
+    };
+    std::thread client_thread([&] {
+        const PreparedTuHandle prepared = authority->prepare({17, 1}, input);
+        const int fd = connect_after_sidecar_ready(port);
+        CHECK(fd >= 0);
+        client_result = asio::co_spawn(client_context,
+                                       client.run_adopted_fd(fd, prepared), asio::use_future);
+        client_context.run();
+    });
+    service::RuntimeResult runtime_result;
+    std::thread runtime_thread([&] {
+        runtime_result = runtime.run_one(
+            control.receiver, request,
+            std::chrono::steady_clock::now() + std::chrono::seconds(5),
+            std::move(endpoint_control));
+    });
+    const int accepted = ::accept(listener, nullptr, nullptr);
+    CHECK(accepted >= 0);
+    CHECK(::close(listener) == 0);
+    local::FdHandoffSender sender{local::HandoffFd(accepted)};
+    CHECK(sender.send(control.sender, request,
+                      std::chrono::steady_clock::now() + std::chrono::seconds(3))
+              .status == local::FdHandoffStatus::Accepted);
+    const auto commit_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!commit_check_seen.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < commit_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    CHECK(commit_check_seen.load(std::memory_order_acquire));
+    send_operation_cancel(control.sender, request.identity, request.request_id);
+    release_commit_check.store(true, std::memory_order_release);
+    runtime_thread.join();
+    client_thread.join();
+    const ClientRunResult client_value = client_result.get();
+    CHECK(runtime_result.status == service::RuntimeStatus::Cancelled &&
+          runtime_result.cancellation == service::RuntimeCancellationReason::Requested);
+    CHECK(runtime_result.endpoint.has_value() &&
+          runtime_result.endpoint->committed_input.has_value() &&
+          runtime_result.endpoint->completed_input.has_value());
+    CHECK(client_value.status == ClientRunStatus::Committed &&
+          client_value.cancellation == ClientCancellationDisposition::None &&
+          client_value.committed_commit.has_value() &&
+          client_value.committed_input.has_value());
+    CHECK(client_value.committed_input == runtime_result.endpoint->committed_input &&
+          client_value.committed_input == runtime_result.endpoint->completed_input);
 }
 
 void test_runtime_stop_interrupts_active_endpoint() {
@@ -1287,7 +1606,12 @@ int main() {
         structured_c_guid_is_strict();
         test_runtime_identity_disconnect_and_endpoint_failure();
         test_runtime_stop_interrupts_control_wait();
+        test_operation_cancel_prebyte_mid_dialogue_eof_deadline();
+        test_runtime_cancel_fail_stop_subprocess();
+        test_runtime_owner_failure_fail_stop_subprocess();
+        test_runtime_live_owner_failure_fail_stop_subprocess();
         test_runtime_zstd_tu_af_unix_loopback();
+        test_operation_cancel_commit_race_preserves_witness();
         test_runtime_stop_interrupts_active_endpoint();
         ready_reader_close_after_bind_is_fail_closed();
         ready_requires_bind_and_replacement_is_preserved();

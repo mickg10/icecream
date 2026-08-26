@@ -143,6 +143,64 @@ void wire_fixtures() {
             "legacy v1 attachment fixture did not decode ownerless");
 }
 
+void operation_cancel_wire_fixtures() {
+    using namespace icecc::p50::local;
+    const Identity identity{0x9192939495969798ULL, 0xa1a2a3a4a5a6a7a8ULL};
+    ControlBindingPlaceholder binding{};
+    for (size_t index = 0; index != binding.size(); ++index)
+        binding[index] = static_cast<uint8_t>(index + 1);
+    const ControlOperation request = make_operation_cancel_operation(
+        identity, ControlCancelTargetRole::FSession, 0x4142434445464748ULL,
+        ControlCancellationReason::Requested, binding);
+    const std::vector<uint8_t> wire = encode_control_operation(request);
+    require(wire.size() == kOperationCancelOperationBytes &&
+                wire[0] == 0 && wire[1] == kControlOperationVersionV3 &&
+                wire[2] == 0 && wire[3] == static_cast<uint8_t>(ControlOperationKind::OperationCancel) &&
+                wire[32] == 0 && wire[33] == static_cast<uint8_t>(ControlCancelTargetRole::FSession) &&
+                wire[34] == 0 && wire[35] == static_cast<uint8_t>(ControlCancellationReason::Requested) &&
+                wire[36] == 0 && wire[37] == static_cast<uint8_t>(ControlOperationRole::Daemon) &&
+                std::equal(binding.begin(), binding.end(), wire.begin() + 40),
+            "operation-cancel v3 fixture changed");
+    ControlOperation decoded;
+    require(decode_control_operation(wire, decoded) &&
+                decoded.kind == ControlOperationKind::OperationCancel &&
+                decoded.identity == identity &&
+                decoded.request_id == request.request_id &&
+                decoded.cancel_target_role == ControlCancelTargetRole::FSession &&
+                decoded.cancellation_reason == ControlCancellationReason::Requested &&
+                decoded.sender_role == ControlOperationRole::Daemon &&
+                decoded.binding_placeholder == binding,
+            "operation-cancel did not round-trip exact launch binding");
+
+    std::vector<uint8_t> reserved_mutant = wire;
+    reserved_mutant[38] = 1;
+    require(!decode_control_operation(reserved_mutant, decoded),
+            "operation-cancel reserved bytes were accepted");
+    std::vector<uint8_t> role_mutant = wire;
+    role_mutant[33] = 0;
+    require(!decode_control_operation(role_mutant, decoded),
+            "operation-cancel unknown target role was accepted");
+    std::vector<uint8_t> reason_mutant = wire;
+    reason_mutant[35] = 0;
+    require(!decode_control_operation(reason_mutant, decoded),
+            "operation-cancel unknown reason was accepted");
+    std::vector<uint8_t> sender_mutant = wire;
+    sender_mutant[37] = static_cast<uint8_t>(ControlOperationRole::Sidecar);
+    require(decode_control_operation(sender_mutant, decoded) &&
+                decoded.sender_role == ControlOperationRole::Sidecar,
+            "operation-cancel sender direction was not typed");
+    std::vector<uint8_t> size_mutant = wire;
+    put_u32(size_mutant, 4, static_cast<uint32_t>(kCacheSessionOperationBytes));
+    require(!decode_control_operation(size_mutant, decoded),
+            "operation-cancel accepted a cache-session size");
+    std::vector<uint8_t> identity_mutant = wire;
+    identity_mutant[15] = 0;
+    identity_mutant[16] = 0;
+    require(decode_control_operation(identity_mutant, decoded) &&
+                decoded.identity != identity,
+            "operation-cancel identity was not carried as an exact field");
+}
+
 void commit_attachment_cancel_replace_close() {
     InputLifecycleRegistry registry(8, 32);
     const local::Identity identity{7, 3};
@@ -493,6 +551,7 @@ int main() {
                 !input_lifecycle_action_valid(InputLifecycleAction::None),
             "identity/action validation changed");
     wire_fixtures();
+    operation_cancel_wire_fixtures();
     commit_attachment_cancel_replace_close();
     close_before_commit_and_attach_close_race();
     replacement_cycle_and_bounds();

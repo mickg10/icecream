@@ -117,6 +117,22 @@ temporary sockets, and handoff busy state are reset before the next session;
 the shared `P50ServerEndpoint::run_adopted` reducer remains the sole endpoint
 state owner.
 
+### Operation cancellation boundary
+
+The sidecar runtime validates the typed `OP_CANCEL` shape, target role, operation
+identity, bounded reason, and immutable binding placeholder, then keeps the
+authenticated control connection owned until endpoint completion or a bounded
+fail-stop. The all-zero placeholder currently used by this lane is deliberately
+not an S2 session claim: exact nonzero session-claim binding and daemon
+`OP_CANCEL`/C_SOURCE emission remain HOLD. No result in this service should be
+read as closing that integration seam.
+
+An exception escaping the endpoint owner executor after a live adopted session
+has been published is supervised as a fail-stop, never returned as an ordinary
+endpoint result. The deletion-sensitive subprocess witness posts that failure
+only after live-session publication and requires supervised exit, so no live
+coroutine can return through session cleanup or serve a subsequent handoff.
+
 The generic `p50_fd_handoff` helper remains a separate ownership primitive. It
 does not know the ordinary-link codec, create a listener, or advertise an
 endpoint.  Production daemon integration and advertisement remain outside
