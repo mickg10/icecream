@@ -57,13 +57,10 @@ void nonblock(int fd) {
     CHECK(flags >= 0 && ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0);
 }
 
-void write_frame(int fd, const Frame& frame) {
-    Status status = Status::InvalidArgument;
-    const auto bytes = encode_frame(frame, &status);
-    CHECK(status == Status::Ok && !bytes.empty());
+void write_bytes(int fd, const uint8_t* bytes, size_t byte_count) {
     size_t offset = 0;
-    while (offset != bytes.size()) {
-        const ssize_t count = ::send(fd, bytes.data() + offset, bytes.size() - offset,
+    while (offset != byte_count) {
+        const ssize_t count = ::send(fd, bytes + offset, byte_count - offset,
 #ifdef MSG_NOSIGNAL
                                      MSG_NOSIGNAL
 #else
@@ -73,6 +70,13 @@ void write_frame(int fd, const Frame& frame) {
         CHECK(count > 0);
         offset += static_cast<size_t>(count);
     }
+}
+
+void write_frame(int fd, const Frame& frame) {
+    Status status = Status::InvalidArgument;
+    const auto bytes = encode_frame(frame, &status);
+    CHECK(status == Status::Ok && !bytes.empty());
+    write_bytes(fd, bytes.data(), bytes.size());
 }
 
 void send_bytes_with_fds(int socket, const uint8_t* bytes, size_t byte_count,
@@ -297,9 +301,13 @@ void test_client_frame_trailing_rejected() {
         std::thread peer([&] {
             Frame hello;
             CHECK(read_frame(pair[1], hello) == Status::Ok);
-            write_frame(pair[1], make_hello_ack(PeerRole::Sidecar, expected.identity));
+            Status status = Status::InvalidArgument;
+            auto reply = encode_frame(
+                make_hello_ack(PeerRole::Sidecar, expected.identity), &status);
+            CHECK(status == Status::Ok && !reply.empty());
             const uint8_t trailing = 0xA5;
-            CHECK(::send(pair[1], &trailing, sizeof(trailing), 0) == 1);
+            reply.push_back(trailing);
+            write_bytes(pair[1], reply.data(), reply.size());
         });
         while (!sender.done()) {
             pollfd pfd{pair[0], sender.desired_events(), 0};
@@ -344,15 +352,11 @@ void test_client_frame_trailing_rejected() {
                 }
             }
             const auto ack = handoff_wire(expected, 2, 1);
-            size_t offset = 0;
-            while (offset != ack.size()) {
-                const ssize_t count = ::send(pair[1], ack.data() + offset,
-                                             ack.size() - offset, 0);
-                CHECK(count > 0);
-                offset += static_cast<size_t>(count);
-            }
             const uint8_t trailing = 0x5A;
-            CHECK(::send(pair[1], &trailing, sizeof(trailing), 0) == 1);
+            std::array<uint8_t, 41> reply{};
+            std::copy(ack.begin(), ack.end(), reply.begin());
+            reply.back() = trailing;
+            write_bytes(pair[1], reply.data(), reply.size());
         });
         while (!sender.done()) {
             pollfd pfd{pair[0], sender.desired_events(), 0};
