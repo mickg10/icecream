@@ -46,15 +46,21 @@ bool capture_source_identity(int fd, SourceIdentity* identity) noexcept {
     captured.inode = static_cast<uint64_t>(info.st_ino);
     captured.mode = static_cast<uint64_t>(info.st_mode);
     captured.size = static_cast<uint64_t>(info.st_size);
-#if defined(F_GET_SEALS)
+#if defined(F_GET_SEALS) && defined(F_SEAL_WRITE) && defined(F_SEAL_GROW) && \
+    defined(F_SEAL_SHRINK)
     errno = 0;
     const int seals = ::fcntl(fd, F_GET_SEALS);
-    if (seals >= 0) {
-        captured.has_seals = true;
-        captured.seals = static_cast<uint64_t>(seals);
-    } else if (errno != EINVAL) {
+    if (seals < 0)
         return false;
-    }
+    const int immutable_seals = F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK;
+    if ((seals & immutable_seals) != immutable_seals)
+        return false;
+    captured.has_seals = true;
+    captured.seals = static_cast<uint64_t>(seals);
+#else
+    // Without kernel seal introspection there is no causal way to prove that
+    // a regular-file handoff cannot be mutated between mint and sweep.
+    return false;
 #endif
     *identity = captured;
     return captured.valid();
@@ -73,6 +79,20 @@ bool source_identity_matches(int fd, const SourceIdentity& expected) noexcept {
     if (!capture_source_identity(fd, &actual))
         return false;
     return source_identity_equal(actual, expected);
+}
+
+// A proof duplicate is an owned capability, but its integer slot can still be
+// closed and reused by an external owner.  Retire only after revalidating the
+// immutable identity, and forget the slot before attempting close so a
+// destructor can never retry against an unrelated replacement descriptor.
+bool retire_owned_proof(int* fd, const SourceIdentity& expected) noexcept {
+    if (fd == nullptr || *fd < 0)
+        return false;
+    const int proof = *fd;
+    *fd = -1;
+    if (!source_identity_matches(proof, expected))
+        return false;
+    return close_exact(proof);
 }
 
 #if defined(ICECC_P50_FORK_FD_HYGIENE_TEST_HOOKS)
@@ -103,36 +123,35 @@ constexpr uint64_t kTestOwnerCookie = UINT64_C(0x9d5f31a7c2e84b61);
 
 DeliveryOwnerToken::DeliveryOwnerToken(int expected_fd,
                                        uint64_t expected_delivery_id,
-                                       int owner_fd, SourceIdentity identity,
+                                       int owned_proof_fd, SourceIdentity identity,
                                        uint64_t owner_cookie) noexcept
     : expected_fd_(expected_fd), expected_delivery_id_(expected_delivery_id),
-      owner_fd_(owner_fd), identity_(identity), owner_cookie_(owner_cookie) {}
+      owned_proof_fd_(owned_proof_fd), identity_(identity), owner_cookie_(owner_cookie) {}
 
 DeliveryOwnerToken::DeliveryOwnerToken(DeliveryOwnerToken&& other) noexcept
     : expected_fd_(other.expected_fd_),
       expected_delivery_id_(other.expected_delivery_id_),
-      owner_fd_(other.owner_fd_),
+      owned_proof_fd_(other.owned_proof_fd_),
       identity_(other.identity_),
       owner_cookie_(other.owner_cookie_) {
     other.expected_fd_ = -1;
     other.expected_delivery_id_ = 0;
-    other.owner_fd_ = -1;
+    other.owned_proof_fd_ = -1;
     other.identity_ = SourceIdentity{};
     other.owner_cookie_ = 0;
 }
 
 DeliveryOwnerToken& DeliveryOwnerToken::operator=(DeliveryOwnerToken&& other) noexcept {
     if (this != &other) {
-        if (owner_fd_ >= 0)
-            (void)::close(owner_fd_);
+        (void)retire_owned_proof(&owned_proof_fd_, identity_);
         expected_fd_ = other.expected_fd_;
         expected_delivery_id_ = other.expected_delivery_id_;
-        owner_fd_ = other.owner_fd_;
+        owned_proof_fd_ = other.owned_proof_fd_;
         identity_ = other.identity_;
         owner_cookie_ = other.owner_cookie_;
         other.expected_fd_ = -1;
         other.expected_delivery_id_ = 0;
-        other.owner_fd_ = -1;
+        other.owned_proof_fd_ = -1;
         other.identity_ = SourceIdentity{};
         other.owner_cookie_ = 0;
     }
@@ -140,50 +159,50 @@ DeliveryOwnerToken& DeliveryOwnerToken::operator=(DeliveryOwnerToken&& other) no
 }
 
 DeliveryOwnerToken::~DeliveryOwnerToken() {
-    if (owner_fd_ >= 0)
-        (void)::close(owner_fd_);
+    (void)retire_owned_proof(&owned_proof_fd_, identity_);
 }
 
 ForkSourceLease::ForkSourceLease(int fd, uint64_t delivery_id, int expected_fd,
                                  uint64_t expected_delivery_id, int owner_fd,
                                  SourceIdentity identity,
                                  uint64_t owner_cookie) noexcept
-    : fd_(fd), delivery_id_(delivery_id), expected_fd_(expected_fd),
-      expected_delivery_id_(expected_delivery_id), owner_fd_(owner_fd),
+    : borrowed_handoff_fd_(fd), delivery_id_(delivery_id), expected_fd_(expected_fd),
+      expected_delivery_id_(expected_delivery_id), owned_proof_fd_(owner_fd),
       identity_(identity), owner_cookie_(owner_cookie) {}
 
 ForkSourceLease::ForkSourceLease(ForkSourceLease&& other) noexcept
-    : fd_(other.fd_), delivery_id_(other.delivery_id_),
+    : borrowed_handoff_fd_(other.borrowed_handoff_fd_), delivery_id_(other.delivery_id_),
       expected_fd_(other.expected_fd_),
       expected_delivery_id_(other.expected_delivery_id_),
-      owner_fd_(other.owner_fd_),
+      owned_proof_fd_(other.owned_proof_fd_),
       identity_(other.identity_),
       owner_cookie_(other.owner_cookie_) {
-    other.fd_ = -1;
+    other.borrowed_handoff_fd_ = -1;
     other.delivery_id_ = 0;
     other.expected_fd_ = -1;
     other.expected_delivery_id_ = 0;
-    other.owner_fd_ = -1;
+    other.owned_proof_fd_ = -1;
     other.identity_ = SourceIdentity{};
     other.owner_cookie_ = 0;
 }
 
 ForkSourceLease& ForkSourceLease::operator=(ForkSourceLease&& other) noexcept {
     if (this != &other) {
-        if (fd_ >= 0)
-            (void)::close(fd_);
-        fd_ = other.fd_;
+        // borrowed_handoff_fd_ belongs to the delivery caller.  Replacing a
+        // lease must never close that caller-owned descriptor.
+        (void)retire_owned_proof(&owned_proof_fd_, identity_);
+        borrowed_handoff_fd_ = other.borrowed_handoff_fd_;
         delivery_id_ = other.delivery_id_;
         expected_fd_ = other.expected_fd_;
         expected_delivery_id_ = other.expected_delivery_id_;
-        owner_fd_ = other.owner_fd_;
+        owned_proof_fd_ = other.owned_proof_fd_;
         identity_ = other.identity_;
         owner_cookie_ = other.owner_cookie_;
-        other.fd_ = -1;
+        other.borrowed_handoff_fd_ = -1;
         other.delivery_id_ = 0;
         other.expected_fd_ = -1;
         other.expected_delivery_id_ = 0;
-        other.owner_fd_ = -1;
+        other.owned_proof_fd_ = -1;
         other.identity_ = SourceIdentity{};
         other.owner_cookie_ = 0;
     }
@@ -191,44 +210,34 @@ ForkSourceLease& ForkSourceLease::operator=(ForkSourceLease&& other) noexcept {
 }
 
 ForkSourceLease::~ForkSourceLease() {
-    if (owner_fd_ >= 0)
-        (void)::close(owner_fd_);
+    (void)retire_owned_proof(&owned_proof_fd_, identity_);
 }
 
 bool ForkSourceLease::retire_identity_proof() noexcept {
-    if (owner_fd_ < 0)
-        return false;
-    const int proof = owner_fd_;
-    if (close_exact(proof)) {
-        owner_fd_ = -1;
-        return true;
-    }
-    if (errno == EBADF)
-        owner_fd_ = -1;
-    return false;
+    return retire_owned_proof(&owned_proof_fd_, identity_);
 }
 
 bool ForkSourceLease::identity_matches_current() const noexcept {
-    return valid() && source_identity_matches(owner_fd_, identity_) &&
-           source_identity_matches(fd_, identity_);
+    return valid() && source_identity_matches(owned_proof_fd_, identity_) &&
+           source_identity_matches(borrowed_handoff_fd_, identity_);
 }
 
 std::optional<ForkSourceLease>
 mint_fork_source_lease(DeliveryOwnerToken&& owner, int fd,
                        uint64_t delivery_id) noexcept {
     if (owner.owner_cookie_ == 0 || owner.expected_fd_ < 0 ||
-        owner.owner_fd_ < 0 || !owner.identity_.valid() ||
+        owner.owned_proof_fd_ < 0 || !owner.identity_.valid() ||
         owner.expected_delivery_id_ == 0 || fd != owner.expected_fd_ ||
         delivery_id != owner.expected_delivery_id_ ||
-        !source_identity_matches(owner.owner_fd_, owner.identity_) ||
+        !source_identity_matches(owner.owned_proof_fd_, owner.identity_) ||
         !source_identity_matches(fd, owner.identity_))
         return std::nullopt;
     ForkSourceLease result(fd, delivery_id, owner.expected_fd_,
-                           owner.expected_delivery_id_, owner.owner_fd_,
+                           owner.expected_delivery_id_, owner.owned_proof_fd_,
                            owner.identity_, owner.owner_cookie_);
     owner.expected_fd_ = -1;
     owner.expected_delivery_id_ = 0;
-    owner.owner_fd_ = -1;
+    owner.owned_proof_fd_ = -1;
     owner.identity_ = SourceIdentity{};
     owner.owner_cookie_ = 0;
     return result;
@@ -641,6 +650,14 @@ test_make_delivery_owner(int expected_fd, uint64_t expected_delivery_id) noexcep
     }
     return DeliveryOwnerToken(expected_fd, expected_delivery_id, owner_fd,
                               identity, kTestOwnerCookie);
+}
+
+int test_delivery_owner_proof_fd(const DeliveryOwnerToken& owner) noexcept {
+    return owner.owned_proof_fd_;
+}
+
+int test_fork_source_lease_proof_fd(const ForkSourceLease& lease) noexcept {
+    return lease.owned_proof_fd_;
 }
 #endif
 

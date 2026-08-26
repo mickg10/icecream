@@ -9,8 +9,11 @@ test -s "$source" -a -s "$test" -a -s "$header"
 
 mutant=$(mktemp "${TMPDIR:-/tmp}/p50forkfdhygiene.XXXXXX")
 identity_dir=
+move_dir=
+proof_dir=
+mutable_dir=
 mutant_dir=
-trap 'rm -f "$mutant"; rm -rf "$mutant_dir" "$identity_dir"' EXIT HUP INT TERM
+trap 'rm -f "$mutant"; rm -rf "$mutant_dir" "$identity_dir" "$move_dir" "$proof_dir" "$mutable_dir"' EXIT HUP INT TERM
 
 # A real runtime mutant changes the accepted source DeliveryId while the
 # owner still authorizes 77.  The mutant must fail before any sweep runs.
@@ -51,10 +54,69 @@ if "$identity_dir/test" >/dev/null 2>&1; then
 fi
 rm -rf "$identity_dir"
 
+# A true ownership mutant closes the borrowed handoff while replacing a lease.
+# The caller-owned descriptor must survive both move-assignment and lease
+# destruction; deleting that distinction must redden the runtime regression.
+move_dir=$(mktemp -d "${TMPDIR:-/tmp}/p50forkfdhygiene-move-mutant.XXXXXX")
+mkdir -p "$move_dir/daemon" "$move_dir/unittests"
+sed 's/borrowed_handoff_fd_ = other.borrowed_handoff_fd_;/if (borrowed_handoff_fd_ >= 0) { (void)::close(borrowed_handoff_fd_); } borrowed_handoff_fd_ = other.borrowed_handoff_fd_;/' \
+    "$source" >"$move_dir/daemon/p50_fork_fd_hygiene.cpp"
+cp "$header" "$move_dir/daemon/p50_fork_fd_hygiene.h"
+cp "$test" "$move_dir/unittests/p50_fork_fd_hygiene_test.cpp"
+"$cxx" "$standard" -Wall -Wextra -Werror \
+    -DICECC_P50_FORK_FD_HYGIENE_TEST_HOOKS -I"$move_dir" \
+    "$move_dir/unittests/p50_fork_fd_hygiene_test.cpp" \
+    "$move_dir/daemon/p50_fork_fd_hygiene.cpp" -o "$move_dir/test"
+if "$move_dir/test" >/dev/null 2>&1; then
+    echo 'FAIL: borrowed-handoff move-assignment mutant survived' >&2
+    exit 1
+fi
+rm -rf "$move_dir"
+
+# A true retirement mutant closes a reused proof-FD number without checking
+# its file identity.  The executable owner/lease proof-reuse rows must catch
+# that double-close/unrelated-close hazard.
+proof_dir=$(mktemp -d "${TMPDIR:-/tmp}/p50forkfdhygiene-proof-mutant.XXXXXX")
+mkdir -p "$proof_dir/daemon" "$proof_dir/unittests"
+sed 's/if (!source_identity_matches(proof, expected))/if ((void)expected, false)/' \
+    "$source" >"$proof_dir/daemon/p50_fork_fd_hygiene.cpp"
+cp "$header" "$proof_dir/daemon/p50_fork_fd_hygiene.h"
+cp "$test" "$proof_dir/unittests/p50_fork_fd_hygiene_test.cpp"
+"$cxx" "$standard" -Wall -Wextra -Werror \
+    -DICECC_P50_FORK_FD_HYGIENE_TEST_HOOKS -I"$proof_dir" \
+    "$proof_dir/unittests/p50_fork_fd_hygiene_test.cpp" \
+    "$proof_dir/daemon/p50_fork_fd_hygiene.cpp" -o "$proof_dir/test"
+if "$proof_dir/test" >/dev/null 2>&1; then
+    echo 'FAIL: proof-FD identity-retirement mutant survived' >&2
+    exit 1
+fi
+rm -rf "$proof_dir"
+
+# A true immutability mutant accepts an unsealed regular file by treating a
+# failed F_GET_SEALS as if all seals were present.  The mint-time rejection
+# regression must redden before such a source can reach sweep.
+mutable_dir=$(mktemp -d "${TMPDIR:-/tmp}/p50forkfdhygiene-mutable-mutant.XXXXXX")
+mkdir -p "$mutable_dir/daemon" "$mutable_dir/unittests"
+sed 's/if (seals < 0)/if (false \&\& seals < 0)/' \
+    "$source" >"$mutable_dir/daemon/p50_fork_fd_hygiene.cpp"
+cp "$header" "$mutable_dir/daemon/p50_fork_fd_hygiene.h"
+cp "$test" "$mutable_dir/unittests/p50_fork_fd_hygiene_test.cpp"
+"$cxx" "$standard" -Wall -Wextra -Werror \
+    -DICECC_P50_FORK_FD_HYGIENE_TEST_HOOKS -I"$mutable_dir" \
+    "$mutable_dir/unittests/p50_fork_fd_hygiene_test.cpp" \
+    "$mutable_dir/daemon/p50_fork_fd_hygiene.cpp" -o "$mutable_dir/test"
+if "$mutable_dir/test" >/dev/null 2>&1; then
+    echo 'FAIL: unsealed-mutable-source mutant survived' >&2
+    exit 1
+fi
+rm -rf "$mutable_dir"
+
 # The identity guard and its move-only owner mint are deletion-sensitive.
 grep -F 'owner.expected_delivery_id_' "$source" >/dev/null
 grep -F 'source->valid()' "$source" >/dev/null
 grep -F 'source_identity_equal' "$source" >/dev/null
+grep -F 'retire_owned_proof' "$source" >/dev/null
+grep -F 'borrowed_handoff_fd_' "$source" >/dev/null
 grep -F 'dup3' "$test" >/dev/null
 
 sed '/CLOSE_RANGE_CLOEXEC/d' "$source" >"$mutant"

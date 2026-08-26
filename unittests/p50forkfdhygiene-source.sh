@@ -25,7 +25,8 @@ grep -F 'ForkSourceLease' "$header" >/dev/null
 grep -F 'mint_fork_source_lease' "$header" >/dev/null
 grep -F 'source_required' "$header" >/dev/null
 grep -F 'SourceIdentity' "$header" >/dev/null
-grep -F 'owner_fd_' "$header" >/dev/null
+grep -F 'owned_proof_fd_' "$header" >/dev/null
+grep -F 'borrowed_handoff_fd_' "$header" >/dev/null
 grep -F 'identity_matches_current' "$header" >/dev/null
 grep -F 'FD_CLOEXEC' "$source" >/dev/null
 grep -F 'st_dev' "$source" >/dev/null

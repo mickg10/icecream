@@ -11,6 +11,10 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#if defined(__linux__)
+#  include <linux/memfd.h>
+#  include <sys/syscall.h>
+#endif
 #include <netinet/in.h>
 #include <unistd.h>
 #include <utility>
@@ -41,6 +45,8 @@ int move_high(int fd, int minimum = 30) {
     require(::close(fd) == 0, "could not close low descriptor");
     return result;
 }
+
+int make_sealed_source(int minimum);
 
 struct Inventory {
     int stat_read = -1;
@@ -73,13 +79,7 @@ Inventory make_inventory(bool with_source) {
     result.client_child = move_high(sockets[1]);
 
     if (with_source) {
-        char path[] = "/tmp/icecc-fork-fd-XXXXXX";
-        const int source = ::mkstemp(path);
-        require(source >= 0, "mkstemp failed");
-        require(::close(source) == 0, "could not close writable source");
-        const int readonly_source = ::open(path, O_RDONLY | O_CLOEXEC);
-        (void)::unlink(path);
-        result.source = move_high(readonly_source, 35);
+        result.source = make_sealed_source(35);
     }
     int unrelated_pipe[2] = {-1, -1};
     require(::pipe(unrelated_pipe) == 0, "unrelated pipe failed");
@@ -98,14 +98,28 @@ Inventory make_inventory(bool with_source) {
     return result;
 }
 
-int make_readonly_source(int minimum) {
-    char path[] = "/tmp/icecc-fork-fd-replacement-XXXXXX";
-    const int writable = ::mkstemp(path);
-    require(writable >= 0, "replacement mkstemp failed");
-    require(::close(writable) == 0, "replacement writable close failed");
-    const int readonly = ::open(path, O_RDONLY | O_CLOEXEC);
-    (void)::unlink(path);
+int make_sealed_source(int minimum) {
+#if defined(__linux__) && defined(MFD_ALLOW_SEALING) && defined(F_ADD_SEALS)
+    const int raw = static_cast<int>(::syscall(
+        SYS_memfd_create, "icecc-fork-fd", MFD_CLOEXEC | MFD_ALLOW_SEALING));
+    require(raw >= 0, "memfd_create failed");
+    const char byte = 'x';
+    require(::write(raw, &byte, 1) == 1, "sealed source write failed");
+    const int seals = F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL;
+    require(::fcntl(raw, F_ADD_SEALS, seals) == 0, "source sealing failed");
+    const std::string proc_path = "/proc/self/fd/" + std::to_string(raw);
+    const int readonly = ::open(proc_path.c_str(), O_RDONLY | O_CLOEXEC);
+    require(readonly >= 0, "could not reopen sealed source read-only");
+    require(::close(raw) == 0, "could not close sealed writable source");
     return move_high(readonly, minimum);
+#else
+    (void)minimum;
+    fail("sealed memfd is required for fork hygiene tests");
+#endif
+}
+
+int make_readonly_source(int minimum) {
+    return make_sealed_source(minimum);
 }
 
 size_t open_fd_count() {
@@ -280,15 +294,8 @@ void test_validation() {
     const int high_writable = move_high(writable, 47);
     auto writable_owner = icecc::p50::forkfd::test_make_delivery_owner(
         high_writable, kAcceptedDeliveryId);
-    require(writable_owner.has_value(), "writable owner token was not minted");
-    auto writable_lease = icecc::p50::forkfd::mint_fork_source_lease(
-        std::move(*writable_owner), high_writable, kAcceptedDeliveryId);
-    require(writable_lease.has_value(), "writable source lease was not minted");
-    KeepSet writable_source{inventory.stat_write, inventory.client_child,
-                            std::move(writable_lease), true, high_writable};
-    require(icecc::p50::forkfd::sweep(writable_source).failure ==
-                Failure::OwnershipFailure,
-            "writable source descriptor was accepted");
+    require(!writable_owner.has_value(),
+            "mutable unsealed regular source was accepted at mint");
     (void)::close(high_writable);
 }
 
@@ -370,6 +377,69 @@ void test_same_number_replacement_and_transfer() {
 #endif
 }
 
+void test_move_assignment_and_proof_reuse() {
+#if defined(__linux__)
+    Inventory inventory = make_inventory(true);
+    const int duplicate = ::fcntl(inventory.source, F_DUPFD_CLOEXEC, 55);
+    require(duplicate >= 0, "could not duplicate sealed handoff");
+
+    auto first_owner = icecc::p50::forkfd::test_make_delivery_owner(
+        inventory.source, kAcceptedDeliveryId);
+    auto second_owner = icecc::p50::forkfd::test_make_delivery_owner(
+        duplicate, kAcceptedDeliveryId);
+    require(first_owner.has_value() && second_owner.has_value(),
+            "same-open-file owner tokens were not minted");
+    auto first = icecc::p50::forkfd::mint_fork_source_lease(
+        std::move(*first_owner), inventory.source, kAcceptedDeliveryId);
+    auto second = icecc::p50::forkfd::mint_fork_source_lease(
+        std::move(*second_owner), duplicate, kAcceptedDeliveryId);
+    require(first.has_value() && second.has_value(),
+            "same-open-file leases were not minted");
+    *first = std::move(*second);
+    require(::fcntl(inventory.source, F_GETFD) >= 0,
+            "lease move-assignment closed the old borrowed handoff FD");
+    require(::fcntl(duplicate, F_GETFD) >= 0,
+            "lease move-assignment lost the incoming borrowed handoff FD");
+    first.reset();
+    require(::fcntl(inventory.source, F_GETFD) >= 0,
+            "lease destruction closed a caller-owned handoff FD");
+    require(::fcntl(duplicate, F_GETFD) >= 0,
+            "lease destruction closed the transferred handoff FD");
+    (void)::close(duplicate);
+
+    auto token = icecc::p50::forkfd::test_make_delivery_owner(
+        inventory.source, kAcceptedDeliveryId);
+    require(token.has_value(), "proof-reuse owner token was not minted");
+    const int proof = icecc::p50::forkfd::test_delivery_owner_proof_fd(*token);
+    require(proof >= 0, "owner proof descriptor was not exposed to test hook");
+    const int replacement = make_sealed_source(56);
+    require(::dup3(replacement, proof, O_CLOEXEC) == proof,
+            "owner proof descriptor reuse failed");
+    (void)::close(replacement);
+    token.reset();
+    require(::fcntl(proof, F_GETFD) >= 0,
+            "owner destructor closed an unrelated reused proof FD");
+    (void)::close(proof);
+
+    auto lease_owner = icecc::p50::forkfd::test_make_delivery_owner(
+        inventory.source, kAcceptedDeliveryId);
+    require(lease_owner.has_value(), "proof-reuse lease owner was not minted");
+    auto lease = icecc::p50::forkfd::mint_fork_source_lease(
+        std::move(*lease_owner), inventory.source, kAcceptedDeliveryId);
+    require(lease.has_value(), "proof-reuse lease was not minted");
+    const int lease_proof =
+        icecc::p50::forkfd::test_fork_source_lease_proof_fd(*lease);
+    const int lease_replacement = make_sealed_source(57);
+    require(::dup3(lease_replacement, lease_proof, O_CLOEXEC) == lease_proof,
+            "lease proof descriptor reuse failed");
+    (void)::close(lease_replacement);
+    lease.reset();
+    require(::fcntl(lease_proof, F_GETFD) >= 0,
+            "lease destructor closed an unrelated reused proof FD");
+    (void)::close(lease_proof);
+#endif
+}
+
 void test_fallback_and_injected_failures() {
     Inventory inventory = make_inventory(true);
     icecc::p50::forkfd::TestHooks unsupported;
@@ -424,6 +494,7 @@ int main() {
     test_exact_two_and_source_omission();
     test_validation();
     test_same_number_replacement_and_transfer();
+    test_move_assignment_and_proof_reuse();
     test_fallback_and_injected_failures();
     std::cout << "ok - exact first-fork descriptor hygiene\n";
     return 0;
