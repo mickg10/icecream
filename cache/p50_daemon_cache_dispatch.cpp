@@ -149,9 +149,12 @@ CacheDispatchOutcome CacheSessionDispatcher::dispatch(MsgChannel& channel,
         return CacheDispatchOutcome{CacheDispatchResult::SidecarUnavailable,
                                     local::FdHandoffStatus::Disconnected, request, false};
 
-    // The accepted socket may outlive a listener retirement.  Revalidate the
-    // immutable pathname lease immediately before relinquishing the ordinary
-    // descriptor so an old incarnation cannot receive a new TU.
+    // Authentication proves which process owns the connected peer, but the
+    // immutable READY lease also names the listener node that made this
+    // incarnation dispatchable. Revalidate that node after the potentially
+    // blocking connect/HELLO exchange and immediately before relinquishing
+    // the ordinary descriptor. A retired listener can keep an accepted
+    // connection alive after its pathname has already been replaced.
     if (!on_demand_->current_path_matches())
         return CacheDispatchOutcome{CacheDispatchResult::SidecarUnavailable,
                                     local::FdHandoffStatus::NotAuthenticated, request, false};

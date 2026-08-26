@@ -24,6 +24,7 @@ grep -F 'const auto deadline' "$impl" >/dev/null
 grep -F 'identity != identity_' "$impl" >/dev/null
 grep -F 'next_request_id_++' "$impl" >/dev/null
 grep -F 'disable();' "$impl" >/dev/null
+grep -Fx '    if (!on_demand_->current_path_matches())' "$impl" >/dev/null
 
 # The dispatcher owns only an immutable on-demand lease.  A cached control
 # relationship or the removed attach API would bypass fresh accept,
@@ -39,6 +40,7 @@ for needle in \
     'fresh accepted relationship' 'endpoint lease' 'path replacement' \
     'wrong endpoint path digest' 'wrong endpoint F_STORE_GUID' \
     'wrong endpoint listener device' 'wrong endpoint listener inode' \
+    'post-HELLO endpoint replacement' \
     'post-release peer disconnect' 'post-release handoff timeout' \
     'request_id == 1' 'request_id == 2'; do
     grep -F "$needle" "$test" >/dev/null
@@ -89,13 +91,27 @@ fi
 # A handshake bypass/deletion mutant must not satisfy the source gate.  The
 # runtime matrix separately proves the saturated non-reading peer timeout.
 mutant=$(mktemp "${TMPDIR:-/tmp}/p50daemoncachedispatch-hello-mutant.XXXXXX")
-trap 'rm -f "$mutant"' EXIT HUP INT TERM
+mutant_identity=$(mktemp "${TMPDIR:-/tmp}/p50daemoncachedispatch-identity-mutant.XXXXXX")
+trap 'rm -f "$mutant" "$mutant_identity"' EXIT HUP INT TERM
 sed 's/relationship\.send_until(/relationship.send(/' "$impl" >"$mutant"
 if bounded_hello_source "$mutant"; then
     echo 'FAIL: HELLO bounded-send deletion/bypass mutant was accepted' >&2
     exit 1
 fi
 echo 'ok - HELLO bounded-send deletion/bypass mutant is rejected'
+
+# Deleting the post-connect listener identity check must be observable. The
+# runtime row replaces the pathname after HELLO and before release; this source
+# witness prevents a build configuration from silently omitting that guard.
+post_connect_identity_guard() {
+    grep -Fx '    if (!on_demand_->current_path_matches())' "$1" >/dev/null
+}
+sed '/^    if (!on_demand_->current_path_matches())$/,+2d' "$impl" >"$mutant_identity"
+if post_connect_identity_guard "$mutant_identity"; then
+    echo 'FAIL: post-connect endpoint identity deletion mutant was accepted' >&2
+    exit 1
+fi
+echo 'ok - post-connect endpoint identity deletion mutant is rejected'
 
 # This lane must not silently acquire endpoint or cache-service ownership.  The
 # archive gate is intentionally independent of Git: exact source archives do

@@ -40,7 +40,10 @@ decoded, the daemon revalidates the current pathname, creates one fresh
 AF_UNIX connection, and performs a
 nonblocking connect, poll/SO_ERROR completion, exact PID+UID+GID
 `SO_PEERCRED`, HELLO, and HELLO_ACK before it calls
-`release_fd_if_input_empty()`.  Any failure in that prefix leaves the public
+`release_fd_if_input_empty()`. Immediately after HELLO_ACK and before release,
+the daemon revalidates the exact listener pathname, device, inode, mode,
+owner, and digest. Authentication of an already accepted connection is not
+authority to use a withdrawn or replaced READY lease. Any failure in that prefix leaves the public
 descriptor owned by `MsgChannel`; the temporary relationship is closed by
 RAII.  A daemon-owned nonzero request id then names the one-shot handoff.
 

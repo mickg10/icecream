@@ -150,10 +150,11 @@ bool receive_cache_operation(Connection& sidecar, Identity identity,
 
 std::thread serve_peer(EndpointFixture &fixture, Identity identity, uint64_t request_id,
                        Frame acknowledgement, PeerAction action, PeerResult &result,
-                       std::chrono::milliseconds acknowledgement_delay = {}) {
+                       std::chrono::milliseconds acknowledgement_delay = {},
+                       std::function<void()> before_ack = {}) {
     return std::thread([&fixture, identity, request_id,
                         acknowledgement = std::move(acknowledgement), action, &result,
-                        acknowledgement_delay]() mutable {
+                        acknowledgement_delay, before_ack = std::move(before_ack)]() mutable {
         Status accept_status = Status::InvalidArgument;
         Connection connection = icecc::p50::local::accept_unix(fixture.listener, &accept_status);
         result.accepted = connection.valid() && accept_status == Status::Ok;
@@ -170,6 +171,8 @@ std::thread serve_peer(EndpointFixture &fixture, Identity identity, uint64_t req
                                                   PeerRole::Daemon, identity) == Status::Ok;
         if (!result.hello)
             return;
+        if (before_ack)
+            before_ack();
         if (acknowledgement_delay.count() != 0)
             std::this_thread::sleep_for(acknowledgement_delay);
         result.ack_sent = connection.send(acknowledgement) == Status::Ok;
@@ -401,6 +404,51 @@ int main() {
         CHECK(outcome.result == CacheDispatchResult::SidecarUnavailable && !outcome.detached,
               "stale or wrong ACK is rejected before release");
         CHECK(ordinary.right->fd == owned, "wrong ACK retains ordinary descriptor ownership");
+    }
+
+    // A peer can remain authenticated on an already accepted connection
+    // while its listener pathname is withdrawn and replaced. The second
+    // lease identity check must happen after HELLO_ACK and before ordinary-fd
+    // release, and it must never remove the replacement node.
+    {
+        EndpointFixture fixture({14, 9});
+        CacheSessionDispatcher dispatcher = make_dispatcher(fixture);
+        MsgPair ordinary = ordinary_pair();
+        PeerResult peer;
+        int replacement = -1;
+        Status replacement_status = Status::InvalidArgument;
+        std::thread server = serve_peer(
+            fixture, fixture.identity, 1,
+            icecc::p50::local::make_hello_ack(PeerRole::Sidecar, fixture.identity),
+            PeerAction::CloseAfterAck, peer, {}, [&] {
+                if (fixture.listener >= 0) {
+                    (void)::close(fixture.listener);
+                    fixture.listener = -1;
+                }
+                (void)::unlink(fixture.path.c_str());
+                replacement = icecc::p50::local::listen_unix(
+                    fixture.path, 4, &replacement_status);
+            });
+        send_cache_session(ordinary.left);
+        Msg *decoded = ordinary.right->get_msg(2, true);
+        const int owned = ordinary.right->fd;
+        const auto outcome = dispatcher.dispatch(*ordinary.right, 50,
+                                                  static_cast<uint32_t>(*decoded));
+        delete decoded;
+        server.join();
+        CHECK(peer.hello && peer.ack_sent && replacement >= 0 &&
+                  replacement_status == Status::Ok,
+              "post-HELLO endpoint replacement races before release");
+        CHECK(outcome.result == CacheDispatchResult::SidecarUnavailable &&
+                  !outcome.detached && ordinary.right->fd == owned,
+              "post-HELLO endpoint replacement retains ordinary fd");
+        struct stat replacement_info{};
+        CHECK(::lstat(fixture.path.c_str(), &replacement_info) == 0 &&
+                  S_ISSOCK(replacement_info.st_mode),
+              "post-HELLO endpoint replacement remains preserved");
+        if (replacement >= 0)
+            (void)::close(replacement);
+        (void)::unlink(fixture.path.c_str());
     }
 
     // Exact path replacement, digest, GUID, device, and inode mismatches are
