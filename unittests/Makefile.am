@@ -33,6 +33,8 @@ TESTS += p50profile p50profile-source.sh p50_profile_sanitize.sh
 TESTS += p50roleowner p50tworole-source.sh
 TESTS += p50sessionjoin p50cachesessionjoin-source.sh \
 	p50cachesessionjoin-mutants.sh p50cachesessionjoin-sanitize.sh
+TESTS += p50cachesessionwire p50cachesessionwire-source.sh \
+	p50cachesessionwire-mutants.sh p50cachesessionwire-sanitize.sh
 
 AM_TESTS_ENVIRONMENT = \
 	ICECC_TEST_BUILDDIR='$(abs_builddir)'; export ICECC_TEST_BUILDDIR; \
@@ -104,6 +106,10 @@ p50sessionjoin_CPPFLAGS = $(AM_CPPFLAGS)
 p50sessionjoin_LDADD = ../cache/libp50sessionjoin.a \
 	../cache/libprotocol50.a ../services/libicecc.la \
 	$(LIBZSTD_LIBS) $(XXHASH_LIBS)
+p50cachesessionwire_SOURCES = p50_cache_session_wire_test.cpp
+p50cachesessionwire_CXXFLAGS = -pthread
+p50cachesessionwire_LDFLAGS = -pthread
+p50cachesessionwire_LDADD = ../services/libicecc.la
 p50readyadvertisement_LDADD = ../cache/libp50readyadvertisement.a
 digest128bench_LDADD = ../services/libicecc.la
 
@@ -127,6 +133,7 @@ check_PROGRAMS += p50reversefdretry
 check_PROGRAMS += p50s2restartreplay
 check_PROGRAMS += p50roleowner
 check_PROGRAMS += p50sessionjoin
+check_PROGRAMS += p50cachesessionwire
 p50wire_SOURCES = p50_wire_test.cpp
 p50sourceingress_SOURCES = p50_source_ingress_test.cpp
 p50sourceingress_CXXFLAGS = -pthread
@@ -382,6 +389,8 @@ EXTRA_DIST += p50tworole-source.sh
 EXTRA_DIST += p50daemontaskcount-source.sh
 EXTRA_DIST += p50cachesessionjoin-source.sh p50cachesessionjoin-mutants.sh \
 	p50cachesessionjoin-sanitize.sh
+EXTRA_DIST += p50cachesessionwire-source.sh p50cachesessionwire-mutants.sh \
+	p50cachesessionwire-sanitize.sh
 
 # Make the tests also print the test log if they fail.
 check: export VERBOSE=1

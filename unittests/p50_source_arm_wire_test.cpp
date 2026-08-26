@@ -129,11 +129,16 @@ P50SourceArmedMsg armed(const P50SourceArmFields &source_arm)
         f_guid[i] = static_cast<uint8_t>(0xd0 + i);
     f_guid[icecc::p50::kStoreIdentityRoleByte] |=
         icecc::p50::kStoreIdentityFileRole;
+    ClaimAttemptCapability128 capability_1;
+    ClaimAttemptCapability128 capability_2;
+    capability_1.bytes.fill(0xb1);
+    capability_2.bytes.fill(0xb2);
     return P50SourceArmedMsg(source_arm, UINT64_C(0x8182838485868788),
                              UINT64_C(0x9192939495969798),
                              UINT64_C(0x999a9b9c9d9e9fa0), f_guid,
                              icecc::p50::kStoreIdentityDerivationVersion,
-                             UINT64_C(0xa1a2a3a4a5a6a7a8), 2500);
+                             UINT64_C(0xa1a2a3a4a5a6a7a8), 2500,
+                             capability_1, capability_2);
 }
 
 Bytes encode_frame(const Msg &message, int protocol = PROTOCOL_VERSION)
@@ -202,7 +207,7 @@ void test_roundtrip_and_exact_echo()
     const P50SourceArmedMsg reply = armed(request.arm);
     const Bytes reply_wire = encode_frame(reply);
     REQUIRE(reply_wire == hex_fixture(
-                "000000c350f000110000000701020304050607081112131415161718"
+                "000000e350f000110000000701020304050607081112131415161718"
                 "0000000f776f726b65722e6578616d706c650000002805000028060000"
                 "003200000002000000000000001321222324252627283132333435363738"
                 "0000000000000001404142434445464748494a4b4c4d4e4f515253545556"
@@ -210,7 +215,9 @@ void test_roundtrip_and_exact_echo()
                 "616263646566676871727374757677788182838485868788919293949596"
                 "9798999a9b9c9d9e9fa0d0d1d2d3d4d5d6d7d8d9dadbdcdddedf"
                 "0000000000000001"
-                "a1a2a3a4a5a6a7a8000009c4"),
+                "a1a2a3a4a5a6a7a8000009c4"
+                "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1"
+                "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"),
             "armed ACK matches the canonical full-ACK Protocol-50 fixture");
     Msg *reply_base = decode_frame(reply_wire);
     auto *decoded_reply = dynamic_cast<P50SourceArmedMsg *>(reply_base);
@@ -283,7 +290,7 @@ void test_rejects_malformed_and_legacy()
     put_u32(ack_truncated, 0, ack_truncated_body - 1);
     Msg *ack_truncated_decoded = decode_frame(ack_truncated);
     REQUIRE(ack_truncated_decoded == nullptr,
-            "armed ACK decoder rejects a truncated bounded-budget tail");
+            "armed ACK decoder rejects a truncated capability tail");
     delete ack_truncated_decoded;
 
     Bytes unterminated = encode_frame(request);
@@ -316,6 +323,15 @@ void test_rejects_malformed_and_legacy()
     no_observation.arm_observation_id = 0;
     REQUIRE(!make_pair(PROTOCOL_VERSION).left->send_msg(no_observation),
             "zero arm observation is refused before framing");
+    P50SourceArmedMsg zero_capability = armed(request.arm);
+    zero_capability.attempt_capability_1 = {};
+    REQUIRE(!make_pair(PROTOCOL_VERSION).left->send_msg(zero_capability),
+            "zero attempt capability is refused before framing");
+    P50SourceArmedMsg equal_capabilities = armed(request.arm);
+    equal_capabilities.attempt_capability_2 =
+        equal_capabilities.attempt_capability_1;
+    REQUIRE(!make_pair(PROTOCOL_VERSION).left->send_msg(equal_capabilities),
+            "equal attempt capabilities are refused before framing");
     P50SourceArmedMsg no_store_generation = armed(request.arm);
     no_store_generation.f_store_generation = 0;
     REQUIRE(!make_pair(PROTOCOL_VERSION).left->send_msg(no_store_generation),
@@ -385,6 +401,14 @@ void test_ack_conflict()
     wrong.source_budget_msec = P50SourceArmedFields::MaxSourceBudgetMsec + 1;
     REQUIRE(!wrong.acknowledges(request),
             "source budget above the hard maximum is rejected");
+    wrong = armed(request.arm);
+    wrong.attempt_capability_1 = {};
+    REQUIRE(!wrong.acknowledges(request),
+            "zero attempt capability cannot authorize the arm");
+    wrong = armed(request.arm);
+    wrong.attempt_capability_2 = wrong.attempt_capability_1;
+    REQUIRE(!wrong.acknowledges(request),
+            "equal attempt capabilities cannot authorize the arm");
 
     wrong = armed(request.arm);
     wrong.f_control_generation = 0;

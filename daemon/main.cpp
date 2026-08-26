@@ -828,6 +828,14 @@ public:
             return false;
         }
 
+        ClaimAttemptCapability128 attempt_capability_1;
+        ClaimAttemptCapability128 attempt_capability_2;
+        if (!fresh_claim_attempt_capabilities(attempt_capability_1,
+                                              attempt_capability_2)) {
+            p50_input_wait.close();
+            return false;
+        }
+
         // Install the exact owner and move to WAIT before emitting ACK.  A
         // peer that observes the ACK can therefore never race an unowned
         // attachment or a missing deadline.
@@ -849,7 +857,8 @@ public:
             fields, lease.identity.generation, lease.identity.attempt,
             p50_source_f_store_generation, lease.f_store_guid.bytes,
             lease.store_derivation_version, observation,
-            static_cast<uint32_t>(remaining));
+            static_cast<uint32_t>(remaining), attempt_capability_1,
+            attempt_capability_2);
         p50_source_armed_ack = acknowledgement;
         if (!channel || !channel->send_msg(acknowledgement)) {
             p50_input_wait.close();

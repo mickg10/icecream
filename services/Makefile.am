@@ -1,6 +1,6 @@
 lib_LTLIBRARIES = libicecc.la
 AM_CPPFLAGS = $(XXHASH_CFLAGS)
-libicecc_la_SOURCES = job.cpp comm.cpp exitcode.cpp getifaddrs.cpp logging.cpp ncpus.c pipes.cpp tempfile.c platform.cpp gcc.cpp util.cpp digest128.cpp
+libicecc_la_SOURCES = job.cpp comm.cpp p50_cache_session_wire.cpp exitcode.cpp getifaddrs.cpp logging.cpp ncpus.c pipes.cpp tempfile.c platform.cpp gcc.cpp util.cpp digest128.cpp
 libicecc_la_LIBADD = \
 	$(LZO_LDADD) \
 	$(LIBZSTD_LIBS) \
@@ -19,6 +19,7 @@ ice_HEADERS = \
 	logging.h
 
 noinst_HEADERS = \
+	p50_cache_session_wire.h \
 	exitcode.h \
 	getifaddrs.h \
 	logging.h \

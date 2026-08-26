@@ -1,267 +1,35 @@
 #include "p50_cache_session_join.h"
 
 #include <algorithm>
-#include <array>
-#include <atomic>
-#include <limits>
 #include <stdexcept>
 #include <type_traits>
 
 namespace icecc::p50::daemon {
 namespace {
 
-constexpr std::array<uint8_t, 4> kMagic{'P', '5', 'C', 'J'};
-constexpr size_t kHeaderBytes = 12;
-std::atomic<uint64_t> g_next_attempt_authority_nonce{1};
-
-void put_u8(std::vector<uint8_t> &out, uint8_t value) { out.push_back(value); }
-
-void put_u16(std::vector<uint8_t> &out, uint16_t value) {
-  out.push_back(static_cast<uint8_t>(value >> 8));
-  out.push_back(static_cast<uint8_t>(value));
-}
-
-void put_u32(std::vector<uint8_t> &out, uint32_t value) {
-  out.push_back(static_cast<uint8_t>(value >> 24));
-  out.push_back(static_cast<uint8_t>(value >> 16));
-  out.push_back(static_cast<uint8_t>(value >> 8));
-  out.push_back(static_cast<uint8_t>(value));
-}
-
-void put_u64(std::vector<uint8_t> &out, uint64_t value) {
-  for (int shift = 56; shift >= 0; shift -= 8)
-    out.push_back(static_cast<uint8_t>(value >> shift));
-}
-
-void put_bytes(std::vector<uint8_t> &out, std::span<const uint8_t> bytes) {
-  out.insert(out.end(), bytes.begin(), bytes.end());
-}
-
-void put_string32_nul(std::vector<uint8_t> &out, const std::string &value) {
-  put_u32(out, static_cast<uint32_t>(value.size() + 1));
-  put_bytes(out, std::span<const uint8_t>(
-                     reinterpret_cast<const uint8_t *>(value.data()),
-                     value.size()));
-  put_u8(out, 0);
-}
-
-class Reader {
-public:
-  explicit Reader(std::span<const uint8_t> bytes) : bytes_(bytes) {}
-
-  bool take_u8(uint8_t &value) {
-    if (remaining() < 1)
-      return false;
-    value = bytes_[offset_++];
-    return true;
-  }
-
-  bool take_u16(uint16_t &value) {
-    if (remaining() < 2)
-      return false;
-    value = static_cast<uint16_t>(bytes_[offset_]) << 8 |
-            static_cast<uint16_t>(bytes_[offset_ + 1]);
-    offset_ += 2;
-    return true;
-  }
-
-  bool take_u32(uint32_t &value) {
-    if (remaining() < 4)
-      return false;
-    value = static_cast<uint32_t>(bytes_[offset_]) << 24 |
-            static_cast<uint32_t>(bytes_[offset_ + 1]) << 16 |
-            static_cast<uint32_t>(bytes_[offset_ + 2]) << 8 |
-            static_cast<uint32_t>(bytes_[offset_ + 3]);
-    offset_ += 4;
-    return true;
-  }
-
-  bool take_u64(uint64_t &value) {
-    if (remaining() < 8)
-      return false;
-    value = 0;
-    for (unsigned i = 0; i != 8; ++i)
-      value = (value << 8) | bytes_[offset_ + i];
-    offset_ += 8;
-    return true;
-  }
-
-  template <typename T> bool take_id(T &value) {
-    if (remaining() < value.bytes.size())
-      return false;
-    std::copy_n(bytes_.begin() + static_cast<ptrdiff_t>(offset_),
-                value.bytes.size(), value.bytes.begin());
-    offset_ += value.bytes.size();
-    return true;
-  }
-
-  bool take_array(std::array<uint8_t, 16> &value) {
-    if (remaining() < value.size())
-      return false;
-    std::copy_n(bytes_.begin() + static_cast<ptrdiff_t>(offset_),
-                value.size(), value.begin());
-    offset_ += value.size();
-    return true;
-  }
-
-  bool take_string32_nul(std::string &value) {
-    uint32_t wire_size = 0;
-    if (!take_u32(wire_size) || wire_size == 0 || wire_size > 256 ||
-        remaining() < wire_size || bytes_[offset_ + wire_size - 1] != 0)
-      return false;
-    const auto begin = bytes_.begin() + static_cast<ptrdiff_t>(offset_);
-    const auto terminator = begin + static_cast<ptrdiff_t>(wire_size - 1);
-    if (std::find(begin, terminator, uint8_t{0}) != terminator)
-      return false;
-    try {
-      value.assign(reinterpret_cast<const char *>(&*begin), wire_size - 1);
-    } catch (...) {
-      return false;
-    }
-    offset_ += wire_size;
-    return true;
-  }
-
-  bool take_zeroes(size_t count) {
-    if (remaining() < count)
-      return false;
-    for (size_t i = 0; i != count; ++i) {
-      if (bytes_[offset_ + i] != 0)
-        return false;
-    }
-    offset_ += count;
-    return true;
-  }
-
-  bool skip(size_t count) {
-    if (count > remaining())
-      return false;
-    offset_ += count;
-    return true;
-  }
-
-  [[nodiscard]] size_t remaining() const noexcept {
-    return bytes_.size() - offset_;
-  }
-
-private:
-  std::span<const uint8_t> bytes_;
-  size_t offset_ = 0;
-};
-
 bool role_guid(Id128 guid, uint8_t expected_role) noexcept {
   return store_identity_guid_valid_for_role(guid.bytes, expected_role);
 }
 
-void put_launch(std::vector<uint8_t> &out, local::Identity identity) {
-  put_u64(out, identity.generation);
-  put_u64(out, identity.attempt);
+bool same_identity(P50WireLaunchIdentity wire,
+                   local::Identity local) noexcept {
+  return wire.generation == local.generation && wire.attempt == local.attempt;
 }
 
-bool take_launch(Reader &reader, local::Identity &identity) {
-  return reader.take_u64(identity.generation) &&
-         reader.take_u64(identity.attempt);
-}
-
-void put_arm(std::vector<uint8_t> &out, const P50SourceArmFields &arm) {
-  put_u32(out, arm.wire_job_id);
-  put_u64(out, arm.assignment_epoch);
-  put_u64(out, arm.assignment_nonce);
-  put_string32_nul(out, arm.selected_f_host);
-  put_u32(out, arm.selected_f_ordinary_port);
-  put_u32(out, arm.selected_f_cache_port);
-  put_u32(out, arm.cache_protocol);
-  put_u32(out, arm.cache_profile);
-  put_u64(out, arm.logical_job);
-  put_u64(out, arm.compiler_attempt);
-  put_u64(out, arm.c_store_generation);
-  put_u64(out, arm.c_store_derivation_version);
-  put_bytes(out, arm.c_store_guid);
-  put_u64(out, arm.source_request_id);
-  put_u32(out, arm.source_mode);
-  put_u64(out, arm.c_control_generation);
-  put_u64(out, arm.c_control_attempt);
-}
-
-bool take_arm(Reader &reader, P50SourceArmFields &arm) {
-  return reader.take_u32(arm.wire_job_id) &&
-         reader.take_u64(arm.assignment_epoch) &&
-         reader.take_u64(arm.assignment_nonce) &&
-         reader.take_string32_nul(arm.selected_f_host) &&
-         reader.take_u32(arm.selected_f_ordinary_port) &&
-         reader.take_u32(arm.selected_f_cache_port) &&
-         reader.take_u32(arm.cache_protocol) &&
-         reader.take_u32(arm.cache_profile) &&
-         reader.take_u64(arm.logical_job) &&
-         reader.take_u64(arm.compiler_attempt) &&
-         reader.take_u64(arm.c_store_generation) &&
-         reader.take_u64(arm.c_store_derivation_version) &&
-         reader.take_array(arm.c_store_guid) &&
-         reader.take_u64(arm.source_request_id) &&
-         reader.take_u32(arm.source_mode) &&
-         reader.take_u64(arm.c_control_generation) &&
-         reader.take_u64(arm.c_control_attempt);
-}
-
-void put_armed(std::vector<uint8_t> &out,
-               const P50SourceArmedFields &armed) {
-  put_arm(out, armed.arm);
-  put_u64(out, armed.f_control_generation);
-  put_u64(out, armed.f_control_attempt);
-  put_u64(out, armed.f_store_generation);
-  put_bytes(out, armed.f_store_guid);
-  put_u64(out, armed.f_store_derivation_version);
-  put_u64(out, armed.arm_observation_id);
-  put_u32(out, armed.source_budget_msec);
-  put_u32(out, 0);
-}
-
-bool take_armed(Reader &reader, P50SourceArmedFields &armed) {
-  return take_arm(reader, armed.arm) &&
-         reader.take_u64(armed.f_control_generation) &&
-         reader.take_u64(armed.f_control_attempt) &&
-         reader.take_u64(armed.f_store_generation) &&
-         reader.take_array(armed.f_store_guid) &&
-         reader.take_u64(armed.f_store_derivation_version) &&
-         reader.take_u64(armed.arm_observation_id) &&
-         reader.take_u32(armed.source_budget_msec) &&
-         reader.take_zeroes(4);
-}
-
-std::vector<uint8_t> finish_wire(std::vector<uint8_t> body) {
-  if (body.size() > std::numeric_limits<uint32_t>::max() ||
-      body.size() > kP50CacheSessionClaimMaxWireBytes - kHeaderBytes)
-    return {};
-  std::vector<uint8_t> wire;
-  wire.reserve(kHeaderBytes + body.size());
-  wire.insert(wire.end(), kMagic.begin(), kMagic.end());
-  put_u16(wire, kP50CacheSessionClaimWireVersion);
-  put_u16(wire, 0);
-  put_u32(wire, static_cast<uint32_t>(body.size()));
-  wire.insert(wire.end(), body.begin(), body.end());
-  return wire;
-}
-
-bool start_wire(Reader &reader, std::span<const uint8_t> wire,
-                uint32_t &body_size) {
-  if (wire.size() < kHeaderBytes ||
-      !std::equal(kMagic.begin(), kMagic.end(), wire.begin()) ||
-      !reader.skip(kMagic.size()))
-    return false;
-  uint16_t version = 0;
-  uint16_t reserved = 0;
-  return reader.take_u16(version) && reader.take_u16(reserved) &&
-         reader.take_u32(body_size) &&
-         version == kP50CacheSessionClaimWireVersion && reserved == 0 &&
-         body_size == wire.size() - kHeaderBytes &&
-         wire.size() <= kP50CacheSessionClaimMaxWireBytes;
+ClaimAttemptCapability128 temporary_attempt_capability(
+    uint64_t observation, uint64_t sequence) noexcept {
+  ClaimAttemptCapability128 capability;
+  for (unsigned index = 0; index != 8; ++index) {
+    const unsigned shift = 56 - 8 * index;
+    capability.bytes[index] =
+        static_cast<uint8_t>(observation >> shift);
+    capability.bytes[index + 8] =
+        static_cast<uint8_t>(sequence >> shift);
+  }
+  return capability;
 }
 
 } // namespace
-
-bool P50CacheSessionArmBinding::valid() const noexcept {
-  return semantic_valid();
-}
 
 std::optional<P50CacheSessionArmBinding>
 cache_session_binding_from_armed(const P50SourceArmedMsg &message) noexcept {
@@ -269,20 +37,21 @@ cache_session_binding_from_armed(const P50SourceArmedMsg &message) noexcept {
     return std::nullopt;
   try {
     P50CacheSessionArmBinding binding;
-    static_cast<P50SourceArmedFields &>(binding) =
-        static_cast<const P50SourceArmedFields &>(message);
+    binding.arm = message.arm;
+    binding.f_control_generation = message.f_control_generation;
+    binding.f_control_attempt = message.f_control_attempt;
+    binding.f_store_generation = message.f_store_generation;
+    binding.f_store_guid = message.f_store_guid;
+    binding.f_store_derivation_version =
+        message.f_store_derivation_version;
+    binding.arm_observation_id = message.arm_observation_id;
+    binding.source_budget_msec = message.source_budget_msec;
     if (!binding.valid())
       return std::nullopt;
     return binding;
   } catch (...) {
     return std::nullopt;
   }
-}
-
-bool P50CacheSessionWireClaim::valid() const noexcept {
-  return binding.valid() && attempt.valid() &&
-         attempt.c_control_launch == binding.c_control_identity() &&
-         attempt.arm_observation_id == binding.arm_observation_id;
 }
 
 bool P50CurrentFIncarnation::valid() const noexcept {
@@ -293,81 +62,41 @@ bool P50CurrentFIncarnation::valid() const noexcept {
          role_guid(store_guid, kStoreIdentityFileRole);
 }
 
-std::vector<uint8_t>
-encode_cache_session_wire_claim(const P50CacheSessionWireClaim &claim) {
-  if (!claim.valid())
-    return {};
-  try {
-    std::vector<uint8_t> body;
-    body.reserve(256 + claim.binding.arm.selected_f_host.size());
-    put_armed(body, claim.binding);
-    put_launch(body, claim.attempt.c_control_launch);
-    put_u64(body, claim.attempt.arm_observation_id);
-    put_u8(body, claim.attempt.ordinal);
-    for (unsigned i = 0; i != 7; ++i)
-      put_u8(body, 0);
-    put_u64(body, claim.attempt.capability);
-    put_u64(body, claim.attempt.authority_nonce);
-    return finish_wire(std::move(body));
-  } catch (...) {
-    return {};
-  }
-}
-
-std::optional<P50CacheSessionWireClaim>
-decode_cache_session_wire_claim(std::span<const uint8_t> wire) {
-  Reader reader(wire);
-  uint32_t body_size = 0;
-  if (!start_wire(reader, wire, body_size) || body_size == 0)
-    return std::nullopt;
-  try {
-    P50CacheSessionWireClaim claim;
-    if (!take_armed(reader, claim.binding) ||
-        !take_launch(reader, claim.attempt.c_control_launch) ||
-        !reader.take_u64(claim.attempt.arm_observation_id) ||
-        !reader.take_u8(claim.attempt.ordinal) ||
-        !reader.take_zeroes(7) ||
-        !reader.take_u64(claim.attempt.capability) ||
-        !reader.take_u64(claim.attempt.authority_nonce) ||
-        reader.remaining() != 0 || !claim.valid())
-      return std::nullopt;
-    return claim;
-  } catch (...) {
-    return std::nullopt;
-  }
-}
-
 P50CacheSessionAttemptAuthority::P50CacheSessionAttemptAuthority(
     size_t max_scopes)
     : max_scopes_(max_scopes) {
   if (max_scopes_ == 0)
     throw std::invalid_argument("P50 attempt authority scope limit is zero");
-  authority_nonce_ =
-      g_next_attempt_authority_nonce.fetch_add(1, std::memory_order_relaxed);
-  if (authority_nonce_ == 0)
-    authority_nonce_ =
-        g_next_attempt_authority_nonce.fetch_add(1, std::memory_order_relaxed);
-  if (authority_nonce_ == 0)
-    throw std::invalid_argument("P50 attempt authority nonce exhausted");
   scopes_.reserve(max_scopes_);
 }
 
 std::optional<P50CacheSessionAttemptProof>
-P50CacheSessionAttemptAuthority::burn(local::Identity c_control_launch,
-                                      uint64_t arm_observation_id) noexcept {
-  if (c_control_launch.generation == 0 || c_control_launch.attempt == 0 ||
-      arm_observation_id == 0 || next_capability_ == 0)
+P50CacheSessionAttemptAuthority::burn(
+    const P50CacheSessionArmBinding &binding) noexcept {
+  if (!binding.valid())
     return std::nullopt;
+  const P50WireLaunchIdentity c_control_launch =
+      binding.c_control_identity();
+  const uint64_t arm_observation_id = binding.arm_observation_id;
   auto it = std::find_if(scopes_.begin(), scopes_.end(),
                          [&](const Scope &scope) {
                            return scope.c_control_launch == c_control_launch &&
                                   scope.arm_observation_id == arm_observation_id;
                          });
   if (it == scopes_.end()) {
-    if (scopes_.size() >= max_scopes_)
+    if (scopes_.size() >= max_scopes_ ||
+        next_capability_ == 0 || next_capability_ == UINT64_MAX)
       return std::nullopt;
+    const ClaimAttemptCapability128 capability_1 =
+        temporary_attempt_capability(arm_observation_id,
+                                     next_capability_++);
+    const ClaimAttemptCapability128 capability_2 =
+        temporary_attempt_capability(arm_observation_id,
+                                     next_capability_++);
     try {
-      scopes_.push_back(Scope{c_control_launch, arm_observation_id});
+      scopes_.push_back(Scope{
+          c_control_launch, arm_observation_id,
+          {capability_1, capability_2}});
     } catch (...) {
       return std::nullopt;
     }
@@ -375,34 +104,28 @@ P50CacheSessionAttemptAuthority::burn(local::Identity c_control_launch,
   }
   if (it->burned >= it->capabilities.size())
     return std::nullopt;
-  const uint64_t capability = next_capability_++;
-  if (capability == 0)
-    return std::nullopt;
   const uint8_t ordinal = static_cast<uint8_t>(it->burned + 1);
-  it->capabilities[it->burned++] = capability;
-  return P50CacheSessionAttemptProof{c_control_launch, arm_observation_id,
-                                     ordinal, capability, authority_nonce_};
+  const ClaimAttemptCapability128 capability =
+      it->capabilities[it->burned++];
+  return P50CacheSessionAttemptProof{ordinal, capability};
 }
 
 bool P50CacheSessionAttemptAuthority::consume(
     const P50CacheSessionAttemptProof &proof,
     const P50CacheSessionArmBinding &binding) noexcept {
-  if (!proof.valid() || !binding.valid() ||
-      proof.authority_nonce != authority_nonce_ ||
-      proof.c_control_launch != binding.c_control_identity() ||
-      proof.arm_observation_id != binding.arm_observation_id)
+  if (!proof.valid() || !binding.valid())
     return false;
   auto it = std::find_if(scopes_.begin(), scopes_.end(),
                          [&](const Scope &scope) {
                            return scope.c_control_launch ==
-                                      proof.c_control_launch &&
+                                      binding.c_control_identity() &&
                                   scope.arm_observation_id ==
-                                      proof.arm_observation_id;
+                                      binding.arm_observation_id;
                          });
   if (it == scopes_.end() || proof.ordinal > it->burned)
     return false;
   const size_t index = proof.ordinal - 1;
-  if (it->capabilities[index] != proof.capability ||
+  if (it->capabilities[index] != proof.selected_capability ||
       (it->consumed & static_cast<uint8_t>(1u << index)) != 0)
     return false;
   it->consumed = static_cast<uint8_t>(
@@ -427,7 +150,8 @@ bool P50CacheSessionOwnerAuthorityAdapter::current(
     return false;
   P50CurrentFIncarnation published_ready{};
   if (!ready_provider_(published_ready) || published_ready != current_f ||
-      binding.f_control_identity() != current_f.control_launch ||
+      !same_identity(binding.f_control_identity(),
+                     current_f.control_launch) ||
       binding.f_store_guid != current_f.store_guid.bytes ||
       binding.f_store_generation != current_f.store_generation ||
       binding.f_store_derivation_version !=
@@ -508,7 +232,8 @@ void P50CacheSessionJoinTable::reclaim_expired_pre_detach(
 bool P50CacheSessionJoinTable::current_binding(
     const P50CacheSessionArmBinding &binding) const noexcept {
   return binding.valid() &&
-         binding.f_control_identity() == current_f_.control_launch &&
+         same_identity(binding.f_control_identity(),
+                       current_f_.control_launch) &&
          binding.f_store_guid == current_f_.store_guid.bytes &&
          binding.f_store_generation == current_f_.store_generation &&
          binding.f_store_derivation_version ==
@@ -568,7 +293,8 @@ P50CacheSessionJoinTable::Row *P50CacheSessionJoinTable::exact_claim(
   if (!claim.valid())
     return nullptr;
   auto *row = exact_row(claim.binding, owner);
-  return row != nullptr && row->active_attempt == claim.attempt.capability
+  return row != nullptr &&
+                 row->active_attempt == claim.attempt.selected_capability
              ? row
              : nullptr;
 }
@@ -579,7 +305,8 @@ const P50CacheSessionJoinTable::Row *P50CacheSessionJoinTable::exact_claim(
   if (!claim.valid())
     return nullptr;
   const auto *row = exact_row(claim.binding, owner);
-  return row != nullptr && row->active_attempt == claim.attempt.capability
+  return row != nullptr &&
+                 row->active_attempt == claim.attempt.selected_capability
              ? row
              : nullptr;
 }
@@ -695,7 +422,7 @@ P50CacheSessionJoinTable::reserve_claim(const P50CacheSessionWireClaim &claim,
     return P50CacheSessionJoinDecision::ReconcileRequired;
   }
   for (size_t i = 0; i != row->attempt_count; ++i) {
-    if (row->attempts[i] == claim.attempt.capability)
+    if (row->attempts[i] == claim.attempt.selected_capability)
       return P50CacheSessionJoinDecision::DuplicateAttempt;
   }
   if (row->state != P50CacheSessionJoinState::Armed)
@@ -705,8 +432,9 @@ P50CacheSessionJoinTable::reserve_claim(const P50CacheSessionWireClaim &claim,
   if (attempt_authority_ == nullptr ||
       !attempt_authority_->consume(claim.attempt, claim.binding))
     return P50CacheSessionJoinDecision::Invalid;
-  row->attempts[row->attempt_count++] = claim.attempt.capability;
-  row->active_attempt = claim.attempt.capability;
+  row->attempts[row->attempt_count++] =
+      claim.attempt.selected_capability;
+  row->active_attempt = claim.attempt.selected_capability;
   row->state = P50CacheSessionJoinState::AttemptReserved;
   return P50CacheSessionJoinDecision::Reserved;
 }
@@ -732,7 +460,7 @@ P50CacheSessionJoinTable::release_pre_detach_for_retry(
     erase_row(row);
     return P50CacheSessionJoinDecision::RetryExhausted;
   }
-  row->active_attempt = 0;
+  row->active_attempt = {};
   row->state = P50CacheSessionJoinState::Armed;
   return P50CacheSessionJoinDecision::RetryAllowed;
 }

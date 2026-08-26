@@ -40,9 +40,11 @@
 #include <compare>
 #include <deque>
 #include <optional>
+#include <span>
 #include <stdint.h>
 #include <string>
 #include <utility>
+#include <vector>
 
 // if you increase the PROTOCOL_VERSION, add a macro below and use that
 #define PROTOCOL_VERSION 50
@@ -78,6 +80,7 @@
 #define IS_PROTOCOL_VERSION(x, c) ((c)->protocol >= (x))
 
 class MsgChannel;
+class P50CacheSessionOutcomeMsg;
 
 // Terms used:
 // S  = scheduler
@@ -184,7 +187,15 @@ public:
         // they are distinct from the empty CACHE_SESSION discriminator and
         // carry all assignment/source/control-launch authority explicitly.
         P50_SOURCE_ARM = 0x50f00010,
-        P50_SOURCE_ARMED = 0x50f00011
+        P50_SOURCE_ARMED = 0x50f00011,
+
+        // Positive cache transition.  The claim payload is exactly one
+        // canonical bounded P5CL value; the outcome payload is exactly one
+        // canonical bounded P5CO value.  The old empty CACHE_SESSION value
+        // above remains a negative/mechanism fixture and never authorizes
+        // this transition.
+        P50_CACHE_SESSION_CLAIM = 0x50f00012,
+        P50_CACHE_SESSION_OUTCOME = 0x50f00013
     };
 
     Msg() = default;
@@ -292,6 +303,10 @@ public:
                 return "P50_SOURCE_ARM";
             case P50_SOURCE_ARMED:
                 return "P50_SOURCE_ARMED";
+            case P50_CACHE_SESSION_CLAIM:
+                return "P50_CACHE_SESSION_CLAIM";
+            case P50_CACHE_SESSION_OUTCOME:
+                return "P50_CACHE_SESSION_OUTCOME";
         }
         return "UNKNOWN";
     }
@@ -302,6 +317,209 @@ public:
 
 protected:
     Value value_;
+};
+
+namespace p50_private_message_registry {
+inline constexpr std::array<uint32_t, 6> values{
+    Msg::CACHE_SESSION, Msg::RESULT_DISPOSITION, Msg::P50_SOURCE_ARM,
+    Msg::P50_SOURCE_ARMED, Msg::P50_CACHE_SESSION_CLAIM,
+    Msg::P50_CACHE_SESSION_OUTCOME};
+inline constexpr bool unique() noexcept
+{
+    for (size_t i = 0; i != values.size(); ++i) {
+        for (size_t j = i + 1; j != values.size(); ++j) {
+            if (values[i] == values[j])
+                return false;
+        }
+    }
+    return true;
+}
+static_assert(unique(), "Protocol-50 private ordinary message collision");
+} // namespace p50_private_message_registry
+
+/* Opaque one-attempt bearer material created by F from the operating-system
+   CSPRNG.  This is deliberately a distinct wire type: it is neither cache
+   identity nor a digest, and production diagnostics must never render its
+   bytes. */
+struct ClaimAttemptCapability128
+{
+    std::array<uint8_t, 16> bytes{};
+
+    [[nodiscard]] bool valid() const noexcept
+    {
+        for (const uint8_t byte : bytes) {
+            if (byte != 0)
+                return true;
+        }
+        return false;
+    }
+    auto operator<=>(const ClaimAttemptCapability128 &) const = default;
+};
+
+using ClaimAttemptEntropyProvider =
+    ssize_t (*)(void *, size_t, unsigned) noexcept;
+
+/* Bounded all-or-nothing capability generation. Short reads, entropy errors,
+   persistent zero output, or persistent equality fail closed. */
+bool fresh_claim_attempt_capabilities_with_provider(
+    ClaimAttemptCapability128 &capability_1,
+    ClaimAttemptCapability128 &capability_2,
+    ClaimAttemptEntropyProvider provider) noexcept;
+bool fresh_claim_attempt_capabilities(
+    ClaimAttemptCapability128 &capability_1,
+    ClaimAttemptCapability128 &capability_2) noexcept;
+
+/* The decoder may expose a move-only stamp for the immediately preceding
+   canonical frame.  A stamp is not descriptor-release authority: only the
+   daemon owner can combine a claim stamp with a successful WAIT reservation,
+   and only exact ADOPTED validation can combine an outcome stamp with the
+   client's retained outbound claim. */
+class P50DecodedClaimStamp
+{
+public:
+    P50DecodedClaimStamp() = default;
+    P50DecodedClaimStamp(const P50DecodedClaimStamp &) = delete;
+    P50DecodedClaimStamp &operator=(const P50DecodedClaimStamp &) = delete;
+    P50DecodedClaimStamp(P50DecodedClaimStamp &&other) noexcept;
+    P50DecodedClaimStamp &operator=(P50DecodedClaimStamp &&other) noexcept;
+
+    [[nodiscard]] bool valid() const noexcept { return stamp_nonce_ != 0; }
+    [[nodiscard]] std::span<const uint8_t> canonical_claim() const noexcept {
+        return canonical_wire_;
+    }
+
+private:
+    friend class MsgChannel;
+    P50DecodedClaimStamp(uint64_t channel_generation, uint64_t mutation_epoch,
+                         uint64_t frame_sequence, uint64_t stamp_nonce,
+                         std::vector<uint8_t> canonical_wire) noexcept;
+    void invalidate() noexcept;
+
+    uint64_t channel_generation_ = 0;
+    uint64_t mutation_epoch_ = 0;
+    uint64_t frame_sequence_ = 0;
+    uint64_t stamp_nonce_ = 0;
+    std::vector<uint8_t> canonical_wire_;
+};
+
+class P50DecodedOutcomeStamp
+{
+public:
+    P50DecodedOutcomeStamp() = default;
+    P50DecodedOutcomeStamp(const P50DecodedOutcomeStamp &) = delete;
+    P50DecodedOutcomeStamp &operator=(const P50DecodedOutcomeStamp &) = delete;
+    P50DecodedOutcomeStamp(P50DecodedOutcomeStamp &&other) noexcept;
+    P50DecodedOutcomeStamp &operator=(P50DecodedOutcomeStamp &&other) noexcept;
+
+    [[nodiscard]] bool valid() const noexcept { return stamp_nonce_ != 0; }
+    [[nodiscard]] std::span<const uint8_t> canonical_outcome() const noexcept {
+        return canonical_wire_;
+    }
+
+private:
+    friend class MsgChannel;
+    P50DecodedOutcomeStamp(uint64_t channel_generation,
+                           uint64_t mutation_epoch, uint64_t frame_sequence,
+                           uint64_t stamp_nonce,
+                           std::vector<uint8_t> canonical_wire) noexcept;
+    void invalidate() noexcept;
+
+    uint64_t channel_generation_ = 0;
+    uint64_t mutation_epoch_ = 0;
+    uint64_t frame_sequence_ = 0;
+    uint64_t stamp_nonce_ = 0;
+    std::vector<uint8_t> canonical_wire_;
+};
+
+/* Direction-safe F/server authority.  It exists only after canonical claim
+   decode plus an owner-atomic Armed -> Reserved transition. */
+class P50ServerClaimReleaseTicket
+{
+public:
+    P50ServerClaimReleaseTicket() = default;
+    P50ServerClaimReleaseTicket(const P50ServerClaimReleaseTicket &) = delete;
+    P50ServerClaimReleaseTicket &
+    operator=(const P50ServerClaimReleaseTicket &) = delete;
+    P50ServerClaimReleaseTicket(P50ServerClaimReleaseTicket &&other) noexcept;
+    P50ServerClaimReleaseTicket &
+    operator=(P50ServerClaimReleaseTicket &&other) noexcept;
+
+    [[nodiscard]] bool valid() const noexcept { return release_nonce_ != 0; }
+    [[nodiscard]] uint64_t reservation_id() const noexcept {
+        return reservation_id_;
+    }
+    [[nodiscard]] std::span<const uint8_t> canonical_claim() const noexcept {
+        return canonical_claim_;
+    }
+
+private:
+    friend class MsgChannel;
+    P50ServerClaimReleaseTicket(uint64_t channel_generation,
+                                uint64_t mutation_epoch,
+                                uint64_t decoded_frame_sequence,
+                                uint64_t reservation_id,
+                                ClaimAttemptCapability128 attempt_capability,
+                                uint64_t stamp_nonce,
+                                uint64_t release_nonce,
+                                std::vector<uint8_t> canonical_claim) noexcept;
+    void invalidate() noexcept;
+
+    uint64_t channel_generation_ = 0;
+    uint64_t mutation_epoch_ = 0;
+    uint64_t decoded_frame_sequence_ = 0;
+    uint64_t reservation_id_ = 0;
+    ClaimAttemptCapability128 attempt_capability_{};
+    uint64_t stamp_nonce_ = 0;
+    uint64_t release_nonce_ = 0;
+    // Zero until the exact echoed ADOPTED P5CO frame has fully flushed.
+    uint64_t outcome_frame_sequence_ = 0;
+    std::vector<uint8_t> canonical_claim_;
+};
+
+/* Direction-safe C/client authority. REFUSED, malformed, EOF, timeout, wrong
+   echo/identity/role, or a stale operation can never construct this type. */
+class P50ClientAdoptedReleaseTicket
+{
+public:
+    P50ClientAdoptedReleaseTicket() = default;
+    P50ClientAdoptedReleaseTicket(
+        const P50ClientAdoptedReleaseTicket &) = delete;
+    P50ClientAdoptedReleaseTicket &
+    operator=(const P50ClientAdoptedReleaseTicket &) = delete;
+    P50ClientAdoptedReleaseTicket(
+        P50ClientAdoptedReleaseTicket &&other) noexcept;
+    P50ClientAdoptedReleaseTicket &
+    operator=(P50ClientAdoptedReleaseTicket &&other) noexcept;
+
+    [[nodiscard]] bool valid() const noexcept { return release_nonce_ != 0; }
+    [[nodiscard]] std::span<const uint8_t> canonical_claim() const noexcept {
+        return canonical_claim_;
+    }
+
+private:
+    friend class MsgChannel;
+    P50ClientAdoptedReleaseTicket(
+        uint64_t channel_generation, uint64_t mutation_epoch,
+        uint64_t decoded_frame_sequence,
+        ClaimAttemptCapability128 attempt_capability,
+        uint64_t stamp_nonce, uint64_t release_nonce,
+        std::vector<uint8_t> canonical_claim,
+        uint64_t f_launch_generation, uint64_t f_launch_attempt,
+        std::array<uint8_t, 16> f_store_guid,
+        uint64_t operation_sequence) noexcept;
+    void invalidate() noexcept;
+
+    uint64_t channel_generation_ = 0;
+    uint64_t mutation_epoch_ = 0;
+    uint64_t decoded_frame_sequence_ = 0;
+    ClaimAttemptCapability128 attempt_capability_{};
+    uint64_t stamp_nonce_ = 0;
+    uint64_t release_nonce_ = 0;
+    std::vector<uint8_t> canonical_claim_;
+    uint64_t f_launch_generation_ = 0;
+    uint64_t f_launch_attempt_ = 0;
+    std::array<uint8_t, 16> f_store_guid_{};
+    uint64_t operation_sequence_ = 0;
 };
 
 enum Compression {
@@ -451,6 +669,46 @@ public:
     bool take_invalid_p50_source_arm_identity(uint32_t *wire_id,
                                               uint64_t *epoch,
                                               uint64_t *nonce) noexcept;
+
+    // Move out the unforgeable stamp for the immediately preceding exact
+    // canonical P5CL/P5CO decode. Each stamp is available once.
+    P50DecodedClaimStamp take_p50_decoded_claim_stamp() noexcept;
+    P50DecodedOutcomeStamp take_p50_decoded_outcome_stamp() noexcept;
+
+    // F owner call after the exact WAIT row was atomically reserved. The
+    // attempt token must be the token carried by the decoded P5CL.
+    P50ServerClaimReleaseTicket issue_p50_server_claim_release_ticket(
+        P50DecodedClaimStamp &&stamp, uint64_t reservation_id,
+        ClaimAttemptCapability128 attempt_capability) noexcept;
+
+    // The only legal F-side ordinary send after a reserved P5CL. The outcome
+    // must echo the ticket's exact claim. ADOPTED rebinds the same ticket only
+    // after the complete P5CO frame flushes; REFUSED consumes it without ever
+    // creating descriptor-release authority.
+    bool send_p50_cache_session_outcome(
+        P50ServerClaimReleaseTicket &ticket,
+        const P50CacheSessionOutcomeMsg &outcome) noexcept;
+
+    // C owner call after receiving P5CO. Validation is performed here against
+    // the exact retained outbound P5CL and the expected accepted F identity.
+    // Only ADOPTED can return a valid ticket.
+    P50ClientAdoptedReleaseTicket issue_p50_client_adopted_release_ticket(
+        P50DecodedOutcomeStamp &&stamp, uint64_t expected_f_launch_generation,
+        uint64_t expected_f_launch_attempt,
+        std::array<uint8_t, 16> expected_f_store_guid,
+        uint64_t expected_operation_sequence) noexcept;
+
+    // Opposite descriptor transitions deliberately accept different types.
+    int release_fd_after_p50_server_claim(
+        P50ServerClaimReleaseTicket &&ticket) noexcept;
+    int release_fd_after_p50_client_adopted(
+        P50ClientAdoptedReleaseTicket &&ticket) noexcept;
+
+    // Exact bounded payload helpers for the two new ordinary messages. They
+    // consume/append bytes only inside the current ordinary frame.
+    bool read_current_message_payload(std::vector<uint8_t> &payload,
+                                      size_t min_bytes, size_t max_bytes);
+    void write_message_payload(std::span<const uint8_t> payload);
 
     /* Transfer the still-owned ordinary-link descriptor after the one
        immediately preceding decode returned CACHE_SESSION.  A successful
@@ -656,6 +914,30 @@ protected:
     // queued frame. Any later send/receive clears it permanently.
     bool cache_session_send_release_armed;
 
+    // P50 positive-bridge channel authority. Generation is globally unique
+    // within the process; mutation_epoch advances on every relevant channel
+    // use and invalidates any previously minted stamp/ticket.
+    uint64_t p50_channel_generation = 0;
+    uint64_t p50_mutation_epoch = 1;
+    uint64_t p50_decoded_frame_sequence = 0;
+    Msg::Value p50_last_decoded_type = Msg::UNKNOWN;
+    uint64_t p50_last_stamp_nonce = 0;
+    bool p50_last_stamp_taken = false;
+    std::vector<uint8_t> p50_last_canonical_payload;
+    uint64_t p50_active_server_release_nonce = 0;
+    uint64_t p50_active_server_claim_stamp_nonce = 0;
+    uint64_t p50_active_client_release_nonce = 0;
+    bool p50_server_outcome_send_armed = false;
+
+    // One exact outbound claim may await one first outcome on this fresh
+    // connection. A queued claim is promoted only after its frame fully
+    // flushes; any other send or unexpected decoded frame clears it.
+    uint64_t p50_queued_claim_frame = 0;
+    std::vector<uint8_t> p50_queued_claim;
+    ClaimAttemptCapability128 p50_queued_claim_attempt_capability{};
+    std::vector<uint8_t> p50_outbound_claim;
+    ClaimAttemptCapability128 p50_outbound_claim_attempt_capability{};
+
     uint32_t invalid_p50_source_arm_wire_id = 0;
     uint64_t invalid_p50_source_arm_epoch = 0;
     uint64_t invalid_p50_source_arm_nonce = 0;
@@ -668,6 +950,13 @@ private:
     socklen_t addr_len;
     bool set_error_recursion;
     std::optional<std::string> error_status;
+
+    void p50_note_channel_mutation() noexcept;
+    void p50_clear_decoded_stamp() noexcept;
+    void p50_clear_outbound_claim() noexcept;
+    void p50_promote_flushed_claim() noexcept;
+    bool p50_clean_release_boundary() const noexcept;
+    int p50_checked_release_fd() noexcept;
 };
 
 // just convenient functions to create MsgChannels
@@ -817,6 +1106,54 @@ public:
     }
 };
 
+class P50CacheSessionClaimMsg : public Msg
+{
+public:
+    static constexpr size_t MaxPayloadBytes = 1024;
+
+    P50CacheSessionClaimMsg()
+        : Msg(Msg::P50_CACHE_SESSION_CLAIM) {}
+    explicit P50CacheSessionClaimMsg(std::vector<uint8_t> canonical_wire)
+        : Msg(Msg::P50_CACHE_SESSION_CLAIM), wire(std::move(canonical_wire)) {}
+
+    void fill_from_channel(MsgChannel *c) override;
+    void send_to_channel(MsgChannel *c) const override;
+    bool valid_payload() const override;
+    bool valid_for_protocol(int negotiated_protocol) const override
+    {
+        return negotiated_protocol == PROTOCOL_VERSION;
+    }
+
+    std::vector<uint8_t> wire;
+
+private:
+    bool wire_payload_valid = true;
+};
+
+class P50CacheSessionOutcomeMsg : public Msg
+{
+public:
+    static constexpr size_t MaxPayloadBytes = 1152;
+
+    P50CacheSessionOutcomeMsg()
+        : Msg(Msg::P50_CACHE_SESSION_OUTCOME) {}
+    explicit P50CacheSessionOutcomeMsg(std::vector<uint8_t> canonical_wire)
+        : Msg(Msg::P50_CACHE_SESSION_OUTCOME), wire(std::move(canonical_wire)) {}
+
+    void fill_from_channel(MsgChannel *c) override;
+    void send_to_channel(MsgChannel *c) const override;
+    bool valid_payload() const override;
+    bool valid_for_protocol(int negotiated_protocol) const override
+    {
+        return negotiated_protocol == PROTOCOL_VERSION;
+    }
+
+    std::vector<uint8_t> wire;
+
+private:
+    bool wire_payload_valid = true;
+};
+
 /*
  * Explicit Protocol-50 source-arm authority.  This is an ordinary-wire
  * admission message, not a CACHE_SESSION payload.  Every field is carried in
@@ -906,6 +1243,9 @@ struct P50SourceArmedFields {
                    icecc::p50::kStoreIdentityDerivationVersion &&
                arm_observation_id != 0 && source_budget_msec != 0 &&
                source_budget_msec <= MaxSourceBudgetMsec &&
+               attempt_capability_1.valid() &&
+               attempt_capability_2.valid() &&
+               attempt_capability_1 != attempt_capability_2 &&
                !icecc::p50::store_identity_file_guid_matches_client(
                    arm.c_store_guid, f_store_guid);
     }
@@ -918,6 +1258,8 @@ struct P50SourceArmedFields {
     uint64_t f_store_derivation_version = 0;
     uint64_t arm_observation_id = 0;
     uint32_t source_budget_msec = 0;
+    ClaimAttemptCapability128 attempt_capability_1{};
+    ClaimAttemptCapability128 attempt_capability_2{};
 
     auto operator<=>(const P50SourceArmedFields&) const = default;
 };
@@ -940,12 +1282,15 @@ public:
                       std::array<uint8_t, 16> f_guid,
                       uint64_t derivation_version,
                       uint64_t observation,
-                      uint32_t source_budget_msec)
+                      uint32_t source_budget_msec,
+                      ClaimAttemptCapability128 capability_1,
+                      ClaimAttemptCapability128 capability_2)
         : Msg(Msg::P50_SOURCE_ARMED),
           P50SourceArmedFields{std::move(fields), f_generation, f_attempt,
                                f_store_generation, f_guid,
                                derivation_version, observation,
-                               source_budget_msec} {}
+                               source_budget_msec, capability_1,
+                               capability_2} {}
 
     void fill_from_channel(MsgChannel *c) override;
     void send_to_channel(MsgChannel *c) const override;

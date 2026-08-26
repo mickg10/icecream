@@ -62,6 +62,13 @@ FStoreGuid f_guid() {
   return guid;
 }
 
+ClaimAttemptCapability128 capability(uint8_t seed) {
+  ClaimAttemptCapability128 value;
+  for (size_t i = 0; i != value.bytes.size(); ++i)
+    value.bytes[i] = static_cast<uint8_t>(seed + i);
+  return value;
+}
+
 P50CurrentFIncarnation incarnation() {
   return P50CurrentFIncarnation{
       71, {81, 2}, f_guid(), 91, kStoreIdentityDerivationVersion, 7001};
@@ -95,7 +102,7 @@ P50CacheSessionArmBinding binding(uint64_t observation, uint32_t wire_job_id) {
       std::move(arm), current.control_launch.generation,
       current.control_launch.attempt, current.store_generation,
       current.store_guid.bytes, current.store_derivation_version,
-      observation, 5000);
+      observation, 5000, capability(0x51), capability(0x91));
   const auto value = cache_session_binding_from_armed(message);
   if (!value)
     throw std::runtime_error("canonical source-armed binding conversion failed");
@@ -105,8 +112,7 @@ P50CacheSessionArmBinding binding(uint64_t observation, uint32_t wire_job_id) {
 P50CacheSessionWireClaim claim(P50CacheSessionArmBinding value,
                                uint64_t attempt) {
   (void)attempt;
-  const auto proof = attempts.burn(value.c_control_identity(),
-                                   value.arm_observation_id);
+  const auto proof = attempts.burn(value);
   return P50CacheSessionWireClaim{std::move(value),
                                    proof.value_or(P50CacheSessionAttemptProof{})};
 }
@@ -144,18 +150,21 @@ void wire_roundtrip_and_bounds() {
       exact.binding.arm, exact.binding.f_control_generation,
       exact.binding.f_control_attempt, exact.binding.f_store_generation,
       exact.binding.f_store_guid, exact.binding.f_store_derivation_version,
-      exact.binding.arm_observation_id, exact.binding.source_budget_msec);
+      exact.binding.arm_observation_id, exact.binding.source_budget_msec,
+      capability(0x51), capability(0x91));
   const auto extracted = cache_session_binding_from_armed(exact_ack);
   CHECK(extracted && *extracted == exact.binding,
         "claim binding is extracted losslessly from the actual full ACK");
   const auto wire = encode_cache_session_wire_claim(exact);
   CHECK(wire == hex_fixture(
-      "5035434a00010000000000f30000000100000000000003e900000000000007d10000000f662e6578616d706c652e7465"
-      "7374000000280a0000280b00000032000000020000000000000bb90000000000000fa1000000000000003d0000000000"
-      "0000010102030405060708090a0b0c0d0e0f100000000000001389000000010000000000000050000000000000000100"
-      "000000000000510000000000000002000000000000005ba122232425262728292a2b2c2d2e2f30000000000000000100"
-      "000000000000640000138800000000000000000000005000000000000000010000000000000064010000000000000000"
-      "000000000000010000000000000001"),
+      "5035434c00010001000000db0000000100000000000003e900000000000007d1"
+      "0000000f662e6578616d706c652e74657374000000280a0000280b0000003200"
+      "0000020000000000000bb90000000000000fa1000000000000003d0000000000"
+      "0000010102030405060708090a0b0c0d0e0f1000000000000013890000000100"
+      "0000000000005000000000000000010000000000000051000000000000000200"
+      "0000000000005ba122232425262728292a2b2c2d2e2f30000000000000000100"
+      "00000000000064000013880000000001000000000000000000000000000064"
+      "0000000000000001"),
         "canonical full-ACK claim has one stable byte representation");
   const auto decoded = decode_cache_session_wire_claim(wire);
   CHECK(!wire.empty() && wire.size() <= kP50CacheSessionClaimMaxWireBytes &&
@@ -187,7 +196,7 @@ void wire_roundtrip_and_bounds() {
   CHECK(!decode_cache_session_wire_claim(malformed),
         "nonzero reserved header is rejected");
   malformed = wire;
-  malformed[malformed.size() - 52] = 1;
+  malformed[malformed.size() - 28] = 1;
   CHECK(!decode_cache_session_wire_claim(malformed),
         "nonzero reserved full-ACK word is rejected");
 
@@ -498,7 +507,6 @@ void attempt_authority_requires_burn_and_scope() {
   const auto now = Clock::now();
   OwnerAuthority owner_authority;
   P50CacheSessionAttemptAuthority c_authority(4);
-  P50CacheSessionAttemptAuthority reset_authority(4);
   P50CacheSessionJoinTable table(1, incarnation(), owner_authority,
                                  c_authority);
   const auto value = binding(600, 60);
@@ -509,30 +517,14 @@ void attempt_authority_requires_burn_and_scope() {
 
   const P50CacheSessionWireClaim forged{
       value,
-      P50CacheSessionAttemptProof{value.c_control_identity(),
-                                  value.arm_observation_id, 1, 999999, 999999}};
+      P50CacheSessionAttemptProof{1, capability(0xd1)}};
   CHECK(table.reserve_claim(forged, exact_owner, now) ==
             P50CacheSessionJoinDecision::Invalid,
         "forged non-burned capability cannot reserve a live WAIT");
 
-  const auto reset_proof = reset_authority.burn(value.c_control_identity(),
-                                                value.arm_observation_id);
-  CHECK(reset_proof.has_value() &&
-            table.reserve_claim(P50CacheSessionWireClaim{value, *reset_proof},
-                                exact_owner, now) ==
-                P50CacheSessionJoinDecision::Invalid,
-        "capability from an independently reset authority is rejected");
-
-  const auto first = c_authority.burn(value.c_control_identity(),
-                                      value.arm_observation_id);
-  const auto late_reset = reset_authority.burn(value.c_control_identity(),
-                                               value.arm_observation_id);
-  const auto second = c_authority.burn(value.c_control_identity(),
-                                       value.arm_observation_id);
-  CHECK(first.has_value() && late_reset.has_value() && second.has_value() &&
-            table.reserve_claim(P50CacheSessionWireClaim{value, *late_reset},
-                                exact_owner, now) ==
-                P50CacheSessionJoinDecision::Invalid &&
+  const auto first = c_authority.burn(value);
+  const auto second = c_authority.burn(value);
+  CHECK(first.has_value() && second.has_value() &&
             table.reserve_claim(P50CacheSessionWireClaim{value, *first},
                                 exact_owner, now) ==
                 P50CacheSessionJoinDecision::Reserved &&
@@ -542,8 +534,7 @@ void attempt_authority_requires_burn_and_scope() {
             table.reserve_claim(P50CacheSessionWireClaim{value, *second},
                                 exact_owner, now) ==
                 P50CacheSessionJoinDecision::Reserved &&
-            !c_authority.burn(value.c_control_identity(),
-                              value.arm_observation_id),
+            !c_authority.burn(value),
         "only two burned ordinals are consumable per exact C arm");
 }
 
@@ -606,13 +597,12 @@ void deadline_and_invalid_settlement_fail_closed() {
   live.source_budget_msec = 5000;
   const auto live_owner = owner(42, 142);
   const auto d1 = table.register_wait(live, live_owner, now);
-  const auto live_proof = c_authority.burn(live.c_control_identity(),
-                                           live.arm_observation_id);
+  const auto live_proof = c_authority.burn(live);
   const P50CacheSessionWireClaim live_claim{
       live, live_proof.value_or(P50CacheSessionAttemptProof{})};
   const auto d2 = table.reserve_claim(live_claim, live_owner, now);
   auto invalid_live_claim = live_claim;
-  invalid_live_claim.attempt.authority_nonce = 0;
+  invalid_live_claim.attempt.selected_capability.bytes[0] ^= 1;
   const auto invalid_d3 =
       table.mark_public_fd_detached(invalid_live_claim, live_owner, now);
   const auto d3 = table.mark_public_fd_detached(live_claim, live_owner, now);
@@ -671,8 +661,7 @@ void production_shaped_owner_adapter() {
   P50CacheSessionJoinTable table(1, adapter_ready, authority, c_authority);
   const auto value = binding(900, 90);
   const P50CacheSessionOwnerContext exact_owner{provenance->lease, 9001};
-  const auto proof = c_authority.burn(value.c_control_identity(),
-                                      value.arm_observation_id);
+  const auto proof = c_authority.burn(value);
   CHECK(proof && table.register_wait(value, exact_owner, Clock::now()) ==
                     P50CacheSessionJoinDecision::Registered &&
             table.reserve_claim(P50CacheSessionWireClaim{value, *proof},

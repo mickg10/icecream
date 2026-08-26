@@ -9,6 +9,7 @@
 #include "p50_local_transport.h"
 #include "p50_source_identity.h"
 #include "services/comm.h"
+#include "services/p50_cache_session_wire.h"
 #include "services/p50_store_identity_wire.h"
 
 #include <array>
@@ -22,60 +23,10 @@
 
 namespace icecc::p50::daemon {
 
-inline constexpr uint16_t kP50CacheSessionClaimWireVersion = 1;
-inline constexpr size_t kP50CacheSessionClaimMaxWireBytes = 1024;
-inline constexpr uint32_t kP50CacheSessionMaxSourceBudgetMsec =
-    P50SourceArmedFields::MaxSourceBudgetMsec;
-
-// Facts F acknowledged on the selected ordinary compile connection.  This is
-// the equality domain shared by the live WAIT registration and the later
-// public-session claim.  The F-local connection lease/client id are excluded.
-struct P50CacheSessionArmBinding : P50SourceArmedFields {
-  [[nodiscard]] bool valid() const noexcept;
-  [[nodiscard]] local::Identity c_control_identity() const noexcept {
-    return {arm.c_control_generation, arm.c_control_attempt};
-  }
-  [[nodiscard]] local::Identity f_control_identity() const noexcept {
-    return {f_control_generation, f_control_attempt};
-  }
-  auto operator<=>(const P50CacheSessionArmBinding &) const = default;
-};
-
 // The only public wire-message conversion consumes the actual decoded
 // message, including its private trailing/truncation validity latch.
 std::optional<P50CacheSessionArmBinding>
 cache_session_binding_from_armed(const P50SourceArmedMsg &message) noexcept;
-
-struct P50CacheSessionAttemptProof {
-  local::Identity c_control_launch{};
-  uint64_t arm_observation_id = 0;
-  uint8_t ordinal = 0;
-  uint64_t capability = 0;
-  uint64_t authority_nonce = 0;
-
-  [[nodiscard]] bool valid() const noexcept {
-    return c_control_launch.generation != 0 &&
-           c_control_launch.attempt != 0 && arm_observation_id != 0 &&
-           ordinal >= 1 && ordinal <= 2 && capability != 0 &&
-           authority_nonce != 0;
-  }
-  auto operator<=>(const P50CacheSessionAttemptProof &) const = default;
-};
-
-struct P50CacheSessionWireClaim {
-  P50CacheSessionArmBinding binding{};
-  // A capability burned by the persistent C-role owner before this attempt is
-  // emitted. It is not an F connection id and is never derived by F.
-  P50CacheSessionAttemptProof attempt{};
-
-  [[nodiscard]] bool valid() const noexcept;
-  auto operator<=>(const P50CacheSessionWireClaim &) const = default;
-};
-
-std::vector<uint8_t>
-encode_cache_session_wire_claim(const P50CacheSessionWireClaim &claim);
-std::optional<P50CacheSessionWireClaim>
-decode_cache_session_wire_claim(std::span<const uint8_t> wire);
 
 struct P50CacheSessionOwnerContext {
   ConnectionLeaseId connection_lease{};
@@ -138,21 +89,20 @@ public:
   operator=(const P50CacheSessionAttemptAuthority &) = delete;
 
   [[nodiscard]] std::optional<P50CacheSessionAttemptProof>
-  burn(local::Identity c_control_launch, uint64_t arm_observation_id) noexcept;
+  burn(const P50CacheSessionArmBinding &binding) noexcept;
   [[nodiscard]] bool consume(const P50CacheSessionAttemptProof &proof,
                               const P50CacheSessionArmBinding &binding) noexcept;
 
 private:
   struct Scope {
-    local::Identity c_control_launch{};
+    P50WireLaunchIdentity c_control_launch{};
     uint64_t arm_observation_id = 0;
-    std::array<uint64_t, 2> capabilities{};
+    std::array<ClaimAttemptCapability128, 2> capabilities{};
     uint8_t burned = 0;
     uint8_t consumed = 0;
   };
 
   size_t max_scopes_ = 0;
-  uint64_t authority_nonce_ = 0;
   uint64_t next_capability_ = 1;
   std::vector<Scope> scopes_;
 };
@@ -333,9 +283,9 @@ private:
     P50CacheSessionOwnerContext owner{};
     TimePoint deadline{};
     P50CacheSessionJoinState state = P50CacheSessionJoinState::Armed;
-    std::array<uint64_t, kMaxAttemptsPerWait> attempts{};
+    std::array<ClaimAttemptCapability128, kMaxAttemptsPerWait> attempts{};
     size_t attempt_count = 0;
-    uint64_t active_attempt = 0;
+    ClaimAttemptCapability128 active_attempt{};
     bool owner_closed = false;
   };
 

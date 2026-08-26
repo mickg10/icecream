@@ -23,6 +23,8 @@ for needle in \
     'P50SourceArmedFields' 'semantic_valid()' \
     'f_control_generation' 'f_control_attempt' 'f_store_generation' \
     'f_store_guid' 'f_store_derivation_version' 'arm_observation_id' \
+    'ClaimAttemptCapability128' 'attempt_capability_1' \
+    'attempt_capability_2' \
     'source_budget_msec' 'MaxSourceBudgetMsec' \
     'P50_SOURCE_MODE_ZSTD_TU' 'CACHE_PROFILE_ZSTD_TU' \
     'kStoreIdentityDerivationVersion' 'kStoreIdentityRoleByte' \
@@ -38,7 +40,9 @@ done
 grep -F 'P50SourceArmMsg' "$test" >/dev/null
 grep -F 'P50SourceArmedMsg' "$test" >/dev/null
 grep -F 'trailing payload bytes' "$test" >/dev/null
-grep -F 'truncated bounded-budget tail' "$test" >/dev/null
+grep -F 'truncated capability tail' "$test" >/dev/null
+grep -F 'zero attempt capability is refused before framing' "$test" >/dev/null
+grep -F 'equal attempt capabilities are refused before framing' "$test" >/dev/null
 grep -F 'Protocol 49' "$test" >/dev/null
 grep -F 'WIRE-AUDIT three-bucket classification' "$test" >/dev/null
 grep -F 'stable Protocol-50 fixture bytes' "$test" >/dev/null

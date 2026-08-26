@@ -44,8 +44,13 @@ P50SourceArmedMsg ack(const P50SourceArmFields& a, uint32_t budget = 2500) {
     std::array<uint8_t, 16> f{};
     for (size_t i = 0; i != f.size(); ++i) f[i] = static_cast<uint8_t>(0xd0 + i);
     f[kStoreIdentityRoleByte] |= kStoreIdentityFileRole;
+    ClaimAttemptCapability128 capability_1;
+    ClaimAttemptCapability128 capability_2;
+    capability_1.bytes.fill(0xc1);
+    capability_2.bytes.fill(0xc2);
     return P50SourceArmedMsg(a, 42, 43, 45, f,
-                             kStoreIdentityDerivationVersion, 44, budget);
+                             kStoreIdentityDerivationVersion, 44, budget,
+                             capability_1, capability_2);
 }
 
 struct Fixture {
