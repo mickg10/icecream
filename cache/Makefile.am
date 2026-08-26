@@ -39,7 +39,8 @@ libp50endpoint_a_SOURCES = p50_endpoint.cpp p50_endpoint.h
 libp50endpoint_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 
 libp50localtransport_a_SOURCES = p50_local_transport.cpp p50_local_transport.h \
-	p50_fd_handoff.cpp p50_fd_handoff.h
+	p50_fd_handoff.cpp p50_fd_handoff.h \
+	p50_reverse_fd_retry.cpp p50_reverse_fd_retry.h
 libp50inputfd_a_SOURCES = p50_input_fd_attachment.cpp p50_input_fd_attachment.h
 libp50inputfd_a_CPPFLAGS = $(AM_CPPFLAGS)
 libp50inputlifecycle_a_SOURCES = p50_input_lifecycle.cpp p50_input_lifecycle.h
@@ -154,6 +155,7 @@ EXTRA_DIST = \
 	P50_READY_ADVERTISEMENT.md \
 	P50_CACHE_SERVICE.md \
 	P50_FD_HANDOFF.md \
+	P50_REVERSE_FD_RETRY.md \
 	P50_DAEMON_CACHE_DISPATCH.md \
 	P50_DAEMON_SIDECAR_ADAPTER.md \
 	P50_INPUT_FD_ATTACHMENT.md \

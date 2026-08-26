@@ -1,0 +1,51 @@
+#!/bin/sh
+# Deletion-sensitive source gate for the isolated reverse FD seam.
+set -eu
+src=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
+
+count() {
+    expected=$1; pattern=$2; file=$3; label=$4
+    actual=$(grep -F -c "$pattern" "$src/$file" || true)
+    if [ "$actual" -ne "$expected" ]; then
+        echo "FAIL: $label (expected $expected, found $actual)" >&2
+        exit 1
+    fi
+    echo "ok - $label"
+}
+
+at_least() {
+    minimum=$1; pattern=$2; file=$3; label=$4
+    actual=$(grep -F -c "$pattern" "$src/$file" || true)
+    if [ "$actual" -lt "$minimum" ]; then
+        echo "FAIL: $label (expected at least $minimum, found $actual)" >&2
+        exit 1
+    fi
+    echo "ok - $label"
+}
+
+count 1 'kMaxReverseFdRemainingMs' cache/p50_reverse_fd_retry.h 'bounded duration constant'
+count 1 'DeliveryId delivery_id = 0' cache/p50_reverse_fd_retry.h 'explicit DeliveryId field'
+count 1 'DeliveryToken token = 0' cache/p50_reverse_fd_retry.h 'explicit token field'
+at_least 1 'original_deadline' cache/p50_reverse_fd_retry.h 'original absolute deadline API'
+at_least 1 'F_DUPFD_CLOEXEC' cache/p50_reverse_fd_retry.cpp 'fresh CLOEXEC duplication'
+at_least 1 'F_SEAL_WRITE' cache/p50_reverse_fd_retry.cpp 'sealed master write protection'
+at_least 1 'remaining_ms' cache/p50_reverse_fd_retry.cpp 'wire carries remaining duration'
+at_least 1 'high_water_' cache/p50_reverse_fd_retry.h 'service high-water ledger'
+at_least 1 'exact_accepted' cache/p50_reverse_fd_retry.cpp 'exact acceptance fingerprint'
+at_least 1 'ReverseFdReceiverState::ToCompile' cache/p50_reverse_fd_retry.cpp 'pre-ACK TOCOMPILE transition'
+at_least 1 'ReverseFdDecision::ExactReplay' cache/p50_reverse_fd_retry.cpp 'replay ACK decision'
+at_least 1 'transition_count_' cache/p50_reverse_fd_retry.h 'single transition witness'
+at_least 1 'fork_count_' cache/p50_reverse_fd_retry.h 'single fork witness'
+count 1 'void ReverseFdOwner::cancel' cache/p50_reverse_fd_retry.cpp 'owner cancellation closure'
+count 1 'void ReverseFdReceiverLedger::cancel' cache/p50_reverse_fd_retry.cpp 'receiver cancellation closure'
+count 1 'P50_REVERSE_FD_RETRY.md' cache/Makefile.am 'documentation distributed'
+count 1 'p50reversefdretry-mutants.sh' unittests/Makefile.am 'mutant gate registered'
+count 1 'p50_reverse_fd_retry_sanitize.sh' unittests/Makefile.am 'sanitizer gate registered'
+
+if grep -E -n 'p50_reverse_fd_retry|ReverseFdOwner|ReverseFdReceiverLedger' \
+        "$src/daemon" "$src/client" "$src/services" >/dev/null 2>&1; then
+    echo 'FAIL: reverse FD seam leaked into daemon/client/services wiring' >&2
+    exit 1
+fi
+echo 'ok - daemon/client/services remain untouched'
+echo 'PASS: reverse sealed-FD source/deletion gates passed'

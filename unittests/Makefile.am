@@ -1,6 +1,8 @@
 TESTS = testargs lockexec backpressure schedpolicy utf8test statewritertest fastesttest hallflowtest jobidalloctest inputpump compilerinput p49assignment p50assignment p50cacheadvertisement p50cachesession p50daemoncachedispatch p50assignment-source.sh p50cacheadvertisement-source.sh p50cachesession-source.sh p50daemoncachedispatch-source.sh p50daemoncachedispatch-sanitize.sh p50localtransport-source.sh p50localtransport-sanitize.sh p50sidecarsupervisor-source.sh p50inputattachment-source.sh p50inputattachment-mutants.sh p50_input_attachment_sanitize.sh p50readyadvertisement-source.sh p50readyadvertisement-mutants.sh p50endpoint-source.sh p50fdhandoff-source.sh p50cacheservice-source.sh p50cacheservice-sanitize.sh p50fdhandoff-sanitize.sh packagebuilderdeps.sh p49daemon-run.sh p49scheduler-run.sh connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh p50assignment-remote.sh daemonlogin-run.sh daemonbatch-run.sh cachehandoffdaemon-run.sh daemoncachedispatch-run.sh boost-prefix-scope.sh p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50inputrecordreopen p50inputattachment p50endpoint p50localtransport p50sidecarsupervisor p50readyadvertisement p50cacheservice p50fdhandoff digest128bench p50_trace_check.sh
 TESTS += p50sourcearm p50sourcearm-source.sh
 TESTS += p50phaseopen p50phaseopen-source.sh
+TESTS += p50reversefdretry p50reversefdretry-source.sh
+TESTS += p50reversefdretry-mutants.sh p50_reverse_fd_retry_sanitize.sh
 TESTS += p50daemonsidecaradapter
 TESTS += p50daemonsidecaradapter-source.sh
 TESTS += p50daemonsidecaradapter-sanitize.sh
@@ -87,6 +89,7 @@ check_PROGRAMS += p50resultdisposition
 check_PROGRAMS += p50_completion_record
 testargs_SOURCES = args.cpp
 check_PROGRAMS += p50sourcearm p50phaseopen
+check_PROGRAMS += p50reversefdretry
 p50wire_SOURCES = p50_wire_test.cpp
 p50slice0_SOURCES = \
 	p50_slice0_test.cpp
@@ -238,6 +241,12 @@ p50phaseopen_CPPFLAGS = $(AM_CPPFLAGS)
 p50phaseopen_CXXFLAGS = -pthread
 p50phaseopen_LDFLAGS = -pthread
 p50phaseopen_LDADD = ../cache/libprotocol50.a ../services/libicecc.la
+p50reversefdretry_SOURCES = p50_reverse_fd_retry_test.cpp
+p50reversefdretry_CPPFLAGS = $(AM_CPPFLAGS)
+p50reversefdretry_CXXFLAGS = -pthread
+p50reversefdretry_LDFLAGS = -pthread
+p50reversefdretry_LDADD = ../cache/libp50localtransport.a ../cache/libprotocol50.a \
+	../services/libicecc.la
 p50cacheservice_SOURCES = p50cacheservice.cpp ../cache/p50_cache_service.cpp
 p50cacheservice_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS) -DICECC_P50_CACHE_SERVICE_NO_MAIN
 p50cacheservice_CXXFLAGS = -pthread
@@ -282,6 +291,8 @@ EXTRA_DIST = sndbuf_shim.c conn_shim.c readyclose_shim.c connectivity-run.sh sch
 
 EXTRA_DIST += p50_trace_check.sh p50assignment-source.sh p50cacheadvertisement-source.sh p50cachesession-source.sh p50daemoncachedispatch-source.sh p50daemoncachedispatch-sanitize.sh p50localtransport-source.sh p50localtransport-sanitize.sh p50sidecarsupervisor-source.sh p50inputattachment-source.sh p50inputattachment-mutants.sh p50_input_attachment_sanitize.sh p50readyadvertisement-source.sh p50readyadvertisement-mutants.sh p50endpoint-source.sh p50fdhandoff-source.sh p50cacheservice-source.sh p50cacheservice-sanitize.sh p50fdhandoff-sanitize.sh p50inputfd-source.sh p50inputfd-sanitize.sh p50inputlifecycle-source.sh p50inputlifecycle-sanitize.sh packagebuilderdeps.sh p50daemonpositive-source.sh p50daemonpositive-run.sh p50zstdsender-source.sh
 EXTRA_DIST += p50sourcearm-source.sh p50phaseopen-source.sh
+EXTRA_DIST += p50reversefdretry-source.sh p50reversefdretry-mutants.sh \
+	p50_reverse_fd_retry_sanitize.sh
 EXTRA_DIST += p50compilee2e-source.sh p50compilee2e-run.sh
 EXTRA_DIST += p50completionflow-source.py
 EXTRA_DIST += p50completionrecord-sanitize.sh
