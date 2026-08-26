@@ -20,6 +20,8 @@ libprotocol50_a_SOURCES = \
 	p50_actions.h \
 	p50_slice0.cpp \
 	p50_slice0.h \
+	p50_profile.cpp \
+	p50_profile.h \
 	p50_zstd.cpp \
 	p50_zstd.h \
 	p50_input_record.cpp \
@@ -149,6 +151,7 @@ EXTRA_DIST = \
 	formal/.gitignore \
 	formal/check_trace.py \
 	P50_ENDPOINT.md \
+	P50_PROFILE_INTERFACE.md \
 	P50_LOCAL_TRANSPORT.md \
 	P50_CACHE_SESSION.md \
 	P50_SIDECAR_SUPERVISOR.md \

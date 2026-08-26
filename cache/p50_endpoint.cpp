@@ -864,7 +864,7 @@ struct P50ClientEndpoint::Impl {
 struct P50ServerEndpoint::Impl {
     struct Pending {
         TxBegin begin;
-        std::unique_ptr<ZstdTuDialogue> dialogue;
+        ProfileDialogue dialogue;
         uint64_t reserved_encoded_bytes = 0;
         uint64_t reserved_raw_bytes = 0;
         uint64_t reserved_window_bytes = 0;
@@ -1356,9 +1356,11 @@ struct P50ServerEndpoint::Impl {
         PreparedBegin result;
         result.replay = route.interrupted.has_value();
         result.pending.begin = begin;
-        result.pending.dialogue =
-            std::make_unique<ZstdTuDialogue>(negotiated_profiles, caps.zstd);
-        result.pending.dialogue->begin(begin);
+        result.pending.dialogue = ProfileDialogue::create(
+            begin.profile,
+            ProfileDialogueConfig{.negotiated_profiles = negotiated_profiles,
+                                  .zstd = caps.zstd});
+        result.pending.dialogue.begin(begin);
         return result;
     }
 
@@ -1402,8 +1404,8 @@ struct P50ServerEndpoint::Impl {
         if (!space.route || !space.route->pending)
             throw std::logic_error("BODY has no F active transaction");
         Pending& pending = *space.route->pending;
-        pending.dialogue->append_body(message);
-        if (pending.dialogue->state() == ZstdTuDialogue::State::BodyClosed)
+        pending.dialogue.append_body(message);
+        if (pending.dialogue.state() == ProfileDialogueState::BodyClosed)
             record(ActionType::BODY_COMPLETE, session, &pending.begin);
     }
 
@@ -1411,8 +1413,8 @@ struct P50ServerEndpoint::Impl {
         const Namespace& space = require(session);
         if (!space.route || !space.route->pending)
             throw std::logic_error("BODY has no F active transaction");
-        return space.route->pending->dialogue->state() ==
-               ZstdTuDialogue::State::BodyClosed;
+        return space.route->pending->dialogue.state() ==
+               ProfileDialogueState::BodyClosed;
     }
 
     TxCommit materialize_and_commit(
@@ -1425,9 +1427,9 @@ struct P50ServerEndpoint::Impl {
             throw std::logic_error("F endpoint has no active transaction");
         Route& route = *space.route;
         Pending& pending = *route.pending;
-        if (pending.dialogue->state() != ZstdTuDialogue::State::BodyClosed)
+        if (pending.dialogue.state() != ProfileDialogueState::BodyClosed)
             throw std::logic_error("input cannot materialize before BODY closure");
-        std::vector<uint8_t> exact = pending.dialogue->materialize();
+        std::vector<uint8_t> exact = pending.dialogue.materialize();
         record(ActionType::INPUT_MATERIALIZED, session, &pending.begin);
         committed_begin = pending.begin;
         TxCommit commit{pending.begin.history_nonce,
@@ -1466,7 +1468,7 @@ struct P50ServerEndpoint::Impl {
         ++route.next_rel.value;
         route.last_commit = commit;
         route.interrupted.reset();
-        pending.dialogue->commit_visible();
+        pending.dialogue.commit_visible();
         release_pending(pending);
         route.pending.reset();
         record(ActionType::INPUT_COMMITTED, session, &committed_begin, commit.post_state_digest);

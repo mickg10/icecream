@@ -1,0 +1,149 @@
+#include "p50_profile.h"
+
+#include <stdexcept>
+#include <utility>
+
+namespace icecc::p50 {
+namespace {
+
+ProfileDialogueState map_state(ZstdTuDialogue::State state) noexcept {
+    switch (state) {
+    case ZstdTuDialogue::State::Idle:
+        return ProfileDialogueState::Idle;
+    case ZstdTuDialogue::State::ReceivingBody:
+        return ProfileDialogueState::ReceivingBody;
+    case ZstdTuDialogue::State::BodyClosed:
+        return ProfileDialogueState::BodyClosed;
+    case ZstdTuDialogue::State::Materialized:
+        return ProfileDialogueState::Materialized;
+    case ZstdTuDialogue::State::Terminal:
+        return ProfileDialogueState::Terminal;
+    }
+    return ProfileDialogueState::Terminal;
+}
+
+void destroy_zstd(void* object) noexcept {
+    delete static_cast<ZstdTuDialogue*>(object);
+}
+
+void begin_zstd(void* object, const TxBegin& begin) {
+    static_cast<ZstdTuDialogue*>(object)->begin(begin);
+}
+
+void append_dict_zstd(void* object, const DictMessage& message) {
+    static_cast<ZstdTuDialogue*>(object)->append_dict(message);
+}
+
+void append_body_zstd(void* object, const BodyMessage& message) {
+    static_cast<ZstdTuDialogue*>(object)->append_body(message);
+}
+
+void receive_need_zstd(void* object, const NeedMessage& message) {
+    static_cast<ZstdTuDialogue*>(object)->receive_need(message);
+}
+
+void receive_fill_zstd(void* object, const FillMessage& message) {
+    static_cast<ZstdTuDialogue*>(object)->receive_fill(message);
+}
+
+std::vector<uint8_t> materialize_zstd(void* object) {
+    return static_cast<ZstdTuDialogue*>(object)->materialize();
+}
+
+void commit_visible_zstd(void* object) {
+    static_cast<ZstdTuDialogue*>(object)->commit_visible();
+}
+
+void disconnect_zstd(void* object) noexcept {
+    static_cast<ZstdTuDialogue*>(object)->disconnect();
+}
+
+ProfileDialogueState state_zstd(const void* object) noexcept {
+    return map_state(static_cast<const ZstdTuDialogue*>(object)->state());
+}
+
+bool terminal_zstd(const void* object) noexcept {
+    return static_cast<const ZstdTuDialogue*>(object)->terminal();
+}
+
+size_t pending_body_bytes_zstd(const void* object) noexcept {
+    return static_cast<const ZstdTuDialogue*>(object)->pending_body_bytes();
+}
+
+const TxBegin* active_begin_zstd(const void* object) noexcept {
+    const auto& active = static_cast<const ZstdTuDialogue*>(object)->active_begin();
+    return active ? &*active : nullptr;
+}
+
+const ProfileDialogueVTable kZstdTuVTable{
+    .profile = ProfileId::ZSTD_TU,
+    .destroy = destroy_zstd,
+    .begin = begin_zstd,
+    .append_dict = append_dict_zstd,
+    .append_body = append_body_zstd,
+    .receive_need = receive_need_zstd,
+    .receive_fill = receive_fill_zstd,
+    .materialize = materialize_zstd,
+    .commit_visible = commit_visible_zstd,
+    .disconnect = disconnect_zstd,
+    .state = state_zstd,
+    .terminal = terminal_zstd,
+    .pending_body_bytes = pending_body_bytes_zstd,
+    .active_begin = active_begin_zstd,
+};
+
+} // namespace
+
+const ProfileDialogueVTable& ProfileDialogue::empty_table() noexcept {
+    static const ProfileDialogueVTable empty{
+        .profile = ProfileId::ZSTD_TU,
+    };
+    return empty;
+}
+
+void ProfileDialogue::reset() noexcept {
+    if (object_ != nullptr)
+        table_->destroy(object_);
+    table_ = &empty_table();
+    object_ = nullptr;
+}
+
+ProfileDialogue::~ProfileDialogue() { reset(); }
+
+ProfileDialogue::ProfileDialogue(ProfileDialogue&& other) noexcept
+    : table_(other.table_), object_(other.object_) {
+    other.table_ = &empty_table();
+    other.object_ = nullptr;
+}
+
+ProfileDialogue& ProfileDialogue::operator=(ProfileDialogue&& other) noexcept {
+    if (this != &other) {
+        reset();
+        table_ = other.table_;
+        object_ = other.object_;
+        other.table_ = &empty_table();
+        other.object_ = nullptr;
+    }
+    return *this;
+}
+
+ProfileDialogue ProfileDialogue::create(ProfileId profile, ProfileDialogueConfig config) {
+    return make_profile_dialogue(profile, config);
+}
+
+ProfileDialogue make_profile_dialogue(ProfileId profile, ProfileDialogueConfig config) {
+    const uint32_t selected_bit = profile_bit(profile);
+    if (selected_bit == 0 ||
+        (config.negotiated_profiles & selected_bit) != selected_bit)
+        throw std::invalid_argument("transaction profile was not negotiated");
+    switch (profile) {
+    case ProfileId::ZSTD_TU:
+        return ProfileDialogue(&kZstdTuVTable,
+                               new ZstdTuDialogue(config.negotiated_profiles,
+                                                  config.zstd));
+    default:
+        throw std::invalid_argument("transaction profile has no dialogue implementation");
+    }
+}
+
+} // namespace icecc::p50
