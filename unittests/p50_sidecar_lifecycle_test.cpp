@@ -361,6 +361,33 @@ void test_lifecycle() {
               lifecycle.state() == LifecycleState::RetryEligible,
           "exact group and path proof authorizes retry");
 
+    // A legacy request can arrive before the outer loop has observed a fork,
+    // so there is no process-group lease to prove.  Even a permissive
+    // GroupObservation::Gone/path-absent callback must remain inert in this
+    // state; otherwise it can manufacture a teardown proof and release a
+    // legacy transition for an incarnation that never had a child.
+    SidecarLifecycleConfig pre_fork_config = config;
+    // Keep this witness independent of the allocator's prior launch history;
+    // the invariant under test is the absence of a fork/group lease, not
+    // allocator exhaustion from the earlier lifecycle rows.
+    pre_fork_config.identities = allocator(config.control_generation);
+    SidecarLifecycle pre_fork_legacy(pre_fork_config);
+    (void)pre_fork_legacy.begin(t0);
+    LifecycleObservation pre_fork_request;
+    pre_fork_request.request_legacy = true;
+    CHECK(pre_fork_legacy.advance(t0, pre_fork_request).action ==
+              LifecycleAction::Withdraw &&
+              pre_fork_legacy.state() == LifecycleState::ReapAndGroupCheck,
+          "pre-fork legacy request enters proof-gated teardown");
+    LifecycleObservation no_group_proof;
+    no_group_proof.group = GroupObservation::Gone;
+    no_group_proof.path_absent = true;
+    no_group_proof.observed_path = pre_fork_legacy.identity()->private_directory;
+    CHECK(pre_fork_legacy.advance(t0 + std::chrono::milliseconds(1), no_group_proof).action ==
+              LifecycleAction::None &&
+              pre_fork_legacy.state() == LifecycleState::ReapAndGroupCheck,
+          "no group proof cannot authorize pre-fork legacy transition");
+
     // Even an injected verifier that returns true for every callback cannot
     // authorize a fabricated lease or a mismatched observed PGID.  The
     // reducer independently binds both facts to the exact fork lease.

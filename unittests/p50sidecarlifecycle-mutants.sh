@@ -5,7 +5,11 @@ build="${ICECC_TEST_BUILDDIR:-$(pwd)}"
 cxx="${ICECC_TEST_CXX:-c++}"
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/p50-sidecar-lifecycle-mutant.XXXXXX")"
 trap 'rm -r -- "$tmp"' EXIT HUP INT TERM
-for mutant_name in pgid store-generation stale-ready listener-node teardown-deadline legacy-direct owner-key group-domain fabricated-lease over-capacity discarded-registration socket-substitution; do
+expected_mutants=13
+mutant_count=0
+compiled_count=0
+for mutant_name in pgid store-generation stale-ready listener-node teardown-deadline legacy-direct owner-key group-domain fabricated-lease over-capacity discarded-registration socket-substitution group-proof-required; do
+    mutant_count=$((mutant_count + 1))
     cp "$root/cache/p50_sidecar_lifecycle.cpp" "$tmp/mutant.cpp"
     # These are semantic deletion mutants; the runtime witness must redden
     # each one rather than merely matching source text.
@@ -35,11 +39,20 @@ for mutant_name in pgid store-generation stale-ready listener-node teardown-dead
         # Keep the substitution bypass syntactically valid so the behavioral
         # witness, rather than the compiler, kills this true mutant.
         sed -i '/if (::lstat(lease.socket_path.c_str(), \&listener) != 0 ||/,/listener.st_ino != lease.listener_inode)/c\    if (false)' "$tmp/mutant.cpp"
-    else
+    elif test "$mutant_name" = group-proof-required; then
+        # A permissive observation must not authorize teardown before the
+        # reducer has captured a group lease for the fork.  Restore the
+        # fail-closed branch to true to make this semantic mutant executable.
+        perl -0pi -e 's/if \(!group_proof_required_\)\n        return false;/if (!group_proof_required_)\n        return true;/' "$tmp/mutant.cpp"
+    elif test "$mutant_name" = owner-key; then
         sed -i 's/event\.owner != owner_key()/false/' "$tmp/mutant.cpp"
+    else
+        echo "unknown lifecycle mutant: $mutant_name" >&2
+        exit 1
     fi
     "$cxx" -std=c++20 -I"$root" -I"$root/cache" -I"$root/services" ${ICECC_TEST_CXXFLAGS:-} \
         -c "$tmp/mutant.cpp" -o "$tmp/mutant.o"
+    compiled_count=$((compiled_count + 1))
     "$cxx" -std=c++20 -pthread -I"$root" -I"$root/services" \
         "$root/unittests/p50_sidecar_lifecycle_test.cpp" "$tmp/mutant.o" \
         "$build/../cache/libp50sidecarsupervisor.a" "$build/../cache/libp50localtransport.a" \
@@ -51,3 +64,5 @@ for mutant_name in pgid store-generation stale-ready listener-node teardown-dead
         exit 1
     fi
 done
+test "$mutant_count" -eq "$expected_mutants"
+test "$compiled_count" -eq "$expected_mutants"
