@@ -94,7 +94,7 @@ observes that same child as stopped with `waitid(P_PIDFD, ... WNOWAIT)`. Only
 that live, unreapable leader plus an exact `getpgid` match authorizes a
 nonzero signal to the numeric process group. Helpers receive a bounded
 `SIGTERM` grace period while the stopped leader anchors the PGID, after which
-the group and exact child receive `SIGKILL`. A blocking `waitpid` follows only
+the group and exact child receive `SIGKILL`. An exact-handle reap follows only
 after exit or a kill result is established. The direct child is never
 signalled through its numeric PID.
 
@@ -103,7 +103,9 @@ absence are proved. The process-group path uses the raw `kill` syscall, so a
 libc wrapper returning persistent `EINTR` cannot strand descendants. Every
 owned descriptor, including the pidfd, is closed. A competing SIGCHLD reaper
 cannot reap a stopped live leader, so it cannot open a PGID-reuse window before
-the group KILL. Group ownership is explicit and cleared on every teardown
+the group KILL. Reaping is likewise bound to the pidfd with
+`waitid(P_PIDFD, WEXITED)`; an external SIGCHLD reaper or later numeric PID
+reuse therefore cannot make the supervisor reap an unrelated child. Group ownership is explicit and cleared on every teardown
 path; an unowned/stale numeric PGID is never signalled. If the leader already
 exited, was externally reaped, moved out of the group, or cannot be stopped and
 observed exactly, the supervisor uses only the pidfd for direct-child teardown.

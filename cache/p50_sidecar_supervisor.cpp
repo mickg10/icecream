@@ -749,6 +749,29 @@ void Supervisor::reap_blocking() noexcept {
         close_if_open(child_pidfd_);
         return;
     }
+    // Once a pidfd has been acquired, never use the reusable numeric PID for
+    // reaping.  An external SIGCHLD reaper may consume this child between a
+    // kill/exit observation and this call; a later fork could then reuse the
+    // numeric PID, and waitpid(child_pid_) would be able to reap that
+    // unrelated child.  P_PIDFD keeps the reap bound to this incarnation.
+#if defined(__linux__) && defined(WEXITED)
+    if (child_pidfd_ >= 0) {
+        constexpr idtype_t kPidfdIdType = static_cast<idtype_t>(3);
+        for (;;) {
+            siginfo_t information{};
+            const int result = ::waitid(kPidfdIdType,
+                                        static_cast<id_t>(child_pidfd_),
+                                        &information, WEXITED);
+            if (result == 0 || (result < 0 && errno == ECHILD))
+                break;
+            if (errno != EINTR)
+                break;
+        }
+        child_pid_ = -1;
+        close_if_open(child_pidfd_);
+        return;
+    }
+#endif
     int status = 0;
     for (;;) {
         const pid_t result = ::waitpid(child_pid_, &status, 0);

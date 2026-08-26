@@ -85,6 +85,7 @@ grep -F 'SYS_openat' "$impl" >/dev/null
 grep -F 'SYS_kill' "$impl" >/dev/null
 grep -F 'errno != EPERM' "$impl" >/dev/null
 grep -F 'WNOWAIT' "$impl" >/dev/null
+grep -F 'waitid(kPidfdIdType' "$impl" >/dev/null
 grep -F 'child_has_exited' "$impl" >/dev/null
 grep -F 'getpgid' "$impl" >/dev/null
 grep -F 'move-group' "$src/unittests/p50_sidecar_supervisor_test.cpp" >/dev/null
@@ -137,6 +138,8 @@ if grep -F 'signal_child_handle(child_pidfd_, SIGTERM)' "$impl" >/dev/null; then
     echo 'FAIL: exact leader must remain STOP-anchored until numeric group use ends' >&2
     exit 1
 fi
+grep -F 'if (child_pidfd_ >= 0)' "$impl" >/dev/null
+grep -F 'static_cast<id_t>(child_pidfd_)' "$impl" >/dev/null
 if grep -F 'setpgid' "$impl" >/dev/null; then
     echo 'FAIL: supervisor regressed from a private session to a joinable daemon-session group' >&2
     exit 1
