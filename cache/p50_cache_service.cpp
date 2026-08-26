@@ -50,6 +50,8 @@ constexpr std::string_view kExpectedGenerationEnvironment =
     "ICECC_CACHE_SERVICE_EXPECTED_GENERATION";
 constexpr std::string_view kExpectedAttemptEnvironment =
     "ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT";
+constexpr std::string_view kExpectedDerivationVersionEnvironment =
+    "ICECC_CACHE_SERVICE_EXPECTED_DERIVATION_VERSION";
 constexpr std::string_view kExpectedFStoreGuidEnvironment =
     "ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID";
 constexpr std::string_view kExpectedCStoreGuidEnvironment =
@@ -245,6 +247,26 @@ bool parse_int(std::string_view text, int& value) noexcept {
     return true;
 }
 
+template <typename Guid>
+bool parse_guid_hex(std::string_view text, Guid& target) noexcept {
+    if (text.size() != target.bytes.size() * 2)
+        return false;
+    for (size_t index = 0; index != target.bytes.size(); ++index) {
+        auto nibble = [](char value) -> int {
+            if (value >= '0' && value <= '9') return value - '0';
+            if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+            if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+            return -1;
+        };
+        const int high = nibble(text[index * 2]);
+        const int low = nibble(text[index * 2 + 1]);
+        if (high < 0 || low < 0)
+            return false;
+        target.bytes[index] = static_cast<uint8_t>((high << 4) | low);
+    }
+    return target != Guid{};
+}
+
 bool next_value(int argc, char* const argv[], int& index, std::string_view& value) noexcept {
     if (index + 1 >= argc || argv[index + 1] == nullptr)
         return false;
@@ -255,7 +277,8 @@ bool next_value(int argc, char* const argv[], int& index, std::string_view& valu
 bool parse_option_uint(std::string_view name, std::string_view value, uint64_t& target) noexcept {
     if (name == "--generation" || name == "--attempt" || name == "--peer-uid" ||
         name == "--peer-gid" || name == "--expected-uid" || name == "--expected-gid" ||
-        name == "--drop-uid" || name == "--drop-gid")
+        name == "--drop-uid" || name == "--drop-gid" ||
+        name == "--store-derivation-version")
         return parse_uint(value, target);
     return false;
 }
@@ -302,6 +325,8 @@ std::string bytes_hex(std::span<const uint8_t> bytes);
 struct StructuredLaunch {
     bool active = false;
     local::Identity identity{};
+    StoreIdentityRoot store_root{};
+    uint64_t store_derivation_version = 0;
     CStoreGuid c_store_guid{};
     FStoreGuid f_store_guid{};
     std::string socket_path;
@@ -310,10 +335,11 @@ struct StructuredLaunch {
 
 bool read_structured_launch(StructuredLaunch& launch) noexcept {
     try {
-        constexpr std::array<std::string_view, 8> names{
+        constexpr std::array<std::string_view, 9> names{
             kReadyFormatEnvironment,
             kExpectedGenerationEnvironment,
             kExpectedAttemptEnvironment,
+            kExpectedDerivationVersionEnvironment,
             kExpectedFStoreGuidEnvironment,
             kExpectedCStoreGuidEnvironment,
             kExpectedSocketEnvironment,
@@ -339,15 +365,20 @@ bool read_structured_launch(StructuredLaunch& launch) noexcept {
         const std::string_view format(values[0]);
         const std::string_view generation_text(values[1]);
         const std::string_view attempt_text(values[2]);
-        const std::string_view expected_guid(values[3]);
-        const std::string_view expected_c_guid(values[4]);
-        const std::string_view expected_socket(values[5]);
-        const std::string_view expected_digest(values[6]);
-        const std::string_view listener_fd_text(values[7]);
+        const std::string_view derivation_text(values[3]);
+        const std::string_view expected_guid(values[4]);
+        const std::string_view expected_c_guid(values[5]);
+        const std::string_view expected_socket(values[6]);
+        const std::string_view expected_digest(values[7]);
+        const std::string_view listener_fd_text(values[8]);
         uint64_t generation = 0;
         uint64_t attempt = 0;
+        uint64_t derivation_version = 0;
         if (format != "2" || !parse_uint(generation_text, generation) ||
-            !parse_uint(attempt_text, attempt) || generation == 0 || attempt == 0 ||
+            !parse_uint(attempt_text, attempt) ||
+            !parse_uint(derivation_text, derivation_version) ||
+            derivation_version != kStoreIdentityDerivationVersion ||
+            generation == 0 || attempt == 0 ||
             generation == std::numeric_limits<uint64_t>::max() ||
             attempt == std::numeric_limits<uint64_t>::max() ||
             expected_socket.empty() || expected_socket.front() != '/' ||
@@ -363,9 +394,16 @@ bool read_structured_launch(StructuredLaunch& launch) noexcept {
         if (ready_fd_text == nullptr || !parse_int(ready_fd_text, ready_fd) ||
             ready_fd < 3 || ready_fd == listener_fd)
             return false;
+        CStoreGuid c_guid{};
+        FStoreGuid guid{};
+        if (!parse_guid_hex(expected_guid, guid) ||
+            !parse_guid_hex(expected_c_guid, c_guid) || c_guid == guid)
+            return false;
+        const StoreIdentityRoot root = store_identity_root_from_f_guid(guid);
+        if (!root.valid() || c_guid != c_store_guid_for_root(root) ||
+            guid != f_store_guid_for_root(root))
+            return false;
         const local::Identity identity{generation, attempt};
-        const CStoreGuid c_guid = c_store_guid_for_incarnation(identity);
-        const FStoreGuid guid = f_store_guid_for_incarnation(identity);
         const icecc::Digest128 digest = icecc::digest128(expected_socket);
         if (expected_guid != bytes_hex(std::span<const uint8_t>(
                                  guid.bytes.data(), guid.bytes.size())) ||
@@ -375,6 +413,8 @@ bool read_structured_launch(StructuredLaunch& launch) noexcept {
             return false;
         launch.active = true;
         launch.identity = identity;
+        launch.store_root = root;
+        launch.store_derivation_version = derivation_version;
         launch.c_store_guid = c_guid;
         launch.f_store_guid = guid;
         launch.socket_path.assign(expected_socket);
@@ -548,12 +588,13 @@ struct ListenerIdentity {
 };
 
 bool write_ready_lease(int fd, const Options& options, const ListenerIdentity& listener) noexcept {
-    const CStoreGuid c_guid = c_store_guid_for_incarnation(options.identity);
-    const FStoreGuid guid = f_store_guid_for_incarnation(options.identity);
+    const CStoreGuid c_guid = options.c_store_guid;
+    const FStoreGuid guid = options.f_store_guid;
     const std::string digest = digest128_hex(digest128(options.socket_path));
     const std::string message =
         "READY v2 generation=" + std::to_string(options.identity.generation) +
         " attempt=" + std::to_string(options.identity.attempt) +
+        " DERIVATION_VERSION=" + std::to_string(options.store_derivation_version) +
         " pid=" + std::to_string(static_cast<long long>(::getpid())) +
         " C_STORE_GUID=" + bytes_hex(std::span<const uint8_t>(c_guid.bytes.data(),
                                                                   c_guid.bytes.size())) +
@@ -765,14 +806,6 @@ bool handle_connection(local::Connection connection, const Options& options,
 }
 
 } // namespace
-
-CStoreGuid c_store_guid_for_identity(local::Identity identity) noexcept {
-    return c_store_guid_for_incarnation(identity);
-}
-
-FStoreGuid f_store_guid_for_identity(local::Identity identity) noexcept {
-    return f_store_guid_for_incarnation(identity);
-}
 
 namespace {
 
@@ -1222,6 +1255,9 @@ bool parse_options(int argc, char* const argv[], Options& options, bool& show_he
         bool have_attempt = false;
         bool have_uid = false;
         bool have_gid = false;
+        bool have_store_derivation_version = false;
+        bool have_c_store_guid = false;
+        bool have_f_store_guid = false;
         for (int index = 1; index < argc; ++index) {
             if (argv[index] == nullptr)
                 return false;
@@ -1242,7 +1278,9 @@ bool parse_options(int argc, char* const argv[], Options& options, bool& show_he
             }
             if (name == "--generation" || name == "--attempt" || name == "--peer-uid" ||
                 name == "--peer-gid" || name == "--expected-uid" || name == "--expected-gid" ||
-                name == "--drop-uid" || name == "--drop-gid" || name == "--backlog") {
+                name == "--drop-uid" || name == "--drop-gid" || name == "--backlog" ||
+                name == "--store-derivation-version" || name == "--c-store-guid" ||
+                name == "--f-store-guid") {
                 if (!next_value(argc, argv, index, value))
                     return false;
                 uint64_t parsed = 0;
@@ -1250,6 +1288,14 @@ bool parse_options(int argc, char* const argv[], Options& options, bool& show_he
                     if (!parse_int(value, options.backlog) || options.backlog < 1 ||
                         options.backlog > kMaxBacklog)
                         return false;
+                } else if (name == "--c-store-guid") {
+                    if (have_c_store_guid || !parse_guid_hex(value, options.c_store_guid))
+                        return false;
+                    have_c_store_guid = true;
+                } else if (name == "--f-store-guid") {
+                    if (have_f_store_guid || !parse_guid_hex(value, options.f_store_guid))
+                        return false;
+                    have_f_store_guid = true;
                 } else if (!parse_option_uint(name, value, parsed)) {
                     return false;
                 } else if (name == "--generation") {
@@ -1262,6 +1308,12 @@ bool parse_options(int argc, char* const argv[], Options& options, bool& show_he
                         return false;
                     options.identity.attempt = parsed;
                     have_attempt = true;
+                } else if (name == "--store-derivation-version") {
+                    if (have_store_derivation_version || options.store_derivation_version != 0 ||
+                        parsed != kStoreIdentityDerivationVersion)
+                        return false;
+                    options.store_derivation_version = parsed;
+                    have_store_derivation_version = true;
                 } else if (name == "--peer-uid" || name == "--expected-uid") {
                     if (have_uid)
                         return false;
@@ -1303,7 +1355,22 @@ int run(const Options& options) noexcept {
     if (!read_structured_launch(structured_launch))
         return 2;
     if (structured_launch.active) {
+        // The supervisor publishes the same immutable tuple in argv and the
+        // authenticated environment.  Both channels must agree exactly;
+        // neither an old GUID nor a current GUID paired with an old launch
+        // may be silently overwritten by the environment copy.
+        if (options.identity != structured_launch.identity ||
+            options.store_derivation_version != structured_launch.store_derivation_version ||
+            options.c_store_guid != structured_launch.c_store_guid ||
+            options.f_store_guid != structured_launch.f_store_guid ||
+            options.socket_path != structured_launch.socket_path)
+        {
+            return 2;
+        }
         effective_options.identity = structured_launch.identity;
+        effective_options.store_derivation_version = structured_launch.store_derivation_version;
+        effective_options.c_store_guid = structured_launch.c_store_guid;
+        effective_options.f_store_guid = structured_launch.f_store_guid;
         effective_options.socket_path = structured_launch.socket_path;
     }
     OwnedFd ready;
@@ -1352,17 +1419,27 @@ int run(const Options& options) noexcept {
         return 2;
     }
     RuntimeConfig runtime_config;
-    // The store identity is explicit runtime state, derived only from the
-    // already authenticated service generation.  A production launcher can
-    // construct SidecarRuntime directly with its durable store GUID.
+    // The store identity is explicit launch state allocated by the supervisor;
+    // it is independent of the control launch identity and rotates on every
+    // restart. Never derive it from generation/attempt or a local clock.
+    StoreIdentityRoot legacy_root{};
+    if (!structured_launch.active && !fresh_store_identity_root(legacy_root))
+        return 2;
+    if (structured_launch.active &&
+        (effective_options.store_derivation_version != kStoreIdentityDerivationVersion ||
+         effective_options.c_store_guid == CStoreGuid{} ||
+         effective_options.f_store_guid == FStoreGuid{} ||
+         effective_options.c_store_guid != c_store_guid_for_root(
+             store_identity_root_from_f_guid(effective_options.f_store_guid)) ||
+         effective_options.f_store_guid != f_store_guid_for_root(
+             store_identity_root_from_f_guid(effective_options.f_store_guid))))
+        return 2;
     runtime_config.f_store_guid = structured_launch.active
-                                      ? structured_launch.f_store_guid
-                                      : f_store_guid_for_incarnation(
-                                            effective_options.identity);
+                                      ? effective_options.f_store_guid
+                                      : f_store_guid_for_root(legacy_root);
     runtime_config.c_store_guid = structured_launch.active
-                                      ? structured_launch.c_store_guid
-                                      : c_store_guid_for_incarnation(
-                                            effective_options.identity);
+                                      ? effective_options.c_store_guid
+                                      : c_store_guid_for_root(legacy_root);
     std::unique_ptr<SidecarRuntime> runtime;
     try {
         runtime = std::make_unique<SidecarRuntime>(std::move(runtime_config));

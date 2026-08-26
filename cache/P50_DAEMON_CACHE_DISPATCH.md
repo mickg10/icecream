@@ -34,7 +34,8 @@ by the daemon; it cannot be mistaken for a compiler-input stream.
 
 In the on-demand constructor, the private relationship source is an immutable
 current READY-lease endpoint, not an attached descriptor. The endpoint binds
-the exact generation/attempt-derived F-store GUID, socket path digest,
+the exact CSPRNG-rooted, role-tagged F-store GUID and StoreIdentity derivation
+version, socket path digest,
 pathname device/inode, and expected PID+UID+GID. After the discriminator is
 decoded, the daemon revalidates the current pathname, creates one fresh
 AF_UNIX connection, and performs a

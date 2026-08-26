@@ -9,6 +9,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -87,15 +88,16 @@ enum class Failure : uint8_t {
 
 struct LaunchIncarnation {
     local::Identity identity{};
+    StoreIdentityRoot store_root{};
     CStoreGuid c_store_guid{};
     FStoreGuid f_store_guid{};
 
     [[nodiscard]] bool valid() const noexcept {
         return identity.generation != 0 && identity.attempt != 0 &&
-        c_store_guid != CStoreGuid{} && f_store_guid != FStoreGuid{} &&
-        c_store_guid != f_store_guid &&
-        c_store_guid == c_store_guid_for_incarnation(identity) &&
-        f_store_guid == f_store_guid_for_incarnation(identity);
+        store_root.valid() && c_store_guid != CStoreGuid{} &&
+        f_store_guid != FStoreGuid{} && c_store_guid != f_store_guid &&
+        c_store_guid == c_store_guid_for_root(store_root) &&
+        f_store_guid == f_store_guid_for_root(store_root);
     }
 };
 
@@ -105,13 +107,17 @@ struct LaunchIncarnation {
 // launch attempt or F_STORE_GUID.
 class LaunchIdentityAllocator {
 public:
-    LaunchIdentityAllocator(uint64_t generation, uint64_t first_attempt = 1) noexcept;
+    LaunchIdentityAllocator(uint64_t generation, uint64_t first_attempt = 1,
+                            StoreIdentityEntropyProvider entropy_provider =
+                                system_store_identity_entropy) noexcept;
     std::optional<LaunchIncarnation> allocate() noexcept;
 
 private:
     std::mutex mutex_;
     uint64_t generation_ = 0;
     uint64_t next_attempt_ = 0;
+    StoreIdentityEntropyProvider entropy_provider_ = nullptr;
+    std::deque<StoreIdentityRoot> recent_roots_;
 };
 
 struct Config {
@@ -128,7 +134,7 @@ struct Config {
     // the time-window budget when each failed attempt itself spans a window.
     uint32_t max_attempts_per_recovery = 16;
 
-    // When set, each launch receives a fresh identity-derived private
+    // When set, each launch receives a fresh StoreIdentity-rooted private
     // directory and must publish a structured READY lease.  The directory is
     // never reused between launches or Supervisor recreations.
     std::string lease_root;
@@ -138,6 +144,8 @@ struct Config {
 struct ReadyLease {
     local::Identity identity{};
     pid_t pid = -1;
+    StoreIdentityRoot store_root{};
+    uint64_t store_derivation_version = 0;
     CStoreGuid c_store_guid{};
     FStoreGuid f_store_guid{};
     std::string private_directory;
@@ -150,8 +158,10 @@ struct ReadyLease {
 
     [[nodiscard]] bool valid() const noexcept {
         if (identity.generation == 0 || identity.attempt == 0 || pid <= 1 ||
-            c_store_guid != c_store_guid_for_incarnation(identity) ||
-            f_store_guid != f_store_guid_for_incarnation(identity) ||
+            !store_root.valid() ||
+            store_derivation_version != kStoreIdentityDerivationVersion ||
+            c_store_guid != c_store_guid_for_root(store_root) ||
+            f_store_guid != f_store_guid_for_root(store_root) ||
             c_store_guid == f_store_guid ||
             !detail::canonical_absolute_lease_path(private_directory) ||
             private_directory.size() + sizeof("/cache.sock") - 1 > local::kMaxUnixPath ||

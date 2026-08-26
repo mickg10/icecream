@@ -1,6 +1,6 @@
 # Protocol-50 sidecar supervisor
 
-`p50_sidecar_supervisor` is the lifecycle and private-incarnation boundary for
+`p50_sidecar_supervisor` is the lifecycle and private StoreIdentity boundary for
 the `icecc-cache-service` sidecar. It does not open a listener, attach to a
 daemon, select a scheduler owner, or alter the Login advertisement. A daemon
 adapter consumes its state, counters, and immutable current READY lease without
@@ -63,15 +63,16 @@ fails closed rather than wrapping.
 Each launch creates a fresh `mkdtemp` directory named with the generation and
 attempt plus a unique suffix. The supervisor scrubs and then publishes the
 complete six-field structured environment tuple: READY format, generation,
-attempt, expected F-store GUID, exact socket path, and path digest. The service
+attempt, StoreIdentity derivation version, expected C/F store GUIDs, exact socket
+path, and path digest. The service
 rejects a partial tuple. It must close this bounded structured frame:
 
 ```text
-READY v2 generation=N attempt=N pid=N F_STORE_GUID=... PATH=/... DIGEST=... DEV=N INO=N
+READY v2 generation=N attempt=N DERIVATION_VERSION=1 pid=N C_STORE_GUID=... F_STORE_GUID=... PATH=/... DIGEST=... DEV=N INO=N
 ```
 
 The supervisor accepts the lease only when all fields match the allocated
-incarnation and direct PID, the GUID and path digest recompute, and pathname
+StoreIdentity root, role GUIDs, and direct PID, the GUID and path digest recompute, and pathname
 `lstat` proves the exact 0600 socket node and advertised device/inode. After
 READY EOF it crosses a small bounded scheduling barrier and rechecks that the
 direct child is still live before promoting the lease. An immediately dying
@@ -82,7 +83,7 @@ proved, and then re-lstats both exact identities; a replacement pathname or
 inode is never blindly unlinked. If death is uncertain, the unique path is
 deliberately leaked for external recovery and no replacement launch is
 authorized. `current_lease()` is the sole lease observation for a daemon
-adapter, and a dispatcher may use only that matching path, GUID, incarnation,
+adapter, and a dispatcher may use only that matching path, GUID, StoreIdentity,
 PID/credentials, and listener identity.
 
 ## Shutdown

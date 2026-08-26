@@ -29,7 +29,9 @@ nonzero `--drop-uid` and `--drop-gid`; the process clears supplementary groups,
 sets gid then uid, and proves real/effective/saved ids before adopting the
 pre-bound listener.
 
-The installed F-store GUID is the complete authenticated incarnation:
+The installed F-store GUID is the role-tagged projection of a fresh
+CSPRNG-backed StoreIdentity root (C is root||0 and F is root||1; neither is
+derived from the local generation/attempt identity):
 generation and attempt are encoded independently. Consequently a restart
 with the same generation and a new attempt cannot reopen the prior empty-store
 identity.
@@ -50,7 +52,7 @@ ICECC_CACHE_SERVICE_EXPECTED_SOCKET_DIGEST=...
 Any partial tuple, reserved/wrapping identity, noncanonical GUID, path, or
 digest exits before listener adoption. A complete valid tuple overrides stale
 command-line identity/path values; the supervisor, not a static CLI pathname,
-owns the incarnation. The service uses that effective identity throughout
+owns the launch. The service uses that effective identity throughout
 runtime and request handling.
 
 The supervisor creates the private `0700` lease directory and binds the unique
@@ -70,7 +72,8 @@ the listener-FD field as part of the all-or-none tuple; an orphaned or aliased
 listener field is rejected. After privilege checks and listener identity capture complete, the
 service writes legacy `READY\n` only for the standalone form. A structured
 supervisor launch writes the exact READY-v2 generation, attempt, PID,
-domain-separated nonzero C/F store GUIDs, path, digest, and listener
+domain-separated nonzero C/F store GUIDs, StoreIdentity derivation version,
+path, digest, and listener
 device/inode frame. A short/interrupted/failing write exits nonzero; the
 supervisor owns structured pathname cleanup and no earlier failure emits
 readiness.

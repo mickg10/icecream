@@ -9,6 +9,7 @@
 // endpoint/store reducer.
 
 #include <cstdint>
+#include "p50_incarnation_identity.h"
 #include <chrono>
 #include <atomic>
 #include <future>
@@ -56,13 +57,6 @@ struct RuntimeResult {
     local::FdHandoffResult handoff{};
     std::optional<ServerRunResult> endpoint;
 };
-
-// Installed sidecars derive their empty-store identity from the complete
-// authenticated incarnation.  Both fields are encoded into the 128-bit GUID,
-// so a restart with the same generation but a new attempt cannot reopen the
-// previous empty store by accident.
-FStoreGuid f_store_guid_for_identity(local::Identity identity) noexcept;
-CStoreGuid c_store_guid_for_identity(local::Identity identity) noexcept;
 
 // One owner/reader for one authenticated control connection and one adopted
 // endpoint session.  The endpoint object and its mutable store remain on the
@@ -136,6 +130,9 @@ private:
 struct Options {
     std::string socket_path;
     local::Identity identity{};
+    uint64_t store_derivation_version = 0;
+    CStoreGuid c_store_guid{};
+    FStoreGuid f_store_guid{};
     local::CredentialExpectation expected_peer;
     std::optional<uint64_t> drop_uid;
     std::optional<uint64_t> drop_gid;

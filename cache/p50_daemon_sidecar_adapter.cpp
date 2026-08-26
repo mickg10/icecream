@@ -434,6 +434,8 @@ bool DaemonSidecarAdapter::attach_current() noexcept
         config_.expected_service_uid, config_.expected_service_gid,
         static_cast<uint64_t>(supervisor_->child_pid())};
     endpoint.lease_identity = lease.identity;
+    endpoint.store_root = lease.store_root;
+    endpoint.store_derivation_version = lease.store_derivation_version;
     endpoint.c_store_guid = lease.c_store_guid;
     endpoint.f_store_guid = lease.f_store_guid;
     endpoint.socket_path_digest = lease.socket_path_digest;

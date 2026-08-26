@@ -34,6 +34,21 @@ void check(bool condition, const char* expression) {
 
 #define CHECK(expression) check((expression), #expression)
 
+ssize_t short_entropy(void* buffer, size_t size, unsigned) noexcept {
+    std::memset(buffer, 0xa5, size);
+    return static_cast<ssize_t>(size - 1);
+}
+
+ssize_t zero_entropy(void* buffer, size_t size, unsigned) noexcept {
+    std::memset(buffer, 0, size);
+    return static_cast<ssize_t>(size);
+}
+
+ssize_t repeated_entropy(void* buffer, size_t size, unsigned) noexcept {
+    std::memset(buffer, 0x3c, size);
+    return static_cast<ssize_t>(size);
+}
+
 bool write_all(int fd, const char* bytes, size_t size) {
     size_t written = 0;
     while (written != size) {
@@ -84,6 +99,8 @@ int structured_child(const std::string& mode, int fd) {
     const char* generation =
         required_environment("ICECC_CACHE_SERVICE_EXPECTED_GENERATION");
     const char* attempt = required_environment("ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT");
+    const char* derivation =
+        required_environment("ICECC_CACHE_SERVICE_EXPECTED_DERIVATION_VERSION");
     const char* guid =
         required_environment("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID");
     const char* c_guid =
@@ -92,8 +109,8 @@ int structured_child(const std::string& mode, int fd) {
     const char* digest =
         required_environment("ICECC_CACHE_SERVICE_EXPECTED_SOCKET_DIGEST");
     if (format == nullptr || std::string(format) != "2" || generation == nullptr ||
-        attempt == nullptr || guid == nullptr || c_guid == nullptr || path == nullptr ||
-        digest == nullptr)
+        attempt == nullptr || derivation == nullptr || guid == nullptr ||
+        c_guid == nullptr || path == nullptr || digest == nullptr)
         return 108;
     int listener = -1;
     if (const char* raw_listener = ::getenv("ICECC_CACHE_SERVICE_LISTENER_FD");
@@ -115,6 +132,7 @@ int structured_child(const std::string& mode, int fd) {
                                     (mode == "structured-wrong-pid" ? 1 : 0);
     const std::string ready =
         "READY v2 generation=" + std::string(generation) + " attempt=" + attempt +
+        " DERIVATION_VERSION=" + derivation +
         " pid=" + std::to_string(published_pid) + " C_STORE_GUID=" + c_guid +
         " F_STORE_GUID=" + guid +
         " PATH=" + path + " DIGEST=" + digest +
@@ -420,8 +438,10 @@ void structured_lease_rotates_across_restart_and_controller_recreation() {
     noncanonical.private_directory += "/../alias";
     CHECK(!noncanonical.valid());
     CHECK((lease1.identity == icecc::p50::local::Identity{71, 1}));
+    CHECK(lease1.store_root.valid());
+    CHECK(lease1.store_derivation_version == icecc::p50::kStoreIdentityDerivationVersion);
     CHECK(lease1.f_store_guid ==
-          icecc::p50::f_store_guid_for_incarnation(lease1.identity));
+          icecc::p50::f_store_guid_for_root(lease1.store_root));
     CHECK(::kill(first.child_pid(), SIGKILL) == 0);
     bool restarted = false;
     for (int attempt = 0; attempt != 100 && !restarted; ++attempt) {
@@ -434,8 +454,10 @@ void structured_lease_rotates_across_restart_and_controller_recreation() {
     const ReadyLease lease2 = *first.current_lease();
     CHECK(lease2.valid());
     CHECK((lease2.identity == icecc::p50::local::Identity{71, 2}));
+    CHECK(lease2.store_root.valid());
+    CHECK(lease2.store_derivation_version == icecc::p50::kStoreIdentityDerivationVersion);
     CHECK(lease2.f_store_guid ==
-          icecc::p50::f_store_guid_for_incarnation(lease2.identity));
+          icecc::p50::f_store_guid_for_root(lease2.store_root));
     CHECK(lease2.f_store_guid != lease1.f_store_guid);
     CHECK(lease2.private_directory != lease1.private_directory);
     CHECK(lease2.socket_path != lease1.socket_path);
@@ -447,8 +469,8 @@ void structured_lease_rotates_across_restart_and_controller_recreation() {
     CHECK((replacement.current_lease()->identity ==
            icecc::p50::local::Identity{71, 3}));
     CHECK(replacement.current_lease()->f_store_guid ==
-          icecc::p50::f_store_guid_for_incarnation(
-              replacement.current_lease()->identity));
+          icecc::p50::f_store_guid_for_root(
+              replacement.current_lease()->store_root));
     replacement.shutdown();
     CHECK(::rmdir(root.c_str()) == 0);
 }
@@ -461,10 +483,12 @@ void structured_actual_service_publishes_prebound_ready() {
     Config config = structured_config("unused", root, allocator, 0);
     config.executable = service_path;
     const std::string stale_socket = root + "/stale.sock";
-    config.arguments = {"--socket", stale_socket,
-                        "--peer-uid", std::to_string(static_cast<uint64_t>(::getuid())),
-                        "--peer-gid", std::to_string(static_cast<uint64_t>(::getgid())),
-                        "--generation", "1", "--attempt", "1"};
+    // Supervisor owns the structured socket, generation, attempt, and
+    // StoreIdentity arguments.  The service-specific peer credentials remain
+    // caller configuration; duplicating supervisor-owned options is rejected
+    // by the strict service parser.
+    config.arguments = {"--peer-uid", std::to_string(static_cast<uint64_t>(::getuid())),
+                        "--peer-gid", std::to_string(static_cast<uint64_t>(::getgid()))};
     Supervisor supervisor(config);
     CHECK(supervisor.start());
     CHECK(supervisor.state() == State::Ready);
@@ -543,6 +567,15 @@ void cleanup_never_deletes_replaced_directory() {
 }
 
 void launch_allocator_refuses_reserved_and_exhausted_identities() {
+    icecc::p50::StoreIdentityRoot root{};
+    CHECK(!icecc::p50::fresh_store_identity_root_with_provider(root, short_entropy));
+    CHECK(root == icecc::p50::StoreIdentityRoot{});
+    CHECK(!icecc::p50::fresh_store_identity_root_with_provider(root, zero_entropy));
+    CHECK(root == icecc::p50::StoreIdentityRoot{});
+    LaunchIdentityAllocator repeated(8, 1, repeated_entropy);
+    CHECK(repeated.allocate().has_value());
+    CHECK(!repeated.allocate().has_value());
+
     LaunchIdentityAllocator zero_generation(0, 1);
     CHECK(!zero_generation.allocate().has_value());
     LaunchIdentityAllocator max_generation(std::numeric_limits<uint64_t>::max(), 1);
@@ -925,7 +958,7 @@ void bounded_recovery_attempts() {
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc == 3 && std::string(argv[1]) == "--fake-child")
+    if (argc >= 3 && std::string(argv[1]) == "--fake-child")
         return fake_child(argv[2]);
     try {
         validation_and_exec_failure();

@@ -375,7 +375,7 @@ bool parse_ready_lease(std::string_view wire, const ReadyLease& expected,
     if (wire.size() < 10 || wire.back() != '\n' || wire.find('\0') != std::string_view::npos)
         return false;
     wire.remove_suffix(1);
-    std::array<std::string_view, 11> fields{};
+    std::array<std::string_view, 12> fields{};
     size_t begin = 0;
     for (size_t index = 0; index != fields.size(); ++index) {
         if (begin >= wire.size())
@@ -401,10 +401,10 @@ bool parse_ready_lease(std::string_view wire, const ReadyLease& expected,
         return false;
     if (fields[0] != "READY" || fields[1] != "v2")
         return false;
-    static constexpr std::array<std::string_view, 9> keys = {
-        "generation", "attempt", "pid", "C_STORE_GUID", "F_STORE_GUID",
-        "PATH", "DIGEST", "DEV", "INO"};
-    std::array<std::string_view, 9> values{};
+    static constexpr std::array<std::string_view, 10> keys = {
+        "generation", "attempt", "DERIVATION_VERSION", "pid", "C_STORE_GUID",
+        "F_STORE_GUID", "PATH", "DIGEST", "DEV", "INO"};
+    std::array<std::string_view, 10> values{};
     for (size_t index = 0; index != keys.size(); ++index) {
         const std::string_view field = fields[index + 2];
         const size_t equals = field.find('=');
@@ -413,23 +413,26 @@ bool parse_ready_lease(std::string_view wire, const ReadyLease& expected,
             return false;
         values[index] = field.substr(equals + 1);
     }
-    uint64_t generation = 0, attempt = 0, pid = 0, device = 0, inode = 0;
+    uint64_t generation = 0, attempt = 0, derivation_version = 0, pid = 0, device = 0,
+             inode = 0;
     const bool scalar_ok = parse_uint64(values[0], generation) &&
                            parse_uint64(values[1], attempt) &&
-                           parse_uint64(values[2], pid) &&
-                           parse_uint64(values[7], device) &&
-                           parse_uint64(values[8], inode);
+                           parse_uint64(values[2], derivation_version) &&
+                           parse_uint64(values[3], pid) &&
+                           parse_uint64(values[8], device) &&
+                           parse_uint64(values[9], inode);
     const bool identity_ok = pid == static_cast<uint64_t>(child) &&
+                             derivation_version == kStoreIdentityDerivationVersion &&
                              generation == expected.identity.generation &&
                              attempt == expected.identity.attempt && device != 0 && inode != 0;
-    const bool guid_ok = values[3] == bytes_hex(std::span<const uint8_t>(
+    const bool guid_ok = values[4] == bytes_hex(std::span<const uint8_t>(
                                       expected.c_store_guid.bytes.data(),
                                       expected.c_store_guid.bytes.size())) &&
-                         values[4] == bytes_hex(std::span<const uint8_t>(
+                         values[5] == bytes_hex(std::span<const uint8_t>(
                                       expected.f_store_guid.bytes.data(),
                                       expected.f_store_guid.bytes.size()));
-    const bool path_ok = values[5] == expected.socket_path &&
-                         values[6] == digest128_hex(expected.socket_path_digest);
+    const bool path_ok = values[6] == expected.socket_path &&
+                         values[7] == digest128_hex(expected.socket_path_digest);
     if (!scalar_ok || !identity_ok || !guid_ok || !path_ok)
         return false;
     struct stat socket_info{};
@@ -441,6 +444,7 @@ bool parse_ready_lease(std::string_view wire, const ReadyLease& expected,
         return false;
     actual = expected;
     actual.pid = child;
+    actual.store_derivation_version = derivation_version;
     actual.listener_device = static_cast<dev_t>(device);
     actual.listener_inode = static_cast<ino_t>(inode);
     return actual.valid();
@@ -501,9 +505,24 @@ bool capture_and_remove_at(int parent_fd, std::string_view name,
             }
             if (errno == EEXIST)
                 continue;
-            // ENOSYS/EINVAL (and denied syscall policies) are deliberately
-            // not replaced with unlink/rmdir fallbacks: unsupported atomic
-            // capture means the only safe result is to leak the lease.
+            // Some filesystems return EINVAL for renameat2 even though plain
+            // directory-FD rename is available. Capture with plain rename
+            // into our unique name, then perform the same inode check below.
+            // If a replacement won the race, it is left in the private
+            // capture name (never unlinked or overwritten): cleanup fails
+            // closed while preserving the unrelated object.
+            if (errno == EINVAL || errno == ENOSYS) {
+                struct stat collision{};
+                if (::fstatat(parent_fd, captured.c_str(), &collision,
+                              AT_SYMLINK_NOFOLLOW) == 0)
+                    continue;
+                if (errno != ENOENT)
+                    return false;
+                if (::renameat(parent_fd, source.c_str(), parent_fd, captured.c_str()) != 0)
+                    return errno == ENOENT;
+                captured_entry = true;
+                break;
+            }
             if (errno == ENOENT)
                 return true;
             return false;
@@ -649,8 +668,10 @@ Supervisor::Supervisor(Config config) : config_(std::move(config)) {}
 Supervisor::~Supervisor() { shutdown(); }
 
 LaunchIdentityAllocator::LaunchIdentityAllocator(uint64_t generation,
-                                                 uint64_t first_attempt) noexcept
-    : generation_(generation), next_attempt_(first_attempt) {
+                                                 uint64_t first_attempt,
+                                                 StoreIdentityEntropyProvider entropy_provider) noexcept
+    : generation_(generation), next_attempt_(first_attempt),
+      entropy_provider_(entropy_provider) {
     // Zero is reserved by the wire contract.  MAX is also rejected rather
     // than permitting an allocation whose successor would wrap and become
     // indistinguishable from an uninitialized allocator.
@@ -667,11 +688,31 @@ std::optional<LaunchIncarnation> LaunchIdentityAllocator::allocate() noexcept {
         next_attempt_ == std::numeric_limits<uint64_t>::max())
         return std::nullopt;
     const local::Identity identity{generation_, next_attempt_++};
-    LaunchIncarnation incarnation{identity, c_store_guid_for_incarnation(identity),
-                                  f_store_guid_for_incarnation(identity)};
-    if (!incarnation.valid())
+    constexpr size_t kMaxRootRetries = 8;
+    for (size_t retry = 0; retry != kMaxRootRetries; ++retry) {
+        StoreIdentityRoot root{};
+        if (!fresh_store_identity_root_with_provider(root, entropy_provider_))
+            return std::nullopt;
+        bool duplicate = false;
+        for (const StoreIdentityRoot& prior : recent_roots_) {
+            if (prior == root) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate)
+            continue;
+        recent_roots_.push_back(root);
+        constexpr size_t kMaxDuplicateHistory = 128;
+        if (recent_roots_.size() > kMaxDuplicateHistory)
+            recent_roots_.pop_front();
+        LaunchIncarnation incarnation{identity, root, c_store_guid_for_root(root),
+                                      f_store_guid_for_root(root)};
+        if (incarnation.valid())
+            return incarnation;
         return std::nullopt;
-    return incarnation;
+    }
+    return std::nullopt;
 }
 
 bool Supervisor::prepare_lease() noexcept {
@@ -701,6 +742,8 @@ bool Supervisor::prepare_lease() noexcept {
         }
         ReadyLease lease;
         lease.identity = incarnation->identity;
+        lease.store_root = incarnation->store_root;
+        lease.store_derivation_version = kStoreIdentityDerivationVersion;
         lease.c_store_guid = incarnation->c_store_guid;
         lease.f_store_guid = incarnation->f_store_guid;
         lease.private_directory = directory;
@@ -1278,6 +1321,7 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
                              value.rfind("ICECC_CACHE_SERVICE_READY_FORMAT=", 0) == 0 ||
                              value.rfind("ICECC_CACHE_SERVICE_EXPECTED_GENERATION=", 0) == 0 ||
                              value.rfind("ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT=", 0) == 0 ||
+                             value.rfind("ICECC_CACHE_SERVICE_EXPECTED_DERIVATION_VERSION=", 0) == 0 ||
                              value.rfind("ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID=", 0) == 0 ||
                              value.rfind("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID=", 0) == 0 ||
                              value.rfind("ICECC_CACHE_SERVICE_EXPECTED_SOCKET=", 0) == 0 ||
@@ -1301,6 +1345,8 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
                                       std::to_string(pending_lease_->identity.generation));
         environment_storage.push_back("ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT=" +
                                       std::to_string(pending_lease_->identity.attempt));
+        environment_storage.push_back("ICECC_CACHE_SERVICE_EXPECTED_DERIVATION_VERSION=" +
+                                      std::to_string(kStoreIdentityDerivationVersion));
         environment_storage.push_back("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID=" +
                                       bytes_hex(std::span<const uint8_t>(
                                           pending_lease_->f_store_guid.bytes.data(),
@@ -1319,10 +1365,26 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
     environment.push_back(nullptr);
 
     std::vector<std::string> argv_storage;
-    argv_storage.reserve(config_.arguments.size() + 1);
+    argv_storage.reserve(config_.arguments.size() + 13);
     argv_storage.push_back(config_.executable);
     for (const std::string& argument : config_.arguments)
         argv_storage.push_back(argument);
+    if (pending_lease_.has_value()) {
+        argv_storage.push_back("--socket");
+        argv_storage.push_back(pending_lease_->socket_path);
+        argv_storage.push_back("--generation");
+        argv_storage.push_back(std::to_string(pending_lease_->identity.generation));
+        argv_storage.push_back("--attempt");
+        argv_storage.push_back(std::to_string(pending_lease_->identity.attempt));
+        argv_storage.push_back("--store-derivation-version");
+        argv_storage.push_back(std::to_string(kStoreIdentityDerivationVersion));
+        argv_storage.push_back("--c-store-guid");
+        argv_storage.push_back(bytes_hex(std::span<const uint8_t>(
+            pending_lease_->c_store_guid.bytes.data(), pending_lease_->c_store_guid.bytes.size())));
+        argv_storage.push_back("--f-store-guid");
+        argv_storage.push_back(bytes_hex(std::span<const uint8_t>(
+            pending_lease_->f_store_guid.bytes.data(), pending_lease_->f_store_guid.bytes.size())));
+    }
     std::vector<char*> argv;
     for (std::string& value : argv_storage)
         argv.push_back(value.data());

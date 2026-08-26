@@ -16,6 +16,7 @@
 #include "services/digest128.h"
 
 #include "p50_fd_handoff.h"
+#include "p50_incarnation_identity.h"
 #include "p50_phase_open.h"
 #include "protocol50.h"
 
@@ -54,6 +55,8 @@ struct OnDemandEndpoint {
     std::string socket_path;
     local::CredentialExpectation expected_peer;
     local::Identity lease_identity{};
+    StoreIdentityRoot store_root{};
+    uint64_t store_derivation_version = 0;
     CStoreGuid c_store_guid{};
     FStoreGuid f_store_guid{};
     icecc::Digest128 socket_path_digest{};

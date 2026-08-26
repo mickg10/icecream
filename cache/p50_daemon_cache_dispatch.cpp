@@ -19,10 +19,12 @@ constexpr uint32_t kCacheSession = 0x50f00000u;
 bool OnDemandEndpoint::valid() const noexcept {
     return !socket_path.empty() && lease_identity.generation != 0 &&
            lease_identity.attempt != 0 &&
+           store_root.valid() &&
+           store_derivation_version == kStoreIdentityDerivationVersion &&
            c_store_guid != CStoreGuid{} && c_store_guid != f_store_guid &&
-           c_store_guid == c_store_guid_for_incarnation(lease_identity) &&
+           c_store_guid == c_store_guid_for_root(store_root) &&
            f_store_guid != FStoreGuid{} &&
-           f_store_guid == f_store_guid_for_incarnation(lease_identity) &&
+           f_store_guid == f_store_guid_for_root(store_root) &&
            socket_path_digest != icecc::Digest128{} && listener_device != 0 &&
            listener_inode != 0 && expected_peer.uid.has_value() &&
            expected_peer.gid.has_value() && expected_peer.pid.has_value() &&

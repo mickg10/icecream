@@ -19,32 +19,16 @@ void check(bool condition, const char* expression) {
 }
 
 int main() {
-    const local::Identity identity{23, 4};
-    const CStoreGuid c = c_store_guid_for_incarnation(identity);
-    const FStoreGuid f = f_store_guid_for_incarnation(identity);
+    StoreIdentityRoot root{};
+    root.bytes[15] = 4;
+    const CStoreGuid c = c_store_guid_for_root(root);
+    const FStoreGuid f = f_store_guid_for_root(root);
     CHECK(c != CStoreGuid{} && f != FStoreGuid{} && c != f);
-    for (size_t index = 0; index != sizeof(identity.generation); ++index)
-        CHECK(c.bytes[index] == f.bytes[index]);
-    for (size_t index = 0; index != sizeof(identity.attempt); ++index)
-        CHECK(c.bytes[sizeof(identity.generation) + index] ==
-              static_cast<uint8_t>(f.bytes[sizeof(identity.generation) + index] ^
-                                   (kCIncarnationAttemptDomainMask >>
-                                    (56u - static_cast<unsigned>(index) * 8u))));
-    // The old overlapping byte layout overwrote generation bytes 4..7 with
-    // the attempt.  These tuples differ only in those overwritten bits and
-    // must still produce distinct C identities.
-    const CStoreGuid overwritten_generation_a =
-        c_store_guid_for_incarnation({0x1122334455667788ULL, 0x0102030405060708ULL});
-    const CStoreGuid overwritten_generation_b =
-        c_store_guid_for_incarnation({0x11223344aabbccddULL, 0x0102030405060708ULL});
-    CHECK(overwritten_generation_a != overwritten_generation_b);
-    CHECK(c_store_guid_for_incarnation({23, 4}) !=
-          c_store_guid_for_incarnation({23, 5}));
-    CHECK(c_store_guid_for_incarnation({23, 4}) !=
-          c_store_guid_for_incarnation({24, 4}));
-    CHECK(c_store_guid_for_incarnation({1, 1}) !=
-          c_store_guid_for_incarnation({std::numeric_limits<uint64_t>::max(),
-                                        std::numeric_limits<uint64_t>::max()}));
+    CHECK((c.bytes[0] & kStoreIdentityRoleBit) == 0);
+    CHECK((f.bytes[0] & kStoreIdentityRoleBit) != 0);
+    StoreIdentityRoot other_root{};
+    other_root.bytes[15] = 5;
+    CHECK(c_store_guid_for_root(other_root) != c);
 
     ClientRoleOwner client(c, f, RoleLimits{1});
     ServerRoleOwner server(c, f, RoleLimits{1});
@@ -97,7 +81,7 @@ int main() {
 
     int namespace_pair[2] = {-1, -1};
     CHECK(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, namespace_pair) == 0);
-    const CStoreGuid other_c = c_store_guid_for_incarnation({23, 5});
+    const CStoreGuid other_c = c_store_guid_for_root(other_root);
     CHECK(!client.adopt(RoleDiscriminator::Client, other_c, f, namespace_pair[0]).has_value());
     CHECK(client.counters().rejected_namespace == 1);
     (void)::close(namespace_pair[1]);

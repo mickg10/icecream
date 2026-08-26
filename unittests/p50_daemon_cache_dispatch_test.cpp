@@ -109,8 +109,10 @@ struct EndpointFixture {
         // gate must retain the exact PID credential binding as a visible field.
         endpoint.expected_peer.pid = static_cast<uint64_t>(::getpid());
         endpoint.lease_identity = identity;
-        endpoint.c_store_guid = icecc::p50::c_store_guid_for_incarnation(identity);
-        endpoint.f_store_guid = icecc::p50::f_store_guid_for_incarnation(identity);
+        endpoint.store_root.bytes[15] = 0x11;
+        endpoint.store_derivation_version = icecc::p50::kStoreIdentityDerivationVersion;
+        endpoint.c_store_guid = icecc::p50::c_store_guid_for_root(endpoint.store_root);
+        endpoint.f_store_guid = icecc::p50::f_store_guid_for_root(endpoint.store_root);
         endpoint.socket_path_digest = icecc::digest128(path);
         endpoint.listener_device = info.st_dev;
         endpoint.listener_inode = info.st_ino;
@@ -232,8 +234,8 @@ int main() {
         CHECK(fixture.endpoint.lease_identity == fixture.identity,
               "endpoint lease identity is exact generation and attempt");
         CHECK(fixture.endpoint.f_store_guid ==
-                  icecc::p50::f_store_guid_for_incarnation(fixture.identity),
-              "endpoint F_STORE_GUID binds the incarnation");
+                  icecc::p50::f_store_guid_for_root(fixture.endpoint.store_root),
+              "endpoint F_STORE_GUID binds the fresh store root");
         CHECK(fixture.endpoint.socket_path_digest == icecc::digest128(fixture.path),
               "endpoint digest binds the exact socket path");
         CHECK(fixture.endpoint.listener_device != 0 && fixture.endpoint.listener_inode != 0,
