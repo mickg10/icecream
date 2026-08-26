@@ -19,6 +19,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <utility>
+#include <string_view>
+#include <cstdlib>
+
+#include "services/digest128.h"
 
 extern char** environ;
 
@@ -27,7 +31,7 @@ namespace {
 
 constexpr char kReadyMessage[] = "READY\n";
 constexpr size_t kReadyMessageSize = sizeof(kReadyMessage) - 1;
-constexpr size_t kMaxReadyBytes = kReadyMessageSize;
+constexpr size_t kMaxReadyBytes = 1024;
 constexpr int kPollSliceMilliseconds = 20;
 constexpr int kMaxFallbackFd = 8192;
 constexpr size_t kMaxProcFdBytes = 1u << 20;
@@ -289,8 +293,99 @@ bool command_is_valid(const Config& config) noexcept {
             return false;
     }
     struct stat info{};
-    return ::stat(config.executable.c_str(), &info) == 0 && S_ISREG(info.st_mode) &&
-           ::access(config.executable.c_str(), X_OK) == 0;
+    if (::stat(config.executable.c_str(), &info) != 0 || !S_ISREG(info.st_mode) ||
+        ::access(config.executable.c_str(), X_OK) != 0)
+        return false;
+    if (config.lease_root.empty())
+        return true;
+    struct stat root{};
+    return config.identity.generation != 0 && config.identity.attempt != 0 &&
+           config.f_store_guid != FStoreGuid{} && config.lease_root.front() == '/' &&
+           config.lease_root.size() <= local::kMaxUnixPath &&
+           ::lstat(config.lease_root.c_str(), &root) == 0 && S_ISDIR(root.st_mode) &&
+           root.st_uid == ::geteuid() && (root.st_mode & 07777) == 0700;
+}
+
+std::string bytes_hex(std::span<const uint8_t> bytes);
+
+bool parse_uint64(std::string_view text, uint64_t& value) noexcept {
+    if (text.empty())
+        return false;
+    value = 0;
+    for (const char character : text) {
+        if (character < '0' || character > '9' ||
+            value > (std::numeric_limits<uint64_t>::max() -
+                     static_cast<uint64_t>(character - '0')) / 10)
+            return false;
+        value = value * 10 + static_cast<uint64_t>(character - '0');
+    }
+    return true;
+}
+
+bool parse_ready_lease(std::string_view wire, const ReadyLease& expected,
+                       pid_t child, ReadyLease& actual) noexcept {
+    if (wire.size() < 10 || wire.back() != '\n' || wire.find('\0') != std::string_view::npos)
+        return false;
+    wire.remove_suffix(1);
+    std::array<std::string_view, 10> fields{};
+    size_t count = 0;
+    while (!wire.empty() && count != fields.size()) {
+        const size_t space = wire.find(' ');
+        fields[count++] = wire.substr(0, space);
+        if (space == std::string_view::npos) {
+            wire = {};
+            break;
+        }
+        wire.remove_prefix(space + 1);
+    }
+    if (count != fields.size() || !wire.empty() || fields[0] != "READY" ||
+        fields[1] != "v2")
+        return false;
+    const auto value_for = [&fields](std::string_view key) -> std::string_view {
+        for (size_t i = 2; i != fields.size(); ++i)
+            if (fields[i].substr(0, key.size() + 1) == key &&
+                fields[i][key.size()] == '=')
+                return fields[i].substr(key.size() + 1);
+        return {};
+    };
+    uint64_t generation = 0, attempt = 0, pid = 0, device = 0, inode = 0;
+    const std::string_view generation_text = value_for("generation");
+    const std::string_view attempt_text = value_for("attempt");
+    const std::string_view pid_text = value_for("pid");
+    const std::string_view device_text = value_for("DEV");
+    const std::string_view inode_text = value_for("INO");
+    if (!parse_uint64(generation_text, generation) || !parse_uint64(attempt_text, attempt) ||
+        !parse_uint64(pid_text, pid) || !parse_uint64(device_text, device) ||
+        !parse_uint64(inode_text, inode) || pid != static_cast<uint64_t>(child) ||
+        generation != expected.identity.generation || attempt != expected.identity.attempt ||
+        device == 0 || inode == 0 ||
+        value_for("F_STORE_GUID") != bytes_hex(std::span<const uint8_t>(
+            expected.f_store_guid.bytes.data(), expected.f_store_guid.bytes.size())) ||
+        value_for("PATH") != expected.socket_path ||
+        value_for("DIGEST") != digest128_hex(expected.socket_path_digest))
+        return false;
+    struct stat socket_info{};
+    if (::lstat(expected.socket_path.c_str(), &socket_info) != 0 ||
+        !S_ISSOCK(socket_info.st_mode) || socket_info.st_dev != static_cast<dev_t>(device) ||
+        socket_info.st_ino != static_cast<ino_t>(inode) ||
+        socket_info.st_uid != ::geteuid() || (socket_info.st_mode & 07777) != 0600)
+        return false;
+    actual = expected;
+    actual.pid = child;
+    actual.listener_device = static_cast<dev_t>(device);
+    actual.listener_inode = static_cast<ino_t>(inode);
+    return true;
+}
+
+std::string bytes_hex(std::span<const uint8_t> bytes) {
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(bytes.size() * 2);
+    for (const uint8_t byte : bytes) {
+        result.push_back(digits[byte >> 4]);
+        result.push_back(digits[byte & 0x0f]);
+    }
+    return result;
 }
 
 void close_if_open(int& fd) noexcept {
@@ -334,6 +429,62 @@ const char* failure_name(Failure failure) noexcept {
 Supervisor::Supervisor(Config config) : config_(std::move(config)) {}
 
 Supervisor::~Supervisor() { shutdown(); }
+
+bool Supervisor::prepare_lease() noexcept {
+    if (config_.lease_root.empty())
+        return true;
+    try {
+        std::string pattern = config_.lease_root + "/g" +
+                              std::to_string(config_.identity.generation) + "-a" +
+                              std::to_string(config_.identity.attempt) + "-XXXXXX";
+        std::vector<char> mutable_pattern(pattern.begin(), pattern.end());
+        mutable_pattern.push_back('\0');
+        char* directory = ::mkdtemp(mutable_pattern.data());
+        if (directory == nullptr)
+            return false;
+        struct stat directory_info{};
+        if (::lstat(directory, &directory_info) != 0 || !S_ISDIR(directory_info.st_mode) ||
+            directory_info.st_uid != ::geteuid() || (directory_info.st_mode & 07777) != 0700) {
+            (void)::rmdir(directory);
+            return false;
+        }
+        ReadyLease lease;
+        lease.identity = config_.identity;
+        lease.f_store_guid = config_.f_store_guid;
+        lease.private_directory = directory;
+        lease.socket_path = lease.private_directory + "/cache.sock";
+        if (lease.socket_path.size() > local::kMaxUnixPath) {
+            (void)::rmdir(directory);
+            return false;
+        }
+        lease.socket_path_digest = digest128(lease.socket_path);
+        lease.directory_device = directory_info.st_dev;
+        lease.directory_inode = directory_info.st_ino;
+        pending_lease_ = std::move(lease);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+void Supervisor::cleanup_lease(std::optional<ReadyLease>& lease) noexcept {
+    if (!lease.has_value())
+        return;
+    // Cleanup is intentionally identity based.  A replacement pathname or
+    // inode is left for its owner; this is the deletion/mutant boundary that
+    // prevents blind unlink after SIGKILL or controller recreation.
+    struct stat socket_info{};
+    if (::lstat(lease->socket_path.c_str(), &socket_info) == 0 &&
+        S_ISSOCK(socket_info.st_mode) && socket_info.st_dev == lease->listener_device &&
+        socket_info.st_ino == lease->listener_inode)
+        (void)::unlink(lease->socket_path.c_str());
+    struct stat directory_info{};
+    if (::lstat(lease->private_directory.c_str(), &directory_info) == 0 &&
+        S_ISDIR(directory_info.st_mode) && directory_info.st_dev == lease->directory_device &&
+        directory_info.st_ino == lease->directory_inode)
+        (void)::rmdir(lease->private_directory.c_str());
+    lease.reset();
+}
 
 bool Supervisor::valid_config(const Config& config) noexcept {
     return command_is_valid(config);
@@ -559,6 +710,8 @@ void Supervisor::shutdown() noexcept {
     increment_saturating(counters_.shutdowns);
     state_ = State::Stopping;
     terminate_child();
+    cleanup_lease(current_lease_);
+    cleanup_lease(pending_lease_);
     close_pipes();
     state_ = State::Stopped;
     last_failure_ = Failure::None;
@@ -593,6 +746,10 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
         state_ = State::DegradedLegacy;
         return false;
     }
+    if (!prepare_lease()) {
+        classify(Failure::Exec);
+        return false;
+    }
     int ready_pipe[2] = {-1, -1};
     int exec_pipe[2] = {-1, -1};
     if (!make_pipe(ready_pipe) || !make_pipe(exec_pipe)) {
@@ -619,7 +776,14 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
     bool replaced = false;
     for (char** entry = environ; entry != nullptr && *entry != nullptr; ++entry) {
         const std::string value(*entry);
-        if (value.rfind(std::string(kReadyFdEnvironment) + "=", 0) == 0) {
+        const bool managed = value.rfind(std::string(kReadyFdEnvironment) + "=", 0) == 0 ||
+                             value.rfind("ICECC_CACHE_SERVICE_READY_FORMAT=", 0) == 0 ||
+                             value.rfind("ICECC_CACHE_SERVICE_EXPECTED_GENERATION=", 0) == 0 ||
+                             value.rfind("ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT=", 0) == 0 ||
+                             value.rfind("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID=", 0) == 0 ||
+                             value.rfind("ICECC_CACHE_SERVICE_EXPECTED_SOCKET=", 0) == 0 ||
+                             value.rfind("ICECC_CACHE_SERVICE_EXPECTED_SOCKET_DIGEST=", 0) == 0;
+        if (managed) {
             if (!replaced) {
                 environment_storage.push_back(ready_env);
                 replaced = true;
@@ -630,6 +794,21 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
     }
     if (!replaced)
         environment_storage.push_back(ready_env);
+    if (pending_lease_.has_value()) {
+        environment_storage.push_back("ICECC_CACHE_SERVICE_READY_FORMAT=2");
+        environment_storage.push_back("ICECC_CACHE_SERVICE_EXPECTED_GENERATION=" +
+                                      std::to_string(pending_lease_->identity.generation));
+        environment_storage.push_back("ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT=" +
+                                      std::to_string(pending_lease_->identity.attempt));
+        environment_storage.push_back("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID=" +
+                                      bytes_hex(std::span<const uint8_t>(
+                                          pending_lease_->f_store_guid.bytes.data(),
+                                          pending_lease_->f_store_guid.bytes.size())));
+        environment_storage.push_back("ICECC_CACHE_SERVICE_EXPECTED_SOCKET=" +
+                                      pending_lease_->socket_path);
+        environment_storage.push_back("ICECC_CACHE_SERVICE_EXPECTED_SOCKET_DIGEST=" +
+                                      digest128_hex(pending_lease_->socket_path_digest));
+    }
     for (std::string& value : environment_storage)
         environment.push_back(value.data());
     environment.push_back(nullptr);
@@ -684,6 +863,7 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
         close_if_open(ready_pipe[0]);
         close_if_open(exec_pipe[0]);
         classify(Failure::Exec);
+        cleanup_lease(pending_lease_);
         return false;
     }
 
@@ -712,6 +892,7 @@ bool Supervisor::launch_and_wait(bool restart) noexcept {
         return true;
     close_pipes();
     terminate_child();
+    cleanup_lease(pending_lease_);
     return false;
 }
 
@@ -791,8 +972,12 @@ bool Supervisor::wait_for_ready() noexcept {
                     const ssize_t count = ::read(ready_read_, bytes, sizeof(bytes));
                     if (count > 0) {
                         ready.append(bytes, static_cast<size_t>(count));
+                        const std::string_view prefix = pending_lease_.has_value()
+                                                            ? std::string_view("READY v2 ")
+                                                            : std::string_view(kReadyMessage);
                         if (ready.size() > kMaxReadyBytes ||
-                            ready.compare(0, ready.size(), kReadyMessage, ready.size()) != 0) {
+                            ready.compare(0, std::min(ready.size(), prefix.size()), prefix,
+                                         std::min(ready.size(), prefix.size())) != 0) {
                             // Keep draining the exec-status side long enough
                             // to observe the group proof before cleanup.  A
                             // malformed READY frame must not erase evidence
@@ -806,8 +991,15 @@ bool Supervisor::wait_for_ready() noexcept {
                     if (count == 0) {
                         ready_eof = true;
                         close_if_open(ready_read_);
-                        if (ready.size() != kReadyMessageSize)
+                        if (pending_lease_.has_value()) {
+                            ReadyLease parsed;
+                            if (!parse_ready_lease(ready, *pending_lease_, expected_child, parsed))
+                                invalid_ready = true;
+                            else
+                                *pending_lease_ = std::move(parsed);
+                        } else if (ready.size() != kReadyMessageSize) {
                             invalid_ready = true;
+                        }
                         break;
                     }
                     if (errno == EINTR)
@@ -831,6 +1023,10 @@ bool Supervisor::wait_for_ready() noexcept {
                 return false;
             }
             close_pipes();
+            if (pending_lease_.has_value()) {
+                current_lease_ = std::move(pending_lease_);
+                pending_lease_.reset();
+            }
             state_ = State::Ready;
             last_failure_ = Failure::None;
             return true;
@@ -901,6 +1097,7 @@ bool Supervisor::poll() noexcept {
         return false;
     if (child_pid_ < 0) {
         terminate_group();
+        cleanup_lease(current_lease_);
         close_pipes();
         classify(Failure::PostReadyExit);
         return restart_after_failure();
@@ -908,6 +1105,7 @@ bool Supervisor::poll() noexcept {
     if (!child_has_exited(child_pid_))
         return true;
     terminate_group();
+    cleanup_lease(current_lease_);
     close_pipes();
     classify(Failure::PostReadyExit);
     return restart_after_failure();

@@ -100,7 +100,7 @@ Update Controller::observe(const Observation& observation) noexcept
     const bool ready = observation.supervisor_state == sidecar::State::Ready;
     const bool authenticated = observation.private_relationship_authenticated;
     const bool advertise = observation.public_listener_bound && ready
-        && authenticated;
+        && authenticated && observation.current_lease_matches;
     const Snapshot target = advertise
         ? present_snapshot(observation.public_listener_port)
         : kAbsent;

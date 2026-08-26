@@ -762,7 +762,6 @@ Connection connect_unix_until(const std::string& path,
             set_status(Status::IoError, status);
             return Connection(-1);
         }
-
         const socklen_t address_length =
             static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) + path.size() + 1);
         const int connect_result = connect_once(
@@ -850,7 +849,6 @@ Connection connect_unix_until_with_test_hook(
     return result;
 }
 #endif
-
 Connection accept_unix(int listener_fd, Status* status) noexcept {
     if (listener_fd < 0) {
         set_status(Status::InvalidArgument, status);

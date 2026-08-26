@@ -22,6 +22,8 @@ require 'observation.supervisor_state == sidecar::State::Ready' "$impl" \
     'presence is gated on exact supervisor READY'
 require 'observation.private_relationship_authenticated' "$impl" \
     'presence is gated on authenticated private HELLO/ACK'
+require 'observation.current_lease_matches' "$impl" \
+    'presence is gated on the current immutable READY lease'
 require 'crashed && current_.present()' "$impl" \
     'a post-READY crash forces withdrawal before recovery'
 require 'CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU' "$impl" \

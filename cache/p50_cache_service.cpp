@@ -26,6 +26,7 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#include "services/digest128.h"
 
 #include <utility>
 #include <future>
@@ -346,6 +347,17 @@ bool write_ready(int fd) noexcept {
     return written && signal_state_ok;
 }
 
+std::string bytes_hex(std::span<const uint8_t> bytes) {
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(bytes.size() * 2);
+    for (const uint8_t byte : bytes) {
+        result.push_back(digits[byte >> 4]);
+        result.push_back(digits[byte & 0x0f]);
+    }
+    return result;
+}
+
 bool drop_and_prove(const Options& options) noexcept {
     if (!options.expected_peer.uid.has_value() || !options.expected_peer.gid.has_value())
         return false;
@@ -403,6 +415,22 @@ struct ListenerIdentity {
     dev_t pathname_device = 0;
     ino_t pathname_inode = 0;
 };
+
+bool write_ready_lease(int fd, const Options& options, const ListenerIdentity& listener) noexcept {
+    const FStoreGuid guid = f_store_guid_for_identity(options.identity);
+    const std::string digest = digest128_hex(digest128(options.socket_path));
+    const std::string message =
+        "READY v2 generation=" + std::to_string(options.identity.generation) +
+        " attempt=" + std::to_string(options.identity.attempt) +
+        " pid=" + std::to_string(static_cast<long long>(::getpid())) +
+        " F_STORE_GUID=" + bytes_hex(std::span<const uint8_t>(guid.bytes.data(),
+                                                                 guid.bytes.size())) +
+        " PATH=" + options.socket_path + " DIGEST=" + digest +
+        " DEV=" + std::to_string(static_cast<unsigned long long>(listener.listener_device)) +
+        " INO=" + std::to_string(static_cast<unsigned long long>(listener.listener_inode)) +
+        "\n";
+    return write_exact(fd, message);
+}
 
 bool capture_listener_identity(int fd, const std::string& path,
                                ListenerIdentity& identity) noexcept {
@@ -1079,6 +1107,14 @@ bool parse_options(int argc, char* const argv[], Options& options, bool& show_he
 }
 
 int run(const Options& options) noexcept {
+    Options effective_options = options;
+    // The supervisor owns the per-incarnation pathname.  A command-line
+    // default is ignored whenever the structured lease contract is active;
+    // this prevents accidental static-path reuse across restart/controller
+    // recreation.
+    if (const char* expected_socket = ::getenv("ICECC_CACHE_SERVICE_EXPECTED_SOCKET");
+        expected_socket != nullptr && *expected_socket != '\0')
+        effective_options.socket_path = expected_socket;
     OwnedFd ready;
     if (!parse_ready_fd(ready))
         return 2;
@@ -1090,33 +1126,37 @@ int run(const Options& options) noexcept {
     if (!signals.install(wake.write.fd))
         return 2;
 
-    if (!drop_and_prove(options))
+    if (!drop_and_prove(effective_options))
         return 2;
 
     local::Status listen_status = local::Status::Ok;
-    const int listener = local::listen_unix(options.socket_path, options.backlog, &listen_status);
+    const int listener = local::listen_unix(effective_options.socket_path, effective_options.backlog,
+                                            &listen_status);
     if (listener < 0)
         return 2;
     OwnedFd listener_owner(listener);
     ListenerIdentity identity{};
-    if (!capture_listener_identity(listener, options.socket_path, identity)) {
-        cleanup_listener(listener, options.socket_path, identity);
+    if (!capture_listener_identity(listener, effective_options.socket_path, identity)) {
+        cleanup_listener(listener, effective_options.socket_path, identity);
         return 2;
     }
     RuntimeConfig runtime_config;
     // The store identity is explicit runtime state, derived only from the
     // already authenticated service generation.  A production launcher can
     // construct SidecarRuntime directly with its durable store GUID.
-    runtime_config.f_store_guid = f_store_guid_for_identity(options.identity);
+    runtime_config.f_store_guid = f_store_guid_for_identity(effective_options.identity);
     std::unique_ptr<SidecarRuntime> runtime;
     try {
         runtime = std::make_unique<SidecarRuntime>(std::move(runtime_config));
     } catch (...) {
-        cleanup_listener(listener, options.socket_path, identity);
+        cleanup_listener(listener, effective_options.socket_path, identity);
         return 2;
     }
-    if (g_stop_requested != 0 || !write_ready(ready.fd)) {
-        cleanup_listener(listener, options.socket_path, identity);
+    const bool structured_ready = ::getenv("ICECC_CACHE_SERVICE_READY_FORMAT") != nullptr;
+    if (g_stop_requested != 0 ||
+        !(structured_ready ? write_ready_lease(ready.fd, effective_options, identity)
+                           : write_ready(ready.fd))) {
+        cleanup_listener(listener, effective_options.socket_path, identity);
         return 2;
     }
     (void)::close(ready.fd);
@@ -1201,9 +1241,11 @@ int run(const Options& options) noexcept {
         worker->cancel_fd.store(cancel_fd, std::memory_order_release);
         try {
             worker->thread = std::thread(
-                [connection = std::move(connection), &options, runtime_ptr = runtime.get(),
+                [connection = std::move(connection), &effective_options,
+                 runtime_ptr = runtime.get(),
                  worker]() mutable {
-                    (void)handle_connection(std::move(connection), options, *runtime_ptr);
+                    (void)handle_connection(std::move(connection), effective_options,
+                                            *runtime_ptr);
                     const int fd = worker->cancel_fd.exchange(-1, std::memory_order_acq_rel);
                     if (fd >= 0)
                         (void)::close(fd);
@@ -1227,7 +1269,7 @@ int run(const Options& options) noexcept {
     }
     workers.clear();
 
-    cleanup_listener(listener, options.socket_path, identity);
+    cleanup_listener(listener, effective_options.socket_path, identity);
     return 0;
 }
 

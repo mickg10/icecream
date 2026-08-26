@@ -17,6 +17,9 @@ grep -F 'peer_credentials_verified' "$impl" >/dev/null
 grep -F 'validate_handshake' "$impl" >/dev/null
 grep -F 'connection.send_until' "$impl" >/dev/null
 grep -F 'connection.receive_until' "$impl" >/dev/null
+grep -F 'connect_unix_until' "$impl" >/dev/null
+grep -F 'expected_peer.pid' "$header" >/dev/null
+grep -F 'on_demand_' "$impl" >/dev/null
 grep -F 'const auto deadline' "$impl" >/dev/null
 grep -F 'identity != identity_' "$impl" >/dev/null
 grep -F 'next_request_id_++' "$impl" >/dev/null

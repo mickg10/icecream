@@ -9,6 +9,9 @@
 #include <chrono>
 #include <cstdint>
 #include <optional>
+#include <string>
+
+#include "services/digest128.h"
 
 #include "p50_fd_handoff.h"
 
@@ -34,11 +37,26 @@ struct CacheDispatchOutcome {
     bool detached = false;
 };
 
+struct OnDemandEndpoint {
+    std::string socket_path;
+    local::CredentialExpectation expected_peer;
+    std::optional<local::Identity> lease_identity;
+    std::optional<icecc::Digest128> socket_path_digest;
+
+    [[nodiscard]] bool valid() const noexcept {
+        return !socket_path.empty() && expected_peer.uid.has_value() &&
+               expected_peer.gid.has_value() && expected_peer.pid.has_value();
+    }
+};
+
 class CacheSessionDispatcher {
 public:
     explicit CacheSessionDispatcher(
         local::Identity identity,
         std::chrono::milliseconds handoff_timeout = std::chrono::milliseconds(250)) noexcept;
+    CacheSessionDispatcher(local::Identity identity, OnDemandEndpoint endpoint,
+                           std::chrono::milliseconds handoff_timeout =
+                               std::chrono::milliseconds(250)) noexcept;
     ~CacheSessionDispatcher();
 
     CacheSessionDispatcher(const CacheSessionDispatcher&) = delete;
@@ -52,11 +70,16 @@ public:
     // closed and not retained.
     bool attach_authenticated(local::Connection connection,
                               local::Identity identity) noexcept;
+    // Installs immutable lease data only.  No Connection is retained; each
+    // decoded CACHE_SESSION creates a fresh one-shot relationship.
+    bool set_on_demand_endpoint(OnDemandEndpoint endpoint) noexcept;
     void disable() noexcept;
 
     [[nodiscard]] bool available() const noexcept {
-        return sidecar_.has_value() && sidecar_->valid() &&
-               sidecar_->peer_credentials_verified() && valid_identity(identity_);
+        return (on_demand_.has_value() ? on_demand_->valid()
+                                       : sidecar_.has_value() && sidecar_->valid() &&
+                                             sidecar_->peer_credentials_verified()) &&
+               valid_identity(identity_);
     }
     [[nodiscard]] local::Identity identity() const noexcept { return identity_; }
     [[nodiscard]] uint64_t next_request_id() const noexcept { return next_request_id_; }
@@ -75,6 +98,9 @@ private:
     local::Identity identity_{};
     uint64_t next_request_id_ = 1;
     std::chrono::milliseconds handoff_timeout_;
+    std::optional<OnDemandEndpoint> on_demand_;
+    // Kept only for old checkpoint tests.  The configured product path never
+    // consults or retains this relationship.
     std::optional<local::Connection> sidecar_;
 };
 

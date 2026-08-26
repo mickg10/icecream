@@ -11,9 +11,14 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <optional>
 #include <vector>
 
+#include "p50_local_transport.h"
+#include "protocol50.h"
+
 #include <sys/types.h>
+#include <sys/stat.h>
 
 namespace icecc::p50::sidecar {
 
@@ -55,6 +60,32 @@ struct Config {
     // Hard cap for one synchronous start/recovery call.  This complements
     // the time-window budget when each failed attempt itself spans a window.
     uint32_t max_attempts_per_recovery = 16;
+
+    // When set, each launch receives a fresh identity-derived private
+    // directory and must publish a structured READY lease.  The directory is
+    // never reused between launches or Supervisor recreations.
+    std::string lease_root;
+    local::Identity identity{};
+    FStoreGuid f_store_guid{};
+};
+
+struct ReadyLease {
+    local::Identity identity{};
+    pid_t pid = -1;
+    FStoreGuid f_store_guid{};
+    std::string private_directory;
+    std::string socket_path;
+    Digest128 socket_path_digest{};
+    dev_t listener_device = 0;
+    ino_t listener_inode = 0;
+    dev_t directory_device = 0;
+    ino_t directory_inode = 0;
+
+    [[nodiscard]] bool valid() const noexcept {
+        return identity.generation != 0 && identity.attempt != 0 && pid > 1 &&
+               f_store_guid != FStoreGuid{} && !private_directory.empty() &&
+               !socket_path.empty() && listener_device != 0 && listener_inode != 0;
+    }
 };
 
 struct Counters {
@@ -111,6 +142,11 @@ public:
         return process_group_owned_ ? process_group_ : -1;
     }
     [[nodiscard]] bool has_private_fds() const noexcept;
+    // A lease is observable only after the exact structured READY frame has
+    // passed all identity, PID, path, digest, and listener inode checks.
+    [[nodiscard]] const std::optional<ReadyLease>& current_lease() const noexcept {
+        return current_lease_;
+    }
 
 private:
     bool launch_and_wait(bool restart) noexcept;
@@ -123,6 +159,8 @@ private:
     bool wait_for_exit(std::chrono::milliseconds timeout) noexcept;
     void terminate_child() noexcept;
     void terminate_group() noexcept;
+    bool prepare_lease() noexcept;
+    void cleanup_lease(std::optional<ReadyLease>& lease) noexcept;
 
     Config config_;
     State state_ = State::Stopped;
@@ -134,6 +172,8 @@ private:
     int ready_read_ = -1;
     int exec_read_ = -1;
     std::vector<std::chrono::steady_clock::time_point> restart_times_;
+    std::optional<ReadyLease> pending_lease_;
+    std::optional<ReadyLease> current_lease_;
 };
 
 } // namespace icecc::p50::sidecar

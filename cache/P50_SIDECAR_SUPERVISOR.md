@@ -45,6 +45,26 @@ The readiness and shutdown bounds may be zero for an immediate bound; the
 restart window must be positive so even a crashing child cannot create an
 unbounded retry loop.
 
+## Current READY lease
+
+When `Config::lease_root`, `identity`, and `f_store_guid` are supplied, every
+launch creates a fresh `mkdtemp` directory named with the generation and
+attempt, plus a unique suffix.  The child receives the exact socket path and
+path digest through its environment and must close the bounded structured
+frame:
+
+```text
+READY v2 generation=N attempt=N pid=N F_STORE_GUID=... PATH=/... DIGEST=... DEV=N INO=N
+```
+
+The supervisor accepts the lease only when all fields match the expected
+incarnation and PID, the path digest recomputes, and `lstat` proves the exact
+0600 socket node and advertised device/inode.  Cleanup occurs only after the
+owned process group is terminal and re-lstats both exact identities; a
+replacement pathname or inode is never blindly unlinked.  `current_lease()`
+is the sole lease observation for a daemon adapter, and a dispatcher may use
+only that matching path.
+
 ## Shutdown
 
 `shutdown()` sends `SIGTERM` to the owned process group and direct PID, waits at

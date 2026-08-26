@@ -33,9 +33,16 @@ grep -F 'process_group_owned_' "$impl" "$header" >/dev/null
 grep -F 'process_group_ = -1' "$impl" >/dev/null
 grep -F 'increment_saturating' "$impl" >/dev/null
 grep -F 'max_attempts_per_recovery' "$impl" "$header" >/dev/null
+grep -F 'mkdtemp' "$impl" >/dev/null
+grep -F 'parse_ready_lease' "$impl" >/dev/null
+grep -F 'F_STORE_GUID' "$impl" "$header" >/dev/null
+grep -F 'listener_device' "$impl" "$header" >/dev/null
+grep -F 'socket_path_digest' "$impl" "$header" >/dev/null
+grep -F 'cleanup_lease' "$impl" >/dev/null
+grep -F 'rmdir' "$impl" >/dev/null
 
 # The component must remain detached from advertisement and daemon ownership.
-if grep -E 'daemon/main|apply_inert_cache_advertisement|LoginMsg|port' "$impl" "$header" >/dev/null; then
+if grep -E 'daemon/main|apply_inert_cache_advertisement|LoginMsg|endpoint_port' "$impl" "$header" >/dev/null; then
     echo 'FAIL: supervisor gained daemon or advertisement integration' >&2
     exit 1
 fi

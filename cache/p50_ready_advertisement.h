@@ -46,6 +46,10 @@ struct Observation {
     // recreation.  A per-instance counter reset is therefore a fail-closed
     // regression, not a new baseline.
     uint64_t cumulative_post_ready_exits = 0;
+    // The daemon adapter sets this from the immutable current READY lease.
+    // A stale/replaced pathname, F_STORE_GUID, PID, or listener inode must
+    // withdraw capability even if an old relationship still authenticates.
+    bool current_lease_matches = true;
 };
 
 // One observation can produce two transitions only when a crash and recovery

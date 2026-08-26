@@ -31,6 +31,15 @@ after that frame is accepted does it call `release_fd_if_input_empty()` and
 send SCM_RIGHTS. A failed operation send leaves the ordinary descriptor owned
 by the daemon; it cannot be mistaken for a compiler-input stream.
 
+In the product constructor, the private relationship is an immutable current
+READY-lease endpoint, not an attached descriptor.  After the discriminator is
+decoded, the daemon creates one fresh AF_UNIX connection and performs a
+nonblocking connect, poll/SO_ERROR completion, exact PID+UID+GID
+`SO_PEERCRED`, HELLO, and HELLO_ACK before it calls
+`release_fd_if_input_empty()`.  Any failure in that prefix leaves the public
+descriptor owned by `MsgChannel`; the temporary relationship is closed by
+RAII.  A daemon-owned nonzero request id then names the one-shot handoff.
+
 The HELLO send uses `Connection::send_until()` over one absolute wall-time
 budget for the complete encoded frame, including partial writes.  Its bounded
 ACK receive uses `Connection::receive_until()` with that exact unchanged

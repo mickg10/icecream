@@ -22,9 +22,10 @@ static int failures = 0;
 static Observation observation(State state, bool authenticated,
                                uint64_t exits = 0,
                                bool listener_bound = true,
-                               uint32_t port = 10245)
+                               uint32_t port = 10245,
+                               bool current_lease = true)
 {
-    return Observation{listener_bound, port, state, authenticated, exits};
+    return Observation{listener_bound, port, state, authenticated, exits, current_lease};
 }
 
 static bool is_absent(const Snapshot& snapshot)
@@ -88,6 +89,11 @@ static void test_withdrawal_levels()
     update = controller.observe(observation(State::Ready, true, 0, false));
     CHECK(update.count == 1 && is_absent(update.transitions[0]),
           "public listener loss withdraws an advertised capability");
+
+    (void)controller.observe(observation(State::Ready, true));
+    update = controller.observe(observation(State::Ready, true, 0, true, 10245, false));
+    CHECK(update.count == 1 && is_absent(update.transitions[0]),
+          "stale READY lease withdraws an otherwise authenticated capability");
 }
 
 static void test_crash_edges_preserve_withdraw_before_republish()

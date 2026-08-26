@@ -47,6 +47,9 @@ compile_and_kill ready-gate \
 compile_and_kill authentication-gate \
     'const bool authenticated = observation.private_relationship_authenticated;' \
     'const bool authenticated = true;'
+compile_and_kill current-lease-gate \
+    '&& authenticated && observation.current_lease_matches;' \
+    '&& authenticated && true;'
 compile_and_kill crash-withdrawal \
     'if (crashed && current_.present()) {' \
     'if ((static_cast<void>(crashed), false) && current_.present()) {'

@@ -688,7 +688,8 @@ void unix_setup() {
     CHECK(::sigaction(SIGUSR1, &action, &previous_action) == 0);
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
     CHECK(::pthread_kill(accept_thread.native_handle(), SIGUSR1) == 0);
-    Connection client = connect_unix(path, &status);
+    Connection client = connect_unix_until(
+        path, std::chrono::steady_clock::now() + std::chrono::seconds(1), &status);
     CHECK(client.valid());
     accept_thread.join();
     CHECK(::sigaction(SIGUSR1, &previous_action, nullptr) == 0);
@@ -707,8 +708,19 @@ void unix_setup() {
     CHECK(client.valid());
     CHECK(accepted.valid());
     CHECK((::fcntl(listener, F_GETFD) & FD_CLOEXEC) != 0);
-    ::close(listener);
+
+    // A refused endpoint is terminal after SO_ERROR and never leaves a
+    // descriptor behind.  This also protects the nonblocking-connect mutant
+    // that incorrectly treats POLLERR as successful readiness.
+    CHECK(::close(listener) == 0);
     ::unlink(path.c_str());
+    Status refused_status = Status::Ok;
+    Connection refused_connection = connect_unix_until(
+        path, std::chrono::steady_clock::now() + std::chrono::milliseconds(100),
+        &refused_status);
+    CHECK(!refused_connection.valid());
+    CHECK(refused_status == Status::InvalidPath || refused_status == Status::IoError ||
+          refused_status == Status::Timeout);
     CHECK(::rmdir(directory) == 0);
 
     CHECK(listen_unix(std::string(kMaxUnixPath + 1, 'x'), 1, &status) < 0);
