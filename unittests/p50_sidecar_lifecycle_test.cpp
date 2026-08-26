@@ -32,10 +32,14 @@ int failures = 0;
 
 ssize_t deterministic_entropy(void* destination, size_t size,
                               unsigned) noexcept {
-    static uint8_t next = 0x20;
+    static uint64_t next = 1;
     if (size != 16) return -1;
     auto* bytes = static_cast<uint8_t*>(destination);
-    for (size_t i = 0; i != size; ++i) bytes[i] = next++;
+    const uint64_t value = next++;
+    for (size_t i = 0; i != 8; ++i)
+        bytes[i] = static_cast<uint8_t>(value >> (i * 8));
+    for (size_t i = 8; i != size; ++i)
+        bytes[i] = static_cast<uint8_t>(0xa0 + i);
     return static_cast<ssize_t>(size);
 }
 
@@ -135,6 +139,7 @@ ReadyLease ready_for(const LifecycleIdentity& identity, pid_t pid) {
           "stat UNIX listener witness");
     ReadyLease lease;
     lease.identity = identity.control;
+    lease.store_generation = identity.store_generation;
     lease.pid = pid;
     lease.store_root = identity.store_root;
     lease.store_derivation_version = kStoreIdentityDerivationVersion;
@@ -193,7 +198,6 @@ void test_lifecycle() {
     const auto t0 = Clock::time_point{};
     SidecarLifecycleConfig config;
     config.control_generation = 91;
-    config.store_generation = 1;
     config.private_root = "/tmp/icecc-p50-lifecycle";
     config.launch_timeout = std::chrono::milliseconds(10);
     config.ready_timeout = std::chrono::milliseconds(10);
@@ -210,9 +214,9 @@ void test_lifecycle() {
               lifecycle.state() == LifecycleState::LaunchPrepared,
           "begin emits one launch preparation");
     const LifecycleIdentity first = launch.identity;
-    CHECK(first.valid() && first.store_generation == 1 &&
+    CHECK(first.valid() && first.store_generation == config.control_generation &&
               first.control.generation == config.control_generation,
-          "exact independent control/store identity");
+          "allocator mints the exact independent control/store incarnation");
     CHECK(lifecycle.begin(t0).action == LifecycleAction::None,
           "second begin cannot launch twice in one turn");
 
@@ -251,6 +255,24 @@ void test_lifecycle() {
           "complete READY publishes the current lease");
     const dev_t first_device = complete.ready_lease->listener_device;
     const ino_t first_inode = complete.ready_lease->listener_inode;
+
+    // The observation and the lease are two distinct joins.  A caller cannot
+    // pair a current observation with a stale lease from another F-store
+    // incarnation and acquire publication authority.
+    SidecarLifecycle lease_generation_mismatch(config);
+    (void)lease_generation_mismatch.begin(t0);
+    move_to_forked(lease_generation_mismatch, 319, t0);
+    const auto lease_generation_identity = *lease_generation_mismatch.identity();
+    LifecycleObservation mismatched_lease_generation;
+    mismatched_lease_generation.ready = ReadyObservation::Complete;
+    mismatched_lease_generation.store_generation =
+        lease_generation_identity.store_generation;
+    mismatched_lease_generation.ready_lease =
+        ready_for(lease_generation_identity, 319);
+    ++mismatched_lease_generation.ready_lease->store_generation;
+    CHECK(lease_generation_mismatch.advance(t0, mismatched_lease_generation).action ==
+              LifecycleAction::Withdraw,
+          "stale lease store generation cannot publish under a current observation");
 
     // A fabricated DEV/INO tuple cannot turn a different current pathname
     // node into a READY lease: publication performs its own lstat/type proof.
@@ -487,10 +509,10 @@ void test_lifecycle() {
     CHECK(replacement.action == LifecycleAction::LaunchPrepared &&
               replacement.identity.control.generation == first.control.generation &&
               replacement.identity.control.attempt != first.control.attempt &&
-              replacement.identity.store_generation == first.store_generation &&
+              replacement.identity.store_generation != first.store_generation &&
               replacement.identity.store_root != first.store_root &&
               replacement.identity.private_directory != first.private_directory,
-          "replacement burns attempt and rotates root/path without control rotation");
+          "replacement burns attempt/store generation/root/path without control rotation");
 
     // Reap-before-READY and same-turn waitable/identity-loss rows must all
     // withdraw rather than publishing a lease for a dead incarnation.
@@ -648,20 +670,32 @@ void test_lifecycle() {
               parsed_exec == ExecObservation::Succeeded,
           "exec parser accepts exact success frame");
     CHECK(!parse_exec_status("EXEC\nX", parsed_exec), "exec parser rejects trailing bytes");
-    const std::string socket = replacement.identity.private_directory + "/cache.sock";
+    const ReadyLease parsed_fixture = ready_for(replacement.identity, 323);
+    const std::string socket = parsed_fixture.socket_path;
     const std::string ready_wire =
         "READY v2 generation=" + std::to_string(replacement.identity.control.generation) +
         " attempt=" + std::to_string(replacement.identity.control.attempt) +
+        " F_STORE_GENERATION=" +
+        std::to_string(replacement.identity.store_generation) +
         " DERIVATION_VERSION=1 pid=323 C_STORE_GUID=" +
         hex_guid(replacement.identity.c_store_guid) + " F_STORE_GUID=" +
         hex_guid(replacement.identity.f_store_guid) + " PATH=" + socket +
         " DIGEST=" + icecc::digest128_hex(icecc::digest128(socket)) +
-        " DEV=1 INO=2 STORE_GENERATION=" +
-        std::to_string(replacement.identity.store_generation) + "\n";
+        " DEV=" + std::to_string(parsed_fixture.listener_device) +
+        " INO=" + std::to_string(parsed_fixture.listener_inode) + "\n";
     ReadyLease parsed_lease;
     CHECK(parse_ready_frame(ready_wire, replacement.identity, 323, parsed_lease) &&
-              parsed_lease.valid(),
-          "structured READY parser validates the complete lease tuple");
+              parsed_lease.valid() &&
+              parsed_lease.store_generation == replacement.identity.store_generation,
+          "structured READY parser validates the canonical production lease tuple");
+    std::string stale_ready_key = ready_wire;
+    const size_t generation_key = stale_ready_key.find("F_STORE_GENERATION");
+    CHECK(generation_key != std::string::npos, "canonical READY key is present");
+    stale_ready_key.replace(generation_key, std::string_view("F_STORE_GENERATION").size(),
+                            "STORE_GENERATION");
+    CHECK(!parse_ready_frame(stale_ready_key, replacement.identity, 323, parsed_lease),
+          "obsolete READY store-generation key is rejected");
+    remove_socket_node(replacement.identity);
 }
 
 } // namespace

@@ -24,11 +24,14 @@ opt in only after creating a private per-attempt leaf and proving
 `cgroup.kill` plus `cgroup.events` exhaustion without reusable numeric PGID
 authority.
 
-Each attempt consumes a fresh `LaunchIdentityAllocator` attempt and store root,
-with fresh C/F role GUIDs and a fresh private path.  The control generation is
-immutable, while `store_generation` is an explicitly separate field and may
-remain 1 across a fresh store namespace. READY is published only after the
-complete lease validates against this identity, and publication is rejected
+Each attempt consumes one complete fresh `LaunchIncarnation` from the shared
+`LaunchIdentityAllocator`: control attempt, F-store generation, store root,
+C/F role GUIDs, and private path all advance together while the daemon control
+generation remains immutable. `SidecarLifecycleConfig` deliberately has no
+second caller-selected store-generation field; replacement therefore cannot
+retain or forge an old F-store fence. READY uses the same canonical
+`F_STORE_GENERATION` schema as the production supervisor and is published only
+after the complete lease validates against this identity, and publication is rejected
 after any waitable/reap, identity-loss, replacement, or teardown observation.
 The lease captures the listener's device/inode; READY publication itself
 performs `lstat()` and requires a current AF_UNIX node with the exact

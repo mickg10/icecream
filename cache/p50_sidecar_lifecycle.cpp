@@ -168,8 +168,8 @@ SidecarLifecycle::SidecarLifecycle(SidecarLifecycleConfig config) noexcept
 }
 
 bool SidecarLifecycle::valid_config(const SidecarLifecycleConfig& config) noexcept {
-    return config.control_generation != 0 && config.store_generation != 0 &&
-           absolute_path(config.private_root) && bounded_timeout(config.launch_timeout) &&
+    return config.control_generation != 0 && absolute_path(config.private_root) &&
+           bounded_timeout(config.launch_timeout) &&
            bounded_timeout(config.exec_timeout) && bounded_timeout(config.ready_timeout) &&
            bounded_timeout(config.grace_timeout) && bounded_timeout(config.kill_timeout) &&
            config.max_attempts != 0 && config.max_attempts <= 100000 &&
@@ -198,7 +198,7 @@ bool SidecarLifecycle::allocate_identity() noexcept {
         return false;
     LifecycleIdentity identity;
     identity.control = allocated->identity;
-    identity.store_generation = config_.store_generation;
+    identity.store_generation = allocated->store_generation;
     identity.store_root = allocated->store_root;
     identity.c_store_guid = allocated->c_store_guid;
     identity.f_store_guid = allocated->f_store_guid;
@@ -291,6 +291,7 @@ bool SidecarLifecycle::accept_ready(const LifecycleObservation& observation) noe
     if (!lease.valid() || lease.pid != child_pid_ ||
         lease.identity != identity_->control ||
         observation.store_generation != identity_->store_generation ||
+        lease.store_generation != identity_->store_generation ||
         lease.store_root != identity_->store_root ||
         lease.c_store_guid != identity_->c_store_guid ||
         lease.f_store_guid != identity_->f_store_guid ||
@@ -813,37 +814,45 @@ bool parse_ready_frame(std::string_view bytes, const LifecycleIdentity& expected
             bytes[end + 1] == ' ') return false;
         begin = end + 1;
     }
-    if (fields[0] != "READY" || fields[1] != "v2" || fields[8].substr(0, 5) != "PATH=" ||
-        fields[9].substr(0, 7) != "DIGEST=" || fields[10].substr(0, 4) != "DEV=" ||
-        fields[11].substr(0, 4) != "INO=") return false;
+    if (fields[0] != "READY" || fields[1] != "v2" ||
+        fields[9].substr(0, 5) != "PATH=" ||
+        fields[10].substr(0, 7) != "DIGEST=" ||
+        fields[11].substr(0, 4) != "DEV=" ||
+        fields[12].substr(0, 4) != "INO=")
+        return false;
     const std::array<std::string_view, 11> keys = {
-        "generation=", "attempt=", "DERIVATION_VERSION=", "pid=", "C_STORE_GUID=",
-        "F_STORE_GUID=", "PATH=", "DIGEST=", "DEV=", "INO=", "STORE_GENERATION="};
+        "generation=", "attempt=", "F_STORE_GENERATION=", "DERIVATION_VERSION=",
+        "pid=", "C_STORE_GUID=", "F_STORE_GUID=", "PATH=", "DIGEST=", "DEV=",
+        "INO="};
     for (size_t i = 0; i != keys.size(); ++i)
         if (fields[i + 2].substr(0, keys[i].size()) != keys[i]) return false;
     uint64_t generation = 0, attempt = 0, version = 0, pid = 0, dev = 0, ino = 0,
              store_generation = 0;
     if (!parse_uint(fields[2].substr(11), generation) ||
         !parse_uint(fields[3].substr(8), attempt) ||
-        !parse_uint(fields[4].substr(19), version) ||
-        !parse_uint(fields[5].substr(4), pid) || !parse_uint(fields[10].substr(4), dev) ||
-        !parse_uint(fields[11].substr(4), ino) ||
-        !parse_uint(fields[12].substr(17), store_generation) ||
+        !parse_uint(fields[4].substr(keys[2].size()), store_generation) ||
+        !parse_uint(fields[5].substr(19), version) ||
+        !parse_uint(fields[6].substr(4), pid) ||
+        !parse_uint(fields[11].substr(4), dev) ||
+        !parse_uint(fields[12].substr(4), ino) ||
         store_generation != expected.store_generation || generation != expected.control.generation ||
         attempt != expected.control.attempt || pid != static_cast<uint64_t>(expected_pid) ||
         version != kStoreIdentityDerivationVersion || dev == 0 || ino == 0)
         return false;
-    const std::string socket = std::string(fields[8].substr(5));
+    const std::string socket = std::string(fields[9].substr(5));
     const std::string expected_socket = expected.private_directory + "/cache.sock";
     if (socket != expected_socket ||
-        fields[9].substr(7) != icecc::digest128_hex(icecc::digest128(expected_socket))) return false;
+        fields[10].substr(7) != icecc::digest128_hex(icecc::digest128(expected_socket)))
+        return false;
     std::array<uint8_t, 16> c_bytes{}, f_bytes{};
-    if (!parse_hex(fields[6].substr(13), c_bytes) ||
-        !parse_hex(fields[7].substr(13), f_bytes)) return false;
+    if (!parse_hex(fields[7].substr(13), c_bytes) ||
+        !parse_hex(fields[8].substr(13), f_bytes))
+        return false;
     if (c_bytes != expected.c_store_guid.bytes || f_bytes != expected.f_store_guid.bytes)
         return false;
     lease = {};
     lease.identity = expected.control;
+    lease.store_generation = store_generation;
     lease.pid = expected_pid;
     lease.store_root = expected.store_root;
     lease.store_derivation_version = version;

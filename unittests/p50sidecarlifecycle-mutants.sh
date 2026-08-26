@@ -5,10 +5,10 @@ build="${ICECC_TEST_BUILDDIR:-$(pwd)}"
 cxx="${ICECC_TEST_CXX:-c++}"
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/p50-sidecar-lifecycle-mutant.XXXXXX")"
 trap 'rm -r -- "$tmp"' EXIT HUP INT TERM
-expected_mutants=13
+expected_mutants=17
 mutant_count=0
 compiled_count=0
-for mutant_name in pgid store-generation stale-ready listener-node teardown-deadline legacy-direct owner-key group-domain fabricated-lease over-capacity discarded-registration socket-substitution group-proof-required; do
+for mutant_name in pgid store-generation allocator-store-generation lease-store-generation ready-generation-key ready-generation-assignment stale-ready listener-node teardown-deadline legacy-direct owner-key group-domain fabricated-lease over-capacity discarded-registration socket-substitution group-proof-required; do
     mutant_count=$((mutant_count + 1))
     cp "$root/cache/p50_sidecar_lifecycle.cpp" "$tmp/mutant.cpp"
     # These are semantic deletion mutants; the runtime witness must redden
@@ -17,6 +17,14 @@ for mutant_name in pgid store-generation stale-ready listener-node teardown-dead
         sed -i 's/observation\.observed_pgid != process_group_/false/' "$tmp/mutant.cpp"
     elif test "$mutant_name" = store-generation; then
         sed -i 's/observation\.store_generation != identity_->store_generation/false/' "$tmp/mutant.cpp"
+    elif test "$mutant_name" = allocator-store-generation; then
+        sed -i 's/identity\.store_generation = allocated->store_generation;/identity.store_generation = config_.control_generation;/' "$tmp/mutant.cpp"
+    elif test "$mutant_name" = lease-store-generation; then
+        sed -i 's/lease\.store_generation != identity_->store_generation/false/' "$tmp/mutant.cpp"
+    elif test "$mutant_name" = ready-generation-key; then
+        sed -i 's/F_STORE_GENERATION=/STORE_GENERATION=/' "$tmp/mutant.cpp"
+    elif test "$mutant_name" = ready-generation-assignment; then
+        sed -i 's/lease\.store_generation = store_generation;/lease.store_generation = 0;/' "$tmp/mutant.cpp"
     elif test "$mutant_name" = stale-ready; then
         sed -i 's/leader_waitable_ || leader_reaped_/false/' "$tmp/mutant.cpp"
         sed -i 's/(leader_waitable_ || identity_lost_)/(false)/' "$tmp/mutant.cpp"

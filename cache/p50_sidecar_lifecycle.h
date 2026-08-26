@@ -207,7 +207,6 @@ struct LifecycleActionResult {
 
 struct SidecarLifecycleConfig {
     uint64_t control_generation = 0;
-    uint64_t store_generation = 1;
     std::string private_root;
     std::chrono::milliseconds launch_timeout{1000};
     std::chrono::milliseconds exec_timeout{1000};
@@ -215,6 +214,10 @@ struct SidecarLifecycleConfig {
     std::chrono::milliseconds grace_timeout{1000};
     std::chrono::milliseconds kill_timeout{1000};
     uint32_t max_attempts = 3;
+    // This allocator is the sole mint for the complete launch incarnation:
+    // control attempt, F-store generation, StoreIdentity root, and role GUIDs.
+    // A second caller-selected store-generation authority is intentionally
+    // absent so replacement cannot retain or forge an old F-store fence.
     std::shared_ptr<LaunchIdentityAllocator> identities;
     std::shared_ptr<KillDomainVerifier> kill_domain_verifier;
 };
