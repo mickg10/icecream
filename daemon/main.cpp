@@ -7936,6 +7936,18 @@ bool Daemon::handle_cache_session(Client *client, Msg *msg)
     }
 
     const int old_fd = client->channel->fd;
+    // The descriptor handoff is asynchronous from the wrapper's point of
+    // view. Re-enter only through the immutable value lease and the exact
+    // live object identities captured at accept time. An fd or Client address
+    // reused after teardown must never authorize a CACHE_SESSION dispatch.
+    const auto lease = client->connection_provenance.lease;
+    if (!connection_leases.revalidate(lease, client, client->channel,
+                                      client->connection_provenance.peer)) {
+        log_warning() << "CACHE_SESSION rejected stale wrapper connection lease" << endl;
+        handle_end(client, 121);
+        return false;
+    }
+
     icecc::p50::daemon::CacheDispatchOutcome outcome;
     auto *dispatcher = scheduler_session_active && cache_adapter != nullptr
             && cache_advertisement_snapshot().present()

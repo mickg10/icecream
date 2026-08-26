@@ -54,6 +54,9 @@ fi
     "$test_srcdir/../cache/p50_daemon_cache_dispatch.cpp" \
     "$test_srcdir/../cache/p50_fd_handoff.cpp" \
     "$test_srcdir/../cache/p50_local_transport.cpp" \
+    "$test_srcdir/../cache/p50_phase_open.cpp" \
+    "$test_srcdir/../cache/p50_source_identity.cpp" \
+    "$test_srcdir/../cache/protocol50.cpp" \
     $ldflags "$services_lib" $extra_libs $libs \
     -o "$binary"
 ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 "$binary"

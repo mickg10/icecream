@@ -9,7 +9,9 @@ iceccd_SOURCES = \
 	workit.cpp \
 	../cache/p50_daemon_cache_dispatch.cpp \
 	../cache/p50_source_identity.cpp \
+	../cache/p50_phase_open.cpp \
 	../cache/p50_input_wait.cpp \
+	../cache/p50_reverse_fd_retry.cpp \
 	environment.cpp \
 	load.cpp \
 	file_util.cpp \
