@@ -69,9 +69,29 @@ std::string hex_guid(const Id128& value) {
 LifecycleObservation forked(pid_t pid) {
     LifecycleObservation observation;
     observation.exec = ExecObservation::Succeeded;
+    observation.group_domain = KillDomainLease{static_cast<uint64_t>(pid), 1, true};
     observation.pid = pid;
     observation.observed_pgid = pid;
     return observation;
+}
+
+void move_to_forked(SidecarLifecycle& lifecycle, pid_t pid,
+                    std::chrono::steady_clock::time_point now) {
+    LifecycleObservation fork = forked(pid);
+    fork.exec = ExecObservation::None;
+    (void)lifecycle.advance(now, fork);
+    (void)lifecycle.advance(now, forked(pid));
+}
+
+void move_to_ready(SidecarLifecycle& lifecycle, pid_t pid,
+                   std::chrono::steady_clock::time_point now) {
+    move_to_forked(lifecycle, pid, now);
+    const auto identity = *lifecycle.identity();
+    LifecycleObservation ready;
+    ready.ready = ReadyObservation::Complete;
+    ready.store_generation = identity.store_generation;
+    ready.ready_lease = ready_for(identity, pid);
+    (void)lifecycle.advance(now, ready);
 }
 
 void test_lifecycle() {
@@ -133,6 +153,8 @@ void test_lifecycle() {
               lifecycle.state() == LifecycleState::Ready &&
               lifecycle.current_ready_lease().has_value(),
           "complete READY publishes the current lease");
+    const dev_t first_device = complete.ready_lease->listener_device;
+    const ino_t first_inode = complete.ready_lease->listener_inode;
 
     CentralChildReaperRegistry reaper;
     CHECK(reaper.register_owner(321, 321, lifecycle), "central registry owns one pid");
@@ -148,6 +170,15 @@ void test_lifecycle() {
     CHECK(reaper.next_unobserved_pid().value_or(-1) == 322,
           "observed owner is deleted from the fairness set");
 
+    ReapMailbox bounded_mailbox;
+    bool mailbox_full = true;
+    for (size_t index = 0; index != 16; ++index)
+        mailbox_full = mailbox_full &&
+                       bounded_mailbox.enqueue(ReapEvent{{9, 1}, 900, 0, true});
+    CHECK(mailbox_full &&
+              !bounded_mailbox.enqueue(ReapEvent{{9, 1}, 900, 0, true}),
+          "reap delivery is bounded rather than an unbounded event queue");
+
     auto withdraw = lifecycle.advance(t0);
     CHECK(withdraw.action == LifecycleAction::Withdraw &&
               lifecycle.state() == LifecycleState::TerminatingGrace &&
@@ -157,30 +188,92 @@ void test_lifecycle() {
     CHECK(term.action == LifecycleAction::SendTerm, "TERM is a separate outer-loop action");
     LifecycleObservation wrong_group;
     wrong_group.group = GroupObservation::Gone;
+    wrong_group.group_domain = KillDomainLease{321, 1, true};
     wrong_group.observed_pgid = 999;
     wrong_group.path_absent = true;
     wrong_group.observed_path = first.private_directory;
-    CHECK(lifecycle.advance(t0 + std::chrono::milliseconds(20), wrong_group).action ==
+    CHECK(lifecycle.advance(t0 + std::chrono::milliseconds(10), wrong_group).action ==
               LifecycleAction::SendKill,
           "stale PGID proof cannot suppress TERM to KILL escalation");
     CHECK(lifecycle.state() == LifecycleState::TerminatingKill,
           "surviving helper keeps lifecycle in kill state");
-    CHECK(lifecycle.advance(t0 + std::chrono::milliseconds(21), wrong_group).action ==
+    CHECK(lifecycle.advance(t0 + std::chrono::milliseconds(11), wrong_group).action ==
               LifecycleAction::None,
           "KILL is emitted once and never duplicated by a later turn");
     LifecycleObservation group_gone = wrong_group;
     group_gone.observed_pgid = 321;
-    CHECK(lifecycle.advance(t0, group_gone).action == LifecycleAction::None &&
+    group_gone.observed_device = first_device;
+    group_gone.observed_inode = first_inode;
+    CHECK(lifecycle.advance(t0 + std::chrono::milliseconds(11), group_gone).action == LifecycleAction::None &&
               lifecycle.state() == LifecycleState::ReapAndGroupCheck,
           "leader reap is insufficient until exact PGID ESRCH");
     LifecycleObservation stale_path = group_gone;
     stale_path.observed_path = "/tmp/stale-other-incarnation";
-    CHECK(lifecycle.advance(t0, stale_path).action == LifecycleAction::None &&
+    CHECK(lifecycle.advance(t0 + std::chrono::milliseconds(11), stale_path).action == LifecycleAction::None &&
               lifecycle.state() == LifecycleState::ReapAndGroupCheck,
           "stale path callback cannot authorize replacement");
-    CHECK(lifecycle.advance(t0, group_gone).action == LifecycleAction::RetryEligible &&
+    LifecycleObservation same_path_new_node = group_gone;
+    same_path_new_node.observed_device = first_device;
+    same_path_new_node.observed_inode = first_inode + 1;
+    CHECK(lifecycle.advance(t0 + std::chrono::milliseconds(11), same_path_new_node).action == LifecycleAction::None &&
+              lifecycle.state() == LifecycleState::ReapAndGroupCheck,
+          "replacement at the same pathname cannot masquerade as old-node absence");
+    CHECK(lifecycle.advance(t0 + std::chrono::milliseconds(11), group_gone).action == LifecycleAction::RetryEligible &&
               lifecycle.state() == LifecycleState::RetryEligible,
           "exact group and path proof authorizes retry");
+
+    // Numeric PGID/Gone is not a reusable kill-domain proof.  A zombie leader
+    // or surviving helper can keep the number present, and a later group can
+    // reuse it after reap; an absent/mismatched external lease must fail
+    // closed rather than authorize a replacement.
+    SidecarLifecycle ambiguous_group(config);
+    (void)ambiguous_group.begin(t0);
+    move_to_ready(ambiguous_group, 350, t0);
+    LifecycleObservation ambiguous_request;
+    ambiguous_request.request_replacement = true;
+    CHECK(ambiguous_group.advance(t0, ambiguous_request).action ==
+              LifecycleAction::Withdraw &&
+              ambiguous_group.advance(t0).action == LifecycleAction::SendTerm,
+          "ambiguous PGID teardown withdraws before TERM");
+    CHECK(ambiguous_group.observe_child_reaped(350, 0, true),
+          "ambiguous PGID row records leader reap");
+    LifecycleObservation numeric_gone;
+    numeric_gone.group = GroupObservation::Gone;
+    numeric_gone.observed_pgid = 350;
+    numeric_gone.path_absent = true;
+    numeric_gone.observed_path = ambiguous_group.identity()->private_directory;
+    numeric_gone.observed_device = ambiguous_group.identity()->listener_device;
+    numeric_gone.observed_inode = ambiguous_group.identity()->listener_inode;
+    // Deliberately no valid group_domain: this is exactly the zombie/reuse
+    // ambiguity that numeric kill(-pgid, 0) cannot resolve.
+    CHECK(ambiguous_group.advance(t0 + std::chrono::milliseconds(10), numeric_gone).action ==
+              LifecycleAction::SendKill,
+          "numeric PGID/Gone cannot suppress KILL without a domain lease");
+    CHECK(ambiguous_group.advance(t0 + std::chrono::milliseconds(20), numeric_gone).action ==
+              LifecycleAction::FailedClosed &&
+              ambiguous_group.state() == LifecycleState::FailedClosed &&
+              !ambiguous_group.current_ready_lease().has_value(),
+          "zombie/reused PGID ambiguity fails closed with capacity withheld");
+
+    SidecarLifecycle reused_group(config);
+    (void)reused_group.begin(t0);
+    move_to_ready(reused_group, 351, t0);
+    CHECK(reused_group.advance(t0, ambiguous_request).action == LifecycleAction::Withdraw &&
+              reused_group.advance(t0).action == LifecycleAction::SendTerm,
+          "reused-PGID witness starts bounded teardown");
+    CHECK(reused_group.observe_child_reaped(351, 0, true),
+          "reused-PGID witness records leader reap");
+    LifecycleObservation mismatched_domain = numeric_gone;
+    mismatched_domain.observed_pgid = 351;
+    mismatched_domain.observed_path = reused_group.identity()->private_directory;
+    mismatched_domain.observed_device = reused_group.identity()->listener_device;
+    mismatched_domain.observed_inode = reused_group.identity()->listener_inode;
+    mismatched_domain.group_domain = KillDomainLease{9999, 7, true};
+    CHECK(reused_group.advance(t0 + std::chrono::milliseconds(10), mismatched_domain).action ==
+              LifecycleAction::SendKill &&
+              reused_group.advance(t0 + std::chrono::milliseconds(20), mismatched_domain).action ==
+                  LifecycleAction::FailedClosed,
+          "reused numeric PGID with a different domain lease fails closed");
 
     auto replacement = lifecycle.begin(t0);
     CHECK(replacement.action == LifecycleAction::LaunchPrepared &&
@@ -190,6 +283,155 @@ void test_lifecycle() {
               replacement.identity.store_root != first.store_root &&
               replacement.identity.private_directory != first.private_directory,
           "replacement burns attempt and rotates root/path without control rotation");
+
+    // Reap-before-READY and same-turn waitable/identity-loss rows must all
+    // withdraw rather than publishing a lease for a dead incarnation.
+    SidecarLifecycle reap_first(config);
+    (void)reap_first.begin(t0);
+    move_to_forked(reap_first, 401, t0);
+    const auto reap_first_identity = *reap_first.identity();
+    CHECK(reap_first.observe_child_reaped(401, 0, true),
+          "leader reap is accepted before READY");
+    LifecycleObservation reap_first_ready;
+    reap_first_ready.ready = ReadyObservation::Complete;
+    reap_first_ready.store_generation = reap_first_identity.store_generation;
+    reap_first_ready.ready_lease = ready_for(reap_first_identity, 401);
+    CHECK(reap_first.advance(t0, reap_first_ready).action == LifecycleAction::Withdraw &&
+              !reap_first.current_ready_lease().has_value(),
+          "reap-before-READY cannot publish stale lease");
+
+    SidecarLifecycle waitable_ready(config);
+    (void)waitable_ready.begin(t0);
+    move_to_forked(waitable_ready, 402, t0);
+    const auto waitable_identity = *waitable_ready.identity();
+    LifecycleObservation waitable = reap_first_ready;
+    waitable.ready_lease = ready_for(waitable_identity, 402);
+    waitable.store_generation = waitable_identity.store_generation;
+    waitable.child_waitable = true;
+    CHECK(waitable_ready.advance(t0, waitable).action == LifecycleAction::Withdraw,
+          "same-turn waitable plus READY loses publication race");
+
+    SidecarLifecycle lost_ready(config);
+    (void)lost_ready.begin(t0);
+    move_to_forked(lost_ready, 403, t0);
+    const auto lost_identity = *lost_ready.identity();
+    LifecycleObservation lost = waitable;
+    lost.ready_lease = ready_for(lost_identity, 403);
+    lost.store_generation = lost_identity.store_generation;
+    lost.child_waitable = false;
+    lost.identity_lost = true;
+    CHECK(lost_ready.advance(t0, lost).action == LifecycleAction::Withdraw,
+          "same-turn identity loss plus READY loses publication race");
+
+    SidecarLifecycle reap_after_ready(config);
+    (void)reap_after_ready.begin(t0);
+    move_to_ready(reap_after_ready, 404, t0);
+    CHECK(reap_after_ready.current_ready_lease().has_value(),
+          "ordering witness starts READY");
+    CHECK(reap_after_ready.observe_child_reaped(404, 0, true),
+          "reap after publication is recorded by same owner");
+    CHECK(reap_after_ready.current_ready_lease().has_value(),
+          "lease remains until owner linearization turn");
+    CHECK(reap_after_ready.advance(t0).action == LifecycleAction::Withdraw &&
+              !reap_after_ready.current_ready_lease().has_value(),
+          "READY-vs-reap ordering withdraws before teardown");
+
+    // RAII/value-event registration has no raw lifecycle pointer.  It also
+    // proves exact listener-node capture, unregister, PID reuse, stale-key
+    // rejection, and destroyed-owner rejection under the custom sanitizer.
+    CentralChildReaperRegistry lifetime_registry;
+    auto owner = std::make_unique<SidecarLifecycle>(config);
+    (void)owner->begin(t0);
+    move_to_forked(*owner, 700, t0);
+    const ReaperOwnerKey old_key = owner->owner_key();
+    auto registration = lifetime_registry.register_owner(
+        700, 700, old_key, owner->reap_mailbox(), first_device, first_inode);
+    CHECK(registration.valid() && lifetime_registry.size() == 1,
+          "RAII registration owns exact PID/generation");
+    const auto captured_node = lifetime_registry.listener_node(700, old_key);
+    CHECK(captured_node.has_value() && captured_node->first == first_device &&
+              captured_node->second == first_inode,
+          "registry captures exact listener device/inode");
+    registration.reset();
+    CHECK(lifetime_registry.size() == 0 &&
+              !lifetime_registry.observe_child_reaped(700, old_key, 0, true),
+          "explicit unregister retires old owner exactly");
+    auto reused = std::make_unique<SidecarLifecycle>(config);
+    (void)reused->begin(t0);
+    move_to_forked(*reused, 700, t0);
+    const ReaperOwnerKey new_key = reused->owner_key();
+    auto reused_registration = lifetime_registry.register_owner(
+        700, 700, new_key, reused->reap_mailbox(), first_device, first_inode);
+    auto reused_mailbox = reused->reap_mailbox().lock();
+    CHECK(reused_registration.valid() && reused_mailbox &&
+              reused_mailbox->enqueue(ReapEvent{old_key, 700, 0, true}) &&
+              reused->advance(t0).action == LifecycleAction::None &&
+              reused->state() == LifecycleState::ForkedAwaitExecAndReady &&
+              !lifetime_registry.observe_child_reaped(700, old_key, 0, true) &&
+              lifetime_registry.observe_child_reaped(700, new_key, 0, true),
+          "stale generation cannot poison reused PID owner");
+    (void)reused->advance(t0);
+    CHECK(lifetime_registry.unregister_owner(700, new_key) &&
+              !lifetime_registry.unregister_owner(700, new_key),
+          "unregister is exact and non-idempotent for stale token");
+    reused_registration.reset();
+    auto dying = std::make_unique<SidecarLifecycle>(config);
+    (void)dying->begin(t0);
+    move_to_forked(*dying, 701, t0);
+    const ReaperOwnerKey dying_key = dying->owner_key();
+    auto dying_registration = lifetime_registry.register_owner(
+        701, 701, dying_key, dying->reap_mailbox(), first_device, first_inode);
+    dying.reset();
+    CHECK(!lifetime_registry.observe_child_reaped(701, dying_key, 0, true),
+          "destroyed owner rejects reap without UAF");
+    dying_registration.reset();
+
+    // One absolute teardown deadline bounds TERM, KILL and proof.  A surviving
+    // helper that ignores TERM receives one KILL, then reaches FailedClosed.
+    SidecarLifecycle deadline_lifecycle(config);
+    (void)deadline_lifecycle.begin(t0);
+    move_to_ready(deadline_lifecycle, 500, t0);
+    LifecycleObservation replace_request;
+    replace_request.request_replacement = true;
+    CHECK(deadline_lifecycle.advance(t0, replace_request).action ==
+              LifecycleAction::Withdraw,
+          "replacement withdraws before TERM");
+    CHECK(deadline_lifecycle.advance(t0).action == LifecycleAction::SendTerm,
+          "TERM is emitted for surviving helper");
+    CHECK(deadline_lifecycle.advance(t0 + std::chrono::milliseconds(10)).action ==
+              LifecycleAction::SendKill && deadline_lifecycle.kill_sent(),
+          "TERM grace escalates to one KILL");
+    CHECK(deadline_lifecycle.advance(t0 + std::chrono::milliseconds(20)).action ==
+              LifecycleAction::FailedClosed &&
+              deadline_lifecycle.state() == LifecycleState::FailedClosed &&
+              !deadline_lifecycle.current_ready_lease().has_value(),
+          "residue at absolute deadline reaches terminal FailedClosed");
+
+    SidecarLifecycle legacy_lifecycle(config);
+    (void)legacy_lifecycle.begin(t0);
+    move_to_ready(legacy_lifecycle, 501, t0);
+    LifecycleObservation legacy_request;
+    legacy_request.request_legacy = true;
+    CHECK(legacy_lifecycle.advance(t0, legacy_request).action == LifecycleAction::Withdraw &&
+              legacy_lifecycle.state() == LifecycleState::TerminatingGrace,
+          "request_legacy withdraws live child instead of abandoning it");
+    CHECK(legacy_lifecycle.advance(t0).action == LifecycleAction::SendTerm,
+          "request_legacy drives TERM");
+    CHECK(legacy_lifecycle.observe_child_reaped(501, 0, true),
+          "legacy teardown records leader reap");
+    LifecycleObservation legacy_gone;
+    legacy_gone.group = GroupObservation::Gone;
+    legacy_gone.group_domain = KillDomainLease{501, 1, true};
+    legacy_gone.observed_pgid = 501;
+    legacy_gone.path_absent = true;
+    legacy_gone.observed_path = legacy_lifecycle.identity()->private_directory;
+    legacy_gone.observed_device = legacy_lifecycle.current_ready_lease()->listener_device;
+    legacy_gone.observed_inode = legacy_lifecycle.current_ready_lease()->listener_inode;
+    (void)legacy_lifecycle.advance(t0 + std::chrono::milliseconds(10), legacy_gone);
+    CHECK(legacy_lifecycle.advance(t0 + std::chrono::milliseconds(10), legacy_gone).action ==
+              LifecycleAction::EnterDegradedLegacy &&
+              legacy_lifecycle.state() == LifecycleState::DegradedLegacy,
+          "request_legacy degrades only after exact teardown proof");
 
     ExecObservation parsed_exec = ExecObservation::None;
     CHECK(parse_exec_status("EXEC\n", parsed_exec) &&

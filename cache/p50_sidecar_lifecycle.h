@@ -12,13 +12,18 @@
 
 #include <chrono>
 #include <cstdint>
-#include <deque>
+#include <atomic>
+#include <array>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
+#include <sys/stat.h>
 #include <sys/types.h>
 
 namespace icecc::p50::sidecar {
@@ -33,6 +38,7 @@ enum class LifecycleState : uint8_t {
     ReapAndGroupCheck,
     RetryEligible,
     DegradedLegacy,
+    FailedClosed,
 };
 
 enum class LifecycleAction : uint8_t {
@@ -44,6 +50,7 @@ enum class LifecycleAction : uint8_t {
     PublishReady,
     EnterDegradedLegacy,
     RetryEligible,
+    FailedClosed,
 };
 
 enum class ExecObservation : uint8_t { None = 0, Succeeded, Failed };
@@ -52,9 +59,26 @@ enum class ReadyObservation : uint8_t { None = 0, Partial, Complete, Invalid };
 // platform macro named ESRCH.
 enum class GroupObservation : uint8_t { Unknown = 0, Present, Gone };
 
+// A numeric PGID and an ESRCH probe are not a non-reusable kill authority:
+// zombies can keep the number present and a later process group can reuse it.
+// The daemon may supply this opaque lease only when another authority has
+// proved that the group identity cannot be reused for this incarnation.  The
+// reducer never creates or infers one; without it teardown fails closed.
+struct KillDomainLease {
+    uint64_t domain_id = 0;
+    uint64_t generation = 0;
+    bool non_reusable = false;
+
+    [[nodiscard]] bool valid() const noexcept {
+        return domain_id != 0 && generation != 0 && non_reusable;
+    }
+    friend bool operator==(const KillDomainLease&, const KillDomainLease&) = default;
+};
+
 // All facts in this structure are supplied by the daemon's already-running
-// outer loop.  In particular, group=ESRCH is the exact getpgid/kill proof for
-// the expected PGID; leader reaping or ECHILD is not substituted for it.
+// outer loop.  A numeric group=Gone/ESRCH observation is only one fact; leader
+// reaping, ECHILD, or that numeric probe alone never substitutes for the
+// non-reusable KillDomainLease.
 struct LifecycleObservation {
     ExecObservation exec = ExecObservation::None;
     ReadyObservation ready = ReadyObservation::None;
@@ -62,12 +86,50 @@ struct LifecycleObservation {
     std::optional<ReadyLease> ready_lease;
     uint64_t store_generation = 0;
     GroupObservation group = GroupObservation::Unknown;
+    KillDomainLease group_domain{};
     pid_t pid = -1;
     pid_t observed_pgid = -1;
     bool path_absent = false;
     std::string_view observed_path{};
+    dev_t observed_device = 0;
+    ino_t observed_inode = 0;
+    bool child_waitable = false;
+    bool identity_lost = false;
     bool request_replacement = false;
     bool request_legacy = false;
+};
+
+struct ReaperOwnerKey {
+    uint64_t owner_id = 0;
+    uint64_t generation = 0;
+
+    [[nodiscard]] bool valid() const noexcept {
+        return owner_id != 0 && generation != 0;
+    }
+    friend bool operator==(const ReaperOwnerKey&, const ReaperOwnerKey&) = default;
+};
+
+struct ReapEvent {
+    ReaperOwnerKey owner{};
+    pid_t pid = -1;
+    int status = 0;
+    bool echild = false;
+};
+
+// A small value mailbox is the lifetime boundary between the central reaper
+// and a lifecycle.  It contains no raw owner pointer and is bounded so a
+// broken outer loop cannot turn reap delivery into unbounded allocation.
+class ReapMailbox {
+public:
+    bool enqueue(ReapEvent event) noexcept;
+    bool dequeue(ReapEvent& event) noexcept;
+
+private:
+    static constexpr size_t kMaximumEvents = 16;
+    std::array<ReapEvent, kMaximumEvents> events_{};
+    std::mutex mutex_;
+    size_t head_ = 0;
+    size_t count_ = 0;
 };
 
 struct LifecycleIdentity {
@@ -79,6 +141,8 @@ struct LifecycleIdentity {
     CStoreGuid c_store_guid{};
     FStoreGuid f_store_guid{};
     std::string private_directory;
+    dev_t listener_device = 0;
+    ino_t listener_inode = 0;
 
     [[nodiscard]] bool valid() const noexcept;
     friend bool operator==(const LifecycleIdentity&, const LifecycleIdentity&) = default;
@@ -129,7 +193,6 @@ public:
     // is rejected.  ECHILD records leader knowledge but does not prove PGID
     // disappearance.
     bool observe_child_reaped(pid_t pid, int status, bool echild = false) noexcept;
-
     [[nodiscard]] LifecycleState state() const noexcept { return state_; }
     [[nodiscard]] const std::optional<LifecycleIdentity>& identity() const noexcept {
         return identity_;
@@ -141,6 +204,12 @@ public:
     [[nodiscard]] bool leader_reaped() const noexcept { return leader_reaped_; }
     [[nodiscard]] bool term_sent() const noexcept { return term_sent_; }
     [[nodiscard]] bool kill_sent() const noexcept { return kill_sent_; }
+    [[nodiscard]] ReaperOwnerKey owner_key() const noexcept {
+        return ReaperOwnerKey{owner_id_, owner_generation_};
+    }
+    [[nodiscard]] std::weak_ptr<ReapMailbox> reap_mailbox() const noexcept {
+        return reap_mailbox_;
+    }
 
 private:
     LifecycleActionResult result(LifecycleAction action) const noexcept;
@@ -151,6 +220,10 @@ private:
     void withdraw() noexcept;
     void enter_termination(std::chrono::steady_clock::time_point now) noexcept;
     void clear_incarnation() noexcept;
+    void consume_reap_events() noexcept;
+    bool consume_reap(const ReapEvent& event) noexcept;
+    LifecycleActionResult fail_closed() noexcept;
+    bool teardown_expired(std::chrono::steady_clock::time_point now) const noexcept;
 
     SidecarLifecycleConfig config_;
     LifecycleState state_ = LifecycleState::Stopped;
@@ -160,34 +233,94 @@ private:
     pid_t process_group_ = -1;
     uint32_t attempts_ = 0;
     bool leader_reaped_ = false;
+    bool leader_waitable_ = false;
     bool echild_observed_ = false;
     bool exec_succeeded_ = false;
     bool term_sent_ = false;
     bool kill_sent_ = false;
+    bool identity_lost_ = false;
+    bool teardown_started_ = false;
+    bool legacy_requested_ = false;
+    bool group_proof_required_ = false;
+    std::optional<KillDomainLease> group_domain_;
     std::string ready_buffer_;
     std::chrono::steady_clock::time_point deadline_{};
+    std::chrono::steady_clock::time_point teardown_deadline_{};
+    uint64_t owner_id_ = 0;
+    uint64_t owner_generation_ = 1;
+    std::shared_ptr<ReapMailbox> reap_mailbox_;
 };
 
 // Central-reaper ownership seam.  The reaper calls observe_child_reaped once
 // for each PID; it never broadcasts a wait result to multiple supervisors.
 class CentralChildReaperRegistry {
+    struct SharedState;
+
 public:
+    CentralChildReaperRegistry() noexcept;
+    class Registration {
+    public:
+        Registration() = default;
+        ~Registration();
+        Registration(const Registration&) = delete;
+        Registration& operator=(const Registration&) = delete;
+        Registration(Registration&& other) noexcept;
+        Registration& operator=(Registration&& other) noexcept;
+
+        [[nodiscard]] bool valid() const noexcept { return state_ != nullptr; }
+        void reset() noexcept;
+        [[nodiscard]] ReaperOwnerKey owner_key() const noexcept { return owner_; }
+
+    private:
+        Registration(std::shared_ptr<SharedState> state, pid_t pid,
+                     ReaperOwnerKey owner) noexcept
+            : state_(std::move(state)), pid_(pid), owner_(owner) {}
+        friend class CentralChildReaperRegistry;
+        std::shared_ptr<SharedState> state_;
+        pid_t pid_ = -1;
+        ReaperOwnerKey owner_{};
+    };
+
+    // Preferred value-event API.  The returned token unregisters exactly this
+    // PID/generation when destroyed, even if the registry itself is gone.
+    Registration register_owner(pid_t pid, pid_t pgid, ReaperOwnerKey owner,
+                                std::weak_ptr<ReapMailbox> mailbox,
+                                dev_t listener_device = 0,
+                                ino_t listener_inode = 0) noexcept;
+
+    // Compatibility seam for callers that already hold a lifecycle.  It
+    // stores only a weak mailbox, never a raw lifecycle pointer; callers may
+    // retire it with unregister_owner().
     bool register_owner(pid_t pid, pid_t pgid, SidecarLifecycle& owner) noexcept;
+    bool unregister_owner(pid_t pid, ReaperOwnerKey owner) noexcept;
+    bool observe_child_reaped(pid_t pid, ReaperOwnerKey owner, int status,
+                              bool echild = false) noexcept;
     bool observe_child_reaped(pid_t pid, int status, bool echild = false) noexcept;
+    [[nodiscard]] std::optional<std::pair<dev_t, ino_t>> listener_node(
+        pid_t pid, ReaperOwnerKey owner) const noexcept;
     // Fair central-reaper scheduling: one owner is selected per outer-loop
     // turn, with a rotating cursor rather than an unordered-map sentinel.
     [[nodiscard]] std::optional<pid_t> next_unobserved_pid() noexcept;
-    [[nodiscard]] size_t size() const noexcept { return owners_.size(); }
+    [[nodiscard]] size_t size() const noexcept;
 
 private:
     struct Entry {
         pid_t pgid = -1;
-        SidecarLifecycle* owner = nullptr;
+        ReaperOwnerKey owner{};
+        std::weak_ptr<ReapMailbox> mailbox;
+        dev_t listener_device = 0;
+        ino_t listener_inode = 0;
         bool observed = false;
+        size_t slot = 0;
     };
-    std::unordered_map<pid_t, Entry> owners_;
-    std::deque<pid_t> order_;
-    size_t cursor_ = 0;
+    struct SharedState {
+        std::mutex mutex;
+        std::unordered_map<pid_t, Entry> owners;
+        std::vector<pid_t> slots;
+        std::vector<size_t> free_slots;
+        size_t cursor = 0;
+    };
+    std::shared_ptr<SharedState> state_;
 };
 
 const char* lifecycle_state_name(LifecycleState state) noexcept;

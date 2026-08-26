@@ -68,7 +68,28 @@ std::string identity_path(std::string_view root, const StoreIdentityRoot& store,
     return path;
 }
 
+std::atomic<uint64_t> g_next_owner_id{1};
+
 } // namespace
+
+bool ReapMailbox::enqueue(ReapEvent event) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (count_ >= kMaximumEvents)
+        return false;
+    events_[(head_ + count_) % kMaximumEvents] = event;
+    ++count_;
+    return true;
+}
+
+bool ReapMailbox::dequeue(ReapEvent& event) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (count_ == 0)
+        return false;
+    event = events_[head_];
+    head_ = (head_ + 1) % kMaximumEvents;
+    --count_;
+    return true;
+}
 
 bool LifecycleIdentity::valid() const noexcept {
     return control.generation != 0 && control.attempt != 0 && store_generation != 0 &&
@@ -88,6 +109,7 @@ const char* lifecycle_state_name(LifecycleState state) noexcept {
     case LifecycleState::ReapAndGroupCheck: return "ReapAndGroupCheck";
     case LifecycleState::RetryEligible: return "RetryEligible";
     case LifecycleState::DegradedLegacy: return "DegradedLegacy";
+    case LifecycleState::FailedClosed: return "FailedClosed";
     }
     return "Unknown";
 }
@@ -102,12 +124,22 @@ const char* lifecycle_action_name(LifecycleAction action) noexcept {
     case LifecycleAction::PublishReady: return "PublishReady";
     case LifecycleAction::EnterDegradedLegacy: return "EnterDegradedLegacy";
     case LifecycleAction::RetryEligible: return "RetryEligible";
+    case LifecycleAction::FailedClosed: return "FailedClosed";
     }
     return "Unknown";
 }
 
 SidecarLifecycle::SidecarLifecycle(SidecarLifecycleConfig config) noexcept
-    : config_(std::move(config)) {}
+    : config_(std::move(config)) {
+    owner_id_ = g_next_owner_id.fetch_add(1, std::memory_order_relaxed);
+    if (owner_id_ == 0)
+        owner_id_ = g_next_owner_id.fetch_add(1, std::memory_order_relaxed);
+    try {
+        reap_mailbox_ = std::make_shared<ReapMailbox>();
+    } catch (...) {
+        reap_mailbox_.reset();
+    }
+}
 
 bool SidecarLifecycle::valid_config(const SidecarLifecycleConfig& config) noexcept {
     return config.control_generation != 0 && config.store_generation != 0 &&
@@ -161,11 +193,15 @@ void SidecarLifecycle::withdraw() noexcept {
 
 void SidecarLifecycle::enter_termination(
     std::chrono::steady_clock::time_point now) noexcept {
+    if (teardown_started_)
+        return;
     withdraw();
+    teardown_started_ = true;
     term_sent_ = false;
     kill_sent_ = false;
     state_ = LifecycleState::TerminatingGrace;
     deadline_ = now + config_.grace_timeout;
+    teardown_deadline_ = now + config_.grace_timeout + config_.kill_timeout;
 }
 
 void SidecarLifecycle::clear_incarnation() noexcept {
@@ -173,11 +209,18 @@ void SidecarLifecycle::clear_incarnation() noexcept {
     child_pid_ = -1;
     process_group_ = -1;
     leader_reaped_ = false;
+    leader_waitable_ = false;
     echild_observed_ = false;
     exec_succeeded_ = false;
     term_sent_ = false;
     kill_sent_ = false;
+    identity_lost_ = false;
+    teardown_started_ = false;
+    legacy_requested_ = false;
+    group_proof_required_ = false;
+    group_domain_.reset();
     ready_buffer_.clear();
+    teardown_deadline_ = {};
 }
 
 LifecycleActionResult SidecarLifecycle::begin(
@@ -191,11 +234,20 @@ LifecycleActionResult SidecarLifecycle::begin(
     child_pid_ = -1;
     process_group_ = -1;
     leader_reaped_ = false;
+    leader_waitable_ = false;
     echild_observed_ = false;
     exec_succeeded_ = false;
     term_sent_ = false;
     kill_sent_ = false;
+    identity_lost_ = false;
+    teardown_started_ = false;
+    legacy_requested_ = false;
+    group_proof_required_ = false;
+    group_domain_.reset();
     ready_buffer_.clear();
+    teardown_deadline_ = {};
+    if (++owner_generation_ == 0)
+        ++owner_generation_;
     state_ = LifecycleState::LaunchPrepared;
     deadline_ = now + config_.launch_timeout;
     return result(LifecycleAction::LaunchPrepared);
@@ -203,22 +255,45 @@ LifecycleActionResult SidecarLifecycle::begin(
 
 bool SidecarLifecycle::accept_ready(const LifecycleObservation& observation) noexcept {
     if (!identity_.has_value() || child_pid_ <= 1 ||
+        leader_waitable_ || leader_reaped_ || identity_lost_ || teardown_started_ ||
+        observation.child_waitable || observation.identity_lost ||
+        observation.request_replacement || observation.request_legacy ||
         observation.ready != ReadyObservation::Complete ||
         !observation.ready_lease.has_value())
         return false;
     const ReadyLease& lease = *observation.ready_lease;
-    return lease.valid() && lease.pid == child_pid_ &&
-           lease.identity == identity_->control &&
-           observation.store_generation == identity_->store_generation &&
-           lease.store_root == identity_->store_root &&
-           lease.c_store_guid == identity_->c_store_guid &&
-           lease.f_store_guid == identity_->f_store_guid &&
-           lease.private_directory == identity_->private_directory;
+    if (!lease.valid() || lease.pid != child_pid_ ||
+        lease.identity != identity_->control ||
+        observation.store_generation != identity_->store_generation ||
+        lease.store_root != identity_->store_root ||
+        lease.c_store_guid != identity_->c_store_guid ||
+        lease.f_store_guid != identity_->f_store_guid ||
+        lease.private_directory != identity_->private_directory ||
+        lease.listener_device == 0 || lease.listener_inode == 0)
+        return false;
+    if ((identity_->listener_device != 0 &&
+         identity_->listener_device != lease.listener_device) ||
+        (identity_->listener_inode != 0 &&
+         identity_->listener_inode != lease.listener_inode))
+        return false;
+    // Capture the exact old node before publication.  Teardown must later
+    // prove that this node, not a replacement at the same pathname, vanished.
+    identity_->listener_device = lease.listener_device;
+    identity_->listener_inode = lease.listener_inode;
+    return true;
 }
 
 bool SidecarLifecycle::exact_group_absent(
     const LifecycleObservation& observation) const noexcept {
-    return process_group_ > 1 && observation.observed_pgid == process_group_ &&
+    if (!group_proof_required_)
+        return true;
+    // A numeric PGID/Gone observation is deliberately insufficient.  The
+    // outer loop must bind the observation to an independently owned,
+    // non-reusable kill-domain lease captured for this exact fork.
+    return leader_reaped_ && group_domain_.has_value() &&
+           group_domain_->valid() && observation.group_domain.valid() &&
+           observation.group_domain == *group_domain_ && process_group_ > 1 &&
+           observation.observed_pgid == process_group_ &&
            observation.group == GroupObservation::Gone;
 }
 
@@ -226,22 +301,87 @@ bool SidecarLifecycle::exact_path_absent(
     const LifecycleObservation& observation) const noexcept {
     if (!identity_.has_value() || !observation.path_absent)
         return false;
-    // An empty path is the compact event-loop observation for the already
-    // registered path.  When a watcher supplies a path, bind it exactly.
-    return observation.observed_path.empty() ||
-           observation.observed_path == identity_->private_directory;
+    if (!observation.observed_path.empty() &&
+        observation.observed_path != identity_->private_directory)
+        return false;
+    if (identity_->listener_device == 0 || identity_->listener_inode == 0)
+        return observation.observed_device == 0 && observation.observed_inode == 0;
+    return observation.observed_device == identity_->listener_device &&
+           observation.observed_inode == identity_->listener_inode;
+}
+
+bool SidecarLifecycle::consume_reap(const ReapEvent& event) noexcept {
+    if (event.owner != owner_key() || event.pid <= 1 ||
+        event.pid != child_pid_ || leader_waitable_ || leader_reaped_)
+        return false;
+    leader_waitable_ = true;
+    leader_reaped_ = true;
+    echild_observed_ = event.echild;
+    return true;
+}
+
+void SidecarLifecycle::consume_reap_events() noexcept {
+    if (!reap_mailbox_)
+        return;
+    // A central reaper gets a fixed delivery quota per owner turn.  Stale
+    // events are discarded by owner generation and cannot poison a new PID.
+    constexpr size_t kReapEventsPerTurn = 8;
+    ReapEvent event;
+    for (size_t count = 0; count != kReapEventsPerTurn &&
+                             reap_mailbox_->dequeue(event); ++count)
+        (void)consume_reap(event);
+}
+
+bool SidecarLifecycle::teardown_expired(
+    std::chrono::steady_clock::time_point now) const noexcept {
+    return teardown_started_ && now >= teardown_deadline_;
+}
+
+LifecycleActionResult SidecarLifecycle::fail_closed() noexcept {
+    withdraw();
+    state_ = LifecycleState::FailedClosed;
+    // Keep the exact identity/PID for diagnostics, but never expose a lease
+    // or permit this object to reopen capacity after bounded teardown fails.
+    return result(LifecycleAction::FailedClosed);
 }
 
 LifecycleActionResult SidecarLifecycle::advance(
     std::chrono::steady_clock::time_point now,
     const LifecycleObservation& observation) noexcept {
-    if (state_ == LifecycleState::DegradedLegacy || state_ == LifecycleState::Stopped)
+    consume_reap_events();
+    if (state_ == LifecycleState::DegradedLegacy ||
+        state_ == LifecycleState::FailedClosed || state_ == LifecycleState::Stopped)
         return result(LifecycleAction::None);
 
+    if (observation.child_waitable)
+        leader_waitable_ = true;
+    if (observation.identity_lost)
+        identity_lost_ = true;
+
     if (observation.request_legacy) {
-        withdraw();
-        state_ = LifecycleState::DegradedLegacy;
-        return result(LifecycleAction::EnterDegradedLegacy);
+        legacy_requested_ = true;
+        if (state_ == LifecycleState::LaunchPrepared && child_pid_ <= 1) {
+            withdraw();
+            teardown_started_ = true;
+            teardown_deadline_ = now + config_.grace_timeout + config_.kill_timeout;
+            state_ = LifecycleState::ReapAndGroupCheck;
+            return result(LifecycleAction::Withdraw);
+        }
+        if (state_ != LifecycleState::TerminatingGrace &&
+            state_ != LifecycleState::TerminatingKill &&
+            state_ != LifecycleState::ReapAndGroupCheck) {
+            enter_termination(now);
+            return result(LifecycleAction::Withdraw);
+        }
+    }
+
+    if ((leader_waitable_ || identity_lost_) &&
+        state_ != LifecycleState::TerminatingGrace &&
+        state_ != LifecycleState::TerminatingKill &&
+        state_ != LifecycleState::ReapAndGroupCheck &&
+        state_ != LifecycleState::LaunchPrepared) {
+        enter_termination(now);
+        return result(LifecycleAction::Withdraw);
     }
 
     switch (state_) {
@@ -260,6 +400,9 @@ LifecycleActionResult SidecarLifecycle::advance(
         if (observation.pid > 1 && observation.observed_pgid == observation.pid) {
             child_pid_ = observation.pid;
             process_group_ = observation.observed_pgid;
+            group_proof_required_ = true;
+            if (observation.group_domain.valid())
+                group_domain_ = observation.group_domain;
             state_ = LifecycleState::ForkedAwaitExecAndReady;
             deadline_ = now + config_.exec_timeout;
         }
@@ -267,7 +410,8 @@ LifecycleActionResult SidecarLifecycle::advance(
 
     case LifecycleState::ForkedAwaitExecAndReady:
         if (observation.exec == ExecObservation::Failed ||
-            observation.ready == ReadyObservation::Invalid || now >= deadline_) {
+            observation.ready == ReadyObservation::Invalid || observation.request_replacement ||
+            observation.identity_lost || observation.child_waitable || now >= deadline_) {
             enter_termination(now);
             return result(LifecycleAction::Withdraw);
         }
@@ -310,6 +454,8 @@ LifecycleActionResult SidecarLifecycle::advance(
         return result(LifecycleAction::None);
 
     case LifecycleState::TerminatingGrace:
+        if (teardown_expired(now))
+            return fail_closed();
         if (exact_group_absent(observation)) {
             state_ = LifecycleState::ReapAndGroupCheck;
             return result(LifecycleAction::None);
@@ -322,25 +468,34 @@ LifecycleActionResult SidecarLifecycle::advance(
         if (now >= deadline_) {
             state_ = LifecycleState::TerminatingKill;
             kill_sent_ = true;
-            deadline_ = now + config_.kill_timeout;
+            deadline_ = std::min(now + config_.kill_timeout, teardown_deadline_);
             return result(LifecycleAction::SendKill);
         }
         return result(LifecycleAction::None);
 
     case LifecycleState::TerminatingKill:
+        if (teardown_expired(now))
+            return fail_closed();
         if (exact_group_absent(observation)) {
             state_ = LifecycleState::ReapAndGroupCheck;
             return result(LifecycleAction::None);
         }
         if (!kill_sent_) {
             kill_sent_ = true;
-            deadline_ = now + config_.kill_timeout;
+            deadline_ = std::min(now + config_.kill_timeout, teardown_deadline_);
             return result(LifecycleAction::SendKill);
         }
         return result(LifecycleAction::None);
 
     case LifecycleState::ReapAndGroupCheck:
+        if (teardown_expired(now))
+            return fail_closed();
         if (exact_group_absent(observation) && exact_path_absent(observation)) {
+            if (legacy_requested_) {
+                withdraw();
+                state_ = LifecycleState::DegradedLegacy;
+                return result(LifecycleAction::EnterDegradedLegacy);
+            }
             clear_incarnation();
             state_ = LifecycleState::RetryEligible;
             return result(LifecycleAction::RetryEligible);
@@ -351,6 +506,7 @@ LifecycleActionResult SidecarLifecycle::advance(
         return result(LifecycleAction::None);
     case LifecycleState::Stopped:
     case LifecycleState::DegradedLegacy:
+    case LifecycleState::FailedClosed:
         return result(LifecycleAction::None);
     }
     return result(LifecycleAction::None);
@@ -365,47 +521,246 @@ bool SidecarLifecycle::observe_child_reaped(pid_t pid, int status,
          state_ != LifecycleState::TerminatingKill &&
          state_ != LifecycleState::ReapAndGroupCheck))
         return false;
+    (void)status;
+    leader_waitable_ = true;
     leader_reaped_ = true;
     echild_observed_ = echild;
     return true;
 }
 
+CentralChildReaperRegistry::CentralChildReaperRegistry() noexcept {
+    try {
+        state_ = std::make_shared<SharedState>();
+    } catch (...) {
+        state_.reset();
+    }
+}
+
+CentralChildReaperRegistry::Registration::~Registration() {
+    reset();
+}
+
+CentralChildReaperRegistry::Registration::Registration(
+    Registration&& other) noexcept
+    : state_(std::move(other.state_)), pid_(other.pid_), owner_(other.owner_) {
+    other.pid_ = -1;
+    other.owner_ = {};
+}
+
+CentralChildReaperRegistry::Registration&
+CentralChildReaperRegistry::Registration::operator=(Registration&& other) noexcept {
+    if (this != &other) {
+        reset();
+        state_ = std::move(other.state_);
+        pid_ = other.pid_;
+        owner_ = other.owner_;
+        other.pid_ = -1;
+        other.owner_ = {};
+    }
+    return *this;
+}
+
+void CentralChildReaperRegistry::Registration::reset() noexcept {
+    if (!state_)
+        return;
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    const auto iterator = state_->owners.find(pid_);
+    if (iterator != state_->owners.end() && iterator->second.owner == owner_) {
+        const size_t slot = iterator->second.slot;
+        if (slot < state_->slots.size()) {
+            state_->slots[slot] = -1;
+            try {
+                state_->free_slots.push_back(slot);
+            } catch (...) {
+                // The hole remains discoverable by register_owner's bounded
+                // registration-time scan.  Destruction must stay noexcept.
+            }
+        }
+        state_->owners.erase(iterator);
+        if (!state_->slots.empty())
+            state_->cursor %= state_->slots.size();
+    }
+    state_.reset();
+    pid_ = -1;
+    owner_ = {};
+}
+
+CentralChildReaperRegistry::Registration
+CentralChildReaperRegistry::register_owner(
+    pid_t pid, pid_t pgid, ReaperOwnerKey owner,
+    std::weak_ptr<ReapMailbox> mailbox, dev_t listener_device,
+    ino_t listener_inode) noexcept {
+    if (!state_ || pid <= 1 || pgid <= 1 || pid != pgid || !owner.valid() ||
+        mailbox.expired())
+        return {};
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    if (state_->owners.find(pid) != state_->owners.end())
+        return {};
+    size_t slot = 0;
+    bool reused = false;
+    try {
+        if (!state_->free_slots.empty()) {
+            slot = state_->free_slots.back();
+            state_->free_slots.pop_back();
+            reused = true;
+            state_->slots[slot] = pid;
+        } else {
+            const auto hole = std::find(state_->slots.begin(), state_->slots.end(), -1);
+            if (hole != state_->slots.end()) {
+                slot = static_cast<size_t>(hole - state_->slots.begin());
+                reused = true;
+                state_->slots[slot] = pid;
+            } else {
+                slot = state_->slots.size();
+                state_->slots.push_back(pid);
+            }
+        }
+        state_->owners.emplace(pid, Entry{pgid, owner, std::move(mailbox),
+                                          listener_device, listener_inode, false,
+                                          slot});
+    } catch (...) {
+        state_->owners.erase(pid);
+        if (reused) {
+            state_->slots[slot] = -1;
+            try {
+                state_->free_slots.push_back(slot);
+            } catch (...) {
+                // The slot remains a reusable hole for the next registration.
+            }
+        } else if (slot < state_->slots.size()) {
+            state_->slots.pop_back();
+        }
+        return {};
+    }
+    return Registration(state_, pid, owner);
+}
+
 bool CentralChildReaperRegistry::register_owner(pid_t pid, pid_t pgid,
                                                 SidecarLifecycle& owner) noexcept {
-    if (pid <= 1 || pgid <= 1 || pid != pgid || owners_.find(pid) != owners_.end())
+    const auto lease = owner.current_ready_lease();
+    const dev_t device = lease.has_value() ? lease->listener_device : 0;
+    const ino_t inode = lease.has_value() ? lease->listener_inode : 0;
+    Registration registration = register_owner(pid, pgid, owner.owner_key(),
+                                                owner.reap_mailbox(), device, inode);
+    if (!registration.valid())
         return false;
-    try {
-        owners_.emplace(pid, Entry{pgid, &owner, false});
-        order_.push_back(pid);
-    } catch (...) {
-        owners_.erase(pid);
+    // This compatibility overload is deliberately persistent; the caller
+    // must call unregister_owner().  It still retains only a weak mailbox.
+    registration.state_.reset();
+    return true;
+}
+
+bool CentralChildReaperRegistry::unregister_owner(pid_t pid,
+                                                  ReaperOwnerKey owner) noexcept {
+    if (!state_ || pid <= 1 || !owner.valid())
         return false;
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    const auto iterator = state_->owners.find(pid);
+    if (iterator == state_->owners.end() || iterator->second.owner != owner)
+        return false;
+    const size_t slot = iterator->second.slot;
+    if (slot < state_->slots.size()) {
+        state_->slots[slot] = -1;
+        state_->free_slots.push_back(slot);
+    }
+    state_->owners.erase(iterator);
+    if (!state_->slots.empty())
+        state_->cursor %= state_->slots.size();
+    return true;
+}
+
+bool CentralChildReaperRegistry::observe_child_reaped(
+    pid_t pid, ReaperOwnerKey owner, int status, bool echild) noexcept {
+    if (!state_ || pid <= 1 || !owner.valid())
+        return false;
+    std::weak_ptr<ReapMailbox> mailbox;
+    {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        const auto iterator = state_->owners.find(pid);
+        if (iterator == state_->owners.end() || iterator->second.owner != owner ||
+            iterator->second.observed)
+            return false;
+        mailbox = iterator->second.mailbox;
+        const auto target = mailbox.lock();
+        if (!target) {
+            const size_t slot = iterator->second.slot;
+            if (slot < state_->slots.size()) {
+                state_->slots[slot] = -1;
+                try {
+                    state_->free_slots.push_back(slot);
+                } catch (...) {
+                    // A reusable hole is sufficient if bookkeeping storage
+                    // is exhausted while retiring a destroyed owner.
+                }
+            }
+            state_->owners.erase(iterator);
+            return false;
+        }
+        // Reserve the one delivery while holding the registry lock.  If the
+        // bounded mailbox is full, leave observed=false so the reaper can
+        // retry rather than poisoning this owner with a lost event.
+        if (!target->enqueue(ReapEvent{owner, pid, status, echild}))
+            return false;
+        iterator->second.observed = true;
     }
     return true;
 }
 
+bool CentralChildReaperRegistry::observe_child_reaped(pid_t pid, int status,
+                                                       bool echild) noexcept {
+    if (!state_ || pid <= 1)
+        return false;
+    ReaperOwnerKey owner;
+    {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        const auto iterator = state_->owners.find(pid);
+        if (iterator == state_->owners.end())
+            return false;
+        owner = iterator->second.owner;
+    }
+    return observe_child_reaped(pid, owner, status, echild);
+}
+
+std::optional<std::pair<dev_t, ino_t>>
+CentralChildReaperRegistry::listener_node(pid_t pid,
+                                          ReaperOwnerKey owner) const noexcept {
+    if (!state_ || pid <= 1 || !owner.valid())
+        return std::nullopt;
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    const auto iterator = state_->owners.find(pid);
+    if (iterator == state_->owners.end() || iterator->second.owner != owner)
+        return std::nullopt;
+    return std::pair<dev_t, ino_t>{iterator->second.listener_device,
+                                   iterator->second.listener_inode};
+}
+
 std::optional<pid_t> CentralChildReaperRegistry::next_unobserved_pid() noexcept {
-    if (order_.empty()) return std::nullopt;
-    for (size_t offset = 0; offset != order_.size(); ++offset) {
-        const size_t index = (cursor_ + offset) % order_.size();
-        const pid_t pid = order_[index];
-        const auto iterator = owners_.find(pid);
-        if (iterator != owners_.end() && !iterator->second.observed) {
-            cursor_ = (index + 1) % order_.size();
+    if (!state_)
+        return std::nullopt;
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    if (state_->slots.empty())
+        return std::nullopt;
+    constexpr size_t kScanQuota = 32;
+    const size_t scans = std::min(kScanQuota, state_->slots.size());
+    for (size_t offset = 0; offset != scans; ++offset) {
+        const size_t index = (state_->cursor + offset) % state_->slots.size();
+        const pid_t pid = state_->slots[index];
+        const auto iterator = state_->owners.find(pid);
+        if (pid > 1 && iterator != state_->owners.end() &&
+            !iterator->second.observed) {
+            state_->cursor = (index + 1) % state_->slots.size();
             return pid;
         }
     }
+    state_->cursor = (state_->cursor + scans) % state_->slots.size();
     return std::nullopt;
 }
 
-bool CentralChildReaperRegistry::observe_child_reaped(pid_t pid, int status,
-                                                       bool echild) noexcept {
-    const auto iterator = owners_.find(pid);
-    if (iterator == owners_.end() || iterator->second.observed ||
-        iterator->second.owner == nullptr)
-        return false;
-    iterator->second.observed = true;
-    return iterator->second.owner->observe_child_reaped(pid, status, echild);
+size_t CentralChildReaperRegistry::size() const noexcept {
+    if (!state_)
+        return 0;
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    return state_->owners.size();
 }
 
 bool parse_exec_status(std::string_view bytes, ExecObservation& result) noexcept {
