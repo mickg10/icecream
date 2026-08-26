@@ -22,6 +22,23 @@ a bounded source fixture and reducer seam; legacy peers do not enter it and
 the existing ordinary FileChunk fallback remains unchanged outside the armed
 path.
 
+## Phase-open precursor
+
+`p50_phase_open` adds the strict handoff boundary used by the next slice:
+`HandoffOffer` binds one nonzero request ID, cache profile, and complete
+`P50SourceArm`; `AttachmentPhaseOpen` must echo that exact request and arm.
+Both messages use length-checked Protocol-50 fixture frames with an explicit
+phase discriminator and no trailing bytes. `P50HandoffAuthority` is intended
+to live once per service incarnation and be shared by all receiver
+connections, retaining a current exact replay record plus a monotonic request
+high-water mark. `P50PhaseOpenState` keeps separate absolute monotonic
+deadlines for establishment and source arrival, so reconnects cannot restart
+either budget.
+
+This is still a protocol/reducer precursor. Production `CompileFile` wiring,
+reverse sealed-FD delivery, and the service's real connection/lease executor
+remain HOLD and are not represented by these fixture APIs.
+
 ## Deliberate boundary
 
 This slice does not claim the production C/F adapter. A follow-on must wire the

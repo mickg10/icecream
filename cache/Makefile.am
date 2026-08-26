@@ -28,6 +28,8 @@ libprotocol50_a_SOURCES = \
 	p50_input_attachment.h \
 	p50_source_identity.cpp \
 	p50_source_identity.h \
+	p50_phase_open.cpp \
+	p50_phase_open.h \
 	p50_input_wait.cpp \
 	p50_input_wait.h \
 	p50_incarnation_identity.h
