@@ -66,6 +66,19 @@ void append_one_byte_at_a_time(ZstdTuDialogue& dialogue,
     }
 }
 
+TxCommit commit_for(const TxBegin& begin) {
+    return TxCommit{begin.history_nonce,
+                    begin.rel_seq,
+                    begin.tu_seq,
+                    begin.transaction_digest,
+                    begin.raw_digest,
+                    compute_post_state_digest(begin.pre_state_digest,
+                                               begin.history_nonce,
+                                               begin.rel_seq,
+                                               begin.tu_seq,
+                                               begin.transaction_digest)};
+}
+
 void test_round_trip_and_persistent_dialogue() {
     const std::vector<uint8_t> input = sample_input();
     const ZstdTuEnvelope first = encode_zstd_tu(
@@ -88,7 +101,7 @@ void test_round_trip_and_persistent_dialogue() {
             "exact BODY count did not close the logical stream");
     require(dialogue.materialize() == input,
             "dialogue ZSTD_TU decode changed exact input");
-    dialogue.commit_visible();
+    dialogue.commit_visible(commit_for(first.begin));
     require(dialogue.state() == ZstdTuDialogue::State::Idle &&
                 dialogue.pending_body_bytes() == 0 &&
                 !dialogue.active_begin(),
@@ -100,7 +113,7 @@ void test_round_trip_and_persistent_dialogue() {
     dialogue.begin(second.begin);
     dialogue.append_body(BodyMessage{second.body});
     require(dialogue.materialize().empty(), "empty input decoded nonempty");
-    dialogue.commit_visible();
+    dialogue.commit_visible(commit_for(second.begin));
 }
 
 void test_single_frame_exactness() {
@@ -355,7 +368,7 @@ void test_randomized_chunking() {
         }
         require(dialogue.materialize() == input,
                 "random dialogue round trip changed input");
-        dialogue.commit_visible();
+        dialogue.commit_visible(commit_for(envelope.begin));
     }
 }
 

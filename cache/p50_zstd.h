@@ -102,11 +102,15 @@ public:
     // Returns exact verified bytes. The caller must publish a restartable
     // InputRecord and route state before calling commit_visible().
     std::vector<uint8_t> materialize();
-    void commit_visible();
+    void commit_visible(const TxCommit& commit);
+    void discard_tentative() noexcept;
 
     // A disconnected dialogue is never reused. A replacement session creates a
     // new instance and replays the complete immutable transaction.
     void disconnect();
+    void reset();
+
+    [[nodiscard]] uint64_t window_limit_bytes() const noexcept;
 
     [[nodiscard]] State state() const { return state_; }
     [[nodiscard]] bool terminal() const { return state_ == State::Terminal; }

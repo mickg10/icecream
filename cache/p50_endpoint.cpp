@@ -1247,6 +1247,7 @@ struct P50ServerEndpoint::Impl {
         const bool replaced = !namespace_inserted && space.active_session != 0;
         if (space.route && space.route->pending) {
             space.route->interrupted = space.route->pending->begin;
+            space.route->pending->dialogue.disconnect();
             release_pending(*space.route->pending);
             space.route->pending.reset();
         }
@@ -1269,6 +1270,7 @@ struct P50ServerEndpoint::Impl {
                 space.route->interrupted = space.route->pending->begin;
             else
                 space.route->interrupted.reset();
+            space.route->pending->dialogue.disconnect();
             release_pending(*space.route->pending);
             space.route->pending.reset();
         }
@@ -1359,7 +1361,9 @@ struct P50ServerEndpoint::Impl {
         result.pending.dialogue = ProfileDialogue::create(
             begin.profile,
             ProfileDialogueConfig{.negotiated_profiles = negotiated_profiles,
-                                  .zstd = caps.zstd});
+                                  .max_encoded_body_bytes = caps.zstd.max_encoded_body_bytes,
+                                  .max_raw_bytes = caps.zstd.max_raw_bytes,
+                                  .max_window_log = caps.zstd.max_window_log});
         result.pending.dialogue.begin(begin);
         return result;
     }
@@ -1407,6 +1411,27 @@ struct P50ServerEndpoint::Impl {
         pending.dialogue.append_body(message);
         if (pending.dialogue.state() == ProfileDialogueState::BodyClosed)
             record(ActionType::BODY_COMPLETE, session, &pending.begin);
+    }
+
+    void append_dict(const Session& session, const DictMessage& message) {
+        Namespace& space = require(session);
+        if (!space.route || !space.route->pending)
+            throw std::logic_error("DICT has no F active transaction");
+        space.route->pending->dialogue.append_dict(message);
+    }
+
+    void receive_need(const Session& session, const NeedMessage& message) {
+        Namespace& space = require(session);
+        if (!space.route || !space.route->pending)
+            throw std::logic_error("NEED has no F active transaction");
+        space.route->pending->dialogue.receive_need(message);
+    }
+
+    void receive_fill(const Session& session, const FillMessage& message) {
+        Namespace& space = require(session);
+        if (!space.route || !space.route->pending)
+            throw std::logic_error("FILL has no F active transaction");
+        space.route->pending->dialogue.receive_fill(message);
     }
 
     bool body_complete(const Session& session) const {
@@ -1468,7 +1493,7 @@ struct P50ServerEndpoint::Impl {
         ++route.next_rel.value;
         route.last_commit = commit;
         route.interrupted.reset();
-        pending.dialogue.commit_visible();
+        pending.dialogue.commit_visible(commit);
         release_pending(pending);
         route.pending.reset();
         record(ActionType::INPUT_COMMITTED, session, &committed_begin, commit.post_state_digest);
@@ -2036,7 +2061,27 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
             Frame component = co_await async_read_frame(
                 socket, selection.limits.max_frame_payload,
                 impl_->stamp(session, AsyncOperationKind::ReadHeader), impl_->completions, verify);
-            impl_->append_body(session, decode_as<BodyMessage>(component));
+            // The reducer owns message ordering, while the selected profile
+            // owns DICT/BODY/NEED/FILL semantics. ZSTD_TU deliberately rejects
+            // the interactive messages through its adapter; future profiles
+            // can implement the same bidirectional dialogue without a new
+            // concrete-profile branch here.
+            switch (component.type) {
+            case MessageType::DICT:
+                impl_->append_dict(session, decode_as<DictMessage>(component));
+                break;
+            case MessageType::BODY:
+                impl_->append_body(session, decode_as<BodyMessage>(component));
+                break;
+            case MessageType::NEED:
+                impl_->receive_need(session, decode_as<NeedMessage>(component));
+                break;
+            case MessageType::FILL:
+                impl_->receive_fill(session, decode_as<FillMessage>(component));
+                break;
+            default:
+                throw std::invalid_argument("unexpected profile component message");
+            }
         } while (!impl_->body_complete(session));
 
         TxBegin committed_begin;
@@ -2100,8 +2145,10 @@ void P50ServerEndpoint::reset_store(FStoreGuid new_guid) {
     if (new_guid == impl_->f_guid)
         throw std::invalid_argument("F store reset requires a fresh GUID");
     for (auto& [guid, space] : impl_->namespaces) {
-        if (space.route && space.route->pending)
+        if (space.route && space.route->pending) {
+            space.route->pending->dialogue.disconnect();
             impl_->release_pending(*space.route->pending);
+        }
         if (space.active_session != 0) {
             Impl::Session invalidated{.serial = space.active_session,
                                       .f_guid = impl_->f_guid,

@@ -3,6 +3,7 @@
 #include "p50_actions.h"
 #include "p50_input_record.h"
 #include "p50_profile.h"
+#include "p50_zstd.h"
 
 #include <utility>
 

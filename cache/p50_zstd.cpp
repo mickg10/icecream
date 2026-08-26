@@ -230,6 +230,17 @@ std::vector<uint8_t> decode_zstd_tu(const TxBegin& begin,
     return codec.decode(begin, encoded_body, limits);
 }
 
+bool commit_matches(const TxCommit& commit, const TxBegin& begin) {
+    return commit.history_nonce == begin.history_nonce &&
+           commit.rel_seq == begin.rel_seq && commit.tu_seq == begin.tu_seq &&
+           commit.transaction_digest == begin.transaction_digest &&
+           commit.raw_digest == begin.raw_digest &&
+           commit.post_state_digest ==
+               compute_post_state_digest(begin.pre_state_digest, begin.history_nonce,
+                                          begin.rel_seq, begin.tu_seq,
+                                          begin.transaction_digest);
+}
+
 ZstdTuDialogue::ZstdTuDialogue(uint32_t negotiated_profiles,
                                ZstdTuLimits limits)
     : negotiated_profiles_(negotiated_profiles), limits_(limits) {
@@ -300,17 +311,37 @@ std::vector<uint8_t> ZstdTuDialogue::materialize() {
     }
 }
 
-void ZstdTuDialogue::commit_visible() {
+void ZstdTuDialogue::commit_visible(const TxCommit& commit) {
     if (state_ != State::Materialized)
         throw std::logic_error(
             "ZSTD_TU commit became visible before materialization");
+    if (!active_ || !commit_matches(commit, *active_))
+        throw std::invalid_argument("ZSTD_TU terminal commit differs from TX_BEGIN");
     clear_active();
     state_ = State::Idle;
+}
+
+void ZstdTuDialogue::discard_tentative() noexcept {
+    if (state_ != State::Idle && state_ != State::Terminal) {
+        clear_active();
+        state_ = State::Idle;
+    }
 }
 
 void ZstdTuDialogue::disconnect() {
     clear_active();
     state_ = State::Terminal;
+}
+
+void ZstdTuDialogue::reset() {
+    if (state_ != State::Terminal)
+        throw std::logic_error("ZSTD_TU reset requires a terminal dialogue");
+    clear_active();
+    state_ = State::Idle;
+}
+
+uint64_t ZstdTuDialogue::window_limit_bytes() const noexcept {
+    return uint64_t{1} << limits_.max_window_log;
 }
 
 [[noreturn]] void ZstdTuDialogue::protocol_error(const char* message) {

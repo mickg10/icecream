@@ -1,6 +1,6 @@
 #pragma once
 
-#include "p50_zstd.h"
+#include "protocol50.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -23,14 +23,23 @@ enum class ProfileDialogueState : uint8_t {
 
 struct ProfileDialogueConfig {
     uint32_t negotiated_profiles = 0;
-    ZstdTuLimits zstd{};
+    // Profile-neutral resource contract. Adapters translate these values to
+    // codec-specific limits; the transaction engine never does.
+    uint64_t max_encoded_body_bytes = 0;
+    uint64_t max_raw_bytes = 0;
+    int max_window_log = 27;
+};
+
+enum class ProfileCommitState : uint8_t {
+    Committed,
+    Tentative,
 };
 
 // A profile implementation is deliberately C-style at this boundary.  The
 // transaction engine never names, allocates, or destroys a concrete profile
 // dialogue; adding a profile adds one vtable/factory implementation instead.
 struct ProfileDialogueVTable {
-    ProfileId profile = ProfileId::ZSTD_TU;
+    ProfileId profile = ProfileId::P29;
     void (*destroy)(void*) noexcept = nullptr;
     void (*begin)(void*, const TxBegin&) = nullptr;
     void (*append_dict)(void*, const DictMessage&) = nullptr;
@@ -38,11 +47,18 @@ struct ProfileDialogueVTable {
     void (*receive_need)(void*, const NeedMessage&) = nullptr;
     void (*receive_fill)(void*, const FillMessage&) = nullptr;
     std::vector<uint8_t> (*materialize)(void*) = nullptr;
-    void (*commit_visible)(void*) = nullptr;
+    // Promotion is bound to the exact terminal identity emitted by the
+    // reducer. A profile cannot make tentative bytes visible for a different
+    // transaction.
+    void (*commit_visible)(void*, const TxCommit&) = nullptr;
+    void (*discard_tentative)(void*) noexcept = nullptr;
     void (*disconnect)(void*) noexcept = nullptr;
+    void (*reset)(void*) = nullptr;
     ProfileDialogueState (*state)(const void*) noexcept = nullptr;
     bool (*terminal)(const void*) noexcept = nullptr;
+    ProfileCommitState (*commit_state)(const void*) noexcept = nullptr;
     size_t (*pending_body_bytes)(const void*) noexcept = nullptr;
+    uint64_t (*window_limit_bytes)(const void*) noexcept = nullptr;
     const TxBegin* (*active_begin)(const void*) noexcept = nullptr;
 };
 
@@ -68,15 +84,23 @@ public:
     void receive_need(const NeedMessage& message) { table_->receive_need(object_, message); }
     void receive_fill(const FillMessage& message) { table_->receive_fill(object_, message); }
     [[nodiscard]] std::vector<uint8_t> materialize() { return table_->materialize(object_); }
-    void commit_visible() { table_->commit_visible(object_); }
+    void commit_visible(const TxCommit& commit) { table_->commit_visible(object_, commit); }
+    void discard_tentative() noexcept { table_->discard_tentative(object_); }
     void disconnect() noexcept { table_->disconnect(object_); }
+    void reset() { table_->reset(object_); }
 
     [[nodiscard]] ProfileDialogueState state() const noexcept {
         return table_->state(object_);
     }
     [[nodiscard]] bool terminal() const noexcept { return table_->terminal(object_); }
+    [[nodiscard]] ProfileCommitState commit_state() const noexcept {
+        return table_->commit_state(object_);
+    }
     [[nodiscard]] size_t pending_body_bytes() const noexcept {
         return table_->pending_body_bytes(object_);
+    }
+    [[nodiscard]] uint64_t window_limit_bytes() const noexcept {
+        return table_->window_limit_bytes(object_);
     }
     [[nodiscard]] const TxBegin* active_begin() const noexcept {
         return table_->active_begin(object_);
@@ -86,7 +110,7 @@ private:
     ProfileDialogue(const ProfileDialogueVTable* table, void* object) noexcept
         : table_(table), object_(object) {}
 
-    void reset() noexcept;
+    void destroy() noexcept;
 
     const ProfileDialogueVTable* table_ = &empty_table();
     void* object_ = nullptr;

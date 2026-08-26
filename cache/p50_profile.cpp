@@ -1,5 +1,7 @@
 #include "p50_profile.h"
 
+#include "p50_zstd.h"
+
 #include <stdexcept>
 #include <utility>
 
@@ -50,12 +52,20 @@ std::vector<uint8_t> materialize_zstd(void* object) {
     return static_cast<ZstdTuDialogue*>(object)->materialize();
 }
 
-void commit_visible_zstd(void* object) {
-    static_cast<ZstdTuDialogue*>(object)->commit_visible();
+void commit_visible_zstd(void* object, const TxCommit& commit) {
+    static_cast<ZstdTuDialogue*>(object)->commit_visible(commit);
+}
+
+void discard_tentative_zstd(void* object) noexcept {
+    static_cast<ZstdTuDialogue*>(object)->discard_tentative();
 }
 
 void disconnect_zstd(void* object) noexcept {
     static_cast<ZstdTuDialogue*>(object)->disconnect();
+}
+
+void reset_zstd(void* object) {
+    static_cast<ZstdTuDialogue*>(object)->reset();
 }
 
 ProfileDialogueState state_zstd(const void* object) noexcept {
@@ -66,8 +76,22 @@ bool terminal_zstd(const void* object) noexcept {
     return static_cast<const ZstdTuDialogue*>(object)->terminal();
 }
 
+ProfileCommitState commit_state_zstd(const void* object) noexcept {
+    const ZstdTuDialogue::State state =
+        static_cast<const ZstdTuDialogue*>(object)->state();
+    return state == ZstdTuDialogue::State::ReceivingBody ||
+                   state == ZstdTuDialogue::State::BodyClosed ||
+                   state == ZstdTuDialogue::State::Materialized
+               ? ProfileCommitState::Tentative
+               : ProfileCommitState::Committed;
+}
+
 size_t pending_body_bytes_zstd(const void* object) noexcept {
     return static_cast<const ZstdTuDialogue*>(object)->pending_body_bytes();
+}
+
+uint64_t window_limit_bytes_zstd(const void* object) noexcept {
+    return static_cast<const ZstdTuDialogue*>(object)->window_limit_bytes();
 }
 
 const TxBegin* active_begin_zstd(const void* object) noexcept {
@@ -85,10 +109,14 @@ const ProfileDialogueVTable kZstdTuVTable{
     .receive_fill = receive_fill_zstd,
     .materialize = materialize_zstd,
     .commit_visible = commit_visible_zstd,
+    .discard_tentative = discard_tentative_zstd,
     .disconnect = disconnect_zstd,
+    .reset = reset_zstd,
     .state = state_zstd,
     .terminal = terminal_zstd,
+    .commit_state = commit_state_zstd,
     .pending_body_bytes = pending_body_bytes_zstd,
+    .window_limit_bytes = window_limit_bytes_zstd,
     .active_begin = active_begin_zstd,
 };
 
@@ -96,19 +124,19 @@ const ProfileDialogueVTable kZstdTuVTable{
 
 const ProfileDialogueVTable& ProfileDialogue::empty_table() noexcept {
     static const ProfileDialogueVTable empty{
-        .profile = ProfileId::ZSTD_TU,
+        .profile = ProfileId::P29,
     };
     return empty;
 }
 
-void ProfileDialogue::reset() noexcept {
+void ProfileDialogue::destroy() noexcept {
     if (object_ != nullptr)
         table_->destroy(object_);
     table_ = &empty_table();
     object_ = nullptr;
 }
 
-ProfileDialogue::~ProfileDialogue() { reset(); }
+ProfileDialogue::~ProfileDialogue() { destroy(); }
 
 ProfileDialogue::ProfileDialogue(ProfileDialogue&& other) noexcept
     : table_(other.table_), object_(other.object_) {
@@ -118,7 +146,7 @@ ProfileDialogue::ProfileDialogue(ProfileDialogue&& other) noexcept
 
 ProfileDialogue& ProfileDialogue::operator=(ProfileDialogue&& other) noexcept {
     if (this != &other) {
-        reset();
+        destroy();
         table_ = other.table_;
         object_ = other.object_;
         other.table_ = &empty_table();
@@ -134,13 +162,17 @@ ProfileDialogue ProfileDialogue::create(ProfileId profile, ProfileDialogueConfig
 ProfileDialogue make_profile_dialogue(ProfileId profile, ProfileDialogueConfig config) {
     const uint32_t selected_bit = profile_bit(profile);
     if (selected_bit == 0 ||
+        (config.negotiated_profiles & ~kDeclaredProfileMask) != 0 ||
         (config.negotiated_profiles & selected_bit) != selected_bit)
         throw std::invalid_argument("transaction profile was not negotiated");
+    ZstdTuLimits zstd_limits{config.max_encoded_body_bytes,
+                             config.max_raw_bytes,
+                             config.max_window_log};
     switch (profile) {
     case ProfileId::ZSTD_TU:
         return ProfileDialogue(&kZstdTuVTable,
                                new ZstdTuDialogue(config.negotiated_profiles,
-                                                  config.zstd));
+                                                  zstd_limits));
     default:
         throw std::invalid_argument("transaction profile has no dialogue implementation");
     }

@@ -15,8 +15,21 @@ if grep -F 'ZstdTuDialogue' "$endpoint" >/dev/null; then
     exit 1
 fi
 grep -F 'struct ProfileDialogueVTable' "$header" >/dev/null
+grep -F '#include "protocol50.h"' "$header" >/dev/null
+if grep -F '#include "p50_zstd.h"' "$header" >/dev/null; then
+    echo 'FAIL: neutral profile interface includes concrete ZSTD header' >&2
+    exit 1
+fi
+grep -F 'commit_visible(const TxCommit&' "$header" >/dev/null
+grep -F 'discard_tentative' "$header" >/dev/null
+grep -F 'window_limit_bytes' "$header" >/dev/null
 grep -F 'make_profile_dialogue' "$profile" >/dev/null
 grep -F 'new ZstdTuDialogue' "$profile" >/dev/null
+grep -F 'impl_->receive_need' "$endpoint" >/dev/null
+grep -F 'impl_->receive_fill' "$endpoint" >/dev/null
+grep -F 'impl_->append_dict' "$endpoint" >/dev/null
+grep -F 'pending.dialogue.commit_visible(commit)' "$endpoint" >/dev/null
+grep -F 'pending->dialogue.disconnect()' "$endpoint" >/dev/null
 grep -F 'P50_PROFILE_INTERFACE.md' "$src/cache/Makefile.am" >/dev/null
 
 mutant=$(mktemp "${TMPDIR:-/tmp}/p50profile-mutant.XXXXXX")
