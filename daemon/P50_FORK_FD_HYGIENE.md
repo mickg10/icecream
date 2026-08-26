@@ -12,8 +12,12 @@ set:
   the lease explicitly separates its borrowed handoff FD from a private proof
   and control pair. Move-assignment and destruction retire only those private
   handles; the caller-owned handoff number is never closed by the lease. The
-  test seam's proof observation slot is caller-owned and may be replaced at
-  any time, including with a same-OFD `dup3` handoff;
+  mint boundary also disarms a rejected owner if a malformed private slot
+  aliases the borrowed handoff, so natural owner destruction cannot close the
+  caller descriptor. The test seam's proof observation slot is caller-owned;
+  move-assignment preserves both destination and moved-from slot references,
+  and the slot may be replaced at any time, including with a same-OFD `dup3`
+  handoff;
 * source handoffs are sealed immutable memfds: unsealed mutable regular files
   are rejected at mint, so a same-size content mutation cannot pass the
   mint-to-sweep identity checks.  The owned proof is reopened as a distinct

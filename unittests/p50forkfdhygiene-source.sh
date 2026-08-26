@@ -40,6 +40,7 @@ grep -F 'open_independent_readonly' "$source" >/dev/null
 grep -F 'owned_proof_fd_ == fd' "$source" >/dev/null
 grep -F 'proof_handoff != OpenFileComparison::Different' "$source" >/dev/null
 grep -F 'control_handoff != OpenFileComparison::Different' "$source" >/dev/null
+grep -F 'disarm_rejected_alias' "$source" "$header" >/dev/null
 grep -F 'dup3' "$test" >/dev/null
 grep -F 'original_backup' "$test" >/dev/null
 grep -F 'same-open-file replacement' "$test" >/dev/null

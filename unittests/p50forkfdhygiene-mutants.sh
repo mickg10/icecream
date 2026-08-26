@@ -15,7 +15,9 @@ mutable_dir=
 mutant_dir=
 alias_dir=
 kcmp_dir=
-trap 'rm -f "$mutant"; rm -rf "$mutant_dir" "$identity_dir" "$move_dir" "$proof_dir" "$mutable_dir" "$alias_dir" "$kcmp_dir"' EXIT HUP INT TERM
+alias_reject_dir=
+slot_dir=
+trap 'rm -f "$mutant"; rm -rf "$mutant_dir" "$identity_dir" "$move_dir" "$proof_dir" "$mutable_dir" "$alias_dir" "$kcmp_dir" "$alias_reject_dir" "$slot_dir"' EXIT HUP INT TERM
 
 # A real runtime mutant changes the accepted source DeliveryId while the
 # owner still authorizes 77.  The mutant must fail before any sweep runs.
@@ -113,6 +115,43 @@ if "$kcmp_dir/test" >/dev/null 2>&1; then
     exit 1
 fi
 rm -rf "$kcmp_dir"
+
+# A true rejected-alias mutant skips the production disarm after mint refuses
+# an owner.  The executable's natural optional reset must catch the destructor
+# closing the caller's handoff without a test-only disarm.
+alias_reject_dir=$(mktemp -d "${TMPDIR:-/tmp}/p50forkfdhygiene-alias-reject-mutant.XXXXXX")
+mkdir -p "$alias_reject_dir/daemon" "$alias_reject_dir/unittests"
+sed 's/owner\.disarm_rejected_alias(fd);/(void)fd;/' \
+    "$source" >"$alias_reject_dir/daemon/p50_fork_fd_hygiene.cpp"
+cp "$header" "$alias_reject_dir/daemon/p50_fork_fd_hygiene.h"
+cp "$test" "$alias_reject_dir/unittests/p50_fork_fd_hygiene_test.cpp"
+"$cxx" "$standard" -Wall -Wextra -Werror \
+    -DICECC_P50_FORK_FD_HYGIENE_TEST_HOOKS -I"$alias_reject_dir" \
+    "$alias_reject_dir/unittests/p50_fork_fd_hygiene_test.cpp" \
+    "$alias_reject_dir/daemon/p50_fork_fd_hygiene.cpp" -o "$alias_reject_dir/test"
+if "$alias_reject_dir/test" >/dev/null 2>&1; then
+    echo 'FAIL: rejected-alias disarm mutant survived' >&2
+    exit 1
+fi
+rm -rf "$alias_reject_dir"
+
+# A true move-assignment mutant restores the slot overwrite.  The executable
+# checks both caller-owned observation slots and the final descriptor count.
+slot_dir=$(mktemp -d "${TMPDIR:-/tmp}/p50forkfdhygiene-slot-mutant.XXXXXX")
+mkdir -p "$slot_dir/daemon" "$slot_dir/unittests"
+sed '/        identity_ = other\.identity_;/i\        proof_slot_fd_ = other.proof_slot_fd_;' \
+    "$source" >"$slot_dir/daemon/p50_fork_fd_hygiene.cpp"
+cp "$header" "$slot_dir/daemon/p50_fork_fd_hygiene.h"
+cp "$test" "$slot_dir/unittests/p50_fork_fd_hygiene_test.cpp"
+"$cxx" "$standard" -Wall -Wextra -Werror \
+    -DICECC_P50_FORK_FD_HYGIENE_TEST_HOOKS -I"$slot_dir" \
+    "$slot_dir/unittests/p50_fork_fd_hygiene_test.cpp" \
+    "$slot_dir/daemon/p50_fork_fd_hygiene.cpp" -o "$slot_dir/test"
+if "$slot_dir/test" >/dev/null 2>&1; then
+    echo 'FAIL: move-assignment proof-slot overwrite mutant survived' >&2
+    exit 1
+fi
+rm -rf "$slot_dir"
 
 # The mint boundary must reject an owner proof whose integer slot aliases the
 # borrowed handoff.  Removing that explicit check transfers the handoff into

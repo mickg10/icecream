@@ -414,6 +414,86 @@ void test_move_assignment_and_proof_reuse() {
             "lease destruction closed the transferred handoff FD");
     (void)::close(duplicate);
 
+    // Observation slots are caller-owned test descriptors.  A move
+    // assignment must not overwrite the destination's slot or discard the
+    // moved-from source's slot; callers still need both numbers to retire
+    // them explicitly.
+    {
+        const size_t before_owner_move = open_fd_count();
+        const int owner_handoff = ::fcntl(inventory.source, F_DUPFD_CLOEXEC, 58);
+        require(owner_handoff >= 0, "could not duplicate owner move handoff");
+        auto owner_a = icecc::p50::forkfd::test_make_delivery_owner(
+            inventory.source, kAcceptedDeliveryId);
+        auto owner_b = icecc::p50::forkfd::test_make_delivery_owner(
+            owner_handoff, kAcceptedDeliveryId);
+        require(owner_a.has_value() && owner_b.has_value(),
+                "owner move-assignment tokens were not minted");
+        const int owner_slot_a =
+            icecc::p50::forkfd::test_delivery_owner_proof_fd(*owner_a);
+        const int owner_slot_b =
+            icecc::p50::forkfd::test_delivery_owner_proof_fd(*owner_b);
+        require(owner_slot_a >= 0 && owner_slot_b >= 0 &&
+                    owner_slot_a != owner_slot_b,
+                "owner move-assignment slots were not distinct");
+        *owner_a = std::move(*owner_b);
+        require(icecc::p50::forkfd::test_delivery_owner_proof_fd(*owner_a) ==
+                    owner_slot_a &&
+                    icecc::p50::forkfd::test_delivery_owner_proof_fd(*owner_b) ==
+                        owner_slot_b,
+                "owner move-assignment discarded a caller proof slot");
+        owner_a.reset();
+        owner_b.reset();
+        require(::fcntl(owner_slot_a, F_GETFD) >= 0 &&
+                    ::fcntl(owner_slot_b, F_GETFD) >= 0,
+                "owner move-assignment retired a caller proof slot");
+        require(::close(owner_slot_a) == 0 && ::close(owner_slot_b) == 0,
+                "owner move-assignment slot cleanup failed");
+        require(::close(owner_handoff) == 0 &&
+                    open_fd_count() == before_owner_move,
+                "owner move-assignment leaked descriptors");
+    }
+
+    {
+        const size_t before_lease_move = open_fd_count();
+        const int lease_handoff = ::fcntl(inventory.source, F_DUPFD_CLOEXEC, 58);
+        require(lease_handoff >= 0, "could not duplicate lease move handoff");
+        auto lease_owner_a = icecc::p50::forkfd::test_make_delivery_owner(
+            inventory.source, kAcceptedDeliveryId);
+        auto lease_owner_b = icecc::p50::forkfd::test_make_delivery_owner(
+            lease_handoff, kAcceptedDeliveryId);
+        require(lease_owner_a.has_value() && lease_owner_b.has_value(),
+                "lease move-assignment owners were not minted");
+        auto lease_a = icecc::p50::forkfd::mint_fork_source_lease(
+            std::move(*lease_owner_a), inventory.source, kAcceptedDeliveryId);
+        auto lease_b = icecc::p50::forkfd::mint_fork_source_lease(
+            std::move(*lease_owner_b), lease_handoff, kAcceptedDeliveryId);
+        require(lease_a.has_value() && lease_b.has_value(),
+                "lease move-assignment leases were not minted");
+        const int lease_slot_a =
+            icecc::p50::forkfd::test_fork_source_lease_proof_fd(*lease_a);
+        const int lease_slot_b =
+            icecc::p50::forkfd::test_fork_source_lease_proof_fd(*lease_b);
+        require(lease_slot_a >= 0 && lease_slot_b >= 0 &&
+                    lease_slot_a != lease_slot_b,
+                "lease move-assignment slots were not distinct");
+        *lease_a = std::move(*lease_b);
+        require(icecc::p50::forkfd::test_fork_source_lease_proof_fd(*lease_a) ==
+                    lease_slot_a &&
+                    icecc::p50::forkfd::test_fork_source_lease_proof_fd(*lease_b) ==
+                        lease_slot_b,
+                "lease move-assignment discarded a caller proof slot");
+        lease_a.reset();
+        lease_b.reset();
+        require(::fcntl(lease_slot_a, F_GETFD) >= 0 &&
+                    ::fcntl(lease_slot_b, F_GETFD) >= 0,
+                "lease move-assignment retired a caller proof slot");
+        require(::close(lease_slot_a) == 0 && ::close(lease_slot_b) == 0,
+                "lease move-assignment slot cleanup failed");
+        require(::close(lease_handoff) == 0 &&
+                    open_fd_count() == before_lease_move,
+                "lease move-assignment leaked descriptors");
+    }
+
     auto token = icecc::p50::forkfd::test_make_delivery_owner(
         inventory.source, kAcceptedDeliveryId);
     require(token.has_value(), "proof-reuse owner token was not minted");
@@ -491,8 +571,7 @@ void test_move_assignment_and_proof_reuse() {
         std::move(*alias_owner), inventory.source, kAcceptedDeliveryId);
     require(!alias_lease.has_value(),
             "mint accepted owned proof FD equal to borrowed handoff FD");
-    if (alias_owner.has_value())
-        icecc::p50::forkfd::test_disarm_delivery_owner(*alias_owner);
+    alias_owner.reset();
     require(alias_slot >= 0 && ::close(alias_slot) == 0,
             "alias proof slot cleanup failed");
     require(::fcntl(inventory.source, F_GETFD) >= 0,
@@ -510,8 +589,7 @@ void test_move_assignment_and_proof_reuse() {
         kAcceptedDeliveryId);
     require(!control_alias_lease.has_value(),
             "mint accepted private control sharing the borrowed OFD");
-    if (control_alias_owner.has_value())
-        icecc::p50::forkfd::test_disarm_delivery_owner(*control_alias_owner);
+    control_alias_owner.reset();
     require(control_alias_slot >= 0 && ::close(control_alias_slot) == 0,
             "control-alias proof slot cleanup failed");
     require(::fcntl(inventory.source, F_GETFD) >= 0,

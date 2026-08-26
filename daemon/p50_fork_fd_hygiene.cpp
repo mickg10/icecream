@@ -222,6 +222,27 @@ DeliveryOwnerToken::DeliveryOwnerToken(int expected_fd,
       proof_slot_fd_(proof_slot_fd), identity_(identity),
       owner_cookie_(owner_cookie) {}
 
+// A mint rejection normally leaves the owner available to its caller, but a
+// malformed owner may have put the borrowed handoff number in one of its
+// supposedly-private slots.  Remove only those aliased slots before the
+// owner's natural destructor runs.  The handoff is caller-owned, so it must
+// never be closed here; any remaining private handle still goes through the
+// ordinary retirement path.
+void DeliveryOwnerToken::disarm_rejected_alias(int handoff_fd) noexcept {
+    const bool proof_alias = owned_proof_fd_ == handoff_fd;
+    const bool control_alias = control_fd_ == handoff_fd;
+    if (proof_alias)
+        owned_proof_fd_ = -1;
+    if (control_alias)
+        control_fd_ = -1;
+    if (proof_alias || control_alias) {
+        (void)retire_owned_proof(&owned_proof_fd_, &control_fd_, identity_);
+        expected_fd_ = -1;
+        expected_delivery_id_ = 0;
+        owner_cookie_ = 0;
+    }
+}
+
 DeliveryOwnerToken::DeliveryOwnerToken(DeliveryOwnerToken&& other) noexcept
     : expected_fd_(other.expected_fd_),
       expected_delivery_id_(other.expected_delivery_id_),
@@ -246,14 +267,15 @@ DeliveryOwnerToken& DeliveryOwnerToken::operator=(DeliveryOwnerToken&& other) no
         expected_delivery_id_ = other.expected_delivery_id_;
         owned_proof_fd_ = other.owned_proof_fd_;
         control_fd_ = other.control_fd_;
-        proof_slot_fd_ = other.proof_slot_fd_;
+        // proof_slot_fd_ is a caller-owned observation descriptor.  It is
+        // deliberately not overwritten: the caller must retain access to
+        // both the old destination slot and the moved-from source slot.
         identity_ = other.identity_;
         owner_cookie_ = other.owner_cookie_;
         other.expected_fd_ = -1;
         other.expected_delivery_id_ = 0;
         other.owned_proof_fd_ = -1;
         other.control_fd_ = -1;
-        other.proof_slot_fd_ = -1;
         other.identity_ = SourceIdentity{};
         other.owner_cookie_ = 0;
     }
@@ -305,7 +327,8 @@ ForkSourceLease& ForkSourceLease::operator=(ForkSourceLease&& other) noexcept {
         expected_delivery_id_ = other.expected_delivery_id_;
         owned_proof_fd_ = other.owned_proof_fd_;
         control_fd_ = other.control_fd_;
-        proof_slot_fd_ = other.proof_slot_fd_;
+        // proof_slot_fd_ is caller-owned test state; retain both sides so a
+        // move assignment cannot orphan the destination's open slot.
         identity_ = other.identity_;
         owner_cookie_ = other.owner_cookie_;
         other.borrowed_handoff_fd_ = -1;
@@ -314,7 +337,6 @@ ForkSourceLease& ForkSourceLease::operator=(ForkSourceLease&& other) noexcept {
         other.expected_delivery_id_ = 0;
         other.owned_proof_fd_ = -1;
         other.control_fd_ = -1;
-        other.proof_slot_fd_ = -1;
         other.identity_ = SourceIdentity{};
         other.owner_cookie_ = 0;
     }
@@ -344,7 +366,8 @@ mint_fork_source_lease(DeliveryOwnerToken&& owner, int fd,
         compare_open_file_description(owner.owned_proof_fd_, fd);
     const OpenFileComparison control_handoff =
         compare_open_file_description(owner.control_fd_, fd);
-    if (owner.owner_cookie_ == 0 || owner.expected_fd_ < 0 ||
+    const bool rejected =
+        owner.owner_cookie_ == 0 || owner.expected_fd_ < 0 ||
         owner.owned_proof_fd_ < 0 || owner.control_fd_ < 0 ||
         owner.owned_proof_fd_ == owner.control_fd_ ||
         owner.owned_proof_fd_ == fd || owner.control_fd_ == fd ||
@@ -355,8 +378,12 @@ mint_fork_source_lease(DeliveryOwnerToken&& owner, int fd,
         proof_handoff != OpenFileComparison::Different ||
         control_handoff != OpenFileComparison::Different ||
         !source_identity_matches(owner.owned_proof_fd_, owner.identity_) ||
-        !source_identity_matches(fd, owner.identity_))
+        !source_identity_matches(fd, owner.identity_);
+    if (rejected) {
+        if (owner.owned_proof_fd_ == fd || owner.control_fd_ == fd)
+            owner.disarm_rejected_alias(fd);
         return std::nullopt;
+    }
     ForkSourceLease result(fd, delivery_id, owner.expected_fd_,
                            owner.expected_delivery_id_, owner.owned_proof_fd_,
                            owner.control_fd_, owner.identity_,
@@ -840,16 +867,6 @@ test_make_delivery_owner_control_alias(int expected_fd,
     return owner;
 }
 
-void test_disarm_delivery_owner(DeliveryOwnerToken& owner) noexcept {
-    if (owner.control_fd_ >= 0)
-        (void)::close(owner.control_fd_);
-    owner.expected_fd_ = -1;
-    owner.expected_delivery_id_ = 0;
-    owner.owned_proof_fd_ = -1;
-    owner.control_fd_ = -1;
-    owner.identity_ = SourceIdentity{};
-    owner.owner_cookie_ = 0;
-}
 #endif
 
 } // namespace icecc::p50::forkfd

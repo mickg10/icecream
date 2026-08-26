@@ -74,10 +74,11 @@ private:
     friend std::optional<DeliveryOwnerToken>
     test_make_delivery_owner_control_alias(int expected_fd,
                                             uint64_t expected_delivery_id) noexcept;
-    friend void test_disarm_delivery_owner(DeliveryOwnerToken&) noexcept;
     friend std::optional<ForkSourceLease>
     mint_fork_source_lease(DeliveryOwnerToken&& owner, int fd,
                            uint64_t delivery_id) noexcept;
+
+    void disarm_rejected_alias(int handoff_fd) noexcept;
 };
 
 enum class Failure : uint8_t {
@@ -205,7 +206,6 @@ test_make_delivery_owner_alias(int expected_fd,
 std::optional<DeliveryOwnerToken>
 test_make_delivery_owner_control_alias(int expected_fd,
                                        uint64_t expected_delivery_id) noexcept;
-void test_disarm_delivery_owner(DeliveryOwnerToken&) noexcept;
 #endif
 
 } // namespace icecc::p50::forkfd
