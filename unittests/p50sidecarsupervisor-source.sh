@@ -106,6 +106,8 @@ grep -F 'mkdtemp' "$impl" >/dev/null
 grep -F 'parse_ready_lease' "$impl" >/dev/null
 grep -F 'F_STORE_GUID' "$impl" "$header" >/dev/null
 grep -F 'listener_device' "$impl" "$header" >/dev/null
+grep -F 'pathname_info' "$impl" >/dev/null
+grep -F 'lstat(lease.socket_path.c_str()' "$impl" >/dev/null
 grep -F 'socket_path_digest' "$impl" "$header" >/dev/null
 grep -F 'cleanup_lease' "$impl" >/dev/null
 grep -F 'rmdir' "$impl" >/dev/null
@@ -120,6 +122,8 @@ grep -F 'socket_path_digest != digest128(socket_path)' "$header" >/dev/null
 grep -F 'cleanup_never_deletes_replaced_socket' \
     "$src/unittests/p50_sidecar_supervisor_test.cpp" >/dev/null
 grep -F 'cleanup_never_deletes_replaced_directory' \
+    "$src/unittests/p50_sidecar_supervisor_test.cpp" >/dev/null
+grep -F 'structured_actual_service_publishes_prebound_ready' \
     "$src/unittests/p50_sidecar_supervisor_test.cpp" >/dev/null
 grep -F 'structured-trailing-space' \
     "$src/unittests/p50_sidecar_supervisor_test.cpp" >/dev/null

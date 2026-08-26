@@ -619,8 +619,29 @@ RuntimeCase authenticated_runtime_pair() {
 
 service::RuntimeConfig test_runtime_config() {
     service::RuntimeConfig config;
+    config.c_store_guid = service::c_store_guid_for_identity({7, 1});
     config.f_store_guid = Id128::from_u64(9001);
     return config;
+}
+
+void structured_c_guid_is_strict() {
+    service::RuntimeConfig config;
+    config.f_store_guid = Id128::from_u64(9001);
+    bool rejected = false;
+    try {
+        service::SidecarRuntime runtime(config);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    CHECK(rejected);
+    config.c_store_guid = config.f_store_guid;
+    rejected = false;
+    try {
+        service::SidecarRuntime runtime(config);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    CHECK(rejected);
 }
 
 void test_runtime_store_identity_fences_attempt() {
@@ -1234,6 +1255,7 @@ int main() {
         frame_header_and_payload_share_one_deadline();
         test_runtime_store_identity_fences_attempt();
         structured_launch_is_complete_and_fail_closed();
+        structured_c_guid_is_strict();
         test_runtime_identity_disconnect_and_endpoint_failure();
         test_runtime_stop_interrupts_control_wait();
         test_runtime_zstd_tu_af_unix_loopback();

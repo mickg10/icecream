@@ -22,6 +22,7 @@ grep -F 'expected_peer.pid' "$test" >/dev/null
 grep -F 'on_demand_' "$impl" >/dev/null
 grep -F 'const auto deadline' "$impl" >/dev/null
 grep -F 'identity != identity_' "$impl" >/dev/null
+grep -F 'c_store_guid != CStoreGuid{}' "$impl" >/dev/null
 grep -F 'next_request_id_++' "$impl" >/dev/null
 grep -F 'disable();' "$impl" >/dev/null
 grep -Fx '    if (!on_demand_->current_path_matches())' "$impl" >/dev/null
@@ -39,6 +40,7 @@ for needle in \
     'OnDemandEndpoint' 'set_on_demand_endpoint' 'fresh endpoint relationship' \
     'fresh accepted relationship' 'endpoint lease' 'path replacement' \
     'wrong endpoint path digest' 'wrong endpoint F_STORE_GUID' \
+    'zero endpoint C_STORE_GUID' \
     'wrong endpoint listener device' 'wrong endpoint listener inode' \
     'post-HELLO endpoint replacement' \
     'post-release peer disconnect' 'post-release handoff timeout' \

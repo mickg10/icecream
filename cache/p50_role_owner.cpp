@@ -21,7 +21,7 @@ std::optional<RoleOwnedFd> adopt_impl(Owner& owner, RoleDiscriminator expected,
         (void)::close(fd);
         return std::nullopt;
     }
-    return RoleOwnedFd{role, fd, owner.live_counter_ptr()};
+    return RoleOwnedFd{role, fd, owner.live_counter_state()};
 }
 
 } // namespace
@@ -29,8 +29,8 @@ std::optional<RoleOwnedFd> adopt_impl(Owner& owner, RoleDiscriminator expected,
 RoleOwnedFd::~RoleOwnedFd() {
     if (fd >= 0)
         (void)::close(fd);
-    if (live_counter != nullptr && *live_counter != 0)
-        --*live_counter;
+    if (live_counter != nullptr && live_counter->live != 0)
+        --live_counter->live;
 }
 
 RoleOwnedFd::RoleOwnedFd(RoleOwnedFd&& other) noexcept
@@ -43,8 +43,8 @@ RoleOwnedFd& RoleOwnedFd::operator=(RoleOwnedFd&& other) noexcept {
     if (this != &other) {
         if (fd >= 0)
             (void)::close(fd);
-        if (live_counter != nullptr && *live_counter != 0)
-            --*live_counter;
+        if (live_counter != nullptr && live_counter->live != 0)
+            --live_counter->live;
         role = other.role;
         fd = other.fd;
         live_counter = other.live_counter;
@@ -57,11 +57,18 @@ RoleOwnedFd& RoleOwnedFd::operator=(RoleOwnedFd&& other) noexcept {
 int RoleOwnedFd::release() noexcept {
     const int result = fd;
     fd = -1;
+    // release() transfers the descriptor and therefore also transfers no
+    // admission lease.  The receiving owner is outside this object's
+    // accounting domain, so free our slot immediately rather than retaining
+    // it until the moved-from wrapper is destroyed.
+    if (live_counter != nullptr && live_counter->live != 0)
+        --live_counter->live;
+    live_counter.reset();
     return result;
 }
 
 ClientRoleOwner::ClientRoleOwner(CStoreGuid c_store_guid, FStoreGuid f_store_guid,
-                                 RoleLimits limits) noexcept
+                                 RoleLimits limits)
     : c_store_guid_(c_store_guid), f_store_guid_(f_store_guid), limits_(limits) {}
 
 ClientRoleOwner::~ClientRoleOwner() = default;
@@ -77,11 +84,11 @@ bool ClientRoleOwner::admit_role(RoleDiscriminator role) noexcept {
         ++counters_.rejected_wrong_role;
         return false;
     }
-    if (live_fds_ >= limits_.max_live_fds) {
+    if (live_state_->live >= limits_.max_live_fds) {
         ++counters_.rejected_limit;
         return false;
     }
-    ++live_fds_;
+    ++live_state_->live;
     ++counters_.accepted;
     return true;
 }
@@ -99,7 +106,7 @@ std::optional<RoleOwnedFd> ClientRoleOwner::adopt(RoleDiscriminator role,
 }
 
 ServerRoleOwner::ServerRoleOwner(CStoreGuid c_store_guid, FStoreGuid f_store_guid,
-                                 RoleLimits limits) noexcept
+                                 RoleLimits limits)
     : c_store_guid_(c_store_guid), f_store_guid_(f_store_guid), limits_(limits) {}
 
 ServerRoleOwner::~ServerRoleOwner() = default;
@@ -115,11 +122,11 @@ bool ServerRoleOwner::admit_role(RoleDiscriminator role) noexcept {
         ++counters_.rejected_wrong_role;
         return false;
     }
-    if (live_fds_ >= limits_.max_live_fds) {
+    if (live_state_->live >= limits_.max_live_fds) {
         ++counters_.rejected_limit;
         return false;
     }
-    ++live_fds_;
+    ++live_state_->live;
     ++counters_.accepted;
     return true;
 }

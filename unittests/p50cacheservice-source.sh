@@ -74,8 +74,13 @@ grep -F 'signal_interrupts_control_wait(SIGTERM)' "$test_file" >/dev/null
 grep -F 'signal_interrupts_control_wait(SIGINT)' "$test_file" >/dev/null
 grep -F 'second_control.sender' "$test_file" >/dev/null
 grep -F 'structured_launch_is_complete_and_fail_closed' "$test_file" >/dev/null
+grep -F 'structured_c_guid_is_strict' "$test_file" >/dev/null
 grep -F 'READY v2 generation=91 attempt=7 pid=' "$test_file" >/dev/null
 grep -F 'ICECC_CACHE_SERVICE_EXPECTED_GENERATION' "$test_file" >/dev/null
+grep -F 'ICECC_CACHE_SERVICE_LISTENER_FD' "$test_file" >/dev/null
+grep -F 'getsockname' "$impl" >/dev/null
+grep -F 'SO_ACCEPTCONN' "$impl" >/dev/null
+grep -F 'nonzero C_STORE_GUID' "$impl" >/dev/null
 grep -F 'WIFEXITED(status) && WEXITSTATUS(status) == 2' "$test_file" >/dev/null
 grep -F 'READY\n' "$doc" >/dev/null
 grep -F 'generation and attempt' "$doc" >/dev/null

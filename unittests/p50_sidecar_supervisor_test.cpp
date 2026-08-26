@@ -453,6 +453,31 @@ void structured_lease_rotates_across_restart_and_controller_recreation() {
     CHECK(::rmdir(root.c_str()) == 0);
 }
 
+void structured_actual_service_publishes_prebound_ready() {
+    const char* service_path = std::getenv("ICECC_TEST_CACHE_SERVICE");
+    CHECK(service_path != nullptr && service_path[0] == '/');
+    const std::string root = make_private_root();
+    auto allocator = std::make_shared<LaunchIdentityAllocator>(73, 1);
+    Config config = structured_config("unused", root, allocator, 0);
+    config.executable = service_path;
+    const std::string stale_socket = root + "/stale.sock";
+    config.arguments = {"--socket", stale_socket,
+                        "--peer-uid", std::to_string(static_cast<uint64_t>(::getuid())),
+                        "--peer-gid", std::to_string(static_cast<uint64_t>(::getgid())),
+                        "--generation", "1", "--attempt", "1"};
+    Supervisor supervisor(config);
+    CHECK(supervisor.start());
+    CHECK(supervisor.state() == State::Ready);
+    const ReadyLease lease = *supervisor.current_lease();
+    struct stat pathname{};
+    CHECK(::lstat(lease.socket_path.c_str(), &pathname) == 0 && S_ISSOCK(pathname.st_mode));
+    CHECK(pathname.st_dev == lease.listener_device && pathname.st_ino == lease.listener_inode);
+    CHECK(::access(stale_socket.c_str(), F_OK) != 0);
+    supervisor.shutdown();
+    CHECK(::access(lease.socket_path.c_str(), F_OK) != 0);
+    CHECK(::rmdir(root.c_str()) == 0);
+}
+
 void structured_dead_or_malformed_ready_is_never_current() {
     for (const char* mode : {"structured-exit", "structured-wrong-pid",
                              "structured-trailing-space", "structured-double-space"}) {
@@ -906,6 +931,7 @@ int main(int argc, char** argv) {
         validation_and_exec_failure();
         launch_allocator_refuses_reserved_and_exhausted_identities();
         structured_lease_rotates_across_restart_and_controller_recreation();
+        structured_actual_service_publishes_prebound_ready();
         structured_dead_or_malformed_ready_is_never_current();
         cleanup_never_deletes_replaced_socket();
         cleanup_never_deletes_replaced_directory();

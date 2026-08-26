@@ -7,6 +7,8 @@
 #include "p50_local_transport.h"
 #include "protocol50.h"
 
+#include <cstdint>
+
 namespace icecc::p50 {
 
 inline FStoreGuid f_store_guid_for_incarnation(local::Identity identity) noexcept
@@ -22,22 +24,21 @@ inline FStoreGuid f_store_guid_for_incarnation(local::Identity identity) noexcep
 }
 
 // C and F are deliberately separate domains.  F remains the launch/attempt
-// namespace above; C uses an explicit domain marker before the same immutable
-// incarnation tuple.  This makes equality impossible even when both stores
-// describe the same supervised process.
+// namespace above; C is the exact reversible full-tuple law below.  A fixed
+// nonzero domain mask is XORed into only the attempt word, so the mapping is
+// bijective (no probabilistic collision claim) and C can never equal F.
+inline constexpr uint64_t kCIncarnationAttemptDomainMask = 0x4353545200000001ULL;
+
 inline CStoreGuid c_store_guid_for_incarnation(local::Identity identity) noexcept
 {
     CStoreGuid result{};
-    result.bytes[0] = 0x43; // "C"
-    result.bytes[1] = 0x53; // "S"
-    result.bytes[2] = 0x54; // "T"
-    result.bytes[3] = 0x52; // "R"
     for (size_t index = 0; index != sizeof(identity.generation); ++index)
-        result.bytes[4 + index] = static_cast<uint8_t>(
+        result.bytes[index] = static_cast<uint8_t>(
             identity.generation >> (56u - static_cast<unsigned>(index) * 8u));
-    for (size_t index = 0; index != sizeof(identity.attempt); ++index)
-        result.bytes[8 + index] = static_cast<uint8_t>(
-            identity.attempt >> (56u - static_cast<unsigned>(index) * 8u));
+    const uint64_t domain_attempt = identity.attempt ^ kCIncarnationAttemptDomainMask;
+    for (size_t index = 0; index != sizeof(domain_attempt); ++index)
+        result.bytes[sizeof(identity.generation) + index] = static_cast<uint8_t>(
+            domain_attempt >> (56u - static_cast<unsigned>(index) * 8u));
     return result;
 }
 

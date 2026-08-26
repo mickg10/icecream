@@ -8,6 +8,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <memory>
+#include <utility>
 
 #include "protocol50.h"
 
@@ -29,10 +31,18 @@ struct RoleCounters {
     uint64_t rejected_limit = 0;
 };
 
+// The accounting state outlives an owner when an adopted descriptor is
+// intentionally transferred or retained.  A raw pointer into the owner would
+// become dangling as soon as that owner was destroyed.
+struct RoleLiveState {
+    size_t live = 0;
+};
+
 struct RoleOwnedFd {
     RoleOwnedFd() noexcept = default;
-    RoleOwnedFd(RoleDiscriminator role, int fd, size_t* live_counter = nullptr) noexcept
-        : role(role), fd(fd), live_counter(live_counter) {}
+    RoleOwnedFd(RoleDiscriminator role, int fd,
+                std::shared_ptr<RoleLiveState> live_counter = {}) noexcept
+        : role(role), fd(fd), live_counter(std::move(live_counter)) {}
     ~RoleOwnedFd();
     RoleOwnedFd(RoleOwnedFd&& other) noexcept;
     RoleOwnedFd& operator=(RoleOwnedFd&& other) noexcept;
@@ -46,7 +56,7 @@ struct RoleOwnedFd {
 
     RoleDiscriminator role = RoleDiscriminator::Client;
     int fd = -1;
-    size_t* live_counter = nullptr;
+    std::shared_ptr<RoleLiveState> live_counter;
 };
 
 // Both role owners intentionally carry their own state.  A limit/counter in
@@ -54,7 +64,7 @@ struct RoleOwnedFd {
 class ClientRoleOwner {
 public:
     ClientRoleOwner(CStoreGuid c_store_guid, FStoreGuid f_store_guid,
-                    RoleLimits limits = {}) noexcept;
+                    RoleLimits limits = {});
     ~ClientRoleOwner();
     ClientRoleOwner(const ClientRoleOwner&) = delete;
     ClientRoleOwner& operator=(const ClientRoleOwner&) = delete;
@@ -65,23 +75,25 @@ public:
     std::optional<RoleOwnedFd> adopt(RoleDiscriminator role, CStoreGuid c_store_guid,
                                       FStoreGuid f_store_guid, int fd) noexcept;
     [[nodiscard]] const RoleCounters& counters() const noexcept { return counters_; }
-    [[nodiscard]] size_t live_fd_count() const noexcept { return live_fds_; }
+    [[nodiscard]] size_t live_fd_count() const noexcept { return live_state_->live; }
     [[nodiscard]] CStoreGuid c_store_guid() const noexcept { return c_store_guid_; }
     [[nodiscard]] FStoreGuid f_store_guid() const noexcept { return f_store_guid_; }
-    [[nodiscard]] size_t* live_counter_ptr() noexcept { return &live_fds_; }
+    [[nodiscard]] std::shared_ptr<RoleLiveState> live_counter_state() const noexcept {
+        return live_state_;
+    }
 
 private:
     CStoreGuid c_store_guid_{};
     FStoreGuid f_store_guid_{};
     RoleLimits limits_{};
     RoleCounters counters_{};
-    size_t live_fds_ = 0;
+    std::shared_ptr<RoleLiveState> live_state_ = std::make_shared<RoleLiveState>();
 };
 
 class ServerRoleOwner {
 public:
     ServerRoleOwner(CStoreGuid c_store_guid, FStoreGuid f_store_guid,
-                    RoleLimits limits = {}) noexcept;
+                    RoleLimits limits = {});
     ~ServerRoleOwner();
     ServerRoleOwner(const ServerRoleOwner&) = delete;
     ServerRoleOwner& operator=(const ServerRoleOwner&) = delete;
@@ -92,17 +104,19 @@ public:
     std::optional<RoleOwnedFd> adopt(RoleDiscriminator role, CStoreGuid c_store_guid,
                                       FStoreGuid f_store_guid, int fd) noexcept;
     [[nodiscard]] const RoleCounters& counters() const noexcept { return counters_; }
-    [[nodiscard]] size_t live_fd_count() const noexcept { return live_fds_; }
+    [[nodiscard]] size_t live_fd_count() const noexcept { return live_state_->live; }
     [[nodiscard]] CStoreGuid c_store_guid() const noexcept { return c_store_guid_; }
     [[nodiscard]] FStoreGuid f_store_guid() const noexcept { return f_store_guid_; }
-    [[nodiscard]] size_t* live_counter_ptr() noexcept { return &live_fds_; }
+    [[nodiscard]] std::shared_ptr<RoleLiveState> live_counter_state() const noexcept {
+        return live_state_;
+    }
 
 private:
     CStoreGuid c_store_guid_{};
     FStoreGuid f_store_guid_{};
     RoleLimits limits_{};
     RoleCounters counters_{};
-    size_t live_fds_ = 0;
+    std::shared_ptr<RoleLiveState> live_state_ = std::make_shared<RoleLiveState>();
 };
 
 } // namespace icecc::p50::role

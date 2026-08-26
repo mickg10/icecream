@@ -19,7 +19,8 @@ done
 for pattern in \
     'enum class RoleDiscriminator' 'class ClientRoleOwner' \
     'class ServerRoleOwner' 'rejected_wrong_role' 'rejected_namespace' \
-    'role != expected' 'RoleOwnedFd'; do
+    'role != expected' 'RoleOwnedFd' 'shared_ptr<RoleLiveState>' \
+    'live_counter.reset()'; do
     grep -F "$pattern" "$roles" "$header" >/dev/null
 done
 

@@ -56,14 +56,18 @@ runtime and request handling.
 The supervisor creates the private `0700` lease directory and binds the unique
 AF_UNIX listener before `fork()`. It passes the descriptor as
 `ICECC_CACHE_SERVICE_LISTENER_FD`; the child clears `CLOEXEC` on that one
-descriptor, drops privileges, and adopts it with `fstat(2)`. Structured mode
-never calls `bind(2)` or unlinks the pathname. The parent performs
-identity-checked deletion after the supervised process group is proven dead.
+descriptor, proves with `getsockname(2)` and `SO_ACCEPTCONN` that the inherited
+listener is bound to the expected pathname, drops privileges, and repeats the
+descriptor proof. Structured mode never calls `bind(2)` or unlinks the
+pathname. The parent performs identity-checked deletion after the supervised
+process group is proven dead.
 
 ## Readiness, signal shutdown, and control
 
-`ICECC_CACHE_SERVICE_READY_FD` is mandatory and names an already-open decimal
-descriptor. After privilege checks and listener identity capture complete, the
+`ICECC_CACHE_SERVICE_READY_FD` is mandatory and names an already-open pipe
+descriptor distinct from the inherited listener. Structured launches require
+the listener-FD field as part of the all-or-none tuple; an orphaned or aliased
+listener field is rejected. After privilege checks and listener identity capture complete, the
 service writes legacy `READY\n` only for the standalone form. A structured
 supervisor launch writes the exact READY-v2 generation, attempt, PID,
 domain-separated nonzero C/F store GUIDs, path, digest, and listener
@@ -117,4 +121,6 @@ this service in `DaemonSidecarAdapter`; this process owns only authenticated
 control, descriptor adoption, CacheWire reduction, and compiler-input lookup.
 
 Shutdown compares the open listener's `fstat` device/inode with the pathname's
-`lstat` device/inode before unlinking. A replacement node is never removed.
+`lstat` device/inode before unlinking. For READY, the pathname `lstat` tuple is
+published: on Linux it is intentionally not equated with the inherited
+socket-FD `fstat` tuple. A replacement node is never removed.

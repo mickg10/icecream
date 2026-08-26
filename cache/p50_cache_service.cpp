@@ -26,6 +26,7 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 #include "services/digest128.h"
@@ -268,6 +269,12 @@ bool parse_ready_fd(OwnedFd& ready) noexcept {
         return false;
     if (::fcntl(fd, F_GETFD) < 0)
         return false;
+    struct stat info{};
+    // READY is a one-way publication pipe, never an inherited listener or a
+    // connected control socket.  This also makes accidental fd aliasing fail
+    // closed before any structured launch state is accepted.
+    if (::fstat(fd, &info) != 0 || !S_ISFIFO(info.st_mode))
+        return false;
     ready.fd = fd;
     return true;
 }
@@ -278,6 +285,10 @@ bool parse_listener_fd(OwnedFd& listener) noexcept {
         return false;
     int fd = -1;
     if (!parse_int(raw, fd) || fd < 3 || ::fcntl(fd, F_GETFD) < 0)
+        return false;
+    const char* ready_raw = ::getenv(kReadyEnvironment.data());
+    int ready_fd = -1;
+    if (ready_raw != nullptr && parse_int(ready_raw, ready_fd) && ready_fd == fd)
         return false;
     struct stat info{};
     if (::fstat(fd, &info) != 0 || !S_ISSOCK(info.st_mode))
@@ -299,7 +310,7 @@ struct StructuredLaunch {
 
 bool read_structured_launch(StructuredLaunch& launch) noexcept {
     try {
-        constexpr std::array<std::string_view, 7> names{
+        constexpr std::array<std::string_view, 8> names{
             kReadyFormatEnvironment,
             kExpectedGenerationEnvironment,
             kExpectedAttemptEnvironment,
@@ -307,6 +318,7 @@ bool read_structured_launch(StructuredLaunch& launch) noexcept {
             kExpectedCStoreGuidEnvironment,
             kExpectedSocketEnvironment,
             kExpectedSocketDigestEnvironment,
+            kListenerEnvironment,
         };
         std::array<const char*, names.size()> values{};
         size_t present = 0;
@@ -331,6 +343,7 @@ bool read_structured_launch(StructuredLaunch& launch) noexcept {
         const std::string_view expected_c_guid(values[4]);
         const std::string_view expected_socket(values[5]);
         const std::string_view expected_digest(values[6]);
+        const std::string_view listener_fd_text(values[7]);
         uint64_t generation = 0;
         uint64_t attempt = 0;
         if (format != "2" || !parse_uint(generation_text, generation) ||
@@ -339,7 +352,16 @@ bool read_structured_launch(StructuredLaunch& launch) noexcept {
             attempt == std::numeric_limits<uint64_t>::max() ||
             expected_socket.empty() || expected_socket.front() != '/' ||
             expected_socket.size() > local::kMaxUnixPath ||
-            expected_socket.find_first_of(" \t\r\n") != std::string_view::npos)
+            expected_socket.find_first_of(" \t\r\n") != std::string_view::npos ||
+            listener_fd_text.empty())
+            return false;
+        int listener_fd = -1;
+        if (!parse_int(listener_fd_text, listener_fd) || listener_fd < 3)
+            return false;
+        const char* ready_fd_text = ::getenv(kReadyEnvironment.data());
+        int ready_fd = -1;
+        if (ready_fd_text == nullptr || !parse_int(ready_fd_text, ready_fd) ||
+            ready_fd < 3 || ready_fd == listener_fd)
             return false;
         const local::Identity identity{generation, attempt};
         const CStoreGuid c_guid = c_store_guid_for_incarnation(identity);
@@ -568,11 +590,43 @@ bool capture_prebound_listener_identity(int fd, const std::string& path,
         info.st_ino == 0 || ::lstat(path.c_str(), &pathname) != 0 ||
         !S_ISSOCK(pathname.st_mode) || pathname.st_dev == 0 || pathname.st_ino == 0)
         return false;
+    // Linux AF_UNIX socket fstat() identity is not the pathname dentry's
+    // lstat() identity.  Prove the association through the kernel's bound
+    // address before dropping privileges, then retain both identities for
+    // strict READY and replacement-safe cleanup checks.
+    sockaddr_un bound{};
+    socklen_t bound_length = sizeof(bound);
+    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &bound_length) != 0 ||
+        bound.sun_family != AF_UNIX || path.size() >= sizeof(bound.sun_path))
+        return false;
+    const size_t bound_path_length = ::strnlen(bound.sun_path, sizeof(bound.sun_path));
+    if (bound_path_length != path.size() ||
+        std::memcmp(bound.sun_path, path.data(), path.size()) != 0)
+        return false;
     identity.listener_device = info.st_dev;
     identity.listener_inode = info.st_ino;
     identity.pathname_device = pathname.st_dev;
     identity.pathname_inode = pathname.st_ino;
     return true;
+}
+
+bool prove_prebound_listener_after_drop(int fd, const std::string& path) noexcept {
+    struct stat info{};
+    if (::fstat(fd, &info) != 0 || !S_ISSOCK(info.st_mode))
+        return false;
+    sockaddr_un bound{};
+    socklen_t bound_length = sizeof(bound);
+    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &bound_length) != 0 ||
+        bound.sun_family != AF_UNIX || path.size() >= sizeof(bound.sun_path))
+        return false;
+    const size_t bound_path_length = ::strnlen(bound.sun_path, sizeof(bound.sun_path));
+    if (bound_path_length != path.size() ||
+        std::memcmp(bound.sun_path, path.data(), path.size()) != 0)
+        return false;
+    int accepting = 0;
+    socklen_t accepting_length = sizeof(accepting);
+    return ::getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &accepting, &accepting_length) == 0 &&
+           accepting != 0;
 }
 
 void cleanup_listener(int fd, const std::string& path, const ListenerIdentity& identity,
@@ -731,13 +785,8 @@ RuntimeConfig validate_runtime_config(RuntimeConfig config) {
         config.max_input_lifecycle_replays == 0)
         throw std::invalid_argument(
             "sidecar runtime input lifecycle limits must be nonzero");
-    // Keep direct library callers source-compatible with the earlier
-    // prototype. Supervised structured launches always provide both GUIDs.
-    if (config.c_store_guid == CStoreGuid{}) {
-        config.c_store_guid = CStoreGuid::from_u64(0x4353545200000001ULL);
-        if (config.c_store_guid == config.f_store_guid)
-            config.c_store_guid.bytes[15] ^= 0x01;
-    }
+    if (config.c_store_guid == CStoreGuid{})
+        throw std::invalid_argument("sidecar runtime requires a nonzero C_STORE_GUID");
     if (config.c_store_guid == config.f_store_guid)
         throw std::invalid_argument("sidecar runtime requires distinct C/F store GUIDs");
     return config;
@@ -1285,6 +1334,9 @@ int run(const Options& options) noexcept {
             return 2;
     }
     if (!drop_and_prove(effective_options))
+        return 2;
+    if (prebound && !prove_prebound_listener_after_drop(listener_owner.fd,
+                                                        effective_options.socket_path))
         return 2;
     if (!prebound) {
         const int listener = local::listen_unix(effective_options.socket_path,

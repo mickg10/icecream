@@ -109,6 +109,7 @@ struct EndpointFixture {
         // gate must retain the exact PID credential binding as a visible field.
         endpoint.expected_peer.pid = static_cast<uint64_t>(::getpid());
         endpoint.lease_identity = identity;
+        endpoint.c_store_guid = icecc::p50::c_store_guid_for_incarnation(identity);
         endpoint.f_store_guid = icecc::p50::f_store_guid_for_incarnation(identity);
         endpoint.socket_path_digest = icecc::digest128(path);
         endpoint.listener_device = info.st_dev;
@@ -501,6 +502,10 @@ int main() {
         bad_guid.f_store_guid.bytes[0] ^= 1;
         CHECK(!CacheSessionDispatcher(fixture.identity, bad_guid).available(),
               "wrong endpoint F_STORE_GUID is rejected");
+        OnDemandEndpoint zero_c_guid = original;
+        zero_c_guid.c_store_guid = icecc::p50::CStoreGuid{};
+        CHECK(!CacheSessionDispatcher(fixture.identity, zero_c_guid).available(),
+              "zero endpoint C_STORE_GUID is rejected");
         OnDemandEndpoint bad_device = original;
         ++bad_device.listener_device;
         CHECK(!CacheSessionDispatcher(fixture.identity, bad_device).available(),

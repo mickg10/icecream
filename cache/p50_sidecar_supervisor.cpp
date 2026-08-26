@@ -695,7 +695,8 @@ bool Supervisor::prepare_lease() noexcept {
         struct stat directory_info{};
         if (::lstat(directory, &directory_info) != 0 || !S_ISDIR(directory_info.st_mode) ||
             directory_info.st_uid != ::geteuid() || (directory_info.st_mode & 07777) != 0700) {
-            (void)::rmdir(directory);
+            // No trusted directory identity exists on this path.  Leave it
+            // for external recovery rather than raw pathname deletion.
             return false;
         }
         ReadyLease lease;
@@ -705,31 +706,46 @@ bool Supervisor::prepare_lease() noexcept {
         lease.private_directory = directory;
         lease.socket_path = lease.private_directory + "/cache.sock";
         if (lease.socket_path.size() > local::kMaxUnixPath) {
-            (void)::rmdir(directory);
             return false;
         }
         lease.socket_path_digest = digest128(lease.socket_path);
         lease.directory_device = directory_info.st_dev;
         lease.directory_inode = directory_info.st_ino;
+        const auto cleanup_failed_setup = [&]() noexcept {
+            close_if_open(pending_listener_fd_);
+            // cleanup_lease_paths opens and verifies the held parent/directory
+            // identities and only removes a socket whose recorded pathname
+            // tuple is still exact.  Unknown socket identity deliberately
+            // leaves the fresh directory behind rather than unlinking by
+            // name.
+            (void)cleanup_lease_paths(lease);
+        };
         local::Status listener_status = local::Status::Ok;
         pending_listener_fd_ = local::listen_unix(lease.socket_path, 1, &listener_status);
         if (pending_listener_fd_ < 0 || listener_status != local::Status::Ok) {
-            close_if_open(pending_listener_fd_);
-            (void)::unlink(lease.socket_path.c_str());
-            (void)::rmdir(directory);
+            cleanup_failed_setup();
             return false;
         }
-        struct stat listener_info{};
-        if (::fstat(pending_listener_fd_, &listener_info) != 0 ||
-            !S_ISSOCK(listener_info.st_mode) || listener_info.st_dev == 0 ||
-            listener_info.st_ino == 0) {
-            close_if_open(pending_listener_fd_);
-            (void)::unlink(lease.socket_path.c_str());
-            (void)::rmdir(directory);
+        struct stat listener_fd_info{};
+        if (::fstat(pending_listener_fd_, &listener_fd_info) != 0 ||
+            !S_ISSOCK(listener_fd_info.st_mode) || listener_fd_info.st_dev == 0 ||
+            listener_fd_info.st_ino == 0) {
+            cleanup_failed_setup();
             return false;
         }
-        lease.listener_device = listener_info.st_dev;
-        lease.listener_inode = listener_info.st_ino;
+        // The service publishes lstat(path), not fstat(inherited-fd): Linux
+        // intentionally gives those two AF_UNIX identities different inode
+        // tuples.  Validate the open descriptor above, then lease the exact
+        // pathname dentry and its parent directory captured after bind.
+        struct stat pathname_info{};
+        if (::lstat(lease.socket_path.c_str(), &pathname_info) != 0 ||
+            !S_ISSOCK(pathname_info.st_mode) || pathname_info.st_dev == 0 ||
+            pathname_info.st_ino == 0) {
+            cleanup_failed_setup();
+            return false;
+        }
+        lease.listener_device = pathname_info.st_dev;
+        lease.listener_inode = pathname_info.st_ino;
         pending_lease_ = std::move(lease);
         return true;
     } catch (...) {
