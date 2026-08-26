@@ -18,6 +18,7 @@ TESTS += p50inputlifecycle
 TESTS += p50compilebinding
 TESTS += p50compilee2e-source.sh p50compilee2e-run.sh p50resultdisposition
 TESTS += p50_completion_record
+TESTS += p50daemontaskcount p50daemontaskcount-source.sh
 TESTS += p50completionflow-source.py
 TESTS += p50completionrecord-sanitize.sh
 TESTS += p50completionflow-run.sh
@@ -97,6 +98,7 @@ check_PROGRAMS += p50inputfd
 check_PROGRAMS += p50inputlifecycle
 check_PROGRAMS += p50resultdisposition
 check_PROGRAMS += p50_completion_record
+check_PROGRAMS += p50daemontaskcount
 check_PROGRAMS += p50connectionprovenance
 check_PROGRAMS += p50profile
 testargs_SOURCES = args.cpp
@@ -228,6 +230,11 @@ p50_completion_record_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)/daemon
 p50_completion_record_CXXFLAGS = -pthread
 p50_completion_record_LDFLAGS = -pthread
 p50_completion_record_LDADD = ../services/libicecc.la
+
+p50daemontaskcount_SOURCES = p50_daemon_task_count_test.cpp ../daemon/p50_task_count.cpp
+p50daemontaskcount_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)
+p50daemontaskcount_CXXFLAGS = -pthread
+p50daemontaskcount_LDFLAGS = -pthread
 p50assignment_CXXFLAGS = -pthread
 p50assignment_LDFLAGS = -pthread
 p50assignment_LDADD = ../services/libicecc.la
@@ -327,6 +334,7 @@ EXTRA_DIST += p50completionflow-source.py
 EXTRA_DIST += p50completionrecord-sanitize.sh
 EXTRA_DIST += p50completionflow-run.sh
 EXTRA_DIST += p50tworole-source.sh
+EXTRA_DIST += p50daemontaskcount-source.sh
 
 # Make the tests also print the test log if they fail.
 check: export VERBOSE=1

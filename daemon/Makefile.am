@@ -4,6 +4,7 @@ iceccd_SOURCES = \
 	main.cpp \
 	connection_provenance.cpp \
 	serve.cpp \
+	p50_task_count.cpp \
 	p50_completion_record.cpp \
 	compiler_input.cpp \
 	workit.cpp \
@@ -42,6 +43,7 @@ AM_LIBTOOLFLAGS = --silent
 
 noinst_HEADERS = \
 	compiler_input.h \
+	p50_task_count.h \
 	p50_completion_record.h \
 	statewriter.h \
 	environment.h \

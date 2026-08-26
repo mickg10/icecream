@@ -56,6 +56,7 @@
 #include "util.h"
 #include "file_util.h"
 #include "p50_completion_record.h"
+#include "p50_task_count.h"
 
 #include <sys/time.h>
 
@@ -221,8 +222,36 @@ int handle_connection(const string &basedir, CompileJob *job,
     }
 
     flush_debug();
+    const auto task_count = iceccd_task_count();
+    trace() << "compile fork task audit job " << job->jobID() << " tasks "
+            << (task_count.has_value() ? static_cast<uint64_t>(*task_count) : 0)
+            << endl;
+#ifdef __linux__
+    // The compile child is long-lived C++ code, not an immediate exec shim.
+    // Any sibling thread could vanish while holding allocator/libc/library
+    // locks.  Refuse before fork unless Linux proves this iceccd incarnation
+    // still has exactly its event-loop task.
+    if (!task_count.has_value() || *task_count != 1) {
+        log_error() << "iceccd compile fork refused: process task count is "
+                    << (task_count.has_value() ? static_cast<uint64_t>(*task_count) : 0)
+                    << endl;
+        (void)close(socket[0]);
+        (void)close(socket[1]);
+        if (owned_compiler_input_fd >= 0)
+            (void)close(owned_compiler_input_fd);
+        return -1;
+    }
+#endif
     pid_t pid = fork();
-    assert(pid >= 0);
+    if (pid < 0) {
+        // Never let a release build interpret fork failure as the child arm.
+        log_perror("iceccd compile-worker fork failed");
+        (void)close(socket[0]);
+        (void)close(socket[1]);
+        if (owned_compiler_input_fd >= 0)
+            (void)close(owned_compiler_input_fd);
+        return -1;
+    }
 
     if (pid > 0) {  // parent
         /* The compile child leads its own process group (set on both
