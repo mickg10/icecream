@@ -39,6 +39,14 @@ fi
 echo 'ok - deleting adopted delegation is rejected'
 
 grep -F 'adopt_connected_fd' "$src/cache/p50_endpoint.h" >/dev/null
+grep -F 'void cancel_active_io() noexcept;' "$src/cache/p50_endpoint.h" >/dev/null
+grep -F 'ClientCancellationDisposition::AbortedPreDurable' "$endpoint" >/dev/null
+grep -F 'ClientCancellationDisposition::ReconcileRequired' "$endpoint" >/dev/null
+grep -F 'active_remote_transmission_may_have_begun = true' "$endpoint" >/dev/null
+grep -F 'raw_cancel_client_after_hello' "$src/unittests/p50_endpoint_test.cpp" >/dev/null
+grep -F 'post-hello C cancellation silently authorized an abort' \
+    "$src/unittests/p50_endpoint_test.cpp" >/dev/null
 grep -F 'CLOEXEC' "$src/cache/P50_ENDPOINT.md" >/dev/null
+grep -F 'Operation-scoped C cancellation' "$src/cache/P50_ENDPOINT.md" >/dev/null
 grep -F '`0/0/0`' "$src/cache/P50_ENDPOINT.md" >/dev/null
-echo 'PASS: adopted endpoint source gate preserves ownership and mechanism-only scope'
+echo 'PASS: adopted endpoint and operation-scoped cancellation source gates hold'

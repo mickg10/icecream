@@ -133,6 +133,11 @@ struct EndpointIoControl {
     // unnegotiated begin. The retained prepared record is never mutated.
     // Product callers leave it unset.
     std::function<TxBegin(const TxBegin&)> outbound_begin_transform;
+    // Test-only cancellation linearization hook immediately before the first
+    // CacheWire write becomes possible.  It receives no endpoint state;
+    // product callers leave it unset.  This lets the deletion gate prove the
+    // narrow no-remote-transmission cancellation outcome deterministically.
+    std::function<void()> before_first_remote_write;
 };
 
 struct PrepareRequestKey {
@@ -217,10 +222,22 @@ enum class ClientRunStatus : uint8_t {
     TerminalError,
 };
 
+// Operation-scoped cancellation is intentionally distinct from an ordinary
+// transport disconnect.  A caller may authorize a clean pre-durable abort
+// only while the endpoint can prove that no CacheWire byte may have reached
+// the peer and no previously active transaction is being reconciled.
+enum class ClientCancellationDisposition : uint8_t {
+    None,
+    AbortedPreDurable,
+    ReconcileRequired,
+};
+
 struct ClientRunResult {
     ClientRunStatus status = ClientRunStatus::Disconnected;
     EndpointReconnectOutcome reconnect = EndpointReconnectOutcome::ExactMatch;
     bool whole_new_attempt = false;
+    ClientCancellationDisposition cancellation =
+        ClientCancellationDisposition::None;
     // These witnesses are populated only after the endpoint has accepted the
     // exact, fully validated TX_COMMIT.  They are deliberately independent of
     // ActionTrace (which is diagnostic, not an authority).
@@ -330,6 +347,12 @@ public:
     static std::optional<boost::asio::ip::tcp::socket> adopt_connected_fd(
         boost::asio::any_io_executor executor, int fd,
         boost::system::error_code& error);
+
+    // Cancel only the currently active C-role dialogue.  The caller must post
+    // this method onto the endpoint's owner executor.  It never resets route
+    // state or authorizes fallback: run() reports whether the operation was
+    // proved pre-durable or instead requires exact reconciliation.
+    void cancel_active_io() noexcept;
 
     [[nodiscard]] CStoreGuid c_store_guid() const;
     [[nodiscard]] std::optional<FStoreGuid> f_store_guid() const;

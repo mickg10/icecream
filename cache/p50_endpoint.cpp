@@ -859,6 +859,11 @@ struct P50ClientEndpoint::Impl {
     PreparedZstdTUPtr queued;
     CompletionLog* completions = nullptr;
     ActionTrace* actions = nullptr;
+    tcp::socket* active_socket = nullptr;
+    bool active_cancel_requested = false;
+    bool active_remote_transmission_may_have_begun = false;
+    ClientCancellationDisposition active_cancellation =
+        ClientCancellationDisposition::None;
 };
 
 struct P50ServerEndpoint::Impl {
@@ -1647,6 +1652,22 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
     if (adopted)
         io->socket = std::move(*adopted);
     tcp::socket& socket = io->socket;
+    struct ActiveSocketGuard {
+        Impl& owner;
+        tcp::socket* socket;
+        ~ActiveSocketGuard() {
+            if (owner.active_socket == socket) {
+                owner.active_socket = nullptr;
+                owner.active_cancel_requested = false;
+                owner.active_remote_transmission_may_have_begun = false;
+                owner.active_cancellation = ClientCancellationDisposition::None;
+            }
+        }
+    } active_socket_guard{*impl_, &socket};
+    impl_->active_socket = &socket;
+    impl_->active_cancel_requested = false;
+    impl_->active_remote_transmission_may_have_begun = false;
+    impl_->active_cancellation = ClientCancellationDisposition::None;
     if (deadline) {
         io->timer.expires_at(*deadline);
         io->timer.async_wait([io](const boost::system::error_code& error) {
@@ -1681,6 +1702,14 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
         hello.c_store_guid = impl_->c_guid;
         hello.supported_profiles = profile_bit(ProfileId::ZSTD_TU);
         hello.limits = impl_->caps.wire;
+        if (control.before_first_remote_write)
+            control.before_first_remote_write();
+        // From this point a completed, partial, or locally interrupted write
+        // may have exposed CacheWire authority to the peer.  Cancellation is
+        // consequently reconciliation work even when the write completion
+        // itself reports zero progress.
+        if (!impl_->active_cancel_requested)
+            impl_->active_remote_transmission_may_have_begun = true;
         co_await async_write_message(socket, hello, impl_->caps.wire.max_frame_payload,
                                      impl_->stamp(session, AsyncOperationKind::WriteFragment),
                                      impl_->completions, control, verify);
@@ -1865,7 +1894,19 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
         io->timer.cancel(timer_error);
         throw;
     }
-    if (!io->committed && io->expired) {
+    if (impl_->active_cancel_requested) {
+        result.cancellation = impl_->active_cancellation;
+        if (result.cancellation ==
+                ClientCancellationDisposition::AbortedPreDurable &&
+            !impl_->active) {
+            // The owner proved that neither this run nor a prior unresolved
+            // transaction could have reached F.  Drop only the queued local
+            // work; the caller's PreparedTuHandle remains independently
+            // owned and no fallback is authorized by this state change.
+            impl_->queued.reset();
+        }
+    }
+    if (!impl_->active_cancel_requested && !io->committed && io->expired) {
         // A timeout is fail-closed: the active transaction/queued work remains
         // exactly as reconciliation state for the next run.
         result = ClientRunResult{};
@@ -1884,6 +1925,17 @@ std::optional<tcp::socket> P50ClientEndpoint::adopt_connected_fd(
     // server helper consumes and closes fd on every failure path, and proves
     // CLOEXEC plus connected IPv4/IPv6 TCP before returning the socket.
     return P50ServerEndpoint::adopt_connected_fd(executor, fd, error);
+}
+
+void P50ClientEndpoint::cancel_active_io() noexcept {
+    if (impl_->active_socket == nullptr)
+        return;
+    impl_->active_cancel_requested = true;
+    impl_->active_cancellation =
+        impl_->active_remote_transmission_may_have_begun || impl_->active
+            ? ClientCancellationDisposition::ReconcileRequired
+            : ClientCancellationDisposition::AbortedPreDurable;
+    close_now(*impl_->active_socket);
 }
 
 CStoreGuid P50ClientEndpoint::c_store_guid() const {

@@ -552,6 +552,21 @@ asio::awaitable<Frame> raw_read(tcp::socket& socket, uint32_t max_payload) {
     co_return result;
 }
 
+asio::awaitable<void> raw_cancel_client_after_hello(
+    tcp::acceptor& acceptor, P50ClientEndpoint& client) {
+    const auto executor = co_await asio::this_coro::executor;
+    tcp::socket socket(executor);
+    co_await acceptor.async_accept(socket, asio::use_awaitable);
+    const Frame hello = co_await raw_read(
+        socket, EndpointCaps{}.wire.max_frame_payload);
+    require(hello.type == MessageType::SESSION_HELLO,
+            "cancellation peer did not observe the first CacheWire frame");
+    client.cancel_active_io();
+    boost::system::error_code ignored;
+    socket.close(ignored);
+    co_return;
+}
+
 template <class T> T raw_decode(const Frame& frame) {
     Message decoded = decode_payload(frame.type, frame.payload);
     T* result = std::get_if<T>(&decoded);
@@ -3408,6 +3423,68 @@ void test_disconnect_at_each_message_boundary() {
     }
 }
 
+void test_client_operation_scoped_cancellation() {
+    const std::vector<uint8_t> input = bytes("operation scoped cancellation\n");
+
+    {
+        TestClient client(Id128::from_u64(742));
+        EndpointIoControl control;
+        control.before_first_remote_write = [&client] {
+            client.endpoint.cancel_active_io();
+        };
+        asio::io_context context;
+        // A listening socket is sufficient for connect completion; the
+        // deterministic hook cancels before the first CacheWire write.
+        tcp::acceptor acceptor(context,
+                               {asio::ip::address_v4::loopback(), 0});
+        std::future<ClientRunResult> run = asio::co_spawn(
+            context,
+            client.endpoint.run(acceptor.local_endpoint(),
+                                admit(client, input), control),
+            asio::use_future);
+        context.run();
+        const ClientRunResult cancelled = run.get();
+        require(cancelled.status == ClientRunStatus::Disconnected &&
+                    cancelled.cancellation ==
+                        ClientCancellationDisposition::AbortedPreDurable &&
+                    !client.has_active_transaction() &&
+                    !client.has_reconciliation_work(),
+                "pre-wire C cancellation was not proved pre-durable");
+    }
+
+    {
+        TestClient client(Id128::from_u64(743));
+        const PreparedTuHandle prepared = admit(client, input);
+        asio::io_context context;
+        tcp::acceptor acceptor(context,
+                               {asio::ip::address_v4::loopback(), 0});
+        std::future<void> peer = asio::co_spawn(
+            context, raw_cancel_client_after_hello(acceptor, client.endpoint),
+            asio::use_future);
+        std::future<ClientRunResult> run = asio::co_spawn(
+            context,
+            client.endpoint.run(acceptor.local_endpoint(), prepared, {}),
+            asio::use_future);
+        context.run();
+        peer.get();
+        const ClientRunResult cancelled = run.get();
+        require(cancelled.status == ClientRunStatus::Disconnected &&
+                    cancelled.cancellation ==
+                        ClientCancellationDisposition::ReconcileRequired &&
+                    client.has_reconciliation_work(),
+                "post-hello C cancellation silently authorized an abort");
+
+        P50ServerEndpoint server(Id128::from_u64(744));
+        const PairResult reconciled = run_pair(client, server);
+        require(reconciled.client.status == ClientRunStatus::Committed &&
+                    reconciled.client.cancellation ==
+                        ClientCancellationDisposition::None &&
+                    !client.has_reconciliation_work() &&
+                    copy_input(server, client.c_store_guid()) == input,
+                "post-hello C cancellation did not preserve exact retry work");
+    }
+}
+
 void test_component_and_allocation_caps() {
     EndpointCaps ordinary;
     {
@@ -4107,6 +4184,7 @@ int main(int argc, char** argv) {
     test_interrupted_begin_identity();
     test_terminal_body_failure_identity();
     test_disconnect_at_each_message_boundary();
+    test_client_operation_scoped_cancellation();
     test_component_and_allocation_caps();
     test_client_deadline_and_direct_socket_ownership();
     test_adopted_endpoint_exact_zstd_and_ownership();
