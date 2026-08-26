@@ -10,6 +10,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <signal.h>
 #include <span>
@@ -109,51 +110,74 @@ const char* environment(const char* name) {
     return value != nullptr && *value != '\0' ? value : nullptr;
 }
 
-int structured_listener(const char* path) {
-    sockaddr_un address{};
-    address.sun_family = AF_UNIX;
-    const size_t length = std::strlen(path);
-    if (length == 0 || length >= sizeof(address.sun_path))
+int inherited_fd(const char* name) {
+    const char* raw = environment(name);
+    if (raw == nullptr)
         return -1;
-    std::memcpy(address.sun_path, path, length + 1);
-    const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (fd < 0)
+    errno = 0;
+    char* end = nullptr;
+    const long value = std::strtol(raw, &end, 10);
+    if (errno != 0 || end == raw || *end != '\0' || value < 3 ||
+        value > std::numeric_limits<int>::max())
         return -1;
-    const socklen_t address_length = static_cast<socklen_t>(
-        offsetof(sockaddr_un, sun_path) + length + 1);
-    if (::bind(fd, reinterpret_cast<const sockaddr*>(&address), address_length) != 0 ||
-        ::chmod(path, 0600) != 0 || ::listen(fd, 4) != 0) {
-        (void)::close(fd);
-        return -1;
+    return static_cast<int>(value);
+}
+
+bool valid_nonzero_guid_hex(std::string_view value) {
+    bool nonzero = false;
+    if (value.size() != 32)
+        return false;
+    for (const char character : value) {
+        if ((character < '0' || character > '9') &&
+            (character < 'a' || character > 'f'))
+            return false;
+        nonzero = nonzero || character != '0';
     }
-    return fd;
+    return nonzero;
 }
 
 int structured_fake_child(int fd) {
+    const char* format = environment("ICECC_CACHE_SERVICE_READY_FORMAT");
     const char* generation = environment("ICECC_CACHE_SERVICE_EXPECTED_GENERATION");
     const char* attempt = environment("ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT");
-    const char* guid = environment("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID");
+    const char* c_guid = environment("ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID");
+    const char* f_guid = environment("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID");
     const char* path = environment("ICECC_CACHE_SERVICE_EXPECTED_SOCKET");
     const char* digest = environment("ICECC_CACHE_SERVICE_EXPECTED_SOCKET_DIGEST");
-    if (generation == nullptr || attempt == nullptr || guid == nullptr || path == nullptr ||
-        digest == nullptr)
+    if (format == nullptr || std::string_view(format) != "2" || generation == nullptr ||
+        attempt == nullptr || c_guid == nullptr || f_guid == nullptr || path == nullptr ||
+        digest == nullptr || !valid_nonzero_guid_hex(c_guid) ||
+        !valid_nonzero_guid_hex(f_guid) || std::string_view(c_guid) == f_guid)
         return 90;
-    const int listener = structured_listener(path);
-    if (listener < 0)
+    const int listener = inherited_fd(kListenerFdEnvironment.data());
+    if (listener < 0 || listener == fd)
         return 91;
     struct stat pathname{};
-    if (::lstat(path, &pathname) != 0) {
-        (void)::close(listener);
+    struct stat descriptor{};
+    sockaddr_un bound{};
+    socklen_t bound_length = sizeof(bound);
+    int accepting = 0;
+    socklen_t accepting_length = sizeof(accepting);
+    if (::lstat(path, &pathname) != 0 || !S_ISSOCK(pathname.st_mode) ||
+        (pathname.st_mode & 07777) != 0600 || pathname.st_dev == 0 || pathname.st_ino == 0 ||
+        ::fcntl(listener, F_GETFD) < 0 || ::fstat(listener, &descriptor) != 0 ||
+        !S_ISSOCK(descriptor.st_mode) ||
+        ::getsockname(listener, reinterpret_cast<sockaddr*>(&bound), &bound_length) != 0 ||
+        bound.sun_family != AF_UNIX ||
+        std::string_view(bound.sun_path, ::strnlen(bound.sun_path, sizeof(bound.sun_path))) !=
+            path ||
+        ::getsockopt(listener, SOL_SOCKET, SO_ACCEPTCONN, &accepting, &accepting_length) != 0 ||
+        accepting_length != sizeof(accepting) || accepting != 1) {
         return 92;
     }
     const std::string ready =
         "READY v2 generation=" + std::string(generation) + " attempt=" + attempt +
         " pid=" + std::to_string(static_cast<long long>(::getpid())) +
-        " F_STORE_GUID=" + guid + " PATH=" + path + " DIGEST=" + digest +
+        " C_STORE_GUID=" + c_guid + " F_STORE_GUID=" + f_guid +
+        " PATH=" + path + " DIGEST=" + digest +
         " DEV=" + std::to_string(static_cast<unsigned long long>(pathname.st_dev)) +
         " INO=" + std::to_string(static_cast<unsigned long long>(pathname.st_ino)) + "\n";
     if (!write_all(fd, ready)) {
-        (void)::close(listener);
         return 93;
     }
     (void)::close(fd);

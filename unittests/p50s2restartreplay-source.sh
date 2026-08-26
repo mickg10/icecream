@@ -16,6 +16,17 @@ gate() {
         'void case_lease_withdrawal_rotation()' \
         'void case_phase_replay()' \
         'void case_adoption_lost_ack_and_reverse_replay()' \
+        'int inherited_fd(const char* name)' \
+        'bool valid_nonzero_guid_hex(std::string_view value)' \
+        'valid_nonzero_guid_hex(c_guid)' \
+        'valid_nonzero_guid_hex(f_guid)' \
+        'kListenerFdEnvironment.data()' \
+        'ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID' \
+        '::getsockname(listener' \
+        'SO_ACCEPTCONN' \
+        '::fcntl(listener, F_GETFD)' \
+        'std::string_view(c_guid) == f_guid' \
+        '" C_STORE_GUID="' \
         'pre_ready_deaths' \
         'post_ready_deaths' \
         'lease_withdrawals' \
@@ -38,6 +49,10 @@ gate() {
 
 test -f "$test_file" && test -f "$doc"
 gate "$test_file"
+if grep -F 'int structured_listener(' "$test_file" >/dev/null; then
+    echo 'FAIL: restart/replay child must inherit, not bind, the supervisor listener' >&2
+    exit 1
+fi
 grep -F 'p50s2restartreplay' "$src/unittests/Makefile.am" >/dev/null
 grep -F 'p50_s2_restart_replay_sanitize.sh' "$src/unittests/Makefile.am" >/dev/null
 grep -F 'P50_S2_RESTART_REPLAY.md' "$src/cache/Makefile.am" >/dev/null
@@ -53,6 +68,13 @@ for pattern in \
     'void case_lease_withdrawal_rotation()' \
     'void case_phase_replay()' \
     'void case_adoption_lost_ack_and_reverse_replay()' \
+    'kListenerFdEnvironment.data()' \
+    'valid_nonzero_guid_hex(c_guid)' \
+    'ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID' \
+    '::getsockname(listener' \
+    'SO_ACCEPTCONN' \
+    '::fcntl(listener, F_GETFD)' \
+    'std::string_view(c_guid) == f_guid' \
     'CHECK(ledger.transition_count() == 1' \
     'ledger.fork_count() == 1'; do
     mutant="$mutant_dir/${pattern##*/}.cpp"

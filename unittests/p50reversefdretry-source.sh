@@ -39,8 +39,10 @@ at_least 1 'fork_count_' cache/p50_reverse_fd_retry.h 'single fork witness'
 count 1 'void ReverseFdOwner::cancel' cache/p50_reverse_fd_retry.cpp 'owner cancellation closure'
 count 1 'void ReverseFdReceiverLedger::cancel' cache/p50_reverse_fd_retry.cpp 'receiver cancellation closure'
 count 1 'P50_REVERSE_FD_RETRY.md' cache/Makefile.am 'documentation distributed'
-count 1 'p50reversefdretry-mutants.sh' unittests/Makefile.am 'mutant gate registered'
-count 1 'p50_reverse_fd_retry_sanitize.sh' unittests/Makefile.am 'sanitizer gate registered'
+for registration in p50reversefdretry-mutants.sh p50_reverse_fd_retry_sanitize.sh; do
+    count 2 "$registration" unittests/Makefile.am \
+        "$registration appears once in TESTS and once in EXTRA_DIST"
+done
 
 if grep -E -n 'p50_reverse_fd_retry|ReverseFdOwner|ReverseFdReceiverLedger' \
         "$src/daemon" "$src/client" "$src/services" >/dev/null 2>&1; then
