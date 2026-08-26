@@ -113,6 +113,7 @@
 #include "p50_completion_record.h"
 #include "p50_daemon_cache_dispatch.h"
 #include "p50_input_wait.h"
+#include "connection_provenance.h"
 
 static std::string pidFilePath;
 static volatile sig_atomic_t exit_main_loop = 0;
@@ -144,6 +145,17 @@ static uint64_t fresh_cache_sidecar_generation() noexcept
     value *= UINT64_C(0x94d049bb133111eb);
     value ^= value >> 31;
     return value == 0 ? 1 : value;
+}
+
+static uint64_t next_daemon_generation()
+{
+    // This counter is process-local and intentionally never belongs to the
+    // scheduler reconnect/clear_children lifecycle.  A daemon instance gets
+    // one immutable nonzero namespace for all accepted wrappers.
+    static uint64_t generation = 0;
+    if (generation == std::numeric_limits<uint64_t>::max())
+        return generation; // retain nonzero state; allocation then fails closed
+    return ++generation;
 }
 
 struct FdSnapshot {
@@ -702,6 +714,9 @@ public:
     // write-before-close race from blocking the daemon event loop.
     std::optional<icecc::p50::P50CompletionRecordReader>
         p50_completion_reader;
+    // Immutable accept-time wrapper provenance.  Async work carries only the
+    // value lease; the daemon registry is the sole pointer re-entry point.
+    ConnectionProvenance connection_provenance;
     CacheHandoff cacheHandoff;   // S2: see the struct's own comment above
     int client_id;
     uint32_t niceness; // nice priority (0-20), for PENDING_USE_CS
@@ -1123,6 +1138,10 @@ static const uint64_t web_lifetime_deadline_msec = 300 * 1000;
 
 struct Daemon {
     Clients clients;
+    // The provenance namespace is daemon-lifetime state.  Neither scheduler
+    // reconnect nor clear_children may reset it or recycle a sequence.
+    uint64_t daemon_generation;
+    ConnectionLeaseRegistry connection_leases;
     // Installed environments received from other nodes. The key is
     // (job->targetPlatform() + "/" job->environmentVersion()).
     map<string, ReceivedEnvironment> received_environments;
@@ -1207,7 +1226,9 @@ struct Daemon {
     deque<JobHistoryEntry> job_history;
     deque<InsightsMinuteEntry> insights_history;
 
-    Daemon() {
+    Daemon()
+        : daemon_generation(next_daemon_generation())
+        , connection_leases(daemon_generation) {
         warn_icecc_user_errno = 0;
         if (getuid() == 0) {
             struct passwd *pw = getpwnam("icecc");
@@ -5975,7 +5996,12 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
        out of scope for this change): this only stores the endpoint
        alongside the job for a later milestone to consume. */
     c->cacheHandoff = Client::CacheHandoff{};
-    if (usecs_cache_handoff_admissible(*msg)) {
+    // Only an accepted AF_UNIX wrapper with complete accept-time peer
+    // credentials may retain a cache handoff.  TCP and failed-credential
+    // wrappers still use the ordinary legacy compile path, but their client
+    // projection is canonically cache-absent.
+    const bool wrapper_cache_eligible = c->connection_provenance.cache_eligible();
+    if (wrapper_cache_eligible && usecs_cache_handoff_admissible(*msg)) {
         c->cacheHandoff = Client::CacheHandoff{
             true, msg->job_id, msg->assignmentEpoch(), msg->assignmentNonce(),
             msg->hostname, msg->port,
@@ -6007,9 +6033,14 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
        would leave every existing anchor and the local-branch test green
        while silently breaking every remote dispatch; see
        unittests/cachehandoffdaemon.cpp's remote-selected-F scenario. */
-    const uint32_t relay_cache_port = c->cacheHandoff.valid ? c->cacheHandoff.cachePort : 0;
-    const uint32_t relay_cache_protocol = c->cacheHandoff.valid ? c->cacheHandoff.cacheProtocol : 0;
-    const uint32_t relay_cache_mask = c->cacheHandoff.valid ? c->cacheHandoff.cacheProfileMask : 0;
+    const CacheHandoffProjection relay_cache = project_cache_handoff(
+        c->connection_provenance,
+        c->cacheHandoff.valid ? c->cacheHandoff.cachePort : 0,
+        c->cacheHandoff.valid ? c->cacheHandoff.cacheProtocol : 0,
+        c->cacheHandoff.valid ? c->cacheHandoff.cacheProfileMask : 0);
+    const uint32_t relay_cache_port = relay_cache.port;
+    const uint32_t relay_cache_protocol = relay_cache.protocol;
+    const uint32_t relay_cache_mask = relay_cache.profile_mask;
 
     if (msg->hostname == remote_name && int(msg->port) == daemon_port) {
         /* S2 (BigOracle, 5th independent gap -- a REAL pre-existing product
@@ -6039,10 +6070,15 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
         install_pending_usecs(c, relay.release());
         c->set_status(Client::PENDING_USE_CS, "scheduler_use_cs: local compile");
     } else {
-        install_pending_usecs(c, new UseCSMsg(msg->host_platform, msg->hostname, msg->port,
-                                              msg->job_id, true, 1, msg->matched_job_id,
-                                              msg->assignmentEpoch(), msg->assignmentNonce(),
-                                              relay_cache_port, relay_cache_protocol, relay_cache_mask));
+        // Preserve every non-cache UseCS field from the scheduler.  The old
+        // reconstruction hardcoded got_env/client_id and silently changed
+        // assignment semantics for remote wrappers.  Only the cache triple
+        // is projected according to the immutable wrapper provenance.
+        std::unique_ptr<UseCSMsg> relay(new UseCSMsg(*msg));
+        relay->cache_endpoint_port = relay_cache_port;
+        relay->cache_protocol = relay_cache_protocol;
+        relay->cache_profile_mask = relay_cache_mask;
+        install_pending_usecs(c, relay.release());
 
         /* EXACT identity is persisted BEFORE the framed write starts, and
            the client is moved to an explicit handoff phase.  If the write
@@ -6073,7 +6109,11 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
         /* This is the remote branch's ACTUAL client wire vehicle -- *msg,
            the scheduler's own frame, relayed directly (not c->usecsmsg,
            see the comment above this branch). */
-        if (!c->channel->send_msg(*msg)) {
+        UseCSMsg client_reply = *msg;
+        client_reply.cache_endpoint_port = relay_cache_port;
+        client_reply.cache_protocol = relay_cache_protocol;
+        client_reply.cache_profile_mask = relay_cache_mask;
+        if (!c->channel->send_msg(client_reply)) {
             ++usecs_exact_aborts;
             handle_end(c, 143);
             return 0;
@@ -7332,6 +7372,13 @@ void Daemon::handle_end(Client *client, int exitcode)
     if (client->status == Client::WAITP50INPUT) {
         client->p50_input_wait.close();
     }
+    // Remove the value lease before erasing/deleting its Client and channel.
+    // Delayed callbacks therefore cannot be rescued by fd or allocator
+    // address reuse; repeated teardown is intentionally harmless.
+    if (client->connection_provenance.lease.valid()) {
+        connection_leases.cancel(client->connection_provenance.lease);
+        client->connection_provenance = ConnectionProvenance{};
+    }
     fd2client.erase(client->channel->fd);
 
     if (client->status == Client::TOINSTALL || client->status == Client::WAITINSTALL) {
@@ -7528,6 +7575,7 @@ void Daemon::clear_children()
 
     // they should be all in clients too
     assert(fd2client.empty());
+    assert(connection_leases.size() == 0);
 
     fd2client.clear();
     new_client_id = 0;
@@ -8384,12 +8432,29 @@ void Daemon::answer_client_requests()
                     note_accept_error("client", errno);
                 }
             } else {
+                // Capture AF_UNIX credentials before any wrapper/channel
+                // setup can run.  TCP and a credential failure remain valid
+                // legacy clients; their provenance simply cannot authorize a
+                // cache handoff.
+                const ListenerKind listener_kind = classify_listener(
+                    listen_fd, unix_listen_fd, tcp_listen_local_fd, tcp_listen_fd);
+                PeerCredentials peer_credentials;
+                if (listener_kind == ListenerKind::UnixLocal)
+                    (void)capture_unix_peer_credentials(acc_fd, peer_credentials);
                 MsgChannel *c = Service::createChannel(acc_fd, &cli_addr, cli_len);
 
                 if (c) {
                     Client *client = new Client;
                     client->client_id = ++new_client_id;
                     client->channel = c;
+                    if (auto provenance = connection_leases.allocate(listener_kind,
+                                                                       peer_credentials)) {
+                        client->connection_provenance = *provenance;
+                        if (!connection_leases.bind(provenance->lease, client, c)) {
+                            connection_leases.cancel(provenance->lease);
+                            client->connection_provenance = ConnectionProvenance{};
+                        }
+                    }
                     clients[c] = client;
 
                     fd2client[c->fd] = client;

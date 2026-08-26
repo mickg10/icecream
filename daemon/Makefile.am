@@ -2,6 +2,7 @@ sbin_PROGRAMS = iceccd
 
 iceccd_SOURCES = \
 	main.cpp \
+	connection_provenance.cpp \
 	serve.cpp \
 	p50_completion_record.cpp \
 	compiler_input.cpp \
@@ -45,4 +46,5 @@ noinst_HEADERS = \
 	load.h \
 	serve.h \
 	workit.h \
-	file_util.h
+	file_util.h \
+	connection_provenance.h
