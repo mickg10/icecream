@@ -24,10 +24,8 @@ struct StoreIdentityRoot {
     std::array<uint8_t, 16> bytes{};
 
     [[nodiscard]] bool valid() const noexcept {
-        bool nonzero = false;
-        for (const uint8_t byte : bytes)
-            nonzero = nonzero || byte != 0;
-        return nonzero && (bytes[0] & kStoreIdentityRoleBit) == 0;
+        return store_identity_guid_valid_for_role(bytes,
+                                                  kStoreIdentityClientRole);
     }
 
     friend bool operator==(const StoreIdentityRoot&, const StoreIdentityRoot&) = default;
@@ -78,10 +76,15 @@ inline bool fresh_store_identity_root(StoreIdentityRoot& root) noexcept {
 
 template <typename Guid>
 inline Guid store_guid_for_root(StoreIdentityRoot root, uint8_t role_bit) noexcept {
+    if (!root.valid() || (role_bit != kStoreIdentityClientRole &&
+                          role_bit != kStoreIdentityFileRole))
+        return Guid{};
     Guid result{};
     root.bytes[0] &= static_cast<uint8_t>(~kStoreIdentityRoleBit);
     root.bytes[0] |= role_bit;
     result.bytes = root.bytes;
+    if (!store_identity_guid_valid_for_role(result.bytes, role_bit))
+        return Guid{};
     return result;
 }
 

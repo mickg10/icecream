@@ -5,8 +5,9 @@
      selected_f_host/ordinary/cache ports, cache_protocol/profile,
      logical_job/compiler_attempt, C store generation/GUID, source request
      id/mode, separate C control generation/attempt; and on ACK the exact arm
-     echo, F control generation/attempt, F StoreIdentity GUID/version, and
-     nonzero arm observation all have strict validators and stable fixtures;
+     echo, F control generation/attempt, F StoreIdentity generation/GUID/version,
+     nonzero arm observation, and bounded source budget all have strict
+     validators and stable fixtures;
    - WIRE-PLACEHOLDER / DERIVED-GUARD: the fixed F role bit and derivation
      version are the only ordinary-wire projection of the later
      CSPRNG-backed StoreIdentity derivation; raw entropy/root is deliberately
@@ -129,9 +130,10 @@ P50SourceArmedMsg armed(const P50SourceArmFields &source_arm)
     f_guid[icecc::p50::kStoreIdentityRoleByte] |=
         icecc::p50::kStoreIdentityFileRole;
     return P50SourceArmedMsg(source_arm, UINT64_C(0x8182838485868788),
-                             UINT64_C(0x9192939495969798), f_guid,
+                             UINT64_C(0x9192939495969798),
+                             UINT64_C(0x999a9b9c9d9e9fa0), f_guid,
                              icecc::p50::kStoreIdentityDerivationVersion,
-                             UINT64_C(0xa1a2a3a4a5a6a7a8));
+                             UINT64_C(0xa1a2a3a4a5a6a7a8), 2500);
 }
 
 Bytes encode_frame(const Msg &message, int protocol = PROTOCOL_VERSION)
@@ -167,6 +169,15 @@ void put_u32(Bytes &bytes, size_t offset, uint32_t value)
     std::memcpy(bytes.data() + offset, &network, sizeof(network));
 }
 
+uint32_t frame_body_size(const Bytes &bytes)
+{
+    if (bytes.size() < sizeof(uint32_t))
+        return 0;
+    uint32_t network = 0;
+    std::memcpy(&network, bytes.data(), sizeof(network));
+    return ntohl(network);
+}
+
 void test_roundtrip_and_exact_echo()
 {
     static_assert(Msg::P50_SOURCE_ARM == UINT32_C(0x50f00010));
@@ -191,15 +202,16 @@ void test_roundtrip_and_exact_echo()
     const P50SourceArmedMsg reply = armed(request.arm);
     const Bytes reply_wire = encode_frame(reply);
     REQUIRE(reply_wire == hex_fixture(
-                "000000b750f000110000000701020304050607081112131415161718"
+                "000000c350f000110000000701020304050607081112131415161718"
                 "0000000f776f726b65722e6578616d706c650000002805000028060000"
                 "003200000002000000000000001321222324252627283132333435363738"
                 "0000000000000001404142434445464748494a4b4c4d4e4f515253545556"
                 "575800000001"
                 "616263646566676871727374757677788182838485868788919293949596"
-                "9798d0d1d2d3d4d5d6d7d8d9dadbdcdddedf0000000000000001"
-                "a1a2a3a4a5a6a7a8"),
-            "armed ACK stable Protocol-50 fixture bytes remain unchanged");
+                "9798999a9b9c9d9e9fa0d0d1d2d3d4d5d6d7d8d9dadbdcdddedf"
+                "0000000000000001"
+                "a1a2a3a4a5a6a7a8000009c4"),
+            "armed ACK matches the canonical full-ACK Protocol-50 fixture");
     Msg *reply_base = decode_frame(reply_wire);
     auto *decoded_reply = dynamic_cast<P50SourceArmedMsg *>(reply_base);
     REQUIRE(decoded_reply && decoded_reply->arm == request.arm,
@@ -233,6 +245,26 @@ void test_rejects_malformed_and_legacy()
             "source-arm decoder rejects trailing payload bytes");
     delete trailing_decoded;
 
+    Bytes ack_trailing = encode_frame(armed(request.arm));
+    REQUIRE(!ack_trailing.empty(), "valid armed ACK fixture exists for mutation");
+    const uint32_t ack_body = frame_body_size(ack_trailing);
+    ack_trailing.push_back(0);
+    put_u32(ack_trailing, 0, ack_body + 1);
+    Msg *ack_trailing_decoded = decode_frame(ack_trailing);
+    REQUIRE(ack_trailing_decoded == nullptr,
+            "armed ACK decoder rejects trailing payload bytes");
+    delete ack_trailing_decoded;
+
+    Bytes ack_truncated = encode_frame(armed(request.arm));
+    REQUIRE(ack_truncated.size() > 5, "armed ACK fixture can be truncated");
+    const uint32_t ack_truncated_body = frame_body_size(ack_truncated);
+    ack_truncated.pop_back();
+    put_u32(ack_truncated, 0, ack_truncated_body - 1);
+    Msg *ack_truncated_decoded = decode_frame(ack_truncated);
+    REQUIRE(ack_truncated_decoded == nullptr,
+            "armed ACK decoder rejects a truncated bounded-budget tail");
+    delete ack_truncated_decoded;
+
     Bytes unterminated = encode_frame(request);
     /* Frame length (4), message type (4), fixed prefix through the host
        length (20), then the host bytes including its terminating NUL. */
@@ -263,6 +295,16 @@ void test_rejects_malformed_and_legacy()
     no_observation.arm_observation_id = 0;
     REQUIRE(!make_pair(PROTOCOL_VERSION).left->send_msg(no_observation),
             "zero arm observation is refused before framing");
+    P50SourceArmedMsg no_store_generation = armed(request.arm);
+    no_store_generation.f_store_generation = 0;
+    REQUIRE(!make_pair(PROTOCOL_VERSION).left->send_msg(no_store_generation),
+            "zero F StoreIdentity generation is refused before framing");
+    P50SourceArmedMsg zero_f_root = armed(request.arm);
+    zero_f_root.f_store_guid.fill(0);
+    zero_f_root.f_store_guid[icecc::p50::kStoreIdentityRoleByte] =
+        icecc::p50::kStoreIdentityFileRole;
+    REQUIRE(!make_pair(PROTOCOL_VERSION).left->send_msg(zero_f_root),
+            "role-tag-only F StoreIdentity with a zero root is refused");
 
     P50SourceArmFields unknown_profile = request.arm;
     unknown_profile.cache_profile = CACHE_PROFILE_P29;
@@ -281,6 +323,11 @@ void test_rejects_malformed_and_legacy()
     REQUIRE(!make_pair(PROTOCOL_VERSION).left->send_msg(
                 P50SourceArmMsg(c_role_alias)),
             "C StoreIdentity with the F role bit is refused");
+    P50SourceArmFields zero_c_root = request.arm;
+    zero_c_root.c_store_guid.fill(0);
+    REQUIRE(!make_pair(PROTOCOL_VERSION).left->send_msg(
+                P50SourceArmMsg(zero_c_root)),
+            "C StoreIdentity with a zero root is refused");
 
     REQUIRE(!make_pair(PROTOCOL_VERSION - 1).left->send_msg(request),
             "source-arm is refused on legacy Protocol 49");
@@ -300,9 +347,52 @@ void test_ack_conflict()
     REQUIRE(!wrong.acknowledges(request),
             "ACK with a C/F GUID alias cannot authorize the arm");
     wrong = armed(request.arm);
+    wrong.f_store_guid = request.arm.c_store_guid;
+    wrong.f_store_guid[icecc::p50::kStoreIdentityRoleByte] |=
+        icecc::p50::kStoreIdentityFileRole;
+    REQUIRE(!wrong.acknowledges(request),
+            "ACK with the same C/F 127-bit root cannot authorize the arm");
+    wrong = armed(request.arm);
     wrong.f_store_guid[1] ^= 1;
     REQUIRE(wrong.acknowledges(request),
             "independent F sidecar StoreIdentity root is accepted");
+    wrong = armed(request.arm);
+    wrong.source_budget_msec = 0;
+    REQUIRE(!wrong.acknowledges(request),
+            "zero source budget is rejected");
+    wrong = armed(request.arm);
+    wrong.source_budget_msec = P50SourceArmedFields::MaxSourceBudgetMsec + 1;
+    REQUIRE(!wrong.acknowledges(request),
+            "source budget above the hard maximum is rejected");
+
+    wrong = armed(request.arm);
+    wrong.f_control_generation = 0;
+    REQUIRE(!wrong.acknowledges(request),
+            "zero F control generation is rejected");
+    wrong = armed(request.arm);
+    wrong.f_control_attempt = 0;
+    REQUIRE(!wrong.acknowledges(request),
+            "zero F control attempt is rejected");
+    wrong = armed(request.arm);
+    wrong.f_store_generation = 0;
+    REQUIRE(!wrong.acknowledges(request),
+            "zero F StoreIdentity generation is rejected");
+    wrong = armed(request.arm);
+    wrong.f_store_derivation_version++;
+    REQUIRE(!wrong.acknowledges(request),
+            "mutated F StoreIdentity version is rejected");
+    wrong = armed(request.arm);
+    wrong.arm.assignment_epoch++;
+    REQUIRE(!wrong.acknowledges(request),
+            "mutated assignment epoch in ACK is rejected");
+    wrong = armed(request.arm);
+    wrong.arm.c_control_attempt++;
+    REQUIRE(!wrong.acknowledges(request),
+            "mutated C control attempt in ACK is rejected");
+    wrong = armed(request.arm);
+    wrong.arm.c_store_generation++;
+    REQUIRE(!wrong.acknowledges(request),
+            "mutated C store generation in ACK is rejected");
 }
 
 } // namespace

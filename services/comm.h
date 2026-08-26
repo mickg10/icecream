@@ -830,7 +830,27 @@ struct P50SourceArmFields {
     uint64_t c_control_generation = 0;
     uint64_t c_control_attempt = 0;
 
-    [[nodiscard]] bool valid() const noexcept;
+    [[nodiscard]] bool valid() const noexcept
+    {
+        return wire_job_id != 0 && assignment_epoch != 0 &&
+               assignment_nonce != 0 && !selected_f_host.empty() &&
+               selected_f_host.size() <= 255 &&
+               selected_f_host.find('\0') == std::string::npos &&
+               selected_f_ordinary_port != 0 &&
+               selected_f_ordinary_port <= UINT16_MAX &&
+               selected_f_cache_port != 0 &&
+               selected_f_cache_port <= UINT16_MAX &&
+               cache_protocol == CACHE_WIRE_PROTOCOL_V1 &&
+               cache_profile == CACHE_PROFILE_ZSTD_TU && logical_job != 0 &&
+               compiler_attempt != 0 && c_store_generation != 0 &&
+               c_store_derivation_version ==
+                   icecc::p50::kStoreIdentityDerivationVersion &&
+               icecc::p50::store_identity_guid_valid_for_role(
+                   c_store_guid, icecc::p50::kStoreIdentityClientRole) &&
+               source_request_id != 0 &&
+               source_mode == P50_SOURCE_MODE_ZSTD_TU &&
+               c_control_generation != 0 && c_control_attempt != 0;
+    }
     auto operator<=>(const P50SourceArmFields&) const = default;
 };
 
@@ -858,30 +878,62 @@ private:
     bool wire_payload_valid = true;
 };
 
+/* Canonical semantic value for the exact F acknowledgement.  Reducers retain
+ * this complete value without retaining MsgChannel framing state. */
+struct P50SourceArmedFields {
+    static constexpr size_t MaxPayloadBytes = 1024;
+    static constexpr uint32_t MaxSourceBudgetMsec = 60000;
+
+    [[nodiscard]] bool semantic_valid() const noexcept
+    {
+        return arm.valid() && f_control_generation != 0 &&
+               f_control_attempt != 0 && f_store_generation != 0 &&
+               icecc::p50::store_identity_guid_valid_for_role(
+                   f_store_guid, icecc::p50::kStoreIdentityFileRole) &&
+               f_store_derivation_version ==
+                   icecc::p50::kStoreIdentityDerivationVersion &&
+               arm_observation_id != 0 && source_budget_msec != 0 &&
+               source_budget_msec <= MaxSourceBudgetMsec &&
+               !icecc::p50::store_identity_file_guid_matches_client(
+                   arm.c_store_guid, f_store_guid);
+    }
+
+    P50SourceArmFields arm{};
+    uint64_t f_control_generation = 0;
+    uint64_t f_control_attempt = 0;
+    uint64_t f_store_generation = 0;
+    std::array<uint8_t, 16> f_store_guid{};
+    uint64_t f_store_derivation_version = 0;
+    uint64_t arm_observation_id = 0;
+    uint32_t source_budget_msec = 0;
+
+    auto operator<=>(const P50SourceArmedFields&) const = default;
+};
+
 /* Exact F acknowledgement.  It echoes every arm field and adds the current
- * F control launch, StoreIdentity-derived F GUID/version, and a fresh
+ * F control launch, StoreIdentity generation/GUID/version, and a fresh
  * nonzero observation.  C and F are independent supervised sidecar
  * incarnations: each GUID must have its own fixed role bit, but the ACK must
  * never pretend that F's CSPRNG root is derived from C's root.  Raw roots are
  * deliberately never sent or logged. */
-class P50SourceArmedMsg : public Msg
+class P50SourceArmedMsg : public Msg, public P50SourceArmedFields
 {
 public:
-    static constexpr size_t MaxPayloadBytes = 1024;
-
     P50SourceArmedMsg()
         : Msg(Msg::P50_SOURCE_ARMED) {}
 
     P50SourceArmedMsg(P50SourceArmFields fields,
                       uint64_t f_generation, uint64_t f_attempt,
+                      uint64_t f_store_generation,
                       std::array<uint8_t, 16> f_guid,
                       uint64_t derivation_version,
-                      uint64_t observation)
-        : Msg(Msg::P50_SOURCE_ARMED), arm(std::move(fields)),
-          f_control_generation(f_generation), f_control_attempt(f_attempt),
-          f_store_guid(f_guid),
-          f_store_derivation_version(derivation_version),
-          arm_observation_id(observation) {}
+                      uint64_t observation,
+                      uint32_t source_budget_msec)
+        : Msg(Msg::P50_SOURCE_ARMED),
+          P50SourceArmedFields{std::move(fields), f_generation, f_attempt,
+                               f_store_generation, f_guid,
+                               derivation_version, observation,
+                               source_budget_msec} {}
 
     void fill_from_channel(MsgChannel *c) override;
     void send_to_channel(MsgChannel *c) const override;
@@ -895,13 +947,6 @@ public:
     {
         return valid_payload() && request.valid_payload() && arm == request.arm;
     }
-
-    P50SourceArmFields arm;
-    uint64_t f_control_generation = 0;
-    uint64_t f_control_attempt = 0;
-    std::array<uint8_t, 16> f_store_guid{};
-    uint64_t f_store_derivation_version = 0;
-    uint64_t arm_observation_id = 0;
 
 private:
     bool wire_payload_valid = true;

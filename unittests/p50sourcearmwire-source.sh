@@ -20,14 +20,17 @@ for needle in \
     'c_store_generation' 'c_store_derivation_version' 'c_store_guid' \
     'source_request_id' 'source_mode' \
     'c_control_generation' 'c_control_attempt' \
-    'f_control_generation' 'f_control_attempt' 'f_store_guid' \
-    'f_store_derivation_version' 'arm_observation_id' \
+    'P50SourceArmedFields' 'semantic_valid()' \
+    'f_control_generation' 'f_control_attempt' 'f_store_generation' \
+    'f_store_guid' 'f_store_derivation_version' 'arm_observation_id' \
+    'source_budget_msec' 'MaxSourceBudgetMsec' \
     'P50_SOURCE_MODE_ZSTD_TU' 'CACHE_PROFILE_ZSTD_TU' \
     'kStoreIdentityDerivationVersion' 'kStoreIdentityRoleByte' \
     'kStoreIdentityRoleMask' 'kStoreIdentityClientRole' \
-    'kStoreIdentityFileRole' 'store_identity_file_guid_matches_client' \
+    'kStoreIdentityFileRole' 'store_identity_guid_valid_for_role' \
+    'store_identity_file_guid_matches_client' \
     'read_bounded_string' 'current_message_bytes_remaining() != 0' \
-    'negotiated_protocol == PROTOCOL_VERSION' 'p50_nonzero' \
+    'negotiated_protocol == PROTOCOL_VERSION' \
     'if (!valid_payload())'; do
     grep -F "$needle" "$header" "$impl" "$identity" >/dev/null
 done
@@ -35,6 +38,7 @@ done
 grep -F 'P50SourceArmMsg' "$test" >/dev/null
 grep -F 'P50SourceArmedMsg' "$test" >/dev/null
 grep -F 'trailing payload bytes' "$test" >/dev/null
+grep -F 'truncated bounded-budget tail' "$test" >/dev/null
 grep -F 'Protocol 49' "$test" >/dev/null
 grep -F 'WIRE-AUDIT three-bucket classification' "$test" >/dev/null
 grep -F 'stable Protocol-50 fixture bytes' "$test" >/dev/null
@@ -47,13 +51,12 @@ if sed -n '/^ice_HEADERS =/,/^$/p' "$makefile" | grep -F 'p50_store_identity_wir
 fi
 sed -n '/^ice_HEADERS =/,/^$/p' "$makefile" | grep -F 'p50_store_identity_wire.h' >/dev/null
 
-# C and F operations run under independent supervised sidecar incarnations.
-# The ACK validates F's role/version and exact echo; it must not invent a
-# cross-host shared StoreIdentity root by joining F_GUID to C_GUID.
-if grep -F 'store_identity_file_guid_matches_client' "$impl" >/dev/null; then
-    echo 'FAIL: source ACK incorrectly joins independent C/F StoreIdentity roots' >&2
-    exit 1
-fi
+# C and F operations run under independent supervised sidecar incarnations,
+# but a role-tagged alias of the same 127-bit root is forbidden.  The complete
+# canonical ACK validator must enforce both individual GUID validity and this
+# pairwise non-alias law.
+grep -F 'store_identity_guid_valid_for_role' "$header" >/dev/null
+grep -F '!icecc::p50::store_identity_file_guid_matches_client' "$header" >/dev/null
 
 # The ACK must not transmit or model raw CSPRNG entropy/root state.
 if grep -F 'f_store_identity_root' "$header" "$impl" "$identity" "$test" >/dev/null; then

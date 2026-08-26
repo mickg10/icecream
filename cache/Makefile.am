@@ -1,6 +1,7 @@
 noinst_LIBRARIES = libprotocol50.a libp50endpoint.a libp50localtransport.a \
 	libp50sidecarsupervisor.a libp50readyadvertisement.a libp50roleowner.a \
-	libp50daemonsidecaradapter.a libp50inputfd.a libp50inputlifecycle.a
+	libp50daemonsidecaradapter.a libp50inputfd.a libp50inputlifecycle.a \
+	libp50sessionjoin.a
 
 sbin_PROGRAMS = icecc-cache-service
 
@@ -30,6 +31,8 @@ libprotocol50_a_SOURCES = \
 	p50_input_attachment.h \
 	p50_source_identity.cpp \
 	p50_source_identity.h \
+	p50_source_ingress.cpp \
+	p50_source_ingress.h \
 	p50_phase_open.cpp \
 	p50_phase_open.h \
 	p50_input_wait.cpp \
@@ -54,6 +57,9 @@ libp50daemonsidecaradapter_a_SOURCES = p50_daemon_sidecar_adapter.cpp \
 	p50_daemon_sidecar_adapter.h
 libp50daemonsidecaradapter_a_CPPFLAGS = $(AM_CPPFLAGS)
 libp50roleowner_a_SOURCES = p50_role_owner.cpp p50_role_owner.h
+libp50sessionjoin_a_SOURCES = p50_cache_session_join.cpp \
+	p50_cache_session_join.h
+libp50sessionjoin_a_CPPFLAGS = $(AM_CPPFLAGS)
 
 EXTRA_DIST = \
 	p50_control_operation.h \
@@ -167,6 +173,8 @@ EXTRA_DIST = \
 	P50_DAEMON_PHASE_REVERSE_WIRING.md \
 	P50_S2_RESTART_REPLAY.md \
 	P50_SOURCE_ARM.md \
+	P50_CACHE_SESSION_JOIN.md \
+	P50_SOURCE_INGRESS.md \
 	P50_PREBOUND_TWO_ROLE.md \
 	formal/README.md
 
