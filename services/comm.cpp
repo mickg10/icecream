@@ -630,6 +630,26 @@ MsgChannel &MsgChannel::operator>>(string &s)
     return *this;
 }
 
+bool MsgChannel::read_bounded_string(string &s, size_t max_length)
+{
+    uint32_t encoded_length = 0;
+    *this >> encoded_length;
+    if (encoded_length == 0 || (encoded_length - 1) > max_length ||
+        encoded_length > current_message_bytes_remaining()) {
+        s.clear();
+        return false;
+    }
+
+    const char *const bytes = inbuf + intogo;
+    if (bytes[encoded_length - 1] != '\0') {
+        s.clear();
+        return false;
+    }
+    s.assign(bytes, encoded_length - 1);
+    intogo += encoded_length;
+    return true;
+}
+
 MsgChannel &MsgChannel::operator<<(const std::string &s)
 {
     uint32_t len = 1 + s.length();
@@ -1608,6 +1628,16 @@ Msg *MsgChannel::get_msg(int timeout, bool eofAllowed)
             m = new ResultDispositionMsg;
         }
         break;
+    case Msg::P50_SOURCE_ARM:
+        if (protocol == PROTOCOL_VERSION) {
+            m = new P50SourceArmMsg;
+        }
+        break;
+    case Msg::P50_SOURCE_ARMED:
+        if (protocol == PROTOCOL_VERSION) {
+            m = new P50SourceArmedMsg;
+        }
+        break;
     case Msg::VERIFY_ENV:
         m = new VerifyEnvMsg;
         break;
@@ -2464,6 +2494,204 @@ void Msg::send_to_channel(MsgChannel *c) const
     }
 
     *c << (uint32_t) *this;
+}
+
+namespace {
+
+constexpr size_t kP50SourceHostMax = 255;
+constexpr size_t kP50SourceArmFixedBytes = 112;
+constexpr size_t kP50SourceArmMinimumBytes = kP50SourceArmFixedBytes + 6;
+constexpr size_t kP50SourceArmedMinimumBytes = kP50SourceArmMinimumBytes + 48;
+
+bool p50_nonzero(const std::array<uint8_t, 16> &value) noexcept
+{
+    for (const uint8_t byte : value) {
+        if (byte != 0)
+            return true;
+    }
+    return false;
+}
+
+bool p50_host_valid(const std::string &host) noexcept
+{
+    if (host.empty() || host.size() > kP50SourceHostMax)
+        return false;
+    return host.find('\0') == std::string::npos;
+}
+
+void p50_write_u64(MsgChannel *channel, uint64_t value)
+{
+    *channel << static_cast<uint32_t>(value >> 32);
+    *channel << static_cast<uint32_t>(value);
+}
+
+bool p50_read_u64(MsgChannel *channel, uint64_t &value)
+{
+    if (channel->current_message_bytes_remaining() < 8)
+        return false;
+    uint32_t high = 0;
+    uint32_t low = 0;
+    *channel >> high;
+    *channel >> low;
+    value = (uint64_t(high) << 32) | low;
+    return true;
+}
+
+void p50_write_id(MsgChannel *channel, const std::array<uint8_t, 16> &value)
+{
+    for (size_t offset = 0; offset != value.size(); offset += 4) {
+        const uint32_t word = (uint32_t(value[offset]) << 24) |
+                              (uint32_t(value[offset + 1]) << 16) |
+                              (uint32_t(value[offset + 2]) << 8) |
+                              uint32_t(value[offset + 3]);
+        *channel << word;
+    }
+}
+
+bool p50_read_id(MsgChannel *channel, std::array<uint8_t, 16> &value)
+{
+    if (channel->current_message_bytes_remaining() < value.size())
+        return false;
+    for (size_t offset = 0; offset != value.size(); offset += 4) {
+        uint32_t word = 0;
+        *channel >> word;
+        value[offset] = static_cast<uint8_t>(word >> 24);
+        value[offset + 1] = static_cast<uint8_t>(word >> 16);
+        value[offset + 2] = static_cast<uint8_t>(word >> 8);
+        value[offset + 3] = static_cast<uint8_t>(word);
+    }
+    return true;
+}
+
+void p50_write_arm(MsgChannel *channel, const P50SourceArmFields &arm)
+{
+    *channel << arm.wire_job_id;
+    p50_write_u64(channel, arm.assignment_epoch);
+    p50_write_u64(channel, arm.assignment_nonce);
+    *channel << arm.selected_f_host;
+    *channel << arm.selected_f_ordinary_port;
+    *channel << arm.selected_f_cache_port;
+    *channel << arm.cache_protocol;
+    *channel << arm.cache_profile;
+    p50_write_u64(channel, arm.logical_job);
+    p50_write_u64(channel, arm.compiler_attempt);
+    p50_write_u64(channel, arm.c_store_generation);
+    p50_write_u64(channel, arm.c_store_derivation_version);
+    p50_write_id(channel, arm.c_store_guid);
+    p50_write_u64(channel, arm.source_request_id);
+    *channel << arm.source_mode;
+    p50_write_u64(channel, arm.c_control_generation);
+    p50_write_u64(channel, arm.c_control_attempt);
+}
+
+bool p50_read_arm(MsgChannel *channel, P50SourceArmFields &arm)
+{
+    if (channel->current_message_bytes_remaining() < kP50SourceArmMinimumBytes)
+        return false;
+    *channel >> arm.wire_job_id;
+    if (!p50_read_u64(channel, arm.assignment_epoch) ||
+        !p50_read_u64(channel, arm.assignment_nonce) ||
+        !channel->read_bounded_string(arm.selected_f_host, kP50SourceHostMax))
+        return false;
+    *channel >> arm.selected_f_ordinary_port;
+    *channel >> arm.selected_f_cache_port;
+    *channel >> arm.cache_protocol;
+    *channel >> arm.cache_profile;
+    if (!p50_read_u64(channel, arm.logical_job) ||
+        !p50_read_u64(channel, arm.compiler_attempt) ||
+        !p50_read_u64(channel, arm.c_store_generation) ||
+        !p50_read_u64(channel, arm.c_store_derivation_version) ||
+        !p50_read_id(channel, arm.c_store_guid) ||
+        !p50_read_u64(channel, arm.source_request_id))
+        return false;
+    *channel >> arm.source_mode;
+    if (!p50_read_u64(channel, arm.c_control_generation) ||
+        !p50_read_u64(channel, arm.c_control_attempt))
+        return false;
+    return true;
+}
+
+} // namespace
+
+bool P50SourceArmFields::valid() const noexcept
+{
+    return wire_job_id != 0 && assignment_epoch != 0 && assignment_nonce != 0 &&
+           p50_host_valid(selected_f_host) && selected_f_ordinary_port != 0 &&
+           selected_f_ordinary_port <= UINT16_MAX && selected_f_cache_port != 0 &&
+           selected_f_cache_port <= UINT16_MAX && cache_protocol == CACHE_WIRE_PROTOCOL_V1 &&
+           cache_profile == CACHE_PROFILE_ZSTD_TU && logical_job != 0 && compiler_attempt != 0 &&
+           c_store_generation != 0 &&
+           c_store_derivation_version == icecc::p50::kStoreIdentityDerivationVersion &&
+           p50_nonzero(c_store_guid) &&
+           (c_store_guid[icecc::p50::kStoreIdentityRoleByte] &
+            icecc::p50::kStoreIdentityRoleMask) == 0 &&
+           source_request_id != 0 && source_mode == P50_SOURCE_MODE_ZSTD_TU &&
+           c_control_generation != 0 && c_control_attempt != 0;
+}
+
+bool P50SourceArmMsg::valid_payload() const
+{
+    return wire_payload_valid && arm.valid();
+}
+
+void P50SourceArmMsg::fill_from_channel(MsgChannel *channel)
+{
+    wire_payload_valid = true;
+    const size_t remaining = channel->current_message_bytes_remaining();
+    if (remaining < kP50SourceArmMinimumBytes || remaining > MaxPayloadBytes ||
+        !p50_read_arm(channel, arm) || channel->current_message_bytes_remaining() != 0) {
+        wire_payload_valid = false;
+    }
+}
+
+void P50SourceArmMsg::send_to_channel(MsgChannel *channel) const
+{
+    /* Keep direct send_to_channel callers from bypassing send_msg's
+       authoritative-payload gate while this message has no production
+       caller yet. */
+    if (!valid_payload())
+        return;
+    Msg::send_to_channel(channel);
+    p50_write_arm(channel, arm);
+}
+
+bool P50SourceArmedMsg::valid_payload() const
+{
+    return wire_payload_valid && arm.valid() && f_control_generation != 0 &&
+           f_control_attempt != 0 && p50_nonzero(f_store_guid) &&
+           icecc::p50::store_identity_file_guid_matches_client(
+               arm.c_store_guid, f_store_guid) &&
+           f_store_derivation_version == icecc::p50::kStoreIdentityDerivationVersion &&
+           arm_observation_id != 0;
+}
+
+void P50SourceArmedMsg::fill_from_channel(MsgChannel *channel)
+{
+    wire_payload_valid = true;
+    const size_t remaining = channel->current_message_bytes_remaining();
+    if (remaining < kP50SourceArmedMinimumBytes || remaining > MaxPayloadBytes ||
+        !p50_read_arm(channel, arm) ||
+        !p50_read_u64(channel, f_control_generation) ||
+        !p50_read_u64(channel, f_control_attempt) ||
+        !p50_read_id(channel, f_store_guid) ||
+        !p50_read_u64(channel, f_store_derivation_version) ||
+        !p50_read_u64(channel, arm_observation_id) ||
+        channel->current_message_bytes_remaining() != 0) {
+        wire_payload_valid = false;
+    }
+}
+
+void P50SourceArmedMsg::send_to_channel(MsgChannel *channel) const
+{
+    if (!valid_payload())
+        return;
+    Msg::send_to_channel(channel);
+    p50_write_arm(channel, arm);
+    p50_write_u64(channel, f_control_generation);
+    p50_write_u64(channel, f_control_attempt);
+    p50_write_id(channel, f_store_guid);
+    p50_write_u64(channel, f_store_derivation_version);
+    p50_write_u64(channel, arm_observation_id);
 }
 
 GetCSMsg::GetCSMsg(const Environments &envs, const std::string &f,

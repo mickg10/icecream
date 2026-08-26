@@ -34,11 +34,15 @@
 #include <netinet/tcp.h>
 
 #include "job.h"
+#include "p50_store_identity_wire.h"
 #include <chrono>
+#include <array>
+#include <compare>
 #include <deque>
 #include <optional>
 #include <stdint.h>
 #include <string>
+#include <utility>
 
 // if you increase the PROTOCOL_VERSION, add a macro below and use that
 #define PROTOCOL_VERSION 50
@@ -174,7 +178,13 @@ public:
         // Protocol-50-only result disposition.  0x50f00001 is reserved by
         // CACHE_SESSION_READY_MAGIC (a raw handoff witness, not a Msg), so
         // this ordinary framed message deliberately uses the next value.
-        RESULT_DISPOSITION = 0x50f00002
+        RESULT_DISPOSITION = 0x50f00002,
+
+        // Protocol-50 source-arm phase.  These are ordinary framed messages;
+        // they are distinct from the empty CACHE_SESSION discriminator and
+        // carry all assignment/source/control-launch authority explicitly.
+        P50_SOURCE_ARM = 0x50f00010,
+        P50_SOURCE_ARMED = 0x50f00011
     };
 
     Msg() = default;
@@ -278,6 +288,10 @@ public:
                 return "CACHE_SESSION";
             case RESULT_DISPOSITION:
                 return "RESULT_DISPOSITION";
+            case P50_SOURCE_ARM:
+                return "P50_SOURCE_ARM";
+            case P50_SOURCE_ARMED:
+                return "P50_SOURCE_ARMED";
         }
         return "UNKNOWN";
     }
@@ -329,6 +343,10 @@ const uint32_t CACHE_DECLARED_PROFILE_MASK =
 /* The converged M2 endpoint has one runnable product dialogue.  Declaring a
    profile name must never advertise a codec which cannot reconstruct input. */
 const uint32_t CACHE_ADVERTISABLE_PROFILE_MASK = CACHE_PROFILE_ZSTD_TU;
+
+/* Source-arm mode values are deliberately closed until another runnable
+   source production path exists. */
+inline constexpr uint32_t P50_SOURCE_MODE_ZSTD_TU = UINT32_C(1);
 
 /* Shared absent-or-present law for a three-word CacheWire advertisement.
    LoginMsg's Login-only capability tail (M0/M1) and UseCSMsg's
@@ -553,6 +571,11 @@ public:
     MsgChannel &operator>>(uint32_t &);
     MsgChannel &operator>>(std::string &);
     MsgChannel &operator>>(std::list<std::string> &);
+
+    // Bounded string reader for new strict wire messages.  Unlike the legacy
+    // operator>>, this requires a length-delimited NUL terminator and never
+    // constructs a string from an untrusted unterminated buffer.
+    bool read_bounded_string(std::string &, size_t max_length);
 
     MsgChannel &operator<<(uint32_t);
     MsgChannel &operator<<(const std::string &);
@@ -780,6 +803,106 @@ public:
     {
         return negotiated_protocol == PROTOCOL_VERSION;
     }
+};
+
+/*
+ * Explicit Protocol-50 source-arm authority.  This is an ordinary-wire
+ * admission message, not a CACHE_SESSION payload.  Every field is carried in
+ * the same frame so a receiver never has to join assignment, endpoint, store,
+ * and control-launch values from separate messages.
+ */
+struct P50SourceArmFields {
+    uint32_t wire_job_id = 0;
+    uint64_t assignment_epoch = 0;
+    uint64_t assignment_nonce = 0;
+    std::string selected_f_host;
+    uint32_t selected_f_ordinary_port = 0;
+    uint32_t selected_f_cache_port = 0;
+    uint32_t cache_protocol = 0;
+    uint32_t cache_profile = 0;
+    uint64_t logical_job = 0;
+    uint64_t compiler_attempt = 0;
+    uint64_t c_store_generation = 0;
+    uint64_t c_store_derivation_version = 0;
+    std::array<uint8_t, 16> c_store_guid{};
+    uint64_t source_request_id = 0;
+    uint32_t source_mode = 0;
+    uint64_t c_control_generation = 0;
+    uint64_t c_control_attempt = 0;
+
+    [[nodiscard]] bool valid() const noexcept;
+    auto operator<=>(const P50SourceArmFields&) const = default;
+};
+
+class P50SourceArmMsg : public Msg
+{
+public:
+    static constexpr size_t MaxPayloadBytes = 512;
+
+    P50SourceArmMsg()
+        : Msg(Msg::P50_SOURCE_ARM) {}
+    explicit P50SourceArmMsg(P50SourceArmFields fields)
+        : Msg(Msg::P50_SOURCE_ARM), arm(std::move(fields)) {}
+
+    void fill_from_channel(MsgChannel *c) override;
+    void send_to_channel(MsgChannel *c) const override;
+    bool valid_payload() const override;
+    bool valid_for_protocol(int negotiated_protocol) const override
+    {
+        return negotiated_protocol == PROTOCOL_VERSION;
+    }
+
+    P50SourceArmFields arm;
+
+private:
+    bool wire_payload_valid = true;
+};
+
+/* Exact F acknowledgement.  It echoes every arm field and adds the current
+ * F control launch, StoreIdentity-derived F GUID/version, and a fresh
+ * nonzero observation.  The CSPRNG root is deliberately never sent or
+ * logged; the receiver checks the fixed F role bit on the derived GUID. */
+class P50SourceArmedMsg : public Msg
+{
+public:
+    static constexpr size_t MaxPayloadBytes = 1024;
+
+    P50SourceArmedMsg()
+        : Msg(Msg::P50_SOURCE_ARMED) {}
+
+    P50SourceArmedMsg(P50SourceArmFields fields,
+                      uint64_t f_generation, uint64_t f_attempt,
+                      std::array<uint8_t, 16> f_guid,
+                      uint64_t derivation_version,
+                      uint64_t observation)
+        : Msg(Msg::P50_SOURCE_ARMED), arm(std::move(fields)),
+          f_control_generation(f_generation), f_control_attempt(f_attempt),
+          f_store_guid(f_guid),
+          f_store_derivation_version(derivation_version),
+          arm_observation_id(observation) {}
+
+    void fill_from_channel(MsgChannel *c) override;
+    void send_to_channel(MsgChannel *c) const override;
+    bool valid_payload() const override;
+    bool valid_for_protocol(int negotiated_protocol) const override
+    {
+        return negotiated_protocol == PROTOCOL_VERSION;
+    }
+
+    [[nodiscard]] bool acknowledges(const P50SourceArmMsg &request) const noexcept
+    {
+        return valid_payload() && request.valid_payload() && arm == request.arm;
+    }
+
+    P50SourceArmFields arm;
+    uint64_t f_control_generation = 0;
+    uint64_t f_control_attempt = 0;
+    std::array<uint8_t, 16> f_store_guid{};
+    uint64_t f_store_derivation_version = 0;
+    uint64_t arm_observation_id = 0;
+
+private:
+    bool wire_payload_valid = true;
 };
 
 class GetCSMsg : public Msg
