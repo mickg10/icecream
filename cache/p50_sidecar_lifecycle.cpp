@@ -318,13 +318,21 @@ bool SidecarLifecycle::accept_ready(const LifecycleObservation& observation) noe
 bool SidecarLifecycle::exact_group_absent(
     const LifecycleObservation& observation) const noexcept {
     if (!group_proof_required_)
-        return true;
+        return false;
     // A numeric PGID/Gone observation is deliberately insufficient.  The
     // outer loop must bind the observation to an independently owned,
     // non-reusable kill-domain lease captured for this exact fork.
-    return leader_reaped_ && group_domain_.has_value() &&
-           group_domain_->valid() && kill_domain_verifier_ &&
-           kill_domain_verifier_->proves_absent(*group_domain_, child_pid_,
+    // Do not let a permissive adapter turn caller-controlled facts into a
+    // teardown authority.  These checks are deliberately independent of the
+    // verifier callback: the observation must be the exact ESRCH/Gone proof,
+    // for this fork's PGID, carrying the exact opaque lease captured for it.
+    if (!leader_reaped_ || observation.group != GroupObservation::Gone ||
+        observation.observed_pgid != process_group_ || !group_domain_.has_value() ||
+        !group_domain_->valid() || !group_domain_->matches(child_pid_, process_group_) ||
+        !observation.group_domain.valid() ||
+        !(observation.group_domain == *group_domain_) || !kill_domain_verifier_)
+        return false;
+    return kill_domain_verifier_->proves_absent(*group_domain_, child_pid_,
                                                 process_group_, observation);
 }
 

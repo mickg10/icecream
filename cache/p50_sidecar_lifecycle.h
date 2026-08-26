@@ -68,6 +68,12 @@ class KillDomainLease {
 public:
     KillDomainLease() = default;
     [[nodiscard]] bool valid() const noexcept { return capability_ != nullptr; }
+    // Keep the kernel-backed identity opaque while allowing the reducer to
+    // reject a verifier that returns a lease for a different fork.
+    [[nodiscard]] bool matches(pid_t pid, pid_t pgid) const noexcept {
+        return capability_ != nullptr && capability_->pid == pid &&
+               capability_->pgid == pgid;
+    }
 
 private:
     struct Capability {
@@ -125,8 +131,9 @@ struct LifecycleObservation {
     std::optional<ReadyLease> ready_lease;
     uint64_t store_generation = 0;
     GroupObservation group = GroupObservation::Unknown;
-    // Retained as an observation-only compatibility field.  The reducer never
-    // treats this caller-provided value as authority.
+    // The reducer never treats this caller-provided value as authority.  It is
+    // accepted only when it is the exact opaque token captured for this fork;
+    // the verifier still has to prove the independently observed absence.
     KillDomainLease group_domain{};
     pid_t pid = -1;
     pid_t observed_pgid = -1;

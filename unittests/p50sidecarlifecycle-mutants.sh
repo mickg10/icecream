@@ -10,7 +10,7 @@ for mutant_name in pgid store-generation stale-ready listener-node teardown-dead
     # These are semantic deletion mutants; the runtime witness must redden
     # each one rather than merely matching source text.
     if test "$mutant_name" = pgid; then
-        sed -i 's/process_group_, observation);/observation.observed_pgid, observation);/' "$tmp/mutant.cpp"
+        sed -i 's/observation\.observed_pgid != process_group_/false/' "$tmp/mutant.cpp"
     elif test "$mutant_name" = store-generation; then
         sed -i 's/observation\.store_generation != identity_->store_generation/false/' "$tmp/mutant.cpp"
     elif test "$mutant_name" = stale-ready; then
@@ -32,7 +32,9 @@ for mutant_name in pgid store-generation stale-ready listener-node teardown-dead
     elif test "$mutant_name" = discarded-registration; then
         sed -i '0,/state_->owners.erase(iterator);/s//if (false) state_->owners.erase(iterator);/' "$tmp/mutant.cpp"
     elif test "$mutant_name" = socket-substitution; then
-        sed -i '/if (::lstat(lease.socket_path.c_str(), \&listener) != 0 ||/,/listener.st_ino != lease.listener_inode)/c\    if (false) {' "$tmp/mutant.cpp"
+        # Keep the substitution bypass syntactically valid so the behavioral
+        # witness, rather than the compiler, kills this true mutant.
+        sed -i '/if (::lstat(lease.socket_path.c_str(), \&listener) != 0 ||/,/listener.st_ino != lease.listener_inode)/c\    if (false)' "$tmp/mutant.cpp"
     else
         sed -i 's/event\.owner != owner_key()/false/' "$tmp/mutant.cpp"
     fi

@@ -47,7 +47,13 @@ std::shared_ptr<LaunchIdentityAllocator> allocator(uint64_t generation) {
 class TestKillDomainVerifier final : public KillDomainVerifier {
 public:
     std::optional<KillDomainLease> capture(pid_t pid, pid_t pgid) noexcept override {
-        return issue(pid, pgid, ++serial_);
+        const auto lease = issue(pid, pgid, ++serial_);
+        if (lease.valid() && captured_count_ < captured_.size()) {
+            captured_pids_[captured_count_] = pid;
+            captured_[captured_count_] = lease;
+            ++captured_count_;
+        }
+        return lease;
     }
     bool proves_absent(const KillDomainLease&, pid_t, pid_t pgid,
                        const LifecycleObservation& observation) const noexcept override {
@@ -55,8 +61,51 @@ public:
                observation.observed_pgid == pgid;
     }
 
+    std::optional<KillDomainLease> lease_for(pid_t pid) const noexcept {
+        for (size_t index = 0; index != captured_count_; ++index) {
+            if (captured_pids_[index] == pid)
+                return captured_[index];
+        }
+        return std::nullopt;
+    }
+
 private:
     uint64_t serial_ = 0;
+    std::array<pid_t, 32> captured_pids_{};
+    std::array<std::optional<KillDomainLease>, 32> captured_{};
+    size_t captured_count_ = 0;
+};
+
+class PermissiveKillDomainVerifier final : public KillDomainVerifier {
+public:
+    std::optional<KillDomainLease> capture(pid_t pid, pid_t pgid) noexcept override {
+        const auto lease = issue(pid, pgid, ++serial_);
+        if (lease.valid() && captured_count_ < captured_.size()) {
+            captured_pids_[captured_count_] = pid;
+            captured_[captured_count_] = lease;
+            ++captured_count_;
+        }
+        return lease;
+    }
+
+    bool proves_absent(const KillDomainLease&, pid_t, pid_t,
+                       const LifecycleObservation&) const noexcept override {
+        return true;
+    }
+
+    std::optional<KillDomainLease> lease_for(pid_t pid) const noexcept {
+        for (size_t index = 0; index != captured_count_; ++index) {
+            if (captured_pids_[index] == pid)
+                return captured_[index];
+        }
+        return std::nullopt;
+    }
+
+private:
+    uint64_t serial_ = 0;
+    std::array<pid_t, 8> captured_pids_{};
+    std::array<std::optional<KillDomainLease>, 8> captured_{};
+    size_t captured_count_ = 0;
 };
 
 void create_socket_node(const std::string& directory, const std::string& path) {
@@ -151,7 +200,8 @@ void test_lifecycle() {
     config.grace_timeout = std::chrono::milliseconds(10);
     config.kill_timeout = std::chrono::milliseconds(10);
     config.identities = allocator(config.control_generation);
-    config.kill_domain_verifier = std::make_shared<TestKillDomainVerifier>();
+    auto verifier = std::make_shared<TestKillDomainVerifier>();
+    config.kill_domain_verifier = verifier;
     SidecarLifecycle lifecycle(config);
     CHECK(SidecarLifecycle::valid_config(config), "valid lifecycle configuration");
 
@@ -287,6 +337,9 @@ void test_lifecycle() {
           "KILL is emitted once and never duplicated by a later turn");
     LifecycleObservation group_gone = wrong_group;
     group_gone.observed_pgid = 321;
+    const auto group_lease = verifier->lease_for(321);
+    CHECK(group_lease.has_value(), "verifier retains the exact fork lease");
+    group_gone.group_domain = *group_lease;
     group_gone.observed_device = first_device;
     group_gone.observed_inode = first_inode;
     remove_socket_node(*lifecycle.identity());
@@ -307,6 +360,46 @@ void test_lifecycle() {
     CHECK(lifecycle.advance(t0 + std::chrono::milliseconds(11), group_gone).action == LifecycleAction::RetryEligible &&
               lifecycle.state() == LifecycleState::RetryEligible,
           "exact group and path proof authorizes retry");
+
+    // Even an injected verifier that returns true for every callback cannot
+    // authorize a fabricated lease or a mismatched observed PGID.  The
+    // reducer independently binds both facts to the exact fork lease.
+    SidecarLifecycleConfig permissive_config = config;
+    auto permissive_verifier = std::make_shared<PermissiveKillDomainVerifier>();
+    permissive_config.kill_domain_verifier = permissive_verifier;
+    SidecarLifecycle permissive_group(permissive_config);
+    (void)permissive_group.begin(t0);
+    move_to_ready(permissive_group, 352, t0);
+    LifecycleObservation permissive_request;
+    permissive_request.request_replacement = true;
+    CHECK(permissive_group.advance(t0, permissive_request).action ==
+              LifecycleAction::Withdraw &&
+              permissive_group.advance(t0).action == LifecycleAction::SendTerm,
+          "permissive verifier witness starts bounded teardown");
+    CHECK(permissive_group.observe_child_reaped(352, 0, true),
+          "permissive verifier witness records leader reap");
+    LifecycleObservation mismatched_before_grace;
+    mismatched_before_grace.group = GroupObservation::Gone;
+    mismatched_before_grace.observed_pgid = 999;
+    mismatched_before_grace.group_domain = *permissive_verifier->lease_for(352);
+    CHECK(permissive_group.advance(t0 + std::chrono::milliseconds(1),
+                                   mismatched_before_grace).action == LifecycleAction::None &&
+              permissive_group.state() == LifecycleState::TerminatingGrace,
+          "permissive verifier cannot authorize a mismatched PGID before grace expiry");
+    LifecycleObservation fabricated_group;
+    fabricated_group.group = GroupObservation::Gone;
+    fabricated_group.observed_pgid = 352;
+    fabricated_group.group_domain = *permissive_verifier->capture(353, 353);
+    CHECK(permissive_group.advance(t0 + std::chrono::milliseconds(10),
+                                   fabricated_group).action == LifecycleAction::SendKill,
+          "permissive verifier cannot authorize a fabricated lease identity");
+
+    LifecycleObservation mismatched_pgid = fabricated_group;
+    mismatched_pgid.group_domain = *permissive_verifier->lease_for(352);
+    mismatched_pgid.observed_pgid = 999;
+    CHECK(permissive_group.advance(t0 + std::chrono::milliseconds(11),
+                                   mismatched_pgid).action == LifecycleAction::None,
+          "permissive verifier cannot authorize a mismatched observed PGID");
 
     // Numeric PGID/Gone is not a reusable kill-domain proof.  A zombie leader
     // or surviving helper can keep the number present, and a later group can
@@ -498,6 +591,7 @@ void test_lifecycle() {
     SidecarLifecycle legacy_lifecycle(config);
     (void)legacy_lifecycle.begin(t0);
     move_to_ready(legacy_lifecycle, 501, t0);
+    const auto legacy_ready_lease = *legacy_lifecycle.current_ready_lease();
     LifecycleObservation legacy_request;
     legacy_request.request_legacy = true;
     CHECK(legacy_lifecycle.advance(t0, legacy_request).action == LifecycleAction::Withdraw &&
@@ -510,10 +604,11 @@ void test_lifecycle() {
     LifecycleObservation legacy_gone;
     legacy_gone.group = GroupObservation::Gone;
     legacy_gone.observed_pgid = 501;
+    legacy_gone.group_domain = *verifier->lease_for(501);
     legacy_gone.path_absent = true;
     legacy_gone.observed_path = legacy_lifecycle.identity()->private_directory;
-    legacy_gone.observed_device = legacy_lifecycle.current_ready_lease()->listener_device;
-    legacy_gone.observed_inode = legacy_lifecycle.current_ready_lease()->listener_inode;
+    legacy_gone.observed_device = legacy_ready_lease.listener_device;
+    legacy_gone.observed_inode = legacy_ready_lease.listener_inode;
     remove_socket_node(*legacy_lifecycle.identity());
     (void)legacy_lifecycle.advance(t0 + std::chrono::milliseconds(10), legacy_gone);
     CHECK(legacy_lifecycle.advance(t0 + std::chrono::milliseconds(10), legacy_gone).action ==
