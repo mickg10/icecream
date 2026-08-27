@@ -71,7 +71,46 @@ enum class InputPublishResult {
 // never erase an unresolved C/F commit witness or permit REL_SEQ reuse.
 class InputRecordStore {
 public:
+    // Move-only, prevalidated publication authority. Exact-byte digesting,
+    // immutable backing allocation, and unordered-map node allocation are
+    // complete before this object reaches the store owner. It exposes no
+    // mutation or publication operation; only InputRecordStore can consume
+    // its preallocated node at the durability linearization point.
+    class PreparedPublish {
+    public:
+        PreparedPublish() noexcept;
+        ~PreparedPublish();
+        PreparedPublish(PreparedPublish&&) noexcept;
+        PreparedPublish& operator=(PreparedPublish&&) noexcept;
+        PreparedPublish(const PreparedPublish&) = delete;
+        PreparedPublish& operator=(const PreparedPublish&) = delete;
+
+        [[nodiscard]] bool valid() const noexcept;
+        [[nodiscard]] InputRecordKey key() const;
+        [[nodiscard]] std::span<const uint8_t> exact_input() const;
+
+    private:
+        friend class InputRecordStore;
+        struct State;
+        explicit PreparedPublish(std::unique_ptr<State> state) noexcept;
+        std::unique_ptr<State> state_;
+    };
+
     InputRecordStore(size_t max_records, uint64_t max_retained_bytes);
+
+    [[nodiscard]] static PreparedPublish prepare_publish(
+        CStoreGuid c_store_guid, const TxBegin& begin,
+        const TxCommit& commit, std::vector<uint8_t> exact_input);
+
+    // Allocation-free owner transition for an open logical job. The map's
+    // bucket arena was reserved at store construction, and the node was
+    // allocated by prepare_publish().
+    InputPublishResult commit_prepared(PreparedPublish prepared);
+
+    // Closed-job counterpart: validate against a retained exact record if one
+    // exists, otherwise consume and discard the prepared node without
+    // recreating compiler-visible authority.
+    InputPublishResult observe_closed_job_commit(PreparedPublish prepared);
 
     // For an open logical job, call this before making the corresponding route
     // commit/TX_COMMIT visible. Failure leaves this store unchanged. An exact
@@ -146,6 +185,8 @@ private:
         std::shared_ptr<const std::vector<uint8_t>> backing;
         bool logical_job_open = true;
     };
+    using Records =
+        std::unordered_map<InputRecordKey, Entry, InputRecordKeyHash>;
 
     static void validate_commit(const TxBegin& begin,
                                 const TxCommit& commit,
@@ -158,7 +199,7 @@ private:
     size_t max_records_ = 0;
     uint64_t max_retained_bytes_ = 0;
     uint64_t retained_bytes_ = 0;
-    std::unordered_map<InputRecordKey, Entry, InputRecordKeyHash> records_;
+    Records records_;
 };
 
 }  // namespace icecc::p50

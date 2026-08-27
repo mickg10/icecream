@@ -2,15 +2,55 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <new>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
+
+namespace allocation_probe {
+
+bool enabled = false;
+size_t count = 0;
+
+}  // namespace allocation_probe
+
+void* operator new(std::size_t size) {
+    void* allocation = std::malloc(size == 0 ? 1 : size);
+    if (!allocation) throw std::bad_alloc();
+    if (allocation_probe::enabled) ++allocation_probe::count;
+    return allocation;
+}
+
+void* operator new[](std::size_t size) {
+    void* allocation = std::malloc(size == 0 ? 1 : size);
+    if (!allocation) throw std::bad_alloc();
+    if (allocation_probe::enabled) ++allocation_probe::count;
+    return allocation;
+}
+
+void operator delete(void* allocation) noexcept {
+    std::free(allocation);
+}
+
+void operator delete[](void* allocation) noexcept {
+    std::free(allocation);
+}
+
+void operator delete(void* allocation, std::size_t) noexcept {
+    std::free(allocation);
+}
+
+void operator delete[](void* allocation, std::size_t) noexcept {
+    std::free(allocation);
+}
 
 namespace {
 
@@ -93,6 +133,138 @@ std::vector<uint8_t> drain(InputCursor& cursor, size_t chunk_size = 31) {
     }
     require(cursor.read(chunk) == 0, "EOF InputCursor produced more bytes");
     return result;
+}
+
+InputPublishResult commit_without_allocations(
+    InputRecordStore& store,
+    InputRecordStore::PreparedPublish prepared) {
+    const size_t before = allocation_probe::count;
+    allocation_probe::enabled = true;
+    try {
+        const InputPublishResult result =
+            store.commit_prepared(std::move(prepared));
+        allocation_probe::enabled = false;
+        require(allocation_probe::count == before,
+                "prepared InputRecord commit allocated at linearization");
+        return result;
+    } catch (...) {
+        allocation_probe::enabled = false;
+        throw;
+    }
+}
+
+void test_prepared_publish_is_exact_one_shot_and_allocation_free() {
+    static_assert(!std::is_copy_constructible_v<
+                  InputRecordStore::PreparedPublish>);
+    static_assert(!std::is_copy_assignable_v<
+                  InputRecordStore::PreparedPublish>);
+    static_assert(std::is_nothrow_move_constructible_v<
+                  InputRecordStore::PreparedPublish>);
+    static_assert(std::is_nothrow_move_assignable_v<
+                  InputRecordStore::PreparedPublish>);
+
+    const CStoreGuid c_guid = Id128::from_u64(70);
+    const std::vector<uint8_t> input = bytes(32 * 1024, 19);
+    const ExactTransaction tx = transaction_for(TuSeq{71}, input);
+    const InputRecordKey key{c_guid, tx.begin.tu_seq};
+    InputRecordStore store(2, 1U << 20);
+
+    InputRecordStore::PreparedPublish prepared =
+        InputRecordStore::prepare_publish(c_guid, tx.begin, tx.commit,
+                                          std::vector<uint8_t>(input));
+    require(prepared.valid() && prepared.key() == key &&
+                std::equal(prepared.exact_input().begin(),
+                           prepared.exact_input().end(), input.begin()),
+            "prepared InputRecord lost its exact identity or bytes");
+
+    InputRecordStore::PreparedPublish moved = std::move(prepared);
+    require(!prepared.valid() && moved.valid(),
+            "prepared InputRecord move duplicated authority");
+    require(commit_without_allocations(store, std::move(moved)) ==
+                InputPublishResult::Published,
+            "prepared InputRecord was not published");
+    require(!moved.valid() && store.contains(key) &&
+                store.retained_bytes() == input.size(),
+            "prepared InputRecord commit did not consume one-shot authority");
+    require_throws<std::invalid_argument>(
+        [&] { (void)store.commit_prepared(std::move(moved)); },
+        "consumed prepared InputRecord was accepted twice");
+
+    InputRecordStore::PreparedPublish duplicate =
+        InputRecordStore::prepare_publish(c_guid, tx.begin, tx.commit,
+                                          std::vector<uint8_t>(input));
+    require(commit_without_allocations(store, std::move(duplicate)) ==
+                InputPublishResult::Existing,
+            "exact prepared duplicate was not idempotent");
+    require(!duplicate.valid() && store.record_count() == 1 &&
+                store.retained_bytes() == input.size(),
+            "prepared duplicate changed retained-input accounting");
+}
+
+void test_prepared_capacity_failure_is_transactional() {
+    const CStoreGuid c_guid = Id128::from_u64(80);
+    const std::vector<uint8_t> first = bytes(1024, 23);
+    const std::vector<uint8_t> second = bytes(2048, 29);
+    const ExactTransaction first_tx = transaction_for(TuSeq{81}, first);
+    const ExactTransaction second_tx =
+        transaction_for(TuSeq{82}, second, RelSeq{1});
+    InputRecordStore store(1, 1U << 20);
+    (void)store.publish(c_guid, first_tx.begin, first_tx.commit, first);
+
+    InputRecordStore::PreparedPublish prepared =
+        InputRecordStore::prepare_publish(c_guid, second_tx.begin,
+                                          second_tx.commit,
+                                          std::vector<uint8_t>(second));
+    require_throws<std::length_error>(
+        [&] { (void)store.commit_prepared(std::move(prepared)); },
+        "prepared InputRecord bypassed the record cap");
+    require(!prepared.valid() && store.record_count() == 1 &&
+                store.retained_bytes() == first.size() &&
+                !store.contains({c_guid, second_tx.begin.tu_seq}),
+            "prepared record-cap failure partially changed the store");
+}
+
+void test_prepared_closed_job_observation_never_reopens() {
+    const CStoreGuid c_guid = Id128::from_u64(90);
+    const std::vector<uint8_t> input = bytes(4096, 31);
+    const ExactTransaction tx = transaction_for(TuSeq{91}, input);
+    const InputRecordKey key{c_guid, tx.begin.tu_seq};
+
+    {
+        InputRecordStore store(2, 1U << 20);
+        InputRecordStore::PreparedPublish prepared =
+            InputRecordStore::prepare_publish(c_guid, tx.begin, tx.commit,
+                                              std::vector<uint8_t>(input));
+        require(store.observe_closed_job_commit(std::move(prepared)) ==
+                    InputPublishResult::NotRetainedJobClosed,
+                "closed job retained a previously unpublished prepared input");
+        require(!prepared.valid() && store.record_count() == 0 &&
+                    store.retained_bytes() == 0,
+                "closed-job prepared discard recreated input authority");
+    }
+
+    {
+        InputRecordStore store(2, 1U << 20);
+        (void)store.publish(c_guid, tx.begin, tx.commit, input);
+        InputCursor authorized = store.attach(key);
+        InputRecordStore::PreparedPublish prepared =
+            InputRecordStore::prepare_publish(c_guid, tx.begin, tx.commit,
+                                              std::vector<uint8_t>(input));
+        require(store.observe_closed_job_commit(std::move(prepared)) ==
+                    InputPublishResult::Existing,
+                "closed-job observation did not match retained exact input");
+        require(!prepared.valid() && !store.job_open(key),
+                "closed-job prepared observation left attachment open");
+        require_throws<std::logic_error>(
+            [&] { (void)store.attach(key); },
+            "closed-job prepared observation allowed a new attachment");
+        require(drain(authorized) == input,
+                "closed-job observation invalidated an authorized cursor");
+        authorized = InputCursor{};
+        store.collect_garbage();
+        require(store.record_count() == 0 && store.retained_bytes() == 0,
+                "closed prepared record was not reclaimed");
+    }
 }
 
 void test_publish_and_independent_restart_cursors() {
@@ -344,6 +516,9 @@ void test_empty_input() {
 }  // namespace
 
 int main() {
+    test_prepared_publish_is_exact_one_shot_and_allocation_free();
+    test_prepared_capacity_failure_is_transactional();
+    test_prepared_closed_job_observation_never_reopens();
     test_publish_and_independent_restart_cursors();
     test_duplicate_and_conflicting_publication();
     test_commit_and_input_validation();

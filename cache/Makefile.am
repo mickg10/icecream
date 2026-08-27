@@ -6,7 +6,8 @@ noinst_LIBRARIES = libprotocol50.a libp50endpoint.a libp50localtransport.a \
 sbin_PROGRAMS = icecc-cache-service
 
 icecc_cache_service_SOURCES = p50_cache_service.cpp p50_cache_service.h
-icecc_cache_service_LDADD = libp50endpoint.a libp50inputfd.a \
+icecc_cache_service_LDADD = libp50endpoint.a libp50adoptedoutcomewriter.a \
+	libp50inputfd.a \
 	libp50inputlifecycle.a libprotocol50.a \
 	libp50localtransport.a ../services/libicecc.la \
 	$(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
@@ -40,7 +41,8 @@ libprotocol50_a_SOURCES = \
 	p50_incarnation_identity.h
 
 AM_CPPFLAGS = -I$(top_srcdir) $(LIBZSTD_CFLAGS)
-libp50endpoint_a_SOURCES = p50_endpoint.cpp p50_endpoint.h
+libp50endpoint_a_SOURCES = p50_endpoint.cpp p50_endpoint.h \
+	p50_endpoint_run_cancel.cpp p50_endpoint_run_cancel.h
 libp50endpoint_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 
 libp50localtransport_a_SOURCES = p50_local_transport.cpp p50_local_transport.h \
@@ -64,7 +66,8 @@ libp50sessionjoin_a_SOURCES = p50_cache_session_join.cpp \
 	p50_cache_session_join.h
 libp50sessionjoin_a_CPPFLAGS = $(AM_CPPFLAGS)
 libp50adoptedoutcomewriter_a_SOURCES = p50_adopted_outcome_writer.cpp \
-	p50_adopted_outcome_writer.h
+	p50_adopted_outcome_writer.h p50_adopted_socket_lease.cpp \
+	p50_adopted_socket_lease.h
 libp50adoptedoutcomewriter_a_CPPFLAGS = $(AM_CPPFLAGS)
 
 EXTRA_DIST = \

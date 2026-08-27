@@ -145,8 +145,8 @@ private:
         std::promise<EndpointOwnerResult> completion, int completion_wake_fd);
     void endpoint_owner_loop() noexcept;
 
-    void cancel_active_socket() noexcept;
-    void release_active_socket() noexcept;
+    void cancel_endpoint_run() noexcept;
+    void release_endpoint_run() noexcept;
     void cancel_active_control() noexcept;
     void close_active_control() noexcept;
 
@@ -160,7 +160,6 @@ private:
     std::atomic_flag busy_ = ATOMIC_FLAG_INIT;
     std::atomic<bool> stop_requested_{false};
     std::atomic<size_t> live_sessions_{0};
-    std::atomic<int> active_cancel_fd_{-1};
     std::atomic<int> active_control_cancel_fd_{-1};
 };
 

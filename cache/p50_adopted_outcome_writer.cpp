@@ -68,7 +68,7 @@ void P5coEndpointHandoff::fence_owned() noexcept {
 }
 
 std::unique_ptr<P5coAdoptedSocketLease>
-P5coEndpointHandoff::take_lease() noexcept {
+P5coEndpointHandoff::take_lease_for_endpoint() noexcept {
     return std::move(lease_);
 }
 

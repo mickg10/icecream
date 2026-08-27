@@ -1007,22 +1007,8 @@ boost::asio::awaitable<void> SidecarRuntime::run_endpoint_on_owner(
             co_return;
         }
 
-        const int cancel_fd = ::dup(socket->native_handle());
-        if (cancel_fd < 0) {
-            owner_result.status = RuntimeStatus::AdoptionFailed;
-            completion.set_value(std::move(owner_result));
-            co_return;
-        }
-        const int cancel_flags = ::fcntl(cancel_fd, F_GETFD);
-        if (cancel_flags < 0 || ::fcntl(cancel_fd, F_SETFD, cancel_flags | FD_CLOEXEC) < 0) {
-            (void)::close(cancel_fd);
-            owner_result.status = RuntimeStatus::AdoptionFailed;
-            completion.set_value(std::move(owner_result));
-            co_return;
-        }
-        active_cancel_fd_.store(cancel_fd, std::memory_order_release);
         if (stop_requested_.load(std::memory_order_acquire)) {
-            cancel_active_socket();
+            cancel_endpoint_run();
             owner_result.status = RuntimeStatus::Stopped;
             completion.set_value(std::move(owner_result));
             co_return;
@@ -1054,7 +1040,7 @@ boost::asio::awaitable<void> SidecarRuntime::run_endpoint_on_owner(
                 throw std::logic_error(
                     "completed input route could not settle lifecycle ownership");
         }
-        release_active_socket();
+        release_endpoint_run();
         live_sessions_.store(endpoint_->live_session_count(), std::memory_order_release);
         owner_result.endpoint = endpoint_result;
         owner_result.status = stop_requested_.load(std::memory_order_acquire)
@@ -1066,7 +1052,7 @@ boost::asio::awaitable<void> SidecarRuntime::run_endpoint_on_owner(
     } catch (...) {
         if (owned_fd >= 0)
             (void)::close(owned_fd);
-        release_active_socket();
+        release_endpoint_run();
         try {
             live_sessions_.store(endpoint_->live_session_count(), std::memory_order_release);
         } catch (...) {
@@ -1201,7 +1187,7 @@ RuntimeResult SidecarRuntime::run_one(
             const auto now = std::chrono::steady_clock::now();
             quiescence_deadline = std::min(
                 deadline, now + config_.cancellation_grace);
-            cancel_active_socket();
+            cancel_endpoint_run();
         }
     };
     const auto fail_stop = [&]() noexcept {
@@ -1521,32 +1507,23 @@ void SidecarRuntime::close_active_control() noexcept {
         (void)::close(fd);
 }
 
-void SidecarRuntime::cancel_active_socket() noexcept {
-    const int fd = active_cancel_fd_.exchange(-1, std::memory_order_acq_rel);
-    if (fd >= 0) {
-        (void)::shutdown(fd, SHUT_RDWR);
-        (void)::close(fd);
-    }
-    // A duplicate descriptor does not reliably wake every platform's Asio
-    // reactor.  Post the actual socket cancellation onto its owner context;
-    // this is normal-thread work and therefore remains outside the signal
-    // handler while preserving endpoint thread affinity.
+void SidecarRuntime::cancel_endpoint_run() noexcept {
+    // Cancellation runs on the endpoint owner.  The standalone lineage does
+    // not yet have daemon OP_CANCEL wiring, so this compatibility seam keeps
+    // the owner-affine wakeup while the typed registry is integrated.
     try {
-        context_.post([this] { endpoint_->cancel_active_io(); });
+        context_.post([this] { endpoint_->request_cancel_for_test(); });
     } catch (...) {
     }
 }
 
-void SidecarRuntime::release_active_socket() noexcept {
-    const int fd = active_cancel_fd_.exchange(-1, std::memory_order_acq_rel);
-    if (fd >= 0)
-        (void)::close(fd);
+void SidecarRuntime::release_endpoint_run() noexcept {
 }
 
 void SidecarRuntime::stop() noexcept {
     stop_requested_.store(true, std::memory_order_release);
     cancel_active_control();
-    cancel_active_socket();
+    cancel_endpoint_run();
 }
 
 size_t SidecarRuntime::live_session_count() const {

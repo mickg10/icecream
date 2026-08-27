@@ -3,7 +3,10 @@
 #include "p50_actions.h"
 #include "p50_input_record.h"
 #include "p50_profile.h"
+#include "p50_sidecar_supervisor.h"
 #include "p50_zstd.h"
+#include "p50_endpoint_run_cancel.h"
+#include "services/p50_cache_session_wire.h"
 
 #include <utility>
 
@@ -23,6 +26,10 @@
 #include <vector>
 
 namespace icecc::p50 {
+
+namespace sidecar {
+class P5coEndpointHandoff;
+}
 
 struct EndpointCaps {
     SessionLimits wire{};
@@ -46,6 +53,8 @@ struct CompletionStamp {
     AsyncOperationKind operation = AsyncOperationKind::Connect;
     CStoreGuid c_store_guid{};
     FStoreGuid f_store_guid{};
+    std::optional<daemon::P50FSessionOperationId> cache_session_operation;
+    std::optional<sidecar::AbsoluteMonotonicDeadline> absolute_deadline;
     uint64_t session_serial = 0;
     HistoryNonce history_nonce{};
     RelSeq rel_seq{};
@@ -63,6 +72,8 @@ struct CompletionLiveIdentity {
     ActorSide actor = ActorSide::C;
     CStoreGuid c_store_guid{};
     FStoreGuid f_store_guid{};
+    std::optional<daemon::P50FSessionOperationId> cache_session_operation;
+    std::optional<sidecar::AbsoluteMonotonicDeadline> absolute_deadline;
     uint64_t session_serial = 0;
     HistoryNonce history_nonce{};
     RelSeq rel_seq{};
@@ -138,6 +149,11 @@ struct EndpointIoControl {
     // product callers leave it unset.  This lets the deletion gate prove the
     // narrow no-remote-transmission cancellation outcome deterministically.
     std::function<void()> before_first_remote_write;
+    // Test-only worker hook.  It executes after the immutable complete-BODY
+    // materialization job leaves the endpoint owner and before codec work.
+    // Product callers leave it unset; it proves the owner timer cannot be
+    // starved by a blocked codec worker.
+    std::function<void()> before_materialize_on_worker;
 };
 
 struct PrepareRequestKey {
@@ -232,10 +248,20 @@ enum class ClientCancellationDisposition : uint8_t {
     ReconcileRequired,
 };
 
+// A local endpoint observation never proves durability.  Only the owning
+// FSession operation may later settle this observation as committed or
+// pre-durable-aborted.
+enum class ClientRunSettlement : uint8_t {
+    Unresolved,
+    CommittedInput,
+    AbortedPreDurable,
+    ReconcileRequired,
+};
+
 struct ClientRunResult {
     ClientRunStatus status = ClientRunStatus::Disconnected;
     EndpointReconnectOutcome reconnect = EndpointReconnectOutcome::ExactMatch;
-    bool whole_new_attempt = false;
+    ClientRunSettlement settlement = ClientRunSettlement::Unresolved;
     ClientCancellationDisposition cancellation =
         ClientCancellationDisposition::None;
     // These witnesses are populated only after the endpoint has accepted the
@@ -250,6 +276,7 @@ enum class ServerRunStatus : uint8_t {
     Completed,
     Disconnected,
     TerminalError,
+    DeadlineExceeded,
 };
 
 struct ServerRunResult {
@@ -352,7 +379,9 @@ public:
     // this method onto the endpoint's owner executor.  It never resets route
     // state or authorizes fallback: run() reports whether the operation was
     // proved pre-durable or instead requires exact reconciliation.
-    void cancel_active_io() noexcept;
+    // Temporary compatibility seam for the standalone lineage. Production
+    // callers use EndpointRunRegistry::request_cancel(EndpointCancelPermit).
+    void request_cancel_for_test() noexcept;
 
     [[nodiscard]] CStoreGuid c_store_guid() const;
     [[nodiscard]] std::optional<FStoreGuid> f_store_guid() const;
@@ -396,10 +425,19 @@ public:
     boost::asio::awaitable<ServerRunResult> run_adopted(
         boost::asio::ip::tcp::socket socket, EndpointIoControl control = {});
 
+    // Consumes the complete post-P5CO authority bundle.  The retained socket
+    // descriptor is endpoint-private and cannot be detached independently of
+    // the exact adopted outcome and original absolute deadline.
+    boost::asio::awaitable<ServerRunResult> run_adopted(
+        sidecar::P5coEndpointHandoff handoff,
+        EndpointIoControl control = {});
+
     // Cancels the active socket on the endpoint's owner executor. The caller
     // must arrange that affinity (SidecarRuntime posts this method); it never
     // changes listener or store ownership and is a no-op between dialogues.
-    void cancel_active_io() noexcept;
+    // Temporary compatibility seam for the standalone lineage. Production
+    // callers use EndpointRunRegistry::request_cancel(EndpointCancelPermit).
+    void request_cancel_for_test() noexcept;
 
     void reset_store(FStoreGuid new_guid);
     [[nodiscard]] InputCursor attach_input(InputRecordKey key) const;
@@ -418,7 +456,9 @@ private:
 
     boost::asio::awaitable<ServerRunResult> run_connected(
         boost::asio::ip::tcp::socket socket, SessionRegistration registration,
-        EndpointIoControl control, boost::asio::ip::tcp::acceptor* acceptor);
+        EndpointIoControl control, boost::asio::ip::tcp::acceptor* acceptor,
+        std::optional<sidecar::AbsoluteMonotonicDeadline> deadline,
+        std::optional<CStoreGuid> expected_c_store_guid);
 
     struct Impl;
     std::unique_ptr<Impl> impl_;

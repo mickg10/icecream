@@ -266,7 +266,7 @@ the selected protocol, complete negotiated profile mask, both negotiated limits,
 namespace/route presence, nonce, REL_SEQ, state digest, and absent last commit.
 
 A peer `ERROR` or a definitive client-side dialogue failure returns the one bounded
-`ClientRunResult::TerminalError` form and sets `whole_new_attempt`. It does not erase queued or
+`ClientRunResult::TerminalError` form and leaves its settlement unresolved. It does not erase queued or
 active Protocol-50 reconciliation identity. Sending the bounded diagnostic to the peer is best
 effort and cannot relabel an already-known terminal result as an uncertain disconnect. An
 uncertain disconnect instead returns `Disconnected` and remains eligible for exact

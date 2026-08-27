@@ -1,4 +1,6 @@
 #include "cache/p50_endpoint.h"
+#include "cache/p50_adopted_outcome_writer.h"
+#include "cache/p50_adopted_socket_lease.h"
 
 #include <zstd.h>
 
@@ -16,19 +18,27 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
+#include <dirent.h>
 #include <fcntl.h>
 #include <future>
 #include <iostream>
+#include <limits>
+#include <memory>
+#include <mutex>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <time.h>
 #include <thread>
 #include <tuple>
 #include <unistd.h>
@@ -64,6 +74,288 @@ void require_throws(Function&& function, std::string_view detail) {
 }
 
 std::vector<uint8_t> bytes(std::string_view text) { return {text.begin(), text.end()}; }
+
+struct P5coStoreGuids {
+    CStoreGuid c;
+    FStoreGuid f;
+};
+
+P5coStoreGuids p5co_store_guids(uint8_t seed) {
+    std::array<uint8_t, 16> client{};
+    std::array<uint8_t, 16> file{};
+    for (size_t index = 0; index != client.size(); ++index) {
+        client[index] = static_cast<uint8_t>(seed + index);
+        file[index] = static_cast<uint8_t>(seed + 41 + index);
+    }
+    client[kStoreIdentityRoleByte] &=
+        static_cast<uint8_t>(~kStoreIdentityRoleMask);
+    file[kStoreIdentityRoleByte] |= kStoreIdentityRoleMask;
+    require(store_identity_guid_valid_for_role(client,
+                                               kStoreIdentityClientRole) &&
+                store_identity_guid_valid_for_role(file,
+                                                   kStoreIdentityFileRole) &&
+                !store_identity_file_guid_matches_client(client, file),
+            "P5CO test StoreGuid identities are invalid or aliased");
+    return {CStoreGuid{client}, FStoreGuid{file}};
+}
+
+ClaimAttemptCapability128 p5co_attempt_capability(uint8_t seed) {
+    ClaimAttemptCapability128 result;
+    for (size_t index = 0; index != result.bytes.size(); ++index)
+        result.bytes[index] = static_cast<uint8_t>(seed + index);
+    require(result.valid(), "P5CO test capability is invalid");
+    return result;
+}
+
+daemon::P50CacheSessionOutcome p5co_adopted_outcome(
+    const P5coStoreGuids& guids, uint64_t operation_sequence) {
+    daemon::P50CacheSessionWireClaim claim;
+    auto& arm = claim.binding.arm;
+    arm.wire_job_id = 1701;
+    arm.assignment_epoch = 1801;
+    arm.assignment_nonce = 1901;
+    arm.selected_f_host = "f.p50-endpoint.test";
+    arm.selected_f_ordinary_port = 10250;
+    arm.selected_f_cache_port = 10251;
+    arm.cache_protocol = CACHE_WIRE_PROTOCOL_V1;
+    arm.cache_profile = CACHE_PROFILE_ZSTD_TU;
+    arm.logical_job = 2001;
+    arm.compiler_attempt = 2101;
+    arm.c_store_generation = 2201;
+    arm.c_store_derivation_version = kStoreIdentityDerivationVersion;
+    arm.c_store_guid = guids.c.bytes;
+    arm.source_request_id = 2301;
+    arm.source_mode = P50_SOURCE_MODE_ZSTD_TU;
+    arm.c_control_generation = 2401;
+    arm.c_control_attempt = 2501;
+    claim.binding.f_control_generation = 3101;
+    claim.binding.f_control_attempt = 3201;
+    claim.binding.f_store_generation = 3301;
+    claim.binding.f_store_guid = guids.f.bytes;
+    claim.binding.f_store_derivation_version =
+        kStoreIdentityDerivationVersion;
+    claim.binding.arm_observation_id = 3401;
+    claim.binding.source_budget_msec = 5000;
+    claim.attempt = {1, p5co_attempt_capability(51)};
+    require(claim.valid(), "P5CO endpoint claim is invalid");
+
+    daemon::P50CacheSessionOutcome outcome;
+    outcome.kind = daemon::P50CacheSessionOutcomeKind::Adopted;
+    outcome.canonical_claim = daemon::encode_cache_session_wire_claim(claim);
+    outcome.f_sidecar_launch = claim.binding.f_control_identity();
+    outcome.f_store_guid = claim.binding.f_store_guid;
+    outcome.operation = {outcome.f_sidecar_launch,
+                         daemon::P50SessionOperationRole::FSession,
+                         operation_sequence};
+    require(outcome.valid(), "P5CO endpoint outcome is invalid");
+    return outcome;
+}
+
+sidecar::AbsoluteMonotonicDeadline p5co_deadline_after(
+    std::chrono::nanoseconds duration) {
+    sidecar::SystemMonotonicObservationSource observations;
+    const std::optional<sidecar::MonotonicObservation> observed =
+        observations.observe();
+    require(observed.has_value() && observed->valid() && duration.count() > 0,
+            "CLOCK_MONOTONIC endpoint deadline setup failed");
+    require(observed->now_ns <=
+                std::numeric_limits<int64_t>::max() - duration.count(),
+            "CLOCK_MONOTONIC endpoint deadline overflowed");
+    return {observed->now_ns + duration.count(),
+            observed->clock.clock_domain_id,
+            observed->clock.time_namespace_id};
+}
+
+class FixedMonotonicObservations final
+    : public sidecar::MonotonicObservationSource {
+public:
+    explicit FixedMonotonicObservations(
+        sidecar::MonotonicObservation observation)
+        : observation_(observation) {}
+
+    std::optional<sidecar::MonotonicObservation> observe() noexcept override {
+        return observation_;
+    }
+
+private:
+    sidecar::MonotonicObservation observation_;
+};
+
+struct EndpointFenceProbe {
+    size_t revalidations = 0;
+    size_t releases = 0;
+    size_t fences = 0;
+    size_t successful_revalidations =
+        std::numeric_limits<size_t>::max();
+    int release_fd = -1;
+    bool fenced = false;
+};
+
+class EndpointFenceLease final : public sidecar::P5coAdoptedSocketLease {
+public:
+    EndpointFenceLease(
+        daemon::P50CacheSessionOutcome outcome,
+        sidecar::AbsoluteMonotonicDeadline deadline,
+        std::shared_ptr<EndpointFenceProbe> probe)
+        : outcome_(std::move(outcome)), deadline_(deadline),
+          probe_(std::move(probe)) {}
+
+    bool revalidate(
+        const daemon::P50CacheSessionOutcome& outcome,
+        const sidecar::AbsoluteMonotonicDeadline& deadline) const noexcept override {
+        ++probe_->revalidations;
+        return !probe_->fenced && outcome == outcome_ && deadline == deadline_ &&
+               probe_->revalidations <= probe_->successful_revalidations;
+    }
+
+    sidecar::P5coWriteResult send_nonblocking(
+        std::span<const uint8_t> bytes, uint8_t flags) noexcept override {
+        const uint8_t required =
+            sidecar::P5coSendFlag::DontWait |
+            sidecar::P5coSendFlag::NoSignal;
+        if (bytes.empty() || flags != required || probe_->fenced)
+            return {sidecar::P5coWriteKind::Error, 0};
+        return {sidecar::P5coWriteKind::Sent, bytes.size()};
+    }
+
+    void fence() noexcept override {
+        if (probe_->fenced)
+            return;
+        probe_->fenced = true;
+        ++probe_->fences;
+        if (probe_->release_fd >= 0) {
+            (void)::close(probe_->release_fd);
+            probe_->release_fd = -1;
+        }
+    }
+
+private:
+    int release_native_fd_for_endpoint(
+        const daemon::P50CacheSessionOutcome& outcome,
+        const sidecar::AbsoluteMonotonicDeadline& deadline) noexcept override {
+        if (probe_->fenced || outcome != outcome_ || deadline != deadline_)
+            return -1;
+        ++probe_->releases;
+        return std::exchange(probe_->release_fd, -1);
+    }
+
+    daemon::P50CacheSessionOutcome outcome_;
+    sidecar::AbsoluteMonotonicDeadline deadline_;
+    std::shared_ptr<EndpointFenceProbe> probe_;
+};
+
+void set_cloexec_or_fail(int fd, std::string_view detail) {
+    const int flags = ::fcntl(fd, F_GETFD);
+    require(flags >= 0 && ::fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0,
+            detail);
+}
+
+struct P5coTcpPair {
+    P5coTcpPair() {
+        const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+        require(listener >= 0, "P5CO TCP listener creation failed");
+        set_cloexec_or_fail(listener, "P5CO TCP listener CLOEXEC failed");
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = 0;
+        require(::bind(listener, reinterpret_cast<const sockaddr*>(&address),
+                       sizeof(address)) == 0 &&
+                    ::listen(listener, 1) == 0,
+                "P5CO TCP listener setup failed");
+        socklen_t address_size = sizeof(address);
+        require(::getsockname(listener, reinterpret_cast<sockaddr*>(&address),
+                              &address_size) == 0,
+                "P5CO TCP listener address failed");
+
+        client = ::socket(AF_INET, SOCK_STREAM, 0);
+        require(client >= 0, "P5CO TCP client creation failed");
+        set_cloexec_or_fail(client, "P5CO TCP client CLOEXEC failed");
+        require(::connect(client, reinterpret_cast<const sockaddr*>(&address),
+                          sizeof(address)) == 0,
+                "P5CO TCP client connect failed");
+        server = ::accept(listener, nullptr, nullptr);
+        const int accept_error = errno;
+        (void)::close(listener);
+        errno = accept_error;
+        require(server >= 0, "P5CO TCP accept failed");
+        set_cloexec_or_fail(server, "P5CO TCP accepted descriptor CLOEXEC failed");
+    }
+
+    ~P5coTcpPair() {
+        if (server >= 0)
+            (void)::close(server);
+        if (client >= 0)
+            (void)::close(client);
+    }
+
+    P5coTcpPair(const P5coTcpPair&) = delete;
+    P5coTcpPair& operator=(const P5coTcpPair&) = delete;
+
+    int take_server() noexcept { return std::exchange(server, -1); }
+    int take_client() noexcept { return std::exchange(client, -1); }
+
+    int server = -1;
+    int client = -1;
+};
+
+void receive_exact_native(int fd, std::span<uint8_t> output) {
+    size_t offset = 0;
+    while (offset != output.size()) {
+        const ssize_t count =
+            ::recv(fd, output.data() + offset, output.size() - offset, 0);
+        if (count < 0 && errno == EINTR)
+            continue;
+        require(count > 0, "P5CO peer did not receive the complete outcome");
+        offset += static_cast<size_t>(count);
+    }
+}
+
+sidecar::P5coEndpointHandoff flush_p5co_for_endpoint_with_observations(
+    int server_fd, int client_fd,
+    const daemon::P50CacheSessionOutcome& outcome,
+    const sidecar::AbsoluteMonotonicDeadline& deadline,
+    std::unique_ptr<sidecar::MonotonicObservationSource> observations) {
+    auto lease = std::make_unique<sidecar::P5coRetainedSocketLease>(
+        local::HandoffFd(server_fd), outcome, deadline);
+    sidecar::AdoptedOutcomeWriter writer(
+        std::move(lease), outcome, std::move(observations), deadline);
+    const std::vector<uint8_t> expected(writer.canonical_frame().begin(),
+                                        writer.canonical_frame().end());
+    require(!expected.empty(), "P5CO endpoint writer encoded no outcome");
+    for (size_t turn = 0;
+         turn != 8 && writer.state() != sidecar::P5coWriterState::FullyFlushed;
+         ++turn) {
+        const sidecar::P5coWriterState state = writer.advance(POLLOUT);
+        require(state == sidecar::P5coWriterState::Writing ||
+                    state == sidecar::P5coWriterState::FullyFlushed,
+                "P5CO endpoint writer did not make bounded progress");
+    }
+    require(writer.state() == sidecar::P5coWriterState::FullyFlushed,
+            "P5CO endpoint writer did not fully flush");
+    std::vector<uint8_t> observed(expected.size());
+    receive_exact_native(client_fd, observed);
+    require(observed == expected,
+            "P5CO peer observed bytes other than the canonical outcome");
+    const std::optional<daemon::P50CacheSessionOutcome> decoded =
+        daemon::decode_cache_session_outcome(observed);
+    require(decoded.has_value() && *decoded == outcome,
+            "P5CO peer did not decode the exact adopted outcome");
+    std::optional<sidecar::P5coEndpointHandoff> handoff =
+        writer.take_for_endpoint();
+    require(handoff.has_value() && handoff->valid(),
+            "fully flushed P5CO did not yield an endpoint handoff");
+    return std::move(*handoff);
+}
+
+sidecar::P5coEndpointHandoff flush_p5co_for_endpoint(
+    int server_fd, int client_fd,
+    const daemon::P50CacheSessionOutcome& outcome,
+    const sidecar::AbsoluteMonotonicDeadline& deadline) {
+    return flush_p5co_for_endpoint_with_observations(
+        server_fd, client_fd, outcome, deadline,
+        std::make_unique<sidecar::SystemMonotonicObservationSource>());
+}
 
 struct TestClient {
     explicit TestClient(CStoreGuid c_store_guid, EndpointCaps caps = {},
@@ -224,6 +516,925 @@ void require_closed_fd(int fd, std::string_view detail) {
     require(fd >= 0 && ::fcntl(fd, F_GETFD) < 0 && errno == EBADF, detail);
 }
 
+size_t open_fd_count() {
+    DIR* directory = ::opendir("/proc/self/fd");
+    require(directory != nullptr, "could not open /proc/self/fd");
+    size_t count = 0;
+    while (const dirent* entry = ::readdir(directory)) {
+        if (std::string_view(entry->d_name) != "." &&
+            std::string_view(entry->d_name) != "..")
+            ++count;
+    }
+    require(::closedir(directory) == 0, "could not close /proc/self/fd");
+    return count;
+}
+
+void test_complete_p5co_endpoint_handoff() {
+    const P5coStoreGuids guids = p5co_store_guids(71);
+    const daemon::P50CacheSessionOutcome outcome =
+        p5co_adopted_outcome(guids, 9101);
+    const sidecar::AbsoluteMonotonicDeadline deadline =
+        p5co_deadline_after(std::chrono::seconds(5));
+    CompletionLog completions;
+    P50ServerEndpoint server(guids.f, {}, &completions);
+    TestClient client(guids.c);
+    const std::vector<uint8_t> input = pseudo_random_bytes(32 * 1024);
+    const PreparedTuHandle prepared = admit(client, input);
+
+    P5coTcpPair pair;
+    const int owned_server_fd = pair.server;
+    const int owned_client_fd = pair.client;
+    sidecar::P5coEndpointHandoff handoff = flush_p5co_for_endpoint(
+        pair.take_server(), pair.client, outcome, deadline);
+
+    asio::io_context context;
+    boost::system::error_code adoption_error;
+    std::optional<tcp::socket> client_socket =
+        P50ClientEndpoint::adopt_connected_fd(
+            context.get_executor(), pair.take_client(), adoption_error);
+    require(client_socket.has_value() && !adoption_error,
+            "P5CO client descriptor adoption failed");
+    std::future<ServerRunResult> server_result = asio::co_spawn(
+        context, server.run_adopted(std::move(handoff)), asio::use_future);
+    std::future<ClientRunResult> client_result = asio::co_spawn(
+        context,
+        client.endpoint.run(std::move(*client_socket), prepared, {},
+                            deadline.as_steady_time_point()),
+        asio::use_future);
+    context.run();
+
+    const ClientRunResult client_value = client_result.get();
+    const ServerRunResult server_value = server_result.get();
+    require(client_value.status == ClientRunStatus::Committed &&
+                server_value.status == ServerRunStatus::Completed &&
+                server_value.c_store_guid == guids.c &&
+                server_value.committed_input.has_value() &&
+                copy_input(server, guids.c) == input &&
+                server.live_session_count() == 0,
+            "complete P5CO endpoint handoff did not commit exact input");
+    require(!completions.completions().empty() &&
+                completions.completions().front().stamp.operation ==
+                    AsyncOperationKind::ReadHeader &&
+                std::all_of(completions.completions().begin(),
+                            completions.completions().end(),
+                            [&](const AsyncCompletion& completion) {
+                                return completion.stamp.cache_session_operation ==
+                                           outcome.operation &&
+                                       completion.stamp.absolute_deadline ==
+                                           deadline;
+                            }) &&
+                std::none_of(completions.completions().begin(),
+                             completions.completions().end(),
+                             [](const AsyncCompletion& completion) {
+                                 return completion.stamp.operation ==
+                                        AsyncOperationKind::Accept;
+                             }),
+            "P5CO endpoint performed work before direct socket ownership");
+    require_closed_fd(owned_server_fd,
+                      "P5CO endpoint did not close the retained server fd");
+    require_closed_fd(owned_client_fd,
+                      "P5CO client did not close its adopted fd");
+    require(context.poll() == 0,
+            "complete P5CO endpoint run retained a timer or socket handler");
+}
+
+void test_p5co_endpoint_absolute_deadline_and_binding() {
+    {
+        const P5coStoreGuids guids = p5co_store_guids(91);
+        const daemon::P50CacheSessionOutcome outcome =
+            p5co_adopted_outcome(guids, 9201);
+        const sidecar::AbsoluteMonotonicDeadline deadline =
+            p5co_deadline_after(std::chrono::milliseconds(150));
+        CompletionLog completions;
+        P50ServerEndpoint server(guids.f, {}, &completions);
+        P5coTcpPair pair;
+        const int owned_server_fd = pair.server;
+        sidecar::P5coEndpointHandoff handoff = flush_p5co_for_endpoint(
+            pair.take_server(), pair.client, outcome, deadline);
+
+        asio::io_context context;
+        const auto started = std::chrono::steady_clock::now();
+        std::future<ServerRunResult> result = asio::co_spawn(
+            context, server.run_adopted(std::move(handoff)), asio::use_future);
+        context.run();
+        const auto elapsed = std::chrono::steady_clock::now() - started;
+        require(result.get().status == ServerRunStatus::DeadlineExceeded &&
+                    elapsed < std::chrono::seconds(2) &&
+                    server.live_session_count() == 0,
+                "P5CO stalled CacheWire read did not expire and release its slot");
+        require(!completions.completions().empty() &&
+                    completions.completions().front().stamp.operation ==
+                        AsyncOperationKind::ReadHeader,
+                "P5CO endpoint did not arm its deadline before the first read");
+        require_closed_fd(owned_server_fd,
+                          "expired P5CO endpoint retained its server fd");
+        require(context.poll() == 0,
+                "expired P5CO endpoint retained a timer or socket handler");
+    }
+
+    {
+        const P5coStoreGuids guids = p5co_store_guids(101);
+        const daemon::P50CacheSessionOutcome outcome =
+            p5co_adopted_outcome(guids, 9251);
+        sidecar::SystemMonotonicObservationSource system_observations;
+        const std::optional<sidecar::MonotonicObservation> system_now =
+            system_observations.observe();
+        require(system_now.has_value() && system_now->valid(),
+                "wrong-clock P5CO setup could not observe CLOCK_MONOTONIC");
+        uint64_t wrong_namespace =
+            system_now->clock.time_namespace_id + 1;
+        if (wrong_namespace == 0)
+            wrong_namespace = 1;
+        const sidecar::MonotonicClockIdentity wrong_clock{
+            system_now->clock.clock_domain_id, wrong_namespace};
+        const sidecar::AbsoluteMonotonicDeadline wrong_deadline{
+            system_now->now_ns + 2000000000LL,
+            wrong_clock.clock_domain_id,
+            wrong_clock.time_namespace_id};
+        P50ServerEndpoint server(guids.f);
+        P5coTcpPair pair;
+        const int owned_server_fd = pair.server;
+        sidecar::P5coEndpointHandoff handoff =
+            flush_p5co_for_endpoint_with_observations(
+                pair.take_server(), pair.client, outcome, wrong_deadline,
+                std::make_unique<FixedMonotonicObservations>(
+                    sidecar::MonotonicObservation{system_now->now_ns,
+                                                  wrong_clock}));
+
+        asio::io_context context;
+        std::future<ServerRunResult> result = asio::co_spawn(
+            context, server.run_adopted(std::move(handoff)), asio::use_future);
+        context.run();
+        require(result.get().status == ServerRunStatus::DeadlineExceeded &&
+                    server.live_session_count() == 0,
+                "P5CO endpoint accepted another CLOCK_MONOTONIC domain");
+        require_closed_fd(owned_server_fd,
+                          "wrong-clock P5CO endpoint did not fence its fd");
+        require(context.poll() == 0,
+                "wrong-clock P5CO endpoint retained a handler");
+    }
+
+    {
+        const P5coStoreGuids claim_guids = p5co_store_guids(111);
+        const P5coStoreGuids other_guids = p5co_store_guids(131);
+        const daemon::P50CacheSessionOutcome outcome =
+            p5co_adopted_outcome(claim_guids, 9301);
+        const sidecar::AbsoluteMonotonicDeadline deadline =
+            p5co_deadline_after(std::chrono::seconds(2));
+        P50ServerEndpoint wrong_server(other_guids.f);
+        P5coTcpPair pair;
+        const int owned_server_fd = pair.server;
+        sidecar::P5coEndpointHandoff handoff = flush_p5co_for_endpoint(
+            pair.take_server(), pair.client, outcome, deadline);
+
+        asio::io_context context;
+        std::future<ServerRunResult> result = asio::co_spawn(
+            context, wrong_server.run_adopted(std::move(handoff)),
+            asio::use_future);
+        context.run();
+        require(result.get().status == ServerRunStatus::Disconnected &&
+                    wrong_server.live_session_count() == 0,
+                "P5CO endpoint accepted another F-store binding");
+        require_closed_fd(owned_server_fd,
+                          "wrong-F P5CO endpoint did not fence its retained fd");
+        require(context.poll() == 0,
+                "wrong-F P5CO endpoint retained an asynchronous handler");
+    }
+
+    {
+        const P5coStoreGuids claim_guids = p5co_store_guids(151);
+        const P5coStoreGuids other_guids = p5co_store_guids(171);
+        const daemon::P50CacheSessionOutcome outcome =
+            p5co_adopted_outcome(claim_guids, 9401);
+        const sidecar::AbsoluteMonotonicDeadline deadline =
+            p5co_deadline_after(std::chrono::seconds(2));
+        P50ServerEndpoint server(claim_guids.f);
+        TestClient wrong_client(other_guids.c);
+        const PreparedTuHandle prepared =
+            admit(wrong_client, bytes("wrong claimed C identity\n"));
+        P5coTcpPair pair;
+        const int owned_server_fd = pair.server;
+        const int owned_client_fd = pair.client;
+        sidecar::P5coEndpointHandoff handoff = flush_p5co_for_endpoint(
+            pair.take_server(), pair.client, outcome, deadline);
+
+        asio::io_context context;
+        boost::system::error_code adoption_error;
+        std::optional<tcp::socket> client_socket =
+            P50ClientEndpoint::adopt_connected_fd(
+                context.get_executor(), pair.take_client(), adoption_error);
+        require(client_socket.has_value() && !adoption_error,
+                "wrong-C P5CO client descriptor adoption failed");
+        std::future<ServerRunResult> server_result = asio::co_spawn(
+            context, server.run_adopted(std::move(handoff)), asio::use_future);
+        std::future<ClientRunResult> client_result = asio::co_spawn(
+            context,
+            wrong_client.endpoint.run(std::move(*client_socket), prepared, {},
+                                      deadline.as_steady_time_point()),
+            asio::use_future);
+        context.run();
+        require(server_result.get().status == ServerRunStatus::TerminalError &&
+                    client_result.get().status == ClientRunStatus::TerminalError &&
+                    server.namespace_count() == 0 &&
+                    server.revision_count() == 0 &&
+                    server.live_session_count() == 0,
+                "P5CO endpoint accepted a SESSION_HELLO from another C store");
+        require_closed_fd(owned_server_fd,
+                          "wrong-C P5CO endpoint retained its server fd");
+        require_closed_fd(owned_client_fd,
+                          "wrong-C P5CO client retained its descriptor");
+        require(context.poll() == 0,
+                "wrong-C P5CO endpoint retained an asynchronous handler");
+    }
+
+    {
+        const P5coStoreGuids guids = p5co_store_guids(181);
+        const daemon::P50CacheSessionOutcome outcome =
+            p5co_adopted_outcome(guids, 9451);
+        const sidecar::AbsoluteMonotonicDeadline deadline =
+            p5co_deadline_after(std::chrono::seconds(2));
+        P50ServerEndpoint server(guids.f);
+        TestClient client(guids.c);
+        const PreparedTuHandle prepared =
+            admit(client, bytes("stale P5CO operation completion\n"));
+        P5coTcpPair pair;
+        sidecar::P5coEndpointHandoff handoff = flush_p5co_for_endpoint(
+            pair.take_server(), pair.client, outcome, deadline);
+
+        asio::io_context context;
+        boost::system::error_code adoption_error;
+        std::optional<tcp::socket> client_socket =
+            P50ClientEndpoint::adopt_connected_fd(
+                context.get_executor(), pair.take_client(), adoption_error);
+        require(client_socket.has_value() && !adoption_error,
+                "stale-operation client descriptor adoption failed");
+        bool mutated = false;
+        EndpointIoControl server_control;
+        server_control.before_live_identity_check =
+            [&](const CompletionStamp& expected,
+                CompletionLiveIdentity& live) {
+                if (!mutated && expected.cache_session_operation.has_value()) {
+                    require(live.cache_session_operation.has_value(),
+                            "typed endpoint live identity lost its P5CO operation");
+                    ++live.cache_session_operation->operation_sequence;
+                    mutated = true;
+                }
+            };
+        std::future<ServerRunResult> server_result = asio::co_spawn(
+            context,
+            server.run_adopted(std::move(handoff), std::move(server_control)),
+            asio::use_future);
+        std::future<ClientRunResult> client_result = asio::co_spawn(
+            context,
+            client.endpoint.run(std::move(*client_socket), prepared, {},
+                                deadline.as_steady_time_point()),
+            asio::use_future);
+        context.run();
+        require(mutated &&
+                    server_result.get().status == ServerRunStatus::Disconnected &&
+                    client_result.get().status == ClientRunStatus::Disconnected &&
+                    server.namespace_count() == 0 &&
+                    server.revision_count() == 0 &&
+                    server.live_session_count() == 0,
+                "stale P5CO operation completion advanced the endpoint");
+        require(context.poll() == 0,
+                "stale P5CO operation completion retained a handler");
+    }
+}
+
+void test_server_completion_rechecks_after_live_callback() {
+    for (const bool cancel_in_callback : {false, true}) {
+        const P5coStoreGuids guids =
+            p5co_store_guids(cancel_in_callback ? 222 : 221);
+        const daemon::P50CacheSessionOutcome outcome =
+            p5co_adopted_outcome(guids,
+                                 cancel_in_callback ? 9752 : 9751);
+        const sidecar::AbsoluteMonotonicDeadline deadline =
+            p5co_deadline_after(cancel_in_callback
+                                    ? std::chrono::seconds(2)
+                                    : std::chrono::milliseconds(150));
+        P50ServerEndpoint server(guids.f);
+        TestClient client(guids.c);
+        const PreparedTuHandle prepared =
+            admit(client, bytes("server completion callback fence\n"));
+        P5coTcpPair pair;
+        sidecar::P5coEndpointHandoff handoff = flush_p5co_for_endpoint(
+            pair.take_server(), pair.client, outcome, deadline);
+
+        asio::io_context context;
+        boost::system::error_code adoption_error;
+        std::optional<tcp::socket> client_socket =
+            P50ClientEndpoint::adopt_connected_fd(
+                context.get_executor(), pair.take_client(), adoption_error);
+        require(client_socket.has_value() && !adoption_error,
+                "server-callback client descriptor adoption failed");
+        size_t unbound_payload_completions = 0;
+        bool crossed_in_callback = false;
+        EndpointIoControl server_control;
+        server_control.before_live_identity_check =
+            [&](const CompletionStamp& expected,
+                CompletionLiveIdentity&) {
+                if (expected.actor != ActorSide::F ||
+                    expected.operation != AsyncOperationKind::ReadPayload ||
+                    expected.transaction_bound)
+                    return;
+                ++unbound_payload_completions;
+                if (unbound_payload_completions != 2)
+                    return;
+                crossed_in_callback = true;
+                if (cancel_in_callback)
+                    server.request_cancel_for_test();
+                else
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(300));
+            };
+        std::future<ServerRunResult> server_result = asio::co_spawn(
+            context,
+            server.run_adopted(std::move(handoff),
+                               std::move(server_control)),
+            asio::use_future);
+        std::future<ClientRunResult> client_result = asio::co_spawn(
+            context,
+            client.endpoint.run(std::move(*client_socket), prepared, {},
+                                deadline.as_steady_time_point()),
+            asio::use_future);
+        context.run();
+
+        const ServerRunResult server_value = server_result.get();
+        const ClientRunResult client_value = client_result.get();
+        require(crossed_in_callback && unbound_payload_completions == 2 &&
+                    server_value.status ==
+                        (cancel_in_callback
+                             ? ServerRunStatus::Disconnected
+                             : ServerRunStatus::DeadlineExceeded) &&
+                    client_value.status ==
+                        (cancel_in_callback
+                             ? ClientRunStatus::Disconnected
+                             : ClientRunStatus::DeadlineExceeded) &&
+                    server.namespace_count() == 0 &&
+                    server.revision_count() == 0 &&
+                    server.live_session_count() == 0 &&
+                    server.owner_usage().retained_input_records == 0,
+                "server completion callback crossed operation authority");
+        require(context.poll() == 0,
+                "server completion callback retained an asynchronous handler");
+    }
+}
+
+sidecar::P5coEndpointHandoff make_fence_probe_handoff(
+    const daemon::P50CacheSessionOutcome& outcome,
+    const sidecar::AbsoluteMonotonicDeadline& deadline,
+    const std::shared_ptr<EndpointFenceProbe>& probe) {
+    sidecar::AdoptedOutcomeWriter writer(
+        std::make_unique<EndpointFenceLease>(outcome, deadline, probe),
+        outcome,
+        std::make_unique<sidecar::SystemMonotonicObservationSource>(),
+        deadline);
+    require(writer.advance(POLLOUT) ==
+                sidecar::P5coWriterState::FullyFlushed,
+            "fence-probe P5CO writer did not flush");
+    std::optional<sidecar::P5coEndpointHandoff> handoff =
+        writer.take_for_endpoint();
+    require(handoff.has_value() && handoff->valid(),
+            "fence-probe P5CO writer did not transfer whole authority");
+    return std::move(*handoff);
+}
+
+void test_p5co_endpoint_fences_post_transfer_failures() {
+    const P5coStoreGuids guids = p5co_store_guids(241);
+    const daemon::P50CacheSessionOutcome outcome =
+        p5co_adopted_outcome(guids, 9801);
+
+    {
+        const sidecar::AbsoluteMonotonicDeadline deadline =
+            p5co_deadline_after(std::chrono::seconds(2));
+        auto probe = std::make_shared<EndpointFenceProbe>();
+        // One flush turn performs two exact validations and transfer performs
+        // the third.  The fourth belongs to the endpoint after it consumes the
+        // handoff and is deliberately stale.
+        probe->successful_revalidations = 3;
+        sidecar::P5coEndpointHandoff handoff =
+            make_fence_probe_handoff(outcome, deadline, probe);
+        P50ServerEndpoint server(guids.f);
+        asio::io_context context;
+        std::future<ServerRunResult> result = asio::co_spawn(
+            context, server.run_adopted(std::move(handoff)), asio::use_future);
+        context.run();
+        require(result.get().status == ServerRunStatus::Disconnected &&
+                    probe->revalidations == 4 && probe->releases == 0 &&
+                    probe->fences == 1 && probe->fenced &&
+                    server.live_session_count() == 0,
+                "post-transfer stale lease was not fenced exactly once");
+    }
+
+    {
+        const sidecar::AbsoluteMonotonicDeadline deadline =
+            p5co_deadline_after(std::chrono::seconds(2));
+        int pipe_fds[2] = {-1, -1};
+        require(::pipe(pipe_fds) == 0,
+                "post-transfer adoption-failure pipe setup failed");
+        const int consumed_fd = pipe_fds[0];
+        auto probe = std::make_shared<EndpointFenceProbe>();
+        probe->release_fd = consumed_fd;
+        sidecar::P5coEndpointHandoff handoff =
+            make_fence_probe_handoff(outcome, deadline, probe);
+        P50ServerEndpoint server(guids.f);
+        asio::io_context context;
+        std::future<ServerRunResult> result = asio::co_spawn(
+            context, server.run_adopted(std::move(handoff)), asio::use_future);
+        context.run();
+        require(result.get().status == ServerRunStatus::Disconnected &&
+                    probe->releases == 1 && probe->fences == 1 &&
+                    probe->fenced && server.live_session_count() == 0,
+                "post-release socket-adoption failure lacked an exact fence");
+        require_closed_fd(consumed_fd,
+                          "failed endpoint adoption retained its descriptor");
+        (void)::close(pipe_fds[1]);
+    }
+
+    {
+        // Hold the sole configured live-session slot open, then consume a
+        // second complete handoff.  Allocation fails after descriptor release;
+        // the RAII transfer guard must still fence the exact authority and the
+        // adopted socket must close during unwinding.
+        P50ServerEndpointConfig config;
+        config.owner_limits.max_live_sessions = 1;
+        P50ServerEndpoint server(guids.f, {}, nullptr, nullptr,
+                                 std::move(config));
+        asio::io_context context;
+
+        P5coTcpPair occupied_pair;
+        boost::system::error_code adoption_error;
+        std::optional<tcp::socket> occupied_socket =
+            P50ServerEndpoint::adopt_connected_fd(
+                context.get_executor(), occupied_pair.take_server(),
+                adoption_error);
+        require(occupied_socket.has_value() && !adoption_error,
+                "live-slot fence probe failed to adopt its first socket");
+        std::future<ServerRunResult> occupied = asio::co_spawn(
+            context, server.run_adopted(std::move(*occupied_socket)),
+            asio::use_future);
+        context.poll();
+        context.restart();
+        require(server.owner_usage().live_sessions == 1,
+                "live-slot fence probe did not occupy its first session");
+
+        const sidecar::AbsoluteMonotonicDeadline deadline =
+            p5co_deadline_after(std::chrono::seconds(2));
+        P5coTcpPair excess_pair;
+        const int consumed_fd = excess_pair.server;
+        auto probe = std::make_shared<EndpointFenceProbe>();
+        probe->release_fd = excess_pair.take_server();
+        sidecar::P5coEndpointHandoff handoff =
+            make_fence_probe_handoff(outcome, deadline, probe);
+        std::future<ServerRunResult> excess = asio::co_spawn(
+            context, server.run_adopted(std::move(handoff)),
+            asio::use_future);
+        context.poll();
+        context.restart();
+        require_throws<std::length_error>(
+            [&] { (void)excess.get(); },
+            "post-release session-allocation failure did not propagate");
+        require(probe->releases == 1 && probe->fences == 1 && probe->fenced,
+                "post-release session-allocation failure was not fenced");
+        require_closed_fd(consumed_fd,
+                          "post-release session-allocation failure retained fd");
+
+        server.request_cancel_for_test();
+        context.run();
+        require(occupied.get().status == ServerRunStatus::Disconnected &&
+                    server.owner_usage().live_sessions == 0,
+                "live-slot fence probe did not release its occupied session");
+    }
+}
+
+void test_p5co_worker_completion_is_stale_after_deadline_or_cancel() {
+    const size_t descriptor_baseline = open_fd_count();
+    {
+        const P5coStoreGuids guids = p5co_store_guids(191);
+        const daemon::P50CacheSessionOutcome outcome =
+            p5co_adopted_outcome(guids, 9501);
+        const sidecar::AbsoluteMonotonicDeadline deadline =
+            p5co_deadline_after(std::chrono::milliseconds(150));
+        ActionTrace actions;
+        P50ServerEndpoint server(guids.f, {}, nullptr, &actions);
+        TestClient client(guids.c);
+        const PreparedTuHandle prepared =
+            admit(client, pseudo_random_bytes(64 * 1024));
+        P5coTcpPair pair;
+        const int owned_server_fd = pair.server;
+        const int owned_client_fd = pair.client;
+        sidecar::P5coEndpointHandoff handoff = flush_p5co_for_endpoint(
+            pair.take_server(), pair.client, outcome, deadline);
+
+        std::atomic<bool> worker_started{false};
+        {
+            asio::io_context context;
+            boost::system::error_code adoption_error;
+            std::optional<tcp::socket> client_socket =
+                P50ClientEndpoint::adopt_connected_fd(
+                    context.get_executor(), pair.take_client(), adoption_error);
+            require(client_socket.has_value() && !adoption_error,
+                    "blocked-codec client descriptor adoption failed");
+            EndpointIoControl server_control;
+            server_control.before_materialize_on_worker = [&] {
+                worker_started.store(true, std::memory_order_release);
+                std::this_thread::sleep_for(std::chrono::milliseconds(400));
+            };
+            const auto started = std::chrono::steady_clock::now();
+            std::optional<std::chrono::steady_clock::time_point> sentinel_observed;
+            bool sentinel_saw_worker = false;
+            asio::steady_timer sentinel(context,
+                                        started + std::chrono::milliseconds(100));
+            sentinel.async_wait([&](const boost::system::error_code& error) {
+                require(!error, "blocked-codec owner sentinel was cancelled");
+                sentinel_observed = std::chrono::steady_clock::now();
+                sentinel_saw_worker =
+                    worker_started.load(std::memory_order_acquire);
+            });
+            std::future<ServerRunResult> server_result = asio::co_spawn(
+                context,
+                server.run_adopted(std::move(handoff), std::move(server_control)),
+                asio::use_future);
+            std::future<ClientRunResult> client_result = asio::co_spawn(
+                context,
+                client.endpoint.run(std::move(*client_socket), prepared, {},
+                                    deadline.as_steady_time_point()),
+                asio::use_future);
+            context.run();
+            const auto endpoint_elapsed =
+                std::chrono::steady_clock::now() - started;
+
+            require(sentinel_observed.has_value() && sentinel_saw_worker &&
+                        *sentinel_observed - started <
+                            std::chrono::milliseconds(250) &&
+                        endpoint_elapsed < std::chrono::milliseconds(300),
+                    "codec work blocked the endpoint timer owner");
+            require(server_result.get().status ==
+                            ServerRunStatus::DeadlineExceeded &&
+                        client_result.get().status ==
+                            ClientRunStatus::DeadlineExceeded &&
+                        server.live_session_count() == 0 &&
+                        !server.last_committed_input(guids.c).has_value() &&
+                        server.owner_usage().retained_input_records == 0 &&
+                        std::none_of(actions.records().begin(),
+                                     actions.records().end(),
+                                     [](const ActionRecord& record) {
+                                         return record.action ==
+                                                ActionType::INPUT_COMMITTED;
+                                     }),
+                    "post-deadline codec completion published durable input");
+            require_closed_fd(
+                owned_server_fd,
+                "post-deadline codec completion retained server fd");
+            require_closed_fd(
+                owned_client_fd,
+                "post-deadline codec completion retained client fd");
+            require(context.poll() == 0,
+                    "post-deadline codec completion retained a handler");
+        }
+        // The endpoint result is already final.  Let the deliberately blocked
+        // global-pool job drain after destroying its owner execution_context.
+        // The shared worker state must contain no Asio object tied to that
+        // dead context, and the next row must see zero inherited inventory.
+        std::this_thread::sleep_for(std::chrono::milliseconds(350));
+    }
+    require(open_fd_count() == descriptor_baseline,
+            "deadline-abandoned worker leaked eventfd/timerfd authority");
+
+    {
+        const P5coStoreGuids guids = p5co_store_guids(211);
+        const daemon::P50CacheSessionOutcome outcome =
+            p5co_adopted_outcome(guids, 9601);
+        const sidecar::AbsoluteMonotonicDeadline deadline =
+            p5co_deadline_after(std::chrono::seconds(2));
+        ActionTrace actions;
+        P50ServerEndpoint server(guids.f, {}, nullptr, &actions);
+        TestClient client(guids.c);
+        const PreparedTuHandle prepared =
+            admit(client, pseudo_random_bytes(64 * 1024));
+        P5coTcpPair pair;
+        sidecar::P5coEndpointHandoff handoff = flush_p5co_for_endpoint(
+            pair.take_server(), pair.client, outcome, deadline);
+
+        asio::io_context context;
+        boost::system::error_code adoption_error;
+        std::optional<tcp::socket> client_socket =
+            P50ClientEndpoint::adopt_connected_fd(
+                context.get_executor(), pair.take_client(), adoption_error);
+        require(client_socket.has_value() && !adoption_error,
+                "cancelled-codec client descriptor adoption failed");
+        std::atomic<bool> worker_started{false};
+        EndpointIoControl server_control;
+        server_control.before_materialize_on_worker = [&] {
+            worker_started.store(true, std::memory_order_release);
+            std::this_thread::sleep_for(std::chrono::milliseconds(350));
+        };
+        bool cancel_saw_worker = false;
+        asio::steady_timer cancel(context, std::chrono::milliseconds(100));
+        cancel.async_wait([&](const boost::system::error_code& error) {
+            require(!error, "blocked-codec cancellation timer was cancelled");
+            cancel_saw_worker =
+                worker_started.load(std::memory_order_acquire);
+            server.request_cancel_for_test();
+        });
+        std::future<ServerRunResult> server_result = asio::co_spawn(
+            context,
+            server.run_adopted(std::move(handoff), std::move(server_control)),
+            asio::use_future);
+        std::future<ClientRunResult> client_result = asio::co_spawn(
+            context,
+            client.endpoint.run(std::move(*client_socket), prepared, {},
+                                deadline.as_steady_time_point()),
+            asio::use_future);
+        context.run();
+
+        require(cancel_saw_worker &&
+                    server_result.get().status ==
+                        ServerRunStatus::Disconnected &&
+                    client_result.get().status == ClientRunStatus::Disconnected &&
+                    server.live_session_count() == 0 &&
+                    !server.last_committed_input(guids.c).has_value() &&
+                    server.owner_usage().retained_input_records == 0 &&
+                    std::none_of(actions.records().begin(),
+                                 actions.records().end(),
+                                 [](const ActionRecord& record) {
+                                     return record.action ==
+                                            ActionType::INPUT_COMMITTED;
+                                 }),
+                "post-cancel codec completion published durable input");
+        require(context.poll() == 0,
+                "post-cancel codec completion retained a handler");
+        std::this_thread::sleep_for(std::chrono::milliseconds(350));
+    }
+    require(open_fd_count() == descriptor_baseline,
+            "cancel-abandoned worker leaked eventfd/timerfd authority");
+}
+
+void test_p5co_codec_queue_is_bounded() {
+    constexpr size_t run_count = 9;
+    asio::io_context context;
+    std::mutex gate_mutex;
+    std::condition_variable gate_changed;
+    size_t worker_started = 0;
+    bool release_workers = false;
+
+    std::vector<std::unique_ptr<P50ServerEndpoint>> servers;
+    std::vector<std::unique_ptr<TestClient>> clients;
+    std::vector<std::future<ServerRunResult>> server_results;
+    std::vector<std::future<ClientRunResult>> client_results;
+    servers.reserve(run_count);
+    clients.reserve(run_count);
+    server_results.reserve(run_count);
+    client_results.reserve(run_count);
+
+    for (size_t index = 0; index != run_count; ++index) {
+        const P5coStoreGuids guids =
+            p5co_store_guids(static_cast<uint8_t>(44 + index));
+        servers.emplace_back(std::make_unique<P50ServerEndpoint>(guids.f));
+        clients.emplace_back(std::make_unique<TestClient>(guids.c));
+        const PreparedTuHandle prepared =
+            admit(*clients.back(), pseudo_random_bytes(1024 + index));
+        const daemon::P50CacheSessionOutcome outcome =
+            p5co_adopted_outcome(guids, 9900 + index);
+        const sidecar::AbsoluteMonotonicDeadline deadline =
+            p5co_deadline_after(std::chrono::seconds(5));
+        P5coTcpPair pair;
+        sidecar::P5coEndpointHandoff handoff = flush_p5co_for_endpoint(
+            pair.take_server(), pair.client, outcome, deadline);
+        boost::system::error_code adoption_error;
+        std::optional<tcp::socket> client_socket =
+            P50ClientEndpoint::adopt_connected_fd(
+                context.get_executor(), pair.take_client(), adoption_error);
+        require(client_socket.has_value() && !adoption_error,
+                "codec-queue client descriptor adoption failed");
+
+        EndpointIoControl server_control;
+        server_control.before_materialize_on_worker = [&] {
+            std::unique_lock lock(gate_mutex);
+            ++worker_started;
+            gate_changed.notify_all();
+            gate_changed.wait(lock, [&] { return release_workers; });
+        };
+        server_results.emplace_back(asio::co_spawn(
+            context,
+            servers.back()->run_adopted(std::move(handoff),
+                                        std::move(server_control)),
+            asio::use_future));
+        client_results.emplace_back(asio::co_spawn(
+            context,
+            clients.back()->endpoint.run(
+                std::move(*client_socket), prepared, {},
+                deadline.as_steady_time_point()),
+            asio::use_future));
+    }
+
+    bool both_workers_blocked = false;
+    bool queue_rejected = false;
+    // Preparation and endpoint state are deliberately single-owner.  Keep the
+    // io_context on this thread (the preparation owner), and use a read-only
+    // observer thread solely to detect the bounded rejection and release the
+    // two blocked codec workers.
+    std::thread observer([&] {
+        {
+            std::unique_lock lock(gate_mutex);
+            both_workers_blocked = gate_changed.wait_for(
+                lock, std::chrono::seconds(2),
+                [&] { return worker_started >= 2; });
+        }
+        const auto rejection_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (both_workers_blocked &&
+               std::chrono::steady_clock::now() < rejection_deadline) {
+            queue_rejected = std::any_of(
+                server_results.begin(), server_results.end(),
+                [](std::future<ServerRunResult>& result) {
+                    return result.wait_for(std::chrono::milliseconds(0)) ==
+                           std::future_status::ready;
+                });
+            if (queue_rejected)
+                break;
+            std::this_thread::yield();
+        }
+        {
+            std::lock_guard lock(gate_mutex);
+            release_workers = true;
+        }
+        gate_changed.notify_all();
+    });
+    context.run();
+    observer.join();
+
+    size_t completed = 0;
+    size_t rejected = 0;
+    for (size_t index = 0; index != run_count; ++index) {
+        const ServerRunResult server = server_results[index].get();
+        const ClientRunResult client = client_results[index].get();
+        if (server.status == ServerRunStatus::Completed &&
+            client.status == ClientRunStatus::Committed) {
+            ++completed;
+        } else if (server.status == ServerRunStatus::TerminalError &&
+                   client.status == ClientRunStatus::TerminalError) {
+            const P50ServerOwnerUsage usage = servers[index]->owner_usage();
+            require(usage.live_sessions == 0 &&
+                        usage.pending_encoded_bytes == 0 &&
+                        usage.pending_raw_bytes == 0 &&
+                        usage.retained_input_records == 0,
+                    "rejected codec-queue admission retained owner inventory");
+            ++rejected;
+        }
+    }
+    require(both_workers_blocked && queue_rejected && completed == 8 &&
+                rejected == 1,
+            "codec pool did not enforce its running-plus-queued job bound");
+
+    // Every completed/abandoned worker must release exactly one admission
+    // slot.  A second wave catches a guard deletion which the initial 8/9
+    // saturation result alone cannot distinguish from a permanent slot leak.
+    const P5coStoreGuids recovery_guids = p5co_store_guids(79);
+    P50ServerEndpoint recovery_server(recovery_guids.f);
+    TestClient recovery_client(recovery_guids.c);
+    const PreparedTuHandle recovery_prepared =
+        admit(recovery_client, bytes("codec admission slot recovery\n"));
+    const daemon::P50CacheSessionOutcome recovery_outcome =
+        p5co_adopted_outcome(recovery_guids, 9991);
+    const sidecar::AbsoluteMonotonicDeadline recovery_deadline =
+        p5co_deadline_after(std::chrono::seconds(2));
+    P5coTcpPair recovery_pair;
+    sidecar::P5coEndpointHandoff recovery_handoff =
+        flush_p5co_for_endpoint(recovery_pair.take_server(),
+                                recovery_pair.client, recovery_outcome,
+                                recovery_deadline);
+    boost::system::error_code recovery_adoption_error;
+    std::optional<tcp::socket> recovery_client_socket =
+        P50ClientEndpoint::adopt_connected_fd(
+            context.get_executor(), recovery_pair.take_client(),
+            recovery_adoption_error);
+    require(recovery_client_socket.has_value() && !recovery_adoption_error,
+            "codec admission recovery descriptor adoption failed");
+    context.restart();
+    std::future<ServerRunResult> recovery_server_result = asio::co_spawn(
+        context, recovery_server.run_adopted(std::move(recovery_handoff)),
+        asio::use_future);
+    std::future<ClientRunResult> recovery_client_result = asio::co_spawn(
+        context,
+        recovery_client.endpoint.run(
+            std::move(*recovery_client_socket), recovery_prepared, {},
+            recovery_deadline.as_steady_time_point()),
+        asio::use_future);
+    context.run();
+    require(recovery_server_result.get().status ==
+                    ServerRunStatus::Completed &&
+                recovery_client_result.get().status ==
+                    ClientRunStatus::Committed,
+            "codec worker completion leaked an admission slot");
+    require(context.poll() == 0,
+            "bounded codec-queue run retained an asynchronous handler");
+}
+
+void test_p5co_deadline_wins_after_owner_job_selector() {
+    const P5coStoreGuids guids = p5co_store_guids(231);
+    bool block_first_selection = true;
+    size_t selector_calls = 0;
+    P50ServerEndpointConfig config;
+    config.input_job_state =
+        [&](CStoreGuid, const TxBegin&, const TxCommit&,
+            std::span<const uint8_t>) {
+            ++selector_calls;
+            if (std::exchange(block_first_selection, false))
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            return InputJobState::Open;
+        };
+    ActionTrace actions;
+    P50ServerEndpoint server(guids.f, {}, nullptr, &actions,
+                             std::move(config));
+    TestClient client(guids.c);
+    const std::vector<uint8_t> input = pseudo_random_bytes(32 * 1024);
+    const PreparedTuHandle prepared = admit(client, input);
+
+    {
+        const daemon::P50CacheSessionOutcome outcome =
+            p5co_adopted_outcome(guids, 9701);
+        const sidecar::AbsoluteMonotonicDeadline deadline =
+            p5co_deadline_after(std::chrono::milliseconds(150));
+        P5coTcpPair pair;
+        sidecar::P5coEndpointHandoff handoff = flush_p5co_for_endpoint(
+            pair.take_server(), pair.client, outcome, deadline);
+        asio::io_context context;
+        boost::system::error_code adoption_error;
+        std::optional<tcp::socket> client_socket =
+            P50ClientEndpoint::adopt_connected_fd(
+                context.get_executor(), pair.take_client(), adoption_error);
+        require(client_socket.has_value() && !adoption_error,
+                "selector-deadline client descriptor adoption failed");
+        std::future<ServerRunResult> server_result = asio::co_spawn(
+            context, server.run_adopted(std::move(handoff)), asio::use_future);
+        std::future<ClientRunResult> client_result = asio::co_spawn(
+            context,
+            client.endpoint.run(std::move(*client_socket), prepared, {},
+                                deadline.as_steady_time_point()),
+            asio::use_future);
+        context.run();
+
+        const ServerRunResult server_value = server_result.get();
+        require(selector_calls == 1 &&
+                    server_value.status == ServerRunStatus::DeadlineExceeded &&
+                    client_result.get().status ==
+                        ClientRunStatus::DeadlineExceeded &&
+                    !server_value.candidate_input.has_value() &&
+                    !server_value.completed_input.has_value() &&
+                    !server_value.committed_input.has_value() &&
+                    !server.last_committed_input(guids.c).has_value() &&
+                    server.owner_usage().retained_input_records == 0 &&
+                    server.owner_usage().pending_raw_bytes == 0 &&
+                    server.live_session_count() == 0 &&
+                    std::none_of(actions.records().begin(),
+                                 actions.records().end(),
+                                 [](const ActionRecord& record) {
+                                     return record.action ==
+                                            ActionType::INPUT_COMMITTED;
+                                 }),
+                "owner job selector published after the absolute deadline");
+        require(context.poll() == 0,
+                "selector-deadline run retained an asynchronous handler");
+    }
+
+    // The timed-out transaction remains the exact interrupted identity.  A
+    // fresh operation/deadline may replay it; the expired operation itself did
+    // not publish or advance the route.
+    {
+        const daemon::P50CacheSessionOutcome outcome =
+            p5co_adopted_outcome(guids, 9702);
+        const sidecar::AbsoluteMonotonicDeadline deadline =
+            p5co_deadline_after(std::chrono::seconds(2));
+        P5coTcpPair pair;
+        sidecar::P5coEndpointHandoff handoff = flush_p5co_for_endpoint(
+            pair.take_server(), pair.client, outcome, deadline);
+        asio::io_context context;
+        boost::system::error_code adoption_error;
+        std::optional<tcp::socket> client_socket =
+            P50ClientEndpoint::adopt_connected_fd(
+                context.get_executor(), pair.take_client(), adoption_error);
+        require(client_socket.has_value() && !adoption_error,
+                "selector-deadline replay descriptor adoption failed");
+        std::future<ServerRunResult> server_result = asio::co_spawn(
+            context, server.run_adopted(std::move(handoff)), asio::use_future);
+        std::future<ClientRunResult> client_result = asio::co_spawn(
+            context,
+            client.endpoint.run(std::move(*client_socket), prepared, {},
+                                deadline.as_steady_time_point()),
+            asio::use_future);
+        context.run();
+        require(selector_calls == 2 &&
+                    server_result.get().status == ServerRunStatus::Completed &&
+                    client_result.get().status == ClientRunStatus::Committed &&
+                    copy_input(server, guids.c) == input,
+                "fresh operation did not replay the exact selector-timeout input");
+        require(context.poll() == 0,
+                "selector-timeout replay retained an asynchronous handler");
+    }
+}
+
 void test_adopted_endpoint_exact_zstd_and_ownership() {
     for (const bool use_native_adoption : {false, true}) {
         CompletionLog completions;
@@ -330,6 +1541,49 @@ void test_client_deadline_and_direct_socket_ownership() {
                 adopted_result.committed_input.has_value() &&
                 server_result.get().status == ServerRunStatus::Completed,
             "connected-socket client overload did not commit its direct witness");
+}
+
+void test_client_completion_deadline_is_fresh_before_first_write() {
+    TestClient client(Id128::from_u64(933));
+    const PreparedTuHandle prepared = admit(client, bytes("completion deadline input\n"));
+
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    std::future<void> peer = asio::co_spawn(
+        context, raw_stall_after_connect(acceptor), asio::use_future);
+
+    bool delayed_connect_completion = false;
+    bool attempted_first_remote_write = false;
+    EndpointIoControl control;
+    control.before_completion_check = [&](const CompletionStamp& observed) {
+        if (delayed_connect_completion || observed.actor != ActorSide::C ||
+            observed.operation != AsyncOperationKind::Connect)
+            return;
+        delayed_connect_completion = true;
+        // The timer shares this owner executor, so it cannot run while this
+        // completion validator is blocked. The reducer itself must freshly
+        // sample the deadline before it initiates the first CacheWire write.
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    };
+    control.before_first_remote_write = [&] {
+        attempted_first_remote_write = true;
+    };
+
+    std::future<ClientRunResult> run = asio::co_spawn(
+        context,
+        client.endpoint.run(
+            acceptor.local_endpoint(), prepared, std::move(control),
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(50)),
+        asio::use_future);
+    context.run();
+    peer.get();
+    const ClientRunResult result = run.get();
+    require(delayed_connect_completion &&
+                result.status == ClientRunStatus::DeadlineExceeded &&
+                !attempted_first_remote_write &&
+                client.has_reconciliation_work() &&
+                context.poll() == 0,
+            "post-deadline client completion attempted the first CacheWire write");
 }
 
 void test_adopted_endpoint_disconnect_and_invalid_rows() {
@@ -561,7 +1815,7 @@ asio::awaitable<void> raw_cancel_client_after_hello(
         socket, EndpointCaps{}.wire.max_frame_payload);
     require(hello.type == MessageType::SESSION_HELLO,
             "cancellation peer did not observe the first CacheWire frame");
-    client.cancel_active_io();
+    client.request_cancel_for_test();
     boost::system::error_code ignored;
     socket.close(ignored);
     co_return;
@@ -2410,7 +3664,7 @@ void test_exact_replay_and_lost_final() {
         const PairResult rejected =
             run_pair(client, server, admit(client, input));
         require(rejected.client.status == ClientRunStatus::TerminalError &&
-                    rejected.client.whole_new_attempt &&
+                    rejected.client.settlement != ClientRunSettlement::CommittedInput &&
                     rejected.server.status == ServerRunStatus::TerminalError &&
                     client.has_active_transaction() &&
                     !copy_input(server, client.c_store_guid()) &&
@@ -2506,7 +3760,7 @@ void test_completion_identity_and_store_replacement() {
         const PairResult replaced = run_pair(client, server);
         require(replaced.client.status == ClientRunStatus::Committed &&
                     replaced.client.reconnect == EndpointReconnectOutcome::ColdFStore &&
-                    replaced.client.whole_new_attempt &&
+                    replaced.client.settlement != ClientRunSettlement::CommittedInput &&
                     replaced.server.session_serial > invalidated.server.session_serial &&
                     copy_input(server, client.c_store_guid()) == input,
                 "precommit F-incarnation replacement did not preserve exact prepared work");
@@ -2548,7 +3802,7 @@ void test_completion_identity_and_store_replacement() {
         const PairResult replaced = run_pair(client, server);
         require(replaced.client.status == ClientRunStatus::Committed &&
                     replaced.client.reconnect == EndpointReconnectOutcome::ColdFStore &&
-                    replaced.client.whole_new_attempt &&
+                    replaced.client.settlement != ClientRunSettlement::CommittedInput &&
                     copy_input(server, client.c_store_guid()) == input,
                 "postcommit/pre-ack F replacement did not replay exact prepared work");
         require_trace(actions, "postcommit/pre-ack F replacement trace");
@@ -2594,7 +3848,7 @@ void test_reset_ack_equality_and_terminal_result() {
                     acceptor, ScriptedSessionState{.f_guid = f_guid}, mutation);
             });
         require(terminal.status == ClientRunStatus::TerminalError &&
-                    terminal.whole_new_attempt && client.has_reconciliation_work() &&
+                    terminal.settlement != ClientRunSettlement::CommittedInput && client.has_reconciliation_work() &&
                     !client.has_active_transaction(),
                 "bad HISTORY_RESET acknowledgement lost queued reconciliation work");
 
@@ -2616,7 +3870,7 @@ void test_reset_ack_equality_and_terminal_result() {
                 return raw_bounded_error_peer(acceptor, kMandatoryControlFramePayload);
             });
         require(terminal.status == ClientRunStatus::TerminalError &&
-                    terminal.whole_new_attempt && terminal.terminal_error &&
+                    terminal.settlement != ClientRunSettlement::CommittedInput && terminal.terminal_error &&
                     encode_payload(Message{*terminal.terminal_error}).size() ==
                         kMandatoryControlFramePayload &&
                     client.has_reconciliation_work(),
@@ -2635,7 +3889,7 @@ void test_reset_ack_equality_and_terminal_result() {
             client, prepared,
             [&](tcp::acceptor& acceptor) { return raw_unknown_frame_peer(acceptor); });
         require(terminal.status == ClientRunStatus::TerminalError &&
-                    terminal.whole_new_attempt && terminal.terminal_error &&
+                    terminal.settlement != ClientRunSettlement::CommittedInput && terminal.terminal_error &&
                     client.has_reconciliation_work() && !client.has_active_transaction(),
                 "client framing failure bypassed the bounded terminal-result path");
         P50ServerEndpoint good(Id128::from_u64(586));
@@ -2679,7 +3933,7 @@ void test_reset_ack_equality_and_terminal_result() {
             });
         require(terminal.status == ClientRunStatus::TerminalError &&
                     terminal.reconnect == EndpointReconnectOutcome::RouteHistoryReset &&
-                    terminal.whole_new_attempt && client.has_active_transaction() &&
+                    terminal.settlement != ClientRunSettlement::CommittedInput && client.has_active_transaction() &&
                     client.has_reconciliation_work() &&
                     client.endpoint.next_rel_seq() == initial_next_rel &&
                     client.endpoint.state_digest() == initial_state &&
@@ -2728,7 +3982,7 @@ void test_reset_ack_equality_and_terminal_result() {
             },
             stop_terminal_report);
         require(local_terminal.status == ClientRunStatus::TerminalError &&
-                    local_terminal.whole_new_attempt &&
+                    local_terminal.settlement != ClientRunSettlement::CommittedInput &&
                     client.has_active_transaction(),
                 "failed terminal-report write relabeled a known route mismatch");
     }
@@ -3173,7 +4427,7 @@ void test_reserved_zero_endpoint_values() {
                 return raw_zero_f_store_state_peer(acceptor);
             });
         require(terminal.status == ClientRunStatus::TerminalError &&
-                    terminal.whole_new_attempt &&
+                    terminal.settlement != ClientRunSettlement::CommittedInput &&
                     client.has_reconciliation_work() &&
                     !client.has_active_transaction() &&
                     !client.endpoint.f_store_guid() &&
@@ -3195,7 +4449,7 @@ void test_reserved_zero_endpoint_values() {
                 return raw_zero_error_code_peer(acceptor);
             });
         require(terminal.status == ClientRunStatus::TerminalError &&
-                    terminal.whole_new_attempt && terminal.terminal_error &&
+                    terminal.settlement != ClientRunSettlement::CommittedInput && terminal.terminal_error &&
                     terminal.terminal_error->code != 0 &&
                     client.has_reconciliation_work() &&
                     !client.has_active_transaction() &&
@@ -3430,7 +4684,7 @@ void test_client_operation_scoped_cancellation() {
         TestClient client(Id128::from_u64(742));
         EndpointIoControl control;
         control.before_first_remote_write = [&client] {
-            client.endpoint.cancel_active_io();
+            client.endpoint.request_cancel_for_test();
         };
         asio::io_context context;
         // A listening socket is sufficient for connect completion; the
@@ -4163,6 +5417,18 @@ int main(int argc, char** argv) {
     const bool performance_gate = argc == 2 && std::string_view(argv[1]) == "--performance";
     if (argc > 2 || (argc == 2 && !performance_gate))
         fail("usage: p50endpoint [--performance]");
+    if (std::getenv("ICECC_P50_ENDPOINT_MUTANT_FOCUS") != nullptr) {
+        test_complete_p5co_endpoint_handoff();
+        test_p5co_endpoint_absolute_deadline_and_binding();
+        test_server_completion_rechecks_after_live_callback();
+        test_p5co_endpoint_fences_post_transfer_failures();
+        test_p5co_worker_completion_is_stale_after_deadline_or_cancel();
+        test_p5co_codec_queue_is_bounded();
+        test_p5co_deadline_wins_after_owner_job_selector();
+        test_client_completion_deadline_is_fresh_before_first_write();
+        std::cout << "p50_endpoint_test: focused P5CO PASS\n";
+        return 0;
+    }
     test_normal_zero_and_completion_stamps();
     test_completion_stamp_correspondence();
     test_completion_live_identity_correspondence();
@@ -4187,6 +5453,14 @@ int main(int argc, char** argv) {
     test_client_operation_scoped_cancellation();
     test_component_and_allocation_caps();
     test_client_deadline_and_direct_socket_ownership();
+    test_client_completion_deadline_is_fresh_before_first_write();
+    test_complete_p5co_endpoint_handoff();
+    test_p5co_endpoint_absolute_deadline_and_binding();
+    test_server_completion_rechecks_after_live_callback();
+    test_p5co_endpoint_fences_post_transfer_failures();
+    test_p5co_worker_completion_is_stale_after_deadline_or_cancel();
+    test_p5co_codec_queue_is_bounded();
+    test_p5co_deadline_wins_after_owner_job_selector();
     test_adopted_endpoint_exact_zstd_and_ownership();
     test_adopted_endpoint_disconnect_and_invalid_rows();
     test_adopted_cross_executor_releases_registration();

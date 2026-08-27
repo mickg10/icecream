@@ -2,10 +2,10 @@
 
 // Sidecar-local reducer for the post-adoption P5CO frame.
 //
-// This is intentionally only a reducer contract.  The current tree has no
-// reviewed typed server-release/client-adopted socket lease, so this layer
-// does not accept or manufacture an fd (or an fd-like integer).  A future
-// handoff implementation supplies the move-only lease below.
+// The reducer itself never accepts or manufactures an fd (or an fd-like
+// integer).  The concrete retained-socket implementation supplies the
+// move-only lease below, and only P50ServerEndpoint may perform its final
+// descriptor release while consuming the complete authority bundle.
 
 #include "p50_sidecar_supervisor.h"
 #include "../services/p50_cache_session_wire.h"
@@ -18,6 +18,10 @@
 #include <vector>
 
 #include <poll.h>
+
+namespace icecc::p50 {
+class P50ServerEndpoint;
+}
 
 namespace icecc::p50::sidecar {
 
@@ -117,11 +121,27 @@ public:
 
 protected:
     P5coAdoptedSocketLease() = default;
+
+private:
+    friend class ::icecc::p50::P50ServerEndpoint;
+
+    // The native descriptor may cross this final boundary only while the
+    // endpoint consumes the complete P5coEndpointHandoff.  This deliberately
+    // has no public wrapper: callers cannot strip socket authority from the
+    // exact outcome and original deadline.  Standalone reducer fakes retain
+    // the fail-closed default.
+    [[nodiscard]] virtual int release_native_fd_for_endpoint(
+        const daemon::P50CacheSessionOutcome&,
+        const AbsoluteMonotonicDeadline&) noexcept {
+        return -1;
+    }
 };
 
 // The endpoint must receive the complete authority bundle, not only a socket
 // pointer.  It is move-only and fences an unconsumed retained lease on
-// destruction; take_lease() is the sole one-shot extraction operation.
+// destruction.  Only P50ServerEndpoint may perform the one-shot internal
+// lease transfer; callers cannot separate socket authority from the exact
+// outcome and original deadline.
 class P5coEndpointHandoff {
 public:
     P5coEndpointHandoff(const P5coEndpointHandoff&) = delete;
@@ -139,14 +159,14 @@ public:
     [[nodiscard]] const AbsoluteMonotonicDeadline& deadline() const noexcept {
         return deadline_;
     }
-    [[nodiscard]] std::unique_ptr<P5coAdoptedSocketLease>
-    take_lease() noexcept;
-
 private:
     friend class AdoptedOutcomeWriter;
+    friend class ::icecc::p50::P50ServerEndpoint;
     P5coEndpointHandoff(std::unique_ptr<P5coAdoptedSocketLease> lease,
                         daemon::P50CacheSessionOutcome outcome,
                         AbsoluteMonotonicDeadline deadline) noexcept;
+    [[nodiscard]] std::unique_ptr<P5coAdoptedSocketLease>
+    take_lease_for_endpoint() noexcept;
     void fence_owned() noexcept;
 
     std::unique_ptr<P5coAdoptedSocketLease> lease_;

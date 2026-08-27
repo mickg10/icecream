@@ -97,7 +97,7 @@ for pair in \
     "$impl|send_cache_session_ready(adopted.get(), deadline)" \
     "$impl|endpoint_->run_adopted" \
     "$impl|busy_.test_and_set" \
-    "$impl|cancel_active_socket()" \
+    "$impl|cancel_endpoint_run()" \
     "$control|kControlOperationVersionV3" \
     "$control|ControlCancelTargetRole::CSource" \
     "$control|ControlCancelTargetRole::FSession" \

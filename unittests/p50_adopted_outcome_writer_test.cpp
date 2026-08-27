@@ -15,6 +15,14 @@ using namespace icecc::p50;
 using namespace icecc::p50::daemon;
 using namespace icecc::p50::sidecar;
 
+template <typename T>
+concept PublicEndpointLeaseExtraction = requires(T& value) {
+    value.take_lease_for_endpoint();
+};
+
+static_assert(!PublicEndpointLeaseExtraction<P5coEndpointHandoff>,
+              "endpoint lease extraction must remain private to P50ServerEndpoint");
+
 namespace {
 
 void check(bool value, const char* expression) {
@@ -370,12 +378,11 @@ void full_flush_then_typed_endpoint_transfer_and_order() {
     CHECK(events == std::vector<char>({'O', 'R'}));
     CHECK(raw->revalidations == 3 && source->calls == 3 && raw->fences == 0);
 
-    auto transferred = handoff->take_lease();
-    CHECK(transferred != nullptr && !handoff->valid());
-    CHECK(handoff->take_lease() == nullptr);
     CHECK(value.state() == P5coWriterState::FullyFlushed);
     CHECK(!value.take_for_endpoint().has_value());
-    transferred.reset();
+    events.clear();
+    handoff.reset();
+    CHECK(events == std::vector<char>({'F'}));
 }
 
 void endpoint_order_and_ownership_loss_after_observation() {

@@ -14,6 +14,8 @@ test_source="$src/unittests/p50_adopted_outcome_writer_test.cpp"
 for pair in \
     "$header|class P5coAdoptedSocketLease" \
     "$header|class P5coEndpointHandoff" \
+    "$header|friend class ::icecc::p50::P50ServerEndpoint" \
+    "$header|take_lease_for_endpoint" \
     "$header|std::optional<P5coEndpointHandoff>" \
     "$header|P50CacheSessionOutcome" \
     "$header|MonotonicObservationSource" \
@@ -35,6 +37,11 @@ for pair in \
     pattern=${pair#*|}
     require "$file" "$pattern"
 done
+
+if grep -F 'take_lease()' "$header" >/dev/null; then
+    echo 'FAIL: public lease-only endpoint extraction remains' >&2
+    exit 1
+fi
 
 # Structural checks complement executable mutants.  These counts ensure that
 # the initial/final send checks and the endpoint-transfer check are all present.

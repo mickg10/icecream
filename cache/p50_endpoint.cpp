@@ -1,16 +1,22 @@
 #include "p50_endpoint.h"
 
+#include "p50_adopted_outcome_writer.h"
+
 #include <boost/asio/buffer.hpp>
+#include <boost/asio/post.hpp>
+#include <boost/asio/posix/stream_descriptor.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/redirect_error.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/this_coro.hpp>
+#include <boost/asio/thread_pool.hpp>
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/asio/write.hpp>
 #include <boost/system/system_error.hpp>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <fcntl.h>
 #include <limits>
@@ -19,7 +25,9 @@
 #include <stdexcept>
 #include <thread>
 #include <tuple>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <sys/timerfd.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -119,6 +127,10 @@ void require_live_completion(const CompletionStamp& expected,
         throw StaleCompletion();
     if (expected.f_store_guid != live.f_store_guid)
         throw StaleCompletion();
+    if (expected.cache_session_operation != live.cache_session_operation)
+        throw StaleCompletion();
+    if (expected.absolute_deadline != live.absolute_deadline)
+        throw StaleCompletion();
     if (expected.session_serial != live.session_serial)
         throw StaleCompletion();
     if (expected.history_nonce != live.history_nonce)
@@ -161,7 +173,7 @@ private:
 
 void set_client_terminal_result(ClientRunResult& result, ErrorMessage error) {
     result.status = ClientRunStatus::TerminalError;
-    result.whole_new_attempt = true;
+    result.settlement = ClientRunSettlement::Unresolved;
     result.terminal_error = std::move(error);
 }
 
@@ -201,6 +213,280 @@ struct ClientIoState {
     bool expired = false;
     bool committed = false;
 };
+
+struct ServerMaterializationAsyncState;
+
+// Server timers own the adopted socket through shared state for the same
+// reason as the client timer above: a cancelled or late handler must never
+// dereference the run coroutine's stack.
+struct ServerIoState {
+    explicit ServerIoState(
+        tcp::socket socket_value,
+        std::optional<daemon::P50FSessionOperationId> operation_value,
+        std::optional<sidecar::AbsoluteMonotonicDeadline> deadline_value)
+        : socket(std::move(socket_value)),
+          deadline_timer(socket.get_executor()),
+          operation(std::move(operation_value)),
+          deadline(std::move(deadline_value)) {}
+
+    tcp::socket socket;
+    asio::posix::stream_descriptor deadline_timer;
+    std::optional<daemon::P50FSessionOperationId> operation;
+    std::optional<sidecar::AbsoluteMonotonicDeadline> deadline;
+    std::weak_ptr<ServerMaterializationAsyncState> materialization;
+    bool expired = false;
+    bool cancelled = false;
+};
+
+bool arm_absolute_deadline_timer(
+    ServerIoState& io,
+    const sidecar::AbsoluteMonotonicDeadline& deadline,
+    boost::system::error_code& error) {
+    error.clear();
+    if (!deadline.valid()) {
+        error = asio::error::invalid_argument;
+        return false;
+    }
+    const int timer_fd =
+        ::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (timer_fd < 0) {
+        error.assign(errno, boost::system::generic_category());
+        return false;
+    }
+    itimerspec timer{};
+    timer.it_value.tv_sec =
+        static_cast<time_t>(deadline.expires_at_ns / 1000000000);
+    timer.it_value.tv_nsec =
+        static_cast<long>(deadline.expires_at_ns % 1000000000);
+    if (::timerfd_settime(timer_fd, TFD_TIMER_ABSTIME, &timer, nullptr) != 0) {
+        error.assign(errno, boost::system::generic_category());
+        (void)::close(timer_fd);
+        return false;
+    }
+    io.deadline_timer.assign(timer_fd, error);
+    if (error) {
+        (void)::close(timer_fd);
+        return false;
+    }
+    return true;
+}
+
+struct ServerMaterializationJob {
+    CStoreGuid c_store_guid;
+    TxBegin begin;
+    TxCommit commit;
+    ProfileDialogue dialogue;
+    std::function<void()> before_materialize;
+};
+
+struct ServerMaterializationCompletion {
+    TxBegin begin;
+    TxCommit commit;
+    ProfileDialogue dialogue;
+    InputRecordStore::PreparedPublish prepared_input;
+    std::exception_ptr failure;
+};
+
+// A worker may outlive both the endpoint coroutine and its io_context.  Keep
+// its notification authority as an ordinary CLOEXEC descriptor, never as an
+// Asio object or executor reference.  eventfd gives the worker and the owner
+// independent descriptor ownership of one nonblocking counter and cannot
+// raise SIGPIPE when the owner has already gone away.
+class UniqueNotificationFd {
+public:
+    UniqueNotificationFd() noexcept = default;
+    explicit UniqueNotificationFd(int fd) noexcept : fd_(fd) {}
+    ~UniqueNotificationFd() { reset(); }
+
+    UniqueNotificationFd(UniqueNotificationFd&& other) noexcept
+        : fd_(std::exchange(other.fd_, -1)) {}
+    UniqueNotificationFd& operator=(UniqueNotificationFd&& other) noexcept {
+        if (this != &other) {
+            reset();
+            fd_ = std::exchange(other.fd_, -1);
+        }
+        return *this;
+    }
+    UniqueNotificationFd(const UniqueNotificationFd&) = delete;
+    UniqueNotificationFd& operator=(const UniqueNotificationFd&) = delete;
+
+    [[nodiscard]] bool valid() const noexcept { return fd_ >= 0; }
+    [[nodiscard]] int get() const noexcept { return fd_; }
+    [[nodiscard]] int release() noexcept { return std::exchange(fd_, -1); }
+    void reset() noexcept {
+        if (fd_ >= 0)
+            (void)::close(std::exchange(fd_, -1));
+    }
+
+private:
+    int fd_ = -1;
+};
+
+void signal_notification_fd(int fd) noexcept {
+    const uint64_t value = 1;
+    for (;;) {
+        const ssize_t result = ::write(fd, &value, sizeof(value));
+        if (result == static_cast<ssize_t>(sizeof(value)))
+            return;
+        if (result < 0 && errno == EINTR)
+            continue;
+        // EAGAIN means the eventfd counter is already saturated and therefore
+        // readable.  Any other error is fail-closed: the adopted endpoint has
+        // an absolute timer/cancellation path and the worker owns no commit
+        // authority.
+        return;
+    }
+}
+
+struct ServerMaterializationAsyncState {
+    // The worker may be the last owner of this state after an endpoint has
+    // timed out.  It must therefore contain no Asio object tied to the owner
+    // execution_context.  The coroutine owns the Asio descriptor while this
+    // state owns a duplicate of the underlying eventfd.
+    explicit ServerMaterializationAsyncState(
+        UniqueNotificationFd worker_notification_value) noexcept
+        : worker_notification(std::move(worker_notification_value)) {}
+
+    UniqueNotificationFd worker_notification;
+    std::mutex mutex;
+    std::optional<ServerMaterializationCompletion> completion;
+};
+
+void cancel_materialization_notification(
+    const std::shared_ptr<ServerMaterializationAsyncState>& state) noexcept {
+    signal_notification_fd(state->worker_notification.get());
+}
+
+class EndpointCodecPool {
+public:
+    static constexpr size_t kWorkerCount = 2;
+    static constexpr size_t kMaxOutstanding = 8;
+
+    [[nodiscard]] bool try_acquire() noexcept {
+        size_t current = outstanding_.load(std::memory_order_relaxed);
+        while (current < kMaxOutstanding) {
+            if (outstanding_.compare_exchange_weak(
+                    current, current + 1, std::memory_order_acq_rel,
+                    std::memory_order_relaxed))
+                return true;
+        }
+        return false;
+    }
+
+    void release() noexcept {
+        const size_t previous =
+            outstanding_.fetch_sub(1, std::memory_order_acq_rel);
+        if (previous == 0)
+            std::terminate();
+    }
+
+    [[nodiscard]] asio::thread_pool& executor() noexcept { return pool_; }
+
+private:
+    asio::thread_pool pool_{kWorkerCount};
+    std::atomic<size_t> outstanding_{0};
+};
+
+EndpointCodecPool& endpoint_codec_pool() {
+    // Product-wide and bounded: codec work cannot create one thread per
+    // relationship or per TU, and abandoned jobs cannot grow an unbounded
+    // thread-pool queue.  Jobs carry no endpoint publication authority.
+    static EndpointCodecPool pool;
+    return pool;
+}
+
+struct EndpointCodecSlotGuard {
+    EndpointCodecPool* pool = nullptr;
+    ~EndpointCodecSlotGuard() {
+        if (pool != nullptr)
+            pool->release();
+    }
+};
+
+asio::awaitable<ServerMaterializationCompletion>
+async_materialize(ServerMaterializationJob job,
+                  const std::shared_ptr<ServerIoState>& io) {
+    const auto owner_executor = co_await asio::this_coro::executor;
+    UniqueNotificationFd owner_notification(
+        ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC));
+    if (!owner_notification.valid())
+        throw boost::system::system_error(
+            boost::system::error_code(errno,
+                                      boost::system::generic_category()));
+    UniqueNotificationFd worker_notification(
+        ::fcntl(owner_notification.get(), F_DUPFD_CLOEXEC, 0));
+    if (!worker_notification.valid())
+        throw boost::system::system_error(
+            boost::system::error_code(errno,
+                                      boost::system::generic_category()));
+
+    asio::posix::stream_descriptor notification(owner_executor);
+    boost::system::error_code assign_error;
+    const int owner_notification_fd = owner_notification.release();
+    notification.assign(owner_notification_fd, assign_error);
+    if (assign_error) {
+        (void)::close(owner_notification_fd);
+        throw boost::system::system_error(assign_error);
+    }
+
+    auto state = std::make_shared<ServerMaterializationAsyncState>(
+        std::move(worker_notification));
+    io->materialization = state;
+    EndpointCodecPool& codec_pool = endpoint_codec_pool();
+    if (!codec_pool.try_acquire())
+        throw std::runtime_error("endpoint codec queue is full");
+    EndpointCodecPool* const codec_pool_owner = &codec_pool;
+    try {
+        asio::post(codec_pool.executor(),
+               [state, codec_pool_owner, job = std::move(job)]() mutable {
+                   EndpointCodecSlotGuard slot{codec_pool_owner};
+                   ServerMaterializationCompletion completion{
+                       .begin = job.begin,
+                       .commit = job.commit,
+                       .dialogue = std::move(job.dialogue),
+                       .prepared_input = {},
+                       .failure = {}};
+                   try {
+                       if (job.before_materialize)
+                           job.before_materialize();
+                       std::vector<uint8_t> exact =
+                           completion.dialogue.materialize();
+                       completion.prepared_input =
+                           InputRecordStore::prepare_publish(
+                               job.c_store_guid, job.begin, job.commit,
+                               std::move(exact));
+                   } catch (...) {
+                       completion.failure = std::current_exception();
+                   }
+                   {
+                       std::lock_guard lock(state->mutex);
+                       state->completion.emplace(std::move(completion));
+                   }
+                   signal_notification_fd(state->worker_notification.get());
+               });
+    } catch (...) {
+        codec_pool.release();
+        if (auto active = io->materialization.lock();
+            active && active.get() == state.get())
+            io->materialization.reset();
+        throw;
+    }
+
+    boost::system::error_code notification_error;
+    co_await notification.async_wait(
+        asio::posix::stream_descriptor::wait_read,
+        asio::redirect_error(asio::use_awaitable, notification_error));
+    std::lock_guard lock(state->mutex);
+    if (auto active = io->materialization.lock();
+        active && active.get() == state.get())
+        io->materialization.reset();
+    if (!state->completion.has_value()) {
+        if (io->expired)
+            throw boost::system::system_error(asio::error::timed_out);
+        throw boost::system::system_error(asio::error::operation_aborted);
+    }
+    co_return std::move(*state->completion);
+}
 
 bool set_cloexec_fd(int fd, boost::system::error_code& error) {
     if (fd < 0) {
@@ -859,7 +1145,7 @@ struct P50ClientEndpoint::Impl {
     PreparedZstdTUPtr queued;
     CompletionLog* completions = nullptr;
     ActionTrace* actions = nullptr;
-    tcp::socket* active_socket = nullptr;
+    tcp::socket* socket_for_test_cancel = nullptr;
     bool active_cancel_requested = false;
     bool active_remote_transmission_may_have_begun = false;
     ClientCancellationDisposition active_cancellation =
@@ -870,6 +1156,7 @@ struct P50ServerEndpoint::Impl {
     struct Pending {
         TxBegin begin;
         ProfileDialogue dialogue;
+        bool materializing = false;
         uint64_t reserved_encoded_bytes = 0;
         uint64_t reserved_raw_bytes = 0;
         uint64_t reserved_window_bytes = 0;
@@ -878,6 +1165,12 @@ struct P50ServerEndpoint::Impl {
     struct PreparedBegin {
         Pending pending;
         bool replay = false;
+    };
+
+    struct MaterializedInput {
+        TxBegin begin;
+        TxCommit commit;
+        InputRecordStore::PreparedPublish prepared_input;
     };
 
     struct Route {
@@ -904,6 +1197,8 @@ struct P50ServerEndpoint::Impl {
 
     struct LiveSession {
         FStoreGuid f_guid{};
+        std::optional<daemon::P50FSessionOperationId> operation;
+        std::optional<sidecar::AbsoluteMonotonicDeadline> deadline;
         std::optional<CStoreGuid> c_guid;
         uint64_t candidate_revision = 0;
         HistoryNonce candidate_nonce{};
@@ -914,6 +1209,8 @@ struct P50ServerEndpoint::Impl {
     struct Session {
         uint64_t serial = 0;
         FStoreGuid f_guid{};
+        std::optional<daemon::P50FSessionOperationId> operation;
+        std::optional<sidecar::AbsoluteMonotonicDeadline> deadline;
         std::optional<CStoreGuid> c_guid;
         uint64_t candidate_revision = 0;
         std::optional<SessionState> candidate_state;
@@ -943,7 +1240,16 @@ struct P50ServerEndpoint::Impl {
                 "F endpoint aggregate decoder-window limit admits no dialogue");
     }
 
-    Session allocate_session() {
+    Session allocate_session(
+        std::optional<daemon::P50FSessionOperationId> operation =
+            std::nullopt,
+        std::optional<sidecar::AbsoluteMonotonicDeadline> deadline =
+            std::nullopt) {
+        if (operation.has_value() != deadline.has_value() ||
+            (operation.has_value() &&
+             (!operation->valid() || !deadline->valid())))
+            throw std::invalid_argument(
+                "typed endpoint session operation/deadline binding is incomplete");
         if (live_sessions.size() >= config.owner_limits.max_live_sessions)
             throw std::length_error("F endpoint reached its live-session bound");
         if (session_exhausted)
@@ -955,6 +1261,8 @@ struct P50ServerEndpoint::Impl {
             ++next_session;
         const auto inserted = live_sessions.emplace(
             result, LiveSession{.f_guid = f_guid,
+                                .operation = operation,
+                                .deadline = deadline,
                                 .c_guid = std::nullopt,
                                 .candidate_revision = 0,
                                 .candidate_nonce = HistoryNonce{},
@@ -964,6 +1272,8 @@ struct P50ServerEndpoint::Impl {
             throw std::logic_error("F endpoint reused a live session serial");
         return Session{.serial = result,
                        .f_guid = f_guid,
+                       .operation = operation,
+                       .deadline = deadline,
                        .c_guid = std::nullopt,
                        .candidate_revision = 0,
                        .candidate_state = std::nullopt,
@@ -973,13 +1283,19 @@ struct P50ServerEndpoint::Impl {
     void require_incarnation(const Session& session) const {
         const auto position = live_sessions.find(session.serial);
         if (session.serial == 0 || session.f_guid != f_guid ||
-            position == live_sessions.end() || position->second.f_guid != session.f_guid)
+            position == live_sessions.end() ||
+            position->second.f_guid != session.f_guid ||
+            position->second.operation != session.operation ||
+            position->second.deadline != session.deadline)
             throw StaleCompletion();
     }
 
     void release_session(const Session& session) {
         const auto position = live_sessions.find(session.serial);
-        if (position != live_sessions.end() && position->second.f_guid == session.f_guid)
+        if (position != live_sessions.end() &&
+            position->second.f_guid == session.f_guid &&
+            position->second.operation == session.operation &&
+            position->second.deadline == session.deadline)
             live_sessions.erase(position);
     }
 
@@ -1044,6 +1360,8 @@ struct P50ServerEndpoint::Impl {
         result.operation = operation;
         result.c_store_guid = session.c_guid.value_or(CStoreGuid{});
         result.f_store_guid = session.f_guid;
+        result.cache_session_operation = session.operation;
+        result.absolute_deadline = session.deadline;
         result.session_serial = session.serial;
         const TxBegin* begin = explicit_begin;
         if (!begin && session.activated && session.c_guid) {
@@ -1079,6 +1397,8 @@ struct P50ServerEndpoint::Impl {
         result.actor = ActorSide::F;
         result.c_store_guid = current.c_guid.value_or(CStoreGuid{});
         result.f_store_guid = f_guid;
+        result.cache_session_operation = current.operation;
+        result.absolute_deadline = current.deadline;
         result.session_serial = session.serial;
         if (!current.c_guid)
             return result;
@@ -1252,7 +1572,8 @@ struct P50ServerEndpoint::Impl {
         const bool replaced = !namespace_inserted && space.active_session != 0;
         if (space.route && space.route->pending) {
             space.route->interrupted = space.route->pending->begin;
-            space.route->pending->dialogue.disconnect();
+            if (space.route->pending->dialogue)
+                space.route->pending->dialogue.disconnect();
             release_pending(*space.route->pending);
             space.route->pending.reset();
         }
@@ -1275,7 +1596,8 @@ struct P50ServerEndpoint::Impl {
                 space.route->interrupted = space.route->pending->begin;
             else
                 space.route->interrupted.reset();
-            space.route->pending->dialogue.disconnect();
+            if (space.route->pending->dialogue)
+                space.route->pending->dialogue.disconnect();
             release_pending(*space.route->pending);
             space.route->pending.reset();
         }
@@ -1447,8 +1769,84 @@ struct P50ServerEndpoint::Impl {
                ProfileDialogueState::BodyClosed;
     }
 
-    TxCommit materialize_and_commit(
-        const Session& session, TxBegin& committed_begin,
+    ServerMaterializationJob begin_materialization(
+        const Session& session, std::function<void()> before_materialize) {
+        Namespace& space = require(session);
+        if (!space.route || !space.route->pending)
+            throw std::logic_error("F endpoint has no active transaction");
+        Pending& pending = *space.route->pending;
+        if (pending.materializing || !pending.dialogue ||
+            pending.dialogue.state() != ProfileDialogueState::BodyClosed)
+            throw std::logic_error("input cannot materialize before BODY closure");
+        if (!session.c_guid)
+            throw StaleCompletion();
+        const TxBegin begin = pending.begin;
+        const TxCommit commit{
+            begin.history_nonce,
+            begin.rel_seq,
+            begin.tu_seq,
+            begin.transaction_digest,
+            begin.raw_digest,
+            compute_post_state_digest(begin.pre_state_digest,
+                                      begin.history_nonce, begin.rel_seq,
+                                      begin.tu_seq,
+                                      begin.transaction_digest)};
+        pending.materializing = true;
+        return ServerMaterializationJob{
+            .c_store_guid = *session.c_guid,
+            .begin = begin,
+            .commit = commit,
+            .dialogue = std::move(pending.dialogue),
+            .before_materialize = std::move(before_materialize)};
+    }
+
+    MaterializedInput finish_materialization(
+        const Session& session,
+        ServerMaterializationCompletion completion) {
+        Namespace& space = require(session);
+        if (!space.route || !space.route->pending)
+            throw StaleCompletion();
+        Pending& pending = *space.route->pending;
+        if (!pending.materializing || pending.dialogue ||
+            pending.begin != completion.begin)
+            throw StaleCompletion();
+        pending.dialogue = std::move(completion.dialogue);
+        pending.materializing = false;
+        if (completion.failure)
+            std::rethrow_exception(completion.failure);
+        if (!pending.dialogue ||
+            pending.dialogue.state() != ProfileDialogueState::Materialized ||
+            !completion.prepared_input.valid() ||
+            completion.prepared_input.key() !=
+                InputRecordKey{*session.c_guid, pending.begin.tu_seq})
+            throw StaleCompletion();
+        record(ActionType::INPUT_MATERIALIZED, session, &pending.begin);
+        return MaterializedInput{completion.begin, completion.commit,
+                                 std::move(completion.prepared_input)};
+    }
+
+    InputJobState select_materialized_job_state(
+        const Session& session, const MaterializedInput& materialized) {
+        Namespace& space = require(session);
+        if (!space.route || !space.route->pending)
+            throw std::logic_error("F endpoint has no active transaction");
+        const Pending& pending = *space.route->pending;
+        if (pending.materializing || !pending.dialogue ||
+            pending.dialogue.state() != ProfileDialogueState::Materialized ||
+            pending.begin != materialized.begin ||
+            !materialized.prepared_input.valid())
+            throw StaleCompletion();
+        return config.input_job_state
+                   ? config.input_job_state(
+                         *session.c_guid, materialized.begin,
+                         materialized.commit,
+                         materialized.prepared_input.exact_input())
+                   : InputJobState::Open;
+    }
+
+    TxCommit commit_materialized(
+        const Session& session, MaterializedInput materialized,
+        InputJobState job_state,
         std::optional<InputRecordKey>& candidate_input,
         std::optional<InputRecordKey>& completed_input,
         std::optional<InputRecordKey>& committed_input) {
@@ -1457,33 +1855,19 @@ struct P50ServerEndpoint::Impl {
             throw std::logic_error("F endpoint has no active transaction");
         Route& route = *space.route;
         Pending& pending = *route.pending;
-        if (pending.dialogue.state() != ProfileDialogueState::BodyClosed)
-            throw std::logic_error("input cannot materialize before BODY closure");
-        std::vector<uint8_t> exact = pending.dialogue.materialize();
-        record(ActionType::INPUT_MATERIALIZED, session, &pending.begin);
-        committed_begin = pending.begin;
-        TxCommit commit{pending.begin.history_nonce,
-                        pending.begin.rel_seq,
-                        pending.begin.tu_seq,
-                        pending.begin.transaction_digest,
-                        pending.begin.raw_digest,
-                        compute_post_state_digest(pending.begin.pre_state_digest,
-                                                  pending.begin.history_nonce,
-                                                  pending.begin.rel_seq, pending.begin.tu_seq,
-                                                  pending.begin.transaction_digest)};
+        if (pending.materializing || !pending.dialogue ||
+            pending.dialogue.state() != ProfileDialogueState::Materialized ||
+            pending.begin != materialized.begin)
+            throw StaleCompletion();
         Revision& revision = require_revision_advance(*session.c_guid);
-        const InputRecordKey input_key{*session.c_guid, pending.begin.tu_seq};
+        const InputRecordKey input_key = materialized.prepared_input.key();
         candidate_input = input_key;
-        const InputJobState job_state = config.input_job_state
-                                            ? config.input_job_state(*session.c_guid,
-                                                                     pending.begin, commit, exact)
-                                            : InputJobState::Open;
         const InputPublishResult publication =
             job_state == InputJobState::Open
-                ? input_records.publish(*session.c_guid, pending.begin, commit,
-                                        std::move(exact))
+                ? input_records.commit_prepared(
+                      std::move(materialized.prepared_input))
                 : input_records.observe_closed_job_commit(
-                      *session.c_guid, pending.begin, commit, exact);
+                      std::move(materialized.prepared_input));
         completed_input = input_key;
         if (job_state == InputJobState::Open &&
             publication != InputPublishResult::NotRetainedJobClosed &&
@@ -1494,15 +1878,16 @@ struct P50ServerEndpoint::Impl {
             space.last_input.reset();
         }
         advance_revision(revision);
-        route.state = commit.post_state_digest;
+        route.state = materialized.commit.post_state_digest;
         ++route.next_rel.value;
-        route.last_commit = commit;
+        route.last_commit = materialized.commit;
         route.interrupted.reset();
-        pending.dialogue.commit_visible(commit);
+        pending.dialogue.commit_visible(materialized.commit);
         release_pending(pending);
         route.pending.reset();
-        record(ActionType::INPUT_COMMITTED, session, &committed_begin, commit.post_state_digest);
-        return commit;
+        record(ActionType::INPUT_COMMITTED, session, &materialized.begin,
+               materialized.commit.post_state_digest);
+        return materialized.commit;
     }
 
     FStoreGuid f_guid{};
@@ -1520,7 +1905,7 @@ struct P50ServerEndpoint::Impl {
     ActionTrace* actions = nullptr;
     InputRecordStore input_records;
     P50ServerEndpointConfig config{};
-    tcp::socket* active_socket = nullptr;
+    ServerIoState* active_io = nullptr;
 };
 
 // The live-session row is inserted before the shared reducer coroutine is
@@ -1552,6 +1937,9 @@ public:
     }
 
     [[nodiscard]] uint64_t serial() const noexcept { return session_.serial; }
+    [[nodiscard]] const Impl::Session& session() const noexcept {
+        return session_;
+    }
 
     void reset() noexcept {
         if (owner_ != nullptr) {
@@ -1656,15 +2044,15 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
         Impl& owner;
         tcp::socket* socket;
         ~ActiveSocketGuard() {
-            if (owner.active_socket == socket) {
-                owner.active_socket = nullptr;
+            if (owner.socket_for_test_cancel == socket) {
+                owner.socket_for_test_cancel = nullptr;
                 owner.active_cancel_requested = false;
                 owner.active_remote_transmission_may_have_begun = false;
                 owner.active_cancellation = ClientCancellationDisposition::None;
             }
         }
-    } active_socket_guard{*impl_, &socket};
-    impl_->active_socket = &socket;
+    } socket_cancel_guard{*impl_, &socket};
+    impl_->socket_for_test_cancel = &socket;
     impl_->active_cancel_requested = false;
     impl_->active_remote_transmission_may_have_begun = false;
     impl_->active_cancellation = ClientCancellationDisposition::None;
@@ -1678,10 +2066,19 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
                 close_now(io->socket);
         });
     }
+    const auto deadline_crossed = [&]() {
+        return deadline.has_value() &&
+               std::chrono::steady_clock::now() >= *deadline;
+    };
+    const auto require_deadline = [&]() {
+        if (deadline_crossed())
+            throw boost::system::system_error(asio::error::timed_out);
+    };
     ClientRunResult result;
     uint32_t terminal_cap = impl_->caps.wire.max_frame_payload;
     const auto verify = [&](const CompletionStamp& expected) {
         impl_->owner.require();
+        require_deadline();
         CompletionStamp observed = expected;
         if (control.before_completion_check)
             control.before_completion_check(observed);
@@ -1691,8 +2088,10 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
         if (control.before_live_identity_check)
             control.before_live_identity_check(expected, live);
         require_live_completion(expected, live);
+        require_deadline();
     };
     try {
+        require_deadline();
         if (remote)
             co_await async_connect(socket, *remote,
                                    impl_->stamp(session, AsyncOperationKind::Connect),
@@ -1751,10 +2150,12 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
             peer.history_nonce == impl_->history_nonce &&
             peer.next_rel_seq.value == impl_->active->begin.rel_seq.value + 1 &&
             peer.state_digest == peer.last_commit->post_state_digest) {
+            require_deadline();
             impl_->accept(*peer.last_commit, ActionType::LOST_COMMIT_ACCEPTED, serial);
             io->committed = true;
             result.committed_commit = *peer.last_commit;
             result.committed_input = InputRecordKey{impl_->c_guid, peer.last_commit->tu_seq};
+            result.settlement = ClientRunSettlement::CommittedInput;
             result.status = ClientRunStatus::Committed;
             result.reconnect = EndpointReconnectOutcome::LostFinalAcknowledgement;
             close_now(socket);
@@ -1779,7 +2180,9 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
         } else {
             result.reconnect = same_f ? EndpointReconnectOutcome::RouteHistoryReset
                                       : EndpointReconnectOutcome::ColdFStore;
-            result.whole_new_attempt = impl_->active.has_value();
+            // A different route is an observation only; an endpoint-local
+            // result cannot authorize a replacement attempt.
+            result.settlement = ClientRunSettlement::ReconcileRequired;
             PreparedZstdTUPtr retry = impl_->active ? impl_->active->prepared : impl_->queued;
             if (same_f && peer.route_present)
                 impl_->advance_nonce_past(peer.history_nonce);
@@ -1860,10 +2263,12 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
             if (commit_frame.type == MessageType::ERROR)
                 throw ClientTerminalResult(decode_as<ErrorMessage>(commit_frame), frame_cap);
             const TxCommit commit = decode_as<TxCommit>(commit_frame);
+            require_deadline();
             impl_->accept(commit, ActionType::COMMIT_ACCEPTED, serial);
             io->committed = true;
             result.committed_commit = commit;
             result.committed_input = InputRecordKey{impl_->c_guid, commit.tu_seq};
+            result.settlement = ClientRunSettlement::CommittedInput;
         });
         result.status = ClientRunStatus::Committed;
         close_now(socket);
@@ -1875,7 +2280,9 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
         result.status = ClientRunStatus::Disconnected;
     } catch (const boost::system::system_error&) {
         close_now(socket);
-        result.status = ClientRunStatus::Disconnected;
+        result.status = io->expired || deadline_crossed()
+                            ? ClientRunStatus::DeadlineExceeded
+                            : ClientRunStatus::Disconnected;
     } catch (const std::bad_alloc&) {
         close_now(socket);
         if (impl_->active_session == serial)
@@ -1927,15 +2334,15 @@ std::optional<tcp::socket> P50ClientEndpoint::adopt_connected_fd(
     return P50ServerEndpoint::adopt_connected_fd(executor, fd, error);
 }
 
-void P50ClientEndpoint::cancel_active_io() noexcept {
-    if (impl_->active_socket == nullptr)
+void P50ClientEndpoint::request_cancel_for_test() noexcept {
+    if (impl_->socket_for_test_cancel == nullptr)
         return;
     impl_->active_cancel_requested = true;
     impl_->active_cancellation =
         impl_->active_remote_transmission_may_have_begun || impl_->active
             ? ClientCancellationDisposition::ReconcileRequired
             : ClientCancellationDisposition::AbortedPreDurable;
-    close_now(*impl_->active_socket);
+    close_now(*impl_->socket_for_test_cancel);
 }
 
 CStoreGuid P50ClientEndpoint::c_store_guid() const {
@@ -2014,7 +2421,84 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_adopted(
     const Impl::Session session = impl_->allocate_session();
     SessionRegistration registration(*impl_, session);
     co_return co_await run_connected(std::move(socket), std::move(registration),
-                                     std::move(control), nullptr);
+                                     std::move(control), nullptr, std::nullopt,
+                                     std::nullopt);
+}
+
+boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_adopted(
+    sidecar::P5coEndpointHandoff handoff, EndpointIoControl control) {
+    impl_->owner.require();
+    ServerRunResult invalid;
+    if (!handoff.valid() ||
+        handoff.outcome().kind !=
+            daemon::P50CacheSessionOutcomeKind::Adopted ||
+        handoff.outcome().f_store_guid != impl_->f_guid.bytes) {
+        co_return invalid;
+    }
+
+    const daemon::P50CacheSessionOutcome exact_outcome = handoff.outcome();
+    const std::optional<daemon::P50CacheSessionWireClaim> exact_claim =
+        daemon::decode_cache_session_wire_claim(
+            exact_outcome.canonical_claim);
+    if (!exact_claim.has_value())
+        co_return invalid;
+    const CStoreGuid expected_c_store_guid{
+        exact_claim->binding.arm.c_store_guid};
+    const sidecar::AbsoluteMonotonicDeadline exact_deadline =
+        handoff.deadline();
+    sidecar::SystemMonotonicObservationSource observations;
+    const std::optional<sidecar::MonotonicObservation> observed =
+        observations.observe();
+    if (!observed.has_value() || !observed->valid() ||
+        !exact_deadline.matches_clock(observed->clock) ||
+        observed->now_ns >= exact_deadline.expires_at_ns) {
+        invalid.status = ServerRunStatus::DeadlineExceeded;
+        co_return invalid;
+    }
+
+    std::unique_ptr<sidecar::P5coAdoptedSocketLease> lease =
+        handoff.take_lease_for_endpoint();
+    if (!lease)
+        co_return invalid;
+    struct LeaseFailureFence {
+        sidecar::P5coAdoptedSocketLease* lease = nullptr;
+        ~LeaseFailureFence() {
+            if (lease != nullptr)
+                lease->fence();
+        }
+        void dismiss() noexcept { lease = nullptr; }
+    } lease_failure_fence{lease.get()};
+    if (!lease->revalidate(exact_outcome, exact_deadline)) {
+        co_return invalid;
+    }
+    const int adopted_fd =
+        lease->release_native_fd_for_endpoint(exact_outcome, exact_deadline);
+    if (adopted_fd < 0) {
+        co_return invalid;
+    }
+
+    const auto executor = co_await asio::this_coro::executor;
+    boost::system::error_code adoption_error;
+    std::optional<tcp::socket> socket =
+        adopt_connected_fd(executor, adopted_fd, adoption_error);
+    if (!socket) {
+        // The endpoint adoption path consumed/closed adopted_fd.  Fence the
+        // exact detached operation as well; descriptor cleanup alone is not an
+        // operation-level terminal witness.
+        co_return invalid;
+    }
+
+    const Impl::Session session =
+        impl_->allocate_session(exact_outcome.operation, exact_deadline);
+    SessionRegistration registration(*impl_, session);
+    // From here the exact typed session registration and connected reducer own
+    // terminal settlement.  Before this point every exception or early return
+    // fences the consumed post-P5CO authority exactly once.
+    lease_failure_fence.dismiss();
+    co_return co_await run_connected(
+        std::move(*socket), std::move(registration), std::move(control),
+        nullptr, exact_deadline,
+        expected_c_store_guid);
 }
 
 boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::accept_one(tcp::acceptor& acceptor,
@@ -2025,34 +2509,99 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::accept_one(tcp::accep
     tcp::socket socket(executor);
     SessionRegistration registration(*impl_, session);
     co_return co_await run_connected(std::move(socket), std::move(registration),
-                                     std::move(control), &acceptor);
+                                     std::move(control), &acceptor,
+                                     std::nullopt, std::nullopt);
 }
 
 boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
-    tcp::socket socket, SessionRegistration registration, EndpointIoControl control,
-    tcp::acceptor* acceptor) {
+    tcp::socket socket_value, SessionRegistration registration,
+    EndpointIoControl control,
+    tcp::acceptor* acceptor,
+    std::optional<sidecar::AbsoluteMonotonicDeadline> deadline,
+    std::optional<CStoreGuid> expected_c_store_guid) {
     impl_->owner.require();
-    const uint64_t session_serial = registration.serial();
-    Impl::Session session{.serial = session_serial,
-                          .f_guid = impl_->f_guid,
-                          .c_guid = std::nullopt,
-                          .candidate_revision = 0,
-                          .candidate_state = std::nullopt,
-                          .activated = false};
+    Impl::Session session = registration.session();
     ServerRunResult result;
     result.session_serial = session.serial;
-    struct ActiveSocketGuard {
-        Impl& owner;
-        tcp::socket* socket;
-        ~ActiveSocketGuard() {
-            if (owner.active_socket == socket)
-                owner.active_socket = nullptr;
+    auto io = std::make_shared<ServerIoState>(
+        std::move(socket_value), session.operation, session.deadline);
+    tcp::socket& socket_for_run = io->socket;
+    struct TimerCancelGuard {
+        std::shared_ptr<ServerIoState> io;
+        ~TimerCancelGuard() {
+            boost::system::error_code ignored;
+            io->deadline_timer.cancel(ignored);
+            io->deadline_timer.close(ignored);
         }
-    } active_socket_guard{*impl_, &socket};
-    impl_->active_socket = &socket;
+    } timer_cancel_guard{io};
+    sidecar::SystemMonotonicObservationSource deadline_observations;
+    const auto deadline_crossed = [&]() {
+        if (!deadline)
+            return false;
+        const std::optional<sidecar::MonotonicObservation> observed =
+            deadline_observations.observe();
+        return !observed.has_value() || !observed->valid() ||
+               !deadline->matches_clock(observed->clock) ||
+               observed->now_ns >= deadline->expires_at_ns;
+    };
+    if (deadline_crossed()) {
+        close_now(socket_for_run);
+        result.status = ServerRunStatus::DeadlineExceeded;
+        co_return result;
+    }
+    if (deadline) {
+        boost::system::error_code timer_error;
+        if (!arm_absolute_deadline_timer(*io, *deadline, timer_error)) {
+            close_now(socket_for_run);
+            result.status = ServerRunStatus::TerminalError;
+            co_return result;
+        }
+        io->deadline_timer.async_wait(
+            asio::posix::stream_descriptor::wait_read,
+            [io](const boost::system::error_code& error) {
+                if (error)
+                    return;
+                uint64_t expirations = 0;
+                const ssize_t drained =
+                    ::read(io->deadline_timer.native_handle(), &expirations,
+                           sizeof(expirations));
+                if (drained < 0 && errno != EAGAIN &&
+                    errno != EWOULDBLOCK)
+                    io->cancelled = true;
+                io->expired = true;
+                if (auto materialization = io->materialization.lock()) {
+                    cancel_materialization_notification(materialization);
+                }
+                close_now(io->socket);
+            });
+    }
+    const auto require_deadline = [&]() {
+        if (deadline_crossed())
+            throw boost::system::system_error(asio::error::timed_out);
+    };
+    const auto require_operation = [&]() {
+        if (io->operation != session.operation ||
+            io->deadline != session.deadline ||
+            io->deadline != deadline)
+            throw StaleCompletion();
+        if (io->cancelled)
+            throw boost::system::system_error(asio::error::operation_aborted);
+        require_deadline();
+    };
+    struct ActiveIoGuard {
+        Impl& owner;
+        ServerIoState* io;
+        ~ActiveIoGuard() {
+            if (owner.active_io == io)
+                owner.active_io = nullptr;
+        }
+    } active_io_guard{*impl_, io.get()};
+    impl_->active_io = io.get();
+    tcp::socket& socket = socket_for_run;
     uint32_t reply_cap = impl_->caps.wire.max_frame_payload;
     const auto verify = [&](const CompletionStamp& expected) {
         impl_->owner.require();
+        require_operation();
         CompletionStamp observed = expected;
         if (control.before_completion_check)
             control.before_completion_check(observed);
@@ -2062,9 +2611,15 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
         if (control.before_live_identity_check)
             control.before_live_identity_check(expected, live);
         require_live_completion(expected, live);
+        // Both completion hooks are arbitrary owner-affine product callbacks.
+        // They may cross the absolute deadline or synchronously request
+        // cancellation, so their identity observation is not the final
+        // operation/deadline observation for this completion.
+        require_operation();
     };
     std::optional<ErrorMessage> terminal_error;
     try {
+        require_operation();
         if (acceptor != nullptr) {
             co_await async_accept(*acceptor, socket,
                                   impl_->stamp(session, AsyncOperationKind::Accept),
@@ -2074,6 +2629,10 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
             socket, impl_->caps.wire.max_frame_payload,
             impl_->stamp(session, AsyncOperationKind::ReadHeader), impl_->completions, verify);
         SessionHello hello = decode_as<SessionHello>(hello_frame);
+        if (expected_c_store_guid.has_value() &&
+            hello.c_store_guid != *expected_c_store_guid)
+            throw std::invalid_argument(
+                "SESSION_HELLO differs from the adopted P5CO claim");
         result.c_store_guid = hello.c_store_guid;
         reply_cap = std::min(reply_cap, hello.limits.max_frame_payload);
         const SessionSelection selection =
@@ -2136,12 +2695,29 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
             }
         } while (!impl_->body_complete(session));
 
-        TxBegin committed_begin;
-        const TxCommit commit =
-            impl_->materialize_and_commit(session, committed_begin,
-                                          result.candidate_input,
-                                          result.completed_input,
-                                          result.committed_input);
+        ServerMaterializationJob materialization =
+            impl_->begin_materialization(
+                session, std::move(control.before_materialize_on_worker));
+        ServerMaterializationCompletion materialization_completion =
+            co_await async_materialize(std::move(materialization), io);
+        // The codec worker owns no publication authority.  Revalidate the
+        // exact owner operation after its completion and before moving the
+        // dialogue or exact bytes back into owner-visible state.
+        require_operation();
+        Impl::MaterializedInput materialized =
+            impl_->finish_materialization(
+                session, std::move(materialization_completion));
+        const InputJobState job_state =
+            impl_->select_materialized_job_state(session, materialized);
+        // The selector is a product callback and may run for arbitrarily long.
+        // Sample the original absolute deadline again after it returns and
+        // immediately before the allocation-free owner publication seam.
+        require_operation();
+        const TxBegin committed_begin = materialized.begin;
+        const TxCommit commit = impl_->commit_materialized(
+            session, std::move(materialized), job_state,
+            result.candidate_input,
+            result.completed_input, result.committed_input);
         co_await async_write_message(
             socket, commit, selection.limits.max_frame_payload,
             impl_->stamp(session, AsyncOperationKind::WriteFragment, &committed_begin),
@@ -2161,7 +2737,9 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
     } catch (const boost::system::system_error&) {
         close_now(socket);
         impl_->disconnect(session, true);
-        result.status = ServerRunStatus::Disconnected;
+        result.status = io->expired || deadline_crossed()
+                            ? ServerRunStatus::DeadlineExceeded
+                            : ServerRunStatus::Disconnected;
         co_return result;
     } catch (const std::exception& error) {
         terminal_error = bounded_error(impl_->config.protocol_error_code,
@@ -2170,6 +2748,12 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
 
     // C++ forbids a coroutine suspension directly inside an exception handler.
     // Preserve the bounded reply there and send it on the ordinary coroutine path.
+    if (io->expired || deadline_crossed()) {
+        close_now(socket);
+        impl_->disconnect(session, true);
+        result.status = ServerRunStatus::DeadlineExceeded;
+        co_return result;
+    }
     try {
         co_await async_write_message(socket, *terminal_error, reply_cap,
                                      impl_->stamp(session, AsyncOperationKind::WriteFragment),
@@ -2185,9 +2769,15 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
     co_return result;
 }
 
-void P50ServerEndpoint::cancel_active_io() noexcept {
-    if (impl_->active_socket != nullptr)
-        close_now(*impl_->active_socket);
+void P50ServerEndpoint::request_cancel_for_test() noexcept {
+    if (impl_->active_io != nullptr) {
+        impl_->active_io->cancelled = true;
+        if (auto materialization =
+                impl_->active_io->materialization.lock()) {
+            cancel_materialization_notification(materialization);
+        }
+        close_now(impl_->active_io->socket);
+    }
 }
 
 void P50ServerEndpoint::reset_store(FStoreGuid new_guid) {
@@ -2198,12 +2788,15 @@ void P50ServerEndpoint::reset_store(FStoreGuid new_guid) {
         throw std::invalid_argument("F store reset requires a fresh GUID");
     for (auto& [guid, space] : impl_->namespaces) {
         if (space.route && space.route->pending) {
-            space.route->pending->dialogue.disconnect();
+            if (space.route->pending->dialogue)
+                space.route->pending->dialogue.disconnect();
             impl_->release_pending(*space.route->pending);
         }
         if (space.active_session != 0) {
             Impl::Session invalidated{.serial = space.active_session,
                                       .f_guid = impl_->f_guid,
+                                      .operation = std::nullopt,
+                                      .deadline = std::nullopt,
                                       .c_guid = guid,
                                       .candidate_revision = 0,
                                       .candidate_state = std::nullopt,

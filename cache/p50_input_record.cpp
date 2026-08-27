@@ -8,6 +8,43 @@
 
 namespace icecc::p50 {
 
+struct InputRecordStore::PreparedPublish::State {
+    explicit State(InputRecordStore::Records::node_type node_value)
+        : node(std::move(node_value)) {}
+
+    InputRecordStore::Records::node_type node;
+};
+
+InputRecordStore::PreparedPublish::PreparedPublish() noexcept = default;
+InputRecordStore::PreparedPublish::~PreparedPublish() = default;
+InputRecordStore::PreparedPublish::PreparedPublish(
+    PreparedPublish&&) noexcept = default;
+InputRecordStore::PreparedPublish&
+InputRecordStore::PreparedPublish::operator=(PreparedPublish&&) noexcept =
+    default;
+
+InputRecordStore::PreparedPublish::PreparedPublish(
+    std::unique_ptr<State> state) noexcept
+    : state_(std::move(state)) {}
+
+bool InputRecordStore::PreparedPublish::valid() const noexcept {
+    return state_ && !state_->node.empty();
+}
+
+InputRecordKey InputRecordStore::PreparedPublish::key() const {
+    if (!valid())
+        throw std::logic_error("empty prepared InputRecord publication");
+    return state_->node.key();
+}
+
+std::span<const uint8_t>
+InputRecordStore::PreparedPublish::exact_input() const {
+    if (!valid() || !state_->node.mapped().backing)
+        throw std::logic_error(
+            "prepared InputRecord publication lost immutable input");
+    return *state_->node.mapped().backing;
+}
+
 size_t InputRecordKeyHash::operator()(const InputRecordKey& key) const noexcept {
     const size_t guid_hash = Id128Hash{}(key.c_store_guid);
     const size_t tu_hash = std::hash<uint64_t>{}(key.tu_seq.value);
@@ -39,6 +76,10 @@ InputRecordStore::InputRecordStore(size_t max_records,
     if (max_records_ == 0 || max_retained_bytes_ == 0)
         throw std::invalid_argument(
             "InputRecordStore record and byte limits must be nonzero");
+    // No commit-time bucket allocation: prepare_publish allocates each node,
+    // while this one construction-time reservation covers the store's full
+    // configured record bound.
+    records_.reserve(max_records_);
 }
 
 void InputRecordStore::validate_commit(
@@ -87,14 +128,45 @@ void InputRecordStore::validate_existing(
 InputPublishResult InputRecordStore::publish(
     CStoreGuid c_store_guid, const TxBegin& begin, const TxCommit& commit,
     std::vector<uint8_t> exact_input) {
+    return commit_prepared(prepare_publish(
+        c_store_guid, begin, commit, std::move(exact_input)));
+}
+
+InputRecordStore::PreparedPublish InputRecordStore::prepare_publish(
+    CStoreGuid c_store_guid, const TxBegin& begin, const TxCommit& commit,
+    std::vector<uint8_t> exact_input) {
     if (c_store_guid == CStoreGuid{})
         throw std::invalid_argument("InputRecord C_STORE_GUID zero is reserved");
 
     validate_commit(begin, commit, exact_input);
     const InputRecordKey key{c_store_guid, begin.tu_seq};
+    auto mutable_backing =
+        std::make_shared<std::vector<uint8_t>>(std::move(exact_input));
+    std::shared_ptr<const std::vector<uint8_t>> backing =
+        std::move(mutable_backing);
+    Entry entry{begin.raw_bytes, begin.raw_digest, begin, commit,
+                std::move(backing), true};
+    Records staging;
+    staging.reserve(1);
+    const auto [position, inserted] = staging.emplace(key, std::move(entry));
+    if (!inserted)
+        throw std::logic_error(
+            "prepared InputRecord staging lost unique key ownership");
+    return PreparedPublish(
+        std::make_unique<PreparedPublish::State>(staging.extract(position)));
+}
+
+InputPublishResult InputRecordStore::commit_prepared(
+    PreparedPublish prepared) {
+    if (!prepared.valid())
+        throw std::invalid_argument(
+            "empty prepared InputRecord publication reached owner");
+    const InputRecordKey key = prepared.state_->node.key();
+    const Entry& candidate = prepared.state_->node.mapped();
     const auto existing = records_.find(key);
     if (existing != records_.end()) {
-        validate_existing(existing->second, begin, commit, exact_input);
+        validate_existing(existing->second, candidate.begin,
+                          candidate.commit, *candidate.backing);
         if (!existing->second.logical_job_open)
             throw std::logic_error(
                 "open logical job named an already-closed InputRecord");
@@ -103,21 +175,32 @@ InputPublishResult InputRecordStore::publish(
 
     if (records_.size() >= max_records_)
         throw std::length_error("InputRecordStore record limit exceeded");
-    if (begin.raw_bytes > max_retained_bytes_ - retained_bytes_)
+    if (candidate.raw_bytes > max_retained_bytes_ - retained_bytes_)
         throw std::length_error("InputRecordStore byte limit exceeded");
 
-    auto mutable_backing =
-        std::make_shared<std::vector<uint8_t>>(std::move(exact_input));
-    std::shared_ptr<const std::vector<uint8_t>> backing =
-        std::move(mutable_backing);
-    Entry entry{begin.raw_bytes, begin.raw_digest, begin, commit,
-                std::move(backing), true};
-    const auto [position, inserted] = records_.emplace(key, std::move(entry));
-    (void)position;
-    if (!inserted)
+    const uint64_t raw_bytes = candidate.raw_bytes;
+    auto insertion = records_.insert(std::move(prepared.state_->node));
+    if (!insertion.inserted)
         throw std::logic_error("InputRecordStore insertion lost key ownership");
-    retained_bytes_ += begin.raw_bytes;
+    prepared.state_.reset();
+    retained_bytes_ += raw_bytes;
     return InputPublishResult::Published;
+}
+
+InputPublishResult InputRecordStore::observe_closed_job_commit(
+    PreparedPublish prepared) {
+    if (!prepared.valid())
+        throw std::invalid_argument(
+            "empty prepared closed-job publication reached owner");
+    const InputRecordKey key = prepared.state_->node.key();
+    const Entry& candidate = prepared.state_->node.mapped();
+    const auto existing = records_.find(key);
+    if (existing == records_.end())
+        return InputPublishResult::NotRetainedJobClosed;
+    validate_existing(existing->second, candidate.begin, candidate.commit,
+                      *candidate.backing);
+    existing->second.logical_job_open = false;
+    return InputPublishResult::Existing;
 }
 
 InputPublishResult InputRecordStore::observe_closed_job_commit(

@@ -20,6 +20,7 @@ icecc_LDADD = \
 	libclient.a \
 	libp50zstdsender.a \
 	../cache/libp50endpoint.a \
+	../cache/libp50adoptedoutcomewriter.a \
 	../cache/libprotocol50.a \
 	../services/libicecc.la \
 	$(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
