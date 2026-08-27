@@ -154,4 +154,4 @@ sed 's/P5coEndpointHandoff handoff(std::move(lease_), std::move(outcome_), deadl
     "$impl" >"$mutant_dir/drop-handoff-outcome.cpp"
 run_rejected_mutant drop-handoff-outcome "$mutant_dir/drop-handoff-outcome.cpp"
 
-echo 'ok - P5CO adopted outcome reducer source/deletion gates hold (12 compiled mutants rejected)'
+echo 'ok - P5CO adopted outcome reducer source/deletion gates hold (11 compiled mutants rejected)'
