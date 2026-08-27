@@ -119,6 +119,42 @@ protected:
     P5coAdoptedSocketLease() = default;
 };
 
+// The endpoint must receive the complete authority bundle, not only a socket
+// pointer.  It is move-only and fences an unconsumed retained lease on
+// destruction; take_lease() is the sole one-shot extraction operation.
+class P5coEndpointHandoff {
+public:
+    P5coEndpointHandoff(const P5coEndpointHandoff&) = delete;
+    P5coEndpointHandoff& operator=(const P5coEndpointHandoff&) = delete;
+    P5coEndpointHandoff(P5coEndpointHandoff&& other) noexcept;
+    P5coEndpointHandoff& operator=(P5coEndpointHandoff&& other) noexcept;
+    ~P5coEndpointHandoff() noexcept;
+
+    [[nodiscard]] bool valid() const noexcept {
+        return lease_ && outcome_.valid() && deadline_.valid();
+    }
+    [[nodiscard]] const daemon::P50CacheSessionOutcome& outcome() const noexcept {
+        return outcome_;
+    }
+    [[nodiscard]] const AbsoluteMonotonicDeadline& deadline() const noexcept {
+        return deadline_;
+    }
+    [[nodiscard]] std::unique_ptr<P5coAdoptedSocketLease>
+    take_lease() noexcept;
+
+private:
+    friend class AdoptedOutcomeWriter;
+    P5coEndpointHandoff(std::unique_ptr<P5coAdoptedSocketLease> lease,
+                        daemon::P50CacheSessionOutcome outcome,
+                        AbsoluteMonotonicDeadline deadline) noexcept;
+    void fence_owned() noexcept;
+
+    std::unique_ptr<P5coAdoptedSocketLease> lease_;
+    daemon::P50CacheSessionOutcome outcome_;
+    AbsoluteMonotonicDeadline deadline_{};
+    bool fenced_ = false;
+};
+
 class AdoptedOutcomeWriter {
 public:
     struct Limits {
@@ -149,11 +185,9 @@ public:
     // CLOCK_MONOTONIC observation source; callers cannot supply or renew time.
     P5coWriterState advance(short revents) noexcept;
 
-    // Transfers the same retained lease to the endpoint only after the full
-    // P5CO frame has flushed and while the original deadline remains valid.
-    // Identity is checked first, followed by a fresh monotonic observation.
-    // A failed/expired writer never returns a lease.
-    [[nodiscard]] std::unique_ptr<P5coAdoptedSocketLease>
+    // Transfers the complete authority bundle only after the full P5CO frame
+    // has flushed and while the original deadline remains valid.
+    [[nodiscard]] std::optional<P5coEndpointHandoff>
     take_for_endpoint() noexcept;
 
     [[nodiscard]] P5coWriterState state() const noexcept { return state_; }

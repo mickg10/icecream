@@ -39,7 +39,9 @@ TESTS += p50cachesessionwire p50cachesessionwire-source.sh \
 	p50cachesessionwire-mutants.sh p50cachesessionwire-sanitize.sh
 TESTS += p50daemoncontrol p50daemoncontrol-source.sh \
 	p50daemoncontrol-mutants.sh p50_daemon_control_sanitize.sh
-TESTS += p50_adopted_outcome_writer-run.sh p50_adopted_outcome_writer-source.sh
+TESTS += p50_adopted_outcome_writer-run.sh \
+	p50_adopted_outcome_writer-source.sh \
+	p50_adopted_outcome_writer-sanitize.sh
 
 AM_TESTS_ENVIRONMENT = \
 	ICECC_TEST_BUILDDIR='$(abs_builddir)'; export ICECC_TEST_BUILDDIR; \
@@ -422,6 +424,7 @@ EXTRA_DIST += p50daemoncontrol-source.sh p50daemoncontrol-mutants.sh \
 	p50_daemon_control_sanitize.sh
 EXTRA_DIST += p50_adopted_outcome_writer-run.sh \
 	p50_adopted_outcome_writer-source.sh \
+	p50_adopted_outcome_writer-sanitize.sh \
 	p50_adopted_outcome_writer_test.cpp
 
 # Make the tests also print the test log if they fail.
