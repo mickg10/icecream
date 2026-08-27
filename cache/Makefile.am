@@ -1,7 +1,7 @@
 noinst_LIBRARIES = libprotocol50.a libp50endpoint.a libp50localtransport.a \
 	libp50sidecarsupervisor.a libp50sidecarlifecycle.a libp50readyadvertisement.a libp50roleowner.a \
 	libp50daemonsidecaradapter.a libp50inputfd.a libp50inputlifecycle.a \
-	libp50sessionjoin.a
+	libp50sessionjoin.a libp50adoptedoutcomewriter.a
 
 sbin_PROGRAMS = icecc-cache-service
 
@@ -63,6 +63,9 @@ libp50roleowner_a_SOURCES = p50_role_owner.cpp p50_role_owner.h
 libp50sessionjoin_a_SOURCES = p50_cache_session_join.cpp \
 	p50_cache_session_join.h
 libp50sessionjoin_a_CPPFLAGS = $(AM_CPPFLAGS)
+libp50adoptedoutcomewriter_a_SOURCES = p50_adopted_outcome_writer.cpp \
+	p50_adopted_outcome_writer.h
+libp50adoptedoutcomewriter_a_CPPFLAGS = $(AM_CPPFLAGS)
 
 EXTRA_DIST = \
 	p50_control_operation.h \
@@ -183,6 +186,8 @@ EXTRA_DIST = \
 	P50_CACHE_SESSION_JOIN.md \
 	P50_SOURCE_INGRESS.md \
 	P50_PREBOUND_TWO_ROLE.md \
+	p50_adopted_outcome_writer.cpp \
+	p50_adopted_outcome_writer.h \
 	formal/README.md
 
 check-local:

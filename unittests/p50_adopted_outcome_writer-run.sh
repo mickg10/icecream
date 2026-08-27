@@ -10,6 +10,7 @@ trap 'rm -f "$out"' EXIT HUP INT TERM
 "$cxx" -std=c++20 -Wall -Wextra -Werror \
     -I"$src/cache" -I"$src/services" -I"$src" \
     "$src/cache/p50_adopted_outcome_writer.cpp" \
+    "$src/services/p50_cache_session_wire.cpp" \
     "$src/unittests/p50_adopted_outcome_writer_test.cpp" \
     -o "$out"
 "$out"
