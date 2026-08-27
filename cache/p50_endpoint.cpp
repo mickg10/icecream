@@ -173,7 +173,7 @@ private:
 
 void set_client_terminal_result(ClientRunResult& result, ErrorMessage error) {
     result.status = ClientRunStatus::TerminalError;
-    result.settlement = ClientRunSettlement::Unresolved;
+    result.observation = ClientRunObservation::PeerTerminalFrame;
     result.terminal_error = std::move(error);
 }
 
@@ -214,7 +214,22 @@ struct ClientIoState {
     bool committed = false;
 };
 
+class ClientRunSocketTarget final : public EndpointSocketTarget {
+public:
+    explicit ClientRunSocketTarget(std::weak_ptr<ClientIoState> io) noexcept
+        : io_(std::move(io)) {}
+    void cancel() noexcept override {
+        if (const auto io = io_.lock())
+            close_now(io->socket);
+    }
+
+private:
+    std::weak_ptr<ClientIoState> io_;
+};
+
 struct ServerMaterializationAsyncState;
+void cancel_materialization_notification(
+    const std::shared_ptr<ServerMaterializationAsyncState>& state) noexcept;
 
 // Server timers own the adopted socket through shared state for the same
 // reason as the client timer above: a cancelled or late handler must never
@@ -236,6 +251,23 @@ struct ServerIoState {
     std::weak_ptr<ServerMaterializationAsyncState> materialization;
     bool expired = false;
     bool cancelled = false;
+};
+
+class ServerRunSocketTarget final : public EndpointSocketTarget {
+public:
+    explicit ServerRunSocketTarget(std::weak_ptr<ServerIoState> io) noexcept
+        : io_(std::move(io)) {}
+    void cancel() noexcept override {
+        if (const auto io = io_.lock()) {
+            io->cancelled = true;
+            if (auto materialization = io->materialization.lock())
+                cancel_materialization_notification(materialization);
+            close_now(io->socket);
+        }
+    }
+
+private:
+    std::weak_ptr<ServerIoState> io_;
 };
 
 bool arm_absolute_deadline_timer(
@@ -982,10 +1014,17 @@ struct P50ClientEndpoint::Impl {
 
     Impl(std::shared_ptr<P50PreparationAuthority> preparation_value, EndpointCaps cap_value,
          HistoryNonce first_nonce,
-         CompletionLog* completion_log, ActionTrace* action_trace)
+         CompletionLog* completion_log, ActionTrace* action_trace,
+         std::optional<EndpointRunIdentity> run_identity_value,
+         std::function<void(EndpointCancelPermit)> admitted_callback,
+         std::function<void(EndpointCancelPermit, EndpointTerminalResult)>
+             terminal_callback)
         : preparation(std::move(preparation_value)), caps(cap_value),
           next_nonce(first_nonce.value),
-          completions(completion_log), actions(action_trace) {
+          completions(completion_log), actions(action_trace),
+          run_identity_seed(std::move(run_identity_value)),
+          on_run_admitted(std::move(admitted_callback)),
+          on_run_terminal(std::move(terminal_callback)) {
         if (!preparation)
             throw std::invalid_argument("C endpoint requires its preparation authority");
         c_guid = preparation->c_store_guid();
@@ -1145,11 +1184,16 @@ struct P50ClientEndpoint::Impl {
     PreparedZstdTUPtr queued;
     CompletionLog* completions = nullptr;
     ActionTrace* actions = nullptr;
+    EndpointRunRegistry endpoint_runs;
+    std::optional<EndpointRunIdentity> run_identity_seed;
+    std::function<void(EndpointCancelPermit)> on_run_admitted;
+    std::function<void(EndpointCancelPermit, EndpointTerminalResult)> on_run_terminal;
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
     tcp::socket* socket_for_test_cancel = nullptr;
     bool active_cancel_requested = false;
-    bool active_remote_transmission_may_have_begun = false;
     ClientCancellationDisposition active_cancellation =
         ClientCancellationDisposition::None;
+#endif
 };
 
 struct P50ServerEndpoint::Impl {
@@ -1905,7 +1949,12 @@ struct P50ServerEndpoint::Impl {
     ActionTrace* actions = nullptr;
     InputRecordStore input_records;
     P50ServerEndpointConfig config{};
+    EndpointRunRegistry endpoint_runs;
+    uint64_t next_run_sequence = 1;
+    uint64_t next_socket_ownership_generation = 1;
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
     ServerIoState* active_io = nullptr;
+#endif
 };
 
 // The live-session row is inserted before the shared reducer coroutine is
@@ -1961,9 +2010,15 @@ void require_outbound_profile_negotiated(uint32_t negotiated_profiles,
 
 P50ClientEndpoint::P50ClientEndpoint(std::shared_ptr<P50PreparationAuthority> preparation,
                                      EndpointCaps caps, HistoryNonce first_history_nonce,
-                                     CompletionLog* completions, ActionTrace* actions)
+                                     CompletionLog* completions, ActionTrace* actions,
+                                     std::optional<EndpointRunIdentity> run_identity_seed,
+                                     std::function<void(EndpointCancelPermit)> on_run_admitted,
+                                     std::function<void(EndpointCancelPermit,
+                                                        EndpointTerminalResult)> on_run_terminal)
     : impl_(std::make_unique<Impl>(std::move(preparation), caps, first_history_nonce, completions,
-                                   actions)) {}
+                                   actions, std::move(run_identity_seed),
+                                   std::move(on_run_admitted),
+                                   std::move(on_run_terminal))) {}
 
 P50ClientEndpoint::~P50ClientEndpoint() = default;
 
@@ -2040,6 +2095,7 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
     if (adopted)
         io->socket = std::move(*adopted);
     tcp::socket& socket = io->socket;
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
     struct ActiveSocketGuard {
         Impl& owner;
         tcp::socket* socket;
@@ -2047,15 +2103,58 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
             if (owner.socket_for_test_cancel == socket) {
                 owner.socket_for_test_cancel = nullptr;
                 owner.active_cancel_requested = false;
-                owner.active_remote_transmission_may_have_begun = false;
                 owner.active_cancellation = ClientCancellationDisposition::None;
             }
         }
     } socket_cancel_guard{*impl_, &socket};
     impl_->socket_for_test_cancel = &socket;
     impl_->active_cancel_requested = false;
-    impl_->active_remote_transmission_may_have_begun = false;
     impl_->active_cancellation = ClientCancellationDisposition::None;
+#endif
+    struct ClientRunLeaseGuard {
+        EndpointRunRegistry* registry = nullptr;
+        std::optional<EndpointRunIdentity> identity;
+        std::optional<EndpointCancelPermit> permit;
+        std::function<void(EndpointCancelPermit, EndpointTerminalResult)> terminal;
+        ~ClientRunLeaseGuard() {
+            if (registry && identity && permit) {
+                const EndpointTerminalResult terminal{
+                    EndpointTerminalResultState::Failed, 0};
+                if (registry->mark_terminal(*identity, terminal)) {
+                    if (this->terminal) {
+                        try {
+                            this->terminal(*permit, terminal);
+                        } catch (...) {
+                            // Terminal publication is an owner callback; a
+                            // callback failure cannot strand endpoint state.
+                        }
+                    }
+                    (void)registry->consume_terminal(*identity);
+                }
+            }
+        }
+    } run_lease{&impl_->endpoint_runs, std::nullopt, std::nullopt,
+                impl_->on_run_terminal};
+    if (impl_->run_identity_seed && impl_->run_identity_seed->valid() &&
+        deadline) {
+        EndpointRunIdentity identity = *impl_->run_identity_seed;
+        identity.endpoint_session_serial = serial;
+        auto handle = impl_->endpoint_runs.admit(
+            identity, impl_->run_identity_seed->sidecar_launch.valid()
+                         ? sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+                               *deadline,
+                               impl_->run_identity_seed->sidecar_launch.identity.generation,
+                               impl_->run_identity_seed->sidecar_launch.identity.attempt)
+                         : sidecar::AbsoluteMonotonicDeadline{},
+            std::make_shared<ClientRunSocketTarget>(io));
+        if (handle) {
+            run_lease.identity = identity;
+            run_lease.permit = handle->permit(EndpointCancelReason::CallerRequested);
+            (void)impl_->endpoint_runs.set_phase(identity, EndpointRunPhase::CacheWire);
+            if (impl_->on_run_admitted)
+                impl_->on_run_admitted(*run_lease.permit);
+        }
+    }
     if (deadline) {
         io->timer.expires_at(*deadline);
         io->timer.async_wait([io](const boost::system::error_code& error) {
@@ -2107,8 +2206,6 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
         // may have exposed CacheWire authority to the peer.  Cancellation is
         // consequently reconciliation work even when the write completion
         // itself reports zero progress.
-        if (!impl_->active_cancel_requested)
-            impl_->active_remote_transmission_may_have_begun = true;
         co_await async_write_message(socket, hello, impl_->caps.wire.max_frame_payload,
                                      impl_->stamp(session, AsyncOperationKind::WriteFragment),
                                      impl_->completions, control, verify);
@@ -2145,6 +2242,24 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
                            impl_->route_known && peer.history_nonce == impl_->history_nonce &&
                            peer.next_rel_seq == impl_->next_rel &&
                            peer.state_digest == impl_->state;
+
+        // An adopted descriptor is already an exact FSession claim.  A local
+        // peer observation that is not the exact retained route cannot grant
+        // a reset, abort, fallback, or second BODY.  Freeze all retained
+        // claim/route/queued authority and return the observation to the
+        // owning FSession operation for authenticated settlement.
+        const bool exact_claim_adopted =
+            !remote && impl_->run_identity_seed &&
+            impl_->run_identity_seed->valid();
+        if (exact_claim_adopted && !exact) {
+            result.observation = same_f ? ClientRunObservation::ReconcileRequired
+                                        : ClientRunObservation::WrongAdoptedPeer;
+            result.reconnect = same_f ? EndpointReconnectOutcome::RouteHistoryReset
+                                      : EndpointReconnectOutcome::WrongAdoptedPeer;
+            close_now(socket);
+            impl_->active_session = 0;
+            co_return result;
+        }
         if (same_f && impl_->active && peer.last_commit && peer.namespace_present &&
             peer.route_present && same_commit(*peer.last_commit, impl_->active->begin) &&
             peer.history_nonce == impl_->history_nonce &&
@@ -2155,7 +2270,7 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
             io->committed = true;
             result.committed_commit = *peer.last_commit;
             result.committed_input = InputRecordKey{impl_->c_guid, peer.last_commit->tu_seq};
-            result.settlement = ClientRunSettlement::CommittedInput;
+            result.observation = ClientRunObservation::ExactCommitObserved;
             result.status = ClientRunStatus::Committed;
             result.reconnect = EndpointReconnectOutcome::LostFinalAcknowledgement;
             close_now(socket);
@@ -2182,7 +2297,7 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
                                       : EndpointReconnectOutcome::ColdFStore;
             // A different route is an observation only; an endpoint-local
             // result cannot authorize a replacement attempt.
-            result.settlement = ClientRunSettlement::ReconcileRequired;
+            result.observation = ClientRunObservation::ReconcileRequired;
             PreparedZstdTUPtr retry = impl_->active ? impl_->active->prepared : impl_->queued;
             if (same_f && peer.route_present)
                 impl_->advance_nonce_past(peer.history_nonce);
@@ -2268,7 +2383,7 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
             io->committed = true;
             result.committed_commit = commit;
             result.committed_input = InputRecordKey{impl_->c_guid, commit.tu_seq};
-            result.settlement = ClientRunSettlement::CommittedInput;
+            result.observation = ClientRunObservation::ExactCommitObserved;
         });
         result.status = ClientRunStatus::Committed;
         close_now(socket);
@@ -2278,11 +2393,15 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
     } catch (const StaleCompletion&) {
         close_now(socket);
         result.status = ClientRunStatus::Disconnected;
+        result.observation = ClientRunObservation::Disconnected;
     } catch (const boost::system::system_error&) {
         close_now(socket);
         result.status = io->expired || deadline_crossed()
                             ? ClientRunStatus::DeadlineExceeded
                             : ClientRunStatus::Disconnected;
+        result.observation = io->expired || deadline_crossed()
+                                 ? ClientRunObservation::DeadlineExpired
+                                 : ClientRunObservation::Disconnected;
     } catch (const std::bad_alloc&) {
         close_now(socket);
         if (impl_->active_session == serial)
@@ -2301,23 +2420,24 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
         io->timer.cancel(timer_error);
         throw;
     }
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
     if (impl_->active_cancel_requested) {
-        result.cancellation = impl_->active_cancellation;
-        if (result.cancellation ==
-                ClientCancellationDisposition::AbortedPreDurable &&
-            !impl_->active) {
-            // The owner proved that neither this run nor a prior unresolved
-            // transaction could have reached F.  Drop only the queued local
-            // work; the caller's PreparedTuHandle remains independently
-            // owned and no fallback is authorized by this state change.
-            impl_->queued.reset();
-        }
+        // An adopted endpoint cannot prove pre-durable abort locally. The
+        // owning FSession operation must settle this exact observation.
+        result.cancellation = ClientCancellationDisposition::ReconcileRequired;
+        result.observation = ClientRunObservation::Cancelled;
     }
-    if (!impl_->active_cancel_requested && !io->committed && io->expired) {
+#endif
+    if (!io->committed && io->expired
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+        && !impl_->active_cancel_requested
+#endif
+    ) {
         // A timeout is fail-closed: the active transaction/queued work remains
         // exactly as reconciliation state for the next run.
         result = ClientRunResult{};
         result.status = ClientRunStatus::DeadlineExceeded;
+        result.observation = ClientRunObservation::DeadlineExpired;
     }
     boost::system::error_code timer_error;
     io->timer.cancel(timer_error);
@@ -2334,16 +2454,25 @@ std::optional<tcp::socket> P50ClientEndpoint::adopt_connected_fd(
     return P50ServerEndpoint::adopt_connected_fd(executor, fd, error);
 }
 
+EndpointCancelResult P50ClientEndpoint::request_cancel(
+    const EndpointCancelPermit& permit) noexcept {
+    return impl_->endpoint_runs.request_cancel(permit);
+}
+
+size_t P50ClientEndpoint::cancel_all_for_incarnation(
+    const SidecarLaunchIdentity& incarnation) noexcept {
+    return impl_->endpoint_runs.cancel_all_for_incarnation(incarnation);
+}
+
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
 void P50ClientEndpoint::request_cancel_for_test() noexcept {
     if (impl_->socket_for_test_cancel == nullptr)
         return;
     impl_->active_cancel_requested = true;
-    impl_->active_cancellation =
-        impl_->active_remote_transmission_may_have_begun || impl_->active
-            ? ClientCancellationDisposition::ReconcileRequired
-            : ClientCancellationDisposition::AbortedPreDurable;
+    impl_->active_cancellation = ClientCancellationDisposition::ReconcileRequired;
     close_now(*impl_->socket_for_test_cancel);
 }
+#endif
 
 CStoreGuid P50ClientEndpoint::c_store_guid() const {
     impl_->owner.check();
@@ -2588,6 +2717,7 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
             throw boost::system::system_error(asio::error::operation_aborted);
         require_deadline();
     };
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
     struct ActiveIoGuard {
         Impl& owner;
         ServerIoState* io;
@@ -2597,8 +2727,58 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
         }
     } active_io_guard{*impl_, io.get()};
     impl_->active_io = io.get();
+#endif
     tcp::socket& socket = socket_for_run;
     uint32_t reply_cap = impl_->caps.wire.max_frame_payload;
+    struct EndpointRunLeaseGuard {
+        EndpointRunRegistry* registry = nullptr;
+        std::optional<EndpointRunIdentity> identity;
+        std::optional<EndpointCancelPermit> permit;
+        std::function<void(EndpointCancelPermit, EndpointTerminalResult)> terminal;
+        ~EndpointRunLeaseGuard() {
+            if (!registry || !identity || !permit)
+                return;
+            const EndpointTerminalResult result{EndpointTerminalResultState::Failed, 0};
+            if (registry->mark_terminal(*identity, result)) {
+                if (terminal) {
+                    try {
+                        terminal(*permit, result);
+                    } catch (...) {
+                        // Owner notification cannot make destructor cleanup
+                        // terminate the endpoint executor.
+                    }
+                }
+                (void)registry->consume_terminal(*identity);
+            }
+        }
+    } run_lease{&impl_->endpoint_runs, std::nullopt, std::nullopt,
+                impl_->config.on_run_terminal};
+    if (impl_->config.sidecar_launch && session.operation &&
+        expected_c_store_guid &&
+        impl_->config.endpoint_generation != 0 &&
+        impl_->next_run_sequence != 0 &&
+        impl_->next_socket_ownership_generation != 0) {
+        EndpointRunIdentity identity;
+        identity.sidecar_launch = *impl_->config.sidecar_launch;
+        identity.c_store_guid = *expected_c_store_guid;
+        identity.f_store_guid = impl_->f_guid;
+        identity.f_session_operation = *session.operation;
+        identity.endpoint_generation = impl_->config.endpoint_generation;
+        identity.endpoint_session_serial = session.serial;
+        identity.run_sequence = impl_->next_run_sequence++;
+        identity.socket_ownership_generation =
+            impl_->next_socket_ownership_generation++;
+        auto handle = impl_->endpoint_runs.admit(
+            identity, deadline.value_or(sidecar::AbsoluteMonotonicDeadline{}),
+            std::make_shared<ServerRunSocketTarget>(io));
+        if (!handle)
+            throw std::length_error("endpoint run identity admission failed");
+        run_lease.identity = identity;
+        run_lease.permit = handle->permit(EndpointCancelReason::CallerRequested);
+        (void)impl_->endpoint_runs.set_phase(identity, EndpointRunPhase::CacheWire);
+        if (impl_->config.on_run_admitted)
+            impl_->config.on_run_admitted(*run_lease.permit);
+    }
     const auto verify = [&](const CompletionStamp& expected) {
         impl_->owner.require();
         require_operation();
@@ -2769,6 +2949,17 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
     co_return result;
 }
 
+EndpointCancelResult P50ServerEndpoint::request_cancel(
+    const EndpointCancelPermit& permit) noexcept {
+    return impl_->endpoint_runs.request_cancel(permit);
+}
+
+size_t P50ServerEndpoint::cancel_all_for_incarnation(
+    const SidecarLaunchIdentity& incarnation) noexcept {
+    return impl_->endpoint_runs.cancel_all_for_incarnation(incarnation);
+}
+
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
 void P50ServerEndpoint::request_cancel_for_test() noexcept {
     if (impl_->active_io != nullptr) {
         impl_->active_io->cancelled = true;
@@ -2779,6 +2970,7 @@ void P50ServerEndpoint::request_cancel_for_test() noexcept {
         close_now(impl_->active_io->socket);
     }
 }
+#endif
 
 void P50ServerEndpoint::reset_store(FStoreGuid new_guid) {
     impl_->owner.require();

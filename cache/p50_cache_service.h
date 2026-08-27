@@ -45,6 +45,7 @@ struct RuntimeConfig {
     uint64_t f_store_generation = 0;
     EndpointCaps endpoint_caps{};
     P50ServerEndpointConfig endpoint_config{};
+    std::optional<SidecarLaunchIdentity> sidecar_launch;
     size_t max_live_handoffs = 1;
     size_t max_input_lifecycle_replays = 8192;
     std::chrono::milliseconds cancellation_grace{100};
@@ -146,6 +147,7 @@ private:
     void endpoint_owner_loop() noexcept;
 
     void cancel_endpoint_run() noexcept;
+    void cancel_endpoint_incarnation() noexcept;
     void release_endpoint_run() noexcept;
     void cancel_active_control() noexcept;
     void close_active_control() noexcept;
@@ -161,6 +163,8 @@ private:
     std::atomic<bool> stop_requested_{false};
     std::atomic<size_t> live_sessions_{0};
     std::atomic<int> active_control_cancel_fd_{-1};
+    mutable std::mutex endpoint_cancel_mutex_;
+    std::optional<EndpointCancelPermit> endpoint_cancel_permit_;
 };
 
 struct Options {

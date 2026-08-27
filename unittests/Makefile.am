@@ -100,9 +100,10 @@ p50inputrecordlate_LDADD = ../cache/libprotocol50.a ../services/libicecc.la \
 p50inputrecordreopen_LDADD = ../cache/libprotocol50.a ../services/libicecc.la \
 	$(XXHASH_LIBS)
 p50inputattachment_LDADD = ../cache/libprotocol50.a ../services/libicecc.la
-p50endpoint_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
+p50endpoint_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS) -DICECC_P50_ENDPOINT_TEST_HOOKS
 p50endpoint_LDFLAGS = $(BOOST_LDFLAGS)
-p50endpoint_LDADD = ../cache/libp50endpoint.a \
+p50endpoint_LDADD = ../cache/libp50endpointtesthooks.a \
+	../cache/libp50endpoint.a \
 	../cache/libp50adoptedoutcomewriter.a \
 	../cache/libp50localtransport.a ../cache/libprotocol50.a \
 	../services/libicecc.la \

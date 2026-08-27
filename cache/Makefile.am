@@ -1,4 +1,4 @@
-noinst_LIBRARIES = libprotocol50.a libp50endpoint.a libp50localtransport.a \
+noinst_LIBRARIES = libprotocol50.a libp50endpoint.a libp50endpointtesthooks.a libp50localtransport.a \
 	libp50sidecarsupervisor.a libp50sidecarlifecycle.a libp50readyadvertisement.a libp50roleowner.a \
 	libp50daemonsidecaradapter.a libp50inputfd.a libp50inputlifecycle.a \
 	libp50sessionjoin.a libp50adoptedoutcomewriter.a
@@ -44,6 +44,13 @@ AM_CPPFLAGS = -I$(top_srcdir) $(LIBZSTD_CFLAGS)
 libp50endpoint_a_SOURCES = p50_endpoint.cpp p50_endpoint.h \
 	p50_endpoint_run_cancel.cpp p50_endpoint_run_cancel.h
 libp50endpoint_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
+
+# Unit-only compatibility object for the pre-existing endpoint behavioral
+# tests.  Product libraries remain macro-free; the hook object is linked only
+# by the legacy test binary and cannot provide a product cancellation path.
+libp50endpointtesthooks_a_SOURCES = p50_endpoint.cpp p50_endpoint.h
+libp50endpointtesthooks_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS) \
+	-DICECC_P50_ENDPOINT_TEST_HOOKS
 
 libp50localtransport_a_SOURCES = p50_local_transport.cpp p50_local_transport.h \
 	p50_fd_handoff.cpp p50_fd_handoff.h \

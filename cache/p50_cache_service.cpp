@@ -953,6 +953,13 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
                 return InputJobState::Closed;
             return InputJobState::Open;
         };
+    if (config_.sidecar_launch) {
+        config_.endpoint_config.sidecar_launch = config_.sidecar_launch;
+        config_.endpoint_config.on_run_admitted = [this](EndpointCancelPermit permit) {
+            std::lock_guard lock(endpoint_cancel_mutex_);
+            endpoint_cancel_permit_ = std::move(permit);
+        };
+    }
     endpoint_ = std::make_unique<P50ServerEndpoint>(
         config_.f_store_guid, config_.endpoint_caps, nullptr, nullptr,
         config_.endpoint_config);
@@ -1508,11 +1515,18 @@ void SidecarRuntime::close_active_control() noexcept {
 }
 
 void SidecarRuntime::cancel_endpoint_run() noexcept {
-    // Cancellation runs on the endpoint owner.  The standalone lineage does
-    // not yet have daemon OP_CANCEL wiring, so this compatibility seam keeps
-    // the owner-affine wakeup while the typed registry is integrated.
+    // The permit is captured at admission and posted to the endpoint owner;
+    // no current-socket lookup or descriptor-derived authority is permitted.
     try {
-        context_.post([this] { endpoint_->request_cancel_for_test(); });
+        std::optional<EndpointCancelPermit> permit;
+        {
+            std::lock_guard lock(endpoint_cancel_mutex_);
+            permit = endpoint_cancel_permit_;
+        }
+        if (permit)
+            context_.post([this, permit = std::move(*permit)] {
+                (void)endpoint_->request_cancel(permit);
+            });
     } catch (...) {
     }
 }
@@ -1520,10 +1534,21 @@ void SidecarRuntime::cancel_endpoint_run() noexcept {
 void SidecarRuntime::release_endpoint_run() noexcept {
 }
 
+void SidecarRuntime::cancel_endpoint_incarnation() noexcept {
+    if (!config_.sidecar_launch)
+        return;
+    try {
+        context_.post([this, incarnation = *config_.sidecar_launch] {
+            (void)endpoint_->cancel_all_for_incarnation(incarnation);
+        });
+    } catch (...) {
+    }
+}
+
 void SidecarRuntime::stop() noexcept {
     stop_requested_.store(true, std::memory_order_release);
     cancel_active_control();
-    cancel_endpoint_run();
+    cancel_endpoint_incarnation();
 }
 
 size_t SidecarRuntime::live_session_count() const {

@@ -114,10 +114,30 @@ fi
 echo 'ok - deleting the exact P5CO operation binding is rejected'
 
 grep -F 'adopt_connected_fd' "$src/cache/p50_endpoint.h" >/dev/null
-grep -F 'void request_cancel_for_test() noexcept;' "$src/cache/p50_endpoint.h" >/dev/null
-grep -F 'ClientCancellationDisposition::AbortedPreDurable' "$endpoint" >/dev/null
+grep -F 'EndpointCancelResult request_cancel(const EndpointCancelPermit& permit)' \
+    "$src/cache/p50_endpoint.h" >/dev/null
+grep -F 'EndpointRunRegistry endpoint_runs' "$endpoint" >/dev/null
+grep -F 'impl_->endpoint_runs.request_cancel(permit)' "$endpoint" >/dev/null
+grep -F 'ClientRunObservation::ExactCommitObserved' "$endpoint" >/dev/null
+grep -F 'ClientRunObservation::WrongAdoptedPeer' "$endpoint" >/dev/null
 grep -F 'ClientCancellationDisposition::ReconcileRequired' "$endpoint" >/dev/null
-grep -F 'active_remote_transmission_may_have_begun = true' "$endpoint" >/dev/null
+if rg -n 'whole_new_attempt|ClientRunSettlement|\.settlement|active_remote_transmission_may_have_begun|AbortedPreDurable' \
+    "$src/cache/p50_endpoint.cpp" "$src/cache/p50_endpoint.h"; then
+    echo 'FAIL: local endpoint retained a settlement or pre-durable authority' >&2
+    exit 1
+fi
+for token in active_socket active_io socket_for_test_cancel active_cancel_fd_ request_cancel_for_test; do
+    if awk -v token="$token" '
+        /^[[:space:]]*#if(n?def)?[[:space:]]+ICECC_P50_ENDPOINT_TEST_HOOKS/ {guard++}
+        /^[[:space:]]*#endif/ && guard > 0 {guard--; next}
+        guard == 0 && index($0, token) {print FNR ":" $0; bad=1}
+        END {exit bad ? 0 : 1}
+    ' "$src/cache/p50_endpoint.cpp" "$src/cache/p50_endpoint.h" \
+      "$src/cache/p50_cache_service.cpp" "$src/cache/p50_cache_service.h"; then
+        echo "FAIL: macro-free product contains forbidden endpoint alias $token" >&2
+        exit 1
+    fi
+done
 grep -F 'raw_cancel_client_after_hello' "$src/unittests/p50_endpoint_test.cpp" >/dev/null
 grep -F 'test_complete_p5co_endpoint_handoff' \
     "$src/unittests/p50_endpoint_test.cpp" >/dev/null

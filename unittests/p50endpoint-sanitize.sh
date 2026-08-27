@@ -22,6 +22,7 @@ compile() {
     "$libtool" --tag=CXX --mode=link "$cxx" "$standard" -O1 -g \
         -Wall -Wextra -Wpedantic -Wno-mismatched-new-delete \
         -fsanitize=address,undefined -fno-omit-frame-pointer -DHAVE_CONFIG_H \
+        -DICECC_P50_ENDPOINT_TEST_HOOKS \
         ${ICECC_TEST_CPPFLAGS:-} ${ICECC_TEST_BOOST_CPPFLAGS:-} \
         ${ICECC_TEST_LIBZSTD_CFLAGS:-} ${ICECC_TEST_XXHASH_CFLAGS:-} \
         -I"$top_build" -I"$src" -I"$src/cache" -I"$src/services" \
@@ -37,6 +38,7 @@ compile() {
 compile "$work/p50endpoint" \
     "$src/unittests/p50_endpoint_test.cpp" \
     "$src/cache/p50_endpoint.cpp" \
+    "$src/cache/p50_endpoint_run_cancel.cpp" \
     "$src/cache/p50_input_record.cpp" \
     "$src/cache/p50_adopted_outcome_writer.cpp" \
     "$src/cache/p50_adopted_socket_lease.cpp"

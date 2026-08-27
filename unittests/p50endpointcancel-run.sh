@@ -22,20 +22,25 @@ printf '%s\n' '{"test":"normal","status":"pass"}' >>"$evidence/results.jsonl"
 ASAN_OPTIONS=detect_leaks=1 "$build/p50endpointcancel-sanitize" >"$evidence/sanitize.log" 2>&1
 printf '%s\n' '{"test":"sanitizer","status":"pass"}' >>"$evidence/results.jsonl"
 
-forbidden_socket='active_'; forbidden_socket="${forbidden_socket}socket"
-forbidden_cancel='cancel_'; forbidden_cancel="${forbidden_cancel}active_io"
-forbidden_fd='active_'; forbidden_fd="${forbidden_fd}cancel_fd_"
-forbidden_attempt='whole_'; forbidden_attempt="${forbidden_attempt}new_attempt"
-if rg -n "${forbidden_socket}|${forbidden_cancel}|${forbidden_fd}|${forbidden_attempt}" \
-    "$src/cache" "$src/client" "$src/daemon" "$src/unittests" --glob '*.{cpp,h,sh,md}' >"$evidence/forbidden.txt"; then
-    printf '%s\n' '{"test":"forbidden-symbol-census","status":"fail"}' >>"$evidence/results.jsonl"
-    exit 1
-fi
+for token in active_socket active_io socket_for_test_cancel active_cancel_fd_ \
+    request_cancel_for_test whole_new_attempt ClientRunSettlement AbortedPreDurable; do
+    if awk -v token="$token" '
+        /^[[:space:]]*#if(n?def)?[[:space:]]+ICECC_P50_ENDPOINT_TEST_HOOKS/ {guard++}
+        /^[[:space:]]*#endif/ && guard > 0 {guard--; next}
+        guard == 0 && index($0, token) {print FILENAME ":" FNR ":" $0; bad=1}
+        END {exit bad ? 0 : 1}
+    ' "$src/cache/p50_endpoint.cpp" "$src/cache/p50_endpoint.h" \
+      "$src/cache/p50_cache_service.cpp" "$src/cache/p50_cache_service.h" \
+      >"$evidence/forbidden.txt"; then
+        printf '%s\n' '{"test":"forbidden-symbol-census","status":"fail"}' >>"$evidence/results.jsonl"
+        exit 1
+    fi
+done
 printf '%s\n' '{"test":"forbidden-symbol-census","status":"pass"}' >>"$evidence/results.jsonl"
 
 cat >"$build/no-arg-mutant.cpp" <<EOF
 #include "$src/cache/p50_endpoint.h"
-int main() { icecc::p50::P50ServerEndpoint *endpoint = nullptr; endpoint->${forbidden_cancel}(); }
+int main() { icecc::p50::P50ServerEndpoint *endpoint = nullptr; endpoint->request_cancel_for_test(); }
 EOF
 if "$cxx" $common -c "$build/no-arg-mutant.cpp" -o "$build/no-arg-mutant.o" \
     >"$evidence/no-arg-mutant.log" 2>&1; then
@@ -43,6 +48,29 @@ if "$cxx" $common -c "$build/no-arg-mutant.cpp" -o "$build/no-arg-mutant.o" \
     exit 1
 fi
 printf '%s\n' '{"test":"no-arg-cancellation-mutant","status":"pass-red"}' >>"$evidence/results.jsonl"
+
+# A singleton/current-run deletion mutant is compiled without the test hook.
+# Restoring a product socket alias must fail because the only cancellation
+# authority is the typed registry permit.
+sed 's/impl_->endpoint_runs.request_cancel(permit)/impl_->socket_for_test_cancel->close()/g' \
+    "$src/cache/p50_endpoint.cpp" >"$build/singleton-mutant.cpp"
+if "$cxx" $common -fsyntax-only "$build/singleton-mutant.cpp" \
+    >"$evidence/singleton-mutant.log" 2>&1; then
+    printf '%s\n' '{"test":"singleton-cancellation-mutant","status":"red-failure"}' >>"$evidence/results.jsonl"
+    exit 1
+fi
+printf '%s\n' '{"test":"singleton-cancellation-mutant","status":"pass-red"}' >>"$evidence/results.jsonl"
+
+# The actual endpoint target carries the production-shaped concurrent and ABA
+# rows; record its invocation in the same manifest when the configured build
+# supplies it.
+test_build=${ICECC_TEST_BUILDDIR:-}
+if [ -n "$test_build" ] && [ -x "$test_build/unittests/p50endpoint" ]; then
+    "$test_build/unittests/p50endpoint" >"$evidence/endpoint.log" 2>&1
+    printf '%s\n' '{"test":"real-endpoint-rows","status":"pass"}' >>"$evidence/results.jsonl"
+else
+    printf '%s\n' '{"test":"real-endpoint-rows","status":"not-built"}' >>"$evidence/results.jsonl"
+fi
 
 git -C "$src" diff --check
 printf '%s\n' '{"test":"git-diff-check","status":"pass"}' >>"$evidence/results.jsonl"

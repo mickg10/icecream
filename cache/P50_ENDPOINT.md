@@ -65,29 +65,24 @@ Those missing integrations are why this component is not an S2 exit claim.
 
 ## Operation-scoped C cancellation
 
-`P50ClientEndpoint::request_cancel_for_test()` is retained only as a standalone
-lineage test seam; production cancellation uses an exact typed permit. The C-role
-counterpart of the
-server endpoint's owner-affine cancellation seam.  Its caller posts onto the
-endpoint owner context; it closes only the current dialogue and never resets
-the route, promotes fallback, or changes another role.
+Production cancellation uses an exact `EndpointCancelPermit` posted onto the
+endpoint owner context. It closes only the registered socket target and never
+resets route state, promotes fallback, or changes another role. The optional
+test-only cancellation hook is compiled only for the endpoint unit target and
+is not part of the product API.
 
-The client records the first point at which any CacheWire byte may have begun
-leaving C.  A cancellation before that point, with no retained active
-transaction, reports `AbortedPreDurable` and may discard only the locally
-queued copy.  Once remote transmission may have begun—or an earlier active
-transaction already exists—the result is `ReconcileRequired`; the prepared or
-active identity remains available for exact retry.  Ordinary disconnects keep
-`None`, so transport failure cannot impersonate explicit owner cancellation.
-The current C API still accepts an absolute `steady_clock::time_point` rather
-than the typed P5CO deadline DTO. It now samples that deadline before and after
-every completion and immediately before accepting a commit. Carrying one typed
-cumulative run lease through the production C-side handoff remains an
-integration requirement.
+The adopted-client result is an identity-bound `ClientRunObservation`. It may
+report `ExactCommitObserved`, `WrongAdoptedPeer`, or `ReconcileRequired`, but
+it never settles distributed durability. In particular, a disconnect,
+terminal frame, cold-store observation, route history difference, or locally
+parsed commit cannot mint `AbortedPreDurable` or `CommittedInput`; only the
+owning authenticated FSession operation can settle those outcomes. Until that
+settlement, retained active/queued work is frozen and no HISTORY_RESET,
+TX_ABORTED, fallback, or second BODY is allowed.
 
 ## Endpoint run identity bridge
 
-`EndpointRunRegistry` is the implementation-only owner-affine bridge for that
+`EndpointRunRegistry` is the owner-affine production bridge for endpoint
 integration. Admission mints an `EndpointRunIdentity` containing the complete
 `sidecar::LaunchIncarnation`, both role-store GUIDs, the exact
 `P50FSessionOperationId`, endpoint generation/session serial, a nonzero run
@@ -100,11 +95,11 @@ the exact socket target. Late timer, descriptor, codec, or cancellation events
 therefore resolve as `Stale` after the row is consumed, even if a descriptor
 number or socket object address is reused. `cancel_all_for_incarnation` is a
 separate shutdown/failure operation and is not reachable through an ordinary
-permit. The current standalone endpoint lineage still uses its owner-affine
-test seam while daemon OP_CANCEL/FSession terminal settlement is wired; the
-registry tests are the production-shaped source material for that handoff.
+permit. The owning FSession callback receives the terminal result before the
+endpoint row is erased; every later timer, descriptor, codec, or cancellation
+event is stale-only.
 
-`ClientRunResult::settlement` is an identity-bound observation, never a local
+`ClientRunResult::observation` is an identity-bound observation, never a local
 replacement authority. Disconnected, terminal-error, cold-store, and route
 reset outcomes remain unresolved/reconciliation observations; only the owning
 FSession operation may settle `CommittedInput` or `AbortedPreDurable`.

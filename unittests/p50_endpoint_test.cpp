@@ -3664,7 +3664,7 @@ void test_exact_replay_and_lost_final() {
         const PairResult rejected =
             run_pair(client, server, admit(client, input));
         require(rejected.client.status == ClientRunStatus::TerminalError &&
-                    rejected.client.settlement != ClientRunSettlement::CommittedInput &&
+                    rejected.client.observation != ClientRunObservation::ExactCommitObserved &&
                     rejected.server.status == ServerRunStatus::TerminalError &&
                     client.has_active_transaction() &&
                     !copy_input(server, client.c_store_guid()) &&
@@ -3760,7 +3760,7 @@ void test_completion_identity_and_store_replacement() {
         const PairResult replaced = run_pair(client, server);
         require(replaced.client.status == ClientRunStatus::Committed &&
                     replaced.client.reconnect == EndpointReconnectOutcome::ColdFStore &&
-                    replaced.client.settlement != ClientRunSettlement::CommittedInput &&
+                    replaced.client.observation == ClientRunObservation::ExactCommitObserved &&
                     replaced.server.session_serial > invalidated.server.session_serial &&
                     copy_input(server, client.c_store_guid()) == input,
                 "precommit F-incarnation replacement did not preserve exact prepared work");
@@ -3802,7 +3802,7 @@ void test_completion_identity_and_store_replacement() {
         const PairResult replaced = run_pair(client, server);
         require(replaced.client.status == ClientRunStatus::Committed &&
                     replaced.client.reconnect == EndpointReconnectOutcome::ColdFStore &&
-                    replaced.client.settlement != ClientRunSettlement::CommittedInput &&
+                    replaced.client.observation == ClientRunObservation::ExactCommitObserved &&
                     copy_input(server, client.c_store_guid()) == input,
                 "postcommit/pre-ack F replacement did not replay exact prepared work");
         require_trace(actions, "postcommit/pre-ack F replacement trace");
@@ -3848,7 +3848,7 @@ void test_reset_ack_equality_and_terminal_result() {
                     acceptor, ScriptedSessionState{.f_guid = f_guid}, mutation);
             });
         require(terminal.status == ClientRunStatus::TerminalError &&
-                    terminal.settlement != ClientRunSettlement::CommittedInput && client.has_reconciliation_work() &&
+                    terminal.observation != ClientRunObservation::ExactCommitObserved && client.has_reconciliation_work() &&
                     !client.has_active_transaction(),
                 "bad HISTORY_RESET acknowledgement lost queued reconciliation work");
 
@@ -3870,7 +3870,7 @@ void test_reset_ack_equality_and_terminal_result() {
                 return raw_bounded_error_peer(acceptor, kMandatoryControlFramePayload);
             });
         require(terminal.status == ClientRunStatus::TerminalError &&
-                    terminal.settlement != ClientRunSettlement::CommittedInput && terminal.terminal_error &&
+                    terminal.observation != ClientRunObservation::ExactCommitObserved && terminal.terminal_error &&
                     encode_payload(Message{*terminal.terminal_error}).size() ==
                         kMandatoryControlFramePayload &&
                     client.has_reconciliation_work(),
@@ -3889,7 +3889,7 @@ void test_reset_ack_equality_and_terminal_result() {
             client, prepared,
             [&](tcp::acceptor& acceptor) { return raw_unknown_frame_peer(acceptor); });
         require(terminal.status == ClientRunStatus::TerminalError &&
-                    terminal.settlement != ClientRunSettlement::CommittedInput && terminal.terminal_error &&
+                    terminal.observation != ClientRunObservation::ExactCommitObserved && terminal.terminal_error &&
                     client.has_reconciliation_work() && !client.has_active_transaction(),
                 "client framing failure bypassed the bounded terminal-result path");
         P50ServerEndpoint good(Id128::from_u64(586));
@@ -3933,7 +3933,7 @@ void test_reset_ack_equality_and_terminal_result() {
             });
         require(terminal.status == ClientRunStatus::TerminalError &&
                     terminal.reconnect == EndpointReconnectOutcome::RouteHistoryReset &&
-                    terminal.settlement != ClientRunSettlement::CommittedInput && client.has_active_transaction() &&
+                    terminal.observation != ClientRunObservation::ExactCommitObserved && client.has_active_transaction() &&
                     client.has_reconciliation_work() &&
                     client.endpoint.next_rel_seq() == initial_next_rel &&
                     client.endpoint.state_digest() == initial_state &&
@@ -3982,7 +3982,7 @@ void test_reset_ack_equality_and_terminal_result() {
             },
             stop_terminal_report);
         require(local_terminal.status == ClientRunStatus::TerminalError &&
-                    local_terminal.settlement != ClientRunSettlement::CommittedInput &&
+                    local_terminal.observation != ClientRunObservation::ExactCommitObserved &&
                     client.has_active_transaction(),
                 "failed terminal-report write relabeled a known route mismatch");
     }
@@ -4427,7 +4427,7 @@ void test_reserved_zero_endpoint_values() {
                 return raw_zero_f_store_state_peer(acceptor);
             });
         require(terminal.status == ClientRunStatus::TerminalError &&
-                    terminal.settlement != ClientRunSettlement::CommittedInput &&
+                    terminal.observation != ClientRunObservation::ExactCommitObserved &&
                     client.has_reconciliation_work() &&
                     !client.has_active_transaction() &&
                     !client.endpoint.f_store_guid() &&
@@ -4449,7 +4449,7 @@ void test_reserved_zero_endpoint_values() {
                 return raw_zero_error_code_peer(acceptor);
             });
         require(terminal.status == ClientRunStatus::TerminalError &&
-                    terminal.settlement != ClientRunSettlement::CommittedInput && terminal.terminal_error &&
+                    terminal.observation != ClientRunObservation::ExactCommitObserved && terminal.terminal_error &&
                     terminal.terminal_error->code != 0 &&
                     client.has_reconciliation_work() &&
                     !client.has_active_transaction() &&
@@ -4700,10 +4700,10 @@ void test_client_operation_scoped_cancellation() {
         const ClientRunResult cancelled = run.get();
         require(cancelled.status == ClientRunStatus::Disconnected &&
                     cancelled.cancellation ==
-                        ClientCancellationDisposition::AbortedPreDurable &&
-                    !client.has_active_transaction() &&
-                    !client.has_reconciliation_work(),
-                "pre-wire C cancellation was not proved pre-durable");
+                        ClientCancellationDisposition::ReconcileRequired &&
+                    (client.has_active_transaction() ||
+                     client.has_reconciliation_work()),
+                "pre-wire C cancellation was incorrectly settled locally");
     }
 
     {

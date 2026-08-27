@@ -229,6 +229,7 @@ enum class EndpointReconnectOutcome : uint8_t {
     LostFinalAcknowledgement,
     ColdFStore,
     RouteHistoryReset,
+    WrongAdoptedPeer,
 };
 
 enum class ClientRunStatus : uint8_t {
@@ -244,24 +245,29 @@ enum class ClientRunStatus : uint8_t {
 // the peer and no previously active transaction is being reconciled.
 enum class ClientCancellationDisposition : uint8_t {
     None,
-    AbortedPreDurable,
     ReconcileRequired,
 };
 
 // A local endpoint observation never proves durability.  Only the owning
 // FSession operation may later settle this observation as committed or
 // pre-durable-aborted.
-enum class ClientRunSettlement : uint8_t {
+enum class ClientRunObservation : uint8_t {
     Unresolved,
-    CommittedInput,
-    AbortedPreDurable,
+    ExactCommitObserved,
+    PeerTerminalFrame,
+    ProtocolViolation,
+    Disconnected,
+    DeadlineExpired,
+    Cancelled,
+    WrongAdoptedPeer,
     ReconcileRequired,
+    LocalFailure,
 };
 
 struct ClientRunResult {
     ClientRunStatus status = ClientRunStatus::Disconnected;
     EndpointReconnectOutcome reconnect = EndpointReconnectOutcome::ExactMatch;
-    ClientRunSettlement settlement = ClientRunSettlement::Unresolved;
+    ClientRunObservation observation = ClientRunObservation::Unresolved;
     ClientCancellationDisposition cancellation =
         ClientCancellationDisposition::None;
     // These witnesses are populated only after the endpoint has accepted the
@@ -330,6 +336,10 @@ struct P50ServerEndpointConfig {
     uint16_t protocol_error_code = 1;
     P50ServerOwnerLimits owner_limits{};
     InputJobStateSelector input_job_state;
+    std::optional<SidecarLaunchIdentity> sidecar_launch;
+    uint64_t endpoint_generation = 1;
+    std::function<void(EndpointCancelPermit)> on_run_admitted;
+    std::function<void(EndpointCancelPermit, EndpointTerminalResult)> on_run_terminal;
 };
 
 // Outbound-admission law shared by the client's production send path and its
@@ -346,7 +356,14 @@ public:
                                EndpointCaps caps = {},
                                HistoryNonce first_history_nonce = HistoryNonce{1},
                                CompletionLog* completions = nullptr,
-                               ActionTrace* actions = nullptr);
+                               ActionTrace* actions = nullptr,
+                               std::optional<EndpointRunIdentity> run_identity_seed =
+                                   std::nullopt,
+                               std::function<void(EndpointCancelPermit)>
+                                   on_run_admitted = {},
+                               std::function<void(EndpointCancelPermit,
+                                                  EndpointTerminalResult)>
+                                   on_run_terminal = {});
     ~P50ClientEndpoint();
     P50ClientEndpoint(const P50ClientEndpoint&) = delete;
     P50ClientEndpoint& operator=(const P50ClientEndpoint&) = delete;
@@ -377,11 +394,13 @@ public:
 
     // Cancel only the currently active C-role dialogue.  The caller must post
     // this method onto the endpoint's owner executor.  It never resets route
-    // state or authorizes fallback: run() reports whether the operation was
-    // proved pre-durable or instead requires exact reconciliation.
-    // Temporary compatibility seam for the standalone lineage. Production
-    // callers use EndpointRunRegistry::request_cancel(EndpointCancelPermit).
+    // state or authorizes fallback: run() reports an observation and the
+    // owning FSession operation performs any distributed settlement.
+    EndpointCancelResult request_cancel(const EndpointCancelPermit& permit) noexcept;
+    size_t cancel_all_for_incarnation(const SidecarLaunchIdentity& incarnation) noexcept;
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
     void request_cancel_for_test() noexcept;
+#endif
 
     [[nodiscard]] CStoreGuid c_store_guid() const;
     [[nodiscard]] std::optional<FStoreGuid> f_store_guid() const;
@@ -435,9 +454,11 @@ public:
     // Cancels the active socket on the endpoint's owner executor. The caller
     // must arrange that affinity (SidecarRuntime posts this method); it never
     // changes listener or store ownership and is a no-op between dialogues.
-    // Temporary compatibility seam for the standalone lineage. Production
-    // callers use EndpointRunRegistry::request_cancel(EndpointCancelPermit).
+    EndpointCancelResult request_cancel(const EndpointCancelPermit& permit) noexcept;
+    size_t cancel_all_for_incarnation(const SidecarLaunchIdentity& incarnation) noexcept;
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
     void request_cancel_for_test() noexcept;
+#endif
 
     void reset_store(FStoreGuid new_guid);
     [[nodiscard]] InputCursor attach_input(InputRecordKey key) const;
