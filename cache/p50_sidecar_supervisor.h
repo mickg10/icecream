@@ -27,6 +27,87 @@
 
 namespace icecc::p50::sidecar {
 
+struct MonotonicClockIdentity {
+    // CLOCK_MONOTONIC is the only clock accepted by the cross-process
+    // deadline contract.  The time namespace inode distinguishes a daemon
+    // from a process which has been moved into another time namespace.
+    uint64_t clock_domain_id = 0;
+    uint64_t time_namespace_id = 0;
+
+    [[nodiscard]] bool valid() const noexcept {
+        return clock_domain_id != 0 && time_namespace_id != 0;
+    }
+    friend bool operator==(const MonotonicClockIdentity&,
+                           const MonotonicClockIdentity&) = default;
+};
+
+// Called during process/configuration setup, never from a lifecycle turn. A
+// forked/execed sidecar inherits the daemon's time namespace and therefore
+// shares this identity unless an external namespace change invalidates it.
+[[nodiscard]] inline MonotonicClockIdentity
+process_monotonic_clock_identity() noexcept {
+    struct stat info{};
+    if (::stat("/proc/self/ns/time", &info) != 0)
+        return {};
+    const uint64_t namespace_id =
+        (static_cast<uint64_t>(info.st_dev) << 32) ^
+        static_cast<uint64_t>(info.st_ino);
+    if (namespace_id == 0)
+        return {};
+    // Linux's CLOCK_MONOTONIC clock domain is represented by id 1 here.  The
+    // numeric id is part of the signed wire binding, not a duration unit.
+    return MonotonicClockIdentity{1, namespace_id};
+}
+
+// A deadline crossing the daemon/sidecar boundary is an absolute value in
+// the CLOCK_MONOTONIC domain.  The two identity fields are supplied by the
+// process owner which established the relationship; zero is intentionally
+// invalid so a receiver cannot silently adopt its own clock or time
+// namespace.  The representation is never reconstructed from a receive-time
+// plus remaining duration.
+struct AbsoluteMonotonicDeadline {
+    int64_t expires_at_ns = 0;
+    uint64_t clock_domain_id = 0;
+    uint64_t time_namespace_id = 0;
+
+    [[nodiscard]] bool valid() const noexcept {
+        return expires_at_ns > 0 && clock_domain_id != 0 &&
+               time_namespace_id != 0;
+    }
+    [[nodiscard]] bool matches_clock(uint64_t expected_clock_domain_id,
+                                     uint64_t expected_time_namespace_id) const noexcept {
+        return valid() && expected_clock_domain_id != 0 &&
+               expected_time_namespace_id != 0 &&
+               clock_domain_id == expected_clock_domain_id &&
+               time_namespace_id == expected_time_namespace_id;
+    }
+    [[nodiscard]] bool matches_clock(
+        const MonotonicClockIdentity& expected) const noexcept {
+        return expected.valid() &&
+               matches_clock(expected.clock_domain_id,
+                             expected.time_namespace_id);
+    }
+    [[nodiscard]] bool expired(int64_t now_ns, uint64_t observed_clock_domain_id,
+                               uint64_t observed_time_namespace_id) const noexcept {
+        return !matches_clock(observed_clock_domain_id, observed_time_namespace_id) ||
+               now_ns >= expires_at_ns;
+    }
+    [[nodiscard]] std::chrono::steady_clock::time_point as_steady_time_point() const noexcept {
+        return std::chrono::steady_clock::time_point{
+            std::chrono::nanoseconds{expires_at_ns}};
+    }
+    [[nodiscard]] static AbsoluteMonotonicDeadline from_steady_time_point(
+        std::chrono::steady_clock::time_point deadline,
+        uint64_t clock_domain_id, uint64_t time_namespace_id) noexcept {
+        const auto count = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            deadline.time_since_epoch()).count();
+        return AbsoluteMonotonicDeadline{count, clock_domain_id,
+                                         time_namespace_id};
+    }
+    friend bool operator==(const AbsoluteMonotonicDeadline&,
+                           const AbsoluteMonotonicDeadline&) = default;
+};
+
 namespace detail {
 
 // Lease paths are generated below one private, absolute root.  Keep the
@@ -109,6 +190,8 @@ struct LaunchIncarnation {
         c_store_guid == c_store_guid_for_root(store_root) &&
         f_store_guid == f_store_guid_for_root(store_root);
     }
+    friend bool operator==(const LaunchIncarnation&,
+                           const LaunchIncarnation&) = default;
 };
 
 // This allocator is deliberately owned outside Supervisor and may be shared

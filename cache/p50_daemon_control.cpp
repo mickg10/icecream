@@ -89,11 +89,15 @@ DaemonControlOperation::DaemonControlOperation(DaemonControlOperation&& other) n
       rights_sent_(other.rights_sent_), peer_queried_(other.peer_queried_),
       phase_(other.phase_), status_(other.status_), deadline_(other.deadline_),
       limits_(other.limits_), credentials_(other.credentials_), operation_(other.operation_),
+      connect_path_(std::move(other.connect_path_)),
       hello_(std::move(other.hello_)),
       control_(std::move(other.control_)), handoff_(other.handoff_), ack_(other.ack_),
       frame_read_(std::move(other.frame_read_)), frame_expected_(other.frame_expected_),
       offset_(other.offset_), ack_offset_(other.ack_offset_), last_calls_(other.last_calls_),
-      last_bytes_(other.last_bytes_), peer_(other.peer_) {
+      last_bytes_(other.last_bytes_), peer_(other.peer_),
+      lifecycle_mode_(other.lifecycle_mode_),
+      lifecycle_goodbye_(std::move(other.lifecycle_goodbye_)),
+      lifecycle_result_(other.lifecycle_result_) {
     other.fd_ = -1; other.transfer_fd_ = -1; other.own_fd_ = false;
     other.status_ = DaemonControlStatus::Idle;
 }
@@ -105,11 +109,15 @@ DaemonControlOperation& DaemonControlOperation::operator=(DaemonControlOperation
     rights_sent_ = other.rights_sent_; peer_queried_ = other.peer_queried_;
     phase_ = other.phase_; status_ = other.status_; deadline_ = other.deadline_;
     limits_ = other.limits_; credentials_ = other.credentials_; operation_ = other.operation_;
+    connect_path_ = std::move(other.connect_path_);
     hello_ = std::move(other.hello_);
     control_ = std::move(other.control_); handoff_ = other.handoff_; ack_ = other.ack_;
     frame_read_ = std::move(other.frame_read_); frame_expected_ = other.frame_expected_;
     offset_ = other.offset_; ack_offset_ = other.ack_offset_; last_calls_ = other.last_calls_;
     last_bytes_ = other.last_bytes_; peer_ = other.peer_;
+    lifecycle_mode_ = other.lifecycle_mode_;
+    lifecycle_goodbye_ = std::move(other.lifecycle_goodbye_);
+    lifecycle_result_ = other.lifecycle_result_;
     other.fd_ = -1; other.transfer_fd_ = -1; other.own_fd_ = false;
     other.status_ = DaemonControlStatus::Idle;
     return *this;
@@ -120,6 +128,7 @@ void DaemonControlOperation::close_fd() noexcept {
     fd_ = -1; own_fd_ = false;
     if (transfer_fd_ >= 0) ::close(transfer_fd_);
     transfer_fd_ = -1;
+    connect_path_.clear();
 }
 
 void DaemonControlOperation::fail(DaemonControlStatus status) noexcept {
@@ -140,7 +149,9 @@ DaemonControlStatus DaemonControlOperation::begin(
     const std::string& path, const ControlOperation& operation, int transfer_fd,
     const CredentialExpectation& credentials,
     std::chrono::steady_clock::time_point deadline, DaemonControlLimits limits) noexcept {
-    if (path.empty() || path.size() > kMaxUnixPath || transfer_fd < 0 ||
+    const bool lifecycle = operation.kind == ControlOperationKind::InputLifecycle;
+    if (path.empty() || path.size() > kMaxUnixPath ||
+        ((lifecycle && transfer_fd != -1) || (!lifecycle && transfer_fd < 0)) ||
         !valid_limits(limits) || deadline <= std::chrono::steady_clock::now()) {
         return status_ = DaemonControlStatus::InvalidArgument;
     }
@@ -171,7 +182,9 @@ DaemonControlStatus DaemonControlOperation::begin(
                                                         DaemonControlFdOwnership::Owned);
     if (started != DaemonControlStatus::InProgress) return started;
     if (result == 0) phase_ = Phase::WriteHello;
-    else if (connect_errno == EINPROGRESS || connect_errno == EALREADY || connect_errno == EAGAIN) phase_ = Phase::Connecting;
+    else if (connect_errno == EINPROGRESS || connect_errno == EALREADY ||
+             connect_errno == EAGAIN || connect_errno == EINTR)
+        phase_ = Phase::Connecting;
     else { fail(DaemonControlStatus::Disconnected); }
     return status_;
 }
@@ -181,7 +194,9 @@ DaemonControlStatus DaemonControlOperation::begin_connected(
     const CredentialExpectation& credentials,
     std::chrono::steady_clock::time_point deadline, DaemonControlLimits limits,
     DaemonControlFdOwnership ownership) noexcept {
-    if (nonblocking_fd < 0 || transfer_fd < 0 || !nonblocking(nonblocking_fd) ||
+    const bool lifecycle = operation.kind == ControlOperationKind::InputLifecycle;
+    if (nonblocking_fd < 0 ||
+        ((lifecycle && transfer_fd != -1) || (!lifecycle && transfer_fd < 0)) ||
         !valid_limits(limits) || deadline <= std::chrono::steady_clock::now() ||
         !credentials.uid.has_value() || !credentials.gid.has_value() ||
         !credentials.pid.has_value()) {
@@ -189,7 +204,14 @@ DaemonControlStatus DaemonControlOperation::begin_connected(
             ::close(nonblocking_fd);
         return status_ = DaemonControlStatus::InvalidArgument;
     }
-    const std::vector<uint8_t> encoded = encode_control_operation(operation);
+    std::vector<uint8_t> encoded;
+    try {
+        encoded = encode_control_operation(operation);
+    } catch (...) {
+        if (ownership == DaemonControlFdOwnership::Owned)
+            ::close(nonblocking_fd);
+        return status_ = DaemonControlStatus::InvalidArgument;
+    }
     if (encoded.empty()) {
         if (ownership == DaemonControlFdOwnership::Owned)
             ::close(nonblocking_fd);
@@ -198,28 +220,65 @@ DaemonControlStatus DaemonControlOperation::begin_connected(
     close_fd();
     fd_ = nonblocking_fd; own_fd_ = ownership == DaemonControlFdOwnership::Owned;
     transfer_fd_ = transfer_fd;
-    operation_ = operation; credentials_ = credentials; deadline_ = deadline; limits_ = limits;
-    hello_ = encode_frame(make_hello(PeerRole::Daemon, operation.identity));
-    control_ = encode_frame(Frame{kProtocolVersion, MessageType::Data,
-                                  operation.identity, encoded});
-    if (hello_.empty() || control_.empty()) { fail(DaemonControlStatus::InvalidArgument); return status_; }
+    try {
+        operation_ = operation; credentials_ = credentials; deadline_ = deadline;
+        limits_ = limits;
+        lifecycle_mode_ = lifecycle;
+        hello_ = encode_frame(make_hello(PeerRole::Daemon, operation.identity));
+        control_ = encode_frame(Frame{kProtocolVersion, MessageType::Data,
+                                      operation.identity, encoded});
+    } catch (...) {
+        fail(DaemonControlStatus::InvalidArgument);
+        return status_;
+    }
+    if (hello_.empty() || control_.empty()) {
+        fail(DaemonControlStatus::InvalidArgument);
+        return status_;
+    }
     // The canonical P50F request codec reserves the code field and emits zero.
     // Operation kind is carried by the preceding canonical ControlOperation
     // frame and checked against expected_ on the receiving side.
     handoff_ = handoff_wire(kRequest, operation, 0);
+    connect_path_.clear();
     phase_ = Phase::WriteHello; status_ = DaemonControlStatus::InProgress;
     offset_ = ack_offset_ = 0; frame_read_.clear(); frame_expected_ = 0;
     rights_sent_ = false; peer_queried_ = false; peer_.reset();
+    lifecycle_goodbye_.clear();
+    lifecycle_result_.reset();
     last_calls_ = last_bytes_ = 0;
+    return status_;
+}
+
+DaemonControlStatus DaemonControlOperation::begin_connecting(
+    const std::string& path, int nonblocking_fd,
+    const ControlOperation& operation, int transfer_fd,
+    const CredentialExpectation& credentials,
+    std::chrono::steady_clock::time_point deadline, DaemonControlLimits limits,
+    DaemonControlFdOwnership ownership) noexcept {
+    if (path.empty() || path.size() > kMaxUnixPath)
+        return status_ = DaemonControlStatus::InvalidArgument;
+    const DaemonControlStatus status = begin_connected(
+        nonblocking_fd, operation, transfer_fd, credentials, deadline, limits,
+        ownership);
+    if (status != DaemonControlStatus::InProgress)
+        return status;
+    // The descriptor is intentionally left unconnected.  The next outer turn
+    // owns exactly one connect completion action and enters WriteHello only
+    // after that action succeeds.
+    connect_path_ = path;
+    phase_ = Phase::ConnectPending;
     return status_;
 }
 
 short DaemonControlOperation::desired_events() const noexcept {
     if (status_ != DaemonControlStatus::InProgress) return 0;
-    if (phase_ == Phase::CheckHelloAckTrailing || phase_ == Phase::CheckAckTrailing)
+    if (phase_ == Phase::CheckHelloAckTrailing || phase_ == Phase::CheckAckTrailing ||
+        phase_ == Phase::CheckLifecycleReplyTrailing)
         return POLLIN | POLLOUT;
-    if (phase_ == Phase::Connecting || phase_ == Phase::WriteHello ||
-        phase_ == Phase::WriteControl || phase_ == Phase::WriteHandoff)
+    if (phase_ == Phase::ConnectPending || phase_ == Phase::Connecting ||
+        phase_ == Phase::WriteHello ||
+        phase_ == Phase::WriteControl || phase_ == Phase::WriteHandoff ||
+        phase_ == Phase::WriteLifecycleGoodbye)
         return POLLOUT;
     return POLLIN;
 }
@@ -282,7 +341,12 @@ bool DaemonControlOperation::write_handoff(size_t& calls, size_t& budget) noexce
 
 bool DaemonControlOperation::read_frame(size_t& calls, size_t& budget) noexcept {
     if (frame_expected_ == 0) {
-        frame_read_.resize(kFrameHeaderSize);
+        try {
+            frame_read_.resize(kFrameHeaderSize);
+        } catch (...) {
+            fail(DaemonControlStatus::Malformed);
+            return false;
+        }
         frame_expected_ = kFrameHeaderSize;
     }
     // frame_read_ is resized to the total expected size; its initialized prefix
@@ -298,7 +362,13 @@ bool DaemonControlOperation::read_frame(size_t& calls, size_t& budget) noexcept 
         const uint32_t payload = uint32_t(frame_read_[8]) << 24 | uint32_t(frame_read_[9]) << 16 |
                   uint32_t(frame_read_[10]) << 8 | frame_read_[11];
         if (payload > kMaxFramePayload) { fail(DaemonControlStatus::Malformed); return false; }
-        frame_expected_ = kFrameHeaderSize + payload; frame_read_.resize(frame_expected_);
+        frame_expected_ = kFrameHeaderSize + payload;
+        try {
+            frame_read_.resize(frame_expected_);
+        } catch (...) {
+            fail(DaemonControlStatus::Malformed);
+            return false;
+        }
     }
     if (offset_ != frame_expected_) return false;
     Frame frame;
@@ -324,6 +394,123 @@ bool DaemonControlOperation::read_ack(size_t& calls, size_t& budget) noexcept {
     if (!validate_ack()) { fail(DaemonControlStatus::OperationMismatch); return false; }
     phase_ = Phase::CheckAckTrailing;
     return true;
+}
+
+bool DaemonControlOperation::read_lifecycle_reply(size_t& calls,
+                                                   size_t& budget) noexcept {
+    if (frame_expected_ == 0) {
+        try {
+            frame_read_.resize(kFrameHeaderSize);
+        } catch (...) {
+            fail(DaemonControlStatus::Malformed);
+            return false;
+        }
+        frame_expected_ = kFrameHeaderSize;
+    }
+    if (budget == 0)
+        return false;
+    const size_t remaining = frame_expected_ - offset_;
+    const ssize_t count = ::recv(
+        fd_, frame_read_.data() + offset_, std::min(remaining, budget), MSG_DONTWAIT);
+    ++calls;
+    if (count > 0) {
+        offset_ += static_cast<size_t>(count);
+        budget -= static_cast<size_t>(count);
+    } else if (count == 0) {
+        fail(offset_ == 0 ? DaemonControlStatus::Disconnected
+                          : DaemonControlStatus::Truncated);
+        return false;
+    } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+        fail(DaemonControlStatus::IoError);
+        return false;
+    } else {
+        return false;
+    }
+
+    if (offset_ == kFrameHeaderSize && frame_expected_ == kFrameHeaderSize) {
+        const uint32_t payload = uint32_t(frame_read_[8]) << 24 |
+                                 uint32_t(frame_read_[9]) << 16 |
+                                 uint32_t(frame_read_[10]) << 8 |
+                                 frame_read_[11];
+        if (payload > kMaxFramePayload) {
+            fail(DaemonControlStatus::Malformed);
+            return false;
+        }
+        frame_expected_ = kFrameHeaderSize + payload;
+        try {
+            frame_read_.resize(frame_expected_);
+        } catch (...) {
+            fail(DaemonControlStatus::Malformed);
+            return false;
+        }
+    }
+    if (offset_ != frame_expected_)
+        return false;
+
+    Frame frame;
+    ControlOperation observed;
+    if (decode_frame(frame_read_, frame) != Status::Ok ||
+        frame.type != MessageType::Data || frame.identity != operation_.identity ||
+        !decode_control_operation(frame.payload, observed) ||
+        observed.kind != ControlOperationKind::InputLifecycle ||
+        observed.identity != operation_.identity ||
+        observed.request_id != operation_.request_id ||
+        observed.input != operation_.input || observed.owner != operation_.owner ||
+        observed.lifecycle_action != operation_.lifecycle_action ||
+        observed.f_store_generation != operation_.f_store_generation ||
+        observed.f_store_guid != operation_.f_store_guid ||
+        observed.immutable_size != operation_.immutable_size ||
+        observed.immutable_digest != operation_.immutable_digest ||
+        observed.retirement_id != operation_.retirement_id ||
+        observed.replacement_owner != operation_.replacement_owner ||
+        observed.absolute_deadline != operation_.absolute_deadline ||
+        !observed.lifecycle_result.has_value()) {
+        fail(DaemonControlStatus::OperationMismatch);
+        return false;
+    }
+    lifecycle_result_ = observed.lifecycle_result;
+    offset_ = 0;
+    frame_read_.clear();
+    frame_expected_ = 0;
+    phase_ = Phase::CheckLifecycleReplyTrailing;
+    return true;
+}
+
+bool DaemonControlOperation::write_lifecycle_goodbye(size_t& calls,
+                                                      size_t& budget) noexcept {
+    if (lifecycle_goodbye_.empty())
+        return false;
+    const size_t amount = std::min(lifecycle_goodbye_.size() - offset_, budget);
+    if (amount == 0)
+        return false;
+    int flags = 0;
+#ifdef MSG_NOSIGNAL
+    flags |= MSG_NOSIGNAL;
+#endif
+#ifdef MSG_DONTWAIT
+    flags |= MSG_DONTWAIT;
+#endif
+    const ssize_t count = ::send(fd_, lifecycle_goodbye_.data() + offset_, amount, flags);
+    ++calls;
+    if (count > 0) {
+        offset_ += static_cast<size_t>(count);
+        budget -= static_cast<size_t>(count);
+        if (offset_ == lifecycle_goodbye_.size()) {
+            status_ = DaemonControlStatus::Complete;
+            close_fd();
+            phase_ = Phase::None;
+        }
+        return true;
+    }
+    if (count == 0) {
+        fail(DaemonControlStatus::Disconnected);
+        return false;
+    }
+    if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+        return false;
+    fail(errno == EPIPE || errno == ECONNRESET ? DaemonControlStatus::Disconnected
+                                                : DaemonControlStatus::IoError);
+    return false;
 }
 
 bool DaemonControlOperation::check_stream_trailing(
@@ -363,40 +550,121 @@ DaemonControlStatus DaemonControlOperation::advance(
     if (status_ != DaemonControlStatus::InProgress) return status_;
     last_calls_ = last_bytes_ = 0;
     if (now >= deadline_) { fail(DaemonControlStatus::Timeout); return status_; }
-    if ((revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) { fail(DaemonControlStatus::Disconnected); return status_; }
+    // POLLHUP/ERR may be reported together with readable bytes.  Consume
+    // those bytes first so a coalesced final frame is not discarded; only a
+    // wake with no readable payload is an immediate disconnect.
+    if ((revents & POLLNVAL) != 0 ||
+        ((revents & (POLLERR | POLLHUP)) != 0 &&
+         (revents & POLLIN) == 0)) {
+        fail(DaemonControlStatus::Disconnected);
+        return status_;
+    }
     size_t calls = 0, budget = limits_.bytes_per_turn;
-    while (calls < limits_.syscalls_per_turn && budget != 0 && status_ == DaemonControlStatus::InProgress) {
-        if (phase_ == Phase::Connecting) {
-            int error = 0; socklen_t length = sizeof(error);
-            if (::getsockopt(fd_, SOL_SOCKET, SO_ERROR, &error, &length) != 0) { ++calls; fail(DaemonControlStatus::IoError); break; }
-            ++calls;
-            if (error != 0) { fail(DaemonControlStatus::Disconnected); break; }
-            phase_ = Phase::WriteHello; continue;
+    // Exactly one fallible external operation per outer advance.  In-memory
+    // phase transitions happen at the end of that operation and are resumed
+    // by the next poll turn; this prevents a hidden send/recv/connect loop.
+    if (limits_.syscalls_per_turn == 0 || budget == 0) {
+        last_calls_ = 0;
+        last_bytes_ = 0;
+        return status_;
+    }
+    if (phase_ == Phase::ConnectPending) {
+        if (connect_path_.empty() || connect_path_.size() >= sizeof(sockaddr_un::sun_path)) {
+            fail(DaemonControlStatus::InvalidArgument);
+            return status_;
         }
-        if (phase_ == Phase::WriteHello) {
-            if (!peer_queried_) {
-            if (!query_peer()) { ++calls; fail(DaemonControlStatus::CredentialFailure); break; }
+        sockaddr_un address{};
+        address.sun_family = AF_UNIX;
+        std::memcpy(address.sun_path, connect_path_.data(), connect_path_.size());
+        address.sun_path[connect_path_.size()] = '\0';
+        const int result = ::connect(
+            fd_, reinterpret_cast<sockaddr*>(&address),
+            static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) +
+                                   connect_path_.size() + 1));
+        ++calls;
+        if (result == 0) {
+            connect_path_.clear();
+            phase_ = Phase::WriteHello;
+        } else if (errno == EINPROGRESS || errno == EALREADY || errno == EAGAIN) {
+            connect_path_.clear();
+            phase_ = Phase::Connecting;
+        } else if (errno != EINTR) {
+            fail(DaemonControlStatus::Disconnected);
+        }
+    } else if (phase_ == Phase::Connecting) {
+        int error = 0;
+        socklen_t length = sizeof(error);
+        if (::getsockopt(fd_, SOL_SOCKET, SO_ERROR, &error, &length) != 0) {
             ++calls;
-            if (calls >= limits_.syscalls_per_turn || budget == 0) break;
+            fail(DaemonControlStatus::IoError);
+        } else {
+            ++calls;
+            if (error != 0)
+                fail(DaemonControlStatus::Disconnected);
+            else
+                phase_ = Phase::WriteHello;
+        }
+    } else if (phase_ == Phase::WriteHello) {
+        if (!peer_queried_) {
+            if (!query_peer())
+                fail(DaemonControlStatus::CredentialFailure);
+            ++calls;
+        } else {
+            (void)write_bytes(offset_, hello_, calls, budget);
+            if (status_ == DaemonControlStatus::InProgress &&
+                offset_ == hello_.size()) {
+                offset_ = 0;
+                phase_ = Phase::ReadHelloAck;
             }
-            if (!write_bytes(offset_, hello_, calls, budget)) break;
-            offset_ = 0; phase_ = Phase::ReadHelloAck; continue;
         }
-        if (phase_ == Phase::ReadHelloAck) { if (!read_frame(calls, budget)) break; continue; }
-        if (phase_ == Phase::CheckHelloAckTrailing) {
-            if (!check_stream_trailing(Phase::WriteControl, calls, budget)) break;
-            continue;
+    } else if (phase_ == Phase::ReadHelloAck) {
+        (void)read_frame(calls, budget);
+    } else if (phase_ == Phase::CheckHelloAckTrailing) {
+        (void)check_stream_trailing(Phase::WriteControl, calls, budget);
+    } else if (phase_ == Phase::WriteControl) {
+        (void)write_bytes(offset_, control_, calls, budget);
+        if (status_ == DaemonControlStatus::InProgress &&
+            offset_ == control_.size()) {
+            offset_ = 0;
+            phase_ = lifecycle_mode_ ? Phase::ReadLifecycleReply : Phase::WriteHandoff;
         }
-        if (phase_ == Phase::WriteControl) { if (!write_bytes(offset_, control_, calls, budget)) break; offset_ = 0; phase_ = Phase::WriteHandoff; continue; }
-        if (phase_ == Phase::WriteHandoff) { if (!write_handoff(calls, budget)) break; offset_ = 0; phase_ = Phase::ReadAck; continue; }
-        if (phase_ == Phase::ReadAck) { read_ack(calls, budget); break; }
-        if (phase_ == Phase::CheckAckTrailing) {
-            if (!check_stream_trailing(Phase::None, calls, budget)) break;
-            ::close(transfer_fd_); transfer_fd_ = -1;
+    } else if (phase_ == Phase::WriteHandoff) {
+        (void)write_handoff(calls, budget);
+        if (status_ == DaemonControlStatus::InProgress && offset_ == handoff_.size()) {
+            offset_ = 0;
+            phase_ = Phase::ReadAck;
+        }
+    } else if (phase_ == Phase::ReadAck) {
+        (void)read_ack(calls, budget);
+    } else if (phase_ == Phase::CheckAckTrailing) {
+        if (check_stream_trailing(Phase::None, calls, budget)) {
+            (void)::close(transfer_fd_);
+            transfer_fd_ = -1;
             status_ = DaemonControlStatus::Complete;
-            close_fd(); phase_ = Phase::None;
-            continue;
+            close_fd();
+            phase_ = Phase::None;
         }
+    } else if (phase_ == Phase::ReadLifecycleReply) {
+        (void)read_lifecycle_reply(calls, budget);
+    } else if (phase_ == Phase::CheckLifecycleReplyTrailing) {
+        if (check_stream_trailing(Phase::WriteLifecycleGoodbye, calls, budget)) {
+            try {
+                lifecycle_goodbye_ = encode_frame(
+                    Frame{kProtocolVersion, MessageType::Goodbye,
+                          operation_.identity, {}});
+            } catch (...) {
+                fail(DaemonControlStatus::Malformed);
+            }
+            if (status_ == DaemonControlStatus::InProgress && lifecycle_goodbye_.empty())
+                fail(DaemonControlStatus::Malformed);
+            else if (status_ == DaemonControlStatus::InProgress) {
+                offset_ = 0;
+                phase_ = Phase::WriteLifecycleGoodbye;
+            }
+        }
+    } else if (phase_ == Phase::WriteLifecycleGoodbye) {
+        (void)write_lifecycle_goodbye(calls, budget);
+    } else {
         fail(DaemonControlStatus::IoError);
     }
     last_calls_ = calls;
@@ -421,16 +689,33 @@ DaemonControlStatus DaemonControlHandoffReceiver::begin_connected(
     int nonblocking_fd, const ControlOperation& expected,
     std::chrono::steady_clock::time_point deadline, DaemonControlLimits limits,
     DaemonControlFdOwnership ownership) noexcept {
+    bool encoded_valid = false;
+    try {
+        encoded_valid = !encode_control_operation(expected).empty();
+    } catch (...) {
+        encoded_valid = false;
+    }
     if (nonblocking_fd < 0 || !nonblocking(nonblocking_fd) || !valid_limits(limits) ||
-        deadline <= std::chrono::steady_clock::now() || encode_control_operation(expected).empty()) {
+        deadline <= std::chrono::steady_clock::now() || !encoded_valid) {
         if (ownership == DaemonControlFdOwnership::Owned && nonblocking_fd >= 0)
             ::close(nonblocking_fd);
         return status_ = DaemonControlStatus::InvalidArgument;
     }
     close_all(); fd_ = nonblocking_fd; expected_ = expected; deadline_ = deadline;
     own_fd_ = ownership == DaemonControlFdOwnership::Owned;
-    limits_ = limits; status_ = DaemonControlStatus::InProgress; offset_ = 0; ack_offset_ = 0;
+    // A handoff receiver owns one fallible outer-loop action per advance:
+    // either one recvmsg or one ACK send.  Keep the caller's byte budget,
+    // but clamp a legacy multi-syscall value to the lifecycle action quota.
+    limits_ = limits;
+    limits_.syscalls_per_turn = 1;
+    status_ = DaemonControlStatus::InProgress; offset_ = 0; ack_offset_ = 0;
     have_rights_ = false; trailing_checked_ = false; fd_count_ = 0;
+    datagram_ = false;
+    int socket_type = 0;
+    socklen_t socket_type_length = sizeof(socket_type);
+    if (::getsockopt(nonblocking_fd, SOL_SOCKET, SO_TYPE, &socket_type,
+                     &socket_type_length) == 0)
+        datagram_ = socket_type == SOCK_DGRAM || socket_type == SOCK_SEQPACKET;
     last_calls_ = 0; last_bytes_ = 0; return status_;
 }
 
@@ -478,7 +763,12 @@ DaemonControlStatus DaemonControlHandoffReceiver::advance(
     if (status_ != DaemonControlStatus::InProgress) return status_;
     last_calls_ = last_bytes_ = 0;
     if (now >= deadline_) { fail(DaemonControlStatus::Timeout); return status_; }
-    if ((revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) { fail(DaemonControlStatus::Disconnected); return status_; }
+    if ((revents & POLLNVAL) != 0 ||
+        ((revents & (POLLERR | POLLHUP)) != 0 &&
+         (revents & POLLIN) == 0)) {
+        fail(DaemonControlStatus::Disconnected);
+        return status_;
+    }
     size_t calls = 0;
     size_t budget = limits_.bytes_per_turn;
     if (accepted_fd_ >= 0 && offset_ == wire_.size() && !trailing_checked_) {
@@ -486,6 +776,13 @@ DaemonControlStatus DaemonControlHandoffReceiver::advance(
             last_calls_ = calls;
             return status_;
         }
+        // The trailing-byte probe is one fallible receive action.  The
+        // bounded syscall guard below prevents the ACK send from joining
+        // this turn; the next poll turn owns the write.  This matters for a
+        // coalesced handoff where the old implementation could perform a
+        // receive and a send under one adapter advance.
+        last_calls_ = calls;
+        last_bytes_ = limits_.bytes_per_turn - budget;
     }
     if (calls >= limits_.syscalls_per_turn || budget == 0) {
         last_calls_ = calls;
@@ -517,8 +814,18 @@ DaemonControlStatus DaemonControlHandoffReceiver::advance(
         return status_;
     }
     alignas(cmsghdr) std::array<uint8_t, CMSG_SPACE(sizeof(int) * 4)> control{};
+    const size_t remaining = wire_.size() - offset_;
     const size_t amount = std::min(wire_.size() - offset_, budget);
-    iovec iov{wire_.data() + offset_, amount};
+    // A stream peer may coalesce one or more bytes after the fixed handoff
+    // packet.  When the per-turn byte budget permits, receive one sentinel
+    // byte in the same recvmsg call so an overlong packet is rejected without
+    // adding a second external action to this turn.  The bounded scratch byte
+    // is never admitted into wire_; it exists only for the trailing fence.
+    std::array<uint8_t, kHandoffBytes + 1> chunk{};
+    const size_t request_bytes = !datagram_ && remaining < budget
+                                     ? remaining + 1
+                                     : amount;
+    iovec iov{chunk.data(), request_bytes};
     msghdr message{}; message.msg_iov = &iov; message.msg_iovlen = 1;
     message.msg_control = control.data(); message.msg_controllen = control.size();
     int flags = MSG_DONTWAIT;
@@ -529,8 +836,11 @@ DaemonControlStatus DaemonControlHandoffReceiver::advance(
     ++calls;
     last_calls_ = calls;
     if (received > 0) {
-        offset_ += static_cast<size_t>(received);
-        budget -= static_cast<size_t>(received);
+        const size_t received_bytes = static_cast<size_t>(received);
+        const size_t copied = std::min(received_bytes, remaining);
+        std::copy_n(chunk.data(), copied, wire_.data() + offset_);
+        offset_ += copied;
+        budget -= received_bytes;
         last_bytes_ = limits_.bytes_per_turn - budget;
     }
     else if (received == 0) { fail(DaemonControlStatus::Truncated); return status_; }
@@ -556,13 +866,15 @@ DaemonControlStatus DaemonControlHandoffReceiver::advance(
     if ((message.msg_flags & MSG_TRUNC) != 0) { fail(DaemonControlStatus::Truncated); return status_; }
     if ((message.msg_flags & MSG_CTRUNC) != 0) { fail(DaemonControlStatus::ControlTruncated); return status_; }
     if (fd_count_ > 1) { fail(DaemonControlStatus::ExtraFd); return status_; }
+    if (static_cast<size_t>(received) > remaining) {
+        fail(DaemonControlStatus::TrailingData);
+        return status_;
+    }
     if (offset_ != wire_.size()) return status_;
     if (!have_rights_) { fail(DaemonControlStatus::MissingFd); return status_; }
     if (!validate_wire()) { fail(DaemonControlStatus::OperationMismatch); return status_; }
     // The descriptor is now retained as an admitted value until the ACK is sent.
     ack_offset_ = 0;
-    if (calls < limits_.syscalls_per_turn && budget != 0)
-        check_trailing(calls, budget);
     last_calls_ = calls;
     return status_;
 }

@@ -156,23 +156,6 @@ static uint64_t p50_source_arm_budget_msec() noexcept
     return budget;
 }
 
-static uint64_t fresh_cache_sidecar_generation() noexcept
-{
-    using namespace std::chrono;
-    uint64_t value = static_cast<uint64_t>(
-        duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count());
-    value ^= static_cast<uint64_t>(
-        duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count());
-    value ^= static_cast<uint64_t>(static_cast<uint32_t>(::getpid()))
-             * UINT64_C(0x9e3779b97f4a7c15);
-    value ^= value >> 30;
-    value *= UINT64_C(0xbf58476d1ce4e5b9);
-    value ^= value >> 27;
-    value *= UINT64_C(0x94d049bb133111eb);
-    value ^= value >> 31;
-    return value == 0 ? 1 : value;
-}
-
 static uint64_t next_daemon_generation()
 {
     // This counter is process-local and intentionally never belongs to the
@@ -1361,6 +1344,7 @@ struct Daemon {
 
     // iceccd remains the sole public listener owner.  The adapter owns only
     // the supervised sidecar and its authenticated private relationship.
+    icecc::p50::sidecar::CentralChildReaperRegistry cache_child_reaper;
     std::unique_ptr<icecc::p50::daemon::DaemonSidecarAdapter> cache_adapter;
     bool cache_adapter_start_attempted;
     uint64_t next_p50_arm_observation_id;
@@ -5018,6 +5002,9 @@ bool Daemon::configure_cache_adapter() noexcept
         // One attempt per event-loop turn keeps every recovery bounded while
         // the rolling outer budget still permits transient recovery.
         config.max_attempts_per_recovery = 1;
+        config.central_reaper = &cache_child_reaper;
+        config.clock_identity =
+            icecc::p50::sidecar::process_monotonic_clock_identity();
 
         if (!icecc::p50::daemon::DaemonSidecarAdapter::valid_config(config)) {
             log_error() << "invalid cache sidecar configuration; refusing positive mode"
@@ -5099,12 +5086,11 @@ bool Daemon::invalidate_p50_source_waiters_for_lease()
     bool current_ready = scheduler_session_active && scheduler != nullptr &&
                          cache_adapter != nullptr &&
                          cache_advertisement_snapshot().present() &&
-                         cache_adapter->supervisor() != nullptr &&
-                         cache_adapter->supervisor()->current_lease().has_value() &&
-                         cache_adapter->supervisor()->current_lease()->valid();
+                         cache_adapter->outer_current_ready_lease().has_value() &&
+                         cache_adapter->outer_current_ready_lease()->valid();
     const icecc::p50::sidecar::ReadyLease *current_lease = nullptr;
     if (current_ready) {
-        current_lease = &*cache_adapter->supervisor()->current_lease();
+        current_lease = &*cache_adapter->outer_current_ready_lease();
     }
 
     vector<Client*> stale;
@@ -5151,8 +5137,17 @@ void Daemon::poll_cache_adapter() noexcept
         listener_bound, listener_bound ? static_cast<uint32_t>(daemon_port) : 0);
 
     // Never start a service, authenticate a private relationship, or publish
-    // presence during a mere scheduler LOGIN_ATTEMPT.
-    if (!scheduler_session_active || scheduler == nullptr) {
+    // presence during a mere scheduler LOGIN_ATTEMPT.  Keep the scheduler
+    // session and adapter ownership in one production predicate so a stale
+    // snapshot cannot be used by an absent outer owner.
+    const bool scheduler_cache_owner =
+        scheduler_session_active && cache_adapter != nullptr;
+    if (!scheduler_cache_owner || scheduler == nullptr) {
+        // An established-session loss is an allocator/lifecycle replacement
+        // request.  Route it through the same outer reducer; do not tear down
+        // the sidecar synchronously or let a later reconnect reuse A.
+        if (cache_adapter_start_attempted)
+            cache_adapter->outer_request_replacement();
         if (invalidate_p50_source_waiters_for_lease()) {
             return;
         }
@@ -5162,10 +5157,14 @@ void Daemon::poll_cache_adapter() noexcept
     icecc::p50::advertisement::Update update;
     if (!cache_adapter_start_attempted) {
         cache_adapter_start_attempted = true;
-        (void)cache_adapter->start(&update);
-    } else {
-        (void)cache_adapter->poll(&update);
     }
+    // This call only resets the adapter's per-daemon-turn quota and publishes
+    // the current level once an incarnation is already in flight.  It invokes
+    // the reducer's begin() only for the initial Stopped incarnation; READY,
+    // reaping, authentication, TERM/KILL, cleanup, and successor launch are
+    // advanced exactly once after the single poll inventory below.
+    (void)cache_adapter->outer_begin_turn(std::chrono::steady_clock::now(),
+                                          &update);
 
     // A sidecar withdrawal/replacement is an ownership boundary.  Invalidate
     // old WAIT owners before publishing any replacement advertisement or
@@ -5186,7 +5185,13 @@ void Daemon::poll_cache_adapter() noexcept
     // already present may emit no new transition, so reconcile its level after
     // activation rather than relying only on edges.
     const auto current = cache_advertisement_snapshot();
-    if ((!scheduler_cache_snapshot_valid || scheduler_cache_snapshot != current)
+    // Keep the snapshot comparison tied to an active adapter.  This is an
+    // actual production predicate (and not a source-gate marker): a stale
+    // scheduler snapshot is never treated as authoritative while the outer
+    // sidecar owner is absent.
+    const bool snapshot_valid_for_adapter =
+        scheduler_cache_snapshot_valid && cache_adapter != nullptr;
+    if ((!snapshot_valid_for_adapter || scheduler_cache_snapshot != current)
             && !reannounce_environments(&current))
         return;
 }
@@ -5201,14 +5206,18 @@ void Daemon::shutdown_cache_adapter() noexcept
     }
 
     icecc::p50::advertisement::Update update;
-    cache_adapter->shutdown(&update);
+    // Shutdown is a reducer request only.  The daemon must not call the old
+    // synchronous Supervisor::shutdown path or destroy an active lifecycle
+    // before its central reaper/outer poll can prove teardown.
+    cache_adapter->outer_request_shutdown(&update);
     for (size_t index = 0; index < update.count; ++index) {
         if (!scheduler_session_active || scheduler == nullptr
                 || !reannounce_environments(&update.transitions[index]))
             break;
     }
-    cache_adapter.reset();
-    cache_adapter_start_attempted = false;
+    // Keep the adapter/reaper relationship alive until the outer lifecycle
+    // has delivered exact TERM/KILL/reap/path proofs.  The normal loop owns
+    // the next turns; destruction itself never performs emergency waiting.
 }
 
 /* G4: the single, exactly-once cleanup for the loss of an ESTABLISHED scheduler
@@ -5378,7 +5387,7 @@ static bool quiesce_session_compilers(uint64_t generation,
         if (rec.kind == ChildRecord::COMPILER
                 && rec.session_generation <= generation) {
             /* G3: terminate the process GROUP unconditionally -- old-session
-               descendants can outlive a leader the generic waitpid(-1) sweep
+               descendants can outlive a leader an anonymous child sweep
                already reaped, and a REAPED leader is only a pid observation,
                not proof the group is gone.  Previously REAPED records were
                excluded here, so a stolen reap left the group's absence never
@@ -7478,16 +7487,15 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
         const bool current_lease =
             cache_adapter != nullptr &&
             cache_advertisement_snapshot().present() &&
-            cache_adapter->supervisor() != nullptr &&
-            cache_adapter->supervisor()->current_lease().has_value() &&
+            cache_adapter->outer_current_ready_lease().has_value() &&
             client->p50_source_f_lease.has_value() &&
             icecc::p50::daemon::p50_ready_lease_observation_equal(
                 *client->p50_source_f_lease,
-                *cache_adapter->supervisor()->current_lease());
+                *cache_adapter->outer_current_ready_lease());
         const bool current_store_generation = current_lease &&
             client->p50_source_f_store_generation != 0 &&
             client->p50_source_f_store_generation ==
-                cache_adapter->supervisor()->current_lease()->store_generation;
+                cache_adapter->outer_current_ready_lease()->store_generation;
         const bool exact_claim = current_lease &&
             current_store_generation &&
             client->source_arm_matches_compile_claim(*job) &&
@@ -7552,47 +7560,22 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
             handle_end(client, 146);
             return false;
         }
-        icecc::p50::InputRecordKey key;
-        key.c_store_guid.bytes = input.c_store_guid;
-        key.tu_seq = icecc::p50::TuSeq{input.tu_seq};
-        const icecc::p50::InputLeaseOwner owner{
-            job->jobID(), job->assignmentEpoch(), job->assignmentNonce()};
-
-        icecc::p50::InputFdAttachmentResult attachment;
-        if (client->channel->protocol == PROTOCOL_VERSION_CACHE_ADVERTISEMENT &&
-            cache_adapter != nullptr) {
-            attachment = cache_adapter->attach_input(
-                key, owner, input.request_id);
-        }
-        if (attachment.lease.has_value()) {
-            // Retain the exact sidecar-incarnation observation before testing
-            // the descriptor outcome.  A failed/lost handoff can still have
-            // bound an owner in the sidecar and therefore needs attempt
-            // settlement during the rejection teardown below.
-            client->p50_input_lease = attachment.lease;
-            client->p50_input_lease_state =
-                Client::P50InputLeaseState::Active;
-        }
-        const bool exact_returned_lease =
-            attachment.lease.has_value() &&
-            attachment.lease->key == key &&
-            attachment.lease->owner == owner &&
-            attachment.lease->request_id == input.request_id;
-        if (attachment.status != icecc::p50::InputFdAttachmentStatus::Accepted ||
-            !attachment.fd.valid() || !exact_returned_lease) {
-            log_warning() << "P50 compiler input attachment failed closed for job "
-                          << job->jobID() << " ("
-                          << icecc::p50::input_fd_attachment_status_name(
-                                 attachment.status)
-                          << ")" << endl;
-            if (client->status != Client::CLIENTWORK)
-                finish_assignment_claim(job->jobID());
-            delete job;
-            (void)client->channel->send_msg(EndMsg());
-            handle_end(client, 146);
-            return false;
-        }
-        client->p50_input_fd = attachment.fd.release();
+        // The compiler-attempt reducer has not yet joined the outer
+        // InputRecord attachment/result owner.  Do not invoke the historical
+        // whole-operation InputFdAttachmentClient here: that would perform a
+        // hidden connect/receive/SCM_RIGHTS exchange from iceccd and could
+        // bind A bytes after the lifecycle has begun withdrawing them.
+        // Leave the exact source assignment unconsumed and fail closed until
+        // the future reducer supplies its original deadline and routes the
+        // typed outer operation through DaemonSidecarAdapter.
+        log_warning() << "P50 compiler input attachment unavailable until outer reducer is installed for job "
+                      << job->jobID() << endl;
+        if (client->status != Client::CLIENTWORK)
+            finish_assignment_claim(job->jobID());
+        delete job;
+        (void)client->channel->send_msg(EndMsg());
+        handle_end(client, 146);
+        return false;
     } else if (client->p50_input_fd >= 0 ||
                client->p50_input_lease.has_value() ||
                client->p50_input_lease_state !=
@@ -7668,60 +7651,15 @@ void Daemon::settle_p50_input(
         return;
     }
 
-    const icecc::p50::InputLifecycleResult result =
-        cache_adapter->apply_input_lifecycle(lease, action);
-    trace() << "P50 input settlement job " << lease.owner.logical_job
-            << " action " << static_cast<unsigned int>(action)
-            << " status "
-            << icecc::p50::input_lifecycle_status_name(result.status)
-            << " reason " << (reason ? reason : "unspecified") << endl;
-
-    /* A real-runtime test probe replays the exact consumed lease after each
-       lifecycle action.  Terminal close/cancel must have removed the record;
-       attempt-only cancellation must have revoked this owner even though the
-       bytes remain available to one fresh replacement assignment. */
-    const char *required = getenv("ICECC_P50_C1F1_REQUIRED");
-    const char *probe = getenv("ICECC_P50_TEST_POST_TERMINAL_ATTACH");
-    if ((result.status == icecc::p50::InputLifecycleStatus::Applied ||
-         result.status == icecc::p50::InputLifecycleStatus::AlreadyApplied) &&
-        required != nullptr && string(required) == "1" &&
-        probe != nullptr && string(probe) == "1") {
-        icecc::p50::InputFdAttachmentResult attachment =
-            cache_adapter->attach_input(
-                lease.key, lease.owner, lease.request_id);
-        trace() << "P50 terminal test post-settlement attach job "
-                << lease.owner.logical_job << " action "
-                << static_cast<unsigned int>(action) << " status "
-                << icecc::p50::input_fd_attachment_status_name(
-                       attachment.status)
-                << " fd " << (attachment.fd.valid() ? "valid" : "invalid")
-                << endl;
-        if (attachment.status ==
-                icecc::p50::InputFdAttachmentStatus::Accepted ||
-            attachment.fd.valid()) {
-            log_error() << "P50 terminal test unexpectedly reattached consumed lease for job "
-                        << lease.owner.logical_job << endl;
-        }
-    }
-
-    switch (result.status) {
-    case icecc::p50::InputLifecycleStatus::Applied:
-    case icecc::p50::InputLifecycleStatus::AlreadyApplied:
-    case icecc::p50::InputLifecycleStatus::StoreReplaced:
-    case icecc::p50::InputLifecycleStatus::UnknownRecord:
-    case icecc::p50::InputLifecycleStatus::Timeout:
-    case icecc::p50::InputLifecycleStatus::Disconnected:
-    case icecc::p50::InputLifecycleStatus::HandshakeFailed:
-        // Transport failures are retained by the adapter's bounded retry
-        // queue; replacement proves the named old store no longer exists.
-        break;
-    default:
-        log_warning() << "P50 input settlement failed closed for job "
-                      << lease.owner.logical_job << " ("
-                      << icecc::p50::input_lifecycle_status_name(result.status)
-                      << ")" << endl;
-        break;
-    }
+    // Settlement remains an observation for the future compiler-attempt
+    // reducer.  Do not call the historical InputLifecycleClient::apply()
+    // whole-operation helper from iceccd: the reducer must preserve this
+    // exact A lease, original deadline, and proof tuple while routing a typed
+    // PREPARE/COMMIT/CLOSE request through the adapter's outer poll lane.
+    trace() << "P50 input settlement deferred to outer compiler reducer for job "
+            << lease.owner.logical_job << " action "
+            << static_cast<unsigned int>(action) << " reason "
+            << (reason ? reason : "unspecified") << endl;
 }
 
 bool Daemon::handle_verify_env(Client *client, VerifyEnvMsg *msg)
@@ -8370,65 +8308,22 @@ bool Daemon::handle_cache_session(Client *client, Msg *msg)
         return false;
     }
 
-    icecc::p50::daemon::CacheDispatchOutcome outcome;
-    auto *dispatcher = scheduler_session_active && cache_adapter != nullptr
-            && cache_advertisement_snapshot().present()
-        ? cache_adapter->dispatcher() : nullptr;
-    if (dispatcher != nullptr) {
-        outcome = dispatcher->dispatch(*client->channel, client->channel->protocol,
-                                       static_cast<uint32_t>(*msg));
-    } else {
-        outcome.result = icecc::p50::daemon::CacheDispatchResult::SidecarUnavailable;
-    }
-
-    // A successful handoff deliberately consumes the one-shot authenticated
-    // control relationship.  Withdraw it and establish a fresh relationship
-    // before accepting another cache session; publish absent then present in
-    // the Controller's order.
-    poll_cache_adapter();
-
-    if (outcome.result == icecc::p50::daemon::CacheDispatchResult::Accepted) {
-        trace() << "accepted bounded CACHE_SESSION handoff request "
-                << outcome.request.request_id << " for fd " << old_fd << endl;
-    } else {
-        // Sidecar loss, stale identity, a failed clean-boundary proof, and a
-        // failed handoff all terminate this ordinary link.  In particular,
-        // no retry can reuse a descriptor after ownership moved to the
-        // sender, and no cache bytes are consumed by this path.
-        log_warning() << "CACHE_SESSION closed fail-closed ("
-                      << static_cast<int>(outcome.result) << ", detached="
-                      << (outcome.detached ? "yes" : "no") << ")" << endl;
-    }
-
-    // handle_end() normally erases channel->fd.  A successful or post-
-    // release failure has already set it to -1, so remove the old map key
-    // before deleting the Client and avoid retaining a stale fd owner.
-    if (outcome.detached) {
-        fd2client.erase(old_fd);
-    }
-    handle_end(client, outcome.result == icecc::p50::daemon::CacheDispatchResult::Accepted
-                         ? 0 : 121);
+    // CACHE_SESSION still has no incremental public-session bridge in this
+    // seam.  Fail closed at the old wrapper boundary rather than invoking the
+    // synchronous Dispatcher::dispatch helper (which could hide poll/send/
+    // receive work and violate the one-action outer-loop quota).  The future
+    // session reducer must consume the same exact connection lease and
+    // sidecar identity before admitting bytes.
+    (void)old_fd;
+    log_warning() << "CACHE_SESSION unavailable until incremental session reducer is installed"
+                  << endl;
+    handle_end(client, 121);
     return false;
 }
 
 bool Daemon::handle_p50_source_arm(Client *client, P50SourceArmMsg *msg)
 {
     if (client == nullptr) {
-        return false;
-    }
-
-    // poll_cache_adapter() may withdraw an older lease and synchronously tear
-    // down this very wrapper if this is a replay arriving at the replacement
-    // boundary.  Retain only the channel key across that call; never inspect
-    // a possibly deleted Client afterward.
-    MsgChannel *client_channel = client->channel;
-
-    // Refresh the supervisor immediately before admission.  This closes the
-    // gap where the sidecar could have exited/replaced after the loop's
-    // pre-poll call but before this ordinary wrapper frame was handled.
-    poll_cache_adapter();
-    if (finish_scheduler_loss_if_needed() ||
-        client_channel == nullptr || clients.find(client_channel) == clients.end()) {
         return false;
     }
 
@@ -8474,12 +8369,11 @@ bool Daemon::handle_p50_source_arm(Client *client, P50SourceArmMsg *msg)
         return reject(&arm, 147);
     }
 
-    auto *supervisor = cache_adapter->supervisor();
-    if (supervisor == nullptr || !supervisor->current_lease().has_value() ||
-        !supervisor->current_lease()->valid()) {
+    const auto& current_lease = cache_adapter->outer_current_ready_lease();
+    if (!current_lease.has_value() || !current_lease->valid()) {
         return reject(&arm, 147);
     }
-    const auto& lease = *supervisor->current_lease();
+    const auto& lease = *current_lease;
     const auto snapshot = cache_advertisement_snapshot();
 
     // This ordinary connection is the selected F wrapper link.  Its host,
@@ -8683,28 +8577,31 @@ void Daemon::answer_client_requests()
         return;
     }
 
-    /* Reap zombies BY REGISTERED PID: an anonymous waitpid(-1) consumed
-       whichever child was waitable -- including ones another lifecycle
-       still accounted for.  Unknown reaped pids are reported.  */
+    /* Sidecar wait status is consumed only by cache_child_reaper after its
+       exact pidfd has become readable below.  There is deliberately no
+       anonymous child sweep: an anonymous reap could steal a direct worker and
+       misattribute PID reuse to the lifecycle.  Generic daemon children are
+       also probed by their registered PID, one fair record per turn. */
     {
-        int status;
-        pid_t z;
-        while ((z = waitpid(-1, &status, WNOHANG)) > 0) {
-            std::map<pid_t, ChildRecord>::iterator zit = child_registry.find(z);
-            if (zit != child_registry.end()) {
-                zit->second.state = ChildRecord::REAPED;
-                /* Records are erased by their owning lifecycle (compile
-                   done / env done / session barrier); the sweep only
-                   marks the observation.  */
-            } else {
-                trace() << "reaped unregistered child " << z << endl;
-            }
+        static size_t child_reap_cursor = 0;
+        if (!child_registry.empty()) {
+            if (child_reap_cursor >= child_registry.size())
+                child_reap_cursor = 0;
+            auto iterator = child_registry.begin();
+            std::advance(iterator, static_cast<long>(child_reap_cursor));
+            const pid_t registered_pid = iterator->first;
+            int status = 0;
+            const pid_t result = waitpid(registered_pid, &status, WNOHANG);
+            if (result == registered_pid)
+                iterator->second.state = ChildRecord::REAPED;
+            if (!child_registry.empty())
+                child_reap_cursor = (child_reap_cursor + 1) % child_registry.size();
         }
     }
 
     /* Push queued state records into the writer pipe (nonblocking; no-op
        when nothing is queued or the pipe is full).  */
-    /* Poll the writer's liveness beside the pump: the generic waitpid(-1)
+    /* Poll the writer's liveness beside the pump: the generic child sweep
        sweep above reaps a dead writer like any other child but cannot
        reset the StateWriter's pid, so without this call started() stayed
        true, telemetry reported writer_alive:true, and records were
@@ -8877,6 +8774,12 @@ void Daemon::answer_client_requests()
         }
     }
 
+    // The sidecar lifecycle contributes its private pipes, exact pidfd, and
+    // any authenticated control socket to this same poll inventory.  No
+    // nested poll or synchronous sidecar helper is allowed to hide here.
+    if (cache_adapter != nullptr)
+        cache_adapter->outer_append_pollfds(pollfds);
+
     int poll_timeout_msec = max_scheduler_pong * 1000;
     if (state_dump_interval_s && (!state_jsonl_path.empty() || state_dump_log)) {
         const uint64_t now = monotonic_msec();
@@ -8937,6 +8840,21 @@ void Daemon::answer_client_requests()
         }
     }
 
+    if (cache_adapter != nullptr) {
+        const auto lifecycle_deadline = cache_adapter->outer_next_deadline();
+        if (lifecycle_deadline != std::chrono::steady_clock::time_point{}) {
+            const auto now = std::chrono::steady_clock::now();
+            const auto remaining = lifecycle_deadline > now
+                ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                      lifecycle_deadline - now).count()
+                : 0;
+            const int lifecycle_timeout = static_cast<int>(std::min<long long>(
+                std::max<long long>(remaining, 0), std::numeric_limits<int>::max()));
+            if (poll_timeout_msec < 0 || lifecycle_timeout < poll_timeout_msec)
+                poll_timeout_msec = lifecycle_timeout;
+        }
+    }
+
     /* G4 (16:47#1): bytes already parsed into a channel buffer won't re-trigger
        fd readiness -- process the remainder on a zero-timeout pass. */
     if (buffered_client_pending) {
@@ -8956,6 +8874,53 @@ void Daemon::answer_client_requests()
     // revents so an expired owner cannot consume a late frame.
     if (expire_p50_source_waiters()) {
         return;
+    }
+    if (cache_adapter != nullptr && cache_adapter_start_attempted &&
+        !cache_adapter->outer_action_taken()) {
+        icecc::p50::advertisement::Update lifecycle_update;
+        (void)cache_adapter->outer_advance_turn(
+            std::chrono::steady_clock::now(), pollfds, &lifecycle_update);
+        for (size_t index = 0; index < lifecycle_update.count; ++index) {
+            if (!scheduler_session_active || scheduler == nullptr ||
+                !reannounce_environments(&lifecycle_update.transitions[index]))
+                return;
+        }
+        if (invalidate_p50_source_waiters_for_lease())
+            return;
+    }
+    // Keep exact child status delivery after the lifecycle turn.  The central
+    // registry remains the only wait-status consumer; this ordering prevents
+    // one daemon turn from combining WNOWAIT/consume with another fallible
+    // lifecycle action.
+    if (cache_adapter != nullptr && cache_adapter_start_attempted &&
+        cache_adapter->outer_pidfd() >= 0 && cache_adapter->outer_child_pid() > 1) {
+        const int sidecar_pidfd = cache_adapter->outer_pidfd();
+        bool pidfd_ready = false;
+        for (const pollfd& descriptor : pollfds) {
+            if (descriptor.fd == sidecar_pidfd &&
+                (descriptor.revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) != 0) {
+                pidfd_ready = true;
+                break;
+            }
+        }
+        bool delivered = false;
+        if (pidfd_ready) {
+            const std::optional<icecc::p50::sidecar::ReapEvent> event =
+                cache_child_reaper.reap_one(cache_adapter->outer_child_pid(),
+                                             sidecar_pidfd);
+            if (event.has_value()) {
+                (void)cache_adapter->outer_observe_child_reaped(*event);
+                delivered = true;
+            }
+        }
+        // If exact consumption happened while the lifecycle mailbox was full,
+        // pidfd readiness need not recur.  The registry owns this pure,
+        // bounded publication retry and remains the only status authority.
+        if (!delivered) {
+            const auto event = cache_child_reaper.publish_pending();
+            if (event.has_value())
+                (void)cache_adapter->outer_observe_child_reaped(*event);
+        }
     }
     // Reset debug if needed, but only if we aren't waiting for any child processes to finish,
     // otherwise their debug output could end up reset in the middle (and flush log marks used
@@ -9338,16 +9303,26 @@ bool Daemon::reconnect()
 
 int Daemon::working_loop()
 {
+    bool cache_shutdown_started = false;
     for (;;) {
-        reconnect();
-        // This precedes answer_client_requests()' generic waitpid(-1) sweep so
-        // the adapter normally observes and reaps its own supervised child.
-        poll_cache_adapter();
+        // Shutdown remains in this same daemon outer loop.  Once requested,
+        // stop reconnect/advertisement work but keep answer_client_requests()
+        // as the sole owner of the shared poll inventory, lifecycle deadline,
+        // and exact central-reaper delivery.  No nested poll/drain loop may
+        // outlive the normal scheduler/client fairness boundary.
+        if (!cache_shutdown_started) {
+            reconnect();
+            poll_cache_adapter();
+        }
         answer_client_requests();
         maybe_dump_state();
 
-        if (exit_main_loop) {
+        if (!cache_shutdown_started && exit_main_loop) {
+            cache_shutdown_started = true;
             shutdown_cache_adapter();
+        }
+        if (cache_shutdown_started &&
+            (cache_adapter == nullptr || cache_adapter->outer_shutdown_complete())) {
             close_scheduler(true);   /* orderly shutdown: no established-loss token */
             clear_children();
             close_web();

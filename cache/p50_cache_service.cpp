@@ -785,8 +785,18 @@ bool handle_connection(local::Connection connection, const Options& options,
             return true;
 
         if (operation.kind == local::ControlOperationKind::CacheSession) {
-            const local::HandoffRequest expected{operation.identity, operation.request_id};
-            (void)runtime.run_one(connection, expected, deadline);
+            /*
+             * Cache-session continuation is deliberately not admitted by the
+             * legacy worker.  The only positive path is the shared-codec
+             * AdoptedOutcomeWriter: it must retain this authenticated control
+             * lease, flush a canonical P5CO/PHASE_OPEN incrementally, and only
+             * then move the same descriptor into CacheWire.  run_one() uses
+             * the old receive-and-ACK / send-magic whole-operation path and is
+             * retained solely for historical fixtures.  Calling it here
+             * would make that path live and would close the control lease at
+             * the wrong boundary, so fail closed until the writer bridge is
+             * installed.
+             */
             return true;
         }
         if (!operation.input.has_value() || !operation.owner.has_value())
@@ -821,11 +831,50 @@ bool handle_connection(local::Connection connection, const Options& options,
         if (operation.lifecycle_result.has_value() ||
             queued_control_data(connection.native_handle()))
             return true;
-        const InputLifecycleRequest request{
-            options.identity, *operation.input, *operation.owner,
-            operation.request_id, operation.lifecycle_action};
+        InputLifecycleRequest request;
+        request.identity = options.identity;
+        request.key = *operation.input;
+        request.owner = *operation.owner;
+        request.operation_id = operation.request_id;
+        request.action = operation.lifecycle_action;
+        request.f_store_generation = operation.f_store_generation;
+        request.f_store_guid = operation.f_store_guid;
+        request.immutable_size = operation.immutable_size;
+        request.immutable_digest = operation.immutable_digest;
+        request.retirement_id = operation.retirement_id;
+        request.replacement_owner = operation.replacement_owner;
+        const bool retirement =
+            operation.lifecycle_action == InputLifecycleAction::PrepareAttemptRetirement ||
+            operation.lifecycle_action == InputLifecycleAction::CommitAttemptReplacement ||
+            operation.lifecycle_action == InputLifecycleAction::CloseLogicalInputLease;
+        if (retirement) {
+            const sidecar::MonotonicClockIdentity clock_identity =
+                sidecar::process_monotonic_clock_identity();
+            const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (!operation.absolute_deadline.valid() ||
+                !operation.absolute_deadline.matches_clock(clock_identity) ||
+                operation.absolute_deadline.expired(
+                    now_ns, clock_identity.clock_domain_id,
+                    clock_identity.time_namespace_id))
+                return true;
+            // Preserve the exact wire value.  This conversion is only a
+            // local representation of the same CLOCK_MONOTONIC nanoseconds;
+            // no receive-time-plus-duration deadline is reconstructed.
+            request.absolute_deadline = operation.absolute_deadline;
+            request.deadline = operation.absolute_deadline.as_steady_time_point();
+        } else {
+            request.deadline = deadline;
+        }
+        // Once the operation envelope has been decoded, every retirement
+        // phase uses that same absolute deadline for apply, response, and
+        // final ACK.  The pre-decode handshake budget above is only the
+        // bounded envelope receive; it cannot renew the retirement budget.
+        const auto operation_deadline = retirement
+            ? operation.absolute_deadline.as_steady_time_point()
+            : deadline;
         const std::optional<InputLifecycleApplyStatus> result =
-            runtime.apply_input_lifecycle_on_owner(request, deadline);
+            runtime.apply_input_lifecycle_on_owner(request, operation_deadline);
         if (!result.has_value())
             return true;
         const std::vector<uint8_t> response_payload =
@@ -836,10 +885,10 @@ bool handle_connection(local::Connection connection, const Options& options,
         const local::Frame response{local::kProtocolVersion,
                                     local::MessageType::Data,
                                     options.identity, response_payload};
-        if (connection.send_until(response, deadline) != local::Status::Ok)
+        if (connection.send_until(response, operation_deadline) != local::Status::Ok)
             return true;
         local::Frame acknowledgement;
-        if (connection.receive_until(acknowledgement, deadline) !=
+        if (connection.receive_until(acknowledgement, operation_deadline) !=
                 local::Status::Ok ||
             acknowledgement.type != local::MessageType::Goodbye ||
             !acknowledgement.payload.empty() ||
@@ -881,6 +930,8 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
           config_.endpoint_config.owner_limits.max_retained_input_records,
           config_.max_input_lifecycle_replays),
       endpoint_work_guard_(asio::make_work_guard(context_)) {
+    input_lifecycle_.bind_store_identity(config_.f_store_generation,
+                                         config_.f_store_guid);
     InputJobStateSelector configured_selector =
         std::move(config_.endpoint_config.input_job_state);
     config_.endpoint_config.input_job_state =
@@ -1397,17 +1448,49 @@ SidecarRuntime::apply_input_lifecycle_on_owner(
             }
             bool mutated = true;
             try {
-                if (decision.close_record)
+                const bool retirement =
+                    request.action == InputLifecycleAction::PrepareAttemptRetirement ||
+                    request.action == InputLifecycleAction::CommitAttemptReplacement ||
+                    request.action == InputLifecycleAction::CloseLogicalInputLease;
+                if (retirement) {
+                    // The sidecar endpoint is the one FInputStoreOwner.  This
+                    // read-only cursor check binds retirement to the exact
+                    // retained bytes without creating a daemon-local core or
+                    // reopening a closed record.
+                    const InputCursor cursor = endpoint_->attach_input(request.key);
+                    if (cursor.remaining() != request.immutable_size ||
+                        cursor.raw_digest() != request.immutable_digest)
+                        mutated = false;
+                }
+                if (mutated && decision.close_record)
                     endpoint_->close_input_job(request.key);
-                if (decision.collect_record)
+                if (mutated && decision.collect_record)
                     endpoint_->collect_input_garbage();
             } catch (...) {
                 mutated = false;
             }
-            input_lifecycle_.finish_apply(request, mutated);
-            const InputLifecycleApplyStatus status =
-                mutated ? InputLifecycleApplyStatus::Applied
-                        : InputLifecycleApplyStatus::UnknownRecord;
+            const bool registry_mutated =
+                input_lifecycle_.finish_apply(request, mutated);
+            InputLifecycleApplyStatus status = InputLifecycleApplyStatus::UnknownRecord;
+            if (mutated && registry_mutated) {
+                switch (request.action) {
+                case InputLifecycleAction::PrepareAttemptRetirement:
+                    status = InputLifecycleApplyStatus::AttemptQuiescedRecordRetained;
+                    break;
+                case InputLifecycleAction::CommitAttemptReplacement:
+                    status = InputLifecycleApplyStatus::ReplacementInstalledRecordRetained;
+                    break;
+                case InputLifecycleAction::CloseLogicalInputLease:
+                    status = endpoint_->owner_usage().retained_input_records <
+                                     before.retained_input_records
+                                 ? InputLifecycleApplyStatus::JobClosedRecordReclaimed
+                                 : InputLifecycleApplyStatus::JobClosedRecordRetained;
+                    break;
+                default:
+                    status = InputLifecycleApplyStatus::Applied;
+                    break;
+                }
+            }
             append_terminal_lifecycle_test_trace(
                 request, status, before, endpoint_->owner_usage());
             completion->set_value(status);
@@ -1670,6 +1753,9 @@ int run(const Options& options) noexcept {
     runtime_config.f_store_guid = structured_launch.active
                                       ? effective_options.f_store_guid
                                       : f_store_guid_for_root(legacy_root);
+    runtime_config.f_store_generation = structured_launch.active
+                                            ? effective_options.f_store_generation
+                                            : 0;
     runtime_config.c_store_guid = structured_launch.active
                                       ? effective_options.c_store_guid
                                       : c_store_guid_for_root(legacy_root);

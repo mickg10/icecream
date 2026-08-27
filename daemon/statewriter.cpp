@@ -92,8 +92,8 @@ bool StateWriter::alive()
     int status = 0;
     const pid_t r = waitpid(m_pid, &status, WNOHANG);
     if (r == m_pid || (r < 0 && errno == ECHILD)) {
-        /* Exited -- possibly already reaped by the daemon's generic
-           waitpid(-1) zombie sweep, which collects this pid like any other
+        /* Exited -- possibly already reaped by the daemon's generic child
+           sweep, which collects this pid like any other
            child's.  Say so ONCE: without this line an operator has no
            signal that the state stream is dead (records keep being
            accepted and dropped, and telemetry would otherwise still say

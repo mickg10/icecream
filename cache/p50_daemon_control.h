@@ -63,6 +63,19 @@ public:
                                         DaemonControlLimits limits,
                                         DaemonControlFdOwnership ownership) noexcept;
 
+    // Initializes the operation on an already-created, nonblocking socket but
+    // deliberately does not call connect(2).  The outer owner can therefore
+    // spend one turn creating the descriptor and a later turn performing the
+    // single connect action before the normal incremental protocol phases.
+    DaemonControlStatus begin_connecting(const std::string& path,
+                                         int nonblocking_fd,
+                                         const ControlOperation& operation,
+                                         int transfer_fd,
+                                         const CredentialExpectation& credentials,
+                                         std::chrono::steady_clock::time_point deadline,
+                                         DaemonControlLimits limits,
+                                         DaemonControlFdOwnership ownership) noexcept;
+
     [[nodiscard]] short desired_events() const noexcept;
     DaemonControlStatus advance(std::chrono::steady_clock::time_point now,
                                 short revents) noexcept;
@@ -76,13 +89,19 @@ public:
     [[nodiscard]] bool deadline_expired(std::chrono::steady_clock::time_point now) const noexcept {
         return status_ == DaemonControlStatus::InProgress && now >= deadline_;
     }
+    [[nodiscard]] std::chrono::steady_clock::time_point deadline() const noexcept {
+        return deadline_;
+    }
     [[nodiscard]] int native_handle() const noexcept { return fd_; }
     [[nodiscard]] const std::optional<PeerCredential>& peer() const noexcept { return peer_; }
+    [[nodiscard]] const std::optional<InputLifecycleApplyStatus>&
+    lifecycle_result() const noexcept { return lifecycle_result_; }
 
 private:
-    enum class Phase : uint8_t { None, Connecting, WriteHello, ReadHelloAck,
+    enum class Phase : uint8_t { None, ConnectPending, Connecting, WriteHello, ReadHelloAck,
                                  CheckHelloAckTrailing, WriteControl, WriteHandoff,
-                                 ReadAck, CheckAckTrailing };
+                                 ReadAck, CheckAckTrailing, ReadLifecycleReply,
+                                 CheckLifecycleReplyTrailing, WriteLifecycleGoodbye };
     void fail(DaemonControlStatus status) noexcept;
     void close_fd() noexcept;
     bool query_peer() noexcept;
@@ -91,6 +110,8 @@ private:
     bool write_handoff(size_t& calls, size_t& budget) noexcept;
     bool read_frame(size_t& calls, size_t& budget) noexcept;
     bool read_ack(size_t& calls, size_t& budget) noexcept;
+    bool read_lifecycle_reply(size_t& calls, size_t& budget) noexcept;
+    bool write_lifecycle_goodbye(size_t& calls, size_t& budget) noexcept;
     bool check_stream_trailing(Phase next_phase, size_t& calls,
                                size_t& budget) noexcept;
     bool validate_ack() noexcept;
@@ -106,6 +127,7 @@ private:
     DaemonControlLimits limits_{};
     CredentialExpectation credentials_{};
     ControlOperation operation_{};
+    std::string connect_path_;
     std::vector<uint8_t> hello_;
     std::vector<uint8_t> control_;
     std::array<uint8_t, 40> handoff_{};
@@ -117,6 +139,9 @@ private:
     size_t last_calls_ = 0;
     size_t last_bytes_ = 0;
     std::optional<PeerCredential> peer_;
+    bool lifecycle_mode_ = false;
+    std::vector<uint8_t> lifecycle_goodbye_;
+    std::optional<InputLifecycleApplyStatus> lifecycle_result_;
 };
 
 // Receiver seam used by the daemon adapter after it has admitted a connection
@@ -160,6 +185,7 @@ private:
     bool own_fd_ = false;
     bool have_rights_ = false;
     bool trailing_checked_ = false;
+    bool datagram_ = false;
     size_t fd_count_ = 0;
     size_t offset_ = 0;
     size_t ack_offset_ = 0;

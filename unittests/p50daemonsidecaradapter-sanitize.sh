@@ -23,8 +23,10 @@ trap 'rm -f "$out"' EXIT HUP INT TERM
     "$top_src/cache/p50_daemon_cache_dispatch.cpp" \
     "$top_src/cache/p50_input_fd_attachment.cpp" \
     "$top_src/cache/p50_input_lifecycle.cpp" \
+    "$top_src/cache/p50_daemon_control.cpp" \
     "$top_src/cache/p50_fd_handoff.cpp" \
     "$top_src/cache/p50_local_transport.cpp" \
+    "$top_src/cache/p50_sidecar_lifecycle.cpp" \
     "$top_src/cache/p50_sidecar_supervisor.cpp" \
     "$top_src/cache/p50_ready_advertisement.cpp" \
     "$top_build/cache/libprotocol50.a" \

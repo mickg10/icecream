@@ -2,11 +2,22 @@
 #include "p50_control_operation.h"
 
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
 
 namespace icecc::p50 {
 
 namespace {
+
+bool attempt_retirement_action(InputLifecycleAction action) noexcept {
+    return action == InputLifecycleAction::PrepareAttemptRetirement ||
+           action == InputLifecycleAction::CommitAttemptReplacement ||
+           action == InputLifecycleAction::CloseLogicalInputLease;
+}
+
+bool nonzero_digest(const Digest128& digest) noexcept {
+    return digest != Digest128{};
+}
 
 InputLifecycleResult lifecycle_rejected(InputLifecycleStatus status,
                                         InputLifecycleRequest request) noexcept {
@@ -52,6 +63,18 @@ InputLifecycleStatus lifecycle_status_for_apply(
         return InputLifecycleStatus::ConflictingReplay;
     case InputLifecycleApplyStatus::CapacityExceeded:
         return InputLifecycleStatus::CapacityExceeded;
+    case InputLifecycleApplyStatus::AttemptQuiescedRecordRetained:
+        return InputLifecycleStatus::AttemptQuiescedRecordRetained;
+    case InputLifecycleApplyStatus::ReplacementInstalledRecordRetained:
+        return InputLifecycleStatus::ReplacementInstalledRecordRetained;
+    case InputLifecycleApplyStatus::JobClosedRecordRetained:
+        return InputLifecycleStatus::JobClosedRecordRetained;
+    case InputLifecycleApplyStatus::JobClosedRecordReclaimed:
+        return InputLifecycleStatus::JobClosedRecordReclaimed;
+    case InputLifecycleApplyStatus::RetirementProofRequired:
+        return InputLifecycleStatus::RetirementProofRequired;
+    case InputLifecycleApplyStatus::GenerationMismatch:
+        return InputLifecycleStatus::GenerationMismatch;
     }
     return InputLifecycleStatus::Rejected;
 }
@@ -64,6 +87,208 @@ InputLifecycleRegistry::InputLifecycleRegistry(size_t max_owners,
     if (max_owners_ == 0 || max_replays_ == 0)
         throw std::invalid_argument(
             "input lifecycle owner and replay limits must be nonzero");
+}
+
+void InputLifecycleRegistry::bind_store_identity(
+    uint64_t f_store_generation, FStoreGuid f_store_guid) noexcept {
+    // Binding is immutable for one runtime.  Refusing an attempted rebinding
+    // keeps a stale sidecar operation from changing the owner identity under
+    // an already-retained InputRecord.
+    if (f_store_generation == 0 || f_store_guid == FStoreGuid{})
+        return;
+    if (f_store_generation_ == 0 && f_store_guid_ == FStoreGuid{}) {
+        f_store_generation_ = f_store_generation;
+        f_store_guid_ = f_store_guid;
+    }
+}
+
+std::optional<InputLifecyclePreparedObservation>
+InputLifecycleRegistry::ObservePrepared(
+    const InputLifecycleOperationLease& operation,
+    uint64_t prepared_id) noexcept {
+    if (!operation.valid() ||
+        operation.action != InputLifecycleAction::PrepareAttemptRetirement ||
+        prepared_id == 0)
+        return std::nullopt;
+
+    const auto existing = refinements_.find(operation.operation_id);
+    if (existing != refinements_.end()) {
+        // Operation ids are never a lookup-only authority.  An exact replay
+        // returns the original observation, while reuse for a different
+        // operation/prepared id fails closed against role-slot reuse.
+        if (!existing->second.prepared.matches(operation, prepared_id))
+            return std::nullopt;
+        return existing->second.prepared;
+    }
+    if (refinements_.size() >= max_replays_ ||
+        next_refinement_observation_id_ == 0)
+        return std::nullopt;
+
+    const InputLifecyclePreparedObservation prepared{
+        operation, prepared_id, next_refinement_observation_id_, true};
+    try {
+        refinements_.emplace(
+            operation.operation_id,
+            Refinement{prepared, InputLifecycleRefinementState::Prepared, 0,
+                       std::nullopt});
+    } catch (...) {
+        return std::nullopt;
+    }
+    if (next_refinement_observation_id_ == std::numeric_limits<uint64_t>::max())
+        next_refinement_observation_id_ = 0;
+    else
+        ++next_refinement_observation_id_;
+    return prepared;
+}
+
+InputLifecycleRefinementResult InputLifecycleRegistry::CancelOrExpire(
+    const InputLifecycleOperationLease& operation,
+    uint64_t observation_id) noexcept {
+    if (!operation.valid() ||
+        operation.action != InputLifecycleAction::PrepareAttemptRetirement ||
+        observation_id == 0)
+        return InputLifecycleRefinementResult::InvalidArgument;
+    const auto position = refinements_.find(operation.operation_id);
+    if (position == refinements_.end())
+        return InputLifecycleRefinementResult::StaleOperation;
+    Refinement& refinement = position->second;
+    if (refinement.prepared.operation != operation ||
+        refinement.prepared.observation_id != observation_id)
+        return InputLifecycleRefinementResult::ConflictingOperation;
+    switch (refinement.state) {
+    case InputLifecycleRefinementState::Prepared:
+        // This is the cancel-first linearization point.  The transient decoder
+        // profile is reset by the owning reducer; no durable bundle is
+        // retained or made visible from this state.
+        refinement.state = InputLifecycleRefinementState::CancelledNoDurability;
+        refinement.permit_id = 0;
+        refinement.durable.reset();
+        return InputLifecycleRefinementResult::CancelledNoDurability;
+    case InputLifecycleRefinementState::CancelledNoDurability:
+        return InputLifecycleRefinementResult::AlreadyCancelled;
+    case InputLifecycleRefinementState::CommitSelected:
+    case InputLifecycleRefinementState::DurableCommitted:
+    case InputLifecycleRefinementState::DeliverySuppressed:
+        // Commit selection is the commit-wins linearization point.  A late
+        // cancellation/expiry cannot erase a durable bundle or lastCommit.
+        return InputLifecycleRefinementResult::CommitWon;
+    case InputLifecycleRefinementState::None:
+        break;
+    }
+    return InputLifecycleRefinementResult::StaleOperation;
+}
+
+std::optional<InputLifecycleCommitPermit>
+InputLifecycleRegistry::SelectCommit(
+    const InputLifecycleOperationLease& operation,
+    uint64_t observation_id) noexcept {
+    if (!operation.valid() ||
+        operation.action != InputLifecycleAction::PrepareAttemptRetirement ||
+        observation_id == 0)
+        return std::nullopt;
+    const auto position = refinements_.find(operation.operation_id);
+    if (position == refinements_.end() ||
+        position->second.prepared.operation != operation ||
+        position->second.prepared.observation_id != observation_id ||
+        position->second.state != InputLifecycleRefinementState::Prepared ||
+        next_refinement_permit_id_ == 0)
+        return std::nullopt;
+    const uint64_t permit_id = next_refinement_permit_id_;
+    position->second.state = InputLifecycleRefinementState::CommitSelected;
+    position->second.permit_id = permit_id;
+    if (next_refinement_permit_id_ == std::numeric_limits<uint64_t>::max())
+        next_refinement_permit_id_ = 0;
+    else
+        ++next_refinement_permit_id_;
+    return InputLifecycleCommitPermit(operation, observation_id, permit_id);
+}
+
+InputLifecycleRefinementResult InputLifecycleRegistry::CommitDurable(
+    InputLifecycleCommitPermit permit,
+    const InputLifecycleDurableBundle& bundle) noexcept {
+    if (!permit.valid())
+        return InputLifecycleRefinementResult::InvalidArgument;
+    const InputLifecycleOperationLease operation = permit.operation();
+    const uint64_t observation_id = permit.observation_id();
+    const uint64_t permit_id = permit.permit_id();
+    const auto position = refinements_.find(operation.operation_id);
+    const bool exact = position != refinements_.end() &&
+                       position->second.prepared.operation == operation &&
+                       position->second.prepared.observation_id == observation_id &&
+                       position->second.state ==
+                           InputLifecycleRefinementState::CommitSelected &&
+                       position->second.permit_id == permit_id &&
+                       bundle.matches(permit) &&
+                       bundle.prepared_id ==
+                           position->second.prepared.prepared_id;
+    // A permit is linearized once at this boundary even when the supplied
+    // bundle is malformed.  The caller cannot retry with a second copy.
+    permit.consume();
+    if (!exact)
+        return position == refinements_.end()
+                   ? InputLifecycleRefinementResult::StaleOperation
+                   : InputLifecycleRefinementResult::ConflictingOperation;
+    position->second.durable = bundle;
+    position->second.state = InputLifecycleRefinementState::DurableCommitted;
+    return InputLifecycleRefinementResult::DurableCommitted;
+}
+
+bool InputLifecycleRegistry::SuppressDeliveryAfterCommit(
+    const InputLifecycleOperationLease& operation,
+    uint64_t observation_id) noexcept {
+    if (!operation.valid() ||
+        operation.action != InputLifecycleAction::PrepareAttemptRetirement ||
+        observation_id == 0)
+        return false;
+    const auto position = refinements_.find(operation.operation_id);
+    if (position == refinements_.end() ||
+        position->second.prepared.operation != operation ||
+        position->second.prepared.observation_id != observation_id)
+        return false;
+    if (position->second.state == InputLifecycleRefinementState::DeliverySuppressed)
+        return true;
+    if (position->second.state != InputLifecycleRefinementState::DurableCommitted ||
+        !position->second.durable.has_value())
+        return false;
+    position->second.state = InputLifecycleRefinementState::DeliverySuppressed;
+    return true;
+}
+
+bool InputLifecycleRegistry::SuppressDeliveryAfterCommit(
+    const InputLifecycleDurableBundle& bundle) noexcept {
+    if (!bundle.valid())
+        return false;
+    const auto position = refinements_.find(bundle.operation.operation_id);
+    if (position == refinements_.end() ||
+        !position->second.durable.has_value() ||
+        position->second.durable.value() != bundle)
+        return false;
+    return SuppressDeliveryAfterCommit(bundle.operation, bundle.observation_id);
+}
+
+std::optional<InputLifecycleRefinementState>
+InputLifecycleRegistry::refinement_state(
+    const InputLifecycleOperationLease& operation) const noexcept {
+    if (!operation.valid())
+        return std::nullopt;
+    const auto position = refinements_.find(operation.operation_id);
+    if (position == refinements_.end() ||
+        position->second.prepared.operation != operation)
+        return std::nullopt;
+    return position->second.state;
+}
+
+std::optional<InputLifecycleDurableBundle>
+InputLifecycleRegistry::durable_bundle(
+    const InputLifecycleOperationLease& operation) const noexcept {
+    if (!operation.valid())
+        return std::nullopt;
+    const auto position = refinements_.find(operation.operation_id);
+    if (position == refinements_.end() ||
+        position->second.prepared.operation != operation ||
+        !position->second.durable.has_value())
+        return std::nullopt;
+    return position->second.durable;
 }
 
 bool InputLifecycleRegistry::key_valid(InputRecordKey key) noexcept {
@@ -268,11 +493,40 @@ void InputLifecycleRegistry::forget_replay(uint64_t operation_id) noexcept {
 InputLifecycleApplyResult InputLifecycleRegistry::begin_apply(
     const InputLifecycleRequest& request) noexcept {
     InputLifecycleApplyResult result;
+    const bool retirement = attempt_retirement_action(request.action);
     if (request.identity.generation == 0 || request.identity.attempt == 0 ||
         request.operation_id == 0 || !key_valid(request.key) ||
         !input_lease_owner_valid(request.owner) ||
         !input_lifecycle_action_valid(request.action))
         return result;
+    if (retirement &&
+        (request.f_store_generation == 0 || request.f_store_guid == FStoreGuid{} ||
+         !nonzero_digest(request.immutable_digest) || request.retirement_id == 0 ||
+         !request.absolute_deadline.valid() ||
+         request.deadline != request.absolute_deadline.as_steady_time_point())) {
+        result.status = InputLifecycleApplyStatus::InvalidArgument;
+        return result;
+    }
+    if (retirement &&
+        (f_store_generation_ == 0 || f_store_guid_ == FStoreGuid{} ||
+         request.f_store_generation != f_store_generation_ ||
+         request.f_store_guid != f_store_guid_)) {
+        result.status = InputLifecycleApplyStatus::GenerationMismatch;
+        return result;
+    }
+    if (request.action == InputLifecycleAction::CommitAttemptReplacement &&
+        (!request.replacement_owner.has_value() ||
+         !input_lease_owner_valid(*request.replacement_owner) ||
+         *request.replacement_owner == request.owner ||
+         request.replacement_owner->logical_job != request.owner.logical_job)) {
+        result.status = InputLifecycleApplyStatus::InvalidArgument;
+        return result;
+    }
+    if (request.action != InputLifecycleAction::CommitAttemptReplacement &&
+        request.replacement_owner.has_value()) {
+        result.status = InputLifecycleApplyStatus::InvalidArgument;
+        return result;
+    }
     if (replay_conflicts(request, result))
         return result;
     if (!reserve_replay(request)) {
@@ -283,7 +537,7 @@ InputLifecycleApplyResult InputLifecycleRegistry::begin_apply(
     auto position = leases_.find(request.key);
     bool created = false;
     if (position == leases_.end()) {
-        if (request.action == InputLifecycleAction::CancelAttempt) {
+        if (request.action == InputLifecycleAction::CancelAttempt || retirement) {
             result.status = InputLifecycleApplyStatus::UnknownRecord;
             complete_replay(request, result.status);
             return result;
@@ -314,6 +568,47 @@ InputLifecycleApplyResult InputLifecycleRegistry::begin_apply(
         complete_replay(request, result.status);
         return result;
     }
+    if (retirement && !lease.committed) {
+        result.status = InputLifecycleApplyStatus::UnknownRecord;
+        complete_replay(request, result.status);
+        return result;
+    }
+    if (retirement && lease.f_store_generation != 0 &&
+        (lease.f_store_generation != request.f_store_generation ||
+         lease.f_store_guid != request.f_store_guid ||
+         lease.immutable_size != request.immutable_size ||
+         lease.immutable_digest != request.immutable_digest)) {
+        result.status = InputLifecycleApplyStatus::GenerationMismatch;
+        complete_replay(request, result.status);
+        return result;
+    }
+    if (request.action == InputLifecycleAction::PrepareAttemptRetirement) {
+        if (lease.attempt_retiring) {
+            result.status = InputLifecycleApplyStatus::AlreadyApplied;
+            complete_replay(request, result.status);
+            return result;
+        }
+        if (lease.attachment_pending || lease.attempt_cancelled) {
+            result.status = InputLifecycleApplyStatus::RetirementProofRequired;
+            complete_replay(request, result.status);
+            return result;
+        }
+    }
+    if (request.action == InputLifecycleAction::CommitAttemptReplacement) {
+        if (!lease.attempt_retiring || lease.retirement_id != request.retirement_id) {
+            result.status = InputLifecycleApplyStatus::RetirementProofRequired;
+            complete_replay(request, result.status);
+            return result;
+        }
+        if (std::find(lease.retired_owners.begin(), lease.retired_owners.end(),
+                      *request.replacement_owner) != lease.retired_owners.end() ||
+            *request.replacement_owner == *lease.owner ||
+            retired_owner_count_ >= max_replays_) {
+            result.status = InputLifecycleApplyStatus::StaleOwner;
+            complete_replay(request, result.status);
+            return result;
+        }
+    }
     if ((lease.job_closed &&
          request.action != InputLifecycleAction::CancelAttempt) ||
         (request.action == InputLifecycleAction::CancelAttempt &&
@@ -333,25 +628,28 @@ InputLifecycleApplyResult InputLifecycleRegistry::begin_apply(
     lease.apply_pending = true;
     lease.apply_created = created;
     result.status = InputLifecycleApplyStatus::Applied;
-    if (request.action != InputLifecycleAction::CancelAttempt && lease.committed) {
+    if (request.action != InputLifecycleAction::CancelAttempt &&
+        request.action != InputLifecycleAction::PrepareAttemptRetirement &&
+        request.action != InputLifecycleAction::CommitAttemptReplacement &&
+        lease.committed) {
         result.close_record = true;
         result.collect_record = true;
     }
     return result;
 }
 
-void InputLifecycleRegistry::finish_apply(
+bool InputLifecycleRegistry::finish_apply(
     const InputLifecycleRequest& request,
     bool endpoint_mutation_succeeded) noexcept {
     const auto replay = replays_.find(request.operation_id);
     const auto position = leases_.find(request.key);
     if (replay == replays_.end() || replay->second.request != request ||
         replay->second.complete || position == leases_.end())
-        return;
+        return false;
     Lease& lease = position->second;
     if (!lease.apply_pending || !lease.owner.has_value() ||
         *lease.owner != request.owner)
-        return;
+        return false;
 
     if (!endpoint_mutation_succeeded) {
         const bool erase = lease.apply_created;
@@ -363,20 +661,59 @@ void InputLifecycleRegistry::finish_apply(
             if (created != leases_.end())
                 erase_lease(created);
         }
-        return;
+        return false;
     }
 
     lease.apply_pending = false;
     lease.apply_created = false;
     if (request.action == InputLifecycleAction::CancelAttempt) {
         lease.attempt_cancelled = true;
+    } else if (request.action == InputLifecycleAction::PrepareAttemptRetirement) {
+        lease.attempt_retiring = true;
+        lease.retirement_id = request.retirement_id;
+        lease.f_store_generation = request.f_store_generation;
+        lease.f_store_guid = request.f_store_guid;
+        lease.immutable_size = request.immutable_size;
+        lease.immutable_digest = request.immutable_digest;
+    } else if (request.action == InputLifecycleAction::CommitAttemptReplacement) {
+        // The old owner is retired only after the caller's complete local
+        // proof has admitted COMMIT.  The retained InputRecord itself is not
+        // closed: the endpoint remains the sole immutable-byte owner.
+        try {
+            lease.retired_owners.push_back(request.owner);
+        } catch (...) {
+            // A bounded append failure is fail-closed rather than a partial
+            // owner substitution.
+            lease.apply_pending = false;
+            lease.apply_created = false;
+            forget_replay(request.operation_id);
+            return false;
+        }
+        ++retired_owner_count_;
+        lease.owner = request.replacement_owner;
+        lease.attempt_retiring = false;
+        lease.retirement_id = 0;
+        lease.attempt_cancelled = false;
+        lease.attachment_request_id = 0;
+        lease.attachment_pending = false;
+        lease.attachment_authorized = false;
     } else {
+        // Logical close is separate from attempt retirement and is the only
+        // path that asks the endpoint owner to close/collect the InputRecord.
         lease.job_closed = true;
         lease.attempt_cancelled = true;
     }
-    replay->second.status = InputLifecycleApplyStatus::Applied;
+    replay->second.status =
+        request.action == InputLifecycleAction::PrepareAttemptRetirement
+            ? InputLifecycleApplyStatus::AttemptQuiescedRecordRetained
+            : request.action == InputLifecycleAction::CommitAttemptReplacement
+                  ? InputLifecycleApplyStatus::ReplacementInstalledRecordRetained
+                  : request.action == InputLifecycleAction::CloseLogicalInputLease
+                        ? InputLifecycleApplyStatus::JobClosedRecordRetained
+                        : InputLifecycleApplyStatus::Applied;
     replay->second.complete = true;
     collect_closed(request.key);
+    return true;
 }
 
 void InputLifecycleRegistry::collect_closed(InputRecordKey key) noexcept {
@@ -401,6 +738,9 @@ void InputLifecycleRegistry::clear() noexcept {
     leases_.clear();
     replays_.clear();
     replay_order_.clear();
+    refinements_.clear();
+    next_refinement_observation_id_ = 1;
+    next_refinement_permit_id_ = 1;
     retired_owner_count_ = 0;
 }
 
@@ -421,6 +761,18 @@ const char* input_lifecycle_status_name(InputLifecycleStatus status) noexcept {
     case InputLifecycleStatus::Rejected: return "rejected";
     case InputLifecycleStatus::Timeout: return "timeout";
     case InputLifecycleStatus::Disconnected: return "disconnected";
+    case InputLifecycleStatus::AttemptQuiescedRecordRetained:
+        return "attempt-quiesced-record-retained";
+    case InputLifecycleStatus::ReplacementInstalledRecordRetained:
+        return "replacement-installed-record-retained";
+    case InputLifecycleStatus::JobClosedRecordRetained:
+        return "job-closed-record-retained";
+    case InputLifecycleStatus::JobClosedRecordReclaimed:
+        return "job-closed-record-reclaimed";
+    case InputLifecycleStatus::RetirementProofRequired:
+        return "retirement-proof-required";
+    case InputLifecycleStatus::GenerationMismatch:
+        return "generation-mismatch";
     }
     return "unknown";
 }
@@ -429,10 +781,22 @@ InputLifecycleResult InputLifecycleClient::apply(
     const std::string& socket_path, InputLifecycleRequest request,
     const local::CredentialExpectation& expected_peer,
     std::chrono::steady_clock::time_point deadline) noexcept {
+    const bool retirement = attempt_retirement_action(request.action);
+    const sidecar::MonotonicClockIdentity clock_identity =
+        sidecar::process_monotonic_clock_identity();
     if (request.identity.generation == 0 || request.identity.attempt == 0 ||
         request.operation_id == 0 || request.key.c_store_guid == CStoreGuid{} ||
         !input_lease_owner_valid(request.owner) ||
         !input_lifecycle_action_valid(request.action) || !expected_peer.specified())
+        return lifecycle_rejected(InputLifecycleStatus::InvalidArgument, request);
+    // A retirement dialogue may only consume the caller's original absolute
+    // CLOCK_MONOTONIC deadline.  The compatibility helper remains available
+    // for old callers, but it cannot reconstruct a fresh deadline from the
+    // receive time or cross into another time namespace.
+    if (retirement &&
+        (!request.absolute_deadline.valid() ||
+         !request.absolute_deadline.matches_clock(clock_identity) ||
+         request.absolute_deadline.as_steady_time_point() != deadline))
         return lifecycle_rejected(InputLifecycleStatus::InvalidArgument, request);
 
     local::Status io = local::Status::InvalidArgument;
@@ -493,6 +857,13 @@ InputLifecycleResult InputLifecycleClient::apply(
         observed.request_id != expected.request_id || observed.input != expected.input ||
         observed.owner != expected.owner ||
         observed.lifecycle_action != expected.lifecycle_action ||
+        observed.f_store_generation != expected.f_store_generation ||
+        observed.f_store_guid != expected.f_store_guid ||
+        observed.immutable_size != expected.immutable_size ||
+        observed.immutable_digest != expected.immutable_digest ||
+        observed.retirement_id != expected.retirement_id ||
+        observed.replacement_owner != expected.replacement_owner ||
+        observed.absolute_deadline != expected.absolute_deadline ||
         !observed.lifecycle_result.has_value())
         return lifecycle_rejected(InputLifecycleStatus::MalformedResponse, request);
     return InputLifecycleResult{

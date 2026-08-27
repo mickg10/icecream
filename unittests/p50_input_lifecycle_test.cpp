@@ -38,7 +38,13 @@ InputRecordKey key(uint64_t value) {
 InputLifecycleRequest request(local::Identity identity, InputRecordKey input,
                               InputLeaseOwner owner, uint64_t operation_id,
                               InputLifecycleAction action) {
-    return InputLifecycleRequest{identity, input, owner, operation_id, action};
+    InputLifecycleRequest value;
+    value.identity = identity;
+    value.key = input;
+    value.owner = owner;
+    value.operation_id = operation_id;
+    value.action = action;
+    return value;
 }
 
 void put_u16(std::vector<uint8_t>& bytes, size_t offset, uint16_t value) {
@@ -224,7 +230,7 @@ void commit_attachment_cancel_replace_close() {
     require(decision.status == InputLifecycleApplyStatus::Applied &&
                 !decision.close_record && !decision.collect_record,
             "attempt cancellation tried to close the logical input lease");
-    registry.finish_apply(cancel, true);
+    (void)registry.finish_apply(cancel, true);
     require(registry.begin_apply(cancel).status ==
                 InputLifecycleApplyStatus::AlreadyApplied,
             "lost cancellation ACK was not exactly replay-safe");
@@ -250,7 +256,7 @@ void commit_attachment_cancel_replace_close() {
     require(decision.status == InputLifecycleApplyStatus::Applied &&
                 decision.close_record && decision.collect_record,
             "accepted result did not request close and collection");
-    registry.finish_apply(close, true);
+    (void)registry.finish_apply(close, true);
     require(registry.owner_count() == 0 && registry.replay_count() >= 3,
             "settled committed owner was not boundedly reclaimed");
     require(registry.begin_apply(close).status ==
@@ -270,7 +276,7 @@ void close_before_commit_and_attach_close_race() {
         require(decision.status == InputLifecycleApplyStatus::Applied &&
                     !decision.close_record,
                 "close-before-commit fabricated an endpoint record");
-        registry.finish_apply(close, true);
+        (void)registry.finish_apply(close, true);
         require(registry.job_closed(input) && registry.owner_count() == 1,
                 "close-before-commit tombstone was not retained");
         require(registry.prepare_route_commit(input) ==
@@ -298,7 +304,7 @@ void close_before_commit_and_attach_close_race() {
         require(decision.status == InputLifecycleApplyStatus::Applied &&
                     decision.close_record,
                 "attach-first close did not serialize behind authorization");
-        registry.finish_apply(close, true);
+        (void)registry.finish_apply(close, true);
         require(registry.owner_count() == 1,
                 "pending attachment owner was reclaimed before handoff finished");
         registry.finish_attachment(input, owner, 7, true);
@@ -326,7 +332,7 @@ void replacement_cycle_and_bounds() {
     require(registry.begin_apply(cancel_first).status ==
                 InputLifecycleApplyStatus::Applied,
             "first attempt cancellation failed");
-    registry.finish_apply(cancel_first, true);
+    (void)registry.finish_apply(cancel_first, true);
     require(registry.begin_attachment(input, second, 2),
             "replacement owner was not admitted");
     registry.finish_attachment(input, second, 2, true);
@@ -335,7 +341,7 @@ void replacement_cycle_and_bounds() {
     require(registry.begin_apply(cancel_second).status ==
                 InputLifecycleApplyStatus::Applied,
             "second attempt cancellation failed");
-    registry.finish_apply(cancel_second, true);
+    (void)registry.finish_apply(cancel_second, true);
     require(!registry.begin_attachment(input, first, 3),
             "retired assignment owner was resurrected");
     require(registry.prepare_route_commit(key(5)) ==
@@ -372,7 +378,7 @@ void cancellation_racing_attachment_finalization_revokes_exact_owner() {
     require(registry.begin_apply(cancel).status ==
                 InputLifecycleApplyStatus::Applied,
             "pending attachment attempt cancellation failed");
-    registry.finish_apply(cancel, true);
+    (void)registry.finish_apply(cancel, true);
 
     // A lost/negative descriptor ACK may finalize after cancellation.  It
     // must not clear the revocation and permit the same owner to attach again.
@@ -382,6 +388,104 @@ void cancellation_racing_attachment_finalization_revokes_exact_owner() {
     require(registry.begin_attachment(input, replacement, 2),
             "fresh replacement owner was rejected after raced cancellation");
     registry.finish_attachment(input, replacement, 2, true);
+}
+
+InputLifecycleOperationLease refinement_lease(local::Identity identity,
+                                              InputRecordKey input,
+                                              InputLeaseOwner owner,
+                                              uint64_t operation_id) {
+    InputLifecycleRequest lifecycle_request = request(
+        identity, input, owner, operation_id,
+        InputLifecycleAction::PrepareAttemptRetirement);
+    lifecycle_request.f_store_generation = 17;
+    lifecycle_request.f_store_guid = Id128::from_u64(0xf500000000000017ULL);
+    lifecycle_request.immutable_size = 23;
+    lifecycle_request.immutable_digest =
+        icecc::digest128("p50-refinement-input-digest");
+    lifecycle_request.retirement_id = 29;
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    lifecycle_request.absolute_deadline =
+        sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+        std::chrono::steady_clock::now() + std::chrono::seconds(5),
+        clock.clock_domain_id, clock.time_namespace_id);
+    lifecycle_request.deadline = lifecycle_request.absolute_deadline.as_steady_time_point();
+    return make_input_lifecycle_operation_lease(lifecycle_request);
+}
+
+void refinement_cancel_commit_ordering() {
+    const local::Identity identity{31, 41};
+    const InputRecordKey input = key(31);
+    const InputLeaseOwner owner{301, 401, 501};
+    const InputLifecycleOperationLease cancel_lease =
+        refinement_lease(identity, input, owner, 601);
+    require(cancel_lease.valid(), "refinement operation lease was not valid");
+
+    InputLifecycleRegistry cancel_first(4, 8);
+    const auto prepared = cancel_first.ObservePrepared(cancel_lease, 701);
+    require(prepared.has_value() && prepared->valid() &&
+                prepared->decoder_touched && prepared->operation == cancel_lease,
+            "ObservePrepared did not mint an exact touched observation");
+    const auto replay = cancel_first.ObservePrepared(cancel_lease, 701);
+    require(replay.has_value() && *replay == *prepared,
+            "ObservePrepared exact replay changed its observation identity");
+    auto stale = cancel_lease;
+    stale.identity.attempt++;
+    require(!cancel_first.ObservePrepared(stale, 701).has_value(),
+            "stale operation was accepted by ObservePrepared");
+    require(cancel_first.CancelOrExpire(cancel_lease, prepared->observation_id) ==
+                InputLifecycleRefinementResult::CancelledNoDurability &&
+                cancel_first.refinement_state(cancel_lease) ==
+                    InputLifecycleRefinementState::CancelledNoDurability &&
+                !cancel_first.durable_bundle(cancel_lease).has_value(),
+            "cancel-first did not select profile-reset/no-durability state");
+    require(cancel_first.CancelOrExpire(cancel_lease, prepared->observation_id) ==
+                InputLifecycleRefinementResult::AlreadyCancelled &&
+                !cancel_first.SelectCommit(cancel_lease, prepared->observation_id)
+                     .has_value(),
+            "cancel-first state admitted a second commit");
+
+    InputLifecycleRegistry commit_first(4, 8);
+    const auto committed_prepared =
+        commit_first.ObservePrepared(cancel_lease, 702);
+    require(committed_prepared.has_value(),
+            "commit-first preparation was not observed");
+    auto permit = commit_first.SelectCommit(
+        cancel_lease, committed_prepared->observation_id);
+    require(permit.has_value() && permit->valid() &&
+                commit_first.refinement_state(cancel_lease) ==
+                    InputLifecycleRefinementState::CommitSelected,
+            "SelectCommit did not mint one exact permit");
+    require(commit_first.CancelOrExpire(cancel_lease,
+                                        committed_prepared->observation_id) ==
+                InputLifecycleRefinementResult::CommitWon,
+            "cancel after commit selection did not preserve commit-wins");
+
+    InputLifecycleDurableBundle bundle;
+    bundle.operation = cancel_lease;
+    bundle.prepared_id = committed_prepared->prepared_id;
+    bundle.observation_id = committed_prepared->observation_id;
+    bundle.permit_id = permit->permit_id();
+    bundle.durable_sequence = 801;
+    bundle.durable_digest = icecc::digest128("p50-refinement-durable-digest");
+    require(bundle.valid() &&
+                commit_first.CommitDurable(std::move(*permit), bundle) ==
+                    InputLifecycleRefinementResult::DurableCommitted &&
+                !permit->valid() &&
+                commit_first.durable_bundle(cancel_lease) == bundle,
+            "CommitDurable did not atomically retain the exact bundle");
+    require(commit_first.CancelOrExpire(cancel_lease,
+                                        committed_prepared->observation_id) ==
+                InputLifecycleRefinementResult::CommitWon &&
+                commit_first.SuppressDeliveryAfterCommit(
+                    cancel_lease, committed_prepared->observation_id) &&
+                commit_first.refinement_state(cancel_lease) ==
+                    InputLifecycleRefinementState::DeliverySuppressed &&
+                commit_first.SuppressDeliveryAfterCommit(bundle),
+            "commit-first durable state was not delivery-suppressed idempotently");
+    auto stale_bundle = bundle;
+    stale_bundle.operation.identity.attempt++;
+    require(!commit_first.SuppressDeliveryAfterCommit(stale_bundle),
+            "stale durable completion suppressed a replacement delivery");
 }
 
 void lifecycle_transport_round_trip() {
@@ -556,6 +660,7 @@ int main() {
     close_before_commit_and_attach_close_race();
     replacement_cycle_and_bounds();
     cancellation_racing_attachment_finalization_revokes_exact_owner();
+    refinement_cancel_commit_ordering();
     lifecycle_transport_round_trip();
     return 0;
 }

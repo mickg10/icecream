@@ -16,13 +16,17 @@ contract() {
     require "$candidate" 'exact_public_tcp_listener' &&
     require "$candidate" 'SO_ACCEPTCONN' &&
     require "$candidate" 'DaemonSidecarAdapter::valid_config' &&
-    require "$candidate" 'if (!scheduler_session_active || scheduler == nullptr)' &&
-    require "$candidate" 'cache_adapter->start(&update)' &&
+    require "$candidate" 'if (!scheduler_cache_owner || scheduler == nullptr)' &&
+    require "$candidate" 'cache_adapter->outer_begin_turn' &&
+    require "$candidate" 'cache_adapter->outer_append_pollfds(pollfds)' &&
+    require "$candidate" 'cache_adapter->outer_advance_turn' &&
     require "$candidate" 'reannounce_environments(&update.transitions[index])' &&
     require "$candidate" 'scheduler_cache_snapshot != current' &&
     require "$candidate" 'scheduler_session_active && cache_adapter != nullptr' &&
     require "$candidate" 'cache_advertisement_snapshot().present()' &&
-    require "$candidate" 'cache_adapter->shutdown(&update)' &&
+    require "$candidate" 'cache_adapter->outer_request_shutdown(&update)' &&
+    require "$candidate" 'cache_child_reaper.reap_one' &&
+    require "$candidate" 'cache_adapter->outer_observe_child_reaped' &&
     require "$candidate" 'apply_cache_advertisement(lmsg, absent)' &&
     require "$candidate" 'scheduler_cache_snapshot_valid = false'
 }
@@ -32,6 +36,7 @@ contract "$daemon" || {
     exit 1
 }
 require "$makefile" 'libp50daemonsidecaradapter.a'
+require "$makefile" 'libp50sidecarlifecycle.a'
 require "$makefile" 'libp50readyadvertisement.a'
 require "$makefile" 'libp50sidecarsupervisor.a'
 require "$runtime_test" 'initial Login is canonical cache absence before ConfCS/READY'
@@ -43,6 +48,13 @@ require "$runtime_test" 'orderly shutdown withdraws before scheduler teardown'
 if grep -F 'apply_inert_cache_advertisement' "$daemon" >/dev/null \
         || grep -F 'cache_dispatcher->dispatch' "$daemon" >/dev/null; then
     echo 'FAIL: obsolete mechanism-only daemon wiring survived' >&2
+    exit 1
+fi
+if grep -F 'cache_adapter->start(' "$daemon" >/dev/null \
+        || grep -F 'cache_adapter->poll(' "$daemon" >/dev/null \
+        || grep -F 'cache_adapter->shutdown(' "$daemon" >/dev/null \
+        || grep -F 'advance_cache_adapter_shutdown_turn' "$daemon" >/dev/null; then
+    echo 'FAIL: synchronous/secondary sidecar adapter path survived production wiring' >&2
     exit 1
 fi
 
@@ -57,13 +69,17 @@ for needle in \
     'exact_public_tcp_listener' \
     'SO_ACCEPTCONN' \
     'DaemonSidecarAdapter::valid_config' \
-    'if (!scheduler_session_active || scheduler == nullptr)' \
-    'cache_adapter->start(&update)' \
+    'if (!scheduler_cache_owner || scheduler == nullptr)' \
+    'cache_adapter->outer_begin_turn' \
+    'cache_adapter->outer_append_pollfds(pollfds)' \
+    'cache_adapter->outer_advance_turn' \
     'reannounce_environments(&update.transitions[index])' \
     'scheduler_cache_snapshot != current' \
     'scheduler_session_active && cache_adapter != nullptr' \
     'cache_advertisement_snapshot().present()' \
-    'cache_adapter->shutdown(&update)' \
+    'cache_adapter->outer_request_shutdown(&update)' \
+    'cache_child_reaper.reap_one' \
+    'cache_adapter->outer_observe_child_reaped' \
     'apply_cache_advertisement(lmsg, absent)' \
     'scheduler_cache_snapshot_valid = false'; do
     mutant="$mutant_dir/main.cpp"

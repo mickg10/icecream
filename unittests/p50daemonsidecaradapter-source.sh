@@ -16,26 +16,35 @@ test -x "$service" || {
     exit 1
 }
 
-grep -F 'current_lease()' "$src" >/dev/null
-grep -F 'set_on_demand_endpoint' "$src" >/dev/null
+grep -F 'outer_current_ready_lease()' "$src" >/dev/null
+grep -F 'outer_prepare_attempt_retirement' "$src" >/dev/null
 grep -F 'launch_identities' "$src" >/dev/null
-grep -F 'lease_root' "$src" >/dev/null
+grep -F 'runtime_directory' "$src" >/dev/null
 grep -F 'cumulative_post_ready_exits_' "$src" >/dev/null
-grep -F 'prior_supervisor_post_ready_exits_' "$src" >/dev/null
+grep -F 'observation.cumulative_post_ready_exits' "$src" >/dev/null
 grep -F 'runtime_nodes_valid()' "$src" >/dev/null
 grep -F 'socket_info.st_dev == socket_device_' "$src" >/dev/null
 grep -F 'socket_info.st_ino == socket_inode_' "$src" >/dev/null
 grep -F 'directory_info.st_ino != attempt_directory_inode_' "$src" >/dev/null
-grep -F 'append_update(update, controller_.observe' "$src" >/dev/null
+grep -F 'controller_.observe(observation)' "$src" >/dev/null
 grep -F 'max_restarts = 0' "$src" >/dev/null
 grep -F 'observe_public_listener' "$header" >/dev/null
+grep -F 'outer_begin_turn' "$header" >/dev/null
+grep -F 'outer_advance_turn' "$header" >/dev/null
+grep -F 'outer_append_pollfds' "$header" >/dev/null
+grep -F 'outer_prepare_attempt_retirement' "$header" >/dev/null
+grep -F 'outer_commit_attempt_replacement' "$header" >/dev/null
+grep -F 'outer_close_logical_input_lease' "$header" >/dev/null
+grep -F 'AttemptLeafRetirementJoin' "$header" >/dev/null
 
 if grep -E 'daemon/main\.cpp|signal\(|sigaction\(|listen_unix\(' "$src" "$header" >/dev/null; then
     echo 'FAIL: adapter acquired daemon-main, signal-handler, or public-listener ownership' >&2
     exit 1
 fi
-if grep -F 'unlink(socket_path_.c_str())' "$src" >/dev/null; then
-    echo 'FAIL: adapter bypasses Supervisor exact lease cleanup' >&2
+if grep -F 'unlink(socket_path_.c_str())' "$src" >/dev/null \
+        || grep -F 'supervisor_->' "$src" >/dev/null \
+        || grep -E '(^|[^[:alnum:]_])waitpid[[:space:]]*\(' "$src" >/dev/null; then
+    echo 'FAIL: adapter retains a synchronous supervisor/reap path' >&2
     exit 1
 fi
 
@@ -91,6 +100,7 @@ link_binary() {
         "$test_object" "$dispatch_object" "$handoff_object" \
         "$attachment_object" "$lifecycle_object" "$adapter_object" \
         "$top_build/cache/libp50readyadvertisement.a" \
+        "$top_build/cache/libp50sidecarlifecycle.a" \
         "$top_build/cache/libp50sidecarsupervisor.a" \
         "$top_build/cache/libp50localtransport.a" \
         "$top_build/cache/libprotocol50.a" \
@@ -147,7 +157,7 @@ cmp -s "$src" "$same_identity_mutant" && {
 compile_and_expect_red same-identity "$same_identity_mutant"
 
 runtime_revalidation_mutant="$tmp_root/runtime-revalidation.cpp"
-sed 's/if (!runtime_nodes_valid()) {/if (false) {/' \
+sed '/bool DaemonSidecarAdapter::runtime_nodes_valid()/! s/runtime_nodes_valid()/true/g' \
     "$src" >"$runtime_revalidation_mutant"
 cmp -s "$src" "$runtime_revalidation_mutant" && {
     echo 'FAIL: runtime-revalidation mutant was not applied' >&2
@@ -156,7 +166,7 @@ cmp -s "$src" "$runtime_revalidation_mutant" && {
 compile_and_expect_red runtime-revalidation "$runtime_revalidation_mutant"
 
 inode_cleanup_mutant="$tmp_root/inode-cleanup.cpp"
-sed 's/directory_info.st_ino == attempt_directory_inode_;/true;/' \
+sed '0,/info.st_ino != expected_inode/s//true/' \
     "$src" >"$inode_cleanup_mutant"
 cmp -s "$src" "$inode_cleanup_mutant" && {
     echo 'FAIL: inode-cleanup mutant was not applied' >&2

@@ -21,6 +21,7 @@ iceccd_SOURCES = \
 
 iceccd_LDADD = \
 	../cache/libp50daemonsidecaradapter.a \
+	../cache/libp50sidecarlifecycle.a \
 	../cache/libp50inputfd.a \
 	../cache/libp50inputlifecycle.a \
 	../cache/libp50readyadvertisement.a \

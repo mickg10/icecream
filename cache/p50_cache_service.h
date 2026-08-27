@@ -39,6 +39,10 @@ namespace icecc::p50::service {
 struct RuntimeConfig {
     CStoreGuid c_store_guid{};
     FStoreGuid f_store_guid{};
+    // Allocator-issued F-store generation paired with f_store_guid.  Legacy
+    // standalone fixtures may leave it zero; v4 retirement requests then
+    // fail closed rather than inventing a default generation.
+    uint64_t f_store_generation = 0;
     EndpointCaps endpoint_caps{};
     P50ServerEndpointConfig endpoint_config{};
     size_t max_live_handoffs = 1;

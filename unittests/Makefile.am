@@ -209,6 +209,7 @@ p50daemonsidecaradapter_CPPFLAGS = $(AM_CPPFLAGS) \
 p50daemonsidecaradapter_CXXFLAGS = -pthread
 p50daemonsidecaradapter_LDFLAGS = -pthread
 p50daemonsidecaradapter_LDADD = ../cache/libp50daemonsidecaradapter.a \
+	../cache/libp50sidecarlifecycle.a \
 	../cache/libp50inputfd.a ../cache/libp50inputlifecycle.a \
 	../cache/libprotocol50.a \
 	../cache/libp50readyadvertisement.a ../cache/libp50sidecarsupervisor.a \
@@ -216,6 +217,7 @@ p50daemonsidecaradapter_LDADD = ../cache/libp50daemonsidecaradapter.a \
 	$(LIBZSTD_LIBS) $(XXHASH_LIBS)
 p50daemonsidecaradapter_DEPENDENCIES = \
 	../cache/libp50daemonsidecaradapter.a ../cache/libp50inputfd.a \
+	../cache/libp50sidecarlifecycle.a \
 	../cache/libp50inputlifecycle.a \
 	../cache/libprotocol50.a ../cache/libp50readyadvertisement.a \
 	../cache/libp50sidecarsupervisor.a ../cache/libp50localtransport.a \
