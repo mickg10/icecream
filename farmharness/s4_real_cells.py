@@ -49,7 +49,7 @@ ROLE_HASHES = {
         "F": "405f9e61c93b6a1b5ba2265bdd6153dbf7898093cd2aeb1081e8006abe5cf907",
         "C": "a7edf79e22497e70be473f29d592ab1e4d06ed6958ca48339d5f84c44f73a2cd",
         "E": "ee7d30b240c38bccf66d4afcdd45993f115a01d4a2fb4e9143d38596609d2ba4",
-        "X": "07268be8dd8801bd0c20a2a59d2fb9e8bae8a0c64a09bb53c37a31a72972318b",
+        "X": "d39e3712e46ccb039ac3d696bfd13a1cbf8446137d991c1475626a85a061f51b",
     },
 }
 
