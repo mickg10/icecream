@@ -34,7 +34,7 @@ check_contract() {
         '(snapshot.profile_mask & arm.cache_profile) == 0' \
         'client->status != Client::UNKNOWN' \
         'client->set_status(Client::UNKNOWN, cancel ? "finish_transfer_env: canceled" : "finish_transfer_env: done")' \
-        'cache_adapter->supervisor()->current_lease()' \
+        'cache_adapter->outer_current_ready_lease()' \
         'p50_ready_lease_observation_equal' \
         '? (POLLIN | POLLHUP | POLLERR)' \
         'next_p50_source_deadline_msec()' \
