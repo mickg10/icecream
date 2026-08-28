@@ -27,7 +27,7 @@ from pathlib import Path
 
 
 SCHEMA = "icecream-s4-real-cell-v1"
-BASE_SHA = "0b294108af422faa7b25b06a5480362f11fc019e"
+BASE_SHA = "9a1653e600fbb28a7edeef02c10c5ccc5fe8fcad"
 P43_SHA = "cd74801e0fa4e83e3ae254ca1d7fe98642f36b89"
 # P50 must be supplied as a build of BASE_SHA. --p50-local-root stages that
 # exact build into a private q3 /tmp root for the cell run.
@@ -47,11 +47,11 @@ ROLE_HASHES = {
         "E": "aab94b6ea8f41335de807f814d24a56e827ce5efaf8b06797a365699e83b36cb",
     },
     "50": {
-        "S": "93188b14f01d74c2d47b0f18403df16e156d343287c522869affba6e223cd7dd",
-        "F": "7307c8f741f942c38c7f76e20daef252f02af628c510a5e69846e0ec031a050a",
-        "C": "1f1db724b5b41cf26e771dc0a57ca7013b618bce2b0f49295e559f0403a10a83",
+        "S": "8857b14179559d0efc9b588c29a6f0fe6c922c9f40d9fc2de498887257931212",
+        "F": "56f6667da25d99660a335eb2349578946f5c1d096726dffa94df5f9fd8c62136",
+        "C": "60004a5cd00ce8f54bc667217b87c02236c0d8d350260f81d0cfb5805ab4c985",
         "E": "ee7d30b240c38bccf66d4afcdd45993f115a01d4a2fb4e9143d38596609d2ba4",
-        "X": "5d86e370c6db59a27b156ab2a2f37da0fe9650977daf845bcfd4dc88e925c744",
+        "X": "dcc6278720c409eeab1efb1491d61232f693b80159b22d4a5659853c0a43ae70",
     },
 }
 
