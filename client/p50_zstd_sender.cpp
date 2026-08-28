@@ -7,6 +7,7 @@
 #include <chrono>
 #include <fcntl.h>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -71,6 +72,12 @@ OwnedSourceFd& OwnedSourceFd::operator=(OwnedSourceFd&& other) noexcept {
 }
 
 struct P50ZstdSourceSender::Impl {
+    struct CompletedRequest {
+        uint64_t raw_bytes = 0;
+        Digest128 raw_digest{};
+        ZstdSourceTransferResult result{};
+    };
+
     Impl(CStoreGuid guid, PrepareRequestKey request_value,
          ZstdSourceTransferConfig config_value)
         : c_guid(guid), request(request_value), config(std::move(config_value)) {
@@ -82,6 +89,8 @@ struct P50ZstdSourceSender::Impl {
             throw std::invalid_argument("sender deadline duration is not positive");
         if (config.maximum_duration > std::chrono::seconds(300))
             throw std::invalid_argument("sender deadline duration exceeds five minutes");
+        if (config.max_completed_requests == 0)
+            throw std::invalid_argument("sender completed-request limit is zero");
         if (config.deadline == Clock::time_point{})
             throw std::invalid_argument("sender requires an absolute deadline");
         if (config.endpoint_caps.zstd.max_raw_bytes > SIZE_MAX)
@@ -116,6 +125,31 @@ struct P50ZstdSourceSender::Impl {
         return result;
     }
 
+    std::optional<ZstdSourceTransferResult> completed_for(
+        PrepareRequestKey key, std::span<const uint8_t> source,
+        Digest128 raw_digest) const {
+        const auto position = completed.find(key);
+        if (position == completed.end())
+            return std::nullopt;
+        const CompletedRequest& value = position->second;
+        if (value.raw_bytes != source.size() || value.raw_digest != raw_digest)
+            throw std::invalid_argument(
+                "PrepareRequestKey was reused for different input");
+        return value.result;
+    }
+
+    void remember_completed(PrepareRequestKey key, std::span<const uint8_t> source,
+                            Digest128 raw_digest,
+                            const ZstdSourceTransferResult& result) {
+        if (completed.size() >= config.max_completed_requests)
+            throw std::length_error("sender completed-request ledger is full");
+        const auto [position, inserted] = completed.emplace(
+            key, CompletedRequest{static_cast<uint64_t>(source.size()), raw_digest, result});
+        if (!inserted)
+            throw std::logic_error("sender completed request was admitted twice");
+        (void)position;
+    }
+
     PrepareRequestKey begin_transfer() {
         if (config.endpoint_caps.profile == ProfileId::ZSTD_TU) {
             if (used) throw std::logic_error("sender is one-shot");
@@ -134,6 +168,7 @@ struct P50ZstdSourceSender::Impl {
     ZstdSourceTransferConfig config{};
     std::shared_ptr<P50PreparationAuthority> authority;
     std::unique_ptr<P50ClientEndpoint> endpoint;
+    std::map<PrepareRequestKey, CompletedRequest> completed;
     bool used = false;
 };
 
@@ -275,6 +310,15 @@ P50ZstdSourceSender::transfer_bytes(
         co_return impl_->invalid(ZstdSourceTransferStatus::SourceError);
 
     const Digest128 raw_digest = digest128(*source);
+    try {
+        if (const auto completed = impl_->completed_for(request, *source, raw_digest))
+            co_return *completed;
+    } catch (const std::invalid_argument&) {
+        co_return impl_->invalid(ZstdSourceTransferStatus::InvalidRequest);
+    }
+    if (impl_->completed.size() >= impl_->config.max_completed_requests)
+        co_return impl_->invalid(ZstdSourceTransferStatus::Unavailable);
+
     PreparedTuHandle prepared;
     try {
         prepared = impl_->authority->prepare(request, *source);
@@ -321,9 +365,28 @@ P50ZstdSourceSender::transfer_bytes(
         // the deadline boundary.  The endpoint freezes this witness before
         // its timer may close the owned socket, so a later clock sample must
         // never discard it.
-        if (run.status == ClientRunStatus::Committed)
-            co_return impl_->committed_from_witness(
+        if (run.status == ClientRunStatus::Committed) {
+            ZstdSourceTransferResult result = impl_->committed_from_witness(
                 run, source->size(), raw_digest, attempt);
+            // Endpoint commit consumes the transaction but intentionally does
+            // not own the preparation reference.  Release it only after the
+            // commit witness is frozen; failed runs retain the exact handle
+            // for the bounded retry/reconciliation path.
+            try {
+                (void)impl_->authority->release(prepared);
+            } catch (...) {
+                co_return impl_->invalid(
+                    ZstdSourceTransferStatus::CommittedIdentityUnavailable);
+            }
+            if (result.status != ZstdSourceTransferStatus::Committed)
+                co_return result;
+            try {
+                impl_->remember_completed(request, *source, raw_digest, result);
+            } catch (const std::length_error&) {
+                co_return impl_->invalid(ZstdSourceTransferStatus::Unavailable);
+            }
+            co_return result;
+        }
         if (run.status == ClientRunStatus::DeadlineExceeded) {
             ZstdSourceTransferResult result =
                 impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);

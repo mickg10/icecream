@@ -59,6 +59,10 @@ struct ZstdSourceTransferResult {
 struct ZstdSourceTransferConfig {
     EndpointCaps endpoint_caps{};
     PreparationAuthorityLimits authority_limits{};
+    // Completed request identities are retained independently from live
+    // preparation entries so releasing a committed handle does not erase
+    // replay idempotence.  This is deliberately bounded per sender.
+    size_t max_completed_requests = 4096;
     // This is an absolute deadline.  The sender refuses an unbounded or stale
     // deadline and never extends it for the one permitted retry.
     std::chrono::steady_clock::time_point deadline{};
