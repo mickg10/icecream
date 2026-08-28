@@ -553,9 +553,10 @@ DaemonControlStatus DaemonControlOperation::advance(
     // POLLHUP/ERR may be reported together with readable bytes.  Consume
     // those bytes first so a coalesced final frame is not discarded; only a
     // wake with no readable payload is an immediate disconnect.
-    if ((revents & POLLNVAL) != 0 ||
-        ((revents & (POLLERR | POLLHUP)) != 0 &&
-         (revents & POLLIN) == 0)) {
+    if (phase_ != Phase::ConnectPending &&
+        ((revents & POLLNVAL) != 0 ||
+         ((revents & (POLLERR | POLLHUP)) != 0 &&
+          (revents & POLLIN) == 0))) {
         fail(DaemonControlStatus::Disconnected);
         return status_;
     }

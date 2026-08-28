@@ -29,9 +29,22 @@ done
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/p50completionflow.XXXXXX")
 cleanup() {
-    test -n "${client_pid:-}" && kill "$client_pid" 2>/dev/null || :
-    test -n "${worker_pid:-}" && kill "$worker_pid" 2>/dev/null || :
-    test -n "${sched_pid:-}" && kill "$sched_pid" 2>/dev/null || :
+    for pid in "${service_pid:-}" "${client_pid:-}" "${worker_pid:-}" "${sched_pid:-}"; do
+        test -n "$pid" && kill "$pid" 2>/dev/null || :
+    done
+    for _ in $(seq 1 50); do
+        live=0
+        for pid in "${service_pid:-}" "${client_pid:-}" "${worker_pid:-}" "${sched_pid:-}"; do
+            if test -n "$pid" && kill -0 "$pid" 2>/dev/null; then
+                live=1
+            fi
+        done
+        test "$live" -eq 0 && break
+        sleep 0.1
+    done
+    for pid in "${service_pid:-}" "${client_pid:-}" "${worker_pid:-}" "${sched_pid:-}"; do
+        test -n "$pid" && kill -9 "$pid" 2>/dev/null || :
+    done
     wait "${client_pid:-}" 2>/dev/null || :
     wait "${worker_pid:-}" 2>/dev/null || :
     wait "${sched_pid:-}" 2>/dev/null || :
@@ -85,6 +98,13 @@ test -n "$envtar" || {
     exit 1
 }
 
+set --
+if test -n "${ICECC_TEST_DAEMON_UID:-}"; then
+    daemon_gid=${ICECC_TEST_DAEMON_GID:-$ICECC_TEST_DAEMON_UID}
+    chown -R "$ICECC_TEST_DAEMON_UID:$daemon_gid" "$work"
+    set -- -u "$ICECC_TEST_DAEMON_UID"
+fi
+
 "$build/scheduler/icecc-scheduler" -p "$port_sched" -n "$network" \
     --assignment-fence-mode strict-nonce -l "$work/scheduler.log" -vvv &
 sched_pid=$!
@@ -97,7 +117,7 @@ kill -0 "$sched_pid" 2>/dev/null || {
 ICECC_TEST_SOCKET="$work/worker.sock" ICECC_P50_C1F1_REQUIRED=1 \
     ICECC_P50_TEST_LIFECYCLE_TRACE="$work/lifecycle.trace" \
     ICECC_P50_TEST_POST_TERMINAL_ATTACH=1 \
-    "$build/daemon/iceccd" -p "$port_worker" -m 1 \
+    "$build/daemon/iceccd" "$@" -p "$port_worker" -m 1 \
     -s "127.0.0.1:$port_sched" -n "$network" -N p50-f \
     -b "$work/envs-f" -l "$work/f.log" -vvv \
     --cache-service "$build/cache/icecc-cache-service" \
@@ -105,7 +125,7 @@ ICECC_TEST_SOCKET="$work/worker.sock" ICECC_P50_C1F1_REQUIRED=1 \
 worker_pid=$!
 
 ICECC_TEST_SOCKET="$work/client.sock" ICECC_P50_C1F1_REQUIRED=1 \
-    "$build/daemon/iceccd" --no-remote -m 0 \
+    "$build/daemon/iceccd" "$@" --no-remote -m 0 \
     -s "127.0.0.1:$port_sched" -n "$network" -N p50-c \
     -b "$work/envs-c" -l "$work/c.log" -vvv &
 client_pid=$!
@@ -135,6 +155,23 @@ for _ in $(seq 1 30); do
 done
 test -n "$service_pid" || {
     echo "FAIL: production daemon did not start its cache sidecar" >&2
+    exit 1
+}
+
+# The process can be alive before F has advertised its usable cache endpoint.
+# Wait for the scheduler's cache-bearing relogin before submitting the first
+# job so startup timing cannot strand an otherwise valid assignment.
+cache_ready=0
+for _ in $(seq 1 30); do
+    if grep -E 'RELOGIN p50-f.*cache=.*cache_profiles=.*zstd_tu' \
+        "$work/scheduler.log" >/dev/null 2>&1; then
+        cache_ready=1
+        break
+    fi
+    sleep 1
+done
+test "$cache_ready" -eq 1 || {
+    echo "FAIL: production F cache endpoint was not advertised READY" >&2
     exit 1
 }
 
@@ -206,9 +243,12 @@ run_remote_cell() {
 
 restart_cache_sidecar() {
     old_pid=$service_pid
+    ready_before=$(grep -E -c \
+        'RELOGIN p50-f.*cache=.*cache_profiles=.*zstd_tu' \
+        "$work/scheduler.log" 2>/dev/null || true)
     kill -9 "$old_pid"
     replacement=
-    for _ in $(seq 1 100); do
+    for _ in $(seq 1 300); do
         replacement=$(find_service_pid)
         if test -n "$replacement" && test "$replacement" != "$old_pid"; then
             break
@@ -224,6 +264,22 @@ restart_cache_sidecar() {
         return 1
     fi
     service_pid=$replacement
+
+    replacement_ready=0
+    for _ in $(seq 1 300); do
+        ready_now=$(grep -E -c \
+            'RELOGIN p50-f.*cache=.*cache_profiles=.*zstd_tu' \
+            "$work/scheduler.log" 2>/dev/null || true)
+        if test "${ready_now:-0}" -gt "${ready_before:-0}"; then
+            replacement_ready=1
+            break
+        fi
+        sleep 0.1
+    done
+    test "$replacement_ready" -eq 1 || {
+        echo "FAIL: replacement cache sidecar did not advertise READY" >&2
+        return 1
+    }
 }
 
 run_remote_cell accepted accepted

@@ -1488,6 +1488,9 @@ struct Daemon {
     void settle_p50_input(Client *client,
                           icecc::p50::InputLifecycleAction action,
                           const char *reason) noexcept;
+    void complete_p50_input_lifecycle(
+        const icecc::p50::InputLifecycleResult& result,
+        const char *reason) noexcept;
     bool expire_p50_source_waiters() __attribute_warn_unused_result__;
     bool invalidate_p50_source_waiters_for_lease() __attribute_warn_unused_result__;
     uint64_t next_p50_source_deadline_msec() const noexcept;
@@ -5020,6 +5023,7 @@ bool Daemon::configure_cache_adapter() noexcept
         config.connect_timeout = std::chrono::milliseconds(1000);
         config.handoff_timeout = std::chrono::milliseconds(250);
         config.input_attachment_timeout = std::chrono::milliseconds(5000);
+        config.input_lifecycle_timeout = std::chrono::milliseconds(5000);
         config.shutdown_timeout = std::chrono::milliseconds(1000);
         config.restart_window = std::chrono::milliseconds(10000);
         config.max_restarts = 3;
@@ -7886,15 +7890,77 @@ void Daemon::settle_p50_input(
         return;
     }
 
-    // Settlement remains an observation for the future compiler-attempt
-    // reducer.  Do not call the historical InputLifecycleClient::apply()
-    // whole-operation helper from iceccd: the reducer must preserve this
-    // exact A lease, original deadline, and proof tuple while routing a typed
-    // PREPARE/COMMIT/CLOSE request through the adapter's outer poll lane.
-    trace() << "P50 input settlement deferred to outer compiler reducer for job "
-            << lease.owner.logical_job << " action "
-            << static_cast<unsigned int>(action) << " reason "
-            << (reason ? reason : "unspecified") << endl;
+    const icecc::p50::InputLifecycleResult result =
+        cache_adapter->apply_input_lifecycle(lease, action);
+    if (result.status == icecc::p50::InputLifecycleStatus::Disconnected) {
+        trace() << "P50 input settlement queued for job "
+                << lease.owner.logical_job << " action "
+                << static_cast<unsigned int>(action) << " reason "
+                << (reason ? reason : "unspecified") << endl;
+        return;
+    }
+    complete_p50_input_lifecycle(result, reason);
+}
+
+void Daemon::complete_p50_input_lifecycle(
+    const icecc::p50::InputLifecycleResult& result,
+    const char *reason) noexcept
+{
+    const icecc::p50::InputLifecycleRequest& request = result.request;
+    const icecc::p50::InputFdRequest lease{
+        request.identity, request.key, request.owner,
+        request.owner.assignment_nonce};
+    trace() << "P50 input settlement job " << request.owner.logical_job
+            << " action " << static_cast<unsigned int>(request.action)
+            << " status "
+            << icecc::p50::input_lifecycle_status_name(result.status)
+            << " reason " << (reason ? reason : "unspecified") << endl;
+
+    /* The product harness retries the consumed lease after each lifecycle
+       action.  Terminal close/cancel removes the record; attempt-only
+       cancellation revokes this owner while preserving the bytes for a new
+       assignment. */
+    const char *required = getenv("ICECC_P50_C1F1_REQUIRED");
+    const char *probe = getenv("ICECC_P50_TEST_POST_TERMINAL_ATTACH");
+    if ((result.status == icecc::p50::InputLifecycleStatus::Applied ||
+         result.status == icecc::p50::InputLifecycleStatus::AlreadyApplied) &&
+        required != nullptr && string(required) == "1" &&
+        probe != nullptr && string(probe) == "1") {
+        icecc::p50::InputFdAttachmentResult attachment =
+            cache_adapter->attach_input(
+                lease.key, lease.owner, lease.request_id);
+        trace() << "P50 terminal test post-settlement attach job "
+                << lease.owner.logical_job << " action "
+                << static_cast<unsigned int>(request.action) << " status "
+                << icecc::p50::input_fd_attachment_status_name(
+                       attachment.status)
+                << " fd " << (attachment.fd.valid() ? "valid" : "invalid")
+                << endl;
+        if (attachment.status ==
+                icecc::p50::InputFdAttachmentStatus::Accepted ||
+            attachment.fd.valid()) {
+            log_error() << "P50 terminal test unexpectedly reattached consumed lease for job "
+                        << lease.owner.logical_job << endl;
+        }
+    }
+
+    switch (result.status) {
+    case icecc::p50::InputLifecycleStatus::Applied:
+    case icecc::p50::InputLifecycleStatus::AlreadyApplied:
+    case icecc::p50::InputLifecycleStatus::StoreReplaced:
+    case icecc::p50::InputLifecycleStatus::UnknownRecord:
+    case icecc::p50::InputLifecycleStatus::Timeout:
+    case icecc::p50::InputLifecycleStatus::Disconnected:
+    case icecc::p50::InputLifecycleStatus::HandshakeFailed:
+        // The adapter retains incomplete operations for bounded retry.
+        break;
+    default:
+        log_warning() << "P50 input settlement rejected for job "
+                      << lease.owner.logical_job << " ("
+                      << icecc::p50::input_lifecycle_status_name(result.status)
+                      << ")" << endl;
+        break;
+    }
 }
 
 bool Daemon::handle_verify_env(Client *client, VerifyEnvMsg *msg)
@@ -9310,6 +9376,25 @@ void Daemon::answer_client_requests()
         icecc::p50::advertisement::Update lifecycle_update;
         (void)cache_adapter->outer_advance_turn(
             std::chrono::steady_clock::now(), pollfds, &lifecycle_update);
+        if (const auto result =
+                cache_adapter->take_outer_input_lifecycle_result();
+            result.has_value()) {
+            const char *reason = "outer input lifecycle";
+            switch (result->request.action) {
+            case icecc::p50::InputLifecycleAction::CancelAttempt:
+                reason = "handle_end";
+                break;
+            case icecc::p50::InputLifecycleAction::CloseAcceptedJob:
+                reason = "submitter accepted complete result";
+                break;
+            case icecc::p50::InputLifecycleAction::CancelJob:
+                reason = "submitter definitive cancellation";
+                break;
+            default:
+                break;
+            }
+            complete_p50_input_lifecycle(*result, reason);
+        }
         for (size_t index = 0; index < lifecycle_update.count; ++index) {
             if (!scheduler_session_active || scheduler == nullptr ||
                 !reannounce_environments(&lifecycle_update.transitions[index]))

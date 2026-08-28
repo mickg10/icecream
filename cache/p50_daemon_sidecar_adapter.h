@@ -339,7 +339,6 @@ private:
     PublicListenerObservation public_listener_{};
     std::shared_ptr<sidecar::LaunchIdentityAllocator> launch_identities_;
     std::unique_ptr<CacheSessionDispatcher> dispatcher_;
-    std::string outer_service_error_path_;
     advertisement::Controller controller_;
     std::string socket_path_;
     std::string attempt_directory_;

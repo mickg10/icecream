@@ -8,6 +8,7 @@
 #include <poll.h>
 #include <stdexcept>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -582,6 +583,45 @@ void test_poll_adapter_relevance_fairness_and_removal() {
     ::close(removed_pair[0]); ::close(removed_pair[1]);
 }
 
+void test_connect_pending_ignores_preconnect_hup() {
+    const std::string path =
+        "/tmp/p50-daemon-control-" + std::to_string(::getpid()) + ".sock";
+    (void)::unlink(path.c_str());
+    const int listener = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    CHECK(listener >= 0);
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    CHECK(path.size() < sizeof(address.sun_path));
+    std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
+    CHECK(::bind(listener, reinterpret_cast<sockaddr*>(&address),
+                 static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) +
+                                        path.size() + 1)) == 0);
+    CHECK(::listen(listener, 1) == 0);
+
+    const int client = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    CHECK(client >= 0);
+    nonblock(client);
+    const int payload = ::open("/dev/null", O_RDONLY);
+    CHECK(payload >= 0);
+    DaemonControlOperation sender;
+    CHECK(sender.begin_connecting(
+              path, client, operation(), payload, credentials(),
+              std::chrono::steady_clock::now() + std::chrono::seconds(1),
+              DaemonControlLimits{1, 4096},
+              DaemonControlFdOwnership::Owned) ==
+          DaemonControlStatus::InProgress);
+
+    CHECK(sender.advance(std::chrono::steady_clock::now(),
+                         POLLOUT | POLLHUP) ==
+          DaemonControlStatus::InProgress);
+    CHECK(sender.last_advance_syscalls() == 1);
+    const int accepted = ::accept(listener, nullptr, nullptr);
+    CHECK(accepted >= 0);
+    ::close(accepted);
+    ::close(listener);
+    (void)::unlink(path.c_str());
+}
+
 } // namespace
 
 int main() {
@@ -595,5 +635,6 @@ int main() {
     test_datagram_msg_truncation_and_deadline();
     test_credentials_and_owned_fd_lifetime();
     test_poll_adapter_relevance_fairness_and_removal();
+    test_connect_pending_ignores_preconnect_hup();
     return 0;
 }

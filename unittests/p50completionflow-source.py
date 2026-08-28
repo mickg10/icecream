@@ -241,7 +241,10 @@ def deletion_mutants(files: dict[str, str]) -> None:
         ("serve", "write_output_file(obj_file, client);", "output_deleted();"),
         ("serve", "icecc::p50::receive_p50_result_disposition(",
          "receive_deleted("),
-        ("serve", "P50CompletionDisposition::AttemptCancelOnly", "AttemptDeleted"),
+        ("serve",
+         "if (disposition ==\n"
+         "                icecc::p50::P50CompletionDisposition::AttemptCancelOnly)",
+         "if (false)"),
         ("main", "InputLifecycleAction::CloseAcceptedJob", "InputLifecycleAction::None"),
         ("main", "InputLifecycleAction::CancelJob", "InputLifecycleAction::None"),
         ("main", "p50_completion_matches_retained_lease(", "lease_check_deleted("),
@@ -251,8 +254,8 @@ def deletion_mutants(files: dict[str, str]) -> None:
         ("record_cpp", "if (count != 0)", "if (false)"),
         ("record_cpp", "record.request_id == record.assignment_nonce", "true"),
         ("cache_service", "ICECC_P50_TEST_LIFECYCLE_TRACE", "TRACE_DELETED"),
-        ("cache_service", "if (decision.collect_record)\n                    endpoint_->collect_input_garbage();",
-         "if (decision.collect_record)\n                    collect_deleted();"),
+        ("cache_service", "if (mutated && decision.collect_record)\n                    endpoint_->collect_input_garbage();",
+         "if (mutated && decision.collect_record)\n                    collect_deleted();"),
         ("runtime_gate", "kill -9 \"$old_pid\"", "kill_deleted"),
         ("runtime_gate", "run_remote_cell disconnect disconnect", "disconnect_deleted"),
     )

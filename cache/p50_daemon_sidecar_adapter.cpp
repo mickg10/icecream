@@ -1518,9 +1518,6 @@ bool DaemonSidecarAdapter::outer_advance_launch_step() noexcept
         return true;
     }
     case OuterLaunchPhase::Fork: {
-        // Production diagnostics: the child's stderr lands in the attempt
-        // directory so a launch/readiness failure is attributable.
-        outer_service_error_path_ = attempt_directory_ + "/service.err";
         const pid_t child = ::fork();
         if (child < 0) {
             if (errno == EINTR)
@@ -1550,15 +1547,9 @@ bool DaemonSidecarAdapter::outer_advance_launch_step() noexcept
             if (!set_cloexec(outer_launch_ready_write_fd_, false) ||
                 !set_cloexec(outer_launch_listener_fd_, false))
                 _exit(127);
-            {
-                const int error_fd = ::open(outer_service_error_path_.c_str(),
-                                            O_WRONLY | O_CREAT | O_TRUNC, 0600);
-                if (error_fd >= 0) {
-                    (void)::dup2(error_fd, 2);
-                    if (error_fd != 2)
-                        (void)::close(error_fd);
-                }
-            }
+            // Keep stderr on iceccd's configured stream.  A diagnostic file
+            // inside the attempt directory prevents that directory from
+            // being retired after a sidecar crash and blocks restart.
             ::execve(config_.executable.c_str(), outer_launch_argv_.data(),
                      outer_launch_environment_.data());
             const int error = errno;
@@ -2710,7 +2701,7 @@ void DaemonSidecarAdapter::outer_append_pollfds(
     append(outer_auth_fd_,
            (outer_auth_phase_ == kAuthConnectPending || outer_auth_phase_ == 1 ||
             outer_auth_phase_ == 2 ||
-            outer_auth_phase_ == 5)
+            outer_auth_phase_ == 4 || outer_auth_phase_ == 5)
                ? static_cast<short>(POLLOUT | POLLERR | POLLHUP)
                                   : static_cast<short>(POLLIN | POLLERR | POLLHUP));
     if (outer_input_operation_ != nullptr)
@@ -2784,9 +2775,12 @@ bool DaemonSidecarAdapter::outer_advance_input(
             outer_input_request_ = request;
             const local::ControlOperation operation =
                 local::make_input_lifecycle_operation(request);
+            // The service accepts on the listener created by iceccd before
+            // fork, so Linux reports iceccd as the peer socket's creator.
+            // READY still binds the serving child and store incarnation.
             const local::CredentialExpectation credentials{
                 config_.expected_service_uid, config_.expected_service_gid,
-                static_cast<uint64_t>(outer_pid_)};
+                static_cast<uint64_t>(::getpid())};
             int socket_type = SOCK_STREAM;
 #ifdef SOCK_CLOEXEC
             socket_type |= SOCK_CLOEXEC;
