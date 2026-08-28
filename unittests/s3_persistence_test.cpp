@@ -159,6 +159,35 @@ void generation_is_part_of_arena_identity() {
             "generation one arena was aliased");
 }
 
+void invalid_namespace_and_atomic_capacity_failure_are_rejected() {
+    PersistenceCore invalid;
+    require_error([&] { invalid.admit(NamespaceId{}); },
+                  ErrorCode::InvalidTransition,
+                  "zero C_GUID namespace was admitted");
+
+    PersistenceCore core(Limits{3, 3, 16, 16});
+    const NamespaceId first = ns(9);
+    const NamespaceId second = ns(10);
+    const NamespaceId incoming = ns(11);
+    core.admit(first);
+    core.admit(second);
+    core.publish(core.begin_install(first, "first", bytes("1")).ticket);
+    core.publish(core.begin_install(second, "second", bytes("2")).ticket);
+    core.pin(second, "second");
+    core.admit(incoming);
+    const auto candidate = core.begin_install(incoming, "incoming", bytes("333"));
+    require_error([&] { core.publish(candidate.ticket); },
+                  ErrorCode::CapacityExceeded,
+                  "insufficient global capacity was accepted");
+    require(core.has_namespace(first) && core.has_namespace(second),
+            "failed capacity preflight evicted a namespace partially");
+    require(core.resident_bytes() == 2,
+            "failed capacity preflight changed resident accounting");
+    core.crash_install(candidate.ticket);
+    require(core.staging_bytes() == 0,
+            "failed publish could not reclaim its staged input");
+}
+
 }  // namespace
 
 int main() {
@@ -166,4 +195,6 @@ int main() {
     immutable_conflict_is_sticky_and_same_content_is_idempotent();
     whole_namespace_global_lru_evicts_only_idle_namespace();
     generation_is_part_of_arena_identity();
+    invalid_namespace_and_atomic_capacity_failure_are_rejected();
+    std::cout << "s3_persistence_test: PASS\n";
 }

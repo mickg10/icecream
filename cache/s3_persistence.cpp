@@ -32,6 +32,22 @@ void PersistenceCore::ensure_key(std::string_view key) const {
                                "S3 object key must not be empty");
 }
 
+uint64_t PersistenceCore::next_clock() {
+    if (clock_ == UINT64_MAX)
+        throw PersistenceError(ErrorCode::CapacityExceeded,
+                               "S3 LRU clock is exhausted");
+    return ++clock_;
+}
+
+uint64_t PersistenceCore::allocate_ticket_serial() {
+    if (next_ticket_serial_ == 0)
+        throw PersistenceError(ErrorCode::CapacityExceeded,
+                               "S3 install-ticket space is exhausted");
+    const uint64_t result = next_ticket_serial_;
+    next_ticket_serial_ = result == UINT64_MAX ? 0 : result + 1;
+    return result;
+}
+
 PersistenceCore::Namespace& PersistenceCore::namespace_for(NamespaceId namespace_id) {
     auto position = namespaces_.find(namespace_id);
     if (position == namespaces_.end() || !position->second.live)
@@ -69,13 +85,16 @@ const PersistenceCore::Object& PersistenceCore::object_for(
 
 void PersistenceCore::admit(NamespaceId namespace_id) {
     ensure_mutable();
+    if (namespace_id.c_guid == CStoreGuid{})
+        throw PersistenceError(ErrorCode::InvalidTransition,
+                               "S3 namespace C_GUID zero is reserved");
     auto [position, inserted] = namespaces_.try_emplace(namespace_id);
     if (!inserted && position->second.live)
         throw PersistenceError(ErrorCode::NamespaceAlreadyAdmitted,
                                "S3 namespace is already admitted");
     Namespace& value = position->second;
     value.id = namespace_id;
-    value.last_touch = ++clock_;
+    value.last_touch = next_clock();
     value.resident_bytes = 0;
     value.live = true;
     value.objects.clear();
@@ -84,7 +103,7 @@ void PersistenceCore::admit(NamespaceId namespace_id) {
 void PersistenceCore::touch(NamespaceId namespace_id) {
     ensure_mutable();
     Namespace& value = namespace_for(namespace_id);
-    value.last_touch = ++clock_;
+    value.last_touch = next_clock();
 }
 
 void PersistenceCore::content_conflict(std::string_view key) const {
@@ -166,7 +185,8 @@ void PersistenceCore::reserve_resident(NamespaceId namespace_id, uint64_t bytes)
         for (NamespaceId id : candidates) {
             if (planned >= required) break;
             const uint64_t charge = namespaces_.at(id).resident_bytes;
-            if (!add_overflows(planned, charge)) planned += charge;
+            planned = add_overflows(planned, charge) ? UINT64_MAX
+                                                     : planned + charge;
             ++victim_count;
         }
         if (planned < required)
@@ -200,7 +220,11 @@ BeginInstallResult PersistenceCore::begin_install(
             content_conflict(key);
         }
         if (existing.state == ObjectState::Installing) {
-            if (existing.content_digest != digest) content_conflict(key);
+            if (existing.content_digest != digest ||
+                existing.payload.size() != payload.size() ||
+                !std::equal(existing.payload.begin(), existing.payload.end(),
+                            payload.begin()))
+                content_conflict(key);
             throw PersistenceError(ErrorCode::InvalidTransition,
                                    "S3 object install is already in progress");
         }
@@ -222,7 +246,7 @@ BeginInstallResult PersistenceCore::begin_install(
     object.state = ObjectState::Installing;
     object.content_digest = digest;
     object.payload.assign(payload.begin(), payload.end());
-    object.ticket_serial = next_ticket_serial_++;
+    object.ticket_serial = allocate_ticket_serial();
     object.pin_count = 0;
     return BeginInstallResult{
         false, InstallTicket{namespace_id, std::string(key), object.ticket_serial}};

@@ -147,6 +147,8 @@ private:
                                            std::string_view key) const;
     [[nodiscard]] Object& ticket_object(const InstallTicket& ticket);
     void content_conflict(std::string_view key) const;
+    [[nodiscard]] uint64_t next_clock();
+    [[nodiscard]] uint64_t allocate_ticket_serial();
 
     Limits limits_;
     uint64_t clock_ = 0;
