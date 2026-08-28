@@ -950,7 +950,12 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
       input_lifecycle_(
           config_.endpoint_config.owner_limits.max_retained_input_records,
           config_.max_input_lifecycle_replays),
-      endpoint_work_guard_(asio::make_work_guard(context_)) {
+      endpoint_work_guard_(asio::make_work_guard(context_)),
+      fsession_owner_(4, config_.f_store_generation) {
+    const auto fsession_ready = fsession::mint_fsession_admission_ready(
+        fsession_owner_.service_generation(), 1);
+    if (!fsession_owner_.open_admission(fsession_ready))
+        throw std::logic_error("failed to open production F-session admission");
     input_lifecycle_.bind_store_identity(config_.f_store_generation,
                                          config_.f_store_guid);
     InputJobStateSelector configured_selector =
