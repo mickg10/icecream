@@ -144,6 +144,24 @@ test -n "$service_pid" || {
     exit 1
 }
 
+# A live child is not yet a usable cache endpoint.  Submit only after the
+# daemon has authenticated READY and the scheduler has consumed F's real
+# cache-bearing relogin; otherwise the assignment is correctly frozen without
+# a handoff and a millisecond startup race masquerades as a product failure.
+cache_ready=0
+for _ in $(seq 1 30); do
+    if grep -E 'RELOGIN p50-f.*cache=.*cache_profiles=.*zstd_tu' \
+        "$work/scheduler.log" >/dev/null 2>&1; then
+        cache_ready=1
+        break
+    fi
+    sleep 1
+done
+test "$cache_ready" -eq 1 || {
+    echo "FAIL: production F cache endpoint was not advertised READY" >&2
+    exit 1
+}
+
 remote_obj="$work/out/remote.o"
 local_obj="$work/out/local.o"
 ICECC_TEST_SOCKET="$work/client.sock" ICECC_TEST_REMOTEBUILD=1 \
