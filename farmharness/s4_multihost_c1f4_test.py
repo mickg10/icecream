@@ -20,6 +20,21 @@ class FourHostRunnerTests(unittest.TestCase):
             ["10 python3 -u farmharness/s5_paired_build.py --warm-blocks 1"],
         )
 
+    def test_image_closure_accepts_index_and_platform_config_only(self) -> None:
+        self.assertTrue(runner.valid_image_id(runner.EXPECTED_IMAGE_ID))
+        self.assertTrue(runner.valid_image_id(runner.EXPECTED_IMAGE_CONFIG_ID))
+        self.assertFalse(runner.valid_image_id("sha256:" + "0" * 64))
+
+    def test_image_closure_requires_q3_source_index(self) -> None:
+        image_ids = {host: runner.EXPECTED_IMAGE_ID for host in runner.HOSTS}
+        image_ids["research7"] = runner.EXPECTED_IMAGE_CONFIG_ID
+        self.assertTrue(runner.valid_image_closure(image_ids))
+        image_ids["q3"] = runner.EXPECTED_IMAGE_CONFIG_ID
+        self.assertFalse(runner.valid_image_closure(image_ids))
+        image_ids["q3"] = runner.EXPECTED_IMAGE_ID
+        image_ids["research6"] = "sha256:" + "0" * 64
+        self.assertFalse(runner.valid_image_closure(image_ids))
+
     def test_parse_fields_keeps_last_value(self) -> None:
         fields = runner.parse_fields(
             "noise\nS4_CACHE_OBSERVED=0\nS4_CACHE_OBSERVED=1\n"

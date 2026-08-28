@@ -30,6 +30,12 @@ from typing import Any
 SCHEMA = "icecream-s4-physical-contention-v2"
 BASE_SOURCE_SHA = "04006b9d94161a047154121f47785aec747ffd87"
 EXPECTED_IMAGE_ID = "sha256:bdb55d4287a473e3ebfbaa7715a50ee670659777278b8d84c350724e6fa8de58"
+# Docker reports the multi-platform index on q3/research6/q2, while the
+# single-platform image loaded on research7 reports its exact config ID.
+# Both IDs are bound to the same exported pinned image; any other ID is
+# rejected.
+EXPECTED_IMAGE_CONFIG_ID = "sha256:fe001a6138f017608b8846b43bf268a76a9d7a5b66c3364ba3f881da2ff0c54b"
+EXPECTED_IMAGE_IDS = frozenset((EXPECTED_IMAGE_ID, EXPECTED_IMAGE_CONFIG_ID))
 SOURCE_IMAGE = "icecream/farm-node:ubuntu22-gcc11-boost174"
 PINNED_IMAGE = "icecream/p50-farm-node:ubuntu22-gcc11-boost174-bdb55d"
 
@@ -184,6 +190,18 @@ def image_id(host: str, image: str, timeout: float) -> str:
     return result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
 
 
+def valid_image_id(value: str) -> bool:
+    """Return whether Docker's exact index or platform-config ID is bound."""
+    return value in EXPECTED_IMAGE_IDS
+
+
+def valid_image_closure(image_ids: dict[str, str]) -> bool:
+    """Require q3's source index and only the two bound Docker identities."""
+    return image_ids.get("q3") == EXPECTED_IMAGE_ID and all(
+        valid_image_id(value) for value in image_ids.values()
+    )
+
+
 TAG_IMAGE_SCRIPT = r"""
 set -eu
 expected=$1; tag=$2
@@ -214,7 +232,7 @@ def pin_image_on_existing_hosts(hosts: list[str], timeout: float) -> None:
 
 def copy_pinned_image_to_research7(timeout: float) -> None:
     existing = image_id("research7", PINNED_IMAGE, timeout)
-    if existing == EXPECTED_IMAGE_ID:
+    if existing == EXPECTED_IMAGE_CONFIG_ID:
         return
     if existing:
         raise HoldError(f"research7 pinned image tag already differs: {existing}")
@@ -239,7 +257,7 @@ def copy_pinned_image_to_research7(timeout: float) -> None:
             "exact image copy to research7 failed: "
             + (source_err + err + out)[-500:].decode(errors="replace")
         )
-    if image_id("research7", PINNED_IMAGE, timeout) != EXPECTED_IMAGE_ID:
+    if image_id("research7", PINNED_IMAGE, timeout) != EXPECTED_IMAGE_CONFIG_ID:
         raise HoldError("research7 loaded image ID differs from the pinned source")
 
 
@@ -762,7 +780,7 @@ def main(argv: list[str] | None = None) -> int:
         if "research7" in selected_hosts:
             copy_pinned_image_to_research7(args.timeout)
         image_ids = {host: image_id(host, PINNED_IMAGE, 60) for host in selected_hosts}
-        if set(image_ids.values()) != {EXPECTED_IMAGE_ID}:
+        if not valid_image_closure(image_ids):
             raise HoldError(f"pinned image IDs differ across hosts: {image_ids}")
 
         for host in selected_hosts:
