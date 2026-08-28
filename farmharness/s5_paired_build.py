@@ -381,30 +381,45 @@ def _manifest_remote_script(source_archive_b64: str, tus: list[dict[str, Any]], 
                         append_log=True) +
                 " || { echo 'S4_STATUS=FAIL reason=prewarm-remote-compile'; exit 1; }",
             ]
-        body += [
-            "# Product trace identity binds C_GUID/F store and the monotonic TU_SEQ stream.",
-            "sleep 1",
-            'S5_TRACE_FILE="$WORK/lifecycle.trace"',
-            '[ -s "$S5_TRACE_FILE" ] || S5_TRACE_FILE="$WORK/ready.trace"',
-            '[ -s "$S5_TRACE_FILE" ] || S5_TRACE_FILE="$WORK/scheduler.log"',
-            '[ -s "$S5_TRACE_FILE" ] || { echo \'S4_STATUS=HOLD reason=prewarm-state-trace-unavailable\'; exit 77; }',
-            'S5_PREWARM_STATE_DIGEST=$(sha256sum "$S5_TRACE_FILE" | awk \'{print $1}\')',
-            'S5_PREWARM_C_GUID=$(grep -Eho \'C_STORE_GUID=[0-9A-Fa-f]{32}\' "$WORK"/*.trace "$WORK"/*.log 2>/dev/null | head -1 | cut -d= -f2 || true)',
-            'S5_PREWARM_F_STORE_GENERATION=$(grep -Eho \'F_STORE_GENERATION=[0-9]+\' "$WORK"/*.trace "$WORK"/*.log 2>/dev/null | head -1 | cut -d= -f2 || true)',
-            'S5_PREWARM_SCHEDULER_EPOCH=$(grep -Eho \'epoch=[0-9]+\' "$WORK"/*.trace "$WORK"/*.log 2>/dev/null | head -1 | cut -d= -f2 || true)',
-            'S5_PREWARM_TU_SEQ_COUNT=$(grep -Eoc \'"tu_seq":[0-9]+\' "$WORK/compile_identity.trace" 2>/dev/null || true)',
-            'S5_PREWARM_TU_SEQ_DIGEST=$(sha256sum "$WORK/compile_identity.trace" 2>/dev/null | awk \'{print $1}\' || true)',
-            'S5_PREWARM_CLIENT_C_GUID=$(grep -Eo \'"c_guid":[0-9]+\' "$WORK/compile_identity.trace" 2>/dev/null | sort -u | wc -l | tr -d " ")',
-            'S5_PREWARM_TU_SEQ_ORDER_OK=$(grep -Eo \'"tu_seq":[0-9]+\' "$WORK/compile_identity.trace" 2>/dev/null | sed -E \'s/.*:([0-9]+)/\\1/\' | awk \'NR==1 {previous=$1; count=1; next} {if ($1 <= previous) exit 2; previous=$1; count++} END {if (count < ' + str(len(tus)) + ') exit 3}\' && echo 1 || echo 0)',
-            '[ -n "$S5_PREWARM_STATE_DIGEST" ] && [ -n "$S5_PREWARM_C_GUID" ] && [ -n "$S5_PREWARM_F_STORE_GENERATION" ] && [ -n "$S5_PREWARM_SCHEDULER_EPOCH" ] || { echo \'S4_STATUS=HOLD reason=prewarm-product-identity-unavailable\'; exit 77; }',
-            '[ "${S5_PREWARM_TU_SEQ_COUNT:-0}" -ge ' + str(len(tus)) + ' ] && [ -n "$S5_PREWARM_TU_SEQ_DIGEST" ] && [ "$S5_PREWARM_CLIENT_C_GUID" = 1 ] && [ "$S5_PREWARM_TU_SEQ_ORDER_OK" = 1 ] || { echo \'S4_STATUS=HOLD reason=prewarm-tu-seq-witness-unavailable\'; exit 77; }',
-            'printf \'S5_PREWARM state_digest=%s trace=%s c_guid=%s f_store_generation=%s scheduler_epoch=%s tu_seq_count=%s tu_seq_digest=%s\\n\' "$S5_PREWARM_STATE_DIGEST" "$S5_TRACE_FILE" "$S5_PREWARM_C_GUID" "$S5_PREWARM_F_STORE_GENERATION" "$S5_PREWARM_SCHEDULER_EPOCH" "$S5_PREWARM_TU_SEQ_COUNT" "$S5_PREWARM_TU_SEQ_DIGEST"',
-            'S5_PREWARM_SELECTED_TU_COUNT=$(grep -Eoc "P50 CompileFile attached exact ZSTD_TU input" "$WORK"/fdaemon*.log 2>/dev/null || true)',
-            'S5_PREWARM_SELECTED_ROUTE_COUNT=$(grep -Eoc "P50 CompileFile attached exact ZSTD_ROUTE input" "$WORK"/fdaemon*.log 2>/dev/null || true)',
-            'printf \'S5_PREWARM_SELECTED_TU_COUNT=%s\\nS5_PREWARM_SELECTED_ROUTE_COUNT=%s\\n\' "$S5_PREWARM_SELECTED_TU_COUNT" "$S5_PREWARM_SELECTED_ROUTE_COUNT"',
-            'if [ "$S5_PREWARM_SELECTED_ROUTE_COUNT" -ne 0 ]; then echo \'S5_SELECTED_PROFILE=ZSTD_ROUTE\'; echo \'S4_STATUS=HOLD reason=selected-profile-not-zstd-tu\'; exit 77; fi',
-            'if [ "$S5_PREWARM_SELECTED_TU_COUNT" -ne ' + str(len(tus)) + ' ]; then echo \'S5_SELECTED_PROFILE=UNKNOWN\'; echo \'S4_STATUS=HOLD reason=selected-profile-not-zstd-tu\'; exit 77; fi',
-        ]
+        if mode == "cache":
+            body += [
+                "# Product trace identity binds C_GUID/F store and the monotonic TU_SEQ stream.",
+                "sleep 1",
+                'S5_TRACE_FILE="$WORK/lifecycle.trace"',
+                '[ -s "$S5_TRACE_FILE" ] || S5_TRACE_FILE="$WORK/ready.trace"',
+                '[ -s "$S5_TRACE_FILE" ] || S5_TRACE_FILE="$WORK/scheduler.log"',
+                '[ -s "$S5_TRACE_FILE" ] || { echo \'S4_STATUS=HOLD reason=prewarm-state-trace-unavailable\'; exit 77; }',
+                'S5_PREWARM_STATE_DIGEST=$(sha256sum "$S5_TRACE_FILE" | awk \'{print $1}\')',
+                'S5_PREWARM_C_GUID=$(grep -Eho \'C_STORE_GUID=[0-9A-Fa-f]{32}\' "$WORK"/*.trace "$WORK"/*.log 2>/dev/null | head -1 | cut -d= -f2 || true)',
+                'S5_PREWARM_F_STORE_GENERATION=$(grep -Eho \'F_STORE_GENERATION=[0-9]+\' "$WORK"/*.trace "$WORK"/*.log 2>/dev/null | head -1 | cut -d= -f2 || true)',
+                'S5_PREWARM_SCHEDULER_EPOCH=$(grep -Eho \'epoch=[0-9]+\' "$WORK"/*.trace "$WORK"/*.log 2>/dev/null | head -1 | cut -d= -f2 || true)',
+                'S5_PREWARM_TU_SEQ_COUNT=$(grep -Eoc \'"tu_seq":[0-9]+\' "$WORK/compile_identity.trace" 2>/dev/null || true)',
+                'S5_PREWARM_TU_SEQ_DIGEST=$(sha256sum "$WORK/compile_identity.trace" 2>/dev/null | awk \'{print $1}\' || true)',
+                'S5_PREWARM_CLIENT_C_GUID=$(grep -Eo \'"c_guid":[0-9]+\' "$WORK/compile_identity.trace" 2>/dev/null | sort -u | wc -l | tr -d " ")',
+                'S5_PREWARM_TU_SEQ_ORDER_OK=$(grep -Eo \'"tu_seq":[0-9]+\' "$WORK/compile_identity.trace" 2>/dev/null | sed -E \'s/.*:([0-9]+)/\\1/\' | awk \'NR==1 {previous=$1; count=1; next} {if ($1 <= previous) exit 2; previous=$1; count++} END {if (count < ' + str(len(tus)) + ') exit 3}\' && echo 1 || echo 0)',
+                '[ -n "$S5_PREWARM_STATE_DIGEST" ] && [ -n "$S5_PREWARM_C_GUID" ] && [ -n "$S5_PREWARM_F_STORE_GENERATION" ] && [ -n "$S5_PREWARM_SCHEDULER_EPOCH" ] || { echo \'S4_STATUS=HOLD reason=prewarm-product-identity-unavailable\'; exit 77; }',
+                '[ "${S5_PREWARM_TU_SEQ_COUNT:-0}" -ge ' + str(len(tus)) + ' ] && [ -n "$S5_PREWARM_TU_SEQ_DIGEST" ] && [ "$S5_PREWARM_CLIENT_C_GUID" = 1 ] && [ "$S5_PREWARM_TU_SEQ_ORDER_OK" = 1 ] || { echo \'S4_STATUS=HOLD reason=prewarm-tu-seq-witness-unavailable\'; exit 77; }',
+                'printf \'S5_PREWARM state_digest=%s trace=%s c_guid=%s f_store_generation=%s scheduler_epoch=%s tu_seq_count=%s tu_seq_digest=%s\\n\' "$S5_PREWARM_STATE_DIGEST" "$S5_TRACE_FILE" "$S5_PREWARM_C_GUID" "$S5_PREWARM_F_STORE_GENERATION" "$S5_PREWARM_SCHEDULER_EPOCH" "$S5_PREWARM_TU_SEQ_COUNT" "$S5_PREWARM_TU_SEQ_DIGEST"',
+                'S5_PREWARM_SELECTED_TU_COUNT=$(grep -Eoc "P50 CompileFile attached exact ZSTD_TU input" "$WORK"/fdaemon*.log 2>/dev/null || true)',
+                'S5_PREWARM_SELECTED_ROUTE_COUNT=$(grep -Eoc "P50 CompileFile attached exact ZSTD_ROUTE input" "$WORK"/fdaemon*.log 2>/dev/null || true)',
+                'printf \'S5_PREWARM_SELECTED_TU_COUNT=%s\\nS5_PREWARM_SELECTED_ROUTE_COUNT=%s\\n\' "$S5_PREWARM_SELECTED_TU_COUNT" "$S5_PREWARM_SELECTED_ROUTE_COUNT"',
+                'if [ "$S5_PREWARM_SELECTED_ROUTE_COUNT" -ne 0 ]; then echo \'S5_SELECTED_PROFILE=ZSTD_ROUTE\'; echo \'S4_STATUS=HOLD reason=selected-profile-not-zstd-tu\'; exit 77; fi',
+                'if [ "$S5_PREWARM_SELECTED_TU_COUNT" -ne ' + str(len(tus)) + ' ]; then echo \'S5_SELECTED_PROFILE=UNKNOWN\'; echo \'S4_STATUS=HOLD reason=selected-profile-not-zstd-tu\'; exit 77; fi',
+            ]
+        else:
+            body += [
+                "# Legacy warm has no cache identity; require only complete deterministic prewarm.",
+                'S5_PREWARM_COMPLETE_COUNT=0',
+                'for prewarm_index in ' + " ".join(str(index) for index in range(len(tus))) + '; do',
+                '  test -s "$WORK/out/prewarm-${prewarm_index}.o" || { echo \'S4_STATUS=HOLD reason=prewarm-manifest-incomplete\'; exit 77; }',
+                '  S5_PREWARM_COMPLETE_COUNT=$((S5_PREWARM_COMPLETE_COUNT + 1))',
+                'done',
+                '[ "$S5_PREWARM_COMPLETE_COUNT" -eq ' + str(len(tus)) + ' ] || { echo \'S4_STATUS=HOLD reason=prewarm-manifest-incomplete\'; exit 77; }',
+                'printf \'S5_PREWARM_LEGACY mode=legacy manifest_count=%s output_count=%s\\n\' ' + str(len(tus)) + ' "$S5_PREWARM_COMPLETE_COUNT"',
+                'if grep -E \'ZSTD_TU|ZSTD_ROUTE|CACHE_SESSION\' "$WORK"/fdaemon*.log "$WORK"/scheduler.log "$WORK"/cdaemon.log >/dev/null 2>&1; then',
+                '  echo \'S4_STATUS=FAIL reason=legacy-cache-profile-observed\'; exit 1',
+                'fi',
+            ]
     body += ["S5_MEASURE_START_NS=$(date +%s%N)",
              'echo "S5_MEASURE_START_NS=$S5_MEASURE_START_NS"']
     for index, tu in enumerate(tus):
@@ -430,10 +445,22 @@ def _manifest_remote_script(source_archive_b64: str, tus: list[dict[str, Any]], 
         'S5_SELECTED_TU_COUNT=$(grep -Eoc "P50 CompileFile attached exact ZSTD_TU input" "$WORK"/fdaemon*.log 2>/dev/null || true)',
         'S5_SELECTED_ROUTE_COUNT=$(grep -Eoc "P50 CompileFile attached exact ZSTD_ROUTE input" "$WORK"/fdaemon*.log 2>/dev/null || true)',
         'printf \'S5_SELECTED_TU_COUNT=%s\\nS5_SELECTED_ROUTE_COUNT=%s\\n\' "$S5_SELECTED_TU_COUNT" "$S5_SELECTED_ROUTE_COUNT"',
-        'if [ "$S5_SELECTED_ROUTE_COUNT" -ne 0 ]; then echo \'S5_SELECTED_PROFILE=ZSTD_ROUTE\'; echo \'S4_STATUS=HOLD reason=selected-profile-not-zstd-tu\'; exit 77; fi',
-        'if [ "$S5_SELECTED_TU_COUNT" -ne ' + str(expected_profile_count) + ' ]; then echo \'S5_SELECTED_PROFILE=UNKNOWN\'; echo \'S4_STATUS=HOLD reason=selected-profile-not-zstd-tu\'; exit 77; fi',
-        'echo \'S5_SELECTED_PROFILE=ZSTD_TU\'',
+    ]
+    if mode == "cache":
+        body += [
+            'if [ "$S5_SELECTED_ROUTE_COUNT" -ne 0 ]; then echo \'S5_SELECTED_PROFILE=ZSTD_ROUTE\'; echo \'S4_STATUS=HOLD reason=selected-profile-not-zstd-tu\'; exit 77; fi',
+            'if [ "$S5_SELECTED_TU_COUNT" -ne ' + str(expected_profile_count) + ' ]; then echo \'S5_SELECTED_PROFILE=UNKNOWN\'; echo \'S4_STATUS=HOLD reason=selected-profile-not-zstd-tu\'; exit 77; fi',
+            'echo \'S5_SELECTED_PROFILE=ZSTD_TU\'',
+        ]
+    else:
+        body += [
+            'if [ "$S5_SELECTED_TU_COUNT" -ne 0 ] || [ "$S5_SELECTED_ROUTE_COUNT" -ne 0 ]; then echo \'S4_STATUS=FAIL reason=legacy-cache-profile-observed\'; exit 1; fi',
+        ]
+    body += [
         'if [ "$S5_ALL_IDENTICAL" -ne 1 ]; then echo \'S4_STATUS=FAIL reason=object-not-byte-identical\'; exit 1; fi',
+    ]
+    if mode == "cache":
+        body += [
         'if [ "$WARM" = 1 ]; then',
         '  S5_POST_C_GUID=$(grep -Eho \'C_STORE_GUID=[0-9A-Fa-f]{32}\' "$WORK"/*.trace "$WORK"/*.log 2>/dev/null | head -1 | cut -d= -f2 || true)',
         '  S5_POST_F_STORE_GENERATION=$(grep -Eho \'F_STORE_GENERATION=[0-9]+\' "$WORK"/*.trace "$WORK"/*.log 2>/dev/null | head -1 | cut -d= -f2 || true)',
@@ -444,6 +471,8 @@ def _manifest_remote_script(source_archive_b64: str, tus: list[dict[str, Any]], 
         '  [ "$S5_POST_C_GUID" = "$S5_PREWARM_C_GUID" ] && [ "$S5_POST_F_STORE_GENERATION" = "$S5_PREWARM_F_STORE_GENERATION" ] && [ "$S5_POST_SCHEDULER_EPOCH" = "$S5_PREWARM_SCHEDULER_EPOCH" ] || { echo \'S4_STATUS=FAIL reason=warm-product-identity-changed\'; exit 1; }',
         '  printf \'S5_WARM_IDENTITY c_guid=%s f_store_generation=%s scheduler_epoch=%s\\n\' "$S5_POST_C_GUID" "$S5_POST_F_STORE_GENERATION" "$S5_POST_SCHEDULER_EPOCH"',
         'fi',
+        ]
+    body += [
         'echo "S4_BYTE_IDENTICAL=$S5_ALL_IDENTICAL"',
     ]
     if len(tus) == 1:
@@ -718,6 +747,9 @@ def run_build(args: argparse.Namespace, run_root: Path, block: dict[str, Any],
             # Identity is a deterministic reference to the product-emitted
             # trace and its SHA, not a producer-invented state value.
             prewarm_identity["snapshot_identity"] = trace + ":" + digest
+    legacy_prewarm = _parse_identity(stdout, "S5_PREWARM_LEGACY")
+    if legacy_prewarm is not None:
+        legacy_prewarm["mode"] = mode
     warm_identity = _parse_identity(stdout, "S5_WARM_IDENTITY")
     row = {
         "kind": "build", "schema": SCHEMA, "build_id": build_id,
@@ -744,7 +776,8 @@ def run_build(args: argparse.Namespace, run_root: Path, block: dict[str, Any],
         "tu_ledger": ledger,
         "aggregate_wall_seconds": ((measure_end - measure_start) / 1e9
                                     if measure_start is not None and measure_end is not None else None),
-        "prewarm": ({"mode": mode, **prewarm_identity} if prewarm_identity else None),
+        "prewarm": ({"mode": mode, **prewarm_identity} if prewarm_identity else
+                     legacy_prewarm),
         "warm_identity": warm_identity,
         "cleanup": fields.get("S4_CLEANUP", "missing"), "status": status,
         "reason": reason,

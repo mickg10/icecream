@@ -120,6 +120,16 @@ class PairedRunnerTest(unittest.TestCase):
         self.assertIn("TU_SEQ", script)
         self.assertIn('WARM=${8:-0}', script)
 
+    def test_warm_legacy_requires_complete_manifest_without_cache_identity(self):
+        tus = [{"tu_id": "fmt-0001-a", "source": "src/a.cc", "flags": ["-O2"]},
+               {"tu_id": "fmt-0002-b", "source": "src/b.cc", "flags": ["-O2"]}]
+        script = _remote_script("archive", tus, "legacy", Path("/unused"), warm=True)
+        self.assertIn("S5_PREWARM_LEGACY mode=legacy manifest_count=%s", script)
+        self.assertIn("prewarm-manifest-incomplete", script)
+        self.assertIn("legacy-cache-profile-observed", script)
+        self.assertNotIn("prewarm-product-identity-unavailable", script)
+        self.assertNotIn("S5_WARM_IDENTITY", script)
+
     def test_parse_exact_tu_ledger(self):
         stdout = ("S5_TU_LEDGER tu_id=fmt-a source=src/a.cc "
                    "remote_sha256=" + "a" * 64 + " remote_bytes=12 "
