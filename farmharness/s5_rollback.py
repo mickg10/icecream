@@ -136,6 +136,30 @@ def _verify_manifest(value: Mapping[str, Any], label: str, *, require_cache: boo
                  f"{label}:{role}:not-executable")
 
 
+def _verify_compile_observation(value: Mapping[str, Any], label: str,
+                                manifest: Mapping[str, Any]) -> None:
+    """Bind compile evidence to the artifact that was actually launched."""
+    expected_root = Path(str(manifest.get("root", ""))).absolute()
+    observed_root = Path(str(value.get("artifact_root", ""))).absolute()
+    _require(observed_root == expected_root,
+             f"{label}:launched artifact root mismatch")
+    expected_hashes = manifest.get("role_hashes")
+    observed_hashes = value.get("role_hashes")
+    _require(isinstance(expected_hashes, Mapping) and
+             isinstance(observed_hashes, Mapping),
+             f"{label}:missing role hashes")
+    _require(dict(observed_hashes) == dict(expected_hashes),
+             f"{label}:launched role hash mismatch")
+    remote = value.get("remote_sha256")
+    reference = value.get("reference_sha256")
+    for name, digest in (("remote", remote), ("reference", reference)):
+        _require(isinstance(digest, str) and len(digest) == 64 and
+                 all(character in "0123456789abcdefABCDEF" for character in digest),
+                 f"{label}:{name} object SHA256 is missing or invalid")
+    _require(remote.lower() == reference.lower(),
+             f"{label}:remote/reference object SHA256 mismatch")
+
+
 def _zero_counter_map(value: Mapping[str, Any], label: str) -> None:
     for name in COUNTERS:
         raw = value.get(name)
@@ -176,6 +200,7 @@ def verify_evidence(evidence: Mapping[str, Any]) -> dict[str, Any]:
 
     legacy = evidence.get("legacy")
     _require(isinstance(legacy, Mapping), "missing legacy compile observation")
+    _verify_compile_observation(legacy, "legacy", artifacts["previous"])
     _require(legacy.get("remote_compile") is True and legacy.get("byte_identical") is True,
              "post-rollback legacy compile was not remote byte-identical")
     _require(legacy.get("cache_observed") is False and
@@ -186,6 +211,7 @@ def verify_evidence(evidence: Mapping[str, Any]) -> dict[str, Any]:
 
     current = evidence.get("current")
     _require(isinstance(current, Mapping), "missing restored current compile observation")
+    _verify_compile_observation(current, "current", artifacts["current"])
     _require(current.get("remote_compile") is True and current.get("byte_identical") is True and
              current.get("cache_observed") is True and
              current.get("selected_profile") == "ZSTD_TU" and
@@ -258,34 +284,23 @@ def make_evidence(current_root: Path, previous_root: Path, bind_path: Path,
     # path: a deployment owner must provide a dedicated bind path.
     if not bind_path.is_symlink() or bind_path.resolve() != current_root:
         raise RollbackError("bind path is not bound to the current role root")
-    bind_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = bind_path.with_name(bind_path.name + ".rollback-new")
-    temporary.unlink(missing_ok=True)
-    temporary.symlink_to(previous_root.resolve(), target_is_directory=True)
-    os.replace(temporary, bind_path)
-    _require(bind_path.resolve() == previous_root,
-             "bind path did not select the previous role root")
-    phases.append("bound_previous")
-    legacy = _run_hook("legacy", hooks.get("legacy", ""), timeout)
-    results["legacy"] = legacy
-    if legacy.returncode != 0:
-        raise RollbackError("post-rollback legacy compile hook failed")
-    phases.append("legacy_verified")
-    temporary.unlink(missing_ok=True)
-    temporary.symlink_to(current_root.resolve(), target_is_directory=True)
-    os.replace(temporary, bind_path)
-    _require(bind_path.resolve() == current_root,
-             "bind path did not restore the current role root")
-    phases.append("bound_current")
-    current = _run_hook("current", hooks.get("current", ""), timeout)
-    results["current"] = current
-    if current.returncode != 0:
-        raise RollbackError("restored current compile hook failed")
-    phases.append("current_profile_verified")
-    # Hooks emit JSON objects on their final line.  Requiring JSON here keeps
-    # shell logs free-form while retaining a typed, fail-closed evidence row.
+
+    def bind_to(root: Path) -> None:
+        bind_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = bind_path.with_name(bind_path.name + ".rollback-new")
+        temporary.unlink(missing_ok=True)
+        temporary.symlink_to(root.resolve(), target_is_directory=True)
+        os.replace(temporary, bind_path)
+        _require(bind_path.resolve() == root,
+                 f"bind path did not select {root.name} role root")
+
+    # Hooks emit JSON objects on their final line.  Parse observations before
+    # advancing to the next lifecycle phase so cleanup follows a verified
+    # restored-current compile, rather than merely a zero return code.
     def hook_json(name: str) -> dict[str, Any]:
-        lines = results[name].stdout.splitlines()
+        result = results.get(name)
+        _require(result is not None, f"{name} hook did not run")
+        lines = result.stdout.splitlines()
         if not lines:
             raise RollbackError(f"{name} hook emitted no evidence")
         try:
@@ -295,10 +310,46 @@ def make_evidence(current_root: Path, previous_root: Path, bind_path: Path,
         if not isinstance(value, dict):
             raise RollbackError(f"{name} hook evidence is not an object")
         return value
+
+    rollback_started = True
+    try:
+        bind_to(previous_root)
+        phases.append("bound_previous")
+        legacy = _run_hook("legacy", hooks.get("legacy", ""), timeout)
+        results["legacy"] = legacy
+        if legacy.returncode != 0:
+            raise RollbackError("post-rollback legacy compile hook failed")
+        phases.append("legacy_verified")
+        bind_to(current_root)
+        phases.append("bound_current")
+        current = _run_hook("current", hooks.get("current", ""), timeout)
+        results["current"] = current
+        if current.returncode != 0:
+            raise RollbackError("restored current compile hook failed")
+        current_observed = hook_json("current")
+        _verify_compile_observation(current_observed, "current", current_manifest)
+        _require(current_observed.get("remote_compile") is True and
+                 current_observed.get("byte_identical") is True and
+                 current_observed.get("cache_observed") is True and
+                 current_observed.get("selected_profile") == "ZSTD_TU" and
+                 isinstance(current_observed.get("selected_tu_count"), int) and
+                 current_observed["selected_tu_count"] > 0,
+                 "restored current ZSTD_TU compile was not byte-identical")
+        _zero_counter_map(current_observed, "current")
+        phases.append("current_profile_verified")
+        cleanup = _run_hook("cleanup", hooks.get("cleanup", ""), timeout)
+        results["cleanup"] = cleanup
+        if cleanup.returncode != 0:
+            raise RollbackError("final rollback cleanup hook failed")
+    finally:
+        # Keep the deployment on the current artifact even when legacy,
+        # current, cleanup, parsing, or validation fails after the rollback
+        # flip.  The operation is deliberately idempotent.
+        if rollback_started:
+            bind_to(current_root)
     drain = hook_json("drain")
     sidecar = {**hook_json("stop"), **hook_json("reclaim")}
     legacy_observed = hook_json("legacy")
-    current_observed = hook_json("current")
     evidence = {
         "schema": SCHEMA,
         "phases": phases,
@@ -309,7 +360,7 @@ def make_evidence(current_root: Path, previous_root: Path, bind_path: Path,
                      "rollback": "previous", "restored": "current"},
         "legacy": legacy_observed,
         "current": current_observed,
-        "cleanup": {**hook_json("reclaim"), "status": "complete", "skipped": False},
+        "cleanup": hook_json("cleanup"),
     }
     verify_evidence(evidence)
     return evidence
@@ -322,13 +373,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--bind-path", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=300.0)
-    for name in ("drain", "stop", "reclaim", "legacy", "current"):
+    for name in ("drain", "stop", "reclaim", "legacy", "current", "cleanup"):
         parser.add_argument(f"--{name}-command", required=True)
     args = parser.parse_args(argv)
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
     hooks = {name: getattr(args, f"{name}_command")
-             for name in ("drain", "stop", "reclaim", "legacy", "current")}
+             for name in ("drain", "stop", "reclaim", "legacy", "current", "cleanup")}
     try:
         evidence = make_evidence(args.current_root, args.previous_root, args.bind_path,
                                  hooks, args.timeout,
