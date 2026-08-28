@@ -8622,8 +8622,11 @@ bool Daemon::handle_p50_source_arm(Client *client, P50SourceArmMsg *msg)
     }
     client->job_id = arm.wire_job_id;
     client->last_known_job_id = arm.wire_job_id;
-    client->set_status(Client::WAITP50INPUT,
-                       "p50: source assignment claimed before ACK");
+
+    // authorize_source_arm_claim() retains the scheduler owner during this
+    // synchronous turn.  Keep Client UNKNOWN until arm_p50_source installs
+    // the complete arm/lease/deadline and performs the sole WAIT transition;
+    // pre-setting WAIT makes that atomic installer reject every real arm.
 
     if (next_p50_arm_observation_id == 0 ||
         next_p50_arm_observation_id == UINT64_MAX) {

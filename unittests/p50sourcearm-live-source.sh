@@ -78,6 +78,17 @@ check_contract() {
         return 1
     fi
 
+    # The complete arm installer owns the sole UNKNOWN -> WAIT transition.
+    # Moving to WAIT immediately after the scheduler claim makes the installer
+    # reject every production request before it can emit the armed ACK.
+    claim_to_install=$(sed -n \
+        '/if (!authorize_source_arm_claim(/,/!client->arm_p50_source(/p' \
+        "$candidate")
+    if printf '%s\n' "$claim_to_install" | \
+        grep -F 'set_status(Client::WAITP50INPUT' >/dev/null; then
+        return 1
+    fi
+
     # The source-arm handler is ordinary-link admission only.  The positive
     # CACHE_SESSION/private/SCM_RIGHTS/InputReady path must not be smuggled
     # into this successor.
