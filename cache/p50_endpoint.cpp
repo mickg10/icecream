@@ -1377,7 +1377,7 @@ struct P50ServerEndpoint::Impl {
           input_records(config_value.owner_limits.max_retained_input_records,
                         config_value.owner_limits.max_retained_input_bytes),
           global_resources(std::make_unique<GlobalResourceModel>(
-              global_resource_limits(config_value.owner_limits), {},
+              global_resource_limits(config_value.owner_limits), GlobalResourceFaults{},
               config_value.global_resource_trace)),
           config(std::move(config_value)) {
         if (f_guid == FStoreGuid{})
@@ -1619,20 +1619,23 @@ struct P50ServerEndpoint::Impl {
     }
 
     void reserve_pending(Pending& pending) {
-        pending.reserved_encoded_bytes = pending.begin.body.encoded_bytes;
-        pending.reserved_raw_bytes = pending.begin.raw_bytes;
-        pending.reserved_window_bytes = uint64_t{1} << caps.zstd.max_window_log;
+        const uint64_t encoded_bytes = pending.begin.body.encoded_bytes;
+        const uint64_t raw_bytes = pending.begin.raw_bytes;
+        const uint64_t window_bytes = uint64_t{1} << caps.zstd.max_window_log;
         const P50ServerOwnerLimits& limits = config.owner_limits;
-        if (exceeds(pending_encoded_bytes, pending.reserved_encoded_bytes,
+        if (exceeds(pending_encoded_bytes, encoded_bytes,
                     limits.max_pending_encoded_bytes) ||
-            exceeds(pending_raw_bytes, pending.reserved_raw_bytes,
+            exceeds(pending_raw_bytes, raw_bytes,
                     limits.max_pending_raw_bytes) ||
-            exceeds(decoder_window_bytes, pending.reserved_window_bytes,
+            exceeds(decoder_window_bytes, window_bytes,
                     limits.max_decoder_window_bytes))
             throw std::length_error("F endpoint reached an aggregate pending-input bound");
-        pending_encoded_bytes += pending.reserved_encoded_bytes;
-        pending_raw_bytes += pending.reserved_raw_bytes;
-        decoder_window_bytes += pending.reserved_window_bytes;
+        pending_encoded_bytes += encoded_bytes;
+        pending_raw_bytes += raw_bytes;
+        decoder_window_bytes += window_bytes;
+        pending.reserved_encoded_bytes = encoded_bytes;
+        pending.reserved_raw_bytes = raw_bytes;
+        pending.reserved_window_bytes = window_bytes;
     }
 
     void release_pending(Pending& pending) {
