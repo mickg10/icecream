@@ -164,6 +164,8 @@ public:
     [[nodiscard]] bool job_open(InputRecordKey key) const;
     [[nodiscard]] size_t namespace_record_count(CStoreGuid c_store_guid) const;
     [[nodiscard]] uint64_t namespace_retained_bytes(CStoreGuid c_store_guid) const;
+    [[nodiscard]] std::vector<InputRecordKey>
+    namespace_keys(CStoreGuid c_store_guid) const;
     // Whole-namespace eviction is legal only after every logical-job lease is
     // closed and every issued cursor has released its immutable backing.
     [[nodiscard]] bool namespace_evictable(CStoreGuid c_store_guid) const;

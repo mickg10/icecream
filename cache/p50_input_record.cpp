@@ -294,6 +294,17 @@ size_t InputRecordStore::namespace_record_count(CStoreGuid c_store_guid) const {
     return result;
 }
 
+std::vector<InputRecordKey>
+InputRecordStore::namespace_keys(CStoreGuid c_store_guid) const {
+    std::vector<InputRecordKey> result;
+    result.reserve(namespace_record_count(c_store_guid));
+    for (const auto& [key, entry] : records_) {
+        (void)entry;
+        if (key.c_store_guid == c_store_guid) result.push_back(key);
+    }
+    return result;
+}
+
 uint64_t InputRecordStore::namespace_retained_bytes(
     CStoreGuid c_store_guid) const {
     uint64_t result = 0;

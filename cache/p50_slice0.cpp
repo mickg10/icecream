@@ -336,6 +336,7 @@ std::string_view global_action_name(GlobalActionType action) {
     case GlobalActionType::ARENA_PRESENT: return "ARENA_PRESENT";
     case GlobalActionType::ARENA_PINNED: return "ARENA_PINNED";
     case GlobalActionType::ARENA_UNPINNED: return "ARENA_UNPINNED";
+    case GlobalActionType::ARENA_RELEASED: return "ARENA_RELEASED";
     case GlobalActionType::INSTALL_CRASHED: return "INSTALL_CRASHED";
     case GlobalActionType::CONTENT_CONFLICT_FATAL: return "CONTENT_CONFLICT_FATAL";
     case GlobalActionType::NAMESPACE_EVICTED: return "NAMESPACE_EVICTED";
@@ -709,6 +710,25 @@ size_t GlobalResourceModel::live_namespace_count() const {
 
 size_t GlobalResourceModel::free_staging_slots() const {
     return limits_.max_staging_slots - slots_.size();
+}
+
+std::optional<size_t> GlobalResourceModel::first_free_staging_slot() const {
+    for (size_t slot = 0; slot < limits_.max_staging_slots; ++slot)
+        if (!slots_.contains(slot)) return slot;
+    return std::nullopt;
+}
+
+void GlobalResourceModel::release(CStoreGuid c_store_guid, Key64 key) {
+    Namespace& space = require_namespace(c_store_guid);
+    const auto position = space.objects.find(key);
+    if (position == space.objects.end() ||
+        (position->second.state != GlobalObjectState::Present &&
+         position->second.state != GlobalObjectState::Pinned))
+        throw std::logic_error("global release requires a resident object");
+    const uint64_t bytes = position->second.bytes;
+    space.objects.erase(position);
+    emit({GlobalActionType::ARENA_RELEASED, c_store_guid, {}, space.generation,
+          key, 0, bytes});
 }
 
 const ImmutableObject& CObjectArena::object(Key64 key) const {

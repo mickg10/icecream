@@ -10,7 +10,7 @@ PYTHON=${PYTHON:-python3}
 for symbol in \
     NAMESPACE_ADMITTED NAMESPACE_TOUCHED TU_STARTED TU_FINISHED \
     ARENA_INSTALLING ARENA_RETRY_INSTALLING ARENA_PRESENT \
-    ARENA_PINNED ARENA_UNPINNED INSTALL_CRASHED CONTENT_CONFLICT_FATAL \
+    ARENA_PINNED ARENA_UNPINNED ARENA_RELEASED INSTALL_CRASHED CONTENT_CONFLICT_FATAL \
     NAMESPACE_EVICTED GENERATION_ADVANCED GENERATION_WRAP_STOPPED \
     C_GUID_FLIPPED; do
     grep -F "$symbol" "$SCRIPT_DIR/check_global_trace.py" >/dev/null || {
@@ -44,9 +44,18 @@ done
 # census next to the existing action/invariant census so a model-only change
 # cannot be reported as an S3 exit.
 for symbol in GlobalResourceModel GlobalResourceTrace global_action_name \
-    write_global_trace begin_install publish conflict evict_oldest free_staging_slots; do
+    write_global_trace begin_install publish conflict evict_oldest free_staging_slots \
+    first_free_staging_slot release; do
     grep -F "$symbol" "$SCRIPT_DIR/../p50_slice0.h" "$SCRIPT_DIR/../p50_slice0.cpp" >/dev/null || {
         echo "missing production global-resource binding: $symbol" >&2
+        exit 1
+    }
+done
+for symbol in global_resources global_resource_trace global_key \
+    reserve_pending release_pending evict_whole_namespace collect_input_garbage; do
+    grep -F "$symbol" "$SCRIPT_DIR/../p50_endpoint.h" \
+        "$SCRIPT_DIR/../p50_endpoint.cpp" >/dev/null || {
+        echo "missing live endpoint global-resource binding: $symbol" >&2
         exit 1
     }
 done
@@ -63,4 +72,3 @@ else
 fi
 
 echo "run_global_formal_gate.sh: static/formal gate passed"
-

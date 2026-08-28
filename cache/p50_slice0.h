@@ -113,6 +113,7 @@ enum class GlobalActionType : uint8_t {
     ARENA_PRESENT,
     ARENA_PINNED,
     ARENA_UNPINNED,
+    ARENA_RELEASED,
     INSTALL_CRASHED,
     CONTENT_CONFLICT_FATAL,
     NAMESPACE_EVICTED,
@@ -204,6 +205,8 @@ public:
     [[nodiscard]] uint64_t staging_bytes() const;
     [[nodiscard]] size_t live_namespace_count() const;
     [[nodiscard]] size_t free_staging_slots() const;
+    [[nodiscard]] std::optional<size_t> first_free_staging_slot() const;
+    void release(CStoreGuid c_store_guid, Key64 key);
 
     // Exposed only so the out-of-line implementation can keep the model's
     // state opaque to callers while remaining C++23-library friendly.

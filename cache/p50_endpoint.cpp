@@ -1,4 +1,5 @@
 #include "p50_endpoint.h"
+#include "p50_slice0.h"
 
 #include "p50_adopted_outcome_writer.h"
 
@@ -82,6 +83,20 @@ void validate_caps(const EndpointCaps& caps) {
         throw std::invalid_argument("endpoint supported profile mask is unsupported");
     if ((caps.supported_profiles & profile_bit(caps.profile)) == 0)
         throw std::invalid_argument("endpoint profile is not supported");
+}
+
+GlobalResourceLimits global_resource_limits(const P50ServerOwnerLimits& limits) {
+    const uint64_t aggregate = limits.max_retained_input_bytes;
+    const uint64_t staging = limits.max_pending_raw_bytes;
+    const uint64_t total = staging > std::numeric_limits<uint64_t>::max() - aggregate
+                               ? std::numeric_limits<uint64_t>::max()
+                               : aggregate + staging;
+    return {.max_aggregate_bytes = aggregate,
+            .max_namespace_bytes = aggregate,
+            .max_staging_bytes = staging,
+            .max_total_bytes = total,
+            .max_generation = KeyLayoutV1::generation_value_mask,
+            .max_staging_slots = limits.max_live_sessions};
 }
 
 CompletionStamp with_operation(CompletionStamp stamp, AsyncOperationKind operation) {
@@ -1288,6 +1303,11 @@ struct P50ServerEndpoint::Impl {
         TxBegin begin;
         std::shared_ptr<ProfileDialogue> dialogue;
         bool materializing = false;
+        bool global_tu_started = false;
+        bool global_staged = false;
+        CStoreGuid global_c_guid{};
+        Key64 global_key{};
+        size_t global_slot = 0;
         uint64_t reserved_encoded_bytes = 0;
         uint64_t reserved_raw_bytes = 0;
         uint64_t reserved_window_bytes = 0;
@@ -1356,11 +1376,18 @@ struct P50ServerEndpoint::Impl {
           actions(action_trace),
           input_records(config_value.owner_limits.max_retained_input_records,
                         config_value.owner_limits.max_retained_input_bytes),
+          global_resources(std::make_unique<GlobalResourceModel>(
+              global_resource_limits(config_value.owner_limits), {},
+              config_value.global_resource_trace)),
           config(std::move(config_value)) {
         if (f_guid == FStoreGuid{})
             throw std::invalid_argument("F endpoint GUID zero is reserved");
         if (config.protocol_error_code == 0)
             throw std::invalid_argument("F endpoint ERROR code zero is reserved");
+        if (config.endpoint_generation == 0 ||
+            config.endpoint_generation >= KeyLayoutV1::generation_value_mask)
+            throw std::invalid_argument(
+                "F endpoint generation is outside the global key layout");
         validate_caps(caps);
         const P50ServerOwnerLimits& limits = config.owner_limits;
         if (limits.max_live_sessions == 0 || limits.max_namespaces == 0 ||
@@ -1448,7 +1475,33 @@ struct P50ServerEndpoint::Impl {
         return result;
     }
 
-    void touch_namespace_on_disconnect(Namespace& space) noexcept {
+    Key64 global_key(TuSeq tu_seq) const {
+        if (tu_seq.value == KeyLayoutV1::ordinal_mask)
+            throw std::overflow_error("global resource key ordinal space exhausted");
+        const auto key = Key64::make(
+            ObjectType::Blob, static_cast<uint16_t>(config.endpoint_generation),
+            tu_seq.value + 1);
+        if (!key)
+            throw std::overflow_error("global resource key cannot be represented");
+        return *key;
+    }
+
+    void finish_global_pending(Pending& pending, bool crash) {
+        if (pending.global_staged && crash) {
+            global_resources->crash_install(pending.global_c_guid,
+                                            pending.global_key,
+                                            pending.global_slot);
+            pending.global_staged = false;
+        }
+        if (pending.global_staged)
+            throw std::logic_error("global pending object was not completed");
+        if (pending.global_tu_started) {
+            global_resources->finish_tu(pending.global_c_guid);
+            pending.global_tu_started = false;
+        }
+    }
+
+    void touch_namespace_on_disconnect(CStoreGuid c_guid, Namespace& space) {
         if (namespace_touch_exhausted)
             return;
         space.last_touch = next_namespace_touch;
@@ -1456,6 +1509,7 @@ struct P50ServerEndpoint::Impl {
             namespace_touch_exhausted = true;
         else
             ++next_namespace_touch;
+        global_resources->touch(c_guid);
     }
 
     bool namespace_has_live_session(CStoreGuid c_guid) const {
@@ -1500,14 +1554,25 @@ struct P50ServerEndpoint::Impl {
         if (!namespace_is_evictable(c_guid))
             throw std::logic_error(
                 "F endpoint selected a live namespace for LRU eviction");
+        for (const InputRecordKey key : input_records.namespace_keys(c_guid))
+            global_resources->release(c_guid, global_key(key.tu_seq));
         input_records.evict_namespace(c_guid);
         namespaces.at(c_guid).last_input.reset();
+    }
+
+    void release_collected_global_inputs(
+        const std::map<CStoreGuid, std::vector<InputRecordKey>>& before) {
+        for (const auto& [c_guid, keys] : before)
+            for (const InputRecordKey key : keys)
+                if (!input_records.contains(key))
+                    global_resources->release(c_guid, global_key(key.tu_seq));
     }
 
     void evict_whole_namespace(CStoreGuid c_guid) {
         if (!namespace_is_evictable(c_guid))
             throw std::logic_error(
                 "F endpoint selected a live namespace for whole-namespace eviction");
+        global_resources->evict(c_guid);
         input_records.evict_namespace(c_guid);
         if (namespaces.erase(c_guid) != 1)
             throw std::logic_error(
@@ -1571,6 +1636,7 @@ struct P50ServerEndpoint::Impl {
     }
 
     void release_pending(Pending& pending) {
+        finish_global_pending(pending, true);
         if (pending.reserved_encoded_bytes > pending_encoded_bytes ||
             pending.reserved_raw_bytes > pending_raw_bytes ||
             pending.reserved_window_bytes > decoder_window_bytes)
@@ -1807,11 +1873,23 @@ struct P50ServerEndpoint::Impl {
             evict_whole_namespace(candidates.front());
         }
         auto [position, namespace_inserted] = namespaces.try_emplace(*session.c_guid);
+        if (namespace_inserted) {
+            try {
+                global_resources->admit(
+                    *session.c_guid,
+                    static_cast<uint16_t>(config.endpoint_generation));
+            } catch (...) {
+                namespaces.erase(position);
+                throw;
+            }
+        }
         std::map<CStoreGuid, Revision>::iterator revision;
         bool revision_inserted = false;
         try {
             std::tie(revision, revision_inserted) = revisions.try_emplace(*session.c_guid);
         } catch (...) {
+            if (namespace_inserted)
+                global_resources->evict(*session.c_guid);
             if (namespace_inserted)
                 namespaces.erase(position);
             throw;
@@ -1837,6 +1915,7 @@ struct P50ServerEndpoint::Impl {
         }
         space.active_session = session.serial;
         space.last_touch = touch;
+        global_resources->touch(*session.c_guid);
         session.activated = true;
         live.activated = true;
         session.candidate_state.reset();
@@ -1862,7 +1941,7 @@ struct P50ServerEndpoint::Impl {
         }
         record(ActionType::SESSION_DISCONNECTED, session);
         space.active_session = 0;
-        touch_namespace_on_disconnect(space);
+        touch_namespace_on_disconnect(*session.c_guid, space);
         advance_revision_on_disconnect(*session.c_guid);
     }
 
@@ -1986,7 +2065,27 @@ struct P50ServerEndpoint::Impl {
         const TxBegin begin = prepared.pending.begin;
         prepared.pending.dialogue->begin(begin);
         const bool replay = prepared.replay;
-        reserve_pending(prepared.pending);
+        prepared.pending.global_c_guid = *session.c_guid;
+        try {
+            global_resources->start_tu(*session.c_guid);
+            prepared.pending.global_tu_started = true;
+            reserve_pending(prepared.pending);
+            const InputRecordKey input_key{*session.c_guid, begin.tu_seq};
+            if (!input_records.contains(input_key)) {
+                const auto slot = global_resources->first_free_staging_slot();
+                if (!slot)
+                    throw std::length_error("F endpoint staging-slot pool is exhausted");
+                prepared.pending.global_key = global_key(begin.tu_seq);
+                prepared.pending.global_slot = *slot;
+                global_resources->begin_install(
+                    *session.c_guid, prepared.pending.global_key,
+                    begin.raw_digest, begin.raw_bytes, *slot, replay);
+                prepared.pending.global_staged = true;
+            }
+        } catch (...) {
+            release_pending(prepared.pending);
+            throw;
+        }
         route.interrupted.reset();
         route.pending = std::move(prepared.pending);
         record(replay ? ActionType::ACTIVE_REPLAYED : ActionType::TX_BEGIN, session, &begin);
@@ -2137,12 +2236,24 @@ struct P50ServerEndpoint::Impl {
             !input_records.contains(input_key))
             ensure_input_capacity(*session.c_guid,
                                   materialized.begin.raw_bytes);
+        if (pending.global_staged) {
+            if (job_state == InputJobState::Open)
+                global_resources->publish(*session.c_guid, pending.global_key,
+                                          pending.global_slot,
+                                          materialized.begin.raw_digest);
+            else
+                global_resources->crash_install(*session.c_guid,
+                                                pending.global_key,
+                                                pending.global_slot);
+            pending.global_staged = false;
+        }
         const InputPublishResult publication =
             job_state == InputJobState::Open
                 ? input_records.commit_prepared(
                       std::move(materialized.prepared_input))
                 : input_records.observe_closed_job_commit(
                       std::move(materialized.prepared_input));
+        finish_global_pending(pending, false);
         completed_input = input_key;
         if (job_state == InputJobState::Open &&
             publication != InputPublishResult::NotRetainedJobClosed &&
@@ -2182,6 +2293,7 @@ struct P50ServerEndpoint::Impl {
     CompletionLog* completions = nullptr;
     ActionTrace* actions = nullptr;
     InputRecordStore input_records;
+    std::unique_ptr<GlobalResourceModel> global_resources;
     P50ServerEndpointConfig config{};
     EndpointRunRegistry endpoint_runs;
     uint64_t next_run_sequence = 1;
@@ -3234,6 +3346,8 @@ void P50ServerEndpoint::reset_store(FStoreGuid new_guid) {
             impl_->record(ActionType::SESSION_DISCONNECTED, invalidated);
         }
     }
+    while (impl_->global_resources->live_namespace_count() != 0)
+        impl_->global_resources->evict_oldest();
     impl_->live_sessions.clear();
     impl_->namespaces.clear();
     impl_->revisions.clear();
@@ -3275,7 +3389,13 @@ void P50ServerEndpoint::close_input_job(InputRecordKey key) {
 
 void P50ServerEndpoint::collect_input_garbage() {
     impl_->owner.require();
+    std::map<CStoreGuid, std::vector<InputRecordKey>> before;
+    for (const auto& [c_guid, space] : impl_->namespaces) {
+        (void)space;
+        before.emplace(c_guid, impl_->input_records.namespace_keys(c_guid));
+    }
     impl_->input_records.collect_garbage();
+    impl_->release_collected_global_inputs(before);
 }
 
 P50ServerOwnerUsage P50ServerEndpoint::owner_usage() const {

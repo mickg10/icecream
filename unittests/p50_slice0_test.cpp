@@ -163,6 +163,8 @@ void test_global_resource_owner_and_caught_slot_mutant() {
     model.touch(n1);
     model.start_tu(n0);
     model.start_tu(n1);
+    require(model.first_free_staging_slot() == std::optional<size_t>{0},
+            "global owner did not expose the first free staging slot");
     model.begin_install(n0, k0, Digest128{}, 3, 0);
     model.begin_install(n1, k1, Digest128{}, 2, 1);
     model.publish(n0, k0, 0, Digest128{});
@@ -194,6 +196,9 @@ void test_global_resource_owner_and_caught_slot_mutant() {
     require_throws<std::logic_error>(
         [&] { model.conflict(n1, k1, conflicting_digest); },
         "global owner did not make same-key content conflict fatal");
+    model.release(n1, k1);
+    require(model.resident_bytes() == 2,
+            "global owner did not release resident bytes after record collection");
 
     GlobalResourceFaults slot_mutant;
     slot_mutant.ignore_slot_ownership = true;

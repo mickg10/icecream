@@ -27,6 +27,8 @@
 
 namespace icecc::p50 {
 
+class GlobalResourceTrace;
+
 namespace sidecar {
 class P5coEndpointHandoff;
 }
@@ -347,6 +349,9 @@ struct P50ServerEndpointConfig {
     InputJobStateSelector input_job_state;
     std::optional<SidecarLaunchIdentity> sidecar_launch;
     uint64_t endpoint_generation = 1;
+    // Optional owner-visible trace for the global resource binding. The
+    // endpoint never owns this sink; callers keep it alive for the endpoint.
+    GlobalResourceTrace* global_resource_trace = nullptr;
     std::function<void(EndpointCancelPermit)> on_run_admitted;
     std::function<void(EndpointCancelPermit, EndpointTerminalResult)> on_run_terminal;
 };

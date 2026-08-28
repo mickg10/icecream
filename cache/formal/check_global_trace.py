@@ -25,6 +25,7 @@ ACTIONS = {
     "ARENA_PRESENT",
     "ARENA_PINNED",
     "ARENA_UNPINNED",
+    "ARENA_RELEASED",
     "INSTALL_CRASHED",
     "CONTENT_CONFLICT_FATAL",
     "NAMESPACE_EVICTED",
@@ -248,6 +249,14 @@ def check(path: Path) -> None:
                 raise ValueError(f"line {index}: invalid unpin")
             current["objects"][key]["state"] = "PRESENT"
 
+        elif action == "ARENA_RELEASED":
+            key = require(row, "key", index)
+            if key not in KEYS or current["objects"][key]["state"] not in {
+                "PRESENT", "PINNED"
+            }:
+                raise ValueError(f"line {index}: RELEASED requires a resident object")
+            current["objects"][key] = {"state": "ABSENT", "content": None}
+
         elif action == "INSTALL_CRASHED":
             key = require(row, "key", index)
             slot = require(row, "slot", index)
@@ -349,4 +358,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
