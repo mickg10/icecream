@@ -1190,12 +1190,18 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     if (!arm.valid())
         return source_transfer_error(1);
 
-    const ProfileId profile = arm.cache_profile == CACHE_PROFILE_ZSTD_ROUTE
-                                  ? ProfileId::Z3_LONG
-                                  : arm.cache_profile == CACHE_PROFILE_ZSTD_TU
-                                        ? ProfileId::ZSTD_TU
-                                        : ProfileId::P29;
-    if (profile == ProfileId::P29)
+    ProfileId profile = ProfileId::ZSTD_TU;
+    if (arm.cache_profile == CACHE_PROFILE_ZSTD_ROUTE)
+        profile = ProfileId::Z3_LONG;
+    else if (arm.cache_profile == CACHE_PROFILE_P29)
+        profile = ProfileId::P29;
+    else if (arm.cache_profile == CACHE_PROFILE_ZSTD_TU)
+        profile = ProfileId::ZSTD_TU;
+#if defined(ICECC_P50_WITH_LIBBSC)
+    else if (arm.cache_profile == CACHE_PROFILE_GRZ)
+        profile = ProfileId::GRZ;
+#endif
+    else
         return source_transfer_error(2);
     const auto source_bytes = read_source_fd(
         source.get(), config_.endpoint_caps.zstd.max_raw_bytes);

@@ -7,8 +7,24 @@ namespace icecc::p50 {
 namespace {
 
 bool supported_profile(ProfileId profile) noexcept {
-    return profile == ProfileId::P29 || profile == ProfileId::ZSTD_TU ||
-           profile == ProfileId::Z3_LONG;
+    if (profile == ProfileId::P29 || profile == ProfileId::ZSTD_TU ||
+        profile == ProfileId::Z3_LONG)
+        return true;
+#if defined(ICECC_P50_WITH_LIBBSC)
+    if (profile == ProfileId::GRZ)
+        return true;
+#endif
+    return false;
+}
+
+bool route_history_profile(ProfileId profile) noexcept {
+    if (profile == ProfileId::P29 || profile == ProfileId::Z3_LONG)
+        return true;
+#if defined(ICECC_P50_WITH_LIBBSC)
+    if (profile == ProfileId::GRZ)
+        return true;
+#endif
+    return false;
 }
 
 ZstdSourceTransferConfig sender_config(const P50RouteOwnerConfig& owner_config,
@@ -74,7 +90,7 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
         co_return invalid();
     Sender& sender = get_or_create(relationship, request, deadline);
     ZstdSourceTransferResult result;
-    if (relationship.profile == ProfileId::Z3_LONG || relationship.profile == ProfileId::P29) {
+    if (route_history_profile(relationship.profile)) {
         result = co_await sender->transfer_route(remote, request, deadline, source);
     } else {
         // ZSTD_TU is intentionally one-shot.  Keep its owner only for this
@@ -99,7 +115,7 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
         co_return invalid();
     Sender& sender = get_or_create(relationship, request, deadline);
     ZstdSourceTransferResult result;
-    if (relationship.profile == ProfileId::Z3_LONG || relationship.profile == ProfileId::P29) {
+    if (route_history_profile(relationship.profile)) {
         result = co_await sender->transfer_route(
             std::move(connection), request, deadline, source);
     } else {

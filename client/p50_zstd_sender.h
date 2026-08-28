@@ -80,10 +80,12 @@ using ConnectedFdFactory =
     std::function<int(std::chrono::steady_clock::time_point deadline)>;
 
 // C-side source transfer.  The historical class name is retained for source
-// compatibility; endpoint_caps.profile selects the exact P29, ZSTD_TU, or
-// ZSTD_ROUTE dialogue and the result records that selection. ZSTD_TU senders
+// compatibility; endpoint_caps.profile selects the exact P29, ZSTD_TU,
+// ZSTD_ROUTE, or dependency-enabled GRZ dialogue and records that selection.
+// ZSTD_TU senders
 // are one-shot because each transfer owns an independent namespace, while
-// P29/ZSTD_ROUTE retain their relationship authority for sequential transfers.
+// P29/ZSTD_ROUTE and dependency-enabled GRZ retain their relationship authority
+// for sequential transfers.
 class P50ZstdSourceSender {
 public:
     P50ZstdSourceSender(CStoreGuid c_store_guid, PrepareRequestKey request,
@@ -104,7 +106,7 @@ public:
     boost::asio::awaitable<ZstdSourceTransferResult> transfer(
         ConnectedFdFactory connection, std::span<const uint8_t> source);
 
-    // A long-lived ZSTD_ROUTE owner must bind every operation to the exact
+    // A long-lived route-profile owner must bind every operation to the exact
     // assignment which produced it and to that operation's current deadline.
     // Unlike the compatibility overloads above, these calls never synthesize
     // the next request token and never reuse the constructor deadline.

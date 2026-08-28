@@ -33,6 +33,16 @@ bool valid_deadline(Clock::time_point deadline, Clock::duration maximum_duration
            deadline - now <= maximum_duration;
 }
 
+bool route_history_profile(ProfileId profile) noexcept {
+    if (profile == ProfileId::P29 || profile == ProfileId::Z3_LONG)
+        return true;
+#if defined(ICECC_P50_WITH_LIBBSC)
+    if (profile == ProfileId::GRZ)
+        return true;
+#endif
+    return false;
+}
+
 std::optional<std::vector<uint8_t>> read_complete_fd(int fd, uint64_t limit) {
     if (fd < 0) return std::nullopt;
     struct stat info {};
@@ -152,8 +162,7 @@ struct P50ZstdSourceSender::Impl {
     }
 
     PrepareRequestKey begin_transfer() {
-        if (config.endpoint_caps.profile == ProfileId::ZSTD_TU ||
-            config.endpoint_caps.profile == ProfileId::GRZ) {
+        if (config.endpoint_caps.profile == ProfileId::ZSTD_TU) {
             if (used) throw std::logic_error("sender is one-shot");
             used = true;
             return request;
@@ -299,8 +308,7 @@ P50ZstdSourceSender::transfer_bytes(
     if (!valid_deadline(deadline, impl_->config.maximum_duration, Clock::now()))
         co_return impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
     if (!nonzero_request(request) ||
-        (explicit_route && impl_->config.endpoint_caps.profile != ProfileId::Z3_LONG &&
-         impl_->config.endpoint_caps.profile != ProfileId::P29))
+        (explicit_route && !route_history_profile(impl_->config.endpoint_caps.profile)))
         co_return impl_->invalid(ZstdSourceTransferStatus::InvalidRequest);
     if (std::holds_alternative<boost::asio::ip::tcp::endpoint>(target)) {
         const auto remote = std::get<boost::asio::ip::tcp::endpoint>(target);
