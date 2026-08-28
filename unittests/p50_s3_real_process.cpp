@@ -191,8 +191,10 @@ pid_t start_server(const char* self, FStoreGuid f_guid,
         ::close(ready[0]);
         const std::string guid = std::to_string(f_guid.bytes[15]);
         const std::string mode = crash_installing ? "--crash" : "--normal";
-        ::dup2(ready[1], 3);
-        ::close(ready[1]);
+        if (ready[1] != 3) {
+            if (::dup2(ready[1], 3) != 3) ::_exit(126);
+            ::close(ready[1]);
+        }
         ::execl(self, self, "--server", mode.c_str(), guid.c_str(), retained.c_str(),
                 static_cast<char*>(nullptr));
         ::_exit(127);
