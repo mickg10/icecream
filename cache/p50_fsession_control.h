@@ -188,8 +188,26 @@ enum class InboundDisposition : uint8_t {
 
 class FSessionInboundControl {
 public:
-    // Classify one already-codec-validated inbound Daemon->Sidecar envelope.
-    // canonical_bytes must be the exact encoded frame, for byte-identical replay.
+    // Sidecar-side acceptor: no row exists until an accepted OperationOffer
+    // (the sole row-creation frame); expects Daemon->Sidecar frames.
+    FSessionInboundControl() noexcept = default;
+
+    // Daemon-side acceptor: the daemon minted the operation, so its row and
+    // identity are pre-bound; expects Sidecar->Daemon frames starting at seq 1.
+    [[nodiscard]] static FSessionInboundControl
+    daemon_bound(const FSessionOperationIdentity& identity) noexcept {
+        FSessionInboundControl in;
+        in.identity_ = identity;
+        in.row_created_ = true;
+        in.expected_direction_ = FSessionControlDirection::SidecarToDaemon;
+        return in;
+    }
+
+    // Classify one already-codec-validated inbound envelope for this acceptor's
+    // expected direction. canonical_bytes must be the exact encoded frame, for
+    // byte-identical replay comparison. A wrong-direction frame is rejected
+    // before any sequence/row logic (direction legality is enforced here as
+    // well as in the codec).
     InboundDisposition classify(const FSessionControlEnvelope& envelope,
                                 std::span<const uint8_t> canonical_bytes);
 
@@ -204,7 +222,9 @@ public:
     void retire() noexcept { retired_ = true; }
 
 private:
-    FSessionOperationIdentity identity_{}; // bound once by the accepted offer
+    FSessionOperationIdentity identity_{}; // bound by the offer / at daemon mint
+    FSessionControlDirection expected_direction_ =
+        FSessionControlDirection::DaemonToSidecar;
     bool row_created_ = false;
     bool retired_ = false;
     uint64_t next_expected_ = 1;

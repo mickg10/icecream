@@ -99,6 +99,66 @@ void test_inbound_sequencer() {
           "retired operation never revived");
 }
 
+// Build an encoded Sidecar->Daemon frame for the daemon-side acceptor tests.
+std::pair<FSessionControlEnvelope, std::optional<std::vector<uint8_t>>>
+sidecar_frame(const FSessionOperationIdentity& id, SidecarToDaemonType type,
+              uint64_t seq, std::vector<uint8_t> payload) {
+    FSessionControlEnvelope e;
+    e.identity = id;
+    e.direction = FSessionControlDirection::SidecarToDaemon;
+    e.message_type = static_cast<uint16_t>(type);
+    e.sequence = seq;
+    e.payload = std::move(payload);
+    return {e, encode_fsession_control(e)};
+}
+
+void test_direction_enforced_per_frame() {
+    // Boundary validation: after row creation, a wrong-direction envelope with a
+    // matching identity and the expected sequence must still be rejected.
+    const auto id = make_identity();
+    FSessionInboundControl in; // sidecar-side: expects DaemonToSidecar
+    auto [offer_e, offer_b] =
+        daemon_frame(id, DaemonToSidecarType::OperationOffer, 1, {1});
+    check(in.classify(offer_e, *offer_b) == InboundDisposition::AcceptedNew,
+          "offer accepted (direction test setup)");
+    auto [sd_e, sd_b] =
+        sidecar_frame(id, SidecarToDaemonType::OperationAccepted, 2, {});
+    check(sd_b.has_value(), "encode wrong-direction frame");
+    check(in.classify(sd_e, *sd_b) == InboundDisposition::StaleWrongIdentity,
+          "wrong-direction frame rejected after row creation");
+    check(in.next_expected() == 2, "wrong-direction frame consumed no sequence");
+}
+
+void test_daemon_bound_acceptor() {
+    const auto id = make_identity();
+    auto in = FSessionInboundControl::daemon_bound(id);
+    check(in.row_created(), "daemon-bound row pre-exists");
+
+    auto [acc_e, acc_b] =
+        sidecar_frame(id, SidecarToDaemonType::OperationAccepted, 1, {7});
+    check(acc_b.has_value(), "encode OperationAccepted");
+    check(in.classify(acc_e, *acc_b) == InboundDisposition::AcceptedNew,
+          "OperationAccepted(1) accepted");
+    check(in.classify(acc_e, *acc_b) == InboundDisposition::ExactReplay,
+          "identical OperationAccepted replays");
+
+    auto [gap_e, gap_b] =
+        sidecar_frame(id, SidecarToDaemonType::TerminalObservation, 4, {});
+    check(in.classify(gap_e, *gap_b) == InboundDisposition::Gap,
+          "seq 4 (next 2) -> Gap on daemon side");
+
+    auto other = make_identity();
+    other.assignment_epoch = 777;
+    auto [wr_e, wr_b] =
+        sidecar_frame(other, SidecarToDaemonType::InputCommitted, 2, {});
+    check(in.classify(wr_e, *wr_b) == InboundDisposition::StaleWrongIdentity,
+          "wrong identity stale on daemon side");
+
+    auto [dd_e, dd_b] = daemon_frame(id, DaemonToSidecarType::OpCancel, 2, {});
+    check(in.classify(dd_e, *dd_b) == InboundDisposition::StaleWrongIdentity,
+          "daemon-direction frame rejected by daemon-side acceptor");
+}
+
 void test_outbound_slots() {
     FSessionOutboundControl out(2); // bounded to 2 live slots
 
@@ -209,6 +269,8 @@ int main() {
           "incomplete identity rejected");
 
     test_inbound_sequencer();
+    test_direction_enforced_per_frame();
+    test_daemon_bound_acceptor();
     test_outbound_slots();
 
     if (g_fail != 0) {

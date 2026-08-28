@@ -204,6 +204,11 @@ InboundDisposition FSessionInboundControl::classify(
     if (retired_)
         return InboundDisposition::StaleWrongIdentity;
 
+    // Direction legality is enforced on EVERY frame, not only at row creation:
+    // a wrong-direction envelope is rejected before any sequence/row logic.
+    if (e.direction != expected_direction_)
+        return InboundDisposition::StaleWrongIdentity;
+
     if (!row_created_) {
         // OperationOffer(seq==1) is the SOLE row-creation frame. Anything else
         // (an early OpCancel, a mis-sequenced offer) is phase-invalid and mints
