@@ -25,7 +25,7 @@ from pathlib import Path
 
 
 SCHEMA = "icecream-s4-real-cell-v1"
-BASE_SHA = "b2027f4b1e536700b99923766e5937163b3bea29"
+BASE_SHA = "32b25d6ecbfd52cd0b68d167c362f210c98eaded"
 P43_SHA = "cd74801e0fa4e83e3ae254ca1d7fe98642f36b89"
 # P50 must be supplied as a build of BASE_SHA. --p50-local-root stages that
 # exact build into a private q3 /tmp root for the cell run.
@@ -45,11 +45,11 @@ ROLE_HASHES = {
         "E": "aab94b6ea8f41335de807f814d24a56e827ce5efaf8b06797a365699e83b36cb",
     },
     "50": {
-        "S": "7d657bd50860186f5e205d3d7b9943340c2cb97110a2e19da8b41ceafc1f58b0",
-        "F": "e106e323cde9d086aa8ff17b35377558e945ba896bffbb3d789025fe1a349adb",
-        "C": "ee583a189db8daa5e295d7c8505ab55ff5f91014078758c7baddff4a49b2dfe0",
-        "E": "1082d3007d28ae9cbf7900e21f998ac8881fad548d26c809ed6b00044b67c700",
-        "X": "a4494f1914220cb0482e6d5eba252bbf4f0e7cb04e93f2ca939811efaa60a718",
+        "S": "8857b14179559d0efc9b588c29a6f0fe6c922c9f40d9fc2de498887257931212",
+        "F": "405f9e61c93b6a1b5ba2265bdd6153dbf7898093cd2aeb1081e8006abe5cf907",
+        "C": "a7edf79e22497e70be473f29d592ab1e4d06ed6958ca48339d5f84c44f73a2cd",
+        "E": "ee7d30b240c38bccf66d4afcdd45993f115a01d4a2fb4e9143d38596609d2ba4",
+        "X": "07268be8dd8801bd0c20a2a59d2fb9e8bae8a0c64a09bb53c37a31a72972318b",
     },
 }
 
@@ -379,7 +379,8 @@ def _run_cell(cell: dict[str, str], args: argparse.Namespace, out_root: Path) ->
         stderr = (exc.stderr or "") if isinstance(exc.stderr, str) else ""
     except OSError as exc:
         error = f"ssh-error:{type(exc).__name__}"
-        stdout = ""; stderr = str(exc)
+        stdout = ""
+        stderr = str(exc)
     else:
         stdout, stderr = completed.stdout, completed.stderr
     (cell_dir / "ssh.stdout").write_text(stdout, encoding="utf-8", errors="replace")
