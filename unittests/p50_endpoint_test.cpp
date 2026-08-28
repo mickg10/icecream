@@ -2250,7 +2250,9 @@ asio::awaitable<void> raw_incompatible_hello(tcp::endpoint remote, CStoreGuid c_
     co_await socket.async_connect(remote, asio::use_awaitable);
     SessionHello hello;
     hello.c_store_guid = c_guid;
-    hello.supported_profiles = profile_bit(ProfileId::P29);
+    // P29 is now a runnable operational profile; use the reserved GRZ label
+    // for this deliberately incompatible HELLO fixture.
+    hello.supported_profiles = profile_bit(ProfileId::GRZ);
     co_await raw_write(socket, hello);
     const Frame terminal = co_await raw_read(socket, hello.limits.max_frame_payload);
     coordination.second_finished = true;

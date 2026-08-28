@@ -24,9 +24,9 @@ void check(bool value, const char* expression) {
 
 #define CHECK(expression) check((expression), #expression)
 
-P50RouteOwnerConfig config() {
+P50RouteOwnerConfig config(ProfileId profile = ProfileId::Z3_LONG) {
     P50RouteOwnerConfig result;
-    result.endpoint_caps.profile = ProfileId::Z3_LONG;
+    result.endpoint_caps.profile = profile;
     result.endpoint_caps.supported_profiles = kOperationalProfileMask;
     result.endpoint_caps.zstd.max_raw_bytes = 1U << 20;
     result.endpoint_caps.zstd.max_encoded_body_bytes = 1U << 20;
@@ -226,10 +226,85 @@ void test_relationship_validation() {
     CHECK(owner.owner_count() == 0);
 }
 
+void test_p29_relationship_owner() {
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    EndpointCaps server_caps;
+    server_caps.profile = ProfileId::P29;
+    server_caps.supported_profiles = kOperationalProfileMask;
+    P50ServerEndpoint server(Id128::from_u64(240), server_caps, nullptr, nullptr,
+                             P50ServerEndpointConfig{
+                                 .input_job_state = [](CStoreGuid, const TxBegin&,
+                                                       const TxCommit&,
+                                                       std::span<const uint8_t>) {
+                                     return InputJobState::Open;
+                                 }});
+    P50CRouteOwner owner(config(ProfileId::P29));
+    const auto route = relationship(141, 241, 1, ProfileId::P29);
+    const std::vector<uint8_t> repeated{'p', '2', '9', '\n', 'p', '2', '9', '\n'};
+
+    auto first = route_call(context, owner, server, acceptor, route, {7101, 1}, repeated);
+    CHECK(first.status == ZstdSourceTransferStatus::Committed);
+    CHECK(first.committed_input->tu_seq.value == 0);
+    auto second = route_call(context, owner, server, acceptor, route, {7101, 2}, repeated);
+    CHECK(second.status == ZstdSourceTransferStatus::Committed);
+    CHECK(second.committed_input->tu_seq.value == 1);
+
+    // A failed route attempt leaves the exact prepared request available for
+    // the bounded retry path and cannot consume the next TU sequence.
+    unsigned failed_connections = 0;
+    context.restart();
+    auto failed = asio::co_spawn(
+        context,
+        owner.transfer(route, {7101, 3},
+                       ConnectedFdFactory{[&failed_connections](auto) {
+                           ++failed_connections;
+                           return -1;
+                       }},
+                       std::chrono::steady_clock::now() + std::chrono::seconds(10),
+                       repeated),
+        asio::use_future);
+    context.run();
+    CHECK(failed.get().status == ZstdSourceTransferStatus::RetryExhausted);
+    CHECK(failed_connections == 2);
+    auto retried = route_call(context, owner, server, acceptor, route, {7101, 3}, repeated);
+    CHECK(retried.status == ZstdSourceTransferStatus::Committed);
+    CHECK(retried.committed_input->tu_seq.value == 2);
+
+    // A different relationship is isolated and starts at TU0; an unsupported
+    // profile fails closed without allocating an owner.
+    const auto different = relationship(142, 241, 1, ProfileId::P29);
+    auto isolated = route_call(context, owner, server, acceptor, different,
+                               {7102, 1}, repeated);
+    CHECK(isolated.status == ZstdSourceTransferStatus::Committed);
+    CHECK(isolated.committed_input->tu_seq.value == 0);
+    const auto unsupported = relationship(143, 241, 1, ProfileId::GRZ);
+    context.restart();
+    auto rejected = asio::co_spawn(
+        context,
+        owner.transfer(unsupported, {7103, 1}, acceptor.local_endpoint(),
+                        std::chrono::steady_clock::now() + std::chrono::seconds(10), repeated),
+        asio::use_future);
+    context.run();
+    CHECK(rejected.get().status == ZstdSourceTransferStatus::InvalidRequest);
+
+    // Resetting the F generation drops both P29 owners; the replacement starts
+    // from TU0 and does not inherit either relationship's route history.
+    owner.reset_f_store(Id128::from_u64(241), 2);
+    CHECK(owner.owner_count() == 0);
+    server.reset_store(Id128::from_u64(242));
+    const auto replacement = relationship(141, 242, 2, ProfileId::P29);
+    auto reset = route_call(context, owner, server, acceptor, replacement,
+                            {7104, 1}, repeated);
+    CHECK(reset.status == ZstdSourceTransferStatus::Committed);
+    CHECK(reset.committed_input->tu_seq.value == 0);
+}
+
 }  // namespace
 
 int main() {
     test_source_transfer_operation_wire();
     test_long_lived_relationship_owner();
     test_relationship_validation();
+    test_p29_relationship_owner();
 }

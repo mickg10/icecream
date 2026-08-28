@@ -299,7 +299,8 @@ P50ZstdSourceSender::transfer_bytes(
     if (!valid_deadline(deadline, impl_->config.maximum_duration, Clock::now()))
         co_return impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
     if (!nonzero_request(request) ||
-        (explicit_route && impl_->config.endpoint_caps.profile != ProfileId::Z3_LONG))
+        (explicit_route && impl_->config.endpoint_caps.profile != ProfileId::Z3_LONG &&
+         impl_->config.endpoint_caps.profile != ProfileId::P29))
         co_return impl_->invalid(ZstdSourceTransferStatus::InvalidRequest);
     if (std::holds_alternative<boost::asio::ip::tcp::endpoint>(target)) {
         const auto remote = std::get<boost::asio::ip::tcp::endpoint>(target);
