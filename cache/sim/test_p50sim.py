@@ -13,6 +13,10 @@ def write_canonical(path: Path, value: object) -> None:
     path.write_bytes(json.dumps(value, sort_keys=True, separators=(",", ":")).encode())
 
 
+def read_jsonl(path: Path) -> list[dict[str, object]]:
+    return [json.loads(line) for line in path.read_bytes().splitlines()]
+
+
 def scenario_tree(tmp_path: Path) -> Path:
     tmp_path.mkdir(parents=True)
     payload = b"an authenticated production Protocol-50 input\n"
@@ -69,6 +73,13 @@ def test_real_endpoint_writes_authenticated_trace(tmp_path: Path) -> None:
     assert summary["client_status"] == "Committed"
     assert summary["server_status"] == "Completed"
     assert int(summary["action_records"]) > 0
+    c_rows = read_jsonl(tmp_path / "output" / "c-action-trace.jsonl")
+    f_rows = read_jsonl(tmp_path / "output" / "f-action-trace.jsonl")
+    produced_rows = read_jsonl(tmp_path / "output" / "actions.jsonl")
+    assert c_rows and f_rows
+    assert all(row["actor"] == "C" for row in c_rows)
+    assert all(row["actor"] == "F" for row in f_rows)
+    assert len(c_rows) + len(f_rows) == len(produced_rows)
 
 
 def test_input_digest_mismatch_rejects_execution(tmp_path: Path) -> None:

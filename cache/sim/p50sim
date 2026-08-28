@@ -68,6 +68,92 @@ def canonical_jsonl(path: Path) -> list[dict[str, object]]:
     return rows
 
 
+def action_identity(row: dict[str, object]) -> tuple[object, ...]:
+    """The existing Protocol-50 transaction identity carried by each action."""
+    return tuple(row.get(field) for field in (
+        "c_store_guid", "f_store_guid", "history_nonce", "rel_seq", "tu_seq",
+        "transaction_digest", "raw_digest"))
+
+
+def combine_process_traces(c_rows: list[dict[str, object]],
+                           f_rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Merge role-local traces at the existing protocol action boundaries.
+
+    Each role's order is retained.  The only cross-role decisions are the
+    protocol's existing identity/order rules: C opens a transaction before F
+    accepts that same transaction, F completes it before C accepts the commit,
+    and a session disconnect follows that acceptance.  This keeps the reducer
+    input deterministic without adding an event schema or wall-clock ordering.
+    """
+    if any(row.get("actor") != "C" for row in c_rows):
+        raise ValueError("C action trace contains a non-C action")
+    if any(row.get("actor") != "F" for row in f_rows):
+        raise ValueError("F action trace contains a non-F action")
+    merged: list[dict[str, object]] = []
+    c_index = f_index = 0
+
+    def transaction(row: dict[str, object]) -> bool:
+        return row.get("action") in {
+            "TX_BEGIN", "ACTIVE_REPLAYED", "DICT_COMPLETE", "NEED_RECORDED",
+            "OBJECT_APPLIED", "BODY_COMPLETE", "INPUT_MATERIALIZED",
+            "INPUT_COMMITTED", "COMMIT_ACCEPTED", "LOST_COMMIT_ACCEPTED",
+        }
+
+    while c_index < len(c_rows) or f_index < len(f_rows):
+        c = c_rows[c_index] if c_index < len(c_rows) else None
+        f = f_rows[f_index] if f_index < len(f_rows) else None
+        if f is None:
+            merged.append(c)
+            c_index += 1
+            continue
+        if c is None:
+            merged.append(f)
+            f_index += 1
+            continue
+        f_action = f.get("action")
+        c_action = c.get("action")
+        if f_action in {"SESSION_OPENED", "SESSION_REPLACED", "HISTORY_RESET"}:
+            merged.append(f)
+            f_index += 1
+        elif f_action == "SESSION_DISCONNECTED":
+            # The F session can close only after C has observed the durable
+            # commit when that acceptance is present in the C trace.
+            if c_action in {"COMMIT_ACCEPTED", "LOST_COMMIT_ACCEPTED"}:
+                merged.append(c)
+                c_index += 1
+            else:
+                merged.append(f)
+                f_index += 1
+        elif c_action == "TX_BEGIN" and f_action == "TX_BEGIN" and \
+                action_identity(c) == action_identity(f):
+            merged.append(c)
+            c_index += 1
+        elif c_action in {"COMMIT_ACCEPTED", "LOST_COMMIT_ACCEPTED"} and \
+                transaction(f) and action_identity(c) == action_identity(f):
+            merged.append(f)
+            f_index += 1
+        elif c_action == "TX_BEGIN" and transaction(f):
+            # F's next transaction action belongs to an earlier REL_SEQ; it
+            # must drain before C can begin the next one.
+            merged.append(f)
+            f_index += 1
+        elif f_action == "TX_BEGIN" and c_action == "TX_BEGIN":
+            # A distinct F transaction is the next accepted route cursor.
+            merged.append(f)
+            f_index += 1
+        elif c_action in {"COMMIT_ACCEPTED", "LOST_COMMIT_ACCEPTED"} and \
+                action_identity(c) != action_identity(f):
+            merged.append(c)
+            c_index += 1
+        elif c_action == "TX_BEGIN":
+            merged.append(c)
+            c_index += 1
+        else:
+            merged.append(f)
+            f_index += 1
+    return merged
+
+
 def child(root: Path, name: object) -> Path:
     if not isinstance(name, str) or not name or Path(name).is_absolute():
         raise ValueError("scenario paths must be relative strings")
@@ -132,9 +218,15 @@ def main(argv: list[str]) -> int:
         output.mkdir(parents=True, exist_ok=True)
         actions = output / "actions.jsonl"
         summary = output / "execution.json"
+        c_process_trace = output / "c-action-trace.jsonl"
+        f_process_trace = output / "f-action-trace.jsonl"
+        execution_environment = os.environ.copy()
+        execution_environment["ICECC_P50_C_ACTION_TRACE"] = str(c_process_trace)
+        execution_environment["ICECC_P50_F_ACTION_TRACE"] = str(f_process_trace)
         result = subprocess.run(
             [str(binary), "--input", str(input_path), "--actions", str(actions), "--summary", str(summary)],
             stdin=subprocess.DEVNULL,
+            env=execution_environment,
             check=False,
         )
         if result.returncode:
@@ -144,7 +236,12 @@ def main(argv: list[str]) -> int:
         # The C++ endpoint writes the authoritative Protocol-50 trace. Keep a
         # separate digest witness so later adapters cannot substitute a fixture.
         produced_action_sha, _ = digest(actions)
-        if canonical_jsonl(actions) != expected_actions:
+        produced_actions = canonical_jsonl(actions)
+        c_process_actions = canonical_jsonl(c_process_trace)
+        f_process_actions = canonical_jsonl(f_process_trace)
+        if combine_process_traces(c_process_actions, f_process_actions) != produced_actions:
+            raise ValueError("deterministic C/F action merge differs from endpoint reducer trace")
+        if produced_actions != expected_actions:
             raise ValueError("production replay differs from canonical live action trace")
         summary_value = json.loads(summary.read_bytes())
         if not isinstance(summary_value, dict):

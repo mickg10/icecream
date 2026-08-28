@@ -1,12 +1,16 @@
 #include "p50_actions.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <map>
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace icecc::p50 {
 namespace {
@@ -83,6 +87,59 @@ void clear_f_pending(FCheckerState& state) {
 }
 
 }  // namespace
+
+void ActionTrace::record(ActionRecord record) noexcept {
+    if (!valid_)
+        return;
+    if (records_.size() >= max_records_) {
+        valid_ = false;
+        return;
+    }
+    try {
+        records_.push_back(std::move(record));
+        const ActionRecord& emitted = records_.back();
+        const char* variable = emitted.actor == ActorSide::C
+                                   ? "ICECC_P50_C_ACTION_TRACE"
+                                   : "ICECC_P50_F_ACTION_TRACE";
+        const char* path = std::getenv(variable);
+        if (path == nullptr || *path == '\0')
+            path = std::getenv("ICECC_P50_ACTION_TRACE");
+        if (path == nullptr || *path == '\0')
+            return;
+        const std::string line = action_jsonl(emitted) + '\n';
+        const int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC |
+                                         O_NOFOLLOW,
+                               0600);
+        if (fd < 0)
+            throw std::runtime_error("cannot open Protocol-50 action trace sink");
+        size_t offset = 0;
+        while (offset != line.size()) {
+            const ssize_t written = ::write(fd, line.data() + offset,
+                                             line.size() - offset);
+            if (written > 0) {
+                offset += static_cast<size_t>(written);
+                continue;
+            }
+            if (written < 0 && errno == EINTR)
+                continue;
+            (void)::close(fd);
+            throw std::runtime_error("cannot write Protocol-50 action trace sink");
+        }
+        if (::close(fd) != 0)
+            throw std::runtime_error("cannot close Protocol-50 action trace sink");
+    } catch (...) {
+        valid_ = false;
+    }
+}
+
+bool action_trace_sink_enabled() noexcept {
+    const char* c_path = std::getenv("ICECC_P50_C_ACTION_TRACE");
+    const char* f_path = std::getenv("ICECC_P50_F_ACTION_TRACE");
+    const char* shared_path = std::getenv("ICECC_P50_ACTION_TRACE");
+    return (c_path != nullptr && *c_path != '\0') ||
+           (f_path != nullptr && *f_path != '\0') ||
+           (shared_path != nullptr && *shared_path != '\0');
+}
 
 std::string_view action_name(ActionType action) {
     switch (action) {

@@ -1120,6 +1120,10 @@ struct P50ClientEndpoint::Impl {
           run_identity_seed(std::move(run_identity_value)),
           on_run_admitted(std::move(admitted_callback)),
           on_run_terminal(std::move(terminal_callback)) {
+        if (actions == nullptr && action_trace_sink_enabled()) {
+            owned_actions = std::make_unique<ActionTrace>(1024);
+            actions = owned_actions.get();
+        }
         if (!preparation)
             throw std::invalid_argument("C endpoint requires its preparation authority");
         c_guid = preparation->c_store_guid();
@@ -1285,6 +1289,7 @@ struct P50ClientEndpoint::Impl {
     PreparedZstdTUPtr queued;
     PreparedTuHandle queued_handle;
     CompletionLog* completions = nullptr;
+    std::unique_ptr<ActionTrace> owned_actions;
     ActionTrace* actions = nullptr;
     EndpointRunRegistry endpoint_runs;
     std::optional<EndpointRunIdentity> run_identity_seed;
@@ -1380,6 +1385,10 @@ struct P50ServerEndpoint::Impl {
               global_resource_limits(config_value.owner_limits), GlobalResourceFaults{},
               config_value.global_resource_trace)),
           config(std::move(config_value)) {
+        if (actions == nullptr && action_trace_sink_enabled()) {
+            owned_actions = std::make_unique<ActionTrace>(1024);
+            actions = owned_actions.get();
+        }
         if (f_guid == FStoreGuid{})
             throw std::invalid_argument("F endpoint GUID zero is reserved");
         if (config.protocol_error_code == 0)
@@ -2296,6 +2305,7 @@ struct P50ServerEndpoint::Impl {
     uint64_t pending_raw_bytes = 0;
     uint64_t decoder_window_bytes = 0;
     CompletionLog* completions = nullptr;
+    std::unique_ptr<ActionTrace> owned_actions;
     ActionTrace* actions = nullptr;
     InputRecordStore input_records;
     std::unique_ptr<GlobalResourceModel> global_resources;

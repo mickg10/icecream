@@ -60,19 +60,7 @@ public:
     explicit ActionTrace(size_t max_records = std::numeric_limits<size_t>::max())
         : max_records_(max_records) {}
 
-    void record(ActionRecord record) noexcept {
-        if (!valid_)
-            return;
-        if (records_.size() >= max_records_) {
-            valid_ = false;
-            return;
-        }
-        try {
-            records_.push_back(std::move(record));
-        } catch (...) {
-            valid_ = false;
-        }
-    }
+    void record(ActionRecord record) noexcept;
     [[nodiscard]] const std::vector<ActionRecord>& records() const { return records_; }
     [[nodiscard]] bool valid() const { return valid_; }
     void clear() {
@@ -89,5 +77,6 @@ private:
 std::string action_jsonl(const ActionRecord& record);
 void write_action_trace(const ActionTrace& trace, const std::string& path);
 std::optional<std::string> check_action_trace(std::span<const ActionRecord> records);
+[[nodiscard]] bool action_trace_sink_enabled() noexcept;
 
 }  // namespace icecc::p50
