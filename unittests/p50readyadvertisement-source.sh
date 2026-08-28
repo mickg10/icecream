@@ -57,13 +57,15 @@ require 'p50readyadvertisement-source.sh' "$src/unittests/Makefile.am" \
 require 'p50readyadvertisement-mutants.sh' "$src/unittests/Makefile.am" \
     'behavioral mutant gate is registered and distributed'
 
-# Mechanism-only checkpoint: daemon Login must remain canonical absence until
-# the supervised private relationship and transition application are wired.
-count=$(grep -F -c 'apply_inert_cache_advertisement' "$src/daemon/main.cpp" || true)
+# The supervised READY projection is now wired through the daemon's canonical
+# snapshot application at definition, login, and shutdown reannouncement.
+# Keep this source gate aligned with the implemented behavior: requiring the
+# old inert-only helper would reject the genuinely live route advertisement.
+count=$(grep -F -c 'apply_cache_advertisement' "$src/daemon/main.cpp" || true)
 if [ "$count" -ne 3 ]; then
-    echo "FAIL: READY mechanism checkpoint changed inert daemon Login ($count anchors)" >&2
+    echo "FAIL: READY daemon snapshot application changed ($count anchors)" >&2
     exit 1
 fi
-echo 'ok - daemon Login remains inert at the mechanism-only checkpoint'
+echo 'ok - daemon Login uses the canonical supervised snapshot application'
 
 echo 'PASS: pure READY advertisement source gates hold'

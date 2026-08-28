@@ -351,13 +351,14 @@ static void test_usecs_legacy_bytes()
     const Bytes p50 = encode_usecs_frame(50, use);
     REQUIRE(!p49.empty() && !p50.empty(), "UseCS encodes at both P49 and P50");
     /* PROTOCOL_VERSION_ASSIGNMENT_IDENTITY and PROTOCOL_VERSION_CACHE_ADVERTISEMENT
-       are the same value (50): P50 UseCS carries both the four-word assignment
-       identity (pre-existing) and this three-word S2 cache-handoff tail, so it
-       is seven words larger than P49 -- not three -- with an unchanged prefix. */
-    REQUIRE(p50.size() == p49.size() + 7 * sizeof(uint32_t)
+       are the same value (50): P50 UseCS carries both the eight-word assignment
+       identity (epoch, nonce, C GUID, TU sequence) and this three-word S2
+       cache-handoff tail, so it is eleven words larger than P49 -- not three --
+       with an unchanged prefix. */
+    REQUIRE(p50.size() == p49.size() + 11 * sizeof(uint32_t)
                 && std::equal(p49.begin() + sizeof(uint32_t), p49.end(),
                               p50.begin() + sizeof(uint32_t)),
-            "P50 UseCS appends exactly seven words to the unchanged P49 body");
+            "P50 UseCS appends exactly eleven words to the unchanged P49 body");
 
     Pair old_pair = make_pair(49);
     REQUIRE(old_pair.left->send_msg(use),
@@ -581,8 +582,10 @@ static void test_usecs_identity_binding_law()
             uint32_t network_job_id = htonl(row.job_id);
             std::memcpy(frame.data() + 8, &network_job_id, sizeof(network_job_id));
         }
-        set_tail_word64(frame, 7, row.epoch);
-        set_tail_word64(frame, 5, row.nonce);
+        // The three cache words are followed by TU sequence (2), C GUID (4),
+        // nonce (2), and epoch (2) identity words from the frame end.
+        set_tail_word64(frame, 11, row.epoch);
+        set_tail_word64(frame, 9, row.nonce);
         set_tail_word(frame, 3, row.cache_port);
         set_tail_word(frame, 2, row.cache_protocol);
         set_tail_word(frame, 1, row.cache_mask);

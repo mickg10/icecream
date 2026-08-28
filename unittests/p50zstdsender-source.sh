@@ -36,7 +36,9 @@ top_build=${ICECC_TEST_TOP_BUILDDIR:-$(CDPATH= cd -- "$src/.." && pwd)}
     ${ICECC_TEST_CPPFLAGS:-} ${ICECC_TEST_BOOST_CPPFLAGS:-} \
     -I"$src" -I"$src/client" -I"$src/cache" -I"$src/services" \
     "$src/unittests/p50_zstd_sender_test.cpp" "$mutant" \
-    "$top_build/cache/libp50endpoint.a" "$top_build/cache/libprotocol50.a" \
+    "$top_build/cache/libp50endpoint.a" \
+    "$top_build/cache/libp50adoptedoutcomewriter.a" \
+    "$top_build/cache/libprotocol50.a" \
     "$top_build/services/.libs/libicecc.a" \
     ${ICECC_TEST_LDFLAGS:-} ${ICECC_TEST_LIBZSTD_LIBS:--lzstd} \
     ${ICECC_TEST_XXHASH_LIBS:--lxxhash} -llzo2 -ldl -o "$work/mutant"
