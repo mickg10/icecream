@@ -137,6 +137,17 @@ encode_fsession_control(const FSessionControlEnvelope& envelope);
 [[nodiscard]] std::optional<FSessionControlEnvelope>
 decode_fsession_control(std::span<const uint8_t> bytes);
 
+// Canonical identity block (de)serialization, exposed for payload codecs:
+// every payload re-binds the complete operation identity and the decoder
+// validates it against the envelope (no field inferred from connection-local
+// mutable state; 5448067827 sec.3).
+void encode_fsession_identity(std::vector<uint8_t>& out,
+                              const FSessionOperationIdentity& identity);
+// Reads the identity block at `offset` (advancing it); false on short input.
+[[nodiscard]] bool decode_fsession_identity(std::span<const uint8_t> bytes,
+                                            size_t& offset,
+                                            FSessionOperationIdentity& identity);
+
 // Fixed encoded size of everything before the payload bytes: header
 // (magic 4 + version 2 + direction 1 + reserved 1 + type 2 + sequence 8),
 // the canonical identity block (12 u64 scalars + role u16 + two 16-byte

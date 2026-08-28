@@ -48,7 +48,9 @@ libprotocol50_a_SOURCES = \
 	p50_fsession_daemon_op.cpp \
 	p50_fsession_daemon_op.h \
 	p50_fsession_service_owner.cpp \
-	p50_fsession_service_owner.h
+	p50_fsession_service_owner.h \
+	p50_fsession_payloads.cpp \
+	p50_fsession_payloads.h
 
 AM_CPPFLAGS = -I$(top_srcdir) $(LIBZSTD_CFLAGS)
 libp50endpoint_a_SOURCES = p50_endpoint.cpp p50_endpoint.h \

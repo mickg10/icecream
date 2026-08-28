@@ -102,6 +102,21 @@ FSessionOperationIdentity get_identity(Reader& r) {
 
 } // namespace
 
+void encode_fsession_identity(std::vector<uint8_t>& out,
+                              const FSessionOperationIdentity& identity) {
+    put_identity(out, identity);
+}
+
+bool decode_fsession_identity(std::span<const uint8_t> bytes, size_t& offset,
+                              FSessionOperationIdentity& identity) {
+    Reader r{bytes, offset, true};
+    identity = get_identity(r);
+    if (!r.ok)
+        return false;
+    offset = r.off;
+    return true;
+}
+
 bool direction_legal_daemon(DaemonToSidecarType type) noexcept {
     switch (type) {
     case DaemonToSidecarType::OperationOffer:
