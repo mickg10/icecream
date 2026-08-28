@@ -23,6 +23,7 @@ enum class ProfileDialogueState : uint8_t {
 
 struct ProfileDialogueConfig {
     uint32_t negotiated_profiles = 0;
+    CStoreGuid c_store_guid{};
     // Profile-neutral resource contract. Adapters translate these values to
     // codec-specific limits; the transaction engine never does.
     uint64_t max_encoded_body_bytes = 0;
@@ -45,6 +46,7 @@ struct ProfileDialogueVTable {
     void (*begin)(void*, const TxBegin&) = nullptr;
     void (*append_dict)(void*, const DictMessage&) = nullptr;
     void (*append_body)(void*, const BodyMessage&) = nullptr;
+    std::vector<NeedMessage> (*need_messages)(void*, size_t) = nullptr;
     void (*receive_need)(void*, const NeedMessage&) = nullptr;
     void (*receive_fill)(void*, const FillMessage&) = nullptr;
     std::vector<uint8_t> (*materialize)(void*) = nullptr;
@@ -82,6 +84,9 @@ public:
     void begin(const TxBegin& begin_value) { table_->begin(object_, begin_value); }
     void append_dict(const DictMessage& message) { table_->append_dict(object_, message); }
     void append_body(const BodyMessage& message) { table_->append_body(object_, message); }
+    [[nodiscard]] std::vector<NeedMessage> need_messages(size_t max_payload) {
+        return table_->need_messages(object_, max_payload);
+    }
     void receive_need(const NeedMessage& message) { table_->receive_need(object_, message); }
     void receive_fill(const FillMessage& message) { table_->receive_fill(object_, message); }
     [[nodiscard]] std::vector<uint8_t> materialize() { return table_->materialize(object_); }

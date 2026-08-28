@@ -38,7 +38,6 @@ namespace {
 
 namespace asio = boost::asio;
 using tcp = asio::ip::tcp;
-using PreparedZstdTUPtr = std::shared_ptr<const ZstdTuEnvelope>;
 
 class SingleThreadOwner {
 public:
@@ -77,7 +76,8 @@ void validate_caps(const EndpointCaps& caps) {
     if (caps.wire.max_fill_record_bytes < 32)
         throw std::invalid_argument("endpoint FILL-record cap is too small");
     validate_zstd_tu_limits(caps.zstd);
-    if (caps.profile != ProfileId::ZSTD_TU && caps.profile != ProfileId::Z3_LONG
+    if (caps.profile != ProfileId::P29 && caps.profile != ProfileId::ZSTD_TU &&
+        caps.profile != ProfileId::Z3_LONG
 #if defined(ICECC_P50_WITH_LIBBSC)
         && caps.profile != ProfileId::GRZ
 #endif
@@ -841,7 +841,7 @@ struct P50PreparationAuthority::Impl {
         uint64_t raw_bytes = 0;
         Digest128 raw_digest{};
         std::vector<uint8_t> raw;
-        PreparedZstdTUPtr prepared;
+        PreparedInputPtr prepared;
         uint64_t references = 1;
         uint64_t retained_bytes = 0;
         bool committed = false;
@@ -863,12 +863,19 @@ struct P50PreparationAuthority::Impl {
         if (authority_limits.max_live_entries == 0 ||
             authority_limits.max_retained_encoded_bytes == 0)
             throw std::invalid_argument("preparation-authority limits must be nonzero");
-        if (profile != ProfileId::ZSTD_TU && profile != ProfileId::Z3_LONG
+        if (profile != ProfileId::P29 && profile != ProfileId::ZSTD_TU &&
+            profile != ProfileId::Z3_LONG
 #if defined(ICECC_P50_WITH_LIBBSC)
             && profile != ProfileId::GRZ
 #endif
             )
             throw std::invalid_argument("preparation authority profile is unsupported");
+        if (profile == ProfileId::P29) {
+            p29_authority = std::make_unique<CAuthority>(c_guid);
+            p29_route = std::make_unique<CRoute>(
+                *p29_authority, FStoreGuid::from_u64(UINT64_C(0x503239434c49454e)),
+                HistoryNonce{1});
+        }
     }
 
     TuSeq next_tu_candidate() const {
@@ -917,6 +924,8 @@ struct P50PreparationAuthority::Impl {
     std::optional<uint64_t> uncommitted_grz_entry;
 #endif
     ZstdRouteCodec route_codec;
+    std::unique_ptr<CAuthority> p29_authority;
+    std::unique_ptr<CRoute> p29_route;
     ProfileId profile = ProfileId::ZSTD_TU;
     std::map<PrepareRequestKey, uint64_t> requests;
     std::map<uint64_t, Entry> entries;
@@ -937,7 +946,7 @@ PreparedTuHandle P50PreparationAuthority::prepare(PrepareRequestKey request,
     if (request.producer_session == 0 || request.request_token == 0)
         throw std::invalid_argument("PrepareRequestKey zero fields are reserved");
     if (exact_input.size() > impl_->zstd_limits.max_raw_bytes)
-        throw std::length_error("ZSTD_TU raw input exceeds the local cap");
+        throw std::length_error("P50 raw input exceeds the local cap");
     const Digest128 raw_digest = digest128(exact_input);
     if (const auto request_position = impl_->requests.find(request);
         request_position != impl_->requests.end()) {
@@ -952,10 +961,10 @@ PreparedTuHandle P50PreparationAuthority::prepare(PrepareRequestKey request,
         return PreparedTuHandle(impl_->identity, entry_position->first);
     }
 
-    if (impl_->profile == ProfileId::Z3_LONG &&
+    if ((impl_->profile == ProfileId::Z3_LONG || impl_->profile == ProfileId::P29) &&
         impl_->uncommitted_route_entry.has_value())
         throw std::logic_error(
-            "ZSTD_ROUTE requires its predecessor to commit before preparing the next TU");
+            "selected route profile requires its predecessor to commit before preparing the next TU");
 #if defined(ICECC_P50_WITH_LIBBSC)
     if (impl_->profile == ProfileId::GRZ && impl_->uncommitted_grz_entry.has_value())
         throw std::logic_error(
@@ -974,57 +983,83 @@ PreparedTuHandle P50PreparationAuthority::prepare(PrepareRequestKey request,
     ZstdTuLimits admission_limits = impl_->zstd_limits;
     admission_limits.max_encoded_body_bytes =
         std::min(admission_limits.max_encoded_body_bytes, retained_room);
-    PreparedZstdTUPtr prepared;
+    PreparedInputPtr prepared;
+    bool p29_active_started = false;
     try {
         if (impl_->profile == ProfileId::ZSTD_TU) {
-            prepared = std::make_shared<const ZstdTuEnvelope>(impl_->codec.encode(
+            const ZstdTuEnvelope envelope = impl_->codec.encode(
                 HistoryNonce{1}, RelSeq{0}, tu_seq, Digest128{}, exact_input,
-                admission_limits));
+                admission_limits);
+            prepared = std::make_shared<const PreparedInputEnvelope>(
+                PreparedInputEnvelope{envelope.begin, {}, envelope.body, {}});
         } else if (impl_->profile == ProfileId::Z3_LONG) {
-            prepared = std::make_shared<const ZstdTuEnvelope>(impl_->route_codec.encode(
+            const ZstdRouteEnvelope envelope = impl_->route_codec.encode(
                 HistoryNonce{1}, RelSeq{0}, tu_seq, Digest128{},
                 std::span<const uint8_t>(impl_->committed_route_history), exact_input,
-                admission_limits));
+                admission_limits);
+            prepared = std::make_shared<const PreparedInputEnvelope>(
+                PreparedInputEnvelope{envelope.begin, {}, envelope.body, {}});
+        } else if (impl_->profile == ProfileId::P29) {
+            std::vector<std::vector<uint8_t>> regions;
+            regions.push_back(std::vector<uint8_t>(exact_input.begin(), exact_input.end()));
+            const PreparedTUPtr p29_prepared = impl_->p29_authority->prepare_from_regions(regions);
+            const CActiveTx& active = impl_->p29_route->begin(
+                p29_prepared, P29RootMode::HistoryIndependent);
+            p29_active_started = true;
+            std::vector<FillRecord> fills;
+            fills.reserve(active.manifest.size());
+            for (Key64 key : active.manifest)
+                fills.push_back(impl_->p29_authority->arena().object(key).fill_record());
+            prepared = std::make_shared<const PreparedInputEnvelope>(
+                PreparedInputEnvelope{active.begin, active.dict, active.body,
+                                      std::move(fills)});
 #if defined(ICECC_P50_WITH_LIBBSC)
-        } else {
-            prepared = std::make_shared<const ZstdTuEnvelope>(impl_->grz_codec.encode(
+        } else if (impl_->profile == ProfileId::GRZ) {
+            const ZstdTuEnvelope envelope = impl_->grz_codec.encode(
                 HistoryNonce{1}, RelSeq{0}, tu_seq, Digest128{}, exact_input,
-                admission_limits));
+                admission_limits);
+            prepared = std::make_shared<const PreparedInputEnvelope>(
+                PreparedInputEnvelope{envelope.begin, {}, envelope.body, {}});
 #endif
+        } else {
+            throw std::logic_error("preparation authority profile is not runnable");
         }
     } catch (...) {
+        if (p29_active_started && impl_->p29_route)
+            impl_->p29_route->abandon_active();
 #if defined(ICECC_P50_WITH_LIBBSC)
         if (impl_->profile == ProfileId::GRZ)
             impl_->grz_codec.discard();
 #endif
         throw;
     }
-    const uint64_t retained = static_cast<uint64_t>(prepared->body.size());
-    if (retained > impl_->authority_limits.max_retained_encoded_bytes ||
-        impl_->retained_bytes > impl_->authority_limits.max_retained_encoded_bytes - retained) {
-#if defined(ICECC_P50_WITH_LIBBSC)
-        if (impl_->profile == ProfileId::GRZ)
-            impl_->grz_codec.discard();
-#endif
-        throw std::length_error("C preparation authority reached its retained-byte bound");
-    }
 
-    auto entry_position = impl_->entries.end();
+    const uint64_t retained = static_cast<uint64_t>(prepared->body.size());
+    bool entry_added = false;
+    bool retained_added = false;
     try {
+        if (retained > impl_->authority_limits.max_retained_encoded_bytes ||
+            impl_->retained_bytes > impl_->authority_limits.max_retained_encoded_bytes - retained)
+            throw std::length_error("C preparation authority reached its retained-byte bound");
+
         Impl::Entry entry{request, static_cast<uint64_t>(exact_input.size()), raw_digest,
                           std::vector<uint8_t>(exact_input.begin(), exact_input.end()), prepared, 1,
                           retained, false};
-        const auto insertion = impl_->entries.emplace(entry_id, std::move(entry));
-        entry_position = insertion.first;
-        const bool entry_inserted = insertion.second;
+        const auto [entry_position, entry_inserted] = impl_->entries.emplace(
+            entry_id, std::move(entry));
+        (void)entry_position;
         if (!entry_inserted)
             throw std::logic_error("C preparation authority reused an entry identifier");
+        entry_added = true;
         const auto [request_position, request_inserted] = impl_->requests.emplace(request, entry_id);
         (void)request_position;
         if (!request_inserted)
             throw std::logic_error("C preparation request was admitted twice");
         impl_->retained_bytes += retained;
+        retained_added = true;
         if (impl_->profile == ProfileId::Z3_LONG)
+            impl_->uncommitted_route_entry = entry_id;
+        if (impl_->profile == ProfileId::P29)
             impl_->uncommitted_route_entry = entry_id;
 #if defined(ICECC_P50_WITH_LIBBSC)
         if (impl_->profile == ProfileId::GRZ)
@@ -1034,11 +1069,22 @@ PreparedTuHandle P50PreparationAuthority::prepare(PrepareRequestKey request,
         impl_->consume_entry();
         return PreparedTuHandle(impl_->identity, entry_id);
     } catch (...) {
-        if (entry_position != impl_->entries.end())
-            impl_->entries.erase(entry_position);
+        if (p29_active_started && impl_->p29_route)
+            impl_->p29_route->abandon_active();
+        if (retained_added)
+            impl_->retained_bytes -= retained;
+        impl_->requests.erase(request);
+        if (entry_added)
+            impl_->entries.erase(entry_id);
+        if ((impl_->profile == ProfileId::Z3_LONG || impl_->profile == ProfileId::P29) &&
+            impl_->uncommitted_route_entry == entry_id)
+            impl_->uncommitted_route_entry.reset();
 #if defined(ICECC_P50_WITH_LIBBSC)
-        if (impl_->profile == ProfileId::GRZ)
+        if (impl_->profile == ProfileId::GRZ) {
+            if (impl_->uncommitted_grz_entry == entry_id)
+                impl_->uncommitted_grz_entry.reset();
             impl_->grz_codec.discard();
+        }
 #endif
         throw;
     }
@@ -1068,9 +1114,13 @@ uint64_t P50PreparationAuthority::release(PreparedTuHandle handle) {
         return entry.references;
     if (impl_->requests.erase(entry.request) != 1)
         throw std::logic_error("preparation request index lost its release target");
-    if (impl_->profile == ProfileId::Z3_LONG && !entry.committed &&
+    if ((impl_->profile == ProfileId::Z3_LONG || impl_->profile == ProfileId::P29) && !entry.committed &&
         impl_->uncommitted_route_entry == handle.entry_id_)
+    {
         impl_->uncommitted_route_entry.reset();
+        if (impl_->profile == ProfileId::P29 && impl_->p29_route)
+            impl_->p29_route->abandon_active();
+    }
 #if defined(ICECC_P50_WITH_LIBBSC)
     if (impl_->profile == ProfileId::GRZ && !entry.committed &&
         impl_->uncommitted_grz_entry == handle.entry_id_) {
@@ -1111,6 +1161,24 @@ void P50PreparationAuthority::commit(PreparedTuHandle handle) {
             impl_->committed_route_history.insert(impl_->committed_route_history.end(),
                                                   entry.raw.begin(), entry.raw.end());
         }
+        entry.committed = true;
+        impl_->uncommitted_route_entry.reset();
+    }
+    if (impl_->profile == ProfileId::P29 && !entry.committed) {
+        if (impl_->uncommitted_route_entry != handle.entry_id_)
+            throw std::logic_error("P29 commit is not its prepared successor");
+        const auto commit = TxCommit{entry.prepared->begin.history_nonce,
+                                     entry.prepared->begin.rel_seq,
+                                     entry.prepared->begin.tu_seq,
+                                     entry.prepared->begin.transaction_digest,
+                                     entry.prepared->begin.raw_digest,
+                                     compute_post_state_digest(
+                                         entry.prepared->begin.pre_state_digest,
+                                         entry.prepared->begin.history_nonce,
+                                         entry.prepared->begin.rel_seq,
+                                         entry.prepared->begin.tu_seq,
+                                         entry.prepared->begin.transaction_digest)};
+        impl_->p29_route->accept_commit(commit);
         entry.committed = true;
         impl_->uncommitted_route_entry.reset();
     }
@@ -1166,7 +1234,7 @@ ProfileId P50PreparationAuthority::profile() const {
     return impl_->profile;
 }
 
-std::shared_ptr<const ZstdTuEnvelope>
+PreparedInputPtr
 P50PreparationAuthority::resolve(PreparedTuHandle handle) const {
     impl_->owner.require();
     if (handle.authority_.lock() != impl_->identity || handle.entry_id_ == 0)
@@ -1190,6 +1258,16 @@ void P50PreparationAuthority::validate_begin(const TxBegin& begin) const {
         if (begin.body.encoded_bytes > impl_->zstd_limits.max_encoded_body_bytes ||
             begin.raw_bytes > impl_->zstd_limits.max_raw_bytes)
             throw std::length_error("prepared route exceeds authority limits");
+    } else {
+        if (begin.profile != ProfileId::P29 ||
+            begin.p29_root_mode == P29RootMode::NotApplicable ||
+            begin.dict.encoding != kP29KeyVectorEncoding ||
+            begin.body.encoding != kP29KeyVectorEncoding)
+            throw std::invalid_argument("prepared P29 profile differs from authority");
+        if (begin.raw_bytes > impl_->zstd_limits.max_raw_bytes ||
+            begin.body.encoded_bytes > impl_->zstd_limits.max_encoded_body_bytes ||
+            begin.dict.encoded_bytes > impl_->zstd_limits.max_encoded_body_bytes)
+            throw std::length_error("prepared P29 input exceeds authority limits");
     }
 #if defined(ICECC_P50_WITH_LIBBSC)
     else {
@@ -1208,7 +1286,7 @@ struct P50ClientEndpoint::Impl {
     };
 
     struct Active {
-        PreparedZstdTUPtr prepared;
+        PreparedInputPtr prepared;
         PreparedTuHandle handle;
         TxBegin begin;
     };
@@ -1337,7 +1415,7 @@ struct P50ClientEndpoint::Impl {
         actions->record(std::move(value));
     }
 
-    void start_active(const PreparedZstdTUPtr& prepared, PreparedTuHandle handle,
+    void start_active(const PreparedInputPtr& prepared, PreparedTuHandle handle,
                       uint64_t serial) {
         if (!route_known || !f_guid)
             throw std::logic_error("cannot begin before a route is known");
@@ -1350,14 +1428,14 @@ struct P50ClientEndpoint::Impl {
         value.begin.rel_seq = next_rel;
         value.begin.tu_seq = prepared->begin.tu_seq;
         value.begin.profile = prepared->begin.profile;
-        value.begin.p29_root_mode = P29RootMode::NotApplicable;
+        value.begin.p29_root_mode = prepared->begin.p29_root_mode;
         value.begin.pre_state_digest = state;
         value.begin.dict = prepared->begin.dict;
         value.begin.body = prepared->begin.body;
         value.begin.raw_bytes = prepared->begin.raw_bytes;
         value.begin.raw_digest = prepared->begin.raw_digest;
         value.begin.transaction_digest =
-            compute_transaction_digest(value.begin, std::span<const uint8_t>{}, prepared->body);
+            compute_transaction_digest(value.begin, prepared->dict, prepared->body);
         preparation->validate_begin(value.begin);
         active = std::move(value);
         record(ActionType::TX_BEGIN, active->begin, serial, active->begin.pre_state_digest);
@@ -1392,7 +1470,7 @@ struct P50ClientEndpoint::Impl {
     RelSeq next_rel{};
     Digest128 state{};
     std::optional<Active> active;
-    PreparedZstdTUPtr queued;
+    PreparedInputPtr queued;
     PreparedTuHandle queued_handle;
     CompletionLog* completions = nullptr;
     std::unique_ptr<ActionTrace> owned_actions;
@@ -2124,7 +2202,8 @@ struct P50ServerEndpoint::Impl {
     }
 
     PreparedBegin prepare_begin(const Namespace& space, const TxBegin& begin,
-                                uint32_t negotiated_profiles) const {
+                                uint32_t negotiated_profiles,
+                                CStoreGuid c_store_guid) const {
         if (!space.route)
             throw std::logic_error("TX_BEGIN arrived before HISTORY_RESET");
         const Route& route = *space.route;
@@ -2149,11 +2228,12 @@ struct P50ServerEndpoint::Impl {
             ProfileDialogue::create(
                 begin.profile,
                 ProfileDialogueConfig{.negotiated_profiles = negotiated_profiles,
+                                      .c_store_guid = c_store_guid,
                                       .max_encoded_body_bytes = caps.zstd.max_encoded_body_bytes,
                                       .max_raw_bytes = caps.zstd.max_raw_bytes,
                                       .max_window_log = caps.zstd.max_window_log,
                                       .max_history_bytes = caps.zstd.max_history_bytes}));
-        if ((begin.profile == ProfileId::Z3_LONG
+        if ((begin.profile == ProfileId::P29 || begin.profile == ProfileId::Z3_LONG
 #if defined(ICECC_P50_WITH_LIBBSC)
              || begin.profile == ProfileId::GRZ
 #endif
@@ -2170,7 +2250,7 @@ struct P50ServerEndpoint::Impl {
         const auto position = namespaces.find(*session.c_guid);
         if (position == namespaces.end())
             throw std::logic_error("TX_BEGIN arrived before HISTORY_RESET");
-        return prepare_begin(position->second, begin, negotiated_profiles);
+        return prepare_begin(position->second, begin, negotiated_profiles, *session.c_guid);
     }
 
     bool install_begin(const Session& session, PreparedBegin prepared) {
@@ -2180,7 +2260,8 @@ struct P50ServerEndpoint::Impl {
             throw std::logic_error("F endpoint already has one active transaction");
         if (route.interrupted && route.interrupted != prepared.pending.begin)
             throw StaleCompletion();
-        if (prepared.pending.begin.profile == ProfileId::Z3_LONG
+        if (prepared.pending.begin.profile == ProfileId::P29 ||
+            prepared.pending.begin.profile == ProfileId::Z3_LONG
 #if defined(ICECC_P50_WITH_LIBBSC)
             || prepared.pending.begin.profile == ProfileId::GRZ
 #endif
@@ -2225,7 +2306,9 @@ struct P50ServerEndpoint::Impl {
     bool begin(const Session& session, const TxBegin& begin,
                uint32_t negotiated_profiles) {
         const Namespace& space = require(session);
-        return install_begin(session, prepare_begin(space, begin, negotiated_profiles));
+        return install_begin(session,
+                             prepare_begin(space, begin, negotiated_profiles,
+                                           *session.c_guid));
     }
 
     void append_body(const Session& session, BodyMessage message) {
@@ -2549,12 +2632,12 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
     }
     if (impl_->active_session != 0)
         throw std::logic_error("C endpoint already has one active dialogue");
-    PreparedZstdTUPtr admitted;
+    PreparedInputPtr admitted;
     if (prepared)
         admitted = impl_->preparation->resolve(prepared);
     if (impl_->active) {
         if (admitted && admitted != impl_->active->prepared)
-            throw std::invalid_argument("retry supplied a different PreparedZstdTU");
+            throw std::invalid_argument("retry supplied a different PreparedInput");
     } else if (admitted) {
         if (impl_->queued && admitted != impl_->queued)
             throw std::invalid_argument("C endpoint already has different queued work");
@@ -2776,7 +2859,7 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
             // A different route is an observation only; an endpoint-local
             // result cannot authorize a replacement attempt.
             result.observation = ClientRunObservation::ReconcileRequired;
-            PreparedZstdTUPtr retry = impl_->active ? impl_->active->prepared : impl_->queued;
+            PreparedInputPtr retry = impl_->active ? impl_->active->prepared : impl_->queued;
             impl_->queued_handle = impl_->active ? impl_->active->handle : impl_->queued_handle;
             if (same_f && peer.route_present)
                 impl_->advance_nonce_past(peer.history_nonce);
@@ -2833,7 +2916,7 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
         if (!impl_->active) {
             if (!impl_->queued)
                 throw std::logic_error("route reconciliation lost queued work");
-            const PreparedZstdTUPtr queued = impl_->queued;
+            const PreparedInputPtr queued = impl_->queued;
             const PreparedTuHandle queued_handle = impl_->queued_handle;
             impl_->start_active(queued, queued_handle, serial);
             impl_->queued.reset();
@@ -2848,10 +2931,52 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
                                      impl_->stamp(session, AsyncOperationKind::WriteFragment),
                                      impl_->completions, control, verify);
 
-        co_await async_write_component<BodyMessage>(
-            socket, impl_->active->prepared->body, frame_cap,
-            impl_->stamp(session, AsyncOperationKind::WriteFragment), impl_->completions, control,
-            verify);
+        if (begin.profile == ProfileId::P29) {
+            co_await async_write_component<DictMessage>(
+                socket, impl_->active->prepared->dict, frame_cap,
+                impl_->stamp(session, AsyncOperationKind::WriteFragment), impl_->completions,
+                control, verify);
+            NeedStreamDecoder need_decoder;
+            for (;;) {
+                Frame need_frame = co_await async_read_frame(
+                    socket, frame_cap,
+                    impl_->stamp(session, AsyncOperationKind::ReadHeader), impl_->completions,
+                    verify);
+                if (need_frame.type == MessageType::ERROR)
+                    throw ClientTerminalResult(decode_as<ErrorMessage>(need_frame), frame_cap);
+                if (need_frame.type != MessageType::NEED)
+                    throw std::invalid_argument("P29 expected NEED before FILL");
+                need_decoder.push(decode_as<NeedMessage>(need_frame));
+                if (need_decoder.complete())
+                    break;
+            }
+            std::map<Key64, const FillRecord*> available;
+            for (const FillRecord& record : impl_->active->prepared->p29_fill_records)
+                available.emplace(record.key, &record);
+            std::vector<FillRecord> selected;
+            selected.reserve(need_decoder.keys().size());
+            for (Key64 key : need_decoder.keys()) {
+                const auto position = available.find(key);
+                if (position == available.end())
+                    throw std::logic_error("P29 Need requested an unprepared object");
+                selected.push_back(*position->second);
+            }
+            const std::vector<FillMessage> fills = encode_fill_messages(selected, frame_cap);
+            for (const FillMessage& fill : fills)
+                co_await async_write_message(
+                    socket, fill, frame_cap,
+                    impl_->stamp(session, AsyncOperationKind::WriteFragment),
+                    impl_->completions, control, verify);
+            co_await async_write_component<BodyMessage>(
+                socket, impl_->active->prepared->body, frame_cap,
+                impl_->stamp(session, AsyncOperationKind::WriteFragment), impl_->completions,
+                control, verify);
+        } else {
+            co_await async_write_component<BodyMessage>(
+                socket, impl_->active->prepared->body, frame_cap,
+                impl_->stamp(session, AsyncOperationKind::WriteFragment), impl_->completions,
+                control, verify);
+        }
         Frame commit_frame = co_await async_read_frame(
             socket, frame_cap, impl_->stamp(session, AsyncOperationKind::ReadHeader),
             impl_->completions, verify);
@@ -3341,6 +3466,17 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
             switch (component.type) {
             case MessageType::DICT:
                 impl_->append_dict(session, decode_as<DictMessage>(component));
+                if (impl_->namespaces.at(*session.c_guid).route->pending->begin.profile ==
+                    ProfileId::P29) {
+                    const std::vector<NeedMessage> needs =
+                        impl_->namespaces.at(*session.c_guid).route->pending->dialogue->
+                            need_messages(selection.limits.max_frame_payload);
+                    for (const NeedMessage& need : needs)
+                        co_await async_write_message(
+                            socket, need, selection.limits.max_frame_payload,
+                            impl_->stamp(session, AsyncOperationKind::WriteFragment),
+                            impl_->completions, control, verify);
+                }
                 break;
             case MessageType::BODY:
                 impl_->append_body(session, decode_as<BodyMessage>(component));

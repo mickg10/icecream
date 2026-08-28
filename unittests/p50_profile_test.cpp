@@ -462,6 +462,33 @@ void test_factory_rejects_unsupported_or_unnegotiated() {
         "factory admitted an undeclared negotiated profile bit");
 }
 
+void test_p29_factory_is_explicit_and_fail_closed() {
+    ProfileDialogue dialogue = ProfileDialogue::create(
+        ProfileId::P29,
+        ProfileDialogueConfig{.negotiated_profiles = profile_bit(ProfileId::P29),
+                              .max_encoded_body_bytes = 1 << 20,
+                              .max_raw_bytes = 1 << 20});
+    if (dialogue.profile() != ProfileId::P29)
+        fail("P29 factory silently selected a different profile");
+    try {
+        TxBegin malformed;
+        malformed.profile = ProfileId::P29;
+        malformed.p29_root_mode = P29RootMode::NotApplicable;
+        dialogue.begin(malformed);
+        fail("P29 accepted an omitted root mode");
+    } catch (const std::exception&) {
+    }
+    try {
+        (void)ProfileDialogue::create(
+            ProfileId::P29,
+            ProfileDialogueConfig{.negotiated_profiles = profile_bit(ProfileId::ZSTD_TU),
+                                  .max_encoded_body_bytes = 1 << 20,
+                                  .max_raw_bytes = 1 << 20});
+        fail("P29 factory accepted an unnegotiated profile");
+    } catch (const std::exception&) {
+    }
+}
+
 } // namespace
 
 int main() {
@@ -470,6 +497,7 @@ int main() {
     test_exact_terminal_promotion_and_discard();
     test_interactive_hooks_are_reachable_and_fail_closed_for_zstd();
     test_factory_rejects_unsupported_or_unnegotiated();
+    test_p29_factory_is_explicit_and_fail_closed();
     test_zstd_route_multi_tu_replay_and_terminal_rules();
     test_zstd_route_reset_and_fallback();
     test_zstd_route_bounded_rolling_history();

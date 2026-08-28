@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <array>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -54,7 +55,8 @@ template <typename Guid> bool parse_guid(std::string_view text, Guid& result) {
 
 void write_summary(const std::string& path, std::span<const uint8_t> input,
                    const ClientRunResult& client, const ServerRunResult& server,
-                   const CompletionLog& completions, const ActionTrace& actions) {
+                   const CompletionLog& completions, const ActionTrace& actions,
+                   ProfileId profile) {
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
     if (!output)
         throw std::runtime_error("cannot open p50sim summary output");
@@ -75,7 +77,8 @@ void write_summary(const std::string& path, std::span<const uint8_t> input,
     const Digest128 final_raw = actions.records().empty()
                                     ? Digest128{}
                                     : actions.records().back().raw_digest;
-    output << "{\"schema\":\"icecream-p50sim-execution-v1\","
+    output << "{\"schema\":\"icecream-p50sim-execution-v1\",\"profile\":\""
+           << profile_name(profile) << "\","
            << "\"raw_bytes\":" << input.size() << ","
            << "\"raw_digest\":\"" << icecc::digest128_hex(icecc::digest128(input))
            << "\",\"client_status\":\""
@@ -106,6 +109,20 @@ struct Arguments {
     FStoreGuid f_store_guid = FStoreGuid::from_u64(0x505053494dULL);
     HistoryNonce history_nonce{1};
 };
+
+ProfileId selected_profile() {
+    const char* requested = std::getenv("ICECC_P50_PROFILE");
+    if (requested == nullptr || *requested == '\0')
+        return ProfileId::ZSTD_TU;
+    const std::string value(requested);
+    if (value == "P29")
+        return ProfileId::P29;
+    if (value == "ZSTD_TU")
+        return ProfileId::ZSTD_TU;
+    if (value == "ZSTD_ROUTE")
+        return ProfileId::Z3_LONG;
+    throw std::invalid_argument("unsupported ICECC_P50_PROFILE: " + value);
+}
 
 Arguments parse(int argc, char** argv) {
     Arguments result;
@@ -151,9 +168,12 @@ int main(int argc, char** argv) {
 
         ActionTrace actions(1024);
         CompletionLog completions(4096);
-        const EndpointCaps caps{};
+        EndpointCaps caps{};
+        caps.profile = selected_profile();
+        caps.supported_profiles = profile_bit(caps.profile);
         auto authority = std::make_shared<P50PreparationAuthority>(
-            arguments.c_store_guid, caps.zstd);
+            arguments.c_store_guid, caps.zstd,
+            PreparationAuthorityLimits{}, 1, caps.profile);
         const PreparedTuHandle prepared = authority->prepare(
             PrepareRequestKey{1, 1}, input);
         if (!prepared)
@@ -179,14 +199,22 @@ int main(int argc, char** argv) {
 
         if (client_result.status != ClientRunStatus::Committed ||
             server_result.status != ServerRunStatus::Completed)
-            throw std::runtime_error("Protocol-50 execution did not commit on both endpoints");
+            throw std::runtime_error(
+                "Protocol-50 execution did not commit on both endpoints (client=" +
+                std::to_string(static_cast<unsigned>(client_result.status)) +
+                ", server=" + std::to_string(static_cast<unsigned>(server_result.status)) +
+                (server_result.terminal_error ? ", server_error=" +
+                     server_result.terminal_error->detail : std::string{}) +
+                (client_result.terminal_error ? ", client_error=" +
+                     client_result.terminal_error->detail : std::string{}) +
+                ")");
         if (!actions.valid())
             throw std::runtime_error("Protocol-50 action trace exceeded its bound");
         if (const auto error = check_action_trace(actions.records()); error)
             throw std::runtime_error("Protocol-50 action trace mismatch: " + *error);
         write_action_trace(actions, arguments.actions);
         write_summary(arguments.summary, input, client_result, server_result,
-                      completions, actions);
+                      completions, actions, caps.profile);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "p50sim: " << error.what() << '\n';

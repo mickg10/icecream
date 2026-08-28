@@ -52,6 +52,7 @@ public:
 struct CompileInputIdentity
 {
     static constexpr uint32_t ZstdTuProfile = 2;
+    static constexpr uint32_t P29Profile = 1;
 
     uint32_t profile = 0;
     std::array<uint8_t, 16> c_store_guid{};
@@ -75,7 +76,7 @@ struct CompileInputIdentity
         /* TU_SEQ zero and an all-zero content digest are valid values.  The
            namespace GUID and the two replay/ownership identities reserve
            zero, so presence cannot be confused with the legacy encoding. */
-        return profile == ZstdTuProfile && c_store_guid != zero
+        return (profile == ZstdTuProfile || profile == P29Profile) && c_store_guid != zero
             && attempt_id != 0 && request_id != 0;
     }
 };

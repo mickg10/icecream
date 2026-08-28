@@ -49,6 +49,7 @@ enum class ZstdSourceTransferStatus : uint8_t {
 
 struct ZstdSourceTransferResult {
     ZstdSourceTransferStatus status = ZstdSourceTransferStatus::Unavailable;
+    ProfileId profile = ProfileId::ZSTD_TU;
     std::optional<InputRecordKey> committed_input;
     uint64_t raw_bytes = 0;
     Digest128 raw_digest{};
@@ -78,9 +79,11 @@ struct ZstdSourceTransferConfig {
 using ConnectedFdFactory =
     std::function<int(std::chrono::steady_clock::time_point deadline)>;
 
-// C-side source transfer.  ZSTD_TU senders are one-shot because each transfer
-// owns an independent namespace.  ZSTD_ROUTE senders retain the relationship
-// authority and endpoint so sequential transfers advance one route.
+// C-side source transfer.  The historical class name is retained for source
+// compatibility; endpoint_caps.profile selects the exact P29, ZSTD_TU, or
+// ZSTD_ROUTE dialogue and the result records that selection. ZSTD_TU senders
+// are one-shot because each transfer owns an independent namespace, while
+// P29/ZSTD_ROUTE retain their relationship authority for sequential transfers.
 class P50ZstdSourceSender {
 public:
     P50ZstdSourceSender(CStoreGuid c_store_guid, PrepareRequestKey request,

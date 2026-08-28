@@ -356,7 +356,7 @@ void test_rejects_malformed_and_legacy()
             "role-tag-only F StoreIdentity with a zero root is refused");
 
     P50SourceArmFields unknown_profile = request.arm;
-    unknown_profile.cache_profile = CACHE_PROFILE_P29;
+    unknown_profile.cache_profile = CACHE_PROFILE_GRZ;
     REQUIRE(!make_pair(PROTOCOL_VERSION).left->send_msg(
                 P50SourceArmMsg(unknown_profile)),
             "non-advertisable cache profile is refused before framing");

@@ -581,7 +581,7 @@ const uint32_t CACHE_DECLARED_PROFILE_MASK =
 /* The endpoint advertises only runnable product dialogues.  GRZ is included
    only in builds that linked the reviewed libbsc residual implementation. */
 const uint32_t CACHE_ADVERTISABLE_PROFILE_MASK =
-    CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE
+    CACHE_PROFILE_P29 | CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE
 #if defined(ICECC_P50_WITH_LIBBSC)
     | CACHE_PROFILE_GRZ
 #endif
@@ -592,6 +592,7 @@ const uint32_t CACHE_ADVERTISABLE_PROFILE_MASK =
    preference; an explicit request never falls back to another profile. */
 enum class P50CacheProfileRequest : uint8_t {
     Default,
+    P29,
     ZSTD_TU,
     ZSTD_ROUTE,
     GRZ_RESIDUAL,
@@ -606,6 +607,8 @@ inline P50CacheProfileRequest p50_cache_profile_request_from_env() noexcept
     const std::string_view requested(value);
     if (requested == "ZSTD_TU")
         return P50CacheProfileRequest::ZSTD_TU;
+    if (requested == "P29")
+        return P50CacheProfileRequest::P29;
     if (requested == "ZSTD_ROUTE")
         return P50CacheProfileRequest::ZSTD_ROUTE;
     if (requested == "GRZ" || requested == "GRZ_RESIDUAL")
@@ -633,6 +636,8 @@ inline constexpr uint32_t p50_select_cache_profile(
         return (advertised & CACHE_PROFILE_ZSTD_ROUTE) != 0
                    ? CACHE_PROFILE_ZSTD_ROUTE
                    : 0;
+    case P50CacheProfileRequest::P29:
+        return (advertised & CACHE_PROFILE_P29) != 0 ? CACHE_PROFILE_P29 : 0;
     case P50CacheProfileRequest::GRZ_RESIDUAL:
         return (advertised & CACHE_PROFILE_GRZ) != 0
                    ? CACHE_PROFILE_GRZ
@@ -648,12 +653,14 @@ inline constexpr uint32_t p50_select_cache_profile(
 inline constexpr uint32_t P50_SOURCE_MODE_ZSTD_TU = UINT32_C(1);
 inline constexpr uint32_t P50_SOURCE_MODE_ZSTD_ROUTE = UINT32_C(2);
 inline constexpr uint32_t P50_SOURCE_MODE_GRZ_RESIDUAL = UINT32_C(3);
+inline constexpr uint32_t P50_SOURCE_MODE_P29 = UINT32_C(4);
 
 inline constexpr bool p50_source_profile_mode_valid(uint32_t profile,
                                                      uint32_t source_mode) noexcept
 {
     return (profile == CACHE_PROFILE_ZSTD_TU &&
             source_mode == P50_SOURCE_MODE_ZSTD_TU) ||
+           (profile == CACHE_PROFILE_P29 && source_mode == P50_SOURCE_MODE_P29) ||
            (profile == CACHE_PROFILE_ZSTD_ROUTE &&
             source_mode == P50_SOURCE_MODE_ZSTD_ROUTE)
 #if defined(ICECC_P50_WITH_LIBBSC)
@@ -666,7 +673,7 @@ inline constexpr bool p50_source_profile_mode_valid(uint32_t profile,
 inline constexpr bool p50_source_profile_selection_valid(uint32_t profiles) noexcept
 {
     return profiles == CACHE_PROFILE_ZSTD_TU ||
-           profiles == CACHE_PROFILE_ZSTD_ROUTE
+           profiles == CACHE_PROFILE_ZSTD_ROUTE || profiles == CACHE_PROFILE_P29
 #if defined(ICECC_P50_WITH_LIBBSC)
            || profiles == CACHE_PROFILE_GRZ
 #endif

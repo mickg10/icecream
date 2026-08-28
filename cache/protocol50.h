@@ -149,7 +149,8 @@ constexpr uint32_t kDeclaredProfileMask = kKnownProfileMask |
 // profile census remains separate; session negotiation admits only codecs
 // built into this executable (GRZ requires the scoped libbsc option).
 constexpr uint32_t kOperationalProfileMask =
-    profile_bit(ProfileId::ZSTD_TU) | profile_bit(ProfileId::Z3_LONG)
+    profile_bit(ProfileId::P29) | profile_bit(ProfileId::ZSTD_TU) |
+    profile_bit(ProfileId::Z3_LONG)
 #if defined(ICECC_P50_WITH_LIBBSC)
     | profile_bit(ProfileId::GRZ)
 #endif

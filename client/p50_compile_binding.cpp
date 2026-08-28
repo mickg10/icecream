@@ -28,6 +28,8 @@ std::optional<ProfileId> p50_zstd_selected_profile(
         assignment.cache_protocol != CACHE_WIRE_PROTOCOL_V1 ||
         !p50_source_profile_selection_valid(assignment.cache_profile_mask))
         return std::nullopt;
+    if (assignment.cache_profile_mask == CACHE_PROFILE_P29)
+        return ProfileId::P29;
     if (assignment.cache_profile_mask == CACHE_PROFILE_ZSTD_ROUTE)
         return ProfileId::Z3_LONG;
     if (assignment.cache_profile_mask == CACHE_PROFILE_GRZ)
@@ -74,8 +76,15 @@ std::optional<CompileInputIdentity> bind_compile_input(
         transfer.attempts == 0 || transfer.attempts > 2)
         return std::nullopt;
 
+    if (transfer.profile != ProfileId::P29 &&
+        transfer.profile != ProfileId::ZSTD_TU &&
+        transfer.profile != ProfileId::Z3_LONG)
+        return std::nullopt;
+
     CompileInputIdentity identity;
-    identity.profile = CompileInputIdentity::ZstdTuProfile;
+    identity.profile = transfer.profile == ProfileId::P29
+                           ? CompileInputIdentity::P29Profile
+                           : CompileInputIdentity::ZstdTuProfile;
     identity.c_store_guid = transfer.committed_input->c_store_guid.bytes;
     identity.tu_seq = transfer.committed_input->tu_seq.value;
     identity.raw_bytes = transfer.raw_bytes;

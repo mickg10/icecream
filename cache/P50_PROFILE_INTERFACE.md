@@ -16,8 +16,10 @@ pending ownership or the endpoint reducer.
 
 This is an internal production seam: it introduces no wire fields, changes no
 digest or identity law, and does not alter the existing ZSTD_TU exception or
-publication behavior. Unsupported, undeclared, or unnegotiated profiles fail
-closed at the factory. A lost terminal is replayed by the existing endpoint
-route: the committed predecessor remains authoritative and the C-side
-prepared envelope deterministically reconstructs the exact encoded body on a
-fresh dialogue.
+publication behavior. The canonical P29 adapter uses the reviewed
+`capability/grouprlz/p29_online_s1.h` object catalogue and key-vector
+DICT/BODY/FILL exchange; it is not a ZSTD codec alias. Unsupported,
+undeclared, or unnegotiated profiles fail closed at the factory. A lost
+terminal is replayed by the existing endpoint route: the committed
+predecessor remains authoritative and each prepared profile envelope
+reconstructs the exact source bytes on a fresh dialogue.

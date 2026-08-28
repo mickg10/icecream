@@ -912,7 +912,10 @@ public:
             acknowledgement.f_store_derivation_version ==
                 p50_source_f_lease->store_derivation_version;
         return ack_matches_lease &&
-               input.profile == CompileInputIdentity::ZstdTuProfile &&
+               ((input.profile == CompileInputIdentity::P29Profile &&
+                 p50_source_arm_fields->cache_profile == CACHE_PROFILE_P29) ||
+                (input.profile == CompileInputIdentity::ZstdTuProfile &&
+                 p50_source_arm_fields->cache_profile != CACHE_PROFILE_P29)) &&
                input.c_store_guid == p50_source_arm_fields->c_store_guid &&
                input.attempt_id == p50_source_arm_fields->compiler_attempt &&
                input.request_id == p50_source_arm_fields->source_request_id;
@@ -7611,7 +7614,12 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
                 arm.assignment_nonce != job->assignmentNonce())
                 continue;
             const CompileInputIdentity &input = job->compileInputIdentity();
-            if (!input.validPresent() || input.profile != CompileInputIdentity::ZstdTuProfile ||
+            if (!input.validPresent() ||
+                ((input.profile != CompileInputIdentity::P29Profile &&
+                  input.profile != CompileInputIdentity::ZstdTuProfile) ||
+                 (input.profile == CompileInputIdentity::P29Profile
+                      ? arm.cache_profile != CACHE_PROFILE_P29
+                      : arm.cache_profile == CACHE_PROFILE_P29)) ||
                 input.c_store_guid != arm.c_store_guid ||
                 input.attempt_id != arm.compiler_attempt ||
                 input.request_id != arm.source_request_id)

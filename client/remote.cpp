@@ -265,11 +265,13 @@ P50SourceArmFields make_p50_source_arm(
     arm.selected_f_ordinary_port = assignment.port;
     arm.selected_f_cache_port = assignment.cache_endpoint_port;
     arm.cache_protocol = assignment.cache_protocol;
-    arm.cache_profile = profile == icecc::p50::ProfileId::Z3_LONG
-                            ? CACHE_PROFILE_ZSTD_ROUTE
-                            : (profile == icecc::p50::ProfileId::GRZ
-                                   ? CACHE_PROFILE_GRZ
-                                   : CACHE_PROFILE_ZSTD_TU);
+    arm.cache_profile = profile == icecc::p50::ProfileId::P29
+                            ? CACHE_PROFILE_P29
+                            : (profile == icecc::p50::ProfileId::Z3_LONG
+                                   ? CACHE_PROFILE_ZSTD_ROUTE
+                                   : (profile == icecc::p50::ProfileId::GRZ
+                                          ? CACHE_PROFILE_GRZ
+                                          : CACHE_PROFILE_ZSTD_TU));
     arm.logical_job = job.jobID();
     arm.compiler_attempt = assignment.assignmentNonce();
     arm.c_store_generation = context.process_generation;
@@ -279,11 +281,13 @@ P50SourceArmFields make_p50_source_arm(
     // committed InputRecord request_id with this exact token, so it must be
     // the UseCS assignment nonce rather than an unrelated local sequence.
     arm.source_request_id = assignment.assignmentNonce();
-    arm.source_mode = profile == icecc::p50::ProfileId::Z3_LONG
-                          ? P50_SOURCE_MODE_ZSTD_ROUTE
-                          : (profile == icecc::p50::ProfileId::GRZ
-                                 ? P50_SOURCE_MODE_GRZ_RESIDUAL
-                                 : P50_SOURCE_MODE_ZSTD_TU);
+    arm.source_mode = profile == icecc::p50::ProfileId::P29
+                          ? P50_SOURCE_MODE_P29
+                          : (profile == icecc::p50::ProfileId::Z3_LONG
+                                 ? P50_SOURCE_MODE_ZSTD_ROUTE
+                                 : (profile == icecc::p50::ProfileId::GRZ
+                                        ? P50_SOURCE_MODE_GRZ_RESIDUAL
+                                        : P50_SOURCE_MODE_ZSTD_TU));
     arm.c_control_generation = context.process_generation;
     arm.c_control_attempt = context.transfer_sequence;
     return arm;
@@ -826,11 +830,13 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                 ? icecc::p50::p50_zstd_selected_profile(*usecs, cserver->protocol)
                 : std::nullopt;
             const char *const p50_profile_name =
-                p50_profile == icecc::p50::ProfileId::Z3_LONG
-                    ? "ZSTD_ROUTE"
-                    : (p50_profile == icecc::p50::ProfileId::GRZ
-                           ? "GRZ_RESIDUAL"
-                           : "ZSTD_TU");
+                p50_profile == icecc::p50::ProfileId::P29
+                    ? "P29"
+                    : (p50_profile == icecc::p50::ProfileId::Z3_LONG
+                           ? "ZSTD_ROUTE"
+                           : (p50_profile == icecc::p50::ProfileId::GRZ
+                                  ? "GRZ_RESIDUAL"
+                                  : "ZSTD_TU"));
             p50_input = p50_profile.has_value();
             if (getenv("ICECC_P50_C1F1_REQUIRED") != nullptr && !p50_input)
                 throw remote_error(

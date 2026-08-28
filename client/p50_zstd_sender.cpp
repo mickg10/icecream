@@ -118,6 +118,7 @@ struct P50ZstdSourceSender::Impl {
             return invalid(ZstdSourceTransferStatus::CommittedIdentityUnavailable);
         ZstdSourceTransferResult result;
         result.status = ZstdSourceTransferStatus::Committed;
+        result.profile = config.endpoint_caps.profile;
         result.committed_input = run.committed_input;
         result.raw_bytes = raw_bytes;
         result.raw_digest = raw_digest;

@@ -52,8 +52,11 @@ void test_exact_mode_admission() {
                                        PROTOCOL_VERSION_CACHE_ADVERTISEMENT));
     mutant = assignment;
     mutant.cache_profile_mask = CACHE_PROFILE_P29;
-    CHECK(!p50_zstd_compile_admissible(mutant,
-                                       PROTOCOL_VERSION_CACHE_ADVERTISEMENT));
+    CHECK(p50_zstd_compile_admissible(mutant,
+                                      PROTOCOL_VERSION_CACHE_ADVERTISEMENT));
+    CHECK(p50_zstd_selected_profile(mutant,
+                                    PROTOCOL_VERSION_CACHE_ADVERTISEMENT) ==
+          std::optional<ProfileId>{ProfileId::P29});
     mutant.cache_profile_mask = CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE;
     CHECK(!p50_zstd_compile_admissible(mutant,
                                        PROTOCOL_VERSION_CACHE_ADVERTISEMENT));
@@ -93,13 +96,20 @@ void test_explicit_profile_selection() {
           CACHE_PROFILE_ZSTD_ROUTE);
     CHECK(p50_select_cache_profile(CACHE_PROFILE_ZSTD_TU,
                                    P50CacheProfileRequest::ZSTD_ROUTE) == 0);
+    CHECK(p50_cache_profile_request_from_env() != P50CacheProfileRequest::P29);
+    CHECK(::setenv("ICECC_P50_PROFILE", "P29", 1) == 0);
+    CHECK(p50_cache_profile_request_from_env() == P50CacheProfileRequest::P29);
+    CHECK(p50_select_cache_profile(CACHE_PROFILE_P29,
+                                   P50CacheProfileRequest::P29) == CACHE_PROFILE_P29);
+    CHECK(p50_select_cache_profile(CACHE_PROFILE_ZSTD_TU,
+                                   P50CacheProfileRequest::P29) == 0);
 
     CHECK(::setenv("ICECC_P50_PROFILE", "UNSUPPORTED_PROFILE", 1) == 0);
     CHECK(p50_cache_profile_request_from_env() ==
           P50CacheProfileRequest::Unsupported);
     CHECK(p50_select_cache_profile(advertised,
                                    P50CacheProfileRequest::Unsupported) == 0);
-    CHECK(p50_select_cache_profile(advertised | CACHE_PROFILE_P29,
+    CHECK(p50_select_cache_profile(advertised | CACHE_PROFILE_Z3_SHARED_LONG,
                                    P50CacheProfileRequest::ZSTD_ROUTE) == 0);
     CHECK(::unsetenv("ICECC_P50_PROFILE") == 0);
 }
@@ -151,6 +161,9 @@ void test_only_exact_commit_binds_compile_selector() {
     CHECK(!bind_compile_input(job, guid, mutant));
     mutant = transfer;
     mutant.attempts = 3;
+    CHECK(!bind_compile_input(job, guid, mutant));
+    mutant = transfer;
+    mutant.profile = ProfileId::GRZ;
     CHECK(!bind_compile_input(job, guid, mutant));
     CHECK(!bind_compile_input(CompileJob{}, guid, transfer));
 }

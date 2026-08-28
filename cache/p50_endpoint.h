@@ -5,6 +5,7 @@
 #include "p50_profile.h"
 #include "p50_sidecar_supervisor.h"
 #include "p50_zstd.h"
+#include "p50_slice0.h"
 #include "p50_endpoint_run_cancel.h"
 #include "services/p50_cache_session_wire.h"
 
@@ -44,6 +45,19 @@ struct EndpointCaps {
     uint32_t supported_profiles = kOperationalProfileMask;
     auto operator<=>(const EndpointCaps&) const = default;
 };
+
+/* One immutable prepared source.  ZSTD profiles populate BODY only; P29
+   populates its key-vector DICT/BODY and the exact object records which answer
+   the F-side Need.  Keeping the two representations in one envelope lets
+   the endpoint reducer remain profile-neutral without treating P29 as a
+   compressed ZSTD variant. */
+struct PreparedInputEnvelope {
+    TxBegin begin;
+    std::vector<uint8_t> dict;
+    std::vector<uint8_t> body;
+    std::vector<FillRecord> p29_fill_records;
+};
+using PreparedInputPtr = std::shared_ptr<const PreparedInputEnvelope>;
 
 enum class AsyncOperationKind : uint8_t {
     Accept,
@@ -228,7 +242,7 @@ public:
     [[nodiscard]] ProfileId profile() const;
 
 private:
-    std::shared_ptr<const ZstdTuEnvelope> resolve(PreparedTuHandle handle) const;
+    PreparedInputPtr resolve(PreparedTuHandle handle) const;
     void validate_begin(const TxBegin& begin) const;
 
     struct Impl;
