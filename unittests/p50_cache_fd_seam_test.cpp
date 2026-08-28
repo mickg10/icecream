@@ -62,6 +62,13 @@ P50CacheSessionFdRequestFields request()
         UINT64_C(0x8877665544332211), CACHE_PROFILE_ZSTD_TU};
 }
 
+P50CacheControlIdentity control_identity()
+{
+    return P50CacheControlIdentity{
+        UINT64_C(0x1112131415161718),
+        UINT64_C(0x2122232425262728)};
+}
+
 std::chrono::steady_clock::time_point deadline()
 {
     return std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -84,7 +91,8 @@ void put64(std::array<uint8_t, P50_CACHE_FD_LEASE_BYTES> &wire,
 }
 
 std::array<uint8_t, P50_CACHE_FD_LEASE_BYTES> lease_wire(
-    const P50CacheSessionFdRequestFields &value)
+    const P50CacheSessionFdRequestFields &value,
+    P50CacheControlIdentity identity = control_identity())
 {
     std::array<uint8_t, P50_CACHE_FD_LEASE_BYTES> wire{};
     put32(wire, 0, P50_CACHE_FD_LEASE_MAGIC);
@@ -93,6 +101,8 @@ std::array<uint8_t, P50_CACHE_FD_LEASE_BYTES> lease_wire(
     put64(wire, 12, value.assignment_epoch);
     put64(wire, 20, value.assignment_nonce);
     put32(wire, 28, value.profile);
+    put64(wire, 32, identity.generation);
+    put64(wire, 40, identity.attempt);
     return wire;
 }
 
@@ -132,7 +142,10 @@ void test_request_and_deleted_source()
 {
     ChannelPair pair = make_pair();
     const auto expected = request();
-    CHECK(pair.left->receive_p50_cache_fd_reply(expected, deadline()) == -1);
+    P50CacheControlIdentity observed;
+    CHECK(pair.left->receive_p50_cache_fd_reply(
+              expected, observed, deadline()) == -1);
+    CHECK(!observed.valid());
     P50CacheSessionFdRequestMsg outbound(expected);
     CHECK(pair.left->send_msg(outbound));
     Msg *decoded = pair.right->get_msg(2, true);
@@ -145,17 +158,22 @@ void test_request_and_deleted_source()
     const char contents[] = "source survives unlink";
     CHECK(::write(source, contents, sizeof(contents)) == sizeof(contents));
     CHECK(::unlink(path) == 0);
-    CHECK(pair.right->send_p50_cache_fd_reply(*typed, source, deadline()));
+    CHECK(pair.right->send_p50_cache_fd_reply(
+        *typed, control_identity(), source, deadline()));
     delete decoded;
 
-    const int received = pair.left->receive_p50_cache_fd_reply(expected, deadline());
+    const int received = pair.left->receive_p50_cache_fd_reply(
+        expected, observed, deadline());
     CHECK(received >= 0);
+    CHECK(observed == control_identity());
     CHECK(::lseek(received, 0, SEEK_SET) == 0);
     char readback[sizeof(contents)]{};
     CHECK(::read(received, readback, sizeof(readback)) == sizeof(readback));
     CHECK(std::memcmp(readback, contents, sizeof(contents)) == 0);
     ::close(received);
-    CHECK(pair.left->receive_p50_cache_fd_reply(expected, deadline()) == -1);
+    CHECK(pair.left->receive_p50_cache_fd_reply(
+              expected, observed, deadline()) == -1);
+    CHECK(!observed.valid());
 }
 
 void test_wrong_echo_consumes_reply_arm()
@@ -172,13 +190,48 @@ void test_wrong_echo_consumes_reply_arm()
     const int source = ::open("/dev/null", O_RDONLY);
     CHECK(source >= 0);
     CHECK(!pair.right->send_p50_cache_fd_reply(
-        P50CacheSessionFdRequestMsg(wrong), source, deadline()));
+        P50CacheSessionFdRequestMsg(wrong), control_identity(), source,
+        deadline()));
     CHECK(::fcntl(source, F_GETFD) == -1 && errno == EBADF);
     const int replacement = ::open("/dev/null", O_RDONLY);
     CHECK(replacement >= 0);
-    CHECK(!pair.right->send_p50_cache_fd_reply(*typed, replacement, deadline()));
+    CHECK(!pair.right->send_p50_cache_fd_reply(
+        *typed, control_identity(), replacement, deadline()));
     CHECK(::fcntl(replacement, F_GETFD) == -1 && errno == EBADF);
     delete decoded;
+}
+
+void test_control_identity_is_required()
+{
+    ChannelPair pair = make_pair();
+    const auto expected = request();
+    P50CacheSessionFdRequestMsg outbound(expected);
+    CHECK(pair.left->send_msg(outbound));
+    Msg *decoded = pair.right->get_msg(2, true);
+    auto *typed = dynamic_cast<P50CacheSessionFdRequestMsg *>(decoded);
+    CHECK(typed != nullptr);
+    const int source = ::open("/dev/null", O_RDONLY);
+    CHECK(source >= 0);
+    CHECK(!pair.right->send_p50_cache_fd_reply(
+        *typed, P50CacheControlIdentity{}, source, deadline()));
+    CHECK(::fcntl(source, F_GETFD) == -1 && errno == EBADF);
+    delete decoded;
+
+    ChannelPair raw_pair = make_pair();
+    P50CacheSessionFdRequestMsg raw_outbound(expected);
+    CHECK(raw_pair.left->send_msg(raw_outbound));
+    Msg *raw_decoded = raw_pair.right->get_msg(2, true);
+    CHECK(dynamic_cast<P50CacheSessionFdRequestMsg *>(raw_decoded) != nullptr);
+    const auto wire = lease_wire(expected, P50CacheControlIdentity{});
+    const int raw_source = ::open("/dev/null", O_RDONLY);
+    CHECK(raw_source >= 0);
+    send_raw(raw_pair.right->fd, wire.data(), wire.size(), &raw_source, 1);
+    P50CacheControlIdentity observed;
+    CHECK(raw_pair.left->receive_p50_cache_fd_reply(
+              expected, observed, deadline()) == -1);
+    CHECK(!observed.valid());
+    ::close(raw_source);
+    delete raw_decoded;
 }
 
 void test_extra_fd_and_trailing_bytes_are_rejected()
@@ -200,7 +253,10 @@ void test_extra_fd_and_trailing_bytes_are_rejected()
             const int fds[2] = {first, second};
             send_raw(pair.right->fd, wire.data(), wire.size(), fds, 2);
         }
-        CHECK(pair.left->receive_p50_cache_fd_reply(expected, deadline()) == -1);
+        P50CacheControlIdentity observed;
+        CHECK(pair.left->receive_p50_cache_fd_reply(
+                  expected, observed, deadline()) == -1);
+        CHECK(!observed.valid());
         ::close(first);
         ::close(second);
     }
@@ -212,7 +268,9 @@ void test_extra_fd_and_trailing_bytes_are_rejected()
     const int source = ::open("/dev/null", O_RDONLY);
     CHECK(source >= 0);
     send_raw(pair.right->fd, wrong.data(), wrong.size(), &source, 1);
-    CHECK(pair.left->receive_p50_cache_fd_reply(expected, deadline()) == -1);
+    P50CacheControlIdentity observed;
+    CHECK(pair.left->receive_p50_cache_fd_reply(
+              expected, observed, deadline()) == -1);
     ::close(source);
 }
 
@@ -224,7 +282,9 @@ void test_short_reply_is_rejected()
     const int source = ::open("/dev/null", O_RDONLY);
     CHECK(source >= 0);
     send_raw(pair.right->fd, wire.data(), 7, &source, 1);
-    CHECK(pair.left->receive_p50_cache_fd_reply(expected, deadline()) == -1);
+    P50CacheControlIdentity observed;
+    CHECK(pair.left->receive_p50_cache_fd_reply(
+              expected, observed, deadline()) == -1);
     ::close(source);
 }
 
@@ -241,7 +301,8 @@ void test_dirty_sender_boundary_is_rejected()
     CHECK(::send(pair.left->fd, &dirty, sizeof(dirty), MSG_NOSIGNAL) == 1);
     const int source = ::open("/dev/null", O_RDONLY);
     CHECK(source >= 0);
-    CHECK(!pair.right->send_p50_cache_fd_reply(*typed, source, deadline()));
+    CHECK(!pair.right->send_p50_cache_fd_reply(
+        *typed, control_identity(), source, deadline()));
     CHECK(::fcntl(source, F_GETFD) == -1 && errno == EBADF);
     ::close(source);
     delete decoded;
@@ -264,10 +325,12 @@ void test_chunked_reply_and_receive_deadline()
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         send_plain(pair.right->fd, wire.data() + 7, wire.size() - 7);
     });
-    const int received = pair.left->receive_p50_cache_fd_reply(expected,
-                                                                  deadline());
+    P50CacheControlIdentity observed;
+    const int received = pair.left->receive_p50_cache_fd_reply(
+        expected, observed, deadline());
     writer.join();
     CHECK(received >= 0);
+    CHECK(observed == control_identity());
     ::close(received);
     ::close(source);
     delete decoded;
@@ -282,13 +345,16 @@ void test_receive_eagain_consumes_arm()
     Msg *decoded = pair.right->get_msg(2, true);
     auto *typed = dynamic_cast<P50CacheSessionFdRequestMsg *>(decoded);
     CHECK(typed != nullptr);
+    P50CacheControlIdentity observed;
     CHECK(pair.left->receive_p50_cache_fd_reply(
-              expected, std::chrono::steady_clock::now() +
+              expected, observed, std::chrono::steady_clock::now() +
                             std::chrono::milliseconds(20)) == -1);
     const int source = ::open("/dev/null", O_RDONLY);
     CHECK(source >= 0);
-    CHECK(pair.right->send_p50_cache_fd_reply(*typed, source, deadline()));
-    CHECK(pair.left->receive_p50_cache_fd_reply(expected, deadline()) == -1);
+    CHECK(pair.right->send_p50_cache_fd_reply(
+        *typed, control_identity(), source, deadline()));
+    CHECK(pair.left->receive_p50_cache_fd_reply(
+              expected, observed, deadline()) == -1);
     delete decoded;
 }
 
@@ -304,7 +370,8 @@ void test_sender_deadline_consumes_fd()
     const int source = ::open("/dev/null", O_RDONLY);
     CHECK(source >= 0);
     CHECK(!pair.right->send_p50_cache_fd_reply(
-        *typed, source, std::chrono::steady_clock::now()));
+        *typed, control_identity(), source,
+        std::chrono::steady_clock::now()));
     CHECK(::fcntl(source, F_GETFD) == -1 && errno == EBADF);
     delete decoded;
 }
@@ -317,7 +384,9 @@ void test_ordinary_mutation_clears_receive_arm()
     CHECK(pair.left->send_msg(outbound));
     PingMsg ping;
     CHECK(pair.left->send_msg(ping));
-    CHECK(pair.left->receive_p50_cache_fd_reply(expected, deadline()) == -1);
+    P50CacheControlIdentity observed;
+    CHECK(pair.left->receive_p50_cache_fd_reply(
+              expected, observed, deadline()) == -1);
 }
 
 } // namespace
@@ -327,6 +396,7 @@ int main()
     try {
         test_request_and_deleted_source();
         test_wrong_echo_consumes_reply_arm();
+        test_control_identity_is_required();
         test_extra_fd_and_trailing_bytes_are_rejected();
         test_short_reply_is_rejected();
         test_dirty_sender_boundary_is_rejected();

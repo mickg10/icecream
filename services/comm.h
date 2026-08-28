@@ -554,10 +554,11 @@ inline constexpr uint32_t CACHE_SESSION_READY_MAGIC = UINT32_C(0x50f00001);
 
 /* Fixed raw reply value for the compiler/cache control descriptor.  The
    payload is: magic, version, wire job, assignment epoch, assignment nonce,
-   and selected profile, all in network byte order. */
+   selected profile, and the already-authenticated sidecar generation/attempt,
+   all in network byte order. */
 inline constexpr uint32_t P50_CACHE_FD_LEASE_MAGIC = UINT32_C(0x5035464c);
-inline constexpr uint32_t P50_CACHE_FD_LEASE_VERSION = 1;
-inline constexpr size_t P50_CACHE_FD_LEASE_BYTES = 32;
+inline constexpr uint32_t P50_CACHE_FD_LEASE_VERSION = 2;
+inline constexpr size_t P50_CACHE_FD_LEASE_BYTES = 48;
 
 /* Send the exact network-order CACHE_SESSION_READY_MAGIC under one absolute
    steady-clock deadline.  The caller retains descriptor ownership. */
@@ -670,6 +671,23 @@ struct P50CacheSessionFdRequestFields
     }
 
     auto operator<=>(const P50CacheSessionFdRequestFields &) const = default;
+};
+
+/* Identity of the supervised cache-service incarnation whose HELLO/ACK was
+   already completed by the local daemon before it passed the descriptor.
+   The wrapper uses this exact value on the first post-handshake control frame;
+   it never authors or guesses a sidecar incarnation. */
+struct P50CacheControlIdentity
+{
+    uint64_t generation = 0;
+    uint64_t attempt = 0;
+
+    [[nodiscard]] bool valid() const noexcept
+    {
+        return generation != 0 && attempt != 0;
+    }
+
+    auto operator<=>(const P50CacheControlIdentity &) const = default;
 };
 
 /* Shared absent-or-present law for a three-word CacheWire advertisement.
@@ -835,10 +853,12 @@ public:
        (success and failure); the receiver owns the returned descriptor on
        success. */
     bool send_p50_cache_fd_reply(
-        const P50CacheSessionFdRequestMsg &request, int transfer_fd,
+        const P50CacheSessionFdRequestMsg &request,
+        P50CacheControlIdentity control_identity, int transfer_fd,
         std::chrono::steady_clock::time_point deadline) noexcept;
     int receive_p50_cache_fd_reply(
         const P50CacheSessionFdRequestFields &expected,
+        P50CacheControlIdentity &control_identity,
         std::chrono::steady_clock::time_point deadline) noexcept;
 
     /* Bytes which remain inside the frame currently being decoded.  This is

@@ -3660,8 +3660,19 @@ void p50_fd_put_u64(std::array<uint8_t, P50_CACHE_FD_LEASE_BYTES> &wire,
         wire[offset + i] = static_cast<uint8_t>(value >> (56 - i * 8));
 }
 
+uint64_t p50_fd_get_u64(
+    const std::array<uint8_t, P50_CACHE_FD_LEASE_BYTES> &wire,
+    size_t offset) noexcept
+{
+    uint64_t value = 0;
+    for (size_t i = 0; i != 8; ++i)
+        value = (value << 8) | wire[offset + i];
+    return value;
+}
+
 std::array<uint8_t, P50_CACHE_FD_LEASE_BYTES>
-p50_fd_lease_wire(const P50CacheSessionFdRequestFields &request) noexcept
+p50_fd_lease_wire(const P50CacheSessionFdRequestFields &request,
+                  P50CacheControlIdentity control_identity) noexcept
 {
     std::array<uint8_t, P50_CACHE_FD_LEASE_BYTES> wire{};
     p50_fd_put_u32(wire, 0, P50_CACHE_FD_LEASE_MAGIC);
@@ -3670,6 +3681,8 @@ p50_fd_lease_wire(const P50CacheSessionFdRequestFields &request) noexcept
     p50_fd_put_u64(wire, 12, request.assignment_epoch);
     p50_fd_put_u64(wire, 20, request.assignment_nonce);
     p50_fd_put_u32(wire, 28, request.profile);
+    p50_fd_put_u64(wire, 32, control_identity.generation);
+    p50_fd_put_u64(wire, 40, control_identity.attempt);
     return wire;
 }
 
@@ -3710,7 +3723,8 @@ bool p50_fd_wait(int socket, short events,
 } // namespace
 
 bool MsgChannel::send_p50_cache_fd_reply(
-    const P50CacheSessionFdRequestMsg &request, int transfer_fd,
+    const P50CacheSessionFdRequestMsg &request,
+    P50CacheControlIdentity control_identity, int transfer_fd,
     std::chrono::steady_clock::time_point deadline) noexcept
 {
     const bool ready = !p50_fd_reply_arm_consumed &&
@@ -3718,7 +3732,8 @@ bool MsgChannel::send_p50_cache_fd_reply(
         protocol == PROTOCOL_VERSION &&
         !eof && instate == NEED_LEN && inofs == intogo && msgtogo == 0 &&
         pending_frame_ends.empty() && framesFlushed() == framesQueued() &&
-        request.valid_payload() && request.request == p50_last_fd_request;
+        request.valid_payload() && request.request == p50_last_fd_request &&
+        control_identity.valid();
     p50_fd_reply_arm_consumed = true;
     if (!ready || !p50_fd_socket_idle(fd)) {
         if (transfer_fd >= 0)
@@ -3727,7 +3742,7 @@ bool MsgChannel::send_p50_cache_fd_reply(
         return false;
     }
 
-    const auto wire = p50_fd_lease_wire(request.request);
+    const auto wire = p50_fd_lease_wire(request.request, control_identity);
     alignas(cmsghdr) std::array<uint8_t, CMSG_SPACE(sizeof(int))> control{};
     size_t offset = 0;
     bool rights_sent = false;
@@ -3785,8 +3800,10 @@ bool MsgChannel::send_p50_cache_fd_reply(
 
 int MsgChannel::receive_p50_cache_fd_reply(
     const P50CacheSessionFdRequestFields &expected,
+    P50CacheControlIdentity &control_identity,
     std::chrono::steady_clock::time_point deadline) noexcept
 {
+    control_identity = {};
     if (!p50_fd_receive_arm)
         return -1;
     const bool ready =
@@ -3891,9 +3908,14 @@ int MsgChannel::receive_p50_cache_fd_reply(
         }
     };
 
+    P50CacheControlIdentity observed_identity;
+    if (offset == wire.size()) {
+        observed_identity.generation = p50_fd_get_u64(wire, 32);
+        observed_identity.attempt = p50_fd_get_u64(wire, 40);
+    }
     const bool exact_payload =
-        offset == wire.size() &&
-        wire == p50_fd_lease_wire(expected);
+        offset == wire.size() && observed_identity.valid() &&
+        wire == p50_fd_lease_wire(expected, observed_identity);
     const bool exact_control = !malformed_control && fd_count == 1 &&
         (message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) == 0;
     if (!exact_payload || !exact_control) {
@@ -3913,6 +3935,7 @@ int MsgChannel::receive_p50_cache_fd_reply(
 
     const int result = received_fds[0];
     received_fds[0] = -1;
+    control_identity = observed_identity;
     p50_note_channel_mutation();
     return result;
 }

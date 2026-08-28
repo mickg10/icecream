@@ -8755,7 +8755,10 @@ bool Daemon::handle_p50_cache_session_fd_request(
         return refuse("cannot mark cache-service control descriptor close-on-exec");
     }
 
-    if (!client->channel->send_p50_cache_fd_reply(*msg, transfer_fd, deadline))
+    const P50CacheControlIdentity control_identity{
+        identity.generation, identity.attempt};
+    if (!client->channel->send_p50_cache_fd_reply(
+            *msg, control_identity, transfer_fd, deadline))
         return refuse("cannot deliver cache-service control descriptor");
 
     trace() << "P50 C-cache control descriptor delivered for assignment "
