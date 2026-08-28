@@ -31,7 +31,7 @@ from capability.distribution import s5_statistics
 
 
 SCHEMA = "icecream-s5-zstd-tu-paired-run-v1"
-EXPECTED_ROOT = "4dd7334a56dbae7456969b0d9a9a420e1afb2b2a"
+EXPECTED_ROOT = "9a1653e600fbb28a7edeef02c10c5ccc5fe8fcad"
 # This field is a historical name in the S5 schema; it carries the pinned
 # source commit identity, not a digest of the external workload checkout.
 SOURCE_SHA = EXPECTED_ROOT
@@ -43,11 +43,11 @@ PROCESS_MARKERS = ("icecc-scheduler", "iceccd", "icecc-cache-service", "icecc")
 # environment.  Keep this S5 identity private to the runner: changing S4's
 # historical matrix constants would silently alter its prior evidence.
 P50_ROLE_HASHES = {
-    "S": "d9d00fcf02b81bdf23aa9e5aad4cdc8a4c33a110fb42aed7a33f5e0e51eb3698",
-    "F": "3c3a9f630579ae3660d9493c17b5a0a7d571dda10726cbb43c237da98af8bcba",
-    "C": "e9a87f11ede45465377c71a54f35a0e735e979a2a581a3e63b56992b56f0a64e",
+    "S": "8857b14179559d0efc9b588c29a6f0fe6c922c9f40d9fc2de498887257931212",
+    "F": "56f6667da25d99660a335eb2349578946f5c1d096726dffa94df5f9fd8c62136",
+    "C": "60004a5cd00ce8f54bc667217b87c02236c0d8d350260f81d0cfb5805ab4c985",
     "E": "ee7d30b240c38bccf66d4afcdd45993f115a01d4a2fb4e9143d38596609d2ba4",
-    "X": "e9fb6c4ea1b1044f71dcbfc2a7754d79359bf408837da8a043e66d060fddcdfe",
+    "X": "dcc6278720c409eeab1efb1491d61232f693b80159b22d4a5659853c0a43ae70",
 }
 SSH = ["-o", "HostName=10.0.27.101", "-o", "HostKeyAlias=tt-quietbox3",
        "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
@@ -176,16 +176,16 @@ def _target_preflight(args: argparse.Namespace) -> dict[str, Any]:
 
 def preflight(args: argparse.Namespace) -> dict[str, Any]:
     local = _local_process_facts()
-    # Probe the target even when the local host is dirty.  This is read-only
-    # and gives the HOLD record complete process/target facts for triage.
+    # The orchestrator does not run a scheduler, daemon, compiler, or cache
+    # process locally.  Record local Icecream processes for context, but scope
+    # the execution gate to the remote host and private experiment resources
+    # that can affect the measured build.
     target = _target_preflight(args)
-    if local:
-        return {"status": "HOLD", "reason": "local-process-contention", "local_processes": local,
-                "target": target}
     if target.get("status") != "READY":
         return {"status": "HOLD", "reason": target.get("reason", "target-contention"),
-                "local_processes": [], "target": target}
-    return {"status": "READY", "reason": "uncontaminated", "local_processes": [], "target": target}
+                "local_processes": local, "target": target}
+    return {"status": "READY", "reason": "target-uncontaminated",
+            "local_processes": local, "target": target}
 
 
 def role_manifest(root: Path) -> dict[str, Any]:
@@ -362,21 +362,36 @@ def _remote_script(source_archive_b64: str, tus: list[dict[str, Any]], mode: str
     if old not in script:
         raise RuntimeError("S4 source generation seam changed")
     script = script.replace(old, extract.rstrip("\n"), 1)
-    old_remote = 'env "${CLIENT_ENV[@]}" timeout 150 "$C" g++ -std=c++17 -O2 -c "$WORK/main.cpp" -o "$REMOTE_OBJ"'
+    old_remote = ('env "${CLIENT_ENV[@]}" timeout 150 "$C" g++ -std=c++17 -O2 '
+                  '-c "$WORK/main.cpp" -o "$REMOTE_OBJ" \\\n'
+                  "  >\"$WORK/client.log\" 2>&1 || { echo 'S4_STATUS=FAIL reason=remote-compile'; exit 1; }")
     old_local = ('g++ -std=c++17 -O2 -c "$WORK/main.cpp" -o "$LOCAL_OBJ" '
                  '2>"$WORK/local.log" || {\n'
                  "    echo 'S4_STATUS=FAIL reason=local-reference'; exit 1;\n"
                  "}")
     if old_remote not in script or old_local not in script:
         raise RuntimeError("S4 compile seam changed")
-    script = script.replace(old_remote, start + compile_line, 1)
+    measured_remote = (start + compile_line + ' \\\n'
+                       "  >\"$WORK/client.log\" 2>&1 || { echo 'S4_STATUS=FAIL reason=remote-compile'; exit 1; }\n"
+                       + finish.rstrip("\n"))
+    script = script.replace(old_remote, measured_remote, 1)
     script = script.replace(old_local, local_line + ' 2>"$WORK/local.log" || {\n'
                             "    echo 'S4_STATUS=FAIL reason=local-reference'; exit 1;\n"
-                            "}\n" + finish, 1)
-    script = script.replace('echo "S4_CACHE_OBSERVED=$cache_seen"',
+                            "}", 1)
+    marker = 'echo "S4_CACHE_OBSERVED=$cache_seen"'
+    if marker not in script:
+        raise RuntimeError("S4 result marker changed")
+    script = script.replace(marker,
                             'echo "S5_MEASURE_START_NS=$S5_MEASURE_START_NS"\n'
-                            'echo "S5_MEASURE_END_NS=$S5_MEASURE_END_NS"\n'
-                            'echo "S4_CACHE_OBSERVED=$cache_seen"', 1)
+                            'echo "S5_MEASURE_END_NS=$S5_MEASURE_END_NS"\n' + marker)
+    if mode == "legacy":
+        strict_scheduler = ('case "$CELL" in\n'
+                            '  s50-c50-f50|s50-c50-f50-c1f2) '
+                            'S_EXTRA="--assignment-fence-mode strict-nonce";;\n'
+                            'esac')
+        if strict_scheduler not in script:
+            raise RuntimeError("S4 strict scheduler seam changed")
+        script = script.replace(strict_scheduler, 'S_EXTRA=""', 1)
     hashes = P50_ROLE_HASHES
     script = script.replace("$S_HASH", hashes["S"])
     script = script.replace("$C_HASH", hashes["C"])

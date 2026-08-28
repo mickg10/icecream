@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 from farmharness.s5_paired_build import (
-    immutable_json, load_workload, preflight, role_manifest, run_build,
+    _remote_script, immutable_json, load_workload, preflight, role_manifest, run_build,
     schedule, schedule_matrix,
 )
 
@@ -40,15 +40,16 @@ class PairedRunnerTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "exact-role-binary-mismatch"):
                 role_manifest(Path(directory))
 
-    def test_local_contention_still_records_target_probe(self):
+    def test_unrelated_local_processes_are_recorded_but_do_not_veto_clean_target(self):
         args = type("Args", (), {"timeout": 1.0})()
         with mock.patch("farmharness.s5_paired_build._local_process_facts",
                         return_value=[{"pid": "123", "command": "iceccd"}]), \
              mock.patch("farmharness.s5_paired_build._target_preflight",
                         return_value={"status": "READY", "reason": "target-clean"}) as target:
             result = preflight(args)
-        self.assertEqual(result["status"], "HOLD")
-        self.assertEqual(result["reason"], "local-process-contention")
+        self.assertEqual(result["status"], "READY")
+        self.assertEqual(result["reason"], "target-uncontaminated")
+        self.assertEqual(result["local_processes"][0]["pid"], "123")
         self.assertEqual(result["target"]["reason"], "target-clean")
         target.assert_called_once_with(args)
 
@@ -64,6 +65,15 @@ class PairedRunnerTest(unittest.TestCase):
         self.assertEqual(row["reason"], "warm-state-cell-not-available")
         self.assertIsNone(row["start_ns"])
         remote.assert_not_called()
+
+    def test_remote_script_scopes_strict_assignment_and_measures_remote_compile(self):
+        tu = {"source": "src/format.cc", "flags": ["-O3"]}
+        cache = _remote_script("archive", [tu], "cache", Path("/unused"))
+        legacy = _remote_script("archive", [tu], "legacy", Path("/unused"))
+        self.assertIn("--assignment-fence-mode strict-nonce", cache)
+        self.assertNotIn("--assignment-fence-mode strict-nonce", legacy)
+        self.assertIn("S5_MEASURE_END_NS=$(date +%s%N)\ng++ -O3", cache)
+        self.assertEqual(cache.count('echo "S5_MEASURE_START_NS='), 2)
 
     def test_manifest_deduplicates_same_translation_unit(self):
         with tempfile.TemporaryDirectory() as directory:
