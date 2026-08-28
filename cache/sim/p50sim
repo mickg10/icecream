@@ -51,6 +51,23 @@ def canonical_json(path: Path) -> dict[str, object]:
     return value
 
 
+def canonical_jsonl(path: Path) -> list[dict[str, object]]:
+    if not regular(path):
+        raise ValueError(f"not a private regular file: {path.name}")
+    rows: list[dict[str, object]] = []
+    for line_number, raw_line in enumerate(path.read_bytes().splitlines(), 1):
+        try:
+            value = json.loads(raw_line)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"action trace line {line_number} is not JSON") from error
+        if not isinstance(value, dict):
+            raise ValueError(f"action trace line {line_number} is not an object")
+        rows.append(value)
+    if not rows:
+        raise ValueError("canonical live action trace is empty")
+    return rows
+
+
 def child(root: Path, name: object) -> Path:
     if not isinstance(name, str) or not name or Path(name).is_absolute():
         raise ValueError("scenario paths must be relative strings")
@@ -85,17 +102,30 @@ def main(argv: list[str]) -> int:
             return 0
         input_path = child(artifacts, scenario.get("input"))
         route_path = child(artifacts, scenario.get("route_trace"))
+        action_path = child(artifacts, scenario.get("action_trace"))
         input_sha, _ = digest(input_path)
         route_sha, _ = digest(route_path)
+        action_sha, _ = digest(action_path)
         if scenario.get("input_sha256") != input_sha:
             raise ValueError("scenario input digest mismatch")
         if scenario.get("route_trace_sha256") != route_sha:
             raise ValueError("canonical route trace digest mismatch")
+        if scenario.get("action_trace_sha256") != action_sha:
+            raise ValueError("canonical live action trace digest mismatch")
         route = canonical_json(route_path)
         if route.get("schema") != "icecream-s7-live-route-trace-v1" or route.get("origin") != "live":
             raise ValueError("route trace is not a canonical live trace")
         if not isinstance(route.get("trace"), list) or not route["trace"]:
             raise ValueError("canonical live route trace is empty")
+        expected_actions = canonical_jsonl(action_path)
+        if route.get("actions") != [row.get("action") for row in expected_actions]:
+            raise ValueError("route trace action sequence differs from live action trace")
+        expected_route = [
+            {"action": row.get("action"), "sequence": sequence}
+            for sequence, row in enumerate(expected_actions, 1)
+        ]
+        if route.get("trace") != expected_route:
+            raise ValueError("route trace stages differ from live action trace")
         binary = Path(__file__).with_name(".p50sim.bin")
         if not regular(binary) or not os.access(binary, os.X_OK):
             raise ValueError("p50sim production binary is not built")
@@ -113,7 +143,9 @@ def main(argv: list[str]) -> int:
             raise ValueError("production execution omitted action or summary evidence")
         # The C++ endpoint writes the authoritative Protocol-50 trace. Keep a
         # separate digest witness so later adapters cannot substitute a fixture.
-        action_sha, _ = digest(actions)
+        produced_action_sha, _ = digest(actions)
+        if canonical_jsonl(actions) != expected_actions:
+            raise ValueError("production replay differs from canonical live action trace")
         summary_value = json.loads(summary.read_bytes())
         if not isinstance(summary_value, dict):
             raise ValueError("production execution summary is not an object")
@@ -126,7 +158,7 @@ def main(argv: list[str]) -> int:
                 "cell": cell,
                 "input_sha256": input_sha,
                 "route_trace_sha256": route_sha,
-                "action_trace_sha256": action_sha,
+                "action_trace_sha256": produced_action_sha,
             }, sort_keys=True, separators=(",", ":")) + "\n",
             encoding="utf-8",
         )

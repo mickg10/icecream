@@ -16,13 +16,33 @@ def write_canonical(path: Path, value: object) -> None:
 def scenario_tree(tmp_path: Path) -> Path:
     tmp_path.mkdir(parents=True)
     payload = b"an authenticated production Protocol-50 input\n"
-    route = {"origin": "live", "schema": "icecream-s7-live-route-trace-v1", "trace": [{"rel_seq": 0}]}
     (tmp_path / "input.bin").write_bytes(payload)
+    probe = tmp_path / "probe"
+    probe.mkdir()
+    binary = HERE / ".p50sim.bin"
+    subprocess.run(
+        [str(binary), "--input", str(tmp_path / "input.bin"), "--actions", str(probe / "actions.jsonl"), "--summary", str(probe / "summary.json")],
+        check=True,
+    )
+    action_bytes = (probe / "actions.jsonl").read_bytes()
+    (tmp_path / "action_trace.jsonl").write_bytes(action_bytes)
+    action_rows = [json.loads(line) for line in action_bytes.splitlines()]
+    route = {
+        "actions": [row["action"] for row in action_rows],
+        "origin": "live",
+        "schema": "icecream-s7-live-route-trace-v1",
+        "trace": [
+            {"action": row["action"], "sequence": sequence}
+            for sequence, row in enumerate(action_rows, 1)
+        ],
+    }
     write_canonical(tmp_path / "route_trace.json", route)
     scenario = {
         "cell": "fmt/ZSTD_TU/cold",
         "input": "input.bin",
         "input_sha256": hashlib.sha256(payload).hexdigest(),
+        "action_trace": "action_trace.jsonl",
+        "action_trace_sha256": hashlib.sha256(action_bytes).hexdigest(),
         "route_trace": "route_trace.json",
         "route_trace_sha256": hashlib.sha256((tmp_path / "route_trace.json").read_bytes()).hexdigest(),
         "schema": "icecream-s7-p50sim-scenario-v1",
@@ -57,3 +77,18 @@ def test_input_digest_mismatch_rejects_execution(tmp_path: Path) -> None:
     result = invoke(artifacts, tmp_path / "output")
     assert result.returncode != 0
     assert "scenario input digest mismatch" in result.stderr
+
+
+def test_action_trace_mutation_rejects_replay(tmp_path: Path) -> None:
+    artifacts = scenario_tree(tmp_path / "artifacts")
+    action_path = artifacts / "action_trace.jsonl"
+    rows = [json.loads(line) for line in action_path.read_bytes().splitlines()]
+    rows[0]["actor"] = "C" if rows[0]["actor"] == "F" else "F"
+    mutated = b"\n".join(json.dumps(row, separators=(",", ":")).encode() for row in rows) + b"\n"
+    action_path.write_bytes(mutated)
+    scenario = json.loads((artifacts / "scenario.json").read_bytes())
+    scenario["action_trace_sha256"] = hashlib.sha256(mutated).hexdigest()
+    write_canonical(artifacts / "scenario.json", scenario)
+    result = invoke(artifacts, tmp_path / "output")
+    assert result.returncode != 0
+    assert "production replay differs from canonical live action trace" in result.stderr
