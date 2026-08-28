@@ -523,6 +523,9 @@ void test_zstd_route_endpoint_continuation_and_retry() {
 }
 
 void test_s3_resource_storm_product_path() {
+    const char* requested = std::getenv("ICECC_P50_S3_RESOURCE_STORM");
+    const bool storm_only = requested != nullptr &&
+                            std::string_view(requested) == "storm";
     P50ServerEndpointConfig soak_config;
     soak_config.owner_limits.max_namespaces = 4;
     soak_config.owner_limits.max_retained_input_records = 1;
@@ -530,7 +533,8 @@ void test_s3_resource_storm_product_path() {
     P50ServerEndpoint soak_server(Id128::from_u64(12000), {}, nullptr, nullptr,
                                   std::move(soak_config));
     TestClient soak_client(Id128::from_u64(12001));
-    for (uint64_t index = 0; index != 10000; ++index) {
+    const uint64_t soak_iterations = storm_only ? 0 : 10000;
+    for (uint64_t index = 0; index != soak_iterations; ++index) {
         const std::vector<uint8_t> input{
             static_cast<uint8_t>(index),
             static_cast<uint8_t>(index >> 8),
@@ -554,7 +558,8 @@ void test_s3_resource_storm_product_path() {
             report_resource_checkpoint("soak-" + std::to_string(index + 1),
                                        soak_server.owner_usage());
     }
-    report_resource_checkpoint("soak-final", soak_server.owner_usage());
+    if (!storm_only)
+        report_resource_checkpoint("soak-final", soak_server.owner_usage());
 
     P50ServerEndpointConfig storm_config;
     storm_config.owner_limits.max_namespaces = 256;
@@ -606,7 +611,7 @@ void test_s3_resource_storm_product_path() {
     storm_server.close_input_job(*recovered.server.committed_input);
     report_resource_checkpoint("storm-recovered", storm_server.owner_usage());
 
-    for (uint64_t index = 0; index != 128; ++index) {
+    for (uint64_t index = 0; index != 512; ++index) {
         TestClient client(Id128::from_u64(14000 + index));
         const std::vector<uint8_t> input(64, static_cast<uint8_t>(index));
         const PairResult result =
@@ -619,16 +624,19 @@ void test_s3_resource_storm_product_path() {
         require(storm_server.owner_usage().retained_input_records <= 8 &&
                     storm_server.owner_usage().retained_input_bytes <= 8 * 64,
                 "multi-C_GUID product eviction storm exceeded retained bounds");
-        if ((index + 1) % 32 == 0)
+        if ((index + 1) % 128 == 0)
             report_resource_checkpoint("storm-" + std::to_string(index + 1),
                                        storm_server.owner_usage());
     }
+    require(storm_server.owner_usage().namespaces <= 256,
+            "multi-C_GUID product storm exceeded the namespace cap");
     report_resource_checkpoint("storm-final", storm_server.owner_usage());
 }
 
 bool s3_resource_storm_requested() {
     const char* value = std::getenv("ICECC_P50_S3_RESOURCE_STORM");
-    return value != nullptr && std::string_view(value) == "1";
+    return value != nullptr &&
+           (std::string_view(value) == "1" || std::string_view(value) == "storm");
 }
 
 PairResult run_adopted_pair(P50ClientEndpoint& client, P50ServerEndpoint& server,
@@ -3483,13 +3491,17 @@ void test_input_record_owner_and_aggregate_limits() {
                     retained.server.committed_input.has_value(),
                 "first namespace did not fit its aggregate bound");
         server.close_input_job(*retained.server.committed_input);
-        const PairResult rejected =
+        const PairResult replacement =
             run_pair(second, server, admit(second, bytes("second namespace\n")));
-        require(rejected.client.status == ClientRunStatus::TerminalError &&
-                    rejected.server.status == ServerRunStatus::TerminalError &&
+        require(replacement.client.status == ClientRunStatus::Committed &&
+                    replacement.server.status == ServerRunStatus::Completed &&
+                    replacement.server.committed_input.has_value() &&
                     server.owner_usage().namespaces == 1 &&
-                    server.owner_usage().revisions == 1,
-                "route-namespace cap was incorrectly treated as evictable cache payload");
+                    server.owner_usage().revisions == 1 &&
+                    !server.last_committed_input(first.c_store_guid()).has_value() &&
+                    copy_input(server, second.c_store_guid()) ==
+                        bytes("second namespace\n"),
+                "whole-namespace LRU did not replace the closed oldest namespace");
     }
 
     {

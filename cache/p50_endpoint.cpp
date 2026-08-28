@@ -1499,6 +1499,17 @@ struct P50ServerEndpoint::Impl {
         namespaces.at(c_guid).last_input.reset();
     }
 
+    void evict_whole_namespace(CStoreGuid c_guid) {
+        if (!namespace_is_evictable(c_guid))
+            throw std::logic_error(
+                "F endpoint selected a live namespace for whole-namespace eviction");
+        input_records.evict_namespace(c_guid);
+        if (namespaces.erase(c_guid) != 1)
+            throw std::logic_error(
+                "F endpoint lost its whole-namespace eviction target");
+        revisions.erase(c_guid);
+    }
+
     void ensure_input_capacity(CStoreGuid incoming, uint64_t raw_bytes) {
         const size_t record_limit = input_records.max_records();
         const uint64_t byte_limit = input_records.max_retained_bytes();
@@ -1782,8 +1793,14 @@ struct P50ServerEndpoint::Impl {
         const uint64_t touch = reserve_namespace_touch();
         const bool new_namespace = !namespaces.contains(*session.c_guid);
         if (new_namespace &&
-            namespaces.size() >= config.owner_limits.max_namespaces)
-            throw std::length_error("F endpoint reached its C-namespace bound");
+            namespaces.size() >= config.owner_limits.max_namespaces) {
+            const std::vector<CStoreGuid> candidates =
+                lru_evictable_namespaces(*session.c_guid);
+            if (candidates.empty())
+                throw std::length_error(
+                    "F endpoint C-namespace bound has no evictable namespace");
+            evict_whole_namespace(candidates.front());
+        }
         auto [position, namespace_inserted] = namespaces.try_emplace(*session.c_guid);
         std::map<CStoreGuid, Revision>::iterator revision;
         bool revision_inserted = false;
