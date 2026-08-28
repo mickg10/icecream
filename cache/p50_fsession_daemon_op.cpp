@@ -31,7 +31,8 @@ DaemonFSessionOperation::mint(const FSessionOperationIdentity& identity,
     op.lease_ = std::move(lease);
     op.inbound_ = FSessionInboundControl::daemon_bound(identity);
     op.outbound_ = FSessionOutboundControl(outbound_slots);
-    const uint64_t seq = op.outbound_.enqueue_idempotent(
+    const uint64_t seq = op.outbound_.stage_frame(
+        identity, FSessionControlDirection::DaemonToSidecar,
         static_cast<uint16_t>(DaemonToSidecarType::OperationOffer),
         placeholder_payload(1));
     if (seq == 0)
@@ -70,7 +71,8 @@ DaemonFSessionOperation::consume_inbound(const FSessionControlEnvelope& e,
         if (phase_ != DaemonOpPhase::Settled && phase_ != DaemonOpPhase::Retired) {
             ++settlement_count_;
             phase_ = DaemonOpPhase::Settled;
-            terminal_ack_seq_ = outbound_.enqueue_idempotent(
+            terminal_ack_seq_ = outbound_.stage_frame(
+                identity_, FSessionControlDirection::DaemonToSidecar,
                 static_cast<uint16_t>(DaemonToSidecarType::TerminalAck),
                 placeholder_payload(6));
         }
@@ -92,7 +94,8 @@ uint64_t DaemonFSessionOperation::offer_public_fd() {
         return 0;
     if (public_fd_offer_id_ == 0) {
         public_fd_offer_id_ = identity_.operation.operation_sequence << 8 | 1;
-        const uint64_t seq = outbound_.enqueue_idempotent(
+        const uint64_t seq = outbound_.stage_frame(
+            identity_, FSessionControlDirection::DaemonToSidecar,
             static_cast<uint16_t>(DaemonToSidecarType::PublicFdOffer),
             placeholder_payload(2));
         if (seq == 0) {
@@ -126,7 +129,8 @@ DaemonFSessionOperation::accept_delivery(uint64_t delivery_id,
     acceptance_ledger_.push_back(receipt);
     ++tocompile_transitions_; // exactly one WAITP50INPUT -> TOCOMPILE
     phase_ = DaemonOpPhase::SourceAccepted;
-    const uint64_t seq = outbound_.enqueue_idempotent(
+    const uint64_t seq = outbound_.stage_frame(
+        identity_, FSessionControlDirection::DaemonToSidecar,
         static_cast<uint16_t>(DaemonToSidecarType::DaemonFdAccepted),
         placeholder_payload(4));
     (void)seq; // slot law verified by tests; wiring drives the flush
@@ -144,7 +148,8 @@ uint64_t DaemonFSessionOperation::request_cancel() {
     default:
         return 0; // settled/reconcile/retired: no cancel authority
     }
-    const uint64_t seq = outbound_.enqueue_idempotent(
+    const uint64_t seq = outbound_.stage_frame(
+        identity_, FSessionControlDirection::DaemonToSidecar,
         static_cast<uint16_t>(DaemonToSidecarType::OpCancel),
         placeholder_payload(5));
     if (seq != 0)

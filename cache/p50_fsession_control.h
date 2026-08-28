@@ -156,6 +156,7 @@ struct OutboundSemanticSlot {
     uint64_t sequence = 0;         // exact direction-local sequence
     uint16_t message_type = 0;     // exact legal message type / phase
     std::vector<uint8_t> canonical_bytes; // the one canonical encoded frame
+    std::vector<uint8_t> semantic_payload; // payload identity for dup detection
     OutboundSlotState state = OutboundSlotState::Empty;
     size_t write_offset = 0;       // for Writing
 
@@ -258,6 +259,17 @@ public:
     // sequence, or 0 if capacity is full for a genuinely new frame.
     [[nodiscard]] uint64_t
     enqueue_idempotent(uint16_t message_type, std::span<const uint8_t> bytes);
+
+    // Stage one COMPLETE canonical control frame for this operation direction:
+    // reserve a sequence, encode the envelope carrying exactly that sequence,
+    // and stage the encoded bytes as the slot's canonical frame. A repeat call
+    // for the same (message_type, payload) semantic transition reuses the
+    // retained frame's sequence (one canonical encoding per transition).
+    // Returns the sequence, or 0 on refusal (capacity full / invalid envelope).
+    [[nodiscard]] uint64_t stage_frame(const FSessionOperationIdentity& identity,
+                                       FSessionControlDirection direction,
+                                       uint16_t message_type,
+                                       std::span<const uint8_t> payload);
 
     // Flush lifecycle. record_written advances Writing offset (-> FullyFlushed
     // when the whole frame is out); mark_acked retains for replay; retire frees.

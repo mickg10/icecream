@@ -35,7 +35,8 @@ SidecarFSessionOperation::consume_inbound(const FSessionControlEnvelope& e,
             phase_ = SidecarOpPhase::AbortedPreDurable;
             return disposition;
         }
-        const uint64_t seq = outbound_.enqueue_idempotent(
+        const uint64_t seq = outbound_.stage_frame(
+            inbound_.identity(), FSessionControlDirection::SidecarToDaemon,
             static_cast<uint16_t>(SidecarToDaemonType::OperationAccepted),
             placeholder_payload(1));
         if (seq != 0)
@@ -68,7 +69,8 @@ uint64_t SidecarFSessionOperation::adopt_public_fd(
     if (!socket_valid || !socket_valid())
         return 0;
 
-    const uint64_t seq = outbound_.enqueue_idempotent(
+    const uint64_t seq = outbound_.stage_frame(
+        inbound_.identity(), FSessionControlDirection::SidecarToDaemon,
         static_cast<uint16_t>(SidecarToDaemonType::PublicFdAdoptedReceipt),
         placeholder_payload(2));
     if (seq == 0)
@@ -98,7 +100,8 @@ uint64_t SidecarFSessionOperation::grant_commit_permit_and_commit() {
     // linearized wins the race and this call refuses).
     if (phase_ != SidecarOpPhase::PreparedAwaitPermit)
         return 0;
-    const uint64_t seq = outbound_.enqueue_idempotent(
+    const uint64_t seq = outbound_.stage_frame(
+        inbound_.identity(), FSessionControlDirection::SidecarToDaemon,
         static_cast<uint16_t>(SidecarToDaemonType::InputCommitted),
         placeholder_payload(3));
     if (seq == 0)
@@ -143,7 +146,8 @@ uint64_t SidecarFSessionOperation::stage_terminal_observation() {
     default:
         return 0;
     }
-    const uint64_t seq = outbound_.enqueue_idempotent(
+    const uint64_t seq = outbound_.stage_frame(
+        inbound_.identity(), FSessionControlDirection::SidecarToDaemon,
         static_cast<uint16_t>(SidecarToDaemonType::TerminalObservation),
         placeholder_payload(4));
     if (seq == 0)

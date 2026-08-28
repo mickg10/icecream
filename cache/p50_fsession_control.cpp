@@ -338,6 +338,42 @@ FSessionOutboundControl::enqueue_idempotent(uint16_t message_type,
     return sequence;
 }
 
+uint64_t
+FSessionOutboundControl::stage_frame(const FSessionOperationIdentity& identity,
+                                     FSessionControlDirection direction,
+                                     uint16_t message_type,
+                                     std::span<const uint8_t> payload) {
+    // Semantic dup: an existing live frame for the same (type, payload)
+    // transition is THE canonical encoding; reuse its sequence.
+    for (const auto& s : slots_) {
+        if (s.occupied() && s.state != OutboundSlotState::Reserved &&
+            s.message_type == message_type &&
+            s.semantic_payload.size() == payload.size() &&
+            std::equal(s.semantic_payload.begin(), s.semantic_payload.end(),
+                       payload.begin()))
+            return s.sequence;
+    }
+    const uint64_t sequence = reserve(message_type);
+    if (sequence == 0)
+        return 0;
+    FSessionControlEnvelope envelope;
+    envelope.identity = identity;
+    envelope.direction = direction;
+    envelope.message_type = message_type;
+    envelope.sequence = sequence;
+    envelope.payload.assign(payload.begin(), payload.end());
+    const auto encoded = encode_fsession_control(envelope);
+    if (!encoded.has_value()) {
+        (void)retire(sequence); // release the reservation; nothing escaped
+        return 0;
+    }
+    OutboundSemanticSlot* slot = mutable_find(sequence);
+    slot->canonical_bytes = *encoded;
+    slot->semantic_payload.assign(payload.begin(), payload.end());
+    slot->state = OutboundSlotState::Queued;
+    return sequence;
+}
+
 bool FSessionOutboundControl::record_written(uint64_t sequence, size_t nbytes) {
     OutboundSemanticSlot* slot = mutable_find(sequence);
     if (slot == nullptr || (slot->state != OutboundSlotState::Queued &&
