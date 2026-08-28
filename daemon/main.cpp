@@ -619,8 +619,11 @@ public:
     }
 
     bool accept_p50_input(const icecc::p50::P50InputReady& ready, int sealed_fd) {
-        if (status != WAITP50INPUT ||
+        if (status != WAITP50INPUT || p50_input_fd >= 0 ||
             !p50_input_wait.accept_ready(ready, sealed_fd))
+            return false;
+        p50_input_fd = p50_input_wait.take_for_fork();
+        if (p50_input_fd < 0)
             return false;
         set_status(TOCOMPILE, "p50: exact ready/sealed input attached");
         return true;
@@ -629,9 +632,13 @@ public:
     bool accept_p50_input(const P50SourceArmFields& fields,
                           const icecc::p50::P50InputReady& ready,
                           int sealed_fd) {
-        if (status != WAITP50INPUT || !p50_source_arm_fields.has_value() ||
+        if (status != WAITP50INPUT || p50_input_fd >= 0 ||
+            !p50_source_arm_fields.has_value() ||
             *p50_source_arm_fields != fields ||
             !p50_input_wait.accept_ready(fields, ready, sealed_fd))
+            return false;
+        p50_input_fd = p50_input_wait.take_for_fork();
+        if (p50_input_fd < 0)
             return false;
         set_status(TOCOMPILE, "p50: exact canonical ready/sealed input attached");
         return true;
@@ -801,6 +808,11 @@ public:
     ConnectionProvenance p50_source_arm_provenance;
     uint64_t p50_source_deadline_msec = 0;
     bool p50_source_compile_pending = false;
+    // CACHE_SESSION transfers this wrapper's public descriptor to the sidecar
+    // but its source-arm assignment remains live until the ordinary compile
+    // connection (or its deadline) settles it. Such a wrapper has no fd to
+    // poll; retaining it in Clients keeps the assignment owner alive.
+    bool p50_cache_session_detached = false;
 
     bool arm_p50_source(const P50SourceArmFields& fields,
                         const icecc::p50::sidecar::ReadyLease& lease,
@@ -5047,7 +5059,7 @@ bool Daemon::configure_cache_adapter() noexcept
 uint64_t Daemon::next_p50_source_deadline_msec() const noexcept
 {
     uint64_t earliest = 0;
-    for (const auto& entry : fd2client) {
+    for (const auto& entry : clients) {
         const Client *client = entry.second;
         if (client == nullptr || client->status != Client::WAITP50INPUT ||
             !client->p50_source_arm_fields.has_value() ||
@@ -5065,8 +5077,8 @@ bool Daemon::expire_p50_source_waiters()
 {
     const uint64_t now = monotonic_msec();
     vector<Client*> expired;
-    expired.reserve(fd2client.size());
-    for (const auto& entry : fd2client) {
+    expired.reserve(clients.size());
+    for (const auto& entry : clients) {
         Client *client = entry.second;
         if (client != nullptr && client->status == Client::WAITP50INPUT &&
             client->p50_source_arm_fields.has_value() &&
@@ -5106,8 +5118,8 @@ bool Daemon::invalidate_p50_source_waiters_for_lease()
     }
 
     vector<Client*> stale;
-    stale.reserve(fd2client.size());
-    for (const auto& entry : fd2client) {
+    stale.reserve(clients.size());
+    for (const auto& entry : clients) {
         Client *client = entry.second;
         if (client == nullptr || client->status != Client::WAITP50INPUT ||
             !client->p50_source_arm_fields.has_value()) {
@@ -7527,6 +7539,97 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
     assert(client);
     assert(job);
 
+    // The source arm arrives on the short-lived cache wrapper, while this
+    // CompileFile arrives on the original ordinary connection.  Once the
+    // cache wrapper has detached its fd, join only that exact retained owner
+    // and move the claim before admitting any compiler input.
+    if (!client->p50_source_arm_fields.has_value()) {
+        Client *detached_owner = nullptr;
+        for (const auto &entry : clients) {
+            Client *candidate = entry.second;
+            if (!candidate->p50_cache_session_detached ||
+                candidate->status != Client::WAITP50INPUT ||
+                !candidate->p50_source_arm_fields.has_value() ||
+                candidate->p50_source_compile_pending || candidate->job != nullptr)
+                continue;
+            const P50SourceArmFields &arm = *candidate->p50_source_arm_fields;
+            if (!job->usesP50Input() || !job->hasAssignmentIdentity() ||
+                arm.wire_job_id != job->jobID() ||
+                arm.assignment_epoch != job->assignmentEpoch() ||
+                arm.assignment_nonce != job->assignmentNonce())
+                continue;
+            const CompileInputIdentity &input = job->compileInputIdentity();
+            if (!input.validPresent() || input.profile != CompileInputIdentity::ZstdTuProfile ||
+                input.c_store_guid != arm.c_store_guid ||
+                input.attempt_id != arm.compiler_attempt ||
+                input.request_id != arm.source_request_id)
+                continue;
+            auto live = live_assignments.find(arm.wire_job_id);
+            if (live == live_assignments.end() ||
+                live->second.phase != WorkerAssignment::Claimed ||
+                live->second.claimant != static_cast<uint32_t>(candidate->client_id) ||
+                live->second.key.epoch != arm.assignment_epoch ||
+                live->second.key.nonce != arm.assignment_nonce)
+                continue;
+            detached_owner = candidate;
+            break;
+        }
+
+        if (detached_owner != nullptr) {
+            const P50SourceArmFields retained_arm =
+                *detached_owner->p50_source_arm_fields;
+            auto live = live_assignments.find(retained_arm.wire_job_id);
+            // The single-threaded daemon loop makes this check-and-transfer
+            // atomic with respect to the exact owner found above.
+            if (live != live_assignments.end() &&
+                live->second.phase == WorkerAssignment::Claimed &&
+                live->second.claimant ==
+                    static_cast<uint32_t>(detached_owner->client_id)) {
+                live->second.claimant = static_cast<uint32_t>(client->client_id);
+                client->p50_source_arm_fields =
+                    std::move(detached_owner->p50_source_arm_fields);
+                client->p50_source_f_lease =
+                    std::move(detached_owner->p50_source_f_lease);
+                client->p50_source_f_store_generation =
+                    detached_owner->p50_source_f_store_generation;
+                client->p50_source_armed_ack =
+                    std::move(detached_owner->p50_source_armed_ack);
+                client->p50_source_deadline_msec =
+                    detached_owner->p50_source_deadline_msec;
+                client->p50_source_arm_provenance =
+                    client->connection_provenance;
+                client->p50_source_compile_pending = false;
+                client->job_id = retained_arm.wire_job_id;
+                client->last_known_job_id = retained_arm.wire_job_id;
+                detached_owner->p50_input_wait.close();
+                // Moving an engaged optional leaves it engaged (with a
+                // moved-from value); clear every source identity before
+                // handle_end so wrapper teardown cannot settle the claim we
+                // just transferred to the ordinary connection.
+                detached_owner->p50_source_arm_fields.reset();
+                detached_owner->p50_source_f_lease.reset();
+                detached_owner->p50_source_armed_ack.reset();
+                detached_owner->p50_source_f_store_generation = 0;
+                detached_owner->p50_source_arm_provenance =
+                    ConnectionProvenance{};
+                detached_owner->p50_source_deadline_msec = 0;
+                detached_owner->p50_source_compile_pending = false;
+                detached_owner->job_id = 0;
+                detached_owner->last_known_job_id = 0;
+                detached_owner->p50_cache_session_detached = false;
+                handle_end(detached_owner, 121);
+                if (!client->p50_input_wait.arm_input(retained_arm)) {
+                    delete job;
+                    (void)client->channel->send_msg(EndMsg());
+                    handle_end(client, 150);
+                    return false;
+                }
+                client->set_status(Client::WAITP50INPUT,
+                                   "p50: detached source owner joined ordinary connection");
+            }
+        }
+    }
+
     if (client->p50_source_arm_fields.has_value()) {
         // A later CompileFile is the same assignment claimant, not a second
         // source arm.  Revalidate the retained F lease at the admission
@@ -7558,16 +7661,73 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
             return false;
         }
 
-        // Retain the exact job as pending state.  This deliberately does not
-        // attach a sidecar fd, consume FileChunk, enter TOCOMPILE, or fork;
-        // positive InputReady/private transport remains a later slice.
+        const CompileInputIdentity &input = job->compileInputIdentity();
+        const icecc::p50::InputRecordKey input_key{
+            icecc::p50::CStoreGuid{input.c_store_guid},
+            icecc::p50::TuSeq{input.tu_seq}};
+        const icecc::p50::InputLeaseOwner input_owner{
+            job->jobID(), job->assignmentEpoch(), job->assignmentNonce()};
+        auto attached = cache_adapter->attach_input(
+            input_key, input_owner, input.request_id);
+        if (attached.status != icecc::p50::InputFdAttachmentStatus::Accepted ||
+            !attached.fd.valid() || !attached.lease.has_value()) {
+            log_warning() << "P50 compiler input attachment failed for job "
+                          << job->jobID() << " (status "
+                          << static_cast<unsigned>(attached.status) << ")" << endl;
+            delete job;
+            (void)client->channel->send_msg(EndMsg());
+            handle_end(client, 146);
+            return false;
+        }
+        const P50SourceArmFields &arm = *client->p50_source_arm_fields;
+        icecc::p50::P50SourceArm ready_arm;
+        ready_arm.wire_job_id = arm.wire_job_id;
+        ready_arm.assignment_epoch = arm.assignment_epoch;
+        ready_arm.assignment_nonce = arm.assignment_nonce;
+        ready_arm.selected_f_host = arm.selected_f_host;
+        ready_arm.selected_f_ordinary_port = arm.selected_f_ordinary_port;
+        ready_arm.selected_f_cache_port = arm.selected_f_cache_port;
+        ready_arm.cache_protocol = arm.cache_protocol;
+        ready_arm.cache_profile = arm.cache_profile;
+        ready_arm.logical_job = arm.logical_job;
+        ready_arm.attempt_id = arm.compiler_attempt;
+        ready_arm.c_store_generation = arm.c_store_generation;
+        ready_arm.c_store_guid = icecc::p50::CStoreGuid{arm.c_store_guid};
+        ready_arm.source_request_id = arm.source_request_id;
+        ready_arm.source_mode = arm.source_mode;
+        icecc::p50::P50InputReady input_ready;
+        input_ready.arm = std::move(ready_arm);
+        input_ready.tu_seq = icecc::p50::TuSeq{input.tu_seq};
+        input_ready.raw_bytes = input.raw_bytes;
+        input_ready.raw_digest = icecc::Digest128{input.raw_digest};
+        input_ready.f_store_guid = client->p50_source_f_lease.has_value()
+                                       ? client->p50_source_f_lease->f_store_guid
+                                       : icecc::p50::FStoreGuid{};
+        input_ready.attachment_store_generation =
+            client->p50_source_f_store_generation;
+        input_ready.attachment_request_id = input.request_id;
+        input_ready.ready_event_id = input.request_id;
+        int attached_fd = attached.fd.get();
+        if (!client->accept_p50_input(*client->p50_source_arm_fields,
+                                      input_ready, attached_fd)) {
+            (void)::close(attached.fd.release());
+            delete job;
+            (void)client->channel->send_msg(EndMsg());
+            handle_end(client, 146);
+            return false;
+        }
+        // accept_p50_input() moved the descriptor into the daemon's exact
+        // compiler-attempt slot; do not let the temporary result close it.
+        (void)attached.fd.release();
+        client->p50_input_lease = attached.lease;
+        client->p50_input_lease_state = Client::P50InputLeaseState::Active;
         client->job = job;
         client->p50_source_compile_pending = true;
         if (client->command_line.empty()) {
             client->command_line = command_line_from_compile_job(job);
         }
         client->last_known_job_id = job->jobID();
-        trace() << "P50 CompileFile retained pending exact source owner for job "
+        trace() << "P50 CompileFile attached exact ZSTD_TU input for job "
                 << job->jobID() << endl;
         return true;
     }
@@ -7776,6 +7936,7 @@ void Daemon::handle_end(Client *client, int exitcode)
     client->p50_source_arm_provenance = ConnectionProvenance{};
     client->p50_source_deadline_msec = 0;
     client->p50_source_compile_pending = false;
+    client->p50_cache_session_detached = false;
     // Remove the value lease before erasing/deleting its Client and channel.
     // Delayed callbacks therefore cannot be rescued by fd or allocator
     // address reuse; repeated teardown is intentionally harmless.
@@ -8388,7 +8549,6 @@ bool Daemon::handle_cache_session(Client *client, Msg *msg)
        the daemon half of the distributed F-session operation from the REAL
        owner facts and stage its identity-complete frames on a dedicated
        second relationship to the same incarnation. */
-    (void)old_fd;
     namespace fsn = icecc::p50::fsession;
     if (client->status != Client::WAITP50INPUT ||
         !client->p50_source_arm_fields.has_value() || cache_adapter == nullptr ||
@@ -8533,6 +8693,15 @@ bool Daemon::handle_cache_session(Client *client, Msg *msg)
     client->fsession_control_fd = ::dup(control.native_handle());
     client->fsession_op = std::make_unique<fsn::DaemonFSessionOperation>(
         std::move(*fsession_op));
+    // The handoff consumed the public descriptor. Remove only its stale
+    // poll-map entry: the Client and its exact source-arm claim remain in
+    // `clients` for the later ordinary CompileFile connection and for
+    // deadline/lease withdrawal. In particular, do not call handle_end()
+    // here; that would settle the retained scheduler assignment.
+    client->p50_cache_session_detached = true;
+    const auto fd_entry = fd2client.find(old_fd);
+    if (fd_entry != fd2client.end() && fd_entry->second == client)
+        fd2client.erase(fd_entry);
     trace() << "CACHE_SESSION dispatched: F-session operation "
             << op_identity.operation.operation_sequence
             << " offered to sidecar (gen "
