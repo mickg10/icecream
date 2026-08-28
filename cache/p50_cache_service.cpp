@@ -2299,6 +2299,15 @@ int run(const Options& options) noexcept {
     runtime_config.c_store_guid = structured_launch.active
                                       ? effective_options.c_store_guid
                                       : c_store_guid_for_root(legacy_root);
+    if (structured_launch.active) {
+        runtime_config.sidecar_launch = SidecarLaunchIdentity{
+            structured_launch.identity,
+            structured_launch.f_store_generation,
+            structured_launch.store_root,
+            structured_launch.c_store_guid,
+            structured_launch.f_store_guid,
+        };
+    }
     std::unique_ptr<SidecarRuntime> runtime;
     try {
         runtime = std::make_unique<SidecarRuntime>(std::move(runtime_config));
