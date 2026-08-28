@@ -138,6 +138,16 @@ uint64_t advance_to_running(SidecarFSessionOperation& op,
     const uint64_t receipt =
         op.adopt_public_fd(std::move(lease), [] { return true; }, kNow);
     check(receipt != 0, "public-FD receipt staged");
+    check(!op.endpoint_started(),
+          "endpoint start refused until adoption receipt is flushed");
+    const auto* receipt_slot = op.outbound().find(receipt);
+    check(receipt_slot != nullptr &&
+              receipt_slot->state == OutboundSlotState::Queued,
+          "adoption receipt remains queued before transport flush");
+    check(receipt_slot != nullptr &&
+              op.outbound().record_written(receipt,
+                                            receipt_slot->canonical_bytes.size()),
+          "flush adoption receipt before endpoint start");
     check(op.endpoint_started(), "endpoint started");
     return 3;
 }

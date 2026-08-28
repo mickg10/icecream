@@ -80,6 +80,19 @@ std::vector<uint8_t> terminal_observation_body(const FSessionOperationIdentity& 
     assert(body.has_value());
     return *body;
 }
+
+std::vector<uint8_t> delivery_offer_body(const FSessionOperationIdentity& id,
+                                         uint64_t delivery_id) {
+    DeliveryOfferPayload p;
+    p.identity = id;
+    p.attachment_delivery_id = delivery_id;
+    p.attachment_admission_id = 1;
+    p.ready_event_id = 1;
+    p.ancillary_attempt_id = 1;
+    auto body = encode_DeliveryOffer(p);
+    assert(body.has_value());
+    return *body;
+}
 } // namespace
 
 int main() {
@@ -121,6 +134,21 @@ int main() {
     (void)op.consume_inbound(adopt_e, adopt_b);
     check(op.phase() == DaemonOpPhase::FdAdoptedObserved, "receipt consumed");
 
+    // The phase alone is not a delivery authority: an exact DeliveryOffer
+    // must have been consumed first, and its delivery id must match.
+    check(!op.accept_delivery(77, true).has_value(),
+          "delivery refused without an exact DeliveryOffer");
+    auto [wrong_offer_e, wrong_offer_b] = sidecar_frame(
+        id, SidecarToDaemonType::DeliveryOffer, 3,
+        delivery_offer_body(id, 78));
+    (void)op.consume_inbound(wrong_offer_e, wrong_offer_b);
+    check(!op.accept_delivery(77, true).has_value(),
+          "delivery refused when its id differs from the exact offer");
+    auto [offer_e, offer_b] = sidecar_frame(
+        id, SidecarToDaemonType::DeliveryOffer, 4,
+        delivery_offer_body(id, 77));
+    (void)op.consume_inbound(offer_e, offer_b);
+
     // Mint-once acceptance; duplicate delivery replays the same receipt.
     auto first = op.accept_delivery(77, true);
     check(first.has_value() && !first->replay && first->receipt.valid(),
@@ -138,12 +166,12 @@ int main() {
     // after the ack is fully flushed.
     // Semantic gate: a placeholder/undecodable observation cannot settle.
     auto [bogus_e, bogus_b] =
-        sidecar_frame(id, SidecarToDaemonType::TerminalObservation, 3, {9});
+        sidecar_frame(id, SidecarToDaemonType::TerminalObservation, 5, {9});
     (void)op.consume_inbound(bogus_e, bogus_b);
     check(op.phase() != DaemonOpPhase::Settled,
           "undecodable terminal observation does not settle");
     auto [term_e, term_b] = sidecar_frame(
-        id, SidecarToDaemonType::TerminalObservation, 4,
+        id, SidecarToDaemonType::TerminalObservation, 6,
         terminal_observation_body(id));
     (void)op.consume_inbound(term_e, term_b);
     check(op.phase() == DaemonOpPhase::Settled, "settled");

@@ -180,6 +180,7 @@ private:
     uint64_t public_fd_offer_id_ = 0;
     uint64_t next_ancillary_attempt_ = 1;
     uint64_t next_cancellation_observation_ = 1;
+    std::optional<DeliveryOfferPayload> delivery_offer_;
     std::vector<InputFdAcceptanceReceipt> acceptance_ledger_;
     uint64_t next_receipt_id_ = 1;
     uint64_t settlement_count_ = 0;

@@ -147,6 +147,24 @@ struct Duplex {
         }
     }
 };
+
+void stage_delivery_offer(Duplex& d, uint64_t delivery_id) {
+    DeliveryOfferPayload offer;
+    offer.identity = d.id;
+    offer.attachment_delivery_id = delivery_id;
+    offer.attachment_admission_id = 1;
+    offer.ready_event_id = 1;
+    offer.ancillary_attempt_id = 1;
+    const auto body = encode_DeliveryOffer(offer);
+    check(body.has_value(), "delivery offer encodes");
+    if (!body.has_value())
+        return;
+    const uint64_t sequence = d.sidecar.outbound().stage_frame(
+        d.id, FSessionControlDirection::SidecarToDaemon,
+        static_cast<uint16_t>(SidecarToDaemonType::DeliveryOffer), *body);
+    check(sequence != 0, "delivery offer staged");
+    d.settle_wire();
+}
 } // namespace
 
 static void test_full_settlement_path() {
@@ -173,6 +191,7 @@ static void test_full_settlement_path() {
     check(d.sidecar.grant_commit_permit_and_commit() != 0, "owner commits");
     d.settle_wire();
 
+    stage_delivery_offer(d, 77);
     auto accept = d.daemon->accept_delivery(77, true);
     check(accept.has_value() && !accept->replay, "daemon accepts delivery");
     check(d.daemon->tocompile_transitions() == 1, "one TOCOMPILE transition");

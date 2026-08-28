@@ -134,6 +134,7 @@ uint64_t SidecarFSessionOperation::adopt_public_fd(
         *body);
     if (seq == 0)
         return 0;
+    public_fd_receipt_sequence_ = seq;
     route_lease_ = std::move(route_lease);
     phase_ = SidecarOpPhase::PublicFdAdopted;
     return seq;
@@ -141,6 +142,11 @@ uint64_t SidecarFSessionOperation::adopt_public_fd(
 
 bool SidecarFSessionOperation::endpoint_started() {
     if (phase_ != SidecarOpPhase::PublicFdAdopted)
+        return false;
+    const auto* receipt = outbound_.find(public_fd_receipt_sequence_);
+    if (receipt == nullptr ||
+        (receipt->state != OutboundSlotState::FullyFlushed &&
+         receipt->state != OutboundSlotState::AckedRetained))
         return false;
     phase_ = SidecarOpPhase::EndpointRunning;
     return true;

@@ -151,8 +151,17 @@ DaemonFSessionOperation::consume_inbound(const FSessionControlEnvelope& e,
     case SidecarToDaemonType::InputCommitted:
     case SidecarToDaemonType::InputAbortedPreDurable:
     case SidecarToDaemonType::InputCancelledAfterCommit:
-    case SidecarToDaemonType::DeliveryOffer:
         break; // recorded by the wiring; no phase change at this layer
+    case SidecarToDaemonType::DeliveryOffer: {
+        // Delivery acceptance is authorized only by the exact typed offer
+        // previously consumed for this operation.  The decoder re-binds the
+        // payload identity to the envelope identity and validates every offer
+        // field before the id is retained.
+        const auto offer = decode_DeliveryOffer(e);
+        if (offer.has_value() && offer->identity == identity_)
+            delivery_offer_ = *offer;
+        break;
+    }
     }
     return disposition;
 }
@@ -188,6 +197,13 @@ std::optional<DeliveryAcceptance>
 DaemonFSessionOperation::accept_delivery(uint64_t delivery_id,
                                          bool descriptor_valid) {
     if (delivery_id == 0)
+        return std::nullopt;
+    // A descriptor is admissible only when the exact delivery id was named by
+    // a previously decoded DeliveryOffer for this operation.  In particular,
+    // the phase alone is not an offer/claim authority.
+    if (!delivery_offer_.has_value() ||
+        !(delivery_offer_->identity == identity_) ||
+        delivery_offer_->attachment_delivery_id != delivery_id)
         return std::nullopt;
     // Replay of an already accepted delivery: return the retained receipt;
     // the caller closes the duplicate descriptor; no second transition.

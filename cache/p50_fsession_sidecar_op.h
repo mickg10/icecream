@@ -41,7 +41,7 @@ namespace icecc::p50::fsession {
 enum class SidecarOpPhase : uint8_t {
     AwaitOffer = 0,
     Accepted,          // offer consumed; OperationAccepted staged
-    PublicFdAdopted,   // receipt staged (flush gate is the slot state)
+    PublicFdAdopted,   // receipt fully flushed (or retained after peer ACK)
     EndpointRunning,   // CacheWire in progress
     PreparedAwaitPermit, // PreparedInputReady; waiting for owner CommitPermit
     PermitSelected,    // owner selected commit; cancellation can no longer win
@@ -84,7 +84,8 @@ public:
     adopt_public_fd(RouteSessionLease&& route_lease,
                     const PublicFdValidator& socket_valid, int64_t now_ns);
 
-    // Endpoint began CacheWire (receipt fully flushed; caller checked slot).
+    // Endpoint began CacheWire only after the exact adoption receipt is fully
+    // flushed (or retained after peer ACK).
     [[nodiscard]] bool endpoint_started();
 
     // --- prepared / commit-vs-cancel race ---------------------------------
@@ -176,6 +177,7 @@ private:
     uint64_t store_generation_ = 1;
     uint64_t consumed_public_fd_offer_ = 0; // from the decoded PublicFdOffer
     uint64_t consumed_socket_cookie_ = 0;
+    uint64_t public_fd_receipt_sequence_ = 0;
     uint64_t owner_sequence_ = 1;
     uint64_t terminal_observation_seq_ = 0;
     bool delivery_suppressed_ = false;

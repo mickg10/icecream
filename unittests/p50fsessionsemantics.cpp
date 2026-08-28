@@ -224,6 +224,20 @@ void control_delivery_requires_response_capacity() {
                                   receipt_frame);
     check(daemon->phase() == DaemonOpPhase::FdAdoptedObserved,
           "control5 setup: adopted");
+    DeliveryOfferPayload offer;
+    offer.identity = id;
+    offer.attachment_delivery_id = 77;
+    offer.attachment_admission_id = 1;
+    offer.ready_event_id = 1;
+    offer.ancillary_attempt_id = 1;
+    auto offer_body = encode_DeliveryOffer(offer);
+    check(offer_body.has_value(), "control5 setup: delivery offer encodes");
+    const auto offer_frame = encode_frame(
+        id, FSessionControlDirection::SidecarToDaemon,
+        static_cast<uint16_t>(SidecarToDaemonType::DeliveryOffer), 3,
+        *offer_body);
+    (void)daemon->consume_inbound(*decode_fsession_control(offer_frame),
+                                  offer_frame);
     const auto result = daemon->accept_delivery(77, true);
     check(!result.has_value() && daemon->tocompile_transitions() == 0 &&
               daemon->phase() == DaemonOpPhase::FdAdoptedObserved,
