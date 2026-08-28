@@ -109,3 +109,15 @@ def test_action_trace_mutation_rejects_replay(tmp_path: Path) -> None:
     result = invoke(artifacts, tmp_path / "output")
     assert result.returncode != 0
     assert "production replay differs from canonical live action trace" in result.stderr
+
+
+def test_manifest_identity_mismatch_rejects_execution(tmp_path: Path) -> None:
+    artifacts = scenario_tree(tmp_path / "artifacts")
+    scenario = json.loads((artifacts / "scenario.json").read_bytes())
+    identity = dict(scenario["identity"])
+    identity["history_nonce"] += 1
+    scenario["identity"] = identity
+    write_canonical(artifacts / "scenario.json", scenario)
+    result = invoke(artifacts, tmp_path / "output")
+    assert result.returncode != 0
+    assert "scenario identity differs from live action snapshot" in result.stderr
