@@ -463,18 +463,25 @@ InputFdAttachmentResult DaemonSidecarAdapter::attach_input(
         return rejected_result;
 
     rejected_result.status = InputFdAttachmentStatus::Disconnected;
-    // Attachment materialisation belongs to the sidecar's InputRecord owner.
-    // This adapter intentionally exposes no synchronous whole-operation
-    // helper and no daemon-local InputAttachmentCore.  The future compiler
-    // attempt reducer consumes this exact lease binding and drives its own
-    // incremental receiver through the outer poll inventory.
-    if (outer_lifecycle_ != nullptr &&
-        outer_lifecycle_->state() == sidecar::LifecycleState::Ready &&
-        outer_ready_lease_.has_value() && outer_ready_lease_->valid())
-        rejected_result.lease = InputFdRequest{
-            local::Identity{config_.generation, outer_ready_lease_->identity.attempt},
-            key, owner, request_id};
-    return rejected_result;
+    if (outer_lifecycle_ == nullptr ||
+        outer_lifecycle_->state() != sidecar::LifecycleState::Ready ||
+        !outer_authenticated_ || !outer_ready_lease_.has_value() ||
+        !outer_ready_lease_->valid() || !runtime_nodes_valid())
+        return rejected_result;
+
+    const local::Identity identity{config_.generation,
+                                   outer_ready_lease_->identity.attempt};
+    // The service inherits a listener created before fork. Linux therefore
+    // reports this daemon as the peer socket's creator; READY and the retained
+    // pidfd separately bind the serving child to this exact incarnation.
+    const local::CredentialExpectation expected{
+        config_.expected_service_uid, config_.expected_service_gid,
+        static_cast<uint64_t>(::getpid())};
+    const auto deadline = std::chrono::steady_clock::now() +
+                          config_.input_attachment_timeout;
+    return InputFdAttachmentClient::attach(
+        socket_path_, InputFdRequest{identity, key, owner, request_id},
+        expected, deadline);
 }
 
 bool DaemonSidecarAdapter::next_input_lifecycle_operation(
