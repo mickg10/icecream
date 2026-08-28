@@ -1,4 +1,5 @@
 #include "p50_slice0.h"
+#include "p50_p29_residual.h"
 
 #include <algorithm>
 #include <fstream>
@@ -10,6 +11,56 @@
 
 namespace icecc::p50 {
 namespace {
+
+constexpr std::array<uint8_t, 4> kP29ResidualMagic{'P', '2', '9', 'R'};
+
+void append_u64le(std::vector<uint8_t>& out, uint64_t value) {
+    for (unsigned shift = 0; shift != 64; shift += 8)
+        out.push_back(static_cast<uint8_t>(value >> shift));
+}
+
+uint64_t read_u64le(std::span<const uint8_t> bytes, size_t& offset) {
+    if (bytes.size() - offset < 8)
+        throw std::invalid_argument("P29 residual BODY ended before its length");
+    uint64_t result = 0;
+    for (unsigned shift = 0; shift != 64; shift += 8)
+        result |= uint64_t(bytes[offset++]) << shift;
+    return result;
+}
+
+std::vector<uint8_t> encode_p29_residual_body(std::span<const uint8_t> root,
+                                              std::span<const uint8_t> residual) {
+    std::vector<uint8_t> result;
+    result.reserve(kP29ResidualMagic.size() + 16 + root.size() + residual.size());
+    result.insert(result.end(), kP29ResidualMagic.begin(), kP29ResidualMagic.end());
+    append_u64le(result, root.size());
+    append_u64le(result, residual.size());
+    result.insert(result.end(), root.begin(), root.end());
+    result.insert(result.end(), residual.begin(), residual.end());
+    return result;
+}
+
+struct P29ResidualBody {
+    std::vector<uint8_t> root;
+    std::vector<uint8_t> residual;
+};
+
+P29ResidualBody decode_p29_residual_body(std::span<const uint8_t> bytes) {
+    if (bytes.size() < kP29ResidualMagic.size() + 16 ||
+        !std::equal(kP29ResidualMagic.begin(), kP29ResidualMagic.end(), bytes.begin()))
+        throw std::invalid_argument("P29 BODY is not a residual-group envelope");
+    size_t offset = kP29ResidualMagic.size();
+    const uint64_t root_size = read_u64le(bytes, offset);
+    const uint64_t residual_size = read_u64le(bytes, offset);
+    if (root_size > bytes.size() - offset || residual_size > bytes.size() - offset - root_size ||
+        offset + root_size + residual_size != bytes.size())
+        throw std::invalid_argument("P29 residual BODY lengths are not exact");
+    P29ResidualBody result;
+    result.root.assign(bytes.begin() + offset, bytes.begin() + offset + root_size);
+    offset += static_cast<size_t>(root_size);
+    result.residual.assign(bytes.begin() + offset, bytes.end());
+    return result;
+}
 
 bool byte_object(ObjectType type) {
     return type == ObjectType::Atom || type == ObjectType::Line ||
@@ -842,7 +893,9 @@ CRoute::CRoute(CAuthority& authority, FStoreGuid f_store_guid,
 CRoute::~CRoute() = default;
 
 const CActiveTx& CRoute::begin(const PreparedTUPtr& prepared,
-                              P29RootMode root_mode) {
+                              P29RootMode root_mode,
+                              std::span<const uint8_t> residual,
+                              bool residual_body) {
     if (!prepared) throw std::invalid_argument("cannot route a null PreparedTU");
     if (active_) throw std::logic_error("C route already has one ACTIVE_TX");
     if (next_rel_seq_.value == std::numeric_limits<uint64_t>::max())
@@ -865,7 +918,13 @@ const CActiveTx& CRoute::begin(const PreparedTUPtr& prepared,
         }
         active.manifest = authority_.transitive_manifest(active.root);
         active.dict = encode_key_vector(active.manifest);
-        active.body = encode_key_vector(active.root);
+        const std::vector<uint8_t> root_bytes = encode_key_vector(active.root);
+        active.body = residual_body
+                          ? encode_p29_residual_body(root_bytes, residual)
+                          : root_bytes;
+        active.region_count = prepared->regions.size();
+        active.block_use_count = plan.block_uses.size();
+        active.new_block_count = plan.new_blocks.size();
         active.begin.history_nonce = history_nonce_;
         active.begin.rel_seq = next_rel_seq_;
         active.begin.tu_seq = prepared->tu_seq;
@@ -874,8 +933,9 @@ const CActiveTx& CRoute::begin(const PreparedTUPtr& prepared,
         active.begin.pre_state_digest = state_digest_;
         active.begin.dict = describe_component(kP29KeyVectorEncoding, active.dict,
                                                active.manifest.size());
-        active.begin.body = describe_component(kP29KeyVectorEncoding, active.body,
-                                               active.root.size());
+        active.begin.body = describe_component(
+            residual_body ? kP29ResidualBodyEncoding : kP29KeyVectorEncoding,
+            active.body, active.root.size());
         active.begin.raw_bytes = prepared->raw_bytes;
         active.begin.raw_digest = prepared->raw_digest;
         active.begin.transaction_digest = compute_transaction_digest(
@@ -972,6 +1032,7 @@ struct FStore::Namespace {
         TxBegin begin;
         std::vector<uint8_t> dict;
         std::vector<uint8_t> body;
+        std::vector<uint8_t> residual;
         bool dict_complete = false;
         bool body_complete = false;
         std::vector<Key64> manifest;
@@ -1107,8 +1168,9 @@ void FStore::begin(SessionHandle session, const TxBegin& begin, bool replay) {
          begin.p29_root_mode != P29RootMode::HistoryIndependent))
         throw std::invalid_argument("TX_BEGIN profile/root mode is unsupported in M1");
     if (begin.dict.encoding != kP29KeyVectorEncoding ||
-        begin.body.encoding != kP29KeyVectorEncoding)
-        throw std::invalid_argument("P29 DICT/BODY key-vector encoding is unsupported");
+        (begin.body.encoding != kP29KeyVectorEncoding &&
+         begin.body.encoding != kP29ResidualBodyEncoding))
+        throw std::invalid_argument("P29 DICT/BODY encoding is unsupported");
     if (route.next_rel_seq.value == std::numeric_limits<uint64_t>::max())
         throw std::overflow_error("F REL_SEQ space exhausted");
     if (route.pending) {
@@ -1162,7 +1224,15 @@ void FStore::append_component(SessionHandle session, bool dict,
         record(ActionType::NEED_RECORDED, session, &pending.begin, std::nullopt,
                {}, pending.remaining.size(), false, exact_need);
     } else {
-        pending.root = decode_key_vector(target);
+        std::vector<uint8_t> root_bytes;
+        if (descriptor.encoding == kP29ResidualBodyEncoding) {
+            const P29ResidualBody composite = decode_p29_residual_body(target);
+            root_bytes = composite.root;
+            pending.residual = composite.residual;
+        } else {
+            root_bytes = target;
+        }
+        pending.root = decode_key_vector(root_bytes);
         if (pending.root.size() != descriptor.decoded_bytes)
             throw std::logic_error("BODY decoded count does not match its descriptor");
         record(ActionType::BODY_COMPLETE, session, &pending.begin);
@@ -1252,10 +1322,24 @@ std::vector<uint8_t> FStore::materialize_and_verify(SessionHandle session) {
         pending.begin.transaction_digest)
         throw std::logic_error("transaction digest changed before materialization");
     std::set<Key64> reached;
-    std::vector<uint8_t> result = materialize_objects(space.objects, pending.root, &reached);
+    const std::vector<uint8_t> object_result =
+        materialize_objects(space.objects, pending.root, &reached);
     if (!std::equal(reached.begin(), reached.end(), pending.manifest.begin(),
                     pending.manifest.end()))
         throw std::logic_error("DICT is not the exact transitive object closure");
+    std::vector<uint8_t> result = object_result;
+    if (pending.begin.body.encoding == kP29ResidualBodyEncoding) {
+        if (!pending.residual.empty()) {
+            residual_group::Codec codec;
+            const residual_group::DecodedFrame frame =
+                codec.decode(pending.residual.data(), pending.residual.size());
+            if (frame.wire_bytes != pending.residual.size())
+                throw std::logic_error("P29 residual frame has trailing bytes");
+            result = std::move(frame.raw);
+        }
+        if (result != object_result)
+            throw std::logic_error("P29 residual differs from immutable object closure");
+    }
     if (result.size() != pending.begin.raw_bytes ||
         digest128(result) != pending.begin.raw_digest)
         throw std::logic_error("materialized input does not match TX_BEGIN exactly");

@@ -3,6 +3,7 @@
 
 #include "p50_adopted_outcome_writer.h"
 #include "p50_grz.h"
+#include "p50_p29_residual.h"
 
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/post.hpp>
@@ -38,6 +39,19 @@ namespace {
 
 namespace asio = boost::asio;
 using tcp = asio::ip::tcp;
+
+std::vector<std::vector<uint8_t>> p29_line_regions(std::span<const uint8_t> input) {
+    std::vector<std::vector<uint8_t>> regions;
+    size_t begin = 0;
+    for (size_t at = 0; at < input.size(); ++at) {
+        if (input[at] != '\n') continue;
+        regions.emplace_back(input.begin() + begin, input.begin() + at + 1);
+        begin = at + 1;
+    }
+    if (begin != input.size())
+        regions.emplace_back(input.begin() + begin, input.end());
+    return regions;
+}
 
 class SingleThreadOwner {
 public:
@@ -1000,11 +1014,14 @@ PreparedTuHandle P50PreparationAuthority::prepare(PrepareRequestKey request,
             prepared = std::make_shared<const PreparedInputEnvelope>(
                 PreparedInputEnvelope{envelope.begin, {}, envelope.body, {}});
         } else if (impl_->profile == ProfileId::P29) {
-            std::vector<std::vector<uint8_t>> regions;
-            regions.push_back(std::vector<uint8_t>(exact_input.begin(), exact_input.end()));
+            std::vector<std::vector<uint8_t>> regions = p29_line_regions(exact_input);
             const PreparedTUPtr p29_prepared = impl_->p29_authority->prepare_from_regions(regions);
+            residual_group::Codec residual_codec;
+            residual_group::Kind residual_kind = residual_group::Kind::Zstd3;
+            const std::vector<uint8_t> residual = residual_codec.encode(
+                exact_input.data(), exact_input.size(), &residual_kind);
             const CActiveTx& active = impl_->p29_route->begin(
-                p29_prepared, P29RootMode::HistoryIndependent);
+                p29_prepared, P29RootMode::HistoryIndependent, residual, true);
             p29_active_started = true;
             std::vector<FillRecord> fills;
             fills.reserve(active.manifest.size());
@@ -1262,7 +1279,8 @@ void P50PreparationAuthority::validate_begin(const TxBegin& begin) const {
         if (begin.profile != ProfileId::P29 ||
             begin.p29_root_mode == P29RootMode::NotApplicable ||
             begin.dict.encoding != kP29KeyVectorEncoding ||
-            begin.body.encoding != kP29KeyVectorEncoding)
+            (begin.body.encoding != kP29KeyVectorEncoding &&
+             begin.body.encoding != kP29ResidualBodyEncoding))
             throw std::invalid_argument("prepared P29 profile differs from authority");
         if (begin.raw_bytes > impl_->zstd_limits.max_raw_bytes ||
             begin.body.encoded_bytes > impl_->zstd_limits.max_encoded_body_bytes ||

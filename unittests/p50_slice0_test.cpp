@@ -1,4 +1,5 @@
 #include "cache/p50_slice0.h"
+#include "cache/p50_p29_residual.h"
 
 #include <algorithm>
 #include <array>
@@ -271,6 +272,43 @@ void test_separate_preparation_real_interning_and_p29() {
     pair.route.accept_commit(pair.f.commit_input(pair.session));
 }
 
+void test_p29_current_tu_residual_and_block_controls() {
+    Pair pair;
+    const auto input = regions({"same-line\n", "same-line\n", "same-line\n",
+                                "same-line\n", "tail\n"});
+    std::vector<uint8_t> exact;
+    for (const auto& region : input) exact.insert(exact.end(), region.begin(), region.end());
+
+    residual_group::Codec codec;
+    residual_group::Kind selected = residual_group::Kind::Zstd3;
+    const std::vector<uint8_t> residual = codec.encode(exact.data(), exact.size(), &selected);
+    const auto decoded = codec.decode(residual.data(), residual.size());
+    require(decoded.wire_bytes == residual.size() && decoded.raw == exact,
+            "P29 residual group did not round-trip the current TU");
+    require(selected == residual_group::Kind::Zstd3 || selected == residual_group::Kind::Bsc ||
+                selected == residual_group::Kind::Zstd10,
+            "P29 residual group selected an unknown codec");
+    require_throws<std::runtime_error>(
+        [&] { (void)codec.decode(residual.data(), residual.size() - 1); },
+        "P29 residual deletion bypass was not rejected");
+
+    const PreparedTUPtr first = pair.c.prepare_from_regions(input);
+    const CActiveTx& first_active = pair.route.begin(
+        first, P29RootMode::HistoryIndependent, residual, true);
+    require(first_active.region_count == input.size() && first_active.block_use_count > 0,
+            "P29 current-TU admission did not expose repeated Regions and Block use");
+    finish(pair, first_active);
+
+    const PreparedTUPtr second = pair.c.prepare_from_regions(input);
+    const CActiveTx& second_active = pair.route.begin(
+        second, P29RootMode::RouteHistory, residual, true);
+    require(second_active.block_use_count > 0 &&
+                std::any_of(second_active.root.begin(), second_active.root.end(),
+                            [](Key64 key) { return key.type() == ObjectType::Block; }),
+            "P29 RouteHistory did not consume the sequential Block plan");
+    finish(pair, second_active);
+}
+
 void test_exact_need_and_duplicate_application() {
     Pair pair;
     const PreparedTUPtr prepared =
@@ -451,7 +489,7 @@ void test_p29_key_vector_encoding_boundary() {
         "F accepted an unsupported P29 DICT encoding");
 
     unsupported = active.begin;
-    unsupported.body.encoding = kP29KeyVectorEncoding + 1;
+    unsupported.body.encoding = kP29ResidualBodyEncoding + 1;
     require_throws<std::invalid_argument>(
         [&] { pair.f.begin(pair.session, unsupported); },
         "F accepted an unsupported P29 BODY encoding");
@@ -880,6 +918,7 @@ int main() {
     test_global_resource_owner_and_caught_slot_mutant();
     test_tu_seq_is_not_route_order();
     test_separate_preparation_real_interning_and_p29();
+    test_p29_current_tu_residual_and_block_controls();
     test_exact_need_and_duplicate_application();
     test_valid_then_invalid_fill_retains_first_object();
     test_trailing_partial_fill_blocks_commit_and_replays();

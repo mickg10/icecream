@@ -30,6 +30,10 @@ struct ChildrenPayload {
 using ObjectPayload = std::variant<BytesPayload, ChildrenPayload>;
 
 constexpr uint16_t kP29KeyVectorEncoding = 1;
+// BODY is a deterministic root-key vector followed by one canonical
+// per-TU residual-group frame.  The object closure remains the Need/FILL
+// integrity proof; the receiver reconstructs the input from this frame.
+constexpr uint16_t kP29ResidualBodyEncoding = 2;
 
 struct ImmutableObject {
     Key64 key{};
@@ -302,6 +306,9 @@ struct CActiveTx {
     std::vector<uint8_t> body;
     std::vector<Key64> root;
     std::vector<Key64> manifest;
+    size_t region_count = 0;
+    size_t block_use_count = 0;
+    size_t new_block_count = 0;
 };
 
 class FStore;
@@ -317,7 +324,8 @@ public:
 
     const CActiveTx& begin(
         const PreparedTUPtr& prepared,
-        P29RootMode root_mode = P29RootMode::RouteHistory);
+        P29RootMode root_mode = P29RootMode::RouteHistory,
+        std::span<const uint8_t> residual = {}, bool residual_body = false);
     std::vector<ImmutableObject> build_fill(const Need& need) const;
     void accept_commit(const TxCommit& committed,
                        ActionType action = ActionType::COMMIT_ACCEPTED);

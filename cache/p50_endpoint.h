@@ -47,10 +47,10 @@ struct EndpointCaps {
 };
 
 /* One immutable prepared source.  ZSTD profiles populate BODY only; P29
-   populates its key-vector DICT/BODY and the exact object records which answer
-   the F-side Need.  Keeping the two representations in one envelope lets
-   the endpoint reducer remain profile-neutral without treating P29 as a
-   compressed ZSTD variant. */
+   populates a key-vector DICT, a root-vector/residual BODY, and the exact
+   object records which answer the F-side Need.  Keeping the two
+   representations in one envelope lets the endpoint reducer remain
+   profile-neutral without treating P29 as a compressed ZSTD variant. */
 struct PreparedInputEnvelope {
     TxBegin begin;
     std::vector<uint8_t> dict;
