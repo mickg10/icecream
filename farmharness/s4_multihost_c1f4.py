@@ -332,9 +332,9 @@ exec /role/scheduler/icecc-scheduler "$@"
 WRAPPER
 chmod 755 "$work/wrapper.sh"
 docker run -d --name "$container" --network host --user 0 \
-  -v "$root:/role:ro" -v "$work:/work" -e S4_UID="$uid" -e S4_GID="$gid" \
-  --entrypoint /work/wrapper.sh "$image" -p "$port" -n "$network" \
-  --assignment-fence-mode strict-nonce -l /work/scheduler.log -vvv \
+  -v "$root:/role:ro" -v "$work:/workspace" -e S4_UID="$uid" -e S4_GID="$gid" \
+  --entrypoint /workspace/wrapper.sh "$image" -p "$port" -n "$network" \
+  --assignment-fence-mode strict-nonce -l /workspace/scheduler.log -vvv \
   >"$work/container.id"
 sleep 1
 [ "$(docker inspect --format '{{.State.Running}}' "$container")" = true ] || exit 77
@@ -358,12 +358,12 @@ exec /role/daemon/iceccd "$@"
 WRAPPER
 chmod 755 "$work/wrapper.sh"
 docker run -d --name "$container" --network host --user 0 --cap-add=SYS_CHROOT \
-  -v "$root:/role:ro" -v "$work:/work" -e S4_UID="$uid" -e S4_GID="$gid" \
-  -e ICECC_TEST_SOCKET=/work/f.sock --entrypoint /work/wrapper.sh "$image" \
+  -v "$root:/role:ro" -v "$work:/workspace" -e S4_UID="$uid" -e S4_GID="$gid" \
+  -e ICECC_TEST_SOCKET=/workspace/f.sock --entrypoint /workspace/wrapper.sh "$image" \
   -p "$port" -m 2 -s "$scheduler:$sport" -n "$network" -N "$name" \
-  -b /work/envs -l /work/fdaemon.log -vvv \
+  -b /workspace/envs -l /workspace/fdaemon.log -vvv \
   --cache-service /role/cache/icecc-cache-service \
-  --cache-runtime-dir /work/cache-runtime >"$work/container.id"
+  --cache-runtime-dir /workspace/cache-runtime >"$work/container.id"
 sleep 2
 [ "$(docker inspect --format '{{.State.Running}}' "$container")" = true ] || exit 77
 printf 'S4_REMOTE_WORK=%s\n' "$work"
