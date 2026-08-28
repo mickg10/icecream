@@ -6282,7 +6282,9 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
             << " " << c << " " << msg->hostname << " " << remote_name <<  endl;
 
     if (!c) {
-        if (send_scheduler(JobDoneMsg(msg->job_id, 107, JobDoneMsg::FROM_SUBMITTER, clients.size()))) {
+        if (send_scheduler(JobDoneMsg(msg->job_id, 107, JobDoneMsg::FROM_SUBMITTER, clients.size(),
+                                      msg->assignmentEpoch(), msg->assignmentNonce(),
+                                      msg->cGuid(), msg->tuSeq()))) {
             return 0;
         }
 
@@ -6302,7 +6304,9 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
                 && c->getcs_generation == scheduler_session_generation)) {
             log_warning() << "scheduler_use_cs batch stale/unpublished job " << msg->job_id
                           << " client " << msg->client_id << "; terminalizing" << endl;
-            return send_scheduler(JobDoneMsg(msg->job_id, 107, JobDoneMsg::FROM_SUBMITTER, clients.size())) ? 0 : 1;
+            return send_scheduler(JobDoneMsg(msg->job_id, 107, JobDoneMsg::FROM_SUBMITTER, clients.size(),
+                                             msg->assignmentEpoch(), msg->assignmentNonce(),
+                                             msg->cGuid(), msg->tuSeq())) ? 0 : 1;
         }
         /* Dedup BEFORE the excess check (bigoracle 00:35 #3): a duplicate exact
            job id -- even one arriving after completion -- is ignored, never
@@ -6318,7 +6322,9 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
         if (c->getcs_delivered >= c->getcs_expected) {
             log_warning() << "scheduler_use_cs batch excess job " << msg->job_id
                           << " client " << msg->client_id << "; terminalizing" << endl;
-            return send_scheduler(JobDoneMsg(msg->job_id, 107, JobDoneMsg::FROM_SUBMITTER, clients.size())) ? 0 : 1;
+            return send_scheduler(JobDoneMsg(msg->job_id, 107, JobDoneMsg::FROM_SUBMITTER, clients.size(),
+                                             msg->assignmentEpoch(), msg->assignmentNonce(),
+                                             msg->cGuid(), msg->tuSeq())) ? 0 : 1;
         }
         c->getcs_batch_jobids.push_back(msg->job_id);   /* record BEFORE the write */
         /* S2 (BigOracle, 4th independent gap): a count>1 request bypassed
@@ -6395,7 +6401,9 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
             && c->status == Client::WAITFORCS)) {
         log_warning() << "scheduler_use_cs unmatched job " << msg->job_id
                       << " client " << msg->client_id << "; terminalizing" << endl;
-        return send_scheduler(JobDoneMsg(msg->job_id, 107, JobDoneMsg::FROM_SUBMITTER, clients.size())) ? 0 : 1;
+        return send_scheduler(JobDoneMsg(msg->job_id, 107, JobDoneMsg::FROM_SUBMITTER, clients.size(),
+                                         msg->assignmentEpoch(), msg->assignmentNonce(),
+                                         msg->cGuid(), msg->tuSeq())) ? 0 : 1;
     }
 
     if (c->status == Client::WAITFORCS) {
@@ -6567,7 +6575,9 @@ int Daemon::scheduler_no_cs(NoCSMsg *msg)
             << " " << c << " " <<  endl;
 
     if (!c) {
-        if (send_scheduler(JobDoneMsg(msg->job_id, 107, JobDoneMsg::FROM_SUBMITTER, clients.size()))) {
+        if (send_scheduler(JobDoneMsg(msg->job_id, 107, JobDoneMsg::FROM_SUBMITTER, clients.size(),
+                                      msg->assignmentEpoch(), msg->assignmentNonce(),
+                                      msg->cGuid(), msg->tuSeq()))) {
             return 0;
         }
 
@@ -6582,7 +6592,9 @@ int Daemon::scheduler_no_cs(NoCSMsg *msg)
             && c->status == Client::WAITFORCS)) {
         log_warning() << "scheduler_no_cs unmatched job " << msg->job_id
                       << " client " << msg->client_id << "; terminalizing" << endl;
-        return send_scheduler(JobDoneMsg(msg->job_id, 107, JobDoneMsg::FROM_SUBMITTER, clients.size())) ? 0 : 1;
+        return send_scheduler(JobDoneMsg(msg->job_id, 107, JobDoneMsg::FROM_SUBMITTER, clients.size(),
+                                         msg->assignmentEpoch(), msg->assignmentNonce(),
+                                         msg->cGuid(), msg->tuSeq())) ? 0 : 1;
     }
 
     if (c->status == Client::WAITFORCS) {
@@ -6602,7 +6614,9 @@ int Daemon::scheduler_no_cs(NoCSMsg *msg)
     install_cache_absent_local_decision(
         *c,
         std::unique_ptr<UseCSMsg>(new UseCSMsg(string(), "127.0.0.1", daemon_port,
-                                                msg->job_id, true, 1, 0)),
+                                                msg->job_id, true, 1, 0,
+                                                msg->assignmentEpoch(), msg->assignmentNonce(),
+                                                msg->cGuid(), msg->tuSeq())),
         "scheduler_no_cs: local compile");
     if (cache_handoff_test_poisoned_no_cs) {
         test_record_cache_handoff_clear(c, "no_cs");
@@ -7495,7 +7509,10 @@ bool Daemon::handle_compile_done(Client *client)
             client->p50_completion_reader->observation();
     }
 
-    JobDoneMsg *msg = new JobDoneMsg(client->job->jobID(), -1, JobDoneMsg::FROM_SERVER, clients.size());
+    JobDoneMsg *msg = new JobDoneMsg(client->job->jobID(), -1, JobDoneMsg::FROM_SERVER,
+                                     clients.size(), client->job->assignmentEpoch(),
+                                     client->job->assignmentNonce(), client->job->cGuid(),
+                                     client->job->tuSeq());
     assert(msg);
     unregister_child(client->child_pid);
     assert(current_kids > 0);
@@ -8155,7 +8172,14 @@ void Daemon::handle_end(Client *client, int exitcode)
 
             trace() << "scheduler->send_msg( JobDoneMsg( " << client->dump() << ", " << exitcode << "))\n";
 
-            JobDoneMsg msg(job_id, exitcode, flag, clients.size());
+            const uint64_t c_guid = client->job ? client->job->cGuid() : 0;
+            const uint64_t tu_seq = client->job ? client->job->tuSeq() : 0;
+            const uint64_t assignment_epoch = client->job
+                ? client->job->assignmentEpoch() : 0;
+            const uint64_t assignment_nonce = client->job
+                ? client->job->assignmentNonce() : 0;
+            JobDoneMsg msg(job_id, exitcode, flag, clients.size(),
+                           assignment_epoch, assignment_nonce, c_guid, tu_seq);
             if( use_client_id ) {
                 msg.set_unknown_job_client_id( client->client_id );
             }

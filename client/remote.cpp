@@ -912,6 +912,10 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
 
         CompileResultMsg *crmsg = dynamic_cast<CompileResultMsg*>(msg);
         assert(crmsg);
+        if (!crmsg->compileIdentityMatches(job)) {
+            delete crmsg;
+            throw client_error(13, "Error 13 - compile result C_GUID/TU_SEQ mismatch");
+        }
         p50_result_received = p50_input;
 
         status = crmsg->status;
@@ -1092,7 +1096,9 @@ maybe_build_local(MsgChannel *local_daemon, UseCSMsg *usecs, CompileJob &job,
         gettimeofday(&endtv, nullptr);
 
         // filling the stats, so the daemon can play proxy for us
-        JobDoneMsg msg(job_id, ret, JobDoneMsg::FROM_SUBMITTER);
+        JobDoneMsg msg(job_id, ret, JobDoneMsg::FROM_SUBMITTER, 0,
+                       job.assignmentEpoch(), job.assignmentNonce(),
+                       job.cGuid(), job.tuSeq());
 
         msg.real_msec = (endtv.tv_sec - begintv.tv_sec) * 1000 + (endtv.tv_usec - begintv.tv_usec) / 1000;
 

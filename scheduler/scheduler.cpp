@@ -148,6 +148,7 @@ static std::unordered_map<SchedulerAssignmentKey, Job *,
    default.  Link versions constrain eligibility but never select a mode. */
 static ConfCSMsg::FenceMode assignment_fence_mode = ConfCSMsg::Legacy;
 static uint64_t scheduler_assignment_epoch = 0;
+static uint64_t next_tu_seq = 0;
 
 static bool assignment_mode_prepares()
 {
@@ -1457,6 +1458,7 @@ static bool send_remote_dispatch_reply(Job *job)
                    job->dispatchGotEnv(), job->localClientId(),
                    job->dispatchMatchedJobId(), job->assignmentEpoch(),
                    job->assignmentNonce(), cache_port, cache_protocol, cache_mask);
+    reply.setCompileIdentity(job->cGuid(), job->tuSeq());
     return job->submitter()->send_msg(
         reply, MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable);
 }
@@ -2775,9 +2777,21 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
         job->setAssignmentPhase(Job::ASSIGNMENT_NONE);
     }
 
+    const bool p50_assignment =
+        IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY, job->submitter())
+        && IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY, use_cs);
+    if (p50_assignment) {
+        assert(next_tu_seq != UINT64_MAX);
+        job->setCompileIdentity(scheduler_assignment_epoch, next_tu_seq++);
+    } else {
+        job->setCompileIdentity(0, 0);
+    }
+
     if (IS_PROTOCOL_VERSION(37, job->submitter()) && local_decision)
     {
-        NoCSMsg m2(job->id(), job->localClientId());
+        NoCSMsg m2(job->id(), job->localClientId(),
+                   job->assignmentEpoch(), job->assignmentNonce(),
+                   job->cGuid(), job->tuSeq());
         if (!job->submitter()->send_msg(m2, MsgChannel::SendNonBlocking | MsgChannel::SendDeferrable)) {
             trace() << "failed to deliver job " << job->id() << endl;
             handle_end(job->submitter(), nullptr);   // will care for the rest
@@ -3378,6 +3392,12 @@ static bool handle_job_done(CompileServer *cs, Msg *_m)
         trace() << "late terminal for absent job " << m->job_id
                 << " ignored (from_server=" << (m->is_from_server() ? 1 : 0) << ")" << endl;
         return true;
+    }
+
+    if (m->cGuid() != j->cGuid() || m->tuSeq() != j->tuSeq()) {
+        log_info() << "compile identity mismatch for job " << m->job_id << endl;
+        handle_end(cs, nullptr);
+        return false;
     }
 
     /* Centralized, phase- and origin-sensitive terminal authority.  The

@@ -40,6 +40,7 @@ TESTS += p50cachesessionwire p50cachesessionwire-source.sh \
 TESTS += p50daemoncontrol p50daemoncontrol-source.sh \
 	p50daemoncontrol-mutants.sh p50_daemon_control_sanitize.sh
 TESTS += p50endpointcancel p50endpointcancel-run.sh
+TESTS += assignment_identity_test
 TESTS += p50_adopted_outcome_writer-run.sh \
 	p50_adopted_outcome_writer-source.sh \
 	p50_adopted_outcome_writer-sanitize.sh \
@@ -183,6 +184,9 @@ check_PROGRAMS += p50sessionjoin
 check_PROGRAMS += p50cachesessionwire
 check_PROGRAMS += p50sidecarlifecycle
 check_PROGRAMS += p50daemoncontrol
+check_PROGRAMS += assignment_identity_test
+assignment_identity_test_SOURCES = assignment_identity_test.cpp
+assignment_identity_test_LDADD = ../services/libicecc.la
 p50wire_SOURCES = p50_wire_test.cpp
 p50sourceingress_SOURCES = p50_source_ingress_test.cpp
 p50sourceingress_CXXFLAGS = -pthread

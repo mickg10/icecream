@@ -75,6 +75,10 @@ public:
     void setAssignmentPhase(AssignmentPhase phase) { m_assignmentPhase = phase; }
     uint64_t assignmentEpoch() const { return m_assignmentEpoch; }
     uint64_t assignmentNonce() const { return m_assignmentNonce; }
+    void setCompileIdentity(uint64_t c_guid, uint64_t tu_seq)
+    { m_cGuid = c_guid; m_tuSeq = tu_seq; }
+    uint64_t cGuid() const { return m_cGuid; }
+    uint64_t tuSeq() const { return m_tuSeq; }
     void setAssignmentIdentity(uint64_t epoch, uint64_t nonce)
     {
         m_assignmentEpoch = epoch;
@@ -223,6 +227,8 @@ private:
     AssignmentPhase m_assignmentPhase = ASSIGNMENT_NONE;
     uint64_t m_assignmentEpoch = 0;
     uint64_t m_assignmentNonce = 0;
+    uint64_t m_cGuid = 0;
+    uint64_t m_tuSeq = 0;
     std::string m_dispatchPlatform;
     bool m_dispatchGotEnv = false;
     uint32_t m_dispatchMatchedJobId = 0;

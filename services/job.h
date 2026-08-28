@@ -125,6 +125,8 @@ public:
         : m_id(0)
         , m_assignment_epoch(0)
         , m_assignment_nonce(0)
+        , m_c_guid(0)
+        , m_tu_seq(0)
         , m_dwarf_fission(false)
         , m_block_rewrite_includes(false)
     {
@@ -293,6 +295,22 @@ public:
                 && m_id != 0);
     }
 
+    /* C_GUID names the scheduler incarnation.  TU_SEQ is zero-based and
+       monotonic within that incarnation, so zero is the first valid value. */
+    void setCompileIdentity(uint64_t c_guid, uint64_t tu_seq)
+    {
+        m_c_guid = c_guid;
+        m_tu_seq = tu_seq;
+    }
+
+    uint64_t cGuid() const { return m_c_guid; }
+    uint64_t tuSeq() const { return m_tu_seq; }
+    bool hasCompileIdentity() const { return m_c_guid != 0; }
+    bool compileIdentityValid() const
+    {
+        return m_c_guid != 0 || m_tu_seq == 0;
+    }
+
     void appendFlag(std::string arg, Argument_Type argumentType)
     {
         m_flags.append(arg, argumentType);
@@ -327,6 +345,8 @@ private:
     unsigned int m_id;
     uint64_t m_assignment_epoch;
     uint64_t m_assignment_nonce;
+    uint64_t m_c_guid;
+    uint64_t m_tu_seq;
     CompileInputIdentity m_compile_input;
     Language m_language;
     std::string m_compiler_pathname;

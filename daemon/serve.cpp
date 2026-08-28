@@ -346,6 +346,8 @@ int handle_connection(const string &basedir, CompileJob *job,
 
         int ret;
         CompileResultMsg rmsg;
+        rmsg.setAssignmentIdentity(job->assignmentEpoch(), job->assignmentNonce());
+        rmsg.setCompileIdentity(job->cGuid(), job->tuSeq());
         unsigned int job_id = job->jobID();
 
         char *tmp_output = nullptr;

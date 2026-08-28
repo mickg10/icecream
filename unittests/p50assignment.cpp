@@ -89,7 +89,9 @@ static void test_eight_cells()
     for (int sn = 0; sn != 2; ++sn) for (int cn = 0; cn != 2; ++cn) for (int fn = 0; fn != 2; ++fn) {
         const int sv = sn ? 50 : 43, cv = cn ? 50 : 43, fv = fn ? 50 : 43;
         const bool all50 = sn && cn && fn;
-        UseCSMsg scheduled("x86_64", "worker", 10245, wire, true, 7, 9, epoch, nonce);
+        const uint64_t c_guid = UINT64_C(0x0102030405060708);
+        UseCSMsg scheduled("x86_64", "worker", 10245, wire, true, 7, 9,
+                           epoch, nonce, c_guid, UINT64_C(0));
         Pair sd = make_pair(std::min(sv, cv));
         UseCSMsg *at_daemon = round_trip(sd, scheduled, Msg::USE_CS);
         Pair dc = make_pair(cv);
@@ -105,7 +107,9 @@ static void test_eight_cells()
         delete received;
         const bool exact = admitted && admitted->jobID() == wire
             && admitted->assignmentEpoch() == (all50 ? epoch : 0)
-            && admitted->assignmentNonce() == (all50 ? nonce : 0);
+            && admitted->assignmentNonce() == (all50 ? nonce : 0)
+            && admitted->cGuid() == (all50 ? c_guid : 0)
+            && admitted->tuSeq() == 0;
         char label[128];
         std::snprintf(label, sizeof(label), "8-cell S%d/C%d/F%d: one wire id, identity %s", sv, cv, fv, all50 ? "exact" : "absent");
         REQUIRE(copied && exact, label);
@@ -155,8 +159,14 @@ static Bytes encoded_compile_with_input(int protocol)
 
 static bool appended_word_count(const Bytes &oldf, const Bytes &newf, size_t words)
 {
-    return newf.size() == oldf.size() + 4 * words
-        && std::equal(oldf.begin() + 4, oldf.end(), newf.begin() + 4);
+    if (newf.size() != oldf.size() + 4 * words || oldf.size() < 4 + 16)
+        return false;
+    /* The new identity words follow the existing assignment words. */
+    const size_t prefix_end = oldf.size() - 16;
+    return std::equal(oldf.begin() + 4, oldf.begin() + prefix_end,
+                      newf.begin() + 4)
+        && std::equal(oldf.begin() + prefix_end, oldf.end(),
+                      newf.begin() + prefix_end);
 }
 
 static uint64_t fnv1a(const Bytes &bytes)
@@ -183,7 +193,7 @@ static void test_bytes()
        cache-handoff tail (see UseCSMsg::cache_endpoint_port et al.) land in the
        same protocol bump, so P50 UseCS is seven words larger than P49, not four. */
     REQUIRE(appended_word_count(u49, u50, 7),
-            "P50 UseCS appends its four identity words plus the S2 three-word cache-handoff tail");
+            "P50 UseCS appends assignment and C_GUID/TU_SEQ words plus the cache tail");
     const Bytes f43 = encoded_compile(43), f48 = encoded_compile(48), f49 = encoded_compile(49), f50 = encoded_compile(50);
     REQUIRE(!f43.empty() && fnv1a(f43) == UINT64_C(0x1d040038613f174d),
             "P43 CompileFile matches its retained byte fixture");
@@ -191,8 +201,8 @@ static void test_bytes()
             "P48 CompileFile matches its retained byte fixture");
     REQUIRE(!f49.empty() && fnv1a(f49) == UINT64_C(0x1d040038613f174d),
             "P49 CompileFile matches its retained byte fixture");
-    REQUIRE(appended_word_count(f49, f50, 21),
-            "P50 CompileFile appends four assignment words and the mandatory 17-word input selector");
+    REQUIRE(appended_word_count(f49, f50, 25),
+            "P50 CompileFile appends assignment, C_GUID/TU_SEQ, and the mandatory input selector");
 }
 
 static void test_compile_input_identity()
@@ -250,14 +260,12 @@ static void test_invalid()
         return rejected;
     };
 
-    /* The wire tail is now seven words: epoch_hi, epoch_lo, nonce_hi, nonce_lo,
-       cache_port, cache_protocol, cache_profile_mask (S2).  encoded_usecs(50)
-       leaves the three cache words at their default zero/absent, so the nonce
-       pair to zero for a partial identity is words 5-4 from the end, i.e.
-       bytes [end-20, end-12) -- not the last 8 bytes any more. */
+    /* The P50 tail carries assignment, C_GUID/TU_SEQ, and the three cache
+       words.  encoded_usecs(50) leaves the cache words absent; zero the
+       nonce-high word to produce a partial assignment. */
     Bytes use_partial = encoded_usecs(50);
-    if (use_partial.size() >= 20) {
-        std::fill(use_partial.end() - 20, use_partial.end() - 12, 0);
+    if (use_partial.size() >= 36) {
+        std::fill(use_partial.end() - 36, use_partial.end() - 32, 0);
     }
     REQUIRE(rejected_by_decoder(use_partial),
             "production decoder rejects partial UseCS identity");
@@ -267,8 +275,8 @@ static void test_invalid()
             "production decoder rejects full UseCS identity with zero wire id");
 
     Bytes compile_partial = encoded_compile(50);
-    if (compile_partial.size() >= 76)
-        std::fill(compile_partial.end() - 76, compile_partial.end() - 68, 0);
+    if (compile_partial.size() >= 92)
+        std::fill(compile_partial.end() - 92, compile_partial.end() - 88, 0);
     REQUIRE(rejected_by_decoder(compile_partial),
             "production decoder rejects partial CompileFile identity");
     Bytes compile_zero_wire = encoded_compile(50);

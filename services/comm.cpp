@@ -3694,9 +3694,15 @@ void UseCSMsg::fill_from_channel(MsgChannel *c)
         *c >> assignment_epoch_lo;
         *c >> assignment_nonce_hi;
         *c >> assignment_nonce_lo;
+        *c >> c_guid_hi;
+        *c >> c_guid_lo;
+        *c >> tu_seq_hi;
+        *c >> tu_seq_lo;
     } else {
         assignment_epoch_hi = assignment_epoch_lo = 0;
         assignment_nonce_hi = assignment_nonce_lo = 0;
+        c_guid_hi = c_guid_lo = 0;
+        tu_seq_hi = tu_seq_lo = 0;
     }
     if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, c)) {
         /* Owner ruling (d23d9c5d HOLD, superseding the earlier rolling-
@@ -3747,6 +3753,10 @@ void UseCSMsg::send_to_channel(MsgChannel *c) const
         *c << assignment_epoch_lo;
         *c << assignment_nonce_hi;
         *c << assignment_nonce_lo;
+        *c << c_guid_hi;
+        *c << c_guid_lo;
+        *c << tu_seq_hi;
+        *c << tu_seq_lo;
     }
     if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, c)) {
         *c << cache_endpoint_port;
@@ -3779,17 +3789,19 @@ bool UseCSMsg::valid_payload() const
     return cache_tail_valid
         && (assignment_absent || assignment_complete)
         && (cache_absent || cache_present)
-        && (!cache_present || assignment_complete);
+        && (!cache_present || assignment_complete)
+        && compileIdentityValid();
 }
 
 bool UseCSMsg::applyAssignmentTo(CompileJob *job) const
 {
-    if (!job || !valid_payload()) {
+    if (!job || !valid_payload() || !compileIdentityValid()) {
         return false;
     }
     job->setJobID(job_id);
     job->setAssignmentIdentity(assignmentEpoch(), assignmentNonce());
-    return true;
+    job->setCompileIdentity(cGuid(), tuSeq());
+    return job->assignmentIdentityValid();
 }
 
 void NoCSMsg::fill_from_channel(MsgChannel *c)
@@ -3797,6 +3809,21 @@ void NoCSMsg::fill_from_channel(MsgChannel *c)
     Msg::fill_from_channel(c);
     *c >> job_id;
     *c >> client_id;
+    if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY, c)) {
+        *c >> assignment_epoch_hi;
+        *c >> assignment_epoch_lo;
+        *c >> assignment_nonce_hi;
+        *c >> assignment_nonce_lo;
+        *c >> c_guid_hi;
+        *c >> c_guid_lo;
+        *c >> tu_seq_hi;
+        *c >> tu_seq_lo;
+    } else {
+        assignment_epoch_hi = assignment_epoch_lo = 0;
+        assignment_nonce_hi = assignment_nonce_lo = 0;
+        c_guid_hi = c_guid_lo = 0;
+        tu_seq_hi = tu_seq_lo = 0;
+    }
 }
 
 void NoCSMsg::send_to_channel(MsgChannel *c) const
@@ -3804,6 +3831,16 @@ void NoCSMsg::send_to_channel(MsgChannel *c) const
     Msg::send_to_channel(c);
     *c << job_id;
     *c << client_id;
+    if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY, c)) {
+        *c << assignment_epoch_hi;
+        *c << assignment_epoch_lo;
+        *c << assignment_nonce_hi;
+        *c << assignment_nonce_lo;
+        *c << c_guid_hi;
+        *c << c_guid_lo;
+        *c << tu_seq_hi;
+        *c << tu_seq_lo;
+    }
 }
 
 
@@ -3974,15 +4011,23 @@ void CompileFileMsg::fill_from_channel(MsgChannel *c)
     }
     if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY, c)) {
         uint32_t epoch_hi, epoch_lo, nonce_hi, nonce_lo;
+        uint32_t c_guid_hi, c_guid_lo, tu_seq_hi, tu_seq_lo;
         *c >> epoch_hi;
         *c >> epoch_lo;
         *c >> nonce_hi;
         *c >> nonce_lo;
+        *c >> c_guid_hi;
+        *c >> c_guid_lo;
+        *c >> tu_seq_hi;
+        *c >> tu_seq_lo;
         job->setAssignmentIdentity(
             (uint64_t(epoch_hi) << 32) | epoch_lo,
             (uint64_t(nonce_hi) << 32) | nonce_lo);
+        job->setCompileIdentity((uint64_t(c_guid_hi) << 32) | c_guid_lo,
+                                (uint64_t(tu_seq_hi) << 32) | tu_seq_lo);
     } else {
         job->setAssignmentIdentity(0, 0);
+        job->setCompileIdentity(0, 0);
     }
     if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, c)) {
         /* Protocol 50 is an unshipped draft.  Its compiler-input selector has
@@ -4055,6 +4100,10 @@ void CompileFileMsg::send_to_channel(MsgChannel *c) const
         *c << uint32_t(job->assignmentEpoch());
         *c << uint32_t(job->assignmentNonce() >> 32);
         *c << uint32_t(job->assignmentNonce());
+        *c << uint32_t(job->cGuid() >> 32);
+        *c << uint32_t(job->cGuid());
+        *c << uint32_t(job->tuSeq() >> 32);
+        *c << uint32_t(job->tuSeq());
     }
     if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, c)) {
         const CompileInputIdentity &input = job->compileInputIdentity();
@@ -4130,6 +4179,21 @@ void CompileResultMsg::fill_from_channel(MsgChannel *c)
         *c >> dwo;
         have_dwo_file = dwo;
     }
+    if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY, c)) {
+        *c >> assignment_epoch_hi;
+        *c >> assignment_epoch_lo;
+        *c >> assignment_nonce_hi;
+        *c >> assignment_nonce_lo;
+        *c >> c_guid_hi;
+        *c >> c_guid_lo;
+        *c >> tu_seq_hi;
+        *c >> tu_seq_lo;
+    } else {
+        assignment_epoch_hi = assignment_epoch_lo = 0;
+        assignment_nonce_hi = assignment_nonce_lo = 0;
+        c_guid_hi = c_guid_lo = 0;
+        tu_seq_hi = tu_seq_lo = 0;
+    }
 }
 
 void CompileResultMsg::send_to_channel(MsgChannel *c) const
@@ -4141,6 +4205,16 @@ void CompileResultMsg::send_to_channel(MsgChannel *c) const
     *c << (uint32_t) was_out_of_memory;
     if (IS_PROTOCOL_VERSION(35, c)) {
         *c << (uint32_t) have_dwo_file;
+    }
+    if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY, c)) {
+        *c << assignment_epoch_hi;
+        *c << assignment_epoch_lo;
+        *c << assignment_nonce_hi;
+        *c << assignment_nonce_lo;
+        *c << c_guid_hi;
+        *c << c_guid_lo;
+        *c << tu_seq_hi;
+        *c << tu_seq_lo;
     }
 }
 
@@ -4260,12 +4334,22 @@ void JobTimingMsg::send_to_channel(MsgChannel *c) const
     *c << mode;
 }
 
-JobDoneMsg::JobDoneMsg(int id, int exit, unsigned int _flags, unsigned int _client_count)
+JobDoneMsg::JobDoneMsg(int id, int exit, unsigned int _flags, unsigned int _client_count,
+                       uint64_t assignment_epoch, uint64_t assignment_nonce,
+                       uint64_t c_guid, uint64_t tu_seq)
     : Msg(Msg::JOB_DONE)
     , exitcode(exit)
     , flags(_flags)
     , job_id(id)
     , client_count(_client_count)
+    , assignment_epoch_hi(uint32_t(assignment_epoch >> 32))
+    , assignment_epoch_lo(uint32_t(assignment_epoch))
+    , assignment_nonce_hi(uint32_t(assignment_nonce >> 32))
+    , assignment_nonce_lo(uint32_t(assignment_nonce))
+    , c_guid_hi(uint32_t(c_guid >> 32))
+    , c_guid_lo(uint32_t(c_guid))
+    , tu_seq_hi(uint32_t(tu_seq >> 32))
+    , tu_seq_lo(uint32_t(tu_seq))
 {
     real_msec = 0;
     user_msec = 0;
@@ -4301,6 +4385,21 @@ void JobDoneMsg::fill_from_channel(MsgChannel *c)
     if (IS_PROTOCOL_VERSION(39, c)) {
         *c >> client_count;
     }
+    if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY, c)) {
+        *c >> assignment_epoch_hi;
+        *c >> assignment_epoch_lo;
+        *c >> assignment_nonce_hi;
+        *c >> assignment_nonce_lo;
+        *c >> c_guid_hi;
+        *c >> c_guid_lo;
+        *c >> tu_seq_hi;
+        *c >> tu_seq_lo;
+    } else {
+        assignment_epoch_hi = assignment_epoch_lo = 0;
+        assignment_nonce_hi = assignment_nonce_lo = 0;
+        c_guid_hi = c_guid_lo = 0;
+        tu_seq_hi = tu_seq_lo = 0;
+    }
 }
 
 void JobDoneMsg::send_to_channel(MsgChannel *c) const
@@ -4323,6 +4422,16 @@ void JobDoneMsg::send_to_channel(MsgChannel *c) const
     *c << flags;
     if (IS_PROTOCOL_VERSION(39, c)) {
         *c << client_count;
+    }
+    if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY, c)) {
+        *c << assignment_epoch_hi;
+        *c << assignment_epoch_lo;
+        *c << assignment_nonce_hi;
+        *c << assignment_nonce_lo;
+        *c << c_guid_hi;
+        *c << c_guid_lo;
+        *c << tu_seq_hi;
+        *c << tu_seq_lo;
     }
 }
 

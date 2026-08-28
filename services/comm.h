@@ -1362,6 +1362,10 @@ public:
         , assignment_epoch_lo(0)
         , assignment_nonce_hi(0)
         , assignment_nonce_lo(0)
+        , c_guid_hi(0)
+        , c_guid_lo(0)
+        , tu_seq_hi(0)
+        , tu_seq_lo(0)
         , cache_endpoint_port(0)
         , cache_protocol(0)
         , cache_profile_mask(0)
@@ -1383,10 +1387,27 @@ public:
           assignment_epoch_lo(uint32_t(assignment_epoch)),
           assignment_nonce_hi(uint32_t(assignment_nonce >> 32)),
           assignment_nonce_lo(uint32_t(assignment_nonce)),
+          c_guid_hi(0),
+          c_guid_lo(0),
+          tu_seq_hi(0),
+          tu_seq_lo(0),
           cache_endpoint_port(cache_port),
           cache_protocol(cache_proto),
           cache_profile_mask(cache_mask),
           cache_tail_valid(true) {}
+
+    /* C_GUID/TU_SEQ-only form used when no cache advertisement is present.
+       Keep the historical cache-tail constructor above source-compatible. */
+    UseCSMsg(std::string platform, std::string host, unsigned int p, unsigned int id, bool gotit,
+             unsigned int _client_id, unsigned int matched_host_jobs,
+             uint64_t assignment_epoch, uint64_t assignment_nonce,
+             uint64_t c_guid, uint64_t tu_seq)
+        : UseCSMsg(std::move(platform), std::move(host), p, id, gotit,
+                   _client_id, matched_host_jobs, assignment_epoch,
+                   assignment_nonce, 0, 0, 0)
+    {
+        setCompileIdentity(c_guid, tu_seq);
+    }
 
     virtual void fill_from_channel(MsgChannel *c);
     virtual void send_to_channel(MsgChannel *c) const;
@@ -1399,6 +1420,26 @@ public:
     uint64_t assignmentNonce() const
     {
         return (uint64_t(assignment_nonce_hi) << 32) | assignment_nonce_lo;
+    }
+
+    void setCompileIdentity(uint64_t c_guid, uint64_t tu_seq)
+    {
+        c_guid_hi = uint32_t(c_guid >> 32);
+        c_guid_lo = uint32_t(c_guid);
+        tu_seq_hi = uint32_t(tu_seq >> 32);
+        tu_seq_lo = uint32_t(tu_seq);
+    }
+    uint64_t cGuid() const
+    {
+        return (uint64_t(c_guid_hi) << 32) | c_guid_lo;
+    }
+    uint64_t tuSeq() const
+    {
+        return (uint64_t(tu_seq_hi) << 32) | tu_seq_lo;
+    }
+    bool compileIdentityValid() const
+    {
+        return cGuid() != 0 || tuSeq() == 0;
     }
 
     bool hasAssignmentIdentity() const
@@ -1421,6 +1462,10 @@ public:
     uint32_t assignment_epoch_lo;
     uint32_t assignment_nonce_hi;
     uint32_t assignment_nonce_lo;
+    uint32_t c_guid_hi;
+    uint32_t c_guid_lo;
+    uint32_t tu_seq_hi;
+    uint32_t tu_seq_lo;
     /* S2: protocol 50 also appends this three-word assignment-bound S->C
        cache-endpoint handoff tail, gated and shaped exactly like LoginMsg's
        Login-only advertisement tail (see cache_advertisement_is_wholly_absent
@@ -1467,17 +1512,42 @@ class NoCSMsg : public Msg
 {
 public:
     NoCSMsg()
-        : Msg(Msg::NO_CS) {}
-    NoCSMsg(unsigned int id, unsigned int _client_id)
+        : Msg(Msg::NO_CS), job_id(0), client_id(0), assignment_epoch_hi(0),
+          assignment_epoch_lo(0), assignment_nonce_hi(0), assignment_nonce_lo(0),
+          c_guid_hi(0), c_guid_lo(0), tu_seq_hi(0), tu_seq_lo(0) {}
+    NoCSMsg(unsigned int id, unsigned int _client_id,
+            uint64_t assignment_epoch = 0, uint64_t assignment_nonce = 0,
+            uint64_t c_guid = 0, uint64_t tu_seq = 0)
         : Msg(Msg::NO_CS),
           job_id(id),
-          client_id(_client_id) {}
+          client_id(_client_id),
+          assignment_epoch_hi(uint32_t(assignment_epoch >> 32)),
+          assignment_epoch_lo(uint32_t(assignment_epoch)),
+          assignment_nonce_hi(uint32_t(assignment_nonce >> 32)),
+          assignment_nonce_lo(uint32_t(assignment_nonce)),
+          c_guid_hi(uint32_t(c_guid >> 32)), c_guid_lo(uint32_t(c_guid)),
+          tu_seq_hi(uint32_t(tu_seq >> 32)), tu_seq_lo(uint32_t(tu_seq)) {}
 
     virtual void fill_from_channel(MsgChannel *c);
     virtual void send_to_channel(MsgChannel *c) const;
 
     uint32_t job_id;
     uint32_t client_id;
+    uint32_t assignment_epoch_hi;
+    uint32_t assignment_epoch_lo;
+    uint32_t assignment_nonce_hi;
+    uint32_t assignment_nonce_lo;
+    uint32_t c_guid_hi;
+    uint32_t c_guid_lo;
+    uint32_t tu_seq_hi;
+    uint32_t tu_seq_lo;
+    uint64_t assignmentEpoch() const
+    { return (uint64_t(assignment_epoch_hi) << 32) | assignment_epoch_lo; }
+    uint64_t assignmentNonce() const
+    { return (uint64_t(assignment_nonce_hi) << 32) | assignment_nonce_lo; }
+    uint64_t cGuid() const { return (uint64_t(c_guid_hi) << 32) | c_guid_lo; }
+    uint64_t tuSeq() const { return (uint64_t(tu_seq_hi) << 32) | tu_seq_lo; }
+    bool compileIdentityValid() const { return cGuid() != 0 || tuSeq() == 0; }
 };
 
 class GetNativeEnvMsg : public Msg
@@ -1545,6 +1615,7 @@ public:
     {
         return job != nullptr && p50_input_tail_valid
             && job->assignmentIdentityValid()
+            && job->compileIdentityValid()
             && job->compileInputIdentityValid();
     }
     CompileJob *takeJob();
@@ -1597,16 +1668,49 @@ public:
         : Msg(Msg::COMPILE_RESULT)
         , status(0)
         , was_out_of_memory(false)
-        , have_dwo_file(false) {}
+        , have_dwo_file(false)
+        , assignment_epoch_hi(0), assignment_epoch_lo(0)
+        , assignment_nonce_hi(0), assignment_nonce_lo(0)
+        , c_guid_hi(0), c_guid_lo(0), tu_seq_hi(0), tu_seq_lo(0) {}
 
     virtual void fill_from_channel(MsgChannel *c);
     virtual void send_to_channel(MsgChannel *c) const;
+
+    void setAssignmentIdentity(uint64_t epoch, uint64_t nonce)
+    {
+        assignment_epoch_hi = uint32_t(epoch >> 32);
+        assignment_epoch_lo = uint32_t(epoch);
+        assignment_nonce_hi = uint32_t(nonce >> 32);
+        assignment_nonce_lo = uint32_t(nonce);
+    }
+    void setCompileIdentity(uint64_t c_guid, uint64_t tu_seq)
+    {
+        c_guid_hi = uint32_t(c_guid >> 32);
+        c_guid_lo = uint32_t(c_guid);
+        tu_seq_hi = uint32_t(tu_seq >> 32);
+        tu_seq_lo = uint32_t(tu_seq);
+    }
+    uint64_t assignmentEpoch() const
+    { return (uint64_t(assignment_epoch_hi) << 32) | assignment_epoch_lo; }
+    uint64_t assignmentNonce() const
+    { return (uint64_t(assignment_nonce_hi) << 32) | assignment_nonce_lo; }
+    uint64_t cGuid() const { return (uint64_t(c_guid_hi) << 32) | c_guid_lo; }
+    uint64_t tuSeq() const { return (uint64_t(tu_seq_hi) << 32) | tu_seq_lo; }
+    bool compileIdentityMatches(const CompileJob &job) const
+    {
+        return job.compileIdentityValid() && cGuid() == job.cGuid()
+            && tuSeq() == job.tuSeq();
+    }
 
     int status;
     std::string out;
     std::string err;
     bool was_out_of_memory;
     bool have_dwo_file;
+    uint32_t assignment_epoch_hi, assignment_epoch_lo;
+    uint32_t assignment_nonce_hi, assignment_nonce_lo;
+    uint32_t c_guid_hi, c_guid_lo;
+    uint32_t tu_seq_hi, tu_seq_lo;
 };
 
 /*
@@ -1761,7 +1865,9 @@ public:
     };
 
     JobDoneMsg(int job_id = 0, int exitcode = -1, unsigned int flags = FROM_SERVER,
-               unsigned int _client_count = 0);
+               unsigned int _client_count = 0, uint64_t assignment_epoch = 0,
+               uint64_t assignment_nonce = 0, uint64_t c_guid = 0,
+               uint64_t tu_seq = 0);
 
     void set_from(from_type from)
     {
@@ -1776,6 +1882,27 @@ public:
     void set_unknown_job_client_id( uint32_t clientId );
     uint32_t unknown_job_client_id() const;
     void set_job_id( uint32_t jobId );
+
+    void setAssignmentIdentity(uint64_t epoch, uint64_t nonce)
+    {
+        assignment_epoch_hi = uint32_t(epoch >> 32);
+        assignment_epoch_lo = uint32_t(epoch);
+        assignment_nonce_hi = uint32_t(nonce >> 32);
+        assignment_nonce_lo = uint32_t(nonce);
+    }
+    void setCompileIdentity(uint64_t c_guid, uint64_t tu_seq)
+    {
+        c_guid_hi = uint32_t(c_guid >> 32);
+        c_guid_lo = uint32_t(c_guid);
+        tu_seq_hi = uint32_t(tu_seq >> 32);
+        tu_seq_lo = uint32_t(tu_seq);
+    }
+    uint64_t assignmentEpoch() const
+    { return (uint64_t(assignment_epoch_hi) << 32) | assignment_epoch_lo; }
+    uint64_t assignmentNonce() const
+    { return (uint64_t(assignment_nonce_hi) << 32) | assignment_nonce_lo; }
+    uint64_t cGuid() const { return (uint64_t(c_guid_hi) << 32) | c_guid_lo; }
+    uint64_t tuSeq() const { return (uint64_t(tu_seq_hi) << 32) | tu_seq_lo; }
 
     virtual void fill_from_channel(MsgChannel *c);
     virtual void send_to_channel(MsgChannel *c) const;
@@ -1796,6 +1923,10 @@ public:
 
     uint32_t job_id;
     uint32_t client_count; // number of CS -> C connections at the moment
+    uint32_t assignment_epoch_hi, assignment_epoch_lo;
+    uint32_t assignment_nonce_hi, assignment_nonce_lo;
+    uint32_t c_guid_hi, c_guid_lo;
+    uint32_t tu_seq_hi, tu_seq_lo;
 };
 
 class JobLocalBeginMsg : public Msg
