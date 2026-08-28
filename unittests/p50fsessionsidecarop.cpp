@@ -194,6 +194,27 @@ void test_endpoint_cannot_autonomously_commit() {
           "commit refused outside PreparedAwaitPermit");
 }
 
+void test_unacked_terminal_tombstone_survives_control_loss() {
+    const auto id = op_identity(kLiveDeadline);
+    RouteAdmissionOwner route;
+    SidecarFSessionOperation op;
+    (void)advance_to_running(op, route, id);
+    check(op.prepared_input_ready(), "prepared (tombstone row)");
+    check(op.grant_commit_permit_and_commit() != 0, "committed (tombstone row)");
+    const uint64_t term = op.stage_terminal_observation();
+    check(term != 0, "terminal staged (tombstone row)");
+    // Control lost with the ACK never consumed: the observation/tombstone must
+    // survive for identical replay -- reconciliation required, and a repeat
+    // stage call still returns the same retained sequence.
+    op.control_lost();
+    check(op.reconcile_required(),
+          "unacked TerminalStaged + control loss -> reconciliation required");
+    check(op.phase() == SidecarOpPhase::TerminalStaged,
+          "observation retained (not erased) after control loss");
+    check(op.stage_terminal_observation() == term,
+          "replay reuses the retained observation sequence");
+}
+
 } // namespace
 
 int main() {
@@ -201,6 +222,7 @@ int main() {
     test_cancel_before_commit();
     test_commit_before_cancel();
     test_endpoint_cannot_autonomously_commit();
+    test_unacked_terminal_tombstone_survives_control_loss();
 
     if (g_fail != 0) {
         std::fprintf(stderr, "%d failure(s)\n", g_fail);

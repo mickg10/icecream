@@ -19,6 +19,8 @@ size_t FSessionServiceOwner::live_operations() const noexcept {
 }
 
 uint64_t FSessionServiceOwner::connection_opened() {
+    if (!admission_enabled_)
+        return 0; // admission closed until exact payload codecs are installed
     if (live_operations() >= max_operations_)
         return 0; // bounded: refuse; no partial row
     const uint64_t connection_id = next_connection_id_++;

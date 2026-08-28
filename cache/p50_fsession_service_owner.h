@@ -43,6 +43,18 @@ public:
     explicit FSessionServiceOwner(size_t max_operations = 8) noexcept
         : max_operations_(max_operations == 0 ? 1 : max_operations) {}
 
+    // Positive admission is CLOSED by default: identity-bearing payloads are
+    // still placeholders, and no live production caller may admit an
+    // operation until the exact payload codecs are installed (5448067827
+    // sec.3). Tests and the eventual codec-complete wiring enable it
+    // explicitly; while closed, connection_opened() refuses (no partial row).
+    void set_admission_enabled(bool enabled) noexcept {
+        admission_enabled_ = enabled;
+    }
+    [[nodiscard]] bool admission_enabled() const noexcept {
+        return admission_enabled_;
+    }
+
     // A new dedicated control connection was accepted. Returns its nonzero
     // connection id, or 0 when the bounded operation table is full (the
     // caller refuses the connection; no partial row exists).
@@ -93,6 +105,7 @@ private:
     [[nodiscard]] Slot* find(uint64_t connection_id) noexcept;
 
     size_t max_operations_;
+    bool admission_enabled_ = false;
     uint64_t next_connection_id_ = 1;
     std::vector<Slot> slots_;
 };

@@ -53,7 +53,16 @@ constexpr int64_t kNow = 1000;
 } // namespace
 
 int main() {
+    // Positive admission is closed by default (placeholder payloads may never
+    // admit a live operation); tests enable it explicitly.
+    {
+        FSessionServiceOwner closed(2);
+        check(closed.connection_opened() == 0,
+              "admission closed by default refuses connections");
+    }
+
     FSessionServiceOwner owner(2); // bounded to two live operations
+    owner.set_admission_enabled(true);
 
     // Two independent connections/operations.
     const uint64_t a = owner.connection_opened();

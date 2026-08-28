@@ -175,8 +175,14 @@ void SidecarFSessionOperation::control_lost() noexcept {
         delivery_suppressed_ = true;
         reconcile_required_ = true;
         break;
-    case SidecarOpPhase::AbortedPreDurable:
     case SidecarOpPhase::TerminalStaged:
+        // The observation is staged but the exact TerminalAck was never
+        // consumed: the bounded observation/tombstone MUST survive for
+        // identical-sequence/bytes replay under reconciliation. Never a
+        // cleanly-terminal state (5448067827 sec.1 row 1).
+        reconcile_required_ = true;
+        break;
+    case SidecarOpPhase::AbortedPreDurable:
     case SidecarOpPhase::Retired:
         break; // already terminal-capable/terminal
     }
