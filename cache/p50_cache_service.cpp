@@ -807,17 +807,25 @@ bool handle_connection(local::Connection connection, const Options& options,
 
         if (operation.kind == local::ControlOperationKind::CacheSession) {
             /*
-             * Cache-session continuation is deliberately not admitted by the
-             * legacy worker.  The only positive path is the shared-codec
-             * AdoptedOutcomeWriter: it must retain this authenticated control
-             * lease, flush a canonical P5CO/PHASE_OPEN incrementally, and only
-             * then move the same descriptor into CacheWire.  run_one() uses
-             * the old receive-and-ACK / send-magic whole-operation path and is
-             * retained solely for historical fixtures.  Calling it here
-             * would make that path live and would close the control lease at
-             * the wrong boundary, so fail closed until the writer bridge is
-             * installed.
+             * Complete the authenticated one-shot public-descriptor handoff,
+             * then move the adopted socket directly to the endpoint owner.
+             * This is the positive production bridge; run_one() is retained
+             * only for historical fixtures and is intentionally not called.
              */
+            local::FdHandoffReceiver receiver;
+            const local::FdHandoffResult handoff =
+                receiver.receive_and_ack(connection, operation.request_id == 0
+                                                     ? local::HandoffRequest{}
+                                                     : local::HandoffRequest{
+                                                           options.identity,
+                                                           operation.request_id},
+                                         deadline);
+            if (handoff.status != local::FdHandoffStatus::Accepted)
+                return true;
+            local::HandoffFd adopted = receiver.take_adopted_fd();
+            if (!adopted.valid() || !send_cache_session_ready(adopted.get(), deadline))
+                return true;
+            runtime.start_adopted_endpoint(adopted.release());
             return true;
         }
         if (!operation.input.has_value() || !operation.owner.has_value())
@@ -1590,6 +1598,25 @@ void SidecarRuntime::route_fsession_connection(int connection_fd) noexcept {
         });
     } catch (...) {
         (void)::close(connection_fd);
+    }
+}
+
+void SidecarRuntime::start_adopted_endpoint(
+    int adopted_fd, EndpointIoControl endpoint_control) noexcept {
+    if (adopted_fd < 0)
+        return;
+    std::promise<EndpointOwnerResult> completion;
+    try {
+        // The coroutine is the sole owner of the adopted descriptor after
+        // this call.  No worker thread runs endpoint code or re-enters the
+        // public CacheWire parser; the existing owner executor does so.
+        asio::co_spawn(context_,
+                       run_endpoint_on_owner(adopted_fd,
+                                              std::move(endpoint_control),
+                                              std::move(completion), -1),
+                       asio::detached);
+    } catch (...) {
+        (void)::close(adopted_fd);
     }
 }
 

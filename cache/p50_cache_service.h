@@ -132,6 +132,13 @@ public:
     void route_fsession_connection(int connection_fd) noexcept;
     [[nodiscard]] size_t live_fsession_operations() const noexcept;
 
+    // Start one already-authenticated public CacheWire socket on the endpoint
+    // owner.  The control worker transfers ownership here after the
+    // CacheSession handoff is ACKed; the historical run_one() worker remains
+    // out of the production path.
+    void start_adopted_endpoint(int adopted_fd,
+                                EndpointIoControl endpoint_control = {}) noexcept;
+
     void stop() noexcept;
     [[nodiscard]] bool stopped() const noexcept { return stop_requested_.load(); }
     [[nodiscard]] size_t live_session_count() const;
