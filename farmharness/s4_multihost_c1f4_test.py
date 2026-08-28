@@ -123,6 +123,10 @@ class FourHostRunnerTests(unittest.TestCase):
         self.assertIn('mktemp -d "$HOME/s4-p50-fourhost-worker.', runner.START_WORKER_SCRIPT)
         self.assertIn('docker stop "$container"', runner.STOP_CONTAINER_SCRIPT)
 
+    def test_profile_is_selected_by_scheduler_not_client_wrapper(self) -> None:
+        self.assertIn('-e ICECC_P50_PROFILE=ZSTD_TU', runner.START_SCHEDULER_SCRIPT)
+        self.assertNotIn('ICECC_P50_PROFILE=ZSTD_TU ICECC_LOGFILE', runner.CLIENT_SCRIPT)
+
 
 if __name__ == "__main__":
     unittest.main()

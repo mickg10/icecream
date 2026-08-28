@@ -335,6 +335,7 @@ WRAPPER
 chmod 755 "$work/wrapper.sh"
 docker run -d --name "$container" --network host --user 0 \
   -v "$work:/probe" -e S4_UID="$uid" -e S4_GID="$gid" \
+  -e ICECC_P50_PROFILE=ZSTD_TU \
   --entrypoint /bin/sh "$image" /probe/wrapper.sh -p "$port" -n "$network" \
   --assignment-fence-mode strict-nonce -l /probe/scheduler.log -vvv \
   >"$work/container.id"
@@ -447,7 +448,7 @@ for i in $(seq 1 "$worker_count"); do
   (
     env ICECC_TEST_SOCKET="$work/c.sock" ICECC_TEST_REMOTEBUILD=1 ICECC_VERSION="$envtar" \
       ICECC_PREFERRED_HOST="$name" ICECC_DEBUG=debug ICECC_P50_C1F1_REQUIRED=1 \
-      ICECC_P50_PROFILE=ZSTD_TU ICECC_LOGFILE="$work/client-debug-$i.log" \
+      ICECC_LOGFILE="$work/client-debug-$i.log" \
       timeout 180 "$root/client/icecc" g++ -std=c++17 -O2 -c "$work/main-$i.cpp" \
       -o "$work/out/remote-$i.o" >"$work/client-$i.log" 2>&1
   ) &
