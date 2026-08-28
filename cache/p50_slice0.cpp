@@ -1,5 +1,6 @@
 #include "p50_slice0.h"
 #include "p50_p29_residual.h"
+#include "capability/grouprlz/alpha_line_codec.h"
 
 #include <algorithm>
 #include <fstream>
@@ -28,127 +29,171 @@ uint64_t read_u64le(std::span<const uint8_t> bytes, size_t& offset) {
     return result;
 }
 
-std::vector<uint8_t> encode_p29_residual_body(std::span<const uint8_t> root,
-                                              std::span<const uint8_t> residual) {
+struct P29ResidualLine {
+    Key64 key{};
+    uint64_t bytes = 0;
+};
+
+std::vector<std::pair<Key64, std::vector<uint8_t>>> residual_line_objects(
+    const ImmutableObjectStore& objects, std::span<const Key64> roots,
+    const std::set<Key64>& acknowledged) {
+    std::vector<std::pair<Key64, std::vector<uint8_t>>> result;
+    std::set<Key64> seen;
+    std::function<void(Key64)> visit = [&](Key64 key) {
+        const ImmutableObject* object = objects.find(key);
+        if (!object) throw std::logic_error("P29 C residual root references an absent object");
+        if (object->key.type() == ObjectType::Block) {
+            const auto* block = std::get_if<ChildrenPayload>(&object->payload);
+            if (!block) throw std::logic_error("P29 C Block is not a child object");
+            for (Key64 child : block->children) visit(child);
+            return;
+        }
+        if (object->key.type() != ObjectType::Region)
+            throw std::logic_error("P29 C residual root is not a Region or Block");
+        const auto* region = std::get_if<ChildrenPayload>(&object->payload);
+        if (!region || region->children.size() != 1)
+            throw std::logic_error("P29 C Region does not contain one Line");
+        const Key64 line_key = region->children.front();
+        if (acknowledged.contains(line_key) || !seen.insert(line_key).second) return;
+        const ImmutableObject* line_object = objects.find(line_key);
+        const auto* line = line_object
+                               ? std::get_if<BytesPayload>(&line_object->payload)
+                               : nullptr;
+        if (!line) throw std::logic_error("P29 C Region child is not a Line payload");
+        result.emplace_back(line_key, line->bytes);
+    };
+    for (Key64 root : roots) visit(root);
+    return result;
+}
+
+std::vector<uint8_t> encode_p29_residual_body(
+    std::span<const uint8_t> root,
+    const std::vector<std::pair<Key64, std::vector<uint8_t>>>& lines) {
+    std::vector<uint8_t> alpha_raw;
+    uint64_t alpha_control_size = 0;
+    uint64_t alpha_data_size = 0;
+    std::vector<alpha_line::Slice> alpha_lines;
+    alpha_lines.reserve(lines.size());
+    std::vector<uint64_t> line_sizes;
+    line_sizes.reserve(lines.size());
+    for (const auto& [key, bytes] : lines) {
+        (void)key;
+        if (bytes.size() > std::numeric_limits<uint32_t>::max())
+            throw std::length_error("P29 residual Line exceeds its bounded size");
+        alpha_lines.push_back({bytes.data(), static_cast<uint32_t>(bytes.size())});
+        line_sizes.push_back(bytes.size());
+    }
+    if (!alpha_lines.empty()) {
+        const std::vector<uint32_t> gaps(alpha_lines.size() + 1, 0);
+        const alpha_line::Encoded encoded = alpha_line::encode(alpha_lines, gaps, {}, false);
+        if (!encoded.valid)
+            throw std::logic_error("P29 alpha line composition failed");
+        alpha_control_size = encoded.control.size();
+        alpha_data_size = encoded.data.size();
+        append_u64le(alpha_raw, encoded.control.size());
+        append_u64le(alpha_raw, encoded.data.size());
+        alpha_raw.insert(alpha_raw.end(), encoded.control.begin(), encoded.control.end());
+        alpha_raw.insert(alpha_raw.end(), encoded.data.begin(), encoded.data.end());
+    }
+    residual_group::Codec codec;
+    residual_group::Kind selected = residual_group::Kind::Zstd3;
+    const std::vector<uint8_t> residual_wire =
+        alpha_raw.empty() ? std::vector<uint8_t>{}
+                          : codec.encode(alpha_raw.data(), alpha_raw.size(), &selected);
     std::vector<uint8_t> result;
-    result.reserve(kP29ResidualMagic.size() + 16 + root.size() + residual.size());
+    result.reserve(kP29ResidualMagic.size() + 40 + root.size() + lines.size() * 16 +
+                   residual_wire.size());
     result.insert(result.end(), kP29ResidualMagic.begin(), kP29ResidualMagic.end());
     append_u64le(result, root.size());
-    append_u64le(result, residual.size());
+    append_u64le(result, lines.size());
+    append_u64le(result, alpha_control_size);
+    append_u64le(result, alpha_data_size);
+    append_u64le(result, residual_wire.size());
     result.insert(result.end(), root.begin(), root.end());
-    result.insert(result.end(), residual.begin(), residual.end());
+    for (size_t i = 0; i != lines.size(); ++i) {
+        append_u64le(result, lines[i].first.wire_value());
+        append_u64le(result, line_sizes[i]);
+    }
+    result.insert(result.end(), residual_wire.begin(), residual_wire.end());
     return result;
 }
 
 struct P29ResidualBody {
     std::vector<uint8_t> root;
     std::vector<uint8_t> residual;
+    std::vector<P29ResidualLine> lines;
 };
 
 P29ResidualBody decode_p29_residual_body(std::span<const uint8_t> bytes) {
-    if (bytes.size() < kP29ResidualMagic.size() + 16 ||
+    if (bytes.size() < kP29ResidualMagic.size() + 40 ||
         !std::equal(kP29ResidualMagic.begin(), kP29ResidualMagic.end(), bytes.begin()))
         throw std::invalid_argument("P29 BODY is not a residual-group envelope");
     size_t offset = kP29ResidualMagic.size();
     const uint64_t root_size = read_u64le(bytes, offset);
+    const uint64_t line_count = read_u64le(bytes, offset);
+    const uint64_t alpha_control_size = read_u64le(bytes, offset);
+    const uint64_t alpha_data_size = read_u64le(bytes, offset);
     const uint64_t residual_size = read_u64le(bytes, offset);
-    if (root_size > bytes.size() - offset || residual_size > bytes.size() - offset - root_size ||
-        offset + root_size + residual_size != bytes.size())
+    if (line_count > (bytes.size() - offset) / 16 ||
+        root_size > bytes.size() - offset - line_count * 16 ||
+        residual_size > bytes.size() - offset - line_count * 16 - root_size ||
+        offset + root_size + line_count * 16 + residual_size != bytes.size())
         throw std::invalid_argument("P29 residual BODY lengths are not exact");
     P29ResidualBody result;
     result.root.assign(bytes.begin() + offset, bytes.begin() + offset + root_size);
     offset += static_cast<size_t>(root_size);
-    result.residual.assign(bytes.begin() + offset, bytes.end());
-    return result;
-}
-
-void append_unacknowledged_line_payload(
-    const CObjectArena& arena, std::span<const Key64> regions,
-    const std::set<Key64>& acknowledged, std::vector<uint8_t>& output) {
-    for (Key64 region_key : regions) {
-        const auto* region = std::get_if<ChildrenPayload>(&arena.object(region_key).payload);
-        if (!region || region->children.size() != 1)
-            throw std::logic_error("P29 Region does not contain exactly one Line");
-        const Key64 line_key = region->children.front();
-        if (acknowledged.contains(line_key)) continue;
-        const auto* line = std::get_if<BytesPayload>(&arena.object(line_key).payload);
-        if (!line) throw std::logic_error("P29 Region child is not a Line payload");
-        const std::vector<uint8_t> payload =
-            residual_group::line_payload(line->bytes);
-        output.insert(output.end(), payload.begin(), payload.end());
+    result.lines.reserve(static_cast<size_t>(line_count));
+    std::set<Key64> line_keys;
+    uint64_t total_line_bytes = 0;
+    for (uint64_t i = 0; i != line_count; ++i) {
+        const Key64 key = Key64::from_wire(read_u64le(bytes, offset)).value_or(Key64{});
+        const uint64_t line_size = read_u64le(bytes, offset);
+        if (!key.valid() || key.type() != ObjectType::Line ||
+            !line_keys.insert(key).second ||
+            line_size > std::numeric_limits<uint32_t>::max() ||
+            total_line_bytes > std::numeric_limits<uint64_t>::max() - line_size)
+            throw std::invalid_argument("P29 residual Line definition is invalid");
+        total_line_bytes += line_size;
+        result.lines.push_back({key, line_size});
     }
-}
-
-std::vector<uint8_t> residual_for_root(
-    const ImmutableObjectStore& objects, std::span<const Key64> roots,
-    const std::set<Key64>& acknowledged) {
-    std::vector<uint8_t> result;
-    std::function<void(Key64)> visit = [&](Key64 key) {
-        const ImmutableObject& object = *objects.find(key);
-        if (object.key.type() == ObjectType::Region) {
-            const auto* region = std::get_if<ChildrenPayload>(&object.payload);
-            if (!region || region->children.size() != 1)
-                throw std::logic_error("P29 F Region does not contain one Line");
-            const Key64 line_key = region->children.front();
-            if (acknowledged.contains(line_key)) return;
-            const auto* line = std::get_if<BytesPayload>(&objects.find(line_key)->payload);
-            if (!line) throw std::logic_error("P29 F Region child is not a Line payload");
-            const std::vector<uint8_t> payload = residual_group::line_payload(line->bytes);
-            result.insert(result.end(), payload.begin(), payload.end());
-        } else if (object.key.type() == ObjectType::Block) {
-            const auto* block = std::get_if<ChildrenPayload>(&object.payload);
-            if (!block) throw std::logic_error("P29 F Block is not a child object");
-            for (Key64 child : block->children) visit(child);
-        } else {
-            throw std::logic_error("P29 F root is not a Region or Block");
-        }
-    };
-    for (Key64 root : roots) visit(root);
-    return result;
-}
-
-std::vector<uint8_t> reconstruct_root_with_residual(
-    const ImmutableObjectStore& objects, std::span<const Key64> roots,
-    const std::set<Key64>& acknowledged, std::span<const uint8_t> residual) {
-    std::vector<uint8_t> result;
-    size_t residual_offset = 0;
-    std::function<void(Key64)> visit = [&](Key64 key) {
-        const ImmutableObject* object = objects.find(key);
-        if (!object) throw std::logic_error("P29 F root references an absent object");
-        if (object->key.type() == ObjectType::Block) {
-            const auto* block = std::get_if<ChildrenPayload>(&object->payload);
-            if (!block) throw std::logic_error("P29 F Block is not a child object");
-            for (Key64 child : block->children) visit(child);
-            return;
-        }
-        if (object->key.type() != ObjectType::Region)
-            throw std::logic_error("P29 F root is not a Region or Block");
-        const auto* region = std::get_if<ChildrenPayload>(&object->payload);
-        if (!region || region->children.size() != 1)
-            throw std::logic_error("P29 F Region does not contain one Line");
-        const Key64 line_key = region->children.front();
-        const ImmutableObject* line_object = objects.find(line_key);
-        const auto* line = line_object
-                               ? std::get_if<BytesPayload>(&line_object->payload)
-                               : nullptr;
-        if (!line) throw std::logic_error("P29 F Region child is not a Line payload");
-        if (acknowledged.contains(line_key)) {
-            result.insert(result.end(), line->bytes.begin(), line->bytes.end());
-            return;
-        }
-        for (uint8_t byte : line->bytes) {
-            if (byte == '\n') {
-                result.push_back(byte);
-            } else {
-                if (residual_offset == residual.size())
-                    throw std::logic_error("P29 residual ended during reconstruction");
-                result.push_back(residual[residual_offset++]);
-            }
-        }
-    };
-    for (Key64 root : roots) visit(root);
-    if (residual_offset != residual.size())
-        throw std::logic_error("P29 residual has trailing bytes after reconstruction");
+    result.residual.assign(bytes.begin() + offset, bytes.end());
+    if (line_count == 0) {
+        if (alpha_control_size != 0 || alpha_data_size != 0 || residual_size != 0)
+            throw std::invalid_argument("P29 empty residual has unexpected payload");
+        return result;
+    }
+    if (residual_size == 0 || alpha_control_size == 0)
+        throw std::invalid_argument("P29 residual line payload is incomplete");
+    residual_group::Codec codec;
+    const residual_group::DecodedFrame frame =
+        codec.decode(result.residual.data(), result.residual.size());
+    if (frame.wire_bytes != result.residual.size())
+        throw std::invalid_argument("P29 residual frame has trailing bytes");
+    const size_t alpha_header = 16;
+    if (frame.raw.size() != alpha_header + alpha_control_size + alpha_data_size)
+        throw std::invalid_argument("P29 alpha composition extent differs");
+    size_t alpha_offset = 0;
+    const uint64_t encoded_control_size = read_u64le(frame.raw, alpha_offset);
+    const uint64_t encoded_data_size = read_u64le(frame.raw, alpha_offset);
+    if (encoded_control_size != alpha_control_size || encoded_data_size != alpha_data_size)
+        throw std::invalid_argument("P29 alpha composition lengths differ");
+    std::vector<uint8_t> control(frame.raw.begin() + alpha_offset,
+                                 frame.raw.begin() + alpha_offset + alpha_control_size);
+    alpha_offset += static_cast<size_t>(alpha_control_size);
+    std::vector<uint8_t> data(frame.raw.begin() + alpha_offset, frame.raw.end());
+    std::vector<uint8_t> decoded;
+    std::string error;
+    if (!alpha_line::decode(control, data, decoded, error))
+        throw std::invalid_argument("P29 alpha line composition is invalid: " + error);
+    size_t decoded_offset = 0;
+    for (const P29ResidualLine& line : result.lines) {
+        if (line.bytes > decoded.size() - decoded_offset)
+            throw std::invalid_argument("P29 alpha line payload is truncated");
+        decoded_offset += static_cast<size_t>(line.bytes);
+    }
+    if (decoded_offset != decoded.size())
+        throw std::invalid_argument("P29 alpha line payload has trailing bytes");
+    result.residual = std::move(decoded);
     return result;
 }
 
@@ -985,15 +1030,20 @@ CRoute::~CRoute() = default;
 std::vector<uint8_t> CRoute::residual_input(const PreparedTUPtr& prepared) const {
     if (!prepared) throw std::invalid_argument("cannot inspect a null PreparedTU");
     std::vector<uint8_t> result;
-    append_unacknowledged_line_payload(authority_.arena(), prepared->regions,
-                                       acknowledged_objects_, result);
+    const auto lines = residual_line_objects(authority_.arena().objects(), prepared->regions,
+                                             acknowledged_objects_);
+    for (const auto& [key, bytes] : lines) {
+        (void)key;
+        result.insert(result.end(), bytes.begin(), bytes.end());
+    }
     return result;
 }
 
 const CActiveTx& CRoute::begin(const PreparedTUPtr& prepared,
-                              P29RootMode root_mode,
-                              std::span<const uint8_t> residual,
-                              bool residual_body) {
+                               P29RootMode root_mode,
+                               std::span<const uint8_t> residual,
+                               bool residual_body) {
+    (void)residual; // C owns the exact line composition; callers cannot inject a second copy.
     if (!prepared) throw std::invalid_argument("cannot route a null PreparedTU");
     if (active_) throw std::logic_error("C route already has one ACTIVE_TX");
     if (next_rel_seq_.value == std::numeric_limits<uint64_t>::max())
@@ -1018,7 +1068,10 @@ const CActiveTx& CRoute::begin(const PreparedTUPtr& prepared,
         active.dict = encode_key_vector(active.manifest);
         const std::vector<uint8_t> root_bytes = encode_key_vector(active.root);
         active.body = residual_body
-                          ? encode_p29_residual_body(root_bytes, residual)
+                          ? encode_p29_residual_body(
+                                root_bytes,
+                                residual_line_objects(authority_.arena().objects(), active.root,
+                                                      acknowledged_objects_))
                           : root_bytes;
         active.region_count = prepared->regions.size();
         active.block_use_count = plan.block_uses.size();
@@ -1062,6 +1115,9 @@ std::vector<ImmutableObject> CRoute::build_fill(const Need& need) const {
     for (Key64 key : need.missing) {
         if (!std::binary_search(active_->manifest.begin(), active_->manifest.end(), key))
             throw std::logic_error("Need requests a key outside the manifest");
+        if (key.type() == ObjectType::Line &&
+            active_->begin.body.encoding == kP29ResidualBodyEncoding)
+            continue; // Line bytes are carried exactly once by the residual composition.
         result.push_back(authority_.arena().object(key));
     }
     return result;
@@ -1133,6 +1189,7 @@ struct FStore::Namespace {
         std::vector<uint8_t> dict;
         std::vector<uint8_t> body;
         std::vector<uint8_t> residual;
+        std::vector<P29ResidualLine> residual_lines;
         bool dict_complete = false;
         bool body_complete = false;
         std::vector<Key64> manifest;
@@ -1333,6 +1390,7 @@ void FStore::append_component(SessionHandle session, bool dict,
             const P29ResidualBody composite = decode_p29_residual_body(target);
             root_bytes = composite.root;
             pending.residual = composite.residual;
+            pending.residual_lines = composite.lines;
         } else {
             root_bytes = target;
         }
@@ -1418,7 +1476,29 @@ std::vector<uint8_t> FStore::materialize_and_verify(SessionHandle session) {
         throw std::logic_error("F route has no ACTIVE_TX to materialize");
     Namespace::FPending& pending = *space.route->pending;
     pending.partial_fill.finish();
-    if (!pending.dict_complete || !pending.body_complete || !pending.remaining.empty())
+    if (!pending.dict_complete || !pending.body_complete)
+        throw std::logic_error("input cannot materialize before DICT, BODY, and Need finish");
+    if (pending.begin.body.encoding == kP29ResidualBodyEncoding) {
+        size_t residual_offset = 0;
+        for (const P29ResidualLine& line : pending.residual_lines) {
+            if (!pending.requested.contains(line.key))
+                throw std::logic_error("P29 residual Line was not in F's exact Need");
+            if (line.bytes > pending.residual.size() - residual_offset)
+                throw std::logic_error("P29 residual Line ended during reconstruction");
+            const std::span<const uint8_t> bytes(pending.residual.data() + residual_offset,
+                                                  static_cast<size_t>(line.bytes));
+            const ImmutableObject object = ImmutableObject::bytes(line.key, bytes);
+            const ObjectApplyResult applied = space.objects.apply(object);
+            pending.remaining.erase(line.key);
+            record(ActionType::OBJECT_APPLIED, session, &pending.begin, line.key,
+                   object.content_digest, pending.remaining.size(),
+                   applied == ObjectApplyResult::Duplicate);
+            residual_offset += static_cast<size_t>(line.bytes);
+        }
+        if (residual_offset != pending.residual.size())
+            throw std::logic_error("P29 residual Line has trailing bytes");
+    }
+    if (!pending.remaining.empty())
         throw std::logic_error("input cannot materialize before DICT, BODY, and Need finish");
     if (pending.materialized)
         throw std::logic_error("input was already materialized for this transaction");
@@ -1431,30 +1511,7 @@ std::vector<uint8_t> FStore::materialize_and_verify(SessionHandle session) {
     if (!std::equal(reached.begin(), reached.end(), pending.manifest.begin(),
                     pending.manifest.end()))
         throw std::logic_error("DICT is not the exact transitive object closure");
-    std::vector<uint8_t> result = object_result;
-    if (pending.begin.body.encoding == kP29ResidualBodyEncoding) {
-        if (!pending.residual.empty()) {
-            residual_group::Codec codec;
-            const residual_group::DecodedFrame frame =
-                codec.decode(pending.residual.data(), pending.residual.size());
-            if (frame.wire_bytes != pending.residual.size())
-                throw std::logic_error("P29 residual frame has trailing bytes");
-            const std::vector<uint8_t> expected_residual = residual_for_root(
-                space.objects, pending.root, pending.acknowledged_before);
-            if (frame.raw != expected_residual)
-                throw std::logic_error("P29 residual differs from Root/Block line payload");
-            result = reconstruct_root_with_residual(
-                space.objects, pending.root, pending.acknowledged_before, frame.raw);
-        }
-        if (pending.residual.empty()) {
-            const std::vector<uint8_t> expected_residual = residual_for_root(
-                space.objects, pending.root, pending.acknowledged_before);
-            if (!expected_residual.empty())
-                throw std::logic_error("P29 nonempty line payload has no residual frame");
-            result = reconstruct_root_with_residual(
-                space.objects, pending.root, pending.acknowledged_before, {});
-        }
-    }
+    const std::vector<uint8_t> result = object_result;
     if (result.size() != pending.begin.raw_bytes ||
         digest128(result) != pending.begin.raw_digest)
         throw std::logic_error("materialized input does not match TX_BEGIN exactly");

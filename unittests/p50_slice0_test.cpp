@@ -302,7 +302,83 @@ void test_p29_current_tu_residual_and_block_controls() {
         first, P29RootMode::HistoryIndependent, residual, true);
     require(first_active.region_count == input.size() && first_active.block_use_count > 0,
             "P29 current-TU admission did not expose repeated Regions and Block use");
-    finish(pair, first_active);
+    const Need first_need = start(pair, first_active);
+    const std::vector<ImmutableObject> first_fill = pair.route.build_fill(first_need);
+    require(std::none_of(first_fill.begin(), first_fill.end(), [](const ImmutableObject& object) {
+                return object.key.type() == ObjectType::Line;
+            }),
+            "P29 residual transfer duplicated literal Line bytes in FILL");
+
+    {
+        Pair missing_structure;
+        const CActiveTx& active = missing_structure.route.begin(
+            missing_structure.c.prepare_from_regions(input),
+            P29RootMode::HistoryIndependent, residual, true);
+        const Need need = start(missing_structure, active);
+        const std::vector<ImmutableObject> fill = missing_structure.route.build_fill(need);
+        require(fill.size() > 1, "P29 missing-structure fixture has one object");
+        missing_structure.f.append_body(missing_structure.session, active.body);
+        for (size_t i = 0; i + 1 < fill.size(); ++i)
+            missing_structure.f.apply_object(missing_structure.session, fill[i]);
+        require_throws<std::logic_error>(
+            [&] { (void)missing_structure.f.materialize_and_verify(missing_structure.session); },
+            "P29 materialization accepted a deleted structural object");
+    }
+    {
+        Pair missing_residual;
+        const CActiveTx& active = missing_residual.route.begin(
+            missing_residual.c.prepare_from_regions(input),
+            P29RootMode::HistoryIndependent, residual, true);
+        const Need need = start(missing_residual, active);
+        for (const ImmutableObject& object : missing_residual.route.build_fill(need))
+            missing_residual.f.apply_object(missing_residual.session, object);
+        require(active.body.size() > 1, "P29 missing-residual fixture is empty");
+        missing_residual.f.append_body(
+            missing_residual.session,
+            std::span<const uint8_t>(active.body).first(active.body.size() - 1));
+        require_throws<std::logic_error>(
+            [&] { (void)missing_residual.f.materialize_and_verify(missing_residual.session); },
+            "P29 materialization accepted a deleted residual byte");
+    }
+
+    for (const ImmutableObject& object : first_fill)
+        pair.f.apply_object(pair.session, object);
+    pair.f.append_body(pair.session, first_active.body);
+    require(pair.f.materialize_and_verify(pair.session) == exact,
+            "P29 structure-only FILL did not reconstruct exact bytes");
+    pair.route.accept_commit(pair.f.commit_input(pair.session));
+
+    Pair warm;
+    const PreparedTUPtr warm_first = warm.c.prepare_from_regions(input);
+    const CActiveTx& warm_active = warm.route.begin(
+        warm_first, P29RootMode::HistoryIndependent, residual, true);
+    finish(warm, warm_active);
+    const PreparedTUPtr warm_second = warm.c.prepare_from_regions(input);
+    const CActiveTx& warm_second_active = warm.route.begin(
+        warm_second, P29RootMode::RouteHistory, {}, true);
+    require(warm_second_active.body.size() > 1,
+            "P29 same-route second TU did not emit a complete frame");
+    finish(warm, warm_second_active);
+
+    Pair different_route;
+    const CActiveTx& isolated_active = different_route.route.begin(
+        different_route.c.prepare_from_regions(input),
+        P29RootMode::HistoryIndependent, residual, true);
+    require(isolated_active.body == first_active.body,
+            "P29 different route changed its independent structural/literal frame");
+    finish(different_route, isolated_active);
+
+    Pair retry;
+    const PreparedTUPtr retry_prepared = retry.c.prepare_from_regions(input);
+    const CActiveTx& retry_active = retry.route.begin(
+        retry_prepared, P29RootMode::HistoryIndependent, residual, true);
+    const std::vector<uint8_t> retry_body = retry_active.body;
+    retry.route.abandon_active();
+    const CActiveTx& retry_again = retry.route.begin(
+        retry_prepared, P29RootMode::HistoryIndependent, residual, true);
+    require(retry_again.body == retry_body,
+            "P29 abort/retry changed its authoritative literal frame");
+    finish(retry, retry_again);
 
     const PreparedTUPtr second = pair.c.prepare_from_regions(input);
     const std::vector<uint8_t> second_residual_input = pair.route.residual_input(second);

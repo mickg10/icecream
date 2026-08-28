@@ -30,9 +30,9 @@ struct ChildrenPayload {
 using ObjectPayload = std::variant<BytesPayload, ChildrenPayload>;
 
 constexpr uint16_t kP29KeyVectorEncoding = 1;
-// BODY is a deterministic root-key vector followed by one canonical
-// per-TU residual-group frame.  The object closure remains the Need/FILL
-// integrity proof; the receiver reconstructs the input from this frame.
+// BODY carries deterministic Root/Block/Region control and one canonical
+// per-TU alpha/residual composition.  Line bytes are absent from FILL and
+// reconstructed independently at F from this authoritative composition.
 constexpr uint16_t kP29ResidualBodyEncoding = 2;
 
 struct ImmutableObject {
