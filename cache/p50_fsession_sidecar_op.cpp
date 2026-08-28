@@ -157,6 +157,31 @@ uint64_t SidecarFSessionOperation::stage_terminal_observation() {
     return seq;
 }
 
+void SidecarFSessionOperation::control_lost() noexcept {
+    switch (phase_) {
+    case SidecarOpPhase::AwaitOffer:
+    case SidecarOpPhase::Accepted:
+    case SidecarOpPhase::PublicFdAdopted:
+    case SidecarOpPhase::EndpointRunning:
+    case SidecarOpPhase::PreparedAwaitPermit:
+        // No commit linearized: the owner proof for AbortedPreDurable holds;
+        // no late record/Ready/route advance may appear.
+        phase_ = SidecarOpPhase::AbortedPreDurable;
+        reconcile_required_ = true;
+        break;
+    case SidecarOpPhase::Committed:
+    case SidecarOpPhase::CancelledAfterCommit:
+        // Durable facts retained; delivery suppressed pending reconciliation.
+        delivery_suppressed_ = true;
+        reconcile_required_ = true;
+        break;
+    case SidecarOpPhase::AbortedPreDurable:
+    case SidecarOpPhase::TerminalStaged:
+    case SidecarOpPhase::Retired:
+        break; // already terminal-capable/terminal
+    }
+}
+
 bool SidecarFSessionOperation::consume_terminal_ack() noexcept {
     if (phase_ != SidecarOpPhase::TerminalStaged ||
         terminal_observation_seq_ == 0)

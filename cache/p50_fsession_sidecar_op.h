@@ -105,6 +105,21 @@ public:
         return delivery_suppressed_;
     }
 
+    // Control relationship lost (EOF/reset). Each half preserves its local
+    // authoritative facts (5443811178 sec.6): before any durable commit the
+    // owner can prove no commit linearized -> AbortedPreDurable; from
+    // Committed the durable bundle is retained and delivery is suppressed
+    // pending reconciliation. Terminal/retired phases are unchanged.
+    void control_lost() noexcept;
+    [[nodiscard]] bool reconcile_required() const noexcept {
+        return reconcile_required_;
+    }
+    // The owner resolved this operation's reconciliation (durable facts were
+    // consulted/settled through the reset/replacement path). Only then may
+    // the slot's local observation state be reclaimed.
+    void mark_reconciled() noexcept { reconciled_ = true; }
+    [[nodiscard]] bool reconciled() const noexcept { return reconciled_; }
+
 private:
     [[nodiscard]] bool deadline_live(int64_t now_ns) const noexcept;
 
@@ -114,6 +129,8 @@ private:
     std::optional<RouteSessionLease> route_lease_;
     uint64_t terminal_observation_seq_ = 0;
     bool delivery_suppressed_ = false;
+    bool reconcile_required_ = false;
+    bool reconciled_ = false;
 };
 
 } // namespace icecc::p50::fsession
