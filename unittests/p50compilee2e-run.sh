@@ -13,10 +13,18 @@ src=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
 build=${ICECC_TEST_TOP_BUILDDIR:-$(CDPATH= cd -- "$src" && pwd)}
 timeout_s=${ICECC_P50_C1F1_TIMEOUT:-180}
 profile_marker=${ICECC_P50_PROFILE:-ZSTD_ROUTE}
+warm=${ICECC_P50_C1F1_WARM:-0}
 case "$profile_marker" in
     ZSTD_TU|ZSTD_ROUTE) ;;
     *)
         echo "FAIL: ICECC_P50_PROFILE must be ZSTD_TU or ZSTD_ROUTE" >&2
+        exit 1
+        ;;
+esac
+case "$warm" in
+    0|1) ;;
+    *)
+        echo "FAIL: ICECC_P50_C1F1_WARM must be 0 or 1" >&2
         exit 1
         ;;
 esac
@@ -147,11 +155,46 @@ test "$port_worker" -ne "$((port_sched + 1))" || {
 }
 network="p50c1f1-$$"
 
-printf '%s\n' \
-    '#include <cstdint>' \
-    'int p50_c1f1_translation_unit() {' \
-    '    return static_cast<int>(UINT32_C(50));' \
-    '}' >"$work/src/main.cpp"
+# A corpus cell may provide an exact input from an authenticated source root.
+# Keep root and relative path separate so the input cannot accidentally be
+# resolved against the build tree or replaced by the generated smoke TU.
+source_root=${ICECC_P50_C1F1_SOURCE_ROOT:-}
+source_relative=${ICECC_P50_C1F1_SOURCE_RELATIVE:-}
+source_input=${ICECC_P50_C1F1_INPUT:-}
+if test -n "$source_root" || test -n "$source_relative"; then
+    test -n "$source_root" && test -n "$source_relative" || {
+        echo "FAIL: source root and source relative path must be supplied together" >&2
+        exit 1
+    }
+    test "${source_root#/}" != "$source_root" || {
+        echo "FAIL: source root must be an absolute path" >&2
+        exit 1
+    }
+    case "$source_relative" in
+        ''|/*|../*|*/../*|*/..)
+            echo "FAIL: source relative path escapes its authenticated root" >&2
+            exit 1
+            ;;
+    esac
+    test -d "$source_root" && test ! -L "$source_root" || {
+        echo "FAIL: authenticated source root is unavailable" >&2
+        exit 1
+    }
+    source_input="$source_root/$source_relative"
+fi
+if test -n "$source_input"; then
+    test -f "$source_input" && test ! -L "$source_input" || {
+        echo "FAIL: authenticated source input is unavailable" >&2
+        exit 1
+    }
+    cp -- "$source_input" "$work/src/main.cpp"
+else
+    printf '%s\n' \
+        '#include <cstdint>' \
+        'int p50_c1f1_translation_unit() {' \
+        '    return static_cast<int>(UINT32_C(50));' \
+        '}' >"$work/src/main.cpp"
+fi
 
 # The environment is made by the real icecc tool, then shipped to the real F
 # daemon. This is deliberately not replaced by the host compiler PATH.
@@ -257,35 +300,48 @@ test "$cache_ready" -eq 1 || {
     exit 1
 }
 
-remote_obj="$work/out/remote.o"
-local_obj="$work/out/local.o"
-ICECC_TEST_SOCKET="$work/client.sock" ICECC_TEST_REMOTEBUILD=1 \
-    ICECC_VERSION="$envtar" ICECC_P50_C1F1_REQUIRED=1 \
-    ICECC_PREFERRED_HOST=p50-f \
-    ICECC_DEBUG=debug ICECC_LOGFILE="$work/client-compile.log" \
-    run_client_with_timeout g++ -std=c++17 -O2 -c \
-    "$work/src/main.cpp" -o "$remote_obj"
-g++ -std=c++17 -O2 -c "$work/src/main.cpp" -o "$local_obj"
-
-cmp -s "$remote_obj" "$local_obj" || {
-    echo "FAIL: real P50 object differs from local reference" >&2
-    exit 1
+compile_once() {
+    label=$1
+    remote_obj="$work/out/remote-$label.o"
+    local_obj="$work/out/local-$label.o"
+    client_log="$work/client-compile-$label.log"
+    ICECC_TEST_SOCKET="$work/client.sock" ICECC_TEST_REMOTEBUILD=1 \
+        ICECC_VERSION="$envtar" ICECC_P50_C1F1_REQUIRED=1 \
+        ICECC_PREFERRED_HOST=p50-f \
+        ICECC_DEBUG=debug ICECC_LOGFILE="$client_log" \
+        run_client_with_timeout g++ -std=c++17 -O2 -c \
+        "$work/src/main.cpp" -o "$remote_obj"
+    g++ -std=c++17 -O2 -c "$work/src/main.cpp" -o "$local_obj"
+    cmp -s "$remote_obj" "$local_obj" || {
+        echo "FAIL: real P50 object differs from local reference ($label)" >&2
+        exit 1
+    }
 }
+
+# Warm is a real two-transaction lifecycle: the prewarm transaction and the
+# measured transaction share the same scheduler, C/F daemons, cache service,
+# and input source.  The prewarm remains outside measured evidence.
+if test "$warm" = 1; then
+    echo "S7_WARM_PREWARM_BEGIN"
+    compile_once prewarm
+    echo "S7_WARM_PREWARM_COMPLETE"
+fi
+compile_once measured
 
 # Positive evidence is mandatory. Absence of a local marker is not enough:
 # the route must identify ZSTD_ROUTE and cache-session handoff.  Legacy FileChunk
 # remains correct for environment upload and object return, so the negative
 # evidence below is deliberately limited to the source-stream and local/client
 # fallback markers.
-grep -F "$profile_marker" "$work/client-compile.log" "$work/c.log" \
+grep -F "$profile_marker" "$work"/client-compile-*.log "$work/c.log" \
     "$work/f.log" >/dev/null &&
-grep -F 'CACHE_SESSION' "$work/client-compile.log" "$work/c.log" \
+grep -F 'CACHE_SESSION' "$work"/client-compile-*.log "$work/c.log" \
     "$work/f.log" >/dev/null || {
     echo "FAIL: no positive $profile_marker/CACHE_SESSION wire evidence" >&2
     exit 1
 }
 if grep -E 'write_fd_to_server from cpp|write_fd_to_server preprocessed|building myself|building_local|local build forced|client_exception|fallback_local' \
-    "$work/client-compile.log" "$work/c.log" "$work/f.log" >/dev/null 2>&1; then
+    "$work"/client-compile-*.log "$work/c.log" "$work/f.log" >/dev/null 2>&1; then
     echo "FAIL: compile path used legacy source streaming or local/client fallback" >&2
     exit 1
 fi
