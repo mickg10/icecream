@@ -352,6 +352,11 @@ struct P50ServerEndpointConfig {
     // Optional owner-visible trace for the global resource binding. The
     // endpoint never owns this sink; callers keep it alive for the endpoint.
     GlobalResourceTrace* global_resource_trace = nullptr;
+    // Called on the endpoint owner immediately after an input record is
+    // published and before TX_COMMIT is exposed to the peer.  Sidecar
+    // lifecycle ownership must observe this edge before a daemon can issue
+    // the corresponding attachment.
+    std::function<void(InputRecordKey, bool)> on_input_committed;
     std::function<void(EndpointCancelPermit)> on_run_admitted;
     std::function<void(EndpointCancelPermit, EndpointTerminalResult)> on_run_terminal;
 };

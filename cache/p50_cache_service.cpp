@@ -876,6 +876,15 @@ bool handle_connection(local::Connection connection, const Options& options,
             const InputFdAttachmentResult result = attachment.serve_request(
                 connection, options.identity, options.expected_peer, request,
                 deadline);
+            if (std::getenv("ICECC_P50_DEBUG_ATTACH") != nullptr) {
+                std::fprintf(stderr,
+                             "P50 sidecar input attachment request=%llu status=%s handoff=%s fd=%s\n",
+                             static_cast<unsigned long long>(request.request_id),
+                             input_fd_attachment_status_name(result.status),
+                             fd_handoff_status_name(result.handoff.status),
+                             result.fd.valid() ? "valid" : "invalid");
+                std::fflush(stderr);
+            }
             runtime.finish_input_attachment_on_owner(
                 request, result.status == InputFdAttachmentStatus::Accepted,
                 deadline);
@@ -1013,6 +1022,17 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
                 configured_state == InputJobState::Closed)
                 return InputJobState::Closed;
             return InputJobState::Open;
+        };
+    config_.endpoint_config.on_input_committed =
+        [this](InputRecordKey key, bool retained) {
+            // Publication and lifecycle ownership are one owner-affine edge.
+            // This runs before TX_COMMIT is written, so an F-side attachment
+            // cannot observe the record in its pre-commit state.
+            const bool observed = input_lifecycle_.observe_route_commit(key, retained);
+            if (std::getenv("ICECC_P50_DEBUG_ATTACH") != nullptr)
+                std::fprintf(stderr, "P50 sidecar lifecycle commit tu=%llu retained=%d observed=%d\n",
+                             static_cast<unsigned long long>(key.tu_seq.value),
+                             int(retained), int(observed));
         };
     if (config_.sidecar_launch) {
         config_.endpoint_config.sidecar_launch = config_.sidecar_launch;

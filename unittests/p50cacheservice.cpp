@@ -1207,9 +1207,13 @@ void test_runtime_zstd_tu_af_unix_loopback() {
     std::thread::id second_owner_id;
     std::atomic<bool> first_runtime_finished{false};
     std::atomic<bool> release_first_runtime{false};
+    std::atomic<bool> first_commit_write_seen{false};
     EndpointIoControl first_endpoint_control;
-    first_endpoint_control.before_completion_check = [&](CompletionStamp&) {
+    first_endpoint_control.before_completion_check = [&](CompletionStamp& stamp) {
         first_owner_id = std::this_thread::get_id();
+        if (stamp.operation == AsyncOperationKind::WriteFragment &&
+            stamp.transaction_bound && stamp.tu_seq == TuSeq{0})
+            first_commit_write_seen.store(true, std::memory_order_release);
     };
     auto authority = std::make_shared<P50PreparationAuthority>(Id128::from_u64(9002));
     P50ClientEndpoint client(authority);
@@ -1246,6 +1250,25 @@ void test_runtime_zstd_tu_af_unix_loopback() {
     local::FdHandoffSender sender{local::HandoffFd(accepted)};
     const local::FdHandoffResult sender_result = sender.send(
         control.sender, request, std::chrono::steady_clock::now() + std::chrono::seconds(3));
+    const auto commit_write_deadline = std::chrono::steady_clock::now() +
+                                       std::chrono::seconds(3);
+    while (!first_commit_write_seen.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < commit_write_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    CHECK(first_commit_write_seen.load(std::memory_order_acquire));
+    // The sidecar lifecycle observer runs in commit_materialized(), before
+    // this TX_COMMIT write completion.  A real owner-queued attachment must
+    // therefore succeed even while the endpoint is still finishing its
+    // dialogue, rather than being surfaced as a disconnected sidecar link.
+    const InputFdRequest attachment_request{
+        {7, 1}, {Id128::from_u64(9002), TuSeq{0}},
+        {41, 1, 2}, 901};
+    const std::optional<InputCursor> attached = runtime.attach_input_on_owner(
+        attachment_request, std::chrono::steady_clock::now() + std::chrono::seconds(3));
+    CHECK(attached.has_value() && attached->remaining() == input.size());
+    runtime.finish_input_attachment_on_owner(
+        attachment_request, true,
+        std::chrono::steady_clock::now() + std::chrono::seconds(3));
     // Stale, wrong-role, wrong-binding, and cross-operation cancellation
     // frames are consumed but must not affect the active dialogue.
     send_operation_cancel(control.sender, request.identity, request.request_id + 99);

@@ -2266,6 +2266,8 @@ struct P50ServerEndpoint::Impl {
         } else {
             space.last_input.reset();
         }
+        if (config.on_input_committed)
+            config.on_input_committed(input_key, committed_input.has_value());
         advance_revision(revision);
         route.state = materialized.commit.post_state_digest;
         ++route.next_rel.value;
