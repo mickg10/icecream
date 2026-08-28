@@ -82,6 +82,18 @@ ConnectionLeaseRegistry::revalidate(ConnectionLeaseId lease, Client *client,
     return record;
 }
 
+std::optional<ConnectionLeaseRecord>
+ConnectionLeaseRegistry::revalidate_live(ConnectionLeaseId lease,
+                                         Client *client,
+                                         MsgChannel *channel,
+                                         PeerCredentials peer) const noexcept {
+    const auto record = lookup(lease);
+    if (!record || record->target.client != client ||
+        record->target.channel != channel || !(record->provenance.peer == peer))
+        return std::nullopt;
+    return record;
+}
+
 bool ConnectionLeaseRegistry::cancel(ConnectionLeaseId lease) noexcept {
     if (!lease.valid())
         return false;

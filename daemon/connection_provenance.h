@@ -100,6 +100,13 @@ public:
                                                      Client *client,
                                                      MsgChannel *channel,
                                                      PeerCredentials peer) const noexcept;
+    // CACHE_SESSION is a fresh public TCP connection, not the Unix-local
+    // compiler wrapper that carries cache eligibility.  Keep exact lease and
+    // live-object validation while deliberately leaving eligibility to the
+    // caller's listener-kind check.
+    std::optional<ConnectionLeaseRecord> revalidate_live(
+        ConnectionLeaseId lease, Client *client, MsgChannel *channel,
+        PeerCredentials peer) const noexcept;
 
     // Removal is performed before Client/channel destruction.  Repeated
     // cancellation is harmless and stale delayed callbacks then fail closed.

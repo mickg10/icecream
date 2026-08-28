@@ -8328,8 +8328,12 @@ bool Daemon::handle_cache_session(Client *client, Msg *msg)
     // live object identities captured at accept time. An fd or Client address
     // reused after teardown must never authorize a CACHE_SESSION dispatch.
     const auto lease = client->connection_provenance.lease;
-    if (!connection_leases.revalidate(lease, client, client->channel,
-                                      client->connection_provenance.peer)) {
+    const bool public_tcp_cache_session =
+        client->connection_provenance.listener == ListenerKind::TcpLoopback ||
+        client->connection_provenance.listener == ListenerKind::TcpRemote;
+    if (!public_tcp_cache_session ||
+        !connection_leases.revalidate_live(
+            lease, client, client->channel, client->connection_provenance.peer)) {
         log_warning() << "CACHE_SESSION rejected stale wrapper connection lease" << endl;
         handle_end(client, 121);
         return false;
