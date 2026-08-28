@@ -26,6 +26,8 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <future>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -470,6 +472,11 @@ PairResult run_pair(P50ClientEndpoint& client, P50ServerEndpoint& server,
     return {client_result.get(), server_result.get()};
 }
 
+size_t staging_file_count();
+uint64_t resident_bytes();
+void report_resource_checkpoint(std::string_view label,
+                                const P50ServerOwnerUsage& usage);
+
 void test_zstd_route_endpoint_continuation_and_retry() {
     const P5coStoreGuids guids = p5co_store_guids(211);
     EndpointCaps caps;
@@ -512,6 +519,108 @@ void test_zstd_route_endpoint_continuation_and_retry() {
                 retried.server.status == ServerRunStatus::Completed &&
                 copy_input(server, guids.c) == failed,
             "ZSTD_ROUTE retry did not discard tentative state and commit exact bytes");
+}
+
+void test_s3_resource_storm_product_path() {
+    P50ServerEndpointConfig soak_config;
+    soak_config.owner_limits.max_namespaces = 4;
+    soak_config.owner_limits.max_retained_input_records = 1;
+    soak_config.owner_limits.max_retained_input_bytes = 4096;
+    P50ServerEndpoint soak_server(Id128::from_u64(12000), {}, nullptr, nullptr,
+                                  std::move(soak_config));
+    TestClient soak_client(Id128::from_u64(12001));
+    for (uint64_t index = 0; index != 10000; ++index) {
+        const std::vector<uint8_t> input{
+            static_cast<uint8_t>(index),
+            static_cast<uint8_t>(index >> 8),
+            static_cast<uint8_t>(index >> 16),
+            static_cast<uint8_t>(index >> 24)};
+        const PairResult result =
+            run_pair(soak_client, soak_server, admit(soak_client, input));
+        require(result.client.status == ClientRunStatus::Committed &&
+                    result.server.status == ServerRunStatus::Completed &&
+                    result.server.committed_input.has_value() &&
+                    copy_input(soak_server, soak_client.c_store_guid()) == input,
+                "10,000-TU product soak failed exact endpoint commit");
+        soak_server.close_input_job(*result.server.committed_input);
+        soak_server.collect_input_garbage();
+        require(soak_server.owner_usage().retained_input_records == 0 &&
+                    soak_server.owner_usage().retained_input_bytes == 0,
+                "10,000-TU product soak retained a released input");
+        if ((index + 1) % 2500 == 0)
+            report_resource_checkpoint("soak-" + std::to_string(index + 1),
+                                       soak_server.owner_usage());
+    }
+    report_resource_checkpoint("soak-final", soak_server.owner_usage());
+
+    P50ServerEndpointConfig storm_config;
+    storm_config.owner_limits.max_namespaces = 256;
+    storm_config.owner_limits.max_retained_input_records = 8;
+    storm_config.owner_limits.max_retained_input_bytes = 8 * 64;
+    P50ServerEndpoint storm_server(Id128::from_u64(13000), {}, nullptr, nullptr,
+                                   std::move(storm_config));
+    std::vector<std::unique_ptr<TestClient>> pinned_clients;
+    std::vector<InputCursor> pinned_cursors;
+    pinned_clients.reserve(8);
+    pinned_cursors.reserve(8);
+    for (uint64_t index = 0; index != 8; ++index) {
+        auto client = std::make_unique<TestClient>(Id128::from_u64(13100 + index));
+        const std::vector<uint8_t> input(64, static_cast<uint8_t>(index + 1));
+        const PairResult result =
+            run_pair(*client, storm_server, admit(*client, input));
+        require(result.client.status == ClientRunStatus::Committed &&
+                    result.server.status == ServerRunStatus::Completed &&
+                    result.server.committed_input.has_value(),
+                "multi-C_GUID storm failed initial product commit");
+        pinned_cursors.emplace_back(
+            storm_server.attach_input(*result.server.committed_input));
+        storm_server.close_input_job(*result.server.committed_input);
+        pinned_clients.emplace_back(std::move(client));
+    }
+    report_resource_checkpoint("storm-pinned", storm_server.owner_usage());
+
+    auto blocked_client = std::make_unique<TestClient>(Id128::from_u64(13200));
+    const std::vector<uint8_t> blocked_input(64, 0xa5);
+    const PreparedTuHandle blocked_prepared = admit(*blocked_client, blocked_input);
+    const PairResult blocked = run_pair(*blocked_client, storm_server,
+                                        blocked_prepared);
+    require(blocked.client.status == ClientRunStatus::TerminalError &&
+                blocked.server.status == ServerRunStatus::TerminalError &&
+                blocked_client->has_active_transaction() &&
+                storm_server.owner_usage().retained_input_records == 8 &&
+                storm_server.owner_usage().retained_input_bytes == 8 * 64,
+            "cursor-pinned product capacity failure changed retained state");
+    report_resource_checkpoint("storm-failed-install", storm_server.owner_usage());
+
+    pinned_cursors.clear();
+    const PairResult recovered = run_pair(*blocked_client, storm_server);
+    require(recovered.client.status == ClientRunStatus::Committed &&
+                recovered.server.status == ServerRunStatus::Completed &&
+                recovered.client.reconnect == EndpointReconnectOutcome::ExactMatch &&
+                recovered.server.committed_input.has_value() &&
+                copy_input(storm_server, blocked_client->c_store_guid()) == blocked_input,
+            "failed product install did not retry exact bytes after cursor release");
+    storm_server.close_input_job(*recovered.server.committed_input);
+    report_resource_checkpoint("storm-recovered", storm_server.owner_usage());
+
+    for (uint64_t index = 0; index != 128; ++index) {
+        TestClient client(Id128::from_u64(14000 + index));
+        const std::vector<uint8_t> input(64, static_cast<uint8_t>(index));
+        const PairResult result =
+            run_pair(client, storm_server, admit(client, input));
+        require(result.client.status == ClientRunStatus::Committed &&
+                    result.server.status == ServerRunStatus::Completed &&
+                    result.server.committed_input.has_value(),
+                "multi-C_GUID product eviction storm failed a commit");
+        storm_server.close_input_job(*result.server.committed_input);
+        require(storm_server.owner_usage().retained_input_records <= 8 &&
+                    storm_server.owner_usage().retained_input_bytes <= 8 * 64,
+                "multi-C_GUID product eviction storm exceeded retained bounds");
+        if ((index + 1) % 32 == 0)
+            report_resource_checkpoint("storm-" + std::to_string(index + 1),
+                                       storm_server.owner_usage());
+    }
+    report_resource_checkpoint("storm-final", storm_server.owner_usage());
 }
 
 PairResult run_adopted_pair(P50ClientEndpoint& client, P50ServerEndpoint& server,
@@ -573,6 +682,51 @@ size_t open_fd_count() {
     }
     require(::closedir(directory) == 0, "could not close /proc/self/fd");
     return count;
+}
+
+size_t staging_file_count() {
+    std::error_code error;
+    const std::filesystem::path directory =
+        std::filesystem::temp_directory_path(error);
+    if (error)
+        return 0;
+    size_t count = 0;
+    std::filesystem::directory_iterator entries(directory, error);
+    for (const auto& entry : entries) {
+        if (error)
+            break;
+        const std::string name = entry.path().filename().string();
+        if (name.find("icecc") == std::string::npos &&
+            name.find("p50") == std::string::npos)
+            continue;
+        std::error_code status_error;
+        if (entry.is_regular_file(status_error) && !status_error)
+            ++count;
+    }
+    return count;
+}
+
+uint64_t resident_bytes() {
+    std::ifstream status("/proc/self/status");
+    std::string key;
+    uint64_t value = 0;
+    std::string unit;
+    while (status >> key >> value >> unit) {
+        if (key == "VmRSS:")
+            return value * 1024;
+    }
+    return 0;
+}
+
+void report_resource_checkpoint(std::string_view label,
+                                const P50ServerOwnerUsage& usage) {
+    std::cerr << "p50_s3_resource checkpoint=" << label
+              << " retained_records=" << usage.retained_input_records
+              << " retained_bytes=" << usage.retained_input_bytes
+              << " namespaces=" << usage.namespaces
+              << " staging_files=" << staging_file_count()
+              << " open_fds=" << open_fd_count()
+              << " rss_bytes=" << resident_bytes() << '\n';
 }
 
 void test_complete_p5co_endpoint_handoff() {
@@ -5564,6 +5718,7 @@ int main(int argc, char** argv) {
     test_adopted_cross_executor_releases_registration();
     test_two_client_one_server_isolation();
     test_zstd_route_endpoint_continuation_and_retry();
+    test_s3_resource_storm_product_path();
     report_zstd1_metrics(performance_gate);
     std::cout << "p50_endpoint_test: PASS\n";
     return 0;
