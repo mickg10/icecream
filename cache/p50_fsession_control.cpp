@@ -257,6 +257,69 @@ InboundDisposition FSessionInboundControl::classify(
     return InboundDisposition::Gap;
 }
 
+// --- FSessionFrameReader ---------------------------------------------------
+
+FSessionFrameReader::Status FSessionFrameReader::validate_prefix() noexcept {
+    if (buffer_.size() >= 4) {
+        uint32_t magic = 0;
+        for (int i = 0; i < 4; ++i)
+            magic = (magic << 8) | buffer_[static_cast<size_t>(i)];
+        if (magic != kFSessionControlMagic) {
+            error_ = true;
+            return Status::Error;
+        }
+    }
+    if (buffer_.size() >= 6) {
+        const uint16_t version =
+            static_cast<uint16_t>((buffer_[4] << 8) | buffer_[5]);
+        if (version != kFSessionControlVersion) {
+            error_ = true;
+            return Status::Error;
+        }
+    }
+    if (buffer_.size() >= kFSessionControlPrefixBytes) {
+        uint32_t payload_len = 0;
+        for (size_t i = kFSessionControlPrefixBytes - 4;
+             i < kFSessionControlPrefixBytes; ++i)
+            payload_len = (payload_len << 8) | buffer_[i];
+        if (payload_len > kFSessionControlMaxPayload) {
+            error_ = true;
+            return Status::Error;
+        }
+        if (buffer_.size() >= kFSessionControlPrefixBytes + payload_len)
+            return Status::FrameReady;
+    }
+    return Status::NeedMore;
+}
+
+FSessionFrameReader::Status
+FSessionFrameReader::feed(std::span<const uint8_t> bytes) {
+    if (error_)
+        return Status::Error;
+    // Bounded accumulation: one maximal frame plus one maximal read's worth.
+    if (buffer_.size() + bytes.size() >
+        2 * (kFSessionControlPrefixBytes + kFSessionControlMaxPayload)) {
+        error_ = true;
+        return Status::Error;
+    }
+    buffer_.insert(buffer_.end(), bytes.begin(), bytes.end());
+    return validate_prefix();
+}
+
+std::optional<std::vector<uint8_t>> FSessionFrameReader::next_frame() {
+    if (error_ || validate_prefix() != Status::FrameReady)
+        return std::nullopt;
+    uint32_t payload_len = 0;
+    for (size_t i = kFSessionControlPrefixBytes - 4;
+         i < kFSessionControlPrefixBytes; ++i)
+        payload_len = (payload_len << 8) | buffer_[i];
+    const size_t total = kFSessionControlPrefixBytes + payload_len;
+    std::vector<uint8_t> frame(buffer_.begin(),
+                               buffer_.begin() + static_cast<long>(total));
+    buffer_.erase(buffer_.begin(), buffer_.begin() + static_cast<long>(total));
+    return frame;
+}
+
 // --- FSessionOutboundControl ----------------------------------------------
 
 size_t FSessionOutboundControl::live_slots() const noexcept {

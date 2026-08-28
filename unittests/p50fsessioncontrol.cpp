@@ -211,6 +211,58 @@ void test_outbound_slots() {
     check(churn.slot_storage() <= 2,
           "outbound slot storage stays bounded across 200 reserve/retire cycles");
 }
+void test_frame_reader() {
+    const auto id = make_identity();
+    auto [e1, b1] = daemon_frame(id, DaemonToSidecarType::OperationOffer, 1,
+                                 {0xAA, 0xBB});
+    auto [e2, b2] = daemon_frame(id, DaemonToSidecarType::OpCancel, 2, {});
+    check(b1.has_value() && b2.has_value(), "frames encode (reader setup)");
+
+    // The computed prefix constant must match the real encoder layout.
+    check(b2->size() == kFSessionControlPrefixBytes,
+          "prefix constant matches an empty-payload frame size");
+    check(b1->size() == kFSessionControlPrefixBytes + 2,
+          "prefix constant matches a 2-byte-payload frame size");
+
+    // Byte-at-a-time delivery of two concatenated frames.
+    std::vector<uint8_t> wire = *b1;
+    wire.insert(wire.end(), b2->begin(), b2->end());
+    FSessionFrameReader reader;
+    std::vector<std::vector<uint8_t>> got;
+    for (uint8_t byte : wire) {
+        const auto status = reader.feed({&byte, 1});
+        check(status != FSessionFrameReader::Status::Error,
+              "no error on legal byte stream");
+        while (auto frame = reader.next_frame())
+            got.push_back(std::move(*frame));
+    }
+    check(got.size() == 2, "two frames extracted from byte-at-a-time stream");
+    if (got.size() == 2) {
+        check(got[0] == *b1 && got[1] == *b2,
+              "extracted frames are byte-exact");
+        check(decode_fsession_control(got[0]).has_value() &&
+                  decode_fsession_control(got[1]).has_value(),
+              "extracted frames decode");
+    }
+    check(reader.buffered() == 0, "no residue after both frames");
+
+    // Garbage magic is a terminal connection error, not a resync.
+    FSessionFrameReader bad;
+    const std::vector<uint8_t> garbage = {0xDE, 0xAD, 0xBE, 0xEF};
+    check(bad.feed(garbage) == FSessionFrameReader::Status::Error,
+          "bad magic -> terminal error");
+    check(bad.errored() && bad.feed({garbage.data(), 1}) ==
+                                FSessionFrameReader::Status::Error,
+          "errored reader stays errored");
+
+    // Oversize declared payload is a terminal error.
+    auto oversize = *b2;
+    oversize[kFSessionControlPrefixBytes - 4] = 0xFF; // payload_len top byte
+    FSessionFrameReader big;
+    check(big.feed(oversize) == FSessionFrameReader::Status::Error,
+          "oversize payload length -> terminal error");
+}
+
 } // namespace
 
 int main() {
@@ -270,6 +322,7 @@ int main() {
 
     test_inbound_sequencer();
     test_direction_enforced_per_frame();
+    test_frame_reader();
     test_daemon_bound_acceptor();
     test_outbound_slots();
 

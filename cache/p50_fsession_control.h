@@ -137,6 +137,38 @@ encode_fsession_control(const FSessionControlEnvelope& envelope);
 [[nodiscard]] std::optional<FSessionControlEnvelope>
 decode_fsession_control(std::span<const uint8_t> bytes);
 
+// Fixed encoded size of everything before the payload bytes: header
+// (magic 4 + version 2 + direction 1 + reserved 1 + type 2 + sequence 8),
+// the canonical identity block (12 u64 scalars + role u16 + two 16-byte
+// GUIDs = 130), and the payload length word. Pinned by a codec-size unit
+// test so an identity-layout change cannot silently desynchronize framing.
+inline constexpr size_t kFSessionControlIdentityBytes = 130;
+inline constexpr size_t kFSessionControlPrefixBytes =
+    18 + kFSessionControlIdentityBytes + 4;
+
+// Incremental frame reader for the persistent control connection: accumulate
+// arbitrary partial byte deliveries and extract complete canonical frames.
+// Bounded (prefix + max payload); a magic/version/length violation is a
+// terminal connection error (no resynchronization on a byte stream).
+class FSessionFrameReader {
+public:
+    enum class Status : uint8_t { NeedMore, FrameReady, Error };
+
+    // Append received bytes. Returns Error if the connection is already in
+    // error or the accumulated prefix is invalid (bad magic/version/oversize).
+    Status feed(std::span<const uint8_t> bytes);
+    // Extract the next complete frame's exact canonical bytes, if any.
+    [[nodiscard]] std::optional<std::vector<uint8_t>> next_frame();
+    [[nodiscard]] bool errored() const noexcept { return error_; }
+    [[nodiscard]] size_t buffered() const noexcept { return buffer_.size(); }
+
+private:
+    [[nodiscard]] Status validate_prefix() noexcept;
+
+    std::vector<uint8_t> buffer_;
+    bool error_ = false;
+};
+
 // ---------------------------------------------------------------------------
 // Bounded outbound semantic slot (5444539259 sec.2): at most one canonical frame
 // per semantic transition; a byte-identical duplicate reuses the retained frame.
