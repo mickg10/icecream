@@ -558,6 +558,60 @@ void test_whole_namespace_eviction_waits_for_jobs_and_cursors() {
             "final whole-namespace eviction leaked retained input");
 }
 
+void test_sequential_10000_tu_retention_release_soak() {
+    const CStoreGuid c_guid = Id128::from_u64(10000);
+    InputRecordStore store(2, 1U << 20);
+    for (uint64_t value = 0; value != 10000; ++value) {
+        const std::vector<uint8_t> input = bytes(64, static_cast<uint32_t>(value));
+        const ExactTransaction tx = transaction_for(TuSeq{value}, input);
+        const InputRecordKey key{c_guid, tx.begin.tu_seq};
+        require(store.publish(c_guid, tx.begin, tx.commit, input) ==
+                    InputPublishResult::Published,
+                "sequential soak did not publish the next TU");
+        require(store.contains(key) && store.record_count() == 1 &&
+                    store.retained_bytes() == input.size(),
+                "sequential soak retained the wrong TU footprint");
+        store.close_job(key);
+        store.collect_garbage();
+        require(!store.contains(key) && store.record_count() == 0 &&
+                    store.retained_bytes() == 0,
+                "sequential soak failed to release a closed TU");
+    }
+}
+
+void test_guid_flip_capacity_failure_then_retry() {
+    const CStoreGuid first_guid = Id128::from_u64(11001);
+    const CStoreGuid replacement_guid = Id128::from_u64(11002);
+    const std::vector<uint8_t> first = bytes(512, 71);
+    const std::vector<uint8_t> replacement = bytes(512, 73);
+    const ExactTransaction first_tx = transaction_for(TuSeq{1}, first);
+    const ExactTransaction replacement_tx = transaction_for(TuSeq{2}, replacement);
+    const InputRecordKey first_key{first_guid, first_tx.begin.tu_seq};
+    const InputRecordKey replacement_key{replacement_guid,
+                                         replacement_tx.begin.tu_seq};
+    InputRecordStore store(1, 1024);
+    require(store.publish(first_guid, first_tx.begin, first_tx.commit, first) ==
+                InputPublishResult::Published,
+            "GUID-flip row failed to publish the original namespace");
+    InputRecordStore::PreparedPublish failed =
+        InputRecordStore::prepare_publish(replacement_guid, replacement_tx.begin,
+                                          replacement_tx.commit,
+                                          std::vector<uint8_t>(replacement));
+    require_throws<std::length_error>(
+        [&] { (void)store.commit_prepared(std::move(failed)); },
+        "GUID-flip row did not fail closed at capacity");
+    require(!failed.valid() && store.contains(first_key) &&
+                !store.contains(replacement_key) && store.record_count() == 1,
+            "failed GUID-flip admission changed retained state");
+    store.close_job(first_key);
+    store.collect_garbage();
+    require(store.publish(replacement_guid, replacement_tx.begin,
+                          replacement_tx.commit, replacement) ==
+                InputPublishResult::Published &&
+                store.contains(replacement_key) && store.record_count() == 1,
+            "GUID-flip retry did not succeed after release");
+}
+
 }  // namespace
 
 int main() {
@@ -572,6 +626,8 @@ int main() {
     test_cursor_outlives_store_owner_object();
     test_empty_input();
     test_whole_namespace_eviction_waits_for_jobs_and_cursors();
+    test_sequential_10000_tu_retention_release_soak();
+    test_guid_flip_capacity_failure_then_retry();
     std::cout << "p50_input_record_test: exact retained-input restart gates passed\n";
     return 0;
 }
