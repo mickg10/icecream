@@ -8701,7 +8701,10 @@ bool Daemon::handle_p50_cache_session_fd_request(
     const ConnectionProvenance& provenance = client->connection_provenance;
     const UseCSMsg *const assignment = client->usecsmsg;
     const Client::CacheHandoff& handoff = client->cacheHandoff;
-    if (client->status != Client::CLIENTWORK || !provenance.cache_eligible() ||
+    const bool assignment_owner_status =
+        client->status == Client::WAITCOMPILE ||
+        client->status == Client::CLIENTWORK;
+    if (!assignment_owner_status || !provenance.cache_eligible() ||
         !connection_leases.revalidate(provenance.lease, client, client->channel,
                                       provenance.peer).has_value())
         return refuse("wrapper connection is not the live local assignment owner");
