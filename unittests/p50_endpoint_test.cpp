@@ -2486,7 +2486,10 @@ asio::awaitable<void> raw_bad_reset_ack_peer(tcp::acceptor& acceptor,
     ack.next_rel_seq = RelSeq{0};
     ack.state_digest = reset.initial_state_digest;
     if (mutation == ResetAckMutation::ProfileMask) {
-        ack.negotiated_profiles = profile_bit(ProfileId::P29);
+        // Use the other runnable source profile so the peer can encode the
+        // state and the client, rather than the fixture itself, observes the
+        // negotiated-profile mismatch.
+        ack.negotiated_profiles = profile_bit(ProfileId::Z3_LONG);
         co_await raw_write(socket, ack);
     } else if (mutation == ResetAckMutation::FrameLimit) {
         require(ack.limits.max_frame_payload > kMandatoryControlFramePayload,

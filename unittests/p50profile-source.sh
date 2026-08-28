@@ -7,7 +7,7 @@ endpoint="$src/cache/p50_endpoint.cpp"
 profile="$src/cache/p50_profile.cpp"
 header="$src/cache/p50_profile.h"
 
-grep -F 'ProfileDialogue dialogue;' "$endpoint" >/dev/null
+grep -F 'std::shared_ptr<ProfileDialogue> dialogue;' "$endpoint" >/dev/null
 grep -F 'ProfileDialogue::create(' "$endpoint" >/dev/null
 grep -F 'ProfileDialogueState::BodyClosed' "$endpoint" >/dev/null
 if grep -F 'ZstdTuDialogue' "$endpoint" >/dev/null; then
@@ -28,15 +28,15 @@ grep -F 'new ZstdTuDialogue' "$profile" >/dev/null
 grep -F 'impl_->receive_need' "$endpoint" >/dev/null
 grep -F 'impl_->receive_fill' "$endpoint" >/dev/null
 grep -F 'impl_->append_dict' "$endpoint" >/dev/null
-grep -F 'pending.dialogue.commit_visible(commit)' "$endpoint" >/dev/null
-grep -F 'pending->dialogue.disconnect()' "$endpoint" >/dev/null
+grep -F 'pending.dialogue->commit_visible(materialized.commit)' "$endpoint" >/dev/null
+grep -F 'space.route->pending->dialogue->discard_tentative()' "$endpoint" >/dev/null
 grep -F 'P50_PROFILE_INTERFACE.md' "$src/cache/Makefile.am" >/dev/null
 
 mutant=$(mktemp "${TMPDIR:-/tmp}/p50profile-mutant.XXXXXX")
 trap 'rm -f "$mutant"' EXIT HUP INT TERM
-sed 's/ProfileDialogue dialogue;/std::unique_ptr<ZstdTuDialogue> dialogue;/' \
+sed 's/std::shared_ptr<ProfileDialogue> dialogue;/std::shared_ptr<ZstdTuDialogue> dialogue;/g' \
     "$endpoint" >"$mutant"
-if grep -F 'ProfileDialogue dialogue;' "$mutant" >/dev/null; then
+if grep -F 'std::shared_ptr<ProfileDialogue> dialogue;' "$mutant" >/dev/null; then
     echo 'FAIL: concrete Pending ownership mutant survived' >&2
     exit 1
 fi
