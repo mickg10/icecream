@@ -211,6 +211,54 @@ private:
     std::vector<std::vector<uint8_t>> retained_; // retained_[s-1] = frame at seq s
 };
 
+// ---------------------------------------------------------------------------
+// Bounded outbound control for one operation's direction (5444539259). Mandatory
+// frames are RESERVED before their irreversible transition, so enqueue can never
+// fail after the durable/authority-advancing step. At most one canonical frame
+// per semantic transition; a byte-identical duplicate reuses the retained frame;
+// acked frames are retained (for exact replay) until retirement. No unbounded
+// message log: reservation fails closed when the bounded live set is full.
+// ---------------------------------------------------------------------------
+class FSessionOutboundControl {
+public:
+    explicit FSessionOutboundControl(size_t max_live_slots = 32) noexcept
+        : max_live_(max_live_slots == 0 ? 1 : max_live_slots) {}
+
+    // Reserve a slot for a mandatory frame BEFORE its irreversible transition.
+    // Returns the direction-local sequence, or 0 if the bounded live set is full
+    // (the caller must then NOT perform the irreversible transition).
+    [[nodiscard]] uint64_t reserve(uint16_t message_type);
+
+    // Stage the one canonical frame into a Reserved slot (Reserved -> Queued).
+    [[nodiscard]] bool stage(uint64_t sequence,
+                             std::span<const uint8_t> canonical_bytes);
+
+    // Idempotent enqueue: if a live slot already holds a byte-identical frame of
+    // this exact type, reuse its sequence; otherwise reserve + stage. Returns the
+    // sequence, or 0 if capacity is full for a genuinely new frame.
+    [[nodiscard]] uint64_t
+    enqueue_idempotent(uint16_t message_type, std::span<const uint8_t> bytes);
+
+    // Flush lifecycle. record_written advances Writing offset (-> FullyFlushed
+    // when the whole frame is out); mark_acked retains for replay; retire frees.
+    [[nodiscard]] bool record_written(uint64_t sequence, size_t nbytes);
+    [[nodiscard]] bool mark_acked(uint64_t sequence);
+    [[nodiscard]] bool retire(uint64_t sequence);
+
+    [[nodiscard]] size_t live_slots() const noexcept;
+    // Backing storage size (retired slots are reused, so this stays bounded by
+    // the live-set cap; exposed for the no-unbounded-log invariant test).
+    [[nodiscard]] size_t slot_storage() const noexcept { return slots_.size(); }
+    [[nodiscard]] const OutboundSemanticSlot* find(uint64_t sequence) const noexcept;
+
+private:
+    OutboundSemanticSlot* mutable_find(uint64_t sequence) noexcept;
+
+    size_t max_live_;
+    uint64_t next_sequence_ = 1;
+    std::vector<OutboundSemanticSlot> slots_;
+};
+
 } // namespace icecc::p50::fsession
 
 #endif // ICECC_CACHE_P50_FSESSION_CONTROL_H

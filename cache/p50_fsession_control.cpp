@@ -252,4 +252,115 @@ InboundDisposition FSessionInboundControl::classify(
     return InboundDisposition::Gap;
 }
 
+// --- FSessionOutboundControl ----------------------------------------------
+
+size_t FSessionOutboundControl::live_slots() const noexcept {
+    size_t n = 0;
+    for (const auto& s : slots_)
+        if (s.occupied())
+            ++n;
+    return n;
+}
+
+const OutboundSemanticSlot*
+FSessionOutboundControl::find(uint64_t sequence) const noexcept {
+    for (const auto& s : slots_)
+        if (s.sequence == sequence && s.state != OutboundSlotState::Empty)
+            return &s;
+    return nullptr;
+}
+
+OutboundSemanticSlot*
+FSessionOutboundControl::mutable_find(uint64_t sequence) noexcept {
+    for (auto& s : slots_)
+        if (s.sequence == sequence && s.state != OutboundSlotState::Empty)
+            return &s;
+    return nullptr;
+}
+
+uint64_t FSessionOutboundControl::reserve(uint16_t message_type) {
+    if (live_slots() >= max_live_)
+        return 0; // fail closed: never grow an unbounded log
+    const uint64_t sequence = next_sequence_++;
+    // Reuse a retired/empty slot's storage so slots_ stays bounded by the live
+    // cap even across long operations (no unbounded message log).
+    for (auto& s : slots_) {
+        if (s.state == OutboundSlotState::Retired ||
+            s.state == OutboundSlotState::Empty) {
+            s = OutboundSemanticSlot{};
+            s.sequence = sequence;
+            s.message_type = message_type;
+            s.state = OutboundSlotState::Reserved;
+            return sequence;
+        }
+    }
+    OutboundSemanticSlot slot;
+    slot.sequence = sequence;
+    slot.message_type = message_type;
+    slot.state = OutboundSlotState::Reserved;
+    slots_.push_back(std::move(slot));
+    return sequence;
+}
+
+bool FSessionOutboundControl::stage(uint64_t sequence,
+                                    std::span<const uint8_t> canonical_bytes) {
+    OutboundSemanticSlot* slot = mutable_find(sequence);
+    if (slot == nullptr || slot->state != OutboundSlotState::Reserved)
+        return false;
+    slot->canonical_bytes.assign(canonical_bytes.begin(), canonical_bytes.end());
+    slot->state = OutboundSlotState::Queued;
+    return true;
+}
+
+uint64_t
+FSessionOutboundControl::enqueue_idempotent(uint16_t message_type,
+                                            std::span<const uint8_t> bytes) {
+    // At most one canonical frame per semantic transition: a byte-identical live
+    // frame of this exact type reuses its sequence rather than appending another.
+    for (const auto& s : slots_) {
+        if (s.occupied() && s.state != OutboundSlotState::Reserved &&
+            s.message_type == message_type &&
+            s.canonical_bytes.size() == bytes.size() &&
+            std::equal(s.canonical_bytes.begin(), s.canonical_bytes.end(),
+                       bytes.begin()))
+            return s.sequence;
+    }
+    const uint64_t sequence = reserve(message_type);
+    if (sequence == 0)
+        return 0;
+    if (!stage(sequence, bytes))
+        return 0;
+    return sequence;
+}
+
+bool FSessionOutboundControl::record_written(uint64_t sequence, size_t nbytes) {
+    OutboundSemanticSlot* slot = mutable_find(sequence);
+    if (slot == nullptr || (slot->state != OutboundSlotState::Queued &&
+                            slot->state != OutboundSlotState::Writing))
+        return false;
+    slot->state = OutboundSlotState::Writing;
+    slot->write_offset += nbytes;
+    if (slot->write_offset >= slot->canonical_bytes.size()) {
+        slot->write_offset = slot->canonical_bytes.size();
+        slot->state = OutboundSlotState::FullyFlushed;
+    }
+    return true;
+}
+
+bool FSessionOutboundControl::mark_acked(uint64_t sequence) {
+    OutboundSemanticSlot* slot = mutable_find(sequence);
+    if (slot == nullptr || slot->state != OutboundSlotState::FullyFlushed)
+        return false;
+    slot->state = OutboundSlotState::AckedRetained;
+    return true;
+}
+
+bool FSessionOutboundControl::retire(uint64_t sequence) {
+    OutboundSemanticSlot* slot = mutable_find(sequence);
+    if (slot == nullptr)
+        return false;
+    slot->state = OutboundSlotState::Retired;
+    return true;
+}
+
 } // namespace icecc::p50::fsession

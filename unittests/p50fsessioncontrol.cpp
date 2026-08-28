@@ -98,6 +98,59 @@ void test_inbound_sequencer() {
     check(in.classify(f3_e, *f3_b) == InboundDisposition::StaleWrongIdentity,
           "retired operation never revived");
 }
+
+void test_outbound_slots() {
+    FSessionOutboundControl out(2); // bounded to 2 live slots
+
+    const uint64_t s1 =
+        out.reserve(static_cast<uint16_t>(SidecarToDaemonType::InputCommitted));
+    check(s1 == 1, "reserve -> seq 1");
+    const std::vector<uint8_t> f1 = {1, 2, 3};
+    check(out.stage(s1, f1), "stage s1");
+    check(out.find(s1) != nullptr &&
+              out.find(s1)->state == OutboundSlotState::Queued,
+          "s1 queued");
+
+    const uint64_t s2 = out.reserve(
+        static_cast<uint16_t>(SidecarToDaemonType::TerminalObservation));
+    check(s2 == 2, "reserve -> seq 2");
+    check(out.reserve(static_cast<uint16_t>(SidecarToDaemonType::DeliveryOffer)) ==
+              0,
+          "reserve fails closed at bounded capacity");
+
+    // A byte-identical live frame of the same type reuses its sequence.
+    check(out.enqueue_idempotent(
+              static_cast<uint16_t>(SidecarToDaemonType::InputCommitted), f1) == s1,
+          "identical frame reuses sequence (one canonical frame per transition)");
+    const std::vector<uint8_t> f1b = {9, 9};
+    check(out.enqueue_idempotent(
+              static_cast<uint16_t>(SidecarToDaemonType::InputCommitted), f1b) == 0,
+          "genuinely new frame blocked at capacity");
+
+    check(out.record_written(s1, 2), "write 2/3");
+    check(out.find(s1)->state == OutboundSlotState::Writing, "s1 writing");
+    check(out.record_written(s1, 9), "write remainder (clamped)");
+    check(out.find(s1)->state == OutboundSlotState::FullyFlushed, "s1 fully flushed");
+    check(out.mark_acked(s1), "s1 acked");
+    check(out.find(s1)->state == OutboundSlotState::AckedRetained,
+          "s1 retained for replay after ack");
+
+    check(out.retire(s2), "retire s2");
+    const uint64_t s3 =
+        out.reserve(static_cast<uint16_t>(SidecarToDaemonType::DeliveryOffer));
+    check(s3 == 3, "reserve after retire -> seq 3 (freed capacity)");
+    check(out.live_slots() == 2, "two live slots (acked-retained s1 + reserved s3)");
+
+    // No unbounded log: reserve+retire churn must reuse retired storage.
+    FSessionOutboundControl churn(2);
+    for (int i = 0; i < 200; ++i) {
+        const uint64_t a = churn.reserve(1);
+        check(a != 0, "churn reserve succeeds");
+        check(churn.retire(a), "churn retire succeeds");
+    }
+    check(churn.slot_storage() <= 2,
+          "outbound slot storage stays bounded across 200 reserve/retire cycles");
+}
 } // namespace
 
 int main() {
@@ -156,6 +209,7 @@ int main() {
           "incomplete identity rejected");
 
     test_inbound_sequencer();
+    test_outbound_slots();
 
     if (g_fail != 0) {
         std::fprintf(stderr, "%d failure(s)\n", g_fail);
