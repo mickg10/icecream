@@ -132,7 +132,28 @@ CacheDispatchOutcome CacheSessionDispatcher::dispatch(MsgChannel& channel,
     if (!relationship.valid())
         return CacheDispatchOutcome{CacheDispatchResult::SidecarUnavailable,
                                     local::FdHandoffStatus::Disconnected, request, false};
-    if (relationship.verify_peer_credentials(on_demand_->expected_peer) != local::Status::Ok)
+    // The supervisor pre-binds the listener before forking the sidecar.  On
+    // Linux SO_PEERCRED consequently reports the daemon that created the
+    // socket, rather than the child (or worker) that accepts it.  Keep the
+    // READY child PID binding, but also accept that one exact creator PID;
+    // UID/GID and the immutable pathname lease remain mandatory in either
+    // case.  A service-created listener still takes the direct child-PID
+    // path, while a pre-bound listener takes the creator-PID path.
+    bool peer_authenticated =
+        relationship.verify_peer_credentials(on_demand_->expected_peer) ==
+        local::Status::Ok;
+    if (!peer_authenticated) {
+        // Re-run through the transport verifier so the Connection records
+        // authentication for the subsequent SCM_RIGHTS sender as well.
+        // Merely querying credentials here would leave that state unset and
+        // make an otherwise valid handoff fail as NotAuthenticated.
+        local::CredentialExpectation creator_expectation = on_demand_->expected_peer;
+        creator_expectation.pid = static_cast<uint64_t>(::getpid());
+        peer_authenticated =
+            relationship.verify_peer_credentials(creator_expectation) ==
+            local::Status::Ok;
+    }
+    if (!peer_authenticated)
         return CacheDispatchOutcome{CacheDispatchResult::SidecarUnavailable,
                                     local::FdHandoffStatus::NotAuthenticated, request, false};
     if (relationship.send_until(local::make_hello(local::PeerRole::Daemon, identity_),

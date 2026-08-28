@@ -21,6 +21,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
 
@@ -211,6 +212,39 @@ CacheSessionDispatcher make_dispatcher(const EndpointFixture &fixture,
     return CacheSessionDispatcher(fixture.identity, fixture.endpoint, timeout);
 }
 
+int serve_inherited_peer(int listener, Identity identity, pid_t daemon_pid) {
+    Status accept_status = Status::InvalidArgument;
+    Connection connection = icecc::p50::local::accept_unix(listener, &accept_status);
+    if (!connection.valid() || accept_status != Status::Ok)
+        return 1;
+    const CredentialExpectation expected{
+        static_cast<uint64_t>(::getuid()), static_cast<uint64_t>(::getgid()),
+        static_cast<uint64_t>(daemon_pid)};
+    if (connection.verify_peer_credentials(expected) != Status::Ok)
+        return 2;
+    Frame hello;
+    if (connection.receive_with_timeout(hello, 2000) != Status::Ok ||
+        icecc::p50::local::validate_handshake(hello, MessageType::Hello,
+                                              PeerRole::Daemon, identity) != Status::Ok)
+        return 3;
+    if (connection.send(icecc::p50::local::make_hello_ack(PeerRole::Sidecar, identity)) !=
+        Status::Ok)
+        return 4;
+    if (!receive_cache_operation(connection, identity, 1))
+        return 5;
+    FdHandoffReceiver receiver;
+    const FdHandoffResult handoff = receiver.receive_and_ack(
+        connection, icecc::p50::local::HandoffRequest{identity, 1},
+        std::chrono::steady_clock::now() + std::chrono::seconds(2));
+    if (handoff.status != icecc::p50::local::FdHandoffStatus::Accepted)
+        return 20 + static_cast<int>(handoff.status);
+    // Keep the authenticated relationship alive long enough for the sender
+    // to consume the exact ACK; an immediate process exit can surface as a
+    // terminal HUP concurrently with an otherwise valid ACK.
+    ::usleep(100000);
+    return 0;
+}
+
 bool receive_cache_operation(Connection& sidecar, Identity identity, uint64_t request_id) {
     Frame frame;
     if (sidecar.receive_until(frame, std::chrono::steady_clock::now() +
@@ -338,6 +372,50 @@ int main() {
         no_barrier.trailing_byte_barrier = false;
         CHECK(!dispatcher.emit_attachment_phase_open(no_barrier, arm).has_value(),
               "phase-open is refused when the trailing-byte proof is removed");
+    }
+
+    // The production supervisor pre-binds the private listener in the daemon
+    // and passes it across exec.  Prove the real process boundary: the child
+    // accepts the relationship, but SO_PEERCRED still names this listener's
+    // creator.  Dispatch must accept that exact creator PID while retaining
+    // the child's READY PID in the endpoint lease.
+    {
+        EndpointFixture fixture({9, 3});
+        MsgPair ordinary = ordinary_pair();
+        const pid_t daemon_pid = ::getpid();
+        const pid_t child_pid = ::fork();
+        if (child_pid == 0) {
+            if (ordinary.left != nullptr)
+                (void)::close(ordinary.left->fd);
+            if (ordinary.right != nullptr)
+                (void)::close(ordinary.right->fd);
+            const int result = serve_inherited_peer(fixture.listener,
+                                                    fixture.identity, daemon_pid);
+            (void)::close(fixture.listener);
+            ::_exit(result);
+        }
+        CHECK(child_pid > 0, "pre-bound listener sidecar process started");
+        if (child_pid > 0) {
+            fixture.endpoint.expected_peer.pid = static_cast<uint64_t>(child_pid);
+            CacheSessionDispatcher dispatcher = make_dispatcher(fixture);
+            send_cache_session(ordinary.left);
+            Msg *decoded = ordinary.right->get_msg(2, true);
+            const auto outcome = decoded == nullptr
+                                     ? icecc::p50::daemon::CacheDispatchOutcome{}
+                                     : dispatcher.dispatch(
+                                           *ordinary.right, 50,
+                                           static_cast<uint32_t>(*decoded));
+            delete decoded;
+            int child_status = 0;
+            const pid_t reaped = ::waitpid(child_pid, &child_status, 0);
+            CHECK(reaped == child_pid && WIFEXITED(child_status) &&
+                      WEXITSTATUS(child_status) == 0,
+                  "pre-bound listener child completes authenticated handoff");
+            CHECK(outcome.result == CacheDispatchResult::Accepted && outcome.detached,
+                  "dispatcher accepts the pre-bound listener creator credential");
+            CHECK(ordinary.right->fd == -1,
+                  "pre-bound listener handoff relinquishes ordinary descriptor");
+        }
     }
 
     // A following ordinary byte is a release barrier.  The control peer has
