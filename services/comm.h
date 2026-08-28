@@ -831,12 +831,15 @@ public:
 
     /* Protocol-50 compiler/cache control seam.  The request must have been
        completely decoded on this channel and the reply is a one-shot raw
-       fixed lease plus one descriptor.  A positive send consumes
-       transfer_fd; the receiver owns the returned descriptor on success. */
+       fixed lease plus one descriptor.  Every call consumes transfer_fd
+       (success and failure); the receiver owns the returned descriptor on
+       success. */
     bool send_p50_cache_fd_reply(
-        const P50CacheSessionFdRequestMsg &request, int transfer_fd) noexcept;
+        const P50CacheSessionFdRequestMsg &request, int transfer_fd,
+        std::chrono::steady_clock::time_point deadline) noexcept;
     int receive_p50_cache_fd_reply(
-        const P50CacheSessionFdRequestFields &expected) noexcept;
+        const P50CacheSessionFdRequestFields &expected,
+        std::chrono::steady_clock::time_point deadline) noexcept;
 
     /* Bytes which remain inside the frame currently being decoded.  This is
        deliberately frame-bounded rather than based on buffered input: a
@@ -1046,6 +1049,12 @@ protected:
     bool p50_fd_reply_arm_consumed = false;
     bool p50_fd_request_ready = false;
     P50CacheSessionFdRequestFields p50_last_fd_request{};
+    bool p50_fd_receive_arm = false;
+    uint64_t p50_fd_receive_frame_sequence = 0;
+    P50CacheSessionFdRequestFields p50_armed_fd_request{};
+    bool p50_fd_request_pending = false;
+    uint64_t p50_fd_pending_request_frame = 0;
+    P50CacheSessionFdRequestFields p50_pending_fd_request{};
 
     // One exact outbound claim may await one first outcome on this fresh
     // connection. A queued claim is promoted only after its frame fully
@@ -1073,6 +1082,7 @@ private:
     void p50_clear_decoded_stamp() noexcept;
     void p50_clear_outbound_claim() noexcept;
     void p50_promote_flushed_claim() noexcept;
+    void p50_promote_flushed_fd_request() noexcept;
     bool p50_clean_release_boundary() const noexcept;
     int p50_checked_release_fd() noexcept;
 };
