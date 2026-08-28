@@ -31,6 +31,16 @@ void test_exact_mode_admission() {
     CHECK(p50_zstd_compile_admissible(assignment,
                                       PROTOCOL_VERSION_CACHE_ADVERTISEMENT));
 
+    CHECK(p50_zstd_selected_profile(assignment,
+                                    PROTOCOL_VERSION_CACHE_ADVERTISEMENT) ==
+          std::optional<ProfileId>{ProfileId::ZSTD_TU});
+    assignment.cache_profile_mask = CACHE_PROFILE_ZSTD_ROUTE;
+    CHECK(p50_zstd_compile_admissible(assignment,
+                                      PROTOCOL_VERSION_CACHE_ADVERTISEMENT));
+    CHECK(p50_zstd_selected_profile(assignment,
+                                    PROTOCOL_VERSION_CACHE_ADVERTISEMENT) ==
+          std::optional<ProfileId>{ProfileId::Z3_LONG});
+
     UseCSMsg mutant = assignment;
     mutant.assignment_nonce_hi = mutant.assignment_nonce_lo = 0;
     CHECK(!p50_zstd_compile_admissible(mutant,
@@ -41,6 +51,12 @@ void test_exact_mode_admission() {
                                        PROTOCOL_VERSION_CACHE_ADVERTISEMENT));
     mutant = assignment;
     mutant.cache_profile_mask = CACHE_PROFILE_P29;
+    CHECK(!p50_zstd_compile_admissible(mutant,
+                                       PROTOCOL_VERSION_CACHE_ADVERTISEMENT));
+    mutant.cache_profile_mask = CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE;
+    CHECK(!p50_zstd_compile_admissible(mutant,
+                                       PROTOCOL_VERSION_CACHE_ADVERTISEMENT));
+    mutant.cache_profile_mask = CACHE_PROFILE_ZSTD_ROUTE | UINT32_C(0x80000000);
     CHECK(!p50_zstd_compile_admissible(mutant,
                                        PROTOCOL_VERSION_CACHE_ADVERTISEMENT));
     mutant = assignment;

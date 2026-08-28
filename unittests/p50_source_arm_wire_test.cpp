@@ -229,6 +229,18 @@ void test_roundtrip_and_exact_echo()
                 decoded_reply->f_control_generation != 0 &&
                 decoded_reply->f_control_attempt != 0,
             "armed ACK carries fresh observation and F control launch");
+
+    P50SourceArmFields route = request.arm;
+    route.cache_profile = CACHE_PROFILE_ZSTD_ROUTE;
+    route.source_mode = P50_SOURCE_MODE_ZSTD_ROUTE;
+    const P50SourceArmMsg route_request(route);
+    REQUIRE(make_pair(PROTOCOL_VERSION).left->send_msg(route_request),
+            "source-arm accepts the exact ZSTD_ROUTE profile/mode pair");
+    P50SourceArmFields route_mode_mismatch = route;
+    route_mode_mismatch.source_mode = P50_SOURCE_MODE_ZSTD_TU;
+    REQUIRE(!make_pair(PROTOCOL_VERSION).left->send_msg(
+                P50SourceArmMsg(route_mode_mismatch)),
+            "source-arm rejects a ZSTD_ROUTE/TU mode mismatch");
     delete request_base;
     delete reply_base;
 }

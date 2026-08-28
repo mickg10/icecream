@@ -39,7 +39,8 @@ static bool is_exact_present(const Snapshot& snapshot, uint32_t port = 10245)
 {
     return snapshot.endpoint_port == port
         && snapshot.protocol == CACHE_WIRE_PROTOCOL_V1
-        && snapshot.profile_mask == CACHE_PROFILE_ZSTD_TU
+        && snapshot.profile_mask ==
+               (CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE)
         && snapshot.present() && !snapshot.absent();
 }
 

@@ -147,7 +147,8 @@ static bool present(const LoginMsg *login, uint32_t port)
 {
     return login != nullptr && login->cache_endpoint_port == port
         && login->cache_protocol == CACHE_WIRE_PROTOCOL_V1
-        && login->cache_profile_mask == CACHE_PROFILE_ZSTD_TU;
+        && login->cache_profile_mask ==
+               (CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE);
 }
 #endif
 

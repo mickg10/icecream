@@ -26,7 +26,8 @@ for needle in \
     'ClaimAttemptCapability128' 'attempt_capability_1' \
     'attempt_capability_2' \
     'source_budget_msec' 'MaxSourceBudgetMsec' \
-    'P50_SOURCE_MODE_ZSTD_TU' 'CACHE_PROFILE_ZSTD_TU' \
+    'P50_SOURCE_MODE_ZSTD_TU' 'P50_SOURCE_MODE_ZSTD_ROUTE' \
+    'CACHE_PROFILE_ZSTD_TU' 'CACHE_PROFILE_ZSTD_ROUTE' \
     'kStoreIdentityDerivationVersion' 'kStoreIdentityRoleByte' \
     'kStoreIdentityRoleMask' 'kStoreIdentityClientRole' \
     'kStoreIdentityFileRole' 'store_identity_guid_valid_for_role' \

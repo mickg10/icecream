@@ -29,8 +29,10 @@ fi
 echo 'ok - transient per-TU authentication is not advertisement authority'
 require 'crashed && current_.present()' "$impl" \
     'a post-READY crash forces withdrawal before recovery'
-require 'CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU' "$impl" \
-    'presence projects only the exact runnable CacheWire profile'
+require 'CACHE_PROFILE_ZSTD_ROUTE' "$impl" \
+    'presence projects the implemented ZSTD_ROUTE capability'
+require 'CACHE_PROFILE_ZSTD_TU' "$impl" \
+    'presence retains the legacy ZSTD_TU capability'
 require 'Error::CounterRegression' "$impl" \
     'counter rollback fails closed'
 require 'Error::CounterSaturated' "$impl" \

@@ -17,11 +17,20 @@ bool nonzero(CStoreGuid value) noexcept {
 
 bool p50_zstd_compile_admissible(const UseCSMsg& assignment,
                                  int compiler_protocol) noexcept {
-    return compiler_protocol == PROTOCOL_VERSION_CACHE_ADVERTISEMENT &&
-           !assignment.hostname.empty() && assignment.port != 0 &&
-           usecs_cache_handoff_admissible(assignment) &&
-           assignment.cache_protocol == CACHE_WIRE_PROTOCOL_V1 &&
-           (assignment.cache_profile_mask & CACHE_PROFILE_ZSTD_TU) != 0;
+    return p50_zstd_selected_profile(assignment, compiler_protocol).has_value();
+}
+
+std::optional<ProfileId> p50_zstd_selected_profile(
+    const UseCSMsg& assignment, int compiler_protocol) noexcept {
+    if (compiler_protocol != PROTOCOL_VERSION_CACHE_ADVERTISEMENT ||
+        assignment.hostname.empty() || assignment.port == 0 ||
+        !usecs_cache_handoff_admissible(assignment) ||
+        assignment.cache_protocol != CACHE_WIRE_PROTOCOL_V1 ||
+        !p50_source_profile_selection_valid(assignment.cache_profile_mask))
+        return std::nullopt;
+    return assignment.cache_profile_mask == CACHE_PROFILE_ZSTD_ROUTE
+               ? std::optional<ProfileId>{ProfileId::Z3_LONG}
+               : std::optional<ProfileId>{ProfileId::ZSTD_TU};
 }
 
 CStoreGuid derive_compile_c_store_guid(const CompileJob& job,

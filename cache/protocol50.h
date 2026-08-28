@@ -141,15 +141,15 @@ constexpr uint32_t profile_bit(ProfileId profile) {
 constexpr uint32_t kM1SupportedProfiles = profile_bit(ProfileId::P29);
 constexpr uint32_t kKnownProfileMask = profile_bit(ProfileId::P29) |
                                        profile_bit(ProfileId::ZSTD_TU) |
-                                       profile_bit(ProfileId::GRZ);
+                                       profile_bit(ProfileId::GRZ) |
+                                       profile_bit(ProfileId::Z3_LONG);
 constexpr uint32_t kDeclaredProfileMask = kKnownProfileMask |
-                                          profile_bit(ProfileId::Z3_LONG) |
                                           profile_bit(ProfileId::Z3_SHARED_LONG);
 // Z3_LONG is the operational name of the first route profile. The legacy
-// advertisement census keeps kKnownProfileMask reserved-compatible; protocol
-// session negotiation uses this explicit implementation mask.
-constexpr uint32_t kOperationalProfileMask = kKnownProfileMask |
-                                              profile_bit(ProfileId::Z3_LONG);
+// profile census remains separate; session negotiation admits only the two
+// runnable source profiles.
+constexpr uint32_t kOperationalProfileMask =
+    profile_bit(ProfileId::ZSTD_TU) | profile_bit(ProfileId::Z3_LONG);
 
 enum class P29RootMode : uint16_t {
     NotApplicable = 0,

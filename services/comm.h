@@ -555,16 +555,35 @@ const uint32_t CACHE_PROFILE_ZSTD_TU = ( UINT32_C(1) << 1 );
 const uint32_t CACHE_PROFILE_GRZ = ( UINT32_C(1) << 2 );
 const uint32_t CACHE_PROFILE_Z3_LONG = ( UINT32_C(1) << 3 );
 const uint32_t CACHE_PROFILE_Z3_SHARED_LONG = ( UINT32_C(1) << 4 );
+/* The first runnable route codec is exposed under its source-path name. */
+const uint32_t CACHE_PROFILE_ZSTD_ROUTE = CACHE_PROFILE_Z3_LONG;
 const uint32_t CACHE_DECLARED_PROFILE_MASK =
     CACHE_PROFILE_P29 | CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_GRZ
     | CACHE_PROFILE_Z3_LONG | CACHE_PROFILE_Z3_SHARED_LONG;
 /* The converged M2 endpoint has one runnable product dialogue.  Declaring a
    profile name must never advertise a codec which cannot reconstruct input. */
-const uint32_t CACHE_ADVERTISABLE_PROFILE_MASK = CACHE_PROFILE_ZSTD_TU;
+const uint32_t CACHE_ADVERTISABLE_PROFILE_MASK =
+    CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE;
 
-/* Source-arm mode values are deliberately closed until another runnable
-   source production path exists. */
+/* Source-arm mode values are deliberately closed to the two runnable source
+   profiles and are never accepted independently of cache_profile. */
 inline constexpr uint32_t P50_SOURCE_MODE_ZSTD_TU = UINT32_C(1);
+inline constexpr uint32_t P50_SOURCE_MODE_ZSTD_ROUTE = UINT32_C(2);
+
+inline constexpr bool p50_source_profile_mode_valid(uint32_t profile,
+                                                     uint32_t source_mode) noexcept
+{
+    return (profile == CACHE_PROFILE_ZSTD_TU &&
+            source_mode == P50_SOURCE_MODE_ZSTD_TU) ||
+           (profile == CACHE_PROFILE_ZSTD_ROUTE &&
+            source_mode == P50_SOURCE_MODE_ZSTD_ROUTE);
+}
+
+inline constexpr bool p50_source_profile_selection_valid(uint32_t profiles) noexcept
+{
+    return profiles == CACHE_PROFILE_ZSTD_TU ||
+           profiles == CACHE_PROFILE_ZSTD_ROUTE;
+}
 
 /* Shared absent-or-present law for a three-word CacheWire advertisement.
    LoginMsg's Login-only capability tail (M0/M1) and UseCSMsg's
@@ -1190,14 +1209,14 @@ struct P50SourceArmFields {
                selected_f_cache_port != 0 &&
                selected_f_cache_port <= UINT16_MAX &&
                cache_protocol == CACHE_WIRE_PROTOCOL_V1 &&
-               cache_profile == CACHE_PROFILE_ZSTD_TU && logical_job != 0 &&
+               p50_source_profile_mode_valid(cache_profile, source_mode) &&
+               logical_job != 0 &&
                compiler_attempt != 0 && c_store_generation != 0 &&
                c_store_derivation_version ==
                    icecc::p50::kStoreIdentityDerivationVersion &&
                icecc::p50::store_identity_guid_valid_for_role(
                    c_store_guid, icecc::p50::kStoreIdentityClientRole) &&
                source_request_id != 0 &&
-               source_mode == P50_SOURCE_MODE_ZSTD_TU &&
                c_control_generation != 0 && c_control_attempt != 0;
     }
     auto operator<=>(const P50SourceArmFields&) const = default;

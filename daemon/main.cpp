@@ -8917,7 +8917,8 @@ bool Daemon::handle_p50_source_arm(Client *client, P50SourceArmMsg *msg)
         arm.selected_f_ordinary_port != static_cast<uint32_t>(daemon_port) ||
         arm.selected_f_cache_port != snapshot.endpoint_port ||
         arm.cache_protocol != snapshot.protocol ||
-        arm.cache_profile != CACHE_PROFILE_ZSTD_TU ||
+        !p50_source_profile_selection_valid(arm.cache_profile) ||
+        !p50_source_profile_mode_valid(arm.cache_profile, arm.source_mode) ||
         (snapshot.profile_mask & arm.cache_profile) == 0 ||
         arm.c_store_derivation_version != lease.store_derivation_version ||
         icecc::p50::store_identity_file_guid_matches_client(

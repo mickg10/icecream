@@ -244,10 +244,8 @@ static void test_p50_round_trip_and_validation()
         {10245, CACHE_WIRE_PROTOCOL_V1, 0, "missing cache profile"},
         {10245, CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_P29,
          "non-runnable P29 endpoint"},
-        {10245, CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_Z3_LONG,
-         "declared-only z3_long endpoint"},
         {10245, CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_Z3_SHARED_LONG,
-         "declared-only z3_shared_long endpoint"},
+         "unimplemented z3_shared_long endpoint"},
         {10245, CACHE_WIRE_PROTOCOL_V1, UINT32_C(0x80000000),
          "unknown profile bit"},
     };
@@ -276,9 +274,9 @@ static void test_p50_round_trip_and_validation()
     REQUIRE(decoder_rejects(malformed),
             "decoder rejects partial protocol absence");
     malformed = valid;
-    set_tail_word(malformed, 1, CACHE_PROFILE_Z3_LONG);
-    REQUIRE(decoder_rejects(malformed),
-            "decoder rejects declared-only profile advertisement");
+    set_tail_word(malformed, 1, CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE);
+    REQUIRE(!decoder_rejects(malformed),
+            "decoder accepts the implemented TU+ROUTE capability advertisement");
     malformed = valid;
     set_tail_word(malformed, 1, UINT32_C(0x80000000));
     REQUIRE(decoder_rejects(malformed),
@@ -422,8 +420,6 @@ static void test_usecs_p50_round_trip_and_validation()
         {10245, CACHE_WIRE_PROTOCOL_V1, 0, "missing cache profile"},
         {10245, CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_P29,
          "non-runnable P29 endpoint"},
-        {10245, CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_Z3_LONG,
-         "declared-only z3_long endpoint"},
         {10245, CACHE_WIRE_PROTOCOL_V1, UINT32_C(0x80000000),
          "unknown profile bit"},
     };
@@ -496,9 +492,10 @@ static void test_usecs_p50_round_trip_and_validation()
     REQUIRE(decoder_rejects(malformed_wire),
             "decoder rejects partial cache-protocol absence");
     malformed_wire = valid;
-    set_tail_word(malformed_wire, 1, CACHE_PROFILE_Z3_LONG);
-    REQUIRE(decoder_rejects(malformed_wire),
-            "decoder rejects declared-only cache-profile advertisement");
+    set_tail_word(malformed_wire, 1,
+                  CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE);
+    REQUIRE(!decoder_rejects(malformed_wire),
+            "decoder accepts the implemented TU+ROUTE cache-profile advertisement");
     malformed_wire = valid;
     set_tail_word(malformed_wire, 1, UINT32_C(0x80000000));
     REQUIRE(decoder_rejects(malformed_wire),
@@ -714,18 +711,30 @@ static void test_declared_profiles_are_inert()
     static_assert(profile_bit(ProfileId::Z3_LONG) == CACHE_PROFILE_Z3_LONG);
     static_assert(profile_bit(ProfileId::Z3_SHARED_LONG)
                   == CACHE_PROFILE_Z3_SHARED_LONG);
-    static_assert((kKnownProfileMask & profile_bit(ProfileId::Z3_LONG)) == 0);
+    static_assert((kKnownProfileMask & profile_bit(ProfileId::Z3_LONG)) != 0);
     static_assert((kKnownProfileMask & profile_bit(ProfileId::Z3_SHARED_LONG)) == 0);
     static_assert((CACHE_ADVERTISABLE_PROFILE_MASK
-                   & (CACHE_PROFILE_Z3_LONG | CACHE_PROFILE_Z3_SHARED_LONG)) == 0);
+                   & CACHE_PROFILE_Z3_LONG) != 0);
+    static_assert((CACHE_ADVERTISABLE_PROFILE_MASK
+                   & CACHE_PROFILE_Z3_SHARED_LONG) == 0);
     REQUIRE(profile_name(ProfileId::Z3_LONG) == "z3_long"
                 && profile_name(ProfileId::Z3_SHARED_LONG) == "z3_shared_long",
             "streaming profile IDs have stable declared labels");
 
-    for (ProfileId profile : {ProfileId::Z3_LONG, ProfileId::Z3_SHARED_LONG}) {
+    {
         SessionHello hello;
         hello.c_store_guid = Id128::from_u64(91);
-        hello.supported_profiles = profile_bit(profile);
+        hello.supported_profiles = profile_bit(ProfileId::Z3_LONG);
+        const SessionSelection selected = negotiate_session(
+            hello, kProtocolVersion, kProtocolVersion, kKnownProfileMask);
+        REQUIRE(selected.negotiated_profiles == profile_bit(ProfileId::Z3_LONG),
+                "implemented ZSTD_ROUTE profile negotiates");
+    }
+
+    {
+        SessionHello hello;
+        hello.c_store_guid = Id128::from_u64(92);
+        hello.supported_profiles = profile_bit(ProfileId::Z3_SHARED_LONG);
         bool negotiation_rejected = false;
         try {
             (void)negotiate_session(hello, kProtocolVersion, kProtocolVersion,
@@ -734,11 +743,11 @@ static void test_declared_profiles_are_inert()
             negotiation_rejected = true;
         }
         REQUIRE(negotiation_rejected,
-                "declared streaming profile cannot negotiate without a codec");
+                "unimplemented ZSTD_SHARED_ROUTE profile cannot negotiate");
 
         TxBegin begin;
         begin.history_nonce = HistoryNonce{1};
-        begin.profile = profile;
+        begin.profile = ProfileId::Z3_SHARED_LONG;
         begin.p29_root_mode = P29RootMode::NotApplicable;
         bool transaction_rejected = false;
         try {

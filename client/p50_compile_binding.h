@@ -17,6 +17,12 @@ namespace icecc::p50 {
 [[nodiscard]] bool p50_zstd_compile_admissible(
     const UseCSMsg& assignment, int compiler_protocol) noexcept;
 
+// Return the one runnable source profile selected by the assignment.  A
+// capability mask is not a source selection: both bits, unknown bits, and
+// zero are rejected rather than silently choosing a codec.
+[[nodiscard]] std::optional<ProfileId> p50_zstd_selected_profile(
+    const UseCSMsg& assignment, int compiler_protocol) noexcept;
+
 // Pure assignment-bound namespace derivation.  Product callers supply a
 // process/invocation nonce; tests can hold them fixed and mutate each assignment
 // field independently.  This namespace remains immutable across the sender's

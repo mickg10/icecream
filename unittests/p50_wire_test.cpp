@@ -102,8 +102,8 @@ std::vector<Message> all_messages() {
     TxCommit commit{{99}, {4}, {7}, digest("tx"), digest("raw"), digest("post")};
     SessionState state;
     state.selected_protocol = kProtocolVersion;
-    state.negotiated_profiles = profile_bit(ProfileId::P29) |
-                                profile_bit(ProfileId::ZSTD_TU);
+    state.negotiated_profiles = profile_bit(ProfileId::ZSTD_TU) |
+                                profile_bit(ProfileId::Z3_LONG);
     state.limits = {65536, 1U << 24};
     state.f_store_guid = Id128::from_u64(2);
     state.namespace_present = true;
@@ -116,8 +116,8 @@ std::vector<Message> all_messages() {
     hello.min_protocol = 49;
     hello.max_protocol = kProtocolVersion;
     hello.c_store_guid = Id128::from_u64(1);
-    hello.supported_profiles = profile_bit(ProfileId::P29) |
-                               profile_bit(ProfileId::ZSTD_TU);
+    hello.supported_profiles = profile_bit(ProfileId::ZSTD_TU) |
+                               profile_bit(ProfileId::Z3_LONG);
     hello.limits = {131072, 1U << 25};
     TxBegin begin;
     begin.history_nonce = {99};
@@ -150,8 +150,8 @@ void test_session_negotiation() {
     hello.min_protocol = 49;
     hello.max_protocol = 51;
     hello.c_store_guid = Id128::from_u64(44);
-    hello.supported_profiles = profile_bit(ProfileId::P29) |
-                               profile_bit(ProfileId::ZSTD_TU);
+    hello.supported_profiles = profile_bit(ProfileId::ZSTD_TU) |
+                               profile_bit(ProfileId::Z3_LONG);
     hello.limits = {256 * 1024, 8 * 1024 * 1024};
     const SessionSelection selected = negotiate_session(
         hello, 50, 52, profile_bit(ProfileId::ZSTD_TU),
@@ -196,8 +196,8 @@ void test_session_negotiation() {
         profile_bit(ProfileId::P29) | profile_bit(ProfileId::ZSTD_TU),
         SessionLimits{kInitialMaxFramePayload, kInitialMaxFillRecordBytes});
     require(exact_selection.limits.max_frame_payload == kMandatoryControlFramePayload &&
-                exact_selection.negotiated_profiles == exact_control_cap.supported_profiles,
-            "152-byte asymmetric control cap did not preserve the profile intersection");
+                exact_selection.negotiated_profiles == profile_bit(ProfileId::ZSTD_TU),
+            "152-byte asymmetric control cap did not preserve the runnable profile intersection");
 
     TxBegin zstd;
     zstd.history_nonce = HistoryNonce{1};
@@ -228,16 +228,16 @@ void test_received_session_state_validation() {
     hello.min_protocol = kProtocolVersion;
     hello.max_protocol = kProtocolVersion + 1;
     hello.c_store_guid = Id128::from_u64(70);
-    hello.supported_profiles = profile_bit(ProfileId::P29) |
-                               profile_bit(ProfileId::ZSTD_TU) |
+    hello.supported_profiles = profile_bit(ProfileId::ZSTD_TU) |
+                               profile_bit(ProfileId::Z3_LONG) |
                                profile_bit(static_cast<ProfileId>(32));
     hello.limits = {128 * 1024, 8 * 1024 * 1024};
 
     const Digest128 post_state = digest("retained post state");
     SessionState state;
     state.selected_protocol = kProtocolVersion;
-    state.negotiated_profiles = profile_bit(ProfileId::P29) |
-                                profile_bit(ProfileId::ZSTD_TU);
+    state.negotiated_profiles = profile_bit(ProfileId::ZSTD_TU) |
+                                profile_bit(ProfileId::Z3_LONG);
     state.limits = {64 * 1024, 4 * 1024 * 1024};
     state.f_store_guid = Id128::from_u64(71);
     state.namespace_present = true;
@@ -259,7 +259,7 @@ void test_received_session_state_validation() {
 
     SessionState absent;
     absent.selected_protocol = kProtocolVersion;
-    absent.negotiated_profiles = profile_bit(ProfileId::P29);
+    absent.negotiated_profiles = profile_bit(ProfileId::ZSTD_TU);
     absent.limits = state.limits;
     absent.f_store_guid = state.f_store_guid;
     validate_session_state(hello, receive_session_state(absent));
@@ -301,7 +301,7 @@ void test_received_session_state_validation() {
         [&] { validate_received(rejected); },
         "SESSION_STATE negotiated an empty profile set");
     rejected = state;
-    rejected.negotiated_profiles = profile_bit(ProfileId::P29) |
+    rejected.negotiated_profiles = profile_bit(ProfileId::ZSTD_TU) |
                                    profile_bit(static_cast<ProfileId>(32));
     require_throws<std::invalid_argument>(
         [&] { validate_received(rejected); },

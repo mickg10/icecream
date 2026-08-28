@@ -13,7 +13,8 @@ constexpr Snapshot kAbsent{};
 
 Snapshot present_snapshot(uint32_t port) noexcept
 {
-    return Snapshot{port, CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU};
+    return Snapshot{port, CACHE_WIRE_PROTOCOL_V1,
+                    CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE};
 }
 
 } // namespace

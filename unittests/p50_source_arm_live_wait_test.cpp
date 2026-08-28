@@ -149,7 +149,8 @@ static bool wait_for_job_done_and_positive_cache_login(
         auto *login = dynamic_cast<LoginMsg *>(message);
         if (login != nullptr && login->cache_endpoint_port == port &&
             login->cache_protocol == CACHE_WIRE_PROTOCOL_V1 &&
-            login->cache_profile_mask == CACHE_PROFILE_ZSTD_TU)
+            login->cache_profile_mask ==
+                (CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE))
             positive_login = true;
         delete message;
     }
@@ -370,7 +371,8 @@ static bool run_live_test(const char *iceccd_path, const char *cache_service_pat
     const bool positive_ok = positive != nullptr &&
         positive->cache_endpoint_port == static_cast<uint32_t>(daemon_port) &&
         positive->cache_protocol == CACHE_WIRE_PROTOCOL_V1 &&
-        positive->cache_profile_mask == CACHE_PROFILE_ZSTD_TU;
+        positive->cache_profile_mask ==
+            (CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE);
     REQUIRE(positive_ok, "runtime READY sidecar publishes exact F advertisement");
     const uint32_t cache_port = positive_ok ? positive->cache_endpoint_port : 0;
     delete positive_message;

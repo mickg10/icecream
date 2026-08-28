@@ -17,6 +17,17 @@ require_count() {
     echo "ok - $label"
 }
 
+require_text() {
+    file=$1
+    pattern=$2
+    label=$3
+    if ! grep -F "$pattern" "$file" >/dev/null; then
+        echo "FAIL: $label" >&2
+        exit 1
+    fi
+    echo "ok - $label"
+}
+
 require_absent() {
     pattern=$1
     shift
@@ -175,8 +186,12 @@ require_absent \
     "$src/daemon/compiler_input.cpp" "$src/daemon/compiler_input.h" \
     "$src/scheduler/job.cpp" "$src/scheduler/job.h"
 
-require_absent 'z3_long|z3_shared_long|Z3_LONG|Z3_SHARED_LONG' \
-    'declared streaming labels have no codec implementation' \
+require_text "$src/cache/p50_zstd.cpp" 'ZstdRouteCodec' \
+    'ZSTD_ROUTE codec implementation remains in the product path'
+require_text "$src/cache/p50_endpoint.cpp" 'ProfileId::Z3_LONG' \
+    'ZSTD_ROUTE endpoint profile remains in the product path'
+require_absent 'z3_shared_long_b1' \
+    'unimplemented route labels remain absent from the product path' \
     "$src/cache/p50_zstd.cpp" "$src/cache/p50_zstd.h" \
     "$src/cache/p50_endpoint.cpp" "$src/cache/p50_endpoint.h" \
     "$src/cache/p50_slice0.cpp" "$src/cache/p50_slice0.h"
