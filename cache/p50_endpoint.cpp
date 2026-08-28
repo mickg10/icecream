@@ -2071,7 +2071,7 @@ struct P50ServerEndpoint::Impl {
             prepared.pending.global_tu_started = true;
             reserve_pending(prepared.pending);
             const InputRecordKey input_key{*session.c_guid, begin.tu_seq};
-            if (!input_records.contains(input_key)) {
+            if (!input_records.contains(input_key) && begin.raw_bytes != 0) {
                 const auto slot = global_resources->first_free_staging_slot();
                 if (!slot)
                     throw std::length_error("F endpoint staging-slot pool is exhausted");

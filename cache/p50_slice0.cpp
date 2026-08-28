@@ -721,9 +721,11 @@ std::optional<size_t> GlobalResourceModel::first_free_staging_slot() const {
 void GlobalResourceModel::release(CStoreGuid c_store_guid, Key64 key) {
     Namespace& space = require_namespace(c_store_guid);
     const auto position = space.objects.find(key);
-    if (position == space.objects.end() ||
-        (position->second.state != GlobalObjectState::Present &&
-         position->second.state != GlobalObjectState::Pinned))
+    // Zero-byte transactions are legal in the endpoint protocol and have no
+    // global resident object to release.
+    if (position == space.objects.end()) return;
+    if (position->second.state != GlobalObjectState::Present &&
+        position->second.state != GlobalObjectState::Pinned)
         throw std::logic_error("global release requires a resident object");
     const uint64_t bytes = position->second.bytes;
     space.objects.erase(position);
