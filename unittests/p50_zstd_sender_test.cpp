@@ -37,6 +37,13 @@ ZstdSourceTransferConfig config() {
     return result;
 }
 
+ZstdSourceTransferConfig route_config() {
+    ZstdSourceTransferConfig result = config();
+    result.compression_level = 3;
+    result.endpoint_caps.profile = ProfileId::Z3_LONG;
+    return result;
+}
+
 int connect_fd(tcp::endpoint remote) {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0)
@@ -145,6 +152,69 @@ void test_adopted_fd_factory_exact_transfer() {
     CHECK(calls == 1);
 }
 
+void test_route_sender_reuses_relationship_for_two_transfers() {
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    EndpointCaps caps;
+    caps.profile = ProfileId::Z3_LONG;
+    caps.zstd.max_raw_bytes = 1U << 20;
+    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    P50ServerEndpointConfig server_config;
+    server_config.input_job_state = [](CStoreGuid, const TxBegin&, const TxCommit&,
+                                       std::span<const uint8_t>) {
+        return InputJobState::Open;
+    };
+    P50ServerEndpoint server(Id128::from_u64(7022), caps, nullptr, nullptr,
+                             server_config);
+    P50ZstdSourceSender sender(Id128::from_u64(7021), PrepareRequestKey{98, 1},
+                               route_config());
+    const std::vector<uint8_t> first{'r', 'o', 'u', 't', 'e', '-', '1'};
+    const std::vector<uint8_t> second{'r', 'o', 'u', 't', 'e', '-', '2'};
+
+    auto first_server = asio::co_spawn(context, server.accept_one(acceptor),
+                                        asio::use_future);
+    auto first_transfer = asio::co_spawn(
+        context, sender.transfer(acceptor.local_endpoint(), first), asio::use_future);
+    context.run();
+    const auto first_result = first_transfer.get();
+    CHECK(first_server.get().status == ServerRunStatus::Completed);
+    CHECK(first_result.status == ZstdSourceTransferStatus::Committed);
+    CHECK(first_result.committed_input.has_value());
+    CHECK(first_result.committed_input->c_store_guid == Id128::from_u64(7021));
+    CHECK(first_result.committed_input->tu_seq.value == 0);
+
+    context.restart();
+    auto second_server = asio::co_spawn(context, server.accept_one(acceptor),
+                                         asio::use_future);
+    auto second_transfer = asio::co_spawn(
+        context, sender.transfer(acceptor.local_endpoint(), second), asio::use_future);
+    context.run();
+    const auto second_result = second_transfer.get();
+    CHECK(second_server.get().status == ServerRunStatus::Completed);
+    CHECK(second_result.status == ZstdSourceTransferStatus::Committed);
+    CHECK(second_result.committed_input.has_value());
+    CHECK(second_result.committed_input->c_store_guid == Id128::from_u64(7021));
+    CHECK(second_result.committed_input->tu_seq.value == 1);
+
+    server.reset_store(Id128::from_u64(7023));
+    P50ZstdSourceSender reset_sender(Id128::from_u64(7024),
+                                     PrepareRequestKey{99, 1}, route_config());
+    const std::vector<uint8_t> after_reset{'r', 'o', 'u', 't', 'e', '-', 'r'};
+    context.restart();
+    auto reset_server = asio::co_spawn(context, server.accept_one(acceptor),
+                                        asio::use_future);
+    auto reset_transfer = asio::co_spawn(
+        context, reset_sender.transfer(acceptor.local_endpoint(), after_reset),
+        asio::use_future);
+    context.run();
+    const auto reset_result = reset_transfer.get();
+    CHECK(reset_server.get().status == ServerRunStatus::Completed);
+    CHECK(reset_result.status == ZstdSourceTransferStatus::Committed);
+    CHECK(reset_result.committed_input.has_value());
+    CHECK(reset_result.committed_input->c_store_guid == Id128::from_u64(7024));
+    CHECK(reset_result.committed_input->tu_seq.value == 0);
+}
+
 void test_absolute_deadline_is_required() {
     ZstdSourceTransferConfig expired = config();
     expired.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
@@ -219,6 +289,7 @@ void test_factory_cannot_extend_absolute_deadline() {
 
 int main() {
     test_exact_network_transfer();
+    test_route_sender_reuses_relationship_for_two_transfers();
     test_owned_fd_and_fail_closed_validation();
     test_adopted_fd_factory_exact_transfer();
     test_absolute_deadline_is_required();

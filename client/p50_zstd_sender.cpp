@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <chrono>
 #include <fcntl.h>
+#include <limits>
 #include <stdexcept>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -114,6 +115,19 @@ struct P50ZstdSourceSender::Impl {
         return result;
     }
 
+    PrepareRequestKey begin_transfer() {
+        if (config.endpoint_caps.profile == ProfileId::ZSTD_TU) {
+            if (used) throw std::logic_error("sender is one-shot");
+            used = true;
+            return request;
+        }
+        if (request.request_token == std::numeric_limits<uint64_t>::max())
+            throw std::overflow_error("route request identity exhausted");
+        const PrepareRequestKey current = request;
+        ++request.request_token;
+        return current;
+    }
+
     CStoreGuid c_guid{};
     PrepareRequestKey request{};
     ZstdSourceTransferConfig config{};
@@ -132,23 +146,21 @@ P50ZstdSourceSender::~P50ZstdSourceSender() = default;
 boost::asio::awaitable<ZstdSourceTransferResult>
 P50ZstdSourceSender::transfer(boost::asio::ip::tcp::endpoint remote,
                                OwnedSourceFd source) {
-    if (impl_->used) throw std::logic_error("sender is one-shot");
-    impl_->used = true;
+    const PrepareRequestKey request = impl_->begin_transfer();
     const auto bytes = read_complete_fd(source.get(),
                                         impl_->config.endpoint_caps.zstd.max_raw_bytes);
-    if (!bytes) return transfer_bytes(ConnectionTarget{remote}, {});
-    return transfer_bytes(ConnectionTarget{remote},
+    if (!bytes) return transfer_bytes(ConnectionTarget{remote}, request, {});
+    return transfer_bytes(ConnectionTarget{remote}, request,
                           std::make_shared<const std::vector<uint8_t>>(*bytes));
 }
 
 boost::asio::awaitable<ZstdSourceTransferResult>
 P50ZstdSourceSender::transfer(boost::asio::ip::tcp::endpoint remote,
                                std::span<const uint8_t> source) {
-    if (impl_->used) throw std::logic_error("sender is one-shot");
-    impl_->used = true;
+    const PrepareRequestKey request = impl_->begin_transfer();
     if (source.size() > impl_->config.endpoint_caps.zstd.max_raw_bytes)
-        return transfer_bytes(ConnectionTarget{remote}, {});
-    return transfer_bytes(ConnectionTarget{remote},
+        return transfer_bytes(ConnectionTarget{remote}, request, {});
+    return transfer_bytes(ConnectionTarget{remote}, request,
                           std::make_shared<const std::vector<uint8_t>>(source.begin(),
                                                                          source.end()));
 }
@@ -156,32 +168,31 @@ P50ZstdSourceSender::transfer(boost::asio::ip::tcp::endpoint remote,
 boost::asio::awaitable<ZstdSourceTransferResult>
 P50ZstdSourceSender::transfer(ConnectedFdFactory connection,
                               OwnedSourceFd source) {
-    if (impl_->used) throw std::logic_error("sender is one-shot");
-    impl_->used = true;
+    const PrepareRequestKey request = impl_->begin_transfer();
     const auto bytes = read_complete_fd(source.get(),
                                         impl_->config.endpoint_caps.zstd.max_raw_bytes);
     if (!bytes)
-        return transfer_bytes(ConnectionTarget{std::move(connection)}, {});
+        return transfer_bytes(ConnectionTarget{std::move(connection)}, request, {});
     return transfer_bytes(
-        ConnectionTarget{std::move(connection)},
+        ConnectionTarget{std::move(connection)}, request,
         std::make_shared<const std::vector<uint8_t>>(*bytes));
 }
 
 boost::asio::awaitable<ZstdSourceTransferResult>
 P50ZstdSourceSender::transfer(ConnectedFdFactory connection,
                               std::span<const uint8_t> source) {
-    if (impl_->used) throw std::logic_error("sender is one-shot");
-    impl_->used = true;
+    const PrepareRequestKey request = impl_->begin_transfer();
     if (source.size() > impl_->config.endpoint_caps.zstd.max_raw_bytes)
-        return transfer_bytes(ConnectionTarget{std::move(connection)}, {});
+        return transfer_bytes(ConnectionTarget{std::move(connection)}, request, {});
     return transfer_bytes(
-        ConnectionTarget{std::move(connection)},
+        ConnectionTarget{std::move(connection)}, request,
         std::make_shared<const std::vector<uint8_t>>(source.begin(), source.end()));
 }
 
 boost::asio::awaitable<ZstdSourceTransferResult>
 P50ZstdSourceSender::transfer_bytes(
     ConnectionTarget target,
+    PrepareRequestKey request,
     std::shared_ptr<const std::vector<uint8_t>> source) {
     if (!valid_deadline(impl_->config, Clock::now()))
         co_return impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
@@ -198,7 +209,7 @@ P50ZstdSourceSender::transfer_bytes(
     const Digest128 raw_digest = digest128(*source);
     PreparedTuHandle prepared;
     try {
-        prepared = impl_->authority->prepare(impl_->request, *source);
+        prepared = impl_->authority->prepare(request, *source);
     } catch (const std::invalid_argument&) {
         co_return impl_->invalid(ZstdSourceTransferStatus::InvalidRequest);
     } catch (const std::length_error&) {

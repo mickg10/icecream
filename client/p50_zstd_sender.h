@@ -74,9 +74,9 @@ struct ZstdSourceTransferConfig {
 using ConnectedFdFactory =
     std::function<int(std::chrono::steady_clock::time_point deadline)>;
 
-// One-shot C-side source transfer.  A sender instance is intentionally not
-// reusable: this keeps request identity, prepared bytes, and retry state in
-// one immutable transaction scope.
+// C-side source transfer.  ZSTD_TU senders are one-shot because each transfer
+// owns an independent namespace.  ZSTD_ROUTE senders retain the relationship
+// authority and endpoint so sequential transfers advance one route.
 class P50ZstdSourceSender {
 public:
     P50ZstdSourceSender(CStoreGuid c_store_guid, PrepareRequestKey request,
@@ -103,6 +103,7 @@ private:
 
     boost::asio::awaitable<ZstdSourceTransferResult> transfer_bytes(
         ConnectionTarget target,
+        PrepareRequestKey request,
         std::shared_ptr<const std::vector<uint8_t>> source);
 
     struct Impl;
