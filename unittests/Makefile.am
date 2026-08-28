@@ -27,7 +27,7 @@ TESTS += p50inputfd-source.sh p50inputfd-sanitize.sh
 TESTS += p50inputfd
 TESTS += p50inputlifecycle-source.sh p50inputlifecycle-sanitize.sh
 TESTS += p50inputlifecycle
-TESTS += p50compilebinding
+TESTS += p50compilebinding p50routeowner
 TESTS += p50compilee2e-source.sh p50compilee2e-run.sh p50resultdisposition
 TESTS += p50profile-selection-source.sh
 TESTS += p50_completion_record
@@ -150,7 +150,7 @@ p50daemoncontrol_LDADD = ../cache/libp50localtransport.a
 p50readyadvertisement_LDADD = ../cache/libp50readyadvertisement.a
 digest128bench_LDADD = ../services/libicecc.la
 
-check_PROGRAMS = testargs lockexec backpressure schedpolicy utf8test statewritertest schedbp daemonlogin daemonbatch cachehandoffdaemon daemoncachedispatch p50daemoncachedispatch p49daemon p49scheduler connectivity fastesttest hallflowtest jobidalloctest inputpump compilerinput p49assignment p50assignment p50cacheadvertisement p50cachesession p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50inputrecordreopen p50inputattachment p50endpoint p50endpointcancel p50localtransport p50sidecarsupervisor p50readyadvertisement p50cacheservice p50fdhandoff digest128bench p50zstdsender p50compilebinding p50fsessioncontrol p50fsessionroute p50fsessionsidecarop p50fsessiondaemonop p50fsessionduplex p50fsessionserviceowner p50fsessionpayloads p50fsessionsemantics
+check_PROGRAMS = testargs lockexec backpressure schedpolicy utf8test statewritertest schedbp daemonlogin daemonbatch cachehandoffdaemon daemoncachedispatch p50daemoncachedispatch p49daemon p49scheduler connectivity fastesttest hallflowtest jobidalloctest inputpump compilerinput p49assignment p50assignment p50cacheadvertisement p50cachesession p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50inputrecordreopen p50inputattachment p50endpoint p50endpointcancel p50localtransport p50sidecarsupervisor p50readyadvertisement p50cacheservice p50fdhandoff digest128bench p50zstdsender p50compilebinding p50routeowner p50fsessioncontrol p50fsessionroute p50fsessionsidecarop p50fsessiondaemonop p50fsessionduplex p50fsessionserviceowner p50fsessionpayloads p50fsessionsemantics
 check_PROGRAMS += s3persistence
 check_PROGRAMS += p50s3realprocess
 p50fsessioncontrol_SOURCES = p50fsessioncontrol.cpp
@@ -257,6 +257,13 @@ p50compilebinding_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 p50compilebinding_CXXFLAGS = -pthread
 p50compilebinding_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 p50compilebinding_LDADD = ../client/libp50zstdsender.a ../cache/libp50endpoint.a \
+	../cache/libp50adoptedoutcomewriter.a ../cache/libprotocol50.a \
+	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
+p50routeowner_SOURCES = p50_route_owner_test.cpp
+p50routeowner_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
+p50routeowner_CXXFLAGS = -pthread
+p50routeowner_LDFLAGS = $(BOOST_LDFLAGS) -pthread
+p50routeowner_LDADD = ../client/libp50zstdsender.a ../cache/libp50endpoint.a \
 	../cache/libp50adoptedoutcomewriter.a ../cache/libprotocol50.a \
 	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 p50resultdisposition_SOURCES = p50_result_disposition_test.cpp
