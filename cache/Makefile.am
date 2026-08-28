@@ -42,7 +42,9 @@ libprotocol50_a_SOURCES = \
 	p50_fsession_control.cpp \
 	p50_fsession_control.h \
 	p50_fsession_route.cpp \
-	p50_fsession_route.h
+	p50_fsession_route.h \
+	p50_fsession_sidecar_op.cpp \
+	p50_fsession_sidecar_op.h
 
 AM_CPPFLAGS = -I$(top_srcdir) $(LIBZSTD_CFLAGS)
 libp50endpoint_a_SOURCES = p50_endpoint.cpp p50_endpoint.h \
