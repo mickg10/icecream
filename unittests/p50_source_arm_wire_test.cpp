@@ -241,6 +241,17 @@ void test_roundtrip_and_exact_echo()
     REQUIRE(!make_pair(PROTOCOL_VERSION).left->send_msg(
                 P50SourceArmMsg(route_mode_mismatch)),
             "source-arm rejects a ZSTD_ROUTE/TU mode mismatch");
+    static_assert(P50_SOURCE_MODE_GRZ_RESIDUAL != P50_SOURCE_MODE_P29);
+    P50SourceArmFields p29 = request.arm;
+    p29.cache_profile = CACHE_PROFILE_P29;
+    p29.source_mode = P50_SOURCE_MODE_P29;
+    REQUIRE(make_pair(PROTOCOL_VERSION).left->send_msg(P50SourceArmMsg(p29)),
+            "source-arm accepts the exact P29 profile/mode pair");
+    P50SourceArmFields p29_mode_mismatch = p29;
+    p29_mode_mismatch.source_mode = P50_SOURCE_MODE_GRZ_RESIDUAL;
+    REQUIRE(!make_pair(PROTOCOL_VERSION).left->send_msg(
+                P50SourceArmMsg(p29_mode_mismatch)),
+            "source-arm rejects a P29/GRZ mode mismatch");
     delete request_base;
     delete reply_base;
 }
@@ -361,7 +372,7 @@ void test_rejects_malformed_and_legacy()
                 P50SourceArmMsg(unknown_profile)),
             "non-advertisable cache profile is refused before framing");
     P50SourceArmFields unknown_mode = request.arm;
-    unknown_mode.source_mode = P50_SOURCE_MODE_ZSTD_TU + 1;
+    unknown_mode.source_mode = UINT32_MAX;
     REQUIRE(!make_pair(PROTOCOL_VERSION).left->send_msg(
                 P50SourceArmMsg(unknown_mode)),
             "unknown source mode is refused before framing");
