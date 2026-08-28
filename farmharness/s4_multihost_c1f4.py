@@ -407,7 +407,7 @@ for i in $(seq 1 "$worker_count"); do
     esac
     {
       printf '#include <cstdint>\nstatic const std::uint32_t values_%s[] = {' "$i"
-      seq 1 "$values_count" | awk '{printf "%s,", ($1 * 2654435761) % 4294967291}'
+      seq 1 "$values_count" | awk '{printf "%.0f,", ($1 * 2654435761) % 4294967291}'
       printf '};\nextern "C" std::uint32_t s4_physical_%s() { return values_%s[%s]; }\n' \
         "$i" "$i" "$((values_count-1))"
     } >"$work/main-$i.cpp"

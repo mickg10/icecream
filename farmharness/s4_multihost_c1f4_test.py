@@ -111,6 +111,7 @@ class FourHostRunnerTests(unittest.TestCase):
         self.assertIn('wait "${pids[$((i-1))]}"', runner.CLIENT_SCRIPT)
         self.assertIn('[ "$load" = same ]', runner.CLIENT_SCRIPT)
         self.assertIn('4) values_count=16384', runner.CLIENT_SCRIPT)
+        self.assertIn('printf "%.0f,"', runner.CLIENT_SCRIPT)
         self.assertIn('for i in $(seq 1 "$worker_count")', runner.CLIENT_SCRIPT)
 
     def test_container_work_mount_uses_generic_probe_path(self) -> None:
