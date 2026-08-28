@@ -333,7 +333,7 @@ WRAPPER
 chmod 755 "$work/wrapper.sh"
 docker run -d --name "$container" --network host --user 0 \
   -v "$root:/role:ro" -v "$work:/workspace" -e S4_UID="$uid" -e S4_GID="$gid" \
-  --entrypoint /workspace/wrapper.sh "$image" -p "$port" -n "$network" \
+  --entrypoint /bin/sh "$image" /workspace/wrapper.sh -p "$port" -n "$network" \
   --assignment-fence-mode strict-nonce -l /workspace/scheduler.log -vvv \
   >"$work/container.id"
 sleep 1
@@ -359,7 +359,7 @@ WRAPPER
 chmod 755 "$work/wrapper.sh"
 docker run -d --name "$container" --network host --user 0 --cap-add=SYS_CHROOT \
   -v "$root:/role:ro" -v "$work:/workspace" -e S4_UID="$uid" -e S4_GID="$gid" \
-  -e ICECC_TEST_SOCKET=/workspace/f.sock --entrypoint /workspace/wrapper.sh "$image" \
+  -e ICECC_TEST_SOCKET=/workspace/f.sock --entrypoint /bin/sh "$image" /workspace/wrapper.sh \
   -p "$port" -m 2 -s "$scheduler:$sport" -n "$network" -N "$name" \
   -b /workspace/envs -l /workspace/fdaemon.log -vvv \
   --cache-service /role/cache/icecc-cache-service \
