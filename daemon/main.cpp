@@ -8719,7 +8719,14 @@ bool Daemon::handle_cache_session(Client *client, Msg *msg)
     if (outcome.result != icecc::p50::daemon::CacheDispatchResult::Accepted ||
         !outcome.handoff_acknowledged || !outcome.trailing_byte_barrier) {
         log_warning() << "CACHE_SESSION handoff failed (result="
-                      << int(outcome.result) << ")" << endl;
+                      << int(outcome.result) << ", handoff="
+                      << icecc::p50::local::fd_handoff_status_name(
+                             outcome.handoff_status)
+                      << ", acknowledged="
+                      << (outcome.handoff_acknowledged ? 1 : 0)
+                      << ", boundary="
+                      << (outcome.trailing_byte_barrier ? 1 : 0) << ")"
+                      << endl;
         handle_end(client, 121);
         return false;
     }
