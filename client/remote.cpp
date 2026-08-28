@@ -861,6 +861,8 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                     log_warning() << p50_profile_name
                                   << " cache source transfer failed closed (status "
                                   << static_cast<unsigned>(transfer.code)
+                                  << ", error "
+                                  << static_cast<unsigned>(transfer.error_code)
                                   << ", attempts "
                                   << static_cast<unsigned>(transfer.attempts)
                                   << ")" << endl;
