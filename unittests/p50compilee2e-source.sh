@@ -42,6 +42,16 @@ contract() {
     require_text "$root/daemon/workit.cpp" 'ICECC_P50_C1F1_REQUIRED' || return 1
     require_text "$root/client/remote.cpp" 'P50ZstdSourceSender sender' || return 1
     require_text "$root/client/remote.cpp" 'job.setCompileInputIdentity(*identity)' || return 1
+    # The real C production caller must retain one arm identity over the
+    # bounded retry loop and cross the ordinary CACHE_SESSION boundary only
+    # after the exact F acknowledgement on that same TCP wrapper.
+    require_text "$root/client/remote.cpp" 'P50SourceArmFields' || return 1
+    require_text "$root/client/remote.cpp" 'P50SourceArmedMsg' || return 1
+    require_text "$root/client/remote.cpp" 'acknowledges(request)' || return 1
+    require_text "$root/client/remote.cpp" 'send_msg(request, MsgChannel::SendNonBlocking)' || return 1
+    require_text "$root/client/remote.cpp" 'send_msg(CacheSessionMsg(), MsgChannel::SendNonBlocking)' || return 1
+    require_text "$root/client/remote.cpp" 'begin_p50_client_transfer' || return 1
+    require_text "$root/client/remote.cpp" 'const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);' || return 1
     require_text "$root/client/Makefile.am" 'libp50zstdsender.a' || return 1
     require_text "$root/client/Makefile.am" 'libprotocol50.a' || return 1
 
@@ -90,6 +100,13 @@ for pair in \
     "daemon/workit.cpp|ICECC_P50_C1F1_REQUIRED" \
     "client/remote.cpp|P50ZstdSourceSender sender" \
     "client/remote.cpp|job.setCompileInputIdentity(*identity)" \
+    "client/remote.cpp|P50SourceArmFields" \
+    "client/remote.cpp|P50SourceArmedMsg" \
+    "client/remote.cpp|acknowledges(request)" \
+    "client/remote.cpp|send_msg(request, MsgChannel::SendNonBlocking)" \
+    "client/remote.cpp|send_msg(CacheSessionMsg(), MsgChannel::SendNonBlocking)" \
+    "client/remote.cpp|begin_p50_client_transfer" \
+    "client/remote.cpp|const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);" \
     "client/Makefile.am|libp50zstdsender.a" \
     "cache/Makefile.am|libp50inputfd.a" \
     "cache/p50_cache_service.cpp|std::make_unique<P50ServerEndpoint>" \

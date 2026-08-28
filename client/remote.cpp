@@ -174,25 +174,102 @@ icecc::p50::OwnedSourceFd prepare_complete_p50_source(
     return icecc::p50::OwnedSourceFd(read_fd);
 }
 
-icecc::p50::CStoreGuid compile_c_store_guid(const CompileJob &job)
+struct P50ClientTransferContext {
+    uint64_t process_generation = 0;
+    uint64_t transfer_sequence = 0;
+    icecc::p50::CStoreGuid c_store_guid{};
+};
+
+P50ClientTransferContext begin_p50_client_transfer(const CompileJob &job)
 {
-    static std::atomic<uint64_t> invocation_serial{1};
-    const uint64_t serial = invocation_serial.fetch_add(1, std::memory_order_relaxed);
-    const uint64_t ticks = static_cast<uint64_t>(
-        std::chrono::steady_clock::now().time_since_epoch().count());
-    const uint64_t process_nonce =
-        (static_cast<uint64_t>(static_cast<uint32_t>(::getpid())) << 32) ^ ticks;
-    return icecc::p50::derive_compile_c_store_guid(job, process_nonce, serial);
+    // The process generation identifies this C producer incarnation.  The
+    // local sequence identifies one source transfer and is deliberately
+    // allocated once before the sender's bounded retry loop.  Both values
+    // therefore remain stable when a fresh TCP wrapper is needed.
+    static const uint64_t process_generation = [] {
+        const uint64_t ticks = static_cast<uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        uint64_t value =
+            (static_cast<uint64_t>(static_cast<uint32_t>(::getpid())) << 32) ^ ticks;
+        return value == 0 ? uint64_t{1} : value;
+    }();
+    static std::atomic<uint64_t> next_transfer_sequence{1};
+    uint64_t transfer_sequence =
+        next_transfer_sequence.load(std::memory_order_relaxed);
+    for (;;) {
+        if (transfer_sequence == 0 || transfer_sequence == UINT64_MAX)
+            throw client_error(106, "Error 106 - P50 transfer identity exhausted");
+        if (next_transfer_sequence.compare_exchange_weak(
+                transfer_sequence, transfer_sequence + 1,
+                std::memory_order_relaxed, std::memory_order_relaxed))
+            break;
+    }
+
+    P50ClientTransferContext result;
+    result.process_generation = process_generation;
+    result.transfer_sequence = transfer_sequence;
+    result.c_store_guid = icecc::p50::derive_compile_c_store_guid(
+        job, process_generation, transfer_sequence);
+    return result;
+}
+
+P50SourceArmFields make_p50_source_arm(
+    const CompileJob &job, const UseCSMsg &assignment,
+    const P50ClientTransferContext &context)
+{
+    P50SourceArmFields arm;
+    arm.wire_job_id = assignment.job_id;
+    arm.assignment_epoch = assignment.assignmentEpoch();
+    arm.assignment_nonce = assignment.assignmentNonce();
+    arm.selected_f_host = assignment.hostname;
+    arm.selected_f_ordinary_port = assignment.port;
+    arm.selected_f_cache_port = assignment.cache_endpoint_port;
+    arm.cache_protocol = assignment.cache_protocol;
+    arm.cache_profile = assignment.cache_profile_mask & CACHE_PROFILE_ZSTD_TU;
+    arm.logical_job = job.jobID();
+    arm.compiler_attempt = assignment.assignmentNonce();
+    arm.c_store_generation = context.process_generation;
+    arm.c_store_derivation_version = icecc::p50::kStoreIdentityDerivationVersion;
+    arm.c_store_guid = context.c_store_guid.bytes;
+    // The sender's PrepareRequest is assignment-bound.  F later compares the
+    // committed InputRecord request_id with this exact token, so it must be
+    // the UseCS assignment nonce rather than an unrelated local sequence.
+    arm.source_request_id = assignment.assignmentNonce();
+    arm.source_mode = P50_SOURCE_MODE_ZSTD_TU;
+    arm.c_control_generation = context.process_generation;
+    arm.c_control_attempt = context.transfer_sequence;
+    return arm;
 }
 
 int detach_p50_cache_session(
-    const std::string &hostname, uint32_t port,
+    const P50SourceArmFields &arm,
     std::chrono::steady_clock::time_point deadline) noexcept
 {
     try {
         std::unique_ptr<MsgChannel> channel(Service::createChannelUntil(
-            hostname, static_cast<unsigned short>(port), deadline));
+            arm.selected_f_host, static_cast<unsigned short>(arm.selected_f_cache_port),
+            deadline));
         if (!channel || channel->protocol != PROTOCOL_VERSION_CACHE_ADVERTISEMENT ||
+            std::chrono::steady_clock::now() >= deadline)
+            return -1;
+
+        // The F daemon retains the WAIT owner only after this exact arm and
+        // acknowledges it before the ordinary CACHE_SESSION boundary.  Keep
+        // the request and ACK on this same TCP wrapper: a bare CACHE_SESSION
+        // on a fresh connection has no retained P50 owner and is rejected.
+        const P50SourceArmMsg request(arm);
+        if (!channel->send_msg(request, MsgChannel::SendNonBlocking))
+            return -1;
+        const auto remaining = deadline - std::chrono::steady_clock::now();
+        const auto timeout = std::chrono::duration_cast<std::chrono::seconds>(
+            remaining).count();
+        if (timeout <= 0 || timeout > INT_MAX)
+            return -1;
+        std::unique_ptr<Msg> response(channel->get_msg(static_cast<int>(timeout)));
+        const auto *ack = response != nullptr
+                              ? dynamic_cast<const P50SourceArmedMsg *>(response.get())
+                              : nullptr;
+        if (ack == nullptr || !ack->acknowledges(request) ||
             std::chrono::steady_clock::now() >= deadline)
             return -1;
         if (!channel->send_msg(CacheSessionMsg(), MsgChannel::SendNonBlocking))
@@ -205,19 +282,24 @@ int detach_p50_cache_session(
 
 icecc::p50::ZstdSourceTransferResult transfer_p50_source(
     const CompileJob &job, const UseCSMsg &assignment,
-    icecc::p50::CStoreGuid c_store_guid,
+    const P50ClientTransferContext &transfer_context,
     icecc::p50::OwnedSourceFd source)
 {
     icecc::p50::ZstdSourceTransferConfig config;
-    config.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    config.deadline = deadline;
     config.maximum_duration = std::chrono::seconds(120);
     icecc::p50::P50ZstdSourceSender sender(
-        c_store_guid, icecc::p50::compile_prepare_request(job), config);
-    const std::string hostname = assignment.hostname;
-    const uint32_t port = assignment.cache_endpoint_port;
+        transfer_context.c_store_guid,
+        icecc::p50::compile_prepare_request(job), config);
+    // The caller supplies the same C GUID used by the sender.  The arm's
+    // process/local counters are captured once and copied into both bounded
+    // connection attempts rather than regenerated by the callback.
+    const P50SourceArmFields arm = make_p50_source_arm(job, assignment,
+                                                        transfer_context);
     icecc::p50::ConnectedFdFactory connection =
-        [hostname, port](std::chrono::steady_clock::time_point deadline) {
-            return detach_p50_cache_session(hostname, port, deadline);
+        [arm](std::chrono::steady_clock::time_point callback_deadline) {
+            return detach_p50_cache_session(arm, callback_deadline);
         };
 
     boost::asio::io_context context;
@@ -710,10 +792,12 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                     return cpp_status;
                 }
 
+                const P50ClientTransferContext transfer_context =
+                    begin_p50_client_transfer(job);
                 const icecc::p50::CStoreGuid c_store_guid =
-                    compile_c_store_guid(job);
+                    transfer_context.c_store_guid;
                 const icecc::p50::ZstdSourceTransferResult transfer =
-                    transfer_p50_source(job, *usecs, c_store_guid,
+                    transfer_p50_source(job, *usecs, transfer_context,
                                         std::move(source));
                 const std::optional<CompileInputIdentity> identity =
                     icecc::p50::bind_compile_input(job, c_store_guid, transfer);

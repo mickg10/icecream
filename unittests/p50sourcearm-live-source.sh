@@ -45,8 +45,7 @@ check_contract() {
         'source_budget_msec <= MaxSourceBudgetMsec' \
         'store_identity_file_guid_matches_client' \
         'p50_source_compile_pending' \
-        'retained_source_owner' \
-        'client->status == Client::WAITP50INPUT && *msg == Msg::CACHE_SESSION'; do
+        'retained_source_owner'; do
         grep -F -- "$needle" "$candidate" "$comm_h" "$comm_cpp" >/dev/null || return 1
     done
 
@@ -68,6 +67,14 @@ check_contract() {
     grep -F 'current_status == Client::WAITFORCHILD ||' "$candidate" >/dev/null || return 1
     grep -F 'current_status == Client::WAITINSTALL;' "$candidate" >/dev/null || return 1
     if grep -F 'current_status == Client::WAITP50INPUT;' "$candidate" >/dev/null; then
+        return 1
+    fi
+
+    # Once the exact arm ACK is retained, CACHE_SESSION is the production
+    # handoff boundary and must reach handle_cache_session.  The old early
+    # exit-152 guard made the real dispatcher unreachable.
+    if grep -F 'client->status == Client::WAITP50INPUT && *msg == Msg::CACHE_SESSION' \
+        "$candidate" >/dev/null; then
         return 1
     fi
 

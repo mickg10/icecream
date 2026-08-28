@@ -8704,17 +8704,6 @@ bool Daemon::handle_activity(Client *client)
         return false;
     }
 
-    // An armed wrapper is not a legacy CACHE_SESSION handoff channel.  Keep
-    // the positive private dispatcher unreachable until the exact later
-    // InputReady transport is specified; this frame still settles the one
-    // retained scheduler owner through the normal teardown path.
-    if (client->status == Client::WAITP50INPUT && *msg == Msg::CACHE_SESSION) {
-        delete msg;
-        (void)client->channel->send_msg(EndMsg());
-        handle_end(client, 152);
-        return false;
-    }
-
     bool ret = false;
 
     if (client->status == Client::TOINSTALL) {
