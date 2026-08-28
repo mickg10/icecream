@@ -161,6 +161,7 @@ network="p50c1f1-$$"
 source_root=${ICECC_P50_C1F1_SOURCE_ROOT:-}
 source_relative=${ICECC_P50_C1F1_SOURCE_RELATIVE:-}
 source_input=${ICECC_P50_C1F1_INPUT:-}
+include_root=${ICECC_P50_C1F1_INCLUDE_ROOT:-}
 if test -n "$source_root" || test -n "$source_relative"; then
     test -n "$source_root" && test -n "$source_relative" || {
         echo "FAIL: source root and source relative path must be supplied together" >&2
@@ -194,6 +195,16 @@ else
         'int p50_c1f1_translation_unit() {' \
         '    return static_cast<int>(UINT32_C(50));' \
         '}' >"$work/src/main.cpp"
+fi
+if test -n "$include_root"; then
+    test "${include_root#/}" != "$include_root" || {
+        echo "FAIL: include root must be an absolute path" >&2
+        exit 1
+    }
+    test -d "$include_root" && test ! -L "$include_root" || {
+        echo "FAIL: authenticated include root is unavailable" >&2
+        exit 1
+    }
 fi
 
 # The environment is made by the real icecc tool, then shipped to the real F
@@ -320,13 +331,19 @@ compile_once() {
     remote_obj="$work/out/remote-$label.o"
     local_obj="$work/out/local-$label.o"
     client_log="$work/client-compile-$label.log"
+    if test -n "$include_root"; then
+        compile_include_args="-I$include_root"
+    else
+        compile_include_args=""
+    fi
     ICECC_TEST_SOCKET="$work/client.sock" ICECC_TEST_REMOTEBUILD=1 \
         ICECC_VERSION="$envtar" ICECC_P50_C1F1_REQUIRED=1 \
         ICECC_PREFERRED_HOST=p50-f \
         ICECC_DEBUG=debug ICECC_LOGFILE="$client_log" \
         run_client_with_timeout g++ -std=c++17 -O2 -c \
-        "$work/src/main.cpp" -o "$remote_obj"
-    g++ -std=c++17 -O2 -c "$work/src/main.cpp" -o "$local_obj"
+        $compile_include_args "$work/src/main.cpp" -o "$remote_obj"
+    g++ -std=c++17 -O2 -c $compile_include_args \
+        "$work/src/main.cpp" -o "$local_obj"
     cmp -s "$remote_obj" "$local_obj" || {
         echo "FAIL: real P50 object differs from local reference ($label)" >&2
         exit 1
