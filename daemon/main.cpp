@@ -112,6 +112,7 @@
 #include "p50_daemon_sidecar_adapter.h"
 #include "p50_completion_record.h"
 #include "p50_daemon_cache_dispatch.h"
+#include "p50_fsession_daemon_op.h"
 #include "p50_input_wait.h"
 #include "connection_provenance.h"
 #include "p50_source_arm_wait_lease.h"
@@ -675,6 +676,10 @@ public:
     }
 
     ~Client() {
+        if (fsession_control_fd >= 0) {
+            (void)::close(fsession_control_fd);
+            fsession_control_fd = -1;
+        }
         status = (Status) - 1;
         delete channel;
         channel = nullptr;
@@ -780,6 +785,11 @@ public:
     // projection above is only a state gate; these values are the authority
     // used for later CompileFile matching and teardown settlement.
     std::optional<P50SourceArmFields> p50_source_arm_fields;
+    /* S2: the daemon half of the distributed F-session operation for this
+       client's CACHE_SESSION, plus its dedicated authenticated control
+       relationship to the exact sidecar incarnation. */
+    std::unique_ptr<icecc::p50::fsession::DaemonFSessionOperation> fsession_op;
+    int fsession_control_fd = -1;
     std::optional<icecc::p50::sidecar::ReadyLease> p50_source_f_lease;
     // Retain the complete ACK, not just a compact lease projection.  The
     // later cache-session join must be derivable from the canonical arm plus
@@ -4974,7 +4984,8 @@ bool Daemon::configure_cache_adapter() noexcept
             || !exact_public_tcp_listener(tcp_listen_fd,
                                           static_cast<uint32_t>(daemon_port))) {
         log_error() << "cache sidecar requires the exact public TCP listener to be bound"
-                    << endl;
+                    << " (noremote=" << noremote << " port=" << daemon_port
+                    << " tcp_listen_fd=" << tcp_listen_fd << ")" << endl;
         return false;
     }
 
@@ -4992,7 +5003,7 @@ bool Daemon::configure_cache_adapter() noexcept
         config.expected_service_uid = config.expected_daemon_uid;
         config.expected_service_gid = config.expected_daemon_gid;
         config.public_listener_port = static_cast<uint32_t>(daemon_port);
-        config.readiness_timeout = std::chrono::milliseconds(1000);
+        config.readiness_timeout = std::chrono::milliseconds(5000);
         config.connect_timeout = std::chrono::milliseconds(1000);
         config.handoff_timeout = std::chrono::milliseconds(250);
         config.input_attachment_timeout = std::chrono::milliseconds(5000);
@@ -5157,6 +5168,7 @@ void Daemon::poll_cache_adapter() noexcept
     icecc::p50::advertisement::Update update;
     if (!cache_adapter_start_attempted) {
         cache_adapter_start_attempted = true;
+        trace() << "cache sidecar outer lifecycle engaged (scheduler session active)" << endl;
     }
     // This call only resets the adapter's per-daemon-turn quota and publishes
     // the current level once an incarnation is already in flight.  It invokes
@@ -5165,6 +5177,21 @@ void Daemon::poll_cache_adapter() noexcept
     // advanced exactly once after the single poll inventory below.
     (void)cache_adapter->outer_begin_turn(std::chrono::steady_clock::now(),
                                           &update);
+    {
+        static icecc::p50::daemon::AdapterState last_traced_state =
+            icecc::p50::daemon::AdapterState::Stopped;
+        static icecc::p50::sidecar::LifecycleState last_traced_lifecycle{};
+        const auto adapter_state = cache_adapter->state();
+        const auto lifecycle_state = cache_adapter->outer_lifecycle_state();
+        if (adapter_state != last_traced_state ||
+            !(lifecycle_state == last_traced_lifecycle)) {
+            trace() << "cache sidecar adapter state=" << int(adapter_state)
+                    << " lifecycle=" << int(static_cast<uint8_t>(lifecycle_state))
+                    << endl;
+            last_traced_state = adapter_state;
+            last_traced_lifecycle = lifecycle_state;
+        }
+    }
 
     // A sidecar withdrawal/replacement is an ownership boundary.  Invalidate
     // old WAIT owners before publishing any replacement advertisement or
@@ -8308,17 +8335,162 @@ bool Daemon::handle_cache_session(Client *client, Msg *msg)
         return false;
     }
 
-    // CACHE_SESSION still has no incremental public-session bridge in this
-    // seam.  Fail closed at the old wrapper boundary rather than invoking the
-    // synchronous Dispatcher::dispatch helper (which could hide poll/send/
-    // receive work and violate the one-action outer-loop quota).  The future
-    // session reducer must consume the same exact connection lease and
-    // sidecar identity before admitting bytes.
+    /* S2 F-session bridge: dispatch the exact clean-boundary descriptor to
+       the authenticated sidecar (bounded, one absolute deadline), then mint
+       the daemon half of the distributed F-session operation from the REAL
+       owner facts and stage its identity-complete frames on a dedicated
+       second relationship to the same incarnation. */
     (void)old_fd;
-    log_warning() << "CACHE_SESSION unavailable until incremental session reducer is installed"
-                  << endl;
-    handle_end(client, 121);
-    return false;
+    namespace fsn = icecc::p50::fsession;
+    if (client->status != Client::WAITP50INPUT ||
+        !client->p50_source_arm_fields.has_value() || cache_adapter == nullptr ||
+        !cache_adapter->authenticated() ||
+        cache_adapter->dispatcher() == nullptr) {
+        log_warning() << "CACHE_SESSION refused: no authenticated cache sidecar"
+                      << endl;
+        handle_end(client, 121);
+        return false;
+    }
+    const auto ready_lease = cache_adapter->outer_current_ready_lease();
+    if (!ready_lease.has_value() || !ready_lease->valid()) {
+        log_warning() << "CACHE_SESSION refused: no READY sidecar lease" << endl;
+        handle_end(client, 121);
+        return false;
+    }
+    const P50SourceArmFields& arm = *client->p50_source_arm_fields;
+    const auto outcome = cache_adapter->dispatcher()->dispatch(
+        *client->channel, client->channel->protocol,
+        static_cast<uint32_t>(Msg::CACHE_SESSION));
+    if (outcome.result != icecc::p50::daemon::CacheDispatchResult::Accepted ||
+        !outcome.handoff_acknowledged || !outcome.trailing_byte_barrier) {
+        log_warning() << "CACHE_SESSION handoff failed (result="
+                      << int(outcome.result) << ")" << endl;
+        handle_end(client, 121);
+        return false;
+    }
+
+    // The public descriptor is transferred; from here the sidecar owns the
+    // CacheWire stream. Mint the daemon F-session half from real owner facts.
+    fsn::FSessionOperationIdentity op_identity;
+    op_identity.daemon_launch_generation = daemon_generation;
+    op_identity.control_connection_generation = outcome.request.request_id;
+    op_identity.operation.sidecar_launch = {ready_lease->identity.generation,
+                                            ready_lease->identity.attempt};
+    op_identity.operation.role =
+        icecc::p50::daemon::P50SessionOperationRole::FSession;
+    op_identity.operation.operation_sequence = outcome.request.request_id;
+    op_identity.c_store_guid = {ready_lease->c_store_guid.bytes};
+    op_identity.f_store_guid = {ready_lease->f_store_guid.bytes};
+    op_identity.assignment_job = arm.wire_job_id;
+    op_identity.assignment_epoch = arm.assignment_epoch;
+    op_identity.assignment_nonce = arm.assignment_nonce;
+    op_identity.arm_observation = arm.source_request_id;
+    {
+        const auto clock = icecc::p50::sidecar::process_monotonic_clock_identity();
+        timespec now_ts{};
+        (void)::clock_gettime(CLOCK_MONOTONIC, &now_ts);
+        const int64_t now_ns =
+            int64_t(now_ts.tv_sec) * 1'000'000'000 + now_ts.tv_nsec;
+        const uint64_t remaining_msec =
+            client->p50_source_deadline_msec > monotonic_msec()
+                ? client->p50_source_deadline_msec - monotonic_msec()
+                : 1;
+        op_identity.deadline = {now_ns + int64_t(remaining_msec) * 1'000'000,
+                                clock.clock_domain_id, clock.time_namespace_id};
+    }
+    fsn::DaemonWaitLease::Facts wait_facts;
+    wait_facts.client_connection_generation =
+        client->connection_provenance.lease.connection_sequence;
+    wait_facts.compile_file_lease =
+        client->connection_provenance.lease.daemon_generation;
+    wait_facts.assignment_job = arm.wire_job_id;
+    wait_facts.assignment_epoch = arm.assignment_epoch;
+    wait_facts.assignment_nonce = arm.assignment_nonce;
+    wait_facts.arm_observation = arm.source_request_id;
+    wait_facts.wait_reservation = arm.source_request_id;
+    wait_facts.consumed_claim_capability = arm.logical_job != 0
+                                               ? arm.logical_job
+                                               : arm.wire_job_id;
+    wait_facts.deadline = op_identity.deadline;
+    auto fsession_op = fsn::DaemonFSessionOperation::mint(
+        op_identity, fsn::DaemonWaitLease(wait_facts));
+    if (!fsession_op.has_value()) {
+        log_warning() << "CACHE_SESSION F-session mint refused" << endl;
+        handle_end(client, 121);
+        return false;
+    }
+
+    // Dedicated control relationship: authenticated HELLO, then raw P5FS
+    // frames (the sidecar discriminates on the envelope magic post-HELLO).
+    const auto control_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+    icecc::p50::local::Status connect_status = icecc::p50::local::Status::Ok;
+    icecc::p50::local::Connection control =
+        icecc::p50::local::connect_unix_until(ready_lease->socket_path,
+                                              control_deadline, &connect_status);
+    bool control_ok = control.valid();
+    if (control_ok) {
+        const icecc::p50::local::Identity control_identity{
+            ready_lease->identity.generation, ready_lease->identity.attempt};
+        icecc::p50::local::CredentialExpectation expect_peer;
+        expect_peer.uid = ::geteuid();
+        expect_peer.gid = ::getegid();
+        control_ok =
+            control.verify_peer_credentials(expect_peer) ==
+                icecc::p50::local::Status::Ok &&
+            control.send_until(
+                icecc::p50::local::make_hello(
+                    icecc::p50::local::PeerRole::Daemon, control_identity),
+                control_deadline) == icecc::p50::local::Status::Ok;
+        if (control_ok) {
+            icecc::p50::local::Frame acknowledgement;
+            control_ok =
+                control.receive_until(acknowledgement, control_deadline) ==
+                    icecc::p50::local::Status::Ok &&
+                icecc::p50::local::validate_handshake(
+                    acknowledgement, icecc::p50::local::MessageType::HelloAck,
+                    icecc::p50::local::PeerRole::Sidecar, control_identity) ==
+                    icecc::p50::local::Status::Ok;
+        }
+    }
+    if (!control_ok) {
+        log_warning() << "CACHE_SESSION F-session control connect failed" << endl;
+        handle_end(client, 121);
+        return false;
+    }
+    // Flush every staged frame (OperationOffer now; more as the op advances).
+    bool frames_ok = true;
+    for (uint64_t seq : fsession_op->outbound().pending_sequences()) {
+        const auto* slot = fsession_op->outbound().find(seq);
+        size_t off = slot->write_offset;
+        while (frames_ok && off < slot->canonical_bytes.size()) {
+            const ssize_t wrote =
+                ::send(control.native_handle(), slot->canonical_bytes.data() + off,
+                       slot->canonical_bytes.size() - off, MSG_NOSIGNAL);
+            if (wrote <= 0) {
+                if (wrote < 0 && errno == EINTR)
+                    continue;
+                frames_ok = false;
+                break;
+            }
+            off += size_t(wrote);
+            (void)fsession_op->outbound().record_written(seq, size_t(wrote));
+        }
+    }
+    if (!frames_ok) {
+        log_warning() << "CACHE_SESSION F-session offer flush failed" << endl;
+        handle_end(client, 121);
+        return false;
+    }
+    client->fsession_control_fd = ::dup(control.native_handle());
+    client->fsession_op = std::make_unique<fsn::DaemonFSessionOperation>(
+        std::move(*fsession_op));
+    trace() << "CACHE_SESSION dispatched: F-session operation "
+            << op_identity.operation.operation_sequence
+            << " offered to sidecar (gen "
+            << ready_lease->identity.generation << "/"
+            << ready_lease->identity.attempt << ")" << endl;
+    return true;
 }
 
 bool Daemon::handle_p50_source_arm(Client *client, P50SourceArmMsg *msg)
@@ -8860,6 +9032,14 @@ void Daemon::answer_client_requests()
     if (buffered_client_pending) {
         poll_timeout_msec = 0;
     }
+    /* An armed sidecar launch/abort plan advances exactly one bounded phase
+       per turn; grant it zero-timeout turns so the finite plan reaches fork
+       (or completes its abort) within the launch deadline instead of
+       expiring between sleepy polls. */
+    if (cache_adapter != nullptr && cache_adapter_start_attempted &&
+        cache_adapter->outer_launch_plan_active()) {
+        poll_timeout_msec = 0;
+    }
 
     int ret = poll(pollfds.data(), pollfds.size(), poll_timeout_msec);
 
@@ -8874,6 +9054,19 @@ void Daemon::answer_client_requests()
     // revents so an expired owner cannot consume a late frame.
     if (expire_p50_source_waiters()) {
         return;
+    }
+    if (cache_adapter != nullptr && cache_adapter_start_attempted) {
+        static unsigned advance_trace_budget = 24;
+        if (advance_trace_budget > 0) {
+            --advance_trace_budget;
+            trace() << "cache lifecycle turn: action_taken="
+                    << cache_adapter->outer_action_taken() << " lifecycle="
+                    << int(static_cast<uint8_t>(
+                           cache_adapter->outer_lifecycle_state()))
+                    << " launch_phase=" << cache_adapter->outer_launch_phase_diag()
+                    << " launch_failed=" << cache_adapter->outer_launch_failed_diag()
+                    << endl;
+        }
     }
     if (cache_adapter != nullptr && cache_adapter_start_attempted &&
         !cache_adapter->outer_action_taken()) {

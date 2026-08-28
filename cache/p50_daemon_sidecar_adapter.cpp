@@ -1511,6 +1511,9 @@ bool DaemonSidecarAdapter::outer_advance_launch_step() noexcept
         return true;
     }
     case OuterLaunchPhase::Fork: {
+        // Production diagnostics: the child's stderr lands in the attempt
+        // directory so a launch/readiness failure is attributable.
+        outer_service_error_path_ = attempt_directory_ + "/service.err";
         const pid_t child = ::fork();
         if (child < 0) {
             if (errno == EINTR)
@@ -1540,6 +1543,15 @@ bool DaemonSidecarAdapter::outer_advance_launch_step() noexcept
             if (!set_cloexec(outer_launch_ready_write_fd_, false) ||
                 !set_cloexec(outer_launch_listener_fd_, false))
                 _exit(127);
+            {
+                const int error_fd = ::open(outer_service_error_path_.c_str(),
+                                            O_WRONLY | O_CREAT | O_TRUNC, 0600);
+                if (error_fd >= 0) {
+                    (void)::dup2(error_fd, 2);
+                    if (error_fd != 2)
+                        (void)::close(error_fd);
+                }
+            }
             ::execve(config_.executable.c_str(), outer_launch_argv_.data(),
                      outer_launch_environment_.data());
             const int error = errno;
@@ -2378,6 +2390,13 @@ void DaemonSidecarAdapter::outer_apply_action(
     switch (action.action) {
     case sidecar::LifecycleAction::LaunchPrepared:
         if (!outer_prepare_launch(action.identity, now)) {
+            std::fprintf(stderr,
+                         "cache sidecar launch preparation refused"
+                         " (identity_valid=%d started=%d phase=%d pid=%ld"
+                         " reaper=%d)\n",
+                         int(action.identity.valid()),
+                         int(outer_launch_started_), int(outer_launch_phase_),
+                         long(outer_pid_), int(outer_reaper_ != nullptr));
             outer_launch_failed_ = true;
             // A failed setup may have created only the attempt directory, or
             // may have failed before owning any pathname at all.  Never arm

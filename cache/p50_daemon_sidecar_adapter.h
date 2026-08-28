@@ -211,6 +211,22 @@ public:
     // never substitutes for this proof.
     [[nodiscard]] bool outer_shutdown_complete() const noexcept;
     [[nodiscard]] bool outer_action_taken() const noexcept { return outer_action_taken_; }
+    // True while a launch/abort plan is mid-flight. The daemon outer loop
+    // must grant zero-timeout turns until the plan completes: each turn
+    // performs exactly one bounded action, and the plan is finite (~30
+    // phases), so this is bounded incremental progress -- without it the
+    // one-second launch deadline expires before the one-phase-per-poll-turn
+    // plan can reach fork.
+    [[nodiscard]] bool outer_launch_plan_active() const noexcept {
+        return outer_launch_phase_ != 0;
+    }
+    // Diagnostic accessors (trace-only).
+    [[nodiscard]] int outer_launch_phase_diag() const noexcept {
+        return int(outer_launch_phase_);
+    }
+    [[nodiscard]] bool outer_launch_failed_diag() const noexcept {
+        return outer_launch_failed_;
+    }
     [[nodiscard]] const std::optional<InputLifecycleResult>&
     outer_last_input_lifecycle_result() const noexcept {
         return outer_last_input_lifecycle_result_;
@@ -323,6 +339,7 @@ private:
     PublicListenerObservation public_listener_{};
     std::shared_ptr<sidecar::LaunchIdentityAllocator> launch_identities_;
     std::unique_ptr<CacheSessionDispatcher> dispatcher_;
+    std::string outer_service_error_path_;
     advertisement::Controller controller_;
     std::string socket_path_;
     std::string attempt_directory_;
