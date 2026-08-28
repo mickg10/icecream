@@ -1,10 +1,10 @@
 #!/bin/sh
-# Real all-P50 C1F1 networked ZSTD_TU compile gate.
+# Real all-P50 C1F1 networked ZSTD_ROUTE compile gate.
 #
 # Once p50compilee2e-source.sh is green this starts the actual built
 # scheduler, one actual iceccd F, one actual iceccd C, and the actual
 # icecc-cache-service owned by the daemon's sidecar adapter. The compiler
-# invocation is required to produce positive ZSTD_TU evidence and a
+# invocation is required to produce positive ZSTD_ROUTE evidence and a
 # byte-identical local reference. No fake peer or legacy FileChunk fallback
 # is accepted.
 set -eu
@@ -86,8 +86,12 @@ chmod 1777 "$work/envs-f" "$work/envs-c"
 chmod 0700 "$work/cache-runtime-f" "$work/home"
 HOME="$work/home"
 export HOME
-port_sched=$((22000 + ($$ % 1000)))
-port_worker=$((23000 + ($$ % 1000)))
+port_sched=${ICECC_P50_C1F1_SCHED_PORT:-$((22000 + ($$ % 1000)))}
+port_worker=${ICECC_P50_C1F1_WORKER_PORT:-$((23000 + ($$ % 1000)))}
+test "$port_sched" != "$port_worker" || {
+    echo "FAIL: scheduler and worker ports must be distinct" >&2
+    exit 1
+}
 network="p50c1f1-$$"
 
 printf '%s\n' \
@@ -107,6 +111,29 @@ test -n "$envtar" || {
     exit 1
 }
 
+# A root container still runs the production daemon's normal privilege drop.
+# Let an explicit test account own the private tree so the daemon can create
+# its log and sidecar runtime files after that drop.  No account is selected
+# by default, preserving the ordinary host invocation.
+set --
+if test -n "${ICECC_TEST_DAEMON_UID:-}"; then
+    daemon_gid=${ICECC_TEST_DAEMON_GID:-$ICECC_TEST_DAEMON_UID}
+    chown -R "$ICECC_TEST_DAEMON_UID:$daemon_gid" "$work"
+    set -- -u "$ICECC_TEST_DAEMON_UID"
+fi
+if test -n "${ICECC_P50_C1F1_WORKER_INTERFACE:-}"; then
+    set -- "$@" -i "$ICECC_P50_C1F1_WORKER_INTERFACE"
+fi
+
+run_client_with_timeout() {
+    if test -n "${ICECC_TEST_DAEMON_UID:-}"; then
+        timeout "$timeout_s" runuser -u "$ICECC_TEST_DAEMON_UID" -- \
+            "$build/client/icecc" "$@"
+    else
+        timeout "$timeout_s" "$build/client/icecc" "$@"
+    fi
+}
+
 "$build/scheduler/icecc-scheduler" -p "$port_sched" -n "$network" \
     --assignment-fence-mode strict-nonce -l "$work/scheduler.log" -vvv &
 sched_pid=$!
@@ -119,7 +146,7 @@ kill -0 "$sched_pid" 2>/dev/null || {
 # This is the only F. The daemon itself must supervise and expose the actual
 # cache service required by the P50 path; the harness never starts a fake peer.
 ICECC_TEST_SOCKET="$work/worker.sock" ICECC_P50_C1F1_REQUIRED=1 \
-    "$build/daemon/iceccd" -p "$port_worker" -m 1 \
+    "$build/daemon/iceccd" "$@" -p "$port_worker" -m 1 \
     -s "127.0.0.1:$port_sched" -n "$network" -N p50-f \
     -b "$work/envs-f" -l "$work/f.log" -vvv \
     --cache-service "$build/cache/icecc-cache-service" \
@@ -127,7 +154,7 @@ ICECC_TEST_SOCKET="$work/worker.sock" ICECC_P50_C1F1_REQUIRED=1 \
 worker_pid=$!
 
 ICECC_TEST_SOCKET="$work/client.sock" ICECC_P50_C1F1_REQUIRED=1 \
-    "$build/daemon/iceccd" --no-remote -m 0 \
+    "$build/daemon/iceccd" "$@" --no-remote -m 0 \
     -s "127.0.0.1:$port_sched" -n "$network" -N p50-c \
     -b "$work/envs-c" -l "$work/c.log" -vvv &
 client_pid=$!
@@ -183,7 +210,7 @@ ICECC_TEST_SOCKET="$work/client.sock" ICECC_TEST_REMOTEBUILD=1 \
     ICECC_VERSION="$envtar" ICECC_P50_C1F1_REQUIRED=1 \
     ICECC_PREFERRED_HOST=p50-f \
     ICECC_DEBUG=debug ICECC_LOGFILE="$work/client-compile.log" \
-    timeout "$timeout_s" "$build/client/icecc" g++ -std=c++17 -O2 -c \
+    run_client_with_timeout g++ -std=c++17 -O2 -c \
     "$work/src/main.cpp" -o "$remote_obj"
 g++ -std=c++17 -O2 -c "$work/src/main.cpp" -o "$local_obj"
 
@@ -193,13 +220,13 @@ cmp -s "$remote_obj" "$local_obj" || {
 }
 
 # Positive evidence is mandatory. Absence of a local marker is not enough:
-# the route must identify ZSTD_TU and cache-session handoff.  Legacy FileChunk
+# the route must identify ZSTD_ROUTE and cache-session handoff.  Legacy FileChunk
 # remains correct for environment upload and object return, so the negative
 # evidence below is deliberately limited to the source-stream and local/client
 # fallback markers.
-grep -E 'ZSTD_TU|CACHE_SESSION' "$work/client-compile.log" "$work/c.log" \
+grep -E 'ZSTD_ROUTE|CACHE_SESSION' "$work/client-compile.log" "$work/c.log" \
     "$work/f.log" >/dev/null || {
-    echo "FAIL: no positive ZSTD_TU/CACHE_SESSION wire evidence" >&2
+    echo "FAIL: no positive ZSTD_ROUTE/CACHE_SESSION wire evidence" >&2
     exit 1
 }
 if grep -E 'write_fd_to_server from cpp|write_fd_to_server preprocessed|building myself|building_local|local build forced|client_exception|fallback_local' \
@@ -208,4 +235,4 @@ if grep -E 'write_fd_to_server from cpp|write_fd_to_server preprocessed|building
     exit 1
 fi
 
-echo "PASS: all-P50 C1F1 ZSTD_TU compile is remote and byte-identical"
+echo "PASS: all-P50 C1F1 ZSTD_ROUTE compile is remote and byte-identical"

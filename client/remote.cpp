@@ -821,6 +821,10 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
             const std::optional<icecc::p50::ProfileId> p50_profile = p50_input
                 ? icecc::p50::p50_zstd_selected_profile(*usecs, cserver->protocol)
                 : std::nullopt;
+            const char *const p50_profile_name =
+                p50_profile == icecc::p50::ProfileId::Z3_LONG
+                    ? "ZSTD_ROUTE"
+                    : "ZSTD_TU";
             p50_input = p50_profile.has_value();
             if (getenv("ICECC_P50_C1F1_REQUIRED") != nullptr && !p50_input)
                 throw remote_error(
@@ -853,17 +857,22 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                 const std::optional<CompileInputIdentity> identity =
                     icecc::p50::bind_compile_input(job, c_store_guid, transfer);
                 if (!identity.has_value()) {
-                    log_warning() << "ZSTD_TU cache source transfer failed closed (status "
+                    log_warning() << p50_profile_name
+                                  << " cache source transfer failed closed (status "
                                   << static_cast<unsigned>(transfer.status)
                                   << ", attempts "
                                   << static_cast<unsigned>(transfer.attempts)
+                                  << (transfer.terminal_error.has_value()
+                                      ? ", terminal=" + transfer.terminal_error->detail
+                                      : std::string{})
                                   << ")" << endl;
                     throw remote_error(
                         106,
                         "Error 106 - P50 cache source transfer did not commit exactly");
                 }
                 job.setCompileInputIdentity(*identity);
-                trace() << "ZSTD_TU source committed for P50 CompileFile: "
+                trace() << p50_profile_name
+                        << " source committed for P50 CompileFile: "
                         << identity->raw_bytes << " exact bytes, TU sequence "
                         << identity->tu_seq << endl;
             } else {

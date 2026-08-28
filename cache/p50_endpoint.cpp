@@ -77,6 +77,11 @@ void validate_caps(const EndpointCaps& caps) {
     validate_zstd_tu_limits(caps.zstd);
     if (caps.profile != ProfileId::ZSTD_TU && caps.profile != ProfileId::Z3_LONG)
         throw std::invalid_argument("endpoint profile is unsupported");
+    if (caps.supported_profiles == 0 ||
+        (caps.supported_profiles & ~kOperationalProfileMask) != 0)
+        throw std::invalid_argument("endpoint supported profile mask is unsupported");
+    if ((caps.supported_profiles & profile_bit(caps.profile)) == 0)
+        throw std::invalid_argument("endpoint profile is not supported");
 }
 
 CompletionStamp with_operation(CompletionStamp stamp, AsyncOperationKind operation) {
@@ -3050,7 +3055,7 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
         reply_cap = std::min(reply_cap, hello.limits.max_frame_payload);
         const SessionSelection selection =
             negotiate_session(hello, kProtocolVersion, kProtocolVersion,
-                              profile_bit(impl_->caps.profile), impl_->caps.wire);
+                              impl_->caps.supported_profiles, impl_->caps.wire);
         SessionState state = impl_->stage(session, hello.c_store_guid, selection);
         co_await async_write_message(socket, state, selection.limits.max_frame_payload,
                                      impl_->stamp(session, AsyncOperationKind::WriteFragment),

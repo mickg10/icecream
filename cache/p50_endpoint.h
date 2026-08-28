@@ -35,6 +35,11 @@ struct EndpointCaps {
     SessionLimits wire{};
     ZstdTuLimits zstd{uint64_t{64} << 20, uint64_t{2} << 30};
     ProfileId profile = ProfileId::ZSTD_TU;
+    // C selects one profile for its preparation authority; F advertises the
+    // runnable source profiles it can negotiate on each session.  Keeping
+    // these distinct permits the READY capability mask to remain truthful
+    // while each route still has one concrete profile.
+    uint32_t supported_profiles = kOperationalProfileMask;
     auto operator<=>(const EndpointCaps&) const = default;
 };
 
