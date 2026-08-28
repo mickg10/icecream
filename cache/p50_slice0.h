@@ -326,6 +326,9 @@ public:
         const PreparedTUPtr& prepared,
         P29RootMode root_mode = P29RootMode::RouteHistory,
         std::span<const uint8_t> residual = {}, bool residual_body = false);
+    // Bytes not covered by this route's acknowledged immutable line objects.
+    // This is the only source admitted to the residual-group codec.
+    std::vector<uint8_t> residual_input(const PreparedTUPtr& prepared) const;
     std::vector<ImmutableObject> build_fill(const Need& need) const;
     void accept_commit(const TxCommit& committed,
                        ActionType action = ActionType::COMMIT_ACCEPTED);
@@ -350,6 +353,7 @@ private:
     Digest128 state_digest_{};
     std::unique_ptr<p29::OnlineS1> matcher_;
     std::optional<CActiveTx> active_;
+    std::set<Key64> acknowledged_objects_;
     ActionTrace* trace_ = nullptr;
 };
 

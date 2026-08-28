@@ -1,5 +1,7 @@
 #pragma once
 
+#include <span>
+
 // CW_P29_BSC_Z3_M64 residual-group transport.  The reviewed implementation is
 // capability/grouprlz/residual_group_codec.h (SHA-256
 // 9f4d721e1495987bc1d5f207e23d31a76fab9b780d5610832927df8f398895f9).
@@ -81,6 +83,48 @@ public:
 inline const char* kind_name(Kind kind) {
     return kind == Kind::Zstd3 ? "zstd3" : kind == Kind::Bsc ? "bsc" : "zstd10";
 }
+
 }  // namespace residual_group
 
 #endif
+
+namespace residual_group {
+
+// The line/Region interner carries deterministic newline framing in the
+// immutable object structure. Only line payload bytes are residual data.
+inline Bytes line_payload(std::span<const std::uint8_t> source) {
+    Bytes result;
+    result.reserve(source.size());
+    for (std::uint8_t byte : source)
+        if (byte != '\n') result.push_back(byte);
+    return result;
+}
+
+inline Bytes reconstruct_line_payload(std::span<const std::uint8_t> template_bytes,
+                                      std::span<const std::uint8_t> payload) {
+    Bytes result;
+    result.reserve(template_bytes.size());
+    std::size_t source_begin = 0;
+    std::size_t payload_offset = 0;
+    for (std::size_t at = 0; at < template_bytes.size(); ++at) {
+        if (template_bytes[at] != '\n') continue;
+        const std::size_t content_size = at - source_begin;
+        if (content_size > payload.size() - payload_offset)
+            fail("line residual ended before object structure");
+        result.insert(result.end(), payload.begin() + payload_offset,
+                      payload.begin() + payload_offset + content_size);
+        payload_offset += content_size;
+        result.push_back('\n');
+        source_begin = at + 1;
+    }
+    const std::size_t content_size = template_bytes.size() - source_begin;
+    if (content_size > payload.size() - payload_offset)
+        fail("line residual ended before final object structure");
+    result.insert(result.end(), payload.begin() + payload_offset,
+                  payload.begin() + payload_offset + content_size);
+    payload_offset += content_size;
+    if (payload_offset != payload.size()) fail("line residual has trailing bytes");
+    return result;
+}
+
+}  // namespace residual_group

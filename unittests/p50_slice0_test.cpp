@@ -281,9 +281,14 @@ void test_p29_current_tu_residual_and_block_controls() {
 
     residual_group::Codec codec;
     residual_group::Kind selected = residual_group::Kind::Zstd3;
-    const std::vector<uint8_t> residual = codec.encode(exact.data(), exact.size(), &selected);
+    const std::vector<uint8_t> residual_input = residual_group::line_payload(exact);
+    require(residual_input != exact,
+            "P29 residual unexpectedly contains the complete raw TU");
+    const std::vector<uint8_t> residual =
+        codec.encode(residual_input.data(), residual_input.size(), &selected);
     const auto decoded = codec.decode(residual.data(), residual.size());
-    require(decoded.wire_bytes == residual.size() && decoded.raw == exact,
+    require(decoded.wire_bytes == residual.size() && decoded.raw == residual_input &&
+                residual_group::reconstruct_line_payload(exact, decoded.raw) == exact,
             "P29 residual group did not round-trip the current TU");
     require(selected == residual_group::Kind::Zstd3 || selected == residual_group::Kind::Bsc ||
                 selected == residual_group::Kind::Zstd10,
@@ -300,8 +305,13 @@ void test_p29_current_tu_residual_and_block_controls() {
     finish(pair, first_active);
 
     const PreparedTUPtr second = pair.c.prepare_from_regions(input);
+    const std::vector<uint8_t> second_residual_input = pair.route.residual_input(second);
+    require(second_residual_input.empty(),
+            "P29 RouteHistory did not recognize acknowledged repeated lines");
+    const std::vector<uint8_t> second_residual =
+        codec.encode(second_residual_input.data(), second_residual_input.size(), &selected);
     const CActiveTx& second_active = pair.route.begin(
-        second, P29RootMode::RouteHistory, residual, true);
+        second, P29RootMode::RouteHistory, second_residual, true);
     require(second_active.block_use_count > 0 &&
                 std::any_of(second_active.root.begin(), second_active.root.end(),
                             [](Key64 key) { return key.type() == ObjectType::Block; }),

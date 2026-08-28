@@ -1018,10 +1018,15 @@ PreparedTuHandle P50PreparationAuthority::prepare(PrepareRequestKey request,
             const PreparedTUPtr p29_prepared = impl_->p29_authority->prepare_from_regions(regions);
             residual_group::Codec residual_codec;
             residual_group::Kind residual_kind = residual_group::Kind::Zstd3;
+            const std::vector<uint8_t> residual_input =
+                impl_->p29_route->residual_input(p29_prepared);
             const std::vector<uint8_t> residual = residual_codec.encode(
-                exact_input.data(), exact_input.size(), &residual_kind);
+                residual_input.data(), residual_input.size(), &residual_kind);
+            const P29RootMode root_mode = impl_->p29_route->next_rel_seq().value == 0
+                                              ? P29RootMode::HistoryIndependent
+                                              : P29RootMode::RouteHistory;
             const CActiveTx& active = impl_->p29_route->begin(
-                p29_prepared, P29RootMode::HistoryIndependent, residual, true);
+                p29_prepared, root_mode, residual, true);
             p29_active_started = true;
             std::vector<FillRecord> fills;
             fills.reserve(active.manifest.size());

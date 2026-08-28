@@ -62,6 +62,96 @@ P29ResidualBody decode_p29_residual_body(std::span<const uint8_t> bytes) {
     return result;
 }
 
+void append_unacknowledged_line_payload(
+    const CObjectArena& arena, std::span<const Key64> regions,
+    const std::set<Key64>& acknowledged, std::vector<uint8_t>& output) {
+    for (Key64 region_key : regions) {
+        const auto* region = std::get_if<ChildrenPayload>(&arena.object(region_key).payload);
+        if (!region || region->children.size() != 1)
+            throw std::logic_error("P29 Region does not contain exactly one Line");
+        const Key64 line_key = region->children.front();
+        if (acknowledged.contains(line_key)) continue;
+        const auto* line = std::get_if<BytesPayload>(&arena.object(line_key).payload);
+        if (!line) throw std::logic_error("P29 Region child is not a Line payload");
+        const std::vector<uint8_t> payload =
+            residual_group::line_payload(line->bytes);
+        output.insert(output.end(), payload.begin(), payload.end());
+    }
+}
+
+std::vector<uint8_t> residual_for_root(
+    const ImmutableObjectStore& objects, std::span<const Key64> roots,
+    const std::set<Key64>& acknowledged) {
+    std::vector<uint8_t> result;
+    std::function<void(Key64)> visit = [&](Key64 key) {
+        const ImmutableObject& object = *objects.find(key);
+        if (object.key.type() == ObjectType::Region) {
+            const auto* region = std::get_if<ChildrenPayload>(&object.payload);
+            if (!region || region->children.size() != 1)
+                throw std::logic_error("P29 F Region does not contain one Line");
+            const Key64 line_key = region->children.front();
+            if (acknowledged.contains(line_key)) return;
+            const auto* line = std::get_if<BytesPayload>(&objects.find(line_key)->payload);
+            if (!line) throw std::logic_error("P29 F Region child is not a Line payload");
+            const std::vector<uint8_t> payload = residual_group::line_payload(line->bytes);
+            result.insert(result.end(), payload.begin(), payload.end());
+        } else if (object.key.type() == ObjectType::Block) {
+            const auto* block = std::get_if<ChildrenPayload>(&object.payload);
+            if (!block) throw std::logic_error("P29 F Block is not a child object");
+            for (Key64 child : block->children) visit(child);
+        } else {
+            throw std::logic_error("P29 F root is not a Region or Block");
+        }
+    };
+    for (Key64 root : roots) visit(root);
+    return result;
+}
+
+std::vector<uint8_t> reconstruct_root_with_residual(
+    const ImmutableObjectStore& objects, std::span<const Key64> roots,
+    const std::set<Key64>& acknowledged, std::span<const uint8_t> residual) {
+    std::vector<uint8_t> result;
+    size_t residual_offset = 0;
+    std::function<void(Key64)> visit = [&](Key64 key) {
+        const ImmutableObject* object = objects.find(key);
+        if (!object) throw std::logic_error("P29 F root references an absent object");
+        if (object->key.type() == ObjectType::Block) {
+            const auto* block = std::get_if<ChildrenPayload>(&object->payload);
+            if (!block) throw std::logic_error("P29 F Block is not a child object");
+            for (Key64 child : block->children) visit(child);
+            return;
+        }
+        if (object->key.type() != ObjectType::Region)
+            throw std::logic_error("P29 F root is not a Region or Block");
+        const auto* region = std::get_if<ChildrenPayload>(&object->payload);
+        if (!region || region->children.size() != 1)
+            throw std::logic_error("P29 F Region does not contain one Line");
+        const Key64 line_key = region->children.front();
+        const ImmutableObject* line_object = objects.find(line_key);
+        const auto* line = line_object
+                               ? std::get_if<BytesPayload>(&line_object->payload)
+                               : nullptr;
+        if (!line) throw std::logic_error("P29 F Region child is not a Line payload");
+        if (acknowledged.contains(line_key)) {
+            result.insert(result.end(), line->bytes.begin(), line->bytes.end());
+            return;
+        }
+        for (uint8_t byte : line->bytes) {
+            if (byte == '\n') {
+                result.push_back(byte);
+            } else {
+                if (residual_offset == residual.size())
+                    throw std::logic_error("P29 residual ended during reconstruction");
+                result.push_back(residual[residual_offset++]);
+            }
+        }
+    };
+    for (Key64 root : roots) visit(root);
+    if (residual_offset != residual.size())
+        throw std::logic_error("P29 residual has trailing bytes after reconstruction");
+    return result;
+}
+
 bool byte_object(ObjectType type) {
     return type == ObjectType::Atom || type == ObjectType::Line ||
            type == ObjectType::Material || type == ObjectType::Path ||
@@ -892,6 +982,14 @@ CRoute::CRoute(CAuthority& authority, FStoreGuid f_store_guid,
 
 CRoute::~CRoute() = default;
 
+std::vector<uint8_t> CRoute::residual_input(const PreparedTUPtr& prepared) const {
+    if (!prepared) throw std::invalid_argument("cannot inspect a null PreparedTU");
+    std::vector<uint8_t> result;
+    append_unacknowledged_line_payload(authority_.arena(), prepared->regions,
+                                       acknowledged_objects_, result);
+    return result;
+}
+
 const CActiveTx& CRoute::begin(const PreparedTUPtr& prepared,
                               P29RootMode root_mode,
                               std::span<const uint8_t> residual,
@@ -1000,6 +1098,7 @@ void CRoute::accept_commit(const TxCommit& committed, ActionType action) {
         throw std::invalid_argument("invalid commit action");
     if (!same_commit(committed, *active_))
         throw std::logic_error("TX_COMMIT does not close C's ACTIVE_TX");
+    acknowledged_objects_.insert(active_->manifest.begin(), active_->manifest.end());
     matcher_->commit();
     state_digest_ = committed.post_state_digest;
     record(action, *active_);
@@ -1022,6 +1121,7 @@ void CRoute::reset_history(FStoreGuid f_store_guid, HistoryNonce history_nonce) 
     history_nonce_ = history_nonce;
     next_rel_seq_ = RelSeq{0};
     state_digest_ = initial_route_digest(authority_.guid(), history_nonce_);
+    acknowledged_objects_.clear();
     matcher_ = std::make_unique<p29::OnlineS1>(authority_.s1_config(),
                                                authority_.block_catalogue());
 }
@@ -1037,6 +1137,7 @@ struct FStore::Namespace {
         bool body_complete = false;
         std::vector<Key64> manifest;
         std::vector<Key64> root;
+        std::set<Key64> acknowledged_before;
         std::set<Key64> requested;
         std::set<Key64> remaining;
         FillStreamDecoder partial_fill;
@@ -1216,7 +1317,10 @@ void FStore::append_component(SessionHandle session, bool dict,
                 pending.manifest.end())
             throw std::logic_error("DICT manifest is not an exact sorted set");
         for (Key64 key : pending.manifest)
-            if (!space.objects.contains(key)) pending.requested.insert(key);
+            if (space.objects.contains(key))
+                pending.acknowledged_before.insert(key);
+            else
+                pending.requested.insert(key);
         pending.remaining = pending.requested;
         record(ActionType::DICT_COMPLETE, session, &pending.begin);
         const std::vector<Key64> exact_need(pending.requested.begin(),
@@ -1335,10 +1439,21 @@ std::vector<uint8_t> FStore::materialize_and_verify(SessionHandle session) {
                 codec.decode(pending.residual.data(), pending.residual.size());
             if (frame.wire_bytes != pending.residual.size())
                 throw std::logic_error("P29 residual frame has trailing bytes");
-            result = std::move(frame.raw);
+            const std::vector<uint8_t> expected_residual = residual_for_root(
+                space.objects, pending.root, pending.acknowledged_before);
+            if (frame.raw != expected_residual)
+                throw std::logic_error("P29 residual differs from Root/Block line payload");
+            result = reconstruct_root_with_residual(
+                space.objects, pending.root, pending.acknowledged_before, frame.raw);
         }
-        if (result != object_result)
-            throw std::logic_error("P29 residual differs from immutable object closure");
+        if (pending.residual.empty()) {
+            const std::vector<uint8_t> expected_residual = residual_for_root(
+                space.objects, pending.root, pending.acknowledged_before);
+            if (!expected_residual.empty())
+                throw std::logic_error("P29 nonempty line payload has no residual frame");
+            result = reconstruct_root_with_residual(
+                space.objects, pending.root, pending.acknowledged_before, {});
+        }
     }
     if (result.size() != pending.begin.raw_bytes ||
         digest128(result) != pending.begin.raw_digest)
