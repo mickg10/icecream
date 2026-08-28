@@ -117,6 +117,8 @@ class FourHostRunnerTests(unittest.TestCase):
         self.assertIn('-v "$work:/probe"', runner.START_WORKER_SCRIPT)
         self.assertIn('--entrypoint /bin/sh "$image" /probe/wrapper.sh', runner.START_WORKER_SCRIPT)
         self.assertNotIn('--entrypoint /work/wrapper.sh', runner.START_WORKER_SCRIPT)
+        self.assertIn('cp -a "$root/." "$work/role/"', runner.START_WORKER_SCRIPT)
+        self.assertNotIn('-v "$root:/role:ro"', runner.START_WORKER_SCRIPT)
         self.assertIn('-v "$work:/probe"', runner.START_SCHEDULER_SCRIPT)
 
 

@@ -323,16 +323,18 @@ set -eu
 root=$1; image=$2; container=$3; port=$4; network=$5; uid=$6; gid=$7
 work=$(mktemp -d /tmp/s4-p50-fourhost-scheduler.XXXXXX)
 chmod 1777 "$work"
+mkdir -p "$work/role"
+cp -a "$root/." "$work/role/"
 cat >"$work/wrapper.sh" <<'WRAPPER'
 #!/bin/sh
 set -eu
 printf 'icecc:x:%s:%s:icecc:/nonexistent:/usr/sbin/nologin\n' "$S4_UID" "$S4_GID" >>/etc/passwd
 printf 'icecc:x:%s:\n' "$S4_GID" >>/etc/group
-exec /role/scheduler/icecc-scheduler "$@"
+exec /probe/role/scheduler/icecc-scheduler "$@"
 WRAPPER
 chmod 755 "$work/wrapper.sh"
 docker run -d --name "$container" --network host --user 0 \
-  -v "$root:/role:ro" -v "$work:/probe" -e S4_UID="$uid" -e S4_GID="$gid" \
+  -v "$work:/probe" -e S4_UID="$uid" -e S4_GID="$gid" \
   --entrypoint /bin/sh "$image" /probe/wrapper.sh -p "$port" -n "$network" \
   --assignment-fence-mode strict-nonce -l /probe/scheduler.log -vvv \
   >"$work/container.id"
@@ -348,21 +350,23 @@ root=$1; image=$2; container=$3; scheduler=$4; sport=$5; network=$6
 name=$7; port=$8; uid=$9; gid=${10}
 work=$(mktemp -d /tmp/s4-p50-fourhost-worker.XXXXXX)
 mkdir -p "$work/envs" "$work/cache-runtime"
+mkdir -p "$work/role"
+cp -a "$root/." "$work/role/"
 chmod 1777 "$work/envs"; chmod 700 "$work/cache-runtime"
 cat >"$work/wrapper.sh" <<'WRAPPER'
 #!/bin/sh
 set -eu
 printf 'icecc:x:%s:%s:icecc:/nonexistent:/usr/sbin/nologin\n' "$S4_UID" "$S4_GID" >>/etc/passwd
 printf 'icecc:x:%s:\n' "$S4_GID" >>/etc/group
-exec /role/daemon/iceccd "$@"
+exec /probe/role/daemon/iceccd "$@"
 WRAPPER
 chmod 755 "$work/wrapper.sh"
 docker run -d --name "$container" --network host --user 0 --cap-add=SYS_CHROOT \
-  -v "$root:/role:ro" -v "$work:/probe" -e S4_UID="$uid" -e S4_GID="$gid" \
+  -v "$work:/probe" -e S4_UID="$uid" -e S4_GID="$gid" \
   -e ICECC_TEST_SOCKET=/probe/f.sock --entrypoint /bin/sh "$image" /probe/wrapper.sh \
   -p "$port" -m 2 -s "$scheduler:$sport" -n "$network" -N "$name" \
   -b /probe/envs -l /probe/fdaemon.log -vvv \
-  --cache-service /role/cache/icecc-cache-service \
+  --cache-service /probe/role/cache/icecc-cache-service \
   --cache-runtime-dir /probe/cache-runtime >"$work/container.id"
 sleep 2
 [ "$(docker inspect --format '{{.State.Running}}' "$container")" = true ] || exit 77
