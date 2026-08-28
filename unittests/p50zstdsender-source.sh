@@ -19,6 +19,7 @@ fi
 grep -q 'attempt <= 2' "$sender"
 grep -q 'RetryExhausted' "$sender"
 grep -q 'PreparedTuHandle prepared' "$sender"
+grep -q 'completed_for(request' "$sender"
 
 # Compile and run a deletion mutant which removes the second attempt.  The
 # focused test's attempts==2 assertion must redden it, proving the retry gate
@@ -47,3 +48,25 @@ if "$work/mutant" >/dev/null 2>&1; then
     exit 1
 fi
 echo 'ok - deleting the exact retry reddens the focused test'
+
+# Removing the completed-request lookup must make the no-connection replay
+# control fail: the mutant attempts the factory again and returns a retry
+# failure instead of the cached committed witness.
+ledger_mutant="$work/p50_zstd_sender_ledger.cpp"
+sed 's/impl_->completed_for(request, \*source, raw_digest)/std::optional<ZstdSourceTransferResult>{}/' \
+    "$sender" >"$ledger_mutant"
+"$cxx" "$standard" -O1 -g -pthread \
+    ${ICECC_TEST_CPPFLAGS:-} ${ICECC_TEST_BOOST_CPPFLAGS:-} \
+    -I"$src" -I"$src/client" -I"$src/cache" -I"$src/services" \
+    "$src/unittests/p50_zstd_sender_test.cpp" "$ledger_mutant" \
+    "$top_build/cache/libp50endpoint.a" \
+    "$top_build/cache/libp50adoptedoutcomewriter.a" \
+    "$top_build/cache/libprotocol50.a" \
+    "$top_build/services/.libs/libicecc.a" \
+    ${ICECC_TEST_LDFLAGS:-} ${ICECC_TEST_LIBZSTD_LIBS:--lzstd} \
+    ${ICECC_TEST_XXHASH_LIBS:--lxxhash} -llzo2 -ldl -o "$work/ledger-mutant"
+if "$work/ledger-mutant" >/dev/null 2>&1; then
+    echo 'FAIL: completed-request-ledger deletion mutant survived' >&2
+    exit 1
+fi
+echo 'ok - deleting the completed-request lookup reddens the replay control'
