@@ -53,7 +53,11 @@ void test_result_transfer()
     job.setCompileIdentity(UINT64_C(7), UINT64_C(9));
     result.setCompileIdentity(UINT64_C(7), UINT64_C(9));
     require(result.compileIdentityMatches(job),
-            "CompileResult C_GUID/TU_SEQ did not match");
+            "CompileResult assignment/C_GUID/TU_SEQ did not match");
+    result.setAssignmentIdentity(epoch, nonce + 1);
+    require(!result.compileIdentityMatches(job),
+            "mismatched CompileResult assignment identity was accepted");
+    result.setAssignmentIdentity(epoch, nonce);
     result.setCompileIdentity(UINT64_C(0), UINT64_C(0));
     require(!result.compileIdentityMatches(job),
             "omitted C_GUID was accepted");

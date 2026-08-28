@@ -188,11 +188,9 @@ static void test_bytes()
             "P48 UseCS matches its retained byte fixture");
     REQUIRE(!u49.empty() && fnv1a(u49) == UINT64_C(0xe556229af116ee8d),
             "P49 UseCS matches its retained byte fixture");
-    /* PROTOCOL_VERSION_ASSIGNMENT_IDENTITY and PROTOCOL_VERSION_CACHE_ADVERTISEMENT
-       are both 50: the four pre-existing identity words and the S2 three-word
-       cache-handoff tail (see UseCSMsg::cache_endpoint_port et al.) land in the
-       same protocol bump, so P50 UseCS is seven words larger than P49, not four. */
-    REQUIRE(appended_word_count(u49, u50, 7),
+    /* Protocol 50 appends four assignment words, four C_GUID/TU_SEQ words,
+       and the three-word cache-handoff tail. */
+    REQUIRE(appended_word_count(u49, u50, 11),
             "P50 UseCS appends assignment and C_GUID/TU_SEQ words plus the cache tail");
     const Bytes f43 = encoded_compile(43), f48 = encoded_compile(48), f49 = encoded_compile(49), f50 = encoded_compile(50);
     REQUIRE(!f43.empty() && fnv1a(f43) == UINT64_C(0x1d040038613f174d),
@@ -262,10 +260,10 @@ static void test_invalid()
 
     /* The P50 tail carries assignment, C_GUID/TU_SEQ, and the three cache
        words.  encoded_usecs(50) leaves the cache words absent; zero the
-       nonce-high word to produce a partial assignment. */
+       complete nonce pair to produce a partial assignment. */
     Bytes use_partial = encoded_usecs(50);
     if (use_partial.size() >= 36) {
-        std::fill(use_partial.end() - 36, use_partial.end() - 32, 0);
+        std::fill(use_partial.end() - 36, use_partial.end() - 28, 0);
     }
     REQUIRE(rejected_by_decoder(use_partial),
             "production decoder rejects partial UseCS identity");
@@ -276,7 +274,7 @@ static void test_invalid()
 
     Bytes compile_partial = encoded_compile(50);
     if (compile_partial.size() >= 92)
-        std::fill(compile_partial.end() - 92, compile_partial.end() - 88, 0);
+        std::fill(compile_partial.end() - 92, compile_partial.end() - 84, 0);
     REQUIRE(rejected_by_decoder(compile_partial),
             "production decoder rejects partial CompileFile identity");
     Bytes compile_zero_wire = encoded_compile(50);

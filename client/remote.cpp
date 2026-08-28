@@ -914,7 +914,7 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
         assert(crmsg);
         if (!crmsg->compileIdentityMatches(job)) {
             delete crmsg;
-            throw client_error(13, "Error 13 - compile result C_GUID/TU_SEQ mismatch");
+            throw client_error(13, "Error 13 - compile result assignment/C_GUID/TU_SEQ mismatch");
         }
         p50_result_received = p50_input;
 

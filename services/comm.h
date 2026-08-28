@@ -1698,8 +1698,10 @@ public:
     uint64_t tuSeq() const { return (uint64_t(tu_seq_hi) << 32) | tu_seq_lo; }
     bool compileIdentityMatches(const CompileJob &job) const
     {
-        return job.compileIdentityValid() && cGuid() == job.cGuid()
-            && tuSeq() == job.tuSeq();
+        return job.assignmentIdentityValid() && job.compileIdentityValid()
+            && assignmentEpoch() == job.assignmentEpoch()
+            && assignmentNonce() == job.assignmentNonce()
+            && cGuid() == job.cGuid() && tuSeq() == job.tuSeq();
     }
 
     int status;

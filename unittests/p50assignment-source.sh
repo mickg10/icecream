@@ -41,10 +41,14 @@ require_count 1 'job->dispatchMatchedJobId(), job->assignmentEpoch(),' \
 # row on Client A, and at the source level by
 # p50cacheadvertisement-source.sh's anchor on the copy-construction text
 # itself.
-require_count 2 'msg->assignmentEpoch()' daemon/main.cpp \
-    'submitter daemon preserves identity in its two remaining explicit production reads (remote relay projection, cache-handoff retention) -- the local relay projection now preserves it implicitly via whole-frame copy, proved behaviorally'
+require_count 8 'msg->assignmentEpoch()' daemon/main.cpp \
+    'submitter daemon preserves assignment identity in relay, cache-handoff, and terminal paths'
 require_count 2 'usecs->applyAssignmentTo(&job)' client/remote.cpp \
     'client remote/local-via-daemon paths copy the production UseCS identity'
+require_count 1 'crmsg->compileIdentityMatches(job)' client/remote.cpp \
+    'client validates assignment and compile identity on the real result path'
+require_count 1 'm->assignmentEpoch() != j->assignmentEpoch()' scheduler/scheduler.cpp \
+    'scheduler validates assignment identity on the real terminal path'
 require_count 1 'record.key.epoch == job.assignmentEpoch()' daemon/main.cpp \
     'fulfillment admission compares the complete epoch'
 require_count 1 'record.key.nonce == job.assignmentNonce()' daemon/main.cpp \

@@ -3394,8 +3394,11 @@ static bool handle_job_done(CompileServer *cs, Msg *_m)
         return true;
     }
 
-    if (m->cGuid() != j->cGuid() || m->tuSeq() != j->tuSeq()) {
-        log_info() << "compile identity mismatch for job " << m->job_id << endl;
+    if (m->assignmentEpoch() != j->assignmentEpoch()
+        || m->assignmentNonce() != j->assignmentNonce()
+        || m->cGuid() != j->cGuid() || m->tuSeq() != j->tuSeq()) {
+        log_info() << "terminal assignment/compile identity mismatch for job "
+                   << m->job_id << endl;
         handle_end(cs, nullptr);
         return false;
     }
