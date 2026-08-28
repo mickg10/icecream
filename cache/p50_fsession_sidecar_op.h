@@ -30,6 +30,7 @@
 #define ICECC_CACHE_P50_FSESSION_SIDECAR_OP_H
 
 #include "p50_fsession_control.h"
+#include "p50_fsession_payloads.h"
 #include "p50_fsession_route.h"
 
 #include <functional>
@@ -43,6 +44,7 @@ enum class SidecarOpPhase : uint8_t {
     PublicFdAdopted,   // receipt staged (flush gate is the slot state)
     EndpointRunning,   // CacheWire in progress
     PreparedAwaitPermit, // PreparedInputReady; waiting for owner CommitPermit
+    PermitSelected,    // owner selected commit; cancellation can no longer win
     Committed,         // durable bundle exists (InputCommitted staged)
     AbortedPreDurable, // cancel linearized before commit
     CancelledAfterCommit, // cancel after commit: bundle retained, delivery suppressed
@@ -85,8 +87,21 @@ public:
 
     // --- prepared / commit-vs-cancel race ---------------------------------
     [[nodiscard]] bool prepared_input_ready();      // -> PreparedAwaitPermit
-    // Owner grants the CommitPermit and the durable commit linearizes.
-    // Returns the staged InputCommitted sequence, or 0 if illegal in phase.
+    // Owner selects commit: STICKY -- after this, a cancel can no longer win
+    // the race; a later failure resolves by actual durable state, never as
+    // AbortedPreDurable (5448121766 sec.4).
+    [[nodiscard]] bool select_commit();             // -> PermitSelected
+    // Consume the selected permit and install the COMPLETE durable bundle
+    // through the canonical store in one transition: the injected callback
+    // performs the actual InputRecord/Ready/route/lastCommit/receipt
+    // installation and must succeed BEFORE the reducer reports Committed.
+    // On callback failure the operation enters reconciliation (per actual
+    // durable state), not AbortedPreDurable. Returns the staged
+    // InputCommitted sequence, or 0 on refusal/failure.
+    using CanonicalCommitFn = std::function<bool()>;
+    [[nodiscard]] uint64_t commit_durable(const CanonicalCommitFn& store_commit);
+    // Substrate convenience for tests: select + commit with an always-true
+    // store callback. Production wiring uses the two-step boundary.
     [[nodiscard]] uint64_t grant_commit_permit_and_commit();
     // Exact OpCancel consumed by the owner (already sequence-accepted through
     // consume_inbound). Applies the race law for the current phase.
@@ -100,6 +115,12 @@ public:
     // Consume the matching TerminalAck (already sequence-accepted). Retires the
     // row. Returns false if no observation is staged.
     [[nodiscard]] bool consume_terminal_ack() noexcept;
+    // Semantic ACK acceptance (5448121766 sec.1): a fresh-sequence envelope is
+    // NOT yet a settlement -- the decoded payload must name this exact
+    // operation, ack_of == the retained observation sequence, and a nonzero
+    // settlement identity, or the operation stays unsettled.
+    [[nodiscard]] bool terminal_ack_semantically_valid(
+        const TerminalAckPayload& ack) const noexcept;
 
     [[nodiscard]] bool delivery_suppressed() const noexcept {
         return delivery_suppressed_;
@@ -114,10 +135,23 @@ public:
     [[nodiscard]] bool reconcile_required() const noexcept {
         return reconcile_required_;
     }
-    // The owner resolved this operation's reconciliation (durable facts were
-    // consulted/settled through the reset/replacement path). Only then may
-    // the slot's local observation state be reclaimed.
-    void mark_reconciled() noexcept { reconciled_ = true; }
+    // Reconciliation retires ONLY through a typed owner permit that names
+    // this exact operation and (when a terminal observation is retained) its
+    // exact sequence, with a typed outcome (5448121766 sec.2). A naked
+    // Boolean cannot erase retained terminal evidence.
+    enum class ReconcileOutcome : uint8_t {
+        DaemonSettlementProved = 1,
+        ExactOperationAbandonedUnderIncarnationLoss = 2,
+        WholeIncarnationTerminated = 3,
+    };
+    struct TerminalReconciliationPermit {
+        FSessionOperationIdentity identity{};
+        uint64_t retained_observation_sequence = 0; // 0 iff none retained
+        ReconcileOutcome outcome = ReconcileOutcome::DaemonSettlementProved;
+        uint64_t supporting_receipt = 0;
+    };
+    [[nodiscard]] bool
+    consume_reconciliation(const TerminalReconciliationPermit& permit) noexcept;
     [[nodiscard]] bool reconciled() const noexcept { return reconciled_; }
 
 private:

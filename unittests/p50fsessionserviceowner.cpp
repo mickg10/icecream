@@ -53,16 +53,26 @@ constexpr int64_t kNow = 1000;
 } // namespace
 
 int main() {
-    // Positive admission is closed by default (placeholder payloads may never
-    // admit a live operation); tests enable it explicitly.
+    // Positive admission is closed by default and opens only through the
+    // exact owner-minted readiness authority.
     {
         FSessionServiceOwner closed(2);
         check(closed.connection_opened() == 0,
               "admission closed by default refuses connections");
+        auto tampered = mint_fsession_admission_ready(1, 1);
+        tampered.codec_registry_hash ^= 1;
+        check(!closed.open_admission(tampered),
+              "tampered codec-registry hash refused");
+        auto wrong_gen = mint_fsession_admission_ready(2, 1);
+        check(!closed.open_admission(wrong_gen),
+              "stale/wrong service generation refused");
+        check(closed.connection_opened() == 0, "still closed after refusals");
     }
 
     FSessionServiceOwner owner(2); // bounded to two live operations
-    owner.set_admission_enabled(true);
+    check(owner.open_admission(mint_fsession_admission_ready(
+              owner.service_generation(), 1)),
+          "exact readiness authority opens admission");
 
     // Two independent connections/operations.
     const uint64_t a = owner.connection_opened();
@@ -123,7 +133,19 @@ int main() {
     check(!owner.reclaim(b), "live B is never evicted");
     check(!owner.reclaim(a),
           "closed A with unresolved reconciliation is NOT reclaimable");
-    owner.operation(a)->mark_reconciled();
+    // Reconciliation retires only through the exact typed permit.
+    SidecarFSessionOperation::TerminalReconciliationPermit wrong;
+    wrong.identity = id_b; // names another operation
+    wrong.retained_observation_sequence = 0;
+    wrong.outcome = SidecarFSessionOperation::ReconcileOutcome::
+        ExactOperationAbandonedUnderIncarnationLoss;
+    wrong.supporting_receipt = 7;
+    check(!owner.operation(a)->consume_reconciliation(wrong),
+          "permit naming another operation retires nothing");
+    SidecarFSessionOperation::TerminalReconciliationPermit permit = wrong;
+    permit.identity = id_a;
+    check(owner.operation(a)->consume_reconciliation(permit),
+          "exact typed permit resolves reconciliation");
     check(owner.reclaim(a), "closed A reclaimed after reconciliation resolves");
     check(owner.live_operations() == 1, "capacity freed");
     check(owner.connection_opened() != 0, "new connection admitted after reclaim");

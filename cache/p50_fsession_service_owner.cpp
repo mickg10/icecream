@@ -2,6 +2,35 @@
 
 namespace icecc::p50::fsession {
 
+uint64_t fsession_payload_registry_hash() noexcept {
+    // FNV-1a over the protocol version and the complete legal message-type
+    // table in both directions -- the sealed registry identity.
+    uint64_t hash = 1469598103934665603ull;
+    const auto mix = [&hash](uint64_t value) {
+        for (int i = 0; i < 8; ++i) {
+            hash ^= (value >> (i * 8)) & 0xFF;
+            hash *= 1099511628211ull;
+        }
+    };
+    mix(kFSessionControlVersion);
+    for (uint16_t t = 1; t <= 6; ++t)
+        mix(0x4400u | t); // Daemon->Sidecar table
+    for (uint16_t t = 1; t <= 8; ++t)
+        mix(0x5300u | t); // Sidecar->Daemon table
+    return hash;
+}
+
+FSessionAdmissionReady
+mint_fsession_admission_ready(uint64_t service_generation,
+                              uint64_t owner_sequence) noexcept {
+    FSessionAdmissionReady ready;
+    ready.service_generation = service_generation;
+    ready.protocol_version = kFSessionControlVersion;
+    ready.codec_registry_hash = fsession_payload_registry_hash();
+    ready.owner_sequence = owner_sequence;
+    return ready;
+}
+
 FSessionServiceOwner::Slot*
 FSessionServiceOwner::find(uint64_t connection_id) noexcept {
     for (auto& slot : slots_)

@@ -1,5 +1,7 @@
 #include "p50_fsession_daemon_op.h"
 
+#include "p50_fsession_payloads.h"
+
 namespace icecc::p50::fsession {
 namespace {
 
@@ -67,14 +69,27 @@ DaemonFSessionOperation::consume_inbound(const FSessionControlEnvelope& e,
             phase_ = DaemonOpPhase::FdAdoptedObserved;
         break;
     case SidecarToDaemonType::TerminalObservation: {
-        // Settle at most once; retain the tombstone; stage the one TerminalAck.
+        // Semantic gate: only a decodable identity-complete observation can
+        // settle; a placeholder/invalid body leaves the daemon unsettled.
+        const auto observation = decode_TerminalObservation(e);
+        if (!observation.has_value())
+            break;
+        // Settle at most once; retain the tombstone; stage the one exact
+        // TerminalAck naming the retained observation sequence.
         if (phase_ != DaemonOpPhase::Settled && phase_ != DaemonOpPhase::Retired) {
             ++settlement_count_;
             phase_ = DaemonOpPhase::Settled;
-            terminal_ack_seq_ = outbound_.stage_frame(
-                identity_, FSessionControlDirection::DaemonToSidecar,
-                static_cast<uint16_t>(DaemonToSidecarType::TerminalAck),
-                placeholder_payload(6));
+            TerminalAckPayload ack;
+            ack.identity = identity_;
+            ack.ack_of_sidecar_sequence = e.sequence;
+            ack.terminal_class_echo = observation->terminal_class;
+            ack.settlement_id = e.sequence; // daemon settlement/tombstone id
+            const auto body = encode_TerminalAck(ack);
+            if (body.has_value())
+                terminal_ack_seq_ = outbound_.stage_frame(
+                    identity_, FSessionControlDirection::DaemonToSidecar,
+                    static_cast<uint16_t>(DaemonToSidecarType::TerminalAck),
+                    *body);
         }
         break;
     }

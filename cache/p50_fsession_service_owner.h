@@ -38,21 +38,52 @@ enum class ServiceIngestStatus : uint8_t {
 // write_fn(bytes) -> bytes written (>0), 0 = would-block, <0 = write error.
 using ServiceWriteFn = std::function<long(std::span<const uint8_t>)>;
 
+// Sealed payload-codec registry identity: protocol version + the complete
+// legal message-type table. Admission readiness must present exactly this
+// value; a build without the full codec set cannot mint it.
+[[nodiscard]] uint64_t fsession_payload_registry_hash() noexcept;
+
+// Owner-minted admission readiness (5448121766 sec.3): the only authority that
+// can open positive admission. Rotates with the service-owner generation.
+struct FSessionAdmissionReady {
+    uint64_t service_generation = 0;
+    uint16_t protocol_version = 0;
+    uint64_t codec_registry_hash = 0;
+    uint64_t owner_sequence = 0;
+    [[nodiscard]] bool valid() const noexcept {
+        return service_generation != 0 &&
+               protocol_version == kFSessionControlVersion &&
+               codec_registry_hash == fsession_payload_registry_hash() &&
+               owner_sequence != 0;
+    }
+};
+[[nodiscard]] FSessionAdmissionReady
+mint_fsession_admission_ready(uint64_t service_generation,
+                              uint64_t owner_sequence) noexcept;
+
 class FSessionServiceOwner {
 public:
-    explicit FSessionServiceOwner(size_t max_operations = 8) noexcept
-        : max_operations_(max_operations == 0 ? 1 : max_operations) {}
+    explicit FSessionServiceOwner(size_t max_operations = 8,
+                                  uint64_t service_generation = 1) noexcept
+        : max_operations_(max_operations == 0 ? 1 : max_operations),
+          service_generation_(service_generation == 0 ? 1
+                                                      : service_generation) {}
 
-    // Positive admission is CLOSED by default: identity-bearing payloads are
-    // still placeholders, and no live production caller may admit an
-    // operation until the exact payload codecs are installed (5448067827
-    // sec.3). Tests and the eventual codec-complete wiring enable it
-    // explicitly; while closed, connection_opened() refuses (no partial row).
-    void set_admission_enabled(bool enabled) noexcept {
-        admission_enabled_ = enabled;
+    // Positive admission is CLOSED by default and opens ONLY by consuming an
+    // exact owner-minted readiness authority whose sealed codec-registry hash,
+    // protocol version, and service generation all match (5448121766 sec.3).
+    // There is no raw Boolean setter.
+    [[nodiscard]] bool open_admission(const FSessionAdmissionReady& ready) noexcept {
+        if (!ready.valid() || ready.service_generation != service_generation_)
+            return false;
+        admission_enabled_ = true;
+        return true;
     }
     [[nodiscard]] bool admission_enabled() const noexcept {
         return admission_enabled_;
+    }
+    [[nodiscard]] uint64_t service_generation() const noexcept {
+        return service_generation_;
     }
 
     // A new dedicated control connection was accepted. Returns its nonzero
@@ -105,6 +136,7 @@ private:
     [[nodiscard]] Slot* find(uint64_t connection_id) noexcept;
 
     size_t max_operations_;
+    uint64_t service_generation_ = 1;
     bool admission_enabled_ = false;
     uint64_t next_connection_id_ = 1;
     std::vector<Slot> slots_;

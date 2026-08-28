@@ -5,6 +5,7 @@
 // 5444410383 sec.5).
 
 #include "cache/p50_fsession_sidecar_op.h"
+#include "cache/p50_fsession_payloads.h"
 
 #include <cassert>
 #include <cstdio>
@@ -64,6 +65,20 @@ icecc::p50::EndpointRunIdentity run_identity() {
     r.socket_ownership_generation = 7;
     assert(r.valid());
     return r;
+}
+
+std::pair<FSessionControlEnvelope, std::vector<uint8_t>>
+frame_with_payload(const FSessionOperationIdentity& id, DaemonToSidecarType type,
+                   uint64_t seq, std::vector<uint8_t> payload) {
+    FSessionControlEnvelope e;
+    e.identity = id;
+    e.direction = FSessionControlDirection::DaemonToSidecar;
+    e.message_type = static_cast<uint16_t>(type);
+    e.sequence = seq;
+    e.payload = std::move(payload);
+    auto enc = encode_fsession_control(e);
+    assert(enc.has_value());
+    return {e, *enc};
 }
 
 std::pair<FSessionControlEnvelope, std::vector<uint8_t>>
@@ -215,6 +230,59 @@ void test_unacked_terminal_tombstone_survives_control_loss() {
           "replay reuses the retained observation sequence");
 }
 
+void test_semantic_ack_and_commit_split() {
+    const auto id = op_identity(kLiveDeadline);
+    RouteAdmissionOwner route;
+    SidecarFSessionOperation op;
+    uint64_t seq = advance_to_running(op, route, id);
+    check(op.prepared_input_ready(), "prepared (gate rows)");
+
+    // Commit split: selection is sticky; a cancel cannot steal it; a store
+    // failure after selection is reconciliation, never AbortedPreDurable.
+    check(op.select_commit(), "owner selects commit");
+    auto [cancel_e, cancel_b] = frame(id, DaemonToSidecarType::OpCancel, seq++);
+    (void)op.consume_inbound(cancel_e, cancel_b, kNow);
+    check(op.phase() == SidecarOpPhase::PermitSelected,
+          "cancel after selection cannot steal the decision");
+    check(op.commit_durable([] { return false; }) == 0,
+          "store failure after selection refuses commit");
+    check(op.phase() == SidecarOpPhase::PermitSelected &&
+              op.reconcile_required(),
+          "store failure -> reconciliation, not AbortedPreDurable");
+    check(op.commit_durable([] { return true; }) != 0,
+          "durable commit succeeds after transient store failure");
+    check(op.phase() == SidecarOpPhase::Committed, "committed");
+
+    // Terminal path with the SEMANTIC ack gate: a fresh-sequence TerminalAck
+    // naming the wrong observation leaves the operation unsettled.
+    const uint64_t term = op.stage_terminal_observation();
+    check(term != 0, "terminal staged (gate rows)");
+    const auto* slot = op.outbound().find(term);
+    check(op.outbound().record_written(term, slot->canonical_bytes.size()),
+          "terminal flushed (gate rows)");
+    TerminalAckPayload wrong_ack;
+    wrong_ack.identity = id;
+    wrong_ack.ack_of_sidecar_sequence = term + 7; // wrong observation
+    wrong_ack.terminal_class_echo = 1;
+    wrong_ack.settlement_id = 5;
+    auto wrong_body = encode_TerminalAck(wrong_ack);
+    check(wrong_body.has_value(), "encode wrong-ack body");
+    auto [wa_e, wa_b] =
+        frame_with_payload(id, DaemonToSidecarType::TerminalAck, seq++, *wrong_body);
+    (void)op.consume_inbound(wa_e, wa_b, kNow);
+    check(op.phase() == SidecarOpPhase::TerminalStaged,
+          "fresh-sequence wrong-ack_of leaves the operation unsettled");
+
+    TerminalAckPayload ack = wrong_ack;
+    ack.ack_of_sidecar_sequence = term;
+    auto ack_body = encode_TerminalAck(ack);
+    auto [ak_e, ak_b] =
+        frame_with_payload(id, DaemonToSidecarType::TerminalAck, seq++, *ack_body);
+    (void)op.consume_inbound(ak_e, ak_b, kNow);
+    check(op.phase() == SidecarOpPhase::Retired,
+          "exact semantic ack settles and retires");
+}
+
 } // namespace
 
 int main() {
@@ -223,6 +291,7 @@ int main() {
     test_commit_before_cancel();
     test_endpoint_cannot_autonomously_commit();
     test_unacked_terminal_tombstone_survives_control_loss();
+    test_semantic_ack_and_commit_split();
 
     if (g_fail != 0) {
         std::fprintf(stderr, "%d failure(s)\n", g_fail);

@@ -7,6 +7,7 @@
 // 5444410383 sec.5).
 
 #include "cache/p50_fsession_daemon_op.h"
+#include "cache/p50_fsession_payloads.h"
 
 #include <cassert>
 #include <cstdio>
@@ -56,15 +57,28 @@ DaemonWaitLease::Facts lease_facts() {
 
 std::pair<FSessionControlEnvelope, std::vector<uint8_t>>
 sidecar_frame(const FSessionOperationIdentity& id, SidecarToDaemonType type,
-              uint64_t seq) {
+              uint64_t seq, std::vector<uint8_t> payload = {}) {
     FSessionControlEnvelope e;
     e.identity = id;
     e.direction = FSessionControlDirection::SidecarToDaemon;
     e.message_type = static_cast<uint16_t>(type);
     e.sequence = seq;
+    e.payload = std::move(payload);
     auto enc = encode_fsession_control(e);
     assert(enc.has_value());
     return {e, *enc};
+}
+
+std::vector<uint8_t> terminal_observation_body(const FSessionOperationIdentity& id) {
+    TerminalObservationPayload p;
+    p.identity = id;
+    p.terminal_class = 1;
+    p.ready_event_id = 0;
+    p.delivery_state = 0;
+    p.highest_accepted_daemon_sequence = 1;
+    auto body = encode_TerminalObservation(p);
+    assert(body.has_value());
+    return *body;
 }
 } // namespace
 
@@ -122,8 +136,15 @@ int main() {
 
     // Terminal settlement: at most once; ack tombstone replayable; retire only
     // after the ack is fully flushed.
-    auto [term_e, term_b] =
-        sidecar_frame(id, SidecarToDaemonType::TerminalObservation, 3);
+    // Semantic gate: a placeholder/undecodable observation cannot settle.
+    auto [bogus_e, bogus_b] =
+        sidecar_frame(id, SidecarToDaemonType::TerminalObservation, 3, {9});
+    (void)op.consume_inbound(bogus_e, bogus_b);
+    check(op.phase() != DaemonOpPhase::Settled,
+          "undecodable terminal observation does not settle");
+    auto [term_e, term_b] = sidecar_frame(
+        id, SidecarToDaemonType::TerminalObservation, 4,
+        terminal_observation_body(id));
     (void)op.consume_inbound(term_e, term_b);
     check(op.phase() == DaemonOpPhase::Settled, "settled");
     check(op.settlement_count() == 1, "one settlement");
