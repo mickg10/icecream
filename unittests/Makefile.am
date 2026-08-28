@@ -45,6 +45,7 @@ TESTS += p50cachesessionwire p50cachesessionwire-source.sh \
 	p50cachesessionwire-mutants.sh p50cachesessionwire-sanitize.sh
 TESTS += p50daemoncontrol p50daemoncontrol-source.sh \
 	p50daemoncontrol-mutants.sh p50_daemon_control_sanitize.sh
+TESTS += p50cachefdseam
 TESTS += p50endpointcancel p50endpointcancel-run.sh
 TESTS += assignment_identity_test
 TESTS += p50_adopted_outcome_writer-run.sh \
@@ -147,6 +148,10 @@ p50daemoncontrol_SOURCES = p50_daemon_control_test.cpp
 p50daemoncontrol_CXXFLAGS = -pthread
 p50daemoncontrol_LDFLAGS = -pthread
 p50daemoncontrol_LDADD = ../cache/libp50localtransport.a
+p50cachefdseam_SOURCES = p50_cache_fd_seam_test.cpp
+p50cachefdseam_CXXFLAGS = -pthread
+p50cachefdseam_LDFLAGS = -pthread
+p50cachefdseam_LDADD = ../services/libicecc.la
 p50readyadvertisement_LDADD = ../cache/libp50readyadvertisement.a
 digest128bench_LDADD = ../services/libicecc.la
 
@@ -192,6 +197,7 @@ check_PROGRAMS += p50sessionjoin
 check_PROGRAMS += p50cachesessionwire
 check_PROGRAMS += p50sidecarlifecycle
 check_PROGRAMS += p50daemoncontrol
+check_PROGRAMS += p50cachefdseam
 check_PROGRAMS += assignment_identity_test
 assignment_identity_test_SOURCES = assignment_identity_test.cpp
 assignment_identity_test_LDADD = ../services/libicecc.la

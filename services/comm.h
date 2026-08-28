@@ -83,6 +83,7 @@
 
 class MsgChannel;
 class P50CacheSessionOutcomeMsg;
+class P50CacheSessionFdRequestMsg;
 
 // Terms used:
 // S  = scheduler
@@ -197,7 +198,12 @@ public:
         // above remains a negative/mechanism fixture and never authorizes
         // this transition.
         P50_CACHE_SESSION_CLAIM = 0x50f00012,
-        P50_CACHE_SESSION_OUTCOME = 0x50f00013
+        P50_CACHE_SESSION_OUTCOME = 0x50f00013,
+
+        // Protocol-50 private ordinary request for the already-authenticated
+        // C-cache control descriptor.  The raw SCM_RIGHTS reply is a separate
+        // clean-boundary exchange and is never interpreted as a Msg.
+        P50_CACHE_SESSION_FD_REQUEST = 0x50f00014
     };
 
     Msg() = default;
@@ -309,6 +315,8 @@ public:
                 return "P50_CACHE_SESSION_CLAIM";
             case P50_CACHE_SESSION_OUTCOME:
                 return "P50_CACHE_SESSION_OUTCOME";
+            case P50_CACHE_SESSION_FD_REQUEST:
+                return "P50_CACHE_SESSION_FD_REQUEST";
         }
         return "UNKNOWN";
     }
@@ -322,10 +330,10 @@ protected:
 };
 
 namespace p50_private_message_registry {
-inline constexpr std::array<uint32_t, 6> values{
+inline constexpr std::array<uint32_t, 7> values{
     Msg::CACHE_SESSION, Msg::RESULT_DISPOSITION, Msg::P50_SOURCE_ARM,
     Msg::P50_SOURCE_ARMED, Msg::P50_CACHE_SESSION_CLAIM,
-    Msg::P50_CACHE_SESSION_OUTCOME};
+    Msg::P50_CACHE_SESSION_OUTCOME, Msg::P50_CACHE_SESSION_FD_REQUEST};
 inline constexpr bool unique() noexcept
 {
     for (size_t i = 0; i != values.size(); ++i) {
@@ -544,6 +552,13 @@ const uint32_t CACHE_WIRE_PROTOCOL_V1 = 50;
    ordinary framed message and carries no CacheWire identity. */
 inline constexpr uint32_t CACHE_SESSION_READY_MAGIC = UINT32_C(0x50f00001);
 
+/* Fixed raw reply value for the compiler/cache control descriptor.  The
+   payload is: magic, version, wire job, assignment epoch, assignment nonce,
+   and selected profile, all in network byte order. */
+inline constexpr uint32_t P50_CACHE_FD_LEASE_MAGIC = UINT32_C(0x5035464c);
+inline constexpr uint32_t P50_CACHE_FD_LEASE_VERSION = 1;
+inline constexpr size_t P50_CACHE_FD_LEASE_BYTES = 32;
+
 /* Send the exact network-order CACHE_SESSION_READY_MAGIC under one absolute
    steady-clock deadline.  The caller retains descriptor ownership. */
 bool send_cache_session_ready(
@@ -635,6 +650,27 @@ inline constexpr bool p50_source_profile_selection_valid(uint32_t profiles) noex
     return profiles == CACHE_PROFILE_ZSTD_TU ||
            profiles == CACHE_PROFILE_ZSTD_ROUTE;
 }
+
+/* The one ordinary-link request used by the compiler-side cache seam.  This
+   is deliberately smaller than the source-arm record: the authenticated
+   relationship already exists, so only the exact assignment and selected
+   source profile are echoed across this boundary. */
+struct P50CacheSessionFdRequestFields
+{
+    uint32_t wire_job_id = 0;
+    uint64_t assignment_epoch = 0;
+    uint64_t assignment_nonce = 0;
+    uint32_t profile = 0;
+
+    [[nodiscard]] bool valid() const noexcept
+    {
+        return wire_job_id != 0 && assignment_epoch != 0 &&
+               assignment_nonce != 0 &&
+               p50_source_profile_selection_valid(profile);
+    }
+
+    auto operator<=>(const P50CacheSessionFdRequestFields &) const = default;
+};
 
 /* Shared absent-or-present law for a three-word CacheWire advertisement.
    LoginMsg's Login-only capability tail (M0/M1) and UseCSMsg's
@@ -792,6 +828,15 @@ public:
        the one-shot send arm, including refusal and timeout paths. */
     int release_fd_after_cache_session_ready(
         std::chrono::steady_clock::time_point deadline);
+
+    /* Protocol-50 compiler/cache control seam.  The request must have been
+       completely decoded on this channel and the reply is a one-shot raw
+       fixed lease plus one descriptor.  A positive send consumes
+       transfer_fd; the receiver owns the returned descriptor on success. */
+    bool send_p50_cache_fd_reply(
+        const P50CacheSessionFdRequestMsg &request, int transfer_fd) noexcept;
+    int receive_p50_cache_fd_reply(
+        const P50CacheSessionFdRequestFields &expected) noexcept;
 
     /* Bytes which remain inside the frame currently being decoded.  This is
        deliberately frame-bounded rather than based on buffered input: a
@@ -998,6 +1043,9 @@ protected:
     uint64_t p50_active_server_claim_stamp_nonce = 0;
     uint64_t p50_active_client_release_nonce = 0;
     bool p50_server_outcome_send_armed = false;
+    bool p50_fd_reply_arm_consumed = false;
+    bool p50_fd_request_ready = false;
+    P50CacheSessionFdRequestFields p50_last_fd_request{};
 
     // One exact outbound claim may await one first outcome on this fresh
     // connection. A queued claim is promoted only after its frame fully
@@ -1292,6 +1340,33 @@ public:
     }
 
     P50SourceArmFields arm;
+
+private:
+    bool wire_payload_valid = true;
+};
+
+/* Exact private request for a raw control-fd lease.  The request is ordinary
+   framed MsgChannel traffic; the reply deliberately is not another Msg so
+   that the descriptor and its fixed lease bytes are received together. */
+class P50CacheSessionFdRequestMsg : public Msg
+{
+public:
+    static constexpr size_t PayloadBytes = 4 + 8 + 8 + 4;
+
+    P50CacheSessionFdRequestMsg()
+        : Msg(Msg::P50_CACHE_SESSION_FD_REQUEST) {}
+    explicit P50CacheSessionFdRequestMsg(P50CacheSessionFdRequestFields fields)
+        : Msg(Msg::P50_CACHE_SESSION_FD_REQUEST), request(std::move(fields)) {}
+
+    void fill_from_channel(MsgChannel *c) override;
+    void send_to_channel(MsgChannel *c) const override;
+    bool valid_payload() const override;
+    bool valid_for_protocol(int negotiated_protocol) const override
+    {
+        return negotiated_protocol == PROTOCOL_VERSION;
+    }
+
+    P50CacheSessionFdRequestFields request;
 
 private:
     bool wire_payload_valid = true;
