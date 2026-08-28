@@ -21,6 +21,7 @@
 #include <boost/asio/detached.hpp>
 #include <boost/asio/this_coro.hpp>
 #include <boost/asio/use_future.hpp>
+#include <boost/asio/posix/stream_descriptor.hpp>
 #include <string_view>
 #include <stdexcept>
 #include <sys/stat.h>
@@ -772,6 +773,26 @@ bool handle_connection(local::Connection connection, const Options& options,
                 return true;
         }
 
+        /* Protocol discrimination on the authenticated relationship: a
+           dedicated F-session control connection's first post-handshake bytes
+           carry the P5FS envelope magic. Peek without consuming, then hand
+           the descriptor to the endpoint owner executor -- no per-connection
+           thread, and exactly one parser ever reads the stream. */
+        {
+            uint8_t magic_peek[4]{};
+            const ssize_t peeked =
+                ::recv(connection.native_handle(), magic_peek,
+                       sizeof(magic_peek), MSG_PEEK | MSG_DONTWAIT);
+            if (peeked == static_cast<ssize_t>(sizeof(magic_peek)) &&
+                magic_peek[0] == 0x50 && magic_peek[1] == 0x35 &&
+                magic_peek[2] == 0x46 && magic_peek[3] == 0x53) { // "P5FS"
+                const int routed = ::dup(connection.native_handle());
+                if (routed >= 0)
+                    runtime.route_fsession_connection(routed);
+                return true; // worker exits; the owner executor drives the fd
+            }
+        }
+
         const auto deadline = std::chrono::steady_clock::now() +
                               std::chrono::milliseconds{kHandshakeMilliseconds};
         local::Frame operation_frame;
@@ -1514,6 +1535,162 @@ void SidecarRuntime::close_active_control() noexcept {
         (void)::close(fd);
 }
 
+// --- dedicated F-session control connections (owner-affine) ---------------
+
+struct SidecarRuntime::FSessionPump {
+    FSessionPump(boost::asio::io_context& context, int fd)
+        : stream(context, fd) {}
+    boost::asio::posix::stream_descriptor stream;
+    uint64_t cid = 0;
+    std::array<uint8_t, 4096> buffer{};
+    bool closed = false;
+};
+
+namespace {
+int64_t fsession_now_ns() noexcept {
+    timespec ts{};
+    (void)::clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<int64_t>(ts.tv_sec) * 1'000'000'000 + ts.tv_nsec;
+}
+} // namespace
+
+void SidecarRuntime::route_fsession_connection(int connection_fd) noexcept {
+    if (connection_fd < 0)
+        return;
+    const int flags = ::fcntl(connection_fd, F_GETFL);
+    if (flags < 0 || ::fcntl(connection_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        (void)::close(connection_fd);
+        return;
+    }
+    try {
+        asio::post(context_, [this, connection_fd] {
+            const uint64_t cid = fsession_owner_.connection_opened();
+            if (cid == 0) {
+                (void)::close(connection_fd); // bounded table full: refuse
+                return;
+            }
+            std::shared_ptr<FSessionPump> pump;
+            try {
+                pump = std::make_shared<FSessionPump>(context_, connection_fd);
+            } catch (...) {
+                fsession_owner_.connection_closed(cid);
+                (void)::close(connection_fd);
+                return;
+            }
+            pump->cid = cid;
+            fsession_pumps_.push_back(pump);
+            fsession_live_.store(fsession_owner_.live_operations(),
+                                 std::memory_order_release);
+            fsession_arm_read(std::move(pump));
+        });
+    } catch (...) {
+        (void)::close(connection_fd);
+    }
+}
+
+void SidecarRuntime::fsession_arm_read(std::shared_ptr<FSessionPump> pump) noexcept {
+    if (pump->closed)
+        return;
+    auto& stream = pump->stream;
+    stream.async_wait(
+        boost::asio::posix::stream_descriptor::wait_read,
+        [this, pump = std::move(pump)](const boost::system::error_code& ec) mutable {
+            if (pump->closed)
+                return;
+            if (ec) {
+                fsession_close(std::move(pump));
+                return;
+            }
+            // Bounded per-turn ingest: at most a few reads, then rearm.
+            for (int round = 0; round < 4; ++round) {
+                const ssize_t got =
+                    ::recv(pump->stream.native_handle(), pump->buffer.data(),
+                           pump->buffer.size(), MSG_DONTWAIT);
+                if (got > 0) {
+                    const fsession::ServiceIngestStatus status = fsession_owner_.on_bytes(
+                        pump->cid,
+                        {pump->buffer.data(), static_cast<size_t>(got)},
+                        fsession_now_ns());
+                    if (status != fsession::ServiceIngestStatus::Progress) {
+                        fsession_close(std::move(pump));
+                        return;
+                    }
+                    fsession_drain(pump);
+                    if (pump->closed)
+                        return;
+                    if (static_cast<size_t>(got) < pump->buffer.size())
+                        break;
+                    continue;
+                }
+                if (got == 0) { // clean EOF
+                    fsession_close(std::move(pump));
+                    return;
+                }
+                if (errno == EINTR)
+                    continue;
+                break; // EAGAIN: wait for the next readability event
+            }
+            fsession_arm_read(std::move(pump));
+        });
+}
+
+void SidecarRuntime::fsession_drain(std::shared_ptr<FSessionPump> pump) noexcept {
+    if (pump->closed)
+        return;
+    const int fd = pump->stream.native_handle();
+    const fsession::ServiceWriteFn write_fn =
+        [fd](std::span<const uint8_t> bytes) -> long {
+        const ssize_t wrote =
+            ::send(fd, bytes.data(), bytes.size(), MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (wrote >= 0)
+            return static_cast<long>(wrote);
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+            return 0;
+        return -1;
+    };
+    if (!fsession_owner_.drain_outbound(pump->cid, write_fn, 64 * 1024)) {
+        fsession_close(std::move(pump));
+        return;
+    }
+    if (fsession_owner_.has_pending_outbound(pump->cid)) {
+        // Would-block residue: resume on the next writability event.
+        pump->stream.async_wait(
+            boost::asio::posix::stream_descriptor::wait_write,
+            [this, pump](const boost::system::error_code& ec) mutable {
+                if (pump->closed)
+                    return;
+                if (ec) {
+                    fsession_close(std::move(pump));
+                    return;
+                }
+                fsession_drain(std::move(pump));
+            });
+    }
+}
+
+void SidecarRuntime::fsession_close(std::shared_ptr<FSessionPump> pump) noexcept {
+    if (pump->closed)
+        return;
+    pump->closed = true;
+    boost::system::error_code ignored;
+    pump->stream.close(ignored);
+    fsession_owner_.connection_closed(pump->cid);
+    (void)fsession_owner_.reclaim(pump->cid); // retained if reconciliation pends
+    fsession_live_.store(fsession_owner_.live_operations(),
+                         std::memory_order_release);
+    for (auto iterator = fsession_pumps_.begin();
+         iterator != fsession_pumps_.end(); ++iterator) {
+        if (iterator->get() == pump.get()) {
+            fsession_pumps_.erase(iterator);
+            break;
+        }
+    }
+}
+
+size_t SidecarRuntime::live_fsession_operations() const noexcept {
+    return fsession_live_.load(std::memory_order_acquire);
+}
+
 void SidecarRuntime::cancel_endpoint_run() noexcept {
     // The permit is captured at admission and posted to the endpoint owner;
     // no current-socket lookup or descriptor-derived authority is permitted.
@@ -1549,6 +1726,17 @@ void SidecarRuntime::stop() noexcept {
     stop_requested_.store(true, std::memory_order_release);
     cancel_active_control();
     cancel_endpoint_incarnation();
+    // Whole-incarnation teardown of dedicated F-session connections: posted to
+    // the owner executor (never a cross-thread socket mutation for an ordinary
+    // per-operation cancel; this is the exact incarnation-failure authority).
+    try {
+        asio::post(context_, [this] {
+            std::vector<std::shared_ptr<FSessionPump>> pumps = fsession_pumps_;
+            for (auto& pump : pumps)
+                fsession_close(pump);
+        });
+    } catch (...) {
+    }
 }
 
 size_t SidecarRuntime::live_session_count() const {

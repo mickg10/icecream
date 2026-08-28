@@ -67,6 +67,10 @@ public:
     // Owner access to the operation for endpoint/route/permit driving.
     [[nodiscard]] SidecarFSessionOperation* operation(uint64_t connection_id);
 
+    // True while staged outbound frames remain unflushed (Queued/Writing),
+    // i.e. the connection wants a writability event.
+    [[nodiscard]] bool has_pending_outbound(uint64_t connection_id);
+
     // Control EOF/reset or caller-initiated close: applies the control-loss
     // law to the operation and releases the connection slot. The operation
     // object is retained until reclaim() so its local facts survive for

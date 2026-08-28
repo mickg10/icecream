@@ -21,6 +21,7 @@
 
 #include "p50_endpoint.h"
 #include "p50_control_operation.h"
+#include "p50_fsession_service_owner.h"
 #include "p50_fd_handoff.h"
 #include "p50_input_fd_attachment.h"
 #include "p50_input_lifecycle.h"
@@ -124,6 +125,13 @@ public:
         InputLifecycleRequest request,
         std::chrono::steady_clock::time_point deadline) noexcept;
 
+    // Route an authenticated dedicated F-session control connection (first
+    // post-handshake bytes carry the P5FS envelope magic) onto the endpoint
+    // owner executor. Takes ownership of connection_fd. No per-connection
+    // thread: the owner-affine FSessionServiceOwner drives it incrementally.
+    void route_fsession_connection(int connection_fd) noexcept;
+    [[nodiscard]] size_t live_fsession_operations() const noexcept;
+
     void stop() noexcept;
     [[nodiscard]] bool stopped() const noexcept { return stop_requested_.load(); }
     [[nodiscard]] size_t live_session_count() const;
@@ -165,6 +173,16 @@ private:
     std::atomic<int> active_control_cancel_fd_{-1};
     mutable std::mutex endpoint_cancel_mutex_;
     std::optional<EndpointCancelPermit> endpoint_cancel_permit_;
+
+    // --- dedicated F-session control connections (owner-affine) -----------
+    struct FSessionPump;
+    void fsession_arm_read(std::shared_ptr<FSessionPump> pump) noexcept;
+    void fsession_drain(std::shared_ptr<FSessionPump> pump) noexcept;
+    void fsession_close(std::shared_ptr<FSessionPump> pump) noexcept;
+    // Accessed only on the endpoint owner executor.
+    fsession::FSessionServiceOwner fsession_owner_{4};
+    std::vector<std::shared_ptr<FSessionPump>> fsession_pumps_;
+    std::atomic<size_t> fsession_live_{0};
 };
 
 struct Options {

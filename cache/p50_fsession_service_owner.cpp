@@ -105,6 +105,20 @@ bool FSessionServiceOwner::drain_outbound(uint64_t connection_id,
     return true;
 }
 
+bool FSessionServiceOwner::has_pending_outbound(uint64_t connection_id) {
+    Slot* slot = find(connection_id);
+    if (slot == nullptr)
+        return false;
+    FSessionOutboundControl& out = slot->op->outbound();
+    for (uint64_t seq = 1; seq <= 1024; ++seq) {
+        const OutboundSemanticSlot* frame = out.find(seq);
+        if (frame != nullptr && (frame->state == OutboundSlotState::Queued ||
+                                 frame->state == OutboundSlotState::Writing))
+            return true;
+    }
+    return false;
+}
+
 SidecarFSessionOperation*
 FSessionServiceOwner::operation(uint64_t connection_id) {
     Slot* slot = find(connection_id);
