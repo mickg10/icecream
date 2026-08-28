@@ -12,5 +12,7 @@ grep -q 'validate_grz_residual_begin' "$root/cache/p50_endpoint.cpp" || fail 'en
 grep -q 'ProfileId::GRZ' "$root/client/p50_compile_binding.cpp" || fail 'compile binding does not carry GRZ'
 grep -q 'P50_SOURCE_MODE_GRZ_RESIDUAL' "$root/client/remote.cpp" || fail 'source arm does not carry GRZ mode'
 grep -q 'ProfileId::GRZ' "$root/client/p50_zstd_sender.cpp" || fail 'sender does not bind GRZ lifetime'
+test "$(git -C "$root" hash-object "$root/vendor/grouprlz/grz2.cpp")" = fa63c7b8ce40a1366b6ba4dc65a59839bfaa7419 || fail 'canonical grz2.cpp source mismatch'
+test "$(git -C "$root" hash-object "$root/vendor/grouprlz/grz2g.cpp")" = 7f57775694b8962d3d92f38ce7e3213842139bc2 || fail 'canonical grz2g.cpp source mismatch'
 if grep -R -n 'GRZR' "$root/cache/p50_grz"*; then fail 'toy GRZR framing remains'; fi
 echo 'PASS GRZ_RESIDUAL source binding, BWT dependency gate, and no toy framing'

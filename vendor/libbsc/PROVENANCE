@@ -14,6 +14,9 @@ extraction (the live endpoint uses only the reviewed residual frame state):
   grz2.cpp blob: fa63c7b8ce40a1366b6ba4dc65a59839bfaa7419
   closure provenance blob: 3aed5ec4fa42b211d0bbefceb147a6ed83b14332
   corrected source SHA256: 57ef6970cc15625f569f1d4ee5a2365620b1bd62aaee970c3c53b20af2286599
+  canonical source package copies (not standalone product binaries):
+    vendor/grouprlz/grz2.cpp  blob fa63c7b8ce40a1366b6ba4dc65a59839bfaa7419
+    vendor/grouprlz/grz2g.cpp blob 7f57775694b8962d3d92f38ce7e3213842139bc2
 
 libbsc is pinned to upstream revision:
   baffa62c70b6ebbecc9af14ce550e965ea247680

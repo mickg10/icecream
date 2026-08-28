@@ -244,6 +244,8 @@ EXTRA_DIST = \
 	../vendor/libbsc/PROVENANCE \
 	../vendor/libbsc/SOURCE-MANIFEST.sha256 \
 	../vendor/libbsc/LICENSE \
+	../vendor/grouprlz/grz2.cpp \
+	../vendor/grouprlz/grz2g.cpp \
 	formal/README.md
 
 check-local:
