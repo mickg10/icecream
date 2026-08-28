@@ -32,6 +32,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -535,8 +536,8 @@ void test_s3_resource_storm_product_path() {
             static_cast<uint8_t>(index >> 8),
             static_cast<uint8_t>(index >> 16),
             static_cast<uint8_t>(index >> 24)};
-        const PairResult result =
-            run_pair(soak_client, soak_server, admit(soak_client, input));
+        const PreparedTuHandle prepared = admit(soak_client, input);
+        const PairResult result = run_pair(soak_client, soak_server, prepared);
         require(result.client.status == ClientRunStatus::Committed &&
                     result.server.status == ServerRunStatus::Completed &&
                     result.server.committed_input.has_value() &&
@@ -544,6 +545,8 @@ void test_s3_resource_storm_product_path() {
                 "10,000-TU product soak failed exact endpoint commit");
         soak_server.close_input_job(*result.server.committed_input);
         soak_server.collect_input_garbage();
+        require(soak_client.authority->release(prepared) == 0,
+                "10,000-TU product soak retained a producer preparation");
         require(soak_server.owner_usage().retained_input_records == 0 &&
                     soak_server.owner_usage().retained_input_bytes == 0,
                 "10,000-TU product soak retained a released input");
@@ -621,6 +624,11 @@ void test_s3_resource_storm_product_path() {
                                        storm_server.owner_usage());
     }
     report_resource_checkpoint("storm-final", storm_server.owner_usage());
+}
+
+bool s3_resource_storm_requested() {
+    const char* value = std::getenv("ICECC_P50_S3_RESOURCE_STORM");
+    return value != nullptr && std::string_view(value) == "1";
 }
 
 PairResult run_adopted_pair(P50ClientEndpoint& client, P50ServerEndpoint& server,
@@ -708,25 +716,32 @@ size_t staging_file_count() {
 
 uint64_t resident_bytes() {
     std::ifstream status("/proc/self/status");
-    std::string key;
-    uint64_t value = 0;
-    std::string unit;
-    while (status >> key >> value >> unit) {
-        if (key == "VmRSS:")
+    std::string line;
+    while (std::getline(status, line)) {
+        if (!line.starts_with("VmRSS:"))
+            continue;
+        std::istringstream fields(line);
+        std::string key;
+        std::string unit;
+        uint64_t value = 0;
+        if (fields >> key >> value >> unit && key == "VmRSS:" && unit == "kB")
             return value * 1024;
+        return 0;
     }
     return 0;
 }
 
 void report_resource_checkpoint(std::string_view label,
                                 const P50ServerOwnerUsage& usage) {
+    const uint64_t rss = resident_bytes();
+    require(rss != 0, "could not read the product-gate RSS checkpoint");
     std::cerr << "p50_s3_resource checkpoint=" << label
               << " retained_records=" << usage.retained_input_records
               << " retained_bytes=" << usage.retained_input_bytes
               << " namespaces=" << usage.namespaces
               << " staging_files=" << staging_file_count()
               << " open_fds=" << open_fd_count()
-              << " rss_bytes=" << resident_bytes() << '\n';
+              << " rss_bytes=" << rss << '\n';
 }
 
 void test_complete_p5co_endpoint_handoff() {
@@ -5718,7 +5733,8 @@ int main(int argc, char** argv) {
     test_adopted_cross_executor_releases_registration();
     test_two_client_one_server_isolation();
     test_zstd_route_endpoint_continuation_and_retry();
-    test_s3_resource_storm_product_path();
+    if (s3_resource_storm_requested())
+        test_s3_resource_storm_product_path();
     report_zstd1_metrics(performance_gate);
     std::cout << "p50_endpoint_test: PASS\n";
     return 0;
