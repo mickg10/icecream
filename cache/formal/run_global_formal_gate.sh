@@ -6,6 +6,13 @@ PYTHON=${PYTHON:-python3}
 
 "$SCRIPT_DIR/run_global_trace_gate.sh"
 "$PYTHON" -m py_compile "$SCRIPT_DIR/check_global_trace.py"
+"$PYTHON" -m py_compile "$SCRIPT_DIR/check_live_global_trace.py"
+
+if [ -n "${P50_ENDPOINT_BIN:-}" ]; then
+    "$SCRIPT_DIR/run_live_global_trace_gate.sh"
+else
+    echo "LIVE TRACE: SKIP — set P50_ENDPOINT_BIN to the built p50endpoint test"
+fi
 
 for symbol in \
     NAMESPACE_ADMITTED NAMESPACE_TOUCHED TU_STARTED TU_FINISHED \
@@ -59,6 +66,11 @@ for symbol in global_resources global_resource_trace global_key \
         exit 1
     }
 done
+grep -F "P50_ENDPOINT_GLOBAL_TRACE_PATH" \
+    "$SCRIPT_DIR/../../unittests/p50_endpoint_test.cpp" >/dev/null || {
+    echo "missing live endpoint global-trace emitter gate" >&2
+    exit 1
+}
 grep -F "ignore_slot_ownership" "$SCRIPT_DIR/../p50_slice0.h" \
     "$SCRIPT_DIR/../../unittests/p50_slice0_test.cpp" >/dev/null || {
     echo "missing known-caught global slot-ownership control" >&2

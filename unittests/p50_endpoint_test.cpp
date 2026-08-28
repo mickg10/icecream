@@ -1,6 +1,7 @@
 #include "cache/p50_endpoint.h"
 #include "cache/p50_adopted_outcome_writer.h"
 #include "cache/p50_adopted_socket_lease.h"
+#include "cache/p50_slice0.h"
 
 #include <zstd.h>
 
@@ -631,6 +632,50 @@ void test_s3_resource_storm_product_path() {
     require(storm_server.owner_usage().namespaces <= 256,
             "multi-C_GUID product storm exceeded the namespace cap");
     report_resource_checkpoint("storm-final", storm_server.owner_usage());
+}
+
+void test_live_global_resource_trace() {
+    GlobalResourceTrace trace;
+    P50ServerEndpointConfig config;
+    config.global_resource_trace = &trace;
+    P50ServerEndpoint server(Id128::from_u64(15000), {}, nullptr, nullptr,
+                             std::move(config));
+    TestClient client(Id128::from_u64(15001));
+    const std::vector<uint8_t> input = bytes("live endpoint global trace\n");
+    const PairResult result = run_pair(client, server, admit(client, input));
+    require(result.client.status == ClientRunStatus::Committed &&
+                result.server.status == ServerRunStatus::Completed &&
+                result.server.committed_input.has_value() &&
+                copy_input(server, client.c_store_guid()) == input,
+            "live global trace transaction did not commit exact input");
+    server.close_input_job(*result.server.committed_input);
+    server.collect_input_garbage();
+    server.reset_store(Id128::from_u64(15002));
+
+    const auto action_index = [&](GlobalActionType action) {
+        const auto position = std::find_if(
+            trace.records().begin(), trace.records().end(),
+            [action](const GlobalActionRecord& record) {
+                return record.action == action;
+            });
+        require(position != trace.records().end(),
+                std::string("live endpoint omitted global action ") +
+                    std::string(global_action_name(action)));
+        return static_cast<size_t>(position - trace.records().begin());
+    };
+    const size_t admitted = action_index(GlobalActionType::NAMESPACE_ADMITTED);
+    const size_t started = action_index(GlobalActionType::TU_STARTED);
+    const size_t installing = action_index(GlobalActionType::ARENA_INSTALLING);
+    const size_t present = action_index(GlobalActionType::ARENA_PRESENT);
+    const size_t finished = action_index(GlobalActionType::TU_FINISHED);
+    const size_t released = action_index(GlobalActionType::ARENA_RELEASED);
+    const size_t evicted = action_index(GlobalActionType::NAMESPACE_EVICTED);
+    require(admitted < started && started < installing && installing < present &&
+                present < finished && finished < released && released < evicted,
+            "live endpoint global trace lifecycle order is invalid");
+
+    if (const char* path = std::getenv("P50_ENDPOINT_GLOBAL_TRACE_PATH"))
+        write_global_trace(trace, path);
 }
 
 bool s3_resource_storm_requested() {
@@ -5748,6 +5793,7 @@ int main(int argc, char** argv) {
     test_adopted_cross_executor_releases_registration();
     test_two_client_one_server_isolation();
     test_zstd_route_endpoint_continuation_and_retry();
+    test_live_global_resource_trace();
     if (s3_resource_storm_requested())
         test_s3_resource_storm_product_path();
     report_zstd1_metrics(performance_gate);
