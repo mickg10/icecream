@@ -2,6 +2,7 @@
 #include "p50_slice0.h"
 
 #include "p50_adopted_outcome_writer.h"
+#include "p50_grz.h"
 
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/post.hpp>
@@ -76,7 +77,11 @@ void validate_caps(const EndpointCaps& caps) {
     if (caps.wire.max_fill_record_bytes < 32)
         throw std::invalid_argument("endpoint FILL-record cap is too small");
     validate_zstd_tu_limits(caps.zstd);
-    if (caps.profile != ProfileId::ZSTD_TU && caps.profile != ProfileId::Z3_LONG)
+    if (caps.profile != ProfileId::ZSTD_TU && caps.profile != ProfileId::Z3_LONG
+#if defined(ICECC_P50_WITH_LIBBSC)
+        && caps.profile != ProfileId::GRZ
+#endif
+        )
         throw std::invalid_argument("endpoint profile is unsupported");
     if (caps.supported_profiles == 0 ||
         (caps.supported_profiles & ~kOperationalProfileMask) != 0)
@@ -847,6 +852,9 @@ struct P50PreparationAuthority::Impl {
          ProfileId profile_value)
         : c_guid(c_store_guid_value), zstd_limits(zstd_limits_value),
           authority_limits(authority_limits_value), codec(compression_level),
+#if defined(ICECC_P50_WITH_LIBBSC)
+          grz_codec(),
+#endif
           identity(std::make_shared<const uint8_t>(0)), route_codec(3),
           profile(profile_value) {
         if (c_guid == CStoreGuid{})
@@ -855,7 +863,11 @@ struct P50PreparationAuthority::Impl {
         if (authority_limits.max_live_entries == 0 ||
             authority_limits.max_retained_encoded_bytes == 0)
             throw std::invalid_argument("preparation-authority limits must be nonzero");
-        if (profile != ProfileId::ZSTD_TU && profile != ProfileId::Z3_LONG)
+        if (profile != ProfileId::ZSTD_TU && profile != ProfileId::Z3_LONG
+#if defined(ICECC_P50_WITH_LIBBSC)
+            && profile != ProfileId::GRZ
+#endif
+            )
             throw std::invalid_argument("preparation authority profile is unsupported");
     }
 
@@ -889,6 +901,9 @@ struct P50PreparationAuthority::Impl {
     ZstdTuLimits zstd_limits{};
     PreparationAuthorityLimits authority_limits{};
     ZstdTuCodec codec;
+#if defined(ICECC_P50_WITH_LIBBSC)
+    GrzResidualCodec grz_codec;
+#endif
     SingleThreadOwner owner;
     std::shared_ptr<const void> identity;
     uint64_t next_tu = 0;
@@ -898,6 +913,9 @@ struct P50PreparationAuthority::Impl {
     uint64_t retained_bytes = 0;
     std::vector<uint8_t> committed_route_history;
     std::optional<uint64_t> uncommitted_route_entry;
+#if defined(ICECC_P50_WITH_LIBBSC)
+    std::optional<uint64_t> uncommitted_grz_entry;
+#endif
     ZstdRouteCodec route_codec;
     ProfileId profile = ProfileId::ZSTD_TU;
     std::map<PrepareRequestKey, uint64_t> requests;
@@ -938,6 +956,11 @@ PreparedTuHandle P50PreparationAuthority::prepare(PrepareRequestKey request,
         impl_->uncommitted_route_entry.has_value())
         throw std::logic_error(
             "ZSTD_ROUTE requires its predecessor to commit before preparing the next TU");
+#if defined(ICECC_P50_WITH_LIBBSC)
+    if (impl_->profile == ProfileId::GRZ && impl_->uncommitted_grz_entry.has_value())
+        throw std::logic_error(
+            "GRZ_RESIDUAL requires its predecessor to commit before preparing the next TU");
+#endif
 
     if (impl_->entries.size() >= impl_->authority_limits.max_live_entries)
         throw std::length_error("C preparation authority reached its live-entry bound");
@@ -952,43 +975,73 @@ PreparedTuHandle P50PreparationAuthority::prepare(PrepareRequestKey request,
     admission_limits.max_encoded_body_bytes =
         std::min(admission_limits.max_encoded_body_bytes, retained_room);
     PreparedZstdTUPtr prepared;
-    if (impl_->profile == ProfileId::ZSTD_TU) {
-        prepared = std::make_shared<const ZstdTuEnvelope>(impl_->codec.encode(
-            HistoryNonce{1}, RelSeq{0}, tu_seq, Digest128{}, exact_input,
-            admission_limits));
-    } else {
-        prepared = std::make_shared<const ZstdTuEnvelope>(impl_->route_codec.encode(
-            HistoryNonce{1}, RelSeq{0}, tu_seq, Digest128{},
-            std::span<const uint8_t>(impl_->committed_route_history), exact_input,
-            admission_limits));
+    try {
+        if (impl_->profile == ProfileId::ZSTD_TU) {
+            prepared = std::make_shared<const ZstdTuEnvelope>(impl_->codec.encode(
+                HistoryNonce{1}, RelSeq{0}, tu_seq, Digest128{}, exact_input,
+                admission_limits));
+        } else if (impl_->profile == ProfileId::Z3_LONG) {
+            prepared = std::make_shared<const ZstdTuEnvelope>(impl_->route_codec.encode(
+                HistoryNonce{1}, RelSeq{0}, tu_seq, Digest128{},
+                std::span<const uint8_t>(impl_->committed_route_history), exact_input,
+                admission_limits));
+#if defined(ICECC_P50_WITH_LIBBSC)
+        } else {
+            prepared = std::make_shared<const ZstdTuEnvelope>(impl_->grz_codec.encode(
+                HistoryNonce{1}, RelSeq{0}, tu_seq, Digest128{}, exact_input,
+                admission_limits));
+#endif
+        }
+    } catch (...) {
+#if defined(ICECC_P50_WITH_LIBBSC)
+        if (impl_->profile == ProfileId::GRZ)
+            impl_->grz_codec.discard();
+#endif
+        throw;
     }
     const uint64_t retained = static_cast<uint64_t>(prepared->body.size());
     if (retained > impl_->authority_limits.max_retained_encoded_bytes ||
-        impl_->retained_bytes > impl_->authority_limits.max_retained_encoded_bytes - retained)
+        impl_->retained_bytes > impl_->authority_limits.max_retained_encoded_bytes - retained) {
+#if defined(ICECC_P50_WITH_LIBBSC)
+        if (impl_->profile == ProfileId::GRZ)
+            impl_->grz_codec.discard();
+#endif
         throw std::length_error("C preparation authority reached its retained-byte bound");
+    }
 
-    Impl::Entry entry{request, static_cast<uint64_t>(exact_input.size()), raw_digest,
-                      std::vector<uint8_t>(exact_input.begin(), exact_input.end()), prepared, 1,
-                      retained, false};
-    const auto [entry_position, entry_inserted] =
-        impl_->entries.emplace(entry_id, std::move(entry));
-    if (!entry_inserted)
-        throw std::logic_error("C preparation authority reused an entry identifier");
+    auto entry_position = impl_->entries.end();
     try {
+        Impl::Entry entry{request, static_cast<uint64_t>(exact_input.size()), raw_digest,
+                          std::vector<uint8_t>(exact_input.begin(), exact_input.end()), prepared, 1,
+                          retained, false};
+        const auto insertion = impl_->entries.emplace(entry_id, std::move(entry));
+        entry_position = insertion.first;
+        const bool entry_inserted = insertion.second;
+        if (!entry_inserted)
+            throw std::logic_error("C preparation authority reused an entry identifier");
         const auto [request_position, request_inserted] = impl_->requests.emplace(request, entry_id);
         (void)request_position;
         if (!request_inserted)
             throw std::logic_error("C preparation request was admitted twice");
+        impl_->retained_bytes += retained;
+        if (impl_->profile == ProfileId::Z3_LONG)
+            impl_->uncommitted_route_entry = entry_id;
+#if defined(ICECC_P50_WITH_LIBBSC)
+        if (impl_->profile == ProfileId::GRZ)
+            impl_->uncommitted_grz_entry = entry_id;
+#endif
+        impl_->consume_tu();
+        impl_->consume_entry();
+        return PreparedTuHandle(impl_->identity, entry_id);
     } catch (...) {
-        impl_->entries.erase(entry_position);
+        if (entry_position != impl_->entries.end())
+            impl_->entries.erase(entry_position);
+#if defined(ICECC_P50_WITH_LIBBSC)
+        if (impl_->profile == ProfileId::GRZ)
+            impl_->grz_codec.discard();
+#endif
         throw;
     }
-    impl_->retained_bytes += retained;
-    if (impl_->profile == ProfileId::Z3_LONG)
-        impl_->uncommitted_route_entry = entry_id;
-    impl_->consume_tu();
-    impl_->consume_entry();
-    return PreparedTuHandle(impl_->identity, entry_id);
 }
 
 uint64_t P50PreparationAuthority::retain(PreparedTuHandle handle) {
@@ -1018,6 +1071,13 @@ uint64_t P50PreparationAuthority::release(PreparedTuHandle handle) {
     if (impl_->profile == ProfileId::Z3_LONG && !entry.committed &&
         impl_->uncommitted_route_entry == handle.entry_id_)
         impl_->uncommitted_route_entry.reset();
+#if defined(ICECC_P50_WITH_LIBBSC)
+    if (impl_->profile == ProfileId::GRZ && !entry.committed &&
+        impl_->uncommitted_grz_entry == handle.entry_id_) {
+        impl_->uncommitted_grz_entry.reset();
+        impl_->grz_codec.discard();
+    }
+#endif
     impl_->retained_bytes -= entry.retained_bytes;
     impl_->entries.erase(position);
     return 0;
@@ -1054,6 +1114,15 @@ void P50PreparationAuthority::commit(PreparedTuHandle handle) {
         entry.committed = true;
         impl_->uncommitted_route_entry.reset();
     }
+#if defined(ICECC_P50_WITH_LIBBSC)
+    if (impl_->profile == ProfileId::GRZ && !entry.committed) {
+        if (impl_->uncommitted_grz_entry != handle.entry_id_)
+            throw std::logic_error("GRZ_RESIDUAL commit is not its prepared successor");
+        impl_->grz_codec.commit();
+        entry.committed = true;
+        impl_->uncommitted_grz_entry.reset();
+    }
+#endif
 }
 
 CStoreGuid P50PreparationAuthority::c_store_guid() const {
@@ -1112,7 +1181,7 @@ void P50PreparationAuthority::validate_begin(const TxBegin& begin) const {
     impl_->owner.require();
     if (impl_->profile == ProfileId::ZSTD_TU)
         validate_zstd_tu_begin(begin, impl_->zstd_limits);
-    else {
+    else if (impl_->profile == ProfileId::Z3_LONG) {
         if (begin.profile != ProfileId::Z3_LONG)
             throw std::invalid_argument("prepared route profile differs from authority");
         // The route envelope has already been validated by its codec; retain
@@ -1122,6 +1191,11 @@ void P50PreparationAuthority::validate_begin(const TxBegin& begin) const {
             begin.raw_bytes > impl_->zstd_limits.max_raw_bytes)
             throw std::length_error("prepared route exceeds authority limits");
     }
+#if defined(ICECC_P50_WITH_LIBBSC)
+    else {
+        validate_grz_residual_begin(begin, impl_->zstd_limits);
+    }
+#endif
 }
 
 struct P50ClientEndpoint::Impl {
@@ -2079,7 +2153,11 @@ struct P50ServerEndpoint::Impl {
                                       .max_raw_bytes = caps.zstd.max_raw_bytes,
                                       .max_window_log = caps.zstd.max_window_log,
                                       .max_history_bytes = caps.zstd.max_history_bytes}));
-        if (begin.profile == ProfileId::Z3_LONG && route.dialogue)
+        if ((begin.profile == ProfileId::Z3_LONG
+#if defined(ICECC_P50_WITH_LIBBSC)
+             || begin.profile == ProfileId::GRZ
+#endif
+             ) && route.dialogue)
             result.pending.dialogue = route.dialogue;
         return result;
     }
@@ -2102,7 +2180,11 @@ struct P50ServerEndpoint::Impl {
             throw std::logic_error("F endpoint already has one active transaction");
         if (route.interrupted && route.interrupted != prepared.pending.begin)
             throw StaleCompletion();
-        if (prepared.pending.begin.profile == ProfileId::Z3_LONG) {
+        if (prepared.pending.begin.profile == ProfileId::Z3_LONG
+#if defined(ICECC_P50_WITH_LIBBSC)
+            || prepared.pending.begin.profile == ProfileId::GRZ
+#endif
+            ) {
             if (!route.dialogue)
                 route.dialogue = prepared.pending.dialogue;
             else

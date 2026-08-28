@@ -84,38 +84,50 @@ uint64_t get_u64(const uint8_t*& cursor, const uint8_t* end) {
     return value;
 }
 
-GroupStage group_encode(std::span<const uint8_t> input) {
+// Encode one TU against the committed route prefix. The matcher is owned by
+// the route codec; newly planted anchors remain provisional until commit and
+// are removed in reverse order on retry/abort.
+GroupStage group_encode(std::span<const uint8_t> history,
+                        std::span<const uint8_t> input,
+                        std::unordered_map<uint64_t, std::vector<uint64_t>>& anchors,
+                        std::vector<std::pair<uint64_t, uint64_t>>& provisional_anchors) {
     GroupStage stage;
-    std::unordered_map<uint64_t, std::vector<uint64_t>> anchors;
-    for (size_t group_start = 0; group_start < input.size(); group_start += kGroupBytes) {
-        const size_t group_end = std::min(input.size(), group_start + kGroupBytes);
+    std::vector<uint8_t> history_input;
+    history_input.reserve(history.size() + input.size());
+    history_input.insert(history_input.end(), history.begin(), history.end());
+    history_input.insert(history_input.end(), input.begin(), input.end());
+    const size_t history_bytes = history.size();
+    for (size_t group_offset = 0; group_offset < input.size(); group_offset += kGroupBytes) {
+        const size_t group_start = history_bytes + group_offset;
+        const size_t group_end = std::min(history_bytes + input.size(), group_start + kGroupBytes);
         ++stage.groups;
         size_t position = group_start;
         size_t residual_start = stage.residual.size();
         while (position < group_end) {
-            uint64_t source = 0;
+            uint64_t source_position = 0;
             size_t length = 0;
             if (position + kAnchorBytes <= group_end) {
-                const uint64_t key = gear_hash(input.data() + position, kAnchorBytes);
+                const uint64_t key = gear_hash(history_input.data() + position, kAnchorBytes);
                 const auto found = anchors.find(key);
                 if (found != anchors.end()) {
                     for (auto candidate = found->second.rbegin(); candidate != found->second.rend(); ++candidate) {
                         const size_t q = static_cast<size_t>(*candidate);
                         if (q >= position || q + kAnchorBytes > position ||
-                            std::memcmp(input.data() + q, input.data() + position, kAnchorBytes) != 0)
+                            std::memcmp(history_input.data() + q,
+                                        history_input.data() + position, kAnchorBytes) != 0)
                             continue;
                         const size_t max_length = std::min(group_end - position, position - q);
                         size_t match = kAnchorBytes;
-                        while (match < max_length && input[q + match] == input[position + match]) ++match;
-                        if (match > length) { source = q; length = match; }
+                        while (match < max_length && history_input[q + match] == history_input[position + match]) ++match;
+                        if (match > length) { source_position = q; length = match; }
                         if (length == max_length) break;
                     }
                 }
             }
             if (length >= kAnchorBytes) {
-                if (position > input.size() - length || source + length > position)
+                if (position > history_input.size() - length || source_position + length > position)
                     throw std::logic_error("GRZ group reference escaped committed history");
-                stage.tokens.push_back({true, source, static_cast<uint32_t>(length)});
+                stage.tokens.push_back({true, source_position, static_cast<uint32_t>(length)});
                 ++stage.references;
                 position += length;
                 residual_start = stage.residual.size();
@@ -123,13 +135,14 @@ GroupStage group_encode(std::span<const uint8_t> input) {
             }
             const size_t add_start = position;
             do {
-                stage.residual.push_back(input[position++]);
+                stage.residual.push_back(history_input[position++]);
                 if (position + kAnchorBytes <= group_end) {
-                    const uint64_t key = gear_hash(input.data() + position, kAnchorBytes);
+                    const uint64_t key = gear_hash(history_input.data() + position, kAnchorBytes);
                     anchors[key].push_back(position);
+                    provisional_anchors.emplace_back(key, position);
                 }
             } while (position < group_end &&
-                     (position + kAnchorBytes > group_end || anchors[gear_hash(input.data() + position, kAnchorBytes)].empty()));
+                     (position + kAnchorBytes > group_end || anchors[gear_hash(history_input.data() + position, kAnchorBytes)].empty()));
             stage.tokens.push_back({false, static_cast<uint64_t>(residual_start),
                                     static_cast<uint32_t>(stage.residual.size() - residual_start)});
             residual_start = stage.residual.size();
@@ -139,7 +152,7 @@ GroupStage group_encode(std::span<const uint8_t> input) {
     return stage;
 }
 
-std::vector<uint8_t> group_pack(const GroupStage& stage,
+std::vector<uint8_t> group_pack(const GroupStage& stage, uint64_t history_bytes,
                                 std::span<const uint8_t> residual_wire) {
     std::vector<uint8_t> output;
     output.reserve(16 + stage.tokens.size() * 13 + residual_wire.size());
@@ -147,6 +160,7 @@ std::vector<uint8_t> group_pack(const GroupStage& stage,
     put_u32(output, stage.groups);
     put_u64(output, stage.references);
     put_u64(output, stage.tokens.size());
+    put_u64(output, history_bytes);
     for (const GroupToken& token : stage.tokens) {
         output.push_back(token.copy ? 1 : 0);
         put_u64(output, token.value);
@@ -163,6 +177,7 @@ struct GroupDecoded {
 };
 
 GroupDecoded group_unpack(const uint8_t* wire, size_t size,
+                          std::span<const uint8_t> history,
                           residual_group::Codec& residual_codec) {
     const uint8_t* cursor = wire;
     const uint8_t* end = wire + size;
@@ -170,6 +185,9 @@ GroupDecoded group_unpack(const uint8_t* wire, size_t size,
     const uint32_t groups = get_u32(cursor, end);
     const uint64_t references = get_u64(cursor, end);
     const uint64_t token_count = get_u64(cursor, end);
+    const uint64_t history_bytes = get_u64(cursor, end);
+    if (history_bytes != history.size())
+        throw std::invalid_argument("GRZ group history does not match route prefix");
     if (groups == 0 || token_count > size / 13 + 1)
         throw std::invalid_argument("GRZ group counts are invalid");
     struct WireToken { bool copy; uint64_t value; uint32_t length; };
@@ -184,13 +202,19 @@ GroupDecoded group_unpack(const uint8_t* wire, size_t size,
     const uint64_t residual_size = get_u64(cursor, end);
     if (residual_size > static_cast<uint64_t>(end - cursor))
         throw std::invalid_argument("GRZ residual payload truncated");
-    const auto residual_frame = residual_codec.decode(cursor, static_cast<size_t>(residual_size));
-    if (residual_frame.wire_bytes != residual_size)
-        throw std::invalid_argument("GRZ residual selector has trailing bytes");
-    const auto& residual = residual_frame.raw;
+    std::vector<uint8_t> empty_residual;
+    const std::vector<uint8_t>* residual = &empty_residual;
+    if (residual_size != 0) {
+        const auto residual_frame = residual_codec.decode(cursor, static_cast<size_t>(residual_size));
+        if (residual_frame.wire_bytes != residual_size)
+            throw std::invalid_argument("GRZ residual selector has trailing bytes");
+        empty_residual = residual_frame.raw;
+        residual = &empty_residual;
+    }
     cursor += residual_size;
     if (cursor != end) throw std::invalid_argument("GRZ group container has trailing bytes");
     GroupDecoded result;
+    result.raw.assign(history.begin(), history.end());
     size_t residual_offset = 0;
     for (const WireToken token : tokens) {
         if (token.length == 0) throw std::invalid_argument("GRZ group token has zero length");
@@ -202,16 +226,17 @@ GroupDecoded group_unpack(const uint8_t* wire, size_t size,
             for (uint32_t i = 0; i < token.length; ++i) result.raw[start + i] = result.raw[token.value + i];
             ++result.references;
         } else {
-            if (token.value != residual_offset || residual_offset > residual.size() ||
-                token.length > residual.size() - residual_offset)
+            if (token.value != residual_offset || residual_offset > residual->size() ||
+                token.length > residual->size() - residual_offset)
                 throw std::invalid_argument("GRZ group ADD does not match residual stream");
-            result.raw.insert(result.raw.end(), residual.begin() + residual_offset,
-                              residual.begin() + residual_offset + token.length);
+            result.raw.insert(result.raw.end(), residual->begin() + residual_offset,
+                              residual->begin() + residual_offset + token.length);
             residual_offset += token.length;
         }
     }
-    if (residual_offset != residual.size() || result.references != references)
+    if (residual_offset != residual->size() || result.references != references)
         throw std::invalid_argument("GRZ group reference/residual accounting differs");
+    result.raw.erase(result.raw.begin(), result.raw.begin() + history.size());
     return result;
 }
 
@@ -257,7 +282,27 @@ bool commit_matches_grz(const TxCommit& commit, const TxBegin& begin) {
 
 struct GrzResidualCodec::State {
     residual_group::Codec codec;
+    std::vector<uint8_t> encode_history;
+    std::vector<uint8_t> encode_pending;
+    std::unordered_map<uint64_t, std::vector<uint64_t>> encode_anchors;
+    std::vector<std::pair<uint64_t, uint64_t>> encode_provisional_anchors;
+    std::vector<uint8_t> decode_history;
+    std::vector<uint8_t> decode_pending;
 };
+
+void rollback_provisional_anchors(
+    std::unordered_map<uint64_t, std::vector<uint64_t>>& anchors,
+    std::vector<std::pair<uint64_t, uint64_t>>& provisional_anchors) noexcept {
+    for (auto it = provisional_anchors.rbegin(); it != provisional_anchors.rend(); ++it) {
+        auto found = anchors.find(it->first);
+        if (found == anchors.end() || found->second.empty() ||
+            found->second.back() != it->second)
+            continue;
+        found->second.pop_back();
+        if (found->second.empty()) anchors.erase(found);
+    }
+    provisional_anchors.clear();
+}
 
 GrzResidualCodec::GrzResidualCodec() : state_(std::make_unique<State>()) {}
 GrzResidualCodec::~GrzResidualCodec() = default;
@@ -274,30 +319,70 @@ GrzResidualEnvelope GrzResidualCodec::encode(
     if (exact_input.size() > limits.max_raw_bytes)
         throw std::length_error("GRZ_RESIDUAL raw input exceeds the local cap");
 
-    const GroupStage stage = group_encode(exact_input);
-    residual_group::Kind selected = residual_group::Kind::Zstd3;
-    const std::vector<uint8_t> residual_wire = state_->codec.encode(
-        stage.residual.data(), stage.residual.size(), &selected);
-    std::vector<uint8_t> encoded = group_pack(stage, residual_wire);
-    if (encoded.empty() || encoded.size() > limits.max_encoded_body_bytes)
-        throw std::length_error("GRZ_RESIDUAL encoded BODY exceeds the local cap");
+    if (!state_->encode_pending.empty())
+        throw std::logic_error("GRZ_RESIDUAL route has an uncommitted TU");
+    if (state_->encode_history.size() > limits.max_history_bytes ||
+        exact_input.size() > limits.max_history_bytes - state_->encode_history.size())
+        throw std::length_error("GRZ_RESIDUAL route history exceeds the local cap");
+    try {
+        const GroupStage stage = group_encode(state_->encode_history, exact_input,
+                                              state_->encode_anchors,
+                                              state_->encode_provisional_anchors);
+        residual_group::Kind selected = residual_group::Kind::Zstd3;
+        const std::vector<uint8_t> residual_wire = state_->codec.encode(
+            stage.residual.data(), stage.residual.size(), &selected);
+        std::vector<uint8_t> encoded = group_pack(stage, state_->encode_history.size(), residual_wire);
+        if (encoded.empty() || encoded.size() > limits.max_encoded_body_bytes) {
+            rollback_provisional_anchors(state_->encode_anchors,
+                                         state_->encode_provisional_anchors);
+            throw std::length_error("GRZ_RESIDUAL encoded BODY exceeds the local cap");
+        }
 
-    GrzResidualEnvelope result;
-    result.begin.history_nonce = history_nonce;
-    result.begin.rel_seq = rel_seq;
-    result.begin.tu_seq = tu_seq;
-    result.begin.profile = ProfileId::GRZ;
-    result.begin.p29_root_mode = P29RootMode::NotApplicable;
-    result.begin.pre_state_digest = pre_state_digest;
-    result.begin.dict = empty_dict_descriptor();
-    result.begin.body = describe_component(kGrzResidualBodyEncoding, encoded,
-                                           exact_input.size());
-    result.begin.raw_bytes = exact_input.size();
-    result.begin.raw_digest = icecc::digest128(exact_input);
-    result.body = std::move(encoded);
-    result.begin.transaction_digest = compute_transaction_digest(
-        result.begin, std::span<const uint8_t>{}, result.body);
-    return result;
+        GrzResidualEnvelope result;
+        result.begin.history_nonce = history_nonce;
+        result.begin.rel_seq = rel_seq;
+        result.begin.tu_seq = tu_seq;
+        result.begin.profile = ProfileId::GRZ;
+        result.begin.p29_root_mode = P29RootMode::NotApplicable;
+        result.begin.pre_state_digest = pre_state_digest;
+        result.begin.dict = empty_dict_descriptor();
+        result.begin.body = describe_component(kGrzResidualBodyEncoding, encoded,
+                                               exact_input.size());
+        result.begin.raw_bytes = exact_input.size();
+        result.begin.raw_digest = icecc::digest128(exact_input);
+        result.body = std::move(encoded);
+        result.begin.transaction_digest = compute_transaction_digest(
+            result.begin, std::span<const uint8_t>{}, result.body);
+        state_->encode_pending.assign(exact_input.begin(), exact_input.end());
+        return result;
+    } catch (...) {
+        rollback_provisional_anchors(state_->encode_anchors,
+                                     state_->encode_provisional_anchors);
+        throw;
+    }
+}
+
+void GrzResidualCodec::commit() {
+    if (!state_->encode_pending.empty()) {
+        state_->encode_history.insert(state_->encode_history.end(),
+                                      state_->encode_pending.begin(),
+                                      state_->encode_pending.end());
+        state_->encode_pending.clear();
+        state_->encode_provisional_anchors.clear();
+    }
+    if (!state_->decode_pending.empty()) {
+        state_->decode_history.insert(state_->decode_history.end(),
+                                      state_->decode_pending.begin(),
+                                      state_->decode_pending.end());
+        state_->decode_pending.clear();
+    }
+}
+
+void GrzResidualCodec::discard() noexcept {
+    rollback_provisional_anchors(state_->encode_anchors,
+                                 state_->encode_provisional_anchors);
+    state_->encode_pending.clear();
+    state_->decode_pending.clear();
 }
 
 GrzResidualEnvelope encode_grz_residual(
@@ -324,12 +409,15 @@ std::vector<uint8_t> GrzResidualCodec::decode(
     if (compute_transaction_digest(begin, std::span<const uint8_t>{},
                                    encoded_body) != begin.transaction_digest)
         throw std::invalid_argument("GRZ_RESIDUAL transaction digest differs");
+    if (!state_->decode_pending.empty())
+        throw std::logic_error("GRZ_RESIDUAL route has an uncommitted decoded TU");
     const GroupDecoded decoded = group_unpack(encoded_body.data(), encoded_body.size(),
-                                              state_->codec);
+                                              state_->decode_history, state_->codec);
     if (decoded.raw.size() != begin.raw_bytes)
         throw std::invalid_argument("GRZ_RESIDUAL decoded size differs");
     if (icecc::digest128(decoded.raw) != begin.raw_digest)
         throw std::invalid_argument("GRZ_RESIDUAL raw input digest differs");
+    state_->decode_pending = decoded.raw;
     return decoded.raw;
 }
 
@@ -410,13 +498,15 @@ void GrzResidualDialogue::commit_visible(const TxCommit& commit) {
         throw std::logic_error("GRZ_RESIDUAL commit became visible before materialization");
     if (!active_ || !commit_matches_grz(commit, *active_))
         throw std::invalid_argument("GRZ_RESIDUAL terminal commit differs from TX_BEGIN");
+    codec_.commit();
     clear_active(); state_ = State::Idle;
 }
 
 void GrzResidualDialogue::discard_tentative() noexcept {
+    codec_.discard();
     if (state_ != State::Idle && state_ != State::Terminal) { clear_active(); state_ = State::Idle; }
 }
-void GrzResidualDialogue::disconnect() { clear_active(); state_ = State::Terminal; }
+void GrzResidualDialogue::disconnect() { codec_.discard(); clear_active(); state_ = State::Terminal; }
 void GrzResidualDialogue::reset() {
     if (state_ != State::Terminal) throw std::logic_error("GRZ_RESIDUAL reset requires a terminal dialogue");
     clear_active(); state_ = State::Idle;
@@ -425,7 +515,7 @@ uint64_t GrzResidualDialogue::window_limit_bytes() const noexcept {
     return uint64_t{1} << limits_.max_window_log;
 }
 [[noreturn]] void GrzResidualDialogue::protocol_error(const char* message) {
-    clear_active(); state_ = State::Terminal; throw std::invalid_argument(message);
+    codec_.discard(); clear_active(); state_ = State::Terminal; throw std::invalid_argument(message);
 }
 void GrzResidualDialogue::clear_active() { active_.reset(); std::vector<uint8_t>().swap(body_); }
 

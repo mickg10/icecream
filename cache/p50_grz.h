@@ -28,6 +28,10 @@ public:
                                TuSeq tu_seq, Digest128 pre_state_digest,
                                std::span<const uint8_t> exact_input,
                                ZstdTuLimits limits);
+    // A route publishes matcher/history state only when its prepared TU is
+    // committed.  Rejection and retry discard the tentative frame state.
+    void commit();
+    void discard() noexcept;
     std::vector<uint8_t> decode(const TxBegin& begin,
                                 std::span<const uint8_t> encoded_body,
                                 ZstdTuLimits limits);

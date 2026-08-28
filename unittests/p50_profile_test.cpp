@@ -330,6 +330,57 @@ void test_interactive_hooks_are_reachable_and_fail_closed_for_zstd() {
 
 void test_factory_rejects_unsupported_or_unnegotiated() {
 #if defined(ICECC_P50_WITH_LIBBSC)
+    // The production codec is route-scoped: each call is one complete TU
+    // frame, while committed matcher history persists into the next TU.
+    std::vector<uint8_t> route_tu1(20000);
+    uint32_t route_seed = 0x7f4a7c15U;
+    for (size_t i = 0; i < route_tu1.size(); ++i) {
+        route_seed ^= route_seed << 13;
+        route_seed ^= route_seed >> 17;
+        route_seed ^= route_seed << 5;
+        route_tu1[i] = static_cast<uint8_t>(route_seed >> 24);
+    }
+    std::vector<uint8_t> route_tu2 = route_tu1;
+    GrzResidualCodec route_encoder;
+    const auto route_one = route_encoder.encode(HistoryNonce{20}, RelSeq{0}, TuSeq{1},
+                                                Digest128{}, route_tu1, limits());
+    require(grz_residual_group_reference_count(route_one.body) == 0,
+            "GRZ_RESIDUAL first route TU referenced bytes before its prefix");
+    route_encoder.commit();
+    const auto route_two = route_encoder.encode(HistoryNonce{20}, RelSeq{1}, TuSeq{2},
+                                                route_commit(route_one.begin).post_state_digest,
+                                                route_tu2, limits());
+    require(grz_residual_group_reference_count(route_two.body) != 0,
+            "GRZ_RESIDUAL route matcher did not reference the prior TU");
+    route_encoder.discard();
+    GrzResidualCodec retry_encoder;
+    const auto retry_one = retry_encoder.encode(HistoryNonce{21}, RelSeq{0}, TuSeq{1},
+                                                Digest128{}, route_tu1, limits());
+    retry_encoder.discard();
+    const auto retry_again = retry_encoder.encode(HistoryNonce{21}, RelSeq{0}, TuSeq{1},
+                                                  Digest128{}, route_tu1, limits());
+    require(retry_one.body == retry_again.body,
+            "GRZ_RESIDUAL retry changed the uncommitted route frame");
+    retry_encoder.commit();
+    const auto retry_two = retry_encoder.encode(HistoryNonce{21}, RelSeq{1}, TuSeq{2},
+                                                route_commit(retry_again.begin).post_state_digest,
+                                                route_tu2, limits());
+    require(grz_residual_group_reference_count(retry_two.body) != 0,
+            "GRZ_RESIDUAL retry published no committed matcher history");
+    GrzResidualCodec other_route;
+    const auto isolated_two = other_route.encode(HistoryNonce{22}, RelSeq{0}, TuSeq{2},
+                                                  Digest128{}, route_tu2, limits());
+    require(grz_residual_group_reference_count(isolated_two.body) == 0,
+            "GRZ_RESIDUAL matcher history crossed route ownership");
+
+    GrzResidualCodec route_decoder;
+    require(route_decoder.decode(route_one.begin, route_one.body, limits()) == route_tu1,
+            "GRZ_RESIDUAL route decoder rejected its first TU");
+    route_decoder.commit();
+    require(route_decoder.decode(route_two.begin, route_two.body, limits()) == route_tu2,
+            "GRZ_RESIDUAL route decoder did not use committed TU history");
+    route_decoder.commit();
+
     for (uint8_t corpus = 1; corpus <= 3; ++corpus) {
         std::vector<uint8_t> input(200000U * corpus);
         for (size_t i = 0; i < input.size(); ++i)
