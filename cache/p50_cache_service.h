@@ -26,6 +26,7 @@
 #include "p50_input_fd_attachment.h"
 #include "p50_input_lifecycle.h"
 #include "p50_local_transport.h"
+#include "../client/p50_route_owner.h"
 
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/executor_work_guard.hpp>
@@ -125,6 +126,13 @@ public:
         InputLifecycleRequest request,
         std::chrono::steady_clock::time_point deadline) noexcept;
 
+    // Consume one admitted source descriptor on the bounded control worker;
+    // the persistent route owner and mutable sender state stay on context_.
+    [[nodiscard]] local::P50SourceTransferResult transfer_source_on_owner(
+        local::P50SourceTransferRequest request,
+        sidecar::AbsoluteMonotonicDeadline deadline,
+        local::HandoffFd source) noexcept;
+
     // Route an authenticated dedicated F-session control connection (first
     // post-handshake bytes carry the P5FS envelope magic) onto the endpoint
     // owner executor. Takes ownership of connection_fd. No per-connection
@@ -171,6 +179,7 @@ private:
     InputLifecycleRegistry input_lifecycle_;
     boost::asio::io_context context_;
     std::unique_ptr<P50ServerEndpoint> endpoint_;
+    std::unique_ptr<P50CRouteOwner> route_owner_;
     EndpointWorkGuard endpoint_work_guard_;
     std::thread endpoint_owner_thread_;
     std::atomic<bool> endpoint_owner_failed_{false};

@@ -855,6 +855,49 @@ bool handle_connection(local::Connection connection, const Options& options,
             runtime.start_adopted_endpoint(adopted.release());
             return true;
         }
+        if (operation.kind == local::ControlOperationKind::SourceTransfer) {
+            const auto clock = sidecar::process_monotonic_clock_identity();
+            if (!operation.source_arm.has_value() ||
+                !operation.absolute_deadline.valid() ||
+                !operation.absolute_deadline.matches_clock(clock) ||
+                operation.absolute_deadline.expired(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count(),
+                    clock.clock_domain_id, clock.time_namespace_id))
+                return true;
+            local::FdHandoffReceiver receiver;
+            const local::FdHandoffResult handoff = receiver.receive_and_ack(
+                connection, local::HandoffRequest{options.identity, operation.request_id},
+                operation.absolute_deadline.as_steady_time_point());
+            if (handoff.status != local::FdHandoffStatus::Accepted)
+                return true;
+            local::HandoffFd source = receiver.take_adopted_fd();
+            const local::P50SourceTransferResult transfer =
+                runtime.transfer_source_on_owner(
+                    *operation.source_arm, operation.absolute_deadline,
+                    std::move(source));
+            const std::vector<uint8_t> response_payload =
+                local::encode_control_operation(
+                    local::make_source_transfer_reply_operation(operation, transfer));
+            if (response_payload.empty())
+                return true;
+            const auto operation_deadline = operation.absolute_deadline.as_steady_time_point();
+            const local::Frame response{local::kProtocolVersion,
+                                        local::MessageType::Data,
+                                        options.identity, response_payload};
+            if (connection.send_until(response, operation_deadline) != local::Status::Ok)
+                return true;
+            local::Frame acknowledgement;
+            if (connection.receive_until(acknowledgement, operation_deadline) !=
+                    local::Status::Ok ||
+                acknowledgement.type != local::MessageType::Goodbye ||
+                !acknowledgement.payload.empty() ||
+                local::validate_identity(acknowledgement, options.identity) !=
+                    local::Status::Ok)
+                return true;
+            return true;
+        }
         if (!operation.input.has_value() || !operation.owner.has_value())
             return true;
 
@@ -987,6 +1030,63 @@ RuntimeConfig validate_runtime_config(RuntimeConfig config) {
     return config;
 }
 
+local::P50SourceTransferResult source_transfer_error(uint16_t code,
+                                                     uint8_t attempts = 0) noexcept {
+    local::P50SourceTransferResult result;
+    result.code = local::SourceTransferResultCode::Error;
+    result.error_code = code == 0 ? 1 : code;
+    result.attempts = attempts;
+    return result;
+}
+
+local::P50SourceTransferResult source_transfer_result(
+    const ZstdSourceTransferResult& transfer, CStoreGuid expected_c_guid) noexcept {
+    if (transfer.status != ZstdSourceTransferStatus::Committed ||
+        !transfer.committed_input.has_value() ||
+        transfer.raw_bytes == 0 || transfer.raw_digest == Digest128{} ||
+        transfer.committed_input->c_store_guid != expected_c_guid)
+        return source_transfer_error(static_cast<uint16_t>(transfer.status) + 1,
+                                     transfer.attempts);
+    local::P50SourceTransferResult result;
+    result.code = local::SourceTransferResultCode::Committed;
+    result.tu_seq = transfer.committed_input->tu_seq.value;
+    result.raw_bytes = transfer.raw_bytes;
+    result.raw_digest = transfer.raw_digest;
+    result.attempts = transfer.attempts;
+    result.c_store_guid = expected_c_guid;
+    return result;
+}
+
+std::optional<std::shared_ptr<const std::vector<uint8_t>>> read_source_fd(
+    int fd, uint64_t limit) noexcept {
+    if (fd < 0 || limit > SIZE_MAX)
+        return std::nullopt;
+    struct stat info{};
+    if (::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) || info.st_size < 0 ||
+        static_cast<uint64_t>(info.st_size) > limit)
+        return std::nullopt;
+    try {
+        auto result = std::make_shared<std::vector<uint8_t>>(
+            static_cast<size_t>(info.st_size));
+        size_t offset = 0;
+        while (offset != result->size()) {
+            const ssize_t count = ::pread(fd, result->data() + offset,
+                                          result->size() - offset,
+                                          static_cast<off_t>(offset));
+            if (count > 0) {
+                offset += static_cast<size_t>(count);
+                continue;
+            }
+            if (count < 0 && errno == EINTR)
+                continue;
+            return std::nullopt;
+        }
+        return std::const_pointer_cast<const std::vector<uint8_t>>(result);
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
 } // namespace
 
 SidecarRuntime::SidecarRuntime(RuntimeConfig config)
@@ -1044,7 +1144,172 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
     endpoint_ = std::make_unique<P50ServerEndpoint>(
         config_.f_store_guid, config_.endpoint_caps, nullptr, nullptr,
         config_.endpoint_config);
+    P50RouteOwnerConfig route_config;
+    route_config.endpoint_caps = config_.endpoint_caps;
+    route_config.compression_level = 3;
+    route_owner_ = std::make_unique<P50CRouteOwner>(std::move(route_config));
     endpoint_owner_thread_ = std::thread([this] { endpoint_owner_loop(); });
+}
+
+local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
+    local::P50SourceTransferRequest request,
+    sidecar::AbsoluteMonotonicDeadline deadline,
+    local::HandoffFd source) noexcept {
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    if (!route_owner_ || !request.valid() || !config_.sidecar_launch.has_value() ||
+        !config_.sidecar_launch->valid() ||
+        config_.sidecar_launch->c_store_guid != config_.c_store_guid ||
+        config_.f_store_guid == FStoreGuid{} || config_.f_store_generation == 0 ||
+        !deadline.valid() ||
+        !deadline.matches_clock(clock) ||
+        deadline.expired(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count(),
+                         clock.clock_domain_id, clock.time_namespace_id) ||
+        !source.valid())
+        return source_transfer_error(1);
+
+    P50SourceArmFields arm;
+    arm.wire_job_id = request.wire_job_id;
+    arm.assignment_epoch = request.assignment_epoch;
+    arm.assignment_nonce = request.assignment_nonce;
+    arm.selected_f_host = request.selected_f_host;
+    arm.selected_f_ordinary_port = request.selected_f_ordinary_port;
+    arm.selected_f_cache_port = request.selected_f_cache_port;
+    arm.cache_protocol = request.cache_protocol;
+    arm.cache_profile = request.cache_profile;
+    arm.logical_job = request.logical_job;
+    arm.compiler_attempt = request.compiler_attempt;
+    arm.c_store_generation = config_.sidecar_launch->store_generation;
+    arm.c_store_derivation_version = kStoreIdentityDerivationVersion;
+    arm.c_store_guid = config_.c_store_guid.bytes;
+    arm.source_request_id = request.source_request_id;
+    arm.source_mode = request.source_mode;
+    arm.c_control_generation = config_.sidecar_launch->identity.generation;
+    arm.c_control_attempt = config_.sidecar_launch->identity.attempt;
+    if (!arm.valid())
+        return source_transfer_error(1);
+
+    const ProfileId profile = arm.cache_profile == CACHE_PROFILE_ZSTD_ROUTE
+                                  ? ProfileId::Z3_LONG
+                                  : arm.cache_profile == CACHE_PROFILE_ZSTD_TU
+                                        ? ProfileId::ZSTD_TU
+                                        : ProfileId::P29;
+    if (profile == ProfileId::P29)
+        return source_transfer_error(2);
+    const auto source_bytes = read_source_fd(
+        source.get(), config_.endpoint_caps.zstd.max_raw_bytes);
+    if (!source_bytes.has_value())
+        return source_transfer_error(3);
+
+    const PrepareRequestKey route_request{arm.assignment_epoch,
+                                          arm.assignment_nonce};
+    const auto transfer_deadline = deadline.as_steady_time_point();
+
+    struct PendingFd {
+        int fd = -1;
+        ~PendingFd() { if (fd >= 0) ::close(fd); }
+    };
+    auto open_armed = [arm](std::chrono::steady_clock::time_point limit,
+                             FStoreGuid& remote_guid,
+                             uint64_t& remote_generation) {
+        try {
+            std::unique_ptr<MsgChannel> channel(Service::createChannelUntil(
+                arm.selected_f_host,
+                static_cast<unsigned short>(arm.selected_f_cache_port), limit));
+            if (!channel || channel->protocol != PROTOCOL_VERSION_CACHE_ADVERTISEMENT ||
+                std::chrono::steady_clock::now() >= limit)
+                return -1;
+            const P50SourceArmMsg request_message(arm);
+            if (!channel->send_msg(request_message, MsgChannel::SendNonBlocking))
+                return -1;
+            const auto remaining = limit - std::chrono::steady_clock::now();
+            const auto timeout = std::chrono::duration_cast<std::chrono::seconds>(remaining).count();
+            if (timeout <= 0 || timeout > INT_MAX)
+                return -1;
+            std::unique_ptr<Msg> response(channel->get_msg(static_cast<int>(timeout)));
+            const auto* acknowledgement = response != nullptr
+                                              ? dynamic_cast<P50SourceArmedMsg*>(response.get())
+                                              : nullptr;
+            if (acknowledgement == nullptr ||
+                !acknowledgement->acknowledges(request_message) ||
+                std::chrono::steady_clock::now() >= limit)
+                return -1;
+            remote_guid.bytes = acknowledgement->f_store_guid;
+            remote_generation = acknowledgement->f_store_generation;
+            if (remote_guid == FStoreGuid{} || remote_generation == 0)
+                return -1;
+            if (!channel->send_msg(CacheSessionMsg(), MsgChannel::SendNonBlocking))
+                return -1;
+            return channel->release_fd_after_cache_session_ready(limit);
+        } catch (...) {
+            return -1;
+        }
+    };
+
+    FStoreGuid remote_f_guid;
+    uint64_t remote_f_generation = 0;
+    const int first_fd = open_armed(transfer_deadline, remote_f_guid,
+                                    remote_f_generation);
+    if (first_fd < 0)
+        return source_transfer_error(4);
+    auto first = std::make_shared<PendingFd>();
+    first->fd = first_fd;
+    const P50RouteRelationship relationship{
+        config_.c_store_guid, remote_f_guid, remote_f_generation, profile};
+    const ConnectedFdFactory connection =
+        [first, open_armed, expected_guid = remote_f_guid,
+         expected_generation = remote_f_generation](
+            std::chrono::steady_clock::time_point limit) mutable {
+            if (first->fd >= 0) {
+                const int fd = first->fd;
+                first->fd = -1;
+                return fd;
+            }
+            FStoreGuid observed_guid;
+            uint64_t observed_generation = 0;
+            const int fd = open_armed(limit, observed_guid, observed_generation);
+            if (fd < 0 || observed_guid != expected_guid ||
+                observed_generation != expected_generation) {
+                if (fd >= 0)
+                    ::close(fd);
+                return -1;
+            }
+            return fd;
+        };
+
+    auto completion = std::make_shared<std::promise<local::P50SourceTransferResult>>();
+    std::future<local::P50SourceTransferResult> result = completion->get_future();
+    try {
+        asio::co_spawn(
+            context_,
+            [this, relationship, request, connection, transfer_deadline,
+             source_bytes = *source_bytes, completion, route_request,
+             expected_c_guid = config_.c_store_guid]() mutable
+                -> asio::awaitable<void> {
+                local::P50SourceTransferResult value = source_transfer_error(4);
+                try {
+                    const ZstdSourceTransferResult transfer = co_await route_owner_->transfer(
+                        relationship, route_request, connection, transfer_deadline,
+                        std::span<const uint8_t>(*source_bytes));
+                    value = source_transfer_result(transfer, expected_c_guid);
+                } catch (...) {
+                    value = source_transfer_error(5);
+                }
+                completion->set_value(value);
+                co_return;
+            },
+            asio::detached);
+    } catch (...) {
+        return source_transfer_error(6);
+    }
+    // The route owner uses the same absolute deadline for connect, arm, and
+    // CacheWire.  A bounded grace lets the owner coroutine publish its typed
+    // terminal result without allowing a control worker to wait forever.
+    const auto wait_limit = transfer_deadline + config_.cancellation_grace;
+    if (result.wait_until(wait_limit) != std::future_status::ready)
+        return source_transfer_error(7);
+    return result.get();
 }
 
 SidecarRuntime::~SidecarRuntime() {

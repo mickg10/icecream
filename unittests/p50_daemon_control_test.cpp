@@ -27,6 +27,27 @@ ControlOperation operation() {
     return value;
 }
 
+ControlOperation source_operation() {
+    P50SourceTransferRequest arm;
+    arm.wire_job_id = 7;
+    arm.assignment_epoch = 3;
+    arm.assignment_nonce = 4;
+    arm.selected_f_host = "worker.example";
+    arm.selected_f_ordinary_port = 10245;
+    arm.selected_f_cache_port = 10246;
+    arm.cache_protocol = CACHE_WIRE_PROTOCOL_V1;
+    arm.cache_profile = CACHE_PROFILE_ZSTD_TU;
+    arm.logical_job = 19;
+    arm.compiler_attempt = 20;
+    arm.source_request_id = 23;
+    arm.source_mode = P50_SOURCE_MODE_ZSTD_TU;
+    const auto clock = icecc::p50::sidecar::process_monotonic_clock_identity();
+    const auto deadline = icecc::p50::sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+        std::chrono::steady_clock::now() + std::chrono::seconds(5),
+        clock.clock_domain_id, clock.time_namespace_id);
+    return make_source_transfer_operation(Identity{91, 17}, arm, deadline);
+}
+
 CredentialExpectation credentials() {
     return CredentialExpectation{static_cast<uint64_t>(::getuid()),
                                  static_cast<uint64_t>(::getgid()),
@@ -184,6 +205,70 @@ void test_extra_fd_is_closed_and_rejected() {
     receiver.advance(std::chrono::steady_clock::now(), pfd.revents);
     CHECK(receiver.status() == DaemonControlStatus::ExtraFd);
     ::close(first); ::close(second); ::close(pair[0]);
+}
+
+void test_source_transfer_reply_and_tu0() {
+    int pair[2] = {-1, -1};
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    nonblock(pair[0]);
+    const ControlOperation expected = source_operation();
+    const int payload = ::open("/dev/null", O_RDONLY);
+    CHECK(payload >= 0);
+    DaemonControlOperation sender;
+    CHECK(sender.begin_authenticated(
+              pair[0], expected, payload, credentials(),
+              expected.identity,
+              std::chrono::steady_clock::now() + std::chrono::seconds(5),
+              DaemonControlLimits{2, 4096}, DaemonControlFdOwnership::Borrowed) ==
+          DaemonControlStatus::InProgress);
+
+    std::thread peer([&] {
+        Frame control;
+        CHECK(read_frame(pair[1], control) == Status::Ok);
+        ControlOperation decoded;
+        CHECK(control.type == MessageType::Data &&
+              decode_control_operation(control.payload, decoded));
+        CHECK(decoded.kind == expected.kind && decoded.identity == expected.identity &&
+              decoded.request_id == expected.request_id &&
+              decoded.source_arm == expected.source_arm &&
+              decoded.absolute_deadline == expected.absolute_deadline);
+
+        Connection connection(pair[1]);
+        CHECK(connection.verify_peer_credentials(credentials()) == Status::Ok);
+        FdHandoffReceiver receiver;
+        const auto handoff = receiver.receive_and_ack(
+            connection, HandoffRequest{expected.identity, expected.request_id},
+            expected.absolute_deadline.as_steady_time_point());
+        CHECK(handoff.status == FdHandoffStatus::Accepted);
+        HandoffFd received = receiver.take_adopted_fd();
+        CHECK(received.valid());
+        received.reset();
+
+        P50SourceTransferResult result;
+        result.code = SourceTransferResultCode::Committed;
+        result.attempts = 1;
+        result.tu_seq = 0;
+        result.raw_bytes = 1;
+        result.raw_digest.bytes[0] = 9;
+        result.c_store_guid.bytes[15] = 91;
+        const auto response = make_source_transfer_reply_operation(expected, result);
+        write_frame(pair[1], Frame{kProtocolVersion, MessageType::Data,
+                                   expected.identity, encode_control_operation(response)});
+        Frame goodbye;
+        CHECK(read_frame(pair[1], goodbye) == Status::Ok);
+        CHECK(goodbye.type == MessageType::Goodbye && goodbye.identity == expected.identity);
+    });
+    while (!sender.done()) {
+        pollfd pfd{pair[0], sender.desired_events(), 0};
+        const int ready = ::poll(&pfd, 1, 1000);
+        CHECK(ready == 1);
+        sender.advance(std::chrono::steady_clock::now(), pfd.revents);
+    }
+    peer.join();
+    CHECK(sender.status() == DaemonControlStatus::Complete);
+    CHECK(sender.source_transfer_result().has_value());
+    CHECK(sender.source_transfer_result()->tu_seq == 0);
+    ::close(pair[1]);
 }
 
 void test_canonical_request_codec_both_directions() {
@@ -627,6 +712,7 @@ void test_connect_pending_ignores_preconnect_hup() {
 int main() {
     test_incremental_handoff_and_fairness();
     test_extra_fd_is_closed_and_rejected();
+    test_source_transfer_reply_and_tu0();
     test_canonical_request_codec_both_directions();
     test_nonzero_reserved_code_rejected();
     test_client_frame_trailing_rejected();

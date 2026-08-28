@@ -54,6 +54,12 @@ bool nonblocking(int fd) noexcept {
     return flags >= 0 && (flags & O_NONBLOCK) != 0;
 }
 
+bool ensure_nonblocking(int fd) noexcept {
+    const int flags = fd >= 0 ? ::fcntl(fd, F_GETFL) : -1;
+    return flags >= 0 && ((flags & O_NONBLOCK) != 0 ||
+                          ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0);
+}
+
 bool valid_limits(const DaemonControlLimits& limits) noexcept {
     return limits.syscalls_per_turn != 0 && limits.bytes_per_turn != 0;
 }
@@ -97,7 +103,8 @@ DaemonControlOperation::DaemonControlOperation(DaemonControlOperation&& other) n
       last_bytes_(other.last_bytes_), peer_(other.peer_),
       lifecycle_mode_(other.lifecycle_mode_),
       lifecycle_goodbye_(std::move(other.lifecycle_goodbye_)),
-      lifecycle_result_(other.lifecycle_result_) {
+      lifecycle_result_(other.lifecycle_result_),
+      source_transfer_result_(other.source_transfer_result_) {
     other.fd_ = -1; other.transfer_fd_ = -1; other.own_fd_ = false;
     other.status_ = DaemonControlStatus::Idle;
 }
@@ -118,6 +125,7 @@ DaemonControlOperation& DaemonControlOperation::operator=(DaemonControlOperation
     lifecycle_mode_ = other.lifecycle_mode_;
     lifecycle_goodbye_ = std::move(other.lifecycle_goodbye_);
     lifecycle_result_ = other.lifecycle_result_;
+    source_transfer_result_ = other.source_transfer_result_;
     other.fd_ = -1; other.transfer_fd_ = -1; other.own_fd_ = false;
     other.status_ = DaemonControlStatus::Idle;
     return *this;
@@ -140,9 +148,10 @@ void DaemonControlOperation::fail(DaemonControlStatus status) noexcept {
 bool DaemonControlOperation::query_peer() noexcept {
     peer_ = query_peer_credentials(fd_);
     peer_queried_ = true;
-    return peer_.has_value() && credentials_.uid.has_value() && credentials_.gid.has_value() &&
-           credentials_.pid.has_value() && peer_->uid == *credentials_.uid &&
-           peer_->gid == *credentials_.gid && peer_->pid == *credentials_.pid;
+    return peer_.has_value() && credentials_.uid.has_value() &&
+           credentials_.gid.has_value() && peer_->uid == *credentials_.uid &&
+           peer_->gid == *credentials_.gid &&
+           (!credentials_.pid.has_value() || peer_->pid == *credentials_.pid);
 }
 
 DaemonControlStatus DaemonControlOperation::begin(
@@ -245,6 +254,86 @@ DaemonControlStatus DaemonControlOperation::begin_connected(
     rights_sent_ = false; peer_queried_ = false; peer_.reset();
     lifecycle_goodbye_.clear();
     lifecycle_result_.reset();
+    source_transfer_result_.reset();
+    last_calls_ = last_bytes_ = 0;
+    return status_;
+}
+
+DaemonControlStatus DaemonControlOperation::begin_authenticated(
+    int nonblocking_fd, const ControlOperation& operation, int transfer_fd,
+    const CredentialExpectation& credentials, Identity authenticated_identity,
+    std::chrono::steady_clock::time_point deadline, DaemonControlLimits limits,
+    DaemonControlFdOwnership ownership) noexcept {
+    if (nonblocking_fd < 0 ||
+        operation.kind != ControlOperationKind::SourceTransfer ||
+        transfer_fd < 0 || !valid_limits(limits) ||
+        deadline <= std::chrono::steady_clock::now() ||
+        operation.identity != authenticated_identity ||
+        authenticated_identity.generation == 0 ||
+        authenticated_identity.attempt == 0 ||
+        !credentials.uid.has_value() || !credentials.gid.has_value()) {
+        if (ownership == DaemonControlFdOwnership::Owned && nonblocking_fd >= 0)
+            ::close(nonblocking_fd);
+        return status_ = DaemonControlStatus::InvalidArgument;
+    }
+    if (!ensure_nonblocking(nonblocking_fd)) {
+        if (ownership == DaemonControlFdOwnership::Owned && nonblocking_fd >= 0)
+            ::close(nonblocking_fd);
+        return status_ = DaemonControlStatus::InvalidArgument;
+    }
+    std::vector<uint8_t> encoded;
+    try {
+        encoded = encode_control_operation(operation);
+    } catch (...) {
+        if (ownership == DaemonControlFdOwnership::Owned)
+            ::close(nonblocking_fd);
+        return status_ = DaemonControlStatus::InvalidArgument;
+    }
+    if (encoded.empty()) {
+        if (ownership == DaemonControlFdOwnership::Owned)
+            ::close(nonblocking_fd);
+        return status_ = DaemonControlStatus::InvalidArgument;
+    }
+    close_fd();
+    fd_ = nonblocking_fd;
+    own_fd_ = ownership == DaemonControlFdOwnership::Owned;
+    transfer_fd_ = transfer_fd;
+    try {
+        operation_ = operation;
+        credentials_ = credentials;
+        deadline_ = deadline;
+        limits_ = limits;
+        lifecycle_mode_ = false;
+        hello_.clear();
+        control_ = encode_frame(Frame{kProtocolVersion, MessageType::Data,
+                                      operation.identity, encoded});
+    } catch (...) {
+        fail(DaemonControlStatus::InvalidArgument);
+        return status_;
+    }
+    if (control_.empty()) {
+        fail(DaemonControlStatus::InvalidArgument);
+        return status_;
+    }
+    handoff_ = handoff_wire(kRequest, operation, 0);
+    connect_path_.clear();
+    phase_ = Phase::WriteControl;
+    status_ = DaemonControlStatus::InProgress;
+    offset_ = ack_offset_ = 0;
+    frame_read_.clear();
+    frame_expected_ = 0;
+    rights_sent_ = false;
+    peer_queried_ = false;
+    peer_.reset();
+    lifecycle_goodbye_.clear();
+    lifecycle_result_.reset();
+    source_transfer_result_.reset();
+    // Authentication is part of admission for this entry, before any
+    // operation bytes or source rights are emitted.
+    if (!query_peer()) {
+        fail(DaemonControlStatus::CredentialFailure);
+        return status_;
+    }
     last_calls_ = last_bytes_ = 0;
     return status_;
 }
@@ -273,7 +362,8 @@ DaemonControlStatus DaemonControlOperation::begin_connecting(
 short DaemonControlOperation::desired_events() const noexcept {
     if (status_ != DaemonControlStatus::InProgress) return 0;
     if (phase_ == Phase::CheckHelloAckTrailing || phase_ == Phase::CheckAckTrailing ||
-        phase_ == Phase::CheckLifecycleReplyTrailing)
+        phase_ == Phase::CheckLifecycleReplyTrailing ||
+        phase_ == Phase::CheckSourceReplyTrailing)
         return POLLIN | POLLOUT;
     if (phase_ == Phase::ConnectPending || phase_ == Phase::Connecting ||
         phase_ == Phase::WriteHello ||
@@ -476,6 +566,78 @@ bool DaemonControlOperation::read_lifecycle_reply(size_t& calls,
     return true;
 }
 
+bool DaemonControlOperation::read_source_reply(size_t& calls,
+                                                size_t& budget) noexcept {
+    if (frame_expected_ == 0) {
+        try {
+            frame_read_.resize(kFrameHeaderSize);
+        } catch (...) {
+            fail(DaemonControlStatus::Malformed);
+            return false;
+        }
+        frame_expected_ = kFrameHeaderSize;
+    }
+    if (budget == 0)
+        return false;
+    const size_t remaining = frame_expected_ - offset_;
+    const ssize_t count = ::recv(fd_, frame_read_.data() + offset_,
+                                 std::min(remaining, budget), MSG_DONTWAIT);
+    ++calls;
+    if (count > 0) {
+        offset_ += static_cast<size_t>(count);
+        budget -= static_cast<size_t>(count);
+    } else if (count == 0) {
+        fail(offset_ == 0 ? DaemonControlStatus::Disconnected
+                          : DaemonControlStatus::Truncated);
+        return false;
+    } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+        fail(DaemonControlStatus::IoError);
+        return false;
+    } else {
+        return false;
+    }
+    if (offset_ == kFrameHeaderSize && frame_expected_ == kFrameHeaderSize) {
+        const uint32_t payload = uint32_t(frame_read_[8]) << 24 |
+                                 uint32_t(frame_read_[9]) << 16 |
+                                 uint32_t(frame_read_[10]) << 8 |
+                                 frame_read_[11];
+        if (payload > kMaxFramePayload) {
+            fail(DaemonControlStatus::Malformed);
+            return false;
+        }
+        frame_expected_ = kFrameHeaderSize + payload;
+        try {
+            frame_read_.resize(frame_expected_);
+        } catch (...) {
+            fail(DaemonControlStatus::Malformed);
+            return false;
+        }
+    }
+    if (offset_ != frame_expected_)
+        return false;
+
+    Frame frame;
+    ControlOperation observed;
+    if (decode_frame(frame_read_, frame) != Status::Ok ||
+        frame.type != MessageType::Data || frame.identity != operation_.identity ||
+        !decode_control_operation(frame.payload, observed) ||
+        observed.kind != ControlOperationKind::SourceTransfer ||
+        observed.identity != operation_.identity ||
+        observed.request_id != operation_.request_id ||
+        observed.source_arm != operation_.source_arm ||
+        observed.absolute_deadline != operation_.absolute_deadline ||
+        !observed.source_result.has_value()) {
+        fail(DaemonControlStatus::OperationMismatch);
+        return false;
+    }
+    source_transfer_result_ = observed.source_result;
+    offset_ = 0;
+    frame_read_.clear();
+    frame_expected_ = 0;
+    phase_ = Phase::CheckSourceReplyTrailing;
+    return true;
+}
+
 bool DaemonControlOperation::write_lifecycle_goodbye(size_t& calls,
                                                       size_t& budget) noexcept {
     if (lifecycle_goodbye_.empty())
@@ -638,7 +800,9 @@ DaemonControlStatus DaemonControlOperation::advance(
     } else if (phase_ == Phase::ReadAck) {
         (void)read_ack(calls, budget);
     } else if (phase_ == Phase::CheckAckTrailing) {
-        if (check_stream_trailing(Phase::None, calls, budget)) {
+        if (operation_.kind == ControlOperationKind::SourceTransfer) {
+            phase_ = Phase::ReadSourceReply;
+        } else if (check_stream_trailing(Phase::None, calls, budget)) {
             (void)::close(transfer_fd_);
             transfer_fd_ = -1;
             status_ = DaemonControlStatus::Complete;
@@ -649,6 +813,28 @@ DaemonControlStatus DaemonControlOperation::advance(
         (void)read_lifecycle_reply(calls, budget);
     } else if (phase_ == Phase::CheckLifecycleReplyTrailing) {
         if (check_stream_trailing(Phase::WriteLifecycleGoodbye, calls, budget)) {
+            try {
+                lifecycle_goodbye_ = encode_frame(
+                    Frame{kProtocolVersion, MessageType::Goodbye,
+                          operation_.identity, {}});
+            } catch (...) {
+                fail(DaemonControlStatus::Malformed);
+            }
+            if (status_ == DaemonControlStatus::InProgress && lifecycle_goodbye_.empty())
+                fail(DaemonControlStatus::Malformed);
+            else if (status_ == DaemonControlStatus::InProgress) {
+                offset_ = 0;
+                phase_ = Phase::WriteLifecycleGoodbye;
+            }
+        }
+    } else if (phase_ == Phase::ReadSourceReply) {
+        (void)read_source_reply(calls, budget);
+    } else if (phase_ == Phase::CheckSourceReplyTrailing) {
+        if (check_stream_trailing(Phase::WriteLifecycleGoodbye, calls, budget)) {
+            if (transfer_fd_ >= 0) {
+                (void)::close(transfer_fd_);
+                transfer_fd_ = -1;
+            }
             try {
                 lifecycle_goodbye_ = encode_frame(
                     Frame{kProtocolVersion, MessageType::Goodbye,

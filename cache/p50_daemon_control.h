@@ -63,6 +63,18 @@ public:
                                         DaemonControlLimits limits,
                                         DaemonControlFdOwnership ownership) noexcept;
 
+    // Initializes the source-transfer operation on a descriptor whose daemon
+    // HELLO/HELLO_ACK exchange was already completed by the supervising
+    // control owner.  The supplied identity is the exact authenticated
+    // sidecar incarnation; this entry starts with WriteControl and therefore
+    // never emits a second HELLO.
+    DaemonControlStatus begin_authenticated(
+        int nonblocking_fd, const ControlOperation& operation, int transfer_fd,
+        const CredentialExpectation& credentials, Identity authenticated_identity,
+        std::chrono::steady_clock::time_point deadline,
+        DaemonControlLimits limits,
+        DaemonControlFdOwnership ownership) noexcept;
+
     // Initializes the operation on an already-created, nonblocking socket but
     // deliberately does not call connect(2).  The outer owner can therefore
     // spend one turn creating the descriptor and a later turn performing the
@@ -96,12 +108,15 @@ public:
     [[nodiscard]] const std::optional<PeerCredential>& peer() const noexcept { return peer_; }
     [[nodiscard]] const std::optional<InputLifecycleApplyStatus>&
     lifecycle_result() const noexcept { return lifecycle_result_; }
+    [[nodiscard]] const std::optional<P50SourceTransferResult>&
+    source_transfer_result() const noexcept { return source_transfer_result_; }
 
 private:
     enum class Phase : uint8_t { None, ConnectPending, Connecting, WriteHello, ReadHelloAck,
                                  CheckHelloAckTrailing, WriteControl, WriteHandoff,
                                  ReadAck, CheckAckTrailing, ReadLifecycleReply,
-                                 CheckLifecycleReplyTrailing, WriteLifecycleGoodbye };
+                                 CheckLifecycleReplyTrailing, ReadSourceReply,
+                                 CheckSourceReplyTrailing, WriteLifecycleGoodbye };
     void fail(DaemonControlStatus status) noexcept;
     void close_fd() noexcept;
     bool query_peer() noexcept;
@@ -111,6 +126,7 @@ private:
     bool read_frame(size_t& calls, size_t& budget) noexcept;
     bool read_ack(size_t& calls, size_t& budget) noexcept;
     bool read_lifecycle_reply(size_t& calls, size_t& budget) noexcept;
+    bool read_source_reply(size_t& calls, size_t& budget) noexcept;
     bool write_lifecycle_goodbye(size_t& calls, size_t& budget) noexcept;
     bool check_stream_trailing(Phase next_phase, size_t& calls,
                                size_t& budget) noexcept;
@@ -142,6 +158,7 @@ private:
     bool lifecycle_mode_ = false;
     std::vector<uint8_t> lifecycle_goodbye_;
     std::optional<InputLifecycleApplyStatus> lifecycle_result_;
+    std::optional<P50SourceTransferResult> source_transfer_result_;
 };
 
 // Receiver seam used by the daemon adapter after it has admitted a connection

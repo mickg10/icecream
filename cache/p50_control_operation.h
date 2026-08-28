@@ -7,6 +7,7 @@
 
 #include "p50_input_lifecycle.h"
 #include "p50_local_transport.h"
+#include "services/comm.h"
 
 #include <algorithm>
 #include <array>
@@ -29,6 +30,7 @@ inline constexpr uint16_t kControlOperationVersionV4 = 4;
 // v5 extends the retirement envelope with the unchanged absolute
 // CLOCK_MONOTONIC deadline and daemon/sidecar clock-namespace identity.
 inline constexpr uint16_t kControlOperationVersionV5 = 5;
+inline constexpr uint16_t kControlOperationVersionV6 = 6;
 inline constexpr size_t kCacheSessionOperationBytes = 32;
 inline constexpr size_t kLegacyInputFdAttachmentOperationBytes = 56;
 inline constexpr size_t kInputFdAttachmentOperationBytes = 88;
@@ -36,12 +38,77 @@ inline constexpr size_t kInputLifecycleOperationBytes = 88;
 inline constexpr size_t kInputAttemptRetirementOperationBytes = 192;
 inline constexpr size_t kControlBindingPlaceholderBytes = 32;
 inline constexpr size_t kOperationCancelOperationBytes = 72;
+// Source transfer carries the bounded daemon assignment request and unchanged
+// absolute deadline.  The sidecar fills the authenticated C identity before
+// sending P50SourceArm to F.  The fixed envelope keeps operation demux bounded
+// while leaving the host field at its protocol maximum.
+inline constexpr size_t kSourceTransferOperationBytes = 512;
 
 enum class ControlOperationKind : uint16_t {
     CacheSession = 1,
     InputFdAttachment = 2,
     InputLifecycle = 3,
     OperationCancel = 4,
+    SourceTransfer = 5,
+};
+
+enum class SourceTransferResultCode : uint16_t {
+    None = 0,
+    Committed = 1,
+    Error = 2,
+};
+
+// The daemon asks the supervised sidecar to transfer one source using the
+// selected assignment.  C-side store/control identity is deliberately absent:
+// the sidecar supplies its current launch identity when it arms F.
+struct P50SourceTransferRequest {
+    uint32_t wire_job_id = 0;
+    uint64_t assignment_epoch = 0;
+    uint64_t assignment_nonce = 0;
+    std::string selected_f_host;
+    uint32_t selected_f_ordinary_port = 0;
+    uint32_t selected_f_cache_port = 0;
+    uint32_t cache_protocol = 0;
+    uint32_t cache_profile = 0;
+    uint64_t logical_job = 0;
+    uint64_t compiler_attempt = 0;
+    uint64_t source_request_id = 0;
+    uint32_t source_mode = 0;
+
+    [[nodiscard]] bool valid() const noexcept {
+        return wire_job_id != 0 && assignment_epoch != 0 &&
+               assignment_nonce != 0 && !selected_f_host.empty() &&
+               selected_f_host.size() <= 255 &&
+               selected_f_host.find('\0') == std::string::npos &&
+               selected_f_ordinary_port != 0 && selected_f_ordinary_port <= UINT16_MAX &&
+               selected_f_cache_port != 0 && selected_f_cache_port <= UINT16_MAX &&
+               cache_protocol == CACHE_WIRE_PROTOCOL_V1 &&
+               p50_source_profile_mode_valid(cache_profile, source_mode) &&
+               logical_job != 0 && compiler_attempt != 0 && source_request_id != 0;
+    }
+    auto operator<=>(const P50SourceTransferRequest&) const = default;
+};
+
+struct P50SourceTransferResult {
+    SourceTransferResultCode code = SourceTransferResultCode::None;
+    uint16_t error_code = 0;
+    uint8_t attempts = 0;
+    uint64_t tu_seq = 0;
+    uint64_t raw_bytes = 0;
+    Digest128 raw_digest{};
+    CStoreGuid c_store_guid{};
+
+    [[nodiscard]] bool valid() const noexcept {
+        if (code == SourceTransferResultCode::Committed)
+            // TU sequence numbers are zero based: the first committed
+            // transfer is deliberately TU0.
+            return error_code == 0 && attempts != 0 &&
+                   raw_digest != Digest128{} && c_store_guid != CStoreGuid{};
+        if (code == SourceTransferResultCode::Error)
+            return error_code != 0 && attempts <= 2;
+        return false;
+    }
+    auto operator<=>(const P50SourceTransferResult&) const = default;
 };
 
 enum class ControlOperationRole : uint16_t {
@@ -86,6 +153,8 @@ struct ControlOperation {
     uint64_t retirement_id = 0;
     std::optional<InputLeaseOwner> replacement_owner;
     sidecar::AbsoluteMonotonicDeadline absolute_deadline{};
+    std::optional<P50SourceTransferRequest> source_arm;
+    std::optional<P50SourceTransferResult> source_result;
 };
 
 namespace detail {
@@ -131,7 +200,8 @@ inline bool control_kind_valid(ControlOperationKind kind) noexcept {
     return kind == ControlOperationKind::CacheSession ||
            kind == ControlOperationKind::InputFdAttachment ||
            kind == ControlOperationKind::InputLifecycle ||
-           kind == ControlOperationKind::OperationCancel;
+           kind == ControlOperationKind::OperationCancel ||
+           kind == ControlOperationKind::SourceTransfer;
 }
 
 inline bool control_role_valid(ControlOperationRole role) noexcept {
@@ -167,12 +237,18 @@ inline bool retirement_action(InputLifecycleAction action) noexcept {
            action == InputLifecycleAction::CloseLogicalInputLease;
 }
 
+inline bool source_result_code_valid(SourceTransferResultCode code) noexcept {
+    return code == SourceTransferResultCode::Committed ||
+           code == SourceTransferResultCode::Error;
+}
+
 }  // namespace detail
 
 inline std::vector<uint8_t> encode_control_operation(
     const ControlOperation& operation) {
     const bool input = detail::control_kind_has_input(operation.kind);
     const bool cancel = operation.kind == ControlOperationKind::OperationCancel;
+    const bool source = operation.kind == ControlOperationKind::SourceTransfer;
     const bool retirement = operation.kind == ControlOperationKind::InputLifecycle &&
                             detail::retirement_action(operation.lifecycle_action);
     bool invalid = !detail::control_identity_valid(operation.identity) ||
@@ -244,10 +320,33 @@ inline std::vector<uint8_t> encode_control_operation(
                   operation.lifecycle_result.has_value() ||
                   operation.absolute_deadline != sidecar::AbsoluteMonotonicDeadline{};
     }
+    if (!invalid && source) {
+        invalid = !operation.source_arm.has_value() ||
+                  !operation.source_arm->valid() ||
+                  operation.request_id != operation.source_arm->source_request_id ||
+                  !operation.absolute_deadline.valid() ||
+                  operation.input.has_value() || operation.owner.has_value() ||
+                  operation.lifecycle_action != InputLifecycleAction::None ||
+                  operation.lifecycle_result.has_value() ||
+                  operation.f_store_generation != 0 ||
+                  operation.f_store_guid != FStoreGuid{} ||
+                  operation.immutable_size != 0 ||
+                  operation.immutable_digest != Digest128{} ||
+                  operation.retirement_id != 0 ||
+                  operation.replacement_owner.has_value() ||
+                  (operation.source_result.has_value() &&
+                   (!operation.source_result->valid() ||
+                    !detail::source_result_code_valid(operation.source_result->code)));
+        if (!invalid && operation.source_result.has_value() &&
+            operation.source_result->code == SourceTransferResultCode::Committed &&
+            operation.source_result->raw_bytes == 0)
+            invalid = true;
+    }
     if (invalid)
         return {};
 
-    const size_t size = retirement ? kInputAttemptRetirementOperationBytes
+    const size_t size = source ? kSourceTransferOperationBytes
+                               : retirement ? kInputAttemptRetirementOperationBytes
                                    : input ? kInputFdAttachmentOperationBytes
                               : cancel ? kOperationCancelOperationBytes
                                        : kCacheSessionOperationBytes;
@@ -256,6 +355,7 @@ inline std::vector<uint8_t> encode_control_operation(
         wire.data(), operation.kind == ControlOperationKind::CacheSession
                          ? kControlOperationVersionV1
                          : cancel ? kControlOperationVersionV3
+                                  : source ? kControlOperationVersionV6
                                   : retirement ? kControlOperationVersionV5
                                                 : kControlOperationVersionV2);
     detail::control_put_u16(wire.data() + 2, static_cast<uint16_t>(operation.kind));
@@ -313,6 +413,44 @@ inline std::vector<uint8_t> encode_control_operation(
                                     operation.absolute_deadline.time_namespace_id);
         }
     }
+    if (source) {
+        const P50SourceTransferRequest& arm = *operation.source_arm;
+        detail::control_put_u32(wire.data() + 32, arm.wire_job_id);
+        detail::control_put_u64(wire.data() + 36, arm.assignment_epoch);
+        detail::control_put_u64(wire.data() + 44, arm.assignment_nonce);
+        detail::control_put_u16(wire.data() + 52,
+                                static_cast<uint16_t>(arm.selected_f_host.size()));
+        std::copy(arm.selected_f_host.begin(), arm.selected_f_host.end(),
+                  wire.begin() + 56);
+        detail::control_put_u32(wire.data() + 312, arm.selected_f_ordinary_port);
+        detail::control_put_u32(wire.data() + 316, arm.selected_f_cache_port);
+        detail::control_put_u32(wire.data() + 320, arm.cache_protocol);
+        detail::control_put_u32(wire.data() + 324, arm.cache_profile);
+        detail::control_put_u64(wire.data() + 328, arm.logical_job);
+        detail::control_put_u64(wire.data() + 336, arm.compiler_attempt);
+        detail::control_put_u64(wire.data() + 376, arm.source_request_id);
+        detail::control_put_u32(wire.data() + 384, arm.source_mode);
+        detail::control_put_u64(
+            wire.data() + 408,
+            static_cast<uint64_t>(operation.absolute_deadline.expires_at_ns));
+        detail::control_put_u64(wire.data() + 416,
+                                operation.absolute_deadline.clock_domain_id);
+        detail::control_put_u64(wire.data() + 424,
+                                operation.absolute_deadline.time_namespace_id);
+        if (operation.source_result.has_value()) {
+            const P50SourceTransferResult& result = *operation.source_result;
+            std::copy(result.c_store_guid.bytes.begin(),
+                      result.c_store_guid.bytes.end(), wire.begin() + 432);
+            detail::control_put_u16(wire.data() + 448,
+                                    static_cast<uint16_t>(result.code));
+            detail::control_put_u16(wire.data() + 450, result.error_code);
+            wire[452] = result.attempts;
+            detail::control_put_u64(wire.data() + 456, result.tu_seq);
+            detail::control_put_u64(wire.data() + 464, result.raw_bytes);
+            std::copy(result.raw_digest.bytes.begin(), result.raw_digest.bytes.end(),
+                      wire.begin() + 472);
+        }
+    }
     return wire;
 }
 
@@ -343,6 +481,9 @@ inline bool decode_control_operation(std::span<const uint8_t> wire,
             : kind == ControlOperationKind::OperationCancel &&
                       version == kControlOperationVersionV3
                   ? kOperationCancelOperationBytes
+            : kind == ControlOperationKind::SourceTransfer &&
+                      version == kControlOperationVersionV6
+                  ? kSourceTransferOperationBytes
                   : 0;
     if (expected_size == 0 || wire.size() != expected_size ||
         detail::control_get_u32(wire.data() + 4) != expected_size)
@@ -453,6 +594,69 @@ inline bool decode_control_operation(std::span<const uint8_t> wire,
                 return false;
         }
     }
+    if (kind == ControlOperationKind::SourceTransfer) {
+        P50SourceTransferRequest arm;
+        arm.wire_job_id = detail::control_get_u32(wire.data() + 32);
+        arm.assignment_epoch = detail::control_get_u64(wire.data() + 36);
+        arm.assignment_nonce = detail::control_get_u64(wire.data() + 44);
+        const uint16_t host_size = detail::control_get_u16(wire.data() + 52);
+        if (host_size > 255)
+            return false;
+        if (std::any_of(wire.begin() + 56 + host_size, wire.begin() + 312,
+                        [](uint8_t byte) { return byte != 0; }))
+            return false;
+        arm.selected_f_host.assign(
+            reinterpret_cast<const char*>(wire.data() + 56), host_size);
+        arm.selected_f_ordinary_port = detail::control_get_u32(wire.data() + 312);
+        arm.selected_f_cache_port = detail::control_get_u32(wire.data() + 316);
+        arm.cache_protocol = detail::control_get_u32(wire.data() + 320);
+        arm.cache_profile = detail::control_get_u32(wire.data() + 324);
+        arm.logical_job = detail::control_get_u64(wire.data() + 328);
+        arm.compiler_attempt = detail::control_get_u64(wire.data() + 336);
+        arm.source_request_id = detail::control_get_u64(wire.data() + 376);
+        arm.source_mode = detail::control_get_u32(wire.data() + 384);
+        if (std::any_of(wire.begin() + 344, wire.begin() + 376,
+                        [](uint8_t byte) { return byte != 0; }) ||
+            std::any_of(wire.begin() + 388, wire.begin() + 408,
+                        [](uint8_t byte) { return byte != 0; }))
+            return false;
+        operation.source_arm = std::move(arm);
+        operation.absolute_deadline.expires_at_ns =
+            static_cast<int64_t>(detail::control_get_u64(wire.data() + 408));
+        operation.absolute_deadline.clock_domain_id =
+            detail::control_get_u64(wire.data() + 416);
+        operation.absolute_deadline.time_namespace_id =
+            detail::control_get_u64(wire.data() + 424);
+        if (!operation.absolute_deadline.valid() ||
+            std::any_of(wire.begin() + 453, wire.begin() + 456,
+                        [](uint8_t byte) { return byte != 0; }) ||
+            std::any_of(wire.begin() + 488, wire.end(),
+                        [](uint8_t byte) { return byte != 0; }) ||
+            !operation.source_arm->valid() ||
+            operation.request_id != operation.source_arm->source_request_id)
+            return false;
+        const auto result_code = static_cast<SourceTransferResultCode>(
+            detail::control_get_u16(wire.data() + 448));
+        if (result_code == SourceTransferResultCode::None &&
+            std::any_of(wire.begin() + 432, wire.begin() + 488,
+                        [](uint8_t byte) { return byte != 0; }))
+            return false;
+        if (result_code != SourceTransferResultCode::None) {
+            P50SourceTransferResult result;
+            std::copy(wire.begin() + 432, wire.begin() + 448,
+                      result.c_store_guid.bytes.begin());
+            result.code = result_code;
+            result.error_code = detail::control_get_u16(wire.data() + 450);
+            result.attempts = wire[452];
+            result.tu_seq = detail::control_get_u64(wire.data() + 456);
+            result.raw_bytes = detail::control_get_u64(wire.data() + 464);
+            std::copy(wire.begin() + 472, wire.begin() + 488,
+                      result.raw_digest.bytes.begin());
+            if (!result.valid())
+                return false;
+            operation.source_result = result;
+        }
+    }
     return true;
 }
 
@@ -464,7 +668,7 @@ inline ControlOperation make_cache_session_operation(Identity identity,
                              ControlOperationRole::Daemon,
                              ControlCancelTargetRole::FSession,
                              ControlCancellationReason::Requested, {}, 0, {}, 0,
-                             {}, 0, std::nullopt};
+                             {}, 0, std::nullopt, {}, std::nullopt, std::nullopt};
 }
 
 inline ControlOperation make_input_fd_attachment_operation(
@@ -475,7 +679,7 @@ inline ControlOperation make_input_fd_attachment_operation(
                              std::nullopt, ControlOperationRole::Daemon,
                              ControlCancelTargetRole::FSession,
                              ControlCancellationReason::Requested, {}, 0, {}, 0,
-                             {}, 0, std::nullopt};
+                             {}, 0, std::nullopt, {}, std::nullopt, std::nullopt};
 }
 
 inline ControlOperation make_input_lifecycle_operation(
@@ -486,7 +690,7 @@ inline ControlOperation make_input_lifecycle_operation(
                                ControlOperationRole::Daemon,
                                ControlCancelTargetRole::FSession,
                                ControlCancellationReason::Requested, {}, 0, {}, 0,
-                               {}, 0, std::nullopt};
+                               {}, 0, std::nullopt, {}, std::nullopt, std::nullopt};
     operation.f_store_generation = request.f_store_generation;
     operation.f_store_guid = request.f_store_guid;
     operation.immutable_size = request.immutable_size;
@@ -505,7 +709,7 @@ inline ControlOperation make_input_lifecycle_reply_operation(
                                request.action, status, ControlOperationRole::Sidecar,
                                ControlCancelTargetRole::FSession,
                                ControlCancellationReason::Requested, {}, 0, {}, 0,
-                               {}, 0, std::nullopt};
+                               {}, 0, std::nullopt, {}, std::nullopt, std::nullopt};
     operation.f_store_generation = request.f_store_generation;
     operation.f_store_guid = request.f_store_guid;
     operation.immutable_size = request.immutable_size;
@@ -528,7 +732,30 @@ inline ControlOperation make_operation_cancel_operation(
                             std::nullopt, std::nullopt, InputLifecycleAction::None,
                             std::nullopt, sender_role, target_role,
                             reason, binding_placeholder, 0, {}, 0, {}, 0,
-                            std::nullopt};
+                            std::nullopt, {}, std::nullopt, std::nullopt};
+}
+
+inline ControlOperation make_source_transfer_operation(
+    Identity identity, const P50SourceTransferRequest& arm,
+    sidecar::AbsoluteMonotonicDeadline deadline) noexcept {
+    ControlOperation operation{ControlOperationKind::SourceTransfer, identity,
+                               arm.source_request_id, std::nullopt, std::nullopt,
+                               InputLifecycleAction::None, std::nullopt,
+                               ControlOperationRole::Daemon,
+                               ControlCancelTargetRole::FSession,
+                               ControlCancellationReason::Requested, {}, 0, {}, 0,
+                               {}, 0, std::nullopt, {}, std::nullopt, std::nullopt};
+    operation.absolute_deadline = deadline;
+    operation.source_arm = arm;
+    return operation;
+}
+
+inline ControlOperation make_source_transfer_reply_operation(
+    const ControlOperation& request, P50SourceTransferResult result) noexcept {
+    ControlOperation operation = request;
+    operation.source_result = result;
+    operation.sender_role = ControlOperationRole::Sidecar;
+    return operation;
 }
 
 inline ControlOperation make_cancel_operation(

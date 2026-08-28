@@ -1,4 +1,5 @@
 #include "client/p50_route_owner.h"
+#include "cache/p50_control_operation.h"
 
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/io_context.hpp>
@@ -37,6 +38,57 @@ P50RouteRelationship relationship(uint64_t c, uint64_t f, uint64_t generation,
                                   ProfileId profile = ProfileId::Z3_LONG) {
     return P50RouteRelationship{Id128::from_u64(c), Id128::from_u64(f), generation,
                                 profile};
+}
+
+void test_source_transfer_operation_wire() {
+    local::P50SourceTransferRequest arm;
+    arm.wire_job_id = 17;
+    arm.assignment_epoch = 3;
+    arm.assignment_nonce = 4;
+    arm.selected_f_host = "127.0.0.1";
+    arm.selected_f_ordinary_port = 8765;
+    arm.selected_f_cache_port = 8766;
+    arm.cache_protocol = CACHE_WIRE_PROTOCOL_V1;
+    arm.cache_profile = CACHE_PROFILE_ZSTD_ROUTE;
+    arm.logical_job = 5;
+    arm.compiler_attempt = 6;
+    arm.source_request_id = 8;
+    arm.source_mode = P50_SOURCE_MODE_ZSTD_ROUTE;
+    CHECK(arm.valid());
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+        std::chrono::steady_clock::now() + std::chrono::seconds(5),
+        clock.clock_domain_id, clock.time_namespace_id);
+    const local::Identity identity{11, 12};
+    const auto request = local::make_source_transfer_operation(identity, arm, deadline);
+    const auto wire = local::encode_control_operation(request);
+    CHECK(wire.size() == local::kSourceTransferOperationBytes);
+    local::ControlOperation decoded;
+    CHECK(local::decode_control_operation(wire, decoded));
+    CHECK(decoded.kind == local::ControlOperationKind::SourceTransfer);
+    CHECK(decoded.source_arm == arm);
+    CHECK(decoded.absolute_deadline == deadline);
+
+    // C control/store identity is supplied by the supervised sidecar, never
+    // by this daemon request.  Any attempt to populate the reserved C slots
+    // is rejected by the fixed operation decoder.
+    auto spoofed = wire;
+    spoofed[344] = 1;
+    CHECK(!local::decode_control_operation(spoofed, decoded));
+
+    local::P50SourceTransferResult committed;
+    committed.code = local::SourceTransferResultCode::Committed;
+    committed.attempts = 1;
+    committed.tu_seq = 0; // The first route result is TU0.
+    committed.raw_bytes = 3;
+    committed.raw_digest.bytes[0] = 1;
+    committed.c_store_guid.bytes[15] = 9;
+    const auto reply = local::make_source_transfer_reply_operation(request, committed);
+    const auto reply_wire = local::encode_control_operation(reply);
+    CHECK(reply_wire.size() == local::kSourceTransferOperationBytes);
+    CHECK(local::decode_control_operation(reply_wire, decoded));
+    CHECK(decoded.source_result.has_value());
+    CHECK(decoded.source_result->tu_seq == 0);
 }
 
 ZstdSourceTransferResult route_call(
@@ -177,6 +229,7 @@ void test_relationship_validation() {
 }  // namespace
 
 int main() {
+    test_source_transfer_operation_wire();
     test_long_lived_relationship_owner();
     test_relationship_validation();
 }

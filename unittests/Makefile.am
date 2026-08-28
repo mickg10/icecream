@@ -424,7 +424,8 @@ p50s2restartreplay_LDFLAGS = -pthread
 p50s2restartreplay_LDADD = ../cache/libp50sidecarsupervisor.a \
 	../cache/libp50localtransport.a ../cache/libprotocol50.a \
 	../services/libicecc.la
-p50cacheservice_SOURCES = p50cacheservice.cpp ../cache/p50_cache_service.cpp
+p50cacheservice_SOURCES = p50cacheservice.cpp ../cache/p50_cache_service.cpp \
+	../client/p50_route_owner.cpp ../client/p50_zstd_sender.cpp
 p50cacheservice_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS) -DICECC_P50_CACHE_SERVICE_NO_MAIN
 p50cacheservice_CXXFLAGS = -pthread
 p50cacheservice_LDFLAGS = $(BOOST_LDFLAGS) -pthread
