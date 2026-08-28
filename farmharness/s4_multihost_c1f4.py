@@ -352,8 +352,8 @@ printf 'S4_REMOTE_WORK=%s\n' "$work"
 
 CLIENT_SCRIPT = r"""
 set -u
-root=$1; scheduler=$2; sport=$3; network=$4; scheduler_log=$5; cport=$6
-shift 6
+root=$1; scheduler=$2; sport=$3; network=$4; scheduler_log=$5; cport=$6; load=$7
+shift 7
 names=("$@")
 work=$(mktemp -d /tmp/s4-p50-fourhost-client.XXXXXX)
 printf 'S4_CLIENT_WORK=%s\n' "$work"
@@ -368,8 +368,18 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 mkdir -p "$work/env" "$work/envs-c" "$work/out"; chmod 1777 "$work/envs-c"
 for i in 1 2 3 4; do
-  printf '#include <cstdint>\nextern "C" int s4_physical_%s() { return %s; }\n' \
-    "$i" "$((90+i))" >"$work/main-$i.cpp"
+  if [ "$load" = same ]; then
+    printf '#include <cstdint>\nextern "C" int s4_physical_%s() { return %s; }\n' \
+      "$i" "$((90+i))" >"$work/main-$i.cpp"
+  else
+    case "$i" in 1) count=32;; 2) count=512;; 3) count=4096;; 4) count=16384;; esac
+    {
+      printf '#include <cstdint>\nstatic const std::uint32_t values_%s[] = {' "$i"
+      seq 1 "$count" | awk '{printf "%s,", ($1 * 2654435761) % 4294967291}'
+      printf '};\nextern "C" std::uint32_t s4_physical_%s() { return values_%s[%s]; }\n' \
+        "$i" "$i" "$((count-1))"
+    } >"$work/main-$i.cpp"
+  fi
   g++ -std=c++17 -O2 -c "$work/main-$i.cpp" -o "$work/out/local-$i.o" \
     2>"$work/local-$i.log" || { echo 'S4_STATUS=FAIL reason=local-reference'; exit 1; }
 done
@@ -400,15 +410,27 @@ for name in "${names[@]}"; do
 done
 sleep 5
 before=$(wc -l <"$scheduler_log")
+pids=()
 for i in 1 2 3 4; do
   name=${names[$((i-1))]}
-  env ICECC_TEST_SOCKET="$work/c.sock" ICECC_TEST_REMOTEBUILD=1 ICECC_VERSION="$envtar" \
-    ICECC_PREFERRED_HOST="$name" ICECC_DEBUG=debug ICECC_P50_C1F1_REQUIRED=1 \
-    ICECC_P50_PROFILE=ZSTD_TU ICECC_LOGFILE="$work/client-debug-$i.log" \
-    timeout 180 "$root/client/icecc" g++ -std=c++17 -O2 -c "$work/main-$i.cpp" \
-    -o "$work/out/remote-$i.o" >"$work/client-$i.log" 2>&1 || {
-      echo "S4_STATUS=FAIL reason=remote-compile-$name"; exit 1;
-    }
+  (
+    env ICECC_TEST_SOCKET="$work/c.sock" ICECC_TEST_REMOTEBUILD=1 ICECC_VERSION="$envtar" \
+      ICECC_PREFERRED_HOST="$name" ICECC_DEBUG=debug ICECC_P50_C1F1_REQUIRED=1 \
+      ICECC_P50_PROFILE=ZSTD_TU ICECC_LOGFILE="$work/client-debug-$i.log" \
+      timeout 180 "$root/client/icecc" g++ -std=c++17 -O2 -c "$work/main-$i.cpp" \
+      -o "$work/out/remote-$i.o" >"$work/client-$i.log" 2>&1
+  ) &
+  pids+=("$!")
+done
+compile_failed=0
+for i in 1 2 3 4; do
+  wait "${pids[$((i-1))]}" || compile_failed=$i
+done
+[ "$compile_failed" -eq 0 ] || {
+  echo "S4_STATUS=FAIL reason=parallel-remote-compile-$compile_failed"; exit 1;
+}
+for i in 1 2 3 4; do
+  name=${names[$((i-1))]}
   cmp -s "$work/out/remote-$i.o" "$work/out/local-$i.o" || {
     echo "S4_STATUS=FAIL reason=object-not-byte-identical-$name"; exit 1;
   }
@@ -516,10 +538,12 @@ def run_client(
     scheduler_port: int,
     network: str,
     client_port: int,
+    load: str,
     timeout: float,
 ) -> tuple[subprocess.CompletedProcess[str], str]:
     args = [stage, HOSTS["q3"]["lan"], str(scheduler_port), network,
-            f"{scheduler_work}/scheduler.log", str(client_port), *WORKER_NAMES.values()]
+            f"{scheduler_work}/scheduler.log", str(client_port), load,
+            *WORKER_NAMES.values()]
     result = run_script("q3", CLIENT_SCRIPT, args, timeout=timeout)
     work = parse_work(result.stdout, "S4_CLIENT_WORK", "/tmp/s4-p50-fourhost-client.")
     return result, work
@@ -659,6 +683,7 @@ def main(argv: list[str] | None = None) -> int:
         default=Path("/tanksmall/scratch/ictmp/experiments/icecream"),
     )
     parser.add_argument("--timeout", type=float, default=900)
+    parser.add_argument("--load", choices=("same", "mixed"), default="same")
     args = parser.parse_args(argv)
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
@@ -700,6 +725,7 @@ def main(argv: list[str] | None = None) -> int:
             "scheduler_port": scheduler_port,
             "worker_ports": {host: worker_base + index for index, host in enumerate(HOSTS)},
             "client_port": client_port,
+            "load": args.load,
         }
         write_json(run_root / "preflight.json", preflight)
 
@@ -733,7 +759,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         client_result, client_work = run_client(
             stages["q3"], works["q3-scheduler"], scheduler_port, network,
-            client_port, args.timeout,
+            client_port, args.load, args.timeout,
         )
         works["q3-client"] = client_work
         (run_root / "client.stdout").write_text(client_result.stdout, encoding="utf-8")
@@ -761,6 +787,7 @@ def main(argv: list[str] | None = None) -> int:
             "base_source_sha": BASE_SOURCE_SHA,
             "profile": "ZSTD_TU",
             "topology": "C1F4",
+            "load": args.load,
             "scheduler_host": "q3",
             "client_host": "q3",
             "physical_worker_hosts": list(HOSTS),
@@ -846,6 +873,7 @@ def main(argv: list[str] | None = None) -> int:
             "base_source_sha": BASE_SOURCE_SHA,
             "profile": "ZSTD_TU",
             "topology": "C1F4",
+            "load": args.load,
             "physical_worker_hosts": list(HOSTS),
             "role_hashes": local_hashes,
             "started_at": started.isoformat(),

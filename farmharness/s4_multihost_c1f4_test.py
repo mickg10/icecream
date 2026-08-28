@@ -67,6 +67,12 @@ class FourHostRunnerTests(unittest.TestCase):
             ("HOLD", "no-worker"),
         )
 
+    def test_client_script_runs_final_compiles_concurrently(self) -> None:
+        self.assertIn('pids+=("$!")', runner.CLIENT_SCRIPT)
+        self.assertIn('wait "${pids[$((i-1))]}"', runner.CLIENT_SCRIPT)
+        self.assertIn('[ "$load" = same ]', runner.CLIENT_SCRIPT)
+        self.assertIn('4) count=16384', runner.CLIENT_SCRIPT)
+
 
 if __name__ == "__main__":
     unittest.main()
