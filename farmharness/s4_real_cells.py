@@ -93,7 +93,7 @@ cleanup() {
     printf 'S4_CLEANUP=bounded forced=%s seconds=%s\n' "$forced" "$((CLEANUP_END-CLEANUP_STARTED))"
     # Emit logs before deleting the private work tree.  Each value is one
     # base64 line, so arbitrary compiler output cannot corrupt the result row.
-    for name in scheduler fdaemon fdaemon2 cdaemon client client-1 client-2 client-3 client-4 client-debug scheduler.stdout fdaemon.stdout fdaemon2.stdout cdaemon.stdout create-env warmup-s4-f warmup-s4-f2 local local-1 local-2 local-3 local-4; do
+    for name in scheduler fdaemon fdaemon2 cdaemon client client-1 client-2 client-3 client-4 client-debug client-debug-1 client-debug-2 client-debug-3 client-debug-4 scheduler.stdout fdaemon.stdout fdaemon2.stdout cdaemon.stdout create-env warmup-s4-f warmup-s4-f2 local local-1 local-2 local-3 local-4; do
         file="$WORK/$name.log"
         [ -f "$file" ] || : >"$file"
         printf '__S4_LOG_BEGIN=%s\n' "$name"
@@ -154,7 +154,9 @@ printf '%s\n' '#include <cstdint>' \
 
 SCHED_PORT=$((24000 + $$ % 1000)); F_PORT=$((25000 + $$ % 1000)); NET="s4-$CELL-$$"
 S_EXTRA=""
-case "$CELL" in s50-c50-f50) S_EXTRA="--assignment-fence-mode strict-nonce";; esac
+case "$CELL" in
+  s50-c50-f50|s50-c50-f50-c1f2) S_EXTRA="--assignment-fence-mode strict-nonce";;
+esac
 "$S" -p "$SCHED_PORT" -n "$NET" -l "$WORK/scheduler.log" -vvv $S_EXTRA >"$WORK/scheduler.stdout" 2>&1 & SCHED_PID=$!
 sleep 1
 kill -0 "$SCHED_PID" 2>/dev/null || { echo 'S4_STATUS=FAIL reason=scheduler-exited'; exit 1; }
@@ -411,6 +413,13 @@ def _parse_remote(stdout: str) -> tuple[dict[str, str], dict[str, str]]:
     return fields, logs
 
 
+def _positive_count(fields: dict[str, str], key: str) -> bool:
+    try:
+        return int(fields.get(key, "0")) > 0
+    except ValueError:
+        return False
+
+
 def _root_arg(root: str, version: str, p43_root: str, p50_root: str) -> str:
     if root:
         return root
@@ -521,8 +530,8 @@ def _run_cell(cell: dict[str, str], args: argparse.Namespace, out_root: Path,
         "client_version": cell["C"], "worker_version": cell["F"],
         "cache_expected": expect_cache, "cache_observed": fields.get("S4_CACHE_OBSERVED") == "1",
         "legacy_observed": fields.get("S4_LEGACY_OBSERVED") == "1",
-        "remote_compile": fields.get("S4_REMOTE_COMPILE") == "1",
-        "byte_identical": fields.get("S4_BYTE_IDENTICAL") == "1",
+        "remote_compile": _positive_count(fields, "S4_REMOTE_COMPILE"),
+        "byte_identical": _positive_count(fields, "S4_BYTE_IDENTICAL"),
         "cleanup": fields.get("S4_CLEANUP", "missing"), "status": status,
         "reason": reason, "returncode": completed.returncode if completed else None,
         "command": command, "roots": roots,
