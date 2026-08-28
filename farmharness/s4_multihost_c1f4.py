@@ -588,6 +588,21 @@ def run_client(
     return result, work
 
 
+STOP_CONTAINER_SCRIPT = r"""
+set -eu
+container=$1
+docker stop "$container" >/dev/null 2>&1 || true
+running=$(docker inspect --format '{{.State.Running}}' "$container" 2>/dev/null || printf false)
+[ "$running" = false ] || exit 77
+"""
+
+
+def stop_container(host: str, container: str, timeout: float) -> None:
+    result = run_script(host, STOP_CONTAINER_SCRIPT, [container], timeout=timeout)
+    if result.returncode != 0:
+        raise HoldError(f"{host} container did not stop before evidence copy: {container}")
+
+
 def copy_remote_tree(host: str, remote: str, destination: Path, timeout: float) -> None:
     if not re.fullmatch(
         r"(?:/tmp|/home/[A-Za-z0-9._-]+)/s4-p50-fourhost-[a-z]+\.[A-Za-z0-9]+", remote
@@ -595,7 +610,7 @@ def copy_remote_tree(host: str, remote: str, destination: Path, timeout: float) 
         raise HoldError(f"refusing unexpected evidence directory: {remote}")
     destination.mkdir(parents=True, exist_ok=False)
     source = subprocess.Popen(
-        [*ssh_argv(host), "tar", "-C", remote, "-cf", "-", "."],
+        [*ssh_argv(host), "tar", "-C", remote, "--exclude=*.sock", "-cf", "-", "."],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -818,6 +833,13 @@ def main(argv: list[str] | None = None) -> int:
         works["q3-client"] = client_work
         (run_root / "client.stdout").write_text(client_result.stdout, encoding="utf-8")
         (run_root / "client.stderr").write_text(client_result.stderr, encoding="utf-8")
+
+        # Freeze all live worker/scheduler logs before copying them.  Some
+        # Docker hosts report tar's file-changed warning as a hard failure.
+        for host in reversed(selected_hosts):
+            key = f"{host}-worker"
+            stop_container(host, containers[key], min(args.timeout, 120))
+        stop_container("q3", containers["q3-scheduler"], min(args.timeout, 120))
 
         copy_remote_tree("q3", works["q3-scheduler"], run_root / "q3-scheduler", args.timeout)
         copy_remote_tree("q3", client_work, run_root / "q3-client", args.timeout)
