@@ -554,11 +554,12 @@ inline constexpr uint32_t CACHE_SESSION_READY_MAGIC = UINT32_C(0x50f00001);
 
 /* Fixed raw reply value for the compiler/cache control descriptor.  The
    payload is: magic, version, wire job, assignment epoch, assignment nonce,
-   selected profile, and the already-authenticated sidecar generation/attempt,
-   all in network byte order. */
+   selected profile, the already-authenticated sidecar generation/attempt,
+   and the exact sidecar peer uid/gid observed by the daemon, all in network
+   byte order. */
 inline constexpr uint32_t P50_CACHE_FD_LEASE_MAGIC = UINT32_C(0x5035464c);
-inline constexpr uint32_t P50_CACHE_FD_LEASE_VERSION = 2;
-inline constexpr size_t P50_CACHE_FD_LEASE_BYTES = 48;
+inline constexpr uint32_t P50_CACHE_FD_LEASE_VERSION = 3;
+inline constexpr size_t P50_CACHE_FD_LEASE_BYTES = 64;
 
 /* Send the exact network-order CACHE_SESSION_READY_MAGIC under one absolute
    steady-clock deadline.  The caller retains descriptor ownership. */
@@ -709,10 +710,13 @@ struct P50CacheControlIdentity
 {
     uint64_t generation = 0;
     uint64_t attempt = 0;
+    uint64_t peer_uid = UINT64_MAX;
+    uint64_t peer_gid = UINT64_MAX;
 
     [[nodiscard]] bool valid() const noexcept
     {
-        return generation != 0 && attempt != 0;
+        return generation != 0 && attempt != 0 &&
+               peer_uid <= UINT32_MAX && peer_gid <= UINT32_MAX;
     }
 
     auto operator<=>(const P50CacheControlIdentity &) const = default;

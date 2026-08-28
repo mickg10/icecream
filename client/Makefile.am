@@ -44,7 +44,7 @@ libclient_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 libp50zstdsender_a_SOURCES = p50_zstd_sender.cpp p50_zstd_sender.h \
 	p50_route_owner.cpp p50_route_owner.h \
 	p50_compile_binding.cpp p50_compile_binding.h
-libp50zstdsender_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
+libp50zstdsender_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS) $(LIBBSC_CFLAGS)
 
 EXTRA_DIST = $(bin_SCRIPTS) P50_ZSTD_SENDER.md
 

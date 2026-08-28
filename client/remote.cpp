@@ -64,6 +64,7 @@
 
 #include <chrono>
 #include <memory>
+#include <optional>
 
 #ifndef O_LARGEFILE
 #define O_LARGEFILE 0
@@ -212,26 +213,38 @@ icecc::p50::OwnedSourceFd prepare_complete_p50_source(
     return icecc::p50::OwnedSourceFd(read_fd);
 }
 
-uint32_t p50_profile_wire(icecc::p50::ProfileId profile) noexcept
+std::optional<uint32_t> p50_profile_wire(
+    icecc::p50::ProfileId profile) noexcept
 {
-    return profile == icecc::p50::ProfileId::P29
-               ? CACHE_PROFILE_P29
-               : profile == icecc::p50::ProfileId::Z3_LONG
-                     ? CACHE_PROFILE_ZSTD_ROUTE
-                     : profile == icecc::p50::ProfileId::GRZ
-                           ? CACHE_PROFILE_GRZ
-                           : CACHE_PROFILE_ZSTD_TU;
+    switch (profile) {
+    case icecc::p50::ProfileId::P29:
+        return CACHE_PROFILE_P29;
+    case icecc::p50::ProfileId::ZSTD_TU:
+        return CACHE_PROFILE_ZSTD_TU;
+    case icecc::p50::ProfileId::Z3_LONG:
+        return CACHE_PROFILE_ZSTD_ROUTE;
+    case icecc::p50::ProfileId::GRZ:
+        return CACHE_PROFILE_GRZ;
+    default:
+        return std::nullopt;
+    }
 }
 
-uint32_t p50_source_mode_wire(icecc::p50::ProfileId profile) noexcept
+std::optional<uint32_t> p50_source_mode_wire(
+    icecc::p50::ProfileId profile) noexcept
 {
-    return profile == icecc::p50::ProfileId::P29
-               ? P50_SOURCE_MODE_P29
-               : profile == icecc::p50::ProfileId::Z3_LONG
-                     ? P50_SOURCE_MODE_ZSTD_ROUTE
-                     : profile == icecc::p50::ProfileId::GRZ
-                           ? P50_SOURCE_MODE_GRZ_RESIDUAL
-                           : P50_SOURCE_MODE_ZSTD_TU;
+    switch (profile) {
+    case icecc::p50::ProfileId::P29:
+        return P50_SOURCE_MODE_P29;
+    case icecc::p50::ProfileId::ZSTD_TU:
+        return P50_SOURCE_MODE_ZSTD_TU;
+    case icecc::p50::ProfileId::Z3_LONG:
+        return P50_SOURCE_MODE_ZSTD_ROUTE;
+    case icecc::p50::ProfileId::GRZ:
+        return P50_SOURCE_MODE_GRZ_RESIDUAL;
+    default:
+        return std::nullopt;
+    }
 }
 
 icecc::p50::local::P50SourceTransferResult p50_transfer_error(
@@ -251,12 +264,16 @@ icecc::p50::local::P50SourceTransferResult transfer_p50_source(
     using namespace icecc::p50::local;
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::seconds(120);
+    const std::optional<uint32_t> profile_wire = p50_profile_wire(profile);
+    const std::optional<uint32_t> source_mode = p50_source_mode_wire(profile);
+    if (!profile_wire.has_value() || !source_mode.has_value() || !source)
+        return p50_transfer_error(1);
     P50CacheSessionFdRequestFields fd_request;
     fd_request.wire_job_id = assignment.job_id;
     fd_request.assignment_epoch = assignment.assignmentEpoch();
     fd_request.assignment_nonce = assignment.assignmentNonce();
-    fd_request.profile = p50_profile_wire(profile);
-    if (!fd_request.valid() || !source)
+    fd_request.profile = *profile_wire;
+    if (!fd_request.valid())
         return p50_transfer_error(1);
 
     // The ordinary local daemon channel is the assignment authority.  The
@@ -291,7 +308,7 @@ icecc::p50::local::P50SourceTransferResult transfer_p50_source(
     request.logical_job = job.jobID();
     request.compiler_attempt = job.assignmentNonce();
     request.source_request_id = assignment.assignmentNonce();
-    request.source_mode = p50_source_mode_wire(profile);
+    request.source_mode = *source_mode;
     if (!request.valid()) {
         ::close(source_dup);
         ::close(control_fd);
@@ -305,19 +322,15 @@ icecc::p50::local::P50SourceTransferResult transfer_p50_source(
     const ControlOperation operation = make_source_transfer_operation(
         identity, request, absolute_deadline);
     CredentialExpectation credentials;
-    credentials.uid = ::geteuid();
-    credentials.gid = ::getegid();
+    credentials.uid = control_identity.peer_uid;
+    credentials.gid = control_identity.peer_gid;
 
     DaemonControlOperation control;
     const DaemonControlStatus started = control.begin_authenticated(
         control_fd, operation, source_dup, credentials, identity, deadline,
         DaemonControlLimits{}, DaemonControlFdOwnership::Owned);
-    if (started != DaemonControlStatus::InProgress) {
-        // begin_authenticated() does not own transfer_fd on argument/setup
-        // rejection; retain explicit ownership on every failure edge.
-        ::close(source_dup);
+    if (started != DaemonControlStatus::InProgress)
         return p50_transfer_error(6);
-    }
 
     while (!control.done()) {
         const auto now = std::chrono::steady_clock::now();

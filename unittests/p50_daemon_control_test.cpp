@@ -707,6 +707,48 @@ void test_connect_pending_ignores_preconnect_hup() {
     (void)::unlink(path.c_str());
 }
 
+void test_authenticated_entry_consumes_transfer_on_every_return() {
+    int invalid_pair[2] = {-1, -1};
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, invalid_pair) == 0);
+    nonblock(invalid_pair[0]);
+    const int invalid_payload = ::open("/dev/null", O_RDONLY);
+    CHECK(invalid_payload >= 0);
+    const ControlOperation expected = source_operation();
+    DaemonControlOperation invalid;
+    CHECK(invalid.begin_authenticated(
+              invalid_pair[0], expected, invalid_payload, credentials(),
+              Identity{expected.identity.generation,
+                       expected.identity.attempt + 1},
+              std::chrono::steady_clock::now() + std::chrono::seconds(1),
+              DaemonControlLimits{}, DaemonControlFdOwnership::Borrowed) ==
+          DaemonControlStatus::InvalidArgument);
+    errno = 0;
+    CHECK(::fcntl(invalid_payload, F_GETFD) == -1 && errno == EBADF);
+    CHECK(::fcntl(invalid_pair[0], F_GETFD) >= 0);
+    ::close(invalid_pair[0]);
+    ::close(invalid_pair[1]);
+
+    int credential_pair[2] = {-1, -1};
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, credential_pair) == 0);
+    nonblock(credential_pair[0]);
+    const int credential_payload = ::open("/dev/null", O_RDONLY);
+    CHECK(credential_payload >= 0);
+    CredentialExpectation mismatch = credentials();
+    mismatch.uid = *mismatch.uid + 1;
+    DaemonControlOperation rejected;
+    CHECK(rejected.begin_authenticated(
+              credential_pair[0], expected, credential_payload, mismatch,
+              expected.identity,
+              std::chrono::steady_clock::now() + std::chrono::seconds(1),
+              DaemonControlLimits{}, DaemonControlFdOwnership::Borrowed) ==
+          DaemonControlStatus::CredentialFailure);
+    errno = 0;
+    CHECK(::fcntl(credential_payload, F_GETFD) == -1 && errno == EBADF);
+    CHECK(::fcntl(credential_pair[0], F_GETFD) >= 0);
+    ::close(credential_pair[0]);
+    ::close(credential_pair[1]);
+}
+
 } // namespace
 
 int main() {
@@ -722,5 +764,6 @@ int main() {
     test_credentials_and_owned_fd_lifetime();
     test_poll_adapter_relevance_fairness_and_removal();
     test_connect_pending_ignores_preconnect_hup();
+    test_authenticated_entry_consumes_transfer_on_every_return();
     return 0;
 }

@@ -3683,6 +3683,8 @@ p50_fd_lease_wire(const P50CacheSessionFdRequestFields &request,
     p50_fd_put_u32(wire, 28, request.profile);
     p50_fd_put_u64(wire, 32, control_identity.generation);
     p50_fd_put_u64(wire, 40, control_identity.attempt);
+    p50_fd_put_u64(wire, 48, control_identity.peer_uid);
+    p50_fd_put_u64(wire, 56, control_identity.peer_gid);
     return wire;
 }
 
@@ -3912,6 +3914,8 @@ int MsgChannel::receive_p50_cache_fd_reply(
     if (offset == wire.size()) {
         observed_identity.generation = p50_fd_get_u64(wire, 32);
         observed_identity.attempt = p50_fd_get_u64(wire, 40);
+        observed_identity.peer_uid = p50_fd_get_u64(wire, 48);
+        observed_identity.peer_gid = p50_fd_get_u64(wire, 56);
     }
     const bool exact_payload =
         offset == wire.size() && observed_identity.valid() &&

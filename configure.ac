@@ -464,7 +464,8 @@ AS_IF([test "x$libbsc_prefix" != xno], [
     LIBS="$LIBBSC_LIBS $LIBS"
     AC_CHECK_HEADERS([libbsc.h], [],
         [AC_MSG_ERROR([--with-libbsc requires libbsc.h from the reviewed libbsc source])])
-    AC_LINK_IFELSE([AC_LANG_PROGRAM([[#include <libbsc.h>]], [[
+    AC_LINK_IFELSE([AC_LANG_PROGRAM([[#include <stddef.h>
+                                      #include <libbsc.h>]], [[
         if (bsc_init(LIBBSC_FEATURE_FASTMODE) != LIBBSC_NO_ERROR) return 1;
         unsigned char input[64] = {}, output[64 + LIBBSC_HEADER_SIZE] = {};
         (void)bsc_compress(input, output, 64, LIBBSC_DEFAULT_LZPHASHSIZE,
@@ -474,6 +475,7 @@ AS_IF([test "x$libbsc_prefix" != xno], [
     ]])], [
         AC_DEFINE([ICECC_P50_WITH_LIBBSC], [1],
                   [Build the GRZ_RESIDUAL profile with libbsc BWT])
+        LIBBSC_CFLAGS="$LIBBSC_CFLAGS -DICECC_P50_WITH_LIBBSC"
         AC_MSG_NOTICE([GRZ_RESIDUAL enabled with libbsc: $LIBBSC_LIBS])
     ], [AC_MSG_ERROR([--with-libbsc was requested but libbsc BWT could not be linked])])
     CPPFLAGS="$icecc_libbsc_save_CPPFLAGS"

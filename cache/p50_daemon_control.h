@@ -67,7 +67,8 @@ public:
     // HELLO/HELLO_ACK exchange was already completed by the supervising
     // control owner.  The supplied identity is the exact authenticated
     // sidecar incarnation; this entry starts with WriteControl and therefore
-    // never emits a second HELLO.
+    // never emits a second HELLO.  A nonnegative transfer_fd is consumed on
+    // every return path; ownership of nonblocking_fd follows ownership.
     DaemonControlStatus begin_authenticated(
         int nonblocking_fd, const ControlOperation& operation, int transfer_fd,
         const CredentialExpectation& credentials, Identity authenticated_identity,

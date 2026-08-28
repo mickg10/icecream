@@ -95,7 +95,7 @@ AM_CPPFLAGS = -I$(top_srcdir)/client -I$(top_srcdir)/services -I$(top_srcdir)/ \
 P50_CLIENT_LINK_LIBS = ../client/libp50zstdsender.a \
 	../cache/libp50endpoint.a ../cache/libp50adoptedoutcomewriter.a \
 	../cache/libprotocol50.a \
-	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
+	../services/libicecc.la $(LIBZSTD_LIBS) $(LIBBSC_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 testargs_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 testargs_LDADD = ../client/libclient.a $(P50_CLIENT_LINK_LIBS)
 p50wire_LDADD = ../cache/libprotocol50.a ../services/libicecc.la
@@ -116,7 +116,7 @@ p50endpoint_LDADD = ../cache/libp50endpointtesthooks.a \
 	../cache/libp50adoptedoutcomewriter.a \
 	../cache/libp50localtransport.a ../cache/libprotocol50.a \
 	../services/libicecc.la \
-	$(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
+	$(LIBZSTD_LIBS) $(LIBBSC_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 p50localtransport_SOURCES = p50_local_transport_test.cpp ../cache/p50_local_transport.cpp
 p50localtransport_CPPFLAGS = $(AM_CPPFLAGS) -DICECC_P50_LOCAL_TRANSPORT_TEST_HOOKS
 p50localtransport_CXXFLAGS = -pthread
@@ -258,21 +258,21 @@ p50zstdsender_CXXFLAGS = -pthread
 p50zstdsender_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 p50zstdsender_LDADD = ../client/libp50zstdsender.a ../cache/libp50endpoint.a \
 	../cache/libp50adoptedoutcomewriter.a ../cache/libprotocol50.a \
-	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
+	../services/libicecc.la $(LIBZSTD_LIBS) $(LIBBSC_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 p50compilebinding_SOURCES = p50_compile_binding_test.cpp
 p50compilebinding_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 p50compilebinding_CXXFLAGS = -pthread
 p50compilebinding_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 p50compilebinding_LDADD = ../client/libp50zstdsender.a ../cache/libp50endpoint.a \
 	../cache/libp50adoptedoutcomewriter.a ../cache/libprotocol50.a \
-	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
+	../services/libicecc.la $(LIBZSTD_LIBS) $(LIBBSC_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 p50routeowner_SOURCES = p50_route_owner_test.cpp
 p50routeowner_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 p50routeowner_CXXFLAGS = -pthread
 p50routeowner_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 p50routeowner_LDADD = ../client/libp50zstdsender.a ../cache/libp50endpoint.a \
 	../cache/libp50adoptedoutcomewriter.a ../cache/libprotocol50.a \
-	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
+	../services/libicecc.la $(LIBZSTD_LIBS) $(LIBBSC_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 p50resultdisposition_SOURCES = p50_result_disposition_test.cpp
 p50resultdisposition_CXXFLAGS = -pthread
 p50resultdisposition_LDFLAGS = -pthread
@@ -372,7 +372,7 @@ p50assignment_LDADD = ../services/libicecc.la
 p50cacheadvertisement_SOURCES = p50cacheadvertisement.cpp
 p50cacheadvertisement_CXXFLAGS = -pthread
 p50cacheadvertisement_LDFLAGS = -pthread
-p50cacheadvertisement_LDADD = ../cache/libprotocol50.a ../services/libicecc.la
+p50cacheadvertisement_LDADD = ../cache/libprotocol50.a ../services/libicecc.la $(LIBBSC_LIBS)
 p50cachesession_SOURCES = p50cachesession.cpp
 p50cachesession_CXXFLAGS = -pthread
 p50cachesession_LDFLAGS = -pthread

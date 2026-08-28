@@ -8766,7 +8766,9 @@ bool Daemon::handle_p50_cache_session_fd_request(
     }
 
     const P50CacheControlIdentity control_identity{
-        identity.generation, identity.attempt};
+        identity.generation, identity.attempt,
+        static_cast<uint64_t>(::geteuid()),
+        static_cast<uint64_t>(::getegid())};
     if (!client->channel->send_p50_cache_fd_reply(
             *msg, control_identity, transfer_fd, deadline))
         return refuse("cannot deliver cache-service control descriptor");

@@ -264,40 +264,39 @@ DaemonControlStatus DaemonControlOperation::begin_authenticated(
     const CredentialExpectation& credentials, Identity authenticated_identity,
     std::chrono::steady_clock::time_point deadline, DaemonControlLimits limits,
     DaemonControlFdOwnership ownership) noexcept {
+    // This entry is called with a private duplicate of the source.  Adopt it
+    // before validation so every return path has one unambiguous closer.
+    close_fd();
+    fd_ = nonblocking_fd;
+    own_fd_ = ownership == DaemonControlFdOwnership::Owned;
+    transfer_fd_ = transfer_fd;
     if (nonblocking_fd < 0 ||
         operation.kind != ControlOperationKind::SourceTransfer ||
-        transfer_fd < 0 || !valid_limits(limits) ||
+        transfer_fd < 0 || transfer_fd == nonblocking_fd ||
+        !valid_limits(limits) ||
         deadline <= std::chrono::steady_clock::now() ||
         operation.identity != authenticated_identity ||
         authenticated_identity.generation == 0 ||
         authenticated_identity.attempt == 0 ||
         !credentials.uid.has_value() || !credentials.gid.has_value()) {
-        if (ownership == DaemonControlFdOwnership::Owned && nonblocking_fd >= 0)
-            ::close(nonblocking_fd);
-        return status_ = DaemonControlStatus::InvalidArgument;
+        fail(DaemonControlStatus::InvalidArgument);
+        return status_;
     }
     if (!ensure_nonblocking(nonblocking_fd)) {
-        if (ownership == DaemonControlFdOwnership::Owned && nonblocking_fd >= 0)
-            ::close(nonblocking_fd);
-        return status_ = DaemonControlStatus::InvalidArgument;
+        fail(DaemonControlStatus::InvalidArgument);
+        return status_;
     }
     std::vector<uint8_t> encoded;
     try {
         encoded = encode_control_operation(operation);
     } catch (...) {
-        if (ownership == DaemonControlFdOwnership::Owned)
-            ::close(nonblocking_fd);
-        return status_ = DaemonControlStatus::InvalidArgument;
+        fail(DaemonControlStatus::InvalidArgument);
+        return status_;
     }
     if (encoded.empty()) {
-        if (ownership == DaemonControlFdOwnership::Owned)
-            ::close(nonblocking_fd);
-        return status_ = DaemonControlStatus::InvalidArgument;
+        fail(DaemonControlStatus::InvalidArgument);
+        return status_;
     }
-    close_fd();
-    fd_ = nonblocking_fd;
-    own_fd_ = ownership == DaemonControlFdOwnership::Owned;
-    transfer_fd_ = transfer_fd;
     try {
         operation_ = operation;
         credentials_ = credentials;

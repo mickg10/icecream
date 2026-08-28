@@ -66,7 +66,8 @@ P50CacheControlIdentity control_identity()
 {
     return P50CacheControlIdentity{
         UINT64_C(0x1112131415161718),
-        UINT64_C(0x2122232425262728)};
+        UINT64_C(0x2122232425262728),
+        UINT64_C(4103), UINT64_C(3513)};
 }
 
 std::chrono::steady_clock::time_point deadline()
@@ -103,6 +104,8 @@ std::array<uint8_t, P50_CACHE_FD_LEASE_BYTES> lease_wire(
     put32(wire, 28, value.profile);
     put64(wire, 32, identity.generation);
     put64(wire, 40, identity.attempt);
+    put64(wire, 48, identity.peer_uid);
+    put64(wire, 56, identity.peer_gid);
     return wire;
 }
 
