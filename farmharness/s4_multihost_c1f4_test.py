@@ -113,12 +113,11 @@ class FourHostRunnerTests(unittest.TestCase):
         self.assertIn('4) values_count=16384', runner.CLIENT_SCRIPT)
         self.assertIn('for i in $(seq 1 "$worker_count")', runner.CLIENT_SCRIPT)
 
-    def test_container_work_mount_uses_existing_image_workspace(self) -> None:
-        self.assertIn('-v "$work:/workspace"', runner.START_WORKER_SCRIPT)
-        self.assertIn('--entrypoint /bin/sh "$image" /workspace/wrapper.sh', runner.START_WORKER_SCRIPT)
-        self.assertNotIn('--entrypoint /workspace/wrapper.sh', runner.START_WORKER_SCRIPT)
+    def test_container_work_mount_uses_generic_probe_path(self) -> None:
+        self.assertIn('-v "$work:/probe"', runner.START_WORKER_SCRIPT)
+        self.assertIn('--entrypoint /bin/sh "$image" /probe/wrapper.sh', runner.START_WORKER_SCRIPT)
         self.assertNotIn('--entrypoint /work/wrapper.sh', runner.START_WORKER_SCRIPT)
-        self.assertIn('-v "$work:/workspace"', runner.START_SCHEDULER_SCRIPT)
+        self.assertIn('-v "$work:/probe"', runner.START_SCHEDULER_SCRIPT)
 
 
 if __name__ == "__main__":
