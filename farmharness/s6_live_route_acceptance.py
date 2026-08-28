@@ -542,8 +542,7 @@ class Runtime:
                 HOME=str(self.root / "home"))
             return [str(self.build / "daemon/iceccd"), *args], values
         command = ["docker", "run", "--rm", "--name", self._client_docker_name(node),
-                   "--network", "host", "--pid", "host", "--user", "0",
-                   "--cap-add", "SYS_CHROOT",
+                   "--network", "host", "--user", "0", "--cap-add", "SYS_CHROOT",
                    "-v", str(self.build) + ":/role:ro", "-v", str(self.root) + ":/work",
                    "-e", "S6_ROLE_UID=" + str(os.getuid()),
                    "-e", "S6_ROLE_GID=" + str(os.getgid())]
@@ -709,12 +708,44 @@ class Runtime:
         if disposition:
             env["ICECC_P50_TEST_DISPOSITION"] = disposition
         source.write_bytes(source_bytes(int(re.sub(r"\D", "", label) or "0")))
-        command = [str(self.build / "client/icecc"), "g++", "-std=c++17", "-O2", "-c", str(source), "-o", str(remote)]
+        compiler_command = [str(self.build / "client/icecc"), "g++", "-std=c++17",
+                            "-O2", "-c", str(source), "-o", str(remote)]
+        command = compiler_command
+        process_env = env
+        if self.docker:
+            inside_source = Path("/work") / source.relative_to(self.root)
+            inside_remote = Path("/work") / remote.relative_to(self.root)
+            inside_envtar = Path("/work") / self.envtar.relative_to(self.root)
+            inside_socket = Path("/work") / socket_path.relative_to(self.root)
+            inside_trace = Path("/work") / trace.relative_to(self.root)
+            inside_log = Path("/work") / wrapper_log.relative_to(self.root)
+            container_env = self.env(
+                ICECC_TEST_SOCKET=str(inside_socket), ICECC_TEST_REMOTEBUILD="1",
+                ICECC_VERSION=str(inside_envtar), ICECC_PREFERRED_HOST="s6-f",
+                ICECC_P50_COMPILE_IDENTITY_TRACE=str(inside_trace), ICECC_DEBUG="debug",
+                ICECC_LOGFILE=str(inside_log), ICECC_CARET_WORKAROUND="0",
+                HOME="/work/home")
+            if disposition:
+                container_env["ICECC_P50_TEST_DISPOSITION"] = disposition
+            command = ["docker", "exec", "--user", "%d:%d" % (os.getuid(), os.getgid()),
+                       "--workdir", "/role"]
+            for key in ("ICECC_TEST_SOCKET", "ICECC_TEST_REMOTEBUILD", "ICECC_VERSION",
+                        "ICECC_PREFERRED_HOST", "ICECC_P50_COMPILE_IDENTITY_TRACE",
+                        "ICECC_DEBUG", "ICECC_LOGFILE", "ICECC_CARET_WORKAROUND",
+                        "ICECC_P50_PROFILE", "ICECC_P50_C1F1_REQUIRED", "HOME", "TMPDIR"):
+                command.extend(["--env", key + "=" + container_env[key]])
+            if disposition:
+                command.extend(["--env", "ICECC_P50_TEST_DISPOSITION=" + disposition])
+            command.extend([self._client_docker_name("s6-c"), "/role/client/icecc",
+                            "g++", "-std=c++17", "-O2", "-c", str(inside_source),
+                            "-o", str(inside_remote)])
+            process_env = os.environ.copy()
         started = time.monotonic()
         output_stream = (self.root / (label + ".stdout")).open("w", encoding="utf-8")
         wrapper: subprocess.Popen[Any] | None = None
         try:
-            wrapper = subprocess.Popen(command, env=env, cwd=self.source, stdout=output_stream,
+            wrapper = subprocess.Popen(command, env=process_env, cwd=self.source,
+                                       stdout=output_stream,
                                        stderr=subprocess.STDOUT, start_new_session=True)
             try:
                 wrapper.communicate(timeout=self.timeout)
@@ -752,9 +783,12 @@ class Runtime:
         _terminate(self.worker)
         self.worker = None
         if self.docker:
-            subprocess.run(["docker", "rm", "-f", self._docker_name],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=10, check=False)
+            try:
+                subprocess.run(["docker", "rm", "-f", self._docker_name],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=30, check=False)
+            except (OSError, subprocess.SubprocessError):
+                pass
 
     def start_second_client(self) -> tuple[bool, str]:
         if self.client2_port == 0:
