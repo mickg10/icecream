@@ -82,6 +82,46 @@ struct CharBufferDeleter {
     }
 };
 
+void append_p50_compile_identity_trace(const CompileJob &job,
+                                       const CompileResultMsg &result) noexcept
+{
+    const char *path = ::getenv("ICECC_P50_COMPILE_IDENTITY_TRACE");
+    if (path == nullptr || *path == '\0' || !job.hasAssignmentIdentity()
+            || !job.hasCompileIdentity() || !result.compileIdentityMatches(job))
+        return;
+
+    char line[512];
+    const int length = ::snprintf(
+        line, sizeof(line),
+        "{\"record\":\"compile-result-identity\",\"job_id\":%u,"
+        "\"assignment_epoch\":%llu,\"assignment_nonce\":%llu,"
+        "\"c_guid\":%llu,\"tu_seq\":%llu}\n",
+        job.jobID(),
+        static_cast<unsigned long long>(result.assignmentEpoch()),
+        static_cast<unsigned long long>(result.assignmentNonce()),
+        static_cast<unsigned long long>(result.cGuid()),
+        static_cast<unsigned long long>(result.tuSeq()));
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(line))
+        return;
+
+    const int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return;
+    size_t offset = 0;
+    while (offset < static_cast<size_t>(length)) {
+        const ssize_t written = ::write(fd, line + offset,
+                                        static_cast<size_t>(length) - offset);
+        if (written > 0) {
+            offset += static_cast<size_t>(written);
+            continue;
+        }
+        if (written < 0 && errno == EINTR)
+            continue;
+        break;
+    }
+    (void)::close(fd);
+}
+
 class TempSourceFile
 {
 public:
@@ -916,6 +956,7 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
             delete crmsg;
             throw client_error(13, "Error 13 - compile result assignment/C_GUID/TU_SEQ mismatch");
         }
+        append_p50_compile_identity_trace(job, *crmsg);
         p50_result_received = p50_input;
 
         status = crmsg->status;

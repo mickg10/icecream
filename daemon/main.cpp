@@ -9384,12 +9384,12 @@ void Daemon::answer_client_requests()
     if (buffered_client_pending) {
         poll_timeout_msec = 0;
     }
-    /* An armed sidecar launch/abort plan advances exactly one bounded phase
-       per turn; grant it zero-timeout turns so the finite plan reaches fork
-       (or completes its abort) within the launch deadline instead of
-       expiring between sleepy polls. */
+    /* An armed sidecar launch/cleanup plan advances exactly one bounded
+       action per turn. Grant zero-timeout turns while already-admitted work
+       can progress, so the finite plan reaches fork or exact teardown before
+       its absolute deadline instead of expiring between quiet polls. */
     if (cache_adapter != nullptr && cache_adapter_start_attempted &&
-        cache_adapter->outer_launch_plan_active()) {
+        cache_adapter->outer_immediate_turn_required()) {
         poll_timeout_msec = 0;
     }
 

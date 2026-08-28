@@ -47,6 +47,8 @@ def check_client(source: str) -> None:
             "fallback/generic definitive-cancel paths are incomplete")
     ordered(flow,
             "CompileResultMsg *crmsg",
+            "if (!crmsg->compileIdentityMatches(job))",
+            "append_p50_compile_identity_trace(job, *crmsg);",
             "p50_result_received = p50_input;",
             "receive_file(job.outputFile(), cserver);",
             "send_p50_disposition(ResultDispositionMsg::Accepted)")
@@ -125,6 +127,8 @@ def check_parent(source: str) -> None:
             "parent consumes an unvalidated P50 child record")
     require("p50_completion_matches_retained_lease" in flow,
             "parent does not bind terminal disposition to its retained lease")
+    require("cache_adapter->outer_immediate_turn_required()" in source,
+            "daemon poll owner can sleep through finite sidecar work")
     ordered(flow,
             "p50_completion_matches_retained_lease(",
             "InputLifecycleAction::CloseAcceptedJob",
@@ -200,6 +204,9 @@ def check_runtime_gate(source: str) -> None:
                   "after_records=0 after_bytes=0",
                   "after_records=1 after_bytes=[1-9][0-9]*",
                   "attempt_only_pids", "attempt_only_attempts",
+                  "ICECC_P50_COMPILE_IDENTITY_TRACE",
+                  "--identity-trace \"$work/compile-identity.jsonl\"",
+                  'statuses != {"c_guid": "PASS", "tu_seq": "PASS"}',
                   "p50_runtime_evidence.py", "runtime.json",
                   "did not retain incomplete rows as HOLD"):
         require(token in source, f"real terminal/reclaim matrix omits {token}")
@@ -248,6 +255,7 @@ def deletion_mutants(files: dict[str, str]) -> None:
          "false"),
         ("client", 'selected == "malformed"', "false"),
         ("client", 'selected == "disconnect"', "false"),
+        ("client", "append_p50_compile_identity_trace(job, *crmsg);", ""),
         ("serve", "write(out_fd, job_stat, sizeof(job_stat))", "write_deleted()"),
         ("serve", "rmsg.status = ret;", "status_binding_deleted();"),
         ("serve", "job_stat[JobStatistics::exit_code] = ret;", "stats_binding_deleted();"),
@@ -261,6 +269,7 @@ def deletion_mutants(files: dict[str, str]) -> None:
         ("main", "InputLifecycleAction::CloseAcceptedJob", "InputLifecycleAction::None"),
         ("main", "InputLifecycleAction::CancelJob", "InputLifecycleAction::None"),
         ("main", "p50_completion_matches_retained_lease(", "lease_check_deleted("),
+        ("main", "cache_adapter->outer_immediate_turn_required()", "false"),
         ("main", "ICECC_P50_TEST_POST_TERMINAL_ATTACH", "PROBE_DELETED"),
         ("record_h", "static_assert(kLegacyCompletionStatsWireSize == 32", "static_assert(true"),
         ("record_cpp", "flags | O_NONBLOCK", "flags"),
@@ -271,6 +280,7 @@ def deletion_mutants(files: dict[str, str]) -> None:
         ("cache_service", "if (mutated && decision.collect_record)\n                    endpoint_->collect_input_garbage();",
          "if (mutated && decision.collect_record)\n                    collect_deleted();"),
         ("runtime_gate", "kill -9 \"$old_pid\"", "kill_deleted"),
+        ("runtime_gate", "--identity-trace \"$work/compile-identity.jsonl\"", ""),
         ("runtime_gate", "run_remote_cell disconnect disconnect", "disconnect_deleted"),
     )
     for filename, old, new in mutations:

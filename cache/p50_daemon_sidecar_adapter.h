@@ -211,12 +211,13 @@ public:
     // never substitutes for this proof.
     [[nodiscard]] bool outer_shutdown_complete() const noexcept;
     [[nodiscard]] bool outer_action_taken() const noexcept { return outer_action_taken_; }
-    // True while a launch/abort plan is mid-flight. The daemon outer loop
-    // must grant zero-timeout turns until the plan completes: each turn
-    // performs exactly one bounded action, and the plan is finite (~30
-    // phases), so this is bounded incremental progress -- without it the
-    // one-second launch deadline expires before the one-phase-per-poll-turn
-    // plan can reach fork.
+    // True while already-admitted in-memory work can make progress without
+    // waiting for another fd event.  The daemon grants zero-timeout turns to
+    // these finite plans; each turn still performs at most one fallible
+    // action.  This covers teardown cleanup as well as launch: otherwise a
+    // quiet farm can sleep until the absolute teardown deadline between two
+    // identity-checked cleanup steps and fail closed before retrying.
+    [[nodiscard]] bool outer_immediate_turn_required() const noexcept;
     [[nodiscard]] bool outer_launch_plan_active() const noexcept {
         return outer_launch_phase_ != 0;
     }

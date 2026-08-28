@@ -29,12 +29,12 @@ bool exact_node(const std::string& path, mode_t mode, bool directory,
 int poll_timeout(DaemonSidecarAdapter& adapter,
                  std::chrono::steady_clock::time_point limit)
 {
-    constexpr auto kTurnCap = std::chrono::milliseconds(50);
     const auto now = std::chrono::steady_clock::now();
     auto remaining = limit > now
         ? std::chrono::duration_cast<std::chrono::milliseconds>(limit - now)
         : std::chrono::milliseconds(0);
-    remaining = std::min(remaining, kTurnCap);
+    if (adapter.outer_immediate_turn_required())
+        return 0;
     const auto lifecycle_deadline = adapter.outer_next_deadline();
     if (lifecycle_deadline != std::chrono::steady_clock::time_point{}) {
         const auto lifecycle_remaining = lifecycle_deadline > now

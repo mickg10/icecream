@@ -32,6 +32,7 @@ grep -F 'observe_public_listener' "$header" >/dev/null
 grep -F 'outer_begin_turn' "$header" >/dev/null
 grep -F 'outer_advance_turn' "$header" >/dev/null
 grep -F 'outer_append_pollfds' "$header" >/dev/null
+grep -F 'outer_immediate_turn_required' "$header" >/dev/null
 grep -F 'outer_prepare_attempt_retirement' "$header" >/dev/null
 grep -F 'outer_commit_attempt_replacement' "$header" >/dev/null
 grep -F 'outer_close_logical_input_lease' "$header" >/dev/null
@@ -104,7 +105,8 @@ link_binary() {
         "$top_build/cache/libp50sidecarsupervisor.a" \
         "$top_build/cache/libp50localtransport.a" \
         "$top_build/cache/libprotocol50.a" \
-        "$top_build/services/.libs/libicecc.a" -llzo2 \
+        "$top_build/services/.libs/libicecc.a" \
+        ${ICECC_TEST_LIBCAP_NG_LIBS:-} -llzo2 \
         ${ICECC_TEST_LIBZSTD_LIBS:--lzstd} \
         ${ICECC_TEST_XXHASH_LIBS:--lxxhash} -o "$binary"
 }

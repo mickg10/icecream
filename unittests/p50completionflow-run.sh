@@ -202,6 +202,7 @@ run_remote_cell() {
     accepted)
         ICECC_TEST_SOCKET="$work/client.sock" ICECC_TEST_REMOTEBUILD=1 \
             ICECC_VERSION="$envtar" ICECC_P50_C1F1_REQUIRED=1 \
+            ICECC_P50_COMPILE_IDENTITY_TRACE="$work/compile-identity.jsonl" \
             ICECC_PREFERRED_HOST=p50-f ICECC_CARET_WORKAROUND=0 \
             ICECC_DEBUG=debug ICECC_LOGFILE="$client_log" \
             timeout "$timeout_s" "$build/client/icecc" g++ -std=c++17 -O2 -Wall -c \
@@ -210,6 +211,7 @@ run_remote_cell() {
     definitive)
         ICECC_TEST_SOCKET="$work/client.sock" ICECC_TEST_REMOTEBUILD=1 \
             ICECC_VERSION="$envtar" ICECC_PREFERRED_HOST=p50-f \
+            ICECC_P50_COMPILE_IDENTITY_TRACE="$work/compile-identity.jsonl" \
             ICECC_CARET_WORKAROUND=1 ICECC_DEBUG=debug \
             ICECC_LOGFILE="$client_log" \
             timeout "$timeout_s" "$build/client/icecc" g++ -std=c++17 -O2 -Wall -c \
@@ -218,6 +220,7 @@ run_remote_cell() {
     malformed|disconnect)
         ICECC_TEST_SOCKET="$work/client.sock" ICECC_TEST_REMOTEBUILD=1 \
             ICECC_VERSION="$envtar" ICECC_P50_C1F1_REQUIRED=1 \
+            ICECC_P50_COMPILE_IDENTITY_TRACE="$work/compile-identity.jsonl" \
             ICECC_PREFERRED_HOST=p50-f ICECC_CARET_WORKAROUND=0 \
             ICECC_P50_TEST_DISPOSITION="$mode" \
             ICECC_DEBUG=debug ICECC_LOGFILE="$client_log" \
@@ -348,13 +351,31 @@ test "$(grep -E -c 'P50 input settlement job .* action 1 ' "$work/f.log")" -eq 2
 python3 "$src/unittests/p50_runtime_evidence.py" \
     --experiment-id "$experiment_id" --run-id "$(basename "$work")" \
     --ready "$work/ready.trace" --lifecycle "$work/lifecycle.trace" \
-    --worker-log "$work/f.log" --output "$work/evidence/runtime.json" \
+    --worker-log "$work/f.log" \
+    --identity-trace "$work/compile-identity.jsonl" \
+    --output "$work/evidence/runtime.json" \
     >"$work/evidence/verification.json"
 grep -F '"status":"HOLD"' "$work/evidence/verification.json" >/dev/null || {
     echo "FAIL: runtime evidence verifier did not retain incomplete rows as HOLD" >&2
     exit 1
 }
 test -s "$work/evidence/runtime.json"
+python3 - "$work/evidence/runtime.json" <<'PY'
+import json
+import sys
+
+document = json.load(open(sys.argv[1], encoding="utf-8"))
+statuses = {row["field"]: row["status"] for row in document["identity_status"]}
+if statuses != {"c_guid": "PASS", "tu_seq": "PASS"}:
+    raise SystemExit(f"FAIL: compile identities are not PASS: {statuses}")
+identities = document["runtime"]["compile_identity"]
+if len(identities) != 4:
+    raise SystemExit(f"FAIL: expected four compile identity records, got {len(identities)}")
+verification = document["verification"]
+if verification.get("status") != "HOLD" or verification.get("issues") != [
+        "statistics_document_missing"]:
+    raise SystemExit(f"FAIL: runtime evidence has unexpected remaining issues: {verification}")
+PY
 
 kill -0 "$service_pid" 2>/dev/null || {
     echo "FAIL: final replacement sidecar is not live" >&2

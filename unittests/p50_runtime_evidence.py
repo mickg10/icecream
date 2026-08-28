@@ -29,6 +29,10 @@ READY_FIELDS = frozenset({
     "f_store_generation", "derivation_version", "pid", "c_store_guid",
     "f_store_guid", "path", "socket_digest", "device", "inode",
 })
+COMPILE_IDENTITY_FIELDS = frozenset({
+    "record", "job_id", "assignment_epoch", "assignment_nonce", "c_guid",
+    "tu_seq",
+})
 
 
 def parse_ready_lines(text: str) -> list[dict[str, Any]]:
@@ -86,6 +90,20 @@ def parse_ready_lines(text: str) -> list[dict[str, Any]]:
     return rows
 
 
+def parse_compile_identity_lines(text: str) -> list[Any]:
+    """Retain every trace line so malformed rows remain incomplete evidence."""
+    rows: list[Any] = []
+    for line in text.splitlines():
+        if not line:
+            rows.append({"record": "invalid"})
+            continue
+        try:
+            rows.append(json.loads(line))
+        except (json.JSONDecodeError, RecursionError):
+            rows.append({"record": "invalid"})
+    return rows
+
+
 def _file_evidence(path: Path) -> dict[str, Any]:
     raw = path.read_bytes()
     return {
@@ -114,6 +132,48 @@ def _valid_ready_row(row: Any) -> bool:
     path = row.get("path")
     return (isinstance(path, str) and bool(path) and
             not any(char.isspace() for char in path))
+
+
+def _valid_compile_identity_row(row: Any) -> bool:
+    if not isinstance(row, Mapping) or set(row) != COMPILE_IDENTITY_FIELDS:
+        return False
+    if row.get("record") != "compile-result-identity":
+        return False
+    for field in ("job_id", "assignment_epoch", "assignment_nonce", "c_guid"):
+        if type(row.get(field)) is not int or row[field] <= 0:
+            return False
+    return type(row.get("tu_seq")) is int and row["tu_seq"] >= 0
+
+
+def _ready_rows_form_replacement_chain(rows: Any) -> bool:
+    if not isinstance(rows, list) or not rows or any(
+            not _valid_ready_row(row) for row in rows):
+        return False
+    if len({row["control_generation"] for row in rows}) != 1:
+        return False
+    for previous, current in zip(rows, rows[1:]):
+        if (current["control_attempt"] <= previous["control_attempt"] or
+                current["f_store_generation"] <= previous["f_store_generation"]):
+            return False
+    identities = {
+        (row["control_attempt"], row["f_store_generation"], row["pid"],
+         row["c_store_guid"], row["f_store_guid"], row["path"],
+         row["socket_digest"], row["device"], row["inode"])
+        for row in rows
+    }
+    return len(identities) == len(rows)
+
+
+def _identity_rows_complete(rows: Any) -> bool:
+    if not isinstance(rows, list) or not rows or any(
+            not _valid_compile_identity_row(row) for row in rows):
+        return False
+    identities = {
+        (row["job_id"], row["assignment_epoch"], row["assignment_nonce"],
+         row["c_guid"], row["tu_seq"])
+        for row in rows
+    }
+    return len(identities) == len(rows)
 
 
 def _lines(path: Path, prefix: str | None = None) -> list[str]:
@@ -145,13 +205,20 @@ def verify_runtime_artifact(document: Mapping[str, Any]) -> dict[str, Any]:
     else:
         if any(not _valid_ready_row(row) for row in ready):
             issues.append("f_store_ready_row_invalid")
-        generations = {row.get("f_store_generation") for row in ready
-                       if _valid_ready_row(row)}
-        if len(generations) != 1:
+        if not _ready_rows_form_replacement_chain(ready):
             issues.append("f_store_generation_ambiguous")
     runtime = document.get("runtime")
     if not isinstance(runtime, Mapping) or not runtime.get("lifecycle"):
         issues.append("runtime_lifecycle_missing")
+    compile_identity = runtime.get("compile_identity") \
+        if isinstance(runtime, Mapping) else None
+    identity_complete = _identity_rows_complete(compile_identity)
+    if not isinstance(compile_identity, list) or not compile_identity:
+        issues.append("compile_identity_missing")
+    elif any(not _valid_compile_identity_row(row) for row in compile_identity):
+        issues.append("compile_identity_row_invalid")
+    elif not identity_complete:
+        issues.append("compile_identity_duplicate")
     identity_status = document.get("identity_status")
     if not isinstance(identity_status, list):
         issues.append("identity_status_missing")
@@ -161,9 +228,10 @@ def verify_runtime_artifact(document: Mapping[str, Any]) -> dict[str, Any]:
         if fields != {"c_guid", "tu_seq"}:
             issues.append("identity_status_fields_incomplete")
         for row in identity_status:
-            if (not isinstance(row, Mapping) or row.get("status") != "HOLD" or
+            expected = "PASS" if identity_complete else "HOLD"
+            if (not isinstance(row, Mapping) or row.get("status") != expected or
                     not isinstance(row.get("reason"), str) or not row["reason"]):
-                issues.append("identity_status_not_hold")
+                issues.append("identity_status_inconsistent")
 
     statistics = document.get("statistics")
     verifier_result: dict[str, Any] | None = None
@@ -221,12 +289,25 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
     source_paths = [ready_path, lifecycle_path]
     if args.worker_log:
         source_paths.append(Path(args.worker_log))
+    identity_path = Path(args.identity_trace) if args.identity_trace else None
+    if identity_path is not None:
+        source_paths.append(identity_path)
     source_paths = [path for path in source_paths if path.exists()]
     ready = parse_ready_lines(ready_path.read_text(encoding="utf-8", errors="replace")
                               if ready_path.exists() else "")
     lifecycle = _lines(lifecycle_path, "P50_LIFECYCLE ")
     settlements = _lines(Path(args.worker_log), "P50 input settlement ") \
         if args.worker_log else []
+    identities = parse_compile_identity_lines(
+        identity_path.read_text(encoding="utf-8", errors="replace")
+        if identity_path is not None and identity_path.exists() else "")
+    identity_complete = _identity_rows_complete(identities)
+    identity_status = "PASS" if identity_complete else "HOLD"
+    identity_reason = (
+        f"{len(identities)} compile-result identity records matched the real job"
+        if identity_complete else
+        "no complete unique compile-result identity witness was collected"
+    )
     return {
         "schema": SCHEMA,
         "experiment_id": args.experiment_id,
@@ -235,13 +316,14 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         "runtime": {
             "lifecycle": lifecycle,
             "settlements": settlements,
+            "compile_identity": identities,
         },
         "source_files": [_file_evidence(path) for path in source_paths],
         "identity_status": [
-            {"field": "c_guid", "status": "HOLD",
-             "reason": "completion artifact does not publish a C_GUID witness"},
-            {"field": "tu_seq", "status": "HOLD",
-             "reason": "completion artifact does not publish a TU_SEQ witness"},
+            {"field": "c_guid", "status": identity_status,
+             "reason": identity_reason},
+            {"field": "tu_seq", "status": identity_status,
+             "reason": identity_reason},
         ],
     }
 
@@ -253,6 +335,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ready", required=True, type=Path)
     parser.add_argument("--lifecycle", required=True, type=Path)
     parser.add_argument("--worker-log", type=Path)
+    parser.add_argument("--identity-trace", type=Path)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args(argv)
     document = collect(args)

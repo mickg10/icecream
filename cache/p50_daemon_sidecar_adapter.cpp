@@ -2300,12 +2300,21 @@ bool DaemonSidecarAdapter::outer_cleanup_exact() noexcept
                 close_failed();
                 return true;
             }
-            // RENAME_NOREPLACE makes the capture a one-way identity fence:
-            // a later pathname occupant can never be mistaken for A, and a
-            // failed/unknown rename is retained as a cleanup hold.
+            // Prefer a no-replace capture.  Linux ZFS returns EINVAL for
+            // RENAME_NOREPLACE on a socket node, so use the ordinary rename
+            // operation there; the attempt directory and capture name are
+            // private to this adapter, and StatCapture still verifies the
+            // exact device/inode before removal.
             if (::syscall(SYS_renameat2, outer_cleanup_parent_fd_, target_name,
                           outer_cleanup_parent_fd_, outer_cleanup_capture_name_.c_str(),
                           1u) == 0) {
+                outer_cleanup_step_ = cleanup_step(OuterCleanupStep::StatCapture);
+                return true;
+            }
+            if ((errno == EINVAL || errno == ENOSYS || errno == EOPNOTSUPP) &&
+                ::renameat(outer_cleanup_parent_fd_, target_name,
+                           outer_cleanup_parent_fd_,
+                           outer_cleanup_capture_name_.c_str()) == 0) {
                 outer_cleanup_step_ = cleanup_step(OuterCleanupStep::StatCapture);
                 return true;
             }
@@ -2734,6 +2743,31 @@ DaemonSidecarAdapter::outer_next_deadline() const noexcept
          pending_input_lifecycle_.front().deadline < deadline))
         deadline = pending_input_lifecycle_.front().deadline;
     return deadline;
+}
+
+bool DaemonSidecarAdapter::outer_immediate_turn_required() const noexcept
+{
+    const sidecar::LifecycleState lifecycle_state =
+        outer_lifecycle_ != nullptr ? outer_lifecycle_->state()
+                                    : sidecar::LifecycleState::Stopped;
+    const bool cleanup_step_ready =
+        outer_cleanup_phase_ != 0 && outer_cleanup_step_ != 0;
+    const bool path_observation_ready =
+        outer_cleanup_phase_ == 0 &&
+        lifecycle_state == sidecar::LifecycleState::ReapAndGroupCheck;
+    const bool retry_ready =
+        lifecycle_state == sidecar::LifecycleState::RetryEligible &&
+        outer_replacement_requested_ && !outer_shutdown_requested_;
+    return outer_launch_phase_ != 0 || cleanup_step_ready ||
+           path_observation_ready || retry_ready ||
+           outer_pending_action_.has_value() || outer_reap_event_pending_ ||
+           outer_shutdown_input_close_pending_ ||
+           outer_replacement_input_close_pending_ ||
+           outer_auth_start_pending_ || outer_auth_failure_ ||
+           outer_input_cancel_lease_.has_value() ||
+           outer_identity_report_pending_ || outer_launch_failed_ ||
+           (outer_ready_complete_ && !outer_ready_invalid_ &&
+            lifecycle_state == sidecar::LifecycleState::ForkedAwaitExecAndReady);
 }
 
 bool DaemonSidecarAdapter::outer_advance_input(
