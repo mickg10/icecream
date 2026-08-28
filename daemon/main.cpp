@@ -1503,6 +1503,9 @@ struct Daemon {
     bool handle_job_done(Client *cl, JobDoneMsg *m) __attribute_warn_unused_result__;
     bool handle_job_timing(Client *client, JobTimingMsg *m) __attribute_warn_unused_result__;
     bool handle_cache_session(Client *client, Msg *msg) __attribute_warn_unused_result__;
+    bool handle_p50_cache_session_fd_request(
+        Client *client, P50CacheSessionFdRequestMsg *msg)
+        __attribute_warn_unused_result__;
     bool handle_compile_done(Client *client) __attribute_warn_unused_result__;
     bool handle_verify_env(Client *client, VerifyEnvMsg *msg) __attribute_warn_unused_result__;
     bool handle_blacklist_host_env(Client *client, Msg *msg) __attribute_warn_unused_result__;
@@ -8668,6 +8671,98 @@ bool Daemon::handle_job_timing(Client *client, JobTimingMsg *m)
     return true;
 }
 
+bool Daemon::handle_p50_cache_session_fd_request(
+    Client *client, P50CacheSessionFdRequestMsg *msg)
+{
+    auto refuse = [&](const char *reason) {
+        log_warning() << "P50 C-cache control request refused: " << reason << endl;
+        if (client != nullptr && client->channel != nullptr)
+            (void)client->channel->send_msg(EndMsg());
+        if (client != nullptr)
+            handle_end(client, 151);
+        return false;
+    };
+
+    if (client == nullptr || client->channel == nullptr || msg == nullptr ||
+        !msg->valid_payload())
+        return refuse("invalid request");
+
+    const P50CacheSessionFdRequestFields& request = msg->request;
+    const ConnectionProvenance& provenance = client->connection_provenance;
+    const UseCSMsg *const assignment = client->usecsmsg;
+    const Client::CacheHandoff& handoff = client->cacheHandoff;
+    if (client->status != Client::CLIENTWORK || !provenance.cache_eligible() ||
+        !connection_leases.revalidate(provenance.lease, client, client->channel,
+                                      provenance.peer).has_value())
+        return refuse("wrapper connection is not the live local assignment owner");
+    if (assignment == nullptr || !assignment->valid_payload() ||
+        !handoff.valid || request.wire_job_id != assignment->job_id ||
+        request.assignment_epoch != assignment->assignmentEpoch() ||
+        request.assignment_nonce != assignment->assignmentNonce() ||
+        request.wire_job_id != handoff.wireJobId ||
+        request.assignment_epoch != handoff.assignmentEpoch ||
+        request.assignment_nonce != handoff.assignmentNonce ||
+        assignment->cache_endpoint_port != handoff.cachePort ||
+        assignment->cache_protocol != handoff.cacheProtocol ||
+        assignment->cache_profile_mask != handoff.cacheProfileMask ||
+        (request.profile & handoff.cacheProfileMask) != request.profile)
+        return refuse("request does not match the retained UseCS handoff");
+
+    if (cache_adapter == nullptr || !cache_adapter->authenticated())
+        return refuse("supervised cache service is unavailable");
+    const auto ready_lease = cache_adapter->outer_current_ready_lease();
+    if (!ready_lease.has_value() || !ready_lease->valid())
+        return refuse("supervised cache service has no current READY lease");
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+    icecc::p50::local::Status connect_status = icecc::p50::local::Status::Ok;
+    icecc::p50::local::Connection control =
+        icecc::p50::local::connect_unix_until(ready_lease->socket_path,
+                                              deadline, &connect_status);
+    if (!control.valid())
+        return refuse("cannot connect to the current cache service");
+
+    const icecc::p50::local::Identity identity{
+        ready_lease->identity.generation, ready_lease->identity.attempt};
+    icecc::p50::local::CredentialExpectation expected_peer;
+    expected_peer.uid = ::geteuid();
+    expected_peer.gid = ::getegid();
+    if (control.verify_peer_credentials(expected_peer) !=
+            icecc::p50::local::Status::Ok ||
+        control.send_until(
+            icecc::p50::local::make_hello(
+                icecc::p50::local::PeerRole::Daemon, identity),
+            deadline) != icecc::p50::local::Status::Ok)
+        return refuse("cache-service HELLO failed");
+
+    icecc::p50::local::Frame acknowledgement;
+    if (control.receive_until(acknowledgement, deadline) !=
+            icecc::p50::local::Status::Ok ||
+        icecc::p50::local::validate_handshake(
+            acknowledgement, icecc::p50::local::MessageType::HelloAck,
+            icecc::p50::local::PeerRole::Sidecar, identity) !=
+            icecc::p50::local::Status::Ok)
+        return refuse("cache-service HELLO acknowledgement failed");
+
+    const int transfer_fd = ::dup(control.native_handle());
+    if (transfer_fd < 0)
+        return refuse("cannot duplicate cache-service control descriptor");
+    const int descriptor_flags = ::fcntl(transfer_fd, F_GETFD);
+    if (descriptor_flags < 0 ||
+        ::fcntl(transfer_fd, F_SETFD, descriptor_flags | FD_CLOEXEC) < 0) {
+        (void)::close(transfer_fd);
+        return refuse("cannot mark cache-service control descriptor close-on-exec");
+    }
+
+    if (!client->channel->send_p50_cache_fd_reply(*msg, transfer_fd, deadline))
+        return refuse("cannot deliver cache-service control descriptor");
+
+    trace() << "P50 C-cache control descriptor delivered for assignment "
+            << request.wire_job_id << " profile " << request.profile << endl;
+    return true;
+}
+
 bool Daemon::handle_cache_session(Client *client, Msg *msg)
 {
     if (!client || !client->channel || !msg || *msg != Msg::CACHE_SESSION) {
@@ -9070,6 +9165,10 @@ bool Daemon::handle_activity(Client *client)
         break;
     case Msg::CACHE_SESSION:
         ret = handle_cache_session(client, msg);
+        break;
+    case Msg::P50_CACHE_SESSION_FD_REQUEST:
+        ret = handle_p50_cache_session_fd_request(
+            client, dynamic_cast<P50CacheSessionFdRequestMsg *>(msg));
         break;
     case Msg::P50_SOURCE_ARM:
         ret = handle_p50_source_arm(client,
