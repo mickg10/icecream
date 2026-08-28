@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""Run one authenticated Protocol-50 ZSTD_TU scenario."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+
+MAX_INPUT_BYTES = 64 * 1024 * 1024
+SCENARIO_SCHEMA = "icecream-s7-p50sim-scenario-v1"
+
+
+def fail(message: str) -> int:
+    print(f"p50sim: {message}", file=sys.stderr)
+    return 1
+
+
+def regular(path: Path) -> bool:
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode) and info.st_nlink == 1
+
+
+def digest(path: Path) -> tuple[str, bytes]:
+    if not regular(path):
+        raise ValueError(f"not a private regular file: {path.name}")
+    value = path.read_bytes()
+    if len(value) > MAX_INPUT_BYTES:
+        raise ValueError("scenario input exceeds the bounded ZSTD_TU admission limit")
+    return hashlib.sha256(value).hexdigest(), value
+
+
+def canonical_json(path: Path) -> dict[str, object]:
+    if not regular(path):
+        raise ValueError(f"not a private regular file: {path.name}")
+    raw = path.read_bytes()
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError(f"{path.name} must contain an object")
+    canonical = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    if raw.strip() != canonical:
+        raise ValueError(f"{path.name} is not canonical JSON")
+    return value
+
+
+def child(root: Path, name: object) -> Path:
+    if not isinstance(name, str) or not name or Path(name).is_absolute():
+        raise ValueError("scenario paths must be relative strings")
+    path = (root / name).resolve()
+    if root not in path.parents:
+        raise ValueError("scenario path escapes its authenticated root")
+    return path
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 7 or argv[1] != "--s7-cell" or argv[3] != "--s7-artifacts" or argv[5] != "--s7-output":
+        return fail("expected --s7-cell CELL --s7-artifacts DIR --s7-output DIR")
+    cell, artifact_name, output_name = argv[2], argv[4], argv[6]
+    artifacts = Path(artifact_name).absolute()
+    output = Path(output_name).absolute()
+    if not artifacts.is_dir() or artifacts.is_symlink():
+        return fail("scenario root is unavailable")
+    try:
+        scenario = canonical_json(artifacts / "scenario.json")
+        if scenario.get("schema") != SCENARIO_SCHEMA:
+            raise ValueError("scenario schema is not supported")
+        if scenario.get("cell") != cell:
+            raise ValueError("scenario cell does not match the requested cell")
+        parts = cell.split("/")
+        if parts != ["fmt", "ZSTD_TU", "cold"] and parts != ["fmt", "ZSTD_TU", "warm"]:
+            # The matrix remains closed: unsupported profiles are an honest HOLD
+            # until their production route has an explicit scenario manifest.
+            (output / "execution_status.json").write_text(
+                '{"schema":"icecream-p50sim-status-v1","status":"HOLD","reason":"scenario_profile_unavailable"}\n',
+                encoding="utf-8",
+            )
+            return 0
+        input_path = child(artifacts, scenario.get("input"))
+        route_path = child(artifacts, scenario.get("route_trace"))
+        input_sha, _ = digest(input_path)
+        route_sha, _ = digest(route_path)
+        if scenario.get("input_sha256") != input_sha:
+            raise ValueError("scenario input digest mismatch")
+        if scenario.get("route_trace_sha256") != route_sha:
+            raise ValueError("canonical route trace digest mismatch")
+        route = canonical_json(route_path)
+        if route.get("schema") != "icecream-s7-live-route-trace-v1" or route.get("origin") != "live":
+            raise ValueError("route trace is not a canonical live trace")
+        if not isinstance(route.get("trace"), list) or not route["trace"]:
+            raise ValueError("canonical live route trace is empty")
+        binary = Path(__file__).with_name(".p50sim.bin")
+        if not regular(binary) or not os.access(binary, os.X_OK):
+            raise ValueError("p50sim production binary is not built")
+        output.mkdir(parents=True, exist_ok=True)
+        actions = output / "actions.jsonl"
+        summary = output / "execution.json"
+        result = subprocess.run(
+            [str(binary), "--input", str(input_path), "--actions", str(actions), "--summary", str(summary)],
+            stdin=subprocess.DEVNULL,
+            check=False,
+        )
+        if result.returncode:
+            return result.returncode
+        if not regular(actions) or not regular(summary):
+            raise ValueError("production execution omitted action or summary evidence")
+        # The C++ endpoint writes the authoritative Protocol-50 trace. Keep a
+        # separate digest witness so later adapters cannot substitute a fixture.
+        action_sha, _ = digest(actions)
+        summary_value = json.loads(summary.read_bytes())
+        if not isinstance(summary_value, dict):
+            raise ValueError("production execution summary is not an object")
+        if summary_value.get("schema") != "icecream-p50sim-execution-v1":
+            raise ValueError("production execution schema mismatch")
+        (output / "execution_status.json").write_text(
+            json.dumps({
+                "schema": "icecream-p50sim-status-v1",
+                "status": "EXECUTED",
+                "cell": cell,
+                "input_sha256": input_sha,
+                "route_trace_sha256": route_sha,
+                "action_trace_sha256": action_sha,
+            }, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        return 0
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        return fail(str(error))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
