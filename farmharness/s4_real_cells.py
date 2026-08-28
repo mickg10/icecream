@@ -188,9 +188,15 @@ g++ -std=c++17 -O2 -c "$WORK/main.cpp" -o "$LOCAL_OBJ" 2>"$WORK/local.log" || {
 cmp -s "$REMOTE_OBJ" "$LOCAL_OBJ" || { echo 'S4_STATUS=FAIL reason=object-not-byte-identical'; exit 1; }
 
 all_logs="$WORK/scheduler.log $WORK/fdaemon.log $WORK/cdaemon.log $WORK/client.log"
-cache_seen=0; legacy_seen=0
+cache_seen=0; legacy_seen=0; remote_seen=0
 grep -E 'ZSTD_TU|CACHE_SESSION' $all_logs >/dev/null 2>&1 && cache_seen=1 || :
 grep -E 'FileChunk|write_fd_to_server|preprocessed|building myself|local build forced|fallback_local' $all_logs >/dev/null 2>&1 && legacy_seen=1 || :
+grep -E 'BEGIN: .*server=s4-f([ (]|$)' "$WORK/scheduler.log" >/dev/null 2>&1 && remote_seen=1 || :
+[ "$remote_seen" -eq 1 ] || {
+    echo 'S4_REMOTE_COMPILE=0'
+    echo 'S4_STATUS=HOLD reason=remote-worker-not-selected'
+    exit 77
+}
 if [ "$EXPECT_CACHE" = 1 ]; then
     [ "$cache_seen" -eq 1 ] || { echo 'S4_STATUS=HOLD reason=cache-not-observed'; exit 77; }
     [ "$legacy_seen" -eq 0 ] || { echo 'S4_STATUS=FAIL reason=cache-cell-used-legacy-fallback'; exit 1; }
@@ -199,7 +205,7 @@ else
 fi
 echo "S4_CACHE_OBSERVED=$cache_seen"
 echo "S4_LEGACY_OBSERVED=$legacy_seen"
-echo 'S4_REMOTE_COMPILE=1'
+echo "S4_REMOTE_COMPILE=$remote_seen"
 echo 'S4_BYTE_IDENTICAL=1'
 echo 'S4_STATUS=PASS reason=remote-byte-identical'
 exit 0
