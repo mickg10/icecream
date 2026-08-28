@@ -10,6 +10,7 @@
 #include <optional>
 #include <set>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <variant>
 #include <vector>
@@ -95,6 +96,132 @@ private:
     std::array<uint64_t, 32> next_ordinal_{};
     ImmutableObjectStore objects_;
     std::map<Digest128, std::vector<Key64>> content_index_;
+};
+
+// The resource owner is deliberately independent from a C/F relationship.
+// F-side namespaces share one resident/staging budget and one slot pool, so
+// this state cannot live in either route's transaction cursor.  Production
+// code can attach a GlobalResourceTrace to retain the same action vocabulary
+// used by formal/Protocol50Global.tla.
+enum class GlobalActionType : uint8_t {
+    NAMESPACE_ADMITTED,
+    NAMESPACE_TOUCHED,
+    TU_STARTED,
+    TU_FINISHED,
+    ARENA_INSTALLING,
+    ARENA_RETRY_INSTALLING,
+    ARENA_PRESENT,
+    ARENA_PINNED,
+    ARENA_UNPINNED,
+    INSTALL_CRASHED,
+    CONTENT_CONFLICT_FATAL,
+    NAMESPACE_EVICTED,
+    GENERATION_ADVANCED,
+    GENERATION_WRAP_STOPPED,
+    C_GUID_FLIPPED,
+};
+
+std::string_view global_action_name(GlobalActionType action);
+
+struct GlobalActionRecord {
+    GlobalActionType action = GlobalActionType::NAMESPACE_ADMITTED;
+    CStoreGuid c_store_guid{};
+    CStoreGuid previous_c_store_guid{};
+    uint16_t generation = 0;
+    Key64 key{};
+    uint32_t slot = 0;
+    uint64_t bytes = 0;
+    uint64_t lru = 0;
+    Digest128 content_digest{};
+};
+
+class GlobalResourceTrace {
+public:
+    void record(GlobalActionRecord action) { records_.push_back(std::move(action)); }
+    [[nodiscard]] const std::vector<GlobalActionRecord>& records() const { return records_; }
+    void clear() { records_.clear(); }
+
+private:
+    std::vector<GlobalActionRecord> records_;
+};
+
+std::string global_action_jsonl(const GlobalActionRecord& record);
+void write_global_trace(const GlobalResourceTrace& trace, const std::string& path);
+
+struct GlobalResourceLimits {
+    uint64_t max_aggregate_bytes = uint64_t{8} << 30;
+    uint64_t max_namespace_bytes = uint64_t{4} << 30;
+    uint64_t max_staging_bytes = uint64_t{4} << 30;
+    uint64_t max_total_bytes = uint64_t{12} << 30;
+    uint16_t max_generation = KeyLayoutV1::generation_value_mask;
+    size_t max_staging_slots = 32;
+    auto operator<=>(const GlobalResourceLimits&) const = default;
+};
+
+// Test-only fault switches make the safety boundary executable: a mutant may
+// bypass one admission check, but check_invariants() must then reject the
+// resulting state.  All defaults preserve the production rules.
+struct GlobalResourceFaults {
+    bool ignore_aggregate_cap = false;
+    bool ignore_namespace_cap = false;
+    bool ignore_staging_cap = false;
+    bool ignore_total_cap = false;
+    bool ignore_slot_ownership = false;
+    bool ignore_lru = false;
+    auto operator<=>(const GlobalResourceFaults&) const = default;
+};
+
+class GlobalResourceModel {
+public:
+    explicit GlobalResourceModel(GlobalResourceLimits limits = {},
+                                 GlobalResourceFaults faults = {},
+                                 GlobalResourceTrace* trace = nullptr);
+    ~GlobalResourceModel();
+    GlobalResourceModel(const GlobalResourceModel&) = delete;
+    GlobalResourceModel& operator=(const GlobalResourceModel&) = delete;
+
+    void admit(CStoreGuid c_store_guid, uint16_t generation = 0);
+    void touch(CStoreGuid c_store_guid);
+    void start_tu(CStoreGuid c_store_guid);
+    void finish_tu(CStoreGuid c_store_guid);
+    void begin_install(CStoreGuid c_store_guid, Key64 key, Digest128 content_digest,
+                       uint64_t bytes, size_t slot, bool retry = false);
+    void publish(CStoreGuid c_store_guid, Key64 key, size_t slot,
+                 Digest128 content_digest);
+    void pin(CStoreGuid c_store_guid, Key64 key);
+    void unpin(CStoreGuid c_store_guid, Key64 key);
+    void crash_install(CStoreGuid c_store_guid, Key64 key, size_t slot);
+    [[noreturn]] void conflict(CStoreGuid c_store_guid, Key64 key,
+                               Digest128 content_digest);
+    void evict(CStoreGuid c_store_guid);
+    CStoreGuid evict_oldest();
+    void advance_generation(CStoreGuid c_store_guid);
+    void stop_generation_wrap(CStoreGuid c_store_guid);
+    void flip_guid(CStoreGuid old_guid, CStoreGuid new_guid);
+
+    [[nodiscard]] std::optional<std::string> check_invariants() const;
+    [[nodiscard]] uint64_t resident_bytes() const;
+    [[nodiscard]] uint64_t staging_bytes() const;
+    [[nodiscard]] size_t live_namespace_count() const;
+    [[nodiscard]] size_t free_staging_slots() const;
+
+    // Exposed only so the out-of-line implementation can keep the model's
+    // state opaque to callers while remaining C++23-library friendly.
+    struct Object;
+    struct Namespace;
+
+private:
+    Namespace& require_namespace(CStoreGuid c_store_guid);
+    const Namespace& require_namespace(CStoreGuid c_store_guid) const;
+    void emit(GlobalActionRecord action);
+
+    GlobalResourceLimits limits_;
+    GlobalResourceFaults faults_;
+    GlobalResourceTrace* trace_ = nullptr;
+    uint64_t clock_ = 0;
+    std::map<CStoreGuid, std::unique_ptr<Namespace>> namespaces_;
+    std::map<size_t, std::pair<CStoreGuid, Key64>> slots_;
+    std::optional<uint64_t> last_eviction_lru_;
 };
 
 struct PreparedTU {

@@ -1,8 +1,10 @@
 #include "p50_slice0.h"
 
 #include <algorithm>
+#include <fstream>
 #include <functional>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 
@@ -291,6 +293,422 @@ GenerationAdvanceResult CObjectArena::advance_generation() {
     ++generation_;
     next_ordinal_.fill(first_ordinal_);
     return GenerationAdvanceResult::Advanced;
+}
+
+struct GlobalResourceModel::Object {
+    enum class State : uint8_t { Absent, Installing, Present, Pinned };
+    State state = State::Absent;
+    Digest128 content_digest{};
+    uint64_t bytes = 0;
+    size_t slot = 0;
+    unsigned attempts = 0;
+    bool crashed = false;
+};
+
+struct GlobalResourceModel::Namespace {
+    uint16_t generation = 0;
+    bool live = false;
+    bool stopped = false;
+    bool active = false;
+    uint64_t lru = 0;
+    std::set<CStoreGuid> guid_history;
+    std::map<Key64, Object> objects;
+};
+
+namespace {
+
+using GlobalObjectState = GlobalResourceModel::Object::State;
+
+bool checked_add(uint64_t left, uint64_t right, uint64_t limit) {
+    return right <= limit && left <= limit - right;
+}
+
+}  // namespace
+
+std::string_view global_action_name(GlobalActionType action) {
+    switch (action) {
+    case GlobalActionType::NAMESPACE_ADMITTED: return "NAMESPACE_ADMITTED";
+    case GlobalActionType::NAMESPACE_TOUCHED: return "NAMESPACE_TOUCHED";
+    case GlobalActionType::TU_STARTED: return "TU_STARTED";
+    case GlobalActionType::TU_FINISHED: return "TU_FINISHED";
+    case GlobalActionType::ARENA_INSTALLING: return "ARENA_INSTALLING";
+    case GlobalActionType::ARENA_RETRY_INSTALLING: return "ARENA_RETRY_INSTALLING";
+    case GlobalActionType::ARENA_PRESENT: return "ARENA_PRESENT";
+    case GlobalActionType::ARENA_PINNED: return "ARENA_PINNED";
+    case GlobalActionType::ARENA_UNPINNED: return "ARENA_UNPINNED";
+    case GlobalActionType::INSTALL_CRASHED: return "INSTALL_CRASHED";
+    case GlobalActionType::CONTENT_CONFLICT_FATAL: return "CONTENT_CONFLICT_FATAL";
+    case GlobalActionType::NAMESPACE_EVICTED: return "NAMESPACE_EVICTED";
+    case GlobalActionType::GENERATION_ADVANCED: return "GENERATION_ADVANCED";
+    case GlobalActionType::GENERATION_WRAP_STOPPED: return "GENERATION_WRAP_STOPPED";
+    case GlobalActionType::C_GUID_FLIPPED: return "C_GUID_FLIPPED";
+    }
+    throw std::logic_error("unknown Protocol-50 global action");
+}
+
+std::string global_action_jsonl(const GlobalActionRecord& record) {
+    static constexpr char digits[] = "0123456789abcdef";
+    const auto id_hex = [&](const CStoreGuid& id) {
+        std::string value;
+        value.reserve(id.bytes.size() * 2);
+        for (const uint8_t byte : id.bytes) {
+            value.push_back(digits[byte >> 4]);
+            value.push_back(digits[byte & 0x0f]);
+        }
+        return value;
+    };
+    const std::string guid = id_hex(record.c_store_guid);
+    std::ostringstream output;
+    output << "{\"action\":\"" << global_action_name(record.action)
+           << "\",\"c_store_guid\":\"" << guid
+           << "\",\"previous_c_store_guid\":\""
+           << id_hex(record.previous_c_store_guid)
+           << "\",\"generation\":" << record.generation
+           << ",\"key64\":" << (record.key.valid() ? record.key.wire_value() : 0)
+           << ",\"slot\":" << record.slot
+           << ",\"bytes\":" << record.bytes
+           << ",\"lru\":" << record.lru
+           << ",\"content_digest\":\"" << digest128_hex(record.content_digest)
+           << "\"}";
+    return output.str();
+}
+
+void write_global_trace(const GlobalResourceTrace& trace, const std::string& path) {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output) throw std::runtime_error("cannot open global action trace output");
+    for (const GlobalActionRecord& record : trace.records())
+        output << global_action_jsonl(record) << '\n';
+    if (!output) throw std::runtime_error("cannot write global action trace output");
+}
+
+GlobalResourceModel::GlobalResourceModel(GlobalResourceLimits limits,
+                                         GlobalResourceFaults faults,
+                                         GlobalResourceTrace* trace)
+    : limits_(limits), faults_(faults), trace_(trace) {
+    if (limits_.max_aggregate_bytes == 0 || limits_.max_namespace_bytes == 0 ||
+        limits_.max_staging_bytes == 0 || limits_.max_total_bytes == 0 ||
+        limits_.max_staging_slots == 0 ||
+        limits_.max_namespace_bytes > limits_.max_aggregate_bytes ||
+        limits_.max_aggregate_bytes > limits_.max_total_bytes ||
+        limits_.max_generation == 0)
+        throw std::invalid_argument("global resource limits are inconsistent");
+}
+
+GlobalResourceModel::~GlobalResourceModel() = default;
+
+GlobalResourceModel::Namespace&
+GlobalResourceModel::require_namespace(CStoreGuid c_store_guid) {
+    const auto position = namespaces_.find(c_store_guid);
+    if (position == namespaces_.end()) throw std::logic_error("unknown C namespace");
+    return *position->second;
+}
+
+const GlobalResourceModel::Namespace&
+GlobalResourceModel::require_namespace(CStoreGuid c_store_guid) const {
+    const auto position = namespaces_.find(c_store_guid);
+    if (position == namespaces_.end()) throw std::logic_error("unknown C namespace");
+    return *position->second;
+}
+
+void GlobalResourceModel::emit(GlobalActionRecord action) {
+    if (trace_) trace_->record(std::move(action));
+}
+
+void GlobalResourceModel::admit(CStoreGuid c_store_guid, uint16_t generation) {
+    if (c_store_guid == CStoreGuid{})
+        throw std::invalid_argument("zero C namespace GUID is reserved");
+    auto position = namespaces_.find(c_store_guid);
+    if (position == namespaces_.end()) {
+        auto inserted = std::make_unique<Namespace>();
+        inserted->generation = generation;
+        inserted->guid_history.insert(c_store_guid);
+        position = namespaces_.emplace(c_store_guid, std::move(inserted)).first;
+    }
+    Namespace& space = *position->second;
+    if (space.live || space.stopped || generation != space.generation ||
+        space.generation >= limits_.max_generation)
+        throw std::logic_error("namespace admission is not at its current generation");
+    space.live = true;
+    emit({GlobalActionType::NAMESPACE_ADMITTED, c_store_guid, {}, space.generation});
+}
+
+void GlobalResourceModel::touch(CStoreGuid c_store_guid) {
+    Namespace& space = require_namespace(c_store_guid);
+    if (!space.live) throw std::logic_error("touch of an absent namespace");
+    ++clock_;
+    space.lru = clock_;
+    emit({GlobalActionType::NAMESPACE_TOUCHED, c_store_guid, {}, space.generation,
+          {}, 0, 0, space.lru});
+}
+
+void GlobalResourceModel::start_tu(CStoreGuid c_store_guid) {
+    Namespace& space = require_namespace(c_store_guid);
+    if (!space.live || space.active) throw std::logic_error("invalid global TU start");
+    space.active = true;
+    emit({GlobalActionType::TU_STARTED, c_store_guid, {}, space.generation});
+}
+
+void GlobalResourceModel::finish_tu(CStoreGuid c_store_guid) {
+    Namespace& space = require_namespace(c_store_guid);
+    if (!space.active) throw std::logic_error("invalid global TU finish");
+    for (auto& [key, object] : space.objects) {
+        if (object.state == GlobalObjectState::Installing)
+            throw std::logic_error("cannot finish TU with an installing object");
+        if (object.state == GlobalObjectState::Pinned) object.state = GlobalObjectState::Present;
+        (void)key;
+    }
+    space.active = false;
+    emit({GlobalActionType::TU_FINISHED, c_store_guid, {}, space.generation});
+}
+
+void GlobalResourceModel::begin_install(CStoreGuid c_store_guid, Key64 key,
+                                        Digest128 content_digest, uint64_t bytes,
+                                        size_t slot, bool retry) {
+    Namespace& space = require_namespace(c_store_guid);
+    if (!space.live || !space.active || !key.valid() || bytes == 0 ||
+        key.generation() != space.generation)
+        throw std::logic_error("invalid global install identity");
+    auto& object = space.objects[key];
+    if (object.state != GlobalObjectState::Absent || (!retry && object.attempts != 0) ||
+        (retry && (!object.crashed || object.attempts != 1)))
+        throw std::logic_error("global install does not start from the required state");
+    const auto owner = slots_.find(slot);
+    if (owner != slots_.end() && !faults_.ignore_slot_ownership)
+        throw std::logic_error("global staging slot is already owned");
+    if (slots_.size() >= limits_.max_staging_slots && owner == slots_.end())
+        throw std::length_error("global staging slot pool is exhausted");
+    const uint64_t staged = staging_bytes();
+    if (!faults_.ignore_staging_cap &&
+        (bytes > limits_.max_staging_bytes || staged > limits_.max_staging_bytes - bytes))
+        throw std::length_error("global staging byte cap exceeded");
+    uint64_t next_staged = 0;
+    if (!checked_add(staged, bytes, std::numeric_limits<uint64_t>::max()) ||
+        (!faults_.ignore_total_cap &&
+         !checked_add(resident_bytes(), next_staged = staged + bytes,
+                      limits_.max_total_bytes)))
+        throw std::length_error("global total byte cap exceeded");
+    object.state = GlobalObjectState::Installing;
+    object.content_digest = content_digest;
+    object.bytes = bytes;
+    object.slot = slot;
+    object.attempts = retry ? 2 : 1;
+    object.crashed = false;
+    slots_[slot] = {c_store_guid, key};
+    emit({retry ? GlobalActionType::ARENA_RETRY_INSTALLING : GlobalActionType::ARENA_INSTALLING,
+          c_store_guid, {}, space.generation, key, static_cast<uint32_t>(slot), bytes, 0,
+          content_digest});
+}
+
+void GlobalResourceModel::publish(CStoreGuid c_store_guid, Key64 key, size_t slot,
+                                  Digest128 content_digest) {
+    Namespace& space = require_namespace(c_store_guid);
+    auto object_position = space.objects.find(key);
+    if (object_position == space.objects.end() ||
+        object_position->second.state != GlobalObjectState::Installing)
+        throw std::logic_error("global publish without INSTALLING object");
+    Object& object = object_position->second;
+    const auto owner = slots_.find(slot);
+    if (owner == slots_.end() || owner->second != std::pair{c_store_guid, key})
+        throw std::logic_error("global publish lost staging ownership");
+    if (object.content_digest != content_digest)
+        throw std::logic_error("global staged content changed before publish");
+    uint64_t namespace_bytes = 0;
+    for (const auto& [unused, candidate] : space.objects)
+        if (candidate.state == GlobalObjectState::Present ||
+            candidate.state == GlobalObjectState::Pinned)
+            namespace_bytes += candidate.bytes;
+    if (!faults_.ignore_namespace_cap &&
+        (object.bytes > limits_.max_namespace_bytes ||
+         namespace_bytes > limits_.max_namespace_bytes - object.bytes))
+        throw std::length_error("global namespace byte cap exceeded");
+    if (!faults_.ignore_aggregate_cap &&
+        (object.bytes > limits_.max_aggregate_bytes ||
+         resident_bytes() > limits_.max_aggregate_bytes - object.bytes))
+        throw std::length_error("global aggregate byte cap exceeded");
+    object.state = GlobalObjectState::Present;
+    slots_.erase(owner);
+    emit({GlobalActionType::ARENA_PRESENT, c_store_guid, {}, space.generation, key,
+          static_cast<uint32_t>(slot), object.bytes, 0, content_digest});
+}
+
+void GlobalResourceModel::pin(CStoreGuid c_store_guid, Key64 key) {
+    Namespace& space = require_namespace(c_store_guid);
+    auto position = space.objects.find(key);
+    if (!space.active || position == space.objects.end() ||
+        position->second.state != GlobalObjectState::Present)
+        throw std::logic_error("global pin requires an active PRESENT object");
+    position->second.state = GlobalObjectState::Pinned;
+    emit({GlobalActionType::ARENA_PINNED, c_store_guid, {}, space.generation, key, 0,
+          position->second.bytes});
+}
+
+void GlobalResourceModel::unpin(CStoreGuid c_store_guid, Key64 key) {
+    Namespace& space = require_namespace(c_store_guid);
+    auto position = space.objects.find(key);
+    if (position == space.objects.end() || position->second.state != GlobalObjectState::Pinned)
+        throw std::logic_error("global unpin requires a PINNED object");
+    position->second.state = GlobalObjectState::Present;
+    emit({GlobalActionType::ARENA_UNPINNED, c_store_guid, {}, space.generation, key, 0,
+          position->second.bytes});
+}
+
+void GlobalResourceModel::crash_install(CStoreGuid c_store_guid, Key64 key, size_t slot) {
+    Namespace& space = require_namespace(c_store_guid);
+    auto position = space.objects.find(key);
+    const auto owner = slots_.find(slot);
+    if (position == space.objects.end() || position->second.state != GlobalObjectState::Installing ||
+        owner == slots_.end() || owner->second != std::pair{c_store_guid, key})
+        throw std::logic_error("global crash does not identify the installing owner");
+    const uint64_t bytes = position->second.bytes;
+    position->second = Object{};
+    position->second.crashed = true;
+    position->second.attempts = 1;
+    slots_.erase(owner);
+    emit({GlobalActionType::INSTALL_CRASHED, c_store_guid, {}, space.generation, key,
+          static_cast<uint32_t>(slot), bytes});
+}
+
+[[noreturn]] void GlobalResourceModel::conflict(CStoreGuid c_store_guid, Key64 key,
+                                                Digest128 content_digest) {
+    Namespace& space = require_namespace(c_store_guid);
+    const auto position = space.objects.find(key);
+    if (position == space.objects.end() ||
+        (position->second.state != GlobalObjectState::Present &&
+         position->second.state != GlobalObjectState::Pinned) ||
+        position->second.content_digest == content_digest)
+        throw std::logic_error("global content conflict lacks an immutable existing object");
+    emit({GlobalActionType::CONTENT_CONFLICT_FATAL, c_store_guid, {}, space.generation, key,
+          0, position->second.bytes, 0, content_digest});
+    throw std::logic_error("same Key64 names different immutable content");
+}
+
+void GlobalResourceModel::evict(CStoreGuid c_store_guid) {
+    Namespace& victim = require_namespace(c_store_guid);
+    if (!victim.live || victim.active) throw std::logic_error("global eviction requires idle namespace");
+    for (const auto& [key, object] : victim.objects)
+        if (object.state == GlobalObjectState::Installing || object.state == GlobalObjectState::Pinned)
+            throw std::logic_error("global eviction crossed a namespace lease");
+    if (!faults_.ignore_lru) {
+        for (const auto& [guid, candidate] : namespaces_) {
+            if (guid == c_store_guid || !candidate->live || candidate->active || candidate->lru >= victim.lru)
+                continue;
+            bool eligible = true;
+            for (const auto& [key, object] : candidate->objects)
+                eligible = eligible && object.state != GlobalObjectState::Installing &&
+                           object.state != GlobalObjectState::Pinned;
+            if (eligible)
+                throw std::logic_error("global eviction selected a non-LRU namespace");
+        }
+    }
+    last_eviction_lru_ = victim.lru;
+    victim.live = false;
+    victim.objects.clear();
+    emit({GlobalActionType::NAMESPACE_EVICTED, c_store_guid, {}, victim.generation, {}, 0, 0,
+          victim.lru});
+}
+
+CStoreGuid GlobalResourceModel::evict_oldest() {
+    std::optional<std::pair<CStoreGuid, uint64_t>> oldest;
+    for (const auto& [guid, space] : namespaces_) {
+        if (!space->live || space->active) continue;
+        bool eligible = true;
+        for (const auto& [key, object] : space->objects)
+            eligible = eligible && object.state != GlobalObjectState::Installing &&
+                       object.state != GlobalObjectState::Pinned;
+        if (eligible && (!oldest || space->lru < oldest->second)) oldest = {guid, space->lru};
+    }
+    if (!oldest) throw std::logic_error("no eligible global namespace to evict");
+    evict(oldest->first);
+    return oldest->first;
+}
+
+void GlobalResourceModel::advance_generation(CStoreGuid c_store_guid) {
+    Namespace& space = require_namespace(c_store_guid);
+    if (space.live || space.stopped || space.generation >= limits_.max_generation)
+        throw std::logic_error("global generation cannot advance");
+    ++space.generation;
+    emit({GlobalActionType::GENERATION_ADVANCED, c_store_guid, {}, space.generation});
+}
+
+void GlobalResourceModel::stop_generation_wrap(CStoreGuid c_store_guid) {
+    Namespace& space = require_namespace(c_store_guid);
+    if (space.live || space.stopped || space.generation != limits_.max_generation)
+        throw std::logic_error("global generation wrap stop is not admissible");
+    space.stopped = true;
+    emit({GlobalActionType::GENERATION_WRAP_STOPPED, c_store_guid, {}, space.generation});
+}
+
+void GlobalResourceModel::flip_guid(CStoreGuid old_guid, CStoreGuid new_guid) {
+    Namespace& old = require_namespace(old_guid);
+    if (!old.stopped || new_guid == CStoreGuid{} || namespaces_.contains(new_guid))
+        throw std::logic_error("global GUID flip does not establish a fresh namespace");
+    auto replacement = std::make_unique<Namespace>();
+    replacement->guid_history = old.guid_history;
+    replacement->guid_history.insert(new_guid);
+    namespaces_.emplace(new_guid, std::move(replacement));
+    emit({GlobalActionType::C_GUID_FLIPPED, new_guid, old_guid, 0});
+}
+
+std::optional<std::string> GlobalResourceModel::check_invariants() const {
+    const uint64_t resident = resident_bytes();
+    const uint64_t staging = staging_bytes();
+    if (resident > limits_.max_aggregate_bytes) return "aggregate resident byte cap exceeded";
+    if (staging > limits_.max_staging_bytes) return "aggregate staging byte cap exceeded";
+    if (!checked_add(resident, staging, limits_.max_total_bytes))
+        return "total simultaneous byte cap exceeded";
+    std::map<size_t, std::pair<CStoreGuid, Key64>> reverse;
+    for (const auto& [guid, space] : namespaces_) {
+        uint64_t namespace_bytes = 0;
+        for (const auto& [key, object] : space->objects) {
+            if (object.state == GlobalObjectState::Present || object.state == GlobalObjectState::Pinned)
+                namespace_bytes += object.bytes;
+            if (object.state == GlobalObjectState::Installing) {
+                if (!reverse.emplace(object.slot, std::pair{guid, key}).second)
+                    return "multiple INSTALLING objects own one staging slot";
+                const auto owner = slots_.find(object.slot);
+                if (owner == slots_.end() || owner->second != std::pair{guid, key})
+                    return "INSTALLING object does not own its staging slot";
+            }
+        }
+        if (namespace_bytes > limits_.max_namespace_bytes) return "namespace byte cap exceeded";
+    }
+    if (reverse.size() != slots_.size()) return "staging slot has no INSTALLING owner";
+    for (const auto& [slot, owner] : slots_)
+        if (!reverse.contains(slot) || reverse.at(slot) != owner)
+            return "staging slot reverse ownership mismatch";
+    if (last_eviction_lru_)
+        for (const auto& [guid, space] : namespaces_)
+            if (space->live && !space->active && space->lru < *last_eviction_lru_)
+                return "global eviction violated LRU ordering";
+    return std::nullopt;
+}
+
+uint64_t GlobalResourceModel::resident_bytes() const {
+    uint64_t total = 0;
+    for (const auto& [guid, space] : namespaces_)
+        for (const auto& [key, object] : space->objects)
+            if (object.state == GlobalObjectState::Present || object.state == GlobalObjectState::Pinned)
+                total += object.bytes;
+    return total;
+}
+
+uint64_t GlobalResourceModel::staging_bytes() const {
+    uint64_t total = 0;
+    for (const auto& [guid, space] : namespaces_)
+        for (const auto& [key, object] : space->objects)
+            if (object.state == GlobalObjectState::Installing) total += object.bytes;
+    return total;
+}
+
+size_t GlobalResourceModel::live_namespace_count() const {
+    size_t count = 0;
+    for (const auto& [guid, space] : namespaces_)
+        if (space->live) ++count;
+    return count;
+}
+
+size_t GlobalResourceModel::free_staging_slots() const {
+    return limits_.max_staging_slots - slots_.size();
 }
 
 const ImmutableObject& CObjectArena::object(Key64 key) const {

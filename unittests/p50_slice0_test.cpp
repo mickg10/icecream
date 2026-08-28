@@ -141,6 +141,86 @@ void test_key_limits_and_mixed_generations() {
             "old and new generations did not coexist on F");
 }
 
+void test_global_resource_owner_and_caught_slot_mutant() {
+    const GlobalResourceLimits limits{
+        .max_aggregate_bytes = 5,
+        .max_namespace_bytes = 4,
+        .max_staging_bytes = 5,
+        .max_total_bytes = 7,
+        .max_generation = 1,
+        .max_staging_slots = 2,
+    };
+    GlobalResourceTrace trace;
+    GlobalResourceModel model(limits, {}, &trace);
+    const CStoreGuid n0 = Id128::from_u64(501);
+    const CStoreGuid n1 = Id128::from_u64(502);
+    const CStoreGuid n2 = Id128::from_u64(503);
+    const Key64 k0 = *Key64::make(ObjectType::Line, 0, 1);
+    const Key64 k1 = *Key64::make(ObjectType::Line, 0, 2);
+    model.admit(n0);
+    model.admit(n1);
+    model.touch(n0);
+    model.touch(n1);
+    model.start_tu(n0);
+    model.start_tu(n1);
+    model.begin_install(n0, k0, Digest128{}, 3, 0);
+    model.begin_install(n1, k1, Digest128{}, 2, 1);
+    model.publish(n0, k0, 0, Digest128{});
+    model.publish(n1, k1, 1, Digest128{});
+    model.pin(n0, k0);
+    model.finish_tu(n0);
+    model.finish_tu(n1);
+    require(model.resident_bytes() == 5 && model.staging_bytes() == 0,
+            "global owner did not account resident bytes across namespaces");
+    require(model.evict_oldest() == n0, "global owner did not evict the oldest namespace");
+    require(!model.check_invariants(), "global owner invariant check rejected valid eviction");
+    model.advance_generation(n0);
+    model.stop_generation_wrap(n0);
+    model.flip_guid(n0, n2);
+    model.admit(n2);
+    model.touch(n2);
+    model.start_tu(n2);
+    model.begin_install(n2, k0, Digest128{}, 2, 0);
+    model.crash_install(n2, k0, 0);
+    model.begin_install(n2, k0, Digest128{}, 2, 0, true);
+    model.publish(n2, k0, 0, Digest128{});
+    model.finish_tu(n2);
+    require(!model.check_invariants(), "global owner retry left invalid state");
+    require(trace.records().size() >= 17, "global owner did not emit the full action vocabulary");
+    if (const char* trace_path = std::getenv("P50_GLOBAL_TRACE_PATH"))
+        write_global_trace(trace, trace_path);
+    Digest128 conflicting_digest{};
+    conflicting_digest.bytes.front() = 1;
+    require_throws<std::logic_error>(
+        [&] { model.conflict(n1, k1, conflicting_digest); },
+        "global owner did not make same-key content conflict fatal");
+
+    GlobalResourceFaults slot_mutant;
+    slot_mutant.ignore_slot_ownership = true;
+    GlobalResourceModel mutant(limits, slot_mutant);
+    mutant.admit(n0);
+    mutant.admit(n1);
+    mutant.start_tu(n0);
+    mutant.start_tu(n1);
+    mutant.begin_install(n0, k0, Digest128{}, 2, 0);
+    mutant.begin_install(n1, k1, Digest128{}, 2, 0);
+    const auto caught = mutant.check_invariants();
+    require(caught && caught->find("staging slot") != std::string::npos,
+            "slot-ownership mutant was not caught by the reverse global invariant");
+
+    GlobalResourceFaults lru_mutant;
+    lru_mutant.ignore_lru = true;
+    GlobalResourceModel wrong_lru(limits, lru_mutant);
+    wrong_lru.admit(n0);
+    wrong_lru.admit(n1);
+    wrong_lru.touch(n0);
+    wrong_lru.touch(n1);
+    wrong_lru.evict(n1);
+    const auto lru_caught = wrong_lru.check_invariants();
+    require(lru_caught && lru_caught->find("LRU") != std::string::npos,
+            "LRU mutant was not caught by the post-eviction global invariant");
+}
+
 void test_tu_seq_is_not_route_order() {
     Pair pair;
     const PreparedTUPtr tu0 = pair.c.prepare_from_regions(regions({"zero\n"}));
@@ -792,6 +872,7 @@ void test_canonical_action_trace() {
 
 int main() {
     test_key_limits_and_mixed_generations();
+    test_global_resource_owner_and_caught_slot_mutant();
     test_tu_seq_is_not_route_order();
     test_separate_preparation_real_interning_and_p29();
     test_exact_need_and_duplicate_application();
