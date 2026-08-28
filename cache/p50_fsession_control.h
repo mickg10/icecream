@@ -165,6 +165,52 @@ struct OutboundSemanticSlot {
     }
 };
 
+// ---------------------------------------------------------------------------
+// Inbound control-sequence acceptor for ONE operation on the dedicated
+// Daemon->Sidecar stream (5444410383 sec.2-3). Encodes the sidecar row-creation
+// and exact-replay/gap law that fixes Root's rejected-probe counterexamples:
+//   - OperationOffer(seq==1) is the SOLE row-creation frame; any earlier frame
+//     (e.g. OpCancel) is phase-invalid and mints no row;
+//   - seq == next_expected accepts exactly one owner transition and advances;
+//   - seq <  next_expected accepts ONLY a byte-identical replay (zero mutation,
+//     replay the prior response); a non-identical duplicate is an op-local error;
+//   - seq >  next_expected is a gap (op-local error, no hiding buffer);
+//   - a retired operation is never revived under the same identity.
+// ---------------------------------------------------------------------------
+enum class InboundDisposition : uint8_t {
+    AcceptedNew,        // seq == next_expected: one owner transition, advance
+    ExactReplay,        // seq <  next_expected, byte-identical: replay, no mutation
+    DuplicateConflict,  // seq <  next_expected, non-identical: op-local error
+    Gap,                // seq >  next_expected: op-local error
+    PhaseInvalidNoRow,  // frame before an accepted OperationOffer: no row created
+    StaleWrongIdentity, // identity mismatch or retired: stale-only, no mutation
+};
+
+class FSessionInboundControl {
+public:
+    // Classify one already-codec-validated inbound Daemon->Sidecar envelope.
+    // canonical_bytes must be the exact encoded frame, for byte-identical replay.
+    InboundDisposition classify(const FSessionControlEnvelope& envelope,
+                                std::span<const uint8_t> canonical_bytes);
+
+    [[nodiscard]] bool row_created() const noexcept { return row_created_; }
+    [[nodiscard]] bool retired() const noexcept { return retired_; }
+    [[nodiscard]] uint64_t next_expected() const noexcept { return next_expected_; }
+    [[nodiscard]] const FSessionOperationIdentity& identity() const noexcept {
+        return identity_;
+    }
+    // Terminal retirement. Object storage may be reused only by minting a fresh
+    // identity/connection-generation (a new object), never by clearing this one.
+    void retire() noexcept { retired_ = true; }
+
+private:
+    FSessionOperationIdentity identity_{}; // bound once by the accepted offer
+    bool row_created_ = false;
+    bool retired_ = false;
+    uint64_t next_expected_ = 1;
+    std::vector<std::vector<uint8_t>> retained_; // retained_[s-1] = frame at seq s
+};
+
 } // namespace icecc::p50::fsession
 
 #endif // ICECC_CACHE_P50_FSESSION_CONTROL_H

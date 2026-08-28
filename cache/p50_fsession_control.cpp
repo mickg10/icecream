@@ -1,5 +1,6 @@
 #include "p50_fsession_control.h"
 
+#include <algorithm>
 #include <cstring>
 
 namespace icecc::p50::fsession {
@@ -193,6 +194,62 @@ decode_fsession_control(std::span<const uint8_t> bytes) {
     if (!e.header_valid())
         return std::nullopt;
     return e;
+}
+
+InboundDisposition FSessionInboundControl::classify(
+    const FSessionControlEnvelope& e, std::span<const uint8_t> bytes) {
+    // A retired operation is never revived under the same identity (5444410383
+    // sec.6): storage reuse requires a fresh identity/connection generation,
+    // i.e. a new object -- never clearing this one.
+    if (retired_)
+        return InboundDisposition::StaleWrongIdentity;
+
+    if (!row_created_) {
+        // OperationOffer(seq==1) is the SOLE row-creation frame. Anything else
+        // (an early OpCancel, a mis-sequenced offer) is phase-invalid and mints
+        // no row / no AbortedPreDurable (fixes rejected-probe blocker 1).
+        if (e.direction == FSessionControlDirection::DaemonToSidecar &&
+            e.message_type ==
+                static_cast<uint16_t>(DaemonToSidecarType::OperationOffer) &&
+            e.sequence == 1 && e.identity.valid()) {
+            identity_ = e.identity;
+            row_created_ = true;
+            retained_.emplace_back(bytes.begin(), bytes.end());
+            next_expected_ = 2;
+            return InboundDisposition::AcceptedNew;
+        }
+        return InboundDisposition::PhaseInvalidNoRow;
+    }
+
+    // Row exists: the complete operation identity must match exactly. A frame
+    // naming a different operation is stale-only and mutates nothing.
+    if (!(e.identity == identity_))
+        return InboundDisposition::StaleWrongIdentity;
+
+    if (e.sequence == next_expected_) {
+        retained_.emplace_back(bytes.begin(), bytes.end());
+        ++next_expected_;
+        return InboundDisposition::AcceptedNew;
+    }
+
+    if (e.sequence < next_expected_) {
+        // Accept ONLY a byte-identical replay of the retained frame at that
+        // sequence -> replay the prior response with zero owner mutation. A
+        // changed re-offer / non-identical duplicate is an op-local protocol
+        // error and cannot reset the row (fixes blocker 2).
+        if (e.sequence >= 1 && e.sequence <= retained_.size()) {
+            const std::vector<uint8_t>& kept =
+                retained_[static_cast<size_t>(e.sequence - 1)];
+            if (kept.size() == bytes.size() &&
+                std::equal(kept.begin(), kept.end(), bytes.begin()))
+                return InboundDisposition::ExactReplay;
+        }
+        return InboundDisposition::DuplicateConflict;
+    }
+
+    // seq > next_expected: a gap. No buffering that could hide a missing
+    // authority transition.
+    return InboundDisposition::Gap;
 }
 
 } // namespace icecc::p50::fsession

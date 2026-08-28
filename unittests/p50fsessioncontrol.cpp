@@ -36,6 +36,68 @@ FSessionOperationIdentity make_identity() {
     id.deadline.time_namespace_id = 9;
     return id;
 }
+
+// Build an encoded Daemon->Sidecar frame for the inbound sequencer tests.
+std::pair<FSessionControlEnvelope, std::optional<std::vector<uint8_t>>>
+daemon_frame(const FSessionOperationIdentity& id, DaemonToSidecarType type,
+             uint64_t seq, std::vector<uint8_t> payload) {
+    FSessionControlEnvelope e;
+    e.identity = id;
+    e.direction = FSessionControlDirection::DaemonToSidecar;
+    e.message_type = static_cast<uint16_t>(type);
+    e.sequence = seq;
+    e.payload = std::move(payload);
+    return {e, encode_fsession_control(e)};
+}
+
+void test_inbound_sequencer() {
+    const auto id = make_identity();
+    FSessionInboundControl in;
+
+    // Blocker 1: an OpCancel before any accepted OperationOffer mints no row.
+    auto [cancel_e, cancel_b] = daemon_frame(id, DaemonToSidecarType::OpCancel, 1, {});
+    check(cancel_b.has_value(), "encode early cancel");
+    check(in.classify(cancel_e, *cancel_b) == InboundDisposition::PhaseInvalidNoRow,
+          "early OpCancel -> PhaseInvalidNoRow");
+    check(!in.row_created(), "no row created by early cancel");
+
+    // OperationOffer(seq==1) is the sole row-creation frame.
+    auto [offer_e, offer_b] =
+        daemon_frame(id, DaemonToSidecarType::OperationOffer, 1, {1, 2, 3});
+    check(offer_b.has_value(), "encode offer");
+    check(in.classify(offer_e, *offer_b) == InboundDisposition::AcceptedNew,
+          "OperationOffer(1) -> AcceptedNew");
+    check(in.row_created(), "row created by offer");
+
+    // Blocker 2: a byte-identical re-offer replays; a changed re-offer conflicts;
+    // neither resets the row.
+    check(in.classify(offer_e, *offer_b) == InboundDisposition::ExactReplay,
+          "identical re-offer -> ExactReplay (no reset)");
+    check(in.next_expected() == 2, "replay did not advance/reset sequence");
+    auto [offer2_e, offer2_b] =
+        daemon_frame(id, DaemonToSidecarType::OperationOffer, 1, {9, 9, 9});
+    check(in.classify(offer2_e, *offer2_b) == InboundDisposition::DuplicateConflict,
+          "changed re-offer -> DuplicateConflict");
+
+    // In-order advance, then a gap.
+    auto [f2_e, f2_b] = daemon_frame(id, DaemonToSidecarType::PublicFdOffer, 2, {});
+    check(in.classify(f2_e, *f2_b) == InboundDisposition::AcceptedNew, "seq 2 -> AcceptedNew");
+    auto [f5_e, f5_b] = daemon_frame(id, DaemonToSidecarType::OpCancel, 5, {});
+    check(in.classify(f5_e, *f5_b) == InboundDisposition::Gap, "seq 5 (next 3) -> Gap");
+
+    // Wrong operation identity is stale-only.
+    auto other = make_identity();
+    other.assignment_nonce = 999;
+    auto [wrong_e, wrong_b] = daemon_frame(other, DaemonToSidecarType::OpCancel, 3, {});
+    check(in.classify(wrong_e, *wrong_b) == InboundDisposition::StaleWrongIdentity,
+          "wrong identity -> StaleWrongIdentity");
+
+    // Blocker 4: a retired operation is never revived under the same identity.
+    in.retire();
+    auto [f3_e, f3_b] = daemon_frame(id, DaemonToSidecarType::OpCancel, 3, {});
+    check(in.classify(f3_e, *f3_b) == InboundDisposition::StaleWrongIdentity,
+          "retired operation never revived");
+}
 } // namespace
 
 int main() {
@@ -92,6 +154,8 @@ int main() {
     bad_id.identity.assignment_job = 0;
     check(!encode_fsession_control(bad_id).has_value(),
           "incomplete identity rejected");
+
+    test_inbound_sequencer();
 
     if (g_fail != 0) {
         std::fprintf(stderr, "%d failure(s)\n", g_fail);
