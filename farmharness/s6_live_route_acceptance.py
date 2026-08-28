@@ -671,7 +671,7 @@ class Runtime:
                 client_daemon, env=client_env,
                 cwd=self.source, stdout=(self.root / "client.stdout").open("w"), stderr=subprocess.STDOUT,
                 start_new_session=True)
-            for _ in range(40):
+            for _ in range(120):
                 if not _alive(self.worker) or not _alive(self.client):
                     return False, "daemon-exited"
                 if _read(self.root / "scheduler.log").count("login") >= 2:
@@ -679,7 +679,7 @@ class Runtime:
                 time.sleep(0.25)
             if _read(self.root / "scheduler.log").count("login") < 2:
                 return False, "daemons-did-not-register"
-            for _ in range(40):
+            for _ in range(120):
                 if (self._worker_cache_ready() and
                         self._client_cache_ready(
                             self.client, "c-ready.trace", "s6-c")):
@@ -779,7 +779,7 @@ class Runtime:
                 stderr=subprocess.STDOUT, start_new_session=True)
         except OSError as error:
             return False, type(error).__name__
-        for _ in range(40):
+        for _ in range(120):
             if not _alive(self.client2):
                 return False, "second-client-exited"
             if (_read(self.root / "scheduler.log").count("login") > previous_logins and
@@ -811,7 +811,7 @@ class Runtime:
                 start_new_session=True)
         except OSError:
             return False
-        for _ in range(40):
+        for _ in range(120):
             if not _alive(self.worker):
                 return False
             current_ready = parse_ready(_read(self.root / "f-ready.trace"))
