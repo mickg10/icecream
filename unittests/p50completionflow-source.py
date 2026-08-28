@@ -156,6 +156,16 @@ def check_parent(source: str) -> None:
 
 
 def check_cache_service(source: str) -> None:
+    ready_trace = section(source, "void append_ready_test_trace(",
+                          "void append_terminal_lifecycle_test_trace(")
+    for token in ("ICECC_P50_C1F1_REQUIRED", "ICECC_P50_TEST_READY_TRACE",
+                  "O_APPEND", "O_CLOEXEC", "::write(fd"):
+        require(token in ready_trace, f"sidecar READY evidence omits {token}")
+    ready = section(source, "bool write_ready_lease(",
+                    "bool capture_listener_identity(")
+    ordered(ready, "const bool written = write_exact(fd, message);",
+            "if (written)", "append_ready_test_trace(message);",
+            "return written;")
     helper = section(source, "void append_terminal_lifecycle_test_trace(",
                      "volatile sig_atomic_t g_stop_requested")
     for token in ("ICECC_P50_C1F1_REQUIRED",
@@ -183,12 +193,15 @@ def check_runtime_gate(source: str) -> None:
                   "run_remote_cell disconnect disconnect",
                   "ICECC_CARET_WORKAROUND=1",
                   "ICECC_P50_TEST_DISPOSITION=\"$mode\"",
+                  "ICECC_P50_TEST_READY_TRACE=\"$work/ready.trace\"",
                   "restart_cache_sidecar",
                   "kill -9 \"$old_pid\"",
                   "P50 terminal test post-settlement attach job",
                   "after_records=0 after_bytes=0",
                   "after_records=1 after_bytes=[1-9][0-9]*",
-                  "attempt_only_pids", "attempt_only_attempts"):
+                  "attempt_only_pids", "attempt_only_attempts",
+                  "p50_runtime_evidence.py", "runtime.json",
+                  "did not retain incomplete rows as HOLD"):
         require(token in source, f"real terminal/reclaim matrix omits {token}")
     ordered(source,
             "run_remote_cell malformed malformed",
@@ -254,6 +267,7 @@ def deletion_mutants(files: dict[str, str]) -> None:
         ("record_cpp", "if (count != 0)", "if (false)"),
         ("record_cpp", "record.request_id == record.assignment_nonce", "true"),
         ("cache_service", "ICECC_P50_TEST_LIFECYCLE_TRACE", "TRACE_DELETED"),
+        ("cache_service", "ICECC_P50_TEST_READY_TRACE", "READY_TRACE_DELETED"),
         ("cache_service", "if (mutated && decision.collect_record)\n                    endpoint_->collect_input_garbage();",
          "if (mutated && decision.collect_record)\n                    collect_deleted();"),
         ("runtime_gate", "kill -9 \"$old_pid\"", "kill_deleted"),

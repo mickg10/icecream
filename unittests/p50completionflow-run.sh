@@ -20,7 +20,7 @@ for binary in \
     }
 done
 
-for command in timeout g++ bash; do
+for command in timeout g++ bash python3; do
     command -v "$command" >/dev/null 2>&1 || {
         echo "SKIP: $command is required for the P50 completion-flow gate" >&2
         exit 77
@@ -57,7 +57,7 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 mkdir -p "$work/envs-f" "$work/envs-c" "$work/toolchain" "$work/src" \
-    "$work/out" "$work/cache-runtime-f" "$work/home"
+    "$work/out" "$work/cache-runtime-f" "$work/home" "$work/evidence"
 chmod 1777 "$work/envs-f" "$work/envs-c"
 chmod 0700 "$work/cache-runtime-f" "$work/home"
 HOME="$work/home"
@@ -65,6 +65,7 @@ export HOME
 port_sched=$((24000 + ($$ % 1000)))
 port_worker=$((25000 + ($$ % 1000)))
 network="p50completion-$$"
+experiment_id=${ICECC_P50_EXPERIMENT_ID:-p50completionflow}
 
 printf '%s\n' \
     '#include <cstdint>' \
@@ -116,6 +117,7 @@ kill -0 "$sched_pid" 2>/dev/null || {
 
 ICECC_TEST_SOCKET="$work/worker.sock" ICECC_P50_C1F1_REQUIRED=1 \
     ICECC_P50_TEST_LIFECYCLE_TRACE="$work/lifecycle.trace" \
+    ICECC_P50_TEST_READY_TRACE="$work/ready.trace" \
     ICECC_P50_TEST_POST_TERMINAL_ATTACH=1 \
     "$build/daemon/iceccd" "$@" -p "$port_worker" -m 1 \
     -s "127.0.0.1:$port_sched" -n "$network" -N p50-f \
@@ -342,6 +344,18 @@ test "$attempt_only_attempts" -eq 2 || {
 test "$(grep -E -c 'P50 input settlement job .* action 2 ' "$work/f.log")" -eq 1
 test "$(grep -E -c 'P50 input settlement job .* action 3 ' "$work/f.log")" -eq 1
 test "$(grep -E -c 'P50 input settlement job .* action 1 ' "$work/f.log")" -eq 2
+
+python3 "$src/unittests/p50_runtime_evidence.py" \
+    --experiment-id "$experiment_id" --run-id "$(basename "$work")" \
+    --ready "$work/ready.trace" --lifecycle "$work/lifecycle.trace" \
+    --worker-log "$work/f.log" --output "$work/evidence/runtime.json" \
+    >"$work/evidence/verification.json"
+grep -F '"status":"HOLD"' "$work/evidence/verification.json" >/dev/null || {
+    echo "FAIL: runtime evidence verifier did not retain incomplete rows as HOLD" >&2
+    exit 1
+}
+test -s "$work/evidence/runtime.json"
+
 kill -0 "$service_pid" 2>/dev/null || {
     echo "FAIL: final replacement sidecar is not live" >&2
     exit 1

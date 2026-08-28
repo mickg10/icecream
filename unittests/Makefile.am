@@ -448,6 +448,7 @@ EXTRA_DIST += p50compilee2e-source.sh p50compilee2e-run.sh
 EXTRA_DIST += p50completionflow-source.py
 EXTRA_DIST += p50completionrecord-sanitize.sh
 EXTRA_DIST += p50completionflow-run.sh
+EXTRA_DIST += p50_runtime_evidence.py
 EXTRA_DIST += p50tworole-source.sh
 EXTRA_DIST += p50daemontaskcount-source.sh
 EXTRA_DIST += p50forkfdhygiene-source.sh p50forkfdhygiene-mutants.sh \

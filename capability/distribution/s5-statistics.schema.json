@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "icecream-s5-zstd-tu-statistics-v2",
+  "title": "S5 ZSTD_TU authenticated statistical evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "contract", "contract_digest", "preregistration_digest", "experiment_id", "builds", "blocks", "tu_rows", "events", "artifact_refs"],
+  "properties": {
+    "schema": {"const": "icecream-s5-zstd-tu-statistics-v2"},
+    "contract_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "preregistration_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "experiment_id": {"type": "string", "minLength": 1},
+    "contract": {"$ref": "#/$defs/contract"},
+    "artifact_refs": {"type": "array", "items": {"$ref": "#/$defs/artifact_ref"}},
+    "builds": {"type": "array", "items": {"$ref": "#/$defs/build"}},
+    "blocks": {"type": "array", "items": {"$ref": "#/$defs/block"}},
+    "tu_rows": {"type": "array", "items": {"$ref": "#/$defs/tu_row"}},
+    "events": {"type": "array", "items": {"$ref": "#/$defs/event"}},
+    "recomputed": {"type": "object", "additionalProperties": false, "properties": {"statistics_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}, "required": ["statistics_sha256"]}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "artifact_ref": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "sha256", "bytes", "artifact_id", "schema", "kind", "producer", "experiment_id", "run_id", "scope"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/digest"}, "bytes": {"type": "integer", "minimum": 0},
+        "artifact_id": {"type": "string", "minLength": 1}, "schema": {"const": "icecream-s5-upstream-artifact-v1"},
+        "kind": {"type": "string", "minLength": 1}, "producer": {"type": "string", "minLength": 1},
+        "experiment_id": {"type": "string", "minLength": 1}, "run_id": {"type": "string", "minLength": 1},
+        "scope": {"type": "object", "additionalProperties": false, "required": ["experiment_id", "build_id", "tu_id"], "properties": {"experiment_id": {"type": "string"}, "build_id": {"type": "string"}, "tu_id": {"type": "string"}}}
+      }
+    },
+    "wire": {
+      "type": "object", "additionalProperties": false,
+      "required": ["direction", "layer", "denominator", "environment_transfer_included"],
+      "properties": {"direction": {"type": "string", "minLength": 1}, "layer": {"type": "string", "minLength": 1}, "denominator": {"type": "string", "minLength": 1}, "environment_transfer_included": {"const": false}}
+    },
+    "bootstrap": {
+      "type": "object", "additionalProperties": false,
+      "required": ["seed", "replicates", "confidence_level", "quantile_convention", "implementation", "code_sha256"],
+      "properties": {"seed": {"type": "integer", "minimum": 0}, "replicates": {"type": "integer", "minimum": 1}, "confidence_level": {"const": 0.95}, "quantile_convention": {"const": "linear"}, "implementation": {"const": "s5-statistics-python-v7"}, "code_sha256": {"$ref": "#/$defs/digest"}}
+    },
+    "prewarm": {
+      "type": "object", "additionalProperties": false,
+      "required": ["manifest_digest", "content_digest", "initial_state_digest"],
+      "properties": {"manifest_digest": {"$ref": "#/$defs/digest"}, "content_digest": {"$ref": "#/$defs/digest"}, "initial_state_digest": {"$ref": "#/$defs/digest"}}
+    },
+    "block_plan_row": {
+      "type": "object", "additionalProperties": false,
+      "required": ["block_id", "build_ids", "regime", "order"],
+      "properties": {"block_id": {"type": "string", "minLength": 1}, "build_ids": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "string"}}, "regime": {"enum": ["cold", "warm"]}, "order": {"enum": ["AB", "BA"]}}
+    },
+    "tu_plan_row": {
+      "type": "object", "additionalProperties": false,
+      "required": ["build_id", "block_id", "regime", "mode", "tu_count", "corpus_id", "tu_ids", "workload_digest", "compiler_digest", "input_digest", "reference_digest", "assignment_ids", "input_record_ids", "result_record_ids", "ledger_record_ids"],
+      "properties": {"build_id": {"type": "string", "minLength": 1}, "block_id": {"type": "string", "minLength": 1}, "regime": {"enum": ["cold", "warm"]}, "mode": {"enum": ["cache", "legacy"]}, "tu_count": {"type": "integer", "minimum": 1}, "corpus_id": {"type": "string", "minLength": 1}, "tu_ids": {"type": "array", "minItems": 1, "items": {"type": "string"}}, "workload_digest": {"$ref": "#/$defs/digest"}, "compiler_digest": {"$ref": "#/$defs/digest"}, "input_digest": {"$ref": "#/$defs/digest"}, "reference_digest": {"$ref": "#/$defs/digest"}, "assignment_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}, "input_record_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}, "result_record_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}, "ledger_record_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}}
+    },
+    "contract": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema", "immutable", "source_sha256", "binary_sha256", "compiler_env_digest", "workload_manifest_digest", "wire_definition_sha256", "block_plan_sha256", "wire_definition", "modes", "regimes", "bootstrap_unit", "ratio_definition", "estimator", "bound_method", "bootstrap", "prewarm", "required_blocks_per_regime", "experiment_id", "run_identity", "failure_policy", "clock_identity", "max_duration_ns", "block_plan", "tu_plan", "tu_plan_sha256", "code_identity", "artifact_plan"],
+      "properties": {
+        "schema": {"const": "icecream-s5-zstd-tu-statistics-v2"}, "immutable": {"const": true},
+        "source_sha256": {"$ref": "#/$defs/digest"}, "binary_sha256": {"$ref": "#/$defs/digest"}, "compiler_env_digest": {"$ref": "#/$defs/digest"}, "workload_manifest_digest": {"$ref": "#/$defs/digest"}, "wire_definition_sha256": {"$ref": "#/$defs/digest"}, "block_plan_sha256": {"$ref": "#/$defs/digest"}, "tu_plan_sha256": {"$ref": "#/$defs/digest"},
+        "wire_definition": {"$ref": "#/$defs/wire"}, "modes": {"const": ["cache", "legacy"]}, "regimes": {"const": ["cold", "warm"]}, "bootstrap_unit": {"const": "whole_block"}, "ratio_definition": {"const": "cache_over_legacy"}, "estimator": {"const": "geometric_mean_log_ratio"}, "bound_method": {"const": "whole_block_bootstrap"}, "bootstrap": {"$ref": "#/$defs/bootstrap"}, "prewarm": {"$ref": "#/$defs/prewarm"}, "required_blocks_per_regime": {"type": "integer", "minimum": 4},
+        "experiment_id": {"type": "string", "minLength": 1}, "run_identity": {"type": "string", "minLength": 1}, "failure_policy": {"const": "fail-closed"}, "clock_identity": {"type": "string", "minLength": 1}, "max_duration_ns": {"type": "integer", "minimum": 1},
+        "block_plan": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/block_plan_row"}}, "tu_plan": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/tu_plan_row"}},
+        "code_identity": {"type": "object", "additionalProperties": false, "required": ["source_sha256", "binary_sha256", "compiler_env_digest", "verifier_sha256"], "properties": {"source_sha256": {"$ref": "#/$defs/digest"}, "binary_sha256": {"$ref": "#/$defs/digest"}, "compiler_env_digest": {"$ref": "#/$defs/digest"}, "verifier_sha256": {"$ref": "#/$defs/digest"}}},
+        "artifact_plan": {"type": "object", "additionalProperties": false, "required": ["refs", "identity_fields"], "properties": {"refs": {"type": "array", "items": {"type": "string"}}, "identity_fields": {"type": "array", "items": {"type": "string"}}}}
+      }
+    },
+    "namespace": {"type": "object", "additionalProperties": false, "required": ["namespace_id", "mode_private", "c_guid", "f_store"], "properties": {"namespace_id": {"type": "string"}, "mode_private": {"type": "boolean"}, "c_guid": {"type": "string"}, "f_store": {"type": "string"}}},
+    "measurement": {"type": "object", "additionalProperties": false, "required": ["work", "preparation_excluded", "reset_outside_measurement", "prewarm_outside_measurement", "contains_preparation", "contains_reset", "contains_prewarm", "preparation_inside_interval", "start_ns", "end_ns"], "properties": {"work": {"const": "full_build"}, "preparation_excluded": {"type": "boolean"}, "reset_outside_measurement": {"type": "boolean"}, "prewarm_outside_measurement": {"type": "boolean"}, "contains_preparation": {"type": "boolean"}, "contains_reset": {"type": "boolean"}, "contains_prewarm": {"type": "boolean"}, "preparation_inside_interval": {"type": "boolean"}, "start_ns": {"type": "integer"}, "end_ns": {"type": "integer"}}},
+    "join": {"type": "object", "additionalProperties": false, "required": ["bijection", "orphan_count", "duplicate_count", "dropped_count", "evidence_ref", "row_key"], "properties": {"bijection": {"type": "boolean"}, "orphan_count": {"type": "integer", "minimum": 0}, "duplicate_count": {"type": "integer", "minimum": 0}, "dropped_count": {"type": "integer", "minimum": 0}, "evidence_ref": {"type": "string"}, "row_key": {"type": "array", "items": {"type": "string"}}}},
+    "reset": {"type": "object", "additionalProperties": false, "properties": {"fresh_c_guid": {"type": "boolean"}, "f_store_wiped": {"type": "boolean"}, "outside_measurement": {"type": "boolean"}, "evidence_ref": {"type": "string"}, "performed": {"type": "boolean"}}},
+    "build_prewarm": {"type": "object", "additionalProperties": false, "required": ["manifest_digest", "content_digest", "initial_state_digest", "snapshot_identity", "mode"], "properties": {"manifest_digest": {"$ref": "#/$defs/digest"}, "content_digest": {"$ref": "#/$defs/digest"}, "initial_state_digest": {"$ref": "#/$defs/digest"}, "snapshot_identity": {"type": "string"}, "mode": {"enum": ["cache", "legacy"]}}},
+    "failure": {"type": "object", "additionalProperties": false, "required": ["reason"], "properties": {"reason": {"type": "string"}}},
+    "censor": {"type": "object", "additionalProperties": false, "required": ["reason"], "properties": {"reason": {"type": "string"}}},
+    "build": {"type": "object", "additionalProperties": false, "required": ["build_id", "block_id", "order", "sequence_in_block", "regime", "mode", "status", "wall_seconds", "namespace", "measurement", "prewarm", "join", "reset"], "properties": {"build_id": {"type": "string"}, "block_id": {"type": "string"}, "order": {"enum": ["AB", "BA"]}, "sequence_in_block": {"type": "integer", "minimum": 0}, "regime": {"enum": ["cold", "warm"]}, "mode": {"enum": ["cache", "legacy"]}, "status": {"enum": ["complete", "failed", "censored"]}, "wall_seconds": {"type": "number", "exclusiveMinimum": 0}, "namespace": {"$ref": "#/$defs/namespace"}, "measurement": {"$ref": "#/$defs/measurement"}, "prewarm": {"$ref": "#/$defs/build_prewarm"}, "join": {"$ref": "#/$defs/join"}, "reset": {"$ref": "#/$defs/reset"}, "failure": {"$ref": "#/$defs/failure"}, "censor": {"$ref": "#/$defs/censor"}}},
+    "block": {"type": "object", "additionalProperties": false, "required": ["block_id", "regime", "order", "mapping", "build_ids", "sequence_build_ids", "cache_build_id", "legacy_build_id", "complete", "join_evidence_ref"], "properties": {"block_id": {"type": "string"}, "regime": {"enum": ["cold", "warm"]}, "order": {"enum": ["AB", "BA"]}, "mapping": {"const": {"A": "cache", "B": "legacy"}}, "build_ids": {"type": "array", "items": {"type": "string"}}, "sequence_build_ids": {"type": "array", "items": {"type": "string"}}, "cache_build_id": {"type": "string"}, "legacy_build_id": {"type": "string"}, "complete": {"type": "boolean"}, "join_evidence_ref": {"type": "string"}}},
+    "join_identity": {"type": "object", "additionalProperties": false, "required": ["run_id", "scheduler_epoch", "wire_id", "wire_nonce", "attempt_id", "selected_f_identity", "f_store_generation", "c_guid", "tu_seq"], "properties": {"run_id": {"type": "string"}, "scheduler_epoch": {"type": "integer"}, "wire_id": {"type": "string"}, "wire_nonce": {"type": "integer"}, "attempt_id": {"type": "integer"}, "selected_f_identity": {"type": "string"}, "f_store_generation": {"type": "integer"}, "c_guid": {"type": "string"}, "tu_seq": {"type": "integer"}}},
+    "tu_row": {"type": "object", "additionalProperties": false, "required": ["build_id", "corpus_id", "tu_id", "order", "argv_digest", "cwd_digest", "env_digest", "input_digest", "reference_digest", "compiler_digest", "join_identity", "object_digest", "result_digest", "status", "bytes_c_to_f", "bytes_f_to_c", "assignment_id", "input_record_id", "result_record_id", "ledger_record_id"], "properties": {"build_id": {"type": "string"}, "corpus_id": {"type": "string"}, "tu_id": {"type": "string"}, "order": {"type": "integer", "minimum": 0}, "argv_digest": {"$ref": "#/$defs/digest"}, "cwd_digest": {"$ref": "#/$defs/digest"}, "env_digest": {"$ref": "#/$defs/digest"}, "input_digest": {"$ref": "#/$defs/digest"}, "reference_digest": {"$ref": "#/$defs/digest"}, "compiler_digest": {"$ref": "#/$defs/digest"}, "join_identity": {"$ref": "#/$defs/join_identity"}, "object_digest": {"$ref": "#/$defs/digest"}, "result_digest": {"$ref": "#/$defs/digest"}, "status": {"enum": ["complete", "failed", "censored"]}, "failure": {"$ref": "#/$defs/failure"}, "censor": {"$ref": "#/$defs/censor"}, "bytes_c_to_f": {"type": "integer", "minimum": 0}, "bytes_f_to_c": {"type": "integer", "minimum": 0}, "assignment_id": {"type": "string", "minLength": 1}, "input_record_id": {"type": "string", "minLength": 1}, "result_record_id": {"type": "string", "minLength": 1}, "ledger_record_id": {"type": "string", "minLength": 1}}},
+    "event": {"type": "object", "additionalProperties": false, "required": ["event_id", "build_id", "kind", "start_ns", "end_ns", "artifact_ref"], "properties": {"event_id": {"type": "string"}, "build_id": {"type": "string"}, "kind": {"enum": ["preparation", "reset", "prewarm", "manifest_validation"]}, "start_ns": {"type": "integer"}, "end_ns": {"type": "integer"}, "artifact_ref": {"type": "string"}}}
+  }
+}

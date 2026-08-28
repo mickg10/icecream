@@ -72,6 +72,30 @@ constexpr int kMaxBacklog = 16;
 // This is a hard concurrent cap, not a per-connection unbounded thread fork.
 constexpr size_t kMaxControlWorkers = 4;
 
+void append_ready_test_trace(std::string_view message) noexcept {
+    const char* required = ::getenv("ICECC_P50_C1F1_REQUIRED");
+    const char* path = ::getenv("ICECC_P50_TEST_READY_TRACE");
+    if (required == nullptr || std::strcmp(required, "1") != 0 ||
+        path == nullptr || *path == '\0')
+        return;
+    const int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return;
+    size_t offset = 0;
+    while (offset < message.size()) {
+        const ssize_t written = ::write(fd, message.data() + offset,
+                                        message.size() - offset);
+        if (written > 0) {
+            offset += static_cast<size_t>(written);
+            continue;
+        }
+        if (written < 0 && errno == EINTR)
+            continue;
+        break;
+    }
+    (void)::close(fd);
+}
+
 void append_terminal_lifecycle_test_trace(
     const InputLifecycleRequest& request,
     InputLifecycleApplyStatus status,
@@ -654,7 +678,10 @@ bool write_ready_lease(int fd, const Options& options, const ListenerIdentity& l
         " INO=" + std::to_string(static_cast<unsigned long long>(
             listener.pathname_inode != 0 ? listener.pathname_inode : listener.listener_inode)) +
         "\n";
-    return write_exact(fd, message);
+    const bool written = write_exact(fd, message);
+    if (written)
+        append_ready_test_trace(message);
+    return written;
 }
 
 bool capture_listener_identity(int fd, const std::string& path,
