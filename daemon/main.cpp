@@ -4608,6 +4608,7 @@ struct WorkerAssignment {
     enum Phase { Reserved, Claimed, ClaimedOrLater, Orphaned } phase;
     AssignmentKey key;
     uint32_t claimant;
+    bool ready_announced = false;
 };
 
 struct AssignmentTerminal {
@@ -5221,6 +5222,25 @@ void Daemon::poll_cache_adapter() noexcept
     if ((!snapshot_valid_for_adapter || scheduler_cache_snapshot != current)
             && !reannounce_environments(&current))
         return;
+
+    /* Complete strict PREPAREs held during sidecar startup only after the
+       same READY snapshot has been published to S.  This keeps the scheduler
+       UseCS projection and the daemon's live endpoint state in one order. */
+    if (cache_adapter->state() == icecc::p50::daemon::AdapterState::Ready &&
+        current.present()) {
+        for (auto& entry : live_assignments) {
+            WorkerAssignment& assignment = entry.second;
+            if (assignment.phase != WorkerAssignment::Reserved ||
+                assignment.ready_announced)
+                continue;
+            if (!send_scheduler(AssignReadyMsg(
+                    assignment.key.epoch, assignment.key.wire_id,
+                    assignment.key.nonce)))
+                return;
+            assignment.ready_announced = true;
+            ++assignment_ready_replies;
+        }
+    }
 }
 
 void Daemon::shutdown_cache_adapter() noexcept
@@ -8145,8 +8165,32 @@ int Daemon::handle_assign_prepare(AssignPrepareMsg *msg)
         ++assignment_prepares;
     }
 
+    /* In strict mode the selected F's cache advertisement is part of the
+       assignment projection.  PREPARE can arrive during sidecar startup;
+       announcing READY in that window makes S emit a valid identity-bearing
+       UseCS with a permanently absent cache tail before the real READY
+       advertisement exists.  Retain the bounded Reserved row and announce
+       it from poll_cache_adapter once the sidecar reaches READY. */
+    const bool wait_for_cache_ready =
+        assignment_fence_mode == ConfCSMsg::StrictNonce &&
+        cache_adapter != nullptr &&
+        (cache_adapter->state() == icecc::p50::daemon::AdapterState::Starting ||
+         (cache_adapter->state() == icecc::p50::daemon::AdapterState::Absent &&
+          cache_adapter->outer_lifecycle_state() ==
+              icecc::p50::sidecar::LifecycleState::Ready) ||
+         cache_adapter->outer_launch_plan_active());
+    if (wait_for_cache_ready)
+        return 0;
+
     ++assignment_ready_replies;
-    return send_scheduler(AssignReadyMsg(key.epoch, key.wire_id, key.nonce)) ? 0 : 1;
+    const bool sent = send_scheduler(AssignReadyMsg(key.epoch, key.wire_id,
+                                                     key.nonce));
+    if (sent) {
+        auto ready = live_assignments.find(key.wire_id);
+        if (ready != live_assignments.end() && ready->second.key == key)
+            ready->second.ready_announced = true;
+    }
+    return sent ? 0 : 1;
 }
 
 int Daemon::handle_revoke_before_start(RevokeBeforeStartMsg *msg)

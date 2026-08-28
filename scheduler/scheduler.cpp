@@ -3001,6 +3001,27 @@ static bool handle_relogin(MsgChannel *mc, Msg *_m)
         cs->send_msg(scheduler_conf_message(cs));
     }
 
+    /* A strict assignment may have crossed READY before this re-login was
+       processed by S.  Its first projection was intentionally held when the
+       retained worker cache tuple was absent; expose those exact jobs now,
+       after installing the positive cache snapshot above. */
+    for (map<unsigned int, Job *>::const_iterator it = jobs.begin();
+         it != jobs.end(); ++it) {
+        Job *job = it->second;
+        if (job == nullptr || job->server() != cs ||
+            job->assignmentPolicy() != Job::ASSIGNMENT_STRICT_NONCE ||
+            job->assignmentPhase() != Job::ASSIGNMENT_READY ||
+            job->assignmentReplySent())
+            continue;
+        if (!cache_advertisement_is_valid_present(
+                cs->cacheEndpointPort(), cs->cacheProtocol(),
+                cs->cacheProfileMask()))
+            continue;
+        if (!send_remote_dispatch_reply(job))
+            return false;
+        job->setAssignmentReplySent(true);
+    }
+
     return false;
 }
 
@@ -3063,6 +3084,13 @@ static bool handle_assignment_ready(CompileServer *cs, Msg *_m)
         job->submitter()->testCutNextFlushAfter(0);
         job->server()->testCutNextFlushAfter(0);
     }
+    const bool cache_ready = cache_advertisement_is_valid_present(
+        cs->cacheEndpointPort(), cs->cacheProtocol(), cs->cacheProfileMask());
+    if (job->assignmentPolicy() == Job::ASSIGNMENT_STRICT_NONCE && !cache_ready) {
+        trace() << "holding strict READY job " << job->id()
+                << " until worker cache re-login" << endl;
+        return true;
+    }
     if (job->assignmentReadyGated() && !send_remote_dispatch_reply(job)) {
         trace() << "failed to expose ready assignment " << job->id() << endl;
         const int worker_fd = cs->fd;
@@ -3082,6 +3110,8 @@ static bool handle_assignment_ready(CompileServer *cs, Msg *_m)
         }
         return worker_still_live;
     }
+    if (job->assignmentReadyGated())
+        job->setAssignmentReplySent(true);
     return true;
 }
 

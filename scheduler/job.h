@@ -89,6 +89,8 @@ public:
         return m_assignmentPolicy == ASSIGNMENT_ENFORCING_COMPAT
             || m_assignmentPolicy == ASSIGNMENT_STRICT_NONCE;
     }
+    bool assignmentReplySent() const { return m_assignmentReplySent; }
+    void setAssignmentReplySent(bool sent) { m_assignmentReplySent = sent; }
 
     /* Prepared modes freeze the complete legacy UseCS projection at the
        dispatch decision.  READY may arrive much later, after selection
@@ -224,6 +226,7 @@ private:
     std::string m_dispatchPlatform;
     bool m_dispatchGotEnv = false;
     uint32_t m_dispatchMatchedJobId = 0;
+    bool m_assignmentReplySent = false;
     CompileServer *m_server;  // on which server we build
     CompileServer *m_submitter;
     bool m_submitterDetached = false;
