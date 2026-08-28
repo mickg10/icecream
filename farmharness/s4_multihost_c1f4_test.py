@@ -120,6 +120,7 @@ class FourHostRunnerTests(unittest.TestCase):
         self.assertIn('cp -a "$root/." "$work/role/"', runner.START_WORKER_SCRIPT)
         self.assertNotIn('-v "$root:/role:ro"', runner.START_WORKER_SCRIPT)
         self.assertIn('-v "$work:/probe"', runner.START_SCHEDULER_SCRIPT)
+        self.assertIn('mktemp -d "$HOME/s4-p50-fourhost-worker.', runner.START_WORKER_SCRIPT)
 
 
 if __name__ == "__main__":

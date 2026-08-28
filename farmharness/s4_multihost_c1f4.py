@@ -321,7 +321,7 @@ def verify_stage(host: str, root: str, timeout: float) -> str:
 START_SCHEDULER_SCRIPT = r"""
 set -eu
 root=$1; image=$2; container=$3; port=$4; network=$5; uid=$6; gid=$7
-work=$(mktemp -d /tmp/s4-p50-fourhost-scheduler.XXXXXX)
+work=$(mktemp -d "$HOME/s4-p50-fourhost-scheduler.XXXXXX")
 chmod 1777 "$work"
 mkdir -p "$work/role"
 cp -a "$root/." "$work/role/"
@@ -348,7 +348,7 @@ START_WORKER_SCRIPT = r"""
 set -eu
 root=$1; image=$2; container=$3; scheduler=$4; sport=$5; network=$6
 name=$7; port=$8; uid=$9; gid=${10}
-work=$(mktemp -d /tmp/s4-p50-fourhost-worker.XXXXXX)
+work=$(mktemp -d "$HOME/s4-p50-fourhost-worker.XXXXXX")
 mkdir -p "$work/envs" "$work/cache-runtime"
 mkdir -p "$work/role"
 cp -a "$root/." "$work/role/"
@@ -494,7 +494,9 @@ exit 0
 
 
 def parse_work(stdout: str, marker: str, prefix: str) -> str:
-    match = re.search(rf"^{re.escape(marker)}=({re.escape(prefix)}[A-Za-z0-9]+)$", stdout, re.M)
+    name = Path(prefix).name
+    location = r"(?:/tmp|/home/[A-Za-z0-9._-]+)"
+    match = re.search(rf"^{re.escape(marker)}=({location}/{re.escape(name)}[A-Za-z0-9]+)$", stdout, re.M)
     if not match:
         raise HoldError(f"remote launcher did not return {marker}")
     return match.group(1)
@@ -587,12 +589,9 @@ def run_client(
 
 
 def copy_remote_tree(host: str, remote: str, destination: Path, timeout: float) -> None:
-    allowed = (
-        "/tmp/s4-p50-fourhost-scheduler.",
-        "/tmp/s4-p50-fourhost-worker.",
-        "/tmp/s4-p50-fourhost-client.",
-    )
-    if not remote.startswith(allowed) or not re.fullmatch(r"/tmp/s4-p50-fourhost-[a-z]+\.[A-Za-z0-9]+", remote):
+    if not re.fullmatch(
+        r"(?:/tmp|/home/[A-Za-z0-9._-]+)/s4-p50-fourhost-[a-z]+\.[A-Za-z0-9]+", remote
+    ):
         raise HoldError(f"refusing unexpected evidence directory: {remote}")
     destination.mkdir(parents=True, exist_ok=False)
     source = subprocess.Popen(
@@ -675,13 +674,14 @@ set -eu
 container=$1; work=$2; stage=$3
 docker rm -f "$container" >/dev/null 2>&1 || true
 case "$work" in
-  /tmp/s4-p50-fourhost-scheduler.*|/tmp/s4-p50-fourhost-worker.*|/tmp/s4-p50-fourhost-client.*)
+  /tmp/s4-p50-fourhost-scheduler.*|/tmp/s4-p50-fourhost-worker.*|/tmp/s4-p50-fourhost-client.*|\
+  /home/*/s4-p50-fourhost-scheduler.*|/home/*/s4-p50-fourhost-worker.*|/home/*/s4-p50-fourhost-client.*)
     rm -rf -- "$work" ;;
   "") ;;
   *) echo "refuse-work:$work"; exit 77 ;;
 esac
 case "$stage" in
-  /tmp/s4-p50-fourhost.*) rm -rf -- "$stage" ;;
+  /tmp/s4-p50-fourhost.*|/home/*/s4-p50-fourhost.*) rm -rf -- "$stage" ;;
   "") ;;
   *) echo "refuse-stage:$stage"; exit 77 ;;
 esac
