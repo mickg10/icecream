@@ -96,4 +96,34 @@ std::optional<CompileInputIdentity> bind_compile_input(
     return identity;
 }
 
+std::optional<CompileInputIdentity> bind_compile_input(
+    const CompileJob& job, ProfileId profile,
+    const local::P50SourceTransferResult& transfer) noexcept {
+    if (!job.hasAssignmentIdentity() || job.jobID() == 0 ||
+        transfer.code != local::SourceTransferResultCode::Committed ||
+        !transfer.valid() || transfer.c_store_guid == CStoreGuid{} ||
+        !store_identity_guid_valid_for_role(
+            transfer.c_store_guid.bytes, kStoreIdentityClientRole) ||
+        transfer.attempts == 0 || transfer.attempts > 2)
+        return std::nullopt;
+
+    if (profile != ProfileId::P29 && profile != ProfileId::ZSTD_TU &&
+        profile != ProfileId::Z3_LONG && profile != ProfileId::GRZ)
+        return std::nullopt;
+
+    CompileInputIdentity identity;
+    identity.profile = profile == ProfileId::P29
+                           ? CompileInputIdentity::P29Profile
+                           : CompileInputIdentity::ZstdTuProfile;
+    identity.c_store_guid = transfer.c_store_guid.bytes;
+    identity.tu_seq = transfer.tu_seq;
+    identity.raw_bytes = transfer.raw_bytes;
+    identity.raw_digest = transfer.raw_digest.bytes;
+    identity.attempt_id = job.assignmentNonce();
+    identity.request_id = job.assignmentNonce();
+    if (!identity.validPresent() || transfer.raw_bytes == 0)
+        return std::nullopt;
+    return identity;
+}
+
 }  // namespace icecc::p50

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "p50_zstd_sender.h"
+#include "cache/p50_control_operation.h"
 
 #include "services/comm.h"
 #include "services/job.h"
@@ -41,5 +42,12 @@ namespace icecc::p50 {
 [[nodiscard]] std::optional<CompileInputIdentity> bind_compile_input(
     const CompileJob& job, CStoreGuid expected_c_store_guid,
     const ZstdSourceTransferResult& transfer) noexcept;
+
+// Bind the selector from the authenticated sidecar's typed result.  The
+// sidecar is the C-store owner for this path, so the GUID is taken from the
+// result itself rather than synthesized by the wrapper.
+[[nodiscard]] std::optional<CompileInputIdentity> bind_compile_input(
+    const CompileJob& job, ProfileId profile,
+    const local::P50SourceTransferResult& transfer) noexcept;
 
 }  // namespace icecc::p50

@@ -168,6 +168,38 @@ void test_only_exact_commit_binds_compile_selector() {
     CHECK(!bind_compile_input(CompileJob{}, guid, transfer));
 }
 
+void test_authenticated_sidecar_result_binds_real_identity() {
+    const CompileJob job = assigned_job();
+    const CStoreGuid guid = Id128::from_u64(0xfeed);
+    local::P50SourceTransferResult transfer;
+    transfer.code = local::SourceTransferResultCode::Committed;
+    transfer.c_store_guid = guid;
+    transfer.tu_seq = 0;
+    transfer.raw_bytes = 1234;
+    transfer.raw_digest = icecc::digest128("sidecar source");
+    transfer.attempts = 1;
+
+    const auto identity = bind_compile_input(job, ProfileId::Z3_LONG, transfer);
+    CHECK(identity.has_value());
+    CHECK(identity->profile == CompileInputIdentity::ZstdTuProfile);
+    CHECK(identity->c_store_guid == guid.bytes);
+    CHECK(identity->tu_seq == 0);
+    CHECK(identity->raw_bytes == transfer.raw_bytes);
+    CHECK(identity->raw_digest == transfer.raw_digest.bytes);
+    CHECK(identity->attempt_id == job.assignmentNonce());
+    CHECK(identity->request_id == job.assignmentNonce());
+
+    const auto p29 = bind_compile_input(job, ProfileId::P29, transfer);
+    CHECK(p29.has_value());
+    CHECK(p29->profile == CompileInputIdentity::P29Profile);
+
+    transfer.attempts = 3;
+    CHECK(!bind_compile_input(job, ProfileId::GRZ, transfer));
+    transfer.attempts = 1;
+    transfer.code = local::SourceTransferResultCode::Error;
+    CHECK(!bind_compile_input(job, ProfileId::ZSTD_TU, transfer));
+}
+
 }  // namespace
 
 int main() {
@@ -175,4 +207,5 @@ int main() {
     test_explicit_profile_selection();
     test_namespace_and_request_are_assignment_bound();
     test_only_exact_commit_binds_compile_selector();
+    test_authenticated_sidecar_result_binds_real_identity();
 }

@@ -40,19 +40,30 @@ contract() {
     # P50 route must fail the requested test, never silently use FileChunk.
     require_text "$root/client/remote.cpp" 'ICECC_P50_C1F1_REQUIRED' || return 1
     require_text "$root/daemon/workit.cpp" 'ICECC_P50_C1F1_REQUIRED' || return 1
-    require_text "$root/client/remote.cpp" 'P50ZstdSourceSender sender' || return 1
     require_text "$root/client/remote.cpp" 'job.setCompileInputIdentity(*identity)' || return 1
-    # The real C production caller must retain one arm identity over the
-    # bounded retry loop and cross the ordinary CACHE_SESSION boundary only
-    # after the exact F acknowledgement on that same TCP wrapper.
-    require_text "$root/client/remote.cpp" 'P50SourceArmFields' || return 1
-    require_text "$root/client/remote.cpp" 'P50SourceArmedMsg' || return 1
-    require_text "$root/client/remote.cpp" 'acknowledges(request)' || return 1
-    require_text "$root/client/remote.cpp" 'send_msg(request, MsgChannel::SendNonBlocking)' || return 1
-    require_text "$root/client/remote.cpp" 'send_msg(CacheSessionMsg(), MsgChannel::SendNonBlocking)' || return 1
-    require_text "$root/client/remote.cpp" 'begin_p50_client_transfer' || return 1
-    require_text "$root/client/remote.cpp" 'const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);' || return 1
+    # The real C production caller leases the already authenticated sidecar
+    # descriptor from the live local daemon relationship, then starts exactly
+    # one source-transfer control operation without a second HELLO.
+    require_text "$root/client/remote.cpp" 'P50CacheSessionFdRequestMsg(fd_request)' || return 1
+    require_text "$root/client/remote.cpp" 'receive_p50_cache_fd_reply' || return 1
+    require_text "$root/client/remote.cpp" 'begin_authenticated' || return 1
+    require_text "$root/client/remote.cpp" 'make_source_transfer_operation' || return 1
+    require_text "$root/client/remote.cpp" 'F_DUPFD_CLOEXEC' || return 1
+    require_text "$root/client/remote.cpp" 'control.advance' || return 1
+    for field in wire_job_id assignment_epoch assignment_nonce selected_f_host \
+        selected_f_ordinary_port selected_f_cache_port cache_protocol cache_profile \
+        logical_job compiler_attempt source_request_id source_mode; do
+        require_text "$root/client/remote.cpp" "request.$field" || return 1
+    done
+    if grep -F 'P50ZstdSourceSender sender' "$root/client/remote.cpp" >/dev/null ||
+       grep -F 'begin_p50_client_transfer' "$root/client/remote.cpp" >/dev/null ||
+       grep -F 'P50SourceArmFields' "$root/client/remote.cpp" >/dev/null ||
+       grep -F 'make_hello' "$root/client/remote.cpp" >/dev/null; then
+        return 1
+    fi
+    require_text "$root/client/remote.cpp" 'std::chrono::seconds(120)' || return 1
     require_text "$root/client/Makefile.am" 'libp50zstdsender.a' || return 1
+    require_text "$root/client/Makefile.am" 'libp50localtransport.a' || return 1
     require_text "$root/client/Makefile.am" 'libprotocol50.a' || return 1
 
     # The service and exact bounded codec are part of the executable topology,
@@ -98,15 +109,14 @@ for pair in \
     "daemon/workit.cpp|ZSTD_TU" \
     "client/remote.cpp|ICECC_P50_C1F1_REQUIRED" \
     "daemon/workit.cpp|ICECC_P50_C1F1_REQUIRED" \
-    "client/remote.cpp|P50ZstdSourceSender sender" \
     "client/remote.cpp|job.setCompileInputIdentity(*identity)" \
-    "client/remote.cpp|P50SourceArmFields" \
-    "client/remote.cpp|P50SourceArmedMsg" \
-    "client/remote.cpp|acknowledges(request)" \
-    "client/remote.cpp|send_msg(request, MsgChannel::SendNonBlocking)" \
-    "client/remote.cpp|send_msg(CacheSessionMsg(), MsgChannel::SendNonBlocking)" \
-    "client/remote.cpp|begin_p50_client_transfer" \
-    "client/remote.cpp|const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);" \
+    "client/remote.cpp|P50CacheSessionFdRequestMsg(fd_request)" \
+    "client/remote.cpp|receive_p50_cache_fd_reply" \
+    "client/remote.cpp|begin_authenticated" \
+    "client/remote.cpp|make_source_transfer_operation" \
+    "client/remote.cpp|F_DUPFD_CLOEXEC" \
+    "client/Makefile.am|libp50localtransport.a" \
+    "client/remote.cpp|std::chrono::seconds(120)" \
     "client/Makefile.am|libp50zstdsender.a" \
     "cache/Makefile.am|libp50inputfd.a" \
     "cache/p50_cache_service.cpp|std::make_unique<P50ServerEndpoint>" \

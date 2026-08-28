@@ -18,6 +18,7 @@ icecc_SOURCES = \
 	main.cpp 
 icecc_LDADD = \
 	libclient.a \
+	../cache/libp50localtransport.a \
 	libp50zstdsender.a \
 	../cache/libp50endpoint.a \
 	../cache/libp50adoptedoutcomewriter.a \

@@ -29,6 +29,7 @@
 #include <sys/wait.h>
 #include <sys/time.h>
 #include <sys/resource.h>
+#include <poll.h>
 
 #ifdef __FreeBSD__
 // Grmbl  Why is this needed?  We don't use readv/writev
@@ -55,16 +56,13 @@
 #include "util.h"
 #include "input_pump.h"
 #include "p50_compile_binding.h"
+#include "cache/p50_control_operation.h"
+#include "cache/p50_daemon_control.h"
+#include "cache/p50_sidecar_supervisor.h"
 #include "services/util.h"
 #include "pipes.h"
 
-#include <boost/asio/co_spawn.hpp>
-#include <boost/asio/io_context.hpp>
-#include <boost/asio/use_future.hpp>
-
-#include <atomic>
 #include <chrono>
-#include <future>
 #include <memory>
 
 #ifndef O_LARGEFILE
@@ -214,156 +212,138 @@ icecc::p50::OwnedSourceFd prepare_complete_p50_source(
     return icecc::p50::OwnedSourceFd(read_fd);
 }
 
-struct P50ClientTransferContext {
-    uint64_t process_generation = 0;
-    uint64_t transfer_sequence = 0;
-    icecc::p50::CStoreGuid c_store_guid{};
-};
-
-P50ClientTransferContext begin_p50_client_transfer(const CompileJob &job)
+uint32_t p50_profile_wire(icecc::p50::ProfileId profile) noexcept
 {
-    // The process generation identifies this C producer incarnation.  The
-    // local sequence identifies one source transfer and is deliberately
-    // allocated once before the sender's bounded retry loop.  Both values
-    // therefore remain stable when a fresh TCP wrapper is needed.
-    static const uint64_t process_generation = [] {
-        const uint64_t ticks = static_cast<uint64_t>(
-            std::chrono::steady_clock::now().time_since_epoch().count());
-        uint64_t value =
-            (static_cast<uint64_t>(static_cast<uint32_t>(::getpid())) << 32) ^ ticks;
-        return value == 0 ? uint64_t{1} : value;
-    }();
-    static std::atomic<uint64_t> next_transfer_sequence{1};
-    uint64_t transfer_sequence =
-        next_transfer_sequence.load(std::memory_order_relaxed);
-    for (;;) {
-        if (transfer_sequence == 0 || transfer_sequence == UINT64_MAX)
-            throw client_error(106, "Error 106 - P50 transfer identity exhausted");
-        if (next_transfer_sequence.compare_exchange_weak(
-                transfer_sequence, transfer_sequence + 1,
-                std::memory_order_relaxed, std::memory_order_relaxed))
-            break;
-    }
+    return profile == icecc::p50::ProfileId::P29
+               ? CACHE_PROFILE_P29
+               : profile == icecc::p50::ProfileId::Z3_LONG
+                     ? CACHE_PROFILE_ZSTD_ROUTE
+                     : profile == icecc::p50::ProfileId::GRZ
+                           ? CACHE_PROFILE_GRZ
+                           : CACHE_PROFILE_ZSTD_TU;
+}
 
-    P50ClientTransferContext result;
-    result.process_generation = process_generation;
-    result.transfer_sequence = transfer_sequence;
-    result.c_store_guid = icecc::p50::derive_compile_c_store_guid(
-        job, process_generation, transfer_sequence);
+uint32_t p50_source_mode_wire(icecc::p50::ProfileId profile) noexcept
+{
+    return profile == icecc::p50::ProfileId::P29
+               ? P50_SOURCE_MODE_P29
+               : profile == icecc::p50::ProfileId::Z3_LONG
+                     ? P50_SOURCE_MODE_ZSTD_ROUTE
+                     : profile == icecc::p50::ProfileId::GRZ
+                           ? P50_SOURCE_MODE_GRZ_RESIDUAL
+                           : P50_SOURCE_MODE_ZSTD_TU;
+}
+
+icecc::p50::local::P50SourceTransferResult p50_transfer_error(
+    uint16_t error_code) noexcept
+{
+    icecc::p50::local::P50SourceTransferResult result;
+    result.code = icecc::p50::local::SourceTransferResultCode::Error;
+    result.error_code = error_code == 0 ? 1 : error_code;
     return result;
 }
 
-P50SourceArmFields make_p50_source_arm(
-    const CompileJob &job, const UseCSMsg &assignment,
-    const P50ClientTransferContext &context, icecc::p50::ProfileId profile)
-{
-    P50SourceArmFields arm;
-    arm.wire_job_id = assignment.job_id;
-    arm.assignment_epoch = assignment.assignmentEpoch();
-    arm.assignment_nonce = assignment.assignmentNonce();
-    arm.selected_f_host = assignment.hostname;
-    arm.selected_f_ordinary_port = assignment.port;
-    arm.selected_f_cache_port = assignment.cache_endpoint_port;
-    arm.cache_protocol = assignment.cache_protocol;
-    arm.cache_profile = profile == icecc::p50::ProfileId::P29
-                            ? CACHE_PROFILE_P29
-                            : (profile == icecc::p50::ProfileId::Z3_LONG
-                                   ? CACHE_PROFILE_ZSTD_ROUTE
-                                   : (profile == icecc::p50::ProfileId::GRZ
-                                          ? CACHE_PROFILE_GRZ
-                                          : CACHE_PROFILE_ZSTD_TU));
-    arm.logical_job = job.jobID();
-    arm.compiler_attempt = assignment.assignmentNonce();
-    arm.c_store_generation = context.process_generation;
-    arm.c_store_derivation_version = icecc::p50::kStoreIdentityDerivationVersion;
-    arm.c_store_guid = context.c_store_guid.bytes;
-    // The sender's PrepareRequest is assignment-bound.  F later compares the
-    // committed InputRecord request_id with this exact token, so it must be
-    // the UseCS assignment nonce rather than an unrelated local sequence.
-    arm.source_request_id = assignment.assignmentNonce();
-    arm.source_mode = profile == icecc::p50::ProfileId::P29
-                          ? P50_SOURCE_MODE_P29
-                          : (profile == icecc::p50::ProfileId::Z3_LONG
-                                 ? P50_SOURCE_MODE_ZSTD_ROUTE
-                                 : (profile == icecc::p50::ProfileId::GRZ
-                                        ? P50_SOURCE_MODE_GRZ_RESIDUAL
-                                        : P50_SOURCE_MODE_ZSTD_TU));
-    arm.c_control_generation = context.process_generation;
-    arm.c_control_attempt = context.transfer_sequence;
-    return arm;
-}
-
-int detach_p50_cache_session(
-    const P50SourceArmFields &arm,
-    std::chrono::steady_clock::time_point deadline) noexcept
-{
-    try {
-        std::unique_ptr<MsgChannel> channel(Service::createChannelUntil(
-            arm.selected_f_host, static_cast<unsigned short>(arm.selected_f_cache_port),
-            deadline));
-        if (!channel || channel->protocol != PROTOCOL_VERSION_CACHE_ADVERTISEMENT ||
-            std::chrono::steady_clock::now() >= deadline)
-            return -1;
-
-        // The F daemon retains the WAIT owner only after this exact arm and
-        // acknowledges it before the ordinary CACHE_SESSION boundary.  Keep
-        // the request and ACK on this same TCP wrapper: a bare CACHE_SESSION
-        // on a fresh connection has no retained P50 owner and is rejected.
-        const P50SourceArmMsg request(arm);
-        if (!channel->send_msg(request, MsgChannel::SendNonBlocking))
-            return -1;
-        const auto remaining = deadline - std::chrono::steady_clock::now();
-        const auto timeout = std::chrono::duration_cast<std::chrono::seconds>(
-            remaining).count();
-        if (timeout <= 0 || timeout > INT_MAX)
-            return -1;
-        std::unique_ptr<Msg> response(channel->get_msg(static_cast<int>(timeout)));
-        const auto *ack = response != nullptr
-                              ? dynamic_cast<const P50SourceArmedMsg *>(response.get())
-                              : nullptr;
-        if (ack == nullptr || !ack->acknowledges(request) ||
-            std::chrono::steady_clock::now() >= deadline)
-            return -1;
-        if (!channel->send_msg(CacheSessionMsg(), MsgChannel::SendNonBlocking))
-            return -1;
-        return channel->release_fd_after_cache_session_ready(deadline);
-    } catch (...) {
-        return -1;
-    }
-}
-
-icecc::p50::ZstdSourceTransferResult transfer_p50_source(
-    const CompileJob &job, const UseCSMsg &assignment,
-    const P50ClientTransferContext &transfer_context,
+icecc::p50::local::P50SourceTransferResult transfer_p50_source(
+    CompileJob &job, const UseCSMsg &assignment, MsgChannel &local_daemon,
     icecc::p50::OwnedSourceFd source, icecc::p50::ProfileId profile)
 {
-    icecc::p50::ZstdSourceTransferConfig config;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
-    config.deadline = deadline;
-    config.maximum_duration = std::chrono::seconds(120);
-    config.endpoint_caps.profile = profile;
-    if (profile == icecc::p50::ProfileId::Z3_LONG)
-        config.compression_level = 3;
-    icecc::p50::P50ZstdSourceSender sender(
-        transfer_context.c_store_guid,
-        icecc::p50::compile_prepare_request(job), config);
-    // The caller supplies the same C GUID used by the sender.  The arm's
-    // process/local counters are captured once and copied into both bounded
-    // connection attempts rather than regenerated by the callback.
-    const P50SourceArmFields arm = make_p50_source_arm(job, assignment,
-                                                        transfer_context, profile);
-    icecc::p50::ConnectedFdFactory connection =
-        [arm](std::chrono::steady_clock::time_point callback_deadline) {
-            return detach_p50_cache_session(arm, callback_deadline);
-        };
+    using namespace icecc::p50;
+    using namespace icecc::p50::local;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(120);
+    P50CacheSessionFdRequestFields fd_request;
+    fd_request.wire_job_id = assignment.job_id;
+    fd_request.assignment_epoch = assignment.assignmentEpoch();
+    fd_request.assignment_nonce = assignment.assignmentNonce();
+    fd_request.profile = p50_profile_wire(profile);
+    if (!fd_request.valid() || !source)
+        return p50_transfer_error(1);
 
-    boost::asio::io_context context;
-    std::future<icecc::p50::ZstdSourceTransferResult> future =
-        boost::asio::co_spawn(
-            context, sender.transfer(std::move(connection), std::move(source)),
-            boost::asio::use_future);
-    context.run();
-    return future.get();
+    // The ordinary local daemon channel is the assignment authority.  The
+    // daemon returns one already-authenticated sidecar control descriptor;
+    // no wrapper-local TCP sender or C-store identity is created here.
+    if (!local_daemon.send_msg(P50CacheSessionFdRequestMsg(fd_request)))
+        return p50_transfer_error(2);
+    P50CacheControlIdentity control_identity;
+    const int control_fd = local_daemon.receive_p50_cache_fd_reply(
+        fd_request, control_identity, deadline);
+    if (control_fd < 0 || !control_identity.valid()) {
+        if (control_fd >= 0)
+            ::close(control_fd);
+        return p50_transfer_error(3);
+    }
+
+    const int source_dup = ::fcntl(source.get(), F_DUPFD_CLOEXEC, 0);
+    if (source_dup < 0) {
+        ::close(control_fd);
+        return p50_transfer_error(4);
+    }
+
+    P50SourceTransferRequest request;
+    request.wire_job_id = assignment.job_id;
+    request.assignment_epoch = assignment.assignmentEpoch();
+    request.assignment_nonce = assignment.assignmentNonce();
+    request.selected_f_host = assignment.hostname;
+    request.selected_f_ordinary_port = assignment.port;
+    request.selected_f_cache_port = assignment.cache_endpoint_port;
+    request.cache_protocol = assignment.cache_protocol;
+    request.cache_profile = fd_request.profile;
+    request.logical_job = job.jobID();
+    request.compiler_attempt = job.assignmentNonce();
+    request.source_request_id = assignment.assignmentNonce();
+    request.source_mode = p50_source_mode_wire(profile);
+    if (!request.valid()) {
+        ::close(source_dup);
+        ::close(control_fd);
+        return p50_transfer_error(5);
+    }
+
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto absolute_deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+        deadline, clock.clock_domain_id, clock.time_namespace_id);
+    const Identity identity{control_identity.generation, control_identity.attempt};
+    const ControlOperation operation = make_source_transfer_operation(
+        identity, request, absolute_deadline);
+    CredentialExpectation credentials;
+    credentials.uid = ::geteuid();
+    credentials.gid = ::getegid();
+
+    DaemonControlOperation control;
+    const DaemonControlStatus started = control.begin_authenticated(
+        control_fd, operation, source_dup, credentials, identity, deadline,
+        DaemonControlLimits{}, DaemonControlFdOwnership::Owned);
+    if (started != DaemonControlStatus::InProgress) {
+        // begin_authenticated() does not own transfer_fd on argument/setup
+        // rejection; retain explicit ownership on every failure edge.
+        ::close(source_dup);
+        return p50_transfer_error(6);
+    }
+
+    while (!control.done()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            (void)control.advance(now, 0);
+            break;
+        }
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - now);
+        const int timeout = static_cast<int>(std::max<int64_t>(1,
+            std::min<int64_t>(remaining.count(), INT_MAX)));
+        pollfd descriptor{control.native_handle(), control.desired_events(), 0};
+        const int ready = ::poll(&descriptor, 1, timeout);
+        if (ready < 0 && errno == EINTR)
+            continue;
+        if (ready < 0) {
+            (void)control.advance(std::chrono::steady_clock::now(), POLLERR);
+            break;
+        }
+        (void)control.advance(std::chrono::steady_clock::now(),
+                              ready == 0 ? short{0} : descriptor.revents);
+    }
+    if (control.status() != DaemonControlStatus::Complete ||
+        !control.source_transfer_result().has_value())
+        return p50_transfer_error(7);
+    return *control.source_transfer_result();
 }
 
 }
@@ -859,24 +839,17 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                     return cpp_status;
                 }
 
-                const P50ClientTransferContext transfer_context =
-                    begin_p50_client_transfer(job);
-                const icecc::p50::CStoreGuid c_store_guid =
-                    transfer_context.c_store_guid;
-                const icecc::p50::ZstdSourceTransferResult transfer =
-                    transfer_p50_source(job, *usecs, transfer_context,
+                const icecc::p50::local::P50SourceTransferResult transfer =
+                    transfer_p50_source(job, *usecs, *local_daemon,
                                         std::move(source), *p50_profile);
                 const std::optional<CompileInputIdentity> identity =
-                    icecc::p50::bind_compile_input(job, c_store_guid, transfer);
+                    icecc::p50::bind_compile_input(job, *p50_profile, transfer);
                 if (!identity.has_value()) {
                     log_warning() << p50_profile_name
                                   << " cache source transfer failed closed (status "
-                                  << static_cast<unsigned>(transfer.status)
+                                  << static_cast<unsigned>(transfer.code)
                                   << ", attempts "
                                   << static_cast<unsigned>(transfer.attempts)
-                                  << (transfer.terminal_error.has_value()
-                                      ? ", terminal=" + transfer.terminal_error->detail
-                                      : std::string{})
                                   << ")" << endl;
                     throw remote_error(
                         106,
