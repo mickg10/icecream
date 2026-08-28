@@ -48,6 +48,7 @@ public:
         begin_ = value;
         dict_bytes_ = body_bytes_ = 0;
         remaining_.clear();
+        requested_keys_.clear();
         need_sent_ = false;
         state_ = State::ReceivingBody;
     }
@@ -79,11 +80,18 @@ public:
             return {};
         if (!need_sent_) {
             const Need need = store_.need(*session_);
+            requested_keys_ = need.missing;
             remaining_.insert(need.missing.begin(), need.missing.end());
+            // Line objects are deliberately named in NEED for exact residual
+            // ownership, but their bytes are supplied by BODY.  Track only
+            // structure here so BODY can close the dialogue without a second
+            // literal transport.
+            for (Key64 key : need.missing)
+                if (key.type() == ObjectType::Line)
+                    remaining_.erase(key);
             need_sent_ = true;
         }
-        const std::vector<Key64> keys(remaining_.begin(), remaining_.end());
-        return encode_need_messages(keys, max_payload);
+        return encode_need_messages(requested_keys_, max_payload);
     }
 
     void receive_need(const NeedMessage&) { fail("P29 F received an unexpected NEED"); }
@@ -162,6 +170,7 @@ private:
         }
         begin_ = {};
         remaining_.clear();
+        requested_keys_.clear();
         dict_bytes_ = body_bytes_ = 0;
         need_sent_ = false;
     }
@@ -172,6 +181,7 @@ private:
     std::optional<SessionHandle> session_;
     TxBegin begin_{};
     std::set<Key64> remaining_;
+    std::vector<Key64> requested_keys_;
     size_t dict_bytes_ = 0;
     size_t body_bytes_ = 0;
     bool need_sent_ = false;

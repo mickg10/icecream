@@ -1030,8 +1030,12 @@ PreparedTuHandle P50PreparationAuthority::prepare(PrepareRequestKey request,
             p29_active_started = true;
             std::vector<FillRecord> fills;
             fills.reserve(active.manifest.size());
-            for (Key64 key : active.manifest)
+            for (Key64 key : active.manifest) {
+                if (active.begin.body.encoding == kP29ResidualBodyEncoding &&
+                    key.type() == ObjectType::Line)
+                    continue;
                 fills.push_back(impl_->p29_authority->arena().object(key).fill_record());
+            }
             prepared = std::make_shared<const PreparedInputEnvelope>(
                 PreparedInputEnvelope{active.begin, active.dict, active.body,
                                       std::move(fills)});
@@ -2979,6 +2983,12 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
             std::vector<FillRecord> selected;
             selected.reserve(need_decoder.keys().size());
             for (Key64 key : need_decoder.keys()) {
+                // A residual P29 BODY is authoritative for Line bytes.  Those
+                // keys remain in NEED so F can validate the residual's exact
+                // ownership, but must not be repeated through FILL.
+                if (impl_->active->begin.body.encoding == kP29ResidualBodyEncoding &&
+                    key.type() == ObjectType::Line)
+                    continue;
                 const auto position = available.find(key);
                 if (position == available.end())
                     throw std::logic_error("P29 Need requested an unprepared object");

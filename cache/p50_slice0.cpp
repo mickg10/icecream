@@ -1391,6 +1391,11 @@ void FStore::append_component(SessionHandle session, bool dict,
             root_bytes = composite.root;
             pending.residual = composite.residual;
             pending.residual_lines = composite.lines;
+            // BODY is authoritative for residual Line bytes.  Remove those
+            // keys from the pending FILL remainder while retaining them in
+            // `requested` for the exact residual ownership check below.
+            for (const P29ResidualLine& line : pending.residual_lines)
+                pending.remaining.erase(line.key);
         } else {
             root_bytes = target;
         }

@@ -553,6 +553,71 @@ void test_zstd_route_authority_bounded_history() {
     }
 }
 
+void test_p29_endpoint_route_dialogue_lifetime() {
+    const P5coStoreGuids guids = p5co_store_guids(227);
+    EndpointCaps caps;
+    caps.profile = ProfileId::P29;
+    caps.zstd.max_raw_bytes = 1U << 20;
+    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    P50ServerEndpoint server(guids.f, caps);
+    TestClient client(guids.c, caps);
+    const std::vector<uint8_t> repeated = bytes(
+        "same-line\nsame-line\nsame-line\nsame-line\ntail\n");
+
+    const PreparedTuHandle first_prepared = admit(client, repeated);
+    const PairResult first = run_pair(client, server, first_prepared);
+    require(first.client.status == ClientRunStatus::Committed &&
+                first.server.status == ServerRunStatus::Completed &&
+                copy_input(server, guids.c) == repeated &&
+                client.endpoint.next_rel_seq().value == 1,
+            "P29 endpoint first TU did not commit exact route state");
+
+    // This second TU is prepared by the same C authority and sent to the
+    // same F namespace.  A fresh F dialogue would lose the committed route
+    // matcher and fail the route-history body/Need exchange.
+    const PreparedTuHandle second_prepared = admit(client, repeated);
+    const PairResult second = run_pair(client, server, second_prepared);
+    require(second.client.status == ClientRunStatus::Committed &&
+                second.server.status == ServerRunStatus::Completed &&
+                copy_input(server, guids.c) == repeated &&
+                client.endpoint.next_rel_seq().value == 2,
+            "P29 endpoint same-route TU2 did not observe committed TU1 state");
+
+    // A different C namespace must receive an independent P29 dialogue and
+    // cannot inherit the first route's matcher/history.
+    TestClient different(p5co_store_guids(228).c, caps);
+    const PairResult isolated = run_pair(different, server, admit(different, repeated));
+    require(isolated.client.status == ClientRunStatus::Committed &&
+                isolated.server.status == ServerRunStatus::Completed &&
+                copy_input(server, different.c_store_guid()) == repeated &&
+                different.endpoint.next_rel_seq().value == 1,
+            "P29 endpoint different route reused same-route dialogue state");
+
+    const PreparedTuHandle failed_prepared = admit(client, bytes("retry-p29\nretry-p29\n"));
+    EndpointIoControl disconnect;
+    disconnect.close_before_write = MessageType::BODY;
+    const PairResult failed = run_pair(client, server, failed_prepared, disconnect);
+    require(failed.client.status == ClientRunStatus::Disconnected &&
+                failed.server.status == ServerRunStatus::Disconnected &&
+                client.has_active_transaction() && client.endpoint.next_rel_seq().value == 2,
+            "P29 endpoint abort advanced the committed route cursor");
+    const PairResult retried = run_pair(client, server, failed_prepared);
+    require(retried.client.status == ClientRunStatus::Committed &&
+                retried.server.status == ServerRunStatus::Completed &&
+                client.endpoint.next_rel_seq().value == 3,
+            "P29 endpoint retry did not discard tentative dialogue state");
+
+    const FStoreGuid replacement = FStoreGuid::from_u64(UINT64_C(0x5032395253455431));
+    const std::vector<uint8_t> after_reset_input = bytes("after-p29-reset\n");
+    server.reset_store(replacement);
+    const PairResult after_reset = run_pair(client, server, admit(client, after_reset_input));
+    require(after_reset.client.status == ClientRunStatus::Committed &&
+                after_reset.server.status == ServerRunStatus::Completed &&
+                copy_input(server, guids.c) == after_reset_input &&
+                client.endpoint.next_rel_seq().value == 1,
+            "P29 endpoint reset did not clear the old F route namespace");
+}
+
 void test_s3_resource_storm_product_path() {
     const char* requested = std::getenv("ICECC_P50_S3_RESOURCE_STORM");
     const bool storm_only = requested != nullptr &&
@@ -5786,6 +5851,11 @@ int main(int argc, char** argv) {
         std::cout << "p50_endpoint_test: focused P5CO PASS\n";
         return 0;
     }
+    if (std::getenv("ICECC_P50_P29_DIALOGUE_FOCUS") != nullptr) {
+        test_p29_endpoint_route_dialogue_lifetime();
+        std::cout << "p50_endpoint_test: focused P29 dialogue PASS\n";
+        return 0;
+    }
     test_normal_zero_and_completion_stamps();
     test_completion_stamp_correspondence();
     test_completion_live_identity_correspondence();
@@ -5824,6 +5894,7 @@ int main(int argc, char** argv) {
     test_two_client_one_server_isolation();
     test_zstd_route_endpoint_continuation_and_retry();
     test_zstd_route_authority_bounded_history();
+    test_p29_endpoint_route_dialogue_lifetime();
     test_live_global_resource_trace();
     if (s3_resource_storm_requested())
         test_s3_resource_storm_product_path();
