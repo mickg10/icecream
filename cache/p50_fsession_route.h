@@ -161,10 +161,14 @@ private:
     uint64_t generation_ = 1;
     uint64_t next_admission_sequence_ = 1;
     std::optional<FSessionOperationIdentity> live_operation_;
-    // Sequential-ABA fence: a settled/resolved operation is terminal for this
-    // route; its exact identity can never re-reserve (a consumed rendezvous
-    // never reopens). A legitimate next TU is a NEW operation identity.
-    std::optional<FSessionOperationIdentity> retired_operation_;
+    // Sequential-ABA fence with PROVEN non-revival depth: retired operations
+    // are fenced by a monotonic same-launch frontier (allocators mint
+    // operation sequences monotonically per sidecar launch), so EVERY earlier
+    // operation of the current launch is inadmissible -- not merely the most
+    // recent one (root probe control 7). A launch rotation starts a fresh
+    // frontier.
+    daemon::P50WireLaunchIdentity retired_launch_{};
+    uint64_t retired_frontier_sequence_ = 0;
     RoutePredecessor cursor_{}; // tagged-cold initially; committed successor after
 };
 

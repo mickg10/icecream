@@ -104,9 +104,11 @@ bool FSessionServiceOwner::drain_outbound(uint64_t connection_id,
         return false;
     size_t budget = max_bytes;
     FSessionOutboundControl& out = slot->op->outbound();
-    // Walk slots in sequence order; write Queued/Writing frames until the
-    // quantum is exhausted or the transport would block.
-    for (uint64_t seq = 1; budget > 0 && seq <= 1024; ++seq) {
+    // Drain the ACTUAL pending sequences in order -- never a fixed numeric
+    // range (a queued frame at any sequence must make progress).
+    for (uint64_t seq : out.pending_sequences()) {
+        if (budget == 0)
+            break;
         const OutboundSemanticSlot* frame = out.find(seq);
         if (frame == nullptr)
             continue;
@@ -140,14 +142,7 @@ bool FSessionServiceOwner::has_pending_outbound(uint64_t connection_id) {
     Slot* slot = find(connection_id);
     if (slot == nullptr)
         return false;
-    FSessionOutboundControl& out = slot->op->outbound();
-    for (uint64_t seq = 1; seq <= 1024; ++seq) {
-        const OutboundSemanticSlot* frame = out.find(seq);
-        if (frame != nullptr && (frame->state == OutboundSlotState::Queued ||
-                                 frame->state == OutboundSlotState::Writing))
-            return true;
-    }
-    return false;
+    return !slot->op->outbound().pending_sequences().empty();
 }
 
 SidecarFSessionOperation*

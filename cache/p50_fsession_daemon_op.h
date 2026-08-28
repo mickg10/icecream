@@ -167,6 +167,9 @@ public:
 
 private:
     DaemonFSessionOperation() = default;
+    [[nodiscard]] bool
+    retiredish_replay_probe(const FSessionControlEnvelope& envelope,
+                            std::span<const uint8_t> bytes) const;
 
     FSessionOperationIdentity identity_{};
     DaemonWaitLease lease_;

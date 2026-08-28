@@ -200,6 +200,11 @@ struct OutboundSemanticSlot {
     uint16_t message_type = 0;     // exact legal message type / phase
     std::vector<uint8_t> canonical_bytes; // the one canonical encoded frame
     std::vector<uint8_t> semantic_payload; // payload identity for dup detection
+    // Duplicate binding is exact identity+direction+type+semantic body: a
+    // frame for a different operation identity or direction is NEVER the same
+    // semantic transition (root probe control 1/2).
+    FSessionOperationIdentity identity{};
+    FSessionControlDirection direction = FSessionControlDirection::DaemonToSidecar;
     OutboundSlotState state = OutboundSlotState::Empty;
     size_t write_offset = 0;       // for Writing
 
@@ -263,6 +268,9 @@ public:
     }
     // Terminal retirement. Object storage may be reused only by minting a fresh
     // identity/connection-generation (a new object), never by clearing this one.
+    // A retired acceptor still answers ExactReplay for byte-identical retained
+    // frames (the peer's lost-ACK replay must find the tombstone; root probe
+    // control 6); everything else is stale.
     void retire() noexcept { retired_ = true; }
 
 private:
@@ -321,6 +329,10 @@ public:
     [[nodiscard]] bool retire(uint64_t sequence);
 
     [[nodiscard]] size_t live_slots() const noexcept;
+    // Live Queued/Writing sequences in ascending order (bounded by the live
+    // cap). The writer drains THESE, never a fixed numeric range (root probe
+    // control 8).
+    [[nodiscard]] std::vector<uint64_t> pending_sequences() const;
     // Backing storage size (retired slots are reused, so this stays bounded by
     // the live-set cap; exposed for the no-unbounded-log invariant test).
     [[nodiscard]] size_t slot_storage() const noexcept { return slots_.size(); }

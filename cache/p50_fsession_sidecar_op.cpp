@@ -6,10 +6,38 @@ bool SidecarFSessionOperation::deadline_live(int64_t now_ns) const noexcept {
     return identity.deadline.valid() && now_ns < identity.deadline.expires_at_ns;
 }
 
+namespace {
+// Phase-legality table: a direction-legal frame that is illegal in the current
+// sidecar phase must NOT advance the inbound frontier (root probe control 3).
+bool sidecar_phase_legal(SidecarOpPhase phase, uint16_t type) noexcept {
+    switch (static_cast<DaemonToSidecarType>(type)) {
+    case DaemonToSidecarType::OperationOffer:
+        return phase == SidecarOpPhase::AwaitOffer;
+    case DaemonToSidecarType::PublicFdOffer:
+        return phase == SidecarOpPhase::Accepted;
+    case DaemonToSidecarType::OpCancel:
+        return phase != SidecarOpPhase::AwaitOffer &&
+               phase != SidecarOpPhase::Retired;
+    case DaemonToSidecarType::DaemonFdAccepted:
+    case DaemonToSidecarType::DaemonFdRejected:
+        return phase == SidecarOpPhase::Committed ||
+               phase == SidecarOpPhase::CancelledAfterCommit;
+    case DaemonToSidecarType::TerminalAck:
+        return phase == SidecarOpPhase::TerminalStaged;
+    }
+    return false;
+}
+} // namespace
+
 InboundDisposition
 SidecarFSessionOperation::consume_inbound(const FSessionControlEnvelope& e,
                                           std::span<const uint8_t> bytes,
                                           int64_t now_ns) {
+    // Atomic phase gate BEFORE any sequence/frontier advance; an exact replay
+    // of an already-consumed sequence still classifies normally.
+    if (e.sequence >= inbound_.next_expected() &&
+        !sidecar_phase_legal(phase_, e.message_type))
+        return InboundDisposition::PhaseInvalidNoRow;
     const InboundDisposition disposition = inbound_.classify(e, bytes);
     if (disposition != InboundDisposition::AcceptedNew)
         return disposition;

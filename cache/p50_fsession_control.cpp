@@ -214,10 +214,19 @@ decode_fsession_control(std::span<const uint8_t> bytes) {
 InboundDisposition FSessionInboundControl::classify(
     const FSessionControlEnvelope& e, std::span<const uint8_t> bytes) {
     // A retired operation is never revived under the same identity (5444410383
-    // sec.6): storage reuse requires a fresh identity/connection generation,
-    // i.e. a new object -- never clearing this one.
-    if (retired_)
+    // sec.6). A byte-identical replay of a retained frame is still recognized
+    // (zero mutation) so a peer's lost-ACK replay finds the tombstone; any
+    // other frame is stale-only.
+    if (retired_) {
+        if (e.sequence >= 1 && e.sequence <= retained_.size()) {
+            const std::vector<uint8_t>& kept =
+                retained_[static_cast<size_t>(e.sequence - 1)];
+            if (kept.size() == bytes.size() &&
+                std::equal(kept.begin(), kept.end(), bytes.begin()))
+                return InboundDisposition::ExactReplay;
+        }
         return InboundDisposition::StaleWrongIdentity;
+    }
 
     // Direction legality is enforced on EVERY frame, not only at row creation:
     // a wrong-direction envelope is rejected before any sequence/row logic.
@@ -345,6 +354,17 @@ size_t FSessionOutboundControl::live_slots() const noexcept {
     return n;
 }
 
+std::vector<uint64_t> FSessionOutboundControl::pending_sequences() const {
+    std::vector<uint64_t> pending;
+    for (const auto& s : slots_) {
+        if (s.state == OutboundSlotState::Queued ||
+            s.state == OutboundSlotState::Writing)
+            pending.push_back(s.sequence);
+    }
+    std::sort(pending.begin(), pending.end());
+    return pending;
+}
+
 const OutboundSemanticSlot*
 FSessionOutboundControl::find(uint64_t sequence) const noexcept {
     for (const auto& s : slots_)
@@ -421,11 +441,23 @@ FSessionOutboundControl::stage_frame(const FSessionOperationIdentity& identity,
                                      FSessionControlDirection direction,
                                      uint16_t message_type,
                                      std::span<const uint8_t> payload) {
-    // Semantic dup: an existing live frame for the same (type, payload)
-    // transition is THE canonical encoding; reuse its sequence.
+    // Direction legality and identity validity gate EVERY path, including the
+    // duplicate fast path (root probe controls 1/2).
+    if (!identity.valid())
+        return 0;
+    const bool legal =
+        direction == FSessionControlDirection::DaemonToSidecar
+            ? direction_legal_daemon(static_cast<DaemonToSidecarType>(message_type))
+            : (direction == FSessionControlDirection::SidecarToDaemon &&
+               direction_legal_sidecar(
+                   static_cast<SidecarToDaemonType>(message_type)));
+    if (!legal)
+        return 0;
+    // Semantic dup: the same transition is exact identity+direction+type+body.
     for (const auto& s : slots_) {
         if (s.occupied() && s.state != OutboundSlotState::Reserved &&
-            s.message_type == message_type &&
+            s.message_type == message_type && s.direction == direction &&
+            s.identity == identity &&
             s.semantic_payload.size() == payload.size() &&
             std::equal(s.semantic_payload.begin(), s.semantic_payload.end(),
                        payload.begin()))
@@ -448,6 +480,8 @@ FSessionOutboundControl::stage_frame(const FSessionOperationIdentity& identity,
     OutboundSemanticSlot* slot = mutable_find(sequence);
     slot->canonical_bytes = *encoded;
     slot->semantic_payload.assign(payload.begin(), payload.end());
+    slot->identity = identity;
+    slot->direction = direction;
     slot->state = OutboundSlotState::Queued;
     return sequence;
 }

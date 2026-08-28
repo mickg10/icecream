@@ -21,9 +21,12 @@ RouteAdmissionOwner::reserve(const FSessionOperationIdentity& operation,
                       : RouteRefusal::RouteBusy;
         return std::nullopt;
     }
-    // Sequential-ABA fence: a settled/resolved operation is terminal for this
-    // route; its exact identity never re-reserves, even with a matching cursor.
-    if (retired_operation_ && *retired_operation_ == operation) {
+    // Sequential-ABA fence: every settled/resolved operation of the current
+    // sidecar launch is terminal for this route -- any operation at or below
+    // the monotonic retirement frontier never re-reserves, regardless of how
+    // many operations intervened.
+    if (operation.operation.sidecar_launch == retired_launch_ &&
+        operation.operation.operation_sequence <= retired_frontier_sequence_) {
         refusal = RouteRefusal::DuplicateOperation;
         return std::nullopt;
     }
@@ -77,9 +80,17 @@ bool RouteAdmissionOwner::settle_and_release(const RouteSessionLease& lease) {
         return false;
     // Release: the committed successor stays as the route cursor; the owner
     // generation advances so every late event naming the old generation is
-    // stale-only (5443966435 sec.6). The settled operation is retired for this
-    // route (sequential-ABA fence).
-    retired_operation_ = live_operation_;
+    // stale-only (5443966435 sec.6). The settled operation raises the
+    // monotonic retirement frontier (sequential-ABA fence at full depth).
+    if (live_operation_) {
+        if (!(live_operation_->operation.sidecar_launch == retired_launch_))
+            retired_frontier_sequence_ = 0;
+        retired_launch_ = live_operation_->operation.sidecar_launch;
+        if (live_operation_->operation.operation_sequence >
+            retired_frontier_sequence_)
+            retired_frontier_sequence_ =
+                live_operation_->operation.operation_sequence;
+    }
     live_operation_.reset();
     state_ = RouteAdmissionState::Idle;
     ++generation_;
@@ -97,7 +108,15 @@ void RouteAdmissionOwner::resolve_and_release() noexcept {
     if (state_ != RouteAdmissionState::ReconcileRequired &&
         state_ != RouteAdmissionState::ResetRequired)
         return;
-    retired_operation_ = live_operation_;
+    if (live_operation_) {
+        if (!(live_operation_->operation.sidecar_launch == retired_launch_))
+            retired_frontier_sequence_ = 0;
+        retired_launch_ = live_operation_->operation.sidecar_launch;
+        if (live_operation_->operation.operation_sequence >
+            retired_frontier_sequence_)
+            retired_frontier_sequence_ =
+                live_operation_->operation.operation_sequence;
+    }
     live_operation_.reset();
     state_ = RouteAdmissionState::Idle;
     ++generation_;

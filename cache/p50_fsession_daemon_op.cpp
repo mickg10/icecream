@@ -3,6 +3,17 @@
 #include "p50_fsession_payloads.h"
 
 namespace icecc::p50::fsession {
+bool DaemonFSessionOperation::retiredish_replay_probe(
+    const FSessionControlEnvelope& e, std::span<const uint8_t> bytes) const {
+    (void)e;
+    (void)bytes;
+    // Replays are recognized by the acceptor itself; the phase gate only needs
+    // to let already-consumed sequences through. A frame below the frontier is
+    // either an exact replay (acceptor: ExactReplay, zero mutation) or a
+    // conflict (acceptor: DuplicateConflict) -- both safe to classify.
+    return e.sequence < inbound_.next_expected();
+}
+
 std::optional<DaemonFSessionOperation>
 DaemonFSessionOperation::mint(const FSessionOperationIdentity& identity,
                               DaemonWaitLease&& lease,
@@ -49,9 +60,39 @@ DaemonFSessionOperation::mint(const FSessionOperationIdentity& identity,
     return op;
 }
 
+namespace {
+// Phase-legality table: a direction-legal frame that is illegal in the current
+// daemon phase must NOT advance the inbound frontier (root probe control 3).
+bool daemon_phase_legal(DaemonOpPhase phase, uint16_t type) noexcept {
+    switch (static_cast<SidecarToDaemonType>(type)) {
+    case SidecarToDaemonType::OperationAccepted:
+        return phase == DaemonOpPhase::Minted;
+    case SidecarToDaemonType::PublicFdAdoptedReceipt:
+        return phase == DaemonOpPhase::PublicFdOffered;
+    case SidecarToDaemonType::EndpointObservation:
+    case SidecarToDaemonType::InputCommitted:
+    case SidecarToDaemonType::InputAbortedPreDurable:
+    case SidecarToDaemonType::InputCancelledAfterCommit:
+    case SidecarToDaemonType::DeliveryOffer:
+        return phase == DaemonOpPhase::FdAdoptedObserved ||
+               phase == DaemonOpPhase::SourceAccepted ||
+               phase == DaemonOpPhase::CancelRequested;
+    case SidecarToDaemonType::TerminalObservation:
+        return phase != DaemonOpPhase::Retired;
+    }
+    return false;
+}
+} // namespace
+
 InboundDisposition
 DaemonFSessionOperation::consume_inbound(const FSessionControlEnvelope& e,
                                          std::span<const uint8_t> bytes) {
+    // Atomic phase gate BEFORE any sequence/frontier advance: a fresh frame
+    // that is phase-illegal is refused without consuming its sequence (an
+    // exact replay of an already-retained frame still classifies normally).
+    if (!retiredish_replay_probe(e, bytes) &&
+        !daemon_phase_legal(phase_, e.message_type))
+        return InboundDisposition::PhaseInvalidNoRow;
     const InboundDisposition disposition = inbound_.classify(e, bytes);
     if (disposition == InboundDisposition::ExactReplay &&
         e.message_type ==
@@ -80,22 +121,29 @@ DaemonFSessionOperation::consume_inbound(const FSessionControlEnvelope& e,
         const auto observation = decode_TerminalObservation(e);
         if (!observation.has_value())
             break;
-        // Settle at most once; retain the tombstone; stage the one exact
-        // TerminalAck naming the retained observation sequence.
+        // Settle at most once. Response capacity is part of the transition's
+        // authority: the exact TerminalAck is staged FIRST, and only a
+        // successful stage permits the settlement transition (root probe
+        // control 4; 5444539259 sec.3).
         if (phase_ != DaemonOpPhase::Settled && phase_ != DaemonOpPhase::Retired) {
-            ++settlement_count_;
-            phase_ = DaemonOpPhase::Settled;
             TerminalAckPayload ack;
             ack.identity = identity_;
             ack.ack_of_sidecar_sequence = e.sequence;
             ack.terminal_class_echo = observation->terminal_class;
             ack.settlement_id = e.sequence; // daemon settlement/tombstone id
             const auto body = encode_TerminalAck(ack);
-            if (body.has_value())
-                terminal_ack_seq_ = outbound_.stage_frame(
-                    identity_, FSessionControlDirection::DaemonToSidecar,
-                    static_cast<uint16_t>(DaemonToSidecarType::TerminalAck),
-                    *body);
+            const uint64_t staged =
+                body.has_value()
+                    ? outbound_.stage_frame(
+                          identity_, FSessionControlDirection::DaemonToSidecar,
+                          static_cast<uint16_t>(DaemonToSidecarType::TerminalAck),
+                          *body)
+                    : 0;
+            if (staged == 0)
+                break; // no capacity: no settlement; the peer replays later
+            terminal_ack_seq_ = staged;
+            ++settlement_count_;
+            phase_ = DaemonOpPhase::Settled;
         }
         break;
     }
@@ -150,25 +198,30 @@ DaemonFSessionOperation::accept_delivery(uint64_t delivery_id,
     if (phase_ != DaemonOpPhase::FdAdoptedObserved || !descriptor_valid)
         return std::nullopt;
 
+    // Response capacity is reserved BEFORE the irreversible acceptance: the
+    // DaemonFdAccepted frame must stage or no ledger/TOCOMPILE transition
+    // occurs (root probe control 5; 5444539259 sec.3).
     InputFdAcceptanceReceipt receipt;
-    receipt.receipt_id = next_receipt_id_++;
+    receipt.receipt_id = next_receipt_id_;
     receipt.delivery_id = delivery_id;
     receipt.operation_sequence = identity_.operation.operation_sequence;
-    acceptance_ledger_.push_back(receipt);
-    ++tocompile_transitions_; // exactly one WAITP50INPUT -> TOCOMPILE
-    phase_ = DaemonOpPhase::SourceAccepted;
     DaemonFdAcceptedPayload accepted;
     accepted.identity = identity_;
     accepted.attachment_delivery_id = delivery_id;
     accepted.acceptance_receipt_id = receipt.receipt_id;
     accepted.replay = 0;
     const auto body = encode_DaemonFdAccepted(accepted);
-    if (body.has_value()) {
-        (void)outbound_.stage_frame(
-            identity_, FSessionControlDirection::DaemonToSidecar,
-            static_cast<uint16_t>(DaemonToSidecarType::DaemonFdAccepted),
-            *body);
-    }
+    if (!body.has_value())
+        return std::nullopt;
+    const uint64_t staged = outbound_.stage_frame(
+        identity_, FSessionControlDirection::DaemonToSidecar,
+        static_cast<uint16_t>(DaemonToSidecarType::DaemonFdAccepted), *body);
+    if (staged == 0)
+        return std::nullopt; // no capacity: refuse; the delivery retries
+    ++next_receipt_id_;
+    acceptance_ledger_.push_back(receipt);
+    ++tocompile_transitions_; // exactly one WAITP50INPUT -> TOCOMPILE
+    phase_ = DaemonOpPhase::SourceAccepted;
     return DeliveryAcceptance{receipt, /*replay=*/false};
 }
 
