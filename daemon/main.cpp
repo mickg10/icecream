@@ -7369,16 +7369,44 @@ void Daemon::handle_old_request()
             received_environments[envforjob].last_use = time(nullptr);
             const int compiler_input_fd = client->p50_input_fd;
             client->p50_input_fd = -1;
-            /* The completed ControlOperation is owned by the cache adapter
-               and is not retained in Client.  If a future positive bridge
-               stores one here, it MUST erase it before this TOCOMPILE/fork
-               edge.  That bridge is intentionally HOLD.  Until the delivery
-               owner mints a ForkSourceLease, a P50 raw candidate fails closed
-               at the child hygiene seam; no numeric request_id is authority. */
+            std::optional<icecc::p50::forkfd::ForkSourceLease>
+                compiler_input_source;
+            if (job->usesP50Input() && compiler_input_fd >= 0 &&
+                client->p50_input_lease.has_value()) {
+                const auto& attachment = *client->p50_input_lease;
+                const auto& input = job->compileInputIdentity();
+                const icecc::p50::InputRecordKey expected_key{
+                    icecc::p50::CStoreGuid{input.c_store_guid},
+                    icecc::p50::TuSeq{input.tu_seq}};
+                const icecc::p50::InputLeaseOwner expected_owner{
+                    job->jobID(), job->assignmentEpoch(), job->assignmentNonce()};
+                const bool attachment_matches =
+                    attachment.key == expected_key &&
+                    attachment.owner == expected_owner &&
+                    attachment.request_id == input.request_id;
+                if (attachment_matches) {
+                    compiler_input_source =
+                        icecc::p50::forkfd::mint_attached_input_source(
+                            compiler_input_fd, attachment.request_id);
+                } else {
+                    log_warning() << "P50 compiler attachment binding mismatch for job "
+                                  << job->jobID() << " request "
+                                  << attachment.request_id << "/"
+                                  << input.request_id << endl;
+                }
+            }
+            if (job->usesP50Input() && !compiler_input_source.has_value()) {
+                log_warning() << "P50 attached input failed compiler-fork validation for job "
+                              << job->jobID() << endl;
+                if (compiler_input_fd >= 0)
+                    (void)::close(compiler_input_fd);
+                handle_end(client, 146);
+                continue;
+            }
             pid = handle_connection(envbasedir, job, client->channel, sock,
                                     mem_limit, user_uid, user_gid,
                                     compiler_input_fd,
-                                    std::nullopt);
+                                    std::move(compiler_input_source));
             trace() << "handle connection returned " << pid << endl;
 
             if (pid > 0) {
@@ -9545,6 +9573,14 @@ void Daemon::answer_client_requests()
                                 return;
                             }
                             if (!alive)
+                                break;
+                            // CACHE_SESSION can transfer the channel fd while
+                            // intentionally retaining this WAIT owner outside
+                            // fd2client for the later ordinary CompileFile.
+                            // Do not start a second read on the now-detached
+                            // MsgChannel; that would turn its expected fd=-1
+                            // state into a malformed-frame teardown.
+                            if (client->p50_cache_session_detached || c->fd < 0)
                                 break;
                             if (client->status != Client::WAITP50INPUT)
                                 break;

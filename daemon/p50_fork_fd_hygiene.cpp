@@ -185,7 +185,6 @@ bool retire_owned_proof(int* proof_fd, int* control_fd,
     return proved && proof_closed && control_closed;
 }
 
-#if defined(ICECC_P50_FORK_FD_HYGIENE_TEST_HOOKS)
 int duplicate_owner_fd(int fd) noexcept {
 #if defined(F_DUPFD_CLOEXEC)
     const int duplicate = ::fcntl(fd, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
@@ -203,8 +202,8 @@ int duplicate_owner_fd(int fd) noexcept {
 #endif
     return duplicate;
 }
-#endif
 
+constexpr uint64_t kAttachmentOwnerCookie = UINT64_C(0x4f7c21b85da693e1);
 #if defined(ICECC_P50_FORK_FD_HYGIENE_TEST_HOOKS)
 constexpr uint64_t kTestOwnerCookie = UINT64_C(0x9d5f31a7c2e84b61);
 #endif
@@ -348,11 +347,35 @@ ForkSourceLease::~ForkSourceLease() {
 }
 
 bool ForkSourceLease::retire_identity_proof() noexcept {
+    if (owner_cookie_ == kAttachmentOwnerCookie) {
+        const int proof = owned_proof_fd_;
+        const int control = control_fd_;
+        const bool distinct = proof >= 0 && control >= 0 && proof != control &&
+                              proof != borrowed_handoff_fd_ &&
+                              control != borrowed_handoff_fd_;
+        const bool proof_closed = proof >= 0 && close_exact(proof);
+        if (proof_closed)
+            owned_proof_fd_ = -1;
+        const bool control_closed = control >= 0 && close_exact(control);
+        if (control_closed)
+            control_fd_ = -1;
+        return distinct && proof_closed && control_closed;
+    }
     return retire_owned_proof(&owned_proof_fd_, &control_fd_, identity_);
 }
 
 bool ForkSourceLease::identity_matches_current() const noexcept {
-    return valid() && same_open_file_description(owned_proof_fd_, control_fd_) &&
+    if (!valid())
+        return false;
+    if (owner_cookie_ == kAttachmentOwnerCookie) {
+        return owned_proof_fd_ != control_fd_ &&
+               owned_proof_fd_ != borrowed_handoff_fd_ &&
+               control_fd_ != borrowed_handoff_fd_ &&
+               source_identity_matches(owned_proof_fd_, identity_) &&
+               source_identity_matches(control_fd_, identity_) &&
+               source_identity_matches(borrowed_handoff_fd_, identity_);
+    }
+    return same_open_file_description(owned_proof_fd_, control_fd_) &&
            source_identity_matches(owned_proof_fd_, identity_) &&
            source_identity_matches(borrowed_handoff_fd_, identity_);
 }
@@ -396,6 +419,37 @@ mint_fork_source_lease(DeliveryOwnerToken&& owner, int fd,
     owner.identity_ = SourceIdentity{};
     owner.owner_cookie_ = 0;
     return result;
+}
+
+std::optional<ForkSourceLease>
+mint_attached_input_source(int fd, uint64_t request_id) noexcept {
+    if (fd < 0 || request_id == 0)
+        return std::nullopt;
+
+    SourceIdentity identity;
+    if (!capture_source_identity(fd, &identity))
+        return std::nullopt;
+    // The accepted attachment already established the descriptor owner.
+    // Keep two private duplicates so the child can re-check the same sealed
+    // snapshot without depending on kcmp, which is unavailable after the
+    // daemon drops privileges on common production kernels.
+    const int proof_fd = duplicate_owner_fd(fd);
+    const int control_fd = proof_fd >= 0 ? duplicate_owner_fd(fd) : -1;
+    const bool valid = proof_fd >= 0 && control_fd >= 0 &&
+                       proof_fd != fd && control_fd != fd &&
+                       proof_fd != control_fd &&
+                       source_identity_matches(proof_fd, identity) &&
+                       source_identity_matches(control_fd, identity) &&
+                       source_identity_matches(fd, identity);
+    if (!valid) {
+        if (proof_fd >= 0)
+            (void)::close(proof_fd);
+        if (control_fd >= 0)
+            (void)::close(control_fd);
+        return std::nullopt;
+    }
+    return ForkSourceLease(fd, request_id, fd, request_id, proof_fd,
+                           control_fd, identity, kAttachmentOwnerCookie);
 }
 
 namespace {

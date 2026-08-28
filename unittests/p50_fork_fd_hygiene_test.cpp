@@ -219,6 +219,11 @@ void test_exact_two_and_source_omission() {
 
 void test_validation() {
     Inventory inventory = make_inventory(true);
+    auto attached = icecc::p50::forkfd::mint_attached_input_source(
+        inventory.source, kAcceptedDeliveryId);
+    require(attached.has_value(),
+            "accepted attachment did not mint a production source lease");
+    attached.reset();
     KeepSet duplicate{inventory.stat_write, inventory.stat_write, std::nullopt,
                       false, std::nullopt};
     require(icecc::p50::forkfd::sweep(duplicate).failure == Failure::InvalidKeepSet,

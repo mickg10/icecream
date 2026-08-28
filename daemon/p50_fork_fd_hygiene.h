@@ -77,7 +77,6 @@ private:
     friend std::optional<ForkSourceLease>
     mint_fork_source_lease(DeliveryOwnerToken&& owner, int fd,
                            uint64_t delivery_id) noexcept;
-
     void disarm_rejected_alias(int handoff_fd) noexcept;
 };
 
@@ -137,17 +136,23 @@ private:
     friend std::optional<ForkSourceLease>
     mint_fork_source_lease(DeliveryOwnerToken&& owner, int fd,
                            uint64_t delivery_id) noexcept;
+    friend std::optional<ForkSourceLease>
+    mint_attached_input_source(int fd, uint64_t request_id) noexcept;
     friend Result sweep(KeepSet& keep) noexcept;
     friend int test_fork_source_lease_proof_fd(const ForkSourceLease&) noexcept;
 };
 
-// The only public construction seam is deliberately fed by an opaque token
-// minted by the delivery owner.  No production minting implementation exists
-// in this bounded slice; the daemon therefore fails closed until its owner
-// bridge supplies one.
+// Compatibility entry for callers which already retain the older delivery
+// token shape.
 [[nodiscard]] std::optional<ForkSourceLease>
 mint_fork_source_lease(DeliveryOwnerToken&& owner, int fd,
                        uint64_t delivery_id) noexcept;
+
+// Production entry from an already accepted InputFdAttachment. The caller
+// supplies that attachment's exact request id; this function verifies the
+// read-only sealed descriptor and prepares it for the first-fork keep set.
+[[nodiscard]] std::optional<ForkSourceLease>
+mint_attached_input_source(int fd, uint64_t request_id) noexcept;
 
 struct KeepSet {
     int stat_pipe_fd = -1;
