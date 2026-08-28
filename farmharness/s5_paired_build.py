@@ -490,7 +490,7 @@ def _manifest_remote_script(source_archive_b64: str, tus: list[dict[str, Any]], 
                             "grep -E 'RELOGIN s4-f.*cache=.*cache_profiles=[^ ]+'", 1)
     if mode == "legacy":
         strict_scheduler = ('case "$CELL" in\n'
-                            '  s50-c50-f50|s50-c50-f50-c1f2) S_EXTRA="--assignment-fence-mode strict-nonce";;\n'
+                            '  s50-c50-f50|s50-c50-f50-c1f2|s50-c50-f50-c1f4) S_EXTRA="--assignment-fence-mode strict-nonce";;\n'
                             'esac')
         if strict_scheduler not in script:
             raise RuntimeError("S4 strict scheduler seam changed")

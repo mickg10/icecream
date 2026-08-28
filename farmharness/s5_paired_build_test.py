@@ -79,7 +79,7 @@ class PairedRunnerTest(unittest.TestCase):
         self.assertIn("S5_MEASURE_END_NS=$(date +%s%N)\ng++ -O3", cache)
         # The marker is emitted by each S4 result cell; all lifecycle result
         # cells carry the same aggregate timing boundary.
-        self.assertEqual(cache.count('echo "S5_MEASURE_START_NS='), 3)
+        self.assertEqual(cache.count('echo "S5_MEASURE_START_NS='), 4)
 
     def test_manifest_deduplicates_same_translation_unit(self):
         with tempfile.TemporaryDirectory() as directory:
