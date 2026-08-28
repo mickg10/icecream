@@ -29,6 +29,7 @@
 #define ICECC_CACHE_P50_FSESSION_DAEMON_OP_H
 
 #include "p50_fsession_control.h"
+#include "p50_fsession_payloads.h"
 
 #include <optional>
 #include <vector>
@@ -115,8 +116,12 @@ public:
     // Create the operation by consuming the wait lease (moved only on
     // success). Returns nullopt if the lease or identity is invalid or the
     // lease facts disagree with the identity's assignment binding.
+    // predecessor: the route cursor this operation presents at admission
+    // (tagged cold for a fresh route; the exact committed successor for a
+    // next-TU operation). Carried in the real OperationOffer payload.
     [[nodiscard]] static std::optional<DaemonFSessionOperation>
     mint(const FSessionOperationIdentity& identity, DaemonWaitLease&& lease,
+         const RoutePredecessor& predecessor = RoutePredecessor{},
          size_t outbound_slots = 16);
 
     [[nodiscard]] DaemonOpPhase phase() const noexcept { return phase_; }
@@ -131,9 +136,10 @@ public:
                                        std::span<const uint8_t> bytes);
 
     // The public socket transfer is about to be attempted (or retried). Mints
-    // the one PublicFdOfferId on first call; every retry reuses it. Only legal
-    // from AcceptedByPeer or an earlier failed attempt of the same offer.
-    [[nodiscard]] uint64_t offer_public_fd();
+    // the one PublicFdOfferId on first call; every retry reuses it but mints a
+    // FRESH AncillaryAttemptId (5448067827 sec.4). socket_cookie identifies
+    // the offered kernel socket. Only legal from AcceptedByPeer onward.
+    [[nodiscard]] uint64_t offer_public_fd(uint64_t socket_cookie);
 
     // A delivery arrived (identified by AttachmentDeliveryId; descriptor
     // validation injected by the wiring). Mints the InputFdAcceptanceReceipt
@@ -142,9 +148,10 @@ public:
     [[nodiscard]] std::optional<DeliveryAcceptance>
     accept_delivery(uint64_t delivery_id, bool descriptor_valid);
 
-    // Daemon-side cancellation decision: stages OpCancel (no socket mutation
-    // here; owner-linearized execution is the sidecar's, 5444264451).
-    [[nodiscard]] uint64_t request_cancel();
+    // Daemon-side cancellation decision: stages the real OpCancel payload with
+    // a minted cancellation-observation identity (no socket mutation here;
+    // owner-linearized execution is the sidecar's, 5444264451).
+    [[nodiscard]] uint64_t request_cancel(uint16_t reason = 1);
 
     // Control loss after transfer may have occurred: typed reconciliation, no
     // WAIT rollback, no second claim.
@@ -166,7 +173,10 @@ private:
     DaemonOpPhase phase_ = DaemonOpPhase::Minted;
     FSessionInboundControl inbound_;
     FSessionOutboundControl outbound_{16};
+    RoutePredecessor predecessor_{};
     uint64_t public_fd_offer_id_ = 0;
+    uint64_t next_ancillary_attempt_ = 1;
+    uint64_t next_cancellation_observation_ = 1;
     std::vector<InputFdAcceptanceReceipt> acceptance_ledger_;
     uint64_t next_receipt_id_ = 1;
     uint64_t settlement_count_ = 0;

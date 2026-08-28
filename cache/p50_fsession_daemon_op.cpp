@@ -3,19 +3,11 @@
 #include "p50_fsession_payloads.h"
 
 namespace icecc::p50::fsession {
-namespace {
-
-std::vector<uint8_t> placeholder_payload(uint8_t tag) {
-    // Exact frame bodies are encoded by the production wiring; the reducer
-    // stages typed frames so the slot/flush/replay law is exercised end to end.
-    return {tag};
-}
-
-} // namespace
-
 std::optional<DaemonFSessionOperation>
 DaemonFSessionOperation::mint(const FSessionOperationIdentity& identity,
-                              DaemonWaitLease&& lease, size_t outbound_slots) {
+                              DaemonWaitLease&& lease,
+                              const RoutePredecessor& predecessor,
+                              size_t outbound_slots) {
     if (!identity.valid() || !lease.valid())
         return std::nullopt;
     // The operation identity's assignment binding must be the lease's exact
@@ -28,15 +20,29 @@ DaemonFSessionOperation::mint(const FSessionOperationIdentity& identity,
         !(identity.deadline == facts.deadline))
         return std::nullopt;
 
+    if (!predecessor.valid())
+        return std::nullopt;
     DaemonFSessionOperation op;
     op.identity_ = identity;
     op.lease_ = std::move(lease);
+    op.predecessor_ = predecessor;
     op.inbound_ = FSessionInboundControl::daemon_bound(identity);
     op.outbound_ = FSessionOutboundControl(outbound_slots);
+    OperationOfferPayload offer;
+    offer.identity = identity;
+    offer.client_connection_generation =
+        op.lease_.facts().client_connection_generation;
+    offer.compile_file_lease = op.lease_.facts().compile_file_lease;
+    offer.wait_reservation = op.lease_.facts().wait_reservation;
+    offer.consumed_claim_capability =
+        op.lease_.facts().consumed_claim_capability;
+    offer.predecessor = predecessor;
+    const auto body = encode_OperationOffer(offer);
+    if (!body.has_value())
+        return std::nullopt;
     const uint64_t seq = op.outbound_.stage_frame(
         identity, FSessionControlDirection::DaemonToSidecar,
-        static_cast<uint16_t>(DaemonToSidecarType::OperationOffer),
-        placeholder_payload(1));
+        static_cast<uint16_t>(DaemonToSidecarType::OperationOffer), *body);
     if (seq == 0)
         return std::nullopt;
     op.phase_ = DaemonOpPhase::Minted;
@@ -103,22 +109,29 @@ DaemonFSessionOperation::consume_inbound(const FSessionControlEnvelope& e,
     return disposition;
 }
 
-uint64_t DaemonFSessionOperation::offer_public_fd() {
+uint64_t DaemonFSessionOperation::offer_public_fd(uint64_t socket_cookie) {
+    if (socket_cookie == 0)
+        return 0;
     if (phase_ != DaemonOpPhase::AcceptedByPeer &&
         phase_ != DaemonOpPhase::PublicFdOffered)
         return 0;
-    if (public_fd_offer_id_ == 0) {
+    // The product transfer identity is STABLE across retries; every rendezvous
+    // attempt carries a FRESH AncillaryAttemptId (5448067827 sec.4).
+    if (public_fd_offer_id_ == 0)
         public_fd_offer_id_ = identity_.operation.operation_sequence << 8 | 1;
-        const uint64_t seq = outbound_.stage_frame(
-            identity_, FSessionControlDirection::DaemonToSidecar,
-            static_cast<uint16_t>(DaemonToSidecarType::PublicFdOffer),
-            placeholder_payload(2));
-        if (seq == 0) {
-            public_fd_offer_id_ = 0;
-            return 0;
-        }
-    }
-    // A retry reuses the exact same PublicFdOfferId (no second client claim).
+    PublicFdOfferPayload offer;
+    offer.identity = identity_;
+    offer.public_fd_offer_id = public_fd_offer_id_;
+    offer.ancillary_attempt_id = next_ancillary_attempt_++;
+    offer.socket_cookie = socket_cookie;
+    const auto body = encode_PublicFdOffer(offer);
+    if (!body.has_value())
+        return 0;
+    const uint64_t seq = outbound_.stage_frame(
+        identity_, FSessionControlDirection::DaemonToSidecar,
+        static_cast<uint16_t>(DaemonToSidecarType::PublicFdOffer), *body);
+    if (seq == 0)
+        return 0;
     phase_ = DaemonOpPhase::PublicFdOffered;
     return public_fd_offer_id_;
 }
@@ -144,15 +157,22 @@ DaemonFSessionOperation::accept_delivery(uint64_t delivery_id,
     acceptance_ledger_.push_back(receipt);
     ++tocompile_transitions_; // exactly one WAITP50INPUT -> TOCOMPILE
     phase_ = DaemonOpPhase::SourceAccepted;
-    const uint64_t seq = outbound_.stage_frame(
-        identity_, FSessionControlDirection::DaemonToSidecar,
-        static_cast<uint16_t>(DaemonToSidecarType::DaemonFdAccepted),
-        placeholder_payload(4));
-    (void)seq; // slot law verified by tests; wiring drives the flush
+    DaemonFdAcceptedPayload accepted;
+    accepted.identity = identity_;
+    accepted.attachment_delivery_id = delivery_id;
+    accepted.acceptance_receipt_id = receipt.receipt_id;
+    accepted.replay = 0;
+    const auto body = encode_DaemonFdAccepted(accepted);
+    if (body.has_value()) {
+        (void)outbound_.stage_frame(
+            identity_, FSessionControlDirection::DaemonToSidecar,
+            static_cast<uint16_t>(DaemonToSidecarType::DaemonFdAccepted),
+            *body);
+    }
     return DeliveryAcceptance{receipt, /*replay=*/false};
 }
 
-uint64_t DaemonFSessionOperation::request_cancel() {
+uint64_t DaemonFSessionOperation::request_cancel(uint16_t reason) {
     switch (phase_) {
     case DaemonOpPhase::Minted:
     case DaemonOpPhase::AcceptedByPeer:
@@ -163,10 +183,16 @@ uint64_t DaemonFSessionOperation::request_cancel() {
     default:
         return 0; // settled/reconcile/retired: no cancel authority
     }
+    OpCancelPayload cancel;
+    cancel.identity = identity_;
+    cancel.reason = reason;
+    cancel.cancellation_observation = next_cancellation_observation_++;
+    const auto body = encode_OpCancel(cancel);
+    if (!body.has_value())
+        return 0;
     const uint64_t seq = outbound_.stage_frame(
         identity_, FSessionControlDirection::DaemonToSidecar,
-        static_cast<uint16_t>(DaemonToSidecarType::OpCancel),
-        placeholder_payload(5));
+        static_cast<uint16_t>(DaemonToSidecarType::OpCancel), *body);
     if (seq != 0)
         phase_ = DaemonOpPhase::CancelRequested;
     return seq;

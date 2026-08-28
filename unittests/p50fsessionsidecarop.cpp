@@ -105,6 +105,17 @@ RouteSessionLease make_lease(RouteAdmissionOwner& route,
 constexpr int64_t kNow = 1000;
 constexpr int64_t kLiveDeadline = 5000;
 
+std::vector<uint8_t> public_fd_offer_body(const FSessionOperationIdentity& id) {
+    PublicFdOfferPayload p;
+    p.identity = id;
+    p.public_fd_offer_id = 0x2A01;
+    p.ancillary_attempt_id = 1;
+    p.socket_cookie = 0xC00C1E;
+    auto body = encode_PublicFdOffer(p);
+    assert(body.has_value());
+    return *body;
+}
+
 // Drive an op to EndpointRunning; returns the next daemon sequence to use.
 uint64_t advance_to_running(SidecarFSessionOperation& op,
                             RouteAdmissionOwner& route,
@@ -114,11 +125,21 @@ uint64_t advance_to_running(SidecarFSessionOperation& op,
               InboundDisposition::AcceptedNew,
           "offer accepted");
     check(op.phase() == SidecarOpPhase::Accepted, "phase Accepted");
-    const uint64_t receipt = op.adopt_public_fd(
-        make_lease(route, id), [] { return true; }, kNow);
+    // Adoption without a consumed PublicFdOffer is refused (no inferred
+    // transfer identity) and leaves the route lease unconsumed; the SAME lease
+    // then succeeds after the exact offer arrives.
+    auto lease = make_lease(route, id);
+    check(op.adopt_public_fd(std::move(lease), [] { return true; }, kNow) == 0,
+          "adoption refused before the exact PublicFdOffer");
+    check(lease.valid(), "refusal left the route lease unconsumed");
+    auto [fd_e, fd_b] = frame_with_payload(
+        id, DaemonToSidecarType::PublicFdOffer, 2, public_fd_offer_body(id));
+    (void)op.consume_inbound(fd_e, fd_b, kNow);
+    const uint64_t receipt =
+        op.adopt_public_fd(std::move(lease), [] { return true; }, kNow);
     check(receipt != 0, "public-FD receipt staged");
     check(op.endpoint_started(), "endpoint started");
-    return 2;
+    return 3;
 }
 
 void test_precondition_refusals() {
@@ -244,12 +265,24 @@ void test_semantic_ack_and_commit_split() {
     (void)op.consume_inbound(cancel_e, cancel_b, kNow);
     check(op.phase() == SidecarOpPhase::PermitSelected,
           "cancel after selection cannot steal the decision");
-    check(op.commit_durable([] { return false; }) == 0,
+    check(op.commit_durable([]() -> std::optional<
+                                SidecarFSessionOperation::CommitBundle> {
+              return std::nullopt;
+          }) == 0,
           "store failure after selection refuses commit");
     check(op.phase() == SidecarOpPhase::PermitSelected &&
               op.reconcile_required(),
           "store failure -> reconciliation, not AbortedPreDurable");
-    check(op.commit_durable([] { return true; }) != 0,
+    check(op.commit_durable([]() -> std::optional<
+                                SidecarFSessionOperation::CommitBundle> {
+              SidecarFSessionOperation::CommitBundle bundle;
+              bundle.ready_event_id = 51;
+              bundle.backing_id = 52;
+              bundle.successor_rel_seq = 11;
+              bundle.successor_digest[0] = 0xAB;
+              bundle.committed_receipt_id = 53;
+              return bundle;
+          }) != 0,
           "durable commit succeeds after transient store failure");
     check(op.phase() == SidecarOpPhase::Committed, "committed");
 

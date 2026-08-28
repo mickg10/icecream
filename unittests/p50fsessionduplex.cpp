@@ -155,7 +155,7 @@ static void test_full_settlement_path() {
     check(d.sidecar.phase() == SidecarOpPhase::Accepted, "sidecar accepted");
     check(d.daemon->phase() == DaemonOpPhase::AcceptedByPeer, "daemon sees accept");
 
-    check(d.daemon->offer_public_fd() != 0, "daemon offers public fd");
+    check(d.daemon->offer_public_fd(0xC00C1E) != 0, "daemon offers public fd");
     d.settle_wire();
 
     RouteRefusal refusal = RouteRefusal::None;
@@ -188,7 +188,7 @@ static void test_full_settlement_path() {
 static void test_cancel_before_commit_duplex() {
     Duplex d;
     d.settle_wire();
-    check(d.daemon->offer_public_fd() != 0, "offer");
+    check(d.daemon->offer_public_fd(0xC00C1E) != 0, "offer");
     d.settle_wire();
     RouteRefusal refusal = RouteRefusal::None;
     auto lease = d.route.reserve(d.id, run_identity(), RoutePredecessor{}, refusal);
@@ -216,7 +216,7 @@ static void test_cancel_before_commit_duplex() {
 static void test_commit_before_cancel_duplex() {
     Duplex d;
     d.settle_wire();
-    check(d.daemon->offer_public_fd() != 0, "offer");
+    check(d.daemon->offer_public_fd(0xC00C1E) != 0, "offer");
     d.settle_wire();
     RouteRefusal refusal = RouteRefusal::None;
     auto lease = d.route.reserve(d.id, run_identity(), RoutePredecessor{}, refusal);

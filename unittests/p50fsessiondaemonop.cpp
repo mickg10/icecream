@@ -99,17 +99,17 @@ int main() {
     check(op.phase() == DaemonOpPhase::Minted, "phase Minted; offer staged");
 
     // Public offer is illegal before the peer accepts.
-    check(op.offer_public_fd() == 0, "public offer refused before acceptance");
+    check(op.offer_public_fd(0xC00C1E) == 0, "public offer refused before acceptance");
 
     auto [acc_e, acc_b] = sidecar_frame(id, SidecarToDaemonType::OperationAccepted, 1);
     (void)op.consume_inbound(acc_e, acc_b);
     check(op.phase() == DaemonOpPhase::AcceptedByPeer, "peer accepted");
 
     // One PublicFdOfferId; a retry reuses it exactly (no second claim).
-    const uint64_t offer_id = op.offer_public_fd();
+    const uint64_t offer_id = op.offer_public_fd(0xC00C1E);
     check(offer_id != 0, "public offer minted");
     check(op.phase() == DaemonOpPhase::PublicFdOffered, "phase PublicFdOffered");
-    check(op.offer_public_fd() == offer_id, "retry reuses the same offer id");
+    check(op.offer_public_fd(0xC00C1E) == offer_id, "retry reuses the same offer id");
 
     // A delivery cannot be accepted while only Offered: the product receipt --
     // never a transport-level ACK -- moves the daemon past Offered.

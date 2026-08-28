@@ -58,8 +58,10 @@ using PublicFdValidator = std::function<bool()>;
 
 class SidecarFSessionOperation {
 public:
-    explicit SidecarFSessionOperation(size_t outbound_slots = 16)
-        : outbound_(outbound_slots) {}
+    explicit SidecarFSessionOperation(size_t outbound_slots = 16,
+                                      uint64_t store_generation = 1)
+        : outbound_(outbound_slots),
+          store_generation_(store_generation == 0 ? 1 : store_generation) {}
 
     [[nodiscard]] SidecarOpPhase phase() const noexcept { return phase_; }
     [[nodiscard]] FSessionInboundControl& inbound() noexcept { return inbound_; }
@@ -98,7 +100,17 @@ public:
     // On callback failure the operation enters reconciliation (per actual
     // durable state), not AbortedPreDurable. Returns the staged
     // InputCommitted sequence, or 0 on refusal/failure.
-    using CanonicalCommitFn = std::function<bool()>;
+    // The canonical-store installation returns the exact durable bundle
+    // identities on success (the real InputCommitted evidence); nullopt on
+    // failure.
+    struct CommitBundle {
+        uint64_t ready_event_id = 0;
+        uint64_t backing_id = 0;
+        uint64_t successor_rel_seq = 0;
+        std::array<uint8_t, 16> successor_digest{};
+        uint64_t committed_receipt_id = 0;
+    };
+    using CanonicalCommitFn = std::function<std::optional<CommitBundle>()>;
     [[nodiscard]] uint64_t commit_durable(const CanonicalCommitFn& store_commit);
     // Substrate convenience for tests: select + commit with an always-true
     // store callback. Production wiring uses the two-step boundary.
@@ -161,6 +173,10 @@ private:
     FSessionInboundControl inbound_;
     FSessionOutboundControl outbound_;
     std::optional<RouteSessionLease> route_lease_;
+    uint64_t store_generation_ = 1;
+    uint64_t consumed_public_fd_offer_ = 0; // from the decoded PublicFdOffer
+    uint64_t consumed_socket_cookie_ = 0;
+    uint64_t owner_sequence_ = 1;
     uint64_t terminal_observation_seq_ = 0;
     bool delivery_suppressed_ = false;
     bool reconcile_required_ = false;

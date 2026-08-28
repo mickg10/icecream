@@ -1,17 +1,6 @@
 #include "p50_fsession_sidecar_op.h"
 
 namespace icecc::p50::fsession {
-namespace {
-
-std::vector<uint8_t> placeholder_payload(uint8_t tag) {
-    // Phase-specific payloads (exact receipts/observation bodies) are encoded
-    // by the production wiring; the reducer stages a canonical typed frame so
-    // slot/flush/replay law is exercised end to end.
-    return {tag};
-}
-
-} // namespace
-
 bool SidecarFSessionOperation::deadline_live(int64_t now_ns) const noexcept {
     const auto& identity = inbound_.identity();
     return identity.deadline.valid() && now_ns < identity.deadline.expires_at_ns;
@@ -35,13 +24,31 @@ SidecarFSessionOperation::consume_inbound(const FSessionControlEnvelope& e,
             phase_ = SidecarOpPhase::AbortedPreDurable;
             return disposition;
         }
-        const uint64_t seq = outbound_.stage_frame(
-            inbound_.identity(), FSessionControlDirection::SidecarToDaemon,
-            static_cast<uint16_t>(SidecarToDaemonType::OperationAccepted),
-            placeholder_payload(1));
-        if (seq != 0)
-            phase_ = SidecarOpPhase::Accepted;
+        OperationAcceptedPayload accepted;
+        accepted.identity = inbound_.identity();
+        accepted.ack_of_daemon_sequence = e.sequence;
+        accepted.sidecar_store_generation = store_generation_;
+        const auto body = encode_OperationAccepted(accepted);
+        if (body.has_value()) {
+            const uint64_t seq = outbound_.stage_frame(
+                inbound_.identity(), FSessionControlDirection::SidecarToDaemon,
+                static_cast<uint16_t>(SidecarToDaemonType::OperationAccepted),
+                *body);
+            if (seq != 0)
+                phase_ = SidecarOpPhase::Accepted;
+        }
         return disposition;
+    }
+
+    if (e.message_type ==
+        static_cast<uint16_t>(DaemonToSidecarType::PublicFdOffer)) {
+        // Retain the exact offered transfer identity: the adoption receipt must
+        // name it, and the injected socket validation compares the cookie.
+        const auto offer = decode_PublicFdOffer(e);
+        if (offer.has_value()) {
+            consumed_public_fd_offer_ = offer->public_fd_offer_id;
+            consumed_socket_cookie_ = offer->socket_cookie;
+        }
     }
 
     if (e.message_type == static_cast<uint16_t>(DaemonToSidecarType::OpCancel))
@@ -74,11 +81,29 @@ uint64_t SidecarFSessionOperation::adopt_public_fd(
         return 0;
     if (!socket_valid || !socket_valid())
         return 0;
+    // The receipt names the exact consumed PublicFdOffer; adoption without a
+    // decoded offer is refused (no inferred transfer identity).
+    if (consumed_public_fd_offer_ == 0)
+        return 0;
 
+    PublicFdAdoptedReceiptPayload receipt;
+    receipt.identity = inbound_.identity();
+    receipt.public_fd_offer_id = consumed_public_fd_offer_;
+    receipt.endpoint_generation = route_lease.endpoint_run().endpoint_generation;
+    receipt.endpoint_session_serial =
+        route_lease.endpoint_run().endpoint_session_serial;
+    receipt.run_sequence = route_lease.endpoint_run().run_sequence;
+    receipt.socket_ownership_generation =
+        route_lease.endpoint_run().socket_ownership_generation;
+    receipt.route_admission_sequence = route_lease.admission_sequence();
+    receipt.sidecar_owner_sequence = owner_sequence_++;
+    const auto body = encode_PublicFdAdoptedReceipt(receipt);
+    if (!body.has_value())
+        return 0;
     const uint64_t seq = outbound_.stage_frame(
         inbound_.identity(), FSessionControlDirection::SidecarToDaemon,
         static_cast<uint16_t>(SidecarToDaemonType::PublicFdAdoptedReceipt),
-        placeholder_payload(2));
+        *body);
     if (seq == 0)
         return 0;
     route_lease_ = std::move(route_lease);
@@ -119,14 +144,27 @@ uint64_t SidecarFSessionOperation::commit_durable(
     // report Committed. A failure after selection is reconciliation per actual
     // durable state -- never AbortedPreDurable (the selection already
     // linearized the owner decision).
-    if (!store_commit || !store_commit()) {
+    const std::optional<CommitBundle> bundle =
+        store_commit ? store_commit() : std::nullopt;
+    if (!bundle.has_value()) {
+        reconcile_required_ = true;
+        return 0;
+    }
+    InputCommittedPayload committed;
+    committed.identity = inbound_.identity();
+    committed.ready_event_id = bundle->ready_event_id;
+    committed.backing_id = bundle->backing_id;
+    committed.successor_rel_seq = bundle->successor_rel_seq;
+    committed.successor_digest = bundle->successor_digest;
+    committed.committed_receipt_id = bundle->committed_receipt_id;
+    const auto body = encode_InputCommitted(committed);
+    if (!body.has_value()) {
         reconcile_required_ = true;
         return 0;
     }
     const uint64_t seq = outbound_.stage_frame(
         inbound_.identity(), FSessionControlDirection::SidecarToDaemon,
-        static_cast<uint16_t>(SidecarToDaemonType::InputCommitted),
-        placeholder_payload(3));
+        static_cast<uint16_t>(SidecarToDaemonType::InputCommitted), *body);
     if (seq == 0) {
         // Durable bundle exists but the evidence frame cannot stage: preserve
         // the durable facts under reconciliation (never a rollback).
@@ -141,7 +179,15 @@ uint64_t SidecarFSessionOperation::commit_durable(
 uint64_t SidecarFSessionOperation::grant_commit_permit_and_commit() {
     if (!select_commit())
         return 0;
-    return commit_durable([] { return true; });
+    return commit_durable([]() -> std::optional<CommitBundle> {
+        CommitBundle bundle;
+        bundle.ready_event_id = 1;
+        bundle.backing_id = 1;
+        bundle.successor_rel_seq = 1;
+        bundle.successor_digest[0] = 1;
+        bundle.committed_receipt_id = 1;
+        return bundle;
+    });
 }
 
 void SidecarFSessionOperation::apply_cancel() noexcept {
