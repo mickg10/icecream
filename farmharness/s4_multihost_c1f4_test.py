@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused local tests for the four-physical-host S4 runner."""
+"""Focused local tests for the physical S4 contention runner."""
 
 from __future__ import annotations
 
@@ -67,11 +67,36 @@ class FourHostRunnerTests(unittest.TestCase):
             ("HOLD", "no-worker"),
         )
 
+    def test_two_host_pass_uses_only_selected_workers(self) -> None:
+        names = [runner.WORKER_NAMES["q3"], runner.WORKER_NAMES["research6"]]
+        fields = {
+            "S4_STATUS": "PASS reason=physical-workers-remote-byte-identical",
+            "S4_REMOTE_COMPILE": "2",
+            "S4_BYTE_IDENTICAL": "2",
+            "S4_WORKER_SELECTION": ",".join(names),
+            "S4_CACHE_OBSERVED": "1",
+            "S4_LEGACY_OBSERVED": "0",
+        }
+        logs = {
+            "q3": "P50 CompileFile attached exact ZSTD_TU input",
+            "research6": "P50 CompileFile attached exact ZSTD_TU input",
+        }
+        self.assertEqual(
+            runner.classify_result(0, fields, logs, names),
+            ("PASS", "2-physical-workers-remote-byte-identical"),
+        )
+        fields["S4_REMOTE_COMPILE"] = "4"
+        self.assertEqual(
+            runner.classify_result(0, fields, logs, names),
+            ("FAIL", "2-compile-byte-ledger-incomplete"),
+        )
+
     def test_client_script_runs_final_compiles_concurrently(self) -> None:
         self.assertIn('pids+=("$!")', runner.CLIENT_SCRIPT)
         self.assertIn('wait "${pids[$((i-1))]}"', runner.CLIENT_SCRIPT)
         self.assertIn('[ "$load" = same ]', runner.CLIENT_SCRIPT)
-        self.assertIn('4) count=16384', runner.CLIENT_SCRIPT)
+        self.assertIn('4) values_count=16384', runner.CLIENT_SCRIPT)
+        self.assertIn('for i in $(seq 1 "$worker_count")', runner.CLIENT_SCRIPT)
 
 
 if __name__ == "__main__":

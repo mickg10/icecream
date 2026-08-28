@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Run one exact Protocol-50 C1F4 cell across four physical worker hosts.
+"""Run an exact Protocol-50 C1F2 or C1F4 physical contention cell.
 
 The scheduler and client run on q3.  One worker container runs on each of q3,
 research6, research7 and q2.  Every host receives the same hash-pinned role
-bundle and the same uniquely tagged Docker image.  Four preferred-host
-compiles must return byte-identical objects and every worker must show the
-ZSTD_TU cache path without a legacy fallback.
+bundle and the same uniquely tagged Docker image.  One preferred-host compile
+per selected worker must return a byte-identical object, and every worker must
+show the ZSTD_TU cache path without a legacy fallback.
 
 The runner deliberately refuses to overlap an S5 timing process.  It retains
 all logs and one JSONL result under ``experiments/icecream`` before removing
@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA = "icecream-s4-four-physical-host-c1f4-v1"
+SCHEMA = "icecream-s4-physical-contention-v2"
 BASE_SOURCE_SHA = "04006b9d94161a047154121f47785aec747ffd87"
 EXPECTED_IMAGE_ID = "sha256:bdb55d4287a473e3ebfbaa7715a50ee670659777278b8d84c350724e6fa8de58"
 SOURCE_IMAGE = "icecream/farm-node:ubuntu22-gcc11-boost174"
@@ -155,9 +155,9 @@ docker version --format '{{.Server.Version}}'
 """
 
 
-def host_preflight(timeout: float) -> dict[str, dict[str, Any]]:
+def host_preflight(hosts: list[str], timeout: float) -> dict[str, dict[str, Any]]:
     rows: dict[str, dict[str, Any]] = {}
-    for host in HOSTS:
+    for host in hosts:
         result = run_script(host, IDENTITY_SCRIPT, timeout=timeout, check=True)
         lines = result.stdout.splitlines()
         if len(lines) < 4 or not lines[1].isdigit() or not lines[2].isdigit():
@@ -198,8 +198,10 @@ docker image inspect --format '{{.Id}}' "$tag"
 """
 
 
-def pin_image_on_existing_hosts(timeout: float) -> None:
-    for host in ("q3", "research6", "q2"):
+def pin_image_on_existing_hosts(hosts: list[str], timeout: float) -> None:
+    for host in hosts:
+        if host == "research7":
+            continue
         result = run_script(
             host, TAG_IMAGE_SCRIPT, [EXPECTED_IMAGE_ID, PINNED_IMAGE], timeout=timeout
         )
@@ -251,7 +253,7 @@ def stage_roles(host: str, root: Path, timeout: float) -> str:
     )
     assert tar_process.stdout is not None
     receiver = subprocess.Popen(
-        [*ssh_argv(host), "bash", "-c", remote],
+        [*ssh_argv(host), "bash", "-c", shlex.quote(remote)],
         stdin=tar_process.stdout,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -355,6 +357,10 @@ set -u
 root=$1; scheduler=$2; sport=$3; network=$4; scheduler_log=$5; cport=$6; load=$7
 shift 7
 names=("$@")
+worker_count=${#names[@]}
+[ "$worker_count" -eq 2 ] || [ "$worker_count" -eq 4 ] || {
+  echo 'S4_STATUS=FAIL reason=unsupported-worker-count'; exit 1;
+}
 work=$(mktemp -d /tmp/s4-p50-fourhost-client.XXXXXX)
 printf 'S4_CLIENT_WORK=%s\n' "$work"
 C_PID=
@@ -367,17 +373,20 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 mkdir -p "$work/env" "$work/envs-c" "$work/out"; chmod 1777 "$work/envs-c"
-for i in 1 2 3 4; do
+for i in $(seq 1 "$worker_count"); do
   if [ "$load" = same ]; then
     printf '#include <cstdint>\nextern "C" int s4_physical_%s() { return %s; }\n' \
       "$i" "$((90+i))" >"$work/main-$i.cpp"
   else
-    case "$i" in 1) count=32;; 2) count=512;; 3) count=4096;; 4) count=16384;; esac
+    case "$i" in
+      1) values_count=32;; 2) values_count=512;;
+      3) values_count=4096;; 4) values_count=16384;;
+    esac
     {
       printf '#include <cstdint>\nstatic const std::uint32_t values_%s[] = {' "$i"
-      seq 1 "$count" | awk '{printf "%s,", ($1 * 2654435761) % 4294967291}'
+      seq 1 "$values_count" | awk '{printf "%s,", ($1 * 2654435761) % 4294967291}'
       printf '};\nextern "C" std::uint32_t s4_physical_%s() { return values_%s[%s]; }\n' \
-        "$i" "$i" "$((count-1))"
+        "$i" "$i" "$((values_count-1))"
     } >"$work/main-$i.cpp"
   fi
   g++ -std=c++17 -O2 -c "$work/main-$i.cpp" -o "$work/out/local-$i.o" \
@@ -411,7 +420,7 @@ done
 sleep 5
 before=$(wc -l <"$scheduler_log")
 pids=()
-for i in 1 2 3 4; do
+for i in $(seq 1 "$worker_count"); do
   name=${names[$((i-1))]}
   (
     env ICECC_TEST_SOCKET="$work/c.sock" ICECC_TEST_REMOTEBUILD=1 ICECC_VERSION="$envtar" \
@@ -423,13 +432,13 @@ for i in 1 2 3 4; do
   pids+=("$!")
 done
 compile_failed=0
-for i in 1 2 3 4; do
+for i in $(seq 1 "$worker_count"); do
   wait "${pids[$((i-1))]}" || compile_failed=$i
 done
 [ "$compile_failed" -eq 0 ] || {
   echo "S4_STATUS=FAIL reason=parallel-remote-compile-$compile_failed"; exit 1;
 }
-for i in 1 2 3 4; do
+for i in $(seq 1 "$worker_count"); do
   name=${names[$((i-1))]}
   cmp -s "$work/out/remote-$i.o" "$work/out/local-$i.o" || {
     echo "S4_STATUS=FAIL reason=object-not-byte-identical-$name"; exit 1;
@@ -453,10 +462,11 @@ grep -E 'write_fd_to_server from cpp|write_fd_to_server preprocessed|building my
 printf 'S4_CACHE_OBSERVED=%s\nS4_LEGACY_OBSERVED=%s\n' "$cache_seen" "$legacy_seen"
 [ "$cache_seen" -eq 1 ] || { echo 'S4_STATUS=HOLD reason=client-cache-not-observed'; exit 77; }
 [ "$legacy_seen" -eq 0 ] || { echo 'S4_STATUS=FAIL reason=legacy-fallback-observed'; exit 1; }
-printf 'S4_WORKER_SELECTION=%s,%s,%s,%s\n' "${names[0]}" "${names[1]}" "${names[2]}" "${names[3]}"
-echo S4_REMOTE_COMPILE=4
-echo S4_BYTE_IDENTICAL=4
-echo 'S4_STATUS=PASS reason=four-physical-workers-remote-byte-identical'
+selection=$(IFS=,; printf '%s' "${names[*]}")
+printf 'S4_WORKER_SELECTION=%s\n' "$selection"
+printf 'S4_REMOTE_COMPILE=%s\n' "$worker_count"
+printf 'S4_BYTE_IDENTICAL=%s\n' "$worker_count"
+echo 'S4_STATUS=PASS reason=physical-workers-remote-byte-identical'
 exit 0
 """
 
@@ -518,18 +528,22 @@ def read_remote_file(host: str, path: str, timeout: float) -> str:
     return result.stdout
 
 
-def wait_for_workers(scheduler_work: str, timeout: float) -> str:
+def wait_for_workers(
+    scheduler_work: str,
+    worker_names: list[str],
+    timeout: float,
+) -> str:
     deadline = time.monotonic() + min(timeout, 120)
     last = ""
     while time.monotonic() < deadline:
         last = read_remote_file("q3", f"{scheduler_work}/scheduler.log", min(timeout, 30))
         if all(
             re.search(rf"RELOGIN {re.escape(name)}.*cache_profiles=.*zstd_tu", last)
-            for name in WORKER_NAMES.values()
+            for name in worker_names
         ):
             return last
         time.sleep(1)
-    raise HoldError("four cache-capable physical workers did not register")
+    raise HoldError(f"{len(worker_names)} cache-capable physical workers did not register")
 
 
 def run_client(
@@ -539,11 +553,12 @@ def run_client(
     network: str,
     client_port: int,
     load: str,
+    worker_names: list[str],
     timeout: float,
 ) -> tuple[subprocess.CompletedProcess[str], str]:
     args = [stage, HOSTS["q3"]["lan"], str(scheduler_port), network,
             f"{scheduler_work}/scheduler.log", str(client_port), load,
-            *WORKER_NAMES.values()]
+            *worker_names]
     result = run_script("q3", CLIENT_SCRIPT, args, timeout=timeout)
     work = parse_work(result.stdout, "S4_CLIENT_WORK", "/tmp/s4-p50-fourhost-client.")
     return result, work
@@ -606,24 +621,31 @@ def classify_result(
     client_returncode: int,
     fields: dict[str, str],
     worker_logs: dict[str, str],
+    worker_names: list[str] | None = None,
 ) -> tuple[str, str]:
+    if worker_names is None:
+        worker_names = list(WORKER_NAMES.values())
     marker = fields.get("S4_STATUS", "")
     if client_returncode == 77 or marker.startswith("HOLD"):
         return "HOLD", marker.split("reason=", 1)[-1] or "client-hold"
     if client_returncode != 0 or not marker.startswith("PASS"):
         return "FAIL", marker.split("reason=", 1)[-1] or "client-failure"
-    expected_selection = ",".join(WORKER_NAMES.values())
-    if fields.get("S4_REMOTE_COMPILE") != "4" or fields.get("S4_BYTE_IDENTICAL") != "4":
-        return "FAIL", "four-compile-byte-ledger-incomplete"
+    expected_count = str(len(worker_names))
+    expected_selection = ",".join(worker_names)
+    if (
+        fields.get("S4_REMOTE_COMPILE") != expected_count
+        or fields.get("S4_BYTE_IDENTICAL") != expected_count
+    ):
+        return "FAIL", f"{expected_count}-compile-byte-ledger-incomplete"
     if fields.get("S4_WORKER_SELECTION") != expected_selection:
-        return "HOLD", "four-physical-worker-selection-incomplete"
+        return "HOLD", f"{expected_count}-physical-worker-selection-incomplete"
     if fields.get("S4_CACHE_OBSERVED") != "1" or fields.get("S4_LEGACY_OBSERVED") != "0":
         return "FAIL", "client-cache-path-observation-differs"
     if not all(worker_cache_observed(log) for log in worker_logs.values()):
         return "HOLD", "cache-path-not-observed-on-every-physical-worker"
     if any(worker_legacy_observed(log) for log in worker_logs.values()):
         return "FAIL", "legacy-path-observed-on-physical-worker"
-    return "PASS", "four-physical-workers-remote-byte-identical"
+    return "PASS", f"{expected_count}-physical-workers-remote-byte-identical"
 
 
 CLEANUP_SCRIPT = r"""
@@ -684,13 +706,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--timeout", type=float, default=900)
     parser.add_argument("--load", choices=("same", "mixed"), default="same")
+    parser.add_argument("--topology", choices=("c1f2", "c1f4"), default="c1f4")
     args = parser.parse_args(argv)
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
 
     started = datetime.now(timezone.utc)
     stamp = started.strftime("%Y%m%dT%H%M%SZ")
-    run_root = args.out_root / f"s4-four-physical-host-c1f4-{stamp}"
+    selected_hosts = list(HOSTS)[:2] if args.topology == "c1f2" else list(HOSTS)
+    selected_worker_names = [WORKER_NAMES[host] for host in selected_hosts]
+    topology = args.topology.upper()
+    run_root = args.out_root / f"s4-physical-contention-{args.topology}-{args.load}-{stamp}"
     run_root.mkdir(parents=True, exist_ok=False)
     local_hashes: dict[str, str] = {}
     identities: dict[str, dict[str, Any]] = {}
@@ -710,7 +736,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         require_no_s5()
         local_hashes = validate_local_roles(args.p50_root.absolute())
-        identities = host_preflight(min(args.timeout, 60))
+        identities = host_preflight(selected_hosts, min(args.timeout, 60))
         preflight = {
             "schema": SCHEMA,
             "started_at": started.isoformat(),
@@ -723,19 +749,23 @@ def main(argv: list[str] | None = None) -> int:
             "expected_image_id": EXPECTED_IMAGE_ID,
             "network": network,
             "scheduler_port": scheduler_port,
-            "worker_ports": {host: worker_base + index for index, host in enumerate(HOSTS)},
+            "worker_ports": {
+                host: worker_base + index for index, host in enumerate(selected_hosts)
+            },
             "client_port": client_port,
             "load": args.load,
+            "topology": topology,
         }
         write_json(run_root / "preflight.json", preflight)
 
-        pin_image_on_existing_hosts(min(args.timeout, 120))
-        copy_pinned_image_to_research7(args.timeout)
-        image_ids = {host: image_id(host, PINNED_IMAGE, 60) for host in HOSTS}
+        pin_image_on_existing_hosts(selected_hosts, min(args.timeout, 120))
+        if "research7" in selected_hosts:
+            copy_pinned_image_to_research7(args.timeout)
+        image_ids = {host: image_id(host, PINNED_IMAGE, 60) for host in selected_hosts}
         if set(image_ids.values()) != {EXPECTED_IMAGE_ID}:
             raise HoldError(f"pinned image IDs differ across hosts: {image_ids}")
 
-        for host in HOSTS:
+        for host in selected_hosts:
             stages[host] = stage_roles(host, args.p50_root.absolute(), args.timeout)
             verification = verify_stage(host, stages[host], min(args.timeout, 60))
             (run_root / f"{host}-stage-verify.txt").write_text(verification, encoding="utf-8")
@@ -745,7 +775,7 @@ def main(argv: list[str] | None = None) -> int:
             stages["q3"], identities["q3"], containers["q3-scheduler"],
             scheduler_port, network, min(args.timeout, 120),
         )
-        for index, host in enumerate(HOSTS):
+        for index, host in enumerate(selected_hosts):
             key = f"{host}-worker"
             containers[key] = f"s4-p50-{host}-worker-{run_token}"
             works[key] = start_worker(
@@ -753,13 +783,15 @@ def main(argv: list[str] | None = None) -> int:
                 network, worker_base + index, min(args.timeout, 120),
             )
 
-        scheduler_registration = wait_for_workers(works["q3-scheduler"], args.timeout)
+        scheduler_registration = wait_for_workers(
+            works["q3-scheduler"], selected_worker_names, args.timeout
+        )
         (run_root / "scheduler-registration.log").write_text(
             scheduler_registration, encoding="utf-8"
         )
         client_result, client_work = run_client(
             stages["q3"], works["q3-scheduler"], scheduler_port, network,
-            client_port, args.load, args.timeout,
+            client_port, args.load, selected_worker_names, args.timeout,
         )
         works["q3-client"] = client_work
         (run_root / "client.stdout").write_text(client_result.stdout, encoding="utf-8")
@@ -768,7 +800,7 @@ def main(argv: list[str] | None = None) -> int:
         copy_remote_tree("q3", works["q3-scheduler"], run_root / "q3-scheduler", args.timeout)
         copy_remote_tree("q3", client_work, run_root / "q3-client", args.timeout)
         worker_logs: dict[str, str] = {}
-        for host in HOSTS:
+        for host in selected_hosts:
             key = f"{host}-worker"
             copy_remote_tree(host, works[key], run_root / f"{host}-worker", args.timeout)
             worker_log_path = run_root / f"{host}-worker" / "fdaemon.log"
@@ -779,20 +811,26 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         fields = parse_fields(client_result.stdout)
-        status, reason = classify_result(client_result.returncode, fields, worker_logs)
+        status, reason = classify_result(
+            client_result.returncode, fields, worker_logs, selected_worker_names
+        )
         result = {
             "schema": SCHEMA,
             "status": status,
             "reason": reason,
             "base_source_sha": BASE_SOURCE_SHA,
             "profile": "ZSTD_TU",
-            "topology": "C1F4",
+            "topology": topology,
             "load": args.load,
             "scheduler_host": "q3",
             "client_host": "q3",
-            "physical_worker_hosts": list(HOSTS),
-            "worker_names": WORKER_NAMES,
-            "worker_lan_addresses": {host: data["lan"] for host, data in HOSTS.items()},
+            "physical_worker_hosts": selected_hosts,
+            "worker_names": {
+                host: WORKER_NAMES[host] for host in selected_hosts
+            },
+            "worker_lan_addresses": {
+                host: HOSTS[host]["lan"] for host in selected_hosts
+            },
             "worker_selection": fields.get("S4_WORKER_SELECTION", "").split(","),
             "remote_compile_count": int(fields.get("S4_REMOTE_COMPILE", "0") or 0),
             "byte_identical_count": int(fields.get("S4_BYTE_IDENTICAL", "0") or 0),
@@ -816,7 +854,10 @@ def main(argv: list[str] | None = None) -> int:
             "ports": {
                 "scheduler": scheduler_port,
                 "client": client_port,
-                "workers": {host: worker_base + index for index, host in enumerate(HOSTS)},
+                "workers": {
+                    host: worker_base + index
+                    for index, host in enumerate(selected_hosts)
+                },
             },
             "client_returncode": client_result.returncode,
             "started_at": started.isoformat(),
@@ -834,7 +875,7 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         # Stop every consumer before removing any staged role root.  In
         # particular, q3's worker and scheduler share the same read-only root.
-        for host in reversed(list(HOSTS)):
+        for host in reversed(selected_hosts):
             key = f"{host}-worker"
             if containers.get(key) or works.get(key):
                 cleanup[key] = cleanup_remote(
@@ -856,7 +897,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         else:
             cleanup["q3-scheduler"] = {"returncode": 0, "status": "not-started"}
-        for host in reversed(list(HOSTS)):
+        for host in reversed(selected_hosts):
             if stages.get(host):
                 cleanup[f"{host}-stage"] = cleanup_remote(
                     host, "", "", stages[host], min(args.timeout, 120)
@@ -872,9 +913,9 @@ def main(argv: list[str] | None = None) -> int:
             "reason": reason,
             "base_source_sha": BASE_SOURCE_SHA,
             "profile": "ZSTD_TU",
-            "topology": "C1F4",
+            "topology": topology,
             "load": args.load,
-            "physical_worker_hosts": list(HOSTS),
+            "physical_worker_hosts": selected_hosts,
             "role_hashes": local_hashes,
             "started_at": started.isoformat(),
             "finished_at": datetime.now(timezone.utc).isoformat(),
