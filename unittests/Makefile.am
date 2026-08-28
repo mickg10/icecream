@@ -30,6 +30,7 @@ TESTS += p50inputlifecycle
 TESTS += p50compilebinding p50routeowner
 TESTS += p50compilee2e-source.sh p50compilee2e-run.sh p50resultdisposition
 TESTS += p50profile-selection-source.sh
+TESTS += p50grz-source.sh
 TESTS += p50_completion_record
 TESTS += p50daemontaskcount p50daemontaskcount-source.sh
 TESTS += p50forkfdhygiene p50forkfdhygiene-source.sh p50forkfdhygiene-mutants.sh p50_fork_fd_hygiene_sanitize.sh p50forkfdhygiene-oot.sh p50forkfdhygiene-package.sh
@@ -90,7 +91,7 @@ TEST_EXTENSIONS = .sh
 SH_LOG_COMPILER = $(SHELL)
 
 AM_CPPFLAGS = -I$(top_srcdir)/client -I$(top_srcdir)/services -I$(top_srcdir)/ \
-	$(LIBZSTD_CFLAGS)
+	$(LIBZSTD_CFLAGS) $(LIBBSC_CFLAGS)
 P50_CLIENT_LINK_LIBS = ../client/libp50zstdsender.a \
 	../cache/libp50endpoint.a ../cache/libp50adoptedoutcomewriter.a \
 	../cache/libprotocol50.a \
@@ -222,7 +223,7 @@ p50s3realprocess_LDADD = ../cache/libp50endpoint.a \
 	$(LIBZSTD_LIBS) $(BOOST_LIBS)
 p50zstd_SOURCES = p50_zstd_test.cpp
 p50profile_SOURCES = p50_profile_test.cpp
-p50profile_LDADD = ../cache/libprotocol50.a ../services/libicecc.la $(LIBZSTD_LIBS)
+p50profile_LDADD = ../cache/libprotocol50.a ../services/libicecc.la $(LIBZSTD_LIBS) $(LIBBSC_LIBS)
 p50zstdwindow_SOURCES = p50_zstd_window_test.cpp
 p50inputrecord_SOURCES = p50_input_record_test.cpp
 p50inputrecordlate_SOURCES = p50_input_record_late_commit_test.cpp

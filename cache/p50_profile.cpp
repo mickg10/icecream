@@ -2,6 +2,10 @@
 
 #include "p50_zstd.h"
 
+#if defined(ICECC_P50_WITH_LIBBSC)
+#include "p50_grz.h"
+#endif
+
 #include <stdexcept>
 #include <utility>
 
@@ -189,6 +193,45 @@ const TxBegin* active_begin_zstd(const void* object) noexcept {
     return active ? &*active : nullptr;
 }
 
+#if defined(ICECC_P50_WITH_LIBBSC)
+ProfileDialogueState map_grz_state(GrzResidualDialogue::State state) noexcept {
+    switch (state) {
+    case GrzResidualDialogue::State::Idle: return ProfileDialogueState::Idle;
+    case GrzResidualDialogue::State::ReceivingBody: return ProfileDialogueState::ReceivingBody;
+    case GrzResidualDialogue::State::BodyClosed: return ProfileDialogueState::BodyClosed;
+    case GrzResidualDialogue::State::Materialized: return ProfileDialogueState::Materialized;
+    case GrzResidualDialogue::State::Terminal: return ProfileDialogueState::Terminal;
+    }
+    return ProfileDialogueState::Terminal;
+}
+void destroy_grz(void* object) noexcept { delete static_cast<GrzResidualDialogue*>(object); }
+void begin_grz(void* object, const TxBegin& value) { static_cast<GrzResidualDialogue*>(object)->begin(value); }
+void append_dict_grz(void* object, const DictMessage& value) { static_cast<GrzResidualDialogue*>(object)->append_dict(value); }
+void append_body_grz(void* object, const BodyMessage& value) { static_cast<GrzResidualDialogue*>(object)->append_body(value); }
+void receive_need_grz(void* object, const NeedMessage& value) { static_cast<GrzResidualDialogue*>(object)->receive_need(value); }
+void receive_fill_grz(void* object, const FillMessage& value) { static_cast<GrzResidualDialogue*>(object)->receive_fill(value); }
+std::vector<uint8_t> materialize_grz(void* object) { return static_cast<GrzResidualDialogue*>(object)->materialize(); }
+void commit_visible_grz(void* object, const TxCommit& value) { static_cast<GrzResidualDialogue*>(object)->commit_visible(value); }
+void discard_tentative_grz(void* object) noexcept { static_cast<GrzResidualDialogue*>(object)->discard_tentative(); }
+void disconnect_grz(void* object) noexcept { static_cast<GrzResidualDialogue*>(object)->disconnect(); }
+void reset_grz(void* object) { static_cast<GrzResidualDialogue*>(object)->reset(); }
+ProfileDialogueState state_grz(const void* object) noexcept { return map_grz_state(static_cast<const GrzResidualDialogue*>(object)->state()); }
+bool terminal_grz(const void* object) noexcept { return static_cast<const GrzResidualDialogue*>(object)->terminal(); }
+ProfileCommitState commit_state_grz(const void* object) noexcept {
+    const auto state = static_cast<const GrzResidualDialogue*>(object)->state();
+    return state == GrzResidualDialogue::State::ReceivingBody ||
+                   state == GrzResidualDialogue::State::BodyClosed ||
+                   state == GrzResidualDialogue::State::Materialized
+               ? ProfileCommitState::Tentative : ProfileCommitState::Committed;
+}
+size_t pending_body_bytes_grz(const void* object) noexcept { return static_cast<const GrzResidualDialogue*>(object)->pending_body_bytes(); }
+uint64_t window_limit_bytes_grz(const void* object) noexcept { return static_cast<const GrzResidualDialogue*>(object)->window_limit_bytes(); }
+const TxBegin* active_begin_grz(const void* object) noexcept {
+    const auto& active = static_cast<const GrzResidualDialogue*>(object)->active_begin();
+    return active ? &*active : nullptr;
+}
+#endif
+
 const ProfileDialogueVTable kZstdTuVTable{
     .profile = ProfileId::ZSTD_TU,
     .destroy = destroy_zstd,
@@ -230,6 +273,29 @@ const ProfileDialogueVTable kZstdRouteVTable{
     .window_limit_bytes = window_limit_bytes_route,
     .active_begin = active_begin_route,
 };
+
+#if defined(ICECC_P50_WITH_LIBBSC)
+const ProfileDialogueVTable kGrzVTable{
+    .profile = ProfileId::GRZ,
+    .destroy = destroy_grz,
+    .begin = begin_grz,
+    .append_dict = append_dict_grz,
+    .append_body = append_body_grz,
+    .receive_need = receive_need_grz,
+    .receive_fill = receive_fill_grz,
+    .materialize = materialize_grz,
+    .commit_visible = commit_visible_grz,
+    .discard_tentative = discard_tentative_grz,
+    .disconnect = disconnect_grz,
+    .reset = reset_grz,
+    .state = state_grz,
+    .terminal = terminal_grz,
+    .commit_state = commit_state_grz,
+    .pending_body_bytes = pending_body_bytes_grz,
+    .window_limit_bytes = window_limit_bytes_grz,
+    .active_begin = active_begin_grz,
+};
+#endif
 
 } // namespace
 
@@ -289,6 +355,12 @@ ProfileDialogue make_profile_dialogue(ProfileId profile, ProfileDialogueConfig c
         return ProfileDialogue(&kZstdRouteVTable,
                                new ZstdRouteDialogue(config.negotiated_profiles,
                                                      zstd_limits));
+#if defined(ICECC_P50_WITH_LIBBSC)
+    case ProfileId::GRZ:
+        return ProfileDialogue(&kGrzVTable,
+                               new GrzResidualDialogue(config.negotiated_profiles,
+                                                       zstd_limits));
+#endif
     default:
         throw std::invalid_argument("transaction profile has no dialogue implementation");
     }

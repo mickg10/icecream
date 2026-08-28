@@ -146,10 +146,14 @@ constexpr uint32_t kKnownProfileMask = profile_bit(ProfileId::P29) |
 constexpr uint32_t kDeclaredProfileMask = kKnownProfileMask |
                                           profile_bit(ProfileId::Z3_SHARED_LONG);
 // Z3_LONG is the operational name of the first route profile. The legacy
-// profile census remains separate; session negotiation admits only the two
-// runnable source profiles.
+// profile census remains separate; session negotiation admits only codecs
+// built into this executable (GRZ requires the scoped libbsc option).
 constexpr uint32_t kOperationalProfileMask =
-    profile_bit(ProfileId::ZSTD_TU) | profile_bit(ProfileId::Z3_LONG);
+    profile_bit(ProfileId::ZSTD_TU) | profile_bit(ProfileId::Z3_LONG)
+#if defined(ICECC_P50_WITH_LIBBSC)
+    | profile_bit(ProfileId::GRZ)
+#endif
+    ;
 
 enum class P29RootMode : uint16_t {
     NotApplicable = 0,

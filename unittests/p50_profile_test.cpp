@@ -1,5 +1,6 @@
 #include "cache/p50_profile.h"
 #include "cache/p50_zstd.h"
+#include "cache/p50_grz.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -325,6 +326,39 @@ void test_interactive_hooks_are_reachable_and_fail_closed_for_zstd() {
 }
 
 void test_factory_rejects_unsupported_or_unnegotiated() {
+#if defined(ICECC_P50_WITH_LIBBSC)
+    for (uint8_t corpus = 1; corpus <= 3; ++corpus) {
+        std::vector<uint8_t> input(200000U * corpus);
+        for (size_t i = 0; i < input.size(); ++i)
+            input[i] = static_cast<uint8_t>((i * 37U + corpus * 11U) ^ (i >> 5));
+        const auto envelope = encode_grz_residual(HistoryNonce{8}, RelSeq{0}, TuSeq{12},
+                                                   Digest128{}, input, limits());
+        require(envelope.begin.profile == ProfileId::GRZ &&
+                    envelope.begin.body.encoding == kGrzResidualBodyEncoding,
+                "GRZ_RESIDUAL did not use the frozen profile and body encoding");
+        require(decode_grz_residual(envelope.begin, envelope.body, limits()) == input,
+                "GRZ_RESIDUAL corpus replay changed exact bytes");
+        auto corrupt = envelope.body;
+        corrupt.back() ^= 1;
+        require_throws<std::exception>(
+            [&] { (void)decode_grz_residual(envelope.begin, corrupt, limits()); },
+            "GRZ_RESIDUAL accepted a corrupt object");
+    }
+    const std::vector<uint8_t> input{'g', 'r', 'z', '-', 'r', 'e', 's', 'i', 'd', 'u', 'a', 'l'};
+    const auto envelope = encode_grz_residual(HistoryNonce{8}, RelSeq{0}, TuSeq{12},
+                                               Digest128{}, input, limits());
+    const auto config = ProfileDialogueConfig{
+        .negotiated_profiles = profile_bit(ProfileId::GRZ),
+        .max_encoded_body_bytes = limits().max_encoded_body_bytes,
+        .max_raw_bytes = limits().max_raw_bytes,
+        .max_window_log = limits().max_window_log};
+    ProfileDialogue dialogue = make_profile_dialogue(ProfileId::GRZ, config);
+    dialogue.begin(envelope.begin);
+    dialogue.append_body(BodyMessage{envelope.body});
+    require(dialogue.materialize() == input,
+            "GRZ_RESIDUAL dialogue did not materialize exact bytes");
+    dialogue.commit_visible(route_commit(envelope.begin));
+#else
     require_throws<std::invalid_argument>(
         [] {
             (void)make_profile_dialogue(
@@ -345,6 +379,7 @@ void test_factory_rejects_unsupported_or_unnegotiated() {
                                       .max_window_log = limits().max_window_log});
         },
         "factory admitted unsupported GRZ profile");
+#endif
     require_throws<std::invalid_argument>(
         [] {
             (void)make_profile_dialogue(

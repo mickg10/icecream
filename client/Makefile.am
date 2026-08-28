@@ -23,7 +23,7 @@ icecc_LDADD = \
 	../cache/libp50adoptedoutcomewriter.a \
 	../cache/libprotocol50.a \
 	../services/libicecc.la \
-	$(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
+	$(LIBZSTD_LIBS) $(LIBBSC_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 icecc_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 icecc_CXXFLAGS = -pthread
 icecc_LDFLAGS = $(BOOST_LDFLAGS) -pthread

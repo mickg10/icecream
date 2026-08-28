@@ -7782,7 +7782,9 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
         trace() << "P50 CompileFile attached exact "
                 << (arm.cache_profile == CACHE_PROFILE_ZSTD_ROUTE
                         ? "ZSTD_ROUTE"
-                        : "ZSTD_TU")
+                        : (arm.cache_profile == CACHE_PROFILE_GRZ
+                               ? "GRZ_RESIDUAL"
+                               : "ZSTD_TU"))
                 << " input for job "
                 << job->jobID() << endl;
         return true;

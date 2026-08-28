@@ -151,7 +151,8 @@ struct P50ZstdSourceSender::Impl {
     }
 
     PrepareRequestKey begin_transfer() {
-        if (config.endpoint_caps.profile == ProfileId::ZSTD_TU) {
+        if (config.endpoint_caps.profile == ProfileId::ZSTD_TU ||
+            config.endpoint_caps.profile == ProfileId::GRZ) {
             if (used) throw std::logic_error("sender is one-shot");
             used = true;
             return request;

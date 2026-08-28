@@ -578,10 +578,14 @@ const uint32_t CACHE_PROFILE_ZSTD_ROUTE = CACHE_PROFILE_Z3_LONG;
 const uint32_t CACHE_DECLARED_PROFILE_MASK =
     CACHE_PROFILE_P29 | CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_GRZ
     | CACHE_PROFILE_Z3_LONG | CACHE_PROFILE_Z3_SHARED_LONG;
-/* The converged M2 endpoint has one runnable product dialogue.  Declaring a
-   profile name must never advertise a codec which cannot reconstruct input. */
+/* The endpoint advertises only runnable product dialogues.  GRZ is included
+   only in builds that linked the reviewed libbsc residual implementation. */
 const uint32_t CACHE_ADVERTISABLE_PROFILE_MASK =
-    CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE;
+    CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE
+#if defined(ICECC_P50_WITH_LIBBSC)
+    | CACHE_PROFILE_GRZ
+#endif
+    ;
 
 /* An optional scheduler-local request chooses the one source profile carried
    in each assignment.  An absent request preserves the historical ROUTE-first
@@ -590,6 +594,7 @@ enum class P50CacheProfileRequest : uint8_t {
     Default,
     ZSTD_TU,
     ZSTD_ROUTE,
+    GRZ_RESIDUAL,
     Unsupported,
 };
 
@@ -603,6 +608,8 @@ inline P50CacheProfileRequest p50_cache_profile_request_from_env() noexcept
         return P50CacheProfileRequest::ZSTD_TU;
     if (requested == "ZSTD_ROUTE")
         return P50CacheProfileRequest::ZSTD_ROUTE;
+    if (requested == "GRZ" || requested == "GRZ_RESIDUAL")
+        return P50CacheProfileRequest::GRZ_RESIDUAL;
     return P50CacheProfileRequest::Unsupported;
 }
 
@@ -626,16 +633,21 @@ inline constexpr uint32_t p50_select_cache_profile(
         return (advertised & CACHE_PROFILE_ZSTD_ROUTE) != 0
                    ? CACHE_PROFILE_ZSTD_ROUTE
                    : 0;
+    case P50CacheProfileRequest::GRZ_RESIDUAL:
+        return (advertised & CACHE_PROFILE_GRZ) != 0
+                   ? CACHE_PROFILE_GRZ
+                   : 0;
     case P50CacheProfileRequest::Unsupported:
         return 0;
     }
     return 0;
 }
 
-/* Source-arm mode values are deliberately closed to the two runnable source
+/* Source-arm mode values are deliberately closed to the runnable source
    profiles and are never accepted independently of cache_profile. */
 inline constexpr uint32_t P50_SOURCE_MODE_ZSTD_TU = UINT32_C(1);
 inline constexpr uint32_t P50_SOURCE_MODE_ZSTD_ROUTE = UINT32_C(2);
+inline constexpr uint32_t P50_SOURCE_MODE_GRZ_RESIDUAL = UINT32_C(3);
 
 inline constexpr bool p50_source_profile_mode_valid(uint32_t profile,
                                                      uint32_t source_mode) noexcept
@@ -643,13 +655,22 @@ inline constexpr bool p50_source_profile_mode_valid(uint32_t profile,
     return (profile == CACHE_PROFILE_ZSTD_TU &&
             source_mode == P50_SOURCE_MODE_ZSTD_TU) ||
            (profile == CACHE_PROFILE_ZSTD_ROUTE &&
-            source_mode == P50_SOURCE_MODE_ZSTD_ROUTE);
+            source_mode == P50_SOURCE_MODE_ZSTD_ROUTE)
+#if defined(ICECC_P50_WITH_LIBBSC)
+           || (profile == CACHE_PROFILE_GRZ &&
+               source_mode == P50_SOURCE_MODE_GRZ_RESIDUAL)
+#endif
+           ;
 }
 
 inline constexpr bool p50_source_profile_selection_valid(uint32_t profiles) noexcept
 {
     return profiles == CACHE_PROFILE_ZSTD_TU ||
-           profiles == CACHE_PROFILE_ZSTD_ROUTE;
+           profiles == CACHE_PROFILE_ZSTD_ROUTE
+#if defined(ICECC_P50_WITH_LIBBSC)
+           || profiles == CACHE_PROFILE_GRZ
+#endif
+           ;
 }
 
 /* The one ordinary-link request used by the compiler-side cache seam.  This

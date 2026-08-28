@@ -10,7 +10,7 @@ icecc_cache_service_LDADD = libp50endpoint.a libp50adoptedoutcomewriter.a \
 	libp50inputfd.a \
 	libp50inputlifecycle.a libprotocol50.a \
 	libp50localtransport.a ../services/libicecc.la \
-	$(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
+	$(LIBZSTD_LIBS) $(LIBBSC_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 icecc_cache_service_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 icecc_cache_service_CXXFLAGS = -O2 -Werror -pthread
 icecc_cache_service_LDFLAGS = $(BOOST_LDFLAGS) -pthread
@@ -26,6 +26,9 @@ libprotocol50_a_SOURCES = \
 	p50_slice0.h \
 	p50_profile.cpp \
 	p50_profile.h \
+	p50_grz.cpp \
+	p50_grz.h \
+	p50_grz_residual_codec.h \
 	p50_zstd.cpp \
 	p50_zstd.h \
 	p50_input_record.cpp \
@@ -54,7 +57,7 @@ libprotocol50_a_SOURCES = \
 	p50_fsession_payloads.cpp \
 	p50_fsession_payloads.h
 
-AM_CPPFLAGS = -I$(top_srcdir) $(LIBZSTD_CFLAGS)
+AM_CPPFLAGS = -I$(top_srcdir) $(LIBZSTD_CFLAGS) $(LIBBSC_CFLAGS)
 libp50endpoint_a_SOURCES = p50_endpoint.cpp p50_endpoint.h \
 	p50_endpoint_run_cancel.cpp p50_endpoint_run_cancel.h
 libp50endpoint_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
@@ -238,6 +241,9 @@ EXTRA_DIST = \
 	P50_PREBOUND_TWO_ROLE.md \
 	p50_adopted_outcome_writer.cpp \
 	p50_adopted_outcome_writer.h \
+	../vendor/libbsc/PROVENANCE \
+	../vendor/libbsc/SOURCE-MANIFEST.sha256 \
+	../vendor/libbsc/LICENSE \
 	formal/README.md
 
 check-local:

@@ -28,9 +28,11 @@ std::optional<ProfileId> p50_zstd_selected_profile(
         assignment.cache_protocol != CACHE_WIRE_PROTOCOL_V1 ||
         !p50_source_profile_selection_valid(assignment.cache_profile_mask))
         return std::nullopt;
-    return assignment.cache_profile_mask == CACHE_PROFILE_ZSTD_ROUTE
-               ? std::optional<ProfileId>{ProfileId::Z3_LONG}
-               : std::optional<ProfileId>{ProfileId::ZSTD_TU};
+    if (assignment.cache_profile_mask == CACHE_PROFILE_ZSTD_ROUTE)
+        return ProfileId::Z3_LONG;
+    if (assignment.cache_profile_mask == CACHE_PROFILE_GRZ)
+        return ProfileId::GRZ;
+    return ProfileId::ZSTD_TU;
 }
 
 CStoreGuid derive_compile_c_store_guid(const CompileJob& job,
