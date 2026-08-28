@@ -542,7 +542,8 @@ class Runtime:
                 HOME=str(self.root / "home"))
             return [str(self.build / "daemon/iceccd"), *args], values
         command = ["docker", "run", "--rm", "--name", self._client_docker_name(node),
-                   "--network", "host", "--user", "0", "--cap-add", "SYS_CHROOT",
+                   "--network", "host", "--pid", "host", "--user", "0",
+                   "--cap-add", "SYS_CHROOT",
                    "-v", str(self.build) + ":/role:ro", "-v", str(self.root) + ":/work",
                    "-e", "S6_ROLE_UID=" + str(os.getuid()),
                    "-e", "S6_ROLE_GID=" + str(os.getgid())]
