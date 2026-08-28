@@ -34,6 +34,7 @@ class P5coEndpointHandoff;
 struct EndpointCaps {
     SessionLimits wire{};
     ZstdTuLimits zstd{uint64_t{64} << 20, uint64_t{2} << 30};
+    ProfileId profile = ProfileId::ZSTD_TU;
     auto operator<=>(const EndpointCaps&) const = default;
 };
 
@@ -198,7 +199,8 @@ public:
         CStoreGuid c_store_guid,
         ZstdTuLimits zstd_limits = {uint64_t{64} << 20, uint64_t{2} << 30},
                                      PreparationAuthorityLimits authority_limits = {},
-                                     int compression_level = 1);
+                                     int compression_level = 1,
+                                     ProfileId profile = ProfileId::ZSTD_TU);
     ~P50PreparationAuthority();
     P50PreparationAuthority(const P50PreparationAuthority&) = delete;
     P50PreparationAuthority& operator=(const P50PreparationAuthority&) = delete;
@@ -207,12 +209,14 @@ public:
                              std::span<const uint8_t> exact_input);
     uint64_t retain(PreparedTuHandle handle);
     uint64_t release(PreparedTuHandle handle);
+    void commit(PreparedTuHandle handle);
 
     [[nodiscard]] CStoreGuid c_store_guid() const;
     [[nodiscard]] ZstdTuLimits zstd_limits() const;
     [[nodiscard]] bool contains(PreparedTuHandle handle) const;
     [[nodiscard]] size_t live_entry_count() const;
     [[nodiscard]] uint64_t retained_encoded_bytes() const;
+    [[nodiscard]] ProfileId profile() const;
 
 private:
     std::shared_ptr<const ZstdTuEnvelope> resolve(PreparedTuHandle handle) const;

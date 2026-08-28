@@ -86,7 +86,7 @@ struct P50ZstdSourceSender::Impl {
             throw std::invalid_argument("ZSTD_TU raw limit does not fit this process");
         authority = std::make_shared<P50PreparationAuthority>(
             c_guid, config.endpoint_caps.zstd, config.authority_limits,
-            config.compression_level);
+            config.compression_level, config.endpoint_caps.profile);
         endpoint = std::make_unique<P50ClientEndpoint>(
             authority, config.endpoint_caps, HistoryNonce{1});
     }

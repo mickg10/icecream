@@ -361,7 +361,8 @@ struct TestClient {
     explicit TestClient(CStoreGuid c_store_guid, EndpointCaps caps = {},
                         HistoryNonce first_history_nonce = HistoryNonce{1},
                         CompletionLog* completions = nullptr, ActionTrace* actions = nullptr)
-        : authority(std::make_shared<P50PreparationAuthority>(c_store_guid, caps.zstd)),
+        : authority(std::make_shared<P50PreparationAuthority>(c_store_guid, caps.zstd,
+                                                              {}, 1, caps.profile)),
           endpoint(authority, caps, first_history_nonce, completions, actions) {}
 
     operator P50ClientEndpoint&() { return endpoint; }
@@ -466,6 +467,46 @@ PairResult run_pair(P50ClientEndpoint& client, P50ServerEndpoint& server,
         asio::use_future);
     context.run();
     return {client_result.get(), server_result.get()};
+}
+
+void test_zstd_route_endpoint_continuation_and_retry() {
+    const P5coStoreGuids guids = p5co_store_guids(811);
+    EndpointCaps caps;
+    caps.profile = ProfileId::Z3_LONG;
+    caps.zstd.max_raw_bytes = 1U << 20;
+    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    P50ServerEndpoint server(guids.f, caps);
+    TestClient client(guids.c, caps);
+    const std::vector<uint8_t> first(64 * 1024, 0x41);
+    const std::vector<uint8_t> second(64 * 1024, 0x41);
+    const PreparedTuHandle first_prepared = admit(client, first);
+    const PairResult first_pair = run_pair(client, server, first_prepared);
+    require(first_pair.client.status == ClientRunStatus::Committed &&
+                first_pair.server.status == ServerRunStatus::Completed &&
+                copy_input(server, guids.c) == first,
+            "ZSTD_ROUTE first endpoint TU did not commit exact bytes");
+
+    const PreparedTuHandle second_prepared = admit(client, second);
+    const PairResult second_pair = run_pair(client, server, second_prepared);
+    require(second_pair.client.status == ClientRunStatus::Committed &&
+                second_pair.server.status == ServerRunStatus::Completed &&
+                copy_input(server, guids.c) == second,
+            "ZSTD_ROUTE second endpoint TU did not use the live route");
+
+    const std::vector<uint8_t> failed(64 * 1024, 0x42);
+    const PreparedTuHandle failed_prepared = admit(client, failed);
+    const PairResult disconnected = run_pair(
+        client, server, failed_prepared,
+        EndpointIoControl{.close_after_write = MessageType::BODY});
+    require(disconnected.client.status == ClientRunStatus::Disconnected &&
+                disconnected.server.status == ServerRunStatus::Disconnected &&
+                client.has_active_transaction(),
+            "ZSTD_ROUTE failed TU did not retain exact retry identity");
+    const PairResult retried = run_pair(client, server, failed_prepared);
+    require(retried.client.status == ClientRunStatus::Committed &&
+                retried.server.status == ServerRunStatus::Completed &&
+                copy_input(server, guids.c) == failed,
+            "ZSTD_ROUTE retry did not discard tentative state and commit exact bytes");
 }
 
 PairResult run_adopted_pair(P50ClientEndpoint& client, P50ServerEndpoint& server,
@@ -5517,6 +5558,7 @@ int main(int argc, char** argv) {
     test_adopted_endpoint_disconnect_and_invalid_rows();
     test_adopted_cross_executor_releases_registration();
     test_two_client_one_server_isolation();
+    test_zstd_route_endpoint_continuation_and_retry();
     report_zstd1_metrics(performance_gate);
     std::cout << "p50_endpoint_test: PASS\n";
     return 0;

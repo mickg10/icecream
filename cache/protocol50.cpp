@@ -85,7 +85,7 @@ void validate_tx_begin_intrinsic(const TxBegin& begin) {
 
 void validate_session_state_intrinsic(const SessionState& state) {
     if (state.selected_protocol != kProtocolVersion || state.negotiated_profiles == 0 ||
-        (state.negotiated_profiles & ~kKnownProfileMask) != 0)
+        (state.negotiated_profiles & ~kOperationalProfileMask) != 0)
         throw std::invalid_argument(
             "SESSION_STATE selected an unimplemented protocol or profile mask");
     if (state.f_store_guid == FStoreGuid{})
@@ -352,7 +352,8 @@ SessionSelection negotiate_session(const SessionHello& hello,
         throw std::invalid_argument(
             "peers do not both implement Protocol 50");
 
-    const uint32_t common = hello.supported_profiles & server_profiles & kKnownProfileMask;
+    const uint32_t common = hello.supported_profiles & server_profiles &
+                            kOperationalProfileMask;
     if (common == 0) throw std::invalid_argument("session profiles do not overlap");
     return {kProtocolVersion, common,
             {std::min(hello.limits.max_frame_payload,

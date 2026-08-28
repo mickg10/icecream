@@ -566,7 +566,7 @@ void ZstdRouteDialogue::commit_visible(const TxCommit& commit) {
 }
 
 void ZstdRouteDialogue::discard_tentative() noexcept {
-    if (state_ != State::Idle && state_ != State::Terminal) {
+    if (state_ != State::Idle) {
         clear_active();
         state_ = State::Idle;
     }

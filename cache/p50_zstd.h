@@ -81,11 +81,7 @@ std::vector<uint8_t> decode_zstd_tu(const TxBegin& begin,
                                     std::span<const uint8_t> encoded_body,
                                     ZstdTuLimits limits);
 
-struct ZstdRouteEnvelope {
-    TxBegin begin;
-    std::vector<uint8_t> body;
-    auto operator<=>(const ZstdRouteEnvelope&) const = default;
-};
+using ZstdRouteEnvelope = ZstdTuEnvelope;
 
 // A route is encoded by replaying the committed raw TUs into a fresh bounded
 // level-3 stream, then flushing the candidate TU.  Keeping this reconstruction
