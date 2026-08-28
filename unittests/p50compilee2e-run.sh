@@ -94,10 +94,55 @@ chmod 1777 "$work/envs-f" "$work/envs-c"
 chmod 0700 "$work/cache-runtime-f" "$work/home"
 HOME="$work/home"
 export HOME
-port_sched=${ICECC_P50_C1F1_SCHED_PORT:-$((22000 + ($$ % 1000)))}
-port_worker=${ICECC_P50_C1F1_WORKER_PORT:-$((23000 + ($$ % 1000)))}
+pick_port_pair() {
+    python3 - <<'PY'
+import secrets
+import socket
+
+start = 40000 + 2 * secrets.randbelow(9000)
+for offset in range(0, 10000, 2):
+    base = start + offset
+    if base + 1 >= 60000:
+        base -= 18000
+    sockets = []
+    try:
+        # The scheduler owns TCP scheduler_port + 1 for its text endpoint;
+        # keep that reserved and place F on the next port.
+        for port in (base, base + 1, base + 2):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(('0.0.0.0', port))
+            sockets.append(sock)
+    except OSError:
+        for sock in sockets:
+            sock.close()
+        continue
+    for sock in sockets:
+        sock.close()
+    print(base, base + 2)
+    break
+else:
+    raise SystemExit('no available scheduler/worker port pair')
+PY
+}
+if test -n "${ICECC_P50_C1F1_SCHED_PORT:-}" || test -n "${ICECC_P50_C1F1_WORKER_PORT:-}"; then
+    port_sched=${ICECC_P50_C1F1_SCHED_PORT:-}
+    port_worker=${ICECC_P50_C1F1_WORKER_PORT:-}
+else
+    ports=$(pick_port_pair)
+    port_sched=${ports%% *}
+    port_worker=${ports##* }
+fi
+test -n "$port_sched" && test -n "$port_worker" || {
+    echo "FAIL: scheduler and worker ports must be specified together" >&2
+    exit 1
+}
 test "$port_sched" != "$port_worker" || {
     echo "FAIL: scheduler and worker ports must be distinct" >&2
+    exit 1
+}
+test "$port_worker" -ne "$((port_sched + 1))" || {
+    echo "FAIL: worker port collides with scheduler text endpoint" >&2
     exit 1
 }
 network="p50c1f1-$$"
