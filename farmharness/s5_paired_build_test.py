@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from farmharness.s5_paired_build import (
-    _parse_tu_ledger, _remote_script, immutable_json, load_workload, preflight,
+    _parse, _parse_tu_ledger, _remote_script, immutable_json, load_workload, preflight,
     role_manifest, run_build,
     schedule, schedule_matrix,
 )
@@ -127,6 +127,13 @@ class PairedRunnerTest(unittest.TestCase):
         self.assertEqual(rows[0]["remote_bytes"], 12)
         self.assertTrue(rows[0]["byte_identical"])
 
+    def test_parse_selected_profile_is_explicit(self):
+        fields, _ = _parse("S5_SELECTED_PROFILE=ZSTD_ROUTE\n"
+                           "S5_SELECTED_TU_COUNT=0\n"
+                           "S5_SELECTED_ROUTE_COUNT=1\n")
+        self.assertEqual(fields["S5_SELECTED_PROFILE"], "ZSTD_ROUTE")
+        self.assertEqual(fields["S5_SELECTED_ROUTE_COUNT"], "1")
+
     def test_build_row_keeps_one_aggregate_and_exact_ledger(self):
         tus = [{"tu_id": "fmt-a", "source": "src/a.cc", "source_sha256": "a" * 64,
                 "flags": ["-O2"]},
@@ -139,6 +146,8 @@ class PairedRunnerTest(unittest.TestCase):
             for name in ("a", "b"))
         stdout = ("S4_STATUS=PASS reason=remote-byte-identical\n"
                   "S5_MEASURE_START_NS=100\nS5_MEASURE_END_NS=2100\n"
+                  "S5_SELECTED_PROFILE=ZSTD_TU\nS5_SELECTED_TU_COUNT=2\n"
+                  "S5_SELECTED_ROUTE_COUNT=0\n"
                   "S4_CACHE_OBSERVED=1\nS4_LEGACY_OBSERVED=0\n"
                   "S4_REMOTE_COMPILE=1\nS4_BYTE_IDENTICAL=1\n" + ledger)
         args = type("Args", (), {"p50_remote_root": "/tmp/staged",
@@ -153,6 +162,9 @@ class PairedRunnerTest(unittest.TestCase):
         self.assertEqual(len(row["tu_ledger"]), 2)
         self.assertAlmostEqual(row["aggregate_wall_seconds"], 0.000002)
         self.assertEqual(row["command"][-3:], ["-", "c1f1", "0"])
+        self.assertEqual(row["selected_profile"], "ZSTD_TU")
+        self.assertEqual(row["selected_tu_count"], 2)
+        self.assertEqual(row["selected_route_count"], 0)
 
 
 if __name__ == "__main__":

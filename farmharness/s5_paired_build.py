@@ -43,11 +43,11 @@ PROCESS_MARKERS = ("icecc-scheduler", "iceccd", "icecc-cache-service", "icecc")
 # this S5 identity private to the runner: changing S4's historical matrix
 # constants would silently alter its prior evidence.
 P50_ROLE_HASHES = {
-    "S": "15f70cf600d316d2a9692ee7e6fb93da94180767a42fad1a36ea532dc7a9a275",
-    "F": "39639ed2c82fa4846073910904bc66e07fc945c653ed72e6a376349ec0ab8fe5",
-    "C": "e21e60e47c9e5499db34cf578c87dece339e9fba5804f22096961980a8a95e61",
+    "S": "7af33781ff63b050bd9634faac600c52e38f0edb1e0c5c48402fa2af4204d605",
+    "F": "d923dcb187fb87d5395a82bfb4507e224d81a9499f4c45cf789a1f262df4bd0f",
+    "C": "781804278af9aff93bff9d4f2f87a6d3152bc1cbe1804e41b926b1a0f22ebb9d",
     "E": "ee7d30b240c38bccf66d4afcdd45993f115a01d4a2fb4e9143d38596609d2ba4",
-    "X": "cefc8b0936c4f4bd1e9e26427cdd59b17a1ea6bc0f63952b928232d9cb784394",
+    "X": "5af26a01bc98fd6070b8c1e075b68f5969f1d15fb08aa1a231dd9319d238a062",
 }
 SSH = ["-o", "HostName=10.0.27.101", "-o", "HostKeyAlias=tt-quietbox3",
        "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
@@ -399,6 +399,11 @@ def _manifest_remote_script(source_archive_b64: str, tus: list[dict[str, Any]], 
             '[ -n "$S5_PREWARM_STATE_DIGEST" ] && [ -n "$S5_PREWARM_C_GUID" ] && [ -n "$S5_PREWARM_F_STORE_GENERATION" ] && [ -n "$S5_PREWARM_SCHEDULER_EPOCH" ] || { echo \'S4_STATUS=HOLD reason=prewarm-product-identity-unavailable\'; exit 77; }',
             '[ "${S5_PREWARM_TU_SEQ_COUNT:-0}" -ge ' + str(len(tus)) + ' ] && [ -n "$S5_PREWARM_TU_SEQ_DIGEST" ] && [ "$S5_PREWARM_CLIENT_C_GUID" = 1 ] && [ "$S5_PREWARM_TU_SEQ_ORDER_OK" = 1 ] || { echo \'S4_STATUS=HOLD reason=prewarm-tu-seq-witness-unavailable\'; exit 77; }',
             'printf \'S5_PREWARM state_digest=%s trace=%s c_guid=%s f_store_generation=%s scheduler_epoch=%s tu_seq_count=%s tu_seq_digest=%s\\n\' "$S5_PREWARM_STATE_DIGEST" "$S5_TRACE_FILE" "$S5_PREWARM_C_GUID" "$S5_PREWARM_F_STORE_GENERATION" "$S5_PREWARM_SCHEDULER_EPOCH" "$S5_PREWARM_TU_SEQ_COUNT" "$S5_PREWARM_TU_SEQ_DIGEST"',
+            'S5_PREWARM_SELECTED_TU_COUNT=$(grep -Eoc "P50 CompileFile attached exact ZSTD_TU input" "$WORK"/fdaemon*.log 2>/dev/null || true)',
+            'S5_PREWARM_SELECTED_ROUTE_COUNT=$(grep -Eoc "P50 CompileFile attached exact ZSTD_ROUTE input" "$WORK"/fdaemon*.log 2>/dev/null || true)',
+            'printf \'S5_PREWARM_SELECTED_TU_COUNT=%s\\nS5_PREWARM_SELECTED_ROUTE_COUNT=%s\\n\' "$S5_PREWARM_SELECTED_TU_COUNT" "$S5_PREWARM_SELECTED_ROUTE_COUNT"',
+            'if [ "$S5_PREWARM_SELECTED_ROUTE_COUNT" -ne 0 ]; then echo \'S5_SELECTED_PROFILE=ZSTD_ROUTE\'; echo \'S4_STATUS=HOLD reason=selected-profile-not-zstd-tu\'; exit 77; fi',
+            'if [ "$S5_PREWARM_SELECTED_TU_COUNT" -ne ' + str(len(tus)) + ' ]; then echo \'S5_SELECTED_PROFILE=UNKNOWN\'; echo \'S4_STATUS=HOLD reason=selected-profile-not-zstd-tu\'; exit 77; fi',
         ]
     body += ["S5_MEASURE_START_NS=$(date +%s%N)",
              'echo "S5_MEASURE_START_NS=$S5_MEASURE_START_NS"']
@@ -420,7 +425,14 @@ def _manifest_remote_script(source_archive_b64: str, tus: list[dict[str, Any]], 
             f'cmp -s "$WORK/out/remote-{index}.o" "$WORK/out/reference-{index}.o" && S5_IDENTICAL_{index}=1 || S5_ALL_IDENTICAL=0',
             f'printf \'S5_TU_LEDGER tu_id=%s source=%s remote_sha256=%s remote_bytes=%s reference_sha256=%s reference_bytes=%s byte_identical=%s\\n\' {shlex.quote(tu_id)} {shlex.quote(str(tu["source"]))} "$S5_REMOTE_SHA_{index}" "$S5_REMOTE_BYTES_{index}" "$S5_REFERENCE_SHA_{index}" "$S5_REFERENCE_BYTES_{index}" "$S5_IDENTICAL_{index}"',
         ]
+    expected_profile_count = len(tus) * (2 if warm else 1)
     body += [
+        'S5_SELECTED_TU_COUNT=$(grep -Eoc "P50 CompileFile attached exact ZSTD_TU input" "$WORK"/fdaemon*.log 2>/dev/null || true)',
+        'S5_SELECTED_ROUTE_COUNT=$(grep -Eoc "P50 CompileFile attached exact ZSTD_ROUTE input" "$WORK"/fdaemon*.log 2>/dev/null || true)',
+        'printf \'S5_SELECTED_TU_COUNT=%s\\nS5_SELECTED_ROUTE_COUNT=%s\\n\' "$S5_SELECTED_TU_COUNT" "$S5_SELECTED_ROUTE_COUNT"',
+        'if [ "$S5_SELECTED_ROUTE_COUNT" -ne 0 ]; then echo \'S5_SELECTED_PROFILE=ZSTD_ROUTE\'; echo \'S4_STATUS=HOLD reason=selected-profile-not-zstd-tu\'; exit 77; fi',
+        'if [ "$S5_SELECTED_TU_COUNT" -ne ' + str(expected_profile_count) + ' ]; then echo \'S5_SELECTED_PROFILE=UNKNOWN\'; echo \'S4_STATUS=HOLD reason=selected-profile-not-zstd-tu\'; exit 77; fi',
+        'echo \'S5_SELECTED_PROFILE=ZSTD_TU\'',
         'if [ "$S5_ALL_IDENTICAL" -ne 1 ]; then echo \'S4_STATUS=FAIL reason=object-not-byte-identical\'; exit 1; fi',
         'if [ "$WARM" = 1 ]; then',
         '  S5_POST_C_GUID=$(grep -Eho \'C_STORE_GUID=[0-9A-Fa-f]{32}\' "$WORK"/*.trace "$WORK"/*.log 2>/dev/null | head -1 | cut -d= -f2 || true)',
@@ -474,6 +486,8 @@ def _manifest_remote_script(source_archive_b64: str, tus: list[dict[str, Any]], 
                             '"ICECC_VERSION=$ENV_TAR" "ICECC_PREFERRED_HOST=s4-f" "ICECC_P50_COMPILE_IDENTITY_TRACE=$WORK/compile_identity.trace"', 1)
     script = script.replace('[ "$EXPECT_CACHE" = 1 ] && CLIENT_ENV+=("ICECC_P50_C1F1_REQUIRED=1")',
                             '[ "$EXPECT_CACHE" = 1 ] && CLIENT_ENV+=("ICECC_P50_C1F1_REQUIRED=1" "ICECC_CARET_WORKAROUND=0")')
+    script = script.replace("grep -E 'RELOGIN s4-f.*cache=.*cache_profiles=.*zstd_tu'",
+                            "grep -E 'RELOGIN s4-f.*cache=.*cache_profiles=[^ ]+'", 1)
     if mode == "legacy":
         strict_scheduler = ('case "$CELL" in\n'
                             '  s50-c50-f50|s50-c50-f50-c1f2) S_EXTRA="--assignment-fence-mode strict-nonce";;\n'
@@ -710,6 +724,11 @@ def run_build(args: argparse.Namespace, run_root: Path, block: dict[str, Any],
         "cache_observed": fields.get("S4_CACHE_OBSERVED") == "1",
         "legacy_observed": fields.get("S4_LEGACY_OBSERVED") == "1",
         "remote_compile": fields.get("S4_REMOTE_COMPILE") == "1",
+        "selected_profile": fields.get("S5_SELECTED_PROFILE"),
+        "selected_tu_count": int(fields["S5_SELECTED_TU_COUNT"])
+                              if fields.get("S5_SELECTED_TU_COUNT", "").isdigit() else None,
+        "selected_route_count": int(fields["S5_SELECTED_ROUTE_COUNT"])
+                                  if fields.get("S5_SELECTED_ROUTE_COUNT", "").isdigit() else None,
         "byte_identical": fields.get("S4_BYTE_IDENTICAL") == "1" and
                           all(row["byte_identical"] for row in ledger),
         "tu_ledger": ledger,
