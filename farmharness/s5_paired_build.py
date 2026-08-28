@@ -31,7 +31,7 @@ from capability.distribution import s5_statistics
 
 
 SCHEMA = "icecream-s5-zstd-tu-paired-run-v1"
-EXPECTED_ROOT = "9a1653e600fbb28a7edeef02c10c5ccc5fe8fcad"
+EXPECTED_ROOT = "04006b9d94161a047154121f47785aec747ffd87"
 # This field is a historical name in the S5 schema; it carries the pinned
 # source commit identity, not a digest of the external workload checkout.
 SOURCE_SHA = EXPECTED_ROOT
@@ -43,8 +43,8 @@ PROCESS_MARKERS = ("icecc-scheduler", "iceccd", "icecc-cache-service", "icecc")
 # this S5 identity private to the runner: changing S4's historical matrix
 # constants would silently alter its prior evidence.
 P50_ROLE_HASHES = {
-    "S": "7af33781ff63b050bd9634faac600c52e38f0edb1e0c5c48402fa2af4204d605",
-    "F": "d923dcb187fb87d5395a82bfb4507e224d81a9499f4c45cf789a1f262df4bd0f",
+    "S": "f1bfc8e6b4fb44815b00efa281c36b0ee35a0faeffb394a320ae908a7fb60750",
+    "F": "b803bf877ff4ff5023a8f96819bd86c530ab54e32405e1f6d12fee9c68126b19",
     "C": "781804278af9aff93bff9d4f2f87a6d3152bc1cbe1804e41b926b1a0f22ebb9d",
     "E": "ee7d30b240c38bccf66d4afcdd45993f115a01d4a2fb4e9143d38596609d2ba4",
     "X": "5af26a01bc98fd6070b8c1e075b68f5969f1d15fb08aa1a231dd9319d238a062",
@@ -495,6 +495,16 @@ def _manifest_remote_script(source_archive_b64: str, tus: list[dict[str, Any]], 
         if strict_scheduler not in script:
             raise RuntimeError("S4 strict scheduler seam changed")
         script = script.replace(strict_scheduler, 'S_EXTRA=""', 1)
+    scheduler_start = ('"$S" -p "$SCHED_PORT" -n "$NET" '
+                       '-l "$WORK/scheduler.log" -vvv $S_EXTRA')
+    if scheduler_start not in script:
+        raise RuntimeError("S4 scheduler launch seam changed")
+    if mode == "cache":
+        script = script.replace(
+            scheduler_start,
+            'ICECC_P50_PROFILE=ZSTD_TU ' + scheduler_start,
+            1,
+        )
     for key, role in (("$S_HASH", "S"), ("$C_HASH", "C"), ("$D_HASH", "F"),
                       ("$F_HASH", "F"), ("$E_HASH", "E")):
         script = script.replace(key, P50_ROLE_HASHES[role])

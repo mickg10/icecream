@@ -74,6 +74,8 @@ class PairedRunnerTest(unittest.TestCase):
         legacy = _remote_script("archive", [tu], "legacy", Path("/unused"))
         self.assertIn("--assignment-fence-mode strict-nonce", cache)
         self.assertNotIn("--assignment-fence-mode strict-nonce", legacy)
+        self.assertIn('ICECC_P50_PROFILE=ZSTD_TU "$S"', cache)
+        self.assertNotIn("ICECC_P50_PROFILE=ZSTD_TU", legacy)
         self.assertIn("S5_MEASURE_END_NS=$(date +%s%N)\ng++ -O3", cache)
         # The marker is emitted by each S4 result cell; all lifecycle result
         # cells carry the same aggregate timing boundary.
