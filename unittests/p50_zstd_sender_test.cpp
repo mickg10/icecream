@@ -215,6 +215,198 @@ void test_route_sender_reuses_relationship_for_two_transfers() {
     CHECK(reset_result.committed_input->tu_seq.value == 0);
 }
 
+void test_explicit_route_operations_bind_request_and_deadline() {
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    EndpointCaps caps;
+    caps.profile = ProfileId::Z3_LONG;
+    caps.zstd.max_raw_bytes = 1U << 20;
+    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    P50ServerEndpointConfig server_config;
+    server_config.input_job_state = [](CStoreGuid, const TxBegin&, const TxCommit&,
+                                       std::span<const uint8_t>) {
+        return InputJobState::Open;
+    };
+    P50ServerEndpoint server(Id128::from_u64(7032), caps, nullptr, nullptr,
+                             server_config);
+
+    // A persistent owner outlives the constructor operation.  Its later
+    // transfers must use their own current deadline rather than this stale
+    // compatibility deadline.
+    ZstdSourceTransferConfig persistent_config = route_config();
+    persistent_config.deadline =
+        std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    P50ZstdSourceSender sender(Id128::from_u64(7031),
+                               PrepareRequestKey{100, 1}, persistent_config);
+    const PrepareRequestKey first_request{7001, 9001};
+    const PrepareRequestKey second_request{7002, 99001};
+    const std::vector<uint8_t> first{'e', 'x', 'a', 'c', 't', '-', '1'};
+    const std::vector<uint8_t> second{'e', 'x', 'a', 'c', 't', '-', '2'};
+
+    auto first_server = asio::co_spawn(context, server.accept_one(acceptor),
+                                        asio::use_future);
+    auto first_transfer = asio::co_spawn(
+        context,
+        sender.transfer_route(acceptor.local_endpoint(), first_request,
+                              std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(10),
+                              first),
+        asio::use_future);
+    context.run();
+    const auto first_result = first_transfer.get();
+    CHECK(first_server.get().status == ServerRunStatus::Completed);
+    CHECK(first_result.status == ZstdSourceTransferStatus::Committed);
+    CHECK(first_result.committed_input.has_value());
+    CHECK(first_result.committed_input->tu_seq.value == 0);
+
+    // Reusing an exact producer request for different bytes is rejected
+    // before another connection is opened or route history can advance.
+    context.restart();
+    const std::vector<uint8_t> wrong{'w', 'r', 'o', 'n', 'g'};
+    auto wrong_transfer = asio::co_spawn(
+        context,
+        sender.transfer_route(acceptor.local_endpoint(), first_request,
+                              std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(10),
+                              wrong),
+        asio::use_future);
+    context.run();
+    CHECK(wrong_transfer.get().status == ZstdSourceTransferStatus::InvalidRequest);
+
+    context.restart();
+    auto second_server = asio::co_spawn(context, server.accept_one(acceptor),
+                                         asio::use_future);
+    auto second_transfer = asio::co_spawn(
+        context,
+        sender.transfer_route(acceptor.local_endpoint(), second_request,
+                              std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(10),
+                              second),
+        asio::use_future);
+    context.run();
+    const auto second_result = second_transfer.get();
+    CHECK(second_server.get().status == ServerRunStatus::Completed);
+    CHECK(second_result.status == ZstdSourceTransferStatus::Committed);
+    CHECK(second_result.committed_input.has_value());
+    CHECK(second_result.committed_input->tu_seq.value == 1);
+
+    // The explicit relationship API cannot accidentally turn a TU-scoped
+    // sender into a stateful route owner.
+    P50ZstdSourceSender tu_sender(Id128::from_u64(7033),
+                                  PrepareRequestKey{7033, 1}, config());
+    asio::io_context invalid_context;
+    auto invalid_profile = asio::co_spawn(
+        invalid_context,
+        tu_sender.transfer_route(
+            acceptor.local_endpoint(), PrepareRequestKey{7033, 2},
+            std::chrono::steady_clock::now() + std::chrono::seconds(10), first),
+        asio::use_future);
+    invalid_context.run();
+    CHECK(invalid_profile.get().status == ZstdSourceTransferStatus::InvalidRequest);
+}
+
+void test_explicit_route_retry_preserves_exact_preparation() {
+    ZstdSourceTransferConfig persistent_config = route_config();
+    persistent_config.deadline =
+        std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    P50ZstdSourceSender sender(Id128::from_u64(7041),
+                               PrepareRequestKey{7041, 1}, persistent_config);
+    const PrepareRequestKey request{8001, 177};
+    const std::vector<uint8_t> source{'r', 'e', 't', 'a', 'i', 'n'};
+
+    unsigned failed_connections = 0;
+    asio::io_context failed_context;
+    auto failed = asio::co_spawn(
+        failed_context,
+        sender.transfer_route(
+            ConnectedFdFactory{[&failed_connections](auto) {
+                ++failed_connections;
+                return -1;
+            }},
+            request,
+            std::chrono::steady_clock::now() + std::chrono::seconds(10), source),
+        asio::use_future);
+    failed_context.run();
+    const auto failed_result = failed.get();
+    CHECK(failed_result.status == ZstdSourceTransferStatus::RetryExhausted);
+    CHECK(failed_result.attempts == 2);
+    CHECK(failed_connections == 2);
+
+    asio::io_context out_of_order_context;
+    auto out_of_order = asio::co_spawn(
+        out_of_order_context,
+        sender.transfer_route(
+            ConnectedFdFactory{[](auto) { return -1; }},
+            PrepareRequestKey{8002, 178},
+            std::chrono::steady_clock::now() + std::chrono::seconds(10), source),
+        asio::use_future);
+    out_of_order_context.run();
+    CHECK(out_of_order.get().status == ZstdSourceTransferStatus::InvalidRequest);
+
+    // The retained request is deterministic across a wrapper retry and still
+    // refuses different bytes.
+    asio::io_context wrong_context;
+    const std::vector<uint8_t> wrong{'d', 'i', 'f', 'f'};
+    auto wrong_result = asio::co_spawn(
+        wrong_context,
+        sender.transfer_route(
+            ConnectedFdFactory{[](auto) { return -1; }}, request,
+            std::chrono::steady_clock::now() + std::chrono::seconds(10), wrong),
+        asio::use_future);
+    wrong_context.run();
+    CHECK(wrong_result.get().status == ZstdSourceTransferStatus::InvalidRequest);
+
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    EndpointCaps caps;
+    caps.profile = ProfileId::Z3_LONG;
+    caps.zstd.max_raw_bytes = 1U << 20;
+    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    P50ServerEndpointConfig server_config;
+    server_config.input_job_state = [](CStoreGuid, const TxBegin&, const TxCommit&,
+                                       std::span<const uint8_t>) {
+        return InputJobState::Open;
+    };
+    P50ServerEndpoint server(Id128::from_u64(7042), caps, nullptr, nullptr,
+                             server_config);
+    auto retry_server = asio::co_spawn(context, server.accept_one(acceptor),
+                                        asio::use_future);
+    auto retry = asio::co_spawn(
+        context,
+        sender.transfer_route(acceptor.local_endpoint(), request,
+                              std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(10),
+                              source),
+        asio::use_future);
+    context.run();
+    const auto retry_result = retry.get();
+    CHECK(retry_server.get().status == ServerRunStatus::Completed);
+    CHECK(retry_result.status == ZstdSourceTransferStatus::Committed);
+    CHECK(retry_result.committed_input.has_value());
+    CHECK(retry_result.committed_input->tu_seq.value == 0);
+
+    // A new exact assignment can follow only after the retained predecessor
+    // committed; it observes that predecessor as route history and gets TU1.
+    context.restart();
+    const std::vector<uint8_t> successor{'s', 'u', 'c', 'c', 'e', 's', 's'};
+    auto successor_server = asio::co_spawn(context, server.accept_one(acceptor),
+                                            asio::use_future);
+    auto successor_transfer = asio::co_spawn(
+        context,
+        sender.transfer_route(acceptor.local_endpoint(),
+                              PrepareRequestKey{8002, 178},
+                              std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(10),
+                              successor),
+        asio::use_future);
+    context.run();
+    const auto successor_result = successor_transfer.get();
+    CHECK(successor_server.get().status == ServerRunStatus::Completed);
+    CHECK(successor_result.status == ZstdSourceTransferStatus::Committed);
+    CHECK(successor_result.committed_input.has_value());
+    CHECK(successor_result.committed_input->tu_seq.value == 1);
+}
+
 void test_absolute_deadline_is_required() {
     ZstdSourceTransferConfig expired = config();
     expired.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
@@ -290,6 +482,8 @@ void test_factory_cannot_extend_absolute_deadline() {
 int main() {
     test_exact_network_transfer();
     test_route_sender_reuses_relationship_for_two_transfers();
+    test_explicit_route_operations_bind_request_and_deadline();
+    test_explicit_route_retry_preserves_exact_preparation();
     test_owned_fd_and_fail_closed_validation();
     test_adopted_fd_factory_exact_transfer();
     test_absolute_deadline_is_required();

@@ -97,6 +97,28 @@ public:
     boost::asio::awaitable<ZstdSourceTransferResult> transfer(
         ConnectedFdFactory connection, std::span<const uint8_t> source);
 
+    // A long-lived ZSTD_ROUTE owner must bind every operation to the exact
+    // assignment which produced it and to that operation's current deadline.
+    // Unlike the compatibility overloads above, these calls never synthesize
+    // the next request token and never reuse the constructor deadline.
+    boost::asio::awaitable<ZstdSourceTransferResult> transfer_route(
+        boost::asio::ip::tcp::endpoint remote, PrepareRequestKey request,
+        std::chrono::steady_clock::time_point deadline, OwnedSourceFd source);
+
+    boost::asio::awaitable<ZstdSourceTransferResult> transfer_route(
+        boost::asio::ip::tcp::endpoint remote, PrepareRequestKey request,
+        std::chrono::steady_clock::time_point deadline,
+        std::span<const uint8_t> source);
+
+    boost::asio::awaitable<ZstdSourceTransferResult> transfer_route(
+        ConnectedFdFactory connection, PrepareRequestKey request,
+        std::chrono::steady_clock::time_point deadline, OwnedSourceFd source);
+
+    boost::asio::awaitable<ZstdSourceTransferResult> transfer_route(
+        ConnectedFdFactory connection, PrepareRequestKey request,
+        std::chrono::steady_clock::time_point deadline,
+        std::span<const uint8_t> source);
+
 private:
     using ConnectionTarget =
         std::variant<boost::asio::ip::tcp::endpoint, ConnectedFdFactory>;
@@ -104,6 +126,8 @@ private:
     boost::asio::awaitable<ZstdSourceTransferResult> transfer_bytes(
         ConnectionTarget target,
         PrepareRequestKey request,
+        std::chrono::steady_clock::time_point deadline,
+        bool explicit_route,
         std::shared_ptr<const std::vector<uint8_t>> source);
 
     struct Impl;

@@ -26,9 +26,10 @@ bool nonzero_request(PrepareRequestKey request) {
     return request.producer_session != 0 && request.request_token != 0;
 }
 
-bool valid_deadline(const ZstdSourceTransferConfig& config, Clock::time_point now) {
-    return config.deadline > now && config.maximum_duration > Clock::duration::zero() &&
-           config.deadline - now <= config.maximum_duration;
+bool valid_deadline(Clock::time_point deadline, Clock::duration maximum_duration,
+                    Clock::time_point now) {
+    return deadline > now && maximum_duration > Clock::duration::zero() &&
+           deadline - now <= maximum_duration;
 }
 
 std::optional<std::vector<uint8_t>> read_complete_fd(int fd, uint64_t limit) {
@@ -149,8 +150,11 @@ P50ZstdSourceSender::transfer(boost::asio::ip::tcp::endpoint remote,
     const PrepareRequestKey request = impl_->begin_transfer();
     const auto bytes = read_complete_fd(source.get(),
                                         impl_->config.endpoint_caps.zstd.max_raw_bytes);
-    if (!bytes) return transfer_bytes(ConnectionTarget{remote}, request, {});
-    return transfer_bytes(ConnectionTarget{remote}, request,
+    if (!bytes)
+        return transfer_bytes(ConnectionTarget{remote}, request,
+                              impl_->config.deadline, false, {});
+    return transfer_bytes(ConnectionTarget{remote}, request, impl_->config.deadline,
+                          false,
                           std::make_shared<const std::vector<uint8_t>>(*bytes));
 }
 
@@ -159,8 +163,10 @@ P50ZstdSourceSender::transfer(boost::asio::ip::tcp::endpoint remote,
                                std::span<const uint8_t> source) {
     const PrepareRequestKey request = impl_->begin_transfer();
     if (source.size() > impl_->config.endpoint_caps.zstd.max_raw_bytes)
-        return transfer_bytes(ConnectionTarget{remote}, request, {});
-    return transfer_bytes(ConnectionTarget{remote}, request,
+        return transfer_bytes(ConnectionTarget{remote}, request,
+                              impl_->config.deadline, false, {});
+    return transfer_bytes(ConnectionTarget{remote}, request, impl_->config.deadline,
+                          false,
                           std::make_shared<const std::vector<uint8_t>>(source.begin(),
                                                                          source.end()));
 }
@@ -172,9 +178,11 @@ P50ZstdSourceSender::transfer(ConnectedFdFactory connection,
     const auto bytes = read_complete_fd(source.get(),
                                         impl_->config.endpoint_caps.zstd.max_raw_bytes);
     if (!bytes)
-        return transfer_bytes(ConnectionTarget{std::move(connection)}, request, {});
+        return transfer_bytes(ConnectionTarget{std::move(connection)}, request,
+                              impl_->config.deadline, false, {});
     return transfer_bytes(
-        ConnectionTarget{std::move(connection)}, request,
+        ConnectionTarget{std::move(connection)}, request, impl_->config.deadline,
+        false,
         std::make_shared<const std::vector<uint8_t>>(*bytes));
 }
 
@@ -183,9 +191,64 @@ P50ZstdSourceSender::transfer(ConnectedFdFactory connection,
                               std::span<const uint8_t> source) {
     const PrepareRequestKey request = impl_->begin_transfer();
     if (source.size() > impl_->config.endpoint_caps.zstd.max_raw_bytes)
-        return transfer_bytes(ConnectionTarget{std::move(connection)}, request, {});
+        return transfer_bytes(ConnectionTarget{std::move(connection)}, request,
+                              impl_->config.deadline, false, {});
     return transfer_bytes(
-        ConnectionTarget{std::move(connection)}, request,
+        ConnectionTarget{std::move(connection)}, request, impl_->config.deadline,
+        false,
+        std::make_shared<const std::vector<uint8_t>>(source.begin(), source.end()));
+}
+
+boost::asio::awaitable<ZstdSourceTransferResult>
+P50ZstdSourceSender::transfer_route(boost::asio::ip::tcp::endpoint remote,
+                                    PrepareRequestKey request,
+                                    Clock::time_point deadline,
+                                    OwnedSourceFd source) {
+    const auto bytes = read_complete_fd(source.get(),
+                                        impl_->config.endpoint_caps.zstd.max_raw_bytes);
+    if (!bytes)
+        return transfer_bytes(ConnectionTarget{remote}, request, deadline, true, {});
+    return transfer_bytes(ConnectionTarget{remote}, request, deadline, true,
+                          std::make_shared<const std::vector<uint8_t>>(*bytes));
+}
+
+boost::asio::awaitable<ZstdSourceTransferResult>
+P50ZstdSourceSender::transfer_route(boost::asio::ip::tcp::endpoint remote,
+                                    PrepareRequestKey request,
+                                    Clock::time_point deadline,
+                                    std::span<const uint8_t> source) {
+    if (source.size() > impl_->config.endpoint_caps.zstd.max_raw_bytes)
+        return transfer_bytes(ConnectionTarget{remote}, request, deadline, true, {});
+    return transfer_bytes(ConnectionTarget{remote}, request, deadline, true,
+                          std::make_shared<const std::vector<uint8_t>>(source.begin(),
+                                                                         source.end()));
+}
+
+boost::asio::awaitable<ZstdSourceTransferResult>
+P50ZstdSourceSender::transfer_route(ConnectedFdFactory connection,
+                                    PrepareRequestKey request,
+                                    Clock::time_point deadline,
+                                    OwnedSourceFd source) {
+    const auto bytes = read_complete_fd(source.get(),
+                                        impl_->config.endpoint_caps.zstd.max_raw_bytes);
+    if (!bytes)
+        return transfer_bytes(ConnectionTarget{std::move(connection)}, request,
+                              deadline, true, {});
+    return transfer_bytes(
+        ConnectionTarget{std::move(connection)}, request, deadline, true,
+        std::make_shared<const std::vector<uint8_t>>(*bytes));
+}
+
+boost::asio::awaitable<ZstdSourceTransferResult>
+P50ZstdSourceSender::transfer_route(ConnectedFdFactory connection,
+                                    PrepareRequestKey request,
+                                    Clock::time_point deadline,
+                                    std::span<const uint8_t> source) {
+    if (source.size() > impl_->config.endpoint_caps.zstd.max_raw_bytes)
+        return transfer_bytes(ConnectionTarget{std::move(connection)}, request,
+                              deadline, true, {});
+    return transfer_bytes(
+        ConnectionTarget{std::move(connection)}, request, deadline, true,
         std::make_shared<const std::vector<uint8_t>>(source.begin(), source.end()));
 }
 
@@ -193,9 +256,14 @@ boost::asio::awaitable<ZstdSourceTransferResult>
 P50ZstdSourceSender::transfer_bytes(
     ConnectionTarget target,
     PrepareRequestKey request,
+    Clock::time_point deadline,
+    bool explicit_route,
     std::shared_ptr<const std::vector<uint8_t>> source) {
-    if (!valid_deadline(impl_->config, Clock::now()))
+    if (!valid_deadline(deadline, impl_->config.maximum_duration, Clock::now()))
         co_return impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
+    if (!nonzero_request(request) ||
+        (explicit_route && impl_->config.endpoint_caps.profile != ProfileId::Z3_LONG))
+        co_return impl_->invalid(ZstdSourceTransferStatus::InvalidRequest);
     if (std::holds_alternative<boost::asio::ip::tcp::endpoint>(target)) {
         const auto remote = std::get<boost::asio::ip::tcp::endpoint>(target);
         if (remote.port() == 0 || remote.address().is_unspecified())
@@ -214,31 +282,36 @@ P50ZstdSourceSender::transfer_bytes(
         co_return impl_->invalid(ZstdSourceTransferStatus::InvalidRequest);
     } catch (const std::length_error&) {
         co_return impl_->invalid(ZstdSourceTransferStatus::SourceError);
+    } catch (const std::logic_error&) {
+        // A relationship permits only one uncommitted successor.  A later
+        // wrapper must retry that exact request rather than crashing the
+        // long-lived owner or advancing around it.
+        co_return impl_->invalid(ZstdSourceTransferStatus::InvalidRequest);
     }
     for (uint8_t attempt = 1; attempt <= 2; ++attempt) {
-        if (Clock::now() >= impl_->config.deadline)
+        if (Clock::now() >= deadline)
             co_return impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
         ClientRunResult run;
         try {
             if (std::holds_alternative<boost::asio::ip::tcp::endpoint>(target)) {
                 run = co_await impl_->endpoint->run(
                     std::get<boost::asio::ip::tcp::endpoint>(target), prepared, {},
-                    impl_->config.deadline);
+                    deadline);
             } else {
                 int connected_fd = -1;
                 try {
                     connected_fd = std::get<ConnectedFdFactory>(target)(
-                        impl_->config.deadline);
+                        deadline);
                 } catch (...) {
                     co_return impl_->invalid(ZstdSourceTransferStatus::TerminalError);
                 }
                 if (connected_fd < 0) {
-                    run.status = Clock::now() >= impl_->config.deadline
+                    run.status = Clock::now() >= deadline
                                      ? ClientRunStatus::DeadlineExceeded
                                      : ClientRunStatus::Disconnected;
                 } else {
                     run = co_await impl_->endpoint->run_adopted_fd(
-                        connected_fd, prepared, {}, impl_->config.deadline);
+                        connected_fd, prepared, {}, deadline);
                 }
             }
         } catch (...) {
