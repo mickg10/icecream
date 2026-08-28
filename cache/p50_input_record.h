@@ -162,6 +162,12 @@ public:
 
     [[nodiscard]] bool contains(InputRecordKey key) const;
     [[nodiscard]] bool job_open(InputRecordKey key) const;
+    [[nodiscard]] size_t namespace_record_count(CStoreGuid c_store_guid) const;
+    [[nodiscard]] uint64_t namespace_retained_bytes(CStoreGuid c_store_guid) const;
+    // Whole-namespace eviction is legal only after every logical-job lease is
+    // closed and every issued cursor has released its immutable backing.
+    [[nodiscard]] bool namespace_evictable(CStoreGuid c_store_guid) const;
+    void evict_namespace(CStoreGuid c_store_guid);
     [[nodiscard]] size_t record_count() const { return records_.size(); }
     [[nodiscard]] uint64_t retained_bytes() const { return retained_bytes_; }
     [[nodiscard]] size_t max_records() const { return max_records_; }

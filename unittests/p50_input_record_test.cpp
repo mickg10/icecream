@@ -513,6 +513,51 @@ void test_empty_input() {
             "empty InputRecord did not close cleanly");
 }
 
+void test_whole_namespace_eviction_waits_for_jobs_and_cursors() {
+    const CStoreGuid first_guid = Id128::from_u64(120);
+    const CStoreGuid second_guid = Id128::from_u64(121);
+    const std::vector<uint8_t> first = bytes(1024, 41);
+    const std::vector<uint8_t> second = bytes(2048, 43);
+    const ExactTransaction first_tx = transaction_for(TuSeq{1}, first);
+    const ExactTransaction second_tx = transaction_for(TuSeq{2}, second);
+    const InputRecordKey first_key{first_guid, first_tx.begin.tu_seq};
+    const InputRecordKey second_key{second_guid, second_tx.begin.tu_seq};
+    InputRecordStore store(4, 1U << 20);
+
+    (void)store.publish(first_guid, first_tx.begin, first_tx.commit, first);
+    (void)store.publish(second_guid, second_tx.begin, second_tx.commit, second);
+    require(store.namespace_record_count(first_guid) == 1 &&
+                store.namespace_retained_bytes(first_guid) == first.size() &&
+                store.namespace_record_count(second_guid) == 1 &&
+                store.namespace_retained_bytes(second_guid) == second.size(),
+            "per-namespace retained-input accounting is wrong");
+    require(!store.namespace_evictable(first_guid),
+            "open logical job was declared namespace-evictable");
+
+    InputCursor cursor = store.attach(first_key);
+    store.close_job(first_key);
+    store.close_job(second_key);
+    require(!store.namespace_evictable(first_guid) &&
+                store.namespace_evictable(second_guid),
+            "cursor ownership did not distinguish namespace eviction state");
+    store.evict_namespace(second_guid);
+    require(!store.contains(second_key) && store.contains(first_key) &&
+                store.record_count() == 1 &&
+                store.retained_bytes() == first.size(),
+            "whole-namespace eviction removed the wrong retained input");
+    require_throws<std::logic_error>(
+        [&] { store.evict_namespace(first_guid); },
+        "whole-namespace eviction ignored an issued cursor");
+    require(drain(cursor) == first,
+            "rejected namespace eviction damaged the issued cursor");
+    cursor = InputCursor{};
+    require(store.namespace_evictable(first_guid),
+            "released cursor did not make the closed namespace evictable");
+    store.evict_namespace(first_guid);
+    require(store.record_count() == 0 && store.retained_bytes() == 0,
+            "final whole-namespace eviction leaked retained input");
+}
+
 }  // namespace
 
 int main() {
@@ -526,6 +571,7 @@ int main() {
     test_close_waits_for_authorized_reader();
     test_cursor_outlives_store_owner_object();
     test_empty_input();
+    test_whole_namespace_eviction_waits_for_jobs_and_cursors();
     std::cout << "p50_input_record_test: exact retained-input restart gates passed\n";
     return 0;
 }

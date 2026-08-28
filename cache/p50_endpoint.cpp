@@ -1229,6 +1229,7 @@ struct P50ServerEndpoint::Impl {
     struct Namespace {
         bool established = false;
         uint64_t active_session = 0;
+        uint64_t last_touch = 0;
         std::optional<HistoryNonce> nonce_high_water;
         std::optional<Route> route;
         std::optional<InputRecordKey> last_input;
@@ -1345,6 +1346,112 @@ struct P50ServerEndpoint::Impl {
 
     static bool exceeds(uint64_t current, uint64_t addition, uint64_t limit) {
         return addition > limit || current > limit - addition;
+    }
+
+    uint64_t reserve_namespace_touch() {
+        if (namespace_touch_exhausted)
+            throw std::overflow_error(
+                "F endpoint namespace LRU clock requires F_STORE_GUID replacement");
+        const uint64_t result = next_namespace_touch;
+        if (next_namespace_touch == std::numeric_limits<uint64_t>::max())
+            namespace_touch_exhausted = true;
+        else
+            ++next_namespace_touch;
+        return result;
+    }
+
+    void touch_namespace_on_disconnect(Namespace& space) noexcept {
+        if (namespace_touch_exhausted)
+            return;
+        space.last_touch = next_namespace_touch;
+        if (next_namespace_touch == std::numeric_limits<uint64_t>::max())
+            namespace_touch_exhausted = true;
+        else
+            ++next_namespace_touch;
+    }
+
+    bool namespace_has_live_session(CStoreGuid c_guid) const {
+        return std::any_of(
+            live_sessions.begin(), live_sessions.end(),
+            [c_guid](const auto& item) {
+                return item.second.c_guid && *item.second.c_guid == c_guid;
+            });
+    }
+
+    bool namespace_is_evictable(CStoreGuid c_guid) const {
+        const auto position = namespaces.find(c_guid);
+        if (position == namespaces.end())
+            return false;
+        const Namespace& space = position->second;
+        return space.active_session == 0 &&
+               !namespace_has_live_session(c_guid) &&
+               (!space.route ||
+                (!space.route->pending && !space.route->interrupted)) &&
+               input_records.namespace_evictable(c_guid);
+    }
+
+    std::vector<CStoreGuid> lru_evictable_namespaces(
+        CStoreGuid excluded) const {
+        std::vector<std::pair<uint64_t, CStoreGuid>> ordered;
+        ordered.reserve(namespaces.size());
+        for (const auto& [c_guid, space] : namespaces) {
+            if (c_guid != excluded && namespace_is_evictable(c_guid))
+                ordered.emplace_back(space.last_touch, c_guid);
+        }
+        std::sort(ordered.begin(), ordered.end());
+        std::vector<CStoreGuid> result;
+        result.reserve(ordered.size());
+        for (const auto& [touch, c_guid] : ordered) {
+            (void)touch;
+            result.push_back(c_guid);
+        }
+        return result;
+    }
+
+    void evict_namespace_inputs(CStoreGuid c_guid) {
+        if (!namespace_is_evictable(c_guid))
+            throw std::logic_error(
+                "F endpoint selected a live namespace for LRU eviction");
+        input_records.evict_namespace(c_guid);
+        namespaces.at(c_guid).last_input.reset();
+    }
+
+    void ensure_input_capacity(CStoreGuid incoming, uint64_t raw_bytes) {
+        const size_t record_limit = input_records.max_records();
+        const uint64_t byte_limit = input_records.max_retained_bytes();
+        if (raw_bytes > byte_limit)
+            throw std::length_error("InputRecordStore byte limit exceeded");
+
+        size_t retained_records = input_records.record_count();
+        uint64_t retained_bytes = input_records.retained_bytes();
+        const auto fits = [&] {
+            return retained_records < record_limit &&
+                   raw_bytes <= byte_limit - retained_bytes;
+        };
+        if (fits())
+            return;
+
+        std::vector<CStoreGuid> selected;
+        for (const CStoreGuid candidate :
+             lru_evictable_namespaces(incoming)) {
+            const size_t records =
+                input_records.namespace_record_count(candidate);
+            const uint64_t bytes =
+                input_records.namespace_retained_bytes(candidate);
+            if (records > retained_records || bytes > retained_bytes)
+                throw std::logic_error(
+                    "F endpoint namespace LRU accounting underflow");
+            retained_records -= records;
+            retained_bytes -= bytes;
+            selected.push_back(candidate);
+            if (fits())
+                break;
+        }
+        if (!fits())
+            throw std::length_error(
+                "InputRecordStore limit has no evictable namespace capacity");
+        for (const CStoreGuid candidate : selected)
+            evict_namespace_inputs(candidate);
     }
 
     void reserve_pending(Pending& pending) {
@@ -1589,8 +1696,10 @@ struct P50ServerEndpoint::Impl {
         LiveSession& live = live_sessions.at(session.serial);
         if (!live.c_guid || *live.c_guid != *session.c_guid || live.activated)
             throw StaleCompletion();
+        const uint64_t touch = reserve_namespace_touch();
         const bool new_namespace = !namespaces.contains(*session.c_guid);
-        if (new_namespace && namespaces.size() >= config.owner_limits.max_namespaces)
+        if (new_namespace &&
+            namespaces.size() >= config.owner_limits.max_namespaces)
             throw std::length_error("F endpoint reached its C-namespace bound");
         auto [position, namespace_inserted] = namespaces.try_emplace(*session.c_guid);
         std::map<CStoreGuid, Revision>::iterator revision;
@@ -1622,6 +1731,7 @@ struct P50ServerEndpoint::Impl {
             space.route->pending.reset();
         }
         space.active_session = session.serial;
+        space.last_touch = touch;
         session.activated = true;
         live.activated = true;
         session.candidate_state.reset();
@@ -1647,6 +1757,7 @@ struct P50ServerEndpoint::Impl {
         }
         record(ActionType::SESSION_DISCONNECTED, session);
         space.active_session = 0;
+        touch_namespace_on_disconnect(space);
         advance_revision_on_disconnect(*session.c_guid);
     }
 
@@ -1904,8 +2015,13 @@ struct P50ServerEndpoint::Impl {
             pending.begin != materialized.begin)
             throw StaleCompletion();
         Revision& revision = require_revision_advance(*session.c_guid);
+        const uint64_t touch = reserve_namespace_touch();
         const InputRecordKey input_key = materialized.prepared_input.key();
         candidate_input = input_key;
+        if (job_state == InputJobState::Open &&
+            !input_records.contains(input_key))
+            ensure_input_capacity(*session.c_guid,
+                                  materialized.begin.raw_bytes);
         const InputPublishResult publication =
             job_state == InputJobState::Open
                 ? input_records.commit_prepared(
@@ -1929,6 +2045,7 @@ struct P50ServerEndpoint::Impl {
         pending.dialogue.commit_visible(materialized.commit);
         release_pending(pending);
         route.pending.reset();
+        space.last_touch = touch;
         record(ActionType::INPUT_COMMITTED, session, &materialized.begin,
                materialized.commit.post_state_digest);
         return materialized.commit;
@@ -1939,6 +2056,8 @@ struct P50ServerEndpoint::Impl {
     SingleThreadOwner owner;
     uint64_t next_session = 1;
     bool session_exhausted = false;
+    uint64_t next_namespace_touch = 1;
+    bool namespace_touch_exhausted = false;
     std::map<uint64_t, LiveSession> live_sessions;
     std::map<CStoreGuid, Namespace> namespaces;
     std::map<CStoreGuid, Revision> revisions;
@@ -3000,6 +3119,8 @@ void P50ServerEndpoint::reset_store(FStoreGuid new_guid) {
     impl_->namespaces.clear();
     impl_->revisions.clear();
     impl_->input_records.clear();
+    impl_->next_namespace_touch = 1;
+    impl_->namespace_touch_exhausted = false;
     impl_->f_guid = new_guid;
 }
 

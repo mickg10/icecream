@@ -284,4 +284,56 @@ bool InputRecordStore::job_open(InputRecordKey key) const {
     return position != records_.end() && position->second.logical_job_open;
 }
 
+size_t InputRecordStore::namespace_record_count(CStoreGuid c_store_guid) const {
+    size_t result = 0;
+    for (const auto& [key, entry] : records_) {
+        (void)entry;
+        if (key.c_store_guid == c_store_guid)
+            ++result;
+    }
+    return result;
+}
+
+uint64_t InputRecordStore::namespace_retained_bytes(
+    CStoreGuid c_store_guid) const {
+    uint64_t result = 0;
+    for (const auto& [key, entry] : records_) {
+        if (key.c_store_guid != c_store_guid)
+            continue;
+        if (entry.raw_bytes > std::numeric_limits<uint64_t>::max() - result)
+            throw std::logic_error(
+                "InputRecord namespace retained-byte accounting overflow");
+        result += entry.raw_bytes;
+    }
+    return result;
+}
+
+bool InputRecordStore::namespace_evictable(CStoreGuid c_store_guid) const {
+    for (const auto& [key, entry] : records_) {
+        if (key.c_store_guid != c_store_guid)
+            continue;
+        if (entry.logical_job_open || !entry.backing ||
+            entry.backing.use_count() != 1)
+            return false;
+    }
+    return true;
+}
+
+void InputRecordStore::evict_namespace(CStoreGuid c_store_guid) {
+    if (!namespace_evictable(c_store_guid))
+        throw std::logic_error(
+            "InputRecord namespace still owns a job lease or cursor");
+    const uint64_t bytes = namespace_retained_bytes(c_store_guid);
+    if (bytes > retained_bytes_)
+        throw std::logic_error(
+            "InputRecord namespace eviction accounting underflow");
+    for (auto position = records_.begin(); position != records_.end();) {
+        if (position->first.c_store_guid == c_store_guid)
+            position = records_.erase(position);
+        else
+            ++position;
+    }
+    retained_bytes_ -= bytes;
+}
+
 }  // namespace icecc::p50

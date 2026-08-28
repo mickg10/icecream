@@ -3262,16 +3262,68 @@ void test_input_record_owner_and_aggregate_limits() {
                                  std::move(config));
         TestClient first(Id128::from_u64(177));
         TestClient second(Id128::from_u64(178));
-        require(run_pair(first, server, admit(first, bytes("first namespace\n")))
-                        .client.status == ClientRunStatus::Committed,
+        const PairResult retained =
+            run_pair(first, server, admit(first, bytes("first namespace\n")));
+        require(retained.client.status == ClientRunStatus::Committed &&
+                    retained.server.committed_input.has_value(),
                 "first namespace did not fit its aggregate bound");
+        server.close_input_job(*retained.server.committed_input);
         const PairResult rejected =
             run_pair(second, server, admit(second, bytes("second namespace\n")));
         require(rejected.client.status == ClientRunStatus::TerminalError &&
                     rejected.server.status == ServerRunStatus::TerminalError &&
                     server.owner_usage().namespaces == 1 &&
                     server.owner_usage().revisions == 1,
-                "namespace-cap failure changed aggregate owner state");
+                "route-namespace cap was incorrectly treated as evictable cache payload");
+    }
+
+    {
+        P50ServerEndpointConfig config;
+        config.owner_limits.max_retained_input_records = 1;
+        P50ServerEndpoint server(Id128::from_u64(208), {}, nullptr, nullptr,
+                                 std::move(config));
+        TestClient first(Id128::from_u64(209));
+        TestClient second(Id128::from_u64(210));
+        const PairResult retained =
+            run_pair(first, server, admit(first, bytes("evictable retained input\n")));
+        require(retained.server.committed_input.has_value(),
+                "retained-input LRU fixture did not publish its first record");
+        InputCursor pinned = server.attach_input(*retained.server.committed_input);
+        server.close_input_job(*retained.server.committed_input);
+
+        const PreparedTuHandle blocked_input =
+            admit(second, bytes("blocked by cursor\n"));
+        const PairResult held =
+            run_pair(second, server, blocked_input);
+        require(held.client.status == ClientRunStatus::TerminalError &&
+                    held.server.status == ServerRunStatus::TerminalError &&
+                    server.owner_usage().retained_input_records == 1 &&
+                    server.owner_usage().retained_input_bytes ==
+                        bytes("evictable retained input\n").size(),
+                "cursor-pinned capacity failure evicted retained input or published new input");
+
+        pinned = InputCursor{};
+        const PairResult retried = run_pair(second, server);
+        require(retried.client.status == ClientRunStatus::Committed &&
+                    retried.server.status == ServerRunStatus::Completed &&
+                    retried.client.reconnect == EndpointReconnectOutcome::ExactMatch &&
+                    server.owner_usage().retained_input_records == 1 &&
+                    server.owner_usage().namespaces == 2 &&
+                    server.owner_usage().revisions == 2,
+                "released cursor did not permit atomic whole-namespace capacity recovery");
+        require(retried.server.committed_input.has_value(),
+                "capacity-recovery retry did not publish its retained input");
+        server.close_input_job(*retried.server.committed_input);
+        const PairResult first_again =
+            run_pair(first, server,
+                     admit(first, bytes("first route after payload eviction\n")));
+        require(first_again.client.status == ClientRunStatus::Committed &&
+                    first_again.server.status == ServerRunStatus::Completed &&
+                    first_again.client.reconnect == EndpointReconnectOutcome::ExactMatch &&
+                    server.owner_usage().retained_input_records == 1 &&
+                    server.owner_usage().namespaces == 2 &&
+                    server.owner_usage().revisions == 2,
+                "cache-payload eviction destroyed the surviving protocol route");
     }
 
     {
