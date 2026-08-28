@@ -1,6 +1,9 @@
 #include "cache/p50_profile.h"
 #include "cache/p50_zstd.h"
 #include "cache/p50_grz.h"
+#if defined(ICECC_P50_WITH_LIBBSC)
+#include "cache/p50_grz_residual_codec.h"
+#endif
 
 #include <cstdlib>
 #include <iostream>
@@ -330,14 +333,20 @@ void test_factory_rejects_unsupported_or_unnegotiated() {
     for (uint8_t corpus = 1; corpus <= 3; ++corpus) {
         std::vector<uint8_t> input(200000U * corpus);
         for (size_t i = 0; i < input.size(); ++i)
-            input[i] = static_cast<uint8_t>((i * 37U + corpus * 11U) ^ (i >> 5));
+            input[i] = static_cast<uint8_t>(((i % 4096U) * 37U + corpus * 11U) ^ (i >> 5));
         const auto envelope = encode_grz_residual(HistoryNonce{8}, RelSeq{0}, TuSeq{12},
                                                    Digest128{}, input, limits());
         require(envelope.begin.profile == ProfileId::GRZ &&
                     envelope.begin.body.encoding == kGrzResidualBodyEncoding,
                 "GRZ_RESIDUAL did not use the frozen profile and body encoding");
+        require(grz_residual_group_reference_count(envelope.body) != 0,
+                "GRZ_RESIDUAL did not emit a Group-RLZ reference");
         require(decode_grz_residual(envelope.begin, envelope.body, limits()) == input,
                 "GRZ_RESIDUAL corpus replay changed exact bytes");
+        residual_group::Codec residual_only;
+        require_throws<std::exception>(
+            [&] { (void)residual_only.decode(envelope.body.data(), envelope.body.size()); },
+            "GRZ_RESIDUAL bypassed the Group-RLZ stage");
         auto corrupt = envelope.body;
         corrupt.back() ^= 1;
         require_throws<std::exception>(

@@ -47,6 +47,10 @@ std::vector<uint8_t> decode_grz_residual(const TxBegin& begin,
                                           std::span<const uint8_t> encoded_body,
                                           ZstdTuLimits limits);
 
+// Test/evidence hook for the reviewed persistent Group-RLZ stage.  The value
+// is encoded in the GRZ container, not maintained in a parallel framework.
+uint64_t grz_residual_group_reference_count(std::span<const uint8_t> body) noexcept;
+
 class GrzResidualDialogue {
 public:
     enum class State { Idle, ReceivingBody, BodyClosed, Materialized, Terminal };
