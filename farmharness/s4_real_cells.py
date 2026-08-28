@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Run the eight real S4 scheduler/client/worker version cells.
+"""Run the real S4 scheduler/client/worker version cells.
 
 This is deliberately a small execution harness.  It does not publish role
 artifacts, create capability/offer records, or infer a result from a model:
 each row is produced by one SSH invocation of the three selected binaries on
 q3.  The remote cell compiles one TU through the real client and compares the
-returned object with a local g++ compilation.  The only cell which enables
-the Protocol-50 cache requirement is ``s50-c50-f50``; every other cell starts
-the ordinary legacy FileChunk path.
+returned object with a local g++ compilation.  The optional ``--c1f2`` row
+runs two distinct F workers and four exact object comparisons.  The only
+ordinary matrix cell which enables the Protocol-50 cache requirement is
+``s50-c50-f50``; every other matrix cell starts the ordinary legacy FileChunk
+path.
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ from pathlib import Path
 
 
 SCHEMA = "icecream-s4-real-cell-v1"
-BASE_SHA = "32b25d6ecbfd52cd0b68d167c362f210c98eaded"
+BASE_SHA = "0b294108af422faa7b25b06a5480362f11fc019e"
 P43_SHA = "cd74801e0fa4e83e3ae254ca1d7fe98642f36b89"
 # P50 must be supplied as a build of BASE_SHA. --p50-local-root stages that
 # exact build into a private q3 /tmp root for the cell run.
@@ -45,11 +47,11 @@ ROLE_HASHES = {
         "E": "aab94b6ea8f41335de807f814d24a56e827ce5efaf8b06797a365699e83b36cb",
     },
     "50": {
-        "S": "8857b14179559d0efc9b588c29a6f0fe6c922c9f40d9fc2de498887257931212",
-        "F": "405f9e61c93b6a1b5ba2265bdd6153dbf7898093cd2aeb1081e8006abe5cf907",
-        "C": "a7edf79e22497e70be473f29d592ab1e4d06ed6958ca48339d5f84c44f73a2cd",
+        "S": "93188b14f01d74c2d47b0f18403df16e156d343287c522869affba6e223cd7dd",
+        "F": "7307c8f741f942c38c7f76e20daef252f02af628c510a5e69846e0ec031a050a",
+        "C": "1f1db724b5b41cf26e771dc0a57ca7013b618bce2b0f49295e559f0403a10a83",
         "E": "ee7d30b240c38bccf66d4afcdd45993f115a01d4a2fb4e9143d38596609d2ba4",
-        "X": "d39e3712e46ccb039ac3d696bfd13a1cbf8446137d991c1475626a85a061f51b",
+        "X": "5d86e370c6db59a27b156ab2a2f37da0fe9650977daf845bcfd4dc88e925c744",
     },
 }
 
@@ -57,39 +59,41 @@ ROLE_HASHES = {
 REMOTE_SCRIPT = r'''#!/bin/bash
 set -u
 SROOT=$1; CROOT=$2; FROOT=$3; CELL=$4; EXPECT_CACHE=$5
+F2ROOT=${6:-}; TOPOLOGY=${7:-c1f1}
 SROOT=${SROOT//\$HOME/$HOME}; CROOT=${CROOT//\$HOME/$HOME}; FROOT=${FROOT//\$HOME/$HOME}
+F2ROOT=${F2ROOT//\$HOME/$HOME}
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/s4-real-cell.XXXXXX")
-SCHED_PID=; F_PID=; C_PID=; ENV_TAR=; F_CONTAINER="s4-$CELL-$$"; CLEANUP_STARTED=$(date +%s)
+SCHED_PID=; F_PID=; F2_PID=; C_PID=; ENV_TAR=; F_CONTAINER="s4-$CELL-f1-$$"; F2_CONTAINER="s4-$CELL-f2-$$"; CLEANUP_STARTED=$(date +%s)
 cleanup() {
     rc=$?
     # Disarm first: EXIT is delivered again by the final `exit` below.
     trap - EXIT HUP INT TERM
-    for pid in "$C_PID" "$F_PID" "$SCHED_PID"; do
+    for pid in "$C_PID" "$F2_PID" "$F_PID" "$SCHED_PID"; do
         [ -n "$pid" ] && kill "$pid" 2>/dev/null || :
     done
-    docker rm -f "$F_CONTAINER" >/dev/null 2>&1 || :
+    docker rm -f "$F_CONTAINER" "$F2_CONTAINER" >/dev/null 2>&1 || :
     deadline=$(( $(date +%s) + 15 )); forced=0
     while [ "$(date +%s)" -lt "$deadline" ]; do
         live=0
-        for pid in "$C_PID" "$F_PID" "$SCHED_PID"; do
+        for pid in "$C_PID" "$F2_PID" "$F_PID" "$SCHED_PID"; do
             [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && live=1 || :
         done
         [ "$live" -eq 0 ] && break
         sleep 0.1
     done
-    for pid in "$C_PID" "$F_PID" "$SCHED_PID"; do
+    for pid in "$C_PID" "$F2_PID" "$F_PID" "$SCHED_PID"; do
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
             forced=1; kill -KILL "$pid" 2>/dev/null || :
         fi
     done
-    for pid in "$C_PID" "$F_PID" "$SCHED_PID"; do
+    for pid in "$C_PID" "$F2_PID" "$F_PID" "$SCHED_PID"; do
         [ -n "$pid" ] && wait "$pid" 2>/dev/null || :
     done
     CLEANUP_END=$(date +%s)
     printf 'S4_CLEANUP=bounded forced=%s seconds=%s\n' "$forced" "$((CLEANUP_END-CLEANUP_STARTED))"
     # Emit logs before deleting the private work tree.  Each value is one
     # base64 line, so arbitrary compiler output cannot corrupt the result row.
-    for name in scheduler fdaemon cdaemon client client-debug scheduler.stdout fdaemon.stdout cdaemon.stdout create-env local; do
+    for name in scheduler fdaemon fdaemon2 cdaemon client client-1 client-2 client-3 client-4 client-debug scheduler.stdout fdaemon.stdout fdaemon2.stdout cdaemon.stdout create-env warmup-s4-f warmup-s4-f2 local local-1 local-2 local-3 local-4; do
         file="$WORK/$name.log"
         [ -f "$file" ] || : >"$file"
         printf '__S4_LOG_BEGIN=%s\n' "$name"
@@ -135,11 +139,15 @@ for spec in \
     role=${spec%%:*}; rest=${spec#*:}; path=${rest%%:*}; hash=${rest#*:}
     check_file "$role" "$path" "$hash"
 done
+if [ "$TOPOLOGY" = c1f2 ]; then
+    F2=$(pick "$F2ROOT" F || true); F2_REL=${F2#"$F2ROOT"/}
+    check_file F2 "$F2" "$F2_HASH"
+fi
 [ "$bad" -eq 0 ] || { echo 'S4_STATUS=HOLD reason=role-root-integrity'; exit 77; }
 
 command -v g++ >/dev/null 2>&1 || { echo 'S4_STATUS=HOLD reason=g++-unavailable'; exit 77; }
 command -v timeout >/dev/null 2>&1 || { echo 'S4_STATUS=HOLD reason=timeout-unavailable'; exit 77; }
-mkdir -p "$WORK/env" "$WORK/envs-f" "$WORK/envs-c" "$WORK/out"
+mkdir -p "$WORK/env" "$WORK/envs-f" "$WORK/envs-f2" "$WORK/envs-c" "$WORK/out"
 chmod 1777 "$WORK/envs-f" "$WORK/envs-c"
 printf '%s\n' '#include <cstdint>' \
   'extern "C" int s4_real_cell() { return 43 + 7; }' >"$WORK/main.cpp"
@@ -161,6 +169,7 @@ if [ "$EXPECT_CACHE" = 1 ]; then
     F_EXTRA="--cache-service /role/cache/icecc-cache-service --cache-runtime-dir /work/cache-runtime"
     mkdir -p "$WORK/cache-runtime"; chmod 700 "$WORK/cache-runtime"
 fi
+F_NAME=s4-f
 
 # The farm image has no icecc account.  The daemon must drop to a user which
 # owns the bind-mounted /work directories; create that account inside this
@@ -178,27 +187,54 @@ docker run --rm --name "$F_CONTAINER" --network host --user 0 --cap-add=SYS_CHRO
   -v "$FROOT:/role:ro" -v "$WORK:/work" \
   -e ICECC_TEST_SOCKET=/work/f.sock -e S4_F_UID="$(id -u)" -e S4_F_GID="$(id -g)" \
   --entrypoint /work/f-wrapper.sh icecream/farm-node:ubuntu22-gcc11-boost174 \
-  -p "$F_PORT" -m 2 -s "127.0.0.1:$SCHED_PORT" -n "$NET" -N s4-f \
+  -p "$F_PORT" -m 2 -s "127.0.0.1:$SCHED_PORT" -n "$NET" -N "$F_NAME" \
   -b /work/envs-f -l /work/fdaemon.log -vvv $F_EXTRA \
   >"$WORK/fdaemon.stdout" 2>&1 & F_PID=$!
 sleep 2
 docker inspect --format 'S4_DOCKER_STATE={{.State.Status}} exit={{.State.ExitCode}}' "$F_CONTAINER" 2>/dev/null || echo 'S4_DOCKER_STATE=missing'
 docker logs "$F_CONTAINER" >>"$WORK/fdaemon.stdout" 2>&1 || :
+if [ "$TOPOLOGY" = c1f2 ]; then
+    cat >"$WORK/f-wrapper2.sh" <<'S4_F2_WRAPPER'
+#!/bin/sh
+set -eu
+printf 'icecc:x:%s:%s:icecc:/nonexistent:/usr/sbin/nologin\n' "$S4_F_UID" "$S4_F_GID" >>/etc/passwd
+printf 'icecc:x:%s:\n' "$S4_F_GID" >>/etc/group
+exec /role/__S4_F2_REL__ "$@"
+S4_F2_WRAPPER
+    sed -i "s#__S4_F2_REL__#$F2_REL#" "$WORK/f-wrapper2.sh"
+    chmod 755 "$WORK/f-wrapper2.sh"
+    F2_EXTRA="$F_EXTRA"
+    docker run --rm --name "$F2_CONTAINER" --network host --user 0 --cap-add=SYS_CHROOT \
+      -v "$F2ROOT:/role:ro" -v "$WORK:/work" \
+      -e ICECC_TEST_SOCKET=/work/f2.sock -e S4_F_UID="$(id -u)" -e S4_F_GID="$(id -g)" \
+      --entrypoint /work/f-wrapper2.sh icecream/farm-node:ubuntu22-gcc11-boost174 \
+      -p "$((F_PORT + 1))" -m 2 -s "127.0.0.1:$SCHED_PORT" -n "$NET" -N s4-f2 \
+      -b /work/envs-f2 -l /work/fdaemon2.log -vvv $F2_EXTRA \
+      >"$WORK/fdaemon2.stdout" 2>&1 & F2_PID=$!
+    sleep 2
+    docker inspect --format 'S4_DOCKER_STATE_F2={{.State.Status}} exit={{.State.ExitCode}}' "$F2_CONTAINER" 2>/dev/null || echo 'S4_DOCKER_STATE_F2=missing'
+    docker logs "$F2_CONTAINER" >>"$WORK/fdaemon2.stdout" 2>&1 || :
+fi
 ICECC_TEST_SOCKET="$WORK/c.sock" "$CDAEMON" --no-remote -m 0 \
   -s "127.0.0.1:$SCHED_PORT" -n "$NET" -N s4-c -b "$WORK/envs-c" \
   -l "$WORK/cdaemon.log" -vvv >"$WORK/cdaemon.stdout" 2>&1 & C_PID=$!
 
+required_logins=2
+[ "$TOPOLOGY" = c1f2 ] && required_logins=3
 for _ in $(seq 1 30); do
     logins=$(grep -c login "$WORK/scheduler.log" 2>/dev/null || true)
-    [ "${logins:-0}" -ge 2 ] && break
+    [ "${logins:-0}" -ge "$required_logins" ] && break
     sleep 1
 done
-[ "${logins:-0}" -ge 2 ] || { echo 'S4_STATUS=FAIL reason=daemon-registration'; exit 1; }
+[ "${logins:-0}" -ge "$required_logins" ] || { echo 'S4_STATUS=FAIL reason=daemon-registration'; exit 1; }
 if [ "$EXPECT_CACHE" = 1 ]; then
     cache_ready=0
     for _ in $(seq 1 30); do
         if grep -E 'RELOGIN s4-f.*cache=.*cache_profiles=.*zstd_tu' \
-            "$WORK/scheduler.log" >/dev/null 2>&1; then
+            "$WORK/scheduler.log" >/dev/null 2>&1 && {
+            [ "$TOPOLOGY" != c1f2 ] || grep -E 'RELOGIN s4-f2.*cache=.*cache_profiles=.*zstd_tu' \
+                "$WORK/scheduler.log" >/dev/null 2>&1;
+        }; then
             cache_ready=1; break
         fi
         sleep 1
@@ -211,6 +247,88 @@ fi
 }
 ENV_TAR=$(find "$WORK/env" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)
 [ -n "$ENV_TAR" ] || { echo 'S4_STATUS=FAIL reason=no-compiler-environment'; exit 1; }
+
+if [ "$TOPOLOGY" = c1f2 ]; then
+    printf '#include <cstdint>\nextern "C" int s4_real_warmup() { return 77; }\n' >"$WORK/warmup.cpp"
+    CLIENT_ENV=("ICECC_TEST_SOCKET=$WORK/c.sock" "ICECC_TEST_REMOTEBUILD=1"
+                "ICECC_VERSION=$ENV_TAR" "ICECC_DEBUG=debug")
+    for preferred in s4-f s4-f2; do
+        env "${CLIENT_ENV[@]}" "ICECC_PREFERRED_HOST=$preferred" \
+            "ICECC_LOGFILE=$WORK/warmup-$preferred.log" timeout 150 "$C" \
+            g++ -std=c++17 -O2 -c "$WORK/warmup.cpp" \
+            -o "$WORK/out/warmup-$preferred.o" >"$WORK/warmup-$preferred.log" 2>&1 || :
+    done
+    for preferred in s4-f s4-f2; do
+        ready=0
+        for _ in $(seq 1 30); do
+            grep -E "RELOGIN $preferred.*\[[^]]+\]" "$WORK/scheduler.log" >/dev/null 2>&1 && {
+                ready=1; break;
+            }
+            sleep 1
+        done
+        [ "$ready" -eq 1 ] || { echo "S4_STATUS=HOLD reason=worker-$preferred-environment-not-ready"; exit 77; }
+    done
+    # The cache sidecar re-announces the worker after its first environment
+    # install.  Let that assignment epoch settle before strict P50 work.
+    sleep 5
+    [ "$EXPECT_CACHE" = 1 ] && CLIENT_ENV+=("ICECC_P50_C1F1_REQUIRED=1")
+    for index in 1 2 3 4; do
+        printf '#include <cstdint>\nextern "C" int s4_real_c1f2_%s() { return %s; }\n' \
+            "$index" "$((43 + index))" >"$WORK/main-$index.cpp"
+    done
+    for index in 1 2 3 4; do
+        g++ -std=c++17 -O2 -c "$WORK/main-$index.cpp" -o "$WORK/out/local-$index.o" \
+            2>"$WORK/local-$index.log" || { echo 'S4_STATUS=FAIL reason=local-reference'; exit 1; }
+    done
+    CLIENT_ENV=("ICECC_TEST_SOCKET=$WORK/c.sock" "ICECC_TEST_REMOTEBUILD=1"
+                "ICECC_VERSION=$ENV_TAR" "ICECC_DEBUG=debug")
+    [ "$EXPECT_CACHE" = 1 ] && CLIENT_ENV+=("ICECC_P50_C1F1_REQUIRED=1")
+    for index in 1 2 3 4; do
+        preferred=s4-f
+        [ "$((index % 2))" -eq 0 ] && preferred=s4-f2
+        env "${CLIENT_ENV[@]}" "ICECC_PREFERRED_HOST=$preferred" \
+            "ICECC_LOGFILE=$WORK/client-debug-$index.log" \
+            timeout 150 "$C" g++ -std=c++17 -O2 -c "$WORK/main-$index.cpp" \
+            -o "$WORK/out/remote-$index.o" >"$WORK/client-$index.log" 2>&1 || {
+            echo 'S4_STATUS=FAIL reason=remote-compile'; exit 1;
+        }
+    done
+    for index in 1 2 3 4; do
+        cmp -s "$WORK/out/remote-$index.o" "$WORK/out/local-$index.o" || {
+            echo 'S4_STATUS=FAIL reason=object-not-byte-identical'; exit 1;
+        }
+    done
+    all_logs="$WORK/scheduler.log $WORK/fdaemon.log $WORK/fdaemon2.log $WORK/cdaemon.log $WORK/client-1.log $WORK/client-2.log $WORK/client-3.log $WORK/client-4.log"
+    cache_seen=0; legacy_seen=0; f1_seen=0; f2_seen=0
+    grep -E 'ZSTD_TU|CACHE_SESSION' $all_logs >/dev/null 2>&1 && cache_seen=1 || :
+    grep -E 'write_fd_to_server from cpp|write_fd_to_server preprocessed|building myself|building_local|local build forced|client_exception|fallback_local' $all_logs >/dev/null 2>&1 && legacy_seen=1 || :
+    grep -E 'BEGIN: .*server=s4-f([ (]|$)' "$WORK/scheduler.log" >/dev/null 2>&1 && f1_seen=1 || :
+    grep -E 'BEGIN: .*server=s4-f2([ (]|$)' "$WORK/scheduler.log" >/dev/null 2>&1 && f2_seen=1 || :
+    [ "$f1_seen" -eq 1 ] && [ "$f2_seen" -eq 1 ] || {
+        echo "S4_WORKER_F1_COMPILE=$f1_seen"; echo "S4_WORKER_F2_COMPILE=$f2_seen"
+        echo 'S4_STATUS=HOLD reason=both-workers-not-selected'; exit 77;
+    }
+    if [ "$EXPECT_CACHE" = 1 ]; then
+        [ "$cache_seen" -eq 1 ] || { echo 'S4_STATUS=HOLD reason=cache-not-observed'; exit 77; }
+        [ "$legacy_seen" -eq 0 ] || { echo 'S4_STATUS=FAIL reason=cache-cell-used-legacy-fallback'; exit 1; }
+        grep -E 'ZSTD_TU|CACHE_SESSION' "$WORK/fdaemon.log" >/dev/null 2>&1 || {
+            echo 'S4_STATUS=HOLD reason=cache-not-observed-on-f1'; exit 77;
+        }
+        grep -E 'ZSTD_TU|CACHE_SESSION' "$WORK/fdaemon2.log" >/dev/null 2>&1 || {
+            echo 'S4_STATUS=HOLD reason=cache-not-observed-on-f2'; exit 77;
+        }
+    else
+        [ "$cache_seen" -eq 0 ] || { echo 'S4_STATUS=FAIL reason=mixed-cell-engaged-cache'; exit 1; }
+    fi
+    echo "S4_CACHE_OBSERVED=$cache_seen"
+    echo "S4_LEGACY_OBSERVED=$legacy_seen"
+    echo "S4_WORKER_F1_COMPILE=$f1_seen"
+    echo "S4_WORKER_F2_COMPILE=$f2_seen"
+    echo 'S4_REMOTE_COMPILE=4'
+    echo 'S4_BYTE_IDENTICAL=4'
+    echo 'S4_STATUS=PASS reason=two-workers-remote-byte-identical'
+    exit 0
+fi
 
 REMOTE_OBJ="$WORK/out/remote.o"; LOCAL_OBJ="$WORK/out/local.o"
 CLIENT_ENV=("ICECC_TEST_SOCKET=$WORK/c.sock" "ICECC_TEST_REMOTEBUILD=1"
@@ -332,8 +450,9 @@ def _stage_p50(args: argparse.Namespace) -> str:
     return line.split("=", 1)[1]
 
 
-def _run_cell(cell: dict[str, str], args: argparse.Namespace, out_root: Path) -> dict[str, object]:
-    expect_cache = cell["id"] == "s50-c50-f50"
+def _run_cell(cell: dict[str, str], args: argparse.Namespace, out_root: Path,
+              topology: str = "c1f1") -> dict[str, object]:
+    expect_cache = cell["id"] == "s50-c50-f50" or topology == "c1f2"
     cell_dir = out_root / cell["id"]
     cell_dir.mkdir()
     if any(cell[role] == "50" for role in ("S", "C", "F")) and not args.p50_root:
@@ -354,14 +473,17 @@ def _run_cell(cell: dict[str, str], args: argparse.Namespace, out_root: Path) ->
     # ssh concatenates the post-host arguments into a remote shell command;
     # quote each data argument and let the remote preamble expand its literal
     # ``$HOME`` token.  This keeps an override from becoming shell syntax.
-    remote_args = [shlex.quote(value) for value in
-                   (roots["S"], roots["C"], roots["F"], cell["id"],
-                    "1" if expect_cache else "0")]
+    remote_values = (roots["S"], roots["C"], roots["F"], cell["id"],
+                     "1" if expect_cache else "0")
+    if topology == "c1f2":
+        remote_values += (roots["F"], topology)
+    remote_args = [shlex.quote(value) for value in remote_values]
     command = ["ssh", *args.ssh_option, args.host, "bash", "-s", "--", *remote_args]
     script = REMOTE_SCRIPT.replace("$S_HASH", ROLE_HASHES[cell["S"]]["S"])
     script = script.replace("$C_HASH", ROLE_HASHES[cell["C"]]["C"])
     script = script.replace("$D_HASH", ROLE_HASHES[cell["C"]]["F"])
     script = script.replace("$F_HASH", ROLE_HASHES[cell["F"]]["F"])
+    script = script.replace("$F2_HASH", ROLE_HASHES[cell["F"]]["F"])
     script = script.replace("$E_HASH", ROLE_HASHES[cell["C"]]["E"])
     # Shell variables cannot safely carry a path containing spaces through a
     # command substitution; this placeholder is replaced with the quoted C
@@ -426,6 +548,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=240.0)
     parser.add_argument("--cell", action="append", choices=[cell["id"] for cell in _cells()],
                         help="run only this cell (repeatable; useful for a bounded smoke run)")
+    parser.add_argument("--c1f2", action="store_true",
+                        help="run the authentic two-worker all-50 C1F2 row")
     args = parser.parse_args(argv)
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
@@ -440,9 +564,15 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
             print(f"P50 staging HOLD: {exc}", file=sys.stderr)
     rows = []
-    selected = [cell for cell in _cells() if not args.cell or cell["id"] in args.cell]
-    for cell in selected:
-        rows.append(_run_cell(cell, args, run_root))
+    if args.c1f2:
+        if args.cell:
+            parser.error("--c1f2 cannot be combined with --cell")
+        rows.append(_run_cell({"id": "s50-c50-f50-c1f2", "S": "50", "C": "50", "F": "50"},
+                              args, run_root, topology="c1f2"))
+    else:
+        selected = [cell for cell in _cells() if not args.cell or cell["id"] in args.cell]
+        for cell in selected:
+            rows.append(_run_cell(cell, args, run_root))
     result_path = run_root / "results.jsonl"
     with result_path.open("x", encoding="utf-8") as stream:
         for row in rows:
