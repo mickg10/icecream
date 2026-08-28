@@ -452,7 +452,7 @@ AS_IF([test "x$libbsc_prefix" != xno], [
         ])
         AS_IF([test -z "$LIBBSC_LIBS"], [
             AS_IF([test -f "$libbsc_prefix/build-gcc2/libbsc.a"], [
-                LIBBSC_LIBS="$libbsc_prefix/build-gcc2/libbsc.a"
+                LIBBSC_LIBS="$libbsc_prefix/build-gcc2/libbsc.a -fopenmp"
             ], [
                 LIBBSC_LIBS="-L$libbsc_prefix/lib -lbsc"
             ])
