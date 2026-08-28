@@ -37,6 +37,105 @@ void require_throws(Callable&& callable, std::string_view text) {
 
 ZstdTuLimits limits() { return {1U << 20, 1U << 20}; }
 
+TxCommit route_commit(const TxBegin& begin) {
+    return TxCommit{begin.history_nonce, begin.rel_seq, begin.tu_seq,
+                    begin.transaction_digest, begin.raw_digest,
+                    compute_post_state_digest(begin.pre_state_digest,
+                                              begin.history_nonce, begin.rel_seq,
+                                              begin.tu_seq,
+                                              begin.transaction_digest)};
+}
+
+ProfileDialogue route_dialogue() {
+    return ProfileDialogue::create(
+        ProfileId::Z3_LONG,
+        ProfileDialogueConfig{.negotiated_profiles = profile_bit(ProfileId::Z3_LONG),
+                              .max_encoded_body_bytes = limits().max_encoded_body_bytes,
+                              .max_raw_bytes = limits().max_raw_bytes,
+                              .max_window_log = limits().max_window_log});
+}
+
+void test_zstd_route_multi_tu_replay_and_terminal_rules() {
+    const std::vector<uint8_t> first{'r', 'o', 'u', 't', 'e', '-', '1'};
+    const std::vector<uint8_t> second{'r', 'o', 'u', 't', 'e', '-', '2'};
+    ZstdRouteCodec codec;
+    std::vector<std::vector<uint8_t>> predecessor;
+    const auto one = codec.encode(HistoryNonce{33}, RelSeq{0}, TuSeq{1},
+                                  Digest128{}, predecessor, first, limits());
+    predecessor.push_back(first);
+    const auto two = codec.encode(HistoryNonce{33}, RelSeq{1}, TuSeq{2},
+                                  compute_post_state_digest(one.begin.pre_state_digest,
+                                                            one.begin.history_nonce,
+                                                            one.begin.rel_seq,
+                                                            one.begin.tu_seq,
+                                                            one.begin.transaction_digest),
+                                  predecessor, second, limits());
+    const auto one_replay = codec.encode(HistoryNonce{33}, RelSeq{0}, TuSeq{1},
+                                         Digest128{}, first, limits());
+    const auto two_replay = codec.encode(HistoryNonce{33}, RelSeq{1}, TuSeq{2},
+                                         compute_post_state_digest(one.begin.pre_state_digest,
+                                                                   one.begin.history_nonce,
+                                                                   one.begin.rel_seq,
+                                                                   one.begin.tu_seq,
+                                                                   one.begin.transaction_digest),
+                                         predecessor, second, limits());
+    require(one_replay.body == one.body && two_replay.body == two.body,
+            "route replay did not retain byte-exact stream prefixes");
+    require(codec.decode({}, one.begin, one.body, limits()) == first,
+            "route first TU did not decode");
+    std::vector<ZstdRouteEnvelope> committed{one};
+    require(codec.decode(committed, two.begin, two.body, limits()) == second,
+            "route predecessor replay did not decode");
+
+    ProfileDialogue dialogue = route_dialogue();
+    dialogue.begin(one.begin);
+    dialogue.append_body(BodyMessage{one.body});
+    require(dialogue.materialize() == first, "route materialization changed bytes");
+    require(dialogue.commit_state() == ProfileCommitState::Tentative,
+            "route materialization was not tentative");
+    dialogue.commit_visible(route_commit(one.begin));
+    dialogue.begin(two.begin);
+    dialogue.append_body(BodyMessage{two.body});
+    require(dialogue.materialize() == second, "route second TU changed bytes");
+    TxCommit mismatch = route_commit(two.begin);
+    mismatch.raw_digest.bytes[0] ^= 0xff;
+    require_throws<std::invalid_argument>(
+        [&] { dialogue.commit_visible(mismatch); },
+        "route accepted a mismatched terminal commit");
+    dialogue.discard_tentative();
+    require(dialogue.state() == ProfileDialogueState::Idle,
+            "route cancel did not reset tentative state");
+    dialogue.begin(two.begin);
+    dialogue.append_body(BodyMessage{two.body});
+    require(dialogue.materialize() == second,
+            "route exact retained bytes did not replay after cancel");
+    dialogue.commit_visible(route_commit(two.begin));
+    dialogue.disconnect();
+    dialogue.reset();
+    require_throws<std::logic_error>([&] { dialogue.reset(); },
+                                     "route reset unexpectedly accepted twice");
+}
+
+void test_zstd_route_reset_and_fallback() {
+    require_throws<std::exception>(
+        [] {
+            ZstdRouteCodec codec;
+            (void)codec.encode(HistoryNonce{1}, RelSeq{0}, TuSeq{1}, Digest128{},
+                                std::span<const uint8_t>{},
+                                ZstdTuLimits{1, 1, 27});
+        },
+        "route admitted a body cap too small for its stream");
+    require_throws<std::invalid_argument>(
+        [] {
+            (void)make_profile_dialogue(
+                ProfileId::Z3_SHARED_LONG,
+                ProfileDialogueConfig{.negotiated_profiles = profile_bit(ProfileId::Z3_SHARED_LONG),
+                                      .max_encoded_body_bytes = limits().max_encoded_body_bytes,
+                                      .max_raw_bytes = limits().max_raw_bytes});
+        },
+        "unsupported shared-long profile did not fall back closed");
+}
+
 void test_zstd_round_trip_and_move_lifetime() {
     const std::vector<uint8_t> input{'p', 'r', 'o', 'f', 'i', 'l', 'e'};
     const ZstdTuEnvelope envelope = encode_zstd_tu(
@@ -117,6 +216,7 @@ void test_exact_terminal_promotion_and_discard() {
     TxCommit bad{envelope.begin.history_nonce, envelope.begin.rel_seq,
                  envelope.begin.tu_seq, envelope.begin.transaction_digest,
                  envelope.begin.raw_digest, Digest128{}};
+    bad.raw_digest.bytes[0] ^= 0xff;
     require_throws<std::invalid_argument>(
         [&] { dialogue.commit_visible(bad); },
         "profile promoted a mismatched terminal commit");
@@ -160,13 +260,23 @@ void test_factory_rejects_unsupported_or_unnegotiated() {
     require_throws<std::invalid_argument>(
         [] {
             (void)make_profile_dialogue(
+                ProfileId::Z3_SHARED_LONG,
+                ProfileDialogueConfig{.negotiated_profiles = profile_bit(ProfileId::Z3_SHARED_LONG),
+                                      .max_encoded_body_bytes = limits().max_encoded_body_bytes,
+                                      .max_raw_bytes = limits().max_raw_bytes,
+                                      .max_window_log = limits().max_window_log});
+        },
+        "factory admitted unsupported profile");
+    require_throws<std::invalid_argument>(
+        [] {
+            (void)make_profile_dialogue(
                 ProfileId::GRZ,
                 ProfileDialogueConfig{.negotiated_profiles = profile_bit(ProfileId::GRZ),
                                       .max_encoded_body_bytes = limits().max_encoded_body_bytes,
                                       .max_raw_bytes = limits().max_raw_bytes,
                                       .max_window_log = limits().max_window_log});
         },
-        "factory admitted unsupported profile");
+        "factory admitted unsupported GRZ profile");
     require_throws<std::invalid_argument>(
         [] {
             (void)make_profile_dialogue(
@@ -197,6 +307,8 @@ int main() {
     test_exact_terminal_promotion_and_discard();
     test_interactive_hooks_are_reachable_and_fail_closed_for_zstd();
     test_factory_rejects_unsupported_or_unnegotiated();
+    test_zstd_route_multi_tu_replay_and_terminal_rules();
+    test_zstd_route_reset_and_fallback();
     std::cout << "p50profile_test: type-erased profile vtable gates passed\n";
     return 0;
 }

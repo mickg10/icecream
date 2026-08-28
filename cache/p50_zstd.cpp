@@ -64,6 +64,8 @@ void validate_zstd_tu_limits(ZstdTuLimits limits) {
         throw std::invalid_argument("ZSTD_TU byte limits must be nonzero");
     if (limits.max_window_log < 10 || limits.max_window_log > 31)
         throw std::invalid_argument("ZSTD_TU window-log cap is outside [10,31]");
+    if (limits.max_history_bytes == 0 || limits.max_history_bytes > SIZE_MAX)
+        throw std::invalid_argument("ZSTD route history cap is outside process bounds");
 }
 
 struct ZstdTuCodec::Contexts {
@@ -228,6 +230,377 @@ std::vector<uint8_t> decode_zstd_tu(const TxBegin& begin,
                                     ZstdTuLimits limits) {
     ZstdTuCodec codec;
     return codec.decode(begin, encoded_body, limits);
+}
+
+bool commit_matches(const TxCommit& commit, const TxBegin& begin);
+
+namespace {
+
+void validate_route_begin_shape(const TxBegin& begin, ZstdTuLimits limits) {
+    validate_zstd_tu_limits(limits);
+    if (begin.profile != ProfileId::Z3_LONG ||
+        begin.p29_root_mode != P29RootMode::NotApplicable)
+        throw std::invalid_argument("transaction is not a ZSTD_ROUTE profile");
+    if (begin.rel_seq.value == std::numeric_limits<uint64_t>::max())
+        throw std::overflow_error("ZSTD_ROUTE begins at terminal REL_SEQ");
+    if (begin.dict != empty_dict_descriptor())
+        throw std::invalid_argument("ZSTD_ROUTE DICT is not canonically empty");
+    if (begin.body.encoding != kZstdRouteBodyEncoding ||
+        begin.body.encoded_bytes == 0)
+        throw std::invalid_argument("ZSTD_ROUTE BODY encoding is invalid");
+    if (begin.body.decoded_bytes != begin.raw_bytes)
+        throw std::invalid_argument("ZSTD_ROUTE decoded and raw lengths differ");
+    if (begin.body.encoded_bytes > limits.max_encoded_body_bytes)
+        throw std::length_error("ZSTD_ROUTE encoded BODY exceeds the local cap");
+    if (begin.raw_bytes > limits.max_raw_bytes)
+        throw std::length_error("ZSTD_ROUTE raw input exceeds the local cap");
+    if (begin.body.encoded_bytes > std::numeric_limits<size_t>::max() ||
+        begin.raw_bytes > std::numeric_limits<size_t>::max())
+        throw std::overflow_error("ZSTD_ROUTE lengths do not fit this process");
+}
+
+void set_route_compression_parameters(ZSTD_CCtx* context, int level,
+                                      ZstdTuLimits limits) {
+    size_t result = ZSTD_CCtx_reset(context, ZSTD_reset_session_and_parameters);
+    if (ZSTD_isError(result)) throw_zstd("ZSTD_ROUTE CCtx reset", result);
+    result = ZSTD_CCtx_setParameter(context, ZSTD_c_compressionLevel, level);
+    if (ZSTD_isError(result)) throw_zstd("ZSTD_ROUTE compression level", result);
+    result = ZSTD_CCtx_setParameter(context, ZSTD_c_windowLog,
+                                    limits.max_window_log);
+    if (ZSTD_isError(result)) throw_zstd("ZSTD_ROUTE window log", result);
+}
+
+void route_compress_flush(ZSTD_CCtx* context, std::span<const uint8_t> input,
+                          std::vector<uint8_t>* retained, uint64_t cap) {
+    const uint8_t input_scratch = 0;
+    ZSTD_inBuffer source{readable_data(input, input_scratch), input.size(), 0};
+    std::array<uint8_t, 128U << 10> scratch{};
+    bool done = false;
+    while (!done) {
+        ZSTD_outBuffer destination{};
+        if (retained != nullptr) {
+            if (retained->size() >= cap)
+                throw std::length_error("ZSTD_ROUTE encoded BODY exceeds the local cap");
+            const size_t room = static_cast<size_t>(std::min<uint64_t>(
+                cap - retained->size(), scratch.size()));
+            destination = {scratch.data(), room, 0};
+        } else {
+            destination = {scratch.data(), scratch.size(), 0};
+        }
+        const size_t previous_input = source.pos;
+        const size_t result = ZSTD_compressStream2(context, &destination, &source,
+                                                   ZSTD_e_flush);
+        if (ZSTD_isError(result)) throw_zstd("ZSTD_ROUTE stream flush", result);
+        if (retained != nullptr)
+            retained->insert(retained->end(), scratch.begin(),
+                             scratch.begin() + destination.pos);
+        done = source.pos == source.size && result == 0;
+        if (!done && source.pos == previous_input && destination.pos == 0)
+            throw std::invalid_argument("ZSTD_ROUTE encoder made no progress");
+    }
+}
+
+void route_decompress_body(ZSTD_DCtx* context, const TxBegin& begin,
+                           std::span<const uint8_t> encoded,
+                           std::vector<uint8_t>* retained) {
+    const uint8_t input_scratch = 0;
+    ZSTD_inBuffer source{readable_data(encoded, input_scratch), encoded.size(), 0};
+    std::array<uint8_t, 128U << 10> scratch{};
+    std::vector<uint8_t> output;
+    if (retained != nullptr) output.resize(static_cast<size_t>(begin.raw_bytes));
+    size_t produced = 0;
+    while (source.pos != source.size || produced != begin.raw_bytes) {
+        const size_t room = static_cast<size_t>(std::min<uint64_t>(
+            begin.raw_bytes - produced,
+            retained != nullptr ? output.size() - produced : scratch.size()));
+        ZSTD_outBuffer destination{
+            retained != nullptr && !output.empty()
+                ? static_cast<void*>(output.data() + produced)
+                : static_cast<void*>(scratch.data()),
+            room, 0};
+        const size_t previous_input = source.pos;
+        const size_t previous_output = destination.pos;
+        const size_t result = ZSTD_decompressStream(context, &destination, &source);
+        if (ZSTD_isError(result)) throw_zstd("ZSTD_ROUTE stream decode", result);
+        produced += destination.pos;
+        if (produced > begin.raw_bytes)
+            throw std::invalid_argument("ZSTD_ROUTE decoder exceeded raw byte count");
+        if (source.pos == previous_input && destination.pos == previous_output)
+            throw std::invalid_argument("ZSTD_ROUTE decoder made no progress");
+    }
+    if (source.pos != source.size || produced != begin.raw_bytes)
+        throw std::invalid_argument("ZSTD_ROUTE decoder consumed the wrong byte count");
+    if (retained != nullptr) {
+        if (icecc::digest128(output) != begin.raw_digest)
+            throw std::invalid_argument("ZSTD_ROUTE raw input digest differs");
+        *retained = std::move(output);
+    }
+}
+
+} // namespace
+
+struct ZstdRouteCodec::Contexts {
+    Contexts() : compress(ZSTD_createCCtx()), decompress(ZSTD_createDCtx()) {
+        if (!compress || !decompress) {
+            ZSTD_freeCCtx(compress);
+            ZSTD_freeDCtx(decompress);
+            throw std::bad_alloc();
+        }
+    }
+    ~Contexts() {
+        ZSTD_freeCCtx(compress);
+        ZSTD_freeDCtx(decompress);
+    }
+    ZSTD_CCtx* compress = nullptr;
+    ZSTD_DCtx* decompress = nullptr;
+};
+
+ZstdRouteCodec::ZstdRouteCodec(int compression_level)
+    : compression_level_(compression_level), contexts_(std::make_unique<Contexts>()) {
+    if (compression_level != 3)
+        throw std::invalid_argument("ZSTD_ROUTE requires compression level 3");
+}
+
+ZstdRouteCodec::~ZstdRouteCodec() = default;
+
+ZstdRouteEnvelope ZstdRouteCodec::encode(
+    HistoryNonce history_nonce, RelSeq rel_seq, TuSeq tu_seq,
+    Digest128 pre_state_digest,
+    const std::vector<std::vector<uint8_t>>& committed_raw,
+    std::span<const uint8_t> exact_input, ZstdTuLimits limits) {
+    validate_zstd_tu_limits(limits);
+    if (history_nonce.value == 0)
+        throw std::invalid_argument("ZSTD_ROUTE HISTORY_NONCE zero is reserved");
+    if (rel_seq.value == std::numeric_limits<uint64_t>::max())
+        throw std::overflow_error("ZSTD_ROUTE cannot encode terminal REL_SEQ");
+    if (exact_input.size() > limits.max_raw_bytes)
+        throw std::length_error("ZSTD_ROUTE raw input exceeds the local cap");
+    if (exact_input.empty())
+        throw std::invalid_argument("ZSTD_ROUTE requires a non-empty TU");
+    set_route_compression_parameters(contexts_->compress, compression_level_, limits);
+    uint64_t history_raw = 0;
+    for (const auto& predecessor : committed_raw) {
+        if (predecessor.size() > limits.max_raw_bytes)
+            throw std::length_error("ZSTD_ROUTE predecessor exceeds the local cap");
+        if (predecessor.size() > limits.max_history_bytes ||
+            history_raw > limits.max_history_bytes - predecessor.size())
+            throw std::length_error("ZSTD_ROUTE predecessor history exceeds the local cap");
+        history_raw += predecessor.size();
+        route_compress_flush(contexts_->compress, predecessor, nullptr,
+                             limits.max_encoded_body_bytes);
+    }
+    std::vector<uint8_t> encoded;
+    route_compress_flush(contexts_->compress, exact_input, &encoded,
+                         limits.max_encoded_body_bytes);
+    if (encoded.empty())
+        throw std::invalid_argument("ZSTD_ROUTE encoder produced an empty BODY");
+
+    ZstdRouteEnvelope result;
+    result.begin.history_nonce = history_nonce;
+    result.begin.rel_seq = rel_seq;
+    result.begin.tu_seq = tu_seq;
+    result.begin.profile = ProfileId::Z3_LONG;
+    result.begin.p29_root_mode = P29RootMode::NotApplicable;
+    result.begin.pre_state_digest = pre_state_digest;
+    result.begin.dict = empty_dict_descriptor();
+    result.begin.body = describe_component(kZstdRouteBodyEncoding, encoded,
+                                           exact_input.size());
+    result.begin.raw_bytes = exact_input.size();
+    result.begin.raw_digest = icecc::digest128(exact_input);
+    result.body = std::move(encoded);
+    result.begin.transaction_digest = compute_transaction_digest(
+        result.begin, std::span<const uint8_t>{}, result.body);
+    return result;
+}
+
+ZstdRouteEnvelope ZstdRouteCodec::encode(
+    HistoryNonce history_nonce, RelSeq rel_seq, TuSeq tu_seq,
+    Digest128 pre_state_digest, std::span<const uint8_t> exact_input,
+    ZstdTuLimits limits) {
+    return encode(history_nonce, rel_seq, tu_seq, pre_state_digest,
+                  std::vector<std::vector<uint8_t>>{}, exact_input, limits);
+}
+
+ZstdRouteEnvelope encode_zstd_route(HistoryNonce history_nonce, RelSeq rel_seq,
+                                    TuSeq tu_seq, Digest128 pre_state_digest,
+                                    std::span<const uint8_t> exact_input,
+                                    ZstdTuLimits limits) {
+    ZstdRouteCodec codec;
+    return codec.encode(history_nonce, rel_seq, tu_seq, pre_state_digest,
+                        exact_input, limits);
+}
+
+std::vector<uint8_t> ZstdRouteCodec::decode(
+    const std::vector<ZstdRouteEnvelope>& committed, const TxBegin& begin,
+    std::span<const uint8_t> encoded_body, ZstdTuLimits limits) {
+    validate_route_begin_shape(begin, limits);
+    if (encoded_body.size() != begin.body.encoded_bytes ||
+        icecc::digest128(encoded_body) != begin.body.digest ||
+        compute_transaction_digest(begin, std::span<const uint8_t>{}, encoded_body) !=
+            begin.transaction_digest)
+        throw std::invalid_argument("ZSTD_ROUTE BODY or transaction digest differs");
+    size_t total_raw = 0;
+    uint64_t total_encoded = 0;
+    for (const auto& predecessor : committed) {
+        validate_route_begin_shape(predecessor.begin, limits);
+        if (predecessor.body.size() != predecessor.begin.body.encoded_bytes ||
+            icecc::digest128(predecessor.body) != predecessor.begin.body.digest)
+            throw std::invalid_argument("ZSTD_ROUTE retained predecessor is corrupt");
+        if (total_raw > std::numeric_limits<size_t>::max() -
+                           static_cast<size_t>(predecessor.begin.raw_bytes))
+            throw std::overflow_error("ZSTD_ROUTE predecessor size overflow");
+        total_raw += static_cast<size_t>(predecessor.begin.raw_bytes);
+        if (predecessor.body.size() > limits.max_history_bytes ||
+            total_encoded > limits.max_history_bytes - predecessor.body.size())
+            throw std::length_error("ZSTD_ROUTE retained history exceeds the local cap");
+        total_encoded += predecessor.body.size();
+    }
+    set_route_compression_parameters(contexts_->compress, compression_level_, limits);
+    (void)total_raw;
+    // The decoder is reset independently for every TU. Replaying the exact
+    // retained predecessor bytes gives a deterministic predecessor context.
+    size_t initialized = ZSTD_initDStream(contexts_->decompress);
+    if (ZSTD_isError(initialized)) throw_zstd("ZSTD_ROUTE init DStream", initialized);
+    initialized = ZSTD_DCtx_setParameter(contexts_->decompress,
+                                         ZSTD_d_windowLogMax,
+                                         limits.max_window_log);
+    if (ZSTD_isError(initialized)) throw_zstd("ZSTD_ROUTE decoder window", initialized);
+    for (const auto& predecessor : committed)
+        route_decompress_body(contexts_->decompress, predecessor.begin,
+                              predecessor.body, nullptr);
+    std::vector<uint8_t> result;
+    route_decompress_body(contexts_->decompress, begin, encoded_body, &result);
+    if (icecc::digest128(result) != begin.raw_digest)
+        throw std::invalid_argument("ZSTD_ROUTE raw input digest differs");
+    return result;
+}
+
+ZstdRouteDialogue::ZstdRouteDialogue(uint32_t negotiated_profiles,
+                                     ZstdTuLimits limits)
+    : negotiated_profiles_(negotiated_profiles), limits_(limits) {
+    validate_zstd_tu_limits(limits_);
+    if (negotiated_profiles_ == 0)
+        throw std::invalid_argument("message session negotiated no profiles");
+}
+
+void ZstdRouteDialogue::begin(const TxBegin& begin_value) {
+    if (state_ != State::Idle)
+        protocol_error("second TX_BEGIN arrived on a live ZSTD_ROUTE dialogue");
+    if ((negotiated_profiles_ & profile_bit(begin_value.profile)) == 0)
+        protocol_error("TX_BEGIN selected an unnegotiated profile");
+    try {
+        validate_route_begin_shape(begin_value, limits_);
+        if (!committed_.empty() && begin_value.history_nonce !=
+                                        committed_.front().begin.history_nonce)
+            throw std::invalid_argument("ZSTD_ROUTE history nonce changed without reset");
+        if (!committed_.empty() &&
+            begin_value.rel_seq.value != committed_.back().begin.rel_seq.value + 1)
+            throw std::invalid_argument("ZSTD_ROUTE REL_SEQ did not advance by one");
+        if (committed_state_ && begin_value.pre_state_digest != *committed_state_)
+            throw std::invalid_argument("ZSTD_ROUTE predecessor state digest differs");
+    } catch (...) {
+        clear_active();
+        state_ = State::Terminal;
+        throw;
+    }
+    active_ = begin_value;
+    state_ = State::ReceivingBody;
+}
+
+void ZstdRouteDialogue::append_dict(const DictMessage&) {
+    protocol_error("ZSTD_ROUTE received DICT after its empty stream was closed");
+}
+
+void ZstdRouteDialogue::append_body(const BodyMessage& message) {
+    if (state_ != State::ReceivingBody || !active_)
+        protocol_error("BODY arrived outside the open ZSTD_ROUTE BODY stream");
+    if (message.bytes.empty()) protocol_error("ZSTD_ROUTE BODY made no progress");
+    const uint64_t expected = active_->body.encoded_bytes;
+    if (body_.size() > expected || message.bytes.size() > expected - body_.size() ||
+        message.bytes.size() > body_.max_size() - body_.size())
+        protocol_error("ZSTD_ROUTE BODY exceeds its declared encoded length");
+    body_.insert(body_.end(), message.bytes.begin(), message.bytes.end());
+    if (body_.size() == expected) state_ = State::BodyClosed;
+}
+
+void ZstdRouteDialogue::receive_need(const NeedMessage&) {
+    protocol_error("ZSTD_ROUTE received an unexpected NEED message");
+}
+
+void ZstdRouteDialogue::receive_fill(const FillMessage&) {
+    protocol_error("ZSTD_ROUTE received an unexpected FILL message");
+}
+
+std::vector<uint8_t> ZstdRouteDialogue::materialize() {
+    if (state_ != State::BodyClosed || !active_)
+        throw std::logic_error("ZSTD_ROUTE materialized before BODY closure");
+    try {
+        std::vector<uint8_t> result = codec_.decode(committed_, *active_, body_, limits_);
+        state_ = State::Materialized;
+        return result;
+    } catch (...) {
+        clear_active();
+        state_ = State::Terminal;
+        throw;
+    }
+}
+
+void ZstdRouteDialogue::commit_visible(const TxCommit& commit) {
+    if (state_ != State::Materialized)
+        throw std::logic_error("ZSTD_ROUTE commit became visible before materialization");
+    if (!active_ || !commit_matches(commit, *active_))
+        throw std::invalid_argument("ZSTD_ROUTE terminal commit differs from TX_BEGIN");
+    uint64_t retained = body_.size();
+    if (retained > limits_.max_history_bytes)
+        throw std::length_error("ZSTD_ROUTE retained history exceeds the local cap");
+    for (const auto& predecessor : committed_) {
+        if (predecessor.body.size() > limits_.max_history_bytes ||
+            retained > limits_.max_history_bytes - predecessor.body.size())
+            throw std::length_error("ZSTD_ROUTE retained history exceeds the local cap");
+        retained += predecessor.body.size();
+    }
+    committed_.push_back(ZstdRouteEnvelope{*active_, std::move(body_)});
+    committed_state_ = commit.post_state_digest;
+    clear_active();
+    state_ = State::Idle;
+}
+
+void ZstdRouteDialogue::discard_tentative() noexcept {
+    if (state_ != State::Idle && state_ != State::Terminal) {
+        clear_active();
+        state_ = State::Idle;
+    }
+}
+
+void ZstdRouteDialogue::disconnect() {
+    clear_active();
+    committed_.clear();
+    committed_state_.reset();
+    state_ = State::Terminal;
+}
+
+void ZstdRouteDialogue::reset() {
+    if (state_ != State::Terminal)
+        throw std::logic_error("ZSTD_ROUTE reset requires a terminal dialogue");
+    clear_active();
+    committed_.clear();
+    committed_state_.reset();
+    state_ = State::Idle;
+}
+
+uint64_t ZstdRouteDialogue::window_limit_bytes() const noexcept {
+    return uint64_t{1} << limits_.max_window_log;
+}
+
+[[noreturn]] void ZstdRouteDialogue::protocol_error(const char* message) {
+    clear_active();
+    state_ = State::Terminal;
+    throw std::invalid_argument(message);
+}
+
+void ZstdRouteDialogue::clear_active() {
+    active_.reset();
+    std::vector<uint8_t>().swap(body_);
 }
 
 bool commit_matches(const TxCommit& commit, const TxBegin& begin) {

@@ -42,7 +42,7 @@ bool known_message_type(MessageType type) {
 
 bool known_profile(ProfileId profile) {
     return profile == ProfileId::P29 || profile == ProfileId::ZSTD_TU ||
-           profile == ProfileId::GRZ;
+           profile == ProfileId::GRZ || profile == ProfileId::Z3_LONG;
 }
 
 bool valid_root_mode(ProfileId profile, P29RootMode mode) {
