@@ -51,12 +51,27 @@ chmod 0711 "$work"
 : >"$work/scheduler.log"
 chmod 0666 "$work/scheduler.log"
 cleanup() {
-    test -n "${client_pid:-}" && kill "$client_pid" 2>/dev/null || :
-    test -n "${worker_pid:-}" && kill "$worker_pid" 2>/dev/null || :
-    test -n "${sched_pid:-}" && kill "$sched_pid" 2>/dev/null || :
-    wait "${client_pid:-}" 2>/dev/null || :
-    wait "${worker_pid:-}" 2>/dev/null || :
-    wait "${sched_pid:-}" 2>/dev/null || :
+    for pid in "${service_pid:-}" "${client_pid:-}" "${worker_pid:-}" "${sched_pid:-}"; do
+        test -n "$pid" && kill "$pid" 2>/dev/null || :
+    done
+    for _ in $(seq 1 50); do
+        live=0
+        for pid in "${service_pid:-}" "${client_pid:-}" "${worker_pid:-}" "${sched_pid:-}"; do
+            if test -n "$pid" && kill -0 "$pid" 2>/dev/null; then
+                live=1
+            fi
+        done
+        test "$live" -eq 0 && break
+        sleep 0.1
+    done
+    for pid in "${service_pid:-}" "${client_pid:-}" "${worker_pid:-}" "${sched_pid:-}"; do
+        test -n "$pid" && kill -9 "$pid" 2>/dev/null || :
+    done
+    for pid in "${client_pid:-}" "${worker_pid:-}" "${sched_pid:-}"; do
+        if test -n "$pid" && ! kill -0 "$pid" 2>/dev/null; then
+            wait "$pid" 2>/dev/null || :
+        fi
+    done
     if test "${ICECC_P50_C1F1_KEEP_WORK:-0}" = 1; then
         echo "INFO: preserving P50 C1F1 workdir $work" >&2
     else
