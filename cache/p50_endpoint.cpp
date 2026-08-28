@@ -896,8 +896,7 @@ struct P50PreparationAuthority::Impl {
     uint64_t next_entry = 1;
     bool entry_exhausted = false;
     uint64_t retained_bytes = 0;
-    std::vector<std::vector<uint8_t>> committed_route_raw;
-    uint64_t committed_route_raw_bytes = 0;
+    std::vector<uint8_t> committed_route_history;
     std::optional<uint64_t> uncommitted_route_entry;
     ZstdRouteCodec route_codec;
     ProfileId profile = ProfileId::ZSTD_TU;
@@ -921,11 +920,6 @@ PreparedTuHandle P50PreparationAuthority::prepare(PrepareRequestKey request,
         throw std::invalid_argument("PrepareRequestKey zero fields are reserved");
     if (exact_input.size() > impl_->zstd_limits.max_raw_bytes)
         throw std::length_error("ZSTD_TU raw input exceeds the local cap");
-    if (impl_->profile == ProfileId::Z3_LONG &&
-        (exact_input.size() > impl_->zstd_limits.max_history_bytes ||
-         impl_->committed_route_raw_bytes >
-             impl_->zstd_limits.max_history_bytes - exact_input.size()))
-        throw std::length_error("ZSTD_ROUTE history exceeds the local cap");
     const Digest128 raw_digest = digest128(exact_input);
     if (const auto request_position = impl_->requests.find(request);
         request_position != impl_->requests.end()) {
@@ -965,7 +959,8 @@ PreparedTuHandle P50PreparationAuthority::prepare(PrepareRequestKey request,
     } else {
         prepared = std::make_shared<const ZstdTuEnvelope>(impl_->route_codec.encode(
             HistoryNonce{1}, RelSeq{0}, tu_seq, Digest128{},
-            impl_->committed_route_raw, exact_input, admission_limits));
+            std::span<const uint8_t>(impl_->committed_route_history), exact_input,
+            admission_limits));
     }
     const uint64_t retained = static_cast<uint64_t>(prepared->body.size());
     if (retained > impl_->authority_limits.max_retained_encoded_bytes ||
@@ -1039,12 +1034,23 @@ void P50PreparationAuthority::commit(PreparedTuHandle handle) {
     if (impl_->profile == ProfileId::Z3_LONG && !entry.committed) {
         if (impl_->uncommitted_route_entry != handle.entry_id_)
             throw std::logic_error("ZSTD_ROUTE commit is not its prepared successor");
-        if (entry.raw.size() > impl_->zstd_limits.max_history_bytes ||
-            impl_->committed_route_raw_bytes >
-                (impl_->zstd_limits.max_history_bytes - entry.raw.size()))
-            throw std::length_error("route history exceeds its bounded raw cap");
-        impl_->committed_route_raw.push_back(entry.raw);
-        impl_->committed_route_raw_bytes += entry.raw.size();
+        const size_t limit = static_cast<size_t>(std::min<uint64_t>(
+            impl_->zstd_limits.max_history_bytes,
+            uint64_t{1} << impl_->zstd_limits.max_window_log));
+        if (entry.raw.size() >= limit) {
+            impl_->committed_route_history.assign(
+                entry.raw.end() - static_cast<std::ptrdiff_t>(limit), entry.raw.end());
+        } else {
+            const size_t excess = impl_->committed_route_history.size() + entry.raw.size() > limit
+                                      ? impl_->committed_route_history.size() + entry.raw.size() - limit
+                                      : 0;
+            if (excess != 0)
+                impl_->committed_route_history.erase(
+                    impl_->committed_route_history.begin(),
+                    impl_->committed_route_history.begin() + excess);
+            impl_->committed_route_history.insert(impl_->committed_route_history.end(),
+                                                  entry.raw.begin(), entry.raw.end());
+        }
         entry.committed = true;
         impl_->uncommitted_route_entry.reset();
     }
@@ -1074,6 +1080,16 @@ size_t P50PreparationAuthority::live_entry_count() const {
 uint64_t P50PreparationAuthority::retained_encoded_bytes() const {
     impl_->owner.check();
     return impl_->retained_bytes;
+}
+
+size_t P50PreparationAuthority::route_history_bytes() const {
+    impl_->owner.check();
+    return impl_->committed_route_history.size();
+}
+
+size_t P50PreparationAuthority::route_history_entries() const {
+    impl_->owner.check();
+    return impl_->committed_route_history.empty() ? 0 : 1;
 }
 
 ProfileId P50PreparationAuthority::profile() const {

@@ -223,6 +223,8 @@ public:
     [[nodiscard]] bool contains(PreparedTuHandle handle) const;
     [[nodiscard]] size_t live_entry_count() const;
     [[nodiscard]] uint64_t retained_encoded_bytes() const;
+    [[nodiscard]] size_t route_history_bytes() const;
+    [[nodiscard]] size_t route_history_entries() const;
     [[nodiscard]] ProfileId profile() const;
 
 private:

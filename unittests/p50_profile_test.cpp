@@ -59,10 +59,10 @@ void test_zstd_route_multi_tu_replay_and_terminal_rules() {
     const std::vector<uint8_t> first{'r', 'o', 'u', 't', 'e', '-', '1'};
     const std::vector<uint8_t> second{'r', 'o', 'u', 't', 'e', '-', '2'};
     ZstdRouteCodec codec;
-    std::vector<std::vector<uint8_t>> predecessor;
+    std::vector<uint8_t> predecessor;
     const auto one = codec.encode(HistoryNonce{33}, RelSeq{0}, TuSeq{1},
                                   Digest128{}, predecessor, first, limits());
-    predecessor.push_back(first);
+    predecessor = first;
     const auto two = codec.encode(HistoryNonce{33}, RelSeq{1}, TuSeq{2},
                                   compute_post_state_digest(one.begin.pre_state_digest,
                                                             one.begin.history_nonce,
@@ -81,10 +81,9 @@ void test_zstd_route_multi_tu_replay_and_terminal_rules() {
                                          predecessor, second, limits());
     require(one_replay.body == one.body && two_replay.body == two.body,
             "route replay did not retain byte-exact stream prefixes");
-    require(codec.decode({}, one.begin, one.body, limits()) == first,
+    require(codec.decode(std::span<const uint8_t>{}, one.begin, one.body, limits()) == first,
             "route first TU did not decode");
-    std::vector<ZstdRouteEnvelope> committed{one};
-    require(codec.decode(committed, two.begin, two.body, limits()) == second,
+    require(codec.decode(predecessor, two.begin, two.body, limits()) == second,
             "route predecessor replay did not decode");
 
     ProfileDialogue dialogue = route_dialogue();
@@ -134,6 +133,75 @@ void test_zstd_route_reset_and_fallback() {
                                       .max_raw_bytes = limits().max_raw_bytes});
         },
         "unsupported shared-long profile did not fall back closed");
+}
+
+void append_route_suffix(std::vector<uint8_t>& history,
+                         std::span<const uint8_t> input, size_t limit) {
+    if (input.size() >= limit) {
+        history.assign(input.end() - static_cast<std::ptrdiff_t>(limit), input.end());
+        return;
+    }
+    const size_t excess = history.size() + input.size() > limit
+                              ? history.size() + input.size() - limit
+                              : 0;
+    if (excess != 0) history.erase(history.begin(), history.begin() + excess);
+    history.insert(history.end(), input.begin(), input.end());
+}
+
+void test_zstd_route_bounded_rolling_history() {
+    ZstdTuLimits bounded{2U << 20, 2U << 20, 12, 4U << 10};
+    ZstdRouteCodec codec;
+    std::vector<uint8_t> history;
+    Digest128 state{};
+    const HistoryNonce nonce{77};
+
+    for (uint64_t index = 0; index != 129; ++index) {
+        std::vector<uint8_t> input(1U << 20, static_cast<uint8_t>('A' + index % 17));
+        const auto envelope = codec.encode(nonce, RelSeq{index}, TuSeq{index}, state,
+                                           history, input, bounded);
+        require(codec.decode(history, envelope.begin, envelope.body, bounded) == input,
+                "bounded route changed bytes after cumulative 128 MiB");
+        append_route_suffix(history, input, bounded.max_history_bytes);
+        state = compute_post_state_digest(state, nonce, envelope.begin.rel_seq,
+                                          envelope.begin.tu_seq,
+                                          envelope.begin.transaction_digest);
+        require(history.size() <= bounded.max_history_bytes,
+                "route prefix exceeded its configured byte window");
+    }
+
+    bounded = ZstdTuLimits{1U << 10, 1U << 20, 12, 4U << 10};
+    history.clear();
+    state = Digest128{};
+    ZstdRouteDialogue dialogue(profile_bit(ProfileId::Z3_LONG), bounded);
+    for (uint64_t index = 0; index != 10000; ++index) {
+        std::vector<uint8_t> input(31, static_cast<uint8_t>(index));
+        const auto envelope = codec.encode(nonce, RelSeq{index}, TuSeq{index}, state,
+                                           history, input, bounded);
+        dialogue.begin(envelope.begin);
+        dialogue.append_body(BodyMessage{envelope.body});
+        require(dialogue.materialize() == input, "rolling dialogue changed small TU bytes");
+        if (index == 0) {
+            dialogue.discard_tentative();
+            dialogue.begin(envelope.begin);
+            dialogue.append_body(BodyMessage{envelope.body});
+            require(dialogue.materialize() == input,
+                    "rolling dialogue retry did not decode exact bytes");
+        }
+        dialogue.commit_visible(route_commit(envelope.begin));
+        append_route_suffix(history, input, bounded.max_history_bytes);
+        state = compute_post_state_digest(state, nonce, envelope.begin.rel_seq,
+                                          envelope.begin.tu_seq,
+                                          envelope.begin.transaction_digest);
+        require(dialogue.retained_history_bytes() <= bounded.max_history_bytes &&
+                    dialogue.retained_history_entries() <= 1,
+                "rolling dialogue retained unbounded route state");
+    }
+    dialogue.disconnect();
+    require(dialogue.retained_history_bytes() == 0,
+            "route disconnect retained committed prefix");
+    dialogue.reset();
+    require(dialogue.state() == ZstdRouteDialogue::State::Idle,
+            "route reset did not return to idle");
 }
 
 void test_zstd_round_trip_and_move_lifetime() {
@@ -309,6 +377,7 @@ int main() {
     test_factory_rejects_unsupported_or_unnegotiated();
     test_zstd_route_multi_tu_replay_and_terminal_rules();
     test_zstd_route_reset_and_fallback();
+    test_zstd_route_bounded_rolling_history();
     std::cout << "p50profile_test: type-erased profile vtable gates passed\n";
     return 0;
 }

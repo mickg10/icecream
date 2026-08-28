@@ -523,6 +523,36 @@ void test_zstd_route_endpoint_continuation_and_retry() {
             "ZSTD_ROUTE retry did not discard tentative state and commit exact bytes");
 }
 
+void test_zstd_route_authority_bounded_history() {
+    EndpointCaps caps;
+    caps.profile = ProfileId::Z3_LONG;
+    caps.zstd.max_raw_bytes = 2U << 20;
+    caps.zstd.max_encoded_body_bytes = 2U << 20;
+    caps.zstd.max_window_log = 12;
+    caps.zstd.max_history_bytes = 4U << 10;
+    PreparationAuthorityLimits authority_limits;
+    authority_limits.max_live_entries = 1;
+    authority_limits.max_retained_encoded_bytes = 8U << 20;
+    P50PreparationAuthority authority(Id128::from_u64(18001), caps.zstd,
+                                      authority_limits, 3, ProfileId::Z3_LONG);
+
+    for (uint64_t index = 0; index != 129; ++index) {
+        const std::vector<uint8_t> input(1U << 20,
+                                         static_cast<uint8_t>('A' + index % 17));
+        const PreparedTuHandle handle =
+            authority.prepare(PrepareRequestKey{180, index + 1}, input);
+        require(authority.live_entry_count() == 1,
+                "route authority did not retain its one active preparation");
+        authority.commit(handle);
+        require(authority.route_history_bytes() <= caps.zstd.max_history_bytes &&
+                    authority.route_history_entries() <= 1,
+                "route authority retained cumulative predecessor state");
+        require(authority.release(handle) == 0 && authority.live_entry_count() == 0 &&
+                    authority.retained_encoded_bytes() == 0,
+                "route authority did not release the committed preparation");
+    }
+}
+
 void test_s3_resource_storm_product_path() {
     const char* requested = std::getenv("ICECC_P50_S3_RESOURCE_STORM");
     const bool storm_only = requested != nullptr &&
@@ -5793,6 +5823,7 @@ int main(int argc, char** argv) {
     test_adopted_cross_executor_releases_registration();
     test_two_client_one_server_isolation();
     test_zstd_route_endpoint_continuation_and_retry();
+    test_zstd_route_authority_bounded_history();
     test_live_global_resource_trace();
     if (s3_resource_storm_requested())
         test_s3_resource_storm_product_path();

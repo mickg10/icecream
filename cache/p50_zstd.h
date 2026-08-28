@@ -16,7 +16,8 @@ namespace icecc::p50 {
 constexpr uint16_t kZstdTuNoDictionaryEncoding = 0;
 constexpr uint16_t kZstdTuBodyEncoding = 1;
 // ZSTD_ROUTE uses the same empty descriptor and component encoding as
-// ZSTD_TU.  Its body is a flushed prefix of one continuing stream.
+// ZSTD_TU. Its body is an independently terminated frame with a bounded
+// exact-raw route prefix.
 constexpr uint16_t kZstdRouteNoDictionaryEncoding = kZstdTuNoDictionaryEncoding;
 constexpr uint16_t kZstdRouteBodyEncoding = kZstdTuBodyEncoding;
 
@@ -28,9 +29,8 @@ struct ZstdTuLimits {
     // and exact-output buffers. Keep that allocation explicit and locally
     // configurable; 27 is Zstd's conventional 128 MiB default.
     int max_window_log = 27;
-    // Relationship history is retained as exact encoded predecessor bytes.
-    // This bound prevents a long-lived route from turning replay into an
-    // unbounded owner allocation.
+    // Relationship history is retained as a bounded suffix of exact raw
+    // predecessor bytes. This is the route's rolling prefix window.
     uint64_t max_history_bytes = uint64_t{128} << 20;
 
     auto operator<=>(const ZstdTuLimits&) const = default;
@@ -83,9 +83,9 @@ std::vector<uint8_t> decode_zstd_tu(const TxBegin& begin,
 
 using ZstdRouteEnvelope = ZstdTuEnvelope;
 
-// A route is encoded by replaying the committed raw TUs into a fresh bounded
-// level-3 stream, then flushing the candidate TU.  Keeping this reconstruction
-// primitive explicit makes retry byte identity independent of a live CCtx.
+// A route uses a bounded exact-raw suffix as the single-use prefix for each
+// independently terminated level-3 frame. Keeping the prefix explicit makes
+// retry byte identity independent of a live CCtx and bounds predecessor work.
 class ZstdRouteCodec {
 public:
     explicit ZstdRouteCodec(int compression_level = 3);
@@ -95,7 +95,7 @@ public:
 
     ZstdRouteEnvelope encode(HistoryNonce history_nonce, RelSeq rel_seq,
                              TuSeq tu_seq, Digest128 pre_state_digest,
-                             const std::vector<std::vector<uint8_t>>& committed_raw,
+                             std::span<const uint8_t> predecessor_history,
                              std::span<const uint8_t> exact_input,
                              ZstdTuLimits limits);
     ZstdRouteEnvelope encode(HistoryNonce history_nonce, RelSeq rel_seq,
@@ -106,6 +106,10 @@ public:
         const std::vector<ZstdRouteEnvelope>& committed,
         const TxBegin& begin, std::span<const uint8_t> encoded_body,
         ZstdTuLimits limits);
+    std::vector<uint8_t> decode(std::span<const uint8_t> predecessor_history,
+                                const TxBegin& begin,
+                                std::span<const uint8_t> encoded_body,
+                                ZstdTuLimits limits);
 
 private:
     struct Contexts;
@@ -120,9 +124,9 @@ ZstdRouteEnvelope encode_zstd_route(HistoryNonce history_nonce, RelSeq rel_seq,
                                         uint64_t{64} << 20,
                                         uint64_t{2} << 30});
 
-// One relationship-scoped dialogue.  It retains only committed envelopes and
-// reconstructs a tentative decoder from those bytes for each candidate TU.
-// Rejection/disconnect never mutates the committed predecessor.
+// One relationship-scoped dialogue. It retains one bounded exact-raw suffix
+// and reconstructs a tentative decoder from that prefix for each candidate
+// TU. Rejection/disconnect never mutates the committed predecessor.
 class ZstdRouteDialogue {
 public:
     enum class State {
@@ -149,6 +153,10 @@ public:
     [[nodiscard]] State state() const { return state_; }
     [[nodiscard]] bool terminal() const { return state_ == State::Terminal; }
     [[nodiscard]] size_t pending_body_bytes() const { return body_.size(); }
+    [[nodiscard]] size_t retained_history_bytes() const { return history_.size(); }
+    [[nodiscard]] size_t retained_history_entries() const {
+        return history_.empty() ? 0 : 1;
+    }
     [[nodiscard]] const std::optional<TxBegin>& active_begin() const {
         return active_;
     }
@@ -163,7 +171,10 @@ private:
     State state_ = State::Idle;
     std::optional<TxBegin> active_;
     std::vector<uint8_t> body_;
-    std::vector<ZstdRouteEnvelope> committed_;
+    std::vector<uint8_t> active_raw_;
+    std::vector<uint8_t> history_;
+    std::optional<HistoryNonce> history_nonce_;
+    std::optional<RelSeq> last_rel_;
     std::optional<Digest128> committed_state_;
 };
 
