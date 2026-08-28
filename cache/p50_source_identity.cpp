@@ -178,7 +178,10 @@ bool P50SourceArm::valid() const noexcept {
 }
 
 bool P50InputReady::valid() const noexcept {
-    return arm.valid() && tu_seq.value != 0 && raw_bytes != 0 &&
+    // TU sequence zero is the first valid member of a C-store generation.
+    // Presence is carried by the nonzero store GUID/request identities, not
+    // by shifting the sequence namespace to one.
+    return arm.valid() && raw_bytes != 0 &&
            f_store_guid != FStoreGuid{} && attachment_store_generation != 0 &&
            attachment_request_id != 0 && ready_event_id != 0;
 }

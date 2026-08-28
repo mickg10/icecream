@@ -114,6 +114,15 @@ void wire_fixture() {
     require(ready_decoded.has_value() && *ready_decoded == ready,
             "input ready fixture did not round-trip");
 
+    P50InputReady first_ready = ready;
+    first_ready.tu_seq = icecc::p50::TuSeq{0};
+    const auto first_ready_wire = icecc::p50::encode_input_ready(first_ready);
+    const auto first_ready_decoded =
+        icecc::p50::decode_input_ready(first_ready_wire);
+    require(!first_ready_wire.empty() && first_ready_decoded.has_value() &&
+                *first_ready_decoded == first_ready,
+            "zero-based first TU sequence did not round-trip");
+
     auto wrong_version = encoded;
     wrong_version[5] = 49;
     require(!icecc::p50::decode_source_arm(wrong_version),
