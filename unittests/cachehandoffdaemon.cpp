@@ -490,6 +490,8 @@ int main(int argc, char **argv)
     const uint32_t remote_wire_job_id = UINT32_C(0x00005203);
     const uint64_t remote_assignment_epoch = UINT64_C(0x5200000000000002);
     const uint64_t remote_assignment_nonce = UINT64_C(0x99aabbccddeeff00);
+    const uint64_t remote_c_guid = UINT64_C(0x52000000000000c3);
+    const uint64_t remote_tu_seq = UINT64_C(37);
     const uint32_t remote_cache_port = UINT32_C(0x0000feed);
     /* BigOracle blueprint: also vary got_env and matched_job_id away from
        their zero/default constructor values, and require both -- plus
@@ -503,13 +505,14 @@ int main(int argc, char **argv)
     const uint32_t remote_matched_job_id = UINT32_C(0x00000037);
     const uint32_t client_c_forwarded_id = forwarded_c ? forwarded_c->client_id : 0;
 
+    UseCSMsg reply_c("x86_64", remote_f_host, remote_f_port,
+                     remote_wire_job_id, remote_got_env, client_c_forwarded_id,
+                     remote_matched_job_id,
+                     remote_assignment_epoch, remote_assignment_nonce,
+                     remote_cache_port, CACHE_WIRE_PROTOCOL_V1,
+                     CACHE_PROFILE_ZSTD_TU);
+    reply_c.setCompileIdentity(remote_c_guid, remote_tu_seq);
     if (scheduler && forwarded_c) {
-        UseCSMsg reply_c("x86_64", remote_f_host, remote_f_port,
-                         remote_wire_job_id, remote_got_env, client_c_forwarded_id,
-                         remote_matched_job_id,
-                         remote_assignment_epoch, remote_assignment_nonce,
-                         remote_cache_port, CACHE_WIRE_PROTOCOL_V1,
-                         CACHE_PROFILE_ZSTD_TU);
         REQUIRE(scheduler->send_msg(reply_c),
                 "fake scheduler sent a remote-selected-F UseCS with a valid "
                 "cache tail");
@@ -535,8 +538,10 @@ int main(int argc, char **argv)
             "matched_job_id exactly -- each varied away from its zero/"
             "default constructor value so this row cannot pass by accident");
     REQUIRE(client_c_use && client_c_use->assignmentEpoch() == remote_assignment_epoch
-                && client_c_use->assignmentNonce() == remote_assignment_nonce,
-            "S2: assignment identity survives the remote-worker relay unchanged");
+                && client_c_use->assignmentNonce() == remote_assignment_nonce
+                && client_c_use->cGuid() == remote_c_guid
+                && client_c_use->tuSeq() == remote_tu_seq,
+            "S2: assignment and compile identities survive the remote-worker relay unchanged");
     REQUIRE(client_c_use && client_c_use->hasCacheAdvertisement()
                 && client_c_use->cache_endpoint_port == remote_cache_port
                 && client_c_use->cache_protocol == CACHE_WIRE_PROTOCOL_V1
@@ -547,6 +552,25 @@ int main(int argc, char **argv)
             "copy");
     delete client_c_wire;
     delete client_c;
+
+    /* A real compiler wrapper can disconnect after receiving UseCS but before
+       it sends its own terminal message (for example, a local preprocessing or
+       cache-source failure).  The submitter daemon has no CompileJob on this
+       path; it must settle from the exact retained UseCS instead of emitting
+       zero assignment/C_GUID/TU_SEQ and causing the scheduler to reject its
+       whole connection. */
+    Msg *client_c_done_wire = scheduler
+        ? wait_for_type(scheduler, Msg::JOB_DONE, 5000) : nullptr;
+    JobDoneMsg *client_c_done = client_c_done_wire
+        ? dynamic_cast<JobDoneMsg *>(client_c_done_wire) : nullptr;
+    REQUIRE(client_c_done != nullptr && !client_c_done->is_from_server()
+                && client_c_done->job_id == remote_wire_job_id
+                && client_c_done->assignmentEpoch() == remote_assignment_epoch
+                && client_c_done->assignmentNonce() == remote_assignment_nonce
+                && client_c_done->cGuid() == remote_c_guid
+                && client_c_done->tuSeq() == remote_tu_seq,
+            "submitter teardown settles the exact retained UseCS assignment and compile identity");
+    delete client_c_done_wire;
 
     /* Client D (BigOracle d23d9c5d HOLD, Gap 3 -- reused-client clearing,
        doubling as the blueprint's "Focused test"): Daemon::scheduler_no_cs

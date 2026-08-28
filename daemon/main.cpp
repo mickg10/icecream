@@ -8172,12 +8172,37 @@ void Daemon::handle_end(Client *client, int exitcode)
 
             trace() << "scheduler->send_msg( JobDoneMsg( " << client->dump() << ", " << exitcode << "))\n";
 
-            const uint64_t c_guid = client->job ? client->job->cGuid() : 0;
-            const uint64_t tu_seq = client->job ? client->job->tuSeq() : 0;
+            /* A submitter-side remote wrapper never owns a CompileJob: its
+               exact assignment lives in the retained UseCS copied by
+               scheduler_use_cs().  If the client disconnects before sending
+               its own JobDone, settling from client->job alone therefore
+               emitted an all-zero identity.  Protocol-50 schedulers correctly
+               reject that terminal frame and close the daemon connection.
+
+               Use the retained frame only when it names this exact job and is
+               still wire-valid.  The job object remains authoritative on the
+               worker/local paths, while stale batch or replacement UseCS
+               objects cannot redirect teardown because their job id differs. */
+            const UseCSMsg *const retained_usecs =
+                client->job == nullptr && job_id > 0 &&
+                        client->usecsmsg != nullptr &&
+                        client->usecsmsg->job_id ==
+                            static_cast<uint32_t>(job_id) &&
+                        client->usecsmsg->valid_payload()
+                    ? client->usecsmsg
+                    : nullptr;
+            const uint64_t c_guid = client->job
+                ? client->job->cGuid()
+                : retained_usecs ? retained_usecs->cGuid() : 0;
+            const uint64_t tu_seq = client->job
+                ? client->job->tuSeq()
+                : retained_usecs ? retained_usecs->tuSeq() : 0;
             const uint64_t assignment_epoch = client->job
-                ? client->job->assignmentEpoch() : 0;
+                ? client->job->assignmentEpoch()
+                : retained_usecs ? retained_usecs->assignmentEpoch() : 0;
             const uint64_t assignment_nonce = client->job
-                ? client->job->assignmentNonce() : 0;
+                ? client->job->assignmentNonce()
+                : retained_usecs ? retained_usecs->assignmentNonce() : 0;
             JobDoneMsg msg(job_id, exitcode, flag, clients.size(),
                            assignment_epoch, assignment_nonce, c_guid, tu_seq);
             if( use_client_id ) {
