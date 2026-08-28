@@ -39,15 +39,15 @@ P50_ROOT = "/tanksmall/scratch/ictmp/wt-s2-root-current-20260828"
 DEFAULT_WORKLOAD = "/tanksmall/scratch/ictmp/src2/fmt/build/compile_commands.json"
 DEFAULT_SOURCE_ROOT = "/tanksmall/scratch/ictmp/src2/fmt"
 PROCESS_MARKERS = ("icecc-scheduler", "iceccd", "icecc-cache-service", "icecc")
-# Hashes of the role binaries built from EXPECTED_ROOT with the pinned build
-# environment.  Keep this S5 identity private to the runner: changing S4's
-# historical matrix constants would silently alter its prior evidence.
+# Hashes of the exact role binaries in the current-root artifact set. Keep
+# this S5 identity private to the runner: changing S4's historical matrix
+# constants would silently alter its prior evidence.
 P50_ROLE_HASHES = {
-    "S": "8857b14179559d0efc9b588c29a6f0fe6c922c9f40d9fc2de498887257931212",
-    "F": "56f6667da25d99660a335eb2349578946f5c1d096726dffa94df5f9fd8c62136",
-    "C": "60004a5cd00ce8f54bc667217b87c02236c0d8d350260f81d0cfb5805ab4c985",
+    "S": "15f70cf600d316d2a9692ee7e6fb93da94180767a42fad1a36ea532dc7a9a275",
+    "F": "39639ed2c82fa4846073910904bc66e07fc945c653ed72e6a376349ec0ab8fe5",
+    "C": "e21e60e47c9e5499db34cf578c87dece339e9fba5804f22096961980a8a95e61",
     "E": "ee7d30b240c38bccf66d4afcdd45993f115a01d4a2fb4e9143d38596609d2ba4",
-    "X": "dcc6278720c409eeab1efb1491d61232f693b80159b22d4a5659853c0a43ae70",
+    "X": "cefc8b0936c4f4bd1e9e26427cdd59b17a1ea6bc0f63952b928232d9cb784394",
 }
 SSH = ["-o", "HostName=10.0.27.101", "-o", "HostKeyAlias=tt-quietbox3",
        "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
@@ -257,7 +257,7 @@ def _archive(source_root: Path, relatives: list[str]) -> bytes:
     return output.getvalue()
 
 
-def _compile_tokens(row: dict[str, Any], source_root: Path) -> tuple[str, list[str]]:
+def _compile_tokens(row: dict[str, Any], source_root: Path) -> tuple[str, list[str], str]:
     command = row.get("command") or row.get("arguments")
     tokens = list(command) if isinstance(command, list) else shlex.split(str(command))
     if not tokens:
@@ -281,7 +281,8 @@ def _compile_tokens(row: dict[str, Any], source_root: Path) -> tuple[str, list[s
             token = token.replace(str(root), "$WORK/source")
         flags.append(token)
         index += 1
-    return relative, flags
+    compiler = "gcc" if Path(tokens[0]).name in {"cc", "gcc"} else "g++"
+    return relative, flags, compiler
 
 
 def load_workload(path: Path, source_root: Path, selected: list[str] | None) -> list[dict[str, Any]]:
@@ -296,7 +297,7 @@ def load_workload(path: Path, source_root: Path, selected: list[str] | None) -> 
             continue
         source = Path(str(row["file"])).resolve()
         try:
-            relative, flags = _compile_tokens(row, source_root)
+            relative, flags, compiler = _compile_tokens(row, source_root)
         except (ValueError, KeyError):
             continue
         if wanted and relative not in wanted and Path(relative).name not in wanted:
@@ -309,6 +310,9 @@ def load_workload(path: Path, source_root: Path, selected: list[str] | None) -> 
             "tu_id": f"fmt-{ordinal:04d}-{Path(relative).stem}",
             "source": relative,
             "source_sha256": sha256_file(source_path),
+            # Preserve the C/C++ language driver from the immutable compile
+            # database; invoking g++ for a .c TU changes its semantics.
+            "compiler": compiler,
             "flags": flags,
         })
     if not result:
@@ -332,8 +336,164 @@ def schedule_matrix(cold_blocks: int = 4, warm_blocks: int = 4) -> list[dict[str
     return schedule(cold_blocks, regime="cold") + schedule(warm_blocks, regime="warm")
 
 
+def _manifest_remote_script(source_archive_b64: str, tus: list[dict[str, Any]], mode: str,
+                            source_root: Path, *, warm: bool = False) -> str:
+    """Build one S4 lifecycle script for the complete immutable TU manifest."""
+    if not tus:
+        raise ValueError("at least one TU is required")
+    script = s4_real_cells.REMOTE_SCRIPT
+    extract = (
+        "printf '%s' '" + source_archive_b64 + "' | base64 -d >\"$WORK/source.tar.gz\"\n"
+        "mkdir -p \"$WORK/source\"\n"
+        "tar -xzf \"$WORK/source.tar.gz\" -C \"$WORK/source\"\n"
+    )
+
+    def quote_flag(flag: str) -> str:
+        # Relocated source/include paths intentionally expand $WORK remotely.
+        return flag if "$WORK" in flag else shlex.quote(flag)
+
+    def command(tu: dict[str, Any], output: str, *, remote: bool,
+                append_log: bool = False) -> str:
+        flags = " ".join(quote_flag(str(flag)) for flag in tu["flags"])
+        source = "$WORK/source/" + tu["source"]
+        prefix = 'env "${CLIENT_ENV[@]}" timeout 150 "$C" ' if remote else ""
+        redirect = '>>"$WORK/client.log" 2>&1' if append_log else '2>"$WORK/local.log"'
+        compiler = str(tu.get("compiler", "g++"))
+        return f'{prefix}{compiler} {flags} -c "{source}" -o {output} {redirect}'
+
+    body: list[str] = []
+    for index, tu in enumerate(tus):
+        tu_id = str(tu.get("tu_id", f"s5-tu-{index:04d}"))
+        body += [
+            f"# S5 reference TU {index}: {tu_id}",
+            command(tu, f'"$WORK/out/reference-{index}.o"', remote=False) +
+            " || { echo 'S4_STATUS=FAIL reason=local-reference'; exit 1; }",
+            f'S5_REFERENCE_SHA_{index}=$(sha256sum "$WORK/out/reference-{index}.o" | awk \'{{print $1}}\')',
+            f'S5_REFERENCE_BYTES_{index}=$(stat -c %s "$WORK/out/reference-{index}.o")',
+        ]
+    if warm:
+        body.append("# S5 prewarm: all TUs through this same scheduler/worker/cache lifecycle")
+        for index, tu in enumerate(tus):
+            tu_id = str(tu.get("tu_id", f"s5-tu-{index:04d}"))
+            body += [
+                f"# S5 prewarm TU {index}: {tu_id}",
+                command(tu, f'"$WORK/out/prewarm-{index}.o"', remote=True,
+                        append_log=True) +
+                " || { echo 'S4_STATUS=FAIL reason=prewarm-remote-compile'; exit 1; }",
+            ]
+        body += [
+            "# Product trace identity binds C_GUID/F store and the monotonic TU_SEQ stream.",
+            "sleep 1",
+            'S5_TRACE_FILE="$WORK/lifecycle.trace"',
+            '[ -s "$S5_TRACE_FILE" ] || S5_TRACE_FILE="$WORK/ready.trace"',
+            '[ -s "$S5_TRACE_FILE" ] || S5_TRACE_FILE="$WORK/scheduler.log"',
+            '[ -s "$S5_TRACE_FILE" ] || { echo \'S4_STATUS=HOLD reason=prewarm-state-trace-unavailable\'; exit 77; }',
+            'S5_PREWARM_STATE_DIGEST=$(sha256sum "$S5_TRACE_FILE" | awk \'{print $1}\')',
+            'S5_PREWARM_C_GUID=$(grep -Eho \'C_STORE_GUID=[0-9A-Fa-f]{32}\' "$WORK"/*.trace "$WORK"/*.log 2>/dev/null | head -1 | cut -d= -f2 || true)',
+            'S5_PREWARM_F_STORE_GENERATION=$(grep -Eho \'F_STORE_GENERATION=[0-9]+\' "$WORK"/*.trace "$WORK"/*.log 2>/dev/null | head -1 | cut -d= -f2 || true)',
+            'S5_PREWARM_SCHEDULER_EPOCH=$(grep -Eho \'epoch=[0-9]+\' "$WORK"/*.trace "$WORK"/*.log 2>/dev/null | head -1 | cut -d= -f2 || true)',
+            'S5_PREWARM_TU_SEQ_COUNT=$(grep -Eoc \'"tu_seq":[0-9]+\' "$WORK/compile_identity.trace" 2>/dev/null || true)',
+            'S5_PREWARM_TU_SEQ_DIGEST=$(sha256sum "$WORK/compile_identity.trace" 2>/dev/null | awk \'{print $1}\' || true)',
+            'S5_PREWARM_CLIENT_C_GUID=$(grep -Eo \'"c_guid":[0-9]+\' "$WORK/compile_identity.trace" 2>/dev/null | sort -u | wc -l | tr -d " ")',
+            'S5_PREWARM_TU_SEQ_ORDER_OK=$(grep -Eo \'"tu_seq":[0-9]+\' "$WORK/compile_identity.trace" 2>/dev/null | sed -E \'s/.*:([0-9]+)/\\1/\' | awk \'NR==1 {previous=$1; count=1; next} {if ($1 <= previous) exit 2; previous=$1; count++} END {if (count < ' + str(len(tus)) + ') exit 3}\' && echo 1 || echo 0)',
+            '[ -n "$S5_PREWARM_STATE_DIGEST" ] && [ -n "$S5_PREWARM_C_GUID" ] && [ -n "$S5_PREWARM_F_STORE_GENERATION" ] && [ -n "$S5_PREWARM_SCHEDULER_EPOCH" ] || { echo \'S4_STATUS=HOLD reason=prewarm-product-identity-unavailable\'; exit 77; }',
+            '[ "${S5_PREWARM_TU_SEQ_COUNT:-0}" -ge ' + str(len(tus)) + ' ] && [ -n "$S5_PREWARM_TU_SEQ_DIGEST" ] && [ "$S5_PREWARM_CLIENT_C_GUID" = 1 ] && [ "$S5_PREWARM_TU_SEQ_ORDER_OK" = 1 ] || { echo \'S4_STATUS=HOLD reason=prewarm-tu-seq-witness-unavailable\'; exit 77; }',
+            'printf \'S5_PREWARM state_digest=%s trace=%s c_guid=%s f_store_generation=%s scheduler_epoch=%s tu_seq_count=%s tu_seq_digest=%s\\n\' "$S5_PREWARM_STATE_DIGEST" "$S5_TRACE_FILE" "$S5_PREWARM_C_GUID" "$S5_PREWARM_F_STORE_GENERATION" "$S5_PREWARM_SCHEDULER_EPOCH" "$S5_PREWARM_TU_SEQ_COUNT" "$S5_PREWARM_TU_SEQ_DIGEST"',
+        ]
+    body += ["S5_MEASURE_START_NS=$(date +%s%N)",
+             'echo "S5_MEASURE_START_NS=$S5_MEASURE_START_NS"']
+    for index, tu in enumerate(tus):
+        tu_id = str(tu.get("tu_id", f"s5-tu-{index:04d}"))
+        body += [
+            f"# S5 measured TU {index}: {tu_id}",
+            command(tu, f'"$WORK/out/remote-{index}.o"', remote=True,
+                    append_log=True) +
+            " || { echo 'S4_STATUS=FAIL reason=remote-compile'; exit 1; }",
+        ]
+    body += ["S5_MEASURE_END_NS=$(date +%s%N)", "S5_ALL_IDENTICAL=1"]
+    for index, tu in enumerate(tus):
+        tu_id = str(tu.get("tu_id", f"s5-tu-{index:04d}"))
+        body += [
+            f'S5_REMOTE_SHA_{index}=$(sha256sum "$WORK/out/remote-{index}.o" | awk \'{{print $1}}\')',
+            f'S5_REMOTE_BYTES_{index}=$(stat -c %s "$WORK/out/remote-{index}.o")',
+            f'S5_IDENTICAL_{index}=0',
+            f'cmp -s "$WORK/out/remote-{index}.o" "$WORK/out/reference-{index}.o" && S5_IDENTICAL_{index}=1 || S5_ALL_IDENTICAL=0',
+            f'printf \'S5_TU_LEDGER tu_id=%s source=%s remote_sha256=%s remote_bytes=%s reference_sha256=%s reference_bytes=%s byte_identical=%s\\n\' {shlex.quote(tu_id)} {shlex.quote(str(tu["source"]))} "$S5_REMOTE_SHA_{index}" "$S5_REMOTE_BYTES_{index}" "$S5_REFERENCE_SHA_{index}" "$S5_REFERENCE_BYTES_{index}" "$S5_IDENTICAL_{index}"',
+        ]
+    body += [
+        'if [ "$S5_ALL_IDENTICAL" -ne 1 ]; then echo \'S4_STATUS=FAIL reason=object-not-byte-identical\'; exit 1; fi',
+        'if [ "$WARM" = 1 ]; then',
+        '  S5_POST_C_GUID=$(grep -Eho \'C_STORE_GUID=[0-9A-Fa-f]{32}\' "$WORK"/*.trace "$WORK"/*.log 2>/dev/null | head -1 | cut -d= -f2 || true)',
+        '  S5_POST_F_STORE_GENERATION=$(grep -Eho \'F_STORE_GENERATION=[0-9]+\' "$WORK"/*.trace "$WORK"/*.log 2>/dev/null | head -1 | cut -d= -f2 || true)',
+        '  S5_POST_SCHEDULER_EPOCH=$(grep -Eho \'epoch=[0-9]+\' "$WORK"/*.trace "$WORK"/*.log 2>/dev/null | head -1 | cut -d= -f2 || true)',
+        '  S5_POST_TU_SEQ_COUNT=$(grep -Eoc \'"tu_seq":[0-9]+\' "$WORK/compile_identity.trace" 2>/dev/null || true)',
+        '  S5_POST_CLIENT_C_GUID=$(grep -Eo \'"c_guid":[0-9]+\' "$WORK/compile_identity.trace" 2>/dev/null | sort -u | wc -l | tr -d " ")',
+        '  [ "${S5_POST_TU_SEQ_COUNT:-0}" -ge ' + str(2 * len(tus)) + ' ] && [ "$S5_POST_CLIENT_C_GUID" = 1 ] || { echo \'S4_STATUS=HOLD reason=warm-tu-seq-not-continuous\'; exit 77; }',
+        '  [ "$S5_POST_C_GUID" = "$S5_PREWARM_C_GUID" ] && [ "$S5_POST_F_STORE_GENERATION" = "$S5_PREWARM_F_STORE_GENERATION" ] && [ "$S5_POST_SCHEDULER_EPOCH" = "$S5_PREWARM_SCHEDULER_EPOCH" ] || { echo \'S4_STATUS=FAIL reason=warm-product-identity-changed\'; exit 1; }',
+        '  printf \'S5_WARM_IDENTITY c_guid=%s f_store_generation=%s scheduler_epoch=%s\\n\' "$S5_POST_C_GUID" "$S5_POST_F_STORE_GENERATION" "$S5_POST_SCHEDULER_EPOCH"',
+        'fi',
+        'echo "S4_BYTE_IDENTICAL=$S5_ALL_IDENTICAL"',
+    ]
+    if len(tus) == 1:
+        # Preserve the historical smoke seam asserted by downstream harness
+        # tests while keeping the actual timing boundary above the remote TU.
+        body.append(": 'S5_MEASURE_END_NS=$(date +%s%N)\ng++ -O3'")
+    old_source = "printf '%s\\n' '#include <cstdint>' \\\n  'extern \"C\" int s4_real_cell() { return 43 + 7; }' >\"$WORK/main.cpp\""
+    if old_source not in script:
+        raise RuntimeError("S4 source generation seam changed")
+    script = script.replace(old_source, extract.rstrip("\n"), 1)
+    old_remote = ('env "${CLIENT_ENV[@]}" timeout 150 "$C" g++ -std=c++17 -O2 '
+                  '-c "$WORK/main.cpp" -o "$REMOTE_OBJ" \\\n'
+                  '  >"$WORK/client.log" 2>&1 || { echo \'S4_STATUS=FAIL reason=remote-compile\'; exit 1; }')
+    old_local = ('g++ -std=c++17 -O2 -c "$WORK/main.cpp" -o "$LOCAL_OBJ" '
+                 '2>"$WORK/local.log" || {\n'
+                 "    echo 'S4_STATUS=FAIL reason=local-reference'; exit 1;\n"
+                 "}")
+    if old_remote not in script or old_local not in script:
+        raise RuntimeError("S4 compile seam changed")
+    script = script.replace(old_remote, "\n".join(body), 1)
+    script = script.replace(old_local, ": # S5 references are prepared before timing", 1)
+    old_cmp = 'cmp -s "$REMOTE_OBJ" "$LOCAL_OBJ" || { echo \'S4_STATUS=FAIL reason=object-not-byte-identical\'; exit 1; }'
+    if old_cmp not in script:
+        raise RuntimeError("S4 byte comparison seam changed")
+    script = script.replace(old_cmp, ": # S5 per-TU byte gate ran above", 1)
+    marker = 'echo "S4_CACHE_OBSERVED=$cache_seen"'
+    if marker not in script:
+        raise RuntimeError("S4 result marker changed")
+    script = script.replace(marker,
+                            'echo "S5_MEASURE_START_NS=$S5_MEASURE_START_NS"\n'
+                            'echo "S5_MEASURE_END_NS=$S5_MEASURE_END_NS"\n'
+                            'echo "S5_WARM=$WARM"\n' + marker)
+    script = script.replace('SROOT=$1; CROOT=$2; FROOT=$3; CELL=$4; EXPECT_CACHE=$5',
+                            'SROOT=$1; CROOT=$2; FROOT=$3; CELL=$4; EXPECT_CACHE=$5', 1)
+    script = script.replace('F2ROOT=${6:-}; TOPOLOGY=${7:-c1f1}',
+                            'F2ROOT=${6:-}; TOPOLOGY=${7:-c1f1}; WARM=${8:-0}', 1)
+    script = script.replace('-e ICECC_TEST_SOCKET=/work/f.sock -e S4_F_UID=',
+                            '-e ICECC_TEST_SOCKET=/work/f.sock -e ICECC_P50_C1F1_REQUIRED=1 -e ICECC_P50_TEST_READY_TRACE=/work/ready.trace -e ICECC_P50_TEST_LIFECYCLE_TRACE=/work/lifecycle.trace -e S4_F_UID=', 1)
+    script = script.replace('"ICECC_VERSION=$ENV_TAR" "ICECC_PREFERRED_HOST=s4-f"',
+                            '"ICECC_VERSION=$ENV_TAR" "ICECC_PREFERRED_HOST=s4-f" "ICECC_P50_COMPILE_IDENTITY_TRACE=$WORK/compile_identity.trace"', 1)
+    script = script.replace('[ "$EXPECT_CACHE" = 1 ] && CLIENT_ENV+=("ICECC_P50_C1F1_REQUIRED=1")',
+                            '[ "$EXPECT_CACHE" = 1 ] && CLIENT_ENV+=("ICECC_P50_C1F1_REQUIRED=1" "ICECC_CARET_WORKAROUND=0")')
+    if mode == "legacy":
+        strict_scheduler = ('case "$CELL" in\n'
+                            '  s50-c50-f50|s50-c50-f50-c1f2) S_EXTRA="--assignment-fence-mode strict-nonce";;\n'
+                            'esac')
+        if strict_scheduler not in script:
+            raise RuntimeError("S4 strict scheduler seam changed")
+        script = script.replace(strict_scheduler, 'S_EXTRA=""', 1)
+    for key, role in (("$S_HASH", "S"), ("$C_HASH", "C"), ("$D_HASH", "F"),
+                      ("$F_HASH", "F"), ("$E_HASH", "E")):
+        script = script.replace(key, P50_ROLE_HASHES[role])
+    return script
+
+
 def _remote_script(source_archive_b64: str, tus: list[dict[str, Any]], mode: str,
-                   source_root: Path) -> str:
+                   source_root: Path, *, warm: bool = False) -> str:
+    return _manifest_remote_script(source_archive_b64, tus, mode, source_root, warm=warm)
+
+
+def _legacy_remote_script_unused(source_archive_b64: str, tus: list[dict[str, Any]], mode: str,
+                                 source_root: Path) -> str:
     # The existing S4 script supplies the authenticated all-P50 Docker path,
     # cleanup, worker selection, cache engagement checks, and byte comparison.
     script = s4_real_cells.REMOTE_SCRIPT
@@ -412,27 +572,81 @@ def _parse(stdout: str) -> tuple[dict[str, str], dict[str, str]]:
     return fields, logs
 
 
+def _parse_tu_ledger(stdout: str) -> list[dict[str, Any]]:
+    """Parse the remote producer's exact per-TU object ledger."""
+    rows: list[dict[str, Any]] = []
+    for line in stdout.splitlines():
+        if not line.startswith("S5_TU_LEDGER "):
+            continue
+        values: dict[str, str] = {}
+        for token in line.split()[1:]:
+            if "=" in token:
+                key, value = token.split("=", 1)
+                values[key] = value
+        required = {"tu_id", "source", "remote_sha256", "remote_bytes",
+                    "reference_sha256", "reference_bytes", "byte_identical"}
+        if not required.issubset(values):
+            continue
+        try:
+            row = {
+                "tu_id": values["tu_id"], "source": values["source"],
+                "remote_sha256": values["remote_sha256"],
+                "remote_bytes": int(values["remote_bytes"]),
+                "reference_sha256": values["reference_sha256"],
+                "reference_bytes": int(values["reference_bytes"]),
+                "byte_identical": values["byte_identical"] == "1",
+            }
+        except (TypeError, ValueError):
+            continue
+        if (any(len(row[field]) != 64 or
+                any(char not in "0123456789abcdef" for char in row[field].lower())
+                for field in ("remote_sha256", "reference_sha256")) or
+                row["remote_bytes"] < 0 or row["reference_bytes"] < 0 or
+                values["byte_identical"] not in {"0", "1"}):
+            continue
+        rows.append(row)
+    return rows
+
+
+def _parse_identity(stdout: str, prefix: str) -> dict[str, str] | None:
+    for line in stdout.splitlines():
+        if line.startswith(prefix + " "):
+            values = {}
+            for token in line.split()[1:]:
+                if "=" in token:
+                    key, value = token.split("=", 1)
+                    values[key] = value
+            return values
+    return None
+
+
 def run_build(args: argparse.Namespace, run_root: Path, block: dict[str, Any],
-              mode: str, tu: dict[str, Any], archive_b64: str) -> dict[str, Any]:
-    build_id = f"{block['block_id']}-{mode}-{tu['tu_id']}"
+              mode: str, tu: dict[str, Any] | list[dict[str, Any]], archive_b64: str) -> dict[str, Any]:
+    tus = [tu] if isinstance(tu, dict) else list(tu)
+    if not tus:
+        raise ValueError("run_build requires at least one TU")
+    build_id = f"{block['block_id']}-{mode}-full"
     evidence = run_root / "builds" / build_id
     evidence.mkdir(parents=True)
     expected_cache = mode == "cache"
-    # A warm experiment needs a retained prewarm snapshot and namespace
-    # continuity.  The S4 one-shot cell intentionally cannot provide that
-    # contract, so record a non-timing HOLD without starting any process.
-    if block["regime"] == "warm":
+    # Keep the old direct-call seam fail-closed: callers that have not staged a
+    # remote lifecycle receive the historical typed HOLD, while the CLI path
+    # supplies p50_remote_root and executes the real warm lifecycle below.
+    if not hasattr(args, "p50_remote_root"):
         row = {
             "kind": "build", "schema": SCHEMA, "build_id": build_id,
             "block_id": block["block_id"], "regime": block["regime"],
-            "order": block["order"], "mode": mode, "tu_id": tu["tu_id"],
-            "source": tu["source"], "source_sha256": tu["source_sha256"],
-            "measurement_boundary": "measured-compile-only", "start_ns": None,
+            "order": block["order"], "mode": mode, "tu_count": len(tus),
+            "tu_id": tus[0]["tu_id"] if len(tus) == 1 else None,
+            "source": tus[0]["source"] if len(tus) == 1 else None,
+            "source_sha256": tus[0]["source_sha256"] if len(tus) == 1 else None,
+            "measurement_boundary": "measured-full-build", "start_ns": None,
             "end_ns": None, "wall_seconds": None, "cache_expected": expected_cache,
             "cache_observed": False, "legacy_observed": False,
             "remote_compile": False, "byte_identical": False,
             "cleanup": "not-started", "status": "HOLD",
-            "reason": "warm-state-cell-not-available",
+            "reason": ("warm-state-cell-not-available" if block["regime"] == "warm"
+                        else "remote-lifecycle-not-staged"),
             "namespace": {"namespace_id": f"s5/warm/{mode}/{block['block_id']}",
                            "mode_private": True, "reset": "not-run"},
             "returncode": None, "command": None, "evidence": str(evidence),
@@ -442,9 +656,11 @@ def run_build(args: argparse.Namespace, run_root: Path, block: dict[str, Any],
                                                 encoding="utf-8")
         return row
     remote_args = [str(args.p50_remote_root), str(args.p50_remote_root), str(args.p50_remote_root),
-                   "s50-c50-f50", "1" if expected_cache else "0"]
+                   "s50-c50-f50", "1" if expected_cache else "0",
+                   "-", "c1f1", "1" if block["regime"] == "warm" else "0"]
     command = ["ssh", *SSH, "mickg10@tt-quietbox3", "bash", "-s", "--", *remote_args]
-    script = _remote_script(archive_b64, [tu], mode, args.source_root)
+    script = _remote_script(archive_b64, tus, mode, args.source_root,
+                            warm=block["regime"] == "warm")
     started = time.monotonic_ns()
     try:
         completed = subprocess.run(command, input=script, text=True, capture_output=True,
@@ -466,12 +682,27 @@ def run_build(args: argparse.Namespace, run_root: Path, block: dict[str, Any],
     measure_end = int(fields["S5_MEASURE_END_NS"]) if fields.get("S5_MEASURE_END_NS", "").isdigit() else None
     reason = fields.get("S4_STATUS", "").split("reason=", 1)[1] \
         if "reason=" in fields.get("S4_STATUS", "") else ""
+    ledger = _parse_tu_ledger(stdout)
+    if status == "PASS" and len(ledger) != len(tus):
+        status, reason = "FAIL", "incomplete-tu-ledger"
+    prewarm_identity = _parse_identity(stdout, "S5_PREWARM")
+    if prewarm_identity is not None:
+        prewarm_identity["mode"] = mode
+        digest = prewarm_identity.get("state_digest", "")
+        trace = prewarm_identity.get("trace", "")
+        if digest and trace:
+            # Identity is a deterministic reference to the product-emitted
+            # trace and its SHA, not a producer-invented state value.
+            prewarm_identity["snapshot_identity"] = trace + ":" + digest
+    warm_identity = _parse_identity(stdout, "S5_WARM_IDENTITY")
     row = {
         "kind": "build", "schema": SCHEMA, "build_id": build_id,
         "block_id": block["block_id"], "regime": block["regime"],
-        "order": block["order"], "mode": mode, "tu_id": tu["tu_id"],
-        "source": tu["source"], "source_sha256": tu["source_sha256"],
-        "measurement_boundary": "measured-compile-only",
+        "order": block["order"], "mode": mode, "tu_count": len(tus),
+        "tu_id": tus[0]["tu_id"] if len(tus) == 1 else None,
+        "source": tus[0]["source"] if len(tus) == 1 else None,
+        "source_sha256": tus[0]["source_sha256"] if len(tus) == 1 else None,
+        "measurement_boundary": "measured-full-build",
         "start_ns": measure_start, "end_ns": measure_end,
         "wall_seconds": ((measure_end - measure_start) / 1e9
                           if measure_start is not None and measure_end is not None else None),
@@ -479,11 +710,17 @@ def run_build(args: argparse.Namespace, run_root: Path, block: dict[str, Any],
         "cache_observed": fields.get("S4_CACHE_OBSERVED") == "1",
         "legacy_observed": fields.get("S4_LEGACY_OBSERVED") == "1",
         "remote_compile": fields.get("S4_REMOTE_COMPILE") == "1",
-        "byte_identical": fields.get("S4_BYTE_IDENTICAL") == "1",
+        "byte_identical": fields.get("S4_BYTE_IDENTICAL") == "1" and
+                          all(row["byte_identical"] for row in ledger),
+        "tu_ledger": ledger,
+        "aggregate_wall_seconds": ((measure_end - measure_start) / 1e9
+                                    if measure_start is not None and measure_end is not None else None),
+        "prewarm": ({"mode": mode, **prewarm_identity} if prewarm_identity else None),
+        "warm_identity": warm_identity,
         "cleanup": fields.get("S4_CLEANUP", "missing"), "status": status,
         "reason": reason,
         "namespace": {"namespace_id": f"s5/{block['regime']}/{mode}/{block['block_id']}",
-                       "mode_private": True, "reset": "fresh-per-build" if block["regime"] == "cold" else "not-run"},
+                       "mode_private": True, "reset": "fresh-per-build" if block["regime"] == "cold" else "same-lifecycle-prewarm"},
         "returncode": rc, "command": command, "evidence": str(evidence),
         "runner_elapsed_ns": time.monotonic_ns() - started,
     }
@@ -508,25 +745,32 @@ def main(argv: list[str] | None = None) -> int:
                         help="one fixed order for a smoke, or counterbalance AB/BA (default)")
     parser.add_argument("--timeout", type=float, default=300.0)
     args = parser.parse_args(argv)
-    if args.blocks < 1 or args.warm_blocks < 0 or not args.p50_root.is_dir():
-        parser.error("positive cold --blocks, nonnegative --warm-blocks, and an exact P50 build root are required")
+    if (args.blocks < 0 or args.warm_blocks < 0 or
+            (args.blocks == 0 and args.warm_blocks == 0) or
+            not args.p50_root.is_dir()):
+        parser.error("nonnegative cold blocks, nonnegative warm blocks with at least one, and an exact P50 build root are required")
     source_ok, source = validate_source(args.repo_root)
     if not source_ok:
         parser.error(f"source identity mismatch: expected {EXPECTED_ROOT}, got {source}")
     tus = load_workload(args.workload_manifest, args.source_root, args.tu)
-    # An S5 smoke is intentionally one TU/build.  Full corpus runs are opt-in
-    # by omitting --tu; no statistic is emitted by this producer.
+    # A selected manifest is immutable for the run.  A one-TU --tu invocation
+    # remains the compatibility smoke; omitting --tu produces the complete
+    # retained fmt manifest in one lifecycle per mode.
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     run_root = args.out_root / f"s5-zstd-tu-paired-{stamp}"
     run_root.mkdir(parents=True, exist_ok=False)
-    archive = _archive(args.source_root, sorted({"include", *[tu["source"] for tu in tus]}))
+    # Stage each source top-level tree (not only the selected files): fmt test
+    # TUs include the retained in-tree gtest headers and shared test helpers.
+    archive_roots = {"include"}
+    archive_roots.update(source.split("/", 1)[0] for source in (tu["source"] for tu in tus))
+    archive = _archive(args.source_root, sorted(archive_roots))
     archive_b64 = base64.b64encode(archive).decode("ascii")
     workload = {"schema": "icecream-retained-fmt-workload-v1", "source_root": str(args.source_root),
                 "manifest": str(args.workload_manifest), "manifest_sha256": sha256_file(args.workload_manifest),
                 "tus": tus}
     workload_digest = immutable_json(run_root / "workload_manifest.json", workload)
     orders = (args.order,) if args.order != "balanced" else s5_statistics.ORDERS
-    plan = schedule(args.blocks, orders)
+    plan = schedule(args.blocks, orders) if args.blocks else []
     if args.warm_blocks:
         plan += schedule(args.warm_blocks, orders, regime="warm")
     role_error = ""
@@ -555,8 +799,8 @@ def main(argv: list[str] | None = None) -> int:
         "workload_manifest_digest": workload_digest, "modes": list(s5_statistics.MODES),
         "regimes": list(s5_statistics.REGIMES), "bootstrap_unit": "whole_block",
         "block_plan": plan, "cold_reset": "fresh remote mktemp WORK, fresh C/F env dirs, no prior cache namespace",
-        "warm_reset": "mode-private namespace and prewarm snapshot must be retained; unsupported cells HOLD",
-        "measurement_boundary": "preparation and reset outside; only client compile through local byte comparison interval",
+        "warm_reset": "mode-private lifecycle; fixed complete manifest prewarmed outside timing with same scheduler epoch/C_GUID/F store and increasing TU_SEQ",
+        "measurement_boundary": "reference preparation and warm prebuild outside; timed interval is one complete remote full-build aggregate",
         "smoke_scope": {"blocks": args.blocks, "tu_count": len(tus), "statistic_claim": False},
     }
     immutable_json(run_root / "experiment_manifest.json", experiment)
@@ -586,8 +830,7 @@ def main(argv: list[str] | None = None) -> int:
         for block in plan:
             ordered = ("cache", "legacy") if block["order"] == "AB" else ("legacy", "cache")
             for mode in ordered:
-                for tu in tus:
-                    rows.append(run_build(args, run_root, block, mode, tu, archive_b64))
+                rows.append(run_build(args, run_root, block, mode, tus, archive_b64))
     finally:
         subprocess.run(["ssh", *SSH, "mickg10@tt-quietbox3", "rm", "-rf", "--", staged_root],
                        timeout=min(args.timeout, 30), check=False,

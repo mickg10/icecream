@@ -2,13 +2,15 @@
 """Small seam tests for the S5 paired runner (no network or product daemon)."""
 
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from farmharness.s5_paired_build import (
-    _remote_script, immutable_json, load_workload, preflight, role_manifest, run_build,
+    _parse_tu_ledger, _remote_script, immutable_json, load_workload, preflight,
+    role_manifest, run_build,
     schedule, schedule_matrix,
 )
 
@@ -73,7 +75,9 @@ class PairedRunnerTest(unittest.TestCase):
         self.assertIn("--assignment-fence-mode strict-nonce", cache)
         self.assertNotIn("--assignment-fence-mode strict-nonce", legacy)
         self.assertIn("S5_MEASURE_END_NS=$(date +%s%N)\ng++ -O3", cache)
-        self.assertEqual(cache.count('echo "S5_MEASURE_START_NS='), 2)
+        # The marker is emitted by each S4 result cell; all lifecycle result
+        # cells carry the same aggregate timing boundary.
+        self.assertEqual(cache.count('echo "S5_MEASURE_START_NS='), 3)
 
     def test_manifest_deduplicates_same_translation_unit(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -89,6 +93,66 @@ class PairedRunnerTest(unittest.TestCase):
             self.assertEqual(result[0]["source"], "src/format.cc")
             self.assertEqual(result[0]["source_sha256"],
                              "643617e36915cf85055f989c78c0b41d7709c4f91ee457de95f99c5efb921764")
+
+    def test_full_manifest_is_one_remote_lifecycle_with_aggregate_ledger(self):
+        tus = [
+            {"tu_id": "fmt-0001-a", "source": "src/a.cc", "flags": ["-O2"]},
+            {"tu_id": "fmt-0002-b", "source": "src/b.cc", "flags": ["-O3"]},
+        ]
+        script = _remote_script("archive", tus, "cache", Path("/unused"))
+        self.assertEqual(script.count("WORK=$(mktemp -d"), 1)
+        self.assertEqual(script.count("# S5 measured TU"), 2)
+        self.assertEqual(script.count("S5_TU_LEDGER"), 2)
+        self.assertIn("S5_MEASURE_START_NS=$(date +%s%N)", script)
+        self.assertIn("S5_MEASURE_END_NS=$(date +%s%N)", script)
+
+    def test_warm_script_prewarms_before_timing_and_binds_product_identity(self):
+        tus = [{"tu_id": "fmt-0001-a", "source": "src/a.cc", "flags": ["-O2"]}]
+        script = _remote_script("archive", tus, "cache", Path("/unused"), warm=True)
+        self.assertIn("# S5 prewarm: all TUs", script)
+        self.assertLess(script.index("S5 prewarm TU"),
+                        script.index("S5_MEASURE_START_NS=$(date +%s%N)"))
+        self.assertIn("S5_PREWARM_STATE_DIGEST", script)
+        self.assertIn("C_STORE_GUID", script)
+        self.assertIn("F_STORE_GENERATION", script)
+        self.assertIn("TU_SEQ", script)
+        self.assertIn('WARM=${8:-0}', script)
+
+    def test_parse_exact_tu_ledger(self):
+        stdout = ("S5_TU_LEDGER tu_id=fmt-a source=src/a.cc "
+                   "remote_sha256=" + "a" * 64 + " remote_bytes=12 "
+                   "reference_sha256=" + "b" * 64 + " reference_bytes=12 byte_identical=1\n")
+        rows = _parse_tu_ledger(stdout)
+        self.assertEqual(rows[0]["tu_id"], "fmt-a")
+        self.assertEqual(rows[0]["remote_bytes"], 12)
+        self.assertTrue(rows[0]["byte_identical"])
+
+    def test_build_row_keeps_one_aggregate_and_exact_ledger(self):
+        tus = [{"tu_id": "fmt-a", "source": "src/a.cc", "source_sha256": "a" * 64,
+                "flags": ["-O2"]},
+               {"tu_id": "fmt-b", "source": "src/b.cc", "source_sha256": "b" * 64,
+                "flags": ["-O2"]}]
+        ledger = "".join(
+            f"S5_TU_LEDGER tu_id=fmt-{name} source=src/{name}.cc "
+            f"remote_sha256={'c' * 64} remote_bytes=8 "
+            f"reference_sha256={'c' * 64} reference_bytes=8 byte_identical=1\n"
+            for name in ("a", "b"))
+        stdout = ("S4_STATUS=PASS reason=remote-byte-identical\n"
+                  "S5_MEASURE_START_NS=100\nS5_MEASURE_END_NS=2100\n"
+                  "S4_CACHE_OBSERVED=1\nS4_LEGACY_OBSERVED=0\n"
+                  "S4_REMOTE_COMPILE=1\nS4_BYTE_IDENTICAL=1\n" + ledger)
+        args = type("Args", (), {"p50_remote_root": "/tmp/staged",
+                                  "source_root": Path("/unused"), "timeout": 2.0})()
+        block = {"block_id": "cold-01", "regime": "cold", "order": "AB"}
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch("farmharness.s5_paired_build.subprocess.run",
+                         return_value=subprocess.CompletedProcess([], 0, stdout, "")):
+            row = run_build(args, Path(directory), block, "cache", tus, "archive")
+        self.assertEqual(row["status"], "PASS")
+        self.assertEqual(row["tu_count"], 2)
+        self.assertEqual(len(row["tu_ledger"]), 2)
+        self.assertAlmostEqual(row["aggregate_wall_seconds"], 0.000002)
+        self.assertEqual(row["command"][-3:], ["-", "c1f1", "0"])
 
 
 if __name__ == "__main__":
