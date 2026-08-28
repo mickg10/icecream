@@ -571,7 +571,7 @@ class Runtime:
                         self.worker.pid, self.build / "cache/icecc-cache-service"))
         try:
             probe = subprocess.run(
-                ["docker", "top", self._docker_name, "-eo", "args"],
+                ["docker", "top", self._docker_name, "-eo", "pid,args"],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 timeout=5, check=False, text=True)
             return (probe.returncode == 0 and "icecc-cache-service" in probe.stdout and
@@ -589,7 +589,7 @@ class Runtime:
                 process.pid, self.build / "cache/icecc-cache-service")
         try:
             probe = subprocess.run(
-                ["docker", "top", self._client_docker_name(node), "-eo", "args"],
+                ["docker", "top", self._client_docker_name(node), "-eo", "pid,args"],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 timeout=5, check=False, text=True)
             return probe.returncode == 0 and "icecc-cache-service" in probe.stdout
