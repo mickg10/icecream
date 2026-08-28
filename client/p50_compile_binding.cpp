@@ -36,8 +36,13 @@ CStoreGuid derive_compile_c_store_guid(const CompileJob& job,
     digest.append_u64(invocation_nonce);
     CStoreGuid result;
     result.bytes = digest.finish().bytes;
-    // Digest128 is not expected to yield zero, but zero is the protocol's
-    // absence sentinel and must be impossible by construction.
+    // StoreIdentity reserves the high bit of byte zero for the role.  A C
+    // namespace is root||0, so canonicalize the digest before it reaches the
+    // source-arm wire instead of accepting a random F-role half of hashes.
+    result.bytes[kStoreIdentityRoleByte] &=
+        static_cast<uint8_t>(~kStoreIdentityRoleMask);
+    // Digest128 is not expected to yield a zero 127-bit root, but zero is the
+    // protocol's absence sentinel and must be impossible by construction.
     if (!nonzero(result))
         result.bytes.back() = 1;
     return result;

@@ -56,6 +56,10 @@ void test_namespace_and_request_are_assignment_bound() {
     const CompileJob second = assigned_job(101, 203);
     const CStoreGuid first_guid = derive_compile_c_store_guid(first, 7, 8);
     CHECK(first_guid != CStoreGuid{});
+    CHECK(store_identity_guid_valid_for_role(
+        first_guid.bytes, kStoreIdentityClientRole));
+    CHECK(!store_identity_guid_valid_for_role(
+        first_guid.bytes, kStoreIdentityFileRole));
     CHECK(first_guid == derive_compile_c_store_guid(first, 7, 8));
     CHECK(first_guid != derive_compile_c_store_guid(second, 7, 8));
     CHECK(first_guid != derive_compile_c_store_guid(first, 7, 9));
