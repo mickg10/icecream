@@ -196,8 +196,8 @@ static bool command_is(pid_t pid, const char *executable)
                         std::ios::in | std::ios::binary);
     if (!input)
         return false;
-    const std::string commandline(
-        std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+    const std::string commandline{
+        std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
     const size_t end = commandline.find('\0');
     return commandline.substr(0, end) == executable;
 }
@@ -498,7 +498,7 @@ static bool run_live_test(const char *iceccd_path, const char *cache_service_pat
                 replacement_followup_armed->f_store_generation != 0 &&
                 replacement_followup_armed->f_control_generation == old_f_control_generation &&
                 replacement_followup_armed->f_control_attempt != old_f_control_attempt &&
-                replacement_followup_armed->f_store_guid != old_f_guid &&
+                replacement_followup_armed->f_store_guid != old_f_guid.bytes &&
                 store_identity_root_from_f_guid(
                     FStoreGuid{replacement_followup_armed->f_store_guid}) != old_f_root &&
                 (old_f_generation == 0 ||
