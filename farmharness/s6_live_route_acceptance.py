@@ -21,7 +21,6 @@ import hashlib
 import json
 import os
 import re
-import shlex
 import shutil
 import signal
 import socket
@@ -504,34 +503,64 @@ class Runtime:
             return [str(self.build / "daemon/iceccd"), *args], values
         command = ["docker", "run", "--rm", "--name", self._docker_name,
                    "--network", "host", "--user", "0", "--cap-add", "SYS_CHROOT",
-                   "-v", str(self.build) + ":/role:ro", "-v", str(self.root) + ":/work"]
+                   "-v", str(self.build) + ":/role:ro", "-v", str(self.root) + ":/work",
+                   "-e", "S6_ROLE_UID=" + str(os.getuid()),
+                   "-e", "S6_ROLE_GID=" + str(os.getgid())]
         for key in ("ICECC_TEST_SOCKET", "ICECC_P50_TEST_READY_TRACE", "ICECC_P50_TEST_LIFECYCLE_TRACE",
                     "ICECC_P50_ACTION_TRACE", "ICECC_P50_PROFILE", "ICECC_P50_C1F1_REQUIRED", "HOME", "TMPDIR"):
             command.extend(["-e", key + "=" + values[key]])
-        command.extend(["--entrypoint", "/bin/sh", self.docker_image, "-c",
-                         "exec /role/daemon/iceccd " + shlex.join(args)])
+        command.extend(["--entrypoint", "/work/docker-role-wrapper.sh",
+                        self.docker_image, "/role/daemon/iceccd", *args])
         return command, os.environ.copy()
 
     def _client_command(self, port: int, node: str, runtime_dir: Path,
                         env_dir: Path, log_name: str, socket_name: str,
                         ready_name: str) -> tuple[list[str], dict[str, str]]:
-        command = [str(self.build / "daemon/iceccd"), "-p", str(port), "-m", "0",
-                   "-s", "127.0.0.1:%d" % self.sched_port,
-                   "-n", "s6-live-%d" % os.getpid(), "-N", node,
-                   "-b", str(env_dir), "-l", str(self.root / log_name), "-vvv",
-                   "--cache-service", str(self.build / "cache/icecc-cache-service"),
-                   "--cache-runtime-dir", str(runtime_dir)]
+        args = ["-p", str(port), "-m", "0", "-s",
+                "127.0.0.1:%d" % self.sched_port,
+                "-n", "s6-live-%d" % os.getpid(), "-N", node,
+                "-b", "/work/" + env_dir.name, "-l", "/work/" + log_name, "-vvv",
+                "--cache-service", "/role/cache/icecc-cache-service",
+                "--cache-runtime-dir", "/work/" + runtime_dir.name]
         values = self.env(
-            ICECC_TEST_SOCKET=str(self.root / socket_name),
-            ICECC_P50_TEST_READY_TRACE=str(self.root / ready_name),
-            ICECC_P50_TEST_LIFECYCLE_TRACE=str(self.root / (node + "-lifecycle.trace")),
-            ICECC_P50_ACTION_TRACE=str(self.root / "action.trace"),
-            HOME=str(self.root / "home"))
-        return command, values
+            ICECC_TEST_SOCKET="/work/" + socket_name,
+            ICECC_P50_TEST_READY_TRACE="/work/" + ready_name,
+            ICECC_P50_TEST_LIFECYCLE_TRACE="/work/" + node + "-lifecycle.trace",
+            ICECC_P50_ACTION_TRACE="/work/action.trace", HOME="/work/home")
+        if not self.docker:
+            args[args.index("-b") + 1] = str(env_dir)
+            args[args.index("-l") + 1] = str(self.root / log_name)
+            args[args.index("--cache-service") + 1] = str(
+                self.build / "cache/icecc-cache-service")
+            args[args.index("--cache-runtime-dir") + 1] = str(runtime_dir)
+            values = self.env(
+                ICECC_TEST_SOCKET=str(self.root / socket_name),
+                ICECC_P50_TEST_READY_TRACE=str(self.root / ready_name),
+                ICECC_P50_TEST_LIFECYCLE_TRACE=str(
+                    self.root / (node + "-lifecycle.trace")),
+                ICECC_P50_ACTION_TRACE=str(self.root / "action.trace"),
+                HOME=str(self.root / "home"))
+            return [str(self.build / "daemon/iceccd"), *args], values
+        command = ["docker", "run", "--rm", "--name", self._client_docker_name(node),
+                   "--network", "host", "--user", "0", "--cap-add", "SYS_CHROOT",
+                   "-v", str(self.build) + ":/role:ro", "-v", str(self.root) + ":/work",
+                   "-e", "S6_ROLE_UID=" + str(os.getuid()),
+                   "-e", "S6_ROLE_GID=" + str(os.getgid())]
+        for key in ("ICECC_TEST_SOCKET", "ICECC_P50_TEST_READY_TRACE",
+                    "ICECC_P50_TEST_LIFECYCLE_TRACE", "ICECC_P50_ACTION_TRACE",
+                    "ICECC_P50_PROFILE", "ICECC_P50_C1F1_REQUIRED", "HOME", "TMPDIR"):
+            command.extend(["-e", key + "=" + values[key]])
+        command.extend(["--entrypoint", "/work/docker-role-wrapper.sh",
+                        self.docker_image, "/role/daemon/iceccd", *args])
+        return command, os.environ.copy()
 
     @property
     def _docker_name(self) -> str:
         return "s6-live-f-%d" % os.getpid()
+
+    def _client_docker_name(self, node: str) -> str:
+        suffix = "c2" if node == "s6-c2" else "c"
+        return "s6-live-%s-%d" % (suffix, os.getpid())
 
     def _worker_cache_ready(self) -> bool:
         if self.worker is None:
@@ -551,11 +580,21 @@ class Runtime:
             return False
 
     def _client_cache_ready(self, process: subprocess.Popen[Any] | None,
-                            ready_name: str) -> bool:
-        return (process is not None and _alive(process) and
-                bool(parse_ready(_read(self.root / ready_name))) and
-                _child_with_executable(
-                    process.pid, self.build / "cache/icecc-cache-service"))
+                            ready_name: str, node: str) -> bool:
+        if process is None or not _alive(process) or not parse_ready(
+                _read(self.root / ready_name)):
+            return False
+        if not self.docker:
+            return _child_with_executable(
+                process.pid, self.build / "cache/icecc-cache-service")
+        try:
+            probe = subprocess.run(
+                ["docker", "top", self._client_docker_name(node), "-eo", "args"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=5, check=False, text=True)
+            return probe.returncode == 0 and "icecc-cache-service" in probe.stdout
+        except (OSError, subprocess.SubprocessError):
+            return False
 
     def env(self, **extra: str) -> dict[str, str]:
         result = os.environ.copy()
@@ -566,6 +605,15 @@ class Runtime:
 
     def launch(self) -> tuple[bool, str]:
         self.root.mkdir(parents=True, exist_ok=True)
+        if self.docker:
+            wrapper = self.root / "docker-role-wrapper.sh"
+            wrapper.write_text(
+                "#!/bin/sh\nset -eu\n"
+                "printf 'icecc:x:%s:%s:icecc:/nonexistent:/usr/sbin/nologin\\n' "
+                "\"$S6_ROLE_UID\" \"$S6_ROLE_GID\" >>/etc/passwd\n"
+                "printf 'icecc:x:%s:\\n' \"$S6_ROLE_GID\" >>/etc/group\n"
+                "exec \"$@\"\n", encoding="utf-8")
+            os.chmod(wrapper, 0o755)
         for name in ("envs-f", "envs-c", "toolchain", "out", "home",
                      "cache-runtime-f", "cache-runtime-c"):
             (self.root / name).mkdir()
@@ -632,12 +680,14 @@ class Runtime:
                 return False, "daemons-did-not-register"
             for _ in range(40):
                 if (self._worker_cache_ready() and
-                        self._client_cache_ready(self.client, "c-ready.trace")):
+                        self._client_cache_ready(
+                            self.client, "c-ready.trace", "s6-c")):
                     break
                 time.sleep(0.25)
             if not self._worker_cache_ready():
                 return False, "cache-service-not-started-by-worker"
-            if not self._client_cache_ready(self.client, "c-ready.trace"):
+            if not self._client_cache_ready(
+                    self.client, "c-ready.trace", "s6-c"):
                 return False, "cache-service-not-started-by-client"
             return True, "ready"
         except (OSError, subprocess.SubprocessError, RuntimeError) as error:
@@ -732,7 +782,8 @@ class Runtime:
             if not _alive(self.client2):
                 return False, "second-client-exited"
             if (_read(self.root / "scheduler.log").count("login") > previous_logins and
-                    self._client_cache_ready(self.client2, "c2-ready.trace")):
+                    self._client_cache_ready(
+                        self.client2, "c2-ready.trace", "s6-c2")):
                 return True, "ready"
             time.sleep(0.25)
         return False, "second-client-not-ready"
@@ -775,8 +826,11 @@ class Runtime:
         for process in (self.client2, self.client, self.worker, self.scheduler):
             _terminate(process)
         if self.docker:
-            subprocess.run(["docker", "rm", "-f", self._docker_name],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            for name in (self._docker_name, self._client_docker_name("s6-c"),
+                         self._client_docker_name("s6-c2")):
+                subprocess.run(["docker", "rm", "-f", name],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               check=False)
         self.client2 = self.client = self.worker = self.scheduler = None
 
 
