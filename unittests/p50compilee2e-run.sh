@@ -12,6 +12,14 @@ set -eu
 src=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
 build=${ICECC_TEST_TOP_BUILDDIR:-$(CDPATH= cd -- "$src" && pwd)}
 timeout_s=${ICECC_P50_C1F1_TIMEOUT:-180}
+profile_marker=${ICECC_P50_PROFILE:-ZSTD_ROUTE}
+case "$profile_marker" in
+    ZSTD_TU|ZSTD_ROUTE) ;;
+    *)
+        echo "FAIL: ICECC_P50_PROFILE must be ZSTD_TU or ZSTD_ROUTE" >&2
+        exit 1
+        ;;
+esac
 
 set +e
 "$src/unittests/p50compilee2e-source.sh"
@@ -224,9 +232,11 @@ cmp -s "$remote_obj" "$local_obj" || {
 # remains correct for environment upload and object return, so the negative
 # evidence below is deliberately limited to the source-stream and local/client
 # fallback markers.
-grep -E 'ZSTD_ROUTE|CACHE_SESSION' "$work/client-compile.log" "$work/c.log" \
+grep -F "$profile_marker" "$work/client-compile.log" "$work/c.log" \
+    "$work/f.log" >/dev/null &&
+grep -F 'CACHE_SESSION' "$work/client-compile.log" "$work/c.log" \
     "$work/f.log" >/dev/null || {
-    echo "FAIL: no positive ZSTD_ROUTE/CACHE_SESSION wire evidence" >&2
+    echo "FAIL: no positive $profile_marker/CACHE_SESSION wire evidence" >&2
     exit 1
 }
 if grep -E 'write_fd_to_server from cpp|write_fd_to_server preprocessed|building myself|building_local|local build forced|client_exception|fallback_local' \
@@ -235,4 +245,4 @@ if grep -E 'write_fd_to_server from cpp|write_fd_to_server preprocessed|building
     exit 1
 fi
 
-echo "PASS: all-P50 C1F1 ZSTD_ROUTE compile is remote and byte-identical"
+echo "PASS: all-P50 C1F1 $profile_marker compile is remote and byte-identical"

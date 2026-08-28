@@ -29,6 +29,7 @@ TESTS += p50inputlifecycle-source.sh p50inputlifecycle-sanitize.sh
 TESTS += p50inputlifecycle
 TESTS += p50compilebinding
 TESTS += p50compilee2e-source.sh p50compilee2e-run.sh p50resultdisposition
+TESTS += p50profile-selection-source.sh
 TESTS += p50_completion_record
 TESTS += p50daemontaskcount p50daemontaskcount-source.sh
 TESTS += p50forkfdhygiene p50forkfdhygiene-source.sh p50forkfdhygiene-mutants.sh p50_fork_fd_hygiene_sanitize.sh p50forkfdhygiene-oot.sh p50forkfdhygiene-package.sh
@@ -468,7 +469,7 @@ EXTRA_DIST += p50sidecarsupervisor-sanitize.sh p50sidecarlifecycle-source.sh \
 	p50sidecarlifecycle-mutants.sh p50sidecarlifecycle-sanitize.sh
 EXTRA_DIST += p50daemonsidecaradapter-source.sh p50daemonsidecaradapter-sanitize.sh
 EXTRA_DIST += p50profile-source.sh p50_profile_sanitize.sh
-EXTRA_DIST += p50compilee2e-source.sh p50compilee2e-run.sh
+EXTRA_DIST += p50compilee2e-source.sh p50compilee2e-run.sh p50profile-selection-source.sh
 EXTRA_DIST += p50completionflow-source.py
 EXTRA_DIST += p50completionrecord-sanitize.sh
 EXTRA_DIST += p50completionflow-run.sh

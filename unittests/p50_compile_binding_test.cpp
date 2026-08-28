@@ -1,5 +1,6 @@
 #include "client/p50_compile_binding.h"
 
+#include <cstdlib>
 #include <stdexcept>
 
 using namespace icecc::p50;
@@ -67,6 +68,42 @@ void test_exact_mode_admission() {
                                        PROTOCOL_VERSION_ASSIGNMENT_FENCE));
 }
 
+void test_explicit_profile_selection() {
+    CHECK(::unsetenv("ICECC_P50_PROFILE") == 0);
+    CHECK(p50_cache_profile_request_from_env() ==
+          P50CacheProfileRequest::Default);
+    const uint32_t advertised =
+        CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE;
+    CHECK(p50_select_cache_profile(advertised,
+                                   P50CacheProfileRequest::Default) ==
+          CACHE_PROFILE_ZSTD_ROUTE);
+
+    CHECK(::setenv("ICECC_P50_PROFILE", "ZSTD_TU", 1) == 0);
+    CHECK(p50_cache_profile_request_from_env() ==
+          P50CacheProfileRequest::ZSTD_TU);
+    CHECK(p50_select_cache_profile(advertised,
+                                   P50CacheProfileRequest::ZSTD_TU) ==
+          CACHE_PROFILE_ZSTD_TU);
+
+    CHECK(::setenv("ICECC_P50_PROFILE", "ZSTD_ROUTE", 1) == 0);
+    CHECK(p50_cache_profile_request_from_env() ==
+          P50CacheProfileRequest::ZSTD_ROUTE);
+    CHECK(p50_select_cache_profile(advertised,
+                                   P50CacheProfileRequest::ZSTD_ROUTE) ==
+          CACHE_PROFILE_ZSTD_ROUTE);
+    CHECK(p50_select_cache_profile(CACHE_PROFILE_ZSTD_TU,
+                                   P50CacheProfileRequest::ZSTD_ROUTE) == 0);
+
+    CHECK(::setenv("ICECC_P50_PROFILE", "UNSUPPORTED_PROFILE", 1) == 0);
+    CHECK(p50_cache_profile_request_from_env() ==
+          P50CacheProfileRequest::Unsupported);
+    CHECK(p50_select_cache_profile(advertised,
+                                   P50CacheProfileRequest::Unsupported) == 0);
+    CHECK(p50_select_cache_profile(advertised | CACHE_PROFILE_P29,
+                                   P50CacheProfileRequest::ZSTD_ROUTE) == 0);
+    CHECK(::unsetenv("ICECC_P50_PROFILE") == 0);
+}
+
 void test_namespace_and_request_are_assignment_bound() {
     const CompileJob first = assigned_job();
     const CompileJob second = assigned_job(101, 203);
@@ -122,6 +159,7 @@ void test_only_exact_commit_binds_compile_selector() {
 
 int main() {
     test_exact_mode_admission();
+    test_explicit_profile_selection();
     test_namespace_and_request_are_assignment_bound();
     test_only_exact_commit_binds_compile_selector();
 }

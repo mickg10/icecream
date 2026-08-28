@@ -38,11 +38,13 @@
 #include <chrono>
 #include <array>
 #include <compare>
+#include <cstdlib>
 #include <deque>
 #include <optional>
 #include <span>
 #include <stdint.h>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -564,6 +566,55 @@ const uint32_t CACHE_DECLARED_PROFILE_MASK =
    profile name must never advertise a codec which cannot reconstruct input. */
 const uint32_t CACHE_ADVERTISABLE_PROFILE_MASK =
     CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE;
+
+/* An optional scheduler-local request chooses the one source profile carried
+   in each assignment.  An absent request preserves the historical ROUTE-first
+   preference; an explicit request never falls back to another profile. */
+enum class P50CacheProfileRequest : uint8_t {
+    Default,
+    ZSTD_TU,
+    ZSTD_ROUTE,
+    Unsupported,
+};
+
+inline P50CacheProfileRequest p50_cache_profile_request_from_env() noexcept
+{
+    const char *const value = std::getenv("ICECC_P50_PROFILE");
+    if (value == nullptr || *value == '\0')
+        return P50CacheProfileRequest::Default;
+    const std::string_view requested(value);
+    if (requested == "ZSTD_TU")
+        return P50CacheProfileRequest::ZSTD_TU;
+    if (requested == "ZSTD_ROUTE")
+        return P50CacheProfileRequest::ZSTD_ROUTE;
+    return P50CacheProfileRequest::Unsupported;
+}
+
+inline constexpr uint32_t p50_select_cache_profile(
+    uint32_t advertised, P50CacheProfileRequest request) noexcept
+{
+    if ((advertised & ~CACHE_ADVERTISABLE_PROFILE_MASK) != 0)
+        return 0;
+    switch (request) {
+    case P50CacheProfileRequest::Default:
+        return (advertised & CACHE_PROFILE_ZSTD_ROUTE) != 0
+                   ? CACHE_PROFILE_ZSTD_ROUTE
+                   : ((advertised & CACHE_PROFILE_ZSTD_TU) != 0
+                          ? CACHE_PROFILE_ZSTD_TU
+                          : 0);
+    case P50CacheProfileRequest::ZSTD_TU:
+        return (advertised & CACHE_PROFILE_ZSTD_TU) != 0
+                   ? CACHE_PROFILE_ZSTD_TU
+                   : 0;
+    case P50CacheProfileRequest::ZSTD_ROUTE:
+        return (advertised & CACHE_PROFILE_ZSTD_ROUTE) != 0
+                   ? CACHE_PROFILE_ZSTD_ROUTE
+                   : 0;
+    case P50CacheProfileRequest::Unsupported:
+        return 0;
+    }
+    return 0;
+}
 
 /* Source-arm mode values are deliberately closed to the two runnable source
    profiles and are never accepted independently of cache_profile. */

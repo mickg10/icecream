@@ -2968,14 +2968,12 @@ static void project_cache_handoff(const CompileServer *cs, uint32_t wire_job_id,
     const uint32_t protocol = cs->cacheProtocol();
     const uint32_t mask = cs->cacheProfileMask();
     // Login advertises runnable capabilities, while the assignment tail must
-    // carry one negotiated profile.  Prefer the continuing ZSTD_ROUTE
-    // relationship when both runnable profiles are available; otherwise use
-    // the per-TU profile.  Unknown bits and malformed triples remain absent.
-    const uint32_t selected_mask = (mask & CACHE_PROFILE_ZSTD_ROUTE) != 0
-        ? CACHE_PROFILE_ZSTD_ROUTE
-        : ((mask & CACHE_PROFILE_ZSTD_TU) != 0
-            ? CACHE_PROFILE_ZSTD_TU
-            : 0);
+    // carry one negotiated profile.  An explicit scheduler request is exact;
+    // an absent request retains the ROUTE-first default.  Unknown bits and
+    // unavailable requests remain absent rather than silently switching.
+    const auto request = p50_cache_profile_request_from_env();
+    const uint32_t selected_mask =
+        p50_select_cache_profile(mask, request);
     if (identity_complete &&
         cache_advertisement_is_valid_present(port, protocol, selected_mask)) {
         out_port = port;
