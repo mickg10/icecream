@@ -354,8 +354,11 @@ icecc::p50::local::P50SourceTransferResult transfer_p50_source(
                               ready == 0 ? short{0} : descriptor.revents);
     }
     if (control.status() != DaemonControlStatus::Complete ||
-        !control.source_transfer_result().has_value())
+        !control.source_transfer_result().has_value()) {
+        log_warning() << "P50 cache control operation ended "
+                      << daemon_control_status_name(control.status()) << std::endl;
         return p50_transfer_error(7);
+    }
     return *control.source_transfer_result();
 }
 
