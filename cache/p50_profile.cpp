@@ -278,7 +278,8 @@ ProfileDialogue make_profile_dialogue(ProfileId profile, ProfileDialogueConfig c
         throw std::invalid_argument("transaction profile was not negotiated");
     ZstdTuLimits zstd_limits{config.max_encoded_body_bytes,
                              config.max_raw_bytes,
-                             config.max_window_log};
+                             config.max_window_log,
+                             config.max_history_bytes};
     switch (profile) {
     case ProfileId::ZSTD_TU:
         return ProfileDialogue(&kZstdTuVTable,

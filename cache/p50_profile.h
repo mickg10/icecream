@@ -28,6 +28,7 @@ struct ProfileDialogueConfig {
     uint64_t max_encoded_body_bytes = 0;
     uint64_t max_raw_bytes = 0;
     int max_window_log = 27;
+    uint64_t max_history_bytes = uint64_t{128} << 20;
 };
 
 enum class ProfileCommitState : uint8_t {

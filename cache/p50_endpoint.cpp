@@ -862,6 +862,7 @@ struct P50PreparationAuthority::Impl {
     uint64_t retained_bytes = 0;
     std::vector<std::vector<uint8_t>> committed_route_raw;
     uint64_t committed_route_raw_bytes = 0;
+    std::optional<uint64_t> uncommitted_route_entry;
     ZstdRouteCodec route_codec;
     ProfileId profile = ProfileId::ZSTD_TU;
     std::map<PrepareRequestKey, uint64_t> requests;
@@ -902,6 +903,11 @@ PreparedTuHandle P50PreparationAuthority::prepare(PrepareRequestKey request,
             throw std::invalid_argument("PrepareRequestKey was reused for different input");
         return PreparedTuHandle(impl_->identity, entry_position->first);
     }
+
+    if (impl_->profile == ProfileId::Z3_LONG &&
+        impl_->uncommitted_route_entry.has_value())
+        throw std::logic_error(
+            "ZSTD_ROUTE requires its predecessor to commit before preparing the next TU");
 
     if (impl_->entries.size() >= impl_->authority_limits.max_live_entries)
         throw std::length_error("C preparation authority reached its live-entry bound");
@@ -947,6 +953,8 @@ PreparedTuHandle P50PreparationAuthority::prepare(PrepareRequestKey request,
         throw;
     }
     impl_->retained_bytes += retained;
+    if (impl_->profile == ProfileId::Z3_LONG)
+        impl_->uncommitted_route_entry = entry_id;
     impl_->consume_tu();
     impl_->consume_entry();
     return PreparedTuHandle(impl_->identity, entry_id);
@@ -976,6 +984,9 @@ uint64_t P50PreparationAuthority::release(PreparedTuHandle handle) {
         return entry.references;
     if (impl_->requests.erase(entry.request) != 1)
         throw std::logic_error("preparation request index lost its release target");
+    if (impl_->profile == ProfileId::Z3_LONG && !entry.committed &&
+        impl_->uncommitted_route_entry == handle.entry_id_)
+        impl_->uncommitted_route_entry.reset();
     impl_->retained_bytes -= entry.retained_bytes;
     impl_->entries.erase(position);
     return 0;
@@ -990,6 +1001,8 @@ void P50PreparationAuthority::commit(PreparedTuHandle handle) {
         throw std::invalid_argument("prepared-TU handle has been released");
     auto& entry = position->second;
     if (impl_->profile == ProfileId::Z3_LONG && !entry.committed) {
+        if (impl_->uncommitted_route_entry != handle.entry_id_)
+            throw std::logic_error("ZSTD_ROUTE commit is not its prepared successor");
         if (entry.raw.size() > impl_->zstd_limits.max_history_bytes ||
             impl_->committed_route_raw_bytes >
                 (impl_->zstd_limits.max_history_bytes - entry.raw.size()))
@@ -997,6 +1010,7 @@ void P50PreparationAuthority::commit(PreparedTuHandle handle) {
         impl_->committed_route_raw.push_back(entry.raw);
         impl_->committed_route_raw_bytes += entry.raw.size();
         entry.committed = true;
+        impl_->uncommitted_route_entry.reset();
     }
 }
 
@@ -1883,7 +1897,8 @@ struct P50ServerEndpoint::Impl {
                             .state = reset.initial_state_digest,
                             .last_commit = std::nullopt,
                             .interrupted = std::nullopt,
-                            .pending = std::nullopt};
+                            .pending = std::nullopt,
+                            .dialogue = nullptr};
         record(ActionType::HISTORY_RESET, session);
     }
 
@@ -1915,8 +1930,9 @@ struct P50ServerEndpoint::Impl {
                 ProfileDialogueConfig{.negotiated_profiles = negotiated_profiles,
                                       .max_encoded_body_bytes = caps.zstd.max_encoded_body_bytes,
                                       .max_raw_bytes = caps.zstd.max_raw_bytes,
-                                      .max_window_log = caps.zstd.max_window_log}));
-        if (route.dialogue)
+                                      .max_window_log = caps.zstd.max_window_log,
+                                      .max_history_bytes = caps.zstd.max_history_bytes}));
+        if (begin.profile == ProfileId::Z3_LONG && route.dialogue)
             result.pending.dialogue = route.dialogue;
         return result;
     }
@@ -1939,10 +1955,12 @@ struct P50ServerEndpoint::Impl {
             throw std::logic_error("F endpoint already has one active transaction");
         if (route.interrupted && route.interrupted != prepared.pending.begin)
             throw StaleCompletion();
-        if (!route.dialogue)
-            route.dialogue = prepared.pending.dialogue;
-        else
-            prepared.pending.dialogue = route.dialogue;
+        if (prepared.pending.begin.profile == ProfileId::Z3_LONG) {
+            if (!route.dialogue)
+                route.dialogue = prepared.pending.dialogue;
+            else
+                prepared.pending.dialogue = route.dialogue;
+        }
         const TxBegin begin = prepared.pending.begin;
         prepared.pending.dialogue->begin(begin);
         const bool replay = prepared.replay;

@@ -361,8 +361,9 @@ struct TestClient {
     explicit TestClient(CStoreGuid c_store_guid, EndpointCaps caps = {},
                         HistoryNonce first_history_nonce = HistoryNonce{1},
                         CompletionLog* completions = nullptr, ActionTrace* actions = nullptr)
-        : authority(std::make_shared<P50PreparationAuthority>(c_store_guid, caps.zstd,
-                                                              {}, 1, caps.profile)),
+        : authority(std::make_shared<P50PreparationAuthority>(
+              c_store_guid, caps.zstd, PreparationAuthorityLimits{}, 1,
+              caps.profile)),
           endpoint(authority, caps, first_history_nonce, completions, actions) {}
 
     operator P50ClientEndpoint&() { return endpoint; }
@@ -470,7 +471,7 @@ PairResult run_pair(P50ClientEndpoint& client, P50ServerEndpoint& server,
 }
 
 void test_zstd_route_endpoint_continuation_and_retry() {
-    const P5coStoreGuids guids = p5co_store_guids(811);
+    const P5coStoreGuids guids = p5co_store_guids(211);
     EndpointCaps caps;
     caps.profile = ProfileId::Z3_LONG;
     caps.zstd.max_raw_bytes = 1U << 20;
@@ -480,6 +481,9 @@ void test_zstd_route_endpoint_continuation_and_retry() {
     const std::vector<uint8_t> first(64 * 1024, 0x41);
     const std::vector<uint8_t> second(64 * 1024, 0x41);
     const PreparedTuHandle first_prepared = admit(client, first);
+    require_throws<std::logic_error>(
+        [&] { (void)admit(client, second); },
+        "ZSTD_ROUTE prepared a successor before its predecessor committed");
     const PairResult first_pair = run_pair(client, server, first_prepared);
     require(first_pair.client.status == ClientRunStatus::Committed &&
                 first_pair.server.status == ServerRunStatus::Completed &&
@@ -495,9 +499,10 @@ void test_zstd_route_endpoint_continuation_and_retry() {
 
     const std::vector<uint8_t> failed(64 * 1024, 0x42);
     const PreparedTuHandle failed_prepared = admit(client, failed);
-    const PairResult disconnected = run_pair(
-        client, server, failed_prepared,
-        EndpointIoControl{.close_after_write = MessageType::BODY});
+    EndpointIoControl disconnect;
+    disconnect.close_before_write = MessageType::BODY;
+    const PairResult disconnected =
+        run_pair(client, server, failed_prepared, disconnect);
     require(disconnected.client.status == ClientRunStatus::Disconnected &&
                 disconnected.server.status == ServerRunStatus::Disconnected &&
                 client.has_active_transaction(),
