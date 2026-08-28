@@ -736,7 +736,8 @@ class Runtime:
                 command.extend(["--env", key + "=" + container_env[key]])
             if disposition:
                 command.extend(["--env", "ICECC_P50_TEST_DISPOSITION=" + disposition])
-            command.extend([self._client_docker_name("s6-c"), "/role/client/icecc",
+            client_node = "s6-c2" if socket_path == self.client2_socket else "s6-c"
+            command.extend([self._client_docker_name(client_node), "/role/client/icecc",
                             "g++", "-std=c++17", "-O2", "-c", str(inside_source),
                             "-o", str(inside_remote)])
             process_env = os.environ.copy()
