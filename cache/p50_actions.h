@@ -53,6 +53,10 @@ struct ActionRecord {
     std::vector<Key64> need_keys;
     uint64_t remaining_need = 0;
     bool duplicate = false;
+    // Exact protocol stage span associated with this action.  This is the
+    // descriptor/component span (or materialized input span), rather than a
+    // wall-clock or socket-buffer estimate.
+    uint64_t stage_bytes = 0;
 };
 
 class ActionTrace {

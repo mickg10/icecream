@@ -790,6 +790,22 @@ ActionRecord action_record(ActionType action, ActorSide actor, CStoreGuid c_guid
         if (action != ActionType::INPUT_COMMITTED && action != ActionType::COMMIT_ACCEPTED &&
             action != ActionType::LOST_COMMIT_ACCEPTED)
             record.state_digest = begin->pre_state_digest;
+        switch (action) {
+        case ActionType::TX_BEGIN:
+            record.stage_bytes = begin->dict.encoded_bytes + begin->body.encoded_bytes;
+            break;
+        case ActionType::DICT_COMPLETE:
+            record.stage_bytes = begin->dict.encoded_bytes;
+            break;
+        case ActionType::BODY_COMPLETE:
+            record.stage_bytes = begin->body.encoded_bytes;
+            break;
+        case ActionType::INPUT_MATERIALIZED:
+            record.stage_bytes = begin->raw_bytes;
+            break;
+        default:
+            break;
+        }
     }
     return record;
 }
@@ -1779,6 +1795,8 @@ struct P50ServerEndpoint::Impl {
             value.need_keys.clear();
             value.remaining_need = 0;
         }
+        if (action == ActionType::NEED_RECORDED)
+            value.stage_bytes = value.need_keys.size() * sizeof(uint64_t);
         actions->record(std::move(value));
     }
 

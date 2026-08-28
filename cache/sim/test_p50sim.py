@@ -49,6 +49,12 @@ def scenario_tree(tmp_path: Path) -> Path:
         "action_trace_sha256": hashlib.sha256(action_bytes).hexdigest(),
         "route_trace": "route_trace.json",
         "route_trace_sha256": hashlib.sha256((tmp_path / "route_trace.json").read_bytes()).hexdigest(),
+        "identity": {
+            "c_store_guid": action_rows[0]["c_store_guid"],
+            "f_store_guid": action_rows[0]["f_store_guid"],
+            "history_nonce": next(row["history_nonce"] for row in action_rows
+                                   if row["action"] in {"TX_BEGIN", "ACTIVE_REPLAYED"}),
+        },
         "schema": "icecream-s7-p50sim-scenario-v1",
     }
     write_canonical(tmp_path / "scenario.json", scenario)

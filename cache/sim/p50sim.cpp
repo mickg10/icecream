@@ -7,6 +7,7 @@
 #include <boost/asio/use_future.hpp>
 
 #include <cstdint>
+#include <array>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -32,6 +33,23 @@ std::vector<uint8_t> read_bytes(const std::string& path) {
     if (!bytes.empty() && !input.read(reinterpret_cast<char*>(bytes.data()), size))
         throw std::runtime_error("cannot read input manifest payload");
     return bytes;
+}
+
+template <typename Guid> bool parse_guid(std::string_view text, Guid& result) {
+    if (text.size() != result.bytes.size() * 2) return false;
+    auto nibble = [](char value) -> int {
+        if (value >= '0' && value <= '9') return value - '0';
+        if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+        if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+        return -1;
+    };
+    for (size_t index = 0; index != result.bytes.size(); ++index) {
+        const int high = nibble(text[index * 2]);
+        const int low = nibble(text[index * 2 + 1]);
+        if (high < 0 || low < 0) return false;
+        result.bytes[index] = static_cast<uint8_t>((high << 4) | low);
+    }
+    return result != Guid{};
 }
 
 void write_summary(const std::string& path, std::span<const uint8_t> input,
@@ -84,6 +102,9 @@ struct Arguments {
     std::string input;
     std::string actions;
     std::string summary;
+    CStoreGuid c_store_guid = CStoreGuid::from_u64(0x505053494dULL);
+    FStoreGuid f_store_guid = FStoreGuid::from_u64(0x505053494dULL);
+    HistoryNonce history_nonce{1};
 };
 
 Arguments parse(int argc, char** argv) {
@@ -98,6 +119,21 @@ Arguments parse(int argc, char** argv) {
             result.actions = argv[++index];
         else if (option == "--summary")
             result.summary = argv[++index];
+        else if (option == "--c-store-guid") {
+            if (!parse_guid(argv[++index], result.c_store_guid))
+                throw std::invalid_argument("invalid --c-store-guid");
+        } else if (option == "--f-store-guid") {
+            if (!parse_guid(argv[++index], result.f_store_guid))
+                throw std::invalid_argument("invalid --f-store-guid");
+        } else if (option == "--history-nonce") {
+            try {
+                result.history_nonce.value = std::stoull(argv[++index]);
+            } catch (...) {
+                throw std::invalid_argument("invalid --history-nonce");
+            }
+            if (result.history_nonce.value == 0)
+                throw std::invalid_argument("--history-nonce must be nonzero");
+        }
         else
             throw std::invalid_argument("unknown option " + option);
     }
@@ -117,7 +153,7 @@ int main(int argc, char** argv) {
         CompletionLog completions(4096);
         const EndpointCaps caps{};
         auto authority = std::make_shared<P50PreparationAuthority>(
-            CStoreGuid::from_u64(0x505053494dULL), caps.zstd);
+            arguments.c_store_guid, caps.zstd);
         const PreparedTuHandle prepared = authority->prepare(
             PrepareRequestKey{1, 1}, input);
         if (!prepared)
@@ -126,9 +162,9 @@ int main(int argc, char** argv) {
         P50ServerEndpointConfig config;
         config.input_job_state = [](CStoreGuid, const TxBegin&, const TxCommit&,
                                     std::span<const uint8_t>) { return InputJobState::Open; };
-        P50ServerEndpoint server(FStoreGuid::from_u64(0x505053494dULL), caps,
+        P50ServerEndpoint server(arguments.f_store_guid, caps,
                                  &completions, &actions, std::move(config));
-        P50ClientEndpoint client(authority, caps, HistoryNonce{1}, &completions, &actions);
+        P50ClientEndpoint client(authority, caps, arguments.history_nonce, &completions, &actions);
 
         asio::io_context context;
         tcp::acceptor acceptor(context, tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0));

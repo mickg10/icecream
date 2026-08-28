@@ -197,7 +197,8 @@ std::string action_jsonl(const ActionRecord& record) {
         out << record.need_keys[index].wire_value();
     }
     out << "],\"remaining_need\":" << record.remaining_need
-        << ",\"duplicate\":" << (record.duplicate ? "true" : "false") << '}';
+        << ",\"duplicate\":" << (record.duplicate ? "true" : "false")
+        << ",\"stage_bytes\":" << record.stage_bytes << '}';
     return out.str();
 }
 

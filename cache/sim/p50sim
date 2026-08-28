@@ -163,6 +163,23 @@ def child(root: Path, name: object) -> Path:
     return path
 
 
+def live_identity(rows: list[dict[str, object]]) -> tuple[str, str, int]:
+    """Read the initial route identity from the authenticated live snapshot."""
+    c_rows = [row for row in rows if row.get("actor") == "C"]
+    f_rows = [row for row in rows if row.get("actor") == "F"]
+    if not c_rows or not f_rows:
+        raise ValueError("live action snapshot has no C/F identity")
+    c_guid = c_rows[0].get("c_store_guid")
+    f_guid = f_rows[0].get("f_store_guid")
+    tx = next((row for row in rows if row.get("action") in {"TX_BEGIN", "ACTIVE_REPLAYED"}), None)
+    nonce = tx.get("history_nonce") if tx else None
+    if not isinstance(c_guid, str) or not isinstance(f_guid, str) or not isinstance(nonce, int):
+        raise ValueError("live action snapshot has incomplete route identity")
+    if len(c_guid) != 32 or len(f_guid) != 32 or nonce <= 0:
+        raise ValueError("live action snapshot has invalid route identity")
+    return c_guid, f_guid, nonce
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 7 or argv[1] != "--s7-cell" or argv[3] != "--s7-artifacts" or argv[5] != "--s7-output":
         return fail("expected --s7-cell CELL --s7-artifacts DIR --s7-output DIR")
@@ -204,6 +221,15 @@ def main(argv: list[str]) -> int:
         if not isinstance(route.get("trace"), list) or not route["trace"]:
             raise ValueError("canonical live route trace is empty")
         expected_actions = canonical_jsonl(action_path)
+        c_guid, f_guid, history_nonce = live_identity(expected_actions)
+        configured_identity = scenario.get("identity")
+        if configured_identity is not None:
+            if not isinstance(configured_identity, dict):
+                raise ValueError("scenario identity must be an object")
+            if configured_identity != {
+                    "c_store_guid": c_guid, "f_store_guid": f_guid,
+                    "history_nonce": history_nonce}:
+                raise ValueError("scenario identity differs from live action snapshot")
         if route.get("actions") != [row.get("action") for row in expected_actions]:
             raise ValueError("route trace action sequence differs from live action trace")
         expected_route = [
@@ -224,7 +250,9 @@ def main(argv: list[str]) -> int:
         execution_environment["ICECC_P50_C_ACTION_TRACE"] = str(c_process_trace)
         execution_environment["ICECC_P50_F_ACTION_TRACE"] = str(f_process_trace)
         result = subprocess.run(
-            [str(binary), "--input", str(input_path), "--actions", str(actions), "--summary", str(summary)],
+            [str(binary), "--input", str(input_path), "--actions", str(actions), "--summary", str(summary),
+             "--c-store-guid", c_guid, "--f-store-guid", f_guid,
+             "--history-nonce", str(history_nonce)],
             stdin=subprocess.DEVNULL,
             env=execution_environment,
             check=False,
