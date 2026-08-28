@@ -44,6 +44,12 @@ command -v bash >/dev/null 2>&1 || {
 }
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/p50compilee2e.XXXXXX")
+# The scheduler changes to its configured service account before opening the
+# requested log.  Keep the test root traversable and pre-create only that log
+# as writable; the cache runtime and HOME below retain their own 0700 modes.
+chmod 0711 "$work"
+: >"$work/scheduler.log"
+chmod 0666 "$work/scheduler.log"
 cleanup() {
     test -n "${client_pid:-}" && kill "$client_pid" 2>/dev/null || :
     test -n "${worker_pid:-}" && kill "$worker_pid" 2>/dev/null || :
