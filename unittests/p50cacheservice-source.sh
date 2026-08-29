@@ -38,6 +38,10 @@ for pair in \
     "$header|RuntimeConfig" \
     "$test_file|legacy_store_identity_launches" \
     "$test_file|test_runtime_store_identity_is_explicit_and_role_tagged" \
+    "$test_file|authenticated_control_farm_accepts_twenty_and_stops" \
+    "$test_file|kConnectionCount = 20" \
+    "$test_file|receive_until(acknowledgement, deadline)" \
+    "$test_file|wait_for_exit_bounded(child.pid, 1000, status)" \
     "$test_file|READY v2 generation=91 attempt=7 F_STORE_GENERATION=191 DERIVATION_VERSION=1" \
     "$doc|CSPRNG"; do
     file=${pair%%|*}; pattern=${pair#*|}

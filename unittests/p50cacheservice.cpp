@@ -186,6 +186,8 @@ struct ReapOnFailure {
     ReapOnFailure& operator=(const ReapOnFailure&) = delete;
 };
 
+bool wait_for_exit_bounded(pid_t pid, int timeout_milliseconds, int& status);
+
 void expect_exact_ready_then_eof(int fd) {
     std::array<char, 6> message{};
     size_t received = 0;
@@ -434,6 +436,66 @@ void authenticated_idle_dispatcher_persists() {
     CHECK(::waitpid(child.pid, &status, 0) == child.pid);
     child.pid = -1;
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(::access((std::string(template_path) + "/service.sock").c_str(), F_OK) != 0);
+    CHECK(::rmdir(template_path) == 0);
+}
+
+void authenticated_control_farm_accepts_twenty_and_stops() {
+    char template_path[] = "/tmp/icecc-cache-service-farm-XXXXXX";
+    const int directory_fd = ::mkstemp(template_path);
+    CHECK(directory_fd >= 0);
+    CHECK(::close(directory_fd) == 0);
+    CHECK(::unlink(template_path) == 0);
+    CHECK(::mkdir(template_path, 0700) == 0);
+
+    Child child = launch(template_path);
+    constexpr size_t kConnectionCount = 20;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(1000);
+    std::vector<local::Connection> connections;
+    connections.reserve(kConnectionCount);
+    for (size_t index = 0; index != kConnectionCount; ++index) {
+        local::Status status = local::Status::Ok;
+        connections.push_back(local::connect_unix_until(
+            std::string(template_path) + "/service.sock", deadline, &status));
+        CHECK(status == local::Status::Ok && connections.back().valid());
+    }
+
+    const local::Frame hello = local::make_hello(local::PeerRole::Daemon, {7, 1});
+    for (auto& connection : connections)
+        CHECK(connection.send(hello) == local::Status::Ok);
+    for (auto& connection : connections) {
+        local::Frame acknowledgement;
+        CHECK(connection.receive_until(acknowledgement, deadline) == local::Status::Ok);
+        CHECK(local::validate_handshake(acknowledgement, local::MessageType::HelloAck,
+                                        local::PeerRole::Sidecar, {7, 1}) == local::Status::Ok);
+    }
+    CHECK(std::chrono::steady_clock::now() < deadline);
+
+    // Keep every authenticated relationship open while the service performs
+    // its normal signal-driven worker shutdown.
+    for (const auto& connection : connections) {
+        unsigned char byte = 0;
+        const ssize_t result = ::recv(connection.native_handle(), &byte, sizeof(byte),
+                                      MSG_PEEK | MSG_DONTWAIT);
+        CHECK(result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+    }
+
+    const auto stop_started = std::chrono::steady_clock::now();
+    CHECK(::kill(child.pid, SIGTERM) == 0);
+    int status = 0;
+    const bool stopped = wait_for_exit_bounded(child.pid, 1000, status);
+    child.pid = -1;
+    CHECK(stopped);
+    CHECK(std::chrono::steady_clock::now() - stop_started <
+          std::chrono::milliseconds(1000));
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    for (const auto& connection : connections) {
+        struct pollfd descriptor{connection.native_handle(), POLLIN | POLLHUP | POLLERR, 0};
+        CHECK(::poll(&descriptor, 1, 1000) > 0);
+        unsigned char byte = 0;
+        CHECK(::recv(connection.native_handle(), &byte, sizeof(byte), 0) == 0);
+    }
     CHECK(::access((std::string(template_path) + "/service.sock").c_str(), F_OK) != 0);
     CHECK(::rmdir(template_path) == 0);
 }
@@ -1621,6 +1683,7 @@ int main() {
         signal_interrupts_control_wait(SIGTERM);
         signal_interrupts_control_wait(SIGINT);
         authenticated_idle_dispatcher_persists();
+        authenticated_control_farm_accepts_twenty_and_stops();
         replacement_node_is_not_removed();
         peer_credentials_are_required();
         rejects_identity_role_and_malformed();
