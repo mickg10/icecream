@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Create and replay the exact fmt/ZSTD_TU warm S7 cell without Docker."""
+"""Replay explicit live captures for the fmt/ZSTD_TU warm S7 cell.
+
+The runner is intentionally replay-only: it never invokes the product binary
+to manufacture an expected trace.  Its six capture arguments must point at
+the retained preprocessed inputs and role-local C/F traces from one live run.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -10,7 +16,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+
 CELL = "fmt/ZSTD_TU/warm"
+SCHEMA = "icecream-s7-fmt-zstd-tu-warm-conformance-v2"
+
+
+class Hold(Exception):
+    pass
+
 
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -19,126 +32,212 @@ def sha256(path: Path) -> str:
             digest.update(block)
     return digest.hexdigest()
 
-def rows(path: Path) -> list[dict[str, object]]:
-    return [json.loads(line) for line in path.read_bytes().splitlines()]
+
+def read_input(path: Path, label: str) -> tuple[str, bytes]:
+    """Snapshot one explicit live input before constructing the scenario."""
+    try:
+        info = path.lstat()
+    except OSError as error:
+        raise Hold(f"missing explicit live {label}: {path}") from error
+    if not path.is_file() or path.is_symlink() or info.st_nlink != 1:
+        raise Hold(f"live {label} is not a private regular file: {path}")
+    try:
+        value = path.read_bytes()
+    except OSError as error:
+        raise Hold(f"cannot read explicit live {label}: {path}") from error
+    return hashlib.sha256(value).hexdigest(), value
+
+
+def read_rows(path: Path, label: str, actor: str | None) -> list[dict[str, object]]:
+    try:
+        info = path.lstat()
+    except OSError as error:
+        raise Hold(f"missing explicit live {label}: {path}") from error
+    if not path.is_file() or path.is_symlink() or info.st_nlink != 1:
+        raise Hold(f"live {label} is not a private regular file: {path}")
+    try:
+        values = [json.loads(line) for line in path.read_bytes().splitlines()]
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"live {label} is not valid JSONL") from error
+    if not values or any(not isinstance(value, dict) for value in values):
+        raise ValueError(f"live {label} is empty or not object JSONL")
+    if actor is not None and any(value.get("actor") != actor for value in values):
+        raise ValueError(f"live {label} contains a non-{actor} action")
+    return values
+
+
+def combine(c_rows: list[dict[str, object]], f_rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Merge two already-captured role traces at Protocol-50 boundaries."""
+    merged: list[dict[str, object]] = []
+    ci = fi = 0
+
+    def transaction(row: dict[str, object]) -> bool:
+        return row.get("action") in {
+            "TX_BEGIN", "ACTIVE_REPLAYED", "DICT_COMPLETE", "NEED_RECORDED",
+            "OBJECT_APPLIED", "BODY_COMPLETE", "INPUT_MATERIALIZED",
+            "INPUT_COMMITTED", "COMMIT_ACCEPTED", "LOST_COMMIT_ACCEPTED",
+        }
+
+    while ci < len(c_rows) or fi < len(f_rows):
+        c = c_rows[ci] if ci < len(c_rows) else None
+        f = f_rows[fi] if fi < len(f_rows) else None
+        if f is None:
+            merged.append(c); ci += 1; continue
+        if c is None:
+            merged.append(f); fi += 1; continue
+        ca, fa = c.get("action"), f.get("action")
+        if ca == "TX_BEGIN" and fa == "SESSION_OPENED" and f.get("session_serial", 0) > 1:
+            merged.append(c); ci += 1; continue
+        if fa in {"SESSION_OPENED", "SESSION_REPLACED", "HISTORY_RESET"}:
+            merged.append(f); fi += 1; continue
+        if fa == "SESSION_DISCONNECTED":
+            if ca in {"COMMIT_ACCEPTED", "LOST_COMMIT_ACCEPTED"}:
+                merged.append(c); ci += 1
+            else:
+                merged.append(f); fi += 1
+            continue
+        if ca == "TX_BEGIN" and fa == "TX_BEGIN":
+            if c.get("transaction_digest") == f.get("transaction_digest"):
+                merged.append(c); ci += 1
+            else:
+                merged.append(f); fi += 1
+            continue
+        if ca in {"COMMIT_ACCEPTED", "LOST_COMMIT_ACCEPTED"} and transaction(f):
+            merged.append(f); fi += 1; continue
+        if ca == "TX_BEGIN" and transaction(f):
+            merged.append(f); fi += 1; continue
+        if ca in {"COMMIT_ACCEPTED", "LOST_COMMIT_ACCEPTED"}:
+            merged.append(c); ci += 1; continue
+        if ca == "TX_BEGIN":
+            merged.append(c); ci += 1
+        else:
+            merged.append(f); fi += 1
+    return merged
+
 
 def write_json(path: Path, value: object) -> None:
     path.write_bytes((json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode())
 
+
 def write_rows(path: Path, values: list[dict[str, object]]) -> None:
     path.write_bytes(b"".join((json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode() for value in values))
 
-def require_regular(path: Path, label: str) -> None:
-    info = path.lstat()
-    if not path.is_file() or path.is_symlink() or info.st_nlink != 1:
-        raise ValueError(f"{label} is not a private regular file")
-
-def run_sim(sim: Path, scenario: Path, output: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run([sys.executable, str(sim), "--s7-cell", CELL,
-                           "--s7-artifacts", str(scenario), "--s7-output", str(output)],
-                          text=True, capture_output=True, check=False)
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--artifact-root", type=Path, required=True)
+    for name in ("prewarm-input", "measured-input", "prewarm-c-trace", "prewarm-f-trace",
+                 "measured-c-trace", "measured-f-trace"):
+        parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--sim", type=Path,
                         default=Path(__file__).resolve().parents[1] / "cache/sim/p50sim")
     args = parser.parse_args(argv)
-    artifact, out = args.artifact_root.resolve(), args.out.resolve()
+    out = args.out.resolve()
     try:
-        if not artifact.is_dir() or artifact.is_symlink() or out.exists():
-            raise ValueError("artifact root is unavailable or output already exists")
-        source = artifact / "artifacts/source/preprocessed.ii"
-        live_c = artifact / "live/c-action-trace-identity-aware.jsonl"
-        live_f = artifact / "live/f-action-trace-identity-aware.jsonl"
-        for path, label in ((source, "preprocessed input"), (live_c, "live C trace"), (live_f, "live F trace")):
-            require_regular(path, label)
-        c_live, f_live = rows(live_c), rows(live_f)
-        live_rows = c_live + f_live
-        c_guid, f_guid = c_live[0]["c_store_guid"], c_live[0]["f_store_guid"]
-        begin = next(row for row in live_rows if row["action"] == "TX_BEGIN")
-        if any(row.get("c_store_guid") != c_guid or row.get("f_store_guid") != f_guid for row in live_rows):
-            raise ValueError("retained live C/F identities disagree")
-        identity = {"c_store_guid": c_guid, "f_store_guid": f_guid,
-                    "history_nonce": begin["history_nonce"], "prewarm_tu_seq": 0,
-                    "measured_tu_seq": 1}
+        if out.exists():
+            raise ValueError("output already exists")
+        pre_c = read_rows(args.prewarm_c_trace, "prewarm C trace", "C")
+        pre_f = read_rows(args.prewarm_f_trace, "prewarm F trace", "F")
+        meas_c = read_rows(args.measured_c_trace, "measured C trace", "C")
+        meas_f = read_rows(args.measured_f_trace, "measured F trace", "F")
+        prewarm_input_sha, prewarm_input_bytes = read_input(args.prewarm_input, "prewarm input")
+        measured_input_sha, measured_input_bytes = read_input(args.measured_input, "measured input")
+        prewarm = combine(pre_c, pre_f)
+        measured = combine(meas_c, meas_f)
+        all_rows = prewarm + measured
+        if not all_rows:
+            raise ValueError("explicit live traces produced no actions")
+        begins = [row for row in all_rows if row.get("action") == "TX_BEGIN"]
+        if len(begins) != 4 or [row.get("tu_seq") for row in begins] != [0, 0, 1, 1]:
+            raise ValueError("explicit live traces do not contain TU0 then TU1")
+        c_guid, f_guid = begins[0].get("c_store_guid"), begins[0].get("f_store_guid")
+        nonce = begins[0].get("history_nonce")
+        if not isinstance(c_guid, str) or not isinstance(f_guid, str) or not isinstance(nonce, int) or nonce <= 0:
+            raise ValueError("explicit live traces have incomplete identity")
+        if any(row.get("c_store_guid") != c_guid or row.get("f_store_guid") != f_guid for row in all_rows):
+            raise ValueError("explicit live traces disagree on C/F identity")
         sim, binary = args.sim.resolve(), args.sim.resolve().with_name(".p50sim.bin")
-        require_regular(binary, "product-linked p50sim binary")
+        if not binary.is_file() or binary.is_symlink():
+            raise Hold(f"product-linked simulator is not built: {binary}")
         out.mkdir(parents=True)
-        scenario, record = out / "scenario", out / "recorded"
-        scenario.mkdir(); record.mkdir()
-        shutil.copyfile(source, scenario / "preprocessed.ii")
-        command = [str(binary), "--prewarm-input", str(scenario / "preprocessed.ii"),
-                   "--measured-input", str(scenario / "preprocessed.ii"),
-                   "--actions", str(record / "actions.jsonl"),
-                   "--prewarm-actions", str(record / "prewarm-actions.jsonl"),
-                   "--measured-actions", str(record / "measured-actions.jsonl"),
-                   "--summary", str(record / "summary.json"), "--c-store-guid", str(c_guid),
-                   "--f-store-guid", str(f_guid), "--history-nonce", str(begin["history_nonce"])]
-        recorded = subprocess.run(command, text=True, capture_output=True, check=False)
-        if recorded.returncode:
-            raise ValueError(f"product warm recording failed: {recorded.stderr.strip()}")
-        all_rows, prewarm_rows = rows(record / "actions.jsonl"), rows(record / "prewarm-actions.jsonl")
-        measured_rows = rows(record / "measured-actions.jsonl")
-        paths = {"actions.jsonl": all_rows, "prewarm-actions.jsonl": prewarm_rows,
-                 "measured-actions.jsonl": measured_rows,
-                 "prewarm-c-action-trace.jsonl": [r for r in prewarm_rows if r["actor"] == "C"],
-                 "prewarm-f-action-trace.jsonl": [r for r in prewarm_rows if r["actor"] == "F"],
-                 "measured-c-action-trace.jsonl": [r for r in measured_rows if r["actor"] == "C"],
-                 "measured-f-action-trace.jsonl": [r for r in measured_rows if r["actor"] == "F"]}
-        for name, value in paths.items():
+        scenario = out / "scenario"
+        scenario.mkdir()
+        (scenario / "prewarm.ii").write_bytes(prewarm_input_bytes)
+        (scenario / "measured.ii").write_bytes(measured_input_bytes)
+        for name, value in {
+            "actions.jsonl": all_rows, "prewarm-actions.jsonl": prewarm, "measured-actions.jsonl": measured,
+            "prewarm-c-action-trace.jsonl": pre_c, "prewarm-f-action-trace.jsonl": pre_f,
+            "measured-c-action-trace.jsonl": meas_c, "measured-f-action-trace.jsonl": meas_f,
+        }.items():
             write_rows(scenario / name, value)
-        ledger = [{"sequence": n, "action": r["action"], "actor": r["actor"], "stage_bytes": r["stage_bytes"],
-                   "transaction_digest": r["transaction_digest"], "raw_digest": r["raw_digest"]}
-                  for n, r in enumerate(all_rows, 1)]
+        ledger = [{"sequence": n, "action": row.get("action"), "actor": row.get("actor"),
+                   "stage_bytes": row.get("stage_bytes"), "transaction_digest": row.get("transaction_digest"),
+                   "raw_digest": row.get("raw_digest")} for n, row in enumerate(all_rows, 1)]
         write_rows(scenario / "stage-ledger.jsonl", ledger)
-        route = {"actions": [r["action"] for r in all_rows], "origin": "live",
+        route = {"actions": [row.get("action") for row in all_rows], "origin": "live",
                  "schema": "icecream-s7-live-route-trace-v1",
-                 "trace": [{"action": r["action"], "sequence": n} for n, r in enumerate(all_rows, 1)]}
+                 "trace": [{"action": row.get("action"), "sequence": n} for n, row in enumerate(all_rows, 1)]}
         write_json(scenario / "route_trace.json", route)
-        scenario_value = {"cell": CELL, "regime": "warm", "schema": "icecream-s7-p50sim-scenario-v1",
-                          "input": "preprocessed.ii", "input_sha256": sha256(scenario / "preprocessed.ii"),
-                          "prewarm_input": "preprocessed.ii", "prewarm_input_sha256": sha256(scenario / "preprocessed.ii"),
-                          "action_trace": "actions.jsonl", "action_trace_sha256": sha256(scenario / "actions.jsonl"),
-                          "prewarm_action_trace": "prewarm-actions.jsonl", "measured_action_trace": "measured-actions.jsonl",
-                          "prewarm_c_action_trace": "prewarm-c-action-trace.jsonl", "prewarm_f_action_trace": "prewarm-f-action-trace.jsonl",
-                          "measured_c_action_trace": "measured-c-action-trace.jsonl", "measured_f_action_trace": "measured-f-action-trace.jsonl",
-                          "stage_ledger": "stage-ledger.jsonl", "route_trace": "route_trace.json",
-                          "route_trace_sha256": sha256(scenario / "route_trace.json"), "identity": identity}
-        write_json(scenario / "scenario.json", scenario_value)
+        identity = {"c_store_guid": c_guid, "f_store_guid": f_guid, "history_nonce": nonce,
+                    "prewarm_tu_seq": 0, "measured_tu_seq": 1}
+        write_json(scenario / "scenario.json", {
+            "cell": CELL, "regime": "warm", "schema": "icecream-s7-p50sim-scenario-v1",
+            "input": "measured.ii", "input_sha256": measured_input_sha,
+            "prewarm_input": "prewarm.ii", "prewarm_input_sha256": prewarm_input_sha,
+            "action_trace": "actions.jsonl", "action_trace_sha256": sha256(scenario / "actions.jsonl"),
+            "prewarm_action_trace": "prewarm-actions.jsonl", "measured_action_trace": "measured-actions.jsonl",
+            "prewarm_c_action_trace": "prewarm-c-action-trace.jsonl", "prewarm_f_action_trace": "prewarm-f-action-trace.jsonl",
+            "measured_c_action_trace": "measured-c-action-trace.jsonl", "measured_f_action_trace": "measured-f-action-trace.jsonl",
+            "stage_ledger": "stage-ledger.jsonl", "route_trace": "route_trace.json",
+            "route_trace_sha256": sha256(scenario / "route_trace.json"), "identity": identity,
+        })
         replay = out / "replay"
-        result = run_sim(sim, scenario, replay)
+        result = subprocess.run([sys.executable, str(sim), "--s7-cell", CELL,
+                                 "--s7-artifacts", str(scenario), "--s7-output", str(replay)],
+                                text=True, capture_output=True, check=False)
         if result.returncode:
             raise ValueError(f"warm replay failed: {result.stderr.strip()}")
         shutil.copyfile(replay / "identities.json", out / "identities.json")
         shutil.copyfile(replay / "stage-ledger.jsonl", out / "stage-ledger.jsonl")
-        shutil.copyfile(scenario / "preprocessed.ii", out / "preprocessed.ii")
+        (out / "prewarm.ii").write_bytes(prewarm_input_bytes)
+        (out / "measured.ii").write_bytes(measured_input_bytes)
+        for name in ("prewarm-c-action-trace.jsonl", "prewarm-f-action-trace.jsonl",
+                     "measured-c-action-trace.jsonl", "measured-f-action-trace.jsonl"):
+            shutil.copyfile(scenario / name, out / name)
         control_scenario = out / "control-scenario"
         shutil.copytree(scenario, control_scenario)
         control_path = control_scenario / "measured-actions.jsonl"
-        write_rows(control_path, [r for r in rows(control_path) if r["action"] != "NEED_RECORDED"])
-        control = run_sim(sim, control_scenario, out / "control-replay")
-        control_log = out / "controls/deletion-measured-trace.log"
-        control_log.parent.mkdir()
-        control_log.write_text("command=warm p50sim replay with measured NEED_RECORDED deletion\n" +
-                               f"returncode={control.returncode}\n{control.stderr}")
+        write_rows(control_path, [row for row in read_rows(control_path, "control measured trace", None)
+                                  if row.get("action") != "NEED_RECORDED"])
+        # The control is expected to fail at the measured action equality gate.
+        control = subprocess.run([sys.executable, str(sim), "--s7-cell", CELL,
+                                  "--s7-artifacts", str(control_scenario), "--s7-output", str(out / "control-replay")],
+                                 text=True, capture_output=True, check=False)
+        (out / "controls").mkdir()
+        (out / "controls/deletion-measured-trace.log").write_text(
+            "command=warm p50sim replay with measured NEED_RECORDED deletion\n"
+            f"returncode={control.returncode}\n{control.stderr}")
         if control.returncode == 0:
             raise ValueError("deletion control unexpectedly passed")
         (out / "commands.log").write_text(
-            "record=" + " ".join(command) + "\n"
             "replay=" + " ".join([sys.executable, str(sim), "--s7-cell", CELL,
                                     "--s7-artifacts", str(scenario), "--s7-output", str(replay)]) + "\n"
             "control=warm p50sim replay with measured NEED_RECORDED deletion\n")
-        write_json(out / "manifest.json", {"schema": "icecream-s7-fmt-zstd-tu-warm-conformance-v1",
-                                            "cell": CELL, "status": "PASS", "input_sha256": sha256(source),
+        write_json(out / "manifest.json", {"schema": SCHEMA, "cell": CELL, "status": "PASS",
+                                            "prewarm_input_sha256": prewarm_input_sha,
+                                            "measured_input_sha256": measured_input_sha,
                                             "identity": identity, "action_count": len(all_rows),
-                                            "prewarm_action_count": len(prewarm_rows), "measured_action_count": len(measured_rows),
-                                            "stage_ledger_count": len(ledger), "deletion_control": {"status": "PASS", "returncode": control.returncode}})
+                                            "prewarm_action_count": len(prewarm), "measured_action_count": len(measured),
+                                            "stage_ledger_count": len(ledger),
+                                            "deletion_control": {"status": "PASS", "returncode": control.returncode}})
         return 0
+    except Hold as error:
+        print(f"HOLD: {error}", file=sys.stderr)
+        return 77
     except (OSError, StopIteration, ValueError, json.JSONDecodeError) as error:
         print(f"s7_warm_replay: {error}", file=sys.stderr)
         return 1
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

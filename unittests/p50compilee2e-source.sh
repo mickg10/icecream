@@ -64,6 +64,17 @@ contract() {
         return 1
     fi
     require_text "$root/client/remote.cpp" 'std::chrono::seconds(120)' || return 1
+    # S7 may retain each successful preprocessor output only when the runner
+    # opts in with a destination; the normal client path remains unchanged.
+    require_text "$root/client/remote.cpp" 'ICECC_P50_PREPROCESSED_CAPTURE' || return 1
+    require_text "$root/client/remote.cpp" 'retain_p50_preprocessed_capture' || return 1
+    require_text "$root/unittests/p50compilee2e-run.sh" 's7-$label-preprocessed.ii' || return 1
+    require_text "$root/unittests/p50compilee2e-run.sh" 's7-warm-c-action-trace.jsonl' || return 1
+    require_text "$root/unittests/p50compilee2e-run.sh" 's7-warm-f-action-trace.jsonl' || return 1
+    require_text "$root/unittests/p50compilee2e-run.sh" 'ICECC_P50_C_ACTION_TRACE=' || return 1
+    require_text "$root/unittests/p50compilee2e-run.sh" 'ICECC_P50_F_ACTION_TRACE=' || return 1
+    require_text "$root/unittests/p50compilee2e-run.sh" 's7-prewarm-c-action-trace.jsonl' || return 1
+    require_text "$root/unittests/p50compilee2e-run.sh" 's7-measured-f-action-trace.jsonl' || return 1
     require_text "$root/client/Makefile.am" 'libp50zstdsender.a' || return 1
     require_text "$root/client/Makefile.am" 'libp50localtransport.a' || return 1
     require_text "$root/client/Makefile.am" 'libprotocol50.a' || return 1
@@ -126,6 +137,15 @@ for pair in \
     "client/remote.cpp|F_DUPFD_CLOEXEC" \
     "client/Makefile.am|libp50localtransport.a" \
     "client/remote.cpp|std::chrono::seconds(120)" \
+    "client/remote.cpp|ICECC_P50_PREPROCESSED_CAPTURE" \
+    "client/remote.cpp|retain_p50_preprocessed_capture" \
+    "unittests/p50compilee2e-run.sh|s7-\$label-preprocessed.ii" \
+    "unittests/p50compilee2e-run.sh|s7-warm-c-action-trace.jsonl" \
+    "unittests/p50compilee2e-run.sh|s7-warm-f-action-trace.jsonl" \
+    "unittests/p50compilee2e-run.sh|ICECC_P50_C_ACTION_TRACE=" \
+    "unittests/p50compilee2e-run.sh|ICECC_P50_F_ACTION_TRACE=" \
+    "unittests/p50compilee2e-run.sh|s7-prewarm-c-action-trace.jsonl" \
+    "unittests/p50compilee2e-run.sh|s7-measured-f-action-trace.jsonl" \
     "client/Makefile.am|libp50zstdsender.a" \
     "cache/Makefile.am|libp50inputfd.a" \
     "cache/p50_cache_service.cpp|std::make_unique<P50ServerEndpoint>" \

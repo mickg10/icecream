@@ -342,6 +342,11 @@ def main(argv: list[str]) -> int:
         if produced_actions != expected_actions:
             raise ValueError("production replay differs from canonical live action trace")
         if warm:
+            for field in ("prewarm_action_trace", "measured_action_trace",
+                          "prewarm_c_action_trace", "prewarm_f_action_trace",
+                          "measured_c_action_trace", "measured_f_action_trace"):
+                if not isinstance(scenario.get(field), str):
+                    raise ValueError(f"warm scenario is missing explicit {field}")
             produced_prewarm = canonical_jsonl(prewarm_actions)
             produced_measured = canonical_jsonl(measured_actions)
             expected_prewarm = canonical_jsonl(

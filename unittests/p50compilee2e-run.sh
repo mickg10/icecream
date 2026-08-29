@@ -59,7 +59,7 @@ command -v bash >/dev/null 2>&1 || {
     exit 77
 }
 
-work=$(mktemp -d "${TMPDIR:-/tmp}/p50compilee2e.XXXXXX")
+work=$(CDPATH= cd -- "$(mktemp -d "${TMPDIR:-/tmp}/p50compilee2e.XXXXXX")" && pwd)
 # The scheduler changes to its configured service account before opening the
 # requested log.  Keep the test root traversable and pre-create only that log
 # as writable; the cache runtime and HOME below retain their own 0700 modes.
@@ -102,6 +102,11 @@ chmod 1777 "$work/envs-f" "$work/envs-c"
 chmod 0700 "$work/cache-runtime-f" "$work/cache-runtime-c" "$work/home"
 HOME="$work/home"
 export HOME
+# Action sinks are role-labelled absolute files.  The production daemons
+# inherit these existing sinks; the warm runner later attributes TU0/TU1 by
+# their captured session/transaction boundaries.
+c_action_trace="$work/s7-warm-c-action-trace.jsonl"
+f_action_trace="$work/s7-warm-f-action-trace.jsonl"
 pick_port_pair() {
     python3 - <<'PY'
 import secrets
@@ -292,6 +297,7 @@ kill -0 "$sched_pid" 2>/dev/null || {
 # This is the only F. The daemon itself must supervise and expose the actual
 # cache service required by the P50 path; the harness never starts a fake peer.
 ICECC_TEST_SOCKET="$work/worker.sock" ICECC_P50_C1F1_REQUIRED=1 \
+    ICECC_P50_C_ACTION_TRACE="$f_action_trace" ICECC_P50_F_ACTION_TRACE="$f_action_trace" \
     "$build/daemon/iceccd" "$@" -p "$port_worker" -m 1 \
     -s "127.0.0.1:$port_sched" -n "$network" -N p50-f \
     -b "$work/envs-f" -l "$work/f.log" -vvv \
@@ -300,6 +306,7 @@ ICECC_TEST_SOCKET="$work/worker.sock" ICECC_P50_C1F1_REQUIRED=1 \
 worker_pid=$!
 
 ICECC_TEST_SOCKET="$work/client.sock" ICECC_P50_C1F1_REQUIRED=1 \
+    ICECC_P50_C_ACTION_TRACE="$c_action_trace" ICECC_P50_F_ACTION_TRACE="$c_action_trace" \
     "$build/daemon/iceccd" "$@" --no-remote -m 0 \
     -s "127.0.0.1:$port_sched" -n "$network" -N p50-c \
     -b "$work/envs-c" -l "$work/c.log" -vvv \
@@ -378,6 +385,7 @@ compile_once() {
     else
         compile_include_args=""
     fi
+    preprocessed_capture="$work/s7-$label-preprocessed.ii"
     if test -n "$compile_db"; then
         # eval is needed to turn the safely shlex-quoted database tokens back
         # into argv. Export first: assignments before the special builtin
@@ -387,15 +395,18 @@ compile_once() {
         ICECC_TEST_REMOTEBUILD=1
         ICECC_VERSION="$envtar"
         ICECC_P50_C1F1_REQUIRED=1
+        ICECC_P50_PREPROCESSED_CAPTURE="$preprocessed_capture"
         ICECC_PREFERRED_HOST=p50-f
         ICECC_DEBUG=debug
         ICECC_LOGFILE="$client_log"
         export ICECC_TEST_SOCKET ICECC_TEST_REMOTEBUILD ICECC_VERSION \
-            ICECC_P50_C1F1_REQUIRED ICECC_PREFERRED_HOST ICECC_DEBUG ICECC_LOGFILE
+            ICECC_P50_C1F1_REQUIRED ICECC_P50_PREPROCESSED_CAPTURE \
+            ICECC_PREFERRED_HOST ICECC_DEBUG ICECC_LOGFILE
         eval "run_client_with_timeout g++ $remote_compile_args"
     else
         ICECC_TEST_SOCKET="$work/client.sock" ICECC_TEST_REMOTEBUILD=1 \
             ICECC_VERSION="$envtar" ICECC_P50_C1F1_REQUIRED=1 \
+            ICECC_P50_PREPROCESSED_CAPTURE="$preprocessed_capture" \
             ICECC_PREFERRED_HOST=p50-f ICECC_DEBUG=debug ICECC_LOGFILE="$client_log" \
             run_client_with_timeout g++ -std=c++17 -O2 -c \
             $compile_include_args "$work/src/main.cpp" -o "$remote_obj"
@@ -406,6 +417,10 @@ compile_once() {
         g++ -std=c++17 -O2 -c $compile_include_args \
             "$work/src/main.cpp" -o "$local_obj"
     fi
+    test -s "$preprocessed_capture" || {
+        echo "FAIL: completed $label preprocessor capture is missing" >&2
+        exit 1
+    }
     cmp -s "$remote_obj" "$local_obj" || {
         echo "FAIL: real P50 object differs from local reference ($label)" >&2
         exit 1
@@ -415,12 +430,46 @@ compile_once() {
 # Warm is a real two-transaction lifecycle: the prewarm transaction and the
 # measured transaction share the same scheduler, C/F daemons, cache service,
 # and input source.  The prewarm remains outside measured evidence.
+prewarm_c_trace="$work/s7-prewarm-c-action-trace.jsonl"
+prewarm_f_trace="$work/s7-prewarm-f-action-trace.jsonl"
+measured_c_trace="$work/s7-measured-c-action-trace.jsonl"
+measured_f_trace="$work/s7-measured-f-action-trace.jsonl"
 if test "$warm" = 1; then
     echo "S7_WARM_PREWARM_BEGIN"
     compile_once prewarm
+    test -s "$c_action_trace" && test -s "$f_action_trace" || {
+        echo "FAIL: prewarm product action traces are missing" >&2
+        exit 1
+    }
+    cp -- "$c_action_trace" "$prewarm_c_trace"
+    cp -- "$f_action_trace" "$prewarm_f_trace"
+    prewarm_c_lines=$(wc -l <"$c_action_trace")
+    prewarm_f_lines=$(wc -l <"$f_action_trace")
     echo "S7_WARM_PREWARM_COMPLETE"
 fi
 compile_once measured
+
+test -s "$c_action_trace" && test -s "$f_action_trace" || {
+    echo "FAIL: measured product action traces are missing" >&2
+    exit 1
+}
+if test "$warm" = 1; then
+    tail -n "+$((prewarm_c_lines + 1))" "$c_action_trace" >"$measured_c_trace"
+    tail -n "+$((prewarm_f_lines + 1))" "$f_action_trace" >"$measured_f_trace"
+else
+    cp -- "$c_action_trace" "$measured_c_trace"
+    cp -- "$f_action_trace" "$measured_f_trace"
+fi
+test -s "$measured_c_trace" && test -s "$measured_f_trace" || {
+    echo "FAIL: measured action-trace slice is empty" >&2
+    exit 1
+}
+echo "S7_PREWARM_INPUT=$work/s7-prewarm-preprocessed.ii"
+echo "S7_MEASURED_INPUT=$work/s7-measured-preprocessed.ii"
+echo "S7_PREWARM_C_ACTION_TRACE=$prewarm_c_trace"
+echo "S7_PREWARM_F_ACTION_TRACE=$prewarm_f_trace"
+echo "S7_MEASURED_C_ACTION_TRACE=$measured_c_trace"
+echo "S7_MEASURED_F_ACTION_TRACE=$measured_f_trace"
 
 # Positive evidence is mandatory. Absence of a local marker is not enough:
 # the route must identify ZSTD_ROUTE and cache-session handoff.  Legacy FileChunk

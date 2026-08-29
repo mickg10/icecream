@@ -158,11 +158,74 @@ private:
     bool linked_ = true;
 };
 
+/* The S7 runner may opt in to retaining the completed preprocessor output.
+   This is deliberately a client-only observation seam: production behavior
+   is unchanged when the variable is absent, while a configured destination
+   must be copied successfully before the normal unlink is allowed to proceed. */
+static bool retain_p50_preprocessed_capture(const char *source) noexcept
+{
+    const char *capture = ::getenv("ICECC_P50_PREPROCESSED_CAPTURE");
+    if (capture == nullptr)
+        return true;
+    if (*capture == '\0' || *capture != '/')
+        return false;
+
+    const int input = ::open(source, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (input < 0)
+        return false;
+    const int output = ::open(capture, O_WRONLY | O_CREAT | O_EXCL |
+                              O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (output < 0) {
+        (void)::close(input);
+        return false;
+    }
+    bool success = true;
+    char buffer[64 * 1024];
+    for (;;) {
+        const ssize_t read_bytes = ::read(input, buffer, sizeof(buffer));
+        if (read_bytes == 0)
+            break;
+        if (read_bytes < 0) {
+            if (errno == EINTR)
+                continue;
+            success = false;
+            break;
+        }
+        ssize_t written_total = 0;
+        while (written_total < read_bytes) {
+            const ssize_t written = ::write(output, buffer + written_total,
+                                            static_cast<size_t>(read_bytes - written_total));
+            if (written > 0) {
+                written_total += written;
+                continue;
+            }
+            if (written < 0 && errno == EINTR)
+                continue;
+            success = false;
+            break;
+        }
+        if (!success)
+            break;
+    }
+    if (success && ::fsync(output) != 0)
+        success = false;
+    if (::close(input) != 0)
+        success = false;
+    if (::close(output) != 0)
+        success = false;
+    if (!success)
+        (void)::unlink(capture);
+    return success;
+}
+
 icecc::p50::OwnedSourceFd prepare_complete_p50_source(
     CompileJob &job, const char *preproc_file, int &cpp_status)
 {
     cpp_status = 0;
     if (preproc_file != nullptr) {
+        if (!retain_p50_preprocessed_capture(preproc_file))
+            throw client_error(
+                11, "Error 11 - unable to retain configured preprocessed input");
         const int fd = ::open(preproc_file, O_RDONLY | O_CLOEXEC);
         if (fd < 0)
             throw client_error(11, "Error 11 - unable to open preprocessed file");
@@ -202,6 +265,10 @@ icecc::p50::OwnedSourceFd prepare_complete_p50_source(
                 "Error 103 - local cpp invocation failed, trying to recompile locally");
         return icecc::p50::OwnedSourceFd(-1);
     }
+
+    if (!retain_p50_preprocessed_capture(temporary.path()))
+        throw client_error(
+            11, "Error 11 - unable to retain configured preprocessed input");
 
     const int read_fd = ::open(temporary.path(), O_RDONLY | O_CLOEXEC);
     if (read_fd < 0)
@@ -1516,11 +1583,10 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon, const Environments &
 
         delete umsgs[0];
 
+        int ret = exit_codes[0];
         if (-1 == ::unlink(preproc)){
             log_perror("unlink failed") << "\t" << preproc << endl;
         }
-
-        int ret = exit_codes[0];
 
         delete [] umsgs;
         delete [] jobs;
