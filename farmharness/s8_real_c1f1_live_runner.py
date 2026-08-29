@@ -791,7 +791,10 @@ def _action_stage_paths(c_path: Path, f_path: Path, expected_count: int,
         f_row = f_by_digest.get(c_row["transaction_digest"])
         if f_row is None:
             _fail(f"action_trace:{index}:transaction_missing_on_F")
-        if index and int(c_row["tu_seq"]) != int(c_begins[index - 1]["tu_seq"]) + 1:
+        # Parallel relationships each maintain their own TU sequence; the
+        # global C trace is intentionally interleaved across those streams.
+        if (suite != PARALLEL_TOPOLOGY and index and
+                int(c_row["tu_seq"]) != int(c_begins[index - 1]["tu_seq"]) + 1):
             _fail(f"action_trace:{index}:sequence_not_contiguous")
         # The two role traces must describe the same transaction, not merely
         # the same long-lived service GUIDs.  Keep the F-side state digest as
