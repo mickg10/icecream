@@ -590,6 +590,145 @@ def _fields(stdout: str, prefix: str) -> list[dict[str, str]]:
     return result
 
 
+def _environment_preparation(stdout: str, work: Path, suite: str) -> dict[str, Any]:
+    """Authenticate real environment warmup and post-warmup sidecar rotation."""
+    expected_relationships = RELATIONSHIP_COUNT[suite]
+    rows = _fields(stdout, "S8_ENV_WARMUP")
+    if len(rows) != expected_relationships:
+        _fail("environment_preparation:warmup_count_mismatch")
+    seen: set[int] = set()
+    warmups: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        try:
+            relationship = int(row["relationship"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise LiveRunnerError(f"environment_preparation:{index}:field_invalid") from exc
+        if (relationship in seen or not 0 <= relationship < expected_relationships or
+                row.get("warmup_has_env") != "false" or
+                row.get("ready_has_env") != "true" or
+                row.get("preparation_measured") != "0" or
+                row.get("cache_state") != "pre_rotation" or
+                not SAFE.fullmatch(row.get("warmup_label", "")) or
+                not SAFE.fullmatch(row.get("ready_label", ""))):
+            _fail(f"environment_preparation:{index}:identity_invalid")
+        seen.add(relationship)
+        for label in (row["warmup_label"], row["ready_label"]):
+            log = work / f"client-compile-{label}.log"
+            try:
+                raw = log.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                raise LiveRunnerError(f"environment_preparation:{index}:warmup_log_missing") from exc
+            expected = "has env: false" if label == row["warmup_label"] else "has env: true"
+            if expected not in raw:
+                _fail(f"environment_preparation:{index}:has_env_evidence_missing")
+        warmups.append({"relationship": relationship, "warmup_label": row["warmup_label"],
+                        "ready_label": row["ready_label"], "measured": False,
+                        "cache_state": "pre_rotation"})
+    if seen != set(range(expected_relationships)):
+        _fail("environment_preparation:relationship_set_incomplete")
+    expected_rotations = expected_relationships + 1
+    rotations = _fields(stdout, "S8_SIDECAR_ROTATION")
+    if len(rotations) != expected_rotations:
+        _fail("environment_preparation:rotation_count_mismatch")
+    rotation_keys: set[tuple[str, int]] = set()
+    rotation_evidence: list[dict[str, Any]] = []
+    for index, row in enumerate(rotations):
+        role = row.get("role", "")
+        try:
+            relationship = int(row["relationship"])
+            before_pid = int(row["before_pid"])
+            after_pid = int(row["after_pid"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise LiveRunnerError(f"environment_preparation:rotation_{index}:field_invalid") from exc
+        key = (role, relationship)
+        if (role not in {"C", "F"} or key in rotation_keys or
+                before_pid <= 0 or after_pid <= 0 or before_pid == after_pid or
+                (role == "C" and relationship != 0) or
+                (role == "F" and not 0 <= relationship < expected_relationships)):
+            _fail(f"environment_preparation:rotation_{index}:identity_invalid")
+        guid_values = {}
+        for field in ("before_c_store_guid", "after_c_store_guid",
+                      "before_f_store_guid", "after_f_store_guid"):
+            value = row.get(field)
+            if not isinstance(value, str) or HEX32.fullmatch(value) is None or int(value, 16) == 0:
+                _fail(f"environment_preparation:rotation_{index}.{field}:invalid_guid")
+            guid_values[field] = value.lower()
+        before_c = guid_values["before_c_store_guid"]
+        after_c = guid_values["after_c_store_guid"]
+        before_f = guid_values["before_f_store_guid"]
+        after_f = guid_values["after_f_store_guid"]
+        if before_c == after_c or before_f == after_f:
+            _fail(f"environment_preparation:rotation_{index}:guid_did_not_rotate")
+        ready_path = work / ("ready-c.trace" if role == "C" else
+                             f"ready-f-{relationship}.trace" if expected_relationships > 1 else
+                             "ready-f.trace")
+        if not ready_path.is_file() or ready_path.is_symlink():
+            _fail(f"environment_preparation:rotation_{index}:ready_trace_missing")
+        raw = ready_path.read_text(encoding="ascii")
+        if (f"pid={before_pid}" not in raw or f"pid={after_pid}" not in raw or
+                f"C_STORE_GUID={before_c}" not in raw or f"C_STORE_GUID={after_c}" not in raw or
+                f"F_STORE_GUID={before_f}" not in raw or f"F_STORE_GUID={after_f}" not in raw):
+            _fail(f"environment_preparation:rotation_{index}:ready_trace_binding_invalid")
+        rotation_keys.add(key)
+        rotation_evidence.append({"role": role, "relationship": relationship,
+                                  "before_pid": before_pid, "after_pid": after_pid,
+                                  "before_c_store_guid": before_c, "after_c_store_guid": after_c,
+                                  "before_f_store_guid": before_f, "after_f_store_guid": after_f,
+                                  "ready_trace": str(ready_path.relative_to(work))})
+    expected_keys = ({("C", 0)} | {("F", relationship) for relationship in range(expected_relationships)})
+    if rotation_keys != expected_keys:
+        _fail("environment_preparation:rotation_set_incomplete")
+    post_ready = _fields(stdout, "S8_ENV_POST_ROTATION_READY")
+    if len(post_ready) != 1:
+        _fail("environment_preparation:post_rotation_ready_missing_or_duplicate")
+    try:
+        post_count = int(post_ready[0]["relationships"])
+        scheduler_offset = int(post_ready[0]["log_offset"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise LiveRunnerError("environment_preparation:post_rotation_ready_invalid") from exc
+    scheduler_log = work / "scheduler.log"
+    if (post_count != expected_relationships or scheduler_offset < 0 or
+            not scheduler_log.is_file() or scheduler_log.is_symlink()):
+        _fail("environment_preparation:post_rotation_ready_identity_invalid")
+    scheduler_tail = scheduler_log.read_bytes()[scheduler_offset:]
+    if expected_relationships == 1:
+        ready_matches = re.findall(rb"RELOGIN p50-f(?:\s|$).*cache=.*cache_profiles=", scheduler_tail)
+        if not ready_matches:
+            _fail("environment_preparation:post_rotation_ready_absent")
+    else:
+        ready_matches = set(re.findall(rb"RELOGIN (p50-f-[0-9]+).*cache=.*cache_profiles=", scheduler_tail))
+        expected_services = {f"p50-f-{relationship}".encode() for relationship in range(expected_relationships)}
+        if ready_matches != expected_services:
+            _fail("environment_preparation:post_rotation_ready_incomplete")
+    preparation = _fields(stdout, "S8_ENV_PREPARATION")
+    if len(preparation) != 1:
+        _fail("environment_preparation:summary_missing_or_duplicate")
+    summary = preparation[0]
+    try:
+        count = int(summary["relationships"])
+        archive_bytes = int(summary["archive_bytes"])
+        start_ns = int(summary["start_ns"])
+        end_ns = int(summary["end_ns"])
+        archive_sha = _hex(summary.get("archive_sha256"), "environment_preparation.archive_sha256")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise LiveRunnerError("environment_preparation:summary_invalid") from exc
+    if (count != expected_relationships or start_ns <= 0 or end_ns < start_ns or
+            archive_bytes <= 0 or summary.get("measured") != "0" or
+            summary.get("cache_state") != "rotated"):
+        _fail("environment_preparation:summary_identity_invalid")
+    if len(_fields(stdout, "S8_ENV_MEASURED_NO_INSTALL")) != 1:
+        _fail("environment_preparation:measured_install_guard_missing")
+    rotation_evidence.sort(key=lambda item: (item["role"], item["relationship"]))
+    warmups.sort(key=lambda item: item["relationship"])
+    return {"relationships": count, "archive_sha256": archive_sha,
+            "archive_bytes": archive_bytes, "preparation_start_ns": start_ns,
+            "preparation_end_ns": end_ns, "measured": False,
+            "cache_state": "rotated", "warmups": warmups,
+            "sidecar_rotations": rotation_evidence,
+            "post_rotation_ready": {"relationships": post_count,
+                                     "scheduler_log_offset": scheduler_offset}}
+
+
 def _binary_identity(stdout: str) -> dict[str, str]:
     binaries: dict[str, str] = {}
     for row in _fields(stdout, "S8_BINARY"):
@@ -1127,6 +1266,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     )
     if scheduling_marker not in stdout.splitlines():
         _fail("product_run:scheduling_identity_missing")
+    environment_preparation = _environment_preparation(stdout, work, suite)
     expected_binaries = _binary_identity(stdout)
     commit, tree, binaries, runner_sha = product_identity(product_root)
     if binaries != expected_binaries:
@@ -1204,6 +1344,9 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
         if not path.is_file():
             _fail(f"action_trace:retained_file_missing:{path.name}")
         shutil.copy2(path, retained / path.name)
+    for path in sorted(work.glob("ready-*.trace")) + sorted(work.glob("s8-environment-warmup-*.jsonl")):
+        if path.is_file() and not path.is_symlink():
+            shutil.copy2(path, retained / path.name)
     service_map_raw = b""
     if suite == PARALLEL_TOPOLOGY:
         service_map_path = work / "s8-f-service-map.tsv"
@@ -1329,6 +1472,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                       },
                       "state_carrying_repeat": passes == 2,
                       "measurement_window": "compile+result_return",
+                      "environment_preparation": environment_preparation,
                       "prewarm": prewarm_descriptor,
                       "evidence": {"results": {"path": "results.jsonl", "sha256": hashlib.sha256(summary_raw).hexdigest(), "bytes": len(summary_raw)},
                                    "timing": {"path": "timing.jsonl", "sha256": hashlib.sha256(timing_raw).hexdigest(), "bytes": len(timing_raw)}},
@@ -1390,6 +1534,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                   },
                   "binary_sha256": binaries, "source_commit": commit, "source_tree": tree,
                   "runner_sha256": runner_sha,
+                  "environment_preparation": environment_preparation,
                   "launch_identity": launch_identity,
                   "curve_manifests": manifests, "remote_compile_required": True,
                   "batch_windows": batch_windows,

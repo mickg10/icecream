@@ -215,6 +215,56 @@ def test_per_tu_profile_evidence_is_required(tmp_path: Path) -> None:
         runner._validate_product_log_evidence(tmp_path, observation, "P29")
 
 
+def test_environment_preparation_requires_each_private_relationship(tmp_path: Path) -> None:
+    work = tmp_path / "p50compilee2e.ready"
+    work.mkdir()
+    digest = "a" * 64
+    stdout = ""
+    for relationship in range(20):
+        warmup, ready = f"env-warm-{relationship}", f"env-ready-{relationship}"
+        (work / f"client-compile-{warmup}.log").write_text("has env: false\n")
+        (work / f"client-compile-{ready}.log").write_text("has env: true\n")
+        stdout += (f"S8_ENV_WARMUP relationship={relationship} warmup_label={warmup} "
+                   f"ready_label={ready} warmup_has_env=false ready_has_env=true "
+                   "preparation_measured=0 cache_state=pre_rotation\n")
+    def frame(pid: int, c_guid: str, f_guid: str) -> str:
+        return (f"READY v2 generation=1 attempt={pid} pid={pid} "
+                f"C_STORE_GUID={c_guid} F_STORE_GUID={f_guid}\n")
+    rotations = []
+    for role, relationship in [("C", 0)] + [("F", index) for index in range(20)]:
+        before_pid, after_pid = 1000 + relationship, 2000 + relationship
+        before_c, after_c = f"{relationship + 1:032x}", f"{relationship + 101:032x}"
+        before_f, after_f = f"{relationship + 201:032x}", f"{relationship + 301:032x}"
+        path = work / ("ready-c.trace" if role == "C" else f"ready-f-{relationship}.trace")
+        path.write_text(frame(before_pid, before_c, before_f) + frame(after_pid, after_c, after_f))
+        rotations.append(
+            f"S8_SIDECAR_ROTATION role={role} relationship={relationship} "
+            f"before_pid={before_pid} after_pid={after_pid} "
+            f"before_c_store_guid={before_c} after_c_store_guid={after_c} "
+            f"before_f_store_guid={before_f} after_f_store_guid={after_f}\n")
+    stdout += "".join(rotations)
+    old_ready = "".join(f"RELOGIN p50-f-{relationship} cache=old cache_profiles=zstd_tu\n"
+                         for relationship in range(20))
+    new_ready = "".join(f"RELOGIN p50-f-{relationship} cache=new cache_profiles=zstd_tu\n"
+                         for relationship in range(20))
+    (work / "scheduler.log").write_bytes((old_ready + new_ready).encode())
+    stdout += f"S8_ENV_POST_ROTATION_READY relationships=20 log_offset={len(old_ready.encode())}\n"
+    stdout += ("S8_ENV_PREPARATION relationships=20 archive_sha256=" + digest +
+               " archive_bytes=31 start_ns=10 end_ns=20 measured=0 cache_state=rotated\n"
+               "S8_ENV_MEASURED_NO_INSTALL checked=1\n")
+    preparation = runner._environment_preparation(stdout, work, runner.PARALLEL_TOPOLOGY)
+    assert preparation["relationships"] == 20
+    assert preparation["measured"] is False
+    assert preparation["cache_state"] == "rotated"
+    (work / "scheduler.log").write_bytes(old_ready.encode())
+    with pytest.raises(runner.LiveRunnerError, match="post_rotation_ready_incomplete"):
+        runner._environment_preparation(stdout, work, runner.PARALLEL_TOPOLOGY)
+    missing = "\n".join(line for line in stdout.splitlines()
+                       if not line.startswith("S8_ENV_WARMUP relationship=19")) + "\n"
+    with pytest.raises(runner.LiveRunnerError, match="warmup_count_mismatch"):
+        runner._environment_preparation(missing, work, runner.PARALLEL_TOPOLOGY)
+
+
 def test_parallel_cache_session_evidence_comes_from_observed_f_log(tmp_path: Path) -> None:
     (tmp_path / "client-compile-full-1-0.log").write_text("ZSTD_ROUTE\n")
     (tmp_path / "f-7.log").write_text("CACHE_SESSION\n")
@@ -413,6 +463,12 @@ def test_batch_shell_excludes_warm_prewarm_and_carries_optional_repeat() -> None
     assert 'C1F20/40) relationship_count=20; slots_per_f=2; execution_slots=40' in shell
     assert '"$build/daemon/iceccd" "$@" -p "$worker_port" -m 2' in shell
     assert '"$work/envs-f-$relationship"' in shell
+    assert 'S8_ENV_WARMUP relationship=$relationship' in shell
+    assert 'S8_ENV_PREPARATION relationships=$environment_warmup_count' in shell
+    assert 'S8_SIDECAR_ROTATION role=$sidecar_role' in shell
+    assert 'scheduler_rotation_offset=$(stat -c %s "$work/scheduler.log")' in shell
+    assert 'S8_ENV_POST_ROTATION_READY relationships=$ready_count' in shell
+    assert 'S8_ENV_MEASURED_NO_INSTALL checked=1' in shell
     assert 'S8_BATCH_WINDOW run=%s start_ns=%s end_ns=%s' in shell
     assert 'run_one "$run_label" "$ordinal" "$relationship" "$f_slot"' in shell
     assert "physical_slot_observed=0" in shell

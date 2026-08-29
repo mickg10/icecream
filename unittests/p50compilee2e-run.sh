@@ -423,6 +423,11 @@ if slots != {(relationship, slot) for relationship in range(20) for slot in rang
     raise SystemExit("topology does not bind both slots of every F relationship")
 PY
 fi
+printf '%s\n' \
+    '#include <cstdint>' \
+    'int p50_environment_readiness_translation_unit() {' \
+    '    return static_cast<int>(UINT32_C(51));' \
+    '}' >"$work/src/environment-readiness.cpp"
 if test -n "$batch_manifest" || test -n "$compile_db" || test -n "$compile_source"; then
     if test -z "$batch_manifest"; then
         test -n "$compile_db" && test -n "$compile_source" || {
@@ -487,11 +492,20 @@ fi
 (cd "$work/toolchain" && timeout "$timeout_s" \
     bash "$build/client/icecc-create-env" "$(command -v g++)" \
     >"$work/create-env.log" 2>&1)
-envtar=$(find "$work/toolchain" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)
+envtar=$(find "$work/toolchain" -maxdepth 1 -type f \( \
+    -name '*.tar.gz' -o -name '*.tar.xz' -o -name '*.tar.zst' -o \
+    -name '*.tar.bz2' -o -name '*.tgz' -o -name '*.tar' \
+    \) -print -quit)
 test -n "$envtar" || {
     echo "FAIL: real icecc-create-env produced no compiler environment" >&2
     exit 1
 }
+
+# Keep the archive identity available for the real environment transfer below.
+# The daemon owns installation and verification; its startup cleanup therefore
+# cannot erase a preparation tree before the live client exercises it.
+envtar_sha256=$(sha256sum "$envtar" | awk '{print $1}')
+envtar_bytes=$(stat -c %s "$envtar")
 
 # A root container still runs the production daemon's normal privilege drop.
 # Let an explicit test account own the private tree so the daemon can create
@@ -537,6 +551,7 @@ if test "$suite" = C1F20/40; then
         f_trace="$work/s7-warm-f-action-trace-$relationship.jsonl"
         ICECC_TEST_SOCKET="$work/worker-$relationship.sock" ICECC_P50_C1F1_REQUIRED=1 \
             ICECC_P50_C_ACTION_TRACE="$f_trace" ICECC_P50_F_ACTION_TRACE="$f_trace" \
+            ICECC_P50_TEST_READY_TRACE="$work/ready-f-$relationship.trace" \
         ICECC_P50_RELATIONSHIP="$relationship" \
             "$build/daemon/iceccd" "$@" -p "$worker_port" -m 2 \
             -s "127.0.0.1:$port_sched" -n "$network" -N "p50-f-$relationship" \
@@ -549,6 +564,7 @@ if test "$suite" = C1F20/40; then
 else
     ICECC_TEST_SOCKET="$work/worker.sock" ICECC_P50_C1F1_REQUIRED=1 \
         ICECC_P50_C_ACTION_TRACE="$f_action_trace" ICECC_P50_F_ACTION_TRACE="$f_action_trace" \
+        ICECC_P50_TEST_READY_TRACE="$work/ready-f.trace" \
         "$build/daemon/iceccd" "$@" -p "$port_worker" -m 1 \
         -s "127.0.0.1:$port_sched" -n "$network" -N p50-f \
         -b "$work/envs-f" -l "$work/f.log" -vvv \
@@ -560,6 +576,7 @@ fi
 
 ICECC_TEST_SOCKET="$work/client.sock" ICECC_P50_C1F1_REQUIRED=1 \
     ICECC_P50_C_ACTION_TRACE="$c_action_trace" ICECC_P50_F_ACTION_TRACE="$c_action_trace" \
+    ICECC_P50_TEST_READY_TRACE="$work/ready-c.trace" \
     "$build/daemon/iceccd" "$@" --no-remote -m 0 \
     -s "127.0.0.1:$port_sched" -n "$network" -N p50-c \
     -b "$work/envs-c" -l "$work/c.log" -vvv \
@@ -652,6 +669,86 @@ done
 test "$cache_ready" -eq 1 || {
     echo "FAIL: production F cache endpoint was not advertised READY" >&2
     exit 1
+}
+
+ready_snapshot() {
+    ready_path=$1
+    ready_fields=$(awk '
+        /^READY v2 / {
+            pid = c = f = ""
+            for (i = 1; i <= NF; ++i) {
+                split($i, field, "=")
+                if (field[1] == "pid") pid = field[2]
+                if (field[1] == "C_STORE_GUID") c = field[2]
+                if (field[1] == "F_STORE_GUID") f = field[2]
+            }
+            if (pid != "" && c != "" && f != "") last = pid " " c " " f
+        }
+        END { if (last == "") exit 1; print last }
+    ' "$ready_path") || return 1
+    set -- $ready_fields
+    ready_pid=$1
+    ready_c_guid=$2
+    ready_f_guid=$3
+}
+
+restart_cache_sidecar() {
+    sidecar_role=$1
+    sidecar_relationship=$2
+    old_pid=$3
+    sidecar_parent=$4
+    ready_path=$5
+    ready_before=$(grep -c '^READY v2 ' "$ready_path" 2>/dev/null || true)
+    ready_snapshot "$ready_path" || {
+        echo "FAIL: missing pre-rotation READY identity ($sidecar_role-$sidecar_relationship)" >&2
+        exit 1
+    }
+    before_pid=$ready_pid
+    before_c_guid=$ready_c_guid
+    before_f_guid=$ready_f_guid
+    kill -9 "$old_pid"
+    replacement=
+    for _ in $(seq 1 300); do
+        replacement=$(ps -eo pid=,ppid=,args= | awk -v parent="$sidecar_parent" \
+            -v exe="$build/cache/icecc-cache-service" \
+            '$2 == parent && index($0, exe) > 0 { print $1; exit }')
+        if test -n "$replacement" && test "$replacement" != "$old_pid"; then
+            break
+        fi
+        sleep 0.1
+    done
+    test -n "$replacement" && test "$replacement" != "$old_pid" || {
+        echo "FAIL: cache sidecar did not restart ($sidecar_role-$sidecar_relationship)" >&2
+        exit 1
+    }
+    replacement_ready=0
+    for _ in $(seq 1 300); do
+        ready_now=$(grep -c '^READY v2 ' "$ready_path" 2>/dev/null || true)
+        if test "${ready_now:-0}" -gt "${ready_before:-0}"; then
+            replacement_ready=1
+            break
+        fi
+        sleep 0.1
+    done
+    test "$replacement_ready" -eq 1 || {
+        echo "FAIL: replacement cache sidecar did not publish READY ($sidecar_role-$sidecar_relationship)" >&2
+        exit 1
+    }
+    ready_snapshot "$ready_path" || {
+        echo "FAIL: replacement READY identity is malformed ($sidecar_role-$sidecar_relationship)" >&2
+        exit 1
+    }
+    test "$ready_pid" = "$replacement" || {
+        echo "FAIL: READY pid does not bind replacement sidecar ($sidecar_role-$sidecar_relationship)" >&2
+        exit 1
+    }
+    test "$before_pid" != "$ready_pid" && test "$before_c_guid" != "$ready_c_guid" && \
+        test "$before_f_guid" != "$ready_f_guid" || {
+        echo "FAIL: sidecar identity did not rotate ($sidecar_role-$sidecar_relationship)" >&2
+        exit 1
+    }
+    echo "S8_SIDECAR_ROTATION role=$sidecar_role relationship=$sidecar_relationship before_pid=$before_pid after_pid=$ready_pid before_c_store_guid=$before_c_guid after_c_store_guid=$ready_c_guid before_f_store_guid=$before_f_guid after_f_store_guid=$ready_f_guid"
+    sidecar_replacement=$replacement
 }
 
 compile_once() {
@@ -769,6 +866,110 @@ service_map.write_text("".join(f"{relationship}\t{service}\t{guid}\n"
                        encoding="ascii")
 PY
 }
+
+# Exercise the daemon-owned environment transfer before measurement.  The
+# second assignment to each relationship must report that its environment is
+# already installed; setup cache state is discarded by rotating only the
+# sidecars below.
+environment_preparation_start_ns=$(date +%s%N)
+environment_warmup_count=0
+environment_warmup_c_trace="$work/s8-environment-warmup-c-action-trace.jsonl"
+if test "$suite" = C1F20/40; then
+    for relationship in $(seq 0 19); do
+        compile_once "env-warm-$relationship" "$work/src/environment-readiness.cpp" "" "" "" "$relationship" 0 ""
+        grep -F 'has env: false' "$work/client-compile-env-warm-$relationship.log" >/dev/null || {
+            echo "FAIL: F environment was not installed by the first real assignment ($relationship)" >&2
+            exit 1
+        }
+        compile_once "env-ready-$relationship" "$work/src/environment-readiness.cpp" "" "" "" "$relationship" 0 ""
+        grep -F 'has env: true' "$work/client-compile-env-ready-$relationship.log" >/dev/null || {
+            echo "FAIL: environment-bearing assignment was not observed ($relationship)" >&2
+            exit 1
+        }
+        echo "S8_ENV_WARMUP relationship=$relationship warmup_label=env-warm-$relationship ready_label=env-ready-$relationship warmup_has_env=false ready_has_env=true preparation_measured=0 cache_state=pre_rotation"
+        environment_warmup_count=$((environment_warmup_count + 1))
+    done
+else
+    compile_once env-warm "$work/src/environment-readiness.cpp" "" "" "" 0 0 ""
+    grep -F 'has env: false' "$work/client-compile-env-warm.log" >/dev/null || {
+        echo "FAIL: F environment was not installed by the first real assignment" >&2
+        exit 1
+    }
+    compile_once env-ready "$work/src/environment-readiness.cpp" "" "" "" 0 0 ""
+    grep -F 'has env: true' "$work/client-compile-env-ready.log" >/dev/null || {
+        echo "FAIL: environment-bearing assignment was not observed" >&2
+        exit 1
+    }
+    echo "S8_ENV_WARMUP relationship=0 warmup_label=env-warm ready_label=env-ready warmup_has_env=false ready_has_env=true preparation_measured=0 cache_state=pre_rotation"
+    environment_warmup_count=1
+fi
+cp -- "$c_action_trace" "$environment_warmup_c_trace"
+if test "$suite" = C1F20/40; then
+    for relationship in $(seq 0 19); do
+        cp -- "$work/s7-warm-f-action-trace-$relationship.jsonl" \
+            "$work/s8-environment-warmup-f-action-trace-$relationship.jsonl"
+    done
+else
+    cp -- "$f_action_trace" "$work/s8-environment-warmup-f-action-trace.jsonl"
+fi
+
+scheduler_rotation_offset=$(stat -c %s "$work/scheduler.log")
+if test "$suite" = C1F20/40; then
+    for relationship in $(seq 0 19); do
+        worker_for_relationship=$(printf '%s\n' "$worker_pids" | awk -v n="$relationship" '{print $(n + 1)}')
+        service_for_relationship=$(ps -eo pid=,ppid=,args= | awk -v parent="$worker_for_relationship" \
+            -v exe="$build/cache/icecc-cache-service" '$2 == parent && index($0, exe) > 0 { print $1; exit }')
+        test -n "$service_for_relationship" || { echo "FAIL: F sidecar disappeared before rotation ($relationship)" >&2; exit 1; }
+        restart_cache_sidecar F "$relationship" "$service_for_relationship" "$worker_for_relationship" \
+            "$work/ready-f-$relationship.trace"
+    done
+    restart_cache_sidecar C 0 "$client_service_pid" "$client_pid" "$work/ready-c.trace"
+else
+    restart_cache_sidecar F 0 "$service_pid" "$worker_pid" "$work/ready-f.trace"
+    service_pid=$sidecar_replacement
+    restart_cache_sidecar C 0 "$client_service_pid" "$client_pid" "$work/ready-c.trace"
+fi
+
+post_rotation_ready=0
+for _ in $(seq 1 30); do
+    if test "$suite" = C1F20/40; then
+        ready_count=$(tail -c +$((scheduler_rotation_offset + 1)) "$work/scheduler.log" | \
+            grep -E "RELOGIN p50-f-[0-9]+.*cache=.*cache_profiles=.*$profile_advertisement" | \
+            grep -oE 'p50-f-[0-9]+' | sort -u | wc -l)
+        test "$ready_count" -ge 20 && post_rotation_ready=1 && break
+    elif tail -c +$((scheduler_rotation_offset + 1)) "$work/scheduler.log" | \
+            grep -E "RELOGIN p50-f.*cache=.*cache_profiles=.*$profile_advertisement" >/dev/null 2>&1; then
+        ready_count=1
+        post_rotation_ready=1
+        break
+    fi
+    sleep 1
+done
+test "$post_rotation_ready" -eq 1 || {
+    echo "FAIL: rotated cache endpoints were not advertised READY" >&2
+    exit 1
+}
+echo "S8_ENV_POST_ROTATION_READY relationships=$ready_count log_offset=$scheduler_rotation_offset"
+
+if test "$suite" = C1F20/40; then
+    for relationship in $(seq 0 19); do
+        stat -c %s "$work/f-$relationship.log" >"$work/f-measured-log-offset-$relationship"
+    done
+else
+    stat -c %s "$work/f.log" >"$work/f-measured-log-offset-0"
+fi
+
+: >"$c_action_trace"
+if test "$suite" = C1F20/40; then
+    for relationship in $(seq 0 19); do
+        : >"$work/s7-warm-f-action-trace-$relationship.jsonl"
+    done
+else
+    : >"$f_action_trace"
+fi
+environment_preparation_end_ns=$(date +%s%N)
+echo "S8_ENV_PREPARATION relationships=$environment_warmup_count archive_sha256=$envtar_sha256 archive_bytes=$envtar_bytes start_ns=$environment_preparation_start_ns end_ns=$environment_preparation_end_ns measured=0 cache_state=rotated"
+
 if test -n "$batch_manifest"; then
     mkdir -p "$work/active"
     mkdir -p "$work/input-ready"
@@ -1149,6 +1350,25 @@ else
     fi
     compile_once measured
 fi
+
+if test "$suite" = C1F20/40; then
+    for relationship in $(seq 0 19); do
+        measured_offset=$(cat "$work/f-measured-log-offset-$relationship")
+        if tail -c +$((measured_offset + 1)) "$work/f-$relationship.log" | \
+                grep -E 'start_install_environment|handle_transfer_env' >/dev/null 2>&1; then
+            echo "FAIL: measured compile attempted environment installation ($relationship)" >&2
+            exit 1
+        fi
+    done
+else
+    measured_offset=$(cat "$work/f-measured-log-offset-0")
+    if tail -c +$((measured_offset + 1)) "$work/f.log" | \
+            grep -E 'start_install_environment|handle_transfer_env' >/dev/null 2>&1; then
+        echo "FAIL: measured compile attempted environment installation" >&2
+        exit 1
+    fi
+fi
+echo "S8_ENV_MEASURED_NO_INSTALL checked=1"
 
 test -s "$c_action_trace" && test -s "$f_action_trace" || {
     echo "FAIL: measured product action traces are missing" >&2
