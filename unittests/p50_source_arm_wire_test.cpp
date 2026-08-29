@@ -252,6 +252,13 @@ void test_roundtrip_and_exact_echo()
     REQUIRE(!make_pair(PROTOCOL_VERSION).left->send_msg(
                 P50SourceArmMsg(p29_mode_mismatch)),
             "source-arm rejects a P29/GRZ mode mismatch");
+#if defined(ICECC_P50_WITH_LIBBSC)
+    P50SourceArmFields grz = request.arm;
+    grz.cache_profile = CACHE_PROFILE_GRZ;
+    grz.source_mode = P50_SOURCE_MODE_GRZ_RESIDUAL;
+    REQUIRE(make_pair(PROTOCOL_VERSION).left->send_msg(P50SourceArmMsg(grz)),
+            "source-arm accepts the exact dependency-enabled GRZ profile/mode pair");
+#endif
     delete request_base;
     delete reply_base;
 }

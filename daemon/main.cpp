@@ -9021,6 +9021,8 @@ bool Daemon::handle_p50_source_arm(Client *client, P50SourceArmMsg *msg)
     };
 
     if (msg == nullptr || !msg->valid_payload()) {
+        log_warning() << "P50 source arm rejected before admission: invalid payload"
+                      << endl;
         return reject(nullptr, 147);
     }
 
@@ -9030,11 +9032,21 @@ bool Daemon::handle_p50_source_arm(Client *client, P50SourceArmMsg *msg)
         !client->source_wrapper_provenance_valid() ||
         cache_adapter == nullptr || !scheduler_session_active ||
         !cache_advertisement_snapshot().present()) {
+        log_warning() << "P50 source arm rejected before admission: daemon state"
+                      << " status=" << static_cast<unsigned>(client->status)
+                      << " retained=" << client->p50_source_arm_fields.has_value()
+                      << " provenance=" << client->source_wrapper_provenance_valid()
+                      << " adapter=" << (cache_adapter != nullptr)
+                      << " scheduler=" << scheduler_session_active
+                      << " advertisement="
+                      << cache_advertisement_snapshot().present() << endl;
         return reject(&arm, 147);
     }
 
     const auto& current_lease = cache_adapter->outer_current_ready_lease();
     if (!current_lease.has_value() || !current_lease->valid()) {
+        log_warning() << "P50 source arm rejected before admission: no current ready lease"
+                      << endl;
         return reject(&arm, 147);
     }
     const auto& lease = *current_lease;
@@ -9055,6 +9067,30 @@ bool Daemon::handle_p50_source_arm(Client *client, P50SourceArmMsg *msg)
         arm.c_store_derivation_version != lease.store_derivation_version ||
         icecc::p50::store_identity_file_guid_matches_client(
             arm.c_store_guid, lease.f_store_guid.bytes)) {
+        log_warning() << "P50 source arm rejected before admission: binding mismatch"
+                      << " host=" << (arm.selected_f_host == remote_name)
+                      << " ordinary_port="
+                      << (arm.selected_f_ordinary_port ==
+                          static_cast<uint32_t>(daemon_port))
+                      << " endpoint_port="
+                      << (arm.selected_f_cache_port == snapshot.endpoint_port)
+                      << " protocol=" << (arm.cache_protocol == snapshot.protocol)
+                      << " profile="
+                      << p50_source_profile_selection_valid(arm.cache_profile)
+                      << " mode="
+                      << p50_source_profile_mode_valid(arm.cache_profile,
+                                                       arm.source_mode)
+                      << " advertised="
+                      << ((snapshot.profile_mask & arm.cache_profile) != 0)
+                      << " derivation="
+                      << (arm.c_store_derivation_version ==
+                          lease.store_derivation_version)
+                      << " distinct_store="
+                      << !icecc::p50::store_identity_file_guid_matches_client(
+                             arm.c_store_guid, lease.f_store_guid.bytes)
+                      << " selected_profile=" << arm.cache_profile
+                      << " source_mode=" << arm.source_mode
+                      << " profile_mask=" << snapshot.profile_mask << endl;
         return reject(&arm, 147);
     }
 
@@ -9063,6 +9099,8 @@ bool Daemon::handle_p50_source_arm(Client *client, P50SourceArmMsg *msg)
     // disconnect/HUP/expiry can use the same exact scheduler JobDone path.
     if (!authorize_source_arm_claim(
             arm, static_cast<uint32_t>(client->client_id))) {
+        log_warning() << "P50 source arm rejected before admission: assignment claim"
+                      << endl;
         return reject(&arm, 147);
     }
     client->job_id = arm.wire_job_id;
@@ -9075,6 +9113,8 @@ bool Daemon::handle_p50_source_arm(Client *client, P50SourceArmMsg *msg)
 
     if (next_p50_arm_observation_id == 0 ||
         next_p50_arm_observation_id == UINT64_MAX) {
+        log_warning() << "P50 source arm rejected before admission: observation id exhausted"
+                      << endl;
         finish_assignment_claim(arm.wire_job_id);
         return reject(&arm, 147);
     }
@@ -9084,6 +9124,8 @@ bool Daemon::handle_p50_source_arm(Client *client, P50SourceArmMsg *msg)
     if (budget_msec == 0 || now > UINT64_MAX - budget_msec ||
         !client->arm_p50_source(
             arm, lease, observation, now + budget_msec)) {
+        log_warning() << "P50 source arm rejected before admission: arm installation"
+                      << " budget_msec=" << budget_msec << endl;
         finish_assignment_claim(arm.wire_job_id);
         return reject(&arm, 147);
     }
