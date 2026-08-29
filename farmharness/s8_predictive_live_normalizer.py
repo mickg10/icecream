@@ -42,6 +42,7 @@ IDENTITY_KEYS = {
     "corpus", "profile", "regime", "split", "run_id", "source_commit",
     "source_tree", "input_digest", "topology_digest", "model_id",
 }
+JOIN_IDENTITY_KEYS = IDENTITY_KEYS - {"model_id"}
 REQUIRED_UNITS_KEYS = {"point", "channel_bytes", "elapsed_ns"}
 THROUGHPUT_UNITS_KEY = "throughput_bytes_per_s"
 UNIT_KEY_OPTIONS = {
@@ -390,7 +391,11 @@ def _load_manifest(path: Path, mode: str) -> dict[str, object]:
 
 
 def _same_identity(left: dict[str, str], right: dict[str, str]) -> None:
-    for field in IDENTITY_KEYS:
+    # The prediction and the observation are produced independently.  Their
+    # cell/run/source/input/topology identities must be identical, while the
+    # predictor version and live-observation producer identifier must remain
+    # distinct and truthful.
+    for field in JOIN_IDENTITY_KEYS:
         if left[field] != right[field]:
             raise NormalizationError(f"identity_mismatch:{field}")
 

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from s8_first_triple_driver import DriverError, run
+from s8_first_triple_driver import DriverError, _normalizer_curve, run
 from s8_predictive_engine import (MANIFEST_SCHEMA, SEMANTICS, TOPOLOGY_SCHEMA,
                                   canonical_bytes, predict)
 from s8_live_metric_producer import produce
@@ -134,6 +134,7 @@ def _producer_package(root: Path, payload: bytes, topology_raw: bytes) -> Path:
         "schema": "icecream-s7-live-cell-v1", "cell": "fmt/ZSTD_TU/cold",
         "status": "PASS", "live_status": "PASS", "acceptance_status": "PASS",
         "conformance_status": "PASS",
+        "binary_sha256": {"client": "c" * 64},
         "measured": {"input_sha256": hashlib.sha256(payload).hexdigest()},
     }
     results = canonical_bytes(summary) + b"\n"
@@ -168,6 +169,9 @@ def test_driver_uses_shared_normalizer_for_scored_records(tmp_path: Path) -> Non
     records = [json.loads(line) for line in (experiment / "records.jsonl").read_bytes().splitlines()]
     assert [record["record_type"] for record in records] == ["predictive_sim", "live", "comparison"]
     assert records[2]["loss_curve"]
+    assert records[0]["model_id"] == "s8-causal-performance-v2"
+    assert records[1]["model_id"] == "fmt-zstd-tu-cold-v1"
+    assert records[2]["model_id"] == "s8-causal-performance-v2"
     assert records[2]["point_errors"]
     assert (experiment / "live_summary.jsonl").read_bytes() == live_raw
     assert json.loads((experiment / "experiment_manifest.json").read_bytes())["comparison_scored"] is True
@@ -201,6 +205,28 @@ def test_driver_accepts_actual_live_metric_producer_curve_contract(tmp_path: Pat
         expected_window
     )
     assert records[2]["loss_curve"]
+    assert records[0]["model_id"] == "s8-causal-performance-v2"
+    assert records[1]["model_id"] == "s7-live-observed"
+    assert records[2]["model_id"] == "s8-causal-performance-v2"
+
+
+def test_predictive_wait_window_is_cumulative_across_tus(tmp_path: Path) -> None:
+    rows = [
+        {"step": 0, "tu_id": "tu-0",
+         "cumulative": {"channel_bytes": 10},
+         "elapsed_ns": {"compile": 2, "result_return": 3}},
+        {"step": 1, "tu_id": "tu-1",
+         "cumulative": {"channel_bytes": 30},
+         "elapsed_ns": {"compile": 4, "result_return": 6}},
+    ]
+    raw = b"".join(canonical_bytes(row) + b"\n" for row in rows)
+    path = tmp_path / "projected.jsonl"
+    _normalizer_curve(raw, path)
+    projected = [json.loads(line) for line in path.read_bytes().splitlines()]
+    assert [row["cumulative"]["elapsed_ns"] for row in projected] == [5, 15]
+    assert [row["cumulative"]["throughput_bytes_per_s"] for row in projected] == [
+        2_000_000_000.0, 2_000_000_000.0,
+    ]
 
 
 @pytest.mark.parametrize(

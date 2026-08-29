@@ -100,6 +100,16 @@ def test_identity_and_units_are_bound_exactly(tmp_path: Path) -> None:
         normalize(predictive, live, tmp_path / "out.jsonl")
 
 
+def test_predictor_and_live_producer_ids_remain_distinct(tmp_path: Path) -> None:
+    live_identity = dict(IDENTITY)
+    live_identity["model_id"] = "s7-live-observed"
+    predictive, live = _pair(tmp_path, live_identity=live_identity)
+    records = normalize(predictive, live, tmp_path / "out.jsonl")
+    assert records[0]["model_id"] == IDENTITY["model_id"]
+    assert records[1]["model_id"] == "s7-live-observed"
+    assert records[2]["model_id"] == IDENTITY["model_id"]
+
+
 @pytest.mark.parametrize(
     "cell", DECLARED_CELLS,
     ids=lambda value: f"{value['corpus']}-{value['profile']}-{value['regime']}",

@@ -199,6 +199,7 @@ def _normalizer_curve(predictive_raw: bytes, path: Path) -> tuple[bytes, str]:
         return value
 
     rows: list[dict[str, object]] = []
+    cumulative_elapsed_ns = 0
     for number, line in enumerate(predictive_raw.splitlines(), 1):
         try:
             value = normalizer.parse_json(line, f"predictive_curve:{number}")
@@ -216,18 +217,19 @@ def _normalizer_curve(predictive_raw: bytes, path: Path) -> tuple[bytes, str]:
         elapsed_components = value.get("elapsed_ns")
         if not isinstance(elapsed_components, dict):
             raise DriverError("predictive_curve:elapsed_components:missing")
-        elapsed_ns = sum(nonnegative_int(elapsed_components.get(component),
-                                         f"elapsed_ns.{component}")
-                         for component in LIVE_ELAPSED_COMPONENTS)
-        if elapsed_ns == 0:
+        point_elapsed_ns = sum(nonnegative_int(elapsed_components.get(component),
+                                               f"elapsed_ns.{component}")
+                               for component in LIVE_ELAPSED_COMPONENTS)
+        if point_elapsed_ns == 0:
             raise DriverError("predictive_curve:elapsed_ns:must_be_positive")
-        throughput = (channel_bytes * 1_000_000_000) / elapsed_ns
+        cumulative_elapsed_ns += point_elapsed_ns
+        throughput = (channel_bytes * 1_000_000_000) / cumulative_elapsed_ns
         if not math.isfinite(throughput) or throughput < 0:
             raise DriverError("predictive_curve:throughput_bytes_per_s:invalid")
         rows.append({"step": value["step"], "tu_id": value["tu_id"],
                      "cumulative": {
                          "channel_bytes": channel_bytes,
-                         "elapsed_ns": elapsed_ns,
+                         "elapsed_ns": cumulative_elapsed_ns,
                          "throughput_bytes_per_s": throughput,
                      }})
     if not rows:
@@ -299,6 +301,14 @@ def run(manifest: Path, live_package: Path, live_manifest: Path | None,
             predictive_raw, normalizer_curve_path)
         identity = {key: str(value) for key, value in live_identity.items()}
         identity["topology_digest"] = topology_facts["sha256"]
+        predictor = predictive_sidecar.get("predictor")
+        model_id = predictor.get("version") if isinstance(predictor, dict) else None
+        if (not isinstance(model_id, str) or not model_id or
+                any(character not in
+                    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-"
+                    for character in model_id)):
+            raise DriverError("predictive_model_id:invalid")
+        identity["model_id"] = model_id
         predictive_manifest_path = experiment / "predictive_curve_manifest.json"
         _write_new(predictive_manifest_path,
                    _curve_manifest(predictive_manifest_path, normalizer_curve_path,
