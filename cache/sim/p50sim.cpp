@@ -141,6 +141,14 @@ ProfileId selected_profile() {
         return ProfileId::ZSTD_TU;
     if (value == "ZSTD_ROUTE")
         return ProfileId::Z3_LONG;
+    if (value == "GRZ" || value == "GRZ_RESIDUAL") {
+#if defined(ICECC_P50_WITH_LIBBSC)
+        return ProfileId::GRZ;
+#else
+        throw std::invalid_argument(
+            "GRZ_RESIDUAL requires a simulator built with --with-libbsc");
+#endif
+    }
     throw std::invalid_argument("unsupported ICECC_P50_PROFILE: " + value);
 }
 
