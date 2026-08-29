@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "icecream-s8-expanded-campaign-v1",
+  "type": "object",
+  "required": ["schema", "timestamp", "execution", "corpus_authority", "methods", "topologies", "depths", "regimes", "images", "prerequisites", "counts", "descriptors"],
+  "properties": {
+    "schema": {"const": "icecream-s8-expanded-campaign-v1"},
+    "timestamp": {"type": "string", "pattern": "^[0-9]{8}T[0-9]{6}Z$"},
+    "execution": {"type": "object", "required": ["mode", "commands_emitted", "required_producer_capability"], "properties": {"mode": {"const": "declarative_only"}, "commands_emitted": {"const": false}, "required_producer_capability": {"const": "icecream.s8.native-live-runner-v1"}}},
+    "methods": {"type": "array", "minItems": 7, "maxItems": 7},
+    "depths": {"const": ["100", "200", "full-1", "state-carrying full-2"]},
+    "regimes": {"const": ["cold", "warm"]},
+    "counts": {"type": "object", "required": ["historical_image_seven_method_grid", "current_image_implemented_subset_theoretical", "current_image_implemented_subset"]},
+    "descriptors": {"type": "object", "required": ["path", "bytes", "sha256", "count"]}
+  }
+}
