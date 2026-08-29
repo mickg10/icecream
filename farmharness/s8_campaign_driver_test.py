@@ -158,14 +158,9 @@ def test_full_campaign_stages_and_retains_two_plan_bound_segments(tmp_path: Path
         commands = json.loads((attempt / "commands.json").read_text())
         assert [item["stage"] for item in commands["predictive_plan"]] == [
             "predictive_plan_full_1", "predictive_plan_full_2"]
-        if state["cell"]["regime"] == "cold":
-            assert "--repeat-plan" in commands["predictive_producer"]["argv"]
-            assert "--output-dir" not in commands["predictive_producer"]["argv"]
-            assert len(state["result"]["segments"]) == 2
-        else:
-            assert "--repeat-plan" not in commands["predictive_producer"]["argv"]
-            assert "--output-dir" in commands["predictive_producer"]["argv"]
-            assert len(state["result"]["segments"]) == 1
+        assert "--repeat-plan" in commands["predictive_producer"]["argv"]
+        assert "--output-dir" not in commands["predictive_producer"]["argv"]
+        assert len(state["result"]["segments"]) == 2
         assert commands["live"]["run"]["argv"][commands["live"]["run"]["argv"].index("--passes") + 1] == "2"
         assert len(state["result"]["plans"]) == 2
         assert all(item["artifacts"] for item in state["result"]["segments"])

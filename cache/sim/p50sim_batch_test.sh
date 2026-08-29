@@ -69,3 +69,16 @@ rows = [json.loads(line) for line in open(sys.argv[1])]
 assert [row["segment"] for row in rows] == ["full-1", "full-1", "full-2", "full-2"]
 assert rows[2]["tu_seq"] == 2 and rows[2]["state_before_digest"] == rows[1]["state_digest"]
 PY
+
+ICECC_P50_PROFILE=ZSTD_ROUTE "$sim" --batch-manifest "$work/manifest" \
+    --batch-assignment-map "$work/map1" --batch-manifest-2 "$work/manifest" \
+    --batch-assignment-map-2 "$work/map1" --batch-manifest-3 "$work/manifest" \
+    --batch-assignment-map-3 "$work/map1" --batch-output "$work/warm-pair.jsonl"
+python3 - "$work/warm-pair.jsonl" <<'PY'
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1])]
+assert [row["segment"] for row in rows] == [
+    "prewarm", "prewarm", "full-1", "full-1", "full-2", "full-2"]
+assert rows[2]["state_before_digest"] == rows[1]["state_digest"]
+assert rows[4]["state_before_digest"] == rows[3]["state_digest"]
+PY

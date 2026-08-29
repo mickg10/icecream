@@ -186,7 +186,9 @@ def _source_commands(cell_dir: Path, cell: dict[str, str], *, depth: str,
                      "--product-build-root", str(product_root)]
     plan_commands: list[dict[str, object]] = []
     result_dirs = [result_dir]
-    paired_full = depth == "full" and cell["regime"] == "cold"
+    # The producer owns the warm lifecycle too: warm full is an authenticated
+    # prewarm followed by scored full-1/full-2 in one paired product process.
+    paired_full = depth == "full"
     if depth == "full":
         repeat_plan = attempt / "depth-plan-full-2.json"
         repeat_result = attempt / f"s8-{_slug(cell)}-{campaign_stamp}-full-2"

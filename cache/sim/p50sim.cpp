@@ -137,8 +137,10 @@ struct Arguments {
     HistoryNonce history_nonce{1};
     std::string batch_manifest;
     std::string batch_manifest_2;
+    std::string batch_manifest_3;
     std::string batch_assignment_map;
     std::string batch_assignment_map_2;
+    std::string batch_assignment_map_3;
     std::string batch_output;
 };
 
@@ -212,10 +214,14 @@ Arguments parse(int argc, char** argv) {
             result.batch_manifest = argv[++index];
         else if (option == "--batch-manifest-2")
             result.batch_manifest_2 = argv[++index];
+        else if (option == "--batch-manifest-3")
+            result.batch_manifest_3 = argv[++index];
         else if (option == "--batch-assignment-map")
             result.batch_assignment_map = argv[++index];
         else if (option == "--batch-assignment-map-2")
             result.batch_assignment_map_2 = argv[++index];
+        else if (option == "--batch-assignment-map-3")
+            result.batch_assignment_map_3 = argv[++index];
         else if (option == "--batch-output")
             result.batch_output = argv[++index];
         else
@@ -223,8 +229,10 @@ Arguments parse(int argc, char** argv) {
     }
     const bool batch = !result.batch_manifest.empty() ||
                        !result.batch_manifest_2.empty() ||
+                       !result.batch_manifest_3.empty() ||
                        !result.batch_assignment_map.empty() ||
                        !result.batch_assignment_map_2.empty() ||
+                       !result.batch_assignment_map_3.empty() ||
                        !result.batch_output.empty();
     if (batch) {
         if (result.batch_manifest.empty() || result.batch_assignment_map.empty() ||
@@ -239,6 +247,12 @@ Arguments parse(int argc, char** argv) {
             result.batch_assignment_map_2 = result.batch_assignment_map;
         if (result.batch_manifest_2.empty() && !result.batch_assignment_map_2.empty())
             throw std::invalid_argument("--batch-assignment-map-2 requires --batch-manifest-2");
+        if (!result.batch_manifest_3.empty() && result.batch_assignment_map_3.empty())
+            result.batch_assignment_map_3 = result.batch_assignment_map;
+        if (result.batch_manifest_3.empty() && !result.batch_assignment_map_3.empty())
+            throw std::invalid_argument("--batch-assignment-map-3 requires --batch-manifest-3");
+        if (!result.batch_manifest_3.empty() && result.batch_manifest_2.empty())
+            throw std::invalid_argument("--batch-manifest-3 requires --batch-manifest-2");
         return result;
     }
     const bool warm = !result.prewarm_input.empty() || !result.measured_input.empty() ||
@@ -515,6 +529,8 @@ void run_batch(const Arguments& arguments) {
         arguments.batch_assignment_map, first.size(), &relationship_count);
     std::vector<std::string> second;
     std::vector<size_t> second_assignments;
+    std::vector<std::string> third;
+    std::vector<size_t> third_assignments;
     if (!arguments.batch_manifest_2.empty()) {
         second = read_batch_manifest(arguments.batch_manifest_2);
         size_t second_relationship_count = 0;
@@ -525,6 +541,17 @@ void run_batch(const Arguments& arguments) {
         if (second_assignments.size() != first_assignments.size() ||
             second_assignments != first_assignments)
             throw std::invalid_argument("repeat segment assignment map differs from segment one");
+    }
+    if (!arguments.batch_manifest_3.empty()) {
+        third = read_batch_manifest(arguments.batch_manifest_3);
+        size_t third_relationship_count = 0;
+        third_assignments = read_batch_assignments(
+            arguments.batch_assignment_map_3, third.size(), &third_relationship_count);
+        if (third_relationship_count != relationship_count)
+            throw std::invalid_argument("third segment relationship cardinality differs");
+        if (third_assignments.size() != first_assignments.size() ||
+            third_assignments != first_assignments)
+            throw std::invalid_argument("third segment assignment map differs from segment one");
     }
     std::ofstream output(arguments.batch_output, std::ios::binary | std::ios::trunc);
     if (!output)
@@ -600,9 +627,15 @@ void run_batch(const Arguments& arguments) {
             }
         }
     };
-    process("full-1", first, first_assignments);
-    if (!second.empty())
-        process("full-2", second, second_assignments);
+    if (!third.empty()) {
+        process("prewarm", first, first_assignments);
+        process("full-1", second, second_assignments);
+        process("full-2", third, third_assignments);
+    } else {
+        process("full-1", first, first_assignments);
+        if (!second.empty())
+            process("full-2", second, second_assignments);
+    }
 }
 
 }  // namespace

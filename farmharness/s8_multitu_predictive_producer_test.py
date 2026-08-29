@@ -203,7 +203,7 @@ def test_warm_curve_excludes_authenticated_prewarm_and_carries_boundary(tmp_path
     assert rows[0]["cumulative"]["C_TO_F_bytes"] == rows[0]["channel_bytes"]["C_TO_F"]
 
 
-def test_warm_repeat_pair_fails_closed_without_three_native_segments(tmp_path: Path) -> None:
+def test_warm_repeat_pair_retains_prewarm_and_two_scored_segments(tmp_path: Path) -> None:
     root, source_manifest = _source(tmp_path / "source", 3)
     matrix = tmp_path / "matrix.json"
     _matrix(matrix)
@@ -219,8 +219,20 @@ def test_warm_repeat_pair_fails_closed_without_three_native_segments(tmp_path: P
     _write(repeat_path, canonical_bytes(repeat) + b"\n")
     manifest = _template(tmp_path / "template-warm-pair",
                          {"corpus": "DuckDB", "profile": "ZSTD_ROUTE", "regime": "warm"})
-    with pytest.raises(MultiTUPredictiveError, match="warm_preload_requires_three_segments"):
-        _produce_pair(full_path, repeat_path, manifest)
+    full_result, repeat_result = _produce_pair(full_path, repeat_path, manifest)
+    assert full_result["excluded_prewarms"]
+    assert repeat_result["excluded_prewarms"]
+    full_rows = [json.loads(line) for line in
+                 (full_dir / "predictive_sim.jsonl").read_text().splitlines()]
+    repeat_rows = [json.loads(line) for line in
+                   (repeat_dir / "predictive_sim.jsonl").read_text().splitlines()]
+    assert len(full_rows) == len(repeat_rows) == 3
+    assert full_rows[0]["step"] == repeat_rows[0]["step"] == 0
+    assert full_rows[0]["cumulative"]["C_TO_F_bytes"] == full_rows[0]["channel_bytes"]["C_TO_F"]
+    assert repeat_rows[0]["product_completion"]["state_before_digest"] == \
+        full_rows[-1]["product_completion"]["state_after_digest"]
+    assert full_result["paired_continuation"] is False
+    assert repeat_result["paired_continuation"] is True
 
 
 def test_relationship_state_route_reuses_identical_tu_but_tu_profile_resets(tmp_path: Path) -> None:

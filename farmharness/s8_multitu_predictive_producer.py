@@ -503,14 +503,25 @@ def _product_rows(simulator: Path, inputs: list[dict[str, object]], assignments:
                   relationship_count: int, cell: dict[str, str], model_id: str,
                   topology_digest: str, assignment_map: Path | None,
                   second_inputs: list[dict[str, object]] | None = None,
-                  second_assignments: list[int] | None = None) -> list[list[dict[str, object]]]:
-    """Run the exact product endpoint batch and project only authenticated rows."""
+                  second_assignments: list[int] | None = None,
+                  third_inputs: list[dict[str, object]] | None = None,
+                  third_assignments: list[int] | None = None) -> list[list[dict[str, object]]]:
+    """Run the exact product endpoint batch and project authenticated rows.
+
+    Two manifests are scored full-1/full-2.  With ``third_inputs`` the first
+    manifest is an excluded warm prewarm and the latter two are scored.
+    """
     with tempfile.TemporaryDirectory(prefix="s8-p50batch-") as scratch:
         if any("\n" in str(item["path"]) or "\r" in str(item["path"]) for item in inputs) or \
                 (second_inputs is not None and any("\n" in str(item["path"]) or
                                                     "\r" in str(item["path"])
-                                                    for item in second_inputs)):
+                                                    for item in second_inputs)) or \
+                (third_inputs is not None and any("\n" in str(item["path"]) or
+                                                   "\r" in str(item["path"])
+                                                   for item in third_inputs)):
             raise MultiTUPredictiveError("product_simulator:input_path_contains_newline")
+        if third_inputs is not None and second_inputs is None:
+            raise MultiTUPredictiveError("product_simulator:third_segment_requires_second")
         manifest = Path(scratch) / "segment-1.manifest"
         manifest.write_text("".join(str(item["path"]) + "\n" for item in inputs), encoding="utf-8")
         mapping = Path(scratch) / "segment-1.assignment"
@@ -529,11 +540,22 @@ def _product_rows(simulator: Path, inputs: list[dict[str, object]], assignments:
                                 "".join(str(value) + "\n" for value in values2), encoding="ascii")
             command += ["--batch-manifest-2", str(manifest2),
                         "--batch-assignment-map-2", str(mapping2)]
+        if third_inputs is not None:
+            manifest3 = Path(scratch) / "segment-3.manifest"
+            manifest3.write_text("".join(str(item["path"]) + "\n" for item in third_inputs),
+                                 encoding="utf-8")
+            mapping3 = Path(scratch) / "segment-3.assignment"
+            values3 = third_assignments if third_assignments is not None else assignments
+            mapping3.write_text("cardinality=" + str(relationship_count) + "\n" +
+                                "".join(str(value) + "\n" for value in values3), encoding="ascii")
+            command += ["--batch-manifest-3", str(manifest3),
+                        "--batch-assignment-map-3", str(mapping3)]
         env = os.environ.copy()
         env["ICECC_P50_PROFILE"] = cell["profile"]
         try:
             timeout_seconds = _batch_timeout_seconds(
-                len(inputs) + (len(second_inputs) if second_inputs is not None else 0))
+                len(inputs) + (len(second_inputs) if second_inputs is not None else 0) +
+                (len(third_inputs) if third_inputs is not None else 0))
             completed = subprocess.run(command, env=env, stdin=subprocess.DEVNULL,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                        check=False, timeout=timeout_seconds)
@@ -545,7 +567,9 @@ def _product_rows(simulator: Path, inputs: list[dict[str, object]], assignments:
         raw, facts = _snapshot(output, "product_batch_output", MAX_PRODUCT_OUTPUT_BYTES)
         if facts["bytes"] == 0:
             raise MultiTUPredictiveError("product_simulator:empty_output")
-        segments: list[list[dict[str, object]]] = [[], [] if second_inputs is not None else []]
+        segment_labels = (["prewarm", "full-1", "full-2"] if third_inputs is not None else
+                          ["full-1", "full-2"])
+        segments: list[list[dict[str, object]]] = [[] for _ in segment_labels]
         for line_number, line in enumerate(raw.splitlines(), 1):
             value = _parse(line, f"product_batch_output:{line_number}")
             if not isinstance(value, dict) or value.get("schema") != "icecream-p50sim-batch-v1":
@@ -553,11 +577,15 @@ def _product_rows(simulator: Path, inputs: list[dict[str, object]], assignments:
             if value.get("profile") != cell["profile"]:
                 raise MultiTUPredictiveError("product_simulator:profile_mismatch")
             segment = value.get("segment")
-            if segment not in ("full-1", "full-2"):
+            if segment not in segment_labels:
                 raise MultiTUPredictiveError("product_simulator:segment_invalid")
-            bucket = 0 if segment == "full-1" else 1
+            bucket = segment_labels.index(str(segment))
             segments[bucket].append(value)
-        expected = [len(inputs), len(second_inputs) if second_inputs is not None else 0]
+        expected = [len(inputs)]
+        if second_inputs is not None:
+            expected.append(len(second_inputs))
+        if third_inputs is not None:
+            expected.append(len(third_inputs))
         previous_by_relationship: dict[str, int] = {}
         state_by_relationship: dict[str, str] = {}
         c_guids: set[str] = set()
@@ -572,7 +600,9 @@ def _product_rows(simulator: Path, inputs: list[dict[str, object]], assignments:
                         row["tu_seq"] <= previous_seq or row.get("committed") is not True:
                     raise MultiTUPredictiveError("product_simulator:order_or_commit_invalid")
                 previous_by_relationship[str(relationship_id)] = row["tu_seq"]
-                item = (inputs if bucket == 0 else second_inputs)[ordinal]
+                segment_inputs = (inputs, second_inputs, third_inputs)[bucket]
+                assert segment_inputs is not None
+                item = segment_inputs[ordinal]
                 if row.get("raw_bytes") != item["bytes"]:
                     raise MultiTUPredictiveError("product_simulator:raw_size_mismatch")
                 _raw_after, facts_after = _snapshot(Path(item["path"]),
@@ -585,11 +615,13 @@ def _product_rows(simulator: Path, inputs: list[dict[str, object]], assignments:
                     raise MultiTUPredictiveError("product_simulator:raw_digest_invalid")
                 if _product_digest128(_raw_after) != row["raw_digest"]:
                     raise MultiTUPredictiveError("product_simulator:raw_digest_binding_invalid")
+                segment_assignments = (assignments, second_assignments, third_assignments)[bucket]
+                assert segment_assignments is not None
                 if row.get("relationship_id") != (
-                        f"c1f{relationship_count}-r{(assignments if bucket == 0 else second_assignments)[ordinal]:02d}"):
+                        f"c1f{relationship_count}-r{segment_assignments[ordinal]:02d}"):
                     raise MultiTUPredictiveError(
                         f"product_simulator:relationship_identity_invalid:{row.get('relationship_id')}"
-                        f"!=c1f{relationship_count}-r{(assignments if bucket == 0 else second_assignments)[ordinal]:02d}")
+                        f"!=c1f{relationship_count}-r{segment_assignments[ordinal]:02d}")
                 if (not isinstance(row.get("c_store_guid"), str) or
                         len(row["c_store_guid"]) != 32 or
                         not isinstance(row.get("f_store_guid"), str) or
@@ -1013,7 +1045,12 @@ def produce_pair(first_plan_path: Path, repeat_plan_path: Path, engine_manifest:
                  calibration_bundle: Path | None = None,
                  assignment_map: Path | None = None,
                  sim_binary: Path | None = None) -> tuple[dict[str, object], dict[str, object]]:
-    """Run full-1 and repeat-full in one process with shared codec contexts."""
+    """Run scored full-1/full-2 in one process with shared codec contexts.
+
+    Warm cells prepend an authenticated, excluded prewarm segment.  The batch
+    simulator emits that segment as ``prewarm`` followed by the two scored
+    segments; only the latter are projected into the two retained curves.
+    """
     first, cell, first_inputs, first_facts = _validate_plan(first_plan_path)
     repeat, repeat_cell, repeat_inputs, repeat_facts = _validate_plan(repeat_plan_path)
     if first["request"]["depth"] != "full" or repeat["request"]["depth"] != "repeat-full":
@@ -1022,8 +1059,6 @@ def produce_pair(first_plan_path: Path, repeat_plan_path: Path, engine_manifest:
         raise MultiTUPredictiveError("repeat_full:paired_input_identity_mismatch")
     if first["source_manifest"] != repeat["source_manifest"]:
         raise MultiTUPredictiveError("repeat_full:paired_source_manifest_mismatch")
-    if cell["regime"] == "warm":
-        raise MultiTUPredictiveError("repeat_full:warm_preload_requires_three_segments")
     scheduling, assignments, relationship_count = _validate_scheduling(first, first_inputs)
     repeat_scheduling, repeat_assignments, repeat_relationship_count = _validate_scheduling(
         repeat, repeat_inputs)
@@ -1056,32 +1091,46 @@ def produce_pair(first_plan_path: Path, repeat_plan_path: Path, engine_manifest:
     if assignment_facts is None:
         assignment_facts = {"authority": "authenticated_plan_scheduling",
                             "sha256": assignment_digest}
-    product_segments = _product_rows(simulator, first_inputs, product_assignments,
-                                     relationship_count, cell, model_id, topology_digest,
-                                     assignment_map, repeat_inputs, product_assignments)
+    warm = cell["regime"] == "warm"
+    product_segments = _product_rows(
+        simulator, first_inputs, product_assignments, relationship_count, cell, model_id,
+        topology_digest, assignment_map,
+        first_inputs if warm else repeat_inputs, product_assignments,
+        repeat_inputs if warm else None, product_assignments if warm else None)
     relationship_states: dict[str, dict[str, object]] = {}
+    first_cumulative = {"C_TO_F_bytes": 0, "F_TO_C_bytes": 0,
+                        "channel_bytes": 0, "elapsed_ns": 0}
+    excluded_prewarms: list[dict[str, object]] = []
+    first_segment = 0
+    if warm:
+        prewarm_cumulative = {"C_TO_F_bytes": 0, "F_TO_C_bytes": 0,
+                              "channel_bytes": 0, "elapsed_ns": 0}
+        _product_curve_rows(product_segments[0], first_inputs, cell, model_id,
+                            topology_digest, topology, calibration, prewarm_cumulative,
+                            scheduling, relationship_states)
+        excluded_prewarms = [_excluded_prewarm(product_segments[0], first_inputs)]
+        first_segment = 1
     first_rows = _product_curve_rows(
-        product_segments[0], first_inputs, cell, model_id, topology_digest, topology, calibration,
-        {"C_TO_F_bytes": 0, "F_TO_C_bytes": 0, "channel_bytes": 0, "elapsed_ns": 0},
-        scheduling,
-        relationship_states)
+        product_segments[first_segment], first_inputs, cell, model_id, topology_digest,
+        topology, calibration, first_cumulative, scheduling, relationship_states)
+    repeat_segment = first_segment + 1
+    repeat_cumulative = {"C_TO_F_bytes": 0, "F_TO_C_bytes": 0,
+                         "channel_bytes": 0, "elapsed_ns": 0}
     repeat_rows = _product_curve_rows(
-        product_segments[1], repeat_inputs, cell, model_id, topology_digest, topology, calibration,
-        {"C_TO_F_bytes": 0, "F_TO_C_bytes": 0, "channel_bytes": 0, "elapsed_ns": 0},
-        scheduling,
-        relationship_states)
+        product_segments[repeat_segment], repeat_inputs, cell, model_id, topology_digest,
+        topology, calibration, repeat_cumulative, scheduling, relationship_states)
     first_producer = _emit_product_segment(
         first, first_facts, first_dir, first_rows, cell, source_commit, source_tree,
         input_digest, topology_digest, model_id, assignment_facts, relationship_count,
         simulator_facts, assignment_digest, str(first["source_manifest"]["sha256"]),
-        scheduling, _batch_timeout_seconds(len(first_inputs) + len(repeat_inputs)), build_root,
-        build_facts, [], False, True)
+        scheduling, _batch_timeout_seconds(len(first_inputs) * (3 if warm else 2)), build_root,
+        build_facts, excluded_prewarms, False, True)
     repeat_producer = _emit_product_segment(
         repeat, repeat_facts, repeat_dir, repeat_rows, cell, source_commit, source_tree,
         input_digest, topology_digest, model_id, assignment_facts, relationship_count,
         simulator_facts, assignment_digest, str(first["source_manifest"]["sha256"]),
-        scheduling, _batch_timeout_seconds(len(first_inputs) + len(repeat_inputs)), build_root,
-        build_facts, [], True, True)
+        scheduling, _batch_timeout_seconds(len(first_inputs) * (3 if warm else 2)), build_root,
+        build_facts, excluded_prewarms, True, True)
     return first_producer, repeat_producer
 
 def _write_new(path: Path, raw: bytes, label: str) -> None:
