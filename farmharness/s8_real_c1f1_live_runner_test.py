@@ -465,6 +465,35 @@ def test_parallel_topology_binds_all_relationships_and_slots(tmp_path: Path) -> 
         runner.load_topology(topology, rows, runner.PARALLEL_TOPOLOGY)
 
 
+def test_parallel_topology_must_match_predictive_schedule(tmp_path: Path) -> None:
+    batch = _batch(tmp_path, 40)
+    rows = runner.load_batch_manifest(batch, 40)
+    topology = tmp_path / "parallel-topology.json"
+    assignments = [
+        {"ordinal": index, "tu_id": row["tu_id"],
+         "relationship": index // 2, "f_slot": index % 2}
+        for index, row in enumerate(rows)
+    ]
+    topology.write_text(json.dumps({
+        "schema": "icecream-s8-topology-assignment-v1",
+        "suite": runner.PARALLEL_TOPOLOGY,
+        "assignments": assignments,
+    }))
+    scheduling = {
+        "topology": "C1F20",
+        "assignments": [
+            {"ordinal": index, "global_slot": index,
+             "f_relationship": index // 2, "per_f_slot": index % 2}
+            for index in range(40)
+        ],
+    }
+    assert len(runner.load_topology(
+        topology, rows, runner.PARALLEL_TOPOLOGY, scheduling)) == 64
+    scheduling["assignments"][1]["per_f_slot"] = 0
+    with pytest.raises(runner.LiveRunnerError, match="predictive_schedule_mismatch"):
+        runner.load_topology(topology, rows, runner.PARALLEL_TOPOLOGY, scheduling)
+
+
 def test_parallel_batch_window_requires_real_overlap() -> None:
     rows = [{} for _ in range(40)]
     observations = []
