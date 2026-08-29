@@ -43,7 +43,6 @@ OBSERVATIONS_SCHEMA = "icecream-s8-predictive-performance-v2"
 ARTIFACT_SCHEMA = "icecream-s8-predictive-artifact-v3"
 HEX64 = set("0123456789abcdef")
 MAX_INPUT_BYTES = 64 * 1024 * 1024
-CURVE_CHUNK_BYTES = 16 * 1024
 
 # This is the predeclared model.  Keeping coefficients in source makes the
 # model immutable and reviewable; the topology declaration is the per-run
@@ -310,8 +309,12 @@ def _predict_curve(raw: bytes, topology: dict[str, object], cell: dict[str, str]
     channel_model = CHANNEL_MODELS[t["cache_channel"]]
     cumulative_c_to_f = cumulative_f_to_c = cumulative_elapsed = 0
     rows: list[dict[str, object]] = []
-    chunks = [raw[offset:offset + CURVE_CHUNK_BYTES]
-              for offset in range(0, len(raw), CURVE_CHUNK_BYTES)] or [b""]
+    # Live evidence is observed at the translation-unit boundary.  Preserve
+    # that measurement unit here: subdividing one authenticated .ii into
+    # artificial byte ranges would create predictive points for which no
+    # independent live observation exists and would make the loss curve
+    # impossible to score honestly.
+    chunks = [raw]
     for step, chunk in enumerate(chunks):
         raw_size, entropy, transitions = _payload_stats(chunk)
         # The authenticated input byte count is already the corpus size.  Do

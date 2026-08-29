@@ -94,6 +94,19 @@ def test_trace_free_producer_emits_raw_cumulative_curve(tmp_path: Path) -> None:
     assert sidecar["predictor"]["action_trace_input"] is False
 
 
+def test_one_authenticated_tu_emits_one_scored_point(tmp_path: Path) -> None:
+    payload = bytes(range(256)) * 256
+    manifest, _input, _topology = _scenario(tmp_path, payload)
+    output = tmp_path / "curve.jsonl"
+    sidecar = predict(manifest, output)
+    rows = output.read_text(encoding="utf-8").splitlines()
+    assert len(rows) == 1
+    row = json.loads(rows[0])
+    assert row["step"] == 0
+    assert row["features"]["raw_input_bytes"] == len(payload)
+    assert sidecar["provenance"]["curve_points"] == 1
+
+
 @pytest.mark.parametrize("cell", DECLARED_CELLS,
                          ids=lambda value: f"{value['corpus']}-{value['profile']}-{value['regime']}")
 def test_every_declared_cell_produces_modeled_curve(tmp_path: Path,
