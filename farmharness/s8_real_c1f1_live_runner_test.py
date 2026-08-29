@@ -363,6 +363,7 @@ def test_batch_shell_excludes_warm_prewarm_and_carries_optional_repeat() -> None
     assert 'cp -- "$predictive_path" "$staged"' in shell
     assert 'compile_args_for "$item_compile_db" "$item_compile_source" "$item_compile_output" "$input_path" "$remote_obj"' in shell
     assert 'input-ready/$run_label-$relationship-$ordinal' in shell
+    assert "source committed for P50 CompileFile" in shell
     assert 'while test -e "$marker"; do sleep 0.005; done' in shell
     assert "grep -oE 'p50-f-[0-9]+' | sort -u | wc -l" in shell
 

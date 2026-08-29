@@ -779,13 +779,23 @@ if test -n "$batch_manifest"; then
         compile_pid=$!
         preprocessed_capture="$work/s7-$run_label-$ordinal-preprocessed.ii"
         # ICECC_P50_PREPROCESSED_CAPTURE is written immediately before the
-        # exact .ii is attached to the live transaction.  This is the
-        # relationship's source-admission witness; waiting for it does not
-        # wait for compile/result completion.
+        # exact .ii is attached to the live transaction.  Then wait for the
+        # product's explicit source-commit witness.  This bounds the C
+        # sidecar's pending admission queue without waiting for compile/result
+        # completion.
         while test ! -s "$preprocessed_capture"; do
             if ! kill -0 "$compile_pid" 2>/dev/null; then
                 wait "$compile_pid" || true
                 echo "FAIL: compile ended before authenticated input-ready ($run_label-$ordinal)" >&2
+                return 1
+            fi
+            sleep 0.005
+        done
+        while ! grep -Fq 'source committed for P50 CompileFile' \
+                "$work/client-compile-$run_label-$ordinal.log"; do
+            if ! kill -0 "$compile_pid" 2>/dev/null; then
+                wait "$compile_pid" || true
+                echo "FAIL: compile ended before product source commit ($run_label-$ordinal)" >&2
                 return 1
             fi
             sleep 0.005
