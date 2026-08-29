@@ -68,6 +68,48 @@ def canonical_jsonl(path: Path) -> list[dict[str, object]]:
     return rows
 
 
+def write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
+    with path.open("wb") as stream:
+        for row in rows:
+            stream.write(json.dumps(row, sort_keys=True, separators=(",", ":")).encode())
+            stream.write(b"\n")
+
+
+def stage_ledger(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Project the product trace to the exact byte-bearing stage ledger."""
+    return [{
+        "sequence": sequence,
+        "action": row.get("action"),
+        "actor": row.get("actor"),
+        "stage_bytes": row.get("stage_bytes"),
+        "transaction_digest": row.get("transaction_digest"),
+        "raw_digest": row.get("raw_digest"),
+    } for sequence, row in enumerate(rows, 1)]
+
+
+def trace_identity(rows: list[dict[str, object]]) -> dict[str, object]:
+    c_rows = [row for row in rows if row.get("actor") == "C"]
+    f_rows = [row for row in rows if row.get("actor") == "F"]
+    if not c_rows or not f_rows:
+        raise ValueError("product action trace has no C/F roles")
+    c_guid = c_rows[0].get("c_store_guid")
+    f_guid = c_rows[0].get("f_store_guid")
+    begins = [row for row in rows if row.get("action") == "TX_BEGIN"]
+    if not isinstance(c_guid, str) or not isinstance(f_guid, str) or not begins:
+        raise ValueError("product action trace has incomplete identity")
+    return {
+        "c_store_guid": c_guid,
+        "f_store_guid": f_guid,
+        "history_nonce": begins[0].get("history_nonce"),
+        "prewarm_tu_seq": begins[0].get("tu_seq"),
+        "measured_tu_seq": begins[-1].get("tu_seq"),
+        "prewarm_rel_seq": begins[0].get("rel_seq"),
+        "measured_rel_seq": begins[-1].get("rel_seq"),
+        "prewarm_session_serial": begins[0].get("session_serial"),
+        "measured_session_serial": begins[-1].get("session_serial"),
+    }
+
+
 def action_identity(row: dict[str, object]) -> tuple[object, ...]:
     """The existing Protocol-50 transaction identity carried by each action."""
     return tuple(row.get(field) for field in (
@@ -112,6 +154,15 @@ def combine_process_traces(c_rows: list[dict[str, object]],
             continue
         f_action = f.get("action")
         c_action = c.get("action")
+        # A warm reconnect may let C's next TX_BEGIN win the event-loop race
+        # with F's SESSION_OPENED.  The session serial makes this ordering
+        # unambiguous; preserve the observed product order instead of forcing
+        # the cold-session prefix before it.
+        if c_action == "TX_BEGIN" and f_action == "SESSION_OPENED" and \
+                f.get("session_serial", 0) > 1:
+            merged.append(c)
+            c_index += 1
+            continue
         if f_action in {"SESSION_OPENED", "SESSION_REPLACED", "HISTORY_RESET"}:
             merged.append(f)
             f_index += 1
@@ -206,11 +257,18 @@ def main(argv: list[str]) -> int:
         input_path = child(artifacts, scenario.get("input"))
         route_path = child(artifacts, scenario.get("route_trace"))
         action_path = child(artifacts, scenario.get("action_trace"))
+        warm = scenario.get("regime") == "warm" or "prewarm_input" in scenario
+        prewarm_input_path = child(artifacts, scenario.get("prewarm_input")) if warm else None
         input_sha, _ = digest(input_path)
         route_sha, _ = digest(route_path)
         action_sha, _ = digest(action_path)
+        prewarm_input_sha = None
+        if prewarm_input_path is not None:
+            prewarm_input_sha, _ = digest(prewarm_input_path)
         if scenario.get("input_sha256") != input_sha:
             raise ValueError("scenario input digest mismatch")
+        if warm and scenario.get("prewarm_input_sha256") != prewarm_input_sha:
+            raise ValueError("scenario prewarm input digest mismatch")
         if scenario.get("route_trace_sha256") != route_sha:
             raise ValueError("canonical route trace digest mismatch")
         if scenario.get("action_trace_sha256") != action_sha:
@@ -226,10 +284,10 @@ def main(argv: list[str]) -> int:
         if configured_identity is not None:
             if not isinstance(configured_identity, dict):
                 raise ValueError("scenario identity must be an object")
-            if configured_identity != {
-                    "c_store_guid": c_guid, "f_store_guid": f_guid,
-                    "history_nonce": history_nonce}:
-                raise ValueError("scenario identity differs from live action snapshot")
+            for key, value in (("c_store_guid", c_guid), ("f_store_guid", f_guid),
+                               ("history_nonce", history_nonce)):
+                if configured_identity.get(key) != value:
+                    raise ValueError("scenario identity differs from live action snapshot")
         if route.get("actions") != [row.get("action") for row in expected_actions]:
             raise ValueError("route trace action sequence differs from live action trace")
         expected_route = [
@@ -249,10 +307,22 @@ def main(argv: list[str]) -> int:
         execution_environment = os.environ.copy()
         execution_environment["ICECC_P50_C_ACTION_TRACE"] = str(c_process_trace)
         execution_environment["ICECC_P50_F_ACTION_TRACE"] = str(f_process_trace)
+        command = [str(binary)]
+        if warm:
+            prewarm_actions = output / "prewarm-actions.jsonl"
+            measured_actions = output / "measured-actions.jsonl"
+            command += ["--prewarm-input", str(prewarm_input_path),
+                        "--measured-input", str(input_path),
+                        "--prewarm-actions", str(prewarm_actions),
+                        "--measured-actions", str(measured_actions)]
+        else:
+            prewarm_actions = measured_actions = None
+            command += ["--input", str(input_path)]
+        command += ["--actions", str(actions), "--summary", str(summary),
+                    "--c-store-guid", c_guid, "--f-store-guid", f_guid,
+                    "--history-nonce", str(history_nonce)]
         result = subprocess.run(
-            [str(binary), "--input", str(input_path), "--actions", str(actions), "--summary", str(summary),
-             "--c-store-guid", c_guid, "--f-store-guid", f_guid,
-             "--history-nonce", str(history_nonce)],
+            command,
             stdin=subprocess.DEVNULL,
             env=execution_environment,
             check=False,
@@ -271,6 +341,58 @@ def main(argv: list[str]) -> int:
             raise ValueError("deterministic C/F action merge differs from endpoint reducer trace")
         if produced_actions != expected_actions:
             raise ValueError("production replay differs from canonical live action trace")
+        if warm:
+            produced_prewarm = canonical_jsonl(prewarm_actions)
+            produced_measured = canonical_jsonl(measured_actions)
+            expected_prewarm = canonical_jsonl(
+                child(artifacts, scenario.get("prewarm_action_trace")))
+            expected_measured = canonical_jsonl(
+                child(artifacts, scenario.get("measured_action_trace")))
+            if produced_prewarm != expected_prewarm:
+                raise ValueError("prewarm TU0 action trace differs from product trace")
+            if produced_measured != expected_measured:
+                raise ValueError("measured TU1 action trace differs from product trace")
+            expected_c = scenario.get("prewarm_c_action_trace")
+            expected_f = scenario.get("prewarm_f_action_trace")
+            if expected_c is not None and canonical_jsonl(child(artifacts, expected_c)) != \
+                    [row for row in produced_prewarm if row.get("actor") == "C"]:
+                raise ValueError("prewarm C action trace differs from product trace")
+            if expected_f is not None and canonical_jsonl(child(artifacts, expected_f)) != \
+                    [row for row in produced_prewarm if row.get("actor") == "F"]:
+                raise ValueError("prewarm F action trace differs from product trace")
+            expected_c = scenario.get("measured_c_action_trace")
+            expected_f = scenario.get("measured_f_action_trace")
+            if expected_c is not None and canonical_jsonl(child(artifacts, expected_c)) != \
+                    [row for row in produced_measured if row.get("actor") == "C"]:
+                raise ValueError("measured C action trace differs from product trace")
+            if expected_f is not None and canonical_jsonl(child(artifacts, expected_f)) != \
+                    [row for row in produced_measured if row.get("actor") == "F"]:
+                raise ValueError("measured F action trace differs from product trace")
+            write_jsonl(output / "prewarm-c-action-trace.jsonl",
+                        [row for row in produced_prewarm if row.get("actor") == "C"])
+            write_jsonl(output / "prewarm-f-action-trace.jsonl",
+                        [row for row in produced_prewarm if row.get("actor") == "F"])
+            write_jsonl(output / "measured-c-action-trace.jsonl",
+                        [row for row in produced_measured if row.get("actor") == "C"])
+            write_jsonl(output / "measured-f-action-trace.jsonl",
+                        [row for row in produced_measured if row.get("actor") == "F"])
+        identities = trace_identity(produced_actions)
+        configured_identity = scenario.get("identity")
+        if isinstance(configured_identity, dict):
+            for key in ("c_store_guid", "f_store_guid", "history_nonce"):
+                if configured_identity.get(key) != identities.get(key):
+                    raise ValueError("product action identity differs from scenario identity")
+            if warm and (configured_identity.get("prewarm_tu_seq") not in (None, 0) or
+                          configured_identity.get("measured_tu_seq") not in (None, 1)):
+                raise ValueError("warm TU identity does not name TU0 then TU1")
+        ledger = stage_ledger(produced_actions)
+        write_jsonl(output / "stage-ledger.jsonl", ledger)
+        expected_ledger_name = scenario.get("stage_ledger")
+        if expected_ledger_name is not None and ledger != canonical_jsonl(
+                child(artifacts, expected_ledger_name)):
+            raise ValueError("stage-byte ledger differs from product trace")
+        (output / "identities.json").write_bytes(
+            (json.dumps(identities, sort_keys=True, separators=(",", ":")) + "\n").encode())
         summary_value = json.loads(summary.read_bytes())
         if not isinstance(summary_value, dict):
             raise ValueError("production execution summary is not an object")

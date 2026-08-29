@@ -70,6 +70,90 @@ def invoke(artifacts: Path, output: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+def warm_scenario_tree(tmp_path: Path) -> Path:
+    tmp_path.mkdir(parents=True)
+    payload = b"an authenticated production Protocol-50 warm input\n"
+    (tmp_path / "preprocessed.ii").write_bytes(payload)
+    probe = tmp_path / "probe"
+    probe.mkdir()
+    binary = HERE / ".p50sim.bin"
+    subprocess.run([
+        str(binary), "--prewarm-input", str(tmp_path / "preprocessed.ii"),
+        "--measured-input", str(tmp_path / "preprocessed.ii"),
+        "--actions", str(probe / "actions.jsonl"),
+        "--prewarm-actions", str(probe / "prewarm-actions.jsonl"),
+        "--measured-actions", str(probe / "measured-actions.jsonl"),
+        "--summary", str(probe / "summary.json"),
+        "--c-store-guid", "4eed5e3d7e595ecd4ba9ce014e951583",
+        "--f-store-guid", "d3ef72d22168e1fb907a38f80315d178",
+        "--history-nonce", "1",
+    ], check=True)
+    action_bytes = (probe / "actions.jsonl").read_bytes()
+    action_rows = [json.loads(line) for line in action_bytes.splitlines()]
+    for name in ("actions.jsonl", "prewarm-actions.jsonl", "measured-actions.jsonl"):
+        (tmp_path / name).write_bytes((probe / name).read_bytes())
+    all_rows = action_rows
+    prewarm_rows = read_jsonl(tmp_path / "prewarm-actions.jsonl")
+    measured_rows = read_jsonl(tmp_path / "measured-actions.jsonl")
+    route = {
+        "actions": [row["action"] for row in all_rows],
+        "origin": "live",
+        "schema": "icecream-s7-live-route-trace-v1",
+        "trace": [
+            {"action": row["action"], "sequence": sequence}
+            for sequence, row in enumerate(all_rows, 1)
+        ],
+    }
+    write_canonical(tmp_path / "route_trace.json", route)
+    identity = {
+        "c_store_guid": "4eed5e3d7e595ecd4ba9ce014e951583",
+        "f_store_guid": "d3ef72d22168e1fb907a38f80315d178",
+        "history_nonce": 1,
+        "prewarm_tu_seq": 0,
+        "measured_tu_seq": 1,
+    }
+    scenario = {
+        "cell": "fmt/ZSTD_TU/warm",
+        "input": "preprocessed.ii",
+        "input_sha256": hashlib.sha256(payload).hexdigest(),
+        "prewarm_input": "preprocessed.ii",
+        "prewarm_input_sha256": hashlib.sha256(payload).hexdigest(),
+        "action_trace": "actions.jsonl",
+        "action_trace_sha256": hashlib.sha256(action_bytes).hexdigest(),
+        "prewarm_action_trace": "prewarm-actions.jsonl",
+        "measured_action_trace": "measured-actions.jsonl",
+        "prewarm_c_action_trace": "prewarm-c-action-trace.jsonl",
+        "prewarm_f_action_trace": "prewarm-f-action-trace.jsonl",
+        "measured_c_action_trace": "measured-c-action-trace.jsonl",
+        "measured_f_action_trace": "measured-f-action-trace.jsonl",
+        "stage_ledger": "stage-ledger.jsonl",
+        "route_trace": "route_trace.json",
+        "route_trace_sha256": hashlib.sha256((tmp_path / "route_trace.json").read_bytes()).hexdigest(),
+        "identity": identity,
+        "schema": "icecream-s7-p50sim-scenario-v1",
+        "regime": "warm",
+    }
+    # Expected role and stage ledgers are generated from the product trace,
+    # then authenticated as scenario inputs for the replay check.
+    for name, rows in (
+        ("prewarm-c-action-trace.jsonl", [row for row in prewarm_rows if row["actor"] == "C"]),
+        ("prewarm-f-action-trace.jsonl", [row for row in prewarm_rows if row["actor"] == "F"]),
+        ("measured-c-action-trace.jsonl", [row for row in measured_rows if row["actor"] == "C"]),
+        ("measured-f-action-trace.jsonl", [row for row in measured_rows if row["actor"] == "F"]),
+    ):
+        (tmp_path / name).write_text("".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows))
+    ledger = [{
+        "sequence": sequence, "action": row["action"], "actor": row["actor"],
+        "stage_bytes": row["stage_bytes"],
+        "transaction_digest": row["transaction_digest"],
+        "raw_digest": row["raw_digest"],
+    } for sequence, row in enumerate(all_rows, 1)]
+    (tmp_path / "stage-ledger.jsonl").write_text(
+        "".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in ledger))
+    write_canonical(tmp_path / "scenario.json", scenario)
+    return tmp_path
+
+
 def test_real_endpoint_writes_authenticated_trace(tmp_path: Path) -> None:
     artifacts = scenario_tree(tmp_path / "artifacts")
     result = invoke(artifacts, tmp_path / "output")
@@ -121,3 +205,34 @@ def test_manifest_identity_mismatch_rejects_execution(tmp_path: Path) -> None:
     result = invoke(artifacts, tmp_path / "output")
     assert result.returncode != 0
     assert "scenario identity differs from live action snapshot" in result.stderr
+
+
+def test_warm_replay_retains_tu_traces_identity_and_stage_ledger(tmp_path: Path) -> None:
+    artifacts = warm_scenario_tree(tmp_path / "artifacts")
+    result = subprocess.run(
+        [str(HERE / "p50sim"), "--s7-cell", "fmt/ZSTD_TU/warm",
+         "--s7-artifacts", str(artifacts), "--s7-output", str(tmp_path / "output")],
+        text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+    assert len(read_jsonl(tmp_path / "output" / "prewarm-actions.jsonl")) == 11
+    measured = read_jsonl(tmp_path / "output" / "measured-actions.jsonl")
+    assert len(measured) == 10
+    assert {row["tu_seq"] for row in measured if row["action"] == "TX_BEGIN"} == {1}
+    identity = json.loads((tmp_path / "output" / "identities.json").read_text())
+    assert identity["prewarm_tu_seq"] == 0
+    assert identity["measured_tu_seq"] == 1
+    assert len(read_jsonl(tmp_path / "output" / "stage-ledger.jsonl")) == 21
+
+
+def test_warm_deletion_control_reddens_measured_trace(tmp_path: Path) -> None:
+    artifacts = warm_scenario_tree(tmp_path / "artifacts")
+    measured = artifacts / "measured-actions.jsonl"
+    rows = [json.loads(line) for line in measured.read_bytes().splitlines()]
+    rows = [row for row in rows if row["action"] != "NEED_RECORDED"]
+    measured.write_text("".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows))
+    result = subprocess.run(
+        [str(HERE / "p50sim"), "--s7-cell", "fmt/ZSTD_TU/warm",
+         "--s7-artifacts", str(artifacts), "--s7-output", str(tmp_path / "output")],
+        text=True, capture_output=True, check=False)
+    assert result.returncode != 0
+    assert "measured TU1 action trace differs from product trace" in result.stderr

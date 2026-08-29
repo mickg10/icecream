@@ -101,10 +101,25 @@ void write_summary(const std::string& path, std::span<const uint8_t> input,
         throw std::runtime_error("cannot write p50sim summary output");
 }
 
+void write_action_slice(const std::string& path,
+                        std::span<const ActionRecord> records) {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output)
+        throw std::runtime_error("cannot open Protocol-50 action slice output");
+    for (const ActionRecord& record : records)
+        output << action_jsonl(record) << '\n';
+    if (!output)
+        throw std::runtime_error("cannot write Protocol-50 action slice output");
+}
+
 struct Arguments {
     std::string input;
+    std::string prewarm_input;
+    std::string measured_input;
     std::string actions;
     std::string summary;
+    std::string prewarm_actions;
+    std::string measured_actions;
     CStoreGuid c_store_guid = CStoreGuid::from_u64(0x505053494dULL);
     FStoreGuid f_store_guid = FStoreGuid::from_u64(0x505053494dULL);
     HistoryNonce history_nonce{1};
@@ -132,10 +147,18 @@ Arguments parse(int argc, char** argv) {
             throw std::invalid_argument("missing value for " + option);
         if (option == "--input")
             result.input = argv[++index];
+        else if (option == "--prewarm-input")
+            result.prewarm_input = argv[++index];
+        else if (option == "--measured-input")
+            result.measured_input = argv[++index];
         else if (option == "--actions")
             result.actions = argv[++index];
         else if (option == "--summary")
             result.summary = argv[++index];
+        else if (option == "--prewarm-actions")
+            result.prewarm_actions = argv[++index];
+        else if (option == "--measured-actions")
+            result.measured_actions = argv[++index];
         else if (option == "--c-store-guid") {
             if (!parse_guid(argv[++index], result.c_store_guid))
                 throw std::invalid_argument("invalid --c-store-guid");
@@ -154,8 +177,18 @@ Arguments parse(int argc, char** argv) {
         else
             throw std::invalid_argument("unknown option " + option);
     }
-    if (result.input.empty() || result.actions.empty() || result.summary.empty())
-        throw std::invalid_argument("--input, --actions, and --summary are required");
+    const bool warm = !result.prewarm_input.empty() || !result.measured_input.empty() ||
+                      !result.prewarm_actions.empty() || !result.measured_actions.empty();
+    if (warm && (result.prewarm_input.empty() || result.measured_input.empty() ||
+                 result.prewarm_actions.empty() || result.measured_actions.empty()))
+        throw std::invalid_argument(
+            "warm replay requires --prewarm-input, --measured-input, "
+            "--prewarm-actions, and --measured-actions");
+    if ((warm ? !result.input.empty() : result.input.empty()) ||
+        result.actions.empty() || result.summary.empty())
+        throw std::invalid_argument(
+            warm ? "warm replay does not accept --input" :
+                   "--input, --actions, and --summary are required");
     return result;
 }
 
@@ -164,7 +197,10 @@ Arguments parse(int argc, char** argv) {
 int main(int argc, char** argv) {
     try {
         const Arguments arguments = parse(argc, argv);
-        const std::vector<uint8_t> input = read_bytes(arguments.input);
+        const bool warm = !arguments.prewarm_input.empty();
+        const std::vector<uint8_t> input = warm
+            ? read_bytes(arguments.measured_input)
+            : read_bytes(arguments.input);
 
         ActionTrace actions(1024);
         CompletionLog completions(4096);
@@ -174,9 +210,14 @@ int main(int argc, char** argv) {
         auto authority = std::make_shared<P50PreparationAuthority>(
             arguments.c_store_guid, caps.zstd,
             PreparationAuthorityLimits{}, 1, caps.profile);
+        const std::vector<uint8_t> prewarm_input = warm
+            ? read_bytes(arguments.prewarm_input) : std::vector<uint8_t>{};
+        const PreparedTuHandle prewarm_prepared = warm
+            ? authority->prepare(PrepareRequestKey{1, 1}, prewarm_input)
+            : PreparedTuHandle{};
         const PreparedTuHandle prepared = authority->prepare(
-            PrepareRequestKey{1, 1}, input);
-        if (!prepared)
+            warm ? PrepareRequestKey{1, 2} : PrepareRequestKey{1, 1}, input);
+        if ((warm && !prewarm_prepared) || !prepared)
             throw std::runtime_error("Protocol-50 preparation returned an invalid handle");
 
         P50ServerEndpointConfig config;
@@ -189,13 +230,29 @@ int main(int argc, char** argv) {
         asio::io_context context;
         tcp::acceptor acceptor(context, tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0));
         const tcp::endpoint endpoint = acceptor.local_endpoint();
-        auto server_future = asio::co_spawn(context, server.accept_one(acceptor),
-                                            asio::use_future);
-        auto client_future = asio::co_spawn(context, client.run(endpoint, prepared),
-                                            asio::use_future);
-        context.run();
-        const ServerRunResult server_result = server_future.get();
-        const ClientRunResult client_result = client_future.get();
+        ClientRunResult client_result;
+        ServerRunResult server_result;
+        const auto run_one = [&](PreparedTuHandle handle) {
+            auto server_future = asio::co_spawn(context, server.accept_one(acceptor),
+                                                asio::use_future);
+            auto client_future = asio::co_spawn(context, client.run(endpoint, handle),
+                                                asio::use_future);
+            context.run();
+            server_result = server_future.get();
+            client_result = client_future.get();
+            if (client_result.status != ClientRunStatus::Committed ||
+                server_result.status != ServerRunStatus::Completed)
+                throw std::runtime_error(
+                    "Protocol-50 execution did not commit on both endpoints");
+            if (warm)
+                context.restart();
+        };
+        const size_t prewarm_begin = actions.records().size();
+        if (warm)
+            run_one(prewarm_prepared);
+        const size_t measured_begin = actions.records().size();
+        run_one(prepared);
+        const size_t measured_end = actions.records().size();
 
         if (client_result.status != ClientRunStatus::Committed ||
             server_result.status != ServerRunStatus::Completed)
@@ -213,6 +270,14 @@ int main(int argc, char** argv) {
         if (const auto error = check_action_trace(actions.records()); error)
             throw std::runtime_error("Protocol-50 action trace mismatch: " + *error);
         write_action_trace(actions, arguments.actions);
+        if (warm) {
+            write_action_slice(arguments.prewarm_actions,
+                               std::span<const ActionRecord>(actions.records().data() + prewarm_begin,
+                                                             measured_begin - prewarm_begin));
+            write_action_slice(arguments.measured_actions,
+                               std::span<const ActionRecord>(actions.records().data() + measured_begin,
+                                                             measured_end - measured_begin));
+        }
         write_summary(arguments.summary, input, client_result, server_result,
                       completions, actions, caps.profile);
         return 0;
