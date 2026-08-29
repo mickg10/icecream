@@ -633,8 +633,11 @@ test -n "$client_service_pid" || {
 cache_ready=0
 for _ in $(seq 1 30); do
     if test "$suite" = C1F20/40; then
+        # A scheduler may relogin the same F more than once.  Count extracted
+        # authenticated service identities, not timestamped log lines.
         ready_count=$(grep -E "RELOGIN p50-f-[0-9]+.*cache=.*cache_profiles=.*$profile_advertisement" \
-            "$work/scheduler.log" 2>/dev/null | sort -u | wc -l)
+            "$work/scheduler.log" 2>/dev/null |
+            grep -oE 'p50-f-[0-9]+' | sort -u | wc -l)
         test "$ready_count" -ge 20 && cache_ready=1 && break
     elif grep -E "RELOGIN p50-f.*cache=.*cache_profiles=.*$profile_advertisement" \
             "$work/scheduler.log" >/dev/null 2>&1; then
@@ -664,7 +667,10 @@ compile_once() {
     client_log="$work/client-compile-$label.log"
     compile_include_args=""
     if test -n "$item_compile_db"; then
-        remote_compile_args=$(compile_args_for "$item_compile_db" "$item_compile_source" "$item_compile_output" "$work/src/$label.cpp" "$remote_obj")
+        # Depth batches stage the authenticated predictive .ii.  Remote and
+        # local compilation must bind to that exact staged input; the source
+        # path is used only to select the unique compile-database command.
+        remote_compile_args=$(compile_args_for "$item_compile_db" "$item_compile_source" "$item_compile_output" "$input_path" "$remote_obj")
         local_compile_args=$(compile_args_for "$item_compile_db" "$item_compile_source" "$item_compile_output" "$input_path" "$local_obj")
     elif test -n "$include_root"; then
         compile_include_args="-I$include_root"
@@ -743,25 +749,44 @@ PY
 }
 if test -n "$batch_manifest"; then
     mkdir -p "$work/active"
+    mkdir -p "$work/input-ready"
     run_one() {
         run_label=$1
         ordinal=$2
         relationship=$3
         f_slot=$4
-        staged="$work/src/$run_label-$ordinal.cpp"
-        source_path=$5
+        predictive_path=$5
         source_sha=$6
         item_compile_db=$7
         item_compile_source=$8
         item_compile_output=$9
+        payload_sha=${10}
+        payload_bytes=${11}
+        staged="$work/src/$run_label-$ordinal.ii"
         marker="$work/active/$run_label-$relationship-$f_slot"
+        input_ready_marker="$work/input-ready/$run_label-$relationship-$ordinal"
         trap 'rm -f "$marker"' EXIT HUP INT TERM
-        cp -- "$source_path" "$staged"
+        cp -- "$predictive_path" "$staged"
         compile_once "$run_label-$ordinal" "$staged" "$item_compile_db" \
-            "$item_compile_source" "$item_compile_output" "$relationship" "$f_slot"
+            "$item_compile_source" "$item_compile_output" "$relationship" "$f_slot" &
+        compile_pid=$!
+        preprocessed_capture="$work/s7-$run_label-$ordinal-preprocessed.ii"
+        # ICECC_P50_PREPROCESSED_CAPTURE is written immediately before the
+        # exact .ii is attached to the live transaction.  This is the
+        # relationship's source-admission witness; waiting for it does not
+        # wait for compile/result completion.
+        while test ! -s "$preprocessed_capture"; do
+            if ! kill -0 "$compile_pid" 2>/dev/null; then
+                wait "$compile_pid" || true
+                echo "FAIL: compile ended before authenticated input-ready ($run_label-$ordinal)" >&2
+                return 1
+            fi
+            sleep 0.005
+        done
+        : >"$input_ready_marker"
+        wait "$compile_pid"
         remote_obj="$work/out/remote-$run_label-$ordinal.o"
         local_obj="$work/out/local-$run_label-$ordinal.o"
-        preprocessed_capture="$work/s7-$run_label-$ordinal-preprocessed.ii"
         remote_sha=$(sha256sum "$remote_obj" | awk '{print $1}')
         local_sha=$(sha256sum "$local_obj" | awk '{print $1}')
         remote_bytes=$(stat -c %s "$remote_obj")
@@ -795,25 +820,32 @@ if test -n "$batch_manifest"; then
             relationship=0; f_slot=0
             if test "$suite" = C1F20/40; then
                 IFS="$(printf '\t')" read -r relationship f_slot <&3
-                # At most two jobs per relationship may be in flight.  Jobs
-                # are admitted from the manifest in order; a later TU waits
-                # for a slot before it can start its transaction.
-                while test -e "$work/active/$run_label-$relationship-0" && \
-                      test -e "$work/active/$run_label-$relationship-1"; do
-                    sleep 0.01
-                done
+                # The topology names the exact slot.  Never substitute the
+                # sibling slot when this preregistered slot is still active.
+                marker="$work/active/$run_label-$relationship-$f_slot"
+                while test -e "$marker"; do sleep 0.005; done
             else
-                while test -e "$work/active/$run_label-0-0"; do
-                    sleep 0.01
-                done
+                marker="$work/active/$run_label-0-0"
+                while test -e "$marker"; do sleep 0.005; done
             fi
-            marker="$work/active/$run_label-$relationship-$f_slot"
-            test ! -e "$marker" || { echo "FAIL: topology reuses active F slot" >&2; exit 1; }
             : >"$marker"
-            run_one "$run_label" "$ordinal" "$relationship" "$f_slot" "$source_path" "$source_sha" \
+            run_one "$run_label" "$ordinal" "$relationship" "$f_slot" "$predictive_path" "$source_sha" \
                 "$item_db" "$item_source" "$item_output" "$payload_sha" "$payload_bytes" \
                 >"$work/job-$run_label-$ordinal.log" 2>&1 &
-            job_pids="$job_pids $!"
+            job_pid=$!
+            job_pids="$job_pids $job_pid"
+            # Serialize only source admission within a relationship.  The
+            # prior job's compiler/result process remains active after this
+            # witness, so both real F slots can overlap.
+            input_ready_marker="$work/input-ready/$run_label-$relationship-$ordinal"
+            while test ! -e "$input_ready_marker"; do
+                if ! kill -0 "$job_pid" 2>/dev/null; then
+                    wait "$job_pid" || true
+                    echo "FAIL: source admission failed ($run_label-$ordinal)" >&2
+                    exit 1
+                fi
+                sleep 0.005
+            done
             ordinal=$((ordinal + 1))
         done <"$work/batch.tsv" 3<"${topology_input:-/dev/null}"
         test "$ordinal" -eq "$batch_expected_count" || { echo "FAIL: batch manifest count changed during run" >&2; exit 1; }

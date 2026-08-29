@@ -358,6 +358,12 @@ def test_batch_shell_excludes_warm_prewarm_and_carries_optional_repeat() -> None
     assert '"$build/daemon/iceccd" "$@" -p "$worker_port" -m 2' in shell
     assert 'S8_BATCH_WINDOW run=%s start_ns=%s end_ns=%s' in shell
     assert 'run_one "$run_label" "$ordinal" "$relationship" "$f_slot"' in shell
+    assert 'staged="$work/src/$run_label-$ordinal.ii"' in shell
+    assert 'cp -- "$predictive_path" "$staged"' in shell
+    assert 'compile_args_for "$item_compile_db" "$item_compile_source" "$item_compile_output" "$input_path" "$remote_obj"' in shell
+    assert 'input-ready/$run_label-$relationship-$ordinal' in shell
+    assert 'while test -e "$marker"; do sleep 0.005; done' in shell
+    assert "grep -oE 'p50-f-[0-9]+' | sort -u | wc -l" in shell
 
 
 def test_unsupported_topology_fails_closed(tmp_path: Path) -> None:
