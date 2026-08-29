@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -80,6 +81,41 @@ def _plan(tmp_path: Path, current: bool = False):
     result = planner.plan_campaign(inventory, recovery, recovery_sha, matrix, matrix_sha,
                                    output, "20260829T000000Z", **kwargs)
     return result, output, inventory, recovery, recovery_sha
+
+
+def _capability_fixture(tmp_path: Path) -> tuple[Path, str, dict[str, object]]:
+    source_root = tmp_path / "producer-source"
+    source_root.mkdir(parents=True)
+    source_path = source_root / "producer.py"
+    source_path.write_bytes(b"# authenticated native/live producer fixture\n")
+    subprocess.run(["git", "init", "-q", str(source_root)], check=True)
+    subprocess.run(["git", "-C", str(source_root), "config", "user.email", "fixture@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(source_root), "config", "user.name", "fixture"], check=True)
+    subprocess.run(["git", "-C", str(source_root), "add", "producer.py"], check=True)
+    subprocess.run(["git", "-C", str(source_root), "commit", "-q", "-m", "fixture"], check=True)
+    commit = subprocess.check_output(["git", "-C", str(source_root), "rev-parse", "HEAD"], text=True).strip()
+    tree = subprocess.check_output(["git", "-C", str(source_root), "rev-parse", "HEAD^{tree}"], text=True).strip()
+    binaries_root = tmp_path / "producer-binaries"
+    binaries_root.mkdir()
+    binaries = {}
+    for name in ("client", "daemon", "scheduler", "cache-service", "simulator"):
+        binary = binaries_root / name
+        binary.write_bytes((name + "\n").encode())
+        binary.chmod(0o755)
+        raw = binary.read_bytes()
+        binaries[name] = {"path": str(binary), "bytes": len(raw),
+                          "sha256": hashlib.sha256(raw).hexdigest()}
+    source_raw = source_path.read_bytes()
+    capability = {
+        "schema": planner.CAPABILITY_SCHEMA, "status": "PASS",
+        "capability": planner.CAPABILITY, "producer_version": "native-live-fixture-v1",
+        "source": {"path": str(source_path), "bytes": len(source_raw), "commit": commit,
+                   "tree": tree, "sha256": hashlib.sha256(source_raw).hexdigest()},
+        "binaries": binaries,
+    }
+    capability_path = tmp_path / "capability.json"
+    capability_path.write_bytes(planner._canonical(capability))
+    return capability_path, hashlib.sha256(capability_path.read_bytes()).hexdigest(), capability
 
 
 def test_authenticates_all_manifests_and_preserves_order(tmp_path: Path) -> None:
@@ -225,19 +261,54 @@ def test_source_mutation_during_streamed_snapshot_read_fails_closed(tmp_path: Pa
 
 def test_authenticated_capability_manifest_enables_only_implemented_profiles(tmp_path: Path) -> None:
     inventory, recovery, recovery_sha, matrix, matrix_sha = _authority(tmp_path / "authority")
-    capability = {
-        "schema": planner.CAPABILITY_SCHEMA, "status": "PASS",
-        "capability": planner.CAPABILITY, "producer_version": "native-live-fixture-v1",
-        "source": {"path": "/source/producer.py", "commit": "a" * 40, "sha256": "b" * 64},
-        "binaries": {name: {"path": f"/build/{name}", "bytes": 1, "sha256": "c" * 64}
-                     for name in ("client", "daemon", "scheduler", "cache-service", "simulator")},
-    }
-    capability_path = tmp_path / "authority" / "capability.json"
-    capability_path.write_bytes(planner._canonical(capability))
+    capability_path, capability_sha, _ = _capability_fixture(tmp_path / "capability-authority")
     result = planner.plan_campaign(
         inventory, recovery, recovery_sha, matrix, matrix_sha,
         tmp_path / "out", "20260829T000000Z",
         current_image_name="image:tag", current_image_id="sha256:" + "a" * 64,
         capability_manifest=capability_path,
-        capability_manifest_sha256=hashlib.sha256(capability_path.read_bytes()).hexdigest())
+        capability_manifest_sha256=capability_sha)
     assert result["counts"]["current_image_ready"] == 704
+
+
+def test_capability_source_and_binary_descriptors_are_authenticated(tmp_path: Path) -> None:
+    capability_path, capability_sha, capability = _capability_fixture(tmp_path)
+    loaded = planner._load_capability(capability_path, capability_sha)
+    assert loaded["source"]["git"]["head"] == capability["source"]["commit"]
+    assert loaded["source"]["git"]["tree"] == capability["source"]["tree"]
+    assert loaded["source"]["git"]["tracked_path"] == "producer.py"
+    assert set(loaded["binaries"]) == {"client", "daemon", "scheduler", "cache-service", "simulator"}
+
+
+def test_capability_missing_binary_fails_closed(tmp_path: Path) -> None:
+    capability_path, capability_sha, capability = _capability_fixture(tmp_path)
+    Path(capability["binaries"]["simulator"]["path"]).unlink()
+    with pytest.raises(planner.PlannerError, match="binary:simulator:unavailable"):
+        planner._load_capability(capability_path, capability_sha)
+
+
+def test_capability_mutated_binary_fails_closed(tmp_path: Path) -> None:
+    capability_path, capability_sha, capability = _capability_fixture(tmp_path)
+    binary = Path(capability["binaries"]["daemon"]["path"])
+    binary.write_bytes(binary.read_bytes() + b"mutated")
+    with pytest.raises(planner.PlannerError, match="binary_(bytes|sha256)_mismatch:daemon"):
+        planner._load_capability(capability_path, capability_sha)
+
+
+def test_capability_mutated_source_fails_closed(tmp_path: Path) -> None:
+    capability_path, capability_sha, capability = _capability_fixture(tmp_path)
+    source = Path(capability["source"]["path"])
+    source.write_bytes(source.read_bytes() + b"mutated")
+    with pytest.raises(planner.PlannerError, match="source_(bytes|sha256)_mismatch"):
+        planner._load_capability(capability_path, capability_sha)
+
+
+def test_capability_path_swap_fails_closed(tmp_path: Path) -> None:
+    capability_path, capability_sha, capability = _capability_fixture(tmp_path)
+    binary = Path(capability["binaries"]["scheduler"]["path"])
+    replacement = binary.with_name("replacement")
+    replacement.write_bytes(b"replacement\n")
+    binary.unlink()
+    binary.symlink_to(replacement)
+    with pytest.raises(planner.PlannerError, match="binary:scheduler:(unavailable|not_private_regular_file)"):
+        planner._load_capability(capability_path, capability_sha)

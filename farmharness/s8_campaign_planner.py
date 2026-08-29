@@ -14,6 +14,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -157,6 +158,116 @@ def _snapshot_file(path: Path, root: Path, label: str) -> tuple[dict[str, object
         os.close(fd)
     return {"path": str(path), "resolved_path": str(resolved), "bytes": size,
             "sha256": digest.hexdigest()}, resolved
+
+
+def _snapshot_descriptor(path: Path, label: str) -> tuple[dict[str, object], Path]:
+    """Hash a declared capability artifact without following its final path."""
+    try:
+        path_info = path.lstat()
+    except OSError as exc:
+        raise PlannerError(f"{label}:unavailable:{path}") from exc
+    if (stat.S_ISLNK(path_info.st_mode) or not stat.S_ISREG(path_info.st_mode) or
+            path_info.st_nlink != 1):
+        raise PlannerError(f"{label}:not_private_regular_file:{path}")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise PlannerError(f"{label}:unavailable:{path}") from exc
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise PlannerError(f"{label}:unavailable:{path}") from exc
+    try:
+        before = os.fstat(fd)
+        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or
+                (before.st_dev, before.st_ino) != (path_info.st_dev, path_info.st_ino)):
+            raise PlannerError(f"{label}:not_private_regular_file:{path}")
+        digest = hashlib.sha256()
+        size = 0
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+        after = os.fstat(fd)
+        before_identity = (before.st_dev, before.st_ino, before.st_size,
+                           before.st_mtime_ns, before.st_ctime_ns)
+        after_identity = (after.st_dev, after.st_ino, after.st_size,
+                           after.st_mtime_ns, after.st_ctime_ns)
+        try:
+            path_after = path.lstat()
+        except OSError as exc:
+            raise PlannerError(f"{label}:path_changed_during_read:{path}") from exc
+        path_after_identity = (path_after.st_dev, path_after.st_ino,
+                               path_after.st_size, path_after.st_mtime_ns,
+                               path_after.st_ctime_ns)
+        if (before_identity != after_identity or size != before.st_size or
+                path_after_identity != after_identity or
+                stat.S_ISLNK(path_after.st_mode) or not stat.S_ISREG(path_after.st_mode) or
+                path_after.st_nlink != 1):
+            raise PlannerError(f"{label}:mutated_during_read:{path}")
+    finally:
+        os.close(fd)
+    return {"path": str(path), "resolved_path": str(resolved), "bytes": size,
+            "sha256": digest.hexdigest()}, resolved
+
+
+def _git_output(repo: Path, args: list[str], label: str) -> str:
+    try:
+        result = subprocess.run(["git", "-C", str(repo), *args], check=True,
+                                capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise PlannerError(f"capability_manifest:{label}") from exc
+    return result.stdout.strip()
+
+
+def _authenticate_capability_source(source: dict[str, object]) -> dict[str, object]:
+    source_path = Path(str(source["path"]))
+    if not source_path.is_absolute():
+        raise PlannerError("capability_manifest:source_path_not_absolute")
+    snapshot, resolved = _snapshot_descriptor(source_path, "capability_manifest:source")
+    if snapshot["bytes"] != source["bytes"]:
+        raise PlannerError("capability_manifest:source_bytes_mismatch")
+    if snapshot["sha256"] != str(source["sha256"]).lower():
+        raise PlannerError("capability_manifest:source_sha256_mismatch")
+
+    repo_text = _git_output(source_path.parent, ["rev-parse", "--show-toplevel"],
+                            "source_git_unavailable")
+    repo = Path(repo_text).resolve()
+    try:
+        relative = resolved.relative_to(repo)
+    except ValueError as exc:
+        raise PlannerError("capability_manifest:source_not_in_git_worktree") from exc
+    relative_name = relative.as_posix()
+    status = _git_output(repo, ["status", "--porcelain", "--untracked-files=no"],
+                         "source_git_status_unavailable")
+    if status:
+        raise PlannerError("capability_manifest:source_git_dirty")
+    head = _git_output(repo, ["rev-parse", "HEAD"], "source_git_head_unavailable")
+    if head.lower() != str(source["commit"]).lower():
+        raise PlannerError("capability_manifest:source_git_head_mismatch")
+    tree = _git_output(repo, ["rev-parse", "HEAD^{tree}"], "source_git_tree_unavailable")
+    declared_tree = source.get("tree")
+    if declared_tree is not None and str(declared_tree).lower() != tree.lower():
+        raise PlannerError("capability_manifest:source_git_tree_mismatch")
+    tracked = _git_output(repo, ["ls-files", "--error-unmatch", "--", relative_name],
+                          "source_git_path_untracked")
+    if tracked != relative_name:
+        raise PlannerError("capability_manifest:source_git_path_untracked")
+    try:
+        committed = subprocess.run(
+            ["git", "-C", str(repo), "show", f"{head}:{relative_name}"],
+            check=True, capture_output=True, timeout=15).stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise PlannerError("capability_manifest:source_git_blob_unavailable") from exc
+    if len(committed) != snapshot["bytes"] or hashlib.sha256(committed).hexdigest() != snapshot["sha256"]:
+        raise PlannerError("capability_manifest:source_git_blob_mismatch")
+    return {**source, "path": str(source_path), "resolved_path": str(resolved),
+            "bytes": snapshot["bytes"], "sha256": snapshot["sha256"],
+            "git": {"root": str(repo), "head": head, "tree": tree,
+                    "tracked_path": relative_name}}
 
 
 def _load_corpus_inventory(path: Path) -> tuple[dict[str, object], list[dict[str, object]], list[dict[str, object]]]:
@@ -344,22 +455,43 @@ def _load_capability(path: Path, expected_sha256: str) -> dict[str, object]:
     if (not isinstance(source, dict) or not isinstance(source.get("commit"), str) or
             not re.fullmatch(r"[0-9a-f]{40}", source["commit"].lower()) or
             not isinstance(source.get("path"), str) or
+            not Path(source["path"]).is_absolute() or
+            not isinstance(source.get("bytes"), int) or source["bytes"] <= 0 or
             not isinstance(source.get("sha256"), str) or
-            not SHA256_RE.fullmatch(source["sha256"].lower())):
+            not SHA256_RE.fullmatch(source["sha256"].lower()) or
+            (source.get("tree") is not None and
+             (not isinstance(source.get("tree"), str) or
+              not re.fullmatch(r"[0-9a-f]{40}", source["tree"].lower())))):
         raise PlannerError("capability_manifest:source_identity_invalid")
     binaries = value.get("binaries")
     if (not isinstance(binaries, dict) or set(binaries) != {"client", "daemon", "scheduler", "cache-service", "simulator"}):
         raise PlannerError("capability_manifest:binary_set_invalid")
     for name, descriptor in binaries.items():
         if (not isinstance(descriptor, dict) or not isinstance(descriptor.get("path"), str) or
+                not Path(descriptor["path"]).is_absolute() or
                 not isinstance(descriptor.get("bytes"), int) or descriptor["bytes"] <= 0 or
                 not isinstance(descriptor.get("sha256"), str) or
                 not SHA256_RE.fullmatch(descriptor["sha256"].lower())):
             raise PlannerError(f"capability_manifest:binary_invalid:{name}")
+    authenticated_source = _authenticate_capability_source(source)
+    authenticated_binaries: dict[str, object] = {}
+    for name, descriptor in binaries.items():
+        binary_path = Path(str(descriptor["path"]))
+        snapshot, resolved = _snapshot_descriptor(binary_path,
+                                                  f"capability_manifest:binary:{name}")
+        if snapshot["bytes"] != descriptor["bytes"]:
+            raise PlannerError(f"capability_manifest:binary_bytes_mismatch:{name}")
+        if snapshot["sha256"] != str(descriptor["sha256"]).lower():
+            raise PlannerError(f"capability_manifest:binary_sha256_mismatch:{name}")
+        authenticated_binaries[name] = {
+            **descriptor, "path": str(binary_path), "resolved_path": str(resolved),
+            "bytes": snapshot["bytes"], "sha256": snapshot["sha256"],
+        }
     return {"path": str(path.resolve()), "bytes": len(raw),
             "sha256": hashlib.sha256(raw).hexdigest(), "schema": CAPABILITY_SCHEMA,
             "capability": CAPABILITY, "producer_version": value["producer_version"],
-            "source": dict(source), "binaries": dict(binaries), "status": "PASS"}
+            "source": authenticated_source, "binaries": authenticated_binaries,
+            "status": "PASS"}
 
 
 def _slug(value: str) -> str:

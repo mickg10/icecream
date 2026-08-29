@@ -49,6 +49,10 @@ capability, so its READY count is zero. The retained Firefox giant/four-block
 extension is `NOT_RUN`.
 
 When available, pass `--capability-manifest PATH --capability-manifest-sha256
-SHA256`. The manifest must authenticate capability version, producer source
-commit/digest, and the five exact executable descriptors; otherwise current
-implemented-profile cells remain held.
+SHA256`. The manifest must include source bytes/SHA-256 and the five exact
+binary bytes/SHA-256 descriptors. The planner reopens every declared path with
+a no-follow descriptor, checks stable file identity while streaming, and
+requires byte-for-byte descriptor equality. The source must additionally be a
+tracked file in a clean Git worktree whose independently observed HEAD, tree,
+and committed blob match the manifest; otherwise current implemented-profile
+cells remain held (or the explicit capability input is rejected).
