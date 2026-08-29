@@ -170,7 +170,8 @@ def test_warm_prewarm_trace_requires_continuing_product_state(tmp_path: Path) ->
 def test_per_tu_profile_evidence_is_required(tmp_path: Path) -> None:
     log = tmp_path / "client-compile-full-1-0.log"
     log.write_text("P29 CACHE_SESSION\n")
-    observation = [{"run": "full-1", "ordinal": 0}]
+    (tmp_path / "f-0.log").write_text("CACHE_SESSION\n")
+    observation = [{"run": "full-1", "ordinal": 0, "relationship": 0}]
     runner._validate_product_log_evidence(tmp_path, observation, "P29")
     log.write_text("CACHE_SESSION\n")
     with pytest.raises(runner.LiveRunnerError, match="profile_evidence_missing"):
