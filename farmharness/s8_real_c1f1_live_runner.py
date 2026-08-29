@@ -36,6 +36,10 @@ except ImportError:  # pragma: no cover
 
 SCHEMA = "icecream-s8-real-c1f1-live-runner-v1"
 TOPOLOGY = "C1F1/100000"
+PARALLEL_TOPOLOGY = "C1F20/40"
+TOPOLOGIES = frozenset((TOPOLOGY, PARALLEL_TOPOLOGY))
+RELATIONSHIP_COUNT = {TOPOLOGY: 1, PARALLEL_TOPOLOGY: 20}
+SLOTS_PER_F = {TOPOLOGY: 1, PARALLEL_TOPOLOGY: 2}
 SCRIPT = Path(__file__).resolve().parents[1] / "unittests/p50compilee2e-run.sh"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
@@ -174,7 +178,8 @@ def load_batch_manifest(path: Path, expected_count: int = 100) -> list[dict[str,
             expected_output_relative = Path(predictive_input["source_relative"]).with_suffix(".o")
             output_parts = Path(compile_output).parts
             expected_parts = expected_output_relative.parts
-            if len(output_parts) < len(expected_parts) or output_parts[-len(expected_parts):] != expected_parts:
+            if (len(output_parts) < len(expected_parts) or
+                    output_parts[-len(expected_parts):] != expected_parts):
                 _fail(f"batch_manifest:{ordinal}:compile_output_predictive_mismatch")
             db_path = Path(db_value)
             cached = compile_databases.get(str(db_path))
@@ -309,8 +314,16 @@ def bind_batch_to_plan(rows: list[dict[str, Any]], plan_inputs: list[dict[str, A
 
 
 def load_topology(path: Path, rows: list[dict[str, Any]],
+                  suite: str = TOPOLOGY,
                   scheduling: dict[str, Any] | None = None) -> str:
-    """Require an explicit C1F1 assignment map bound to the ordered inputs."""
+    """Require an explicit assignment map bound to ordered product inputs.
+
+    C1F20/40 keeps one ordered source-stage queue per F relationship.  The
+    map is therefore part of the authenticated input, rather than a caller
+    hint that the shell runner may replace after launch.
+    """
+    if suite not in TOPOLOGIES:
+        _fail("topology:unsupported_suite")
     digest, _ = _sha(path)
     try:
         value = json.loads(path.read_text())
@@ -318,7 +331,7 @@ def load_topology(path: Path, rows: list[dict[str, Any]],
         raise LiveRunnerError("topology:invalid_json") from exc
     if (not isinstance(value, dict) or
             value.get("schema") != "icecream-s8-topology-assignment-v1" or
-            value.get("suite") != TOPOLOGY):
+            value.get("suite") != suite):
         _fail("topology:unsupported_suite")
     assignments = value.get("assignments", value.get("inputs"))
     if not isinstance(assignments, list) or len(assignments) != len(rows):
@@ -327,18 +340,46 @@ def load_topology(path: Path, rows: list[dict[str, Any]],
         if (not isinstance(item, dict) or item.get("ordinal") != ordinal or
                 item.get("tu_id") != row["tu_id"]):
             _fail(f"topology:{ordinal}:identity_mismatch")
-        if item.get("relationship") != 0 or item.get("f_slot") != 0:
-            _fail(f"topology:{ordinal}:C1F1_assignment_invalid")
+        relationship, f_slot = item.get("relationship"), item.get("f_slot")
+        if (type(relationship) is not int or type(f_slot) is not int or
+                relationship < 0 or relationship >= RELATIONSHIP_COUNT[suite] or
+                f_slot < 0 or f_slot >= SLOTS_PER_F[suite]):
+            _fail(f"topology:{ordinal}:assignment_invalid")
+    if suite == PARALLEL_TOPOLOGY:
+        relationships = [item["relationship"] for item in assignments]
+        if set(relationships) != set(range(RELATIONSHIP_COUNT[suite])):
+            _fail("topology:relationship_set_invalid")
+        slots = {(item["relationship"], item["f_slot"]) for item in assignments}
+        expected_slots = {(relationship, slot)
+                          for relationship in range(RELATIONSHIP_COUNT[suite])
+                          for slot in range(SLOTS_PER_F[suite])}
+        if slots != expected_slots:
+            _fail("topology:slot_set_invalid")
+        # Each relationship is an independent ordered source-stage stream.
+        # Interleaving between relationships is allowed, but a relationship's
+        # source order must never move backwards or overlap itself.
+        for relationship in range(RELATIONSHIP_COUNT[suite]):
+            positions = [i for i, value in enumerate(relationships) if value == relationship]
+            if positions != sorted(positions):  # defensive, documents contract
+                _fail("topology:relationship_order_invalid")
     if scheduling is not None:
+        if not isinstance(scheduling, dict):
+            _fail("topology:predictive_schedule_invalid")
         planned = scheduling.get("assignments")
-        if (scheduling.get("topology") != "C1F1" or
+        expected_plan_topology = ("C1F20" if suite == PARALLEL_TOPOLOGY else "C1F1")
+        if (scheduling.get("topology") != expected_plan_topology or
                 not isinstance(planned, list) or len(planned) != len(rows)):
             _fail("topology:predictive_schedule_invalid")
-        for ordinal, item in enumerate(planned):
-            if (not isinstance(item, dict) or item.get("ordinal") != ordinal or
-                    item.get("global_slot") != 0 or
-                    item.get("f_relationship") != 0 or
-                    item.get("per_f_slot") != 0):
+        for ordinal, (planned_item, live_item) in enumerate(
+                zip(planned, assignments, strict=True)):
+            relationship = live_item["relationship"]
+            f_slot = live_item["f_slot"]
+            expected_global_slot = relationship * SLOTS_PER_F[suite] + f_slot
+            if (not isinstance(planned_item, dict) or
+                    planned_item.get("ordinal") != ordinal or
+                    planned_item.get("global_slot") != expected_global_slot or
+                    planned_item.get("f_relationship") != relationship or
+                    planned_item.get("per_f_slot") != f_slot):
                 _fail(f"topology:{ordinal}:predictive_schedule_mismatch")
     return digest
 
@@ -389,12 +430,15 @@ def build_command(batch_manifest: Path, profile: str,
                   *, product_root: Path, corpus: str = "DuckDB",
                   regime: str = "cold", depth: str = "100", full_count: int | None = None,
                   passes: int = 2, workdir: Path | None = None,
-                  predictive_plan: Path | None = None, script: Path = SCRIPT) -> list[str]:
+                  predictive_plan: Path | None = None, script: Path = SCRIPT,
+                  suite: str = TOPOLOGY, topology: Path | None = None) -> list[str]:
     """Build the exact launch argv; this function never executes it."""
     if profile not in PROFILES:
         _fail("profile:undeclared")
     if corpus not in CORPORA:
         _fail("corpus:undeclared")
+    if suite not in TOPOLOGIES:
+        _fail("topology:unsupported_suite")
     if regime not in REGIMES:
         _fail("regime:undeclared")
     count = selected_count(depth, full_count)
@@ -408,6 +452,13 @@ def build_command(batch_manifest: Path, profile: str,
     if not batch_manifest.is_absolute() or not batch_manifest.is_file() or batch_manifest.is_symlink():
         _fail("batch_manifest:unavailable")
     load_batch_manifest(batch_manifest, count)
+    if topology is not None:
+        if not topology.is_absolute() or not topology.is_file() or topology.is_symlink():
+            _fail("topology:unavailable")
+        rows = load_batch_manifest(batch_manifest, count)
+        load_topology(topology, rows, suite)
+    elif suite != TOPOLOGY:
+        _fail("topology:required_for_parallel_suite")
     product_identity(product_root, script)
     command = ["env", f"ICECC_TEST_TOP_SRCDIR={product_root}",
             f"ICECC_TEST_TOP_BUILDDIR={product_root}",
@@ -417,9 +468,12 @@ def build_command(batch_manifest: Path, profile: str,
             f"ICECC_P50_C1F1_TIMEOUT={derive_timeout(count, passes, regime == 'warm')}",
             f"ICECC_P50_C1F1_PASSES={passes}",
             f"ICECC_P50_C1F1_EXPECTED_COUNT={count}",
+            f"ICECC_P50_SUITE={suite}",
             "ICECC_P50_C1F1_KEEP_WORK=1",
             f"ICECC_P50_C1F1_BATCH_MANIFEST={batch_manifest}",
             f"ICECC_P50_PREDICTIVE_PLAN={predictive_plan}"]
+    if topology is not None:
+        command.append(f"ICECC_P50_TOPOLOGY={topology}")
     if workdir is not None:
         if (not workdir.is_absolute() or workdir.name.startswith("p50compilee2e.") is False):
             _fail("workdir:invalid")
@@ -579,7 +633,14 @@ def _validate_product_log_evidence(work: Path, observations: list[dict[str, Any]
 
 
 def _timing_rows(stdout: str, rows: list[dict[str, Any]], work: Path,
-                 passes: int) -> list[dict[str, Any]]:
+                 passes: int, assignments: list[dict[str, Any]] | None = None,
+                 suite: str = TOPOLOGY) -> list[dict[str, Any]]:
+    if suite not in TOPOLOGIES:
+        _fail("topology:unsupported_suite")
+    if assignments is None:
+        assignments = [{"relationship": 0, "f_slot": 0} for _ in rows]
+    if len(assignments) != len(rows):
+        _fail("batch:assignment_count_mismatch")
     observations = _fields(stdout, "S8_BATCH_TU")
     if len(observations) != passes * len(rows):
         _fail("batch:incomplete_product_rows")
@@ -606,11 +667,17 @@ def _timing_rows(stdout: str, rows: list[dict[str, Any]], work: Path,
                 parsed[key] = int(observed[key])
             except (KeyError, TypeError, ValueError) as exc:
                 raise LiveRunnerError(f"batch:{index}:{key}_invalid") from exc
+        expected_assignment = assignments[ordinal]
+        expected_route = ordinal if suite == PARALLEL_TOPOLOGY else 0
         if (parsed["preprocessed_bytes"] <= 0 or parsed["remote_bytes"] <= 0 or
                 parsed["local_bytes"] <= 0 or parsed["compile_end_ns"] <= parsed["compile_start_ns"] or
-                parsed["wait_for_cs_ns"] <= 0 or parsed["assignment"] != 0 or
-                parsed["relationship"] != 0 or parsed["f_slot"] != 0):
+                parsed["wait_for_cs_ns"] <= 0 or parsed["assignment"] != expected_route or
+                parsed["relationship"] != expected_assignment["relationship"] or
+                parsed["f_slot"] != expected_assignment["f_slot"]):
             _fail(f"batch:{index}:product_metric_invalid")
+        if (suite == PARALLEL_TOPOLOGY and
+                observed.get("service_identity") != f"p50-f-{parsed['relationship']}"):
+            _fail(f"batch:{index}:service_identity_invalid")
         if (observed["preprocessed_sha256"] != expected["predictive_input"]["sha256"] or
                 parsed["preprocessed_bytes"] != expected["predictive_input"]["bytes"]):
             _fail(f"batch:{index}:predictive_payload_mismatch")
@@ -636,7 +703,49 @@ def _timing_rows(stdout: str, rows: list[dict[str, Any]], work: Path,
     return result
 
 
-def _action_stage_paths(c_path: Path, f_path: Path, expected_count: int) -> list[dict[str, Any]]:
+def _batch_windows(stdout: str, observations: list[dict[str, Any]],
+                   rows: list[dict[str, Any]], passes: int,
+                   suite: str) -> dict[str, dict[str, int]]:
+    """Authenticate wall windows emitted around the real compile jobs."""
+    windows = _fields(stdout, "S8_BATCH_WINDOW")
+    expected_runs = ["full-1"] + (["full-2"] if passes == 2 else [])
+    if len(windows) != len(expected_runs):
+        _fail("batch:window_count_mismatch")
+    result: dict[str, dict[str, int]] = {}
+    for window, run in zip(windows, expected_runs, strict=True):
+        if window.get("run") != run or run in result:
+            _fail("batch:window_identity_invalid")
+        try:
+            start_ns, end_ns = int(window["start_ns"]), int(window["end_ns"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise LiveRunnerError("batch:window_timestamp_invalid") from exc
+        if start_ns <= 0 or end_ns <= start_ns:
+            _fail("batch:window_timestamp_invalid")
+        selected = [row for row in observations if row["run"] == run]
+        if len(selected) != len(rows):
+            _fail("batch:window_observation_count_mismatch")
+        starts = [int(row["compile_start_ns"]) for row in selected]
+        ends = [int(row["compile_end_ns"]) for row in selected]
+        if min(starts) < start_ns or max(ends) > end_ns:
+            _fail(f"batch:{run}:compile_outside_batch_window")
+        if suite == PARALLEL_TOPOLOGY:
+            if not any(starts[left] < ends[right] and starts[right] < ends[left]
+                       for left in range(len(starts))
+                       for right in range(left + 1, len(starts))):
+                _fail(f"batch:{run}:no_observed_compile_overlap")
+            routes = {(int(row["relationship"]), int(row["f_slot"])) for row in selected}
+            if routes != {(relationship, slot)
+                          for relationship in range(RELATIONSHIP_COUNT[suite])
+                          for slot in range(SLOTS_PER_F[suite])}:
+                _fail(f"batch:{run}:slot_evidence_incomplete")
+        result[run] = {"start_ns": start_ns, "end_ns": end_ns,
+                       "makespan_ns": end_ns - start_ns}
+    return result
+
+
+def _action_stage_paths(c_path: Path, f_path: Path, expected_count: int,
+                        assignments: list[dict[str, Any]] | None = None,
+                        suite: str = TOPOLOGY) -> list[dict[str, Any]]:
     if not c_path.is_file() or not f_path.is_file():
         _fail("action_trace:missing")
     c_rows = action_parser.parse_action(c_path.read_text())
@@ -645,42 +754,94 @@ def _action_stage_paths(c_path: Path, f_path: Path, expected_count: int) -> list
     f_begins = [row for row in f_rows if row["action"] == "TX_BEGIN" and row["actor"] == "F"]
     if len(c_begins) != expected_count or len(f_begins) != expected_count:
         _fail("action_trace:TX_BEGIN_count_mismatch")
-    identities = {(row["c_store_guid"], row["f_store_guid"]) for row in c_begins + f_begins}
-    if len(identities) != 1:
-        _fail("action_trace:C_F_identity_changed")
-    for index, (c_row, f_row) in enumerate(zip(c_begins, f_begins, strict=True)):
+    if suite not in TOPOLOGIES:
+        _fail("action_trace:unsupported_suite")
+    if assignments is None:
+        assignments = [{"relationship": 0, "f_slot": 0} for _ in range(expected_count)]
+    elif len(assignments) != expected_count:
+        if len(assignments) == 0 or expected_count % len(assignments):
+            _fail("action_trace:assignment_count_mismatch")
+        assignments = assignments * (expected_count // len(assignments))
+    # Parallel F traces are merged by transaction digest.  Matching by digest
+    # prevents an interleaved twenty-F trace from being mistaken for a change
+    # in source order.
+    f_by_digest: dict[str, dict[str, Any]] = {}
+    for row in f_begins:
+        digest = row["transaction_digest"]
+        if digest in f_by_digest:
+            _fail("action_trace:duplicate_transaction")
+        f_by_digest[digest] = row
+    c_guid = {row["c_store_guid"] for row in c_begins}
+    if len(c_guid) != 1:
+        _fail("action_trace:C_identity_changed")
+    relation_f_guid: dict[int, str] = {}
+    relation_last_seq: dict[int, int] = {}
+    result = []
+    for index, c_row in enumerate(c_begins):
+        f_row = f_by_digest.get(c_row["transaction_digest"])
+        if f_row is None:
+            _fail(f"action_trace:{index}:transaction_missing_on_F")
+        if index and int(c_row["tu_seq"]) != int(c_begins[index - 1]["tu_seq"]) + 1:
+            _fail(f"action_trace:{index}:sequence_not_contiguous")
         # The two role traces must describe the same transaction, not merely
         # the same long-lived service GUIDs.  Keep the F-side state digest as
         # evidence below; C's stage bytes are the measured C->F channel.
         for field in ("tu_seq", "rel_seq", "history_nonce", "raw_digest", "transaction_digest"):
             if c_row[field] != f_row[field]:
                 _fail(f"action_trace:{index}:{field}_mismatch")
-        if index and (c_row["tu_seq"] != c_begins[index - 1]["tu_seq"] + 1 or
-                      c_row["rel_seq"] != c_begins[index - 1]["rel_seq"] + 1):
-            _fail(f"action_trace:{index}:sequence_not_contiguous")
-    return [{"c_to_f_bytes": int(row["stage_bytes"]),
-             "c_store_guid": row["c_store_guid"], "f_store_guid": row["f_store_guid"],
-             "tu_seq": int(row["tu_seq"]), "rel_seq": int(row["rel_seq"]),
-             "history_nonce": int(row["history_nonce"]),
-             "raw_digest": row["raw_digest"], "state_digest": row["state_digest"],
-             "transaction_digest": row["transaction_digest"],
-             "f_state_digest": f_row["state_digest"], "f_raw_digest": f_row["raw_digest"]}
-            for row, f_row in zip(c_begins, f_begins, strict=True)]
+        assignment = assignments[index]
+        relationship = int(assignment["relationship"])
+        if relationship in relation_f_guid and relation_f_guid[relationship] != f_row["f_store_guid"]:
+            _fail(f"action_trace:{index}:relationship_service_changed")
+        relation_f_guid[relationship] = f_row["f_store_guid"]
+        previous = relation_last_seq.get(relationship)
+        if previous is not None and int(c_row["rel_seq"]) != previous + 1:
+            _fail(f"action_trace:{index}:relationship_sequence_not_contiguous")
+        relation_last_seq[relationship] = int(c_row["rel_seq"])
+        if c_row["c_store_guid"] != f_row["c_store_guid"] or c_row["f_store_guid"] != f_row["f_store_guid"]:
+            _fail(f"action_trace:{index}:service_identity_mismatch")
+        result.append({"c_to_f_bytes": int(c_row["stage_bytes"]),
+             "c_store_guid": c_row["c_store_guid"], "f_store_guid": c_row["f_store_guid"],
+             "tu_seq": int(c_row["tu_seq"]), "rel_seq": int(c_row["rel_seq"]),
+             "history_nonce": int(c_row["history_nonce"]),
+             "raw_digest": c_row["raw_digest"], "state_digest": c_row["state_digest"],
+             "transaction_digest": c_row["transaction_digest"],
+             "f_state_digest": f_row["state_digest"], "f_raw_digest": f_row["raw_digest"],
+             "relationship": relationship, "f_slot": int(assignment["f_slot"])})
+    if suite == PARALLEL_TOPOLOGY and set(relation_f_guid) != set(range(RELATIONSHIP_COUNT[suite])):
+        _fail("action_trace:relationship_set_mismatch")
+    return result
 
 
-def _action_stage(work: Path, expected_count: int) -> list[dict[str, Any]]:
+def _action_stage(work: Path, expected_count: int,
+                  assignments: list[dict[str, Any]] | None = None,
+                  suite: str = TOPOLOGY) -> list[dict[str, Any]]:
     # These are the post-prewarm slices emitted by the shell gate.  Reading
     # the full warm trace would admit prewarm transactions as measurements.
     return _action_stage_paths(work / "s7-measured-c-action-trace.jsonl",
                                work / "s7-measured-f-action-trace.jsonl",
-                               expected_count)
+                               expected_count, assignments, suite)
 
 
 def _validate_warm_continuation(prewarm: list[dict[str, Any]],
-                                measured: list[dict[str, Any]], expected_count: int) -> None:
+                                measured: list[dict[str, Any]], expected_count: int,
+                                suite: str = TOPOLOGY) -> None:
     """Bind measured TU zero to the terminal prewarm transaction state."""
     if len(prewarm) != expected_count or len(measured) < expected_count:
         _fail("action_trace:prewarm_count_mismatch")
+    if suite == PARALLEL_TOPOLOGY:
+        for relationship in range(RELATIONSHIP_COUNT[suite]):
+            prior = [item for item in prewarm if item["relationship"] == relationship]
+            current = [item for item in measured if item["relationship"] == relationship]
+            if not prior or not current:
+                _fail("action_trace:relationship_missing_from_warm_continuation")
+            terminal, first = prior[-1], current[0]
+            if (terminal["f_store_guid"] != first["f_store_guid"] or
+                    first["tu_seq"] <= terminal["tu_seq"] or
+                    first["rel_seq"] != terminal["rel_seq"] + 1 or
+                    first["history_nonce"] != terminal["history_nonce"]):
+                _fail("action_trace:relationship_state_does_not_continue_prewarm")
+        return
     terminal, first = prewarm[-1], measured[0]
     if (terminal["c_store_guid"] != first["c_store_guid"] or
             terminal["f_store_guid"] != first["f_store_guid"] or
@@ -708,7 +869,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
              launch_identity: dict[str, Any] | None = None,
              execution_environment: str = "host_product_build",
              runtime_image: dict[str, str] | None = None,
-             timestamp: str | None = None) -> Path:
+             timestamp: str | None = None, suite: str = TOPOLOGY) -> Path:
     """Turn one completed product invocation into two authenticated live curves."""
     if returncode != 0 or "PASS: all-P50 C1F1" not in stdout:
         _fail("product_run:did_not_pass")
@@ -721,7 +882,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
             set(runtime_image) != {"reference", "image_id", "architecture", "os", "created"} or
             IMAGE_ID.fullmatch(runtime_image.get("image_id", "")) is None):
         _fail("execution_environment:image_identity_invalid")
-    if corpus not in CORPORA or regime not in REGIMES:
+    if corpus not in CORPORA or regime not in REGIMES or suite not in TOPOLOGIES:
         _fail("cell:undeclared")
     plan, plan_inputs, plan_sha = load_predictive_plan(
         predictive_plan, corpus=corpus, profile=profile, regime=regime, depth=depth)
@@ -732,7 +893,9 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
         _fail("run_options:invalid")
     rows = load_batch_manifest(batch_manifest, expected_count)
     bind_batch_to_plan(rows, plan_inputs)
-    topology_sha = load_topology(topology, rows, plan.get("scheduling"))
+    topology_sha = load_topology(topology, rows, suite, plan.get("scheduling"))
+    topology_value = json.loads(topology.read_text())
+    assignments = topology_value.get("assignments", topology_value.get("inputs"))
     work_lines = [line.split("=", 1)[1] for line in stdout.splitlines() if line.startswith("S7_WORKDIR=")]
     if len(work_lines) != 1:
         _fail("product_run:workdir_missing")
@@ -747,11 +910,16 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
         return values[0]
     if output_value("S8_BATCH_COUNT") != str(expected_count):
         _fail("product_run:batch_count_mismatch")
+    if output_value("S8_SUITE") != suite:
+        _fail("product_run:suite_mismatch")
     if output_value("S8_BATCH_PASSES") != str(passes):
         _fail("product_run:batch_passes_mismatch")
     if output_value("S8_BATCH_WARM") != str(int(regime == "warm")):
         _fail("product_run:batch_regime_mismatch")
-    if "S8_SCHEDULING mode=serial execution_slots=1 max_concurrency=1" not in stdout.splitlines():
+    scheduling_marker = ("S8_SCHEDULING mode=parallel execution_slots=40 max_concurrency=40"
+                         if suite == PARALLEL_TOPOLOGY else
+                         "S8_SCHEDULING mode=serial execution_slots=1 max_concurrency=1")
+    if scheduling_marker not in stdout.splitlines():
         _fail("product_run:scheduling_identity_missing")
     expected_binaries = _binary_identity(stdout)
     commit, tree, binaries, runner_sha = product_identity(product_root)
@@ -763,9 +931,10 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                 launch_identity.get("binary_sha256") != binaries or
                 launch_identity.get("runner_sha256") != runner_sha):
             _fail("product_identity:changed_during_run")
-    observations = _timing_rows(stdout, rows, work, passes)
+    observations = _timing_rows(stdout, rows, work, passes, assignments, suite)
+    batch_windows = _batch_windows(stdout, observations, rows, passes, suite)
     _validate_product_log_evidence(work, observations, profile)
-    stages = _action_stage(work, len(observations))
+    stages = _action_stage(work, len(observations), assignments, suite)
     if len(stages) != len(observations):
         _fail("action_trace:stage_count_mismatch")
     for observation, action in zip(observations, stages, strict=True):
@@ -781,8 +950,9 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     if regime == "warm":
         prewarm_stages = _action_stage_paths(
             work / "s7-prewarm-c-action-trace.jsonl",
-            work / "s7-prewarm-f-action-trace.jsonl", expected_count)
-        _validate_warm_continuation(prewarm_stages, stages, expected_count)
+            work / "s7-prewarm-f-action-trace.jsonl", expected_count,
+            assignments, suite)
+        _validate_warm_continuation(prewarm_stages, stages, expected_count, suite)
     batch_manifest_sha, batch_manifest_bytes = _sha(batch_manifest)
     input_sha = hashlib.sha256(_canonical({"source_manifest_sha256": plan["source_manifest"]["sha256"],
                                            "inputs": plan_inputs})).hexdigest()
@@ -794,7 +964,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     if TIMESTAMP.fullmatch(timestamp) is None:
         _fail("timestamp:invalid")
-    target = output / "icecream" / TOPOLOGY.replace("/", "-") / timestamp / profile
+    target = output / "icecream" / suite.replace("/", "-") / timestamp / profile
     target.parent.mkdir(parents=True, exist_ok=True)
     target.mkdir(parents=True, exist_ok=False)
     # Preserve the product-generated files, not just their digests.  The
@@ -822,6 +992,13 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
         if not path.is_file():
             _fail(f"action_trace:retained_file_missing:{path.name}")
         shutil.copy2(path, retained / path.name)
+    # Logs are product evidence, not caller-provided measurements.  Preserve
+    # every lifecycle log so assignment and timing rows can be audited later.
+    for path in sorted(work.glob("*.log")):
+        if path.is_file() and path.name not in {p.name for p in trace_paths}:
+            shutil.copy2(path, retained / path.name)
+    assignment_raw = _canonical({"suite": suite, "assignments": assignments}) + b"\n"
+    _write_new(retained / "assignment-witness.json", assignment_raw)
     for item in observations:
         if retain_all_artifacts or item["ordinal"] < artifact_sample:
             for field in ("preprocessed_path", "remote_path", "local_path"):
@@ -883,7 +1060,10 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
         "c_action": hashlib.sha256(c_action_raw).hexdigest(),
         "f_action": hashlib.sha256(f_action_raw).hexdigest(),
     })).hexdigest()
-    witness = {"c_action": {"path": "product-evidence/s7-measured-c-action-trace.jsonl", "sha256": hashlib.sha256(c_action_raw).hexdigest(), "bytes": len(c_action_raw)},
+    witness = {"assignment": {"path": "product-evidence/assignment-witness.json",
+                               "sha256": hashlib.sha256(assignment_raw).hexdigest(),
+                               "bytes": len(assignment_raw)},
+               "c_action": {"path": "product-evidence/s7-measured-c-action-trace.jsonl", "sha256": hashlib.sha256(c_action_raw).hexdigest(), "bytes": len(c_action_raw)},
                "f_action": {"path": "product-evidence/s7-measured-f-action-trace.jsonl", "sha256": hashlib.sha256(f_action_raw).hexdigest(), "bytes": len(f_action_raw)}}
     if passes == 2:
         witness["timing_full_2"] = {"path": "timing_full-2.jsonl", "sha256": hashlib.sha256(timing_by_run["full-2"]).hexdigest(), "bytes": len(timing_by_run["full-2"])}
@@ -969,7 +1149,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     _write_new(target / "live_curve_manifest.json", (target / "live_curve_manifest_full-1.json").read_bytes())
     _write_new(target / "records.jsonl", b"".join(_canonical(record) + b"\n" for record in records))
     experiment = {"schema": SCHEMA, "cell": {"corpus": corpus, "profile": profile, "regime": regime},
-                  "split": split, "topology": TOPOLOGY, "depth": depth,
+                  "split": split, "topology": suite, "depth": depth,
                   "declared_count": expected_count, "runs": ["full-1"] + (["full-2"] if passes == 2 else []),
                   "same_service_state": True, "input_manifest_sha256": batch_manifest_sha,
                   "input_digest": input_sha,
@@ -984,10 +1164,16 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                   "runner_sha256": runner_sha,
                   "launch_identity": launch_identity,
                   "curve_manifests": manifests, "remote_compile_required": True,
-                  "scheduling": {"mode": "serial", "execution_slots": 1, "max_concurrency": 1},
+                  "batch_windows": batch_windows,
+                  "scheduling": ({"mode": "parallel", "execution_slots": 40, "max_concurrency": 40}
+                                  if suite == PARALLEL_TOPOLOGY else
+                                  {"mode": "serial", "execution_slots": 1, "max_concurrency": 1}),
                   "artifact_retention": {"mode": "all" if retain_all_artifacts else "sample",
                                          "sample_tus_per_run": artifact_sample},
-                  "prewarm": regime == "warm", "prewarm_evidence": prewarm_descriptor}
+                  "prewarm": regime == "warm", "prewarm_evidence": prewarm_descriptor,
+                  "suite": suite, "relationship_count": RELATIONSHIP_COUNT[suite],
+                  "slots_per_f": SLOTS_PER_F[suite],
+                  "assignment_witness": "product-evidence/assignment-witness.json"}
     _write_new(target / "experiment_manifest.json", _canonical(experiment) + b"\n")
     # The lifecycle temporary tree is diagnostic state on failure, but must
     # not survive a fully authenticated successful retention.
@@ -1039,6 +1225,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--batch-manifest", type=Path, required=True)
     parser.add_argument("--predictive-plan", type=Path, required=True)
     parser.add_argument("--topology", type=Path, required=True)
+    parser.add_argument("--suite", choices=tuple(TOPOLOGIES), default=TOPOLOGY)
     parser.add_argument("--profile", choices=PROFILES, required=True)
     parser.add_argument("--product-root", type=Path, required=True)
     parser.add_argument("--corpus", choices=CORPORA, default="DuckDB")
@@ -1067,7 +1254,7 @@ def main(argv: list[str] | None = None) -> int:
         args.full_count = len(plan_inputs)
     count = selected_count(args.depth, args.full_count)
     rows = load_batch_manifest(batch_manifest, count)
-    load_topology(topology, rows, _plan.get("scheduling"))
+    load_topology(topology, rows, args.suite, _plan.get("scheduling"))
     run_workdir: Path | None = None
     run_work_parent: Path | None = None
     runtime_image: dict[str, str] | None = None
@@ -1082,7 +1269,7 @@ def main(argv: list[str] | None = None) -> int:
             execution_environment = "pinned_container_product_build"
         else:
             run_workdir = Path(tempfile.mkdtemp(
-                prefix="p50compilee2e.", dir=DEFAULT_CONTAINER_TEMP_ROOT))
+                prefix="p50compilee2e.", dir=tempfile.gettempdir()))
             run_workdir.rmdir()
     launch_identity = None
     if args.execute:
@@ -1095,7 +1282,8 @@ def main(argv: list[str] | None = None) -> int:
                             product_root=args.product_root.absolute(), corpus=args.corpus,
                             regime=args.regime, depth=args.depth, full_count=args.full_count,
                             passes=args.passes, workdir=run_workdir,
-                            predictive_plan=predictive_plan)
+                            predictive_plan=predictive_plan, suite=args.suite,
+                            topology=topology)
     if not args.execute:
         print(json.dumps({"schema": SCHEMA, "status": "DRY_RUN", "command": command,
                           "execution_mode": args.execution_mode,
@@ -1144,7 +1332,7 @@ def main(argv: list[str] | None = None) -> int:
                         launch_identity=launch_identity,
                         execution_environment=execution_environment,
                         runtime_image=runtime_image,
-                        timestamp=args.timestamp)
+                        timestamp=args.timestamp, suite=args.suite)
     except LiveRunnerError as exc:
         print(str(exc))
         if run_workdir is not None:

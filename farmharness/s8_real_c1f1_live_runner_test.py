@@ -332,7 +332,7 @@ def test_predictive_schedule_slot_mutation_fails_before_live_descriptor(tmp_path
         {"ordinal": 0, "global_slot": 1, "f_relationship": 0, "per_f_slot": 0}
     ]}
     with pytest.raises(runner.LiveRunnerError, match="predictive_schedule_mismatch"):
-        runner.load_topology(topology, rows, scheduling)
+        runner.load_topology(topology, rows, scheduling=scheduling)
 
 
 def test_product_identity_rejects_tracked_edit(tmp_path: Path) -> None:
@@ -354,6 +354,10 @@ def test_batch_shell_excludes_warm_prewarm_and_carries_optional_repeat() -> None
         "s8_real_c1f1_live_runner.py").read_text()
     assert "shutil.rmtree(work)" in Path(__file__).resolve().parent.joinpath(
         "s8_real_c1f1_live_runner.py").read_text()
+    assert 'C1F20/40) relationship_count=20; slots_per_f=2; execution_slots=40' in shell
+    assert '"$build/daemon/iceccd" "$@" -p "$worker_port" -m 2' in shell
+    assert 'S8_BATCH_WINDOW run=%s start_ns=%s end_ns=%s' in shell
+    assert 'run_one "$run_label" "$ordinal" "$relationship" "$f_slot"' in shell
 
 
 def test_unsupported_topology_fails_closed(tmp_path: Path) -> None:
@@ -363,6 +367,44 @@ def test_unsupported_topology_fails_closed(tmp_path: Path) -> None:
     topology.write_text(json.dumps({"suite": "C1F20/40", "assignments": []}))
     with pytest.raises(runner.LiveRunnerError, match="unsupported_suite"):
         runner.load_topology(topology, rows)
+
+
+def test_parallel_topology_binds_all_relationships_and_slots(tmp_path: Path) -> None:
+    batch = _batch(tmp_path)
+    rows = runner.load_batch_manifest(batch)
+    topology = tmp_path / "parallel-topology.json"
+    assignments = [{"ordinal": index, "tu_id": row["tu_id"],
+                    "relationship": index % 20, "f_slot": (index // 20) % 2}
+                   for index, row in enumerate(rows)]
+    topology.write_text(json.dumps({"schema": "icecream-s8-topology-assignment-v1",
+                                    "suite": runner.PARALLEL_TOPOLOGY,
+                                    "assignments": assignments}))
+    assert len(runner.load_topology(topology, rows, runner.PARALLEL_TOPOLOGY)) == 64
+    assignments[0]["relationship"] = 20
+    topology.write_text(json.dumps({"schema": "icecream-s8-topology-assignment-v1",
+                                    "suite": runner.PARALLEL_TOPOLOGY,
+                                    "assignments": assignments}))
+    with pytest.raises(runner.LiveRunnerError, match="assignment_invalid"):
+        runner.load_topology(topology, rows, runner.PARALLEL_TOPOLOGY)
+
+
+def test_parallel_batch_window_requires_real_overlap() -> None:
+    rows = [{} for _ in range(40)]
+    observations = [{"run": "full-1", "relationship": index % 20,
+                     "f_slot": (index // 20) % 2,
+                     "compile_start_ns": 1_000 + index,
+                     "compile_end_ns": 2_000 + index}
+                    for index in range(40)]
+    stdout = "S8_BATCH_WINDOW run=full-1 start_ns=900 end_ns=2100\n"
+    windows = runner._batch_windows(stdout, observations, rows, 1,
+                                    runner.PARALLEL_TOPOLOGY)
+    assert windows["full-1"]["makespan_ns"] == 1_200
+    serial = [{**row, "compile_start_ns": 1 + index * 100,
+               "compile_end_ns": 1 + index * 100 + 10}
+              for index, row in enumerate(observations)]
+    serial_stdout = "S8_BATCH_WINDOW run=full-1 start_ns=1 end_ns=5000\n"
+    with pytest.raises(runner.LiveRunnerError, match="no_observed_compile_overlap"):
+        runner._batch_windows(serial_stdout, serial, rows, 1, runner.PARALLEL_TOPOLOGY)
 
 
 def test_source_mutation_is_rejected_before_launch(tmp_path: Path) -> None:
