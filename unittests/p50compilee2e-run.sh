@@ -532,7 +532,10 @@ compile_once() {
     client_log="$work/client-compile-$label.log"
     compile_include_args=""
     if test -n "$item_compile_db"; then
-        remote_compile_args=$(compile_args_for "$item_compile_db" "$item_compile_source" "$item_compile_output" "$work/src/$label.cpp" "$remote_obj")
+        # A depth campaign passes the authenticated retained .ii as input_path,
+        # so the live product and predictive simulator consume identical bytes.
+        # Single-source callers continue to pass their ordinary staged source.
+        remote_compile_args=$(compile_args_for "$item_compile_db" "$item_compile_source" "$item_compile_output" "$input_path" "$remote_obj")
         local_compile_args=$(compile_args_for "$item_compile_db" "$item_compile_source" "$item_compile_output" "$input_path" "$local_obj")
     elif test -n "$include_root"; then
         compile_include_args="-I$include_root"
@@ -597,8 +600,8 @@ if test -n "$batch_manifest"; then
         emit_rows=${2:-1}
         ordinal=0
         while IFS="$(printf '\t')" read -r tu_id source_path source_relative source_sha predictive_path predictive_relative payload_sha payload_bytes item_db item_db_sha item_source item_output; do
-            staged="$work/src/$run_label-$ordinal.cpp"
-            cp -- "$source_path" "$staged"
+            staged="$work/src/$run_label-$ordinal.ii"
+            cp -- "$predictive_path" "$staged"
             compile_once "$run_label-$ordinal" "$staged" "$item_db" "$item_source" "$item_output"
             remote_obj="$work/out/remote-$run_label-$ordinal.o"
             local_obj="$work/out/local-$run_label-$ordinal.o"
