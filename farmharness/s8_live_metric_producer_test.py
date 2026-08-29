@@ -83,6 +83,26 @@ def test_missing_timing_is_hold_and_never_scored(tmp_path: Path) -> None:
     assert not (tmp_path / "hold" / "live-curve-manifest.json").exists()
 
 
+def test_partial_directional_timing_is_hold_and_never_scored(tmp_path: Path) -> None:
+    package = _fixture(tmp_path)
+    timing_path = package / "timing.jsonl"
+    rows = [json.loads(line) for line in timing_path.read_bytes().splitlines()]
+    rows[0]["C_TO_F_bytes"] = 17
+    timing = b"".join(canonical_bytes(row) + b"\n" for row in rows)
+    timing_path.write_bytes(timing)
+    evidence_path = package / "evidence.json"
+    evidence = json.loads(evidence_path.read_text())
+    evidence["evidence"]["timing"].update(sha256=_digest(timing), bytes=len(timing))
+    evidence.pop("evidence_sha256")
+    evidence["evidence_sha256"] = _digest(canonical_bytes(evidence))
+    evidence_path.write_bytes(canonical_bytes(evidence) + b"\n")
+    result = json.loads(produce(package, tmp_path / "hold").read_text())
+    assert result["status"] == "HOLD"
+    assert result["scored"] is False
+    assert result["reason"] == "timing:timing:1:directional_fields_must_be_paired"
+    assert not (tmp_path / "hold" / "live-curve-manifest.json").exists()
+
+
 @pytest.mark.parametrize("corpus", ("DuckDB", "LLVM-1238"))
 def test_held_out_cells_are_scored_only_from_authenticated_fixture(tmp_path: Path,
                                                                     corpus: str) -> None:

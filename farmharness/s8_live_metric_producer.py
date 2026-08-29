@@ -261,8 +261,16 @@ def _timing_rows(package: Path, descriptors: dict[str, dict[str, object]], cell:
             # it when present so its curve has the same non-derived metric
             # shape as the predictive product curve; legacy S7 packages stay
             # consumable as their original aggregate curve.
-            directional = (value.get("C_TO_F_bytes"), value.get("F_TO_C_bytes"))
-            if all(type(item) is int and item >= 0 for item in directional):
+            directional_fields = ("C_TO_F_bytes", "F_TO_C_bytes")
+            directional_present = tuple(field in value for field in directional_fields)
+            if any(directional_present):
+                if not all(directional_present):
+                    raise ProducerError(
+                        f"timing:{name}:{line_number}:directional_fields_must_be_paired")
+                directional = tuple(value[field] for field in directional_fields)
+                if not all(type(item) is int and item >= 0 for item in directional):
+                    raise ProducerError(
+                        f"timing:{name}:{line_number}:directional_bytes_invalid")
                 row["C_TO_F_bytes"], row["F_TO_C_bytes"] = directional
             rows.append(row)
     # A cold S7 cell has exactly one measured TU.  Never manufacture extra
