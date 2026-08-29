@@ -14,6 +14,7 @@ build=${ICECC_TEST_TOP_BUILDDIR:-$(CDPATH= cd -- "$src" && pwd)}
 timeout_s=${ICECC_P50_C1F1_TIMEOUT:-180}
 profile_marker=${ICECC_P50_PROFILE:-ZSTD_ROUTE}
 warm=${ICECC_P50_C1F1_WARM:-0}
+passes=${ICECC_P50_C1F1_PASSES:-2}
 grz_product_configured() {
     # GRZ is a product capability, not merely a selector spelling.  Require
     # both configure's feature definition and the generated cache product
@@ -54,6 +55,13 @@ case "$warm" in
         exit 1
         ;;
 esac
+case "$passes" in
+    1|2) ;;
+    *)
+        echo "FAIL: ICECC_P50_C1F1_PASSES must be 1 or 2" >&2
+        exit 1
+        ;;
+esac
 
 set +e
 "$src/unittests/p50compilee2e-source.sh"
@@ -85,7 +93,17 @@ command -v bash >/dev/null 2>&1 || {
     exit 77
 }
 
-work=$(CDPATH= cd -- "$(mktemp -d "${TMPDIR:-/tmp}/p50compilee2e.XXXXXX")" && pwd)
+if test -n "${ICECC_P50_C1F1_WORKDIR:-}"; then
+    work=$ICECC_P50_C1F1_WORKDIR
+    case "$work" in
+        /*/p50compilee2e.*) ;;
+        *) echo "FAIL: supplied workdir must be an absolute private p50compilee2e path" >&2; exit 1 ;;
+    esac
+    test ! -e "$work" || { echo "FAIL: supplied workdir already exists" >&2; exit 1; }
+    mkdir -p "$work"
+else
+    work=$(CDPATH= cd -- "$(mktemp -d "${TMPDIR:-/tmp}/p50compilee2e.XXXXXX")" && pwd)
+fi
 # The scheduler changes to its configured service account before opening the
 # requested log.  Keep the test root traversable and pre-create only that log
 # as writable; the cache runtime and HOME below retain their own 0700 modes.
@@ -258,9 +276,14 @@ if not rows:
     raise SystemExit("empty batch manifest")
 seen = set()
 for row in rows:
-    if not isinstance(row, dict) or set(row) - {"tu_id", "source", "sha256", "compile_db", "compile_source"}:
+    if not isinstance(row, dict) or set(row) - {"tu_id", "source", "sha256", "preprocessed_sha256", "preprocessed_bytes", "compile_db", "compile_source"}:
         raise SystemExit("batch manifest fields invalid")
     tu, source, expected = row.get("tu_id"), row.get("source"), row.get("sha256")
+    payload_sha, payload_bytes = row.get("preprocessed_sha256"), row.get("preprocessed_bytes")
+    if (not isinstance(payload_sha, str) or len(payload_sha) != 64 or
+            any(char not in "0123456789abcdef" for char in payload_sha) or
+            type(payload_bytes) is not int or payload_bytes <= 0):
+        raise SystemExit("batch predictive payload descriptor invalid")
     if (not isinstance(tu, str) or not tu or tu in seen or "\t" in tu or
             any(char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-" for char in tu)):
         raise SystemExit("batch TU identity invalid")
@@ -281,9 +304,19 @@ for row in rows:
             raise SystemExit("batch compile database unavailable")
         if not isinstance(compile_source, str) or not os.path.isabs(compile_source):
             raise SystemExit("batch compile source must be absolute")
-    print("\t".join((tu, source, actual, db, compile_source)))
+    print("\t".join((tu, source, actual, payload_sha, str(payload_bytes), db, compile_source)))
     seen.add(tu)
 PY
+    batch_expected_count=${ICECC_P50_C1F1_EXPECTED_COUNT:-}
+    test "$batch_expected_count" -gt 0 2>/dev/null || {
+        echo "FAIL: batch expected count is required" >&2
+        exit 1
+    }
+    batch_actual_count=$(wc -l <"$work/batch.tsv")
+    test "$batch_actual_count" -eq "$batch_expected_count" || {
+        echo "FAIL: batch manifest count does not match selected depth" >&2
+        exit 1
+    }
 fi
 if test -n "$batch_manifest" || test -n "$compile_db" || test -n "$compile_source"; then
     if test -z "$batch_manifest"; then
@@ -517,35 +550,20 @@ compile_once() {
     }
 }
 
-# Warm is a real two-transaction lifecycle: the prewarm transaction and the
-# measured transaction share the same scheduler, C/F daemons, cache service,
-# and input source.  The prewarm remains outside measured evidence.
+# A batch always reuses this one scheduler/C/F/cache lifecycle.  Warm mode
+# first compiles the exact selected ordered manifest as prewarm work; those
+# rows remain outside measured evidence while the trace offsets below bind the
+# measured pass(es) to the same service state.
 prewarm_c_trace="$work/s7-prewarm-c-action-trace.jsonl"
 prewarm_f_trace="$work/s7-prewarm-f-action-trace.jsonl"
 measured_c_trace="$work/s7-measured-c-action-trace.jsonl"
 measured_f_trace="$work/s7-measured-f-action-trace.jsonl"
-if test "$warm" = 1; then
-    echo "S7_WARM_PREWARM_BEGIN"
-    compile_once prewarm
-    test -s "$c_action_trace" && test -s "$f_action_trace" || {
-        echo "FAIL: prewarm product action traces are missing" >&2
-        exit 1
-    }
-    cp -- "$c_action_trace" "$prewarm_c_trace"
-    cp -- "$f_action_trace" "$prewarm_f_trace"
-    prewarm_c_lines=$(wc -l <"$c_action_trace")
-    prewarm_f_lines=$(wc -l <"$f_action_trace")
-    echo "S7_WARM_PREWARM_COMPLETE"
-fi
 if test -n "$batch_manifest"; then
-    test "$warm" = 0 || {
-        echo "FAIL: batch manifest currently supports cold full-1/full-2 only" >&2
-        exit 1
-    }
     run_batch() {
         run_label=$1
+        emit_rows=${2:-1}
         ordinal=0
-        while IFS="$(printf '\t')" read -r tu_id source_path source_sha item_db item_source; do
+        while IFS="$(printf '\t')" read -r tu_id source_path source_sha payload_sha payload_bytes item_db item_source; do
             staged="$work/src/$run_label-$ordinal.cpp"
             cp -- "$source_path" "$staged"
             compile_once "$run_label-$ordinal" "$staged" "$item_db" "$item_source"
@@ -558,21 +576,55 @@ if test -n "$batch_manifest"; then
             local_bytes=$(stat -c %s "$local_obj")
             preprocessed_sha=$(sha256sum "$preprocessed_capture" | awk '{print $1}')
             preprocessed_bytes=$(stat -c %s "$preprocessed_capture")
+            test "$preprocessed_sha" = "$payload_sha" && test "$preprocessed_bytes" -eq "$payload_bytes" || {
+                echo "FAIL: preprocessed payload differs from authenticated predictive descriptor ($run_label-$ordinal)" >&2
+                exit 1
+            }
             wait_ms=$(sed -nE 's/.*<\/wait for cs: ([0-9]+)ms>.*/\1/p' "$work/client-compile-$run_label-$ordinal.log" | tail -n 1)
             test -n "$wait_ms" || { echo "FAIL: client wait-for-cs timing missing ($run_label-$ordinal)" >&2; exit 1; }
-            printf 'S8_BATCH_TU run=%s ordinal=%s tu_id=%s source_sha256=%s preprocessed_path=%s preprocessed_sha256=%s preprocessed_bytes=%s remote_path=%s remote_sha256=%s remote_bytes=%s local_path=%s local_sha256=%s local_bytes=%s byte_identical=%s remote_compile=%s compile_start_ns=%s compile_end_ns=%s wait_for_cs_ns=%s assignment=0 relationship=0 f_slot=0\n' \
-                "$run_label" "$ordinal" "$tu_id" "$source_sha" "$preprocessed_capture" "$preprocessed_sha" "$preprocessed_bytes" \
-                "$remote_obj" "$remote_sha" "$remote_bytes" "$local_obj" "$local_sha" "$local_bytes" \
-                "$(test "$remote_sha" = "$local_sha" && echo 1 || echo 0)" 1 \
-                "$compile_start_ns" "$compile_end_ns" "$((wait_ms * 1000000))"
+            if test "$emit_rows" = 1; then
+                printf 'S8_BATCH_TU run=%s ordinal=%s tu_id=%s source_sha256=%s preprocessed_path=%s preprocessed_sha256=%s preprocessed_bytes=%s remote_path=%s remote_sha256=%s remote_bytes=%s local_path=%s local_sha256=%s local_bytes=%s byte_identical=%s remote_compile=%s compile_start_ns=%s compile_end_ns=%s wait_for_cs_ns=%s assignment=0 relationship=0 f_slot=0\n' \
+                    "$run_label" "$ordinal" "$tu_id" "$source_sha" "$preprocessed_capture" "$preprocessed_sha" "$preprocessed_bytes" \
+                    "$remote_obj" "$remote_sha" "$remote_bytes" "$local_obj" "$local_sha" "$local_bytes" \
+                    "$(test "$remote_sha" = "$local_sha" && echo 1 || echo 0)" 1 \
+                    "$compile_start_ns" "$compile_end_ns" "$((wait_ms * 1000000))"
+            fi
             ordinal=$((ordinal + 1))
         done <"$work/batch.tsv"
-        test "$ordinal" -gt 0 || { echo "FAIL: batch manifest produced no TUs" >&2; exit 1; }
+        test "$ordinal" -eq "$batch_expected_count" || { echo "FAIL: batch manifest count changed during run" >&2; exit 1; }
         echo "S8_BATCH_COMPLETE run=$run_label count=$ordinal"
     }
-    run_batch full-1
-    run_batch full-2
+    if test "$warm" = 1; then
+        echo "S7_WARM_PREWARM_BEGIN"
+        run_batch prewarm 0
+        test -s "$c_action_trace" && test -s "$f_action_trace" || {
+            echo "FAIL: prewarm product action traces are missing" >&2
+            exit 1
+        }
+        cp -- "$c_action_trace" "$prewarm_c_trace"
+        cp -- "$f_action_trace" "$prewarm_f_trace"
+        prewarm_c_lines=$(wc -l <"$c_action_trace")
+        prewarm_f_lines=$(wc -l <"$f_action_trace")
+        echo "S7_WARM_PREWARM_COMPLETE"
+    fi
+    run_batch full-1 1
+    if test "$passes" = 2; then
+        run_batch full-2 1
+    fi
 else
+    if test "$warm" = 1; then
+        echo "S7_WARM_PREWARM_BEGIN"
+        compile_once prewarm
+        test -s "$c_action_trace" && test -s "$f_action_trace" || {
+            echo "FAIL: prewarm product action traces are missing" >&2
+            exit 1
+        }
+        cp -- "$c_action_trace" "$prewarm_c_trace"
+        cp -- "$f_action_trace" "$prewarm_f_trace"
+        prewarm_c_lines=$(wc -l <"$c_action_trace")
+        prewarm_f_lines=$(wc -l <"$f_action_trace")
+        echo "S7_WARM_PREWARM_COMPLETE"
+    fi
     compile_once measured
 fi
 
@@ -599,6 +651,10 @@ echo "S7_MEASURED_C_ACTION_TRACE=$measured_c_trace"
 echo "S7_MEASURED_F_ACTION_TRACE=$measured_f_trace"
 echo "S7_WORKDIR=$work"
 if test -n "$batch_manifest"; then
+    echo "S8_BATCH_COUNT=$batch_expected_count"
+    echo "S8_BATCH_PASSES=$passes"
+    echo "S8_BATCH_WARM=$warm"
+    echo "S8_SCHEDULING mode=serial execution_slots=1 max_concurrency=1"
     echo "S8_IMAGE_ID=$image_id"
     for binary_role in scheduler/icecc-scheduler daemon/iceccd client/icecc cache/icecc-cache-service; do
         binary_path="$build/$binary_role"
