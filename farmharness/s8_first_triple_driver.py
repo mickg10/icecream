@@ -41,7 +41,7 @@ LIVE_SCHEMA = "icecream-s7-live-cell-v1"
 DRIVER_SCHEMA = "icecream-s8-first-triple-driver-v2"
 LIVE_PRODUCERS = frozenset({
     "s7_live_observation", "s7_warm_replay", "s7_zstd_tu_cells",
-    "s8_live_metric_producer",
+    "s8_live_metric_producer", "s8_real_c1f1_live_runner",
 })
 CELL_FIELDS = frozenset(("corpus", "profile", "regime"))
 # S7's retained ``wait for cs`` measurement covers the remote compile and

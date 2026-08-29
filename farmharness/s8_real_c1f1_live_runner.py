@@ -114,12 +114,17 @@ def load_batch_manifest(path: Path, expected_count: int = 100) -> list[dict[str,
     for ordinal, value in enumerate(values):
         if not isinstance(value, dict):
             _fail(f"batch_manifest:{ordinal}:object_required")
-        required = {"tu_id", "source", "sha256", "preprocessed_sha256", "preprocessed_bytes"}
+        required = {"tu_id", "source", "source_relative", "sha256",
+                    "preprocessed_sha256", "preprocessed_bytes"}
         if not required.issubset(value) or set(value) - required - {"compile_db", "compile_source"}:
             _fail(f"batch_manifest:{ordinal}:fields_invalid")
         tu_id, source = value["tu_id"], value["source"]
+        source_relative = value["source_relative"]
         if (not isinstance(tu_id, str) or SAFE.fullmatch(tu_id) is None or tu_id in seen
-                or not isinstance(source, str) or not os.path.isabs(source)):
+                or not isinstance(source, str) or not os.path.isabs(source)
+                or not isinstance(source_relative, str) or not source_relative or
+                os.path.isabs(source_relative) or any(part in ("", ".", "..")
+                                                       for part in Path(source_relative).parts)):
             _fail(f"batch_manifest:{ordinal}:identity_invalid")
         digest, size = _sha(Path(source))
         if value.get("sha256") != digest:
@@ -129,6 +134,7 @@ def load_batch_manifest(path: Path, expected_count: int = 100) -> list[dict[str,
         if type(payload_bytes) is not int or payload_bytes <= 0:
             _fail(f"batch_manifest:{ordinal}:preprocessed_bytes_invalid")
         row = {"ordinal": ordinal, "tu_id": tu_id, "source": source,
+               "source_relative": source_relative,
                "sha256": digest, "bytes": size,
                "preprocessed_sha256": payload_sha, "preprocessed_bytes": payload_bytes}
         for key in ("compile_db", "compile_source"):
@@ -142,12 +148,18 @@ def load_batch_manifest(path: Path, expected_count: int = 100) -> list[dict[str,
     return rows
 
 
-def payload_descriptor_digest(rows: list[dict[str, Any]]) -> str:
-    """Hash the ordered predictive `.ii` descriptors, independent of paths."""
-    descriptors = [{"ordinal": row["ordinal"], "tu_id": row["tu_id"],
-                    "sha256": row["preprocessed_sha256"],
-                    "bytes": row["preprocessed_bytes"]} for row in rows]
-    return hashlib.sha256(_canonical(descriptors)).hexdigest()
+def payload_descriptors(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{"ordinal": row["ordinal"], "path": row["source"],
+             "source_relative": row["source_relative"],
+             "sha256": row["preprocessed_sha256"],
+             "bytes": row["preprocessed_bytes"]} for row in rows]
+
+
+def payload_descriptor_digest(rows: list[dict[str, Any]], source_manifest_sha256: str) -> str:
+    """Use the same source-manifest-plus-ordered-input contract as S8."""
+    aggregate = {"source_manifest_sha256": source_manifest_sha256,
+                 "inputs": payload_descriptors(rows)}
+    return hashlib.sha256(_canonical(aggregate)).hexdigest()
 
 
 def load_topology(path: Path, rows: list[dict[str, Any]]) -> str:
@@ -181,7 +193,7 @@ def _inside(path: Path, root: Path) -> bool:
     return True
 
 
-def product_identity(product_root: Path, script: Path = SCRIPT) -> tuple[str, str, dict[str, str]]:
+def product_identity(product_root: Path, script: Path = SCRIPT) -> tuple[str, str, dict[str, str], str]:
     """Bind source and all runtime executables to the selected product tree."""
     if (not product_root.is_absolute() or product_root.is_symlink() or
             not product_root.is_dir()):
@@ -211,7 +223,8 @@ def product_identity(product_root: Path, script: Path = SCRIPT) -> tuple[str, st
         _fail("source_identity:tracked_or_index_dirty")
     if HEX40.fullmatch(commit) is None or HEX40.fullmatch(tree) is None:
         _fail("source_identity:invalid")
-    return commit, tree, binaries
+    script_sha, _ = _sha(script)
+    return commit, tree, binaries, script_sha
 
 
 def build_command(batch_manifest: Path, profile: str, image_id: str,
@@ -359,14 +372,19 @@ def _action_stage(work: Path, expected_count: int) -> list[dict[str, Any]]:
         # The two role traces must describe the same transaction, not merely
         # the same long-lived service GUIDs.  Keep the F-side state digest as
         # evidence below; C's stage bytes are the measured C->F channel.
-        for field in ("tu_seq", "rel_seq", "transaction_digest"):
+        for field in ("tu_seq", "rel_seq", "history_nonce", "raw_digest", "transaction_digest"):
             if c_row[field] != f_row[field]:
                 _fail(f"action_trace:{index}:{field}_mismatch")
-    return [{"stage_bytes": int(row["stage_bytes"]),
+        if index and (c_row["tu_seq"] != c_begins[index - 1]["tu_seq"] + 1 or
+                      c_row["rel_seq"] != c_begins[index - 1]["rel_seq"] + 1):
+            _fail(f"action_trace:{index}:sequence_not_contiguous")
+    return [{"c_to_f_bytes": int(row["stage_bytes"]),
              "c_store_guid": row["c_store_guid"], "f_store_guid": row["f_store_guid"],
              "tu_seq": int(row["tu_seq"]), "rel_seq": int(row["rel_seq"]),
-             "state_digest": row["state_digest"], "transaction_digest": row["transaction_digest"],
-             "f_state_digest": f_row["state_digest"]}
+             "history_nonce": int(row["history_nonce"]),
+             "raw_digest": row["raw_digest"], "state_digest": row["state_digest"],
+             "transaction_digest": row["transaction_digest"],
+             "f_state_digest": f_row["state_digest"], "f_raw_digest": f_row["raw_digest"]}
             for row, f_row in zip(c_begins, f_begins, strict=True)]
 
 
@@ -385,6 +403,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
              corpus: str = "DuckDB", regime: str = "cold", depth: str = "100",
              full_count: int | None = None, passes: int = 2,
              artifact_sample: int = 2, retain_all_artifacts: bool = False,
+             launch_identity: dict[str, Any] | None = None,
              timestamp: str | None = None) -> Path:
     """Turn one completed product invocation into two authenticated live curves."""
     if returncode != 0 or "PASS: all-P50 C1F1" not in stdout:
@@ -417,21 +436,30 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     if "S8_SCHEDULING mode=serial execution_slots=1 max_concurrency=1" not in stdout.splitlines():
         _fail("product_run:scheduling_identity_missing")
     _, expected_binaries = _product_identity(stdout, image_id)
-    commit, tree, binaries = product_identity(product_root)
+    commit, tree, binaries, runner_sha = product_identity(product_root)
     if binaries != expected_binaries:
         _fail("binary_identity:stdout_mismatch")
+    if launch_identity is not None:
+        if (launch_identity.get("source_commit") != commit or
+                launch_identity.get("source_tree") != tree or
+                launch_identity.get("binary_sha256") != binaries or
+                launch_identity.get("runner_sha256") != runner_sha):
+            _fail("product_identity:changed_during_run")
     observations = _timing_rows(stdout, rows, work, passes)
     stages = _action_stage(work, len(observations))
     if len(stages) != len(observations):
         _fail("action_trace:stage_count_mismatch")
     for observation, action in zip(observations, stages, strict=True):
         observation.update(action)
-        observation["channel_bytes"] = action["stage_bytes"]
+        observation["c_to_f_bytes"] = action["c_to_f_bytes"]
+        observation["f_to_c_bytes"] = observation["returned_object_bytes"]
+        observation["channel_bytes"] = (observation["c_to_f_bytes"] +
+                                         observation["f_to_c_bytes"])
         observation["elapsed_ns"] = observation["measured_elapsed_ns"]
-        if action["stage_bytes"] <= 0:
+        if action["c_to_f_bytes"] <= 0:
             _fail("action_trace:zero_stage_bytes")
     batch_manifest_sha, batch_manifest_bytes = _sha(batch_manifest)
-    input_sha = payload_descriptor_digest(rows)
+    input_sha = payload_descriptor_digest(rows, batch_manifest_sha)
     if timestamp is None:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     if TIMESTAMP.fullmatch(timestamp) is None:
@@ -446,9 +474,8 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     retained.mkdir()
     shutil.copy2(batch_manifest, retained / "batch-manifest.jsonl")
     shutil.copy2(topology, retained / "topology.json")
-    payload_raw = _canonical([{"ordinal": row["ordinal"], "tu_id": row["tu_id"],
-                              "sha256": row["preprocessed_sha256"],
-                              "bytes": row["preprocessed_bytes"]} for row in rows])
+    payload_raw = _canonical({"source_manifest_sha256": batch_manifest_sha,
+                              "inputs": payload_descriptors(rows)})
     _write_new(retained / "input-descriptors.json", payload_raw)
     retained_input_sha, retained_input_bytes = _sha(retained / "batch-manifest.jsonl")
     retained_payload_sha, retained_payload_bytes = _sha(retained / "input-descriptors.json")
@@ -484,6 +511,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
         timing_rows = [{"schema": "icecream-s7-live-timing-v1", "cell": cell,
                         "phase": "measured", "ordinal": item["ordinal"], "tu_id": item["tu_id"],
                         "elapsed_ns": item["elapsed_ns"], "channel_bytes": item["channel_bytes"],
+                        "C_TO_F_bytes": item["c_to_f_bytes"], "F_TO_C_bytes": item["f_to_c_bytes"],
                         "object_sha256": item["remote_sha256"], "remote_compile": True,
                         "wait_for_cs_ns": item["wait_for_cs_ns"],
                         "client_elapsed_ns": item["client_elapsed_ns"],
@@ -494,7 +522,9 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                         "rel_seq": item["rel_seq"], "c_store_guid": item["c_store_guid"],
                         "f_store_guid": item["f_store_guid"], "state_digest": item["state_digest"],
                         "f_state_digest": item["f_state_digest"],
-                        "transaction_digest": item["transaction_digest"]}
+                        "transaction_digest": item["transaction_digest"],
+                        "raw_digest": item["raw_digest"], "f_raw_digest": item["f_raw_digest"],
+                        "history_nonce": item["history_nonce"]}
                        for item in observations if item["run"] == run]
         timing_raw = b"".join(_canonical(row) + b"\n" for row in timing_rows)
         timing_by_run[run] = timing_raw
@@ -530,7 +560,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                       "topology": {"path": "product-evidence/topology.json",
                                    "sha256": retained_topology_sha,
                                    "bytes": retained_topology_bytes},
-                      "runner": {"name": "p50compilee2e-run.sh", "sha256": hashlib.sha256(SCRIPT.read_bytes()).hexdigest()},
+                      "runner": {"name": "p50compilee2e-run.sh", "sha256": runner_sha},
                       "binary_sha256": binaries, "state_carrying_repeat": passes == 2,
                       "measurement_window": "compile+result_return",
                       "evidence": {"results": {"path": "results.jsonl", "sha256": hashlib.sha256(summary_raw).hexdigest(), "bytes": len(summary_raw)},
@@ -587,6 +617,8 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                   "input_digest": input_sha,
                   "topology_sha256": topology_sha, "image_id": image_id,
                   "binary_sha256": binaries, "source_commit": commit, "source_tree": tree,
+                  "runner_sha256": runner_sha,
+                  "launch_identity": launch_identity,
                   "curve_manifests": manifests, "remote_compile_required": True,
                   "scheduling": {"mode": "serial", "execution_slots": 1, "max_concurrency": 1},
                   "artifact_retention": {"mode": "all" if retain_all_artifacts else "sample",
@@ -599,6 +631,43 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
         _fail("workdir:unsafe_cleanup_path")
     shutil.rmtree(work)
     return target
+
+
+def _run_product(command: list[str], timeout: int) -> tuple[str, int]:
+    """Run the shell lifecycle as one process group with signal cleanup."""
+    process = subprocess.Popen(command, text=True, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, start_new_session=True)
+    previous: dict[int, Any] = {}
+
+    def interrupt(signum: int, _frame: object) -> None:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGTERM)
+        raise KeyboardInterrupt
+
+    try:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous[signum] = signal.signal(signum, interrupt)
+        try:
+            stdout, _ = process.communicate(timeout=timeout)
+            return stdout, process.returncode
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                stdout, _ = process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                stdout, _ = process.communicate()
+            raise LiveRunnerError(f"product_run:timeout:{timeout}")
+        except KeyboardInterrupt as exc:
+            try:
+                stdout, _ = process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                stdout, _ = process.communicate()
+            raise LiveRunnerError("product_run:interrupted") from exc
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -628,6 +697,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.execute:
         run_workdir = Path(tempfile.mkdtemp(prefix="p50compilee2e.", dir=tempfile.gettempdir()))
         run_workdir.rmdir()
+    launch_identity = None
+    if args.execute:
+        launch_commit, launch_tree, launch_binaries, launch_runner_sha = product_identity(args.product_root.absolute())
+        launch_identity = {"source_commit": launch_commit, "source_tree": launch_tree,
+                           "binary_sha256": launch_binaries, "runner_sha256": launch_runner_sha}
     command = build_command(batch_manifest, args.profile, args.image_id,
                             product_root=args.product_root.absolute(), corpus=args.corpus,
                             regime=args.regime, depth=args.depth, full_count=args.full_count,
@@ -637,22 +711,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     try:
         timeout = derive_timeout(count, args.passes, args.regime == "warm")
-        process = subprocess.Popen(command, text=True, stdout=subprocess.PIPE,
-                                  stderr=subprocess.STDOUT, start_new_session=True)
         try:
-            stdout, _ = process.communicate(timeout=timeout)
-            returncode = process.returncode
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                stdout, _ = process.communicate(timeout=10)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                stdout, _ = process.communicate()
+            stdout, returncode = _run_product(command, timeout)
+        except LiveRunnerError as exc:
             print(f"timeout_seconds={timeout}")
             print(f"workdir={run_workdir}" if run_workdir is not None else "workdir=unknown")
-            print("product_run:timeout; temporary workdir is retained if reported by the runner")
-            print(stdout, end="")
+            print(str(exc))
             return 77
         path = finalize(stdout, returncode, batch_manifest=batch_manifest,
                         topology=topology, output=args.output.absolute(), profile=args.profile,
@@ -661,6 +725,7 @@ def main(argv: list[str] | None = None) -> int:
                         full_count=args.full_count, passes=args.passes,
                         artifact_sample=args.artifact_sample,
                         retain_all_artifacts=args.retain_all_artifacts,
+                        launch_identity=launch_identity,
                         timestamp=args.timestamp)
     except LiveRunnerError as exc:
         print(str(exc))

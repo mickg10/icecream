@@ -276,9 +276,10 @@ if not rows:
     raise SystemExit("empty batch manifest")
 seen = set()
 for row in rows:
-    if not isinstance(row, dict) or set(row) - {"tu_id", "source", "sha256", "preprocessed_sha256", "preprocessed_bytes", "compile_db", "compile_source"}:
+    if not isinstance(row, dict) or set(row) - {"tu_id", "source", "source_relative", "sha256", "preprocessed_sha256", "preprocessed_bytes", "compile_db", "compile_source"}:
         raise SystemExit("batch manifest fields invalid")
     tu, source, expected = row.get("tu_id"), row.get("source"), row.get("sha256")
+    source_relative = row.get("source_relative")
     payload_sha, payload_bytes = row.get("preprocessed_sha256"), row.get("preprocessed_bytes")
     if (not isinstance(payload_sha, str) or len(payload_sha) != 64 or
             any(char not in "0123456789abcdef" for char in payload_sha) or
@@ -287,6 +288,9 @@ for row in rows:
     if (not isinstance(tu, str) or not tu or tu in seen or "\t" in tu or
             any(char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-" for char in tu)):
         raise SystemExit("batch TU identity invalid")
+    if (not isinstance(source_relative, str) or not source_relative or source_relative.startswith("/") or
+            any(part in ("", ".", "..") for part in source_relative.split("/"))):
+        raise SystemExit("batch source-relative identity invalid")
     if not isinstance(source, str) or not os.path.isabs(source) or "\t" in source:
         raise SystemExit("batch source must be absolute")
     try:
@@ -304,7 +308,7 @@ for row in rows:
             raise SystemExit("batch compile database unavailable")
         if not isinstance(compile_source, str) or not os.path.isabs(compile_source):
             raise SystemExit("batch compile source must be absolute")
-    print("\t".join((tu, source, actual, payload_sha, str(payload_bytes), db, compile_source)))
+    print("\t".join((tu, source, source_relative, actual, payload_sha, str(payload_bytes), db, compile_source)))
     seen.add(tu)
 PY
     batch_expected_count=${ICECC_P50_C1F1_EXPECTED_COUNT:-}
@@ -563,7 +567,7 @@ if test -n "$batch_manifest"; then
         run_label=$1
         emit_rows=${2:-1}
         ordinal=0
-        while IFS="$(printf '\t')" read -r tu_id source_path source_sha payload_sha payload_bytes item_db item_source; do
+        while IFS="$(printf '\t')" read -r tu_id source_path source_relative source_sha payload_sha payload_bytes item_db item_source; do
             staged="$work/src/$run_label-$ordinal.cpp"
             cp -- "$source_path" "$staged"
             compile_once "$run_label-$ordinal" "$staged" "$item_db" "$item_source"
