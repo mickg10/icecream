@@ -26,6 +26,8 @@
 #define _GNU_SOURCE 1
 #endif
 
+#include "config.h"
+
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -59,7 +61,6 @@
 #include "../services/logging.h"
 #include "../services/job.h"
 #include "../services/util.h"
-#include "config.h"
 
 #include "compileserver.h"
 #include "selection.h"
@@ -67,6 +68,11 @@
 #include "scheduler.h"
 #include "fastest.h"
 #include "jobidallocator.h"
+
+#if defined(ICECC_P50_WITH_LIBBSC)
+static_assert((CACHE_ADVERTISABLE_PROFILE_MASK & CACHE_PROFILE_GRZ) != 0,
+              "the scheduler must parse CacheWire profiles after config.h");
+#endif
 
 /* TODO:
    * leak check
