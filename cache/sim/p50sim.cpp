@@ -21,6 +21,11 @@ using namespace icecc::p50;
 
 namespace {
 
+// SidecarRuntime's production route owner pins the current P50 source path to
+// level 3.  Exact conformance must reproduce that product configuration, not
+// P50PreparationAuthority's older level-1 unit-test default.
+constexpr int kCurrentProductCompressionLevel = 3;
+
 std::vector<uint8_t> read_bytes(const std::string& path) {
     std::ifstream input(path, std::ios::binary);
     if (!input)
@@ -209,7 +214,8 @@ int main(int argc, char** argv) {
         caps.supported_profiles = profile_bit(caps.profile);
         auto authority = std::make_shared<P50PreparationAuthority>(
             arguments.c_store_guid, caps.zstd,
-            PreparationAuthorityLimits{}, 1, caps.profile);
+            PreparationAuthorityLimits{}, kCurrentProductCompressionLevel,
+            caps.profile);
         const std::vector<uint8_t> prewarm_input = warm
             ? read_bytes(arguments.prewarm_input) : std::vector<uint8_t>{};
         const PreparedTuHandle prewarm_prepared = warm
