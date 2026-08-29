@@ -607,8 +607,9 @@ def _validate_product_log_evidence(work: Path, observations: list[dict[str, Any]
 
     The shell gate may only enforce that a command returned successfully; it
     must not turn that assertion into a trusted metric.  The selected profile
-    and CACHE_SESSION handoff are therefore checked here for every measured
-    client invocation, alongside the byte/object and action evidence below.
+    is checked in every measured client invocation, while CACHE_SESSION is
+    checked in the F daemon log for that planned relationship.  The action
+    trace below separately authenticates the resulting F store identity.
     """
     profile_markers = {
         "P29": ("P29", "CACHE_SESSION"),
@@ -626,8 +627,15 @@ def _validate_product_log_evidence(work: Path, observations: list[dict[str, Any]
             raw = log.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
             raise LiveRunnerError(f"batch:{index}:client_log_missing") from exc
-        if not all(marker in raw for marker in markers):
+        if markers[0] not in raw:
             _fail(f"batch:{index}:product_profile_evidence_missing")
+        f_log = work / f"f-{observed['relationship']}.log"
+        try:
+            f_raw = f_log.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise LiveRunnerError(f"batch:{index}:f_log_missing") from exc
+        if markers[1] not in f_raw:
+            _fail(f"batch:{index}:cache_session_evidence_missing")
         if re.search(r"building myself|building_local|local build forced|fallback_local|client_exception", raw):
             _fail(f"batch:{index}:product_local_fallback")
 
