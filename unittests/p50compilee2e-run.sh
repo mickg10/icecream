@@ -816,8 +816,12 @@ compile_once() {
     if test -n "$item_compile_db"; then
         eval "g++ $local_compile_args"
     else
-        g++ -x c++ -std=c++17 -O2 -c $compile_include_args \
-            - -o "$local_obj" <"$input_path"
+        # Mirror the real client invocation for preparation compiles.  Feeding
+        # the same bytes through stdin changes GCC's FILE symbol to <stdin>,
+        # so a correct remote object would fail this byte-exact witness solely
+        # because its source basename is retained.
+        g++ -std=c++17 -O2 -c $compile_include_args \
+            "$input_path" -o "$local_obj"
     fi
     test -s "$preprocessed_capture" || {
         echo "FAIL: completed $label preprocessor capture is missing" >&2

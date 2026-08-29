@@ -542,6 +542,8 @@ def test_batch_shell_excludes_warm_prewarm_and_carries_optional_repeat() -> None
     assert 'compile_args_for "$item_compile_db" "$item_compile_source" "$item_compile_output" "$input_path" "$remote_obj"' in shell
     assert 'compile_args_for "$item_compile_db" "$item_compile_source" "$item_compile_output" "$input_path" "$local_obj"' in shell
     assert 'eval "g++ $local_compile_args"' in shell
+    assert '"$input_path" -o "$local_obj"' in shell
+    assert 'g++ -x c++ -std=c++17' not in shell
     assert 'stdin_mode' not in shell
     assert 'if test "$passes" = 2; then' in shell
     assert "s7-measured-c-action-trace.jsonl" in runner_source
