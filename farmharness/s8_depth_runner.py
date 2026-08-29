@@ -29,6 +29,7 @@ SCHEMA = "icecream-s8-depth-run-plan-v1"
 MATRIX_AUDIT_SCHEMA = "icecream-s8-matrix-audit-v1"
 DEPTHS = (100, 200, "full", "repeat-full")
 TOPOLOGIES = ("C1F1", "C1F20")
+TIMEOUT_POLICY = "min(21600,max(180,60+2*total_tus))"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 TIMESTAMPED_DIR = re.compile(
     r"^s8-[A-Za-z0-9_.-]+-\d{8}T\d{6}Z(?:-[A-Za-z0-9_.-]+)?$"
@@ -42,7 +43,11 @@ class DepthPlanError(ValueError):
 
 
 def build_schedule(inputs: list[dict[str, Any]], topology: str) -> dict[str, Any]:
-    """Build an authenticated deterministic execution-slot assignment."""
+    """Build an authenticated least-planned-load assignment.
+
+    Assignment uses estimated service only; actual modeled component timings
+    are scheduled later after authenticated product bytes are available.
+    """
     if topology not in TOPOLOGIES:
         raise DepthPlanError("scheduling:topology_invalid")
     if topology == "C1F1":
@@ -72,7 +77,8 @@ def build_schedule(inputs: list[dict[str, Any]], topology: str) -> dict[str, Any
         "global_slots": slots, "execution_slots": slots,
         "stream_capacity_tus": capacity,
         "service_duration_model": "base_compile_ns_plus_24_ns_per_input_byte",
-        "assignment_policy": "earliest_available_global_slot_then_slot_index",
+        "assignment_policy": "least_planned_load_then_lowest_slot",
+        "assignment_policy_version": "s8-planned-load-v1",
         "assignment_epoch_reset": True, "assignments": assignments,
     }
 
@@ -267,6 +273,7 @@ def build_plan(source_manifest: Path, source_root: Path, matrix_audit: Path,
             "producer_points": requested_points,
             "live_observation": "separate_authenticated_curve_required",
             "required": "authenticated predictive curve over the ordered TU sequence",
+            "timeout_policy": TIMEOUT_POLICY,
             "note": "The producer invokes the current simulator per TU and binds the aggregate input digest; live observations are never synthesized.",
         },
     }

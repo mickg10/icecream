@@ -40,12 +40,13 @@ SCHEMA = "icecream-s8-multitu-predictive-producer-v1"
 SEMANTICS = CURRENT_SEMANTICS
 PRODUCER = "s8-multitu-predictive-producer-v1"
 PLAN_SCHEMA = depth_runner.SCHEMA
-HEX40 = re.compile(r"^[0-9a-fA-F]{40}$")
 HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
 SAFE_ID = re.compile(r"^[A-Za-z0-9_.-]+$")
 MAX_PLAN_BYTES = 8 * 1024 * 1024
 MAX_INPUT_BYTES = 512 * 1024 * 1024
 MAX_PRODUCT_OUTPUT_BYTES = 64 * 1024 * 1024
+MAX_BATCH_TIMEOUT_SECONDS = 6 * 60 * 60
+TIMEOUT_POLICY = "min(21600,max(180,60+2*total_tus))"
 
 
 class MultiTUPredictiveError(ValueError):
@@ -196,7 +197,8 @@ def _validate_plan(plan_path: Path) -> tuple[dict[str, object], dict[str, str], 
     contract = value.get("execution_contract")
     if (not isinstance(contract, dict) or
             contract.get("status") != "READY_MULTI_TU_PREDICTOR" or
-            contract.get("producer") != "farmharness.s8_multitu_predictive_producer"):
+            contract.get("producer") != "farmharness.s8_multitu_predictive_producer" or
+            contract.get("timeout_policy") != TIMEOUT_POLICY):
         raise MultiTUPredictiveError("plan:multi_tu_producer_contract_invalid")
     cell = _check_cell(value)
     _validate_matrix(value, cell)
@@ -321,6 +323,80 @@ def _product_binary(path: Path | None) -> tuple[Path, dict[str, object]]:
     return candidate, _digest(candidate, "product_simulator", MAX_PRODUCT_OUTPUT_BYTES)
 
 
+def _product_build_identity(build_root: Path | None, sim_binary: Path | None
+                            ) -> tuple[Path, Path, str, str, dict[str, object]]:
+    """Bind the run to a clean Git product build root and its binary."""
+    root = (build_root or Path(__file__).resolve().parents[1]).resolve()
+    try:
+        root_info = root.lstat()
+    except OSError as exc:
+        raise MultiTUPredictiveError(f"product_build_root:unavailable:{root}") from exc
+    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+        raise MultiTUPredictiveError("product_build_root:not_directory")
+    try:
+        top = subprocess.run(["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+                             check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, timeout=10)
+        status = subprocess.run(["git", "-C", str(root), "status", "--porcelain",
+                                 "--untracked-files=no"], check=False,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, timeout=10)
+        head = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                              check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True, timeout=10)
+        tree = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD^{tree}"],
+                              check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise MultiTUPredictiveError("product_build_root:git_probe_failed") from exc
+    if top.returncode != 0 or head.returncode != 0 or tree.returncode != 0:
+        raise MultiTUPredictiveError("product_build_root:not_git_repository")
+    try:
+        actual_root = Path(top.stdout.strip()).resolve()
+    except (OSError, ValueError) as exc:
+        raise MultiTUPredictiveError("product_build_root:git_root_invalid") from exc
+    if actual_root != root.resolve():
+        raise MultiTUPredictiveError("product_build_root:must_be_git_root")
+    if status.returncode != 0 or status.stdout:
+        raise MultiTUPredictiveError("product_build_root:tracked_worktree_dirty")
+    source_file = root / "cache" / "sim" / "p50sim.cpp"
+    try:
+        source_file.resolve().relative_to(root.resolve())
+        tracked_source = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "--error-unmatch", "cache/sim/p50sim.cpp"],
+            check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise MultiTUPredictiveError("product_build_root:source_probe_failed") from exc
+    if (not source_file.is_file() or tracked_source.returncode != 0 or
+            tracked_source.stdout.strip() != "cache/sim/p50sim.cpp"):
+        raise MultiTUPredictiveError("product_build_root:tracked_product_source_missing")
+    try:
+        source_info = source_file.lstat()
+    except OSError as exc:
+        raise MultiTUPredictiveError("product_build_root:source_stat_failed") from exc
+    if (stat.S_ISLNK(source_info.st_mode) or not stat.S_ISREG(source_info.st_mode) or
+            source_info.st_nlink != 1):
+        raise MultiTUPredictiveError("product_build_root:source_not_private_regular_file")
+    commit = head.stdout.strip().lower()
+    tree_id = tree.stdout.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", commit) or int(commit, 16) == 0 or \
+            not re.fullmatch(r"[0-9a-f]{40}", tree_id) or int(tree_id, 16) == 0:
+        raise MultiTUPredictiveError("product_build_root:git_identity_invalid")
+    candidate = sim_binary or root / "cache" / "sim" / ".p50sim.bin"
+    try:
+        candidate.resolve().relative_to(root.resolve())
+    except ValueError as exc:
+        raise MultiTUPredictiveError("product_simulator:outside_product_build_root") from exc
+    simulator, simulator_facts = _product_binary(candidate)
+    return root, simulator, commit, tree_id, simulator_facts
+
+
+def _batch_timeout_seconds(total_tus: int) -> int:
+    if type(total_tus) is not int or total_tus <= 0:
+        raise MultiTUPredictiveError("product_simulator:tu_count_invalid")
+    return min(MAX_BATCH_TIMEOUT_SECONDS, max(180, 60 + 2 * total_tus))
+
+
 def _product_rows(simulator: Path, inputs: list[dict[str, object]], assignments: list[int],
                   relationship_count: int, cell: dict[str, str], model_id: str,
                   topology_digest: str, assignment_map: Path | None,
@@ -354,9 +430,11 @@ def _product_rows(simulator: Path, inputs: list[dict[str, object]], assignments:
         env = os.environ.copy()
         env["ICECC_P50_PROFILE"] = cell["profile"]
         try:
+            timeout_seconds = _batch_timeout_seconds(
+                len(inputs) + (len(second_inputs) if second_inputs is not None else 0))
             completed = subprocess.run(command, env=env, stdin=subprocess.DEVNULL,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                       check=False, timeout=180)
+                                       check=False, timeout=timeout_seconds)
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise MultiTUPredictiveError("product_simulator:execution_failed") from exc
         if completed.returncode != 0:
@@ -461,7 +539,8 @@ def _product_curve_rows(product_rows: list[dict[str, object]], inputs: list[dict
             slots_per_f <= 0 or not isinstance(assignments, list) or
             len(assignments) != len(inputs)):
         raise MultiTUPredictiveError("plan:scheduling_runtime_invalid")
-    available = [0] * slots
+    slot_available = [0] * slots
+    relationship_source_ready: dict[str, int] = {}
     serial_elapsed = 0
     for ordinal, (product, item) in enumerate(zip(product_rows, inputs, strict=True)):
         raw, facts = _snapshot(Path(item["path"]), f"predictive_input[{ordinal}]", MAX_INPUT_BYTES)
@@ -498,11 +577,22 @@ def _product_curve_rows(product_rows: list[dict[str, object]], inputs: list[dict
                 assignment.get("per_f_slot") != assignment["global_slot"] % slots_per_f):
             raise MultiTUPredictiveError("plan:scheduling_assignment_invalid")
         global_slot = assignment["global_slot"]
-        service = elapsed
-        start = available[global_slot]
-        finish = start + service
-        available[global_slot] = finish
-        serial_elapsed += service
+        source_service = sum(int(modeled_elapsed[key])
+                             for key in ("startup", "input_ready", "transaction_commit"))
+        execution_service = sum(int(modeled_elapsed[key])
+                                for key in ("compile", "result_return"))
+        if (source_service < 0 or execution_service < 0 or
+                source_service + execution_service != elapsed):
+            raise MultiTUPredictiveError("predictive_engine:component_conservation_invalid")
+        source_ready_before = relationship_source_ready.get(relationship_id, 0)
+        slot_admission = slot_available[global_slot]
+        source_start = max(slot_admission, source_ready_before)
+        source_finish = source_start + source_service
+        compile_start = source_finish
+        finish = compile_start + execution_service
+        relationship_source_ready[relationship_id] = source_finish
+        slot_available[global_slot] = finish
+        serial_elapsed += source_service + execution_service
         cumulative["C_TO_F_bytes"] += c_to_f
         cumulative["F_TO_C_bytes"] += f_to_c
         cumulative["channel_bytes"] += c_to_f + f_to_c
@@ -537,8 +627,19 @@ def _product_curve_rows(product_rows: list[dict[str, object]], inputs: list[dict
             "scheduling": {"global_slot": global_slot,
                             "f_relationship": assignment["f_relationship"],
                             "per_f_slot": assignment["per_f_slot"],
-                            "start_ns": start, "finish_ns": finish,
-                            "service_ns": service},
+                            "slot_available_at_admission_ns": slot_admission,
+                            "relationship_source_ready_before_ns": source_ready_before,
+                            "source_start_ns": source_start,
+                            "source_finish_ns": source_finish,
+                            "source_service_ns": source_service,
+                            "compile_start_ns": compile_start,
+                            "execution_start_ns": compile_start,
+                            "execution_finish_ns": finish,
+                            "execution_service_ns": execution_service,
+                            "finish_ns": finish,
+                            "service_ns": source_service + execution_service,
+                            "relationship_source_ready_after_ns": source_finish,
+                            "slot_available_after_ns": finish},
             "product_completion": {"raw_bytes": product["raw_bytes"],
                                     "raw_digest": product["raw_digest"],
                                     "tx_digest": product["transaction_digest"],
@@ -557,15 +658,24 @@ def _product_curve_rows(product_rows: list[dict[str, object]], inputs: list[dict
             "cumulative": dict(cumulative),
         })
     if rows:
-        prior_finish: dict[int, int] = {}
+        prior_source_finish: dict[str, int] = {}
+        prior_execution_finish: dict[int, int] = {}
         for row in rows:
             event = row["scheduling"]
             slot = int(event["global_slot"])
-            if event["start_ns"] < prior_finish.get(slot, 0):
-                raise MultiTUPredictiveError("plan:scheduling_concurrency_overlap")
-            if event["finish_ns"] != event["start_ns"] + event["service_ns"]:
+            relation = str(row["relationship_id"])
+            if event["source_start_ns"] < prior_source_finish.get(relation, 0):
+                raise MultiTUPredictiveError("plan:scheduling_source_overlap")
+            if event["compile_start_ns"] < prior_execution_finish.get(slot, 0):
+                raise MultiTUPredictiveError("plan:scheduling_execution_overlap")
+            if (event["source_finish_ns"] != event["source_start_ns"] + event["source_service_ns"] or
+                    event["execution_finish_ns"] != event["compile_start_ns"] + event["execution_service_ns"] or
+                    event["finish_ns"] != event["source_start_ns"] + event["service_ns"]):
                 raise MultiTUPredictiveError("plan:scheduling_event_invalid")
-            prior_finish[slot] = event["finish_ns"]
+            if event["service_ns"] != event["source_service_ns"] + event["execution_service_ns"]:
+                raise MultiTUPredictiveError("plan:scheduling_component_conservation_invalid")
+            prior_source_finish[relation] = event["source_finish_ns"]
+            prior_execution_finish[slot] = event["execution_finish_ns"]
         if cumulative["elapsed_ns"] != max(row["scheduling"]["finish_ns"] for row in rows):
             raise MultiTUPredictiveError("plan:scheduling_makespan_invalid")
         rows[-1]["schedule_summary"] = {"makespan_ns": cumulative["elapsed_ns"],
@@ -581,6 +691,8 @@ def _emit_product_segment(plan: dict[str, object], plan_facts: dict[str, object]
                           relationship_count: int, simulator_facts: dict[str, object],
                           assignment_digest: str, input_manifest_sha256: str,
                           scheduling: dict[str, object],
+                          timeout_seconds: int,
+                          product_build_root: Path,
                           continuation: bool, paired: bool = False) -> dict[str, object]:
     curve_raw = b"".join(canonical_bytes(row) + b"\n" for row in rows)
     curve_sha = hashlib.sha256(curve_raw).hexdigest()
@@ -604,14 +716,17 @@ def _emit_product_segment(plan: dict[str, object], plan_facts: dict[str, object]
                          "sha256": plan_facts["plan"]["sha256"],
                          "bytes": plan_facts["plan"]["bytes"]},
                 "topology_digest": topology_digest,
+                "product_build_root": str(product_build_root),
                 "scheduling": {"schema": scheduling["schema"],
                                 "topology": scheduling["topology"],
                                 "f_relationships": scheduling["f_relationships"],
                                 "slots_per_f": scheduling["slots_per_f"],
                                 "global_slots": scheduling["global_slots"],
+                                "execution_slots": scheduling["execution_slots"],
                                 "stream_capacity_tus": scheduling["stream_capacity_tus"],
                                 "service_duration_model": scheduling["service_duration_model"],
                                 "assignment_policy": scheduling["assignment_policy"],
+                                "assignment_policy_version": scheduling["assignment_policy_version"],
                                 "assignment_epoch_reset": scheduling["assignment_epoch_reset"],
                                 "makespan_ns": rows[-1]["cumulative"]["elapsed_ns"] if rows else 0,
                                 "serial_service_ns": sum(row["scheduling"]["service_ns"]
@@ -636,6 +751,8 @@ def _emit_product_segment(plan: dict[str, object], plan_facts: dict[str, object]
                                   "source_commit": source_commit, "source_tree": source_tree,
                                   "input_manifest_sha256": input_manifest_sha256,
                                   "assignment_sha256": assignment_digest},
+                "execution": {"batch_timeout_seconds": timeout_seconds,
+                               "timeout_policy": TIMEOUT_POLICY},
                 "outputs": {"predictive_sim": {"path": "predictive_sim.jsonl",
                                                   "sha256": curve_sha, "bytes": len(curve_raw),
                                                   "points": len(rows)},
@@ -658,8 +775,8 @@ def _emit_product_segment(plan: dict[str, object], plan_facts: dict[str, object]
     return producer
 
 
-def produce(plan_path: Path, engine_manifest: Path, source_commit: str,
-            source_tree: str, output_dir: Path | None = None,
+def produce(plan_path: Path, engine_manifest: Path, product_build_root: Path,
+            output_dir: Path | None = None,
             calibration_bundle: Path | None = None,
             assignment_map: Path | None = None,
             sim_binary: Path | None = None) -> dict[str, object]:
@@ -670,8 +787,8 @@ def produce(plan_path: Path, engine_manifest: Path, source_commit: str,
             "repeat_full:paired_producer_required_to_restore_terminal_codec_state")
     scheduling, assignments, relationship_count = _validate_scheduling(plan, inputs)
     assignment_facts = _check_optional_assignment(assignment_map, assignments, relationship_count)
-    source_commit = _sha(source_commit, "source_commit", HEX40)
-    source_tree = _sha(source_tree, "source_tree", HEX40)
+    build_root, simulator, source_commit, source_tree, simulator_facts = _product_build_identity(
+        product_build_root, sim_binary)
     manifest, _template_raw, _template_input, topology_facts, template_sha, topology, template_cell = engine.load_inputs(engine_manifest)
     if template_cell != cell or manifest["split"] != SPLITS[cell["corpus"]]:
         raise MultiTUPredictiveError("engine_manifest:cell_or_split_mismatch")
@@ -701,7 +818,6 @@ def produce(plan_path: Path, engine_manifest: Path, source_commit: str,
                 "source_tree": source_tree, "input_digest": input_digest,
                 "topology_digest": topology_digest, "model_id": model_id}
 
-    simulator, simulator_facts = _product_binary(sim_binary)
     product_assignments = assignments
     assignment_digest = hashlib.sha256(canonical_bytes(
         {"topology": scheduling["topology"], "cardinality": relationship_count,
@@ -720,10 +836,11 @@ def produce(plan_path: Path, engine_manifest: Path, source_commit: str,
                                  source_commit, source_tree, input_digest, topology_digest,
                                  model_id, assignment_facts, relationship_count,
                                  simulator_facts, assignment_digest,
-                                 str(plan["source_manifest"]["sha256"]), scheduling, False)
+                                 str(plan["source_manifest"]["sha256"]), scheduling,
+                                 _batch_timeout_seconds(len(inputs)), build_root, False)
 
 def produce_pair(first_plan_path: Path, repeat_plan_path: Path, engine_manifest: Path,
-                 source_commit: str, source_tree: str,
+                 product_build_root: Path,
                  calibration_bundle: Path | None = None,
                  assignment_map: Path | None = None,
                  sim_binary: Path | None = None) -> tuple[dict[str, object], dict[str, object]]:
@@ -743,8 +860,8 @@ def produce_pair(first_plan_path: Path, repeat_plan_path: Path, engine_manifest:
             repeat_relationship_count != relationship_count):
         raise MultiTUPredictiveError("repeat_full:paired_scheduling_mismatch")
     assignment_facts = _check_optional_assignment(assignment_map, assignments, relationship_count)
-    source_commit = _sha(source_commit, "source_commit", HEX40)
-    source_tree = _sha(source_tree, "source_tree", HEX40)
+    build_root, simulator, source_commit, source_tree, simulator_facts = _product_build_identity(
+        product_build_root, sim_binary)
     manifest, _template_raw, _template_input, topology_facts, template_sha, topology, template_cell = engine.load_inputs(engine_manifest)
     if template_cell != cell or manifest["split"] != SPLITS[cell["corpus"]]:
         raise MultiTUPredictiveError("engine_manifest:cell_or_split_mismatch")
@@ -760,7 +877,6 @@ def produce_pair(first_plan_path: Path, repeat_plan_path: Path, engine_manifest:
     aggregate_input = {"source_manifest_sha256": first["source_manifest"]["sha256"],
                        "inputs": first_inputs}
     input_digest = hashlib.sha256(canonical_bytes(aggregate_input)).hexdigest()
-    simulator, simulator_facts = _product_binary(sim_binary)
     product_assignments = assignments
     assignment_digest = hashlib.sha256(canonical_bytes(
         {"topology": scheduling["topology"], "cardinality": relationship_count,
@@ -786,12 +902,14 @@ def produce_pair(first_plan_path: Path, repeat_plan_path: Path, engine_manifest:
         first, first_facts, first_dir, first_rows, cell, source_commit, source_tree,
         input_digest, topology_digest, model_id, assignment_facts, relationship_count,
         simulator_facts, assignment_digest, str(first["source_manifest"]["sha256"]),
-        scheduling, False, True)
+        scheduling, _batch_timeout_seconds(len(first_inputs) + len(repeat_inputs)), build_root,
+        False, True)
     repeat_producer = _emit_product_segment(
         repeat, repeat_facts, repeat_dir, repeat_rows, cell, source_commit, source_tree,
         input_digest, topology_digest, model_id, assignment_facts, relationship_count,
         simulator_facts, assignment_digest, str(first["source_manifest"]["sha256"]),
-        scheduling, True, True)
+        scheduling, _batch_timeout_seconds(len(first_inputs) + len(repeat_inputs)), build_root,
+        True, True)
     return first_producer, repeat_producer
 
 def _write_new(path: Path, raw: bytes, label: str) -> None:
@@ -812,12 +930,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repeat-plan", type=Path,
                         help="paired repeat-full plan; runs full-1 and full-2 in one product process")
     parser.add_argument("--engine-manifest", type=Path, required=True)
-    parser.add_argument("--source-commit", required=True)
-    parser.add_argument("--source-tree", required=True)
+    parser.add_argument("--product-build-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--calibration-manifest", type=Path)
     parser.add_argument("--assignment-map", type=Path,
-                        help="authenticated JSON {cardinality,assignments} mapping")
+                        help="legacy equality check against the authenticated plan schedule")
     parser.add_argument("--sim-binary", type=Path,
                         help="exact product-linked cache/sim/p50sim batch executable")
     args = parser.parse_args(argv)
@@ -826,13 +943,13 @@ def main(argv: list[str] | None = None) -> int:
             if args.output_dir is not None:
                 raise MultiTUPredictiveError("repeat_full:output_dir_is_plan_bound")
             produce_pair(args.plan.absolute(), args.repeat_plan.absolute(),
-                         args.engine_manifest.absolute(), args.source_commit, args.source_tree,
+                         args.engine_manifest.absolute(), args.product_build_root.absolute(),
                          args.calibration_manifest.absolute() if args.calibration_manifest else None,
                          args.assignment_map.absolute() if args.assignment_map else None,
                          args.sim_binary.absolute() if args.sim_binary else None)
         else:
-            produce(args.plan.absolute(), args.engine_manifest.absolute(), args.source_commit,
-                    args.source_tree,
+            produce(args.plan.absolute(), args.engine_manifest.absolute(),
+                    args.product_build_root.absolute(),
                     args.output_dir.absolute() if args.output_dir else None,
                     args.calibration_manifest.absolute() if args.calibration_manifest else None,
                     args.assignment_map.absolute() if args.assignment_map else None,

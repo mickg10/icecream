@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -15,10 +17,6 @@ from s8_predictive_engine import (
 )
 from s8_multitu_predictive_producer import MultiTUPredictiveError, produce, produce_pair
 from s8_schema import CORPORA, PROFILES, REGIMES, SPLITS
-
-
-COMMIT = "1" * 40
-TREE = "2" * 40
 
 
 def _write(path: Path, raw: bytes | str) -> None:
@@ -90,13 +88,50 @@ def _plan(tmp_path: Path, count: int, depth: int | str, suffix: str,
     return plan_path
 
 
+def _product_build_root(anchor: Path) -> Path:
+    """Create a real clean Git product root containing the built simulator."""
+    root = anchor.parent / "product-build"
+    root.mkdir(parents=True, exist_ok=True)
+    binary = Path(__file__).resolve().parents[1] / "cache" / "sim" / ".p50sim.bin"
+    target = root / "cache" / "sim" / ".p50sim.bin"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if not target.exists():
+        shutil.copy2(binary, target)
+    source = Path(__file__).resolve().parents[1] / "cache" / "sim" / "p50sim.cpp"
+    source_target = root / "cache" / "sim" / "p50sim.cpp"
+    if not source_target.exists():
+        shutil.copy2(source, source_target)
+    marker = root / "product-source.txt"
+    if not marker.exists():
+        _write(marker, "authenticated product build fixture\n")
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        subprocess.run(["git", "-C", str(root), "config", "user.email", "tests@example.invalid"],
+                       check=True)
+        subprocess.run(["git", "-C", str(root), "config", "user.name", "S8 tests"], check=True)
+        subprocess.run(["git", "-C", str(root), "add", "product-source.txt", "cache/sim/p50sim.cpp"],
+                       check=True)
+        subprocess.run(["git", "-C", str(root), "commit", "-qm", "product build fixture"],
+                       check=True)
+    return root
+
+
+def _produce(plan_path: Path, engine_manifest: Path, **kwargs: object) -> dict[str, object]:
+    return produce(plan_path, engine_manifest, _product_build_root(plan_path), **kwargs)
+
+
+def _produce_pair(first_plan: Path, repeat_plan: Path, engine_manifest: Path,
+                  **kwargs: object) -> tuple[dict[str, object], dict[str, object]]:
+    return produce_pair(first_plan, repeat_plan, engine_manifest,
+                        _product_build_root(first_plan), **kwargs)
+
+
 def test_producer_emits_100_ordered_points_and_continuous_relationship(tmp_path: Path) -> None:
     plan_path = _plan(tmp_path / "run", 100, 100, "100", "warm")
     cell = {"corpus": "DuckDB", "profile": "P29", "regime": "warm"}
     manifest = _template(tmp_path / "template", cell)
     plan = json.loads(plan_path.read_bytes())
     output = Path(plan["result"]["directory"])
-    result = produce(plan_path, manifest, COMMIT, TREE)
+    result = _produce(plan_path, manifest)
     rows = [json.loads(line) for line in (output / "predictive_sim.jsonl").read_text().splitlines()]
     assert len(rows) == 100
     assert [row["step"] for row in rows] == list(range(100))
@@ -156,14 +191,14 @@ def test_reorder_and_mutation_fail_before_producer_output(tmp_path: Path) -> Non
     _write(plan_path, canonical_bytes(value) + b"\n")
     manifest = _template(tmp_path / "template", {"corpus": "DuckDB", "profile": "P29", "regime": "cold"})
     with pytest.raises(MultiTUPredictiveError, match="input_sequence"):
-        produce(plan_path, manifest, COMMIT, TREE)
+        _produce(plan_path, manifest)
     assert not Path(value["result"]["directory"]).exists()
 
     plan_path = _plan(tmp_path / "mutation", 100, 100, "mutation")
     plan = json.loads(plan_path.read_bytes())
     Path(plan["inputs"][0]["path"]).write_bytes(b"mutated\n")
     with pytest.raises(MultiTUPredictiveError):
-        produce(plan_path, manifest, COMMIT, TREE)
+        _produce(plan_path, manifest)
     assert not Path(plan["result"]["directory"]).exists()
 
     plan_path = _plan(tmp_path / "duplicate", 100, 100, "duplicate")
@@ -171,7 +206,7 @@ def test_reorder_and_mutation_fail_before_producer_output(tmp_path: Path) -> Non
     value["inputs"][1] = value["inputs"][0]
     _write(plan_path, canonical_bytes(value) + b"\n")
     with pytest.raises(MultiTUPredictiveError, match="input_sequence"):
-        produce(plan_path, manifest, COMMIT, TREE)
+        _produce(plan_path, manifest)
 
 
 def test_repeat_full_has_same_input_identity_but_distinct_run_identity(tmp_path: Path) -> None:
@@ -189,7 +224,7 @@ def test_repeat_full_has_same_input_identity_but_distinct_run_identity(tmp_path:
     repeat_path = tmp_path / "repeat-plan.json"
     _write(repeat_path, canonical_bytes(repeat) + b"\n")
     manifest = _template(tmp_path / "template", {"corpus": "DuckDB", "profile": "P29", "regime": "cold"})
-    full_result, repeat_result = produce_pair(full_path, repeat_path, manifest, COMMIT, TREE)
+    full_result, repeat_result = _produce_pair(full_path, repeat_path, manifest)
     assert full_result["identity"]["input_digest"] == repeat_result["identity"]["input_digest"]
     assert full_result["identity"]["run_id"] != repeat_result["identity"]["run_id"]
     assert full_result["outputs"]["predictive_sim"]["points"] == 3
@@ -199,7 +234,7 @@ def test_repeat_full_has_same_input_identity_but_distinct_run_identity(tmp_path:
 def test_output_manifest_is_consumable_by_existing_normalizer(tmp_path: Path) -> None:
     plan_path = _plan(tmp_path / "run", 100, 100, "normalize")
     manifest = _template(tmp_path / "template", {"corpus": "DuckDB", "profile": "P29", "regime": "cold"})
-    produce(plan_path, manifest, COMMIT, TREE)
+    _produce(plan_path, manifest)
     output = Path(json.loads(plan_path.read_bytes())["result"]["directory"])
     predictive_manifest = output / "predictive_curve_manifest.json"
     predicted = (output / "predictive_sim.jsonl").read_bytes()
@@ -221,7 +256,7 @@ def test_non_zstd_p29_keeps_product_endpoint_bytes(tmp_path: Path) -> None:
     plan_path = _plan(tmp_path / profile, 100, 100, profile, profile=profile)
     cell = {"corpus": "DuckDB", "profile": profile, "regime": "cold"}
     manifest = _template(tmp_path / f"template-{profile}", cell)
-    result = produce(plan_path, manifest, COMMIT, TREE)
+    result = _produce(plan_path, manifest)
     output = Path(json.loads(plan_path.read_bytes())["result"]["directory"])
     rows = [json.loads(line) for line in (output / "predictive_sim.jsonl").read_text().splitlines()]
     _value, _raw, _input, _topology_facts, _sha, topology, _cell = load_inputs(manifest)
@@ -235,14 +270,14 @@ def test_grz_without_libbsc_fails_closed(tmp_path: Path) -> None:
     manifest = _template(tmp_path / "template-grz",
                          {"corpus": "DuckDB", "profile": "GRZ_RESIDUAL", "regime": "cold"})
     with pytest.raises(MultiTUPredictiveError, match="requires a simulator built with --with-libbsc"):
-        produce(plan_path, manifest, COMMIT, TREE)
+        _produce(plan_path, manifest)
 
 
 def test_twenty_relationships_have_independent_first_use_startup(tmp_path: Path) -> None:
     plan_path = _plan(tmp_path / "twenty", 100, 100, "twenty", "warm", "ZSTD_ROUTE", "C1F20")
     cell = {"corpus": "DuckDB", "profile": "ZSTD_ROUTE", "regime": "warm"}
     manifest = _template(tmp_path / "template-twenty", cell)
-    produce(plan_path, manifest, COMMIT, TREE)
+    _produce(plan_path, manifest)
     output = Path(json.loads(plan_path.read_bytes())["result"]["directory"])
     rows = [json.loads(line) for line in (output / "predictive_sim.jsonl").read_text().splitlines()]
     assert sum(row["startup_ns"] > 0 for row in rows) == 20
@@ -272,7 +307,7 @@ def test_authenticated_topology_schedule_declares_exact_capacity_and_makespan(tm
     assert {item["per_f_slot"] for item in scheduling["assignments"]} == {0, 1}
     manifest = _template(tmp_path / "template-schedule",
                          {"corpus": "DuckDB", "profile": "P29", "regime": "cold"})
-    produce(plan_path, manifest, COMMIT, TREE)
+    _produce(plan_path, manifest)
     rows = [json.loads(line) for line in
             (Path(value["result"]["directory"]) / "predictive_sim.jsonl").read_text().splitlines()]
     serial = sum(row["scheduling"]["service_ns"] for row in rows)
@@ -280,14 +315,27 @@ def test_authenticated_topology_schedule_declares_exact_capacity_and_makespan(tm
     assert rows[-1]["schedule_summary"]["makespan_ns"] == rows[-1]["cumulative"]["elapsed_ns"]
     assert rows[-1]["schedule_summary"]["serial_service_ns"] == serial
     assert all(row["scheduling"]["finish_ns"] ==
-               row["scheduling"]["start_ns"] + row["scheduling"]["service_ns"] for row in rows)
+               row["scheduling"]["source_start_ns"] + row["scheduling"]["service_ns"] for row in rows)
+    first_f = [row for row in rows if row["scheduling"]["f_relationship"] == 0]
+    assert first_f[1]["scheduling"]["source_start_ns"] == first_f[0]["scheduling"]["source_finish_ns"]
+    assert first_f[1]["scheduling"]["source_start_ns"] < first_f[0]["scheduling"]["finish_ns"]
+
+
+def test_planning_policy_is_explicit_for_variable_input_sizes(tmp_path: Path) -> None:
+    inputs = [{"bytes": 1}, {"bytes": 101}, {"bytes": 7}]
+    schedule = depth_runner.build_schedule(inputs, "C1F20")
+    assert schedule["assignment_policy"] == "least_planned_load_then_lowest_slot"
+    assert schedule["assignment_policy_version"] == "s8-planned-load-v1"
+    assert schedule["service_duration_model"] == "base_compile_ns_plus_24_ns_per_input_byte"
+    assert [item["planning_service_ns"] for item in schedule["assignments"]] == [1500024, 1502424, 1500168]
+    assert [item["global_slot"] for item in schedule["assignments"]] == [0, 1, 2]
 
 
 def test_c1f1_schedule_is_serial_and_topology_mutation_fails_closed(tmp_path: Path) -> None:
     plan_path = _plan(tmp_path / "serial", 100, 100, "serial", topology="C1F1")
     manifest = _template(tmp_path / "template-serial",
                          {"corpus": "DuckDB", "profile": "P29", "regime": "cold"})
-    produce(plan_path, manifest, COMMIT, TREE)
+    _produce(plan_path, manifest)
     value = json.loads(plan_path.read_bytes())
     rows = [json.loads(line) for line in
             (Path(value["result"]["directory"]) / "predictive_sim.jsonl").read_text().splitlines()]
@@ -300,7 +348,38 @@ def test_c1f1_schedule_is_serial_and_topology_mutation_fails_closed(tmp_path: Pa
     changed["scheduling"]["global_slots"] = 39
     _write(mutated, canonical_bytes(changed) + b"\n")
     with pytest.raises(MultiTUPredictiveError, match="scheduling_authenticated_mismatch"):
-        produce(mutated, manifest, COMMIT, TREE)
+        _produce(mutated, manifest)
+
+
+def test_product_identity_requires_clean_build_root_and_timeout_contract(tmp_path: Path) -> None:
+    plan_path = _plan(tmp_path / "identity", 100, 100, "identity")
+    manifest = _template(tmp_path / "template-identity",
+                         {"corpus": "DuckDB", "profile": "P29", "regime": "cold"})
+    build_root = _product_build_root(plan_path)
+    result = produce(plan_path, manifest, build_root)
+    expected_commit = subprocess.check_output(
+        ["git", "-C", str(build_root), "rev-parse", "HEAD"], text=True).strip()
+    expected_tree = subprocess.check_output(
+        ["git", "-C", str(build_root), "rev-parse", "HEAD^{tree}"], text=True).strip()
+    assert result["identity"]["source_commit"] == expected_commit
+    assert result["identity"]["source_tree"] == expected_tree
+    assert result["product_build_root"] == str(build_root.resolve())
+    assert result["execution"]["batch_timeout_seconds"] == 260
+
+    changed_source = build_root / "cache" / "sim" / "p50sim.cpp"
+    changed_source.write_bytes(changed_source.read_bytes() + b"\n")
+    dirty_plan = _plan(tmp_path / "dirty", 100, 100, "dirty")
+    dirty_manifest = _template(tmp_path / "template-dirty",
+                               {"corpus": "DuckDB", "profile": "P29", "regime": "cold"})
+    with pytest.raises(MultiTUPredictiveError, match="tracked_worktree_dirty"):
+        produce(dirty_plan, dirty_manifest, build_root)
+
+    timeout_plan = _plan(tmp_path / "timeout", 100, 100, "timeout")
+    timeout_value = json.loads(timeout_plan.read_bytes())
+    timeout_value["execution_contract"]["timeout_policy"] = "180"
+    _write(timeout_plan, canonical_bytes(timeout_value) + b"\n")
+    with pytest.raises(MultiTUPredictiveError, match="multi_tu_producer_contract_invalid"):
+        _produce(timeout_plan, dirty_manifest)
 
 
 def test_standalone_repeat_fails_and_pair_carries_terminal_codec_state(tmp_path: Path) -> None:
@@ -318,14 +397,14 @@ def test_standalone_repeat_fails_and_pair_carries_terminal_codec_state(tmp_path:
     _write(repeat_path, canonical_bytes(repeat) + b"\n")
     manifest = _template(tmp_path / "template-pair", {"corpus": "DuckDB", "profile": "ZSTD_ROUTE", "regime": "warm"})
     with pytest.raises(MultiTUPredictiveError, match="paired_producer"):
-        produce(repeat_path, manifest, COMMIT, TREE)
-    first_result, second_result = produce_pair(full_path, repeat_path, manifest, COMMIT, TREE)
+        _produce(repeat_path, manifest)
+    first_result, second_result = _produce_pair(full_path, repeat_path, manifest)
     second_output = Path(repeat["result"]["directory"])
     second_rows = [json.loads(line) for line in (second_output / "predictive_sim.jsonl").read_text().splitlines()]
     assert second_rows[0]["relationship_state"]["transition"] == "relationship_continue"
     first_output = Path(full["result"]["directory"])
     first_rows = [json.loads(line) for line in (first_output / "predictive_sim.jsonl").read_text().splitlines()]
-    assert first_rows[0]["scheduling"]["start_ns"] == 0
-    assert second_rows[0]["scheduling"]["start_ns"] == 0
+    assert first_rows[0]["scheduling"]["source_start_ns"] == 0
+    assert second_rows[0]["scheduling"]["source_start_ns"] == 0
     assert second_result["codec"]["paired_stream_scope"] == "full-1+full-2"
     assert first_result["codec"]["mode"] == "paired_continuation"
