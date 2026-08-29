@@ -363,6 +363,13 @@ def test_batch_shell_excludes_warm_prewarm_and_carries_optional_repeat() -> None
     assert '"$work/envs-f-$relationship"' in shell
     assert 'S8_BATCH_WINDOW run=%s start_ns=%s end_ns=%s' in shell
     assert 'run_one "$run_label" "$ordinal" "$relationship" "$f_slot"' in shell
+    assert "planned_assignment=%s" in shell
+    assert "planned_admission_slot=%s" in shell
+    assert "preferred_service_identity=p50-f-%s" in shell
+    assert "source_admission=global_source_commit_gate" in shell
+    assert "physical_slot_observed=0" in shell
+    assert '"physical_slot_observed": False' in Path(__file__).resolve().parent.joinpath(
+        "s8_real_c1f1_live_runner.py").read_text()
     assert 'staged="$work/src/$run_label-$ordinal.ii"' in shell
     assert 'cp -- "$predictive_path" "$staged"' in shell
     assert 'compile_args_for "$item_compile_db" "$item_compile_source" "$item_compile_output" "$input_path" "$remote_obj"' in shell
@@ -405,7 +412,7 @@ def test_parallel_topology_binds_all_relationships_and_slots(tmp_path: Path) -> 
 def test_parallel_batch_window_requires_real_overlap() -> None:
     rows = [{} for _ in range(40)]
     observations = [{"run": "full-1", "relationship": index % 20,
-                     "f_slot": (index // 20) % 2,
+                     "planned_admission_slot": (index // 20) % 2,
                      "compile_start_ns": 1_000 + index,
                      "compile_end_ns": 2_000 + index}
                     for index in range(40)]

@@ -660,7 +660,8 @@ def _timing_rows(stdout: str, rows: list[dict[str, Any]], work: Path,
         if observed["source_sha256"] != expected["sha256"]:
             _fail(f"batch:{index}:source_digest_mismatch")
         integer_fields = ("preprocessed_bytes", "remote_bytes", "local_bytes", "compile_start_ns",
-                          "compile_end_ns", "wait_for_cs_ns", "assignment", "relationship", "f_slot")
+                          "compile_end_ns", "wait_for_cs_ns", "planned_assignment", "relationship",
+                          "planned_admission_slot")
         parsed = {}
         for key in integer_fields:
             try:
@@ -671,13 +672,13 @@ def _timing_rows(stdout: str, rows: list[dict[str, Any]], work: Path,
         expected_route = ordinal if suite == PARALLEL_TOPOLOGY else 0
         if (parsed["preprocessed_bytes"] <= 0 or parsed["remote_bytes"] <= 0 or
                 parsed["local_bytes"] <= 0 or parsed["compile_end_ns"] <= parsed["compile_start_ns"] or
-                parsed["wait_for_cs_ns"] <= 0 or parsed["assignment"] != expected_route or
+                parsed["wait_for_cs_ns"] <= 0 or parsed["planned_assignment"] != expected_route or
                 parsed["relationship"] != expected_assignment["relationship"] or
-                parsed["f_slot"] != expected_assignment["f_slot"]):
+                parsed["planned_admission_slot"] != expected_assignment["f_slot"]):
             _fail(f"batch:{index}:product_metric_invalid")
         if (suite == PARALLEL_TOPOLOGY and
-                observed.get("service_identity") != f"p50-f-{parsed['relationship']}"):
-            _fail(f"batch:{index}:service_identity_invalid")
+                observed.get("preferred_service_identity") != f"p50-f-{parsed['relationship']}"):
+            _fail(f"batch:{index}:preferred_service_identity_invalid")
         if (observed["preprocessed_sha256"] != expected["predictive_input"]["sha256"] or
                 parsed["preprocessed_bytes"] != expected["predictive_input"]["bytes"]):
             _fail(f"batch:{index}:predictive_payload_mismatch")
@@ -733,7 +734,8 @@ def _batch_windows(stdout: str, observations: list[dict[str, Any]],
                        for left in range(len(starts))
                        for right in range(left + 1, len(starts))):
                 _fail(f"batch:{run}:no_observed_compile_overlap")
-            routes = {(int(row["relationship"]), int(row["f_slot"])) for row in selected}
+            routes = {(int(row["relationship"]), int(row["planned_admission_slot"]))
+                      for row in selected}
             if routes != {(relationship, slot)
                           for relationship in range(RELATIONSHIP_COUNT[suite])
                           for slot in range(SLOTS_PER_F[suite])}:
@@ -807,7 +809,8 @@ def _action_stage_paths(c_path: Path, f_path: Path, expected_count: int,
              "raw_digest": c_row["raw_digest"], "state_digest": c_row["state_digest"],
              "transaction_digest": c_row["transaction_digest"],
              "f_state_digest": f_row["state_digest"], "f_raw_digest": f_row["raw_digest"],
-             "relationship": relationship, "f_slot": int(assignment["f_slot"])})
+             "relationship": relationship,
+             "planned_admission_slot": int(assignment["f_slot"])})
     if suite == PARALLEL_TOPOLOGY and set(relation_f_guid) != set(range(RELATIONSHIP_COUNT[suite])):
         _fail("action_trace:relationship_set_mismatch")
     return result
@@ -916,7 +919,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
         _fail("product_run:batch_passes_mismatch")
     if output_value("S8_BATCH_WARM") != str(int(regime == "warm")):
         _fail("product_run:batch_regime_mismatch")
-    scheduling_marker = ("S8_SCHEDULING mode=parallel execution_slots=40 max_concurrency=40"
+    scheduling_marker = ("S8_SCHEDULING mode=parallel execution_slots=40 max_concurrency=40 relationships=20 slots_per_f=2 source_admission=global_source_commit_gate physical_slot_observed=0"
                          if suite == PARALLEL_TOPOLOGY else
                          "S8_SCHEDULING mode=serial execution_slots=1 max_concurrency=1")
     if scheduling_marker not in stdout.splitlines():
@@ -1027,8 +1030,10 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                         "client_elapsed_ns": item["client_elapsed_ns"],
                         "returned_object_bytes": item["returned_object_bytes"], "run": run,
                         "measurement_window": "compile+result_return",
-                        "assignment": item["assignment"], "relationship": item["relationship"],
-                        "f_slot": item["f_slot"], "tu_seq": item["tu_seq"],
+                        "planned_assignment": item["planned_assignment"],
+                        "relationship": item["relationship"],
+                        "planned_admission_slot": item["planned_admission_slot"],
+                        "tu_seq": item["tu_seq"],
                         "rel_seq": item["rel_seq"], "c_store_guid": item["c_store_guid"],
                         "f_store_guid": item["f_store_guid"], "state_digest": item["state_digest"],
                         "f_state_digest": item["f_state_digest"],
@@ -1165,7 +1170,11 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                   "launch_identity": launch_identity,
                   "curve_manifests": manifests, "remote_compile_required": True,
                   "batch_windows": batch_windows,
-                  "scheduling": ({"mode": "parallel", "execution_slots": 40, "max_concurrency": 40}
+                  "scheduling": ({"mode": "parallel", "execution_slots": 40, "max_concurrency": 40,
+                                  "capacity_evidence": "configured_relationship_lanes",
+                                  "admission_lane_field": "planned_admission_slot",
+                                  "physical_slot_observed": False,
+                                  "source_admission": "global_source_commit_gate"}
                                   if suite == PARALLEL_TOPOLOGY else
                                   {"mode": "serial", "execution_slots": 1, "max_concurrency": 1}),
                   "artifact_retention": {"mode": "all" if retain_all_artifacts else "sample",

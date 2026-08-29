@@ -856,8 +856,9 @@ if test -n "$batch_manifest"; then
             relationship=0; f_slot=0
             if test "$suite" = C1F20/40; then
                 IFS="$(printf '\t')" read -r relationship f_slot <&3
-                # The topology names the exact slot.  Never substitute the
-                # sibling slot when this preregistered slot is still active.
+                # The topology names the exact planned admission lane.  Never
+                # substitute the sibling lane while this lane is still active;
+                # the product evidence records the actual F identity below.
                 marker="$work/active/$run_label-$relationship-$f_slot"
                 while test -e "$marker"; do sleep 0.005; done
             else
@@ -870,9 +871,10 @@ if test -n "$batch_manifest"; then
                 >"$work/job-$run_label-$ordinal.log" 2>&1 &
             job_pid=$!
             job_pids="$job_pids $job_pid"
-            # Serialize only source admission within a relationship.  The
-            # prior job's compiler/result process remains active after this
-            # witness, so both real F slots can overlap.
+            # The launch loop globally waits for each product source-commit /
+            # input-ready witness.  This intentionally serializes short C-side
+            # source admission; the prior job's compiler/result process remains
+            # active after the witness, so real F compile slots can overlap.
             input_ready_marker="$work/input-ready/$run_label-$relationship-$ordinal"
             while test ! -e "$input_ready_marker"; do
                 if ! kill -0 "$job_pid" 2>/dev/null; then
@@ -905,7 +907,7 @@ $result
 EOF
             wait_ns=$(cat "$work/wait-$run_label-$ordinal.ns")
             if test "$emit_rows" = 1; then
-                printf 'S8_BATCH_TU run=%s ordinal=%s tu_id=%s source_sha256=%s preprocessed_path=%s preprocessed_sha256=%s preprocessed_bytes=%s remote_path=%s remote_sha256=%s remote_bytes=%s local_path=%s local_sha256=%s local_bytes=%s compile_start_ns=%s compile_end_ns=%s wait_for_cs_ns=%s assignment=%s relationship=%s f_slot=%s service_identity=p50-f-%s\n' \
+                printf 'S8_BATCH_TU run=%s ordinal=%s tu_id=%s source_sha256=%s preprocessed_path=%s preprocessed_sha256=%s preprocessed_bytes=%s remote_path=%s remote_sha256=%s remote_bytes=%s local_path=%s local_sha256=%s local_bytes=%s compile_start_ns=%s compile_end_ns=%s wait_for_cs_ns=%s planned_assignment=%s relationship=%s planned_admission_slot=%s preferred_service_identity=p50-f-%s\n' \
                     "$run_label" "$ordinal" "$tu_id" "$source_sha" "$preprocessed_capture" "$preprocessed_sha" "$preprocessed_bytes" \
                     "$remote_obj" "$remote_sha" "$remote_bytes" "$local_obj" "$local_sha" "$local_bytes" \
                     "$compile_start_ns" "$compile_end_ns" "$wait_ns" \
@@ -979,7 +981,7 @@ if test -n "$batch_manifest"; then
     echo "S8_BATCH_PASSES=$passes"
     echo "S8_BATCH_WARM=$warm"
     if test "$suite" = C1F20/40; then
-        echo "S8_SCHEDULING mode=parallel execution_slots=40 max_concurrency=40 relationships=20 slots_per_f=2"
+        echo "S8_SCHEDULING mode=parallel execution_slots=40 max_concurrency=40 relationships=20 slots_per_f=2 source_admission=global_source_commit_gate physical_slot_observed=0"
     else
         echo "S8_SCHEDULING mode=serial execution_slots=1 max_concurrency=1"
     fi
