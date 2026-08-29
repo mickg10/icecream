@@ -162,6 +162,8 @@ source_root=${ICECC_P50_C1F1_SOURCE_ROOT:-}
 source_relative=${ICECC_P50_C1F1_SOURCE_RELATIVE:-}
 source_input=${ICECC_P50_C1F1_INPUT:-}
 include_root=${ICECC_P50_C1F1_INCLUDE_ROOT:-}
+compile_db=${ICECC_P50_C1F1_COMPILE_DB:-}
+compile_source=${ICECC_P50_C1F1_COMPILE_SOURCE:-}
 if test -n "$source_root" || test -n "$source_relative"; then
     test -n "$source_root" && test -n "$source_relative" || {
         echo "FAIL: source root and source relative path must be supplied together" >&2
@@ -195,6 +197,35 @@ else
         'int p50_c1f1_translation_unit() {' \
         '    return static_cast<int>(UINT32_C(50));' \
         '}' >"$work/src/main.cpp"
+fi
+if test -n "$compile_db" || test -n "$compile_source"; then
+    test -n "$compile_db" && test -n "$compile_source" || {
+        echo "FAIL: compile database and source must be supplied together" >&2; exit 1;
+    }
+    test -f "$compile_db" && test ! -L "$compile_db" || {
+        echo "FAIL: authoritative compile database is unavailable" >&2; exit 1;
+    }
+    test "${compile_source#/}" != "$compile_source" || {
+        echo "FAIL: compile database source must be absolute" >&2; exit 1;
+    }
+    compile_args_for() {
+        output=$1
+        python3 - "$compile_db" "$compile_source" "$work/src/main.cpp" "$output" <<'PY'
+import json, shlex, sys
+db, source, staged, output = sys.argv[1:]
+entries = json.load(open(db, encoding='utf-8'))
+matches = [e for e in entries if isinstance(e, dict) and e.get('file') == source]
+if len(matches) != 1 or not isinstance(matches[0].get('command'), str): raise SystemExit(1)
+tokens = shlex.split(matches[0]['command'])
+if len(tokens) < 2 or source not in tokens: raise SystemExit(1)
+tokens = tokens[1:]
+tokens[tokens.index(source)] = staged
+for i, token in enumerate(tokens[:-1]):
+    if token == '-o': tokens[i + 1] = output; break
+else: raise SystemExit(1)
+print(shlex.join(tokens))
+PY
+    }
 fi
 if test -n "$include_root"; then
     test "${include_root#/}" != "$include_root" || {
@@ -331,19 +362,32 @@ compile_once() {
     remote_obj="$work/out/remote-$label.o"
     local_obj="$work/out/local-$label.o"
     client_log="$work/client-compile-$label.log"
-    if test -n "$include_root"; then
+    if test -n "$compile_db"; then
+        remote_compile_args=$(compile_args_for "$remote_obj")
+        local_compile_args=$(compile_args_for "$local_obj")
+    elif test -n "$include_root"; then
         compile_include_args="-I$include_root"
     else
         compile_include_args=""
     fi
-    ICECC_TEST_SOCKET="$work/client.sock" ICECC_TEST_REMOTEBUILD=1 \
-        ICECC_VERSION="$envtar" ICECC_P50_C1F1_REQUIRED=1 \
-        ICECC_PREFERRED_HOST=p50-f \
-        ICECC_DEBUG=debug ICECC_LOGFILE="$client_log" \
-        run_client_with_timeout g++ -std=c++17 -O2 -c \
-        $compile_include_args "$work/src/main.cpp" -o "$remote_obj"
-    g++ -std=c++17 -O2 -c $compile_include_args \
-        "$work/src/main.cpp" -o "$local_obj"
+    if test -n "$compile_db"; then
+        ICECC_TEST_SOCKET="$work/client.sock" ICECC_TEST_REMOTEBUILD=1 \
+            ICECC_VERSION="$envtar" ICECC_P50_C1F1_REQUIRED=1 \
+            ICECC_PREFERRED_HOST=p50-f ICECC_DEBUG=debug ICECC_LOGFILE="$client_log" \
+            eval "run_client_with_timeout g++ $remote_compile_args"
+    else
+        ICECC_TEST_SOCKET="$work/client.sock" ICECC_TEST_REMOTEBUILD=1 \
+            ICECC_VERSION="$envtar" ICECC_P50_C1F1_REQUIRED=1 \
+            ICECC_PREFERRED_HOST=p50-f ICECC_DEBUG=debug ICECC_LOGFILE="$client_log" \
+            run_client_with_timeout g++ -std=c++17 -O2 -c \
+            $compile_include_args "$work/src/main.cpp" -o "$remote_obj"
+    fi
+    if test -n "$compile_db"; then
+        eval "g++ $local_compile_args"
+    else
+        g++ -std=c++17 -O2 -c $compile_include_args \
+            "$work/src/main.cpp" -o "$local_obj"
+    fi
     cmp -s "$remote_obj" "$local_obj" || {
         echo "FAIL: real P50 object differs from local reference ($label)" >&2
         exit 1

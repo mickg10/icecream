@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 import os
+import shlex
 import stat
 from datetime import datetime, timezone
 from pathlib import Path
@@ -103,6 +104,40 @@ def source_from_manifest(root: Path, manifest: Path) -> tuple[Path, str] | None:
     return (path, relative.as_posix()) if authenticated_input(path) else None
 
 
+def compile_argv_from_database(database: Path, source: str) -> list[str] | None:
+    """Return the authoritative command's arguments after its compiler.
+
+    The database and selected source are authenticated regular files.  The
+    caller owns replacement of the source/output paths; all flags remain
+    byte-for-byte in their database order.
+    """
+    authenticated = authenticated_input(database)
+    if authenticated is None:
+        return None
+    try:
+        entries = json.loads(database.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("file") != source:
+            continue
+        command = entry.get("command")
+        if not isinstance(command, str):
+            return None
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            return None
+        if len(tokens) < 2:
+            return None
+        # The compiler is selected by the production runner.  Retain every
+        # remaining token, including the exact -I/-D ordering.
+        return tokens[1:]
+    return None
+
+
 def cell_row(
     corpus: str,
     regime: str,
@@ -173,6 +208,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--source-relative", required=True)
+    parser.add_argument("--compile-db", type=Path)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
     output = args.out.absolute()
@@ -192,6 +228,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         for corpus, regime in CELLS
     ]
+    if args.compile_db is not None:
+        compile_argv = compile_argv_from_database(args.compile_db, str(args.source_root / args.source_relative))
+        if compile_argv is None:
+            parser.error("authoritative compile database entry unavailable")
+        for row in rows:
+            row["compile_db"] = str(args.compile_db.absolute())
+            row["compile_db_sha256"] = sha256(args.compile_db)
+            row["compile_argv"] = compile_argv
     write_jsonl(experiment / "results.jsonl", rows)
     # The caller receives one stable path and one immutable JSONL payload.  A
     # later product run must use a new experiment directory rather than
