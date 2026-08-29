@@ -14,12 +14,36 @@ build=${ICECC_TEST_TOP_BUILDDIR:-$(CDPATH= cd -- "$src" && pwd)}
 timeout_s=${ICECC_P50_C1F1_TIMEOUT:-180}
 profile_marker=${ICECC_P50_PROFILE:-ZSTD_ROUTE}
 warm=${ICECC_P50_C1F1_WARM:-0}
+grz_product_configured() {
+    # GRZ is a product capability, not merely a selector spelling.  Require
+    # both configure's feature definition and the generated cache product
+    # makefile's libbsc compile/link inputs before starting the live gate.
+    test -f "$build/config.h" || return 1
+    grep -F '#define ICECC_P50_WITH_LIBBSC 1' "$build/config.h" >/dev/null \
+        || return 1
+    test -f "$build/cache/Makefile" || return 1
+    grep -E '^LIBBSC_CFLAGS = .*ICECC_P50_WITH_LIBBSC' \
+        "$build/cache/Makefile" >/dev/null || return 1
+    grep -E '^LIBBSC_LIBS = .*(libbsc\.a|-lbsc)' \
+        "$build/cache/Makefile" >/dev/null || return 1
+}
 case "$profile_marker" in
     P29) profile_advertisement=p29 ;;
     ZSTD_TU) profile_advertisement=zstd_tu ;;
     ZSTD_ROUTE) profile_advertisement=z3_long ;;
+    GRZ|GRZ_RESIDUAL)
+        grz_product_configured || {
+            echo "FAIL: ICECC_P50_PROFILE=$profile_marker requires a product build configured with libbsc" >&2
+            exit 1
+        }
+        # The client emits the canonical production profile marker for both
+        # accepted environment aliases; the scheduler advertises its wire
+        # capability spelling separately.
+        profile_marker=GRZ_RESIDUAL
+        profile_advertisement=grz
+        ;;
     *)
-        echo "FAIL: ICECC_P50_PROFILE must be P29, ZSTD_TU, or ZSTD_ROUTE" >&2
+        echo "FAIL: ICECC_P50_PROFILE must be P29, ZSTD_TU, ZSTD_ROUTE, GRZ, or GRZ_RESIDUAL" >&2
         exit 1
         ;;
 esac
