@@ -51,9 +51,9 @@ def build_schedule(inputs: list[dict[str, Any]], topology: str) -> dict[str, Any
     if topology not in TOPOLOGIES:
         raise DepthPlanError("scheduling:topology_invalid")
     if topology == "C1F1":
-        relationships, slots, slots_per_f, capacity = 1, 1, 1, 100000
+        relationships, slots, slots_per_f, capacity, capacity_status = 1, 1, 1, 100000, "DECLARED"
     else:
-        relationships, slots, slots_per_f, capacity = 20, 40, 2, 40
+        relationships, slots, slots_per_f, capacity, capacity_status = 20, 40, 2, None, "NOT_DECLARED"
     available = [0] * slots
     assignments: list[dict[str, Any]] = []
     for ordinal, item in enumerate(inputs):
@@ -76,6 +76,7 @@ def build_schedule(inputs: list[dict[str, Any]], topology: str) -> dict[str, Any
         "f_relationships": relationships, "slots_per_f": slots_per_f,
         "global_slots": slots, "execution_slots": slots,
         "stream_capacity_tus": capacity,
+        "stream_capacity_status": capacity_status,
         "service_duration_model": "base_compile_ns_plus_24_ns_per_input_byte",
         "assignment_policy": "least_planned_load_then_lowest_slot",
         "assignment_policy_version": "s8-planned-load-v1",
@@ -274,7 +275,7 @@ def build_plan(source_manifest: Path, source_root: Path, matrix_audit: Path,
             "live_observation": "separate_authenticated_curve_required",
             "required": "authenticated predictive curve over the ordered TU sequence",
             "timeout_policy": TIMEOUT_POLICY,
-            "note": "The producer invokes the current simulator per TU and binds the aggregate input digest; live observations are never synthesized.",
+            "note": "The producer invokes one authenticated product batch over the ordered TU sequence and binds the aggregate input digest; live observations are never synthesized.",
         },
     }
     if repeat_of is not None:

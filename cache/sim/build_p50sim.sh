@@ -8,7 +8,9 @@ dep_root=${ICECC_P50_DEP_ROOT:-/tanksmall/MICKG2/mickg/src/mickg10/icecream-deps
 cxx=${CXX:-g++}
 output="$sim_dir/.p50sim.bin"
 temporary=$(mktemp "$sim_dir/.p50sim.bin.XXXXXX")
-trap 'rm -f "$temporary"' EXIT HUP INT TERM
+receipt="$sim_dir/.p50sim-build.json"
+receipt_temporary=$(mktemp "$sim_dir/.p50sim-build.json.XXXXXX")
+trap 'rm -f "$temporary" "$receipt_temporary"' EXIT HUP INT TERM
 
 config_cppflags=
 libbsc_cflags=
@@ -27,6 +29,11 @@ if [ -f "$build_root/config.h" ]; then
             exit 1
         fi
     fi
+fi
+
+with_libbsc=0
+if [ -n "$libbsc_libs" ]; then
+    with_libbsc=1
 fi
 
 if [ -f "$build_root/cache/Makefile" ] && [ -f "$build_root/services/Makefile" ]; then
@@ -59,4 +66,33 @@ else
         -lzstd -lxxhash $libbsc_libs -pthread -o "$temporary"
 fi
 mv "$temporary" "$output"
+git_root=$(git -C "$root" rev-parse --show-toplevel)
+git_status=$(git -C "$git_root" status --porcelain --untracked-files=no)
+if [ -n "$git_status" ]; then
+    echo "p50sim: product source tree is tracked-dirty; refusing build receipt" >&2
+    exit 1
+fi
+source_commit=$(git -C "$git_root" rev-parse HEAD)
+source_tree=$(git -C "$git_root" rev-parse 'HEAD^{tree}')
+sha256_file() { sha256sum "$1" | awk '{print $1}'; }
+bytes_file() { wc -c < "$1" | tr -d ' '; }
+artifact_json() {
+    artifact=$1
+    if [ -f "$artifact" ]; then
+        printf '{"path":"%s","sha256":"%s","bytes":%s}' \
+            "$artifact" "$(sha256_file "$artifact")" "$(bytes_file "$artifact")"
+    else
+        printf 'null'
+    fi
+}
+compiler_path=$(command -v "$cxx" || printf '%s' "$cxx")
+compiler_version=$($cxx --version 2>/dev/null | head -n 1 | tr '\n' ' ')
+printf '{"schema":"icecream-p50sim-build-v1","source":{"root":"%s","head":"%s","tree":"%s","tracked_clean":true},"binary":{"path":"%s","sha256":"%s","bytes":%s},"inputs":{"build_script":%s,"p50sim_source":%s,"config_h":%s,"cache_makefile":%s,"services_makefile":%s},"configuration":{"with_libbsc":%s,"make_mode":"%s","dependency_root":"%s","compiler_path":"%s","compiler_version":"%s"}}\n' \
+    "$git_root" "$source_commit" "$source_tree" "$output" "$(sha256_file "$output")" "$(bytes_file "$output")" \
+    "$(artifact_json "$sim_dir/build_p50sim.sh")" "$(artifact_json "$sim_dir/p50sim.cpp")" \
+    "$(artifact_json "$build_root/config.h")" "$(artifact_json "$build_root/cache/Makefile")" \
+    "$(artifact_json "$build_root/services/Makefile")" "$with_libbsc" \
+    "$(if [ -f "$build_root/cache/Makefile" ] && [ -f "$build_root/services/Makefile" ]; then printf product_make; else printf direct_sources; fi)" \
+    "$dep_root" "$compiler_path" "$compiler_version" > "$receipt_temporary"
+mv "$receipt_temporary" "$receipt"
 trap - EXIT HUP INT TERM

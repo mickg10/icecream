@@ -61,6 +61,7 @@ unittests/*.log
 compile_commands.json
 .p50sim.bin
 cache/sim/.p50sim.bin*
+cache/sim/.p50sim-build.json*
 farmharness/__pycache__/
 .vs*
 package_builder/**/out/

@@ -324,7 +324,7 @@ def _product_binary(path: Path | None) -> tuple[Path, dict[str, object]]:
 
 
 def _product_build_identity(build_root: Path | None, sim_binary: Path | None
-                            ) -> tuple[Path, Path, str, str, dict[str, object]]:
+                            ) -> tuple[Path, Path, str, str, dict[str, object], dict[str, object]]:
     """Bind the run to a clean Git product build root and its binary."""
     root = (build_root or Path(__file__).resolve().parents[1]).resolve()
     try:
@@ -388,7 +388,93 @@ def _product_build_identity(build_root: Path | None, sim_binary: Path | None
     except ValueError as exc:
         raise MultiTUPredictiveError("product_simulator:outside_product_build_root") from exc
     simulator, simulator_facts = _product_binary(candidate)
-    return root, simulator, commit, tree_id, simulator_facts
+    receipt_path = simulator.parent / ".p50sim-build.json"
+    receipt_raw, receipt_facts = _snapshot(receipt_path, "product_build_receipt", MAX_PLAN_BYTES)
+    receipt = _parse(receipt_raw, "product_build_receipt")
+    if (not isinstance(receipt, dict) or set(receipt) != {
+            "schema", "source", "binary", "inputs", "configuration"} or
+            receipt.get("schema") != "icecream-p50sim-build-v1"):
+        raise MultiTUPredictiveError("product_build_receipt:schema_invalid")
+    source = receipt["source"]
+    if (not isinstance(source, dict) or set(source) != {"root", "head", "tree", "tracked_clean"} or
+            source.get("root") != str(root) or source.get("head") != commit or
+            source.get("tree") != tree_id or source.get("tracked_clean") is not True):
+        raise MultiTUPredictiveError("product_build_receipt:source_mismatch")
+
+    def verify_artifact(value: object, expected: Path, label: str,
+                        optional: bool = False) -> dict[str, object] | None:
+        if value is None and optional and not expected.exists():
+            return None
+        if (not isinstance(value, dict) or set(value) != {"path", "sha256", "bytes"} or
+                value.get("path") != str(expected.resolve())):
+            raise MultiTUPredictiveError(f"product_build_receipt:{label}_descriptor_invalid")
+        actual = _digest(expected, f"product_build_receipt:{label}", MAX_PLAN_BYTES)
+        if actual["sha256"] != value.get("sha256") or actual["bytes"] != value.get("bytes"):
+            raise MultiTUPredictiveError(f"product_build_receipt:{label}_stale")
+        return actual
+
+    binary_value = receipt["binary"]
+    if (not isinstance(binary_value, dict) or binary_value.get("path") != str(simulator.resolve()) or
+            binary_value.get("sha256") != simulator_facts["sha256"] or
+            binary_value.get("bytes") != simulator_facts["bytes"]):
+        raise MultiTUPredictiveError("product_build_receipt:binary_stale")
+    inputs = receipt["inputs"]
+    if (not isinstance(inputs, dict) or set(inputs) != {
+            "build_script", "p50sim_source", "config_h", "cache_makefile", "services_makefile"}):
+        raise MultiTUPredictiveError("product_build_receipt:inputs_invalid")
+    build_script = root / "cache" / "sim" / "build_p50sim.sh"
+    source_file = root / "cache" / "sim" / "p50sim.cpp"
+    verify_artifact(inputs["build_script"], build_script, "build_script")
+    verify_artifact(inputs["p50sim_source"], source_file, "p50sim_source")
+    config_file = root / "config.h"
+    cache_makefile = root / "cache" / "Makefile"
+    services_makefile = root / "services" / "Makefile"
+    verify_artifact(inputs["config_h"], config_file, "config_h", True)
+    verify_artifact(inputs["cache_makefile"], cache_makefile, "cache_makefile", True)
+    verify_artifact(inputs["services_makefile"], services_makefile, "services_makefile", True)
+    configuration = receipt["configuration"]
+    if (not isinstance(configuration, dict) or set(configuration) != {
+            "with_libbsc", "make_mode", "dependency_root", "compiler_path", "compiler_version"} or
+            configuration.get("with_libbsc") not in (0, 1) or
+            configuration.get("make_mode") not in ("product_make", "direct_sources") or
+            not isinstance(configuration.get("dependency_root"), str) or
+            not isinstance(configuration.get("compiler_path"), str) or
+            not isinstance(configuration.get("compiler_version"), str) or
+            not configuration["compiler_version"]):
+        raise MultiTUPredictiveError("product_build_receipt:configuration_invalid")
+
+    tools: dict[str, dict[str, object]] = {}
+    current_tools = {
+        "producer": Path(__file__).resolve(),
+        "depth_runner": Path(depth_runner.__file__).resolve(),
+        "predictive_engine": Path(engine.__file__).resolve(),
+    }
+    for name, current in current_tools.items():
+        relative = Path("farmharness") / current.name
+        expected = root / relative
+        if current.name not in {"s8_multitu_predictive_producer.py", "s8_depth_runner.py",
+                                "s8_predictive_engine.py"}:
+            raise MultiTUPredictiveError("product_build_root:tool_name_invalid")
+        relative = Path("farmharness") / current.name
+        try:
+            tracked = subprocess.run(
+                ["git", "-C", str(root), "ls-files", "--error-unmatch", str(relative)],
+                check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise MultiTUPredictiveError("product_build_root:tool_probe_failed") from exc
+        if tracked.returncode != 0 or tracked.stdout.strip() != str(relative):
+            raise MultiTUPredictiveError(f"product_build_root:tracked_tool_missing:{name}")
+        current_facts = _digest(current, f"tool:{name}", MAX_PLAN_BYTES)
+        expected_facts = _digest(expected, f"product_build_root:tool:{name}", MAX_PLAN_BYTES)
+        if current_facts["sha256"] != expected_facts["sha256"] or \
+                current_facts["bytes"] != expected_facts["bytes"]:
+            raise MultiTUPredictiveError(f"product_build_root:tool_source_mismatch:{name}")
+        tools[name] = {"path": str(expected.resolve()), "sha256": expected_facts["sha256"],
+                       "bytes": expected_facts["bytes"], "tree": tree_id}
+    return root, simulator, commit, tree_id, simulator_facts, {
+        "root": str(root), "receipt": receipt_facts, "tools": tools,
+    }
 
 
 def _batch_timeout_seconds(total_tus: int) -> int:
@@ -693,6 +779,7 @@ def _emit_product_segment(plan: dict[str, object], plan_facts: dict[str, object]
                           scheduling: dict[str, object],
                           timeout_seconds: int,
                           product_build_root: Path,
+                          build_facts: dict[str, object],
                           continuation: bool, paired: bool = False) -> dict[str, object]:
     curve_raw = b"".join(canonical_bytes(row) + b"\n" for row in rows)
     curve_sha = hashlib.sha256(curve_raw).hexdigest()
@@ -717,6 +804,7 @@ def _emit_product_segment(plan: dict[str, object], plan_facts: dict[str, object]
                          "bytes": plan_facts["plan"]["bytes"]},
                 "topology_digest": topology_digest,
                 "product_build_root": str(product_build_root),
+                "product_build": build_facts,
                 "scheduling": {"schema": scheduling["schema"],
                                 "topology": scheduling["topology"],
                                 "f_relationships": scheduling["f_relationships"],
@@ -724,6 +812,7 @@ def _emit_product_segment(plan: dict[str, object], plan_facts: dict[str, object]
                                 "global_slots": scheduling["global_slots"],
                                 "execution_slots": scheduling["execution_slots"],
                                 "stream_capacity_tus": scheduling["stream_capacity_tus"],
+                                "stream_capacity_status": scheduling["stream_capacity_status"],
                                 "service_duration_model": scheduling["service_duration_model"],
                                 "assignment_policy": scheduling["assignment_policy"],
                                 "assignment_policy_version": scheduling["assignment_policy_version"],
@@ -787,7 +876,7 @@ def produce(plan_path: Path, engine_manifest: Path, product_build_root: Path,
             "repeat_full:paired_producer_required_to_restore_terminal_codec_state")
     scheduling, assignments, relationship_count = _validate_scheduling(plan, inputs)
     assignment_facts = _check_optional_assignment(assignment_map, assignments, relationship_count)
-    build_root, simulator, source_commit, source_tree, simulator_facts = _product_build_identity(
+    build_root, simulator, source_commit, source_tree, simulator_facts, build_facts = _product_build_identity(
         product_build_root, sim_binary)
     manifest, _template_raw, _template_input, topology_facts, template_sha, topology, template_cell = engine.load_inputs(engine_manifest)
     if template_cell != cell or manifest["split"] != SPLITS[cell["corpus"]]:
@@ -837,7 +926,7 @@ def produce(plan_path: Path, engine_manifest: Path, product_build_root: Path,
                                  model_id, assignment_facts, relationship_count,
                                  simulator_facts, assignment_digest,
                                  str(plan["source_manifest"]["sha256"]), scheduling,
-                                 _batch_timeout_seconds(len(inputs)), build_root, False)
+                                 _batch_timeout_seconds(len(inputs)), build_root, build_facts, False)
 
 def produce_pair(first_plan_path: Path, repeat_plan_path: Path, engine_manifest: Path,
                  product_build_root: Path,
@@ -860,7 +949,7 @@ def produce_pair(first_plan_path: Path, repeat_plan_path: Path, engine_manifest:
             repeat_relationship_count != relationship_count):
         raise MultiTUPredictiveError("repeat_full:paired_scheduling_mismatch")
     assignment_facts = _check_optional_assignment(assignment_map, assignments, relationship_count)
-    build_root, simulator, source_commit, source_tree, simulator_facts = _product_build_identity(
+    build_root, simulator, source_commit, source_tree, simulator_facts, build_facts = _product_build_identity(
         product_build_root, sim_binary)
     manifest, _template_raw, _template_input, topology_facts, template_sha, topology, template_cell = engine.load_inputs(engine_manifest)
     if template_cell != cell or manifest["split"] != SPLITS[cell["corpus"]]:
@@ -903,13 +992,13 @@ def produce_pair(first_plan_path: Path, repeat_plan_path: Path, engine_manifest:
         input_digest, topology_digest, model_id, assignment_facts, relationship_count,
         simulator_facts, assignment_digest, str(first["source_manifest"]["sha256"]),
         scheduling, _batch_timeout_seconds(len(first_inputs) + len(repeat_inputs)), build_root,
-        False, True)
+        build_facts, False, True)
     repeat_producer = _emit_product_segment(
         repeat, repeat_facts, repeat_dir, repeat_rows, cell, source_commit, source_tree,
         input_digest, topology_digest, model_id, assignment_facts, relationship_count,
         simulator_facts, assignment_digest, str(first["source_manifest"]["sha256"]),
         scheduling, _batch_timeout_seconds(len(first_inputs) + len(repeat_inputs)), build_root,
-        True, True)
+        build_facts, True, True)
     return first_producer, repeat_producer
 
 def _write_new(path: Path, raw: bytes, label: str) -> None:

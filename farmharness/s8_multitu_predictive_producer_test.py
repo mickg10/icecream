@@ -101,6 +101,16 @@ def _product_build_root(anchor: Path) -> Path:
     source_target = root / "cache" / "sim" / "p50sim.cpp"
     if not source_target.exists():
         shutil.copy2(source, source_target)
+    source_root = Path(__file__).resolve().parents[1]
+    build_script_target = root / "cache" / "sim" / "build_p50sim.sh"
+    if not build_script_target.exists():
+        shutil.copy2(source_root / "cache/sim/build_p50sim.sh", build_script_target)
+    for name in ("s8_multitu_predictive_producer.py", "s8_depth_runner.py",
+                 "s8_predictive_engine.py"):
+        target_tool = root / "farmharness" / name
+        target_tool.parent.mkdir(parents=True, exist_ok=True)
+        if not target_tool.exists():
+            shutil.copy2(source_root / "farmharness" / name, target_tool)
     marker = root / "product-source.txt"
     if not marker.exists():
         _write(marker, "authenticated product build fixture\n")
@@ -108,10 +118,30 @@ def _product_build_root(anchor: Path) -> Path:
         subprocess.run(["git", "-C", str(root), "config", "user.email", "tests@example.invalid"],
                        check=True)
         subprocess.run(["git", "-C", str(root), "config", "user.name", "S8 tests"], check=True)
-        subprocess.run(["git", "-C", str(root), "add", "product-source.txt", "cache/sim/p50sim.cpp"],
+        subprocess.run(["git", "-C", str(root), "add", "product-source.txt", "cache/sim/p50sim.cpp",
+                        "cache/sim/build_p50sim.sh", "farmharness/s8_multitu_predictive_producer.py",
+                        "farmharness/s8_depth_runner.py", "farmharness/s8_predictive_engine.py"],
                        check=True)
         subprocess.run(["git", "-C", str(root), "commit", "-qm", "product build fixture"],
                        check=True)
+    def artifact(path: Path) -> dict[str, object]:
+        return {"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "bytes": path.stat().st_size}
+    receipt = {
+        "schema": "icecream-p50sim-build-v1",
+        "source": {"root": str(root.resolve()),
+                   "head": subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip(),
+                   "tree": subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD^{tree}"], text=True).strip(),
+                   "tracked_clean": True},
+        "binary": artifact(target),
+        "inputs": {"build_script": artifact(root / "cache/sim/build_p50sim.sh"),
+                   "p50sim_source": artifact(source_target), "config_h": None,
+                   "cache_makefile": None, "services_makefile": None},
+        "configuration": {"with_libbsc": 0, "make_mode": "direct_sources",
+                           "dependency_root": "test", "compiler_path": "g++",
+                           "compiler_version": "test compiler"},
+    }
+    _write(root / "cache/sim/.p50sim-build.json", canonical_bytes(receipt) + b"\n")
     return root
 
 
@@ -294,6 +324,7 @@ def test_authenticated_topology_schedule_declares_exact_capacity_and_makespan(tm
     assert one["scheduling"]["global_slots"] == 1
     assert one["scheduling"]["execution_slots"] == 1
     assert one["scheduling"]["stream_capacity_tus"] == 100000
+    assert one["scheduling"]["stream_capacity_status"] == "DECLARED"
     assert {item["global_slot"] for item in one["scheduling"]["assignments"]} == {0}
 
     plan_path = _plan(tmp_path / "twenty", 100, 100, "twenty-schedule", topology="C1F20")
@@ -301,7 +332,7 @@ def test_authenticated_topology_schedule_declares_exact_capacity_and_makespan(tm
     scheduling = value["scheduling"]
     assert (scheduling["f_relationships"], scheduling["slots_per_f"],
             scheduling["global_slots"], scheduling["execution_slots"],
-            scheduling["stream_capacity_tus"]) == (20, 2, 40, 40, 40)
+            scheduling["stream_capacity_tus"], scheduling["stream_capacity_status"]) == (20, 2, 40, 40, None, "NOT_DECLARED")
     assert {item["global_slot"] for item in scheduling["assignments"]} == set(range(40))
     assert {item["f_relationship"] for item in scheduling["assignments"]} == set(range(20))
     assert {item["per_f_slot"] for item in scheduling["assignments"]} == {0, 1}
