@@ -27,11 +27,13 @@ from typing import Any
 try:
     from . import s8_depth_runner as depth_runner
     from . import s8_predictive_engine as engine
+    from . import s8_predictive_live_normalizer as normalizer
     from .s8_schema import CURRENT_SEMANTICS, CORPORA, PROFILES, REGIMES, SPLITS
     from .s8_predictive_live_normalizer import MANIFEST_SCHEMA as CURVE_MANIFEST_SCHEMA
 except ImportError:  # pragma: no cover
     import s8_depth_runner as depth_runner
     import s8_predictive_engine as engine
+    import s8_predictive_live_normalizer as normalizer
     from s8_schema import CURRENT_SEMANTICS, CORPORA, PROFILES, REGIMES, SPLITS
     from s8_predictive_live_normalizer import MANIFEST_SCHEMA as CURVE_MANIFEST_SCHEMA
 
