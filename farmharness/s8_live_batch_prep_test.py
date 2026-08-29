@@ -10,7 +10,7 @@ import s8_live_batch_prep as prep
 import s8_real_c1f1_live_runner as live_runner
 
 
-def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+def _fixture(tmp_path: Path, topology: str = "C1F1") -> tuple[Path, Path, Path, Path]:
     corpus = tmp_path / "corpus"
     source_root = tmp_path / "source"
     output_root = source_root / "build"
@@ -79,6 +79,17 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
                                      "sha256": hashlib.sha256(source_raw).hexdigest(),
                                      "bytes": len(source_raw), "entries": 100}
     plan_value["inputs"] = plan_inputs
+    slots = 1 if topology == "C1F1" else 40
+    plan_value["scheduling"] = {
+        "schema": "icecream-s8-scheduling-topology-v1",
+        "topology": topology,
+        "assignments": [
+            {"ordinal": ordinal, "global_slot": ordinal % slots,
+             "f_relationship": 0 if topology == "C1F1" else (ordinal % slots) // 2,
+             "per_f_slot": 0 if topology == "C1F1" else ordinal % 2}
+            for ordinal in range(100)
+        ],
+    }
     plan = tmp_path / "predictive-plan.json"
     plan.write_text(json.dumps(plan_value, sort_keys=True))
     compile_db = tmp_path / "compile_commands.json"
@@ -113,6 +124,24 @@ def test_compile_output_cannot_be_rebound_to_another_predictive_tu(tmp_path: Pat
     with pytest.raises(live_runner.LiveRunnerError,
                        match="compile_output_predictive_mismatch"):
         live_runner.load_batch_manifest(batch)
+
+
+def test_prepare_c1f20_uses_exact_predictive_assignments(tmp_path: Path) -> None:
+    plan, compile_db, output_root, source_root = _fixture(tmp_path, "C1F20")
+    target = prep.prepare(predictive_plan=plan, compile_db=compile_db,
+                          compile_output_root=output_root,
+                          compile_source_root=source_root,
+                          output=tmp_path / "prepared")
+    plan_value = json.loads(plan.read_text())
+    topology = json.loads((target / "topology.json").read_text())
+    assert topology["suite"] == live_runner.PARALLEL_TOPOLOGY
+    assert [(item["relationship"], item["f_slot"])
+            for item in topology["assignments"]] == [
+        (item["f_relationship"], item["per_f_slot"])
+        for item in plan_value["scheduling"]["assignments"]
+    ]
+    manifest = json.loads((target / "prep-manifest.json").read_text())
+    assert manifest["topology"] == live_runner.PARALLEL_TOPOLOGY
 
 
 def test_missing_compile_output_mapping_fails_closed(tmp_path: Path) -> None:

@@ -124,7 +124,7 @@ def _compile_map(path: Path, output_root: Path) -> tuple[list[dict[str, Any]], d
 
 def prepare(*, predictive_plan: Path, compile_db: Path, compile_output_root: Path,
             compile_source_root: Path, output: Path) -> Path:
-    """Emit one new C1F1 batch package and return its directory."""
+    """Emit one new plan-scheduled live batch package and return its directory."""
     for label, root in (("compile_output_root", compile_output_root),
                         ("compile_source_root", compile_source_root)):
         if not root.is_absolute() or root.is_symlink() or not root.is_dir():
@@ -132,6 +132,23 @@ def prepare(*, predictive_plan: Path, compile_db: Path, compile_output_root: Pat
     if not output.is_absolute() or output.exists() or output.is_symlink():
         _fail("output:must_be_new_absolute_directory")
     plan, inputs, plan_sha = _plan_identity(predictive_plan)
+    scheduling = plan.get("scheduling")
+    if not isinstance(scheduling, dict):
+        _fail("predictive_plan:scheduling_invalid")
+    planned_assignments = scheduling.get("assignments")
+    topology_name = scheduling.get("topology")
+    suite_by_plan_topology = {
+        "C1F1": live_runner.TOPOLOGY,
+        "C1F20": live_runner.PARALLEL_TOPOLOGY,
+    }
+    try:
+        suite = suite_by_plan_topology[topology_name]
+    except (KeyError, TypeError) as exc:
+        raise BatchPrepError("predictive_plan:scheduling_topology_invalid") from exc
+    if (scheduling.get("schema") != "icecream-s8-scheduling-topology-v1" or
+            not isinstance(planned_assignments, list) or
+            len(planned_assignments) != len(inputs)):
+        _fail("predictive_plan:scheduling_invalid")
     _all_entries, compile_entries = _compile_map(compile_db, compile_output_root)
     selected: list[dict[str, Any]] = []
     for ordinal, item in enumerate(inputs):
@@ -151,7 +168,12 @@ def prepare(*, predictive_plan: Path, compile_db: Path, compile_output_root: Pat
     rows: list[dict[str, Any]] = []
     assignments: list[dict[str, Any]] = []
     cell = plan["cell"]
-    for ordinal, (item, entry) in enumerate(zip(inputs, selected, strict=True)):
+    for ordinal, (item, entry, planned) in enumerate(
+            zip(inputs, selected, planned_assignments, strict=True)):
+        if (not isinstance(planned, dict) or planned.get("ordinal") != ordinal or
+                type(planned.get("f_relationship")) is not int or
+                type(planned.get("per_f_slot")) is not int):
+            _fail(f"predictive_plan:scheduling_assignment_invalid:{ordinal}")
         source_path = Path(entry["file"]).resolve()
         source_sha, _ = live_runner._sha(source_path)
         source_relative = _inside(source_path, compile_source_root,
@@ -167,12 +189,13 @@ def prepare(*, predictive_plan: Path, compile_db: Path, compile_output_root: Pat
                "compile_output": str(Path(entry["output"]).resolve())}
         rows.append(row)
         assignments.append({"ordinal": ordinal, "tu_id": tu_id,
-                            "relationship": 0, "f_slot": 0})
+                            "relationship": planned["f_relationship"],
+                            "f_slot": planned["per_f_slot"]})
 
     batch = output / "batch-manifest.jsonl"
     topology = output / "topology.json"
     batch_raw = b"".join(_canonical(row) + b"\n" for row in rows)
-    topology_value = {"schema": TOPOLOGY_SCHEMA, "suite": live_runner.TOPOLOGY,
+    topology_value = {"schema": TOPOLOGY_SCHEMA, "suite": suite,
                       "assignments": assignments}
     live_runner._write_new(batch, batch_raw)
     live_runner._write_new(topology, _canonical(topology_value) + b"\n")
@@ -180,11 +203,11 @@ def prepare(*, predictive_plan: Path, compile_db: Path, compile_output_root: Pat
     # Re-open the emitted package through the consumer before declaring it.
     loaded_rows = live_runner.load_batch_manifest(batch, len(inputs))
     live_runner.bind_batch_to_plan(loaded_rows, inputs)
-    live_runner.load_topology(topology, loaded_rows)
+    live_runner.load_topology(topology, loaded_rows, suite, scheduling)
 
     manifest_value = {
         "schema": SCHEMA, "status": "READY", "cell": cell,
-        "split": plan["split"], "count": len(inputs), "topology": live_runner.TOPOLOGY,
+        "split": plan["split"], "count": len(inputs), "topology": suite,
         "predictive_plan": {**_descriptor(predictive_plan), "validated_sha256": plan_sha},
         "source_compile_db": _descriptor(compile_db),
         "selected_compile_db": selected_db_descriptor,
