@@ -168,6 +168,8 @@ def build(*, experiment: Path, runtime: Path, replay: Path, corpus: str,
             not build_root.is_dir() or build_root.is_symlink()):
         raise ResultsError("runtime_or_source:not_private_directory")
     source_commit = digest(source_commit, "source_commit", HEX40)
+    profile = PROFILE
+    cell_label = f"{corpus}/{profile}/{regime}"
     try:
         tree = subprocess.run(["git", "-C", str(source_repository), "rev-parse", f"{source_commit}^{{tree}}"],
                               check=True, capture_output=True, text=True, timeout=15).stdout.strip()
@@ -207,8 +209,12 @@ def build(*, experiment: Path, runtime: Path, replay: Path, corpus: str,
         raise ResultsError("traces:tx_begin_identity_mismatch")
     if c_begin.get("stage_bytes", 0) <= 0 or not isinstance(c_begin.get("stage_bytes"), int):
         raise ResultsError("traces:stage_bytes_invalid")
+    stage_rows = jsonl(stage_raw, "stage_ledger")
+    stage_begins = [row for row in stage_rows if row.get("action") == "TX_BEGIN" and row.get("actor") == "C"]
+    if len(stage_begins) != 1 or stage_begins[0].get("stage_bytes") != c_begin["stage_bytes"]:
+        raise ResultsError("stage_ledger:stage_bytes_mismatch")
     input_sha = digest(input_sha, "input_sha256")
-    if replay_manifest.get("status") != "PASS" or replay_manifest.get("cell") != f"{corpus}/{PROFILE}/{regime}":
+    if replay_manifest.get("status") != "PASS" or replay_manifest.get("cell") != cell_label:
         raise ResultsError("replay_manifest:acceptance_mismatch")
     if replay_manifest.get("input_sha256", replay_manifest.get("measured_input_sha256")) != input_sha:
         raise ResultsError("replay_manifest:input_mismatch")
@@ -262,6 +268,10 @@ def build(*, experiment: Path, runtime: Path, replay: Path, corpus: str,
         "binaries": binary_descriptors,
         **prewarm_descriptors,
     }
+    for label, path in (("deletion_control", replay / "controls" / "deletion-measured-trace.log"),
+                        ("mutation_control", replay / "controls" / "mutation-measured-input.log")):
+        raw, _ = snapshot(path, label)
+        descriptors[label] = descriptor(path, raw, _evidence_path(path, experiment))
     evidence_sha = hashlib.sha256(canonical({"cell": cell, "files": descriptors})).hexdigest()
     row = {
         "schema": SCHEMA, "cell": cell, "corpus": corpus, "profile": PROFILE, "regime": regime,

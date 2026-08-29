@@ -62,6 +62,9 @@ def _fixture(root: Path, regime: str = "cold") -> dict[str, object]:
                 "measured_action_count": 11 if regime == "cold" else 10,
                 "prewarm_action_count": 0 if regime == "cold" else 11}
     manifest_raw = _write(replay / "manifest.json", manifest)
+    controls = replay / "controls"
+    _write(controls / "deletion-measured-trace.log", {"status": "PASS"})
+    _write(controls / "mutation-measured-input.log", {"status": "PASS"})
     (runtime / "client-compile-measured.log").write_text("</wait for cs: 456ms>\nICECC: got 78 bytes (12%)\n")
     for name in ("local.o", "remote.o"):
         (runtime / name).write_bytes(b"object bytes")
