@@ -122,12 +122,16 @@ chmod 0711 "$work"
 : >"$work/scheduler.log"
 chmod 0666 "$work/scheduler.log"
 cleanup() {
-    for pid in "${service_pid:-}" "${client_service_pid:-}" "${client_pid:-}" ${worker_pids:-} ${service_pids:-} "${worker_pid:-}" "${sched_pid:-}"; do
+    # Batch wrappers own their compiler child and remove their planned-lane
+    # marker from an EXIT trap.  Stop them before the daemons so an interrupted
+    # parallel batch cannot strand a compiler or a lane lease.
+    cleanup_pids="${batch_job_pids:-} ${service_pid:-} ${client_service_pid:-} ${client_pid:-} ${worker_pids:-} ${service_pids:-} ${worker_pid:-} ${sched_pid:-}"
+    for pid in $cleanup_pids; do
         test -n "$pid" && kill "$pid" 2>/dev/null || :
     done
     for _ in $(seq 1 50); do
         live=0
-        for pid in "${service_pid:-}" "${client_service_pid:-}" "${client_pid:-}" ${worker_pids:-} ${service_pids:-} "${worker_pid:-}" "${sched_pid:-}"; do
+        for pid in $cleanup_pids; do
             if test -n "$pid" && kill -0 "$pid" 2>/dev/null; then
                 live=1
             fi
@@ -135,13 +139,11 @@ cleanup() {
         test "$live" -eq 0 && break
         sleep 0.1
     done
-    for pid in "${service_pid:-}" "${client_service_pid:-}" "${client_pid:-}" ${worker_pids:-} ${service_pids:-} "${worker_pid:-}" "${sched_pid:-}"; do
+    for pid in $cleanup_pids; do
         test -n "$pid" && kill -9 "$pid" 2>/dev/null || :
     done
-    for pid in "${client_pid:-}" "${worker_pid:-}" "${sched_pid:-}"; do
-        if test -n "$pid" && ! kill -0 "$pid" 2>/dev/null; then
-            wait "$pid" 2>/dev/null || :
-        fi
+    for pid in $cleanup_pids; do
+        test -n "$pid" && wait "$pid" 2>/dev/null || :
     done
     if test "${ICECC_P50_C1F1_KEEP_WORK:-0}" = 1; then
         echo "INFO: preserving P50 C1F1 workdir $work" >&2
@@ -745,20 +747,31 @@ measured_c_trace="$work/s7-measured-c-action-trace.jsonl"
 measured_f_trace="$work/s7-measured-f-action-trace.jsonl"
 merge_parallel_f_traces() {
     test "$suite" = C1F20/40 || return 0
-    python3 - "$work" "$f_action_trace" <<'PY'
+    python3 - "$work" "$f_action_trace" "$work/s8-f-service-map.tsv" <<'PY'
 import json, pathlib, sys
-root, output = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+root, output, service_map = map(pathlib.Path, sys.argv[1:])
 rows = []
-for path in sorted(root.glob("s7-warm-f-action-trace-*.jsonl")):
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if line.strip():
-            rows.append(json.loads(line))
+relationships = []
+for relationship in range(20):
+    path = root / f"s7-warm-f-action-trace-{relationship}.jsonl"
+    path_rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+                 if line.strip()]
+    identities = {row.get("f_store_guid") for row in path_rows
+                  if row.get("action") == "TX_BEGIN" and row.get("actor") == "F"}
+    if len(identities) != 1:
+        raise SystemExit(f"F relationship {relationship} has no unique observed store identity")
+    relationships.append((relationship, f"p50-f-{relationship}", identities.pop()))
+    for line in path_rows:
+        rows.append(line)
 if not rows:
     raise SystemExit("parallel F action traces are empty")
 rows.sort(key=lambda row: (int(row.get("tu_seq", -1)), int(row.get("rel_seq", -1)),
                            row.get("f_store_guid", "")))
 output.write_text("".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
                              for row in rows), encoding="utf-8")
+service_map.write_text("".join(f"{relationship}\t{service}\t{guid}\n"
+                               for relationship, service, guid in relationships),
+                       encoding="ascii")
 PY
 }
 if test -n "$batch_manifest"; then
@@ -776,11 +789,66 @@ if test -n "$batch_manifest"; then
         item_compile_output=$9
         payload_sha=${10}
         payload_bytes=${11}
+        predecessor_ordinal=${12:--1}
         timing_path="$work/timing-$run_label-$ordinal.tsv"
         staged="$work/src/$run_label-$ordinal.ii"
         marker="$work/active/$run_label-$relationship-$f_slot"
         input_ready_marker="$work/input-ready/$run_label-$relationship-$ordinal"
-        trap 'rm -f "$marker"' EXIT HUP INT TERM
+        failure_marker="$work/input-ready/$run_label-$relationship-$ordinal.failed"
+        owner_token="$run_label:$relationship:$f_slot:$ordinal:$$"
+        owner_path="$work/active/.owner-$run_label-$relationship-$f_slot-$ordinal-$$"
+        compile_pid=
+        owns_marker=0
+        input_ready_published=0
+        release_planned_lane() {
+            if test "$owns_marker" -eq 1; then
+                marker_owner=$(cat "$marker" 2>/dev/null || true)
+                if test "$marker_owner" = "$owner_token"; then
+                    rm -f "$marker"
+                fi
+            fi
+            rm -f "$owner_path"
+            owns_marker=0
+        }
+        run_one_cleanup() {
+            if test -n "$compile_pid" && kill -0 "$compile_pid" 2>/dev/null; then
+                kill "$compile_pid" 2>/dev/null || :
+                wait "$compile_pid" 2>/dev/null || :
+            fi
+            release_planned_lane
+            if test "$input_ready_published" -eq 0; then
+                : >"$failure_marker"
+            fi
+        }
+        trap run_one_cleanup EXIT
+        trap 'exit 129' HUP
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+
+        # Only this relationship's immediately preceding source commit gates
+        # admission.  Other relationships have independent predecessor
+        # markers and therefore reach the C sidecar concurrently.
+        if test "$predecessor_ordinal" -ge 0; then
+            predecessor_marker="$work/input-ready/$run_label-$relationship-$predecessor_ordinal"
+            predecessor_failure="$predecessor_marker.failed"
+            while test ! -e "$predecessor_marker"; do
+                test ! -e "$predecessor_failure" || {
+                    echo "FAIL: predecessor source admission failed ($run_label-$ordinal)" >&2
+                    return 1
+                }
+                sleep 0.005
+            done
+        fi
+
+        # f_slot is an authenticated *planned admission lane*, not an observed
+        # scheduler slot.  A hard link is the atomic lane acquisition; its
+        # owner token prevents a stale wrapper from removing a successor's
+        # lease.  Set owns_marker before waiting so an interrupt also removes
+        # the private owner file without touching somebody else's marker.
+        printf '%s\n' "$owner_token" >"$owner_path"
+        owns_marker=1
+        while ! ln "$owner_path" "$marker" 2>/dev/null; do sleep 0.005; done
+        admission_start_ns=$(date +%s%N)
         cp -- "$predictive_path" "$staged"
         compile_once "$run_label-$ordinal" "$staged" "$item_compile_db" \
             "$item_compile_source" "$item_compile_output" "$relationship" "$f_slot" \
@@ -809,18 +877,39 @@ if test -n "$batch_manifest"; then
             fi
             sleep 0.005
         done
-        : >"$input_ready_marker"
-        wait "$compile_pid"
-        test -s "$timing_path" || {
-            echo "FAIL: compile timing handoff is missing ($run_label-$ordinal)" >&2
-            return 1
-        }
-        compile_start_ns=$(sed -n '1p' "$timing_path")
-        compile_end_ns=$(sed -n '2p' "$timing_path")
-        test -n "$compile_start_ns" && test -n "$compile_end_ns" || {
+        input_ready_ns=$(date +%s%N)
+        input_ready_tmp="$input_ready_marker.tmp.$$"
+        printf '%s\n' "$input_ready_ns" >"$input_ready_tmp"
+        mv -- "$input_ready_tmp" "$input_ready_marker"
+        input_ready_published=1
+        # compile_once publishes its second timing row immediately after the
+        # remote object/result returns and before running the local reference
+        # compile.  Release the planned lane at that product boundary so the
+        # correctness witness cannot throttle later remote work.
+        compile_start_ns=
+        compile_end_ns=
+        while test -z "$compile_end_ns"; do
+            compile_start_ns=$(sed -n '1p' "$timing_path" 2>/dev/null || true)
+            compile_end_ns=$(sed -n '2p' "$timing_path" 2>/dev/null || true)
+            if test -z "$compile_end_ns" && ! kill -0 "$compile_pid" 2>/dev/null; then
+                wait "$compile_pid" || true
+                compile_pid=
+                echo "FAIL: compile ended before remote-result timing ($run_label-$ordinal)" >&2
+                return 1
+            fi
+            test -n "$compile_end_ns" || sleep 0.005
+        done
+        test -n "$compile_start_ns" || {
             echo "FAIL: compile timing handoff is incomplete ($run_label-$ordinal)" >&2
             return 1
         }
+        release_planned_lane
+        if ! wait "$compile_pid"; then
+            compile_pid=
+            echo "FAIL: compile/local witness failed ($run_label-$ordinal)" >&2
+            return 1
+        fi
+        compile_pid=
         remote_obj="$work/out/remote-$run_label-$ordinal.o"
         local_obj="$work/out/local-$run_label-$ordinal.o"
         remote_sha=$(sha256sum "$remote_obj" | awk '{print $1}')
@@ -835,11 +924,39 @@ if test -n "$batch_manifest"; then
         }
         wait_ms=$(sed -nE 's/.*<\/wait for cs: ([0-9]+)ms>.*/\1/p' \
             "$work/client-compile-$run_label-$ordinal.log" | tail -n 1)
-        test -n "$wait_ms" || { echo "FAIL: client wait-for-cs timing missing ($run_label-$ordinal)" >&2; exit 1; }
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        test -n "$wait_ms" || { echo "FAIL: client wait-for-cs timing missing ($run_label-$ordinal)" >&2; return 1; }
+        client_log="$work/client-compile-$run_label-$ordinal.log"
+        observed_scheduler_job_id=$(sed -nE \
+            's/.*Have to use host .* - Job ID: ([0-9]+) - env:.*/\1/p' "$client_log" | tail -n 1)
+        observed_source_tu_seq=$(sed -nE \
+            's/.*source committed for P50 CompileFile: .* TU sequence ([0-9]+).*/\1/p' "$client_log" | tail -n 1)
+        test "$observed_scheduler_job_id" -gt 0 2>/dev/null && \
+            test "$observed_source_tu_seq" -ge 0 2>/dev/null || {
+            echo "FAIL: observed scheduler/source identity missing ($run_label-$ordinal)" >&2
+            return 1
+        }
+        observed_f_service_identity=
+        for _ in $(seq 1 200); do
+            observed_f_service_identity=$(sed -nE \
+                "s/.*BEGIN: $observed_scheduler_job_id client=[^ ]+ server=([^ (]+).*/\\1/p" \
+                "$work/scheduler.log" | tail -n 1)
+            test -n "$observed_f_service_identity" && break
+            sleep 0.005
+        done
+        expected_f_service_identity=p50-f
+        test "$suite" != C1F20/40 || expected_f_service_identity="p50-f-$relationship"
+        test "$observed_f_service_identity" = "$expected_f_service_identity" || {
+            echo "FAIL: observed F service differs from planned relationship ($run_label-$ordinal)" >&2
+            return 1
+        }
+        witness_end_ns=$(date +%s%N)
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$ordinal" "$source_sha" "$preprocessed_capture" "$preprocessed_sha" "$preprocessed_bytes" \
             "$remote_obj" "$remote_sha" "$remote_bytes" "$local_obj" "$local_sha" "$local_bytes" \
-            "$compile_start_ns" "$compile_end_ns" >"$work/result-$run_label-$ordinal.tsv"
+            "$relationship" "$f_slot" "$admission_start_ns" "$input_ready_ns" \
+            "$compile_start_ns" "$compile_end_ns" "$witness_end_ns" \
+            "$observed_scheduler_job_id" "$observed_f_service_identity" "$observed_source_tu_seq" \
+            >"$work/result-$run_label-$ordinal.tsv"
         printf '%s\n' "$((wait_ms * 1000000))" >"$work/wait-$run_label-$ordinal.ns"
     }
     run_batch() {
@@ -852,79 +969,154 @@ if test -n "$batch_manifest"; then
         fi
         batch_start_ns=$(date +%s%N)
         job_pids=""
+        batch_job_pids=""
         while IFS="$(printf '\t')" read -r tu_id source_path source_relative source_sha predictive_path predictive_relative payload_sha payload_bytes item_db item_db_sha item_source item_output; do
             relationship=0; f_slot=0
             if test "$suite" = C1F20/40; then
                 IFS="$(printf '\t')" read -r relationship f_slot <&3
-                # The topology names the exact planned admission lane.  Never
-                # substitute the sibling lane while this lane is still active;
-                # the product evidence records the actual F identity below.
-                marker="$work/active/$run_label-$relationship-$f_slot"
-                while test -e "$marker"; do sleep 0.005; done
-            else
-                marker="$work/active/$run_label-0-0"
-                while test -e "$marker"; do sleep 0.005; done
             fi
-            : >"$marker"
+            predecessor_file="$work/input-ready/$run_label-$relationship.last"
+            predecessor_ordinal=-1
+            if test -e "$predecessor_file"; then
+                predecessor_ordinal=$(cat "$predecessor_file")
+                test "$predecessor_ordinal" -ge 0 2>/dev/null && \
+                    test "$predecessor_ordinal" -lt "$ordinal" || {
+                    echo "FAIL: relationship predecessor state invalid ($run_label-$ordinal)" >&2
+                    exit 1
+                }
+            fi
+            printf '%s\n' "$ordinal" >"$predecessor_file"
             run_one "$run_label" "$ordinal" "$relationship" "$f_slot" "$predictive_path" "$source_sha" \
                 "$item_db" "$item_source" "$item_output" "$payload_sha" "$payload_bytes" \
+                "$predecessor_ordinal" \
                 >"$work/job-$run_label-$ordinal.log" 2>&1 &
             job_pid=$!
             job_pids="$job_pids $job_pid"
-            # The launch loop globally waits for each product source-commit /
-            # input-ready witness.  This intentionally serializes short C-side
-            # source admission; the prior job's compiler/result process remains
-            # active after the witness, so real F compile slots can overlap.
-            input_ready_marker="$work/input-ready/$run_label-$relationship-$ordinal"
-            while test ! -e "$input_ready_marker"; do
-                if ! kill -0 "$job_pid" 2>/dev/null; then
-                    wait "$job_pid" || true
-                    echo "FAIL: source admission failed ($run_label-$ordinal)" >&2
-                    exit 1
-                fi
-                sleep 0.005
-            done
+            batch_job_pids="$job_pids"
             ordinal=$((ordinal + 1))
         done <"$work/batch.tsv" 3<"${topology_input:-/dev/null}"
         test "$ordinal" -eq "$batch_expected_count" || { echo "FAIL: batch manifest count changed during run" >&2; exit 1; }
+        batch_failed=0
         for pid in $job_pids; do
-            wait "$pid" || {
-                echo "FAIL: real compile job failed ($run_label)" >&2
-                cat "$work"/job-"$run_label"-*.log 2>/dev/null || true
-                exit 1
-            }
+            if ! wait "$pid"; then
+                batch_failed=1
+                break
+            fi
         done
+        if test "$batch_failed" -ne 0; then
+            for pid in $job_pids; do kill "$pid" 2>/dev/null || :; done
+            for pid in $job_pids; do wait "$pid" 2>/dev/null || :; done
+            batch_job_pids=""
+            echo "FAIL: real compile job failed ($run_label)" >&2
+            cat "$work"/job-"$run_label"-*.log 2>/dev/null || true
+            exit 1
+        fi
+        batch_job_pids=""
         batch_end_ns=$(date +%s%N)
+        batch_metrics=$(python3 - "$work" "$run_label" "$ordinal" "$batch_start_ns" \
+                "$batch_end_ns" "$relationship_count" "$slots_per_f" <<'PY'
+import pathlib, sys
+
+root = pathlib.Path(sys.argv[1])
+run, count = sys.argv[2], int(sys.argv[3])
+batch_start, batch_end = int(sys.argv[4]), int(sys.argv[5])
+relationship_count, slots_per_f = int(sys.argv[6]), int(sys.argv[7])
+records = []
+for ordinal in range(count):
+    fields = (root / f"result-{run}-{ordinal}.tsv").read_text(encoding="utf-8").rstrip("\n").split("\t")
+    if len(fields) != 21:
+        raise SystemExit(f"result field count invalid ({run}-{ordinal})")
+    record = {
+        "ordinal": int(fields[0]), "relationship": int(fields[11]), "lane": int(fields[12]),
+        "admission_start": int(fields[13]), "input_ready": int(fields[14]),
+        "compile_start": int(fields[15]), "compile_end": int(fields[16]),
+        "witness_end": int(fields[17]), "job_id": int(fields[18]),
+        "service": fields[19], "tu_seq": int(fields[20]),
+    }
+    if (record["ordinal"] != ordinal or
+            not 0 <= record["relationship"] < relationship_count or
+            not 0 <= record["lane"] < slots_per_f or
+            record["service"] != (f"p50-f-{record['relationship']}"
+                                  if relationship_count > 1 else "p50-f") or
+            not batch_start <= record["admission_start"] <= record["compile_start"] <=
+                record["input_ready"] <= record["compile_end"] <= record["witness_end"] <= batch_end):
+        raise SystemExit(f"result concurrency identity invalid ({run}-{ordinal})")
+    records.append(record)
+if len({record["job_id"] for record in records}) != count:
+    raise SystemExit(f"scheduler job identity is not unique ({run})")
+
+def peak(intervals):
+    events = [(start, 1) for start, _ in intervals] + [(end, -1) for _, end in intervals]
+    active = maximum = 0
+    for _, delta in sorted(events, key=lambda item: (item[0], item[1])):
+        active += delta
+        maximum = max(maximum, active)
+    return maximum
+
+per_relationship = []
+for relationship in range(relationship_count):
+    selected = sorted((record for record in records if record["relationship"] == relationship),
+                      key=lambda record: record["ordinal"])
+    if not selected:
+        raise SystemExit(f"relationship {relationship} has no work ({run})")
+    for previous, current in zip(selected, selected[1:]):
+        if (current["admission_start"] < previous["input_ready"] or
+                current["tu_seq"] != previous["tu_seq"] + 1):
+            raise SystemExit(f"relationship admission order invalid ({run}-{relationship})")
+    for lane in range(slots_per_f):
+        lane_rows = [record for record in selected if record["lane"] == lane]
+        for previous, current in zip(lane_rows, lane_rows[1:]):
+            if current["admission_start"] < previous["compile_end"]:
+                raise SystemExit(f"planned admission lane overlapped ({run}-{relationship}-{lane})")
+    relationship_peak = peak([(record["admission_start"], record["compile_end"])
+                              for record in selected])
+    if relationship_peak > slots_per_f:
+        raise SystemExit(f"relationship active-job cap exceeded ({run}-{relationship})")
+    per_relationship.append(relationship_peak)
+
+admissions = [(record["admission_start"], record["input_ready"]) for record in records]
+compiles = [(record["compile_start"], record["compile_end"]) for record in records]
+admitted_or_compiling = [(record["admission_start"], record["compile_end"])
+                         for record in records]
+remote_end = max(record["compile_end"] for record in records)
+print(" ".join((
+    f"makespan_ns={remote_end - batch_start}",
+    f"harness_completion_ns={batch_end - batch_start}",
+    f"max_concurrent_source_admissions={peak(admissions)}",
+    f"max_concurrent_compile_result_jobs={peak(compiles)}",
+    f"max_concurrent_admitted_or_compiling_jobs={peak(admitted_or_compiling)}",
+    f"max_concurrent_active_per_relationship={max(per_relationship)}",
+)))
+PY
+)
         if test "$emit_rows" = 1; then
             printf 'S8_BATCH_WINDOW run=%s start_ns=%s end_ns=%s\n' \
                 "$run_label" "$batch_start_ns" "$batch_end_ns"
+            printf 'S8_BATCH_METRICS run=%s %s\n' "$run_label" "$batch_metrics"
         fi
         ordinal=0
-        # The launch loop consumed the topology descriptor while admitting
-        # each relationship/lane.  Reopen it before emitting authenticated
-        # rows; otherwise every row would inherit the final lane read.
-        if test "$suite" = C1F20/40; then
-            exec 3<"$topology_input"
-        fi
         while IFS="$(printf '\t')" read -r tu_id source_path source_relative source_sha predictive_path predictive_relative payload_sha payload_bytes item_db item_db_sha item_source item_output; do
-            relationship=0; f_slot=0
-            if test "$suite" = C1F20/40; then
-                IFS="$(printf '\t')" read -r relationship f_slot <&3
-            fi
             result=$(cat "$work/result-$run_label-$ordinal.tsv")
-            IFS="$(printf '\t')" read -r _ result_source_sha preprocessed_capture preprocessed_sha preprocessed_bytes remote_obj remote_sha remote_bytes local_obj local_sha local_bytes compile_start_ns compile_end_ns <<EOF
+            IFS="$(printf '\t')" read -r _ result_source_sha preprocessed_capture preprocessed_sha preprocessed_bytes remote_obj remote_sha remote_bytes local_obj local_sha local_bytes planned_relationship planned_admission_lane admission_start_ns input_ready_ns compile_start_ns compile_end_ns witness_end_ns observed_scheduler_job_id observed_f_service_identity observed_source_tu_seq <<EOF
 $result
 EOF
+            test "$result_source_sha" = "$source_sha" || {
+                echo "FAIL: result/source binding changed ($run_label-$ordinal)" >&2
+                exit 1
+            }
             wait_ns=$(cat "$work/wait-$run_label-$ordinal.ns")
             if test "$emit_rows" = 1; then
-                printf 'S8_BATCH_TU run=%s ordinal=%s tu_id=%s source_sha256=%s preprocessed_path=%s preprocessed_sha256=%s preprocessed_bytes=%s remote_path=%s remote_sha256=%s remote_bytes=%s local_path=%s local_sha256=%s local_bytes=%s compile_start_ns=%s compile_end_ns=%s wait_for_cs_ns=%s planned_assignment=%s relationship=%s planned_admission_slot=%s preferred_service_identity=p50-f-%s\n' \
+                printf 'S8_BATCH_TU run=%s ordinal=%s tu_id=%s source_sha256=%s preprocessed_path=%s preprocessed_sha256=%s preprocessed_bytes=%s remote_path=%s remote_sha256=%s remote_bytes=%s local_path=%s local_sha256=%s local_bytes=%s admission_start_ns=%s input_ready_ns=%s compile_start_ns=%s compile_end_ns=%s witness_end_ns=%s wait_for_cs_ns=%s planned_assignment_ordinal=%s planned_relationship=%s planned_admission_lane=%s observed_scheduler_job_id=%s observed_f_service_identity=%s observed_source_tu_seq=%s\n' \
                     "$run_label" "$ordinal" "$tu_id" "$source_sha" "$preprocessed_capture" "$preprocessed_sha" "$preprocessed_bytes" \
                     "$remote_obj" "$remote_sha" "$remote_bytes" "$local_obj" "$local_sha" "$local_bytes" \
-                    "$compile_start_ns" "$compile_end_ns" "$wait_ns" \
-                    "$([ "$suite" = C1F20/40 ] && printf '%s' "$ordinal" || printf '0')" "$relationship" "$f_slot" "$relationship"
+                    "$admission_start_ns" "$input_ready_ns" "$compile_start_ns" "$compile_end_ns" \
+                    "$witness_end_ns" "$wait_ns" \
+                    "$([ "$suite" = C1F20/40 ] && printf '%s' "$ordinal" || printf '0')" \
+                    "$planned_relationship" "$planned_admission_lane" "$observed_scheduler_job_id" \
+                    "$observed_f_service_identity" "$observed_source_tu_seq"
             fi
             ordinal=$((ordinal + 1))
-        done <"$work/batch.tsv" 3<"${topology_input:-/dev/null}"
+        done <"$work/batch.tsv"
         echo "S8_BATCH_COMPLETE run=$run_label count=$ordinal"
     }
     if test "$warm" = 1; then
@@ -991,9 +1183,9 @@ if test -n "$batch_manifest"; then
     echo "S8_BATCH_PASSES=$passes"
     echo "S8_BATCH_WARM=$warm"
     if test "$suite" = C1F20/40; then
-        echo "S8_SCHEDULING mode=parallel execution_slots=40 max_concurrency=40 relationships=20 slots_per_f=2 source_admission=global_source_commit_gate physical_slot_observed=0"
+        echo "S8_SCHEDULING mode=relationship-ordered execution_slots=40 relationships=20 planned_admission_lanes_per_relationship=2 physical_slot_observed=0"
     else
-        echo "S8_SCHEDULING mode=serial execution_slots=1 max_concurrency=1"
+        echo "S8_SCHEDULING mode=relationship-ordered execution_slots=1 relationships=1 planned_admission_lanes_per_relationship=1"
     fi
     for binary_role in scheduler/icecc-scheduler daemon/iceccd client/icecc cache/icecc-cache-service; do
         binary_path="$build/$binary_role"

@@ -167,15 +167,63 @@ def test_warm_prewarm_trace_requires_continuing_product_state(tmp_path: Path) ->
         runner._validate_warm_continuation(prewarm, measured, 1)
 
 
+def test_parallel_action_trace_binds_by_observed_service_not_global_arrival(
+        tmp_path: Path) -> None:
+    c_path = tmp_path / "c.jsonl"
+    f_path = tmp_path / "f.jsonl"
+    assignments = []
+    by_relationship: dict[tuple[int, int], tuple[dict[str, object], dict[str, object]]] = {}
+    for wave in range(2):
+        for relationship in range(20):
+            ordinal = wave * 20 + relationship
+            assignments.append({"relationship": relationship, "f_slot": wave})
+            digest = f"{ordinal + 1:032x}"
+            f_guid = f"{relationship + 1:032x}"
+            c_row = _action_row("C", wave)
+            f_row = _action_row("F", wave)
+            for row in (c_row, f_row):
+                row["f_store_guid"] = f_guid
+                row["transaction_digest"] = digest
+                row["raw_digest"] = f"{ordinal + 101:032x}"
+            by_relationship[(relationship, wave)] = c_row, f_row
+    # Relationships are intentionally observed in reverse order; only each
+    # relationship's own source sequence remains ordered.
+    observed = [(relationship, wave) for wave in range(2)
+                for relationship in reversed(range(20))]
+    c_path.write_text("".join(json.dumps(by_relationship[key][0]) + "\n" for key in observed))
+    f_path.write_text("".join(json.dumps(by_relationship[key][1]) + "\n" for key in reversed(observed)))
+    (tmp_path / "s8-f-service-map.tsv").write_text("".join(
+        f"{relationship}\tp50-f-{relationship}\t{relationship + 1:032x}\n"
+        for relationship in range(20)))
+    stages = runner._action_stage_paths(
+        c_path, f_path, 40, assignments, runner.PARALLEL_TOPOLOGY)
+    assert [(row["planned_relationship"], row["planned_admission_lane"])
+            for row in stages] == [(index % 20, index // 20) for index in range(40)]
+    assert [row["tu_seq"] for row in stages] == [index // 20 for index in range(40)]
+    assert stages[0]["observed_f_service_identity"] == "p50-f-0"
+
+
 def test_per_tu_profile_evidence_is_required(tmp_path: Path) -> None:
     log = tmp_path / "client-compile-full-1-0.log"
     log.write_text("P29 CACHE_SESSION\n")
-    (tmp_path / "f-0.log").write_text("CACHE_SESSION\n")
-    observation = [{"run": "full-1", "ordinal": 0, "relationship": 0}]
+    (tmp_path / "f.log").write_text("CACHE_SESSION\n")
+    observation = [{"run": "full-1", "ordinal": 0, "planned_relationship": 0,
+                    "observed_f_service_identity": "p50-f"}]
     runner._validate_product_log_evidence(tmp_path, observation, "P29")
     log.write_text("CACHE_SESSION\n")
     with pytest.raises(runner.LiveRunnerError, match="profile_evidence_missing"):
         runner._validate_product_log_evidence(tmp_path, observation, "P29")
+
+
+def test_parallel_cache_session_evidence_comes_from_observed_f_log(tmp_path: Path) -> None:
+    (tmp_path / "client-compile-full-1-0.log").write_text("ZSTD_ROUTE\n")
+    (tmp_path / "f-7.log").write_text("CACHE_SESSION\n")
+    observation = [{"run": "full-1", "ordinal": 0, "planned_relationship": 7,
+                    "observed_f_service_identity": "p50-f-7"}]
+    runner._validate_product_log_evidence(tmp_path, observation, "ZSTD_ROUTE")
+    (tmp_path / "f-7.log").write_text("no cache evidence\n")
+    with pytest.raises(runner.LiveRunnerError, match="cache_session_evidence_missing"):
+        runner._validate_product_log_evidence(tmp_path, observation, "ZSTD_ROUTE")
 
 
 @pytest.mark.parametrize("profile", ["ZSTD_TU", "ZSTD_ROUTE", "P29", "GRZ_RESIDUAL"])
@@ -364,19 +412,26 @@ def test_batch_shell_excludes_warm_prewarm_and_carries_optional_repeat() -> None
     assert '"$work/envs-f-$relationship"' in shell
     assert 'S8_BATCH_WINDOW run=%s start_ns=%s end_ns=%s' in shell
     assert 'run_one "$run_label" "$ordinal" "$relationship" "$f_slot"' in shell
-    assert "planned_assignment=%s" in shell
-    assert "planned_admission_slot=%s" in shell
-    assert "preferred_service_identity=p50-f-%s" in shell
-    assert "source_admission=global_source_commit_gate" in shell
     assert "physical_slot_observed=0" in shell
     assert '"physical_slot_observed": False' in Path(__file__).resolve().parent.joinpath(
         "s8_real_c1f1_live_runner.py").read_text()
+    assert '"source_admission": "per_relationship_source_commit_gate"' in (
+        Path(__file__).resolve().parent / "s8_real_c1f1_live_runner.py").read_text()
     assert 'staged="$work/src/$run_label-$ordinal.ii"' in shell
     assert 'cp -- "$predictive_path" "$staged"' in shell
     assert 'compile_args_for "$item_compile_db" "$item_compile_source" "$item_compile_output" "$input_path" "$remote_obj"' in shell
     assert 'input-ready/$run_label-$relationship-$ordinal' in shell
     assert "source committed for P50 CompileFile" in shell
-    assert 'while test -e "$marker"; do sleep 0.005; done' in shell
+    assert 'while ! ln "$owner_path" "$marker" 2>/dev/null; do sleep 0.005; done' in shell
+    assert 'if test "$marker_owner" = "$owner_token"; then' in shell
+    assert shell.index("release_planned_lane\n        if ! wait") < shell.index(
+        'witness_end_ns=$(date +%s%N)')
+    assert 'predecessor_marker="$work/input-ready/$run_label-$relationship-$predecessor_ordinal"' in shell
+    assert "S8_BATCH_METRICS run=%s" in shell
+    assert "planned_admission_lane=%s" in shell
+    assert "observed_scheduler_job_id=%s" in shell
+    assert "observed_f_service_identity=%s" in shell
+    assert "assignment=%s relationship=%s f_slot=%s service_identity=" not in shell
     assert "grep -oE 'p50-f-[0-9]+' | sort -u | wc -l" in shell
     assert "fsession_owner_(64, config_.f_store_generation)" in cache_service
     assert "::listen(outer_launch_listener_fd_, 64)" in sidecar_adapter
@@ -412,21 +467,122 @@ def test_parallel_topology_binds_all_relationships_and_slots(tmp_path: Path) -> 
 
 def test_parallel_batch_window_requires_real_overlap() -> None:
     rows = [{} for _ in range(40)]
-    observations = [{"run": "full-1", "relationship": index % 20,
-                     "planned_admission_slot": (index // 20) % 2,
-                     "compile_start_ns": 1_000 + index,
-                     "compile_end_ns": 2_000 + index}
-                    for index in range(40)]
-    stdout = "S8_BATCH_WINDOW run=full-1 start_ns=900 end_ns=2100\n"
+    observations = []
+    for index in range(40):
+        wave = index // 20
+        observations.append({
+            "run": "full-1", "planned_assignment_ordinal": index,
+            "planned_relationship": index % 20, "planned_admission_lane": wave,
+            "admission_start_ns": 1_000 + wave * 100,
+            "compile_start_ns": 1_001 + wave * 100,
+            "input_ready_ns": 1_100 + wave * 100,
+            "compile_end_ns": 1_300 + wave * 100,
+            "witness_end_ns": 1_350 + wave * 100,
+            "observed_source_tu_seq": wave,
+        })
+    stdout = (
+        "S8_BATCH_WINDOW run=full-1 start_ns=900 end_ns=1500\n"
+        "S8_BATCH_METRICS run=full-1 makespan_ns=500 harness_completion_ns=600 "
+        "max_concurrent_source_admissions=20 max_concurrent_compile_result_jobs=40 "
+        "max_concurrent_admitted_or_compiling_jobs=40 "
+        "max_concurrent_active_per_relationship=2\n"
+    )
     windows = runner._batch_windows(stdout, observations, rows, 1,
                                     runner.PARALLEL_TOPOLOGY)
-    assert windows["full-1"]["makespan_ns"] == 1_200
-    serial = [{**row, "compile_start_ns": 1 + index * 100,
-               "compile_end_ns": 1 + index * 100 + 10}
-              for index, row in enumerate(observations)]
-    serial_stdout = "S8_BATCH_WINDOW run=full-1 start_ns=1 end_ns=5000\n"
+    assert windows["full-1"]["makespan_ns"] == 500
+    assert windows["full-1"]["harness_completion_ns"] == 600
+    assert windows["full-1"]["max_concurrent_source_admissions"] == 20
+    assert windows["full-1"]["max_concurrent_active_per_relationship"] == 2
+
+    serial = []
+    for index, row in enumerate(observations):
+        start = 1_000 + index * 100
+        serial.append({**row, "admission_start_ns": start,
+                       "compile_start_ns": start + 1, "input_ready_ns": start + 10,
+                       "compile_end_ns": start + 50, "witness_end_ns": start + 60})
+    serial_stdout = (
+        "S8_BATCH_WINDOW run=full-1 start_ns=900 end_ns=5000\n"
+        "S8_BATCH_METRICS run=full-1 makespan_ns=4050 harness_completion_ns=4100 "
+        "max_concurrent_source_admissions=1 max_concurrent_compile_result_jobs=1 "
+        "max_concurrent_admitted_or_compiling_jobs=1 "
+        "max_concurrent_active_per_relationship=1\n"
+    )
     with pytest.raises(runner.LiveRunnerError, match="no_observed_compile_overlap"):
         runner._batch_windows(serial_stdout, serial, rows, 1, runner.PARALLEL_TOPOLOGY)
+
+
+def test_relationship_admission_model_removes_global_source_serialization() -> None:
+    """Bounded 40-job model of the old global gate and new relationship gates."""
+    global_gate = []
+    relationship_gate = []
+    for ordinal in range(40):
+        relationship, wave = ordinal % 20, ordinal // 20
+        global_start = ordinal * 10
+        global_gate.append({
+            "planned_assignment_ordinal": ordinal,
+            "planned_relationship": relationship, "planned_admission_lane": wave,
+            "admission_start_ns": global_start, "input_ready_ns": global_start + 10,
+            "compile_start_ns": global_start + 1, "compile_end_ns": global_start + 101,
+            "witness_end_ns": global_start + 110, "observed_source_tu_seq": wave,
+        })
+        relationship_start = wave * 10
+        relationship_gate.append({
+            "planned_assignment_ordinal": ordinal,
+            "planned_relationship": relationship, "planned_admission_lane": wave,
+            "admission_start_ns": relationship_start,
+            "input_ready_ns": relationship_start + 10,
+            "compile_start_ns": relationship_start + 1,
+            "compile_end_ns": relationship_start + 101,
+            "witness_end_ns": relationship_start + 110,
+            "observed_source_tu_seq": wave,
+        })
+    baseline = runner._observed_concurrency(global_gate, runner.PARALLEL_TOPOLOGY)
+    prototype = runner._observed_concurrency(relationship_gate, runner.PARALLEL_TOPOLOGY)
+    baseline_makespan = max(row["compile_end_ns"] for row in global_gate)
+    prototype_makespan = max(row["compile_end_ns"] for row in relationship_gate)
+    assert baseline["max_concurrent_source_admissions"] == 1
+    assert prototype["max_concurrent_source_admissions"] == 20
+    assert prototype["max_concurrent_active_per_relationship"] == 2
+    assert prototype_makespan == 111
+    assert baseline_makespan == 491
+
+
+def test_planned_lane_can_reenter_at_remote_result_before_local_witness() -> None:
+    rows = [
+        {"planned_assignment_ordinal": 0, "planned_relationship": 0,
+         "planned_admission_lane": 0, "admission_start_ns": 1,
+         "input_ready_ns": 10, "compile_start_ns": 2, "compile_end_ns": 100,
+         "witness_end_ns": 180, "observed_source_tu_seq": 0},
+        {"planned_assignment_ordinal": 1, "planned_relationship": 0,
+         "planned_admission_lane": 0, "admission_start_ns": 100,
+         "input_ready_ns": 110, "compile_start_ns": 101, "compile_end_ns": 200,
+         "witness_end_ns": 250, "observed_source_tu_seq": 1},
+    ]
+    observed = runner._observed_concurrency(rows, runner.TOPOLOGY)
+    assert observed["max_concurrent_active_per_relationship"] == 1
+
+
+def test_live_curve_uses_prefix_wall_makespan_not_sum_of_job_durations() -> None:
+    selected = [
+        {"compile_start_ns": 110, "compile_end_ns": 300,
+         "elapsed_ns": 190, "c_to_f_bytes": 4, "f_to_c_bytes": 6,
+         "channel_bytes": 10},
+        {"compile_start_ns": 120, "compile_end_ns": 220,
+         "elapsed_ns": 100, "c_to_f_bytes": 8, "f_to_c_bytes": 12,
+         "channel_bytes": 20},
+        {"compile_start_ns": 310, "compile_end_ns": 400,
+         "elapsed_ns": 90, "c_to_f_bytes": 12, "f_to_c_bytes": 18,
+         "channel_bytes": 30},
+    ]
+    curve = runner._live_curve_rows(
+        selected, [{"tu_id": f"tu-{index}"} for index in range(3)],
+        {"corpus": "DuckDB", "profile": "ZSTD_ROUTE", "regime": "cold"}, 100)
+    assert [row["cumulative"]["elapsed_ns"] for row in curve] == [200, 200, 300]
+    assert curve[-1]["cumulative"]["elapsed_ns"] != sum(
+        row["elapsed_ns"] for row in selected)
+    assert curve[-1]["cumulative"]["C_TO_F_bytes"] == 24
+    assert curve[-1]["cumulative"]["F_TO_C_bytes"] == 36
+    assert curve[-1]["cumulative"]["channel_bytes"] == 60
 
 
 def test_source_mutation_is_rejected_before_launch(tmp_path: Path) -> None:

@@ -43,6 +43,7 @@ SLOTS_PER_F = {TOPOLOGY: 1, PARALLEL_TOPOLOGY: 2}
 SCRIPT = Path(__file__).resolve().parents[1] / "unittests/p50compilee2e-run.sh"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
+HEX32 = re.compile(r"^[0-9a-f]{32}$")
 SAFE = re.compile(r"^[A-Za-z0-9_.-]+$")
 TIMESTAMP = re.compile(r"^\d{8}T\d{6}Z$")
 IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -629,7 +630,9 @@ def _validate_product_log_evidence(work: Path, observations: list[dict[str, Any]
             raise LiveRunnerError(f"batch:{index}:client_log_missing") from exc
         if markers[0] not in raw:
             _fail(f"batch:{index}:product_profile_evidence_missing")
-        f_log = work / f"f-{observed['relationship']}.log"
+        service_identity = observed.get("observed_f_service_identity")
+        f_log = (work / "f.log" if service_identity == "p50-f" else
+                 work / f"f-{observed['planned_relationship']}.log")
         try:
             f_raw = f_log.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
@@ -667,9 +670,12 @@ def _timing_rows(stdout: str, rows: list[dict[str, Any]], work: Path,
             _hex(observed.get(key), f"batch:{index}.{key}")
         if observed["source_sha256"] != expected["sha256"]:
             _fail(f"batch:{index}:source_digest_mismatch")
-        integer_fields = ("preprocessed_bytes", "remote_bytes", "local_bytes", "compile_start_ns",
-                          "compile_end_ns", "wait_for_cs_ns", "planned_assignment", "relationship",
-                          "planned_admission_slot")
+        integer_fields = (
+            "preprocessed_bytes", "remote_bytes", "local_bytes", "admission_start_ns",
+            "input_ready_ns", "compile_start_ns", "compile_end_ns", "witness_end_ns",
+            "wait_for_cs_ns", "planned_assignment_ordinal", "planned_relationship",
+            "planned_admission_lane", "observed_scheduler_job_id", "observed_source_tu_seq",
+        )
         parsed = {}
         for key in integer_fields:
             try:
@@ -679,14 +685,21 @@ def _timing_rows(stdout: str, rows: list[dict[str, Any]], work: Path,
         expected_assignment = assignments[ordinal]
         expected_route = ordinal if suite == PARALLEL_TOPOLOGY else 0
         if (parsed["preprocessed_bytes"] <= 0 or parsed["remote_bytes"] <= 0 or
-                parsed["local_bytes"] <= 0 or parsed["compile_end_ns"] <= parsed["compile_start_ns"] or
-                parsed["wait_for_cs_ns"] <= 0 or parsed["planned_assignment"] != expected_route or
-                parsed["relationship"] != expected_assignment["relationship"] or
-                parsed["planned_admission_slot"] != expected_assignment["f_slot"]):
+                parsed["local_bytes"] <= 0 or
+                not parsed["admission_start_ns"] <= parsed["compile_start_ns"] <=
+                    parsed["input_ready_ns"] <= parsed["compile_end_ns"] <=
+                    parsed["witness_end_ns"] or
+                parsed["wait_for_cs_ns"] <= 0 or
+                parsed["planned_assignment_ordinal"] != expected_route or
+                parsed["planned_relationship"] != expected_assignment["relationship"] or
+                parsed["planned_admission_lane"] != expected_assignment["f_slot"] or
+                parsed["observed_scheduler_job_id"] <= 0 or
+                parsed["observed_source_tu_seq"] < 0):
             _fail(f"batch:{index}:product_metric_invalid")
-        if (suite == PARALLEL_TOPOLOGY and
-                observed.get("preferred_service_identity") != f"p50-f-{parsed['relationship']}"):
-            _fail(f"batch:{index}:preferred_service_identity_invalid")
+        expected_service = (f"p50-f-{parsed['planned_relationship']}"
+                            if suite == PARALLEL_TOPOLOGY else "p50-f")
+        if observed.get("observed_f_service_identity") != expected_service:
+            _fail(f"batch:{index}:service_identity_invalid")
         if (observed["preprocessed_sha256"] != expected["predictive_input"]["sha256"] or
                 parsed["preprocessed_bytes"] != expected["predictive_input"]["bytes"]):
             _fail(f"batch:{index}:predictive_payload_mismatch")
@@ -704,6 +717,12 @@ def _timing_rows(stdout: str, rows: list[dict[str, Any]], work: Path,
         if remote_path.read_bytes() != local_path.read_bytes():
             _fail(f"batch:{index}:object_not_byte_identical")
         result.append({**observed, **parsed, "run": run, "ordinal": ordinal,
+                       # Compatibility aliases below remain internal to the
+                       # current curve builder.  Product evidence uses the
+                       # explicit planned/observed names above.
+                       "assignment": parsed["planned_assignment_ordinal"],
+                       "relationship": parsed["planned_relationship"],
+                       "f_slot": parsed["planned_admission_lane"],
                        "elapsed_ns": parsed["compile_end_ns"] - parsed["compile_start_ns"],
                        "client_elapsed_ns": parsed["compile_end_ns"] - parsed["compile_start_ns"],
                        "measured_elapsed_ns": parsed["wait_for_cs_ns"],
@@ -712,20 +731,96 @@ def _timing_rows(stdout: str, rows: list[dict[str, Any]], work: Path,
     return result
 
 
+def _max_concurrency(intervals: list[tuple[int, int]]) -> int:
+    """Return the peak for positive half-open intervals.
+
+    End events sort before start events at an equal timestamp, so adjacent
+    planned-lane leases are not misreported as overlap.
+    """
+    if not intervals or any(end <= start for start, end in intervals):
+        _fail("batch:concurrency_interval_invalid")
+    events = [(start, 1) for start, _ in intervals]
+    events.extend((end, -1) for _, end in intervals)
+    active = maximum = 0
+    for _timestamp, delta in sorted(events, key=lambda item: (item[0], item[1])):
+        active += delta
+        if active < 0:
+            _fail("batch:concurrency_interval_invalid")
+        maximum = max(maximum, active)
+    if active != 0:
+        _fail("batch:concurrency_interval_invalid")
+    return maximum
+
+
+def _observed_concurrency(selected: list[dict[str, Any]], suite: str) -> dict[str, int]:
+    """Authenticate relationship ordering/lane caps and derive live peaks."""
+    relationships = RELATIONSHIP_COUNT[suite]
+    slots_per_f = SLOTS_PER_F[suite]
+    per_relationship: list[int] = []
+    for relationship in range(relationships):
+        related = sorted(
+            (row for row in selected if int(row["planned_relationship"]) == relationship),
+            key=lambda row: int(row["planned_assignment_ordinal"]),
+        )
+        if not related:
+            _fail(f"batch:relationship_missing:{relationship}")
+        for previous, current in zip(related, related[1:]):
+            if (int(current["admission_start_ns"]) < int(previous["input_ready_ns"]) or
+                    int(current["observed_source_tu_seq"]) !=
+                    int(previous["observed_source_tu_seq"]) + 1):
+                _fail(f"batch:relationship_admission_order_invalid:{relationship}")
+        for lane in range(slots_per_f):
+            lane_rows = [row for row in related
+                         if int(row["planned_admission_lane"]) == lane]
+            for previous, current in zip(lane_rows, lane_rows[1:]):
+                if int(current["admission_start_ns"]) < int(previous["compile_end_ns"]):
+                    _fail(f"batch:planned_lane_overlap:{relationship}:{lane}")
+        relationship_peak = _max_concurrency([
+            (int(row["admission_start_ns"]), int(row["compile_end_ns"]))
+            for row in related
+        ])
+        if relationship_peak > slots_per_f:
+            _fail(f"batch:relationship_active_cap_exceeded:{relationship}")
+        per_relationship.append(relationship_peak)
+    return {
+        "max_concurrent_source_admissions": _max_concurrency([
+            (int(row["admission_start_ns"]), int(row["input_ready_ns"]))
+            for row in selected
+        ]),
+        "max_concurrent_compile_result_jobs": _max_concurrency([
+            (int(row["compile_start_ns"]), int(row["compile_end_ns"]))
+            for row in selected
+        ]),
+        "max_concurrent_admitted_or_compiling_jobs": _max_concurrency([
+            (int(row["admission_start_ns"]), int(row["compile_end_ns"]))
+            for row in selected
+        ]),
+        "max_concurrent_active_per_relationship": max(per_relationship),
+    }
+
+
 def _batch_windows(stdout: str, observations: list[dict[str, Any]],
                    rows: list[dict[str, Any]], passes: int,
                    suite: str) -> dict[str, dict[str, int]]:
-    """Authenticate wall windows emitted around the real compile jobs."""
+    """Authenticate wall windows and independently recompute emitted peaks."""
     windows = _fields(stdout, "S8_BATCH_WINDOW")
+    metric_rows = _fields(stdout, "S8_BATCH_METRICS")
     expected_runs = ["full-1"] + (["full-2"] if passes == 2 else [])
-    if len(windows) != len(expected_runs):
+    if len(windows) != len(expected_runs) or len(metric_rows) != len(expected_runs):
         _fail("batch:window_count_mismatch")
     result: dict[str, dict[str, int]] = {}
-    for window, run in zip(windows, expected_runs, strict=True):
-        if window.get("run") != run or run in result:
+    metric_fields = (
+        "makespan_ns", "harness_completion_ns", "max_concurrent_source_admissions",
+        "max_concurrent_compile_result_jobs", "max_concurrent_admitted_or_compiling_jobs",
+        "max_concurrent_active_per_relationship",
+    )
+    for window, emitted_metrics, run in zip(windows, metric_rows, expected_runs, strict=True):
+        if (window.get("run") != run or emitted_metrics.get("run") != run or
+                run in result):
             _fail("batch:window_identity_invalid")
         try:
             start_ns, end_ns = int(window["start_ns"]), int(window["end_ns"])
+            parsed_metrics = {key: int(emitted_metrics[key]) for key in metric_fields}
         except (KeyError, TypeError, ValueError) as exc:
             raise LiveRunnerError("batch:window_timestamp_invalid") from exc
         if start_ns <= 0 or end_ns <= start_ns:
@@ -735,21 +830,95 @@ def _batch_windows(stdout: str, observations: list[dict[str, Any]],
             _fail("batch:window_observation_count_mismatch")
         starts = [int(row["compile_start_ns"]) for row in selected]
         ends = [int(row["compile_end_ns"]) for row in selected]
-        if min(starts) < start_ns or max(ends) > end_ns:
+        if (min(int(row["admission_start_ns"]) for row in selected) < start_ns or
+                max(int(row["witness_end_ns"]) for row in selected) > end_ns or
+                min(starts) < start_ns or max(ends) > end_ns):
             _fail(f"batch:{run}:compile_outside_batch_window")
+        # Scored wall time ends at the last remote result; the local byte
+        # witness remains a separate harness completion boundary and cannot
+        # tax throughput.
+        computed_metrics = {
+            "makespan_ns": max(ends) - start_ns,
+            "harness_completion_ns": end_ns - start_ns,
+            **_observed_concurrency(selected, suite),
+        }
+        if parsed_metrics != computed_metrics:
+            _fail(f"batch:{run}:concurrency_metrics_mismatch")
         if suite == PARALLEL_TOPOLOGY:
-            if not any(starts[left] < ends[right] and starts[right] < ends[left]
-                       for left in range(len(starts))
-                       for right in range(left + 1, len(starts))):
+            if computed_metrics["max_concurrent_compile_result_jobs"] <= 1:
                 _fail(f"batch:{run}:no_observed_compile_overlap")
-            routes = {(int(row["relationship"]), int(row["planned_admission_slot"]))
-                      for row in selected}
+            routes = {(int(row["planned_relationship"]),
+                       int(row["planned_admission_lane"])) for row in selected}
             if routes != {(relationship, slot)
                           for relationship in range(RELATIONSHIP_COUNT[suite])
                           for slot in range(SLOTS_PER_F[suite])}:
                 _fail(f"batch:{run}:slot_evidence_incomplete")
-        result[run] = {"start_ns": start_ns, "end_ns": end_ns,
-                       "makespan_ns": end_ns - start_ns}
+        result[run] = {"start_ns": start_ns, "end_ns": end_ns, **computed_metrics}
+    return result
+
+
+def _live_curve_rows(selected: list[dict[str, Any]], rows: list[dict[str, Any]],
+                     cell: dict[str, str], batch_start_ns: int) -> list[dict[str, Any]]:
+    """Build a prefix wall-time curve for possibly overlapping live jobs."""
+    if len(selected) != len(rows) or batch_start_ns <= 0:
+        _fail("curve:live_prefix_inputs_invalid")
+    c_to_f_total = f_to_c_total = channel = 0
+    prefix_end = batch_start_ns
+    curve: list[dict[str, Any]] = []
+    for step, (item, source) in enumerate(zip(selected, rows, strict=True)):
+        try:
+            prefix_end = max(prefix_end, int(item["compile_end_ns"]))
+            c_to_f = int(item["c_to_f_bytes"])
+            f_to_c = int(item["f_to_c_bytes"])
+            item_channel = int(item["channel_bytes"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise LiveRunnerError("curve:live_prefix_metric_invalid") from exc
+        if c_to_f <= 0 or f_to_c <= 0 or item_channel != c_to_f + f_to_c:
+            _fail("curve:live_prefix_metric_invalid")
+        c_to_f_total += c_to_f
+        f_to_c_total += f_to_c
+        channel += item_channel
+        elapsed = prefix_end - batch_start_ns
+        if elapsed <= 0 or channel <= 0:
+            _fail("curve:live_prefix_metric_invalid")
+        curve.append({
+            "step": step,
+            "tu_id": source["tu_id"],
+            "cell": cell,
+            "cumulative": {
+                "C_TO_F_bytes": c_to_f_total,
+                "F_TO_C_bytes": f_to_c_total,
+                "channel_bytes": channel,
+                "elapsed_ns": elapsed,
+                "throughput_bytes_per_s": channel * 1_000_000_000 / elapsed,
+            },
+        })
+    return curve
+
+
+def _f_service_relationships(path: Path) -> dict[str, tuple[int, str]]:
+    """Bind observed F store GUIDs to the daemon/service trace that emitted them."""
+    if not path.is_file() or path.is_symlink():
+        _fail("action_trace:F_service_map_missing")
+    result: dict[str, tuple[int, str]] = {}
+    seen_relationships: set[int] = set()
+    for index, line in enumerate(path.read_text(encoding="ascii").splitlines()):
+        fields = line.split("\t")
+        if len(fields) != 3:
+            _fail(f"action_trace:F_service_map_invalid:{index}")
+        try:
+            relationship = int(fields[0])
+        except ValueError as exc:
+            raise LiveRunnerError(f"action_trace:F_service_map_invalid:{index}") from exc
+        service, guid = fields[1], fields[2]
+        if (not 0 <= relationship < RELATIONSHIP_COUNT[PARALLEL_TOPOLOGY] or
+                service != f"p50-f-{relationship}" or HEX32.fullmatch(guid) is None or
+                guid == "0" * 32 or guid in result or relationship in seen_relationships):
+            _fail(f"action_trace:F_service_map_invalid:{index}")
+        result[guid] = (relationship, service)
+        seen_relationships.add(relationship)
+    if seen_relationships != set(range(RELATIONSHIP_COUNT[PARALLEL_TOPOLOGY])):
+        _fail("action_trace:F_service_map_incomplete")
     return result
 
 
@@ -772,9 +941,10 @@ def _action_stage_paths(c_path: Path, f_path: Path, expected_count: int,
         if len(assignments) == 0 or expected_count % len(assignments):
             _fail("action_trace:assignment_count_mismatch")
         assignments = assignments * (expected_count // len(assignments))
-    # Parallel F traces are merged by transaction digest.  Matching by digest
-    # prevents an interleaved twenty-F trace from being mistaken for a change
-    # in source order.
+    # Parallel F traces are merged by transaction digest.  Inter-relationship
+    # transaction order is intentionally free, so bind each observed F store
+    # GUID to its service trace and only then pair relationship-local trace
+    # sequence with that relationship's authenticated input order.
     f_by_digest: dict[str, dict[str, Any]] = {}
     for row in f_begins:
         digest = row["transaction_digest"]
@@ -784,47 +954,65 @@ def _action_stage_paths(c_path: Path, f_path: Path, expected_count: int,
     c_guid = {row["c_store_guid"] for row in c_begins}
     if len(c_guid) != 1:
         _fail("action_trace:C_identity_changed")
-    relation_f_guid: dict[int, str] = {}
-    relation_last_seq: dict[int, int] = {}
-    result = []
+    if suite == PARALLEL_TOPOLOGY:
+        by_f_guid = _f_service_relationships(c_path.parent / "s8-f-service-map.tsv")
+    else:
+        f_guids = {row["f_store_guid"] for row in f_begins}
+        if len(f_guids) != 1:
+            _fail("action_trace:relationship_service_changed")
+        by_f_guid = {f_guids.pop(): (0, "p50-f")}
+    observed_by_relationship: dict[int, list[tuple[dict[str, Any], dict[str, Any], str]]] = {
+        relationship: [] for relationship in range(RELATIONSHIP_COUNT[suite])
+    }
     for index, c_row in enumerate(c_begins):
         f_row = f_by_digest.get(c_row["transaction_digest"])
         if f_row is None:
             _fail(f"action_trace:{index}:transaction_missing_on_F")
-        # Parallel relationships each maintain their own TU sequence; the
-        # global C trace is intentionally interleaved across those streams.
-        if (suite != PARALLEL_TOPOLOGY and index and
-                int(c_row["tu_seq"]) != int(c_begins[index - 1]["tu_seq"]) + 1):
-            _fail(f"action_trace:{index}:sequence_not_contiguous")
         # The two role traces must describe the same transaction, not merely
         # the same long-lived service GUIDs.  Keep the F-side state digest as
         # evidence below; C's stage bytes are the measured C->F channel.
         for field in ("tu_seq", "rel_seq", "history_nonce", "raw_digest", "transaction_digest"):
             if c_row[field] != f_row[field]:
                 _fail(f"action_trace:{index}:{field}_mismatch")
-        assignment = assignments[index]
-        relationship = int(assignment["relationship"])
-        if relationship in relation_f_guid and relation_f_guid[relationship] != f_row["f_store_guid"]:
-            _fail(f"action_trace:{index}:relationship_service_changed")
-        relation_f_guid[relationship] = f_row["f_store_guid"]
-        previous = relation_last_seq.get(relationship)
-        if previous is not None and int(c_row["rel_seq"]) != previous + 1:
-            _fail(f"action_trace:{index}:relationship_sequence_not_contiguous")
-        relation_last_seq[relationship] = int(c_row["rel_seq"])
         if c_row["c_store_guid"] != f_row["c_store_guid"] or c_row["f_store_guid"] != f_row["f_store_guid"]:
             _fail(f"action_trace:{index}:service_identity_mismatch")
-        result.append({"c_to_f_bytes": int(c_row["stage_bytes"]),
-             "c_store_guid": c_row["c_store_guid"], "f_store_guid": c_row["f_store_guid"],
-             "tu_seq": int(c_row["tu_seq"]), "rel_seq": int(c_row["rel_seq"]),
-             "history_nonce": int(c_row["history_nonce"]),
-             "raw_digest": c_row["raw_digest"], "state_digest": c_row["state_digest"],
-             "transaction_digest": c_row["transaction_digest"],
-             "f_state_digest": f_row["state_digest"], "f_raw_digest": f_row["raw_digest"],
-             "relationship": relationship,
-             "planned_admission_slot": int(assignment["f_slot"])})
-    if suite == PARALLEL_TOPOLOGY and set(relation_f_guid) != set(range(RELATIONSHIP_COUNT[suite])):
-        _fail("action_trace:relationship_set_mismatch")
-    return result
+        try:
+            relationship, service = by_f_guid[f_row["f_store_guid"]]
+        except KeyError as exc:
+            raise LiveRunnerError(f"action_trace:{index}:unbound_F_service") from exc
+        observed_by_relationship[relationship].append((c_row, f_row, service))
+
+    result: list[dict[str, Any] | None] = [None] * expected_count
+    for relationship, observed in observed_by_relationship.items():
+        planned = [(index, assignment) for index, assignment in enumerate(assignments)
+                   if int(assignment["relationship"]) == relationship]
+        observed.sort(key=lambda item: (int(item[0]["rel_seq"]), int(item[0]["tu_seq"])))
+        if len(planned) != len(observed) or not observed:
+            _fail(f"action_trace:relationship_count_mismatch:{relationship}")
+        for position in range(1, len(observed)):
+            previous, current = observed[position - 1][0], observed[position][0]
+            if (int(current["rel_seq"]) != int(previous["rel_seq"]) + 1 or
+                    int(current["tu_seq"]) != int(previous["tu_seq"]) + 1):
+                _fail(f"action_trace:relationship_sequence_not_contiguous:{relationship}")
+        for (planned_index, assignment), (c_row, f_row, service) in zip(
+                planned, observed, strict=True):
+            result[planned_index] = {
+                "c_to_f_bytes": int(c_row["stage_bytes"]),
+                "c_store_guid": c_row["c_store_guid"], "f_store_guid": c_row["f_store_guid"],
+                "tu_seq": int(c_row["tu_seq"]), "rel_seq": int(c_row["rel_seq"]),
+                "history_nonce": int(c_row["history_nonce"]),
+                "raw_digest": c_row["raw_digest"], "state_digest": c_row["state_digest"],
+                "transaction_digest": c_row["transaction_digest"],
+                "f_state_digest": f_row["state_digest"], "f_raw_digest": f_row["raw_digest"],
+                "planned_relationship": relationship,
+                "planned_admission_lane": int(assignment["f_slot"]),
+                "observed_f_service_identity": service,
+                # Compatibility aliases for the current curve schema.
+                "relationship": relationship, "f_slot": int(assignment["f_slot"]),
+            }
+    if any(item is None for item in result):
+        _fail("action_trace:relationship_binding_incomplete")
+    return [item for item in result if item is not None]
 
 
 def _action_stage(work: Path, expected_count: int,
@@ -930,9 +1118,13 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
         _fail("product_run:batch_passes_mismatch")
     if output_value("S8_BATCH_WARM") != str(int(regime == "warm")):
         _fail("product_run:batch_regime_mismatch")
-    scheduling_marker = ("S8_SCHEDULING mode=parallel execution_slots=40 max_concurrency=40 relationships=20 slots_per_f=2 source_admission=global_source_commit_gate physical_slot_observed=0"
-                         if suite == PARALLEL_TOPOLOGY else
-                         "S8_SCHEDULING mode=serial execution_slots=1 max_concurrency=1")
+    scheduling_marker = (
+        "S8_SCHEDULING mode=relationship-ordered execution_slots=40 relationships=20 "
+        "planned_admission_lanes_per_relationship=2 physical_slot_observed=0"
+        if suite == PARALLEL_TOPOLOGY else
+        "S8_SCHEDULING mode=relationship-ordered execution_slots=1 relationships=1 "
+        "planned_admission_lanes_per_relationship=1"
+    )
     if scheduling_marker not in stdout.splitlines():
         _fail("product_run:scheduling_identity_missing")
     expected_binaries = _binary_identity(stdout)
@@ -952,6 +1144,12 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     if len(stages) != len(observations):
         _fail("action_trace:stage_count_mismatch")
     for observation, action in zip(observations, stages, strict=True):
+        if (observation["observed_source_tu_seq"] != action["tu_seq"] or
+                observation["observed_f_service_identity"] !=
+                action["observed_f_service_identity"] or
+                observation["planned_relationship"] != action["planned_relationship"] or
+                observation["planned_admission_lane"] != action["planned_admission_lane"]):
+            _fail("action_trace:job_topology_binding_mismatch")
         observation.update(action)
         observation["c_to_f_bytes"] = action["c_to_f_bytes"]
         observation["f_to_c_bytes"] = observation["returned_object_bytes"]
@@ -1006,6 +1204,12 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
         if not path.is_file():
             _fail(f"action_trace:retained_file_missing:{path.name}")
         shutil.copy2(path, retained / path.name)
+    service_map_raw = b""
+    if suite == PARALLEL_TOPOLOGY:
+        service_map_path = work / "s8-f-service-map.tsv"
+        # Parsing above authenticated the exact 20-row GUID/service binding.
+        service_map_raw = service_map_path.read_bytes()
+        shutil.copy2(service_map_path, retained / service_map_path.name)
     # Logs are product evidence, not caller-provided measurements.  Preserve
     # every lifecycle log so assignment and timing rows can be audited later.
     for path in sorted(work.glob("*.log")):
@@ -1041,9 +1245,17 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                         "client_elapsed_ns": item["client_elapsed_ns"],
                         "returned_object_bytes": item["returned_object_bytes"], "run": run,
                         "measurement_window": "compile+result_return",
-                        "planned_assignment": item["planned_assignment"],
-                        "relationship": item["relationship"],
-                        "planned_admission_slot": item["planned_admission_slot"],
+                        "admission_start_ns": item["admission_start_ns"],
+                        "input_ready_ns": item["input_ready_ns"],
+                        "compile_start_ns": item["compile_start_ns"],
+                        "compile_end_ns": item["compile_end_ns"],
+                        "witness_end_ns": item["witness_end_ns"],
+                        "planned_assignment_ordinal": item["planned_assignment_ordinal"],
+                        "planned_relationship": item["planned_relationship"],
+                        "planned_admission_lane": item["planned_admission_lane"],
+                        "observed_scheduler_job_id": item["observed_scheduler_job_id"],
+                        "observed_f_service_identity": item["observed_f_service_identity"],
+                        "observed_source_tu_seq": item["observed_source_tu_seq"],
                         "tu_seq": item["tu_seq"],
                         "rel_seq": item["rel_seq"], "c_store_guid": item["c_store_guid"],
                         "f_store_guid": item["f_store_guid"], "state_digest": item["state_digest"],
@@ -1075,12 +1287,19 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
         "results": hashlib.sha256(summary_raw).hexdigest(),
         "c_action": hashlib.sha256(c_action_raw).hexdigest(),
         "f_action": hashlib.sha256(f_action_raw).hexdigest(),
+        "f_service_map": hashlib.sha256(service_map_raw).hexdigest() if service_map_raw else None,
     })).hexdigest()
     witness = {"assignment": {"path": "product-evidence/assignment-witness.json",
                                "sha256": hashlib.sha256(assignment_raw).hexdigest(),
                                "bytes": len(assignment_raw)},
                "c_action": {"path": "product-evidence/s7-measured-c-action-trace.jsonl", "sha256": hashlib.sha256(c_action_raw).hexdigest(), "bytes": len(c_action_raw)},
                "f_action": {"path": "product-evidence/s7-measured-f-action-trace.jsonl", "sha256": hashlib.sha256(f_action_raw).hexdigest(), "bytes": len(f_action_raw)}}
+    if service_map_raw:
+        witness["f_service_map"] = {
+            "path": "product-evidence/s8-f-service-map.tsv",
+            "sha256": hashlib.sha256(service_map_raw).hexdigest(),
+            "bytes": len(service_map_raw),
+        }
     if passes == 2:
         witness["timing_full_2"] = {"path": "timing_full-2.jsonl", "sha256": hashlib.sha256(timing_by_run["full-2"]).hexdigest(), "bytes": len(timing_by_run["full-2"])}
     evidence_value = {"schema": "icecream-s7-live-evidence-v1",
@@ -1122,18 +1341,11 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     manifests: dict[str, str] = {}
     for run in run_names:
         selected = [row for row in observations if row["run"] == run]
-        elapsed = channel = c_to_f_total = f_to_c_total = 0
-        curve: list[dict[str, Any]] = []
-        for step, (item, source) in enumerate(zip(selected, rows, strict=True)):
-            elapsed += item["elapsed_ns"]
-            channel += item["channel_bytes"]
-            c_to_f_total += item["c_to_f_bytes"]
-            f_to_c_total += item["f_to_c_bytes"]
-            curve.append({"step": step, "tu_id": source["tu_id"], "cell": {"corpus": corpus, "profile": profile, "regime": regime},
-                          "cumulative": {"C_TO_F_bytes": c_to_f_total,
-                                         "F_TO_C_bytes": f_to_c_total,
-                                         "channel_bytes": channel, "elapsed_ns": elapsed,
-                                         "throughput_bytes_per_s": channel * 1_000_000_000 / elapsed}})
+        curve = _live_curve_rows(
+            selected, rows,
+            {"corpus": corpus, "profile": profile, "regime": regime},
+            batch_windows[run]["start_ns"],
+        )
         curve_raw = b"".join(_canonical(row) + b"\n" for row in curve)
         curve_name = f"live_curve_{run}.jsonl"
         manifest_name = f"live_curve_manifest_{run}.json"
@@ -1181,13 +1393,21 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                   "launch_identity": launch_identity,
                   "curve_manifests": manifests, "remote_compile_required": True,
                   "batch_windows": batch_windows,
-                  "scheduling": ({"mode": "parallel", "execution_slots": 40, "max_concurrency": 40,
-                                  "capacity_evidence": "configured_relationship_lanes",
-                                  "admission_lane_field": "planned_admission_slot",
-                                  "physical_slot_observed": False,
-                                  "source_admission": "global_source_commit_gate"}
-                                  if suite == PARALLEL_TOPOLOGY else
-                                  {"mode": "serial", "execution_slots": 1, "max_concurrency": 1}),
+                  "scheduling": ({
+                      "mode": "relationship_ordered", "execution_slots": 40,
+                      "planned_admission_lanes_per_relationship": 2,
+                      "admission_lane_field": "planned_admission_lane",
+                      "physical_slot_observed": False,
+                      "source_admission": "per_relationship_source_commit_gate",
+                      "observed_batch_concurrency": batch_windows,
+                  } if suite == PARALLEL_TOPOLOGY else {
+                      "mode": "relationship_ordered", "execution_slots": 1,
+                      "planned_admission_lanes_per_relationship": 1,
+                      "admission_lane_field": "planned_admission_lane",
+                      "physical_slot_observed": False,
+                      "source_admission": "per_relationship_source_commit_gate",
+                      "observed_batch_concurrency": batch_windows,
+                  }),
                   "artifact_retention": {"mode": "all" if retain_all_artifacts else "sample",
                                          "sample_tus_per_run": artifact_sample},
                   "prewarm": regime == "warm", "prewarm_evidence": prewarm_descriptor,
