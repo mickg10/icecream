@@ -221,9 +221,7 @@ int main(int argc, char** argv) {
         const PreparedTuHandle prewarm_prepared = warm
             ? authority->prepare(PrepareRequestKey{1, 1}, prewarm_input)
             : PreparedTuHandle{};
-        const PreparedTuHandle prepared = authority->prepare(
-            warm ? PrepareRequestKey{1, 2} : PrepareRequestKey{1, 1}, input);
-        if ((warm && !prewarm_prepared) || !prepared)
+        if (warm && !prewarm_prepared)
             throw std::runtime_error("Protocol-50 preparation returned an invalid handle");
 
         P50ServerEndpointConfig config;
@@ -257,6 +255,13 @@ int main(int argc, char** argv) {
         if (warm)
             run_one(prewarm_prepared);
         const size_t measured_begin = actions.records().size();
+        // Route-history profiles may prepare only one tentative TU at a time.
+        // The live warm lifecycle commits TU0 before the next compiler wrapper
+        // prepares TU1, so predictive/exact execution must preserve that order.
+        const PreparedTuHandle prepared = authority->prepare(
+            warm ? PrepareRequestKey{1, 2} : PrepareRequestKey{1, 1}, input);
+        if (!prepared)
+            throw std::runtime_error("Protocol-50 preparation returned an invalid handle");
         run_one(prepared);
         const size_t measured_end = actions.records().size();
 

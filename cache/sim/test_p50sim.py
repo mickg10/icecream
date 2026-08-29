@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -180,6 +181,30 @@ def warm_scenario_tree(tmp_path: Path) -> Path:
         "".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in ledger))
     write_canonical(tmp_path / "scenario.json", scenario)
     return tmp_path
+
+
+def test_route_profile_commits_prewarm_before_preparing_measured(tmp_path: Path) -> None:
+    payload = b"route-history warm ordering input\n"
+    input_path = tmp_path / "input.ii"
+    input_path.write_bytes(payload)
+    actions = tmp_path / "actions.jsonl"
+    prewarm_actions = tmp_path / "prewarm-actions.jsonl"
+    measured_actions = tmp_path / "measured-actions.jsonl"
+    summary = tmp_path / "summary.json"
+    environment = os.environ.copy()
+    environment["ICECC_P50_PROFILE"] = "ZSTD_ROUTE"
+    result = subprocess.run([
+        str(HERE / ".p50sim.bin"),
+        "--prewarm-input", str(input_path),
+        "--measured-input", str(input_path),
+        "--actions", str(actions),
+        "--prewarm-actions", str(prewarm_actions),
+        "--measured-actions", str(measured_actions),
+        "--summary", str(summary),
+    ], env=environment, text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+    begins = [row for row in read_jsonl(actions) if row["action"] == "TX_BEGIN"]
+    assert [row["tu_seq"] for row in begins] == [0, 0, 1, 1]
 
 
 def test_real_endpoint_writes_authenticated_trace(tmp_path: Path) -> None:
