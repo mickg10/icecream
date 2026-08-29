@@ -270,7 +270,7 @@ if not rows:
     raise SystemExit("empty batch manifest")
 seen = set()
 for row in rows:
-    if not isinstance(row, dict) or set(row) - {"tu_id", "source", "source_relative", "sha256", "predictive_input", "compile_db", "compile_source"}:
+    if not isinstance(row, dict) or set(row) - {"tu_id", "source", "source_relative", "sha256", "predictive_input", "compile_db", "compile_db_sha256", "compile_source", "compile_output"}:
         raise SystemExit("batch manifest fields invalid")
     tu, source, expected = row.get("tu_id"), row.get("source"), row.get("sha256")
     source_relative = row.get("source_relative")
@@ -309,13 +309,25 @@ for row in rows:
     actual = hashlib.sha256(open(source, "rb").read()).hexdigest()
     if not isinstance(expected, str) or expected != actual:
         raise SystemExit("batch source digest mismatch")
-    db, compile_source = row.get("compile_db", ""), row.get("compile_source", source)
+    db = row.get("compile_db", "")
+    db_sha = row.get("compile_db_sha256", "")
+    compile_source = row.get("compile_source", source)
+    compile_output = row.get("compile_output", "")
+    compile_values = (db, db_sha, row.get("compile_source", ""), compile_output)
+    if any(compile_values) and not all(compile_values):
+        raise SystemExit("batch compile binding incomplete")
     if db or compile_source != source:
         if not isinstance(db, str) or not os.path.isabs(db) or not os.path.isfile(db) or os.path.islink(db):
             raise SystemExit("batch compile database unavailable")
-        if not isinstance(compile_source, str) or not os.path.isabs(compile_source):
-            raise SystemExit("batch compile source must be absolute")
-    print("\t".join((tu, source, source_relative, actual, predictive["path"], predictive["source_relative"], payload_sha, str(payload_bytes), db, compile_source)))
+        if (not isinstance(db_sha, str) or len(db_sha) != 64 or
+                any(char not in "0123456789abcdef" for char in db_sha) or
+                hashlib.sha256(open(db, "rb").read()).hexdigest() != db_sha):
+            raise SystemExit("batch compile database digest mismatch")
+        if (not isinstance(compile_source, str) or not os.path.isabs(compile_source) or
+                compile_source != source or not isinstance(compile_output, str) or
+                not os.path.isabs(compile_output)):
+            raise SystemExit("batch compile source/output binding invalid")
+    print("\t".join((tu, source, source_relative, actual, predictive["path"], predictive["source_relative"], payload_sha, str(payload_bytes), db, db_sha, compile_source, compile_output)))
     seen.add(tu)
 PY
     batch_expected_count=${ICECC_P50_C1F1_EXPECTED_COUNT:-}
@@ -342,12 +354,21 @@ if test -n "$batch_manifest" || test -n "$compile_db" || test -n "$compile_sourc
         }
     fi
     compile_args_for() {
-        db=$1; source=$2; staged=$3; output=$4
-        python3 - "$db" "$source" "$staged" "$output" <<'PY'
-import json, shlex, sys
-db, source, staged, output = sys.argv[1:]
+        db=$1; source=$2; expected_db_output=$3; staged=$4; output=$5
+        python3 - "$db" "$source" "$expected_db_output" "$staged" "$output" <<'PY'
+import json, os, shlex, sys
+db, source, expected_db_output, staged, output = sys.argv[1:]
 entries = json.load(open(db, encoding='utf-8'))
-matches = [e for e in entries if isinstance(e, dict) and e.get('file') == source]
+def resolved_output(entry):
+    value = entry.get('output')
+    directory = entry.get('directory')
+    if not isinstance(value, str) or not isinstance(directory, str):
+        return None
+    return os.path.realpath(value if os.path.isabs(value) else os.path.join(directory, value))
+matches = [e for e in entries if isinstance(e, dict) and
+           os.path.realpath(e.get('file', '')) == os.path.realpath(source) and
+           (not expected_db_output or
+            resolved_output(e) == os.path.realpath(expected_db_output))]
 if len(matches) != 1 or not isinstance(matches[0].get('command'), str): raise SystemExit(1)
 tokens = shlex.split(matches[0]['command'])
 if len(tokens) < 2 or source not in tokens: raise SystemExit(1)
@@ -505,13 +526,14 @@ compile_once() {
     input_path=${2:-$work/src/main.cpp}
     item_compile_db=${3:-$compile_db}
     item_compile_source=${4:-$compile_source}
+    item_compile_output=${5:-}
     remote_obj="$work/out/remote-$label.o"
     local_obj="$work/out/local-$label.o"
     client_log="$work/client-compile-$label.log"
     compile_include_args=""
     if test -n "$item_compile_db"; then
-        remote_compile_args=$(compile_args_for "$item_compile_db" "$item_compile_source" "$work/src/$label.cpp" "$remote_obj")
-        local_compile_args=$(compile_args_for "$item_compile_db" "$item_compile_source" "$input_path" "$local_obj")
+        remote_compile_args=$(compile_args_for "$item_compile_db" "$item_compile_source" "$item_compile_output" "$work/src/$label.cpp" "$remote_obj")
+        local_compile_args=$(compile_args_for "$item_compile_db" "$item_compile_source" "$item_compile_output" "$input_path" "$local_obj")
     elif test -n "$include_root"; then
         compile_include_args="-I$include_root"
     else
@@ -574,10 +596,10 @@ if test -n "$batch_manifest"; then
         run_label=$1
         emit_rows=${2:-1}
         ordinal=0
-        while IFS="$(printf '\t')" read -r tu_id source_path source_relative source_sha predictive_path predictive_relative payload_sha payload_bytes item_db item_source; do
+        while IFS="$(printf '\t')" read -r tu_id source_path source_relative source_sha predictive_path predictive_relative payload_sha payload_bytes item_db item_db_sha item_source item_output; do
             staged="$work/src/$run_label-$ordinal.cpp"
             cp -- "$source_path" "$staged"
-            compile_once "$run_label-$ordinal" "$staged" "$item_db" "$item_source"
+            compile_once "$run_label-$ordinal" "$staged" "$item_db" "$item_source" "$item_output"
             remote_obj="$work/out/remote-$run_label-$ordinal.o"
             local_obj="$work/out/local-$run_label-$ordinal.o"
             preprocessed_capture="$work/s7-$run_label-$ordinal-preprocessed.ii"

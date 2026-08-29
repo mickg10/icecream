@@ -110,12 +110,17 @@ def load_batch_manifest(path: Path, expected_count: int = 100) -> list[dict[str,
         _fail(f"batch_manifest:expected_{expected_count}_rows")
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
+    compile_databases: dict[str, tuple[str, list[object]]] = {}
     for ordinal, value in enumerate(values):
         if not isinstance(value, dict):
             _fail(f"batch_manifest:{ordinal}:object_required")
         required = {"tu_id", "source", "source_relative", "sha256", "predictive_input"}
-        if not required.issubset(value) or set(value) - required - {"compile_db", "compile_source"}:
+        compile_fields = {"compile_db", "compile_db_sha256", "compile_source", "compile_output"}
+        if not required.issubset(value) or set(value) - required - compile_fields:
             _fail(f"batch_manifest:{ordinal}:fields_invalid")
+        present_compile_fields = compile_fields.intersection(value)
+        if present_compile_fields and present_compile_fields != compile_fields:
+            _fail(f"batch_manifest:{ordinal}:compile_binding_incomplete")
         tu_id, source = value["tu_id"], value["source"]
         source_relative = value["source_relative"]
         if (not isinstance(tu_id, str) or SAFE.fullmatch(tu_id) is None or tu_id in seen
@@ -149,12 +154,59 @@ def load_batch_manifest(path: Path, expected_count: int = 100) -> list[dict[str,
         row = {"ordinal": ordinal, "tu_id": tu_id, "source": source,
                "source_relative": source_relative,
                "sha256": digest, "bytes": size, "predictive_input": predictive_input}
-        for key in ("compile_db", "compile_source"):
-            if key in value:
-                if not isinstance(value[key], str) or not os.path.isabs(value[key]):
-                    _fail(f"batch_manifest:{ordinal}:{key}_invalid")
-                _sha(Path(value[key]))
-                row[key] = value[key]
+        if present_compile_fields:
+            db_value = value["compile_db"]
+            db_sha = _hex(value["compile_db_sha256"],
+                          f"batch_manifest:{ordinal}.compile_db_sha256")
+            compile_source = value["compile_source"]
+            compile_output = value["compile_output"]
+            if (not isinstance(db_value, str) or not os.path.isabs(db_value) or
+                    not isinstance(compile_source, str) or not os.path.isabs(compile_source) or
+                    not isinstance(compile_output, str) or not os.path.isabs(compile_output) or
+                    compile_source != source):
+                _fail(f"batch_manifest:{ordinal}:compile_binding_invalid")
+            expected_output_relative = Path(predictive_input["source_relative"]).with_suffix(".o")
+            output_parts = Path(compile_output).parts
+            expected_parts = expected_output_relative.parts
+            if len(output_parts) < len(expected_parts) or output_parts[-len(expected_parts):] != expected_parts:
+                _fail(f"batch_manifest:{ordinal}:compile_output_predictive_mismatch")
+            db_path = Path(db_value)
+            cached = compile_databases.get(str(db_path))
+            if cached is None:
+                observed_db_sha, _ = _sha(db_path)
+                try:
+                    entries = json.loads(db_path.read_text())
+                except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                    raise LiveRunnerError(
+                        f"batch_manifest:{ordinal}:compile_db_invalid") from exc
+                if not isinstance(entries, list):
+                    _fail(f"batch_manifest:{ordinal}:compile_db_invalid")
+                cached = (observed_db_sha, entries)
+                compile_databases[str(db_path)] = cached
+            if cached[0] != db_sha:
+                _fail(f"batch_manifest:{ordinal}:compile_db_digest_mismatch")
+            source_path = Path(compile_source).resolve()
+            output_path = Path(compile_output).resolve()
+            matches = []
+            for entry in cached[1]:
+                if not isinstance(entry, dict) or not isinstance(entry.get("directory"), str):
+                    continue
+                entry_source = entry.get("file")
+                entry_output = entry.get("output")
+                if not isinstance(entry_source, str) or not isinstance(entry_output, str):
+                    continue
+                resolved_output = Path(entry_output)
+                if not resolved_output.is_absolute():
+                    resolved_output = Path(entry["directory"]) / resolved_output
+                if (Path(entry_source).resolve() == source_path and
+                        resolved_output.resolve() == output_path and
+                        isinstance(entry.get("command"), str)):
+                    matches.append(entry)
+            if len(matches) != 1:
+                _fail(f"batch_manifest:{ordinal}:compile_entry_not_unique")
+            row.update({"compile_db": str(db_path), "compile_db_sha256": db_sha,
+                        "compile_source": str(source_path),
+                        "compile_output": str(output_path)})
         rows.append(row)
         seen.add(tu_id)
     return rows
