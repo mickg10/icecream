@@ -37,7 +37,7 @@ MANIFEST_SCHEMA = "icecream-s8-curve-manifest-v1"
 RECORD_SCHEMA = "icecream-s8-predictive-live-record-v1"
 SEMANTICS = CURRENT_SEMANTICS
 MANIFEST_KEYS = {"schema", "identity", "units", "curve", "provenance"}
-OPTIONAL_MANIFEST_KEYS = {"evidence"}
+OPTIONAL_MANIFEST_KEYS = {"evidence", "comparison"}
 IDENTITY_KEYS = {
     "corpus", "profile", "regime", "split", "run_id", "source_commit",
     "source_tree", "input_digest", "topology_digest", "model_id",
@@ -62,6 +62,7 @@ HEX40 = re.compile(r"^[0-9a-fA-F]{40}$")
 SAFE_ID = re.compile(r"^[A-Za-z0-9_.-]+$")
 MAX_MANIFEST_BYTES = 1 * 1024 * 1024
 MAX_CURVE_BYTES = 64 * 1024 * 1024
+COMPARISON_SCHEMA = "icecream-s8-plan-capture-join-v1"
 
 
 class NormalizationError(ValueError):
@@ -233,6 +234,36 @@ def _validate_provenance(value: object, mode: str) -> dict[str, object]:
     return {"mode": mode, "producer": producer, "trace_free": value["trace_free"]}
 
 
+def comparison_descriptor(plan_sha256: str) -> dict[str, str]:
+    """Derive the only join key from the authenticated predictive plan.
+
+    Producer run IDs and source identities remain local to each producer.  A
+    plan digest is immutable evidence of the exact ordered input/topology
+    request, so it is suitable as the shared comparison capture identity.
+    """
+    plan_sha256 = _sha(plan_sha256, "comparison.plan_sha256")
+    comparison_id = hashlib.sha256(canonical_bytes(
+        {"schema": COMPARISON_SCHEMA, "plan_sha256": plan_sha256}
+    )).hexdigest()
+    return {"schema": COMPARISON_SCHEMA, "plan_sha256": plan_sha256,
+            "comparison_id": comparison_id}
+
+
+def _validate_comparison(value: object) -> dict[str, str]:
+    if not isinstance(value, dict) or set(value) != {
+            "schema", "plan_sha256", "comparison_id"}:
+        raise NormalizationError("comparison:fields_invalid")
+    if value["schema"] != COMPARISON_SCHEMA:
+        raise NormalizationError("comparison:schema_invalid")
+    plan_sha = _sha(value["plan_sha256"], "comparison.plan_sha256")
+    comparison_id = _sha(value["comparison_id"], "comparison.comparison_id")
+    expected = comparison_descriptor(plan_sha)["comparison_id"]
+    if comparison_id != expected:
+        raise NormalizationError("comparison:plan_binding_mismatch")
+    return {"schema": COMPARISON_SCHEMA, "plan_sha256": plan_sha,
+            "comparison_id": comparison_id}
+
+
 def _validate_evidence(value: object) -> dict[str, object]:
     """Validate optional producer evidence without treating it as a curve.
 
@@ -366,6 +397,8 @@ def _load_manifest(path: Path, mode: str) -> dict[str, object]:
     if value["schema"] != MANIFEST_SCHEMA:
         raise NormalizationError("manifest:schema_invalid")
     identity = _validate_identity(value["identity"])
+    comparison = (_validate_comparison(value["comparison"])
+                  if "comparison" in value else None)
     units = _validate_units(value["units"])
     provenance = _validate_provenance(value["provenance"], mode)
     evidence = (_validate_evidence(value["evidence"])
@@ -379,6 +412,7 @@ def _load_manifest(path: Path, mode: str) -> dict[str, object]:
         "manifest_path": path.resolve(),
         "curve_path": curve_path.resolve(),
         "identity": identity,
+        "comparison": comparison,
         "units": units,
         "provenance": provenance,
         "evidence": evidence,
@@ -390,14 +424,22 @@ def _load_manifest(path: Path, mode: str) -> dict[str, object]:
     }
 
 
-def _same_identity(left: dict[str, str], right: dict[str, str]) -> None:
-    # The prediction and the observation are produced independently.  Their
-    # cell/run/source/input/topology identities must be identical, while the
-    # predictor version and live-observation producer identifier must remain
-    # distinct and truthful.
-    for field in JOIN_IDENTITY_KEYS:
+def _same_identity(left: dict[str, str], right: dict[str, str],
+                   left_comparison: dict[str, str] | None = None,
+                   right_comparison: dict[str, str] | None = None) -> None:
+    # Independent producers necessarily have different run/source/topology
+    # identities.  The exact authenticated plan is the shared capture key;
+    # cell and input identity remain explicit defense-in-depth checks.
+    fields = ("corpus", "profile", "regime", "split", "input_digest")
+    if left_comparison is None or right_comparison is None:
+        # Legacy artifacts remain fail-closed: without an authenticated plan
+        # key, require the complete historical producer identity.
+        fields = tuple(JOIN_IDENTITY_KEYS)
+    for field in fields:
         if left[field] != right[field]:
             raise NormalizationError(f"identity_mismatch:{field}")
+    if left_comparison is not None and right_comparison is not None and left_comparison != right_comparison:
+        raise NormalizationError("comparison_mismatch:plan_or_capture")
 
 
 def _same_units(left: dict[str, str], right: dict[str, str]) -> None:
@@ -463,6 +505,8 @@ def _comparison(predicted: dict[str, object], observed: dict[str, object], ident
         "cell": {field: identity[field] for field in ("corpus", "profile", "regime")},
         "split": identity["split"],
         "identity": identity,
+        **({"comparison": predicted["comparison"]}
+           if predicted.get("comparison") is not None else {}),
         "units": units,
         "model_id": identity["model_id"],
         "provenance": {
@@ -487,6 +531,8 @@ def _normalized_record(mode: str, artifact: dict[str, object]) -> dict[str, obje
         "cell": {field: identity[field] for field in ("corpus", "profile", "regime")},
         "split": identity["split"],
         "identity": identity,
+        **({"comparison": artifact["comparison"]}
+           if artifact.get("comparison") is not None else {}),
         "units": units,
         "model_id": identity["model_id"],
         "provenance": {
@@ -528,7 +574,7 @@ def normalize(predictive_manifest: Path, live_manifest: Path, out: Path) -> list
         raise NormalizationError("artifacts_must_use_separate_manifests")
     if predictive["curve_path"] == live["curve_path"]:
         raise NormalizationError("artifacts_must_use_separate_curves")
-    _same_identity(p_identity, l_identity)
+    _same_identity(p_identity, l_identity, predictive["comparison"], live["comparison"])
     _same_units(p_units, l_units)
     predictive_record = _normalized_record("predictive_sim", predictive)
     live_record = _normalized_record("live", live)

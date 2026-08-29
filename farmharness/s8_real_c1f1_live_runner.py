@@ -774,6 +774,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     batch_manifest_sha, batch_manifest_bytes = _sha(batch_manifest)
     input_sha = hashlib.sha256(_canonical({"source_manifest_sha256": plan["source_manifest"]["sha256"],
                                            "inputs": plan_inputs})).hexdigest()
+    comparison = normalizer.comparison_descriptor(plan_sha)
     if timestamp is None:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     if TIMESTAMP.fullmatch(timestamp) is None:
@@ -884,6 +885,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                                             "bytes": retained_payload_bytes},
                       "predictive_plan": {"path": "product-evidence/predictive-plan.json",
                                           "sha256": retained_plan_sha, "bytes": retained_plan_bytes},
+                      "comparison": comparison,
                       "topology": {"path": "product-evidence/topology.json",
                                    "sha256": retained_topology_sha,
                                    "bytes": retained_topology_bytes},
@@ -909,13 +911,17 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     manifests: dict[str, str] = {}
     for run in run_names:
         selected = [row for row in observations if row["run"] == run]
-        elapsed = channel = 0
+        elapsed = channel = c_to_f_total = f_to_c_total = 0
         curve: list[dict[str, Any]] = []
         for step, (item, source) in enumerate(zip(selected, rows, strict=True)):
             elapsed += item["elapsed_ns"]
             channel += item["channel_bytes"]
+            c_to_f_total += item["c_to_f_bytes"]
+            f_to_c_total += item["f_to_c_bytes"]
             curve.append({"step": step, "tu_id": source["tu_id"], "cell": {"corpus": corpus, "profile": profile, "regime": regime},
-                          "cumulative": {"channel_bytes": channel, "elapsed_ns": elapsed,
+                          "cumulative": {"C_TO_F_bytes": c_to_f_total,
+                                         "F_TO_C_bytes": f_to_c_total,
+                                         "channel_bytes": channel, "elapsed_ns": elapsed,
                                          "throughput_bytes_per_s": channel * 1_000_000_000 / elapsed}})
         curve_raw = b"".join(_canonical(row) + b"\n" for row in curve)
         curve_name = f"live_curve_{run}.jsonl"
@@ -926,6 +932,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                                         "source_commit": commit, "source_tree": tree,
                                         "input_digest": input_sha, "topology_digest": topology_sha,
                                         "model_id": "s8-real-live"},
+                          "comparison": comparison,
                           "units": {"point": "step", "channel_bytes": "bytes", "elapsed_ns": "ns",
                                     "throughput_bytes_per_s": "bytes_per_s"},
                           "curve": {"path": curve_name, "sha256": hashlib.sha256(curve_raw).hexdigest(), "bytes": len(curve_raw)},

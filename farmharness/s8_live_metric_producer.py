@@ -255,8 +255,16 @@ def _timing_rows(package: Path, descriptors: dict[str, dict[str, object]], cell:
                 raise ProducerError(f"timing:{name}:{line_number}:elapsed_invalid")
             if type(channel) is not int or channel <= 0:
                 raise ProducerError(f"timing:{name}:{line_number}:channel_bytes_invalid")
-            rows.append({"tu_id": tu_id, "elapsed_ns": elapsed,
-                         "channel_bytes": channel})
+            row = {"tu_id": tu_id, "elapsed_ns": elapsed,
+                   "channel_bytes": channel}
+            # The real S8 runner retains directional channel evidence.  Keep
+            # it when present so its curve has the same non-derived metric
+            # shape as the predictive product curve; legacy S7 packages stay
+            # consumable as their original aggregate curve.
+            directional = (value.get("C_TO_F_bytes"), value.get("F_TO_C_bytes"))
+            if all(type(item) is int and item >= 0 for item in directional):
+                row["C_TO_F_bytes"], row["F_TO_C_bytes"] = directional
+            rows.append(row)
     # A cold S7 cell has exactly one measured TU.  Never manufacture extra
     # points by subdividing it; every emitted point below corresponds to one
     # retained measured TU.  Warm captures may include prewarm rows, which are
@@ -324,17 +332,28 @@ def produce(package: Path, out: Path) -> Path:
         "input_digest": input_digest, "topology_digest": topology_digest,
         "model_id": "s7-live-observed",
     }
+    comparison = None
+    if "comparison" in evidence:
+        try:
+            comparison = normalizer._validate_comparison(evidence["comparison"])
+        except normalizer.NormalizationError as exc:
+            return _hold(out, f"comparison:{exc}")
     rows: list[dict[str, object]] = []
-    elapsed_total = bytes_total = 0
+    elapsed_total = bytes_total = c_to_f_total = f_to_c_total = 0
     for step, observation in enumerate(observations):
         elapsed_total += int(observation["elapsed_ns"])
         bytes_total += int(observation["channel_bytes"])
+        if "C_TO_F_bytes" in observation:
+            c_to_f_total += int(observation["C_TO_F_bytes"])
+            f_to_c_total += int(observation["F_TO_C_bytes"])
+        cumulative = {"channel_bytes": bytes_total, "elapsed_ns": elapsed_total}
+        if "C_TO_F_bytes" in observation:
+            cumulative.update({"C_TO_F_bytes": c_to_f_total,
+                               "F_TO_C_bytes": f_to_c_total})
+        cumulative["throughput_bytes_per_s"] = (bytes_total * 1_000_000_000) / elapsed_total
         rows.append({
             "step": step, "tu_id": observation["tu_id"], "cell": {"corpus": corpus, "profile": profile, "regime": regime},
-            "cumulative": {
-                "channel_bytes": bytes_total, "elapsed_ns": elapsed_total,
-                "throughput_bytes_per_s": (bytes_total * 1_000_000_000) / elapsed_total,
-            },
+            "cumulative": cumulative,
         })
     curve_raw = b"".join(_canonical(row) + b"\n" for row in rows)
     curve_path = out / "live-curve.jsonl"
@@ -356,6 +375,8 @@ def produce(package: Path, out: Path) -> Path:
         "provenance": {"mode": "live", "producer": "s8_live_metric_producer", "trace_free": False},
         "evidence": evidence_descriptor,
     }
+    if comparison is not None:
+        manifest["comparison"] = comparison
     result = {
         "schema": SCHEMA, "status": "PASS", "scored": True,
         "cell": summary["cell"], "source_commit": identity["source_commit"],

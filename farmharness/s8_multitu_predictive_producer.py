@@ -727,6 +727,8 @@ def _product_curve_rows(product_rows: list[dict[str, object]], inputs: list[dict
         cumulative["F_TO_C_bytes"] += f_to_c
         cumulative["channel_bytes"] += c_to_f + f_to_c
         cumulative["elapsed_ns"] = max(cumulative["elapsed_ns"], finish)
+        if cumulative["elapsed_ns"] <= 0:
+            raise MultiTUPredictiveError("predictive_engine:elapsed_invalid")
         before = product["state_before_digest"]
         after = product["state_digest"]
         if not isinstance(relationship_id, str) or not isinstance(before, str) or \
@@ -788,7 +790,10 @@ def _product_curve_rows(product_rows: list[dict[str, object]], inputs: list[dict
             "source_relative": item["source_relative"],
             "topology_digest": topology_digest,
             "provenance": "product_p50sim_batch",
-            "cumulative": dict(cumulative),
+            "cumulative": {**cumulative,
+                            "throughput_bytes_per_s":
+                                (cumulative["channel_bytes"] * 1_000_000_000 /
+                                 cumulative["elapsed_ns"])},
         })
     if rows:
         prior_source_finish: dict[str, int] = {}
@@ -837,8 +842,11 @@ def _emit_product_segment(plan: dict[str, object], plan_facts: dict[str, object]
                 "source_commit": source_commit, "source_tree": source_tree,
                 "input_digest": input_digest, "topology_digest": topology_digest,
                 "model_id": model_id}
+    comparison = normalizer.comparison_descriptor(str(plan_facts["plan"]["sha256"]))
     curve_manifest = {"schema": CURVE_MANIFEST_SCHEMA, "identity": identity,
-                      "units": {"point": "step", "channel_bytes": "bytes", "elapsed_ns": "ns"},
+                      "comparison": comparison,
+                      "units": {"point": "step", "channel_bytes": "bytes", "elapsed_ns": "ns",
+                                "throughput_bytes_per_s": "bytes_per_s"},
                       "curve": {"path": "predictive_sim.jsonl", "sha256": curve_sha,
                                 "bytes": len(curve_raw)},
                       "provenance": {"mode": "predictive_sim", "producer": PRODUCER,

@@ -12,6 +12,7 @@ from s8_predictive_live_normalizer import (
     MANIFEST_SCHEMA,
     NormalizationError,
     canonical_bytes,
+    comparison_descriptor,
     normalize,
 )
 from s8_schema import CURRENT_SEMANTICS, DECLARED_CELLS, SPLITS
@@ -30,6 +31,7 @@ IDENTITY = {
     "model_id": "fmt-zstd-tu-cold-v1",
 }
 UNITS = {"point": "step", "channel_bytes": "bytes", "elapsed_ns": "ns"}
+COMPARISON = comparison_descriptor("e" * 64)
 
 
 def _curve_rows(offset: int = 0) -> list[dict[str, object]]:
@@ -51,6 +53,7 @@ def _write_manifest(root: Path, name: str, mode: str, rows: list[dict[str, objec
     value: dict[str, object] = {
         "schema": MANIFEST_SCHEMA,
         "identity": identity or IDENTITY,
+        "comparison": COMPARISON,
         "units": UNITS,
         "curve": {"path": curve.name, "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)},
         "provenance": {
@@ -108,6 +111,42 @@ def test_predictor_and_live_producer_ids_remain_distinct(tmp_path: Path) -> None
     assert records[0]["model_id"] == IDENTITY["model_id"]
     assert records[1]["model_id"] == "s7-live-observed"
     assert records[2]["model_id"] == IDENTITY["model_id"]
+
+
+def test_exact_plan_join_allows_independent_run_and_source_identity(tmp_path: Path) -> None:
+    live_identity = dict(IDENTITY)
+    live_identity.update(run_id="full-1", source_commit="f" * 40,
+                         source_tree="2" * 40, topology_digest="1" * 64,
+                         model_id="s8-real-live")
+    predictive, live = _pair(tmp_path, live_identity=live_identity)
+    records = normalize(predictive, live, tmp_path / "out.jsonl")
+    assert records[2]["comparison"]["comparison_id"] == COMPARISON["comparison_id"]
+
+
+def test_run_id_source_mismatch_without_plan_key_is_rejected(tmp_path: Path) -> None:
+    predictive, live = _pair(tmp_path)
+    value = json.loads(live.read_text())
+    value.pop("comparison")
+    value["identity"] = dict(value["identity"], run_id="unrelated-live",
+                              source_commit="f" * 40, source_tree="2" * 40)
+    live.write_bytes(canonical_bytes(value) + b"\n")
+    with pytest.raises(NormalizationError, match="identity_mismatch:(run_id|source_commit|source_tree)"):
+        normalize(predictive, live, tmp_path / "out.jsonl")
+
+
+def test_changed_input_or_plan_topology_cannot_join(tmp_path: Path) -> None:
+    predictive, _ = _pair(tmp_path)
+    changed_input = dict(IDENTITY, input_digest="1" * 64)
+    live = _write_manifest(tmp_path, "live-input", "live", _curve_rows(),
+                           identity=changed_input)
+    with pytest.raises(NormalizationError, match="identity_mismatch:input_digest"):
+        normalize(predictive, live, tmp_path / "input-out.jsonl")
+
+    changed_plan = comparison_descriptor("2" * 64)
+    live = _write_manifest(tmp_path, "live-topology", "live", _curve_rows(),
+                           extra={"comparison": changed_plan})
+    with pytest.raises(NormalizationError, match="comparison_mismatch"):
+        normalize(predictive, live, tmp_path / "topology-out.jsonl")
 
 
 @pytest.mark.parametrize(
