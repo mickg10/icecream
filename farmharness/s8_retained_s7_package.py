@@ -186,6 +186,12 @@ def build(s7_package: Path, replay: Path, source_repository: Path, out: Path) ->
         "measured-f-action-trace.jsonl": replay / "measured-f-action-trace.jsonl",
         "input.ii": replay / "measured.ii",
     }
+    if regime == "warm":
+        replay_files.update({
+            "prewarm-c-action-trace.jsonl": replay / "prewarm-c-action-trace.jsonl",
+            "prewarm-f-action-trace.jsonl": replay / "prewarm-f-action-trace.jsonl",
+            "prewarm.ii": replay / "prewarm.ii",
+        })
     retained: dict[str, tuple[bytes, str]] = {
         name: _snapshot(path, f"retained.{name}") for name, path in replay_files.items()
     }
@@ -212,6 +218,15 @@ def build(s7_package: Path, replay: Path, source_repository: Path, out: Path) ->
             raise PackageError(f"results.conformance.{field}:mismatch")
     if retained["input.ii"][1] != input_sha:
         raise PackageError("retained_input:digest_mismatch")
+    if regime == "warm":
+        if (replay_manifest.get("prewarm_action_count", 0) <= 0 or
+                replay_manifest.get("prewarm_input_sha256") != retained["prewarm.ii"][1]):
+            raise PackageError("warm:prewarm_evidence_mismatch")
+        pre_c = _trace_rows(retained["prewarm-c-action-trace.jsonl"][0], "prewarm_c_trace")
+        pre_f = _trace_rows(retained["prewarm-f-action-trace.jsonl"][0], "prewarm_f_trace")
+        if (_one_begin(pre_c, "C").get("tu_seq") != 0 or
+                _one_begin(pre_f, "F").get("tu_seq") != 0):
+            raise PackageError("warm:prewarm_identity_invalid")
 
     c_rows = _trace_rows(retained["measured-c-action-trace.jsonl"][0], "c_trace")
     f_rows = _trace_rows(retained["measured-f-action-trace.jsonl"][0], "f_trace")
@@ -306,6 +321,13 @@ def build(s7_package: Path, replay: Path, source_repository: Path, out: Path) ->
         "wire_observation": {"c_to_f_bytes": c_to_f, "f_to_c_bytes": f_to_c,
                              "channel_bytes": c_to_f + f_to_c},
         "evidence": evidence_files, "derivation_evidence": derivation_files,
+        "prewarm_evidence": ({
+            "input": _descriptor("prewarm.ii", retained["prewarm.ii"][0]),
+            "c_trace": _descriptor("prewarm-c-action-trace.jsonl",
+                                    retained["prewarm-c-action-trace.jsonl"][0]),
+            "f_trace": _descriptor("prewarm-f-action-trace.jsonl",
+                                    retained["prewarm-f-action-trace.jsonl"][0]),
+        } if regime == "warm" else None),
     }
     evidence["evidence_sha256"] = hashlib.sha256(_canonical(evidence)).hexdigest()
     evidence_raw = _canonical(evidence) + b"\n"
