@@ -344,6 +344,10 @@ def test_product_identity_rejects_tracked_edit(tmp_path: Path) -> None:
 
 def test_batch_shell_excludes_warm_prewarm_and_carries_optional_repeat() -> None:
     shell = (Path(__file__).resolve().parents[1] / "unittests/p50compilee2e-run.sh").read_text()
+    cache_service = (Path(__file__).resolve().parents[1] /
+                     "cache/p50_cache_service.cpp").read_text()
+    sidecar_adapter = (Path(__file__).resolve().parents[1] /
+                       "cache/p50_daemon_sidecar_adapter.cpp").read_text()
     assert "run_batch prewarm 0" in shell
     assert "run_batch full-1 1" in shell
     assert 'staged="$work/src/$run_label-$ordinal.ii"' in shell
@@ -366,6 +370,8 @@ def test_batch_shell_excludes_warm_prewarm_and_carries_optional_repeat() -> None
     assert "source committed for P50 CompileFile" in shell
     assert 'while test -e "$marker"; do sleep 0.005; done' in shell
     assert "grep -oE 'p50-f-[0-9]+' | sort -u | wc -l" in shell
+    assert "fsession_owner_(64, config_.f_store_generation)" in cache_service
+    assert "::listen(outer_launch_listener_fd_, 64)" in sidecar_adapter
 
 
 def test_unsupported_topology_fails_closed(tmp_path: Path) -> None:
