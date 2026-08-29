@@ -427,7 +427,7 @@ void absolute_receive_budget_and_terminal_teardown() {
     ::close(partial_sockets[0]);
     CHECK(partial_reader.receive_until(
               ignored, std::chrono::steady_clock::now() + std::chrono::seconds(1)) ==
-          Status::IoError);
+          Status::Truncated);
 }
 
 void terminal_poll_errors_and_sigpipe_safety() {

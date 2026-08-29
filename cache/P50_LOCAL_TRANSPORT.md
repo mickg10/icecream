@@ -39,9 +39,10 @@ writer.  It encodes the complete frame before writing and carries one absolute
 writes prevents a writable hint from turning into a blocking send; timeout
 returns `Status::Timeout` and preserves the one-writer gate.  Per-call
 `MSG_DONTWAIT` avoids mutating `O_NONBLOCK` on the shared open file
-description; platforms without that primitive fail closed.  Poll error and
-hangup bits are checked before requested input or output readiness, and
-SIGPIPE protection remains the same as the ordinary writer.
+description; platforms without that primitive fail closed.  A read drains a
+complete record queued with peer hangup before observing EOF; hard poll errors
+and write-side hangup remain terminal.  SIGPIPE protection remains the same as
+the ordinary writer.
 
 `connect_unix_until(path, deadline, status)` is the bounded AF_UNIX client
 precursor.  It applies the same private-parent and exact-private-node checks as

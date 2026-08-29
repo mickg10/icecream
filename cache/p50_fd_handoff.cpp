@@ -619,10 +619,12 @@ FdHandoffResult FdHandoffReceiver::receive_and_ack(
     seen_request_ = actual;
     const auto ack = encode_wire(kAckType, actual, kCodeAck);
     const FdHandoffStatus ack_status = send_wire(connection.fd_, ack, -1, deadline);
-    if (ack_status != FdHandoffStatus::Accepted)
+    if (ack_status != FdHandoffStatus::Accepted) {
+        adopted_.reset();
         return result(ack_status, ack_status == FdHandoffStatus::Timeout
                                      ? FdHandoffSenderState::TimedOut
                                      : FdHandoffSenderState::Disconnected);
+    }
     return result(FdHandoffStatus::Accepted, FdHandoffSenderState::Acked);
 }
 

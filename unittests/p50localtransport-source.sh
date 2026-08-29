@@ -218,18 +218,20 @@ echo 'ok - executable EAGAIN/EWOULDBLOCK deletion mutant is rejected'
 # is the sole exception: it owns a newly-created descriptor until return and
 # explicitly restores that descriptor before handing it to Connection.  The
 # local transport and FD handoff both use the one shared absolute-deadline poll
-# helper in the public transport header; keep its terminal checks explicit so
-# a POLLERR/POLLHUP/POLLNVAL deletion mutant is visible in review.
+# helper in the public transport header.  Readable bytes win over a concurrent
+# stream hangup; hard poll errors and write-side hangup remain terminal.
 grep -F 'MSG_DONTWAIT' "$transport" >/dev/null
 grep -F 'detail::wait_for_io' "$transport" >/dev/null
 grep -F 'DeadlinePollResult' "$poll_helper" >/dev/null
-grep -F '(POLLERR | POLLHUP | POLLNVAL)' "$poll_helper" >/dev/null
+grep -F '(POLLERR | POLLNVAL)' "$poll_helper" >/dev/null
+grep -F '(events & POLLIN)' "$poll_helper" >/dev/null
+grep -F '(descriptor.revents & POLLHUP)' "$poll_helper" >/dev/null
 grep -F '(descriptor.revents & events)' "$poll_helper" >/dev/null
 if grep -F '(us + 999)' "$transport" "$poll_helper" >/dev/null; then
     echo 'FAIL: shared deadline helper still rounds sub-millisecond waits up' >&2
     exit 1
 fi
-echo 'ok - bounded transport preserves shared flags and rejects terminal poll state'
+echo 'ok - bounded transport preserves shared flags and drains readable EOF state'
 
 listener_body() {
     sed -n '/^static int listen_unix_impl/,/^Connection connect_unix/p' "$1"

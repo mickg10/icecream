@@ -556,7 +556,7 @@ void test_submillisecond_absolute_deadline() {
     CHECK(elapsed < 1000);
 }
 
-void test_terminal_poll_bits_are_error_first() {
+void test_terminal_poll_bits_preserve_queued_reads() {
     {
         Pair pair = raw_pair();
         authenticate(pair.connection);
@@ -577,6 +577,26 @@ void test_terminal_poll_bits_are_error_first() {
         CHECK(result.status == FdHandoffStatus::Disconnected);
         CHECK(!receiver.adopted());
         CHECK(::close(fd) == 0);
+    }
+
+    {
+        int fds[2] = {-1, -1};
+        CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+        const auto ack = wire(2, request(), 1);
+        CHECK(send_all(fds[1], ack.data(), ack.size()));
+        CHECK(::close(fds[1]) == 0);
+        struct pollfd descriptor{fds[0], POLLIN, 0};
+        CHECK(::poll(&descriptor, 1, 1000) == 1);
+        CHECK((descriptor.revents & (POLLIN | POLLHUP)) == (POLLIN | POLLHUP));
+        CHECK(detail::wait_for_io(
+                  fds[0], POLLIN,
+                  std::chrono::steady_clock::now() + std::chrono::seconds(1)) ==
+              detail::DeadlinePollResult::Ready);
+        std::array<uint8_t, kWireSize> received{};
+        CHECK(::recv(fds[0], received.data(), received.size(), MSG_WAITALL) ==
+              static_cast<ssize_t>(received.size()));
+        CHECK(received == ack);
+        CHECK(::close(fds[0]) == 0);
     }
 
     {
@@ -640,7 +660,7 @@ int main() {
     test_forced_positive_short_writes();
 #endif
     test_submillisecond_absolute_deadline();
-    test_terminal_poll_bits_are_error_first();
+    test_terminal_poll_bits_preserve_queued_reads();
     test_timeout_disconnect_auth();
     return 0;
 }

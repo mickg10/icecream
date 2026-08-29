@@ -34,9 +34,10 @@ enum class DeadlinePollResult {
 
 // Shared by framed local transport and descriptor handoff.  Poll timeout
 // conversion floors to milliseconds and probes with zero below one
-// millisecond; it never adds a rounding constant to a duration.  Terminal
-// poll bits are checked before requested readiness in both directions, so a
-// POLLERR/POLLHUP/POLLNVAL indication cannot be masked by POLLIN or POLLOUT.
+// millisecond; it never adds a rounding constant to a duration.  A stream may
+// report POLLIN together with POLLHUP when its peer wrote a final complete
+// record and closed.  Drain that readable record before observing EOF; writes
+// and hard poll errors remain terminal.
 inline DeadlinePollResult wait_for_io(
     int fd, short events,
     std::chrono::steady_clock::time_point deadline) noexcept {
@@ -72,7 +73,11 @@ inline DeadlinePollResult wait_for_io(
         if (ready == 0)
             continue;
 
-        if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
+        if ((descriptor.revents & (POLLERR | POLLNVAL)) != 0)
+            return DeadlinePollResult::Error;
+        if ((events & POLLIN) != 0 && (descriptor.revents & POLLIN) != 0)
+            return DeadlinePollResult::Ready;
+        if ((descriptor.revents & POLLHUP) != 0)
             return DeadlinePollResult::Error;
         if ((descriptor.revents & events) != 0)
             return DeadlinePollResult::Ready;

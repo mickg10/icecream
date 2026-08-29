@@ -27,7 +27,9 @@ gate() {
 
 gate "$source_file"
 grep -Fq 'DeadlinePollResult' "$poll_helper"
-grep -Fq '(POLLERR | POLLHUP | POLLNVAL)' "$poll_helper"
+grep -Fq '(POLLERR | POLLNVAL)' "$poll_helper"
+grep -Fq '(events & POLLIN)' "$poll_helper"
+grep -Fq '(descriptor.revents & POLLHUP)' "$poll_helper"
 grep -Fq '(descriptor.revents & events)' "$poll_helper"
 if grep -Fq '(us + 999)' "$poll_helper"; then
     echo 'sub-millisecond deadline ceiling survived in shared helper' >&2
@@ -59,9 +61,9 @@ for pattern in \
 done
 
 helper_mutant="$mutant_dir/poll-helper-mutant.h"
-sed '/POLLERR | POLLHUP | POLLNVAL/d' "$poll_helper" >"$helper_mutant"
-if grep -Fq '(POLLERR | POLLHUP | POLLNVAL)' "$helper_mutant"; then
-    echo 'terminal-poll deletion mutant survived: shared helper' >&2
+sed '/events & POLLIN/d' "$poll_helper" >"$helper_mutant"
+if grep -Fq '(events & POLLIN)' "$helper_mutant"; then
+    echo 'readable-hangup deletion mutant survived: shared helper' >&2
     exit 1
 fi
 
