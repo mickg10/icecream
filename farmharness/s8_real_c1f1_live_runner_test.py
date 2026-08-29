@@ -188,6 +188,7 @@ def test_dry_run_command_targets_real_single_lifecycle_for_all_profiles(tmp_path
                                    regime="warm", depth="100", passes=2,
                                    predictive_plan=plan)
     assert command[0] == "env"
+    assert "ICECC_CARET_WORKAROUND=0" in command
     assert f"ICECC_P50_PROFILE={profile}" in command
     assert "ICECC_P50_C1F1_WARM=1" in command
     assert "ICECC_P50_C1F1_PASSES=2" in command

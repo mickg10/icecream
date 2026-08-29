@@ -45,6 +45,7 @@ IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
 PINNED_IMAGE = "icecream/farm-node:ubuntu22-gcc11-boost174"
 DEFAULT_CONTAINER_BIND_ROOT = Path("/tanksmall")
 DEFAULT_CONTAINER_TEMP_ROOT = Path("/tmp")
+SCORED_CARET_WORKAROUND = "0"
 
 
 class LiveRunnerError(ValueError):
@@ -398,6 +399,7 @@ def build_command(batch_manifest: Path, profile: str,
     product_identity(product_root, script)
     command = ["env", f"ICECC_TEST_TOP_SRCDIR={product_root}",
             f"ICECC_TEST_TOP_BUILDDIR={product_root}",
+            f"ICECC_CARET_WORKAROUND={SCORED_CARET_WORKAROUND}",
             f"ICECC_P50_PROFILE={profile}", f"ICECC_P50_CORPUS={corpus}",
             f"ICECC_P50_C1F1_WARM={int(regime == 'warm')}",
             f"ICECC_P50_C1F1_TIMEOUT={derive_timeout(count, passes, regime == 'warm')}",
@@ -865,6 +867,10 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                       "binary_sha256": binaries,
                       "execution_environment": execution_environment,
                       "runtime_image": runtime_image,
+                      "diagnostic_policy": {
+                          "icecc_caret_workaround": SCORED_CARET_WORKAROUND,
+                          "default_caret_companion_excluded": True,
+                      },
                       "state_carrying_repeat": passes == 2,
                       "measurement_window": "compile+result_return",
                       "prewarm": prewarm_descriptor,
@@ -923,6 +929,10 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                   "topology_sha256": topology_sha, "predictive_plan_sha256": plan_sha,
                   "execution_environment": execution_environment,
                   "runtime_image": runtime_image,
+                  "diagnostic_policy": {
+                      "icecc_caret_workaround": SCORED_CARET_WORKAROUND,
+                      "default_caret_companion_excluded": True,
+                  },
                   "binary_sha256": binaries, "source_commit": commit, "source_tree": tree,
                   "runner_sha256": runner_sha,
                   "launch_identity": launch_identity,
