@@ -155,6 +155,7 @@ mkdir -p "$work/envs-f" "$work/envs-c" "$work/toolchain" "$work/src" "$work/out"
     "$work/cache-runtime-f" "$work/cache-runtime-c" "$work/home"
 if test "$suite" = C1F20/40; then
     for relationship in $(seq 0 19); do
+        mkdir -p "$work/envs-f-$relationship"
         mkdir -p "$work/cache-runtime-f-$relationship"
     done
 fi
@@ -162,6 +163,7 @@ chmod 1777 "$work/envs-f" "$work/envs-c"
 chmod 0700 "$work/cache-runtime-f" "$work/cache-runtime-c" "$work/home"
 if test "$suite" = C1F20/40; then
     for relationship in $(seq 0 19); do
+        chmod 1777 "$work/envs-f-$relationship"
         chmod 0700 "$work/cache-runtime-f-$relationship"
     done
 fi
@@ -538,10 +540,10 @@ if test "$suite" = C1F20/40; then
         f_trace="$work/s7-warm-f-action-trace-$relationship.jsonl"
         ICECC_TEST_SOCKET="$work/worker-$relationship.sock" ICECC_P50_C1F1_REQUIRED=1 \
             ICECC_P50_C_ACTION_TRACE="$f_trace" ICECC_P50_F_ACTION_TRACE="$f_trace" \
-            ICECC_P50_RELATIONSHIP="$relationship" \
+        ICECC_P50_RELATIONSHIP="$relationship" \
             "$build/daemon/iceccd" "$@" -p "$worker_port" -m 2 \
             -s "127.0.0.1:$port_sched" -n "$network" -N "p50-f-$relationship" \
-            -b "$work/envs-f" -l "$work/f-$relationship.log" -vvv \
+            -b "$work/envs-f-$relationship" -l "$work/f-$relationship.log" -vvv \
             --cache-service "$build/cache/icecc-cache-service" \
             --cache-runtime-dir "$work/cache-runtime-f-$relationship" &
         worker_pid=$!

@@ -356,6 +356,7 @@ def test_batch_shell_excludes_warm_prewarm_and_carries_optional_repeat() -> None
         "s8_real_c1f1_live_runner.py").read_text()
     assert 'C1F20/40) relationship_count=20; slots_per_f=2; execution_slots=40' in shell
     assert '"$build/daemon/iceccd" "$@" -p "$worker_port" -m 2' in shell
+    assert '"$work/envs-f-$relationship"' in shell
     assert 'S8_BATCH_WINDOW run=%s start_ns=%s end_ns=%s' in shell
     assert 'run_one "$run_label" "$ordinal" "$relationship" "$f_slot"' in shell
     assert 'staged="$work/src/$run_label-$ordinal.ii"' in shell
