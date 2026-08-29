@@ -50,6 +50,7 @@ IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
 PINNED_IMAGE = "icecream/farm-node:ubuntu22-gcc11-boost174"
 DEFAULT_CONTAINER_BIND_ROOT = Path("/tanksmall")
 DEFAULT_CONTAINER_TEMP_ROOT = Path("/tmp")
+DEFAULT_CONTAINER_WORK_ROOT = Path("/p5")
 SCORED_CARET_WORKAROUND = "0"
 
 
@@ -567,7 +568,8 @@ def container_name(work_parent: Path) -> str:
 def build_container_command(inner: list[str], *, image_identity: dict[str, str],
                             bind_root: Path, work_parent: Path,
                             required_paths: list[Path],
-                            temp_root: Path = DEFAULT_CONTAINER_TEMP_ROOT) -> list[str]:
+                            temp_root: Path = DEFAULT_CONTAINER_TEMP_ROOT,
+                            container_work_root: Path = DEFAULT_CONTAINER_WORK_ROOT) -> list[str]:
     """Wrap one product lifecycle in the pinned root-capable build image."""
     if (set(image_identity) != {"reference", "image_id", "architecture", "os", "created"} or
             IMAGE_ID.fullmatch(image_identity.get("image_id", "")) is None or
@@ -577,6 +579,10 @@ def build_container_command(inner: list[str], *, image_identity: dict[str, str],
     bind_root = bind_root.resolve()
     work_parent = work_parent.resolve()
     temp_root = validated_container_temp_root(temp_root).resolve()
+    if (not container_work_root.is_absolute() or
+            container_work_root.parent != Path("/") or
+            SAFE.fullmatch(container_work_root.name) is None):
+        _fail("container_mount:container_work_root_invalid")
     if (not bind_root.is_absolute() or bind_root.is_symlink() or not bind_root.is_dir() or
             not work_parent.is_absolute() or work_parent.is_symlink() or
             not work_parent.is_dir() or work_parent.parent != temp_root or
@@ -591,14 +597,14 @@ def build_container_command(inner: list[str], *, image_identity: dict[str, str],
     inner_shell = shlex.join(inner)
     cleanup_shell = ("set +e\n" + inner_shell + "\n"
                      "product_status=$?\n"
-                     f"chown -R {uid}:{gid} {shlex.quote(str(work_parent))} || exit 70\n"
+                     f"chown -R {uid}:{gid} {shlex.quote(str(container_work_root))} || exit 70\n"
                      "exit \"$product_status\"\n")
     return ["docker", "run", "--rm", "--user", "0", "--network", "host",
             "--name", container_name(work_parent),
             "--env", "ICECC_TEST_DAEMON_UID=nobody",
             "--env", "ICECC_TEST_DAEMON_GID=nogroup",
             "-v", f"{bind_root}:{bind_root}:ro",
-            "-v", f"{work_parent}:{work_parent}:rw",
+            "-v", f"{work_parent}:{container_work_root}:rw",
             image_identity["image_id"], "/bin/sh", "-lc", cleanup_shell]
 
 
@@ -1242,6 +1248,26 @@ def _write_new(path: Path, raw: bytes) -> None:
         os.fsync(stream.fileno())
 
 
+def _retained_workdir(stdout: str, *, host_workdir: Path | None = None,
+                      reported_workdir: Path | None = None) -> Path:
+    work_lines = [line.split("=", 1)[1] for line in stdout.splitlines()
+                  if line.startswith("S7_WORKDIR=")]
+    if len(work_lines) != 1:
+        _fail("product_run:workdir_missing")
+    observed = Path(work_lines[0])
+    if host_workdir is None:
+        if reported_workdir is not None:
+            _fail("product_run:workdir_mapping_incomplete")
+        work = observed
+    else:
+        if reported_workdir is None or observed != reported_workdir:
+            _fail("product_run:workdir_mapping_mismatch")
+        work = host_workdir
+    if work.is_symlink() or not work.is_dir():
+        _fail("product_run:workdir_unavailable")
+    return work
+
+
 def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Path,
              predictive_plan: Path, output: Path, profile: str, product_root: Path,
              repeat_predictive_plan: Path | None = None,
@@ -1251,6 +1277,8 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
              launch_identity: dict[str, Any] | None = None,
              execution_environment: str = "host_product_build",
              runtime_image: dict[str, str] | None = None,
+             host_workdir: Path | None = None,
+             reported_workdir: Path | None = None,
              timestamp: str | None = None, suite: str = TOPOLOGY) -> Path:
     """Turn one completed product invocation into two authenticated live curves."""
     if returncode != 0 or "PASS: all-P50 C1F1" not in stdout:
@@ -1289,12 +1317,8 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     topology_sha = load_topology(topology, rows, suite, plan.get("scheduling"))
     topology_value = json.loads(topology.read_text())
     assignments = topology_value.get("assignments", topology_value.get("inputs"))
-    work_lines = [line.split("=", 1)[1] for line in stdout.splitlines() if line.startswith("S7_WORKDIR=")]
-    if len(work_lines) != 1:
-        _fail("product_run:workdir_missing")
-    work = Path(work_lines[0])
-    if work.is_symlink() or not work.is_dir():
-        _fail("product_run:workdir_unavailable")
+    work = _retained_workdir(stdout, host_workdir=host_workdir,
+                             reported_workdir=reported_workdir)
     def output_value(prefix: str) -> str:
         values = [line.split("=", 1)[1] for line in stdout.splitlines()
                   if line.startswith(prefix + "=")]
@@ -1739,6 +1763,7 @@ def main(argv: list[str] | None = None) -> int:
     rows = load_batch_manifest(batch_manifest, count)
     load_topology(topology, rows, args.suite, _plan.get("scheduling"))
     run_workdir: Path | None = None
+    command_workdir: Path | None = None
     run_work_parent: Path | None = None
     runtime_image: dict[str, str] | None = None
     container_temp_root = (validated_container_temp_root(args.container_temp_root)
@@ -1751,12 +1776,14 @@ def main(argv: list[str] | None = None) -> int:
                 prefix="p5.", dir=container_temp_root))
             run_work_parent.chmod(0o711)
             run_workdir = run_work_parent / "p50compilee2e.run"
+            command_workdir = DEFAULT_CONTAINER_WORK_ROOT / "p50compilee2e.run"
             runtime_image = container_image_identity(args.container_image)
             execution_environment = "pinned_container_product_build"
         else:
             run_workdir = Path(tempfile.mkdtemp(
                 prefix="p50compilee2e.", dir=tempfile.gettempdir()))
             run_workdir.rmdir()
+            command_workdir = run_workdir
     launch_identity = None
     if args.execute:
         launch_commit, launch_tree, launch_binaries, launch_runner_sha = product_identity(args.product_root.absolute())
@@ -1767,7 +1794,7 @@ def main(argv: list[str] | None = None) -> int:
     command = build_command(batch_manifest, args.profile,
                             product_root=args.product_root.absolute(), corpus=args.corpus,
                             regime=args.regime, depth=args.depth, full_count=args.full_count,
-                            passes=args.passes, workdir=run_workdir,
+                            passes=args.passes, workdir=command_workdir,
                             predictive_plan=predictive_plan, suite=args.suite,
                             topology=topology)
     if not args.execute:
@@ -1778,6 +1805,8 @@ def main(argv: list[str] | None = None) -> int:
                           "container_image": args.container_image
                           if args.execution_mode == "pinned-container" else None,
                           "container_temp_root": str(args.container_temp_root.absolute())
+                          if args.execution_mode == "pinned-container" else None,
+                          "container_work_root": str(DEFAULT_CONTAINER_WORK_ROOT)
                           if args.execution_mode == "pinned-container" else None},
                          sort_keys=True))
         return 0
@@ -1797,7 +1826,8 @@ def main(argv: list[str] | None = None) -> int:
             command, image_identity=runtime_image,
             bind_root=args.container_bind_root.absolute(),
             work_parent=run_work_parent, required_paths=required_paths,
-            temp_root=container_temp_root)
+            temp_root=container_temp_root,
+            container_work_root=DEFAULT_CONTAINER_WORK_ROOT)
     try:
         timeout = derive_timeout(count, args.passes, args.regime == "warm")
         try:
@@ -1815,6 +1845,8 @@ def main(argv: list[str] | None = None) -> int:
             if cleanup_error is not None:
                 print(str(cleanup_error))
             return 77
+        if run_workdir is not None:
+            _write_new(run_workdir / "product-output.log", stdout.encode("utf-8"))
         path = finalize(stdout, returncode, batch_manifest=batch_manifest,
                         topology=topology, output=args.output.absolute(), profile=args.profile,
                         predictive_plan=predictive_plan, product_root=args.product_root.absolute(),
@@ -1826,6 +1858,10 @@ def main(argv: list[str] | None = None) -> int:
                         launch_identity=launch_identity,
                         execution_environment=execution_environment,
                         runtime_image=runtime_image,
+                        host_workdir=run_workdir
+                        if args.execution_mode == "pinned-container" else None,
+                        reported_workdir=command_workdir
+                        if args.execution_mode == "pinned-container" else None,
                         timestamp=args.timestamp, suite=args.suite)
     except LiveRunnerError as exc:
         print(str(exc))

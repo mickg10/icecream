@@ -372,10 +372,11 @@ def test_container_command_uses_resolved_image_and_read_only_product_mount(
         assert identity["image_id"] in command
         assert identity["reference"] not in command
         assert f"{bind_root.resolve()}:{bind_root.resolve()}:ro" in command
-        assert f"{work_parent}:{work_parent}:rw" in command
+        assert f"{work_parent}:{runner.DEFAULT_CONTAINER_WORK_ROOT}:rw" in command
         assert "ICECC_TEST_DAEMON_UID=nobody" in command
         assert "ICECC_TEST_DAEMON_GID=nogroup" in command
-        assert f"chown -R {os.geteuid()}:{os.getegid()}" in command[-1]
+        assert (f"chown -R {os.geteuid()}:{os.getegid()} "
+                f"{runner.DEFAULT_CONTAINER_WORK_ROOT}") in command[-1]
     finally:
         work_parent.rmdir()
 
@@ -395,11 +396,29 @@ def test_container_temp_root_must_be_a_real_directory(tmp_path: Path) -> None:
     command = runner.build_container_command(
         ["env", "true"], image_identity=identity, bind_root=tmp_path,
         work_parent=work_parent, required_paths=[required], temp_root=root)
-    assert f"{work_parent.resolve()}:{work_parent.resolve()}:rw" in command
+    assert (f"{work_parent.resolve()}:{runner.DEFAULT_CONTAINER_WORK_ROOT}:rw"
+            in command)
+    socket_path = (runner.DEFAULT_CONTAINER_WORK_ROOT / "p50compilee2e.run" /
+                   "cache-runtime-f-19" /
+                   ("attempt-100000-" + "a" * 32) / "cache.sock")
+    assert len(str(socket_path)) < 108
     alias = tmp_path / "container-work-alias"
     alias.symlink_to(root, target_is_directory=True)
     with pytest.raises(runner.LiveRunnerError, match="container_temp_root:invalid"):
         runner.validated_container_temp_root(alias)
+
+
+def test_container_reported_workdir_maps_to_retained_host_tree(tmp_path: Path) -> None:
+    host = tmp_path / "p50compilee2e.run"
+    host.mkdir()
+    reported = runner.DEFAULT_CONTAINER_WORK_ROOT / "p50compilee2e.run"
+    assert runner._retained_workdir(
+        f"S7_WORKDIR={reported}\n", host_workdir=host,
+        reported_workdir=reported) == host
+    with pytest.raises(runner.LiveRunnerError, match="workdir_mapping_mismatch"):
+        runner._retained_workdir(
+            "S7_WORKDIR=/wrong/p50compilee2e.run\n", host_workdir=host,
+            reported_workdir=reported)
 
 
 def test_container_cleanup_is_exact_and_tolerates_already_removed(
@@ -528,6 +547,7 @@ def test_batch_shell_excludes_warm_prewarm_and_carries_optional_repeat() -> None
     assert "s7-measured-c-action-trace.jsonl" in runner_source
     assert "shutil.rmtree(work)" in runner_source
     assert '"comparison": manifest_value["comparison"]' in runner_source
+    assert 'product-output.log' in runner_source
     assert 'C1F20/40) relationship_count=20; slots_per_f=2; execution_slots=40' in shell
     assert '"$build/daemon/iceccd" "$@" -p "$worker_port" -m 2' in shell
     assert '"$work/envs-f-$relationship"' in shell
