@@ -384,6 +384,18 @@ def test_container_temp_root_must_be_a_real_directory(tmp_path: Path) -> None:
     root = tmp_path / "container-work"
     root.mkdir()
     assert runner.validated_container_temp_root(root) == root.absolute()
+    work_parent = root / "p5.custom"
+    work_parent.mkdir()
+    required = tmp_path / "required"
+    required.write_text("input\n")
+    identity = {"reference": runner.PINNED_IMAGE,
+                "image_id": "sha256:" + "a" * 64,
+                "architecture": "amd64", "os": "linux",
+                "created": "2026-08-21T21:11:43Z"}
+    command = runner.build_container_command(
+        ["env", "true"], image_identity=identity, bind_root=tmp_path,
+        work_parent=work_parent, required_paths=[required], temp_root=root)
+    assert f"{work_parent.resolve()}:{work_parent.resolve()}:rw" in command
     alias = tmp_path / "container-work-alias"
     alias.symlink_to(root, target_is_directory=True)
     with pytest.raises(runner.LiveRunnerError, match="container_temp_root:invalid"):

@@ -566,7 +566,8 @@ def container_name(work_parent: Path) -> str:
 
 def build_container_command(inner: list[str], *, image_identity: dict[str, str],
                             bind_root: Path, work_parent: Path,
-                            required_paths: list[Path]) -> list[str]:
+                            required_paths: list[Path],
+                            temp_root: Path = DEFAULT_CONTAINER_TEMP_ROOT) -> list[str]:
     """Wrap one product lifecycle in the pinned root-capable build image."""
     if (set(image_identity) != {"reference", "image_id", "architecture", "os", "created"} or
             IMAGE_ID.fullmatch(image_identity.get("image_id", "")) is None or
@@ -575,9 +576,10 @@ def build_container_command(inner: list[str], *, image_identity: dict[str, str],
         _fail("container_image:identity_invalid")
     bind_root = bind_root.resolve()
     work_parent = work_parent.resolve()
+    temp_root = validated_container_temp_root(temp_root).resolve()
     if (not bind_root.is_absolute() or bind_root.is_symlink() or not bind_root.is_dir() or
             not work_parent.is_absolute() or work_parent.is_symlink() or
-            not work_parent.is_dir() or work_parent.parent != DEFAULT_CONTAINER_TEMP_ROOT or
+            not work_parent.is_dir() or work_parent.parent != temp_root or
             not work_parent.name.startswith("p5.")):
         _fail("container_mount:invalid_root")
     if not required_paths or any(not _path_within(path, bind_root)
@@ -1739,10 +1741,12 @@ def main(argv: list[str] | None = None) -> int:
     run_workdir: Path | None = None
     run_work_parent: Path | None = None
     runtime_image: dict[str, str] | None = None
+    container_temp_root = (validated_container_temp_root(args.container_temp_root)
+                           if args.execution_mode == "pinned-container" else None)
     execution_environment = "host_product_build"
     if args.execute:
         if args.execution_mode == "pinned-container":
-            container_temp_root = validated_container_temp_root(args.container_temp_root)
+            assert container_temp_root is not None
             run_work_parent = Path(tempfile.mkdtemp(
                 prefix="p5.", dir=container_temp_root))
             run_work_parent.chmod(0o711)
@@ -1792,7 +1796,8 @@ def main(argv: list[str] | None = None) -> int:
         command = build_container_command(
             command, image_identity=runtime_image,
             bind_root=args.container_bind_root.absolute(),
-            work_parent=run_work_parent, required_paths=required_paths)
+            work_parent=run_work_parent, required_paths=required_paths,
+            temp_root=container_temp_root)
     try:
         timeout = derive_timeout(count, args.passes, args.regime == "warm")
         try:
