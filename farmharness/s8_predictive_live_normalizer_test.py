@@ -145,6 +145,15 @@ def test_route_action_trace_fields_are_not_consumed(tmp_path: Path) -> None:
         normalize(predictive, live, tmp_path / "out.jsonl")
 
 
+def test_negative_metric_is_rejected(tmp_path: Path) -> None:
+    negative = [{**_curve_rows()[0],
+                 "cumulative": {"channel_bytes": -1, "elapsed_ns": 100}},
+                _curve_rows()[1]]
+    predictive, live = _pair(tmp_path, predicted=negative)
+    with pytest.raises(NormalizationError, match="metric_negative"):
+        normalize(predictive, live, tmp_path / "out.jsonl")
+
+
 def test_manifest_trace_reference_is_rejected(tmp_path: Path) -> None:
     predictive, live = _pair(tmp_path)
     raw = json.loads(predictive.read_bytes())

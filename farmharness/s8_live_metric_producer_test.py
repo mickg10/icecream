@@ -63,6 +63,10 @@ def test_cold_and_warm_emit_authenticated_curve(tmp_path: Path) -> None:
         assert rows[1]["cumulative"]["channel_bytes"] == 200
         artifact = _load_manifest(out / "live-curve-manifest.json", "live")
         assert artifact["evidence"]["binary_sha256"]["client"] == "d" * 64
+        assert artifact["units"] == {
+            "point": "step", "channel_bytes": "bytes", "elapsed_ns": "ns",
+            "throughput_bytes_per_s": "bytes_per_s",
+        }
 
 
 def test_missing_timing_is_hold_and_never_scored(tmp_path: Path) -> None:

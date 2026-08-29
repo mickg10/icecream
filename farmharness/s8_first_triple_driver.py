@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import stat
 import sys
@@ -36,8 +37,15 @@ except ImportError:  # pragma: no cover - direct harness invocation.
 CELL = {"corpus": "fmt", "profile": "ZSTD_TU", "regime": "cold"}
 LIVE_SCHEMA = "icecream-s7-live-cell-v1"
 DRIVER_SCHEMA = "icecream-s8-first-triple-driver-v2"
-LIVE_PRODUCERS = frozenset({"s7_live_observation", "s7_warm_replay", "s7_zstd_tu_cells"})
+LIVE_PRODUCERS = frozenset({
+    "s7_live_observation", "s7_warm_replay", "s7_zstd_tu_cells",
+    "s8_live_metric_producer",
+})
 CELL_FIELDS = frozenset(("corpus", "profile", "regime"))
+# S7's retained ``wait for cs`` measurement covers the remote compile and
+# result-return window.  Source compression/uplink, startup, and commit are
+# retained in the raw predictor artifact but are not comparable live metrics.
+LIVE_ELAPSED_COMPONENTS = ("compile", "result_return")
 
 
 class DriverError(ValueError):
@@ -177,7 +185,19 @@ def _load_live_curve(path: Path, cell: dict[str, str] = CELL) -> dict[str, objec
 
 
 def _normalizer_curve(predictive_raw: bytes, path: Path) -> tuple[bytes, str]:
-    """Drop only incompatible predictor metadata; retain every numeric metric."""
+    """Project raw predictor points to the independently observed metric set.
+
+    The predictor may retain directional channel counters and elapsed
+    components for analysis.  The retained S7 live curve exposes only total
+    channel bytes, elapsed nanoseconds, and the derived throughput.  This
+    authenticated view deliberately compares exactly that common set and
+    never invents points or uses a digest as a metric.
+    """
+    def nonnegative_int(value: object, label: str) -> int:
+        if type(value) is not int or value < 0:
+            raise DriverError(f"predictive_curve:{label}:nonnegative_integer_required")
+        return value
+
     rows: list[dict[str, object]] = []
     for number, line in enumerate(predictive_raw.splitlines(), 1):
         try:
@@ -188,15 +208,28 @@ def _normalizer_curve(predictive_raw: bytes, path: Path) -> tuple[bytes, str]:
             raise DriverError("predictive_curve:not_object")
         if not isinstance(value.get("step"), int) or not isinstance(value.get("tu_id"), str):
             raise DriverError("predictive_curve:point_identity_invalid")
-        if not isinstance(value.get("cumulative"), dict):
+        cumulative = value.get("cumulative")
+        if not isinstance(cumulative, dict):
             raise DriverError("predictive_curve:missing_cumulative_metrics")
-        # The predictor's other metadata includes internal model labels and
-        # elapsed component names (for example transaction_commit) that the
-        # normalizer intentionally excludes.  Retain the exact point identity
-        # and cumulative numeric metrics; the raw predictor file remains
-        # alongside this deterministic normalizer view.
+        channel_bytes = nonnegative_int(cumulative.get("channel_bytes"),
+                                        "channel_bytes")
+        elapsed_components = value.get("elapsed_ns")
+        if not isinstance(elapsed_components, dict):
+            raise DriverError("predictive_curve:elapsed_components:missing")
+        elapsed_ns = sum(nonnegative_int(elapsed_components.get(component),
+                                         f"elapsed_ns.{component}")
+                         for component in LIVE_ELAPSED_COMPONENTS)
+        if elapsed_ns == 0:
+            raise DriverError("predictive_curve:elapsed_ns:must_be_positive")
+        throughput = (channel_bytes * 1_000_000_000) / elapsed_ns
+        if not math.isfinite(throughput) or throughput < 0:
+            raise DriverError("predictive_curve:throughput_bytes_per_s:invalid")
         rows.append({"step": value["step"], "tu_id": value["tu_id"],
-                     "cumulative": value["cumulative"]})
+                     "cumulative": {
+                         "channel_bytes": channel_bytes,
+                         "elapsed_ns": elapsed_ns,
+                         "throughput_bytes_per_s": throughput,
+                     }})
     if not rows:
         raise DriverError("predictive_curve:empty")
     raw = b"".join(normalizer.canonical_bytes(row) + b"\n" for row in rows)
@@ -208,7 +241,8 @@ def _curve_manifest(path: Path, curve: Path, curve_raw: bytes, identity: dict[st
     value = {
         "schema": normalizer.MANIFEST_SCHEMA,
         "identity": identity,
-        "units": {"point": "step", "channel_bytes": "bytes", "elapsed_ns": "ns"},
+        "units": {"point": "step", "channel_bytes": "bytes", "elapsed_ns": "ns",
+                  "throughput_bytes_per_s": "bytes_per_s"},
         "curve": {"path": curve.name, "sha256": hashlib.sha256(curve_raw).hexdigest(),
                   "bytes": len(curve_raw)},
         "provenance": {"mode": "predictive_sim", "producer": "s8_predictive_engine",

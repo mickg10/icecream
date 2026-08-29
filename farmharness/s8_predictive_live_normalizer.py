@@ -42,7 +42,18 @@ IDENTITY_KEYS = {
     "corpus", "profile", "regime", "split", "run_id", "source_commit",
     "source_tree", "input_digest", "topology_digest", "model_id",
 }
-UNITS_KEYS = {"point", "channel_bytes", "elapsed_ns"}
+REQUIRED_UNITS_KEYS = {"point", "channel_bytes", "elapsed_ns"}
+THROUGHPUT_UNITS_KEY = "throughput_bytes_per_s"
+UNIT_KEY_OPTIONS = {
+    frozenset(REQUIRED_UNITS_KEYS),
+    frozenset((*REQUIRED_UNITS_KEYS, THROUGHPUT_UNITS_KEY)),
+}
+CANONICAL_UNITS = {
+    "point": "step",
+    "channel_bytes": "bytes",
+    "elapsed_ns": "ns",
+    "throughput_bytes_per_s": "bytes_per_s",
+}
 DESCRIPTOR_KEYS = {"path", "sha256", "bytes"}
 PROVENANCE_KEYS = {"mode", "producer", "trace_free"}
 HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -203,9 +214,13 @@ def _validate_identity(value: object) -> dict[str, str]:
 
 
 def _validate_units(value: object) -> dict[str, str]:
-    if not isinstance(value, dict) or set(value) != UNITS_KEYS:
+    if not isinstance(value, dict) or frozenset(value) not in UNIT_KEY_OPTIONS:
         raise NormalizationError("units:fields_invalid")
-    return {field: _safe_id(value[field], f"units.{field}") for field in UNITS_KEYS}
+    result = {field: _safe_id(value[field], f"units.{field}") for field in value}
+    for field, expected in CANONICAL_UNITS.items():
+        if field in result and result[field] != expected:
+            raise NormalizationError(f"units.{field}:unexpected_unit")
+    return result
 
 
 def _validate_provenance(value: object, mode: str) -> dict[str, object]:
@@ -283,6 +298,8 @@ def _flatten_numeric(value: object, prefix: str) -> dict[str, int | float]:
         finite = False
     if not finite:
         raise NormalizationError(f"curve.{prefix}:metric_not_finite_number")
+    if value < 0:
+        raise NormalizationError(f"curve.{prefix}:metric_negative")
     return {prefix: value}
 
 
@@ -379,8 +396,8 @@ def _same_identity(left: dict[str, str], right: dict[str, str]) -> None:
 
 
 def _same_units(left: dict[str, str], right: dict[str, str]) -> None:
-    for field in UNITS_KEYS:
-        if left[field] != right[field]:
+    for field in set(left) | set(right):
+        if left.get(field) != right.get(field):
             raise NormalizationError(f"units_mismatch:{field}")
 
 

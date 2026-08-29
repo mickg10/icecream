@@ -329,7 +329,8 @@ def produce(package: Path, out: Path) -> Path:
     }
     manifest = {
         "schema": CURVE_MANIFEST_SCHEMA, "identity": identity,
-        "units": {"point": "step", "channel_bytes": "bytes", "elapsed_ns": "ns"},
+        "units": {"point": "step", "channel_bytes": "bytes", "elapsed_ns": "ns",
+                  "throughput_bytes_per_s": "bytes_per_s"},
         "curve": {"path": curve_path.name, "sha256": hashlib.sha256(curve_raw).hexdigest(), "bytes": len(curve_raw)},
         "provenance": {"mode": "live", "producer": "s8_live_metric_producer", "trace_free": False},
         "evidence": evidence_descriptor,
