@@ -27,11 +27,13 @@ from typing import Any
 try:  # Works with ``python -m farmharness...`` and PYTHONPATH=farmharness.
     from . import s8_predictive_live_normalizer as normalizer
     from .s8_schema import CORPORA, PROFILES, REGIMES, SPLITS
-    from .s8_predictive_engine import PredictionError, load_inputs, predict
+    from .s8_predictive_engine import (
+        PredictionError, load_calibration_bundle, load_inputs, predict,
+    )
 except ImportError:  # pragma: no cover - direct harness invocation.
     import s8_predictive_live_normalizer as normalizer
     from s8_schema import CORPORA, PROFILES, REGIMES, SPLITS
-    from s8_predictive_engine import PredictionError, load_inputs, predict
+    from s8_predictive_engine import PredictionError, load_calibration_bundle, load_inputs, predict
 
 
 CELL = {"corpus": "fmt", "profile": "ZSTD_TU", "regime": "cold"}
@@ -272,7 +274,8 @@ def _timestamped_directory(root: Path, cell: dict[str, str] = CELL) -> Path:
 
 
 def run(manifest: Path, live_package: Path, live_manifest: Path | None,
-        experiments: Path, cell: dict[str, str] | None = None) -> Path:
+        experiments: Path, cell: dict[str, str] | None = None,
+        calibration_bundle: Path | None = None) -> Path:
     """Run predictor and shared normalizer into one immutable experiment dir."""
     target_cell = _validate_cell(CELL if cell is None else cell, "requested_cell")
     live, live_raw, live_sha, live_results_path = _live_summary(live_package, target_cell)
@@ -290,11 +293,17 @@ def run(manifest: Path, live_package: Path, live_manifest: Path | None,
     _require_cell(manifest_cell, target_cell, "predictive_manifest")
     if input_facts["sha256"] != live_identity["input_digest"]:
         raise DriverError("predictive_input_and_live_input_digest_mismatch")
+    if calibration_bundle is not None:
+        try:
+            load_calibration_bundle(calibration_bundle.absolute())
+        except PredictionError as exc:
+            raise DriverError(f"calibration_bundle:{exc}") from exc
 
     experiment = _timestamped_directory(experiments, target_cell)
     try:
         predictive_path = experiment / "predictive_sim.jsonl"
-        predictive_sidecar = predict(manifest, predictive_path)
+        predictive_sidecar = predict(manifest, predictive_path,
+                                     calibration_bundle=calibration_bundle)
         predictive_raw = predictive_path.read_bytes()
         normalizer_curve_path = experiment / "predictive_curve.jsonl"
         normalizer_curve_raw, _normalizer_curve_sha = _normalizer_curve(
@@ -334,6 +343,10 @@ def run(manifest: Path, live_package: Path, live_manifest: Path | None,
                                 "sha256": hashlib.sha256(predictive_raw).hexdigest(),
                                 "bytes": len(predictive_raw),
                                 "producer_manifest": predictive_sidecar},
+            **({"calibration_bundle": {
+                "path": str(calibration_bundle.absolute()),
+                "sha256": predictive_sidecar["provenance"]["calibration_bundle_sha256"],
+            }} if calibration_bundle is not None else {}),
             "live_summary": {"path": "live_summary.jsonl", "sha256": live_sha,
                              "bytes": len(live_raw), "source": str(live_results_path.absolute())},
             "live_curve_manifest": {"path": str(live_manifest.absolute()),
@@ -360,12 +373,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--corpus", choices=CORPORA, default=CELL["corpus"])
     parser.add_argument("--profile", choices=PROFILES, default=CELL["profile"])
     parser.add_argument("--regime", choices=REGIMES, default=CELL["regime"])
+    parser.add_argument("--calibration-manifest", type=Path,
+                        help="authenticated frozen calibration model manifest")
     args = parser.parse_args(argv)
     try:
         print(run(args.manifest.absolute(), args.live_package.absolute(),
                   args.live_manifest.absolute() if args.live_manifest else None,
                   args.experiments.absolute(),
-                  {"corpus": args.corpus, "profile": args.profile, "regime": args.regime}))
+                  {"corpus": args.corpus, "profile": args.profile, "regime": args.regime},
+                  args.calibration_manifest.absolute() if args.calibration_manifest else None))
     except (DriverError, PredictionError) as exc:
         print(str(exc), file=sys.stderr)
         return 77

@@ -41,7 +41,10 @@ MANIFEST_SCHEMA = "icecream-s8-predictive-engine-manifest-v3"
 TOPOLOGY_SCHEMA = "icecream-c1f1-topology-state-v1"
 OBSERVATIONS_SCHEMA = "icecream-s8-predictive-performance-v2"
 ARTIFACT_SCHEMA = "icecream-s8-predictive-artifact-v3"
+CALIBRATION_MANIFEST_SCHEMA = "icecream-s8-calibration-model-manifest-v1"
+CALIBRATION_BUNDLE_SCHEMA = "icecream-s8-calibration-model-bundle-v1"
 HEX64 = set("0123456789abcdef")
+HEX40 = set("0123456789abcdef")
 MAX_INPUT_BYTES = 64 * 1024 * 1024
 
 # This is the predeclared model.  Keeping coefficients in source makes the
@@ -216,6 +219,99 @@ def _authenticate(path: Path, descriptor: dict[str, object], label: str,
     return raw, facts
 
 
+def load_calibration_bundle(manifest_path: Path) -> dict[str, object]:
+    """Authenticate a frozen calibration bundle for this base model."""
+    manifest_raw, manifest_facts = regular_snapshot(manifest_path, "calibration_manifest")
+    value = parse_json(manifest_raw, "calibration_manifest")
+    expected_keys = {"schema", "semantics", "bundle", "request", "predictor", "inputs"}
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise PredictionError("calibration_manifest:fields_invalid")
+    if value["schema"] != CALIBRATION_MANIFEST_SCHEMA or value["semantics"] != SEMANTICS:
+        raise PredictionError("calibration_manifest:schema_or_semantics_invalid")
+    predictor = value["predictor"]
+    if not isinstance(predictor, dict) or set(predictor) != {"source_commit", "source_tree", "model_id"}:
+        raise PredictionError("calibration_manifest:predictor_invalid")
+    if predictor["model_id"] != BASE_MODEL["id"]:
+        raise PredictionError("calibration_manifest:base_model_mismatch")
+    for field in ("source_commit", "source_tree"):
+        digest = predictor[field]
+        if (not isinstance(digest, str) or len(digest) != 40 or
+                set(digest.lower()) - HEX40 or int(digest, 16) == 0):
+            raise PredictionError(f"calibration_manifest:predictor_{field}_invalid")
+    bundle_descriptor = _artifact_path(manifest_path.parent, value["bundle"], "calibration_bundle")
+    bundle_raw, bundle_facts = _authenticate(bundle_descriptor, value["bundle"], "calibration_bundle")
+    bundle = parse_json(bundle_raw, "calibration_bundle")
+    if not isinstance(bundle, dict) or set(bundle) != {
+            "schema", "semantics", "request", "predictor", "calibration", "inputs"}:
+        raise PredictionError("calibration_bundle:fields_invalid")
+    if bundle["schema"] != CALIBRATION_BUNDLE_SCHEMA or bundle["semantics"] != SEMANTICS:
+        raise PredictionError("calibration_bundle:schema_or_semantics_invalid")
+    if bundle["predictor"] != predictor:
+        raise PredictionError("calibration_bundle:predictor_identity_mismatch")
+    if value["request"] != bundle["request"] or value["inputs"] != bundle["inputs"]:
+        raise PredictionError("calibration_bundle:manifest_binding_mismatch")
+    if (not isinstance(bundle["request"], dict) or
+            set(bundle["request"]) != {"sha256", "bytes"} or
+            not isinstance(bundle["inputs"], list) or len(bundle["inputs"]) != 16):
+        raise PredictionError("calibration_bundle:input_bindings_invalid")
+    expected_cells = {
+        f"{cell['corpus']}/{cell['profile']}/{cell['regime']}": cell
+        for cell in DECLARED_CELLS if SPLITS[cell["corpus"]] == "calibration"
+    }
+    seen_cells: set[str] = set()
+    bucket_corpora: dict[str, set[str]] = {
+        f"{profile}/{regime}": set()
+        for profile in PROFILE_MODELS for regime in REGIME_MODELS
+    }
+    for binding in bundle["inputs"]:
+        if not isinstance(binding, dict) or set(binding) != {
+                "cell", "records_path", "records_sha256", "records_bytes"}:
+            raise PredictionError("calibration_bundle:input_binding_invalid")
+        cell = binding["cell"]
+        if not isinstance(cell, dict) or set(cell) != {"corpus", "profile", "regime"}:
+            raise PredictionError("calibration_bundle:input_cell_invalid")
+        cell_id = f"{cell.get('corpus')}/{cell.get('profile')}/{cell.get('regime')}"
+        if cell_id not in expected_cells or cell_id in seen_cells:
+            raise PredictionError(f"calibration_bundle:input_cell_duplicate_or_invalid:{cell_id}")
+        seen_cells.add(cell_id)
+        bucket_corpora[f"{cell['profile']}/{cell['regime']}"].add(cell["corpus"])
+        path = binding["records_path"]
+        if (not isinstance(path, str) or not path or Path(path).is_absolute() or
+                any(part in ("", ".", "..") for part in Path(path).parts)):
+            raise PredictionError("calibration_bundle:input_path_invalid")
+        digest = binding["records_sha256"]
+        if (not isinstance(digest, str) or len(digest) != 64 or
+                set(digest.lower()) - HEX64 or int(digest, 16) == 0):
+            raise PredictionError("calibration_bundle:input_digest_invalid")
+        if type(binding["records_bytes"]) is not int or binding["records_bytes"] <= 0:
+            raise PredictionError("calibration_bundle:input_bytes_invalid")
+    if seen_cells != set(expected_cells):
+        raise PredictionError("calibration_bundle:input_cell_set_invalid")
+    if any(corpora != {"fmt", "RocksDB"} for corpora in bucket_corpora.values()):
+        raise PredictionError("calibration_bundle:bucket_sources_invalid")
+    calibration = bundle["calibration"]
+    if not isinstance(calibration, dict) or not isinstance(calibration.get("scales"), dict):
+        raise PredictionError("calibration_bundle:calibration_invalid")
+    expected_buckets = {f"{profile}/{regime}"
+                        for profile in PROFILE_MODELS for regime in REGIME_MODELS}
+    scales = calibration["scales"]
+    if set(scales) != expected_buckets:
+        raise PredictionError("calibration_bundle:bucket_set_invalid")
+    for bucket, bucket_scales in scales.items():
+        if not isinstance(bucket_scales, dict) or set(bucket_scales) != {"channel_bytes", "elapsed_ns"}:
+            raise PredictionError(f"calibration_bundle:bucket_invalid:{bucket}")
+        for metric, scale in bucket_scales.items():
+            if type(scale) not in (int, float) or not math.isfinite(float(scale)) or scale <= 0:
+                raise PredictionError(f"calibration_bundle:scale_invalid:{bucket}:{metric}")
+    return {
+        "bundle": bundle,
+        "bundle_sha256": bundle_facts["sha256"],
+        "manifest_sha256": manifest_facts["sha256"],
+        "scales": scales,
+        "model_id": f"{BASE_MODEL['id']}-cal-{bundle_facts['sha256']}",
+    }
+
+
 def _guid(value: object, label: str) -> str:
     if not isinstance(value, str) or len(value) != 32 or set(value.lower()) - set("0123456789abcdef"):
         raise PredictionError(f"topology:{label}:invalid_guid")
@@ -299,7 +395,8 @@ def _payload_stats(raw: bytes) -> tuple[int, float, float]:
     return size, entropy, transitions / max(1, size - 1)
 
 
-def _predict_curve(raw: bytes, topology: dict[str, object], cell: dict[str, str]) -> list[dict[str, object]]:
+def _predict_curve(raw: bytes, topology: dict[str, object], cell: dict[str, str],
+                   calibration: dict[str, object] | None = None) -> list[dict[str, object]]:
     t = topology["topology"]
     assert isinstance(t, dict)
     c_workers, f_workers = int(t["c_workers"]), int(t["f_workers"])
@@ -307,6 +404,16 @@ def _predict_curve(raw: bytes, topology: dict[str, object], cell: dict[str, str]
     profile_model = PROFILE_MODELS[cell["profile"]]
     regime_model = REGIME_MODELS[cell["regime"]]
     channel_model = CHANNEL_MODELS[t["cache_channel"]]
+    calibrated_model_id = BASE_MODEL["id"]
+    channel_scale = elapsed_scale = 1.0
+    if calibration is not None:
+        scales = calibration["scales"]
+        assert isinstance(scales, dict)
+        bucket = scales[f"{cell['profile']}/{cell['regime']}"]
+        assert isinstance(bucket, dict)
+        channel_scale = float(bucket["channel_bytes"])
+        elapsed_scale = float(bucket["elapsed_ns"])
+        calibrated_model_id = str(calibration["model_id"])
     cumulative_c_to_f = cumulative_f_to_c = cumulative_elapsed = 0
     rows: list[dict[str, object]] = []
     # Live evidence is observed at the translation-unit boundary.  Preserve
@@ -325,9 +432,14 @@ def _predict_curve(raw: bytes, topology: dict[str, object], cell: dict[str, str]
         source_bytes = (max(BASE_MODEL["minimum_frame_bytes"],
                             round(raw_size * ratio)) + profile_model["channel_overhead"] +
                         channel_model["overhead"]) if raw_size else 0
-        result_bytes = (max(BASE_MODEL["minimum_frame_bytes"],
-                            round(raw_size * profile_model["result_fraction"] * regime_model["channel_factor"])) +
-                        channel_model["overhead"]) if raw_size else 0
+        base_result_bytes = (max(BASE_MODEL["minimum_frame_bytes"],
+                                 round(raw_size * profile_model["result_fraction"] * regime_model["channel_factor"])) +
+                             channel_model["overhead"]) if raw_size else 0
+        result_bytes = base_result_bytes
+        if raw_size:
+            # Calibration applies one bucket factor to both channel directions.
+            source_bytes = max(1, round(source_bytes * channel_scale))
+            result_bytes = max(1, round(base_result_bytes * channel_scale))
         compress_ns = (BASE_MODEL["base_compress_ns"] + raw_size * BASE_MODEL["compress_ns_per_byte"] + c_workers - 1) // c_workers
         uplink_rate = (BASE_MODEL["uplink_bytes_per_ns"] * c_workers /
                        (profile_model["uplink_factor"] * channel_model["uplink_factor"]))
@@ -337,7 +449,17 @@ def _predict_curve(raw: bytes, topology: dict[str, object], cell: dict[str, str]
         compile_ns = (compile_work_ns + f_workers - 1) // f_workers
         downlink_rate = (BASE_MODEL["downlink_bytes_per_ns"] * f_workers /
                          (profile_model["downlink_factor"] * channel_model["downlink_factor"]))
-        return_ns = _ceil_ratio(result_bytes, downlink_rate)
+        # The live wait-for-cs comparison window is compile + result return.
+        # Compute that base window before calibration channel scaling leaks into
+        # return time, then apportion one rounded scaled total deterministically.
+        base_return_ns = _ceil_ratio(base_result_bytes, downlink_rate)
+        base_window_ns = compile_ns + base_return_ns
+        scaled_window_ns = max(2, round(base_window_ns * elapsed_scale))
+        scaled_compile_ns = max(1, round(compile_ns * elapsed_scale))
+        if scaled_compile_ns >= scaled_window_ns:
+            scaled_compile_ns = scaled_window_ns - 1
+        compile_ns = scaled_compile_ns
+        return_ns = scaled_window_ns - scaled_compile_ns
         commit_ns = (BASE_MODEL["base_commit_ns"] + f_workers - 1) // f_workers
         startup_ns = regime_model["startup_ns"] if step == 0 else 0
         total_ns = input_ready_ns + compile_ns + return_ns + commit_ns + startup_ns
@@ -351,7 +473,7 @@ def _predict_curve(raw: bytes, topology: dict[str, object], cell: dict[str, str]
             "step": step,
             "tu_id": f"{cell['corpus']}-{cell['regime']}-input-{step:06d}",
             "cell": cell,
-            "model_id": f"{BASE_MODEL['id']}:{cell['corpus']}:{cell['profile']}:{cell['regime']}",
+            "model_id": calibrated_model_id,
             "channel_bytes": {"C_TO_F": source_bytes, "F_TO_C": result_bytes,
                                "total": source_bytes + result_bytes},
             "elapsed_ns": {"startup": startup_ns, "compression": compress_ns,
@@ -382,7 +504,8 @@ def _write_new(path: Path, raw: bytes, label: str) -> None:
         raise PredictionError(f"{label}:output_write_failed:{path}") from exc
 
 
-def predict(manifest_path: Path, out_path: Path, sim_binary: Path | None = None) -> dict[str, object]:
+def predict(manifest_path: Path, out_path: Path, sim_binary: Path | None = None,
+            calibration_bundle: Path | None = None) -> dict[str, object]:
     """Produce a raw cumulative prediction curve and authenticated sidecar.
 
     ``sim_binary`` remains an ignored compatibility argument for callers of
@@ -390,7 +513,8 @@ def predict(manifest_path: Path, out_path: Path, sim_binary: Path | None = None)
     """
     del sim_binary
     manifest, input_raw, input_facts, topology_facts, manifest_sha, topology, cell = load_inputs(manifest_path)
-    rows = _predict_curve(input_raw, topology, cell)
+    calibration = load_calibration_bundle(calibration_bundle) if calibration_bundle is not None else None
+    rows = _predict_curve(input_raw, topology, cell, calibration)
     payload = b"".join(canonical_bytes(row) + b"\n" for row in rows)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     sidecar_path = out_path.with_name(out_path.name + ".manifest.json")
@@ -404,16 +528,27 @@ def predict(manifest_path: Path, out_path: Path, sim_binary: Path | None = None)
         "input": {"path": manifest["input"]["path"], **input_facts},
         "topology_state": {"path": manifest["topology_state"]["path"], **topology_facts},
         "predictor": {
-            "name": "icecream-s8-causal-performance-model", "version": BASE_MODEL["id"],
+            "name": "icecream-s8-causal-performance-model",
+            "version": calibration["model_id"] if calibration is not None else BASE_MODEL["id"],
+            "base_model_id": BASE_MODEL["id"],
             "route_trace_consumed": False, "action_trace_input": False,
             "model_assumptions": {"base": BASE_MODEL, "corpus": CORPUS_MODELS[cell["corpus"]],
                                   "profile": PROFILE_MODELS[cell["profile"]],
                                   "regime": REGIME_MODELS[cell["regime"]]},
+            **({"calibration": {
+                "bundle_sha256": calibration["bundle_sha256"],
+                "bucket": f"{cell['profile']}/{cell['regime']}",
+                "channel_bytes_scale": calibration["scales"][f"{cell['profile']}/{cell['regime']}"]["channel_bytes"],
+                "elapsed_ns_scale": calibration["scales"][f"{cell['profile']}/{cell['regime']}"]["elapsed_ns"],
+                "throughput": "derived_from_calibrated_channel_bytes_and_elapsed_ns",
+            }} if calibration is not None else {}),
             "topology_effects": {"c_workers": "producer compression and uplink share",
                                   "f_workers": "compile, return and commit share",
                                   "cache_channel": "fixed C_TO_F source and F_TO_C result"},
         },
-        "provenance": {"manifest_sha256": manifest_sha, "curve_points": len(rows)},
+        "provenance": {"manifest_sha256": manifest_sha, "curve_points": len(rows),
+                       **({"calibration_bundle_sha256": calibration["bundle_sha256"]}
+                          if calibration is not None else {})},
     }
     _write_new(sidecar_path, canonical_bytes(sidecar) + b"\n", "artifact_manifest")
     return sidecar
@@ -425,9 +560,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", type=Path, required=True)
     # Accepted for source compatibility; the predictor never invokes it.
     parser.add_argument("--sim", type=Path)
+    parser.add_argument("--calibration-manifest", type=Path,
+                        help="authenticated frozen calibration model manifest")
     args = parser.parse_args(argv)
     try:
-        predict(args.manifest.absolute(), args.out.absolute(), args.sim)
+        predict(args.manifest.absolute(), args.out.absolute(), args.sim,
+                args.calibration_manifest.absolute() if args.calibration_manifest else None)
     except PredictionError as exc:
         print(str(exc), file=sys.stderr)
         return 77
