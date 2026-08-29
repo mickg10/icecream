@@ -17,6 +17,34 @@ def read_jsonl(path: Path) -> list[dict[str, object]]:
     return [json.loads(line) for line in path.read_bytes().splitlines()]
 
 
+def write_role_traces(artifacts: Path, rows: list[dict[str, object]]) -> None:
+    for actor in ("C", "F"):
+        (artifacts / f"{actor.lower()}-trace.jsonl").write_text(
+            "".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+                    for row in rows if row["actor"] == actor))
+
+
+def invoke_explicit_runner(artifacts: Path, cell: str, output: Path) -> subprocess.CompletedProcess[str]:
+    root = HERE.parents[1]
+    command = [str(root / "farmharness/s7_warm_replay.py"), "--cell", cell, "--out", str(output)]
+    if cell.endswith("/warm"):
+        command += [
+            "--prewarm-input", str(artifacts / "preprocessed.ii"),
+            "--measured-input", str(artifacts / "preprocessed.ii"),
+            "--prewarm-c-trace", str(artifacts / "prewarm-c-action-trace.jsonl"),
+            "--prewarm-f-trace", str(artifacts / "prewarm-f-action-trace.jsonl"),
+            "--measured-c-trace", str(artifacts / "measured-c-action-trace.jsonl"),
+            "--measured-f-trace", str(artifacts / "measured-f-action-trace.jsonl"),
+        ]
+    else:
+        command += [
+            "--input", str(artifacts / "input.bin"),
+            "--c-trace", str(artifacts / "c-trace.jsonl"),
+            "--f-trace", str(artifacts / "f-trace.jsonl"),
+        ]
+    return subprocess.run(command, text=True, capture_output=True, check=False)
+
+
 def scenario_tree(tmp_path: Path) -> Path:
     tmp_path.mkdir(parents=True)
     payload = b"an authenticated production Protocol-50 input\n"
@@ -236,3 +264,21 @@ def test_warm_deletion_control_reddens_measured_trace(tmp_path: Path) -> None:
         text=True, capture_output=True, check=False)
     assert result.returncode != 0
     assert "measured TU1 action trace differs from product trace" in result.stderr
+
+
+def test_explicit_runner_supports_fmt_and_rocksdb_cold_warm(tmp_path: Path) -> None:
+    cold = scenario_tree(tmp_path / "cold")
+    write_role_traces(cold, read_jsonl(cold / "action_trace.jsonl"))
+    warm = warm_scenario_tree(tmp_path / "warm")
+    for cell, artifacts in (
+        ("fmt/ZSTD_TU/cold", cold),
+        ("fmt/ZSTD_TU/warm", warm),
+        ("RocksDB/ZSTD_TU/cold", cold),
+        ("RocksDB/ZSTD_TU/warm", warm),
+    ):
+        result = invoke_explicit_runner(artifacts, cell, tmp_path / cell.replace("/", "-"))
+        assert result.returncode == 0, f"{cell}: {result.stderr}"
+        manifest = json.loads((tmp_path / cell.replace("/", "-") / "manifest.json").read_text())
+        assert manifest["cell"] == cell
+        assert manifest["schema"] == f"icecream-s7-{cell.split('/')[0].lower()}-zstd-tu-{cell.split('/')[-1]}-conformance-v2"
+        assert manifest["deletion_control"]["returncode"] != 0

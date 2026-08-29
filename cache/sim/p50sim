@@ -14,6 +14,11 @@ from pathlib import Path
 
 MAX_INPUT_BYTES = 64 * 1024 * 1024
 SCENARIO_SCHEMA = "icecream-s7-p50sim-scenario-v1"
+SUPPORTED_CELLS = frozenset(
+    f"{corpus}/ZSTD_TU/{regime}"
+    for corpus in ("fmt", "RocksDB")
+    for regime in ("cold", "warm")
+)
 
 
 def fail(message: str) -> int:
@@ -245,8 +250,7 @@ def main(argv: list[str]) -> int:
             raise ValueError("scenario schema is not supported")
         if scenario.get("cell") != cell:
             raise ValueError("scenario cell does not match the requested cell")
-        parts = cell.split("/")
-        if parts != ["fmt", "ZSTD_TU", "cold"] and parts != ["fmt", "ZSTD_TU", "warm"]:
+        if cell not in SUPPORTED_CELLS:
             # The matrix remains closed: unsupported profiles are an honest HOLD
             # until their production route has an explicit scenario manifest.
             (output / "execution_status.json").write_text(
@@ -341,6 +345,11 @@ def main(argv: list[str]) -> int:
             raise ValueError("deterministic C/F action merge differs from endpoint reducer trace")
         if produced_actions != expected_actions:
             raise ValueError("production replay differs from canonical live action trace")
+        if not warm and isinstance(scenario.get("measured_action_trace"), str):
+            expected_measured = canonical_jsonl(
+                child(artifacts, scenario.get("measured_action_trace")))
+            if produced_actions != expected_measured:
+                raise ValueError("measured action trace differs from product trace")
         if warm:
             for field in ("prewarm_action_trace", "measured_action_trace",
                           "prewarm_c_action_trace", "prewarm_f_action_trace",
