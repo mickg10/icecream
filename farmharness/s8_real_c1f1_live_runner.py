@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import signal
 import shutil
 import subprocess
@@ -40,6 +41,10 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 SAFE = re.compile(r"^[A-Za-z0-9_.-]+$")
 TIMESTAMP = re.compile(r"^\d{8}T\d{6}Z$")
+IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
+PINNED_IMAGE = "icecream/farm-node:ubuntu22-gcc11-boost174"
+DEFAULT_CONTAINER_BIND_ROOT = Path("/tanksmall")
+DEFAULT_CONTAINER_TEMP_ROOT = Path("/tmp")
 
 
 class LiveRunnerError(ValueError):
@@ -409,6 +414,75 @@ def build_command(batch_manifest: Path, profile: str,
     return command
 
 
+def container_image_identity(image: str = PINNED_IMAGE) -> dict[str, str]:
+    """Resolve a mutable image reference once and return its immutable identity."""
+    if not isinstance(image, str) or not image:
+        _fail("container_image:invalid_reference")
+    try:
+        completed = subprocess.run(
+            ["docker", "image", "inspect", image], check=True, capture_output=True,
+            text=True, timeout=30)
+        values = json.loads(completed.stdout)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        raise LiveRunnerError("container_image:inspect_failed") from exc
+    if not isinstance(values, list) or len(values) != 1 or not isinstance(values[0], dict):
+        _fail("container_image:inspect_ambiguous")
+    value = values[0]
+    image_id = value.get("Id")
+    architecture = value.get("Architecture")
+    operating_system = value.get("Os")
+    created = value.get("Created")
+    if (not isinstance(image_id, str) or IMAGE_ID.fullmatch(image_id.lower()) is None or
+            architecture != "amd64" or operating_system != "linux" or
+            not isinstance(created, str) or not created):
+        _fail("container_image:identity_invalid")
+    return {"reference": image, "image_id": image_id.lower(),
+            "architecture": architecture, "os": operating_system, "created": created}
+
+
+def _path_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def build_container_command(inner: list[str], *, image_identity: dict[str, str],
+                            bind_root: Path, work_parent: Path,
+                            required_paths: list[Path]) -> list[str]:
+    """Wrap one product lifecycle in the pinned root-capable build image."""
+    if (set(image_identity) != {"reference", "image_id", "architecture", "os", "created"} or
+            IMAGE_ID.fullmatch(image_identity.get("image_id", "")) is None or
+            image_identity.get("architecture") != "amd64" or
+            image_identity.get("os") != "linux"):
+        _fail("container_image:identity_invalid")
+    bind_root = bind_root.resolve()
+    work_parent = work_parent.resolve()
+    if (not bind_root.is_absolute() or bind_root.is_symlink() or not bind_root.is_dir() or
+            not work_parent.is_absolute() or work_parent.is_symlink() or
+            not work_parent.is_dir() or work_parent.parent != DEFAULT_CONTAINER_TEMP_ROOT or
+            not work_parent.name.startswith("p5.")):
+        _fail("container_mount:invalid_root")
+    if not required_paths or any(not _path_within(path, bind_root)
+                                 for path in required_paths):
+        _fail("container_mount:required_path_outside_read_only_root")
+    if not inner or inner[0] != "env":
+        _fail("container_command:inner_invalid")
+    uid, gid = os.geteuid(), os.getegid()
+    inner_shell = shlex.join(inner)
+    cleanup_shell = ("set +e\n" + inner_shell + "\n"
+                     "product_status=$?\n"
+                     f"chown -R {uid}:{gid} {shlex.quote(str(work_parent))} || exit 70\n"
+                     "exit \"$product_status\"\n")
+    return ["docker", "run", "--rm", "--user", "0", "--network", "host",
+            "--env", "ICECC_TEST_DAEMON_UID=nobody",
+            "--env", "ICECC_TEST_DAEMON_GID=nogroup",
+            "-v", f"{bind_root}:{bind_root}:ro",
+            "-v", f"{work_parent}:{work_parent}:rw",
+            image_identity["image_id"], "/bin/sh", "-lc", cleanup_shell]
+
+
 def _fields(stdout: str, prefix: str) -> list[dict[str, str]]:
     result = []
     for line in stdout.splitlines():
@@ -594,10 +668,21 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
              full_count: int | None = None, passes: int = 2,
              artifact_sample: int = 2, retain_all_artifacts: bool = False,
              launch_identity: dict[str, Any] | None = None,
+             execution_environment: str = "host_product_build",
+             runtime_image: dict[str, str] | None = None,
              timestamp: str | None = None) -> Path:
     """Turn one completed product invocation into two authenticated live curves."""
     if returncode != 0 or "PASS: all-P50 C1F1" not in stdout:
         _fail("product_run:did_not_pass")
+    if execution_environment not in {"host_product_build", "pinned_container_product_build"}:
+        _fail("execution_environment:invalid")
+    if ((execution_environment == "pinned_container_product_build") !=
+            (runtime_image is not None)):
+        _fail("execution_environment:image_binding_invalid")
+    if runtime_image is not None and (
+            set(runtime_image) != {"reference", "image_id", "architecture", "os", "created"} or
+            IMAGE_ID.fullmatch(runtime_image.get("image_id", "")) is None):
+        _fail("execution_environment:image_identity_invalid")
     if corpus not in CORPORA or regime not in REGIMES:
         _fail("cell:undeclared")
     plan, plan_inputs, plan_sha = load_predictive_plan(
@@ -777,7 +862,9 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                                    "sha256": retained_topology_sha,
                                    "bytes": retained_topology_bytes},
                       "runner": {"name": "p50compilee2e-run.sh", "sha256": runner_sha},
-                      "binary_sha256": binaries, "execution_environment": "host_product_build",
+                      "binary_sha256": binaries,
+                      "execution_environment": execution_environment,
+                      "runtime_image": runtime_image,
                       "state_carrying_repeat": passes == 2,
                       "measurement_window": "compile+result_return",
                       "prewarm": prewarm_descriptor,
@@ -834,7 +921,8 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                   "same_service_state": True, "input_manifest_sha256": batch_manifest_sha,
                   "input_digest": input_sha,
                   "topology_sha256": topology_sha, "predictive_plan_sha256": plan_sha,
-                  "execution_environment": "host_product_build",
+                  "execution_environment": execution_environment,
+                  "runtime_image": runtime_image,
                   "binary_sha256": binaries, "source_commit": commit, "source_tree": tree,
                   "runner_sha256": runner_sha,
                   "launch_identity": launch_identity,
@@ -905,6 +993,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--retain-all-artifacts", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--timestamp", help="UTC experiment directory, YYYYMMDDTHHMMSSZ")
+    parser.add_argument("--execution-mode", choices=("pinned-container", "host"),
+                        default="pinned-container")
+    parser.add_argument("--container-image", default=PINNED_IMAGE)
+    parser.add_argument("--container-bind-root", type=Path,
+                        default=DEFAULT_CONTAINER_BIND_ROOT)
     parser.add_argument("--execute", action="store_true", help="execute one real run; intentionally separate from dry-run tests")
     args = parser.parse_args(argv)
     batch_manifest = args.batch_manifest.absolute()
@@ -919,22 +1012,54 @@ def main(argv: list[str] | None = None) -> int:
     rows = load_batch_manifest(batch_manifest, count)
     load_topology(topology, rows)
     run_workdir: Path | None = None
+    run_work_parent: Path | None = None
+    runtime_image: dict[str, str] | None = None
+    execution_environment = "host_product_build"
     if args.execute:
-        run_workdir = Path(tempfile.mkdtemp(prefix="p50compilee2e.", dir=tempfile.gettempdir()))
-        run_workdir.rmdir()
+        if args.execution_mode == "pinned-container":
+            run_work_parent = Path(tempfile.mkdtemp(
+                prefix="p5.", dir=DEFAULT_CONTAINER_TEMP_ROOT))
+            run_work_parent.chmod(0o711)
+            run_workdir = run_work_parent / "p50compilee2e.run"
+            runtime_image = container_image_identity(args.container_image)
+            execution_environment = "pinned_container_product_build"
+        else:
+            run_workdir = Path(tempfile.mkdtemp(
+                prefix="p50compilee2e.", dir=DEFAULT_CONTAINER_TEMP_ROOT))
+            run_workdir.rmdir()
     launch_identity = None
     if args.execute:
         launch_commit, launch_tree, launch_binaries, launch_runner_sha = product_identity(args.product_root.absolute())
         launch_identity = {"source_commit": launch_commit, "source_tree": launch_tree,
                            "binary_sha256": launch_binaries, "runner_sha256": launch_runner_sha}
+        if runtime_image is not None:
+            launch_identity["runtime_image"] = runtime_image
     command = build_command(batch_manifest, args.profile,
                             product_root=args.product_root.absolute(), corpus=args.corpus,
                             regime=args.regime, depth=args.depth, full_count=args.full_count,
                             passes=args.passes, workdir=run_workdir,
                             predictive_plan=predictive_plan)
     if not args.execute:
-        print(json.dumps({"schema": SCHEMA, "status": "DRY_RUN", "command": command}, sort_keys=True))
+        print(json.dumps({"schema": SCHEMA, "status": "DRY_RUN", "command": command,
+                          "execution_mode": args.execution_mode,
+                          "container_image": args.container_image
+                          if args.execution_mode == "pinned-container" else None},
+                         sort_keys=True))
         return 0
+    if args.execution_mode == "pinned-container":
+        assert run_work_parent is not None and runtime_image is not None
+        required_paths = [batch_manifest, predictive_plan, topology,
+                          args.product_root.absolute(), SCRIPT]
+        for row in rows:
+            required_paths.extend((Path(row["source"]),
+                                   Path(row["predictive_input"]["path"])))
+            for field in ("compile_db", "compile_source", "compile_output"):
+                if field in row:
+                    required_paths.append(Path(row[field]))
+        command = build_container_command(
+            command, image_identity=runtime_image,
+            bind_root=args.container_bind_root.absolute(),
+            work_parent=run_work_parent, required_paths=required_paths)
     try:
         timeout = derive_timeout(count, args.passes, args.regime == "warm")
         try:
@@ -952,12 +1077,16 @@ def main(argv: list[str] | None = None) -> int:
                         artifact_sample=args.artifact_sample,
                         retain_all_artifacts=args.retain_all_artifacts,
                         launch_identity=launch_identity,
+                        execution_environment=execution_environment,
+                        runtime_image=runtime_image,
                         timestamp=args.timestamp)
     except LiveRunnerError as exc:
         print(str(exc))
         if run_workdir is not None:
             print(f"workdir={run_workdir}")
         return 77
+    if run_work_parent is not None:
+        run_work_parent.rmdir()
     print(path)
     return 0
 

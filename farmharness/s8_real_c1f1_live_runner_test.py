@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -201,6 +202,54 @@ def test_dry_run_command_targets_real_single_lifecycle_for_all_profiles(tmp_path
 def test_timeout_scales_and_is_capped() -> None:
     assert runner.derive_timeout(100, 1, False) < runner.derive_timeout(100, 2, True)
     assert runner.derive_timeout(100000, 2, True) == runner.MAX_TIMEOUT_SECONDS
+
+
+def test_container_command_uses_resolved_image_and_read_only_product_mount(
+        tmp_path: Path) -> None:
+    bind_root = tmp_path / "tanksmall"
+    product = bind_root / "product"
+    product.mkdir(parents=True)
+    required = product / "batch.jsonl"
+    required.write_text("{}\n")
+    work_parent = Path("/tmp") / f"p5.pytest-{os.getpid()}-{tmp_path.name}"
+    work_parent.mkdir()
+    try:
+        identity = {"reference": runner.PINNED_IMAGE,
+                    "image_id": "sha256:" + "a" * 64,
+                    "architecture": "amd64", "os": "linux",
+                    "created": "2026-08-21T21:11:43Z"}
+        command = runner.build_container_command(
+            ["env", "ICECC_P50_PROFILE=ZSTD_TU", str(product / "run.sh")],
+            image_identity=identity, bind_root=bind_root,
+            work_parent=work_parent, required_paths=[required, product])
+        assert command[:7] == ["docker", "run", "--rm", "--user", "0", "--network", "host"]
+        assert identity["image_id"] in command
+        assert identity["reference"] not in command
+        assert f"{bind_root.resolve()}:{bind_root.resolve()}:ro" in command
+        assert f"{work_parent}:{work_parent}:rw" in command
+        assert "ICECC_TEST_DAEMON_UID=nobody" in command
+        assert "ICECC_TEST_DAEMON_GID=nogroup" in command
+        assert f"chown -R {os.geteuid()}:{os.getegid()}" in command[-1]
+    finally:
+        work_parent.rmdir()
+
+
+def test_container_command_rejects_input_outside_read_only_root(tmp_path: Path) -> None:
+    bind_root = tmp_path / "root"
+    bind_root.mkdir()
+    work_parent = Path("/tmp") / f"p5.pytest-outside-{os.getpid()}-{tmp_path.name}"
+    work_parent.mkdir()
+    identity = {"reference": runner.PINNED_IMAGE,
+                "image_id": "sha256:" + "b" * 64,
+                "architecture": "amd64", "os": "linux",
+                "created": "2026-08-21T21:11:43Z"}
+    try:
+        with pytest.raises(runner.LiveRunnerError, match="required_path_outside"):
+            runner.build_container_command(
+                ["env", "true"], image_identity=identity, bind_root=bind_root,
+                work_parent=work_parent, required_paths=[tmp_path.parent])
+    finally:
+        work_parent.rmdir()
 
 
 def test_topology_requires_exact_tu_identity(tmp_path: Path) -> None:
