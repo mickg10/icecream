@@ -11,15 +11,22 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 
+SUPPORTED_PROFILES = ("ZSTD_TU", "ZSTD_ROUTE", "P29", "GRZ_RESIDUAL")
+# GRZ_RESIDUAL is the S7 name; the product's environment-facing registry calls
+# the same route GRZ.  Keep this translation at the adapter boundary.
+PROFILE_ENV = {"ZSTD_TU": "ZSTD_TU", "ZSTD_ROUTE": "ZSTD_ROUTE",
+               "P29": "P29", "GRZ_RESIDUAL": "GRZ"}
 SUPPORTED_CELLS = frozenset(
-    f"{corpus}/ZSTD_TU/{regime}"
+    f"{corpus}/{profile}/{regime}"
     for corpus in ("fmt", "RocksDB")
+    for profile in SUPPORTED_PROFILES
     for regime in ("cold", "warm")
 )
 
@@ -144,7 +151,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sim", type=Path,
                         default=Path(__file__).resolve().parents[1] / "cache/sim/p50sim")
     args = parser.parse_args(argv)
-    corpus, _profile, regime = args.cell.split("/")
+    corpus, profile, regime = args.cell.split("/")
     warm = regime == "warm"
     warm_names = ("prewarm_input", "measured_input", "prewarm_c_trace", "prewarm_f_trace",
                   "measured_c_trace", "measured_f_trace")
@@ -236,7 +243,10 @@ def main(argv: list[str] | None = None) -> int:
         replay = out / "replay"
         replay_command = [sys.executable, str(sim), "--s7-cell", args.cell,
                           "--s7-artifacts", str(scenario), "--s7-output", str(replay)]
-        result = subprocess.run(replay_command, text=True, capture_output=True, check=False)
+        replay_env = os.environ.copy()
+        replay_env["ICECC_P50_PROFILE"] = PROFILE_ENV[profile]
+        result = subprocess.run(replay_command, text=True, capture_output=True,
+                                check=False, env=replay_env)
         if result.returncode:
             raise ValueError(f"{regime} replay failed: {result.stderr.strip()}")
         shutil.copyfile(replay / "identities.json", out / "identities.json")
@@ -257,16 +267,32 @@ def main(argv: list[str] | None = None) -> int:
         control_command = [sys.executable, str(sim), "--s7-cell", args.cell,
                            "--s7-artifacts", str(control_scenario),
                            "--s7-output", str(out / "control-replay")]
-        control = subprocess.run(control_command, text=True, capture_output=True, check=False)
+        control = subprocess.run(control_command, text=True, capture_output=True,
+                                 check=False, env=replay_env)
         (out / "controls").mkdir()
-        (out / "controls/deletion-measured-trace.log").write_text(
-            f"command={' '.join(control_command)}\nreturncode={control.returncode}\n{control.stderr}")
         if control.returncode == 0:
             raise ValueError("deletion control unexpectedly passed")
+        mutation_scenario = out / "mutation-control-scenario"
+        shutil.copytree(scenario, mutation_scenario)
+        mutated_input = mutation_scenario / "measured.ii"
+        mutated_input.write_bytes(mutated_input.read_bytes() + b"\x00")
+        mutation_command = [sys.executable, str(sim), "--s7-cell", args.cell,
+                            "--s7-artifacts", str(mutation_scenario),
+                            "--s7-output", str(out / "mutation-control-replay")]
+        mutation = subprocess.run(mutation_command, text=True, capture_output=True,
+                                  check=False, env=replay_env)
         (out / "commands.log").write_text(
-            f"replay={' '.join(replay_command)}\ncontrol={' '.join(control_command)}\n")
+            f"replay={' '.join(replay_command)}\n"
+            f"control-deletion={' '.join(control_command)}\n"
+            f"control-mutation={' '.join(mutation_command)}\n")
+        (out / "controls/deletion-measured-trace.log").write_text(
+            f"command={' '.join(control_command)}\nreturncode={control.returncode}\n{control.stderr}")
+        (out / "controls/mutation-measured-input.log").write_text(
+            f"command={' '.join(mutation_command)}\nreturncode={mutation.returncode}\n{mutation.stderr}")
+        if mutation.returncode == 0:
+            raise ValueError("input mutation control unexpectedly passed")
         write_json(out / "manifest.json", {
-            "schema": schema_for_cell(args.cell), "cell": args.cell, "profile": "ZSTD_TU",
+            "schema": schema_for_cell(args.cell), "cell": args.cell, "profile": profile,
             "regime": regime, "status": "PASS", "corpus": corpus,
             "input_sha256": measured_input_sha,
             **({"prewarm_input_sha256": prewarm_input_sha} if warm else {}),
@@ -274,6 +300,7 @@ def main(argv: list[str] | None = None) -> int:
             "prewarm_action_count": len(prewarm), "measured_action_count": len(measured),
             "stage_ledger_count": len(ledger),
             "deletion_control": {"status": "PASS", "returncode": control.returncode},
+            "mutation_control": {"status": "PASS", "returncode": mutation.returncode},
         })
         return 0
     except Hold as error:
