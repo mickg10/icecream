@@ -826,10 +826,31 @@ public:
             source_deadline_msec - now > P50SourceArmedFields::MaxSourceBudgetMsec ||
             fields.c_store_derivation_version != lease.store_derivation_version ||
             !connection_provenance.lease.valid()) {
+            log_warning() << "P50 source arm installation failed: precondition"
+                          << " status=" << static_cast<unsigned>(status)
+                          << " retained=" << p50_source_arm_fields.has_value()
+                          << " fields=" << fields.valid()
+                          << " lease=" << lease.valid()
+                          << " observation=" << (observation != 0)
+                          << " generation=" << (lease.identity.generation != 0)
+                          << " deadline_future=" << (source_deadline_msec > now)
+                          << " budget_bounded="
+                          << (source_deadline_msec > now &&
+                              source_deadline_msec - now <=
+                                  P50SourceArmedFields::MaxSourceBudgetMsec)
+                          << " derivation="
+                          << (fields.c_store_derivation_version ==
+                              lease.store_derivation_version)
+                          << " provenance=" << connection_provenance.lease.valid()
+                          << endl;
             return false;
         }
 
         if (!p50_input_wait.arm_input(fields)) {
+            log_warning() << "P50 source arm installation failed: input wait"
+                          << " state="
+                          << static_cast<unsigned>(p50_input_wait.state())
+                          << " fields=" << fields.valid() << endl;
             return false;
         }
 
@@ -837,6 +858,8 @@ public:
         ClaimAttemptCapability128 attempt_capability_2;
         if (!fresh_claim_attempt_capabilities(attempt_capability_1,
                                               attempt_capability_2)) {
+            log_warning() << "P50 source arm installation failed: capability allocation"
+                          << endl;
             p50_input_wait.close();
             return false;
         }
@@ -855,6 +878,8 @@ public:
 
         const uint64_t remaining = source_deadline_msec - monotonic_msec();
         if (remaining == 0 || remaining > P50SourceArmedFields::MaxSourceBudgetMsec) {
+            log_warning() << "P50 source arm installation failed: expired budget"
+                          << " remaining_msec=" << remaining << endl;
             p50_input_wait.close();
             return false;
         }
@@ -865,7 +890,23 @@ public:
             static_cast<uint32_t>(remaining), attempt_capability_1,
             attempt_capability_2);
         p50_source_armed_ack = acknowledgement;
-        if (!channel || !channel->send_msg(acknowledgement)) {
+        if (!channel) {
+            log_warning() << "P50 source arm installation failed: missing channel"
+                          << endl;
+            p50_input_wait.close();
+            return false;
+        }
+        if (!acknowledgement.valid_payload()) {
+            log_warning() << "P50 source arm installation failed: invalid acknowledgement"
+                          << " store_generation="
+                          << (p50_source_f_store_generation != 0)
+                          << " budget_msec=" << remaining << endl;
+            p50_input_wait.close();
+            return false;
+        }
+        if (!channel->send_msg(acknowledgement)) {
+            log_warning() << "P50 source arm installation failed: acknowledgement send"
+                          << " protocol=" << channel->protocol << endl;
             p50_input_wait.close();
             return false;
         }
