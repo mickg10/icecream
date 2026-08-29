@@ -49,6 +49,14 @@ CORPORA = {
     },
 }
 PROFILES = ("ZSTD_TU", "ZSTD_ROUTE", "P29", "GRZ_RESIDUAL")
+REGIMES = ("cold", "warm")
+PRODUCT_BINARIES = (
+    Path("daemon/iceccd"), Path("scheduler/icecc-scheduler"),
+    Path("client/icecc"), Path("cache/icecc-cache-service"),
+)
+PRODUCT_CONFIG = Path("config.h")
+PRODUCT_CACHE_MAKEFILE = Path("cache/Makefile")
+LIBBSC_DEFINE = "#define ICECC_P50_WITH_LIBBSC 1"
 MAX_FILE_BYTES = 512 * 1024 * 1024
 
 
@@ -267,7 +275,114 @@ def _runner_contract(repo: Path) -> dict[str, Any]:
     }
 
 
-def preflight(root: Path = DEFAULT_ROOT, repo: Path | None = None) -> dict[str, Any]:
+def _product_build_contract(product_build: Path, repo: Path,
+                            runner: dict[str, Any]) -> dict[str, Any]:
+    """Authenticate one already-built product without executing it."""
+    build = product_build.resolve()
+    try:
+        info = product_build.lstat()
+    except OSError as exc:
+        raise PreflightError(f"product_build:unavailable:{product_build}") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise PreflightError(f"product_build:not_private_directory:{product_build}")
+
+    binaries: dict[str, Any] = {}
+    for relative in PRODUCT_BINARIES:
+        path = build / relative
+        facts = _sha256(path, f"product_build.binary:{relative}")
+        try:
+            mode = path.stat().st_mode
+        except OSError as exc:
+            raise PreflightError(f"product_build.binary:stat_failed:{relative}") from exc
+        if not mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
+            raise PreflightError(f"product_build.binary:not_executable:{relative}")
+        binaries[str(relative)] = {"relative": str(relative), **facts}
+
+    config_path = build / PRODUCT_CONFIG
+    config_facts = _sha256(config_path, "product_build.config_h")
+    try:
+        config_lines = config_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise PreflightError("product_build.config_h:unreadable") from exc
+    if config_lines.count(LIBBSC_DEFINE) != 1:
+        raise PreflightError("product_build.grz_config:libbsc_define_missing_or_ambiguous")
+
+    makefile_path = build / PRODUCT_CACHE_MAKEFILE
+    makefile_facts = _sha256(makefile_path, "product_build.cache_makefile")
+    try:
+        makefile_lines = makefile_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise PreflightError("product_build.cache_makefile:unreadable") from exc
+    cflags = [line.strip() for line in makefile_lines
+              if line.startswith("LIBBSC_CFLAGS =")]
+    libs = [line.strip() for line in makefile_lines
+            if line.startswith("LIBBSC_LIBS =")]
+    if (len(cflags) != 1 or "ICECC_P50_WITH_LIBBSC" not in cflags[0] or
+            len(libs) != 1 or not ("libbsc.a" in libs[0] or "-lbsc" in libs[0])):
+        raise PreflightError("product_build.grz_config:libbsc_make_inputs_invalid")
+
+    if (runner.get("contract_check") != "PASS" or
+            runner.get("profiles") != list(PROFILES) or
+            runner.get("warm_values") != [0, 1]):
+        raise PreflightError("product_build.runner_compatibility_invalid")
+    runner_sha = runner.get("sha256")
+    source_contract = runner.get("source_contract")
+    if (not isinstance(runner_sha, str) or len(runner_sha) != 64 or
+            not isinstance(source_contract, dict) or
+            not isinstance(source_contract.get("sha256"), str) or
+            len(source_contract["sha256"]) != 64):
+        raise PreflightError("product_build.runner_binding_invalid")
+
+    return {
+        "status": "READY", "path": str(build),
+        "git": _git_identity(repo),
+        "required_binaries": binaries,
+        "config_h": {"relative": str(PRODUCT_CONFIG), **config_facts},
+        "cache_makefile": {"relative": str(PRODUCT_CACHE_MAKEFILE), **makefile_facts},
+        "grz": {
+            "config_define": LIBBSC_DEFINE,
+            "cflags_line": cflags[0], "libs_line": libs[0],
+        },
+        "runner_compatibility": {
+            "runner_sha256": runner_sha,
+            "source_contract_sha256": source_contract["sha256"],
+            "profiles": list(PROFILES), "warm_values": [0, 1],
+            "contract_check": "PASS",
+        },
+    }
+
+
+def _ready_cell_commands(repo: Path, runner: dict[str, Any],
+                         corpora: dict[str, Any], product_build: dict[str, Any]
+                         ) -> list[dict[str, Any]]:
+    """Render deterministic argv and shell forms for every held-out cell."""
+    commands: list[dict[str, Any]] = []
+    for corpus in CORPORA:
+        row = corpora[corpus]
+        for profile in PROFILES:
+            for regime in REGIMES:
+                warm = 1 if regime == "warm" else 0
+                argv = [
+                    "env",
+                    f"ICECC_TEST_TOP_SRCDIR={repo}",
+                    f"ICECC_TEST_TOP_BUILDDIR={product_build['path']}",
+                    f"ICECC_P50_PROFILE={profile}",
+                    f"ICECC_P50_C1F1_WARM={warm}",
+                    f"ICECC_P50_C1F1_SOURCE_ROOT={row['corpus_root']}",
+                    f"ICECC_P50_C1F1_SOURCE_RELATIVE={row['representative_ii']['relative']}",
+                    f"ICECC_P50_C1F1_COMPILE_DB={row['compile_database']['file']['path']}",
+                    f"ICECC_P50_C1F1_COMPILE_SOURCE={row['compile_database']['source']}",
+                    runner["path"],
+                ]
+                commands.append({
+                    "cell": {"corpus": corpus, "profile": profile, "regime": regime},
+                    "argv": argv, "command": shlex.join(argv),
+                })
+    return commands
+
+
+def preflight(root: Path = DEFAULT_ROOT, repo: Path | None = None,
+              product_build: Path | None = None) -> dict[str, Any]:
     """Return a deterministic, authenticated held-out readiness manifest."""
     root = root.resolve()
     repo = (repo or Path(__file__).resolve().parents[1]).resolve()
@@ -315,7 +430,7 @@ def preflight(root: Path = DEFAULT_ROOT, repo: Path | None = None) -> dict[str, 
     runner = _runner_contract(repo)
     for corpus, row in corpora.items():
         source_root = Path(row["source_root"])
-        compile_source = Path(row["compile_database"]["source"]).relative_to(source_root)
+        compile_source = Path(row["compile_database"]["source"]).resolve()
         row["runner_template"] = (
             f"ICECC_TEST_TOP_SRCDIR={repo} ICECC_TEST_TOP_BUILDDIR=$PRODUCT_BUILD "
             f"ICECC_P50_PROFILE=$PROFILE ICECC_P50_C1F1_WARM=$WARM "
@@ -324,13 +439,18 @@ def preflight(root: Path = DEFAULT_ROOT, repo: Path | None = None) -> dict[str, 
             f"ICECC_P50_C1F1_COMPILE_DB={row['compile_database']['file']['path']} "
             f"ICECC_P50_C1F1_COMPILE_SOURCE={compile_source} {runner['path']}"
         )
-    runner["product_build"] = {
-        "status": "NOT_CHECKED",
-        "required_for_runtime": True,
-        "required_binaries": ["daemon/iceccd", "scheduler/icecc-scheduler",
-                               "client/icecc", "cache/icecc-cache-service"],
-        "grz_requirement": "config.h ICECC_P50_WITH_LIBBSC and cache/Makefile libbsc inputs",
-    }
+    if product_build is None:
+        runner["product_build"] = {
+            "status": "NOT_CHECKED",
+            "required_for_runtime": True,
+            "required_binaries": [str(path) for path in PRODUCT_BINARIES],
+            "grz_requirement": "config.h ICECC_P50_WITH_LIBBSC and cache/Makefile libbsc inputs",
+        }
+    else:
+        binding = _product_build_contract(product_build, repo, runner)
+        binding["ready_cell_commands"] = _ready_cell_commands(
+            repo, runner, corpora, binding)
+        runner["product_build"] = binding
     return {"schema": SCHEMA, "status": "PASS", "root": str(root),
             "corpora": corpora, "runner": runner}
 
@@ -349,10 +469,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument("--product-build", type=Path,
+                        help="optional existing product build to authenticate")
     parser.add_argument("--out", type=Path)
     args = parser.parse_args(argv)
     try:
-        value = preflight(args.root, args.repo)
+        value = preflight(args.root, args.repo, args.product_build)
         raw = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
         if args.out:
             _write_new(args.out.absolute(), raw)

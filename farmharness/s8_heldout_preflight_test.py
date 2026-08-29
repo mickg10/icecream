@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from pathlib import Path
 
 import pytest
@@ -37,6 +38,20 @@ def _fixture(root: Path) -> None:
         }]) + "\n")
 
 
+def _product_build(root: Path) -> Path:
+    build = root / "product-build"
+    for relative in preflight.PRODUCT_BINARIES:
+        path = build / relative
+        _write(path, (str(relative) + "\n").encode())
+        path.chmod(0o755)
+    _write(build / preflight.PRODUCT_CONFIG,
+           "#define ICECC_P50_WITH_LIBBSC 1\n")
+    _write(build / preflight.PRODUCT_CACHE_MAKEFILE,
+           "LIBBSC_CFLAGS = -DICECC_P50_WITH_LIBBSC\n"
+           "LIBBSC_LIBS = /opt/libbsc.a\n")
+    return build
+
+
 def test_preflight_binds_both_corpora_and_repeated_matrix_cells(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -53,6 +68,7 @@ def test_preflight_binds_both_corpora_and_repeated_matrix_cells(
         "llvm/lib/Analysis/AliasAnalysis.cpp")
     assert value["runner"]["profiles"] == ["ZSTD_TU", "ZSTD_ROUTE", "P29", "GRZ_RESIDUAL"]
     assert value["runner"]["warm_values"] == [0, 1]
+    assert Path(value["corpora"]["DuckDB"]["compile_database"]["source"]).is_absolute()
 
 
 def test_preflight_rejects_matrix_with_wrong_repeat_factor(tmp_path: Path) -> None:
@@ -76,3 +92,81 @@ def test_cli_is_read_only_without_output_path(tmp_path: Path,
     output = json.loads(capsys.readouterr().out)
     assert output["schema"] == preflight.SCHEMA
     assert not list(tmp_path.glob("*.json"))
+
+
+def test_product_build_binding_is_authenticated_and_renders_all_cells(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fixture(tmp_path)
+    build = _product_build(tmp_path)
+    monkeypatch.setattr(preflight, "_git_identity",
+                        lambda root: {"commit": "a" * 40, "tree": "b" * 40})
+    repo = Path(__file__).resolve().parents[1]
+    value = preflight.preflight(tmp_path, repo, build)
+    repeat = preflight.preflight(tmp_path, repo, build)
+    assert value == repeat
+    binding = value["runner"]["product_build"]
+    assert binding["status"] == "READY"
+    assert set(binding["required_binaries"]) == {
+        str(path) for path in preflight.PRODUCT_BINARIES
+    }
+    assert binding["git"] == {"commit": "a" * 40, "tree": "b" * 40}
+    commands = binding["ready_cell_commands"]
+    assert len(commands) == 16
+    assert len({tuple(item["cell"].values()) for item in commands}) == 16
+    for item in commands:
+        assert item["command"] == shlex.join(item["argv"])
+        assert "$" not in item["command"]
+        assert item["argv"][-1] == str(repo / preflight.RUNNER)
+        compile_source = value["corpora"][item["cell"]["corpus"]][
+            "compile_database"]["source"]
+        compile_arg = f"ICECC_P50_C1F1_COMPILE_SOURCE={compile_source}"
+        assert compile_arg in item["argv"]
+        assert Path(compile_source).is_absolute()
+
+
+def test_product_build_binding_rejects_missing_binary_and_bad_grz_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fixture(tmp_path)
+    build = _product_build(tmp_path)
+    monkeypatch.setattr(preflight, "_git_identity",
+                        lambda root: {"commit": "a" * 40, "tree": "b" * 40})
+    (build / preflight.PRODUCT_BINARIES[0]).unlink()
+    with pytest.raises(preflight.PreflightError, match="product_build.binary:.*unavailable"):
+        preflight.preflight(tmp_path, Path(__file__).resolve().parents[1], build)
+
+    bad_root = tmp_path / "bad-grz"
+    _fixture(bad_root)
+    build = _product_build(bad_root)
+    (build / preflight.PRODUCT_CONFIG).write_text("/* no GRZ */\n", encoding="utf-8")
+    with pytest.raises(preflight.PreflightError, match="libbsc_define_missing"):
+        preflight.preflight(bad_root, Path(__file__).resolve().parents[1], build)
+
+    bad_make_root = tmp_path / "bad-make"
+    _fixture(bad_make_root)
+    build = _product_build(bad_make_root)
+    (build / preflight.PRODUCT_CACHE_MAKEFILE).write_text(
+        "LIBBSC_CFLAGS =\nLIBBSC_LIBS =\n", encoding="utf-8")
+    with pytest.raises(preflight.PreflightError, match="libbsc_make_inputs_invalid"):
+        preflight.preflight(bad_make_root, Path(__file__).resolve().parents[1], build)
+
+
+def test_product_build_binding_rejects_incompatible_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fixture(tmp_path)
+    build = _product_build(tmp_path)
+    monkeypatch.setattr(preflight, "_git_identity",
+                        lambda root: {"commit": "a" * 40, "tree": "b" * 40})
+    runner = {
+        "path": str(Path(__file__).resolve().parents[1] / preflight.RUNNER),
+        "sha256": "c" * 64,
+        "source_contract": {"sha256": "d" * 64},
+        "profiles": ["ZSTD_TU"], "warm_values": [0, 1],
+        "contract_check": "PASS",
+    }
+    monkeypatch.setattr(preflight, "_runner_contract", lambda repo: runner)
+    with pytest.raises(preflight.PreflightError,
+                       match="product_build.runner_compatibility_invalid"):
+        preflight.preflight(tmp_path, Path(__file__).resolve().parents[1], build)
