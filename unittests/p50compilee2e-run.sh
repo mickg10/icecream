@@ -67,12 +67,12 @@ chmod 0711 "$work"
 : >"$work/scheduler.log"
 chmod 0666 "$work/scheduler.log"
 cleanup() {
-    for pid in "${service_pid:-}" "${client_pid:-}" "${worker_pid:-}" "${sched_pid:-}"; do
+    for pid in "${service_pid:-}" "${client_service_pid:-}" "${client_pid:-}" "${worker_pid:-}" "${sched_pid:-}"; do
         test -n "$pid" && kill "$pid" 2>/dev/null || :
     done
     for _ in $(seq 1 50); do
         live=0
-        for pid in "${service_pid:-}" "${client_pid:-}" "${worker_pid:-}" "${sched_pid:-}"; do
+        for pid in "${service_pid:-}" "${client_service_pid:-}" "${client_pid:-}" "${worker_pid:-}" "${sched_pid:-}"; do
             if test -n "$pid" && kill -0 "$pid" 2>/dev/null; then
                 live=1
             fi
@@ -80,7 +80,7 @@ cleanup() {
         test "$live" -eq 0 && break
         sleep 0.1
     done
-    for pid in "${service_pid:-}" "${client_pid:-}" "${worker_pid:-}" "${sched_pid:-}"; do
+    for pid in "${service_pid:-}" "${client_service_pid:-}" "${client_pid:-}" "${worker_pid:-}" "${sched_pid:-}"; do
         test -n "$pid" && kill -9 "$pid" 2>/dev/null || :
     done
     for pid in "${client_pid:-}" "${worker_pid:-}" "${sched_pid:-}"; do
