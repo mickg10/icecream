@@ -665,6 +665,7 @@ compile_once() {
     item_compile_output=${5:-}
     relationship=${6:-0}
     f_slot=${7:-0}
+    timing_path=${8:-}
     preferred_host=p50-f
     if test "$suite" = C1F20/40; then
         preferred_host="p50-f-$relationship"
@@ -686,6 +687,9 @@ compile_once() {
     fi
     preprocessed_capture="$work/s7-$label-preprocessed.ii"
     compile_start_ns=$(date +%s%N)
+    if test -n "$timing_path"; then
+        printf '%s\n' "$compile_start_ns" >"$timing_path"
+    fi
     if test -n "$item_compile_db"; then
         # eval is needed to turn the safely shlex-quoted database tokens back
         # into argv. Export first: assignments before the special builtin
@@ -712,6 +716,9 @@ compile_once() {
             $compile_include_args "$input_path" -o "$remote_obj"
     fi
     compile_end_ns=$(date +%s%N)
+    if test -n "$timing_path"; then
+        printf '%s\n' "$compile_end_ns" >>"$timing_path"
+    fi
     if test -n "$item_compile_db"; then
         eval "g++ $local_compile_args" <"$input_path"
     else
@@ -769,13 +776,15 @@ if test -n "$batch_manifest"; then
         item_compile_output=$9
         payload_sha=${10}
         payload_bytes=${11}
+        timing_path="$work/timing-$run_label-$ordinal.tsv"
         staged="$work/src/$run_label-$ordinal.ii"
         marker="$work/active/$run_label-$relationship-$f_slot"
         input_ready_marker="$work/input-ready/$run_label-$relationship-$ordinal"
         trap 'rm -f "$marker"' EXIT HUP INT TERM
         cp -- "$predictive_path" "$staged"
         compile_once "$run_label-$ordinal" "$staged" "$item_compile_db" \
-            "$item_compile_source" "$item_compile_output" "$relationship" "$f_slot" &
+            "$item_compile_source" "$item_compile_output" "$relationship" "$f_slot" \
+            "$timing_path" &
         compile_pid=$!
         preprocessed_capture="$work/s7-$run_label-$ordinal-preprocessed.ii"
         # ICECC_P50_PREPROCESSED_CAPTURE is written immediately before the
@@ -802,6 +811,16 @@ if test -n "$batch_manifest"; then
         done
         : >"$input_ready_marker"
         wait "$compile_pid"
+        test -s "$timing_path" || {
+            echo "FAIL: compile timing handoff is missing ($run_label-$ordinal)" >&2
+            return 1
+        }
+        compile_start_ns=$(sed -n '1p' "$timing_path")
+        compile_end_ns=$(sed -n '2p' "$timing_path")
+        test -n "$compile_start_ns" && test -n "$compile_end_ns" || {
+            echo "FAIL: compile timing handoff is incomplete ($run_label-$ordinal)" >&2
+            return 1
+        }
         remote_obj="$work/out/remote-$run_label-$ordinal.o"
         local_obj="$work/out/local-$run_label-$ordinal.o"
         remote_sha=$(sha256sum "$remote_obj" | awk '{print $1}')
