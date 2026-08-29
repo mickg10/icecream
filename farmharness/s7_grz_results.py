@@ -122,13 +122,35 @@ def parse_binary(value: str) -> tuple[str, Path]:
     return name, Path(path)
 
 
-def _tx_begin(path: Path, actor: str) -> tuple[dict[str, Any], bytes, str]:
-    raw, sha = snapshot(path, f"{actor.lower()}_trace")
-    rows = jsonl(raw, f"{actor.lower()}_trace")
+def _tx_begin_rows(rows: list[dict[str, Any]], actor: str, label: str) -> dict[str, Any]:
     matches = [row for row in rows if row.get("action") == "TX_BEGIN" and row.get("actor") == actor]
     if len(matches) != 1:
-        raise ResultsError(f"{actor.lower()}_trace:tx_begin_count={len(matches)}")
-    return matches[0], raw, sha
+        raise ResultsError(f"{label}:tx_begin_count={len(matches)}")
+    return matches[0]
+
+
+def _tx_begin(path: Path, actor: str) -> tuple[dict[str, Any], bytes, str]:
+    raw, sha = snapshot(path, f"{actor.lower()}_trace")
+    begin = _tx_begin_rows(jsonl(raw, f"{actor.lower()}_trace"), actor,
+                           f"{actor.lower()}_trace")
+    return begin, raw, sha
+
+
+def _stage_begin(stage_rows: list[dict[str, Any]], trace_begin: dict[str, Any],
+                 actor: str, label: str) -> dict[str, Any]:
+    """Bind one trace TX_BEGIN to exactly one stage-ledger TX_BEGIN.
+
+    Warm replays contain both prewarm and measured transactions.  Since the
+    combined ledger has no TU sequence, join on the transaction identity and
+    reject duplicate matches rather than selecting by row count.
+    """
+    fields = ("transaction_digest", "raw_digest", "stage_bytes")
+    matches = [row for row in stage_rows
+               if row.get("action") == "TX_BEGIN" and row.get("actor") == actor
+               and all(row.get(field) == trace_begin.get(field) for field in fields)]
+    if len(matches) != 1:
+        raise ResultsError(f"stage_ledger:{label}_match_count={len(matches)}")
+    return matches[0]
 
 
 def _inside(path: Path, root: Path, label: str) -> str:
@@ -210,14 +232,20 @@ def build(*, experiment: Path, runtime: Path, replay: Path, corpus: str,
     if c_begin.get("stage_bytes", 0) <= 0 or not isinstance(c_begin.get("stage_bytes"), int):
         raise ResultsError("traces:stage_bytes_invalid")
     stage_rows = jsonl(stage_raw, "stage_ledger")
-    stage_begins = [row for row in stage_rows if row.get("action") == "TX_BEGIN" and row.get("actor") == "C"]
-    if len(stage_begins) != 1 or stage_begins[0].get("stage_bytes") != c_begin["stage_bytes"]:
-        raise ResultsError("stage_ledger:stage_bytes_mismatch")
+    _stage_begin(stage_rows, c_begin, "C", "measured_c")
+    _stage_begin(stage_rows, f_begin, "F", "measured_f")
     input_sha = digest(input_sha, "input_sha256")
     if replay_manifest.get("status") != "PASS" or replay_manifest.get("cell") != cell_label:
         raise ResultsError("replay_manifest:acceptance_mismatch")
     if replay_manifest.get("input_sha256", replay_manifest.get("measured_input_sha256")) != input_sha:
         raise ResultsError("replay_manifest:input_mismatch")
+    manifest_identity = replay_manifest.get("identity")
+    if (not isinstance(manifest_identity, dict) or
+            manifest_identity.get("c_store_guid") != c_begin.get("c_store_guid") or
+            manifest_identity.get("f_store_guid") != c_begin.get("f_store_guid") or
+            manifest_identity.get("history_nonce") != c_begin.get("history_nonce") or
+            manifest_identity.get("measured_tu_seq") != c_begin.get("tu_seq")):
+        raise ResultsError("replay_manifest:identity_mismatch")
     if replay_manifest.get("deletion_control", {}).get("status") != "PASS" or replay_manifest.get("mutation_control", {}).get("status") != "PASS":
         raise ResultsError("replay_manifest:controls_not_pass")
     c_guid, f_guid = c_begin.get("c_store_guid"), c_begin.get("f_store_guid")
@@ -240,18 +268,34 @@ def build(*, experiment: Path, runtime: Path, replay: Path, corpus: str,
     elapsed_ns, f_to_c = int(waits[0]) * 1_000_000, int(returned[0])
     if elapsed_ns <= 0 or f_to_c <= 0:
         raise ResultsError("client_log:wire_or_wait_observation_invalid")
+    runtime_relative = _inside(runtime, experiment, "runtime")
+    source_relative = _evidence_path(source_file, source_repository)
     prewarm_descriptors: dict[str, object] = {}
     prewarm_count = 0
     if regime == "warm":
         if not all((prewarm_input, prewarm_c_trace, prewarm_f_trace)):
             raise ResultsError("warm:prewarm_evidence_required")
+        prewarm_raws: dict[str, bytes] = {}
         for label, path in (("prewarm_input", prewarm_input), ("prewarm_c_trace", prewarm_c_trace), ("prewarm_f_trace", prewarm_f_trace)):
             raw, _ = snapshot(Path(path), label)
+            prewarm_raws[label] = raw
             prewarm_descriptors[label] = descriptor(Path(path), raw, _inside(Path(path), replay.parent, label))
-        prewarm_c_rows = jsonl(Path(prewarm_c_trace).read_bytes(), "prewarm_c_trace")
-        prewarm_f_rows = jsonl(Path(prewarm_f_trace).read_bytes(), "prewarm_f_trace")
+        if replay_manifest.get("prewarm_input_sha256") != hashlib.sha256(prewarm_raws["prewarm_input"]).hexdigest():
+            raise ResultsError("warm:prewarm_input_mismatch")
+        if replay_manifest.get("identity", {}).get("prewarm_tu_seq") != 0:
+            raise ResultsError("warm:prewarm_manifest_identity_invalid")
+        prewarm_c_rows = jsonl(prewarm_raws["prewarm_c_trace"], "prewarm_c_trace")
+        prewarm_f_rows = jsonl(prewarm_raws["prewarm_f_trace"], "prewarm_f_trace")
+        prewarm_c_begin = _tx_begin_rows(prewarm_c_rows, "C", "prewarm_c_trace")
+        prewarm_f_begin = _tx_begin_rows(prewarm_f_rows, "F", "prewarm_f_trace")
+        if any(prewarm_c_begin.get(field) != prewarm_f_begin.get(field) for field in joined):
+            raise ResultsError("warm:prewarm_trace_identity_mismatch")
+        if prewarm_c_begin.get("tu_seq") != 0 or prewarm_f_begin.get("tu_seq") != 0:
+            raise ResultsError("warm:prewarm_identity_invalid")
+        _stage_begin(stage_rows, prewarm_c_begin, "C", "prewarm_c")
+        _stage_begin(stage_rows, prewarm_f_begin, "F", "prewarm_f")
         prewarm_count = sum(row.get("action") == "TX_BEGIN" for row in prewarm_c_rows + prewarm_f_rows)
-        if prewarm_count != 2 or not any(row.get("tu_seq") == 0 for row in prewarm_c_rows + prewarm_f_rows):
+        if prewarm_count != 2:
             raise ResultsError("warm:prewarm_identity_invalid")
     cell = f"{corpus}/{PROFILE}/{regime}"
     descriptors = {
@@ -276,10 +320,10 @@ def build(*, experiment: Path, runtime: Path, replay: Path, corpus: str,
     row = {
         "schema": SCHEMA, "cell": cell, "corpus": corpus, "profile": PROFILE, "regime": regime,
         "status": "PASS", "live_status": "PASS", "acceptance_status": "PASS", "conformance_status": "PASS",
-        "run_id": experiment.name, "runtime": _inside(runtime, experiment, "runtime"),
+        "run_id": experiment.name, "runtime": runtime_relative,
         "live_source_commit": source_commit, "replay_source_commit": source_commit,
         "replay_source_tree": source_tree,
-        "source": {"relative": source_file.name, "sha256": source_sha, "bytes": len(source_raw)},
+        "source": {"relative": source_relative, "sha256": source_sha, "bytes": len(source_raw)},
         "binary_sha256": binary_hashes,
         "measured": {"input_sha256": input_sha, "tu_seq": c_begin["tu_seq"],
                      "source_transfer_bytes": int(c_begin["stage_bytes"]),
@@ -302,6 +346,14 @@ def build(*, experiment: Path, runtime: Path, replay: Path, corpus: str,
     }
     out.parent.mkdir(parents=True, exist_ok=True)
     out.mkdir()
+    # s8_retained_s7_package resolves results.runtime inside this normalized
+    # directory. Preserve that explicit path with the authenticated log.
+    runtime_log = out / runtime_relative / "client-compile-measured.log"
+    runtime_log.parent.mkdir(parents=True, exist_ok=True)
+    with runtime_log.open("xb") as stream:
+        stream.write(client_raw)
+        stream.flush()
+        os.fsync(stream.fileno())
     result_path = out / "results.jsonl"
     result_raw = canonical(row) + b"\n"
     with result_path.open("xb") as stream:

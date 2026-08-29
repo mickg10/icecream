@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from s7_grz_results import ResultsError, build, canonical
+from s8_retained_s7_package import build as build_package
 
 
 def _git_repo(root: Path) -> tuple[Path, str]:
@@ -51,7 +52,15 @@ def _fixture(root: Path, regime: str = "cold") -> dict[str, object]:
              "raw_digest": "4" * 32, "stage_bytes": 123}
     c_raw = _write(replay / "measured-c-action-trace.jsonl", {**begin, "actor": "C"})
     f_raw = _write(replay / "measured-f-action-trace.jsonl", {**begin, "actor": "F"})
-    stage_raw = _write(replay / "stage-ledger.jsonl", {"action": "TX_BEGIN", "actor": "C", "stage_bytes": 123})
+    stage_rows = [{"action": "TX_BEGIN", "actor": actor, "stage_bytes": 123,
+                   "transaction_digest": "3" * 32, "raw_digest": "4" * 32}
+                  for actor in ("C", "F")]
+    if regime == "warm":
+        stage_rows.extend({"action": "TX_BEGIN", "actor": actor, "stage_bytes": 99,
+                           "transaction_digest": "5" * 32, "raw_digest": "6" * 32}
+                          for actor in ("C", "F"))
+    stage_raw = b"".join(canonical(row) + b"\n" for row in stage_rows)
+    (replay / "stage-ledger.jsonl").write_bytes(stage_raw)
     identity_raw = _write(replay / "identities.json", ident)
     manifest = {"schema": f"icecream-s7-fmt-grz-residual-{regime}-conformance-v2",
                 "cell": f"fmt/GRZ_RESIDUAL/{regime}", "status": "PASS",
@@ -61,6 +70,9 @@ def _fixture(root: Path, regime: str = "cold") -> dict[str, object]:
                 "action_count": 11 if regime == "cold" else 21,
                 "measured_action_count": 11 if regime == "cold" else 10,
                 "prewarm_action_count": 0 if regime == "cold" else 11}
+    if regime == "warm":
+        manifest["prewarm_input_sha256"] = hashlib.sha256(b"prewarm input\n").hexdigest()
+        manifest["identity"]["prewarm_tu_seq"] = 0
     manifest_raw = _write(replay / "manifest.json", manifest)
     controls = replay / "controls"
     _write(controls / "deletion-measured-trace.log", {"status": "PASS"})
@@ -76,7 +88,8 @@ def _fixture(root: Path, regime: str = "cold") -> dict[str, object]:
     if regime == "warm":
         prewarm_raw = b"prewarm input\n"
         (replay / "prewarm.ii").write_bytes(prewarm_raw)
-        pre_begin = {**begin, "tu_seq": 0}
+        pre_begin = {**begin, "tu_seq": 0, "transaction_digest": "5" * 32,
+                     "raw_digest": "6" * 32, "stage_bytes": 99}
         _write(replay / "prewarm-c-action-trace.jsonl", {**pre_begin, "actor": "C"})
         _write(replay / "prewarm-f-action-trace.jsonl", {**pre_begin, "actor": "F"})
     return {"experiment": experiment, "runtime": runtime, "replay": replay,
@@ -132,3 +145,30 @@ def test_warm_without_prewarm_is_rejected(tmp_path: Path) -> None:
               source_commit=f["commit"], source_file=f["source"], build_root=f["build"],
               local_object=f["runtime"] / "local.o", remote_object=f["runtime"] / "remote.o",
               binaries=f["binaries"], out=tmp_path / "out")
+
+
+def test_duplicate_stage_transaction_match_is_rejected(tmp_path: Path) -> None:
+    f = _fixture(tmp_path, "warm")
+    stage = f["replay"] / "stage-ledger.jsonl"
+    original = stage.read_bytes()
+    stage.write_bytes(original.rstrip(b"\n") + b"\n" + original.splitlines()[0] + b"\n")
+    with pytest.raises(ResultsError, match="stage_ledger:measured_c_match_count=2"):
+        build(experiment=f["experiment"], runtime=f["runtime"], replay=f["replay"],
+              corpus="fmt", regime="warm", source_repository=f["repo"],
+              source_commit=f["commit"], source_file=f["source"], build_root=f["build"],
+              local_object=f["runtime"] / "local.o", remote_object=f["runtime"] / "remote.o",
+              binaries=f["binaries"], out=tmp_path / "out",
+              prewarm_input=f["replay"] / "prewarm.ii",
+              prewarm_c_trace=f["replay"] / "prewarm-c-action-trace.jsonl",
+              prewarm_f_trace=f["replay"] / "prewarm-f-action-trace.jsonl")
+
+
+def test_normalized_output_is_consumable_by_retained_package_builder(tmp_path: Path) -> None:
+    f = _fixture(tmp_path)
+    normalized_root = tmp_path / "normalized"
+    normalized_root.mkdir()
+    normalized = _run(normalized_root)
+    package = build_package(normalized.parent, f["replay"], f["repo"], tmp_path / "package")
+    assert package.exists()
+    assert (tmp_path / "normalized" / "out" / "runtime" / "run" /
+            "client-compile-measured.log").exists()
