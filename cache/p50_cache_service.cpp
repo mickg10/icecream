@@ -70,7 +70,7 @@ constexpr int kMaxBacklog = 16;
 // A bounded control farm keeps an authenticated idle dispatcher or an active
 // cache-wire handoff from consuming the only worker needed by compiler input.
 // This is a hard concurrent cap, not a per-connection unbounded thread fork.
-constexpr size_t kMaxControlWorkers = 4;
+constexpr size_t kMaxControlWorkers = 64;
 
 void append_ready_test_trace(std::string_view message) noexcept {
     const char* required = ::getenv("ICECC_P50_C1F1_REQUIRED");

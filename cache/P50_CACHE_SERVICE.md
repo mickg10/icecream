@@ -89,7 +89,7 @@ Asio owner context. Thus both an in-flight `FdHandoffReceiver` and an active
 `run_adopted` dialogue terminate within the bounded shutdown gate without C++
 object work in the signal handler.
 
-The listener admits at most four concurrent control workers. This hard cap
+The listener admits at most sixty-four concurrent control workers. This hard cap
 means an authenticated idle dispatcher or one active CacheWire session cannot
 consume the slot needed by a compiler-input attachment; excess connections
 are closed. Each connection must pass peer-credential verification and one

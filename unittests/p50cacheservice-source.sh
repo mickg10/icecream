@@ -27,6 +27,7 @@ for pair in \
     "$impl|have_f_store_guid" \
     "$impl|structured_launch.c_store_guid" \
     "$impl|structured_launch.f_store_guid" \
+    "$impl|kMaxControlWorkers = 64" \
     "$impl|structured_launch.f_store_generation" \
     "$impl|store_identity_root_from_f_guid" \
     "$impl|c_guid != c_store_guid_for_root(root)" \
