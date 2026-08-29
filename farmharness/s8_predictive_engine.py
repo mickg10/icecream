@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Trace-free predictive producer for the ``fmt/ZSTD_TU/cold`` S8 cell.
+"""Trace-free predictive producer for the declared S8 cell cross-product.
 
 The producer is intentionally causal.  It reads only an authenticated input
 payload and a predeclared C1F1 topology declaration.  It does not read a live
@@ -22,14 +22,25 @@ import sys
 from pathlib import Path
 from typing import Any
 
+try:  # Works both as a module and as a directly invoked harness script.
+    from .s8_schema import (
+        CALIBRATION_CORPORA, CORPORA, CURRENT_SEMANTICS, DECLARED_CELLS,
+        HELD_OUT_CORPORA, PROFILES, REGIMES, SPLITS,
+    )
+except ImportError:  # pragma: no cover - exercised by direct script runners.
+    from s8_schema import (
+        CALIBRATION_CORPORA, CORPORA, CURRENT_SEMANTICS, DECLARED_CELLS,
+        HELD_OUT_CORPORA, PROFILES, REGIMES, SPLITS,
+    )
 
-CELL = {"corpus": "fmt", "profile": "ZSTD_TU", "regime": "cold"}
+# Compatibility name for callers constructing the default fmt calibration
+# fixture.  The held-out policy is always performed against SPLITS[cell["corpus"]].
 SPLIT = "calibration"
-SEMANTICS = "s8-predictive-performance-v1"
-MANIFEST_SCHEMA = "icecream-s8-predictive-engine-manifest-v2"
+SEMANTICS = CURRENT_SEMANTICS
+MANIFEST_SCHEMA = "icecream-s8-predictive-engine-manifest-v3"
 TOPOLOGY_SCHEMA = "icecream-c1f1-topology-state-v1"
-OBSERVATIONS_SCHEMA = "icecream-s8-predictive-performance-v1"
-ARTIFACT_SCHEMA = "icecream-s8-predictive-artifact-v2"
+OBSERVATIONS_SCHEMA = "icecream-s8-predictive-performance-v2"
+ARTIFACT_SCHEMA = "icecream-s8-predictive-artifact-v3"
 HEX64 = set("0123456789abcdef")
 MAX_INPUT_BYTES = 64 * 1024 * 1024
 CURVE_CHUNK_BYTES = 16 * 1024
@@ -37,8 +48,8 @@ CURVE_CHUNK_BYTES = 16 * 1024
 # This is the predeclared model.  Keeping coefficients in source makes the
 # model immutable and reviewable; the topology declaration is the per-run
 # input.  Units are explicit so the output can be compared without inference.
-MODEL = {
-    "id": "fmt-zstd-tu-cold-v1",
+BASE_MODEL = {
+    "id": "s8-causal-performance-v2",
     "compression_level": 3,
     "base_compress_ns": 18_000,
     "compress_ns_per_byte": 10,
@@ -50,6 +61,42 @@ MODEL = {
     "downlink_bytes_per_ns": 0.025,
     "result_fraction": 0.12,
     "minimum_frame_bytes": 64,
+}
+
+# These immutable parameters are the complete model declaration.  They are
+# intentionally small and explicit: no fitted/live result is loaded while
+# producing a prediction.  Factors are dimensionless except for the base and
+# per-byte terms in BASE_MODEL.
+CORPUS_MODELS = {
+    "fmt": {"compile_factor": 0.90},
+    "RocksDB": {"compile_factor": 1.12},
+    "DuckDB": {"compile_factor": 1.25},
+    "LLVM-1238": {"compile_factor": 1.38},
+}
+PROFILE_MODELS = {
+    "ZSTD_TU": {"compression_factor": 1.00, "result_fraction": 0.12,
+                "uplink_factor": 1.00, "downlink_factor": 1.00,
+                "channel_overhead": 0},
+    "ZSTD_ROUTE": {"compression_factor": 0.92, "result_fraction": 0.12,
+                   "uplink_factor": 1.08, "downlink_factor": 0.96,
+                   "channel_overhead": 96},
+    "P29": {"compression_factor": 0.86, "result_fraction": 0.10,
+            "uplink_factor": 1.16, "downlink_factor": 0.92,
+            "channel_overhead": 128},
+    "GRZ_RESIDUAL": {"compression_factor": 0.74, "result_fraction": 0.08,
+                     "uplink_factor": 1.28, "downlink_factor": 0.88,
+                     "channel_overhead": 160},
+}
+REGIME_MODELS = {
+    "cold": {"compression_factor": 1.00, "compile_factor": 1.00,
+             "channel_factor": 1.00, "startup_ns": 0},
+    "warm": {"compression_factor": 0.72, "compile_factor": 0.82,
+             "channel_factor": 0.84, "startup_ns": 25_000},
+}
+CHANNEL_MODELS = {
+    "direct": {"uplink_factor": 1.00, "downlink_factor": 1.00, "overhead": 0},
+    "route": {"uplink_factor": 1.12, "downlink_factor": 1.08, "overhead": 80},
+    "residual": {"uplink_factor": 1.25, "downlink_factor": 1.16, "overhead": 120},
 }
 
 MANIFEST_KEYS = {"schema", "semantics", "cell", "split", "predictive_mode",
@@ -178,11 +225,10 @@ def _guid(value: object, label: str) -> str:
     return value.lower()
 
 
-def validate_topology(value: object) -> None:
+def validate_topology(value: object, cell: dict[str, str]) -> None:
     if not isinstance(value, dict) or set(value) != TOPOLOGY_KEYS:
         raise PredictionError("topology:fields_invalid")
-    if value["schema"] != TOPOLOGY_SCHEMA or value["semantics"] not in {
-            SEMANTICS, "s8-current-semantics-v1"} or value["cell"] != CELL:
+    if value["schema"] != TOPOLOGY_SCHEMA or value["semantics"] != SEMANTICS or value["cell"] != cell:
         raise PredictionError("topology:schema_or_cell_invalid")
     topology, state = value["topology"], value["state"]
     if not isinstance(topology, dict) or set(topology) != TOPOLOGY_FIELDS:
@@ -196,26 +242,30 @@ def validate_topology(value: object) -> None:
     for field in ("c_workers", "f_workers"):
         if type(topology[field]) is not int or topology[field] <= 0:
             raise PredictionError(f"topology:{field}_invalid")
-    if topology["cache_channel"] != "direct":
-        raise PredictionError("topology:cache_channel_must_be_direct")
-    if state["c_cache"] != "cold" or state["f_cache"] != "cold":
-        raise PredictionError("topology:state_must_be_cold")
+    if topology["cache_channel"] not in CHANNEL_MODELS:
+        raise PredictionError("topology:cache_channel_invalid")
+    if state["c_cache"] != cell["regime"] or state["f_cache"] != cell["regime"]:
+        raise PredictionError("topology:state_regime_mismatch")
     if type(state["generation"]) is not int or state["generation"] < 0:
         raise PredictionError("topology:generation_invalid")
 
 
-def load_inputs(manifest_path: Path) -> tuple[dict[str, object], bytes, dict[str, Any], dict[str, Any], str, dict[str, object]]:
+def load_inputs(manifest_path: Path) -> tuple[dict[str, object], bytes, dict[str, Any], dict[str, Any], str, dict[str, object], dict[str, str]]:
     manifest_raw, manifest_facts = regular_snapshot(manifest_path, "manifest")
     value = parse_json(manifest_raw, "manifest")
     if not isinstance(value, dict) or set(value) != MANIFEST_KEYS:
         raise PredictionError("manifest:fields_are_not_current_engine_manifest")
-    # v1 manifests are accepted only for migration-free callers that already
-    # authenticate the model in source.  The model itself is predeclared here.
-    if value["schema"] not in {MANIFEST_SCHEMA, "icecream-s8-predictive-engine-manifest-v1"}:
+    if value["schema"] != MANIFEST_SCHEMA:
         raise PredictionError("manifest:schema_invalid")
-    if value["semantics"] not in {SEMANTICS, "s8-current-semantics-v1"}:
+    if value["semantics"] != SEMANTICS:
         raise PredictionError("manifest:semantics_invalid")
-    if value["cell"] != CELL or value["split"] != SPLIT or value["predictive_mode"] is not True:
+    cell = value["cell"]
+    if not isinstance(cell, dict) or set(cell) != {"corpus", "profile", "regime"}:
+        raise PredictionError("manifest:cell_invalid")
+    if (cell["corpus"] not in CORPORA or cell["profile"] not in PROFILES or
+            cell["regime"] not in REGIMES):
+        raise PredictionError("manifest:cell_not_declared")
+    if value["split"] != SPLITS[cell["corpus"]] or value["predictive_mode"] is not True:
         raise PredictionError("manifest:cell_split_or_predictive_mode_invalid")
     base = manifest_path.parent
     input_path = _artifact_path(base, value["input"], "input")
@@ -225,9 +275,9 @@ def load_inputs(manifest_path: Path) -> tuple[dict[str, object], bytes, dict[str
     input_raw, input_facts = _authenticate(input_path, value["input"], "input", MAX_INPUT_BYTES)
     topology_raw, topology_facts = _authenticate(topology_path, value["topology_state"], "topology_state")
     topology = parse_json(topology_raw, "topology_state")
-    validate_topology(topology)
+    validate_topology(topology, cell)
     assert isinstance(topology, dict)
-    return value, input_raw, input_facts, topology_facts, manifest_facts["sha256"], topology
+    return value, input_raw, input_facts, topology_facts, manifest_facts["sha256"], topology, cell
 
 
 def _ceil_ratio(numerator: int, denominator: float) -> int:
@@ -250,27 +300,44 @@ def _payload_stats(raw: bytes) -> tuple[int, float, float]:
     return size, entropy, transitions / max(1, size - 1)
 
 
-def _predict_curve(raw: bytes, topology: dict[str, object]) -> list[dict[str, object]]:
+def _predict_curve(raw: bytes, topology: dict[str, object], cell: dict[str, str]) -> list[dict[str, object]]:
     t = topology["topology"]
     assert isinstance(t, dict)
     c_workers, f_workers = int(t["c_workers"]), int(t["f_workers"])
+    corpus_model = CORPUS_MODELS[cell["corpus"]]
+    profile_model = PROFILE_MODELS[cell["profile"]]
+    regime_model = REGIME_MODELS[cell["regime"]]
+    channel_model = CHANNEL_MODELS[t["cache_channel"]]
     cumulative_c_to_f = cumulative_f_to_c = cumulative_elapsed = 0
     rows: list[dict[str, object]] = []
     chunks = [raw[offset:offset + CURVE_CHUNK_BYTES]
               for offset in range(0, len(raw), CURVE_CHUNK_BYTES)] or [b""]
     for step, chunk in enumerate(chunks):
         raw_size, entropy, transitions = _payload_stats(chunk)
+        # The authenticated input byte count is already the corpus size.  Do
+        # not multiply it by a corpus-specific factor or charge it twice.
         # Entropy and transitions are content features, not identity metadata.
         ratio = min(0.98, max(0.20, 0.20 + 0.065 * entropy + 0.13 * transitions))
-        source_bytes = max(MODEL["minimum_frame_bytes"], round(raw_size * ratio)) if raw_size else 0
-        result_bytes = max(MODEL["minimum_frame_bytes"], round(raw_size * MODEL["result_fraction"])) if raw_size else 0
-        compress_ns = (MODEL["base_compress_ns"] + raw_size * MODEL["compress_ns_per_byte"] + c_workers - 1) // c_workers
-        input_ready_ns = compress_ns + _ceil_ratio(source_bytes, MODEL["uplink_bytes_per_ns"] * c_workers) + MODEL["network_rtt_ns"]
-        compile_work_ns = MODEL["base_compile_ns"] + raw_size * MODEL["compile_ns_per_byte"]
+        ratio *= profile_model["compression_factor"] * regime_model["compression_factor"]
+        source_bytes = (max(BASE_MODEL["minimum_frame_bytes"],
+                            round(raw_size * ratio)) + profile_model["channel_overhead"] +
+                        channel_model["overhead"]) if raw_size else 0
+        result_bytes = (max(BASE_MODEL["minimum_frame_bytes"],
+                            round(raw_size * profile_model["result_fraction"] * regime_model["channel_factor"])) +
+                        channel_model["overhead"]) if raw_size else 0
+        compress_ns = (BASE_MODEL["base_compress_ns"] + raw_size * BASE_MODEL["compress_ns_per_byte"] + c_workers - 1) // c_workers
+        uplink_rate = (BASE_MODEL["uplink_bytes_per_ns"] * c_workers /
+                       (profile_model["uplink_factor"] * channel_model["uplink_factor"]))
+        input_ready_ns = compress_ns + _ceil_ratio(source_bytes, uplink_rate) + BASE_MODEL["network_rtt_ns"]
+        compile_work_ns = (BASE_MODEL["base_compile_ns"] + raw_size * BASE_MODEL["compile_ns_per_byte"])
+        compile_work_ns = round(compile_work_ns * corpus_model["compile_factor"] * regime_model["compile_factor"])
         compile_ns = (compile_work_ns + f_workers - 1) // f_workers
-        return_ns = _ceil_ratio(result_bytes, MODEL["downlink_bytes_per_ns"] * f_workers)
-        commit_ns = (MODEL["base_commit_ns"] + f_workers - 1) // f_workers
-        total_ns = input_ready_ns + compile_ns + return_ns + commit_ns
+        downlink_rate = (BASE_MODEL["downlink_bytes_per_ns"] * f_workers /
+                         (profile_model["downlink_factor"] * channel_model["downlink_factor"]))
+        return_ns = _ceil_ratio(result_bytes, downlink_rate)
+        commit_ns = (BASE_MODEL["base_commit_ns"] + f_workers - 1) // f_workers
+        startup_ns = regime_model["startup_ns"] if step == 0 else 0
+        total_ns = input_ready_ns + compile_ns + return_ns + commit_ns + startup_ns
         cumulative_c_to_f += source_bytes
         cumulative_f_to_c += result_bytes
         cumulative_elapsed += total_ns
@@ -279,18 +346,21 @@ def _predict_curve(raw: bytes, topology: dict[str, object]) -> list[dict[str, ob
         rows.append({
             "schema": OBSERVATIONS_SCHEMA,
             "step": step,
-            "tu_id": f"fmt-cold-input-{step:06d}",
-            "model_id": MODEL["id"],
+            "tu_id": f"{cell['corpus']}-{cell['regime']}-input-{step:06d}",
+            "cell": cell,
+            "model_id": f"{BASE_MODEL['id']}:{cell['corpus']}:{cell['profile']}:{cell['regime']}",
             "channel_bytes": {"C_TO_F": source_bytes, "F_TO_C": result_bytes,
                                "total": source_bytes + result_bytes},
-            "elapsed_ns": {"compression": compress_ns, "input_ready": input_ready_ns,
+            "elapsed_ns": {"startup": startup_ns, "compression": compress_ns,
+                            "input_ready": input_ready_ns,
                             "compile": compile_ns, "result_return": return_ns,
                             "transaction_commit": commit_ns, "total": total_ns},
             "cumulative": {"C_TO_F_bytes": cumulative_c_to_f,
                             "F_TO_C_bytes": cumulative_f_to_c,
                             "channel_bytes": cumulative_c_to_f + cumulative_f_to_c,
                             "elapsed_ns": cumulative_elapsed},
-            "features": {"raw_input_bytes": raw_size, "entropy_bits_per_byte": entropy,
+            "features": {"raw_input_bytes": raw_size,
+                          "entropy_bits_per_byte": entropy,
                           "transition_rate": transitions},
             "provenance": "modeled",
         })
@@ -316,8 +386,8 @@ def predict(manifest_path: Path, out_path: Path, sim_binary: Path | None = None)
     the rejected scaffold.  It is never opened or executed.
     """
     del sim_binary
-    manifest, input_raw, input_facts, topology_facts, manifest_sha, topology = load_inputs(manifest_path)
-    rows = _predict_curve(input_raw, topology)
+    manifest, input_raw, input_facts, topology_facts, manifest_sha, topology, cell = load_inputs(manifest_path)
+    rows = _predict_curve(input_raw, topology, cell)
     payload = b"".join(canonical_bytes(row) + b"\n" for row in rows)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     sidecar_path = out_path.with_name(out_path.name + ".manifest.json")
@@ -326,14 +396,16 @@ def predict(manifest_path: Path, out_path: Path, sim_binary: Path | None = None)
     _write_new(out_path, payload, "prediction_curve")
     output_facts = {"sha256": hashlib.sha256(payload).hexdigest(), "bytes": len(payload)}
     sidecar = {
-        "schema": ARTIFACT_SCHEMA, "semantics": SEMANTICS, "cell": CELL,
-        "split": SPLIT, "observations": {"path": out_path.name, **output_facts},
+        "schema": ARTIFACT_SCHEMA, "semantics": SEMANTICS, "cell": cell,
+        "split": manifest["split"], "observations": {"path": out_path.name, **output_facts},
         "input": {"path": manifest["input"]["path"], **input_facts},
         "topology_state": {"path": manifest["topology_state"]["path"], **topology_facts},
         "predictor": {
-            "name": "icecream-s8-causal-performance-model", "version": MODEL["id"],
+            "name": "icecream-s8-causal-performance-model", "version": BASE_MODEL["id"],
             "route_trace_consumed": False, "action_trace_input": False,
-            "model_assumptions": MODEL,
+            "model_assumptions": {"base": BASE_MODEL, "corpus": CORPUS_MODELS[cell["corpus"]],
+                                  "profile": PROFILE_MODELS[cell["profile"]],
+                                  "regime": REGIME_MODELS[cell["regime"]]},
             "topology_effects": {"c_workers": "producer compression and uplink share",
                                   "f_workers": "compile, return and commit share",
                                   "cache_channel": "fixed C_TO_F source and F_TO_C result"},
