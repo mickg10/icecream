@@ -384,9 +384,19 @@ void test_factory_rejects_unsupported_or_unnegotiated() {
     GrzResidualCodec route_decoder;
     auto invalid_initial = route_one.begin;
     invalid_initial.rel_seq = RelSeq{1};
+    invalid_initial.transaction_digest = compute_transaction_digest(
+        invalid_initial, std::span<const uint8_t>{}, route_one.body);
     require_throws<std::invalid_argument>(
         [&] { (void)route_decoder.decode(invalid_initial, route_one.body, limits()); },
-        "GRZ_RESIDUAL decoder accepted a nonzero initial REL_SEQ");
+        "GRZ_RESIDUAL decoder accepted a wire-valid nonzero initial REL_SEQ");
+    auto invalid_initial_digest = route_one.begin;
+    invalid_initial_digest.pre_state_digest = Digest128{1, 0};
+    invalid_initial_digest.transaction_digest = compute_transaction_digest(
+        invalid_initial_digest, std::span<const uint8_t>{}, route_one.body);
+    require_throws<std::invalid_argument>(
+        [&] {
+            (void)route_decoder.decode(invalid_initial_digest, route_one.body, limits());
+        }, "GRZ_RESIDUAL decoder accepted a wire-valid nonempty initial predecessor digest");
     require(route_decoder.decode(route_one.begin, route_one.body, limits()) == route_tu1,
             "GRZ_RESIDUAL route decoder rejected its first TU");
     route_decoder.commit();
@@ -520,6 +530,14 @@ void test_grz_bounded_history_is_transactional() {
     c_side.commit();
     require(c_side.retained_history_bytes() <= bounded.max_history_bytes,
             "GRZ retained history exceeded the configured bound");
+    const Digest128 second_state = compute_post_state_digest(
+        retry.begin.pre_state_digest, retry.begin.history_nonce, retry.begin.rel_seq,
+        retry.begin.tu_seq, retry.begin.transaction_digest);
+    const auto third = c_side.encode(HistoryNonce{71}, RelSeq{2}, TuSeq{3},
+                                     second_state, input, bounded);
+    require(grz_residual_group_reference_count(third.body) != 0,
+            "GRZ post-eviction continuation did not use rebuilt suffix anchors");
+    c_side.commit();
     require_throws<std::invalid_argument>(
         [&] {
             (void)c_side.encode(HistoryNonce{71}, RelSeq{2}, TuSeq{3}, Digest128{}, input,
@@ -533,8 +551,13 @@ void test_grz_bounded_history_is_transactional() {
     require(f_side.decode(retry.begin, retry.body, bounded) == input,
             "GRZ F side rejected the bounded continuation");
     f_side.commit();
+    require(f_side.decode(third.begin, third.body, bounded) == input,
+            "GRZ F side rejected the post-eviction continuation");
+    f_side.commit();
     require(f_side.retained_history_bytes() <= bounded.max_history_bytes,
             "GRZ F-side history exceeded the configured bound");
+    require(c_side.retained_history_bytes() <= bounded.max_history_bytes,
+            "GRZ C-side history exceeded the post-eviction bound");
 
     GrzResidualCodec isolated;
     const auto isolated_first = isolated.encode(HistoryNonce{72}, RelSeq{0}, TuSeq{1},
