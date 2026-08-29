@@ -75,6 +75,11 @@ contract() {
     require_text "$root/unittests/p50compilee2e-run.sh" 'ICECC_P50_F_ACTION_TRACE=' || return 1
     require_text "$root/unittests/p50compilee2e-run.sh" 's7-prewarm-c-action-trace.jsonl' || return 1
     require_text "$root/unittests/p50compilee2e-run.sh" 's7-measured-f-action-trace.jsonl' || return 1
+    # Every supported selector must remain a live S7 profile cell.  The
+    # runner maps the wire-level capability spelling separately from the
+    # positive profile marker emitted by the client.
+    require_text "$root/unittests/p50compilee2e-run.sh" 'P29) profile_advertisement=p29' || return 1
+    require_text "$root/unittests/p50compilee2e-run.sh" 'profile_advertisement' || return 1
     require_text "$root/client/Makefile.am" 'libp50zstdsender.a' || return 1
     require_text "$root/client/Makefile.am" 'libp50localtransport.a' || return 1
     require_text "$root/client/Makefile.am" 'libprotocol50.a' || return 1
@@ -146,6 +151,8 @@ for pair in \
     "unittests/p50compilee2e-run.sh|ICECC_P50_F_ACTION_TRACE=" \
     "unittests/p50compilee2e-run.sh|s7-prewarm-c-action-trace.jsonl" \
     "unittests/p50compilee2e-run.sh|s7-measured-f-action-trace.jsonl" \
+    "unittests/p50compilee2e-run.sh|P29) profile_advertisement=p29" \
+    "unittests/p50compilee2e-run.sh|profile_advertisement" \
     "client/Makefile.am|libp50zstdsender.a" \
     "cache/Makefile.am|libp50inputfd.a" \
     "cache/p50_cache_service.cpp|std::make_unique<P50ServerEndpoint>" \

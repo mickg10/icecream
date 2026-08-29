@@ -1,10 +1,10 @@
 #!/bin/sh
-# Real all-P50 C1F1 networked ZSTD_ROUTE compile gate.
+# Real all-P50 C1F1 networked profile compile gate.
 #
 # Once p50compilee2e-source.sh is green this starts the actual built
 # scheduler, one actual iceccd F, one actual iceccd C, and the actual
 # icecc-cache-service owned by the daemon's sidecar adapter. The compiler
-# invocation is required to produce positive ZSTD_ROUTE evidence and a
+# invocation is required to produce positive selected-profile evidence and a
 # byte-identical local reference. No fake peer or legacy FileChunk fallback
 # is accepted.
 set -eu
@@ -15,9 +15,11 @@ timeout_s=${ICECC_P50_C1F1_TIMEOUT:-180}
 profile_marker=${ICECC_P50_PROFILE:-ZSTD_ROUTE}
 warm=${ICECC_P50_C1F1_WARM:-0}
 case "$profile_marker" in
-    ZSTD_TU|ZSTD_ROUTE) ;;
+    P29) profile_advertisement=p29 ;;
+    ZSTD_TU) profile_advertisement=zstd_tu ;;
+    ZSTD_ROUTE) profile_advertisement=z3_long ;;
     *)
-        echo "FAIL: ICECC_P50_PROFILE must be ZSTD_TU or ZSTD_ROUTE" >&2
+        echo "FAIL: ICECC_P50_PROFILE must be P29, ZSTD_TU, or ZSTD_ROUTE" >&2
         exit 1
         ;;
 esac
@@ -360,7 +362,7 @@ test -n "$client_service_pid" || {
 # a handoff and a millisecond startup race masquerades as a product failure.
 cache_ready=0
 for _ in $(seq 1 30); do
-    if grep -E 'RELOGIN p50-f.*cache=.*cache_profiles=.*zstd_tu' \
+    if grep -E "RELOGIN p50-f.*cache=.*cache_profiles=.*$profile_advertisement" \
         "$work/scheduler.log" >/dev/null 2>&1; then
         cache_ready=1
         break
@@ -472,7 +474,7 @@ echo "S7_MEASURED_C_ACTION_TRACE=$measured_c_trace"
 echo "S7_MEASURED_F_ACTION_TRACE=$measured_f_trace"
 
 # Positive evidence is mandatory. Absence of a local marker is not enough:
-# the route must identify ZSTD_ROUTE and cache-session handoff.  Legacy FileChunk
+# the route must identify the selected profile and cache-session handoff. Legacy FileChunk
 # remains correct for environment upload and object return, so the negative
 # evidence below is deliberately limited to the source-stream and local/client
 # fallback markers.
