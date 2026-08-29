@@ -40,8 +40,11 @@ DEFAULT_PROFILE = "ZSTD_ROUTE"
 SCENARIOS = (
     "same_relationship_tu0_tu1",
     "different_relationship_isolation",
-    "abort_retry_no_route_advance",
     "explicit_f_reset_clean_recovery",
+)
+FOCUSED_RETRY_GATES = (
+    "unittests/p50routeowner",
+    "unittests/p50zstdsender",
 )
 HEX128 = re.compile(r"^[0-9a-fA-F]{32}$")
 READY_RE = re.compile(
@@ -346,7 +349,7 @@ def self_test() -> int:
     assert DEFAULT_PROFILE in PROFILES
     assert set(SCENARIOS) == {
         "same_relationship_tu0_tu1", "different_relationship_isolation",
-        "abort_retry_no_route_advance", "explicit_f_reset_clean_recovery",
+        "explicit_f_reset_clean_recovery",
     }
     assert source_bytes(0) != source_bytes(1)
     with tempfile.TemporaryDirectory(prefix="s6-harness-selftest-") as directory:
@@ -693,8 +696,8 @@ class Runtime:
         except (OSError, subprocess.SubprocessError, RuntimeError) as error:
             return False, type(error).__name__
 
-    def compile(self, source: Path, label: str, socket_path: Path | None = None,
-                disposition: str | None = None) -> dict[str, Any]:
+    def compile(self, source: Path, label: str,
+                socket_path: Path | None = None) -> dict[str, Any]:
         if self.envtar is None or socket_path is None:
             return {"status": "HOLD", "reason": "runtime-not-ready", "label": label}
         remote = self.root / "out" / (label + "-remote.o")
@@ -705,8 +708,6 @@ class Runtime:
                        ICECC_VERSION=str(self.envtar), ICECC_PREFERRED_HOST="s6-f",
                        ICECC_P50_COMPILE_IDENTITY_TRACE=str(trace), ICECC_DEBUG="debug",
                        ICECC_LOGFILE=str(wrapper_log), ICECC_CARET_WORKAROUND="0")
-        if disposition:
-            env["ICECC_P50_TEST_DISPOSITION"] = disposition
         source.write_bytes(source_bytes(int(re.sub(r"\D", "", label) or "0")))
         compiler_command = [str(self.build / "client/icecc"), "g++", "-std=c++17",
                             "-O2", "-c", str(source), "-o", str(remote)]
@@ -725,8 +726,6 @@ class Runtime:
                 ICECC_P50_COMPILE_IDENTITY_TRACE=str(inside_trace), ICECC_DEBUG="debug",
                 ICECC_LOGFILE=str(inside_log), ICECC_CARET_WORKAROUND="0",
                 HOME="/work/home")
-            if disposition:
-                container_env["ICECC_P50_TEST_DISPOSITION"] = disposition
             command = ["docker", "exec", "--user", "%d:%d" % (os.getuid(), os.getgid()),
                        "--workdir", "/role"]
             for key in ("ICECC_TEST_SOCKET", "ICECC_TEST_REMOTEBUILD", "ICECC_VERSION",
@@ -734,8 +733,6 @@ class Runtime:
                         "ICECC_DEBUG", "ICECC_LOGFILE", "ICECC_CARET_WORKAROUND",
                         "ICECC_P50_PROFILE", "ICECC_P50_C1F1_REQUIRED", "HOME", "TMPDIR"):
                 command.extend(["--env", key + "=" + container_env[key]])
-            if disposition:
-                command.extend(["--env", "ICECC_P50_TEST_DISPOSITION=" + disposition])
             client_node = "s6-c2" if socket_path == self.client2_socket else "s6-c"
             command.extend([self._client_docker_name(client_node), "/role/client/icecc",
                             "g++", "-std=c++17", "-O2", "-c", str(inside_source),
@@ -905,6 +902,11 @@ def run_acceptance(args: argparse.Namespace) -> int:
         manifest["binary_sha256"] = {
             name: sha256(path) for name, path in product_paths.items() if path.is_file()
         }
+        manifest["focused_retry_gate_sha256"] = {
+            relative: sha256(build / relative)
+            for relative in FOCUSED_RETRY_GATES
+            if (build / relative).is_file()
+        }
         if args.docker:
             try:
                 manifest["docker_image_id"] = subprocess.check_output(
@@ -937,6 +939,30 @@ def run_acceptance(args: argparse.Namespace) -> int:
                         existing_gate_output=(gate_result.stdout.decode("utf-8", "replace")[-2000:]
                                               if gate_result is not None else ""))
             writer.emit("summary", "HOLD", reason=reason, output=str(output))
+            return 77
+        focused_retry: dict[str, Any] = {}
+        focused_retry_ok = True
+        for relative in FOCUSED_RETRY_GATES:
+            path = build / relative
+            try:
+                result = subprocess.run(
+                    [str(path)], cwd=source, env={**os.environ, "TMPDIR": "/tmp"},
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    timeout=args.timeout, check=False)
+                focused_retry[relative] = {
+                    "returncode": result.returncode,
+                    "sha256": sha256(path) if path.is_file() else "missing",
+                    "output": result.stdout.decode("utf-8", "replace")[-2000:],
+                }
+                focused_retry_ok = focused_retry_ok and result.returncode == 0
+            except (OSError, subprocess.SubprocessError) as error:
+                focused_retry[relative] = {"error": type(error).__name__}
+                focused_retry_ok = False
+        writer.emit("focused-retry-gates", "PASS" if focused_retry_ok else "HOLD",
+                    gates=focused_retry)
+        if not focused_retry_ok:
+            writer.emit("summary", "HOLD", reason="focused-retry-gate",
+                        output=str(output))
             return 77
         runtime = Runtime(output / "runtime", source, build, args.profile, args.timeout, writer,
                           docker=args.docker)
@@ -996,25 +1022,12 @@ def run_acceptance(args: argparse.Namespace) -> int:
             else:
                 isolated["reason"] = client2_reason
         writer.emit("scenario", isolated.get("status", "HOLD"), scenario=SCENARIOS[1], result=isolated)
-        retry_source = output / "runtime" / "tu3.cpp"
-        before_retry = parse_action(_read(runtime.root / "action.trace"))
-        first_retry = runtime.compile(retry_source, "wrapper3-abort", runtime.client_socket, disposition="disconnect")
-        retry = runtime.compile(retry_source, "wrapper4-retry", runtime.client_socket)
-        retry_evidence = evidence_document(args.profile, runtime.root, SCENARIOS[2])
-        after_retry = parse_action(_read(runtime.root / "action.trace"))
-        retry_actions = after_retry[len(before_retry):]
-        retry["first_attempt"] = first_retry
-        retry["route_advanced"] = len({row["rel_seq"] for row in retry_actions}) > 1
-        retry["abort_observed"] = any(row["action"] == "TX_ABORTED" for row in retry_actions)
-        retry["retry_same_rel_seq"] = len({row["rel_seq"] for row in retry_actions}) == 1 and bool(retry_actions)
-        retry["status"] = "PASS" if retry.get("status") == "PASS" and retry["abort_observed"] and retry["retry_same_rel_seq"] and retry_evidence["status"] == "PASS" else "HOLD"
-        writer.emit("scenario", retry["status"], scenario=SCENARIOS[2], evidence=retry_evidence, result=retry)
         runtime.stop_worker()
         old_ready = parse_ready(_read(runtime.root / "f-ready.trace"))
         old_f_guids = {row["F_GUID"] for row in old_ready}
         reset_ready = runtime.start_worker_replacement()
         reset = runtime.compile(output / "runtime" / "tu4.cpp", "wrapper4-after-f-reset", runtime.client_socket)
-        reset_evidence = evidence_document(args.profile, runtime.root, SCENARIOS[3])
+        reset_evidence = evidence_document(args.profile, runtime.root, SCENARIOS[2])
         new_ready = parse_ready(_read(runtime.root / "f-ready.trace"))
         new_f_guids = sorted({row["F_GUID"] for row in new_ready} - old_f_guids)
         action_f_guids = {row["f_store_guid"] for row in reset_evidence["actions"]}
@@ -1025,8 +1038,8 @@ def run_acceptance(args: argparse.Namespace) -> int:
             "PASS" if reset.get("status") == "PASS" and reset_ready and
             len(new_f_guids) == 1 and reset["replacement_observed_on_wire"]
             else "HOLD")
-        writer.emit("scenario", reset["status"], scenario=SCENARIOS[3], evidence=reset_evidence, result=reset)
-        statuses = [same_pass, isolated.get("status") == "PASS", retry.get("status") == "PASS", reset.get("status") == "PASS"]
+        writer.emit("scenario", reset["status"], scenario=SCENARIOS[2], evidence=reset_evidence, result=reset)
+        statuses = [same_pass, isolated.get("status") == "PASS", reset.get("status") == "PASS"]
         final = "PASS" if all(statuses) else "HOLD"
         writer.emit("summary", final, scenarios=dict(zip(SCENARIOS, statuses)), output=str(output))
         return 0 if final == "PASS" else 77
