@@ -561,7 +561,9 @@ void test_grz_endpoint_roundtrip() {
     caps.zstd.max_raw_bytes = 1U << 20;
     caps.zstd.max_encoded_body_bytes = 1U << 20;
     P50ServerEndpoint server(guids.f, caps);
-    TestClient client(guids.c, caps);
+    // A non-default first nonce must bind both the transport cursor and the
+    // C GRZ preparation authority; preparation must not fall back to nonce 1.
+    TestClient client(guids.c, caps, HistoryNonce{37});
     const std::vector<uint8_t> before_reset = bytes(
         "GRZ endpoint authority must validate its own residual begin\n");
     const PairResult first = run_pair(client, server, admit(client, before_reset));

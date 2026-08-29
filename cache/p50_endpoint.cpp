@@ -936,6 +936,7 @@ struct P50PreparationAuthority::Impl {
     std::optional<uint64_t> uncommitted_route_entry;
 #if defined(ICECC_P50_WITH_LIBBSC)
     std::optional<uint64_t> uncommitted_grz_entry;
+    HistoryNonce grz_history_nonce{1};
     RelSeq grz_next_rel{};
     Digest128 grz_state_digest{};
 #endif
@@ -1044,7 +1045,7 @@ PreparedTuHandle P50PreparationAuthority::prepare(PrepareRequestKey request,
 #if defined(ICECC_P50_WITH_LIBBSC)
         } else if (impl_->profile == ProfileId::GRZ) {
             const ZstdTuEnvelope envelope = impl_->grz_codec.encode(
-                HistoryNonce{1}, impl_->grz_next_rel, tu_seq,
+                impl_->grz_history_nonce, impl_->grz_next_rel, tu_seq,
                 impl_->grz_state_digest, exact_input,
                 admission_limits);
             prepared = std::make_shared<const PreparedInputEnvelope>(
@@ -1239,8 +1240,10 @@ void P50PreparationAuthority::prime_grz_initial_state(HistoryNonce history_nonce
     if (!impl_->entries.empty() || impl_->uncommitted_grz_entry.has_value() ||
         impl_->grz_next_rel.value != 0 || impl_->grz_state_digest != Digest128{})
         throw std::logic_error("GRZ_RESIDUAL initial state was already used");
-    impl_->grz_state_digest = initial_route_digest(impl_->c_guid, history_nonce);
-    impl_->grz_codec.prime_initial_state(history_nonce, impl_->grz_state_digest);
+    const Digest128 initial_state = initial_route_digest(impl_->c_guid, history_nonce);
+    impl_->grz_codec.prime_initial_state(history_nonce, initial_state);
+    impl_->grz_history_nonce = history_nonce;
+    impl_->grz_state_digest = initial_state;
 #else
     (void)history_nonce;
 #endif
@@ -1291,6 +1294,7 @@ PreparedInputPtr P50PreparationAuthority::reset_grz_route(
         PreparedInputEnvelope{envelope.begin, {}, envelope.body, {}});
 
     impl_->grz_codec = std::move(rebuilt);
+    impl_->grz_history_nonce = history_nonce;
     impl_->grz_next_rel = RelSeq{0};
     impl_->grz_state_digest = reset_state;
     impl_->retained_bytes = impl_->retained_bytes - old_retained + retained;
