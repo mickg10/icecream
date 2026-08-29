@@ -37,6 +37,7 @@ MANIFEST_SCHEMA = "icecream-s8-curve-manifest-v1"
 RECORD_SCHEMA = "icecream-s8-predictive-live-record-v1"
 SEMANTICS = CURRENT_SEMANTICS
 MANIFEST_KEYS = {"schema", "identity", "units", "curve", "provenance"}
+OPTIONAL_MANIFEST_KEYS = {"evidence"}
 IDENTITY_KEYS = {
     "corpus", "profile", "regime", "split", "run_id", "source_commit",
     "source_tree", "input_digest", "topology_digest", "model_id",
@@ -216,6 +217,34 @@ def _validate_provenance(value: object, mode: str) -> dict[str, object]:
     return {"mode": mode, "producer": producer, "trace_free": value["trace_free"]}
 
 
+def _validate_evidence(value: object) -> dict[str, object]:
+    """Validate optional producer evidence without treating it as a curve.
+
+    Older S8 manifests intentionally have no evidence envelope.  New live
+    producers may attach this small, content-addressed envelope; its hashes
+    are retained in normalized provenance and are never inferred here.
+    """
+    if not isinstance(value, dict) or set(value) != {
+            "results_sha256", "evidence_manifest_sha256", "binary_sha256",
+            "evidence_sha256"}:
+        raise NormalizationError("evidence:fields_invalid")
+    for field in ("results_sha256", "evidence_manifest_sha256", "evidence_sha256"):
+        _sha(value[field], f"evidence.{field}")
+    binaries = value["binary_sha256"]
+    if not isinstance(binaries, dict) or not binaries:
+        raise NormalizationError("evidence.binary_sha256:invalid")
+    for name, digest in binaries.items():
+        if not isinstance(name, str) or not name:
+            raise NormalizationError("evidence.binary_sha256:name_invalid")
+        _sha(digest, f"evidence.binary_sha256.{name}")
+    return {
+        "results_sha256": value["results_sha256"].lower(),
+        "evidence_manifest_sha256": value["evidence_manifest_sha256"].lower(),
+        "binary_sha256": {name: str(digest).lower() for name, digest in binaries.items()},
+        "evidence_sha256": value["evidence_sha256"].lower(),
+    }
+
+
 def _forbidden_curve_key(key: object) -> bool:
     if not isinstance(key, str):
         return True
@@ -293,7 +322,10 @@ def _parse_curve(raw: bytes, label: str, identity: dict[str, str]) -> tuple[list
             raise NormalizationError(f"{label}:{line_number}:metric_shape_changed")
         if metrics:
             for key, current in flat.items():
-                if current < metrics[-1][key]:
+                # Throughput is a derived instantaneous/aggregate rate;
+                # unlike elapsed time and byte counters it may decrease.
+                if ("throughput" not in key and
+                        current < metrics[-1][key]):
                     raise NormalizationError(f"{label}:{line_number}:cumulative_value_decreased")
         rows.append(value)
         metrics.append(flat)
@@ -310,13 +342,16 @@ def _parse_curve(raw: bytes, label: str, identity: dict[str, str]) -> tuple[list
 def _load_manifest(path: Path, mode: str) -> dict[str, object]:
     raw, facts = _snapshot(path, "manifest", MAX_MANIFEST_BYTES)
     value = parse_json(raw, "manifest")
-    if not isinstance(value, dict) or set(value) != MANIFEST_KEYS:
+    if not isinstance(value, dict) or not MANIFEST_KEYS.issubset(value) or \
+            set(value) - MANIFEST_KEYS - OPTIONAL_MANIFEST_KEYS:
         raise NormalizationError("manifest:fields_invalid")
     if value["schema"] != MANIFEST_SCHEMA:
         raise NormalizationError("manifest:schema_invalid")
     identity = _validate_identity(value["identity"])
     units = _validate_units(value["units"])
     provenance = _validate_provenance(value["provenance"], mode)
+    evidence = (_validate_evidence(value["evidence"])
+                if "evidence" in value else None)
     curve_path = _descriptor_path(path.parent, value["curve"], "curve")
     if curve_path.resolve() == path.resolve():
         raise NormalizationError("curve:manifest_alias")
@@ -328,6 +363,7 @@ def _load_manifest(path: Path, mode: str) -> dict[str, object]:
         "identity": identity,
         "units": units,
         "provenance": provenance,
+        "evidence": evidence,
         "manifest_sha256": facts["sha256"],
         "curve_sha256": curve_sha,
         "rows": rows,
@@ -435,6 +471,8 @@ def _normalized_record(mode: str, artifact: dict[str, object]) -> dict[str, obje
             **artifact["provenance"],
             "manifest_sha256": artifact["manifest_sha256"],
             "curve_sha256": artifact["curve_sha256"],
+            **({"evidence": artifact["evidence"]}
+               if artifact.get("evidence") is not None else {}),
         },
         "raw_cumulative_curve": artifact["rows"],
     }
