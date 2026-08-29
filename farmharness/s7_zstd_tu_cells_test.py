@@ -30,6 +30,27 @@ class S7InputSeamsTest(unittest.TestCase):
             self.assertEqual(argv, ["-DSECOND=2", "-Ifirst", "-std=gnu++20", "-c", source])
             self.assertIsNone(compile_argv_from_database(database, str(root / "other.cc")))
 
+    def test_compile_database_keeps_debug_and_normalizes_producer_notes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "compile_commands.json"
+            source = str(root / "db.cc")
+            database.write_text(json.dumps([{
+                "file": source,
+                "command": f"/usr/bin/c++ -g -O2 -c {source}",
+            }]), encoding="utf-8")
+            argv = compile_argv_from_database(database, source)
+            self.assertIn("-g", argv)
+            self.assertEqual(argv[-1], "-gno-record-gcc-switches")
+
+            database.write_text(json.dumps([{
+                "file": source,
+                "command": f"/usr/bin/c++ -g -grecord-gcc-switches -c {source}",
+            }]), encoding="utf-8")
+            explicit = compile_argv_from_database(database, source)
+            self.assertEqual(explicit.count("-grecord-gcc-switches"), 1)
+            self.assertNotIn("-gno-record-gcc-switches", explicit)
+
 
 if __name__ == "__main__":
     unittest.main()

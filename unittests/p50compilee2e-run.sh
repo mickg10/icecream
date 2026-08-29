@@ -223,6 +223,14 @@ tokens[tokens.index(source)] = staged
 for i, token in enumerate(tokens[:-1]):
     if token == '-o': tokens[i + 1] = output; break
 else: raise SystemExit(1)
+# Icecream's GCC remote arm adds -fdirectives-only and allocator parameters.
+# Keep the compile database's debug output, but do not encode those
+# compiler-owned switches in DW_AT_producer: otherwise semantically identical
+# local and remote objects differ only in their debug string table.
+if (any(token == '-g' or token.startswith('-g') for token in tokens)
+        and not any(token in ('-grecord-gcc-switches', '-gno-record-gcc-switches')
+                    for token in tokens)):
+    tokens.append('-gno-record-gcc-switches')
 print(shlex.join(tokens))
 PY
     }

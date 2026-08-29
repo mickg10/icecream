@@ -33,3 +33,13 @@ grep -Fx 'ICECC_PREFERRED_HOST=p50-f' "$envout"
 grep -Fx 'ICECC_DEBUG=debug' "$envout"
 grep -Fx 'ICECC_LOGFILE=client.log' "$envout"
 echo 'ok - compile-db argv eval exports client environment'
+
+python3 - "$(dirname "$0")/p50compilee2e-run.sh" <<'PY'
+import pathlib
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+assert "tokens.append('-gno-record-gcc-switches')" in text
+assert "'-grecord-gcc-switches', '-gno-record-gcc-switches'" in text
+PY
+echo 'ok - compile-db debug argv preserves DWARF with deterministic producer notes'

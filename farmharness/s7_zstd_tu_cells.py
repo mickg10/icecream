@@ -133,8 +133,20 @@ def compile_argv_from_database(database: Path, source: str) -> list[str] | None:
         if len(tokens) < 2:
             return None
         # The compiler is selected by the production runner.  Retain every
-        # remaining token, including the exact -I/-D ordering.
-        return tokens[1:]
+        # remaining token, including the exact -I/-D ordering.  The live
+        # runner applies the same final switch when debug output is enabled:
+        # Icecream adds remote-only GCC switches whose DW_AT_producer spelling
+        # would otherwise defeat the full-object byte-equality control.
+        argv = tokens[1:]
+        if (
+            any(token == "-g" or token.startswith("-g") for token in argv)
+            and not any(
+                token in {"-grecord-gcc-switches", "-gno-record-gcc-switches"}
+                for token in argv
+            )
+        ):
+            argv.append("-gno-record-gcc-switches")
+        return argv
     return None
 
 
