@@ -195,7 +195,23 @@ source_input=${ICECC_P50_C1F1_INPUT:-}
 include_root=${ICECC_P50_C1F1_INCLUDE_ROOT:-}
 compile_db=${ICECC_P50_C1F1_COMPILE_DB:-}
 compile_source=${ICECC_P50_C1F1_COMPILE_SOURCE:-}
-if test -n "$source_root" || test -n "$source_relative"; then
+batch_manifest=${ICECC_P50_C1F1_BATCH_MANIFEST:-}
+image_id=${ICECC_P50_C1F1_IMAGE_ID:-}
+if test -n "$batch_manifest"; then
+    test -z "$source_root" && test -z "$source_relative" && test -z "$source_input" || {
+        echo "FAIL: batch manifest cannot be combined with single-input fields" >&2
+        exit 1
+    }
+    test -f "$batch_manifest" && test ! -L "$batch_manifest" || {
+        echo "FAIL: authenticated batch manifest is unavailable" >&2
+        exit 1
+    }
+    python3 - "$image_id" <<'PY'
+import re, sys
+if re.fullmatch(r"sha256:[0-9a-f]{64}", sys.argv[1] or "") is None:
+    raise SystemExit("batch image ID must be an exact sha256 digest")
+PY
+elif test -n "$source_root" || test -n "$source_relative"; then
     test -n "$source_root" && test -n "$source_relative" || {
         echo "FAIL: source root and source relative path must be supplied together" >&2
         exit 1
@@ -216,32 +232,74 @@ if test -n "$source_root" || test -n "$source_relative"; then
     }
     source_input="$source_root/$source_relative"
 fi
-if test -n "$source_input"; then
+if test -z "$batch_manifest" && test -n "$source_input"; then
     test -f "$source_input" && test ! -L "$source_input" || {
         echo "FAIL: authenticated source input is unavailable" >&2
         exit 1
     }
     cp -- "$source_input" "$work/src/main.cpp"
-else
+elif test -z "$batch_manifest"; then
     printf '%s\n' \
         '#include <cstdint>' \
         'int p50_c1f1_translation_unit() {' \
         '    return static_cast<int>(UINT32_C(50));' \
         '}' >"$work/src/main.cpp"
 fi
-if test -n "$compile_db" || test -n "$compile_source"; then
-    test -n "$compile_db" && test -n "$compile_source" || {
-        echo "FAIL: compile database and source must be supplied together" >&2; exit 1;
-    }
-    test -f "$compile_db" && test ! -L "$compile_db" || {
-        echo "FAIL: authoritative compile database is unavailable" >&2; exit 1;
-    }
-    test "${compile_source#/}" != "$compile_source" || {
-        echo "FAIL: compile database source must be absolute" >&2; exit 1;
-    }
+if test -n "$batch_manifest"; then
+    # Validate every source snapshot before starting a daemon.  The TSV is
+    # only a transport for authenticated paths; all observations below are
+    # still emitted by the product lifecycle after each real compile.
+    python3 - "$batch_manifest" >"$work/batch.tsv" <<'PY'
+import hashlib, json, os, stat, sys
+path = sys.argv[1]
+with open(path, encoding="utf-8") as stream:
+    rows = [json.loads(line) for line in stream if line.strip()]
+if not rows:
+    raise SystemExit("empty batch manifest")
+seen = set()
+for row in rows:
+    if not isinstance(row, dict) or set(row) - {"tu_id", "source", "sha256", "compile_db", "compile_source"}:
+        raise SystemExit("batch manifest fields invalid")
+    tu, source, expected = row.get("tu_id"), row.get("source"), row.get("sha256")
+    if (not isinstance(tu, str) or not tu or tu in seen or "\t" in tu or
+            any(char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-" for char in tu)):
+        raise SystemExit("batch TU identity invalid")
+    if not isinstance(source, str) or not os.path.isabs(source) or "\t" in source:
+        raise SystemExit("batch source must be absolute")
+    try:
+        info = os.lstat(source)
+    except OSError:
+        raise SystemExit("batch source unavailable")
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise SystemExit("batch source is not a private regular file")
+    actual = hashlib.sha256(open(source, "rb").read()).hexdigest()
+    if not isinstance(expected, str) or expected != actual:
+        raise SystemExit("batch source digest mismatch")
+    db, compile_source = row.get("compile_db", ""), row.get("compile_source", source)
+    if db or compile_source != source:
+        if not isinstance(db, str) or not os.path.isabs(db) or not os.path.isfile(db) or os.path.islink(db):
+            raise SystemExit("batch compile database unavailable")
+        if not isinstance(compile_source, str) or not os.path.isabs(compile_source):
+            raise SystemExit("batch compile source must be absolute")
+    print("\t".join((tu, source, actual, db, compile_source)))
+    seen.add(tu)
+PY
+fi
+if test -n "$batch_manifest" || test -n "$compile_db" || test -n "$compile_source"; then
+    if test -z "$batch_manifest"; then
+        test -n "$compile_db" && test -n "$compile_source" || {
+            echo "FAIL: compile database and source must be supplied together" >&2; exit 1;
+        }
+        test -f "$compile_db" && test ! -L "$compile_db" || {
+            echo "FAIL: authoritative compile database is unavailable" >&2; exit 1;
+        }
+        test "${compile_source#/}" != "$compile_source" || {
+            echo "FAIL: compile database source must be absolute" >&2; exit 1;
+        }
+    fi
     compile_args_for() {
-        output=$1
-        python3 - "$compile_db" "$compile_source" "$work/src/main.cpp" "$output" <<'PY'
+        db=$1; source=$2; staged=$3; output=$4
+        python3 - "$db" "$source" "$staged" "$output" <<'PY'
 import json, shlex, sys
 db, source, staged, output = sys.argv[1:]
 entries = json.load(open(db, encoding='utf-8'))
@@ -400,19 +458,24 @@ test "$cache_ready" -eq 1 || {
 
 compile_once() {
     label=$1
+    input_path=${2:-$work/src/main.cpp}
+    item_compile_db=${3:-$compile_db}
+    item_compile_source=${4:-$compile_source}
     remote_obj="$work/out/remote-$label.o"
     local_obj="$work/out/local-$label.o"
     client_log="$work/client-compile-$label.log"
-    if test -n "$compile_db"; then
-        remote_compile_args=$(compile_args_for "$remote_obj")
-        local_compile_args=$(compile_args_for "$local_obj")
+    compile_include_args=""
+    if test -n "$item_compile_db"; then
+        remote_compile_args=$(compile_args_for "$item_compile_db" "$item_compile_source" "$work/src/$label.cpp" "$remote_obj")
+        local_compile_args=$(compile_args_for "$item_compile_db" "$item_compile_source" "$input_path" "$local_obj")
     elif test -n "$include_root"; then
         compile_include_args="-I$include_root"
     else
         compile_include_args=""
     fi
     preprocessed_capture="$work/s7-$label-preprocessed.ii"
-    if test -n "$compile_db"; then
+    compile_start_ns=$(date +%s%N)
+    if test -n "$item_compile_db"; then
         # eval is needed to turn the safely shlex-quoted database tokens back
         # into argv. Export first: assignments before the special builtin
         # `eval` become shell variables, not necessarily the environment seen
@@ -435,13 +498,14 @@ compile_once() {
             ICECC_P50_PREPROCESSED_CAPTURE="$preprocessed_capture" \
             ICECC_PREFERRED_HOST=p50-f ICECC_DEBUG=debug ICECC_LOGFILE="$client_log" \
             run_client_with_timeout g++ -std=c++17 -O2 -c \
-            $compile_include_args "$work/src/main.cpp" -o "$remote_obj"
+            $compile_include_args "$input_path" -o "$remote_obj"
     fi
-    if test -n "$compile_db"; then
+    compile_end_ns=$(date +%s%N)
+    if test -n "$item_compile_db"; then
         eval "g++ $local_compile_args"
     else
         g++ -std=c++17 -O2 -c $compile_include_args \
-            "$work/src/main.cpp" -o "$local_obj"
+            "$input_path" -o "$local_obj"
     fi
     test -s "$preprocessed_capture" || {
         echo "FAIL: completed $label preprocessor capture is missing" >&2
@@ -473,7 +537,44 @@ if test "$warm" = 1; then
     prewarm_f_lines=$(wc -l <"$f_action_trace")
     echo "S7_WARM_PREWARM_COMPLETE"
 fi
-compile_once measured
+if test -n "$batch_manifest"; then
+    test "$warm" = 0 || {
+        echo "FAIL: batch manifest currently supports cold full-1/full-2 only" >&2
+        exit 1
+    }
+    run_batch() {
+        run_label=$1
+        ordinal=0
+        while IFS="$(printf '\t')" read -r tu_id source_path source_sha item_db item_source; do
+            staged="$work/src/$run_label-$ordinal.cpp"
+            cp -- "$source_path" "$staged"
+            compile_once "$run_label-$ordinal" "$staged" "$item_db" "$item_source"
+            remote_obj="$work/out/remote-$run_label-$ordinal.o"
+            local_obj="$work/out/local-$run_label-$ordinal.o"
+            preprocessed_capture="$work/s7-$run_label-$ordinal-preprocessed.ii"
+            remote_sha=$(sha256sum "$remote_obj" | awk '{print $1}')
+            local_sha=$(sha256sum "$local_obj" | awk '{print $1}')
+            remote_bytes=$(stat -c %s "$remote_obj")
+            local_bytes=$(stat -c %s "$local_obj")
+            preprocessed_sha=$(sha256sum "$preprocessed_capture" | awk '{print $1}')
+            preprocessed_bytes=$(stat -c %s "$preprocessed_capture")
+            wait_ms=$(sed -nE 's/.*<\/wait for cs: ([0-9]+)ms>.*/\1/p' "$work/client-compile-$run_label-$ordinal.log" | tail -n 1)
+            test -n "$wait_ms" || { echo "FAIL: client wait-for-cs timing missing ($run_label-$ordinal)" >&2; exit 1; }
+            printf 'S8_BATCH_TU run=%s ordinal=%s tu_id=%s source_sha256=%s preprocessed_path=%s preprocessed_sha256=%s preprocessed_bytes=%s remote_path=%s remote_sha256=%s remote_bytes=%s local_path=%s local_sha256=%s local_bytes=%s byte_identical=%s remote_compile=%s compile_start_ns=%s compile_end_ns=%s wait_for_cs_ns=%s assignment=0 relationship=0 f_slot=0\n' \
+                "$run_label" "$ordinal" "$tu_id" "$source_sha" "$preprocessed_capture" "$preprocessed_sha" "$preprocessed_bytes" \
+                "$remote_obj" "$remote_sha" "$remote_bytes" "$local_obj" "$local_sha" "$local_bytes" \
+                "$(test "$remote_sha" = "$local_sha" && echo 1 || echo 0)" 1 \
+                "$compile_start_ns" "$compile_end_ns" "$((wait_ms * 1000000))"
+            ordinal=$((ordinal + 1))
+        done <"$work/batch.tsv"
+        test "$ordinal" -gt 0 || { echo "FAIL: batch manifest produced no TUs" >&2; exit 1; }
+        echo "S8_BATCH_COMPLETE run=$run_label count=$ordinal"
+    }
+    run_batch full-1
+    run_batch full-2
+else
+    compile_once measured
+fi
 
 test -s "$c_action_trace" && test -s "$f_action_trace" || {
     echo "FAIL: measured product action traces are missing" >&2
@@ -496,6 +597,17 @@ echo "S7_PREWARM_C_ACTION_TRACE=$prewarm_c_trace"
 echo "S7_PREWARM_F_ACTION_TRACE=$prewarm_f_trace"
 echo "S7_MEASURED_C_ACTION_TRACE=$measured_c_trace"
 echo "S7_MEASURED_F_ACTION_TRACE=$measured_f_trace"
+echo "S7_WORKDIR=$work"
+if test -n "$batch_manifest"; then
+    echo "S8_IMAGE_ID=$image_id"
+    for binary_role in scheduler/icecc-scheduler daemon/iceccd client/icecc cache/icecc-cache-service; do
+        binary_path="$build/$binary_role"
+        test -x "$binary_path" || { echo "FAIL: missing binary $binary_path" >&2; exit 1; }
+        printf 'S8_BINARY role=%s sha256=%s bytes=%s path=%s\n' \
+            "$binary_role" "$(sha256sum "$binary_path" | awk '{print $1}')" \
+            "$(stat -c %s "$binary_path")" "$binary_path"
+    done
+fi
 
 # Positive evidence is mandatory. Absence of a local marker is not enough:
 # the route must identify the selected profile and cache-session handoff. Legacy FileChunk
