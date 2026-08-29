@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Normalize one retained GRZ S7 run into its canonical live result row.
+"""Normalize one retained S7 run into its canonical live result row.
 
 The standard runner's output directory is an input, never an output target.
 All runtime, source, object, and product paths are explicit CLI arguments so
@@ -19,10 +19,19 @@ import sys
 from pathlib import Path
 from typing import Any
 
+try:
+    from .s8_schema import CORPORA, PROFILES, REGIMES
+except ImportError:  # pragma: no cover - direct harness invocation.
+    from s8_schema import CORPORA, PROFILES, REGIMES
+
 
 SCHEMA = "icecream-s7-live-cell-v1"
 PROFILE = "GRZ_RESIDUAL"
-CELL_RE = re.compile(r"^(fmt|RocksDB)/GRZ_RESIDUAL/(cold|warm)$")
+CELL_RE = re.compile(
+    rf"^(?:{'|'.join(re.escape(value) for value in CORPORA)})/"
+    rf"(?:{'|'.join(re.escape(value) for value in PROFILES)})/"
+    rf"(?:{'|'.join(re.escape(value) for value in REGIMES)})$"
+)
 HEX = re.compile(r"^[0-9a-f]{64}$")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX32 = re.compile(r"^[0-9a-f]{32}$")
@@ -172,13 +181,14 @@ def build(*, experiment: Path, runtime: Path, replay: Path, corpus: str,
           regime: str, source_repository: Path, source_commit: str,
           source_file: Path, build_root: Path, local_object: Path,
           remote_object: Path, binaries: list[str], out: Path,
+          profile: str = PROFILE,
           prewarm_input: Path | None = None,
           prewarm_c_trace: Path | None = None,
           prewarm_f_trace: Path | None = None) -> Path:
     """Authenticate and write exactly one canonical result row."""
     if out.exists() or out.is_symlink():
         raise ResultsError("output:already_exists")
-    if corpus not in {"fmt", "RocksDB"} or regime not in {"cold", "warm"}:
+    if corpus not in CORPORA or profile not in PROFILES or regime not in REGIMES:
         raise ResultsError("cell:unsupported")
     experiment = experiment.resolve(); runtime = runtime.resolve(); replay = replay.resolve()
     source_repository = source_repository.resolve(); source_file = source_file.resolve()
@@ -190,7 +200,6 @@ def build(*, experiment: Path, runtime: Path, replay: Path, corpus: str,
             not build_root.is_dir() or build_root.is_symlink()):
         raise ResultsError("runtime_or_source:not_private_directory")
     source_commit = digest(source_commit, "source_commit", HEX40)
-    profile = PROFILE
     cell_label = f"{corpus}/{profile}/{regime}"
     try:
         tree = subprocess.run(["git", "-C", str(source_repository), "rev-parse", f"{source_commit}^{{tree}}"],
@@ -297,7 +306,7 @@ def build(*, experiment: Path, runtime: Path, replay: Path, corpus: str,
         prewarm_count = sum(row.get("action") == "TX_BEGIN" for row in prewarm_c_rows + prewarm_f_rows)
         if prewarm_count != 2:
             raise ResultsError("warm:prewarm_identity_invalid")
-    cell = f"{corpus}/{PROFILE}/{regime}"
+    cell = f"{corpus}/{profile}/{regime}"
     descriptors = {
         "replay_manifest": descriptor(replay_manifest_path, replay_manifest_raw, _inside(replay_manifest_path, experiment, "replay_manifest")),
         "identities": descriptor(identities_path, identities_raw, _inside(identities_path, experiment, "identities")),
@@ -318,7 +327,7 @@ def build(*, experiment: Path, runtime: Path, replay: Path, corpus: str,
         descriptors[label] = descriptor(path, raw, _evidence_path(path, experiment))
     evidence_sha = hashlib.sha256(canonical({"cell": cell, "files": descriptors})).hexdigest()
     row = {
-        "schema": SCHEMA, "cell": cell, "corpus": corpus, "profile": PROFILE, "regime": regime,
+        "schema": SCHEMA, "cell": cell, "corpus": corpus, "profile": profile, "regime": regime,
         "status": "PASS", "live_status": "PASS", "acceptance_status": "PASS", "conformance_status": "PASS",
         "run_id": experiment.name, "runtime": runtime_relative,
         "live_source_commit": source_commit, "replay_source_commit": source_commit,
@@ -366,8 +375,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--experiment", type=Path, required=True)
     parser.add_argument("--runtime", type=Path, required=True)
     parser.add_argument("--replay", type=Path, required=True)
-    parser.add_argument("--corpus", choices=("fmt", "RocksDB"), required=True)
-    parser.add_argument("--regime", choices=("cold", "warm"), required=True)
+    parser.add_argument("--corpus", choices=CORPORA, required=True)
+    parser.add_argument("--profile", choices=PROFILES, default=PROFILE)
+    parser.add_argument("--regime", choices=REGIMES, required=True)
     parser.add_argument("--source-repository", type=Path, required=True)
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--source-file", type=Path, required=True)
@@ -382,7 +392,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         print(build(experiment=args.experiment.absolute(), runtime=args.runtime.absolute(),
-                    replay=args.replay.absolute(), corpus=args.corpus, regime=args.regime,
+                    replay=args.replay.absolute(), corpus=args.corpus, profile=args.profile,
+                    regime=args.regime,
                     source_repository=args.source_repository.absolute(), source_commit=args.source_commit,
                     source_file=args.source_file.absolute(), build_root=args.build_root.absolute(),
                     local_object=args.local_object.absolute(), remote_object=args.remote_object.absolute(),

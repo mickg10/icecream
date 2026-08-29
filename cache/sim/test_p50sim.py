@@ -6,6 +6,12 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
+from s7_grz_results import build as normalize_s7
+from s8_live_metric_producer import produce
+from s8_retained_s7_package import build as build_s8_package
+
 
 HERE = Path(__file__).resolve().parent
 
@@ -291,7 +297,7 @@ def test_warm_deletion_control_reddens_measured_trace(tmp_path: Path) -> None:
     assert "measured TU1 action trace differs from product trace" in result.stderr
 
 
-def test_explicit_runner_supports_fmt_and_rocksdb_cold_warm(tmp_path: Path) -> None:
+def test_explicit_runner_supports_all_declared_corpora_cold_warm(tmp_path: Path) -> None:
     cold = scenario_tree(tmp_path / "cold")
     write_role_traces(cold, read_jsonl(cold / "action_trace.jsonl"))
     warm = warm_scenario_tree(tmp_path / "warm")
@@ -300,6 +306,10 @@ def test_explicit_runner_supports_fmt_and_rocksdb_cold_warm(tmp_path: Path) -> N
         ("fmt/ZSTD_TU/warm", warm),
         ("RocksDB/ZSTD_TU/cold", cold),
         ("RocksDB/ZSTD_TU/warm", warm),
+        ("DuckDB/ZSTD_TU/cold", cold),
+        ("DuckDB/ZSTD_TU/warm", warm),
+        ("LLVM-1238/ZSTD_TU/cold", cold),
+        ("LLVM-1238/ZSTD_TU/warm", warm),
     ):
         result = invoke_explicit_runner(artifacts, cell, tmp_path / cell.replace("/", "-"))
         assert result.returncode == 0, f"{cell}: {result.stderr}"
@@ -307,3 +317,63 @@ def test_explicit_runner_supports_fmt_and_rocksdb_cold_warm(tmp_path: Path) -> N
         assert manifest["cell"] == cell
         assert manifest["schema"] == f"icecream-s7-{cell.split('/')[0].lower()}-zstd-tu-{cell.split('/')[-1]}-conformance-v2"
         assert manifest["deletion_control"]["returncode"] != 0
+
+
+def normalizer_source(root: Path) -> tuple[Path, str]:
+    repository = root / "source"
+    repository.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    subprocess.run(["git", "-C", str(repository), "config", "user.email", "fixture@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(repository), "config", "user.name", "fixture"], check=True)
+    (repository / "format.cc").write_text("int value;\n")
+    subprocess.run(["git", "-C", str(repository), "add", "format.cc"], check=True)
+    subprocess.run(["git", "-C", str(repository), "commit", "-q", "-m", "fixture"], check=True)
+    commit = subprocess.check_output(["git", "-C", str(repository), "rev-parse", "HEAD"], text=True).strip()
+    return repository, commit
+
+
+@pytest.mark.parametrize("corpus", ("DuckDB", "LLVM-1238"))
+@pytest.mark.parametrize("regime", ("cold", "warm"))
+def test_held_out_replay_normalize_package_metric_end_to_end(tmp_path: Path, corpus: str,
+                                                             regime: str) -> None:
+    """The runner OUT root is consumed directly by S7 and S8 adapters."""
+    capture = (scenario_tree if regime == "cold" else warm_scenario_tree)(tmp_path / "capture")
+    if regime == "cold":
+        write_role_traces(capture, read_jsonl(capture / "action_trace.jsonl"))
+    evidence_root = tmp_path / "evidence"
+    source_repository, source_commit = normalizer_source(evidence_root)
+    experiment = evidence_root / "experiment"
+    replay = experiment / "exact-replay"
+    result = invoke_explicit_runner(capture, f"{corpus}/ZSTD_TU/{regime}", replay)
+    assert result.returncode == 0, result.stderr
+    runtime = experiment / "runtime" / "run"
+    runtime.mkdir(parents=True)
+    (runtime / "client-compile-measured.log").write_text(
+        "</wait for cs: 456ms>\nICECC: got 78 bytes (12%)\n")
+    for name in ("local.o", "remote.o"):
+        (runtime / name).write_bytes(b"object bytes")
+    build_root = evidence_root / "build"
+    build_root.mkdir()
+    binaries = []
+    for name in ("client", "daemon"):
+        path = build_root / name
+        path.write_bytes((name + " binary").encode())
+        binaries.append(f"{name}={path}")
+    normalized = normalize_s7(
+        experiment=experiment, runtime=runtime, replay=replay, corpus=corpus,
+        profile="ZSTD_TU", regime=regime, source_repository=source_repository,
+        source_commit=source_commit, source_file=source_repository / "format.cc",
+        build_root=build_root, local_object=runtime / "local.o",
+        remote_object=runtime / "remote.o", binaries=binaries,
+        out=tmp_path / "normalized",
+        **({"prewarm_input": replay / "prewarm.ii",
+            "prewarm_c_trace": replay / "prewarm-c-action-trace.jsonl",
+            "prewarm_f_trace": replay / "prewarm-f-action-trace.jsonl"}
+           if regime == "warm" else {}),
+    )
+    package_manifest = build_s8_package(normalized.parent, replay, source_repository,
+                                        tmp_path / "package")
+    metric = json.loads(produce(package_manifest.parent, tmp_path / "metric").read_bytes())
+    assert metric["status"] == "PASS"
+    metric_manifest = json.loads((tmp_path / "metric" / "live-curve-manifest.json").read_bytes())
+    assert metric_manifest["identity"]["corpus"] == corpus

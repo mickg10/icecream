@@ -4,6 +4,8 @@ import hashlib
 import json
 from pathlib import Path
 
+import pytest
+
 from s8_live_metric_producer import produce
 from s8_predictive_live_normalizer import _load_manifest, canonical_bytes
 
@@ -12,12 +14,12 @@ def _digest(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def _fixture(root: Path, regime: str = "cold") -> Path:
+def _fixture(root: Path, regime: str = "cold", corpus: str = "fmt") -> Path:
     package = root / f"s7-{regime}"
     package.mkdir()
     payload = b"fmt source bytes\n"
     summary = {
-        "schema": "icecream-s7-live-cell-v1", "cell": f"fmt/ZSTD_TU/{regime}",
+        "schema": "icecream-s7-live-cell-v1", "cell": f"{corpus}/ZSTD_TU/{regime}",
         "status": "PASS", "live_status": "PASS", "acceptance_status": "PASS",
         "conformance_status": "PASS",
         "binary_sha256": {"client": "d" * 64, "daemon": "e" * 64},
@@ -27,15 +29,15 @@ def _fixture(root: Path, regime: str = "cold") -> Path:
     (package / "results.jsonl").write_bytes(results)
     (package / "input.ii").write_bytes(payload)
     rows = [
-        {"schema": "icecream-s7-live-timing-v1", "cell": f"fmt/ZSTD_TU/{regime}",
+        {"schema": "icecream-s7-live-timing-v1", "cell": f"{corpus}/ZSTD_TU/{regime}",
          "phase": "measured", "tu_id": "tu-0", "elapsed_ns": 100, "channel_bytes": 50},
-        {"schema": "icecream-s7-live-timing-v1", "cell": f"fmt/ZSTD_TU/{regime}",
+        {"schema": "icecream-s7-live-timing-v1", "cell": f"{corpus}/ZSTD_TU/{regime}",
          "phase": "measured", "tu_id": "tu-1", "elapsed_ns": 200, "channel_bytes": 150},
     ]
     timing = b"".join(canonical_bytes(row) + b"\n" for row in rows)
     (package / "timing.jsonl").write_bytes(timing)
     evidence = {
-        "schema": "icecream-s7-live-evidence-v1", "cell": f"fmt/ZSTD_TU/{regime}",
+        "schema": "icecream-s7-live-evidence-v1", "cell": f"{corpus}/ZSTD_TU/{regime}",
         "run_id": f"fixture-{regime}", "source_commit": "a" * 40,
         "source_tree": "b" * 40, "topology_sha256": "c" * 64,
         "binary_sha256": {"client": "d" * 64, "daemon": "e" * 64},
@@ -79,6 +81,29 @@ def test_missing_timing_is_hold_and_never_scored(tmp_path: Path) -> None:
         "reason": "evidence.timing:unavailable:" + str(package / "timing.jsonl"),
     }
     assert not (tmp_path / "hold" / "live-curve-manifest.json").exists()
+
+
+@pytest.mark.parametrize("corpus", ("DuckDB", "LLVM-1238"))
+def test_held_out_cells_are_scored_only_from_authenticated_fixture(tmp_path: Path,
+                                                                    corpus: str) -> None:
+    result = json.loads(produce(_fixture(tmp_path, corpus=corpus),
+                                tmp_path / "live").read_text())
+    assert result["status"] == "PASS"
+    assert result["scored"] is True
+    manifest = json.loads((tmp_path / "live" / "live-curve-manifest.json").read_text())
+    assert manifest["identity"]["split"] == "held_out_validation"
+
+
+def test_undeclared_cell_is_hold_before_evidence_is_trusted(tmp_path: Path) -> None:
+    package = _fixture(tmp_path)
+    summary_path = package / "results.jsonl"
+    summary = json.loads(summary_path.read_text())
+    summary["cell"] = "not-a-corpus/ZSTD_TU/cold"
+    summary_path.write_bytes(canonical_bytes(summary) + b"\n")
+    result = json.loads(produce(package, tmp_path / "hold").read_text())
+    assert result["status"] == "HOLD"
+    assert result["scored"] is False
+    assert result["reason"] == "results:cell_invalid"
 
 
 def test_mismatched_evidence_digest_is_hold(tmp_path: Path) -> None:

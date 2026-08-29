@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from s7_grz_results import ResultsError, build, canonical
+from s8_live_metric_producer import produce
 from s8_retained_s7_package import build as build_package
 
 
@@ -33,7 +34,8 @@ def _write(path: Path, value: object) -> bytes:
     return raw
 
 
-def _fixture(root: Path, regime: str = "cold") -> dict[str, object]:
+def _fixture(root: Path, regime: str = "cold", corpus: str = "fmt",
+             profile: str = "GRZ_RESIDUAL") -> dict[str, object]:
     repo, commit = _git_repo(root)
     experiment = root / "experiment"
     replay = experiment / "exact-replay"
@@ -62,8 +64,8 @@ def _fixture(root: Path, regime: str = "cold") -> dict[str, object]:
     stage_raw = b"".join(canonical(row) + b"\n" for row in stage_rows)
     (replay / "stage-ledger.jsonl").write_bytes(stage_raw)
     identity_raw = _write(replay / "identities.json", ident)
-    manifest = {"schema": f"icecream-s7-fmt-grz-residual-{regime}-conformance-v2",
-                "cell": f"fmt/GRZ_RESIDUAL/{regime}", "status": "PASS",
+    manifest = {"schema": f"icecream-s7-{corpus.lower()}-{profile.lower()}-{regime}-conformance-v2",
+                "cell": f"{corpus}/{profile}/{regime}", "status": "PASS",
                 "input_sha256": input_sha, "identity": ident,
                 "deletion_control": {"status": "PASS", "returncode": 1},
                 "mutation_control": {"status": "PASS", "returncode": 1},
@@ -97,10 +99,11 @@ def _fixture(root: Path, regime: str = "cold") -> dict[str, object]:
             "build": build_root, "binaries": binaries}
 
 
-def _run(root: Path, regime: str = "cold") -> Path:
-    f = _fixture(root, regime)
+def _run(root: Path, regime: str = "cold", corpus: str = "fmt",
+         profile: str = "GRZ_RESIDUAL") -> Path:
+    f = _fixture(root, regime, corpus, profile)
     return build(experiment=f["experiment"], runtime=f["runtime"], replay=f["replay"],
-                 corpus="fmt", regime=regime, source_repository=f["repo"],
+                 corpus=corpus, profile=profile, regime=regime, source_repository=f["repo"],
                  source_commit=f["commit"], source_file=f["source"], build_root=f["build"],
                  local_object=f["runtime"] / "local.o", remote_object=f["runtime"] / "remote.o",
                  binaries=f["binaries"], out=root / "out",
@@ -134,6 +137,19 @@ def test_object_mutation_is_rejected_without_output(tmp_path: Path) -> None:
               source_commit=f["commit"], source_file=f["source"], build_root=f["build"],
               local_object=f["runtime"] / "local.o", remote_object=remote,
               binaries=f["binaries"], out=tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+def test_undeclared_corpus_is_rejected_without_output(tmp_path: Path) -> None:
+    f = _fixture(tmp_path)
+    with pytest.raises(ResultsError, match="cell:unsupported"):
+        build(experiment=f["experiment"], runtime=f["runtime"], replay=f["replay"],
+              corpus="not-a-corpus", profile="ZSTD_TU", regime="cold",
+              source_repository=f["repo"], source_commit=f["commit"],
+              source_file=f["source"], build_root=f["build"],
+              local_object=f["runtime"] / "local.o",
+              remote_object=f["runtime"] / "remote.o", binaries=f["binaries"],
+              out=tmp_path / "out")
     assert not (tmp_path / "out").exists()
 
 
@@ -172,3 +188,22 @@ def test_normalized_output_is_consumable_by_retained_package_builder(tmp_path: P
     assert package.exists()
     assert (tmp_path / "normalized" / "out" / "runtime" / "run" /
             "client-compile-measured.log").exists()
+
+
+@pytest.mark.parametrize("corpus", ("DuckDB", "LLVM-1238"))
+def test_held_out_corpus_and_profile_flow_to_package(tmp_path: Path, corpus: str) -> None:
+    normalized_root = tmp_path / corpus
+    normalized_root.mkdir()
+    normalized = _run(normalized_root, corpus=corpus, profile="ZSTD_TU")
+    row = json.loads(normalized.read_bytes())
+    assert row["cell"] == f"{corpus}/ZSTD_TU/cold"
+    f = {"replay": normalized_root / "experiment" / "exact-replay",
+         "repo": normalized_root / "source"}
+    package = build_package(normalized.parent, f["replay"], f["repo"],
+                            tmp_path / f"{corpus}-package")
+    assert package.exists()
+    metric = json.loads(produce(package.parent, tmp_path / f"{corpus}-metric").read_bytes())
+    assert metric["status"] == "PASS"
+    curve_manifest = json.loads(
+        (tmp_path / f"{corpus}-metric" / "live-curve-manifest.json").read_bytes())
+    assert curve_manifest["identity"]["split"] == "held_out_validation"

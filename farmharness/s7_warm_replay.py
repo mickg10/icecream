@@ -17,17 +17,21 @@ import subprocess
 import sys
 from pathlib import Path
 
+try:
+    from .s8_schema import CORPORA, PROFILES, REGIMES
+except ImportError:  # pragma: no cover - direct harness invocation.
+    from s8_schema import CORPORA, PROFILES, REGIMES
 
-SUPPORTED_PROFILES = ("ZSTD_TU", "ZSTD_ROUTE", "P29", "GRZ_RESIDUAL")
+SUPPORTED_PROFILES = PROFILES
 # GRZ_RESIDUAL is the S7 name; the product's environment-facing registry calls
 # the same route GRZ.  Keep this translation at the adapter boundary.
 PROFILE_ENV = {"ZSTD_TU": "ZSTD_TU", "ZSTD_ROUTE": "ZSTD_ROUTE",
                "P29": "P29", "GRZ_RESIDUAL": "GRZ"}
 SUPPORTED_CELLS = frozenset(
     f"{corpus}/{profile}/{regime}"
-    for corpus in ("fmt", "RocksDB")
+    for corpus in CORPORA
     for profile in SUPPORTED_PROFILES
-    for regime in ("cold", "warm")
+    for regime in REGIMES
 )
 
 

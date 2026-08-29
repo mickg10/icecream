@@ -9,9 +9,9 @@ import s7_warm_replay as replay
 
 class ExplicitReplayContractTest(unittest.TestCase):
     def test_matrix_contains_every_profile_corpus_and_regime(self):
-        self.assertEqual(len(replay.SUPPORTED_CELLS), 16)
+        self.assertEqual(len(replay.SUPPORTED_CELLS), 32)
         for profile in replay.SUPPORTED_PROFILES:
-            for corpus in ("fmt", "RocksDB"):
+            for corpus in ("fmt", "RocksDB", "DuckDB", "LLVM-1238"):
                 for regime in ("cold", "warm"):
                     self.assertIn(f"{corpus}/{profile}/{regime}", replay.SUPPORTED_CELLS)
 
@@ -29,6 +29,8 @@ class ExplicitReplayContractTest(unittest.TestCase):
         self.assertEqual(replay.PROFILE_ENV["GRZ_RESIDUAL"], "GRZ")
         self.assertEqual(replay.schema_for_cell("RocksDB/P29/cold"),
                          "icecream-s7-rocksdb-p29-cold-conformance-v2")
+        self.assertEqual(replay.schema_for_cell("DuckDB/ZSTD_TU/cold"),
+                         "icecream-s7-duckdb-zstd-tu-cold-conformance-v2")
 
 
 if __name__ == "__main__":

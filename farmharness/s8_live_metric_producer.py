@@ -21,8 +21,10 @@ from typing import Any
 
 try:
     from . import s8_predictive_live_normalizer as normalizer
+    from .s8_schema import CORPORA, PROFILES, REGIMES, SPLITS
 except ImportError:  # pragma: no cover - direct harness invocation.
     import s8_predictive_live_normalizer as normalizer
+    from s8_schema import CORPORA, PROFILES, REGIMES, SPLITS
 
 
 SCHEMA = "icecream-s8-live-metric-producer-v1"
@@ -32,7 +34,11 @@ LIVE_SCHEMA = "icecream-s7-live-cell-v1"
 CURVE_MANIFEST_SCHEMA = normalizer.MANIFEST_SCHEMA
 HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
 HEX40 = re.compile(r"^[0-9a-fA-F]{40}$")
-CELL_RE = re.compile(r"^(fmt|RocksDB)/(ZSTD_TU|ZSTD_ROUTE|P29|GRZ_RESIDUAL)/(cold|warm)$")
+CELL_RE = re.compile(
+    rf"^(?:{'|'.join(re.escape(value) for value in CORPORA)})/"
+    rf"(?:{'|'.join(re.escape(value) for value in PROFILES)})/"
+    rf"(?:{'|'.join(re.escape(value) for value in REGIMES)})$"
+)
 MAX_BYTES = 64 * 1024 * 1024
 
 
@@ -312,7 +318,7 @@ def produce(package: Path, out: Path) -> Path:
         return _hold(out, "topology_sha256:missing_or_invalid")
     identity = {
         "corpus": corpus, "profile": profile, "regime": regime,
-        "split": "calibration" if corpus in {"fmt", "RocksDB"} else "held_out_validation",
+        "split": SPLITS[corpus],
         "run_id": str(evidence.get("run_id", "s7-live")),
         "source_commit": provenance["source_commit"], "source_tree": provenance["source_tree"],
         "input_digest": input_digest, "topology_digest": topology_digest,
