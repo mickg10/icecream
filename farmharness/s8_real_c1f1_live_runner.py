@@ -540,6 +540,13 @@ def container_image_identity(image: str = PINNED_IMAGE) -> dict[str, str]:
             "architecture": architecture, "os": operating_system, "created": created}
 
 
+def validated_container_temp_root(path: Path) -> Path:
+    root = path.absolute()
+    if not root.is_dir() or root.is_symlink():
+        _fail("container_temp_root:invalid")
+    return root
+
+
 def _path_within(path: Path, root: Path) -> bool:
     try:
         path.resolve().relative_to(root.resolve())
@@ -1703,6 +1710,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--container-image", default=PINNED_IMAGE)
     parser.add_argument("--container-bind-root", type=Path,
                         default=DEFAULT_CONTAINER_BIND_ROOT)
+    parser.add_argument("--container-temp-root", type=Path,
+                        default=DEFAULT_CONTAINER_TEMP_ROOT)
     parser.add_argument("--execute", action="store_true", help="execute one real run; intentionally separate from dry-run tests")
     args = parser.parse_args(argv)
     batch_manifest = args.batch_manifest.absolute()
@@ -1733,8 +1742,9 @@ def main(argv: list[str] | None = None) -> int:
     execution_environment = "host_product_build"
     if args.execute:
         if args.execution_mode == "pinned-container":
+            container_temp_root = validated_container_temp_root(args.container_temp_root)
             run_work_parent = Path(tempfile.mkdtemp(
-                prefix="p5.", dir=DEFAULT_CONTAINER_TEMP_ROOT))
+                prefix="p5.", dir=container_temp_root))
             run_work_parent.chmod(0o711)
             run_workdir = run_work_parent / "p50compilee2e.run"
             runtime_image = container_image_identity(args.container_image)
@@ -1762,6 +1772,8 @@ def main(argv: list[str] | None = None) -> int:
                           if repeat_predictive_plan is not None else None,
                           "execution_mode": args.execution_mode,
                           "container_image": args.container_image
+                          if args.execution_mode == "pinned-container" else None,
+                          "container_temp_root": str(args.container_temp_root.absolute())
                           if args.execution_mode == "pinned-container" else None},
                          sort_keys=True))
         return 0

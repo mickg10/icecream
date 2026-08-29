@@ -380,6 +380,16 @@ def test_container_command_uses_resolved_image_and_read_only_product_mount(
         work_parent.rmdir()
 
 
+def test_container_temp_root_must_be_a_real_directory(tmp_path: Path) -> None:
+    root = tmp_path / "container-work"
+    root.mkdir()
+    assert runner.validated_container_temp_root(root) == root.absolute()
+    alias = tmp_path / "container-work-alias"
+    alias.symlink_to(root, target_is_directory=True)
+    with pytest.raises(runner.LiveRunnerError, match="container_temp_root:invalid"):
+        runner.validated_container_temp_root(alias)
+
+
 def test_container_cleanup_is_exact_and_tolerates_already_removed(
         monkeypatch: pytest.MonkeyPatch) -> None:
     work_parent = Path("/tmp") / f"p5.cleanup-{os.getpid()}"
