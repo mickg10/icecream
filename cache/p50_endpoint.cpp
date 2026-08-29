@@ -936,6 +936,8 @@ struct P50PreparationAuthority::Impl {
     std::optional<uint64_t> uncommitted_route_entry;
 #if defined(ICECC_P50_WITH_LIBBSC)
     std::optional<uint64_t> uncommitted_grz_entry;
+    RelSeq grz_next_rel{};
+    Digest128 grz_state_digest{};
 #endif
     ZstdRouteCodec route_codec;
     std::unique_ptr<CAuthority> p29_authority;
@@ -1042,7 +1044,8 @@ PreparedTuHandle P50PreparationAuthority::prepare(PrepareRequestKey request,
 #if defined(ICECC_P50_WITH_LIBBSC)
         } else if (impl_->profile == ProfileId::GRZ) {
             const ZstdTuEnvelope envelope = impl_->grz_codec.encode(
-                HistoryNonce{1}, RelSeq{0}, tu_seq, Digest128{}, exact_input,
+                HistoryNonce{1}, impl_->grz_next_rel, tu_seq,
+                impl_->grz_state_digest, exact_input,
                 admission_limits);
             prepared = std::make_shared<const PreparedInputEnvelope>(
                 PreparedInputEnvelope{envelope.begin, {}, envelope.body, {}});
@@ -1213,6 +1216,15 @@ void P50PreparationAuthority::commit(PreparedTuHandle handle) {
         if (impl_->uncommitted_grz_entry != handle.entry_id_)
             throw std::logic_error("GRZ_RESIDUAL commit is not its prepared successor");
         impl_->grz_codec.commit();
+        impl_->grz_state_digest = compute_post_state_digest(
+            entry.prepared->begin.pre_state_digest,
+            entry.prepared->begin.history_nonce,
+            entry.prepared->begin.rel_seq,
+            entry.prepared->begin.tu_seq,
+            entry.prepared->begin.transaction_digest);
+        if (impl_->grz_next_rel.value == std::numeric_limits<uint64_t>::max())
+            throw std::overflow_error("GRZ_RESIDUAL REL_SEQ exhausted");
+        ++impl_->grz_next_rel.value;
         entry.committed = true;
         impl_->uncommitted_grz_entry.reset();
     }
@@ -1247,11 +1259,19 @@ uint64_t P50PreparationAuthority::retained_encoded_bytes() const {
 
 size_t P50PreparationAuthority::route_history_bytes() const {
     impl_->owner.check();
+#if defined(ICECC_P50_WITH_LIBBSC)
+    if (impl_->profile == ProfileId::GRZ)
+        return impl_->grz_codec.retained_history_bytes();
+#endif
     return impl_->committed_route_history.size();
 }
 
 size_t P50PreparationAuthority::route_history_entries() const {
     impl_->owner.check();
+#if defined(ICECC_P50_WITH_LIBBSC)
+    if (impl_->profile == ProfileId::GRZ)
+        return impl_->grz_codec.retained_history_bytes() == 0 ? 0 : 1;
+#endif
     return impl_->committed_route_history.empty() ? 0 : 1;
 }
 

@@ -32,9 +32,12 @@ public:
     // committed.  Rejection and retry discard the tentative frame state.
     void commit();
     void discard() noexcept;
+    void reset() noexcept;
     std::vector<uint8_t> decode(const TxBegin& begin,
                                 std::span<const uint8_t> encoded_body,
                                 ZstdTuLimits limits);
+
+    [[nodiscard]] size_t retained_history_bytes() const noexcept;
 
 private:
     struct State;
@@ -72,6 +75,7 @@ public:
     void reset();
 
     [[nodiscard]] uint64_t window_limit_bytes() const noexcept;
+    [[nodiscard]] size_t retained_history_bytes() const noexcept;
     [[nodiscard]] State state() const { return state_; }
     [[nodiscard]] bool terminal() const { return state_ == State::Terminal; }
     [[nodiscard]] size_t pending_body_bytes() const { return body_.size(); }
@@ -86,6 +90,9 @@ private:
     State state_ = State::Idle;
     std::optional<TxBegin> active_;
     std::vector<uint8_t> body_;
+    std::optional<HistoryNonce> history_nonce_;
+    std::optional<RelSeq> last_rel_;
+    std::optional<Digest128> committed_state_;
 };
 
 } // namespace icecc::p50

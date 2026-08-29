@@ -462,6 +462,75 @@ void test_factory_rejects_unsupported_or_unnegotiated() {
         "factory admitted an undeclared negotiated profile bit");
 }
 
+void test_grz_bounded_history_is_transactional() {
+#if defined(ICECC_P50_WITH_LIBBSC)
+    ZstdTuLimits bounded{1U << 20, 1U << 20, 10, 1024};
+    std::vector<uint8_t> input(700);
+    uint32_t seed = 0x7f4a7c15U;
+    for (size_t i = 0; i < input.size(); ++i) {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        input[i] = static_cast<uint8_t>(seed >> 24);
+    }
+    GrzResidualCodec c_side;
+    const auto first = c_side.encode(HistoryNonce{71}, RelSeq{0}, TuSeq{1},
+                                     Digest128{}, input, bounded);
+    c_side.commit();
+    const Digest128 first_state = compute_post_state_digest(
+        first.begin.pre_state_digest, first.begin.history_nonce, first.begin.rel_seq,
+        first.begin.tu_seq, first.begin.transaction_digest);
+    const auto candidate = c_side.encode(HistoryNonce{71}, RelSeq{1}, TuSeq{2},
+                                           first_state, input, bounded);
+    require(grz_residual_group_reference_count(candidate.body) != 0,
+            "GRZ bounded continuation did not use the committed suffix");
+    require(candidate.body == [&] {
+        GrzResidualCodec peer;
+        const auto peer_first = peer.encode(HistoryNonce{71}, RelSeq{0}, TuSeq{1},
+                                              Digest128{}, input, bounded);
+        peer.commit();
+        const auto peer_second = peer.encode(HistoryNonce{71}, RelSeq{1}, TuSeq{2},
+                                                compute_post_state_digest(
+                                                    peer_first.begin.pre_state_digest,
+                                                    peer_first.begin.history_nonce,
+                                                    peer_first.begin.rel_seq,
+                                                    peer_first.begin.tu_seq,
+                                                    peer_first.begin.transaction_digest),
+                                                input, bounded);
+        return peer_second.body;
+    }(), "GRZ C/F continuation bytes diverged");
+    c_side.discard();
+    const auto retry = c_side.encode(HistoryNonce{71}, RelSeq{1}, TuSeq{2},
+                                     first_state, input, bounded);
+    require(retry.body == candidate.body,
+            "GRZ rollback/retry changed the candidate frame");
+    c_side.commit();
+    require(c_side.retained_history_bytes() <= bounded.max_history_bytes,
+            "GRZ retained history exceeded the configured bound");
+    require_throws<std::invalid_argument>(
+        [&] {
+            (void)c_side.encode(HistoryNonce{71}, RelSeq{2}, TuSeq{3}, Digest128{}, input,
+                                bounded);
+        }, "GRZ accepted a stale predecessor digest");
+
+    GrzResidualCodec f_side;
+    require(f_side.decode(first.begin, first.body, bounded) == input,
+            "GRZ F side rejected the first exact TU");
+    f_side.commit();
+    require(f_side.decode(retry.begin, retry.body, bounded) == input,
+            "GRZ F side rejected the bounded continuation");
+    f_side.commit();
+    require(f_side.retained_history_bytes() <= bounded.max_history_bytes,
+            "GRZ F-side history exceeded the configured bound");
+
+    GrzResidualCodec isolated;
+    const auto isolated_first = isolated.encode(HistoryNonce{72}, RelSeq{0}, TuSeq{1},
+                                                 Digest128{}, input, bounded);
+    require(grz_residual_group_reference_count(isolated_first.body) == 0,
+            "GRZ matcher state crossed relationship ownership");
+#endif
+}
+
 void test_p29_factory_is_explicit_and_fail_closed() {
     ProfileDialogue dialogue = ProfileDialogue::create(
         ProfileId::P29,
@@ -497,6 +566,7 @@ int main() {
     test_exact_terminal_promotion_and_discard();
     test_interactive_hooks_are_reachable_and_fail_closed_for_zstd();
     test_factory_rejects_unsupported_or_unnegotiated();
+    test_grz_bounded_history_is_transactional();
     test_p29_factory_is_explicit_and_fail_closed();
     test_zstd_route_multi_tu_replay_and_terminal_rules();
     test_zstd_route_reset_and_fallback();

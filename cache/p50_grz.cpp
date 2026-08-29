@@ -21,6 +21,10 @@ namespace {
 constexpr uint32_t kGroupRlzMagic = UINT32_C(0x31505247); // GRP1
 constexpr size_t kGroupBytes = 64U << 10;
 constexpr size_t kAnchorBytes = 16;
+// The exact raw suffix is the authoritative route window.  Keep the matcher
+// index deliberately smaller than that window so its node/vector overhead
+// cannot turn a bounded relationship into an unbounded allocation.
+constexpr size_t kMaxAnchorEntries = 16U << 10;
 
 struct GroupToken {
     bool copy = false;
@@ -90,6 +94,7 @@ uint64_t get_u64(const uint8_t*& cursor, const uint8_t* end) {
 GroupStage group_encode(std::span<const uint8_t> history,
                         std::span<const uint8_t> input,
                         std::unordered_map<uint64_t, std::vector<uint64_t>>& anchors,
+                        size_t& anchor_count,
                         std::vector<std::pair<uint64_t, uint64_t>>& provisional_anchors) {
     GroupStage stage;
     std::vector<uint8_t> history_input;
@@ -138,11 +143,16 @@ GroupStage group_encode(std::span<const uint8_t> history,
                 stage.residual.push_back(history_input[position++]);
                 if (position + kAnchorBytes <= group_end) {
                     const uint64_t key = gear_hash(history_input.data() + position, kAnchorBytes);
-                    anchors[key].push_back(position);
-                    provisional_anchors.emplace_back(key, position);
+                    if (anchor_count < kMaxAnchorEntries) {
+                        anchors[key].push_back(position);
+                        ++anchor_count;
+                        provisional_anchors.emplace_back(key, position);
+                    }
                 }
             } while (position < group_end &&
-                     (position + kAnchorBytes > group_end || anchors[gear_hash(history_input.data() + position, kAnchorBytes)].empty()));
+                     (position + kAnchorBytes > group_end ||
+                      anchors.find(gear_hash(history_input.data() + position,
+                                              kAnchorBytes)) == anchors.end()));
             stage.tokens.push_back({false, static_cast<uint64_t>(residual_start),
                                     static_cast<uint32_t>(stage.residual.size() - residual_start)});
             residual_start = stage.residual.size();
@@ -150,6 +160,57 @@ GroupStage group_encode(std::span<const uint8_t> history,
         }
     }
     return stage;
+}
+
+uint64_t history_limit(ZstdTuLimits limits) {
+    return std::min(limits.max_history_bytes,
+                    uint64_t{1} << limits.max_window_log);
+}
+
+void rebuild_anchors(std::vector<uint8_t>& history,
+                     std::unordered_map<uint64_t, std::vector<uint64_t>>& anchors,
+                     size_t& anchor_count) {
+    anchors.clear();
+    anchor_count = 0;
+    if (history.size() < kAnchorBytes)
+        return;
+    // Favor the newest suffix: those anchors are the only ones that can
+    // reference a long continuation after eviction of the old prefix.
+    const size_t available = history.size() - kAnchorBytes + 1;
+    const size_t first = available > kMaxAnchorEntries
+                             ? available - kMaxAnchorEntries
+                             : 0;
+    for (size_t position = first; position < available; ++position) {
+        const uint64_t key = gear_hash(history.data() + position, kAnchorBytes);
+        anchors[key].push_back(position);
+        ++anchor_count;
+    }
+}
+
+void retain_suffix(std::vector<uint8_t>& history,
+                   std::span<const uint8_t> committed,
+                   uint64_t limit) {
+    const size_t bounded = static_cast<size_t>(limit);
+    if (committed.size() >= bounded) {
+        history.assign(committed.end() - static_cast<std::ptrdiff_t>(bounded),
+                       committed.end());
+    } else {
+        const size_t excess = history.size() + committed.size() > bounded
+                                  ? history.size() + committed.size() - bounded
+                                  : 0;
+        if (excess != 0)
+            history.erase(history.begin(), history.begin() + excess);
+        history.insert(history.end(), committed.begin(), committed.end());
+    }
+}
+
+void retain_committed_suffix(std::vector<uint8_t>& history,
+                             std::span<const uint8_t> committed,
+                             uint64_t limit,
+                             std::unordered_map<uint64_t, std::vector<uint64_t>>& anchors,
+                             size_t& anchor_count) {
+    retain_suffix(history, committed, limit);
+    rebuild_anchors(history, anchors, anchor_count);
 }
 
 std::vector<uint8_t> group_pack(const GroupStage& stage, uint64_t history_bytes,
@@ -285,13 +346,29 @@ struct GrzResidualCodec::State {
     std::vector<uint8_t> encode_history;
     std::vector<uint8_t> encode_pending;
     std::unordered_map<uint64_t, std::vector<uint64_t>> encode_anchors;
+    size_t encode_anchor_count = 0;
     std::vector<std::pair<uint64_t, uint64_t>> encode_provisional_anchors;
+    std::optional<HistoryNonce> encode_history_nonce;
+    std::optional<RelSeq> encode_last_rel;
+    std::optional<Digest128> encode_state_digest;
+    std::optional<HistoryNonce> encode_pending_nonce;
+    std::optional<RelSeq> encode_pending_rel;
+    std::optional<Digest128> encode_pending_state;
+    uint64_t encode_history_limit = uint64_t{128} << 20;
     std::vector<uint8_t> decode_history;
     std::vector<uint8_t> decode_pending;
+    std::optional<HistoryNonce> decode_history_nonce;
+    std::optional<RelSeq> decode_last_rel;
+    std::optional<Digest128> decode_state_digest;
+    std::optional<HistoryNonce> decode_pending_nonce;
+    std::optional<RelSeq> decode_pending_rel;
+    std::optional<Digest128> decode_pending_state;
+    uint64_t decode_history_limit = uint64_t{128} << 20;
 };
 
 void rollback_provisional_anchors(
     std::unordered_map<uint64_t, std::vector<uint64_t>>& anchors,
+    size_t& anchor_count,
     std::vector<std::pair<uint64_t, uint64_t>>& provisional_anchors) noexcept {
     for (auto it = provisional_anchors.rbegin(); it != provisional_anchors.rend(); ++it) {
         auto found = anchors.find(it->first);
@@ -299,9 +376,24 @@ void rollback_provisional_anchors(
             found->second.back() != it->second)
             continue;
         found->second.pop_back();
+        if (anchor_count != 0)
+            --anchor_count;
         if (found->second.empty()) anchors.erase(found);
     }
     provisional_anchors.clear();
+}
+
+void validate_grz_successor(const TxBegin& begin,
+                            const std::optional<HistoryNonce>& history_nonce,
+                            const std::optional<RelSeq>& last_rel,
+                            const std::optional<Digest128>& state_digest) {
+    if (history_nonce && begin.history_nonce != *history_nonce)
+        throw std::invalid_argument("GRZ_RESIDUAL history nonce changed without reset");
+    if (last_rel && (last_rel->value == std::numeric_limits<uint64_t>::max() ||
+                     begin.rel_seq.value != last_rel->value + 1))
+        throw std::invalid_argument("GRZ_RESIDUAL REL_SEQ did not advance by one");
+    if (state_digest && begin.pre_state_digest != *state_digest)
+        throw std::invalid_argument("GRZ_RESIDUAL predecessor state digest differs");
 }
 
 GrzResidualCodec::GrzResidualCodec() : state_(std::make_unique<State>()) {}
@@ -321,12 +413,19 @@ GrzResidualEnvelope GrzResidualCodec::encode(
 
     if (!state_->encode_pending.empty())
         throw std::logic_error("GRZ_RESIDUAL route has an uncommitted TU");
-    if (state_->encode_history.size() > limits.max_history_bytes ||
-        exact_input.size() > limits.max_history_bytes - state_->encode_history.size())
-        throw std::length_error("GRZ_RESIDUAL route history exceeds the local cap");
+    const uint64_t limit = history_limit(limits);
+    if (state_->encode_history.size() > limit)
+        throw std::logic_error("GRZ_RESIDUAL committed history exceeds the local cap");
+    TxBegin successor;
+    successor.history_nonce = history_nonce;
+    successor.rel_seq = rel_seq;
+    successor.pre_state_digest = pre_state_digest;
+    validate_grz_successor(successor, state_->encode_history_nonce,
+                           state_->encode_last_rel, state_->encode_state_digest);
     try {
         const GroupStage stage = group_encode(state_->encode_history, exact_input,
                                               state_->encode_anchors,
+                                              state_->encode_anchor_count,
                                               state_->encode_provisional_anchors);
         residual_group::Kind selected = residual_group::Kind::Zstd3;
         const std::vector<uint8_t> residual_wire = state_->codec.encode(
@@ -334,6 +433,7 @@ GrzResidualEnvelope GrzResidualCodec::encode(
         std::vector<uint8_t> encoded = group_pack(stage, state_->encode_history.size(), residual_wire);
         if (encoded.empty() || encoded.size() > limits.max_encoded_body_bytes) {
             rollback_provisional_anchors(state_->encode_anchors,
+                                         state_->encode_anchor_count,
                                          state_->encode_provisional_anchors);
             throw std::length_error("GRZ_RESIDUAL encoded BODY exceeds the local cap");
         }
@@ -354,9 +454,16 @@ GrzResidualEnvelope GrzResidualCodec::encode(
         result.begin.transaction_digest = compute_transaction_digest(
             result.begin, std::span<const uint8_t>{}, result.body);
         state_->encode_pending.assign(exact_input.begin(), exact_input.end());
+        state_->encode_pending_nonce = history_nonce;
+        state_->encode_pending_rel = rel_seq;
+        state_->encode_pending_state = compute_post_state_digest(
+            pre_state_digest, history_nonce, rel_seq, tu_seq,
+            result.begin.transaction_digest);
+        state_->encode_history_limit = limit;
         return result;
     } catch (...) {
         rollback_provisional_anchors(state_->encode_anchors,
+                                     state_->encode_anchor_count,
                                      state_->encode_provisional_anchors);
         throw;
     }
@@ -364,25 +471,64 @@ GrzResidualEnvelope GrzResidualCodec::encode(
 
 void GrzResidualCodec::commit() {
     if (!state_->encode_pending.empty()) {
-        state_->encode_history.insert(state_->encode_history.end(),
-                                      state_->encode_pending.begin(),
-                                      state_->encode_pending.end());
+        // Commit is the only point at which the route window advances.  The
+        // complete predecessor remains available to a retry until this call.
+        retain_committed_suffix(state_->encode_history, state_->encode_pending,
+                                state_->encode_history_limit,
+                                state_->encode_anchors,
+                                state_->encode_anchor_count);
+        state_->encode_history_nonce = state_->encode_pending_nonce;
+        state_->encode_last_rel = state_->encode_pending_rel;
+        state_->encode_state_digest = state_->encode_pending_state;
         state_->encode_pending.clear();
+        state_->encode_pending_nonce.reset();
+        state_->encode_pending_rel.reset();
+        state_->encode_pending_state.reset();
         state_->encode_provisional_anchors.clear();
     }
     if (!state_->decode_pending.empty()) {
-        state_->decode_history.insert(state_->decode_history.end(),
-                                      state_->decode_pending.begin(),
-                                      state_->decode_pending.end());
+        retain_suffix(state_->decode_history, state_->decode_pending,
+                      state_->decode_history_limit);
+        state_->decode_history_nonce = state_->decode_pending_nonce;
+        state_->decode_last_rel = state_->decode_pending_rel;
+        state_->decode_state_digest = state_->decode_pending_state;
         state_->decode_pending.clear();
+        state_->decode_pending_nonce.reset();
+        state_->decode_pending_rel.reset();
+        state_->decode_pending_state.reset();
     }
 }
 
 void GrzResidualCodec::discard() noexcept {
     rollback_provisional_anchors(state_->encode_anchors,
+                                 state_->encode_anchor_count,
                                  state_->encode_provisional_anchors);
     state_->encode_pending.clear();
     state_->decode_pending.clear();
+    state_->encode_pending_nonce.reset();
+    state_->encode_pending_rel.reset();
+    state_->encode_pending_state.reset();
+    state_->decode_pending_nonce.reset();
+    state_->decode_pending_rel.reset();
+    state_->decode_pending_state.reset();
+}
+
+void GrzResidualCodec::reset() noexcept {
+    discard();
+    state_->encode_history.clear();
+    state_->encode_anchors.clear();
+    state_->encode_anchor_count = 0;
+    state_->decode_history.clear();
+    state_->encode_history_nonce.reset();
+    state_->encode_last_rel.reset();
+    state_->encode_state_digest.reset();
+    state_->decode_history_nonce.reset();
+    state_->decode_last_rel.reset();
+    state_->decode_state_digest.reset();
+}
+
+size_t GrzResidualCodec::retained_history_bytes() const noexcept {
+    return std::max(state_->encode_history.size(), state_->decode_history.size());
 }
 
 GrzResidualEnvelope encode_grz_residual(
@@ -411,6 +557,10 @@ std::vector<uint8_t> GrzResidualCodec::decode(
         throw std::invalid_argument("GRZ_RESIDUAL transaction digest differs");
     if (!state_->decode_pending.empty())
         throw std::logic_error("GRZ_RESIDUAL route has an uncommitted decoded TU");
+    validate_grz_successor(begin, state_->decode_history_nonce,
+                           state_->decode_last_rel, state_->decode_state_digest);
+    if (state_->decode_history.size() > history_limit(limits))
+        throw std::length_error("GRZ_RESIDUAL decoder history exceeds the local cap");
     const GroupDecoded decoded = group_unpack(encoded_body.data(), encoded_body.size(),
                                               state_->decode_history, state_->codec);
     if (decoded.raw.size() != begin.raw_bytes)
@@ -418,6 +568,12 @@ std::vector<uint8_t> GrzResidualCodec::decode(
     if (icecc::digest128(decoded.raw) != begin.raw_digest)
         throw std::invalid_argument("GRZ_RESIDUAL raw input digest differs");
     state_->decode_pending = decoded.raw;
+    state_->decode_pending_nonce = begin.history_nonce;
+    state_->decode_pending_rel = begin.rel_seq;
+    state_->decode_pending_state = compute_post_state_digest(
+        begin.pre_state_digest, begin.history_nonce, begin.rel_seq, begin.tu_seq,
+        begin.transaction_digest);
+    state_->decode_history_limit = history_limit(limits);
     return decoded.raw;
 }
 
@@ -453,7 +609,11 @@ void GrzResidualDialogue::begin(const TxBegin& begin_value) {
     if (state_ != State::Idle) protocol_error("second TX_BEGIN arrived on a live dialogue");
     if ((negotiated_profiles_ & profile_bit(begin_value.profile)) == 0)
         protocol_error("TX_BEGIN selected an unnegotiated profile");
-    try { validate_shape(begin_value, limits_); }
+    try {
+        validate_shape(begin_value, limits_);
+        validate_grz_successor(begin_value, history_nonce_, last_rel_,
+                               committed_state_);
+    }
     catch (...) { clear_active(); state_ = State::Terminal; throw; }
     active_ = begin_value;
     state_ = State::ReceivingBody;
@@ -499,6 +659,9 @@ void GrzResidualDialogue::commit_visible(const TxCommit& commit) {
     if (!active_ || !commit_matches_grz(commit, *active_))
         throw std::invalid_argument("GRZ_RESIDUAL terminal commit differs from TX_BEGIN");
     codec_.commit();
+    history_nonce_ = active_->history_nonce;
+    last_rel_ = active_->rel_seq;
+    committed_state_ = commit.post_state_digest;
     clear_active(); state_ = State::Idle;
 }
 
@@ -506,13 +669,28 @@ void GrzResidualDialogue::discard_tentative() noexcept {
     codec_.discard();
     if (state_ != State::Idle && state_ != State::Terminal) { clear_active(); state_ = State::Idle; }
 }
-void GrzResidualDialogue::disconnect() { codec_.discard(); clear_active(); state_ = State::Terminal; }
+void GrzResidualDialogue::disconnect() {
+    codec_.reset();
+    clear_active();
+    history_nonce_.reset();
+    last_rel_.reset();
+    committed_state_.reset();
+    state_ = State::Terminal;
+}
 void GrzResidualDialogue::reset() {
     if (state_ != State::Terminal) throw std::logic_error("GRZ_RESIDUAL reset requires a terminal dialogue");
-    clear_active(); state_ = State::Idle;
+    codec_.reset();
+    clear_active();
+    history_nonce_.reset();
+    last_rel_.reset();
+    committed_state_.reset();
+    state_ = State::Idle;
 }
 uint64_t GrzResidualDialogue::window_limit_bytes() const noexcept {
     return uint64_t{1} << limits_.max_window_log;
+}
+size_t GrzResidualDialogue::retained_history_bytes() const noexcept {
+    return codec_.retained_history_bytes();
 }
 [[noreturn]] void GrzResidualDialogue::protocol_error(const char* message) {
     codec_.discard(); clear_active(); state_ = State::Terminal; throw std::invalid_argument(message);
