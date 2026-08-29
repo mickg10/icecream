@@ -339,7 +339,7 @@ def _product_build_contract(product_build: Path, repo: Path,
 
     return {
         "status": "READY", "path": str(build),
-        "git": _git_identity(repo),
+        "git": _git_identity(build),
         "required_binaries": binaries,
         "config_h": {"relative": str(PRODUCT_CONFIG), **config_facts},
         "cache_makefile": {"relative": str(PRODUCT_CACHE_MAKEFILE), **makefile_facts},

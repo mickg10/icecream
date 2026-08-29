@@ -53,10 +53,10 @@ def _product_build(root: Path) -> Path:
     return build
 
 
-def _git_fixture(root: Path) -> Path:
-    root.mkdir(parents=True)
+def _git_fixture(root: Path, content: str = "source\n") -> Path:
+    root.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-q", str(root)], check=True)
-    _write(root / "tracked.txt", "source\n")
+    _write(root / "tracked.txt", content)
     subprocess.run(["git", "-C", str(root), "add", "tracked.txt"], check=True)
     subprocess.run([
         "git", "-C", str(root), "-c", "user.name=S8 test",
@@ -153,6 +153,26 @@ def test_product_build_binding_is_authenticated_and_renders_all_cells(
         compile_arg = f"ICECC_P50_C1F1_COMPILE_SOURCE={compile_source}"
         assert compile_arg in item["argv"]
         assert Path(compile_source).is_absolute()
+
+
+def test_product_build_git_binding_cannot_use_source_repository(
+    tmp_path: Path,
+) -> None:
+    source_repo = _git_fixture(tmp_path / "source-repo")
+    product_build = _git_fixture(_product_build(tmp_path / "product-repo"), "product\n")
+    runner = {
+        "sha256": "c" * 64,
+        "source_contract": {"sha256": "d" * 64},
+        "profiles": list(preflight.PROFILES), "warm_values": [0, 1],
+        "contract_check": "PASS",
+    }
+    source_identity = preflight._git_identity(source_repo)
+    product_identity = preflight._git_identity(product_build)
+    assert source_identity["commit"] != product_identity["commit"]
+    assert source_identity["tree"] != product_identity["tree"]
+    binding = preflight._product_build_contract(product_build, source_repo, runner)
+    assert binding["git"] == product_identity
+    assert binding["git"] != source_identity
 
 
 def test_product_build_binding_rejects_missing_binary_and_bad_grz_config(
