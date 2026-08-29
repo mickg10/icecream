@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shlex
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -52,6 +53,18 @@ def _product_build(root: Path) -> Path:
     return build
 
 
+def _git_fixture(root: Path) -> Path:
+    root.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    _write(root / "tracked.txt", "source\n")
+    subprocess.run(["git", "-C", str(root), "add", "tracked.txt"], check=True)
+    subprocess.run([
+        "git", "-C", str(root), "-c", "user.name=S8 test",
+        "-c", "user.email=s8-test@example.invalid", "commit", "-qm", "fixture",
+    ], check=True)
+    return root
+
+
 def test_preflight_binds_both_corpora_and_repeated_matrix_cells(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -92,6 +105,23 @@ def test_cli_is_read_only_without_output_path(tmp_path: Path,
     output = json.loads(capsys.readouterr().out)
     assert output["schema"] == preflight.SCHEMA
     assert not list(tmp_path.glob("*.json"))
+
+
+def test_git_identity_allows_untracked_outputs_but_rejects_tracked_edits(
+    tmp_path: Path,
+) -> None:
+    root = _git_fixture(tmp_path / "source")
+    clean = preflight._git_identity(root)
+    assert clean["status"] == "tracked_clean"
+    assert clean["untracked"] == "ignored"
+    assert "reject_tracked_or_index_changes" in clean["status_policy"]
+
+    _write(root / "generated-product-output", "generated\n")
+    assert preflight._git_identity(root) == clean
+
+    _write(root / "tracked.txt", "mutated\n")
+    with pytest.raises(preflight.PreflightError, match="source_git_tracked_changes"):
+        preflight._git_identity(root)
 
 
 def test_product_build_binding_is_authenticated_and_renders_all_cells(

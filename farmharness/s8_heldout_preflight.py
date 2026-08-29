@@ -137,13 +137,17 @@ def _git_identity(root: Path) -> dict[str, str]:
 
     try:
         status = subprocess.run(["git", "-C", str(root), "status", "--porcelain",
-                                 "--untracked-files=all"], check=True,
+                                 "--untracked-files=no"], check=True,
                                 capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError) as exc:
         raise PreflightError(f"source_git_status_unavailable:{root}") from exc
     if status.stdout:
-        raise PreflightError(f"source_git_dirty:{root}")
-    return {"commit": rev("HEAD"), "tree": rev("HEAD^{tree}")}
+        raise PreflightError(f"source_git_tracked_changes:{root}")
+    return {
+        "commit": rev("HEAD"), "tree": rev("HEAD^{tree}"),
+        "status": "tracked_clean", "untracked": "ignored",
+        "status_policy": "reject_tracked_or_index_changes_ignore_untracked_generated_outputs",
+    }
 
 
 def _paths_from_manifest(path: Path, root: Path, label: str,
