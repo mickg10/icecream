@@ -678,7 +678,7 @@ def _excluded_prewarm(product_rows: list[dict[str, object]],
     descriptors = [{"ordinal": item["ordinal"], "source_relative": item["source_relative"],
                     "sha256": item["sha256"], "bytes": item["bytes"]} for item in inputs]
     return {
-        "segment": "full-1", "excluded": True, "points": len(inputs),
+        "segment": "prewarm", "excluded": True, "points": len(inputs),
         "raw_bytes": sum(int(item["bytes"]) for item in inputs),
         "input_digest": hashlib.sha256(canonical_bytes(descriptors)).hexdigest(),
         "inputs": descriptors,

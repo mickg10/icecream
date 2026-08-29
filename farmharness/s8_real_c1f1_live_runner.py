@@ -34,7 +34,7 @@ except ImportError:  # pragma: no cover
     from s8_schema import CORPORA, PROFILES, REGIMES, SPLITS
 
 
-SCHEMA = "icecream-s8-real-c1f1-live-runner-v1"
+SCHEMA = "icecream-s8-real-c1f1-live-runner-v2"
 TOPOLOGY = "C1F1/100000"
 PARALLEL_TOPOLOGY = "C1F20/40"
 TOPOLOGIES = frozenset((TOPOLOGY, PARALLEL_TOPOLOGY))
@@ -252,7 +252,8 @@ def load_predictive_plan(path: Path, *, corpus: str, profile: str, regime: str,
     if not isinstance(request, dict):
         _fail("predictive_plan:request_missing")
     requested_depth = request.get("depth")
-    if (depth == "full" and requested_depth != "full") or (depth != "full" and requested_depth != int(depth)):
+    if ((depth in {"full", "repeat-full"} and requested_depth != depth) or
+            (depth not in {"full", "repeat-full"} and requested_depth != int(depth))):
         _fail("predictive_plan:depth_mismatch")
     source = value.get("source_manifest")
     inputs = value.get("inputs")
@@ -278,7 +279,7 @@ def load_predictive_plan(path: Path, *, corpus: str, profile: str, regime: str,
         raise LiveRunnerError("predictive_plan:source_manifest_unreadable") from exc
     if source["entries"] != len(source_lines) or len(inputs) > len(source_lines):
         _fail("predictive_plan:source_manifest_entries_mismatch")
-    if depth != "full" and len(inputs) != int(depth):
+    if depth not in {"full", "repeat-full"} and len(inputs) != int(depth):
         _fail("predictive_plan:input_count_mismatch")
     for ordinal, item in enumerate(inputs):
         if (not isinstance(item, dict) or set(item) != {"ordinal", "path", "source_relative", "sha256", "bytes"} or
@@ -304,6 +305,36 @@ def load_predictive_plan(path: Path, *, corpus: str, profile: str, regime: str,
         if listed.resolve() != item_path.resolve():
             _fail(f"predictive_plan:input_sequence_mismatch:{ordinal}")
     return value, [dict(item) for item in inputs], plan_sha
+
+
+def load_repeat_predictive_plan(path: Path, *, first_path: Path,
+                                first_plan: dict[str, Any],
+                                first_inputs: list[dict[str, Any]], first_sha: str,
+                                corpus: str, profile: str,
+                                regime: str) -> tuple[dict[str, Any],
+                                                      list[dict[str, Any]], str]:
+    """Authenticate full-2 as the declared repeat of the exact full-1 plan."""
+    repeat, repeat_inputs, repeat_sha = load_predictive_plan(
+        path, corpus=corpus, profile=profile, regime=regime, depth="repeat-full")
+    current_first_sha, current_first_bytes = _sha(first_path)
+    if current_first_sha != first_sha:
+        _fail("repeat_predictive_plan:first_plan_changed")
+    repeat_of = repeat.get("repeat_of")
+    if (not isinstance(repeat_of, dict) or
+            set(repeat_of) != {"path", "sha256", "bytes"} or
+            not isinstance(repeat_of.get("path"), str) or
+            not os.path.isabs(repeat_of["path"]) or
+            Path(repeat_of["path"]).resolve() != first_path.resolve() or
+            repeat_of.get("sha256") != first_sha or
+            repeat_of.get("bytes") != current_first_bytes):
+        _fail("repeat_predictive_plan:repeat_of_mismatch")
+    for field in ("semantics", "source_manifest", "source_root",
+                  "matrix_precondition", "inputs", "scheduling"):
+        if repeat.get(field) != first_plan.get(field):
+            _fail(f"repeat_predictive_plan:{field}_mismatch")
+    if repeat_inputs != first_inputs:
+        _fail("repeat_predictive_plan:input_sequence_mismatch")
+    return repeat, repeat_inputs, repeat_sha
 
 
 def bind_batch_to_plan(rows: list[dict[str, Any]], plan_inputs: list[dict[str, Any]]) -> None:
@@ -1204,6 +1235,7 @@ def _write_new(path: Path, raw: bytes) -> None:
 
 def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Path,
              predictive_plan: Path, output: Path, profile: str, product_root: Path,
+             repeat_predictive_plan: Path | None = None,
              corpus: str = "DuckDB", regime: str = "cold", depth: str = "100",
              full_count: int | None = None, passes: int = 2,
              artifact_sample: int = 2, retain_all_artifacts: bool = False,
@@ -1225,13 +1257,24 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
         _fail("execution_environment:image_identity_invalid")
     if corpus not in CORPORA or regime not in REGIMES or suite not in TOPOLOGIES:
         _fail("cell:undeclared")
+    if passes not in (1, 2) or type(artifact_sample) is not int or artifact_sample < 0:
+        _fail("run_options:invalid")
     plan, plan_inputs, plan_sha = load_predictive_plan(
         predictive_plan, corpus=corpus, profile=profile, regime=regime, depth=depth)
+    repeat_plan: dict[str, Any] | None = None
+    repeat_plan_sha: str | None = None
+    if repeat_predictive_plan is not None:
+        if depth != "full" or passes != 2:
+            _fail("repeat_predictive_plan:only_valid_for_full_two_pass")
+        repeat_plan, _repeat_inputs, repeat_plan_sha = load_repeat_predictive_plan(
+            repeat_predictive_plan, first_path=predictive_plan, first_plan=plan,
+            first_inputs=plan_inputs, first_sha=plan_sha, corpus=corpus,
+            profile=profile, regime=regime)
+    elif depth == "full" and passes == 2:
+        _fail("repeat_predictive_plan:required_for_full_two_pass")
     if full_count is None and depth == "full":
         full_count = len(plan_inputs)
     expected_count = selected_count(depth, full_count)
-    if passes not in (1, 2) or type(artifact_sample) is not int or artifact_sample < 0:
-        _fail("run_options:invalid")
     rows = load_batch_manifest(batch_manifest, expected_count)
     bind_batch_to_plan(rows, plan_inputs)
     topology_sha = load_topology(topology, rows, suite, plan.get("scheduling"))
@@ -1310,6 +1353,11 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                                            "inputs": plan_inputs})).hexdigest()
     try:
         comparison = normalizer.comparison_descriptor(plan_sha, plan.get("scheduling"))
+        comparisons = {"full-1": comparison}
+        if passes == 2:
+            comparisons["full-2"] = normalizer.comparison_descriptor(
+                repeat_plan_sha if repeat_plan_sha is not None else plan_sha,
+                repeat_plan.get("scheduling") if repeat_plan is not None else plan.get("scheduling"))
     except normalizer.NormalizationError as exc:
         _fail(f"predictive_plan:{exc}")
     if timestamp is None:
@@ -1327,6 +1375,8 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     shutil.copy2(batch_manifest, retained / "batch-manifest.jsonl")
     shutil.copy2(topology, retained / "topology.json")
     shutil.copy2(predictive_plan, retained / "predictive-plan.json")
+    if repeat_predictive_plan is not None:
+        shutil.copy2(repeat_predictive_plan, retained / "predictive-plan-full-2.json")
     payload_raw = _canonical({"source_manifest_sha256": plan["source_manifest"]["sha256"],
                               "inputs": plan_inputs})
     _write_new(retained / "input-descriptors.json", payload_raw)
@@ -1334,9 +1384,17 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     retained_payload_sha, retained_payload_bytes = _sha(retained / "input-descriptors.json")
     retained_topology_sha, retained_topology_bytes = _sha(retained / "topology.json")
     retained_plan_sha, retained_plan_bytes = _sha(retained / "predictive-plan.json")
+    retained_repeat_plan_sha: str | None = None
+    retained_repeat_plan_bytes: int | None = None
+    if repeat_predictive_plan is not None:
+        retained_repeat_plan_sha, retained_repeat_plan_bytes = _sha(
+            retained / "predictive-plan-full-2.json")
     if (retained_input_sha != batch_manifest_sha or retained_topology_sha != topology_sha or
             retained_plan_sha != plan_sha or retained_payload_sha != input_sha):
         _fail("manifest_snapshot:changed_during_copy")
+    if (repeat_predictive_plan is not None and
+            retained_repeat_plan_sha != repeat_plan_sha):
+        _fail("repeat_predictive_plan:snapshot_changed_during_copy")
     trace_paths = [work / "s7-measured-c-action-trace.jsonl", work / "s7-measured-f-action-trace.jsonl"]
     if regime == "warm":
         trace_paths.extend((work / "s7-prewarm-c-action-trace.jsonl", work / "s7-prewarm-f-action-trace.jsonl"))
@@ -1445,7 +1503,17 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
         }
     if passes == 2:
         witness["timing_full_2"] = {"path": "timing_full-2.jsonl", "sha256": hashlib.sha256(timing_by_run["full-2"]).hexdigest(), "bytes": len(timing_by_run["full-2"])}
-    evidence_value = {"schema": "icecream-s7-live-evidence-v1",
+    predictive_plans: dict[str, dict[str, object]] = {
+        "full-1": {"path": "product-evidence/predictive-plan.json",
+                   "sha256": retained_plan_sha, "bytes": retained_plan_bytes},
+    }
+    if retained_repeat_plan_sha is not None and retained_repeat_plan_bytes is not None:
+        predictive_plans["full-2"] = {
+            "path": "product-evidence/predictive-plan-full-2.json",
+            "sha256": retained_repeat_plan_sha,
+            "bytes": retained_repeat_plan_bytes,
+        }
+    evidence_value = {"schema": "icecream-s7-live-evidence-v2",
                       "cell": cell, "split": split, "run_id": "s8-real-c1f1",
                       "source_commit": commit, "source_tree": tree,
                       "input_manifest_sha256": batch_manifest_sha, "input_digest": input_sha,
@@ -1458,7 +1526,9 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                                             "bytes": retained_payload_bytes},
                       "predictive_plan": {"path": "product-evidence/predictive-plan.json",
                                           "sha256": retained_plan_sha, "bytes": retained_plan_bytes},
+                      "predictive_plans": predictive_plans,
                       "comparison": comparison,
+                      "comparisons": comparisons,
                       "topology": {"path": "product-evidence/topology.json",
                                    "sha256": retained_topology_sha,
                                    "bytes": retained_topology_bytes},
@@ -1499,7 +1569,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                                         "source_commit": commit, "source_tree": tree,
                                         "input_digest": input_sha, "topology_digest": topology_sha,
                                         "model_id": "s8-real-live"},
-                          "comparison": comparison,
+                          "comparison": comparisons[run],
                           "units": {"point": "step", "channel_bytes": "bytes", "elapsed_ns": "ns",
                                     "C_TO_F_bytes": "bytes", "F_TO_C_bytes": "bytes",
                                     "throughput_bytes_per_s": "bytes_per_s"},
@@ -1511,7 +1581,9 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
         manifest_raw = _canonical(manifest_value) + b"\n"
         _write_new(target / curve_name, curve_raw)
         _write_new(target / manifest_name, manifest_raw)
-        artifact = {"identity": manifest_value["identity"], "units": manifest_value["units"],
+        artifact = {"identity": manifest_value["identity"],
+                    "comparison": manifest_value["comparison"],
+                    "units": manifest_value["units"],
                     "provenance": manifest_value["provenance"], "manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
                     "curve_sha256": hashlib.sha256(curve_raw).hexdigest(), "rows": curve,
                     "evidence": manifest_value["evidence"]}
@@ -1526,6 +1598,9 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                   "same_service_state": True, "input_manifest_sha256": batch_manifest_sha,
                   "input_digest": input_sha,
                   "topology_sha256": topology_sha, "predictive_plan_sha256": plan_sha,
+                  "predictive_plan_sha256_by_run": {
+                      run: comparisons[run]["plan_sha256"] for run in run_names
+                  },
                   "execution_environment": execution_environment,
                   "runtime_image": runtime_image,
                   "diagnostic_policy": {
@@ -1609,6 +1684,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch-manifest", type=Path, required=True)
     parser.add_argument("--predictive-plan", type=Path, required=True)
+    parser.add_argument("--repeat-predictive-plan", type=Path)
     parser.add_argument("--topology", type=Path, required=True)
     parser.add_argument("--suite", choices=tuple(TOPOLOGIES), default=TOPOLOGY)
     parser.add_argument("--profile", choices=PROFILES, required=True)
@@ -1631,10 +1707,21 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     batch_manifest = args.batch_manifest.absolute()
     predictive_plan = args.predictive_plan.absolute()
+    repeat_predictive_plan = (args.repeat_predictive_plan.absolute()
+                              if args.repeat_predictive_plan is not None else None)
     topology = args.topology.absolute()
     _plan, plan_inputs, _plan_sha = load_predictive_plan(
         predictive_plan, corpus=args.corpus, profile=args.profile,
         regime=args.regime, depth=args.depth)
+    if repeat_predictive_plan is not None:
+        if args.depth != "full" or args.passes != 2:
+            _fail("repeat_predictive_plan:only_valid_for_full_two_pass")
+        load_repeat_predictive_plan(
+            repeat_predictive_plan, first_path=predictive_plan, first_plan=_plan,
+            first_inputs=plan_inputs, first_sha=_plan_sha, corpus=args.corpus,
+            profile=args.profile, regime=args.regime)
+    elif args.depth == "full" and args.passes == 2:
+        _fail("repeat_predictive_plan:required_for_full_two_pass")
     if args.depth == "full":
         args.full_count = len(plan_inputs)
     count = selected_count(args.depth, args.full_count)
@@ -1671,6 +1758,8 @@ def main(argv: list[str] | None = None) -> int:
                             topology=topology)
     if not args.execute:
         print(json.dumps({"schema": SCHEMA, "status": "DRY_RUN", "command": command,
+                          "repeat_predictive_plan": str(repeat_predictive_plan)
+                          if repeat_predictive_plan is not None else None,
                           "execution_mode": args.execution_mode,
                           "container_image": args.container_image
                           if args.execution_mode == "pinned-container" else None},
@@ -1680,6 +1769,8 @@ def main(argv: list[str] | None = None) -> int:
         assert run_work_parent is not None and runtime_image is not None
         required_paths = [batch_manifest, predictive_plan, topology,
                           args.product_root.absolute(), SCRIPT]
+        if repeat_predictive_plan is not None:
+            required_paths.append(repeat_predictive_plan)
         for row in rows:
             required_paths.extend((Path(row["source"]),
                                    Path(row["predictive_input"]["path"])))
@@ -1710,6 +1801,7 @@ def main(argv: list[str] | None = None) -> int:
         path = finalize(stdout, returncode, batch_manifest=batch_manifest,
                         topology=topology, output=args.output.absolute(), profile=args.profile,
                         predictive_plan=predictive_plan, product_root=args.product_root.absolute(),
+                        repeat_predictive_plan=repeat_predictive_plan,
                         corpus=args.corpus, regime=args.regime, depth=args.depth,
                         full_count=args.full_count, passes=args.passes,
                         artifact_sample=args.artifact_sample,

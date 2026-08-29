@@ -30,9 +30,9 @@ except ImportError:  # direct invocation
     from s8_schema import CORPORA, PROFILES, REGIMES, SPLITS
 
 
-SCHEMA = "icecream-s8-campaign-driver-v2"
-CELL_SCHEMA = "icecream-s8-campaign-cell-v2"
-SUMMARY_SCHEMA = "icecream-s8-campaign-summary-v2"
+SCHEMA = "icecream-s8-campaign-driver-v3"
+CELL_SCHEMA = "icecream-s8-campaign-cell-v3"
+SUMMARY_SCHEMA = "icecream-s8-campaign-summary-v3"
 DEPTHS = ("100", "200", "full")
 TOPOLOGIES = ("C1F1/100000", "C1F20/40")
 TOPOLOGY_ARGS = {"C1F1/100000": "C1F1", "C1F20/40": "C1F20"}
@@ -142,15 +142,22 @@ def _artifact_tree(root: Path) -> list[dict[str, object]]:
     return result
 
 
-def _git_identity(repo: Path) -> dict[str, str]:
+def _git_identity(repo: Path) -> dict[str, object]:
     try:
         head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"],
                                        text=True, stderr=subprocess.DEVNULL).strip()
         tree = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"],
                                        text=True, stderr=subprocess.DEVNULL).strip()
+        tracked_diff = subprocess.check_output(
+            ["git", "-C", str(repo), "diff", "--binary", "--no-ext-diff", "HEAD", "--"],
+            stderr=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError) as exc:
         raise CampaignError("git:identity_unavailable") from exc
-    return {"root": str(repo), "head": head, "tree": tree}
+    return {
+        "root": str(repo), "head": head, "tree": tree,
+        "tracked_clean": not tracked_diff,
+        "tracked_diff_sha256": hashlib.sha256(tracked_diff).hexdigest(),
+    }
 
 
 def _command_record(argv: list[str], cwd: Path, *, stage: str, executable: bool = True,
@@ -171,7 +178,9 @@ def _source_commands(cell_dir: Path, cell: dict[str, str], *, depth: str,
                      engine_manifest: Path, product_root: Path, python: str,
                      campaign_stamp: str, compile_db: Path | None,
                      compile_source_root: Path | None, compile_output_root: Path | None,
-                     repo: Path) -> tuple[list[dict[str, object]], dict[str, object], dict[str, object], dict[str, object], list[Path]]:
+                     repo: Path) -> tuple[list[dict[str, object]], dict[str, object],
+                                          dict[str, object], list[dict[str, object]],
+                                          list[Path]]:
     attempt = cell_dir / "attempt-001"
     result_dir = attempt / f"s8-{_slug(cell)}-{campaign_stamp}"
     plan = attempt / ("depth-plan-full-1.json" if depth == "full" else "depth-plan.json")
@@ -220,29 +229,47 @@ def _source_commands(cell_dir: Path, cell: dict[str, str], *, depth: str,
                  "--compile-source-root", compile_src_arg,
                  "--compile-output-root", compile_out_arg, "--output", str(prep_dir)]
     live_out = attempt / "live-output"
+    live_target = (live_out / "icecream" / cell["topology"].replace("/", "-") /
+                   campaign_stamp / cell["profile"])
     live_argv = [python, str((repo / "farmharness/s8_real_c1f1_live_runner.py").absolute()),
                  "--batch-manifest", str(prep_dir / "batch-manifest.jsonl"),
                  "--predictive-plan", str(plan), "--topology", str(prep_dir / "topology.json"),
                  "--suite", cell["topology"], "--profile", cell["profile"],
                  "--product-root", str(product_root), "--corpus", cell["corpus"],
                  "--regime", cell["regime"], "--depth", depth, "--passes", "2" if depth == "full" else "1",
-                 "--output", str(live_out),
+                 "--output", str(live_out), "--timestamp", campaign_stamp,
                  "--execute"]
-    comparison_argv = [python, str((repo / "farmharness/s8_predictive_live_normalizer.py").absolute()),
-                       "--predictive-manifest", str(result_dir / "predictive_curve_manifest.json"),
-                       "--live-manifest", str(live_out / "live-curve-manifest.json"),
-                       "--out", str(attempt / "records.jsonl")]
+    if depth == "full":
+        live_argv.extend(("--repeat-predictive-plan", str(repeat_plan)))
+    comparison_specs = [("comparison", result_dir / "predictive_curve_manifest.json",
+                         live_target / "live_curve_manifest.json", attempt / "records.jsonl")]
+    if depth == "full":
+        comparison_specs = [
+            ("comparison_full_1", result_dir / "predictive_curve_manifest.json",
+             live_target / "live_curve_manifest_full-1.json", attempt / "records-full-1.jsonl"),
+            ("comparison_full_2", repeat_result / "predictive_curve_manifest.json",
+             live_target / "live_curve_manifest_full-2.json", attempt / "records-full-2.jsonl"),
+        ]
     missing = []
     if compile_db is None:
         missing.append("compile-db")
     if compile_source_root is None:
         missing.append("compile-source-root")
     reason = "live inputs not configured: " + ", ".join(missing) if missing else "live execution staged by request"
+    comparison_commands = []
+    for stage, predictive_manifest, live_manifest, records in comparison_specs:
+        comparison_argv = [
+            python, str((repo / "farmharness/s8_predictive_live_normalizer.py").absolute()),
+            "--predictive-manifest", str(predictive_manifest),
+            "--live-manifest", str(live_manifest), "--out", str(records),
+        ]
+        comparison_commands.append(_command_record(
+            comparison_argv, repo, stage=stage, executable=False,
+            reason="requires authenticated live curve"))
     return (plan_commands, producer_command,
             {"prepare": _command_record(prep_argv, repo, stage="live_prepare", executable=False, reason=reason),
              "run": _command_record(live_argv, repo, stage="live_run", executable=False, reason=reason)},
-            _command_record(comparison_argv, repo, stage="comparison", executable=False,
-                            reason="requires authenticated live curve"), result_dirs)
+            comparison_commands, result_dirs)
 
 
 def _run_command(command: dict[str, object], cwd: Path, stdout: Path, stderr: Path) -> int:
@@ -389,6 +416,8 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
         metadata = _load_json(campaign / "campaign.json")
         if metadata.get("schema") != SCHEMA or metadata.get("config") != config:
             raise CampaignError("resume:campaign_configuration_mismatch")
+        if metadata.get("git") != _git_identity(repo):
+            raise CampaignError("resume:source_identity_mismatch")
     runner = command_runner or _run_command
     records: list[dict[str, Any]] = []
     stamp = str(metadata["created_utc"])

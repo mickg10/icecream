@@ -195,7 +195,7 @@ def test_warm_curve_excludes_authenticated_prewarm_and_carries_boundary(tmp_path
         result["excluded_prewarms"][0]["state_boundaries"][0]["last_state_after_digest"]
     prewarm = result["excluded_prewarms"][0]
     assert prewarm["excluded"] is True
-    assert prewarm["segment"] == "full-1"
+    assert prewarm["segment"] == "prewarm"
     assert prewarm["input_digest"] == hashlib.sha256(canonical_bytes([
         {"ordinal": item["ordinal"], "source_relative": item["source_relative"],
          "sha256": item["sha256"], "bytes": item["bytes"]} for item in plan["inputs"]

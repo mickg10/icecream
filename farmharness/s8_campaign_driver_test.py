@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -44,9 +45,20 @@ def _runner_factory(fail_producer: int | None = None):
 
 
 def _kwargs(tmp_path: Path, **extra: object) -> dict[str, object]:
+    repo = tmp_path / "repo"
+    if not (repo / ".git").is_dir():
+        repo.mkdir()
+        (repo / "source-marker").write_text("initial\n")
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email",
+                        "test@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name",
+                        "S8 test"], check=True)
+        subprocess.run(["git", "-C", str(repo), "add", "source-marker"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "initial"], check=True)
     values: dict[str, object] = {
         "output_root": tmp_path / "experiments",
-        "repo": Path(__file__).resolve().parents[1],
+        "repo": repo,
         "corpus": "DuckDB",
         "depth": "100",
         "source_manifest": str(tmp_path / "source" / "{profile}.txt"),
@@ -77,7 +89,15 @@ def test_predictive_campaign_retains_all_cells_commands_hashes_and_summary(tmp_p
         assert set(commands) == {"predictive_plan", "predictive_producer", "live", "comparison"}
         assert commands["predictive_plan"][0]["sha256"]
         assert commands["live"]["prepare"]["executable"] is False
-        assert commands["comparison"]["reason"] == "requires authenticated live curve"
+        assert len(commands["comparison"]) == 1
+        assert commands["comparison"][0]["reason"] == "requires authenticated live curve"
+        comparison = commands["comparison"][0]
+        assert comparison["argv"][comparison["argv"].index("--live-manifest") + 1].endswith(
+            "live_curve_manifest.json")
+        assert "/live-output/icecream/" in comparison["argv"][
+            comparison["argv"].index("--live-manifest") + 1]
+        live_argv = commands["live"]["run"]["argv"]
+        assert live_argv[live_argv.index("--timestamp") + 1] == "20260829T120000Z"
         assert state["result"]["artifacts"]
 
 
@@ -146,6 +166,30 @@ def test_resume_rejects_changed_declaration(tmp_path: Path) -> None:
                              command_runner=runner)
 
 
+def test_resume_rejects_changed_source_identity(tmp_path: Path) -> None:
+    runner, _ = _runner_factory()
+    kwargs = _kwargs(tmp_path)
+    campaign = driver.run_campaign(**kwargs, command_runner=runner,
+                                   timestamp="20260829T120006Z")
+    metadata_path = campaign / "campaign.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["git"]["head"] = "0" * 40
+    metadata_path.write_bytes(driver.canonical(metadata))
+    with pytest.raises(driver.CampaignError, match="source_identity_mismatch"):
+        driver.run_campaign(**kwargs, resume=campaign, command_runner=runner)
+
+
+def test_resume_rejects_changed_tracked_source_bytes(tmp_path: Path) -> None:
+    runner, _ = _runner_factory()
+    kwargs = _kwargs(tmp_path)
+    campaign = driver.run_campaign(**kwargs, command_runner=runner,
+                                   timestamp="20260829T120007Z")
+    repo = Path(kwargs["repo"])
+    (repo / "source-marker").write_text("changed without a commit\n")
+    with pytest.raises(driver.CampaignError, match="source_identity_mismatch"):
+        driver.run_campaign(**kwargs, resume=campaign, command_runner=runner)
+
+
 def test_full_campaign_stages_and_retains_two_plan_bound_segments(tmp_path: Path) -> None:
     runner, calls = _runner_factory()
     campaign = driver.run_campaign(**_kwargs(tmp_path, depth="full"), command_runner=runner,
@@ -162,5 +206,21 @@ def test_full_campaign_stages_and_retains_two_plan_bound_segments(tmp_path: Path
         assert "--output-dir" not in commands["predictive_producer"]["argv"]
         assert len(state["result"]["segments"]) == 2
         assert commands["live"]["run"]["argv"][commands["live"]["run"]["argv"].index("--passes") + 1] == "2"
+        assert commands["live"]["run"]["argv"][
+            commands["live"]["run"]["argv"].index("--repeat-predictive-plan") + 1
+        ].endswith("depth-plan-full-2.json")
+        assert [item["stage"] for item in commands["comparison"]] == [
+            "comparison_full_1", "comparison_full_2"]
+        first_comparison, second_comparison = commands["comparison"]
+        assert first_comparison["argv"][first_comparison["argv"].index("--live-manifest") + 1].endswith(
+            "live_curve_manifest_full-1.json")
+        assert second_comparison["argv"][second_comparison["argv"].index("--live-manifest") + 1].endswith(
+            "live_curve_manifest_full-2.json")
+        assert first_comparison["argv"][first_comparison["argv"].index("--predictive-manifest") + 1] != \
+            second_comparison["argv"][second_comparison["argv"].index("--predictive-manifest") + 1]
+        assert first_comparison["argv"][first_comparison["argv"].index("--out") + 1].endswith(
+            "records-full-1.jsonl")
+        assert second_comparison["argv"][second_comparison["argv"].index("--out") + 1].endswith(
+            "records-full-2.jsonl")
         assert len(state["result"]["plans"]) == 2
         assert all(item["artifacts"] for item in state["result"]["segments"])

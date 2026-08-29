@@ -138,6 +138,51 @@ def test_predictive_plan_source_relative_mutation_is_rejected(tmp_path: Path) ->
                                     regime="cold", depth="100")
 
 
+def test_repeat_full_plan_binds_exact_first_plan_and_owns_full_2_descriptor(
+        tmp_path: Path) -> None:
+    batch = _batch(tmp_path, 3)
+    first_path = _plan(tmp_path, batch, count=3)
+    first_value = json.loads(first_path.read_text())
+    first_value["request"]["depth"] = "full"
+    first_value["request"]["requested_curve_points"] = "full"
+    first_value["matrix_precondition"] = {"status": "PASS", "sha256": "a" * 64}
+    first_value["scheduling"] = {
+        "topology": "C1F1",
+        "assignments": [{"ordinal": ordinal, "global_slot": 0}
+                        for ordinal in range(3)],
+    }
+    first_path.write_text(json.dumps(first_value, sort_keys=True))
+    first_plan, first_inputs, first_sha = runner.load_predictive_plan(
+        first_path, corpus="DuckDB", profile="ZSTD_TU", regime="cold", depth="full")
+    _first_sha, first_bytes = runner._sha(first_path)
+    repeat_value = json.loads(json.dumps(first_value))
+    repeat_value["request"]["depth"] = "repeat-full"
+    repeat_value["request"]["requested_curve_points"] = "repeat-full"
+    repeat_value["repeat_of"] = {"path": str(first_path.resolve()),
+                                 "sha256": first_sha, "bytes": first_bytes}
+    repeat_path = tmp_path / "repeat-predictive-plan.json"
+    repeat_path.write_text(json.dumps(repeat_value, sort_keys=True))
+
+    repeat_plan, repeat_inputs, repeat_sha = runner.load_repeat_predictive_plan(
+        repeat_path, first_path=first_path, first_plan=first_plan,
+        first_inputs=first_inputs, first_sha=first_sha, corpus="DuckDB",
+        profile="ZSTD_TU", regime="cold")
+    assert repeat_inputs == first_inputs
+    first_descriptor = runner.normalizer.comparison_descriptor(
+        first_sha, first_plan["scheduling"])
+    repeat_descriptor = runner.normalizer.comparison_descriptor(
+        repeat_sha, repeat_plan["scheduling"])
+    assert first_descriptor["comparison_id"] != repeat_descriptor["comparison_id"]
+
+    repeat_value["scheduling"]["assignments"][0]["global_slot"] = 1
+    repeat_path.write_text(json.dumps(repeat_value, sort_keys=True))
+    with pytest.raises(runner.LiveRunnerError, match="scheduling_mismatch"):
+        runner.load_repeat_predictive_plan(
+            repeat_path, first_path=first_path, first_plan=first_plan,
+            first_inputs=first_inputs, first_sha=first_sha, corpus="DuckDB",
+            profile="ZSTD_TU", regime="cold")
+
+
 def _action_row(actor: str, seq: int, *, history: int = 9) -> dict[str, object]:
     digest = "a" * 32
     return {
@@ -443,6 +488,8 @@ def test_product_identity_rejects_tracked_edit(tmp_path: Path) -> None:
 
 def test_batch_shell_excludes_warm_prewarm_and_carries_optional_repeat() -> None:
     shell = (Path(__file__).resolve().parents[1] / "unittests/p50compilee2e-run.sh").read_text()
+    runner_source = Path(__file__).resolve().parent.joinpath(
+        "s8_real_c1f1_live_runner.py").read_text()
     cache_service = (Path(__file__).resolve().parents[1] /
                      "cache/p50_cache_service.cpp").read_text()
     sidecar_adapter = (Path(__file__).resolve().parents[1] /
@@ -456,10 +503,9 @@ def test_batch_shell_excludes_warm_prewarm_and_carries_optional_repeat() -> None
     assert 'eval "g++ $local_compile_args"' in shell
     assert 'stdin_mode' not in shell
     assert 'if test "$passes" = 2; then' in shell
-    assert "s7-measured-c-action-trace.jsonl" in Path(__file__).resolve().parent.joinpath(
-        "s8_real_c1f1_live_runner.py").read_text()
-    assert "shutil.rmtree(work)" in Path(__file__).resolve().parent.joinpath(
-        "s8_real_c1f1_live_runner.py").read_text()
+    assert "s7-measured-c-action-trace.jsonl" in runner_source
+    assert "shutil.rmtree(work)" in runner_source
+    assert '"comparison": manifest_value["comparison"]' in runner_source
     assert 'C1F20/40) relationship_count=20; slots_per_f=2; execution_slots=40' in shell
     assert '"$build/daemon/iceccd" "$@" -p "$worker_port" -m 2' in shell
     assert '"$work/envs-f-$relationship"' in shell
