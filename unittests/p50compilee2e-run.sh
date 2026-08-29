@@ -371,10 +371,20 @@ compile_once() {
         compile_include_args=""
     fi
     if test -n "$compile_db"; then
-        ICECC_TEST_SOCKET="$work/client.sock" ICECC_TEST_REMOTEBUILD=1 \
-            ICECC_VERSION="$envtar" ICECC_P50_C1F1_REQUIRED=1 \
-            ICECC_PREFERRED_HOST=p50-f ICECC_DEBUG=debug ICECC_LOGFILE="$client_log" \
-            eval "run_client_with_timeout g++ $remote_compile_args"
+        # eval is needed to turn the safely shlex-quoted database tokens back
+        # into argv. Export first: assignments before the special builtin
+        # `eval` become shell variables, not necessarily the environment seen
+        # by the external client called by run_client_with_timeout.
+        ICECC_TEST_SOCKET="$work/client.sock"
+        ICECC_TEST_REMOTEBUILD=1
+        ICECC_VERSION="$envtar"
+        ICECC_P50_C1F1_REQUIRED=1
+        ICECC_PREFERRED_HOST=p50-f
+        ICECC_DEBUG=debug
+        ICECC_LOGFILE="$client_log"
+        export ICECC_TEST_SOCKET ICECC_TEST_REMOTEBUILD ICECC_VERSION \
+            ICECC_P50_C1F1_REQUIRED ICECC_PREFERRED_HOST ICECC_DEBUG ICECC_LOGFILE
+        eval "run_client_with_timeout g++ $remote_compile_args"
     else
         ICECC_TEST_SOCKET="$work/client.sock" ICECC_TEST_REMOTEBUILD=1 \
             ICECC_VERSION="$envtar" ICECC_P50_C1F1_REQUIRED=1 \
