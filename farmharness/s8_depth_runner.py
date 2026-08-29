@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Build an authenticated, side-effect-free S8 depth-run plan.
 
-The current S8 driver is one-input/one-point.  This layer therefore plans the
-100-TU, 200-TU, full, and repeat-full inputs without pretending that a set of
-single-TU records is one authenticated multi-TU curve.  A future depth-capable
-producer can consume this plan and write exactly one ``records.jsonl`` under
-the declared timestamped result directory.
+The plan is consumed by ``s8_multitu_predictive_producer``.  Live observation
+collection remains a separate authenticated input to the normalizer; this
+planner never treats a collection of single-TU records as a completed live
+curve.
 """
 
 from __future__ import annotations
@@ -221,11 +220,12 @@ def build_plan(source_manifest: Path, source_root: Path, matrix_audit: Path,
                     "raw_jsonl": ["predictive_sim.jsonl", "live_summary.jsonl", "records.jsonl"],
                     "records": "records.jsonl", "experiment_manifest": "experiment_manifest.json"},
         "execution_contract": {
-            "status": "MISSING_DEPTH_PRODUCER",
-            "current_driver": "s8_first_triple_driver-v2",
-            "current_driver_points": 1,
-            "required": "one authenticated predictor/live curve over the listed TU sequence",
-            "note": "Do not concatenate single-TU records; identity and input digest must bind this sequence.",
+            "status": "READY_MULTI_TU_PREDICTOR",
+            "producer": "farmharness.s8_multitu_predictive_producer",
+            "producer_points": requested_points,
+            "live_observation": "separate_authenticated_curve_required",
+            "required": "authenticated predictive curve over the ordered TU sequence",
+            "note": "The producer invokes the current simulator per TU and binds the aggregate input digest; live observations are never synthesized.",
         },
     }
     if repeat_of is not None:

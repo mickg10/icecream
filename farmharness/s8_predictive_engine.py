@@ -101,6 +101,19 @@ CHANNEL_MODELS = {
     "residual": {"uplink_factor": 1.25, "downlink_factor": 1.16, "overhead": 120},
 }
 
+# The profile relationship is part of the declared product contract.  It is
+# deliberately separate from the topology's physical channel so a sequential
+# producer cannot accidentally turn a direct TU run into a routed run merely
+# because a fixture used a route-shaped topology.
+RELATIONSHIP_MODES = {
+    "ZSTD_TU": "tu",
+    "ZSTD_ROUTE": "route",
+    "P29": "route",
+    "GRZ_RESIDUAL": "residual",
+}
+RELATIONSHIP_STATE_SCHEMA = "icecream-s8-predictive-relationship-state-v1"
+RELATIONSHIP_CODEC_SCHEMA = "icecream-s8-predictive-zstd-relationship-v1"
+
 MANIFEST_KEYS = {"schema", "semantics", "cell", "split", "predictive_mode",
                  "input", "topology_state"}
 ARTIFACT_KEYS = {"path", "sha256", "bytes"}
@@ -184,7 +197,8 @@ def regular_snapshot(path: Path, label: str, limit: int | None = None) -> tuple[
 
 
 def _sha256(value: object, label: str) -> str:
-    if not isinstance(value, str) or len(value) != 64 or set(value.lower()) - HEX64:
+    if (not isinstance(value, str) or len(value) != 64 or
+            set(value.lower()) - HEX64 or int(value, 16) == 0):
         raise PredictionError(f"{label}:invalid_sha256")
     return value.lower()
 
@@ -490,6 +504,157 @@ def _predict_curve(raw: bytes, topology: dict[str, object], cell: dict[str, str]
             "provenance": "modeled",
         })
     return rows
+
+
+def relationship_mode(cell: dict[str, str]) -> str:
+    """Return the declared sequential relationship for one S8 profile."""
+    try:
+        return RELATIONSHIP_MODES[cell["profile"]]
+    except (KeyError, TypeError) as exc:
+        raise PredictionError("relationship:profile_not_declared") from exc
+
+
+def apply_encoded_source_bytes(row: dict[str, object], encoded_bytes: int,
+                               topology: dict[str, object], cell: dict[str, str],
+                               startup: int | None = None) -> None:
+    """Recompute the modeled input-link window from actual encoded bytes."""
+    if type(encoded_bytes) is not int or encoded_bytes < 0:
+        raise PredictionError("relationship_codec:encoded_bytes_invalid")
+    elapsed = row.get("elapsed_ns")
+    if not isinstance(elapsed, dict):
+        raise PredictionError("relationship_codec:elapsed_shape_invalid")
+    topology_values = topology["topology"]
+    assert isinstance(topology_values, dict)
+    c_workers = int(topology_values["c_workers"])
+    profile_model = PROFILE_MODELS[cell["profile"]]
+    channel_model = CHANNEL_MODELS[topology_values["cache_channel"]]
+    uplink_rate = (BASE_MODEL["uplink_bytes_per_ns"] * c_workers /
+                   (profile_model["uplink_factor"] * channel_model["uplink_factor"]))
+    compression = int(elapsed["compression"])
+    old_ready = int(elapsed["input_ready"])
+    new_ready = compression + _ceil_ratio(encoded_bytes, uplink_rate) + BASE_MODEL["network_rtt_ns"]
+    elapsed["input_ready"] = new_ready
+    elapsed["total"] = int(elapsed["total"]) + new_ready - old_ready
+    if startup is not None:
+        if type(startup) is not int or startup < 0:
+            raise PredictionError("relationship_codec:startup_invalid")
+        previous_startup = int(elapsed["startup"])
+        elapsed["startup"] = startup
+        elapsed["total"] = int(elapsed["total"]) + startup - previous_startup
+
+
+def new_relationship_state(topology: dict[str, object], cell: dict[str, str],
+                           topology_digest: str | None = None) -> dict[str, object]:
+    """Create the explicit state carried between ordered simulator calls.
+
+    The default one-TU ``predict`` path never uses this interface and remains
+    byte-for-byte/numerically frozen.  ``topology_digest`` should be the hash
+    of the authenticated topology artifact when one is available.
+    """
+    validate_topology(topology, cell)
+    digest = topology_digest or hashlib.sha256(canonical_bytes(topology)).hexdigest()
+    _sha256(digest, "relationship.topology_digest")
+    return {
+        "schema": RELATIONSHIP_STATE_SCHEMA, "semantics": SEMANTICS,
+        "cell": dict(cell), "mode": relationship_mode(cell),
+        "topology_digest": digest.lower(), "next_step": 0,
+        "last_input_sha256": None, "c_cache_bytes": 0,
+        "f_cache_digest": None, "reset_points": [],
+    }
+
+
+def _validate_relationship_state(state: object, topology: dict[str, object],
+                                 cell: dict[str, str]) -> dict[str, object]:
+    if not isinstance(state, dict) or set(state) != {
+            "schema", "semantics", "cell", "mode", "topology_digest", "next_step",
+            "last_input_sha256", "c_cache_bytes", "f_cache_digest", "reset_points"}:
+        raise PredictionError("relationship_state:fields_invalid")
+    if (state["schema"] != RELATIONSHIP_STATE_SCHEMA or
+            state["semantics"] != SEMANTICS or state["cell"] != cell or
+            state["mode"] != relationship_mode(cell)):
+        raise PredictionError("relationship_state:identity_invalid")
+    _sha256(state["topology_digest"], "relationship.topology_digest")
+    if type(state["next_step"]) is not int or state["next_step"] < 0:
+        raise PredictionError("relationship_state:next_step_invalid")
+    last = state["last_input_sha256"]
+    if last is not None:
+        _sha256(last, "relationship.last_input_sha256")
+    if type(state["c_cache_bytes"]) is not int or state["c_cache_bytes"] < 0:
+        raise PredictionError("relationship_state:c_cache_bytes_invalid")
+    if state["f_cache_digest"] is not None:
+        _sha256(state["f_cache_digest"], "relationship.f_cache_digest")
+    if state["next_step"] == 0 and (last is not None or state["c_cache_bytes"] != 0 or
+                                     state["f_cache_digest"] is not None):
+        raise PredictionError("relationship_state:reset_sequence_mismatch")
+    if state["mode"] == "tu" and (last is not None or state["c_cache_bytes"] != 0 or
+                                    state["f_cache_digest"] is not None):
+        raise PredictionError("relationship_state:tu_cache_must_reset")
+    resets = state["reset_points"]
+    if (not isinstance(resets, list) or any(type(point) is not int or point < 0
+                                             for point in resets) or
+            resets != list(range(len(resets))) or len(resets) > state["next_step"]):
+        raise PredictionError("relationship_state:reset_points_invalid")
+    validate_topology(topology, cell)
+    return state
+
+
+def predict_sequential(raw: bytes, topology: dict[str, object], cell: dict[str, str],
+                       state: dict[str, object],
+                       calibration: dict[str, object] | None = None) -> tuple[dict[str, object], dict[str, object]]:
+    """Predict one TU and advance a declared relationship state.
+
+    ``ZSTD_TU`` clears relationship caches at every boundary.  The route and
+    residual modes retain a rolling C/F relationship; a repeated payload is a
+    cache reuse and therefore has a smaller C-to-F transfer and input-ready
+    window.  No route/action/trace evidence is read or generated.
+    """
+    state = _validate_relationship_state(state, topology, cell)
+    before_digest = hashlib.sha256(canonical_bytes(state)).hexdigest()
+    mode = str(state["mode"])
+    payload_digest = hashlib.sha256(raw).hexdigest()
+    step = int(state["next_step"])
+    reset_point = mode == "tu"
+    if reset_point:
+        state["last_input_sha256"] = None
+        state["c_cache_bytes"] = 0
+        state["f_cache_digest"] = None
+        state["reset_points"].append(step)
+    rows = _predict_curve(raw, topology, cell, calibration)
+    if len(rows) != 1:
+        raise PredictionError("relationship:one_tu_prediction_required")
+    row = rows[0]
+    channel = row["channel_bytes"]
+    elapsed = row["elapsed_ns"]
+    assert isinstance(channel, dict) and isinstance(elapsed, dict)
+    previous = state["last_input_sha256"]
+    cache_reuse = mode != "tu" and previous == payload_digest
+    # Numeric wire bytes are supplied by the authenticated product boundary.
+    # This state API only records the transition; it does not use a
+    # metadata-derived byte multiplier.
+    transition = "c_cache_reuse" if cache_reuse else ("tu_reset" if reset_point else "relationship_advance")
+    if mode != "tu" and step > 0:
+        startup = int(elapsed["startup"])
+        elapsed["startup"] = 0
+        elapsed["total"] = int(elapsed["total"]) - startup
+    if mode == "tu":
+        state["last_input_sha256"] = None
+        state["c_cache_bytes"] = 0
+        state["f_cache_digest"] = None
+    else:
+        state["last_input_sha256"] = payload_digest
+        state["c_cache_bytes"] = int(channel["C_TO_F"])
+        state["f_cache_digest"] = hashlib.sha256(canonical_bytes({
+            "previous_f": state["f_cache_digest"], "previous_c": payload_digest,
+            "F_TO_C_bytes": channel["F_TO_C"]})).hexdigest()
+    state["next_step"] = step + 1
+    after_digest = hashlib.sha256(canonical_bytes(state)).hexdigest()
+    row["relationship_mode"] = mode
+    row["relationship_state"] = {
+        "topology_digest": state["topology_digest"],
+        "before_digest": before_digest, "after_digest": after_digest,
+        "transition": transition, "reset_point": reset_point,
+    }
+    return row, state
 
 
 def _write_new(path: Path, raw: bytes, label: str) -> None:

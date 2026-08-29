@@ -55,7 +55,7 @@ def test_depths_select_authenticated_order_and_preserve_single_result_dir(tmp_pa
         assert plan["inputs"][-1]["ordinal"] == len(plan["inputs"]) - 1
         assert not result_dir.exists()
         assert plan["result"]["raw_jsonl"] == ["predictive_sim.jsonl", "live_summary.jsonl", "records.jsonl"]
-        assert plan["execution_contract"]["status"] == "MISSING_DEPTH_PRODUCER"
+        assert plan["execution_contract"]["status"] == "READY_MULTI_TU_PREDICTOR"
     assert plans[100]["source_manifest"]["sha256"] == plans[200]["source_manifest"]["sha256"]
 
 

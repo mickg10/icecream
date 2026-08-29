@@ -8,11 +8,18 @@
 
 #include <cstdint>
 #include <array>
+#include <algorithm>
+#include <chrono>
+#include <cctype>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <memory>
+#include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace asio = boost::asio;
@@ -128,6 +135,11 @@ struct Arguments {
     CStoreGuid c_store_guid = CStoreGuid::from_u64(0x505053494dULL);
     FStoreGuid f_store_guid = FStoreGuid::from_u64(0x505053494dULL);
     HistoryNonce history_nonce{1};
+    std::string batch_manifest;
+    std::string batch_manifest_2;
+    std::string batch_assignment_map;
+    std::string batch_assignment_map_2;
+    std::string batch_output;
 };
 
 ProfileId selected_profile() {
@@ -150,6 +162,16 @@ ProfileId selected_profile() {
 #endif
     }
     throw std::invalid_argument("unsupported ICECC_P50_PROFILE: " + value);
+}
+
+std::string_view selected_profile_label() {
+    const char* requested = std::getenv("ICECC_P50_PROFILE");
+    if (requested == nullptr || *requested == '\0')
+        return "ZSTD_TU";
+    const std::string_view value(requested);
+    if (value == "GRZ" || value == "GRZ_RESIDUAL")
+        return "GRZ_RESIDUAL";
+    return value;
 }
 
 Arguments parse(int argc, char** argv) {
@@ -186,9 +208,38 @@ Arguments parse(int argc, char** argv) {
             }
             if (result.history_nonce.value == 0)
                 throw std::invalid_argument("--history-nonce must be nonzero");
-        }
+        } else if (option == "--batch-manifest")
+            result.batch_manifest = argv[++index];
+        else if (option == "--batch-manifest-2")
+            result.batch_manifest_2 = argv[++index];
+        else if (option == "--batch-assignment-map")
+            result.batch_assignment_map = argv[++index];
+        else if (option == "--batch-assignment-map-2")
+            result.batch_assignment_map_2 = argv[++index];
+        else if (option == "--batch-output")
+            result.batch_output = argv[++index];
         else
             throw std::invalid_argument("unknown option " + option);
+    }
+    const bool batch = !result.batch_manifest.empty() ||
+                       !result.batch_manifest_2.empty() ||
+                       !result.batch_assignment_map.empty() ||
+                       !result.batch_assignment_map_2.empty() ||
+                       !result.batch_output.empty();
+    if (batch) {
+        if (result.batch_manifest.empty() || result.batch_assignment_map.empty() ||
+            result.batch_output.empty() || !result.input.empty() ||
+            !result.prewarm_input.empty() || !result.measured_input.empty() ||
+            !result.actions.empty() || !result.summary.empty() ||
+            !result.prewarm_actions.empty() || !result.measured_actions.empty())
+            throw std::invalid_argument(
+                "batch mode requires --batch-manifest, --batch-assignment-map, "
+                "and --batch-output, and cannot be combined with scenario options");
+        if (!result.batch_manifest_2.empty() && result.batch_assignment_map_2.empty())
+            result.batch_assignment_map_2 = result.batch_assignment_map;
+        if (result.batch_manifest_2.empty() && !result.batch_assignment_map_2.empty())
+            throw std::invalid_argument("--batch-assignment-map-2 requires --batch-manifest-2");
+        return result;
     }
     const bool warm = !result.prewarm_input.empty() || !result.measured_input.empty() ||
                       !result.prewarm_actions.empty() || !result.measured_actions.empty();
@@ -205,11 +256,362 @@ Arguments parse(int argc, char** argv) {
     return result;
 }
 
+std::string id_hex(const Id128& id) {
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(id.bytes.size() * 2);
+    for (uint8_t byte : id.bytes) {
+        result.push_back(digits[byte >> 4]);
+        result.push_back(digits[byte & 15]);
+    }
+    return result;
+}
+
+FStoreGuid relation_guid(FStoreGuid base, size_t relation) {
+    uint64_t suffix = 0;
+    for (size_t index = 8; index < base.bytes.size(); ++index)
+        suffix = (suffix << 8) | base.bytes[index];
+    suffix += static_cast<uint64_t>(relation);
+    for (size_t index = 0; index != 8; ++index)
+        base.bytes[15 - index] = static_cast<uint8_t>(suffix >> (index * 8));
+    return base;
+}
+
+std::string trim_copy(std::string value) {
+    const auto not_space = [](unsigned char c) { return !std::isspace(c); };
+    value.erase(value.begin(), std::find_if(value.begin(), value.end(), not_space));
+    value.erase(std::find_if(value.rbegin(), value.rend(), not_space).base(), value.end());
+    return value;
+}
+
+std::vector<std::string> read_batch_manifest(const std::string& path) {
+    std::ifstream input(path);
+    if (!input)
+        throw std::runtime_error("cannot open batch TU manifest: " + path);
+    std::vector<std::string> result;
+    std::string line;
+    while (std::getline(input, line)) {
+        line = trim_copy(std::move(line));
+        if (line.empty() || line[0] == '#')
+            continue;
+        result.push_back(std::move(line));
+    }
+    if (result.empty())
+        throw std::invalid_argument("batch TU manifest is empty");
+    std::vector<std::string> sorted = result;
+    std::sort(sorted.begin(), sorted.end());
+    if (std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end())
+        throw std::invalid_argument("batch TU manifest contains a duplicate path");
+    return result;
+}
+
+uint64_t parse_decimal(std::string_view text, size_t& cursor) {
+    while (cursor < text.size() && std::isspace(static_cast<unsigned char>(text[cursor])))
+        ++cursor;
+    const size_t begin = cursor;
+    while (cursor < text.size() && std::isdigit(static_cast<unsigned char>(text[cursor])))
+        ++cursor;
+    if (begin == cursor)
+        throw std::invalid_argument("assignment map contains a non-numeric value");
+    try {
+        return std::stoull(std::string(text.substr(begin, cursor - begin)));
+    } catch (...) {
+        throw std::invalid_argument("assignment map numeric value is out of range");
+    }
+}
+
+bool digest_is_zero(const Digest128& digest) {
+    return digest == Digest128{};
+}
+
+std::vector<size_t> read_batch_assignments(const std::string& path,
+                                           size_t expected, size_t* declared_cardinality) {
+    std::ifstream input(path);
+    if (!input)
+        throw std::runtime_error("cannot open batch assignment map: " + path);
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    const std::string text = buffer.str();
+    if (text.empty())
+        throw std::invalid_argument("batch assignment map is empty");
+
+    uint64_t cardinality = 0;
+    std::vector<size_t> assignments;
+    const size_t json_cardinality = text.find("\"cardinality\"");
+    const size_t json_assignments = text.find("\"assignments\"");
+    if (json_cardinality != std::string::npos && json_assignments != std::string::npos) {
+        size_t cursor = text.find(':', json_cardinality);
+        if (cursor == std::string::npos)
+            throw std::invalid_argument("assignment map cardinality is malformed");
+        ++cursor;
+        cardinality = parse_decimal(text, cursor);
+        const size_t open = text.find('[', json_assignments);
+        const size_t close = text.find(']', open == std::string::npos ? 0 : open + 1);
+        if (open == std::string::npos || close == std::string::npos)
+            throw std::invalid_argument("assignment map assignments are malformed");
+        cursor = open + 1;
+        while (cursor < close) {
+            while (cursor < close && (std::isspace(static_cast<unsigned char>(text[cursor])) ||
+                                      text[cursor] == ','))
+                ++cursor;
+            if (cursor == close)
+                break;
+            assignments.push_back(static_cast<size_t>(parse_decimal(text, cursor)));
+            while (cursor < close && std::isspace(static_cast<unsigned char>(text[cursor])))
+                ++cursor;
+            if (cursor < close && text[cursor] != ',')
+                throw std::invalid_argument("assignment map assignments are malformed");
+        }
+    } else {
+        std::istringstream lines(text);
+        std::string line;
+        bool first = true;
+        while (std::getline(lines, line)) {
+            line = trim_copy(std::move(line));
+            if (line.empty() || line[0] == '#')
+                continue;
+            if (first) {
+                first = false;
+                const std::string prefix = "cardinality=";
+                if (line.rfind(prefix, 0) == 0)
+                    cardinality = std::stoull(line.substr(prefix.size()));
+                else
+                    throw std::invalid_argument(
+                        "text assignment map must start with cardinality=<1|20>");
+            } else {
+                size_t cursor = 0;
+                assignments.push_back(static_cast<size_t>(parse_decimal(line, cursor)));
+                if (!trim_copy(line.substr(cursor)).empty())
+                    throw std::invalid_argument("assignment map line has trailing data");
+            }
+        }
+    }
+    if (cardinality != 1 && cardinality != 20)
+        throw std::invalid_argument("batch relationship cardinality must be 1 or 20");
+    if (assignments.size() != expected)
+        throw std::invalid_argument("assignment map length does not match TU manifest");
+    for (size_t assignment : assignments)
+        if (assignment >= cardinality)
+            throw std::invalid_argument("assignment map selects an unknown relationship");
+    *declared_cardinality = static_cast<size_t>(cardinality);
+    return assignments;
+}
+
+struct BatchRelation {
+    std::shared_ptr<P50PreparationAuthority> authority;
+    std::unique_ptr<P50ServerEndpoint> server;
+    std::unique_ptr<P50ClientEndpoint> client;
+    ActionTrace actions{256};
+    CompletionLog completions{256};
+    uint64_t request_token = 0;
+    uint64_t tu_count = 0;
+    std::optional<Digest128> last_state_digest;
+};
+
+void write_batch_row(std::ostream& output, std::string_view segment,
+                     std::string_view relation_id, size_t index,
+                     size_t expected_tu_seq,
+                     const std::vector<uint8_t>& input,
+                     const ClientRunResult& client, const ServerRunResult& server,
+                     const CompletionLog& completions, const ActionTrace& actions,
+                     const P50ClientEndpoint& client_endpoint,
+                     const std::optional<Digest128>& expected_before,
+                     std::chrono::steady_clock::duration elapsed,
+                     ProfileId profile) {
+    const Digest128 raw_digest = icecc::digest128(input);
+    Digest128 tx_digest{};
+    Digest128 begin_tx_digest{};
+    Digest128 action_raw_digest{};
+    Digest128 state_before{};
+    Digest128 state_after{};
+    uint64_t encoded_source_bytes = 0;
+    bool tx_begin_found = false;
+    bool commit_found = false;
+    for (auto position = actions.records().rbegin(); position != actions.records().rend(); ++position) {
+        if (position->action == ActionType::COMMIT_ACCEPTED && position->raw_digest == raw_digest &&
+            position->tu_seq.value == expected_tu_seq) {
+            tx_digest = position->transaction_digest;
+            action_raw_digest = position->raw_digest;
+            state_after = position->state_digest;
+            commit_found = true;
+        }
+        if (position->action == ActionType::TX_BEGIN && position->raw_digest == raw_digest &&
+            position->tu_seq.value == expected_tu_seq) {
+            state_before = position->state_digest;
+            begin_tx_digest = position->transaction_digest;
+            encoded_source_bytes = position->stage_bytes;
+            tx_begin_found = true;
+        }
+    }
+    uint64_t c_writes = 0;
+    uint64_t f_writes = 0;
+    uint64_t c_reads = 0;
+    uint64_t f_reads = 0;
+    for (const AsyncCompletion& completion : completions.completions()) {
+        if (completion.stamp.operation == AsyncOperationKind::WriteFragment) {
+            if (completion.stamp.actor == ActorSide::C)
+                c_writes += completion.transferred_bytes;
+            else
+                f_writes += completion.transferred_bytes;
+        } else if (completion.stamp.operation == AsyncOperationKind::ReadHeader ||
+                   completion.stamp.operation == AsyncOperationKind::ReadPayload) {
+            if (completion.stamp.actor == ActorSide::C)
+                c_reads += completion.transferred_bytes;
+            else
+                f_reads += completion.transferred_bytes;
+        }
+    }
+    if ((digest_is_zero(state_before) ||
+        (expected_before.has_value() && state_before != *expected_before) ||
+        state_after != client_endpoint.state_digest()) ||
+        !client.committed_input || !server.committed_input ||
+        client.committed_input != server.committed_input ||
+        client.committed_input->tu_seq.value != expected_tu_seq || action_raw_digest != raw_digest ||
+        !tx_begin_found || !commit_found || digest_is_zero(begin_tx_digest) ||
+        begin_tx_digest != tx_digest || digest_is_zero(tx_digest) || digest_is_zero(state_after) ||
+        c_writes != f_reads || f_writes != c_reads) {
+        std::ostringstream detail;
+        detail << "product completion did not authenticate exact TU (client="
+               << static_cast<bool>(client.committed_input) << ",server="
+               << static_cast<bool>(server.committed_input) << ",same="
+               << (client.committed_input && server.committed_input &&
+                   *client.committed_input == *server.committed_input)
+               << ",seq=" << (client.committed_input ?
+                                  std::to_string(client.committed_input->tu_seq.value) : "none")
+               << ",index=" << expected_tu_seq << ",raw=" << (action_raw_digest == raw_digest)
+               << ",tx_begin=" << tx_begin_found << ",commit=" << commit_found
+               << ",wire=" << (c_writes == f_reads && f_writes == c_reads) << ")";
+        throw std::runtime_error(detail.str());
+    }
+    output << "{\"schema\":\"icecream-p50sim-batch-v1\",\"segment\":\""
+           << segment << "\",\"profile\":\"" << selected_profile_label()
+           << "\",\"relationship_id\":\"" << relation_id << "\",\"tu_index\":"
+           << index << ",\"tu_seq\":" << client.committed_input->tu_seq.value
+           << ",\"c_store_guid\":\"" << id_hex(client_endpoint.c_store_guid())
+           << "\",\"f_store_guid\":\""
+           << id_hex(client_endpoint.f_store_guid().value_or(FStoreGuid{})) << "\""
+           << ",\"raw_bytes\":" << input.size() << ",\"raw_digest\":\""
+           << icecc::digest128_hex(raw_digest) << "\",\"encoded_source_bytes\":"
+           << encoded_source_bytes << ",\"c_to_f_bytes\":" << c_writes
+           << ",\"f_to_c_bytes\":" << f_writes << ",\"peer_c_read_bytes\":" << c_reads
+           << ",\"peer_f_read_bytes\":" << f_reads << ",\"simulator_execution_ns\":"
+           << std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()
+           << ",\"action_records\":" << actions.records().size()
+           << ",\"state_before_digest\":\"" << icecc::digest128_hex(state_before)
+           << "\",\"state_digest\":\"" << icecc::digest128_hex(state_after)
+           << "\",\"transaction_digest\":\"" << icecc::digest128_hex(tx_digest)
+           << "\",\"committed\":true}\n";
+    if (!output)
+        throw std::runtime_error("cannot write batch output");
+}
+
+void run_batch(const Arguments& arguments) {
+    const ProfileId profile = selected_profile();
+    const std::vector<std::string> first = read_batch_manifest(arguments.batch_manifest);
+    size_t relationship_count = 0;
+    const std::vector<size_t> first_assignments = read_batch_assignments(
+        arguments.batch_assignment_map, first.size(), &relationship_count);
+    std::vector<std::string> second;
+    std::vector<size_t> second_assignments;
+    if (!arguments.batch_manifest_2.empty()) {
+        second = read_batch_manifest(arguments.batch_manifest_2);
+        size_t second_relationship_count = 0;
+        second_assignments = read_batch_assignments(arguments.batch_assignment_map_2,
+                                                    second.size(), &second_relationship_count);
+        if (second_relationship_count != relationship_count)
+            throw std::invalid_argument("repeat segment relationship cardinality differs");
+        if (second_assignments.size() != first_assignments.size() ||
+            second_assignments != first_assignments)
+            throw std::invalid_argument("repeat segment assignment map differs from segment one");
+    }
+    std::ofstream output(arguments.batch_output, std::ios::binary | std::ios::trunc);
+    if (!output)
+        throw std::runtime_error("cannot open batch output: " + arguments.batch_output);
+
+    EndpointCaps caps{};
+    caps.profile = profile;
+    caps.supported_profiles = profile_bit(profile);
+    asio::io_context context;
+    tcp::acceptor acceptor(context,
+                           tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0));
+    const tcp::endpoint endpoint = acceptor.local_endpoint();
+    std::vector<BatchRelation> relations;
+    relations.reserve(relationship_count);
+    for (size_t relation = 0; relation < relationship_count; ++relation) {
+        const FStoreGuid f_guid = relation_guid(arguments.f_store_guid, relation);
+        relations.emplace_back();
+        BatchRelation& item = relations.back();
+        item.authority = std::make_shared<P50PreparationAuthority>(
+            arguments.c_store_guid, caps.zstd, PreparationAuthorityLimits{},
+            kCurrentProductCompressionLevel, profile);
+        P50ServerEndpointConfig config;
+        config.input_job_state = [](CStoreGuid, const TxBegin&, const TxCommit&,
+                                    std::span<const uint8_t>) { return InputJobState::Open; };
+        item.server = std::make_unique<P50ServerEndpoint>(f_guid, caps,
+                                                           &item.completions, &item.actions,
+                                                           std::move(config));
+        item.client = std::make_unique<P50ClientEndpoint>(item.authority, caps,
+                                                           arguments.history_nonce,
+                                                           &item.completions, &item.actions);
+    }
+    const auto process = [&](std::string_view segment, const std::vector<std::string>& manifest,
+                             const std::vector<size_t>& assignments) {
+        for (size_t index = 0; index < manifest.size(); ++index) {
+            BatchRelation& relation = relations[assignments[index]];
+            const std::vector<uint8_t> input = read_bytes(manifest[index]);
+            relation.actions.clear();
+            relation.completions.clear();
+            const std::optional<Digest128> expected_before = relation.last_state_digest;
+            auto prepared = relation.authority->prepare(
+                PrepareRequestKey{1, ++relation.request_token}, input);
+            if (!prepared)
+                throw std::runtime_error("product preparation returned an invalid handle");
+            const size_t relationship_tu_seq = static_cast<size_t>(relation.tu_count++);
+            context.restart();
+            const auto started = std::chrono::steady_clock::now();
+            auto server_future = asio::co_spawn(context,
+                                                relation.server->accept_one(acceptor),
+                                                asio::use_future);
+            auto client_future = asio::co_spawn(context,
+                                                relation.client->run(endpoint, prepared),
+                                                asio::use_future);
+            context.run();
+            const auto elapsed = std::chrono::steady_clock::now() - started;
+            const ServerRunResult server_result = server_future.get();
+            const ClientRunResult client_result = client_future.get();
+            if (client_result.status != ClientRunStatus::Committed ||
+                server_result.status != ServerRunStatus::Completed ||
+                !relation.actions.valid() || !relation.completions.valid())
+                throw std::runtime_error("product batch TU did not commit on both endpoints");
+            const std::string relation_id =
+                "c1f" + std::to_string(relationship_count) + "-r" +
+                (assignments[index] < 10 ? "0" : "") + std::to_string(assignments[index]);
+            write_batch_row(output, segment, relation_id, index, relationship_tu_seq, input,
+                            client_result, server_result, relation.completions,
+                            relation.actions, *relation.client, expected_before, elapsed, profile);
+            for (const ActionRecord& action : relation.actions.records()) {
+                if (action.action == ActionType::COMMIT_ACCEPTED &&
+                    action.raw_digest == icecc::digest128(input)) {
+                    relation.last_state_digest = action.state_digest;
+                    break;
+                }
+            }
+        }
+    };
+    process("full-1", first, first_assignments);
+    if (!second.empty())
+        process("full-2", second, second_assignments);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     try {
         const Arguments arguments = parse(argc, argv);
+        if (!arguments.batch_manifest.empty()) {
+            run_batch(arguments);
+            return 0;
+        }
         const bool warm = !arguments.prewarm_input.empty();
         const std::vector<uint8_t> input = warm
             ? read_bytes(arguments.measured_input)

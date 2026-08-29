@@ -1,0 +1,276 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+
+import pytest
+
+import s8_depth_runner as depth_runner
+import s8_predictive_engine as engine
+import s8_predictive_live_normalizer as normalizer
+from s8_predictive_engine import (
+    MANIFEST_SCHEMA, SEMANTICS, TOPOLOGY_SCHEMA, canonical_bytes, load_inputs,
+    new_relationship_state, predict_sequential, PredictionError,
+)
+from s8_multitu_predictive_producer import MultiTUPredictiveError, produce, produce_pair
+from s8_schema import CORPORA, PROFILES, REGIMES, SPLITS
+
+
+COMMIT = "1" * 40
+TREE = "2" * 40
+
+
+def _write(path: Path, raw: bytes | str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(raw.encode() if isinstance(raw, str) else raw)
+
+
+def _matrix(path: Path) -> None:
+    cells = [{"cell": f"{corpus}/{profile}/{regime}", "split": SPLITS[corpus]}
+             for corpus in CORPORA for profile in PROFILES for regime in REGIMES]
+    value = {
+        "schema": depth_runner.MATRIX_AUDIT_SCHEMA, "status": "PASS",
+        "matrix": {"expected_cells": 32, "completed_cells": 32, "missing_cells": [],
+                   "invalid_candidates": [], "calibration_cells": 16,
+                   "held_out_validation_cells": 16},
+        "cells": cells,
+    }
+    _write(path, canonical_bytes(value) + b"\n")
+
+
+def _template(path: Path, cell: dict[str, str]) -> Path:
+    input_path = path / "template.ii"
+    _write(input_path, b"template input\n")
+    topology = {
+        "schema": TOPOLOGY_SCHEMA, "semantics": SEMANTICS, "cell": cell,
+        "topology": {"c_store_guid": "1".zfill(32), "f_store_guid": "2".zfill(32),
+                     "history_nonce": 1, "c_workers": 1, "f_workers": 1,
+                     "cache_channel": {"ZSTD_TU": "direct", "ZSTD_ROUTE": "route",
+                                       "P29": "route", "GRZ_RESIDUAL": "residual"}[cell["profile"]]},
+        "state": {"c_cache": cell["regime"], "f_cache": cell["regime"], "generation": 0},
+    }
+    topology_path = path / "topology.json"
+    topology_raw = canonical_bytes(topology) + b"\n"
+    _write(topology_path, topology_raw)
+    descriptor = lambda p: {"path": p.name, "sha256": hashlib.sha256(p.read_bytes()).hexdigest(),
+                            "bytes": p.stat().st_size}
+    manifest = {
+        "schema": MANIFEST_SCHEMA, "semantics": SEMANTICS, "cell": cell,
+        "split": SPLITS[cell["corpus"]], "predictive_mode": True,
+        "input": descriptor(input_path), "topology_state": descriptor(topology_path),
+    }
+    manifest_path = path / "engine-manifest.json"
+    _write(manifest_path, canonical_bytes(manifest) + b"\n")
+    return manifest_path
+
+
+def _source(tmp_path: Path, count: int) -> tuple[Path, Path]:
+    root = tmp_path / "corpus"
+    paths: list[str] = []
+    for index in range(count):
+        path = root / "units" / f"unit-{index:04d}.ii"
+        _write(path, f"int unit_{index}();\n")
+        paths.append(str(path))
+    manifest = root / "manifest.txt"
+    _write(manifest, "\n".join(paths) + "\n")
+    return root, manifest
+
+
+def _plan(tmp_path: Path, count: int, depth: int | str, suffix: str,
+          regime: str = "cold", profile: str = "P29") -> Path:
+    root, manifest = _source(tmp_path, count)
+    matrix = tmp_path / "matrix.json"
+    _matrix(matrix)
+    result_dir = tmp_path / f"s8-DuckDB-{profile}-{regime}-20260829T000000Z-{suffix}"
+    value = depth_runner.build_plan(manifest, root, matrix, result_dir,
+                                    "DuckDB", profile, regime, depth)
+    plan_path = tmp_path / f"{suffix}-plan.json"
+    _write(plan_path, canonical_bytes(value) + b"\n")
+    return plan_path
+
+
+def test_producer_emits_100_ordered_points_and_continuous_relationship(tmp_path: Path) -> None:
+    plan_path = _plan(tmp_path / "run", 100, 100, "100", "warm")
+    cell = {"corpus": "DuckDB", "profile": "P29", "regime": "warm"}
+    manifest = _template(tmp_path / "template", cell)
+    plan = json.loads(plan_path.read_bytes())
+    output = Path(plan["result"]["directory"])
+    result = produce(plan_path, manifest, COMMIT, TREE)
+    rows = [json.loads(line) for line in (output / "predictive_sim.jsonl").read_text().splitlines()]
+    assert len(rows) == 100
+    assert [row["step"] for row in rows] == list(range(100))
+    assert len({row["tu_id"] for row in rows}) == 100
+    assert len({row["topology_digest"] for row in rows}) == 1
+    assert rows[0]["startup_ns"] > 0
+    assert all(row["startup_ns"] == 0 for row in rows[1:])
+    assert result["relationship"]["mode"] == "route"
+    assert result["relationship"]["reset_points"] == []
+    assert len(result["relationship"]["state_after_digests"]) == 100
+    assert rows[-1]["cumulative"]["channel_bytes"] == sum(
+        row["channel_bytes"]["total"] for row in rows)
+    assert result["live_observation"].startswith("not_emitted")
+    assert not (output / "live_summary.jsonl").exists()
+
+
+def test_relationship_state_route_reuses_identical_tu_but_tu_profile_resets(tmp_path: Path) -> None:
+    raw = b"identical translation unit\n" * 8
+    for profile in ("ZSTD_TU", "ZSTD_ROUTE", "P29", "GRZ_RESIDUAL"):
+        cell = {"corpus": "DuckDB", "profile": profile, "regime": "cold"}
+        manifest = _template(tmp_path / profile, cell)
+        _value, _template_raw, _input, topology_facts, _sha, topology, _cell = load_inputs(manifest)
+        state = new_relationship_state(topology, cell, topology_facts["sha256"])
+        first, state = predict_sequential(raw, topology, cell, state)
+        second, state = predict_sequential(raw, topology, cell, state)
+        assert first["relationship_state"]["after_digest"] != second["relationship_state"]["after_digest"]
+        if profile == "ZSTD_TU":
+            assert second["channel_bytes"] == first["channel_bytes"]
+            assert second["relationship_state"]["transition"] == "tu_reset"
+            assert second["relationship_state"]["reset_point"] is True
+        else:
+            assert second["relationship_state"]["transition"] == "c_cache_reuse"
+            assert second["relationship_state"]["reset_point"] is False
+
+
+def test_relationship_state_reset_or_step_mutation_is_not_silent(tmp_path: Path) -> None:
+    cell = {"corpus": "DuckDB", "profile": "ZSTD_ROUTE", "regime": "cold"}
+    manifest = _template(tmp_path / "route", cell)
+    _value, _raw, _input, topology_facts, _sha, topology, _cell = load_inputs(manifest)
+    state = new_relationship_state(topology, cell, topology_facts["sha256"])
+    _first, state = predict_sequential(b"same\n", topology, cell, state)
+    _first, continued_state = predict_sequential(b"same\n", topology, cell,
+                                                  new_relationship_state(topology, cell,
+                                                                          topology_facts["sha256"]))
+    _continued, _continued_state = predict_sequential(b"same\n", topology, cell, continued_state)
+    reset_state = new_relationship_state(topology, cell, topology_facts["sha256"])
+    assert reset_state["next_step"] == 0
+    state["next_step"] = 0
+    with pytest.raises(PredictionError, match="relationship_state"):
+        predict_sequential(b"same\n", topology, cell, state)
+
+
+def test_reorder_and_mutation_fail_before_producer_output(tmp_path: Path) -> None:
+    plan_path = _plan(tmp_path / "reorder", 100, 100, "reorder")
+    value = json.loads(plan_path.read_bytes())
+    value["inputs"][0], value["inputs"][1] = value["inputs"][1], value["inputs"][0]
+    _write(plan_path, canonical_bytes(value) + b"\n")
+    manifest = _template(tmp_path / "template", {"corpus": "DuckDB", "profile": "P29", "regime": "cold"})
+    with pytest.raises(MultiTUPredictiveError, match="input_sequence"):
+        produce(plan_path, manifest, COMMIT, TREE)
+    assert not Path(value["result"]["directory"]).exists()
+
+    plan_path = _plan(tmp_path / "mutation", 100, 100, "mutation")
+    plan = json.loads(plan_path.read_bytes())
+    Path(plan["inputs"][0]["path"]).write_bytes(b"mutated\n")
+    with pytest.raises(MultiTUPredictiveError):
+        produce(plan_path, manifest, COMMIT, TREE)
+    assert not Path(plan["result"]["directory"]).exists()
+
+    plan_path = _plan(tmp_path / "duplicate", 100, 100, "duplicate")
+    value = json.loads(plan_path.read_bytes())
+    value["inputs"][1] = value["inputs"][0]
+    _write(plan_path, canonical_bytes(value) + b"\n")
+    with pytest.raises(MultiTUPredictiveError, match="input_sequence"):
+        produce(plan_path, manifest, COMMIT, TREE)
+
+
+def test_repeat_full_has_same_input_identity_but_distinct_run_identity(tmp_path: Path) -> None:
+    root, source_manifest = _source(tmp_path / "source", 3)
+    matrix = tmp_path / "matrix.json"
+    _matrix(matrix)
+    full_dir = tmp_path / "s8-DuckDB-P29-cold-20260829T000000Z-full"
+    full = depth_runner.build_plan(source_manifest, root, matrix, full_dir,
+                                   "DuckDB", "P29", "cold", "full")
+    full_path = tmp_path / "full-plan.json"
+    _write(full_path, canonical_bytes(full) + b"\n")
+    repeat_dir = tmp_path / "s8-DuckDB-P29-cold-20260829T010000Z-repeat-full"
+    repeat = depth_runner.build_plan(source_manifest, root, matrix, repeat_dir,
+                                     "DuckDB", "P29", "cold", "repeat-full", full_path)
+    repeat_path = tmp_path / "repeat-plan.json"
+    _write(repeat_path, canonical_bytes(repeat) + b"\n")
+    manifest = _template(tmp_path / "template", {"corpus": "DuckDB", "profile": "P29", "regime": "cold"})
+    full_result, repeat_result = produce_pair(full_path, repeat_path, manifest, COMMIT, TREE)
+    assert full_result["identity"]["input_digest"] == repeat_result["identity"]["input_digest"]
+    assert full_result["identity"]["run_id"] != repeat_result["identity"]["run_id"]
+    assert full_result["outputs"]["predictive_sim"]["points"] == 3
+    assert repeat_result["outputs"]["predictive_sim"]["points"] == 3
+
+
+def test_output_manifest_is_consumable_by_existing_normalizer(tmp_path: Path) -> None:
+    plan_path = _plan(tmp_path / "run", 100, 100, "normalize")
+    manifest = _template(tmp_path / "template", {"corpus": "DuckDB", "profile": "P29", "regime": "cold"})
+    produce(plan_path, manifest, COMMIT, TREE)
+    output = Path(json.loads(plan_path.read_bytes())["result"]["directory"])
+    predictive_manifest = output / "predictive_curve_manifest.json"
+    predicted = (output / "predictive_sim.jsonl").read_bytes()
+    live_curve = output / "live.jsonl"
+    live_curve.write_bytes(predicted)
+    live_value = json.loads(predictive_manifest.read_bytes())
+    live_value["provenance"] = {"mode": "live", "producer": "authenticated-live-v1", "trace_free": False}
+    live_value["curve"] = {"path": live_curve.name, "sha256": hashlib.sha256(predicted).hexdigest(),
+                            "bytes": len(predicted)}
+    live_manifest = output / "live-manifest.json"
+    _write(live_manifest, canonical_bytes(live_value) + b"\n")
+    records = normalizer.normalize(predictive_manifest, live_manifest, output / "records.jsonl")
+    assert [record["record_type"] for record in records] == ["predictive_sim", "live", "comparison"]
+    assert len(records[0]["raw_cumulative_curve"]) == 100
+
+
+def test_non_zstd_p29_keeps_product_endpoint_bytes(tmp_path: Path) -> None:
+    profile = "P29"
+    plan_path = _plan(tmp_path / profile, 100, 100, profile, profile=profile)
+    cell = {"corpus": "DuckDB", "profile": profile, "regime": "cold"}
+    manifest = _template(tmp_path / f"template-{profile}", cell)
+    result = produce(plan_path, manifest, COMMIT, TREE)
+    output = Path(json.loads(plan_path.read_bytes())["result"]["directory"])
+    rows = [json.loads(line) for line in (output / "predictive_sim.jsonl").read_text().splitlines()]
+    _value, _raw, _input, _topology_facts, _sha, topology, _cell = load_inputs(manifest)
+    assert rows[0]["channel_bytes"]["C_TO_F"] == rows[0]["product_completion"]["encoded_source_bytes"]
+    assert result["codec"]["mode"] == "product_endpoint_batch"
+    assert result["codec"]["native_product"] is True
+
+
+def test_grz_without_libbsc_fails_closed(tmp_path: Path) -> None:
+    plan_path = _plan(tmp_path / "grz", 100, 100, "GRZ_RESIDUAL", profile="GRZ_RESIDUAL")
+    manifest = _template(tmp_path / "template-grz",
+                         {"corpus": "DuckDB", "profile": "GRZ_RESIDUAL", "regime": "cold"})
+    with pytest.raises(MultiTUPredictiveError, match="requires a simulator built with --with-libbsc"):
+        produce(plan_path, manifest, COMMIT, TREE)
+
+
+def test_twenty_relationships_have_independent_first_use_startup(tmp_path: Path) -> None:
+    plan_path = _plan(tmp_path / "twenty", 100, 100, "twenty", "warm", "ZSTD_ROUTE")
+    cell = {"corpus": "DuckDB", "profile": "ZSTD_ROUTE", "regime": "warm"}
+    manifest = _template(tmp_path / "template-twenty", cell)
+    assignment = tmp_path / "assignment.json"
+    _write(assignment, canonical_bytes({"cardinality": 20, "assignments": [index % 20 for index in range(100)]}) + b"\n")
+    produce(plan_path, manifest, COMMIT, TREE, assignment_map=assignment)
+    output = Path(json.loads(plan_path.read_bytes())["result"]["directory"])
+    rows = [json.loads(line) for line in (output / "predictive_sim.jsonl").read_text().splitlines()]
+    assert sum(row["startup_ns"] > 0 for row in rows) == 20
+    assert {row["relationship_id"] for row in rows[:20]} == {f"c1f20-r{index:02d}" for index in range(20)}
+    assert all(row["startup_ns"] == 0 for row in rows[20:])
+
+
+def test_standalone_repeat_fails_and_pair_carries_terminal_codec_state(tmp_path: Path) -> None:
+    root, source_manifest = _source(tmp_path / "source", 3)
+    matrix = tmp_path / "matrix.json"
+    _matrix(matrix)
+    cell_args = ("DuckDB", "ZSTD_ROUTE", "warm")
+    full_dir = tmp_path / "s8-DuckDB-ZSTD_ROUTE-warm-20260829T000000Z-full"
+    full = depth_runner.build_plan(source_manifest, root, matrix, full_dir, *cell_args, "full")
+    full_path = tmp_path / "full-plan.json"
+    _write(full_path, canonical_bytes(full) + b"\n")
+    repeat_dir = tmp_path / "s8-DuckDB-ZSTD_ROUTE-warm-20260829T010000Z-repeat-full"
+    repeat = depth_runner.build_plan(source_manifest, root, matrix, repeat_dir, *cell_args, "repeat-full", full_path)
+    repeat_path = tmp_path / "repeat-plan.json"
+    _write(repeat_path, canonical_bytes(repeat) + b"\n")
+    manifest = _template(tmp_path / "template-pair", {"corpus": "DuckDB", "profile": "ZSTD_ROUTE", "regime": "warm"})
+    with pytest.raises(MultiTUPredictiveError, match="paired_producer"):
+        produce(repeat_path, manifest, COMMIT, TREE)
+    first_result, second_result = produce_pair(full_path, repeat_path, manifest, COMMIT, TREE)
+    second_output = Path(repeat["result"]["directory"])
+    second_rows = [json.loads(line) for line in (second_output / "predictive_sim.jsonl").read_text().splitlines()]
+    assert second_rows[0]["relationship_state"]["transition"] == "relationship_continue"
+    assert second_result["codec"]["paired_stream_scope"] == "full-1+full-2"
+    assert first_result["codec"]["mode"] == "paired_continuation"
