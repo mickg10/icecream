@@ -907,6 +907,10 @@ if test -n "$batch_manifest"; then
             exec 3<"$topology_input"
         fi
         while IFS="$(printf '\t')" read -r tu_id source_path source_relative source_sha predictive_path predictive_relative payload_sha payload_bytes item_db item_db_sha item_source item_output; do
+            relationship=0; f_slot=0
+            if test "$suite" = C1F20/40; then
+                IFS="$(printf '\t')" read -r relationship f_slot <&3
+            fi
             result=$(cat "$work/result-$run_label-$ordinal.tsv")
             IFS="$(printf '\t')" read -r _ result_source_sha preprocessed_capture preprocessed_sha preprocessed_bytes remote_obj remote_sha remote_bytes local_obj local_sha local_bytes compile_start_ns compile_end_ns <<EOF
 $result
