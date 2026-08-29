@@ -234,6 +234,11 @@ public:
     // Bind a fresh GRZ authority to the transport's authenticated initial
     // route cursor before its first prepared TU is admitted.
     void prime_grz_initial_state(HistoryNonce history_nonce);
+    // Rebuild the one uncommitted GRZ TU after an acknowledged F route reset.
+    // Exact-route retries never call this hook, so their committed encoder
+    // state remains available for byte-exact replay.
+    PreparedInputPtr reset_grz_route(PreparedTuHandle handle,
+                                     HistoryNonce history_nonce);
 
     [[nodiscard]] CStoreGuid c_store_guid() const;
     [[nodiscard]] ZstdTuLimits zstd_limits() const;

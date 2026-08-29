@@ -562,14 +562,65 @@ void test_grz_endpoint_roundtrip() {
     caps.zstd.max_encoded_body_bytes = 1U << 20;
     P50ServerEndpoint server(guids.f, caps);
     TestClient client(guids.c, caps);
-    const std::vector<uint8_t> input = bytes(
+    const std::vector<uint8_t> before_reset = bytes(
         "GRZ endpoint authority must validate its own residual begin\n");
+    const PairResult first = run_pair(client, server, admit(client, before_reset));
+    require(first.client.status == ClientRunStatus::Committed &&
+                first.server.status == ServerRunStatus::Completed &&
+                copy_input(server, guids.c) == before_reset &&
+                client.endpoint.next_rel_seq().value == 1,
+            "GRZ endpoint failed its first real sender-to-endpoint round trip");
 
-    const PairResult result = run_pair(client, server, admit(client, input));
-    require(result.client.status == ClientRunStatus::Committed &&
-                result.server.status == ServerRunStatus::Completed &&
-                copy_input(server, guids.c) == input,
-            "GRZ endpoint failed a real sender-to-endpoint TU0 round trip");
+    // A transport disconnect is not a route reset.  F keeps the committed
+    // dialogue, so the exact retry must use the retained C/F GRZ history.
+    const std::vector<uint8_t> exact_retry = bytes(
+        "GRZ ordinary reconnect must retain the committed predecessor\n");
+    const PreparedTuHandle retry_handle = admit(client, exact_retry);
+    EndpointIoControl disconnect;
+    disconnect.close_before_write = MessageType::BODY;
+    const PairResult disconnected = run_pair(client, server, retry_handle, disconnect);
+    require(disconnected.client.status == ClientRunStatus::Disconnected &&
+                disconnected.server.status == ServerRunStatus::Disconnected &&
+                client.has_active_transaction() &&
+                client.endpoint.next_rel_seq().value == 1,
+            "GRZ ordinary disconnect did not retain exact retry state");
+    const PairResult retried = run_pair(client, server, retry_handle);
+    require(retried.client.status == ClientRunStatus::Committed &&
+                retried.client.reconnect == EndpointReconnectOutcome::ExactMatch &&
+                retried.server.status == ServerRunStatus::Completed &&
+                copy_input(server, guids.c) == exact_retry &&
+                client.endpoint.next_rel_seq().value == 2,
+            "GRZ ordinary reconnect did not retain committed dialogue history");
+
+    // An acknowledged F-store replacement is a cold route reset.  The C
+    // authority must rebuild the uncommitted GRZ body against the new empty
+    // route before sending REL_SEQ zero.
+    const std::vector<uint8_t> after_reset = bytes(
+        "GRZ acknowledged cold reset must re-prime the C encoder\n");
+    const PreparedTuHandle reset_handle = admit(client, after_reset);
+    const PairResult interrupted = run_pair(client, server, reset_handle, disconnect);
+    require(interrupted.client.status == ClientRunStatus::Disconnected &&
+                interrupted.server.status == ServerRunStatus::Disconnected &&
+                client.has_active_transaction(),
+            "GRZ reset fixture did not retain its interrupted transaction");
+    server.reset_store(FStoreGuid::from_u64(UINT64_C(0x47525a434f4c4452)));
+    const PairResult reset = run_pair(client, server, reset_handle);
+    require(reset.client.status == ClientRunStatus::Committed &&
+                reset.client.reconnect == EndpointReconnectOutcome::ColdFStore &&
+                reset.server.status == ServerRunStatus::Completed &&
+                copy_input(server, guids.c) == after_reset &&
+                client.endpoint.next_rel_seq().value == 1,
+            "GRZ acknowledged cold reset did not rebuild the C encoder route");
+
+    const std::vector<uint8_t> continuation = bytes(
+        "GRZ post-reset continuation must use the rebuilt anchor history\n");
+    const PairResult continued = run_pair(client, server, admit(client, continuation));
+    require(continued.client.status == ClientRunStatus::Committed &&
+                continued.client.reconnect == EndpointReconnectOutcome::ExactMatch &&
+                continued.server.status == ServerRunStatus::Completed &&
+                copy_input(server, guids.c) == continuation &&
+                client.endpoint.next_rel_seq().value == 2,
+            "GRZ post-reset continuation did not preserve the new route history");
 }
 #endif
 

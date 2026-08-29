@@ -403,6 +403,8 @@ void validate_grz_successor(const TxBegin& begin,
 
 GrzResidualCodec::GrzResidualCodec() : state_(std::make_unique<State>()) {}
 GrzResidualCodec::~GrzResidualCodec() = default;
+GrzResidualCodec::GrzResidualCodec(GrzResidualCodec&&) noexcept = default;
+GrzResidualCodec& GrzResidualCodec::operator=(GrzResidualCodec&&) noexcept = default;
 
 void GrzResidualCodec::prime_initial_state(HistoryNonce history_nonce,
                                             Digest128 state_digest) {

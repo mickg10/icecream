@@ -1246,6 +1246,63 @@ void P50PreparationAuthority::prime_grz_initial_state(HistoryNonce history_nonce
 #endif
 }
 
+PreparedInputPtr P50PreparationAuthority::reset_grz_route(
+    PreparedTuHandle handle, HistoryNonce history_nonce) {
+    impl_->owner.require();
+#if defined(ICECC_P50_WITH_LIBBSC)
+    if (impl_->profile != ProfileId::GRZ)
+        throw std::invalid_argument("GRZ route reset selected a non-GRZ authority");
+    if (history_nonce.value == 0)
+        throw std::invalid_argument("GRZ route reset HISTORY_NONCE is zero");
+    if (handle.authority_.lock() != impl_->identity || handle.entry_id_ == 0)
+        throw std::invalid_argument("prepared-TU handle does not belong to this C authority");
+    const auto position = impl_->entries.find(handle.entry_id_);
+    if (position == impl_->entries.end())
+        throw std::invalid_argument("prepared-TU handle has been released");
+    Impl::Entry& entry = position->second;
+    if (entry.committed || impl_->uncommitted_grz_entry != handle.entry_id_)
+        throw std::logic_error(
+            "GRZ route reset requires its one uncommitted transaction");
+
+    const uint64_t old_retained = entry.retained_bytes;
+    if (old_retained > impl_->retained_bytes)
+        throw std::logic_error("GRZ authority retained-byte accounting underflow");
+    const uint64_t retained_room =
+        impl_->authority_limits.max_retained_encoded_bytes -
+        (impl_->retained_bytes - old_retained);
+    if (retained_room == 0)
+        throw std::length_error("C preparation authority reached its retained-byte bound");
+
+    ZstdTuLimits admission_limits = impl_->zstd_limits;
+    admission_limits.max_encoded_body_bytes =
+        std::min(admission_limits.max_encoded_body_bytes, retained_room);
+    const Digest128 reset_state = initial_route_digest(impl_->c_guid, history_nonce);
+    // Build against a fresh codec first.  If admission fails, the old
+    // uncommitted retry remains intact and can still be reconciled.
+    GrzResidualCodec rebuilt;
+    rebuilt.prime_initial_state(history_nonce, reset_state);
+    const GrzResidualEnvelope envelope = rebuilt.encode(
+        history_nonce, RelSeq{0}, entry.prepared->begin.tu_seq, reset_state,
+        entry.raw, admission_limits);
+    const uint64_t retained = static_cast<uint64_t>(envelope.body.size());
+    if (retained > retained_room)
+        throw std::length_error("C preparation authority reached its retained-byte bound");
+    const PreparedInputPtr prepared = std::make_shared<const PreparedInputEnvelope>(
+        PreparedInputEnvelope{envelope.begin, {}, envelope.body, {}});
+
+    impl_->grz_codec = std::move(rebuilt);
+    impl_->grz_next_rel = RelSeq{0};
+    impl_->grz_state_digest = reset_state;
+    impl_->retained_bytes = impl_->retained_bytes - old_retained + retained;
+    entry.retained_bytes = retained;
+    entry.prepared = prepared;
+    return prepared;
+#else
+    (void)history_nonce;
+    return resolve(handle);
+#endif
+}
+
 CStoreGuid P50PreparationAuthority::c_store_guid() const {
     impl_->owner.check();
     return impl_->c_guid;
@@ -2958,6 +3015,12 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
                 return received;
             });
             (void)reset_ack;
+            PreparedInputPtr reset_retry = retry;
+#if defined(ICECC_P50_WITH_LIBBSC)
+            if (impl_->caps.profile == ProfileId::GRZ)
+                reset_retry = impl_->preparation->reset_grz_route(
+                    impl_->queued_handle, replacement_nonce);
+#endif
             if (impl_->active) {
                 if (same_f) {
                     impl_->record(ActionType::TX_ABORTED, impl_->active->begin, serial,
@@ -2968,7 +3031,7 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
                 }
             }
             impl_->active.reset();
-            impl_->queued = retry;
+            impl_->queued = std::move(reset_retry);
             impl_->f_guid = peer.f_store_guid;
             impl_->history_nonce = replacement_nonce;
             impl_->next_rel = replacement_rel;

@@ -23,6 +23,8 @@ public:
     ~GrzResidualCodec();
     GrzResidualCodec(const GrzResidualCodec&) = delete;
     GrzResidualCodec& operator=(const GrzResidualCodec&) = delete;
+    GrzResidualCodec(GrzResidualCodec&&) noexcept;
+    GrzResidualCodec& operator=(GrzResidualCodec&&) noexcept;
 
     GrzResidualEnvelope encode(HistoryNonce history_nonce, RelSeq rel_seq,
                                TuSeq tu_seq, Digest128 pre_state_digest,
