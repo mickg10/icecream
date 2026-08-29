@@ -193,8 +193,10 @@ def build(s7_package: Path, replay: Path, source_repository: Path, out: Path) ->
     identities = _json(retained["identities.json"][0], "identities")
     if not isinstance(replay_manifest, dict) or not isinstance(identities, dict):
         raise PackageError("replay:manifest_or_identity_invalid")
+    replay_input_sha = replay_manifest.get(
+        "measured_input_sha256", replay_manifest.get("input_sha256"))
     if (replay_manifest.get("status") != "PASS" or replay_manifest.get("cell") != cell_label or
-            replay_manifest.get("input_sha256") != input_sha or
+            replay_input_sha != input_sha or
             replay_manifest.get("deletion_control", {}).get("status") != "PASS"):
         raise PackageError("replay:acceptance_mismatch")
     conformance = results.get("conformance")
