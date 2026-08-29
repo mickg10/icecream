@@ -38,7 +38,7 @@ static bool is_absent(const Snapshot& snapshot)
 static bool is_exact_present(const Snapshot& snapshot, uint32_t port = 10245)
 {
     constexpr uint32_t expected_profiles =
-        CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE
+        CACHE_PROFILE_P29 | CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE
 #if defined(ICECC_P50_WITH_LIBBSC)
         | CACHE_PROFILE_GRZ
 #endif

@@ -9,7 +9,8 @@ The controller publishes only two kinds of snapshots:
 
 * absent: `(0, 0, 0)`;
 * present: `(public daemon TCP port, CACHE_WIRE_PROTOCOL_V1,
-  CACHE_PROFILE_ZSTD_TU)`.
+  CACHE_PROFILE_P29 | CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE)`, plus
+  `CACHE_PROFILE_GRZ` in a dependency-enabled build.
 
 Presence requires all of the following in one observation: the daemon's
 public listener is bound to a valid TCP port, the supervisor is exactly

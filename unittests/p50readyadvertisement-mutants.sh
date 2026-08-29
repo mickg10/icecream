@@ -54,8 +54,8 @@ compile_and_kill crash-withdrawal \
     'if (crashed && current_.present()) {' \
     'if ((static_cast<void>(crashed), false) && current_.present()) {'
 compile_and_kill runnable-profile \
-    'CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU' \
-    'CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_P29'
+    'CACHE_PROFILE_P29 | CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE' \
+    'CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE'
 compile_and_kill counter-saturation \
     '== std::numeric_limits<uint64_t>::max()) {' \
     '== std::numeric_limits<uint64_t>::max() && false) {'

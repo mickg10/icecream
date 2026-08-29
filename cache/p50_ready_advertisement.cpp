@@ -13,7 +13,8 @@ constexpr Snapshot kAbsent{};
 
 Snapshot present_snapshot(uint32_t port) noexcept
 {
-    constexpr uint32_t profiles = CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE
+    constexpr uint32_t profiles =
+        CACHE_PROFILE_P29 | CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE
 #if defined(ICECC_P50_WITH_LIBBSC)
         | CACHE_PROFILE_GRZ
 #endif
