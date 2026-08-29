@@ -167,8 +167,11 @@ def test_producer_emits_100_ordered_points_and_continuous_relationship(tmp_path:
     assert [row["step"] for row in rows] == list(range(100))
     assert len({row["tu_id"] for row in rows}) == 100
     assert len({row["topology_digest"] for row in rows}) == 1
-    assert rows[0]["startup_ns"] > 0
-    assert all(row["startup_ns"] == 0 for row in rows[1:])
+    assert rows[0]["startup_ns"] == 0
+    assert all(row["startup_ns"] == 0 for row in rows)
+    assert len(result["excluded_prewarms"]) == 1
+    assert result["excluded_prewarms"][0]["points"] == 100
+    assert result["excluded_prewarms"][0]["raw_bytes"] == sum(item["bytes"] for item in plan["inputs"])
     assert result["relationship"]["mode"] == "route"
     assert result["relationship"]["reset_points"] == []
     assert len(result["relationship"]["state_after_digests"]) == 100
@@ -176,6 +179,48 @@ def test_producer_emits_100_ordered_points_and_continuous_relationship(tmp_path:
         row["channel_bytes"]["total"] for row in rows)
     assert result["live_observation"].startswith("not_emitted")
     assert not (output / "live_summary.jsonl").exists()
+
+
+def test_warm_curve_excludes_authenticated_prewarm_and_carries_boundary(tmp_path: Path) -> None:
+    plan_path = _plan(tmp_path / "warm", 100, 100, "warm", "warm", "P29")
+    plan = json.loads(plan_path.read_bytes())
+    manifest = _template(tmp_path / "template-warm",
+                         {"corpus": "DuckDB", "profile": "P29", "regime": "warm"})
+    result = _produce(plan_path, manifest)
+    output = Path(plan["result"]["directory"])
+    rows = [json.loads(line) for line in (output / "predictive_sim.jsonl").read_text().splitlines()]
+    assert [row["step"] for row in rows] == list(range(100))
+    assert rows[0]["product_completion"]["tu_seq"] == 100
+    assert rows[0]["product_completion"]["state_before_digest"] == \
+        result["excluded_prewarms"][0]["state_boundaries"][0]["last_state_after_digest"]
+    prewarm = result["excluded_prewarms"][0]
+    assert prewarm["excluded"] is True
+    assert prewarm["segment"] == "full-1"
+    assert prewarm["input_digest"] == hashlib.sha256(canonical_bytes([
+        {"ordinal": item["ordinal"], "source_relative": item["source_relative"],
+         "sha256": item["sha256"], "bytes": item["bytes"]} for item in plan["inputs"]
+    ])).hexdigest()
+    assert rows[0]["cumulative"]["C_TO_F_bytes"] == rows[0]["channel_bytes"]["C_TO_F"]
+
+
+def test_warm_repeat_pair_fails_closed_without_three_native_segments(tmp_path: Path) -> None:
+    root, source_manifest = _source(tmp_path / "source", 3)
+    matrix = tmp_path / "matrix.json"
+    _matrix(matrix)
+    cell_args = ("DuckDB", "ZSTD_ROUTE", "warm")
+    full_dir = tmp_path / "s8-DuckDB-ZSTD_ROUTE-warm-20260829T000000Z-full"
+    full = depth_runner.build_plan(source_manifest, root, matrix, full_dir, *cell_args, "full")
+    full_path = tmp_path / "full-plan.json"
+    _write(full_path, canonical_bytes(full) + b"\n")
+    repeat_dir = tmp_path / "s8-DuckDB-ZSTD_ROUTE-warm-20260829T010000Z-repeat-full"
+    repeat = depth_runner.build_plan(source_manifest, root, matrix, repeat_dir,
+                                     *cell_args, "repeat-full", full_path)
+    repeat_path = tmp_path / "repeat-plan.json"
+    _write(repeat_path, canonical_bytes(repeat) + b"\n")
+    manifest = _template(tmp_path / "template-warm-pair",
+                         {"corpus": "DuckDB", "profile": "ZSTD_ROUTE", "regime": "warm"})
+    with pytest.raises(MultiTUPredictiveError, match="warm_preload_requires_three_segments"):
+        _produce_pair(full_path, repeat_path, manifest)
 
 
 def test_relationship_state_route_reuses_identical_tu_but_tu_profile_resets(tmp_path: Path) -> None:
@@ -264,7 +309,7 @@ def test_repeat_full_has_same_input_identity_but_distinct_run_identity(tmp_path:
 def test_output_manifest_is_consumable_by_existing_normalizer(tmp_path: Path) -> None:
     plan_path = _plan(tmp_path / "run", 100, 100, "normalize")
     manifest = _template(tmp_path / "template", {"corpus": "DuckDB", "profile": "P29", "regime": "cold"})
-    _produce(plan_path, manifest)
+    result = _produce(plan_path, manifest)
     output = Path(json.loads(plan_path.read_bytes())["result"]["directory"])
     predictive_manifest = output / "predictive_curve_manifest.json"
     predicted = (output / "predictive_sim.jsonl").read_bytes()
@@ -303,17 +348,17 @@ def test_grz_without_libbsc_fails_closed(tmp_path: Path) -> None:
         _produce(plan_path, manifest)
 
 
-def test_twenty_relationships_have_independent_first_use_startup(tmp_path: Path) -> None:
+def test_twenty_relationships_have_authenticated_warm_boundaries(tmp_path: Path) -> None:
     plan_path = _plan(tmp_path / "twenty", 100, 100, "twenty", "warm", "ZSTD_ROUTE", "C1F20")
     cell = {"corpus": "DuckDB", "profile": "ZSTD_ROUTE", "regime": "warm"}
     manifest = _template(tmp_path / "template-twenty", cell)
-    _produce(plan_path, manifest)
+    result = _produce(plan_path, manifest)
     output = Path(json.loads(plan_path.read_bytes())["result"]["directory"])
     rows = [json.loads(line) for line in (output / "predictive_sim.jsonl").read_text().splitlines()]
-    assert sum(row["startup_ns"] > 0 for row in rows) == 20
+    assert all(row["startup_ns"] == 0 for row in rows)
     assert len({row["relationship_id"] for row in rows}) == 20
     assert {row["scheduling"]["global_slot"] for row in rows} == set(range(40))
-    assert all(row["startup_ns"] == 0 for row in rows[40:])
+    assert len(result["excluded_prewarms"][0]["state_boundaries"]) == 20
 
 
 def test_authenticated_topology_schedule_declares_exact_capacity_and_makespan(tmp_path: Path) -> None:
@@ -417,7 +462,7 @@ def test_standalone_repeat_fails_and_pair_carries_terminal_codec_state(tmp_path:
     root, source_manifest = _source(tmp_path / "source", 3)
     matrix = tmp_path / "matrix.json"
     _matrix(matrix)
-    cell_args = ("DuckDB", "ZSTD_ROUTE", "warm")
+    cell_args = ("DuckDB", "ZSTD_ROUTE", "cold")
     full_dir = tmp_path / "s8-DuckDB-ZSTD_ROUTE-warm-20260829T000000Z-full"
     full = depth_runner.build_plan(source_manifest, root, matrix, full_dir, *cell_args, "full")
     full_path = tmp_path / "full-plan.json"
@@ -426,7 +471,7 @@ def test_standalone_repeat_fails_and_pair_carries_terminal_codec_state(tmp_path:
     repeat = depth_runner.build_plan(source_manifest, root, matrix, repeat_dir, *cell_args, "repeat-full", full_path)
     repeat_path = tmp_path / "repeat-plan.json"
     _write(repeat_path, canonical_bytes(repeat) + b"\n")
-    manifest = _template(tmp_path / "template-pair", {"corpus": "DuckDB", "profile": "ZSTD_ROUTE", "regime": "warm"})
+    manifest = _template(tmp_path / "template-pair", {"corpus": "DuckDB", "profile": "ZSTD_ROUTE", "regime": "cold"})
     with pytest.raises(MultiTUPredictiveError, match="paired_producer"):
         _produce(repeat_path, manifest)
     first_result, second_result = _produce_pair(full_path, repeat_path, manifest)

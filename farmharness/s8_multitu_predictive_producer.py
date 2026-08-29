@@ -195,10 +195,14 @@ def _validate_plan(plan_path: Path) -> tuple[dict[str, object], dict[str, str], 
             value.get("semantics") != SEMANTICS:
         raise MultiTUPredictiveError("plan:schema_or_semantics_invalid")
     contract = value.get("execution_contract")
+    declared_cell = value.get("cell")
+    warm_prewarm = isinstance(declared_cell, dict) and declared_cell.get("regime") == "warm"
     if (not isinstance(contract, dict) or
             contract.get("status") != "READY_MULTI_TU_PREDICTOR" or
             contract.get("producer") != "farmharness.s8_multitu_predictive_producer" or
-            contract.get("timeout_policy") != TIMEOUT_POLICY):
+            contract.get("timeout_policy") != TIMEOUT_POLICY or
+            contract.get("warm_prewarm") != warm_prewarm or
+            contract.get("warm_prewarm_segments") != (1 if warm_prewarm else 0)):
         raise MultiTUPredictiveError("plan:multi_tu_producer_contract_invalid")
     cell = _check_cell(value)
     _validate_matrix(value, cell)
@@ -608,6 +612,36 @@ def _product_rows(simulator: Path, inputs: list[dict[str, object]], assignments:
         return segments
 
 
+def _excluded_prewarm(product_rows: list[dict[str, object]],
+                      inputs: list[dict[str, object]]) -> dict[str, object]:
+    """Describe the authenticated warm segment excluded from measured output."""
+    if len(product_rows) != len(inputs):
+        raise MultiTUPredictiveError("prewarm:point_count_mismatch")
+    boundaries: dict[str, dict[str, object]] = {}
+    for ordinal, (row, item) in enumerate(zip(product_rows, inputs, strict=True)):
+        relationship_id = row.get("relationship_id")
+        if not isinstance(relationship_id, str):
+            raise MultiTUPredictiveError("prewarm:relationship_identity_invalid")
+        entry = boundaries.setdefault(relationship_id, {
+            "relationship_id": relationship_id,
+            "first_state_before_digest": row["state_before_digest"],
+        })
+        entry["last_state_after_digest"] = row["state_digest"]
+        entry["last_tu_seq"] = row["tu_seq"]
+        entry["last_ordinal"] = ordinal
+        if row.get("raw_bytes") != item["bytes"] or row.get("raw_digest") is None:
+            raise MultiTUPredictiveError("prewarm:input_binding_invalid")
+    descriptors = [{"ordinal": item["ordinal"], "source_relative": item["source_relative"],
+                    "sha256": item["sha256"], "bytes": item["bytes"]} for item in inputs]
+    return {
+        "segment": "full-1", "excluded": True, "points": len(inputs),
+        "raw_bytes": sum(int(item["bytes"]) for item in inputs),
+        "input_digest": hashlib.sha256(canonical_bytes(descriptors)).hexdigest(),
+        "inputs": descriptors,
+        "state_boundaries": [boundaries[key] for key in sorted(boundaries)],
+    }
+
+
 def _product_curve_rows(product_rows: list[dict[str, object]], inputs: list[dict[str, object]],
                         cell: dict[str, str], model_id: str, topology_digest: str,
                         topology: dict[str, object], calibration: dict[str, object] | None,
@@ -728,6 +762,9 @@ def _product_curve_rows(product_rows: list[dict[str, object]], inputs: list[dict
                             "slot_available_after_ns": finish},
             "product_completion": {"raw_bytes": product["raw_bytes"],
                                     "raw_digest": product["raw_digest"],
+                                    "tu_seq": product["tu_seq"],
+                                    "state_before_digest": product["state_before_digest"],
+                                    "state_after_digest": product["state_digest"],
                                     "tx_digest": product["transaction_digest"],
                                     "encoded_source_bytes": encoded_source,
                                     "wire_c_to_f_bytes": product["c_to_f_bytes"],
@@ -780,6 +817,7 @@ def _emit_product_segment(plan: dict[str, object], plan_facts: dict[str, object]
                           timeout_seconds: int,
                           product_build_root: Path,
                           build_facts: dict[str, object],
+                          excluded_prewarms: list[dict[str, object]],
                           continuation: bool, paired: bool = False) -> dict[str, object]:
     curve_raw = b"".join(canonical_bytes(row) + b"\n" for row in rows)
     curve_sha = hashlib.sha256(curve_raw).hexdigest()
@@ -799,6 +837,7 @@ def _emit_product_segment(plan: dict[str, object], plan_facts: dict[str, object]
     producer = {"schema": SCHEMA, "semantics": SEMANTICS, "cell": cell,
                 "split": SPLITS[cell["corpus"]], "identity": identity,
                 "request": plan["request"], "paired_continuation": continuation,
+                "excluded_prewarms": excluded_prewarms,
                 "plan": {"path": plan_facts["plan"]["path"],
                          "sha256": plan_facts["plan"]["sha256"],
                          "bytes": plan_facts["plan"]["bytes"]},
@@ -914,19 +953,37 @@ def produce(plan_path: Path, engine_manifest: Path, product_build_root: Path,
     if assignment_facts is None:
         assignment_facts = {"authority": "authenticated_plan_scheduling",
                             "sha256": assignment_digest}
-    product_segments = _product_rows(simulator, inputs, product_assignments, relationship_count,
-                                     cell, model_id, topology_digest, assignment_map)
-    product_rows = _product_curve_rows(product_segments[0], inputs, cell, model_id,
-                                        topology_digest, topology, calibration,
-                                        {"C_TO_F_bytes": 0, "F_TO_C_bytes": 0,
-                                         "channel_bytes": 0, "elapsed_ns": 0},
-                                        scheduling)
+    warm = cell["regime"] == "warm"
+    product_segments = _product_rows(
+        simulator, inputs, product_assignments, relationship_count, cell, model_id,
+        topology_digest, assignment_map, inputs if warm else None,
+        product_assignments if warm else None)
+    excluded_prewarms: list[dict[str, object]] = []
+    if warm:
+        relationship_states: dict[str, dict[str, object]] = {}
+        _product_curve_rows(product_segments[0], inputs, cell, model_id, topology_digest,
+                            topology, calibration,
+                            {"C_TO_F_bytes": 0, "F_TO_C_bytes": 0,
+                             "channel_bytes": 0, "elapsed_ns": 0},
+                            scheduling, relationship_states)
+        product_rows = _product_curve_rows(
+            product_segments[1], inputs, cell, model_id, topology_digest, topology, calibration,
+            {"C_TO_F_bytes": 0, "F_TO_C_bytes": 0, "channel_bytes": 0, "elapsed_ns": 0},
+            scheduling, relationship_states)
+        excluded_prewarms = [_excluded_prewarm(product_segments[0], inputs)]
+    else:
+        product_rows = _product_curve_rows(product_segments[0], inputs, cell, model_id,
+                                           topology_digest, topology, calibration,
+                                           {"C_TO_F_bytes": 0, "F_TO_C_bytes": 0,
+                                            "channel_bytes": 0, "elapsed_ns": 0},
+                                           scheduling)
     return _emit_product_segment(plan, plan_facts, output_dir, product_rows, cell,
                                  source_commit, source_tree, input_digest, topology_digest,
                                  model_id, assignment_facts, relationship_count,
                                  simulator_facts, assignment_digest,
                                  str(plan["source_manifest"]["sha256"]), scheduling,
-                                 _batch_timeout_seconds(len(inputs)), build_root, build_facts, False)
+                                 _batch_timeout_seconds(len(inputs) * (2 if warm else 1)),
+                                 build_root, build_facts, excluded_prewarms, False)
 
 def produce_pair(first_plan_path: Path, repeat_plan_path: Path, engine_manifest: Path,
                  product_build_root: Path,
@@ -942,6 +999,8 @@ def produce_pair(first_plan_path: Path, repeat_plan_path: Path, engine_manifest:
         raise MultiTUPredictiveError("repeat_full:paired_input_identity_mismatch")
     if first["source_manifest"] != repeat["source_manifest"]:
         raise MultiTUPredictiveError("repeat_full:paired_source_manifest_mismatch")
+    if cell["regime"] == "warm":
+        raise MultiTUPredictiveError("repeat_full:warm_preload_requires_three_segments")
     scheduling, assignments, relationship_count = _validate_scheduling(first, first_inputs)
     repeat_scheduling, repeat_assignments, repeat_relationship_count = _validate_scheduling(
         repeat, repeat_inputs)
@@ -992,13 +1051,13 @@ def produce_pair(first_plan_path: Path, repeat_plan_path: Path, engine_manifest:
         input_digest, topology_digest, model_id, assignment_facts, relationship_count,
         simulator_facts, assignment_digest, str(first["source_manifest"]["sha256"]),
         scheduling, _batch_timeout_seconds(len(first_inputs) + len(repeat_inputs)), build_root,
-        build_facts, False, True)
+        build_facts, [], False, True)
     repeat_producer = _emit_product_segment(
         repeat, repeat_facts, repeat_dir, repeat_rows, cell, source_commit, source_tree,
         input_digest, topology_digest, model_id, assignment_facts, relationship_count,
         simulator_facts, assignment_digest, str(first["source_manifest"]["sha256"]),
         scheduling, _batch_timeout_seconds(len(first_inputs) + len(repeat_inputs)), build_root,
-        build_facts, True, True)
+        build_facts, [], True, True)
     return first_producer, repeat_producer
 
 def _write_new(path: Path, raw: bytes, label: str) -> None:

@@ -275,6 +275,8 @@ def build_plan(source_manifest: Path, source_root: Path, matrix_audit: Path,
             "live_observation": "separate_authenticated_curve_required",
             "required": "authenticated predictive curve over the ordered TU sequence",
             "timeout_policy": TIMEOUT_POLICY,
+            "warm_prewarm": regime == "warm",
+            "warm_prewarm_segments": 1 if regime == "warm" else 0,
             "note": "The producer invokes one authenticated product batch over the ordered TU sequence and binds the aggregate input digest; live observations are never synthesized.",
         },
     }
