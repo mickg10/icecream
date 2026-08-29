@@ -16,6 +16,9 @@ grep -q 'value == "GRZ" || value == "GRZ_RESIDUAL"' "$root/cache/sim/p50sim.cpp"
 grep -q 'GRZ_RESIDUAL requires a simulator built with --with-libbsc' "$root/cache/sim/p50sim.cpp" || fail 'simulator does not fail closed without libbsc'
 grep -q 'ICECC_P50_BUILD_ROOT' "$root/cache/sim/build_p50sim.sh" || fail 'simulator build does not support an out-of-tree product build'
 grep -q 'libbsc_cflags' "$root/cache/sim/build_p50sim.sh" || fail 'simulator build does not consume configured libbsc flags'
+sed -n '/^p50cacheservice_LDADD =/,/^p50cacheservice_DEPENDENCIES/p' \
+    "$root/unittests/Makefile.am" | grep -Fq '$(LIBBSC_LIBS)' || \
+    fail 'cache-service runtime test does not link the configured GRZ dependency'
 test "$(git -C "$root" hash-object "$root/vendor/grouprlz/grz2.cpp")" = fa63c7b8ce40a1366b6ba4dc65a59839bfaa7419 || fail 'canonical grz2.cpp source mismatch'
 test "$(git -C "$root" hash-object "$root/vendor/grouprlz/grz2g.cpp")" = 7f57775694b8962d3d92f38ce7e3213842139bc2 || fail 'canonical grz2g.cpp source mismatch'
 if grep -R -n 'GRZR' "$root/cache/p50_grz"*; then fail 'toy GRZR framing remains'; fi

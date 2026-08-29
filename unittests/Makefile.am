@@ -426,15 +426,18 @@ p50s2restartreplay_LDADD = ../cache/libp50sidecarsupervisor.a \
 	../services/libicecc.la
 p50cacheservice_SOURCES = p50cacheservice.cpp ../cache/p50_cache_service.cpp \
 	../client/p50_route_owner.cpp ../client/p50_zstd_sender.cpp
-p50cacheservice_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS) -DICECC_P50_CACHE_SERVICE_NO_MAIN
+p50cacheservice_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS) \
+	-DICECC_P50_CACHE_SERVICE_NO_MAIN -DICECC_P50_ENDPOINT_TEST_HOOKS
 p50cacheservice_CXXFLAGS = -pthread
 p50cacheservice_LDFLAGS = $(BOOST_LDFLAGS) -pthread
-p50cacheservice_LDADD = ../cache/libp50endpoint.a \
+p50cacheservice_LDADD = ../cache/libp50endpointtesthooks.a \
+	../cache/libp50endpoint.a \
 	../cache/libp50adoptedoutcomewriter.a ../cache/libp50inputfd.a \
 	../cache/libp50inputlifecycle.a \
 	../cache/libprotocol50.a ../cache/libp50localtransport.a \
-	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
+	../services/libicecc.la $(LIBZSTD_LIBS) $(LIBBSC_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 p50cacheservice_DEPENDENCIES = ../cache/icecc-cache-service \
+	../cache/libp50endpointtesthooks.a \
 	../cache/libp50inputfd.a ../cache/libp50inputlifecycle.a readyclose_shim.so
 p50fdhandoff_SOURCES = p50fdhandoff.cpp ../cache/p50_fd_handoff.cpp \
 	../cache/p50_local_transport.cpp

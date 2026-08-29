@@ -983,6 +983,9 @@ void test_runtime_cancel_fail_stop_subprocess(bool owner_failure_case = false,
         (void)::close(live_marker[0]);
         auto child_abort = [] { _exit(126); };
         service::RuntimeConfig config = test_runtime_config();
+        SessionHello hello;
+        hello.c_store_guid = config.c_store_guid;
+        const std::vector<uint8_t> hello_frame = encode_frame(Message{hello});
         const int marker_fd = marker[1];
         config.cancellation_grace = std::chrono::milliseconds(80);
         if (owner_failure_case) {
@@ -1037,8 +1040,10 @@ void test_runtime_cancel_fail_stop_subprocess(bool owner_failure_case = false,
             child_abort();
         (void)::close(listener);
         EndpointIoControl endpoint_control;
+        std::atomic_bool completion_stalled{false};
         if (!owner_failure_case && !live_owner_failure_case) {
-            endpoint_control.before_completion_check = [](CompletionStamp&) {
+            endpoint_control.before_completion_check = [&completion_stalled](CompletionStamp&) {
+                completion_stalled.store(true, std::memory_order_release);
                 for (;;)
                     std::this_thread::yield();
             };
@@ -1062,6 +1067,13 @@ void test_runtime_cancel_fail_stop_subprocess(bool owner_failure_case = false,
                    std::chrono::steady_clock::now() < live_deadline)
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             if (runtime.live_session_count() != 1)
+                child_abort();
+            if (!write_all(peer, hello_frame))
+                child_abort();
+            while (!completion_stalled.load(std::memory_order_acquire) &&
+                   std::chrono::steady_clock::now() < live_deadline)
+                std::this_thread::yield();
+            if (!completion_stalled.load(std::memory_order_acquire))
                 child_abort();
             send_operation_cancel(control.sender, request.identity, request.request_id);
         }
@@ -1278,7 +1290,6 @@ void test_runtime_zstd_tu_af_unix_loopback() {
             first_commit_write_seen.store(true, std::memory_order_release);
     };
     auto authority = std::make_shared<P50PreparationAuthority>(Id128::from_u64(9002));
-    P50ClientEndpoint client(authority);
 
     uint16_t port = 0;
     const int listener = loopback_listener(port);
@@ -1286,6 +1297,7 @@ void test_runtime_zstd_tu_af_unix_loopback() {
     std::future<ClientRunResult> client_result;
     std::atomic<bool> first_ready_seen{false};
     std::thread client_thread([&] {
+        P50ClientEndpoint client(authority);
         const PreparedTuHandle prepared = authority->prepare({1, 1}, input);
         const int fd = connect_after_sidecar_ready(port);
         first_ready_seen.store(fd >= 0, std::memory_order_release);
@@ -1373,13 +1385,13 @@ void test_runtime_zstd_tu_af_unix_loopback() {
     };
     RuntimeCase second_control = authenticated_runtime_pair();
     auto second_authority = std::make_shared<P50PreparationAuthority>(Id128::from_u64(9012));
-    P50ClientEndpoint second_client(second_authority);
     uint16_t second_port = 0;
     const int second_listener = loopback_listener(second_port);
     asio::io_context second_client_context;
     std::future<ClientRunResult> second_client_result;
     std::atomic<bool> second_ready_seen{false};
     std::thread second_client_thread([&] {
+        P50ClientEndpoint second_client(second_authority);
         const PreparedTuHandle prepared = second_authority->prepare({2, 2}, second_input);
         const int fd = connect_after_sidecar_ready(second_port);
         second_ready_seen.store(fd >= 0, std::memory_order_release);
@@ -1437,7 +1449,6 @@ void test_operation_cancel_commit_race_preserves_witness() {
     RuntimeCase control = authenticated_runtime_pair();
     const local::HandoffRequest request{{7, 1}, 17};
     auto authority = std::make_shared<P50PreparationAuthority>(Id128::from_u64(9123));
-    P50ClientEndpoint client(authority);
     uint16_t port = 0;
     const int listener = loopback_listener(port);
     asio::io_context client_context;
@@ -1454,6 +1465,7 @@ void test_operation_cancel_commit_race_preserves_witness() {
             std::this_thread::yield();
     };
     std::thread client_thread([&] {
+        P50ClientEndpoint client(authority);
         const PreparedTuHandle prepared = authority->prepare({17, 1}, input);
         const int fd = connect_after_sidecar_ready(port);
         CHECK(fd >= 0);

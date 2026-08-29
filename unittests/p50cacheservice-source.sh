@@ -10,8 +10,10 @@ identity="$src/cache/p50_incarnation_identity.h"
 wire="$src/services/p50_store_identity_wire.h"
 doc="$src/cache/P50_CACHE_SERVICE.md"
 test_file="$src/unittests/p50cacheservice.cpp"
+test_makefile="$src/unittests/Makefile.am"
+product_makefile="$src/cache/Makefile.am"
 
-require() { grep -F "$2" "$1" >/dev/null; }
+require() { grep -F -- "$2" "$1" >/dev/null; }
 for pair in \
     "$identity|StoreIdentityEntropyProvider" \
     "$wire|kStoreIdentityRoleMask" \
@@ -28,6 +30,8 @@ for pair in \
     "$impl|structured_launch.c_store_guid" \
     "$impl|structured_launch.f_store_guid" \
     "$impl|kMaxControlWorkers = 64" \
+    "$impl|#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS" \
+    "$impl|endpoint_->request_cancel_for_test()" \
     "$impl|structured_launch.f_store_generation" \
     "$impl|store_identity_root_from_f_guid" \
     "$impl|c_guid != c_store_guid_for_root(root)" \
@@ -42,11 +46,21 @@ for pair in \
     "$test_file|kConnectionCount = 20" \
     "$test_file|receive_until(acknowledgement, deadline)" \
     "$test_file|wait_for_exit_bounded(child.pid, 1000, status)" \
+    "$test_makefile|p50cacheservice_LDADD = ../cache/libp50endpointtesthooks.a" \
+    "$test_makefile|../cache/libp50endpoint.a" \
+    "$test_makefile|p50cacheservice_DEPENDENCIES = ../cache/icecc-cache-service" \
+    "$test_makefile|-DICECC_P50_CACHE_SERVICE_NO_MAIN -DICECC_P50_ENDPOINT_TEST_HOOKS" \
     "$test_file|READY v2 generation=91 attempt=7 F_STORE_GENERATION=191 DERIVATION_VERSION=1" \
     "$doc|CSPRNG"; do
     file=${pair%%|*}; pattern=${pair#*|}
     require "$file" "$pattern"
 done
+
+if sed -n '/^icecc_cache_service_CPPFLAGS =/,/^icecc_cache_service_CXXFLAGS =/p' \
+    "$product_makefile" | grep -Fq 'ICECC_P50_ENDPOINT_TEST_HOOKS'; then
+    echo 'FAIL: installed cache service enables endpoint test hooks' >&2
+    exit 1
+fi
 
 # Structured GUIDs must not have an identity-derived fallback, and the legacy
 # launch must remain a separate, fresh-root path.

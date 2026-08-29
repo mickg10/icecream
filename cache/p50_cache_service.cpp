@@ -2054,10 +2054,18 @@ void SidecarRuntime::cancel_endpoint_run() noexcept {
             std::lock_guard lock(endpoint_cancel_mutex_);
             permit = endpoint_cancel_permit_;
         }
-        if (permit)
+        if (permit) {
             context_.post([this, permit = std::move(*permit)] {
                 (void)endpoint_->request_cancel(permit);
             });
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+        } else {
+            // Historical raw-fd fixtures do not carry a P5CO operation and
+            // therefore cannot mint a production cancellation permit.  Keep
+            // their owner-wakeup coverage inside the test-hooks build only.
+            context_.post([this] { endpoint_->request_cancel_for_test(); });
+#endif
+        }
     } catch (...) {
     }
 }
