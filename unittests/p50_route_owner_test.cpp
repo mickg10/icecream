@@ -278,7 +278,7 @@ void test_p29_relationship_owner() {
                                {7102, 1}, repeated);
     CHECK(isolated.status == ZstdSourceTransferStatus::Committed);
     CHECK(isolated.committed_input->tu_seq.value == 0);
-    const auto unsupported = relationship(143, 241, 1, ProfileId::GRZ);
+    const auto unsupported = relationship(143, 241, 1, static_cast<ProfileId>(99));
     context.restart();
     auto rejected = asio::co_spawn(
         context,
@@ -300,6 +300,36 @@ void test_p29_relationship_owner() {
     CHECK(reset.committed_input->tu_seq.value == 0);
 }
 
+#if defined(ICECC_P50_WITH_LIBBSC)
+void test_grz_relationship_owner() {
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    EndpointCaps server_caps;
+    server_caps.profile = ProfileId::GRZ;
+    server_caps.supported_profiles = kOperationalProfileMask;
+    P50ServerEndpoint server(Id128::from_u64(250), server_caps, nullptr, nullptr,
+                             P50ServerEndpointConfig{
+                                 .input_job_state = [](CStoreGuid, const TxBegin&,
+                                                       const TxCommit&,
+                                                       std::span<const uint8_t>) {
+                                     return InputJobState::Open;
+                                 }});
+    P50CRouteOwner owner(config(ProfileId::GRZ));
+    const auto route = relationship(151, 251, 1, ProfileId::GRZ);
+    const std::vector<uint8_t> first{'g', 'r', 'z', '-', 't', 'u', '0', '\n'};
+    const std::vector<uint8_t> second{'g', 'r', 'z', '-', 't', 'u', '1', '\n'};
+
+    auto first_result = route_call(context, owner, server, acceptor, route,
+                                   {7201, 1}, first);
+    CHECK(first_result.status == ZstdSourceTransferStatus::Committed);
+    CHECK(first_result.committed_input->tu_seq.value == 0);
+    auto second_result = route_call(context, owner, server, acceptor, route,
+                                    {7201, 2}, second);
+    CHECK(second_result.status == ZstdSourceTransferStatus::Committed);
+    CHECK(second_result.committed_input->tu_seq.value == 1);
+}
+#endif
+
 }  // namespace
 
 int main() {
@@ -307,4 +337,7 @@ int main() {
     test_long_lived_relationship_owner();
     test_relationship_validation();
     test_p29_relationship_owner();
+#if defined(ICECC_P50_WITH_LIBBSC)
+    test_grz_relationship_owner();
+#endif
 }

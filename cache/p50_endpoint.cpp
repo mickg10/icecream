@@ -1284,7 +1284,13 @@ void P50PreparationAuthority::validate_begin(const TxBegin& begin) const {
         if (begin.body.encoded_bytes > impl_->zstd_limits.max_encoded_body_bytes ||
             begin.raw_bytes > impl_->zstd_limits.max_raw_bytes)
             throw std::length_error("prepared route exceeds authority limits");
-    } else {
+    }
+#if defined(ICECC_P50_WITH_LIBBSC)
+    else if (impl_->profile == ProfileId::GRZ) {
+        validate_grz_residual_begin(begin, impl_->zstd_limits);
+    }
+#endif
+    else {
         if (begin.profile != ProfileId::P29 ||
             begin.p29_root_mode == P29RootMode::NotApplicable ||
             begin.dict.encoding != kP29KeyVectorEncoding ||
@@ -1296,11 +1302,6 @@ void P50PreparationAuthority::validate_begin(const TxBegin& begin) const {
             begin.dict.encoded_bytes > impl_->zstd_limits.max_encoded_body_bytes)
             throw std::length_error("prepared P29 input exceeds authority limits");
     }
-#if defined(ICECC_P50_WITH_LIBBSC)
-    else {
-        validate_grz_residual_begin(begin, impl_->zstd_limits);
-    }
-#endif
 }
 
 struct P50ClientEndpoint::Impl {

@@ -553,6 +553,26 @@ void test_zstd_route_authority_bounded_history() {
     }
 }
 
+#if defined(ICECC_P50_WITH_LIBBSC)
+void test_grz_endpoint_roundtrip() {
+    const P5coStoreGuids guids = p5co_store_guids(229);
+    EndpointCaps caps;
+    caps.profile = ProfileId::GRZ;
+    caps.zstd.max_raw_bytes = 1U << 20;
+    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    P50ServerEndpoint server(guids.f, caps);
+    TestClient client(guids.c, caps);
+    const std::vector<uint8_t> input = bytes(
+        "GRZ endpoint authority must validate its own residual begin\n");
+
+    const PairResult result = run_pair(client, server, admit(client, input));
+    require(result.client.status == ClientRunStatus::Committed &&
+                result.server.status == ServerRunStatus::Completed &&
+                copy_input(server, guids.c) == input,
+            "GRZ endpoint failed a real sender-to-endpoint TU0 round trip");
+}
+#endif
+
 void test_p29_endpoint_route_dialogue_lifetime() {
     const P5coStoreGuids guids = p5co_store_guids(227);
     EndpointCaps caps;
@@ -2250,9 +2270,10 @@ asio::awaitable<void> raw_incompatible_hello(tcp::endpoint remote, CStoreGuid c_
     co_await socket.async_connect(remote, asio::use_awaitable);
     SessionHello hello;
     hello.c_store_guid = c_guid;
-    // P29 is now a runnable operational profile; use the reserved GRZ label
-    // for this deliberately incompatible HELLO fixture.
-    hello.supported_profiles = profile_bit(ProfileId::GRZ);
+    // Use a reserved profile bit so this remains deliberately incompatible
+    // when every currently implemented profile, including dependency-gated
+    // GRZ, is enabled.
+    hello.supported_profiles = uint32_t{1} << 31;
     co_await raw_write(socket, hello);
     const Frame terminal = co_await raw_read(socket, hello.limits.max_frame_payload);
     coordination.second_finished = true;
@@ -5896,6 +5917,9 @@ int main(int argc, char** argv) {
     test_two_client_one_server_isolation();
     test_zstd_route_endpoint_continuation_and_retry();
     test_zstd_route_authority_bounded_history();
+#if defined(ICECC_P50_WITH_LIBBSC)
+    test_grz_endpoint_roundtrip();
+#endif
     test_p29_endpoint_route_dialogue_lifetime();
     test_live_global_resource_trace();
     if (s3_resource_storm_requested())
