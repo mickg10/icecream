@@ -428,14 +428,16 @@ void write_batch_row(std::ostream& output, std::string_view segment,
     bool tx_begin_found = false;
     bool commit_found = false;
     for (auto position = actions.records().rbegin(); position != actions.records().rend(); ++position) {
-        if (position->action == ActionType::COMMIT_ACCEPTED && position->raw_digest == raw_digest &&
+        if (position->actor == ActorSide::C &&
+            position->action == ActionType::COMMIT_ACCEPTED && position->raw_digest == raw_digest &&
             position->tu_seq.value == expected_tu_seq) {
             tx_digest = position->transaction_digest;
             action_raw_digest = position->raw_digest;
             state_after = position->state_digest;
             commit_found = true;
         }
-        if (position->action == ActionType::TX_BEGIN && position->raw_digest == raw_digest &&
+        if (position->actor == ActorSide::C &&
+            position->action == ActionType::TX_BEGIN && position->raw_digest == raw_digest &&
             position->tu_seq.value == expected_tu_seq) {
             state_before = position->state_digest;
             begin_tx_digest = position->transaction_digest;

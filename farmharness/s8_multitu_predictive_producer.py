@@ -267,25 +267,44 @@ def _validate_plan(plan_path: Path) -> tuple[dict[str, object], dict[str, str], 
     return value, cell, inputs, {"plan": plan_facts, "source": source_facts, "source_path": source_path}
 
 
-def _load_assignment(plan: dict[str, object], inputs: list[dict[str, object]],
-                     assignment_path: Path | None) -> tuple[list[int] | None, int, dict[str, object] | None]:
-    """Load an optional authenticated 1C1F/1C20F assignment mapping."""
-    if assignment_path is not None:
-        raw, facts = _snapshot(assignment_path, "relationship_assignment", MAX_PLAN_BYTES)
-        value = _parse(raw, "relationship_assignment")
-        descriptor = {"path": facts["path"], "sha256": facts["sha256"], "bytes": facts["bytes"]}
-    else:
-        value = plan.get("relationship_assignment")
-        descriptor = None
-    if value is None:
-        return None, 1, descriptor
+def _validate_scheduling(plan: dict[str, object], inputs: list[dict[str, object]]) -> tuple[dict[str, object], list[int], int]:
+    """Require the plan's complete deterministic topology/assignment declaration."""
+    scheduling = plan.get("scheduling")
+    if not isinstance(scheduling, dict):
+        raise MultiTUPredictiveError("plan:scheduling_missing")
+    topology = scheduling.get("topology")
+    if not isinstance(topology, str):
+        raise MultiTUPredictiveError("plan:scheduling_topology_invalid")
+    try:
+        expected = depth_runner.build_schedule(inputs, topology)
+    except depth_runner.DepthPlanError as exc:
+        raise MultiTUPredictiveError(str(exc)) from exc
+    if scheduling != expected:
+        raise MultiTUPredictiveError("plan:scheduling_authenticated_mismatch")
+    assignments_value = scheduling["assignments"]
+    assert isinstance(assignments_value, list)
+    # The native batch map addresses F relationships; the execution slot is
+    # retained separately in each plan/curve assignment for scheduling.
+    assignments = [int(item["f_relationship"]) for item in assignments_value]
+    relationship_count = int(scheduling["f_relationships"])
+    if len(assignments) != len(inputs) or relationship_count not in (1, 20):
+        raise MultiTUPredictiveError("plan:scheduling_assignment_invalid")
+    return scheduling, assignments, relationship_count
+
+
+def _check_optional_assignment(path: Path | None, assignments: list[int],
+                               relationship_count: int) -> dict[str, object] | None:
+    """Accept a legacy map only as an equality check, never as authority."""
+    if path is None:
+        return None
+    raw, facts = _snapshot(path, "relationship_assignment", MAX_PLAN_BYTES)
+    value = _parse(raw, "relationship_assignment")
     if (not isinstance(value, dict) or set(value) != {"cardinality", "assignments"} or
-            type(value["cardinality"]) is not int or value["cardinality"] not in (1, 20) or
-            not isinstance(value["assignments"], list) or len(value["assignments"]) != len(inputs) or
-            any(type(item) is not int or not 0 <= item < value["cardinality"]
-                for item in value["assignments"])):
-        raise MultiTUPredictiveError("relationship_assignment:invalid_or_wrong_length")
-    return list(value["assignments"]), value["cardinality"], descriptor
+            value.get("cardinality") != relationship_count or
+            value.get("assignments") != assignments):
+        raise MultiTUPredictiveError("relationship_assignment:does_not_match_authenticated_plan")
+    return {"path": facts["path"], "sha256": facts["sha256"], "bytes": facts["bytes"],
+            "authority": "plan_schedule_equality_check"}
 
 
 def _product_binary(path: Path | None) -> tuple[Path, dict[str, object]]:
@@ -429,11 +448,21 @@ def _product_curve_rows(product_rows: list[dict[str, object]], inputs: list[dict
                         cell: dict[str, str], model_id: str, topology_digest: str,
                         topology: dict[str, object], calibration: dict[str, object] | None,
                         cumulative: dict[str, int],
+                        scheduling: dict[str, object],
                         relationship_states: dict[str, dict[str, object]] | None = None
                         ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     if relationship_states is None:
         relationship_states = {}
+    slots = scheduling.get("global_slots")
+    slots_per_f = scheduling.get("slots_per_f")
+    assignments = scheduling.get("assignments")
+    if (type(slots) is not int or slots <= 0 or type(slots_per_f) is not int or
+            slots_per_f <= 0 or not isinstance(assignments, list) or
+            len(assignments) != len(inputs)):
+        raise MultiTUPredictiveError("plan:scheduling_runtime_invalid")
+    available = [0] * slots
+    serial_elapsed = 0
     for ordinal, (product, item) in enumerate(zip(product_rows, inputs, strict=True)):
         raw, facts = _snapshot(Path(item["path"]), f"predictive_input[{ordinal}]", MAX_INPUT_BYTES)
         if facts["sha256"] != item["sha256"] or facts["bytes"] != item["bytes"]:
@@ -461,10 +490,23 @@ def _product_curve_rows(product_rows: list[dict[str, object]], inputs: list[dict
         elapsed = modeled_elapsed["total"]
         if type(f_to_c) is not int or type(elapsed) is not int or f_to_c < 0 or elapsed < 0:
             raise MultiTUPredictiveError("predictive_engine:model_value_invalid")
+        assignment = assignments[ordinal]
+        if (not isinstance(assignment, dict) or type(assignment.get("global_slot")) is not int or
+                not 0 <= assignment["global_slot"] < slots or
+                assignment.get("ordinal") != ordinal or
+                assignment.get("f_relationship") != assignment["global_slot"] // slots_per_f or
+                assignment.get("per_f_slot") != assignment["global_slot"] % slots_per_f):
+            raise MultiTUPredictiveError("plan:scheduling_assignment_invalid")
+        global_slot = assignment["global_slot"]
+        service = elapsed
+        start = available[global_slot]
+        finish = start + service
+        available[global_slot] = finish
+        serial_elapsed += service
         cumulative["C_TO_F_bytes"] += c_to_f
         cumulative["F_TO_C_bytes"] += f_to_c
         cumulative["channel_bytes"] += c_to_f + f_to_c
-        cumulative["elapsed_ns"] += elapsed
+        cumulative["elapsed_ns"] = max(cumulative["elapsed_ns"], finish)
         before = product["state_before_digest"]
         after = product["state_digest"]
         if not isinstance(relationship_id, str) or not isinstance(before, str) or \
@@ -492,6 +534,11 @@ def _product_curve_rows(product_rows: list[dict[str, object]], inputs: list[dict
                                                           else "relationship_start")),
                                     "reset_point": engine.RELATIONSHIP_MODES[cell["profile"]] == "tu"},
             "relationship_id": relationship_id,
+            "scheduling": {"global_slot": global_slot,
+                            "f_relationship": assignment["f_relationship"],
+                            "per_f_slot": assignment["per_f_slot"],
+                            "start_ns": start, "finish_ns": finish,
+                            "service_ns": service},
             "product_completion": {"raw_bytes": product["raw_bytes"],
                                     "raw_digest": product["raw_digest"],
                                     "tx_digest": product["transaction_digest"],
@@ -509,6 +556,21 @@ def _product_curve_rows(product_rows: list[dict[str, object]], inputs: list[dict
             "provenance": "product_p50sim_batch",
             "cumulative": dict(cumulative),
         })
+    if rows:
+        prior_finish: dict[int, int] = {}
+        for row in rows:
+            event = row["scheduling"]
+            slot = int(event["global_slot"])
+            if event["start_ns"] < prior_finish.get(slot, 0):
+                raise MultiTUPredictiveError("plan:scheduling_concurrency_overlap")
+            if event["finish_ns"] != event["start_ns"] + event["service_ns"]:
+                raise MultiTUPredictiveError("plan:scheduling_event_invalid")
+            prior_finish[slot] = event["finish_ns"]
+        if cumulative["elapsed_ns"] != max(row["scheduling"]["finish_ns"] for row in rows):
+            raise MultiTUPredictiveError("plan:scheduling_makespan_invalid")
+        rows[-1]["schedule_summary"] = {"makespan_ns": cumulative["elapsed_ns"],
+                                         "serial_service_ns": serial_elapsed,
+                                         "global_slots": slots}
     return rows
 
 
@@ -518,6 +580,7 @@ def _emit_product_segment(plan: dict[str, object], plan_facts: dict[str, object]
                           topology_digest: str, model_id: str, assignment_facts: dict[str, object] | None,
                           relationship_count: int, simulator_facts: dict[str, object],
                           assignment_digest: str, input_manifest_sha256: str,
+                          scheduling: dict[str, object],
                           continuation: bool, paired: bool = False) -> dict[str, object]:
     curve_raw = b"".join(canonical_bytes(row) + b"\n" for row in rows)
     curve_sha = hashlib.sha256(curve_raw).hexdigest()
@@ -541,6 +604,18 @@ def _emit_product_segment(plan: dict[str, object], plan_facts: dict[str, object]
                          "sha256": plan_facts["plan"]["sha256"],
                          "bytes": plan_facts["plan"]["bytes"]},
                 "topology_digest": topology_digest,
+                "scheduling": {"schema": scheduling["schema"],
+                                "topology": scheduling["topology"],
+                                "f_relationships": scheduling["f_relationships"],
+                                "slots_per_f": scheduling["slots_per_f"],
+                                "global_slots": scheduling["global_slots"],
+                                "stream_capacity_tus": scheduling["stream_capacity_tus"],
+                                "service_duration_model": scheduling["service_duration_model"],
+                                "assignment_policy": scheduling["assignment_policy"],
+                                "assignment_epoch_reset": scheduling["assignment_epoch_reset"],
+                                "makespan_ns": rows[-1]["cumulative"]["elapsed_ns"] if rows else 0,
+                                "serial_service_ns": sum(row["scheduling"]["service_ns"]
+                                                          for row in rows)},
                 "relationship": {"mode": engine.RELATIONSHIP_MODES[cell["profile"]],
                                   "relationship_count": relationship_count,
                                   "state_after_digests": [row["relationship_state"]["after_digest"]
@@ -593,7 +668,8 @@ def produce(plan_path: Path, engine_manifest: Path, source_commit: str,
     if plan["request"]["depth"] == "repeat-full":
         raise MultiTUPredictiveError(
             "repeat_full:paired_producer_required_to_restore_terminal_codec_state")
-    assignments, relationship_count, assignment_facts = _load_assignment(plan, inputs, assignment_map)
+    scheduling, assignments, relationship_count = _validate_scheduling(plan, inputs)
+    assignment_facts = _check_optional_assignment(assignment_map, assignments, relationship_count)
     source_commit = _sha(source_commit, "source_commit", HEX40)
     source_tree = _sha(source_tree, "source_tree", HEX40)
     manifest, _template_raw, _template_input, topology_facts, template_sha, topology, template_cell = engine.load_inputs(engine_manifest)
@@ -626,20 +702,25 @@ def produce(plan_path: Path, engine_manifest: Path, source_commit: str,
                 "topology_digest": topology_digest, "model_id": model_id}
 
     simulator, simulator_facts = _product_binary(sim_binary)
-    product_assignments = assignments if assignments is not None else [0] * len(inputs)
+    product_assignments = assignments
     assignment_digest = hashlib.sha256(canonical_bytes(
-        {"cardinality": relationship_count, "assignments": product_assignments})).hexdigest()
+        {"topology": scheduling["topology"], "cardinality": relationship_count,
+         "assignments": product_assignments, "schedule": scheduling})).hexdigest()
+    if assignment_facts is None:
+        assignment_facts = {"authority": "authenticated_plan_scheduling",
+                            "sha256": assignment_digest}
     product_segments = _product_rows(simulator, inputs, product_assignments, relationship_count,
                                      cell, model_id, topology_digest, assignment_map)
     product_rows = _product_curve_rows(product_segments[0], inputs, cell, model_id,
                                         topology_digest, topology, calibration,
                                         {"C_TO_F_bytes": 0, "F_TO_C_bytes": 0,
-                                         "channel_bytes": 0, "elapsed_ns": 0})
+                                         "channel_bytes": 0, "elapsed_ns": 0},
+                                        scheduling)
     return _emit_product_segment(plan, plan_facts, output_dir, product_rows, cell,
                                  source_commit, source_tree, input_digest, topology_digest,
                                  model_id, assignment_facts, relationship_count,
                                  simulator_facts, assignment_digest,
-                                 str(plan["source_manifest"]["sha256"]), False)
+                                 str(plan["source_manifest"]["sha256"]), scheduling, False)
 
 def produce_pair(first_plan_path: Path, repeat_plan_path: Path, engine_manifest: Path,
                  source_commit: str, source_tree: str,
@@ -655,8 +736,13 @@ def produce_pair(first_plan_path: Path, repeat_plan_path: Path, engine_manifest:
         raise MultiTUPredictiveError("repeat_full:paired_input_identity_mismatch")
     if first["source_manifest"] != repeat["source_manifest"]:
         raise MultiTUPredictiveError("repeat_full:paired_source_manifest_mismatch")
-    assignments, relationship_count, assignment_facts = _load_assignment(
-        first, first_inputs, assignment_map)
+    scheduling, assignments, relationship_count = _validate_scheduling(first, first_inputs)
+    repeat_scheduling, repeat_assignments, repeat_relationship_count = _validate_scheduling(
+        repeat, repeat_inputs)
+    if (repeat_scheduling != scheduling or repeat_assignments != assignments or
+            repeat_relationship_count != relationship_count):
+        raise MultiTUPredictiveError("repeat_full:paired_scheduling_mismatch")
+    assignment_facts = _check_optional_assignment(assignment_map, assignments, relationship_count)
     source_commit = _sha(source_commit, "source_commit", HEX40)
     source_tree = _sha(source_tree, "source_tree", HEX40)
     manifest, _template_raw, _template_input, topology_facts, template_sha, topology, template_cell = engine.load_inputs(engine_manifest)
@@ -675,9 +761,13 @@ def produce_pair(first_plan_path: Path, repeat_plan_path: Path, engine_manifest:
                        "inputs": first_inputs}
     input_digest = hashlib.sha256(canonical_bytes(aggregate_input)).hexdigest()
     simulator, simulator_facts = _product_binary(sim_binary)
-    product_assignments = assignments if assignments is not None else [0] * len(first_inputs)
+    product_assignments = assignments
     assignment_digest = hashlib.sha256(canonical_bytes(
-        {"cardinality": relationship_count, "assignments": product_assignments})).hexdigest()
+        {"topology": scheduling["topology"], "cardinality": relationship_count,
+         "assignments": product_assignments, "schedule": scheduling})).hexdigest()
+    if assignment_facts is None:
+        assignment_facts = {"authority": "authenticated_plan_scheduling",
+                            "sha256": assignment_digest}
     product_segments = _product_rows(simulator, first_inputs, product_assignments,
                                      relationship_count, cell, model_id, topology_digest,
                                      assignment_map, repeat_inputs, product_assignments)
@@ -685,19 +775,23 @@ def produce_pair(first_plan_path: Path, repeat_plan_path: Path, engine_manifest:
     first_rows = _product_curve_rows(
         product_segments[0], first_inputs, cell, model_id, topology_digest, topology, calibration,
         {"C_TO_F_bytes": 0, "F_TO_C_bytes": 0, "channel_bytes": 0, "elapsed_ns": 0},
+        scheduling,
         relationship_states)
     repeat_rows = _product_curve_rows(
         product_segments[1], repeat_inputs, cell, model_id, topology_digest, topology, calibration,
         {"C_TO_F_bytes": 0, "F_TO_C_bytes": 0, "channel_bytes": 0, "elapsed_ns": 0},
+        scheduling,
         relationship_states)
     first_producer = _emit_product_segment(
         first, first_facts, first_dir, first_rows, cell, source_commit, source_tree,
         input_digest, topology_digest, model_id, assignment_facts, relationship_count,
-        simulator_facts, assignment_digest, str(first["source_manifest"]["sha256"]), False, True)
+        simulator_facts, assignment_digest, str(first["source_manifest"]["sha256"]),
+        scheduling, False, True)
     repeat_producer = _emit_product_segment(
         repeat, repeat_facts, repeat_dir, repeat_rows, cell, source_commit, source_tree,
         input_digest, topology_digest, model_id, assignment_facts, relationship_count,
-        simulator_facts, assignment_digest, str(first["source_manifest"]["sha256"]), True, True)
+        simulator_facts, assignment_digest, str(first["source_manifest"]["sha256"]),
+        scheduling, True, True)
     return first_producer, repeat_producer
 
 def _write_new(path: Path, raw: bytes, label: str) -> None:

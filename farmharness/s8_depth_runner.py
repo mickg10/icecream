@@ -28,6 +28,7 @@ except ImportError:  # pragma: no cover
 SCHEMA = "icecream-s8-depth-run-plan-v1"
 MATRIX_AUDIT_SCHEMA = "icecream-s8-matrix-audit-v1"
 DEPTHS = (100, 200, "full", "repeat-full")
+TOPOLOGIES = ("C1F1", "C1F20")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 TIMESTAMPED_DIR = re.compile(
     r"^s8-[A-Za-z0-9_.-]+-\d{8}T\d{6}Z(?:-[A-Za-z0-9_.-]+)?$"
@@ -38,6 +39,42 @@ MAX_INPUT_BYTES = 512 * 1024 * 1024
 
 class DepthPlanError(ValueError):
     """Raised when a depth request cannot be authenticated without guessing."""
+
+
+def build_schedule(inputs: list[dict[str, Any]], topology: str) -> dict[str, Any]:
+    """Build an authenticated deterministic execution-slot assignment."""
+    if topology not in TOPOLOGIES:
+        raise DepthPlanError("scheduling:topology_invalid")
+    if topology == "C1F1":
+        relationships, slots, slots_per_f, capacity = 1, 1, 1, 100000
+    else:
+        relationships, slots, slots_per_f, capacity = 20, 40, 2, 40
+    available = [0] * slots
+    assignments: list[dict[str, Any]] = []
+    for ordinal, item in enumerate(inputs):
+        if (not isinstance(item, dict) or type(item.get("bytes")) is not int or
+                item["bytes"] < 0):
+            raise DepthPlanError("scheduling:input_bytes_invalid")
+        service = 1_500_000 + item["bytes"] * 24
+        slot = min(range(slots), key=lambda candidate: (available[candidate], candidate))
+        start = available[slot]
+        finish = start + service
+        available[slot] = finish
+        assignments.append({
+            "ordinal": ordinal, "global_slot": slot,
+            "f_relationship": slot // slots_per_f, "per_f_slot": slot % slots_per_f,
+            "planning_service_ns": service, "planning_start_ns": start,
+            "planning_finish_ns": finish,
+        })
+    return {
+        "schema": "icecream-s8-scheduling-topology-v1", "topology": topology,
+        "f_relationships": relationships, "slots_per_f": slots_per_f,
+        "global_slots": slots, "execution_slots": slots,
+        "stream_capacity_tus": capacity,
+        "service_duration_model": "base_compile_ns_plus_24_ns_per_input_byte",
+        "assignment_policy": "earliest_available_global_slot_then_slot_index",
+        "assignment_epoch_reset": True, "assignments": assignments,
+    }
 
 
 def _digest(path: Path, label: str, limit: int = MAX_INPUT_BYTES) -> dict[str, Any]:
@@ -180,10 +217,13 @@ def _repeat_precondition(path: Path, cell: dict[str, str], source_manifest: dict
 
 def build_plan(source_manifest: Path, source_root: Path, matrix_audit: Path,
                result_dir: Path, corpus: str, profile: str, regime: str,
-               depth: int | str, repeat_of: Path | None = None) -> dict[str, Any]:
+               depth: int | str, repeat_of: Path | None = None,
+               topology: str = "C1F1") -> dict[str, Any]:
     cell = _cell(corpus, profile, regime)
     if depth not in DEPTHS:
         raise DepthPlanError("request:depth_invalid")
+    if topology not in TOPOLOGIES:
+        raise DepthPlanError("scheduling:topology_invalid")
     if not result_dir.is_absolute() or TIMESTAMPED_DIR.fullmatch(result_dir.name) is None:
         raise DepthPlanError("result_dir:timestamped_absolute_directory_required")
     if result_dir.exists() or result_dir.is_symlink():
@@ -205,6 +245,7 @@ def build_plan(source_manifest: Path, source_root: Path, matrix_audit: Path,
                                             {"sha256": manifest_facts["sha256"]}, selected)
     elif repeat_of is not None:
         raise DepthPlanError("repeat_of:only_valid_for_repeat_full")
+    scheduling = build_schedule(selected, topology)
     source = {"root": str(source_root.resolve()),
               "manifest": {"path": manifest_facts["path"], "sha256": manifest_facts["sha256"],
                            "bytes": manifest_facts["bytes"], "entries": len(all_inputs)}}
@@ -216,6 +257,7 @@ def build_plan(source_manifest: Path, source_root: Path, matrix_audit: Path,
         "source_manifest": source["manifest"], "source_root": source["root"],
         "matrix_precondition": matrix_facts,
         "inputs": selected,
+        "scheduling": scheduling,
         "result": {"directory": str(result_dir),
                     "raw_jsonl": ["predictive_sim.jsonl", "live_summary.jsonl", "records.jsonl"],
                     "records": "records.jsonl", "experiment_manifest": "experiment_manifest.json"},
@@ -254,6 +296,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--regime", choices=REGIMES, required=True)
     parser.add_argument("--depth", choices=("100", "200", "full", "repeat-full"), required=True)
     parser.add_argument("--repeat-of", type=Path)
+    parser.add_argument("--topology", choices=TOPOLOGIES, default="C1F1")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
     depth: int | str = int(args.depth) if args.depth.isdigit() else args.depth
@@ -261,7 +304,8 @@ def main(argv: list[str] | None = None) -> int:
         plan = build_plan(args.source_manifest.absolute(), args.source_root.absolute(),
                           args.matrix_audit.absolute(), args.result_dir.absolute(),
                           args.corpus, args.profile, args.regime, depth,
-                          args.repeat_of.absolute() if args.repeat_of else None)
+                          args.repeat_of.absolute() if args.repeat_of else None,
+                          args.topology)
         raw = (json.dumps(plan, sort_keys=True, separators=(",", ":")) + "\n").encode()
         _write_new(args.out.absolute(), raw)
     except DepthPlanError as exc:

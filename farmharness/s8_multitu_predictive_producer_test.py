@@ -78,13 +78,13 @@ def _source(tmp_path: Path, count: int) -> tuple[Path, Path]:
 
 
 def _plan(tmp_path: Path, count: int, depth: int | str, suffix: str,
-          regime: str = "cold", profile: str = "P29") -> Path:
+          regime: str = "cold", profile: str = "P29", topology: str = "C1F1") -> Path:
     root, manifest = _source(tmp_path, count)
     matrix = tmp_path / "matrix.json"
     _matrix(matrix)
     result_dir = tmp_path / f"s8-DuckDB-{profile}-{regime}-20260829T000000Z-{suffix}"
     value = depth_runner.build_plan(manifest, root, matrix, result_dir,
-                                    "DuckDB", profile, regime, depth)
+                                    "DuckDB", profile, regime, depth, topology=topology)
     plan_path = tmp_path / f"{suffix}-plan.json"
     _write(plan_path, canonical_bytes(value) + b"\n")
     return plan_path
@@ -239,17 +239,68 @@ def test_grz_without_libbsc_fails_closed(tmp_path: Path) -> None:
 
 
 def test_twenty_relationships_have_independent_first_use_startup(tmp_path: Path) -> None:
-    plan_path = _plan(tmp_path / "twenty", 100, 100, "twenty", "warm", "ZSTD_ROUTE")
+    plan_path = _plan(tmp_path / "twenty", 100, 100, "twenty", "warm", "ZSTD_ROUTE", "C1F20")
     cell = {"corpus": "DuckDB", "profile": "ZSTD_ROUTE", "regime": "warm"}
     manifest = _template(tmp_path / "template-twenty", cell)
-    assignment = tmp_path / "assignment.json"
-    _write(assignment, canonical_bytes({"cardinality": 20, "assignments": [index % 20 for index in range(100)]}) + b"\n")
-    produce(plan_path, manifest, COMMIT, TREE, assignment_map=assignment)
+    produce(plan_path, manifest, COMMIT, TREE)
     output = Path(json.loads(plan_path.read_bytes())["result"]["directory"])
     rows = [json.loads(line) for line in (output / "predictive_sim.jsonl").read_text().splitlines()]
     assert sum(row["startup_ns"] > 0 for row in rows) == 20
-    assert {row["relationship_id"] for row in rows[:20]} == {f"c1f20-r{index:02d}" for index in range(20)}
-    assert all(row["startup_ns"] == 0 for row in rows[20:])
+    assert len({row["relationship_id"] for row in rows}) == 20
+    assert {row["scheduling"]["global_slot"] for row in rows} == set(range(40))
+    assert all(row["startup_ns"] == 0 for row in rows[40:])
+
+
+def test_authenticated_topology_schedule_declares_exact_capacity_and_makespan(tmp_path: Path) -> None:
+    one_path = _plan(tmp_path / "one", 100, 100, "one", topology="C1F1")
+    one = json.loads(one_path.read_bytes())
+    assert isinstance(one["scheduling"], dict)
+    assert one["scheduling"]["f_relationships"] == 1
+    assert one["scheduling"]["global_slots"] == 1
+    assert one["scheduling"]["execution_slots"] == 1
+    assert one["scheduling"]["stream_capacity_tus"] == 100000
+    assert {item["global_slot"] for item in one["scheduling"]["assignments"]} == {0}
+
+    plan_path = _plan(tmp_path / "twenty", 100, 100, "twenty-schedule", topology="C1F20")
+    value = json.loads(plan_path.read_bytes())
+    scheduling = value["scheduling"]
+    assert (scheduling["f_relationships"], scheduling["slots_per_f"],
+            scheduling["global_slots"], scheduling["execution_slots"],
+            scheduling["stream_capacity_tus"]) == (20, 2, 40, 40, 40)
+    assert {item["global_slot"] for item in scheduling["assignments"]} == set(range(40))
+    assert {item["f_relationship"] for item in scheduling["assignments"]} == set(range(20))
+    assert {item["per_f_slot"] for item in scheduling["assignments"]} == {0, 1}
+    manifest = _template(tmp_path / "template-schedule",
+                         {"corpus": "DuckDB", "profile": "P29", "regime": "cold"})
+    produce(plan_path, manifest, COMMIT, TREE)
+    rows = [json.loads(line) for line in
+            (Path(value["result"]["directory"]) / "predictive_sim.jsonl").read_text().splitlines()]
+    serial = sum(row["scheduling"]["service_ns"] for row in rows)
+    assert rows[-1]["cumulative"]["elapsed_ns"] < serial
+    assert rows[-1]["schedule_summary"]["makespan_ns"] == rows[-1]["cumulative"]["elapsed_ns"]
+    assert rows[-1]["schedule_summary"]["serial_service_ns"] == serial
+    assert all(row["scheduling"]["finish_ns"] ==
+               row["scheduling"]["start_ns"] + row["scheduling"]["service_ns"] for row in rows)
+
+
+def test_c1f1_schedule_is_serial_and_topology_mutation_fails_closed(tmp_path: Path) -> None:
+    plan_path = _plan(tmp_path / "serial", 100, 100, "serial", topology="C1F1")
+    manifest = _template(tmp_path / "template-serial",
+                         {"corpus": "DuckDB", "profile": "P29", "regime": "cold"})
+    produce(plan_path, manifest, COMMIT, TREE)
+    value = json.loads(plan_path.read_bytes())
+    rows = [json.loads(line) for line in
+            (Path(value["result"]["directory"]) / "predictive_sim.jsonl").read_text().splitlines()]
+    assert all(row["scheduling"]["global_slot"] == 0 for row in rows)
+    assert rows[-1]["cumulative"]["elapsed_ns"] == sum(
+        row["scheduling"]["service_ns"] for row in rows)
+
+    mutated = _plan(tmp_path / "mutated", 100, 100, "mutated", topology="C1F20")
+    changed = json.loads(mutated.read_bytes())
+    changed["scheduling"]["global_slots"] = 39
+    _write(mutated, canonical_bytes(changed) + b"\n")
+    with pytest.raises(MultiTUPredictiveError, match="scheduling_authenticated_mismatch"):
+        produce(mutated, manifest, COMMIT, TREE)
 
 
 def test_standalone_repeat_fails_and_pair_carries_terminal_codec_state(tmp_path: Path) -> None:
@@ -272,5 +323,9 @@ def test_standalone_repeat_fails_and_pair_carries_terminal_codec_state(tmp_path:
     second_output = Path(repeat["result"]["directory"])
     second_rows = [json.loads(line) for line in (second_output / "predictive_sim.jsonl").read_text().splitlines()]
     assert second_rows[0]["relationship_state"]["transition"] == "relationship_continue"
+    first_output = Path(full["result"]["directory"])
+    first_rows = [json.loads(line) for line in (first_output / "predictive_sim.jsonl").read_text().splitlines()]
+    assert first_rows[0]["scheduling"]["start_ns"] == 0
+    assert second_rows[0]["scheduling"]["start_ns"] == 0
     assert second_result["codec"]["paired_stream_scope"] == "full-1+full-2"
     assert first_result["codec"]["mode"] == "paired_continuation"
