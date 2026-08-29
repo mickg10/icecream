@@ -73,6 +73,9 @@ struct Config {
 
     // The adapter does not own this listener.  A present advertisement is
     // emitted only when observe_public_listener() reports this exact port.
+    // Zero denotes a local-only adapter (for a submitter daemon with no
+    // public worker listener), which can authenticate control handoffs but
+    // never projects a scheduler advertisement.
     uint32_t public_listener_port = 0;
 
     std::chrono::milliseconds readiness_timeout{1000};

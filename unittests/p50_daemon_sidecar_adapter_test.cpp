@@ -156,11 +156,11 @@ int main()
 
     if (!DaemonSidecarAdapter::valid_config(config))
         return 3;
-    auto invalid = config;
-    invalid.public_listener_port = 0;
-    if (DaemonSidecarAdapter::valid_config(invalid))
+    auto local_only = config;
+    local_only.public_listener_port = 0;
+    if (!DaemonSidecarAdapter::valid_config(local_only))
         return 4;
-    invalid = config;
+    auto invalid = config;
     invalid.generation = 0;
     if (DaemonSidecarAdapter::valid_config(invalid))
         return 5;
@@ -232,8 +232,24 @@ int main()
     if (::access(adapter.socket_path().c_str(), F_OK) == 0)
         return 17;
 
-    if (::rmdir(directory) != 0)
+    // A submitter-only daemon still needs an authenticated local adapter for
+    // the C cache-control handoff, but has no public listener to advertise.
+    auto local_config = config;
+    local_config.public_listener_port = 0;
+    DaemonSidecarAdapter local_adapter(local_config);
+    local_adapter.observe_public_listener(false, 0);
+    icecc::p50::advertisement::Update local_update;
+    if (!drive_until(local_adapter, reaper, local_update,
+                     std::chrono::seconds(5), [&] {
+                         return local_adapter.authenticated() &&
+                                local_adapter.advertisement_snapshot().absent();
+                     }))
         return 18;
+    if (!drive_shutdown(local_adapter, reaper, local_update))
+        return 19;
+
+    if (::rmdir(directory) != 0)
+        return 20;
     std::puts("p50 daemon sidecar adapter outer lifecycle: ok");
     return 0;
 }

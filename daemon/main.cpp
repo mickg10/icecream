@@ -5002,9 +5002,11 @@ bool Daemon::configure_cache_adapter() noexcept
     if (cache_service_executable.empty() && cache_runtime_directory.empty())
         return true;
 
-    if (noremote || daemon_port <= 0 || daemon_port > UINT16_MAX
-            || !exact_public_tcp_listener(tcp_listen_fd,
-                                          static_cast<uint32_t>(daemon_port))) {
+    const bool local_only_cache_adapter = noremote;
+    if (daemon_port < 0 || daemon_port > UINT16_MAX ||
+            (!local_only_cache_adapter &&
+             !exact_public_tcp_listener(tcp_listen_fd,
+                                        static_cast<uint32_t>(daemon_port)))) {
         log_error() << "cache sidecar requires the exact public TCP listener to be bound"
                     << " (noremote=" << noremote << " port=" << daemon_port
                     << " tcp_listen_fd=" << tcp_listen_fd << ")" << endl;
@@ -5024,7 +5026,12 @@ bool Daemon::configure_cache_adapter() noexcept
         config.expected_daemon_gid = static_cast<uint64_t>(::getegid());
         config.expected_service_uid = config.expected_daemon_uid;
         config.expected_service_gid = config.expected_daemon_gid;
-        config.public_listener_port = static_cast<uint32_t>(daemon_port);
+        // A submitter-only daemon has no public worker listener.  Its cache
+        // sidecar is still required for the authenticated C control handoff,
+        // but it must remain local-only and therefore cannot advertise a
+        // public cache endpoint to the scheduler.
+        config.public_listener_port = local_only_cache_adapter
+            ? 0 : static_cast<uint32_t>(daemon_port);
         config.readiness_timeout = std::chrono::milliseconds(5000);
         config.connect_timeout = std::chrono::milliseconds(1000);
         config.handoff_timeout = std::chrono::milliseconds(250);
@@ -5052,8 +5059,9 @@ bool Daemon::configure_cache_adapter() noexcept
             return false;
         }
         cache_adapter.reset(created);
-        cache_adapter->observe_public_listener(true,
-                                               static_cast<uint32_t>(daemon_port));
+        cache_adapter->observe_public_listener(
+            !local_only_cache_adapter,
+            local_only_cache_adapter ? 0 : static_cast<uint32_t>(daemon_port));
         cache_adapter_start_attempted = false;
         log_info() << "cache sidecar configured for public port " << daemon_port
                    << "; advertisement remains absent until scheduler activation and READY"

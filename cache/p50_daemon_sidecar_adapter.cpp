@@ -399,7 +399,7 @@ bool DaemonSidecarAdapter::valid_config(const Config& config) noexcept
         config.runtime_directory.empty() ||
         config.runtime_directory.front() != '/' || has_nul(config.runtime_directory) ||
         config.runtime_directory.size() >= 180 ||
-        config.generation == 0 || config.public_listener_port == 0 ||
+        config.generation == 0 ||
         config.public_listener_port > std::numeric_limits<uint16_t>::max() ||
         !valid_id(config.expected_daemon_uid) || !valid_gid(config.expected_daemon_gid) ||
         !valid_id(config.expected_service_uid) || !valid_gid(config.expected_service_gid) ||

@@ -29,12 +29,12 @@ done
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/p50completionflow.XXXXXX")
 cleanup() {
-    for pid in "${service_pid:-}" "${client_pid:-}" "${worker_pid:-}" "${sched_pid:-}"; do
+    for pid in "${service_pid:-}" "${client_service_pid:-}" "${client_pid:-}" "${worker_pid:-}" "${sched_pid:-}"; do
         test -n "$pid" && kill "$pid" 2>/dev/null || :
     done
     for _ in $(seq 1 50); do
         live=0
-        for pid in "${service_pid:-}" "${client_pid:-}" "${worker_pid:-}" "${sched_pid:-}"; do
+        for pid in "${service_pid:-}" "${client_service_pid:-}" "${client_pid:-}" "${worker_pid:-}" "${sched_pid:-}"; do
             if test -n "$pid" && kill -0 "$pid" 2>/dev/null; then
                 live=1
             fi
@@ -42,7 +42,7 @@ cleanup() {
         test "$live" -eq 0 && break
         sleep 0.1
     done
-    for pid in "${service_pid:-}" "${client_pid:-}" "${worker_pid:-}" "${sched_pid:-}"; do
+    for pid in "${service_pid:-}" "${client_service_pid:-}" "${client_pid:-}" "${worker_pid:-}" "${sched_pid:-}"; do
         test -n "$pid" && kill -9 "$pid" 2>/dev/null || :
     done
     wait "${client_pid:-}" 2>/dev/null || :
@@ -57,9 +57,9 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 mkdir -p "$work/envs-f" "$work/envs-c" "$work/toolchain" "$work/src" \
-    "$work/out" "$work/cache-runtime-f" "$work/home" "$work/evidence"
+    "$work/out" "$work/cache-runtime-f" "$work/cache-runtime-c" "$work/home" "$work/evidence"
 chmod 1777 "$work/envs-f" "$work/envs-c"
-chmod 0700 "$work/cache-runtime-f" "$work/home"
+chmod 0700 "$work/cache-runtime-f" "$work/cache-runtime-c" "$work/home"
 HOME="$work/home"
 export HOME
 port_sched=$((24000 + ($$ % 1000)))
@@ -129,7 +129,9 @@ worker_pid=$!
 ICECC_TEST_SOCKET="$work/client.sock" ICECC_P50_C1F1_REQUIRED=1 \
     "$build/daemon/iceccd" "$@" --no-remote -m 0 \
     -s "127.0.0.1:$port_sched" -n "$network" -N p50-c \
-    -b "$work/envs-c" -l "$work/c.log" -vvv &
+    -b "$work/envs-c" -l "$work/c.log" -vvv \
+    --cache-service "$build/cache/icecc-cache-service" \
+    --cache-runtime-dir "$work/cache-runtime-c" &
 client_pid=$!
 
 logins=0
@@ -149,6 +151,12 @@ find_service_pid() {
         '$2 == parent && index($0, exe) > 0 { print $1; exit }'
 }
 
+find_client_service_pid() {
+    ps -eo pid=,ppid=,args= | \
+        awk -v parent="$client_pid" -v exe="$build/cache/icecc-cache-service" \
+        '$2 == parent && index($0, exe) > 0 { print $1; exit }'
+}
+
 service_pid=
 for _ in $(seq 1 30); do
     service_pid=$(find_service_pid)
@@ -157,6 +165,17 @@ for _ in $(seq 1 30); do
 done
 test -n "$service_pid" || {
     echo "FAIL: production daemon did not start its cache sidecar" >&2
+    exit 1
+}
+
+client_service_pid=
+for _ in $(seq 1 30); do
+    client_service_pid=$(find_client_service_pid)
+    test -n "$client_service_pid" && break
+    sleep 1
+done
+test -n "$client_service_pid" || {
+    echo "FAIL: C daemon did not start its authenticated local cache sidecar" >&2
     exit 1
 }
 

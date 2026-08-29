@@ -28,6 +28,8 @@ contract() {
     # production daemon, not only in standalone P50 unit tests.
     require_text "$root/daemon/main.cpp" 'DaemonSidecarAdapter' || return 1
     require_text "$root/daemon/main.cpp" 'observe_public_listener' || return 1
+    require_text "$root/daemon/main.cpp" 'local_only_cache_adapter' || return 1
+    require_text "$root/daemon/main.cpp" 'config.public_listener_port = local_only_cache_adapter' || return 1
     require_text "$root/daemon/main.cpp" 'cache_adapter' || return 1
     require_text "$root/daemon/Makefile.am" 'libp50daemonsidecaradapter.a' || return 1
 
@@ -72,6 +74,13 @@ contract() {
     require_text "$root/cache/Makefile.am" 'libp50inputfd.a' || return 1
     require_text "$root/cache/p50_cache_service.cpp" \
         'std::make_unique<P50ServerEndpoint>' || return 1
+    # The live C1F1 runner must provision the submitter-side adapter as well
+    # as F's advertised service; otherwise the production C handler correctly
+    # fails closed before it can hand off the authenticated control socket.
+    require_text "$root/unittests/p50compilee2e-run.sh" \
+        '--cache-service "$build/cache/icecc-cache-service"' || return 1
+    require_text "$root/unittests/p50compilee2e-run.sh" \
+        '--cache-runtime-dir "$work/cache-runtime-c"' || return 1
 }
 
 # Keep primitive P50 evidence visible in this test. These assertions prevent
