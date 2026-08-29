@@ -328,10 +328,14 @@ static void test_ready_wire_and_failure_boundaries()
         joined.push_back(0xaa);
         send_bytes(sidecar_fd, joined);
         const int owned = pair.left->fd;
-        REQUIRE(pair.left->release_fd_after_cache_session_ready(
-                    std::chrono::steady_clock::now() + std::chrono::seconds(1)) == -1 &&
-                    pair.left->fd == owned,
-                "a byte behind READY blocks transition into CacheWire");
+        const int released = pair.left->release_fd_after_cache_session_ready(
+            std::chrono::steady_clock::now() + std::chrono::seconds(1));
+        REQUIRE(released == owned && pair.left->fd == -1,
+                "READY transfers ownership when the endpoint has already written CacheWire");
+        unsigned char queued = 0;
+        REQUIRE(recv(released, &queued, sizeof(queued), 0) == 1 && queued == 0xaa,
+                "queued post-READY CacheWire bytes remain for the endpoint parser");
+        close(released);
         close(sidecar_fd);
     }
 }

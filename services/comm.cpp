@@ -2597,14 +2597,11 @@ static bool receive_cache_session_ready(
         ntohl(ready) != CACHE_SESSION_READY_MAGIC)
         return false;
 
-    /* READY is the entire F->C transition boundary.  Refuse EOF or any
-       sidecar/CacheWire byte already queued behind it. */
-    unsigned char extra = 0;
-    const ssize_t peeked = recv(fd, &extra, sizeof(extra),
-                                MSG_PEEK | MSG_DONTWAIT);
-    if (peeked >= 0)
-        return false;
-    return errno == EAGAIN || errno == EWOULDBLOCK;
+    /* READY transfers ownership of the descriptor.  The F endpoint starts
+       its first CacheWire write immediately after publishing READY, so a
+       valid greeting may already be queued by the time C observes the
+       witness.  Leave those bytes untouched for the endpoint parser. */
+    return true;
 }
 
 int MsgChannel::release_fd_after_cache_session_ready(
