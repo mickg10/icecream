@@ -450,6 +450,15 @@ def _path_within(path: Path, root: Path) -> bool:
     return True
 
 
+def container_name(work_parent: Path) -> str:
+    """Return the unique, inspectable Docker name for one private run root."""
+    name = f"p50-s8-{work_parent.name}"
+    if (not work_parent.name.startswith("p5.") or SAFE.fullmatch(name) is None or
+            len(name) > 63):
+        _fail("container_name:invalid")
+    return name
+
+
 def build_container_command(inner: list[str], *, image_identity: dict[str, str],
                             bind_root: Path, work_parent: Path,
                             required_paths: list[Path]) -> list[str]:
@@ -478,11 +487,26 @@ def build_container_command(inner: list[str], *, image_identity: dict[str, str],
                      f"chown -R {uid}:{gid} {shlex.quote(str(work_parent))} || exit 70\n"
                      "exit \"$product_status\"\n")
     return ["docker", "run", "--rm", "--user", "0", "--network", "host",
+            "--name", container_name(work_parent),
             "--env", "ICECC_TEST_DAEMON_UID=nobody",
             "--env", "ICECC_TEST_DAEMON_GID=nogroup",
             "-v", f"{bind_root}:{bind_root}:ro",
             "-v", f"{work_parent}:{work_parent}:rw",
             image_identity["image_id"], "/bin/sh", "-lc", cleanup_shell]
+
+
+def stop_container(name: str) -> None:
+    """Remove the exact private run container after client loss or timeout."""
+    if SAFE.fullmatch(name) is None or not name.startswith("p50-s8-p5."):
+        _fail("container_cleanup:name_invalid")
+    try:
+        completed = subprocess.run(
+            ["docker", "container", "rm", "--force", name], capture_output=True,
+            text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise LiveRunnerError("container_cleanup:command_failed") from exc
+    if completed.returncode != 0 and "No such container" not in completed.stderr:
+        _fail("container_cleanup:remove_failed")
 
 
 def _fields(stdout: str, prefix: str) -> list[dict[str, str]]:
@@ -1075,9 +1099,17 @@ def main(argv: list[str] | None = None) -> int:
         try:
             stdout, returncode = _run_product(command, timeout)
         except LiveRunnerError as exc:
+            cleanup_error: LiveRunnerError | None = None
+            if run_work_parent is not None:
+                try:
+                    stop_container(container_name(run_work_parent))
+                except LiveRunnerError as stop_exc:
+                    cleanup_error = stop_exc
             print(f"timeout_seconds={timeout}")
             print(f"workdir={run_workdir}" if run_workdir is not None else "workdir=unknown")
             print(str(exc))
+            if cleanup_error is not None:
+                print(str(cleanup_error))
             return 77
         path = finalize(stdout, returncode, batch_manifest=batch_manifest,
                         topology=topology, output=args.output.absolute(), profile=args.profile,

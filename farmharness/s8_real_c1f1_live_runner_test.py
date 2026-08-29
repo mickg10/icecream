@@ -224,6 +224,7 @@ def test_container_command_uses_resolved_image_and_read_only_product_mount(
             image_identity=identity, bind_root=bind_root,
             work_parent=work_parent, required_paths=[required, product])
         assert command[:7] == ["docker", "run", "--rm", "--user", "0", "--network", "host"]
+        assert command[7:9] == ["--name", runner.container_name(work_parent)]
         assert identity["image_id"] in command
         assert identity["reference"] not in command
         assert f"{bind_root.resolve()}:{bind_root.resolve()}:ro" in command
@@ -231,6 +232,65 @@ def test_container_command_uses_resolved_image_and_read_only_product_mount(
         assert "ICECC_TEST_DAEMON_UID=nobody" in command
         assert "ICECC_TEST_DAEMON_GID=nogroup" in command
         assert f"chown -R {os.geteuid()}:{os.getegid()}" in command[-1]
+    finally:
+        work_parent.rmdir()
+
+
+def test_container_cleanup_is_exact_and_tolerates_already_removed(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    work_parent = Path("/tmp") / f"p5.cleanup-{os.getpid()}"
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 1, "", "Error: No such container")
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    name = runner.container_name(work_parent)
+    runner.stop_container(name)
+    assert calls == [["docker", "container", "rm", "--force", name]]
+    with pytest.raises(runner.LiveRunnerError, match="name_invalid"):
+        runner.stop_container("unrelated-container")
+
+
+def test_interrupted_product_removes_its_exact_container(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    work_parent = Path("/tmp") / f"p5.cleanup-main-{os.getpid()}"
+    work_parent.mkdir()
+    stopped: list[str] = []
+    image = {"reference": runner.PINNED_IMAGE,
+             "image_id": "sha256:" + "a" * 64,
+             "architecture": "amd64", "os": "linux",
+             "created": "2026-08-21T21:11:43Z"}
+
+    monkeypatch.setattr(runner.tempfile, "mkdtemp", lambda **_kwargs: str(work_parent))
+    monkeypatch.setattr(runner, "load_predictive_plan",
+                        lambda *_args, **_kwargs: ({}, [], "b" * 64))
+    monkeypatch.setattr(runner, "load_batch_manifest", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(runner, "load_topology", lambda *_args, **_kwargs: "c" * 64)
+    monkeypatch.setattr(runner, "container_image_identity", lambda *_args: image)
+    monkeypatch.setattr(
+        runner, "product_identity",
+        lambda *_args: ("d" * 40, "e" * 40, {"client/icecc": "f" * 64}, "1" * 64))
+    monkeypatch.setattr(runner, "build_command", lambda *_args, **_kwargs: ["env", "true"])
+    monkeypatch.setattr(runner, "build_container_command",
+                        lambda *_args, **_kwargs: ["docker", "run"])
+
+    def interrupted(_command: list[str], _timeout: int) -> tuple[str, int]:
+        raise runner.LiveRunnerError("product_run:interrupted")
+
+    monkeypatch.setattr(runner, "_run_product", interrupted)
+    monkeypatch.setattr(runner, "stop_container", stopped.append)
+    try:
+        status = runner.main([
+            "--batch-manifest", str(tmp_path / "batch.jsonl"),
+            "--predictive-plan", str(tmp_path / "plan.json"),
+            "--topology", str(tmp_path / "topology.json"),
+            "--profile", "ZSTD_TU", "--product-root", str(tmp_path / "product"),
+            "--output", str(tmp_path / "output"), "--execute",
+        ])
+        assert status == 77
+        assert stopped == [runner.container_name(work_parent)]
     finally:
         work_parent.rmdir()
 
