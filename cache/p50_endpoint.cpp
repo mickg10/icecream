@@ -1231,6 +1231,21 @@ void P50PreparationAuthority::commit(PreparedTuHandle handle) {
 #endif
 }
 
+void P50PreparationAuthority::prime_grz_initial_state(HistoryNonce history_nonce) {
+    impl_->owner.require();
+#if defined(ICECC_P50_WITH_LIBBSC)
+    if (impl_->profile != ProfileId::GRZ)
+        return;
+    if (!impl_->entries.empty() || impl_->uncommitted_grz_entry.has_value() ||
+        impl_->grz_next_rel.value != 0 || impl_->grz_state_digest != Digest128{})
+        throw std::logic_error("GRZ_RESIDUAL initial state was already used");
+    impl_->grz_state_digest = initial_route_digest(impl_->c_guid, history_nonce);
+    impl_->grz_codec.prime_initial_state(history_nonce, impl_->grz_state_digest);
+#else
+    (void)history_nonce;
+#endif
+}
+
 CStoreGuid P50PreparationAuthority::c_store_guid() const {
     impl_->owner.check();
     return impl_->c_guid;
@@ -1367,6 +1382,7 @@ struct P50ClientEndpoint::Impl {
             throw std::invalid_argument("C endpoint and preparation authority use different profiles");
         if (first_nonce.value == 0)
             throw std::invalid_argument("first endpoint HISTORY_NONCE must be nonzero");
+        preparation->prime_grz_initial_state(first_nonce);
     }
 
     uint64_t allocate_session() {

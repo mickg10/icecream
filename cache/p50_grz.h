@@ -30,6 +30,11 @@ public:
                                ZstdTuLimits limits);
     // A route publishes matcher/history state only when its prepared TU is
     // committed.  Rejection and retry discard the tentative frame state.
+    // The endpoint may prime an empty route with its authenticated transport
+    // cursor before the first TU.  This preserves the nonzero route identity
+    // digest while keeping unprimed standalone codecs fail-closed.
+    void prime_initial_state(HistoryNonce history_nonce,
+                             Digest128 state_digest);
     void commit();
     void discard() noexcept;
     void reset() noexcept;

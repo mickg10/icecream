@@ -231,6 +231,9 @@ public:
     uint64_t retain(PreparedTuHandle handle);
     uint64_t release(PreparedTuHandle handle);
     void commit(PreparedTuHandle handle);
+    // Bind a fresh GRZ authority to the transport's authenticated initial
+    // route cursor before its first prepared TU is admitted.
+    void prime_grz_initial_state(HistoryNonce history_nonce);
 
     [[nodiscard]] CStoreGuid c_store_guid() const;
     [[nodiscard]] ZstdTuLimits zstd_limits() const;

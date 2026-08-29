@@ -390,6 +390,8 @@ void validate_grz_successor(const TxBegin& begin,
     if (!last_rel && !state_digest &&
         (begin.rel_seq.value != 0 || begin.pre_state_digest != Digest128{}))
         throw std::invalid_argument("GRZ_RESIDUAL initial state must start at REL_SEQ zero");
+    if (!last_rel && state_digest && begin.rel_seq.value != 0)
+        throw std::invalid_argument("GRZ_RESIDUAL initial state must start at REL_SEQ zero");
     if (history_nonce && begin.history_nonce != *history_nonce)
         throw std::invalid_argument("GRZ_RESIDUAL history nonce changed without reset");
     if (last_rel && (last_rel->value == std::numeric_limits<uint64_t>::max() ||
@@ -401,6 +403,22 @@ void validate_grz_successor(const TxBegin& begin,
 
 GrzResidualCodec::GrzResidualCodec() : state_(std::make_unique<State>()) {}
 GrzResidualCodec::~GrzResidualCodec() = default;
+
+void GrzResidualCodec::prime_initial_state(HistoryNonce history_nonce,
+                                            Digest128 state_digest) {
+    if (history_nonce.value == 0)
+        throw std::invalid_argument("GRZ_RESIDUAL initial HISTORY_NONCE is zero");
+    if (!state_->encode_history.empty() || !state_->decode_history.empty() ||
+        !state_->encode_pending.empty() || !state_->decode_pending.empty() ||
+        state_->encode_history_nonce || state_->decode_history_nonce ||
+        state_->encode_last_rel || state_->decode_last_rel ||
+        state_->encode_state_digest || state_->decode_state_digest)
+        throw std::logic_error("GRZ_RESIDUAL initial state was already primed");
+    state_->encode_history_nonce = history_nonce;
+    state_->encode_state_digest = state_digest;
+    state_->decode_history_nonce = history_nonce;
+    state_->decode_state_digest = state_digest;
+}
 
 GrzResidualEnvelope GrzResidualCodec::encode(
     HistoryNonce history_nonce, RelSeq rel_seq, TuSeq tu_seq,
@@ -614,8 +632,17 @@ void GrzResidualDialogue::begin(const TxBegin& begin_value) {
         protocol_error("TX_BEGIN selected an unnegotiated profile");
     try {
         validate_shape(begin_value, limits_);
-        validate_grz_successor(begin_value, history_nonce_, last_rel_,
-                               committed_state_);
+        const bool initial_route = !history_nonce_ && !last_rel_ && !committed_state_;
+        if (initial_route)
+            codec_.prime_initial_state(begin_value.history_nonce,
+                                       begin_value.pre_state_digest);
+        validate_grz_successor(
+            begin_value, initial_route
+                           ? std::optional<HistoryNonce>(begin_value.history_nonce)
+                           : history_nonce_,
+            last_rel_, initial_route
+                       ? std::optional<Digest128>(begin_value.pre_state_digest)
+                       : committed_state_);
     }
     catch (...) { clear_active(); state_ = State::Terminal; throw; }
     active_ = begin_value;
