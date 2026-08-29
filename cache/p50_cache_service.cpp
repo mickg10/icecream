@@ -1095,7 +1095,11 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
           config_.endpoint_config.owner_limits.max_retained_input_records,
           config_.max_input_lifecycle_replays),
       endpoint_work_guard_(asio::make_work_guard(context_)),
-      fsession_owner_(4, config_.f_store_generation) {
+      // One C sidecar may serve twenty persistent relationships, with two
+      // compile slots per F.  Keep the operation table bounded while leaving
+      // room for every concurrently admitted C/F session (40) plus control
+      // churn during replacement.
+      fsession_owner_(64, config_.f_store_generation) {
     const auto fsession_ready = fsession::mint_fsession_admission_ready(
         fsession_owner_.service_generation(), 1);
     if (!fsession_owner_.open_admission(fsession_ready))
