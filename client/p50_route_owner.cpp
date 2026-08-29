@@ -17,16 +17,6 @@ bool supported_profile(ProfileId profile) noexcept {
     return false;
 }
 
-bool route_history_profile(ProfileId profile) noexcept {
-    if (profile == ProfileId::P29 || profile == ProfileId::Z3_LONG)
-        return true;
-#if defined(ICECC_P50_WITH_LIBBSC)
-    if (profile == ProfileId::GRZ)
-        return true;
-#endif
-    return false;
-}
-
 ZstdSourceTransferConfig sender_config(const P50RouteOwnerConfig& owner_config,
                                        ProfileId profile,
                                        std::chrono::steady_clock::time_point deadline) {
@@ -86,20 +76,11 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
         remote.address().is_unspecified())
         co_return invalid();
 
-    if (relationship.profile == ProfileId::ZSTD_TU && owns(relationship))
-        co_return invalid();
     Sender& sender = get_or_create(relationship, request, deadline);
-    ZstdSourceTransferResult result;
-    if (route_history_profile(relationship.profile)) {
-        result = co_await sender->transfer_route(remote, request, deadline, source);
-    } else {
-        // ZSTD_TU is intentionally one-shot.  Keep its owner only for this
-        // wrapper call, while still using this map to prevent cross-profile
-        // state from sharing a sender.
-        result = co_await sender->transfer(remote, source);
-        owners_.erase(relationship);
-    }
-    co_return result;
+    // Every stable C/F relationship owns the TU sequence.  ZSTD_TU still
+    // compresses each source independently; retaining its sender prevents a
+    // later wrapper from reusing (C_GUID, TU0).
+    co_return co_await sender->transfer_route(remote, request, deadline, source);
 }
 
 boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
@@ -111,18 +92,9 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
         request.request_token == 0 || !connection)
         co_return invalid();
 
-    if (relationship.profile == ProfileId::ZSTD_TU && owns(relationship))
-        co_return invalid();
     Sender& sender = get_or_create(relationship, request, deadline);
-    ZstdSourceTransferResult result;
-    if (route_history_profile(relationship.profile)) {
-        result = co_await sender->transfer_route(
-            std::move(connection), request, deadline, source);
-    } else {
-        result = co_await sender->transfer(std::move(connection), source);
-        owners_.erase(relationship);
-    }
-    co_return result;
+    co_return co_await sender->transfer_route(
+        std::move(connection), request, deadline, source);
 }
 
 void P50CRouteOwner::reset_f_store(FStoreGuid f_store_guid,

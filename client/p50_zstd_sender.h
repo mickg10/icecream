@@ -82,10 +82,11 @@ using ConnectedFdFactory =
 // C-side source transfer.  The historical class name is retained for source
 // compatibility; endpoint_caps.profile selects the exact P29, ZSTD_TU,
 // ZSTD_ROUTE, or dependency-enabled GRZ dialogue and records that selection.
-// ZSTD_TU senders
-// are one-shot because each transfer owns an independent namespace, while
-// P29/ZSTD_ROUTE and dependency-enabled GRZ retain their relationship authority
-// for sequential transfers.
+// Direct ZSTD_TU transfer calls are one-shot.  The assignment-bound
+// transfer_route overloads may retain the sender so one stable C/F relationship
+// advances TU identity while each ZSTD_TU payload remains independently
+// compressed.  P29/ZSTD_ROUTE and dependency-enabled GRZ additionally retain
+// compression history for sequential transfers.
 class P50ZstdSourceSender {
 public:
     P50ZstdSourceSender(CStoreGuid c_store_guid, PrepareRequestKey request,

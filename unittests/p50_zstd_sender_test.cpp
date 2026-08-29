@@ -425,19 +425,41 @@ void test_explicit_route_operations_bind_request_and_deadline() {
     CHECK(second_result.committed_input.has_value());
     CHECK(second_result.committed_input->tu_seq.value == 1);
 
-    // The explicit relationship API cannot accidentally turn a TU-scoped
-    // sender into a stateful route owner.
+    // ZSTD_TU keeps sequence ownership across wrappers while each transfer
+    // still uses the independent per-TU codec path.
     P50ZstdSourceSender tu_sender(Id128::from_u64(7033),
                                   PrepareRequestKey{7033, 1}, config());
-    asio::io_context invalid_context;
-    auto invalid_profile = asio::co_spawn(
-        invalid_context,
+    P50ServerEndpoint tu_server(Id128::from_u64(7034), {}, nullptr, nullptr,
+                                server_config);
+    context.restart();
+    auto tu_first_server = asio::co_spawn(context, tu_server.accept_one(acceptor),
+                                           asio::use_future);
+    auto tu_first = asio::co_spawn(
+        context,
         tu_sender.transfer_route(
             acceptor.local_endpoint(), PrepareRequestKey{7033, 2},
             std::chrono::steady_clock::now() + std::chrono::seconds(10), first),
         asio::use_future);
-    invalid_context.run();
-    CHECK(invalid_profile.get().status == ZstdSourceTransferStatus::InvalidRequest);
+    context.run();
+    CHECK(tu_first_server.get().status == ServerRunStatus::Completed);
+    const auto tu_first_result = tu_first.get();
+    CHECK(tu_first_result.status == ZstdSourceTransferStatus::Committed);
+    CHECK(tu_first_result.committed_input->tu_seq.value == 0);
+
+    context.restart();
+    auto tu_second_server = asio::co_spawn(context, tu_server.accept_one(acceptor),
+                                            asio::use_future);
+    auto tu_second = asio::co_spawn(
+        context,
+        tu_sender.transfer_route(
+            acceptor.local_endpoint(), PrepareRequestKey{7033, 3},
+            std::chrono::steady_clock::now() + std::chrono::seconds(10), second),
+        asio::use_future);
+    context.run();
+    CHECK(tu_second_server.get().status == ServerRunStatus::Completed);
+    const auto tu_second_result = tu_second.get();
+    CHECK(tu_second_result.status == ZstdSourceTransferStatus::Committed);
+    CHECK(tu_second_result.committed_input->tu_seq.value == 1);
 }
 
 void test_explicit_route_retry_preserves_exact_preparation() {

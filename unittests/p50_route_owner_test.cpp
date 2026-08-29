@@ -186,19 +186,23 @@ void test_long_lived_relationship_owner() {
     CHECK(other_f.committed_input->tu_seq.value == 0);
     CHECK(owner.owner_count() == 2);
 
-    // A different profile is also isolated.  ZSTD_TU is deliberately
-    // one-shot and is removed after its wrapper call.
+    // A different profile is also isolated.  ZSTD_TU retains only the
+    // relationship's TU sequence; each payload is still compressed alone.
     const auto tu_route = relationship(101, 203, 1, ProfileId::ZSTD_TU);
     server.reset_store(Id128::from_u64(203));
     auto tu = route_call(context, owner, server, acceptor, tu_route, {7003, 1}, first);
     CHECK(tu.status == ZstdSourceTransferStatus::Committed);
     CHECK(tu.committed_input->tu_seq.value == 0);
-    CHECK(!owner.owns(tu_route) && owner.owner_count() == 2);
+    auto tu_successor = route_call(context, owner, server, acceptor, tu_route,
+                                   {7003, 2}, second);
+    CHECK(tu_successor.status == ZstdSourceTransferStatus::Committed);
+    CHECK(tu_successor.committed_input->tu_seq.value == 1);
+    CHECK(owner.owns(tu_route) && owner.owner_count() == 3);
 
     // Explicit F generation reset drops old route history; the new generation
     // recreates a sender at TU0.
     owner.reset_f_store(Id128::from_u64(201), 2);
-    CHECK(!owner.owns(first_route) && owner.owner_count() == 1);
+    CHECK(!owner.owns(first_route) && owner.owner_count() == 2);
     const auto replacement_route = relationship(101, 201, 2);
     server.reset_store(Id128::from_u64(201));
     auto replacement = route_call(context, owner, server, acceptor,
