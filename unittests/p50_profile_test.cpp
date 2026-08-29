@@ -382,6 +382,11 @@ void test_factory_rejects_unsupported_or_unnegotiated() {
             "GRZ_RESIDUAL matcher history crossed route ownership");
 
     GrzResidualCodec route_decoder;
+    auto invalid_initial = route_one.begin;
+    invalid_initial.rel_seq = RelSeq{1};
+    require_throws<std::invalid_argument>(
+        [&] { (void)route_decoder.decode(invalid_initial, route_one.body, limits()); },
+        "GRZ_RESIDUAL decoder accepted a nonzero initial REL_SEQ");
     require(route_decoder.decode(route_one.begin, route_one.body, limits()) == route_tu1,
             "GRZ_RESIDUAL route decoder rejected its first TU");
     route_decoder.commit();
