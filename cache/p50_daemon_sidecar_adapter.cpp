@@ -1251,7 +1251,10 @@ bool DaemonSidecarAdapter::outer_advance_launch_step() noexcept
         next(OuterLaunchPhase::ListenListener);
         return true;
     case OuterLaunchPhase::ListenListener:
-        if (::listen(outer_launch_listener_fd_, 16) != 0) {
+        // A single C sidecar serves twenty relationships with two F slots;
+        // its inherited listener must absorb the corresponding control
+        // connection burst without refusing a valid session.
+        if (::listen(outer_launch_listener_fd_, 64) != 0) {
             fail_setup();
             return true;
         }
