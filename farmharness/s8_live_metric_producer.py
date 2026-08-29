@@ -205,11 +205,22 @@ def _read_evidence(package: Path, summary: dict[str, Any], summary_raw: bytes,
         observed, observed_sha = _snapshot(path, f"evidence.{name}")
         if observed_sha != descriptor["sha256"] or len(observed) != descriptor["bytes"]:
             raise ProducerError(f"evidence.{name}:digest_mismatch")
+    derivation_value = value.get("derivation_evidence")
+    if value.get("measurement_window") is not None and derivation_value is None:
+        raise ProducerError("derivation_evidence:missing")
+    if derivation_value is not None:
+        derivation = _descriptor_map(derivation_value, "derivation_evidence")
+        for name, descriptor in derivation.items():
+            path = _relative(package, descriptor["path"], f"derivation_evidence.{name}")
+            observed, observed_sha = _snapshot(path, f"derivation_evidence.{name}")
+            if observed_sha != descriptor["sha256"] or len(observed) != descriptor["bytes"]:
+                raise ProducerError(f"derivation_evidence.{name}:digest_mismatch")
     return value, timing, {"source_commit": source_commit, "source_tree": source_tree,
                            **{f"binary_{name}_sha256": digest for name, digest in binary_hashes.items()}}, manifest_sha
 
 
-def _timing_rows(package: Path, descriptors: dict[str, dict[str, object]], cell: str) -> list[dict[str, object]]:
+def _timing_rows(package: Path, descriptors: dict[str, dict[str, object]], cell: str,
+                 measurement_window: object | None = None) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for name, descriptor in descriptors.items():
         path = _relative(package, descriptor["path"], f"evidence.{name}")
@@ -222,6 +233,9 @@ def _timing_rows(package: Path, descriptors: dict[str, dict[str, object]], cell:
                 raise ProducerError(f"timing:{name}:{line_number}:schema_invalid")
             if value.get("cell") != cell:
                 raise ProducerError(f"timing:{name}:{line_number}:cell_mismatch")
+            if (measurement_window is not None and
+                    value.get("measurement_window") != measurement_window):
+                raise ProducerError(f"timing:{name}:{line_number}:measurement_window_mismatch")
             # A warm run may retain prewarm rows; only explicit measured rows
             # are admissible.  Absence of the phase is accepted for cold.
             if value.get("phase", "measured") != "measured":
@@ -281,7 +295,8 @@ def produce(package: Path, out: Path) -> Path:
         summary, summary_raw, summary_sha = _read_summary(package)
         evidence, timing, provenance, evidence_manifest_sha = _read_evidence(
             package, summary, summary_raw, summary_sha)
-        observations = _timing_rows(package, timing, summary["cell"])
+        observations = _timing_rows(package, timing, summary["cell"],
+                                    evidence.get("measurement_window"))
     except ProducerError as exc:
         return _hold(out, str(exc))
 
