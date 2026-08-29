@@ -324,6 +324,17 @@ def test_topology_requires_exact_tu_identity(tmp_path: Path) -> None:
         runner.load_topology(topology, rows)
 
 
+def test_predictive_schedule_slot_mutation_fails_before_live_descriptor(tmp_path: Path) -> None:
+    batch = _batch(tmp_path, 1)
+    rows = runner.load_batch_manifest(batch, 1)
+    topology = _topology(tmp_path, batch)
+    scheduling = {"topology": "C1F1", "assignments": [
+        {"ordinal": 0, "global_slot": 1, "f_relationship": 0, "per_f_slot": 0}
+    ]}
+    with pytest.raises(runner.LiveRunnerError, match="predictive_schedule_mismatch"):
+        runner.load_topology(topology, rows, scheduling)
+
+
 def test_product_identity_rejects_tracked_edit(tmp_path: Path) -> None:
     product, script = _product(tmp_path)
     (product / "unittests/p50compilee2e-run.sh").write_text("#!/bin/sh\nexit 1\n")

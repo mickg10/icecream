@@ -31,7 +31,9 @@ IDENTITY = {
     "model_id": "fmt-zstd-tu-cold-v1",
 }
 UNITS = {"point": "step", "channel_bytes": "bytes", "elapsed_ns": "ns"}
-COMPARISON = comparison_descriptor("e" * 64)
+SCHEDULING = {"topology": "C1F1", "assignments": [{"ordinal": 0,
+                                                     "global_slot": 0}]}
+COMPARISON = comparison_descriptor("e" * 64, SCHEDULING)
 
 
 def _curve_rows(offset: int = 0) -> list[dict[str, object]]:
@@ -142,7 +144,7 @@ def test_changed_input_or_plan_topology_cannot_join(tmp_path: Path) -> None:
     with pytest.raises(NormalizationError, match="identity_mismatch:input_digest"):
         normalize(predictive, live, tmp_path / "input-out.jsonl")
 
-    changed_plan = comparison_descriptor("2" * 64)
+    changed_plan = comparison_descriptor("2" * 64, SCHEDULING)
     live = _write_manifest(tmp_path, "live-topology", "live", _curve_rows(),
                            extra={"comparison": changed_plan})
     with pytest.raises(NormalizationError, match="comparison_mismatch"):
@@ -164,7 +166,8 @@ def test_plan_capture_id_changes_with_authenticated_schedule_or_topology() -> No
     changed = {"scheduling": {"topology": "C1F1", "assignments": [{"ordinal": 0,
                                                                        "global_slot": 1}]}}
     changed_sha = hashlib.sha256(canonical_bytes(changed)).hexdigest()
-    assert comparison_descriptor(plan_sha)["comparison_id"] != comparison_descriptor(changed_sha)["comparison_id"]
+    assert comparison_descriptor(plan_sha, plan["scheduling"])["comparison_id"] != comparison_descriptor(
+        changed_sha, changed["scheduling"])["comparison_id"]
 
 
 @pytest.mark.parametrize(

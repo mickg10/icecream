@@ -308,7 +308,8 @@ def bind_batch_to_plan(rows: list[dict[str, Any]], plan_inputs: list[dict[str, A
             _fail(f"predictive_plan:batch_input_mismatch:{ordinal}")
 
 
-def load_topology(path: Path, rows: list[dict[str, Any]]) -> str:
+def load_topology(path: Path, rows: list[dict[str, Any]],
+                  scheduling: dict[str, Any] | None = None) -> str:
     """Require an explicit C1F1 assignment map bound to the ordered inputs."""
     digest, _ = _sha(path)
     try:
@@ -328,6 +329,17 @@ def load_topology(path: Path, rows: list[dict[str, Any]]) -> str:
             _fail(f"topology:{ordinal}:identity_mismatch")
         if item.get("relationship") != 0 or item.get("f_slot") != 0:
             _fail(f"topology:{ordinal}:C1F1_assignment_invalid")
+    if scheduling is not None:
+        planned = scheduling.get("assignments")
+        if (scheduling.get("topology") != "C1F1" or
+                not isinstance(planned, list) or len(planned) != len(rows)):
+            _fail("topology:predictive_schedule_invalid")
+        for ordinal, item in enumerate(planned):
+            if (not isinstance(item, dict) or item.get("ordinal") != ordinal or
+                    item.get("global_slot") != 0 or
+                    item.get("f_relationship") != 0 or
+                    item.get("per_f_slot") != 0):
+                _fail(f"topology:{ordinal}:predictive_schedule_mismatch")
     return digest
 
 
@@ -720,7 +732,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
         _fail("run_options:invalid")
     rows = load_batch_manifest(batch_manifest, expected_count)
     bind_batch_to_plan(rows, plan_inputs)
-    topology_sha = load_topology(topology, rows)
+    topology_sha = load_topology(topology, rows, plan.get("scheduling"))
     work_lines = [line.split("=", 1)[1] for line in stdout.splitlines() if line.startswith("S7_WORKDIR=")]
     if len(work_lines) != 1:
         _fail("product_run:workdir_missing")
@@ -774,7 +786,10 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     batch_manifest_sha, batch_manifest_bytes = _sha(batch_manifest)
     input_sha = hashlib.sha256(_canonical({"source_manifest_sha256": plan["source_manifest"]["sha256"],
                                            "inputs": plan_inputs})).hexdigest()
-    comparison = normalizer.comparison_descriptor(plan_sha)
+    try:
+        comparison = normalizer.comparison_descriptor(plan_sha, plan.get("scheduling"))
+    except normalizer.NormalizationError as exc:
+        _fail(f"predictive_plan:{exc}")
     if timestamp is None:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     if TIMESTAMP.fullmatch(timestamp) is None:
@@ -1052,7 +1067,7 @@ def main(argv: list[str] | None = None) -> int:
         args.full_count = len(plan_inputs)
     count = selected_count(args.depth, args.full_count)
     rows = load_batch_manifest(batch_manifest, count)
-    load_topology(topology, rows)
+    load_topology(topology, rows, _plan.get("scheduling"))
     run_workdir: Path | None = None
     run_work_parent: Path | None = None
     runtime_image: dict[str, str] | None = None

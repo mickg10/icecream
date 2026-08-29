@@ -243,34 +243,52 @@ def _validate_provenance(value: object, mode: str) -> dict[str, object]:
     return {"mode": mode, "producer": producer, "trace_free": value["trace_free"]}
 
 
-def comparison_descriptor(plan_sha256: str) -> dict[str, str]:
+def comparison_descriptor(plan_sha256: str, scheduling: object) -> dict[str, str]:
     """Derive the only join key from the authenticated predictive plan.
 
-    Producer run IDs and source identities remain local to each producer.  A
-    plan digest is immutable evidence of the exact ordered input/topology
-    request, so it is suitable as the shared comparison capture identity.
+    Producer run IDs and source identities remain local to each producer.  The
+    plan digest is paired with a normalized scheduling projection so an
+    input-only plan cannot be reused to join an unrelated topology capture.
     """
     plan_sha256 = _sha(plan_sha256, "comparison.plan_sha256")
+    if not isinstance(scheduling, dict):
+        raise NormalizationError("comparison:scheduling_missing")
+    assignments = scheduling.get("assignments")
+    topology = scheduling.get("topology")
+    if (not isinstance(topology, str) or not topology or
+            not isinstance(assignments, list) or not assignments):
+        raise NormalizationError("comparison:scheduling_projection_invalid")
+    scheduling_sha256 = hashlib.sha256(canonical_bytes(
+        {"topology": topology, "assignments": assignments}
+    )).hexdigest()
     comparison_id = hashlib.sha256(canonical_bytes(
-        {"schema": COMPARISON_SCHEMA, "plan_sha256": plan_sha256}
+        {"schema": COMPARISON_SCHEMA, "plan_sha256": plan_sha256,
+         "scheduling_sha256": scheduling_sha256}
     )).hexdigest()
     return {"schema": COMPARISON_SCHEMA, "plan_sha256": plan_sha256,
-            "comparison_id": comparison_id}
+            "scheduling_sha256": scheduling_sha256, "comparison_id": comparison_id}
 
 
 def _validate_comparison(value: object) -> dict[str, str]:
     if not isinstance(value, dict) or set(value) != {
-            "schema", "plan_sha256", "comparison_id"}:
+            "schema", "plan_sha256", "scheduling_sha256", "comparison_id"}:
         raise NormalizationError("comparison:fields_invalid")
     if value["schema"] != COMPARISON_SCHEMA:
         raise NormalizationError("comparison:schema_invalid")
     plan_sha = _sha(value["plan_sha256"], "comparison.plan_sha256")
+    scheduling_sha = _sha(value["scheduling_sha256"], "comparison.scheduling_sha256")
     comparison_id = _sha(value["comparison_id"], "comparison.comparison_id")
-    expected = comparison_descriptor(plan_sha)["comparison_id"]
-    if comparison_id != expected:
+    # The scheduling projection is checked against the authenticated plan by
+    # the producer/runner before this descriptor is emitted.  Here we still
+    # bind the capture ID to both digests and reject self-inconsistent data.
+    expected = hashlib.sha256(canonical_bytes(
+        {"schema": COMPARISON_SCHEMA, "plan_sha256": plan_sha,
+         "scheduling_sha256": scheduling_sha}
+    )).hexdigest()
+    if comparison_id != expected or int(scheduling_sha, 16) == 0:
         raise NormalizationError("comparison:plan_binding_mismatch")
     return {"schema": COMPARISON_SCHEMA, "plan_sha256": plan_sha,
-            "comparison_id": comparison_id}
+            "scheduling_sha256": scheduling_sha, "comparison_id": comparison_id}
 
 
 def _validate_evidence(value: object) -> dict[str, object]:

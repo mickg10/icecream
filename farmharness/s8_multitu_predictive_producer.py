@@ -844,7 +844,8 @@ def _emit_product_segment(plan: dict[str, object], plan_facts: dict[str, object]
                 "source_commit": source_commit, "source_tree": source_tree,
                 "input_digest": input_digest, "topology_digest": topology_digest,
                 "model_id": model_id}
-    comparison = normalizer.comparison_descriptor(str(plan_facts["plan"]["sha256"]))
+    comparison = normalizer.comparison_descriptor(
+        str(plan_facts["plan"]["sha256"]), scheduling)
     curve_manifest = {"schema": CURVE_MANIFEST_SCHEMA, "identity": identity,
                       "comparison": comparison,
                       "units": {"point": "step", "channel_bytes": "bytes", "elapsed_ns": "ns",
