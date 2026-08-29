@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import stat
 import sys
@@ -21,6 +22,8 @@ from typing import Any
 SCHEMA = "icecream-s8-expanded-campaign-v1"
 DESCRIPTOR_SCHEMA = "icecream-s8-campaign-descriptor-v1"
 RECOVERY_SCHEMA = "icecream-s8-image-authority-recovery-v1"
+MATRIX_AUDIT_SCHEMA = "icecream-s8-matrix-audit-v1"
+CAPABILITY_SCHEMA = "icecream-s8-native-live-runner-capability-v1"
 CAPABILITY = "icecream.s8.native-live-runner-v1"
 TIMESTAMP_RE = re.compile(r"^\d{8}T\d{6}Z$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -118,7 +121,45 @@ def _hex(value: object, label: str) -> str:
     return value
 
 
-def _load_corpus_inventory(path: Path) -> tuple[dict[str, object], list[dict[str, object]]]:
+def _snapshot_file(path: Path, root: Path, label: str) -> tuple[dict[str, object], Path]:
+    """Hash one retained source snapshot through a no-follow descriptor."""
+    try:
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(root.resolve())
+    except (OSError, ValueError) as exc:
+        raise PlannerError(f"{label}:resolved_escape:{path}") from exc
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise PlannerError(f"{label}:unavailable:{path}") from exc
+    try:
+        before = os.fstat(fd)
+        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or
+                resolved != path.resolve(strict=True)):
+            raise PlannerError(f"{label}:not_private_regular_file:{path}")
+        digest = hashlib.sha256()
+        size = 0
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+        after = os.fstat(fd)
+        before_identity = (before.st_dev, before.st_ino, before.st_size,
+                           before.st_mtime_ns, before.st_ctime_ns)
+        after_identity = (after.st_dev, after.st_ino, after.st_size,
+                          after.st_mtime_ns, after.st_ctime_ns)
+        if before_identity != after_identity or size != before.st_size:
+            raise PlannerError(f"{label}:mutated_during_read:{path}")
+    finally:
+        os.close(fd)
+    return {"path": str(path), "resolved_path": str(resolved), "bytes": size,
+            "sha256": digest.hexdigest()}, resolved
+
+
+def _load_corpus_inventory(path: Path) -> tuple[dict[str, object], list[dict[str, object]], list[dict[str, object]]]:
     value, raw = _json(path, "corpus_inventory")
     if value.get("schema") != "icecream-s8-image-authority-inventory-v1":
         raise PlannerError("corpus_inventory:schema_invalid")
@@ -136,6 +177,9 @@ def _load_corpus_inventory(path: Path) -> tuple[dict[str, object], list[dict[str
     if not isinstance(entries, list) or len(entries) != len(CORPUS_AUTHORITY):
         raise PlannerError("corpus_inventory:expected_11_manifests")
     records: list[dict[str, object]] = []
+    snapshots: list[dict[str, object]] = []
+    seen_paths: set[str] = set()
+    seen_resolved: set[str] = set()
     total = 0
     for entry, (manifest_id, project, count) in zip(entries, CORPUS_AUTHORITY):
         if not isinstance(entry, dict):
@@ -163,6 +207,23 @@ def _load_corpus_inventory(path: Path) -> tuple[dict[str, object], list[dict[str
             raise PlannerError(f"manifest:{manifest_id}:tu_count_mismatch")
         if len(set(paths)) != len(paths):
             raise PlannerError(f"manifest:{manifest_id}:duplicate_source_path")
+        corpus_root = manifest_path.parent
+        corpus_snapshots = []
+        for ordinal, source_path in enumerate(paths):
+            candidate = Path(source_path)
+            if not candidate.is_absolute():
+                raise PlannerError(f"manifest:{manifest_id}:source_path_not_absolute:{ordinal}")
+            if source_path in seen_paths:
+                raise PlannerError(f"manifest:{manifest_id}:duplicate_source_path_global:{ordinal}")
+            snapshot, resolved = _snapshot_file(candidate, corpus_root,
+                                                f"snapshot:{manifest_id}:{ordinal}")
+            if str(resolved) in seen_resolved:
+                raise PlannerError(f"manifest:{manifest_id}:duplicate_resolved_source_path:{ordinal}")
+            seen_paths.add(source_path)
+            seen_resolved.add(str(resolved))
+            item = {"corpus": manifest_id, "ordinal": ordinal, **snapshot}
+            corpus_snapshots.append(item)
+            snapshots.append(item)
         checkouts = entry.get("source_checkouts")
         source_commit = entry.get("source_commit")
         if (not isinstance(checkouts, list) or not checkouts or
@@ -175,12 +236,18 @@ def _load_corpus_inventory(path: Path) -> tuple[dict[str, object], list[dict[str
                           "sha256": observed_sha},
             "ordered_source_paths": paths,
             "source_checkouts": list(checkouts), "source_commit": source_commit,
+            "snapshot": {
+                "count": len(corpus_snapshots),
+                "total_raw_bytes": sum(int(item["bytes"]) for item in corpus_snapshots),
+                "ordered_snapshot_digest": hashlib.sha256(
+                    b"".join(_canonical(item) for item in corpus_snapshots)).hexdigest(),
+            },
         })
         total += count
     if total != 8261:
         raise PlannerError(f"corpus_inventory:total_tu_count:{total}")
     return {"path": str(path.resolve()), "bytes": len(raw),
-            "sha256": hashlib.sha256(raw).hexdigest()}, records
+            "sha256": hashlib.sha256(raw).hexdigest()}, records, snapshots
 
 
 def _load_image_recovery(path: Path, expected_sha256: str) -> tuple[dict[str, object], list[dict[str, object]]]:
@@ -227,6 +294,88 @@ def _current_image(name: str | None, image_id: str | None) -> dict[str, object]:
             "authority": "explicit_content_id_argument"}
 
 
+def _load_matrix_audit(path: Path, expected_sha256: str) -> dict[str, object]:
+    raw = _private_file(path, "matrix_audit")
+    if (not isinstance(expected_sha256, str) or
+            not SHA256_RE.fullmatch(expected_sha256.lower()) or
+            hashlib.sha256(raw).hexdigest() != expected_sha256.lower()):
+        raise PlannerError("matrix_audit:sha256_mismatch")
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PlannerError("matrix_audit:invalid_json") from exc
+    if not isinstance(value, dict) or value.get("schema") != MATRIX_AUDIT_SCHEMA or value.get("status") != "PASS":
+        raise PlannerError("matrix_audit:schema_or_status_invalid")
+    matrix = value.get("matrix")
+    if (not isinstance(matrix, dict) or matrix.get("expected_cells") != 32 or
+            matrix.get("completed_cells") != 32 or matrix.get("calibration_cells") != 16 or
+            matrix.get("calibration_expected") != 16 or matrix.get("held_out_validation_cells") != 16 or
+            matrix.get("held_out_validation_expected") != 16 or
+            matrix.get("missing_cells") != [] or matrix.get("invalid_candidates") != []):
+        raise PlannerError("matrix_audit:matrix_contract_invalid")
+    cells = value.get("cells")
+    if not isinstance(cells, list) or len(cells) != 32 or any(
+            not isinstance(cell, dict) or cell.get("status") != "PASS" for cell in cells):
+        raise PlannerError("matrix_audit:cells_invalid")
+    return {"path": str(path.resolve()), "bytes": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "schema": MATRIX_AUDIT_SCHEMA, "status": "PASS",
+            "matrix": {key: matrix[key] for key in (
+                "expected_cells", "completed_cells", "calibration_cells",
+                "calibration_expected", "held_out_validation_cells",
+                "held_out_validation_expected", "missing_cells", "invalid_candidates")}}
+
+
+def _load_capability(path: Path, expected_sha256: str) -> dict[str, object]:
+    raw = _private_file(path, "capability_manifest")
+    if (not isinstance(expected_sha256, str) or
+            not SHA256_RE.fullmatch(expected_sha256.lower()) or
+            hashlib.sha256(raw).hexdigest() != expected_sha256.lower()):
+        raise PlannerError("capability_manifest:sha256_mismatch")
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PlannerError("capability_manifest:invalid_json") from exc
+    if not isinstance(value, dict) or value.get("schema") != CAPABILITY_SCHEMA or value.get("status") != "PASS":
+        raise PlannerError("capability_manifest:schema_or_status_invalid")
+    if value.get("capability") != CAPABILITY or not isinstance(value.get("producer_version"), str) or not value["producer_version"]:
+        raise PlannerError("capability_manifest:producer_identity_invalid")
+    source = value.get("source")
+    if (not isinstance(source, dict) or not isinstance(source.get("commit"), str) or
+            not re.fullmatch(r"[0-9a-f]{40}", source["commit"].lower()) or
+            not isinstance(source.get("path"), str) or
+            not isinstance(source.get("sha256"), str) or
+            not SHA256_RE.fullmatch(source["sha256"].lower())):
+        raise PlannerError("capability_manifest:source_identity_invalid")
+    binaries = value.get("binaries")
+    if (not isinstance(binaries, dict) or set(binaries) != {"client", "daemon", "scheduler", "cache-service", "simulator"}):
+        raise PlannerError("capability_manifest:binary_set_invalid")
+    for name, descriptor in binaries.items():
+        if (not isinstance(descriptor, dict) or not isinstance(descriptor.get("path"), str) or
+                not isinstance(descriptor.get("bytes"), int) or descriptor["bytes"] <= 0 or
+                not isinstance(descriptor.get("sha256"), str) or
+                not SHA256_RE.fullmatch(descriptor["sha256"].lower())):
+            raise PlannerError(f"capability_manifest:binary_invalid:{name}")
+    return {"path": str(path.resolve()), "bytes": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(), "schema": CAPABILITY_SCHEMA,
+            "capability": CAPABILITY, "producer_version": value["producer_version"],
+            "source": dict(source), "binaries": dict(binaries), "status": "PASS"}
+
+
+def _slug(value: str) -> str:
+    result = re.sub(r"[^A-Za-z0-9]+", "-", value).strip("-").lower()
+    if not result:
+        raise PlannerError("result_path:empty_slug")
+    return result
+
+
+def _result_relative_directory(timestamp: str, image: dict[str, object], corpus: dict[str, object],
+                               method: str, topology: dict[str, object], depth: str, regime: str) -> str:
+    return "/".join(("experiments", "icecream", "s8-expanded", timestamp,
+                      _slug(str(image["key"])), _slug(str(corpus["project"])), _slug(method),
+                      _slug(str(topology["id"])), _slug(depth), _slug(regime)))
+
+
 def _write_exact(path: Path, raw: bytes) -> None:
     if path.exists():
         if _private_file(path, "existing_output") != raw:
@@ -236,8 +385,10 @@ def _write_exact(path: Path, raw: bytes) -> None:
 
 
 def plan_campaign(corpus_inventory: Path, image_recovery: Path, image_recovery_sha256: str,
-                  output_root: Path, timestamp: str, current_image_name: str | None = None,
-                  current_image_id: str | None = None) -> dict[str, object]:
+                  matrix_audit: Path, matrix_audit_sha256: str, output_root: Path,
+                  timestamp: str, current_image_name: str | None = None,
+                  current_image_id: str | None = None, capability_manifest: Path | None = None,
+                  capability_manifest_sha256: str | None = None) -> dict[str, object]:
     if not TIMESTAMP_RE.fullmatch(timestamp):
         raise PlannerError("timestamp:expected_YYYYMMDDTHHMMSSZ")
     if METHODS != EXPECTED_METHODS:
@@ -250,9 +401,15 @@ def plan_campaign(corpus_inventory: Path, image_recovery: Path, image_recovery_s
          item.get("stream_capacity_status")) for item in TOPOLOGIES)
     if topology_signature != EXPECTED_TOPOLOGY_SIGNATURE:
         raise PlannerError("topology_contract:mutated")
-    corpus_descriptor, corpora = _load_corpus_inventory(corpus_inventory)
+    corpus_descriptor, corpora, snapshots = _load_corpus_inventory(corpus_inventory)
     recovery_descriptor, historical_images = _load_image_recovery(image_recovery, image_recovery_sha256)
+    matrix_descriptor = _load_matrix_audit(matrix_audit, matrix_audit_sha256)
     current = _current_image(current_image_name, current_image_id)
+    capability = None
+    if (capability_manifest is None) != (capability_manifest_sha256 is None):
+        raise PlannerError("capability_manifest:path_and_sha256_required_together")
+    if capability_manifest is not None:
+        capability = _load_capability(capability_manifest, str(capability_manifest_sha256))
     images = historical_images + [current]
     methods = [{
         "name": method,
@@ -262,6 +419,7 @@ def plan_campaign(corpus_inventory: Path, image_recovery: Path, image_recovery_s
         else "method is not implemented on current Root; no alias is permitted",
     } for method in METHODS]
     descriptors: list[dict[str, object]] = []
+    result_paths: set[str] = set()
     for image in images:
         if image["key"] == "current-pinned" and image["image_id"] is None:
             continue
@@ -273,24 +431,35 @@ def plan_campaign(corpus_inventory: Path, image_recovery: Path, image_recovery_s
                             descriptor_id = "/".join((str(image["key"]), str(corpus["project"]), method,
                                                        str(topology["id"]), depth, regime))
                             if image["status"] == "MISSING_EXTERNAL_AUTHORITY":
-                                status, reason, capability = (
+                                status, reason, producer_capability = (
                                     "MISSING_EXTERNAL_AUTHORITY",
                                     "historical image cell is unavailable without external image authority",
                                     None)
                             elif method not in IMPLEMENTED_METHODS:
-                                status, reason, capability = (
+                                status, reason, producer_capability = (
                                     "NOT_READY", "method_not_implemented_on_current_root", None)
+                            elif capability is None:
+                                status, reason, producer_capability = (
+                                    "NOT_READY", "required_producer_capability_not_integrated_on_planner_source", None)
                             else:
-                                status, reason, capability = "READY", "declarative capability can be bound by native/live runner", CAPABILITY
+                                status, reason, producer_capability = "READY", "authenticated producer capability", CAPABILITY
+                            result_relative_directory = _result_relative_directory(
+                                timestamp, image, corpus, method, topology, depth, regime)
+                            if result_relative_directory in result_paths:
+                                raise PlannerError(f"result_path:collision:{result_relative_directory}")
+                            result_paths.add(result_relative_directory)
                             descriptors.append({
                                 "schema": DESCRIPTOR_SCHEMA, "descriptor_id": descriptor_id,
                                 "image": dict(image), "corpus": {
                                     "manifest_id": corpus["manifest_id"], "project": corpus["project"],
                                     "tu_count": corpus["tu_count"],
                                     "manifest": corpus["manifest"], "source_commit": corpus["source_commit"],
+                                    "snapshot": corpus["snapshot"],
                                 }, "method": method, "topology": dict(topology), "depth": depth,
                                 "regime": regime, "status": status, "reason": reason,
-                                "producer_capability": capability, "execution": "declarative_only",
+                                "producer_capability": producer_capability, "execution": "declarative_only",
+                                "campaign_timestamp": timestamp,
+                                "result_relative_directory": result_relative_directory,
                             })
     historical_count = sum(1 for item in descriptors if item["image"]["key"] != "current-pinned")
     current_count = len(descriptors) - historical_count
@@ -302,7 +471,10 @@ def plan_campaign(corpus_inventory: Path, image_recovery: Path, image_recovery_s
         # implementation subset is reported separately below.
         raise PlannerError("planner:current_descriptor_count")
     current_implemented = sum(1 for item in descriptors
-                              if item["image"]["key"] == "current-pinned" and item["status"] == "READY")
+                              if item["image"]["key"] == "current-pinned" and
+                              item["method"] in IMPLEMENTED_METHODS)
+    current_ready = sum(1 for item in descriptors
+                        if item["image"]["key"] == "current-pinned" and item["status"] == "READY")
     if current_implemented != expected_current:
         raise PlannerError(f"planner:current_implemented_count:{current_implemented}")
     output_input = output_root
@@ -316,17 +488,23 @@ def plan_campaign(corpus_inventory: Path, image_recovery: Path, image_recovery_s
         raise PlannerError("output:not_private_directory")
     output_root = output_input.resolve()
     output_root.mkdir(parents=True, exist_ok=True)
+    snapshots_raw = b"".join(_canonical(item) for item in snapshots)
     descriptors_raw = b"".join(_canonical(item) for item in descriptors)
+    _write_exact(output_root / "corpus-snapshots.jsonl", snapshots_raw)
     descriptor_path = output_root / "descriptors.jsonl"
     _write_exact(descriptor_path, descriptors_raw)
     index: dict[str, object] = {
-        "schema": SCHEMA, "timestamp": timestamp, "layout": "experiments/icecream/<campaign>/<timestamp>",
+        "schema": SCHEMA, "timestamp": timestamp, "campaign_root": str(output_root),
+        "layout": "experiments/icecream/s8-expanded/<timestamp>/<image>/<corpus>/<method>/<topology>/<depth>/<regime>",
         "execution": {"mode": "declarative_only", "commands_emitted": False,
                        "required_producer_capability": CAPABILITY},
         "corpus_authority": {"inventory": corpus_descriptor, "total_manifests": len(corpora),
-                              "total_tus": sum(int(item["tu_count"]) for item in corpora), "records": corpora},
+                              "total_tus": sum(int(item["tu_count"]) for item in corpora), "records": corpora,
+                              "snapshots": {"path": "corpus-snapshots.jsonl", "bytes": len(snapshots_raw),
+                                            "sha256": hashlib.sha256(snapshots_raw).hexdigest(), "count": len(snapshots)}},
         "methods": methods, "topologies": list(TOPOLOGIES), "depths": list(DEPTHS), "regimes": list(REGIMES),
-        "images": images, "image_recovery": recovery_descriptor,
+        "images": images, "image_recovery": recovery_descriptor, "matrix_audit": matrix_descriptor,
+        "capability_manifest": capability,
         "prerequisites": {
             "canonical_32_cell_one_tu_audit": {
                 "status": "SATISFIED", "cell_count": 32,
@@ -338,6 +516,7 @@ def plan_campaign(corpus_inventory: Path, image_recovery: Path, image_recovery_s
             "historical_image_seven_method_grid": HISTORICAL_GRID_COUNT,
             "current_image_implemented_subset_theoretical": CURRENT_IMPLEMENTED_COUNT,
             "current_image_implemented_subset": current_implemented,
+            "current_image_ready": current_ready,
             "descriptors_total": len(descriptors),
             "descriptor_status_counts": {
                 status: sum(1 for item in descriptors if item["status"] == status)
@@ -356,15 +535,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--corpus-inventory", type=Path, required=True)
     parser.add_argument("--image-recovery-report", type=Path, required=True)
     parser.add_argument("--image-recovery-sha256", required=True)
+    parser.add_argument("--matrix-audit", type=Path, required=True)
+    parser.add_argument("--matrix-audit-sha256", required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--timestamp", required=True)
     parser.add_argument("--current-image-name")
     parser.add_argument("--current-image-id")
+    parser.add_argument("--capability-manifest", type=Path)
+    parser.add_argument("--capability-manifest-sha256")
     args = parser.parse_args(argv)
     try:
         index = plan_campaign(args.corpus_inventory, args.image_recovery_report,
-                              args.image_recovery_sha256, args.output_root, args.timestamp,
-                              args.current_image_name, args.current_image_id)
+                              args.image_recovery_sha256, args.matrix_audit,
+                              args.matrix_audit_sha256, args.output_root, args.timestamp,
+                              args.current_image_name, args.current_image_id,
+                              args.capability_manifest, args.capability_manifest_sha256)
     except (PlannerError, OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"s8_campaign_planner: {exc}", file=sys.stderr)
         return 77
