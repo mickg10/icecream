@@ -20,6 +20,7 @@ def _fixture(root: Path, regime: str = "cold") -> Path:
         "schema": "icecream-s7-live-cell-v1", "cell": f"fmt/ZSTD_TU/{regime}",
         "status": "PASS", "live_status": "PASS", "acceptance_status": "PASS",
         "conformance_status": "PASS",
+        "binary_sha256": {"client": "d" * 64, "daemon": "e" * 64},
         "measured": {"input_sha256": _digest(payload)},
     }
     results = (json.dumps(summary, sort_keys=True, separators=(",", ":")) + "\n").encode()
@@ -84,3 +85,15 @@ def test_mismatched_evidence_digest_is_hold(tmp_path: Path) -> None:
     result = json.loads(produce(package, tmp_path / "hold").read_text())
     assert result["status"] == "HOLD"
     assert result["reason"] == "evidence_sha256:mismatch"
+
+
+def test_binary_hash_mismatch_with_s7_summary_is_hold(tmp_path: Path) -> None:
+    package = _fixture(tmp_path)
+    evidence = json.loads((package / "evidence.json").read_text())
+    evidence["binary_sha256"]["client"] = "f" * 64
+    evidence.pop("evidence_sha256")
+    evidence["evidence_sha256"] = _digest(canonical_bytes(evidence))
+    (package / "evidence.json").write_bytes(canonical_bytes(evidence) + b"\n")
+    result = json.loads(produce(package, tmp_path / "hold").read_text())
+    assert result["status"] == "HOLD"
+    assert result["reason"] == "binary_sha256:results_mismatch"

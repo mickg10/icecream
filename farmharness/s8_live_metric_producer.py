@@ -186,6 +186,17 @@ def _read_evidence(package: Path, summary: dict[str, Any], summary_raw: bytes,
     computed = hashlib.sha256(_canonical(without_digest)).hexdigest()
     if declared != computed:
         raise ProducerError("evidence_sha256:mismatch")
+    summary_binaries = summary.get("binary_sha256")
+    if not isinstance(summary_binaries, dict):
+        raise ProducerError("binary_sha256:results_missing")
+    normalized_summary_binaries = {
+        name: _hex(digest, f"results.binary_sha256.{name}")
+        for name, digest in summary_binaries.items()
+        if isinstance(name, str)
+    }
+    if (len(normalized_summary_binaries) != len(summary_binaries) or
+            normalized_summary_binaries != binary_hashes):
+        raise ProducerError("binary_sha256:results_mismatch")
     timing = {name: descriptor for name, descriptor in files.items() if name != "results"}
     if not timing:
         raise ProducerError("evidence:timing_observation_missing")
