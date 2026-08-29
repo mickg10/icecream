@@ -433,9 +433,10 @@ if test -n "$batch_manifest" || test -n "$compile_db" || test -n "$compile_sourc
     fi
     compile_args_for() {
         db=$1; source=$2; expected_db_output=$3; staged=$4; output=$5
-        python3 - "$db" "$source" "$expected_db_output" "$staged" "$output" <<'PY'
+        stdin_mode=${6:-0}
+        python3 - "$db" "$source" "$expected_db_output" "$staged" "$output" "$stdin_mode" <<'PY'
 import json, os, shlex, sys
-db, source, expected_db_output, staged, output = sys.argv[1:]
+db, source, expected_db_output, staged, output, stdin_mode = sys.argv[1:]
 entries = json.load(open(db, encoding='utf-8'))
 def resolved_output(entry):
     value = entry.get('output')
@@ -455,6 +456,10 @@ tokens[tokens.index(source)] = staged
 for i, token in enumerate(tokens[:-1]):
     if token == '-o': tokens[i + 1] = output; break
 else: raise SystemExit(1)
+if stdin_mode == "1":
+    input_index = tokens.index(staged)
+    tokens[input_index:input_index] = ["-x", "c++"]
+    tokens[input_index + 2] = "-"
 # Icecream's GCC remote arm adds -fdirectives-only and allocator parameters.
 # Keep the compile database's debug output, but do not encode those
 # compiler-owned switches in DW_AT_producer: otherwise semantically identical
@@ -671,7 +676,7 @@ compile_once() {
         # local compilation must bind to that exact staged input; the source
         # path is used only to select the unique compile-database command.
         remote_compile_args=$(compile_args_for "$item_compile_db" "$item_compile_source" "$item_compile_output" "$input_path" "$remote_obj")
-        local_compile_args=$(compile_args_for "$item_compile_db" "$item_compile_source" "$item_compile_output" "$input_path" "$local_obj")
+        local_compile_args=$(compile_args_for "$item_compile_db" "$item_compile_source" "$item_compile_output" "$input_path" "$local_obj" 1)
     elif test -n "$include_root"; then
         compile_include_args="-I$include_root"
     else
@@ -706,10 +711,10 @@ compile_once() {
     fi
     compile_end_ns=$(date +%s%N)
     if test -n "$item_compile_db"; then
-        eval "g++ $local_compile_args"
+        eval "g++ $local_compile_args" <"$input_path"
     else
-        g++ -std=c++17 -O2 -c $compile_include_args \
-            "$input_path" -o "$local_obj"
+        g++ -x c++ -std=c++17 -O2 -c $compile_include_args \
+            - -o "$local_obj" <"$input_path"
     fi
     test -s "$preprocessed_capture" || {
         echo "FAIL: completed $label preprocessor capture is missing" >&2
