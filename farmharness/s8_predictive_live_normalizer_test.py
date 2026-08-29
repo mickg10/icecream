@@ -149,6 +149,24 @@ def test_changed_input_or_plan_topology_cannot_join(tmp_path: Path) -> None:
         normalize(predictive, live, tmp_path / "topology-out.jsonl")
 
 
+def test_directional_units_must_be_declared_as_a_pair(tmp_path: Path) -> None:
+    predictive, _ = _pair(tmp_path)
+    live = _write_manifest(tmp_path, "live-partial-units", "live", _curve_rows(),
+                           extra={"units": {**UNITS, "C_TO_F_bytes": "bytes"}})
+    with pytest.raises(NormalizationError, match="directional_fields_must_be_paired"):
+        normalize(predictive, live, tmp_path / "partial-units-out.jsonl")
+
+
+def test_plan_capture_id_changes_with_authenticated_schedule_or_topology() -> None:
+    plan = {"scheduling": {"topology": "C1F1", "assignments": [{"ordinal": 0,
+                                                                    "global_slot": 0}]}}
+    plan_sha = hashlib.sha256(canonical_bytes(plan)).hexdigest()
+    changed = {"scheduling": {"topology": "C1F1", "assignments": [{"ordinal": 0,
+                                                                       "global_slot": 1}]}}
+    changed_sha = hashlib.sha256(canonical_bytes(changed)).hexdigest()
+    assert comparison_descriptor(plan_sha)["comparison_id"] != comparison_descriptor(changed_sha)["comparison_id"]
+
+
 @pytest.mark.parametrize(
     "cell", DECLARED_CELLS,
     ids=lambda value: f"{value['corpus']}-{value['profile']}-{value['regime']}",

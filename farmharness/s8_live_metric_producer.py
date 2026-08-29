@@ -367,10 +367,16 @@ def produce(package: Path, out: Path) -> Path:
         "binary_sha256": binary_hashes,
         "evidence_sha256": evidence["evidence_sha256"],
     }
+    directional_units = bool(rows) and all(
+        "C_TO_F_bytes" in row["cumulative"] and "F_TO_C_bytes" in row["cumulative"]
+        for row in rows)
+    units = {"point": "step", "channel_bytes": "bytes", "elapsed_ns": "ns",
+             "throughput_bytes_per_s": "bytes_per_s"}
+    if directional_units:
+        units.update({"C_TO_F_bytes": "bytes", "F_TO_C_bytes": "bytes"})
     manifest = {
         "schema": CURVE_MANIFEST_SCHEMA, "identity": identity,
-        "units": {"point": "step", "channel_bytes": "bytes", "elapsed_ns": "ns",
-                  "throughput_bytes_per_s": "bytes_per_s"},
+        "units": units,
         "curve": {"path": curve_path.name, "sha256": hashlib.sha256(curve_raw).hexdigest(), "bytes": len(curve_raw)},
         "provenance": {"mode": "live", "producer": "s8_live_metric_producer", "trace_free": False},
         "evidence": evidence_descriptor,

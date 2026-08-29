@@ -45,15 +45,19 @@ IDENTITY_KEYS = {
 JOIN_IDENTITY_KEYS = IDENTITY_KEYS - {"model_id"}
 REQUIRED_UNITS_KEYS = {"point", "channel_bytes", "elapsed_ns"}
 THROUGHPUT_UNITS_KEY = "throughput_bytes_per_s"
+DIRECTIONAL_UNITS_KEYS = {"C_TO_F_bytes", "F_TO_C_bytes"}
 UNIT_KEY_OPTIONS = {
     frozenset(REQUIRED_UNITS_KEYS),
     frozenset((*REQUIRED_UNITS_KEYS, THROUGHPUT_UNITS_KEY)),
+    frozenset((*REQUIRED_UNITS_KEYS, THROUGHPUT_UNITS_KEY, *DIRECTIONAL_UNITS_KEYS)),
 }
 CANONICAL_UNITS = {
     "point": "step",
     "channel_bytes": "bytes",
     "elapsed_ns": "ns",
     "throughput_bytes_per_s": "bytes_per_s",
+    "C_TO_F_bytes": "bytes",
+    "F_TO_C_bytes": "bytes",
 }
 DESCRIPTOR_KEYS = {"path", "sha256", "bytes"}
 PROVENANCE_KEYS = {"mode", "producer", "trace_free"}
@@ -216,7 +220,12 @@ def _validate_identity(value: object) -> dict[str, str]:
 
 
 def _validate_units(value: object) -> dict[str, str]:
-    if not isinstance(value, dict) or frozenset(value) not in UNIT_KEY_OPTIONS:
+    if not isinstance(value, dict):
+        raise NormalizationError("units:fields_invalid")
+    directional = DIRECTIONAL_UNITS_KEYS & set(value)
+    if directional and directional != DIRECTIONAL_UNITS_KEYS:
+        raise NormalizationError("units:directional_fields_must_be_paired")
+    if frozenset(value) not in UNIT_KEY_OPTIONS:
         raise NormalizationError("units:fields_invalid")
     result = {field: _safe_id(value[field], f"units.{field}") for field in value}
     for field, expected in CANONICAL_UNITS.items():

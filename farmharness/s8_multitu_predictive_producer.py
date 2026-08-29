@@ -848,6 +848,7 @@ def _emit_product_segment(plan: dict[str, object], plan_facts: dict[str, object]
     curve_manifest = {"schema": CURVE_MANIFEST_SCHEMA, "identity": identity,
                       "comparison": comparison,
                       "units": {"point": "step", "channel_bytes": "bytes", "elapsed_ns": "ns",
+                                "C_TO_F_bytes": "bytes", "F_TO_C_bytes": "bytes",
                                 "throughput_bytes_per_s": "bytes_per_s"},
                       "curve": {"path": "predictive_sim.jsonl", "sha256": curve_sha,
                                 "bytes": len(curve_raw)},

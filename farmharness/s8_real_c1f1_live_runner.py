@@ -934,6 +934,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                                         "model_id": "s8-real-live"},
                           "comparison": comparison,
                           "units": {"point": "step", "channel_bytes": "bytes", "elapsed_ns": "ns",
+                                    "C_TO_F_bytes": "bytes", "F_TO_C_bytes": "bytes",
                                     "throughput_bytes_per_s": "bytes_per_s"},
                           "curve": {"path": curve_name, "sha256": hashlib.sha256(curve_raw).hexdigest(), "bytes": len(curve_raw)},
                           "provenance": {"mode": "live", "producer": "s8_real_c1f1_live_runner", "trace_free": False},
