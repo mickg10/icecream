@@ -342,6 +342,14 @@ void test_factory_rejects_unsupported_or_unnegotiated() {
     }
     std::vector<uint8_t> route_tu2 = route_tu1;
     GrzResidualCodec route_encoder;
+    require_throws<std::invalid_argument>(
+        [&] { (void)route_encoder.encode(HistoryNonce{20}, RelSeq{1}, TuSeq{1},
+                                                               Digest128{}, route_tu1, limits()); },
+        "GRZ_RESIDUAL accepted a nonzero initial REL_SEQ");
+    require_throws<std::invalid_argument>(
+        [&] { (void)route_encoder.encode(HistoryNonce{20}, RelSeq{0}, TuSeq{1},
+                                                               Digest128{1, 0}, route_tu1, limits()); },
+        "GRZ_RESIDUAL accepted a nonempty initial predecessor digest");
     const auto route_one = route_encoder.encode(HistoryNonce{20}, RelSeq{0}, TuSeq{1},
                                                 Digest128{}, route_tu1, limits());
     require(grz_residual_group_reference_count(route_one.body) == 0,

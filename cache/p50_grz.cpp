@@ -387,6 +387,9 @@ void validate_grz_successor(const TxBegin& begin,
                             const std::optional<HistoryNonce>& history_nonce,
                             const std::optional<RelSeq>& last_rel,
                             const std::optional<Digest128>& state_digest) {
+    if (!last_rel && !state_digest &&
+        (begin.rel_seq.value != 0 || begin.pre_state_digest != Digest128{}))
+        throw std::invalid_argument("GRZ_RESIDUAL initial state must start at REL_SEQ zero");
     if (history_nonce && begin.history_nonce != *history_nonce)
         throw std::invalid_argument("GRZ_RESIDUAL history nonce changed without reset");
     if (last_rel && (last_rel->value == std::numeric_limits<uint64_t>::max() ||
