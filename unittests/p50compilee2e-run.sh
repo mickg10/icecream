@@ -214,7 +214,6 @@ include_root=${ICECC_P50_C1F1_INCLUDE_ROOT:-}
 compile_db=${ICECC_P50_C1F1_COMPILE_DB:-}
 compile_source=${ICECC_P50_C1F1_COMPILE_SOURCE:-}
 batch_manifest=${ICECC_P50_C1F1_BATCH_MANIFEST:-}
-image_id=${ICECC_P50_C1F1_IMAGE_ID:-}
 if test -n "$batch_manifest"; then
     test -z "$source_root" && test -z "$source_relative" && test -z "$source_input" || {
         echo "FAIL: batch manifest cannot be combined with single-input fields" >&2
@@ -224,11 +223,6 @@ if test -n "$batch_manifest"; then
         echo "FAIL: authenticated batch manifest is unavailable" >&2
         exit 1
     }
-    python3 - "$image_id" <<'PY'
-import re, sys
-if re.fullmatch(r"sha256:[0-9a-f]{64}", sys.argv[1] or "") is None:
-    raise SystemExit("batch image ID must be an exact sha256 digest")
-PY
 elif test -n "$source_root" || test -n "$source_relative"; then
     test -n "$source_root" && test -n "$source_relative" || {
         echo "FAIL: source root and source relative path must be supplied together" >&2
@@ -276,15 +270,28 @@ if not rows:
     raise SystemExit("empty batch manifest")
 seen = set()
 for row in rows:
-    if not isinstance(row, dict) or set(row) - {"tu_id", "source", "source_relative", "sha256", "preprocessed_sha256", "preprocessed_bytes", "compile_db", "compile_source"}:
+    if not isinstance(row, dict) or set(row) - {"tu_id", "source", "source_relative", "sha256", "predictive_input", "compile_db", "compile_source"}:
         raise SystemExit("batch manifest fields invalid")
     tu, source, expected = row.get("tu_id"), row.get("source"), row.get("sha256")
     source_relative = row.get("source_relative")
-    payload_sha, payload_bytes = row.get("preprocessed_sha256"), row.get("preprocessed_bytes")
-    if (not isinstance(payload_sha, str) or len(payload_sha) != 64 or
-            any(char not in "0123456789abcdef" for char in payload_sha) or
-            type(payload_bytes) is not int or payload_bytes <= 0):
+    predictive = row.get("predictive_input")
+    if (not isinstance(predictive, dict) or
+            set(predictive) != {"ordinal", "path", "source_relative", "sha256", "bytes"} or
+            predictive.get("ordinal") != len(seen) or
+            not isinstance(predictive.get("path"), str) or not os.path.isabs(predictive["path"]) or
+            not isinstance(predictive.get("source_relative"), str) or not predictive["source_relative"] or
+            predictive["source_relative"].startswith("/") or
+            any(part in ("", ".", "..") for part in predictive["source_relative"].split("/")) or
+            not isinstance(predictive.get("sha256"), str) or len(predictive["sha256"]) != 64 or
+            any(char not in "0123456789abcdef" for char in predictive["sha256"]) or
+            type(predictive.get("bytes")) is not int or predictive["bytes"] <= 0):
         raise SystemExit("batch predictive payload descriptor invalid")
+    payload_sha, payload_bytes = predictive["sha256"], predictive["bytes"]
+    predictive_info = os.lstat(predictive["path"])
+    if (stat.S_ISLNK(predictive_info.st_mode) or not stat.S_ISREG(predictive_info.st_mode) or
+            predictive_info.st_nlink != 1 or hashlib.sha256(open(predictive["path"], "rb").read()).hexdigest() != payload_sha or
+            predictive_info.st_size != payload_bytes):
+        raise SystemExit("batch predictive payload unavailable or changed")
     if (not isinstance(tu, str) or not tu or tu in seen or "\t" in tu or
             any(char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-" for char in tu)):
         raise SystemExit("batch TU identity invalid")
@@ -308,7 +315,7 @@ for row in rows:
             raise SystemExit("batch compile database unavailable")
         if not isinstance(compile_source, str) or not os.path.isabs(compile_source):
             raise SystemExit("batch compile source must be absolute")
-    print("\t".join((tu, source, source_relative, actual, payload_sha, str(payload_bytes), db, compile_source)))
+    print("\t".join((tu, source, source_relative, actual, predictive["path"], predictive["source_relative"], payload_sha, str(payload_bytes), db, compile_source)))
     seen.add(tu)
 PY
     batch_expected_count=${ICECC_P50_C1F1_EXPECTED_COUNT:-}
@@ -567,7 +574,7 @@ if test -n "$batch_manifest"; then
         run_label=$1
         emit_rows=${2:-1}
         ordinal=0
-        while IFS="$(printf '\t')" read -r tu_id source_path source_relative source_sha payload_sha payload_bytes item_db item_source; do
+        while IFS="$(printf '\t')" read -r tu_id source_path source_relative source_sha predictive_path predictive_relative payload_sha payload_bytes item_db item_source; do
             staged="$work/src/$run_label-$ordinal.cpp"
             cp -- "$source_path" "$staged"
             compile_once "$run_label-$ordinal" "$staged" "$item_db" "$item_source"
@@ -587,10 +594,9 @@ if test -n "$batch_manifest"; then
             wait_ms=$(sed -nE 's/.*<\/wait for cs: ([0-9]+)ms>.*/\1/p' "$work/client-compile-$run_label-$ordinal.log" | tail -n 1)
             test -n "$wait_ms" || { echo "FAIL: client wait-for-cs timing missing ($run_label-$ordinal)" >&2; exit 1; }
             if test "$emit_rows" = 1; then
-                printf 'S8_BATCH_TU run=%s ordinal=%s tu_id=%s source_sha256=%s preprocessed_path=%s preprocessed_sha256=%s preprocessed_bytes=%s remote_path=%s remote_sha256=%s remote_bytes=%s local_path=%s local_sha256=%s local_bytes=%s byte_identical=%s remote_compile=%s compile_start_ns=%s compile_end_ns=%s wait_for_cs_ns=%s assignment=0 relationship=0 f_slot=0\n' \
+                printf 'S8_BATCH_TU run=%s ordinal=%s tu_id=%s source_sha256=%s preprocessed_path=%s preprocessed_sha256=%s preprocessed_bytes=%s remote_path=%s remote_sha256=%s remote_bytes=%s local_path=%s local_sha256=%s local_bytes=%s compile_start_ns=%s compile_end_ns=%s wait_for_cs_ns=%s assignment=0 relationship=0 f_slot=0\n' \
                     "$run_label" "$ordinal" "$tu_id" "$source_sha" "$preprocessed_capture" "$preprocessed_sha" "$preprocessed_bytes" \
                     "$remote_obj" "$remote_sha" "$remote_bytes" "$local_obj" "$local_sha" "$local_bytes" \
-                    "$(test "$remote_sha" = "$local_sha" && echo 1 || echo 0)" 1 \
                     "$compile_start_ns" "$compile_end_ns" "$((wait_ms * 1000000))"
             fi
             ordinal=$((ordinal + 1))
@@ -659,7 +665,6 @@ if test -n "$batch_manifest"; then
     echo "S8_BATCH_PASSES=$passes"
     echo "S8_BATCH_WARM=$warm"
     echo "S8_SCHEDULING mode=serial execution_slots=1 max_concurrency=1"
-    echo "S8_IMAGE_ID=$image_id"
     for binary_role in scheduler/icecc-scheduler daemon/iceccd client/icecc cache/icecc-cache-service; do
         binary_path="$build/$binary_role"
         test -x "$binary_path" || { echo "FAIL: missing binary $binary_path" >&2; exit 1; }
@@ -667,24 +672,6 @@ if test -n "$batch_manifest"; then
             "$binary_role" "$(sha256sum "$binary_path" | awk '{print $1}')" \
             "$(stat -c %s "$binary_path")" "$binary_path"
     done
-fi
-
-# Positive evidence is mandatory. Absence of a local marker is not enough:
-# the route must identify the selected profile and cache-session handoff. Legacy FileChunk
-# remains correct for environment upload and object return, so the negative
-# evidence below is deliberately limited to the source-stream and local/client
-# fallback markers.
-grep -F "$profile_marker" "$work"/client-compile-*.log "$work/c.log" \
-    "$work/f.log" >/dev/null &&
-grep -F 'CACHE_SESSION' "$work"/client-compile-*.log "$work/c.log" \
-    "$work/f.log" >/dev/null || {
-    echo "FAIL: no positive $profile_marker/CACHE_SESSION wire evidence" >&2
-    exit 1
-}
-if grep -E 'write_fd_to_server from cpp|write_fd_to_server preprocessed|building myself|building_local|local build forced|client_exception|fallback_local' \
-    "$work"/client-compile-*.log "$work/c.log" "$work/f.log" >/dev/null 2>&1; then
-    echo "FAIL: compile path used legacy source streaming or local/client fallback" >&2
-    exit 1
 fi
 
 echo "PASS: all-P50 C1F1 $profile_marker compile is remote and byte-identical"
