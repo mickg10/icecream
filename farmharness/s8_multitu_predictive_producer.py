@@ -478,7 +478,17 @@ def _product_build_identity(build_root: Path | None, sim_binary: Path | None
                        "bytes": expected_facts["bytes"], "tree": tree_id}
     return root, simulator, commit, tree_id, simulator_facts, {
         "root": str(root), "receipt": receipt_facts, "tools": tools,
+        "configuration": configuration,
     }
+
+
+def _require_profile_build(cell: dict[str, str], build_facts: dict[str, object]) -> None:
+    configuration = build_facts.get("configuration")
+    if (cell["profile"] == "GRZ_RESIDUAL" and
+            (not isinstance(configuration, dict) or
+             configuration.get("with_libbsc") != 1)):
+        raise MultiTUPredictiveError(
+            "GRZ_RESIDUAL requires a simulator built with --with-libbsc")
 
 
 def _batch_timeout_seconds(total_tus: int) -> int:
@@ -917,6 +927,7 @@ def produce(plan_path: Path, engine_manifest: Path, product_build_root: Path,
     assignment_facts = _check_optional_assignment(assignment_map, assignments, relationship_count)
     build_root, simulator, source_commit, source_tree, simulator_facts, build_facts = _product_build_identity(
         product_build_root, sim_binary)
+    _require_profile_build(cell, build_facts)
     manifest, _template_raw, _template_input, topology_facts, template_sha, topology, template_cell = engine.load_inputs(engine_manifest)
     if template_cell != cell or manifest["split"] != SPLITS[cell["corpus"]]:
         raise MultiTUPredictiveError("engine_manifest:cell_or_split_mismatch")
@@ -1010,6 +1021,7 @@ def produce_pair(first_plan_path: Path, repeat_plan_path: Path, engine_manifest:
     assignment_facts = _check_optional_assignment(assignment_map, assignments, relationship_count)
     build_root, simulator, source_commit, source_tree, simulator_facts, build_facts = _product_build_identity(
         product_build_root, sim_binary)
+    _require_profile_build(cell, build_facts)
     manifest, _template_raw, _template_input, topology_facts, template_sha, topology, template_cell = engine.load_inputs(engine_manifest)
     if template_cell != cell or manifest["split"] != SPLITS[cell["corpus"]]:
         raise MultiTUPredictiveError("engine_manifest:cell_or_split_mismatch")
