@@ -377,7 +377,8 @@ def load_calibration_bundle(manifest_path: Path) -> dict[str, object]:
             expected_pass_id = "full-2" if depth_class == "repeat-full" else "full-1"
             if (not isinstance(runs, list) or not runs or
                     any(not isinstance(run, str) for run in runs) or
-                    pass_id != expected_pass_id or pass_id not in runs or
+                    pass_id != expected_pass_id or manifest.get("pass_id") != pass_id or
+                    pass_id not in runs or
                     (depth_class == "repeat-full" and "full-1" not in runs)):
                 raise PredictionError("calibration_experiment_manifest:runs_invalid")
             records_descriptor = manifest.get("records")

@@ -255,7 +255,7 @@ def _explicit_experiment_authority(records_path: Path, cell: dict[str, str],
         raise CalibrationError(f"{label}:experiment_manifest_topology_mismatch")
     # Derived packages distinguish source depth (``full``) from the
     # state-carrying repeat class (``repeat-full``); the latter is authoritative
-    # for context binding.  Native runner manifests only expose ``depth``.
+    # for context binding.
     if (authority.get("depth") != ("full" if depth_class == "repeat-full" else depth_class) or
             authority.get("depth_class") != depth_class):
         raise CalibrationError(f"{label}:experiment_manifest_depth_mismatch")
@@ -263,9 +263,6 @@ def _explicit_experiment_authority(records_path: Path, cell: dict[str, str],
     if not isinstance(runs, list) or not runs or any(not isinstance(run, str) for run in runs):
         raise CalibrationError(f"{label}:experiment_manifest_runs_invalid")
     pass_id = authority.get("pass_id")
-    if pass_id is None:
-        # Native runner manifests identify the canonical first pass by run.
-        pass_id = "full-2" if depth_class == "repeat-full" else "full-1"
     expected_pass_id = "full-2" if depth_class == "repeat-full" else "full-1"
     if pass_id != expected_pass_id or pass_id not in runs or (
             depth_class == "repeat-full" and "full-1" not in runs):

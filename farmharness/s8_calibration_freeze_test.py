@@ -666,7 +666,7 @@ def test_explicit_freeze_requires_directional_metrics(record_type: str, tmp_path
         freeze(request, root / "bundle.json")
 
 
-@pytest.mark.parametrize("tamper", ("nonadjacent", "cell", "topology", "depth", "records"))
+@pytest.mark.parametrize("tamper", ("nonadjacent", "cell", "topology", "depth", "pass", "records"))
 def test_loader_rejects_invalid_adjacent_context_authority(tamper: str, tmp_path: Path) -> None:
     root = tmp_path / tamper
     root.mkdir()
@@ -689,6 +689,9 @@ def test_loader_rejects_invalid_adjacent_context_authority(tamper: str, tmp_path
             authority["topology"] = authority["suite"] = "C1F20/40"
         elif tamper == "depth":
             authority["depth"] = authority["depth_class"] = "200"
+        elif tamper == "pass":
+            authority["pass_id"] = "full-2"
+            authority["runs"] = ["full-1", "full-2"]
         else:
             authority["records"]["path"] = "wrong-records.jsonl"
         authority_path.write_bytes(canonical_bytes(authority) + b"\n")
