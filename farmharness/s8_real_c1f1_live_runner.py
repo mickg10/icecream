@@ -156,6 +156,7 @@ def compile_entry_predictive_relative(entry: object) -> str | None:
 
 
 DEPTH_COUNTS = {"100": 100, "200": 200}
+MIN_TIMEOUT_SECONDS = 180
 MAX_TIMEOUT_SECONDS = 4 * 60 * 60
 
 
@@ -168,14 +169,20 @@ def selected_count(depth: str, full_count: int | None = None) -> int:
     raise AssertionError("unreachable")
 
 
-def derive_timeout(tu_count: int, passes: int = 2, warm: bool = False) -> int:
+def derive_timeout(tu_count: int, passes: int = 2, warm: bool = False,
+                   timeout_seconds: int | None = None) -> int:
     """Bound a real run by selected work, including warm prewarm work."""
     if type(tu_count) is not int or tu_count <= 0 or passes not in (1, 2):
         _fail("timeout:arguments_invalid")
     work_passes = passes + (1 if warm else 0)
+    if timeout_seconds is not None:
+        if (type(timeout_seconds) is not int or
+                not MIN_TIMEOUT_SECONDS <= timeout_seconds <= MAX_TIMEOUT_SECONDS):
+            _fail("timeout:override_invalid")
+        return timeout_seconds
     # 12 seconds/TU/pass is deliberately conservative for a remote compile;
     # cap runaway manifests while allowing a multi-hour full-corpus run.
-    return min(MAX_TIMEOUT_SECONDS, max(180, 30 + tu_count * 12 * work_passes))
+    return min(MAX_TIMEOUT_SECONDS, max(MIN_TIMEOUT_SECONDS, 30 + tu_count * 12 * work_passes))
 
 
 def load_batch_manifest(path: Path, expected_count: int = 100) -> list[dict[str, Any]]:
@@ -544,7 +551,8 @@ def build_command(batch_manifest: Path, profile: str,
                   regime: str = "cold", depth: str = "100", full_count: int | None = None,
                   passes: int = 2, workdir: Path | None = None,
                   predictive_plan: Path | None = None, script: Path = SCRIPT,
-                  suite: str = TOPOLOGY, topology: Path | None = None) -> list[str]:
+                  suite: str = TOPOLOGY, topology: Path | None = None,
+                  timeout_seconds: int | None = None) -> list[str]:
     """Build the exact launch argv; this function never executes it."""
     if profile not in PROFILES:
         _fail("profile:undeclared")
@@ -557,7 +565,7 @@ def build_command(batch_manifest: Path, profile: str,
     count = selected_count(depth, full_count)
     if passes not in (1, 2):
         _fail("passes:undeclared")
-    derive_timeout(count, passes, regime == "warm")
+    effective_timeout = derive_timeout(count, passes, regime == "warm", timeout_seconds)
     if predictive_plan is None or not predictive_plan.is_absolute() or not predictive_plan.is_file() or predictive_plan.is_symlink():
         _fail("predictive_plan:unavailable")
     load_predictive_plan(predictive_plan, corpus=corpus, profile=profile,
@@ -578,7 +586,7 @@ def build_command(batch_manifest: Path, profile: str,
             f"ICECC_CARET_WORKAROUND={SCORED_CARET_WORKAROUND}",
             f"ICECC_P50_PROFILE={profile}", f"ICECC_P50_CORPUS={corpus}",
             f"ICECC_P50_C1F1_WARM={int(regime == 'warm')}",
-            f"ICECC_P50_C1F1_TIMEOUT={derive_timeout(count, passes, regime == 'warm')}",
+            f"ICECC_P50_C1F1_TIMEOUT={effective_timeout}",
             f"ICECC_P50_C1F1_PASSES={passes}",
             f"ICECC_P50_C1F1_EXPECTED_COUNT={count}",
             f"ICECC_P50_SUITE={suite}",
@@ -1425,6 +1433,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
              repeat_predictive_plan: Path | None = None,
              corpus: str = "DuckDB", regime: str = "cold", depth: str = "100",
              full_count: int | None = None, passes: int = 2,
+             timeout_seconds: int | None = None,
              artifact_sample: int = 2, retain_all_artifacts: bool = False,
              launch_identity: dict[str, Any] | None = None,
              execution_environment: str = "host_product_build",
@@ -1448,6 +1457,8 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
         _fail("cell:undeclared")
     if passes not in (1, 2) or type(artifact_sample) is not int or artifact_sample < 0:
         _fail("run_options:invalid")
+    expected_count = selected_count(depth, full_count)
+    effective_timeout = derive_timeout(expected_count, passes, regime == "warm", timeout_seconds)
     plan, plan_inputs, plan_sha = load_predictive_plan(
         predictive_plan, corpus=corpus, profile=profile, regime=regime, depth=depth)
     repeat_plan: dict[str, Any] | None = None
@@ -1721,6 +1732,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                       "runner": {"name": "p50compilee2e-run.sh", "sha256": runner_sha},
                       "binary_sha256": binaries,
                       "execution_environment": execution_environment,
+                      "execution_limits": {"timeout_seconds": effective_timeout},
                       "runtime_image": runtime_image,
                       "diagnostic_policy": {
                           "icecc_caret_workaround": SCORED_CARET_WORKAROUND,
@@ -1788,6 +1800,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                       run: comparisons[run]["plan_sha256"] for run in run_names
                   },
                   "execution_environment": execution_environment,
+                  "execution_limits": {"timeout_seconds": effective_timeout},
                   "runtime_image": runtime_image,
                   "diagnostic_policy": {
                       "icecc_caret_workaround": SCORED_CARET_WORKAROUND,
@@ -1880,6 +1893,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--depth", choices=("100", "200", "full"), default="100")
     parser.add_argument("--full-count", type=int)
     parser.add_argument("--passes", type=int, choices=(1, 2), default=2)
+    parser.add_argument("--timeout-seconds", type=int,
+                        help=f"override timeout ({MIN_TIMEOUT_SECONDS}-{MAX_TIMEOUT_SECONDS} seconds)")
     parser.add_argument("--artifact-sample", type=int, default=2)
     parser.add_argument("--retain-all-artifacts", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
@@ -1913,6 +1928,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.depth == "full":
         args.full_count = len(plan_inputs)
     count = selected_count(args.depth, args.full_count)
+    effective_timeout = derive_timeout(count, args.passes, args.regime == "warm",
+                                       args.timeout_seconds)
     rows = load_batch_manifest(batch_manifest, count)
     load_topology(topology, rows, args.suite, _plan.get("scheduling"))
     run_workdir: Path | None = None
@@ -1949,7 +1966,7 @@ def main(argv: list[str] | None = None) -> int:
                             regime=args.regime, depth=args.depth, full_count=args.full_count,
                             passes=args.passes, workdir=command_workdir,
                             predictive_plan=predictive_plan, suite=args.suite,
-                            topology=topology)
+                            topology=topology, timeout_seconds=effective_timeout)
     if not args.execute:
         print(json.dumps({"schema": SCHEMA, "status": "DRY_RUN", "command": command,
                           "repeat_predictive_plan": str(repeat_predictive_plan)
@@ -1960,7 +1977,8 @@ def main(argv: list[str] | None = None) -> int:
                           "container_temp_root": str(args.container_temp_root.absolute())
                           if args.execution_mode == "pinned-container" else None,
                           "container_work_root": str(DEFAULT_CONTAINER_WORK_ROOT)
-                          if args.execution_mode == "pinned-container" else None},
+                          if args.execution_mode == "pinned-container" else None,
+                          "execution_limits": {"timeout_seconds": effective_timeout}},
                          sort_keys=True))
         return 0
     if args.execution_mode == "pinned-container":
@@ -1982,7 +2000,7 @@ def main(argv: list[str] | None = None) -> int:
             temp_root=container_temp_root,
             container_work_root=DEFAULT_CONTAINER_WORK_ROOT)
     try:
-        timeout = derive_timeout(count, args.passes, args.regime == "warm")
+        timeout = effective_timeout
         try:
             stdout, returncode = _run_product(command, timeout)
         except LiveRunnerError as exc:
@@ -2008,6 +2026,7 @@ def main(argv: list[str] | None = None) -> int:
                         full_count=args.full_count, passes=args.passes,
                         artifact_sample=args.artifact_sample,
                         retain_all_artifacts=args.retain_all_artifacts,
+                        timeout_seconds=effective_timeout,
                         launch_identity=launch_identity,
                         execution_environment=execution_environment,
                         runtime_image=runtime_image,

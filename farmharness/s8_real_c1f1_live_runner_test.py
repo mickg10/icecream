@@ -406,6 +406,24 @@ def test_timeout_scales_and_is_capped() -> None:
     assert runner.derive_timeout(100000, 2, True) == runner.MAX_TIMEOUT_SECONDS
 
 
+def test_timeout_default_and_explicit_override_are_bounded() -> None:
+    assert runner.derive_timeout(100, 2, False) == 2430
+    assert runner.derive_timeout(100, 2, False, 900) == 900
+    for invalid in (runner.MIN_TIMEOUT_SECONDS - 1, runner.MAX_TIMEOUT_SECONDS + 1, "900", 900.0):
+        with pytest.raises(runner.LiveRunnerError, match="timeout:override_invalid"):
+            runner.derive_timeout(100, 2, False, invalid)  # type: ignore[arg-type]
+
+
+def test_timeout_override_propagates_to_dry_run_command(tmp_path: Path) -> None:
+    batch = _batch(tmp_path)
+    plan = _plan(tmp_path, batch)
+    product, script = _product(tmp_path)
+    command = runner.build_command(
+        batch, "ZSTD_TU", product_root=product, script=script,
+        predictive_plan=plan, timeout_seconds=901)
+    assert "ICECC_P50_C1F1_TIMEOUT=901" in command
+
+
 def test_container_command_uses_resolved_image_and_read_only_product_mount(
         tmp_path: Path) -> None:
     bind_root = tmp_path / "tanksmall"
