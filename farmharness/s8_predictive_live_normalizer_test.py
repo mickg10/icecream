@@ -115,6 +115,23 @@ def test_predictor_and_live_producer_ids_remain_distinct(tmp_path: Path) -> None
     assert records[2]["model_id"] == IDENTITY["model_id"]
 
 
+def test_manifest_campaign_identity_is_preserved_on_all_records(tmp_path: Path) -> None:
+    metadata = {"topology": "C1F1", "depth_class": "100", "pass_id": "a90"}
+    predictive = _write_manifest(tmp_path, "predictive", "predictive_sim", _curve_rows(), extra=metadata)
+    live = _write_manifest(tmp_path, "live", "live", _curve_rows(2), extra=metadata)
+    records = normalize(predictive, live, tmp_path / "out.jsonl")
+    assert all({key: record[key] for key in metadata} == metadata for record in records)
+
+
+def test_manifest_campaign_identity_mismatch_is_rejected(tmp_path: Path) -> None:
+    predictive = _write_manifest(tmp_path, "predictive", "predictive_sim", _curve_rows(),
+                                 extra={"topology": "C1F1", "depth_class": "100", "pass_id": "a90"})
+    live = _write_manifest(tmp_path, "live", "live", _curve_rows(2),
+                           extra={"topology": "C1F1", "depth_class": "200", "pass_id": "a90"})
+    with pytest.raises(NormalizationError, match="manifest_metadata_mismatch:depth_class"):
+        normalize(predictive, live, tmp_path / "out.jsonl")
+
+
 def test_exact_plan_join_allows_independent_run_and_source_identity(tmp_path: Path) -> None:
     live_identity = dict(IDENTITY)
     live_identity.update(run_id="full-1", source_commit="f" * 40,

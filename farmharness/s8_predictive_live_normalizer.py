@@ -28,16 +28,18 @@ from pathlib import Path
 from typing import Any
 
 try:  # Works both as a module and as a directly invoked harness script.
-    from .s8_schema import CORPORA, CURRENT_SEMANTICS, PROFILES, REGIMES, SPLITS
+    from .s8_schema import (CORPORA, CURRENT_SEMANTICS, DEPTH_CLASSES, PROFILES,
+                            REGIMES, SPLITS, TOPOLOGIES)
 except ImportError:  # pragma: no cover - exercised by direct script runners.
-    from s8_schema import CORPORA, CURRENT_SEMANTICS, PROFILES, REGIMES, SPLITS
+    from s8_schema import (CORPORA, CURRENT_SEMANTICS, DEPTH_CLASSES, PROFILES,
+                           REGIMES, SPLITS, TOPOLOGIES)
 
 
 MANIFEST_SCHEMA = "icecream-s8-curve-manifest-v1"
 RECORD_SCHEMA = "icecream-s8-predictive-live-record-v1"
 SEMANTICS = CURRENT_SEMANTICS
 MANIFEST_KEYS = {"schema", "identity", "units", "curve", "provenance"}
-OPTIONAL_MANIFEST_KEYS = {"evidence", "comparison"}
+OPTIONAL_MANIFEST_KEYS = {"evidence", "comparison", "topology", "depth_class", "pass_id"}
 IDENTITY_KEYS = {
     "corpus", "profile", "regime", "split", "run_id", "source_commit",
     "source_tree", "input_digest", "topology_digest", "model_id",
@@ -67,6 +69,7 @@ SAFE_ID = re.compile(r"^[A-Za-z0-9_.-]+$")
 MAX_MANIFEST_BYTES = 1 * 1024 * 1024
 MAX_CURVE_BYTES = 64 * 1024 * 1024
 COMPARISON_SCHEMA = "icecream-s8-plan-capture-join-v1"
+PASS_ID = re.compile(r"^[A-Za-z0-9_.:-]+$")
 
 
 class NormalizationError(ValueError):
@@ -326,6 +329,34 @@ def _validate_evidence(value: object) -> dict[str, object]:
     }
 
 
+def _validate_manifest_metadata(value: dict[str, object]) -> dict[str, str]:
+    """Validate producer-declared campaign identity without inferring it.
+
+    Curve manifests from the original S8 producers predate these fields, so
+    they remain optional.  When present they are copied verbatim into all
+    three records and joined between predictive and live inputs.  This keeps
+    topology/depth/pass labels authenticated instead of silently replacing
+    them with a driver's defaults.
+    """
+    result: dict[str, str] = {}
+    if "topology" in value:
+        topology = value["topology"]
+        if not isinstance(topology, str) or topology not in TOPOLOGIES:
+            raise NormalizationError("manifest.topology:invalid")
+        result["topology"] = topology
+    if "depth_class" in value:
+        depth = value["depth_class"]
+        if not isinstance(depth, str) or depth not in set(DEPTH_CLASSES) - {"legacy"}:
+            raise NormalizationError("manifest.depth_class:invalid")
+        result["depth_class"] = depth
+    if "pass_id" in value:
+        pass_id = value["pass_id"]
+        if not isinstance(pass_id, str) or not pass_id or PASS_ID.fullmatch(pass_id) is None:
+            raise NormalizationError("manifest.pass_id:invalid")
+        result["pass_id"] = pass_id
+    return result
+
+
 def _forbidden_curve_key(key: object) -> bool:
     if not isinstance(key, str):
         return True
@@ -435,6 +466,7 @@ def _load_manifest(path: Path, mode: str) -> dict[str, object]:
                   if "comparison" in value else None)
     units = _validate_units(value["units"])
     provenance = _validate_provenance(value["provenance"], mode)
+    metadata = _validate_manifest_metadata(value)
     evidence = (_validate_evidence(value["evidence"])
                 if "evidence" in value else None)
     curve_path = _descriptor_path(path.parent, value["curve"], "curve")
@@ -450,6 +482,7 @@ def _load_manifest(path: Path, mode: str) -> dict[str, object]:
         "units": units,
         "provenance": provenance,
         "evidence": evidence,
+        "metadata": metadata,
         "manifest_sha256": facts["sha256"],
         "curve_sha256": curve_sha,
         "rows": rows,
@@ -480,6 +513,13 @@ def _same_units(left: dict[str, str], right: dict[str, str]) -> None:
     for field in set(left) | set(right):
         if left.get(field) != right.get(field):
             raise NormalizationError(f"units_mismatch:{field}")
+
+
+def _same_metadata(left: dict[str, str], right: dict[str, str]) -> None:
+    if left != right:
+        for field in sorted(set(left) | set(right)):
+            if left.get(field) != right.get(field):
+                raise NormalizationError(f"manifest_metadata_mismatch:{field}")
 
 
 def _comparison(predicted: dict[str, object], observed: dict[str, object], identity: dict[str, str], units: dict[str, str]) -> dict[str, object]:
@@ -539,6 +579,7 @@ def _comparison(predicted: dict[str, object], observed: dict[str, object], ident
         "cell": {field: identity[field] for field in ("corpus", "profile", "regime")},
         "split": identity["split"],
         "identity": identity,
+        **predicted["metadata"],
         **({"comparison": predicted["comparison"]}
            if predicted.get("comparison") is not None else {}),
         "units": units,
@@ -565,6 +606,7 @@ def _normalized_record(mode: str, artifact: dict[str, object]) -> dict[str, obje
         "cell": {field: identity[field] for field in ("corpus", "profile", "regime")},
         "split": identity["split"],
         "identity": identity,
+        **artifact["metadata"],
         **({"comparison": artifact["comparison"]}
            if artifact.get("comparison") is not None else {}),
         "units": units,
@@ -610,6 +652,7 @@ def normalize(predictive_manifest: Path, live_manifest: Path, out: Path) -> list
         raise NormalizationError("artifacts_must_use_separate_curves")
     _same_identity(p_identity, l_identity, predictive["comparison"], live["comparison"])
     _same_units(p_units, l_units)
+    _same_metadata(predictive["metadata"], live["metadata"])
     predictive_record = _normalized_record("predictive_sim", predictive)
     live_record = _normalized_record("live", live)
     comparison_record = _comparison(predictive, live, p_identity, p_units)
