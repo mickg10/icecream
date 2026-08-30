@@ -480,6 +480,28 @@ def test_timeout_override_propagates_to_dry_run_command(tmp_path: Path) -> None:
     assert "ICECC_P50_C1F1_TIMEOUT=901" in command
 
 
+def test_build_command_reuses_authenticated_rows_for_topology(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    batch = _batch(tmp_path)
+    plan = _plan(tmp_path, batch)
+    topology = _topology(tmp_path, batch)
+    product, script = _product(tmp_path)
+    calls = 0
+    original = runner.load_batch_manifest
+
+    def counted(path: Path, expected_count: int = 100) -> list[dict[str, object]]:
+        nonlocal calls
+        calls += 1
+        return original(path, expected_count)
+
+    monkeypatch.setattr(runner, "load_batch_manifest", counted)
+    command = runner.build_command(
+        batch, "ZSTD_TU", product_root=product, script=script,
+        predictive_plan=plan, topology=topology)
+    assert command[-1] == str(script)
+    assert calls == 1
+
+
 def test_input_ready_publication_precedes_lane_release_and_predecessor_failure_propagates() -> None:
     shell = (Path(__file__).resolve().parents[1] / "unittests" /
              "p50compilee2e-run.sh").read_text()

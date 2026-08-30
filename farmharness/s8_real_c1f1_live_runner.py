@@ -579,11 +579,10 @@ def build_command(batch_manifest: Path, profile: str,
                          regime=regime, depth=depth)
     if not batch_manifest.is_absolute() or not batch_manifest.is_file() or batch_manifest.is_symlink():
         _fail("batch_manifest:unavailable")
-    load_batch_manifest(batch_manifest, count)
+    rows = load_batch_manifest(batch_manifest, count)
     if topology is not None:
         if not topology.is_absolute() or not topology.is_file() or topology.is_symlink():
             _fail("topology:unavailable")
-        rows = load_batch_manifest(batch_manifest, count)
         load_topology(topology, rows, suite)
     elif suite != TOPOLOGY:
         _fail("topology:required_for_parallel_suite")
