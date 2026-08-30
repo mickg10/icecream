@@ -44,6 +44,8 @@ REPORT_SCHEMA = "icecream-s8-loss-report-v1"
 AUTHORITY_SCHEMA = "icecream-s8-loss-authority-chain-v1"
 SEMANTICS = CURRENT_SEMANTICS
 STATUSES = frozenset(("PASS", "MISSING", "EXCLUDED", "HOLD", "DRY_RUN"))
+LEGACY_EXPERIMENT_SCHEMA = "icecream-s8-first-triple-driver-v2"
+REAL_EXPERIMENT_SCHEMA = "icecream-s8-real-c1f1-live-runner-v2"
 PASS_IDS = re.compile(r"^[A-Za-z0-9_.:-]+$")
 HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
 METRICS = {
@@ -222,6 +224,41 @@ def _number(value: object, label: str) -> float:
     return float(value)
 
 
+def _validate_experiment_identity(manifest: dict[str, Any], entry: dict[str, Any]) -> None:
+    """Bind caller labels to real-run metadata when that metadata exists.
+
+    The original first-triple driver manifests predate topology/depth/pass
+    fields and are the only compatibility case.  A real runner manifest is
+    self-describing; accepting a caller-supplied relabel for any of its
+    declared fields would make a valid curve appear to belong to another
+    topology or pass.
+    """
+    fields = {key for key in ("topology", "suite", "depth", "runs") if key in manifest}
+    if not fields:
+        if manifest.get("schema") == LEGACY_EXPERIMENT_SCHEMA:
+            return
+        raise LossReportError(f"{entry['pass_id']}:experiment_identity_metadata_missing")
+    if (manifest.get("schema") == REAL_EXPERIMENT_SCHEMA and
+            fields != {"topology", "suite", "depth", "runs"}):
+        raise LossReportError(f"{entry['pass_id']}:experiment_identity_metadata_incomplete")
+    expected_suite = {"C1F1": "C1F1/100000", "C1F20": "C1F20/40"}[entry["topology"]]
+    if "topology" in manifest and manifest["topology"] != expected_suite:
+        raise LossReportError(f"{entry['pass_id']}:experiment_topology_mismatch")
+    if "suite" in manifest and manifest["suite"] != expected_suite:
+        raise LossReportError(f"{entry['pass_id']}:experiment_suite_mismatch")
+    expected_depth = "full" if entry["depth_class"] == "repeat-full" else entry["depth_class"]
+    if "depth" in manifest and str(manifest["depth"]) != expected_depth:
+        raise LossReportError(f"{entry['pass_id']}:experiment_depth_mismatch")
+    if "runs" in manifest:
+        runs = manifest["runs"]
+        if not isinstance(runs, list) or any(not isinstance(run, str) for run in runs):
+            raise LossReportError(f"{entry['pass_id']}:experiment_runs_invalid")
+        if entry["pass_id"] not in runs:
+            raise LossReportError(f"{entry['pass_id']}:experiment_pass_mismatch")
+        if entry["pass_id"] == "full-2" and "full-1" not in runs:
+            raise LossReportError(f"{entry['pass_id']}:experiment_repeat_without_full_1")
+
+
 def _metrics(values: dict[str, int | float], label: str) -> dict[str, float]:
     result: dict[str, float] = {}
     for output, source in METRICS.items():
@@ -264,8 +301,23 @@ def _point(entry: dict[str, Any], record_sha: str, step: int, tu_id: str,
 
 
 def _accepted(entry: dict[str, Any], base: Path,
-              calibration_sha256: str | None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+              calibration_manifest_sha256: str | None,
+              calibration_bundle_sha256: str | None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     records_path, descriptor = _descriptor(base, entry["records"], f"{entry['pass_id']}.records")
+    manifest_path = records_path.parent / "experiment_manifest.json"
+    manifest_raw, manifest_facts = _snapshot(manifest_path, f"{entry['pass_id']}.experiment_manifest", 4 * 1024 * 1024)
+    manifest_value = _parse(manifest_raw, f"{entry['pass_id']}.experiment_manifest")
+    if not isinstance(manifest_value, dict) or manifest_value.get("status") != "PASS":
+        raise LossReportError(f"{entry['pass_id']}:experiment_manifest_not_pass")
+    _validate_experiment_identity(manifest_value, entry)
+    if entry["split"] == "held_out_validation":
+        frozen_sha = calibration_bundle_sha256
+        attached = manifest_value.get("calibration_bundle")
+        if frozen_sha is not None:
+            if (not isinstance(attached, dict) or
+                    not isinstance(attached.get("sha256"), str) or
+                    attached["sha256"].lower() != frozen_sha):
+                raise LossReportError(f"{entry['pass_id']}:experiment_calibration_bundle_mismatch")
     try:
         candidate = auditor._candidate(records_path)
     except (auditor.AuditError, KeyError, TypeError, OverflowError) as exc:
@@ -273,8 +325,7 @@ def _accepted(entry: dict[str, Any], base: Path,
     expected_cell = "/".join(entry["cell"][key] for key in ("corpus", "profile", "regime"))
     if candidate["cell"] != expected_cell or candidate["split"] != entry["split"]:
         raise LossReportError(f"{entry['pass_id']}:canonical_identity_mismatch")
-    descriptor_result = auditor._descriptor_matches(
-        json.loads((records_path.parent / "experiment_manifest.json").read_text()), records_path)  # type: ignore[arg-type]
+    descriptor_result = auditor._descriptor_matches(manifest_value, records_path)
     raw = descriptor_result["raw"]
     facts = descriptor_result["facts"]
     if facts["sha256"] != descriptor["sha256"] or facts["bytes"] != descriptor["bytes"]:
@@ -292,14 +343,17 @@ def _accepted(entry: dict[str, Any], base: Path,
     pred_rows = curves["predicted"][0]
     obs_rows = curves["observed"][0]
     points = [_point(entry, str(descriptor["sha256"]), int(p_row["step"]), str(p_row["tu_id"]), p_values, o_values,
-                     calibration_sha256)
+                     calibration_manifest_sha256)
               for p_row, o_row, p_values, o_values in zip(pred_rows, obs_rows, predicted, observed, strict=True)
               if p_row["step"] == o_row["step"] and p_row["tu_id"] == o_row["tu_id"]]
     if len(points) != len(pred_rows):
         raise LossReportError(f"{entry['pass_id']}:point_alignment_mismatch")
     return points, {"records": descriptor, "points": len(points), "cell": entry["cell"],
                     "split": entry["split"], "topology": entry["topology"],
-                    "depth_class": entry["depth_class"], "pass_id": entry["pass_id"]}
+                    "depth_class": entry["depth_class"], "pass_id": entry["pass_id"],
+                    "experiment_manifest": {"path": str(manifest_path),
+                                             "sha256": manifest_facts["sha256"],
+                                             "bytes": manifest_facts["bytes"]}}
 
 
 def _new_dir(root: Path) -> Path:
@@ -327,12 +381,16 @@ def _write_new(path: Path, raw: bytes) -> dict[str, object]:
 
 
 def _frozen(path: Path) -> dict[str, object]:
-    raw, facts = _snapshot(path, "calibration_manifest", 4 * 1024 * 1024)
+    _raw, facts = _snapshot(path, "calibration_manifest", 4 * 1024 * 1024)
     try:
-        load_calibration_bundle(path)
+        loaded = load_calibration_bundle(path)
     except Exception as exc:  # engine has a deliberately broad input boundary
         raise LossReportError(f"calibration_manifest:not_frozen:{exc}") from exc
-    return {"path": str(path.resolve()), "sha256": facts["sha256"], "bytes": facts["bytes"]}
+    bundle_sha = loaded.get("bundle_sha256") if isinstance(loaded, dict) else None
+    if not isinstance(bundle_sha, str) or HEX64.fullmatch(bundle_sha) is None or int(bundle_sha, 16) == 0:
+        raise LossReportError("calibration_manifest:bundle_digest_missing")
+    return {"path": str(path.resolve()), "sha256": facts["sha256"], "bytes": facts["bytes"],
+            "bundle_sha256": bundle_sha.lower()}
 
 
 def build_report(input_manifest: Path, output_root: Path,
@@ -353,7 +411,8 @@ def build_report(input_manifest: Path, output_root: Path,
         if entry["status"] != "PASS":
             continue
         points, binding = _accepted(entry, base,
-                                    str(calibration_binding["sha256"]) if calibration_binding else None)
+                                    str(calibration_binding["sha256"]) if calibration_binding else None,
+                                    str(calibration_binding["bundle_sha256"]) if calibration_binding else None)
         point_rows.extend(points)
         accepted.append(binding)
     point_raw = b"".join(_canonical(row) for row in point_rows)

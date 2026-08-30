@@ -14,7 +14,7 @@ def _canonical(value: object) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
-def _experiment(root: Path, corpus: str = "fmt") -> Path:
+def _experiment(root: Path, corpus: str = "fmt", manifest_extra: dict[str, object] | None = None) -> Path:
     cell = {"corpus": corpus, "profile": "ZSTD_TU", "regime": "cold"}
     identity = {**cell, "split": SPLITS[corpus], "run_id": "run-1",
                 "source_commit": "a" * 40, "source_tree": "b" * 40,
@@ -69,10 +69,13 @@ def _experiment(root: Path, corpus: str = "fmt") -> Path:
     experiment.mkdir()
     records_path = experiment / "records.jsonl"
     records_path.write_bytes(records)
-    (experiment / "experiment_manifest.json").write_bytes(_canonical({
+    manifest = {
         "schema": "icecream-s8-first-triple-driver-v2", "status": "PASS", "cell": cell,
         "split": SPLITS[corpus], "records": {"path": "records.jsonl",
-        "sha256": hashlib.sha256(records).hexdigest(), "bytes": len(records)}}))
+        "sha256": hashlib.sha256(records).hexdigest(), "bytes": len(records)}}
+    if manifest_extra:
+        manifest.update(manifest_extra)
+    (experiment / "experiment_manifest.json").write_bytes(_canonical(manifest))
     return records_path
 
 
@@ -132,3 +135,45 @@ def test_non_pass_entry_is_retained_as_status_but_not_measurement(tmp_path: Path
     assert report["status_counts"]["DRY_RUN"] == 1
     assert curve["accepted_entries"] == 1
     assert curve["excluded_entries"]["DRY_RUN"] == 1
+
+
+@pytest.mark.parametrize(("field", "value"), (("topology", "C1F20/40"),
+                                                  ("suite", "C1F20/40"),
+                                                  ("depth", "100"),
+                                                  ("runs", ["full-2"])))
+def test_real_manifest_cannot_be_relabelled(tmp_path: Path, field: str, value: object) -> None:
+    records = _experiment(tmp_path, manifest_extra={
+        "schema": "icecream-s8-real-c1f1-live-runner-v2", "topology": "C1F1/100000",
+        "suite": "C1F1/100000", "depth": "200", "runs": ["full-1"],
+    })
+    extra = {"schema": "icecream-s8-real-c1f1-live-runner-v2", "topology": "C1F1/100000",
+             "suite": "C1F1/100000", "depth": "200", "runs": ["full-1"], field: value}
+    manifest_path = records.parent / "experiment_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest.update(extra)
+    manifest_path.write_bytes(_canonical(manifest))
+    with pytest.raises(LossReportError, match="experiment_(topology|suite|depth|pass)_mismatch"):
+        build_report(_input_manifest(tmp_path, records), tmp_path / "experiments")
+
+
+def test_real_manifest_shape_is_accepted(tmp_path: Path) -> None:
+    records = _experiment(tmp_path, manifest_extra={
+        "schema": "icecream-s8-real-c1f1-live-runner-v2", "topology": "C1F1/100000",
+        "suite": "C1F1/100000", "depth": "200", "runs": ["full-1"],
+    })
+    output = build_report(_input_manifest(tmp_path, records), tmp_path / "experiments")
+    assert json.loads((output / "report-manifest.json").read_text())["status"] == "PASS"
+
+
+def test_held_out_rejects_unrelated_frozen_bundle(monkeypatch: pytest.MonkeyPatch,
+                                                 tmp_path: Path) -> None:
+    records = _experiment(tmp_path, corpus="DuckDB", manifest_extra={
+        "calibration_bundle": {"path": "frozen.json", "sha256": "b" * 64},
+    })
+    frozen = tmp_path / "frozen.json"
+    frozen.write_bytes(b"fixture\n")
+    monkeypatch.setattr("s8_loss_report.load_calibration_bundle",
+                        lambda _path: {"bundle_sha256": "a" * 64})
+    with pytest.raises(LossReportError, match="experiment_calibration_bundle_mismatch"):
+        build_report(_input_manifest(tmp_path, records, corpus="DuckDB"),
+                     tmp_path / "experiments", frozen)
