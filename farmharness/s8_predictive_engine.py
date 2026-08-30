@@ -48,6 +48,11 @@ LEGACY_CALIBRATION_BUNDLE_SCHEMA = "icecream-s8-calibration-model-bundle-v1"
 HEX64 = set("0123456789abcdef")
 HEX40 = set("0123456789abcdef")
 MAX_INPUT_BYTES = 64 * 1024 * 1024
+CALIBRATION_METADATA_FIELDS = {
+    "product_image_digest", "toolchain_digest", "output_contract_digest",
+    "host_digest", "ordered_input_class",
+}
+EXPLICIT_DEPTH_CLASSES = ("100", "200", "full", "repeat-full")
 
 # This is the predeclared model.  Keeping coefficients in source makes the
 # model immutable and reviewable; the topology declaration is the per-run
@@ -63,6 +68,9 @@ BASE_MODEL = {
     "network_rtt_ns": 80_000,
     "uplink_bytes_per_ns": 0.0125,
     "downlink_bytes_per_ns": 0.025,
+    # F-to-C object bytes are an output-contract property, not a source
+    # profile or scheduling-regime property.  Keep this base term invariant;
+    # calibration supplies only the authenticated contract/depth correction.
     "result_fraction": 0.12,
     "minimum_frame_bytes": 64,
 }
@@ -278,6 +286,7 @@ def load_calibration_bundle(manifest_path: Path) -> dict[str, object]:
             not isinstance(bundle["inputs"], list) or
             len(bundle["inputs"]) < len(expected_cells)):
         raise PredictionError("calibration_bundle:input_bindings_invalid")
+    explicit_bundle = not migrated
     # Bind each evidence cell together with its topology/depth context.  The
     # same corpus/profile/regime is expected to recur across contexts.
     seen_cells: set[tuple[str, str]] = set()
@@ -401,14 +410,21 @@ def load_calibration_bundle(manifest_path: Path) -> dict[str, object]:
                           {"path": path, "sha256": digest, "bytes": binding["records_bytes"]},
                           "calibration_records")
             del authority_facts
+    if explicit_bundle and not legacy_v2 and binding_contexts != {
+            f"{topology}/{depth_class}"
+            for topology in TOPOLOGIES for depth_class in EXPLICIT_DEPTH_CLASSES
+    }:
+        raise PredictionError("calibration_bundle:incomplete_context_slice")
     expected_context_cells = {
         (context, cell_id)
         for context in binding_contexts
-        for cell_id in expected_cells
+        for cell_id in (set(expected_cells) if (migrated or legacy_v2)
+                        else {cell_id for _context, cell_id in seen_cells})
     }
     if seen_cells != expected_context_cells:
         raise PredictionError("calibration_bundle:input_cell_set_invalid")
-    if any(corpora != {"fmt", "RocksDB"} for corpora in bucket_corpora.values()):
+    included_buckets = {bucket for bucket, corpora in bucket_corpora.items() if corpora}
+    if any(bucket_corpora[bucket] != {"fmt", "RocksDB"} for bucket in included_buckets):
         raise PredictionError("calibration_bundle:bucket_sources_invalid")
     calibration = bundle["calibration"]
     if not isinstance(calibration, dict) or not isinstance(calibration.get("scales"), dict):
@@ -429,13 +445,23 @@ def load_calibration_bundle(manifest_path: Path) -> dict[str, object]:
                 "elapsed_ns": bucket_scales["elapsed_ns"],
             }
     else:
+        identity = calibration.get("identity")
+        if not legacy_v2:
+            if (not isinstance(identity, dict) or
+                    set(identity) != CALIBRATION_METADATA_FIELDS):
+                raise PredictionError("calibration_bundle:calibration_identity_invalid")
+            for field in CALIBRATION_METADATA_FIELDS - {"ordered_input_class"}:
+                _sha256(identity[field], f"calibration.identity.{field}")
+            if identity["ordered_input_class"] != "ordered":
+                raise PredictionError("calibration_bundle:ordered_input_class_invalid")
         contexts = calibration.get("contexts")
         if (not isinstance(contexts, list) or not contexts or
                 any(not isinstance(context, str) or "/" not in context for context in contexts)):
             raise PredictionError("calibration_bundle:contexts_invalid")
         if binding_contexts != set(contexts):
             raise PredictionError("calibration_bundle:context_binding_mismatch")
-        expected_keys = {f"{context}/{bucket}" for context in contexts for bucket in expected_buckets}
+        expected_keys = {f"{context}/{bucket}" for context in contexts
+                         for bucket in included_buckets}
         legacy_aliases = (expected_buckets if set(contexts) == {"C1F1/legacy"} else set())
         # Aliases are permitted only for migrated legacy fixtures; a v2 bundle
         # must have no unscoped aggregate bucket capable of leaking to C1F20.
@@ -632,9 +658,12 @@ def _predict_curve(raw: bytes, topology: dict[str, object], cell: dict[str, str]
         source_bytes = (max(BASE_MODEL["minimum_frame_bytes"],
                             round(raw_size * ratio)) + profile_model["channel_overhead"] +
                         channel_model["overhead"]) if raw_size else 0
+        # Object-return bytes are determined solely by the authenticated
+        # output contract and ordered input/depth class.  Profile, regime, and
+        # topology may affect source bytes and elapsed time, but must not
+        # change this uncalibrated F_TO_C base prediction.
         base_result_bytes = (max(BASE_MODEL["minimum_frame_bytes"],
-                                 round(raw_size * profile_model["result_fraction"] * regime_model["channel_factor"])) +
-                             channel_model["overhead"]) if raw_size else 0
+                                 round(raw_size * BASE_MODEL["result_fraction"]))) if raw_size else 0
         result_bytes = base_result_bytes
         if raw_size:
             # Standalone causal predictions use direction-specific factors.

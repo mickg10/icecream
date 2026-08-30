@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Freeze a deterministic S8 calibration model from the 16 calibration cells.
+"""Freeze a deterministic S8 calibration model from complete evidence slices.
 
-The input is an authenticated request naming one normalized ``records.jsonl``
-for every ``fmt``/``RocksDB`` profile and regime cell.  The request never
+The input is an authenticated request naming normalized ``records.jsonl``
+triples for each included profile/regime and every complete topology/depth
+slice.  The request never
 names a live trace or a held-out corpus.  Each records file is authenticated,
 checked as one predictive/live/comparison triple, and reduced to robust
 observed-over-predicted scale factors for C-to-F bytes, F-to-C bytes, and
@@ -47,6 +48,15 @@ DESCRIPTOR_KEYS = {"path", "sha256", "bytes"}
 CELL_KEYS = {"corpus", "profile", "regime"}
 COMMON_METRICS = ("channel_bytes", "elapsed_ns", "throughput_bytes_per_s")
 FACTOR_FIELDS = ("C_TO_F_bytes", "F_TO_C_bytes", "elapsed_ns")
+CALIBRATION_METADATA_FIELDS = (
+    "product_image_digest", "toolchain_digest", "output_contract_digest",
+    "host_digest", "ordered_input_class",
+)
+EXPLICIT_DEPTH_CLASSES = ("100", "200", "full", "repeat-full")
+EXPLICIT_CONTEXTS = tuple(
+    f"{topology}/{depth_class}"
+    for topology in TOPOLOGIES for depth_class in EXPLICIT_DEPTH_CLASSES
+)
 RECORD_TYPES = ("predictive_sim", "live", "comparison")
 CALIBRATION_CELLS = tuple(
     dict(cell) for cell in DECLARED_CELLS if SPLITS[cell["corpus"]] == "calibration"
@@ -299,6 +309,22 @@ def _finite_nonnegative(value: object, label: str) -> int | float:
     return value
 
 
+def _calibration_metadata(value: object, label: str) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise CalibrationError(f"{label}:calibration_metadata_missing")
+    if set(value) != set(CALIBRATION_METADATA_FIELDS):
+        raise CalibrationError(f"{label}:calibration_metadata_missing")
+    result: dict[str, str] = {}
+    for field in CALIBRATION_METADATA_FIELDS:
+        if field == "ordered_input_class":
+            if value[field] != "ordered":
+                raise CalibrationError(f"{label}.{field}:invalid")
+            result[field] = value[field]
+        else:
+            result[field] = _digest(value[field], f"{label}.{field}")
+    return result
+
+
 def _identity(value: object, cell: dict[str, str], label: str) -> dict[str, object]:
     if not isinstance(value, dict):
         raise CalibrationError(f"{label}:identity_missing")
@@ -385,14 +411,18 @@ def _curve(value: object, cell: dict[str, str], label: str,
 
 
 def _records(raw: bytes, cell: dict[str, str], predictor_model_id: str,
-             label: str, require_directional: bool = False
-             ) -> tuple[dict[str, object], dict[str, object], dict[str, object], int]:
+             label: str, require_directional: bool = False,
+             require_metadata: bool = False
+             ) -> tuple[dict[str, object], dict[str, object], dict[str, object], int,
+                        dict[str, str]]:
     lines = raw.splitlines()
     if len(lines) != 3 or any(not line.strip() for line in lines):
         raise CalibrationError(f"{label}:expected_three_records")
     by_type: dict[str, dict[str, object]] = {}
     shared_identity: dict[str, object] | None = None
     shared_units: dict[str, str] | None = None
+    shared_metadata: dict[str, str] | None = None
+    metadata_records = 0
     curves: dict[str, list[dict[str, object]]] = {}
     for number, line in enumerate(lines, 1):
         value = parse_json(line, f"{label}:{number}")
@@ -429,6 +459,17 @@ def _records(raw: bytes, cell: dict[str, str], predictor_model_id: str,
                     raise CalibrationError(f"{label}:{number}:identity_mismatch:{field}")
             if units != shared_units:
                 raise CalibrationError(f"{label}:{number}:units_mismatch")
+        metadata = {field: value[field] for field in CALIBRATION_METADATA_FIELDS
+                    if field in value}
+        if metadata:
+            metadata_records += 1
+            metadata = _calibration_metadata(metadata, f"{label}:{number}")
+            if shared_metadata is None:
+                shared_metadata = metadata
+            elif metadata != shared_metadata:
+                raise CalibrationError(f"{label}:{number}:calibration_metadata_mismatch")
+        elif require_metadata:
+            raise CalibrationError(f"{label}:{number}:calibration_metadata_missing")
         if record_type in ("predictive_sim", "live"):
             curves[record_type] = _curve(value.get("raw_cumulative_curve"), cell,
                                           f"{label}:{record_type}", require_directional)
@@ -438,13 +479,18 @@ def _records(raw: bytes, cell: dict[str, str], predictor_model_id: str,
         by_type[record_type] = value
     if set(by_type) != set(RECORD_TYPES):
         raise CalibrationError(f"{label}:record_types_missing")
+    if require_metadata and metadata_records != len(RECORD_TYPES):
+        raise CalibrationError(f"{label}:calibration_metadata_missing")
     predicted, observed = curves["predictive_sim"], curves["live"]
     if len(predicted) != len(observed):
         raise CalibrationError(f"{label}:curve_length_mismatch")
     for index, (left, right) in enumerate(zip(predicted, observed, strict=True)):
         if left["step"] != right["step"] or left["tu_id"] != right["tu_id"]:
             raise CalibrationError(f"{label}:point_identity_mismatch:{index}")
-    return by_type["predictive_sim"], by_type["live"], by_type["comparison"], len(predicted)
+    if shared_metadata is None:
+        shared_metadata = {}
+    return (by_type["predictive_sim"], by_type["live"], by_type["comparison"],
+            len(predicted), shared_metadata)
 
 
 def _median(values: list[float], label: str) -> float:
@@ -456,6 +502,22 @@ def _median(values: list[float], label: str) -> float:
     if not math.isfinite(result) or result <= 0:
         raise CalibrationError(f"{label}:invalid_estimate")
     return result
+
+
+def _geometric_median(log_values: list[float], label: str) -> float:
+    """Robust multiplicative estimate: median(log(observed/predicted))."""
+    if not log_values:
+        raise CalibrationError(f"{label}:no_samples")
+    values = sorted(log_values)
+    middle = len(values) // 2
+    log_estimate = (values[middle] if len(values) % 2 else
+                    (values[middle - 1] + values[middle]) / 2)
+    if not math.isfinite(log_estimate):
+        raise CalibrationError(f"{label}:invalid_estimate")
+    estimate = math.exp(log_estimate)
+    if not math.isfinite(estimate) or estimate <= 0:
+        raise CalibrationError(f"{label}:invalid_estimate")
+    return estimate
 
 
 def _write_new(path: Path, raw: bytes, label: str) -> None:
@@ -472,7 +534,7 @@ def _write_new(path: Path, raw: bytes, label: str) -> None:
 
 
 def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = None) -> dict[str, object]:
-    """Validate exactly 16 calibration triples and write a deterministic bundle."""
+    """Validate complete calibration slices and write a deterministic bundle."""
     request_root = request_path.parent.resolve()
     if bundle_path.parent.resolve() != request_root:
         raise CalibrationError("outputs:must_share_request_root")
@@ -504,6 +566,10 @@ def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = N
     # C1F1/legacy so their aggregate factor can never leak into C1F20.
     context_bucket_ratios: dict[str, dict[str, dict[str, list[float]]]] = {}
     context_bucket_corpora: dict[str, dict[str, set[str]]] = {}
+    f_log_ratios: dict[str, list[float]] = {}
+    elapsed_groups: dict[str, list[float]] = {}
+    metadata_identity: dict[str, str] | None = None
+    metadata_by_record: list[tuple[str, str, str]] = []
     context_ids: set[str] = set()
     total_points = 0
     for index, item in enumerate(comparisons):
@@ -540,9 +606,15 @@ def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = N
         records_raw, actual_sha, actual_bytes = _snapshot(records_path, "records", MAX_RECORDS_BYTES)
         if actual_sha != records_sha or actual_bytes != records_bytes:
             raise CalibrationError(f"comparison:{index}:records_changed_after_authentication")
-        predictive, live, _comparison, point_count = _records(
+        predictive, live, _comparison, point_count, record_metadata = _records(
             records_raw, cell, predictor_identity["model_id"], f"comparison:{index}.records",
-            require_directional=not legacy)
+            require_directional=not legacy, require_metadata=not legacy)
+        if not legacy:
+            if metadata_identity is None:
+                metadata_identity = record_metadata
+            elif record_metadata != metadata_identity:
+                raise CalibrationError(f"comparison:{index}:calibration_metadata_mismatch")
+            metadata_by_record.append((cell["corpus"], topology, depth_class))
         p_curve = _curve(predictive["raw_cumulative_curve"], cell,
                          f"comparison:{index}.predictive", require_directional=not legacy)
         l_curve = _curve(live["raw_cumulative_curve"], cell,
@@ -569,10 +641,21 @@ def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = N
                                else p_metrics.get(direction, p_metrics["channel_bytes"]))
                 l_direction = (l_metrics[direction] if not legacy
                                else l_metrics.get(direction, l_metrics["channel_bytes"]))
-                context_bucket_ratios[context][bucket].setdefault(direction, []).append(
-                    float(l_direction) / float(p_direction))
-            context_bucket_ratios[context][bucket]["elapsed_ns"].append(
-                float(l_metrics["elapsed_ns"]) / float(p_metrics["elapsed_ns"]))
+                if p_direction <= 0 or l_direction <= 0:
+                    if direction == "F_TO_C_bytes" and not legacy:
+                        raise CalibrationError(
+                            f"comparison:{index}:F_TO_C_bytes_nonpositive")
+                    if p_direction <= 0:
+                        raise CalibrationError(f"comparison:{index}:ratio_nonpositive")
+                ratio = float(l_direction) / float(p_direction)
+                if direction == "F_TO_C_bytes" and not legacy:
+                    f_log_ratios.setdefault(depth_class, []).append(math.log(ratio))
+                else:
+                    context_bucket_ratios[context][bucket].setdefault(direction, []).append(ratio)
+            elapsed_ratio = float(l_metrics["elapsed_ns"]) / float(p_metrics["elapsed_ns"])
+            context_bucket_ratios[context][bucket]["elapsed_ns"].append(elapsed_ratio)
+            if not legacy:
+                elapsed_groups.setdefault(f"{topology}/{bucket}", []).append(elapsed_ratio)
         total_points += point_count
         binding = {
             "cell": cell,
@@ -595,33 +678,61 @@ def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = N
                 "pass_id": pass_id,
             })
         input_bindings.append(binding)
-    # Every context included in a provisional bundle must have the same
-    # complete calibration matrix.  Contexts are deliberately not prescribed
-    # here: a new topology/depth can be frozen as soon as its own evidence is
-    # available, without pretending that unmeasured contexts exist.
-    for context in sorted(context_ids):
-        missing = sorted(
-            CALIBRATION_CELL_IDS - {
+    legacy_request = context_ids == {"C1F1/legacy"}
+    if legacy_request:
+        for context in sorted(context_ids):
+            missing = sorted(CALIBRATION_CELL_IDS - {
                 cell_id for context_id, cell_id in seen if context_id == context
-            }
-        )
-        if missing:
+            })
+            if missing:
+                raise CalibrationError(
+                    f"comparisons:missing_cells:{context}:{','.join(missing)}")
+        expected_points = len(CALIBRATION_CELLS)
+        if len(comparisons) != expected_points or len(seen) != expected_points:
+            raise CalibrationError("comparisons:expected_complete_16_cell_matrix")
+    else:
+        # A scoring bundle admits only complete preregistered slices: both
+        # calibration corpora x both topologies x all four depth classes for
+        # every included profile/regime.  Independent buckets may be frozen
+        # incrementally, but no partial context slice is accepted.
+        if context_ids != set(EXPLICIT_CONTEXTS):
+            missing = sorted(set(EXPLICIT_CONTEXTS) - context_ids)
             raise CalibrationError(
-                f"comparisons:missing_cells:{context}:{','.join(missing)}")
-    expected_points = len(CALIBRATION_CELLS) * len(context_ids)
-    if (not context_ids or len(comparisons) != expected_points or
-            len(seen) != expected_points):
-        raise CalibrationError("comparisons:expected_complete_16_cell_matrix_per_context")
+                f"comparisons:missing_complete_context_slice:{','.join(missing)}")
+        included_buckets = {
+            cell_id.split("/", 1)[1]
+            for _context, cell_id in seen
+        }
+        expected = len(included_buckets) * len(EXPLICIT_CONTEXTS) * 2
+        for bucket in sorted(included_buckets):
+            present = {
+                (context, cell_id.split("/", 1)[0])
+                for context, cell_id in seen if cell_id.endswith(f"/{bucket}")
+            }
+            required = {(context, corpus) for context in EXPLICIT_CONTEXTS
+                        for corpus in ("fmt", "RocksDB")}
+            if present != required:
+                raise CalibrationError(f"comparisons:partial_complete_slice:{bucket}")
+        if len(comparisons) != expected or len(seen) != expected:
+            raise CalibrationError("comparisons:expected_complete_slice_per_bucket")
     input_bindings.sort(key=lambda item: (
         _context_id(str(item["topology"]), str(item["depth_class"])),
         _cell_id(item["cell"])))
     scales: dict[str, dict[str, float]] = {}
+    f_factors: dict[str, float] = {}
+    if not legacy_request:
+        for depth_class in EXPLICIT_DEPTH_CLASSES:
+            f_factors[depth_class] = _geometric_median(
+                f_log_ratios.get(depth_class, []),
+                f"F_TO_C_bytes/{depth_class}")
+    scale_bucket_ids = (sorted(CALIBRATION_BUCKET_IDS) if legacy_request else
+                        sorted({cell_id.split("/", 1)[1] for _context, cell_id in seen}))
     for context in sorted(context_ids):
-        for bucket_id in sorted(CALIBRATION_BUCKET_IDS):
+        for bucket_id in scale_bucket_ids:
             ratios = context_bucket_ratios[context][bucket_id]
             if (context_bucket_corpora[context][bucket_id] != {"fmt", "RocksDB"} or
                     len(ratios.get("C_TO_F_bytes", [])) < 2 or
-                    len(ratios.get("F_TO_C_bytes", [])) < 2 or
+                    (legacy_request and len(ratios.get("F_TO_C_bytes", [])) < 2) or
                     len(ratios["elapsed_ns"]) < 2):
                 raise CalibrationError(f"bucket:{context}/{bucket_id}:expected_two_corpora")
             key = f"{context}/{bucket_id}"
@@ -632,9 +743,12 @@ def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = N
             c_factor = (1.0 if context != "C1F1/legacy" else
                         _median(ratios.get("C_TO_F_bytes", ratios["channel_bytes"]),
                                 f"{key}:C_TO_F_bytes"))
-            f_factor = _median(ratios.get("F_TO_C_bytes", ratios["channel_bytes"]),
-                               f"{key}:F_TO_C_bytes")
-            elapsed_factor = _median(ratios["elapsed_ns"], f"{key}:elapsed_ns")
+            f_factor = (_geometric_median(ratios.get("F_TO_C_bytes", ratios["channel_bytes"]),
+                                          f"{key}:F_TO_C_bytes")
+                        if legacy_request else f_factors[context.split("/", 1)[1]])
+            elapsed_samples = (ratios["elapsed_ns"] if legacy_request else
+                               elapsed_groups.get(f"{context.split('/', 1)[0]}/{bucket_id}", []))
+            elapsed_factor = _median(elapsed_samples, f"{key}:elapsed_ns")
             if context == "C1F1/legacy" and context_ids == {"C1F1/legacy"}:
                 # Read-only aliases keep older C1F1 callers source-compatible
                 # while the canonical v2 key remains topology/depth scoped.
@@ -645,6 +759,28 @@ def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = N
             else:
                 scales[key] = {"C_TO_F_bytes": c_factor, "F_TO_C_bytes": f_factor,
                                "elapsed_ns": elapsed_factor}
+    diagnostics = {
+        "leave_one_corpus_out": {
+            corpus: {
+                "excluded": corpus,
+                "samples": sum(1 for record_corpus, _topology, _depth in metadata_by_record
+                                if record_corpus != corpus),
+                "non_vacuous": any(record_corpus != corpus
+                                    for record_corpus, _topology, _depth in metadata_by_record),
+            }
+            for corpus in CORPORA
+        },
+        "leave_one_depth_out": {
+            depth_class: {
+                "excluded": depth_class,
+                "samples": sum(1 for _corpus, _topology, record_depth in metadata_by_record
+                                if record_depth != depth_class),
+                "non_vacuous": any(record_depth != depth_class
+                                    for _corpus, _topology, record_depth in metadata_by_record),
+            }
+            for depth_class in (EXPLICIT_DEPTH_CLASSES if not legacy_request else ("legacy",))
+        },
+    }
     bundle = {
         "schema": BUNDLE_SCHEMA,
         "semantics": SEMANTICS,
@@ -658,6 +794,13 @@ def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = N
             "scales": scales,
             "factor_fields": list(FACTOR_FIELDS),
             "contexts": sorted(context_ids),
+            "identity": metadata_identity,
+            "factor_scopes": {
+                "C_TO_F_bytes": "exact_identity_1.0",
+                "F_TO_C_bytes": "product_image_digest/toolchain_digest/output_contract_digest/ordered_input_class/depth_class",
+                "elapsed_ns": "host_digest/product_image_digest/topology/profile/regime",
+            },
+            "diagnostics": diagnostics,
             "legacy_contexts": sorted(context for context in context_ids
                                        if context.endswith("/legacy")),
             "derived_metrics": {

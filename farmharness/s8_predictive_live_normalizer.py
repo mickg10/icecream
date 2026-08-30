@@ -40,6 +40,11 @@ RECORD_SCHEMA = "icecream-s8-predictive-live-record-v1"
 SEMANTICS = CURRENT_SEMANTICS
 MANIFEST_KEYS = {"schema", "identity", "units", "curve", "provenance"}
 OPTIONAL_MANIFEST_KEYS = {"evidence", "comparison", "topology", "depth_class", "pass_id"}
+CALIBRATION_METADATA_KEYS = {
+    "product_image_digest", "toolchain_digest", "output_contract_digest",
+    "host_digest", "ordered_input_class",
+}
+OPTIONAL_MANIFEST_KEYS |= CALIBRATION_METADATA_KEYS
 IDENTITY_KEYS = {
     "corpus", "profile", "regime", "split", "run_id", "source_commit",
     "source_tree", "input_digest", "topology_digest", "model_id",
@@ -70,6 +75,7 @@ MAX_MANIFEST_BYTES = 1 * 1024 * 1024
 MAX_CURVE_BYTES = 64 * 1024 * 1024
 COMPARISON_SCHEMA = "icecream-s8-plan-capture-join-v1"
 PASS_ID = re.compile(r"^[A-Za-z0-9_.:-]+$")
+ORDERED_INPUT_CLASSES = frozenset(("ordered",))
 
 
 class NormalizationError(ValueError):
@@ -354,6 +360,17 @@ def _validate_manifest_metadata(value: dict[str, object]) -> dict[str, str]:
         if not isinstance(pass_id, str) or not pass_id or PASS_ID.fullmatch(pass_id) is None:
             raise NormalizationError("manifest.pass_id:invalid")
         result["pass_id"] = pass_id
+    calibration_fields = CALIBRATION_METADATA_KEYS & set(value)
+    if calibration_fields and calibration_fields != CALIBRATION_METADATA_KEYS:
+        missing = ",".join(sorted(CALIBRATION_METADATA_KEYS - calibration_fields))
+        raise NormalizationError(f"manifest.calibration_metadata_missing:{missing}")
+    if calibration_fields:
+        for field in CALIBRATION_METADATA_KEYS - {"ordered_input_class"}:
+            result[field] = _sha(value[field], f"manifest.{field}")
+        ordered = value["ordered_input_class"]
+        if ordered not in ORDERED_INPUT_CLASSES:
+            raise NormalizationError("manifest.ordered_input_class:invalid")
+        result["ordered_input_class"] = ordered
     return result
 
 
