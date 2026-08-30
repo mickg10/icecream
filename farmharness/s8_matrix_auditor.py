@@ -299,8 +299,15 @@ def _candidate(records_path: Path) -> dict[str, Any]:
         raise AuditError("experiment_manifest:split_mismatch")
     records = _jsonl(descriptor["raw"], str(records_path))
     identities = [_record_identity(record, expected, f"record.{i}") for i, record in enumerate(records)]
-    if identities[0] != identities[2] or any(identities[0][key] != identities[1][key] for key in identities[0] if key != "model_id"):
+    # Predictive and live producers are independent: source commit/tree,
+    # topology digest, and run ID may differ.  The normalizer authenticates
+    # their shared cell/input and exact plan capture key instead of relabeling
+    # either producer's identity.
+    shared = ("corpus", "profile", "regime", "split", "input_digest")
+    if identities[0] != identities[2] or any(identities[0][key] != identities[1][key] for key in shared):
         raise AuditError("records:identity_join_mismatch")
+    if records[0].get("comparison") != records[1].get("comparison"):
+        raise AuditError("records:comparison_join_mismatch")
     predictive_provenance = _record_provenance(
         records[0].get("provenance"), "predictive_sim", "records.predictive_sim")
     live_provenance = _record_provenance(records[1].get("provenance"), "live", "records.live")

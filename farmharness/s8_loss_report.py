@@ -333,9 +333,14 @@ def _accepted(entry: dict[str, Any], base: Path,
     identities = [auditor._record_identity(record, tuple(entry["cell"][key] for key in ("corpus", "profile", "regime")),
                                           f"{entry['pass_id']}.record.{index}")
                   for index, record in enumerate(records)]
+    # Producer/source identities remain truthful and independent; the
+    # normalizer binds the join through shared cell/input and plan capture.
+    shared_identity = ("corpus", "profile", "regime", "split", "input_digest")
     if identities[0] != identities[2] or any(identities[0][key] != identities[1][key]
-                                              for key in identities[0] if key != "model_id"):
+                                              for key in shared_identity):
         raise LossReportError(f"{entry['pass_id']}:identity_join_mismatch")
+    if records[0].get("comparison") != records[1].get("comparison"):
+        raise LossReportError(f"{entry['pass_id']}:comparison_join_mismatch")
     curves = auditor._curves(records, identities, str(records_path))
     predicted = curves["predicted"][1]
     observed = curves["observed"][1]
