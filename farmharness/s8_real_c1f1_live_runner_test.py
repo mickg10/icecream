@@ -373,8 +373,13 @@ def test_container_command_uses_resolved_image_and_read_only_product_mount(
         assert identity["reference"] not in command
         assert f"{bind_root.resolve()}:{bind_root.resolve()}:ro" in command
         assert f"{work_parent}:{runner.DEFAULT_CONTAINER_WORK_ROOT}:rw" in command
-        assert "ICECC_TEST_DAEMON_UID=nobody" in command
-        assert "ICECC_TEST_DAEMON_GID=nogroup" in command
+        assert f"ICECC_TEST_DAEMON_UID={runner.CONTAINER_DAEMON_USER}" in command
+        assert f"ICECC_TEST_DAEMON_GID={runner.CONTAINER_DAEMON_GROUP}" in command
+        shell = command[-1]
+        account_ready = shell.index("set +e")
+        assert shell.index("groupadd --system icecc") < account_ready
+        assert shell.index("useradd --system --gid icecc") < account_ready
+        assert shell.index("getent passwd icecc") < account_ready
         assert (f"chown -R {os.geteuid()}:{os.getegid()} "
                 f"{runner.DEFAULT_CONTAINER_WORK_ROOT}") in command[-1]
     finally:
@@ -406,6 +411,40 @@ def test_container_temp_root_must_be_a_real_directory(tmp_path: Path) -> None:
     alias.symlink_to(root, target_is_directory=True)
     with pytest.raises(runner.LiveRunnerError, match="container_temp_root:invalid"):
         runner.validated_container_temp_root(alias)
+
+
+def test_container_account_preparation_is_deletion_sensitive(tmp_path: Path) -> None:
+    """Removing the pre-start account preparation restores daemon fallback."""
+    bind_root = tmp_path / "root"
+    bind_root.mkdir()
+    work_parent = Path("/tmp") / f"p5.account-{os.getpid()}-{tmp_path.name}"
+    work_parent.mkdir()
+    identity = {"reference": runner.PINNED_IMAGE,
+                "image_id": "sha256:" + "a" * 64,
+                "architecture": "amd64", "os": "linux",
+                "created": "2026-08-21T21:11:43Z"}
+    try:
+        command = runner.build_container_command(
+            ["env", "true"], image_identity=identity, bind_root=bind_root,
+            work_parent=work_parent, required_paths=[bind_root])
+        shell = command[-1]
+        prelude, product = shell.split("set +e\n", 1)
+        assert "getent passwd icecc" in prelude
+        assert "groupadd --system icecc" in prelude
+        assert "useradd --system --gid icecc" in prelude
+        # The daemon source emits this exact warning when its constructor
+        # cannot resolve icecc.  A deletion mutant has no account preparation
+        # before product startup, so that constructor-time condition returns.
+        daemon_source = (Path(__file__).resolve().parents[1] /
+                         "daemon/main.cpp").read_text()
+        assert 'getpwnam("icecc")' in daemon_source
+        assert "No icecc user on system. Falling back to nobody." in daemon_source
+        deletion_mutant = product
+        assert "getent passwd icecc" not in deletion_mutant
+        assert "groupadd --system icecc" not in deletion_mutant
+        assert "useradd --system --gid icecc" not in deletion_mutant
+    finally:
+        work_parent.rmdir()
 
 
 def test_container_reported_workdir_maps_to_retained_host_tree(tmp_path: Path) -> None:

@@ -52,6 +52,8 @@ DEFAULT_CONTAINER_BIND_ROOT = Path("/tanksmall")
 DEFAULT_CONTAINER_TEMP_ROOT = Path("/tmp")
 DEFAULT_CONTAINER_WORK_ROOT = Path("/p5")
 DEFAULT_REPORTED_WORKDIR = DEFAULT_CONTAINER_WORK_ROOT / "p50compilee2e.run"
+CONTAINER_DAEMON_USER = "icecc"
+CONTAINER_DAEMON_GROUP = "icecc"
 SCORED_CARET_WORKAROUND = "0"
 
 
@@ -596,14 +598,31 @@ def build_container_command(inner: list[str], *, image_identity: dict[str, str],
         _fail("container_command:inner_invalid")
     uid, gid = os.geteuid(), os.getegid()
     inner_shell = shlex.join(inner)
-    cleanup_shell = ("set +e\n" + inner_shell + "\n"
+    # The pinned farm-node image is deliberately a build image and does not
+    # install the icecc package account.  Provision the normal service
+    # account while the container is still root so every daemon (including
+    # the scheduler's constructor-time lookup) sees the same account before
+    # product startup.  The commands are idempotent for a future image that
+    # already carries the account.
+    account_setup_shell = (
+        f"if ! getent group {CONTAINER_DAEMON_GROUP} >/dev/null 2>&1; then\n"
+        f"    groupadd --system {CONTAINER_DAEMON_GROUP}\n"
+        "fi\n"
+        f"if ! getent passwd {CONTAINER_DAEMON_USER} >/dev/null 2>&1; then\n"
+        f"    useradd --system --gid {CONTAINER_DAEMON_GROUP} --no-create-home "
+        f"--home-dir /nonexistent --shell /usr/sbin/nologin {CONTAINER_DAEMON_USER}\n"
+        "fi\n"
+        f"getent passwd {CONTAINER_DAEMON_USER} >/dev/null 2>&1 || exit 71\n"
+        f"getent group {CONTAINER_DAEMON_GROUP} >/dev/null 2>&1 || exit 71\n"
+    )
+    cleanup_shell = (account_setup_shell + "set +e\n" + inner_shell + "\n"
                      "product_status=$?\n"
                      f"chown -R {uid}:{gid} {shlex.quote(str(container_work_root))} || exit 70\n"
                      "exit \"$product_status\"\n")
     return ["docker", "run", "--rm", "--user", "0", "--network", "host",
             "--name", container_name(work_parent),
-            "--env", "ICECC_TEST_DAEMON_UID=nobody",
-            "--env", "ICECC_TEST_DAEMON_GID=nogroup",
+            "--env", f"ICECC_TEST_DAEMON_UID={CONTAINER_DAEMON_USER}",
+            "--env", f"ICECC_TEST_DAEMON_GID={CONTAINER_DAEMON_GROUP}",
             "-v", f"{bind_root}:{bind_root}:ro",
             "-v", f"{work_parent}:{container_work_root}:rw",
             image_identity["image_id"], "/bin/sh", "-lc", cleanup_shell]
