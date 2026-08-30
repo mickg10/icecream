@@ -424,6 +424,19 @@ def test_timeout_override_propagates_to_dry_run_command(tmp_path: Path) -> None:
     assert "ICECC_P50_C1F1_TIMEOUT=901" in command
 
 
+def test_input_ready_publication_precedes_lane_release_and_predecessor_failure_propagates() -> None:
+    shell = (Path(__file__).resolve().parents[1] / "unittests" /
+             "p50compilee2e-run.sh").read_text()
+    source_commit = shell.index("source committed for P50 CompileFile")
+    publish = shell.index("mv -- \"$input_ready_tmp\" \"$input_ready_marker\"")
+    release = shell.index("release_planned_lane\n        if ! wait")
+    predecessor_wait = shell.index('while test ! -e "$predecessor_marker"; do')
+    predecessor_failure = shell.index('test ! -e "$predecessor_failure" || {')
+    assert source_commit < publish < release
+    assert predecessor_wait < predecessor_failure < predecessor_wait + 200
+    assert 'echo "FAIL: predecessor source admission failed' in shell
+
+
 def test_container_command_uses_resolved_image_and_read_only_product_mount(
         tmp_path: Path) -> None:
     bind_root = tmp_path / "tanksmall"

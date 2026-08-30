@@ -602,6 +602,19 @@ static UseCSMsg *get_server(MsgChannel *local_daemon)
     int timeout = 4 * 60;
     if( get_niceness() > 0 ) // low priority jobs may take longer to get a slot assigned
         timeout = 60 * 60;
+    // P50 depth batches can legitimately wait longer for a scheduler slot
+    // while other relationships are completing.  The runner already exports
+    // this authenticated run limit; use it for the assignment wait too so a
+    // client cannot terminate before its input-ready witness is published.
+    const char *configured_timeout = ::getenv("ICECC_P50_C1F1_TIMEOUT");
+    if (configured_timeout != nullptr && *configured_timeout != '\0') {
+        char *end = nullptr;
+        errno = 0;
+        const long parsed = ::strtol(configured_timeout, &end, 10);
+        if (errno == 0 && end != configured_timeout && *end == '\0' && parsed > 0 &&
+            parsed <= INT_MAX)
+            timeout = static_cast<int>(parsed);
+    }
     Msg *umsg = local_daemon->get_msg( timeout );
 
     if (!umsg || *umsg != Msg::USE_CS) {
