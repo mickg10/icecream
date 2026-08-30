@@ -34,6 +34,11 @@ class PackagingError(ValueError):
     """Source authority or output is invalid."""
 
 
+def _derived_depth_class(source_depth: str, pass_id: str) -> str:
+    """Return the report depth label while preserving source authority."""
+    return "repeat-full" if pass_id == "full-2" else source_depth
+
+
 def _sha(value: object, label: str) -> str:
     if not isinstance(value, str) or HEX64.fullmatch(value) is None or int(value, 16) == 0:
         raise PackagingError(f"{label}:invalid_digest")
@@ -97,6 +102,9 @@ def _authority(source_dir: Path, pass_id: str) -> tuple[dict[str, Any], Path, di
     depth = authority.get("depth")
     if not isinstance(depth, str) or depth not in set(DEPTH_CLASSES) - {"legacy", "repeat-full"}:
         raise PackagingError("source.depth:invalid")
+    declared_count = authority.get("declared_count")
+    if type(declared_count) is not int or declared_count <= 0:
+        raise PackagingError("source.declared_count:invalid")
     runs = authority.get("runs")
     if not isinstance(runs, list) or any(not isinstance(run, str) for run in runs) or pass_id not in runs:
         raise PackagingError("source.runs:pass_mismatch")
@@ -112,7 +120,8 @@ def _authority(source_dir: Path, pass_id: str) -> tuple[dict[str, Any], Path, di
     _sha(plans[pass_id], "source.predictive_plan_sha256_by_run")
     return authority, selected, {"path": manifest_path, "facts": authority_facts, "cell": cell,
                                  "split": split, "topology": topology, "suite": suite,
-                                 "depth": depth, "runs": runs, "plan_sha256": plans[pass_id].lower()}
+                                 "depth": depth, "declared_count": declared_count, "runs": runs,
+                                 "plan_sha256": plans[pass_id].lower()}
 
 
 def _bind_live(authority: dict[str, Any], live: dict[str, Any], cell: tuple[str, str, str],
@@ -173,7 +182,10 @@ def package(predictive_manifest: Path, source_dir: Path, pass_id: str,
     manifest = {
         "schema": SCHEMA, "status": "PASS", "cell": dict(zip(("corpus", "profile", "regime"), source["cell"])),
         "split": source["split"], "topology": source["topology"], "suite": source["suite"],
-        "depth": source["depth"], "depth_class": source["depth"], "pass_id": pass_id, "runs": source["runs"],
+        "depth": source["depth"],
+        "depth_class": _derived_depth_class(source["depth"], pass_id),
+        "pass_id": pass_id, "runs": source["runs"],
+        "requested_curve_points": source["declared_count"],
         "records": {"path": "records.jsonl", "sha256": records_facts["sha256"], "bytes": records_facts["bytes"]},
         "predictive_curve_manifest": _descriptor(predictive_manifest, p_facts),
         "live_curve_manifest": _descriptor(live_manifest, live_facts),
