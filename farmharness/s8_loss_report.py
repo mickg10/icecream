@@ -296,8 +296,7 @@ def _point(entry: dict[str, Any], record_sha: str, step: int, tu_id: str,
             "topology": entry["topology"], "depth_class": entry["depth_class"],
             "pass_id": entry["pass_id"], "step": step, "tu_id": tu_id,
             "record_sha256": record_sha, "calibration_manifest_sha256": calibration_sha256,
-            "metrics": metrics,
-            "squared_error": squared}
+            "metrics": metrics, "unit_mixed_squared_error": squared}
 
 
 def _accepted(entry: dict[str, Any], base: Path,
@@ -421,20 +420,52 @@ def build_report(input_manifest: Path, output_root: Path,
     for row in point_rows:
         by_step.setdefault(int(row["step"]), []).append(row)
     expected = len(accepted)
-    cumulative = 0.0
+    cumulative: dict[str, dict[str, float | int]] = {
+        name: {"sse": 0.0, "absolute": 0.0, "count": 0,
+               "relative": 0.0, "relative_count": 0}
+        for name in METRICS
+    }
     curve: list[dict[str, Any]] = []
     for step in sorted(by_step):
         rows = by_step[step]
-        squared = sum(float(row["squared_error"]) for row in rows)
-        cumulative += squared
-        curve.append({"step": step, "point_count": len(rows), "missing_measurements": expected - len(rows),
-                      "sum_squared_error": squared,
-                      "mean_squared_error": squared / len(rows) if rows else None,
-                      "cumulative_loss": cumulative})
+        per_metric: dict[str, Any] = {}
+        for name in METRICS:
+            errors = [row["metrics"][name]["error"] for row in rows]
+            step_sse = sum(float(item["squared"]) for item in errors)
+            step_absolute = sum(float(item["absolute"]) for item in errors)
+            relative = [abs(float(item["relative"])) for item in errors
+                        if item["relative"] is not None]
+            state = cumulative[name]
+            state["sse"] = float(state["sse"]) + step_sse
+            state["absolute"] = float(state["absolute"]) + step_absolute
+            state["count"] = int(state["count"]) + len(errors)
+            state["relative"] = float(state["relative"]) + sum(relative)
+            state["relative_count"] = int(state["relative_count"]) + len(relative)
+            count = len(errors)
+            total_count = int(state["count"])
+            relative_count = int(state["relative_count"])
+            per_metric[name] = {
+                "point_count": count,
+                "sse": step_sse,
+                "mse": step_sse / count if count else None,
+                "mae": step_absolute / count if count else None,
+                "mape": sum(relative) / len(relative) if relative else None,
+                "mape_count": len(relative),
+                "cumulative_sse": float(state["sse"]),
+                "cumulative_mse": float(state["sse"]) / total_count if total_count else None,
+                "cumulative_mae": float(state["absolute"]) / total_count if total_count else None,
+                "cumulative_mape": (float(state["relative"]) / relative_count
+                                     if relative_count else None),
+                "cumulative_mape_count": relative_count,
+            }
+        curve.append({"step": step, "point_count": len(rows),
+                      "missing_measurements": expected - len(rows),
+                      "metrics": per_metric})
     curve_value = {"schema": CURVE_SCHEMA, "semantics": SEMANTICS,
                    "status": "PASS" if not any(status_counts[s] for s in STATUSES - {"PASS"}) else "INCOMPLETE",
                    "accepted_entries": expected, "accepted_points": len(point_rows),
                    "excluded_entries": {key: status_counts[key] for key in sorted(STATUSES - {"PASS"})},
+                   "mape_definition": "mean(abs(prediction-observation)/abs(observation)); zero observations excluded",
                    "loss_curve": curve}
     curve_raw = _canonical(curve_value)
     curve_descriptor = _write_new(out / "loss-curve.json", curve_raw)

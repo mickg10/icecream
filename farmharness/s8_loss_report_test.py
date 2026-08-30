@@ -66,7 +66,7 @@ def _experiment(root: Path, corpus: str = "fmt", manifest_extra: dict[str, objec
                   "point_errors": errors, "loss_curve": losses}
     records = b"".join(_canonical(row) for row in (pred, live, comparison))
     experiment = root / "accepted"
-    experiment.mkdir()
+    experiment.mkdir(parents=True)
     records_path = experiment / "records.jsonl"
     records_path.write_bytes(records)
     manifest = {
@@ -107,6 +107,9 @@ def test_report_flattens_authenticated_directional_points_and_excludes_statuses(
     curve = json.loads((output / "loss-curve.json").read_text())
     assert curve["accepted_points"] == 2
     assert curve["loss_curve"][0]["point_count"] == 1
+    assert curve["loss_curve"][0]["metrics"]["elapsed"]["cumulative_sse"] == 400.0
+    assert curve["loss_curve"][1]["metrics"]["C_TO_F"]["cumulative_mae"] == 2.0
+    assert "mape_definition" in curve
     assert (output / "sha256-manifest.json").exists()
 
 
@@ -177,3 +180,31 @@ def test_held_out_rejects_unrelated_frozen_bundle(monkeypatch: pytest.MonkeyPatc
     with pytest.raises(LossReportError, match="experiment_calibration_bundle_mismatch"):
         build_report(_input_manifest(tmp_path, records, corpus="DuckDB"),
                      tmp_path / "experiments", frozen)
+
+
+def test_same_pass_id_is_scoped_by_topology_and_timestamped_runs_are_distinct(tmp_path: Path) -> None:
+    first = _experiment(tmp_path, manifest_extra={
+        "schema": "icecream-s8-real-c1f1-live-runner-v2", "topology": "C1F1/100000",
+        "suite": "C1F1/100000", "depth": "200", "runs": ["full-1"],
+    })
+    second = _experiment(tmp_path / "c1f20", manifest_extra={
+        "schema": "icecream-s8-real-c1f1-live-runner-v2", "topology": "C1F20/40",
+        "suite": "C1F20/40", "depth": "200", "runs": ["full-1"],
+    })
+    input_path = _input_manifest(tmp_path, first)
+    value = json.loads(input_path.read_text())
+    value["entries"].append({
+        "cell": {"corpus": "fmt", "profile": "ZSTD_TU", "regime": "cold"},
+        "split": "calibration", "topology": "C1F20", "depth_class": "200",
+        "pass_id": "full-1", "status": "PASS",
+        "records": {"path": str(second.relative_to(tmp_path)),
+                     "sha256": hashlib.sha256(second.read_bytes()).hexdigest(),
+                     "bytes": second.stat().st_size},
+    })
+    input_path.write_bytes(_canonical(value))
+    first_output = build_report(input_path, tmp_path / "experiments")
+    second_output = build_report(input_path, tmp_path / "experiments")
+    assert first_output != second_output
+    rows = [json.loads(line) for line in (first_output / "point-loss.jsonl").read_bytes().splitlines()]
+    assert {row["topology"] for row in rows} == {"C1F1", "C1F20"}
+    assert {row["pass_id"] for row in rows} == {"full-1"}
