@@ -584,8 +584,14 @@ void run_batch(const Arguments& arguments) {
         const FStoreGuid f_guid = relation_guid(arguments.f_store_guid, relation);
         relations.emplace_back();
         BatchRelation& item = relations.back();
+        PreparationAuthorityLimits authority_limits{};
+        // The batch engine executes one TU at a time per relationship.  Match
+        // the live sender lifecycle and make a missing post-commit release
+        // fail on the next TU instead of accumulating preparations until the
+        // retained-byte ceiling is reached.
+        authority_limits.max_live_entries = 1;
         item.authority = std::make_shared<P50PreparationAuthority>(
-            arguments.c_store_guid, caps.zstd, PreparationAuthorityLimits{},
+            arguments.c_store_guid, caps.zstd, authority_limits,
             kCurrentProductCompressionLevel, profile);
         P50ServerEndpointConfig config;
         config.input_job_state = [](CStoreGuid, const TxBegin&, const TxCommit&,
@@ -639,6 +645,11 @@ void run_batch(const Arguments& arguments) {
                     break;
                 }
             }
+            if (relation.authority->release(prepared) != 0 ||
+                relation.authority->live_entry_count() != 0 ||
+                relation.authority->retained_encoded_bytes() != 0)
+                throw std::runtime_error(
+                    "product batch retained a committed preparation");
         }
     };
     if (!third.empty()) {
