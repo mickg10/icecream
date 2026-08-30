@@ -642,6 +642,9 @@ def _salvage(live_root: Path, predictive_full_1: Path, predictive_full_2: Path, 
             expected_plan["scheduling"])
         if loaded.get("comparison") != evidence["comparisons"][run] or loaded.get("comparison") != expected_comparison:
             _fail(f"predictive_manifest:comparison:{run}")
+        for point, product in zip(loaded["rows"], products[run], strict=True):
+            if point.get("step") != product["ordinal"] or point.get("tu_id") != product["tu_id"]:
+                _fail(f"predictive_manifest:product_join:{run}:{product['ordinal']}")
         producer_desc[run] = _validate_predictive_producer(
             manifest, live_root / "product-evidence" / ("predictive-plan.json" if run == "full-1" else "predictive-plan-full-2.json"),
             run, evidence)
