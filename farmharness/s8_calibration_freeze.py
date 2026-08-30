@@ -257,7 +257,12 @@ def _explicit_experiment_authority(records_path: Path, cell: dict[str, str],
     suite = authority.get("suite", authority.get("topology"))
     if not isinstance(suite, str) or not suite.startswith(topology + "/"):
         raise CalibrationError(f"{label}:experiment_manifest_topology_mismatch")
-    manifest_depth = authority.get("depth", authority.get("depth_class"))
+    # Derived packages distinguish source depth (``full``) from the
+    # state-carrying repeat class (``repeat-full``); the latter is authoritative
+    # for context binding.  Native runner manifests only expose ``depth``.
+    manifest_depth = (authority.get("depth_class")
+                      if schema == "icecream-s8-derived-experiment-v1"
+                      else authority.get("depth", authority.get("depth_class")))
     depth_aliases = {
         "100": {"100"}, "200": {"200"},
         "full": {"full", "full-1"},
@@ -476,6 +481,11 @@ def _write_new(path: Path, raw: bytes, label: str) -> None:
 
 def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = None) -> dict[str, object]:
     """Validate exactly 16 calibration triples and write a deterministic bundle."""
+    request_root = request_path.parent.resolve()
+    if bundle_path.parent.resolve() != request_root:
+        raise CalibrationError("outputs:must_share_request_root")
+    if manifest_path is not None and manifest_path.parent.resolve() != request_root:
+        raise CalibrationError("outputs:must_share_request_root")
     request_raw, request_sha, request_bytes = _snapshot(request_path, "request", MAX_REQUEST_BYTES)
     request = parse_json(request_raw, "request")
     if not isinstance(request, dict) or set(request) != REQUEST_KEYS:
@@ -504,7 +514,6 @@ def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = N
     context_bucket_corpora: dict[str, dict[str, set[str]]] = {}
     context_ids: set[str] = set()
     total_points = 0
-    request_root = request_path.parent.resolve()
     for index, item in enumerate(comparisons):
         if not isinstance(item, dict):
             raise CalibrationError(f"comparison:{index}:fields_invalid")
@@ -551,6 +560,15 @@ def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = N
                 raise CalibrationError(f"comparison:{index}:zero_live_metric")
             bucket = f"{cell['profile']}/{cell['regime']}"
             context_bucket_corpora[context][bucket].add(cell["corpus"])
+            if not legacy:
+                # Product batches expose the encoded source byte count as an
+                # authoritative boundary value.  It is not a calibratable
+                # quantity: predictive and live C-to-F bytes must agree
+                # exactly at every joined point.
+                if (p_metrics.get("C_TO_F_bytes", p_metrics["channel_bytes"]) !=
+                        l_metrics.get("C_TO_F_bytes", l_metrics["channel_bytes"])):
+                    raise CalibrationError(
+                        f"comparison:{index}:C_TO_F_bytes_boundary_mismatch")
             for direction in ("C_TO_F_bytes", "F_TO_C_bytes"):
                 p_direction = p_metrics.get(direction, p_metrics["channel_bytes"])
                 l_direction = l_metrics.get(direction, l_metrics["channel_bytes"])
@@ -614,8 +632,9 @@ def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = N
             # migrated legacy fixture therefore intentionally uses the same
             # factor for both directions; explicit v2 evidence must provide
             # directional factors (see FACTOR_FIELDS below).
-            c_factor = _median(ratios.get("C_TO_F_bytes", ratios["channel_bytes"]),
-                               f"{key}:C_TO_F_bytes")
+            c_factor = (1.0 if context != "C1F1/legacy" else
+                        _median(ratios.get("C_TO_F_bytes", ratios["channel_bytes"]),
+                                f"{key}:C_TO_F_bytes"))
             f_factor = _median(ratios.get("F_TO_C_bytes", ratios["channel_bytes"]),
                                f"{key}:F_TO_C_bytes")
             elapsed_factor = _median(ratios["elapsed_ns"], f"{key}:elapsed_ns")

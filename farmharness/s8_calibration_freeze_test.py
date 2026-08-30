@@ -135,6 +135,17 @@ def _explicitize(root: Path, comparisons: list[dict[str, object]],
         target = root / "explicit" / f"{topology}-{depth}" / Path(source).parent.name
         target.mkdir(parents=True, exist_ok=True)
         raw = source.read_bytes()
+        records = [json.loads(line) for line in raw.splitlines()]
+        predicted_channels = [row["cumulative"]["channel_bytes"]
+                              for row in records[0]["raw_cumulative_curve"]]
+        for record in records[:2]:
+            for index, row in enumerate(record["raw_cumulative_curve"]):
+                total = row["cumulative"]["channel_bytes"]
+                if "C_TO_F_bytes" not in row["cumulative"]:
+                    c_to_f = max(1, min(predicted_channels[index], total) - 1)
+                    row["cumulative"].update({"C_TO_F_bytes": c_to_f,
+                                               "F_TO_C_bytes": total - c_to_f})
+        raw = b"".join(canonical_bytes(record) + b"\n" for record in records)
         records_path = target / "records.jsonl"
         records_path.write_bytes(raw)
         authority = {
@@ -205,13 +216,15 @@ def test_records_tampering_is_rejected_by_bound_sha256(tmp_path: Path) -> None:
 
 def test_bundle_is_deterministic_and_calibration_improves_synthetic_error(tmp_path: Path) -> None:
     request, _ = _request(tmp_path)
-    first_bundle = tmp_path / "first" / "bundle.json"
-    first_manifest = tmp_path / "first" / "manifest.json"
-    second_bundle = tmp_path / "second" / "bundle.json"
-    second_manifest = tmp_path / "second" / "manifest.json"
+    first_bundle = tmp_path / "first-bundle.json"
+    first_manifest = tmp_path / "first-manifest.json"
+    second_bundle = tmp_path / "second-bundle.json"
+    second_manifest = tmp_path / "second-manifest.json"
     first = freeze(request, first_bundle, first_manifest)
     second = freeze(request, second_bundle, second_manifest)
-    assert first == second
+    assert {key: value for key, value in first.items() if key != "bundle"} == {
+        key: value for key, value in second.items() if key != "bundle"
+    }
     assert first_bundle.read_bytes() == second_bundle.read_bytes()
     bundle = json.loads(first_bundle.read_bytes())
     scales = bundle["calibration"]["scales"]
@@ -423,11 +436,12 @@ def test_v2_freeze_preserves_directional_factors(tmp_path: Path) -> None:
             for row in record["raw_cumulative_curve"]:
                 total = row["cumulative"]["channel_bytes"]
                 if record["record_type"] == "predictive_sim":
-                    row["cumulative"].update({"C_TO_F_bytes": total * 0.6,
-                                               "F_TO_C_bytes": total * 0.4})
-                else:
                     row["cumulative"].update({"C_TO_F_bytes": total * 0.8,
                                                "F_TO_C_bytes": total * 0.2})
+                else:
+                    c_to_f = min(80.0 if total <= 150.0 else 160.0, total - 1.0)
+                    row["cumulative"].update({"C_TO_F_bytes": c_to_f,
+                                               "F_TO_C_bytes": total - c_to_f})
         raw = b"".join(canonical_bytes(record) + b"\n" for record in records)
         path.write_bytes(raw)
         comparison["records"].update({"sha256": hashlib.sha256(raw).hexdigest(),
@@ -440,8 +454,44 @@ def test_v2_freeze_preserves_directional_factors(tmp_path: Path) -> None:
     bundle = tmp_path / "bundle.json"
     freeze(request, bundle)
     scales = json.loads(bundle.read_bytes())["calibration"]["scales"]
-    assert scales["C1F1/100/ZSTD_TU/cold"]["C_TO_F_bytes"] == pytest.approx(5 / 3)
-    assert scales["C1F1/100/ZSTD_TU/cold"]["F_TO_C_bytes"] == pytest.approx(5 / 8)
+    assert scales["C1F1/100/ZSTD_TU/cold"]["C_TO_F_bytes"] == pytest.approx(1.0)
+    assert scales["C1F1/100/ZSTD_TU/cold"]["F_TO_C_bytes"] == pytest.approx(2.25)
+
+
+def test_v2_freeze_rejects_predictive_source_byte_mismatch(tmp_path: Path) -> None:
+    request, comparisons = _request(tmp_path)
+    for comparison in comparisons:
+        comparison["topology"] = "C1F1"
+        comparison["depth_class"] = "100"
+        path = tmp_path / comparison["records"]["path"]
+        records = [json.loads(line) for line in path.read_bytes().splitlines()]
+        for row in records[0]["raw_cumulative_curve"]:
+            total = row["cumulative"]["channel_bytes"]
+            row["cumulative"].update({"C_TO_F_bytes": total * 0.6,
+                                       "F_TO_C_bytes": total * 0.4})
+        raw = b"".join(canonical_bytes(record) + b"\n" for record in records)
+        path.write_bytes(raw)
+        comparison["records"].update({"sha256": hashlib.sha256(raw).hexdigest(),
+                                       "bytes": len(raw)})
+    _explicitize(tmp_path, comparisons, "C1F1", "100")
+    path = tmp_path / comparisons[0]["records"]["path"]
+    records = [json.loads(line) for line in path.read_bytes().splitlines()]
+    row = records[0]["raw_cumulative_curve"][0]
+    row["cumulative"]["C_TO_F_bytes"] -= 1
+    row["cumulative"]["F_TO_C_bytes"] += 1
+    raw = b"".join(canonical_bytes(record) + b"\n" for record in records)
+    path.write_bytes(raw)
+    comparisons[0]["records"].update({"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)})
+    authority_path = path.parent / "experiment_manifest.json"
+    authority = json.loads(authority_path.read_bytes())
+    authority["records"].update({"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)})
+    authority_path.write_bytes(canonical_bytes(authority) + b"\n")
+    request.write_bytes(canonical_bytes({
+        "schema": REQUEST_SCHEMA, "semantics": SEMANTICS,
+        "predictor": PREDICTOR, "comparisons": comparisons,
+    }) + b"\n")
+    with pytest.raises(CalibrationError, match="C_TO_F_bytes_boundary_mismatch"):
+        freeze(request, tmp_path / "bundle.json")
 
 
 def test_v2_freeze_allows_complete_matrices_in_multiple_contexts(tmp_path: Path) -> None:
@@ -518,3 +568,34 @@ def test_v2_freeze_rejects_missing_cell_within_one_context(tmp_path: Path) -> No
     request.write_bytes(canonical_bytes(value) + b"\n")
     with pytest.raises(CalibrationError, match="missing_cells:C1F20/200"):
         freeze(request, tmp_path / "bundle.json")
+
+
+def test_derived_repeat_full_binds_depth_class_and_full_2_pass(tmp_path: Path) -> None:
+    request, comparisons = _request(tmp_path)
+    for comparison in comparisons:
+        comparison["topology"] = "C1F1"
+        comparison["depth_class"] = "repeat-full"
+    _explicitize(tmp_path, comparisons, "C1F1", "full")
+    # The source experiment remains ``depth=full``; the packager's
+    # state-carrying class and pass identity are what bind repeat-full.
+    for comparison in comparisons:
+        authority_path = (tmp_path / comparison["records"]["path"]).parent / "experiment_manifest.json"
+        authority = json.loads(authority_path.read_bytes())
+        authority["depth"] = "full"
+        authority["depth_class"] = "repeat-full"
+        authority["pass_id"] = "full-2"
+        authority["runs"] = ["full-1", "full-2"]
+        authority_path.write_bytes(canonical_bytes(authority) + b"\n")
+    request.write_bytes(canonical_bytes({
+        "schema": REQUEST_SCHEMA, "semantics": SEMANTICS,
+        "predictor": PREDICTOR, "comparisons": comparisons,
+    }) + b"\n")
+    manifest = freeze(request, tmp_path / "bundle.json")
+    assert manifest["inputs"][0]["pass_id"] == "full-2"
+    assert json.loads((tmp_path / "bundle.json").read_bytes())["calibration"]["contexts"] == ["C1F1/repeat-full"]
+
+
+def test_freeze_rejects_outputs_outside_request_root(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    with pytest.raises(CalibrationError, match="must_share_request_root"):
+        freeze(request, tmp_path / "other" / "bundle.json")
