@@ -213,6 +213,18 @@ def _sha256(value: object, label: str) -> str:
     return value.lower()
 
 
+def _authority_calibration_metadata(value: object, label: str) -> dict[str, str]:
+    if not isinstance(value, dict) or set(value) != CALIBRATION_METADATA_FIELDS:
+        raise PredictionError(f"{label}:fields_invalid")
+    result = {}
+    for field in CALIBRATION_METADATA_FIELDS - {"ordered_input_class"}:
+        result[field] = _sha256(value[field], f"{label}.{field}")
+    if value["ordered_input_class"] != "ordered":
+        raise PredictionError(f"{label}.ordered_input_class:invalid")
+    result["ordered_input_class"] = "ordered"
+    return result
+
+
 def _artifact_path(base: Path, value: object, label: str) -> Path:
     if not isinstance(value, dict) or set(value) != ARTIFACT_KEYS:
         raise PredictionError(f"{label}:descriptor_invalid")
@@ -290,6 +302,7 @@ def load_calibration_bundle(manifest_path: Path) -> dict[str, object]:
     # Bind each evidence cell together with its topology/depth context.  The
     # same corpus/profile/regime is expected to recur across contexts.
     seen_cells: set[tuple[str, str]] = set()
+    authority_metadata_by_binding: dict[tuple[str, str], dict[str, str]] = {}
     binding_contexts: set[str] = set()
     # v2 bundles emitted from a legacy v1 request retain the v2 envelope but
     # intentionally have unscoped legacy bindings.  Keep that migration path
@@ -406,6 +419,10 @@ def load_calibration_bundle(manifest_path: Path) -> dict[str, object]:
                     type(records_descriptor["bytes"]) is not int or
                     records_descriptor["bytes"] != binding["records_bytes"]):
                 raise PredictionError("calibration_experiment_manifest:records_descriptor_mismatch")
+            authority_metadata_by_binding[(f"{topology}/{depth_class}", cell_id)] = (
+                _authority_calibration_metadata(
+                    manifest.get("calibration_metadata"),
+                    "calibration_experiment_manifest:calibration_metadata"))
             _authenticate(records_path,
                           {"path": path, "sha256": digest, "bytes": binding["records_bytes"]},
                           "calibration_records")
@@ -454,6 +471,11 @@ def load_calibration_bundle(manifest_path: Path) -> dict[str, object]:
                 _sha256(identity[field], f"calibration.identity.{field}")
             if identity["ordered_input_class"] != "ordered":
                 raise PredictionError("calibration_bundle:ordered_input_class_invalid")
+            if (set(authority_metadata_by_binding) != seen_cells or
+                    any(metadata != identity
+                        for metadata in authority_metadata_by_binding.values())):
+                raise PredictionError(
+                    "calibration_experiment_manifest:calibration_metadata_mismatch")
         contexts = calibration.get("contexts")
         if (not isinstance(contexts, list) or not contexts or
                 any(not isinstance(context, str) or "/" not in context for context in contexts)):

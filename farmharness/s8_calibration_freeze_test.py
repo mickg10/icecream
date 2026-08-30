@@ -611,6 +611,29 @@ def test_loader_rejects_invalid_adjacent_context_authority(tamper: str, tmp_path
         load_calibration_bundle(manifest)
 
 
+@pytest.mark.parametrize("mutation", ("missing_host", "changed_host"))
+def test_loader_binds_authority_calibration_metadata_to_frozen_identity(
+        mutation: str, tmp_path: Path) -> None:
+    bundle, manifest = _explicit_bundle(tmp_path)
+    value = json.loads(bundle.read_bytes())
+    binding = value["inputs"][0]
+    authority_path = tmp_path / binding["experiment_manifest"]["path"]
+    authority = json.loads(authority_path.read_bytes())
+    if mutation == "missing_host":
+        del authority["calibration_metadata"]["host_digest"]
+    else:
+        authority["calibration_metadata"]["host_digest"] = "e" * 64
+    authority_path.write_bytes(canonical_bytes(authority) + b"\n")
+    raw = authority_path.read_bytes()
+    binding["experiment_manifest"] = {
+        "path": str(authority_path.relative_to(tmp_path)),
+        "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw),
+    }
+    _refresh_loaded_bundle(bundle, manifest, value)
+    with pytest.raises(PredictionError, match="calibration_experiment_manifest:calibration_metadata"):
+        load_calibration_bundle(manifest)
+
+
 def test_loader_reports_inferred_c1f20_context_in_sidecar(tmp_path: Path) -> None:
     bundle, manifest = _explicit_bundle(tmp_path, "C1F20", "full")
     predictive_manifest = _engine_inputs(tmp_path / "engine")
