@@ -30,6 +30,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -844,6 +845,52 @@ void test_live_global_resource_trace() {
 
     if (const char* path = std::getenv("P50_ENDPOINT_GLOBAL_TRACE_PATH"))
         write_global_trace(trace, path);
+}
+
+void test_automatic_action_trace_is_complete_past_1024_records() {
+    char trace_path[] = "/tmp/p50endpoint-f-action-trace-XXXXXX";
+    const int trace_fd = ::mkstemp(trace_path);
+    require(trace_fd >= 0, "automatic action-trace fixture could not create a path");
+    require(::close(trace_fd) == 0 && ::unlink(trace_path) == 0,
+            "automatic action-trace fixture could not prepare an absent path");
+    require(::setenv("ICECC_P50_F_ACTION_TRACE", trace_path, 1) == 0,
+            "automatic action-trace fixture could not enable the F sink");
+
+    {
+        P50ServerEndpoint server(Id128::from_u64(15101));
+        TestClient client(Id128::from_u64(15102));
+        for (uint64_t index = 0; index != 129; ++index) {
+            const std::vector<uint8_t> input{
+                static_cast<uint8_t>(index),
+                static_cast<uint8_t>(index >> 8),
+                0x50,
+                0x38,
+            };
+            const PreparedTuHandle prepared = admit(client, input);
+            const PairResult result = run_pair(client, server, prepared);
+            require(result.client.status == ClientRunStatus::Committed &&
+                        result.server.status == ServerRunStatus::Completed &&
+                        result.server.committed_input.has_value(),
+                    "automatic action-trace fixture failed a product transaction");
+            server.close_input_job(*result.server.committed_input);
+            server.collect_input_garbage();
+            require(client.authority->release(prepared) == 0,
+                    "automatic action-trace fixture retained a preparation");
+        }
+    }
+
+    require(::unsetenv("ICECC_P50_F_ACTION_TRACE") == 0,
+            "automatic action-trace fixture could not disable the F sink");
+    std::ifstream trace(trace_path, std::ios::binary);
+    require(static_cast<bool>(trace),
+            "automatic action-trace fixture did not create its requested trace");
+    const std::string contents((std::istreambuf_iterator<char>(trace)),
+                               std::istreambuf_iterator<char>());
+    require(static_cast<size_t>(std::count(contents.begin(), contents.end(), '\n')) > 1024 &&
+                contents.find("\"tu_seq\":128") != std::string::npos,
+            "automatically owned action trace truncated after 1024 records");
+    require(::unlink(trace_path) == 0,
+            "automatic action-trace fixture could not remove its trace");
 }
 
 bool s3_resource_storm_requested() {
@@ -5975,6 +6022,7 @@ int main(int argc, char** argv) {
 #endif
     test_p29_endpoint_route_dialogue_lifetime();
     test_live_global_resource_trace();
+    test_automatic_action_trace_is_complete_past_1024_records();
     if (s3_resource_storm_requested())
         test_s3_resource_storm_product_path();
     report_zstd1_metrics(performance_gate);

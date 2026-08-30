@@ -1429,7 +1429,7 @@ struct P50ClientEndpoint::Impl {
           on_run_admitted(std::move(admitted_callback)),
           on_run_terminal(std::move(terminal_callback)) {
         if (actions == nullptr && action_trace_sink_enabled()) {
-            owned_actions = std::make_unique<ActionTrace>(1024);
+            owned_actions = std::make_unique<ActionTrace>();
             actions = owned_actions.get();
         }
         if (!preparation)
@@ -1695,7 +1695,7 @@ struct P50ServerEndpoint::Impl {
               config_value.global_resource_trace)),
           config(std::move(config_value)) {
         if (actions == nullptr && action_trace_sink_enabled()) {
-            owned_actions = std::make_unique<ActionTrace>(1024);
+            owned_actions = std::make_unique<ActionTrace>();
             actions = owned_actions.get();
         }
         if (f_guid == FStoreGuid{})
