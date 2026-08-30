@@ -51,6 +51,20 @@ def _sha40(value: object, label: str) -> str:
     return value.lower()
 
 
+def _authority_calibration_metadata(authority: dict[str, Any]) -> dict[str, str]:
+    """Use only metadata explicitly authenticated by the retained authority."""
+    value = authority.get("calibration_metadata")
+    if not isinstance(value, dict) or "host_digest" not in value:
+        raise PackagingError(
+            "source_experiment_manifest.calibration_metadata:host_digest_missing"
+        )
+    try:
+        return normalizer._validate_calibration_metadata(
+            value, "source_experiment_manifest.calibration_metadata")
+    except normalizer.NormalizationError as exc:
+        raise PackagingError(str(exc)) from exc
+
+
 def _read(path: Path, label: str, limit: int = 8 * 1024 * 1024) -> tuple[bytes, dict[str, Any]]:
     try:
         raw, facts = normalizer._snapshot(path, label, limit)
@@ -118,10 +132,12 @@ def _authority(source_dir: Path, pass_id: str) -> tuple[dict[str, Any], Path, di
     if not isinstance(plans, dict) or pass_id not in plans:
         raise PackagingError("source.predictive_plan_sha256_by_run:pass_missing")
     _sha(plans[pass_id], "source.predictive_plan_sha256_by_run")
+    metadata = _authority_calibration_metadata(authority)
     return authority, selected, {"path": manifest_path, "facts": authority_facts, "cell": cell,
                                  "split": split, "topology": topology, "suite": suite,
                                  "depth": depth, "declared_count": declared_count, "runs": runs,
-                                 "plan_sha256": plans[pass_id].lower()}
+                                 "plan_sha256": plans[pass_id].lower(),
+                                 "calibration_metadata": metadata}
 
 
 def _bind_live(authority: dict[str, Any], live: dict[str, Any], cell: tuple[str, str, str],
@@ -175,7 +191,9 @@ def package(predictive_manifest: Path, source_dir: Path, pass_id: str,
         raise PackagingError("output:timestamp_collision")
     records_path = out / "records.jsonl"
     try:
-        records = normalizer.normalize(predictive_manifest, live_manifest, records_path)
+        records = normalizer.normalize(
+            predictive_manifest, live_manifest, records_path,
+            authenticated_metadata=source["calibration_metadata"])
     except normalizer.NormalizationError as exc:
         raise PackagingError(f"normalization:{exc}") from exc
     records_raw, records_facts = _read(records_path, "records")
@@ -191,6 +209,7 @@ def package(predictive_manifest: Path, source_dir: Path, pass_id: str,
         "live_curve_manifest": _descriptor(live_manifest, live_facts),
         "source_experiment_manifest": _descriptor(source["path"], source["facts"]),
         "predictive_plan_sha256": source["plan_sha256"], "comparison_scored": True,
+        "calibration_metadata": source["calibration_metadata"],
     }
     raw = normalizer.canonical_bytes(manifest) + b"\n"
     manifest_path = out / "experiment_manifest.json"

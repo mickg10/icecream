@@ -67,6 +67,7 @@ def _triple(root: Path, cell: dict[str, str], context: str) -> tuple[str, dict[s
                  "depth": "full" if depth == "repeat-full" else depth,
                  "depth_class": depth, "pass_id": pass_id,
                  "runs": ["full-1", "full-2"] if depth == "repeat-full" else ["full-1"],
+                 "calibration_metadata": dict(META),
                  "records": {"path": "records.jsonl", "sha256": hashlib.sha256(raw).hexdigest(),
                              "bytes": len(raw)}}
     (root / "experiment_manifest.json").write_bytes(canonical_bytes(authority) + b"\n")
@@ -104,6 +105,9 @@ def test_complete_slices_pool_ftoc_and_retain_loo_diagnostics(tmp_path: Path) ->
     assert scales["C1F1/100/ZSTD_TU/cold"]["F_TO_C_bytes"] == pytest.approx(
         scales["C1F20/100/GRZ_RESIDUAL/warm"]["F_TO_C_bytes"])
     assert bundle["calibration"]["diagnostics"]["leave_one_corpus_out"]["fmt"]["non_vacuous"]
+    assert bundle["calibration"]["diagnostics"]["leave_one_corpus_out"]["fmt"][
+        "p95_abs_log_ratio_error"] >= 0
+    assert bundle["calibration"]["diagnostics"]["leave_one_depth_out"]["full"]["count"] > 0
     assert manifest["inputs"]
 
     subset_root = tmp_path / "subset"

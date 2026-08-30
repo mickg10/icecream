@@ -82,6 +82,19 @@ class NormalizationError(ValueError):
     """Raised for any unauthenticated, ambiguous, or mismatched input."""
 
 
+def _validate_calibration_metadata(value: object,
+                                   label: str = "calibration_metadata") -> dict[str, str]:
+    if not isinstance(value, dict) or set(value) != CALIBRATION_METADATA_KEYS:
+        raise NormalizationError(f"{label}:fields_invalid")
+    result: dict[str, str] = {}
+    for field in CALIBRATION_METADATA_KEYS - {"ordered_input_class"}:
+        result[field] = _sha(value[field], f"{label}.{field}")
+    if value["ordered_input_class"] not in ORDERED_INPUT_CLASSES:
+        raise NormalizationError(f"{label}.ordered_input_class:invalid")
+    result["ordered_input_class"] = value["ordered_input_class"]
+    return result
+
+
 def canonical_bytes(value: object) -> bytes:
     try:
         return json.dumps(
@@ -365,12 +378,8 @@ def _validate_manifest_metadata(value: dict[str, object]) -> dict[str, str]:
         missing = ",".join(sorted(CALIBRATION_METADATA_KEYS - calibration_fields))
         raise NormalizationError(f"manifest.calibration_metadata_missing:{missing}")
     if calibration_fields:
-        for field in CALIBRATION_METADATA_KEYS - {"ordered_input_class"}:
-            result[field] = _sha(value[field], f"manifest.{field}")
-        ordered = value["ordered_input_class"]
-        if ordered not in ORDERED_INPUT_CLASSES:
-            raise NormalizationError("manifest.ordered_input_class:invalid")
-        result["ordered_input_class"] = ordered
+        result.update(_validate_calibration_metadata(
+            {field: value[field] for field in CALIBRATION_METADATA_KEYS}, "manifest"))
     return result
 
 
@@ -653,7 +662,8 @@ def _write_new(path: Path, records: list[dict[str, object]]) -> None:
         raise NormalizationError(f"output_write_failed:{path}") from exc
 
 
-def normalize(predictive_manifest: Path, live_manifest: Path, out: Path) -> list[dict[str, object]]:
+def normalize(predictive_manifest: Path, live_manifest: Path, out: Path,
+              authenticated_metadata: dict[str, str] | None = None) -> list[dict[str, object]]:
     """Authenticate, align, and write exactly three normalized records."""
     predictive = _load_manifest(predictive_manifest, "predictive_sim")
     live = _load_manifest(live_manifest, "live")
@@ -670,6 +680,14 @@ def normalize(predictive_manifest: Path, live_manifest: Path, out: Path) -> list
     _same_identity(p_identity, l_identity, predictive["comparison"], live["comparison"])
     _same_units(p_units, l_units)
     _same_metadata(predictive["metadata"], live["metadata"])
+    if authenticated_metadata is not None:
+        authority_metadata = _validate_calibration_metadata(authenticated_metadata)
+        for artifact in (predictive, live):
+            metadata = artifact["metadata"]
+            assert isinstance(metadata, dict)
+            if metadata and metadata != authority_metadata:
+                raise NormalizationError("authority_metadata:mismatch")
+            artifact["metadata"] = authority_metadata
     predictive_record = _normalized_record("predictive_sim", predictive)
     live_record = _normalized_record("live", live)
     comparison_record = _comparison(predictive, live, p_identity, p_units)

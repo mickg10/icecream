@@ -53,6 +53,7 @@ CALIBRATION_METADATA_FIELDS = (
     "host_digest", "ordered_input_class",
 )
 EXPLICIT_DEPTH_CLASSES = ("100", "200", "full", "repeat-full")
+FTOC_DEPTH_CLASSES = ("100", "200", "full")
 EXPLICIT_CONTEXTS = tuple(
     f"{topology}/{depth_class}"
     for topology in TOPOLOGIES for depth_class in EXPLICIT_DEPTH_CLASSES
@@ -236,8 +237,9 @@ def _descriptor(value: object, base: Path, label: str) -> tuple[Path, str, int]:
 
 
 def _explicit_experiment_authority(records_path: Path, cell: dict[str, str],
-                                   topology: str, depth_class: str,
-                                   label: str) -> tuple[Path, str, dict[str, object]]:
+                                       topology: str, depth_class: str,
+                                       label: str) -> tuple[Path, str, dict[str, object],
+                                                             dict[str, str]]:
     """Authenticate the PASS experiment that produced one explicit context.
 
     Context fields in a request are hints until the adjacent experiment
@@ -292,7 +294,12 @@ def _explicit_experiment_authority(records_path: Path, cell: dict[str, str],
     del actual_raw
     if actual_sha != expected_sha or actual_bytes != records_descriptor["bytes"]:
         raise CalibrationError(f"{label}:experiment_manifest_records_authentication_failed")
-    return manifest_path, pass_id, {"sha256": digest, "bytes": size}
+    try:
+        metadata = _calibration_metadata(authority.get("calibration_metadata"),
+                                         f"{label}.experiment_manifest.calibration_metadata")
+    except CalibrationError as exc:
+        raise CalibrationError(f"{label}:authority_calibration_metadata_missing") from exc
+    return manifest_path, pass_id, {"sha256": digest, "bytes": size}, metadata
 
 
 def _finite_nonnegative(value: object, label: str) -> int | float:
@@ -520,6 +527,24 @@ def _geometric_median(log_values: list[float], label: str) -> float:
     return estimate
 
 
+def _log_residual_summary(values: list[float], label: str) -> dict[str, object]:
+    if not values:
+        raise CalibrationError(f"{label}:no_samples")
+    ordered = sorted(values)
+    position = max(0, min(len(ordered) - 1, math.ceil(.95 * len(ordered)) - 1))
+    middle = len(ordered) // 2
+    median = (ordered[middle] if len(ordered) % 2 else
+              (ordered[middle - 1] + ordered[middle]) / 2)
+    if not all(math.isfinite(value) and value >= 0 for value in ordered):
+        raise CalibrationError(f"{label}:invalid_residual")
+    return {
+        "count": len(ordered),
+        "median_abs_log_ratio_error": median,
+        "p95_abs_log_ratio_error": ordered[position],
+        "max_abs_log_ratio_error": ordered[-1],
+    }
+
+
 def _write_new(path: Path, raw: bytes, label: str) -> None:
     if path.exists() or path.is_symlink():
         raise CalibrationError(f"{label}:output_already_exists:{path}")
@@ -567,6 +592,7 @@ def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = N
     context_bucket_ratios: dict[str, dict[str, dict[str, list[float]]]] = {}
     context_bucket_corpora: dict[str, dict[str, set[str]]] = {}
     f_log_ratios: dict[str, list[float]] = {}
+    f_log_samples: list[tuple[str, str, float]] = []
     elapsed_groups: dict[str, list[float]] = {}
     metadata_identity: dict[str, str] | None = None
     metadata_by_record: list[tuple[str, str, str]] = []
@@ -599,9 +625,9 @@ def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = N
         seen.add(identity)
         records_path, records_sha, records_bytes = _descriptor(
             item["records"], request_root, f"comparison:{index}.records")
-        experiment_manifest_path = pass_id = authority_facts = None
+        experiment_manifest_path = pass_id = authority_facts = authority_metadata = None
         if not legacy:
-            experiment_manifest_path, pass_id, authority_facts = _explicit_experiment_authority(
+            experiment_manifest_path, pass_id, authority_facts, authority_metadata = _explicit_experiment_authority(
                 records_path, cell, topology, depth_class, f"comparison:{index}")
         records_raw, actual_sha, actual_bytes = _snapshot(records_path, "records", MAX_RECORDS_BYTES)
         if actual_sha != records_sha or actual_bytes != records_bytes:
@@ -611,10 +637,11 @@ def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = N
             require_directional=not legacy, require_metadata=not legacy)
         if not legacy:
             if metadata_identity is None:
-                metadata_identity = record_metadata
-            elif record_metadata != metadata_identity:
+                metadata_identity = authority_metadata
+            if record_metadata != authority_metadata or record_metadata != metadata_identity:
                 raise CalibrationError(f"comparison:{index}:calibration_metadata_mismatch")
-            metadata_by_record.append((cell["corpus"], topology, depth_class))
+            metadata_by_record.append((cell["corpus"], topology,
+                                       "full" if depth_class == "repeat-full" else depth_class))
         p_curve = _curve(predictive["raw_cumulative_curve"], cell,
                          f"comparison:{index}.predictive", require_directional=not legacy)
         l_curve = _curve(live["raw_cumulative_curve"], cell,
@@ -649,7 +676,10 @@ def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = N
                         raise CalibrationError(f"comparison:{index}:ratio_nonpositive")
                 ratio = float(l_direction) / float(p_direction)
                 if direction == "F_TO_C_bytes" and not legacy:
-                    f_log_ratios.setdefault(depth_class, []).append(math.log(ratio))
+                    fit_depth = "full" if depth_class == "repeat-full" else depth_class
+                    log_ratio = math.log(ratio)
+                    f_log_ratios.setdefault(fit_depth, []).append(log_ratio)
+                    f_log_samples.append((cell["corpus"], fit_depth, log_ratio))
                 else:
                     context_bucket_ratios[context][bucket].setdefault(direction, []).append(ratio)
             elapsed_ratio = float(l_metrics["elapsed_ns"]) / float(p_metrics["elapsed_ns"])
@@ -668,7 +698,7 @@ def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = N
         }
         if not legacy:
             assert experiment_manifest_path is not None and pass_id is not None
-            assert authority_facts is not None
+            assert authority_facts is not None and authority_metadata is not None
             binding.update({
                 "experiment_manifest": {
                     "path": str(experiment_manifest_path.relative_to(request_root)),
@@ -721,7 +751,7 @@ def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = N
     scales: dict[str, dict[str, float]] = {}
     f_factors: dict[str, float] = {}
     if not legacy_request:
-        for depth_class in EXPLICIT_DEPTH_CLASSES:
+        for depth_class in FTOC_DEPTH_CLASSES:
             f_factors[depth_class] = _geometric_median(
                 f_log_ratios.get(depth_class, []),
                 f"F_TO_C_bytes/{depth_class}")
@@ -745,7 +775,9 @@ def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = N
                                 f"{key}:C_TO_F_bytes"))
             f_factor = (_geometric_median(ratios.get("F_TO_C_bytes", ratios["channel_bytes"]),
                                           f"{key}:F_TO_C_bytes")
-                        if legacy_request else f_factors[context.split("/", 1)[1]])
+                        if legacy_request else f_factors[
+                            "full" if context.split("/", 1)[1] == "repeat-full"
+                            else context.split("/", 1)[1]])
             elapsed_samples = (ratios["elapsed_ns"] if legacy_request else
                                elapsed_groups.get(f"{context.split('/', 1)[0]}/{bucket_id}", []))
             elapsed_factor = _median(elapsed_samples, f"{key}:elapsed_ns")
@@ -759,28 +791,43 @@ def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = N
             else:
                 scales[key] = {"C_TO_F_bytes": c_factor, "F_TO_C_bytes": f_factor,
                                "elapsed_ns": elapsed_factor}
-    diagnostics = {
-        "leave_one_corpus_out": {
-            corpus: {
-                "excluded": corpus,
-                "samples": sum(1 for record_corpus, _topology, _depth in metadata_by_record
-                                if record_corpus != corpus),
-                "non_vacuous": any(record_corpus != corpus
-                                    for record_corpus, _topology, _depth in metadata_by_record),
+    if legacy_request:
+        diagnostics = {
+            "leave_one_corpus_out": {corpus: {"excluded": corpus, "samples": 0,
+                                                "non_vacuous": False}
+                                     for corpus in CORPORA},
+            "leave_one_depth_out": {"legacy": {"excluded": "legacy", "samples": 0,
+                                                  "non_vacuous": False}},
+        }
+    else:
+        corpus_diagnostics: dict[str, object] = {}
+        for excluded in ("fmt", "RocksDB"):
+            train_by_depth = {
+                depth: [log_ratio for corpus, depth_value, log_ratio in f_log_samples
+                        if corpus != excluded and depth_value == depth]
+                for depth in FTOC_DEPTH_CLASSES
             }
-            for corpus in CORPORA
-        },
-        "leave_one_depth_out": {
-            depth_class: {
-                "excluded": depth_class,
-                "samples": sum(1 for _corpus, _topology, record_depth in metadata_by_record
-                                if record_depth != depth_class),
-                "non_vacuous": any(record_depth != depth_class
-                                    for _corpus, _topology, record_depth in metadata_by_record),
-            }
-            for depth_class in (EXPLICIT_DEPTH_CLASSES if not legacy_request else ("legacy",))
-        },
-    }
+            heldout = [(depth, log_ratio) for corpus, depth, log_ratio in f_log_samples
+                       if corpus == excluded]
+            residuals = [abs(log_ratio - math.log(_geometric_median(
+                train_by_depth[depth], f"diagnostic.corpus.{excluded}.{depth}")))
+                         for depth, log_ratio in heldout]
+            summary = _log_residual_summary(residuals, f"diagnostic.corpus.{excluded}")
+            summary.update({"excluded": excluded, "non_vacuous": True})
+            corpus_diagnostics[excluded] = summary
+        depth_diagnostics: dict[str, object] = {}
+        for excluded in FTOC_DEPTH_CLASSES:
+            train = [log_ratio for _corpus, depth, log_ratio in f_log_samples
+                     if depth != excluded]
+            heldout = [log_ratio for _corpus, depth, log_ratio in f_log_samples
+                       if depth == excluded]
+            fit = math.log(_geometric_median(train, f"diagnostic.depth.{excluded}"))
+            summary = _log_residual_summary([abs(log_ratio - fit) for log_ratio in heldout],
+                                            f"diagnostic.depth.{excluded}")
+            summary.update({"excluded": excluded, "non_vacuous": True})
+            depth_diagnostics[excluded] = summary
+        diagnostics = {"leave_one_corpus_out": corpus_diagnostics,
+                       "leave_one_depth_out": depth_diagnostics}
     bundle = {
         "schema": BUNDLE_SCHEMA,
         "semantics": SEMANTICS,
