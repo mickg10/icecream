@@ -1790,6 +1790,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                     "units": manifest_value["units"],
                     "provenance": manifest_value["provenance"], "manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
                     "curve_sha256": hashlib.sha256(curve_raw).hexdigest(), "rows": curve,
+                    "metadata": normalizer._validate_manifest_metadata(manifest_value),
                     "evidence": manifest_value["evidence"]}
         records.append(normalizer._normalized_record("live", artifact))
         manifests[run] = manifest_name

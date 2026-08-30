@@ -1092,3 +1092,62 @@ def test_runner_curve_is_accepted_by_current_live_intake(tmp_path: Path) -> None
     artifact = _load_live_curve(manifest_path,
                                 cell={key: identity[key] for key in ("corpus", "profile", "regime")})
     assert artifact["provenance"]["producer"] == "s8_real_c1f1_live_runner"
+
+
+def test_finalize_supplies_optional_metadata_to_normalized_live_record(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The terminal path is deletion-sensitive at the normalizer boundary."""
+    batch_manifest = tmp_path / "batch.jsonl"
+    batch_manifest.write_bytes(b"batch\n")
+    topology = tmp_path / "topology.json"
+    topology.write_bytes(canonical_bytes({"assignments": []}) + b"\n")
+    predictive_plan = tmp_path / "predictive-plan.json"
+    predictive_plan.write_bytes(b"{}\n")
+    work = tmp_path / "p50compilee2e.run"
+    work.mkdir()
+    (work / "s7-measured-c-action-trace.jsonl").write_bytes(b"c-action\n")
+    (work / "s7-measured-f-action-trace.jsonl").write_bytes(b"f-action\n")
+    rows = [{"tu_id": "tu-0"}]
+    plan = {"source_manifest": {"sha256": "a" * 64},
+            "scheduling": {"topology": runner.TOPOLOGY,
+                            "assignments": [{"ordinal": 0, "global_slot": 0}]}}
+    plan_sha = hashlib.sha256(predictive_plan.read_bytes()).hexdigest()
+    topology_sha = hashlib.sha256(topology.read_bytes()).hexdigest()
+    monkeypatch.setattr(runner, "load_predictive_plan",
+                        lambda *_args, **_kwargs: (plan, [{"ordinal": 0}], plan_sha))
+    monkeypatch.setattr(runner, "load_batch_manifest", lambda *_args: rows)
+    monkeypatch.setattr(runner, "bind_batch_to_plan", lambda *_args: None)
+    monkeypatch.setattr(runner, "load_topology", lambda *_args: topology_sha)
+    monkeypatch.setattr(runner, "_retained_workdir", lambda *_args, **_kwargs: work)
+    monkeypatch.setattr(runner, "_environment_preparation", lambda *_args: {})
+    monkeypatch.setattr(runner, "_binary_identity", lambda *_args: {"client/icecc": "d" * 64})
+    monkeypatch.setattr(runner, "product_identity",
+                        lambda *_args: ("e" * 40, "f" * 40,
+                                        {"client/icecc": "d" * 64}, "1" * 64))
+    monkeypatch.setattr(runner, "_timing_rows", lambda *_args: [])
+    monkeypatch.setattr(runner, "_batch_windows",
+                        lambda *_args: {"full-1": {"start_ns": 1, "end_ns": 2}})
+    monkeypatch.setattr(runner, "_validate_product_log_evidence", lambda *_args: None)
+    monkeypatch.setattr(runner, "_action_stage", lambda *_args: [])
+    monkeypatch.setattr(
+        runner, "_live_curve_rows",
+        lambda *_args: [{"step": 0, "tu_id": "tu-0",
+                         "cumulative": {"channel_bytes": 1, "elapsed_ns": 1}}])
+    stdout = (
+        "PASS: all-P50 C1F1\n"
+        "S8_BATCH_COUNT=1\n"
+        f"S8_SUITE={runner.TOPOLOGY}\n"
+        "S8_BATCH_PASSES=1\n"
+        "S8_BATCH_WARM=0\n"
+        "S8_SCHEDULING mode=relationship-ordered execution_slots=1 relationships=1 "
+        "planned_admission_lanes_per_relationship=1\n"
+    )
+    output = runner.finalize(
+        stdout, 0, batch_manifest=batch_manifest, topology=topology,
+        predictive_plan=predictive_plan, output=tmp_path / "output",
+        profile="ZSTD_TU", product_root=tmp_path, corpus="DuckDB", regime="cold",
+        depth="full", full_count=1, passes=1, timestamp="20260830T000000Z")
+    records = [json.loads(line) for line in (output / "records.jsonl").read_text().splitlines()]
+    assert len(records) == 1
+    assert records[0]["record_type"] == "live"
+    assert records[0]["provenance"]["producer"] == "s8_real_c1f1_live_runner"
