@@ -1052,7 +1052,11 @@ if test -n "$batch_manifest"; then
                     echo "FAIL: predecessor source admission failed ($run_label-$ordinal)" >&2
                     return 1
                 }
-                sleep 0.005
+                # Every later TU waits here concurrently. A 5 ms external
+                # sleep creates a fork storm at depth 200 and distorts the
+                # product timing it is meant to observe. A 100 ms poll keeps
+                # admission responsive without making the harness the load.
+                sleep 0.1
             done
         fi
 
