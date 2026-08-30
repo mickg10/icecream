@@ -835,7 +835,14 @@ def _environment_preparation(stdout: str, work: Path, suite: str) -> dict[str, A
         _fail("environment_preparation:post_rotation_ready_identity_invalid")
     scheduler_tail = scheduler_log.read_bytes()[scheduler_offset:]
     if expected_relationships == 1:
-        ready_matches = re.findall(rb"RELOGIN p50-f(?:\s|$).*cache=.*cache_profiles=", scheduler_tail)
+        # Real scheduler service names include the platform suffix before the
+        # colon (``p50-f(x86_64):``).  Keep accepting the compact fixture form
+        # while requiring a service-name boundary so p50-f-* cannot satisfy
+        # the single-relationship witness.
+        ready_matches = re.findall(
+            rb"RELOGIN p50-f(?:\([^\r\n()]+\))?:?(?:\s|$)[^\r\n]*cache=[^\r\n]*cache_profiles=",
+            scheduler_tail,
+        )
         if not ready_matches:
             _fail("environment_preparation:post_rotation_ready_absent")
     else:

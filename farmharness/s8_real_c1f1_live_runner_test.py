@@ -310,6 +310,50 @@ def test_environment_preparation_requires_each_private_relationship(tmp_path: Pa
         runner._environment_preparation(missing, work, runner.PARALLEL_TOPOLOGY)
 
 
+def test_environment_preparation_accepts_real_single_scheduler_service_name(
+        tmp_path: Path) -> None:
+    work = tmp_path / "p50compilee2e.ready"
+    work.mkdir()
+    (work / "client-compile-env-warm.log").write_text("has env: false\n")
+    (work / "client-compile-env-ready.log").write_text("has env: true\n")
+    before_c, after_c = "1" * 32, "2" * 32
+    before_f, after_f = "3" * 32, "4" * 32
+
+    def frame(pid: int, c_guid: str, f_guid: str) -> str:
+        return (f"READY v2 generation=1 attempt={pid} pid={pid} "
+                f"C_STORE_GUID={c_guid} F_STORE_GUID={f_guid}\n")
+
+    for role, before_pid, after_pid in (("F", 1001, 2001), ("C", 1002, 2002)):
+        (work / f"ready-{role.lower()}.trace").write_text(
+            frame(before_pid, before_c, before_f) + frame(after_pid, after_c, after_f))
+    old_ready = b"RELOGIN p50-f(x86_64): [] cache=off\n"
+    new_ready = (b"RELOGIN p50-f(x86_64): [env(x86_64), ] cache=127.0.0.1:54320 "
+                 b"cache_wire=v1 cache_protocol=50 cache_profiles=p29 zstd_tu grz z3_long\n")
+    (work / "scheduler.log").write_bytes(old_ready + new_ready)
+    stdout = (
+        "S8_ENV_WARMUP relationship=0 warmup_label=env-warm ready_label=env-ready "
+        "warmup_has_env=false ready_has_env=true preparation_measured=0 "
+        "cache_state=pre_rotation\n"
+        f"S8_SIDECAR_ROTATION role=F relationship=0 before_pid=1001 after_pid=2001 "
+        f"before_c_store_guid={before_c} after_c_store_guid={after_c} "
+        f"before_f_store_guid={before_f} after_f_store_guid={after_f}\n"
+        f"S8_SIDECAR_ROTATION role=C relationship=0 before_pid=1002 after_pid=2002 "
+        f"before_c_store_guid={before_c} after_c_store_guid={after_c} "
+        f"before_f_store_guid={before_f} after_f_store_guid={after_f}\n"
+        f"S8_ENV_POST_ROTATION_READY relationships=1 log_offset={len(old_ready)}\n"
+        f"S8_ENV_PREPARATION relationships=1 archive_sha256={'a' * 64} archive_bytes=31 "
+        "start_ns=10 end_ns=20 measured=0 cache_state=rotated\n"
+        "S8_ENV_MEASURED_NO_INSTALL checked=1\n"
+    )
+    preparation = runner._environment_preparation(stdout, work, runner.TOPOLOGY)
+    assert preparation["post_rotation_ready"]["relationships"] == 1
+
+    (work / "scheduler.log").write_bytes(
+        old_ready + new_ready.replace(b"p50-f(x86_64)", b"p50-f-0(x86_64)"))
+    with pytest.raises(runner.LiveRunnerError, match="post_rotation_ready_absent"):
+        runner._environment_preparation(stdout, work, runner.TOPOLOGY)
+
+
 def test_parallel_cache_session_evidence_comes_from_observed_f_log(tmp_path: Path) -> None:
     (tmp_path / "client-compile-full-1-0.log").write_text("ZSTD_ROUTE\n")
     (tmp_path / "f-7.log").write_text("CACHE_SESSION\n")
