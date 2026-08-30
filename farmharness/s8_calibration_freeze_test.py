@@ -425,6 +425,22 @@ def test_v2_freeze_allows_complete_matrices_in_multiple_contexts(tmp_path: Path)
         item = dict(comparison)
         item["topology"] = "C1F20"
         item["depth_class"] = "200"
+        source = tmp_path / comparison["records"]["path"]
+        target = tmp_path / "explicit" / Path(source).parent.name
+        target.mkdir(parents=True, exist_ok=True)
+        raw = source.read_bytes()
+        (target / "records.jsonl").write_bytes(raw)
+        authority = {
+            "schema": "icecream-s8-derived-experiment-v1", "status": "PASS",
+            "cell": dict(item["cell"]), "split": "calibration",
+            "topology": "C1F20/40", "suite": "C1F20/40", "depth": "200",
+            "depth_class": "200", "pass_id": "pass-200", "runs": ["pass-200"],
+            "records": {"path": "records.jsonl", "sha256": hashlib.sha256(raw).hexdigest(),
+                        "bytes": len(raw)},
+        }
+        (target / "experiment_manifest.json").write_bytes(canonical_bytes(authority) + b"\n")
+        item["records"] = {"path": str((target / "records.jsonl").relative_to(tmp_path)),
+                            "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
         second.append(item)
     value = json.loads(request.read_bytes())
     value["comparisons"] = [*comparisons, *second]
@@ -440,6 +456,15 @@ def test_v2_freeze_allows_complete_matrices_in_multiple_contexts(tmp_path: Path)
     }
     loaded = load_calibration_bundle(tmp_path / "calibration-model-manifest.json")
     assert set(loaded["contexts"]) == {"C1F1/legacy", "C1F20/200"}
+
+
+def test_v2_freeze_rejects_context_relabel_without_adjacent_authority(tmp_path: Path) -> None:
+    request, comparisons = _request(tmp_path)
+    value = json.loads(request.read_bytes())
+    value["comparisons"][0].update({"topology": "C1F20", "depth_class": "200"})
+    request.write_bytes(canonical_bytes(value) + b"\n")
+    with pytest.raises(CalibrationError, match="experiment_manifest"):
+        freeze(request, tmp_path / "bundle.json")
 
 
 def test_v2_freeze_rejects_missing_cell_within_one_context(tmp_path: Path) -> None:

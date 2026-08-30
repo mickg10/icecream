@@ -225,6 +225,73 @@ def _descriptor(value: object, base: Path, label: str) -> tuple[Path, str, int]:
     return path, digest, actual_bytes
 
 
+def _explicit_experiment_authority(records_path: Path, cell: dict[str, str],
+                                   topology: str, depth_class: str,
+                                   label: str) -> tuple[Path, str, dict[str, object]]:
+    """Authenticate the PASS experiment that produced one explicit context.
+
+    Context fields in a request are hints until the adjacent experiment
+    manifest proves them.  In particular, never let one records file be
+    relabeled as C1F20 (or a different depth) by changing request JSON alone.
+    """
+    manifest_path = records_path.parent / "experiment_manifest.json"
+    raw, digest, size = _snapshot(manifest_path, f"{label}.experiment_manifest", MAX_RECORDS_BYTES)
+    authority = parse_json(raw, f"{label}.experiment_manifest")
+    if not isinstance(authority, dict) or authority.get("status") != "PASS":
+        raise CalibrationError(f"{label}:experiment_manifest_not_pass")
+    schema = authority.get("schema")
+    if schema not in {"icecream-s8-derived-experiment-v1",
+                      "icecream-s8-real-c1f1-live-runner-v2"}:
+        raise CalibrationError(f"{label}:experiment_manifest_schema_invalid")
+    manifest_cell = authority.get("cell")
+    if isinstance(manifest_cell, str):
+        expected = "/".join(cell.values())
+    elif isinstance(manifest_cell, dict):
+        expected = cell
+    else:
+        raise CalibrationError(f"{label}:experiment_manifest_cell_invalid")
+    if manifest_cell != expected:
+        raise CalibrationError(f"{label}:experiment_manifest_cell_mismatch")
+    if authority.get("split") != SPLITS[cell["corpus"]]:
+        raise CalibrationError(f"{label}:experiment_manifest_split_mismatch")
+    suite = authority.get("suite", authority.get("topology"))
+    if not isinstance(suite, str) or not suite.startswith(topology + "/"):
+        raise CalibrationError(f"{label}:experiment_manifest_topology_mismatch")
+    manifest_depth = authority.get("depth", authority.get("depth_class"))
+    depth_aliases = {
+        "100": {"100"}, "200": {"200"},
+        "full": {"full", "full-1"},
+        "repeat-full": {"full-2", "repeat-full", "state-carrying full-2"},
+    }
+    if manifest_depth not in depth_aliases.get(depth_class, set()):
+        raise CalibrationError(f"{label}:experiment_manifest_depth_mismatch")
+    runs = authority.get("runs")
+    if not isinstance(runs, list) or not runs or any(not isinstance(run, str) for run in runs):
+        raise CalibrationError(f"{label}:experiment_manifest_runs_invalid")
+    pass_id = authority.get("pass_id")
+    if pass_id is None:
+        # Native runner manifests identify the canonical first pass by run.
+        pass_id = "full-2" if depth_class == "repeat-full" else "full-1"
+    if not isinstance(pass_id, str) or not pass_id or pass_id not in runs:
+        raise CalibrationError(f"{label}:experiment_manifest_pass_mismatch")
+    records_descriptor = authority.get("records")
+    if not isinstance(records_descriptor, dict) or set(records_descriptor) != DESCRIPTOR_KEYS:
+        raise CalibrationError(f"{label}:experiment_manifest_records_missing")
+    descriptor_path = records_descriptor.get("path")
+    if not isinstance(descriptor_path, str) or Path(descriptor_path).is_absolute() or \
+            any(part in ("", ".", "..") for part in Path(descriptor_path).parts) or \
+            (records_path.parent / descriptor_path).resolve() != records_path.resolve():
+        raise CalibrationError(f"{label}:experiment_manifest_records_mismatch")
+    expected_sha = _digest(records_descriptor.get("sha256"), f"{label}.experiment_manifest.records.sha256")
+    if type(records_descriptor.get("bytes")) is not int or records_descriptor["bytes"] <= 0:
+        raise CalibrationError(f"{label}:experiment_manifest_records_bytes_invalid")
+    actual_raw, actual_sha, actual_bytes = _snapshot(records_path, f"{label}.records", MAX_RECORDS_BYTES)
+    del actual_raw
+    if actual_sha != expected_sha or actual_bytes != records_descriptor["bytes"]:
+        raise CalibrationError(f"{label}:experiment_manifest_records_authentication_failed")
+    return manifest_path, pass_id, {"sha256": digest, "bytes": size}
+
+
 def _finite_nonnegative(value: object, label: str) -> int | float:
     if type(value) not in (int, float):
         raise CalibrationError(f"{label}:metric_not_finite_number")
@@ -465,6 +532,10 @@ def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = N
         seen.add(identity)
         records_path, records_sha, records_bytes = _descriptor(
             item["records"], request_root, f"comparison:{index}.records")
+        experiment_manifest_path = pass_id = authority_facts = None
+        if not legacy:
+            experiment_manifest_path, pass_id, authority_facts = _explicit_experiment_authority(
+                records_path, cell, topology, depth_class, f"comparison:{index}")
         records_raw, actual_sha, actual_bytes = _snapshot(records_path, "records", MAX_RECORDS_BYTES)
         if actual_sha != records_sha or actual_bytes != records_bytes:
             raise CalibrationError(f"comparison:{index}:records_changed_after_authentication")
@@ -488,7 +559,7 @@ def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = N
             context_bucket_ratios[context][bucket]["elapsed_ns"].append(
                 float(l_metrics["elapsed_ns"]) / float(p_metrics["elapsed_ns"]))
         total_points += point_count
-        input_bindings.append({
+        binding = {
             "cell": cell,
             "topology": topology,
             "depth_class": depth_class,
@@ -496,7 +567,19 @@ def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = N
             "records_path": str(records_path.relative_to(request_root)),
             "records_sha256": records_sha,
             "records_bytes": records_bytes,
-        })
+        }
+        if not legacy:
+            assert experiment_manifest_path is not None and pass_id is not None
+            assert authority_facts is not None
+            binding.update({
+                "experiment_manifest": {
+                    "path": str(experiment_manifest_path.relative_to(request_root)),
+                    "sha256": authority_facts["sha256"],
+                    "bytes": authority_facts["bytes"],
+                },
+                "pass_id": pass_id,
+            })
+        input_bindings.append(binding)
     # Every context included in a provisional bundle must have the same
     # complete calibration matrix.  Contexts are deliberately not prescribed
     # here: a new topology/depth can be frozen as soon as its own evidence is

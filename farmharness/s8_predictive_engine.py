@@ -281,14 +281,21 @@ def load_calibration_bundle(manifest_path: Path) -> dict[str, object]:
     # same corpus/profile/regime is expected to recur across contexts.
     seen_cells: set[tuple[str, str]] = set()
     binding_contexts: set[str] = set()
+    # v2 bundles emitted from a legacy v1 request retain the v2 envelope but
+    # intentionally have unscoped legacy bindings.  Keep that migration path
+    # distinct from explicit context bundles (which carry authority fields).
+    legacy_v2 = (not migrated and bool(bundle["inputs"]) and
+                 all(isinstance(binding, dict) and "topology" not in binding
+                     for binding in bundle["inputs"]))
     bucket_corpora: dict[str, set[str]] = {
         f"{profile}/{regime}": set()
         for profile in PROFILE_MODELS for regime in REGIME_MODELS
     }
     for binding in bundle["inputs"]:
         expected_binding_keys = {"cell", "records_path", "records_sha256", "records_bytes"}
-        if not migrated:
-            expected_binding_keys |= {"topology", "depth_class", "compatibility"}
+        if not migrated and not legacy_v2:
+            expected_binding_keys |= {"topology", "depth_class", "compatibility",
+                                      "experiment_manifest", "pass_id"}
         if not isinstance(binding, dict) or set(binding) != expected_binding_keys:
             raise PredictionError("calibration_bundle:input_binding_invalid")
         cell = binding["cell"]
@@ -297,7 +304,7 @@ def load_calibration_bundle(manifest_path: Path) -> dict[str, object]:
         cell_id = f"{cell.get('corpus')}/{cell.get('profile')}/{cell.get('regime')}"
         if cell_id not in expected_cells:
             raise PredictionError(f"calibration_bundle:input_cell_duplicate_or_invalid:{cell_id}")
-        if migrated:
+        if migrated or legacy_v2:
             topology, depth_class = "C1F1", "legacy"
         else:
             topology, depth_class = binding["topology"], binding["depth_class"]
@@ -323,6 +330,21 @@ def load_calibration_bundle(manifest_path: Path) -> dict[str, object]:
             raise PredictionError("calibration_bundle:input_digest_invalid")
         if type(binding["records_bytes"]) is not int or binding["records_bytes"] <= 0:
             raise PredictionError("calibration_bundle:input_bytes_invalid")
+        if not migrated and not legacy_v2:
+            pass_id = binding["pass_id"]
+            if (not isinstance(pass_id, str) or not pass_id or
+                    any(ch not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.:-" for ch in pass_id)):
+                raise PredictionError("calibration_bundle:pass_id_invalid")
+            manifest_descriptor = binding["experiment_manifest"]
+            manifest_path = _artifact_path(manifest_path.parent, manifest_descriptor,
+                                           "calibration_experiment_manifest")
+            manifest_raw, manifest_facts = _authenticate(
+                manifest_path, manifest_descriptor, "calibration_experiment_manifest")
+            manifest = parse_json(manifest_raw, "calibration_experiment_manifest")
+            if (not isinstance(manifest, dict) or manifest.get("status") != "PASS" or
+                    manifest.get("pass_id", pass_id) != pass_id):
+                raise PredictionError("calibration_experiment_manifest:authority_mismatch")
+            del manifest_facts
     expected_context_cells = {
         (context, cell_id)
         for context in binding_contexts
