@@ -237,6 +237,7 @@ def _authenticate(path: Path, descriptor: dict[str, object], label: str,
 
 def load_calibration_bundle(manifest_path: Path) -> dict[str, object]:
     """Authenticate a frozen calibration bundle for this base model."""
+    bundle_root = manifest_path.parent
     manifest_raw, manifest_facts = regular_snapshot(manifest_path, "calibration_manifest")
     value = parse_json(manifest_raw, "calibration_manifest")
     expected_keys = {"schema", "semantics", "bundle", "request", "predictor", "inputs"}
@@ -285,7 +286,7 @@ def load_calibration_bundle(manifest_path: Path) -> dict[str, object]:
     # intentionally have unscoped legacy bindings.  Keep that migration path
     # distinct from explicit context bundles (which carry authority fields).
     legacy_v2 = (not migrated and bool(bundle["inputs"]) and
-                 all(isinstance(binding, dict) and "topology" not in binding
+                 all(isinstance(binding, dict) and "experiment_manifest" not in binding
                      for binding in bundle["inputs"]))
     bucket_corpora: dict[str, set[str]] = {
         f"{profile}/{regime}": set()
@@ -296,6 +297,8 @@ def load_calibration_bundle(manifest_path: Path) -> dict[str, object]:
         if not migrated and not legacy_v2:
             expected_binding_keys |= {"topology", "depth_class", "compatibility",
                                       "experiment_manifest", "pass_id"}
+        elif legacy_v2:
+            expected_binding_keys |= {"topology", "depth_class", "compatibility"}
         if not isinstance(binding, dict) or set(binding) != expected_binding_keys:
             raise PredictionError("calibration_bundle:input_binding_invalid")
         cell = binding["cell"]
@@ -336,15 +339,15 @@ def load_calibration_bundle(manifest_path: Path) -> dict[str, object]:
                     any(ch not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.:-" for ch in pass_id)):
                 raise PredictionError("calibration_bundle:pass_id_invalid")
             manifest_descriptor = binding["experiment_manifest"]
-            manifest_path = _artifact_path(manifest_path.parent, manifest_descriptor,
+            authority_path = _artifact_path(bundle_root, manifest_descriptor,
                                            "calibration_experiment_manifest")
-            manifest_raw, manifest_facts = _authenticate(
-                manifest_path, manifest_descriptor, "calibration_experiment_manifest")
+            manifest_raw, authority_facts = _authenticate(
+                authority_path, manifest_descriptor, "calibration_experiment_manifest")
             manifest = parse_json(manifest_raw, "calibration_experiment_manifest")
             if (not isinstance(manifest, dict) or manifest.get("status") != "PASS" or
                     manifest.get("pass_id", pass_id) != pass_id):
                 raise PredictionError("calibration_experiment_manifest:authority_mismatch")
-            del manifest_facts
+            del authority_facts
     expected_context_cells = {
         (context, cell_id)
         for context in binding_contexts

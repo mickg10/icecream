@@ -127,6 +127,32 @@ def _request(root: Path, *, mutate: dict[str, object] | None = None) -> tuple[Pa
     return path, comparisons
 
 
+def _explicitize(root: Path, comparisons: list[dict[str, object]],
+                 topology: str, depth: str) -> None:
+    """Move synthetic records under authenticated derived experiment dirs."""
+    for comparison in comparisons:
+        source = root / comparison["records"]["path"]
+        target = root / "explicit" / f"{topology}-{depth}" / Path(source).parent.name
+        target.mkdir(parents=True, exist_ok=True)
+        raw = source.read_bytes()
+        records_path = target / "records.jsonl"
+        records_path.write_bytes(raw)
+        authority = {
+            "schema": "icecream-s8-derived-experiment-v1", "status": "PASS",
+            "cell": dict(comparison["cell"]), "split": "calibration",
+            "topology": f"{topology}/40", "suite": f"{topology}/40",
+            "depth": depth, "depth_class": depth,
+            "pass_id": f"pass-{depth}", "runs": [f"pass-{depth}"],
+            "records": {"path": "records.jsonl", "sha256": hashlib.sha256(raw).hexdigest(),
+                        "bytes": len(raw)},
+        }
+        (target / "experiment_manifest.json").write_bytes(canonical_bytes(authority) + b"\n")
+        comparison["records"] = {
+            "path": str(records_path.relative_to(root)),
+            "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw),
+        }
+
+
 def test_freeze_binds_exactly_16_inputs_and_source_identity(tmp_path: Path) -> None:
     request, comparisons = _request(tmp_path)
     manifest = freeze(request, tmp_path / "bundle.json", tmp_path / "manifest.json")
@@ -362,11 +388,13 @@ def test_calibrated_engine_and_driver_expose_stable_model_id(tmp_path: Path) -> 
 
 
 def test_v2_bundle_scopes_factors_to_explicit_topology_and_depth(tmp_path: Path) -> None:
-    request, _ = _request(tmp_path)
+    request, comparisons = _request(tmp_path)
     value = json.loads(request.read_bytes())
-    for comparison in value["comparisons"]:
+    for comparison in comparisons:
         comparison["topology"] = "C1F1"
         comparison["depth_class"] = "full"
+    _explicitize(tmp_path, comparisons, "C1F1", "full")
+    value["comparisons"] = comparisons
     request.write_bytes(canonical_bytes(value) + b"\n")
     bundle = tmp_path / "bundle.json"
     manifest = tmp_path / "manifest.json"
@@ -404,6 +432,7 @@ def test_v2_freeze_preserves_directional_factors(tmp_path: Path) -> None:
         path.write_bytes(raw)
         comparison["records"].update({"sha256": hashlib.sha256(raw).hexdigest(),
                                        "bytes": len(raw)})
+    _explicitize(tmp_path, comparisons, "C1F1", "100")
     request.write_bytes(canonical_bytes({
         "schema": REQUEST_SCHEMA, "semantics": SEMANTICS,
         "predictor": PREDICTOR, "comparisons": comparisons,
@@ -420,13 +449,17 @@ def test_v2_freeze_allows_complete_matrices_in_multiple_contexts(tmp_path: Path)
     # Duplicate the authenticated 16-cell matrix for a second measured
     # topology/depth context.  A context is part of identity, so this is not
     # a duplicate cell and should produce one authenticated bundle.
+    for comparison in comparisons:
+        comparison["topology"] = "C1F1"
+        comparison["depth_class"] = "full"
+    _explicitize(tmp_path, comparisons, "C1F1", "full")
     second = []
     for comparison in comparisons:
         item = dict(comparison)
         item["topology"] = "C1F20"
         item["depth_class"] = "200"
         source = tmp_path / comparison["records"]["path"]
-        target = tmp_path / "explicit" / Path(source).parent.name
+        target = tmp_path / "explicit-second" / Path(source).parent.name
         target.mkdir(parents=True, exist_ok=True)
         raw = source.read_bytes()
         (target / "records.jsonl").write_bytes(raw)
@@ -450,12 +483,12 @@ def test_v2_freeze_allows_complete_matrices_in_multiple_contexts(tmp_path: Path)
     scales = json.loads(bundle.read_bytes())["calibration"]["scales"]
     assert set(scales) == {
         f"{context}/{profile}/{regime}"
-        for context in ("C1F1/legacy", "C1F20/200")
+        for context in ("C1F1/full", "C1F20/200")
         for profile in ("ZSTD_TU", "ZSTD_ROUTE", "P29", "GRZ_RESIDUAL")
         for regime in ("cold", "warm")
     }
     loaded = load_calibration_bundle(tmp_path / "calibration-model-manifest.json")
-    assert set(loaded["contexts"]) == {"C1F1/legacy", "C1F20/200"}
+    assert set(loaded["contexts"]) == {"C1F1/full", "C1F20/200"}
 
 
 def test_v2_freeze_rejects_context_relabel_without_adjacent_authority(tmp_path: Path) -> None:
@@ -469,12 +502,17 @@ def test_v2_freeze_rejects_context_relabel_without_adjacent_authority(tmp_path: 
 
 def test_v2_freeze_rejects_missing_cell_within_one_context(tmp_path: Path) -> None:
     request, comparisons = _request(tmp_path)
+    for comparison in comparisons:
+        comparison["topology"] = "C1F1"
+        comparison["depth_class"] = "full"
+    _explicitize(tmp_path, comparisons, "C1F1", "full")
     second = []
     for comparison in comparisons[:-1]:
         item = dict(comparison)
         item["topology"] = "C1F20"
         item["depth_class"] = "200"
         second.append(item)
+    _explicitize(tmp_path, second, "C1F20", "200")
     value = json.loads(request.read_bytes())
     value["comparisons"] = [*comparisons, *second]
     request.write_bytes(canonical_bytes(value) + b"\n")
