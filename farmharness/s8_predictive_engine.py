@@ -268,15 +268,18 @@ def load_calibration_bundle(manifest_path: Path) -> dict[str, object]:
         raise PredictionError("calibration_bundle:predictor_identity_mismatch")
     if value["request"] != bundle["request"] or value["inputs"] != bundle["inputs"]:
         raise PredictionError("calibration_bundle:manifest_binding_mismatch")
-    if (not isinstance(bundle["request"], dict) or
-            set(bundle["request"]) != {"sha256", "bytes"} or
-            not isinstance(bundle["inputs"], list) or len(bundle["inputs"]) != 16):
-        raise PredictionError("calibration_bundle:input_bindings_invalid")
     expected_cells = {
         f"{cell['corpus']}/{cell['profile']}/{cell['regime']}": cell
         for cell in DECLARED_CELLS if SPLITS[cell["corpus"]] == "calibration"
     }
-    seen_cells: set[str] = set()
+    if (not isinstance(bundle["request"], dict) or
+            set(bundle["request"]) != {"sha256", "bytes"} or
+            not isinstance(bundle["inputs"], list) or
+            len(bundle["inputs"]) < len(expected_cells)):
+        raise PredictionError("calibration_bundle:input_bindings_invalid")
+    # Bind each evidence cell together with its topology/depth context.  The
+    # same corpus/profile/regime is expected to recur across contexts.
+    seen_cells: set[tuple[str, str]] = set()
     binding_contexts: set[str] = set()
     bucket_corpora: dict[str, set[str]] = {
         f"{profile}/{regime}": set()
@@ -292,9 +295,8 @@ def load_calibration_bundle(manifest_path: Path) -> dict[str, object]:
         if not isinstance(cell, dict) or set(cell) != {"corpus", "profile", "regime"}:
             raise PredictionError("calibration_bundle:input_cell_invalid")
         cell_id = f"{cell.get('corpus')}/{cell.get('profile')}/{cell.get('regime')}"
-        if cell_id not in expected_cells or cell_id in seen_cells:
+        if cell_id not in expected_cells:
             raise PredictionError(f"calibration_bundle:input_cell_duplicate_or_invalid:{cell_id}")
-        seen_cells.add(cell_id)
         if migrated:
             topology, depth_class = "C1F1", "legacy"
         else:
@@ -305,6 +307,11 @@ def load_calibration_bundle(manifest_path: Path) -> dict[str, object]:
                     binding["compatibility"] != ("legacy_c1f1" if depth_class == "legacy" else "explicit")):
                 raise PredictionError("calibration_bundle:context_invalid")
         binding_contexts.add(f"{topology}/{depth_class}")
+        context_cell = (f"{topology}/{depth_class}", cell_id)
+        if context_cell in seen_cells:
+            raise PredictionError(
+                f"calibration_bundle:input_cell_duplicate_or_invalid:{topology}/{depth_class}/{cell_id}")
+        seen_cells.add(context_cell)
         bucket_corpora[f"{cell['profile']}/{cell['regime']}"].add(cell["corpus"])
         path = binding["records_path"]
         if (not isinstance(path, str) or not path or Path(path).is_absolute() or
@@ -316,7 +323,12 @@ def load_calibration_bundle(manifest_path: Path) -> dict[str, object]:
             raise PredictionError("calibration_bundle:input_digest_invalid")
         if type(binding["records_bytes"]) is not int or binding["records_bytes"] <= 0:
             raise PredictionError("calibration_bundle:input_bytes_invalid")
-    if seen_cells != set(expected_cells):
+    expected_context_cells = {
+        (context, cell_id)
+        for context in binding_contexts
+        for cell_id in expected_cells
+    }
+    if seen_cells != expected_context_cells:
         raise PredictionError("calibration_bundle:input_cell_set_invalid")
     if any(corpora != {"fmt", "RocksDB"} for corpora in bucket_corpora.values()):
         raise PredictionError("calibration_bundle:bucket_sources_invalid")

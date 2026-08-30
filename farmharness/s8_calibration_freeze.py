@@ -426,7 +426,10 @@ def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = N
     comparisons = request["comparisons"]
     if not isinstance(comparisons, list):
         raise CalibrationError("comparisons:not_a_list")
-    seen: set[str] = set()
+    # A cell may legitimately be measured in more than one scheduling
+    # context.  Context is part of the calibration identity; keying only by
+    # cell would make a multi-context bundle impossible to construct.
+    seen: set[tuple[str, str]] = set()
     input_bindings: list[dict[str, object]] = []
     # Context is part of the key.  Legacy rows are deliberately isolated in
     # C1F1/legacy so their aggregate factor can never leak into C1F20.
@@ -455,9 +458,11 @@ def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = N
             raise CalibrationError(f"comparison:{index}:cell_not_calibration")
         if cell_id not in CALIBRATION_CELL_IDS:
             raise CalibrationError(f"comparison:{index}:cell_not_calibration")
-        if cell_id in seen:
-            raise CalibrationError(f"comparison:{index}:duplicate_cell:{cell_id}")
-        seen.add(cell_id)
+        identity = (context, cell_id)
+        if identity in seen:
+            raise CalibrationError(
+                f"comparison:{index}:duplicate_cell_context:{context}/{cell_id}")
+        seen.add(identity)
         records_path, records_sha, records_bytes = _descriptor(
             item["records"], request_root, f"comparison:{index}.records")
         records_raw, actual_sha, actual_bytes = _snapshot(records_path, "records", MAX_RECORDS_BYTES)
@@ -492,12 +497,26 @@ def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = N
             "records_sha256": records_sha,
             "records_bytes": records_bytes,
         })
-    missing = sorted(CALIBRATION_CELL_IDS - seen)
-    if missing:
-        raise CalibrationError(f"comparisons:missing_cells:{','.join(missing)}")
-    if len(comparisons) != len(CALIBRATION_CELLS) or len(seen) != len(CALIBRATION_CELLS):
-        raise CalibrationError("comparisons:expected_exactly_16_unique_calibration_cells")
-    input_bindings.sort(key=lambda item: _cell_id(item["cell"]))
+    # Every context included in a provisional bundle must have the same
+    # complete calibration matrix.  Contexts are deliberately not prescribed
+    # here: a new topology/depth can be frozen as soon as its own evidence is
+    # available, without pretending that unmeasured contexts exist.
+    for context in sorted(context_ids):
+        missing = sorted(
+            CALIBRATION_CELL_IDS - {
+                cell_id for context_id, cell_id in seen if context_id == context
+            }
+        )
+        if missing:
+            raise CalibrationError(
+                f"comparisons:missing_cells:{context}:{','.join(missing)}")
+    expected_points = len(CALIBRATION_CELLS) * len(context_ids)
+    if (not context_ids or len(comparisons) != expected_points or
+            len(seen) != expected_points):
+        raise CalibrationError("comparisons:expected_complete_16_cell_matrix_per_context")
+    input_bindings.sort(key=lambda item: (
+        _context_id(str(item["topology"]), str(item["depth_class"])),
+        _cell_id(item["cell"])))
     scales: dict[str, dict[str, float]] = {}
     for context in sorted(context_ids):
         for bucket_id in sorted(CALIBRATION_BUCKET_IDS):
@@ -517,7 +536,7 @@ def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = N
             f_factor = _median(ratios.get("F_TO_C_bytes", ratios["channel_bytes"]),
                                f"{key}:F_TO_C_bytes")
             elapsed_factor = _median(ratios["elapsed_ns"], f"{key}:elapsed_ns")
-            if context == "C1F1/legacy":
+            if context == "C1F1/legacy" and context_ids == {"C1F1/legacy"}:
                 # Read-only aliases keep older C1F1 callers source-compatible
                 # while the canonical v2 key remains topology/depth scoped.
                 scales[bucket_id] = {

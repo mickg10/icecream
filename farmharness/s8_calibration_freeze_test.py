@@ -413,3 +413,45 @@ def test_v2_freeze_preserves_directional_factors(tmp_path: Path) -> None:
     scales = json.loads(bundle.read_bytes())["calibration"]["scales"]
     assert scales["C1F1/100/ZSTD_TU/cold"]["C_TO_F_bytes"] == pytest.approx(5 / 3)
     assert scales["C1F1/100/ZSTD_TU/cold"]["F_TO_C_bytes"] == pytest.approx(5 / 8)
+
+
+def test_v2_freeze_allows_complete_matrices_in_multiple_contexts(tmp_path: Path) -> None:
+    request, comparisons = _request(tmp_path)
+    # Duplicate the authenticated 16-cell matrix for a second measured
+    # topology/depth context.  A context is part of identity, so this is not
+    # a duplicate cell and should produce one authenticated bundle.
+    second = []
+    for comparison in comparisons:
+        item = dict(comparison)
+        item["topology"] = "C1F20"
+        item["depth_class"] = "200"
+        second.append(item)
+    value = json.loads(request.read_bytes())
+    value["comparisons"] = [*comparisons, *second]
+    request.write_bytes(canonical_bytes(value) + b"\n")
+    bundle = tmp_path / "bundle.json"
+    freeze(request, bundle)
+    scales = json.loads(bundle.read_bytes())["calibration"]["scales"]
+    assert set(scales) == {
+        f"{context}/{profile}/{regime}"
+        for context in ("C1F1/legacy", "C1F20/200")
+        for profile in ("ZSTD_TU", "ZSTD_ROUTE", "P29", "GRZ_RESIDUAL")
+        for regime in ("cold", "warm")
+    }
+    loaded = load_calibration_bundle(tmp_path / "calibration-model-manifest.json")
+    assert set(loaded["contexts"]) == {"C1F1/legacy", "C1F20/200"}
+
+
+def test_v2_freeze_rejects_missing_cell_within_one_context(tmp_path: Path) -> None:
+    request, comparisons = _request(tmp_path)
+    second = []
+    for comparison in comparisons[:-1]:
+        item = dict(comparison)
+        item["topology"] = "C1F20"
+        item["depth_class"] = "200"
+        second.append(item)
+    value = json.loads(request.read_bytes())
+    value["comparisons"] = [*comparisons, *second]
+    request.write_bytes(canonical_bytes(value) + b"\n")
+    with pytest.raises(CalibrationError, match="missing_cells:C1F20/200"):
+        freeze(request, tmp_path / "bundle.json")
