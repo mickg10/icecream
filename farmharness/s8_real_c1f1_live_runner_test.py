@@ -222,7 +222,9 @@ def test_parallel_action_trace_binds_by_observed_service_not_global_arrival(
         for relationship in range(20):
             ordinal = wave * 20 + relationship
             assignments.append({"relationship": relationship, "f_slot": wave})
-            digest = f"{ordinal + 1:032x}"
+            # Transaction digests are allowed to collide across independent
+            # relationships, as they do for repeated build occurrences.
+            digest = f"{wave + 1:032x}"
             f_guid = f"{relationship + 1:032x}"
             c_row = _action_row("C", wave)
             f_row = _action_row("F", wave)
@@ -246,6 +248,17 @@ def test_parallel_action_trace_binds_by_observed_service_not_global_arrival(
             for row in stages] == [(index % 20, index // 20) for index in range(40)]
     assert [row["tu_seq"] for row in stages] == [index // 20 for index in range(40)]
     assert stages[0]["observed_f_service_identity"] == "p50-f-0"
+
+
+def test_action_trace_rejects_duplicate_within_one_relationship(tmp_path: Path) -> None:
+    c_path = tmp_path / "c.jsonl"
+    f_path = tmp_path / "f.jsonl"
+    c_row = _action_row("C", 0)
+    f_row = _action_row("F", 0)
+    c_path.write_text(json.dumps(c_row) + "\n" + json.dumps(c_row) + "\n")
+    f_path.write_text(json.dumps(f_row) + "\n" + json.dumps(f_row) + "\n")
+    with pytest.raises(runner.LiveRunnerError, match="duplicate_transaction"):
+        runner._action_stage_paths(c_path, f_path, 2)
 
 
 def test_per_tu_profile_evidence_is_required(tmp_path: Path) -> None:

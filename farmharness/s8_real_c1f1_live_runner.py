@@ -1267,16 +1267,21 @@ def _action_stage_paths(c_path: Path, f_path: Path, expected_count: int,
         if len(assignments) == 0 or expected_count % len(assignments):
             _fail("action_trace:assignment_count_mismatch")
         assignments = assignments * (expected_count // len(assignments))
-    # Parallel F traces are merged by transaction digest.  Inter-relationship
-    # transaction order is intentionally free, so bind each observed F store
-    # GUID to its service trace and only then pair relationship-local trace
-    # sequence with that relationship's authenticated input order.
-    f_by_digest: dict[str, dict[str, Any]] = {}
+    # Transaction digests are relationship-local: two independent F services
+    # can process the same repeated source at the same local sequence and
+    # legitimately emit the same digest.  Include both store identities and
+    # relationship-local sequence in the join key; only an exact duplicate
+    # product transaction is invalid.
+    def transaction_key(row: dict[str, Any]) -> tuple[str, str, int, int, str]:
+        return (row["c_store_guid"], row["f_store_guid"], int(row["tu_seq"]),
+                int(row["rel_seq"]), row["transaction_digest"])
+
+    f_by_transaction: dict[tuple[str, str, int, int, str], dict[str, Any]] = {}
     for row in f_begins:
-        digest = row["transaction_digest"]
-        if digest in f_by_digest:
+        key = transaction_key(row)
+        if key in f_by_transaction:
             _fail("action_trace:duplicate_transaction")
-        f_by_digest[digest] = row
+        f_by_transaction[key] = row
     c_guid = {row["c_store_guid"] for row in c_begins}
     if len(c_guid) != 1:
         _fail("action_trace:C_identity_changed")
@@ -1291,7 +1296,7 @@ def _action_stage_paths(c_path: Path, f_path: Path, expected_count: int,
         relationship: [] for relationship in range(RELATIONSHIP_COUNT[suite])
     }
     for index, c_row in enumerate(c_begins):
-        f_row = f_by_digest.get(c_row["transaction_digest"])
+        f_row = f_by_transaction.get(transaction_key(c_row))
         if f_row is None:
             _fail(f"action_trace:{index}:transaction_missing_on_F")
         # The two role traces must describe the same transaction, not merely
