@@ -20,9 +20,9 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from .s8_schema import CORPORA, CURRENT_SEMANTICS, PROFILES, REGIMES, SPLITS
+    from .s8_schema import CORPORA, CURRENT_SEMANTICS, DEPTH_CLASSES, PROFILES, REGIMES, SPLITS
 except ImportError:  # pragma: no cover
-    from s8_schema import CORPORA, CURRENT_SEMANTICS, PROFILES, REGIMES, SPLITS
+    from s8_schema import CORPORA, CURRENT_SEMANTICS, DEPTH_CLASSES, PROFILES, REGIMES, SPLITS
 
 
 SCHEMA = "icecream-s8-depth-run-plan-v1"
@@ -42,7 +42,8 @@ class DepthPlanError(ValueError):
     """Raised when a depth request cannot be authenticated without guessing."""
 
 
-def build_schedule(inputs: list[dict[str, Any]], topology: str) -> dict[str, Any]:
+def build_schedule(inputs: list[dict[str, Any]], topology: str,
+                   depth_class: str | None = None) -> dict[str, Any]:
     """Build an authenticated least-planned-load assignment.
 
     Assignment uses estimated service only; actual modeled component timings
@@ -71,7 +72,7 @@ def build_schedule(inputs: list[dict[str, Any]], topology: str) -> dict[str, Any
             "planning_service_ns": service, "planning_start_ns": start,
             "planning_finish_ns": finish,
         })
-    return {
+    result = {
         "schema": "icecream-s8-scheduling-topology-v1", "topology": topology,
         "f_relationships": relationships, "slots_per_f": slots_per_f,
         "global_slots": slots, "execution_slots": slots,
@@ -82,6 +83,11 @@ def build_schedule(inputs: list[dict[str, Any]], topology: str) -> dict[str, Any
         "assignment_policy_version": "s8-planned-load-v1",
         "assignment_epoch_reset": True, "assignments": assignments,
     }
+    if depth_class is not None:
+        if depth_class not in set(DEPTH_CLASSES) - {"legacy"}:
+            raise DepthPlanError("scheduling:depth_class_invalid")
+        result["depth_class"] = depth_class
+    return result
 
 
 def select_inputs(all_inputs: list[dict[str, Any]],
@@ -291,15 +297,18 @@ def build_plan(source_manifest: Path, source_root: Path, matrix_audit: Path,
                                             {"sha256": manifest_facts["sha256"]}, selected)
     elif repeat_of is not None:
         raise DepthPlanError("repeat_of:only_valid_for_repeat_full")
-    scheduling = build_schedule(selected, topology)
+    # repeat-full is a continuation of the same full-depth execution class;
+    # codec state differs, but its calibration scope is the full-depth class.
+    depth_class = "full" if depth == "repeat-full" else (str(depth) if isinstance(depth, int) else depth)
+    scheduling = build_schedule(selected, topology, depth_class)
     source = {"root": str(source_root.resolve()),
               "manifest": {"path": manifest_facts["path"], "sha256": manifest_facts["sha256"],
                            "bytes": manifest_facts["bytes"], "entries": len(all_inputs)}}
     plan: dict[str, Any] = {
         "schema": SCHEMA, "semantics": CURRENT_SEMANTICS,
         "cell": cell, "split": SPLITS[corpus],
-        "request": {"depth": depth, "requested_curve_points": requested_points,
-                    "base_matrix_cells": 32,
+        "request": {"depth": depth, "depth_class": depth_class,
+                    "requested_curve_points": requested_points, "base_matrix_cells": 32,
                     "source_selection": source_selection},
         "source_manifest": source["manifest"], "source_root": source["root"],
         "matrix_precondition": matrix_facts,

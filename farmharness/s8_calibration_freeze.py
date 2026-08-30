@@ -5,9 +5,10 @@ The input is an authenticated request naming one normalized ``records.jsonl``
 for every ``fmt``/``RocksDB`` profile and regime cell.  The request never
 names a live trace or a held-out corpus.  Each records file is authenticated,
 checked as one predictive/live/comparison triple, and reduced to robust
-observed-over-predicted scale factors for channel bytes and elapsed
-nanoseconds.  Throughput is deliberately derived from those two factors and
-is never fitted independently.
+observed-over-predicted scale factors for C-to-F bytes, F-to-C bytes, and
+elapsed nanoseconds.  Factors are scoped by topology and depth class.
+Throughput is deliberately derived from those factors and is never fitted
+independently.
 """
 
 from __future__ import annotations
@@ -24,23 +25,28 @@ from pathlib import Path
 from typing import Any
 
 try:  # Works as a package module and as a direct harness script.
-    from .s8_schema import CORPORA, CURRENT_SEMANTICS, DECLARED_CELLS, PROFILES, REGIMES, SPLITS
+    from .s8_schema import (CORPORA, CURRENT_SEMANTICS, DECLARED_CELLS, DEPTH_CLASSES,
+                            PROFILES, REGIMES, SPLITS, TOPOLOGIES)
     from .s8_predictive_live_normalizer import RECORD_SCHEMA
 except ImportError:  # pragma: no cover - direct invocation.
-    from s8_schema import CORPORA, CURRENT_SEMANTICS, DECLARED_CELLS, PROFILES, REGIMES, SPLITS
+    from s8_schema import (CORPORA, CURRENT_SEMANTICS, DECLARED_CELLS, DEPTH_CLASSES,
+                           PROFILES, REGIMES, SPLITS, TOPOLOGIES)
     from s8_predictive_live_normalizer import RECORD_SCHEMA
 
 
-REQUEST_SCHEMA = "icecream-s8-calibration-request-v1"
-BUNDLE_SCHEMA = "icecream-s8-calibration-model-bundle-v1"
-MANIFEST_SCHEMA = "icecream-s8-calibration-model-manifest-v1"
+REQUEST_SCHEMA = "icecream-s8-calibration-request-v2"
+BUNDLE_SCHEMA = "icecream-s8-calibration-model-bundle-v2"
+MANIFEST_SCHEMA = "icecream-s8-calibration-model-manifest-v2"
+LEGACY_REQUEST_SCHEMA = "icecream-s8-calibration-request-v1"
 SEMANTICS = CURRENT_SEMANTICS
 REQUEST_KEYS = {"schema", "semantics", "predictor", "comparisons"}
 PREDICTOR_KEYS = {"source_commit", "source_tree", "model_id"}
 COMPARISON_KEYS = {"cell", "records"}
+CONTEXT_COMPARISON_KEYS = {"cell", "records", "topology", "depth_class"}
 DESCRIPTOR_KEYS = {"path", "sha256", "bytes"}
 CELL_KEYS = {"corpus", "profile", "regime"}
 COMMON_METRICS = ("channel_bytes", "elapsed_ns", "throughput_bytes_per_s")
+FACTOR_FIELDS = ("C_TO_F_bytes", "F_TO_C_bytes", "elapsed_ns")
 RECORD_TYPES = ("predictive_sim", "live", "comparison")
 CALIBRATION_CELLS = tuple(
     dict(cell) for cell in DECLARED_CELLS if SPLITS[cell["corpus"]] == "calibration"
@@ -160,6 +166,39 @@ def _cell_id(cell: dict[str, str]) -> str:
     return f"{cell['corpus']}/{cell['profile']}/{cell['regime']}"
 
 
+def _depth_class(value: object, label: str) -> str:
+    # Depth is serialized as a class, rather than inferred from the number of
+    # rows.  ``repeat-full`` is normalized by the depth planner to the
+    # continuing ``full`` class; codec state itself remains in the live join.
+    if type(value) is int:
+        value = str(value)
+    if not isinstance(value, str) or value not in set(DEPTH_CLASSES) - {"legacy"}:
+        raise CalibrationError(f"{label}:invalid_depth_class")
+    return value
+
+
+def _calibration_context(item: dict[str, object], label: str) -> tuple[str, str, bool]:
+    """Return topology/depth and whether this is a legacy C1F1 fixture.
+
+    v1 requests had no context.  They are accepted only as a migration aid
+    and are permanently scoped to C1F1/legacy; they cannot calibrate a depth
+    plan or the C1F20 topology.
+    """
+    keys = set(item)
+    if keys == COMPARISON_KEYS:
+        return "C1F1", "legacy", True
+    if keys != CONTEXT_COMPARISON_KEYS:
+        raise CalibrationError(f"{label}:fields_invalid")
+    topology = item["topology"]
+    if topology not in TOPOLOGIES:
+        raise CalibrationError(f"{label}:invalid_topology")
+    return str(topology), _depth_class(item["depth_class"], f"{label}.depth_class"), False
+
+
+def _context_id(topology: str, depth_class: str) -> str:
+    return f"{topology}/{depth_class}"
+
+
 def _descriptor(value: object, base: Path, label: str) -> tuple[Path, str, int]:
     if not isinstance(value, dict) or set(value) != DESCRIPTOR_KEYS:
         raise CalibrationError(f"{label}:descriptor_invalid")
@@ -226,6 +265,7 @@ def _curve(value: object, cell: dict[str, str], label: str) -> list[dict[str, ob
     rows: list[dict[str, object]] = []
     seen_steps: set[int] = set()
     seen_tus: set[str] = set()
+    directional_shape: bool | None = None
     for number, row in enumerate(value, 1):
         if not isinstance(row, dict) or {"step", "tu_id", "cumulative"} - set(row):
             raise CalibrationError(f"{label}:{number}:point_fields_invalid")
@@ -236,14 +276,28 @@ def _curve(value: object, cell: dict[str, str], label: str) -> list[dict[str, ob
             raise CalibrationError(f"{label}:{number}:tu_id_invalid_or_duplicate")
         if "cell" in row and row["cell"] != cell:
             raise CalibrationError(f"{label}:{number}:cell_mismatch")
-        if not isinstance(cumulative, dict) or set(cumulative) != set(COMMON_METRICS):
+        if not isinstance(cumulative, dict) or set(cumulative) not in (
+                set(COMMON_METRICS),
+                set((*COMMON_METRICS, "C_TO_F_bytes", "F_TO_C_bytes"))):
             raise CalibrationError(f"{label}:{number}:metric_shape_invalid")
+        current_directional = "C_TO_F_bytes" in cumulative
+        if directional_shape is not None and current_directional != directional_shape:
+            raise CalibrationError(f"{label}:{number}:metric_shape_changed")
+        directional_shape = current_directional
         metrics = {
             metric: _finite_nonnegative(cumulative[metric], f"{label}:{number}:{metric}")
             for metric in COMMON_METRICS
         }
         elapsed = metrics["elapsed_ns"]
         channel = metrics["channel_bytes"]
+        if "C_TO_F_bytes" in cumulative:
+            for direction in ("C_TO_F_bytes", "F_TO_C_bytes"):
+                metrics[direction] = _finite_nonnegative(
+                    cumulative[direction], f"{label}:{number}:{direction}")
+            if not math.isclose(float(metrics["C_TO_F_bytes"]) +
+                                float(metrics["F_TO_C_bytes"]), float(channel),
+                                rel_tol=1e-12, abs_tol=1e-12):
+                raise CalibrationError(f"{label}:{number}:directional_channel_not_conserved")
         if elapsed <= 0:
             raise CalibrationError(f"{label}:{number}:elapsed_ns_must_be_positive")
         expected_throughput = float(channel) * 1_000_000_000 / float(elapsed)
@@ -253,7 +307,9 @@ def _curve(value: object, cell: dict[str, str], label: str) -> list[dict[str, ob
         if previous is not None:
             if step != len(rows):
                 raise CalibrationError(f"{label}:{number}:reordered_or_missing_point")
-            for metric in ("channel_bytes", "elapsed_ns"):
+            for metric in ("channel_bytes", "elapsed_ns", "C_TO_F_bytes", "F_TO_C_bytes"):
+                if metric not in metrics or metric not in previous:
+                    continue
                 if metrics[metric] < previous[metric]:
                     raise CalibrationError(f"{label}:{number}:{metric}_decreased")
         previous = metrics
@@ -357,7 +413,7 @@ def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = N
     request = parse_json(request_raw, "request")
     if not isinstance(request, dict) or set(request) != REQUEST_KEYS:
         raise CalibrationError("request:fields_invalid")
-    if request["schema"] != REQUEST_SCHEMA or request["semantics"] != SEMANTICS:
+    if request["schema"] not in {REQUEST_SCHEMA, LEGACY_REQUEST_SCHEMA} or request["semantics"] != SEMANTICS:
         raise CalibrationError("request:schema_or_semantics_invalid")
     predictor = request["predictor"]
     if not isinstance(predictor, dict) or set(predictor) != PREDICTOR_KEYS:
@@ -372,18 +428,27 @@ def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = N
         raise CalibrationError("comparisons:not_a_list")
     seen: set[str] = set()
     input_bindings: list[dict[str, object]] = []
-    bucket_ratios: dict[str, dict[str, list[float]]] = {
-        f"{bucket['profile']}/{bucket['regime']}": {
-            "channel_bytes": [], "elapsed_ns": []
-        }
-        for bucket in CALIBRATION_BUCKETS
-    }
-    bucket_corpora: dict[str, set[str]] = {bucket_id: set() for bucket_id in CALIBRATION_BUCKET_IDS}
+    # Context is part of the key.  Legacy rows are deliberately isolated in
+    # C1F1/legacy so their aggregate factor can never leak into C1F20.
+    context_bucket_ratios: dict[str, dict[str, dict[str, list[float]]]] = {}
+    context_bucket_corpora: dict[str, dict[str, set[str]]] = {}
+    context_ids: set[str] = set()
     total_points = 0
     request_root = request_path.parent.resolve()
     for index, item in enumerate(comparisons):
-        if not isinstance(item, dict) or set(item) != COMPARISON_KEYS:
+        if not isinstance(item, dict):
             raise CalibrationError(f"comparison:{index}:fields_invalid")
+        topology, depth_class, legacy = _calibration_context(item, f"comparison:{index}")
+        context = _context_id(topology, depth_class)
+        context_ids.add(context)
+        context_bucket_ratios.setdefault(context, {
+            f"{bucket['profile']}/{bucket['regime']}": {
+                "channel_bytes": [], "elapsed_ns": []
+            } for bucket in CALIBRATION_BUCKETS
+        })
+        context_bucket_corpora.setdefault(context, {
+            bucket_id: set() for bucket_id in CALIBRATION_BUCKET_IDS
+        })
         cell = _cell(item["cell"], f"comparison:{index}.cell")
         cell_id = _cell_id(cell)
         if SPLITS[cell["corpus"]] != "calibration":
@@ -409,14 +474,20 @@ def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = N
             if l_metrics["channel_bytes"] <= 0 or l_metrics["elapsed_ns"] <= 0:
                 raise CalibrationError(f"comparison:{index}:zero_live_metric")
             bucket = f"{cell['profile']}/{cell['regime']}"
-            bucket_corpora[bucket].add(cell["corpus"])
-            bucket_ratios[bucket]["channel_bytes"].append(
-                float(l_metrics["channel_bytes"]) / float(p_metrics["channel_bytes"]))
-            bucket_ratios[bucket]["elapsed_ns"].append(
+            context_bucket_corpora[context][bucket].add(cell["corpus"])
+            for direction in ("C_TO_F_bytes", "F_TO_C_bytes"):
+                p_direction = p_metrics.get(direction, p_metrics["channel_bytes"])
+                l_direction = l_metrics.get(direction, l_metrics["channel_bytes"])
+                context_bucket_ratios[context][bucket].setdefault(direction, []).append(
+                    float(l_direction) / float(p_direction))
+            context_bucket_ratios[context][bucket]["elapsed_ns"].append(
                 float(l_metrics["elapsed_ns"]) / float(p_metrics["elapsed_ns"]))
         total_points += point_count
         input_bindings.append({
             "cell": cell,
+            "topology": topology,
+            "depth_class": depth_class,
+            "compatibility": "legacy_c1f1" if legacy else "explicit",
             "records_path": str(records_path.relative_to(request_root)),
             "records_sha256": records_sha,
             "records_bytes": records_bytes,
@@ -428,27 +499,51 @@ def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = N
         raise CalibrationError("comparisons:expected_exactly_16_unique_calibration_cells")
     input_bindings.sort(key=lambda item: _cell_id(item["cell"]))
     scales: dict[str, dict[str, float]] = {}
-    for bucket_id in sorted(CALIBRATION_BUCKET_IDS):
-        ratios = bucket_ratios[bucket_id]
-        if (bucket_corpora[bucket_id] != {"fmt", "RocksDB"} or
-                len(ratios["channel_bytes"]) < 2 or len(ratios["elapsed_ns"]) < 2):
-            raise CalibrationError(f"bucket:{bucket_id}:expected_two_corpora")
-        scales[bucket_id] = {
-            "channel_bytes": _median(ratios["channel_bytes"], f"{bucket_id}:channel_bytes"),
-            "elapsed_ns": _median(ratios["elapsed_ns"], f"{bucket_id}:elapsed_ns"),
-        }
+    for context in sorted(context_ids):
+        for bucket_id in sorted(CALIBRATION_BUCKET_IDS):
+            ratios = context_bucket_ratios[context][bucket_id]
+            if (context_bucket_corpora[context][bucket_id] != {"fmt", "RocksDB"} or
+                    len(ratios.get("C_TO_F_bytes", [])) < 2 or
+                    len(ratios.get("F_TO_C_bytes", [])) < 2 or
+                    len(ratios["elapsed_ns"]) < 2):
+                raise CalibrationError(f"bucket:{context}/{bucket_id}:expected_two_corpora")
+            key = f"{context}/{bucket_id}"
+            # Existing records expose only aggregate channel bytes.  A
+            # migrated legacy fixture therefore intentionally uses the same
+            # factor for both directions; explicit v2 evidence must provide
+            # directional factors (see FACTOR_FIELDS below).
+            c_factor = _median(ratios.get("C_TO_F_bytes", ratios["channel_bytes"]),
+                               f"{key}:C_TO_F_bytes")
+            f_factor = _median(ratios.get("F_TO_C_bytes", ratios["channel_bytes"]),
+                               f"{key}:F_TO_C_bytes")
+            elapsed_factor = _median(ratios["elapsed_ns"], f"{key}:elapsed_ns")
+            if context == "C1F1/legacy":
+                # Read-only aliases keep older C1F1 callers source-compatible
+                # while the canonical v2 key remains topology/depth scoped.
+                scales[bucket_id] = {
+                    "channel_bytes": c_factor,
+                    "elapsed_ns": elapsed_factor,
+                }
+            else:
+                scales[key] = {"C_TO_F_bytes": c_factor, "F_TO_C_bytes": f_factor,
+                               "elapsed_ns": elapsed_factor}
     bundle = {
         "schema": BUNDLE_SCHEMA,
         "semantics": SEMANTICS,
         "request": {"sha256": request_sha, "bytes": request_bytes},
         "predictor": predictor_identity,
         "calibration": {
+            "schema": "icecream-s8-calibration-factors-v2",
             "method": "median_live_over_predictive_v1",
             "cells": len(input_bindings),
             "points": total_points,
             "scales": scales,
+            "factor_fields": list(FACTOR_FIELDS),
+            "contexts": sorted(context_ids),
+            "legacy_contexts": sorted(context for context in context_ids
+                                       if context.endswith("/legacy")),
             "derived_metrics": {
-                "throughput_bytes_per_s": "channel_bytes * 1000000000 / elapsed_ns",
+                "throughput_bytes_per_s": "(C_TO_F_bytes + F_TO_C_bytes) * 1000000000 / elapsed_ns",
             },
         },
         "inputs": input_bindings,

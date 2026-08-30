@@ -51,6 +51,8 @@ def test_depths_select_authenticated_order_and_preserve_single_result_dir(tmp_pa
         plan = runner.build_plan(*common[:3], result_dir, *common[3:], depth)
         plans[depth] = plan
         assert len(plan["inputs"]) == (depth if isinstance(depth, int) else 201)
+        assert plan["request"]["depth_class"] == ("full" if depth == "full" else str(depth))
+        assert plan["scheduling"]["depth_class"] == plan["request"]["depth_class"]
         assert plan["inputs"][0]["ordinal"] == 0
         assert plan["inputs"][-1]["ordinal"] == len(plan["inputs"]) - 1
         assert not result_dir.exists()
@@ -93,6 +95,9 @@ def test_repeat_full_requires_matching_prior_full_plan(tmp_path: Path) -> None:
     repeat = runner.build_plan(manifest, source_root, matrix, repeat_dir,
                                "DuckDB", "P29", "cold", "repeat-full", full_path)
     assert repeat["request"]["requested_curve_points"] == "repeat-full"
+    assert full["request"]["depth_class"] == "full"
+    assert repeat["request"]["depth_class"] == "full"
+    assert repeat["scheduling"]["depth_class"] == "full"
     assert repeat["repeat_of"]["sha256"] == hashlib.sha256(full_path.read_bytes()).hexdigest()
     assert len(repeat["inputs"]) == 4
 

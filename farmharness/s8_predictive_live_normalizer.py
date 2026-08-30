@@ -258,9 +258,16 @@ def comparison_descriptor(plan_sha256: str, scheduling: object) -> dict[str, str
     if (not isinstance(topology, str) or not topology or
             not isinstance(assignments, list) or not assignments):
         raise NormalizationError("comparison:scheduling_projection_invalid")
-    scheduling_sha256 = hashlib.sha256(canonical_bytes(
-        {"topology": topology, "assignments": assignments}
-    )).hexdigest()
+    projection: dict[str, object] = {"topology": topology, "assignments": assignments}
+    # New depth plans bind their calibration class into the comparison key.
+    # Omit it for legacy scheduling objects so historical artifacts retain
+    # their original join identity.
+    if "depth_class" in scheduling:
+        depth_class = scheduling["depth_class"]
+        if not isinstance(depth_class, str) or not depth_class:
+            raise NormalizationError("comparison:scheduling_depth_class_invalid")
+        projection["depth_class"] = depth_class
+    scheduling_sha256 = hashlib.sha256(canonical_bytes(projection)).hexdigest()
     comparison_id = hashlib.sha256(canonical_bytes(
         {"schema": COMPARISON_SCHEMA, "plan_sha256": plan_sha256,
          "scheduling_sha256": scheduling_sha256}

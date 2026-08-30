@@ -235,6 +235,9 @@ def _validate_plan(plan_path: Path) -> tuple[dict[str, object], dict[str, str], 
     depth = request.get("depth")
     if depth not in (100, 200, "full", "repeat-full"):
         raise MultiTUPredictiveError("plan:depth_invalid")
+    expected_depth_class = "full" if depth == "repeat-full" else (str(depth) if isinstance(depth, int) else depth)
+    if request.get("depth_class") != expected_depth_class:
+        raise MultiTUPredictiveError("plan:depth_class_invalid")
     try:
         expected_inputs, expected_selection = depth_runner.select_inputs(all_inputs, depth)
     except depth_runner.DepthPlanError as exc:
@@ -296,7 +299,10 @@ def _validate_scheduling(plan: dict[str, object], inputs: list[dict[str, object]
     if not isinstance(topology, str):
         raise MultiTUPredictiveError("plan:scheduling_topology_invalid")
     try:
-        expected = depth_runner.build_schedule(inputs, topology)
+        request = plan.get("request")
+        depth = request.get("depth") if isinstance(request, dict) else None
+        depth_class = "full" if depth == "repeat-full" else (str(depth) if isinstance(depth, int) else depth)
+        expected = depth_runner.build_schedule(inputs, topology, depth_class)
     except depth_runner.DepthPlanError as exc:
         raise MultiTUPredictiveError(str(exc)) from exc
     if scheduling != expected:
@@ -737,7 +743,15 @@ def _product_curve_rows(product_rows: list[dict[str, object]], inputs: list[dict
         was_started = state is not None and int(state.get("next_step", 0)) > 0
         if state is None:
             state = engine.new_relationship_state(topology, cell, topology_digest)
-        simulated, state = engine.predict_sequential(raw, topology, cell, state, calibration)
+        depth_class = scheduling.get("depth_class")
+        if not isinstance(depth_class, str):
+            raise MultiTUPredictiveError("plan:scheduling_depth_class_missing")
+        try:
+            simulated, state = engine.predict_sequential(
+                raw, topology, cell, state, calibration, depth_class,
+                str(scheduling["topology"]))
+        except engine.PredictionError as exc:
+            raise MultiTUPredictiveError(str(exc)) from exc
         encoded_source = product["encoded_source_bytes"]
         if type(encoded_source) is not int or encoded_source < 0:
             raise MultiTUPredictiveError("product_simulator:encoded_source_invalid")
@@ -748,6 +762,9 @@ def _product_curve_rows(product_rows: list[dict[str, object]], inputs: list[dict
         modeled_elapsed = simulated["elapsed_ns"]
         if not isinstance(modeled_channel, dict) or not isinstance(modeled_elapsed, dict):
             raise MultiTUPredictiveError("predictive_engine:model_shape_invalid")
+        # The product's encoded-source count is authoritative for C_TO_F.  A
+        # calibration factor may shape a standalone causal estimate, but it
+        # must never rewrite bytes observed at this product boundary.
         c_to_f = encoded_source
         f_to_c = modeled_channel["F_TO_C"]
         elapsed = modeled_elapsed["total"]
@@ -997,6 +1014,13 @@ def produce(plan_path: Path, engine_manifest: Path, product_build_root: Path,
         raise MultiTUPredictiveError("engine_manifest:cell_or_split_mismatch")
     calibration = (engine.load_calibration_bundle(calibration_bundle)
                    if calibration_bundle is not None else None)
+    if calibration is not None:
+        try:
+            engine._calibration_factors(calibration, topology, cell,
+                                        str(scheduling["depth_class"]),
+                                        str(scheduling["topology"]))
+        except engine.PredictionError as exc:
+            raise MultiTUPredictiveError(str(exc)) from exc
     model_id = (str(calibration["model_id"]) if calibration is not None
                 else str(engine.BASE_MODEL["id"]))
     if not SAFE_ID.fullmatch(model_id):
@@ -1094,6 +1118,13 @@ def produce_pair(first_plan_path: Path, repeat_plan_path: Path, engine_manifest:
         raise MultiTUPredictiveError("engine_manifest:cell_or_split_mismatch")
     calibration = (engine.load_calibration_bundle(calibration_bundle)
                    if calibration_bundle is not None else None)
+    if calibration is not None:
+        try:
+            engine._calibration_factors(calibration, topology, cell,
+                                        str(scheduling["depth_class"]),
+                                        str(scheduling["topology"]))
+        except engine.PredictionError as exc:
+            raise MultiTUPredictiveError(str(exc)) from exc
     model_id = str(calibration["model_id"]) if calibration is not None else str(engine.BASE_MODEL["id"])
     topology_digest = str(topology_facts["sha256"])
     first_dir = Path(str(first["result"]["directory"]))

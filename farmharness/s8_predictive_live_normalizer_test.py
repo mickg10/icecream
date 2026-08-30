@@ -170,6 +170,15 @@ def test_plan_capture_id_changes_with_authenticated_schedule_or_topology() -> No
         changed_sha, changed["scheduling"])["comparison_id"]
 
 
+def test_plan_capture_id_binds_depth_class_when_declared() -> None:
+    scheduling = {"topology": "C1F1", "depth_class": "100",
+                  "assignments": [{"ordinal": 0, "global_slot": 0}]}
+    changed = {**scheduling, "depth_class": "200"}
+    plan_sha = "a" * 64
+    assert comparison_descriptor(plan_sha, scheduling)["comparison_id"] != comparison_descriptor(
+        plan_sha, changed)["comparison_id"]
+
+
 @pytest.mark.parametrize(
     "cell", DECLARED_CELLS,
     ids=lambda value: f"{value['corpus']}-{value['profile']}-{value['regime']}",

@@ -22,8 +22,8 @@ from s8_predictive_engine import (
     SEMANTICS as ENGINE_SEMANTICS,
     TOPOLOGY_SCHEMA,
     canonical_bytes as engine_canonical_bytes,
-    load_calibration_bundle,
-    predict,
+    load_calibration_bundle, load_inputs,
+    predict, _predict_curve, PredictionError,
 )
 from s8_predictive_live_normalizer import RECORD_SCHEMA
 
@@ -359,3 +359,57 @@ def test_calibrated_engine_and_driver_expose_stable_model_id(tmp_path: Path) -> 
     records = [json.loads(line) for line in (experiment / "records.jsonl").read_bytes().splitlines()]
     assert records[0]["model_id"].startswith("s8-causal-performance-v2-cal-")
     assert records[1]["model_id"] != records[0]["model_id"]
+
+
+def test_v2_bundle_scopes_factors_to_explicit_topology_and_depth(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    value = json.loads(request.read_bytes())
+    for comparison in value["comparisons"]:
+        comparison["topology"] = "C1F1"
+        comparison["depth_class"] = "full"
+    request.write_bytes(canonical_bytes(value) + b"\n")
+    bundle = tmp_path / "bundle.json"
+    manifest = tmp_path / "manifest.json"
+    freeze(request, bundle, manifest)
+    loaded = load_calibration_bundle(manifest)
+    assert loaded["contexts"] == ["C1F1/full"]
+    assert set(loaded["scales"]) == {
+        f"C1F1/full/{profile}/{regime}"
+        for profile in ("ZSTD_TU", "ZSTD_ROUTE", "P29", "GRZ_RESIDUAL")
+        for regime in ("cold", "warm")
+    }
+    engine_manifest = _engine_inputs(tmp_path / "engine")
+    _value, _raw, _input, _facts, _sha, topology, cell = load_inputs(engine_manifest)
+    with pytest.raises(PredictionError, match="unsupported_context:C1F20/full"):
+        _predict_curve(b"payload", topology, cell, loaded, "full", "C1F20")
+
+
+def test_v2_freeze_preserves_directional_factors(tmp_path: Path) -> None:
+    request, comparisons = _request(tmp_path)
+    for comparison in comparisons:
+        comparison["topology"] = "C1F1"
+        comparison["depth_class"] = "100"
+        path = tmp_path / comparison["records"]["path"]
+        records = [json.loads(line) for line in path.read_bytes().splitlines()]
+        for record in records[:2]:
+            for row in record["raw_cumulative_curve"]:
+                total = row["cumulative"]["channel_bytes"]
+                if record["record_type"] == "predictive_sim":
+                    row["cumulative"].update({"C_TO_F_bytes": total * 0.6,
+                                               "F_TO_C_bytes": total * 0.4})
+                else:
+                    row["cumulative"].update({"C_TO_F_bytes": total * 0.8,
+                                               "F_TO_C_bytes": total * 0.2})
+        raw = b"".join(canonical_bytes(record) + b"\n" for record in records)
+        path.write_bytes(raw)
+        comparison["records"].update({"sha256": hashlib.sha256(raw).hexdigest(),
+                                       "bytes": len(raw)})
+    request.write_bytes(canonical_bytes({
+        "schema": REQUEST_SCHEMA, "semantics": SEMANTICS,
+        "predictor": PREDICTOR, "comparisons": comparisons,
+    }) + b"\n")
+    bundle = tmp_path / "bundle.json"
+    freeze(request, bundle)
+    scales = json.loads(bundle.read_bytes())["calibration"]["scales"]
+    assert scales["C1F1/100/ZSTD_TU/cold"]["C_TO_F_bytes"] == pytest.approx(5 / 3)
+    assert scales["C1F1/100/ZSTD_TU/cold"]["F_TO_C_bytes"] == pytest.approx(5 / 8)

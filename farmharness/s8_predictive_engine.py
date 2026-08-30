@@ -25,12 +25,12 @@ from typing import Any
 try:  # Works both as a module and as a directly invoked harness script.
     from .s8_schema import (
         CALIBRATION_CORPORA, CORPORA, CURRENT_SEMANTICS, DECLARED_CELLS,
-        HELD_OUT_CORPORA, PROFILES, REGIMES, SPLITS,
+        HELD_OUT_CORPORA, PROFILES, REGIMES, SPLITS, TOPOLOGIES, DEPTH_CLASSES,
     )
 except ImportError:  # pragma: no cover - exercised by direct script runners.
     from s8_schema import (
         CALIBRATION_CORPORA, CORPORA, CURRENT_SEMANTICS, DECLARED_CELLS,
-        HELD_OUT_CORPORA, PROFILES, REGIMES, SPLITS,
+        HELD_OUT_CORPORA, PROFILES, REGIMES, SPLITS, TOPOLOGIES, DEPTH_CLASSES,
     )
 
 # Compatibility name for callers constructing the default fmt calibration
@@ -41,8 +41,10 @@ MANIFEST_SCHEMA = "icecream-s8-predictive-engine-manifest-v3"
 TOPOLOGY_SCHEMA = "icecream-c1f1-topology-state-v1"
 OBSERVATIONS_SCHEMA = "icecream-s8-predictive-performance-v2"
 ARTIFACT_SCHEMA = "icecream-s8-predictive-artifact-v3"
-CALIBRATION_MANIFEST_SCHEMA = "icecream-s8-calibration-model-manifest-v1"
-CALIBRATION_BUNDLE_SCHEMA = "icecream-s8-calibration-model-bundle-v1"
+CALIBRATION_MANIFEST_SCHEMA = "icecream-s8-calibration-model-manifest-v2"
+CALIBRATION_BUNDLE_SCHEMA = "icecream-s8-calibration-model-bundle-v2"
+LEGACY_CALIBRATION_MANIFEST_SCHEMA = "icecream-s8-calibration-model-manifest-v1"
+LEGACY_CALIBRATION_BUNDLE_SCHEMA = "icecream-s8-calibration-model-bundle-v1"
 HEX64 = set("0123456789abcdef")
 HEX40 = set("0123456789abcdef")
 MAX_INPUT_BYTES = 64 * 1024 * 1024
@@ -240,8 +242,9 @@ def load_calibration_bundle(manifest_path: Path) -> dict[str, object]:
     expected_keys = {"schema", "semantics", "bundle", "request", "predictor", "inputs"}
     if not isinstance(value, dict) or set(value) != expected_keys:
         raise PredictionError("calibration_manifest:fields_invalid")
-    if value["schema"] != CALIBRATION_MANIFEST_SCHEMA or value["semantics"] != SEMANTICS:
+    if value["schema"] not in {CALIBRATION_MANIFEST_SCHEMA, LEGACY_CALIBRATION_MANIFEST_SCHEMA} or value["semantics"] != SEMANTICS:
         raise PredictionError("calibration_manifest:schema_or_semantics_invalid")
+    migrated = value["schema"] == LEGACY_CALIBRATION_MANIFEST_SCHEMA
     predictor = value["predictor"]
     if not isinstance(predictor, dict) or set(predictor) != {"source_commit", "source_tree", "model_id"}:
         raise PredictionError("calibration_manifest:predictor_invalid")
@@ -258,7 +261,8 @@ def load_calibration_bundle(manifest_path: Path) -> dict[str, object]:
     if not isinstance(bundle, dict) or set(bundle) != {
             "schema", "semantics", "request", "predictor", "calibration", "inputs"}:
         raise PredictionError("calibration_bundle:fields_invalid")
-    if bundle["schema"] != CALIBRATION_BUNDLE_SCHEMA or bundle["semantics"] != SEMANTICS:
+    expected_bundle_schema = (LEGACY_CALIBRATION_BUNDLE_SCHEMA if migrated else CALIBRATION_BUNDLE_SCHEMA)
+    if bundle["schema"] != expected_bundle_schema or bundle["semantics"] != SEMANTICS:
         raise PredictionError("calibration_bundle:schema_or_semantics_invalid")
     if bundle["predictor"] != predictor:
         raise PredictionError("calibration_bundle:predictor_identity_mismatch")
@@ -273,13 +277,16 @@ def load_calibration_bundle(manifest_path: Path) -> dict[str, object]:
         for cell in DECLARED_CELLS if SPLITS[cell["corpus"]] == "calibration"
     }
     seen_cells: set[str] = set()
+    binding_contexts: set[str] = set()
     bucket_corpora: dict[str, set[str]] = {
         f"{profile}/{regime}": set()
         for profile in PROFILE_MODELS for regime in REGIME_MODELS
     }
     for binding in bundle["inputs"]:
-        if not isinstance(binding, dict) or set(binding) != {
-                "cell", "records_path", "records_sha256", "records_bytes"}:
+        expected_binding_keys = {"cell", "records_path", "records_sha256", "records_bytes"}
+        if not migrated:
+            expected_binding_keys |= {"topology", "depth_class", "compatibility"}
+        if not isinstance(binding, dict) or set(binding) != expected_binding_keys:
             raise PredictionError("calibration_bundle:input_binding_invalid")
         cell = binding["cell"]
         if not isinstance(cell, dict) or set(cell) != {"corpus", "profile", "regime"}:
@@ -288,6 +295,16 @@ def load_calibration_bundle(manifest_path: Path) -> dict[str, object]:
         if cell_id not in expected_cells or cell_id in seen_cells:
             raise PredictionError(f"calibration_bundle:input_cell_duplicate_or_invalid:{cell_id}")
         seen_cells.add(cell_id)
+        if migrated:
+            topology, depth_class = "C1F1", "legacy"
+        else:
+            topology, depth_class = binding["topology"], binding["depth_class"]
+            if (topology not in TOPOLOGIES or
+                    depth_class not in (set(DEPTH_CLASSES) - {"legacy"} | {"legacy"}) or
+                    (depth_class == "legacy" and topology != "C1F1") or
+                    binding["compatibility"] != ("legacy_c1f1" if depth_class == "legacy" else "explicit")):
+                raise PredictionError("calibration_bundle:context_invalid")
+        binding_contexts.add(f"{topology}/{depth_class}")
         bucket_corpora[f"{cell['profile']}/{cell['regime']}"].add(cell["corpus"])
         path = binding["records_path"]
         if (not isinstance(path, str) or not path or Path(path).is_absolute() or
@@ -309,11 +326,46 @@ def load_calibration_bundle(manifest_path: Path) -> dict[str, object]:
     expected_buckets = {f"{profile}/{regime}"
                         for profile in PROFILE_MODELS for regime in REGIME_MODELS}
     scales = calibration["scales"]
-    if set(scales) != expected_buckets:
-        raise PredictionError("calibration_bundle:bucket_set_invalid")
-    for bucket, bucket_scales in scales.items():
-        if not isinstance(bucket_scales, dict) or set(bucket_scales) != {"channel_bytes", "elapsed_ns"}:
-            raise PredictionError(f"calibration_bundle:bucket_invalid:{bucket}")
+    canonical_scales: dict[str, dict[str, object]] = {}
+    if migrated:
+        if set(scales) != expected_buckets:
+            raise PredictionError("calibration_bundle:bucket_set_invalid")
+        for bucket, bucket_scales in scales.items():
+            if not isinstance(bucket_scales, dict) or set(bucket_scales) != {"channel_bytes", "elapsed_ns"}:
+                raise PredictionError(f"calibration_bundle:bucket_invalid:{bucket}")
+            canonical_scales[f"C1F1/legacy/{bucket}"] = {
+                "C_TO_F_bytes": bucket_scales["channel_bytes"],
+                "F_TO_C_bytes": bucket_scales["channel_bytes"],
+                "elapsed_ns": bucket_scales["elapsed_ns"],
+            }
+    else:
+        contexts = calibration.get("contexts")
+        if (not isinstance(contexts, list) or not contexts or
+                any(not isinstance(context, str) or "/" not in context for context in contexts)):
+            raise PredictionError("calibration_bundle:contexts_invalid")
+        if binding_contexts != set(contexts):
+            raise PredictionError("calibration_bundle:context_binding_mismatch")
+        expected_keys = {f"{context}/{bucket}" for context in contexts for bucket in expected_buckets}
+        legacy_aliases = (expected_buckets if set(contexts) == {"C1F1/legacy"} else set())
+        # Aliases are permitted only for migrated legacy fixtures; a v2 bundle
+        # must have no unscoped aggregate bucket capable of leaking to C1F20.
+        accepted_keys = expected_keys | legacy_aliases
+        # v2 bundles emitted from a legacy request intentionally contain only
+        # the old aliases; those aliases are still normalized to a scoped
+        # C1F1/legacy context below.
+        if set(scales) not in (expected_keys, accepted_keys, legacy_aliases):
+            raise PredictionError("calibration_bundle:bucket_set_invalid")
+        for bucket, bucket_scales in scales.items():
+            expected_fields = ({"channel_bytes", "elapsed_ns"} if bucket in legacy_aliases else
+                               {"C_TO_F_bytes", "F_TO_C_bytes", "elapsed_ns"})
+            if not isinstance(bucket_scales, dict) or set(bucket_scales) != expected_fields:
+                raise PredictionError(f"calibration_bundle:bucket_invalid:{bucket}")
+            canonical_scales[bucket if bucket not in legacy_aliases else f"C1F1/legacy/{bucket}"] = (
+                {"C_TO_F_bytes": bucket_scales["channel_bytes"],
+                 "F_TO_C_bytes": bucket_scales["channel_bytes"],
+                 "elapsed_ns": bucket_scales["elapsed_ns"]}
+                if bucket in legacy_aliases else bucket_scales)
+    for bucket, bucket_scales in canonical_scales.items():
         for metric, scale in bucket_scales.items():
             if type(scale) not in (int, float) or not math.isfinite(float(scale)) or scale <= 0:
                 raise PredictionError(f"calibration_bundle:scale_invalid:{bucket}:{metric}")
@@ -321,7 +373,8 @@ def load_calibration_bundle(manifest_path: Path) -> dict[str, object]:
         "bundle": bundle,
         "bundle_sha256": bundle_facts["sha256"],
         "manifest_sha256": manifest_facts["sha256"],
-        "scales": scales,
+        "scales": canonical_scales,
+        "contexts": sorted({key.rsplit("/", 2)[0] for key in canonical_scales}),
         "model_id": f"{BASE_MODEL['id']}-cal-{bundle_facts['sha256']}",
     }
 
@@ -409,8 +462,41 @@ def _payload_stats(raw: bytes) -> tuple[int, float, float]:
     return size, entropy, transitions / max(1, size - 1)
 
 
+def _calibration_factors(calibration: dict[str, object], topology: dict[str, object],
+                         cell: dict[str, str], depth_class: str,
+                         topology_name: str | None = None) -> dict[str, float]:
+    topology_values = topology.get("topology")
+    if not isinstance(topology_values, dict):
+        raise PredictionError("calibration:topology_missing")
+    # The calibration topology key is the scheduling topology, not the
+    # physical cache-channel name.  C1F20 therefore cannot fall back to the
+    # C1F1 aggregate bundle.
+    topology_name = topology_name or topology_values.get("topology", topology_values.get("suite"))
+    if topology_name is None:
+        # Engine topology artifacts predate the scheduling name.  Worker
+        # cardinality is an unambiguous local derivation for this compatibility
+        # path and never broadens a C1F1 calibration to C1F20.
+        topology_name = "C1F1" if topology_values.get("f_workers") == 1 else "C1F20"
+    if topology_name not in TOPOLOGIES:
+        raise PredictionError("calibration:topology_unsupported")
+    if depth_class not in DEPTH_CLASSES:
+        raise PredictionError("calibration:depth_class_unsupported")
+    context = f"{topology_name}/{depth_class}"
+    scales = calibration.get("scales")
+    if not isinstance(scales, dict):
+        raise PredictionError("calibration:scales_invalid")
+    bucket = scales.get(f"{context}/{cell['profile']}/{cell['regime']}")
+    if bucket is None:
+        raise PredictionError(f"calibration:unsupported_context:{context}")
+    if not isinstance(bucket, dict) or set(bucket) != {"C_TO_F_bytes", "F_TO_C_bytes", "elapsed_ns"}:
+        raise PredictionError("calibration:factor_shape_invalid")
+    return {field: float(bucket[field]) for field in ("C_TO_F_bytes", "F_TO_C_bytes", "elapsed_ns")}
+
+
 def _predict_curve(raw: bytes, topology: dict[str, object], cell: dict[str, str],
-                   calibration: dict[str, object] | None = None) -> list[dict[str, object]]:
+                   calibration: dict[str, object] | None = None,
+                   depth_class: str = "legacy",
+                   calibration_topology: str | None = None) -> list[dict[str, object]]:
     t = topology["topology"]
     assert isinstance(t, dict)
     c_workers, f_workers = int(t["c_workers"]), int(t["f_workers"])
@@ -419,14 +505,13 @@ def _predict_curve(raw: bytes, topology: dict[str, object], cell: dict[str, str]
     regime_model = REGIME_MODELS[cell["regime"]]
     channel_model = CHANNEL_MODELS[t["cache_channel"]]
     calibrated_model_id = BASE_MODEL["id"]
-    channel_scale = elapsed_scale = 1.0
+    c_to_f_scale = f_to_c_scale = elapsed_scale = 1.0
     if calibration is not None:
-        scales = calibration["scales"]
-        assert isinstance(scales, dict)
-        bucket = scales[f"{cell['profile']}/{cell['regime']}"]
-        assert isinstance(bucket, dict)
-        channel_scale = float(bucket["channel_bytes"])
-        elapsed_scale = float(bucket["elapsed_ns"])
+        factors = _calibration_factors(calibration, topology, cell, depth_class,
+                                       calibration_topology)
+        c_to_f_scale = factors["C_TO_F_bytes"]
+        f_to_c_scale = factors["F_TO_C_bytes"]
+        elapsed_scale = factors["elapsed_ns"]
         calibrated_model_id = str(calibration["model_id"])
     cumulative_c_to_f = cumulative_f_to_c = cumulative_elapsed = 0
     rows: list[dict[str, object]] = []
@@ -451,9 +536,11 @@ def _predict_curve(raw: bytes, topology: dict[str, object], cell: dict[str, str]
                              channel_model["overhead"]) if raw_size else 0
         result_bytes = base_result_bytes
         if raw_size:
-            # Calibration applies one bucket factor to both channel directions.
-            source_bytes = max(1, round(source_bytes * channel_scale))
-            result_bytes = max(1, round(base_result_bytes * channel_scale))
+            # Standalone causal predictions use direction-specific factors.
+            # Product batch callers replace C_TO_F with authenticated product
+            # bytes at the boundary below.
+            source_bytes = max(1, round(source_bytes * c_to_f_scale))
+            result_bytes = max(1, round(base_result_bytes * f_to_c_scale))
         compress_ns = (BASE_MODEL["base_compress_ns"] + raw_size * BASE_MODEL["compress_ns_per_byte"] + c_workers - 1) // c_workers
         uplink_rate = (BASE_MODEL["uplink_bytes_per_ns"] * c_workers /
                        (profile_model["uplink_factor"] * channel_model["uplink_factor"]))
@@ -600,7 +687,9 @@ def _validate_relationship_state(state: object, topology: dict[str, object],
 
 def predict_sequential(raw: bytes, topology: dict[str, object], cell: dict[str, str],
                        state: dict[str, object],
-                       calibration: dict[str, object] | None = None) -> tuple[dict[str, object], dict[str, object]]:
+                       calibration: dict[str, object] | None = None,
+                       depth_class: str = "legacy",
+                       calibration_topology: str | None = None) -> tuple[dict[str, object], dict[str, object]]:
     """Predict one TU and advance a declared relationship state.
 
     ``ZSTD_TU`` clears relationship caches at every boundary.  The route and
@@ -619,7 +708,8 @@ def predict_sequential(raw: bytes, topology: dict[str, object], cell: dict[str, 
         state["c_cache_bytes"] = 0
         state["f_cache_digest"] = None
         state["reset_points"].append(step)
-    rows = _predict_curve(raw, topology, cell, calibration)
+    rows = _predict_curve(raw, topology, cell, calibration, depth_class,
+                          calibration_topology)
     if len(rows) != 1:
         raise PredictionError("relationship:one_tu_prediction_required")
     row = rows[0]
@@ -670,7 +760,8 @@ def _write_new(path: Path, raw: bytes, label: str) -> None:
 
 
 def predict(manifest_path: Path, out_path: Path, sim_binary: Path | None = None,
-            calibration_bundle: Path | None = None) -> dict[str, object]:
+            calibration_bundle: Path | None = None, *, depth_class: str = "legacy",
+            calibration_topology: str | None = None) -> dict[str, object]:
     """Produce a raw cumulative prediction curve and authenticated sidecar.
 
     ``sim_binary`` remains an ignored compatibility argument for callers of
@@ -679,7 +770,8 @@ def predict(manifest_path: Path, out_path: Path, sim_binary: Path | None = None,
     del sim_binary
     manifest, input_raw, input_facts, topology_facts, manifest_sha, topology, cell = load_inputs(manifest_path)
     calibration = load_calibration_bundle(calibration_bundle) if calibration_bundle is not None else None
-    rows = _predict_curve(input_raw, topology, cell, calibration)
+    rows = _predict_curve(input_raw, topology, cell, calibration, depth_class,
+                          calibration_topology)
     payload = b"".join(canonical_bytes(row) + b"\n" for row in rows)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     sidecar_path = out_path.with_name(out_path.name + ".manifest.json")
@@ -702,9 +794,10 @@ def predict(manifest_path: Path, out_path: Path, sim_binary: Path | None = None,
                                   "regime": REGIME_MODELS[cell["regime"]]},
             **({"calibration": {
                 "bundle_sha256": calibration["bundle_sha256"],
-                "bucket": f"{cell['profile']}/{cell['regime']}",
-                "channel_bytes_scale": calibration["scales"][f"{cell['profile']}/{cell['regime']}"]["channel_bytes"],
-                "elapsed_ns_scale": calibration["scales"][f"{cell['profile']}/{cell['regime']}"]["elapsed_ns"],
+                "context": f"{calibration_topology or 'C1F1'}/{depth_class}",
+                "factor_fields": ["C_TO_F_bytes", "F_TO_C_bytes", "elapsed_ns"],
+                "factors": _calibration_factors(calibration, topology, cell, depth_class,
+                                                  calibration_topology),
                 "throughput": "derived_from_calibrated_channel_bytes_and_elapsed_ns",
             }} if calibration is not None else {}),
             "topology_effects": {"c_workers": "producer compression and uplink share",
@@ -727,10 +820,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sim", type=Path)
     parser.add_argument("--calibration-manifest", type=Path,
                         help="authenticated frozen calibration model manifest")
+    parser.add_argument("--depth-class", choices=tuple(DEPTH_CLASSES), default="legacy")
+    parser.add_argument("--calibration-topology", choices=TOPOLOGIES)
     args = parser.parse_args(argv)
     try:
         predict(args.manifest.absolute(), args.out.absolute(), args.sim,
-                args.calibration_manifest.absolute() if args.calibration_manifest else None)
+                args.calibration_manifest.absolute() if args.calibration_manifest else None,
+                depth_class=args.depth_class, calibration_topology=args.calibration_topology)
     except PredictionError as exc:
         print(str(exc), file=sys.stderr)
         return 77
