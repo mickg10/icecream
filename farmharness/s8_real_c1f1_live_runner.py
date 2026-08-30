@@ -197,6 +197,7 @@ def load_batch_manifest(path: Path, expected_count: int = 100) -> list[dict[str,
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
     compile_databases: dict[str, tuple[str, list[object]]] = {}
+    compile_match_indexes: dict[str, dict[tuple[Path, Path], list[dict[str, Any]]]] = {}
     for ordinal, value in enumerate(values):
         if not isinstance(value, dict):
             _fail(f"batch_manifest:{ordinal}:object_required")
@@ -274,18 +275,24 @@ def load_batch_manifest(path: Path, expected_count: int = 100) -> list[dict[str,
                 _fail(f"batch_manifest:{ordinal}:compile_db_digest_mismatch")
             source_path = Path(compile_source).resolve()
             output_path = Path(compile_output).resolve()
-            matches = []
-            for entry in cached[1]:
-                if not isinstance(entry, dict) or not isinstance(entry.get("directory"), str):
-                    continue
-                entry_source = entry.get("file")
-                if not isinstance(entry_source, str):
-                    continue
-                resolved_output = compile_entry_output(entry)
-                if (Path(entry_source).resolve() == source_path and
-                        resolved_output == output_path and
-                        isinstance(entry.get("command"), str)):
-                    matches.append(entry)
+            match_index = compile_match_indexes.get(str(db_path))
+            if match_index is None:
+                match_index = {}
+                for entry in cached[1]:
+                    if (not isinstance(entry, dict) or
+                            not isinstance(entry.get("directory"), str)):
+                        continue
+                    entry_source = entry.get("file")
+                    if not isinstance(entry_source, str):
+                        continue
+                    resolved_output = compile_entry_output(entry)
+                    if (resolved_output is None or
+                            not isinstance(entry.get("command"), str)):
+                        continue
+                    key = (Path(entry_source).resolve(), resolved_output)
+                    match_index.setdefault(key, []).append(entry)
+                compile_match_indexes[str(db_path)] = match_index
+            matches = match_index.get((source_path, output_path), [])
             if len(matches) != 1:
                 _fail(f"batch_manifest:{ordinal}:compile_entry_not_unique")
             row.update({"compile_db": str(db_path), "compile_db_sha256": db_sha,

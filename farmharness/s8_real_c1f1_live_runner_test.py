@@ -54,6 +54,45 @@ def _batch(tmp_path: Path, count: int = 100) -> Path:
     return path
 
 
+def _compile_batch(tmp_path: Path, count: int = 100) -> Path:
+    source_root = tmp_path / "source"
+    output_root = source_root / "build"
+    payload_root = tmp_path / "payload"
+    output_root.mkdir(parents=True)
+    payload_root.mkdir()
+    entries = []
+    rows = []
+    for ordinal in range(count):
+        source = source_root / f"source-{ordinal:03d}.cc"
+        source.write_text(f"int source_{ordinal}() {{ return {ordinal}; }}\n")
+        payload = payload_root / f"source-{ordinal:03d}.ii"
+        payload.write_text(f"int source_{ordinal}();\n")
+        output = output_root / f"source-{ordinal:03d}.o"
+        entries.append({"directory": str(output_root), "file": str(source),
+                        "output": str(output),
+                        "command": f"/usr/bin/c++ -DORDINAL={ordinal} -o {output} -c {source}"})
+        payload_raw = payload.read_bytes()
+        rows.append({"tu_id": f"duck-tu-{ordinal:03d}", "source": str(source),
+                     "source_relative": f"source-{ordinal:03d}.ii",
+                     "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                     "predictive_input": {
+                         "ordinal": ordinal, "path": str(payload),
+                         "source_relative": f"source-{ordinal:03d}.ii",
+                         "sha256": hashlib.sha256(payload_raw).hexdigest(),
+                         "bytes": len(payload_raw)},
+                     "compile_db": str(tmp_path / "compile_commands.json"),
+                     "compile_db_sha256": "", "compile_source": str(source),
+                     "compile_output": str(output)})
+    compile_db = tmp_path / "compile_commands.json"
+    compile_db.write_text(json.dumps(entries, sort_keys=True))
+    db_sha = hashlib.sha256(compile_db.read_bytes()).hexdigest()
+    for row in rows:
+        row["compile_db_sha256"] = db_sha
+    batch = tmp_path / "compile-batch.jsonl"
+    batch.write_text("".join(json.dumps(row, sort_keys=True) + "\n" for row in rows))
+    return batch
+
+
 def _topology(tmp_path: Path, batch: Path) -> Path:
     rows = [json.loads(line) for line in batch.read_text().splitlines()]
     path = tmp_path / "topology.json"
@@ -113,6 +152,23 @@ def test_input_digest_matches_source_manifest_plus_ordered_payload_contract(tmp_
     expected_digest = hashlib.sha256(runner._canonical(expected)).hexdigest()
     assert runner.payload_descriptor_digest(rows, source_manifest_sha) == expected_digest
     assert runner.payload_descriptors(rows)[0]["source_relative"] == "translation-units/tu-000.ii"
+
+
+def test_compile_binding_parses_each_database_command_once(tmp_path: Path,
+                                                           monkeypatch: pytest.MonkeyPatch) -> None:
+    batch = _compile_batch(tmp_path)
+    calls = 0
+    original = runner.compile_entry_output
+
+    def counted(entry: object) -> Path | None:
+        nonlocal calls
+        calls += 1
+        return original(entry)
+
+    monkeypatch.setattr(runner, "compile_entry_output", counted)
+    rows = runner.load_batch_manifest(batch)
+    assert len(rows) == 100
+    assert calls == 100
 
 
 def test_predictive_plan_path_swap_is_rejected(tmp_path: Path) -> None:
