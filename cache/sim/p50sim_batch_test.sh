@@ -31,6 +31,32 @@ assert route[1]["f_store_guid"] == route[0]["f_store_guid"]
 assert route[1]["c_to_f_bytes"] != tu[1]["c_to_f_bytes"] or route[1]["state_digest"] != tu[1]["state_digest"]
 PY
 
+printf '%s\n%s\n%s\n%s\n' "$work/a.ii" "$work/b.ii" \
+    "$work/a.ii" "$work/b.ii" > "$work/repeated.manifest"
+printf '%s\n%s\n%s\n%s\n%s\n' cardinality=1 0 0 0 0 > "$work/repeated.map"
+if ICECC_P50_PROFILE=ZSTD_TU "$sim" \
+       --batch-manifest "$work/repeated.manifest" \
+       --batch-assignment-map "$work/repeated.map" \
+       --batch-output "$work/repeated-rejected.jsonl" 2>"$work/repeated.err"; then
+    echo "p50sim_batch_test: repeated paths accepted without explicit occurrence mode" >&2
+    exit 1
+fi
+grep -q 'batch TU manifest contains a duplicate path' "$work/repeated.err"
+ICECC_P50_PROFILE=ZSTD_TU "$sim" \
+    --batch-manifest "$work/repeated.manifest" \
+    --batch-assignment-map "$work/repeated.map" \
+    --batch-output "$work/repeated.jsonl" \
+    --batch-allow-repeated-inputs 1
+python3 - "$work/repeated.jsonl" <<'PY'
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1])]
+assert len(rows) == 4
+assert [row["tu_index"] for row in rows] == [0, 1, 2, 3]
+assert [row["tu_seq"] for row in rows] == [0, 1, 2, 3]
+assert rows[0]["raw_digest"] == rows[2]["raw_digest"]
+assert rows[0]["transaction_digest"] != rows[2]["transaction_digest"]
+PY
+
 for n in 0 1 2 3 4 5 6 7 8 9; do
     printf 'unit-%s\n' "$n" > "$work/$n.ii"
     printf '%s\n' "$work/$n.ii" >> "$work/manifest20"

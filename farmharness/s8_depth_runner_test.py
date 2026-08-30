@@ -59,6 +59,27 @@ def test_depths_select_authenticated_order_and_preserve_single_result_dir(tmp_pa
     assert plans[100]["source_manifest"]["sha256"] == plans[200]["source_manifest"]["sha256"]
 
 
+def test_short_corpus_repeats_explicit_build_occurrences_for_100_and_200(tmp_path: Path) -> None:
+    source_root, manifest = _inputs(tmp_path, 50)
+    matrix = tmp_path / "matrix.json"
+    _matrix(matrix)
+    for depth, cycles in ((100, 2), (200, 4)):
+        result_dir = tmp_path / f"s8-fmt-ZSTD_TU-cold-20260829T000000Z-{depth}"
+        plan = runner.build_plan(manifest, source_root, matrix, result_dir,
+                                 "fmt", "ZSTD_TU", "cold", depth)
+        assert len(plan["inputs"]) == depth
+        assert [item["ordinal"] for item in plan["inputs"]] == list(range(depth))
+        assert plan["inputs"][0]["path"] == plan["inputs"][50]["path"]
+        assert plan["inputs"][0]["sha256"] == plan["inputs"][50]["sha256"]
+        assert plan["request"]["source_selection"] == {
+            "policy": "manifest_order_cycles_then_prefix",
+            "source_manifest_entries": 50,
+            "complete_build_cycles": cycles,
+            "tail_entries": 0,
+            "occurrence_identity": "global_ordinal_plus_source_digest",
+        }
+
+
 def test_repeat_full_requires_matching_prior_full_plan(tmp_path: Path) -> None:
     source_root, manifest = _inputs(tmp_path, 4)
     matrix = tmp_path / "matrix.json"

@@ -26,10 +26,12 @@ from typing import Any
 
 try:
     from . import s6_live_route_acceptance as action_parser
+    from . import s8_depth_runner as depth_runner
     from . import s8_predictive_live_normalizer as normalizer
     from .s8_schema import CORPORA, PROFILES, REGIMES, SPLITS
 except ImportError:  # pragma: no cover
     import s6_live_route_acceptance as action_parser
+    import s8_depth_runner as depth_runner
     import s8_predictive_live_normalizer as normalizer
     from s8_schema import CORPORA, PROFILES, REGIMES, SPLITS
 
@@ -281,10 +283,26 @@ def load_predictive_plan(path: Path, *, corpus: str, profile: str, regime: str,
         source_lines = [line.strip() for line in source_path.read_text().splitlines()]
     except (OSError, UnicodeError) as exc:
         raise LiveRunnerError("predictive_plan:source_manifest_unreadable") from exc
-    if source["entries"] != len(source_lines) or len(inputs) > len(source_lines):
+    if source["entries"] != len(source_lines):
         _fail("predictive_plan:source_manifest_entries_mismatch")
     if depth not in {"full", "repeat-full"} and len(inputs) != int(depth):
         _fail("predictive_plan:input_count_mismatch")
+    try:
+        inventory, _manifest_facts = depth_runner._manifest_inputs(
+            source_path, Path(source_root), "source_manifest")
+        expected_inputs, expected_selection = depth_runner.select_inputs(
+            inventory, int(depth) if depth.isdigit() else depth)
+    except depth_runner.DepthPlanError as exc:
+        raise LiveRunnerError(str(exc)) from exc
+    request = value.get("request")
+    if not isinstance(request, dict):
+        _fail("predictive_plan:request_invalid")
+    declared_selection = request.get("source_selection")
+    if declared_selection is None:
+        if len(expected_inputs) > len(inventory):
+            _fail("predictive_plan:source_selection_required_for_repetition")
+    elif declared_selection != expected_selection:
+        _fail("predictive_plan:source_selection_mismatch")
     for ordinal, item in enumerate(inputs):
         if (not isinstance(item, dict) or set(item) != {"ordinal", "path", "source_relative", "sha256", "bytes"} or
                 item["ordinal"] != ordinal or not isinstance(item["path"], str) or
@@ -301,13 +319,13 @@ def load_predictive_plan(path: Path, *, corpus: str, profile: str, regime: str,
         digest, size = _sha(item_path)
         if digest != item["sha256"] or size != item["bytes"]:
             _fail(f"predictive_plan:input_mismatch:{ordinal}")
-        if ordinal >= len(source_lines):
-            _fail("predictive_plan:source_manifest_short")
-        listed = Path(source_lines[ordinal])
+        listed = Path(source_lines[ordinal % len(source_lines)])
         if not listed.is_absolute():
             listed = Path(source_root) / listed
         if listed.resolve() != item_path.resolve():
             _fail(f"predictive_plan:input_sequence_mismatch:{ordinal}")
+    if inputs != expected_inputs:
+        _fail("predictive_plan:source_selection_mismatch")
     return value, [dict(item) for item in inputs], plan_sha
 
 

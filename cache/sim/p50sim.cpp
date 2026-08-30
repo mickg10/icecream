@@ -142,6 +142,7 @@ struct Arguments {
     std::string batch_assignment_map_2;
     std::string batch_assignment_map_3;
     std::string batch_output;
+    bool batch_allow_repeated_inputs = false;
 };
 
 ProfileId selected_profile() {
@@ -224,6 +225,13 @@ Arguments parse(int argc, char** argv) {
             result.batch_assignment_map_3 = argv[++index];
         else if (option == "--batch-output")
             result.batch_output = argv[++index];
+        else if (option == "--batch-allow-repeated-inputs") {
+            const std::string value = argv[++index];
+            if (value != "0" && value != "1")
+                throw std::invalid_argument(
+                    "--batch-allow-repeated-inputs must be 0 or 1");
+            result.batch_allow_repeated_inputs = value == "1";
+        }
         else
             throw std::invalid_argument("unknown option " + option);
     }
@@ -233,7 +241,8 @@ Arguments parse(int argc, char** argv) {
                        !result.batch_assignment_map.empty() ||
                        !result.batch_assignment_map_2.empty() ||
                        !result.batch_assignment_map_3.empty() ||
-                       !result.batch_output.empty();
+                       !result.batch_output.empty() ||
+                       result.batch_allow_repeated_inputs;
     if (batch) {
         if (result.batch_manifest.empty() || result.batch_assignment_map.empty() ||
             result.batch_output.empty() || !result.input.empty() ||
@@ -298,7 +307,8 @@ std::string trim_copy(std::string value) {
     return value;
 }
 
-std::vector<std::string> read_batch_manifest(const std::string& path) {
+std::vector<std::string> read_batch_manifest(const std::string& path,
+                                             bool allow_repeated_inputs) {
     std::ifstream input(path);
     if (!input)
         throw std::runtime_error("cannot open batch TU manifest: " + path);
@@ -314,7 +324,8 @@ std::vector<std::string> read_batch_manifest(const std::string& path) {
         throw std::invalid_argument("batch TU manifest is empty");
     std::vector<std::string> sorted = result;
     std::sort(sorted.begin(), sorted.end());
-    if (std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end())
+    if (!allow_repeated_inputs &&
+        std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end())
         throw std::invalid_argument("batch TU manifest contains a duplicate path");
     return result;
 }
@@ -523,7 +534,8 @@ void write_batch_row(std::ostream& output, std::string_view segment,
 
 void run_batch(const Arguments& arguments) {
     const ProfileId profile = selected_profile();
-    const std::vector<std::string> first = read_batch_manifest(arguments.batch_manifest);
+    const std::vector<std::string> first = read_batch_manifest(
+        arguments.batch_manifest, arguments.batch_allow_repeated_inputs);
     size_t relationship_count = 0;
     const std::vector<size_t> first_assignments = read_batch_assignments(
         arguments.batch_assignment_map, first.size(), &relationship_count);
@@ -532,7 +544,8 @@ void run_batch(const Arguments& arguments) {
     std::vector<std::string> third;
     std::vector<size_t> third_assignments;
     if (!arguments.batch_manifest_2.empty()) {
-        second = read_batch_manifest(arguments.batch_manifest_2);
+        second = read_batch_manifest(arguments.batch_manifest_2,
+                                     arguments.batch_allow_repeated_inputs);
         size_t second_relationship_count = 0;
         second_assignments = read_batch_assignments(arguments.batch_assignment_map_2,
                                                     second.size(), &second_relationship_count);
@@ -543,7 +556,8 @@ void run_batch(const Arguments& arguments) {
             throw std::invalid_argument("repeat segment assignment map differs from segment one");
     }
     if (!arguments.batch_manifest_3.empty()) {
-        third = read_batch_manifest(arguments.batch_manifest_3);
+        third = read_batch_manifest(arguments.batch_manifest_3,
+                                    arguments.batch_allow_repeated_inputs);
         size_t third_relationship_count = 0;
         third_assignments = read_batch_assignments(
             arguments.batch_assignment_map_3, third.size(), &third_relationship_count);

@@ -181,6 +181,24 @@ def test_producer_emits_100_ordered_points_and_continuous_relationship(tmp_path:
     assert not (output / "live_summary.jsonl").exists()
 
 
+def test_short_corpus_repeated_build_occurrences_produce_distinct_curve_points(
+        tmp_path: Path) -> None:
+    plan_path = _plan(tmp_path / "short", 50, 100, "100", profile="ZSTD_TU")
+    manifest = _template(tmp_path / "template-short",
+                         {"corpus": "DuckDB", "profile": "ZSTD_TU", "regime": "cold"})
+    plan = json.loads(plan_path.read_text())
+    output = Path(plan["result"]["directory"])
+    _produce(plan_path, manifest)
+    rows = [json.loads(line) for line in
+            (output / "predictive_sim.jsonl").read_text().splitlines()]
+    assert len(rows) == 100
+    assert len({row["tu_id"] for row in rows}) == 100
+    assert plan["inputs"][0]["path"] == plan["inputs"][50]["path"]
+    assert plan["inputs"][0]["sha256"] == plan["inputs"][50]["sha256"]
+    assert rows[0]["input_sha256"] == rows[50]["input_sha256"]
+    assert rows[0]["tu_id"] != rows[50]["tu_id"]
+
+
 def test_warm_curve_excludes_authenticated_prewarm_and_carries_boundary(tmp_path: Path) -> None:
     plan_path = _plan(tmp_path / "warm", 100, 100, "warm", "warm", "P29")
     plan = json.loads(plan_path.read_bytes())

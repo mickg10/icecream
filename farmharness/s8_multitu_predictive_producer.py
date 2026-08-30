@@ -227,7 +227,7 @@ def _validate_plan(plan_path: Path) -> tuple[dict[str, object], dict[str, str], 
             manifest_read_facts["bytes"] != source_facts["bytes"]):
         raise MultiTUPredictiveError("plan:source_manifest_changed_while_reading")
     inputs = value.get("inputs")
-    if not isinstance(inputs, list) or not inputs or len(inputs) > len(all_inputs):
+    if not isinstance(inputs, list) or not inputs:
         raise MultiTUPredictiveError("plan:inputs_invalid")
     request = value.get("request")
     if not isinstance(request, dict):
@@ -235,11 +235,23 @@ def _validate_plan(plan_path: Path) -> tuple[dict[str, object], dict[str, str], 
     depth = request.get("depth")
     if depth not in (100, 200, "full", "repeat-full"):
         raise MultiTUPredictiveError("plan:depth_invalid")
-    expected_len = depth if isinstance(depth, int) else len(all_inputs)
+    try:
+        expected_inputs, expected_selection = depth_runner.select_inputs(all_inputs, depth)
+    except depth_runner.DepthPlanError as exc:
+        raise MultiTUPredictiveError(str(exc)) from exc
+    expected_len = len(expected_inputs)
     if len(inputs) != expected_len or request.get("requested_curve_points") not in (depth, "full", "repeat-full"):
         raise MultiTUPredictiveError("plan:depth_input_count_mismatch")
-    if inputs != all_inputs[:len(inputs)]:
-        raise MultiTUPredictiveError("plan:input_sequence_not_manifest_prefix")
+    declared_selection = request.get("source_selection")
+    if declared_selection is None:
+        # Plans emitted before explicit occurrence selection remain valid only
+        # when they never repeat the retained inventory.
+        if len(expected_inputs) > len(all_inputs):
+            raise MultiTUPredictiveError("plan:source_selection_required_for_repetition")
+    elif declared_selection != expected_selection:
+        raise MultiTUPredictiveError("plan:source_selection_invalid")
+    if inputs != expected_inputs:
+        raise MultiTUPredictiveError("plan:input_sequence_not_declared_selection")
     for index, item in enumerate(inputs):
         if not isinstance(item, dict) or set(item) != {"ordinal", "path", "source_relative", "sha256", "bytes"}:
             raise MultiTUPredictiveError(f"plan:input_descriptor_invalid:{index}")
@@ -550,6 +562,14 @@ def _product_rows(simulator: Path, inputs: list[dict[str, object]], assignments:
                                 "".join(str(value) + "\n" for value in values3), encoding="ascii")
             command += ["--batch-manifest-3", str(manifest3),
                         "--batch-assignment-map-3", str(mapping3)]
+        segments_for_identity = [inputs]
+        if second_inputs is not None:
+            segments_for_identity.append(second_inputs)
+        if third_inputs is not None:
+            segments_for_identity.append(third_inputs)
+        if any(len({str(item["path"]) for item in segment}) != len(segment)
+               for segment in segments_for_identity):
+            command += ["--batch-allow-repeated-inputs", "1"]
         env = os.environ.copy()
         env["ICECC_P50_PROFILE"] = cell["profile"]
         try:

@@ -8,6 +8,8 @@ import pytest
 
 import s8_live_batch_prep as prep
 import s8_real_c1f1_live_runner as live_runner
+import s8_depth_runner as depth_runner
+from s8_schema import CORPORA, PROFILES, REGIMES, SPLITS
 
 
 def _fixture(tmp_path: Path, topology: str = "C1F1") -> tuple[Path, Path, Path, Path]:
@@ -153,3 +155,59 @@ def test_missing_compile_output_mapping_fails_closed(tmp_path: Path) -> None:
                      compile_output_root=output_root,
                      compile_source_root=source_root,
                      output=tmp_path / "prepared")
+
+
+def test_short_corpus_repetitions_share_one_compile_binding_per_source(
+        tmp_path: Path) -> None:
+    corpus = tmp_path / "corpus"
+    source_root = tmp_path / "source"
+    output_root = source_root / "build"
+    output_root.mkdir(parents=True)
+    entries = []
+    manifest_lines = []
+    for ordinal in range(50):
+        relative = Path("units") / f"unit-{ordinal:03d}.ii"
+        predictive = corpus / relative
+        predictive.parent.mkdir(parents=True, exist_ok=True)
+        predictive.write_text(f"int unit_{ordinal}();\n")
+        manifest_lines.append(str(predictive))
+        source = source_root / relative.with_suffix(".cc")
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(f"int unit_{ordinal}() {{ return {ordinal}; }}\n")
+        object_path = output_root / relative.with_suffix(".o")
+        entries.append({"directory": str(output_root), "file": str(source),
+                        "output": str(object_path),
+                        "command": f"/usr/bin/c++ -o {object_path} -c {source}"})
+    manifest = corpus / "manifest.txt"
+    manifest.write_text("\n".join(manifest_lines) + "\n")
+    matrix = tmp_path / "matrix.json"
+    cells = [{"cell": f"{corpus_name}/{profile}/{regime}",
+              "split": SPLITS[corpus_name]}
+             for corpus_name in CORPORA for profile in PROFILES for regime in REGIMES]
+    matrix.write_text(json.dumps({
+        "schema": depth_runner.MATRIX_AUDIT_SCHEMA, "status": "PASS",
+        "matrix": {"expected_cells": 32, "completed_cells": 32,
+                   "missing_cells": [], "invalid_candidates": [],
+                   "calibration_cells": 16, "held_out_validation_cells": 16},
+        "cells": cells,
+    }, sort_keys=True) + "\n")
+    result_dir = tmp_path / "s8-fmt-ZSTD_TU-cold-20260829T000000Z-100"
+    plan_value = depth_runner.build_plan(
+        manifest, corpus, matrix, result_dir, "fmt", "ZSTD_TU", "cold", 100,
+        topology="C1F20")
+    plan = tmp_path / "predictive-plan.json"
+    plan.write_text(json.dumps(plan_value, sort_keys=True) + "\n")
+    compile_db = tmp_path / "compile_commands.json"
+    compile_db.write_text(json.dumps(entries, sort_keys=True) + "\n")
+
+    target = prep.prepare(predictive_plan=plan, compile_db=compile_db,
+                          compile_output_root=output_root,
+                          compile_source_root=source_root,
+                          output=tmp_path / "prepared")
+    rows = live_runner.load_batch_manifest(target / "batch-manifest.jsonl", 100)
+    selected = json.loads((target / "selected-compile-commands.json").read_text())
+    assert len(selected) == 50
+    assert len({row["tu_id"] for row in rows}) == 100
+    assert rows[0]["predictive_input"]["path"] == rows[50]["predictive_input"]["path"]
+    assert rows[0]["compile_source"] == rows[50]["compile_source"]
+    assert rows[0]["compile_output"] == rows[50]["compile_output"]

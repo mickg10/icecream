@@ -161,8 +161,18 @@ def prepare(*, predictive_plan: Path, compile_db: Path, compile_output_root: Pat
         selected.append(entry)
 
     output.mkdir(parents=True, exist_ok=False)
+    # A short corpus may intentionally contribute multiple build occurrences
+    # at the 100/200 checkpoints.  Keep one authoritative compile command per
+    # source/output identity; occurrence rows below may reference it repeatedly.
+    selected_unique: list[dict[str, Any]] = []
+    selected_keys: set[bytes] = set()
+    for entry in selected:
+        key = _canonical(entry)
+        if key not in selected_keys:
+            selected_keys.add(key)
+            selected_unique.append(entry)
     selected_db = output / "selected-compile-commands.json"
-    live_runner._write_new(selected_db, _canonical(selected) + b"\n")
+    live_runner._write_new(selected_db, _canonical(selected_unique) + b"\n")
     selected_db_descriptor = _descriptor(selected_db)
 
     rows: list[dict[str, Any]] = []

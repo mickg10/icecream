@@ -84,6 +84,50 @@ def build_schedule(inputs: list[dict[str, Any]], topology: str) -> dict[str, Any
     }
 
 
+def select_inputs(all_inputs: list[dict[str, Any]],
+                  depth: int | str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Select compile occurrences while keeping the source inventory immutable.
+
+    The 100/200 checkpoints are compile-job counts.  A retained corpus may be
+    smaller (fmt has 50 TUs), in which case whole manifest-order build cycles
+    are repeated and each occurrence receives a new global ordinal.  The file
+    path and digest remain unchanged, so a repeated compile is explicit rather
+    than being presented as a new source TU.
+    """
+    if not all_inputs:
+        raise DepthPlanError("request:empty_source_manifest")
+    if isinstance(depth, int):
+        if depth <= 0:
+            raise DepthPlanError("request:depth_invalid")
+        source_entries = len(all_inputs)
+        complete_cycles, tail_entries = divmod(depth, source_entries)
+        selected = []
+        for ordinal in range(depth):
+            item = dict(all_inputs[ordinal % source_entries])
+            item["ordinal"] = ordinal
+            selected.append(item)
+        policy = ("manifest_prefix" if depth <= source_entries else
+                  "manifest_order_cycles_then_prefix")
+        selection = {
+            "policy": policy,
+            "source_manifest_entries": source_entries,
+            "complete_build_cycles": complete_cycles,
+            "tail_entries": tail_entries,
+            "occurrence_identity": "global_ordinal_plus_source_digest",
+        }
+        return selected, selection
+    if depth not in ("full", "repeat-full"):
+        raise DepthPlanError("request:depth_invalid")
+    selected = [dict(item) for item in all_inputs]
+    return selected, {
+        "policy": "full_manifest_once",
+        "source_manifest_entries": len(all_inputs),
+        "complete_build_cycles": 1,
+        "tail_entries": 0,
+        "occurrence_identity": "global_ordinal_plus_source_digest",
+    }
+
+
 def _digest(path: Path, label: str, limit: int = MAX_INPUT_BYTES) -> dict[str, Any]:
     try:
         info = path.lstat()
@@ -237,14 +281,9 @@ def build_plan(source_manifest: Path, source_root: Path, matrix_audit: Path,
         raise DepthPlanError(f"result_dir:already_exists:{result_dir}")
     matrix_facts = _matrix_precondition(matrix_audit, cell)
     all_inputs, manifest_facts = _manifest_inputs(source_manifest, source_root, "source_manifest")
-    if isinstance(depth, int):
-        selected = all_inputs[:depth]
-        if len(selected) != depth:
-            raise DepthPlanError(f"request:insufficient_inputs:{len(all_inputs)}<{depth}")
-        requested_points: int | str = depth
-    else:
-        selected = all_inputs
-        requested_points = "repeat-full" if depth == "repeat-full" else "full"
+    selected, source_selection = select_inputs(all_inputs, depth)
+    requested_points: int | str = (depth if isinstance(depth, int) else
+                                   "repeat-full" if depth == "repeat-full" else "full")
     if depth == "repeat-full":
         if repeat_of is None:
             raise DepthPlanError("repeat_of:required_for_repeat_full")
@@ -260,7 +299,8 @@ def build_plan(source_manifest: Path, source_root: Path, matrix_audit: Path,
         "schema": SCHEMA, "semantics": CURRENT_SEMANTICS,
         "cell": cell, "split": SPLITS[corpus],
         "request": {"depth": depth, "requested_curve_points": requested_points,
-                    "base_matrix_cells": 32},
+                    "base_matrix_cells": 32,
+                    "source_selection": source_selection},
         "source_manifest": source["manifest"], "source_root": source["root"],
         "matrix_precondition": matrix_facts,
         "inputs": selected,
