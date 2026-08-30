@@ -613,7 +613,7 @@ static UseCSMsg *get_server(MsgChannel *local_daemon)
         const long parsed = ::strtol(configured_timeout, &end, 10);
         if (errno == 0 && end != configured_timeout && *end == '\0' && parsed > 0 &&
             parsed <= INT_MAX)
-            timeout = static_cast<int>(parsed);
+            timeout = std::max(timeout, static_cast<int>(parsed));
     }
     Msg *umsg = local_daemon->get_msg( timeout );
 
