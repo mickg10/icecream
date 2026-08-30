@@ -93,6 +93,68 @@ def _hex(value: object, label: str) -> str:
     return value.lower()
 
 
+def _compile_entry_output_operand(entry: object) -> tuple[Path, str] | None:
+    """Return the command working directory and its single ``-o`` operand."""
+    if not isinstance(entry, dict):
+        return None
+    directory, command = entry.get("directory"), entry.get("command")
+    if not isinstance(directory, str) or not os.path.isabs(directory) or not isinstance(command, str):
+        return None
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    outputs: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "-o":
+            if index + 1 >= len(tokens):
+                return None
+            outputs.append(tokens[index + 1])
+            index += 2
+            continue
+        if token.startswith("-o") and len(token) > 2:
+            outputs.append(token[2:])
+        index += 1
+    if len(outputs) != 1 or not outputs[0]:
+        return None
+    return Path(directory), outputs[0]
+
+
+def compile_entry_output(entry: object) -> Path | None:
+    """Resolve the object actually named by the compile command's ``-o``.
+
+    CMake's optional compile-database ``output`` field can be relative to the
+    top-level build tree even when ``directory`` is a subdirectory.  The
+    command itself runs in ``directory`` and is the execution authority used
+    to create the retained corpus, so its single ``-o`` operand is the only
+    reliable live binding.
+    """
+    parsed = _compile_entry_output_operand(entry)
+    if parsed is None:
+        return None
+    directory, operand = parsed
+    output = Path(operand)
+    return (output if output.is_absolute() else directory / output).resolve()
+
+
+def compile_entry_predictive_relative(entry: object) -> str | None:
+    """Project a command output to the corpus path used by preprocess_corpus.py."""
+    parsed = _compile_entry_output_operand(entry)
+    if parsed is None:
+        return None
+    directory, operand = parsed
+    output = Path(operand)
+    relative = os.path.relpath(output, directory) if output.is_absolute() else operand
+    relative = relative.lstrip("./")
+    path = Path(relative)
+    if (not relative or path.is_absolute() or any(part in ("", ".", "..") for part in path.parts)):
+        return None
+    return (path.with_suffix(".ii") if path.suffix == ".o" else
+            Path(f"{path.as_posix()}.ii")).as_posix()
+
+
 DEPTH_COUNTS = {"100": 100, "200": 200}
 MAX_TIMEOUT_SECONDS = 4 * 60 * 60
 
@@ -210,14 +272,11 @@ def load_batch_manifest(path: Path, expected_count: int = 100) -> list[dict[str,
                 if not isinstance(entry, dict) or not isinstance(entry.get("directory"), str):
                     continue
                 entry_source = entry.get("file")
-                entry_output = entry.get("output")
-                if not isinstance(entry_source, str) or not isinstance(entry_output, str):
+                if not isinstance(entry_source, str):
                     continue
-                resolved_output = Path(entry_output)
-                if not resolved_output.is_absolute():
-                    resolved_output = Path(entry["directory"]) / resolved_output
+                resolved_output = compile_entry_output(entry)
                 if (Path(entry_source).resolve() == source_path and
-                        resolved_output.resolve() == output_path and
+                        resolved_output == output_path and
                         isinstance(entry.get("command"), str)):
                     matches.append(entry)
             if len(matches) != 1:

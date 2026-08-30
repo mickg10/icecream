@@ -113,6 +113,30 @@ def test_prepare_binds_duplicate_sources_by_exact_compile_output(tmp_path: Path)
     assert json.loads((target / "prep-manifest.json").read_text())["status"] == "READY"
 
 
+def test_prepare_uses_command_output_when_cmake_metadata_is_top_build_relative(
+        tmp_path: Path) -> None:
+    plan, compile_db, output_root, source_root = _fixture(tmp_path)
+    command_root = output_root / "test"
+    command_root.mkdir()
+    entries = json.loads(compile_db.read_text())
+    for entry in entries:
+        actual = Path(entry["output"])
+        relative = actual.relative_to(output_root)
+        entry["directory"] = str(command_root)
+        entry["command"] = entry["command"].replace(str(actual), relative.as_posix())
+        entry["output"] = (Path("test") / relative).as_posix()
+    compile_db.write_text(json.dumps(entries, sort_keys=True))
+
+    target = prep.prepare(predictive_plan=plan, compile_db=compile_db,
+                          compile_output_root=command_root,
+                          compile_source_root=source_root,
+                          output=tmp_path / "prepared")
+    rows = live_runner.load_batch_manifest(target / "batch-manifest.jsonl")
+    assert rows[0]["compile_output"] == str(
+        (command_root / "target-000/same.cpp.o").resolve())
+    assert len({row["compile_output"] for row in rows}) == 100
+
+
 def test_compile_output_cannot_be_rebound_to_another_predictive_tu(tmp_path: Path) -> None:
     plan, compile_db, output_root, source_root = _fixture(tmp_path)
     target = prep.prepare(predictive_plan=plan, compile_db=compile_db,

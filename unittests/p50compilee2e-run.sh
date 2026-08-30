@@ -447,10 +447,26 @@ import json, os, shlex, sys
 db, source, expected_db_output, staged, output = sys.argv[1:]
 entries = json.load(open(db, encoding='utf-8'))
 def resolved_output(entry):
-    value = entry.get('output')
     directory = entry.get('directory')
-    if not isinstance(value, str) or not isinstance(directory, str):
+    command = entry.get('command')
+    if not isinstance(directory, str) or not isinstance(command, str):
         return None
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    outputs = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == '-o':
+            if index + 1 >= len(tokens): return None
+            outputs.append(tokens[index + 1]); index += 2; continue
+        if token.startswith('-o') and len(token) > 2:
+            outputs.append(token[2:])
+        index += 1
+    if len(outputs) != 1 or not outputs[0]: return None
+    value = outputs[0]
     return os.path.realpath(value if os.path.isabs(value) else os.path.join(directory, value))
 matches = [e for e in entries if isinstance(e, dict) and
            os.path.realpath(e.get('file', '')) == os.path.realpath(source) and

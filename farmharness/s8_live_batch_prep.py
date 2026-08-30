@@ -100,24 +100,24 @@ def _compile_map(path: Path, output_root: Path) -> tuple[list[dict[str, Any]], d
             continue
         directory_path = Path(directory)
         source_path = Path(source)
-        output_path = Path(output)
         if not directory_path.is_absolute() or not source_path.is_absolute():
             continue
-        if not output_path.is_absolute():
-            output_path = directory_path / output_path
+        output_path = live_runner.compile_entry_output(entry)
+        predictive_relative = live_runner.compile_entry_predictive_relative(entry)
+        if output_path is None or predictive_relative is None:
+            continue
         try:
-            output_relative = _inside(output_path, output_root, f"compile_db:{index}.output")
+            _inside(output_path, output_root, f"compile_db:{index}.output")
         except BatchPrepError:
             continue
-        if output_relative.suffix != ".o":
+        if output_path.suffix != ".o":
             continue
-        predictive_relative = output_relative.with_suffix(".ii").as_posix()
         if predictive_relative in result:
             _fail(f"compile_db:duplicate_output:{predictive_relative}")
         normalized = dict(entry)
         normalized["directory"] = str(directory_path.resolve())
         normalized["file"] = str(source_path.resolve())
-        normalized["output"] = str(output_path.resolve())
+        normalized["output"] = str(output_path)
         result[predictive_relative] = normalized
     return value, result
 
