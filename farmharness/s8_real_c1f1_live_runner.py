@@ -51,6 +51,7 @@ PINNED_IMAGE = "icecream/farm-node:ubuntu22-gcc11-boost174"
 DEFAULT_CONTAINER_BIND_ROOT = Path("/tanksmall")
 DEFAULT_CONTAINER_TEMP_ROOT = Path("/tmp")
 DEFAULT_CONTAINER_WORK_ROOT = Path("/p5")
+DEFAULT_REPORTED_WORKDIR = DEFAULT_CONTAINER_WORK_ROOT / "p50compilee2e.run"
 SCORED_CARET_WORKAROUND = "0"
 
 
@@ -828,9 +829,31 @@ def _validate_product_log_evidence(work: Path, observations: list[dict[str, Any]
             _fail(f"batch:{index}:product_local_fallback")
 
 
+def _reported_artifact_path(value: object, *, work: Path,
+                            reported_work: Path | None,
+                            reason: str) -> Path:
+    if not isinstance(value, str) or not value:
+        _fail(reason)
+    observed = Path(value)
+    if not observed.is_absolute() or ".." in observed.parts:
+        _fail(reason)
+    if reported_work is None:
+        return observed
+    if reported_work != DEFAULT_REPORTED_WORKDIR:
+        _fail(reason)
+    try:
+        relative = observed.relative_to(reported_work)
+    except ValueError:
+        _fail(reason)
+    if not relative.parts:
+        _fail(reason)
+    return work.joinpath(*relative.parts)
+
+
 def _timing_rows(stdout: str, rows: list[dict[str, Any]], work: Path,
                  passes: int, assignments: list[dict[str, Any]] | None = None,
-                 suite: str = TOPOLOGY) -> list[dict[str, Any]]:
+                 suite: str = TOPOLOGY,
+                 reported_work: Path | None = None) -> list[dict[str, Any]]:
     if suite not in TOPOLOGIES:
         _fail("topology:unsupported_suite")
     if assignments is None:
@@ -888,13 +911,22 @@ def _timing_rows(stdout: str, rows: list[dict[str, Any]], work: Path,
         if (observed["preprocessed_sha256"] != expected["predictive_input"]["sha256"] or
                 parsed["preprocessed_bytes"] != expected["predictive_input"]["bytes"]):
             _fail(f"batch:{index}:predictive_payload_mismatch")
-        remote_path, local_path, pre_path = Path(observed["remote_path"]), Path(observed["local_path"]), Path(observed["preprocessed_path"])
+        remote_path = _reported_artifact_path(
+            observed.get("remote_path"), work=work, reported_work=reported_work,
+            reason=f"batch:{index}:remote_object_path_invalid")
+        local_path = _reported_artifact_path(
+            observed.get("local_path"), work=work, reported_work=reported_work,
+            reason=f"batch:{index}:local_object_path_invalid")
+        pre_path = _reported_artifact_path(
+            observed.get("preprocessed_path"), work=work, reported_work=reported_work,
+            reason=f"batch:{index}:preprocessed_path_invalid")
         for path, expected_sha, expected_bytes, label in (
                 (remote_path, observed["remote_sha256"], parsed["remote_bytes"], "remote_object"),
                 (local_path, observed["local_sha256"], parsed["local_bytes"], "local_object"),
                 (pre_path, observed["preprocessed_sha256"], parsed["preprocessed_bytes"], "preprocessed")):
             expected_parent = work if label == "preprocessed" else work / "out"
-            if path.parent != expected_parent:
+            if (path.parent != expected_parent or expected_parent.is_symlink() or
+                    not expected_parent.is_dir()):
                 _fail(f"batch:{index}:{label}_path_invalid")
             digest, size = _sha(path)
             if digest != expected_sha or size != expected_bytes:
@@ -902,6 +934,12 @@ def _timing_rows(stdout: str, rows: list[dict[str, Any]], work: Path,
         if remote_path.read_bytes() != local_path.read_bytes():
             _fail(f"batch:{index}:object_not_byte_identical")
         result.append({**observed, **parsed, "run": run, "ordinal": ordinal,
+                       "reported_preprocessed_path": observed["preprocessed_path"],
+                       "reported_remote_path": observed["remote_path"],
+                       "reported_local_path": observed["local_path"],
+                       "preprocessed_path": str(pre_path),
+                       "remote_path": str(remote_path),
+                       "local_path": str(local_path),
                        # Compatibility aliases below remain internal to the
                        # current curve builder.  Product evidence uses the
                        # explicit planned/observed names above.
@@ -1260,10 +1298,16 @@ def _retained_workdir(stdout: str, *, host_workdir: Path | None = None,
             _fail("product_run:workdir_mapping_incomplete")
         work = observed
     else:
-        if reported_workdir is None or observed != reported_workdir:
+        if (reported_workdir != DEFAULT_REPORTED_WORKDIR or
+                observed != DEFAULT_REPORTED_WORKDIR):
             _fail("product_run:workdir_mapping_mismatch")
         work = host_workdir
-    if work.is_symlink() or not work.is_dir():
+    try:
+        canonical_work = work.resolve(strict=True)
+    except OSError:
+        _fail("product_run:workdir_unavailable")
+    if (not work.is_absolute() or work.is_symlink() or not work.is_dir() or
+            canonical_work != work):
         _fail("product_run:workdir_unavailable")
     return work
 
@@ -1353,7 +1397,8 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                 launch_identity.get("binary_sha256") != binaries or
                 launch_identity.get("runner_sha256") != runner_sha):
             _fail("product_identity:changed_during_run")
-    observations = _timing_rows(stdout, rows, work, passes, assignments, suite)
+    observations = _timing_rows(stdout, rows, work, passes, assignments, suite,
+                                reported_workdir)
     batch_windows = _batch_windows(stdout, observations, rows, passes, suite)
     _validate_product_log_evidence(work, observations, profile)
     stages = _action_stage(work, len(observations), assignments, suite)
@@ -1776,7 +1821,7 @@ def main(argv: list[str] | None = None) -> int:
                 prefix="p5.", dir=container_temp_root))
             run_work_parent.chmod(0o711)
             run_workdir = run_work_parent / "p50compilee2e.run"
-            command_workdir = DEFAULT_CONTAINER_WORK_ROOT / "p50compilee2e.run"
+            command_workdir = DEFAULT_REPORTED_WORKDIR
             runtime_image = container_image_identity(args.container_image)
             execution_environment = "pinned_container_product_build"
         else:

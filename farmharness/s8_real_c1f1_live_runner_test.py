@@ -411,7 +411,7 @@ def test_container_temp_root_must_be_a_real_directory(tmp_path: Path) -> None:
 def test_container_reported_workdir_maps_to_retained_host_tree(tmp_path: Path) -> None:
     host = tmp_path / "p50compilee2e.run"
     host.mkdir()
-    reported = runner.DEFAULT_CONTAINER_WORK_ROOT / "p50compilee2e.run"
+    reported = runner.DEFAULT_REPORTED_WORKDIR
     assert runner._retained_workdir(
         f"S7_WORKDIR={reported}\n", host_workdir=host,
         reported_workdir=reported) == host
@@ -419,6 +419,88 @@ def test_container_reported_workdir_maps_to_retained_host_tree(tmp_path: Path) -
         runner._retained_workdir(
             "S7_WORKDIR=/wrong/p50compilee2e.run\n", host_workdir=host,
             reported_workdir=reported)
+    real_parent = tmp_path / "real"
+    real_parent.mkdir()
+    (real_parent / "p50compilee2e.run").mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(real_parent, target_is_directory=True)
+    with pytest.raises(runner.LiveRunnerError, match="workdir_unavailable"):
+        runner._retained_workdir(
+            f"S7_WORKDIR={reported}\n",
+            host_workdir=alias / "p50compilee2e.run",
+            reported_workdir=reported)
+
+
+def test_container_reported_artifacts_map_only_beneath_exact_workdir(
+        tmp_path: Path) -> None:
+    host = tmp_path / "p50compilee2e.run"
+    reported = runner.DEFAULT_REPORTED_WORKDIR
+    mapped = runner._reported_artifact_path(
+        str(reported / "out" / "remote-full-1-0.o"), work=host,
+        reported_work=reported, reason="artifact_path_invalid")
+    assert mapped == host / "out" / "remote-full-1-0.o"
+    for invalid in (
+            Path("out/remote-full-1-0.o"),
+            reported.parent / "other" / "remote-full-1-0.o",
+            reported / ".." / "other" / "remote-full-1-0.o"):
+        with pytest.raises(runner.LiveRunnerError, match="artifact_path_invalid"):
+            runner._reported_artifact_path(
+                str(invalid), work=host, reported_work=reported,
+                reason="artifact_path_invalid")
+    with pytest.raises(runner.LiveRunnerError, match="artifact_path_invalid"):
+        runner._reported_artifact_path(
+            "/untrusted-prefix/out/remote-full-1-0.o", work=host,
+            reported_work=Path("/untrusted-prefix"),
+            reason="artifact_path_invalid")
+
+
+def test_timing_rows_read_container_artifacts_from_retained_host_tree(
+        tmp_path: Path) -> None:
+    host = tmp_path / "p50compilee2e.run"
+    (host / "out").mkdir(parents=True)
+    reported = runner.DEFAULT_REPORTED_WORKDIR
+    preprocessed = host / "s7-full-1-0-preprocessed.ii"
+    remote = host / "out" / "remote-full-1-0.o"
+    local = host / "out" / "local-full-1-0.o"
+    preprocessed.write_bytes(b"predictive input\n")
+    remote.write_bytes(b"object\n")
+    local.write_bytes(remote.read_bytes())
+    def digest(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    source_sha = hashlib.sha256(b"source\n").hexdigest()
+    rows = [{"tu_id": "tu-0", "sha256": source_sha,
+             "predictive_input": {"sha256": digest(preprocessed),
+                                  "bytes": preprocessed.stat().st_size}}]
+    fields = {
+        "run": "full-1", "ordinal": "0", "tu_id": "tu-0",
+        "source_sha256": source_sha,
+        "preprocessed_path": str(reported / preprocessed.name),
+        "preprocessed_sha256": digest(preprocessed),
+        "preprocessed_bytes": str(preprocessed.stat().st_size),
+        "remote_path": str(reported / "out" / remote.name),
+        "remote_sha256": digest(remote), "remote_bytes": str(remote.stat().st_size),
+        "local_path": str(reported / "out" / local.name),
+        "local_sha256": digest(local), "local_bytes": str(local.stat().st_size),
+        "admission_start_ns": "10", "compile_start_ns": "20",
+        "input_ready_ns": "30", "compile_end_ns": "40", "witness_end_ns": "50",
+        "wait_for_cs_ns": "1", "planned_assignment_ordinal": "0",
+        "planned_relationship": "0", "planned_admission_lane": "0",
+        "observed_scheduler_job_id": "1", "observed_f_service_identity": "p50-f",
+        "observed_source_tu_seq": "0",
+    }
+    stdout = "S8_BATCH_TU " + " ".join(f"{key}={value}" for key, value in fields.items())
+    observations = runner._timing_rows(
+        stdout, rows, host, 1, [{"relationship": 0, "f_slot": 0}],
+        runner.TOPOLOGY, reported)
+    assert observations[0]["preprocessed_path"] == str(preprocessed)
+    assert observations[0]["remote_path"] == str(remote)
+    assert observations[0]["local_path"] == str(local)
+    assert observations[0]["reported_remote_path"] == fields["remote_path"]
+    bad = stdout.replace(fields["remote_path"], "/p5/other/remote-full-1-0.o")
+    with pytest.raises(runner.LiveRunnerError, match="remote_object_path_invalid"):
+        runner._timing_rows(
+            bad, rows, host, 1, [{"relationship": 0, "f_slot": 0}],
+            runner.TOPOLOGY, reported)
 
 
 def test_container_cleanup_is_exact_and_tolerates_already_removed(
