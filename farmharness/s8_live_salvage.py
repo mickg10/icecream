@@ -394,6 +394,40 @@ def _write(path: Path, raw: bytes) -> None:
         os.fsync(stream.fileno())
 
 
+def _relative_output_path(root: Path, relative: str, label: str) -> Path:
+    candidate = Path(relative)
+    if candidate.is_absolute() or any(part in ("", ".", "..") for part in candidate.parts):
+        _fail(f"{label}:path_not_relative")
+    path = root / candidate
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError as exc:
+        raise SalvageError(f"{label}:path_escapes_output") from exc
+    return path
+
+
+def _post_validate_output(out: Path, experiment: dict[str, Any], witness: dict[str, Any],
+                          environment_preparation: Any) -> None:
+    for run, relative in experiment["curve_manifests"].items():
+        path = _relative_output_path(out, relative, f"output.curve_manifest.{run}")
+        if not path.is_file():
+            _fail(f"output.curve_manifest.{run}:missing")
+        normalizer._load_manifest(path, "live")
+    witness_path = _relative_output_path(out, experiment["assignment_witness"], "output.assignment_witness")
+    _, facts = _read(witness_path, "output.assignment_witness")
+    if facts["sha256"] != witness["sha256"] or facts["bytes"] != witness["bytes"]:
+        _fail("output.assignment_witness:descriptor_mismatch")
+    evidence_path = _relative_output_path(out, experiment["evidence"], "output.evidence")
+    if not evidence_path.is_file():
+        _fail("output.evidence:missing")
+    for name in ("records.jsonl", "live_curve_full-1.jsonl", "live_curve_full-2.jsonl",
+                 "live_curve_manifest.json", "live_curve.jsonl"):
+        if not (out / name).is_file():
+            _fail(f"output:{name}:missing")
+    if experiment["environment_preparation"] != environment_preparation:
+        _fail("output.environment_preparation:mismatch")
+
+
 def _curve_matches(expected_raw: bytes, actual_raw: bytes) -> bool:
     expected = _jsonl(expected_raw, "recomputed_curve")
     actual = _jsonl(actual_raw, "retained_curve")
@@ -462,8 +496,18 @@ def salvage(live_root: Path, predictive_full_1: Path, predictive_full_2: Path, o
     full2_value["curve"] = {"path": "live_curve_full-2.jsonl", "sha256": hashlib.sha256(full2_curve).hexdigest(), "bytes": len(full2_curve)}
     full2_manifest = normalizer.canonical_bytes(full2_value) + b"\n"
 
+    assignment_ref = evidence.get("witness", {}).get("assignment") if isinstance(evidence.get("witness"), dict) else None
+    if (not isinstance(assignment_ref, dict) or assignment_ref.get("path") != "product-evidence/assignment-witness.json" or
+            assignment_ref.get("sha256") is None or assignment_ref.get("bytes") is None):
+        _fail("evidence:assignment_witness_descriptor")
+    assignment_source = live_root / assignment_ref["path"]
+    assignment_desc = _descriptor(assignment_source, "assignment_witness")
+    if assignment_desc["sha256"] != assignment_ref["sha256"] or assignment_desc["bytes"] != assignment_ref["bytes"]:
+        _fail("evidence:assignment_witness_sha256")
+
     out.mkdir()
     (out / "product-evidence").mkdir()
+    _write(out / "product-evidence" / "assignment-witness.json", _read(assignment_source, "assignment_witness")[0])
     for name in ("results.jsonl", "timing_full-1.jsonl", "timing_full-2.jsonl", "timing.jsonl"):
         _write(out / name, _read(live_root / name, name)[0])
     full1_curve = _read(live_root / "live_curve_full-1.jsonl", "live_curve_full_1")[0]
@@ -488,6 +532,7 @@ def salvage(live_root: Path, predictive_full_1: Path, predictive_full_2: Path, o
         "traces": trace_desc,
         "logs": log_desc,
         "topology": plan_facts["topology"],
+        "assignment_witness": assignment_desc,
         "plans": {run: _descriptor(path, f"predictive_{run}") for run, path in zip(("full-1", "full-2"),
                                                                                       (live_root / "product-evidence" / "predictive-plan.json",
                                                                                        live_root / "product-evidence" / "predictive-plan-full-2.json"), strict=True)},
@@ -516,6 +561,10 @@ def salvage(live_root: Path, predictive_full_1: Path, predictive_full_2: Path, o
                   "predictive_plan_sha256_by_run": {run: evidence["predictive_plans"][run]["sha256"] for run in ("full-1", "full-2")},
                   "binary_sha256": evidence["binary_sha256"], "runner_sha256": evidence["runner"]["sha256"],
                   "execution_environment": evidence["execution_environment"], "runtime_image": evidence["runtime_image"],
+                  "launch_identity": {"source_commit": EXPECTED_COMMIT, "source_tree": EXPECTED_TREE,
+                                      "binary_sha256": evidence["binary_sha256"], "runner_sha256": evidence["runner"]["sha256"],
+                                      "runtime_image": evidence["runtime_image"]},
+                  "environment_preparation": evidence["environment_preparation"],
                   "execution_limits": evidence["execution_limits"], "diagnostic_policy": evidence["diagnostic_policy"],
                   "remote_compile_required": True, "replay": "immutable_salvage_from_retained_evidence", "raw_product_returncode": 0,
                   "raw_product_log_sha256": product_desc["sha256"], "curve_manifests": {"full-1": "live_curve_manifest_full-1.json", "full-2": "live_curve_manifest_full-2.json"},
@@ -530,6 +579,7 @@ def salvage(live_root: Path, predictive_full_1: Path, predictive_full_2: Path, o
                   "assignment_witness": "product-evidence/assignment-witness.json", "evidence": "salvage_manifest.json",
                   "prewarm": False, "prewarm_evidence": None}
     _write(out / "experiment_manifest.json", normalizer.canonical_bytes(experiment) + b"\n")
+    _post_validate_output(out, experiment, assignment_desc, evidence["environment_preparation"])
     return out
 
 
