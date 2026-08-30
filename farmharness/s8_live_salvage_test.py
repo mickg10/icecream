@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from s8_live_salvage import (SalvageError, _load_timing, _product_log,
-                              _validate_predictive_producer)
+                              _validate_predictive_producer, _validate_trace, salvage)
 
 
 RAW = Path(
@@ -81,3 +81,43 @@ def test_mutated_predictive_curve_is_rejected_by_adjacent_producer(tmp_path: Pat
     evidence = json.loads((RAW / "evidence.json").read_text())
     with pytest.raises(SalvageError, match="producer.full-1.curve:descriptor_mismatch"):
         _validate_predictive_producer(manifest, RAW / "product-evidence/predictive-plan.json", "full-1", evidence)
+
+
+def _trace_fixture(tmp_path: Path) -> tuple[Path, dict[str, list[dict[str, object]]]]:
+    root = tmp_path / "trace-raw"
+    evidence_dir = root / "product-evidence"
+    evidence_dir.mkdir(parents=True)
+    for name in ("s7-measured-c-action-trace.jsonl", "s7-measured-f-action-trace.jsonl"):
+        (evidence_dir / name).write_bytes((RAW / "product-evidence" / name).read_bytes())
+    timings = {run: _load_timing(RAW, run)[0] for run in ("full-1", "full-2")}
+    return root, timings
+
+
+@pytest.mark.skipif(not RAW.is_dir(), reason="terminal raw package is not mounted")
+def test_swapped_c_begin_commit_is_rejected(tmp_path: Path) -> None:
+    root, timings = _trace_fixture(tmp_path)
+    path = root / "product-evidence/s7-measured-c-action-trace.jsonl"
+    lines = path.read_text().splitlines()
+    lines[0], lines[1] = lines[1], lines[0]
+    path.write_text("\n".join(lines) + "\n")
+    with pytest.raises(SalvageError, match="c_action:ordered_sequence"):
+        _validate_trace(root, timings)
+
+
+@pytest.mark.skipif(not RAW.is_dir(), reason="terminal raw package is not mounted")
+def test_c_trace_actor_mutation_is_rejected(tmp_path: Path) -> None:
+    root, timings = _trace_fixture(tmp_path)
+    path = root / "product-evidence/s7-measured-c-action-trace.jsonl"
+    first = path.read_text().splitlines()
+    first[0] = first[0].replace('"actor":"C"', '"actor":"F"', 1)
+    path.write_text("\n".join(first) + "\n")
+    with pytest.raises(SalvageError, match="c_action:actor:0"):
+        _validate_trace(root, timings)
+
+
+@pytest.mark.skipif(not RAW.is_dir(), reason="terminal raw package is not mounted")
+def test_symlink_live_root_is_rejected(tmp_path: Path) -> None:
+    link = tmp_path / "live-link"
+    link.symlink_to(RAW, target_is_directory=True)
+    with pytest.raises(SalvageError, match="output:must_be_new_sibling"):
+        salvage(link, Path("missing-predictive-1"), Path("missing-predictive-2"), tmp_path / "sibling")

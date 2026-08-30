@@ -227,25 +227,45 @@ def _validate_trace(root: Path, timings: dict[str, list[dict[str, Any]]]) -> dic
     trace_facts: dict[str, Any] = {}
     tx: dict[str, dict[tuple[int, int], dict[str, Any]]] = {"c_action": {}, "f_action": {}}
     commits: dict[str, dict[tuple[int, int], dict[str, Any]]] = {"c_action": {}, "f_action": {}}
+    row_indices: dict[str, dict[tuple[int, int], tuple[int, int]]] = {"c_action": {}, "f_action": {}}
     for key, path in paths.items():
         raw, facts = _read(path, key, 64 * 1024 * 1024)
         rows = _jsonl(raw, key)
         trace_facts[key] = {"path": str(path.resolve()), **facts, "lines": len(rows)}
-        for row in rows:
+        expected_actor = "C" if key == "c_action" else "F"
+        for row_index, row in enumerate(rows):
+            if row.get("actor") != expected_actor:
+                _fail(f"{key}:actor:{row_index}")
             if row.get("action") == "TX_BEGIN":
                 ident = (row.get("tu_seq"), row.get("rel_seq"))
                 if not all(type(x) is int for x in ident) or ident in tx[key]:
                     _fail(f"{key}:tx_identity")
                 tx[key][ident] = row
+                prior = row_indices[key].get(ident)
+                row_indices[key][ident] = (row_index, prior[1] if prior else -1)
             commit_action = "COMMIT_ACCEPTED" if key == "c_action" else "INPUT_COMMITTED"
             if row.get("action") == commit_action:
                 ident = (row.get("tu_seq"), row.get("rel_seq"))
                 if not all(type(x) is int for x in ident) or ident in commits[key]:
                     _fail(f"{key}:commit_identity")
                 commits[key][ident] = row
+                prior = row_indices[key].get(ident)
+                row_indices[key][ident] = (prior[0] if prior else -1, row_index)
         expected = 1244 if key == "c_action" else 1244
         if len(tx[key]) != expected or len(commits[key]) != expected:
             _fail(f"{key}:tx_count")
+        if key == "c_action":
+            if len(rows) != expected * 2:
+                _fail("c_action:line_count")
+            for ordinal in range(expected * 2):
+                row = rows[ordinal]
+                wanted = "TX_BEGIN" if ordinal % 2 == 0 else "COMMIT_ACCEPTED"
+                ident = (ordinal // 2, ordinal // 2)
+                if row.get("action") != wanted or row.get("tu_seq") != ident[0] or row.get("rel_seq") != ident[1]:
+                    _fail(f"c_action:ordered_sequence:{ordinal}")
+        for ident, (begin_index, commit_index) in row_indices[key].items():
+            if begin_index < 0 or commit_index <= begin_index:
+                _fail(f"{key}:begin_commit_order:{ident}")
         trace_facts[key]["tx_begin_count"] = len(tx[key])
         trace_facts[key]["commit_count"] = len(commits[key])
     for run, rows in timings.items():
@@ -599,7 +619,12 @@ def _curve_matches(expected_raw: bytes, actual_raw: bytes) -> bool:
 def _salvage(live_root: Path, predictive_full_1: Path, predictive_full_2: Path, out: Path) -> Path:
     live_root = live_root.absolute()
     out = out.absolute()
-    if not live_root.is_dir() or out.parent.resolve() != live_root.parent.resolve() or out == live_root:
+    try:
+        live_info = live_root.lstat()
+    except OSError:
+        _fail("live_root:unavailable")
+    if (stat.S_ISLNK(live_info.st_mode) or not stat.S_ISDIR(live_info.st_mode) or
+            out.parent.resolve() != live_root.parent.resolve() or out == live_root):
         _fail("output:must_be_new_sibling")
     if out.exists() or out.is_symlink():
         _fail("output:already_exists")
