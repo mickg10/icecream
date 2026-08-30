@@ -3,17 +3,25 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import shutil
 from pathlib import Path
 
 import pytest
 
-from s8_live_salvage import SalvageError, _load_timing, _product_log
+from s8_live_salvage import (SalvageError, _load_timing, _product_log,
+                              _validate_predictive_producer)
 
 
 RAW = Path(
     "/tanksmall/scratch/ictmp/experiments/icecream/"
     "s8-rocksdb-zstd-tu-cold-full-6c72c2da-20260830T125215Z/"
     "live-output-full2/C1F1/icecream/C1F1-100000/20260830T125215Z/ZSTD_TU"
+)
+PRODUCER_FULL = Path(
+    "/tanksmall/scratch/ictmp/experiments/icecream/"
+    "s8-rocksdb-zstd-tu-cold-full-6c72c2da-20260830T125215Z/results/"
+    "s8-RocksDB-ZSTD_TU-cold-C1F1-20260830T125215Z-full"
 )
 
 
@@ -48,3 +56,28 @@ def test_mutated_product_log_is_rejected_and_source_hash_is_unchanged(tmp_path: 
     with pytest.raises(SalvageError, match="product_log:"):
         _product_log(root)
     assert hashlib.sha256(source.read_bytes()).hexdigest() == before
+
+
+@pytest.mark.skipif(not RAW.is_dir(), reason="terminal raw package is not mounted")
+def test_predictive_manifest_without_adjacent_producer_is_rejected(tmp_path: Path) -> None:
+    source = PRODUCER_FULL / "predictive_curve_manifest.json"
+    isolated = tmp_path / "predictive_curve_manifest.json"
+    isolated.write_bytes(source.read_bytes())
+    evidence = json.loads((RAW / "evidence.json").read_text())
+    with pytest.raises(SalvageError, match="producer_manifest.full-1:unavailable"):
+        _validate_predictive_producer(isolated, RAW / "product-evidence/predictive-plan.json", "full-1", evidence)
+
+
+@pytest.mark.skipif(not RAW.is_dir(), reason="terminal raw package is not mounted")
+def test_mutated_predictive_curve_is_rejected_by_adjacent_producer(tmp_path: Path) -> None:
+    source_dir = PRODUCER_FULL
+    isolated_dir = tmp_path / "producer"
+    shutil.copytree(source_dir, isolated_dir)
+    manifest = isolated_dir / "predictive_curve_manifest.json"
+    producer = isolated_dir / "producer_manifest.json"
+    producer_value = json.loads(producer.read_text())
+    producer_value["outputs"]["predictive_sim"]["sha256"] = "1" * 64
+    producer.write_text(json.dumps(producer_value, sort_keys=True, separators=(",", ":")))
+    evidence = json.loads((RAW / "evidence.json").read_text())
+    with pytest.raises(SalvageError, match="producer.full-1.curve:descriptor_mismatch"):
+        _validate_predictive_producer(manifest, RAW / "product-evidence/predictive-plan.json", "full-1", evidence)

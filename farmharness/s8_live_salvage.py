@@ -18,6 +18,7 @@ import re
 import stat
 import sys
 import math
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -155,17 +156,24 @@ def _product_log(root: Path) -> tuple[dict[str, list[dict[str, Any]]], dict[str,
             run = v.get("run")
             if run not in records:
                 _fail("product_log:unknown_run")
-            required = ("ordinal", "tu_id", "preprocessed_sha256", "preprocessed_bytes",
+            required = ("ordinal", "tu_id", "source_sha256",
+                        "preprocessed_sha256", "preprocessed_bytes",
                         "remote_sha256", "remote_bytes", "local_sha256", "local_bytes",
-                        "observed_source_tu_seq", "observed_scheduler_job_id",
-                        "compile_end_ns")
+                        "admission_start_ns", "input_ready_ns", "compile_start_ns", "compile_end_ns",
+                        "witness_end_ns", "wait_for_cs_ns", "planned_assignment_ordinal",
+                        "planned_relationship", "planned_admission_lane", "observed_scheduler_job_id",
+                        "observed_f_service_identity", "observed_source_tu_seq")
             if any(k not in v for k in required):
                 _fail("product_log:record_fields_missing")
             item: dict[str, Any] = {"run": run, "tu_id": v["tu_id"]}
-            for k in ("preprocessed_sha256", "remote_sha256", "local_sha256"):
+            item["observed_f_service_identity"] = v["observed_f_service_identity"]
+            for k in ("source_sha256", "preprocessed_sha256", "remote_sha256", "local_sha256"):
                 item[k] = _sha(v[k], f"product.{k}")
             for k in ("ordinal", "preprocessed_bytes", "remote_bytes", "local_bytes",
-                      "observed_source_tu_seq", "observed_scheduler_job_id", "compile_end_ns"):
+                      "admission_start_ns", "input_ready_ns", "compile_start_ns", "compile_end_ns",
+                      "witness_end_ns", "wait_for_cs_ns", "planned_assignment_ordinal",
+                      "planned_relationship", "planned_admission_lane", "observed_source_tu_seq",
+                      "observed_scheduler_job_id"):
                 item[k] = _token_int(v[k], f"product.{k}")
             if any(item[k] <= 0 for k in ("preprocessed_bytes", "remote_bytes", "local_bytes")):
                 _fail("product_log:nonpositive_artifact")
@@ -306,6 +314,132 @@ def _descriptor(path: Path, label: str) -> dict[str, Any]:
     return {"path": str(path.resolve()), **facts}
 
 
+def _auth_descriptor(root: Path, value: Any, label: str,
+                     aliases: tuple[Path, ...] = ()) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {"path", "sha256", "bytes"}:
+        _fail(f"{label}:descriptor")
+    relative = value["path"]
+    candidate = _relative_output_path(root, relative, label)
+    raw, facts = _read(candidate, label)
+    if facts["sha256"] != _sha(value["sha256"], f"{label}.sha256") or facts["bytes"] != value["bytes"]:
+        _fail(f"{label}:descriptor_mismatch")
+    for alias in aliases:
+        alias_raw, alias_facts = _read(alias, f"{label}.alias")
+        if alias_raw != raw or alias_facts != facts:
+            _fail(f"{label}:alias_mismatch")
+    return {"path": str(candidate.resolve()), **facts}
+
+
+def _join_product_record(product: dict[str, Any], timing: dict[str, Any], label: str) -> None:
+    fields = (
+        "tu_id", "observed_source_tu_seq", "observed_scheduler_job_id",
+        "admission_start_ns", "input_ready_ns", "compile_start_ns",
+        "compile_end_ns", "witness_end_ns", "wait_for_cs_ns",
+        "planned_assignment_ordinal", "planned_relationship", "planned_admission_lane",
+        "observed_f_service_identity",
+    )
+    if any(product.get(field) != timing.get(field) for field in fields):
+        _fail(f"product_timing_join:{label}:identity_or_timing")
+
+
+def _validate_batch_authorities(root: Path, products: dict[str, list[dict[str, Any]]],
+                                plans: list[dict[str, Any]]) -> dict[str, Any]:
+    evidence = root / "product-evidence"
+    batch_raw, batch_facts = _read(evidence / "batch-manifest.jsonl", "batch_manifest", 128 * 1024 * 1024)
+    batch = _jsonl(batch_raw, "batch_manifest")
+    input_raw, input_facts = _read(evidence / "input-descriptors.json", "input_descriptors", 16 * 1024 * 1024)
+    inputs_value = _json(input_raw, "input_descriptors")
+    inputs = inputs_value.get("inputs") if isinstance(inputs_value, dict) else None
+    if not isinstance(inputs, list) or len(inputs) != EXPECTED_COUNT or len(batch) != EXPECTED_COUNT:
+        _fail("input_authorities:count")
+    for ordinal, (batch_row, descriptor) in enumerate(zip(batch, inputs, strict=True)):
+        if batch_row.get("predictive_input", {}).get("ordinal") != ordinal or descriptor.get("ordinal") != ordinal:
+            _fail(f"input_authorities:ordinal:{ordinal}")
+        if batch_row.get("predictive_input") != descriptor:
+            _fail(f"input_authorities:descriptor_join:{ordinal}")
+        for plan in plans:
+            plan_input = plan["inputs"][ordinal]
+            if (plan_input.get("ordinal") != ordinal or plan_input.get("sha256") != descriptor.get("sha256") or
+                    plan_input.get("bytes") != descriptor.get("bytes") or
+                    plan_input.get("source_relative") != descriptor.get("source_relative")):
+                _fail(f"input_authorities:plan_join:{ordinal}")
+        for run in ("full-1", "full-2"):
+            product = products[run][ordinal]
+            if (product.get("ordinal") != ordinal or product.get("source_sha256") != batch_row.get("sha256") or
+                    product.get("preprocessed_sha256") != descriptor.get("sha256") or
+                    product.get("preprocessed_bytes") != descriptor.get("bytes") or
+                    product.get("tu_id") != batch_row.get("tu_id")):
+                _fail(f"input_authorities:product_join:{run}:{ordinal}")
+    return {"batch_manifest": {"path": str((evidence / "batch-manifest.jsonl").resolve()), **batch_facts},
+            "input_descriptors": {"path": str((evidence / "input-descriptors.json").resolve()), **input_facts}}
+
+
+def _producer_descriptor(base: Path, value: Any, label: str) -> dict[str, Any]:
+    if (not isinstance(value, dict) or
+            not {"path", "sha256", "bytes"}.issubset(value)):
+        _fail(f"{label}:descriptor")
+    path = Path(value["path"])
+    if not path.is_absolute():
+        path = base / path
+    raw, facts = _read(path, label)
+    if facts["sha256"] != _sha(value["sha256"], f"{label}.sha256") or facts["bytes"] != value["bytes"]:
+        _fail(f"{label}:descriptor_mismatch")
+    return {"path": str(path.resolve()), **facts}
+
+
+def _validate_predictive_producer(manifest: Path, plan_path: Path, run: str,
+                                 evidence: dict[str, Any]) -> dict[str, Any]:
+    manifest = manifest.absolute()
+    producer_path = manifest.parent / "producer_manifest.json"
+    producer_raw, producer_facts = _read(producer_path, f"producer_manifest.{run}", 8 * 1024 * 1024)
+    producer = _json(producer_raw, f"producer_manifest.{run}")
+    if not isinstance(producer, dict) or producer.get("schema") != "icecream-s8-multitu-predictive-producer-v1":
+        _fail(f"producer_manifest.{run}:schema")
+    identity = producer.get("identity")
+    if (not isinstance(identity, dict) or identity.get("source_commit") != EXPECTED_COMMIT or
+            identity.get("source_tree") != EXPECTED_TREE):
+        _fail(f"producer_manifest.{run}:identity")
+    predictive = normalizer._load_manifest(manifest, "predictive_sim")
+    if (producer.get("cell") != dict(zip(("corpus", "profile", "regime"), EXPECTED_CELL)) or
+            identity.get("input_digest") != predictive["identity"]["input_digest"] or
+            identity.get("topology_digest") != predictive["identity"]["topology_digest"]):
+        _fail(f"producer_manifest.{run}:cell_binding")
+    expected_plan = evidence["predictive_plans"][run]
+    plan_ref = _producer_descriptor(manifest.parent, producer.get("plan"), f"producer.{run}.plan")
+    _, expected_plan_facts = _read(plan_path, f"plan.{run}")
+    if plan_ref["sha256"] != expected_plan_facts["sha256"] or plan_ref["bytes"] != expected_plan_facts["bytes"] or \
+            plan_ref["sha256"] != expected_plan.get("sha256") or plan_ref["bytes"] != expected_plan.get("bytes"):
+        _fail(f"producer_manifest.{run}:plan_binding")
+    outputs = producer.get("outputs")
+    if not isinstance(outputs, dict):
+        _fail(f"producer_manifest.{run}:outputs")
+    manifest_ref = _producer_descriptor(manifest.parent, outputs.get("predictive_manifest"), f"producer.{run}.manifest")
+    if manifest_ref["path"] != str(manifest.resolve()):
+        _fail(f"producer_manifest.{run}:manifest_not_adjacent")
+    curve_ref = _producer_descriptor(manifest.parent, outputs.get("predictive_sim"), f"producer.{run}.curve")
+    if (curve_ref["path"] != str(Path(predictive["curve_path"]).resolve()) or
+            curve_ref["sha256"] != predictive["curve_sha256"] or curve_ref["bytes"] != Path(predictive["curve_path"]).stat().st_size):
+        _fail(f"producer_manifest.{run}:curve_binding")
+    batch_binding = producer.get("batch_binding")
+    if (not isinstance(batch_binding, dict) or batch_binding.get("source_commit") != EXPECTED_COMMIT or
+            batch_binding.get("source_tree") != EXPECTED_TREE or
+            not isinstance(batch_binding.get("input_manifest_sha256"), str) or
+            not isinstance(batch_binding.get("assignment_sha256"), str) or
+            not isinstance(batch_binding.get("simulator_sha256"), str)):
+        _fail(f"producer_manifest.{run}:batch_binding")
+    codec = producer.get("codec")
+    simulator_ref = codec.get("simulator") if isinstance(codec, dict) else None
+    simulator = _producer_descriptor(manifest.parent, simulator_ref, f"producer.{run}.simulator")
+    if simulator["sha256"] != batch_binding.get("simulator_sha256"):
+        _fail(f"producer_manifest.{run}:simulator_binding")
+    build = producer.get("product_build")
+    receipt = _producer_descriptor(manifest.parent, build.get("receipt") if isinstance(build, dict) else None,
+                                   f"producer.{run}.build_receipt")
+    return {"path": str(producer_path.resolve()), **producer_facts,
+            "manifest": manifest_ref, "curve": curve_ref, "plan": plan_ref,
+            "simulator": simulator, "build_receipt": receipt}
+
+
 def _validate_inputs(root: Path, predictive: tuple[Path, Path]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     evidence_raw, evidence_facts = _read(root / "evidence.json", "evidence", 4 * 1024 * 1024)
     evidence = _json(evidence_raw, "evidence")
@@ -320,6 +454,12 @@ def _validate_inputs(root: Path, predictive: tuple[Path, Path]) -> tuple[dict[st
     without.pop("evidence_sha256", None)
     if hashlib.sha256(normalizer.canonical_bytes(without)).hexdigest() != claimed:
         _fail("evidence:self_hash_mismatch")
+    evidence_files: dict[str, Any] = {}
+    evidence_files["results"] = _auth_descriptor(root, evidence.get("evidence", {}).get("results"),
+                                                  "evidence.results")
+    evidence_files["timing"] = _auth_descriptor(
+        root, evidence.get("evidence", {}).get("timing"), "evidence.timing",
+        aliases=(root / "timing_full-1.jsonl",))
     predictive_plans = evidence.get("predictive_plans")
     if (not isinstance(predictive_plans, dict) or
             not all(isinstance(predictive_plans.get(run), dict) for run in ("full-1", "full-2"))):
@@ -327,9 +467,11 @@ def _validate_inputs(root: Path, predictive: tuple[Path, Path]) -> tuple[dict[st
     plans: list[dict[str, Any]] = []
     plan_paths = (root / "product-evidence" / "predictive-plan.json",
                   root / "product-evidence" / "predictive-plan-full-2.json")
-    for path, expected_sha in zip(plan_paths, (predictive_plans["full-1"]["sha256"], predictive_plans["full-2"]["sha256"]), strict=True):
+    for run, path in zip(("full-1", "full-2"), plan_paths, strict=True):
+        plan_descriptor = predictive_plans[run]
+        expected_sha = plan_descriptor.get("sha256")
         raw, facts = _read(path, "predictive_plan", 8 * 1024 * 1024)
-        if facts["sha256"] != expected_sha:
+        if facts["sha256"] != _sha(expected_sha, f"evidence.predictive_plans.{run}.sha256") or facts["bytes"] != plan_descriptor.get("bytes"):
             _fail(f"predictive_plan:sha256:{path}")
         value = _json(raw, "predictive_plan")
         if not isinstance(value, dict) or value.get("cell") != dict(zip(("corpus", "profile", "regime"), EXPECTED_CELL)):
@@ -337,6 +479,12 @@ def _validate_inputs(root: Path, predictive: tuple[Path, Path]) -> tuple[dict[st
         if len(value.get("inputs", [])) != EXPECTED_COUNT or value.get("scheduling", {}).get("topology") != "C1F1":
             _fail("predictive_plan:count_or_topology")
         plans.append(value)
+    witness = evidence.get("witness")
+    if not isinstance(witness, dict):
+        _fail("evidence:witness")
+    evidence_files["timing_full_2"] = _auth_descriptor(root, witness.get("timing_full_2"), "evidence.timing_full_2")
+    evidence_files["c_action"] = _auth_descriptor(root, witness.get("c_action"), "evidence.c_action")
+    evidence_files["f_action"] = _auth_descriptor(root, witness.get("f_action"), "evidence.f_action")
     topology_path = root / "product-evidence" / "topology.json"
     topology_raw, topology_facts = _read(topology_path, "topology", 8 * 1024 * 1024)
     topology = {"path": str(topology_path.resolve()), **topology_facts}
@@ -363,7 +511,8 @@ def _validate_inputs(root: Path, predictive: tuple[Path, Path]) -> tuple[dict[st
         observed = _descriptor(source, f"evidence_{key}")
         if observed["sha256"] != descriptor.get("sha256") or observed["bytes"] != descriptor.get("bytes"):
             _fail(f"evidence:{key}:sha256")
-    return evidence, {"path": str((root / "evidence.json").resolve()), **evidence_facts}, {"plans": plans, "topology": topology}
+    return evidence, {"path": str((root / "evidence.json").resolve()), **evidence_facts,
+                      "authenticated_descriptors": evidence_files}, {"plans": plans, "topology": topology}
 
 
 def _curve_rows(timing: list[dict[str, Any]], start_ns: int) -> bytes:
@@ -447,7 +596,7 @@ def _curve_matches(expected_raw: bytes, actual_raw: bytes) -> bool:
     return True
 
 
-def salvage(live_root: Path, predictive_full_1: Path, predictive_full_2: Path, out: Path) -> Path:
+def _salvage(live_root: Path, predictive_full_1: Path, predictive_full_2: Path, out: Path) -> Path:
     live_root = live_root.absolute()
     out = out.absolute()
     if not live_root.is_dir() or out.parent.resolve() != live_root.parent.resolve() or out == live_root:
@@ -456,6 +605,13 @@ def salvage(live_root: Path, predictive_full_1: Path, predictive_full_2: Path, o
         _fail("output:already_exists")
     evidence, evidence_desc, plan_facts = _validate_inputs(live_root, (predictive_full_1.absolute(), predictive_full_2.absolute()))
     products, product_desc = _product_log(live_root)
+    input_authorities = _validate_batch_authorities(live_root, products, plan_facts["plans"])
+    for key, observed_key in (("input_manifest", "batch_manifest"), ("input_descriptors", "input_descriptors")):
+        ref = evidence.get(key)
+        observed = input_authorities[observed_key]
+        declared = _auth_descriptor(live_root, ref, f"evidence.{key}")
+        if declared["sha256"] != observed["sha256"] or declared["bytes"] != observed["bytes"]:
+            _fail(f"evidence:{key}:descriptor_mismatch")
     timings: dict[str, list[dict[str, Any]]] = {}
     timing_desc: dict[str, Any] = {}
     for run in ("full-1", "full-2"):
@@ -465,6 +621,7 @@ def salvage(live_root: Path, predictive_full_1: Path, predictive_full_2: Path, o
                       ("remote_sha256", "object_sha256"), ("remote_bytes", "returned_object_bytes"))
             if any(product[a] != timing[b] for a, b in checks):
                 _fail(f"product_timing_join:{run}:{product['ordinal']}")
+            _join_product_record(product, timing, f"{run}:{product['ordinal']}")
     trace_desc = _validate_trace(live_root, timings)
     log_desc = _validate_logs(live_root)
 
@@ -475,6 +632,7 @@ def salvage(live_root: Path, predictive_full_1: Path, predictive_full_2: Path, o
     expected1 = _curve_rows(timings["full-1"], product_desc["windows"]["full-1"]["start_ns"])
     if not _curve_matches(expected1, _read(live_root / "live_curve_full-1.jsonl", "live_curve_full_1")[0]):
         _fail("live_curve_full_1:recompute_mismatch")
+    producer_desc: dict[str, Any] = {}
     for run, manifest, expected_plan in (("full-1", predictive_full_1, plan_facts["plans"][0]), ("full-2", predictive_full_2, plan_facts["plans"][1])):
         loaded = normalizer._load_manifest(manifest.absolute(), "predictive_sim")
         if loaded["identity"]["source_commit"] != EXPECTED_COMMIT or loaded["identity"]["source_tree"] != EXPECTED_TREE:
@@ -484,6 +642,9 @@ def salvage(live_root: Path, predictive_full_1: Path, predictive_full_2: Path, o
             expected_plan["scheduling"])
         if loaded.get("comparison") != evidence["comparisons"][run] or loaded.get("comparison") != expected_comparison:
             _fail(f"predictive_manifest:comparison:{run}")
+        producer_desc[run] = _validate_predictive_producer(
+            manifest, live_root / "product-evidence" / ("predictive-plan.json" if run == "full-1" else "predictive-plan-full-2.json"),
+            run, evidence)
 
     full1_value = _json(_read(live1_manifest, "live_manifest")[0], "live_manifest")
     if not isinstance(full1_value, dict):
@@ -531,6 +692,8 @@ def salvage(live_root: Path, predictive_full_1: Path, predictive_full_2: Path, o
         "timing": timing_desc,
         "traces": trace_desc,
         "logs": log_desc,
+        "input_authorities": input_authorities,
+        "predictive_producers": producer_desc,
         "topology": plan_facts["topology"],
         "assignment_witness": assignment_desc,
         "plans": {run: _descriptor(path, f"predictive_{run}") for run, path in zip(("full-1", "full-2"),
@@ -581,6 +744,18 @@ def salvage(live_root: Path, predictive_full_1: Path, predictive_full_2: Path, o
     _write(out / "experiment_manifest.json", normalizer.canonical_bytes(experiment) + b"\n")
     _post_validate_output(out, experiment, assignment_desc, evidence["environment_preparation"])
     return out
+
+
+def salvage(live_root: Path, predictive_full_1: Path, predictive_full_2: Path, out: Path) -> Path:
+    """Publish a complete sibling or remove the newly-created one on failure."""
+    output = out.absolute()
+    existed = output.exists() or output.is_symlink()
+    try:
+        return _salvage(live_root, predictive_full_1, predictive_full_2, output)
+    except Exception:
+        if not existed and output.is_dir() and not output.is_symlink():
+            shutil.rmtree(output)
+        raise
 
 
 def main(argv: list[str] | None = None) -> int:
