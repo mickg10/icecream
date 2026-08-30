@@ -330,7 +330,8 @@ def _identity(value: object, cell: dict[str, str], label: str) -> dict[str, obje
     return value
 
 
-def _curve(value: object, cell: dict[str, str], label: str) -> list[dict[str, object]]:
+def _curve(value: object, cell: dict[str, str], label: str,
+           require_directional: bool = False) -> list[dict[str, object]]:
     if not isinstance(value, list) or not value:
         raise CalibrationError(f"{label}:curve_missing")
     previous: dict[str, int | float] | None = None
@@ -353,6 +354,8 @@ def _curve(value: object, cell: dict[str, str], label: str) -> list[dict[str, ob
                 set((*COMMON_METRICS, "C_TO_F_bytes", "F_TO_C_bytes"))):
             raise CalibrationError(f"{label}:{number}:metric_shape_invalid")
         current_directional = "C_TO_F_bytes" in cumulative
+        if require_directional and not current_directional:
+            raise CalibrationError(f"{label}:{number}:directional_metrics_required")
         if directional_shape is not None and current_directional != directional_shape:
             raise CalibrationError(f"{label}:{number}:metric_shape_changed")
         directional_shape = current_directional
@@ -394,7 +397,8 @@ def _curve(value: object, cell: dict[str, str], label: str) -> list[dict[str, ob
 
 
 def _records(raw: bytes, cell: dict[str, str], predictor_model_id: str,
-             label: str) -> tuple[dict[str, object], dict[str, object], dict[str, object], int]:
+             label: str, require_directional: bool = False
+             ) -> tuple[dict[str, object], dict[str, object], dict[str, object], int]:
     lines = raw.splitlines()
     if len(lines) != 3 or any(not line.strip() for line in lines):
         raise CalibrationError(f"{label}:expected_three_records")
@@ -439,7 +443,7 @@ def _records(raw: bytes, cell: dict[str, str], predictor_model_id: str,
                 raise CalibrationError(f"{label}:{number}:units_mismatch")
         if record_type in ("predictive_sim", "live"):
             curves[record_type] = _curve(value.get("raw_cumulative_curve"), cell,
-                                          f"{label}:{record_type}")
+                                          f"{label}:{record_type}", require_directional)
         else:
             if not isinstance(value.get("point_errors"), list) or not isinstance(value.get("loss_curve"), list):
                 raise CalibrationError(f"{label}:comparison:shape_invalid")
@@ -549,9 +553,12 @@ def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = N
         if actual_sha != records_sha or actual_bytes != records_bytes:
             raise CalibrationError(f"comparison:{index}:records_changed_after_authentication")
         predictive, live, _comparison, point_count = _records(
-            records_raw, cell, predictor_identity["model_id"], f"comparison:{index}.records")
-        p_curve = _curve(predictive["raw_cumulative_curve"], cell, f"comparison:{index}.predictive")
-        l_curve = _curve(live["raw_cumulative_curve"], cell, f"comparison:{index}.live")
+            records_raw, cell, predictor_identity["model_id"], f"comparison:{index}.records",
+            require_directional=not legacy)
+        p_curve = _curve(predictive["raw_cumulative_curve"], cell,
+                         f"comparison:{index}.predictive", require_directional=not legacy)
+        l_curve = _curve(live["raw_cumulative_curve"], cell,
+                         f"comparison:{index}.live", require_directional=not legacy)
         for p_row, l_row in zip(p_curve, l_curve, strict=True):
             p_metrics, l_metrics = p_row["metrics"], l_row["metrics"]
             if p_metrics["channel_bytes"] <= 0 or p_metrics["elapsed_ns"] <= 0:
@@ -570,8 +577,10 @@ def freeze(request_path: Path, bundle_path: Path, manifest_path: Path | None = N
                     raise CalibrationError(
                         f"comparison:{index}:C_TO_F_bytes_boundary_mismatch")
             for direction in ("C_TO_F_bytes", "F_TO_C_bytes"):
-                p_direction = p_metrics.get(direction, p_metrics["channel_bytes"])
-                l_direction = l_metrics.get(direction, l_metrics["channel_bytes"])
+                p_direction = (p_metrics[direction] if not legacy
+                               else p_metrics.get(direction, p_metrics["channel_bytes"]))
+                l_direction = (l_metrics[direction] if not legacy
+                               else l_metrics.get(direction, l_metrics["channel_bytes"]))
                 context_bucket_ratios[context][bucket].setdefault(direction, []).append(
                     float(l_direction) / float(p_direction))
             context_bucket_ratios[context][bucket]["elapsed_ns"].append(

@@ -286,7 +286,11 @@ def load_calibration_bundle(manifest_path: Path) -> dict[str, object]:
     # intentionally have unscoped legacy bindings.  Keep that migration path
     # distinct from explicit context bundles (which carry authority fields).
     legacy_v2 = (not migrated and bool(bundle["inputs"]) and
-                 all(isinstance(binding, dict) and "experiment_manifest" not in binding
+                 all(isinstance(binding, dict) and
+                     "experiment_manifest" not in binding and
+                     binding.get("topology") == "C1F1" and
+                     binding.get("depth_class") == "legacy" and
+                     binding.get("compatibility") == "legacy_c1f1"
                      for binding in bundle["inputs"]))
     bucket_corpora: dict[str, set[str]] = {
         f"{profile}/{regime}": set()
@@ -339,14 +343,71 @@ def load_calibration_bundle(manifest_path: Path) -> dict[str, object]:
                     any(ch not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.:-" for ch in pass_id)):
                 raise PredictionError("calibration_bundle:pass_id_invalid")
             manifest_descriptor = binding["experiment_manifest"]
+            records_path = _artifact_path(bundle_root, {
+                "path": path, "sha256": digest, "bytes": binding["records_bytes"]},
+                "calibration_records")
             authority_path = _artifact_path(bundle_root, manifest_descriptor,
                                            "calibration_experiment_manifest")
+            expected_authority_path = records_path.parent / "experiment_manifest.json"
+            if authority_path.resolve() != expected_authority_path.resolve():
+                raise PredictionError(
+                    "calibration_experiment_manifest:authority_path_mismatch")
             manifest_raw, authority_facts = _authenticate(
                 authority_path, manifest_descriptor, "calibration_experiment_manifest")
             manifest = parse_json(manifest_raw, "calibration_experiment_manifest")
-            if (not isinstance(manifest, dict) or manifest.get("status") != "PASS" or
-                    manifest.get("pass_id", pass_id) != pass_id):
-                raise PredictionError("calibration_experiment_manifest:authority_mismatch")
+            if not isinstance(manifest, dict) or manifest.get(
+                    "schema") != "icecream-s8-derived-experiment-v1":
+                raise PredictionError("calibration_experiment_manifest:schema_invalid")
+            if manifest.get("status") != "PASS":
+                raise PredictionError("calibration_experiment_manifest:not_pass")
+            if manifest.get("cell") != cell:
+                raise PredictionError("calibration_experiment_manifest:cell_mismatch")
+            if manifest.get("split") != SPLITS[cell["corpus"]]:
+                raise PredictionError("calibration_experiment_manifest:split_mismatch")
+            manifest_topology = manifest.get("topology")
+            suite = manifest.get("suite")
+            if (not isinstance(manifest_topology, str) or
+                    not isinstance(suite, str) or suite != manifest_topology or
+                    not manifest_topology.startswith(f"{topology}/")):
+                raise PredictionError("calibration_experiment_manifest:topology_mismatch")
+            manifest_depth = manifest.get("depth_class")
+            manifest_source_depth = manifest.get("depth")
+            depth_aliases = {
+                "100": {"100"}, "200": {"200"},
+                "full": {"full", "full-1"},
+                "repeat-full": {"full-2", "repeat-full", "state-carrying full-2"},
+            }
+            source_depth_aliases = {
+                "100": {"100"}, "200": {"200"},
+                "full": {"full", "full-1"},
+                "repeat-full": {"full", "full-2", "repeat-full"},
+            }
+            if (manifest_depth not in depth_aliases.get(depth_class, set()) or
+                    manifest_source_depth not in source_depth_aliases.get(depth_class, set())):
+                raise PredictionError("calibration_experiment_manifest:depth_mismatch")
+            runs = manifest.get("runs")
+            if (not isinstance(runs, list) or not runs or
+                    any(not isinstance(run, str) for run in runs) or pass_id not in runs):
+                raise PredictionError("calibration_experiment_manifest:runs_invalid")
+            records_descriptor = manifest.get("records")
+            if (not isinstance(records_descriptor, dict) or
+                    set(records_descriptor) != {"path", "sha256", "bytes"}):
+                raise PredictionError("calibration_experiment_manifest:records_missing")
+            descriptor_path = records_descriptor["path"]
+            if (not isinstance(descriptor_path, str) or not descriptor_path or
+                    Path(descriptor_path).is_absolute() or
+                    any(part in ("", ".", "..") for part in Path(descriptor_path).parts) or
+                    (authority_path.parent / descriptor_path).resolve() != records_path.resolve()):
+                raise PredictionError("calibration_experiment_manifest:records_path_mismatch")
+            descriptor_sha = _sha256(records_descriptor["sha256"],
+                                     "calibration_experiment_manifest.records.sha256")
+            if (descriptor_sha != digest.lower() or
+                    type(records_descriptor["bytes"]) is not int or
+                    records_descriptor["bytes"] != binding["records_bytes"]):
+                raise PredictionError("calibration_experiment_manifest:records_descriptor_mismatch")
+            _authenticate(records_path,
+                          {"path": path, "sha256": digest, "bytes": binding["records_bytes"]},
+                          "calibration_records")
             del authority_facts
     expected_context_cells = {
         (context, cell_id)
@@ -406,6 +467,9 @@ def load_calibration_bundle(manifest_path: Path) -> dict[str, object]:
         for metric, scale in bucket_scales.items():
             if type(scale) not in (int, float) or not math.isfinite(float(scale)) or scale <= 0:
                 raise PredictionError(f"calibration_bundle:scale_invalid:{bucket}:{metric}")
+        if not bucket.startswith("C1F1/legacy/") and bucket_scales["C_TO_F_bytes"] != 1.0:
+            raise PredictionError(
+                f"calibration_bundle:explicit_source_scale_invalid:{bucket}")
     return {
         "bundle": bundle,
         "bundle_sha256": bundle_facts["sha256"],
@@ -499,23 +563,31 @@ def _payload_stats(raw: bytes) -> tuple[int, float, float]:
     return size, entropy, transitions / max(1, size - 1)
 
 
-def _calibration_factors(calibration: dict[str, object], topology: dict[str, object],
-                         cell: dict[str, str], depth_class: str,
-                         topology_name: str | None = None) -> dict[str, float]:
+def _resolve_calibration_topology(topology: dict[str, object],
+                                  topology_name: str | None = None) -> str:
     topology_values = topology.get("topology")
     if not isinstance(topology_values, dict):
         raise PredictionError("calibration:topology_missing")
     # The calibration topology key is the scheduling topology, not the
     # physical cache-channel name.  C1F20 therefore cannot fall back to the
     # C1F1 aggregate bundle.
-    topology_name = topology_name or topology_values.get("topology", topology_values.get("suite"))
-    if topology_name is None:
+    resolved = topology_name
+    if resolved is None:
+        resolved = topology_values.get("topology", topology_values.get("suite"))
+    if resolved is None:
         # Engine topology artifacts predate the scheduling name.  Worker
         # cardinality is an unambiguous local derivation for this compatibility
         # path and never broadens a C1F1 calibration to C1F20.
-        topology_name = "C1F1" if topology_values.get("f_workers") == 1 else "C1F20"
-    if topology_name not in TOPOLOGIES:
+        resolved = "C1F1" if topology_values.get("f_workers") == 1 else "C1F20"
+    if resolved not in TOPOLOGIES:
         raise PredictionError("calibration:topology_unsupported")
+    return resolved
+
+
+def _calibration_factors(calibration: dict[str, object], topology: dict[str, object],
+                         cell: dict[str, str], depth_class: str,
+                         topology_name: str | None = None) -> dict[str, float]:
+    topology_name = _resolve_calibration_topology(topology, topology_name)
     if depth_class not in DEPTH_CLASSES:
         raise PredictionError("calibration:depth_class_unsupported")
     context = f"{topology_name}/{depth_class}"
@@ -807,8 +879,10 @@ def predict(manifest_path: Path, out_path: Path, sim_binary: Path | None = None,
     del sim_binary
     manifest, input_raw, input_facts, topology_facts, manifest_sha, topology, cell = load_inputs(manifest_path)
     calibration = load_calibration_bundle(calibration_bundle) if calibration_bundle is not None else None
+    resolved_calibration_topology = (_resolve_calibration_topology(topology, calibration_topology)
+                                     if calibration is not None else calibration_topology)
     rows = _predict_curve(input_raw, topology, cell, calibration, depth_class,
-                          calibration_topology)
+                          resolved_calibration_topology)
     payload = b"".join(canonical_bytes(row) + b"\n" for row in rows)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     sidecar_path = out_path.with_name(out_path.name + ".manifest.json")
@@ -831,10 +905,10 @@ def predict(manifest_path: Path, out_path: Path, sim_binary: Path | None = None,
                                   "regime": REGIME_MODELS[cell["regime"]]},
             **({"calibration": {
                 "bundle_sha256": calibration["bundle_sha256"],
-                "context": f"{calibration_topology or 'C1F1'}/{depth_class}",
+                "context": f"{resolved_calibration_topology}/{depth_class}",
                 "factor_fields": ["C_TO_F_bytes", "F_TO_C_bytes", "elapsed_ns"],
                 "factors": _calibration_factors(calibration, topology, cell, depth_class,
-                                                  calibration_topology),
+                                                  resolved_calibration_topology),
                 "throughput": "derived_from_calibrated_channel_bytes_and_elapsed_ns",
             }} if calibration is not None else {}),
             "topology_effects": {"c_workers": "producer compression and uplink share",
