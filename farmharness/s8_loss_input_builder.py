@@ -179,12 +179,13 @@ def _scan(root: Path) -> dict[tuple[str, str, str, str, str, str], dict[str, Any
         if not isinstance(manifest, dict) or manifest.get("schema") != DERIVED_SCHEMA:
             continue
         key, value = _context(manifest, path)
-        # Authenticate the resolved file above, but publish the record path
-        # relative to the canonical input root, as required by the loss
-        # reporter's descriptor contract.
+        # Authenticate that every accepted record remains inside the derived
+        # root.  ``build`` publishes the final path relative to the input
+        # manifest's parent because that is the loss reporter's resolution
+        # base; the two directories need not be identical.
         records_path = Path(value["records"]["path"]).resolve()
         try:
-            value["records"]["path"] = str(records_path.relative_to(root))
+            records_path.relative_to(root)
         except ValueError as exc:
             raise LossInputError(
                 f"{path}:records.path_not_under_derived_root"
@@ -203,6 +204,7 @@ def build(derived_root: Path, output: Path, mode: str = "calibration") -> Path:
     if output.exists() or output.is_symlink():
         raise LossInputError(f"output:already_exists:{output}")
     root = derived_root.resolve()
+    output_base = output.parent.resolve()
     found = _scan(root)
     entries: list[dict[str, Any]] = []
     for corpus in ("fmt", "RocksDB"):
@@ -213,10 +215,22 @@ def build(derived_root: Path, output: Path, mode: str = "calibration") -> Path:
                         pass_id = PASS_FOR_DEPTH[depth]
                         key = (corpus, profile, regime, topology, depth, pass_id)
                         if key in found:
+                            records = dict(found[key]["records"])
+                            records_path = Path(records["path"]).resolve()
+                            try:
+                                relative = records_path.relative_to(output_base)
+                            except ValueError as exc:
+                                raise LossInputError(
+                                    "output:accepted_records_not_under_manifest_parent:"
+                                    f"{records_path}"
+                                ) from exc
+                            if any(part in ("", ".", "..") for part in relative.parts):
+                                raise LossInputError("output:records_path_not_private_relative")
+                            records["path"] = str(relative)
                             entries.append({"cell": {"corpus": corpus, "profile": profile, "regime": regime},
                                             "split": "calibration", "topology": topology,
                                             "depth_class": depth, "pass_id": pass_id, "status": "PASS",
-                                            "records": found[key]["records"]})
+                                            "records": records})
                         else:
                             entries.append({"cell": {"corpus": corpus, "profile": profile, "regime": regime},
                                             "split": "calibration", "topology": topology,

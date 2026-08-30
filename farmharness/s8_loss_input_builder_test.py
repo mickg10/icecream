@@ -74,3 +74,17 @@ def test_rejects_quarantined_candidate_and_existing_output(tmp_path: Path) -> No
     output.write_text("sentinel")
     with pytest.raises(LossInputError, match="already_exists"):
         build(tmp_path, output)
+
+
+def test_records_are_relative_to_manifest_parent_not_derived_root(tmp_path: Path) -> None:
+    derived = tmp_path / "derived"
+    _derived(derived)
+    output = build(derived, tmp_path / "loss-input.json")
+    entry = next(row for row in json.loads(output.read_text())["entries"]
+                 if row["status"] == "PASS")
+    assert entry["records"]["path"] == "derived/accepted/records.jsonl"
+    assert (output.parent / entry["records"]["path"]).read_bytes() == b"records\n"
+
+    outside = tmp_path / "sibling" / "loss-input.json"
+    with pytest.raises(LossInputError, match="accepted_records_not_under_manifest_parent"):
+        build(derived, outside)
