@@ -148,12 +148,15 @@ def _explicitize(root: Path, comparisons: list[dict[str, object]],
         raw = b"".join(canonical_bytes(record) + b"\n" for record in records)
         records_path = target / "records.jsonl"
         records_path.write_bytes(raw)
+        pass_id = "full-2" if depth == "repeat-full" else "full-1"
+        runs = ["full-1", "full-2"] if depth == "repeat-full" else ["full-1"]
+        suite = "C1F1/100000" if topology == "C1F1" else "C1F20/40"
         authority = {
             "schema": "icecream-s8-derived-experiment-v1", "status": "PASS",
             "cell": dict(comparison["cell"]), "split": "calibration",
-            "topology": f"{topology}/40", "suite": f"{topology}/40",
-            "depth": depth, "depth_class": depth,
-            "pass_id": f"pass-{depth}", "runs": [f"pass-{depth}"],
+            "topology": suite, "suite": suite,
+            "depth": "full" if depth == "repeat-full" else depth,
+            "depth_class": depth, "pass_id": pass_id, "runs": runs,
             "records": {"path": "records.jsonl", "sha256": hashlib.sha256(raw).hexdigest(),
                         "bytes": len(raw)},
         }
@@ -162,6 +165,29 @@ def _explicitize(root: Path, comparisons: list[dict[str, object]],
             "path": str(records_path.relative_to(root)),
             "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw),
         }
+
+
+def _explicit_bundle(root: Path, topology: str = "C1F1", depth: str = "full") -> tuple[Path, Path]:
+    request, comparisons = _request(root)
+    value = json.loads(request.read_bytes())
+    for comparison in comparisons:
+        comparison.update({"topology": topology, "depth_class": depth})
+    _explicitize(root, comparisons, topology, depth)
+    request.write_bytes(canonical_bytes({**value, "comparisons": comparisons}) + b"\n")
+    bundle, manifest = root / "bundle.json", root / "manifest.json"
+    freeze(request, bundle, manifest)
+    return bundle, manifest
+
+
+def _refresh_loaded_bundle(bundle: Path, manifest: Path, value: dict[str, object]) -> None:
+    bundle_raw = canonical_bytes(value) + b"\n"
+    bundle.write_bytes(bundle_raw)
+    manifest_value = json.loads(manifest.read_bytes())
+    manifest_value["bundle"] = {"path": bundle.name,
+                                 "sha256": hashlib.sha256(bundle_raw).hexdigest(),
+                                 "bytes": len(bundle_raw)}
+    manifest_value["inputs"] = value["inputs"]
+    manifest.write_bytes(canonical_bytes(manifest_value) + b"\n")
 
 
 def test_freeze_binds_exactly_16_inputs_and_source_identity(tmp_path: Path) -> None:
@@ -517,7 +543,7 @@ def test_v2_freeze_allows_complete_matrices_in_multiple_contexts(tmp_path: Path)
             "schema": "icecream-s8-derived-experiment-v1", "status": "PASS",
             "cell": dict(item["cell"]), "split": "calibration",
             "topology": "C1F20/40", "suite": "C1F20/40", "depth": "200",
-            "depth_class": "200", "pass_id": "pass-200", "runs": ["pass-200"],
+            "depth_class": "200", "pass_id": "full-1", "runs": ["full-1"],
             "records": {"path": "records.jsonl", "sha256": hashlib.sha256(raw).hexdigest(),
                         "bytes": len(raw)},
         }
@@ -599,3 +625,115 @@ def test_freeze_rejects_outputs_outside_request_root(tmp_path: Path) -> None:
     request, _ = _request(tmp_path)
     with pytest.raises(CalibrationError, match="must_share_request_root"):
         freeze(request, tmp_path / "other" / "bundle.json")
+
+
+def test_loader_rejects_tampered_explicit_source_scale(tmp_path: Path) -> None:
+    bundle, manifest = _explicit_bundle(tmp_path)
+    value = json.loads(bundle.read_bytes())
+    value["calibration"]["scales"]["C1F1/full/ZSTD_TU/cold"]["C_TO_F_bytes"] = 2.0
+    _refresh_loaded_bundle(bundle, manifest, value)
+    with pytest.raises(PredictionError, match="explicit_source_scale_invalid"):
+        load_calibration_bundle(manifest)
+
+
+@pytest.mark.parametrize("record_type", ("predictive_sim", "live"))
+def test_explicit_freeze_requires_directional_metrics(record_type: str, tmp_path: Path) -> None:
+    root = tmp_path / record_type
+    root.mkdir()
+    request, comparisons = _request(root)
+    value = json.loads(request.read_bytes())
+    for comparison in comparisons:
+        comparison.update({"topology": "C1F1", "depth_class": "full"})
+    _explicitize(root, comparisons, "C1F1", "full")
+    records_path = root / comparisons[0]["records"]["path"]
+    records = [json.loads(line) for line in records_path.read_bytes().splitlines()]
+    target = next(record for record in records if record["record_type"] == record_type)
+    for row in target["raw_cumulative_curve"]:
+        row["cumulative"].pop("C_TO_F_bytes")
+        row["cumulative"].pop("F_TO_C_bytes")
+    raw = b"".join(canonical_bytes(record) + b"\n" for record in records)
+    records_path.write_bytes(raw)
+    descriptor = {"path": str(records_path.relative_to(root)),
+                  "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
+    comparisons[0]["records"] = descriptor
+    authority_path = records_path.parent / "experiment_manifest.json"
+    authority = json.loads(authority_path.read_bytes())
+    authority["records"] = {"path": "records.jsonl", "sha256": descriptor["sha256"],
+                             "bytes": descriptor["bytes"]}
+    authority_path.write_bytes(canonical_bytes(authority) + b"\n")
+    request.write_bytes(canonical_bytes({**value, "comparisons": comparisons}) + b"\n")
+    with pytest.raises(CalibrationError, match="directional_metrics_required"):
+        freeze(request, root / "bundle.json")
+
+
+@pytest.mark.parametrize("tamper", ("nonadjacent", "cell", "topology", "depth", "records"))
+def test_loader_rejects_invalid_adjacent_context_authority(tamper: str, tmp_path: Path) -> None:
+    root = tmp_path / tamper
+    root.mkdir()
+    bundle, manifest = _explicit_bundle(root)
+    value = json.loads(bundle.read_bytes())
+    binding = value["inputs"][0]
+    authority_path = root / binding["experiment_manifest"]["path"]
+    authority = json.loads(authority_path.read_bytes())
+    assert authority["topology"] == authority["suite"] == "C1F1/100000"
+    assert authority["depth"] == authority["depth_class"] == "full"
+    assert authority["pass_id"] == "full-1" and authority["runs"] == ["full-1"]
+    if tamper == "nonadjacent":
+        replacement = root / "other-authority.json"
+        replacement.write_bytes(authority_path.read_bytes())
+        authority_descriptor_path = replacement
+    else:
+        if tamper == "cell":
+            authority["cell"] = {"corpus": "RocksDB", "profile": "ZSTD_TU", "regime": "cold"}
+        elif tamper == "topology":
+            authority["topology"] = authority["suite"] = "C1F20/40"
+        elif tamper == "depth":
+            authority["depth"] = authority["depth_class"] = "200"
+        else:
+            authority["records"]["path"] = "wrong-records.jsonl"
+        authority_path.write_bytes(canonical_bytes(authority) + b"\n")
+        authority_descriptor_path = authority_path
+    raw = authority_descriptor_path.read_bytes()
+    binding["experiment_manifest"] = {
+        "path": str(authority_descriptor_path.relative_to(root)),
+        "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw),
+    }
+    _refresh_loaded_bundle(bundle, manifest, value)
+    with pytest.raises(PredictionError, match="calibration_experiment_manifest"):
+        load_calibration_bundle(manifest)
+
+
+def test_loader_reports_inferred_c1f20_context_in_sidecar(tmp_path: Path) -> None:
+    bundle, manifest = _explicit_bundle(tmp_path, "C1F20", "full")
+    predictive_manifest = _engine_inputs(tmp_path / "engine")
+    topology_path = tmp_path / "engine" / "topology.json"
+    topology = json.loads(topology_path.read_bytes())
+    topology["topology"]["f_workers"] = 20
+    topology_raw = engine_canonical_bytes(topology) + b"\n"
+    topology_path.write_bytes(topology_raw)
+    predictive = json.loads(predictive_manifest.read_bytes())
+    predictive["topology_state"].update({
+        "sha256": hashlib.sha256(topology_raw).hexdigest(), "bytes": len(topology_raw)})
+    predictive_manifest.write_bytes(engine_canonical_bytes(predictive) + b"\n")
+    sidecar = predict(predictive_manifest, tmp_path / "curve.jsonl",
+                      calibration_bundle=manifest, depth_class="full")
+    calibration = sidecar["predictor"]["calibration"]
+    assert calibration["context"] == "C1F20/full"
+    assert calibration["factors"] == json.loads(bundle.read_bytes())["calibration"]["scales"][
+        "C1F20/full/ZSTD_ROUTE/warm"]
+
+
+def test_freeze_and_loader_share_derived_authority_schema(tmp_path: Path) -> None:
+    request, comparisons = _request(tmp_path)
+    value = json.loads(request.read_bytes())
+    for comparison in comparisons:
+        comparison.update({"topology": "C1F1", "depth_class": "full"})
+    _explicitize(tmp_path, comparisons, "C1F1", "full")
+    authority_path = tmp_path / comparisons[0]["records"]["path"]
+    authority_path = authority_path.parent / "experiment_manifest.json"
+    authority = json.loads(authority_path.read_bytes())
+    authority["schema"] = "icecream-s8-real-c1f1-live-runner-v2"
+    authority_path.write_bytes(canonical_bytes(authority) + b"\n")
+    request.write_bytes(canonical_bytes({**value, "comparisons": comparisons}) + b"\n")
+    with pytest.raises(CalibrationError, match="experiment_manifest_schema_invalid"):
+        freeze(request, tmp_path / "bundle.json")

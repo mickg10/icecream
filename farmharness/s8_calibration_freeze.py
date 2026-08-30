@@ -240,35 +240,24 @@ def _explicit_experiment_authority(records_path: Path, cell: dict[str, str],
     if not isinstance(authority, dict) or authority.get("status") != "PASS":
         raise CalibrationError(f"{label}:experiment_manifest_not_pass")
     schema = authority.get("schema")
-    if schema not in {"icecream-s8-derived-experiment-v1",
-                      "icecream-s8-real-c1f1-live-runner-v2"}:
+    if schema != "icecream-s8-derived-experiment-v1":
         raise CalibrationError(f"{label}:experiment_manifest_schema_invalid")
     manifest_cell = authority.get("cell")
-    if isinstance(manifest_cell, str):
-        expected = "/".join(cell.values())
-    elif isinstance(manifest_cell, dict):
-        expected = cell
-    else:
+    if not isinstance(manifest_cell, dict):
         raise CalibrationError(f"{label}:experiment_manifest_cell_invalid")
-    if manifest_cell != expected:
+    if manifest_cell != cell:
         raise CalibrationError(f"{label}:experiment_manifest_cell_mismatch")
     if authority.get("split") != SPLITS[cell["corpus"]]:
         raise CalibrationError(f"{label}:experiment_manifest_split_mismatch")
-    suite = authority.get("suite", authority.get("topology"))
-    if not isinstance(suite, str) or not suite.startswith(topology + "/"):
+    expected_suite = "C1F1/100000" if topology == "C1F1" else "C1F20/40"
+    if (authority.get("topology") != expected_suite or
+            authority.get("suite") != expected_suite):
         raise CalibrationError(f"{label}:experiment_manifest_topology_mismatch")
     # Derived packages distinguish source depth (``full``) from the
     # state-carrying repeat class (``repeat-full``); the latter is authoritative
     # for context binding.  Native runner manifests only expose ``depth``.
-    manifest_depth = (authority.get("depth_class")
-                      if schema == "icecream-s8-derived-experiment-v1"
-                      else authority.get("depth", authority.get("depth_class")))
-    depth_aliases = {
-        "100": {"100"}, "200": {"200"},
-        "full": {"full", "full-1"},
-        "repeat-full": {"full-2", "repeat-full", "state-carrying full-2"},
-    }
-    if manifest_depth not in depth_aliases.get(depth_class, set()):
+    if (authority.get("depth") != ("full" if depth_class == "repeat-full" else depth_class) or
+            authority.get("depth_class") != depth_class):
         raise CalibrationError(f"{label}:experiment_manifest_depth_mismatch")
     runs = authority.get("runs")
     if not isinstance(runs, list) or not runs or any(not isinstance(run, str) for run in runs):
@@ -277,7 +266,9 @@ def _explicit_experiment_authority(records_path: Path, cell: dict[str, str],
     if pass_id is None:
         # Native runner manifests identify the canonical first pass by run.
         pass_id = "full-2" if depth_class == "repeat-full" else "full-1"
-    if not isinstance(pass_id, str) or not pass_id or pass_id not in runs:
+    expected_pass_id = "full-2" if depth_class == "repeat-full" else "full-1"
+    if pass_id != expected_pass_id or pass_id not in runs or (
+            depth_class == "repeat-full" and "full-1" not in runs):
         raise CalibrationError(f"{label}:experiment_manifest_pass_mismatch")
     records_descriptor = authority.get("records")
     if not isinstance(records_descriptor, dict) or set(records_descriptor) != DESCRIPTOR_KEYS:

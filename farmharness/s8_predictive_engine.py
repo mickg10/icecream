@@ -364,30 +364,21 @@ def load_calibration_bundle(manifest_path: Path) -> dict[str, object]:
                 raise PredictionError("calibration_experiment_manifest:cell_mismatch")
             if manifest.get("split") != SPLITS[cell["corpus"]]:
                 raise PredictionError("calibration_experiment_manifest:split_mismatch")
-            manifest_topology = manifest.get("topology")
-            suite = manifest.get("suite")
-            if (not isinstance(manifest_topology, str) or
-                    not isinstance(suite, str) or suite != manifest_topology or
-                    not manifest_topology.startswith(f"{topology}/")):
+            expected_suite = "C1F1/100000" if topology == "C1F1" else "C1F20/40"
+            if (manifest.get("topology") != expected_suite or
+                    manifest.get("suite") != expected_suite):
                 raise PredictionError("calibration_experiment_manifest:topology_mismatch")
             manifest_depth = manifest.get("depth_class")
             manifest_source_depth = manifest.get("depth")
-            depth_aliases = {
-                "100": {"100"}, "200": {"200"},
-                "full": {"full", "full-1"},
-                "repeat-full": {"full-2", "repeat-full", "state-carrying full-2"},
-            }
-            source_depth_aliases = {
-                "100": {"100"}, "200": {"200"},
-                "full": {"full", "full-1"},
-                "repeat-full": {"full", "full-2", "repeat-full"},
-            }
-            if (manifest_depth not in depth_aliases.get(depth_class, set()) or
-                    manifest_source_depth not in source_depth_aliases.get(depth_class, set())):
+            if (manifest_depth != depth_class or
+                    manifest_source_depth != ("full" if depth_class == "repeat-full" else depth_class)):
                 raise PredictionError("calibration_experiment_manifest:depth_mismatch")
             runs = manifest.get("runs")
+            expected_pass_id = "full-2" if depth_class == "repeat-full" else "full-1"
             if (not isinstance(runs, list) or not runs or
-                    any(not isinstance(run, str) for run in runs) or pass_id not in runs):
+                    any(not isinstance(run, str) for run in runs) or
+                    pass_id != expected_pass_id or pass_id not in runs or
+                    (depth_class == "repeat-full" and "full-1" not in runs)):
                 raise PredictionError("calibration_experiment_manifest:runs_invalid")
             records_descriptor = manifest.get("records")
             if (not isinstance(records_descriptor, dict) or
