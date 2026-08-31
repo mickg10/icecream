@@ -1352,8 +1352,12 @@ def test_external_finalizer_propagates_scope_placement_and_authority(
     evidence = json.loads((output / "evidence.json").read_text())
     curve_manifest = json.loads((output / "live_curve_manifest.json").read_text())
     experiment = json.loads((output / "experiment_manifest.json").read_text())
+    loaded_curve = runner.normalizer._load_manifest(
+        output / "live_curve_manifest.json", "live")
     assert evidence["execution_scope"] == runner.EXTERNAL_FARM_EXECUTION_SCOPE
     assert curve_manifest["role_placement"] == evidence["role_placement"]
+    assert "external_farm" not in curve_manifest
+    assert loaded_curve["execution_scope"] == runner.EXTERNAL_FARM_EXECUTION_SCOPE
     assert experiment["external_farm"]["manifest"]["sha256"] == hashlib.sha256(manifest.read_bytes()).hexdigest()
     assert (output / "product-evidence" / "external-farm-authority.json").is_file()
 

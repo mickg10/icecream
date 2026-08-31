@@ -2967,13 +2967,6 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                           "evidence": {"results_sha256": hashlib.sha256(summary_raw).hexdigest(),
                                        "evidence_manifest_sha256": evidence_manifest_sha,
                                        "binary_sha256": binaries, "evidence_sha256": evidence_value["evidence_sha256"]}}
-        if external_binding is not None:
-            manifest_value["external_farm"] = {
-                "manifest": external_binding["manifest"],
-                "authority": external_binding["authority"],
-                "stdout": external_binding["stdout"],
-                "receipt": external_binding["receipt"],
-            }
         if calibration_metadata is not None:
             manifest_value.update(calibration_metadata)
         manifest_raw = _canonical(manifest_value) + b"\n"
