@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 import subprocess
+from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -16,7 +18,7 @@ from s8_predictive_live_normalizer import MANIFEST_SCHEMA, canonical_bytes
 def _product(tmp_path: Path) -> tuple[Path, Path]:
     root = tmp_path / "product"
     for role in ("scheduler/icecc-scheduler", "daemon/iceccd", "client/icecc",
-                 "cache/icecc-cache-service"):
+                 "client/icecc-create-env", "cache/icecc-cache-service"):
         path = root / role
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(role.encode())
@@ -1088,7 +1090,8 @@ def _external_authority(tmp_path: Path, manifest: Path, manifest_sha: str) -> tu
                          for role in runner.EXTERNAL_FARM_ROLE_PATHS},
             "cpu_count": {"q3": 32, "q2": 32, "research6": 20, "research7": 12}[host],
             "idle": {"status": "PASS", "load_1m": 0.1,
-                     "captured_at": "2026-08-31T00:00:00Z",
+                     "captured_at": datetime.now(timezone.utc).replace(microsecond=0).strftime(
+                         "%Y-%m-%dT%H:%M:%SZ"),
                      "baseline_digest": hashlib.sha256(f"baseline-{host}".encode()).hexdigest()},
             "cpu_sample": sample,
             "cpu_sample_digest": hashlib.sha256((runner._canonical(sample) + b"\n")).hexdigest(),
@@ -1121,16 +1124,50 @@ def _external_authority(tmp_path: Path, manifest: Path, manifest_sha: str) -> tu
 
 def _external_input(tmp_path: Path, manifest: Path, authority: Path,
                     work: Path, stdout: str) -> runner.ExternalFarmFinalization:
+    manifest_sha = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    authority_sha = hashlib.sha256(authority.read_bytes()).hexdigest()
+    manifest_value = json.loads(manifest.read_text())
+    authority_value = json.loads(authority.read_text())
+    execution_id = "test-external-001"
+    started_at = datetime.now(timezone.utc).replace(microsecond=0).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+    finished_at = started_at
+    def identity(host: str, service: str, ordinal: int) -> dict[str, object]:
+        # Some negative cases deliberately remove a mapped host before the
+        # adapter is called; keep the receipt constructible so the authority
+        # gate, rather than this fixture, reports the rejection.
+        host_value = authority_value["hosts"].get(host, authority_value["hosts"]["q2"])
+        return {"host": host, "service": service,
+                "physical_host_digest": host_value["physical_host_digest"],
+                "boot_id_digest": host_value["boot_id_digest"],
+                "pid": 1000 + ordinal, "container_id": "%064x" % (ordinal + 1)}
+    start_marker = (f"S8_EXTERNAL_FARM_EXECUTION execution_id={execution_id} "
+                    f"manifest_sha256={manifest_sha} authority_sha256={authority_sha} "
+                    f"phase=start timestamp={started_at}")
+    end_marker = (f"S8_EXTERNAL_FARM_EXECUTION execution_id={execution_id} "
+                  f"manifest_sha256={manifest_sha} authority_sha256={authority_sha} "
+                  f"phase=end timestamp={finished_at}")
+    stdout = stdout.rstrip("\n") + "\n" + start_marker + "\n" + end_marker + "\n"
     stdout_path = tmp_path / "product-output.log"
     stdout_path.write_text(stdout, encoding="utf-8")
+    mapping = authority_value["placements"][manifest_value["suite"]]["relationship_hosts"]
+    workers = [identity(host, "p50-f" if len(mapping) == 1 else f"p50-f-{index}", index + 2)
+               | {"relationship": index}
+               for index, host in enumerate(mapping)]
     receipt = {"schema": runner.EXTERNAL_FARM_RECEIPT_SCHEMA,
-               "mode": "external_farm", "suite": json.loads(manifest.read_text())["suite"],
-               "manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
-               "authority_sha256": hashlib.sha256(authority.read_bytes()).hexdigest(),
+               "mode": "external_farm", "suite": manifest_value["suite"],
+               "manifest_sha256": manifest_sha, "authority_sha256": authority_sha,
                "stdout": {"path": str(stdout_path),
                           "sha256": hashlib.sha256(stdout_path.read_bytes()).hexdigest(),
                           "bytes": stdout_path.stat().st_size},
-               "workdir": str(work)}
+               "workdir": str(work),
+               "execution": {"execution_id": execution_id,
+                             "scheduler": identity("q3", "p50-scheduler", 0),
+                             "client": identity("q3", "p50-c", 1),
+                             "workers": workers, "started_at": started_at,
+                             "finished_at": finished_at, "start_marker": start_marker,
+                             "end_marker": end_marker,
+                             "artifacts": {"collection": "complete", "cleanup": "complete"}}}
     receipt_path = tmp_path / "external-receipt.json"
     receipt_path.write_bytes(runner._canonical(receipt) + b"\n")
     return runner.ExternalFarmFinalization(
@@ -1220,6 +1257,27 @@ def test_external_binding_rejects_stdout_file_mutation(tmp_path: Path) -> None:
         runner._external_farm_binding(external, runner.TOPOLOGY)
 
 
+@pytest.mark.parametrize("mutation", [
+    lambda value: value.pop("execution"),
+    lambda value: value["execution"]["artifacts"].update({"cleanup": "pending"}),
+    lambda value: value["execution"]["workers"][0].update({"host": "q3"}),
+])
+def test_external_binding_requires_genuine_lifecycle_receipt(
+        tmp_path: Path, mutation: object) -> None:
+    manifest, manifest_sha = _external_farm(tmp_path)
+    authority, authority_sha = _external_authority(tmp_path, manifest, manifest_sha)
+    work = tmp_path / "p50compilee2e.external"; work.mkdir()
+    external = _external_input(tmp_path, manifest, authority, work, f"S7_WORKDIR={work}")
+    receipt_value = json.loads(external.receipt_path.read_text())
+    mutation(receipt_value)  # type: ignore[operator]
+    external.receipt_path.write_bytes(runner._canonical(receipt_value) + b"\n")
+    external = replace(external,
+                       receipt_sha256=hashlib.sha256(external.receipt_path.read_bytes()).hexdigest(),
+                       receipt_bytes=external.receipt_path.stat().st_size)
+    with pytest.raises(runner.LiveRunnerError, match="external_farm.receipt"):
+        runner._external_farm_binding(external, runner.TOPOLOGY)
+
+
 @pytest.mark.parametrize(("mutation", "message"), [
     (lambda value: value.update({"suite": runner.PARALLEL_TOPOLOGY}), "identity_invalid"),
     (lambda value: value["scheduler"].update({"host": "127.0.0.1"}), "loopback"),
@@ -1238,6 +1296,8 @@ def test_external_manifest_rejects_transport_identity_mutations(
 
 def test_external_finalizer_propagates_scope_placement_and_authority(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "client").mkdir()
+    (tmp_path / "client/icecc-create-env").write_bytes(b"client/icecc-create-env")
     batch_manifest = tmp_path / "batch.jsonl"; batch_manifest.write_bytes(b"batch\n")
     topology = tmp_path / "topology.json"
     topology.write_bytes(runner._canonical({"assignments": []}) + b"\n")

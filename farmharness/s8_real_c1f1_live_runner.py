@@ -461,6 +461,9 @@ def _load_external_farm_authority(path: Path, expected_sha256: str,
     if len({normalized_hosts[host]["physical_host_digest"]
             for host in EXTERNAL_FARM_HOSTS}) != len(EXTERNAL_FARM_HOSTS):
         _fail("external_farm.authority:physical_hosts_not_unique")
+    if len({normalized_hosts[host]["boot_id_digest"]
+            for host in EXTERNAL_FARM_HOSTS}) != len(EXTERNAL_FARM_HOSTS):
+        _fail("external_farm.authority:boot_ids_not_unique")
     if any(normalized_hosts[host]["binaries"] != reference_binaries
            for host in EXTERNAL_FARM_HOSTS):
         _fail("external_farm.authority:per_host_binary_mismatch")

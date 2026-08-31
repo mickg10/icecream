@@ -11,7 +11,15 @@ per-host binaries, idle witness, descriptors, and pinned image closure.
 An authenticated `external-farm-receipt-v1` descriptor with `mode` set to
 `external_farm` binds the manifest, authority, stdout, suite, and workdir.
 Its exact keys are `schema`, `mode`, `suite`, `manifest_sha256`,
-`authority_sha256`, `stdout` (`path`, `sha256`, `bytes`), and `workdir`.
+`authority_sha256`, `stdout` (`path`, `sha256`, `bytes`), `workdir`, and
+`execution`.  The execution block contains an execution ID, q3 scheduler and
+client identities, an ordered F identity for every relationship, bounded PID
+and container IDs, UTC `started_at`/`finished_at`, exact stdout start/end
+markers, and `artifacts` set to `{"collection":"complete","cleanup":"complete"}`.
+The stdout markers are
+`S8_EXTERNAL_FARM_EXECUTION execution_id=... manifest_sha256=... authority_sha256=... phase=start|end timestamp=...`.
+They are required evidence of the external lifecycle, and every used host's
+idle capture must be no more than 300 seconds before `started_at`.
 
 Use `execution_environment="external_farm_product_build"` when calling the
 adapter.  The adapter then runs the mature product evidence path unchanged,
