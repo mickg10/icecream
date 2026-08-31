@@ -673,7 +673,7 @@ awk -v load="$load" -v max="$max_load" 'BEGIN { exit !(load <= max) }'
 machine=$(sha256sum /etc/machine-id | awk '{print $1}')
 boot=$(sha256sum /proc/sys/kernel/random/boot_id | awk '{print $1}')
 test "$boot" = "$expected_boot"
-nic_rows=$(for p in /sys/class/net/*; do n=${p##*/}; test "$n" = lo && continue; real=$(readlink -f "$p" 2>/dev/null || true); mac=$(cat "$p/address" 2>/dev/null || true); case "$real" in */virtual/*) continue;; esac; test -n "$mac" && test "$mac" != 00:00:00:00:00:00 && printf '%s:%s:%s\\n' "$n" "$mac" "$real"; done | sort)
+nic_rows=$(for p in /sys/class/net/*; do n=${p##*/}; test "$n" = lo && continue; real=$(readlink -f "$p" 2>/dev/null || true); mac=$(cat "$p/address" 2>/dev/null || true); case "$real" in */virtual/*) continue;; esac; test -n "$mac" && test "$mac" != 00:00:00:00:00:00 && printf '%s:%s:%s\n' "$n" "$mac" "$real"; done | sort)
 test -n "$nic_rows"
 nic=$(printf '%s\\n' "$nic_rows" | sha256sum | awk '{print $1}')
 physical=$(printf '{"machine_id_sha256":"%s","nic_identity_sha256":"%s"}' "$machine" "$nic" | sha256sum | awk '{print $1}')

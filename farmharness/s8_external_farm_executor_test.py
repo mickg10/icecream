@@ -97,6 +97,17 @@ def test_remote_failure_retains_bounded_diagnostic(
         transport.run("q3", "set -eu\nprintf phase-name\n")
 
 
+def test_preflight_and_authority_capture_hash_identical_nic_rows() -> None:
+    executor_source = Path(executor.__file__).read_text(encoding="utf-8")
+    authority_source = (Path(executor.__file__).with_name(
+        "s8_external_farm_authority.py").read_text(encoding="utf-8"))
+    pattern = re.compile(r"^nic_rows=\$\(for p in /sys/class/net/\*;.*done \| sort\)$", re.M)
+    executor_row = pattern.search(executor_source)
+    authority_row = pattern.search(authority_source)
+    assert executor_row is not None and authority_row is not None
+    assert executor_row.group(0) == authority_row.group(0)
+
+
 def test_parallel_gate_requires_all_lanes_and_overlap() -> None:
     with pytest.raises(executor.ExternalFarmError, match="parallel_overlap_missing"):
         executor.overlap_required("C1F20/40", {"planned_lanes": 40, "max_concurrent": 1})
