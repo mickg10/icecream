@@ -92,6 +92,14 @@ LOOPBACK_EXECUTION_SCOPE = "loopback_correctness_only"
 EXTERNAL_FARM_EXECUTION_SCOPE = "external_farm_timing"
 EXTERNAL_FARM_SCHEMA = "icecream-s8-external-farm-v1"
 EXTERNAL_FARM_AUTHORITY_SCHEMA = "icecream-s8-external-farm-authority-v1"
+EXTERNAL_FARM_RECEIPT_SCHEMA = "icecream-s8-external-farm-receipt-v1"
+EXTERNAL_FARM_HOSTS = ("q3", "q2", "research6", "research7")
+EXTERNAL_FARM_ROLE_PATHS = (
+    "scheduler/icecc-scheduler", "daemon/iceccd", "client/icecc",
+    "client/icecc-create-env", "cache/icecc-cache-service")
+EXTERNAL_FARM_PINNED_IMAGE = "icecream/p50-farm-node:ubuntu22-gcc11-boost174-bdb55d"
+EXTERNAL_FARM_IMAGE_INDEX = "sha256:bdb55d4287a473e3ebfbaa7715a50ee670659777278b8d84c350724e6fa8de58"
+EXTERNAL_FARM_IMAGE_CONFIG = "sha256:fe001a6138f0176088b8846b43bf268a76a9d7a5b66c3364ba3f881da2ff0c54b"
 ROLE_PLACEMENT_SCHEMA = "icecream-s8-role-placement-v1"
 # Keep the runner's emitted identity aligned with the current intake schema.
 CALIBRATION_METADATA_FIELDS = frozenset(normalizer.CALIBRATION_METADATA_KEYS)
@@ -126,7 +134,12 @@ class ExternalFarmFinalization:
     authority_path: Path
     authority_sha256: str
     workdir: Path
-    stdout: str
+    stdout_path: Path
+    stdout_sha256: str
+    stdout_bytes: int
+    receipt_path: Path
+    receipt_sha256: str
+    receipt_bytes: int
 
 
 def _external_input(value: object) -> ExternalFarmFinalization:
@@ -135,7 +148,9 @@ def _external_input(value: object) -> ExternalFarmFinalization:
         return value
     if isinstance(value, Mapping):
         required = {"manifest_path", "manifest_sha256", "authority_path",
-                    "authority_sha256", "workdir", "stdout"}
+                    "authority_sha256", "workdir", "stdout_path",
+                    "stdout_sha256", "stdout_bytes", "receipt_path",
+                    "receipt_sha256", "receipt_bytes"}
         if set(value) != required:
             _fail("external_farm.input:fields_invalid")
         try:
@@ -144,7 +159,13 @@ def _external_input(value: object) -> ExternalFarmFinalization:
                 manifest_sha256=value["manifest_sha256"],
                 authority_path=Path(value["authority_path"]),
                 authority_sha256=value["authority_sha256"],
-                workdir=Path(value["workdir"]), stdout=value["stdout"])
+                workdir=Path(value["workdir"]),
+                stdout_path=Path(value["stdout_path"]),
+                stdout_sha256=value["stdout_sha256"],
+                stdout_bytes=value["stdout_bytes"],
+                receipt_path=Path(value["receipt_path"]),
+                receipt_sha256=value["receipt_sha256"],
+                receipt_bytes=value["receipt_bytes"])
         except (TypeError, ValueError) as exc:
             raise LiveRunnerError("external_farm.input:fields_invalid") from exc
     _fail("external_farm.input:fields_invalid")
@@ -213,14 +234,8 @@ def load_external_farm_manifest(path: Path, expected_sha256: str,
         value = normalizer.parse_json(path.read_bytes(), "external_farm.manifest")
     except (normalizer.NormalizationError, OSError) as exc:
         raise LiveRunnerError("external_farm.manifest:invalid_json") from exc
-    if not isinstance(value, dict) or set(value) - {
-            "schema", "suite", "scheduler", "client", "workers", "role_placement",
-            # Older transports put their detailed host witness next to the
-            # seven-field placement.  The finalizer authenticates the
-            # standalone authority below; retaining this optional field here
-            # keeps the manifest loader forward-compatible without treating
-            # it as evidence by itself.
-            "farm_authority"}:
+    if not isinstance(value, dict) or set(value) != {
+            "schema", "suite", "scheduler", "client", "workers", "role_placement"}:
         _fail("external_farm.manifest:fields_invalid")
     if value.get("schema") != EXTERNAL_FARM_SCHEMA or value.get("suite") != suite:
         _fail("external_farm.manifest:identity_invalid")
@@ -283,12 +298,6 @@ def load_external_farm_manifest(path: Path, expected_sha256: str,
                   "scheduler": {"host": host, "port": port},
                   "client": {"host_digest": client_digest},
                   "workers": normalized_workers, "role_placement": placement}
-    if "farm_authority" in value:
-        authority = value["farm_authority"]
-        if (not isinstance(authority, dict) or
-                authority.get("schema") != EXTERNAL_FARM_AUTHORITY_SCHEMA):
-            _fail("external_farm.farm_authority:fields_invalid")
-        normalized["farm_authority"] = authority
     return normalized, digest, size
 
 
@@ -312,9 +321,8 @@ def _private_descriptor(value: object, label: str) -> tuple[Path, str, int]:
 
 def _load_external_farm_authority(path: Path, expected_sha256: str,
                                   manifest: dict[str, object],
-                                  manifest_sha256: str,
                                   suite: str) -> tuple[dict[str, object], str, int]:
-    """Load the independent host/image authority required for timing."""
+    """Load the canonical four-host authority emitted by S8 capture."""
     if (not path.is_absolute() or path.is_symlink() or not path.is_file() or
             path.stat().st_nlink != 1):
         _fail("external_farm.authority:unavailable")
@@ -326,80 +334,202 @@ def _load_external_farm_authority(path: Path, expected_sha256: str,
         value = normalizer.parse_json(path.read_bytes(), "external_farm.authority")
     except (normalizer.NormalizationError, OSError) as exc:
         raise LiveRunnerError("external_farm.authority:invalid_json") from exc
-    required = {"schema", "suite", "manifest_sha256", "role_placement",
-                "runtime_image", "host_descriptor"}
-    allowed = required | {"calibration_metadata"}
-    if not isinstance(value, dict) or not required.issubset(value) or set(value) - allowed:
+    if (not isinstance(value, dict) or
+            set(value) != {"schema", "hosts", "placements"} or
+            value.get("schema") != EXTERNAL_FARM_AUTHORITY_SCHEMA):
         _fail("external_farm.authority:fields_invalid")
-    if (value.get("schema") != EXTERNAL_FARM_AUTHORITY_SCHEMA or
-            value.get("suite") != suite or
-            value.get("manifest_sha256") != manifest_sha256 or
-            value.get("role_placement") != manifest.get("role_placement")):
-        _fail("external_farm.authority:identity_mismatch")
-    try:
-        placement = normalizer._validate_role_placement(value.get("role_placement"), "live")
-    except normalizer.NormalizationError as exc:
-        raise LiveRunnerError(str(exc)) from exc
-    if (placement is None or placement.get("mode") != "external_farm" or
-            placement.get("roles_disjoint") is not True or
-            placement.get("timing_eligible") is not True):
-        _fail("external_farm.authority:role_placement_invalid")
-    runtime_image = value.get("runtime_image")
-    if (not isinstance(runtime_image, dict) or
-            set(runtime_image) != {"reference", "image_id", "architecture", "os", "created"} or
-            IMAGE_ID.fullmatch(runtime_image.get("image_id", "")) is None or
-            runtime_image.get("architecture") != "amd64" or
-            runtime_image.get("os") != "linux" or
-            not isinstance(runtime_image.get("reference"), str) or
-            not isinstance(runtime_image.get("created"), str)):
-        _fail("external_farm.authority:runtime_image_invalid")
-    descriptor_path, descriptor_sha, descriptor_bytes = _private_descriptor(
-        value.get("host_descriptor"), "external_farm.authority.host_descriptor")
-    metadata: dict[str, str] | None = None
-    if "calibration_metadata" in value:
+    hosts = value.get("hosts")
+    if not isinstance(hosts, dict) or set(hosts) != set(EXTERNAL_FARM_HOSTS):
+        _fail("external_farm.authority:host_set_invalid")
+    normalized_hosts: dict[str, object] = {}
+    for host in EXTERNAL_FARM_HOSTS:
+        item = hosts[host]
+        required = {"target", "lan", "hostname", "descriptor", "physical_host_digest",
+                    "boot_id_digest", "image", "binaries", "cpu_count", "idle",
+                    "cpu_sample", "cpu_sample_digest"}
+        if not isinstance(item, dict) or set(item) != required:
+            _fail(f"external_farm.authority:{host}:fields_invalid")
+        if (not isinstance(item["target"], str) or not item["target"] or
+                not isinstance(item["lan"], str) or not item["lan"] or
+                not isinstance(item["hostname"], str) or not item["hostname"]):
+            _fail(f"external_farm.authority:{host}:identity_invalid")
+        physical = _hex(item["physical_host_digest"],
+                        f"external_farm.authority:{host}.physical_host_digest")
+        boot = _hex(item["boot_id_digest"],
+                    f"external_farm.authority:{host}.boot_id_digest")
+        descriptor_path, descriptor_sha, descriptor_bytes = _private_descriptor(
+            item["descriptor"], f"external_farm.authority:{host}.descriptor")
         try:
-            metadata = normalizer._validate_calibration_metadata(
-                value["calibration_metadata"], "external_farm.authority.calibration_metadata")
-        except normalizer.NormalizationError as exc:
-            raise LiveRunnerError(str(exc)) from exc
-        if metadata["host_digest"] != descriptor_sha:
-            _fail("external_farm.authority:host_descriptor_binding_mismatch")
-        if metadata["product_image_digest"] != runtime_image["image_id"].removeprefix("sha256:"):
-            _fail("external_farm.authority:runtime_image_binding_mismatch")
-    normalized = {
-        "schema": EXTERNAL_FARM_AUTHORITY_SCHEMA, "suite": suite,
-        "manifest_sha256": manifest_sha256,
-        "role_placement": placement,
-        "runtime_image": {key: runtime_image[key] for key in
-                           ("reference", "image_id", "architecture", "os", "created")},
-        "host_descriptor": {"path": str(descriptor_path), "sha256": descriptor_sha,
-                             "bytes": descriptor_bytes},
-    }
-    if metadata is not None:
-        normalized["calibration_metadata"] = metadata
+            descriptor_value = normalizer.parse_json(
+                descriptor_path.read_bytes(), f"external_farm.authority:{host}.descriptor")
+        except (normalizer.NormalizationError, OSError) as exc:
+            raise LiveRunnerError(
+                f"external_farm.authority:{host}.descriptor:invalid_json") from exc
+        descriptor_facts = (descriptor_value.get("facts")
+                           if isinstance(descriptor_value, dict) else None)
+        if (not isinstance(descriptor_value, dict) or
+                set(descriptor_value) != {"schema", "facts"} or
+                descriptor_value.get("schema") != "icecream-s8-external-host-descriptor-v1" or
+                not isinstance(descriptor_facts, dict) or
+                set(descriptor_facts) != {"machine_id_sha256", "boot_id_sha256",
+                                          "nic_identity_sha256", "cpu_vendor_sha256",
+                                          "cpu_model_sha256", "cpu_count",
+                                          "physical_host_digest"}):
+            _fail(f"external_farm.authority:{host}.descriptor:fields_invalid")
+        for field in ("machine_id_sha256", "boot_id_sha256", "nic_identity_sha256",
+                      "cpu_vendor_sha256", "cpu_model_sha256", "physical_host_digest"):
+            _hex(descriptor_facts[field], f"external_farm.authority:{host}.descriptor.{field}")
+        physical_input = {"machine_id_sha256": descriptor_facts["machine_id_sha256"],
+                          "nic_identity_sha256": descriptor_facts["nic_identity_sha256"]}
+        expected_physical = hashlib.sha256(_canonical(physical_input)).hexdigest()
+        if (descriptor_facts["physical_host_digest"] != expected_physical or
+                descriptor_facts["physical_host_digest"] != physical or
+                descriptor_facts["boot_id_sha256"] != boot or
+                type(descriptor_facts["cpu_count"]) is not int or
+                descriptor_facts["cpu_count"] != item["cpu_count"]):
+            _fail(f"external_farm.authority:{host}:host_identity_mismatch")
+        image = item["image"]
+        expected_image = (EXTERNAL_FARM_IMAGE_CONFIG if host == "research7"
+                          else EXTERNAL_FARM_IMAGE_INDEX)
+        if (not isinstance(image, dict) or
+                set(image) != {"reference", "image_id", "architecture", "os", "created"} or
+                image.get("reference") != EXTERNAL_FARM_PINNED_IMAGE or
+                image.get("image_id") != expected_image or
+                image.get("architecture") != "amd64" or image.get("os") != "linux" or
+                not isinstance(image.get("created"), str) or not image["created"]):
+            _fail(f"external_farm.authority:{host}:image_invalid")
+        binaries = item["binaries"]
+        if not isinstance(binaries, dict) or set(binaries) != set(EXTERNAL_FARM_ROLE_PATHS):
+            _fail(f"external_farm.authority:{host}:binary_identity_incomplete")
+        normalized_binaries = {role: _hex(binaries[role],
+                                           f"external_farm.authority:{host}.binaries.{role}")
+                              for role in EXTERNAL_FARM_ROLE_PATHS}
+        idle = item["idle"]
+        sample = item["cpu_sample"]
+        baseline_digest = (_hex(idle.get("baseline_digest"),
+                                f"external_farm.authority:{host}.baseline_digest")
+                           if isinstance(idle, dict) else "")
+        sample_digest = (_hex(item["cpu_sample_digest"],
+                              f"external_farm.authority:{host}.cpu_sample_digest")
+                         if isinstance(item["cpu_sample_digest"], str) else "")
+        if (not isinstance(idle, dict) or set(idle) !=
+                {"status", "load_1m", "captured_at", "baseline_digest"} or
+                idle.get("status") not in {"PASS", "HOLD"} or
+                type(idle.get("load_1m")) not in (int, float) or idle["load_1m"] < 0 or
+                not isinstance(idle.get("captured_at"), str) or
+                not isinstance(sample, dict) or set(sample) !=
+                {"before", "after", "duration_seconds", "idle_percent"} or
+                any(not isinstance(sample[field], str) or not sample[field]
+                    for field in ("before", "after")) or
+                type(sample["duration_seconds"]) not in (int, float) or
+                not .5 <= float(sample["duration_seconds"]) <= 5 or
+                type(sample["idle_percent"]) not in (int, float) or
+                not 0 <= float(sample["idle_percent"]) <= 100 or
+                idle.get("status") != ("PASS" if float(idle.get("load_1m", 1)) <= 0.50 and
+                                        float(sample.get("idle_percent", 0)) >= 95.0 else "HOLD") or
+                sample_digest !=
+                hashlib.sha256((_canonical(sample) + b"\n")).hexdigest()):
+            _fail(f"external_farm.authority:{host}:idle_invalid")
+        normalized_hosts[host] = {
+            **item, "physical_host_digest": physical, "boot_id_digest": boot,
+            "descriptor": {"path": str(descriptor_path), "sha256": descriptor_sha,
+                            "bytes": descriptor_bytes},
+            "image": {key: image[key] for key in
+                       ("reference", "image_id", "architecture", "os", "created")},
+            "binaries": normalized_binaries,
+        }
+    reference_binaries = normalized_hosts["q3"]["binaries"]
+    if any(normalized_hosts[host]["binaries"] != reference_binaries
+           for host in EXTERNAL_FARM_HOSTS):
+        _fail("external_farm.authority:per_host_binary_mismatch")
+    placements = value.get("placements")
+    if not isinstance(placements, dict) or set(placements) != set(TOPOLOGIES):
+        _fail("external_farm.authority:placements_invalid")
+    mappings: dict[str, list[str]] = {}
+    for placement_suite, count in ((TOPOLOGY, 1), (PARALLEL_TOPOLOGY, 20)):
+        entry = placements[placement_suite]
+        mapping = entry.get("relationship_hosts") if isinstance(entry, dict) else None
+        if (not isinstance(entry, dict) or set(entry) != {"relationship_hosts"} or
+                not isinstance(mapping, list) or len(mapping) != count or
+                any(host not in EXTERNAL_FARM_HOSTS[1:] for host in mapping)):
+            _fail(f"external_farm.authority:{placement_suite}:mapping_invalid")
+        if any(normalized_hosts[host]["idle"]["status"] != "PASS" for host in set(mapping)):
+            _fail(f"external_farm.authority:{placement_suite}:host_not_idle")
+        mappings[placement_suite] = list(mapping)
+    if normalized_hosts["q3"]["idle"]["status"] != "PASS":
+        _fail("external_farm.authority:q3:not_idle")
+    mapping = mappings[suite]
+    manifest_workers = manifest["workers"]
+    if (len(manifest_workers) != len(mapping) or
+            manifest["scheduler"]["host"] != normalized_hosts["q3"]["lan"]):
+        _fail("external_farm.authority:manifest_mapping_mismatch")
+    expected_client = normalized_hosts["q3"]["physical_host_digest"]
+    if manifest["client"]["host_digest"] != expected_client:
+        _fail("external_farm.authority:client_identity_mismatch")
+    worker_digests = []
+    for index, (worker, host) in enumerate(zip(manifest_workers, mapping, strict=True)):
+        expected_service = "p50-f" if suite == TOPOLOGY else f"p50-f-{index}"
+        if (worker["relationship"] != index or worker["service"] != expected_service or
+                worker["host_digest"] != normalized_hosts[host]["physical_host_digest"]):
+            _fail(f"external_farm.authority:{suite}:worker_mapping_mismatch:{index}")
+        worker_digests.append(worker["host_digest"])
+    placement = manifest["role_placement"]
+    expected_f = list(dict.fromkeys(worker_digests))
+    if (placement["c_host_digest"] != expected_client or
+            placement["scheduler_host_digest"] != normalized_hosts["q3"]["physical_host_digest"] or
+            placement["f_host_digests"] != expected_f):
+        _fail("external_farm.authority:role_placement_mismatch")
+    normalized = {"schema": EXTERNAL_FARM_AUTHORITY_SCHEMA,
+                  "hosts": normalized_hosts,
+                  "placements": {name: {"relationship_hosts": mappings[name]}
+                                 for name in mappings}}
     return normalized, digest, size
 
 
 def _external_farm_binding(external: ExternalFarmFinalization, suite: str) -> dict[str, object]:
     """Authenticate all external inputs and return immutable source facts."""
     if not all(isinstance(path, Path) for path in
-               (external.manifest_path, external.authority_path, external.workdir)):
+               (external.manifest_path, external.authority_path, external.workdir,
+                external.stdout_path, external.receipt_path)):
         _fail("external_farm.input:fields_invalid")
     manifest, manifest_sha, manifest_bytes = load_external_farm_manifest(
         external.manifest_path, external.manifest_sha256, suite)
     authority, authority_sha, authority_bytes = _load_external_farm_authority(
-        external.authority_path, external.authority_sha256, manifest, manifest_sha, suite)
+        external.authority_path, external.authority_sha256, manifest, suite)
     if external.manifest_path.resolve() == external.authority_path.resolve():
         _fail("external_farm:manifest_authority_must_differ")
-    if not isinstance(external.stdout, str) or not external.stdout:
-        _fail("external_farm.stdout:invalid")
+    stdout_path, stdout_sha, stdout_bytes = _private_descriptor(
+        {"path": str(external.stdout_path), "sha256": external.stdout_sha256,
+         "bytes": external.stdout_bytes}, "external_farm.stdout")
+    try:
+        stdout = stdout_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise LiveRunnerError("external_farm.stdout:invalid") from exc
+    receipt_path, receipt_sha, receipt_bytes = _private_descriptor(
+        {"path": str(external.receipt_path), "sha256": external.receipt_sha256,
+         "bytes": external.receipt_bytes}, "external_farm.receipt")
+    try:
+        receipt = normalizer.parse_json(receipt_path.read_bytes(), "external_farm.receipt")
+    except (normalizer.NormalizationError, OSError) as exc:
+        raise LiveRunnerError("external_farm.receipt:invalid_json") from exc
+    if (not isinstance(receipt, dict) or set(receipt) != {
+            "schema", "mode", "suite", "manifest_sha256", "authority_sha256",
+            "stdout", "workdir"} or receipt.get("schema") != EXTERNAL_FARM_RECEIPT_SCHEMA or
+            receipt.get("mode") != "external_farm" or receipt.get("suite") != suite or
+            receipt.get("manifest_sha256") != manifest_sha or
+            receipt.get("authority_sha256") != authority_sha or
+            receipt.get("stdout") != {"path": str(stdout_path), "sha256": stdout_sha,
+                                       "bytes": stdout_bytes}):
+        _fail("external_farm.receipt:identity_mismatch")
     if (not external.workdir.is_absolute() or external.workdir.is_symlink() or
             not external.workdir.is_dir()):
         _fail("external_farm.workdir:invalid")
     try:
         if external.workdir.resolve(strict=True) != external.workdir:
             _fail("external_farm.workdir:invalid")
-        marker = [line.split("=", 1)[1] for line in external.stdout.splitlines()
+        if receipt.get("workdir") != str(external.workdir):
+            _fail("external_farm.receipt:workdir_mismatch")
+        marker = [line.split("=", 1)[1] for line in stdout.splitlines()
                   if line.startswith("S7_WORKDIR=")]
         observed_workdir = Path(marker[0]) if len(marker) == 1 else None
         if observed_workdir is None or observed_workdir.resolve() != external.workdir.resolve():
@@ -411,15 +541,44 @@ def _external_farm_binding(external: ExternalFarmFinalization, suite: str) -> di
                       "sha256": manifest_sha, "bytes": manifest_bytes},
         "authority": {"path": "product-evidence/external-farm-authority.json",
                        "sha256": authority_sha, "bytes": authority_bytes},
+        "stdout": {"path": "product-evidence/product-output.log",
+                    "sha256": stdout_sha, "bytes": stdout_bytes},
+        "receipt": {"path": "product-evidence/external-farm-receipt.json",
+                     "sha256": receipt_sha, "bytes": receipt_bytes},
         "role_placement": manifest["role_placement"],
-        "runtime_image": authority["runtime_image"],
-        "host_descriptor": authority["host_descriptor"],
+        "hosts": authority["hosts"],
         "manifest_value": manifest,
         "authority_value": authority,
     }
-    if "calibration_metadata" in authority:
-        result["calibration_metadata"] = authority["calibration_metadata"]
     return result
+
+
+def _external_calibration_metadata(binding: dict[str, object], work: Path,
+                                   preparation: dict[str, Any],
+                                   rows: list[dict[str, Any]],
+                                   observations: list[dict[str, Any]],
+                                   suite: str) -> dict[str, str]:
+    """Derive calibration identity from every selected physical host/image."""
+    mapping = binding["authority_value"]["placements"][suite]["relationship_hosts"]
+    used = ["q3", *dict.fromkeys(mapping)]
+    hosts = binding["hosts"]
+    closure = [{"host": host, "physical_host_digest": hosts[host]["physical_host_digest"],
+                "boot_id_digest": hosts[host]["boot_id_digest"],
+                "descriptor": hosts[host]["descriptor"], "image": hosts[host]["image"],
+                "binaries": hosts[host]["binaries"]} for host in sorted(used)]
+    host_closure = hashlib.sha256(_canonical({"schema": "icecream-s8-host-closure-v1",
+                                              "hosts": closure})).hexdigest()
+    image_closure = hashlib.sha256(_canonical({"schema": "icecream-s8-image-closure-v1",
+                                               "hosts": [{"host": item["host"],
+                                                          "image": item["image"]}
+                                                         for item in closure]})).hexdigest()
+    return {
+        "product_image_digest": image_closure,
+        "toolchain_digest": _authenticated_toolchain_digest(work, preparation),
+        "output_contract_digest": _output_contract_digest(rows, observations, suite),
+        "host_digest": host_closure,
+        "ordered_input_class": "ordered",
+    }
 
 
 def _co_resident_role_placement(host_digest: str, suite: str) -> dict[str, object]:
@@ -2170,6 +2329,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     """Turn one completed product invocation into two authenticated live curves."""
     external_binding: dict[str, object] | None = None
     external_input: ExternalFarmFinalization | None = None
+    external_stdout = stdout
     if external_farm is not None:
         external_input = _external_input(external_farm)
         # An external result is a replacement for the local launch lifecycle;
@@ -2178,11 +2338,9 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
             _fail("external_farm:local_execution_authority_present")
         if execution_environment != "external_farm_product_build":
             _fail("external_farm:execution_environment_invalid")
-        if stdout != external_input.stdout:
-            _fail("external_farm:stdout_mismatch")
         external_binding = _external_farm_binding(external_input, suite)
-        runtime_image = external_binding["runtime_image"]  # type: ignore[assignment]
-        host_descriptor_path = Path(external_binding["host_descriptor"]["path"])  # type: ignore[index]
+        external_stdout = Path(external_input.stdout_path).read_text(encoding="utf-8")
+        stdout = external_stdout
     measurement_method, effective_product_profile, calibration_eligible = \
         _measurement_descriptor(profile, product_profile)
     raw_ii = effective_product_profile == RAW_II_PROFILE
@@ -2200,8 +2358,8 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
             (execution_environment == "pinned_container_product_build") !=
             (runtime_image is not None)):
         _fail("execution_environment:image_binding_invalid")
-    if external_binding is not None and runtime_image is None:
-        _fail("external_farm:runtime_image_missing")
+    if external_binding is not None and not external_binding.get("hosts"):
+        _fail("external_farm:authority_hosts_missing")
     if runtime_image is not None and (
             set(runtime_image) != {"reference", "image_id", "architecture", "os", "created"} or
             IMAGE_ID.fullmatch(runtime_image.get("image_id", "")) is None):
@@ -2263,6 +2421,15 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     commit, tree, binaries, runner_sha = product_identity(product_root)
     if binaries != expected_binaries:
         _fail("binary_identity:stdout_mismatch")
+    if external_binding is not None:
+        mapping = external_binding["authority_value"]["placements"][suite]["relationship_hosts"]
+        used_hosts = ["q3", *dict.fromkeys(mapping)]
+        authority_binaries = external_binding["hosts"]["q3"]["binaries"]
+        if any(external_binding["hosts"][host]["binaries"] != authority_binaries
+               for host in used_hosts):
+            _fail("external_farm.authority:per_host_binary_mismatch")
+        if any(authority_binaries.get(role) != digest for role, digest in expected_binaries.items()):
+            _fail("external_farm.authority:product_binary_mismatch")
     if launch_identity is not None:
         if (launch_identity.get("source_commit") != commit or
                 launch_identity.get("source_tree") != tree or
@@ -2277,8 +2444,6 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     host_descriptor_binding: dict[str, object] | None = None
     role_placement: dict[str, object] | None = None
     if launch_identity is not None or external_binding is not None:
-        if runtime_image is None or host_descriptor_path is None:
-            _fail("calibration_metadata:authority_missing")
         if external_binding is not None:
             # Re-read both authority files immediately before deriving
             # metadata.  A transport cannot swap a valid authority after the
@@ -2286,29 +2451,31 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
             rebound = _external_farm_binding(external_input, suite)  # type: ignore[arg-type]
             if rebound != external_binding:
                 _fail("external_farm:authority_changed_during_finalize")
-            host_digest, host_bytes = _load_host_descriptor(host_descriptor_path)[1:]
-            if (host_digest != external_binding["host_descriptor"]["sha256"] or
-                    host_bytes != external_binding["host_descriptor"]["bytes"]):
-                _fail("external_farm:host_descriptor_changed_during_finalize")
+            calibration_metadata = _external_calibration_metadata(
+                external_binding, work, environment_preparation, rows, observations, suite)
+            role_placement = external_binding["role_placement"]
+            host_descriptor_binding = {
+                "mode": "external_farm",
+                "hosts": {host: external_binding["hosts"][host]["descriptor"]
+                          for host in sorted(external_binding["hosts"])
+                          if host == "q3" or host in external_binding["authority_value"]["placements"][suite]["relationship_hosts"]},
+            }
         else:
+            if runtime_image is None or host_descriptor_path is None:
+                _fail("calibration_metadata:authority_missing")
             if launch_identity.get("runtime_image") != runtime_image:
                 _fail("calibration_metadata:runtime_image_changed_during_run")
             host_digest, host_bytes = _authenticated_host_binding(
                 host_descriptor_path, launch_identity)
-        calibration_metadata = _calibration_metadata(
-            runtime_image=runtime_image, preparation=environment_preparation,
-            work=work, rows=rows, observations=observations, suite=suite,
-            host_descriptor=host_descriptor_path)
-        if (external_binding is not None and
-                external_binding.get("calibration_metadata") is not None and
-                calibration_metadata != external_binding["calibration_metadata"]):
-            _fail("external_farm.authority:calibration_metadata_mismatch")
-        host_descriptor_binding = {"path": "product-evidence/host-descriptor.json",
-                                   "sha256": host_digest, "bytes": host_bytes}
-        role_placement = (external_binding["role_placement"]
-                          if external_binding is not None else
-                          _co_resident_role_placement(calibration_metadata["host_digest"], suite))
         if external_binding is None:
+            calibration_metadata = _calibration_metadata(
+                runtime_image=runtime_image, preparation=environment_preparation,
+                work=work, rows=rows, observations=observations, suite=suite,
+                host_descriptor=host_descriptor_path)
+            host_descriptor_binding = {"path": "product-evidence/host-descriptor.json",
+                                       "sha256": host_digest, "bytes": host_bytes}
+            role_placement = _co_resident_role_placement(
+                calibration_metadata["host_digest"], suite)
             try:
                 normalizer._validate_role_placement(role_placement, "live")
             except normalizer.NormalizationError as exc:
@@ -2383,8 +2550,12 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
         # points at bytes retained beside the product evidence.
         manifest_source = external_input.manifest_path  # type: ignore[union-attr]
         authority_source = external_input.authority_path  # type: ignore[union-attr]
+        stdout_source = external_input.stdout_path  # type: ignore[union-attr]
+        receipt_source = external_input.receipt_path  # type: ignore[union-attr]
         shutil.copy2(manifest_source, retained / "external-farm-manifest.json")
         shutil.copy2(authority_source, retained / "external-farm-authority.json")
+        shutil.copy2(stdout_source, retained / "product-output.log")
+        shutil.copy2(receipt_source, retained / "external-farm-receipt.json")
         copied_manifest_sha, copied_manifest_bytes = _sha(
             retained / "external-farm-manifest.json")
         copied_authority_sha, copied_authority_bytes = _sha(
@@ -2394,6 +2565,25 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                 copied_authority_sha != external_binding["authority"]["sha256"] or
                 copied_authority_bytes != external_binding["authority"]["bytes"]):
             _fail("external_farm:source_changed_during_copy")
+        if (_sha(retained / "product-output.log") !=
+                (external_binding["stdout"]["sha256"], external_binding["stdout"]["bytes"]) or
+                _sha(retained / "external-farm-receipt.json") !=
+                (external_binding["receipt"]["sha256"], external_binding["receipt"]["bytes"])):
+            _fail("external_farm:stdout_or_receipt_changed_during_copy")
+        copied_descriptors: dict[str, dict[str, object]] = {}
+        used_hosts = ["q3", *dict.fromkeys(
+            external_binding["authority_value"]["placements"][suite]["relationship_hosts"])]
+        for host in sorted(used_hosts):
+            source = Path(external_binding["hosts"][host]["descriptor"]["path"])
+            destination = retained / f"external-host-descriptor-{host}.json"
+            shutil.copy2(source, destination)
+            copied_sha, copied_bytes = _sha(destination)
+            expected = external_binding["hosts"][host]["descriptor"]
+            if copied_sha != expected["sha256"] or copied_bytes != expected["bytes"]:
+                _fail(f"external_farm:host_descriptor_changed_during_copy:{host}")
+            copied_descriptors[host] = {"path": f"product-evidence/{destination.name}",
+                                        "sha256": copied_sha, "bytes": copied_bytes}
+        host_descriptor_binding = {"mode": "external_farm", "hosts": copied_descriptors}
     payload_raw = _canonical({"source_manifest_sha256": plan["source_manifest"]["sha256"],
                               "inputs": plan_inputs})
     _write_new(retained / "input-descriptors.json", payload_raw)
@@ -2467,6 +2657,8 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
         summary_value["external_farm"] = {
             "manifest": external_binding["manifest"],
             "authority": external_binding["authority"],
+            "stdout": external_binding["stdout"],
+            "receipt": external_binding["receipt"],
         }
     summary_raw = _canonical(summary_value) + b"\n"
     _write_new(target / "results.jsonl", summary_raw)
@@ -2614,6 +2806,8 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
         evidence_value["external_farm"] = {
             "manifest": external_binding["manifest"],
             "authority": external_binding["authority"],
+            "stdout": external_binding["stdout"],
+            "receipt": external_binding["receipt"],
         }
     evidence_value["evidence_sha256"] = hashlib.sha256(_canonical(evidence_value)).hexdigest()
     evidence_raw = _canonical(evidence_value) + b"\n"
@@ -2653,6 +2847,8 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
             manifest_value["external_farm"] = {
                 "manifest": external_binding["manifest"],
                 "authority": external_binding["authority"],
+                "stdout": external_binding["stdout"],
+                "receipt": external_binding["receipt"],
             }
         if calibration_metadata is not None:
             manifest_value.update(calibration_metadata)
@@ -2730,6 +2926,8 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
         experiment["external_farm"] = {
             "manifest": external_binding["manifest"],
             "authority": external_binding["authority"],
+            "stdout": external_binding["stdout"],
+            "receipt": external_binding["receipt"],
         }
     _write_new(target / "experiment_manifest.json", _canonical(experiment) + b"\n")
     # The lifecycle temporary tree is diagnostic state on failure, but must
