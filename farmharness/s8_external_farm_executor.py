@@ -342,6 +342,17 @@ def build_external_command(batch_manifest: Path, predictive_plan: Path, topology
     return ["env", "ICECC_P50_EXTERNAL_FARM=1", *command[1:]]
 
 
+def external_timeout_seconds(tu_count: int, passes: int, warm: bool) -> int:
+    """Bound remote work, post-measurement local references, and collection."""
+    if type(tu_count) is not int or tu_count <= 0 or passes not in (1, 2):
+        raise ExternalFarmError("timeout:arguments_invalid")
+    # Every remote batch has an equally sized, deliberately non-overlapping
+    # local correctness pass.  A warm regime adds one more such pair.
+    work_passes = 2 * (passes + (1 if warm else 0))
+    return min(live.MAX_TIMEOUT_SECONDS,
+               max(live.MIN_TIMEOUT_SECONDS, 30 + tu_count * 12 * work_passes))
+
+
 def overlap_required(topology: str, observed: Mapping[str, int]) -> None:
     if topology == "C1F20/40":
         if observed.get("planned_lanes") != 40 or observed.get("max_concurrent", 0) <= 1:
@@ -1495,16 +1506,24 @@ def main(argv: list[str] | None = None) -> int:
                 raise ExternalFarmError("execute:batch,predictive,topology,product-root,output required")
             if args.repeat_predictive_plan is not None:
                 raise ExternalFarmError("execute:repeat_predictive_plan_external_hold")
+            rows, _assignments = validate_batch_inputs(
+                args.batch_manifest.absolute(), args.predictive_plan.absolute(),
+                args.topology_file.absolute(), corpus=args.corpus,
+                profile=args.profile, regime=args.regime, depth=args.depth,
+                suite=args.topology)
+            timeout_seconds = external_timeout_seconds(
+                len(rows), args.passes, args.regime == "warm")
             command = build_external_command(
                 args.batch_manifest.absolute(), args.predictive_plan.absolute(),
                 args.topology_file.absolute(), args.product_root.absolute(),
                 profile=args.profile, corpus=args.corpus, regime=args.regime,
                 depth=args.depth, suite=args.topology,
-                workdir=Path("/tmp/p50compilee2e.external"), timeout_seconds=900,
+                workdir=Path("/tmp/p50compilee2e.external"),
+                timeout_seconds=timeout_seconds,
                 passes=args.passes, repeat_predictive_plan=(args.repeat_predictive_plan.absolute()
                                                             if args.repeat_predictive_plan else None))
             extra_plans = ()
-            result = SSHTransport(authority).execute(
+            result = SSHTransport(authority, timeout=timeout_seconds).execute(
                 topology=args.topology, relationship_hosts=hosts, profile=args.profile,
                 batch_manifest=args.batch_manifest.absolute(),
                 predictive_plan=args.predictive_plan.absolute(),
@@ -1517,7 +1536,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         print(json.dumps(plan, sort_keys=True, separators=(",", ":")))
         return 0
-    except (ExternalFarmError, OSError) as exc:
+    except (ExternalFarmError, OSError, subprocess.TimeoutExpired) as exc:
         print(f"s8_external_farm_executor: {exc}", file=os.sys.stderr)
         return 2
 

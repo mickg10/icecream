@@ -246,6 +246,17 @@ def test_external_command_preserves_two_pass_repeat_input(monkeypatch: pytest.Mo
     assert "ICECC_P50_REPEAT_PREDICTIVE_PLAN=/tanksmall/plan-full-2.json" in command
 
 
+def test_external_timeout_includes_post_measurement_references() -> None:
+    assert executor.external_timeout_seconds(100, 1, False) == 2430
+    assert executor.external_timeout_seconds(100, 2, False) == 4830
+    assert executor.external_timeout_seconds(100, 2, True) == 7230
+    assert executor.external_timeout_seconds(100000, 2, True) == \
+        executor.live.MAX_TIMEOUT_SECONDS
+    for invalid in (0, -1, True):
+        with pytest.raises(executor.ExternalFarmError, match="timeout:arguments_invalid"):
+            executor.external_timeout_seconds(invalid, 1, False)
+
+
 def test_external_shell_branch_skips_every_local_role_start() -> None:
     shell = (Path(__file__).resolve().parents[1] / "unittests" /
              "p50compilee2e-run.sh").read_text(encoding="utf-8")
