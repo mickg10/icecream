@@ -483,6 +483,17 @@ def _copy_remote_tree(host: str, remote: str, destination: Path, timeout: float)
                                 (source_error + sink_error)[-300:].decode(errors="replace"))
 
 
+def _finish_cleanup(cleanup_errors: Sequence[str], primary_error: BaseException | None) -> None:
+    if not cleanup_errors:
+        return
+    cleanup_error = ExternalFarmError(
+        "cleanup:incomplete:" + "|".join(cleanup_errors[:3]))
+    if primary_error is not None:
+        primary_error.add_note(str(cleanup_error))
+        return
+    raise cleanup_error
+
+
 class SSHTransport:
     """Bounded command transport; lifecycle policy stays in this adapter."""
     def __init__(self, authority: Mapping[str, Any], *, timeout: float = 900):
@@ -606,6 +617,7 @@ class SSHTransport:
         (output / "external-farm.json").write_bytes(manifest_bytes)
         (output / "external-authority.json").write_bytes(authority_bytes)
         receipt_context: dict[str, Any] | None = None
+        primary_error: BaseException | None = None
         try:
             if host_product_root is not None:
                 # q3 intentionally has no shared /tanksmall.  Stage the
@@ -1129,6 +1141,9 @@ PY'''
                               "output": str(output)}
             receipt_context["result_payload"] = result_payload
             return result_payload
+        except BaseException as exc:
+            primary_error = exc
+            raise
         finally:
             supervisor_stop.set()
             if supervisor is not None:
@@ -1168,10 +1183,27 @@ kill "$pid" 2>/dev/null || true
                                for host in dict.fromkeys(("q3", *relationship_hosts))],
                              ("q3", f"/tmp/{token}-reset-worker.sh"),
                              ("q3", f"/tmp/{token}-collect-worker.sh")]
-            remove_path = "set -eu; path=$1; case $path in /tmp/s8ext-*|/tmp/p50compilee2e.external.*|/tmp/s4-p50-fourhost-f*.*) rm -rf -- \"$path\";; *) exit 77;; esac"
+            remove_path = r'''set -eu
+path=$1; image=$2
+case $path in
+  /tmp/s8ext-*|/tmp/p50compilee2e.external.*|/tmp/s4-p50-fourhost-f*.*) ;;
+  *) exit 77;;
+esac
+test ! -L "$path" || exit 77
+test -e "$path" || exit 0
+if test -f "$path"; then
+  rm -f -- "$path"
+  exit 0
+fi
+test -d "$path" || exit 77
+docker run --rm --network none --user 0 -v "$path:/probe/cleanup:rw" \
+  --entrypoint /bin/sh "$image" -c 'find /probe/cleanup -mindepth 1 -delete'
+rmdir -- "$path"
+'''
             for host, path in cleanup_paths:
                 try:
-                    self.run(host, remove_path, [path])
+                    self.run(host, remove_path,
+                             [path, self.authority["hosts"][host]["image"]["reference"]])
                 except ExternalFarmError as exc:
                     cleanup_errors.append(f"{host}:{path}:{exc}")
             if receipt_context is not None and not cleanup_errors:
@@ -1225,8 +1257,7 @@ kill "$pid" 2>/dev/null || true
                         "receipt_sha256": receipt_sha,
                         "receipt_bytes": receipt_bytes,
                     }
-            if cleanup_errors:
-                raise ExternalFarmError("cleanup:incomplete:" + "|".join(cleanup_errors[:3]))
+            _finish_cleanup(cleanup_errors, primary_error)
 
 
 def build_plan(authority: Mapping[str, Any], topology: str,

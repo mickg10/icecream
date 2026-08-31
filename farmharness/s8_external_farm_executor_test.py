@@ -97,6 +97,18 @@ def test_remote_failure_retains_bounded_diagnostic(
         transport.run("q3", "set -eu\nprintf phase-name\n")
 
 
+def test_cleanup_does_not_replace_primary_error_and_handles_container_owned_files() -> None:
+    primary = executor.ExternalFarmError("primary failure")
+    executor._finish_cleanup(["q2:permission"], primary)
+    assert any("cleanup:incomplete:q2:permission" in note
+               for note in getattr(primary, "__notes__", []))
+    with pytest.raises(executor.ExternalFarmError, match="cleanup:incomplete:q2:permission"):
+        executor._finish_cleanup(["q2:permission"], None)
+    source = Path(executor.__file__).read_text(encoding="utf-8")
+    assert "docker run --rm --network none --user 0" in source
+    assert "find /probe/cleanup -mindepth 1 -delete" in source
+
+
 def test_preflight_and_authority_capture_hash_identical_nic_rows() -> None:
     executor_source = Path(executor.__file__).read_text(encoding="utf-8")
     authority_source = (Path(executor.__file__).with_name(
