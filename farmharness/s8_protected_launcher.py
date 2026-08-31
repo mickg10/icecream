@@ -35,6 +35,7 @@ DEFAULT_DMI = (Path("/sys/class/dmi/id/product_uuid"),
 # Must match s8_campaign_driver.LIVE_LOCK_PATH.  This is host-global, not a
 # caller-selected campaign or container-temp namespace.
 LIVE_LOCK_PATH = Path("/tmp/icecream-s8-live-run.lock")
+LAUNCHER_PID_ENV = "ICECC_S8_PROTECTED_LAUNCHER_PID"
 
 
 class LauncherError(ValueError):
@@ -219,6 +220,7 @@ def build_command(campaign_argv: list[str], *, workspace: Path,
                   dmi_paths: tuple[Path, ...] | None = None,
                   owner_uid: int | None = None, owner_gid: int | None = None,
                   docker_gid: int | None = None,
+                  launcher_pid: int | None = None,
                   docker_group_supported: bool = False) -> list[str]:
     """Return the exact supervisor Docker argv; never execute it."""
     if not campaign_argv:
@@ -248,7 +250,8 @@ def build_command(campaign_argv: list[str], *, workspace: Path,
     uid = os.geteuid() if owner_uid is None else owner_uid
     gid = os.getegid() if owner_gid is None else owner_gid
     socket_gid = _docker_group_id(docker_socket) if docker_gid is None else docker_gid
-    if min(uid, gid, socket_gid) < 0:
+    owner_pid = os.getpid() if launcher_pid is None else launcher_pid
+    if min(uid, gid, socket_gid) < 0 or type(owner_pid) is not int or owner_pid <= 1:
         raise LauncherError("owner_identity:invalid")
     script = "for tool in python3 docker git; do command -v \"$tool\" >/dev/null 2>&1 || { echo supervisor_tool_missing:$tool >&2; exit 78; }; done\n"
     script += "exec " + shlex.join(campaign_argv) + "\n"
@@ -256,7 +259,8 @@ def build_command(campaign_argv: list[str], *, workspace: Path,
                "--entrypoint", "/bin/sh",
                "--workdir", str(workspace),
                "--user", f"{uid}:{gid}", "--group-add", str(socket_gid),
-               "--oom-score-adj=-1000", "--env", "PYTHONUNBUFFERED=1"]
+               "--oom-score-adj=-1000", "--env", "PYTHONUNBUFFERED=1",
+               "--env", f"{LAUNCHER_PID_ENV}={owner_pid}"]
     for path in (workspace, experiment_root, container_temp_root):
         command.extend(("--volume", f"{path}:{path}:rw"))
     command.extend(("--volume", f"{docker_socket}:{docker_socket}:rw",

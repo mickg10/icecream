@@ -509,7 +509,7 @@ def test_live_lock_is_host_global_for_campaigns_sharing_temp_root(
 
 
 def test_competing_process_scanner_ignores_host_docker_infrastructure_and_finds_work(
-        tmp_path: Path) -> None:
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     proc = tmp_path / "proc"
     proc.mkdir()
     commands = {
@@ -525,6 +525,21 @@ def test_competing_process_scanner_ignores_host_docker_infrastructure_and_finds_
         entry = proc / str(pid)
         entry.mkdir()
         (entry / "cmdline").write_bytes(command.replace(" ", "\0").encode())
+        (entry / "status").write_text("PPid:\t1\n")
+    found = driver._competing_processes(proc_root=proc, ancestor_pid=99999)
+    assert [item.split(":", 1)[0] for item in found] == ["104", "105", "106"]
+
+    launcher = proc / "200"
+    launcher.mkdir()
+    (launcher / "cmdline").write_bytes(
+        b"python3\0/repo/farmharness/s8_protected_launcher.py\0--execute\0")
+    (launcher / "status").write_text("PPid:\t1\n")
+    owned_docker = proc / "201"
+    owned_docker.mkdir()
+    (owned_docker / "cmdline").write_bytes(
+        b"docker\0run\0supervisor\0s8_campaign_driver.py\0")
+    (owned_docker / "status").write_text("PPid:\t200\n")
+    monkeypatch.setenv(driver.LAUNCHER_PID_ENV, "200")
     found = driver._competing_processes(proc_root=proc, ancestor_pid=99999)
     assert [item.split(":", 1)[0] for item in found] == ["104", "105", "106"]
 

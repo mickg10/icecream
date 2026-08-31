@@ -49,6 +49,7 @@ METHOD_BY_PROFILE = {"GRZ_RESIDUAL": "GRZ"}
 # One host-wide inode is shared by every campaign and every protected
 # supervisor.  It is deliberately independent of a campaign/temp namespace.
 LIVE_LOCK_PATH = Path("/tmp/icecream-s8-live-run.lock")
+LAUNCHER_PID_ENV = "ICECC_S8_PROTECTED_LAUNCHER_PID"
 
 
 class CampaignError(ValueError):
@@ -316,10 +317,57 @@ def _process_ancestors(pid: int | None = None) -> set[int]:
     return result
 
 
+def _measurement_launcher_processes(proc_root: Path = Path("/proc")) -> set[int]:
+    """Return the protected launcher's process tree visible from its supervisor."""
+    raw = os.environ.get(LAUNCHER_PID_ENV)
+    try:
+        launcher_pid = int(raw) if raw is not None else 0
+    except ValueError:
+        return set()
+    if launcher_pid <= 1:
+        return set()
+    try:
+        command = (proc_root / str(launcher_pid) / "cmdline").read_bytes()
+    except OSError:
+        return set()
+    words = command.split(b"\0")
+    decoded = [word.decode("utf-8", "replace") for word in words if word]
+    if (not decoded or Path(decoded[0]).name not in {"python", "python3"} or
+            not any(Path(word).name == "s8_protected_launcher.py" for word in decoded) or
+            "--execute" not in decoded):
+        return set()
+
+    parents: dict[int, int] = {}
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return set()
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            status = (entry / "status").read_text()
+            parent_line = next(line for line in status.splitlines()
+                               if line.startswith("PPid:"))
+            parents[int(entry.name)] = int(parent_line.split()[1])
+        except (OSError, StopIteration, ValueError, IndexError):
+            continue
+    owned = {launcher_pid}
+    changed = True
+    while changed:
+        changed = False
+        for pid, parent in parents.items():
+            if parent in owned and pid not in owned:
+                owned.add(pid)
+                changed = True
+    return owned
+
+
 def _competing_processes(*, proc_root: Path = Path("/proc"),
                          ancestor_pid: int | None = None) -> list[str]:
     """Find unrelated S8/build/Docker processes before a measurement."""
     excluded = _process_ancestors(ancestor_pid)
+    excluded.update(_measurement_launcher_processes(proc_root))
     # dockerd/containerd and Docker plumbing are normal host infrastructure,
     # not competing measurements. A docker CLI command is interesting only
     # when its arguments identify an actual S8/build/tool workload.

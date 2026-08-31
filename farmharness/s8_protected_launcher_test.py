@@ -66,6 +66,7 @@ def test_build_command_is_host_visible_pinned_and_owner_bound(tmp_path: Path,
             docker_socket=paths["socket"], machine_id=paths["machine_id"],
             cpuinfo=paths["cpuinfo"], dmi_paths=(paths["dmi"],),
             owner_uid=123, owner_gid=456, docker_gid=789,
+            launcher_pid=321,
             docker_group_supported=True)
     finally:
         sock.close()
@@ -76,6 +77,7 @@ def test_build_command_is_host_visible_pinned_and_owner_bound(tmp_path: Path,
     assert command[-2] == "-lc"
     assert command.count("/bin/sh") == 1
     assert "--oom-score-adj=-1000" in command
+    assert f"{launcher.LAUNCHER_PID_ENV}=321" in command
     assert ["--user", "123:456"] == command[command.index("--user"):command.index("--user") + 2]
     assert ["--group-add", "789"] == command[command.index("--group-add"):command.index("--group-add") + 2]
     for path in (paths["workspace"], paths["experiments"], paths["temp"]):
