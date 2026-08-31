@@ -90,10 +90,11 @@ def test_remote_failure_retains_bounded_diagnostic(
     transport = executor.SSHTransport(_authority(tmp_path))
     monkeypatch.setattr(
         executor.s4, "run_script",
-        lambda *args, **kwargs: subprocess.CompletedProcess([], 17, "", "specific failure\n"))
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            [], 17, "first signal\n", "specific failure\n"))
     with pytest.raises(
             executor.ExternalFarmError,
-            match=r"q3:remote_command_failed:17:script=[0-9a-f]{12}:.*specific failure"):
+            match=r"q3:remote_command_failed:17:script=[0-9a-f]{12}:.*first signal.*specific failure"):
         transport.run("q3", "set -eu\nprintf phase-name\n")
 
 

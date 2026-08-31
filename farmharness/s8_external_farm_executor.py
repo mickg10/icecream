@@ -508,7 +508,8 @@ class SSHTransport:
         if result.returncode:
             script_sha = hashlib.sha256(script.encode("utf-8")).hexdigest()[:12]
             preview = " ".join(script.split())[:160]
-            detail = (result.stderr or result.stdout)[-500:].strip().replace("\n", " | ")
+            combined = "\n".join(value for value in (result.stdout, result.stderr) if value)
+            detail = combined[-2000:].strip().replace("\n", " | ")
             raise ExternalFarmError(
                 f"{host}:remote_command_failed:{result.returncode}:"
                 f"script={script_sha}:{preview}:detail={detail or 'none'}")
