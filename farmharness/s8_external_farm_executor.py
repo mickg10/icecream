@@ -512,32 +512,9 @@ def _retained_identity(root: Path, container_name: str) -> tuple[str, int]:
     return container_id.lower(), pid
 
 
-def _copy_remote_tree(host: str, remote: str, destination: Path, timeout: float) -> None:
-    """Copy one uniquely named role tree, including the finalizer workdir form."""
-    if not re.fullmatch(r"/tmp/(?:s4-p50-fourhost-[a-z]+|p50compilee2e\.external)\.[A-Za-z0-9]+", remote):
-        raise ExternalFarmError("evidence:unexpected_remote_workdir")
-    if destination.exists() or destination.is_symlink():
-        raise ExternalFarmError("evidence:destination_already_exists")
-    destination.mkdir(parents=True, exist_ok=False)
-    source = subprocess.Popen([*s4.ssh_argv(host), "tar", "-C", remote,
-                               "--exclude=*.sock", "-cf", "-", "."],
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    assert source.stdout is not None
-    sink = subprocess.Popen(["tar", "-C", str(destination), "-xf", "-"],
-                            stdin=source.stdout, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE)
-    source.stdout.close()
-    _, sink_error = sink.communicate(timeout=timeout)
-    source_error = source.stderr.read() if source.stderr else b""
-    source_rc = source.wait(timeout=30)
-    if source_rc != 0 or sink.returncode != 0:
-        raise ExternalFarmError("evidence:remote_tree_copy_failed:" +
-                                (source_error + sink_error)[-300:].decode(errors="replace"))
-
-
-def _copy_remote_tree_as_root(host: str, remote: str, destination: Path,
-                              image: str, timeout: float) -> None:
-    """Retain a failed role tree even when its daemon-owned files are 0700."""
+def _copy_remote_tree(host: str, remote: str, destination: Path,
+                      image: str, timeout: float) -> None:
+    """Copy a role tree through a root reader for daemon/compiler-owned files."""
     pattern = (r"/tmp/(?:s4-p50-fourhost-[a-z0-9-]+|"
                r"p50compilee2e\.external)\.[A-Za-z0-9]+")
     if not re.fullmatch(pattern, remote):
@@ -561,7 +538,7 @@ def _copy_remote_tree_as_root(host: str, remote: str, destination: Path,
     source_error = source.stderr.read() if source.stderr else b""
     source_rc = source.wait(timeout=30)
     if source_rc != 0 or sink.returncode != 0:
-        raise ExternalFarmError("evidence:failed_remote_tree_copy_failed:" +
+        raise ExternalFarmError("evidence:remote_tree_copy_failed:" +
                                 (source_error + sink_error)[-300:].decode(errors="replace"))
 
 
@@ -1259,10 +1236,14 @@ printf 'S8_SIDECAR_ROTATION role=C relationship=0 before_pid=%s after_pid=%s bef
             # these contain C/F traces, scheduler log, and the F service map.
             # The finalizer binds S7_WORKDIR to this exact absolute path, so
             # retain q3's tree at the same private path used by the client.
-            _copy_remote_tree("q3", client_work, Path(client_work), self.timeout)
+            _copy_remote_tree(
+                "q3", client_work, Path(client_work),
+                str(self.authority["hosts"]["q3"]["image"]["reference"]), self.timeout)
             for relationship, host in enumerate(relationship_hosts):
                 _copy_remote_tree(host, worker_work(relationship),
-                                  output / f"remote-f-{relationship}", self.timeout)
+                                  output / f"remote-f-{relationship}",
+                                  str(self.authority["hosts"][host]["image"]["reference"]),
+                                  self.timeout)
                 f_evidence = output / f"remote-f-{relationship}"
                 f_log = f_evidence / "f.log"
                 f_offset = f_evidence / "f-measured-log-offset"
@@ -1384,7 +1365,7 @@ kill "$pid" 2>/dev/null || true
                 for host, remote, name in failure_trees:
                     destination = output / "failure-diagnostics" / name
                     try:
-                        _copy_remote_tree_as_root(
+                        _copy_remote_tree(
                             host, remote, destination,
                             str(self.authority["hosts"][host]["image"]["reference"]),
                             self.timeout)

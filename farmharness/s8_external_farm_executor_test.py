@@ -325,7 +325,10 @@ def test_concrete_transport_invokes_q3_c_scheduler_and_non_q3_f(tmp_path: Path, 
     monkeypatch.setattr(transport, "run", fake_run)
     monkeypatch.setattr(executor.s4, "run_script",
                         lambda *args, **kwargs: subprocess.CompletedProcess([], 1, "", ""))
-    def fake_copy(host: str, remote: str, destination: Path, timeout: float) -> None:
+    copied_images: list[str] = []
+    def fake_copy(host: str, remote: str, destination: Path,
+                  image: str, timeout: float) -> None:
+        copied_images.append(image)
         destination.mkdir(parents=True, exist_ok=False)
         if host == "q3":
             (destination / "scheduler.container-id").write_text("a" * 64)
@@ -345,6 +348,8 @@ def test_concrete_transport_invokes_q3_c_scheduler_and_non_q3_f(tmp_path: Path, 
     assert result["status"] == "PASS"
     assert any(host == "q3" and "icecc-scheduler" in script for host, script in calls)
     assert any(host == "q2" and "iceccd" in script for host, script in calls)
+    assert copied_images == [authority["hosts"]["q3"]["image"]["reference"],
+                             authority["hosts"]["q2"]["image"]["reference"]]
     assert any(host == "q3" and "--no-remote -m 0" in script for host, script in calls)
     assert any(host == "q3" and "2>>/probe/work/c-service.stderr" in script
                for host, script in calls)
