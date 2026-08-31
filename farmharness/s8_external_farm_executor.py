@@ -353,6 +353,46 @@ def external_timeout_seconds(tu_count: int, passes: int, warm: bool) -> int:
                max(live.MIN_TIMEOUT_SECONDS, 30 + tu_count * 12 * work_passes))
 
 
+def marker_wait_hook(request: str, ready: str, failed: str) -> str:
+    """Create a hook which cannot outlive a failed marker supervisor."""
+    paths = (request, ready, failed)
+    if any(not isinstance(path, str) or not Path(path).is_absolute() or
+           "\n" in path or "\0" in path
+           for path in paths):
+        raise ExternalFarmError("marker:path_invalid")
+    request_q, ready_q, failed_q = map(shlex.quote, paths)
+    return ("#!/bin/sh\nset -eu\n"
+            f"touch {request_q}\n"
+            f"while test ! -f {ready_q}; do\n"
+            f"  if test -f {failed_q}; then cat {failed_q} >&2; exit 1; fi\n"
+            "  sleep 0.2\n"
+            "done\n")
+
+
+def f_service_map_script(client_work: str, relationship_count: int) -> str:
+    """Return a composable heredoc command with a real terminator newline."""
+    if (not isinstance(client_work, str) or not Path(client_work).is_absolute() or
+            "\n" in client_work or "\0" in client_work or
+            type(relationship_count) is not int or
+            relationship_count <= 0):
+        raise ExternalFarmError("service_map:arguments_invalid")
+    return f'''python3 - {shlex.quote(client_work)} <<'PY'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+rows = []
+for relationship in range({relationship_count}):
+    path = root / f"f-trace-{{relationship}}.jsonl"
+    identities = {{json.loads(line).get("f_store_guid") for line in path.read_text().splitlines()
+                  if line.strip() and json.loads(line).get("action") == "TX_BEGIN"
+                  and json.loads(line).get("actor") == "F"}}
+    if len(identities) != 1:
+        raise SystemExit("missing unique F store identity")
+    rows.append(f"{{relationship}}\\tp50-f{{('-' + str(relationship)) if {relationship_count} > 1 else ''}}\\t{{identities.pop()}}\\n")
+(root / "s8-f-service-map.tsv").write_text("".join(rows))
+PY
+'''
+
+
 def overlap_required(topology: str, observed: Mapping[str, int]) -> None:
     if topology == "C1F20/40":
         if observed.get("planned_lanes") != 40 or observed.get("max_concurrent", 0) <= 1:
@@ -988,9 +1028,10 @@ printf 'S8_SIDECAR_ROTATION role=C relationship=0 before_pid=%s after_pid=%s bef
                 f"while test ! -f {client_work}/external-reset.request; do sleep 0.2; done"] + reset_lines[2:]
             encoded = base64.b64encode(("\n".join(reset_worker_lines) + "\n").encode()).decode()
             self.run("q3", f"printf %s {shlex.quote(encoded)} | base64 -d >{reset_worker_path}; chmod 700 {reset_worker_path}")
-            reset_hook = ("#!/bin/sh\nset -eu\n"
-                          f"touch {client_work}/external-reset.request\n"
-                          f"while test ! -f {client_work}/external-reset.ready; do sleep 0.2; done\n")
+            supervisor_failure_path = f"{client_work}/external-supervisor.failed"
+            reset_hook = marker_wait_hook(
+                f"{client_work}/external-reset.request",
+                f"{client_work}/external-reset.ready", supervisor_failure_path)
             hook_encoded = base64.b64encode(reset_hook.encode()).decode()
             self.run("q3", f"printf %s {shlex.quote(hook_encoded)} | base64 -d >{reset_path}; chmod 700 {reset_path}")
             collect_path = f"{client_work}/collect-hook.sh"
@@ -1002,23 +1043,34 @@ printf 'S8_SIDECAR_ROTATION role=C relationship=0 before_pid=%s after_pid=%s bef
                 f"while test ! -f {client_work}/external-f-traces.request; do sleep 0.2; done"] + collect_lines[2:]
             collect_encoded = base64.b64encode(("\n".join(collect_worker_lines) + "\n").encode()).decode()
             self.run("q3", f"printf %s {shlex.quote(collect_encoded)} | base64 -d >{collect_worker_path}; chmod 700 {collect_worker_path}")
-            collect_hook = ("#!/bin/sh\nset -eu\n"
-                            f"touch {client_work}/external-f-traces.request\n"
-                            f"while test ! -f {client_work}/external-f-traces.ready; do sleep 0.2; done\n")
+            collect_hook = marker_wait_hook(
+                f"{client_work}/external-f-traces.request",
+                f"{client_work}/external-f-traces.ready", supervisor_failure_path)
             hook_encoded = base64.b64encode(collect_hook.encode()).decode()
             self.run("q3", f"printf %s {shlex.quote(hook_encoded)} | base64 -d >{collect_path}; chmod 700 {collect_path}")
             prewarm_path = f"{client_work}/prewarm-hook.sh"
-            prewarm_hook = ("#!/bin/sh\nset -eu\n"
-                            f"touch {client_work}/external-prewarm.request\n"
-                            f"while test ! -f {client_work}/external-prewarm.ready; do sleep 0.2; done\n")
+            prewarm_hook = marker_wait_hook(
+                f"{client_work}/external-prewarm.request",
+                f"{client_work}/external-prewarm.ready", supervisor_failure_path)
             prewarm_encoded = base64.b64encode(prewarm_hook.encode()).decode()
             self.run("q3", f"printf %s {shlex.quote(prewarm_encoded)} | base64 -d >{prewarm_path}; chmod 700 {prewarm_path}")
-            self.run("q3", f"rm -f {client_work}/external-reset.request {client_work}/external-f-traces.request {client_work}/external-reset.ready {client_work}/external-f-traces.ready; "
+            self.run("q3", f"rm -f {client_work}/external-reset.request {client_work}/external-f-traces.request {client_work}/external-reset.ready {client_work}/external-f-traces.ready {supervisor_failure_path}; "
                               f"nohup {reset_worker_path} {client_work} {topology} {profile} >{client_work}/reset-worker.stdout 2>&1 & echo $! >{client_work}/reset-worker.pid; "
                               f"nohup {collect_worker_path} {client_work} {topology} {profile} >{client_work}/collect-worker.stdout 2>&1 & echo $! >{client_work}/collect-worker.pid")
             def supervise_external_markers() -> None:
                 reset_done = prewarm_done = collection_done = False
                 deadline = time.monotonic() + self.timeout
+                def record_failure(message: str) -> None:
+                    supervisor_errors.append(message)
+                    encoded_error = base64.b64encode((message + "\n").encode()).decode()
+                    try:
+                        s4.run_script(
+                            "q3",
+                            f"printf %s {shlex.quote(encoded_error)} | base64 -d >"
+                            f"{shlex.quote(supervisor_failure_path)}",
+                            timeout=30)
+                    except (OSError, subprocess.SubprocessError):
+                        pass
                 while time.monotonic() < deadline and not supervisor_stop.is_set():
                     def exists(path: str) -> bool:
                         result = s4.run_script("q3", "test -f \"$1\"", [path], timeout=30)
@@ -1140,29 +1192,18 @@ printf 'S8_SIDECAR_ROTATION role=C relationship=0 before_pid=%s after_pid=%s bef
                                 aggregate += "; : >" + client_work + "/s7-prewarm-f-action-trace.jsonl; " + "; ".join(
                                     f"cat {shlex.quote(client_work + '/prewarm-f-trace-' + str(i) + '.jsonl')} >>{client_work}/s7-prewarm-f-action-trace.jsonl"
                                     for i in range(len(destinations)))
-                                map_script = f'''python3 - {shlex.quote(client_work)} <<'PY'
-import json, pathlib, sys
-root = pathlib.Path(sys.argv[1])
-rows = []
-for relationship in range({len(destinations)}):
-    path = root / f"f-trace-{{relationship}}.jsonl"
-    identities = {{json.loads(line).get("f_store_guid") for line in path.read_text().splitlines()
-                  if line.strip() and json.loads(line).get("action") == "TX_BEGIN"
-                  and json.loads(line).get("actor") == "F"}}
-    if len(identities) != 1:
-        raise SystemExit("missing unique F store identity")
-    rows.append(f"{{relationship}}\\tp50-f{{('-' + str(relationship)) if {len(destinations)} > 1 else ''}}\\t{{identities.pop()}}\\n")
-(root / "s8-f-service-map.tsv").write_text("".join(rows))
-PY'''
-                            completion = aggregate + (("; " + map_script) if map_script else "")
-                            self.run("q3", completion + f"; touch {client_work}/external-f-traces.ready")
+                                map_script = f_service_map_script(
+                                    client_work, len(destinations))
+                            completion = aggregate + (("\n" + map_script) if map_script else "")
+                            self.run("q3", completion +
+                                     f"\ntouch {client_work}/external-f-traces.ready")
                             collection_done = True
-                    except (ExternalFarmError, OSError) as exc:
-                        supervisor_errors.append(str(exc))
+                    except (ExternalFarmError, OSError, subprocess.SubprocessError) as exc:
+                        record_failure(str(exc))
                         return
                     time.sleep(0.2)
                 if not supervisor_stop.is_set() and (not reset_done or not collection_done):
-                    supervisor_errors.append("external:marker_supervisor_timeout")
+                    record_failure("external:marker_supervisor_timeout")
             supervisor = threading.Thread(target=supervise_external_markers, daemon=True)
             supervisor.start()
             self.run("q3", readiness_gate(profile, f"{client_work}/scheduler.log",

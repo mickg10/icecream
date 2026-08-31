@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shlex
 import shutil
 import subprocess
 import datetime as dt
@@ -255,6 +256,33 @@ def test_external_timeout_includes_post_measurement_references() -> None:
     for invalid in (0, -1, True):
         with pytest.raises(executor.ExternalFarmError, match="timeout:arguments_invalid"):
             executor.external_timeout_seconds(invalid, 1, False)
+
+
+def test_service_map_heredoc_is_composable(tmp_path: Path) -> None:
+    guid = "ab" * 16
+    (tmp_path / "f-trace-0.jsonl").write_text(json.dumps(
+        {"action": "TX_BEGIN", "actor": "F", "f_store_guid": guid}) + "\n")
+    marker = tmp_path / "after-heredoc"
+    script = executor.f_service_map_script(str(tmp_path), 1)
+    script += f"touch {shlex.quote(str(marker))}\n"
+    subprocess.run(["bash", "-c", script], check=True, timeout=5)
+    assert marker.is_file()
+    assert (tmp_path / "s8-f-service-map.tsv").read_text() == \
+        f"0\tp50-f\t{guid}\n"
+
+
+def test_marker_hook_reports_supervisor_failure_without_timeout(tmp_path: Path) -> None:
+    request = tmp_path / "request"
+    ready = tmp_path / "ready"
+    failed = tmp_path / "failed"
+    failed.write_text("collection failed\n")
+    result = subprocess.run(
+        ["sh", "-c", executor.marker_wait_hook(
+            str(request), str(ready), str(failed))],
+        text=True, capture_output=True, timeout=2)
+    assert result.returncode != 0
+    assert request.is_file()
+    assert "collection failed" in result.stderr
 
 
 def test_external_shell_branch_skips_every_local_role_start() -> None:
