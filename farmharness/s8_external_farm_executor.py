@@ -801,7 +801,8 @@ PY
                                 f"/probe/product/daemon/iceccd -p {scheduler_port + 3 + relationship} "
                                 f"-m {TOPOLOGIES[topology][1]} -s {scheduler_host}:{scheduler_port} "
                                 f"-n {network} -N {service} -b /probe/work/envs -l /probe/work/f.log "
-                                f"-vvv {' '.join(shlex.quote(arg) for arg in args)}")
+                                f"-vvv {' '.join(shlex.quote(arg) for arg in args)} "
+                                f"2>>/probe/work/f-service.stderr")
                 worker = (f"set -eu; root={shlex.quote(staged_roots.get(host, root_mount))}; image={shlex.quote(self.authority['hosts'][host]['image'].get('reference', ''))}; test \"$(docker image inspect --format '{{{{.Id}}}}' \"$image\")\" = {self.authority['hosts'][host]['image']['image_id']}; mkdir -p {worker_root}/envs "
                           f"{worker_root}/cache-runtime-{('f-' + str(relationship))}; chmod 1777 {worker_root} {worker_root}/envs; chmod 700 {worker_root}/cache-runtime-{('f-' + str(relationship))}; : >{worker_root}/s7-prewarm-f-action-trace-{relationship}.jsonl; "
                           f"docker run -d --name {token}-f-{relationship} --network host --user 0 --cap-add SYS_CHROOT {profile_flag} -e ICECC_P50_RELATIONSHIP={relationship} -e ICECC_P50_F_ACTION_TRACE=/probe/work/s7-warm-f-action-trace-{relationship}.jsonl -e ICECC_P50_F_LEGACY_WIRE_TRACE=/probe/work/s7-measured-f-legacy-wire-trace-{relationship}.jsonl -e ICECC_P50_TEST_READY_TRACE=/probe/work/ready.trace {mounts_for(host)} -v {worker_root}:/probe/work:rw --entrypoint /bin/sh $image -c {shlex.quote(worker_inner)} "
@@ -832,7 +833,8 @@ PY
                             f"/probe/product/daemon/iceccd --no-remote -m 0 -p {scheduler_port + 2} "
                             f"-s {scheduler_host}:{scheduler_port} -n {network} -N s8-p50-c "
                             f"-b /probe/work/envs -l /probe/work/c.log -vvv "
-                            f"{' '.join(shlex.quote(arg) for arg in c_args)}")
+                            f"{' '.join(shlex.quote(arg) for arg in c_args)} "
+                            f"2>>/probe/work/c-service.stderr")
             client_daemon = (f"set -eu; root={shlex.quote(root_mount)}; image={shlex.quote(self.authority['hosts']['q3']['image'].get('reference', ''))}; test \"$(docker image inspect --format '{{{{.Id}}}}' \"$image\")\" = {self.authority['hosts']['q3']['image']['image_id']}; mkdir -p {client_work}/envs {client_work}/cache-runtime-c; "
                              f"chmod 1777 {client_work}/envs; chmod 700 {client_work}/cache-runtime-c; "
                              f"docker run -d --name {token}-c --pid=host --network host --user 0 {profile_flag} -e ICECC_TEST_SOCKET=/probe/work/client.sock -e ICECC_P50_C_ACTION_TRACE=/probe/work/s7-warm-c-action-trace.jsonl -e ICECC_P50_C_LEGACY_WIRE_TRACE=/probe/work/s7-measured-c-legacy-wire-trace.jsonl -e ICECC_P50_TEST_READY_TRACE=/probe/work/ready-c.trace {docker_mounts} -v {client_work}:/probe/work:rw --entrypoint /bin/sh $image -c {shlex.quote(client_inner)} "

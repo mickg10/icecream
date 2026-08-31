@@ -302,6 +302,10 @@ def test_concrete_transport_invokes_q3_c_scheduler_and_non_q3_f(tmp_path: Path, 
     assert any(host == "q3" and "icecc-scheduler" in script for host, script in calls)
     assert any(host == "q2" and "iceccd" in script for host, script in calls)
     assert any(host == "q3" and "--no-remote -m 0" in script for host, script in calls)
+    assert any(host == "q3" and "2>>/probe/work/c-service.stderr" in script
+               for host, script in calls)
+    assert any(host == "q2" and "2>>/probe/work/f-service.stderr" in script
+               for host, script in calls)
     assert all(not (host == "q3" and "-N p50-f" in script) for host, script in calls)
     receipt = json.loads((tmp_path / "out" / "external-farm-receipt.json").read_text())
     assert receipt["schema"] == "icecream-s8-external-farm-receipt-v1"
