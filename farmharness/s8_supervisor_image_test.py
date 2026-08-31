@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -127,3 +128,13 @@ def test_dockerfile_contract_mutations_are_load_bearing(tmp_path: Path) -> None:
     missing_cli.write_text(valid.replace("python3 git docker.io", "python3 git"))
     with pytest.raises(image.ImageAuthorityError, match="required_package_missing:docker.io"):
         image._dockerfile_contract(missing_cli)
+
+
+def test_documented_base_binding_matches_authority_constants() -> None:
+    document = (Path(__file__).resolve().parents[1] / "docs/S8_SUPERVISOR_IMAGE.md").read_text()
+    match = re.search(r"^BASE_ID=(sha256:[0-9a-f]{64})$", document, re.MULTILINE)
+    assert match is not None
+    assert match.group(1) == image.BASE_IMAGE_ID
+    assert f"BASE={image.BASE_REFERENCE}" in document
+    assert 'docker tag "$BASE_SOURCE" "$BASE"' in document
+    assert "684bd6a073312363ef4913356b6e311caad9dbde" not in document
