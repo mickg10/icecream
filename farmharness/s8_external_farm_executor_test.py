@@ -19,8 +19,12 @@ def _authority(tmp_path: Path) -> dict[str, object]:
         descriptor.write_text(json.dumps({"host": host}))
         sha, size = executor._sha(descriptor)
         hosts[host] = {
-            "target": f"mickg@{host}", "descriptor": {"path": str(descriptor), "sha256": sha, "bytes": size},
+            "target": executor.s4.HOSTS[host]["target"], "lan": executor.s4.HOSTS[host]["lan"],
+            "hostname": host, "descriptor": {"path": str(descriptor), "sha256": sha, "bytes": size},
             "physical_host_digest": hashlib.sha256(host.encode()).hexdigest(),
+            "boot_id_digest": hashlib.sha256((host + ":boot").encode()).hexdigest(),
+            "machine_id_sha256": hashlib.sha256((host + ":machine").encode()).hexdigest(),
+            "nic_identity_sha256": hashlib.sha256((host + ":nic").encode()).hexdigest(),
             "cpu_count": executor.CPU_COUNTS[host],
             "idle": {"status": "PASS", "load_1m": 0.1,
                      "captured_at": dt.datetime.now(dt.timezone.utc).isoformat()},
@@ -92,6 +96,31 @@ def test_authority_requires_environment_builder_and_descriptor(tmp_path: Path) -
         executor._validate_authority(authority)
 
 
+def test_authority_binds_routing_and_staging_rejects_outside_input(tmp_path: Path) -> None:
+    authority = _authority(tmp_path)
+    authority["hosts"]["q3"]["lan"] = "192.0.2.1"
+    with pytest.raises(executor.ExternalFarmError, match="identity_invalid"):
+        executor._validate_authority(authority)
+    inside = Path("/tanksmall/MICKG2")
+    outside = Path("/proc/cpuinfo")
+    with pytest.raises(executor.ExternalFarmError, match="outside_staged_product"):
+        executor._stage_input_paths(outside, outside, outside, inside, [])
+
+
+def test_external_command_preserves_two_pass_repeat_input(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(executor.live, "build_command", lambda *args, **kwargs: [
+        "env", "ICECC_P50_C1F1_PASSES=2", "/tanksmall/unittests/p50compilee2e-run.sh"])
+    command = executor.build_external_command(
+        Path("/tanksmall/batch.jsonl"), Path("/tanksmall/plan.json"),
+        Path("/tanksmall/topology.json"), Path("/tanksmall/product"),
+        profile="ZSTD_TU", corpus="DuckDB", regime="cold", depth="100",
+        suite="C1F1/100000", workdir=Path("/tmp/p50compilee2e.external"),
+        timeout_seconds=900, passes=2,
+        repeat_predictive_plan=Path("/tanksmall/plan-full-2.json"))
+    assert "ICECC_P50_C1F1_PASSES=2" in command
+    assert "ICECC_P50_REPEAT_PREDICTIVE_PLAN=/tanksmall/plan-full-2.json" in command
+
+
 def test_external_shell_branch_skips_every_local_role_start() -> None:
     shell = (Path(__file__).resolve().parents[1] / "unittests" /
              "p50compilee2e-run.sh").read_text(encoding="utf-8")
@@ -118,11 +147,28 @@ def test_concrete_transport_invokes_q3_c_scheduler_and_non_q3_f(tmp_path: Path, 
     calls: list[tuple[str, str]] = []
     def fake_run(host: str, script: str, args: Sequence[object] = ()) -> subprocess.CompletedProcess[str]:
         calls.append((host, script))
-        stdout = ("PASS: all-P50 C1F1\nS8_BATCH_METRICS max_concurrent_admitted_or_compiling_jobs=2\n"
-                  if "-batch" in script else "")
+        if "S8_F_INTERFERENCE" in script:
+            stdout = "S8_F_INTERFERENCE before=1 after=2\n"
+        else:
+            stdout = ("PASS: all-P50 C1F1\nS8_BATCH_METRICS max_concurrent_admitted_or_compiling_jobs=2\n"
+                      if "-batch" in script else "")
         return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
     monkeypatch.setattr(transport, "run", fake_run)
-    monkeypatch.setattr(executor.s4, "copy_remote_tree", lambda *args, **kwargs: None)
+    monkeypatch.setattr(executor.s4, "run_script",
+                        lambda *args, **kwargs: subprocess.CompletedProcess([], 1, "", ""))
+    def fake_copy(host: str, remote: str, destination: Path, timeout: float) -> None:
+        destination.mkdir(parents=True, exist_ok=False)
+        if host == "q3":
+            (destination / "scheduler.container-id").write_text("a" * 64)
+            (destination / "scheduler.pid").write_text("100")
+            (destination / "c.container-id").write_text("b" * 64)
+            (destination / "c.pid").write_text("101")
+        else:
+            (destination / "container-id").write_text("c" * 64)
+            (destination / "container-pid").write_text("102")
+            (destination / "f.log").write_text("")
+            (destination / "f-measured-log-offset").write_text("0")
+    monkeypatch.setattr(executor, "_copy_remote_tree", fake_copy)
     result = transport.execute_command(topology="C1F1/100000", relationship_hosts=["q2"],
                                        profile="ZSTD_ROUTE", product_root_remote="/product",
                                        batch_command=["env", "ICECC_P50_EXTERNAL_FARM=1", "/product/unittests/p50compilee2e-run.sh"],
@@ -132,6 +178,16 @@ def test_concrete_transport_invokes_q3_c_scheduler_and_non_q3_f(tmp_path: Path, 
     assert any(host == "q2" and "iceccd" in script for host, script in calls)
     assert any(host == "q3" and "--no-remote -m 0" in script for host, script in calls)
     assert all(not (host == "q3" and "-N p50-f" in script) for host, script in calls)
+    receipt = json.loads((tmp_path / "out" / "external-farm-receipt.json").read_text())
+    assert receipt["schema"] == "icecream-s8-external-farm-receipt-v1"
+    assert receipt["execution"]["artifacts"] == {"collection": "complete", "cleanup": "complete"}
+    assert receipt["execution"]["start_marker"].startswith("S8_EXTERNAL_FARM_EXECUTION ")
+    assert receipt["workdir"].startswith("/tmp/p50compilee2e.external.")
+    stdout = (tmp_path / "out" / "product-output.log").read_text()
+    assert stdout.count("S8_EXTERNAL_FARM_EXECUTION ") == 2
+    assert result["finalizer_input"]["receipt_path"].endswith("external-farm-receipt.json")
+    assert result["finalizer_input"]["receipt_sha256"] == executor._sha(
+        tmp_path / "out" / "external-farm-receipt.json")[0]
 
 
 def test_arbitrary_true_command_cannot_be_admitted(tmp_path: Path) -> None:

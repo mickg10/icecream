@@ -123,11 +123,16 @@ command -v bash >/dev/null 2>&1 || {
 if test -n "${ICECC_P50_C1F1_WORKDIR:-}"; then
     work=$ICECC_P50_C1F1_WORKDIR
     case "$work" in
-        /*/p50compilee2e.*) ;;
+        /*/p50compilee2e.*|/tmp/s4-p50-fourhost-client.*)
+            ;;
         *) echo "FAIL: supplied workdir must be an absolute private p50compilee2e path" >&2; exit 1 ;;
     esac
-    test ! -e "$work" || { echo "FAIL: supplied workdir already exists" >&2; exit 1; }
-    mkdir -p "$work"
+    if test "$external_mode" = 1; then
+        test -d "$work" && test ! -L "$work" || { echo "FAIL: external workdir is unavailable" >&2; exit 1; }
+    else
+        test ! -e "$work" || { echo "FAIL: supplied workdir already exists" >&2; exit 1; }
+        mkdir -p "$work"
+    fi
 else
     work=$(CDPATH= cd -- "$(mktemp -d "${TMPDIR:-/tmp}/p50compilee2e.XXXXXX")" && pwd)
 fi
@@ -143,6 +148,17 @@ else
     : >"$work/scheduler.log"
 fi
 chmod 0666 "$work/scheduler.log"
+if test "$external_mode" = 1; then
+    test -n "${ICECC_P50_EXTERNAL_EXECUTION_ID:-}" &&
+        test -n "${ICECC_P50_EXTERNAL_MANIFEST_SHA256:-}" &&
+        test -n "${ICECC_P50_EXTERNAL_AUTHORITY_SHA256:-}" &&
+        test -n "${ICECC_P50_EXTERNAL_START_UTC:-}" || {
+        echo "FAIL: external lifecycle identity is incomplete" >&2; exit 1;
+    }
+    printf 'S8_EXTERNAL_FARM_EXECUTION execution_id=%s manifest_sha256=%s authority_sha256=%s phase=start timestamp=%s\n' \
+        "$ICECC_P50_EXTERNAL_EXECUTION_ID" "$ICECC_P50_EXTERNAL_MANIFEST_SHA256" \
+        "$ICECC_P50_EXTERNAL_AUTHORITY_SHA256" "$ICECC_P50_EXTERNAL_START_UTC"
+fi
 cleanup() {
     # Batch wrappers own their compiler child and remove their planned-lane
     # marker from an EXIT trap.  Stop them before the daemons so an interrupted
@@ -221,14 +237,15 @@ for offset in range(0, 10000, 2):
         base -= 18000
     sockets = []
     try:
-        # The scheduler owns TCP scheduler_port + 1 for its text endpoint.
+        # The scheduler owns TCP base + 1 for its text endpoint; C and F use
+        # separate ports reserved before any role starts.
         # Reserve every relationship's port before any daemon starts so the
         # twenty persistent F identities cannot partially overlap another run.
-        ports = (base, base + 1)
+        ports = (base, base + 1, base + 2)
         if suite == "C1F20/40":
-            ports += tuple(base + 2 * (relationship + 1) for relationship in range(20))
+            ports += tuple(base + 3 + 2 * relationship for relationship in range(20))
         else:
-            ports += (base + 2,)
+            ports += (base + 3,)
         for port in ports:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -240,7 +257,7 @@ for offset in range(0, 10000, 2):
         continue
     for sock in sockets:
         sock.close()
-    print(base, base + 2)
+    print(base, base + 3)
     break
 else:
     raise SystemExit('no available scheduler/worker port pair')
@@ -248,7 +265,7 @@ PY
 }
 if test "$external_mode" = 1; then
     port_sched=${ICECC_P50_EXTERNAL_SCHED_PORT:-}
-    port_worker=${ICECC_P50_EXTERNAL_WORKER_PORT:-}
+    port_worker=${ICECC_P50_EXTERNAL_WORKER_PORT:-$((port_sched + 3))}
     test -n "$port_sched" || { echo "FAIL: external scheduler port required" >&2; exit 1; }
     test -n "${ICECC_P50_EXTERNAL_SCHEDULER_LOG:-}" || {
         echo "FAIL: external scheduler log required" >&2; exit 1;
@@ -269,7 +286,8 @@ test "$port_sched" != "$port_worker" || {
     echo "FAIL: scheduler and worker ports must be distinct" >&2
     exit 1
 }
-test "$port_worker" -ne "$((port_sched + 1))" || {
+port_client=$((port_sched + 2))
+test "$port_worker" -ne "$port_client" || {
     echo "FAIL: worker port collides with scheduler text endpoint" >&2
     exit 1
 }
@@ -657,7 +675,7 @@ if test "$cache_enabled" -eq 1; then
         ICECC_P50_C_ACTION_TRACE="$c_action_trace" ICECC_P50_F_ACTION_TRACE="$c_action_trace" \
         ICECC_P50_C_LEGACY_WIRE_TRACE="$c_legacy_wire_trace" \
         ICECC_P50_TEST_READY_TRACE="$work/ready-c.trace" \
-        "$build/daemon/iceccd" "$@" --no-remote -m 0 \
+        "$build/daemon/iceccd" "$@" --no-remote -m 0 -p "$port_client" \
         -s "127.0.0.1:$port_sched" -n "$network" -N p50-c \
         -b "$work/envs-c" -l "$work/c.log" -vvv \
         --cache-service "$build/cache/icecc-cache-service" \
@@ -667,7 +685,7 @@ else
         ICECC_P50_C_ACTION_TRACE="$c_action_trace" ICECC_P50_F_ACTION_TRACE="$c_action_trace" \
         ICECC_P50_C_LEGACY_WIRE_TRACE="$c_legacy_wire_trace" \
         ICECC_P50_TEST_READY_TRACE="$work/ready-c.trace" \
-        "$build/daemon/iceccd" "$@" --no-remote -m 0 \
+        "$build/daemon/iceccd" "$@" --no-remote -m 0 -p "$port_client" \
         -s "127.0.0.1:$port_sched" -n "$network" -N p50-c \
         -b "$work/envs-c" -l "$work/c.log" -vvv &
 fi
@@ -775,8 +793,8 @@ fi
 else
     # The external transport owns these processes.  This client-only branch
     # must never create a scheduler, C daemon, or F daemon on q3; it waits on
-    # the authenticated scheduler log and uses the already-running q3 C/F
-    # identities for the mature batch below.
+    # the authenticated scheduler log and uses the already-running q3 C plus
+    # externally placed F identities for the mature batch below.
     sched_pid=
     worker_pids=
     service_pids=
@@ -1150,6 +1168,10 @@ if test "$external_mode" = 1; then
         test -f "${ICECC_P50_EXTERNAL_RESET_READY:-}" || {
             echo "FAIL: external F reset READY witness missing" >&2; exit 1;
         }
+        test -s "$work/external-rotation-evidence" || {
+            echo "FAIL: external sidecar rotation evidence missing" >&2; exit 1;
+        }
+        cat "$work/external-rotation-evidence"
     fi
 elif test "$cache_enabled" -eq 0; then
     ready_count=0
@@ -1634,6 +1656,17 @@ EOF
             test -s "$f_action_trace" || { echo "FAIL: prewarm F action trace is missing" >&2; exit 1; }
             cp -- "$f_action_trace" "$prewarm_f_trace"
         fi
+        if test "$external_mode" = 1; then
+            test -x "${ICECC_P50_EXTERNAL_PREWARM_HOOK:-}" || {
+                echo "FAIL: external prewarm trace handshake is required" >&2
+                exit 1
+            }
+            "${ICECC_P50_EXTERNAL_PREWARM_HOOK}" "$work" "$suite" "$profile_marker"
+            test -f "${ICECC_P50_EXTERNAL_PREWARM_READY:-}" || {
+                echo "FAIL: external prewarm READY witness missing" >&2
+                exit 1
+            }
+        fi
         prewarm_c_lines=$(wc -l <"$c_action_trace")
         if test "$external_mode" = 0; then
             prewarm_f_lines=$(wc -l <"$f_action_trace")
@@ -1661,6 +1694,17 @@ else
         if test "$external_mode" = 0; then
             test -s "$f_action_trace" || { echo "FAIL: prewarm F action trace is missing" >&2; exit 1; }
             cp -- "$f_action_trace" "$prewarm_f_trace"
+        fi
+        if test "$external_mode" = 1; then
+            test -x "${ICECC_P50_EXTERNAL_PREWARM_HOOK:-}" || {
+                echo "FAIL: external prewarm trace handshake is required" >&2
+                exit 1
+            }
+            "${ICECC_P50_EXTERNAL_PREWARM_HOOK}" "$work" "$suite" "$profile_marker"
+            test -f "${ICECC_P50_EXTERNAL_PREWARM_READY:-}" || {
+                echo "FAIL: external prewarm READY witness missing" >&2
+                exit 1
+            }
         fi
         prewarm_c_lines=$(wc -l <"$c_action_trace")
         if test "$external_mode" = 0; then
