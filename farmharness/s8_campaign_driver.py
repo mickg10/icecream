@@ -642,8 +642,18 @@ def _cell_state(path: Path) -> dict[str, Any]:
     return value
 
 
-def _authenticate_comparison(path: Path) -> dict[str, object]:
-    """Require a normalizer-produced comparison record before all-mode PASS."""
+def _authenticate_comparison(
+        path: Path, *, expected_cell: tuple[str, str, str] | None = None,
+        experiment_identity: dict[str, str] | None = None) -> dict[str, object]:
+    """Authenticate and summarize one immutable per-experiment comparison.
+
+    The campaign result is the operator-facing per-experiment artifact.  A
+    path/hash/point-count tuple was insufficient because it did not bind the
+    comparison to the campaign cell or expose the final predicted/observed
+    transfer and elapsed values.  When ``expected_cell`` is supplied, reuse
+    the canonical matrix-auditor checks so malformed or mutated point errors
+    cannot be promoted to a PASS.
+    """
     descriptor = _private_file(path, "comparison_output")
     try:
         rows = [json.loads(line) for line in path.read_text().splitlines()
@@ -660,9 +670,84 @@ def _authenticate_comparison(path: Path) -> dict[str, object]:
     if not isinstance(comparison.get("point_errors"), list) or not isinstance(
             comparison.get("loss_curve"), list):
         raise CampaignError("comparison_output:authenticated_fields_missing")
-    return {"path": str(path), "bytes": descriptor["bytes"],
-            "sha256": descriptor["sha256"], "record_type": "comparison",
-            "points": len(comparison["loss_curve"])}
+    result: dict[str, object] = {
+        "path": str(path), "bytes": descriptor["bytes"],
+        "sha256": descriptor["sha256"], "record_type": "comparison",
+        "points": len(comparison["loss_curve"]),
+    }
+    if expected_cell is None:
+        return result
+
+    try:
+        from . import s8_matrix_auditor as auditor
+    except ImportError:  # direct invocation
+        import s8_matrix_auditor as auditor
+    try:
+        identities = [auditor._record_identity(row, expected_cell,
+                                                f"comparison.record.{index}")
+                      for index, row in enumerate(rows)]
+        if identities[0] != identities[2]:
+            raise CampaignError("comparison_output:comparison_identity_mismatch")
+        shared = ("corpus", "profile", "regime", "split", "input_digest")
+        if any(identities[0][key] != identities[1][key] for key in shared):
+            raise CampaignError("comparison_output:source_identity_mismatch")
+        units = [auditor._record_units(row, f"comparison.record.{index}")
+                 for index, row in enumerate(rows)]
+        if units[0] != units[1] or units[0] != units[2]:
+            raise CampaignError("comparison_output:units_mismatch")
+        curves = auditor._curves(rows, identities, str(path))
+    except CampaignError:
+        raise
+    except (auditor.AuditError, KeyError, TypeError, OverflowError) as exc:
+        raise CampaignError(f"comparison_output:invalid_measurements:{exc}") from exc
+
+    # If a producer has begun emitting explicit metadata, it must agree with
+    # the campaign declaration.  Older normalizer records omit these fields;
+    # the campaign identity below remains explicit and immutable in that
+    # compatibility case.
+    if experiment_identity is not None:
+        for row in rows:
+            for key in ("topology", "depth_class", "pass_id"):
+                if key in row and row[key] != experiment_identity[key]:
+                    raise CampaignError(f"comparison_output:{key}_mismatch")
+        predicted_curve = curves["predicted"][0]
+        observed_curve = curves["observed"][0]
+        predicted_final = predicted_curve[-1]["cumulative"]
+        observed_final = observed_curve[-1]["cumulative"]
+        final_errors = curves["errors"][-1]["errors"]
+        final_loss = curves["losses"][-1]
+        def metric_snapshot(value: object) -> dict[str, object]:
+            if not isinstance(value, dict):
+                raise CampaignError("comparison_output:cumulative_metrics_invalid")
+            try:
+                return {
+                    "transfer_bytes": value["channel_bytes"],
+                    "elapsed_ns": value["elapsed_ns"],
+                    "C_TO_F_bytes": value["C_TO_F_bytes"],
+                    "F_TO_C_bytes": value["F_TO_C_bytes"],
+                    "throughput_bytes_per_s": value["throughput_bytes_per_s"],
+                }
+            except KeyError as exc:
+                raise CampaignError(
+                    "comparison_output:cumulative_metrics_invalid") from exc
+        if not isinstance(predicted_final, dict) or not isinstance(observed_final, dict):
+            raise CampaignError("comparison_output:cumulative_metrics_invalid")
+        result.update({
+            "identity": dict(experiment_identity),
+            "predicted": metric_snapshot(predicted_final),
+            "observed": metric_snapshot(observed_final),
+            "errors": {
+                "transfer_bytes": final_errors["cumulative.channel_bytes"],
+                "elapsed_ns": final_errors["cumulative.elapsed_ns"],
+                "metrics": final_errors,
+            },
+            "aggregate": {
+                "loss_curve_points": len(curves["losses"]),
+                "final": final_loss,
+                "curve_in_records": True,
+            },
+        })
+    return result
 
 
 def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
@@ -835,6 +920,12 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
             result_path = attempt_dir / "result.json"
             _write_new(result_path, canonical({"schema": "icecream-s8-campaign-result-v2",
                                                "cell": cell, "attempt": attempt_no,
+                                               "identity": {
+                                                   "method": cell["profile"], "corpus": cell["corpus"],
+                                                   "regime": cell["regime"], "split": SPLITS[corpus],
+                                                   "topology": cell["topology"], "depth_class": depth,
+                                                   "pass_id": "full-1",
+                                               },
                                                "status": "STAGED", "result": None,
                                                "error": status["reason"]}))
             status["result_record"] = {"path": str(result_path.relative_to(campaign)),
@@ -905,7 +996,7 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
                     result["live"] = live_record
                 if error is None:
                     comparisons: list[dict[str, object]] = []
-                    for command in comparison_cmd:
+                    for comparison_index, command in enumerate(comparison_cmd):
                         if command.get("executable") is not True:
                             raise CampaignError(f"{command['stage']}:command_not_executable")
                         rc = runner(command, repo, stdout, stderr)
@@ -914,7 +1005,31 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
                             break
                         comparison_argv = [str(item) for item in command["argv"]]  # type: ignore[index]
                         comparison_path = Path(comparison_argv[comparison_argv.index("--out") + 1])
-                        comparisons.append(_authenticate_comparison(comparison_path))
+                        pass_id = ("full-2" if depth == "full" and comparison_index == 1
+                                   else "full-1")
+                        depth_class = "repeat-full" if pass_id == "full-2" else depth
+                        experiment_identity = {
+                            "method": cell["profile"], "corpus": cell["corpus"],
+                            "regime": cell["regime"], "split": SPLITS[corpus],
+                            "topology": cell["topology"], "depth_class": depth_class,
+                            "pass_id": pass_id,
+                        }
+                        comparison_record = _authenticate_comparison(
+                            comparison_path,
+                            expected_cell=(cell["corpus"], cell["profile"], cell["regime"]),
+                            experiment_identity=experiment_identity)
+                        try:
+                            comparison_record["path"] = str(
+                                comparison_path.resolve().relative_to(campaign.resolve()))
+                        except ValueError as exc:
+                            raise CampaignError(
+                                "comparison_output:path_not_under_campaign") from exc
+                        comparison_record["records"] = {
+                            "path": comparison_record["path"],
+                            "sha256": comparison_record["sha256"],
+                            "bytes": comparison_record["bytes"],
+                        }
+                        comparisons.append(comparison_record)
                     if error is None:
                         assert result is not None
                         result["comparisons"] = comparisons
@@ -939,7 +1054,18 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
                     if not curve_lines:
                         raise CampaignError("predictive_result:empty_curve")
                     curve = json.loads(curve_lines[-1])
-                    segments.append({"directory": str(result_dir), "artifacts": artifacts,
+                    segment_index = len(segments)
+                    segment_pass = ("full-2" if depth == "full" and segment_index == 1
+                                    else "full-1")
+                    segment_identity = {
+                        "method": cell["profile"], "corpus": cell["corpus"],
+                        "regime": cell["regime"], "split": SPLITS[corpus],
+                        "topology": cell["topology"],
+                        "depth_class": ("repeat-full" if segment_pass == "full-2" else depth),
+                        "pass_id": segment_pass,
+                    }
+                    segments.append({"directory": str(result_dir), "identity": segment_identity,
+                                     "artifacts": artifacts,
                                      "points": len(curve_lines),
                                      "final": curve.get("cumulative", {}) if isinstance(curve, dict) else {}})
                 result = {"segments": segments,
@@ -966,6 +1092,10 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
             status.update(status="FAIL", error=error)
         status["ended_utc"] = datetime.now(timezone.utc).isoformat()
         result_record = {"schema": "icecream-s8-campaign-result-v2", "cell": cell,
+                         "identity": {"method": cell["profile"], "corpus": cell["corpus"],
+                                      "regime": cell["regime"], "split": SPLITS[corpus],
+                                      "topology": cell["topology"], "depth_class": depth,
+                                      "pass_id": "full-1"},
                          "attempt": attempt_no, "status": status["status"],
                          "result": result, "error": error}
         result_path = attempt_dir / "result.json"

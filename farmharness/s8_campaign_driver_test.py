@@ -47,6 +47,43 @@ def _runner_factory(fail_producer: int | None = None):
 def _all_runner_factory(*, fail_stage: str | None = None):
     calls: list[str] = []
 
+    def comparison_rows(cell: dict[str, str]) -> list[str]:
+        identity = {**cell, "split": "calibration", "run_id": "run-1",
+                    "source_commit": "a" * 40, "source_tree": "b" * 40,
+                    "input_digest": "c" * 64, "topology_digest": "d" * 64,
+                    "model_id": "model-1"}
+        units = {"point": "step", "channel_bytes": "bytes", "elapsed_ns": "ns",
+                 "throughput_bytes_per_s": "bytes_per_s", "C_TO_F_bytes": "bytes",
+                 "F_TO_C_bytes": "bytes"}
+        curve = [{"step": 0, "tu_id": "tu-0", "cumulative": {
+            "C_TO_F_bytes": 6, "F_TO_C_bytes": 4, "channel_bytes": 10,
+            "elapsed_ns": 1, "throughput_bytes_per_s": 1.0e10}}]
+        common = {"schema": "icecream-s8-predictive-live-record-v1",
+                  "semantics": "s8-current-semantics-v1", "cell": cell,
+                  "split": "calibration", "identity": identity,
+                  "units": units, "model_id": "model-1"}
+        predicted = {**common, "record_type": "predictive_sim",
+                     "raw_cumulative_curve": curve}
+        observed = {**common, "record_type": "live",
+                    "raw_cumulative_curve": curve}
+        comparison = {**common, "record_type": "comparison",
+                      "point_errors": [{"step": 0, "tu_id": "tu-0", "errors": {
+                          "cumulative.C_TO_F_bytes": {"signed": 0, "absolute": 0,
+                                                        "relative": 0, "squared": 0},
+                          "cumulative.F_TO_C_bytes": {"signed": 0, "absolute": 0,
+                                                        "relative": 0, "squared": 0},
+                          "cumulative.channel_bytes": {"signed": 0, "absolute": 0,
+                                                         "relative": 0, "squared": 0},
+                          "cumulative.elapsed_ns": {"signed": 0, "absolute": 0,
+                                                     "relative": 0, "squared": 0},
+                          "cumulative.throughput_bytes_per_s": {"signed": 0, "absolute": 0,
+                                                                  "relative": 0, "squared": 0},
+                      }}],
+                      "loss_curve": [{"step": 0, "tu_id": "tu-0",
+                                      "squared_error": 0, "cumulative_loss": 0}]}
+        return [json.dumps(value, sort_keys=True) + "\n"
+                for value in (predicted, observed, comparison)]
+
     def run(command: dict[str, object], _cwd: Path, stdout: Path, stderr: Path) -> int:
         stage = str(command["stage"])
         argv = [str(item) for item in command["argv"]]  # type: ignore[index]
@@ -80,12 +117,17 @@ def _all_runner_factory(*, fail_stage: str | None = None):
             if fail_stage == stage:
                 return 23
             output = Path(argv[argv.index("--out") + 1])
-            rows = []
-            for record_type in ("predictive_sim", "live", "comparison"):
-                row = {"schema": "icecream-s8-predictive-live-record-v1",
-                       "record_type": record_type, "point_errors": [], "loss_curve": []}
-                rows.append(json.dumps(row) + "\n")
-            output.write_text("".join(rows))
+            cell_corpus = next(corpus for corpus in driver.CORPORA
+                               if any(part.startswith(f"{corpus}-") for part in output.parts))
+            slug = next(part for part in output.parts
+                        if part.startswith(f"{cell_corpus}-"))
+            profile = next(profile for profile in driver.PROFILES
+                           if slug.startswith(f"{cell_corpus}-{profile}-"))
+            remainder = slug[len(f"{cell_corpus}-{profile}-"):]
+            regime = remainder.split("-", 1)[0]
+            comparison_cell = {"corpus": cell_corpus, "profile": profile,
+                               "regime": regime}
+            output.write_text("".join(comparison_rows(comparison_cell)))
         return 0
 
     return run, calls
@@ -326,8 +368,54 @@ def test_all_mode_retains_authenticated_live_and_comparison_result(tmp_path: Pat
     assert state["status"] == "PASS"
     assert state["result"]["live"]["sha256"]
     assert state["result"]["comparisons"][0]["record_type"] == "comparison"
+    comparison = state["result"]["comparisons"][0]
+    assert comparison["records"]["path"].endswith("records.jsonl")
+    cell = state["cell"]
+    assert comparison["identity"] == {
+        "method": cell["profile"], "corpus": cell["corpus"],
+        "regime": cell["regime"], "split": "calibration",
+        "topology": cell["topology"], "depth_class": "100", "pass_id": "full-1",
+    }
+    assert comparison["predicted"]["transfer_bytes"] == 10
+    assert comparison["observed"]["elapsed_ns"] == 1
+    assert comparison["errors"]["transfer_bytes"]["absolute"] == 0
+    assert comparison["errors"]["elapsed_ns"]["relative"] == 0
+    assert comparison["aggregate"] == {
+        "loss_curve_points": 1,
+        "final": {"step": 0, "tu_id": "tu-0", "squared_error": 0,
+                   "cumulative_loss": 0},
+        "curve_in_records": True,
+    }
     assert calls[:5] == ["predictive_plan", "predictive_producer", "live_prepare",
                          "live_run", "comparison"]
+
+
+def test_all_mode_rejects_mutated_comparison_error_curve(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runner, _ = _all_runner_factory()
+    monkeypatch.setattr(driver, "_validate_live_prerequisites", lambda **_kwargs: {})
+    campaign = driver.run_campaign(
+        **_all_kwargs(tmp_path), mode="all", command_runner=runner,
+        container_image_id="sha256:" + "a" * 64, container_temp_root=tmp_path,
+        idle_host_gate=lambda: True, oom_protection=lambda: None,
+        timestamp="20260831T120022Z")
+    state = json.loads(next((campaign / "cells").glob("*/status.json")).read_text())
+    comparison_path = campaign / state["result"]["comparisons"][0]["records"]["path"]
+    rows = [json.loads(line) for line in comparison_path.read_text().splitlines()]
+    rows[2]["point_errors"][0]["errors"]["cumulative.channel_bytes"]["absolute"] = 1
+    comparison_path.write_text("".join(json.dumps(row, sort_keys=True) + "\n"
+                                               for row in rows))
+    cell = state["cell"]
+    with pytest.raises(driver.CampaignError, match="prediction_error_value_mismatch"):
+        driver._authenticate_comparison(
+            comparison_path,
+            expected_cell=(cell["corpus"], cell["profile"], cell["regime"]),
+            experiment_identity={
+                "method": cell["profile"], "corpus": cell["corpus"],
+                "regime": cell["regime"], "split": "calibration",
+                "topology": cell["topology"],
+                "depth_class": "100", "pass_id": "full-1",
+            })
 
 
 def test_all_mode_live_failure_stops_before_next_cell(tmp_path: Path,
