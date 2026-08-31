@@ -1054,51 +1054,104 @@ def test_local_runner_declares_non_calibratable_role_placement() -> None:
 
 
 def _external_authority(tmp_path: Path, manifest: Path, manifest_sha: str) -> tuple[Path, str]:
-    """Build the standalone host/image authority consumed by the adapter."""
-    descriptor = tmp_path / "external-host-descriptor.json"
-    descriptor.write_bytes(runner._canonical({
-        "schema": runner.HOST_DESCRIPTOR_SCHEMA,
-        "facts": {
-            "machine_id_sha256": "1" * 64,
-            "dmi_source": "unavailable",
-            "dmi_identity_sha256": None,
-            "cpu_vendor_sha256": "2" * 64,
-            "cpu_model_sha256": "3" * 64,
-            "cpu_count": 8,
-        },
-    }) + b"\n")
-    descriptor_sha = hashlib.sha256(descriptor.read_bytes()).hexdigest()
+    """Build the exact four-host authority emitted by the capture tool."""
+    hosts = {}
+    for index, host in enumerate(runner.EXTERNAL_FARM_HOSTS):
+        machine = hashlib.sha256(f"machine-{host}".encode()).hexdigest()
+        nic = hashlib.sha256(f"nic-{host}".encode()).hexdigest()
+        physical = hashlib.sha256(runner._canonical({
+            "machine_id_sha256": machine, "nic_identity_sha256": nic})).hexdigest()
+        descriptor = tmp_path / f"{host}-descriptor.json"
+        descriptor.write_bytes(runner._canonical({
+            "schema": "icecream-s8-external-host-descriptor-v1",
+            "facts": {"machine_id_sha256": machine,
+                      "boot_id_sha256": hashlib.sha256(f"boot-{host}".encode()).hexdigest(),
+                      "nic_identity_sha256": nic, "cpu_vendor_sha256": "2" * 64,
+                      "cpu_model_sha256": "3" * 64,
+                      "cpu_count": {"q3": 32, "q2": 32, "research6": 20,
+                                     "research7": 12}[host],
+                      "physical_host_digest": physical}}) + b"\n")
+        sample = {"before": "cpu before", "after": "cpu after",
+                  "duration_seconds": 1.0, "idle_percent": 100.0}
+        hosts[host] = {
+            "target": f"user@{host}", "lan": f"10.0.27.{100 + index}",
+            "hostname": host, "descriptor": {"path": str(descriptor),
+                "sha256": hashlib.sha256(descriptor.read_bytes()).hexdigest(),
+                "bytes": descriptor.stat().st_size},
+            "physical_host_digest": physical,
+            "boot_id_digest": hashlib.sha256(f"boot-{host}".encode()).hexdigest(),
+            "image": {"reference": runner.EXTERNAL_FARM_PINNED_IMAGE,
+                       "image_id": (runner.EXTERNAL_FARM_IMAGE_CONFIG if host == "research7"
+                                    else runner.EXTERNAL_FARM_IMAGE_INDEX),
+                       "architecture": "amd64", "os": "linux", "created": "now"},
+            "binaries": {role: hashlib.sha256(role.encode()).hexdigest()
+                         for role in runner.EXTERNAL_FARM_ROLE_PATHS},
+            "cpu_count": {"q3": 32, "q2": 32, "research6": 20, "research7": 12}[host],
+            "idle": {"status": "PASS", "load_1m": 0.1,
+                     "captured_at": "2026-08-31T00:00:00Z",
+                     "baseline_digest": hashlib.sha256(f"baseline-{host}".encode()).hexdigest()},
+            "cpu_sample": sample,
+            "cpu_sample_digest": hashlib.sha256((runner._canonical(sample) + b"\n")).hexdigest(),
+        }
     manifest_value = json.loads(manifest.read_text())
-    metadata = {"product_image_digest": "7" * 64,
-                "toolchain_digest": "5" * 64,
-                "output_contract_digest": "6" * 64,
-                "host_digest": descriptor_sha,
-                "ordered_input_class": "ordered"}
-    authority = {
-        "schema": runner.EXTERNAL_FARM_AUTHORITY_SCHEMA,
-        "suite": manifest_value["suite"], "manifest_sha256": manifest_sha,
-        "role_placement": manifest_value["role_placement"],
-        "runtime_image": {"reference": runner.PINNED_IMAGE,
-                           "image_id": "sha256:" + "7" * 64,
-                           "architecture": "amd64", "os": "linux", "created": "now"},
-        "host_descriptor": {"path": str(descriptor), "sha256": descriptor_sha,
-                             "bytes": descriptor.stat().st_size},
-        "calibration_metadata": metadata,
+    mapping = (["q2"] if manifest_value["suite"] == runner.TOPOLOGY
+               else ["q2"] * 15 + ["research7"] * 5)
+    manifest_value["scheduler"] = {"host": hosts["q3"]["lan"], "port": 54321}
+    manifest_value["client"] = {"host_digest": hosts["q3"]["physical_host_digest"]}
+    manifest_value["workers"] = [{"relationship": i,
+                                   "service": "p50-f" if len(mapping) == 1 else f"p50-f-{i}",
+                                   "host_digest": hosts[host]["physical_host_digest"]}
+                                  for i, host in enumerate(mapping)]
+    manifest_value["role_placement"] = {
+        "schema": runner.ROLE_PLACEMENT_SCHEMA, "mode": "external_farm",
+        "c_host_digest": hosts["q3"]["physical_host_digest"],
+        "scheduler_host_digest": hosts["q3"]["physical_host_digest"],
+        "f_host_digests": list(dict.fromkeys(hosts[host]["physical_host_digest"] for host in mapping)),
+        "roles_disjoint": True, "timing_eligible": True,
     }
+    manifest.write_bytes(runner._canonical(manifest_value) + b"\n")
+    manifest_sha = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    authority = {"schema": runner.EXTERNAL_FARM_AUTHORITY_SCHEMA, "hosts": hosts,
+                 "placements": {"C1F1/100000": {"relationship_hosts": ["q2"]},
+                                "C1F20/40": {"relationship_hosts": ["q2"] * 15 + ["research7"] * 5}}}
     path = tmp_path / "external-authority.json"
     path.write_bytes(runner._canonical(authority) + b"\n")
     return path, hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _external_input(tmp_path: Path, manifest: Path, authority: Path,
+                    work: Path, stdout: str) -> runner.ExternalFarmFinalization:
+    stdout_path = tmp_path / "product-output.log"
+    stdout_path.write_text(stdout, encoding="utf-8")
+    receipt = {"schema": runner.EXTERNAL_FARM_RECEIPT_SCHEMA,
+               "mode": "external_farm", "suite": json.loads(manifest.read_text())["suite"],
+               "manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
+               "authority_sha256": hashlib.sha256(authority.read_bytes()).hexdigest(),
+               "stdout": {"path": str(stdout_path),
+                          "sha256": hashlib.sha256(stdout_path.read_bytes()).hexdigest(),
+                          "bytes": stdout_path.stat().st_size},
+               "workdir": str(work)}
+    receipt_path = tmp_path / "external-receipt.json"
+    receipt_path.write_bytes(runner._canonical(receipt) + b"\n")
+    return runner.ExternalFarmFinalization(
+        manifest, hashlib.sha256(manifest.read_bytes()).hexdigest(), authority,
+        hashlib.sha256(authority.read_bytes()).hexdigest(), work, stdout_path,
+        hashlib.sha256(stdout_path.read_bytes()).hexdigest(), stdout_path.stat().st_size,
+        receipt_path, hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+        receipt_path.stat().st_size)
 
 
 def test_external_binding_requires_independent_authority_and_binds_hashes(
         tmp_path: Path) -> None:
     manifest, manifest_sha = _external_farm(tmp_path)
     authority, authority_sha = _external_authority(tmp_path, manifest, manifest_sha)
-    external = runner.ExternalFarmFinalization(
-        manifest, manifest_sha, authority, authority_sha,
-        tmp_path / "p50compilee2e.external", f"S7_WORKDIR={tmp_path / 'p50compilee2e.external'}")
     (tmp_path / "p50compilee2e.external").mkdir()
+    external = _external_input(tmp_path, manifest, authority,
+                                tmp_path / "p50compilee2e.external",
+                                f"S7_WORKDIR={tmp_path / 'p50compilee2e.external'}")
     binding = runner._external_farm_binding(external, runner.TOPOLOGY)
+    manifest_sha = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    authority_sha = hashlib.sha256(authority.read_bytes()).hexdigest()
     assert binding["manifest"]["sha256"] == manifest_sha
     assert binding["authority"]["sha256"] == authority_sha
     assert binding["role_placement"] == json.loads(manifest.read_text())["role_placement"]
@@ -1109,16 +1162,14 @@ def test_external_binding_rejects_authority_hash_mutation_and_local_launch(
     manifest, manifest_sha = _external_farm(tmp_path)
     authority, authority_sha = _external_authority(tmp_path, manifest, manifest_sha)
     work = tmp_path / "p50compilee2e.external"; work.mkdir()
-    external = runner.ExternalFarmFinalization(
-        manifest, manifest_sha, authority, authority_sha, work,
-        f"S7_WORKDIR={work}")
+    external = _external_input(tmp_path, manifest, authority, work, f"S7_WORKDIR={work}")
     authority.write_bytes(authority.read_bytes() + b"\n")
     with pytest.raises(runner.LiveRunnerError, match="authority:sha256_mismatch"):
         runner._external_farm_binding(external, runner.TOPOLOGY)
     with pytest.raises(runner.LiveRunnerError, match="local_execution_authority_present"):
         # The local identity is intentionally rejected before any product
         # parsing, so a caller cannot relabel a loopback run as external.
-        runner.finalize(external.stdout, 0, batch_manifest=manifest, topology=manifest,
+        runner.finalize("caller supplied text", 0, batch_manifest=manifest, topology=manifest,
                         predictive_plan=manifest, output=tmp_path / "out", profile="ZSTD_TU",
                         product_root=tmp_path, external_farm=external,
                         launch_identity={"source_commit": "a" * 40},
@@ -1134,6 +1185,39 @@ def test_external_binding_rejects_disconnected_worker_host_digest(
     with pytest.raises(runner.LiveRunnerError, match="worker_binding_mismatch|identity_invalid"):
         runner.load_external_farm_manifest(
             manifest, hashlib.sha256(manifest.read_bytes()).hexdigest(), runner.TOPOLOGY)
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda value: value["hosts"].pop("research7"),
+    lambda value: value["placements"][runner.PARALLEL_TOPOLOGY].update(
+        {"relationship_hosts": ["q2"] * 20}),
+    lambda value: value["hosts"]["q2"]["binaries"].update(
+        {runner.EXTERNAL_FARM_ROLE_PATHS[0]: "a" * 64}),
+    lambda value: value["hosts"]["q2"]["image"].update(
+        {"image_id": runner.EXTERNAL_FARM_IMAGE_CONFIG}),
+    lambda value: value["hosts"]["q2"].update({"boot_id_digest": "b" * 64}),
+])
+def test_external_authority_rejects_fabricated_or_mutated_identity(
+        tmp_path: Path, mutation: object) -> None:
+    manifest, manifest_sha = _external_farm(tmp_path, runner.PARALLEL_TOPOLOGY)
+    authority, _authority_sha = _external_authority(tmp_path, manifest, manifest_sha)
+    value = json.loads(authority.read_text())
+    mutation(value)  # type: ignore[operator]
+    authority.write_bytes(runner._canonical(value) + b"\n")
+    work = tmp_path / "p50compilee2e.external"; work.mkdir()
+    external = _external_input(tmp_path, manifest, authority, work, f"S7_WORKDIR={work}")
+    with pytest.raises(runner.LiveRunnerError, match="external_farm.authority"):
+        runner._external_farm_binding(external, runner.PARALLEL_TOPOLOGY)
+
+
+def test_external_binding_rejects_stdout_file_mutation(tmp_path: Path) -> None:
+    manifest, manifest_sha = _external_farm(tmp_path)
+    authority, _authority_sha = _external_authority(tmp_path, manifest, manifest_sha)
+    work = tmp_path / "p50compilee2e.external"; work.mkdir()
+    external = _external_input(tmp_path, manifest, authority, work, f"S7_WORKDIR={work}")
+    external.stdout_path.write_text("S7_WORKDIR=changed\n", encoding="utf-8")
+    with pytest.raises(runner.LiveRunnerError, match="stdout:hash_mismatch"):
+        runner._external_farm_binding(external, runner.TOPOLOGY)
 
 
 @pytest.mark.parametrize(("mutation", "message"), [
@@ -1174,37 +1258,33 @@ def test_external_finalizer_propagates_scope_placement_and_authority(
     monkeypatch.setattr(runner, "load_topology", lambda *_args: topology_sha)
     monkeypatch.setattr(runner, "_retained_workdir", lambda stdout, **_kwargs: work)
     monkeypatch.setattr(runner, "_environment_preparation", lambda *_args: {})
-    monkeypatch.setattr(runner, "_binary_identity", lambda *_args: {"client/icecc": "e" * 64})
+    binary_identity = {role: hashlib.sha256(role.encode()).hexdigest()
+                       for role in runner.EXTERNAL_FARM_ROLE_PATHS
+                       if role != "client/icecc-create-env"}
+    monkeypatch.setattr(runner, "_binary_identity", lambda *_args: binary_identity)
     monkeypatch.setattr(runner, "product_identity",
-                        lambda *_args: ("f" * 40, "1" * 40, {"client/icecc": "e" * 64}, "2" * 64))
+                        lambda *_args: ("f" * 40, "1" * 40, binary_identity, "2" * 64))
     monkeypatch.setattr(runner, "_timing_rows", lambda *_args: [])
     monkeypatch.setattr(runner, "_batch_windows",
                         lambda *_args: {"full-1": {"start_ns": 1, "end_ns": 2}})
     monkeypatch.setattr(runner, "_validate_product_log_evidence", lambda *_args: None)
     monkeypatch.setattr(runner, "_action_stage", lambda *_args: [])
     metadata = {"product_image_digest": "7" * 64, "toolchain_digest": "5" * 64,
-                "output_contract_digest": "6" * 64, "host_digest": "0" * 64,
+                "output_contract_digest": "6" * 64, "host_digest": "8" * 64,
                 "ordered_input_class": "ordered"}
-    monkeypatch.setattr(runner, "_calibration_metadata", lambda **_kwargs: metadata)
+    monkeypatch.setattr(runner, "_external_calibration_metadata", lambda *_args: metadata)
     monkeypatch.setattr(runner, "_live_curve_rows",
                         lambda *_args: [{"step": 0, "tu_id": "tu-0",
                                          "cumulative": {"channel_bytes": 1, "elapsed_ns": 1}}])
     manifest, manifest_sha = _external_farm(tmp_path)
     authority, authority_sha = _external_authority(tmp_path, manifest, manifest_sha)
-    authority_value = json.loads(authority.read_text())
-    descriptor = Path(authority_value["host_descriptor"]["path"])
-    metadata["host_digest"] = hashlib.sha256(descriptor.read_bytes()).hexdigest()
-    authority_value["calibration_metadata"] = metadata
-    authority.write_bytes(runner._canonical(authority_value) + b"\n")
-    authority_sha = hashlib.sha256(authority.read_bytes()).hexdigest()
-    external = runner.ExternalFarmFinalization(
-        manifest, manifest_sha, authority, authority_sha, work,
-        f"PASS: all-P50 C1F1\nS7_WORKDIR={work}\nS8_BATCH_COUNT=1\n"
+    stdout = (f"PASS: all-P50 C1F1\nS7_WORKDIR={work}\nS8_BATCH_COUNT=1\n"
         f"S8_SUITE={runner.TOPOLOGY}\nS8_BATCH_PASSES=1\nS8_BATCH_WARM=0\n"
         "S8_SCHEDULING mode=relationship-ordered execution_slots=1 relationships=1 "
         "planned_admission_lanes_per_relationship=1\n")
+    external = _external_input(tmp_path, manifest, authority, work, stdout)
     output = runner.finalize(
-        external.stdout, 0, batch_manifest=batch_manifest, topology=topology,
+        "mutated caller text", 0, batch_manifest=batch_manifest, topology=topology,
         predictive_plan=predictive_plan, output=tmp_path / "output", profile="ZSTD_TU",
         product_root=tmp_path, corpus="DuckDB", regime="cold", depth="full", full_count=1,
         passes=1, timestamp="20260831T000000Z", execution_environment="external_farm_product_build",
@@ -1214,7 +1294,7 @@ def test_external_finalizer_propagates_scope_placement_and_authority(
     experiment = json.loads((output / "experiment_manifest.json").read_text())
     assert evidence["execution_scope"] == runner.EXTERNAL_FARM_EXECUTION_SCOPE
     assert curve_manifest["role_placement"] == evidence["role_placement"]
-    assert experiment["external_farm"]["manifest"]["sha256"] == manifest_sha
+    assert experiment["external_farm"]["manifest"]["sha256"] == hashlib.sha256(manifest.read_bytes()).hexdigest()
     assert (output / "product-evidence" / "external-farm-authority.json").is_file()
 
 
