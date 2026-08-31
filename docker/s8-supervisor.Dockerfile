@@ -1,0 +1,24 @@
+# syntax=docker/dockerfile:1.7
+#
+# The supervisor is deliberately a small tool image.  Campaign inputs and the
+# driver checkout are mounted by s8_protected_launcher.py; no source tree or
+# measurement artifact is copied into this image.
+FROM icecream/farm-node:ubuntu22-gcc11-boost174@sha256:bdb55d4287a473e3ebfbaa7715a50ee670659777278b8d84c350724e6fa8de58
+
+USER root
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1
+
+# Ubuntu's docker.io package supplies the Docker CLI at /usr/bin/docker.  The
+# daemon is never started in this image; the protected launcher mounts the
+# host daemon socket and runs as the caller's UID/GID.
+RUN apt-get update \
+ && apt-get install --yes --no-install-recommends \
+      python3=3.10.6-1~22.04.1 \
+      git=1:2.34.1-1ubuntu1.17 \
+      docker.io=29.1.3-0ubuntu3~22.04.2 \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+ENTRYPOINT ["/bin/sh"]
+CMD ["-lc", "command -v python3 && command -v git && command -v docker"]
