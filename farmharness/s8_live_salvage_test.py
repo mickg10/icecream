@@ -83,6 +83,62 @@ def test_mutated_predictive_curve_is_rejected_by_adjacent_producer(tmp_path: Pat
         _validate_predictive_producer(manifest, RAW / "product-evidence/predictive-plan.json", "full-1", evidence)
 
 
+@pytest.mark.skipif(not RAW.is_dir(), reason="terminal raw package is not mounted")
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("run_id", "rebound-run"),
+        ("model_id", "rebound-model"),
+        ("split", "held_out_validation"),
+        ("source_commit", "a" * 40),
+        ("source_tree", "b" * 40),
+        ("input_digest", "a" * 64),
+        ("topology_digest", "b" * 64),
+        ("corpus", "DuckDB"),
+        ("profile", "ZSTD_ROUTE"),
+        ("regime", "warm"),
+    ),
+)
+def test_each_producer_identity_field_is_bound_to_predictive_authority(
+    tmp_path: Path, field: str, replacement: str
+) -> None:
+    isolated_dir = tmp_path / "producer"
+    shutil.copytree(PRODUCER_FULL, isolated_dir)
+    producer = isolated_dir / "producer_manifest.json"
+    value = json.loads(producer.read_text())
+    value["identity"][field] = replacement
+    producer.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")))
+    evidence = json.loads((RAW / "evidence.json").read_text())
+    with pytest.raises(SalvageError):
+        _validate_predictive_producer(
+            isolated_dir / "predictive_curve_manifest.json",
+            RAW / "product-evidence/predictive-plan.json",
+            "full-1",
+            evidence,
+        )
+
+
+@pytest.mark.skipif(not RAW.is_dir(), reason="terminal raw package is not mounted")
+@pytest.mark.parametrize("field", ("input_manifest_sha256", "assignment_sha256"))
+def test_each_producer_batch_authority_is_bound_to_plan_authority(
+    tmp_path: Path, field: str
+) -> None:
+    isolated_dir = tmp_path / "producer"
+    shutil.copytree(PRODUCER_FULL, isolated_dir)
+    producer = isolated_dir / "producer_manifest.json"
+    value = json.loads(producer.read_text())
+    value["batch_binding"][field] = "a" * 64
+    producer.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")))
+    evidence = json.loads((RAW / "evidence.json").read_text())
+    with pytest.raises(SalvageError):
+        _validate_predictive_producer(
+            isolated_dir / "predictive_curve_manifest.json",
+            RAW / "product-evidence/predictive-plan.json",
+            "full-1",
+            evidence,
+        )
+
+
 def _trace_fixture(tmp_path: Path) -> tuple[Path, dict[str, list[dict[str, object]]]]:
     root = tmp_path / "trace-raw"
     evidence_dir = root / "product-evidence"
@@ -101,6 +157,20 @@ def test_swapped_c_begin_commit_is_rejected(tmp_path: Path) -> None:
     lines[0], lines[1] = lines[1], lines[0]
     path.write_text("\n".join(lines) + "\n")
     with pytest.raises(SalvageError, match="c_action:ordered_sequence"):
+        _validate_trace(root, timings)
+
+
+@pytest.mark.skipif(not RAW.is_dir(), reason="terminal raw package is not mounted")
+def test_swapped_complete_f_transaction_groups_are_rejected(tmp_path: Path) -> None:
+    root, timings = _trace_fixture(tmp_path)
+    path = root / "product-evidence/s7-measured-f-action-trace.jsonl"
+    lines = path.read_text().splitlines()
+    # Each transaction's six action rows are bracketed by SESSION_DISCONNECTED
+    # and SESSION_OPENED.  Exchange the first two complete groups while
+    # retaining all lifecycle rows and their copied witness bytes.
+    lines[2:8], lines[10:16] = lines[10:16], lines[2:8]
+    path.write_text("\n".join(lines) + "\n")
+    with pytest.raises(SalvageError, match="f_action:ordered_sequence"):
         _validate_trace(root, timings)
 
 

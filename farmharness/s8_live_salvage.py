@@ -263,6 +263,23 @@ def _validate_trace(root: Path, timings: dict[str, list[dict[str, Any]]]) -> dic
                 ident = (ordinal // 2, ordinal // 2)
                 if row.get("action") != wanted or row.get("tu_seq") != ident[0] or row.get("rel_seq") != ident[1]:
                     _fail(f"c_action:ordered_sequence:{ordinal}")
+        else:
+            # F carries session lifecycle rows around each transaction.  The
+            # transaction markers are nevertheless a single global stream;
+            # checking only the identity maps below would accept two complete
+            # transaction groups exchanged in the trace.
+            transaction_events = [
+                (row.get("action"), row.get("tu_seq"), row.get("rel_seq"))
+                for row in rows
+                if row.get("action") in {"TX_BEGIN", "INPUT_COMMITTED"}
+            ]
+            expected_events = [
+                (action, ordinal, ordinal)
+                for ordinal in range(expected)
+                for action in ("TX_BEGIN", "INPUT_COMMITTED")
+            ]
+            if transaction_events != expected_events:
+                _fail("f_action:ordered_sequence")
         for ident, (begin_index, commit_index) in row_indices[key].items():
             if begin_index < 0 or commit_index <= begin_index:
                 _fail(f"{key}:begin_commit_order:{ident}")
@@ -407,6 +424,60 @@ def _producer_descriptor(base: Path, value: Any, label: str) -> dict[str, Any]:
     return {"path": str(path.resolve()), **facts}
 
 
+def _predictive_plan_authority(plan: dict[str, Any], label: str) -> dict[str, str]:
+    """Recompute the producer's source and scheduling authorities.
+
+    These are the same canonical objects used by
+    ``s8_multitu_predictive_producer``.  In particular, the source-manifest
+    digest is deliberately distinct from the live batch-manifest witness.
+    """
+    source = plan.get("source_manifest")
+    if (not isinstance(source, dict) or
+            set(source) != {"path", "sha256", "bytes", "entries"}):
+        _fail(f"{label}:source_manifest_authority")
+    source_sha = _sha(source.get("sha256"), f"{label}.source_manifest_sha256")
+    source_facts = _descriptor(Path(str(source.get("path"))), f"{label}.source_manifest")
+    if (source_facts["sha256"] != source_sha or
+            source_facts["bytes"] != source.get("bytes")):
+        _fail(f"{label}:source_manifest_authority")
+    inputs = plan.get("inputs")
+    if not isinstance(inputs, list) or not inputs:
+        _fail(f"{label}:inputs_authority")
+    input_digest = hashlib.sha256(normalizer.canonical_bytes(
+        {"source_manifest_sha256": source_sha, "inputs": inputs})).hexdigest()
+
+    scheduling = plan.get("scheduling")
+    if not isinstance(scheduling, dict):
+        _fail(f"{label}:scheduling_authority")
+    assignments = scheduling.get("assignments")
+    relationship_count = scheduling.get("f_relationships")
+    topology = scheduling.get("topology")
+    if (not isinstance(assignments, list) or not assignments or
+            type(relationship_count) is not int or relationship_count <= 0 or
+            not isinstance(topology, str) or not topology):
+        _fail(f"{label}:scheduling_authority")
+    try:
+        product_assignments = []
+        for ordinal, assignment in enumerate(assignments):
+            if (not isinstance(assignment, dict) or
+                    type(assignment.get("f_relationship")) is not int):
+                raise ValueError
+            product_assignments.append(assignment["f_relationship"])
+        assignment_value = {
+            "topology": topology,
+            "cardinality": relationship_count,
+            "assignments": product_assignments,
+            "schedule": scheduling,
+        }
+        assignment_digest = hashlib.sha256(
+            normalizer.canonical_bytes(assignment_value)).hexdigest()
+    except (TypeError, ValueError):
+        _fail(f"{label}:scheduling_authority")
+    return {"source_manifest_sha256": source_sha,
+            "input_digest": input_digest,
+            "assignment_sha256": assignment_digest}
+
+
 def _validate_predictive_producer(manifest: Path, plan_path: Path, run: str,
                                  evidence: dict[str, Any]) -> dict[str, Any]:
     manifest = manifest.absolute()
@@ -420,9 +491,15 @@ def _validate_predictive_producer(manifest: Path, plan_path: Path, run: str,
             identity.get("source_tree") != EXPECTED_TREE):
         _fail(f"producer_manifest.{run}:identity")
     predictive = normalizer._load_manifest(manifest, "predictive_sim")
+    predictive_identity = predictive["identity"]
+    if not isinstance(predictive_identity, dict):
+        _fail(f"producer_manifest.{run}:predictive_identity")
     if (producer.get("cell") != dict(zip(("corpus", "profile", "regime"), EXPECTED_CELL)) or
-            identity.get("input_digest") != predictive["identity"]["input_digest"] or
-            identity.get("topology_digest") != predictive["identity"]["topology_digest"]):
+            producer.get("split") != predictive_identity["split"] or
+            producer.get("topology_digest") != predictive_identity["topology_digest"] or
+            set(identity) != set(predictive_identity) or
+            any(identity.get(field) != predictive_identity.get(field)
+                for field in predictive_identity)):
         _fail(f"producer_manifest.{run}:cell_binding")
     expected_plan = evidence["predictive_plans"][run]
     plan_ref = _producer_descriptor(manifest.parent, producer.get("plan"), f"producer.{run}.plan")
@@ -440,6 +517,14 @@ def _validate_predictive_producer(manifest: Path, plan_path: Path, run: str,
     if (curve_ref["path"] != str(Path(predictive["curve_path"]).resolve()) or
             curve_ref["sha256"] != predictive["curve_sha256"] or curve_ref["bytes"] != Path(predictive["curve_path"]).stat().st_size):
         _fail(f"producer_manifest.{run}:curve_binding")
+    plan_raw, _ = _read(plan_path, f"plan_authority.{run}", 8 * 1024 * 1024)
+    plan_value = _json(plan_raw, f"plan_authority.{run}")
+    if not isinstance(plan_value, dict):
+        _fail(f"producer_manifest.{run}:plan_authority")
+    authority = _predictive_plan_authority(plan_value, f"producer.{run}")
+    if (predictive_identity["input_digest"] != authority["input_digest"] or
+            identity["input_digest"] != authority["input_digest"]):
+        _fail(f"producer_manifest.{run}:input_digest_binding")
     batch_binding = producer.get("batch_binding")
     if (not isinstance(batch_binding, dict) or batch_binding.get("source_commit") != EXPECTED_COMMIT or
             batch_binding.get("source_tree") != EXPECTED_TREE or
@@ -447,6 +532,14 @@ def _validate_predictive_producer(manifest: Path, plan_path: Path, run: str,
             not isinstance(batch_binding.get("assignment_sha256"), str) or
             not isinstance(batch_binding.get("simulator_sha256"), str)):
         _fail(f"producer_manifest.{run}:batch_binding")
+    if (_sha(batch_binding["input_manifest_sha256"],
+             f"producer.{run}.batch_binding.input_manifest_sha256") !=
+            authority["source_manifest_sha256"]):
+        _fail(f"producer_manifest.{run}:batch_input_manifest_binding")
+    if (_sha(batch_binding["assignment_sha256"],
+             f"producer.{run}.batch_binding.assignment_sha256") !=
+            authority["assignment_sha256"]):
+        _fail(f"producer_manifest.{run}:batch_assignment_binding")
     codec = producer.get("codec")
     simulator_ref = codec.get("simulator") if isinstance(codec, dict) else None
     simulator = _producer_descriptor(manifest.parent, simulator_ref, f"producer.{run}.simulator")
