@@ -180,6 +180,7 @@ int main()
     config.central_reaper = &reaper;
     DaemonSidecarAdapter adapter(config);
     adapter.observe_public_listener(true, config.public_listener_port);
+    adapter.outer_set_scheduler_owner(true);
     icecc::p50::advertisement::Update update;
     if (!drive_until(adapter, reaper, update, std::chrono::seconds(5), [&] {
             return adapter.authenticated() &&
@@ -238,6 +239,7 @@ int main()
     local_config.public_listener_port = 0;
     DaemonSidecarAdapter local_adapter(local_config);
     local_adapter.observe_public_listener(false, 0);
+    local_adapter.outer_set_scheduler_owner(true);
     icecc::p50::advertisement::Update local_update;
     if (!drive_until(local_adapter, reaper, local_update,
                      std::chrono::seconds(5), [&] {
@@ -248,8 +250,47 @@ int main()
     if (!drive_shutdown(local_adapter, reaper, local_update))
         return 19;
 
-    if (::rmdir(directory) != 0)
+    // Replacement teardown is allowed to finish without an active scheduler,
+    // but RetryEligible must remain parked: it must neither mint B nor keep
+    // the daemon in a zero-timeout loop.  Restoring the owner releases exactly
+    // one successor launch on a later outer turn.
+    DaemonSidecarAdapter parked_adapter(config);
+    parked_adapter.observe_public_listener(true, config.public_listener_port);
+    parked_adapter.outer_set_scheduler_owner(true);
+    icecc::p50::advertisement::Update parked_update;
+    if (!drive_until(parked_adapter, reaper, parked_update,
+                     std::chrono::seconds(5), [&] {
+                         return parked_adapter.authenticated() &&
+                                parked_adapter.advertisement_snapshot().present();
+                     }))
         return 20;
+    const uint64_t parked_attempt = parked_adapter.attempt();
+    parked_adapter.outer_set_scheduler_owner(false);
+    parked_adapter.outer_request_replacement();
+    if (!drive_until(parked_adapter, reaper, parked_update,
+                     std::chrono::seconds(5), [&] {
+                         return parked_adapter.outer_lifecycle_state() ==
+                                    icecc::p50::sidecar::LifecycleState::RetryEligible &&
+                                !parked_adapter.outer_immediate_turn_required();
+                     }))
+        return 21;
+    if (parked_adapter.attempt() != parked_attempt ||
+        parked_adapter.outer_child_pid() > 1 ||
+        parked_adapter.outer_immediate_turn_required())
+        return 22;
+    parked_adapter.outer_set_scheduler_owner(true);
+    if (!drive_until(parked_adapter, reaper, parked_update,
+                     std::chrono::seconds(5), [&] {
+                         return parked_adapter.attempt() > parked_attempt &&
+                                parked_adapter.authenticated() &&
+                                parked_adapter.advertisement_snapshot().present();
+                     }))
+        return 23;
+    if (!drive_shutdown(parked_adapter, reaper, parked_update))
+        return 24;
+
+    if (::rmdir(directory) != 0)
+        return 25;
     std::puts("p50 daemon sidecar adapter outer lifecycle: ok");
     return 0;
 }

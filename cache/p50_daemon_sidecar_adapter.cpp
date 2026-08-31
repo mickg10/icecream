@@ -2760,7 +2760,8 @@ bool DaemonSidecarAdapter::outer_immediate_turn_required() const noexcept
         lifecycle_state == sidecar::LifecycleState::ReapAndGroupCheck;
     const bool retry_ready =
         lifecycle_state == sidecar::LifecycleState::RetryEligible &&
-        outer_replacement_requested_ && !outer_shutdown_requested_;
+        outer_replacement_requested_ && !outer_shutdown_requested_ &&
+        outer_scheduler_owner_active_;
     return outer_launch_phase_ != 0 || cleanup_step_ready ||
            path_observation_ready || retry_ready ||
            outer_pending_action_.has_value() || outer_reap_event_pending_ ||
@@ -3320,7 +3321,8 @@ bool DaemonSidecarAdapter::outer_advance_turn(
     // here, after all queued input/control work and exact cleanup have
     // completed; shutdown never enters this branch and therefore can never
     // launch after an unproved retirement.
-    if (!reaper_delivery_pending && !outer_shutdown_requested_ &&
+    if (!reaper_delivery_pending && outer_scheduler_owner_active_ &&
+        !outer_shutdown_requested_ &&
         outer_replacement_requested_ &&
         outer_lifecycle_->state() == sidecar::LifecycleState::RetryEligible) {
         if (!reserve_outer_restart()) {
@@ -3490,6 +3492,7 @@ bool DaemonSidecarAdapter::outer_advance_turn(
 
 void DaemonSidecarAdapter::outer_request_shutdown(advertisement::Update* result) noexcept
 {
+    outer_scheduler_owner_active_ = false;
     outer_replacement_requested_ = false;
     outer_replacement_input_close_pending_ = false;
     outer_shutdown_requested_ = true;
@@ -3506,6 +3509,11 @@ void DaemonSidecarAdapter::outer_request_shutdown(advertisement::Update* result)
     outer_observe(update);
     if (result != nullptr)
         *result = update;
+}
+
+void DaemonSidecarAdapter::outer_set_scheduler_owner(bool active) noexcept
+{
+    outer_scheduler_owner_active_ = active;
 }
 
 void DaemonSidecarAdapter::outer_request_replacement() noexcept

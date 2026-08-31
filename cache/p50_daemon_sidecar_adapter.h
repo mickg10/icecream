@@ -194,6 +194,10 @@ public:
     // shutdown: after exact teardown reaches RetryEligible, a later scheduler
     // turn may ask the same allocator to mint the next incarnation.
     void outer_request_replacement() noexcept;
+    // Grants the active scheduler owner permission to mint the next sidecar
+    // incarnation after replacement teardown.  Without this grant a parked
+    // RetryEligible state cannot launch or force zero-timeout turns.
+    void outer_set_scheduler_owner(bool active) noexcept;
     void outer_request_shutdown(advertisement::Update* update = nullptr) noexcept;
     void outer_append_pollfds(std::vector<pollfd>& pollfds) const noexcept;
     [[nodiscard]] std::chrono::steady_clock::time_point outer_next_deadline() const noexcept;
@@ -412,6 +416,7 @@ private:
     bool outer_identity_report_pending_ = false;
     bool outer_shutdown_requested_ = false;
     bool outer_replacement_requested_ = false;
+    bool outer_scheduler_owner_active_ = false;
     bool outer_replacement_input_close_pending_ = false;
     bool outer_shutdown_input_close_pending_ = false;
     // Set only when the central registry delivered an immutable exact-PID

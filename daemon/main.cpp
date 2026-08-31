@@ -5226,6 +5226,7 @@ void Daemon::poll_cache_adapter() noexcept
     const bool scheduler_cache_owner =
         scheduler_session_active && cache_adapter != nullptr;
     if (!scheduler_cache_owner || scheduler == nullptr) {
+        cache_adapter->outer_set_scheduler_owner(false);
         // An established-session loss is an allocator/lifecycle replacement
         // request.  Route it through the same outer reducer; do not tear down
         // the sidecar synchronously or let a later reconnect reuse A.
@@ -5242,6 +5243,7 @@ void Daemon::poll_cache_adapter() noexcept
         cache_adapter_start_attempted = true;
         trace() << "cache sidecar outer lifecycle engaged (scheduler session active)" << endl;
     }
+    cache_adapter->outer_set_scheduler_owner(true);
     // This call only resets the adapter's per-daemon-turn quota and publishes
     // the current level once an incarnation is already in flight.  It invokes
     // the reducer's begin() only for the initial Stopped incarnation; READY,
@@ -5327,6 +5329,7 @@ void Daemon::shutdown_cache_adapter() noexcept
     // Shutdown is a reducer request only.  The daemon must not call the old
     // synchronous Supervisor::shutdown path or destroy an active lifecycle
     // before its central reaper/outer poll can prove teardown.
+    cache_adapter->outer_set_scheduler_owner(false);
     cache_adapter->outer_request_shutdown(&update);
     for (size_t index = 0; index < update.count; ++index) {
         if (!scheduler_session_active || scheduler == nullptr
