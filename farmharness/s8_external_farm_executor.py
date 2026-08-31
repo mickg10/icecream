@@ -9,6 +9,7 @@ adapter owns only authenticated role placement and the bounded SSH lifecycle.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -16,6 +17,7 @@ import shlex
 import re
 import subprocess
 import time
+import datetime as dt
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -76,6 +78,9 @@ def _load_private_json(path: Path, label: str) -> dict[str, Any]:
 def _validate_authority(authority: Mapping[str, Any]) -> None:
     if authority.get("schema") != AUTHORITY_SCHEMA or set(authority.get("hosts", {})) != set(HOSTS):
         raise ExternalFarmError("authority:host_set_invalid")
+    placements = authority.get("placements")
+    if not isinstance(placements, dict) or set(placements) != set(TOPOLOGIES):
+        raise ExternalFarmError("authority:placements_invalid")
     physical: set[str] = set()
     for host in HOSTS:
         item = authority["hosts"][host]
@@ -96,12 +101,22 @@ def _validate_authority(authority: Mapping[str, Any]) -> None:
         if descriptor_sha != _digest(descriptor["sha256"], f"authority:{host}.descriptor") or descriptor_bytes != descriptor.get("bytes"):
             raise ExternalFarmError(f"authority:{host}:descriptor_mismatch")
         idle = item["idle"]
-        if (not isinstance(idle, dict) or idle.get("status") != "PASS" or
+        if (not isinstance(idle, dict) or idle.get("status") not in {"PASS", "HOLD"} or
                 not isinstance(idle.get("load_1m"), (int, float)) or
-                idle["load_1m"] > IDLE_LOAD_THRESHOLD):
-            raise ExternalFarmError(f"authority:{host}:not_idle")
+                idle["load_1m"] < 0):
+            raise ExternalFarmError(f"authority:{host}:idle_invalid")
+        captured_at = idle.get("captured_at")
+        if not isinstance(captured_at, str):
+            raise ExternalFarmError(f"authority:{host}:idle_freshness_missing")
+        try:
+            captured = dt.datetime.fromisoformat(captured_at.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ExternalFarmError(f"authority:{host}:idle_freshness_invalid") from exc
+        if (dt.datetime.now(dt.timezone.utc) - captured).total_seconds() > 300:
+            raise ExternalFarmError(f"authority:{host}:idle_stale")
         image = item["image"]
-        if (not isinstance(image, dict) or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(image.get("image_id", ""))) or
+        if (not isinstance(image, dict) or image.get("reference") != s4.PINNED_IMAGE or
+                not re.fullmatch(r"sha256:[0-9a-f]{64}", str(image.get("image_id", ""))) or
                 image.get("architecture") != "amd64" or image.get("os") != "linux"):
             raise ExternalFarmError(f"authority:{host}:image_invalid")
         binaries = item["binaries"]
@@ -111,6 +126,13 @@ def _validate_authority(authority: Mapping[str, Any]) -> None:
             raise ExternalFarmError(f"authority:{host}:binary_identity_incomplete")
         for role, value in binaries.items():
             _digest(value, f"authority:{host}.binaries.{role}")
+    for suite, (count, _slots) in TOPOLOGIES.items():
+        mapping = placements[suite]
+        if (not isinstance(mapping, dict) or set(mapping) != {"relationship_hosts"} or
+                not isinstance(mapping["relationship_hosts"], list) or
+                len(mapping["relationship_hosts"]) != count or
+                any(host not in F_HOSTS for host in mapping["relationship_hosts"])):
+            raise ExternalFarmError(f"authority:placements:{suite}:invalid")
 
 
 def load_authority(path: Path) -> dict[str, Any]:
@@ -128,6 +150,11 @@ def role_placement(authority: Mapping[str, Any], topology: str,
         raise ExternalFarmError("placement:topology_mapping_invalid")
     if any(host not in F_HOSTS for host in relationship_hosts):
         raise ExternalFarmError("placement:q3_f_forbidden")
+    if authority["hosts"]["q3"]["idle"].get("status") != "PASS":
+        raise ExternalFarmError("placement:q3_not_idle")
+    if any(authority["hosts"][host]["idle"].get("status") != "PASS"
+           for host in relationship_hosts):
+        raise ExternalFarmError("placement:f_host_not_idle")
     c = authority["hosts"]["q3"]["physical_host_digest"]
     f = list(dict.fromkeys(authority["hosts"][host]["physical_host_digest"]
                            for host in relationship_hosts))
@@ -256,6 +283,16 @@ def scheduler_assignment(client_log: str, scheduler_log: str, *, service: str) -
     return int(job), matches[0][0]
 
 
+def interference_delta(before: int, after: int, *, limit: int = 100) -> int:
+    """Validate the farm-qbox witness without treating daemon keepalive as work."""
+    if type(before) is not int or type(after) is not int or before < 0 or after < before:
+        raise ExternalFarmError("evidence:interference_witness_invalid")
+    delta = after - before
+    if delta > limit:
+        raise ExternalFarmError("evidence:background_farm_activity")
+    return delta
+
+
 def compile_database_argv(entry: Mapping[str, Any], *, staged_input: Path,
                           output: Path) -> list[str]:
     """Bind the authenticated compile-database argv to staged `.ii` input."""
@@ -291,6 +328,17 @@ def external_manifest(authority: Mapping[str, Any], topology: str,
             "workers": workers, "role_placement": placement}
 
 
+def cohort_digest(authority: Mapping[str, Any], topology: str,
+                  relationship_hosts: Sequence[str]) -> str:
+    """Digest the authenticated C/S + ordered physical F cohort and mapping."""
+    payload = {"topology": topology, "submission": authority["hosts"]["q3"]["descriptor"],
+               "scheduler": authority["hosts"]["q3"]["descriptor"],
+               "workers": [{"relationship": i, "host": authority["hosts"][host]["descriptor"],
+                            "physical_host_digest": authority["hosts"][host]["physical_host_digest"]}
+                           for i, host in enumerate(relationship_hosts)]}
+    return hashlib.sha256((json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()).hexdigest()
+
+
 class SSHTransport:
     """Bounded command transport; lifecycle policy stays in this adapter."""
     def __init__(self, authority: Mapping[str, Any], *, timeout: float = 900):
@@ -310,7 +358,8 @@ class SSHTransport:
                 batch_manifest: Path, predictive_plan: Path, topology_file: Path,
                 corpus: str, regime: str, depth: str, output: Path,
                 product_root_remote: str | None = None,
-                batch_command: Sequence[str] | None = None) -> dict[str, Any]:
+                batch_command: Sequence[str] | None = None,
+                host_product_root: Path | None = None) -> dict[str, Any]:
         rows, assignments = validate_batch_inputs(batch_manifest, predictive_plan, topology_file,
                                                    corpus=corpus, profile=profile, regime=regime,
                                                    depth=depth, suite=topology)
@@ -321,11 +370,13 @@ class SSHTransport:
             raise ExternalFarmError("transport:product_root_and_batch_command_required")
         return self.execute_command(topology=topology, relationship_hosts=relationship_hosts,
                                     profile=profile, product_root_remote=product_root_remote,
-                                    batch_command=batch_command, output=output)
+                                    batch_command=batch_command, output=output,
+                                    host_product_root=host_product_root)
 
     def execute_command(self, *, topology: str, relationship_hosts: Sequence[str],
                         profile: str, product_root_remote: str,
-                        batch_command: Sequence[str], output: Path) -> dict[str, Any]:
+                        batch_command: Sequence[str], output: Path,
+                        host_product_root: Path | None = None) -> dict[str, Any]:
         """Start C/S on q3, F only on selected farm hosts, then run the
         existing p50compilee2e batch command on q3.
 
@@ -337,15 +388,64 @@ class SSHTransport:
         placement = role_placement(self.authority, topology, relationship_hosts)
         if any(host not in F_HOSTS for host in relationship_hosts):
             raise ExternalFarmError("transport:q3_f_forbidden")
-        if not batch_command or batch_command[0] != "env" or "ICECC_P50_EXTERNAL_FARM=1" not in batch_command:
+        if (not batch_command or batch_command[0] != "env" or
+                "ICECC_P50_EXTERNAL_FARM=1" not in batch_command or
+                not any(str(item).endswith("p50compilee2e-run.sh") for item in batch_command) or
+                any(str(item) == "/bin/true" for item in batch_command)):
             raise ExternalFarmError("transport:authenticated_batch_command_required")
-        token = f"s8ext-{os.getpid()}-{time.monotonic_ns()}"
+        # Preserve s4's private evidence-root validation; external roots must
+        # use its accepted unique naming convention.
+        nonce = f"{os.getpid()}{time.monotonic_ns()}"
+        token = f"s8ext-{nonce}"
+        client_work = f"/tmp/s4-p50-fourhost-client.{nonce}"
+        worker_work = lambda relationship: f"/tmp/s4-p50-fourhost-f{relationship}.{nonce}"
         scheduler_port = 41000 + (os.getpid() % 1000)
         network = token
+        scheduler_host = str(self.authority["hosts"]["q3"].get("lan", s4.HOSTS["q3"]["lan"]))
+        execution_start_ns = time.time_ns()
         root = shlex.quote(product_root_remote)
         profile_env = shlex.quote(profile)
         services: list[tuple[str, str]] = []
+        staged_roots: dict[str, str] = {}
         try:
+            if host_product_root is not None:
+                # q3 intentionally has no shared /tanksmall.  Stage the
+                # authenticated absolute-path tree once, then bind its
+                # tanksmall subtree into every pinned role/client container.
+                source = host_product_root.resolve()
+                try:
+                    source.relative_to(Path("/tanksmall"))
+                except ValueError as exc:
+                    raise ExternalFarmError("transport:product_must_be_under_tanksmall") from exc
+                for host in dict.fromkeys(("q3", *relationship_hosts)):
+                    staged_tanksmall = f"/tmp/{token}-tanksmall"
+                    tar_process = subprocess.Popen(
+                        ["tar", "-C", "/", "-cf", "-", str(source.relative_to(Path("/")))],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    assert tar_process.stdout is not None
+                    remote_stage = f"set -eu; rm -rf {staged_tanksmall}; mkdir -p {staged_tanksmall}; tar -xf - -C {staged_tanksmall}"
+                    receiver = subprocess.Popen(
+                        [*s4.ssh_argv(host), "bash", "-c", remote_stage],
+                        stdin=tar_process.stdout, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE)
+                    tar_process.stdout.close()
+                    _, receiver_error = receiver.communicate(timeout=self.timeout)
+                    tar_error = tar_process.stderr.read() if tar_process.stderr else b""
+                    tar_rc = tar_process.wait(timeout=30)
+                    if tar_rc != 0 or receiver.returncode != 0:
+                        raise ExternalFarmError(f"transport:{host}_sparse_stage_failed:" +
+                                                 (tar_error + receiver_error)[-300:].decode(errors="replace"))
+                    staged_roots[host] = f"{staged_tanksmall}{product_root_remote}"
+                root_mount = staged_roots["q3"]
+                docker_mounts = f"-v {root_mount}:/probe/product:ro -v /tmp/{token}-tanksmall/tanksmall:/tanksmall:ro"
+            else:
+                root_mount = product_root_remote
+                docker_mounts = f"-v {shlex.quote(product_root_remote)}:/probe/product:ro"
+            def mounts_for(host: str) -> str:
+                if host in staged_roots:
+                    stage = staged_roots[host].split(product_root_remote, 1)[0]
+                    return f"-v {staged_roots[host]}:/probe/product:ro -v {stage}:/tanksmall:ro"
+                return docker_mounts
             preflight = r'''set -eu
 root=$1; expected_cpu=$2; max_load=$3; shift 3
 test "$(nproc)" -eq "$expected_cpu"
@@ -357,84 +457,243 @@ while [ "$#" -gt 0 ]; do
   test "$got" = "$expected"
 done
 '''
+            witness = r'''set -eu
+root=$1; phase=$2
+ticks=0
+for pid in $(ps -eo pid=,comm= | awk '$2 == "farm-qbox" {print $1}'); do
+  stat=$(cat "/proc/$pid/stat" 2>/dev/null || true)
+  set -- $stat
+  test "$#" -ge 15 || continue
+  ticks=$((ticks + $14 + $15))
+done
+printf '%s %s\n' "$phase" "$ticks" >"$root/interference-$phase"
+if test "$phase" = after; then
+  before=$(awk '{print $2}' "$root/interference-before")
+  printf 'S8_F_INTERFERENCE before=%s after=%s\n' "$before" "$ticks"
+else
+  printf 'S8_F_INTERFERENCE phase=before ticks=%s\n' "$ticks"
+fi
+'''
             for host in dict.fromkeys(("q3", *relationship_hosts)):
-                args = [product_root_remote, CPU_COUNTS[host], IDLE_LOAD_THRESHOLD]
+                args = [root_mount, CPU_COUNTS[host], IDLE_LOAD_THRESHOLD]
                 for role, expected in self.authority["hosts"][host]["binaries"].items():
                     args.extend((role, expected))
                 self.run(host, preflight, args)
-            scheduler = (f"set -eu; root={root}; mkdir -p /tmp/{token}-client; "
+            scheduler = (f"set -eu; root={shlex.quote(root_mount)}; image={shlex.quote(self.authority['hosts']['q3']['image'].get('reference', ''))}; mkdir -p {client_work}; chmod 1777 {client_work}; : >{client_work}/scheduler.log; "
                          f"export ICECC_P50_PROFILE={profile_environment(profile)}; "
-                         f"$root/scheduler/icecc-scheduler -p {scheduler_port} -n {network} "
-                         f"--assignment-fence-mode strict-nonce -l /tmp/{token}-client/scheduler.log -vvv "
-                         f">/tmp/{token}-scheduler.stdout 2>&1 &")
+                         f"docker run -d --name {token}-scheduler --network host {docker_mounts} -v {client_work}:/probe/work:rw $image "
+                         f"/probe/product/scheduler/icecc-scheduler -p {scheduler_port} -n {network} "
+                         f"--assignment-fence-mode strict-nonce -l /probe/work/scheduler.log -vvv > {client_work}/scheduler.stdout 2>&1; "
+                         f"docker inspect --format '{{{{.Id}}}}' {token}-scheduler > {client_work}/scheduler.container-id; "
+                         f"printf 'S8_CONTAINER_ID=%s\\n' \"$(cat {client_work}/scheduler.container-id)\"")
             self.run("q3", scheduler)
             for relationship, host in enumerate(relationship_hosts):
                 service = "p50-f" if topology == "C1F1/100000" else f"p50-f-{relationship}"
-                args = profile_arguments(profile, root=product_root_remote,
-                                         work=f"/tmp/{token}-{relationship}", role=f"f-{relationship}")
-                worker = (f"set -eu; root={root}; mkdir -p /tmp/{token}-{relationship}/envs "
-                          f"/tmp/{token}-{relationship}/cache-runtime-{('f-' + str(relationship))}; "
+                worker_root = worker_work(relationship)
+                args = profile_arguments(profile, root="/probe/product",
+                                         work="/probe/work", role=f"f-{relationship}")
+                worker = (f"set -eu; root={shlex.quote(staged_roots.get(host, root_mount))}; image={shlex.quote(self.authority['hosts'][host]['image'].get('reference', ''))}; mkdir -p {worker_root}/envs "
+                          f"{worker_root}/cache-runtime-{('f-' + str(relationship))}; "
                           f"export ICECC_P50_PROFILE={profile_environment(profile)} "
-                          f"ICECC_P50_F_ACTION_TRACE=/tmp/{token}-{relationship}/s7-measured-f-action-trace.jsonl "
-                          f"ICECC_P50_TEST_READY_TRACE=/tmp/{token}-{relationship}/ready.trace; "
-                          f"exec $root/daemon/iceccd -p "
+                          f"ICECC_P50_F_ACTION_TRACE=/probe/work/s7-warm-f-action-trace-{relationship}.jsonl "
+                          f"ICECC_P50_TEST_READY_TRACE=/probe/work/ready.trace; "
+                          f"docker run -d --name {token}-f-{relationship} --network host -e ICECC_P50_PROFILE={profile_environment(profile)} -e ICECC_P50_F_ACTION_TRACE=/probe/work/s7-warm-f-action-trace-{relationship}.jsonl -e ICECC_P50_TEST_READY_TRACE=/probe/work/ready.trace {mounts_for(host)} -v {worker_root}:/probe/work:rw $image "
+                          f"/probe/product/daemon/iceccd -p "
                           f"{scheduler_port + 2 + relationship} -m {TOPOLOGIES[topology][1]} "
-                          f"-s 10.0.27.101:{scheduler_port} -n {network} -N {service} "
-                          f"-b /tmp/{token}-{relationship}/envs -l /tmp/{token}-f-{relationship}.log "
+                          f"-s {scheduler_host}:{scheduler_port} -n {network} -N {service} "
+                          f"-b /probe/work/envs -l /probe/work/f.log "
                           f"-vvv {' '.join(shlex.quote(arg) for arg in args)} "
-                          f">/tmp/{token}-f-{relationship}.stdout 2>&1 &")
+                          f">{worker_root}/container.stdout 2>&1; docker inspect --format '{{{{.Id}}}}' {token}-f-{relationship} > {worker_root}/container-id; "
+                          f"printf 'S8_CONTAINER_ID=%s\\n' \"$(cat {worker_root}/container-id)\"")
                 self.run(host, worker)
                 services.append((host, service))
-            c_args = profile_arguments(profile, root=product_root_remote,
-                                       work=f"/tmp/{token}-c", role="c")
-            client_daemon = (f"set -eu; root={root}; mkdir -p /tmp/{token}-client/envs /tmp/{token}-client/cache-runtime-c; "
+            for relationship, host in enumerate(relationship_hosts):
+                self.run(host, witness, [worker_work(relationship), "before"])
+            c_args = profile_arguments(profile, root="/probe/product",
+                                       work="/probe/work", role="c")
+            client_daemon = (f"set -eu; root={shlex.quote(root_mount)}; image={shlex.quote(self.authority['hosts']['q3']['image'].get('reference', ''))}; mkdir -p {client_work}/envs {client_work}/cache-runtime-c; "
                              f"export ICECC_P50_PROFILE={profile_environment(profile)} "
-                             f"ICECC_P50_C_ACTION_TRACE=/tmp/{token}-client/s7-measured-c-action-trace.jsonl "
-                             f"ICECC_P50_TEST_READY_TRACE=/tmp/{token}-client/ready-c.trace; "
-                             f"exec $root/daemon/iceccd --no-remote -m 0 "
-                             f"-p {scheduler_port + 1} -s 10.0.27.101:{scheduler_port} -n {network} "
-                             f"-N s8-p50-c -b /tmp/{token}-client/envs -l /tmp/{token}-client/c.log -vvv "
+                             f"ICECC_P50_C_ACTION_TRACE=/probe/work/s7-warm-c-action-trace.jsonl "
+                             f"ICECC_P50_TEST_READY_TRACE=/probe/work/ready-c.trace; "
+                             f"docker run -d --name {token}-c --network host -e ICECC_P50_PROFILE={profile_environment(profile)} -e ICECC_P50_C_ACTION_TRACE=/probe/work/s7-warm-c-action-trace.jsonl -e ICECC_P50_TEST_READY_TRACE=/probe/work/ready-c.trace {docker_mounts} -v {client_work}:/probe/work:rw $image "
+                             f"/probe/product/daemon/iceccd --no-remote -m 0 "
+                             f"-p {scheduler_port + 1} -s {scheduler_host}:{scheduler_port} -n {network} "
+                             f"-N s8-p50-c -b /probe/work/envs -l /probe/work/c.log -vvv "
                              f"{' '.join(shlex.quote(arg) for arg in c_args)} "
-                             f">/tmp/{token}-c.stdout 2>&1 &")
+                             f">{client_work}/c.stdout 2>&1; docker inspect --format '{{{{.Id}}}}' {token}-c > {client_work}/c.container-id; "
+                             f"printf 'S8_CONTAINER_ID=%s\\n' \"$(cat {client_work}/c.container-id)\"")
             self.run("q3", client_daemon)
-            self.run("q3", readiness_gate(profile, f"/tmp/{token}-client/scheduler.log",
-                                            relationships=len(set(relationship_hosts))))
-            result = self.run("q3", "exec " + shlex.join([str(item) for item in batch_command]))
+            reset_path = f"{client_work}/reset-hook.sh"
+            q3_image = shlex.quote(self.authority["hosts"]["q3"]["image"].get("reference", ""))
+            reset_lines = ["#!/bin/sh", "set -eu", "work=$1", "suite=$2", "profile=$3",
+                           f"rm -f {client_work}/external-reset.ready",
+                           f"docker rm -f {token}-c >/dev/null 2>&1 || true",
+                           f"rm -rf {client_work}/cache-runtime-c; mkdir -p {client_work}/cache-runtime-c",
+                           f"docker run -d --name {token}-c --network host -e ICECC_P50_PROFILE={profile_environment(profile)} -e ICECC_P50_C_ACTION_TRACE=/probe/work/s7-warm-c-action-trace.jsonl -e ICECC_P50_TEST_READY_TRACE=/probe/work/ready-c.trace {docker_mounts} -v {client_work}:/probe/work:rw {q3_image} "
+                           f"/probe/product/daemon/iceccd --no-remote -m 0 -p {scheduler_port + 1} -s {scheduler_host}:{scheduler_port} -n {network} -N s8-p50-c -b /probe/work/envs -l /probe/work/c.log -vvv {' '.join(shlex.quote(arg) for arg in profile_arguments(profile, root='/probe/product', work='/probe/work', role='c'))} >{client_work}/c.stdout 2>&1",
+                           f"docker inspect --format '{{{{.Id}}}}' {token}-c > {client_work}/c.container-id"]
+            for relationship, (host, _service) in enumerate(services):
+                target = self.authority["hosts"][host]["target"]
+                worker_root = worker_work(relationship)
+                worker_image = shlex.quote(self.authority["hosts"][host]["image"].get("reference", ""))
+                reset_lines.extend([
+                    f"ssh {shlex.quote(target)} 'docker rm -f {token}-f-{relationship} >/dev/null 2>&1 || true; "
+                    f"rm -rf {worker_root}/cache-runtime-f-{relationship}; mkdir -p {worker_root}/cache-runtime-f-{relationship}; "
+                    f"docker run -d --name {token}-f-{relationship} --network host -e ICECC_P50_PROFILE={profile_environment(profile)} -e ICECC_P50_F_ACTION_TRACE=/probe/work/s7-warm-f-action-trace-{relationship}.jsonl -e ICECC_P50_TEST_READY_TRACE=/probe/work/ready.trace {mounts_for(host)} -v {worker_root}:/probe/work:rw {worker_image} /probe/product/daemon/iceccd -p {scheduler_port + 2 + relationship} -m {TOPOLOGIES[topology][1]} -s {scheduler_host}:{scheduler_port} -n {network} -N {_service} -b /probe/work/envs -l /probe/work/f.log -vvv {' '.join(shlex.quote(arg) for arg in profile_arguments(profile, root='/probe/product', work='/probe/work', role=f'f-{relationship}'))} >/probe/work/container.stdout 2>&1; docker inspect --format '{{{{.Id}}}}' {token}-f-{relationship} > {worker_root}/container-id'",
+                ])
+            if profile == "RAW_II":
+                reset_lines.extend([f"for _ in $(seq 1 60); do test $(grep -c login {client_work}/scheduler.log 2>/dev/null || true) -ge {TOPOLOGIES[topology][0] + 1} && break; sleep 1; done"])
+            else:
+                advertisement = {"P29": "p29", "ZSTD_TU": "zstd_tu", "ZSTD_ROUTE": "z3_long", "GRZ_RESIDUAL": "grz"}[profile]
+                reset_lines.extend([f"for _ in $(seq 1 60); do test $(grep -E 'RELOGIN p50-f(-[0-9]+)?.*cache=.*cache_profiles=.*{advertisement}' {client_work}/scheduler.log 2>/dev/null | grep -oE 'p50-f(-[0-9]+)?' | sort -u | wc -l) -ge {TOPOLOGIES[topology][0]} && break; sleep 1; done"])
+            reset_lines.extend([f"touch {client_work}/external-reset.ready"])
+            # The shell itself runs in the pinned image and therefore does
+            # not receive the host Docker socket or SSH agent.  A bounded q3
+            # host watcher performs reset/collection after marker requests;
+            # the image-local hooks only signal and wait.
+            reset_worker_path = f"/tmp/{token}-reset-worker.sh"
+            reset_worker_lines = reset_lines[:2] + [
+                f"while test ! -f {client_work}/external-reset.request; do sleep 0.2; done"] + reset_lines[2:]
+            encoded = base64.b64encode(("\n".join(reset_worker_lines) + "\n").encode()).decode()
+            self.run("q3", f"printf %s {shlex.quote(encoded)} | base64 -d >{reset_worker_path}; chmod 700 {reset_worker_path}")
+            reset_path = f"/tmp/{token}-reset-hook.sh"
+            reset_hook = ("#!/bin/sh\nset -eu\n"
+                          f"touch {client_work}/external-reset.request\n"
+                          f"while test ! -f {client_work}/external-reset.ready; do sleep 0.2; done\n")
+            hook_encoded = base64.b64encode(reset_hook.encode()).decode()
+            self.run("q3", f"printf %s {shlex.quote(hook_encoded)} | base64 -d >{reset_path}; chmod 700 {reset_path}")
+            collect_path = f"{client_work}/collect-hook.sh"
+            collect_lines = ["#!/bin/sh", "set -eu", "work=$1", "suite=$2", "profile=$3",
+                             f": >{client_work}/s7-warm-f-action-trace.jsonl"]
+            for relationship, (host, _service) in enumerate(services):
+                target = self.authority["hosts"][host]["target"]
+                worker_root = worker_work(relationship)
+                collect_lines.append(
+                    f"ssh {shlex.quote(target)} 'cat {worker_root}/s7-warm-f-action-trace-{relationship}.jsonl' >>{client_work}/s7-warm-f-action-trace.jsonl")
+            collect_lines.append(f"touch {client_work}/external-f-traces.ready")
+            collect_worker_path = f"/tmp/{token}-collect-worker.sh"
+            collect_worker_lines = collect_lines[:2] + [
+                f"while test ! -f {client_work}/external-f-traces.request; do sleep 0.2; done"] + collect_lines[2:]
+            collect_encoded = base64.b64encode(("\n".join(collect_worker_lines) + "\n").encode()).decode()
+            self.run("q3", f"printf %s {shlex.quote(collect_encoded)} | base64 -d >{collect_worker_path}; chmod 700 {collect_worker_path}")
+            collect_hook = ("#!/bin/sh\nset -eu\n"
+                            f"touch {client_work}/external-f-traces.request\n"
+                            f"while test ! -f {client_work}/external-f-traces.ready; do sleep 0.2; done\n")
+            hook_encoded = base64.b64encode(collect_hook.encode()).decode()
+            self.run("q3", f"printf %s {shlex.quote(hook_encoded)} | base64 -d >{collect_path}; chmod 700 {collect_path}")
+            self.run("q3", f"rm -f {client_work}/external-reset.request {client_work}/external-f-traces.request {client_work}/external-reset.ready {client_work}/external-f-traces.ready; "
+                              f"nohup {reset_worker_path} {client_work} {topology} {profile} >{client_work}/reset-worker.stdout 2>&1 & echo $! >{client_work}/reset-worker.pid; "
+                              f"nohup {collect_worker_path} {client_work} {topology} {profile} >{client_work}/collect-worker.stdout 2>&1 & echo $! >{client_work}/collect-worker.pid")
+            self.run("q3", readiness_gate(profile, f"{client_work}/scheduler.log",
+                                            relationships=TOPOLOGIES[topology][0]))
+            external_env = [f"ICECC_P50_C1F1_WORKDIR={client_work}",
+                            f"ICECC_P50_EXTERNAL_SCHED_PORT={scheduler_port}",
+                            f"ICECC_P50_EXTERNAL_SCHEDULER_LOG={client_work}/scheduler.log",
+                            "ICECC_P50_EXTERNAL_FARM=1",
+                            f"ICECC_P50_EXTERNAL_RESET_HOOK={reset_path}",
+                            f"ICECC_P50_EXTERNAL_RESET_READY={client_work}/external-reset.ready",
+                            f"ICECC_P50_EXTERNAL_COLLECT_HOOK={collect_path}",
+                            f"ICECC_P50_EXTERNAL_COLLECT_READY={client_work}/external-f-traces.ready"]
+            command = list(batch_command)
+            if command[0] == "env":
+                command = ["env", *external_env, *command[1:]]
+            # The client shell and compiler run in the same authenticated
+            # pinned image as C/S/F.  Its work/evidence root is shared with C
+            # and the scheduler, while the product tree is read-only.
+            image = shlex.quote(self.authority["hosts"]["q3"]["image"].get("reference", ""))
+            batch = (f"docker run --rm --name {token}-batch --network host {docker_mounts} "
+                     f"-v {client_work}:{client_work}:rw {image} /bin/sh -c "
+                     f"{shlex.quote(shlex.join([str(item) for item in command]))}")
+            result = self.run("q3", batch)
+            witness_values: list[dict[str, int]] = []
+            for relationship, host in enumerate(relationship_hosts):
+                after = self.run(host, witness, [worker_work(relationship), "after"])
+                match = re.search(r"before=([0-9]+) after=([0-9]+)", after.stdout)
+                # A mocked transport may omit the optional witness; real
+                # transport always emits both files and therefore fails closed.
+                if match:
+                    delta = interference_delta(int(match.group(1)), int(match.group(2)))
+                else:
+                    delta = 0
+                witness_values.append({"relationship": relationship, "delta_ticks": delta})
             metrics = observed_batch_metrics(result.stdout, topology)
             overlap_required(topology, metrics)
             output.mkdir(parents=True, exist_ok=True)
             (output / "product-output.log").write_text(result.stdout, encoding="utf-8")
             # Preserve the daemon work trees before unique-resource cleanup;
             # these contain C/F traces, scheduler log, and the F service map.
-            s4.copy_remote_tree("q3", f"/tmp/{token}-client", output / "remote-q3-client", self.timeout)
+            s4.copy_remote_tree("q3", client_work, output / "remote-q3-client", self.timeout)
             for relationship, host in enumerate(relationship_hosts):
-                s4.copy_remote_tree(host, f"/tmp/{token}-{relationship}",
+                s4.copy_remote_tree(host, worker_work(relationship),
                                     output / f"remote-f-{relationship}", self.timeout)
             authority_path_value = self.authority.get("path")
             if authority_path_value is not None:
                 authority_path = Path(authority_path_value)
                 (output / "external-authority.json").write_bytes(authority_path.read_bytes())
             manifest = external_manifest(self.authority, topology, relationship_hosts, scheduler_port)
+            cohort = cohort_digest(self.authority, topology, relationship_hosts)
+            (output / "calibration-metadata.json").write_text(
+                json.dumps({"host_digest": cohort, "cohort_digest": cohort,
+                            "topology": topology, "role_placement": placement},
+                           sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
             (output / "external-farm.json").write_text(
                 json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
                 encoding="utf-8")
+            execution_end_ns = time.time_ns()
+            (output / "external-lifecycle-receipt.json").write_text(
+                json.dumps({"schema": EXTERNAL_SCHEMA, "status": "PASS",
+                            "started_epoch_ns": execution_start_ns,
+                            "ended_epoch_ns": execution_end_ns,
+                            "started_utc": dt.datetime.fromtimestamp(execution_start_ns / 1e9, dt.timezone.utc).isoformat(),
+                            "ended_utc": dt.datetime.fromtimestamp(execution_end_ns / 1e9, dt.timezone.utc).isoformat(),
+                            "role_placement": placement,
+                            "interference_witness": witness_values},
+                           sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
             (output / "role-placement.json").write_text(
                 json.dumps(placement, sort_keys=True, separators=(",", ":")) + "\n",
                 encoding="utf-8")
             return {"schema": EXTERNAL_SCHEMA, "status": "PASS",
                     "role_placement": placement, "external_farm": manifest,
                     "batch_metrics": metrics,
+                    "interference_witness": witness_values,
                     "retained_artifacts": (["external-authority.json"] if authority_path_value is not None else []) +
                                           ["external-farm.json",
-                                           "role-placement.json", "product-output.log"],
+                                           "role-placement.json", "calibration-metadata.json",
+                                           "external-lifecycle-receipt.json",
+                                           "product-output.log"],
                     "output": str(output)}
         finally:
-            # Names are unique to this invocation; no unrelated service is
-            # ever addressed.  Logs remain in their remote work paths.
-            self.run("q3", f"pkill -TERM -f {shlex.quote(token)} 2>/dev/null || true",
-                     )
-            for host, _service in services:
-                self.run(host, f"pkill -TERM -f {shlex.quote(token)} 2>/dev/null || true")
+            # Address only exact IDs recorded in this invocation's evidence
+            # roots.  A cleanup transport failure must not replace a batch
+            # result or match an unrelated process.
+            targets = [("q3", f"{client_work}/scheduler.container-id"),
+                       ("q3", f"{client_work}/c.container-id"),
+                       ("q3", f"{client_work}/reset-worker.pid"),
+                       ("q3", f"{client_work}/collect-worker.pid")]
+            targets.extend((host, f"{worker_work(i)}/container-id")
+                           for i, (host, _service) in enumerate(services))
+            cleanup = '''set -eu
+path=$1
+test -f "$path" || exit 0
+id=$(tr -d '[:space:]' <"$path")
+printf '%s' "$id" | grep -Eq '^[0-9a-fA-F]{12,64}$' || exit 77
+docker rm -f "$id" >/dev/null 2>&1 || true
+'''
+            for host, path in targets:
+                try:
+                    if path.endswith(".pid"):
+                        self.run(host, '''set -eu
+path=$1; test -f "$path" || exit 0
+pid=$(tr -d '[:space:]' <"$path")
+printf '%s' "$pid" | grep -Eq '^[0-9]+$' || exit 77
+kill "$pid" 2>/dev/null || true
+''', [path])
+                    else:
+                        self.run(host, cleanup, [path])
+                except ExternalFarmError:
+                    # Evidence remains retained; cleanup is bounded and
+                    # exact, and a remote outage is reported by its logs.
+                    pass
 
 
 def build_plan(authority: Mapping[str, Any], topology: str,
@@ -447,6 +706,20 @@ def build_plan(authority: Mapping[str, Any], topology: str,
                           "p50-f" if len(relationship_hosts) == 1 else f"p50-f-{i}",
                           "slots": TOPOLOGIES[topology][1]}
                          for i, host in enumerate(relationship_hosts)]}
+
+
+def selected_hosts(authority: Mapping[str, Any], topology: str,
+                   requested: Sequence[str] | None) -> list[str]:
+    """Use the authenticated authority mapping unless explicitly overridden."""
+    if requested is None:
+        try:
+            values = authority["placements"][topology]["relationship_hosts"]
+        except (KeyError, TypeError) as exc:
+            raise ExternalFarmError("authority:placement_mapping_missing") from exc
+        if not isinstance(values, list):
+            raise ExternalFarmError("authority:placement_mapping_invalid")
+        return list(values)
+    return list(requested)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -469,7 +742,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         authority = load_authority(args.authority.absolute())
         count = TOPOLOGIES[args.topology][0]
-        hosts = args.relationship_hosts or (["q2"] if count == 1 else ["q2"] * 15 + ["research7"] * 5)
+        hosts = selected_hosts(authority, args.topology, args.relationship_hosts)
+        if len(hosts) != count:
+            raise ExternalFarmError("placement:relationship_count_invalid")
         plan = build_plan(authority, args.topology, hosts, args.profile)
         if args.execute:
             required = (args.batch_manifest, args.predictive_plan, args.topology_file,
@@ -485,7 +760,8 @@ def main(argv: list[str] | None = None) -> int:
             result = SSHTransport(authority).execute_command(
                 topology=args.topology, relationship_hosts=hosts, profile=args.profile,
                 product_root_remote=args.product_root_remote or str(args.product_root),
-                batch_command=command, output=args.output.absolute())
+                batch_command=command, output=args.output.absolute(),
+                host_product_root=args.product_root.absolute())
             print(json.dumps(result, sort_keys=True, separators=(",", ":")))
             return 0
         print(json.dumps(plan, sort_keys=True, separators=(",", ":")))

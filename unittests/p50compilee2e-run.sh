@@ -17,6 +17,11 @@ suite=${ICECC_P50_SUITE:-C1F1/100000}
 warm=${ICECC_P50_C1F1_WARM:-0}
 passes=${ICECC_P50_C1F1_PASSES:-2}
 topology=${ICECC_P50_TOPOLOGY:-}
+external_mode=${ICECC_P50_EXTERNAL_FARM:-0}
+case "$external_mode" in
+    0|1) ;;
+    *) echo "FAIL: ICECC_P50_EXTERNAL_FARM must be 0 or 1" >&2; exit 1 ;;
+esac
 case "$suite" in
     C1F1/100000) relationship_count=1; slots_per_f=1; execution_slots=1 ;;
     C1F20/40) relationship_count=20; slots_per_f=2; execution_slots=40 ;;
@@ -130,7 +135,13 @@ fi
 # requested log.  Keep the test root traversable and pre-create only that log
 # as writable; the cache runtime and HOME below retain their own 0700 modes.
 chmod 0711 "$work"
-: >"$work/scheduler.log"
+if test "$external_mode" = 1; then
+    test -f "$work/scheduler.log" && test ! -L "$work/scheduler.log" || {
+        echo "FAIL: external scheduler log is unavailable" >&2; exit 1;
+    }
+else
+    : >"$work/scheduler.log"
+fi
 chmod 0666 "$work/scheduler.log"
 cleanup() {
     # Batch wrappers own their compiler child and remove their planned-lane
@@ -235,7 +246,14 @@ else:
     raise SystemExit('no available scheduler/worker port pair')
 PY
 }
-if test -n "${ICECC_P50_C1F1_SCHED_PORT:-}" || test -n "${ICECC_P50_C1F1_WORKER_PORT:-}"; then
+if test "$external_mode" = 1; then
+    port_sched=${ICECC_P50_EXTERNAL_SCHED_PORT:-}
+    port_worker=${ICECC_P50_EXTERNAL_WORKER_PORT:-}
+    test -n "$port_sched" || { echo "FAIL: external scheduler port required" >&2; exit 1; }
+    test -n "${ICECC_P50_EXTERNAL_SCHEDULER_LOG:-}" || {
+        echo "FAIL: external scheduler log required" >&2; exit 1;
+    }
+elif test -n "${ICECC_P50_C1F1_SCHED_PORT:-}" || test -n "${ICECC_P50_C1F1_WORKER_PORT:-}"; then
     port_sched=${ICECC_P50_C1F1_SCHED_PORT:-}
     port_worker=${ICECC_P50_C1F1_WORKER_PORT:-}
 else
@@ -565,6 +583,7 @@ run_client_with_timeout() {
     fi
 }
 
+if test "$external_mode" = 0; then
 "$build/scheduler/icecc-scheduler" -p "$port_sched" -n "$network" \
     --assignment-fence-mode strict-nonce -l "$work/scheduler.log" -vvv &
 sched_pid=$!
@@ -753,6 +772,39 @@ test "$cache_ready" -eq 1 || {
     exit 1
 }
 fi
+else
+    # The external transport owns these processes.  This client-only branch
+    # must never create a scheduler, C daemon, or F daemon on q3; it waits on
+    # the authenticated scheduler log and uses the already-running q3 C/F
+    # identities for the mature batch below.
+    sched_pid=
+    worker_pids=
+    service_pids=
+    worker_pid=
+    service_pid=
+    client_pid=
+    client_service_pid=
+    external_required=$((relationship_count + 1))
+    test -n "${ICECC_P50_EXTERNAL_RESET_HOOK:-}" && test -n "${ICECC_P50_EXTERNAL_RESET_READY:-}" || {
+        echo "FAIL: external F reset handshake is required" >&2; exit 1;
+    }
+    external_ready=0
+    for _ in $(seq 1 60); do
+        logins=$(grep -c login "$work/scheduler.log" 2>/dev/null || true)
+        if test "$cache_enabled" -eq 0; then
+            test "${logins:-0}" -ge "$external_required" && external_ready=1 && break
+        elif test "$suite" = C1F20/40; then
+            ready_count=$(grep -E "RELOGIN p50-f-[0-9]+.*cache=.*cache_profiles=.*$profile_advertisement" \
+                "$work/scheduler.log" 2>/dev/null | grep -oE 'p50-f-[0-9]+' | sort -u | wc -l)
+            test "${ready_count:-0}" -ge 20 && external_ready=1 && break
+        elif grep -E "RELOGIN p50-f.*cache=.*cache_profiles=.*$profile_advertisement" \
+                "$work/scheduler.log" >/dev/null 2>&1; then
+            external_ready=1; break
+        fi
+        sleep 1
+    done
+    test "$external_ready" -eq 1 || { echo "FAIL: external farm READY/registration missing" >&2; exit 1; }
+fi
 
 ready_snapshot() {
     ready_path=$1
@@ -912,7 +964,11 @@ compile_once() {
     if test -n "$timing_path"; then
         printf '%s\n' "$compile_end_ns" >>"$timing_path"
     fi
-    if test -n "$item_compile_db"; then
+    if test "$external_mode" = 1 && test -n "$timing_path"; then
+        # Defer q3's byte-identical reference until the remote batch barrier.
+        printf '%s\n' "$input_path" "$item_compile_db" "$item_compile_source" \
+            "$item_compile_output" "$local_obj" "$remote_obj" >"$work/local-pending-$label"
+    elif test -n "$item_compile_db"; then
         eval "g++ $local_compile_args"
     else
         # Mirror the real client invocation for preparation compiles.  Feeding
@@ -926,10 +982,12 @@ compile_once() {
         echo "FAIL: completed $label preprocessor capture is missing" >&2
         exit 1
     }
-    cmp -s "$remote_obj" "$local_obj" || {
-        echo "FAIL: real P50 object differs from local reference ($label)" >&2
-        exit 1
-    }
+    if test "$external_mode" = 0 || test -z "$timing_path"; then
+        cmp -s "$remote_obj" "$local_obj" || {
+            echo "FAIL: real P50 object differs from local reference ($label)" >&2
+            exit 1
+        }
+    fi
 }
 
 # A batch always reuses this one scheduler/C/F/cache lifecycle.  Warm mode
@@ -1066,7 +1124,9 @@ else
 fi
 if test "$cache_enabled" -eq 1; then
 cp -- "$c_action_trace" "$environment_warmup_c_trace"
-if test "$suite" = C1F20/40; then
+if test "$external_mode" = 1; then
+    :
+elif test "$suite" = C1F20/40; then
     for relationship in $(seq 0 19); do
         cp -- "$work/s7-warm-f-action-trace-$relationship.jsonl" \
             "$work/s8-environment-warmup-f-action-trace-$relationship.jsonl"
@@ -1077,7 +1137,21 @@ fi
 fi
 
 scheduler_rotation_offset=$(stat -c %s "$work/scheduler.log")
-if test "$cache_enabled" -eq 0; then
+if test "$external_mode" = 1; then
+    # Remote transport performs the untimed F warmup and cache rotation.  The
+    # q3 client only records the authenticated scheduler offset here.
+    ready_count=$relationship_count
+    post_rotation_ready=1
+    if test -n "${ICECC_P50_EXTERNAL_RESET_HOOK:-}"; then
+        test -x "$ICECC_P50_EXTERNAL_RESET_HOOK" || {
+            echo "FAIL: external reset hook is not authenticated/executable" >&2; exit 1;
+        }
+        "$ICECC_P50_EXTERNAL_RESET_HOOK" "$work" "$suite" "$profile_marker"
+        test -f "${ICECC_P50_EXTERNAL_RESET_READY:-}" || {
+            echo "FAIL: external F reset READY witness missing" >&2; exit 1;
+        }
+    fi
+elif test "$cache_enabled" -eq 0; then
     ready_count=0
 elif test "$suite" = C1F20/40; then
     for relationship in $(seq 0 19); do
@@ -1120,7 +1194,13 @@ test "$post_rotation_ready" -eq 1 || {
 fi
 echo "S8_ENV_POST_ROTATION_READY relationships=$ready_count log_offset=$scheduler_rotation_offset"
 
-if test "$suite" = C1F20/40; then
+if test "$external_mode" = 1; then
+    if test "$suite" = C1F20/40; then
+        for relationship in $(seq 0 19); do : >"$work/f-measured-log-offset-$relationship"; done
+    else
+        : >"$work/f-measured-log-offset-0"
+    fi
+elif test "$suite" = C1F20/40; then
     for relationship in $(seq 0 19); do
         stat -c %s "$work/f-$relationship.log" >"$work/f-measured-log-offset-$relationship"
     done
@@ -1129,7 +1209,11 @@ else
 fi
 
 : >"$c_action_trace"
-if test "$suite" = C1F20/40; then
+if test "$external_mode" = 1; then
+    # F traces are copied into this q3 workdir by the external transport after
+    # the remote daemons are frozen; never truncate a remote trace here.
+    :
+elif test "$suite" = C1F20/40; then
     for relationship in $(seq 0 19); do
         : >"$work/s7-warm-f-action-trace-$relationship.jsonl"
     done
@@ -1286,9 +1370,14 @@ if test -n "$batch_manifest"; then
         remote_obj="$work/out/remote-$run_label-$ordinal.o"
         local_obj="$work/out/local-$run_label-$ordinal.o"
         remote_sha=$(sha256sum "$remote_obj" | awk '{print $1}')
-        local_sha=$(sha256sum "$local_obj" | awk '{print $1}')
         remote_bytes=$(stat -c %s "$remote_obj")
-        local_bytes=$(stat -c %s "$local_obj")
+        if test "$external_mode" = 1; then
+            local_sha=PENDING
+            local_bytes=0
+        else
+            local_sha=$(sha256sum "$local_obj" | awk '{print $1}')
+            local_bytes=$(stat -c %s "$local_obj")
+        fi
         preprocessed_sha=$(sha256sum "$preprocessed_capture" | awk '{print $1}')
         preprocessed_bytes=$(stat -c %s "$preprocessed_capture")
         test "$preprocessed_sha" = "${10}" && test "$preprocessed_bytes" -eq "${11}" || {
@@ -1386,6 +1475,44 @@ if test -n "$batch_manifest"; then
         fi
         batch_job_pids=""
         batch_end_ns=$(date +%s%N)
+        if test "$external_mode" = 1; then
+            # Correctness witnesses are intentionally post-measurement: no
+            # local GCC process can overlap the final remote compile interval.
+            for reference in "$work"/local-pending-"$run_label"-*; do
+                test -f "$reference" || continue
+                ordinal_ref=${reference##*-}
+                input_ref=$(sed -n '1p' "$reference")
+                db_ref=$(sed -n '2p' "$reference")
+                source_ref=$(sed -n '3p' "$reference")
+                output_ref=$(sed -n '4p' "$reference")
+                local_ref=$(sed -n '5p' "$reference")
+                remote_ref=$(sed -n '6p' "$reference")
+                local_witness_start_ns=$(date +%s%N)
+                if test -n "$db_ref"; then
+                    local_ref_args=$(compile_args_for "$db_ref" "$source_ref" "$output_ref" "$input_ref" "$local_ref")
+                    eval "g++ $local_ref_args"
+                else
+                    g++ -std=c++17 -O2 -c "$input_ref" -o "$local_ref"
+                fi
+                cmp -s "$remote_ref" "$local_ref" || {
+                    echo "FAIL: post-measurement local reference differs ($run_label-$ordinal_ref)" >&2
+                    exit 1
+                }
+                local_ref_sha=$(sha256sum "$local_ref" | awk '{print $1}')
+                local_ref_bytes=$(stat -c %s "$local_ref")
+                python3 - "$work/result-$run_label-$ordinal_ref.tsv" "$local_ref_sha" "$local_ref_bytes" <<'PY'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+fields = path.read_text(encoding="utf-8").rstrip("\n").split("\t")
+if len(fields) != 21:
+    raise SystemExit("post-reference result field count invalid")
+fields[9], fields[10] = sys.argv[2], sys.argv[3]
+path.write_text("\t".join(fields) + "\n", encoding="utf-8")
+PY
+                echo "S8_EXTERNAL_LOCAL_WITNESS run=$run_label ordinal=$ordinal_ref remote_batch_end_ns=$batch_end_ns local_witness_start_ns=$local_witness_start_ns"
+                rm -f "$reference"
+            done
+        fi
         batch_metrics=$(python3 - "$work" "$run_label" "$ordinal" "$batch_start_ns" \
                 "$batch_end_ns" "$relationship_count" "$slots_per_f" <<'PY'
 import pathlib, sys
@@ -1495,42 +1622,73 @@ EOF
     if test "$warm" = 1 && test "$cache_enabled" -eq 1; then
         echo "S7_WARM_PREWARM_BEGIN"
         run_batch prewarm 0
-        merge_parallel_f_traces
-        test -s "$c_action_trace" && test -s "$f_action_trace" || {
+        if test "$external_mode" = 0; then
+            merge_parallel_f_traces
+        fi
+        test -s "$c_action_trace" || {
             echo "FAIL: prewarm product action traces are missing" >&2
             exit 1
         }
         cp -- "$c_action_trace" "$prewarm_c_trace"
-        cp -- "$f_action_trace" "$prewarm_f_trace"
+        if test "$external_mode" = 0; then
+            test -s "$f_action_trace" || { echo "FAIL: prewarm F action trace is missing" >&2; exit 1; }
+            cp -- "$f_action_trace" "$prewarm_f_trace"
+        fi
         prewarm_c_lines=$(wc -l <"$c_action_trace")
-        prewarm_f_lines=$(wc -l <"$f_action_trace")
+        if test "$external_mode" = 0; then
+            prewarm_f_lines=$(wc -l <"$f_action_trace")
+        else
+            prewarm_f_lines=0
+        fi
         echo "S7_WARM_PREWARM_COMPLETE"
     fi
     run_batch full-1 1
     if test "$passes" = 2; then
         run_batch full-2 1
     fi
-    if test "$cache_enabled" -eq 1; then
+    if test "$cache_enabled" -eq 1 && test "$external_mode" -eq 0; then
         merge_parallel_f_traces
     fi
 else
     if test "$warm" = 1 && test "$cache_enabled" -eq 1; then
         echo "S7_WARM_PREWARM_BEGIN"
         compile_once prewarm
-        test -s "$c_action_trace" && test -s "$f_action_trace" || {
+        test -s "$c_action_trace" || {
             echo "FAIL: prewarm product action traces are missing" >&2
             exit 1
         }
         cp -- "$c_action_trace" "$prewarm_c_trace"
-        cp -- "$f_action_trace" "$prewarm_f_trace"
+        if test "$external_mode" = 0; then
+            test -s "$f_action_trace" || { echo "FAIL: prewarm F action trace is missing" >&2; exit 1; }
+            cp -- "$f_action_trace" "$prewarm_f_trace"
+        fi
         prewarm_c_lines=$(wc -l <"$c_action_trace")
-        prewarm_f_lines=$(wc -l <"$f_action_trace")
+        if test "$external_mode" = 0; then
+            prewarm_f_lines=$(wc -l <"$f_action_trace")
+        else
+            prewarm_f_lines=0
+        fi
         echo "S7_WARM_PREWARM_COMPLETE"
     fi
     compile_once measured
 fi
 
-if test "$suite" = C1F20/40; then
+if test "$external_mode" = 1; then
+    # The external executor owns F trace collection.  The hook blocks the
+    # finalizer until every remote relationship trace has been copied into
+    # this q3 workdir, so measured evidence cannot race the SSH transfer.
+    test -x "${ICECC_P50_EXTERNAL_COLLECT_HOOK:-}" || {
+        echo "FAIL: external F trace collection handshake is required" >&2
+        exit 1
+    }
+    "${ICECC_P50_EXTERNAL_COLLECT_HOOK}" "$work" "$suite" "$profile_marker"
+    test -f "${ICECC_P50_EXTERNAL_COLLECT_READY:-}" || {
+        echo "FAIL: external F trace collection READY witness missing" >&2
+        exit 1
+    }
+fi
+
+if test "$external_mode" = 0 && test "$suite" = C1F20/40; then
     for relationship in $(seq 0 19); do
         measured_offset=$(cat "$work/f-measured-log-offset-$relationship")
         if tail -c +$((measured_offset + 1)) "$work/f-$relationship.log" | \
@@ -1539,7 +1697,7 @@ if test "$suite" = C1F20/40; then
             exit 1
         fi
     done
-else
+elif test "$external_mode" = 0; then
     measured_offset=$(cat "$work/f-measured-log-offset-0")
     if tail -c +$((measured_offset + 1)) "$work/f.log" | \
             grep -E 'start_install_environment|handle_transfer_env' >/dev/null 2>&1; then
@@ -1547,24 +1705,40 @@ else
         exit 1
     fi
 fi
-echo "S8_ENV_MEASURED_NO_INSTALL checked=1"
+if test "$external_mode" = 1; then
+    echo "S8_ENV_MEASURED_NO_INSTALL checked=external-transport"
+else
+    echo "S8_ENV_MEASURED_NO_INSTALL checked=1"
+fi
 
-if test "$cache_enabled" -eq 1; then
-test -s "$c_action_trace" && test -s "$f_action_trace" || {
+    if test "$cache_enabled" -eq 1; then
+test -s "$c_action_trace" || {
     echo "FAIL: measured product action traces are missing" >&2
     exit 1
 }
-if test "$warm" = 1; then
+if test "$external_mode" = 0; then
+test -s "$f_action_trace" || {
+    echo "FAIL: measured product F action trace is missing" >&2
+    exit 1
+}
+fi
+if test "$external_mode" = 1; then
+    cp -- "$c_action_trace" "$measured_c_trace"
+elif test "$warm" = 1; then
     tail -n "+$((prewarm_c_lines + 1))" "$c_action_trace" >"$measured_c_trace"
     tail -n "+$((prewarm_f_lines + 1))" "$f_action_trace" >"$measured_f_trace"
 else
     cp -- "$c_action_trace" "$measured_c_trace"
     cp -- "$f_action_trace" "$measured_f_trace"
 fi
-test -s "$measured_c_trace" && test -s "$measured_f_trace" || {
-    echo "FAIL: measured action-trace slice is empty" >&2
-    exit 1
-}
+if test "$external_mode" = 1; then
+    test -s "$measured_c_trace" || { echo "FAIL: measured C action-trace slice is empty" >&2; exit 1; }
+else
+    test -s "$measured_c_trace" && test -s "$measured_f_trace" || {
+        echo "FAIL: measured action-trace slice is empty" >&2
+        exit 1
+    }
+fi
 else
     : >"$measured_c_trace"
     : >"$measured_f_trace"

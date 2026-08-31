@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import datetime as dt
 from pathlib import Path
 from typing import Sequence
 
@@ -21,13 +22,17 @@ def _authority(tmp_path: Path) -> dict[str, object]:
             "target": f"mickg@{host}", "descriptor": {"path": str(descriptor), "sha256": sha, "bytes": size},
             "physical_host_digest": hashlib.sha256(host.encode()).hexdigest(),
             "cpu_count": executor.CPU_COUNTS[host],
-            "idle": {"status": "PASS", "load_1m": 0.1},
-            "image": {"image_id": "sha256:" + "a" * 64, "architecture": "amd64", "os": "linux"},
+            "idle": {"status": "PASS", "load_1m": 0.1,
+                     "captured_at": dt.datetime.now(dt.timezone.utc).isoformat()},
+            "image": {"reference": executor.s4.PINNED_IMAGE, "image_id": "sha256:" + "a" * 64,
+                      "architecture": "amd64", "os": "linux"},
             "binaries": {role: hashlib.sha256((host + role).encode()).hexdigest() for role in {
                 "scheduler/icecc-scheduler", "daemon/iceccd", "client/icecc",
                 "client/icecc-create-env", "cache/icecc-cache-service"}},
         }
-    return {"schema": executor.AUTHORITY_SCHEMA, "hosts": hosts}
+    return {"schema": executor.AUTHORITY_SCHEMA, "hosts": hosts,
+            "placements": {"C1F1/100000": {"relationship_hosts": ["q2"]},
+                           "C1F20/40": {"relationship_hosts": ["q2"] * 15 + ["research7"] * 5}}}
 
 
 def test_placement_has_no_q3_f_and_disjoint_physical_ids(tmp_path: Path) -> None:
@@ -42,6 +47,12 @@ def test_parallel_gate_requires_all_lanes_and_overlap() -> None:
     with pytest.raises(executor.ExternalFarmError, match="parallel_overlap_missing"):
         executor.overlap_required("C1F20/40", {"planned_lanes": 40, "max_concurrent": 1})
     executor.overlap_required("C1F20/40", {"planned_lanes": 40, "max_concurrent": 2})
+
+
+def test_interference_witness_allows_keepalive_tick_but_holds_material_work() -> None:
+    assert executor.interference_delta(10, 110) == 100
+    with pytest.raises(executor.ExternalFarmError, match="background_farm_activity"):
+        executor.interference_delta(10, 111)
 
 
 def test_f_to_c_is_returned_object_for_compressed_and_legacy_ledger_for_raw() -> None:
@@ -81,6 +92,26 @@ def test_authority_requires_environment_builder_and_descriptor(tmp_path: Path) -
         executor._validate_authority(authority)
 
 
+def test_external_shell_branch_skips_every_local_role_start() -> None:
+    shell = (Path(__file__).resolve().parents[1] / "unittests" /
+             "p50compilee2e-run.sh").read_text(encoding="utf-8")
+    marker = 'if test "$external_mode" = 0; then'
+    start = shell.index(marker)
+    external_marker = '\nelse\n    # The external transport owns these processes.'
+    external_start = shell.index(external_marker, start)
+    branch = shell[start:external_start]
+    external_end = shell.index("\nfi\n", shell.index("\nfi\n", external_start) + 1)
+    external = shell[external_start:external_end]
+    assert '"$build/scheduler/icecc-scheduler"' in branch
+    assert '"$build/daemon/iceccd"' in branch
+    assert '"$build/scheduler/icecc-scheduler"' not in external
+    assert '"$build/daemon/iceccd"' not in external
+    assert "ICECC_P50_EXTERNAL_RESET_HOOK" in external
+    assert "relationship_count" in external
+    assert "remote_batch_end_ns=$batch_end_ns" in shell
+    assert "local_witness_start_ns=$(date +%s%N)" in shell
+
+
 def test_concrete_transport_invokes_q3_c_scheduler_and_non_q3_f(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     authority = _authority(tmp_path)
     transport = executor.SSHTransport(authority)
@@ -88,16 +119,26 @@ def test_concrete_transport_invokes_q3_c_scheduler_and_non_q3_f(tmp_path: Path, 
     def fake_run(host: str, script: str, args: Sequence[object] = ()) -> subprocess.CompletedProcess[str]:
         calls.append((host, script))
         stdout = ("PASS: all-P50 C1F1\nS8_BATCH_METRICS max_concurrent_admitted_or_compiling_jobs=2\n"
-                  if script.startswith("exec env ") else "")
+                  if "-batch" in script else "")
         return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
     monkeypatch.setattr(transport, "run", fake_run)
     monkeypatch.setattr(executor.s4, "copy_remote_tree", lambda *args, **kwargs: None)
     result = transport.execute_command(topology="C1F1/100000", relationship_hosts=["q2"],
                                        profile="ZSTD_ROUTE", product_root_remote="/product",
-                                       batch_command=["env", "ICECC_P50_EXTERNAL_FARM=1", "/product/run"],
+                                       batch_command=["env", "ICECC_P50_EXTERNAL_FARM=1", "/product/unittests/p50compilee2e-run.sh"],
                                        output=tmp_path / "out")
     assert result["status"] == "PASS"
     assert any(host == "q3" and "icecc-scheduler" in script for host, script in calls)
     assert any(host == "q2" and "iceccd" in script for host, script in calls)
     assert any(host == "q3" and "--no-remote -m 0" in script for host, script in calls)
     assert all(not (host == "q3" and "-N p50-f" in script) for host, script in calls)
+
+
+def test_arbitrary_true_command_cannot_be_admitted(tmp_path: Path) -> None:
+    authority = _authority(tmp_path)
+    with pytest.raises(executor.ExternalFarmError, match="authenticated_batch_command"):
+        executor.SSHTransport(authority).execute_command(
+            topology="C1F1/100000", relationship_hosts=["q2"], profile="ZSTD_ROUTE",
+            product_root_remote="/product",
+            batch_command=["env", "ICECC_P50_EXTERNAL_FARM=1", "/bin/true"],
+            output=tmp_path / "out")
