@@ -794,6 +794,14 @@ PY
             for relationship, host in enumerate(relationship_hosts):
                 service = "p50-f" if topology == "C1F1/100000" else f"p50-f-{relationship}"
                 worker_root = worker_work(relationship)
+                worker_shared_files = " ".join((
+                    f"{worker_root}/f.log",
+                    f"{worker_root}/f-service.stderr",
+                    f"{worker_root}/ready.trace",
+                    f"{worker_root}/s7-prewarm-f-action-trace-{relationship}.jsonl",
+                    f"{worker_root}/s7-warm-f-action-trace-{relationship}.jsonl",
+                    f"{worker_root}/s7-measured-f-legacy-wire-trace-{relationship}.jsonl",
+                ))
                 args = profile_arguments(profile, root="/probe/product",
                                          work="/probe/work", role=f"f-{relationship}")
                 worker_inner = (daemon_account +
@@ -804,7 +812,8 @@ PY
                                 f"-vvv {' '.join(shlex.quote(arg) for arg in args)} "
                                 f"2>>/probe/work/f-service.stderr")
                 worker = (f"set -eu; root={shlex.quote(staged_roots.get(host, root_mount))}; image={shlex.quote(self.authority['hosts'][host]['image'].get('reference', ''))}; test \"$(docker image inspect --format '{{{{.Id}}}}' \"$image\")\" = {self.authority['hosts'][host]['image']['image_id']}; mkdir -p {worker_root}/envs "
-                          f"{worker_root}/cache-runtime-{('f-' + str(relationship))}; chmod 1777 {worker_root} {worker_root}/envs; chmod 700 {worker_root}/cache-runtime-{('f-' + str(relationship))}; : >{worker_root}/s7-prewarm-f-action-trace-{relationship}.jsonl; "
+                          f"{worker_root}/cache-runtime-{('f-' + str(relationship))}; chmod 1777 {worker_root} {worker_root}/envs; chmod 700 {worker_root}/cache-runtime-{('f-' + str(relationship))}; "
+                          f"for path in {worker_shared_files}; do : >\"$path\"; done; chmod 0666 {worker_shared_files}; "
                           f"docker run -d --name {token}-f-{relationship} --network host --user 0 --cap-add SYS_CHROOT {profile_flag} -e ICECC_P50_RELATIONSHIP={relationship} -e ICECC_P50_F_ACTION_TRACE=/probe/work/s7-warm-f-action-trace-{relationship}.jsonl -e ICECC_P50_F_LEGACY_WIRE_TRACE=/probe/work/s7-measured-f-legacy-wire-trace-{relationship}.jsonl -e ICECC_P50_TEST_READY_TRACE=/probe/work/ready.trace {mounts_for(host)} -v {worker_root}:/probe/work:rw --entrypoint /bin/sh $image -c {shlex.quote(worker_inner)} "
                           f">{worker_root}/container.stdout 2>&1; test \"$(docker inspect --format '{{{{.State.Running}}}}' {token}-f-{relationship})\" = true; docker inspect --format '{{{{.Id}}}}' {token}-f-{relationship} > {worker_root}/container-id; docker inspect --format '{{{{.State.Pid}}}}' {token}-f-{relationship} > {worker_root}/container-pid; "
                           f"printf 'S8_CONTAINER_ID=%s\\n' \"$(cat {worker_root}/container-id)\"")
@@ -840,7 +849,18 @@ PY
                              f"docker run -d --name {token}-c --pid=host --network host --user 0 {profile_flag} -e ICECC_TEST_SOCKET=/probe/work/client.sock -e ICECC_P50_C_ACTION_TRACE=/probe/work/s7-warm-c-action-trace.jsonl -e ICECC_P50_C_LEGACY_WIRE_TRACE=/probe/work/s7-measured-c-legacy-wire-trace.jsonl -e ICECC_P50_TEST_READY_TRACE=/probe/work/ready-c.trace {docker_mounts} -v {client_work}:/probe/work:rw -v {client_work}:{client_work}:rw --entrypoint /bin/sh $image -c {shlex.quote(client_inner)} "
                              f">{client_work}/c.stdout 2>&1; test \"$(docker inspect --format '{{{{.State.Running}}}}' {token}-c)\" = true; docker inspect --format '{{{{.Id}}}}' {token}-c > {client_work}/c.container-id; docker inspect --format '{{{{.State.Pid}}}}' {token}-c > {client_work}/c.pid; "
                              f"printf 'S8_CONTAINER_ID=%s\\n' \"$(cat {client_work}/c.container-id)\"")
-            self.run("q3", f"mkdir -p {client_work}; : >{client_work}/s7-prewarm-c-action-trace.jsonl; : >{client_work}/s7-prewarm-f-action-trace.jsonl")
+            client_shared_files = " ".join((
+                f"{client_work}/c.log",
+                f"{client_work}/c-service.stderr",
+                f"{client_work}/ready-c.trace",
+                f"{client_work}/s7-prewarm-c-action-trace.jsonl",
+                f"{client_work}/s7-prewarm-f-action-trace.jsonl",
+                f"{client_work}/s7-warm-c-action-trace.jsonl",
+                f"{client_work}/s7-measured-c-legacy-wire-trace.jsonl",
+            ))
+            self.run("q3", f"set -eu; mkdir -p {client_work}; "
+                            f"for path in {client_shared_files}; do : >\"$path\"; done; "
+                            f"chmod 0666 {client_shared_files}")
             self.run("q3", client_daemon)
             reset_path = f"{client_work}/reset-hook.sh"
             q3_image = shlex.quote(self.authority["hosts"]["q3"]["image"].get("reference", ""))
