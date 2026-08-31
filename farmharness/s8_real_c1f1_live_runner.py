@@ -22,9 +22,10 @@ import signal
 import shutil
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 try:
     from . import s6_live_route_acceptance as action_parser
@@ -90,6 +91,7 @@ SCORED_CARET_WORKAROUND = "0"
 LOOPBACK_EXECUTION_SCOPE = "loopback_correctness_only"
 EXTERNAL_FARM_EXECUTION_SCOPE = "external_farm_timing"
 EXTERNAL_FARM_SCHEMA = "icecream-s8-external-farm-v1"
+EXTERNAL_FARM_AUTHORITY_SCHEMA = "icecream-s8-external-farm-authority-v1"
 ROLE_PLACEMENT_SCHEMA = "icecream-s8-role-placement-v1"
 # Keep the runner's emitted identity aligned with the current intake schema.
 CALIBRATION_METADATA_FIELDS = frozenset(normalizer.CALIBRATION_METADATA_KEYS)
@@ -107,6 +109,46 @@ class LiveRunnerError(ValueError):
 
 def _fail(reason: str) -> None:
     raise LiveRunnerError(reason)
+
+
+@dataclass(frozen=True)
+class ExternalFarmFinalization:
+    """Authenticated output supplied by an external-farm transport.
+
+    The transport owns execution and retention.  It must hand the mature
+    runner the exact stdout/workdir pair it captured, plus immutable file
+    descriptors for the placement manifest and host/image authority.  No
+    remote command or transport behavior is part of this boundary.
+    """
+
+    manifest_path: Path
+    manifest_sha256: str
+    authority_path: Path
+    authority_sha256: str
+    workdir: Path
+    stdout: str
+
+
+def _external_input(value: object) -> ExternalFarmFinalization:
+    """Normalize the small public adapter contract without accepting extras."""
+    if isinstance(value, ExternalFarmFinalization):
+        return value
+    if isinstance(value, Mapping):
+        required = {"manifest_path", "manifest_sha256", "authority_path",
+                    "authority_sha256", "workdir", "stdout"}
+        if set(value) != required:
+            _fail("external_farm.input:fields_invalid")
+        try:
+            return ExternalFarmFinalization(
+                manifest_path=Path(value["manifest_path"]),
+                manifest_sha256=value["manifest_sha256"],
+                authority_path=Path(value["authority_path"]),
+                authority_sha256=value["authority_sha256"],
+                workdir=Path(value["workdir"]), stdout=value["stdout"])
+        except (TypeError, ValueError) as exc:
+            raise LiveRunnerError("external_farm.input:fields_invalid") from exc
+    _fail("external_farm.input:fields_invalid")
+    raise AssertionError("unreachable")
 
 
 def _canonical(value: object) -> bytes:
@@ -171,8 +213,14 @@ def load_external_farm_manifest(path: Path, expected_sha256: str,
         value = normalizer.parse_json(path.read_bytes(), "external_farm.manifest")
     except (normalizer.NormalizationError, OSError) as exc:
         raise LiveRunnerError("external_farm.manifest:invalid_json") from exc
-    if not isinstance(value, dict) or set(value) != {
-            "schema", "suite", "scheduler", "client", "workers", "role_placement"}:
+    if not isinstance(value, dict) or set(value) - {
+            "schema", "suite", "scheduler", "client", "workers", "role_placement",
+            # Older transports put their detailed host witness next to the
+            # seven-field placement.  The finalizer authenticates the
+            # standalone authority below; retaining this optional field here
+            # keeps the manifest loader forward-compatible without treating
+            # it as evidence by itself.
+            "farm_authority"}:
         _fail("external_farm.manifest:fields_invalid")
     if value.get("schema") != EXTERNAL_FARM_SCHEMA or value.get("suite") != suite:
         _fail("external_farm.manifest:identity_invalid")
@@ -235,7 +283,143 @@ def load_external_farm_manifest(path: Path, expected_sha256: str,
                   "scheduler": {"host": host, "port": port},
                   "client": {"host_digest": client_digest},
                   "workers": normalized_workers, "role_placement": placement}
+    if "farm_authority" in value:
+        authority = value["farm_authority"]
+        if (not isinstance(authority, dict) or
+                authority.get("schema") != EXTERNAL_FARM_AUTHORITY_SCHEMA):
+            _fail("external_farm.farm_authority:fields_invalid")
+        normalized["farm_authority"] = authority
     return normalized, digest, size
+
+
+def _private_descriptor(value: object, label: str) -> tuple[Path, str, int]:
+    """Authenticate a transport-owned absolute regular-file descriptor."""
+    if not isinstance(value, dict) or set(value) != {"path", "sha256", "bytes"}:
+        _fail(f"{label}:descriptor_invalid")
+    path_value = value.get("path")
+    if not isinstance(path_value, str):
+        _fail(f"{label}:descriptor_invalid")
+    path = Path(path_value)
+    if (not path.is_absolute() or type(value.get("bytes")) is not int or
+            value["bytes"] <= 0):
+        _fail(f"{label}:descriptor_invalid")
+    expected = _hex(value.get("sha256"), f"{label}.sha256")
+    observed, size = _sha(path)
+    if observed != expected or size != value["bytes"]:
+        _fail(f"{label}:hash_mismatch")
+    return path, observed, size
+
+
+def _load_external_farm_authority(path: Path, expected_sha256: str,
+                                  manifest: dict[str, object],
+                                  manifest_sha256: str,
+                                  suite: str) -> tuple[dict[str, object], str, int]:
+    """Load the independent host/image authority required for timing."""
+    if (not path.is_absolute() or path.is_symlink() or not path.is_file() or
+            path.stat().st_nlink != 1):
+        _fail("external_farm.authority:unavailable")
+    expected = _hex(expected_sha256, "external_farm.authority_sha256")
+    digest, size = _sha(path)
+    if digest != expected:
+        _fail("external_farm.authority:sha256_mismatch")
+    try:
+        value = normalizer.parse_json(path.read_bytes(), "external_farm.authority")
+    except (normalizer.NormalizationError, OSError) as exc:
+        raise LiveRunnerError("external_farm.authority:invalid_json") from exc
+    required = {"schema", "suite", "manifest_sha256", "role_placement",
+                "runtime_image", "host_descriptor"}
+    allowed = required | {"calibration_metadata"}
+    if not isinstance(value, dict) or not required.issubset(value) or set(value) - allowed:
+        _fail("external_farm.authority:fields_invalid")
+    if (value.get("schema") != EXTERNAL_FARM_AUTHORITY_SCHEMA or
+            value.get("suite") != suite or
+            value.get("manifest_sha256") != manifest_sha256 or
+            value.get("role_placement") != manifest.get("role_placement")):
+        _fail("external_farm.authority:identity_mismatch")
+    try:
+        placement = normalizer._validate_role_placement(value.get("role_placement"), "live")
+    except normalizer.NormalizationError as exc:
+        raise LiveRunnerError(str(exc)) from exc
+    if (placement is None or placement.get("mode") != "external_farm" or
+            placement.get("roles_disjoint") is not True or
+            placement.get("timing_eligible") is not True):
+        _fail("external_farm.authority:role_placement_invalid")
+    runtime_image = value.get("runtime_image")
+    if (not isinstance(runtime_image, dict) or
+            set(runtime_image) != {"reference", "image_id", "architecture", "os", "created"} or
+            IMAGE_ID.fullmatch(runtime_image.get("image_id", "")) is None or
+            runtime_image.get("architecture") != "amd64" or
+            runtime_image.get("os") != "linux" or
+            not isinstance(runtime_image.get("reference"), str) or
+            not isinstance(runtime_image.get("created"), str)):
+        _fail("external_farm.authority:runtime_image_invalid")
+    descriptor_path, descriptor_sha, descriptor_bytes = _private_descriptor(
+        value.get("host_descriptor"), "external_farm.authority.host_descriptor")
+    metadata: dict[str, str] | None = None
+    if "calibration_metadata" in value:
+        try:
+            metadata = normalizer._validate_calibration_metadata(
+                value["calibration_metadata"], "external_farm.authority.calibration_metadata")
+        except normalizer.NormalizationError as exc:
+            raise LiveRunnerError(str(exc)) from exc
+        if metadata["host_digest"] != descriptor_sha:
+            _fail("external_farm.authority:host_descriptor_binding_mismatch")
+        if metadata["product_image_digest"] != runtime_image["image_id"].removeprefix("sha256:"):
+            _fail("external_farm.authority:runtime_image_binding_mismatch")
+    normalized = {
+        "schema": EXTERNAL_FARM_AUTHORITY_SCHEMA, "suite": suite,
+        "manifest_sha256": manifest_sha256,
+        "role_placement": placement,
+        "runtime_image": {key: runtime_image[key] for key in
+                           ("reference", "image_id", "architecture", "os", "created")},
+        "host_descriptor": {"path": str(descriptor_path), "sha256": descriptor_sha,
+                             "bytes": descriptor_bytes},
+    }
+    if metadata is not None:
+        normalized["calibration_metadata"] = metadata
+    return normalized, digest, size
+
+
+def _external_farm_binding(external: ExternalFarmFinalization, suite: str) -> dict[str, object]:
+    """Authenticate all external inputs and return immutable source facts."""
+    if not all(isinstance(path, Path) for path in
+               (external.manifest_path, external.authority_path, external.workdir)):
+        _fail("external_farm.input:fields_invalid")
+    manifest, manifest_sha, manifest_bytes = load_external_farm_manifest(
+        external.manifest_path, external.manifest_sha256, suite)
+    authority, authority_sha, authority_bytes = _load_external_farm_authority(
+        external.authority_path, external.authority_sha256, manifest, manifest_sha, suite)
+    if external.manifest_path.resolve() == external.authority_path.resolve():
+        _fail("external_farm:manifest_authority_must_differ")
+    if not isinstance(external.stdout, str) or not external.stdout:
+        _fail("external_farm.stdout:invalid")
+    if (not external.workdir.is_absolute() or external.workdir.is_symlink() or
+            not external.workdir.is_dir()):
+        _fail("external_farm.workdir:invalid")
+    try:
+        if external.workdir.resolve(strict=True) != external.workdir:
+            _fail("external_farm.workdir:invalid")
+        marker = [line.split("=", 1)[1] for line in external.stdout.splitlines()
+                  if line.startswith("S7_WORKDIR=")]
+        observed_workdir = Path(marker[0]) if len(marker) == 1 else None
+        if observed_workdir is None or observed_workdir.resolve() != external.workdir.resolve():
+            _fail("external_farm.workdir:stdout_mismatch")
+    except OSError as exc:
+        raise LiveRunnerError("external_farm.workdir:unavailable") from exc
+    result = {
+        "manifest": {"path": "product-evidence/external-farm-manifest.json",
+                      "sha256": manifest_sha, "bytes": manifest_bytes},
+        "authority": {"path": "product-evidence/external-farm-authority.json",
+                       "sha256": authority_sha, "bytes": authority_bytes},
+        "role_placement": manifest["role_placement"],
+        "runtime_image": authority["runtime_image"],
+        "host_descriptor": authority["host_descriptor"],
+        "manifest_value": manifest,
+        "authority_value": authority,
+    }
+    if "calibration_metadata" in authority:
+        result["calibration_metadata"] = authority["calibration_metadata"]
+    return result
 
 
 def _co_resident_role_placement(host_digest: str, suite: str) -> dict[str, object]:
@@ -1981,22 +2165,43 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
              host_descriptor_path: Path | None = None,
              host_workdir: Path | None = None,
              reported_workdir: Path | None = None,
+             external_farm: ExternalFarmFinalization | Mapping[str, object] | None = None,
              timestamp: str | None = None, suite: str = TOPOLOGY) -> Path:
     """Turn one completed product invocation into two authenticated live curves."""
+    external_binding: dict[str, object] | None = None
+    external_input: ExternalFarmFinalization | None = None
+    if external_farm is not None:
+        external_input = _external_input(external_farm)
+        # An external result is a replacement for the local launch lifecycle;
+        # accepting either authority would make local elapsed time relabelable.
+        if launch_identity is not None or host_workdir is not None or reported_workdir is not None:
+            _fail("external_farm:local_execution_authority_present")
+        if execution_environment != "external_farm_product_build":
+            _fail("external_farm:execution_environment_invalid")
+        if stdout != external_input.stdout:
+            _fail("external_farm:stdout_mismatch")
+        external_binding = _external_farm_binding(external_input, suite)
+        runtime_image = external_binding["runtime_image"]  # type: ignore[assignment]
+        host_descriptor_path = Path(external_binding["host_descriptor"]["path"])  # type: ignore[index]
     measurement_method, effective_product_profile, calibration_eligible = \
         _measurement_descriptor(profile, product_profile)
     raw_ii = effective_product_profile == RAW_II_PROFILE
     transfer_accounting = _transfer_accounting(effective_product_profile)
     if returncode != 0 or "PASS: all-P50 C1F1" not in stdout:
         _fail("product_run:did_not_pass")
-    if execution_environment not in {"host_product_build", "pinned_container_product_build"}:
+    if execution_environment not in {"host_product_build", "pinned_container_product_build",
+                                     "external_farm_product_build"}:
         _fail("execution_environment:invalid")
     # This runner co-locates C, F, the scheduler, caches, and compilers.  Its
     # elapsed time remains useful for protocol/output evidence only.
-    execution_scope = LOOPBACK_EXECUTION_SCOPE
-    if ((execution_environment == "pinned_container_product_build") !=
+    execution_scope = (EXTERNAL_FARM_EXECUTION_SCOPE if external_binding is not None
+                       else LOOPBACK_EXECUTION_SCOPE)
+    if (external_binding is None and
+            (execution_environment == "pinned_container_product_build") !=
             (runtime_image is not None)):
         _fail("execution_environment:image_binding_invalid")
+    if external_binding is not None and runtime_image is None:
+        _fail("external_farm:runtime_image_missing")
     if runtime_image is not None and (
             set(runtime_image) != {"reference", "image_id", "architecture", "os", "created"} or
             IMAGE_ID.fullmatch(runtime_image.get("image_id", "")) is None):
@@ -2071,25 +2276,43 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     calibration_metadata: dict[str, str] | None = None
     host_descriptor_binding: dict[str, object] | None = None
     role_placement: dict[str, object] | None = None
-    if launch_identity is not None:
+    if launch_identity is not None or external_binding is not None:
         if runtime_image is None or host_descriptor_path is None:
             _fail("calibration_metadata:authority_missing")
-        if launch_identity.get("runtime_image") != runtime_image:
-            _fail("calibration_metadata:runtime_image_changed_during_run")
-        host_digest, host_bytes = _authenticated_host_binding(
-            host_descriptor_path, launch_identity)
+        if external_binding is not None:
+            # Re-read both authority files immediately before deriving
+            # metadata.  A transport cannot swap a valid authority after the
+            # initial gate and still label the retained run with its hash.
+            rebound = _external_farm_binding(external_input, suite)  # type: ignore[arg-type]
+            if rebound != external_binding:
+                _fail("external_farm:authority_changed_during_finalize")
+            host_digest, host_bytes = _load_host_descriptor(host_descriptor_path)[1:]
+            if (host_digest != external_binding["host_descriptor"]["sha256"] or
+                    host_bytes != external_binding["host_descriptor"]["bytes"]):
+                _fail("external_farm:host_descriptor_changed_during_finalize")
+        else:
+            if launch_identity.get("runtime_image") != runtime_image:
+                _fail("calibration_metadata:runtime_image_changed_during_run")
+            host_digest, host_bytes = _authenticated_host_binding(
+                host_descriptor_path, launch_identity)
         calibration_metadata = _calibration_metadata(
             runtime_image=runtime_image, preparation=environment_preparation,
             work=work, rows=rows, observations=observations, suite=suite,
             host_descriptor=host_descriptor_path)
+        if (external_binding is not None and
+                external_binding.get("calibration_metadata") is not None and
+                calibration_metadata != external_binding["calibration_metadata"]):
+            _fail("external_farm.authority:calibration_metadata_mismatch")
         host_descriptor_binding = {"path": "product-evidence/host-descriptor.json",
                                    "sha256": host_digest, "bytes": host_bytes}
-        role_placement = _co_resident_role_placement(
-            calibration_metadata["host_digest"], suite)
-        try:
-            normalizer._validate_role_placement(role_placement, "live")
-        except normalizer.NormalizationError as exc:
-            raise LiveRunnerError("role_placement:local_identity_invalid") from exc
+        role_placement = (external_binding["role_placement"]
+                          if external_binding is not None else
+                          _co_resident_role_placement(calibration_metadata["host_digest"], suite))
+        if external_binding is None:
+            try:
+                normalizer._validate_role_placement(role_placement, "live")
+            except normalizer.NormalizationError as exc:
+                raise LiveRunnerError("role_placement:local_identity_invalid") from exc
     stages = (_legacy_wire_stage(work, observations, assignments, suite)
               if raw_ii else _action_stage(work, len(observations), assignments, suite))
     if len(stages) != len(observations):
@@ -2154,6 +2377,23 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                 retained_host_sha != host_descriptor_binding["sha256"] or
                 retained_host_bytes != host_descriptor_binding["bytes"]):
             _fail("host_descriptor:snapshot_changed_during_copy")
+    if external_binding is not None:
+        # The source descriptors were re-authenticated immediately before
+        # finalization.  Verify the copies too, so every downstream manifest
+        # points at bytes retained beside the product evidence.
+        manifest_source = external_input.manifest_path  # type: ignore[union-attr]
+        authority_source = external_input.authority_path  # type: ignore[union-attr]
+        shutil.copy2(manifest_source, retained / "external-farm-manifest.json")
+        shutil.copy2(authority_source, retained / "external-farm-authority.json")
+        copied_manifest_sha, copied_manifest_bytes = _sha(
+            retained / "external-farm-manifest.json")
+        copied_authority_sha, copied_authority_bytes = _sha(
+            retained / "external-farm-authority.json")
+        if (copied_manifest_sha != external_binding["manifest"]["sha256"] or
+                copied_manifest_bytes != external_binding["manifest"]["bytes"] or
+                copied_authority_sha != external_binding["authority"]["sha256"] or
+                copied_authority_bytes != external_binding["authority"]["bytes"]):
+            _fail("external_farm:source_changed_during_copy")
     payload_raw = _canonical({"source_manifest_sha256": plan["source_manifest"]["sha256"],
                               "inputs": plan_inputs})
     _write_new(retained / "input-descriptors.json", payload_raw)
@@ -2223,6 +2463,11 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                      "live_status": "PASS", "acceptance_status": "PASS",
                      "conformance_status": "PASS", "binary_sha256": binaries,
                      "measured": {"input_sha256": input_sha}}
+    if external_binding is not None:
+        summary_value["external_farm"] = {
+            "manifest": external_binding["manifest"],
+            "authority": external_binding["authority"],
+        }
     summary_raw = _canonical(summary_value) + b"\n"
     _write_new(target / "results.jsonl", summary_raw)
     timing_by_run: dict[str, bytes] = {}
@@ -2365,6 +2610,11 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                       "evidence": {"results": {"path": "results.jsonl", "sha256": hashlib.sha256(summary_raw).hexdigest(), "bytes": len(summary_raw)},
                                    "timing": {"path": "timing.jsonl", "sha256": hashlib.sha256(timing_raw).hexdigest(), "bytes": len(timing_raw)}},
                       "witness": witness}
+    if external_binding is not None:
+        evidence_value["external_farm"] = {
+            "manifest": external_binding["manifest"],
+            "authority": external_binding["authority"],
+        }
     evidence_value["evidence_sha256"] = hashlib.sha256(_canonical(evidence_value)).hexdigest()
     evidence_raw = _canonical(evidence_value) + b"\n"
     _write_new(target / "evidence.json", evidence_raw)
@@ -2399,6 +2649,11 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                           "evidence": {"results_sha256": hashlib.sha256(summary_raw).hexdigest(),
                                        "evidence_manifest_sha256": evidence_manifest_sha,
                                        "binary_sha256": binaries, "evidence_sha256": evidence_value["evidence_sha256"]}}
+        if external_binding is not None:
+            manifest_value["external_farm"] = {
+                "manifest": external_binding["manifest"],
+                "authority": external_binding["authority"],
+            }
         if calibration_metadata is not None:
             manifest_value.update(calibration_metadata)
         manifest_raw = _canonical(manifest_value) + b"\n"
@@ -2471,6 +2726,11 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                   "suite": suite, "relationship_count": RELATIONSHIP_COUNT[suite],
                   "slots_per_f": SLOTS_PER_F[suite],
                   "assignment_witness": "product-evidence/assignment-witness.json"}
+    if external_binding is not None:
+        experiment["external_farm"] = {
+            "manifest": external_binding["manifest"],
+            "authority": external_binding["authority"],
+        }
     _write_new(target / "experiment_manifest.json", _canonical(experiment) + b"\n")
     # The lifecycle temporary tree is diagnostic state on failure, but must
     # not survive a fully authenticated successful retention.
