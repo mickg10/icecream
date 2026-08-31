@@ -341,9 +341,7 @@ def _validate_timing_placement(value: object, label: str, *, execution_scope: ob
                                required: bool = False) -> None:
     """Require external-farm placement for any calibration timing input."""
     if execution_scope != "external_farm_timing":
-        if required:
-            raise CalibrationError(f"{label}:execution_scope_not_timing_eligible")
-        return
+        raise CalibrationError(f"{label}:execution_scope_not_timing_eligible")
     if value is None:
         if required:
             raise CalibrationError(f"{label}:role_placement_missing")
