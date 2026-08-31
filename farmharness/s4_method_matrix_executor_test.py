@@ -79,6 +79,8 @@ class S4MethodMatrixExecutorTest(unittest.TestCase):
             self.assertEqual(raw["status"], "STAGED")
             self.assertTrue(raw["executable"])
             self.assertEqual(raw["harness_profile"], "ZSTD_TU")
+            self.assertEqual(raw["transfer_accounting"]["basis"],
+                             "framed_application_wire_bytes")
             raw_live = next(row for row in raw["commands"] if row["stage"] == "live_run")
             self.assertEqual(raw_live["argv"][raw_live["argv"].index("--profile") + 1], "ZSTD_TU")
             self.assertEqual(raw_live["argv"][raw_live["argv"].index("--product-profile") + 1], "RAW_II")

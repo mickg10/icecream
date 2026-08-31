@@ -1,10 +1,11 @@
+import json
 from pathlib import Path
 
 import pytest
 
 from s8_derived_experiment_packager import (
-    _authority_calibration_metadata, _authority_role_placement, _derived_depth_class,
-    _derived_manifest, package, PackagingError,
+    _authority, _authority_calibration_metadata, _authority_role_placement, _derived_depth_class,
+    _authority_measurement_metadata, _derived_manifest, package, PackagingError,
 )
 
 
@@ -45,6 +46,47 @@ def test_authority_requires_explicit_external_farm_placement() -> None:
     assert _authority_role_placement({"role_placement": placement}) == placement
 
 
+def test_raw_ii_cannot_enter_calibration_under_zstd_tu() -> None:
+    cell = ("fmt", "ZSTD_TU", "cold")
+    with pytest.raises(PackagingError, match="calibration_ineligible"):
+        _authority_measurement_metadata({"calibration_eligible": False}, cell)
+    with pytest.raises(PackagingError, match="measurement_method:profile_mismatch"):
+        _authority_measurement_metadata(
+            {"measurement_method": "RAW_II", "product_profile": "RAW_II"}, cell)
+
+
+@pytest.mark.parametrize("mutation, error", [
+    ({"calibration_eligible": False}, "calibration_ineligible"),
+    ({"measurement_method": "RAW_II", "product_profile": "RAW_II"},
+     "measurement_method:profile_mismatch"),
+])
+def test_authority_rejects_raw_metadata_before_packaging(tmp_path: Path,
+                                                          mutation: dict[str, object],
+                                                          error: str) -> None:
+    authority = {"cell": {"corpus": "fmt", "profile": "ZSTD_TU", "regime": "cold"},
+                 **mutation}
+    (tmp_path / "experiment_manifest.json").write_text(
+        json.dumps(authority), encoding="ascii")
+    with pytest.raises(PackagingError, match=error):
+        _authority(tmp_path, "full-1")
+
+
+def test_compressed_method_metadata_remains_packagable_and_legacy_is_compatible() -> None:
+    cell = ("fmt", "ZSTD_TU", "cold")
+    assert _authority_measurement_metadata({}, cell) == {}
+    metadata = _authority_measurement_metadata(
+        {"measurement_method": "ZSTD_TU", "product_profile": "ZSTD_TU",
+         "calibration_eligible": True,
+         "transfer_accounting": {
+             "basis": "source_stage_plus_returned_object_payload",
+             "c_to_f_frames": ["P50_SOURCE_STAGE"],
+             "f_to_c_frames": ["RETURNED_OBJECT"],
+         }}, cell)
+    assert metadata["calibration_eligible"] is True
+    assert metadata["transfer_accounting"]["basis"] == \
+        "source_stage_plus_returned_object_payload"
+
+
 def test_derived_manifest_propagates_authenticated_timing_authority() -> None:
     placement = {
         "schema": "icecream-s8-role-placement-v1", "mode": "external_farm",
@@ -59,6 +101,15 @@ def test_derived_manifest_propagates_authenticated_timing_authority() -> None:
         "path": Path("source/experiment_manifest.json"),
         "facts": {"sha256": "3" * 64, "bytes": 17},
         "plan_sha256": "4" * 64, "calibration_metadata": {},
+        "measurement_metadata": {
+            "measurement_method": "ZSTD_TU", "product_profile": "ZSTD_TU",
+            "calibration_eligible": True,
+            "transfer_accounting": {
+                "basis": "source_stage_plus_returned_object_payload",
+                "c_to_f_frames": ["P50_SOURCE_STAGE"],
+                "f_to_c_frames": ["RETURNED_OBJECT"],
+            },
+        },
         "execution_scope": "external_farm_timing", "role_placement": placement,
     }
     manifest = _derived_manifest(
@@ -67,6 +118,8 @@ def test_derived_manifest_propagates_authenticated_timing_authority() -> None:
         {"sha256": "7" * 64, "bytes": 29})
     assert manifest["execution_scope"] == "external_farm_timing"
     assert manifest["role_placement"] == placement
+    assert manifest["transfer_accounting"]["basis"] == \
+        "source_stage_plus_returned_object_payload"
 
 
 @pytest.mark.skipif(not PREDICTIVE.exists() or not (LIVE / "experiment_manifest.json").exists(),

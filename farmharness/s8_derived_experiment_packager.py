@@ -109,6 +109,54 @@ def _cell(value: object) -> tuple[str, str, str]:
     return result  # type: ignore[return-value]
 
 
+def _authority_measurement_metadata(authority: dict[str, Any],
+                                    cell: tuple[str, str, str]) -> dict[str, Any]:
+    """Reject method arms that cannot be an ordinary S8 calibration cell."""
+    result: dict[str, Any] = {}
+    if "calibration_eligible" in authority:
+        eligible = authority["calibration_eligible"]
+        if type(eligible) is not bool:
+            raise PackagingError(
+                "source_experiment_manifest.calibration_eligible:invalid")
+        if not eligible:
+            raise PackagingError(
+                "source_experiment_manifest:calibration_ineligible")
+        result["calibration_eligible"] = eligible
+
+    expected_method = cell[1]
+    if "measurement_method" in authority:
+        method = authority["measurement_method"]
+        if not isinstance(method, str) or method != expected_method:
+            raise PackagingError(
+                "source_experiment_manifest.measurement_method:profile_mismatch")
+        result["measurement_method"] = method
+
+    expected_product = "GRZ" if expected_method == "GRZ_RESIDUAL" else expected_method
+    if "product_profile" in authority:
+        product = authority["product_profile"]
+        if not isinstance(product, str) or product != expected_product:
+            raise PackagingError(
+                "source_experiment_manifest.product_profile:profile_mismatch")
+        result["product_profile"] = product
+
+    if "transfer_accounting" in authority:
+        transfer = authority["transfer_accounting"]
+        expected = ({
+            "basis": "framed_application_wire_bytes",
+            "c_to_f_frames": ["COMPILE_FILE", "FILE_CHUNK", "END"],
+            "f_to_c_frames": ["COMPILE_RESULT", "FILE_CHUNK", "END"],
+        } if expected_product == "RAW_II" else {
+            "basis": "source_stage_plus_returned_object_payload",
+            "c_to_f_frames": ["P50_SOURCE_STAGE"],
+            "f_to_c_frames": ["RETURNED_OBJECT"],
+        })
+        if transfer != expected:
+            raise PackagingError(
+                "source_experiment_manifest.transfer_accounting:profile_mismatch")
+        result["transfer_accounting"] = transfer
+    return result
+
+
 def _authority(source_dir: Path, pass_id: str) -> tuple[dict[str, Any], Path, dict[str, Any]]:
     if not PASS_ID.fullmatch(pass_id):
         raise PackagingError("pass_id:invalid")
@@ -119,6 +167,7 @@ def _authority(source_dir: Path, pass_id: str) -> tuple[dict[str, Any], Path, di
     if "status" in authority and authority.get("status") != "PASS":
         raise PackagingError("source_experiment_manifest:not_pass")
     cell = _cell(authority.get("cell"))
+    measurement_metadata = _authority_measurement_metadata(authority, cell)
     split = authority.get("split")
     if split != SPLITS[cell[0]]:
         raise PackagingError("source.split:policy_mismatch")
@@ -157,6 +206,7 @@ def _authority(source_dir: Path, pass_id: str) -> tuple[dict[str, Any], Path, di
                                  "depth": depth, "declared_count": declared_count, "runs": runs,
                                  "plan_sha256": plans[pass_id].lower(),
                                  "calibration_metadata": metadata,
+                                 "measurement_metadata": measurement_metadata,
                                  "execution_scope": authority.get("execution_scope"),
                                  "role_placement": role_placement}
 
@@ -187,7 +237,7 @@ def _derived_manifest(source: dict[str, Any], pass_id: str,
                       live_manifest: Path, live_facts: dict[str, Any],
                       records_facts: dict[str, Any]) -> dict[str, Any]:
     """Build the derived manifest from authenticated source descriptors."""
-    return {
+    result = {
         "schema": SCHEMA, "status": "PASS",
         "cell": dict(zip(("corpus", "profile", "regime"), source["cell"])),
         "split": source["split"], "topology": source["topology"],
@@ -205,6 +255,8 @@ def _derived_manifest(source: dict[str, Any], pass_id: str,
         "execution_scope": source["execution_scope"],
         "role_placement": source["role_placement"],
     }
+    result.update(source.get("measurement_metadata", {}))
+    return result
 
 
 def package(predictive_manifest: Path, source_dir: Path, pass_id: str,

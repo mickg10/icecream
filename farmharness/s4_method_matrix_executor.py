@@ -38,6 +38,20 @@ RAW_II_GAP = (
 RAW_II_HARNESS_PROFILE = "ZSTD_TU"
 
 
+def _transfer_accounting(method: str) -> dict[str, object]:
+    if method == "RAW_II":
+        return {
+            "basis": "framed_application_wire_bytes",
+            "c_to_f_frames": ["COMPILE_FILE", "FILE_CHUNK", "END"],
+            "f_to_c_frames": ["COMPILE_RESULT", "FILE_CHUNK", "END"],
+        }
+    return {
+        "basis": "source_stage_plus_returned_object_payload",
+        "c_to_f_frames": ["P50_SOURCE_STAGE"],
+        "f_to_c_frames": ["RETURNED_OBJECT"],
+    }
+
+
 def _stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
@@ -77,6 +91,7 @@ def _arm(method: str, block: dict[str, Any], root: Path, *, python: str,
         "method": method, "product_profile": product_method,
         "harness_profile": harness_profile, "state": "s50-c50-f50",
         "artifact": "P50", "artifact_version": 50,
+        "transfer_accounting": _transfer_accounting(method),
         "mode": "whole-legacy" if method == "RAW_II" else "current",
         "cache_expected": method != "RAW_II",
         "cache_disabled": method == "RAW_II",

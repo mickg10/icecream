@@ -46,6 +46,21 @@ PARALLEL_TOPOLOGY = "C1F20/40"
 TOPOLOGIES = frozenset((TOPOLOGY, PARALLEL_TOPOLOGY))
 
 
+def _transfer_accounting(product_profile: str) -> dict[str, object]:
+    """Name the byte basis without changing either live measurement path."""
+    if product_profile == RAW_II_PROFILE:
+        return {
+            "basis": "framed_application_wire_bytes",
+            "c_to_f_frames": ["COMPILE_FILE", "FILE_CHUNK", "END"],
+            "f_to_c_frames": ["COMPILE_RESULT", "FILE_CHUNK", "END"],
+        }
+    return {
+        "basis": "source_stage_plus_returned_object_payload",
+        "c_to_f_frames": ["P50_SOURCE_STAGE"],
+        "f_to_c_frames": ["RETURNED_OBJECT"],
+    }
+
+
 def _measurement_descriptor(harness_profile: str,
                             product_profile: str | None) -> tuple[str, str, bool]:
     """Keep the method arm distinct from the S8 input/profile label."""
@@ -1935,6 +1950,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     measurement_method, effective_product_profile, calibration_eligible = \
         _measurement_descriptor(profile, product_profile)
     raw_ii = effective_product_profile == RAW_II_PROFILE
+    transfer_accounting = _transfer_accounting(effective_product_profile)
     if returncode != 0 or "PASS: all-P50 C1F1" not in stdout:
         _fail("product_run:did_not_pass")
     if execution_environment not in {"host_product_build", "pinned_container_product_build"}:
@@ -2167,6 +2183,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                      "measurement_method": measurement_method,
                      "product_profile": effective_product_profile,
                      "calibration_eligible": calibration_eligible,
+                     "transfer_accounting": transfer_accounting,
                      "live_status": "PASS", "acceptance_status": "PASS",
                      "conformance_status": "PASS", "binary_sha256": binaries,
                      "measured": {"input_sha256": input_sha}}
@@ -2272,6 +2289,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                       "measurement_method": measurement_method,
                       "product_profile": effective_product_profile,
                       "calibration_eligible": calibration_eligible,
+                      "transfer_accounting": transfer_accounting,
                       "source_commit": commit, "source_tree": tree,
                       "input_manifest_sha256": batch_manifest_sha, "input_digest": input_sha,
                       "topology_sha256": topology_sha,
@@ -2368,6 +2386,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                   "measurement_method": measurement_method,
                   "product_profile": effective_product_profile,
                   "calibration_eligible": calibration_eligible,
+                  "transfer_accounting": transfer_accounting,
                   "split": split, "topology": suite, "depth": depth,
                   "declared_count": expected_count, "runs": ["full-1"] + (["full-2"] if passes == 2 else []),
                   "same_service_state": True, "input_manifest_sha256": batch_manifest_sha,
