@@ -113,6 +113,16 @@ def test_cleanup_does_not_replace_primary_error_and_handles_container_owned_file
     assert source.index("failure-diagnostics") < source.index("cleanup_paths =")
 
 
+def test_external_c_has_visible_unix_peer_pid_and_teardown_stops_scheduler_last() -> None:
+    source = Path(executor.__file__).read_text(encoding="utf-8")
+    assert source.count("-c --pid=host --network host --user 0") == 2
+    targets = source[source.index("targets = [(\"q3\""):
+                     source.index("cleanup = '''set -eu")]
+    assert targets.index("reset-worker.pid") < targets.index("c.container-id")
+    assert targets.index("c.container-id") < targets.index("worker_work(i)")
+    assert targets.index("worker_work(i)") < targets.index("scheduler.container-id")
+
+
 def test_preflight_and_authority_capture_hash_identical_nic_rows() -> None:
     executor_source = Path(executor.__file__).read_text(encoding="utf-8")
     authority_source = (Path(executor.__file__).with_name(

@@ -835,7 +835,7 @@ PY
                             f"{' '.join(shlex.quote(arg) for arg in c_args)}")
             client_daemon = (f"set -eu; root={shlex.quote(root_mount)}; image={shlex.quote(self.authority['hosts']['q3']['image'].get('reference', ''))}; test \"$(docker image inspect --format '{{{{.Id}}}}' \"$image\")\" = {self.authority['hosts']['q3']['image']['image_id']}; mkdir -p {client_work}/envs {client_work}/cache-runtime-c; "
                              f"chmod 1777 {client_work}/envs; chmod 700 {client_work}/cache-runtime-c; "
-                             f"docker run -d --name {token}-c --network host --user 0 {profile_flag} -e ICECC_TEST_SOCKET=/probe/work/client.sock -e ICECC_P50_C_ACTION_TRACE=/probe/work/s7-warm-c-action-trace.jsonl -e ICECC_P50_C_LEGACY_WIRE_TRACE=/probe/work/s7-measured-c-legacy-wire-trace.jsonl -e ICECC_P50_TEST_READY_TRACE=/probe/work/ready-c.trace {docker_mounts} -v {client_work}:/probe/work:rw --entrypoint /bin/sh $image -c {shlex.quote(client_inner)} "
+                             f"docker run -d --name {token}-c --pid=host --network host --user 0 {profile_flag} -e ICECC_TEST_SOCKET=/probe/work/client.sock -e ICECC_P50_C_ACTION_TRACE=/probe/work/s7-warm-c-action-trace.jsonl -e ICECC_P50_C_LEGACY_WIRE_TRACE=/probe/work/s7-measured-c-legacy-wire-trace.jsonl -e ICECC_P50_TEST_READY_TRACE=/probe/work/ready-c.trace {docker_mounts} -v {client_work}:/probe/work:rw --entrypoint /bin/sh $image -c {shlex.quote(client_inner)} "
                              f">{client_work}/c.stdout 2>&1; test \"$(docker inspect --format '{{{{.State.Running}}}}' {token}-c)\" = true; docker inspect --format '{{{{.Id}}}}' {token}-c > {client_work}/c.container-id; docker inspect --format '{{{{.State.Pid}}}}' {token}-c > {client_work}/c.pid; "
                              f"printf 'S8_CONTAINER_ID=%s\\n' \"$(cat {client_work}/c.container-id)\"")
             self.run("q3", f"mkdir -p {client_work}; : >{client_work}/s7-prewarm-c-action-trace.jsonl; : >{client_work}/s7-prewarm-f-action-trace.jsonl")
@@ -850,7 +850,7 @@ PY
                            f"if test -f {client_work}/s7-warm-c-action-trace.jsonl; then mv {client_work}/s7-warm-c-action-trace.jsonl {client_work}/setup-c-action-trace.jsonl; fi; : >{client_work}/s7-warm-c-action-trace.jsonl; : >{client_work}/s7-measured-c-legacy-wire-trace.jsonl",
                            f"rm -rf {client_work}/cache-runtime-c; mkdir -p {client_work}/cache-runtime-c",
                            f"chmod 1777 {client_work}/envs; chmod 700 {client_work}/cache-runtime-c; "
-                           f"test \"$(docker image inspect --format '{{{{.Id}}}}' {q3_image})\" = {self.authority['hosts']['q3']['image']['image_id']}; docker run -d --name {token}-c --network host --user 0 {profile_flag} -e ICECC_TEST_SOCKET=/probe/work/client.sock -e ICECC_P50_C_ACTION_TRACE=/probe/work/s7-warm-c-action-trace.jsonl -e ICECC_P50_C_LEGACY_WIRE_TRACE=/probe/work/s7-measured-c-legacy-wire-trace.jsonl -e ICECC_P50_TEST_READY_TRACE=/probe/work/ready-c.trace {docker_mounts} -v {client_work}:/probe/work:rw --entrypoint /bin/sh {q3_image} -c {shlex.quote(reset_c_inner)} >{client_work}/c.stdout 2>&1",
+                           f"test \"$(docker image inspect --format '{{{{.Id}}}}' {q3_image})\" = {self.authority['hosts']['q3']['image']['image_id']}; docker run -d --name {token}-c --pid=host --network host --user 0 {profile_flag} -e ICECC_TEST_SOCKET=/probe/work/client.sock -e ICECC_P50_C_ACTION_TRACE=/probe/work/s7-warm-c-action-trace.jsonl -e ICECC_P50_C_LEGACY_WIRE_TRACE=/probe/work/s7-measured-c-legacy-wire-trace.jsonl -e ICECC_P50_TEST_READY_TRACE=/probe/work/ready-c.trace {docker_mounts} -v {client_work}:/probe/work:rw --entrypoint /bin/sh {q3_image} -c {shlex.quote(reset_c_inner)} >{client_work}/c.stdout 2>&1",
                            f"docker inspect --format '{{{{.State.Running}}}}' {token}-c | grep -Fx true; for _ in $(seq 1 300); do grep -q '^READY v2 ' {client_work}/ready-c.trace && break; sleep 0.1; done; grep -q '^READY v2 ' {client_work}/ready-c.trace; docker inspect --format '{{{{.Id}}}}' {token}-c > {client_work}/c.container-id; cp {client_work}/c.container-id {client_work}/c-rotation-after-id; docker inspect --format '{{{{.State.Pid}}}}' {token}-c > {client_work}/c.pid; cat {client_work}/ready-c-before.trace {client_work}/ready-c.trace > {client_work}/ready-c-combined.trace; mv {client_work}/ready-c-combined.trace {client_work}/ready-c.trace",
                            f"before_ready=$(grep '^READY v2 ' {client_work}/ready-c-before.trace | tail -1); after_ready=$(grep '^READY v2 ' {client_work}/ready-c.trace | tail -1); field() {{ printf '%s\\n' \"$1\" | awk -v key=\"$2\" '{{for(i=1;i<=NF;i++){{split($i,a,\"=\"); if(a[1]==key){{print a[2]; exit}}}}}}'; }}; before_pid=$(field \"$before_ready\" pid); after_pid=$(field \"$after_ready\" pid); test -n \"$before_pid\" -a -n \"$after_pid\"; printf 'S8_SIDECAR_ROTATION role=C relationship=0 before_pid=%s after_pid=%s before_c_store_guid=%s after_c_store_guid=%s before_f_store_guid=%s after_f_store_guid=%s\\n' \"$before_pid\" \"$after_pid\" \"$(field \"$before_ready\" C_STORE_GUID)\" \"$(field \"$after_ready\" C_STORE_GUID)\" \"$(field \"$before_ready\" F_STORE_GUID)\" \"$(field \"$after_ready\" F_STORE_GUID)\" >{client_work}/external-rotation-evidence"]
             reset_lines.extend([f"for _ in $(seq 1 600); do test -f {client_work}/external-f-reset.ready && break; sleep 0.2; done",
@@ -1185,12 +1185,15 @@ PY'''
             # Address only exact IDs recorded in this invocation's evidence
             # roots.  A cleanup transport failure must not replace a batch
             # result or match an unrelated process.
-            targets = [("q3", f"{client_work}/scheduler.container-id"),
-                       ("q3", f"{client_work}/c.container-id"),
-                       ("q3", f"{client_work}/reset-worker.pid"),
-                       ("q3", f"{client_work}/collect-worker.pid")]
+            # Stop helper loops and data-plane roles before S.  Killing S
+            # first makes every still-live daemon enter its reconnect path
+            # and can burn a core while cleanup works through the list.
+            targets = [("q3", f"{client_work}/reset-worker.pid"),
+                       ("q3", f"{client_work}/collect-worker.pid"),
+                       ("q3", f"{client_work}/c.container-id")]
             targets.extend((host, f"{worker_work(i)}/container-id")
                            for i, (host, _service) in enumerate(services))
+            targets.append(("q3", f"{client_work}/scheduler.container-id"))
             cleanup = '''set -eu
 path=$1
 test -f "$path" || exit 0
