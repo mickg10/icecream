@@ -120,7 +120,12 @@ def check_parent(source: str) -> None:
             "p50_completion_reader->pump()",
             "P50CompletionPumpResult::Pending",
             "return true;",
-            "unregister_child(client->child_pid)")
+            "complete_child_registration(client->child_pid)")
+    child_completion = section(source, "static void complete_child_registration(",
+                               "/* The exact quiescence barrier")
+    require("waitpid(pid, &status, WNOHANG)" in child_completion and
+            "ChildRecord::COMPLETION_OBSERVED" in child_completion,
+            "normal completion does not retain the child for exact reaping")
     require("!p50_input &&\n        read(client->pipe_from_child" in flow,
             "legacy parent read is not isolated from the P50 record")
     require("p50_observation.valid()" in flow,

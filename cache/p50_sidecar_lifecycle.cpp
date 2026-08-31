@@ -1067,6 +1067,11 @@ LifecycleActionResult SidecarLifecycle::advance(
         if (accept_ready(observation)) {
             current_ready_lease_ = observation.ready_lease;
             state_ = LifecycleState::Ready;
+            // Launch/exec/READY deadlines govern only startup.  Leaving the
+            // READY deadline armed makes the daemon's outer poll timeout stay
+            // at zero after it expires, burning one core for the lifetime of
+            // an otherwise idle relationship.
+            deadline_ = {};
             return result(LifecycleAction::PublishReady);
         }
         if (observation.ready == ReadyObservation::Complete) {

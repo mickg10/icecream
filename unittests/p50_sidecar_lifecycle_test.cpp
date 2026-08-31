@@ -190,6 +190,8 @@ void move_to_ready(SidecarLifecycle& lifecycle, pid_t pid,
     ready.ready = ReadyObservation::Complete;
     ready.store_generation = identity.store_generation;
     ready.ready_lease = ready_for(identity, pid);
+    ready.observed_device = ready.ready_lease->listener_device;
+    ready.observed_inode = ready.ready_lease->listener_inode;
     (void)lifecycle.advance(now, ready);
 }
 
@@ -238,6 +240,8 @@ void test_lifecycle() {
     complete.ready = ReadyObservation::Complete;
     complete.store_generation = first.store_generation;
     complete.ready_lease = ready_for(first, 321);
+    complete.observed_device = complete.ready_lease->listener_device;
+    complete.observed_inode = complete.ready_lease->listener_inode;
     SidecarLifecycle rejected(config);
     const auto rejected_launch = rejected.begin(t0);
     LifecycleObservation rejected_fork = forked(323);
@@ -253,6 +257,8 @@ void test_lifecycle() {
               lifecycle.state() == LifecycleState::Ready &&
               lifecycle.current_ready_lease().has_value(),
           "complete READY publishes the current lease");
+    CHECK(lifecycle.next_deadline() == std::chrono::steady_clock::time_point{},
+          "complete READY disarms the startup deadline");
     const dev_t first_device = complete.ready_lease->listener_device;
     const ino_t first_inode = complete.ready_lease->listener_inode;
 

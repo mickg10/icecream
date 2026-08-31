@@ -5465,7 +5465,7 @@ struct ChildRecord {
     enum Kind { COMPILER, ENV_INSTALL, STATE_WRITER, OTHER } kind;
     uint64_t session_generation;
     unsigned int owning_client_id;
-    enum State { RUNNING, TERM_SENT, KILL_SENT, REAPED } state;
+    enum State { RUNNING, COMPLETION_OBSERVED, TERM_SENT, KILL_SENT, REAPED } state;
 };
 static std::map<pid_t, ChildRecord> child_registry;
 static bool child_ownership_failed = false;
@@ -5486,6 +5486,28 @@ static void register_child(pid_t pid, pid_t pgid, ChildRecord::Kind kind,
 static void unregister_child(pid_t pid)
 {
     child_registry.erase(pid);
+}
+
+/* A result/EOF can become readable just before the worker exits.  Keep the
+   exact PID registered until its wait status is consumed; erasing it first
+   leaves an unreapable zombie because anonymous waitpid is intentionally not
+   used beside the sidecar's exact reaper. */
+static void complete_child_registration(pid_t pid)
+{
+    auto record = child_registry.find(pid);
+    if (record == child_registry.end())
+        return;
+    if (record->second.state == ChildRecord::REAPED) {
+        child_registry.erase(record);
+        return;
+    }
+    int status = 0;
+    const pid_t result = waitpid(pid, &status, WNOHANG);
+    if (result == pid || (result < 0 && errno == ECHILD)) {
+        child_registry.erase(record);
+        return;
+    }
+    record->second.state = ChildRecord::COMPLETION_OBSERVED;
 }
 
 /* The exact quiescence barrier for one lost scheduler session:
@@ -6822,7 +6844,7 @@ bool Daemon::handle_env_install_child_done(Client *client)
     }
     log_info() << "handle_env_install_child_done PID " << client->child_pid << " for " << client->outfile
         << " status: " << ( success ? "success" : "failed" ) << endl;
-    unregister_child(client->child_pid);
+    complete_child_registration(client->child_pid);
     client->child_pid = -1;
     assert(current_kids > 0);
     current_kids--;
@@ -7572,7 +7594,7 @@ bool Daemon::handle_compile_done(Client *client)
                                      client->job->assignmentNonce(), client->job->cGuid(),
                                      client->job->tuSeq());
     assert(msg);
-    unregister_child(client->child_pid);
+    complete_child_registration(client->child_pid);
     assert(current_kids > 0);
     current_kids--;
 
@@ -9352,11 +9374,24 @@ void Daemon::answer_client_requests()
             std::advance(iterator, static_cast<long>(child_reap_cursor));
             const pid_t registered_pid = iterator->first;
             int status = 0;
+            const bool lifecycle_complete =
+                iterator->second.state == ChildRecord::COMPLETION_OBSERVED;
             const pid_t result = waitpid(registered_pid, &status, WNOHANG);
-            if (result == registered_pid)
-                iterator->second.state = ChildRecord::REAPED;
-            if (!child_registry.empty())
-                child_reap_cursor = (child_reap_cursor + 1) % child_registry.size();
+            bool erased = false;
+            if (result == registered_pid ||
+                (result < 0 && errno == ECHILD && lifecycle_complete)) {
+                if (lifecycle_complete) {
+                    child_registry.erase(iterator);
+                    erased = true;
+                } else {
+                    iterator->second.state = ChildRecord::REAPED;
+                }
+            }
+            if (!child_registry.empty()) {
+                child_reap_cursor = erased
+                    ? child_reap_cursor % child_registry.size()
+                    : (child_reap_cursor + 1) % child_registry.size();
+            }
         }
     }
 
