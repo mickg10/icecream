@@ -484,6 +484,35 @@ def _copy_remote_tree(host: str, remote: str, destination: Path, timeout: float)
                                 (source_error + sink_error)[-300:].decode(errors="replace"))
 
 
+def _copy_remote_tree_as_root(host: str, remote: str, destination: Path,
+                              image: str, timeout: float) -> None:
+    """Retain a failed role tree even when its daemon-owned files are 0700."""
+    pattern = (r"/tmp/(?:s4-p50-fourhost-[a-z0-9-]+|"
+               r"p50compilee2e\.external)\.[A-Za-z0-9]+")
+    if not re.fullmatch(pattern, remote):
+        raise ExternalFarmError("evidence:unexpected_remote_workdir")
+    if destination.exists() or destination.is_symlink():
+        raise ExternalFarmError("evidence:destination_already_exists")
+    destination.mkdir(parents=True, exist_ok=False)
+    source = subprocess.Popen(
+        [*s4.ssh_argv(host), "docker", "run", "--rm", "--network", "none",
+         "--user", "0", "-v", f"{remote}:/probe/evidence:ro",
+         "--entrypoint", "/bin/sh", image, "-c",
+         "tar --exclude='*.sock' -C /probe/evidence -cf - ."],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert source.stdout is not None
+    sink = subprocess.Popen(["tar", "-C", str(destination), "-xf", "-"],
+                            stdin=source.stdout, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+    source.stdout.close()
+    _, sink_error = sink.communicate(timeout=timeout)
+    source_error = source.stderr.read() if source.stderr else b""
+    source_rc = source.wait(timeout=30)
+    if source_rc != 0 or sink.returncode != 0:
+        raise ExternalFarmError("evidence:failed_remote_tree_copy_failed:" +
+                                (source_error + sink_error)[-300:].decode(errors="replace"))
+
+
 def _finish_cleanup(cleanup_errors: Sequence[str], primary_error: BaseException | None) -> None:
     if not cleanup_errors:
         return
@@ -1181,6 +1210,34 @@ kill "$pid" 2>/dev/null || true
                         self.run(host, cleanup, [path])
                 except ExternalFarmError as exc:
                     cleanup_errors.append(f"{host}:{path}:{exc}")
+            if primary_error is not None:
+                retained_failure: list[str] = []
+                failure_copy_errors: list[str] = []
+                failure_trees = [("q3", client_work, "q3-workdir")]
+                failure_trees.extend(
+                    (host, worker_work(i), f"f-{i}-workdir")
+                    for i, (host, _service) in enumerate(services))
+                for host, remote, name in failure_trees:
+                    destination = output / "failure-diagnostics" / name
+                    try:
+                        _copy_remote_tree_as_root(
+                            host, remote, destination,
+                            str(self.authority["hosts"][host]["image"]["reference"]),
+                            self.timeout)
+                        retained_failure.append(str(destination.relative_to(output)))
+                    except ExternalFarmError as exc:
+                        failure_copy_errors.append(f"{host}:{remote}:{exc}")
+                failure_record = {
+                    "schema": "icecream-s8-external-farm-failure-v1",
+                    "status": "FAIL",
+                    "error_type": type(primary_error).__name__,
+                    "error": str(primary_error),
+                    "retained_diagnostics": retained_failure,
+                    "diagnostic_copy_errors": failure_copy_errors,
+                }
+                (output / "failure.json").write_text(
+                    json.dumps(failure_record, sort_keys=True, separators=(",", ":")) + "\n",
+                    encoding="utf-8")
             cleanup_paths = [("q3", client_work),
                              *[(host, worker_work(i)) for i, (host, _service) in enumerate(services)],
                              *[(host, f"/tmp/{token}-tanksmall")

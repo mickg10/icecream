@@ -108,6 +108,9 @@ def test_cleanup_does_not_replace_primary_error_and_handles_container_owned_file
     source = Path(executor.__file__).read_text(encoding="utf-8")
     assert "docker run --rm --network none --user 0" in source
     assert "find /probe/cleanup -mindepth 1 -delete" in source
+    assert "failure-diagnostics" in source
+    assert "icecream-s8-external-farm-failure-v1" in source
+    assert source.index("failure-diagnostics") < source.index("cleanup_paths =")
 
 
 def test_preflight_and_authority_capture_hash_identical_nic_rows() -> None:
