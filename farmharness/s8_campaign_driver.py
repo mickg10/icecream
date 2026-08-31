@@ -303,7 +303,7 @@ def _process_ancestors(pid: int | None = None) -> set[int]:
 def _competing_processes() -> list[str]:
     """Find unrelated S8/build/Docker processes before a measurement."""
     excluded = _process_ancestors()
-    needles = ("s8", "p50compile", "docker", "cmake", "ninja", "make", "gcc", "clang")
+    needles = ("s8", "p50compile", "docker", "build", "cmake", "ninja", "make", "gcc", "clang")
     found: list[str] = []
     try:
         entries = list(Path("/proc").iterdir())
