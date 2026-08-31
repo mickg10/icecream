@@ -22,6 +22,7 @@ import shlex
 import stat
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -177,40 +178,51 @@ def _private_file(path: Path, label: str) -> dict[str, object]:
     return _sha(path)
 
 
-def _validate_calibration_manifest(path: Path) -> dict[str, object]:
-    """Validate a frozen calibration manifest and its bound bundle.
-
-    Held-out execution is deliberately coupled to the same immutable bundle
-    contract used by the S8 freeze tool.  The preflight module's no-follow
-    descriptor helper is used when available; the local checks retain a
-    useful error when this driver is invoked directly.
-    """
-    facts = _private_file(path, "calibration_manifest")
+def _validate_simulator_authority(path: Path, repo: Path) -> dict[str, object]:
+    """Authenticate the exact simulator build receipt for this checkout."""
+    facts = _private_file(path, "simulator_authority")
     try:
         value = json.loads(path.read_text())
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise CampaignError("calibration_manifest:invalid_json") from exc
-    if not isinstance(value, dict) or value.get("schema") not in {
-            "icecream-s8-calibration-model-manifest-v1",
-            "icecream-s8-calibration-model-manifest-v2"}:
-        raise CampaignError("calibration_manifest:schema_invalid")
-    bundle = value.get("bundle")
-    if (not isinstance(bundle, dict) or
-            set(bundle) != {"path", "sha256", "bytes"} or
-            not isinstance(bundle.get("path"), str) or
-            Path(bundle["path"]).is_absolute() or
-            any(part in ("", ".", "..") for part in Path(bundle["path"]).parts) or
-            not isinstance(bundle.get("sha256"), str) or
-            not re.fullmatch(r"[0-9a-f]{64}", bundle["sha256"].lower()) or
-            type(bundle.get("bytes")) is not int or bundle["bytes"] <= 0):
-        raise CampaignError("calibration_manifest:bundle_descriptor_invalid")
-    bundle_path = path.parent / bundle["path"]
-    bundle_facts = _private_file(bundle_path, "calibration_bundle")
-    if (bundle_facts["sha256"] != bundle["sha256"].lower() or
-            bundle_facts["bytes"] != bundle["bytes"]):
-        raise CampaignError("calibration_manifest:bundle_binding_mismatch")
-    return {"path": str(path.absolute()), "sha256": facts["sha256"],
-            "bytes": facts["bytes"], "bundle": bundle_facts}
+        raise CampaignError("simulator_authority:invalid_json") from exc
+    if (not isinstance(value, dict) or
+            set(value) != {"schema", "source", "binary", "inputs", "configuration"} or
+            value.get("schema") != "icecream-p50sim-build-v1"):
+        raise CampaignError("simulator_authority:schema_invalid")
+    current = _git_identity(repo)
+    if current.get("tracked_clean") is not True:
+        raise CampaignError("git:tracked_worktree_dirty")
+    source = value.get("source")
+    if (not isinstance(source, dict) or
+            set(source) != {"root", "head", "tree", "tracked_clean"} or
+            source.get("root") != str(repo) or source.get("head") != current["head"] or
+            source.get("tree") != current["tree"] or source.get("tracked_clean") is not True):
+        raise CampaignError("simulator_authority:source_mismatch")
+    binary = value.get("binary")
+    if (not isinstance(binary, dict) or set(binary) != {"path", "sha256", "bytes"} or
+            not isinstance(binary.get("path"), str) or not Path(binary["path"]).is_absolute()):
+        raise CampaignError("simulator_authority:binary_descriptor_invalid")
+    binary_path = Path(binary["path"])
+    observed = _private_file(binary_path, "simulator_authority_binary")
+    if (observed["path"] != str(binary_path.resolve()) or
+            observed["sha256"] != str(binary.get("sha256", "")).lower() or
+            observed["bytes"] != binary.get("bytes")):
+        raise CampaignError("simulator_authority:binary_mismatch")
+    return {"path": str(path.resolve()), "sha256": facts["sha256"],
+            "bytes": facts["bytes"], "binary": observed,
+            "source": {"head": current["head"], "tree": current["tree"]}}
+
+
+def _inspect_container_image(image: str, expected_image_id: str) -> dict[str, str]:
+    """Read the pinned image identity without changing the image store."""
+    try:
+        from . import s8_real_c1f1_live_runner as live_runner
+    except ImportError:  # direct invocation
+        import s8_real_c1f1_live_runner as live_runner
+    try:
+        return live_runner.container_image_identity(image, expected_image_id)
+    except live_runner.LiveRunnerError as exc:
+        raise CampaignError(f"live_preflight:container_image:{exc}") from exc
 
 
 def _validate_live_prerequisites(*, repo: Path, product_root: Path,
@@ -222,7 +234,7 @@ def _validate_live_prerequisites(*, repo: Path, product_root: Path,
                                  container_image_id: str | None,
                                  container_temp_root: Path | None,
                                  simulator_authority: Path | None,
-                                 calibration_manifest: Path | None,
+                                 image_inspector: Callable[[str, str], dict[str, str]] | None,
                                  corpus: str) -> dict[str, object]:
     """Fail before the first predictive command when all-mode is not runnable."""
     if not isinstance(container_image, str) or not container_image.strip():
@@ -242,9 +254,9 @@ def _validate_live_prerequisites(*, repo: Path, product_root: Path,
             _private_file(path, label)
         elif not path.is_dir():
             raise CampaignError(f"live_preflight:{label}_directory_required")
-    _private_file(matrix_audit, "simulator_authority")
-    if simulator_authority is not None:
-        _private_file(simulator_authority, "simulator_authority")
+    _private_file(matrix_audit, "matrix_audit")
+    if simulator_authority is None:
+        raise CampaignError("live_preflight:simulator_authority_required")
     if product_root.is_symlink() or not product_root.is_dir():
         raise CampaignError("live_preflight:product_root_unavailable")
     for relative in ("scheduler/icecc-scheduler", "daemon/iceccd", "client/icecc",
@@ -255,33 +267,114 @@ def _validate_live_prerequisites(*, repo: Path, product_root: Path,
     # The product itself is checked again by the pinned runner immediately
     # before launch.  Checking its Git state here closes the work-before-fail
     # gap for all-mode campaigns.
-    _git_identity(repo)
-    _git_identity(product_root)
-    if SPLITS[corpus] == "held_out_validation" and calibration_manifest is None:
-        raise CampaignError("live_preflight:heldout_requires_frozen_calibration_manifest")
-    calibration = (_validate_calibration_manifest(calibration_manifest)
-                   if calibration_manifest is not None else None)
-    return {"container_image": container_image,
-            "container_image_id": container_image_id.lower(),
+    repo_identity = _git_identity(repo)
+    product_identity = _git_identity(product_root)
+    if repo_identity.get("tracked_clean") is not True:
+        raise CampaignError("live_preflight:repo_tracked_worktree_dirty")
+    if product_identity.get("tracked_clean") is not True:
+        raise CampaignError("live_preflight:product_tracked_worktree_dirty")
+    simulator = _validate_simulator_authority(simulator_authority, repo)
+    image = (image_inspector or _inspect_container_image)(container_image,
+                                                          container_image_id.lower())
+    if (not isinstance(image, dict) or image.get("reference") != container_image or
+            image.get("image_id") != container_image_id.lower()):
+        raise CampaignError("live_preflight:container_image_identity_mismatch")
+    return {"container_image": image,
+            "simulator_authority": simulator,
             "container_temp_root": str(container_temp_root),
-            "simulator_authority": str(simulator_authority or matrix_audit),
-            "calibration_manifest": calibration}
+            "matrix_audit": str(matrix_audit)}
 
 
-def _host_is_idle() -> bool:
-    """Conservative local idle gate; callers may inject a scheduler gate."""
+def _process_ancestors(pid: int | None = None) -> set[int]:
+    result: set[int] = set()
+    current = os.getpid() if pid is None else pid
+    while current > 1 and current not in result:
+        result.add(current)
+        try:
+            status = Path(f"/proc/{current}/status").read_text()
+            parent_line = next(line for line in status.splitlines()
+                               if line.startswith("PPid:"))
+            current = int(parent_line.split()[1])
+        except (OSError, StopIteration, ValueError, IndexError):
+            break
+    return result
+
+
+def _competing_processes() -> list[str]:
+    """Find unrelated S8/build/Docker processes before a measurement."""
+    excluded = _process_ancestors()
+    needles = ("s8", "p50compile", "docker", "cmake", "ninja", "make", "gcc", "clang")
+    found: list[str] = []
     try:
-        load_1m = os.getloadavg()[0]
-        cpu_count = os.cpu_count() or 1
-    except (AttributeError, OSError):
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return ["/proc:unavailable"]
+    for entry in entries:
+        if not entry.name.isdigit() or int(entry.name) in excluded:
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        command = raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()
+        if command and any(needle in command.lower() for needle in needles):
+            found.append(f"{entry.name}:{command}")
+    return found
+
+
+def _stale_p50_containers() -> list[str]:
+    """Return stopped or running private S8 container names."""
+    try:
+        completed = subprocess.run(
+            ["docker", "container", "ls", "--all", "--filter", "name=^p50-s8-",
+             "--format", "{{.Names}}"], check=False, capture_output=True,
+            text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return ["docker:probe_failed"]
+    if completed.returncode != 0:
+        return ["docker:probe_failed"]
+    return [line.strip() for line in completed.stdout.splitlines()
+            if line.strip().startswith("p50-s8-")]
+
+
+def _proc_cpu_stat() -> tuple[int, ...]:
+    try:
+        line = next(line for line in Path("/proc/stat").read_text().splitlines()
+                    if line.startswith("cpu "))
+        fields = [int(value) for value in line.split()[1:]
+                  if value.isdigit()]
+    except (OSError, StopIteration, ValueError):
+        return ()
+    return tuple(fields[:8])
+
+
+def _host_is_idle(*, process_scanner: Callable[[], list[str]] = _competing_processes,
+                  container_scanner: Callable[[], list[str]] = _stale_p50_containers,
+                  stat_reader: Callable[[], tuple[int, ...]] = _proc_cpu_stat,
+                  sleep_fn: Callable[[float], None] = time.sleep,
+                  sample_seconds: float = 0.1) -> bool:
+    """Apply process, stale-container, and short CPU idle gates."""
+    if process_scanner() or container_scanner():
         return False
-    return load_1m < float(cpu_count)
+    first = stat_reader()
+    if len(first) < 5:
+        return False
+    sleep_fn(sample_seconds)
+    second = stat_reader()
+    if len(second) < 5:
+        return False
+    total = sum(b - a for a, b in zip(first, second))
+    if total <= 0:
+        return False
+    idle = (second[3] - first[3])
+    iowait = (second[4] - first[4])
+    return idle / total >= 0.80 and iowait / total <= 0.05
 
 
 @contextlib.contextmanager
-def _live_run_lock(root: Path):
+def _live_run_lock(temp_root: Path):
     """Own the live measurement slot for exactly one cell."""
-    lock_path = root / ".s8-live-run.lock"
+    lock_path = temp_root / ".s8-live-run.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+") as stream:
         try:
@@ -565,9 +658,9 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
                  container_image_id: str | None = None,
                  container_temp_root: Path | None = None,
                  simulator_authority: Path | None = None,
-                 calibration_manifest: Path | None = None,
                  idle_host_gate: Callable[[], bool] | None = None,
-                 oom_protection: Callable[[], None] | None = None) -> Path:
+                 oom_protection: Callable[[], None] | None = None,
+                 image_inspector: Callable[[str, str], dict[str, str]] | None = None) -> Path:
     """Run a campaign, or resume it without rewriting prior attempts."""
     if depth not in DEPTHS:
         raise CampaignError("depth:undeclared")
@@ -575,6 +668,8 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
         raise CampaignError("mode:undeclared")
     if corpus not in CORPORA:
         raise CampaignError("corpus:undeclared")
+    if mode == "all" and SPLITS[corpus] == "held_out_validation":
+        raise CampaignError("live_preflight:all_mode_is_calibration_only")
     repo = repo.absolute()
     python = python or sys.executable
     source_manifest_spec, source_root_spec = str(source_manifest), str(source_root)
@@ -586,8 +681,6 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
     container_temp_path = Path(container_temp_root).absolute() if container_temp_root else None
     simulator_authority_path = (Path(simulator_authority).absolute()
                                  if simulator_authority else None)
-    calibration_manifest_path = (Path(calibration_manifest).absolute()
-                                  if calibration_manifest else None)
     live_authority: dict[str, object] | None = None
     if mode == "all" and execute:
         live_authority = _validate_live_prerequisites(
@@ -596,7 +689,7 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
             compile_output_root=compile_output_path, container_image=container_image,
             container_image_id=container_image_id, container_temp_root=container_temp_path,
             simulator_authority=simulator_authority_path,
-            calibration_manifest=calibration_manifest_path, corpus=corpus)
+            image_inspector=image_inspector, corpus=corpus)
         (oom_protection or _verify_oom_protection)()
     config: dict[str, object] = {"corpus": corpus, "depth": depth,
         "mode": mode,
@@ -610,7 +703,6 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
         "container_image_id": container_image_id.lower() if isinstance(container_image_id, str) else None,
         "container_temp_root": str(container_temp_path) if container_temp_path else None,
         "simulator_authority": str(simulator_authority_path) if simulator_authority_path else None,
-        "calibration_manifest": str(calibration_manifest_path) if calibration_manifest_path else None,
         "dimensions": {"profiles": list(PROFILES), "regimes": list(REGIMES),
                        "topologies": list(TOPOLOGIES)}}
     if resume is None:
@@ -759,7 +851,8 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
                     if not {"batch-manifest.jsonl", "topology.json"}.issubset(prep_names):
                         raise CampaignError("live_prepare:required_artifact_missing")
                 if error is None:
-                    with _live_run_lock(campaign):
+                    assert container_temp_path is not None
+                    with _live_run_lock(container_temp_path):
                         gate = idle_host_gate or _host_is_idle
                         try:
                             idle = bool(gate())
@@ -807,6 +900,9 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
                 error = f"live:{exc}"
         if error is None:
             try:
+                live_evidence = ({key: value for key, value in result.items()
+                                  if key in {"live", "comparisons"}}
+                                 if mode == "all" and result is not None else {})
                 segments: list[dict[str, Any]] = []
                 for result_dir in result_dirs:
                     result_dir = Path(result_dir)
@@ -834,6 +930,7 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
                     result["plans"].append(plan_record)
                 if len(segments) == 1:
                     result.update(segments[0])
+                result.update(live_evidence)
             except (OSError, ValueError, IndexError, CampaignError) as exc:
                 error = f"predictive_result:{exc}"
         if error is None:
@@ -865,9 +962,9 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
         # Update summary after each cell so a killed process can resume with a
         # truthful partial view.
         _replace_json(campaign / "summary.json", _summary(campaign, records, config))
-        if interrupted:
-            # The interrupted attempt is retained as-is.  Remaining cells
-            # stay PENDING until an explicitly requested retry/resume.
+        if interrupted or (mode == "all" and error is not None):
+            # The failed/interrupted attempt is retained as-is.  Remaining
+            # cells stay PENDING until an explicitly requested retry/resume.
             break
     # Include untouched prior states when an early skip left records sparse.
     all_records = []
@@ -903,7 +1000,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--container-image-id")
     parser.add_argument("--container-temp-root", type=Path)
     parser.add_argument("--simulator-authority", type=Path)
-    parser.add_argument("--calibration-manifest", type=Path)
     parser.add_argument("--plan-only", action="store_true",
                         help="retain the full matrix and staged commands without executing predictive cells")
     parser.add_argument("--mode", choices=("predictive-only", "all"), default="predictive-only",
@@ -924,8 +1020,7 @@ def main(argv: list[str] | None = None) -> int:
                                 mode=args.mode, container_image=args.container_image,
                                 container_image_id=args.container_image_id,
                                 container_temp_root=args.container_temp_root,
-                                simulator_authority=args.simulator_authority,
-                                calibration_manifest=args.calibration_manifest)
+                                simulator_authority=args.simulator_authority)
     except CampaignError as exc:
         print(f"s8_campaign_driver: {exc}", file=sys.stderr)
         return 2
