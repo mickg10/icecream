@@ -126,12 +126,13 @@ def test_preflight_and_authority_capture_hash_identical_nic_rows() -> None:
     assert executor_hash.group(0) == authority_hash.group(0)
 
 
-def test_preflight_allows_staging_load_to_settle_without_raising_threshold() -> None:
+def test_preflight_rechecks_current_idle_after_staging() -> None:
     source = Path(executor.__file__).read_text(encoding="utf-8")
-    assert "for _ in $(seq 1 30); do" in source
-    assert 'load_ready=1' in source
-    assert 'fail load_1m "$load" "$max_load"' in source
+    assert "for _ in $(seq 1 10); do" in source
+    assert 'idle_ready=1' in source
+    assert 'fail cpu_idle_percent "$idle" "$min_idle"' in source
     assert executor.IDLE_LOAD_THRESHOLD == 0.50
+    assert executor.MIN_IDLE_PERCENT == 95.0
 
 
 def test_parallel_gate_requires_all_lanes_and_overlap() -> None:

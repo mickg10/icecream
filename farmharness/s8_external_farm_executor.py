@@ -41,6 +41,7 @@ CPU_COUNTS = {"q3": 32, "q2": 32, "research6": 20, "research7": 12}
 TOPOLOGIES = {"C1F1/100000": (1, 1), "C1F20/40": (20, 2)}
 PROFILES = ("P29", "ZSTD_TU", "ZSTD_ROUTE", "GRZ_RESIDUAL", "RAW_II")
 IDLE_LOAD_THRESHOLD = 0.50
+MIN_IDLE_PERCENT = 95.0
 
 
 class ExternalFarmError(ValueError):
@@ -679,20 +680,22 @@ class SSHTransport:
                               "if ! getent passwd icecc >/dev/null 2>&1; then useradd --system --gid icecc "
                               "--no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin icecc; fi; ")
             preflight = r'''set -eu
-root=$1; expected_cpu=$2; max_load=$3; expected_physical=$4; expected_boot=$5; shift 5
+root=$1; expected_cpu=$2; min_idle=$3; expected_physical=$4; expected_boot=$5; shift 5
 fail() { printf 'S8_PREFLIGHT_FAIL field=%s observed=%s expected=%s\n' "$1" "$2" "$3" >&2; exit 77; }
 actual_cpu=$(nproc)
 test "$actual_cpu" -eq "$expected_cpu" || fail cpu_count "$actual_cpu" "$expected_cpu"
-load_ready=0
-for _ in $(seq 1 30); do
-  load=$(cut -d' ' -f1 /proc/loadavg)
-  if awk -v load="$load" -v max="$max_load" 'BEGIN { exit !(load <= max) }'; then
-    load_ready=1
+idle_ready=0
+for _ in $(seq 1 10); do
+  before=$(awk '/^cpu / {print; exit}' /proc/stat)
+  sleep 1
+  after=$(awk '/^cpu / {print; exit}' /proc/stat)
+  idle=$(awk -v b="$before" -v a="$after" 'BEGIN {split(b,x," "); n=split(a,y," "); total=0; for(i=2;i<=n;i++) total+=y[i]-x[i]; if(total<=0) exit 1; print (100*(y[5]-x[5])/total)}')
+  if awk -v idle="$idle" -v min="$min_idle" 'BEGIN { exit !(idle >= min) }'; then
+    idle_ready=1
     break
   fi
-  sleep 1
 done
-test "$load_ready" -eq 1 || fail load_1m "$load" "$max_load"
+test "$idle_ready" -eq 1 || fail cpu_idle_percent "$idle" "$min_idle"
 machine=$(sha256sum /etc/machine-id | awk '{print $1}')
 boot=$(sha256sum /proc/sys/kernel/random/boot_id | awk '{print $1}')
 test "$boot" = "$expected_boot" || fail boot_id "$boot" "$expected_boot"
@@ -738,7 +741,7 @@ finally:
 PY
 '''
             for host in dict.fromkeys(("q3", *relationship_hosts)):
-                args = [root_mount, CPU_COUNTS[host], IDLE_LOAD_THRESHOLD,
+                args = [root_mount, CPU_COUNTS[host], MIN_IDLE_PERCENT,
                         self.authority["hosts"][host]["physical_host_digest"],
                         self.authority["hosts"][host]["boot_id_digest"]]
                 for role, expected in self.authority["hosts"][host]["binaries"].items():
