@@ -12,6 +12,8 @@ resume creates a new attempt directory and keeps every earlier attempt.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -38,6 +40,9 @@ TOPOLOGIES = ("C1F1/100000", "C1F20/40")
 TOPOLOGY_ARGS = {"C1F1/100000": "C1F1", "C1F20/40": "C1F20"}
 CAMPAIGN_STAMP = "%Y%m%dT%H%M%SZ"
 STAMP_RE = re.compile(r"^\d{8}T\d{6}Z$")
+IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+PINNED_IMAGE = "icecream/farm-node:ubuntu22-gcc11-boost174"
+OOM_SCORE_ADJ = -1000
 
 
 class CampaignError(ValueError):
@@ -160,6 +165,152 @@ def _git_identity(repo: Path) -> dict[str, object]:
     }
 
 
+def _private_file(path: Path, label: str) -> dict[str, object]:
+    """Return a stable descriptor for an authority file."""
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise CampaignError(f"{label}:unavailable") from exc
+    if (path.is_symlink() or not stat.S_ISREG(info.st_mode) or
+            info.st_nlink != 1):
+        raise CampaignError(f"{label}:not_private_regular_file")
+    return _sha(path)
+
+
+def _validate_calibration_manifest(path: Path) -> dict[str, object]:
+    """Validate a frozen calibration manifest and its bound bundle.
+
+    Held-out execution is deliberately coupled to the same immutable bundle
+    contract used by the S8 freeze tool.  The preflight module's no-follow
+    descriptor helper is used when available; the local checks retain a
+    useful error when this driver is invoked directly.
+    """
+    facts = _private_file(path, "calibration_manifest")
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise CampaignError("calibration_manifest:invalid_json") from exc
+    if not isinstance(value, dict) or value.get("schema") not in {
+            "icecream-s8-calibration-model-manifest-v1",
+            "icecream-s8-calibration-model-manifest-v2"}:
+        raise CampaignError("calibration_manifest:schema_invalid")
+    bundle = value.get("bundle")
+    if (not isinstance(bundle, dict) or
+            set(bundle) != {"path", "sha256", "bytes"} or
+            not isinstance(bundle.get("path"), str) or
+            Path(bundle["path"]).is_absolute() or
+            any(part in ("", ".", "..") for part in Path(bundle["path"]).parts) or
+            not isinstance(bundle.get("sha256"), str) or
+            not re.fullmatch(r"[0-9a-f]{64}", bundle["sha256"].lower()) or
+            type(bundle.get("bytes")) is not int or bundle["bytes"] <= 0):
+        raise CampaignError("calibration_manifest:bundle_descriptor_invalid")
+    bundle_path = path.parent / bundle["path"]
+    bundle_facts = _private_file(bundle_path, "calibration_bundle")
+    if (bundle_facts["sha256"] != bundle["sha256"].lower() or
+            bundle_facts["bytes"] != bundle["bytes"]):
+        raise CampaignError("calibration_manifest:bundle_binding_mismatch")
+    return {"path": str(path.absolute()), "sha256": facts["sha256"],
+            "bytes": facts["bytes"], "bundle": bundle_facts}
+
+
+def _validate_live_prerequisites(*, repo: Path, product_root: Path,
+                                 matrix_audit: Path,
+                                 compile_db: Path | None,
+                                 compile_source_root: Path | None,
+                                 compile_output_root: Path | None,
+                                 container_image: str | None,
+                                 container_image_id: str | None,
+                                 container_temp_root: Path | None,
+                                 simulator_authority: Path | None,
+                                 calibration_manifest: Path | None,
+                                 corpus: str) -> dict[str, object]:
+    """Fail before the first predictive command when all-mode is not runnable."""
+    if not isinstance(container_image, str) or not container_image.strip():
+        raise CampaignError("live_preflight:container_image_reference_required")
+    if (not isinstance(container_image_id, str) or
+            IMAGE_ID_RE.fullmatch(container_image_id.lower()) is None):
+        raise CampaignError("live_preflight:container_image_content_id_required")
+    for path, label in ((compile_db, "compile_db"),
+                        (compile_source_root, "compile_source_root"),
+                        (compile_output_root, "compile_output_root"),
+                        (container_temp_root, "container_temp_root")):
+        if path is None or not path.is_absolute():
+            raise CampaignError(f"live_preflight:{label}_required")
+        if path.is_symlink() or not path.exists():
+            raise CampaignError(f"live_preflight:{label}_unavailable")
+        if label == "compile_db":
+            _private_file(path, label)
+        elif not path.is_dir():
+            raise CampaignError(f"live_preflight:{label}_directory_required")
+    _private_file(matrix_audit, "simulator_authority")
+    if simulator_authority is not None:
+        _private_file(simulator_authority, "simulator_authority")
+    if product_root.is_symlink() or not product_root.is_dir():
+        raise CampaignError("live_preflight:product_root_unavailable")
+    for relative in ("scheduler/icecc-scheduler", "daemon/iceccd", "client/icecc",
+                     "cache/icecc-cache-service"):
+        executable = product_root / relative
+        if not executable.is_file() or executable.is_symlink() or not os.access(executable, os.X_OK):
+            raise CampaignError(f"live_preflight:product_binary_unavailable:{relative}")
+    # The product itself is checked again by the pinned runner immediately
+    # before launch.  Checking its Git state here closes the work-before-fail
+    # gap for all-mode campaigns.
+    _git_identity(repo)
+    _git_identity(product_root)
+    if SPLITS[corpus] == "held_out_validation" and calibration_manifest is None:
+        raise CampaignError("live_preflight:heldout_requires_frozen_calibration_manifest")
+    calibration = (_validate_calibration_manifest(calibration_manifest)
+                   if calibration_manifest is not None else None)
+    return {"container_image": container_image,
+            "container_image_id": container_image_id.lower(),
+            "container_temp_root": str(container_temp_root),
+            "simulator_authority": str(simulator_authority or matrix_audit),
+            "calibration_manifest": calibration}
+
+
+def _host_is_idle() -> bool:
+    """Conservative local idle gate; callers may inject a scheduler gate."""
+    try:
+        load_1m = os.getloadavg()[0]
+        cpu_count = os.cpu_count() or 1
+    except (AttributeError, OSError):
+        return False
+    return load_1m < float(cpu_count)
+
+
+@contextlib.contextmanager
+def _live_run_lock(root: Path):
+    """Own the live measurement slot for exactly one cell."""
+    lock_path = root / ".s8-live-run.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as stream:
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise CampaignError("live_preflight:single_live_run_owned") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def _verify_oom_protection() -> None:
+    """Require the executor itself to be protected before a live run."""
+    path = Path("/proc/self/oom_score_adj")
+    try:
+        observed = int(path.read_text().strip())
+    except (OSError, ValueError) as exc:
+        raise CampaignError("live_preflight:oom_protection_unavailable") from exc
+    if observed != OOM_SCORE_ADJ:
+        try:
+            path.write_text(str(OOM_SCORE_ADJ))
+            observed = int(path.read_text().strip())
+        except (OSError, ValueError) as exc:
+            raise CampaignError("live_preflight:oom_protection_unavailable") from exc
+    if observed != OOM_SCORE_ADJ:
+        raise CampaignError("live_preflight:oom_protection_unavailable")
+
+
 def _command_record(argv: list[str], cwd: Path, *, stage: str, executable: bool = True,
                     reason: str | None = None) -> dict[str, object]:
     value: dict[str, object] = {
@@ -178,7 +329,9 @@ def _source_commands(cell_dir: Path, cell: dict[str, str], *, depth: str,
                      engine_manifest: Path, product_root: Path, python: str,
                      campaign_stamp: str, compile_db: Path | None,
                      compile_source_root: Path | None, compile_output_root: Path | None,
-                     repo: Path) -> tuple[list[dict[str, object]], dict[str, object],
+                     repo: Path, container_image: str | None = None,
+                     container_image_id: str | None = None,
+                     container_temp_root: Path | None = None) -> tuple[list[dict[str, object]], dict[str, object],
                                           dict[str, object], list[dict[str, object]],
                                           list[Path]]:
     attempt = cell_dir / "attempt-001"
@@ -239,6 +392,12 @@ def _source_commands(cell_dir: Path, cell: dict[str, str], *, depth: str,
                  "--regime", cell["regime"], "--depth", depth, "--passes", "2" if depth == "full" else "1",
                  "--output", str(live_out), "--timestamp", campaign_stamp,
                  "--execute"]
+    if container_image is not None:
+        live_argv.extend(("--container-image", container_image))
+    if container_image_id is not None:
+        live_argv.extend(("--container-image-id", container_image_id))
+    if container_temp_root is not None:
+        live_argv.extend(("--container-temp-root", str(container_temp_root)))
     if depth == "full":
         live_argv.extend(("--repeat-predictive-plan", str(repeat_plan)))
     comparison_specs = [("comparison", result_dir / "predictive_curve_manifest.json",
@@ -255,6 +414,7 @@ def _source_commands(cell_dir: Path, cell: dict[str, str], *, depth: str,
         missing.append("compile-db")
     if compile_source_root is None:
         missing.append("compile-source-root")
+    live_executable = not missing and container_image_id is not None and container_temp_root is not None
     reason = "live inputs not configured: " + ", ".join(missing) if missing else "live execution staged by request"
     comparison_commands = []
     for stage, predictive_manifest, live_manifest, records in comparison_specs:
@@ -264,11 +424,15 @@ def _source_commands(cell_dir: Path, cell: dict[str, str], *, depth: str,
             "--live-manifest", str(live_manifest), "--out", str(records),
         ]
         comparison_commands.append(_command_record(
-            comparison_argv, repo, stage=stage, executable=False,
-            reason="requires authenticated live curve"))
+            comparison_argv, repo, stage=stage, executable=live_executable,
+            reason=None if live_executable else "requires authenticated live curve"))
     return (plan_commands, producer_command,
-            {"prepare": _command_record(prep_argv, repo, stage="live_prepare", executable=False, reason=reason),
-             "run": _command_record(live_argv, repo, stage="live_run", executable=False, reason=reason)},
+            {"prepare": _command_record(prep_argv, repo, stage="live_prepare",
+                                         executable=live_executable,
+                                         reason=None if live_executable else reason),
+             "run": _command_record(live_argv, repo, stage="live_run",
+                                     executable=live_executable,
+                                     reason=None if live_executable else reason)},
             comparison_commands, result_dirs)
 
 
@@ -362,6 +526,29 @@ def _cell_state(path: Path) -> dict[str, Any]:
     return value
 
 
+def _authenticate_comparison(path: Path) -> dict[str, object]:
+    """Require a normalizer-produced comparison record before all-mode PASS."""
+    descriptor = _private_file(path, "comparison_output")
+    try:
+        rows = [json.loads(line) for line in path.read_text().splitlines()
+                if line.strip()]
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise CampaignError("comparison_output:invalid_jsonl") from exc
+    if len(rows) != 3 or not all(isinstance(row, dict) for row in rows):
+        raise CampaignError("comparison_output:record_count_invalid")
+    if [row.get("record_type") for row in rows] != ["predictive_sim", "live", "comparison"]:
+        raise CampaignError("comparison_output:record_types_invalid")
+    comparison = rows[-1]
+    if comparison.get("schema") != "icecream-s8-predictive-live-record-v1":
+        raise CampaignError("comparison_output:schema_invalid")
+    if not isinstance(comparison.get("point_errors"), list) or not isinstance(
+            comparison.get("loss_curve"), list):
+        raise CampaignError("comparison_output:authenticated_fields_missing")
+    return {"path": str(path), "bytes": descriptor["bytes"],
+            "sha256": descriptor["sha256"], "record_type": "comparison",
+            "points": len(comparison["loss_curve"])}
+
+
 def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
                  source_manifest: str | Path, source_root: str | Path,
                  matrix_audit: Path, engine_manifest_template: str | Path,
@@ -373,7 +560,14 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
                  execute: bool = True,
                  mode: str = "predictive-only",
                  command_runner: Callable[[dict[str, object], Path, Path, Path], int] | None = None,
-                 timestamp: str | None = None) -> Path:
+                 timestamp: str | None = None,
+                 container_image: str | None = PINNED_IMAGE,
+                 container_image_id: str | None = None,
+                 container_temp_root: Path | None = None,
+                 simulator_authority: Path | None = None,
+                 calibration_manifest: Path | None = None,
+                 idle_host_gate: Callable[[], bool] | None = None,
+                 oom_protection: Callable[[], None] | None = None) -> Path:
     """Run a campaign, or resume it without rewriting prior attempts."""
     if depth not in DEPTHS:
         raise CampaignError("depth:undeclared")
@@ -389,6 +583,21 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
     compile_db_path = Path(compile_db).absolute() if compile_db else None
     compile_source_path = Path(compile_source_root).absolute() if compile_source_root else None
     compile_output_path = Path(compile_output_root).absolute() if compile_output_root else None
+    container_temp_path = Path(container_temp_root).absolute() if container_temp_root else None
+    simulator_authority_path = (Path(simulator_authority).absolute()
+                                 if simulator_authority else None)
+    calibration_manifest_path = (Path(calibration_manifest).absolute()
+                                  if calibration_manifest else None)
+    live_authority: dict[str, object] | None = None
+    if mode == "all" and execute:
+        live_authority = _validate_live_prerequisites(
+            repo=repo, product_root=product_build_root, matrix_audit=matrix_audit,
+            compile_db=compile_db_path, compile_source_root=compile_source_path,
+            compile_output_root=compile_output_path, container_image=container_image,
+            container_image_id=container_image_id, container_temp_root=container_temp_path,
+            simulator_authority=simulator_authority_path,
+            calibration_manifest=calibration_manifest_path, corpus=corpus)
+        (oom_protection or _verify_oom_protection)()
     config: dict[str, object] = {"corpus": corpus, "depth": depth,
         "mode": mode,
         "source_manifest": source_manifest_spec, "source_root": source_root_spec,
@@ -397,6 +606,11 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
         "compile_db": str(compile_db_path) if compile_db_path else None,
         "compile_source_root": str(compile_source_path) if compile_source_path else None,
         "compile_output_root": str(compile_output_path) if compile_output_path else None,
+        "container_image": container_image if mode == "all" else None,
+        "container_image_id": container_image_id.lower() if isinstance(container_image_id, str) else None,
+        "container_temp_root": str(container_temp_path) if container_temp_path else None,
+        "simulator_authority": str(simulator_authority_path) if simulator_authority_path else None,
+        "calibration_manifest": str(calibration_manifest_path) if calibration_manifest_path else None,
         "dimensions": {"profiles": list(PROFILES), "regimes": list(REGIMES),
                        "topologies": list(TOPOLOGIES)}}
     if resume is None:
@@ -406,6 +620,7 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
         metadata = {"schema": SCHEMA, "status": "IN_PROGRESS", "created_utc": requested_stamp,
                     "campaign_root": str(campaign), "git": identity, "config": config,
                     "mode": mode if execute else "plan-only", "staged_stages": ["live", "comparison"],
+                    "live_authority": live_authority,
                     "config_sha256": hashlib.sha256(canonical(config)).hexdigest(),
                     "matrix": {"corpus": corpus, "profiles": list(PROFILES),
                                "regimes": list(REGIMES), "topologies": list(TOPOLOGIES),
@@ -431,7 +646,7 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
         if old.get("status") == "PASS":
             records.append(old)
             continue
-        if old.get("status") == "FAIL" and not retry_failed:
+        if old.get("status") in {"FAIL", "INTERRUPTED"} and not retry_failed:
             records.append(old)
             continue
         if old.get("status") in {"FAIL", "STAGED", "INTERRUPTED"}:
@@ -443,7 +658,10 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
         if old.get("status") == "RUNNING":
             old.setdefault("history", []).append({"status": "RUNNING", "ended": "interrupted_on_resume"})
             old["status"] = "INTERRUPTED"
+            old["ended_utc"] = datetime.now(timezone.utc).isoformat()
             _replace_json(state_path, old)
+            records.append(old)
+            continue
         attempt_no = _attempt(cell_dir)
         attempt_dir = cell_dir / f"attempt-{attempt_no:03d}"
         attempt_dir.mkdir()
@@ -455,7 +673,10 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
             source_root=source_root, matrix_audit=matrix_audit, engine_manifest=engine_manifest,
             product_root=product_build_root, python=python, campaign_stamp=stamp,
             compile_db=compile_db_path, compile_source_root=compile_source_path,
-            compile_output_root=compile_output_path, repo=repo)
+            compile_output_root=compile_output_path, repo=repo,
+            container_image=container_image if mode == "all" else None,
+            container_image_id=container_image_id if mode == "all" else None,
+            container_temp_root=container_temp_path if mode == "all" else None)
         # _source_commands uses attempt-001 as a stable template. Rebase every
         # generated path to this attempt so retries cannot overwrite outputs.
         def rebase(value: object) -> object:
@@ -508,12 +729,82 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
         stdout, stderr = attempt_dir / "stdout.log", attempt_dir / "stderr.log"
         result: dict[str, Any] | None = None
         error: str | None = None
-        for command in plan_cmds + [producer_cmd]:
-            stage = str(command["stage"])
-            rc = runner(command, repo, stdout, stderr)
-            if rc != 0:
-                error = f"{stage}:returncode:{rc}"
-                break
+        interrupted = False
+        try:
+            for command in plan_cmds + [producer_cmd]:
+                stage = str(command["stage"])
+                rc = runner(command, repo, stdout, stderr)
+                if rc != 0:
+                    error = f"{stage}:returncode:{rc}"
+                    break
+        except KeyboardInterrupt:
+            interrupted = True
+            error = "campaign:interrupted"
+        if error is None and mode == "all":
+            # Live execution is intentionally sequential.  Preparation may
+            # produce the authenticated batch/topology handoff, but only the
+            # lock-and-gate immediately around live_run owns the measurement.
+            live_prepare = live_cmds["prepare"]
+            live_run = live_cmds["run"]
+            try:
+                for command in (live_prepare,):
+                    rc = runner(command, repo, stdout, stderr)
+                    if rc != 0:
+                        error = f"{command['stage']}:returncode:{rc}"
+                        break
+                if error is None:
+                    prep_argv = [str(item) for item in live_prepare["argv"]]  # type: ignore[index]
+                    prep_dir = Path(prep_argv[prep_argv.index("--output") + 1])
+                    prep_names = {str(item["path"]) for item in _artifact_tree(prep_dir)}
+                    if not {"batch-manifest.jsonl", "topology.json"}.issubset(prep_names):
+                        raise CampaignError("live_prepare:required_artifact_missing")
+                if error is None:
+                    with _live_run_lock(campaign):
+                        gate = idle_host_gate or _host_is_idle
+                        try:
+                            idle = bool(gate())
+                        except Exception as exc:  # a gate must fail closed
+                            raise CampaignError("live_run:idle_host_gate_failed") from exc
+                        if not idle:
+                            raise CampaignError("live_run:host_not_idle")
+                        if live_run.get("executable") is not True:
+                            raise CampaignError("live_run:command_not_executable")
+                        rc = runner(live_run, repo, stdout, stderr)
+                    if rc != 0:
+                        error = f"{live_run['stage']}:returncode:{rc}"
+                if error is None:
+                    live_argv = [str(item) for item in live_run["argv"]]  # type: ignore[index]
+                    live_out = Path(live_argv[live_argv.index("--output") + 1])
+                    target = (live_out / "icecream" / cell["topology"].replace("/", "-") /
+                              stamp / cell["profile"])
+                    live_names = {str(item["path"]) for item in _artifact_tree(target)}
+                    if "live_curve_manifest.json" not in live_names:
+                        raise CampaignError("live_run:authenticated_curve_missing")
+                    live_record = _sha(target / "live_curve_manifest.json")
+                    live_record["path"] = str((target / "live_curve_manifest.json").relative_to(campaign))
+                    if result is None:
+                        result = {}
+                    result["live"] = live_record
+                if error is None:
+                    comparisons: list[dict[str, object]] = []
+                    for command in comparison_cmd:
+                        if command.get("executable") is not True:
+                            raise CampaignError(f"{command['stage']}:command_not_executable")
+                        rc = runner(command, repo, stdout, stderr)
+                        if rc != 0:
+                            error = f"{command['stage']}:returncode:{rc}"
+                            break
+                        comparison_argv = [str(item) for item in command["argv"]]  # type: ignore[index]
+                        comparison_path = Path(comparison_argv[comparison_argv.index("--out") + 1])
+                        comparisons.append(_authenticate_comparison(comparison_path))
+                    if error is None:
+                        assert result is not None
+                        result["comparisons"] = comparisons
+            except KeyboardInterrupt:
+                interrupted = True
+                error = "campaign:interrupted"
+            except (CampaignError, OSError, ValueError) as exc:
+                error = f"live:{exc}"
         if error is None:
             try:
                 segments: list[dict[str, Any]] = []
@@ -547,6 +838,8 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
                 error = f"predictive_result:{exc}"
         if error is None:
             status.update(status="PASS", result=result)
+        elif interrupted:
+            status.update(status="INTERRUPTED", error=error)
         else:
             status.update(status="FAIL", error=error)
         status["ended_utc"] = datetime.now(timezone.utc).isoformat()
@@ -572,6 +865,10 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
         # Update summary after each cell so a killed process can resume with a
         # truthful partial view.
         _replace_json(campaign / "summary.json", _summary(campaign, records, config))
+        if interrupted:
+            # The interrupted attempt is retained as-is.  Remaining cells
+            # stay PENDING until an explicitly requested retry/resume.
+            break
     # Include untouched prior states when an early skip left records sparse.
     all_records = []
     for cell in cells(corpus):
@@ -602,10 +899,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--compile-db")
     parser.add_argument("--compile-source-root")
     parser.add_argument("--compile-output-root")
+    parser.add_argument("--container-image", default=PINNED_IMAGE)
+    parser.add_argument("--container-image-id")
+    parser.add_argument("--container-temp-root", type=Path)
+    parser.add_argument("--simulator-authority", type=Path)
+    parser.add_argument("--calibration-manifest", type=Path)
     parser.add_argument("--plan-only", action="store_true",
                         help="retain the full matrix and staged commands without executing predictive cells")
     parser.add_argument("--mode", choices=("predictive-only", "all"), default="predictive-only",
-                        help="run predictive cells now; live/comparison commands remain explicitly staged")
+                        help="run predictive cells, or execute serialized live and comparison stages")
     parser.add_argument("--repo", type=Path, default=Path.cwd())
     parser.add_argument("--python", default=sys.executable)
     args = parser.parse_args(argv)
@@ -619,7 +921,11 @@ def main(argv: list[str] | None = None) -> int:
                                 resume=args.resume, retry_failed=args.retry_failed,
                                 compile_db=args.compile_db, compile_source_root=args.compile_source_root,
                                 compile_output_root=args.compile_output_root, execute=not args.plan_only,
-                                mode=args.mode)
+                                mode=args.mode, container_image=args.container_image,
+                                container_image_id=args.container_image_id,
+                                container_temp_root=args.container_temp_root,
+                                simulator_authority=args.simulator_authority,
+                                calibration_manifest=args.calibration_manifest)
     except CampaignError as exc:
         print(f"s8_campaign_driver: {exc}", file=sys.stderr)
         return 2

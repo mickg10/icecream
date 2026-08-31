@@ -535,6 +535,7 @@ def test_container_command_uses_resolved_image_and_read_only_product_mount(
             work_parent=work_parent, required_paths=[required, product])
         assert command[:7] == ["docker", "run", "--rm", "--user", "0", "--network", "host"]
         assert command[7:9] == ["--name", runner.container_name(work_parent)]
+        assert "--oom-score-adj=-1000" in command
         assert identity["image_id"] in command
         assert identity["reference"] not in command
         assert f"{bind_root.resolve()}:{bind_root.resolve()}:ro" in command

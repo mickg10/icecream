@@ -224,3 +224,39 @@ def test_full_campaign_stages_and_retains_two_plan_bound_segments(tmp_path: Path
             "records-full-2.jsonl")
         assert len(state["result"]["plans"]) == 2
         assert all(item["artifacts"] for item in state["result"]["segments"])
+
+
+def test_all_mode_commands_are_executable_and_pin_runtime_inputs(tmp_path: Path) -> None:
+    cell = {"corpus": "DuckDB", "profile": "ZSTD_TU", "regime": "cold",
+            "topology": "C1F1/100000"}
+    values = driver._source_commands(
+        tmp_path / "cell", cell, depth="100",
+        source_manifest=tmp_path / "manifest.txt", source_root=tmp_path,
+        matrix_audit=tmp_path / "matrix.json", engine_manifest=tmp_path / "engine.json",
+        product_root=tmp_path / "product", python="python",
+        campaign_stamp="20260831T120000Z", compile_db=tmp_path / "compile.json",
+        compile_source_root=tmp_path / "source", compile_output_root=tmp_path / "out",
+        repo=tmp_path / "repo", container_image=driver.PINNED_IMAGE,
+        container_image_id="sha256:" + "a" * 64, container_temp_root=tmp_path)
+    live = values[2]
+    assert live["prepare"]["executable"] is True
+    assert live["run"]["executable"] is True
+    run_argv = [str(item) for item in live["run"]["argv"]]
+    assert run_argv[run_argv.index("--container-image") + 1] == driver.PINNED_IMAGE
+    assert run_argv[run_argv.index("--container-image-id") + 1] == "sha256:" + "a" * 64
+    assert run_argv[run_argv.index("--container-temp-root") + 1] == str(tmp_path)
+    assert values[3][0]["executable"] is True
+
+
+def test_all_mode_fails_before_campaign_creation_without_live_authority(tmp_path: Path) -> None:
+    kwargs = _kwargs(tmp_path)
+    with pytest.raises(driver.CampaignError, match="container_image_content_id_required"):
+        driver.run_campaign(**kwargs, mode="all", timestamp="20260831T120010Z")
+    assert not list((tmp_path / "experiments").glob("s8-campaign-*"))
+
+
+def test_comparison_authentication_requires_normalizer_record(tmp_path: Path) -> None:
+    output = tmp_path / "records.jsonl"
+    output.write_text("{}\n")
+    with pytest.raises(driver.CampaignError, match="record_count_invalid"):
+        driver._authenticate_comparison(output)

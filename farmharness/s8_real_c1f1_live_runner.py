@@ -802,7 +802,8 @@ def build_command(batch_manifest: Path, profile: str,
     return command
 
 
-def container_image_identity(image: str = PINNED_IMAGE) -> dict[str, str]:
+def container_image_identity(image: str = PINNED_IMAGE,
+                             expected_image_id: str | None = None) -> dict[str, str]:
     """Resolve a mutable image reference once and return its immutable identity."""
     if not isinstance(image, str) or not image:
         _fail("container_image:invalid_reference")
@@ -824,6 +825,10 @@ def container_image_identity(image: str = PINNED_IMAGE) -> dict[str, str]:
             architecture != "amd64" or operating_system != "linux" or
             not isinstance(created, str) or not created):
         _fail("container_image:identity_invalid")
+    if (expected_image_id is not None and
+            (IMAGE_ID.fullmatch(expected_image_id.lower()) is None or
+             image_id.lower() != expected_image_id.lower())):
+        _fail("container_image:content_id_mismatch")
     return {"reference": image, "image_id": image_id.lower(),
             "architecture": architecture, "os": operating_system, "created": created}
 
@@ -904,7 +909,7 @@ def build_container_command(inner: list[str], *, image_identity: dict[str, str],
                      f"chown -R {uid}:{gid} {shlex.quote(str(container_work_root))} || exit 70\n"
                      "exit \"$product_status\"\n")
     return ["docker", "run", "--rm", "--user", "0", "--network", "host",
-            "--name", container_name(work_parent),
+            "--name", container_name(work_parent), "--oom-score-adj=-1000",
             "--env", f"ICECC_TEST_DAEMON_UID={CONTAINER_DAEMON_USER}",
             "--env", f"ICECC_TEST_DAEMON_GID={CONTAINER_DAEMON_GROUP}",
             "-v", f"{bind_root}:{bind_root}:ro",
@@ -2073,10 +2078,34 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     return target
 
 
+def _protect_child_from_oom() -> None:
+    """Set and verify the runner child protection before product startup."""
+    try:
+        path = Path("/proc/self/oom_score_adj")
+        path.write_text("-1000")
+        if path.read_text().strip() != "-1000":
+            raise OSError("oom_score_adj verification failed")
+    except (OSError, UnicodeError, ValueError):
+        # os._exit is intentional: a child that cannot establish protection
+        # must not reach the measurement lifecycle.
+        os._exit(125)
+
+
+def _verify_child_oom(pid: int) -> bool:
+    try:
+        return Path(f"/proc/{pid}/oom_score_adj").read_text().strip() == "-1000"
+    except (OSError, UnicodeError, ValueError):
+        return False
+
+
 def _run_product(command: list[str], timeout: int) -> tuple[str, int]:
     """Run the shell lifecycle as one process group with signal cleanup."""
     process = subprocess.Popen(command, text=True, stdout=subprocess.PIPE,
-                               stderr=subprocess.STDOUT, start_new_session=True)
+                               stderr=subprocess.STDOUT, start_new_session=True,
+                               preexec_fn=_protect_child_from_oom)
+    if not _verify_child_oom(process.pid):
+        os.killpg(process.pid, signal.SIGKILL)
+        raise LiveRunnerError("product_run:oom_protection_unavailable")
     previous: dict[int, Any] = {}
 
     def interrupt(signum: int, _frame: object) -> None:
@@ -2133,6 +2162,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--execution-mode", choices=("pinned-container", "host"),
                         default="pinned-container")
     parser.add_argument("--container-image", default=PINNED_IMAGE)
+    parser.add_argument("--container-image-id",
+                        help="exact content ID expected for --container-image")
     parser.add_argument("--container-bind-root", type=Path,
                         default=DEFAULT_CONTAINER_BIND_ROOT)
     parser.add_argument("--container-temp-root", type=Path,
@@ -2181,7 +2212,8 @@ def main(argv: list[str] | None = None) -> int:
             run_work_parent.chmod(0o711)
             run_workdir = run_work_parent / "p50compilee2e.run"
             command_workdir = DEFAULT_REPORTED_WORKDIR
-            runtime_image = container_image_identity(args.container_image)
+            runtime_image = container_image_identity(args.container_image,
+                                                     args.container_image_id)
             execution_environment = "pinned_container_product_build"
             host_descriptor_path = run_work_parent / "host-descriptor.json"
         else:
