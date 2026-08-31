@@ -2731,7 +2731,12 @@ DaemonSidecarAdapter::outer_next_deadline() const noexcept
         (deadline == std::chrono::steady_clock::time_point{} ||
          outer_launch_deadline_ < deadline))
         deadline = outer_launch_deadline_;
-    if (outer_auth_fd_ >= 0 &&
+    // The authenticated control descriptor intentionally remains open for
+    // later operations.  Its connect/HELLO deadline applies only while the
+    // authentication state machine is active; carrying that expired deadline
+    // after phase 0 forces the daemon into poll(..., 0) forever.
+    if (outer_auth_fd_ >= 0 && outer_auth_phase_ != 0 &&
+        outer_auth_deadline_ != std::chrono::steady_clock::time_point{} &&
         (deadline == std::chrono::steady_clock::time_point{} ||
          outer_auth_deadline_ < deadline))
         deadline = outer_auth_deadline_;
@@ -2762,8 +2767,20 @@ bool DaemonSidecarAdapter::outer_immediate_turn_required() const noexcept
         lifecycle_state == sidecar::LifecycleState::RetryEligible &&
         outer_replacement_requested_ && !outer_shutdown_requested_ &&
         outer_scheduler_owner_active_;
+    const bool reducer_request_ready =
+        (outer_shutdown_requested_ || outer_replacement_requested_) &&
+        (lifecycle_state == sidecar::LifecycleState::LaunchPrepared ||
+         lifecycle_state == sidecar::LifecycleState::ForkedAwaitExecAndReady ||
+         lifecycle_state == sidecar::LifecycleState::Ready);
+    const bool signal_step_ready =
+        outer_lifecycle_ != nullptr &&
+        ((lifecycle_state == sidecar::LifecycleState::TerminatingGrace &&
+          !outer_lifecycle_->term_sent()) ||
+         (lifecycle_state == sidecar::LifecycleState::TerminatingKill &&
+          !outer_lifecycle_->kill_sent()));
     return outer_launch_phase_ != 0 || cleanup_step_ready ||
-           path_observation_ready || retry_ready ||
+           path_observation_ready || retry_ready || reducer_request_ready ||
+           signal_step_ready ||
            outer_pending_action_.has_value() || outer_reap_event_pending_ ||
            outer_shutdown_input_close_pending_ ||
            outer_replacement_input_close_pending_ ||

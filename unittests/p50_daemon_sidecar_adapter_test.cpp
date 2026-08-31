@@ -189,6 +189,10 @@ int main()
     {
         return 8;
     }
+    if (adapter.outer_next_deadline() !=
+            std::chrono::steady_clock::time_point{} ||
+        adapter.outer_immediate_turn_required())
+        return 26;
 
     const pid_t first_pid = adapter.outer_child_pid();
     const std::string first_path = adapter.socket_path();
