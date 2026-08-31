@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "icecream-s4-artifact-manifest-v1",
+  "title": "S4 immutable artifact manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "manifest_version", "planner", "matrix", "versions", "overall", "manifest_sha256"],
+  "properties": {
+    "schema": {"const": "icecream-s4-artifact-manifest-v1"},
+    "manifest_version": {"const": 1},
+    "planner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_metadata_commit", "runtime_source_commit", "runtime_authority"],
+      "properties": {
+        "source_metadata_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "runtime_source_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "runtime_authority": {"const": "product-runtime"}
+      }
+    },
+    "matrix": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state_count", "transition_count", "state_space"],
+      "properties": {
+        "state_count": {"const": 27},
+        "transition_count": {"const": 729},
+        "state_space": {"const": "{43,44,50}^3"}
+      }
+    },
+    "versions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["43", "44", "50"],
+      "properties": {
+        "43": {"$ref": "#/$defs/version"},
+        "44": {"$ref": "#/$defs/version"},
+        "50": {"$ref": "#/$defs/version"}
+      }
+    },
+    "overall": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "required_versions"],
+      "properties": {
+        "status": {"enum": ["READY", "NOT_READY"]},
+        "required_versions": {"const": [43, 44, 50]}
+      }
+    },
+    "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "version": {
+      "type": "object",
+      "required": ["status", "version", "label", "role_completeness", "roles", "errors"],
+      "properties": {
+        "status": {"enum": ["BOUND", "NOT_BOUND"]},
+        "version": {"enum": [43, 44, 50]},
+        "label": {"type": "string", "pattern": "^P(43|44|50)$"},
+        "artifact_root": {"type": ["string", "null"]},
+        "source": {"type": "object"},
+        "build": {"type": "object"},
+        "protocol_assertion": {"type": ["object", "null"]},
+        "role_completeness": {"type": "object"},
+        "roles": {"type": "object"},
+        "errors": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "schema": "icecream-s4-build-receipt-v1",
+  "version": 44,
+  "label": "P44",
+  "artifact_root": "/private/absolute/path/to/p44-build-root",
+  "source": {
+    "commit": "8c8cb881f8f5f8b7c10a608885f1b66e8e6ee7d3",
+    "tree": "RECORD_EXACT_40_HEX_SOURCE_TREE",
+    "repository": "/private/absolute/path/to/p44-source-checkout"
+  },
+  "build": {
+    "source_commit": "8c8cb881f8f5f8b7c10a608885f1b66e8e6ee7d3",
+    "source_tree": "RECORD_EXACT_40_HEX_SOURCE_TREE",
+    "authority": "release-build",
+    "receipt_id": "RECORD_UNIQUE_RECEIPT_ID",
+    "command": "RECORD_EXACT_NONEXECUTED_BUILD_COMMAND_AND_OPTIONS"
+  },
+  "protocol_assertion": {
+    "path": "services/comm.h",
+    "text": "#define PROTOCOL_VERSION 44",
+    "version": 44
+  },
+  "roles": {
+    "S": {"path": "scheduler/icecc-scheduler", "bytes": 0, "sha256": "RECORD_64_HEX"},
+    "C": {"path": "client/icecc", "bytes": 0, "sha256": "RECORD_64_HEX"},
+    "F": {"path": "daemon/iceccd", "bytes": 0, "sha256": "RECORD_64_HEX"},
+    "E": {"path": "client/icecc-create-env", "bytes": 0, "sha256": "RECORD_64_HEX"}
+  }
+}

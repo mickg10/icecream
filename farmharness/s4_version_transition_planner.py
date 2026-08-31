@@ -211,6 +211,37 @@ def expected_cache_engagement(state: Sequence[int]) -> bool:
     return all_p50(state)
 
 
+def artifact_binding_contract() -> dict[str, Any]:
+    """Describe the receipt boundary used by the later S4 matrix runner.
+
+    This is metadata only.  Receipt validation and file hashing live in
+    :mod:`s4_artifact_binder`; keeping the contract here makes a serialized
+    plan self-describing without performing any binding or build work.
+    """
+    return {
+        "schema": "icecream-s4-artifact-manifest-v1",
+        "receipt_schema": "icecream-s4-build-receipt-v1",
+        "versions": [43, 44, 50],
+        "roles": {"43": ["S", "C", "F", "E"],
+                   "44": ["S", "C", "F", "E"],
+                   "50": ["S", "C", "F", "E", "X"]},
+        "state_count": 27,
+        "transition_count": 729,
+        "p43_source_commit": P43_SOURCE_SHA,
+        "p44_source_commit": P44_SOURCE_SHA,
+        # P50_SOURCE_SHA is planner metadata.  The runtime receipt must use
+        # the independent product build authority retained by real_cells.
+        "p50_planner_source_commit": P50_SOURCE_SHA,
+        "p50_runtime_source_commit": HARNESS_INVENTORY["runner_p50_build_source_sha"],
+        "p44_status_without_receipt": "NOT_BOUND",
+        "protocol_assertions": {
+            "43": "#define PROTOCOL_VERSION 43",
+            "44": P44_PROTOCOL_ASSERTION,
+            "50": "#define PROTOCOL_VERSION 50",
+        },
+    }
+
+
 def _artifact_contract(version: int) -> dict[str, Any]:
     if version == 43:
         return {
@@ -478,6 +509,7 @@ def build_plan() -> dict[str, Any]:
     return {
         "schema": SCHEMA,
         "source": {"integration_head": P50_SOURCE_SHA, "harness": HARNESS_INVENTORY},
+        "artifact_binding_contract": artifact_binding_contract(),
         "roles": list(ROLES),
         "real_artifact_versions": [
             _artifact_contract(version) for version in REAL_VERSIONS
