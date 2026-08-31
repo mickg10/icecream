@@ -25,6 +25,15 @@ PREDICTOR = {"source_commit": "1" * 40, "source_tree": "2" * 40,
              "model_id": "s8-causal-performance-v2"}
 UNITS = {"point": "step", "channel_bytes": "bytes", "elapsed_ns": "ns",
          "throughput_bytes_per_s": "bytes_per_s"}
+EXTERNAL_PLACEMENT = {
+    "schema": "icecream-s8-role-placement-v1",
+    "mode": "external_farm",
+    "c_host_digest": "d" * 64,
+    "scheduler_host_digest": "d" * 64,
+    "f_host_digests": ["e" * 64],
+    "roles_disjoint": True,
+    "timing_eligible": True,
+}
 
 
 def _triple(root: Path, cell: dict[str, str], context: str) -> tuple[str, dict[str, object]]:
@@ -51,11 +60,16 @@ def _triple(root: Path, cell: dict[str, str], context: str) -> tuple[str, dict[s
                         "record_type": kind, "cell": cell, "split": "calibration",
                         "identity": {**identity, "model_id": model_id}, **META,
                         "units": UNITS, "model_id": model_id,
+                        **({"execution_scope": "external_farm_timing",
+                            "role_placement": EXTERNAL_PLACEMENT}
+                           if kind == "live" else {}),
                         "raw_cumulative_curve": curve})
     records.append({"schema": RECORD_SCHEMA, "semantics": SEMANTICS,
                     "record_type": "comparison", "cell": cell, "split": "calibration",
                     "identity": identity, **META, "units": UNITS,
                     "model_id": PREDICTOR["model_id"], "point_errors": [], "loss_curve": []})
+    records[-1].update({"execution_scope": "external_farm_timing",
+                        "role_placement": EXTERNAL_PLACEMENT})
     raw = b"".join(canonical_bytes(record) + b"\n" for record in records)
     records_path = root / "records.jsonl"
     records_path.write_bytes(raw)
@@ -68,6 +82,8 @@ def _triple(root: Path, cell: dict[str, str], context: str) -> tuple[str, dict[s
                  "depth_class": depth, "pass_id": pass_id,
                  "runs": ["full-1", "full-2"] if depth == "repeat-full" else ["full-1"],
                  "calibration_metadata": dict(META),
+                 "execution_scope": "external_farm_timing",
+                 "role_placement": EXTERNAL_PLACEMENT,
                  "records": {"path": "records.jsonl", "sha256": hashlib.sha256(raw).hexdigest(),
                              "bytes": len(raw)}}
     (root / "experiment_manifest.json").write_bytes(canonical_bytes(authority) + b"\n")
