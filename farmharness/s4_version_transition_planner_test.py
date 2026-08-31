@@ -84,8 +84,12 @@ class S4VersionTransitionPlannerTest(unittest.TestCase):
                             item["byte_identical_required"]
                             for item in contract["measurement_cells"]))
         block = contract["measurement_cells"][0]
-        self.assertEqual([arm["method"] for arm in block["AB"]], ["RAW_II", block["method"]])
-        self.assertEqual([arm["method"] for arm in block["BA"]], [block["method"], "RAW_II"])
+        self.assertEqual(block["order"], "AB")
+        self.assertEqual([arm["method"] for arm in block["sequence"]], ["RAW_II", block["method"]])
+        self.assertNotIn("AB", block)
+        self.assertNotIn("BA", block)
+        ba_block = next(item for item in contract["measurement_cells"] if item["order"] == "BA")
+        self.assertEqual([arm["method"] for arm in ba_block["sequence"]], [ba_block["method"], "RAW_II"])
 
     def test_version_cost_blocks_are_explicit_and_cache_free(self) -> None:
         contract = self.plan["homogeneous_version_comparison_contract"]
@@ -98,14 +102,13 @@ class S4VersionTransitionPlannerTest(unittest.TestCase):
         self.assertTrue(contract["counterbalanced"])
         self.assertTrue(contract["no_cache"])
         for block in contract["blocks"]:
-            self.assertEqual(len(block["AB"]), 2)
-            self.assertEqual(len(block["BA"]), 2)
+            self.assertEqual(len(block["sequence"]), 2)
             self.assertFalse(block["cache_expected"])
             self.assertTrue(block["byte_identical_required"])
-            self.assertEqual(block["AB"][0]["method"], "WHOLE_LEGACY")
-            self.assertEqual(block["AB"][1]["method"], "RAW_II")
-            self.assertEqual(block["BA"][0]["method"], "RAW_II")
-            self.assertEqual(block["BA"][1]["method"], "WHOLE_LEGACY")
+            expected = ["WHOLE_LEGACY", "RAW_II"] if block["order"] == "AB" else ["RAW_II", "WHOLE_LEGACY"]
+            self.assertEqual([arm["method"] for arm in block["sequence"]], expected)
+            self.assertNotIn("AB", block)
+            self.assertNotIn("BA", block)
 
     def test_each_baseline_has_six_upgrade_and_downgrade_orders(self) -> None:
         self.assertEqual({key: len(value) for key, value in self.plan["upgrade_orders"].items()},
@@ -140,13 +143,16 @@ class S4VersionTransitionPlannerTest(unittest.TestCase):
             mutant = json.loads(json.dumps(self.plan))
             block = mutant["execution_measurement_contract"]["measurement_cells"][0]
             if mutation == "missing":
-                del block["BA"]
+                del block["sequence"]
             else:
-                block["AB"].reverse()
+                block["sequence"].reverse()
             self.assertEqual(audit_plan(mutant)["status"], "FAIL", mutation)
         mutant = json.loads(json.dumps(self.plan))
+        mutant["execution_measurement_contract"]["measurement_cells"][0]["AB"] = []
+        self.assertEqual(audit_plan(mutant)["status"], "FAIL")
+        mutant = json.loads(json.dumps(self.plan))
         block = mutant["homogeneous_version_comparison_contract"]["blocks"][0]
-        block["BA"].reverse()
+        block["sequence"].reverse()
         self.assertEqual(audit_plan(mutant)["status"], "FAIL")
 
     def test_cli_is_non_executing_and_emits_json(self) -> None:

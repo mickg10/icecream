@@ -335,12 +335,13 @@ def _measurement_contract() -> dict[str, Any]:
             "order": order, "counterbalanced_pair": f"{method}/{depth}/{topology['id']}/{regime}",
             "cache_expected": True, "remote_compile_required": True,
             "byte_identical_required": True,
-            # Both orderings are retained on every block so a consumer cannot
-            # accidentally turn an AB/BA label into a single-arm run.
-            "AB": [arm("RAW_II", "whole-legacy", cache_expected=False),
-                   arm(method, "current", cache_expected=True)],
-            "BA": [arm(method, "current", cache_expected=True),
-                   arm("RAW_II", "whole-legacy", cache_expected=False)],
+            # The block's order is authoritative.  Exactly one two-arm
+            # sequence is retained, avoiding an ambiguous four-arm block.
+            "sequence": ([arm("RAW_II", "whole-legacy", cache_expected=False),
+                           arm(method, "current", cache_expected=True)]
+                          if order == "AB" else
+                          [arm(method, "current", cache_expected=True),
+                           arm("RAW_II", "whole-legacy", cache_expected=False)]),
         }
         for method in P50_METHODS
         for depth in P50_DEPTHS
@@ -403,7 +404,7 @@ def _version_comparison_contract() -> dict[str, Any]:
                             "old_version": old_version, "state": f"s{old_version}-vs-s50",
                             "depth": depth, "topology": topology["id"], "regime": regime,
                             "order": order,
-                            "AB": [old, current], "BA": [current, old],
+                            "sequence": [old, current] if order == "AB" else [current, old],
                             "cache_expected": False, "p50_cache_traffic": "zero-required",
                             "byte_identical_required": True,
                         })
@@ -684,11 +685,11 @@ def audit_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
                     value.get("cache_expected"), value.get("cache_disabled"))
         raw_signature = ("P50_RAW_II", 50, "P50", "s50-c50-f50", "RAW_II", "whole-legacy", False, True)
         method_signature = (f"P50_{item.get('method')}", 50, "P50", "s50-c50-f50", item.get("method"), "current", True, False)
-        ab = item.get("AB")
-        ba = item.get("BA")
-        if (not isinstance(ab, list) or not isinstance(ba, list) or len(ab) != 2 or len(ba) != 2 or
-                tuple(arm_signature(part) for part in ab) != (raw_signature, method_signature) or
-                tuple(arm_signature(part) for part in ba) != (method_signature, raw_signature)):
+        sequence = item.get("sequence")
+        expected_sequence = (raw_signature, method_signature) if item.get("order") == "AB" else (method_signature, raw_signature)
+        if (item.get("order") not in P50_ORDERS or "AB" in item or "BA" in item or
+                not isinstance(sequence, list) or len(sequence) != 2 or
+                tuple(arm_signature(part) for part in sequence) != expected_sequence):
             errors.append(f"measurement-counterbalanced-arms:{item.get('id')}")
     if observed_measurements != expected_measurements:
         errors.append("measurement-grid-mismatch")
@@ -731,13 +732,14 @@ def audit_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
             return (value.get("name"), value.get("artifact_version"), value.get("artifact"),
                     value.get("state"), value.get("method"), value.get("mode"),
                     value.get("cache_expected"), value.get("cache_disabled"))
-        ab, ba = item.get("AB"), item.get("BA")
-        if (old not in (43, 44) or item.get("cache_expected") is not False or
+        sequence = item.get("sequence")
+        expected_sequence = (old_signature, p50_signature) if item.get("order") == "AB" else (p50_signature, old_signature)
+        if (old not in (43, 44) or item.get("order") not in P50_ORDERS or
+                item.get("cache_expected") is not False or
                 item.get("p50_cache_traffic") != "zero-required" or
                 item.get("byte_identical_required") is not True or
-                not isinstance(ab, list) or not isinstance(ba, list) or len(ab) != 2 or len(ba) != 2 or
-                tuple(vsignature(part) for part in ab) != (old_signature, p50_signature) or
-                tuple(vsignature(part) for part in ba) != (p50_signature, old_signature)):
+                "AB" in item or "BA" in item or not isinstance(sequence, list) or len(sequence) != 2 or
+                tuple(vsignature(part) for part in sequence) != expected_sequence):
             errors.append(f"version-comparison-arms:{item.get('id')}")
     if observed_version_keys != expected_version_keys:
         errors.append("version-comparison-grid-mismatch")
