@@ -317,8 +317,8 @@ boot=$(sha256sum /proc/sys/kernel/random/boot_id | awk '{print $1}')
 nic_rows=$(for p in /sys/class/net/*; do n=${p##*/}; test "$n" = lo && continue; real=$(readlink -f "$p" 2>/dev/null || true); mac=$(cat "$p/address" 2>/dev/null || true); case "$real" in */virtual/*) continue;; esac; test -n "$mac" && test "$mac" != 00:00:00:00:00:00 && printf '%s:%s:%s\n' "$n" "$mac" "$real"; done | sort)
 test -n "$nic_rows"
 nic=$(printf '%s\n' "$nic_rows" | sha256sum | awk '{print $1}')
-vendor_raw=$(awk -F: 'tolower($1)=="vendor_id" {gsub(/^ +| +$/, "", $2); print $2; exit}' /proc/cpuinfo); test -n "$vendor_raw"
-model_raw=$(awk -F: 'tolower($1)=="model name" {gsub(/^ +| +$/, "", $2); print $2; exit}' /proc/cpuinfo); test -n "$model_raw"
+vendor_raw=$(awk -F: '{key=$1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", key); if(tolower(key)=="vendor_id") {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit}}' /proc/cpuinfo); test -n "$vendor_raw"
+model_raw=$(awk -F: '{key=$1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", key); if(tolower(key)=="model name") {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit}}' /proc/cpuinfo); test -n "$model_raw"
 vendor=$(printf '%s' "$vendor_raw" | sha256sum | awk '{print $1}')
 model=$(printf '%s' "$model_raw" | sha256sum | awk '{print $1}')
 before=$(awk '/^cpu / {print; exit}' /proc/stat); started=$(date +%s%N); sleep 1; after=$(awk '/^cpu / {print; exit}' /proc/stat); ended=$(date +%s%N)

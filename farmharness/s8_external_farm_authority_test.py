@@ -112,6 +112,13 @@ def test_remote_capture_parser_retains_raw_cpu_sample() -> None:
     assert parsed["cpu_sample"]["idle_percent"] == 100.0
 
 
+def test_remote_capture_trims_cpuinfo_key_whitespace() -> None:
+    assert authority.REMOTE_CAPTURE_SCRIPT.count(
+        'key=$1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)') == 2
+    assert 'tolower(key)=="vendor_id"' in authority.REMOTE_CAPTURE_SCRIPT
+    assert 'tolower(key)=="model name"' in authority.REMOTE_CAPTURE_SCRIPT
+
+
 def test_dry_run_does_not_capture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     root = _root(tmp_path)
     monkeypatch.setattr(authority, "final_head_source_identity", lambda _root: {"commit": "a" * 40, "tree": "b" * 40})
