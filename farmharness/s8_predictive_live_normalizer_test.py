@@ -41,6 +41,24 @@ CALIBRATION_METADATA = {
     "host_digest": "4" * 64,
     "ordered_input_class": "ordered",
 }
+LOOPBACK_PLACEMENT = {
+    "schema": "icecream-s8-role-placement-v1",
+    "mode": "co_resident_loopback",
+    "c_host_digest": "4" * 64,
+    "scheduler_host_digest": "4" * 64,
+    "f_host_digests": ["4" * 64],
+    "roles_disjoint": False,
+    "timing_eligible": False,
+}
+EXTERNAL_PLACEMENT = {
+    "schema": "icecream-s8-role-placement-v1",
+    "mode": "external_farm",
+    "c_host_digest": "4" * 64,
+    "scheduler_host_digest": "5" * 64,
+    "f_host_digests": ["6" * 64],
+    "roles_disjoint": True,
+    "timing_eligible": True,
+}
 
 
 def _curve_rows(offset: int = 0) -> list[dict[str, object]]:
@@ -143,7 +161,9 @@ def test_live_calibration_authority_fills_trace_free_predictive_metadata(
         tmp_path: Path) -> None:
     predictive = _write_manifest(tmp_path, "predictive", "predictive_sim", _curve_rows())
     live = _write_manifest(tmp_path, "live", "live", _curve_rows(2),
-                           extra=CALIBRATION_METADATA)
+                           extra={**CALIBRATION_METADATA,
+                                  "execution_scope": "external_farm_timing",
+                                  "role_placement": EXTERNAL_PLACEMENT})
     with pytest.raises(NormalizationError, match="manifest_metadata_mismatch:host_digest"):
         normalize(predictive, live, tmp_path / "without-authority.jsonl")
     records = normalize(
@@ -153,10 +173,37 @@ def test_live_calibration_authority_fills_trace_free_predictive_metadata(
                CALIBRATION_METADATA for row in records)
 
 
+def test_loopback_live_is_rejected_from_calibration(tmp_path: Path) -> None:
+    predictive = _write_manifest(tmp_path, "predictive", "predictive_sim", _curve_rows())
+    live = _write_manifest(
+        tmp_path, "live", "live", _curve_rows(2),
+        extra={**CALIBRATION_METADATA, "execution_scope": "loopback_correctness_only",
+               "role_placement": LOOPBACK_PLACEMENT})
+    with pytest.raises(NormalizationError,
+                       match="role_placement:live_calibration_requires_external_farm"):
+        normalize(predictive, live, tmp_path / "out.jsonl",
+                  authenticated_metadata=CALIBRATION_METADATA)
+
+
+def test_external_farm_live_is_eligible_when_placement_is_disjoint(tmp_path: Path) -> None:
+    predictive = _write_manifest(tmp_path, "predictive", "predictive_sim", _curve_rows())
+    live = _write_manifest(
+        tmp_path, "live", "live", _curve_rows(2),
+        extra={**CALIBRATION_METADATA, "execution_scope": "external_farm_timing",
+               "role_placement": EXTERNAL_PLACEMENT})
+    records = normalize(predictive, live, tmp_path / "out.jsonl",
+                        authenticated_metadata=CALIBRATION_METADATA)
+    assert all(record["execution_scope"] == "external_farm_timing" for record in records[1:])
+    assert records[2]["role_placement"]["roles_disjoint"] is True
+
+
 def test_calibration_authority_rejects_live_metadata_mismatch(tmp_path: Path) -> None:
     predictive = _write_manifest(tmp_path, "predictive", "predictive_sim", _curve_rows())
     changed = {**CALIBRATION_METADATA, "host_digest": "5" * 64}
-    live = _write_manifest(tmp_path, "live", "live", _curve_rows(2), extra=changed)
+    live = _write_manifest(
+        tmp_path, "live", "live", _curve_rows(2),
+        extra={**changed, "execution_scope": "external_farm_timing",
+               "role_placement": EXTERNAL_PLACEMENT})
     with pytest.raises(NormalizationError, match="authority_metadata:mismatch"):
         normalize(predictive, live, tmp_path / "out.jsonl",
                   authenticated_metadata=CALIBRATION_METADATA)

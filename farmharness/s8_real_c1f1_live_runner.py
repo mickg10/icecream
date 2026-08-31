@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 import platform
@@ -58,6 +59,10 @@ DEFAULT_REPORTED_WORKDIR = DEFAULT_CONTAINER_WORK_ROOT / "p50compilee2e.run"
 CONTAINER_DAEMON_USER = "icecc"
 CONTAINER_DAEMON_GROUP = "icecc"
 SCORED_CARET_WORKAROUND = "0"
+LOOPBACK_EXECUTION_SCOPE = "loopback_correctness_only"
+EXTERNAL_FARM_EXECUTION_SCOPE = "external_farm_timing"
+EXTERNAL_FARM_SCHEMA = "icecream-s8-external-farm-v1"
+ROLE_PLACEMENT_SCHEMA = "icecream-s8-role-placement-v1"
 # Keep the runner's emitted identity aligned with the current intake schema.
 CALIBRATION_METADATA_FIELDS = frozenset(normalizer.CALIBRATION_METADATA_KEYS)
 HOST_DESCRIPTOR_SCHEMA = "icecream-s8-measurement-host-descriptor-v1"
@@ -100,6 +105,122 @@ def _hex(value: object, label: str) -> str:
     if not isinstance(value, str) or HEX64.fullmatch(value) is None or int(value, 16) == 0:
         _fail(f"{label}:invalid_digest")
     return value.lower()
+
+
+def _external_scheduler_host(value: object) -> str:
+    """Accept a routable scheduler name, never an accidental local endpoint."""
+    if not isinstance(value, str) or not value or any(char.isspace() for char in value):
+        _fail("external_farm.scheduler.host:invalid")
+    if value.lower() in {"localhost", "localhost.localdomain"}:
+        _fail("external_farm.scheduler.host:loopback")
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        address = None
+    if address is not None and (address.is_loopback or address.is_unspecified or
+                                address.is_multicast or address.is_link_local):
+        _fail("external_farm.scheduler.host:loopback")
+    return value
+
+
+def load_external_farm_manifest(path: Path, expected_sha256: str,
+                                suite: str) -> tuple[dict[str, object], str, int]:
+    """Load an authenticated C/F placement and scheduler authority.
+
+    This is intentionally a manifest-only boundary.  The current product
+    shell starts a co-resident scheduler/F farm and therefore cannot consume
+    this authority yet; accepting the manifest here makes that missing launch
+    input explicit instead of allowing local elapsed time into calibration.
+    """
+    if (not path.is_absolute() or path.is_symlink() or not path.is_file() or
+            path.stat().st_nlink != 1):
+        _fail("external_farm.manifest:unavailable")
+    expected = _hex(expected_sha256, "external_farm.manifest_sha256")
+    digest, size = _sha(path)
+    if digest != expected:
+        _fail("external_farm.manifest:sha256_mismatch")
+    try:
+        value = normalizer.parse_json(path.read_bytes(), "external_farm.manifest")
+    except (normalizer.NormalizationError, OSError) as exc:
+        raise LiveRunnerError("external_farm.manifest:invalid_json") from exc
+    if not isinstance(value, dict) or set(value) != {
+            "schema", "suite", "scheduler", "client", "workers", "role_placement"}:
+        _fail("external_farm.manifest:fields_invalid")
+    if value.get("schema") != EXTERNAL_FARM_SCHEMA or value.get("suite") != suite:
+        _fail("external_farm.manifest:identity_invalid")
+    scheduler = value.get("scheduler")
+    if (not isinstance(scheduler, dict) or set(scheduler) != {"host", "port"}):
+        _fail("external_farm.scheduler:fields_invalid")
+    host = _external_scheduler_host(scheduler.get("host"))
+    port = scheduler.get("port")
+    if type(port) is not int or not 1 <= port <= 65535:
+        _fail("external_farm.scheduler.port:invalid")
+    client = value.get("client")
+    if not isinstance(client, dict) or set(client) != {"host_digest"}:
+        _fail("external_farm.client:fields_invalid")
+    client_digest = _hex(client.get("host_digest"), "external_farm.client.host_digest")
+    try:
+        placement = normalizer._validate_role_placement(value.get("role_placement"), "live")
+    except normalizer.NormalizationError as exc:
+        raise LiveRunnerError(str(exc)) from exc
+    if (placement is None or placement.get("mode") != "external_farm" or
+            placement.get("c_host_digest") != client_digest or
+            placement.get("roles_disjoint") is not True or
+            placement.get("timing_eligible") is not True):
+        _fail("external_farm.role_placement:invalid")
+    workers = value.get("workers")
+    expected_relationships = RELATIONSHIP_COUNT.get(suite)
+    if not isinstance(workers, list) or expected_relationships is None or \
+            len(workers) != expected_relationships:
+        _fail("external_farm.workers:count_invalid")
+    seen_relationships: set[int] = set()
+    seen_services: set[str] = set()
+    seen_hosts: set[str] = set()
+    normalized_workers: list[dict[str, object]] = []
+    for index, worker in enumerate(workers):
+        if not isinstance(worker, dict) or set(worker) != {
+                "relationship", "service", "host_digest"}:
+            _fail(f"external_farm.workers:{index}:fields_invalid")
+        relationship = worker.get("relationship")
+        service = worker.get("service")
+        worker_digest = _hex(worker.get("host_digest"),
+                             f"external_farm.workers:{index}.host_digest")
+        expected_service = ("p50-f" if suite == TOPOLOGY
+                            else f"p50-f-{relationship}")
+        if (type(relationship) is not int or relationship in seen_relationships or
+                not 0 <= relationship < expected_relationships or
+                not isinstance(service, str) or service != expected_service or
+                service in seen_services or worker_digest == client_digest):
+            _fail(f"external_farm.workers:{index}:identity_invalid")
+        seen_relationships.add(relationship)
+        seen_services.add(service)
+        seen_hosts.add(worker_digest)
+        normalized_workers.append({"relationship": relationship, "service": service,
+                                   "host_digest": worker_digest})
+    if seen_relationships != set(range(expected_relationships)):
+        _fail("external_farm.workers:relationship_set_incomplete")
+    if suite == PARALLEL_TOPOLOGY and len(seen_hosts) != expected_relationships:
+        _fail("external_farm.workers:host_identity_not_unique")
+    if placement.get("f_host_digests") != [item["host_digest"] for item in normalized_workers]:
+        _fail("external_farm.role_placement:worker_binding_mismatch")
+    normalized = {"schema": EXTERNAL_FARM_SCHEMA, "suite": suite,
+                  "scheduler": {"host": host, "port": port},
+                  "client": {"host_digest": client_digest},
+                  "workers": normalized_workers, "role_placement": placement}
+    return normalized, digest, size
+
+
+def _co_resident_role_placement(host_digest: str, suite: str) -> dict[str, object]:
+    """Describe the local runner's wire-only co-resident placement."""
+    return {
+        "schema": ROLE_PLACEMENT_SCHEMA,
+        "mode": "co_resident_loopback",
+        "c_host_digest": host_digest,
+        "scheduler_host_digest": host_digest,
+        "f_host_digests": [host_digest] * RELATIONSHIP_COUNT[suite],
+        "roles_disjoint": False,
+        "timing_eligible": False,
+    }
 
 
 def _read_host_fact(path: Path, label: str) -> str:
@@ -1651,6 +1772,9 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
         _fail("product_run:did_not_pass")
     if execution_environment not in {"host_product_build", "pinned_container_product_build"}:
         _fail("execution_environment:invalid")
+    # This runner co-locates C, F, the scheduler, caches, and compilers.  Its
+    # elapsed time remains useful for protocol/output evidence only.
+    execution_scope = LOOPBACK_EXECUTION_SCOPE
     if ((execution_environment == "pinned_container_product_build") !=
             (runtime_image is not None)):
         _fail("execution_environment:image_binding_invalid")
@@ -1727,6 +1851,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     _validate_product_log_evidence(work, observations, profile)
     calibration_metadata: dict[str, str] | None = None
     host_descriptor_binding: dict[str, object] | None = None
+    role_placement: dict[str, object] | None = None
     if launch_identity is not None:
         if runtime_image is None or host_descriptor_path is None:
             _fail("calibration_metadata:authority_missing")
@@ -1740,6 +1865,12 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
             host_descriptor=host_descriptor_path)
         host_descriptor_binding = {"path": "product-evidence/host-descriptor.json",
                                    "sha256": host_digest, "bytes": host_bytes}
+        role_placement = _co_resident_role_placement(
+            calibration_metadata["host_digest"], suite)
+        try:
+            normalizer._validate_role_placement(role_placement, "live")
+        except normalizer.NormalizationError as exc:
+            raise LiveRunnerError("role_placement:local_identity_invalid") from exc
     stages = _action_stage(work, len(observations), assignments, suite)
     if len(stages) != len(observations):
         _fail("action_trace:stage_count_mismatch")
@@ -1959,6 +2090,9 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                       "runner": {"name": "p50compilee2e-run.sh", "sha256": runner_sha},
                       "binary_sha256": binaries,
                       "execution_environment": execution_environment,
+                      "execution_scope": execution_scope,
+                      **({"role_placement": role_placement}
+                         if role_placement is not None else {}),
                       "execution_limits": {"timeout_seconds": effective_timeout},
                       "runtime_image": runtime_image,
                       "diagnostic_policy": {
@@ -2002,6 +2136,9 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                                     "C_TO_F_bytes": "bytes", "F_TO_C_bytes": "bytes",
                                     "throughput_bytes_per_s": "bytes_per_s"},
                           "curve": {"path": curve_name, "sha256": hashlib.sha256(curve_raw).hexdigest(), "bytes": len(curve_raw)},
+                          "execution_scope": execution_scope,
+                          **({"role_placement": role_placement}
+                             if role_placement is not None else {}),
                           "provenance": {"mode": "live", "producer": "s8_real_c1f1_live_runner", "trace_free": False},
                           "evidence": {"results_sha256": hashlib.sha256(summary_raw).hexdigest(),
                                        "evidence_manifest_sha256": evidence_manifest_sha,
@@ -2017,6 +2154,8 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                     "provenance": manifest_value["provenance"], "manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
                     "curve_sha256": hashlib.sha256(curve_raw).hexdigest(), "rows": curve,
                     "metadata": normalizer._validate_manifest_metadata(manifest_value),
+                    "execution_scope": execution_scope,
+                    "role_placement": role_placement,
                     "evidence": manifest_value["evidence"]}
         records.append(normalizer._normalized_record("live", artifact))
         manifests[run] = manifest_name
@@ -2033,6 +2172,9 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                       run: comparisons[run]["plan_sha256"] for run in run_names
                   },
                   "execution_environment": execution_environment,
+                  "execution_scope": execution_scope,
+                  **({"role_placement": role_placement}
+                     if role_placement is not None else {}),
                   "execution_limits": {"timeout_seconds": effective_timeout},
                   "runtime_image": runtime_image,
                   "diagnostic_policy": {

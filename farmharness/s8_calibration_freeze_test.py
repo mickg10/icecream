@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import s8_calibration_freeze as calibration
 from s8_calibration_freeze import (
     BUNDLE_SCHEMA,
     CALIBRATION_CELLS,
@@ -540,6 +541,28 @@ def test_loader_rejects_tampered_explicit_source_scale(tmp_path: Path) -> None:
     _refresh_loaded_bundle(bundle, manifest, value)
     with pytest.raises(PredictionError, match="explicit_source_scale_invalid"):
         load_calibration_bundle(manifest)
+
+
+def test_freeze_rejects_co_resident_timing_placement(tmp_path: Path) -> None:
+    root = tmp_path / "placement"
+    records_path, raw = _records(root, {"corpus": "fmt", "profile": "P29", "regime": "cold"})
+    values = [json.loads(line) for line in raw.splitlines()]
+    placement = {
+        "schema": "icecream-s8-role-placement-v1",
+        "mode": "co_resident_loopback",
+        "c_host_digest": "4" * 64,
+        "scheduler_host_digest": "4" * 64,
+        "f_host_digests": ["4" * 64],
+        "roles_disjoint": False,
+        "timing_eligible": False,
+    }
+    values[1]["role_placement"] = placement
+    values[2]["role_placement"] = placement
+    with pytest.raises(CalibrationError, match="role_placement_not_timing_eligible"):
+        calibration._records(
+            b"".join(canonical_bytes(value) + b"\n" for value in values),
+            {"corpus": "fmt", "profile": "P29", "regime": "cold"},
+            PREDICTOR["model_id"], "placement", require_metadata=True)
 
 
 @pytest.mark.parametrize("record_type", ("predictive_sim", "live"))

@@ -28,10 +28,12 @@ from typing import Any
 try:  # Works as a package module and as a direct harness script.
     from .s8_schema import (CORPORA, CURRENT_SEMANTICS, DECLARED_CELLS, DEPTH_CLASSES,
                             PROFILES, REGIMES, SPLITS, TOPOLOGIES)
+    from . import s8_predictive_live_normalizer as normalizer
     from .s8_predictive_live_normalizer import RECORD_SCHEMA
 except ImportError:  # pragma: no cover - direct invocation.
     from s8_schema import (CORPORA, CURRENT_SEMANTICS, DECLARED_CELLS, DEPTH_CLASSES,
                            PROFILES, REGIMES, SPLITS, TOPOLOGIES)
+    import s8_predictive_live_normalizer as normalizer
     from s8_predictive_live_normalizer import RECORD_SCHEMA
 
 
@@ -299,6 +301,8 @@ def _explicit_experiment_authority(records_path: Path, cell: dict[str, str],
                                          f"{label}.experiment_manifest.calibration_metadata")
     except CalibrationError as exc:
         raise CalibrationError(f"{label}:authority_calibration_metadata_missing") from exc
+    _validate_timing_placement(authority.get("role_placement"),
+                               f"{label}.experiment_manifest")
     return manifest_path, pass_id, {"sha256": digest, "bytes": size}, metadata
 
 
@@ -330,6 +334,19 @@ def _calibration_metadata(value: object, label: str) -> dict[str, str]:
         else:
             result[field] = _digest(value[field], f"{label}.{field}")
     return result
+
+
+def _validate_timing_placement(value: object, label: str) -> None:
+    """Reject co-resident timing while retaining older records without it."""
+    if value is None:
+        return
+    try:
+        placement = normalizer._validate_role_placement(value, "live")
+    except normalizer.NormalizationError as exc:
+        raise CalibrationError(f"{label}:role_placement_invalid") from exc
+    if (placement is None or placement.get("mode") != "external_farm" or
+            placement.get("timing_eligible") is not True):
+        raise CalibrationError(f"{label}:role_placement_not_timing_eligible")
 
 
 def _identity(value: object, cell: dict[str, str], label: str) -> dict[str, object]:
@@ -477,6 +494,9 @@ def _records(raw: bytes, cell: dict[str, str], predictor_model_id: str,
                 raise CalibrationError(f"{label}:{number}:calibration_metadata_mismatch")
         elif require_metadata:
             raise CalibrationError(f"{label}:{number}:calibration_metadata_missing")
+        if record_type in ("live", "comparison"):
+            _validate_timing_placement(value.get("role_placement"),
+                                       f"{label}:{number}")
         if record_type in ("predictive_sim", "live"):
             curves[record_type] = _curve(value.get("raw_cumulative_curve"), cell,
                                           f"{label}:{record_type}", require_directional)

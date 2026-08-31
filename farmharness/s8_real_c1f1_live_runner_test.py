@@ -931,6 +931,59 @@ def test_parallel_topology_must_match_predictive_schedule(tmp_path: Path) -> Non
         runner.load_topology(topology, rows, runner.PARALLEL_TOPOLOGY, scheduling)
 
 
+def _external_farm(tmp_path: Path, suite: str = runner.TOPOLOGY) -> tuple[Path, str]:
+    count = runner.RELATIONSHIP_COUNT[suite]
+    c_digest = "1" * 64
+    scheduler_digest = "2" * 64
+    f_digests = [f"{index + 3:064x}" for index in range(count)]
+    value = {
+        "schema": runner.EXTERNAL_FARM_SCHEMA,
+        "suite": suite,
+        "scheduler": {"host": "10.0.27.101", "port": 54321},
+        "client": {"host_digest": c_digest},
+        "workers": [{"relationship": index,
+                     "service": "p50-f" if suite == runner.TOPOLOGY else f"p50-f-{index}",
+                     "host_digest": f_digests[index]} for index in range(count)],
+        "role_placement": {
+            "schema": runner.ROLE_PLACEMENT_SCHEMA, "mode": "external_farm",
+            "c_host_digest": c_digest, "scheduler_host_digest": scheduler_digest,
+            "f_host_digests": f_digests, "roles_disjoint": True,
+            "timing_eligible": True,
+        },
+    }
+    path = tmp_path / "external-farm.json"
+    path.write_bytes(runner._canonical(value) + b"\n")
+    return path, hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_external_farm_manifest_proves_disjoint_role_hosts(tmp_path: Path) -> None:
+    path, digest = _external_farm(tmp_path)
+    value, observed, size = runner.load_external_farm_manifest(
+        path, digest, runner.TOPOLOGY)
+    assert observed == digest and size == path.stat().st_size
+    assert value["role_placement"]["timing_eligible"] is True
+
+
+def test_external_farm_manifest_rejects_client_worker_co_residence(tmp_path: Path) -> None:
+    path, _digest = _external_farm(tmp_path)
+    value = json.loads(path.read_text())
+    value["workers"][0]["host_digest"] = value["client"]["host_digest"]
+    value["role_placement"]["f_host_digests"][0] = value["client"]["host_digest"]
+    path.write_bytes(runner._canonical(value) + b"\n")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    with pytest.raises(runner.LiveRunnerError, match="role_placement:external_identity_invalid"):
+        runner.load_external_farm_manifest(path, digest, runner.TOPOLOGY)
+
+
+def test_local_runner_declares_non_calibratable_role_placement() -> None:
+    placement = runner._co_resident_role_placement("a" * 64, runner.PARALLEL_TOPOLOGY)
+    assert placement["schema"] == runner.ROLE_PLACEMENT_SCHEMA
+    assert placement["mode"] == "co_resident_loopback"
+    assert placement["roles_disjoint"] is False
+    assert placement["timing_eligible"] is False
+    assert placement["f_host_digests"] == ["a" * 64] * 20
+
+
 def test_parallel_batch_window_requires_real_overlap() -> None:
     rows = [{} for _ in range(40)]
     observations = []

@@ -39,7 +39,8 @@ MANIFEST_SCHEMA = "icecream-s8-curve-manifest-v1"
 RECORD_SCHEMA = "icecream-s8-predictive-live-record-v1"
 SEMANTICS = CURRENT_SEMANTICS
 MANIFEST_KEYS = {"schema", "identity", "units", "curve", "provenance"}
-OPTIONAL_MANIFEST_KEYS = {"evidence", "comparison", "topology", "depth_class", "pass_id"}
+OPTIONAL_MANIFEST_KEYS = {"evidence", "comparison", "topology", "depth_class", "pass_id",
+                          "execution_scope", "role_placement"}
 CALIBRATION_METADATA_KEYS = {
     "product_image_digest", "toolchain_digest", "output_contract_digest",
     "host_digest", "ordered_input_class",
@@ -77,6 +78,9 @@ LIVE_EXPERIMENT_SCHEMA = "icecream-s8-real-c1f1-live-runner-v2"
 COMPARISON_SCHEMA = "icecream-s8-plan-capture-join-v1"
 PASS_ID = re.compile(r"^[A-Za-z0-9_.:-]+$")
 ORDERED_INPUT_CLASSES = frozenset(("ordered",))
+EXECUTION_SCOPES = frozenset(("loopback_correctness_only", "external_farm_timing"))
+ROLE_PLACEMENT_SCHEMA = "icecream-s8-role-placement-v1"
+ROLE_PLACEMENT_MODES = frozenset(("co_resident_loopback", "external_farm"))
 
 
 class NormalizationError(ValueError):
@@ -394,6 +398,65 @@ def _validate_manifest_metadata(value: dict[str, object]) -> dict[str, str]:
     return result
 
 
+def _validate_execution_scope(value: object, mode: str) -> str | None:
+    """Validate the producer's timing authority without inferring it.
+
+    A local C/F process pair can prove protocol bytes and output identity, but
+    its elapsed time includes co-resident scheduler, F, cache, and compiler
+    work.  Such a curve is retained as a loopback correctness observation and
+    is never eligible for calibration.  A calibration live curve must name an
+    independently supplied farm explicitly.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in EXECUTION_SCOPES:
+        raise NormalizationError("execution_scope:invalid")
+    if mode == "predictive_sim" or value == "loopback_correctness_only":
+        if mode == "predictive_sim":
+            raise NormalizationError("execution_scope:predictive_sim_invalid")
+    return value
+
+
+def _validate_role_placement(value: object, mode: str) -> dict[str, object] | None:
+    """Validate the authenticated placement of submission and compile roles."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {
+            "schema", "mode", "c_host_digest", "scheduler_host_digest",
+            "f_host_digests", "roles_disjoint", "timing_eligible"}:
+        raise NormalizationError("role_placement:fields_invalid")
+    if value.get("schema") != ROLE_PLACEMENT_SCHEMA or \
+            value.get("mode") not in ROLE_PLACEMENT_MODES:
+        raise NormalizationError("role_placement:identity_invalid")
+    c_digest = _sha(value.get("c_host_digest"), "role_placement.c_host_digest")
+    scheduler_digest = _sha(value.get("scheduler_host_digest"),
+                             "role_placement.scheduler_host_digest")
+    f_digests = value.get("f_host_digests")
+    if (not isinstance(f_digests, list) or not f_digests or
+            any(not isinstance(item, str) for item in f_digests)):
+        raise NormalizationError("role_placement.f_host_digests:invalid")
+    f_digests = [_sha(item, "role_placement.f_host_digest") for item in f_digests]
+    roles_disjoint = value.get("roles_disjoint")
+    timing_eligible = value.get("timing_eligible")
+    if type(roles_disjoint) is not bool or type(timing_eligible) is not bool:
+        raise NormalizationError("role_placement:flags_invalid")
+    placement_mode = value["mode"]
+    if placement_mode == "co_resident_loopback":
+        if (roles_disjoint or timing_eligible or
+                scheduler_digest != c_digest or any(item != c_digest for item in f_digests)):
+            raise NormalizationError("role_placement:loopback_identity_invalid")
+    elif (not roles_disjoint or not timing_eligible or
+          scheduler_digest == c_digest or any(item == c_digest for item in f_digests) or
+          len(set(f_digests)) != len(f_digests)):
+        raise NormalizationError("role_placement:external_identity_invalid")
+    if mode == "predictive_sim":
+        raise NormalizationError("role_placement:predictive_sim_invalid")
+    return {"schema": ROLE_PLACEMENT_SCHEMA, "mode": placement_mode,
+            "c_host_digest": c_digest, "scheduler_host_digest": scheduler_digest,
+            "f_host_digests": f_digests, "roles_disjoint": roles_disjoint,
+            "timing_eligible": timing_eligible}
+
+
 def _forbidden_curve_key(key: object) -> bool:
     if not isinstance(key, str):
         return True
@@ -504,6 +567,8 @@ def _load_manifest(path: Path, mode: str) -> dict[str, object]:
     units = _validate_units(value["units"])
     provenance = _validate_provenance(value["provenance"], mode)
     metadata = _validate_manifest_metadata(value)
+    execution_scope = _validate_execution_scope(value.get("execution_scope"), mode)
+    role_placement = _validate_role_placement(value.get("role_placement"), mode)
     evidence = (_validate_evidence(value["evidence"])
                 if "evidence" in value else None)
     curve_path = _descriptor_path(path.parent, value["curve"], "curve")
@@ -520,6 +585,8 @@ def _load_manifest(path: Path, mode: str) -> dict[str, object]:
         "provenance": provenance,
         "evidence": evidence,
         "metadata": metadata,
+        "execution_scope": execution_scope,
+        "role_placement": role_placement,
         "manifest_sha256": facts["sha256"],
         "curve_sha256": curve_sha,
         "rows": rows,
@@ -616,6 +683,10 @@ def _comparison(predicted: dict[str, object], observed: dict[str, object], ident
         "cell": {field: identity[field] for field in ("corpus", "profile", "regime")},
         "split": identity["split"],
         "identity": identity,
+        **({"execution_scope": observed["execution_scope"]}
+           if observed.get("execution_scope") is not None else {}),
+        **({"role_placement": observed["role_placement"]}
+           if observed.get("role_placement") is not None else {}),
         **predicted["metadata"],
         **({"comparison": predicted["comparison"]}
            if predicted.get("comparison") is not None else {}),
@@ -643,6 +714,10 @@ def _normalized_record(mode: str, artifact: dict[str, object]) -> dict[str, obje
         "cell": {field: identity[field] for field in ("corpus", "profile", "regime")},
         "split": identity["split"],
         "identity": identity,
+        **({"execution_scope": artifact["execution_scope"]}
+           if artifact.get("execution_scope") is not None else {}),
+        **({"role_placement": artifact["role_placement"]}
+           if artifact.get("role_placement") is not None else {}),
         **artifact["metadata"],
         **({"comparison": artifact["comparison"]}
            if artifact.get("comparison") is not None else {}),
@@ -691,6 +766,11 @@ def normalize(predictive_manifest: Path, live_manifest: Path, out: Path,
     _same_identity(p_identity, l_identity, predictive["comparison"], live["comparison"])
     _same_units(p_units, l_units)
     if authenticated_metadata is not None:
+        if (live.get("execution_scope") != "external_farm_timing" or
+                not isinstance(live.get("role_placement"), dict) or
+                live["role_placement"].get("timing_eligible") is not True):
+            raise NormalizationError(
+                "role_placement:live_calibration_requires_external_farm")
         authority_metadata = _validate_calibration_metadata(authenticated_metadata)
         for artifact in (predictive, live):
             metadata = artifact["metadata"]
