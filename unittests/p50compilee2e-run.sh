@@ -978,6 +978,60 @@ environment_preparation_start_ns=$(date +%s%N)
 environment_warmup_count=0
 environment_warmup_c_trace="$work/s8-environment-warmup-c-action-trace.jsonl"
 if test "$cache_enabled" -eq 0; then
+    # RAW_II has no cache sidecar, but its first remote compile still installs
+    # ICECC_VERSION on each F.  Pay that setup cost before the measured batch
+    # without assigning it a TU timing row or retaining its wire witness.
+    if test "$suite" = C1F20/40; then
+        for relationship in $(seq 0 19); do
+            compile_once "raw-env-ready-$relationship" "$work/src/environment-readiness.cpp" "" "" "" "$relationship" 0 ""
+            grep -F 'has env: false' "$work/client-compile-raw-env-ready-$relationship.log" >/dev/null || {
+                echo "FAIL: RAW_II F environment was not installed ($relationship)" >&2
+                exit 1
+            }
+            environment_warmup_count=$((environment_warmup_count + 1))
+            echo "S8_RAW_ENV_READY relationship=$relationship label=raw-env-ready-$relationship measured=0 cache_state=disabled"
+        done
+    else
+        compile_once raw-env-ready "$work/src/environment-readiness.cpp" "" "" "" 0 0 ""
+        grep -F 'has env: false' "$work/client-compile-raw-env-ready.log" >/dev/null || {
+            echo "FAIL: RAW_II F environment was not installed" >&2
+            exit 1
+        }
+        environment_warmup_count=1
+        echo "S8_RAW_ENV_READY relationship=0 label=raw-env-ready measured=0 cache_state=disabled"
+    fi
+    test "$environment_warmup_count" -eq "$relationship_count" || {
+        echo "FAIL: RAW_II environment readiness count mismatch" >&2
+        exit 1
+    }
+    test -s "$c_legacy_wire_trace" || {
+        echo "FAIL: RAW_II environment readiness has no C wire witness" >&2
+        exit 1
+    }
+    if test "$suite" = C1F20/40; then
+        for relationship in $(seq 0 19); do
+            test -s "$work/s7-measured-f-legacy-wire-trace-$relationship.jsonl" || {
+                echo "FAIL: RAW_II environment readiness has no F wire witness ($relationship)" >&2
+                exit 1
+            }
+        done
+    else
+        test -s "$f_legacy_wire_trace" || {
+            echo "FAIL: RAW_II environment readiness has no F wire witness" >&2
+            exit 1
+        }
+    fi
+    # The daemon keeps the same role-labelled sinks for the measured pass;
+    # truncate only after every F has completed readiness so setup rows cannot
+    # enter the retained per-TU RAW_II curve.
+    : >"$c_legacy_wire_trace"
+    if test "$suite" = C1F20/40; then
+        for relationship in $(seq 0 19); do
+            : >"$work/s7-measured-f-legacy-wire-trace-$relationship.jsonl"
+        done
+    else
+        : >"$f_legacy_wire_trace"
+    fi
     : >"$environment_warmup_c_trace"
     : >"$work/s8-environment-warmup-f-action-trace.jsonl"
     environment_preparation_end_ns=$(date +%s%N)
@@ -1084,7 +1138,7 @@ else
 fi
 environment_preparation_end_ns=${environment_preparation_end_ns:-$(date +%s%N)}
 if test "$cache_enabled" -eq 0; then
-    echo "S8_ENV_PREPARATION relationships=0 archive_sha256=$envtar_sha256 archive_bytes=$envtar_bytes start_ns=$environment_preparation_start_ns end_ns=$environment_preparation_end_ns measured=0 cache_state=disabled"
+    echo "S8_ENV_PREPARATION relationships=$environment_warmup_count readiness_compiles=$environment_warmup_count archive_sha256=$envtar_sha256 archive_bytes=$envtar_bytes start_ns=$environment_preparation_start_ns end_ns=$environment_preparation_end_ns measured=0 cache_state=disabled"
 else
     echo "S8_ENV_PREPARATION relationships=$environment_warmup_count archive_sha256=$envtar_sha256 archive_bytes=$envtar_bytes start_ns=$environment_preparation_start_ns end_ns=$environment_preparation_end_ns measured=0 cache_state=rotated"
 fi

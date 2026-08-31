@@ -1105,17 +1105,53 @@ def _environment_preparation(stdout: str, work: Path, suite: str) -> dict[str, A
         try:
             start_ns = int(disabled[0]["start_ns"])
             end_ns = int(disabled[0]["end_ns"])
+            relationships = int(disabled[0]["relationships"])
+            readiness_compiles = int(disabled[0]["readiness_compiles"])
             archive_bytes = int(disabled[0]["archive_bytes"])
             archive_sha = _hex(disabled[0].get("archive_sha256"),
                                "environment_preparation.archive_sha256")
         except (KeyError, TypeError, ValueError) as exc:
             raise LiveRunnerError("environment_preparation:disabled_invalid") from exc
-        if start_ns <= 0 or end_ns < start_ns or archive_bytes <= 0:
+        if (start_ns <= 0 or end_ns < start_ns or archive_bytes <= 0 or
+                relationships != expected_relationships or
+                readiness_compiles != expected_relationships):
             _fail("environment_preparation:disabled_invalid")
-        return {"relationships": 0, "archive_sha256": archive_sha,
+        readiness = _fields(stdout, "S8_RAW_ENV_READY")
+        if len(readiness) != expected_relationships:
+            _fail("environment_preparation:raw_readiness_count_mismatch")
+        seen: set[int] = set()
+        readiness_rows: list[dict[str, Any]] = []
+        for index, row in enumerate(readiness):
+            try:
+                relationship = int(row["relationship"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise LiveRunnerError(
+                    f"environment_preparation:raw_readiness_invalid:{index}") from exc
+            label = row.get("label", "")
+            if (relationship in seen or not 0 <= relationship < expected_relationships or
+                    row.get("measured") != "0" or row.get("cache_state") != "disabled" or
+                    not SAFE.fullmatch(label) or
+                    label != (f"raw-env-ready-{relationship}" if suite == PARALLEL_TOPOLOGY
+                              else "raw-env-ready")):
+                _fail(f"environment_preparation:raw_readiness_invalid:{index}")
+            log = work / f"client-compile-{label}.log"
+            try:
+                raw = log.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                raise LiveRunnerError(
+                    f"environment_preparation:raw_readiness_log_missing:{index}") from exc
+            if "has env: false" not in raw:
+                _fail(f"environment_preparation:raw_readiness_evidence_missing:{index}")
+            seen.add(relationship)
+            readiness_rows.append({"relationship": relationship, "label": label,
+                                   "measured": False, "cache_state": "disabled"})
+        if seen != set(range(expected_relationships)):
+            _fail("environment_preparation:raw_readiness_relationship_set_incomplete")
+        return {"relationships": relationships, "readiness_compiles": readiness_compiles,
+                "archive_sha256": archive_sha,
                 "archive_bytes": archive_bytes, "preparation_start_ns": start_ns,
                 "preparation_end_ns": end_ns, "measured": False,
-                "cache_state": "disabled", "warmups": [],
+                "cache_state": "disabled", "warmups": readiness_rows,
                 "sidecar_rotations": [], "post_rotation_ready": {"relationships": 0}}
     rows = _fields(stdout, "S8_ENV_WARMUP")
     if len(rows) != expected_relationships:

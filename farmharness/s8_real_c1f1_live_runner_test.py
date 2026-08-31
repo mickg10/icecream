@@ -423,6 +423,36 @@ def test_environment_preparation_accepts_real_single_scheduler_service_name(
         runner._environment_preparation(stdout, work, runner.TOPOLOGY)
 
 
+def test_raw_environment_preparation_requires_each_relationship_readiness(
+        tmp_path: Path) -> None:
+    work = tmp_path / "p50compilee2e.ready"
+    work.mkdir()
+    stdout = ""
+    for relationship in range(20):
+        label = f"raw-env-ready-{relationship}"
+        (work / f"client-compile-{label}.log").write_text("has env: false\n")
+        stdout += (f"S8_RAW_ENV_READY relationship={relationship} label={label} "
+                   "measured=0 cache_state=disabled\n")
+    stdout += ("S8_ENV_PREPARATION relationships=20 readiness_compiles=20 "
+               f"archive_sha256={'a' * 64} archive_bytes=31 start_ns=10 end_ns=20 "
+               "measured=0 cache_state=disabled\n")
+    preparation = runner._environment_preparation(
+        stdout, work, runner.PARALLEL_TOPOLOGY)
+    assert preparation["relationships"] == 20
+    assert preparation["readiness_compiles"] == 20
+    assert preparation["cache_state"] == "disabled"
+    with pytest.raises(runner.LiveRunnerError, match="disabled_invalid"):
+        runner._environment_preparation(
+            stdout.replace("readiness_compiles=20", "readiness_compiles=19"),
+            work, runner.PARALLEL_TOPOLOGY)
+    with pytest.raises(runner.LiveRunnerError, match="raw_readiness_count_mismatch"):
+        missing = "\n".join(line for line in stdout.splitlines()
+                              if "S8_RAW_ENV_READY relationship=19" not in line) + "\n"
+        runner._environment_preparation(
+            missing,
+            work, runner.PARALLEL_TOPOLOGY)
+
+
 def test_parallel_cache_session_evidence_comes_from_observed_f_log(tmp_path: Path) -> None:
     (tmp_path / "client-compile-full-1-0.log").write_text("ZSTD_ROUTE\n")
     (tmp_path / "f-7.log").write_text("CACHE_SESSION\n")
@@ -844,6 +874,11 @@ def test_batch_shell_excludes_warm_prewarm_and_carries_optional_repeat() -> None
     assert '"$work/envs-f-$relationship"' in shell
     assert 'S8_ENV_WARMUP relationship=$relationship' in shell
     assert 'S8_ENV_PREPARATION relationships=$environment_warmup_count' in shell
+    assert 'raw-env-ready-$relationship' in shell
+    assert ': >"$c_legacy_wire_trace"' in shell
+    assert 's7-measured-f-legacy-wire-trace-$relationship.jsonl' in shell
+    assert shell.index('raw-env-ready-$relationship') < shell.index(
+        ': >"$c_legacy_wire_trace"') < shell.index('S8_ENV_PREPARATION relationships=')
     assert 'S8_SIDECAR_ROTATION role=$sidecar_role' in shell
     assert 'scheduler_rotation_offset=$(stat -c %s "$work/scheduler.log")' in shell
     assert 'S8_ENV_POST_ROTATION_READY relationships=$ready_count' in shell
