@@ -1398,6 +1398,14 @@ def test_raw_ii_method_cannot_enter_calibration_as_zstd_tu() -> None:
     assert eligible is False
 
 
+def test_transfer_accounting_distinguishes_raw_and_compressed_bases() -> None:
+    raw = runner._transfer_accounting(runner.RAW_II_PROFILE)
+    compressed = runner._transfer_accounting("ZSTD_TU")
+    assert raw["basis"] == "framed_application_wire_bytes"
+    assert compressed["basis"] == "source_stage_plus_returned_object_payload"
+    assert raw != compressed
+
+
 @pytest.mark.parametrize("mutation", [
     {"C": {"job_id": 72}},
     {"F": {"c_to_f_received_bytes": 139}},
