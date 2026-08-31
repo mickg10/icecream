@@ -301,8 +301,9 @@ def _explicit_experiment_authority(records_path: Path, cell: dict[str, str],
                                          f"{label}.experiment_manifest.calibration_metadata")
     except CalibrationError as exc:
         raise CalibrationError(f"{label}:authority_calibration_metadata_missing") from exc
-    _validate_timing_placement(authority.get("role_placement"),
-                               f"{label}.experiment_manifest")
+    _validate_timing_placement(
+        authority.get("role_placement"), f"{label}.experiment_manifest",
+        execution_scope=authority.get("execution_scope"), required=True)
     return manifest_path, pass_id, {"sha256": digest, "bytes": size}, metadata
 
 
@@ -336,9 +337,16 @@ def _calibration_metadata(value: object, label: str) -> dict[str, str]:
     return result
 
 
-def _validate_timing_placement(value: object, label: str) -> None:
-    """Reject co-resident timing while retaining older records without it."""
+def _validate_timing_placement(value: object, label: str, *, execution_scope: object = None,
+                               required: bool = False) -> None:
+    """Require external-farm placement for any calibration timing input."""
+    if execution_scope != "external_farm_timing":
+        if required:
+            raise CalibrationError(f"{label}:execution_scope_not_timing_eligible")
+        return
     if value is None:
+        if required:
+            raise CalibrationError(f"{label}:role_placement_missing")
         return
     try:
         placement = normalizer._validate_role_placement(value, "live")
@@ -496,7 +504,9 @@ def _records(raw: bytes, cell: dict[str, str], predictor_model_id: str,
             raise CalibrationError(f"{label}:{number}:calibration_metadata_missing")
         if record_type in ("live", "comparison"):
             _validate_timing_placement(value.get("role_placement"),
-                                       f"{label}:{number}")
+                                       f"{label}:{number}",
+                                       execution_scope=value.get("execution_scope"),
+                                       required=True)
         if record_type in ("predictive_sim", "live"):
             curves[record_type] = _curve(value.get("raw_cumulative_curve"), cell,
                                           f"{label}:{record_type}", require_directional)

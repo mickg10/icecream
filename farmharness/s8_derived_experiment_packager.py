@@ -65,6 +65,21 @@ def _authority_calibration_metadata(authority: dict[str, Any]) -> dict[str, str]
         raise PackagingError(str(exc)) from exc
 
 
+def _authority_role_placement(authority: dict[str, Any]) -> dict[str, Any]:
+    """Require the source experiment to identify a disjoint timing farm."""
+    try:
+        placement = normalizer._validate_role_placement(
+            authority.get("role_placement"), "live")
+    except normalizer.NormalizationError as exc:
+        raise PackagingError(
+            "source_experiment_manifest.role_placement:invalid") from exc
+    if (placement is None or placement.get("mode") != "external_farm" or
+            placement.get("timing_eligible") is not True):
+        raise PackagingError(
+            "source_experiment_manifest.role_placement:not_timing_eligible")
+    return placement
+
+
 def _read(path: Path, label: str, limit: int = 8 * 1024 * 1024) -> tuple[bytes, dict[str, Any]]:
     try:
         raw, facts = normalizer._snapshot(path, label, limit)
@@ -133,11 +148,17 @@ def _authority(source_dir: Path, pass_id: str) -> tuple[dict[str, Any], Path, di
         raise PackagingError("source.predictive_plan_sha256_by_run:pass_missing")
     _sha(plans[pass_id], "source.predictive_plan_sha256_by_run")
     metadata = _authority_calibration_metadata(authority)
+    role_placement = _authority_role_placement(authority)
+    if authority.get("execution_scope") != "external_farm_timing":
+        raise PackagingError(
+            "source_experiment_manifest.execution_scope:not_timing_eligible")
     return authority, selected, {"path": manifest_path, "facts": authority_facts, "cell": cell,
                                  "split": split, "topology": topology, "suite": suite,
                                  "depth": depth, "declared_count": declared_count, "runs": runs,
                                  "plan_sha256": plans[pass_id].lower(),
-                                 "calibration_metadata": metadata}
+                                 "calibration_metadata": metadata,
+                                 "execution_scope": authority.get("execution_scope"),
+                                 "role_placement": role_placement}
 
 
 def _bind_live(authority: dict[str, Any], live: dict[str, Any], cell: tuple[str, str, str],
@@ -156,6 +177,34 @@ def _bind_live(authority: dict[str, Any], live: dict[str, Any], cell: tuple[str,
     comparison = live.get("comparison")
     if not isinstance(comparison, dict):
         raise PackagingError("live.comparison:missing")
+    if (live.get("execution_scope") != authority.get("execution_scope") or
+            live.get("role_placement") != authority.get("role_placement")):
+        raise PackagingError("live.role_placement:authority_mismatch")
+
+
+def _derived_manifest(source: dict[str, Any], pass_id: str,
+                      predictive_manifest: Path, predictive_facts: dict[str, Any],
+                      live_manifest: Path, live_facts: dict[str, Any],
+                      records_facts: dict[str, Any]) -> dict[str, Any]:
+    """Build the derived manifest from authenticated source descriptors."""
+    return {
+        "schema": SCHEMA, "status": "PASS",
+        "cell": dict(zip(("corpus", "profile", "regime"), source["cell"])),
+        "split": source["split"], "topology": source["topology"],
+        "suite": source["suite"], "depth": source["depth"],
+        "depth_class": _derived_depth_class(source["depth"], pass_id),
+        "pass_id": pass_id, "runs": source["runs"],
+        "requested_curve_points": source["declared_count"],
+        "records": {"path": "records.jsonl", "sha256": records_facts["sha256"],
+                    "bytes": records_facts["bytes"]},
+        "predictive_curve_manifest": _descriptor(predictive_manifest, predictive_facts),
+        "live_curve_manifest": _descriptor(live_manifest, live_facts),
+        "source_experiment_manifest": _descriptor(source["path"], source["facts"]),
+        "predictive_plan_sha256": source["plan_sha256"], "comparison_scored": True,
+        "calibration_metadata": source["calibration_metadata"],
+        "execution_scope": source["execution_scope"],
+        "role_placement": source["role_placement"],
+    }
 
 
 def package(predictive_manifest: Path, source_dir: Path, pass_id: str,
@@ -197,20 +246,9 @@ def package(predictive_manifest: Path, source_dir: Path, pass_id: str,
     except normalizer.NormalizationError as exc:
         raise PackagingError(f"normalization:{exc}") from exc
     records_raw, records_facts = _read(records_path, "records")
-    manifest = {
-        "schema": SCHEMA, "status": "PASS", "cell": dict(zip(("corpus", "profile", "regime"), source["cell"])),
-        "split": source["split"], "topology": source["topology"], "suite": source["suite"],
-        "depth": source["depth"],
-        "depth_class": _derived_depth_class(source["depth"], pass_id),
-        "pass_id": pass_id, "runs": source["runs"],
-        "requested_curve_points": source["declared_count"],
-        "records": {"path": "records.jsonl", "sha256": records_facts["sha256"], "bytes": records_facts["bytes"]},
-        "predictive_curve_manifest": _descriptor(predictive_manifest, p_facts),
-        "live_curve_manifest": _descriptor(live_manifest, live_facts),
-        "source_experiment_manifest": _descriptor(source["path"], source["facts"]),
-        "predictive_plan_sha256": source["plan_sha256"], "comparison_scored": True,
-        "calibration_metadata": source["calibration_metadata"],
-    }
+    del records_raw
+    manifest = _derived_manifest(source, pass_id, predictive_manifest, p_facts,
+                                 live_manifest, live_facts, records_facts)
     raw = normalizer.canonical_bytes(manifest) + b"\n"
     manifest_path = out / "experiment_manifest.json"
     try:

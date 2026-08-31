@@ -175,7 +175,6 @@ def load_external_farm_manifest(path: Path, expected_sha256: str,
         _fail("external_farm.workers:count_invalid")
     seen_relationships: set[int] = set()
     seen_services: set[str] = set()
-    seen_hosts: set[str] = set()
     normalized_workers: list[dict[str, object]] = []
     for index, worker in enumerate(workers):
         if not isinstance(worker, dict) or set(worker) != {
@@ -194,14 +193,15 @@ def load_external_farm_manifest(path: Path, expected_sha256: str,
             _fail(f"external_farm.workers:{index}:identity_invalid")
         seen_relationships.add(relationship)
         seen_services.add(service)
-        seen_hosts.add(worker_digest)
         normalized_workers.append({"relationship": relationship, "service": service,
                                    "host_digest": worker_digest})
     if seen_relationships != set(range(expected_relationships)):
         _fail("external_farm.workers:relationship_set_incomplete")
-    if suite == PARALLEL_TOPOLOGY and len(seen_hosts) != expected_relationships:
-        _fail("external_farm.workers:host_identity_not_unique")
-    if placement.get("f_host_digests") != [item["host_digest"] for item in normalized_workers]:
+    physical_hosts = placement.get("f_host_digests")
+    worker_hosts = [item["host_digest"] for item in normalized_workers]
+    if (not isinstance(physical_hosts, list) or
+            any(host not in physical_hosts for host in worker_hosts) or
+            set(physical_hosts) != set(worker_hosts)):
         _fail("external_farm.role_placement:worker_binding_mismatch")
     normalized = {"schema": EXTERNAL_FARM_SCHEMA, "suite": suite,
                   "scheduler": {"host": host, "port": port},
@@ -217,7 +217,7 @@ def _co_resident_role_placement(host_digest: str, suite: str) -> dict[str, objec
         "mode": "co_resident_loopback",
         "c_host_digest": host_digest,
         "scheduler_host_digest": host_digest,
-        "f_host_digests": [host_digest] * RELATIONSHIP_COUNT[suite],
+        "f_host_digests": [host_digest],
         "roles_disjoint": False,
         "timing_eligible": False,
     }

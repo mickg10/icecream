@@ -185,6 +185,17 @@ def test_loopback_live_is_rejected_from_calibration(tmp_path: Path) -> None:
                   authenticated_metadata=CALIBRATION_METADATA)
 
 
+def test_placementless_live_is_rejected_from_calibration(tmp_path: Path) -> None:
+    predictive = _write_manifest(tmp_path, "predictive", "predictive_sim", _curve_rows())
+    live = _write_manifest(
+        tmp_path, "live", "live", _curve_rows(2),
+        extra={**CALIBRATION_METADATA, "execution_scope": "external_farm_timing"})
+    with pytest.raises(NormalizationError,
+                       match="role_placement:live_calibration_requires_external_farm"):
+        normalize(predictive, live, tmp_path / "out.jsonl",
+                  authenticated_metadata=CALIBRATION_METADATA)
+
+
 def test_external_farm_live_is_eligible_when_placement_is_disjoint(tmp_path: Path) -> None:
     predictive = _write_manifest(tmp_path, "predictive", "predictive_sim", _curve_rows())
     live = _write_manifest(

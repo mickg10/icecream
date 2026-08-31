@@ -46,6 +46,15 @@ CALIBRATION_METADATA = {
     "host_digest": "4" * 64,
     "ordered_input_class": "ordered",
 }
+EXTERNAL_PLACEMENT = {
+    "schema": "icecream-s8-role-placement-v1",
+    "mode": "external_farm",
+    "c_host_digest": "4" * 64,
+    "scheduler_host_digest": "4" * 64,
+    "f_host_digests": ["5" * 64],
+    "roles_disjoint": True,
+    "timing_eligible": True,
+}
 
 
 def _records(root: Path, cell: dict[str, str], channel_scale: float = 1.25,
@@ -88,11 +97,13 @@ def _records(root: Path, cell: dict[str, str], channel_scale: float = 1.25,
         {"schema": RECORD_SCHEMA, "semantics": SEMANTICS,
          "record_type": "live", "cell": cell, "split": "calibration",
          "identity": {**identity, "model_id": "s7-live-observed"}, **CALIBRATION_METADATA, "units": UNITS,
+         "execution_scope": "external_farm_timing", "role_placement": EXTERNAL_PLACEMENT,
          "model_id": "s7-live-observed",
          "raw_cumulative_curve": observed},
         {"schema": RECORD_SCHEMA, "semantics": SEMANTICS,
          "record_type": "comparison", "cell": cell, "split": "calibration",
          "identity": identity, **CALIBRATION_METADATA, "units": UNITS, "model_id": identity["model_id"],
+         "execution_scope": "external_farm_timing", "role_placement": EXTERNAL_PLACEMENT,
          "point_errors": [{"step": row["step"], "tu_id": row["tu_id"], "errors": {}}
                           for row in predicted],
          "loss_curve": [{"step": row["step"], "tu_id": row["tu_id"],
@@ -167,6 +178,8 @@ def _explicitize(root: Path, comparisons: list[dict[str, object]],
             "depth": "full" if depth == "repeat-full" else depth,
             "depth_class": depth, "pass_id": pass_id, "runs": runs,
             "calibration_metadata": dict(CALIBRATION_METADATA),
+            "execution_scope": "external_farm_timing",
+            "role_placement": dict(EXTERNAL_PLACEMENT),
             "records": {"path": "records.jsonl", "sha256": hashlib.sha256(raw).hexdigest(),
                         "bytes": len(raw)},
         }
@@ -563,6 +576,32 @@ def test_freeze_rejects_co_resident_timing_placement(tmp_path: Path) -> None:
             b"".join(canonical_bytes(value) + b"\n" for value in values),
             {"corpus": "fmt", "profile": "P29", "regime": "cold"},
             PREDICTOR["model_id"], "placement", require_metadata=True)
+
+
+def test_freeze_rejects_placementless_timing_records(tmp_path: Path) -> None:
+    root = tmp_path / "missing-placement"
+    records_path, raw = _records(root, {"corpus": "fmt", "profile": "P29", "regime": "cold"})
+    values = [json.loads(line) for line in raw.splitlines()]
+    values[1].pop("role_placement")
+    values[2].pop("role_placement")
+    with pytest.raises(CalibrationError, match="role_placement_missing"):
+        calibration._records(
+            b"".join(canonical_bytes(value) + b"\n" for value in values),
+            {"corpus": "fmt", "profile": "P29", "regime": "cold"},
+            PREDICTOR["model_id"], "missing-placement", require_metadata=True)
+
+
+def test_freeze_rejects_non_timing_execution_scope(tmp_path: Path) -> None:
+    root = tmp_path / "wrong-scope"
+    records_path, raw = _records(root, {"corpus": "fmt", "profile": "P29", "regime": "cold"})
+    values = [json.loads(line) for line in raw.splitlines()]
+    values[1]["execution_scope"] = "loopback_correctness_only"
+    values[2]["execution_scope"] = "loopback_correctness_only"
+    with pytest.raises(CalibrationError, match="execution_scope_not_timing_eligible"):
+        calibration._records(
+            b"".join(canonical_bytes(value) + b"\n" for value in values),
+            {"corpus": "fmt", "profile": "P29", "regime": "cold"},
+            PREDICTOR["model_id"], "wrong-scope", require_metadata=True)
 
 
 @pytest.mark.parametrize("record_type", ("predictive_sim", "live"))

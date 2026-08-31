@@ -446,7 +446,7 @@ def _validate_role_placement(value: object, mode: str) -> dict[str, object] | No
                 scheduler_digest != c_digest or any(item != c_digest for item in f_digests)):
             raise NormalizationError("role_placement:loopback_identity_invalid")
     elif (not roles_disjoint or not timing_eligible or
-          scheduler_digest == c_digest or any(item == c_digest for item in f_digests) or
+          any(item == c_digest for item in f_digests) or
           len(set(f_digests)) != len(f_digests)):
         raise NormalizationError("role_placement:external_identity_invalid")
     if mode == "predictive_sim":

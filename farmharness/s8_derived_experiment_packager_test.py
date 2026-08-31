@@ -3,7 +3,8 @@ from pathlib import Path
 import pytest
 
 from s8_derived_experiment_packager import (
-    _authority_calibration_metadata, _derived_depth_class, package, PackagingError,
+    _authority_calibration_metadata, _authority_role_placement, _derived_depth_class,
+    _derived_manifest, package, PackagingError,
 )
 
 
@@ -30,6 +31,42 @@ def test_authority_calibration_metadata_requires_exact_captured_identity() -> No
     del missing_host["host_digest"]
     with pytest.raises(PackagingError, match="host_digest_missing"):
         _authority_calibration_metadata({"calibration_metadata": missing_host})
+
+
+def test_authority_requires_explicit_external_farm_placement() -> None:
+    with pytest.raises(PackagingError, match="role_placement:(invalid|not_timing_eligible)"):
+        _authority_role_placement({})
+    placement = {
+        "schema": "icecream-s8-role-placement-v1", "mode": "external_farm",
+        "c_host_digest": "1" * 64, "scheduler_host_digest": "1" * 64,
+        "f_host_digests": ["2" * 64], "roles_disjoint": True,
+        "timing_eligible": True,
+    }
+    assert _authority_role_placement({"role_placement": placement}) == placement
+
+
+def test_derived_manifest_propagates_authenticated_timing_authority() -> None:
+    placement = {
+        "schema": "icecream-s8-role-placement-v1", "mode": "external_farm",
+        "c_host_digest": "1" * 64, "scheduler_host_digest": "1" * 64,
+        "f_host_digests": ["2" * 64], "roles_disjoint": True,
+        "timing_eligible": True,
+    }
+    source = {
+        "cell": ("fmt", "ZSTD_TU", "cold"), "split": "calibration",
+        "topology": "C1F1/100000", "suite": "C1F1/100000", "depth": "full",
+        "runs": ["full-1"], "declared_count": 3,
+        "path": Path("source/experiment_manifest.json"),
+        "facts": {"sha256": "3" * 64, "bytes": 17},
+        "plan_sha256": "4" * 64, "calibration_metadata": {},
+        "execution_scope": "external_farm_timing", "role_placement": placement,
+    }
+    manifest = _derived_manifest(
+        source, "full-1", Path("predictive.json"), {"sha256": "5" * 64, "bytes": 19},
+        Path("live.json"), {"sha256": "6" * 64, "bytes": 23},
+        {"sha256": "7" * 64, "bytes": 29})
+    assert manifest["execution_scope"] == "external_farm_timing"
+    assert manifest["role_placement"] == placement
 
 
 @pytest.mark.skipif(not PREDICTIVE.exists() or not (LIVE / "experiment_manifest.json").exists(),
