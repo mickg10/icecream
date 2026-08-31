@@ -113,9 +113,10 @@ def test_cleanup_does_not_replace_primary_error_and_handles_container_owned_file
     assert source.index("failure-diagnostics") < source.index("cleanup_paths =")
 
 
-def test_external_c_has_visible_unix_peer_pid_and_teardown_stops_scheduler_last() -> None:
+def test_external_c_and_batch_share_peer_pid_time_namespace_and_stop_scheduler_last() -> None:
     source = Path(executor.__file__).read_text(encoding="utf-8")
     assert source.count("-c --pid=host --network host --user 0") == 2
+    assert "-batch --pid=host --network host" in source
     targets = source[source.index("targets = [(\"q3\""):
                      source.index("cleanup = '''set -eu")]
     assert targets.index("reset-worker.pid") < targets.index("c.container-id")

@@ -1076,7 +1076,13 @@ PY'''
             # pinned image as C/S/F.  Its work/evidence root is shared with C
             # and the scheduler, while the product tree is read-only.
             image = shlex.quote(self.authority["hosts"]["q3"]["image"].get("reference", ""))
-            batch = (f"docker run --rm --name {token}-batch --network host {docker_mounts} "
+            # C and the compiler wrapper exchange an absolute CLOCK_MONOTONIC
+            # deadline whose wire identity includes /proc/self/ns/time.  C also
+            # needs host PID visibility for the wrapper's SO_PEERCRED identity;
+            # put the batch in that same PID/time namespace instead of letting
+            # Docker create a sibling time namespace that the sidecar must
+            # reject before the first source-transfer attempt.
+            batch = (f"docker run --rm --name {token}-batch --pid=host --network host {docker_mounts} "
                      f"-v {client_work}:{client_work}:rw {image} /bin/sh -c "
                      f"{shlex.quote(shlex.join([str(item) for item in command]))}")
             result = self.run("q3", batch)
