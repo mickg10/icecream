@@ -14,6 +14,7 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import re
 import shlex
 import signal
@@ -57,6 +58,14 @@ DEFAULT_REPORTED_WORKDIR = DEFAULT_CONTAINER_WORK_ROOT / "p50compilee2e.run"
 CONTAINER_DAEMON_USER = "icecc"
 CONTAINER_DAEMON_GROUP = "icecc"
 SCORED_CARET_WORKAROUND = "0"
+# Keep the runner's emitted identity aligned with the current intake schema.
+CALIBRATION_METADATA_FIELDS = frozenset(normalizer.CALIBRATION_METADATA_KEYS)
+HOST_DESCRIPTOR_SCHEMA = "icecream-s8-measurement-host-descriptor-v1"
+OUTPUT_CONTRACT_SCHEMA = "icecream-s8-output-compile-contract-v1"
+HOST_MACHINE_ID = Path("/etc/machine-id")
+HOST_DMI_PRODUCT_UUID = Path("/sys/class/dmi/id/product_uuid")
+HOST_DMI_BOARD_SERIAL = Path("/sys/class/dmi/id/board_serial")
+HOST_CPUINFO = Path("/proc/cpuinfo")
 
 
 class LiveRunnerError(ValueError):
@@ -91,6 +100,190 @@ def _hex(value: object, label: str) -> str:
     if not isinstance(value, str) or HEX64.fullmatch(value) is None or int(value, 16) == 0:
         _fail(f"{label}:invalid_digest")
     return value.lower()
+
+
+def _read_host_fact(path: Path, label: str) -> str:
+    """Read one stable host fact without retaining the raw identifier."""
+    try:
+        info = path.lstat()
+        if path.is_symlink() or not path.is_file() or info.st_nlink != 1:
+            _fail(f"host_descriptor:{label}:not_private_file")
+        raw = path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError) as exc:
+        raise LiveRunnerError(f"host_descriptor:{label}:unavailable") from exc
+    if not raw or "\x00" in raw:
+        _fail(f"host_descriptor:{label}:empty_or_binary")
+    return raw
+
+
+def _hash_host_fact(label: str, raw: str) -> str:
+    return hashlib.sha256(("icecream-s8-host-fact-v1\0" + label + "\0" + raw).encode(
+        "utf-8")).hexdigest()
+
+
+def _stable_host_facts() -> dict[str, object]:
+    """Capture stable physical-host facts before any container is launched."""
+    machine_id = _read_host_fact(HOST_MACHINE_ID, "machine_id")
+    dmi_path: Path | None = None
+    dmi_value = ""
+    for candidate, label in ((HOST_DMI_PRODUCT_UUID, "dmi_product_uuid"),
+                             (HOST_DMI_BOARD_SERIAL, "dmi_board_serial")):
+        try:
+            dmi_value = _read_host_fact(candidate, label)
+        except LiveRunnerError:
+            continue
+        dmi_path = candidate
+        break
+    try:
+        cpuinfo = _read_host_fact(HOST_CPUINFO, "cpuinfo")
+    except LiveRunnerError:
+        cpuinfo = ""
+    cpu_vendor = next((line.split(":", 1)[1].strip() for line in cpuinfo.splitlines()
+                       if line.startswith("vendor_id") and ":" in line), "")
+    cpu_model = next((line.split(":", 1)[1].strip() for line in cpuinfo.splitlines()
+                      if line.startswith("model name") and ":" in line), "")
+    cpu_vendor = cpu_vendor or platform.machine()
+    cpu_model = cpu_model or platform.processor() or platform.machine()
+    if not cpu_vendor or not cpu_model:
+        _fail("host_descriptor:cpu_identity:unavailable")
+    cpu_count = os.cpu_count()
+    if type(cpu_count) is not int or cpu_count <= 0:
+        _fail("host_descriptor:cpu_count:unavailable")
+    return {
+        "machine_id_sha256": _hash_host_fact("machine_id", machine_id),
+        "dmi_source": dmi_path.name if dmi_path is not None else "unavailable",
+        "dmi_identity_sha256": (_hash_host_fact(dmi_path.name, dmi_value)
+                                if dmi_path is not None else None),
+        "cpu_vendor_sha256": _hash_host_fact("cpu_vendor", cpu_vendor),
+        "cpu_model_sha256": _hash_host_fact("cpu_model", cpu_model),
+        "cpu_count": cpu_count,
+    }
+
+
+def capture_host_descriptor(path: Path) -> dict[str, object]:
+    """Persist an exact, redacted measurement-host descriptor once."""
+    if not path.is_absolute() or path.exists() or path.is_symlink():
+        _fail("host_descriptor:output_invalid")
+    value = {"schema": HOST_DESCRIPTOR_SCHEMA, "facts": _stable_host_facts()}
+    _write_new(path, _canonical(value) + b"\n")
+    digest, size = _sha(path)
+    return {"path": str(path), "sha256": digest, "bytes": size}
+
+
+def _load_host_descriptor(path: Path) -> tuple[dict[str, object], str, int]:
+    """Authenticate a previously captured descriptor and return its facts."""
+    try:
+        private = (path.is_absolute() and not path.is_symlink() and path.is_file() and
+                   path.stat().st_nlink == 1)
+    except OSError:
+        private = False
+    if not private:
+        _fail("host_descriptor:unavailable")
+    digest, size = _sha(path)
+    try:
+        value = normalizer.parse_json(path.read_bytes(), "host_descriptor")
+    except (normalizer.NormalizationError, OSError) as exc:
+        raise LiveRunnerError("host_descriptor:invalid_json") from exc
+    if not isinstance(value, dict) or set(value) != {"schema", "facts"} or \
+            value.get("schema") != HOST_DESCRIPTOR_SCHEMA:
+        _fail("host_descriptor:fields_invalid")
+    facts = value.get("facts")
+    required = {"machine_id_sha256", "dmi_source", "dmi_identity_sha256",
+                "cpu_vendor_sha256", "cpu_model_sha256", "cpu_count"}
+    if not isinstance(facts, dict) or set(facts) != required:
+        _fail("host_descriptor:facts_invalid")
+    for field in required - {"dmi_source", "cpu_count", "dmi_identity_sha256"}:
+        _hex(facts.get(field), f"host_descriptor.facts.{field}")
+    if (facts.get("dmi_source") not in {HOST_DMI_PRODUCT_UUID.name,
+                                         HOST_DMI_BOARD_SERIAL.name, "unavailable"} or
+            (facts.get("dmi_source") != "unavailable" and
+             not HEX64.fullmatch(facts.get("dmi_identity_sha256", ""))) or
+            type(facts.get("cpu_count")) is not int or facts["cpu_count"] <= 0 or
+            (facts.get("dmi_source") == "unavailable" and
+             facts.get("dmi_identity_sha256") is not None)):
+        _fail("host_descriptor:facts_invalid")
+    return value, digest, size
+
+
+def _authenticated_toolchain_digest(work: Path,
+                                    preparation: dict[str, Any]) -> str:
+    """Bind the product environment archive bytes to calibration identity."""
+    expected_sha = _hex(preparation.get("archive_sha256"),
+                        "toolchain.archive_sha256")
+    expected_bytes = preparation.get("archive_bytes")
+    if type(expected_bytes) is not int or expected_bytes <= 0:
+        _fail("toolchain.archive_bytes:invalid")
+    try:
+        candidates = sorted(path for path in (work / "toolchain").iterdir()
+                            if path.is_file() and not path.is_symlink() and
+                            path.suffix in {".gz", ".xz", ".zst", ".bz2", ".tgz", ".tar"})
+    except OSError as exc:
+        raise LiveRunnerError("toolchain:archive_unavailable") from exc
+    if len(candidates) != 1:
+        _fail("toolchain:archive_ambiguous_or_missing")
+    observed_sha, observed_bytes = _sha(candidates[0])
+    if observed_sha != expected_sha or observed_bytes != expected_bytes:
+        _fail("toolchain:archive_binding_mismatch")
+    return observed_sha
+
+
+def _output_contract_digest(rows: list[dict[str, Any]],
+                            observations: list[dict[str, Any]], suite: str) -> str:
+    """Hash the authenticated compile/output contract used by measured rows."""
+    if not rows or len(rows) != len(observations):
+        _fail("output_contract:row_count_mismatch")
+    for row, observed in zip(rows, observations, strict=True):
+        if not all(field in row for field in ("compile_db", "compile_db_sha256",
+                                               "compile_source", "compile_output")):
+            _fail("output_contract:compile_binding_missing")
+        _hex(row["compile_db_sha256"], "output_contract.compile_db")
+        if observed.get("remote_compile", True) is not True:
+            _fail("output_contract:remote_compile_required")
+    contract = {
+        "schema": OUTPUT_CONTRACT_SCHEMA,
+        "compile": {"authority": "authenticated_compile_database",
+                     "output_operand": "single_-o",
+                     "source_binding": "compile_entry_file", "required": True},
+        "measurement_window": "compile+result_return",
+        "output": {"remote_compile_required": True,
+                    "identity": "returned_remote_object_sha256",
+                    "bytes": "returned_remote_object_bytes"},
+    }
+    return hashlib.sha256(_canonical(contract)).hexdigest()
+
+
+def _calibration_metadata(*, runtime_image: dict[str, str],
+                          preparation: dict[str, Any], work: Path,
+                          rows: list[dict[str, Any]],
+                          observations: list[dict[str, Any]], suite: str,
+                          host_descriptor: Path) -> dict[str, str]:
+    """Derive the five identity fields from authenticated run authorities."""
+    if (set(runtime_image) != {"reference", "image_id", "architecture", "os", "created"} or
+            IMAGE_ID.fullmatch(runtime_image.get("image_id", "")) is None or
+            runtime_image.get("architecture") != "amd64" or
+            runtime_image.get("os") != "linux"):
+        _fail("calibration_metadata:product_image_invalid")
+    _value, host_digest, _host_bytes = _load_host_descriptor(host_descriptor)
+    return {
+        "product_image_digest": runtime_image["image_id"].removeprefix("sha256:"),
+        "toolchain_digest": _authenticated_toolchain_digest(work, preparation),
+        "output_contract_digest": _output_contract_digest(rows, observations, suite),
+        "host_digest": host_digest,
+        "ordered_input_class": "ordered",
+    }
+
+
+def _authenticated_host_binding(path: Path,
+                                launch_identity: dict[str, Any]) -> tuple[str, int]:
+    """Require the descriptor captured before launch to survive the run."""
+    _value, digest, size = _load_host_descriptor(path)
+    launch_host = launch_identity.get("host_descriptor")
+    if (not isinstance(launch_host, dict) or
+            set(launch_host) != {"sha256", "bytes"} or
+            launch_host.get("sha256") != digest or
+            launch_host.get("bytes") != size):
+        _fail("calibration_metadata:host_descriptor_changed_during_run")
+    return digest, size
 
 
 def _compile_entry_output_operand(entry: object) -> tuple[Path, str] | None:
@@ -1444,6 +1637,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
              launch_identity: dict[str, Any] | None = None,
              execution_environment: str = "host_product_build",
              runtime_image: dict[str, str] | None = None,
+             host_descriptor_path: Path | None = None,
              host_workdir: Path | None = None,
              reported_workdir: Path | None = None,
              timestamp: str | None = None, suite: str = TOPOLOGY) -> Path:
@@ -1526,6 +1720,21 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                                 reported_workdir)
     batch_windows = _batch_windows(stdout, observations, rows, passes, suite)
     _validate_product_log_evidence(work, observations, profile)
+    calibration_metadata: dict[str, str] | None = None
+    host_descriptor_binding: dict[str, object] | None = None
+    if launch_identity is not None:
+        if runtime_image is None or host_descriptor_path is None:
+            _fail("calibration_metadata:authority_missing")
+        if launch_identity.get("runtime_image") != runtime_image:
+            _fail("calibration_metadata:runtime_image_changed_during_run")
+        host_digest, host_bytes = _authenticated_host_binding(
+            host_descriptor_path, launch_identity)
+        calibration_metadata = _calibration_metadata(
+            runtime_image=runtime_image, preparation=environment_preparation,
+            work=work, rows=rows, observations=observations, suite=suite,
+            host_descriptor=host_descriptor_path)
+        host_descriptor_binding = {"path": "product-evidence/host-descriptor.json",
+                                   "sha256": host_digest, "bytes": host_bytes}
     stages = _action_stage(work, len(observations), assignments, suite)
     if len(stages) != len(observations):
         _fail("action_trace:stage_count_mismatch")
@@ -1580,6 +1789,13 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     shutil.copy2(predictive_plan, retained / "predictive-plan.json")
     if repeat_predictive_plan is not None:
         shutil.copy2(repeat_predictive_plan, retained / "predictive-plan-full-2.json")
+    if host_descriptor_path is not None and calibration_metadata is not None:
+        shutil.copy2(host_descriptor_path, retained / "host-descriptor.json")
+        retained_host_sha, retained_host_bytes = _sha(retained / "host-descriptor.json")
+        if (host_descriptor_binding is None or
+                retained_host_sha != host_descriptor_binding["sha256"] or
+                retained_host_bytes != host_descriptor_binding["bytes"]):
+            _fail("host_descriptor:snapshot_changed_during_copy")
     payload_raw = _canonical({"source_manifest_sha256": plan["source_manifest"]["sha256"],
                               "inputs": plan_inputs})
     _write_new(retained / "input-descriptors.json", payload_raw)
@@ -1748,6 +1964,9 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                       "measurement_window": "compile+result_return",
                       "environment_preparation": environment_preparation,
                       "prewarm": prewarm_descriptor,
+                      **({"calibration_metadata": calibration_metadata,
+                          "host_descriptor": host_descriptor_binding}
+                         if calibration_metadata is not None else {}),
                       "evidence": {"results": {"path": "results.jsonl", "sha256": hashlib.sha256(summary_raw).hexdigest(), "bytes": len(summary_raw)},
                                    "timing": {"path": "timing.jsonl", "sha256": hashlib.sha256(timing_raw).hexdigest(), "bytes": len(timing_raw)}},
                       "witness": witness}
@@ -1782,6 +2001,8 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                           "evidence": {"results_sha256": hashlib.sha256(summary_raw).hexdigest(),
                                        "evidence_manifest_sha256": evidence_manifest_sha,
                                        "binary_sha256": binaries, "evidence_sha256": evidence_value["evidence_sha256"]}}
+        if calibration_metadata is not None:
+            manifest_value.update(calibration_metadata)
         manifest_raw = _canonical(manifest_value) + b"\n"
         _write_new(target / curve_name, curve_raw)
         _write_new(target / manifest_name, manifest_raw)
@@ -1817,6 +2038,9 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                   "runner_sha256": runner_sha,
                   "environment_preparation": environment_preparation,
                   "launch_identity": launch_identity,
+                  **({"calibration_metadata": calibration_metadata,
+                      "host_descriptor": host_descriptor_binding}
+                     if calibration_metadata is not None else {}),
                   "curve_manifests": manifests, "remote_compile_required": True,
                   "batch_windows": batch_windows,
                   "scheduling": ({
@@ -1915,6 +2139,8 @@ def main(argv: list[str] | None = None) -> int:
                         default=DEFAULT_CONTAINER_TEMP_ROOT)
     parser.add_argument("--execute", action="store_true", help="execute one real run; intentionally separate from dry-run tests")
     args = parser.parse_args(argv)
+    if args.execute and args.execution_mode == "host":
+        _fail("calibration_metadata:runtime_image_required")
     batch_manifest = args.batch_manifest.absolute()
     predictive_plan = args.predictive_plan.absolute()
     repeat_predictive_plan = (args.repeat_predictive_plan.absolute()
@@ -1942,6 +2168,7 @@ def main(argv: list[str] | None = None) -> int:
     run_workdir: Path | None = None
     command_workdir: Path | None = None
     run_work_parent: Path | None = None
+    host_descriptor_path: Path | None = None
     runtime_image: dict[str, str] | None = None
     container_temp_root = (validated_container_temp_root(args.container_temp_root)
                            if args.execution_mode == "pinned-container" else None)
@@ -1956,11 +2183,15 @@ def main(argv: list[str] | None = None) -> int:
             command_workdir = DEFAULT_REPORTED_WORKDIR
             runtime_image = container_image_identity(args.container_image)
             execution_environment = "pinned_container_product_build"
+            host_descriptor_path = run_work_parent / "host-descriptor.json"
         else:
             run_workdir = Path(tempfile.mkdtemp(
                 prefix="p50compilee2e.", dir=tempfile.gettempdir()))
             run_workdir.rmdir()
             command_workdir = run_workdir
+            host_descriptor_path = run_workdir / "host-descriptor.json"
+        assert host_descriptor_path is not None
+        host_descriptor = capture_host_descriptor(host_descriptor_path)
     launch_identity = None
     if args.execute:
         launch_commit, launch_tree, launch_binaries, launch_runner_sha = product_identity(args.product_root.absolute())
@@ -1968,6 +2199,14 @@ def main(argv: list[str] | None = None) -> int:
                            "binary_sha256": launch_binaries, "runner_sha256": launch_runner_sha}
         if runtime_image is not None:
             launch_identity["runtime_image"] = runtime_image
+        if host_descriptor_path is None:
+            _fail("calibration_metadata:host_descriptor_missing")
+        host_digest = host_descriptor.get("sha256")
+        host_bytes = host_descriptor.get("bytes")
+        if (not isinstance(host_digest, str) or type(host_bytes) is not int):
+            _fail("calibration_metadata:host_descriptor_invalid")
+        launch_identity["host_descriptor"] = {"sha256": host_digest,
+                                               "bytes": host_bytes}
     command = build_command(batch_manifest, args.profile,
                             product_root=args.product_root.absolute(), corpus=args.corpus,
                             regime=args.regime, depth=args.depth, full_count=args.full_count,
@@ -2017,6 +2256,8 @@ def main(argv: list[str] | None = None) -> int:
                     stop_container(container_name(run_work_parent))
                 except LiveRunnerError as stop_exc:
                     cleanup_error = stop_exc
+            if host_descriptor_path is not None and host_descriptor_path.is_file():
+                host_descriptor_path.unlink()
             print(f"timeout_seconds={timeout}")
             print(f"workdir={run_workdir}" if run_workdir is not None else "workdir=unknown")
             print(str(exc))
@@ -2037,6 +2278,7 @@ def main(argv: list[str] | None = None) -> int:
                         launch_identity=launch_identity,
                         execution_environment=execution_environment,
                         runtime_image=runtime_image,
+                        host_descriptor_path=host_descriptor_path,
                         host_workdir=run_workdir
                         if args.execution_mode == "pinned-container" else None,
                         reported_workdir=command_workdir
@@ -2048,6 +2290,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"workdir={run_workdir}")
         return 77
     if run_work_parent is not None:
+        if host_descriptor_path is not None and host_descriptor_path.is_file():
+            host_descriptor_path.unlink()
         run_work_parent.rmdir()
     print(path)
     return 0

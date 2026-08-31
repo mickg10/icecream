@@ -1151,3 +1151,120 @@ def test_finalize_supplies_optional_metadata_to_normalized_live_record(
     assert len(records) == 1
     assert records[0]["record_type"] == "live"
     assert records[0]["provenance"]["producer"] == "s8_real_c1f1_live_runner"
+
+
+def test_host_descriptor_is_redacted_stable_and_content_addressed(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Host identity is stable while raw machine identifiers never persist."""
+    facts = {
+        runner.HOST_MACHINE_ID: "machine-secret-1\n",
+        runner.HOST_DMI_PRODUCT_UUID: "dmi-secret-1\n",
+        runner.HOST_CPUINFO: "vendor_id : GenuineTest\nmodel name : Test CPU\n",
+    }
+
+    def read(path: Path, label: str) -> str:
+        if path not in facts:
+            raise runner.LiveRunnerError(f"missing:{label}")
+        return facts[path].strip()
+
+    monkeypatch.setattr(runner, "_read_host_fact", read)
+    monkeypatch.setattr(runner.os, "cpu_count", lambda: 8)
+    monkeypatch.setattr(runner, "HOST_DMI_BOARD_SERIAL", tmp_path / "missing-board")
+    first = runner.capture_host_descriptor(tmp_path / "host-1.json")
+    second = runner.capture_host_descriptor(tmp_path / "host-2.json")
+    assert first["sha256"] == second["sha256"]
+    raw = (tmp_path / "host-1.json").read_text()
+    assert "machine-secret-1" not in raw
+    assert "dmi-secret-1" not in raw
+    assert runner._load_host_descriptor(tmp_path / "host-1.json")[1] == first["sha256"]
+
+
+def test_host_descriptor_deletion_and_change_are_fail_closed(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    facts = {
+        runner.HOST_MACHINE_ID: "machine-secret-2\n",
+        runner.HOST_DMI_PRODUCT_UUID: "dmi-secret-2\n",
+        runner.HOST_CPUINFO: "vendor_id : GenuineTest\nmodel name : Test CPU\n",
+    }
+    monkeypatch.setattr(runner, "_read_host_fact",
+                        lambda path, _label: facts[path].strip())
+    monkeypatch.setattr(runner.os, "cpu_count", lambda: 8)
+    descriptor = tmp_path / "host.json"
+    binding = runner.capture_host_descriptor(descriptor)
+    value = json.loads(descriptor.read_text())
+    del value["facts"]["machine_id_sha256"]
+    descriptor.write_text(json.dumps(value, sort_keys=True) + "\n")
+    with pytest.raises(runner.LiveRunnerError, match="facts_invalid"):
+        runner._load_host_descriptor(descriptor)
+    descriptor.unlink()
+    runner.capture_host_descriptor(descriptor)
+    changed = json.loads(descriptor.read_text())
+    changed["facts"]["cpu_count"] = 16
+    descriptor.write_text(json.dumps(changed, sort_keys=True) + "\n")
+    _value, digest, size = runner._load_host_descriptor(descriptor)
+    assert digest != binding["sha256"] or size != binding["bytes"]
+
+
+def test_host_descriptor_binding_rejects_deletion_and_changed_snapshot(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(runner, "_read_host_fact",
+                        lambda path, _label: {
+                            runner.HOST_MACHINE_ID: "machine-secret-4",
+                            runner.HOST_DMI_PRODUCT_UUID: "dmi-secret-4",
+                            runner.HOST_CPUINFO: "vendor_id : GenuineTest\nmodel name : Test CPU",
+                        }[path])
+    monkeypatch.setattr(runner.os, "cpu_count", lambda: 8)
+    descriptor = tmp_path / "host.json"
+    captured = runner.capture_host_descriptor(descriptor)
+    identity = {"host_descriptor": {"sha256": captured["sha256"],
+                                     "bytes": captured["bytes"]}}
+    assert runner._authenticated_host_binding(descriptor, identity) == (
+        captured["sha256"], captured["bytes"])
+    descriptor.unlink()
+    with pytest.raises(runner.LiveRunnerError, match="host_descriptor:unavailable"):
+        runner._authenticated_host_binding(descriptor, identity)
+    runner.capture_host_descriptor(descriptor)
+    changed = json.loads(descriptor.read_text())
+    changed["facts"]["cpu_count"] = 16
+    descriptor.write_text(json.dumps(changed, sort_keys=True) + "\n")
+    with pytest.raises(runner.LiveRunnerError,
+                       match="host_descriptor_changed_during_run"):
+        runner._authenticated_host_binding(descriptor, identity)
+
+
+def test_calibration_metadata_has_exact_fields_and_no_caller_override(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    facts = {
+        runner.HOST_MACHINE_ID: "machine-secret-3\n",
+        runner.HOST_DMI_PRODUCT_UUID: "dmi-secret-3\n",
+        runner.HOST_CPUINFO: "vendor_id : GenuineTest\nmodel name : Test CPU\n",
+    }
+    monkeypatch.setattr(runner, "_read_host_fact",
+                        lambda path, _label: facts[path].strip())
+    monkeypatch.setattr(runner.os, "cpu_count", lambda: 8)
+    descriptor = tmp_path / "host.json"
+    runner.capture_host_descriptor(descriptor)
+    archive = tmp_path / "work" / "toolchain" / "env.tar.gz"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"authenticated compiler environment")
+    archive_sha = hashlib.sha256(archive.read_bytes()).hexdigest()
+    work = archive.parents[1]
+    rows = [{"ordinal": 0, "predictive_input": {"ordinal": 0},
+             "compile_db": "/src/compile_commands.json",
+             "compile_db_sha256": "a" * 64, "compile_source": "/src/a.cc",
+             "compile_output": "/build/a.o"}]
+    observations = [{"remote_compile": True}]
+    metadata = runner._calibration_metadata(
+        runtime_image={"reference": runner.PINNED_IMAGE,
+                       "image_id": "sha256:" + "b" * 64,
+                       "architecture": "amd64", "os": "linux", "created": "now"},
+        preparation={"archive_sha256": archive_sha, "archive_bytes": archive.stat().st_size},
+        work=work, rows=rows, observations=observations,
+        suite=runner.TOPOLOGY, host_descriptor=descriptor)
+    assert set(metadata) == runner.CALIBRATION_METADATA_FIELDS
+    assert metadata["ordered_input_class"] == "ordered"
+    with pytest.raises(TypeError):
+        runner._calibration_metadata(  # type: ignore[call-arg]
+            metadata=metadata, runtime_image={}, preparation={}, work=work,
+            rows=rows, observations=observations, suite=runner.TOPOLOGY,
+            host_descriptor=descriptor)
