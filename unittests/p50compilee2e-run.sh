@@ -1371,10 +1371,17 @@ if test -n "$batch_manifest"; then
             compile_start_ns=$(sed -n '1p' "$timing_path" 2>/dev/null || true)
             compile_end_ns=$(sed -n '2p' "$timing_path" 2>/dev/null || true)
             if test -z "$compile_end_ns" && ! kill -0 "$compile_pid" 2>/dev/null; then
-                wait "$compile_pid" || true
-                compile_pid=
-                echo "FAIL: compile ended before remote-result timing ($run_label-$ordinal)" >&2
-                return 1
+                # The child writes the second row immediately before exit.
+                # It can exit between the reads above and kill -0, so consume
+                # the final file state before classifying the handoff as lost.
+                compile_start_ns=$(sed -n '1p' "$timing_path" 2>/dev/null || true)
+                compile_end_ns=$(sed -n '2p' "$timing_path" 2>/dev/null || true)
+                if test -z "$compile_end_ns"; then
+                    wait "$compile_pid" || true
+                    compile_pid=
+                    echo "FAIL: compile ended before remote-result timing ($run_label-$ordinal)" >&2
+                    return 1
+                fi
             fi
             test -n "$compile_end_ns" || sleep 0.005
         done
