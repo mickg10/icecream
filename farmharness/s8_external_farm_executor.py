@@ -837,7 +837,7 @@ PY
                             f"2>>/probe/work/c-service.stderr")
             client_daemon = (f"set -eu; root={shlex.quote(root_mount)}; image={shlex.quote(self.authority['hosts']['q3']['image'].get('reference', ''))}; test \"$(docker image inspect --format '{{{{.Id}}}}' \"$image\")\" = {self.authority['hosts']['q3']['image']['image_id']}; mkdir -p {client_work}/envs {client_work}/cache-runtime-c; "
                              f"chmod 1777 {client_work}/envs; chmod 700 {client_work}/cache-runtime-c; "
-                             f"docker run -d --name {token}-c --pid=host --network host --user 0 {profile_flag} -e ICECC_TEST_SOCKET=/probe/work/client.sock -e ICECC_P50_C_ACTION_TRACE=/probe/work/s7-warm-c-action-trace.jsonl -e ICECC_P50_C_LEGACY_WIRE_TRACE=/probe/work/s7-measured-c-legacy-wire-trace.jsonl -e ICECC_P50_TEST_READY_TRACE=/probe/work/ready-c.trace {docker_mounts} -v {client_work}:/probe/work:rw --entrypoint /bin/sh $image -c {shlex.quote(client_inner)} "
+                             f"docker run -d --name {token}-c --pid=host --network host --user 0 {profile_flag} -e ICECC_TEST_SOCKET=/probe/work/client.sock -e ICECC_P50_C_ACTION_TRACE=/probe/work/s7-warm-c-action-trace.jsonl -e ICECC_P50_C_LEGACY_WIRE_TRACE=/probe/work/s7-measured-c-legacy-wire-trace.jsonl -e ICECC_P50_TEST_READY_TRACE=/probe/work/ready-c.trace {docker_mounts} -v {client_work}:/probe/work:rw -v {client_work}:{client_work}:rw --entrypoint /bin/sh $image -c {shlex.quote(client_inner)} "
                              f">{client_work}/c.stdout 2>&1; test \"$(docker inspect --format '{{{{.State.Running}}}}' {token}-c)\" = true; docker inspect --format '{{{{.Id}}}}' {token}-c > {client_work}/c.container-id; docker inspect --format '{{{{.State.Pid}}}}' {token}-c > {client_work}/c.pid; "
                              f"printf 'S8_CONTAINER_ID=%s\\n' \"$(cat {client_work}/c.container-id)\"")
             self.run("q3", f"mkdir -p {client_work}; : >{client_work}/s7-prewarm-c-action-trace.jsonl; : >{client_work}/s7-prewarm-f-action-trace.jsonl")
@@ -852,7 +852,7 @@ PY
                            f"if test -f {client_work}/s7-warm-c-action-trace.jsonl; then mv {client_work}/s7-warm-c-action-trace.jsonl {client_work}/setup-c-action-trace.jsonl; fi; : >{client_work}/s7-warm-c-action-trace.jsonl; : >{client_work}/s7-measured-c-legacy-wire-trace.jsonl",
                            f"rm -rf {client_work}/cache-runtime-c; mkdir -p {client_work}/cache-runtime-c",
                            f"chmod 1777 {client_work}/envs; chmod 700 {client_work}/cache-runtime-c; "
-                           f"test \"$(docker image inspect --format '{{{{.Id}}}}' {q3_image})\" = {self.authority['hosts']['q3']['image']['image_id']}; docker run -d --name {token}-c --pid=host --network host --user 0 {profile_flag} -e ICECC_TEST_SOCKET=/probe/work/client.sock -e ICECC_P50_C_ACTION_TRACE=/probe/work/s7-warm-c-action-trace.jsonl -e ICECC_P50_C_LEGACY_WIRE_TRACE=/probe/work/s7-measured-c-legacy-wire-trace.jsonl -e ICECC_P50_TEST_READY_TRACE=/probe/work/ready-c.trace {docker_mounts} -v {client_work}:/probe/work:rw --entrypoint /bin/sh {q3_image} -c {shlex.quote(reset_c_inner)} >{client_work}/c.stdout 2>&1",
+                           f"test \"$(docker image inspect --format '{{{{.Id}}}}' {q3_image})\" = {self.authority['hosts']['q3']['image']['image_id']}; docker run -d --name {token}-c --pid=host --network host --user 0 {profile_flag} -e ICECC_TEST_SOCKET=/probe/work/client.sock -e ICECC_P50_C_ACTION_TRACE=/probe/work/s7-warm-c-action-trace.jsonl -e ICECC_P50_C_LEGACY_WIRE_TRACE=/probe/work/s7-measured-c-legacy-wire-trace.jsonl -e ICECC_P50_TEST_READY_TRACE=/probe/work/ready-c.trace {docker_mounts} -v {client_work}:/probe/work:rw -v {client_work}:{client_work}:rw --entrypoint /bin/sh {q3_image} -c {shlex.quote(reset_c_inner)} >{client_work}/c.stdout 2>&1",
                            f"docker inspect --format '{{{{.State.Running}}}}' {token}-c | grep -Fx true; for _ in $(seq 1 300); do grep -q '^READY v2 ' {client_work}/ready-c.trace && break; sleep 0.1; done; grep -q '^READY v2 ' {client_work}/ready-c.trace; docker inspect --format '{{{{.Id}}}}' {token}-c > {client_work}/c.container-id; cp {client_work}/c.container-id {client_work}/c-rotation-after-id; docker inspect --format '{{{{.State.Pid}}}}' {token}-c > {client_work}/c.pid; cat {client_work}/ready-c-before.trace {client_work}/ready-c.trace > {client_work}/ready-c-combined.trace; mv {client_work}/ready-c-combined.trace {client_work}/ready-c.trace",
                            f"before_ready=$(grep '^READY v2 ' {client_work}/ready-c-before.trace | tail -1); after_ready=$(grep '^READY v2 ' {client_work}/ready-c.trace | tail -1); field() {{ printf '%s\\n' \"$1\" | awk -v key=\"$2\" '{{for(i=1;i<=NF;i++){{split($i,a,\"=\"); if(a[1]==key){{print a[2]; exit}}}}}}'; }}; before_pid=$(field \"$before_ready\" pid); after_pid=$(field \"$after_ready\" pid); test -n \"$before_pid\" -a -n \"$after_pid\"; printf 'S8_SIDECAR_ROTATION role=C relationship=0 before_pid=%s after_pid=%s before_c_store_guid=%s after_c_store_guid=%s before_f_store_guid=%s after_f_store_guid=%s\\n' \"$before_pid\" \"$after_pid\" \"$(field \"$before_ready\" C_STORE_GUID)\" \"$(field \"$after_ready\" C_STORE_GUID)\" \"$(field \"$before_ready\" F_STORE_GUID)\" \"$(field \"$after_ready\" F_STORE_GUID)\" >{client_work}/external-rotation-evidence"]
             reset_lines.extend([f"for _ in $(seq 1 600); do test -f {client_work}/external-f-reset.ready && break; sleep 0.2; done",
@@ -1074,18 +1074,13 @@ PY'''
                 command = ["env", *external_env,
                            *[item for item in command[1:]
                              if not str(item).startswith("ICECC_P50_C1F1_WORKDIR=")]]
-            # The client shell and compiler run in the same authenticated
-            # pinned image as C/S/F.  Its work/evidence root is shared with C
-            # and the scheduler, while the product tree is read-only.
-            image = shlex.quote(self.authority["hosts"]["q3"]["image"].get("reference", ""))
             # C and the compiler wrapper exchange an absolute CLOCK_MONOTONIC
-            # deadline whose wire identity includes /proc/self/ns/time.  C also
-            # needs host PID visibility for the wrapper's SO_PEERCRED identity;
-            # put the batch in that same PID/time namespace instead of letting
-            # Docker create a sibling time namespace that the sidecar must
-            # reject before the first source-transfer attempt.
-            batch = (f"docker run --rm --name {token}-batch --pid=host --network host {docker_mounts} "
-                     f"-v {client_work}:{client_work}:rw {image} /bin/sh -c "
+            # deadline whose wire identity includes /proc/self/ns/time.
+            # ``--pid=host`` does not make two sibling Docker containers share
+            # a time namespace, so execute the batch inside C's already pinned
+            # container.  The second C bind above exposes the unique evidence
+            # root at the same absolute path expected by the mature runner.
+            batch = (f"docker exec --user 0 {token}-c /bin/sh -c "
                      f"{shlex.quote(shlex.join([str(item) for item in command]))}")
             result = self.run("q3", batch)
             supervisor_stop.set()

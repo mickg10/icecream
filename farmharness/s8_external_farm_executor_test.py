@@ -113,10 +113,12 @@ def test_cleanup_does_not_replace_primary_error_and_handles_container_owned_file
     assert source.index("failure-diagnostics") < source.index("cleanup_paths =")
 
 
-def test_external_c_and_batch_share_peer_pid_time_namespace_and_stop_scheduler_last() -> None:
+def test_external_batch_executes_inside_c_time_namespace_and_stops_scheduler_last() -> None:
     source = Path(executor.__file__).read_text(encoding="utf-8")
     assert source.count("-c --pid=host --network host --user 0") == 2
-    assert "-batch --pid=host --network host" in source
+    assert source.count("-v {client_work}:/probe/work:rw -v {client_work}:{client_work}:rw") == 2
+    assert "docker exec --user 0 {token}-c" in source
+    assert "docker run --rm --name {token}-batch" not in source
     targets = source[source.index("targets = [(\"q3\""):
                      source.index("cleanup = '''set -eu")]
     assert targets.index("reset-worker.pid") < targets.index("c.container-id")
@@ -276,7 +278,7 @@ def test_concrete_transport_invokes_q3_c_scheduler_and_non_q3_f(tmp_path: Path, 
             stdout = (("PASS: all-P50 C1F1\n"
                        f"S7_WORKDIR={workdir.group(1)}\n"
                        "S8_BATCH_METRICS max_concurrent_admitted_or_compiling_jobs=2\n")
-                      if "-batch" in script and workdir is not None else "")
+                      if "docker exec --user 0" in script and workdir is not None else "")
         return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
     monkeypatch.setattr(transport, "run", fake_run)
     monkeypatch.setattr(executor.s4, "run_script",
