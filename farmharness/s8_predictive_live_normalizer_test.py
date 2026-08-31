@@ -11,6 +11,7 @@ import pytest
 from s8_predictive_live_normalizer import (
     MANIFEST_SCHEMA,
     NormalizationError,
+    _validate_role_placement,
     canonical_bytes,
     comparison_descriptor,
     normalize,
@@ -206,6 +207,13 @@ def test_external_farm_live_is_eligible_when_placement_is_disjoint(tmp_path: Pat
                         authenticated_metadata=CALIBRATION_METADATA)
     assert all(record["execution_scope"] == "external_farm_timing" for record in records[1:])
     assert records[2]["role_placement"]["roles_disjoint"] is True
+
+
+def test_external_farm_rejects_f_host_overlapping_scheduler() -> None:
+    placement = {**EXTERNAL_PLACEMENT,
+                 "f_host_digests": [EXTERNAL_PLACEMENT["scheduler_host_digest"]]}
+    with pytest.raises(NormalizationError, match="role_placement:external_identity_invalid"):
+        _validate_role_placement(placement, "live")
 
 
 def test_calibration_authority_rejects_live_metadata_mismatch(tmp_path: Path) -> None:

@@ -995,6 +995,19 @@ def test_external_farm_manifest_rejects_client_worker_co_residence(tmp_path: Pat
         runner.load_external_farm_manifest(path, digest, runner.TOPOLOGY)
 
 
+def test_external_farm_manifest_rejects_scheduler_worker_co_residence(tmp_path: Path) -> None:
+    path, _digest = _external_farm(tmp_path)
+    value = json.loads(path.read_text())
+    scheduler_digest = "2" * 64
+    value["role_placement"]["scheduler_host_digest"] = scheduler_digest
+    value["role_placement"]["f_host_digests"][0] = scheduler_digest
+    value["workers"][0]["host_digest"] = scheduler_digest
+    path.write_bytes(runner._canonical(value) + b"\n")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    with pytest.raises(runner.LiveRunnerError, match="role_placement:external_identity_invalid"):
+        runner.load_external_farm_manifest(path, digest, runner.TOPOLOGY)
+
+
 def test_local_runner_declares_non_calibratable_role_placement() -> None:
     placement = runner._co_resident_role_placement("a" * 64, runner.PARALLEL_TOPOLOGY)
     assert placement["schema"] == runner.ROLE_PLACEMENT_SCHEMA

@@ -411,9 +411,8 @@ def _validate_execution_scope(value: object, mode: str) -> str | None:
         return None
     if not isinstance(value, str) or value not in EXECUTION_SCOPES:
         raise NormalizationError("execution_scope:invalid")
-    if mode == "predictive_sim" or value == "loopback_correctness_only":
-        if mode == "predictive_sim":
-            raise NormalizationError("execution_scope:predictive_sim_invalid")
+    if mode == "predictive_sim":
+        raise NormalizationError("execution_scope:predictive_sim_invalid")
     return value
 
 
@@ -446,7 +445,7 @@ def _validate_role_placement(value: object, mode: str) -> dict[str, object] | No
                 scheduler_digest != c_digest or any(item != c_digest for item in f_digests)):
             raise NormalizationError("role_placement:loopback_identity_invalid")
     elif (not roles_disjoint or not timing_eligible or
-          any(item == c_digest for item in f_digests) or
+          any(item in {c_digest, scheduler_digest} for item in f_digests) or
           len(set(f_digests)) != len(f_digests)):
         raise NormalizationError("role_placement:external_identity_invalid")
     if mode == "predictive_sim":
