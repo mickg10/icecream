@@ -28,6 +28,17 @@ ROLES = ("S", "C", "F")
 REAL_VERSIONS = (43, 44, 50)
 BOUNDARY_VERSIONS = (48, 49)
 ALL_VERSIONS = REAL_VERSIONS + BOUNDARY_VERSIONS
+P50_METHODS = ("ZSTD_TU", "ZSTD_ROUTE", "P29", "GRZ")
+P50_DEPTHS = ("100", "200", "full", "repeat-full")
+P50_REGIMES = ("cold", "warm")
+P50_ORDERS = ("AB", "BA")
+P50_TOPOLOGIES: tuple[dict[str, Any], ...] = (
+    {"id": "C1F1/100000", "f_relationships": 1,
+     "slots_per_f": 1, "global_slots": 1, "stream_capacity_tus": 100000},
+    {"id": "C1F20/40", "f_relationships": 20,
+     "slots_per_f": 2, "global_slots": 40, "stream_capacity_tus": None,
+     "stream_capacity_status": "NOT_DECLARED"},
+)
 
 # The source authorities are intentionally explicit.  P44 is not a typo for
 # P43: it is the distinct proto/cache lineage and its comm.h assertion is
@@ -81,6 +92,37 @@ RETAINED_ROLE_HASHES: dict[str, dict[str, str]] = {
         "C": "781804278af9aff93bff9d4f2f87a6d3152bc1cbe1804e41b926b1a0f22ebb9d",
         "E": "ee7d30b240c38bccf66d4afcdd45993f115a01d4a2fb4e9143d38596609d2ba4",
         "X": "5af26a01bc98fd6070b8c1e075b68f5969f1d15fb08aa1a231dd9319d238a062",
+    },
+}
+
+# The current source's profile registry names GRZ_RESIDUAL at the harness
+# boundary but accepts GRZ in the product-facing environment variable.  The
+# planner uses the shorter product method name requested by S4.
+P50_METHOD_CONTRACTS: dict[str, dict[str, Any]] = {
+    "ZSTD_TU": {"source_profile": "ZSTD_TU", "implemented": True},
+    "ZSTD_ROUTE": {"source_profile": "ZSTD_ROUTE", "implemented": True},
+    "P29": {"source_profile": "P29", "implemented": True},
+    "GRZ": {"source_profile": "GRZ_RESIDUAL", "implemented": True,
+            "build_requirement": "exact current P50 build with ICECC_P50_WITH_LIBBSC"},
+}
+
+# These names occur in historical/planning material but are absent from the
+# current P50CacheProfileRequest/CACHE_ADVERTISABLE_PROFILE_MASK inventory.
+# Keep them visible as opt-in future fixtures, never as required methods.
+OPTIONAL_UNACCEPTED_METHOD_EXTRAS: dict[str, dict[str, Any]] = {
+    "ZSTD_COHORT": {
+        "implemented": False, "accepted": False, "required": False,
+        "source_inventory": {
+            "files": ["services/comm.h"],
+            "finding": "absent from P50CacheProfileRequest and advertised profile mask",
+        },
+    },
+    "ZSTD_GLOBAL": {
+        "implemented": False, "accepted": False, "required": False,
+        "source_inventory": {
+            "files": ["services/comm.h"],
+            "finding": "global resource model is lifecycle state, not a current cache method/profile",
+        },
     },
 }
 
@@ -274,6 +316,50 @@ def _migration_orders(lower: int, upper: int, direction: str) -> list[dict[str, 
     return result
 
 
+def _measurement_contract() -> dict[str, Any]:
+    """Return the frozen dimensions for each required P50 method arm."""
+    cells = [
+        {
+            "id": f"p50-{method.lower()}-{depth}-{topology['id']}-{regime}-{order}",
+            "state": "s50-c50-f50", "method": method,
+            "depth": depth, "topology": topology["id"], "regime": regime,
+            "order": order, "counterbalanced_pair": f"{method}/{depth}/{topology['id']}/{regime}",
+            "cache_expected": True, "remote_compile_required": True,
+            "byte_identical_required": True,
+        }
+        for method in P50_METHODS
+        for depth in P50_DEPTHS
+        for topology in P50_TOPOLOGIES
+        for regime in P50_REGIMES
+        for order in P50_ORDERS
+    ]
+    return {
+        "scope": "homogeneous P50 only",
+        "state": "s50-c50-f50",
+        "methods": list(P50_METHODS),
+        "method_contracts": P50_METHOD_CONTRACTS,
+        "depths": list(P50_DEPTHS),
+        "topologies": [dict(topology) for topology in P50_TOPOLOGIES],
+        "regimes": list(P50_REGIMES),
+        "orders": list(P50_ORDERS),
+        "counterbalanced": True,
+        "counterbalance_unit": "method/depth/topology/regime pair with AB and BA",
+        "output_contract": {
+            "remote_compile": True,
+            "byte_identical": True,
+            "failed_or_censored_rows_retained": True,
+        },
+        "measurement_cells": cells,
+        "measurement_cell_count": len(cells),
+        "execution": {
+            "planned_only": True,
+            "runner": "later S4/S5 bound runner",
+            "preparation_outside_measurement": True,
+            "no_mixed_version_performance": True,
+        },
+    }
+
+
 def build_plan() -> dict[str, Any]:
     """Build the complete deterministic plan, without executing any arm."""
     states = [_state_descriptor(state) for state in STATIC_STATES]
@@ -292,28 +378,34 @@ def build_plan() -> dict[str, Any]:
     performance_arms = {
         "p43_homogeneous_legacy": {
             "state": "s43-c43-f43", "source_version": 43,
-            "mode": "legacy", "cache_expected": False,
+            "method": "WHOLE_LEGACY", "mode": "legacy", "cache_expected": False,
+            "cache_disabled": True,
             "artifact_requirement": "exact P43 release-tag binaries",
         },
         "p44_homogeneous_legacy": {
             "state": "s44-c44-f44", "source_version": 44,
-            "mode": "legacy", "cache_expected": False,
+            "method": "WHOLE_LEGACY", "mode": "legacy", "cache_expected": False,
+            "cache_disabled": True,
             "artifact_requirement": "exact P44 proto/cache-lineage binaries",
             "old_p44_cache_behavior": "UNRESOLVED",
         },
-        "p50_homogeneous_legacy": {
+        "p50_raw_ii_whole_legacy": {
             "state": "s50-c50-f50", "source_version": 50,
-            "mode": "legacy", "cache_expected": False,
+            "method": "RAW_II", "mode": "whole-legacy", "cache_expected": False,
             "cache_disabled": True,
             "artifact_requirement": "exact current P50 binaries; legacy/cache disabled",
         },
-        "p50_homogeneous_current": {
+    }
+    for method in P50_METHODS:
+        key = f"p50_{method.lower()}"
+        performance_arms[key] = {
             "state": "s50-c50-f50", "source_version": 50,
-            "mode": "current", "cache_expected": True,
+            "method": method, "mode": "current", "cache_expected": True,
             "cache_disabled": False,
             "artifact_requirement": "exact current P50 binaries and cache service",
-        },
-    }
+            "measurement_contract": "execution_measurement_contract",
+        }
+    measurement_contract = _measurement_contract()
     return {
         "schema": SCHEMA,
         "source": {"integration_head": P50_SOURCE_SHA, "harness": HARNESS_INVENTORY},
@@ -331,7 +423,15 @@ def build_plan() -> dict[str, Any]:
         "transition_count": len(transitions),
         "transition_class_counts": {"no-op": 27, "one-role": 162, "multi-role": 540},
         "homogeneous_states": ["s43-c43-f43", "s44-c44-f44", "s50-c50-f50"],
+        "homogeneous_version_arms": {
+            "P43": "p43_homogeneous_legacy",
+            "P44": "p44_homogeneous_legacy",
+            "P50": "p50_raw_ii_whole_legacy",
+        },
         "performance_arms": performance_arms,
+        "execution_measurement_contract": measurement_contract,
+        "optional_unaccepted_method_extras": OPTIONAL_UNACCEPTED_METHOD_EXTRAS,
+        "mixed_version_performance": "forbidden-correctness-only",
         "upgrade_orders": upgrade_orders,
         "downgrade_orders": downgrade_orders,
         "migration_orders": {
@@ -445,6 +545,71 @@ def audit_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
             if len(path) != 4 or path[0] != expected_start or path[-1] != expected_finish:
                 errors.append(f"downgrade-order-path:{key}")
 
+    arms = plan.get("performance_arms", {})
+    required_arms = {
+        "p43_homogeneous_legacy": ("s43-c43-f43", 43),
+        "p44_homogeneous_legacy": ("s44-c44-f44", 44),
+        "p50_raw_ii_whole_legacy": ("s50-c50-f50", 50),
+        **{f"p50_{method.lower()}": ("s50-c50-f50", 50) for method in P50_METHODS},
+    }
+    if "p50_homogeneous_current" in arms:
+        errors.append("generic-p50-current-arm-forbidden")
+    if not isinstance(arms, Mapping):
+        errors.append("performance-arms-not-object")
+        arms = {}
+    for key, (expected_state, expected_version) in required_arms.items():
+        arm = arms.get(key)
+        if not isinstance(arm, Mapping):
+            errors.append(f"missing-performance-arm:{key}")
+            continue
+        if arm.get("state") != expected_state or arm.get("source_version") != expected_version:
+            errors.append(f"performance-arm-identity:{key}")
+        try:
+            if not homogeneous(parse_state(arm.get("state"))):
+                errors.append(f"mixed-performance-arm:{key}")
+        except PlannerError:
+            errors.append(f"performance-arm-state:{key}")
+    contract = plan.get("execution_measurement_contract")
+    if not isinstance(contract, Mapping):
+        errors.append("execution-measurement-contract-missing")
+        contract = {}
+    if tuple(contract.get("methods", ())) != P50_METHODS:
+        errors.append("measurement-methods")
+    if tuple(contract.get("depths", ())) != P50_DEPTHS:
+        errors.append("measurement-depths")
+    if tuple(contract.get("regimes", ())) != P50_REGIMES:
+        errors.append("measurement-regimes")
+    if tuple(contract.get("orders", ())) != P50_ORDERS or contract.get("counterbalanced") is not True:
+        errors.append("measurement-counterbalance")
+    topology_ids = tuple(item.get("id") for item in contract.get("topologies", ())
+                         if isinstance(item, Mapping))
+    if topology_ids != tuple(item["id"] for item in P50_TOPOLOGIES):
+        errors.append("measurement-topologies")
+    measurements = contract.get("measurement_cells", ())
+    expected_measurements = {
+        (method, depth, topology["id"], regime, order)
+        for method in P50_METHODS for depth in P50_DEPTHS
+        for topology in P50_TOPOLOGIES for regime in P50_REGIMES
+        for order in P50_ORDERS
+    }
+    observed_measurements: set[tuple[object, ...]] = set()
+    if not isinstance(measurements, list) or len(measurements) != len(expected_measurements):
+        errors.append("measurement-cell-count")
+        measurements = []
+    for item in measurements:
+        if not isinstance(item, Mapping):
+            errors.append("measurement-cell-not-object")
+            continue
+        identity = (item.get("method"), item.get("depth"), item.get("topology"),
+                    item.get("regime"), item.get("order"))
+        observed_measurements.add(identity)
+        if item.get("state") != "s50-c50-f50" or item.get("cache_expected") is not True:
+            errors.append(f"measurement-state:{item.get('id')}")
+        if item.get("remote_compile_required") is not True or item.get("byte_identical_required") is not True:
+            errors.append(f"measurement-byte-exact:{item.get('id')}")
+    if observed_measurements != expected_measurements:
+        errors.append("measurement-grid-mismatch")
+
     extras = plan.get("boundary_extras", ())
     for version in BOUNDARY_VERSIONS:
         row = next((item for item in extras if isinstance(item, Mapping) and item.get("version") == version), None)
@@ -461,6 +626,8 @@ def audit_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
         "ordered_pairs_unique": len(seen_pairs),
         "upgrade_order_counts": {key: len(plan.get("upgrade_orders", {}).get(key, ())) for key in ("43_to_50", "44_to_50")},
         "downgrade_order_counts": {key: len(plan.get("downgrade_orders", {}).get(key, ())) for key in ("50_to_43", "50_to_44")},
+        "performance_arm_count": len(arms),
+        "p50_measurement_count": len(measurements),
     }
 
 

@@ -59,8 +59,28 @@ class S4VersionTransitionPlannerTest(unittest.TestCase):
                          ["s43-c43-f43", "s44-c44-f44", "s50-c50-f50"])
         self.assertEqual(arms["p43_homogeneous_legacy"]["state"], "s43-c43-f43")
         self.assertEqual(arms["p44_homogeneous_legacy"]["state"], "s44-c44-f44")
-        self.assertTrue(arms["p50_homogeneous_legacy"]["cache_disabled"])
-        self.assertTrue(arms["p50_homogeneous_current"]["cache_expected"])
+        self.assertTrue(arms["p50_raw_ii_whole_legacy"]["cache_disabled"])
+        self.assertEqual(self.plan["homogeneous_version_arms"], {
+            "P43": "p43_homogeneous_legacy",
+            "P44": "p44_homogeneous_legacy",
+            "P50": "p50_raw_ii_whole_legacy",
+        })
+
+    def test_p50_methods_are_named_and_cover_every_execution_dimension(self) -> None:
+        contract = self.plan["execution_measurement_contract"]
+        self.assertEqual(contract["methods"], ["ZSTD_TU", "ZSTD_ROUTE", "P29", "GRZ"])
+        self.assertEqual(contract["depths"], ["100", "200", "full", "repeat-full"])
+        self.assertEqual([item["id"] for item in contract["topologies"]],
+                         ["C1F1/100000", "C1F20/40"])
+        self.assertEqual(contract["regimes"], ["cold", "warm"])
+        self.assertEqual(contract["orders"], ["AB", "BA"])
+        self.assertTrue(contract["counterbalanced"])
+        self.assertEqual(len(contract["measurement_cells"]), 128)
+        self.assertEqual(set(arms for arms in self.plan["performance_arms"] if arms.startswith("p50_")),
+                         {"p50_raw_ii_whole_legacy", "p50_zstd_tu", "p50_zstd_route", "p50_p29", "p50_grz"})
+        self.assertTrue(all(item["state"] == "s50-c50-f50" and
+                            item["byte_identical_required"]
+                            for item in contract["measurement_cells"]))
 
     def test_each_baseline_has_six_upgrade_and_downgrade_orders(self) -> None:
         self.assertEqual({key: len(value) for key, value in self.plan["upgrade_orders"].items()},
@@ -76,6 +96,13 @@ class S4VersionTransitionPlannerTest(unittest.TestCase):
         self.assertEqual([row["version"] for row in self.plan["boundary_extras"]], [48, 49])
         self.assertTrue(all(not row["required_real_artifact"] for row in self.plan["boundary_extras"]))
         self.assertFalse(any(48 in state or 49 in state for state in STATIC_STATES))
+
+    def test_cohort_and_global_are_optional_unaccepted_extras(self) -> None:
+        extras = self.plan["optional_unaccepted_method_extras"]
+        for method in ("ZSTD_COHORT", "ZSTD_GLOBAL"):
+            self.assertFalse(extras[method]["implemented"])
+            self.assertFalse(extras[method]["accepted"])
+            self.assertFalse(extras[method]["required"])
 
     def test_auditor_is_fail_closed_on_cache_mutation(self) -> None:
         mutant = json.loads(json.dumps(self.plan))
