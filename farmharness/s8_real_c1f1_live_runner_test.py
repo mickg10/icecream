@@ -1053,6 +1053,171 @@ def test_local_runner_declares_non_calibratable_role_placement() -> None:
     assert placement["f_host_digests"] == ["a" * 64]
 
 
+def _external_authority(tmp_path: Path, manifest: Path, manifest_sha: str) -> tuple[Path, str]:
+    """Build the standalone host/image authority consumed by the adapter."""
+    descriptor = tmp_path / "external-host-descriptor.json"
+    descriptor.write_bytes(runner._canonical({
+        "schema": runner.HOST_DESCRIPTOR_SCHEMA,
+        "facts": {
+            "machine_id_sha256": "1" * 64,
+            "dmi_source": "unavailable",
+            "dmi_identity_sha256": None,
+            "cpu_vendor_sha256": "2" * 64,
+            "cpu_model_sha256": "3" * 64,
+            "cpu_count": 8,
+        },
+    }) + b"\n")
+    descriptor_sha = hashlib.sha256(descriptor.read_bytes()).hexdigest()
+    manifest_value = json.loads(manifest.read_text())
+    metadata = {"product_image_digest": "7" * 64,
+                "toolchain_digest": "5" * 64,
+                "output_contract_digest": "6" * 64,
+                "host_digest": descriptor_sha,
+                "ordered_input_class": "ordered"}
+    authority = {
+        "schema": runner.EXTERNAL_FARM_AUTHORITY_SCHEMA,
+        "suite": manifest_value["suite"], "manifest_sha256": manifest_sha,
+        "role_placement": manifest_value["role_placement"],
+        "runtime_image": {"reference": runner.PINNED_IMAGE,
+                           "image_id": "sha256:" + "7" * 64,
+                           "architecture": "amd64", "os": "linux", "created": "now"},
+        "host_descriptor": {"path": str(descriptor), "sha256": descriptor_sha,
+                             "bytes": descriptor.stat().st_size},
+        "calibration_metadata": metadata,
+    }
+    path = tmp_path / "external-authority.json"
+    path.write_bytes(runner._canonical(authority) + b"\n")
+    return path, hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_external_binding_requires_independent_authority_and_binds_hashes(
+        tmp_path: Path) -> None:
+    manifest, manifest_sha = _external_farm(tmp_path)
+    authority, authority_sha = _external_authority(tmp_path, manifest, manifest_sha)
+    external = runner.ExternalFarmFinalization(
+        manifest, manifest_sha, authority, authority_sha,
+        tmp_path / "p50compilee2e.external", f"S7_WORKDIR={tmp_path / 'p50compilee2e.external'}")
+    (tmp_path / "p50compilee2e.external").mkdir()
+    binding = runner._external_farm_binding(external, runner.TOPOLOGY)
+    assert binding["manifest"]["sha256"] == manifest_sha
+    assert binding["authority"]["sha256"] == authority_sha
+    assert binding["role_placement"] == json.loads(manifest.read_text())["role_placement"]
+
+
+def test_external_binding_rejects_authority_hash_mutation_and_local_launch(
+        tmp_path: Path) -> None:
+    manifest, manifest_sha = _external_farm(tmp_path)
+    authority, authority_sha = _external_authority(tmp_path, manifest, manifest_sha)
+    work = tmp_path / "p50compilee2e.external"; work.mkdir()
+    external = runner.ExternalFarmFinalization(
+        manifest, manifest_sha, authority, authority_sha, work,
+        f"S7_WORKDIR={work}")
+    authority.write_bytes(authority.read_bytes() + b"\n")
+    with pytest.raises(runner.LiveRunnerError, match="authority:sha256_mismatch"):
+        runner._external_farm_binding(external, runner.TOPOLOGY)
+    with pytest.raises(runner.LiveRunnerError, match="local_execution_authority_present"):
+        # The local identity is intentionally rejected before any product
+        # parsing, so a caller cannot relabel a loopback run as external.
+        runner.finalize(external.stdout, 0, batch_manifest=manifest, topology=manifest,
+                        predictive_plan=manifest, output=tmp_path / "out", profile="ZSTD_TU",
+                        product_root=tmp_path, external_farm=external,
+                        launch_identity={"source_commit": "a" * 40},
+                        execution_environment="external_farm_product_build")
+
+
+def test_external_binding_rejects_disconnected_worker_host_digest(
+        tmp_path: Path) -> None:
+    manifest, _digest = _external_farm(tmp_path)
+    value = json.loads(manifest.read_text())
+    value["workers"][0]["host_digest"] = "9" * 64
+    manifest.write_bytes(runner._canonical(value) + b"\n")
+    with pytest.raises(runner.LiveRunnerError, match="worker_binding_mismatch|identity_invalid"):
+        runner.load_external_farm_manifest(
+            manifest, hashlib.sha256(manifest.read_bytes()).hexdigest(), runner.TOPOLOGY)
+
+
+@pytest.mark.parametrize(("mutation", "message"), [
+    (lambda value: value.update({"suite": runner.PARALLEL_TOPOLOGY}), "identity_invalid"),
+    (lambda value: value["scheduler"].update({"host": "127.0.0.1"}), "loopback"),
+    (lambda value: value["workers"][0].update({"host_digest": "1" * 64}), "identity_invalid"),
+])
+def test_external_manifest_rejects_transport_identity_mutations(
+        tmp_path: Path, mutation: object, message: str) -> None:
+    path, _digest = _external_farm(tmp_path)
+    value = json.loads(path.read_text())
+    mutation(value)  # type: ignore[operator]
+    path.write_bytes(runner._canonical(value) + b"\n")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    with pytest.raises(runner.LiveRunnerError, match=message):
+        runner.load_external_farm_manifest(path, digest, runner.TOPOLOGY)
+
+
+def test_external_finalizer_propagates_scope_placement_and_authority(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    batch_manifest = tmp_path / "batch.jsonl"; batch_manifest.write_bytes(b"batch\n")
+    topology = tmp_path / "topology.json"
+    topology.write_bytes(runner._canonical({"assignments": []}) + b"\n")
+    predictive_plan = tmp_path / "predictive-plan.json"; predictive_plan.write_bytes(b"plan\n")
+    work = tmp_path / "p50compilee2e.external"; work.mkdir()
+    (work / "s7-measured-c-action-trace.jsonl").write_bytes(b"c-action\n")
+    (work / "s7-measured-f-action-trace.jsonl").write_bytes(b"f-action\n")
+    rows = [{"tu_id": "tu-0"}]
+    plan = {"source_manifest": {"sha256": "a" * 64},
+            "scheduling": {"topology": runner.TOPOLOGY,
+                            "assignments": [{"ordinal": 0, "global_slot": 0}]}}
+    plan_sha = hashlib.sha256(predictive_plan.read_bytes()).hexdigest()
+    monkeypatch.setattr(runner, "load_predictive_plan",
+                        lambda *_args, **_kwargs: (plan, [{"ordinal": 0}], plan_sha))
+    monkeypatch.setattr(runner, "load_batch_manifest", lambda *_args: rows)
+    monkeypatch.setattr(runner, "bind_batch_to_plan", lambda *_args: None)
+    topology_sha = hashlib.sha256(topology.read_bytes()).hexdigest()
+    monkeypatch.setattr(runner, "load_topology", lambda *_args: topology_sha)
+    monkeypatch.setattr(runner, "_retained_workdir", lambda stdout, **_kwargs: work)
+    monkeypatch.setattr(runner, "_environment_preparation", lambda *_args: {})
+    monkeypatch.setattr(runner, "_binary_identity", lambda *_args: {"client/icecc": "e" * 64})
+    monkeypatch.setattr(runner, "product_identity",
+                        lambda *_args: ("f" * 40, "1" * 40, {"client/icecc": "e" * 64}, "2" * 64))
+    monkeypatch.setattr(runner, "_timing_rows", lambda *_args: [])
+    monkeypatch.setattr(runner, "_batch_windows",
+                        lambda *_args: {"full-1": {"start_ns": 1, "end_ns": 2}})
+    monkeypatch.setattr(runner, "_validate_product_log_evidence", lambda *_args: None)
+    monkeypatch.setattr(runner, "_action_stage", lambda *_args: [])
+    metadata = {"product_image_digest": "7" * 64, "toolchain_digest": "5" * 64,
+                "output_contract_digest": "6" * 64, "host_digest": "0" * 64,
+                "ordered_input_class": "ordered"}
+    monkeypatch.setattr(runner, "_calibration_metadata", lambda **_kwargs: metadata)
+    monkeypatch.setattr(runner, "_live_curve_rows",
+                        lambda *_args: [{"step": 0, "tu_id": "tu-0",
+                                         "cumulative": {"channel_bytes": 1, "elapsed_ns": 1}}])
+    manifest, manifest_sha = _external_farm(tmp_path)
+    authority, authority_sha = _external_authority(tmp_path, manifest, manifest_sha)
+    authority_value = json.loads(authority.read_text())
+    descriptor = Path(authority_value["host_descriptor"]["path"])
+    metadata["host_digest"] = hashlib.sha256(descriptor.read_bytes()).hexdigest()
+    authority_value["calibration_metadata"] = metadata
+    authority.write_bytes(runner._canonical(authority_value) + b"\n")
+    authority_sha = hashlib.sha256(authority.read_bytes()).hexdigest()
+    external = runner.ExternalFarmFinalization(
+        manifest, manifest_sha, authority, authority_sha, work,
+        f"PASS: all-P50 C1F1\nS7_WORKDIR={work}\nS8_BATCH_COUNT=1\n"
+        f"S8_SUITE={runner.TOPOLOGY}\nS8_BATCH_PASSES=1\nS8_BATCH_WARM=0\n"
+        "S8_SCHEDULING mode=relationship-ordered execution_slots=1 relationships=1 "
+        "planned_admission_lanes_per_relationship=1\n")
+    output = runner.finalize(
+        external.stdout, 0, batch_manifest=batch_manifest, topology=topology,
+        predictive_plan=predictive_plan, output=tmp_path / "output", profile="ZSTD_TU",
+        product_root=tmp_path, corpus="DuckDB", regime="cold", depth="full", full_count=1,
+        passes=1, timestamp="20260831T000000Z", execution_environment="external_farm_product_build",
+        external_farm=external)
+    evidence = json.loads((output / "evidence.json").read_text())
+    curve_manifest = json.loads((output / "live_curve_manifest.json").read_text())
+    experiment = json.loads((output / "experiment_manifest.json").read_text())
+    assert evidence["execution_scope"] == runner.EXTERNAL_FARM_EXECUTION_SCOPE
+    assert curve_manifest["role_placement"] == evidence["role_placement"]
+    assert experiment["external_farm"]["manifest"]["sha256"] == manifest_sha
+    assert (output / "product-evidence" / "external-farm-authority.json").is_file()
+
+
 def test_parallel_batch_window_requires_real_overlap() -> None:
     rows = [{} for _ in range(40)]
     observations = []
