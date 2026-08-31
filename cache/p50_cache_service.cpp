@@ -823,14 +823,48 @@ bool handle_connection(local::Connection connection, const Options& options,
         const auto deadline = std::chrono::steady_clock::now() +
                               std::chrono::milliseconds{kHandshakeMilliseconds};
         local::Frame operation_frame;
-        if (connection.receive_until(operation_frame, deadline) != local::Status::Ok ||
-            operation_frame.type != local::MessageType::Data ||
-            local::validate_identity(operation_frame, options.identity) != local::Status::Ok)
+        const local::Status receive_status =
+            connection.receive_until(operation_frame, deadline);
+        if (receive_status != local::Status::Ok) {
+            // A daemon may close an authenticated idle relationship without
+            // starting an operation.  That ordinary EOF needs no diagnostic.
+            if (receive_status != local::Status::CleanEof) {
+                std::fprintf(stderr,
+                             "P50_CONTROL_REFUSED stage=operation-frame "
+                             "receive=%s\n",
+                             local::status_name(receive_status));
+                std::fflush(stderr);
+            }
             return true;
+        }
+        const local::Status identity_status =
+            local::validate_identity(operation_frame, options.identity);
+        if (operation_frame.type != local::MessageType::Data ||
+            identity_status != local::Status::Ok) {
+            std::fprintf(stderr,
+                         "P50_CONTROL_REFUSED stage=operation-frame receive=ok "
+                         "type=%u identity=%s\n",
+                         static_cast<unsigned>(operation_frame.type),
+                         local::status_name(identity_status));
+            std::fflush(stderr);
+            return true;
+        }
         local::ControlOperation operation;
-        if (!local::decode_control_operation(operation_frame.payload, operation) ||
-            operation.identity != options.identity || operation.request_id == 0)
+        const bool operation_decoded =
+            local::decode_control_operation(operation_frame.payload, operation);
+        if (!operation_decoded || operation.identity != options.identity ||
+            operation.request_id == 0) {
+            std::fprintf(stderr,
+                         "P50_CONTROL_REFUSED stage=operation-decode decoded=%u "
+                         "payload_bytes=%zu generation=%llu attempt=%llu request=%llu\n",
+                         operation_decoded ? 1u : 0u,
+                         operation_frame.payload.size(),
+                         static_cast<unsigned long long>(operation.identity.generation),
+                         static_cast<unsigned long long>(operation.identity.attempt),
+                         static_cast<unsigned long long>(operation.request_id));
+            std::fflush(stderr);
             return true;
+        }
 
         if (operation.kind == local::ControlOperationKind::CacheSession) {
             /*
@@ -857,45 +891,117 @@ bool handle_connection(local::Connection connection, const Options& options,
         }
         if (operation.kind == local::ControlOperationKind::SourceTransfer) {
             const auto clock = sidecar::process_monotonic_clock_identity();
-            if (!operation.source_arm.has_value() ||
-                !operation.absolute_deadline.valid() ||
-                !operation.absolute_deadline.matches_clock(clock) ||
-                operation.absolute_deadline.expired(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now().time_since_epoch())
-                        .count(),
-                    clock.clock_domain_id, clock.time_namespace_id))
+            const int64_t now_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count();
+            const bool source_present = operation.source_arm.has_value();
+            const bool deadline_valid = operation.absolute_deadline.valid();
+            const bool clock_matches =
+                operation.absolute_deadline.matches_clock(clock);
+            const bool deadline_expired = operation.absolute_deadline.expired(
+                now_ns, clock.clock_domain_id, clock.time_namespace_id);
+            if (!source_present || !deadline_valid || !clock_matches ||
+                deadline_expired) {
+                std::fprintf(
+                    stderr,
+                    "P50_SOURCE_TRANSFER_REFUSED stage=deadline request=%llu "
+                    "source=%u valid=%u clock_match=%u expired=%u now_ns=%lld "
+                    "expires_ns=%lld operation_clock=%llu "
+                    "operation_time_namespace=%llu local_clock=%llu "
+                    "local_time_namespace=%llu\n",
+                    static_cast<unsigned long long>(operation.request_id),
+                    source_present ? 1u : 0u, deadline_valid ? 1u : 0u,
+                    clock_matches ? 1u : 0u, deadline_expired ? 1u : 0u,
+                    static_cast<long long>(now_ns),
+                    static_cast<long long>(operation.absolute_deadline.expires_at_ns),
+                    static_cast<unsigned long long>(
+                        operation.absolute_deadline.clock_domain_id),
+                    static_cast<unsigned long long>(
+                        operation.absolute_deadline.time_namespace_id),
+                    static_cast<unsigned long long>(clock.clock_domain_id),
+                    static_cast<unsigned long long>(clock.time_namespace_id));
+                std::fflush(stderr);
                 return true;
+            }
             local::FdHandoffReceiver receiver;
             const local::FdHandoffResult handoff = receiver.receive_and_ack(
                 connection, local::HandoffRequest{options.identity, operation.request_id},
                 operation.absolute_deadline.as_steady_time_point());
-            if (handoff.status != local::FdHandoffStatus::Accepted)
+            if (handoff.status != local::FdHandoffStatus::Accepted) {
+                std::fprintf(stderr,
+                             "P50_SOURCE_TRANSFER_REFUSED stage=fd-handoff "
+                             "request=%llu status=%s state=%u\n",
+                             static_cast<unsigned long long>(operation.request_id),
+                             local::fd_handoff_status_name(handoff.status),
+                             static_cast<unsigned>(handoff.sender_state));
+                std::fflush(stderr);
                 return true;
+            }
             local::HandoffFd source = receiver.take_adopted_fd();
             const local::P50SourceTransferResult transfer =
                 runtime.transfer_source_on_owner(
                     *operation.source_arm, operation.absolute_deadline,
                     std::move(source));
+            if (transfer.code != local::SourceTransferResultCode::Committed) {
+                std::fprintf(stderr,
+                             "P50_SOURCE_TRANSFER_REFUSED stage=owner-result "
+                             "request=%llu code=%u error=%u attempts=%u\n",
+                             static_cast<unsigned long long>(operation.request_id),
+                             static_cast<unsigned>(transfer.code),
+                             static_cast<unsigned>(transfer.error_code),
+                             static_cast<unsigned>(transfer.attempts));
+                std::fflush(stderr);
+            }
             const std::vector<uint8_t> response_payload =
                 local::encode_control_operation(
                     local::make_source_transfer_reply_operation(operation, transfer));
-            if (response_payload.empty())
+            if (response_payload.empty()) {
+                std::fprintf(stderr,
+                             "P50_SOURCE_TRANSFER_REFUSED stage=response-encode "
+                             "request=%llu\n",
+                             static_cast<unsigned long long>(operation.request_id));
+                std::fflush(stderr);
                 return true;
+            }
             const auto operation_deadline = operation.absolute_deadline.as_steady_time_point();
             const local::Frame response{local::kProtocolVersion,
                                         local::MessageType::Data,
                                         options.identity, response_payload};
-            if (connection.send_until(response, operation_deadline) != local::Status::Ok)
+            const local::Status response_status =
+                connection.send_until(response, operation_deadline);
+            if (response_status != local::Status::Ok) {
+                std::fprintf(stderr,
+                             "P50_SOURCE_TRANSFER_REFUSED stage=response-send "
+                             "request=%llu status=%s\n",
+                             static_cast<unsigned long long>(operation.request_id),
+                             local::status_name(response_status));
+                std::fflush(stderr);
                 return true;
+            }
             local::Frame acknowledgement;
-            if (connection.receive_until(acknowledgement, operation_deadline) !=
-                    local::Status::Ok ||
+            const local::Status acknowledgement_status =
+                connection.receive_until(acknowledgement, operation_deadline);
+            const local::Status acknowledgement_identity =
+                acknowledgement_status == local::Status::Ok
+                    ? local::validate_identity(acknowledgement, options.identity)
+                    : local::Status::IdentityMismatch;
+            if (acknowledgement_status != local::Status::Ok ||
                 acknowledgement.type != local::MessageType::Goodbye ||
                 !acknowledgement.payload.empty() ||
-                local::validate_identity(acknowledgement, options.identity) !=
-                    local::Status::Ok)
+                acknowledgement_identity != local::Status::Ok) {
+                std::fprintf(stderr,
+                             "P50_SOURCE_TRANSFER_REFUSED stage=response-ack "
+                             "request=%llu receive=%s type=%u payload_bytes=%zu "
+                             "identity=%s\n",
+                             static_cast<unsigned long long>(operation.request_id),
+                             local::status_name(acknowledgement_status),
+                             static_cast<unsigned>(acknowledgement.type),
+                             acknowledgement.payload.size(),
+                             local::status_name(acknowledgement_identity));
+                std::fflush(stderr);
                 return true;
+            }
             return true;
         }
         if (!operation.input.has_value() || !operation.owner.has_value())
@@ -1223,37 +1329,54 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     auto open_armed = [arm](std::chrono::steady_clock::time_point limit,
                              FStoreGuid& remote_guid,
                              uint64_t& remote_generation) {
+        const auto refused = [&arm](const char* stage, long long detail = 0) {
+            std::fprintf(stderr,
+                         "P50_SOURCE_TRANSFER_REFUSED stage=%s request=%llu "
+                         "f_host=%s f_cache_port=%u detail=%lld\n",
+                         stage,
+                         static_cast<unsigned long long>(arm.source_request_id),
+                         arm.selected_f_host.c_str(), arm.selected_f_cache_port,
+                         detail);
+            std::fflush(stderr);
+            return -1;
+        };
         try {
             std::unique_ptr<MsgChannel> channel(Service::createChannelUntil(
                 arm.selected_f_host,
                 static_cast<unsigned short>(arm.selected_f_cache_port), limit));
-            if (!channel || channel->protocol != PROTOCOL_VERSION_CACHE_ADVERTISEMENT ||
-                std::chrono::steady_clock::now() >= limit)
-                return -1;
+            if (!channel)
+                return refused("f-connect");
+            if (channel->protocol != PROTOCOL_VERSION_CACHE_ADVERTISEMENT)
+                return refused("f-protocol", channel->protocol);
+            if (std::chrono::steady_clock::now() >= limit)
+                return refused("f-connect-deadline");
             const P50SourceArmMsg request_message(arm);
             if (!channel->send_msg(request_message, MsgChannel::SendNonBlocking))
-                return -1;
+                return refused("f-arm-send");
             const auto remaining = limit - std::chrono::steady_clock::now();
             const auto timeout = std::chrono::duration_cast<std::chrono::seconds>(remaining).count();
             if (timeout <= 0 || timeout > INT_MAX)
-                return -1;
+                return refused("f-arm-budget", timeout);
             std::unique_ptr<Msg> response(channel->get_msg(static_cast<int>(timeout)));
             const auto* acknowledgement = response != nullptr
                                               ? dynamic_cast<P50SourceArmedMsg*>(response.get())
                                               : nullptr;
-            if (acknowledgement == nullptr ||
-                !acknowledgement->acknowledges(request_message) ||
-                std::chrono::steady_clock::now() >= limit)
-                return -1;
+            if (acknowledgement == nullptr)
+                return refused("f-arm-reply");
+            if (!acknowledgement->acknowledges(request_message))
+                return refused("f-arm-mismatch");
+            if (std::chrono::steady_clock::now() >= limit)
+                return refused("f-arm-deadline");
             remote_guid.bytes = acknowledgement->f_store_guid;
             remote_generation = acknowledgement->f_store_generation;
             if (remote_guid == FStoreGuid{} || remote_generation == 0)
-                return -1;
+                return refused("f-store-identity");
             if (!channel->send_msg(CacheSessionMsg(), MsgChannel::SendNonBlocking))
-                return -1;
-            return channel->release_fd_after_cache_session_ready(limit);
+                return refused("f-cache-session-send");
+            const int ready_fd = channel->release_fd_after_cache_session_ready(limit);
+            return ready_fd >= 0 ? ready_fd : refused("f-cache-session-ready");
         } catch (...) {
-            return -1;
+            return refused("f-open-exception");
         }
     };
 
