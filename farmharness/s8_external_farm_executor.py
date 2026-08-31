@@ -494,11 +494,12 @@ def _copy_remote_tree_as_root(host: str, remote: str, destination: Path,
     if destination.exists() or destination.is_symlink():
         raise ExternalFarmError("evidence:destination_already_exists")
     destination.mkdir(parents=True, exist_ok=False)
+    remote_command = shlex.join(
+        ["docker", "run", "--rm", "--network", "none", "--user", "0",
+         "-v", f"{remote}:/probe/evidence:ro", "--entrypoint", "/bin/tar",
+         image, "--exclude=*.sock", "-C", "/probe/evidence", "-cf", "-", "."])
     source = subprocess.Popen(
-        [*s4.ssh_argv(host), "docker", "run", "--rm", "--network", "none",
-         "--user", "0", "-v", f"{remote}:/probe/evidence:ro",
-         "--entrypoint", "/bin/sh", image, "-c",
-         "tar --exclude='*.sock' -C /probe/evidence -cf - ."],
+        [*s4.ssh_argv(host), remote_command],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     assert source.stdout is not None
     sink = subprocess.Popen(["tar", "-C", str(destination), "-xf", "-"],
