@@ -670,8 +670,16 @@ root=$1; expected_cpu=$2; max_load=$3; expected_physical=$4; expected_boot=$5; s
 fail() { printf 'S8_PREFLIGHT_FAIL field=%s observed=%s expected=%s\n' "$1" "$2" "$3" >&2; exit 77; }
 actual_cpu=$(nproc)
 test "$actual_cpu" -eq "$expected_cpu" || fail cpu_count "$actual_cpu" "$expected_cpu"
-load=$(cut -d' ' -f1 /proc/loadavg)
-awk -v load="$load" -v max="$max_load" 'BEGIN { exit !(load <= max) }' || fail load_1m "$load" "$max_load"
+load_ready=0
+for _ in $(seq 1 30); do
+  load=$(cut -d' ' -f1 /proc/loadavg)
+  if awk -v load="$load" -v max="$max_load" 'BEGIN { exit !(load <= max) }'; then
+    load_ready=1
+    break
+  fi
+  sleep 1
+done
+test "$load_ready" -eq 1 || fail load_1m "$load" "$max_load"
 machine=$(sha256sum /etc/machine-id | awk '{print $1}')
 boot=$(sha256sum /proc/sys/kernel/random/boot_id | awk '{print $1}')
 test "$boot" = "$expected_boot" || fail boot_id "$boot" "$expected_boot"
