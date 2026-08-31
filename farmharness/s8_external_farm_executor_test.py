@@ -145,6 +145,24 @@ def test_authority_binds_routing_and_staging_rejects_outside_input(tmp_path: Pat
         executor._stage_input_paths(outside, outside, outside, inside, [])
 
 
+def test_staging_requires_inputs_but_not_the_replaced_compile_output(tmp_path: Path) -> None:
+    product = tmp_path / "product"; product.mkdir()
+    batch = tmp_path / "batch.jsonl"; batch.write_text("batch\n")
+    plan = tmp_path / "plan.json"; plan.write_text("{}\n")
+    topology = tmp_path / "topology.json"; topology.write_text("{}\n")
+    source = tmp_path / "source.cc"; source.write_text("int source();\n")
+    payload = tmp_path / "source.ii"; payload.write_text("int source();\n")
+    compile_db = tmp_path / "compile_commands.json"; compile_db.write_text("[]\n")
+    missing_output = tmp_path / "build" / "source.o"
+    paths = executor._stage_input_paths(
+        batch, plan, topology, product,
+        [{"source": str(source), "compile_db": str(compile_db),
+          "compile_source": str(source), "compile_output": str(missing_output),
+          "predictive_input": {"path": str(payload)}}])
+    assert missing_output not in paths
+    assert {source.resolve(), payload.resolve(), compile_db.resolve()}.issubset(paths)
+
+
 def test_external_command_preserves_two_pass_repeat_input(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(executor.live, "build_command", lambda *args, **kwargs: [
         "env", "ICECC_P50_C1F1_PASSES=2", "/tanksmall/unittests/p50compilee2e-run.sh"])

@@ -262,7 +262,10 @@ def _stage_input_paths(batch_manifest: Path, predictive_plan: Path, topology: Pa
     """
     values: list[Path] = [batch_manifest, predictive_plan, topology, product_root]
     for row in rows:
-        for key in ("source", "compile_db", "compile_source", "compile_output"):
+        # compile_output authenticates the database's original ``-o`` operand,
+        # but the mature runner replaces it with its private remote/local
+        # object paths.  It is an output contract, never a staged input.
+        for key in ("source", "compile_db", "compile_source"):
             value = row.get(key)
             if value is not None:
                 values.append(Path(str(value)))
