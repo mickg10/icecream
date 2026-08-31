@@ -55,6 +55,13 @@ def _repo_head(repo: Path) -> str:
         raise ValueError("git:head_unavailable") from exc
 
 
+def _repeat_predecessor(root: Path, method: str) -> Path:
+    """Resolve repeat-full to its sibling full arm in this campaign."""
+    regime_dir, topology_dir, depth_dir, method_dir = root.parents[:4]
+    return (method_dir / "full" / topology_dir.name / regime_dir.name / root.name /
+            "arms" / method / "attempt-001" / "depth-plan.json")
+
+
 def _arm(method: str, block: dict[str, Any], root: Path, *, python: str,
          repo: Path, source_manifest: str, source_root: str,
          matrix_audit: Path, engine_manifest: str, product_root: Path,
@@ -91,15 +98,17 @@ def _arm(method: str, block: dict[str, Any], root: Path, *, python: str,
     repeat_of = root / "references" / "depth-plan-full.json"
     first_plan = plan
     first_result = result
+    predecessor: dict[str, Any] | None = None
     # repeat-full is a distinct contract depth.  It references the same arm's
     # full plan, but remains a separate materialized experiment directory.
     if depth == "repeat-full":
-        repeat_of = (root.parent.parent.parent.parent / "full" /
-                     root.parent.parent.name / root.parent.name / root.name /
-                     "arms" / method /
-                     "attempt-001" / "depth-plan.json")
+        repeat_of = _repeat_predecessor(root, method)
         first_plan = repeat_of
         first_result = repeat_of.parent / "predictive"
+        predecessor = {"depth": "full", "path": str(repeat_of),
+                       "corpus": corpus, "method": method,
+                       "topology": topology, "regime": regime,
+                       "order": str(block["order"])}
     depth_args = [python, str(repo / "farmharness/s8_depth_runner.py"),
                   "--source-manifest", source_manifest, "--source-root", source_root,
                   "--matrix-audit", str(matrix_audit), "--result-dir", str(result),
@@ -146,19 +155,26 @@ def _arm(method: str, block: dict[str, Any], root: Path, *, python: str,
                              "--out", str(attempt / f"records{suffix}.jsonl")])
     live_ready = compile_db is not None and compile_source_root is not None
     reason = None if live_ready else "authenticated compile DB/source root not configured"
+    # The S8 commands are retained as a handoff, but no individual arm is
+    # executable until the comparison's RAW_II half has a valid bridge.
+    command_reason = RAW_II_GAP
+    if not live_ready:
+        command_reason += "; " + reason
     commands = [
-        _command_record(depth_args, repo, stage="predictive_plan"),
-        _command_record(producer_args, repo, stage="predictive_producer"),
-        _command_record(prep_args, repo, stage="live_prepare", executable=live_ready, reason=reason),
-        _command_record(live_args, repo, stage="live_run", executable=live_ready, reason=reason),
+        _command_record(depth_args, repo, stage="predictive_plan", executable=False, reason=command_reason),
+        _command_record(producer_args, repo, stage="predictive_producer", executable=False, reason=command_reason),
+        _command_record(prep_args, repo, stage="live_prepare", executable=False, reason=command_reason),
+        _command_record(live_args, repo, stage="live_run", executable=False, reason=command_reason),
     ]
     commands.extend(_command_record(command, repo, stage="comparison" if len(compare_args) == 1
                                     else f"comparison_{segment or 'full-1'}",
-                                    executable=live_ready,
-                                    reason=None if live_ready else "requires authenticated live curve")
+                                    executable=False, reason=command_reason)
                     for command, (_result, segment) in zip(compare_args, compare_segments))
-    record = {**common, "status": "STAGED", "executable": live_ready,
-              "commands": commands, "measurement": _measurement()}
+    record = {**common, "status": "STAGED", "executable": False,
+              "execution_blocker": RAW_II_GAP, "commands": commands,
+              "measurement": _measurement()}
+    if predecessor is not None:
+        record["repeat_predecessor"] = predecessor
     (arm_dir / "manifest.json").write_bytes(_canonical(record))
     return record
 
@@ -180,18 +196,18 @@ def _format_template(spec: str, *, corpus: str, profile: str, regime: str,
         raise ValueError(f"path_template:invalid:{spec}") from exc
 
 
-def materialize_matrix(*, output_root: Path, repo: Path, source_manifest: str,
+def materialize_matrix(*, output_root: Path, repo: Path, corpus: str,
+                       source_manifest: str,
                        source_root: str, matrix_audit: Path,
                        engine_manifest: str, product_root: Path,
                        compile_db: Path | None = None,
                        compile_source_root: Path | None = None,
                        compile_output_root: Path | None = None,
-                       corpora: tuple[str, ...] = tuple(sorted(CALIBRATION_CORPORA)),
                        python: str = sys.executable, timestamp: str | None = None,
                        execute: bool = False) -> Path:
     if execute:
         raise ValueError("execution is intentionally unavailable until RAW_II bridge exists")
-    if any(corpus not in CALIBRATION_CORPORA for corpus in corpora):
+    if corpus not in CALIBRATION_CORPORA:
         raise ValueError("held-out corpora are forbidden")
     repo = repo.absolute()
     plan = build_plan()
@@ -204,50 +220,51 @@ def materialize_matrix(*, output_root: Path, repo: Path, source_manifest: str,
     blocks = 0
     blocked = 0
     staged = 0
-    for corpus in corpora:
-        for template in contract["measurement_cells"]:
-            block = {**template, "corpus": corpus}
-            harness_profile = ("GRZ_RESIDUAL" if template["method"] == "GRZ"
-                               else str(template["method"]))
-            block_source_manifest = _format_template(
-                source_manifest, corpus=corpus, profile=harness_profile,
-                regime=str(template["regime"]), topology=str(template["topology"]))
-            block_source_root = _format_template(
-                source_root, corpus=corpus, profile=harness_profile,
-                regime=str(template["regime"]), topology=str(template["topology"]))
-            block_engine_manifest = _format_template(
-                engine_manifest, corpus=corpus, profile=harness_profile,
-                regime=str(template["regime"]), topology=str(template["topology"]))
-            ident = f"{corpus}/{template['method']}/{template['depth']}/{_safe(template['topology'])}/{template['regime']}/{template['order']}"
-            block_dir = campaign / "experiments" / ident
-            block_dir.mkdir(parents=True, exist_ok=True)
-            arms = []
-            for arm_template in template["sequence"]:
-                method = str(arm_template["method"])
-                arms.append(_arm(method, block, block_dir, python=python, repo=repo,
-                                 source_manifest=block_source_manifest, source_root=block_source_root,
-                                 matrix_audit=matrix_audit.absolute(),
-                                 engine_manifest=block_engine_manifest, product_root=product_root.absolute(),
-                                 compile_db=compile_db, compile_source_root=compile_source_root,
-                                 compile_output_root=compile_output_root))
-            block_record = {"schema": "icecream-s4-method-comparison-block-v1",
-                            "id": template["id"], "corpus": corpus,
-                            "split": SPLITS[corpus], "method": template["method"],
-                            "depth": template["depth"], "topology": template["topology"],
-                            "regime": template["regime"], "order": template["order"],
-                            "counterbalanced": True,
-                            "sequence": [row["method"] for row in arms],
-                            "arms": [{"method": row["method"], "status": row["status"],
-                                      "manifest": f"arms/{row['method']}/manifest.json",
-                                      "product_profile": row["product_profile"],
-                                      "harness_profile": row["harness_profile"]} for row in arms]}
-            (block_dir / "manifest.json").write_bytes(_canonical(block_record))
-            blocks += 1
-            blocked += sum(row["status"] == "BLOCKED" for row in arms)
-            staged += sum(row["status"] == "STAGED" for row in arms)
+    for template in contract["measurement_cells"]:
+        block = {**template, "corpus": corpus}
+        harness_profile = ("GRZ_RESIDUAL" if template["method"] == "GRZ"
+                           else str(template["method"]))
+        block_source_manifest = _format_template(
+            source_manifest, corpus=corpus, profile=harness_profile,
+            regime=str(template["regime"]), topology=str(template["topology"]))
+        block_source_root = _format_template(
+            source_root, corpus=corpus, profile=harness_profile,
+            regime=str(template["regime"]), topology=str(template["topology"]))
+        block_engine_manifest = _format_template(
+            engine_manifest, corpus=corpus, profile=harness_profile,
+            regime=str(template["regime"]), topology=str(template["topology"]))
+        ident = f"{corpus}/{template['method']}/{template['depth']}/{_safe(template['topology'])}/{template['regime']}/{template['order']}"
+        block_dir = campaign / "experiments" / ident
+        block_dir.mkdir(parents=True, exist_ok=True)
+        arms = []
+        for arm_template in template["sequence"]:
+            method = str(arm_template["method"])
+            arms.append(_arm(method, block, block_dir, python=python, repo=repo,
+                             source_manifest=block_source_manifest, source_root=block_source_root,
+                             matrix_audit=matrix_audit.absolute(),
+                             engine_manifest=block_engine_manifest, product_root=product_root.absolute(),
+                             compile_db=compile_db, compile_source_root=compile_source_root,
+                             compile_output_root=compile_output_root))
+        block_record = {"schema": "icecream-s4-method-comparison-block-v1",
+                        "id": template["id"], "corpus": corpus,
+                        "split": SPLITS[corpus], "method": template["method"],
+                        "depth": template["depth"], "topology": template["topology"],
+                        "regime": template["regime"], "order": template["order"],
+                        "counterbalanced": True,
+                        "sequence": [row["method"] for row in arms],
+                        "arms": [{"method": row["method"], "status": row["status"],
+                                  "manifest": f"arms/{row['method']}/manifest.json",
+                                  "product_profile": row["product_profile"],
+                                  "harness_profile": row["harness_profile"]} for row in arms]}
+        (block_dir / "manifest.json").write_bytes(_canonical(block_record))
+        blocks += 1
+        blocked += sum(row["status"] == "BLOCKED" for row in arms)
+        staged += sum(row["status"] == "STAGED" for row in arms)
     summary = {"schema": SUMMARY_SCHEMA, "status": "STAGED_RAW_II_GAP",
                "campaign_root": str(campaign), "dry_run": True,
+               "execution_ready": False,
                "source_plan_schema": plan["schema"], "split_policy": {
+                   "campaign_corpus": corpus,
                    "allowed_corpora": list(sorted(CALIBRATION_CORPORA)),
                    "held_out_corpora": ["DuckDB", "LLVM-1238"]},
                "comparison_blocks": blocks, "arm_runs": blocks * 2,
@@ -258,7 +275,7 @@ def materialize_matrix(*, output_root: Path, repo: Path, source_manifest: str,
     (campaign / "summary.json").write_bytes(_canonical(summary))
     config = {"source_manifest": source_manifest, "source_root": source_root,
               "matrix_audit": str(matrix_audit), "engine_manifest": engine_manifest,
-              "product_root": str(product_root), "corpora": list(corpora),
+              "product_root": str(product_root), "corpus": corpus,
               "python": python, "execute_requested": execute}
     (campaign / "matrix.json").write_bytes(_canonical({"schema": SCHEMA,
                                                         "repo_head": _repo_head(repo),
@@ -270,6 +287,8 @@ def materialize_matrix(*, output_root: Path, repo: Path, source_manifest: str,
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--corpus", choices=tuple(sorted(CALIBRATION_CORPORA)), required=True,
+                        help="one calibration corpus per campaign; run separately for the other corpus")
     parser.add_argument("--source-manifest", required=True)
     parser.add_argument("--source-root", required=True)
     parser.add_argument("--matrix-audit", type=Path, required=True)
@@ -285,7 +304,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="fail closed: a RAW_II bridge is not yet available")
     args = parser.parse_args(argv)
     try:
-        print(materialize_matrix(output_root=args.output_root, repo=args.repo,
+        print(materialize_matrix(output_root=args.output_root, repo=args.repo, corpus=args.corpus,
                                  source_manifest=args.source_manifest, source_root=args.source_root,
                                  matrix_audit=args.matrix_audit, engine_manifest=args.engine_manifest,
                                  product_root=args.product_root, compile_db=args.compile_db,
