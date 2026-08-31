@@ -44,6 +44,9 @@ STAMP_RE = re.compile(r"^\d{8}T\d{6}Z$")
 IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 PINNED_IMAGE = "icecream/farm-node:ubuntu22-gcc11-boost174"
 OOM_SCORE_ADJ = -1000
+# One host-wide inode is shared by every campaign and every protected
+# supervisor.  It is deliberately independent of a campaign/temp namespace.
+LIVE_LOCK_PATH = Path("/tmp/icecream-s8-live-run.lock")
 
 
 class CampaignError(ValueError):
@@ -300,13 +303,23 @@ def _process_ancestors(pid: int | None = None) -> set[int]:
     return result
 
 
-def _competing_processes() -> list[str]:
+def _competing_processes(*, proc_root: Path = Path("/proc"),
+                         ancestor_pid: int | None = None) -> list[str]:
     """Find unrelated S8/build/Docker processes before a measurement."""
-    excluded = _process_ancestors()
-    needles = ("s8", "p50compile", "docker", "build", "cmake", "ninja", "make", "gcc", "clang")
+    excluded = _process_ancestors(ancestor_pid)
+    # dockerd/containerd and Docker plumbing are normal host infrastructure,
+    # not competing measurements. A docker CLI command is interesting only
+    # when its arguments identify an actual S8/build/tool workload.
+    infrastructure = {"dockerd", "containerd", "docker-proxy", "docker-init",
+                      "containerd-shim", "containerd-shim-runc-v2"}
+    workload_names = {"s8_campaign_driver.py", "s8_real_c1f1_live_runner.py",
+                      "p50compile", "p50compilee2e-run.sh", "icecc",
+                      "iceccd", "icecc-scheduler", "cmake", "ninja", "make",
+                      "gcc", "g++", "clang", "clang++", "cc", "c++", "ld",
+                      "ar", "ccache", "build", "build.py", "compile", "compile.py"}
     found: list[str] = []
     try:
-        entries = list(Path("/proc").iterdir())
+        entries = list(proc_root.iterdir())
     except OSError:
         return ["/proc:unavailable"]
     for entry in entries:
@@ -317,8 +330,18 @@ def _competing_processes() -> list[str]:
         except OSError:
             continue
         command = raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()
-        if command and any(needle in command.lower() for needle in needles):
+        if not command:
+            continue
+        words = command.split()
+        executable = Path(words[0]).name.lower() if words else ""
+        names = {Path(word).name.lower() for word in words}
+        # Daemons are ignored by executable name. Docker's client remains
+        # eligible only if its command carries an actual workload name.
+        if executable in infrastructure:
+            continue
+        if names & workload_names:
             found.append(f"{entry.name}:{command}")
+    found.sort()
     return found
 
 
@@ -372,9 +395,9 @@ def _host_is_idle(*, process_scanner: Callable[[], list[str]] = _competing_proce
 
 
 @contextlib.contextmanager
-def _live_run_lock(temp_root: Path):
+def _live_run_lock(_temp_root: Path | None = None):
     """Own the live measurement slot for exactly one cell."""
-    lock_path = temp_root / ".s8-live-run.lock"
+    lock_path = LIVE_LOCK_PATH
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+") as stream:
         try:
@@ -725,6 +748,8 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
             raise CampaignError("resume:campaign_configuration_mismatch")
         if metadata.get("git") != _git_identity(repo):
             raise CampaignError("resume:source_identity_mismatch")
+        if mode == "all" and metadata.get("live_authority") != live_authority:
+            raise CampaignError("resume:live_authority_mismatch")
     runner = command_runner or _run_command
     records: list[dict[str, Any]] = []
     stamp = str(metadata["created_utc"])

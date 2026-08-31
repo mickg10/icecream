@@ -359,6 +359,29 @@ def test_all_mode_oom_refusal_happens_before_campaign_creation(
     assert not list((tmp_path / "experiments").glob("s8-campaign-*"))
 
 
+def test_all_mode_resume_revalidates_and_compares_live_authority(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runner, _ = _all_runner_factory()
+    kwargs = _all_kwargs(tmp_path)
+    authority = {"container_image": {"image_id": "sha256:" + "a" * 64},
+                 "simulator_authority": {"sha256": "b" * 64}}
+    monkeypatch.setattr(driver, "_validate_live_prerequisites", lambda **_kwargs: authority)
+    campaign = driver.run_campaign(
+        **kwargs, mode="all", command_runner=runner,
+        container_image_id="sha256:" + "a" * 64, container_temp_root=tmp_path,
+        idle_host_gate=lambda: True, oom_protection=lambda: None,
+        timestamp="20260831T120024Z")
+    changed = {"container_image": {"image_id": "sha256:" + "c" * 64},
+               "simulator_authority": {"sha256": "b" * 64}}
+    monkeypatch.setattr(driver, "_validate_live_prerequisites", lambda **_kwargs: changed)
+    with pytest.raises(driver.CampaignError, match="live_authority_mismatch"):
+        driver.run_campaign(
+            **kwargs, mode="all", resume=campaign, retry_failed=True,
+            command_runner=runner, container_image_id="sha256:" + "a" * 64,
+            container_temp_root=tmp_path, idle_host_gate=lambda: True,
+            oom_protection=lambda: None)
+
+
 def test_all_mode_refuses_heldout_corpus_even_with_other_inputs(tmp_path: Path) -> None:
     kwargs = _kwargs(tmp_path)
     with pytest.raises(driver.CampaignError, match="all_mode_is_calibration_only"):
@@ -375,11 +398,34 @@ def test_comparison_authentication_requires_normalizer_record(tmp_path: Path) ->
         driver._authenticate_comparison(output)
 
 
-def test_live_lock_is_host_global_for_campaigns_sharing_temp_root(tmp_path: Path) -> None:
+def test_live_lock_is_host_global_for_campaigns_sharing_temp_root(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(driver, "LIVE_LOCK_PATH", tmp_path / "host-global.lock")
     with driver._live_run_lock(tmp_path):
         with pytest.raises(driver.CampaignError, match="single_live_run_owned"):
-            with driver._live_run_lock(tmp_path):
+            with driver._live_run_lock(tmp_path / "different-campaign-temp"):
                 pass
+
+
+def test_competing_process_scanner_ignores_host_docker_infrastructure_and_finds_work(
+        tmp_path: Path) -> None:
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    commands = {
+        101: "/usr/bin/dockerd --host=unix:///var/run/docker.sock",
+        102: "/usr/bin/containerd",
+        103: "/usr/bin/docker-proxy -proto tcp",
+        104: "python3 /repo/farmharness/s8_campaign_driver.py --mode all",
+        105: "/opt/p50compile --job 1",
+        106: "/usr/bin/docker run supervisor s8_campaign_driver.py",
+        107: "/usr/bin/docker ps --all",
+    }
+    for pid, command in commands.items():
+        entry = proc / str(pid)
+        entry.mkdir()
+        (entry / "cmdline").write_bytes(command.replace(" ", "\0").encode())
+    found = driver._competing_processes(proc_root=proc, ancestor_pid=99999)
+    assert [item.split(":", 1)[0] for item in found] == ["104", "105", "106"]
 
 
 def test_idle_gate_rejects_processes_and_requires_cpu_headroom() -> None:

@@ -25,12 +25,16 @@ from typing import Any, Callable
 
 SCHEMA = "icecream-s8-protected-launcher-v1"
 IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
+GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 SAFE_IMAGE = re.compile(r"^[A-Za-z0-9_.:/@-]+$")
 DEFAULT_SOCKET = Path("/var/run/docker.sock")
 DEFAULT_MACHINE_ID = Path("/etc/machine-id")
 DEFAULT_CPUINFO = Path("/proc/cpuinfo")
 DEFAULT_DMI = (Path("/sys/class/dmi/id/product_uuid"),
                Path("/sys/class/dmi/id/board_serial"))
+# Must match s8_campaign_driver.LIVE_LOCK_PATH.  This is host-global, not a
+# caller-selected campaign or container-temp namespace.
+LIVE_LOCK_PATH = Path("/tmp/icecream-s8-live-run.lock")
 
 
 class LauncherError(ValueError):
@@ -38,6 +42,14 @@ class LauncherError(ValueError):
 
 
 def _private_file(path: Path, label: str) -> None:
+    if not path.is_absolute():
+        raise LauncherError(f"{label}:relative_path")
+    for ancestor in (path, *path.parents):
+        try:
+            if ancestor.is_symlink():
+                raise LauncherError(f"{label}:symlink_ancestor")
+        except OSError as exc:
+            raise LauncherError(f"{label}:unavailable") from exc
     try:
         info = path.lstat()
     except OSError as exc:
@@ -47,18 +59,101 @@ def _private_file(path: Path, label: str) -> None:
 
 
 def _private_dir(path: Path, label: str) -> Path:
-    if not path.is_absolute() or path.is_symlink() or not path.is_dir():
+    if not path.is_absolute():
+        raise LauncherError(f"{label}:relative_path")
+    for ancestor in (path, *path.parents):
+        try:
+            if ancestor.is_symlink():
+                raise LauncherError(f"{label}:symlink_ancestor")
+        except OSError as exc:
+            raise LauncherError(f"{label}:unavailable") from exc
+    if not path.is_dir():
         raise LauncherError(f"{label}:unavailable")
     return path
 
 
 def _socket(path: Path) -> None:
+    if not path.is_absolute():
+        raise LauncherError("docker_socket:relative_path")
+    for ancestor in (path, *path.parents):
+        try:
+            if ancestor.is_symlink():
+                raise LauncherError("docker_socket:symlink_ancestor")
+        except OSError as exc:
+            raise LauncherError("docker_socket:unavailable") from exc
     try:
         info = path.lstat()
     except OSError as exc:
         raise LauncherError("docker_socket:unavailable") from exc
     if path.is_symlink() or not stat.S_ISSOCK(info.st_mode):
         raise LauncherError("docker_socket:not_socket")
+
+
+def _option_values(argv: list[str], option: str) -> list[str]:
+    values: list[str] = []
+    for index, value in enumerate(argv):
+        if value == option:
+            if index + 1 >= len(argv) or argv[index + 1].startswith("--"):
+                raise LauncherError(f"campaign_argv:{option[2:]}_invalid")
+            values.append(argv[index + 1])
+    return values
+
+
+def _validate_campaign_argv(argv: list[str], workspace: Path) -> tuple[Path, Path]:
+    """Authenticate the supervisor's exact Python driver and authority paths."""
+    if len(argv) < 2 or Path(argv[0]).name not in {"python", "python3"}:
+        raise LauncherError("campaign_argv:python_driver_required")
+    expected_driver = workspace / "farmharness" / "s8_campaign_driver.py"
+    if argv[1] != str(expected_driver):
+        raise LauncherError("campaign_argv:driver_path_mismatch")
+    mode_values = _option_values(argv, "--mode")
+    if len(mode_values) != 1 or mode_values[0] != "all" or "--mode=all" in argv:
+        raise LauncherError("campaign_argv:exactly_one_all_mode_required")
+    authority_values = _option_values(argv, "--simulator-authority")
+    if len(authority_values) != 1:
+        raise LauncherError("campaign_argv:simulator_authority_required")
+    repo_values = _option_values(argv, "--repo")
+    if len(repo_values) > 1 or (repo_values and repo_values[0] != str(workspace)):
+        raise LauncherError("campaign_argv:repo_path_mismatch")
+    authority = Path(authority_values[0])
+    if not authority.is_absolute():
+        raise LauncherError("simulator_authority:relative_path")
+    return authority, workspace
+
+
+def _validate_simulator_binding(receipt_path: Path, repo: Path) -> Path:
+    """Validate and return the exact repo-linked simulator binary."""
+    expected_receipt = repo / "cache" / "sim" / ".p50sim-build.json"
+    if receipt_path != expected_receipt:
+        raise LauncherError("simulator_authority:path_mismatch")
+    _private_file(receipt_path, "simulator_authority")
+    try:
+        value = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise LauncherError("simulator_authority:invalid_json") from exc
+    if (not isinstance(value, dict) or
+            set(value) != {"schema", "source", "binary", "inputs", "configuration"} or
+            value.get("schema") != "icecream-p50sim-build-v1" or
+            not isinstance(value.get("source"), dict) or
+            set(value["source"]) != {"root", "head", "tree", "tracked_clean"} or
+            value["source"].get("root") != str(repo) or
+            not isinstance(value["source"].get("head"), str) or
+            GIT_SHA.fullmatch(value["source"]["head"]) is None or
+            not isinstance(value["source"].get("tree"), str) or
+            GIT_SHA.fullmatch(value["source"]["tree"]) is None or
+            value["source"].get("tracked_clean") is not True):
+        raise LauncherError("simulator_authority:source_mismatch")
+    binary = value.get("binary")
+    expected_binary = repo / "cache" / "sim" / ".p50sim.bin"
+    if (not isinstance(binary, dict) or set(binary) != {"path", "sha256", "bytes"} or
+            binary.get("path") != str(expected_binary)):
+        raise LauncherError("simulator_authority:binary_path_mismatch")
+    _private_file(expected_binary, "simulator_authority_binary")
+    observed = _sha(expected_binary)
+    if (observed != str(binary.get("sha256", "")).lower() or
+            expected_binary.stat().st_size != binary.get("bytes")):
+        raise LauncherError("simulator_authority:binary_mismatch")
+    return expected_binary
 
 
 def _sha(path: Path) -> str:
@@ -128,13 +223,6 @@ def build_command(campaign_argv: list[str], *, workspace: Path,
     """Return the exact supervisor Docker argv; never execute it."""
     if not campaign_argv:
         raise LauncherError("campaign_argv:required")
-    if not any(item == "all" or item == "--mode=all" for item in campaign_argv):
-        try:
-            mode_index = campaign_argv.index("--mode")
-        except ValueError:
-            mode_index = -1
-        if mode_index < 0 or mode_index + 1 >= len(campaign_argv) or campaign_argv[mode_index + 1] != "all":
-            raise LauncherError("campaign_argv:all_mode_required")
     if (set(image_identity) != {"reference", "image_id", "architecture", "os", "created"} or
             not isinstance(image_identity.get("reference"), str) or
             SAFE_IMAGE.fullmatch(image_identity["reference"]) is None or
@@ -147,13 +235,16 @@ def build_command(campaign_argv: list[str], *, workspace: Path,
     workspace = _private_dir(workspace, "workspace")
     experiment_root = _private_dir(experiment_root, "experiment_root")
     container_temp_root = _private_dir(container_temp_root, "container_temp_root")
+    simulator_authority, repo = _validate_campaign_argv(campaign_argv, workspace)
+    simulator_binary = _validate_simulator_binding(simulator_authority, repo)
     for path, label in ((machine_id, "host_machine_id"), (cpuinfo, "host_cpuinfo")):
         _private_file(path, label)
     dmi_paths = dmi_paths if dmi_paths is not None else tuple(
-        path for path in DEFAULT_DMI if path.is_file() and not path.is_symlink())
+        path.resolve() for path in DEFAULT_DMI if path.is_file() and not path.is_symlink())
     for path in dmi_paths:
         _private_file(path, "host_dmi")
     _socket(docker_socket)
+    _private_file(LIVE_LOCK_PATH, "live_lock")
     uid = os.geteuid() if owner_uid is None else owner_uid
     gid = os.getegid() if owner_gid is None else owner_gid
     socket_gid = _docker_group_id(docker_socket) if docker_gid is None else docker_gid
@@ -163,16 +254,20 @@ def build_command(campaign_argv: list[str], *, workspace: Path,
     script += "exec " + shlex.join(campaign_argv) + "\n"
     command = ["docker", "run", "--rm", "--init", "--pid=host", "--network=host",
                "--entrypoint", "/bin/sh",
+               "--workdir", str(workspace),
                "--user", f"{uid}:{gid}", "--group-add", str(socket_gid),
                "--oom-score-adj=-1000", "--env", "PYTHONUNBUFFERED=1"]
     for path in (workspace, experiment_root, container_temp_root):
         command.extend(("--volume", f"{path}:{path}:rw"))
     command.extend(("--volume", f"{docker_socket}:{docker_socket}:rw",
                     "--volume", f"{machine_id}:{machine_id}:ro",
-                    "--volume", f"{cpuinfo}:{cpuinfo}:ro"))
+                    "--volume", f"{cpuinfo}:{cpuinfo}:ro",
+                    "--volume", f"{LIVE_LOCK_PATH}:{LIVE_LOCK_PATH}:rw",
+                    "--volume", f"{simulator_authority}:{simulator_authority}:ro",
+                    "--volume", f"{simulator_binary}:{simulator_binary}:ro"))
     for path in dmi_paths:
         command.extend(("--volume", f"{path}:{path}:ro"))
-    command.extend((image_identity["image_id"], "/bin/sh", "-lc", script))
+    command.extend((image_identity["image_id"], "-lc", script))
     return command
 
 
