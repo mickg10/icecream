@@ -364,6 +364,7 @@ def _bind_one(receipt: Mapping[str, Any]) -> dict[str, Any]:
                              for role in required),
     }
     status = "BOUND" if not errors else "NOT_BOUND"
+    receipt_raw = _canonical(receipt)
     return {
         "status": status,
         "version": version,
@@ -371,6 +372,8 @@ def _bind_one(receipt: Mapping[str, Any]) -> dict[str, Any]:
         "artifact_root": str(root) if root is not None else receipt.get("artifact_root"),
         "source": source,
         "build": build,
+        "receipt": {"bytes": len(receipt_raw),
+                    "sha256": hashlib.sha256(receipt_raw).hexdigest()},
         "protocol_assertion": protocol,
         "role_completeness": completeness,
         "roles": roles,
