@@ -79,8 +79,8 @@ def test_research6_is_captured_but_not_an_executable_f_host(tmp_path: Path) -> N
 
 def test_rotation_uses_ready_pids_and_worker_root_allows_daemon_outputs() -> None:
     source = Path(executor.__file__).read_text(encoding="utf-8")
-    assert source.count(r'before_pid=$(field \"$before_ready\" pid)') >= 2
-    assert source.count(r'after_pid=$(field \"$after_ready\" pid)') >= 2
+    assert source.count('before_pid=$(field "$before_ready" pid)') >= 2
+    assert source.count('after_pid=$(field "$after_ready" pid)') >= 2
     assert "before_pid=$(cat {client_work}/c-rotation-before-pid)" not in source
     assert 'chmod 1777 {worker_root} {worker_root}/envs' in source
 
@@ -115,10 +115,13 @@ def test_cleanup_does_not_replace_primary_error_and_handles_container_owned_file
 
 def test_external_batch_executes_inside_c_time_namespace_and_stops_scheduler_last() -> None:
     source = Path(executor.__file__).read_text(encoding="utf-8")
-    assert source.count("-c --pid=host --network host --user 0") == 2
-    assert source.count("-v {client_work}:/probe/work:rw -v {client_work}:{client_work}:rw") == 2
+    assert source.count("-c --pid=host --network host --user 0") == 1
+    assert source.count("-v {client_work}:/probe/work:rw -v {client_work}:{client_work}:rw") == 1
     assert "docker exec --user 0 {token}-c" in source
     assert "docker run --rm --name {token}-batch" not in source
+    assert 'docker exec --user 0 "$container_id" /bin/sh -c' in source
+    assert "kill -9 \"$pid\"" in source
+    assert "docker rm -f {token}-c" not in source
     targets = source[source.index("targets = [(\"q3\""):
                      source.index("cleanup = '''set -eu")]
     assert targets.index("reset-worker.pid") < targets.index("c.container-id")

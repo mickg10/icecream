@@ -791,6 +791,26 @@ PY
                          f"test \"$(docker inspect --format '{{{{.State.Running}}}}' {token}-scheduler)\" = true; docker inspect --format '{{{{.Id}}}}' {token}-scheduler > {client_work}/scheduler.container-id; docker inspect --format '{{{{.State.Pid}}}}' {token}-scheduler > {client_work}/scheduler.pid; "
                          f"printf 'S8_CONTAINER_ID=%s\\n' \"$(cat {client_work}/scheduler.container-id)\"")
             self.run("q3", scheduler)
+            sidecar_kill_inner = r'''set -eu
+pid=$1
+role=$2
+runtime=$3
+printf '%s' "$pid" | grep -Eq '^[0-9]+$'
+test -r "/proc/$pid/status" -a -r "/proc/$pid/cmdline"
+command=$(tr '\0' ' ' <"/proc/$pid/cmdline")
+printf '%s\n' "$command" | grep -F '/probe/product/cache/icecc-cache-service'
+printf '%s\n' "$command" | grep -F -- "--socket $runtime/"
+parent=$(awk '/^PPid:/ {print $2}' "/proc/$pid/status")
+test -n "$parent" -a -r "/proc/$parent/cmdline"
+parent_command=$(tr '\0' ' ' <"/proc/$parent/cmdline")
+printf '%s\n' "$parent_command" | grep -F '/probe/product/daemon/iceccd'
+case $role in
+  C) printf '%s\n' "$parent_command" | grep -F -- '--no-remote' | grep -F -- '-N s8-p50-c' ;;
+  F) printf '%s\n' "$parent_command" | grep -F -- '-N p50-f' ;;
+  *) exit 77 ;;
+esac
+kill -9 "$pid"
+'''
             for relationship, host in enumerate(relationship_hosts):
                 service = "p50-f" if topology == "C1F1/100000" else f"p50-f-{relationship}"
                 worker_root = worker_work(relationship)
@@ -819,14 +839,47 @@ PY
                           f"printf 'S8_CONTAINER_ID=%s\\n' \"$(cat {worker_root}/container-id)\"")
                 self.run(host, worker)
                 services.append((host, service))
-                f_reset_scripts.append((host,
-                    f"set -eu; test -s {worker_root}/container-id; cp {worker_root}/container-id {worker_root}/rotation-before-id; test -s {worker_root}/container-pid; cp {worker_root}/container-pid {worker_root}/rotation-before-pid; test -s {worker_root}/ready.trace; cp {worker_root}/ready.trace {worker_root}/ready-before.trace; : >{worker_root}/ready.trace; docker rm -f {token}-f-{relationship} >/dev/null 2>&1 || true; "
-                    f"if test -f {worker_root}/s7-warm-f-action-trace-{relationship}.jsonl; then mv {worker_root}/s7-warm-f-action-trace-{relationship}.jsonl {worker_root}/setup-f-action-trace-{relationship}.jsonl; fi; "
-                    f": >{worker_root}/s7-warm-f-action-trace-{relationship}.jsonl; : >{worker_root}/s7-measured-f-legacy-wire-trace-{relationship}.jsonl; "
-                    f"rm -rf {worker_root}/cache-runtime-f-{relationship}; mkdir -p {worker_root}/cache-runtime-f-{relationship}; chmod 1777 {worker_root}/envs; chmod 700 {worker_root}/cache-runtime-f-{relationship}; "
-                    f": >{worker_root}/f.log; "
-                    f"image={shlex.quote(self.authority['hosts'][host]['image'].get('reference', ''))}; test \"$(docker image inspect --format '{{{{.Id}}}}' \"$image\")\" = {self.authority['hosts'][host]['image']['image_id']}; docker run -d --name {token}-f-{relationship} --network host --user 0 --cap-add SYS_CHROOT {profile_flag} -e ICECC_P50_RELATIONSHIP={relationship} -e ICECC_P50_F_ACTION_TRACE=/probe/work/s7-warm-f-action-trace-{relationship}.jsonl -e ICECC_P50_F_LEGACY_WIRE_TRACE=/probe/work/s7-measured-f-legacy-wire-trace-{relationship}.jsonl -e ICECC_P50_TEST_READY_TRACE=/probe/work/ready.trace {mounts_for(host)} -v {worker_root}:/probe/work:rw --entrypoint /bin/sh \"$image\" -c {shlex.quote(worker_inner)} >{worker_root}/container.stdout 2>&1; "
-                    f"docker inspect --format '{{{{.State.Running}}}}' {token}-f-{relationship} | grep -Fx true; for _ in $(seq 1 300); do grep -q '^READY v2 ' {worker_root}/ready.trace && break; sleep 0.1; done; grep -q '^READY v2 ' {worker_root}/ready.trace; stat -c %s {worker_root}/f.log > {worker_root}/f-measured-log-offset; docker inspect --format '{{{{.Id}}}}' {token}-f-{relationship} > {worker_root}/container-id; cp {worker_root}/container-id {worker_root}/rotation-after-id; docker inspect --format '{{{{.State.Pid}}}}' {token}-f-{relationship} > {worker_root}/container-pid; before_ready=$(grep '^READY v2 ' {worker_root}/ready-before.trace | tail -1); after_ready=$(grep '^READY v2 ' {worker_root}/ready.trace | tail -1); field() {{ printf '%s\\n' \"$1\" | awk -v key=\"$2\" '{{for(i=1;i<=NF;i++){{split($i,a,\"=\"); if(a[1]==key){{print a[2]; exit}}}}}}'; }}; before_pid=$(field \"$before_ready\" pid); after_pid=$(field \"$after_ready\" pid); test -n \"$before_pid\" -a -n \"$after_pid\"; cat {worker_root}/ready-before.trace {worker_root}/ready.trace > {worker_root}/ready-combined.trace; mv {worker_root}/ready-combined.trace {worker_root}/ready.trace; printf 'S8_F_READY before_pid=%s after_pid=%s before=%s after=%s\\n' \"$before_pid\" \"$after_pid\" \"$before_ready\" \"$after_ready\""))
+                f_reset_scripts.append((host, f'''set -eu
+test -s {worker_root}/container-id
+cp {worker_root}/container-id {worker_root}/rotation-before-id
+test -s {worker_root}/ready.trace
+cp {worker_root}/ready.trace {worker_root}/ready-before.trace
+container_id=$(tr -d '[:space:]' <{worker_root}/container-id)
+printf '%s' "$container_id" | grep -Eq '^[0-9a-fA-F]{{12,64}}$'
+docker inspect --format '{{{{.State.Running}}}}' "$container_id" | grep -Fx true
+field() {{ printf '%s\n' "$1" | awk -v key="$2" '{{for(i=1;i<=NF;i++){{split($i,a,"="); if(a[1]==key){{print a[2]; exit}}}}}}'; }}
+before_count=$(grep -c '^READY v2 ' {worker_root}/ready.trace)
+before_ready=$(grep '^READY v2 ' {worker_root}/ready.trace | tail -1)
+before_pid=$(field "$before_ready" pid)
+before_c_guid=$(field "$before_ready" C_STORE_GUID)
+before_f_guid=$(field "$before_ready" F_STORE_GUID)
+printf '%s' "$before_pid" | grep -Eq '^[0-9]+$'
+test -n "$before_c_guid" -a -n "$before_f_guid"
+if test -f {worker_root}/s7-warm-f-action-trace-{relationship}.jsonl; then
+  mv {worker_root}/s7-warm-f-action-trace-{relationship}.jsonl {worker_root}/setup-f-action-trace-{relationship}.jsonl
+fi
+: >{worker_root}/s7-warm-f-action-trace-{relationship}.jsonl
+: >{worker_root}/s7-measured-f-legacy-wire-trace-{relationship}.jsonl
+chmod 0666 {worker_root}/s7-warm-f-action-trace-{relationship}.jsonl {worker_root}/s7-measured-f-legacy-wire-trace-{relationship}.jsonl
+docker exec --user 0 "$container_id" /bin/sh -c {shlex.quote(sidecar_kill_inner)} p50-sidecar-kill "$before_pid" F /probe/work/cache-runtime-f-{relationship}
+replacement_ready=0
+for _ in $(seq 1 300); do
+  ready_now=$(grep -c '^READY v2 ' {worker_root}/ready.trace 2>/dev/null || true)
+  if test "${{ready_now:-0}}" -gt "$before_count"; then replacement_ready=1; break; fi
+  sleep 0.1
+done
+test "$replacement_ready" -eq 1
+after_ready=$(grep '^READY v2 ' {worker_root}/ready.trace | tail -1)
+after_pid=$(field "$after_ready" pid)
+after_c_guid=$(field "$after_ready" C_STORE_GUID)
+after_f_guid=$(field "$after_ready" F_STORE_GUID)
+printf '%s' "$after_pid" | grep -Eq '^[0-9]+$'
+test "$after_pid" != "$before_pid"
+test "$after_c_guid" != "$before_c_guid"
+test "$after_f_guid" != "$before_f_guid"
+stat -c %s {worker_root}/f.log >{worker_root}/f-measured-log-offset
+cp {worker_root}/container-id {worker_root}/rotation-after-id
+'''))
                 f_prewarm_scripts.append((host,
                     f"set -eu; test -s {worker_root}/s7-warm-f-action-trace-{relationship}.jsonl; "
                     f"cp {worker_root}/s7-warm-f-action-trace-{relationship}.jsonl {worker_root}/s7-prewarm-f-action-trace-{relationship}.jsonl; "
@@ -863,18 +916,50 @@ PY
                             f"chmod 0666 {client_shared_files}")
             self.run("q3", client_daemon)
             reset_path = f"{client_work}/reset-hook.sh"
-            q3_image = shlex.quote(self.authority["hosts"]["q3"]["image"].get("reference", ""))
-            reset_c_inner = client_inner
             reset_lines = ["#!/bin/sh", "set -eu", "work=$1", "suite=$2", "profile=$3",
-                           f"rm -f {client_work}/external-reset.ready",
-                           f"test -s {client_work}/c.container-id; cp {client_work}/c.container-id {client_work}/c-rotation-before-id; test -s {client_work}/c.pid; cp {client_work}/c.pid {client_work}/c-rotation-before-pid; test -s {client_work}/ready-c.trace; cp {client_work}/ready-c.trace {client_work}/ready-c-before.trace; : >{client_work}/ready-c.trace",
-                           f"docker rm -f {token}-c >/dev/null 2>&1 || true",
-                           f"if test -f {client_work}/s7-warm-c-action-trace.jsonl; then mv {client_work}/s7-warm-c-action-trace.jsonl {client_work}/setup-c-action-trace.jsonl; fi; : >{client_work}/s7-warm-c-action-trace.jsonl; : >{client_work}/s7-measured-c-legacy-wire-trace.jsonl",
-                           f"rm -rf {client_work}/cache-runtime-c; mkdir -p {client_work}/cache-runtime-c",
-                           f"chmod 1777 {client_work}/envs; chmod 700 {client_work}/cache-runtime-c; "
-                           f"test \"$(docker image inspect --format '{{{{.Id}}}}' {q3_image})\" = {self.authority['hosts']['q3']['image']['image_id']}; docker run -d --name {token}-c --pid=host --network host --user 0 {profile_flag} -e ICECC_TEST_SOCKET=/probe/work/client.sock -e ICECC_P50_C_ACTION_TRACE=/probe/work/s7-warm-c-action-trace.jsonl -e ICECC_P50_C_LEGACY_WIRE_TRACE=/probe/work/s7-measured-c-legacy-wire-trace.jsonl -e ICECC_P50_TEST_READY_TRACE=/probe/work/ready-c.trace {docker_mounts} -v {client_work}:/probe/work:rw -v {client_work}:{client_work}:rw --entrypoint /bin/sh {q3_image} -c {shlex.quote(reset_c_inner)} >{client_work}/c.stdout 2>&1",
-                           f"docker inspect --format '{{{{.State.Running}}}}' {token}-c | grep -Fx true; for _ in $(seq 1 300); do grep -q '^READY v2 ' {client_work}/ready-c.trace && break; sleep 0.1; done; grep -q '^READY v2 ' {client_work}/ready-c.trace; docker inspect --format '{{{{.Id}}}}' {token}-c > {client_work}/c.container-id; cp {client_work}/c.container-id {client_work}/c-rotation-after-id; docker inspect --format '{{{{.State.Pid}}}}' {token}-c > {client_work}/c.pid; cat {client_work}/ready-c-before.trace {client_work}/ready-c.trace > {client_work}/ready-c-combined.trace; mv {client_work}/ready-c-combined.trace {client_work}/ready-c.trace",
-                           f"before_ready=$(grep '^READY v2 ' {client_work}/ready-c-before.trace | tail -1); after_ready=$(grep '^READY v2 ' {client_work}/ready-c.trace | tail -1); field() {{ printf '%s\\n' \"$1\" | awk -v key=\"$2\" '{{for(i=1;i<=NF;i++){{split($i,a,\"=\"); if(a[1]==key){{print a[2]; exit}}}}}}'; }}; before_pid=$(field \"$before_ready\" pid); after_pid=$(field \"$after_ready\" pid); test -n \"$before_pid\" -a -n \"$after_pid\"; printf 'S8_SIDECAR_ROTATION role=C relationship=0 before_pid=%s after_pid=%s before_c_store_guid=%s after_c_store_guid=%s before_f_store_guid=%s after_f_store_guid=%s\\n' \"$before_pid\" \"$after_pid\" \"$(field \"$before_ready\" C_STORE_GUID)\" \"$(field \"$after_ready\" C_STORE_GUID)\" \"$(field \"$before_ready\" F_STORE_GUID)\" \"$(field \"$after_ready\" F_STORE_GUID)\" >{client_work}/external-rotation-evidence"]
+                           f'''rm -f {client_work}/external-reset.ready
+test -s {client_work}/c.container-id
+cp {client_work}/c.container-id {client_work}/c-rotation-before-id
+test -s {client_work}/c.pid
+cp {client_work}/c.pid {client_work}/c-rotation-before-pid
+test -s {client_work}/ready-c.trace
+cp {client_work}/ready-c.trace {client_work}/ready-c-before.trace
+container_id=$(tr -d '[:space:]' <{client_work}/c.container-id)
+printf '%s' "$container_id" | grep -Eq '^[0-9a-fA-F]{{12,64}}$'
+docker inspect --format '{{{{.State.Running}}}}' "$container_id" | grep -Fx true
+field() {{ printf '%s\n' "$1" | awk -v key="$2" '{{for(i=1;i<=NF;i++){{split($i,a,"="); if(a[1]==key){{print a[2]; exit}}}}}}'; }}
+before_count=$(grep -c '^READY v2 ' {client_work}/ready-c.trace)
+before_ready=$(grep '^READY v2 ' {client_work}/ready-c.trace | tail -1)
+before_pid=$(field "$before_ready" pid)
+before_c_guid=$(field "$before_ready" C_STORE_GUID)
+before_f_guid=$(field "$before_ready" F_STORE_GUID)
+printf '%s' "$before_pid" | grep -Eq '^[0-9]+$'
+test -n "$before_c_guid" -a -n "$before_f_guid"
+if test -f {client_work}/s7-warm-c-action-trace.jsonl; then
+  mv {client_work}/s7-warm-c-action-trace.jsonl {client_work}/setup-c-action-trace.jsonl
+fi
+: >{client_work}/s7-warm-c-action-trace.jsonl
+: >{client_work}/s7-measured-c-legacy-wire-trace.jsonl
+chmod 0666 {client_work}/s7-warm-c-action-trace.jsonl {client_work}/s7-measured-c-legacy-wire-trace.jsonl
+docker exec --user 0 "$container_id" /bin/sh -c {shlex.quote(sidecar_kill_inner)} p50-sidecar-kill "$before_pid" C /probe/work/cache-runtime-c
+replacement_ready=0
+for _ in $(seq 1 300); do
+  ready_now=$(grep -c '^READY v2 ' {client_work}/ready-c.trace 2>/dev/null || true)
+  if test "${{ready_now:-0}}" -gt "$before_count"; then replacement_ready=1; break; fi
+  sleep 0.1
+done
+test "$replacement_ready" -eq 1
+after_ready=$(grep '^READY v2 ' {client_work}/ready-c.trace | tail -1)
+after_pid=$(field "$after_ready" pid)
+after_c_guid=$(field "$after_ready" C_STORE_GUID)
+after_f_guid=$(field "$after_ready" F_STORE_GUID)
+printf '%s' "$after_pid" | grep -Eq '^[0-9]+$'
+test "$after_pid" != "$before_pid"
+test "$after_c_guid" != "$before_c_guid"
+test "$after_f_guid" != "$before_f_guid"
+cp {client_work}/c.container-id {client_work}/c-rotation-after-id
+printf 'S8_SIDECAR_ROTATION role=C relationship=0 before_pid=%s after_pid=%s before_c_store_guid=%s after_c_store_guid=%s before_f_store_guid=%s after_f_store_guid=%s\n' "$before_pid" "$after_pid" "$before_c_guid" "$after_c_guid" "$before_f_guid" "$after_f_guid" >{client_work}/external-rotation-evidence
+''']
             reset_lines.extend([f"for _ in $(seq 1 600); do test -f {client_work}/external-f-reset.ready && break; sleep 0.2; done",
                                 f"test -f {client_work}/external-f-reset.ready"])
             if profile == "RAW_II":
@@ -934,7 +1019,7 @@ PY
                             rotation_lines: list[str] = []
                             for relationship, (host, _service) in enumerate(services):
                                 worker_root = worker_work(relationship)
-                                rotation = self.run(host, f"set -eu; before=$(cat {worker_root}/rotation-before-id); after=$(cat {worker_root}/rotation-after-id); test \"$before\" != \"$after\"; before_ready=$(grep '^READY v2 ' {worker_root}/ready-before.trace | tail -1); after_ready=$(grep '^READY v2 ' {worker_root}/ready.trace | tail -1); printf 'S8_F_READY before_pid=%s after_pid=%s before=%s after=%s\\n' \"$(cat {worker_root}/rotation-before-pid)\" \"$(cat {worker_root}/container-pid)\" \"$before_ready\" \"$after_ready\"")
+                                rotation = self.run(host, f"set -eu; before_container=$(cat {worker_root}/rotation-before-id); after_container=$(cat {worker_root}/rotation-after-id); test \"$before_container\" = \"$after_container\"; before_ready=$(grep '^READY v2 ' {worker_root}/ready-before.trace | tail -1); after_ready=$(grep '^READY v2 ' {worker_root}/ready.trace | tail -1); field() {{ printf '%s\\n' \"$1\" | awk -v key=\"$2\" '{{for(i=1;i<=NF;i++){{split($i,a,\"=\"); if(a[1]==key){{print a[2]; exit}}}}}}'; }}; before_pid=$(field \"$before_ready\" pid); after_pid=$(field \"$after_ready\" pid); test -n \"$before_pid\" -a -n \"$after_pid\" -a \"$before_pid\" != \"$after_pid\"; printf 'S8_F_READY before_pid=%s after_pid=%s before=%s after=%s\\n' \"$before_pid\" \"$after_pid\" \"$before_ready\" \"$after_ready\"")
                                 match = re.search(r"S8_F_READY before_pid=([0-9]+) after_pid=([0-9]+) before=(READY v2 .*?) after=(READY v2 .*)", rotation.stdout)
                                 if match is None:
                                     raise ExternalFarmError(f"evidence:f_rotation_ready_missing:{relationship}")
