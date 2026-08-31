@@ -33,7 +33,10 @@ ROLE_PLACEMENT_SCHEMA = "icecream-s8-role-placement-v1"
 EXTERNAL_SCHEMA = "icecream-s8-external-farm-v1"
 AUTHORITY_SCHEMA = "icecream-s8-external-farm-authority-v1"
 HOSTS = ("q3", "q2", "research6", "research7")
-F_HOSTS = ("q2", "research6", "research7")
+# research6 remains a captured authority host, but it is deliberately not an
+# executable F target until the production placement policy is changed and a
+# fresh authority is generated for that change.
+F_HOSTS = ("q2", "research7")
 CPU_COUNTS = {"q3": 32, "q2": 32, "research6": 20, "research7": 12}
 TOPOLOGIES = {"C1F1/100000": (1, 1), "C1F20/40": (20, 2)}
 PROFILES = ("P29", "ZSTD_TU", "ZSTD_ROUTE", "GRZ_RESIDUAL", "RAW_II")
@@ -83,20 +86,24 @@ def _validate_authority(authority: Mapping[str, Any]) -> None:
     if not isinstance(placements, dict) or set(placements) != set(TOPOLOGIES):
         raise ExternalFarmError("authority:placements_invalid")
     physical: set[str] = set()
+    boots: set[str] = set()
+    reference_binaries: dict[str, str] | None = None
+    now = dt.datetime.now(dt.timezone.utc)
     for host in HOSTS:
         item = authority["hosts"][host]
         required = {"target", "lan", "hostname", "descriptor", "physical_host_digest", "boot_id_digest",
-                    "machine_id_sha256", "nic_identity_sha256",
-                    "cpu_count", "idle", "binaries", "image"}
-        if not isinstance(item, dict) or not required.issubset(item):
+                    "cpu_count", "idle", "binaries", "image", "cpu_sample",
+                    "cpu_sample_digest"}
+        if not isinstance(item, dict) or set(item) != required:
             raise ExternalFarmError(f"authority:{host}:fields_incomplete")
         value = _digest(item["physical_host_digest"], f"authority:{host}.physical_host_digest")
         if value in physical:
             raise ExternalFarmError("authority:physical_hosts_not_unique")
         physical.add(value)
-        _digest(item["boot_id_digest"], f"authority:{host}.boot_id_digest")
-        _digest(item["machine_id_sha256"], f"authority:{host}.machine_id_sha256")
-        _digest(item["nic_identity_sha256"], f"authority:{host}.nic_identity_sha256")
+        boot = _digest(item["boot_id_digest"], f"authority:{host}.boot_id_digest")
+        if boot in boots:
+            raise ExternalFarmError("authority:boot_ids_not_unique")
+        boots.add(boot)
         if (item["cpu_count"] != CPU_COUNTS[host] or
                 item["target"] != s4.HOSTS[host]["target"] or
                 item["lan"] != s4.HOSTS[host]["lan"] or
@@ -109,24 +116,68 @@ def _validate_authority(authority: Mapping[str, Any]) -> None:
         descriptor_sha, descriptor_bytes = _sha(Path(descriptor["path"]))
         if descriptor_sha != _digest(descriptor["sha256"], f"authority:{host}.descriptor") or descriptor_bytes != descriptor.get("bytes"):
             raise ExternalFarmError(f"authority:{host}:descriptor_mismatch")
+        descriptor_value = _load_private_json(Path(descriptor["path"]),
+                                              f"authority:{host}.descriptor")
+        facts = descriptor_value.get("facts")
+        fact_fields = {"machine_id_sha256", "boot_id_sha256", "nic_identity_sha256",
+                       "cpu_vendor_sha256", "cpu_model_sha256", "cpu_count",
+                       "physical_host_digest"}
+        if (set(descriptor_value) != {"schema", "facts"} or
+                descriptor_value.get("schema") != "icecream-s8-external-host-descriptor-v1" or
+                not isinstance(facts, dict) or set(facts) != fact_fields):
+            raise ExternalFarmError(f"authority:{host}:descriptor_fields_invalid")
+        for field in fact_fields - {"cpu_count"}:
+            _digest(facts[field], f"authority:{host}.descriptor.{field}")
+        physical_input = {"machine_id_sha256": facts["machine_id_sha256"],
+                          "nic_identity_sha256": facts["nic_identity_sha256"]}
+        expected_physical = hashlib.sha256(json.dumps(
+            physical_input, sort_keys=True, separators=(",", ":")).encode("ascii")).hexdigest()
+        if (facts["physical_host_digest"] != expected_physical or
+                facts["physical_host_digest"] != value or
+                facts["boot_id_sha256"] != boot or
+                facts["cpu_count"] != CPU_COUNTS[host]):
+            raise ExternalFarmError(f"authority:{host}:descriptor_identity_mismatch")
         idle = item["idle"]
-        if (not isinstance(idle, dict) or idle.get("status") not in {"PASS", "HOLD"} or
-                not isinstance(idle.get("load_1m"), (int, float)) or
-                idle["load_1m"] < 0):
+        sample = item["cpu_sample"]
+        if (not isinstance(idle, dict) or
+                set(idle) != {"status", "load_1m", "captured_at", "baseline_digest"} or
+                idle.get("status") not in {"PASS", "HOLD"} or
+                type(idle.get("load_1m")) not in (int, float) or idle["load_1m"] < 0 or
+                not isinstance(sample, dict) or
+                set(sample) != {"before", "after", "duration_seconds", "idle_percent"} or
+                any(not isinstance(sample.get(field), str) or not sample[field]
+                    for field in ("before", "after")) or
+                type(sample.get("duration_seconds")) not in (int, float) or
+                not .5 <= float(sample["duration_seconds"]) <= 5 or
+                type(sample.get("idle_percent")) not in (int, float) or
+                not 0 <= float(sample["idle_percent"]) <= 100):
+            raise ExternalFarmError(f"authority:{host}:idle_invalid")
+        _digest(idle["baseline_digest"], f"authority:{host}.baseline_digest")
+        sample_sha = hashlib.sha256((json.dumps(
+            sample, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")).hexdigest()
+        if (_digest(item["cpu_sample_digest"], f"authority:{host}.cpu_sample_digest") !=
+                sample_sha or idle["status"] !=
+                ("PASS" if float(idle["load_1m"]) <= IDLE_LOAD_THRESHOLD and
+                 float(sample["idle_percent"]) >= 95.0 else "HOLD")):
             raise ExternalFarmError(f"authority:{host}:idle_invalid")
         captured_at = idle.get("captured_at")
         if not isinstance(captured_at, str):
             raise ExternalFarmError(f"authority:{host}:idle_freshness_missing")
         try:
             captured = dt.datetime.fromisoformat(captured_at.replace("Z", "+00:00"))
-        except ValueError as exc:
+        except (TypeError, ValueError) as exc:
             raise ExternalFarmError(f"authority:{host}:idle_freshness_invalid") from exc
-        if (dt.datetime.now(dt.timezone.utc) - captured).total_seconds() > 300:
+        if captured.tzinfo is None or not -30 <= (now - captured).total_seconds() <= 300:
             raise ExternalFarmError(f"authority:{host}:idle_stale")
         image = item["image"]
-        if (not isinstance(image, dict) or image.get("reference") != s4.PINNED_IMAGE or
-                not re.fullmatch(r"sha256:[0-9a-f]{64}", str(image.get("image_id", ""))) or
-                image.get("architecture") != "amd64" or image.get("os") != "linux"):
+        expected_image = (s4.EXPECTED_IMAGE_CONFIG_ID if host == "research7"
+                          else s4.EXPECTED_IMAGE_ID)
+        if (not isinstance(image, dict) or
+                set(image) != {"reference", "image_id", "architecture", "os", "created"} or
+                image.get("reference") != s4.PINNED_IMAGE or
+                image.get("image_id") != expected_image or
+                image.get("architecture") != "amd64" or image.get("os") != "linux" or
+                not isinstance(image.get("created"), str) or not image["created"]):
             raise ExternalFarmError(f"authority:{host}:image_invalid")
         binaries = item["binaries"]
         required_roles = {"scheduler/icecc-scheduler", "daemon/iceccd", "client/icecc",
@@ -135,6 +186,10 @@ def _validate_authority(authority: Mapping[str, Any]) -> None:
             raise ExternalFarmError(f"authority:{host}:binary_identity_incomplete")
         for role, value in binaries.items():
             _digest(value, f"authority:{host}.binaries.{role}")
+        if reference_binaries is None:
+            reference_binaries = binaries
+        elif binaries != reference_binaries:
+            raise ExternalFarmError("authority:per_host_binary_mismatch")
     for suite, (count, _slots) in TOPOLOGIES.items():
         mapping = placements[suite]
         if (not isinstance(mapping, dict) or set(mapping) != {"relationship_hosts"} or
@@ -683,7 +738,7 @@ PY
                                 f"-n {network} -N {service} -b /probe/work/envs -l /probe/work/f.log "
                                 f"-vvv {' '.join(shlex.quote(arg) for arg in args)}")
                 worker = (f"set -eu; root={shlex.quote(staged_roots.get(host, root_mount))}; image={shlex.quote(self.authority['hosts'][host]['image'].get('reference', ''))}; test \"$(docker image inspect --format '{{{{.Id}}}}' \"$image\")\" = {self.authority['hosts'][host]['image']['image_id']}; mkdir -p {worker_root}/envs "
-                          f"{worker_root}/cache-runtime-{('f-' + str(relationship))}; chmod 1777 {worker_root}/envs; chmod 700 {worker_root}/cache-runtime-{('f-' + str(relationship))}; : >{worker_root}/s7-prewarm-f-action-trace-{relationship}.jsonl; "
+                          f"{worker_root}/cache-runtime-{('f-' + str(relationship))}; chmod 1777 {worker_root} {worker_root}/envs; chmod 700 {worker_root}/cache-runtime-{('f-' + str(relationship))}; : >{worker_root}/s7-prewarm-f-action-trace-{relationship}.jsonl; "
                           f"docker run -d --name {token}-f-{relationship} --network host --user 0 --cap-add SYS_CHROOT {profile_flag} -e ICECC_P50_RELATIONSHIP={relationship} -e ICECC_P50_F_ACTION_TRACE=/probe/work/s7-warm-f-action-trace-{relationship}.jsonl -e ICECC_P50_F_LEGACY_WIRE_TRACE=/probe/work/s7-measured-f-legacy-wire-trace-{relationship}.jsonl -e ICECC_P50_TEST_READY_TRACE=/probe/work/ready.trace {mounts_for(host)} -v {worker_root}:/probe/work:rw --entrypoint /bin/sh $image -c {shlex.quote(worker_inner)} "
                           f">{worker_root}/container.stdout 2>&1; test \"$(docker inspect --format '{{{{.State.Running}}}}' {token}-f-{relationship})\" = true; docker inspect --format '{{{{.Id}}}}' {token}-f-{relationship} > {worker_root}/container-id; docker inspect --format '{{{{.State.Pid}}}}' {token}-f-{relationship} > {worker_root}/container-pid; "
                           f"printf 'S8_CONTAINER_ID=%s\\n' \"$(cat {worker_root}/container-id)\"")
@@ -696,7 +751,7 @@ PY
                     f"rm -rf {worker_root}/cache-runtime-f-{relationship}; mkdir -p {worker_root}/cache-runtime-f-{relationship}; chmod 1777 {worker_root}/envs; chmod 700 {worker_root}/cache-runtime-f-{relationship}; "
                     f": >{worker_root}/f.log; "
                     f"image={shlex.quote(self.authority['hosts'][host]['image'].get('reference', ''))}; test \"$(docker image inspect --format '{{{{.Id}}}}' \"$image\")\" = {self.authority['hosts'][host]['image']['image_id']}; docker run -d --name {token}-f-{relationship} --network host --user 0 --cap-add SYS_CHROOT {profile_flag} -e ICECC_P50_RELATIONSHIP={relationship} -e ICECC_P50_F_ACTION_TRACE=/probe/work/s7-warm-f-action-trace-{relationship}.jsonl -e ICECC_P50_F_LEGACY_WIRE_TRACE=/probe/work/s7-measured-f-legacy-wire-trace-{relationship}.jsonl -e ICECC_P50_TEST_READY_TRACE=/probe/work/ready.trace {mounts_for(host)} -v {worker_root}:/probe/work:rw --entrypoint /bin/sh \"$image\" -c {shlex.quote(worker_inner)} >{worker_root}/container.stdout 2>&1; "
-                    f"docker inspect --format '{{{{.State.Running}}}}' {token}-f-{relationship} | grep -Fx true; for _ in $(seq 1 300); do grep -q '^READY v2 ' {worker_root}/ready.trace && break; sleep 0.1; done; grep -q '^READY v2 ' {worker_root}/ready.trace; stat -c %s {worker_root}/f.log > {worker_root}/f-measured-log-offset; docker inspect --format '{{{{.Id}}}}' {token}-f-{relationship} > {worker_root}/container-id; cp {worker_root}/container-id {worker_root}/rotation-after-id; docker inspect --format '{{{{.State.Pid}}}}' {token}-f-{relationship} > {worker_root}/container-pid; before_ready=$(grep '^READY v2 ' {worker_root}/ready-before.trace | tail -1); after_ready=$(grep '^READY v2 ' {worker_root}/ready.trace | tail -1); cat {worker_root}/ready-before.trace {worker_root}/ready.trace > {worker_root}/ready-combined.trace; mv {worker_root}/ready-combined.trace {worker_root}/ready.trace; printf 'S8_F_READY before_pid=%s after_pid=%s before=%s after=%s\\n' \"$(cat {worker_root}/rotation-before-pid)\" \"$(cat {worker_root}/container-pid)\" \"$before_ready\" \"$after_ready\""))
+                    f"docker inspect --format '{{{{.State.Running}}}}' {token}-f-{relationship} | grep -Fx true; for _ in $(seq 1 300); do grep -q '^READY v2 ' {worker_root}/ready.trace && break; sleep 0.1; done; grep -q '^READY v2 ' {worker_root}/ready.trace; stat -c %s {worker_root}/f.log > {worker_root}/f-measured-log-offset; docker inspect --format '{{{{.Id}}}}' {token}-f-{relationship} > {worker_root}/container-id; cp {worker_root}/container-id {worker_root}/rotation-after-id; docker inspect --format '{{{{.State.Pid}}}}' {token}-f-{relationship} > {worker_root}/container-pid; before_ready=$(grep '^READY v2 ' {worker_root}/ready-before.trace | tail -1); after_ready=$(grep '^READY v2 ' {worker_root}/ready.trace | tail -1); field() {{ printf '%s\\n' \"$1\" | awk -v key=\"$2\" '{{for(i=1;i<=NF;i++){{split($i,a,\"=\"); if(a[1]==key){{print a[2]; exit}}}}}}'; }}; before_pid=$(field \"$before_ready\" pid); after_pid=$(field \"$after_ready\" pid); test -n \"$before_pid\" -a -n \"$after_pid\"; cat {worker_root}/ready-before.trace {worker_root}/ready.trace > {worker_root}/ready-combined.trace; mv {worker_root}/ready-combined.trace {worker_root}/ready.trace; printf 'S8_F_READY before_pid=%s after_pid=%s before=%s after=%s\\n' \"$before_pid\" \"$after_pid\" \"$before_ready\" \"$after_ready\""))
                 f_prewarm_scripts.append((host,
                     f"set -eu; test -s {worker_root}/s7-warm-f-action-trace-{relationship}.jsonl; "
                     f"cp {worker_root}/s7-warm-f-action-trace-{relationship}.jsonl {worker_root}/s7-prewarm-f-action-trace-{relationship}.jsonl; "
@@ -732,7 +787,7 @@ PY
                            f"chmod 1777 {client_work}/envs; chmod 700 {client_work}/cache-runtime-c; "
                            f"test \"$(docker image inspect --format '{{{{.Id}}}}' {q3_image})\" = {self.authority['hosts']['q3']['image']['image_id']}; docker run -d --name {token}-c --network host --user 0 {profile_flag} -e ICECC_TEST_SOCKET=/probe/work/client.sock -e ICECC_P50_C_ACTION_TRACE=/probe/work/s7-warm-c-action-trace.jsonl -e ICECC_P50_C_LEGACY_WIRE_TRACE=/probe/work/s7-measured-c-legacy-wire-trace.jsonl -e ICECC_P50_TEST_READY_TRACE=/probe/work/ready-c.trace {docker_mounts} -v {client_work}:/probe/work:rw --entrypoint /bin/sh {q3_image} -c {shlex.quote(reset_c_inner)} >{client_work}/c.stdout 2>&1",
                            f"docker inspect --format '{{{{.State.Running}}}}' {token}-c | grep -Fx true; for _ in $(seq 1 300); do grep -q '^READY v2 ' {client_work}/ready-c.trace && break; sleep 0.1; done; grep -q '^READY v2 ' {client_work}/ready-c.trace; docker inspect --format '{{{{.Id}}}}' {token}-c > {client_work}/c.container-id; cp {client_work}/c.container-id {client_work}/c-rotation-after-id; docker inspect --format '{{{{.State.Pid}}}}' {token}-c > {client_work}/c.pid; cat {client_work}/ready-c-before.trace {client_work}/ready-c.trace > {client_work}/ready-c-combined.trace; mv {client_work}/ready-c-combined.trace {client_work}/ready-c.trace",
-                           f"before_ready=$(grep '^READY v2 ' {client_work}/ready-c-before.trace | tail -1); after_ready=$(grep '^READY v2 ' {client_work}/ready-c.trace | tail -1); before_pid=$(cat {client_work}/c-rotation-before-pid); after_pid=$(cat {client_work}/c.pid); field() {{ printf '%s\\n' \"$1\" | awk -v key=\"$2\" '{{for(i=1;i<=NF;i++){{split($i,a,\"=\"); if(a[1]==key){{print a[2]; exit}}}}}}'; }}; printf 'S8_SIDECAR_ROTATION role=C relationship=0 before_pid=%s after_pid=%s before_c_store_guid=%s after_c_store_guid=%s before_f_store_guid=%s after_f_store_guid=%s\\n' \"$before_pid\" \"$after_pid\" \"$(field \"$before_ready\" C_STORE_GUID)\" \"$(field \"$after_ready\" C_STORE_GUID)\" \"$(field \"$before_ready\" F_STORE_GUID)\" \"$(field \"$after_ready\" F_STORE_GUID)\" >{client_work}/external-rotation-evidence"]
+                           f"before_ready=$(grep '^READY v2 ' {client_work}/ready-c-before.trace | tail -1); after_ready=$(grep '^READY v2 ' {client_work}/ready-c.trace | tail -1); field() {{ printf '%s\\n' \"$1\" | awk -v key=\"$2\" '{{for(i=1;i<=NF;i++){{split($i,a,\"=\"); if(a[1]==key){{print a[2]; exit}}}}}}'; }}; before_pid=$(field \"$before_ready\" pid); after_pid=$(field \"$after_ready\" pid); test -n \"$before_pid\" -a -n \"$after_pid\"; printf 'S8_SIDECAR_ROTATION role=C relationship=0 before_pid=%s after_pid=%s before_c_store_guid=%s after_c_store_guid=%s before_f_store_guid=%s after_f_store_guid=%s\\n' \"$before_pid\" \"$after_pid\" \"$(field \"$before_ready\" C_STORE_GUID)\" \"$(field \"$after_ready\" C_STORE_GUID)\" \"$(field \"$before_ready\" F_STORE_GUID)\" \"$(field \"$after_ready\" F_STORE_GUID)\" >{client_work}/external-rotation-evidence"]
             reset_lines.extend([f"for _ in $(seq 1 600); do test -f {client_work}/external-f-reset.ready && break; sleep 0.2; done",
                                 f"test -f {client_work}/external-f-reset.ready"])
             if profile == "RAW_II":

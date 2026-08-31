@@ -102,7 +102,7 @@ EXTERNAL_FARM_ROLE_PATHS = (
     "client/icecc-create-env", "cache/icecc-cache-service")
 EXTERNAL_FARM_PINNED_IMAGE = "icecream/p50-farm-node:ubuntu22-gcc11-boost174-bdb55d"
 EXTERNAL_FARM_IMAGE_INDEX = "sha256:bdb55d4287a473e3ebfbaa7715a50ee670659777278b8d84c350724e6fa8de58"
-EXTERNAL_FARM_IMAGE_CONFIG = "sha256:fe001a6138f0176088b8846b43bf268a76a9d7a5b66c3364ba3f881da2ff0c54b"
+EXTERNAL_FARM_IMAGE_CONFIG = "sha256:fe001a6138f017608b8846b43bf268a76a9d7a5b66c3364ba3f881da2ff0c54b"
 ROLE_PLACEMENT_SCHEMA = "icecream-s8-role-placement-v1"
 # Keep the runner's emitted identity aligned with the current intake schema.
 CALIBRATION_METADATA_FIELDS = frozenset(normalizer.CALIBRATION_METADATA_KEYS)

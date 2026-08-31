@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import shutil
 import subprocess
 import datetime as dt
 from pathlib import Path
@@ -10,27 +12,46 @@ from typing import Sequence
 import pytest
 
 import s8_external_farm_executor as executor
+import s8_real_c1f1_live_runner as finalizer
 
 
 def _authority(tmp_path: Path) -> dict[str, object]:
     hosts: dict[str, object] = {}
     for host in executor.HOSTS:
+        machine = hashlib.sha256((host + ":machine").encode()).hexdigest()
+        nic = hashlib.sha256((host + ":nic").encode()).hexdigest()
+        physical_input = {"machine_id_sha256": machine, "nic_identity_sha256": nic}
+        physical = hashlib.sha256(json.dumps(
+            physical_input, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        boot = hashlib.sha256((host + ":boot").encode()).hexdigest()
+        facts = {"machine_id_sha256": machine, "boot_id_sha256": boot,
+                 "nic_identity_sha256": nic, "cpu_vendor_sha256": "2" * 64,
+                 "cpu_model_sha256": "3" * 64, "cpu_count": executor.CPU_COUNTS[host],
+                 "physical_host_digest": physical}
         descriptor = tmp_path / f"{host}.descriptor"
-        descriptor.write_text(json.dumps({"host": host}))
+        descriptor.write_text(json.dumps(
+            {"schema": "icecream-s8-external-host-descriptor-v1", "facts": facts},
+            sort_keys=True, separators=(",", ":")) + "\n")
         sha, size = executor._sha(descriptor)
+        sample = {"before": "cpu before", "after": "cpu after",
+                  "duration_seconds": 1.0, "idle_percent": 100.0}
         hosts[host] = {
             "target": executor.s4.HOSTS[host]["target"], "lan": executor.s4.HOSTS[host]["lan"],
             "hostname": host, "descriptor": {"path": str(descriptor), "sha256": sha, "bytes": size},
-            "physical_host_digest": hashlib.sha256(host.encode()).hexdigest(),
-            "boot_id_digest": hashlib.sha256((host + ":boot").encode()).hexdigest(),
-            "machine_id_sha256": hashlib.sha256((host + ":machine").encode()).hexdigest(),
-            "nic_identity_sha256": hashlib.sha256((host + ":nic").encode()).hexdigest(),
+            "physical_host_digest": physical, "boot_id_digest": boot,
             "cpu_count": executor.CPU_COUNTS[host],
             "idle": {"status": "PASS", "load_1m": 0.1,
-                     "captured_at": dt.datetime.now(dt.timezone.utc).isoformat()},
-            "image": {"reference": executor.s4.PINNED_IMAGE, "image_id": "sha256:" + "a" * 64,
-                      "architecture": "amd64", "os": "linux"},
-            "binaries": {role: hashlib.sha256((host + role).encode()).hexdigest() for role in {
+                     "captured_at": dt.datetime.now(dt.timezone.utc).replace(
+                         microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                     "baseline_digest": hashlib.sha256((host + ":baseline").encode()).hexdigest()},
+            "cpu_sample": sample,
+            "cpu_sample_digest": hashlib.sha256((json.dumps(
+                sample, sort_keys=True, separators=(",", ":")) + "\n").encode()).hexdigest(),
+            "image": {"reference": executor.s4.PINNED_IMAGE,
+                      "image_id": (executor.s4.EXPECTED_IMAGE_CONFIG_ID if host == "research7"
+                                   else executor.s4.EXPECTED_IMAGE_ID),
+                      "architecture": "amd64", "os": "linux", "created": "now"},
+            "binaries": {role: hashlib.sha256(role.encode()).hexdigest() for role in {
                 "scheduler/icecc-scheduler", "daemon/iceccd", "client/icecc",
                 "client/icecc-create-env", "cache/icecc-cache-service"}},
         }
@@ -45,6 +66,23 @@ def test_placement_has_no_q3_f_and_disjoint_physical_ids(tmp_path: Path) -> None
     assert placement["c_host_digest"] not in placement["f_host_digests"]
     with pytest.raises(executor.ExternalFarmError, match="q3_f_forbidden"):
         executor.role_placement(authority, "C1F1/100000", ["q3"])
+
+
+def test_research6_is_captured_but_not_an_executable_f_host(tmp_path: Path) -> None:
+    authority = _authority(tmp_path)
+    authority["placements"]["C1F1/100000"]["relationship_hosts"] = ["research6"]
+    with pytest.raises(executor.ExternalFarmError, match="placements:C1F1/100000:invalid"):
+        executor._validate_authority(authority)
+    with pytest.raises(executor.ExternalFarmError, match="q3_f_forbidden"):
+        executor.role_placement(_authority(tmp_path), "C1F1/100000", ["research6"])
+
+
+def test_rotation_uses_ready_pids_and_worker_root_allows_daemon_outputs() -> None:
+    source = Path(executor.__file__).read_text(encoding="utf-8")
+    assert source.count(r'before_pid=$(field \"$before_ready\" pid)') >= 2
+    assert source.count(r'after_pid=$(field \"$after_ready\" pid)') >= 2
+    assert "before_pid=$(cat {client_work}/c-rotation-before-pid)" not in source
+    assert 'chmod 1777 {worker_root} {worker_root}/envs' in source
 
 
 def test_parallel_gate_requires_all_lanes_and_overlap() -> None:
@@ -150,8 +188,13 @@ def test_concrete_transport_invokes_q3_c_scheduler_and_non_q3_f(tmp_path: Path, 
         if "S8_F_INTERFERENCE" in script:
             stdout = "S8_F_INTERFERENCE before=1 after=2\n"
         else:
-            stdout = ("PASS: all-P50 C1F1\nS8_BATCH_METRICS max_concurrent_admitted_or_compiling_jobs=2\n"
-                      if "-batch" in script else "")
+            workdir = re.search(
+                r"ICECC_P50_C1F1_WORKDIR=(/tmp/p50compilee2e\.external\.[A-Za-z0-9]+)",
+                script)
+            stdout = (("PASS: all-P50 C1F1\n"
+                       f"S7_WORKDIR={workdir.group(1)}\n"
+                       "S8_BATCH_METRICS max_concurrent_admitted_or_compiling_jobs=2\n")
+                      if "-batch" in script and workdir is not None else "")
         return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
     monkeypatch.setattr(transport, "run", fake_run)
     monkeypatch.setattr(executor.s4, "run_script",
@@ -188,6 +231,21 @@ def test_concrete_transport_invokes_q3_c_scheduler_and_non_q3_f(tmp_path: Path, 
     assert result["finalizer_input"]["receipt_path"].endswith("external-farm-receipt.json")
     assert result["finalizer_input"]["receipt_sha256"] == executor._sha(
         tmp_path / "out" / "external-farm-receipt.json")[0]
+    finalizer_input = result["finalizer_input"]
+    retained_workdir = Path(finalizer_input["workdir"])
+    try:
+        external = finalizer.ExternalFarmFinalization(
+            Path(finalizer_input["manifest_path"]), finalizer_input["manifest_sha256"],
+            Path(finalizer_input["authority_path"]), finalizer_input["authority_sha256"],
+            retained_workdir, Path(finalizer_input["stdout_path"]),
+            finalizer_input["stdout_sha256"], finalizer_input["stdout_bytes"],
+            Path(finalizer_input["receipt_path"]), finalizer_input["receipt_sha256"],
+            finalizer_input["receipt_bytes"])
+        binding = finalizer._external_farm_binding(external, finalizer.TOPOLOGY)
+        assert binding["manifest"]["sha256"] == finalizer_input["manifest_sha256"]
+        assert binding["authority"]["sha256"] == finalizer_input["authority_sha256"]
+    finally:
+        shutil.rmtree(retained_workdir, ignore_errors=True)
 
 
 def test_arbitrary_true_command_cannot_be_admitted(tmp_path: Path) -> None:
