@@ -44,6 +44,8 @@ STAMP_RE = re.compile(r"^\d{8}T\d{6}Z$")
 IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 PINNED_IMAGE = "icecream/farm-node:ubuntu22-gcc11-boost174"
 OOM_SCORE_ADJ = -1000
+# The owner-facing method name differs from the harness profile for GRZ.
+METHOD_BY_PROFILE = {"GRZ_RESIDUAL": "GRZ"}
 # One host-wide inode is shared by every campaign and every protected
 # supervisor.  It is deliberately independent of a campaign/temp namespace.
 LIVE_LOCK_PATH = Path("/tmp/icecream-s8-live-run.lock")
@@ -68,6 +70,17 @@ def _safe(value: str) -> str:
 
 def _cell_id(cell: dict[str, str]) -> str:
     return "/".join((cell["corpus"], cell["profile"], cell["regime"], cell["topology"]))
+
+
+def _experiment_identity(cell: dict[str, str], *, split: str,
+                         depth_class: str, pass_id: str) -> dict[str, str]:
+    profile = cell["profile"]
+    return {
+        "method": METHOD_BY_PROFILE.get(profile, profile), "profile": profile,
+        "corpus": cell["corpus"], "regime": cell["regime"], "split": split,
+        "topology": cell["topology"], "depth_class": depth_class,
+        "pass_id": pass_id,
+    }
 
 
 def _slug(cell: dict[str, str]) -> str:
@@ -920,12 +933,9 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
             result_path = attempt_dir / "result.json"
             _write_new(result_path, canonical({"schema": "icecream-s8-campaign-result-v2",
                                                "cell": cell, "attempt": attempt_no,
-                                               "identity": {
-                                                   "method": cell["profile"], "corpus": cell["corpus"],
-                                                   "regime": cell["regime"], "split": SPLITS[corpus],
-                                                   "topology": cell["topology"], "depth_class": depth,
-                                                   "pass_id": "full-1",
-                                               },
+                                               "identity": _experiment_identity(
+                                                   cell, split=SPLITS[corpus],
+                                                   depth_class=depth, pass_id="full-1"),
                                                "status": "STAGED", "result": None,
                                                "error": status["reason"]}))
             status["result_record"] = {"path": str(result_path.relative_to(campaign)),
@@ -1008,12 +1018,9 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
                         pass_id = ("full-2" if depth == "full" and comparison_index == 1
                                    else "full-1")
                         depth_class = "repeat-full" if pass_id == "full-2" else depth
-                        experiment_identity = {
-                            "method": cell["profile"], "corpus": cell["corpus"],
-                            "regime": cell["regime"], "split": SPLITS[corpus],
-                            "topology": cell["topology"], "depth_class": depth_class,
-                            "pass_id": pass_id,
-                        }
+                        experiment_identity = _experiment_identity(
+                            cell, split=SPLITS[corpus], depth_class=depth_class,
+                            pass_id=pass_id)
                         comparison_record = _authenticate_comparison(
                             comparison_path,
                             expected_cell=(cell["corpus"], cell["profile"], cell["regime"]),
@@ -1057,13 +1064,10 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
                     segment_index = len(segments)
                     segment_pass = ("full-2" if depth == "full" and segment_index == 1
                                     else "full-1")
-                    segment_identity = {
-                        "method": cell["profile"], "corpus": cell["corpus"],
-                        "regime": cell["regime"], "split": SPLITS[corpus],
-                        "topology": cell["topology"],
-                        "depth_class": ("repeat-full" if segment_pass == "full-2" else depth),
-                        "pass_id": segment_pass,
-                    }
+                    segment_identity = _experiment_identity(
+                        cell, split=SPLITS[corpus],
+                        depth_class=("repeat-full" if segment_pass == "full-2" else depth),
+                        pass_id=segment_pass)
                     segments.append({"directory": str(result_dir), "identity": segment_identity,
                                      "artifacts": artifacts,
                                      "points": len(curve_lines),
@@ -1092,10 +1096,9 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
             status.update(status="FAIL", error=error)
         status["ended_utc"] = datetime.now(timezone.utc).isoformat()
         result_record = {"schema": "icecream-s8-campaign-result-v2", "cell": cell,
-                         "identity": {"method": cell["profile"], "corpus": cell["corpus"],
-                                      "regime": cell["regime"], "split": SPLITS[corpus],
-                                      "topology": cell["topology"], "depth_class": depth,
-                                      "pass_id": "full-1"},
+                         "identity": _experiment_identity(
+                             cell, split=SPLITS[corpus], depth_class=depth,
+                             pass_id="full-1"),
                          "attempt": attempt_no, "status": status["status"],
                          "result": result, "error": error}
         result_path = attempt_dir / "result.json"

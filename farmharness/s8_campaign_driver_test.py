@@ -238,6 +238,17 @@ def test_plan_only_stages_live_and_comparison_without_running_predictive(tmp_pat
     assert len(list(campaign.glob("cells/*/attempt-001/result.json"))) == 16
 
 
+def test_experiment_identity_maps_grz_owner_method() -> None:
+    cell = {"corpus": "fmt", "profile": "GRZ_RESIDUAL", "regime": "warm",
+            "topology": "C1F20/40"}
+    assert driver._experiment_identity(
+        cell, split="calibration", depth_class="100", pass_id="full-1") == {
+            "method": "GRZ", "profile": "GRZ_RESIDUAL", "corpus": "fmt",
+            "regime": "warm", "split": "calibration", "topology": "C1F20/40",
+            "depth_class": "100", "pass_id": "full-1",
+        }
+
+
 def test_new_campaign_uses_suffix_on_same_second_without_overwrite(tmp_path: Path) -> None:
     first = driver._new_campaign_root(tmp_path, "20260829T120003Z")
     second = driver._new_campaign_root(tmp_path, "20260829T120003Z")
@@ -372,7 +383,8 @@ def test_all_mode_retains_authenticated_live_and_comparison_result(tmp_path: Pat
     assert comparison["records"]["path"].endswith("records.jsonl")
     cell = state["cell"]
     assert comparison["identity"] == {
-        "method": cell["profile"], "corpus": cell["corpus"],
+        "method": driver.METHOD_BY_PROFILE.get(cell["profile"], cell["profile"]),
+        "profile": cell["profile"], "corpus": cell["corpus"],
         "regime": cell["regime"], "split": "calibration",
         "topology": cell["topology"], "depth_class": "100", "pass_id": "full-1",
     }
@@ -411,7 +423,8 @@ def test_all_mode_rejects_mutated_comparison_error_curve(
             comparison_path,
             expected_cell=(cell["corpus"], cell["profile"], cell["regime"]),
             experiment_identity={
-                "method": cell["profile"], "corpus": cell["corpus"],
+                "method": driver.METHOD_BY_PROFILE.get(cell["profile"], cell["profile"]),
+                "profile": cell["profile"], "corpus": cell["corpus"],
                 "regime": cell["regime"], "split": "calibration",
                 "topology": cell["topology"],
                 "depth_class": "100", "pass_id": "full-1",
