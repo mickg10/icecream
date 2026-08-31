@@ -27,13 +27,13 @@ class S4MethodMatrixExecutorTest(unittest.TestCase):
                 compile_source_root=Path("/compile-src"),
                 timestamp="20260831T141130Z")
             summary = json.loads((campaign / "summary.json").read_text())
-            self.assertEqual(summary["status"], "STAGED_RAW_II_GAP")
+            self.assertEqual(summary["status"], "STAGED")
             self.assertFalse(summary["execution_ready"])
             self.assertEqual(summary["comparison_blocks"], 128)
             self.assertEqual(summary["arm_runs"], 256)
-            self.assertEqual(summary["blocked_arms"], 128)
-            self.assertEqual(summary["staged_arms"], 128)
-            self.assertEqual(summary["raw_ii_gap"], RAW_II_GAP)
+            self.assertEqual(summary["blocked_arms"], 0)
+            self.assertEqual(summary["staged_arms"], 256)
+            self.assertIsNone(summary["raw_ii_gap"])
             self.assertEqual(summary["split_policy"]["campaign_corpus"], "fmt")
             self.assertFalse(any("DuckDB" in str(path) or "LLVM-1238" in str(path)
                                  for path in campaign.rglob("*")))
@@ -46,9 +46,9 @@ class S4MethodMatrixExecutorTest(unittest.TestCase):
             method = json.loads((grz / "arms/GRZ/manifest.json").read_text())
             self.assertEqual(method["product_profile"], "GRZ")
             self.assertEqual(method["harness_profile"], "GRZ_RESIDUAL")
-            self.assertFalse(method["executable"])
-            self.assertEqual(method["execution_blocker"], RAW_II_GAP)
-            self.assertTrue(all(not row["executable"] for row in method["commands"]))
+            self.assertTrue(method["executable"])
+            self.assertNotIn("execution_blocker", method)
+            self.assertTrue(all(row["executable"] for row in method["commands"]))
             self.assertEqual(method["measurement"]["channel_bytes"], None)
             live = next(row for row in method["commands"] if row["stage"] == "live_run")
             self.assertIn("--profile", live["argv"])
@@ -76,14 +76,16 @@ class S4MethodMatrixExecutorTest(unittest.TestCase):
             self.assertEqual(repeat_method["repeat_predecessor"]["order"], "AB")
 
             raw = json.loads((grz / "arms/RAW_II/manifest.json").read_text())
-            self.assertEqual(raw["status"], "BLOCKED")
-            self.assertFalse(raw["executable"])
-            self.assertEqual(raw["commands"], [])
-            self.assertIn("does not provide the required multi-TU transfer curve", raw["gap"])
+            self.assertEqual(raw["status"], "STAGED")
+            self.assertTrue(raw["executable"])
+            self.assertEqual(raw["harness_profile"], "ZSTD_TU")
+            raw_live = next(row for row in raw["commands"] if row["stage"] == "live_run")
+            self.assertEqual(raw_live["argv"][raw_live["argv"].index("--profile") + 1], "ZSTD_TU")
+            self.assertEqual(raw_live["argv"][raw_live["argv"].index("--product-profile") + 1], "RAW_II")
 
     def test_execute_fails_closed_without_running_anything(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            with self.assertRaisesRegex(ValueError, "RAW_II bridge"):
+            with self.assertRaisesRegex(ValueError, "intentionally unavailable"):
                 materialize_matrix(
                     output_root=Path(temp), repo=Path.cwd(), corpus="fmt", source_manifest="x",
                     source_root="x", matrix_audit=Path("x"), engine_manifest="x",

@@ -81,6 +81,48 @@ uint64_t next_p50_nonzero(std::atomic<uint64_t> &counter) noexcept
     return value == 0 ? counter.fetch_add(1, std::memory_order_relaxed) : value;
 }
 
+bool is_p50_legacy_wire_frame(Msg::Value type) noexcept
+{
+    return type == Msg::COMPILE_FILE || type == Msg::FILE_CHUNK || type == Msg::END ||
+           type == Msg::COMPILE_RESULT;
+}
+
+const char *p50_legacy_wire_trace_path(P50LegacyWireRole role) noexcept
+{
+    const char *specific = role == P50LegacyWireRole::C
+                               ? std::getenv("ICECC_P50_C_LEGACY_WIRE_TRACE")
+                               : std::getenv("ICECC_P50_F_LEGACY_WIRE_TRACE");
+    if (specific != nullptr && *specific != '\0')
+        return specific;
+    const char *shared = std::getenv("ICECC_P50_LEGACY_WIRE_TRACE");
+    return shared != nullptr && *shared != '\0' ? shared : nullptr;
+}
+
+bool append_p50_legacy_wire_trace(const char *path, const std::string &line) noexcept
+{
+    if (path == nullptr)
+        return true;
+    const int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC |
+                                    O_NOFOLLOW,
+                          0600);
+    if (fd < 0)
+        return false;
+    size_t offset = 0;
+    while (offset != line.size()) {
+        const ssize_t written = ::write(fd, line.data() + offset,
+                                         line.size() - offset);
+        if (written > 0) {
+            offset += static_cast<size_t>(written);
+            continue;
+        }
+        if (written < 0 && errno == EINTR)
+            continue;
+        (void)::close(fd);
+        return false;
+    }
+    return ::close(fd) == 0;
+}
+
 } // namespace
 
 namespace {
@@ -835,7 +877,17 @@ bool MsgChannel::flush_writebuf(int send_flags)
         if (test_cut_armed) {
             test_cut_bytes -= (size_t)ret;   // next iteration fails at 0
         }
+        const uint64_t drained_begin = total_drained;
         total_drained += (uint64_t)ret;
+        for (const P50LegacyPendingFrame &frame : p50_legacy_pending_frames) {
+            const uint64_t overlap_begin = std::max(frame.begin, drained_begin);
+            const uint64_t overlap_end = std::min(frame.end, total_drained);
+            if (overlap_end > overlap_begin)
+                p50_legacy_note_drained(overlap_begin, overlap_end);
+        }
+        while (!p50_legacy_pending_frames.empty() &&
+               p50_legacy_pending_frames.front().end <= total_drained)
+            p50_legacy_pending_frames.pop_front();
         while (!pending_frame_ends.empty()
                && pending_frame_ends.front() <= total_drained) {
             pending_frame_ends.pop_front();
@@ -1162,6 +1214,7 @@ void MsgChannel::writecompressed(const unsigned char *in_buf, size_t _in_len, si
     }
     memcpy(msgbuf + msgtogo_old, &_olen, 4);
     msgtogo += out_len;
+    total_appended += out_len;
     _out_len = out_len;
 }
 
@@ -1655,6 +1708,118 @@ MsgChannel::~MsgChannel()
 string MsgChannel::dump() const
 {
     return name + ": (" + char((int)instate + 'A') + " eof: " + char(eof + '0') + ")";
+}
+
+bool MsgChannel::set_p50_legacy_wire_identity(
+    const P50LegacyWireIdentity &identity) noexcept
+{
+    if (!identity.valid())
+        return false;
+    if (p50_legacy_wire_role == P50LegacyWireRole::F) {
+        if (!p50_legacy_pending_compile_file.has_value() ||
+            p50_legacy_pending_compile_file->identity != identity)
+            return false;
+    }
+    if (p50_legacy_wire_identity_set) {
+        if (p50_legacy_wire_role == P50LegacyWireRole::F &&
+            p50_legacy_pending_compile_file.has_value())
+            return false;
+        return !p50_legacy_wire_completed &&
+               p50_legacy_wire_identity == identity;
+    }
+    p50_legacy_wire_identity = identity;
+    p50_legacy_wire_identity_set = true;
+    p50_legacy_wire_completed = false;
+    p50_legacy_c_to_f_sent = 0;
+    p50_legacy_c_to_f_received = 0;
+    p50_legacy_f_to_c_sent = 0;
+    p50_legacy_f_to_c_received = 0;
+    p50_legacy_pending_frames.clear();
+    if (p50_legacy_wire_role == P50LegacyWireRole::F) {
+        p50_legacy_c_to_f_received =
+            p50_legacy_pending_compile_file->frame_bytes;
+        p50_legacy_pending_compile_file.reset();
+    } else {
+        p50_legacy_pending_compile_file.reset();
+    }
+    return true;
+}
+
+void MsgChannel::p50_legacy_note_received(Msg::Value type,
+                                           size_t frame_bytes) noexcept
+{
+    if (!p50_legacy_wire_identity_set || p50_legacy_wire_completed ||
+        !is_p50_legacy_wire_frame(type))
+        return;
+    const uint64_t bytes = static_cast<uint64_t>(frame_bytes);
+    uint64_t *counter = p50_legacy_wire_role == P50LegacyWireRole::C
+                            ? &p50_legacy_f_to_c_received
+                            : &p50_legacy_c_to_f_received;
+    if (bytes > std::numeric_limits<uint64_t>::max() - *counter)
+        *counter = std::numeric_limits<uint64_t>::max();
+    else
+        *counter += bytes;
+}
+
+void MsgChannel::p50_legacy_note_frame_queued(Msg::Value type,
+                                               uint64_t begin,
+                                               uint64_t end) noexcept
+{
+    if (!p50_legacy_wire_identity_set || p50_legacy_wire_completed ||
+        !is_p50_legacy_wire_frame(type) || end <= begin)
+        return;
+    p50_legacy_pending_frames.push_back({begin, end});
+}
+
+void MsgChannel::p50_legacy_note_drained(uint64_t begin,
+                                         uint64_t end) noexcept
+{
+    if (!p50_legacy_wire_identity_set || p50_legacy_wire_completed ||
+        end <= begin)
+        return;
+    const uint64_t bytes = end - begin;
+    uint64_t *counter = p50_legacy_wire_role == P50LegacyWireRole::C
+                            ? &p50_legacy_c_to_f_sent
+                            : &p50_legacy_f_to_c_sent;
+    if (bytes > std::numeric_limits<uint64_t>::max() - *counter)
+        *counter = std::numeric_limits<uint64_t>::max();
+    else
+        *counter += bytes;
+}
+
+bool MsgChannel::p50_legacy_wire_complete() noexcept
+{
+    if (!p50_legacy_wire_identity_set || p50_legacy_wire_completed)
+        return false;
+    if (!p50_legacy_pending_frames.empty() || msgtogo != 0)
+        return false;
+    p50_legacy_wire_completed = true;
+
+    const char *path = p50_legacy_wire_trace_path(p50_legacy_wire_role);
+    if (path == nullptr)
+        return true;
+
+    const char *role = p50_legacy_wire_role == P50LegacyWireRole::C ? "C" : "F";
+    char line[1024];
+    const int length = std::snprintf(
+        line, sizeof(line),
+        "{\"schema\":\"icecream-p50-legacy-wire-v1\",\"role\":\"%s\","
+        "\"job_id\":%u,\"assignment_epoch\":%llu,"
+        "\"assignment_nonce\":%llu,\"c_guid\":%llu,\"tu_seq\":%llu,"
+        "\"c_to_f_sent_bytes\":%llu,\"c_to_f_received_bytes\":%llu,"
+        "\"f_to_c_sent_bytes\":%llu,\"f_to_c_received_bytes\":%llu}\n",
+        role, p50_legacy_wire_identity.job_id,
+        static_cast<unsigned long long>(p50_legacy_wire_identity.assignment_epoch),
+        static_cast<unsigned long long>(p50_legacy_wire_identity.assignment_nonce),
+        static_cast<unsigned long long>(p50_legacy_wire_identity.c_guid),
+        static_cast<unsigned long long>(p50_legacy_wire_identity.tu_seq),
+        static_cast<unsigned long long>(p50_legacy_c_to_f_sent),
+        static_cast<unsigned long long>(p50_legacy_c_to_f_received),
+        static_cast<unsigned long long>(p50_legacy_f_to_c_sent),
+        static_cast<unsigned long long>(p50_legacy_f_to_c_received));
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(line))
+        return false;
+    return append_p50_legacy_wire_trace(path, std::string(line, length));
 }
 
 /* Wait blocking until the protocol setup for this channel is complete.
@@ -2155,6 +2320,29 @@ Msg *MsgChannel::get_msg(int timeout, bool eofAllowed)
             set_error();
             return nullptr;
         }
+    }
+
+    /* The frame is complete and its payload has passed the ordinary decoder.
+       Count the exact framed bytes now; buffered bytes belonging to a later
+       message are outside current_message_end and are not included.  F's
+       CompileFile identity is attached by handle_compile_file immediately
+       after this return, so retain that one frame until the binding occurs. */
+    const uint64_t frame_bytes =
+        inmsglen + (text_based ? 0 : sizeof(uint32_t));
+    if (type == Msg::COMPILE_FILE &&
+        p50_legacy_wire_role == P50LegacyWireRole::F) {
+        P50LegacyWireIdentity identity;
+        const auto *compile = dynamic_cast<const CompileFileMsg *>(m);
+        if (compile == nullptr || p50_legacy_pending_compile_file.has_value() ||
+            !compile->legacy_wire_identity(identity)) {
+            delete m;
+            set_error();
+            return nullptr;
+        }
+        p50_legacy_pending_compile_file =
+            P50LegacyPendingCompileFile{identity, frame_bytes};
+    } else {
+        p50_legacy_note_received(type, frame_bytes);
     }
 
     instate = NEED_LEN;
@@ -2742,6 +2930,9 @@ bool MsgChannel::send_msg(const Msg &m, int flags)
        tracking (framesFlushed advances when its last byte drains).  */
     ++frames_queued_seq;
     pending_frame_ends.push_back(total_appended);
+    p50_legacy_note_frame_queued(
+        static_cast<Msg::Value>(m),
+        total_appended - (msgtogo - msgtogo_old), total_appended);
     while (!pending_frame_ends.empty()
            && pending_frame_ends.front() <= total_drained) {
         pending_frame_ends.pop_front();

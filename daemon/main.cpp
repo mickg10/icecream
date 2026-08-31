@@ -7912,6 +7912,20 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
     }
 
     client->job = job;
+    if (!job->usesP50Input() && client->channel->protocol >= PROTOCOL_VERSION) {
+        const P50LegacyWireIdentity identity{
+            job->jobID(), job->assignmentEpoch(), job->assignmentNonce(),
+            job->cGuid(), job->tuSeq()};
+        if (!client->channel->set_p50_legacy_wire_identity(identity)) {
+            log_warning() << "legacy wire identity could not be bound for job "
+                          << job->jobID() << endl;
+            client->job = nullptr;
+            delete job;
+            (void)client->channel->send_msg(EndMsg());
+            handle_end(client, 146);
+            return false;
+        }
+    }
     if (client->command_line.empty()) {
         client->command_line = command_line_from_compile_job(job);
     }
@@ -9838,6 +9852,7 @@ void Daemon::answer_client_requests()
                 MsgChannel *c = Service::createChannel(acc_fd, &cli_addr, cli_len);
 
                 if (c) {
+                    c->set_p50_legacy_wire_role(P50LegacyWireRole::F);
                     Client *client = new Client;
                     client->client_id = ++new_client_id;
                     client->channel = c;

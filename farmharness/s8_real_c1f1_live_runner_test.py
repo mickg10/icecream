@@ -446,7 +446,8 @@ def test_dry_run_command_targets_real_single_lifecycle_for_all_profiles(tmp_path
                                    predictive_plan=plan)
     assert command[0] == "env"
     assert "ICECC_CARET_WORKAROUND=0" in command
-    assert f"ICECC_P50_PROFILE={profile}" in command
+    expected_product_profile = "GRZ" if profile == "GRZ_RESIDUAL" else profile
+    assert f"ICECC_P50_PROFILE={expected_product_profile}" in command
     assert "ICECC_P50_C1F1_WARM=1" in command
     assert "ICECC_P50_C1F1_PASSES=2" in command
     assert "ICECC_P50_C1F1_EXPECTED_COUNT=100" in command
@@ -1355,3 +1356,58 @@ def test_calibration_metadata_has_exact_fields_and_no_caller_override(
             metadata=metadata, runtime_image={}, preparation={}, work=work,
             rows=rows, observations=observations, suite=runner.TOPOLOGY,
             host_descriptor=descriptor)
+
+
+def _write_legacy_wire_fixture(work: Path, *, mutate: dict[str, object] | None = None) -> None:
+    base = {
+        "schema": "icecream-p50-legacy-wire-v1", "job_id": 71,
+        "assignment_epoch": 73, "assignment_nonce": 79, "c_guid": 83,
+        "tu_seq": 0, "c_to_f_sent_bytes": 140,
+        "c_to_f_received_bytes": 0, "f_to_c_sent_bytes": 96,
+        "f_to_c_received_bytes": 96,
+    }
+    c_row = {**base, "role": "C", "f_to_c_sent_bytes": 0}
+    f_row = {**base, "role": "F", "c_to_f_received_bytes": 140,
+             "f_to_c_sent_bytes": 96, "f_to_c_received_bytes": 0,
+             "c_to_f_sent_bytes": 0}
+    if mutate:
+        c_row.update(mutate.get("C", {}))
+        f_row.update(mutate.get("F", {}))
+    (work / "s7-measured-c-legacy-wire-trace.jsonl").write_text(
+        json.dumps(c_row, sort_keys=True) + "\n", encoding="ascii")
+    (work / "s7-measured-f-legacy-wire-trace.jsonl").write_text(
+        json.dumps(f_row, sort_keys=True) + "\n", encoding="ascii")
+
+
+def test_legacy_wire_stage_joins_authenticated_c_and_f_totals(tmp_path: Path) -> None:
+    _write_legacy_wire_fixture(tmp_path)
+    observations = [{"observed_scheduler_job_id": 71,
+                     "observed_source_tu_seq": 0}]
+    assignments = [{"relationship": 0, "f_slot": 0}]
+    rows = runner._legacy_wire_stage(tmp_path, observations, assignments)
+    assert rows[0]["c_to_f_bytes"] == 140
+    assert rows[0]["f_to_c_bytes"] == 96
+    assert rows[0]["channel_bytes"] == 236
+
+
+def test_raw_ii_method_cannot_enter_calibration_as_zstd_tu() -> None:
+    method, product, eligible = runner._measurement_descriptor(
+        "ZSTD_TU", runner.RAW_II_PROFILE)
+    assert method == runner.RAW_II_PROFILE
+    assert product == runner.RAW_II_PROFILE
+    assert eligible is False
+
+
+@pytest.mark.parametrize("mutation", [
+    {"C": {"job_id": 72}},
+    {"F": {"c_to_f_received_bytes": 139}},
+    {"F": {"f_to_c_received_bytes": 1}},
+])
+def test_legacy_wire_stage_rejects_identity_or_direction_mutation(
+        tmp_path: Path, mutation: dict[str, object]) -> None:
+    _write_legacy_wire_fixture(tmp_path, mutate=mutation)
+    observations = [{"observed_scheduler_job_id": 71,
+                     "observed_source_tu_seq": 0}]
+    assignments = [{"relationship": 0, "f_slot": 0}]
+    with pytest.raises(runner.LiveRunnerError, match="legacy_wire:"):
+        runner._legacy_wire_stage(tmp_path, observations, assignments)

@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -220,6 +221,171 @@ void send_chunk(MsgChannel *channel, const std::string &bytes)
         std::fprintf(stderr, "could not send test FileChunkMsg\n");
         std::exit(2);
     }
+}
+
+void test_p50_legacy_wire_witness()
+{
+    char trace_path[] = "/tmp/icecc-p50-legacy-wire-XXXXXX";
+    const int placeholder = mkstemp(trace_path);
+    REQUIRE(placeholder >= 0,
+            "legacy wire witness test creates a private trace destination");
+    if (placeholder < 0)
+        return;
+    close(placeholder);
+    unlink(trace_path);
+    setenv("ICECC_P50_C_LEGACY_WIRE_TRACE", trace_path, 1);
+
+    ChannelPair pair = make_channel_pair();
+    pair.sender->set_p50_legacy_wire_role(P50LegacyWireRole::C);
+    const P50LegacyWireIdentity identity{17, 31, 41, 53, 0};
+    REQUIRE(pair.sender->set_p50_legacy_wire_identity(identity),
+            "legacy wire witness binds one complete assignment/TU identity");
+    REQUIRE(!pair.sender->set_p50_legacy_wire_identity(
+                P50LegacyWireIdentity{18, 31, 41, 53, 0}),
+            "legacy wire witness rejects identity replacement in one stream");
+    send_chunk(pair.sender, "legacy-source");
+    REQUIRE(pair.sender->send_msg(EndMsg()),
+            "legacy wire witness observes the source terminator frame");
+    REQUIRE(pair.sender->p50_legacy_wire_complete(),
+            "legacy wire witness emits only after all queued bytes drain");
+
+    std::ifstream input(trace_path);
+    std::string line;
+    std::getline(input, line);
+    REQUIRE(line.find("\"role\":\"C\"") != std::string::npos &&
+                line.find("\"job_id\":17") != std::string::npos &&
+                line.find("\"assignment_epoch\":31") != std::string::npos &&
+                line.find("\"assignment_nonce\":41") != std::string::npos &&
+                line.find("\"c_guid\":53") != std::string::npos &&
+                line.find("\"tu_seq\":0") != std::string::npos,
+            "legacy wire witness records the exact assignment/TU identity");
+    REQUIRE(line.find("\"c_to_f_sent_bytes\":") != std::string::npos &&
+                line.find("\"f_to_c_sent_bytes\":0") != std::string::npos,
+            "legacy wire witness records directional drained-byte counters");
+    delete pair.sender;
+    delete pair.receiver;
+    unsetenv("ICECC_P50_C_LEGACY_WIRE_TRACE");
+    unlink(trace_path);
+}
+
+uint64_t trace_counter(const std::string &line, const char *name)
+{
+    const std::string marker = std::string("\"") + name + "\":";
+    const std::size_t offset = line.find(marker);
+    if (offset == std::string::npos)
+        return 0;
+    return std::strtoull(line.c_str() + offset + marker.size(), nullptr, 10);
+}
+
+void test_p50_legacy_compile_file_conservation()
+{
+    char c_path[] = "/tmp/icecc-p50-legacy-c-XXXXXX";
+    char f_path[] = "/tmp/icecc-p50-legacy-f-XXXXXX";
+    const int c_placeholder = mkstemp(c_path);
+    const int f_placeholder = mkstemp(f_path);
+    REQUIRE(c_placeholder >= 0 && f_placeholder >= 0,
+            "legacy conservation test creates C/F trace destinations");
+    if (c_placeholder < 0 || f_placeholder < 0)
+        return;
+    close(c_placeholder);
+    close(f_placeholder);
+    unlink(c_path);
+    unlink(f_path);
+    setenv("ICECC_P50_C_LEGACY_WIRE_TRACE", c_path, 1);
+    setenv("ICECC_P50_F_LEGACY_WIRE_TRACE", f_path, 1);
+
+    ChannelPair pair = make_channel_pair();
+    pair.sender->set_p50_legacy_wire_role(P50LegacyWireRole::C);
+    pair.receiver->set_p50_legacy_wire_role(P50LegacyWireRole::F);
+    CompileJob job;
+    job.setJobID(17);
+    job.setAssignmentIdentity(31, 41);
+    job.setCompileIdentity(53, 7);
+    const P50LegacyWireIdentity identity{17, 31, 41, 53, 7};
+    REQUIRE(pair.sender->set_p50_legacy_wire_identity(identity),
+            "C binds the CompileFile identity before queueing it");
+    CompileFileMsg compile(&job);
+    REQUIRE(pair.sender->send_msg(compile),
+            "C sends the initial CompileFile frame");
+    Msg *decoded = pair.receiver->get_msg(5);
+    REQUIRE(dynamic_cast<CompileFileMsg *>(decoded) != nullptr,
+            "F decodes the initial CompileFile frame before binding identity");
+    delete decoded;
+    REQUIRE(!pair.receiver->set_p50_legacy_wire_identity(
+                P50LegacyWireIdentity{18, 31, 41, 53, 7}),
+            "F rejects attaching a decoded CompileFile to another job");
+    REQUIRE(pair.receiver->set_p50_legacy_wire_identity(identity),
+            "F binds the exact decoded CompileFile identity");
+    send_chunk(pair.sender, "legacy-source");
+    REQUIRE(pair.sender->send_msg(EndMsg()),
+            "C sends the source terminator after CompileFile");
+    delete pair.receiver->get_msg(5);
+    delete pair.receiver->get_msg(5);
+
+    CompileResultMsg result;
+    result.setAssignmentIdentity(31, 41);
+    result.setCompileIdentity(53, 7);
+    REQUIRE(pair.receiver->send_msg(result), "F sends the compile result");
+    REQUIRE(pair.receiver->send_msg(EndMsg()), "F sends the result terminator");
+    delete pair.sender->get_msg(5);
+    delete pair.sender->get_msg(5);
+    REQUIRE(pair.receiver->p50_legacy_wire_complete(),
+            "F completes after all legacy frames drain");
+    REQUIRE(pair.sender->p50_legacy_wire_complete(),
+            "C completes after all legacy frames arrive");
+
+    std::ifstream c_input(c_path);
+    std::ifstream f_input(f_path);
+    std::string c_line, f_line;
+    std::getline(c_input, c_line);
+    std::getline(f_input, f_line);
+    const uint64_t c_sent = trace_counter(c_line, "c_to_f_sent_bytes");
+    const uint64_t f_received = trace_counter(f_line, "c_to_f_received_bytes");
+    const uint64_t c_received = trace_counter(c_line, "f_to_c_received_bytes");
+    const uint64_t f_sent = trace_counter(f_line, "f_to_c_sent_bytes");
+    REQUIRE(c_sent > 0 && c_sent == f_received,
+            "CompileFile-inclusive C-to-F bytes conserve across both roles");
+    REQUIRE(c_received > 0 && c_received == f_sent,
+            "F-to-C bytes conserve across both roles");
+    const uint64_t full_c_to_f = c_sent;
+
+    /* A CompileFile-only stream supplies a mutation-sensitive lower bound:
+       if the initial frame is dropped from the C ledger, this independent
+       production send still has to account for a positive framed total and
+       the full exchange cannot contain less than that frame. */
+    char compile_only_path[] = "/tmp/icecc-p50-compile-only-XXXXXX";
+    const int compile_only_placeholder = mkstemp(compile_only_path);
+    REQUIRE(compile_only_placeholder >= 0,
+            "CompileFile inclusion test creates a private baseline trace");
+    if (compile_only_placeholder >= 0) {
+        close(compile_only_placeholder);
+        unlink(compile_only_path);
+        setenv("ICECC_P50_C_LEGACY_WIRE_TRACE", compile_only_path, 1);
+        ChannelPair compile_only = make_channel_pair();
+        compile_only.sender->set_p50_legacy_wire_role(P50LegacyWireRole::C);
+        REQUIRE(compile_only.sender->set_p50_legacy_wire_identity(identity),
+                "CompileFile baseline binds the same TU identity");
+        REQUIRE(compile_only.sender->send_msg(compile),
+                "CompileFile baseline queues the initial frame");
+        REQUIRE(compile_only.sender->p50_legacy_wire_complete(),
+                "CompileFile baseline drains and records its frame");
+        std::ifstream compile_only_input(compile_only_path);
+        std::string compile_only_line;
+        std::getline(compile_only_input, compile_only_line);
+        const uint64_t compile_only_bytes =
+            trace_counter(compile_only_line, "c_to_f_sent_bytes");
+        REQUIRE(compile_only_bytes > 0 && full_c_to_f > compile_only_bytes,
+                "C-to-F total retains CompileFile bytes alongside source frames");
+        delete compile_only.sender;
+        delete compile_only.receiver;
+        unlink(compile_only_path);
+    }
+    delete pair.sender;
+    delete pair.receiver;
+    unsetenv("ICECC_P50_C_LEGACY_WIRE_TRACE");
+    unsetenv("ICECC_P50_F_LEGACY_WIRE_TRACE");
+    unlink(c_path);
+    unlink(f_path);
 }
 
 void test_buffering_short_writes_end_and_accounting()
@@ -455,5 +621,7 @@ int main()
     test_unexpected_message_and_eof();
     test_p50_immutable_cursor_and_accounting();
     test_p50_descriptor_and_identity_rejections();
+    test_p50_legacy_wire_witness();
+    test_p50_legacy_compile_file_conservation();
     return failures == 0 ? 0 : 1;
 }

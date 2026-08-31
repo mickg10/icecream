@@ -85,6 +85,24 @@ class MsgChannel;
 class P50CacheSessionOutcomeMsg;
 class P50CacheSessionFdRequestMsg;
 
+enum class P50LegacyWireRole : uint8_t { C, F };
+
+struct P50LegacyWireIdentity {
+    uint32_t job_id = 0;
+    uint64_t assignment_epoch = 0;
+    uint64_t assignment_nonce = 0;
+    uint64_t c_guid = 0;
+    uint64_t tu_seq = 0;
+
+    [[nodiscard]] bool valid() const noexcept
+    {
+        return job_id != 0 && assignment_epoch != 0 &&
+               assignment_nonce != 0 && c_guid != 0;
+    }
+
+    auto operator<=>(const P50LegacyWireIdentity &) const = default;
+};
+
 // Terms used:
 // S  = scheduler
 // C  = client
@@ -904,6 +922,18 @@ public:
     // false <--> error (msg not send)
     bool send_msg(const Msg &, int SendFlags = SendBlocking);
 
+    /* The legacy FileChunk stream has no input selector carrying TU identity.
+       The product supplies this identity after assignment and before source
+       bytes are transferred.  Counters then follow complete ordinary frames
+       at the channel's send/read boundaries. */
+    void set_p50_legacy_wire_role(P50LegacyWireRole role) noexcept
+    {
+        p50_legacy_wire_role = role;
+    }
+    bool set_p50_legacy_wire_identity(
+        const P50LegacyWireIdentity &identity) noexcept;
+    bool p50_legacy_wire_complete() noexcept;
+
     // Consume the one terminal STATUS_TEXT, if any, that set_error() fetched
     // while the channel was still readable.  Presence is independent of the
     // text being nonempty.  This moves a bounded value out of the channel,
@@ -1053,12 +1083,30 @@ protected:
     uint64_t total_drained = 0;
     uint64_t frames_queued_seq = 0;
     std::deque<uint64_t> pending_frame_ends;   // append offsets of frame ends
+    struct P50LegacyPendingFrame {
+        uint64_t begin = 0;
+        uint64_t end = 0;
+    };
+    struct P50LegacyPendingCompileFile {
+        P50LegacyWireIdentity identity{};
+        uint64_t frame_bytes = 0;
+    };
+    std::deque<P50LegacyPendingFrame> p50_legacy_pending_frames;
+    std::optional<P50LegacyPendingCompileFile> p50_legacy_pending_compile_file;
     // test-only one-shot mid-frame cut; see testCutNextFlushAfter()
     size_t test_cut_bytes = 0;
     bool test_cut_armed = false;
     // deferred-output deadline state; see deferred_output_armed()
     bool pending_write_armed;
     uint64_t pending_write_deadline_msec;
+    P50LegacyWireRole p50_legacy_wire_role = P50LegacyWireRole::C;
+    P50LegacyWireIdentity p50_legacy_wire_identity{};
+    bool p50_legacy_wire_identity_set = false;
+    bool p50_legacy_wire_completed = false;
+    uint64_t p50_legacy_c_to_f_sent = 0;
+    uint64_t p50_legacy_c_to_f_received = 0;
+    uint64_t p50_legacy_f_to_c_sent = 0;
+    uint64_t p50_legacy_f_to_c_received = 0;
     char *inbuf;
     size_t inbuflen;
     size_t inofs;
@@ -1135,6 +1183,10 @@ private:
     void p50_clear_outbound_claim() noexcept;
     void p50_promote_flushed_claim() noexcept;
     void p50_promote_flushed_fd_request() noexcept;
+    void p50_legacy_note_received(Msg::Value type, size_t frame_bytes) noexcept;
+    void p50_legacy_note_frame_queued(Msg::Value type,
+                                      uint64_t begin, uint64_t end) noexcept;
+    void p50_legacy_note_drained(uint64_t begin, uint64_t end) noexcept;
     bool p50_clean_release_boundary() const noexcept;
     int p50_checked_release_fd() noexcept;
 };
@@ -1824,6 +1876,14 @@ public:
             && job->assignmentIdentityValid()
             && job->compileIdentityValid()
             && job->compileInputIdentityValid();
+    }
+    bool legacy_wire_identity(P50LegacyWireIdentity &identity) const noexcept
+    {
+        if (job == nullptr)
+            return false;
+        identity = {job->jobID(), job->assignmentEpoch(),
+                    job->assignmentNonce(), job->cGuid(), job->tuSeq()};
+        return identity.valid();
     }
     CompileJob *takeJob();
 

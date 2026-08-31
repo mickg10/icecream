@@ -39,7 +39,12 @@ grz_product_configured() {
     grep -E '^LIBBSC_LIBS = .*(libbsc\.a|-lbsc)' \
         "$build/cache/Makefile" >/dev/null || return 1
 }
+cache_enabled=1
 case "$profile_marker" in
+    RAW_II)
+        cache_enabled=0
+        profile_advertisement=none
+        ;;
     P29) profile_advertisement=p29 ;;
     ZSTD_TU) profile_advertisement=zstd_tu ;;
     ZSTD_ROUTE) profile_advertisement=z3_long ;;
@@ -59,6 +64,9 @@ case "$profile_marker" in
         exit 1
         ;;
 esac
+if test "$cache_enabled" -eq 0; then
+    unset ICECC_P50_C1F1_REQUIRED
+fi
 case "$warm" in
     0|1) ;;
     *)
@@ -83,13 +91,16 @@ test "$rc" -eq 0 || exit "$rc"
 for binary in \
     "$build/daemon/iceccd" \
     "$build/scheduler/icecc-scheduler" \
-    "$build/client/icecc" \
-    "$build/cache/icecc-cache-service"; do
+    "$build/client/icecc"; do
     test -x "$binary" || {
         echo "SKIP: missing built executable $binary" >&2
         exit 77
     }
 done
+if test "$cache_enabled" -eq 1 && test ! -x "$build/cache/icecc-cache-service"; then
+    echo "SKIP: missing built executable $build/cache/icecc-cache-service" >&2
+    exit 77
+fi
 
 command -v timeout >/dev/null 2>&1 || {
     echo "SKIP: timeout(1) is required for bounded C1F1 cleanup" >&2
@@ -155,10 +166,14 @@ trap cleanup EXIT HUP INT TERM
 
 mkdir -p "$work/envs-f" "$work/envs-c" "$work/toolchain" "$work/src" "$work/out" \
     "$work/cache-runtime-f" "$work/cache-runtime-c" "$work/home"
-if test "$suite" = C1F20/40; then
+if test "$cache_enabled" -eq 1 && test "$suite" = C1F20/40; then
     for relationship in $(seq 0 19); do
         mkdir -p "$work/envs-f-$relationship"
         mkdir -p "$work/cache-runtime-f-$relationship"
+    done
+elif test "$suite" = C1F20/40; then
+    for relationship in $(seq 0 19); do
+        mkdir -p "$work/envs-f-$relationship"
     done
 fi
 chmod 1777 "$work/envs-f" "$work/envs-c"
@@ -166,7 +181,9 @@ chmod 0700 "$work/cache-runtime-f" "$work/cache-runtime-c" "$work/home"
 if test "$suite" = C1F20/40; then
     for relationship in $(seq 0 19); do
         chmod 1777 "$work/envs-f-$relationship"
-        chmod 0700 "$work/cache-runtime-f-$relationship"
+        if test "$cache_enabled" -eq 1; then
+            chmod 0700 "$work/cache-runtime-f-$relationship"
+        fi
     done
 fi
 HOME="$work/home"
@@ -176,6 +193,8 @@ export HOME
 # their captured session/transaction boundaries.
 c_action_trace="$work/s7-warm-c-action-trace.jsonl"
 f_action_trace="$work/s7-warm-f-action-trace.jsonl"
+c_legacy_wire_trace="$work/s7-measured-c-legacy-wire-trace.jsonl"
+f_legacy_wire_trace="$work/s7-measured-f-legacy-wire-trace.jsonl"
 pick_port_pair() {
     python3 - "$suite" <<'PY'
 import secrets
@@ -565,39 +584,74 @@ if test "$suite" = C1F20/40; then
         worker_port=$((port_worker + relationship * 2))
         test "$worker_port" -lt 60000 || { echo "FAIL: worker port range exhausted" >&2; exit 1; }
         f_trace="$work/s7-warm-f-action-trace-$relationship.jsonl"
-        ICECC_TEST_SOCKET="$work/worker-$relationship.sock" ICECC_P50_C1F1_REQUIRED=1 \
-            ICECC_P50_C_ACTION_TRACE="$f_trace" ICECC_P50_F_ACTION_TRACE="$f_trace" \
-            ICECC_P50_TEST_READY_TRACE="$work/ready-f-$relationship.trace" \
-        ICECC_P50_RELATIONSHIP="$relationship" \
-            "$build/daemon/iceccd" "$@" -p "$worker_port" -m 2 \
-            -s "127.0.0.1:$port_sched" -n "$network" -N "p50-f-$relationship" \
-            -b "$work/envs-f-$relationship" -l "$work/f-$relationship.log" -vvv \
-            --cache-service "$build/cache/icecc-cache-service" \
-            --cache-runtime-dir "$work/cache-runtime-f-$relationship" &
+        f_wire_trace="$work/s7-measured-f-legacy-wire-trace-$relationship.jsonl"
+        if test "$cache_enabled" -eq 1; then
+            ICECC_TEST_SOCKET="$work/worker-$relationship.sock" ICECC_P50_C1F1_REQUIRED=1 \
+                ICECC_P50_C_ACTION_TRACE="$f_trace" ICECC_P50_F_ACTION_TRACE="$f_trace" \
+                ICECC_P50_TEST_READY_TRACE="$work/ready-f-$relationship.trace" \
+                ICECC_P50_F_LEGACY_WIRE_TRACE="$f_wire_trace" \
+                ICECC_P50_RELATIONSHIP="$relationship" \
+                "$build/daemon/iceccd" "$@" -p "$worker_port" -m 2 \
+                -s "127.0.0.1:$port_sched" -n "$network" -N "p50-f-$relationship" \
+                -b "$work/envs-f-$relationship" -l "$work/f-$relationship.log" -vvv \
+                --cache-service "$build/cache/icecc-cache-service" \
+                --cache-runtime-dir "$work/cache-runtime-f-$relationship" &
+        else
+            ICECC_TEST_SOCKET="$work/worker-$relationship.sock" \
+                ICECC_P50_C_ACTION_TRACE="$f_trace" ICECC_P50_F_ACTION_TRACE="$f_trace" \
+                ICECC_P50_TEST_READY_TRACE="$work/ready-f-$relationship.trace" \
+                ICECC_P50_F_LEGACY_WIRE_TRACE="$f_wire_trace" \
+                ICECC_P50_RELATIONSHIP="$relationship" \
+                "$build/daemon/iceccd" "$@" -p "$worker_port" -m 2 \
+                -s "127.0.0.1:$port_sched" -n "$network" -N "p50-f-$relationship" \
+                -b "$work/envs-f-$relationship" -l "$work/f-$relationship.log" -vvv &
+        fi
         worker_pid=$!
         worker_pids="$worker_pids $worker_pid"
     done
 else
-    ICECC_TEST_SOCKET="$work/worker.sock" ICECC_P50_C1F1_REQUIRED=1 \
+    if test "$cache_enabled" -eq 1; then
+        ICECC_TEST_SOCKET="$work/worker.sock" ICECC_P50_C1F1_REQUIRED=1 \
+            ICECC_P50_F_LEGACY_WIRE_TRACE="$f_legacy_wire_trace" \
         ICECC_P50_C_ACTION_TRACE="$f_action_trace" ICECC_P50_F_ACTION_TRACE="$f_action_trace" \
         ICECC_P50_TEST_READY_TRACE="$work/ready-f.trace" \
         "$build/daemon/iceccd" "$@" -p "$port_worker" -m 1 \
         -s "127.0.0.1:$port_sched" -n "$network" -N p50-f \
         -b "$work/envs-f" -l "$work/f.log" -vvv \
-        --cache-service "$build/cache/icecc-cache-service" \
-        --cache-runtime-dir "$work/cache-runtime-f" &
+            --cache-service "$build/cache/icecc-cache-service" \
+            --cache-runtime-dir "$work/cache-runtime-f" &
+    else
+        ICECC_TEST_SOCKET="$work/worker.sock" \
+            ICECC_P50_F_LEGACY_WIRE_TRACE="$f_legacy_wire_trace" \
+            ICECC_P50_C_ACTION_TRACE="$f_action_trace" ICECC_P50_F_ACTION_TRACE="$f_action_trace" \
+            ICECC_P50_TEST_READY_TRACE="$work/ready-f.trace" \
+            "$build/daemon/iceccd" "$@" -p "$port_worker" -m 1 \
+            -s "127.0.0.1:$port_sched" -n "$network" -N p50-f \
+            -b "$work/envs-f" -l "$work/f.log" -vvv &
+    fi
     worker_pid=$!
     worker_pids="$worker_pid"
 fi
 
-ICECC_TEST_SOCKET="$work/client.sock" ICECC_P50_C1F1_REQUIRED=1 \
-    ICECC_P50_C_ACTION_TRACE="$c_action_trace" ICECC_P50_F_ACTION_TRACE="$c_action_trace" \
-    ICECC_P50_TEST_READY_TRACE="$work/ready-c.trace" \
-    "$build/daemon/iceccd" "$@" --no-remote -m 0 \
-    -s "127.0.0.1:$port_sched" -n "$network" -N p50-c \
-    -b "$work/envs-c" -l "$work/c.log" -vvv \
-    --cache-service "$build/cache/icecc-cache-service" \
-    --cache-runtime-dir "$work/cache-runtime-c" &
+if test "$cache_enabled" -eq 1; then
+    ICECC_TEST_SOCKET="$work/client.sock" ICECC_P50_C1F1_REQUIRED=1 \
+        ICECC_P50_C_ACTION_TRACE="$c_action_trace" ICECC_P50_F_ACTION_TRACE="$c_action_trace" \
+        ICECC_P50_C_LEGACY_WIRE_TRACE="$c_legacy_wire_trace" \
+        ICECC_P50_TEST_READY_TRACE="$work/ready-c.trace" \
+        "$build/daemon/iceccd" "$@" --no-remote -m 0 \
+        -s "127.0.0.1:$port_sched" -n "$network" -N p50-c \
+        -b "$work/envs-c" -l "$work/c.log" -vvv \
+        --cache-service "$build/cache/icecc-cache-service" \
+        --cache-runtime-dir "$work/cache-runtime-c" &
+else
+    ICECC_TEST_SOCKET="$work/client.sock" \
+        ICECC_P50_C_ACTION_TRACE="$c_action_trace" ICECC_P50_F_ACTION_TRACE="$c_action_trace" \
+        ICECC_P50_C_LEGACY_WIRE_TRACE="$c_legacy_wire_trace" \
+        ICECC_P50_TEST_READY_TRACE="$work/ready-c.trace" \
+        "$build/daemon/iceccd" "$@" --no-remote -m 0 \
+        -s "127.0.0.1:$port_sched" -n "$network" -N p50-c \
+        -b "$work/envs-c" -l "$work/c.log" -vvv &
+fi
 client_pid=$!
 
 logins=0
@@ -621,7 +675,7 @@ test "${logins:-0}" -ge "$required_logins" || {
 # wiring. Merely checking that the file exists would permit a mechanism-only
 # test to masquerade as an end-to-end compile.
 service_pid=
-if test "$suite" = C1F20/40; then
+if test "$cache_enabled" -eq 1 && test "$suite" = C1F20/40; then
     for relationship in $(seq 0 19); do
         found=
         for _ in $(seq 1 30); do
@@ -636,7 +690,7 @@ if test "$suite" = C1F20/40; then
         service_pids="$service_pids $found"
     done
     service_pid=$(printf '%s\n' "$service_pids" | awk '{print $1}')
-else
+elif test "$cache_enabled" -eq 1; then
     for _ in $(seq 1 30); do
         service_pid=$(ps -eo pid=,ppid=,args= | \
             awk -v parent="$worker_pid" -v exe="$build/cache/icecc-cache-service" \
@@ -651,6 +705,7 @@ else
 fi
 
 client_service_pid=
+if test "$cache_enabled" -eq 1; then
 for _ in $(seq 1 30); do
     client_service_pid=$(ps -eo pid=,ppid=,args= | \
         awk -v parent="$client_pid" -v exe="$build/cache/icecc-cache-service" \
@@ -662,12 +717,23 @@ test -n "$client_service_pid" || {
     echo "FAIL: C daemon did not start its authenticated local cache sidecar" >&2
     exit 1
 }
+else
+    client_service_pid=
+    if ps -eo args= | grep -F "$build/cache/icecc-cache-service" | grep -v grep >/dev/null 2>&1; then
+        echo "FAIL: RAW_II unexpectedly has a cache-service process" >&2
+        exit 1
+    fi
+    echo "S8_RAW_II mode=whole-legacy cache_disabled=1 cache_traffic=0"
+fi
 
 # A live child is not yet a usable cache endpoint.  Submit only after the
 # daemon has authenticated READY and the scheduler has consumed F's real
 # cache-bearing relogin; otherwise the assignment is correctly frozen without
 # a handoff and a millisecond startup race masquerades as a product failure.
 cache_ready=0
+if test "$cache_enabled" -eq 0; then
+    cache_ready=1
+else
 for _ in $(seq 1 30); do
     if test "$suite" = C1F20/40; then
         # A scheduler may relogin the same F more than once.  Count extracted
@@ -686,6 +752,7 @@ test "$cache_ready" -eq 1 || {
     echo "FAIL: production F cache endpoint was not advertised READY" >&2
     exit 1
 }
+fi
 
 ready_snapshot() {
     ready_path=$1
@@ -796,6 +863,9 @@ compile_once() {
         compile_include_args=""
     fi
     preprocessed_capture="$work/s7-$label-preprocessed.ii"
+    if test "$cache_enabled" -eq 0; then
+        cp -- "$input_path" "$preprocessed_capture"
+    fi
     compile_start_ns=$(date +%s%N)
     if test -n "$timing_path"; then
         printf '%s\n' "$compile_start_ns" >"$timing_path"
@@ -808,18 +878,31 @@ compile_once() {
         ICECC_TEST_SOCKET="$work/client.sock"
         ICECC_TEST_REMOTEBUILD=1
         ICECC_VERSION="$envtar"
-        ICECC_P50_C1F1_REQUIRED=1
+        if test "$cache_enabled" -eq 1; then
+            ICECC_P50_C1F1_REQUIRED=1
+        else
+            unset ICECC_P50_C1F1_REQUIRED
+        fi
         ICECC_P50_PREPROCESSED_CAPTURE="$preprocessed_capture"
+        ICECC_P50_C_LEGACY_WIRE_TRACE="$c_legacy_wire_trace"
         ICECC_PREFERRED_HOST="$preferred_host"
         ICECC_DEBUG=debug
         ICECC_LOGFILE="$client_log"
         export ICECC_TEST_SOCKET ICECC_TEST_REMOTEBUILD ICECC_VERSION \
-            ICECC_P50_C1F1_REQUIRED ICECC_P50_PREPROCESSED_CAPTURE \
-            ICECC_PREFERRED_HOST ICECC_DEBUG ICECC_LOGFILE
+            ICECC_P50_PREPROCESSED_CAPTURE \
+            ICECC_P50_C_LEGACY_WIRE_TRACE ICECC_PREFERRED_HOST ICECC_DEBUG ICECC_LOGFILE
         eval "run_client_with_timeout g++ $remote_compile_args"
-    else
+    elif test "$cache_enabled" -eq 1; then
         ICECC_TEST_SOCKET="$work/client.sock" ICECC_TEST_REMOTEBUILD=1 \
             ICECC_VERSION="$envtar" ICECC_P50_C1F1_REQUIRED=1 \
+            ICECC_P50_PREPROCESSED_CAPTURE="$preprocessed_capture" \
+            ICECC_P50_C_LEGACY_WIRE_TRACE="$c_legacy_wire_trace" \
+            ICECC_PREFERRED_HOST="$preferred_host" ICECC_DEBUG=debug ICECC_LOGFILE="$client_log" \
+            run_client_with_timeout g++ -std=c++17 -O2 -c \
+            $compile_include_args "$input_path" -o "$remote_obj"
+    else
+        ICECC_TEST_SOCKET="$work/client.sock" ICECC_TEST_REMOTEBUILD=1 \
+            ICECC_VERSION="$envtar" ICECC_P50_C_LEGACY_WIRE_TRACE="$c_legacy_wire_trace" \
             ICECC_P50_PREPROCESSED_CAPTURE="$preprocessed_capture" \
             ICECC_PREFERRED_HOST="$preferred_host" ICECC_DEBUG=debug ICECC_LOGFILE="$client_log" \
             run_client_with_timeout g++ -std=c++17 -O2 -c \
@@ -894,7 +977,11 @@ PY
 environment_preparation_start_ns=$(date +%s%N)
 environment_warmup_count=0
 environment_warmup_c_trace="$work/s8-environment-warmup-c-action-trace.jsonl"
-if test "$suite" = C1F20/40; then
+if test "$cache_enabled" -eq 0; then
+    : >"$environment_warmup_c_trace"
+    : >"$work/s8-environment-warmup-f-action-trace.jsonl"
+    environment_preparation_end_ns=$(date +%s%N)
+elif test "$suite" = C1F20/40; then
     for relationship in $(seq 0 19); do
         compile_once "env-warm-$relationship" "$work/src/environment-readiness.cpp" "" "" "" "$relationship" 0 ""
         grep -F 'has env: false' "$work/client-compile-env-warm-$relationship.log" >/dev/null || {
@@ -923,6 +1010,7 @@ else
     echo "S8_ENV_WARMUP relationship=0 warmup_label=env-warm ready_label=env-ready warmup_has_env=false ready_has_env=true preparation_measured=0 cache_state=pre_rotation"
     environment_warmup_count=1
 fi
+if test "$cache_enabled" -eq 1; then
 cp -- "$c_action_trace" "$environment_warmup_c_trace"
 if test "$suite" = C1F20/40; then
     for relationship in $(seq 0 19); do
@@ -932,9 +1020,12 @@ if test "$suite" = C1F20/40; then
 else
     cp -- "$f_action_trace" "$work/s8-environment-warmup-f-action-trace.jsonl"
 fi
+fi
 
 scheduler_rotation_offset=$(stat -c %s "$work/scheduler.log")
-if test "$suite" = C1F20/40; then
+if test "$cache_enabled" -eq 0; then
+    ready_count=0
+elif test "$suite" = C1F20/40; then
     for relationship in $(seq 0 19); do
         worker_for_relationship=$(printf '%s\n' "$worker_pids" | awk -v n="$relationship" '{print $(n + 1)}')
         service_for_relationship=$(ps -eo pid=,ppid=,args= | awk -v parent="$worker_for_relationship" \
@@ -951,6 +1042,9 @@ else
 fi
 
 post_rotation_ready=0
+if test "$cache_enabled" -eq 0; then
+    post_rotation_ready=1
+else
 for _ in $(seq 1 30); do
     if test "$suite" = C1F20/40; then
         ready_count=$(tail -c +$((scheduler_rotation_offset + 1)) "$work/scheduler.log" | \
@@ -969,6 +1063,7 @@ test "$post_rotation_ready" -eq 1 || {
     echo "FAIL: rotated cache endpoints were not advertised READY" >&2
     exit 1
 }
+fi
 echo "S8_ENV_POST_ROTATION_READY relationships=$ready_count log_offset=$scheduler_rotation_offset"
 
 if test "$suite" = C1F20/40; then
@@ -987,8 +1082,12 @@ if test "$suite" = C1F20/40; then
 else
     : >"$f_action_trace"
 fi
-environment_preparation_end_ns=$(date +%s%N)
-echo "S8_ENV_PREPARATION relationships=$environment_warmup_count archive_sha256=$envtar_sha256 archive_bytes=$envtar_bytes start_ns=$environment_preparation_start_ns end_ns=$environment_preparation_end_ns measured=0 cache_state=rotated"
+environment_preparation_end_ns=${environment_preparation_end_ns:-$(date +%s%N)}
+if test "$cache_enabled" -eq 0; then
+    echo "S8_ENV_PREPARATION relationships=0 archive_sha256=$envtar_sha256 archive_bytes=$envtar_bytes start_ns=$environment_preparation_start_ns end_ns=$environment_preparation_end_ns measured=0 cache_state=disabled"
+else
+    echo "S8_ENV_PREPARATION relationships=$environment_warmup_count archive_sha256=$envtar_sha256 archive_bytes=$envtar_bytes start_ns=$environment_preparation_start_ns end_ns=$environment_preparation_end_ns measured=0 cache_state=rotated"
+fi
 
 if test -n "$batch_manifest"; then
     mkdir -p "$work/active"
@@ -1339,7 +1438,7 @@ EOF
         done <"$work/batch.tsv"
         echo "S8_BATCH_COMPLETE run=$run_label count=$ordinal"
     }
-    if test "$warm" = 1; then
+    if test "$warm" = 1 && test "$cache_enabled" -eq 1; then
         echo "S7_WARM_PREWARM_BEGIN"
         run_batch prewarm 0
         merge_parallel_f_traces
@@ -1357,9 +1456,11 @@ EOF
     if test "$passes" = 2; then
         run_batch full-2 1
     fi
-    merge_parallel_f_traces
+    if test "$cache_enabled" -eq 1; then
+        merge_parallel_f_traces
+    fi
 else
-    if test "$warm" = 1; then
+    if test "$warm" = 1 && test "$cache_enabled" -eq 1; then
         echo "S7_WARM_PREWARM_BEGIN"
         compile_once prewarm
         test -s "$c_action_trace" && test -s "$f_action_trace" || {
@@ -1394,6 +1495,7 @@ else
 fi
 echo "S8_ENV_MEASURED_NO_INSTALL checked=1"
 
+if test "$cache_enabled" -eq 1; then
 test -s "$c_action_trace" && test -s "$f_action_trace" || {
     echo "FAIL: measured product action traces are missing" >&2
     exit 1
@@ -1409,6 +1511,10 @@ test -s "$measured_c_trace" && test -s "$measured_f_trace" || {
     echo "FAIL: measured action-trace slice is empty" >&2
     exit 1
 }
+else
+    : >"$measured_c_trace"
+    : >"$measured_f_trace"
+fi
 echo "S7_PREWARM_INPUT=$work/s7-prewarm-preprocessed.ii"
 echo "S7_MEASURED_INPUT=$work/s7-measured-preprocessed.ii"
 echo "S7_PREWARM_C_ACTION_TRACE=$prewarm_c_trace"
@@ -1426,7 +1532,9 @@ if test -n "$batch_manifest"; then
     else
         echo "S8_SCHEDULING mode=relationship-ordered execution_slots=1 relationships=1 planned_admission_lanes_per_relationship=1"
     fi
-    for binary_role in scheduler/icecc-scheduler daemon/iceccd client/icecc cache/icecc-cache-service; do
+    binary_roles="scheduler/icecc-scheduler daemon/iceccd client/icecc"
+    test "$cache_enabled" -eq 1 && binary_roles="$binary_roles cache/icecc-cache-service"
+    for binary_role in $binary_roles; do
         binary_path="$build/$binary_role"
         test -x "$binary_path" || { echo "FAIL: missing binary $binary_path" >&2; exit 1; }
         printf 'S8_BINARY role=%s sha256=%s bytes=%s path=%s\n' \

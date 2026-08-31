@@ -39,9 +39,22 @@ except ImportError:  # pragma: no cover
 
 
 SCHEMA = "icecream-s8-real-c1f1-live-runner-v2"
+RAW_II_PROFILE = "RAW_II"
+PRODUCT_PROFILES = (*PROFILES, "GRZ", RAW_II_PROFILE)
 TOPOLOGY = "C1F1/100000"
 PARALLEL_TOPOLOGY = "C1F20/40"
 TOPOLOGIES = frozenset((TOPOLOGY, PARALLEL_TOPOLOGY))
+
+
+def _measurement_descriptor(harness_profile: str,
+                            product_profile: str | None) -> tuple[str, str, bool]:
+    """Keep the method arm distinct from the S8 input/profile label."""
+    effective = product_profile or (
+        "GRZ" if harness_profile == "GRZ_RESIDUAL" else harness_profile)
+    if effective not in PRODUCT_PROFILES:
+        _fail("product_profile:undeclared")
+    raw_ii = effective == RAW_II_PROFILE
+    return (RAW_II_PROFILE if raw_ii else harness_profile, effective, not raw_ii)
 RELATIONSHIP_COUNT = {TOPOLOGY: 1, PARALLEL_TOPOLOGY: 20}
 SLOTS_PER_F = {TOPOLOGY: 1, PARALLEL_TOPOLOGY: 2}
 SCRIPT = Path(__file__).resolve().parents[1] / "unittests/p50compilee2e-run.sh"
@@ -873,10 +886,13 @@ def build_command(batch_manifest: Path, profile: str,
                   passes: int = 2, workdir: Path | None = None,
                   predictive_plan: Path | None = None, script: Path = SCRIPT,
                   suite: str = TOPOLOGY, topology: Path | None = None,
-                  timeout_seconds: int | None = None) -> list[str]:
+                  timeout_seconds: int | None = None,
+                  product_profile: str | None = None) -> list[str]:
     """Build the exact launch argv; this function never executes it."""
     if profile not in PROFILES:
         _fail("profile:undeclared")
+    _measurement_method, effective_product_profile, _calibration_eligible = \
+        _measurement_descriptor(profile, product_profile)
     if corpus not in CORPORA:
         _fail("corpus:undeclared")
     if suite not in TOPOLOGIES:
@@ -904,7 +920,7 @@ def build_command(batch_manifest: Path, profile: str,
     command = ["env", f"ICECC_TEST_TOP_SRCDIR={product_root}",
             f"ICECC_TEST_TOP_BUILDDIR={product_root}",
             f"ICECC_CARET_WORKAROUND={SCORED_CARET_WORKAROUND}",
-            f"ICECC_P50_PROFILE={profile}", f"ICECC_P50_CORPUS={corpus}",
+            f"ICECC_P50_PROFILE={effective_product_profile}", f"ICECC_P50_CORPUS={corpus}",
             f"ICECC_P50_C1F1_WARM={int(regime == 'warm')}",
             f"ICECC_P50_C1F1_TIMEOUT={effective_timeout}",
             f"ICECC_P50_C1F1_PASSES={passes}",
@@ -1069,6 +1085,23 @@ def _fields(stdout: str, prefix: str) -> list[dict[str, str]]:
 def _environment_preparation(stdout: str, work: Path, suite: str) -> dict[str, Any]:
     """Authenticate real environment warmup and post-warmup sidecar rotation."""
     expected_relationships = RELATIONSHIP_COUNT[suite]
+    disabled = _fields(stdout, "S8_ENV_PREPARATION")
+    if len(disabled) == 1 and disabled[0].get("cache_state") == "disabled":
+        try:
+            start_ns = int(disabled[0]["start_ns"])
+            end_ns = int(disabled[0]["end_ns"])
+            archive_bytes = int(disabled[0]["archive_bytes"])
+            archive_sha = _hex(disabled[0].get("archive_sha256"),
+                               "environment_preparation.archive_sha256")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise LiveRunnerError("environment_preparation:disabled_invalid") from exc
+        if start_ns <= 0 or end_ns < start_ns or archive_bytes <= 0:
+            _fail("environment_preparation:disabled_invalid")
+        return {"relationships": 0, "archive_sha256": archive_sha,
+                "archive_bytes": archive_bytes, "preparation_start_ns": start_ns,
+                "preparation_end_ns": end_ns, "measured": False,
+                "cache_state": "disabled", "warmups": [],
+                "sidecar_rotations": [], "post_rotation_ready": {"relationships": 0}}
     rows = _fields(stdout, "S8_ENV_WARMUP")
     if len(rows) != expected_relationships:
         _fail("environment_preparation:warmup_count_mismatch")
@@ -1212,14 +1245,18 @@ def _environment_preparation(stdout: str, work: Path, suite: str) -> dict[str, A
                                      "scheduler_log_offset": scheduler_offset}}
 
 
-def _binary_identity(stdout: str) -> dict[str, str]:
+def _binary_identity(stdout: str, *, allow_raw: bool = False) -> dict[str, str]:
+    allow_raw = allow_raw or "S8_RAW_II mode=whole-legacy" in stdout
     binaries: dict[str, str] = {}
     for row in _fields(stdout, "S8_BINARY"):
         role, digest = row.get("role"), row.get("sha256")
         if not isinstance(role, str) or role in binaries or HEX64.fullmatch(digest or "") is None:
             _fail("binary_identity:invalid")
         binaries[role] = digest  # type: ignore[assignment]
-    if set(binaries) != {"scheduler/icecc-scheduler", "daemon/iceccd", "client/icecc", "cache/icecc-cache-service"}:
+    expected = {"scheduler/icecc-scheduler", "daemon/iceccd", "client/icecc"}
+    if not allow_raw:
+        expected.add("cache/icecc-cache-service")
+    if set(binaries) != expected:
         _fail("binary_identity:incomplete")
     return binaries
 
@@ -1234,6 +1271,23 @@ def _validate_product_log_evidence(work: Path, observations: list[dict[str, Any]
     checked in the F daemon log for that planned relationship.  The action
     trace below separately authenticates the resulting F store identity.
     """
+    if profile == RAW_II_PROFILE:
+        for path in sorted(work.glob("*.log")):
+            raw = path.read_text(encoding="utf-8", errors="replace")
+            if "CACHE_SESSION" in raw or re.search(
+                    r"P29|ZSTD_TU|ZSTD_ROUTE|GRZ_RESIDUAL", raw):
+                _fail("raw_ii:cache_or_profile_evidence_observed")
+        for index, observed in enumerate(observations):
+            log = work / f"client-compile-{observed['run']}-{observed['ordinal']}.log"
+            try:
+                raw = log.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                raise LiveRunnerError(f"batch:{index}:client_log_missing") from exc
+            if "write_fd_to_server" not in raw:
+                _fail(f"batch:{index}:raw_ii_legacy_transfer_evidence_missing")
+            if re.search(r"building myself|building_local|local build forced|fallback_local|client_exception", raw):
+                _fail(f"batch:{index}:product_local_fallback")
+        return
     profile_markers = {
         "P29": ("P29", "CACHE_SESSION"),
         "ZSTD_TU": ("ZSTD_TU", "CACHE_SESSION"),
@@ -1689,6 +1743,115 @@ def _action_stage(work: Path, expected_count: int,
                                expected_count, assignments, suite)
 
 
+def _legacy_wire_rows(path: Path, role: str) -> list[dict[str, int | str]]:
+    """Read the product's role-labelled legacy frame ledger."""
+    if role not in {"C", "F"} or not path.is_file() or path.is_symlink():
+        _fail("legacy_wire:trace_missing")
+    required = (
+        "job_id", "assignment_epoch", "assignment_nonce", "c_guid", "tu_seq",
+        "c_to_f_sent_bytes", "c_to_f_received_bytes", "f_to_c_sent_bytes",
+        "f_to_c_received_bytes",
+    )
+    result: list[dict[str, int | str]] = []
+    for index, line in enumerate(path.read_text(encoding="ascii").splitlines()):
+        try:
+            value = json.loads(line)
+        except (ValueError, TypeError) as exc:
+            raise LiveRunnerError(f"legacy_wire:row_invalid:{index}") from exc
+        if (not isinstance(value, dict) or
+                value.get("schema") != "icecream-p50-legacy-wire-v1" or
+                value.get("role") != role or set(value) != {"schema", "role", *required}):
+            _fail(f"legacy_wire:row_identity_invalid:{index}")
+        row: dict[str, int | str] = {"schema": value["schema"], "role": value["role"]}
+        for field in required:
+            candidate = value[field]
+            if type(candidate) is not int or candidate < 0:
+                _fail(f"legacy_wire:{field}_invalid:{index}")
+            row[field] = candidate
+        if (int(row["job_id"]) == 0 or int(row["assignment_epoch"]) == 0 or
+                int(row["assignment_nonce"]) == 0 or int(row["c_guid"]) == 0):
+            _fail(f"legacy_wire:identity_zero:{index}")
+        result.append(row)
+    if not result:
+        _fail("legacy_wire:trace_empty")
+    return result
+
+
+def _legacy_wire_stage(work: Path, observations: list[dict[str, Any]],
+                       assignments: list[dict[str, Any]],
+                       suite: str = TOPOLOGY) -> list[dict[str, Any]]:
+    """Join C/F whole-legacy byte witnesses to the live TU rows."""
+    if suite not in TOPOLOGIES or len(observations) != len(assignments):
+        _fail("legacy_wire:inputs_invalid")
+    c_rows = _legacy_wire_rows(work / "s7-measured-c-legacy-wire-trace.jsonl", "C")
+    f_paths = (sorted(work.glob("s7-measured-f-legacy-wire-trace-*.jsonl"))
+               if suite == PARALLEL_TOPOLOGY else
+               [work / "s7-measured-f-legacy-wire-trace.jsonl"])
+    if not f_paths or any(not path.is_file() or path.is_symlink() for path in f_paths):
+        _fail("legacy_wire:F_trace_missing")
+    f_rows = [row for path in f_paths for row in _legacy_wire_rows(path, "F")]
+    if len(c_rows) != len(observations) or len(f_rows) != len(observations):
+        _fail("legacy_wire:row_count_mismatch")
+
+    def key(row: dict[str, int | str]) -> tuple[int, int, int, int, int]:
+        return (int(row["job_id"]), int(row["assignment_epoch"]),
+                int(row["assignment_nonce"]), int(row["c_guid"]), int(row["tu_seq"]))
+
+    c_by_key: dict[tuple[int, int, int, int, int], dict[str, int | str]] = {}
+    f_by_key: dict[tuple[int, int, int, int, int], dict[str, int | str]] = {}
+    for row in c_rows:
+        if key(row) in c_by_key:
+            _fail("legacy_wire:duplicate_C_identity")
+        c_by_key[key(row)] = row
+    for row in f_rows:
+        if key(row) in f_by_key:
+            _fail("legacy_wire:duplicate_F_identity")
+        f_by_key[key(row)] = row
+    result: list[dict[str, Any]] = []
+    for index, observation in enumerate(observations):
+        try:
+            job_id = int(observation["observed_scheduler_job_id"])
+            tu_seq = int(observation["observed_source_tu_seq"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise LiveRunnerError(f"legacy_wire:observation_identity_invalid:{index}") from exc
+        matches = [row for row in c_rows
+                   if int(row["job_id"]) == job_id and int(row["tu_seq"]) == tu_seq]
+        if len(matches) != 1:
+            _fail(f"legacy_wire:C_observation_binding_invalid:{index}")
+        c_row = matches[0]
+        identity = key(c_row)
+        f_row = f_by_key.get(identity)
+        if f_row is None:
+            _fail(f"legacy_wire:F_identity_missing:{index}")
+        c_send = int(c_row["c_to_f_sent_bytes"])
+        c_recv = int(c_row["f_to_c_received_bytes"])
+        f_recv = int(f_row["c_to_f_received_bytes"])
+        f_send = int(f_row["f_to_c_sent_bytes"])
+        if (c_send <= 0 or c_recv <= 0 or f_recv <= 0 or f_send <= 0 or
+                int(c_row["c_to_f_received_bytes"]) != 0 or
+                int(c_row["f_to_c_sent_bytes"]) != 0 or
+                int(f_row["c_to_f_sent_bytes"]) != 0 or
+                int(f_row["f_to_c_received_bytes"]) != 0 or
+                c_send != f_recv or c_recv != f_send):
+            _fail(f"legacy_wire:directional_bytes_mismatch:{index}")
+        assignment = assignments[index]
+        result.append({
+            "c_to_f_bytes": c_send,
+            "f_to_c_bytes": c_recv,
+            "channel_bytes": c_send + c_recv,
+            "legacy_wire_identity": {
+                "job_id": identity[0], "assignment_epoch": identity[1],
+                "assignment_nonce": identity[2], "c_guid": identity[3],
+                "tu_seq": identity[4],
+            },
+            "planned_relationship": int(assignment["relationship"]),
+            "planned_admission_lane": int(assignment["f_slot"]),
+            "relationship": int(assignment["relationship"]),
+            "f_slot": int(assignment["f_slot"]),
+        })
+    return result
+
+
 def _validate_warm_continuation(prewarm: list[dict[str, Any]],
                                 measured: list[dict[str, Any]], expected_count: int,
                                 suite: str = TOPOLOGY) -> None:
@@ -1756,6 +1919,7 @@ def _retained_workdir(stdout: str, *, host_workdir: Path | None = None,
 def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Path,
              predictive_plan: Path, output: Path, profile: str, product_root: Path,
              repeat_predictive_plan: Path | None = None,
+             product_profile: str | None = None,
              corpus: str = "DuckDB", regime: str = "cold", depth: str = "100",
              full_count: int | None = None, passes: int = 2,
              timeout_seconds: int | None = None,
@@ -1768,6 +1932,9 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
              reported_workdir: Path | None = None,
              timestamp: str | None = None, suite: str = TOPOLOGY) -> Path:
     """Turn one completed product invocation into two authenticated live curves."""
+    measurement_method, effective_product_profile, calibration_eligible = \
+        _measurement_descriptor(profile, product_profile)
+    raw_ii = effective_product_profile == RAW_II_PROFILE
     if returncode != 0 or "PASS: all-P50 C1F1" not in stdout:
         _fail("product_run:did_not_pass")
     if execution_environment not in {"host_product_build", "pinned_container_product_build"}:
@@ -1848,7 +2015,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     observations = _timing_rows(stdout, rows, work, passes, assignments, suite,
                                 reported_workdir)
     batch_windows = _batch_windows(stdout, observations, rows, passes, suite)
-    _validate_product_log_evidence(work, observations, profile)
+    _validate_product_log_evidence(work, observations, effective_product_profile)
     calibration_metadata: dict[str, str] | None = None
     host_descriptor_binding: dict[str, object] | None = None
     role_placement: dict[str, object] | None = None
@@ -1871,26 +2038,28 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
             normalizer._validate_role_placement(role_placement, "live")
         except normalizer.NormalizationError as exc:
             raise LiveRunnerError("role_placement:local_identity_invalid") from exc
-    stages = _action_stage(work, len(observations), assignments, suite)
+    stages = (_legacy_wire_stage(work, observations, assignments, suite)
+              if raw_ii else _action_stage(work, len(observations), assignments, suite))
     if len(stages) != len(observations):
         _fail("action_trace:stage_count_mismatch")
     for observation, action in zip(observations, stages, strict=True):
-        if (observation["observed_source_tu_seq"] != action["tu_seq"] or
+        if (not raw_ii and (observation["observed_source_tu_seq"] != action["tu_seq"] or
                 observation["observed_f_service_identity"] !=
                 action["observed_f_service_identity"] or
                 observation["planned_relationship"] != action["planned_relationship"] or
-                observation["planned_admission_lane"] != action["planned_admission_lane"]):
+                observation["planned_admission_lane"] != action["planned_admission_lane"])):
             _fail("action_trace:job_topology_binding_mismatch")
         observation.update(action)
         observation["c_to_f_bytes"] = action["c_to_f_bytes"]
-        observation["f_to_c_bytes"] = observation["returned_object_bytes"]
-        observation["channel_bytes"] = (observation["c_to_f_bytes"] +
-                                         observation["f_to_c_bytes"])
+        if not raw_ii:
+            observation["f_to_c_bytes"] = observation["returned_object_bytes"]
+            observation["channel_bytes"] = (observation["c_to_f_bytes"] +
+                                             observation["f_to_c_bytes"])
         observation["elapsed_ns"] = observation["measured_elapsed_ns"]
         if action["c_to_f_bytes"] <= 0:
             _fail("action_trace:zero_stage_bytes")
     prewarm_stages: list[dict[str, Any]] = []
-    if regime == "warm":
+    if regime == "warm" and not raw_ii:
         prewarm_stages = _action_stage_paths(
             work / "s7-prewarm-c-action-trace.jsonl",
             work / "s7-prewarm-f-action-trace.jsonl", expected_count,
@@ -1912,7 +2081,8 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     if TIMESTAMP.fullmatch(timestamp) is None:
         _fail("timestamp:invalid")
-    target = output / "icecream" / suite.replace("/", "-") / timestamp / profile
+    target = (output / "icecream" / suite.replace("/", "-") / timestamp /
+              (RAW_II_PROFILE if raw_ii else profile))
     target.parent.mkdir(parents=True, exist_ok=True)
     target.mkdir(parents=True, exist_ok=False)
     # Preserve the product-generated files, not just their digests.  The
@@ -1950,18 +2120,28 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     if (repeat_predictive_plan is not None and
             retained_repeat_plan_sha != repeat_plan_sha):
         _fail("repeat_predictive_plan:snapshot_changed_during_copy")
-    trace_paths = [work / "s7-measured-c-action-trace.jsonl", work / "s7-measured-f-action-trace.jsonl"]
-    if regime == "warm":
+    trace_paths = [] if raw_ii else [work / "s7-measured-c-action-trace.jsonl",
+                                     work / "s7-measured-f-action-trace.jsonl"]
+    if regime == "warm" and not raw_ii:
         trace_paths.extend((work / "s7-prewarm-c-action-trace.jsonl", work / "s7-prewarm-f-action-trace.jsonl"))
     for path in trace_paths:
         if not path.is_file():
             _fail(f"action_trace:retained_file_missing:{path.name}")
         shutil.copy2(path, retained / path.name)
+    wire_paths = [work / "s7-measured-c-legacy-wire-trace.jsonl"]
+    wire_paths.extend(sorted(work.glob("s7-measured-f-legacy-wire-trace-*.jsonl"))
+                        if suite == PARALLEL_TOPOLOGY else
+                        [work / "s7-measured-f-legacy-wire-trace.jsonl"])
+    if raw_ii:
+        for path in wire_paths:
+            if not path.is_file() or path.is_symlink():
+                _fail(f"legacy_wire:retained_file_missing:{path.name}")
+            shutil.copy2(path, retained / path.name)
     for path in sorted(work.glob("ready-*.trace")) + sorted(work.glob("s8-environment-warmup-*.jsonl")):
         if path.is_file() and not path.is_symlink():
             shutil.copy2(path, retained / path.name)
     service_map_raw = b""
-    if suite == PARALLEL_TOPOLOGY:
+    if suite == PARALLEL_TOPOLOGY and not raw_ii:
         service_map_path = work / "s8-f-service-map.tsv"
         # Parsing above authenticated the exact 20-row GUID/service binding.
         service_map_raw = service_map_path.read_bytes()
@@ -1984,6 +2164,9 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     split = SPLITS[corpus]
     summary_value = {"schema": "icecream-s7-live-cell-v1",
                      "cell": cell, "split": split, "status": "PASS",
+                     "measurement_method": measurement_method,
+                     "product_profile": effective_product_profile,
+                     "calibration_eligible": calibration_eligible,
                      "live_status": "PASS", "acceptance_status": "PASS",
                      "conformance_status": "PASS", "binary_sha256": binaries,
                      "measured": {"input_sha256": input_sha}}
@@ -2012,13 +2195,13 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                         "observed_scheduler_job_id": item["observed_scheduler_job_id"],
                         "observed_f_service_identity": item["observed_f_service_identity"],
                         "observed_source_tu_seq": item["observed_source_tu_seq"],
-                        "tu_seq": item["tu_seq"],
-                        "rel_seq": item["rel_seq"], "c_store_guid": item["c_store_guid"],
-                        "f_store_guid": item["f_store_guid"], "state_digest": item["state_digest"],
-                        "f_state_digest": item["f_state_digest"],
-                        "transaction_digest": item["transaction_digest"],
-                        "raw_digest": item["raw_digest"], "f_raw_digest": item["f_raw_digest"],
-                        "history_nonce": item["history_nonce"]}
+                        **({"tu_seq": item["tu_seq"],
+                            "rel_seq": item["rel_seq"], "c_store_guid": item["c_store_guid"],
+                            "f_store_guid": item["f_store_guid"], "state_digest": item["state_digest"],
+                            "f_state_digest": item["f_state_digest"],
+                            "transaction_digest": item["transaction_digest"],
+                            "raw_digest": item["raw_digest"], "f_raw_digest": item["f_raw_digest"],
+                            "history_nonce": item["history_nonce"]} if not raw_ii else {})}
                        for item in observations if item["run"] == run]
         timing_raw = b"".join(_canonical(row) + b"\n" for row in timing_rows)
         timing_by_run[run] = timing_raw
@@ -2028,10 +2211,16 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     # retain the state-carrying repeat as a separately named witness.
     timing_raw = timing_by_run["full-1"]
     _write_new(target / "timing.jsonl", timing_raw)
-    c_action_raw = (retained / "s7-measured-c-action-trace.jsonl").read_bytes()
-    f_action_raw = (retained / "s7-measured-f-action-trace.jsonl").read_bytes()
+    c_action_raw = ((retained / "s7-measured-c-action-trace.jsonl").read_bytes()
+                    if not raw_ii else b"")
+    f_action_raw = ((retained / "s7-measured-f-action-trace.jsonl").read_bytes()
+                    if not raw_ii else b"")
+    c_wire_raw = ((retained / "s7-measured-c-legacy-wire-trace.jsonl").read_bytes()
+                  if raw_ii else b"")
+    f_wire_raw = (b"".join((retained / path.name).read_bytes()
+                            for path in wire_paths[1:]) if raw_ii else b"")
     prewarm_descriptor = None
-    if regime == "warm":
+    if regime == "warm" and not raw_ii:
         pre_c_raw = (retained / "s7-prewarm-c-action-trace.jsonl").read_bytes()
         pre_f_raw = (retained / "s7-prewarm-f-action-trace.jsonl").read_bytes()
         prewarm_descriptor = {"count": len(prewarm_stages), "input_digest": input_sha,
@@ -2043,13 +2232,23 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
         "results": hashlib.sha256(summary_raw).hexdigest(),
         "c_action": hashlib.sha256(c_action_raw).hexdigest(),
         "f_action": hashlib.sha256(f_action_raw).hexdigest(),
+        "c_legacy_wire": hashlib.sha256(c_wire_raw).hexdigest() if raw_ii else None,
+        "f_legacy_wire": hashlib.sha256(f_wire_raw).hexdigest() if raw_ii else None,
         "f_service_map": hashlib.sha256(service_map_raw).hexdigest() if service_map_raw else None,
     })).hexdigest()
     witness = {"assignment": {"path": "product-evidence/assignment-witness.json",
                                "sha256": hashlib.sha256(assignment_raw).hexdigest(),
-                               "bytes": len(assignment_raw)},
-               "c_action": {"path": "product-evidence/s7-measured-c-action-trace.jsonl", "sha256": hashlib.sha256(c_action_raw).hexdigest(), "bytes": len(c_action_raw)},
-               "f_action": {"path": "product-evidence/s7-measured-f-action-trace.jsonl", "sha256": hashlib.sha256(f_action_raw).hexdigest(), "bytes": len(f_action_raw)}}
+                               "bytes": len(assignment_raw)}}
+    if not raw_ii:
+        witness["c_action"] = {"path": "product-evidence/s7-measured-c-action-trace.jsonl",
+                                "sha256": hashlib.sha256(c_action_raw).hexdigest(), "bytes": len(c_action_raw)}
+        witness["f_action"] = {"path": "product-evidence/s7-measured-f-action-trace.jsonl",
+                                "sha256": hashlib.sha256(f_action_raw).hexdigest(), "bytes": len(f_action_raw)}
+    else:
+        witness["c_legacy_wire"] = {"path": "product-evidence/s7-measured-c-legacy-wire-trace.jsonl",
+                                     "sha256": hashlib.sha256(c_wire_raw).hexdigest(), "bytes": len(c_wire_raw)}
+        witness["f_legacy_wire"] = {"paths": [f"product-evidence/{path.name}" for path in wire_paths[1:]],
+                                     "sha256": hashlib.sha256(f_wire_raw).hexdigest(), "bytes": len(f_wire_raw)}
     if service_map_raw:
         witness["f_service_map"] = {
             "path": "product-evidence/s8-f-service-map.tsv",
@@ -2070,6 +2269,9 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
         }
     evidence_value = {"schema": "icecream-s7-live-evidence-v2",
                       "cell": cell, "split": split, "run_id": "s8-real-c1f1",
+                      "measurement_method": measurement_method,
+                      "product_profile": effective_product_profile,
+                      "calibration_eligible": calibration_eligible,
                       "source_commit": commit, "source_tree": tree,
                       "input_manifest_sha256": batch_manifest_sha, "input_digest": input_sha,
                       "topology_sha256": topology_sha,
@@ -2163,6 +2365,9 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     _write_new(target / "live_curve_manifest.json", (target / "live_curve_manifest_full-1.json").read_bytes())
     _write_new(target / "records.jsonl", b"".join(_canonical(record) + b"\n" for record in records))
     experiment = {"schema": SCHEMA, "cell": {"corpus": corpus, "profile": profile, "regime": regime},
+                  "measurement_method": measurement_method,
+                  "product_profile": effective_product_profile,
+                  "calibration_eligible": calibration_eligible,
                   "split": split, "topology": suite, "depth": depth,
                   "declared_count": expected_count, "runs": ["full-1"] + (["full-2"] if passes == 2 else []),
                   "same_service_state": True, "input_manifest_sha256": batch_manifest_sha,
@@ -2289,6 +2494,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--topology", type=Path, required=True)
     parser.add_argument("--suite", choices=tuple(TOPOLOGIES), default=TOPOLOGY)
     parser.add_argument("--profile", choices=PROFILES, required=True)
+    parser.add_argument("--product-profile", choices=PRODUCT_PROFILES)
     parser.add_argument("--product-root", type=Path, required=True)
     parser.add_argument("--corpus", choices=CORPORA, default="DuckDB")
     parser.add_argument("--regime", choices=REGIMES, default="cold")
@@ -2386,7 +2592,8 @@ def main(argv: list[str] | None = None) -> int:
                             regime=args.regime, depth=args.depth, full_count=args.full_count,
                             passes=args.passes, workdir=command_workdir,
                             predictive_plan=predictive_plan, suite=args.suite,
-                            topology=topology, timeout_seconds=effective_timeout)
+                            topology=topology, timeout_seconds=effective_timeout,
+                            product_profile=args.product_profile)
     if not args.execute:
         print(json.dumps({"schema": SCHEMA, "status": "DRY_RUN", "command": command,
                           "repeat_predictive_plan": str(repeat_predictive_plan)
@@ -2443,6 +2650,7 @@ def main(argv: list[str] | None = None) -> int:
         path = finalize(stdout, returncode, batch_manifest=batch_manifest,
                         topology=topology, output=args.output.absolute(), profile=args.profile,
                         predictive_plan=predictive_plan, product_root=args.product_root.absolute(),
+                        product_profile=args.product_profile,
                         repeat_predictive_plan=repeat_predictive_plan,
                         corpus=args.corpus, regime=args.regime, depth=args.depth,
                         full_count=args.full_count, passes=args.passes,

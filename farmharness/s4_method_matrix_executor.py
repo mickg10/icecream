@@ -4,8 +4,8 @@
 The S4 planner intentionally stops at descriptors.  This small adapter binds
 those descriptors to the existing S8 depth, predictive, live, and normalizer
 commands.  It is dry-run only by default and never reads corpus inputs while
-materializing a campaign.  RAW_II is reported as a hard, explicit gap: the
-current product has no legacy multi-TU measurement entry point.
+materializing a campaign.  RAW_II uses the explicit whole-legacy live arm
+while retaining a separate S8 input profile for source-plan paths.
 """
 
 from __future__ import annotations
@@ -32,10 +32,10 @@ except ImportError:  # pragma: no cover
 SCHEMA = "icecream-s4-method-matrix-executor-v1"
 SUMMARY_SCHEMA = "icecream-s4-method-matrix-summary-v1"
 RAW_II_GAP = (
-    "RAW_II is not an S8 product profile and the current live runner is "
-    "cache-profile-only; s4_real_cells is a one-TU Docker/SSH harness and "
-    "does not provide the required multi-TU transfer curve."
+    "RAW_II uses the P50 whole-legacy/no-cache path and is measured by the "
+    "role-labelled legacy wire witness."
 )
+RAW_II_HARNESS_PROFILE = "ZSTD_TU"
 
 
 def _stamp() -> str:
@@ -69,23 +69,18 @@ def _arm(method: str, block: dict[str, Any], root: Path, *, python: str,
          compile_output_root: Path | None) -> dict[str, Any]:
     """Return one arm record without touching any source or product input."""
     product_method = method
-    harness_profile = "GRZ_RESIDUAL" if method == "GRZ" else method
+    harness_profile = (RAW_II_HARNESS_PROFILE if method == "RAW_II" else
+                       ("GRZ_RESIDUAL" if method == "GRZ" else method))
     arm_dir = root / "arms" / method
     arm_dir.mkdir(parents=True, exist_ok=True)
     common = {
         "method": method, "product_profile": product_method,
         "harness_profile": harness_profile, "state": "s50-c50-f50",
         "artifact": "P50", "artifact_version": 50,
-        "mode": "current", "cache_expected": True,
-        "cache_disabled": False,
+        "mode": "whole-legacy" if method == "RAW_II" else "current",
+        "cache_expected": method != "RAW_II",
+        "cache_disabled": method == "RAW_II",
     }
-    if method == "RAW_II":
-        record = {**common, "mode": "whole-legacy", "cache_expected": False,
-                  "cache_disabled": True, "status": "BLOCKED",
-                  "executable": False, "gap": RAW_II_GAP,
-                  "commands": [], "measurement": _measurement()}
-        (arm_dir / "manifest.json").write_bytes(_canonical(record))
-        return record
 
     depth = str(block["depth"])
     corpus = str(block["corpus"])
@@ -135,6 +130,7 @@ def _arm(method: str, block: dict[str, Any], root: Path, *, python: str,
                  "--batch-manifest", str(prep / "batch-manifest.jsonl"),
                  "--predictive-plan", str(first_plan), "--topology", str(prep / "topology.json"),
                  "--suite", topology, "--profile", harness_profile,
+                 "--product-profile", product_method,
                  "--product-root", str(product_root), "--corpus", corpus,
                  "--regime", regime, "--depth", "full" if depth == "repeat-full" else depth,
                  "--passes", "2" if depth == "repeat-full" else "1", "--output", str(attempt / "live-output"),
@@ -155,23 +151,21 @@ def _arm(method: str, block: dict[str, Any], root: Path, *, python: str,
                              "--out", str(attempt / f"records{suffix}.jsonl")])
     live_ready = compile_db is not None and compile_source_root is not None
     reason = None if live_ready else "authenticated compile DB/source root not configured"
-    # The S8 commands are retained as a handoff, but no individual arm is
-    # executable until the comparison's RAW_II half has a valid bridge.
-    command_reason = RAW_II_GAP
-    if not live_ready:
-        command_reason += "; " + reason
+    command_reason = None if live_ready else reason
+    command_executable = live_ready
     commands = [
-        _command_record(depth_args, repo, stage="predictive_plan", executable=False, reason=command_reason),
-        _command_record(producer_args, repo, stage="predictive_producer", executable=False, reason=command_reason),
-        _command_record(prep_args, repo, stage="live_prepare", executable=False, reason=command_reason),
-        _command_record(live_args, repo, stage="live_run", executable=False, reason=command_reason),
+        _command_record(depth_args, repo, stage="predictive_plan", executable=command_executable, reason=command_reason),
+        _command_record(producer_args, repo, stage="predictive_producer", executable=command_executable, reason=command_reason),
+        _command_record(prep_args, repo, stage="live_prepare", executable=command_executable, reason=command_reason),
+        _command_record(live_args, repo, stage="live_run", executable=command_executable, reason=command_reason),
     ]
     commands.extend(_command_record(command, repo, stage="comparison" if len(compare_args) == 1
-                                    else f"comparison_{segment or 'full-1'}",
-                                    executable=False, reason=command_reason)
+                                    else f"comparison_{segment or 'full-1'}", executable=command_executable,
+                                    reason=command_reason)
                     for command, (_result, segment) in zip(compare_args, compare_segments))
-    record = {**common, "status": "STAGED", "executable": False,
-              "execution_blocker": RAW_II_GAP, "commands": commands,
+    record = {**common, "status": "STAGED", "executable": command_executable,
+              **({"execution_blocker": command_reason} if command_reason else {}),
+              "commands": commands,
               "measurement": _measurement()}
     if predecessor is not None:
         record["repeat_predecessor"] = predecessor
@@ -206,7 +200,7 @@ def materialize_matrix(*, output_root: Path, repo: Path, corpus: str,
                        python: str = sys.executable, timestamp: str | None = None,
                        execute: bool = False) -> Path:
     if execute:
-        raise ValueError("execution is intentionally unavailable until RAW_II bridge exists")
+        raise ValueError("execution is intentionally unavailable in this materializer")
     if corpus not in CALIBRATION_CORPORA:
         raise ValueError("held-out corpora are forbidden")
     repo = repo.absolute()
@@ -222,8 +216,10 @@ def materialize_matrix(*, output_root: Path, repo: Path, corpus: str,
     staged = 0
     for template in contract["measurement_cells"]:
         block = {**template, "corpus": corpus}
-        harness_profile = ("GRZ_RESIDUAL" if template["method"] == "GRZ"
-                           else str(template["method"]))
+        harness_profile = (RAW_II_HARNESS_PROFILE
+                           if template["method"] == "RAW_II" else
+                           ("GRZ_RESIDUAL" if template["method"] == "GRZ"
+                            else str(template["method"])))
         block_source_manifest = _format_template(
             source_manifest, corpus=corpus, profile=harness_profile,
             regime=str(template["regime"]), topology=str(template["topology"]))
@@ -260,7 +256,7 @@ def materialize_matrix(*, output_root: Path, repo: Path, corpus: str,
         blocks += 1
         blocked += sum(row["status"] == "BLOCKED" for row in arms)
         staged += sum(row["status"] == "STAGED" for row in arms)
-    summary = {"schema": SUMMARY_SCHEMA, "status": "STAGED_RAW_II_GAP",
+    summary = {"schema": SUMMARY_SCHEMA, "status": "STAGED",
                "campaign_root": str(campaign), "dry_run": True,
                "execution_ready": False,
                "source_plan_schema": plan["schema"], "split_policy": {
@@ -269,7 +265,7 @@ def materialize_matrix(*, output_root: Path, repo: Path, corpus: str,
                    "held_out_corpora": ["DuckDB", "LLVM-1238"]},
                "comparison_blocks": blocks, "arm_runs": blocks * 2,
                "staged_arms": staged, "blocked_arms": blocked,
-               "raw_ii_gap": RAW_II_GAP,
+               "raw_ii_gap": None,
                "metrics": {"channel_bytes": "pending", "elapsed_ns": "pending",
                             "simulator_comparison": "pending"}}
     (campaign / "summary.json").write_bytes(_canonical(summary))

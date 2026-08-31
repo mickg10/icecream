@@ -480,6 +480,12 @@ int handle_connection(const string &basedir, CompileJob *job,
             }
         }
 
+        if (!p50_input && client->protocol >= PROTOCOL_VERSION &&
+            !client->p50_legacy_wire_complete()) {
+            log_warning() << "legacy wire witness did not reach completion for job "
+                          << job->jobID() << endl;
+        }
+
         if (p50_input) {
             const icecc::p50::P50CompletionDisposition disposition =
                 icecc::p50::receive_p50_result_disposition(

@@ -811,6 +811,7 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                         << port << endl;
             throw client_error(2, "Error 2 - no server found at " + hostname);
         }
+        cserver->set_p50_legacy_wire_role(P50LegacyWireRole::C);
 
         // Environment transfer always stays on the ordinary legacy stream.
         // Source selection happens only after this phase and then remains one
@@ -960,6 +961,16 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                         << identity->tu_seq << endl;
             } else {
                 job.clearCompileInputIdentity();
+                if (cserver->protocol >= PROTOCOL_VERSION) {
+                    const P50LegacyWireIdentity identity{
+                        job.jobID(), job.assignmentEpoch(), job.assignmentNonce(),
+                        job.cGuid(), job.tuSeq()};
+                    if (!cserver->set_p50_legacy_wire_identity(identity)) {
+                        throw client_error(
+                            106,
+                            "Error 106 - legacy wire identity could not be bound");
+                    }
+                }
             }
 
             CompileFileMsg compile_file(&job);
@@ -1125,6 +1136,12 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                 string dwo_output = job.outputFile().substr(0, job.outputFile().rfind('.')) + ".dwo";
                 receive_file(dwo_output, cserver);
             }
+        }
+
+        if (!p50_input && cserver->protocol >= PROTOCOL_VERSION &&
+            !cserver->p50_legacy_wire_complete()) {
+            throw client_error(
+                108, "Error 108 - legacy wire witness did not reach completion");
         }
 
         if (p50_input &&
