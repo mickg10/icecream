@@ -495,7 +495,12 @@ class SSHTransport:
             raise ExternalFarmError("transport:unknown_host")
         result = s4.run_script(host, script, [str(arg) for arg in args], timeout=self.timeout)
         if result.returncode:
-            raise ExternalFarmError(f"{host}:remote_command_failed:{result.returncode}")
+            script_sha = hashlib.sha256(script.encode("utf-8")).hexdigest()[:12]
+            preview = " ".join(script.split())[:160]
+            detail = (result.stderr or result.stdout)[-500:].strip().replace("\n", " | ")
+            raise ExternalFarmError(
+                f"{host}:remote_command_failed:{result.returncode}:"
+                f"script={script_sha}:{preview}:detail={detail or 'none'}")
         return result
 
     def execute(self, *, topology: str, relationship_hosts: Sequence[str], profile: str,

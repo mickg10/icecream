@@ -85,6 +85,18 @@ def test_rotation_uses_ready_pids_and_worker_root_allows_daemon_outputs() -> Non
     assert 'chmod 1777 {worker_root} {worker_root}/envs' in source
 
 
+def test_remote_failure_retains_bounded_diagnostic(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    transport = executor.SSHTransport(_authority(tmp_path))
+    monkeypatch.setattr(
+        executor.s4, "run_script",
+        lambda *args, **kwargs: subprocess.CompletedProcess([], 17, "", "specific failure\n"))
+    with pytest.raises(
+            executor.ExternalFarmError,
+            match=r"q3:remote_command_failed:17:script=[0-9a-f]{12}:.*specific failure"):
+        transport.run("q3", "set -eu\nprintf phase-name\n")
+
+
 def test_parallel_gate_requires_all_lanes_and_overlap() -> None:
     with pytest.raises(executor.ExternalFarmError, match="parallel_overlap_missing"):
         executor.overlap_required("C1F20/40", {"planned_lanes": 40, "max_concurrent": 1})
