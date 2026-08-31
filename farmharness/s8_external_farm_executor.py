@@ -667,21 +667,24 @@ class SSHTransport:
                               "--no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin icecc; fi; ")
             preflight = r'''set -eu
 root=$1; expected_cpu=$2; max_load=$3; expected_physical=$4; expected_boot=$5; shift 5
-test "$(nproc)" -eq "$expected_cpu"
+fail() { printf 'S8_PREFLIGHT_FAIL field=%s observed=%s expected=%s\n' "$1" "$2" "$3" >&2; exit 77; }
+actual_cpu=$(nproc)
+test "$actual_cpu" -eq "$expected_cpu" || fail cpu_count "$actual_cpu" "$expected_cpu"
 load=$(cut -d' ' -f1 /proc/loadavg)
-awk -v load="$load" -v max="$max_load" 'BEGIN { exit !(load <= max) }'
+awk -v load="$load" -v max="$max_load" 'BEGIN { exit !(load <= max) }' || fail load_1m "$load" "$max_load"
 machine=$(sha256sum /etc/machine-id | awk '{print $1}')
 boot=$(sha256sum /proc/sys/kernel/random/boot_id | awk '{print $1}')
-test "$boot" = "$expected_boot"
+test "$boot" = "$expected_boot" || fail boot_id "$boot" "$expected_boot"
 nic_rows=$(for p in /sys/class/net/*; do n=${p##*/}; test "$n" = lo && continue; real=$(readlink -f "$p" 2>/dev/null || true); mac=$(cat "$p/address" 2>/dev/null || true); case "$real" in */virtual/*) continue;; esac; test -n "$mac" && test "$mac" != 00:00:00:00:00:00 && printf '%s:%s:%s\n' "$n" "$mac" "$real"; done | sort)
-test -n "$nic_rows"
-nic=$(printf '%s\\n' "$nic_rows" | sha256sum | awk '{print $1}')
+test -n "$nic_rows" || fail nic_inventory empty nonempty
+nic=$(printf '%s\n' "$nic_rows" | sha256sum | awk '{print $1}')
 physical=$(printf '{"machine_id_sha256":"%s","nic_identity_sha256":"%s"}' "$machine" "$nic" | sha256sum | awk '{print $1}')
-test "$physical" = "$expected_physical"
+test "$physical" = "$expected_physical" || fail physical_host "$physical" "$expected_physical"
 while [ "$#" -gt 0 ]; do
   rel=$1; expected=$2; shift 2
+  test -f "$root/$rel" && test ! -L "$root/$rel" || fail "role:$rel" missing regular_file
   got=$(sha256sum "$root/$rel" | awk '{print $1}')
-  test "$got" = "$expected"
+  test "$got" = "$expected" || fail "role:$rel" "$got" "$expected"
 done
 '''
             witness = r'''set -eu

@@ -106,6 +106,11 @@ def test_preflight_and_authority_capture_hash_identical_nic_rows() -> None:
     authority_row = pattern.search(authority_source)
     assert executor_row is not None and authority_row is not None
     assert executor_row.group(0) == authority_row.group(0)
+    hash_pattern = re.compile(r"^nic=\$\(printf .*sha256sum.*$", re.M)
+    executor_hash = hash_pattern.search(executor_source)
+    authority_hash = hash_pattern.search(authority_source)
+    assert executor_hash is not None and authority_hash is not None
+    assert executor_hash.group(0) == authority_hash.group(0)
 
 
 def test_parallel_gate_requires_all_lanes_and_overlap() -> None:
