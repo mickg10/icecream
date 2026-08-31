@@ -24,16 +24,27 @@ def _inspect() -> bytes:
                        sort_keys=True) + "\n").encode()
 
 
+def _base_inspect(image_id: str = image.BASE_IMAGE_ID) -> bytes:
+    return (json.dumps({"Id": image_id, "Os": "linux", "Architecture": "amd64",
+                        "Created": "2026-08-31T00:00:00Z"}, sort_keys=True) + "\n").encode()
+
+
 def test_receipt_binds_definition_image_id_platform_and_raw_inspect(tmp_path: Path) -> None:
     dockerfile = _dockerfile(tmp_path)
     inspect_path = tmp_path / "inspect.json"
     inspect_raw = _inspect()
     inspect_path.write_bytes(inspect_raw)
+    base_raw = _base_inspect()
+    base_path = tmp_path / "base-inspect.json"
+    base_path.write_bytes(base_raw)
     receipt = image.make_receipt(dockerfile=dockerfile, image_ref="local/s8-supervisor:1",
                                  inspect_raw=inspect_raw, inspect_path=inspect_path,
+                                 base_inspect_raw=base_raw, base_inspect_path=base_path,
                                  source_commit="b" * 40)
     assert receipt["schema"] == image.SCHEMA
     assert receipt["base"]["reference"] == image.BASE_REFERENCE
+    assert receipt["base"]["source_reference"] == image.BASE_SOURCE_REFERENCE
+    assert receipt["base"]["image_id"] == image.BASE_IMAGE_ID
     assert receipt["image"]["image_id"] == "sha256:" + "a" * 64
     assert receipt["image"]["os"] == "linux"
     assert receipt["image"]["architecture"] == "amd64"
@@ -48,6 +59,9 @@ def test_receipt_binds_definition_image_id_platform_and_raw_inspect(tmp_path: Pa
 
 def test_receipt_rejects_wrong_id_or_platform(tmp_path: Path) -> None:
     dockerfile = _dockerfile(tmp_path)
+    base_raw = _base_inspect()
+    base_path = tmp_path / "base-inspect.json"
+    base_path.write_bytes(base_raw)
     inspect_path = tmp_path / "inspect.json"
     for field, value in (("Id", "sha256:not-a-content-id"), ("Architecture", "arm64")):
         obj = {"Id": "sha256:" + "a" * 64, "Os": "linux", "Architecture": "amd64"}
@@ -56,16 +70,42 @@ def test_receipt_rejects_wrong_id_or_platform(tmp_path: Path) -> None:
         inspect_path.write_bytes(raw)
         with pytest.raises(image.ImageAuthorityError):
             image.make_receipt(dockerfile=dockerfile, image_ref="s8-supervisor:local",
-                               inspect_raw=raw, inspect_path=inspect_path)
+                               inspect_raw=raw, inspect_path=inspect_path,
+                               base_inspect_raw=base_raw, base_inspect_path=base_path)
 
 
 def test_build_command_is_pinned_and_non_running(tmp_path: Path) -> None:
     dockerfile = _dockerfile(tmp_path)
     command = image.build_command(context=tmp_path, dockerfile=dockerfile,
-                                  image_ref="local/s8-supervisor:1")
+                                  image_ref="local/s8-supervisor:1",
+                                  base_inspect_raw=_base_inspect())
     assert command[:4] == ["docker", "build", "--pull=false", "--platform=linux/amd64"]
     assert "--file" in command and "--tag" in command
     assert "run" not in command
+    binding = image.base_binding_command()
+    assert binding[:3] == ["sh", "-eu", "-c"]
+    assert "docker image inspect" in binding[3]
+    assert "docker tag" in binding[3]
+    assert image.BASE_SOURCE_REFERENCE in binding[3]
+    assert image.BASE_REFERENCE in binding[3]
+    assert image.BASE_IMAGE_ID in binding[3]
+
+
+def test_base_preflight_rejects_wrong_local_content_id(tmp_path: Path) -> None:
+    dockerfile = _dockerfile(tmp_path)
+    child_raw = _inspect()
+    child_path = tmp_path / "inspect.json"
+    child_path.write_bytes(child_raw)
+    with pytest.raises(image.ImageAuthorityError, match="base:content_id_mismatch"):
+        image.build_command(context=tmp_path, dockerfile=dockerfile,
+                            image_ref="local/s8-supervisor:1",
+                            base_inspect_raw=_base_inspect("sha256:" + "c" * 64))
+
+    with pytest.raises(image.ImageAuthorityError, match="base:content_id_mismatch"):
+        image.make_receipt(dockerfile=dockerfile, image_ref="local/s8-supervisor:1",
+                           inspect_raw=child_raw, inspect_path=child_path,
+                           base_inspect_raw=_base_inspect("sha256:" + "d" * 64),
+                           base_inspect_path=tmp_path / "base.json")
 
 
 def test_dockerfile_contract_rejects_unpinned_base_or_missing_tool(tmp_path: Path) -> None:
@@ -73,3 +113,17 @@ def test_dockerfile_contract_rejects_unpinned_base_or_missing_tool(tmp_path: Pat
     path.write_text("FROM ubuntu:22.04\nRUN apt-get install python3 git\n")
     with pytest.raises(image.ImageAuthorityError, match="base_reference_mismatch"):
         image._dockerfile_contract(path)
+
+
+def test_dockerfile_contract_mutations_are_load_bearing(tmp_path: Path) -> None:
+    valid = _dockerfile(tmp_path).read_text()
+    changed_base = tmp_path / "changed-base.Dockerfile"
+    changed_base.write_text(valid.replace(image.BASE_REFERENCE,
+                                          "icecream/s8-supervisor-base:decoy"))
+    with pytest.raises(image.ImageAuthorityError, match="base_reference_mismatch"):
+        image._dockerfile_contract(changed_base)
+
+    missing_cli = tmp_path / "missing-cli.Dockerfile"
+    missing_cli.write_text(valid.replace("python3 git docker.io", "python3 git"))
+    with pytest.raises(image.ImageAuthorityError, match="required_package_missing:docker.io"):
+        image._dockerfile_contract(missing_cli)

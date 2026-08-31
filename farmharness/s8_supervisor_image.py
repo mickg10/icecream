@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import stat
 from pathlib import Path
 from typing import Any
@@ -22,10 +23,11 @@ from typing import Any
 
 SCHEMA = "icecream-s8-supervisor-image-authority-v1"
 BASE_REFERENCE = (
-    "icecream/farm-node:ubuntu22-gcc11-boost174@"
-    "sha256:bdb55d4287a473e3ebfbaa7715a50ee670659777278b8d84c350724e6fa8de58"
+    "icecream/s8-supervisor-base:ubuntu22-config-"
+    "fe001a6138f017608b8846b43bf268a76a9d7a5b66c3364ba3f881da2ff0c54b"
 )
-BASE_DIGEST = "sha256:bdb55d4287a473e3ebfbaa7715a50ee670659777278b8d84c350724e6fa8de58"
+BASE_SOURCE_REFERENCE = "icecream/farm-node:ubuntu22-gcc11-boost174"
+BASE_IMAGE_ID = "sha256:fe001a6138f017608b8846b43bf268a76a9d7a5b66c3364ba3f881da2ff0c54b"
 REQUIRED_TOOLS = ("python3", "git", "docker")
 REQUIRED_PACKAGES = ("python3", "git", "docker.io")
 IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -74,8 +76,8 @@ def _dockerfile_contract(path: Path) -> dict[str, Any]:
             froms.append(match.group(1))
     if froms != [BASE_REFERENCE]:
         raise ImageAuthorityError("dockerfile:base_reference_mismatch")
-    if "@" not in froms[0] or BASE_DIGEST not in froms[0]:
-        raise ImageAuthorityError("dockerfile:base_must_be_digest_pinned")
+    if BASE_IMAGE_ID.removeprefix("sha256:") not in froms[0]:
+        raise ImageAuthorityError("dockerfile:base_must_bind_local_image_id")
     missing = [package for package in REQUIRED_PACKAGES
                if not re.search(rf"(?<![A-Za-z0-9_.+-]){re.escape(package)}(?![A-Za-z0-9_.+-])", text)]
     if missing:
@@ -113,10 +115,20 @@ def _image_identity(image_ref: str, inspect: dict[str, Any]) -> dict[str, str]:
             "os": operating_system, "architecture": architecture}
 
 
+def _base_identity(inspect_raw: bytes) -> dict[str, str]:
+    """Validate a captured inspect of the locally materialized base tag."""
+    identity = _image_identity(BASE_REFERENCE, _inspect_object(inspect_raw))
+    if identity["image_id"] != BASE_IMAGE_ID:
+        raise ImageAuthorityError("base:content_id_mismatch")
+    return identity
+
+
 def make_receipt(*, dockerfile: Path, image_ref: str, inspect_raw: bytes,
-                 inspect_path: Path, source_commit: str | None = None) -> dict[str, Any]:
+                 inspect_path: Path, base_inspect_raw: bytes,
+                 base_inspect_path: Path, source_commit: str | None = None) -> dict[str, Any]:
     """Validate inputs and return a canonical, immutable-image authority value."""
     contract = _dockerfile_contract(dockerfile)
+    base_identity = _base_identity(base_inspect_raw)
     inspect = _inspect_object(inspect_raw)
     identity = _image_identity(image_ref, inspect)
     if source_commit is not None:
@@ -126,12 +138,20 @@ def make_receipt(*, dockerfile: Path, image_ref: str, inspect_raw: bytes,
     receipt: dict[str, Any] = {
         "schema": SCHEMA,
         "image": identity,
-        "base": {"reference": BASE_REFERENCE, "digest": BASE_DIGEST},
+        "base": {"source_reference": BASE_SOURCE_REFERENCE,
+                 "reference": BASE_REFERENCE, "image_id": base_identity["image_id"],
+                 "os": base_identity["os"], "architecture": base_identity["architecture"]},
         "required_tools": list(REQUIRED_TOOLS),
         "dockerfile": contract,
         "inspect": {"path": str(inspect_path.resolve()), "bytes": len(inspect_raw),
                      "sha256": _digest(inspect_raw), "Id": identity["image_id"],
                      "Os": identity["os"], "Architecture": identity["architecture"]},
+        "base_inspect": {"path": str(base_inspect_path.resolve()),
+                         "bytes": len(base_inspect_raw),
+                         "sha256": _digest(base_inspect_raw),
+                         "Id": base_identity["image_id"],
+                         "Os": base_identity["os"],
+                         "Architecture": base_identity["architecture"]},
     }
     if source_commit is not None:
         receipt["source_commit"] = source_commit
@@ -160,11 +180,13 @@ def write_once(path: Path, value: object) -> bytes:
     return raw
 
 
-def build_command(*, context: Path, dockerfile: Path, image_ref: str) -> list[str]:
-    """Return the exact non-running build command for the reviewed definition."""
+def build_command(*, context: Path, dockerfile: Path, image_ref: str,
+                  base_inspect_raw: bytes) -> list[str]:
+    """Return a build command only after base identity preflight succeeds."""
     if not context.is_absolute() or not context.is_dir():
         raise ImageAuthorityError("build_context:directory_required")
     _dockerfile_contract(dockerfile)
+    _base_identity(base_inspect_raw)
     if IMAGE_REFERENCE.fullmatch(image_ref) is None:
         raise ImageAuthorityError("image_reference:invalid")
     return ["docker", "build", "--pull=false", "--platform=linux/amd64",
@@ -172,18 +194,38 @@ def build_command(*, context: Path, dockerfile: Path, image_ref: str) -> list[st
             str(context.resolve())]
 
 
+def base_binding_command() -> list[str]:
+    """Return the explicit, fail-closed local retag/preflight recipe."""
+    source = shlex.quote(BASE_SOURCE_REFERENCE)
+    target = shlex.quote(BASE_REFERENCE)
+    expected = shlex.quote(BASE_IMAGE_ID)
+    script = (
+        "set -eu; "
+        f"actual=$(docker image inspect {source} --format '{{{{.Id}}}}'); "
+        f"test \"$actual\" = {expected}; "
+        f"docker tag {source} {target}; "
+        f"bound=$(docker image inspect {target} --format '{{{{.Id}}}}'); "
+        f"test \"$bound\" = {expected}"
+    )
+    return ["sh", "-eu", "-c", script]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dockerfile", type=Path, default=DEFAULT_DOCKERFILE)
     parser.add_argument("--image-ref", required=True)
     parser.add_argument("--inspect-json", type=Path, required=True)
+    parser.add_argument("--base-inspect-json", type=Path, required=True)
     parser.add_argument("--receipt", type=Path, required=True)
     parser.add_argument("--source-commit")
     args = parser.parse_args(argv)
     try:
         inspect_raw = _regular_file(args.inspect_json, "inspect")
+        base_inspect_raw = _regular_file(args.base_inspect_json, "base_inspect")
         receipt = make_receipt(dockerfile=args.dockerfile, image_ref=args.image_ref,
                                inspect_raw=inspect_raw, inspect_path=args.inspect_json,
+                               base_inspect_raw=base_inspect_raw,
+                               base_inspect_path=args.base_inspect_json,
                                source_commit=args.source_commit)
         write_once(args.receipt, receipt)
         print(canonical(receipt).decode("ascii"), end="")
