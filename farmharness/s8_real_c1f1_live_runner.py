@@ -23,7 +23,7 @@ import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -79,6 +79,9 @@ HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX32 = re.compile(r"^[0-9a-f]{32}$")
 SAFE = re.compile(r"^[A-Za-z0-9_.-]+$")
 TIMESTAMP = re.compile(r"^\d{8}T\d{6}Z$")
+ISO_UTC = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+EXTERNAL_EXECUTION_ID = re.compile(r"^[A-Za-z0-9_.:-]{8,128}$")
+EXTERNAL_CONTAINER_ID = re.compile(r"^[0-9a-f]{12,128}$")
 IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
 PINNED_IMAGE = "icecream/farm-node:ubuntu22-gcc11-boost174"
 DEFAULT_CONTAINER_BIND_ROOT = Path("/tanksmall")
@@ -192,6 +195,18 @@ def _sha(path: Path) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
+def _private_location(path: Path, label: str) -> None:
+    """Reject descriptor paths reached through a symlinked directory."""
+    if not path.is_absolute():
+        _fail(f"{label}:descriptor_invalid")
+    for ancestor in (path, *path.parents):
+        try:
+            if ancestor.is_symlink():
+                _fail(f"{label}:descriptor_invalid")
+        except OSError as exc:
+            raise LiveRunnerError(f"{label}:descriptor_invalid") from exc
+
+
 def _hex(value: object, label: str) -> str:
     if not isinstance(value, str) or HEX64.fullmatch(value) is None or int(value, 16) == 0:
         _fail(f"{label}:invalid_digest")
@@ -223,6 +238,7 @@ def load_external_farm_manifest(path: Path, expected_sha256: str,
     this authority yet; accepting the manifest here makes that missing launch
     input explicit instead of allowing local elapsed time into calibration.
     """
+    _private_location(path, "external_farm.manifest")
     if (not path.is_absolute() or path.is_symlink() or not path.is_file() or
             path.stat().st_nlink != 1):
         _fail("external_farm.manifest:unavailable")
@@ -309,6 +325,7 @@ def _private_descriptor(value: object, label: str) -> tuple[Path, str, int]:
     if not isinstance(path_value, str):
         _fail(f"{label}:descriptor_invalid")
     path = Path(path_value)
+    _private_location(path, label)
     if (not path.is_absolute() or type(value.get("bytes")) is not int or
             value["bytes"] <= 0):
         _fail(f"{label}:descriptor_invalid")
@@ -323,6 +340,7 @@ def _load_external_farm_authority(path: Path, expected_sha256: str,
                                   manifest: dict[str, object],
                                   suite: str) -> tuple[dict[str, object], str, int]:
     """Load the canonical four-host authority emitted by S8 capture."""
+    _private_location(path, "external_farm.authority")
     if (not path.is_absolute() or path.is_symlink() or not path.is_file() or
             path.stat().st_nlink != 1):
         _fail("external_farm.authority:unavailable")
@@ -417,6 +435,7 @@ def _load_external_farm_authority(path: Path, expected_sha256: str,
                 idle.get("status") not in {"PASS", "HOLD"} or
                 type(idle.get("load_1m")) not in (int, float) or idle["load_1m"] < 0 or
                 not isinstance(idle.get("captured_at"), str) or
+                ISO_UTC.fullmatch(idle.get("captured_at", "")) is None or
                 not isinstance(sample, dict) or set(sample) !=
                 {"before", "after", "duration_seconds", "idle_percent"} or
                 any(not isinstance(sample[field], str) or not sample[field]
@@ -439,6 +458,9 @@ def _load_external_farm_authority(path: Path, expected_sha256: str,
             "binaries": normalized_binaries,
         }
     reference_binaries = normalized_hosts["q3"]["binaries"]
+    if len({normalized_hosts[host]["physical_host_digest"]
+            for host in EXTERNAL_FARM_HOSTS}) != len(EXTERNAL_FARM_HOSTS):
+        _fail("external_farm.authority:physical_hosts_not_unique")
     if any(normalized_hosts[host]["binaries"] != reference_binaries
            for host in EXTERNAL_FARM_HOSTS):
         _fail("external_farm.authority:per_host_binary_mismatch")
@@ -514,13 +536,98 @@ def _external_farm_binding(external: ExternalFarmFinalization, suite: str) -> di
         raise LiveRunnerError("external_farm.receipt:invalid_json") from exc
     if (not isinstance(receipt, dict) or set(receipt) != {
             "schema", "mode", "suite", "manifest_sha256", "authority_sha256",
-            "stdout", "workdir"} or receipt.get("schema") != EXTERNAL_FARM_RECEIPT_SCHEMA or
+            "stdout", "workdir", "execution"} or receipt.get("schema") != EXTERNAL_FARM_RECEIPT_SCHEMA or
             receipt.get("mode") != "external_farm" or receipt.get("suite") != suite or
             receipt.get("manifest_sha256") != manifest_sha or
             receipt.get("authority_sha256") != authority_sha or
             receipt.get("stdout") != {"path": str(stdout_path), "sha256": stdout_sha,
                                        "bytes": stdout_bytes}):
         _fail("external_farm.receipt:identity_mismatch")
+    execution = receipt.get("execution")
+    identity_fields = {"host", "service", "physical_host_digest", "boot_id_digest",
+                       "pid", "container_id"}
+    def execution_identity(value: object, label: str, host: str, service: str) -> None:
+        expected_fields = identity_fields | ({"relationship"} if label.startswith("workers:") else set())
+        if (not isinstance(value, dict) or set(value) != expected_fields or
+                value.get("host") != host or value.get("service") != service or
+                value.get("physical_host_digest") != authority["hosts"][host]["physical_host_digest"] or
+                value.get("boot_id_digest") != authority["hosts"][host]["boot_id_digest"] or
+                type(value.get("pid")) is not int or not 1 <= value["pid"] <= 4_194_304 or
+                not isinstance(value.get("container_id"), str) or
+                EXTERNAL_CONTAINER_ID.fullmatch(value["container_id"]) is None):
+            _fail(f"external_farm.receipt:{label}:identity_invalid")
+    if not isinstance(execution, dict) or set(execution) != {
+            "execution_id", "scheduler", "client", "workers", "started_at",
+            "finished_at", "start_marker", "end_marker", "artifacts"}:
+        _fail("external_farm.receipt:execution_invalid")
+    execution_id = execution.get("execution_id")
+    if (not isinstance(execution_id, str) or
+            EXTERNAL_EXECUTION_ID.fullmatch(execution_id) is None):
+        _fail("external_farm.receipt:execution_id_invalid")
+    execution_identity(execution.get("scheduler"), "scheduler", "q3", "p50-scheduler")
+    execution_identity(execution.get("client"), "client", "q3", "p50-c")
+    mapping = authority["placements"][suite]["relationship_hosts"]
+    workers = execution.get("workers")
+    if not isinstance(workers, list) or len(workers) != len(mapping):
+        _fail("external_farm.receipt:workers_invalid")
+    for index, (worker, host) in enumerate(zip(workers, mapping, strict=True)):
+        service = "p50-f" if suite == TOPOLOGY else f"p50-f-{index}"
+        execution_identity(worker, f"workers:{index}", host, service)
+        if not isinstance(worker, dict) or worker.get("relationship") != index:
+            _fail(f"external_farm.receipt:workers:{index}:mapping_invalid")
+    if (not isinstance(execution["started_at"], str) or
+            ISO_UTC.fullmatch(execution["started_at"]) is None or
+            not isinstance(execution["finished_at"], str) or
+            ISO_UTC.fullmatch(execution["finished_at"]) is None):
+        _fail("external_farm.receipt:execution_time_invalid")
+    try:
+        started_at = datetime.strptime(execution["started_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc)
+        finished_at = datetime.strptime(execution["finished_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc)
+    except ValueError as exc:
+        raise LiveRunnerError("external_farm.receipt:execution_time_invalid") from exc
+    now = datetime.now(timezone.utc)
+    if (finished_at < started_at or started_at > now + timedelta(seconds=30) or
+            finished_at > now + timedelta(seconds=30) or
+            (finished_at - started_at).total_seconds() > MAX_TIMEOUT_SECONDS):
+        _fail("external_farm.receipt:execution_time_invalid")
+    used_hosts = ["q3", *dict.fromkeys(mapping)]
+    for host in used_hosts:
+        try:
+            captured_at = datetime.strptime(
+                authority["hosts"][host]["idle"]["captured_at"],
+                "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError) as exc:
+            raise LiveRunnerError(f"external_farm.authority:{host}:idle_invalid") from exc
+        age = (started_at - captured_at).total_seconds()
+        if age < -30 or age > 300:
+            _fail(f"external_farm.authority:{host}:capture_stale")
+    artifacts = execution.get("artifacts")
+    if artifacts != {"collection": "complete", "cleanup": "complete"}:
+        _fail("external_farm.receipt:artifacts_incomplete")
+    marker_pattern = re.compile(
+        r"^S8_EXTERNAL_FARM_EXECUTION execution_id=([^ ]+) manifest_sha256=([0-9a-f]{64}) "
+        r"authority_sha256=([0-9a-f]{64}) phase=(start|end) timestamp=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)$")
+    marker_rows = []
+    for line in stdout.splitlines():
+        match = marker_pattern.fullmatch(line)
+        if match is not None:
+            marker_rows.append((match, line))
+    if len(marker_rows) != 2:
+        _fail("external_farm.receipt:lifecycle_markers_missing")
+    phases = [match.group(4) for match, _line in marker_rows]
+    if phases != ["start", "end"]:
+        _fail("external_farm.receipt:lifecycle_markers_invalid")
+    for marker_index, (match, line) in enumerate(marker_rows):
+        if (match.group(1) != execution_id or match.group(2) != manifest_sha or
+                match.group(3) != authority_sha or
+                match.group(5) != (execution["started_at"] if marker_index == 0
+                                   else execution["finished_at"])):
+            _fail("external_farm.receipt:lifecycle_marker_identity_mismatch")
+    if (execution.get("start_marker") != marker_rows[0][1] or
+            execution.get("end_marker") != marker_rows[1][1]):
+        _fail("external_farm.receipt:lifecycle_marker_receipt_mismatch")
     if (not external.workdir.is_absolute() or external.workdir.is_symlink() or
             not external.workdir.is_dir()):
         _fail("external_farm.workdir:invalid")
@@ -564,7 +671,9 @@ def _external_calibration_metadata(binding: dict[str, object], work: Path,
     hosts = binding["hosts"]
     closure = [{"host": host, "physical_host_digest": hosts[host]["physical_host_digest"],
                 "boot_id_digest": hosts[host]["boot_id_digest"],
-                "descriptor": hosts[host]["descriptor"], "image": hosts[host]["image"],
+                "descriptor": {"sha256": hosts[host]["descriptor"]["sha256"],
+                               "bytes": hosts[host]["descriptor"]["bytes"]},
+                "image": hosts[host]["image"],
                 "binaries": hosts[host]["binaries"]} for host in sorted(used)]
     host_closure = hashlib.sha256(_canonical({"schema": "icecream-s8-host-closure-v1",
                                               "hosts": closure})).hexdigest()
@@ -2428,7 +2537,19 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
         if any(external_binding["hosts"][host]["binaries"] != authority_binaries
                for host in used_hosts):
             _fail("external_farm.authority:per_host_binary_mismatch")
-        if any(authority_binaries.get(role) != digest for role, digest in expected_binaries.items()):
+        # The product identity is the local final-head binary inventory.  It
+        # is checked directly against the captured authority (the stdout
+        # inventory was already checked above), so a caller cannot fabricate
+        # an otherwise matching S8_BINARY line.
+        try:
+            create_env_sha, _create_env_bytes = _sha(
+                product_root / "client/icecc-create-env")
+        except LiveRunnerError as exc:
+            raise LiveRunnerError("external_farm.authority:product_binary_mismatch") from exc
+        local_product_binaries = {**binaries, "client/icecc-create-env": create_env_sha}
+        if (set(local_product_binaries) != set(authority_binaries) or
+                any(authority_binaries.get(role) != digest
+                    for role, digest in local_product_binaries.items())):
             _fail("external_farm.authority:product_binary_mismatch")
     if launch_identity is not None:
         if (launch_identity.get("source_commit") != commit or
