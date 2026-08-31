@@ -548,6 +548,9 @@ def audit_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
     errors: list[str] = []
     if plan.get("schema") != SCHEMA:
         errors.append("schema-mismatch")
+    expected_binding = artifact_binding_contract()
+    if plan.get("artifact_binding_contract") != expected_binding:
+        errors.append("artifact-binding-contract-mismatch")
     if tuple(plan.get("roles", ())) != ROLES:
         errors.append("role-order-mismatch")
     for version, expected in ((43, P43_SOURCE_SHA), (44, P44_SOURCE_SHA), (50, P50_SOURCE_SHA)):

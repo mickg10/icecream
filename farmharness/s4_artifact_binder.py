@@ -78,6 +78,27 @@ PROTOCOL_ASSERTIONS = {
 PROTOCOL_PATH = "services/comm.h"
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+RECEIPT_FIELDS = frozenset({"schema", "version", "label", "artifact_root",
+                            "source", "build", "protocol_assertion", "roles",
+                            "artifact_manifest", "manifest"})
+SOURCE_FIELDS = frozenset({"commit", "tree", "repository"})
+BUILD_FIELDS = frozenset({"source_commit", "source_tree", "authority",
+                          "receipt_id", "command"})
+PROTOCOL_FIELDS = frozenset({"path", "text", "version"})
+ROLE_DESCRIPTOR_FIELDS = frozenset({"path", "bytes", "sha256"})
+MANIFEST_FIELDS = frozenset({"schema", "manifest_version", "planner", "matrix",
+                             "versions", "overall", "manifest_sha256"})
+PLANNER_FIELDS = frozenset({"source_metadata_commit", "runtime_source_commit",
+                            "runtime_authority"})
+MATRIX_FIELDS = frozenset({"state_count", "transition_count", "state_space"})
+OVERALL_FIELDS = frozenset({"status", "required_versions"})
+BOUND_ROLE_FIELDS = frozenset({"role", "name", "path", "bytes", "sha256",
+                               "executable"})
+VERSION_FIELDS = frozenset({"status", "version", "label", "artifact_root", "source",
+                            "build", "receipt", "protocol_assertion",
+                            "role_completeness", "roles", "errors"})
+COMPLETENESS_FIELDS = frozenset({"required", "present", "complete"})
+RECEIPT_DIGEST_FIELDS = frozenset({"bytes", "sha256", "document"})
 
 
 class ArtifactBindingError(ValueError):
@@ -107,6 +128,25 @@ def _required(mapping: Mapping[str, Any], name: str, errors: list[str]) -> objec
     return mapping[name]
 
 
+def _reject_unknown(mapping: Mapping[str, Any], allowed: frozenset[str],
+                    label: str, errors: list[str]) -> None:
+    errors.extend(f"{label}:unknown:{key}" for key in sorted(set(mapping) - allowed))
+
+
+def _first_ancestor_symlink(path: Path) -> Path | None:
+    """Return the first symlink in the lexical path, including ancestors."""
+    absolute = Path(os.path.abspath(str(path)))
+    current = Path(absolute.anchor)
+    for component in absolute.parts[1:]:
+        current /= component
+        try:
+            if current.is_symlink():
+                return current
+        except OSError:
+            return None
+    return None
+
+
 def _root_from(receipt: Mapping[str, Any], errors: list[str]) -> Path | None:
     raw = receipt.get("artifact_root")
     if raw is None:
@@ -118,12 +158,14 @@ def _root_from(receipt: Mapping[str, Any], errors: list[str]) -> Path | None:
     try:
         # Do not resolve a symlink away before checking it.  The root itself
         # is part of the provenance boundary and must be a real directory.
-        if root.is_symlink() or not root.is_dir():
+        if (_first_ancestor_symlink(root) is not None or
+                root.is_symlink() or not root.is_dir()):
             errors.append("artifact-root:not-private-directory")
             return None
-        if root.stat().st_mode & 0o022:
+        root_info = root.lstat()
+        if root_info.st_mode & 0o022:
             errors.append("artifact-root:not-private")
-        return root.resolve()
+        return Path(os.path.normpath(str(root.absolute())))
     except OSError as exc:
         errors.append(f"artifact-root:unreadable:{exc}")
         return None
@@ -141,17 +183,12 @@ def _role_path(root: Path, descriptor: Mapping[str, Any], role: str,
     # lexical containment catches ../ aliases; resolving is only used for the
     # comparison after the lexical check and never to bless a symlink.
     try:
-        lexical = candidate.absolute()
+        lexical = Path(os.path.normpath(str(candidate.absolute())))
         lexical.relative_to(root)
-        resolved = candidate.resolve(strict=False)
-        resolved.relative_to(root.resolve())
-        relative = resolved.relative_to(root.resolve())
-        current = root.resolve()
-        for component in relative.parts:
-            current /= component
-            if current.is_symlink():
-                errors.append(f"{role}:path-alias")
-                return None
+        if _first_ancestor_symlink(lexical) is not None:
+            errors.append(f"{role}:path-alias")
+            return None
+        lexical.resolve(strict=False).relative_to(root.resolve())
     except ValueError:
         errors.append(f"{role}:path-outside-root")
         return None
@@ -167,6 +204,7 @@ def _protocol(receipt: Mapping[str, Any], version: int,
     if not isinstance(value, Mapping):
         errors.append("protocol-assertion:missing")
         return None
+    _reject_unknown(value, PROTOCOL_FIELDS, "protocol-assertion", errors)
     path = value.get("path")
     text = value.get("text")
     expected = PROTOCOL_ASSERTIONS[version]
@@ -174,7 +212,7 @@ def _protocol(receipt: Mapping[str, Any], version: int,
         errors.append("protocol-assertion:path-mismatch")
     if text != expected:
         errors.append(f"protocol-assertion:expected-{version}")
-    raw_version = value.get("version", version)
+    raw_version = value.get("version")
     if raw_version != version:
         errors.append(f"protocol-assertion:version-mismatch:{raw_version}")
     return {"path": path, "text": text, "version": raw_version}
@@ -203,6 +241,8 @@ def _source_and_build(receipt: Mapping[str, Any], version: int,
     if not isinstance(build, Mapping):
         errors.append("build:missing")
         build = {}
+    _reject_unknown(source, SOURCE_FIELDS, "source", errors)
+    _reject_unknown(build, BUILD_FIELDS, "build", errors)
     commit = source.get("commit")
     tree = source.get("tree")
     for name, value in (("commit", commit), ("tree", tree)):
@@ -226,6 +266,11 @@ def _source_and_build(receipt: Mapping[str, Any], version: int,
             errors.append("P50:planner-source-metadata-is-not-runtime-authority")
     if commit != expected:
         errors.append(f"P{version}:source-commit-mismatch")
+    expected_authority = P50_RUNTIME_AUTHORITY if version == 50 else "release-build"
+    if build.get("authority") != expected_authority:
+        errors.append(f"P{version}:build-authority-mismatch")
+    if not isinstance(build.get("receipt_id"), str) or not build["receipt_id"].strip():
+        errors.append(f"P{version}:build-receipt-id-missing")
     return (
         {"commit": commit, "tree": tree, **({"repository": source["repository"]}
                                                if isinstance(source.get("repository"), str)
@@ -282,6 +327,7 @@ def _roles(receipt: Mapping[str, Any], root: Path, version: int,
             errors.append(f"{role}:missing-or-not-object")
             result[role] = {"role": role, "status": "NOT_BOUND"}
             continue
+        _reject_unknown(descriptor, ROLE_DESCRIPTOR_FIELDS, f"{role}:descriptor", errors)
         path = _role_path(root, descriptor, role, errors)
         item: dict[str, Any] = {
             "role": role, "name": ROLE_NAMES[role],
@@ -308,6 +354,8 @@ def _roles(receipt: Mapping[str, Any], root: Path, version: int,
             # is also an alias, even if its bytes currently match.
             if info.st_mode & 0o022:
                 errors.append(f"{role}:not-private")
+            if info.st_nlink != 1:
+                errors.append(f"{role}:nlink-not-one")
             inode = (info.st_dev, info.st_ino)
             if inode in seen_inodes:
                 errors.append(f"{role}:aliased-inode:{seen_inodes[inode]}")
@@ -344,6 +392,11 @@ def _retained_check(version: int, roles: Mapping[str, Any], errors: list[str]) -
 
 def _bind_one(receipt: Mapping[str, Any]) -> dict[str, Any]:
     errors: list[str] = []
+    _reject_unknown(receipt, RECEIPT_FIELDS, "receipt", errors)
+    for field in ("schema", "version", "label", "artifact_root", "source",
+                  "build", "protocol_assertion", "roles"):
+        if field not in receipt:
+            errors.append(f"receipt:missing:{field}")
     if receipt.get("schema") != RECEIPT_SCHEMA:
         errors.append("schema-mismatch")
     version = _version(receipt, errors)
@@ -373,7 +426,8 @@ def _bind_one(receipt: Mapping[str, Any]) -> dict[str, Any]:
         "source": source,
         "build": build,
         "receipt": {"bytes": len(receipt_raw),
-                    "sha256": hashlib.sha256(receipt_raw).hexdigest()},
+                    "sha256": hashlib.sha256(receipt_raw).hexdigest(),
+                    "document": receipt},
         "protocol_assertion": protocol,
         "role_completeness": completeness,
         "roles": roles,
@@ -417,9 +471,13 @@ def bind_receipts(receipts: object) -> dict[str, Any]:
         else:
             versions[str(version)] = {
                 "status": "NOT_BOUND", "version": version, "label": f"P{version}",
+                "artifact_root": None, "source": None, "build": None,
+                "receipt": None, "protocol_assertion": None,
                 "role_completeness": {"required": list(REQUIRED_ROLES[version]),
                                        "present": [], "complete": False},
-                "roles": {}, "errors": [f"missing-receipt:P{version}"],
+                "roles": {role: {"role": role, "status": "NOT_BOUND"}
+                          for role in REQUIRED_ROLES[version]},
+                "errors": [f"missing-receipt:P{version}"],
             }
     payload: dict[str, Any] = {
         "schema": MANIFEST_SCHEMA,
@@ -443,6 +501,13 @@ def bind_receipts(receipts: object) -> dict[str, Any]:
 def audit_artifact_manifest(manifest: Mapping[str, Any], *, rehash: bool = True) -> dict[str, Any]:
     """Audit a serialized manifest, including current files when requested."""
     errors: list[str] = []
+    if not isinstance(manifest, Mapping):
+        return {"schema": AUDIT_SCHEMA, "status": "FAIL",
+                "errors": ["manifest:not-object"]}
+    _reject_unknown(manifest, MANIFEST_FIELDS, "manifest", errors)
+    for field in MANIFEST_FIELDS:
+        if field not in manifest:
+            errors.append(f"manifest:missing:{field}")
     if manifest.get("schema") != MANIFEST_SCHEMA:
         errors.append("schema-mismatch")
     supplied_digest = manifest.get("manifest_sha256")
@@ -450,22 +515,144 @@ def audit_artifact_manifest(manifest: Mapping[str, Any], *, rehash: bool = True)
     unsigned.pop("manifest_sha256", None)
     if not _valid_hex(supplied_digest, HEX64) or hashlib.sha256(_canonical(unsigned)).hexdigest() != supplied_digest:
         errors.append("manifest-sha256-mismatch")
+    planner = manifest.get("planner")
+    expected_planner = {
+        "source_metadata_commit": P50_PRODUCT_SOURCE_METADATA_SHA,
+        "runtime_source_commit": P50_RUNTIME_SOURCE_SHA,
+        "runtime_authority": P50_RUNTIME_AUTHORITY,
+    }
+    if not isinstance(planner, Mapping):
+        errors.append("planner:missing-or-not-object")
+    else:
+        _reject_unknown(planner, PLANNER_FIELDS, "planner", errors)
+        if dict(planner) != expected_planner:
+            errors.append("planner:contract-mismatch")
+    matrix = manifest.get("matrix")
+    expected_matrix = {"state_count": 27, "transition_count": 729,
+                       "state_space": "{43,44,50}^3"}
+    if not isinstance(matrix, Mapping):
+        errors.append("matrix:missing-or-not-object")
+    else:
+        _reject_unknown(matrix, MATRIX_FIELDS, "matrix", errors)
+        if dict(matrix) != expected_matrix:
+            errors.append("matrix:contract-mismatch")
+    overall = manifest.get("overall")
+    expected_versions = [43, 44, 50]
+    if not isinstance(overall, Mapping):
+        errors.append("overall:missing-or-not-object")
+    else:
+        _reject_unknown(overall, OVERALL_FIELDS, "overall", errors)
+        if overall.get("required_versions") != expected_versions:
+            errors.append("overall:versions-mismatch")
     versions = manifest.get("versions")
     if not isinstance(versions, Mapping):
         errors.append("versions:missing-or-not-object")
         versions = {}
+    if set(versions) != {"43", "44", "50"}:
+        errors.append("versions:key-set-mismatch")
     for version in (43, 44, 50):
         row = versions.get(str(version))
         if not isinstance(row, Mapping):
             errors.append(f"missing:P{version}")
             continue
+        _reject_unknown(row, VERSION_FIELDS, f"P{version}:row", errors)
+        for field in VERSION_FIELDS:
+            if field not in row:
+                errors.append(f"P{version}:row:missing:{field}")
+        row_errors = row.get("errors")
+        if not isinstance(row_errors, list) or any(not isinstance(item, str) for item in row_errors):
+            errors.append(f"P{version}:row:errors-invalid")
         if row.get("status") != "BOUND":
             errors.append(f"P{version}:not-bound")
             continue
+        if row_errors:
+            errors.append(f"P{version}:bound-row-has-errors")
         if row.get("version") != version or row.get("label") != f"P{version}":
             errors.append(f"P{version}:identity-mismatch")
         source = row.get("source")
         build = row.get("build")
+        protocol = row.get("protocol_assertion")
+        receipt_digest = row.get("receipt")
+        if not isinstance(receipt_digest, Mapping):
+            errors.append(f"P{version}:receipt-digest-missing")
+        else:
+            _reject_unknown(receipt_digest, RECEIPT_DIGEST_FIELDS,
+                            f"P{version}:receipt", errors)
+            if (type(receipt_digest.get("bytes")) is not int or
+                    receipt_digest.get("bytes", -1) < 1):
+                errors.append(f"P{version}:receipt-bytes-invalid")
+            if not _valid_hex(receipt_digest.get("sha256"), HEX64):
+                errors.append(f"P{version}:receipt-sha256-invalid")
+            document = receipt_digest.get("document")
+            if not isinstance(document, Mapping):
+                errors.append(f"P{version}:receipt-document-invalid")
+            else:
+                _reject_unknown(document, RECEIPT_FIELDS, f"P{version}:receipt-document", errors)
+                document_source_for_shape = document.get("source")
+                if isinstance(document_source_for_shape, Mapping):
+                    _reject_unknown(document_source_for_shape, SOURCE_FIELDS,
+                                    f"P{version}:receipt-document:source", errors)
+                document_build_for_shape = document.get("build")
+                if isinstance(document_build_for_shape, Mapping):
+                    _reject_unknown(document_build_for_shape, BUILD_FIELDS,
+                                    f"P{version}:receipt-document:build", errors)
+                document_protocol_for_shape = document.get("protocol_assertion")
+                if isinstance(document_protocol_for_shape, Mapping):
+                    _reject_unknown(document_protocol_for_shape, PROTOCOL_FIELDS,
+                                    f"P{version}:receipt-document:protocol", errors)
+                document_roles_for_shape = document.get("roles")
+                if isinstance(document_roles_for_shape, Mapping):
+                    for role, descriptor in document_roles_for_shape.items():
+                        if isinstance(descriptor, Mapping):
+                            _reject_unknown(descriptor, ROLE_DESCRIPTOR_FIELDS,
+                                            f"P{version}:receipt-document:{role}", errors)
+                document_raw = _canonical(document)
+                if (receipt_digest.get("bytes") != len(document_raw) or
+                        receipt_digest.get("sha256") != hashlib.sha256(document_raw).hexdigest()):
+                    errors.append(f"P{version}:receipt-digest-mismatch")
+                if (document.get("version") != version or document.get("label") != f"P{version}" or
+                        document.get("schema") != RECEIPT_SCHEMA):
+                    errors.append(f"P{version}:receipt-document-identity-mismatch")
+                document_root = document.get("artifact_root")
+                normalized_document_root = (str(Path(os.path.normpath(
+                    str(Path(document_root).absolute()))))
+                    if isinstance(document_root, str) else None)
+                if normalized_document_root != row.get("artifact_root"):
+                    errors.append(f"P{version}:receipt-document-root-mismatch")
+                document_protocol = document.get("protocol_assertion")
+                if document_protocol != protocol:
+                    errors.append(f"P{version}:receipt-document-protocol-mismatch")
+                document_source = document.get("source")
+                if isinstance(document_source, Mapping) and isinstance(source, Mapping):
+                    if (document_source.get("commit") != source.get("commit") or
+                            document_source.get("tree") != source.get("tree")):
+                        errors.append(f"P{version}:receipt-document-source-mismatch")
+                document_build = document.get("build")
+                if isinstance(document_build, Mapping) and isinstance(build, Mapping):
+                    if (document_build.get("source_commit") != build.get("source_commit") or
+                            document_build.get("source_tree") != build.get("source_tree") or
+                            document_build.get("authority") != build.get("authority") or
+                            document_build.get("receipt_id") != build.get("receipt_id")):
+                        errors.append(f"P{version}:receipt-document-build-mismatch")
+                document_roles = document.get("roles")
+                row_roles = row.get("roles")
+                if not isinstance(document_roles, Mapping) or not isinstance(row_roles, Mapping):
+                    errors.append(f"P{version}:receipt-document-roles-missing")
+                else:
+                    if set(document_roles) != set(REQUIRED_ROLES[version]):
+                        errors.append(f"P{version}:receipt-document-role-key-set-mismatch")
+                    for role in REQUIRED_ROLES[version]:
+                        document_role = document_roles.get(role)
+                        row_role = row_roles.get(role)
+                        if (not isinstance(document_role, Mapping) or
+                                not isinstance(row_role, Mapping) or
+                                document_role.get("bytes") != row_role.get("bytes") or
+                                document_role.get("sha256") != row_role.get("sha256")):
+                            errors.append(f"P{version}:receipt-document-role-mismatch:{role}")
+        if isinstance(source, Mapping):
+            _reject_unknown(source, SOURCE_FIELDS, f"P{version}:source", errors)
+        if isinstance(build, Mapping):
+            _reject_unknown(build, BUILD_FIELDS, f"P{version}:build", errors)
         expected_commit = (P50_RUNTIME_SOURCE_SHA if version == 50
                            else SOURCE_AUTHORITIES[version])
         if (not isinstance(source, Mapping) or source.get("commit") != expected_commit or
@@ -475,46 +662,119 @@ def audit_artifact_manifest(manifest: Mapping[str, Any], *, rehash: bool = True)
                 build.get("source_commit") != (source.get("commit") if isinstance(source, Mapping) else None) or
                 build.get("source_tree") != (source.get("tree") if isinstance(source, Mapping) else None)):
             errors.append(f"P{version}:build-source-mismatch")
-        if version == 50 and (not isinstance(build, Mapping) or
-                              build.get("authority") != P50_RUNTIME_AUTHORITY):
-            errors.append("P50:runtime-authority-missing-or-wrong")
-        protocol = row.get("protocol_assertion")
+        expected_authority = (P50_RUNTIME_AUTHORITY if version == 50 else "release-build")
+        if (not isinstance(build, Mapping) or
+                build.get("authority") != expected_authority):
+            errors.append(f"P{version}:build-authority-mismatch")
+        if (not isinstance(build, Mapping) or
+                not isinstance(build.get("receipt_id"), str) or
+                not build["receipt_id"].strip()):
+            errors.append(f"P{version}:build-receipt-id-missing")
+        if isinstance(protocol, Mapping):
+            _reject_unknown(protocol, PROTOCOL_FIELDS,
+                            f"P{version}:protocol-assertion", errors)
         if (not isinstance(protocol, Mapping) or protocol.get("path") != PROTOCOL_PATH or
                 protocol.get("text") != PROTOCOL_ASSERTIONS[version] or
-                protocol.get("version", version) != version):
+                protocol.get("version") != version):
             errors.append(f"P{version}:protocol-assertion-mismatch")
+        elif set(protocol) != PROTOCOL_FIELDS:
+            errors.append(f"P{version}:protocol-assertion-fields")
         completeness = row.get("role_completeness")
         if (not isinstance(completeness, Mapping) or
                 completeness.get("required") != list(REQUIRED_ROLES[version]) or
                 completeness.get("complete") is not True):
             errors.append(f"P{version}:role-completeness-mismatch")
+        if isinstance(completeness, Mapping):
+            _reject_unknown(completeness, COMPLETENESS_FIELDS,
+                            f"P{version}:role-completeness", errors)
+            if completeness.get("present") != list(REQUIRED_ROLES[version]):
+                errors.append(f"P{version}:role-presence-mismatch")
+        roles_for_retained = row.get("roles")
+        if version == 43 and isinstance(roles_for_retained, Mapping):
+            for role, expected_hash in RETAINED_ROLE_HASHES["43"].items():
+                role_value = roles_for_retained.get(role)
+                observed_hash = (role_value.get("sha256")
+                                 if isinstance(role_value, Mapping) else None)
+                if observed_hash != expected_hash:
+                    errors.append(f"P43:{role}:retained-hash-mismatch")
+        semantic_roles = row.get("roles")
+        if not isinstance(semantic_roles, Mapping):
+            errors.append(f"P{version}:roles-missing")
+        else:
+            if set(semantic_roles) != set(REQUIRED_ROLES[version]):
+                errors.append(f"P{version}:role-key-set-mismatch")
+            for role in REQUIRED_ROLES[version]:
+                item = semantic_roles.get(role)
+                if not isinstance(item, Mapping):
+                    errors.append(f"P{version}:{role}:missing")
+                    continue
+                _reject_unknown(item, BOUND_ROLE_FIELDS, f"P{version}:{role}", errors)
+                if (item.get("role") != role or item.get("name") != ROLE_NAMES[role] or
+                        item.get("executable") is not True):
+                    errors.append(f"P{version}:{role}:descriptor-identity-mismatch")
+                if (type(item.get("bytes")) is not int or item.get("bytes", -1) < 0 or
+                        not _valid_hex(item.get("sha256"), HEX64)):
+                    errors.append(f"P{version}:{role}:descriptor-digest-invalid")
+        semantic_root_raw = row.get("artifact_root")
+        semantic_root = (Path(semantic_root_raw)
+                          if isinstance(semantic_root_raw, str) else None)
+        if (semantic_root is None or not semantic_root.is_absolute() or
+                _first_ancestor_symlink(semantic_root) is not None or
+                semantic_root.is_symlink() or not semantic_root.is_dir()):
+            errors.append(f"P{version}:artifact-root-invalid")
+        else:
+            try:
+                if semantic_root.lstat().st_mode & 0o022:
+                    errors.append(f"P{version}:artifact-root-not-private")
+            except OSError:
+                errors.append(f"P{version}:artifact-root-unreadable")
         if rehash:
             root_raw = row.get("artifact_root")
             root = Path(str(root_raw)) if isinstance(root_raw, str) else None
-            if root is None or root.is_symlink() or not root.is_dir():
+            if (root is None or not root.is_absolute() or
+                    _first_ancestor_symlink(root) is not None or
+                    root.is_symlink() or not root.is_dir()):
                 errors.append(f"P{version}:artifact-root-invalid")
                 continue
+            try:
+                if root.lstat().st_mode & 0o022:
+                    errors.append(f"P{version}:artifact-root-not-private")
+            except OSError:
+                errors.append(f"P{version}:artifact-root-unreadable")
             roles = row.get("roles")
             if not isinstance(roles, Mapping):
                 errors.append(f"P{version}:roles-missing")
                 continue
+            if set(roles) != set(REQUIRED_ROLES[version]):
+                errors.append(f"P{version}:role-key-set-mismatch")
             seen_inodes: set[tuple[int, int]] = set()
+            seen_paths: set[Path] = set()
             for role in REQUIRED_ROLES[version]:
                 item = roles.get(role)
                 if not isinstance(item, Mapping):
                     errors.append(f"P{version}:{role}:missing")
                     continue
+                _reject_unknown(item, BOUND_ROLE_FIELDS, f"P{version}:{role}", errors)
+                if (item.get("role") != role or item.get("name") != ROLE_NAMES[role] or
+                        item.get("executable") is not True):
+                    errors.append(f"P{version}:{role}:descriptor-identity-mismatch")
+                if (type(item.get("bytes")) is not int or item.get("bytes", -1) < 0 or
+                        not _valid_hex(item.get("sha256"), HEX64)):
+                    errors.append(f"P{version}:{role}:descriptor-digest-invalid")
                 path = Path(str(item.get("path", "")))
                 try:
                     resolved_root = root.resolve()
+                    if not path.is_absolute():
+                        raise ValueError("relative role path")
+                    lexical = Path(os.path.normpath(str(path)))
+                    lexical.relative_to(root)
+                    if _first_ancestor_symlink(lexical) is not None:
+                        raise ValueError("path alias")
                     resolved_path = path.resolve(strict=False)
                     resolved_path.relative_to(resolved_root)
-                    current = resolved_root
-                    for component in resolved_path.relative_to(resolved_root).parts:
-                        current /= component
-                        if current.is_symlink():
-                            errors.append(f"P{version}:{role}:path-alias")
-                            raise ValueError("path alias")
+                    if lexical in seen_paths:
+                        errors.append(f"P{version}:{role}:aliased-path")
+                    seen_paths.add(lexical)
                     info = path.lstat()
                     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
                         errors.append(f"P{version}:{role}:not-private-regular-file")
@@ -525,12 +785,24 @@ def audit_artifact_manifest(manifest: Mapping[str, Any], *, rehash: bool = True)
                     if inode in seen_inodes:
                         errors.append(f"P{version}:{role}:aliased-inode")
                     seen_inodes.add(inode)
+                    if info.st_nlink != 1:
+                        errors.append(f"P{version}:{role}:nlink-not-one")
+                    if not (info.st_mode & 0o111):
+                        errors.append(f"P{version}:{role}:not-executable")
                     if info.st_size != item.get("bytes"):
                         errors.append(f"P{version}:{role}:bytes-changed")
                     if _sha256(path) != item.get("sha256"):
                         errors.append(f"P{version}:{role}:sha256-changed")
-                except (ValueError, OSError):
+                except (ValueError, OSError) as exc:
+                    if str(exc) == "path alias":
+                        errors.append(f"P{version}:{role}:path-alias")
                     errors.append(f"P{version}:{role}:missing-or-deleted")
+    expected_overall = ("READY" if all(
+        isinstance(versions.get(str(version)), Mapping) and
+        versions[str(version)].get("status") == "BOUND"
+        for version in (43, 44, 50)) else "NOT_READY")
+    if isinstance(overall, Mapping) and overall.get("status") != expected_overall:
+        errors.append("overall:status-mismatch")
     return {"schema": AUDIT_SCHEMA, "status": "PASS" if not errors else "FAIL",
             "errors": errors, "overall": manifest.get("overall"),
             "manifest_sha256": supplied_digest}

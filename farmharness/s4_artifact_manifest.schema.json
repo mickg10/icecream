@@ -8,9 +8,23 @@
   "properties": {
     "schema": {"const": "icecream-s4-artifact-manifest-v1"},
     "manifest_version": {"const": 1},
+    "planner": {"$ref": "#/$defs/planner"},
+    "matrix": {"$ref": "#/$defs/matrix"},
+    "versions": {
+      "type": "object", "additionalProperties": false,
+      "required": ["43", "44", "50"],
+      "properties": {
+        "43": {"$ref": "#/$defs/version"},
+        "44": {"$ref": "#/$defs/version"},
+        "50": {"$ref": "#/$defs/version"}
+      }
+    },
+    "overall": {"$ref": "#/$defs/overall"},
+    "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "$defs": {
     "planner": {
-      "type": "object",
-      "additionalProperties": false,
+      "type": "object", "additionalProperties": false,
       "required": ["source_metadata_commit", "runtime_source_commit", "runtime_authority"],
       "properties": {
         "source_metadata_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
@@ -19,8 +33,7 @@
       }
     },
     "matrix": {
-      "type": "object",
-      "additionalProperties": false,
+      "type": "object", "additionalProperties": false,
       "required": ["state_count", "transition_count", "state_space"],
       "properties": {
         "state_count": {"const": 27},
@@ -28,41 +41,134 @@
         "state_space": {"const": "{43,44,50}^3"}
       }
     },
-    "versions": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["43", "44", "50"],
-      "properties": {
-        "43": {"$ref": "#/$defs/version"},
-        "44": {"$ref": "#/$defs/version"},
-        "50": {"$ref": "#/$defs/version"}
-      }
-    },
     "overall": {
-      "type": "object",
-      "additionalProperties": false,
+      "type": "object", "additionalProperties": false,
       "required": ["status", "required_versions"],
       "properties": {
         "status": {"enum": ["READY", "NOT_READY"]},
         "required_versions": {"const": [43, 44, 50]}
       }
     },
-    "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
-  },
-  "$defs": {
+    "source": {
+      "type": "object", "additionalProperties": false,
+      "required": ["commit", "tree"],
+      "properties": {
+        "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "repository": {"type": "string"}
+      }
+    },
+    "build": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source_commit", "source_tree", "authority", "receipt_id"],
+      "properties": {
+        "source_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "source_tree": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "authority": {"enum": ["release-build", "product-runtime"]},
+        "receipt_id": {"type": "string", "minLength": 1},
+        "command": {"type": "string"}
+      }
+    },
+    "protocol": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "text", "version"],
+      "properties": {
+        "path": {"const": "services/comm.h"},
+        "text": {"type": "string", "pattern": "^#define PROTOCOL_VERSION (43|44|50)$"},
+        "version": {"enum": [43, 44, 50]}
+      }
+    },
+    "receipt": {
+      "type": "object", "additionalProperties": false,
+      "required": ["bytes", "sha256", "document"],
+      "properties": {
+        "bytes": {"type": "integer", "minimum": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "document": {"$ref": "#/$defs/receipt_document"}
+      }
+    },
+    "receipt_role": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "bytes", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "bytes": {"type": "integer", "minimum": 0},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "receipt_document": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema", "version", "label", "artifact_root", "source", "build", "protocol_assertion", "roles"],
+      "properties": {
+        "schema": {"const": "icecream-s4-build-receipt-v1"},
+        "version": {"enum": [43, 44, 50]},
+        "label": {"type": "string", "pattern": "^P(43|44|50)$"},
+        "artifact_root": {"type": "string", "minLength": 1},
+        "source": {"$ref": "#/$defs/source"},
+        "build": {"$ref": "#/$defs/build"},
+        "protocol_assertion": {"$ref": "#/$defs/protocol"},
+        "roles": {
+          "type": "object", "additionalProperties": false,
+          "patternProperties": {"^(S|C|F|E|X)$": {"$ref": "#/$defs/receipt_role"}}
+        },
+        "artifact_manifest": {"type": "string", "minLength": 1},
+        "manifest": {"type": "string", "minLength": 1}
+      }
+    },
+    "role": {
+      "type": "object", "additionalProperties": false,
+      "required": ["role", "name", "path", "bytes", "sha256", "executable"],
+      "properties": {
+        "role": {"enum": ["S", "C", "F", "E", "X"]},
+        "name": {"type": "string"},
+        "path": {"type": "string", "minLength": 1},
+        "bytes": {"type": "integer", "minimum": 0},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "executable": {"const": true}
+      }
+    },
+    "completeness": {
+      "type": "object", "additionalProperties": false,
+      "required": ["required", "present", "complete"],
+      "properties": {
+        "required": {"type": "array", "items": {"enum": ["S", "C", "F", "E", "X"]}},
+        "present": {"type": "array", "items": {"enum": ["S", "C", "F", "E", "X"]}},
+        "complete": {"type": "boolean"}
+      }
+    },
+    "missing_role": {
+      "type": "object", "additionalProperties": false,
+      "required": ["role", "status"],
+      "properties": {"role": {"enum": ["S", "C", "F", "E", "X"]}, "status": {"const": "NOT_BOUND"}}
+    },
     "version": {
-      "type": "object",
-      "required": ["status", "version", "label", "role_completeness", "roles", "errors"],
+      "type": "object", "additionalProperties": false,
+      "required": ["status", "version", "label", "artifact_root", "source", "build", "receipt", "protocol_assertion", "role_completeness", "roles", "errors"],
+      "allOf": [
+        {"if": {"properties": {"status": {"const": "BOUND"}}}, "then": {"properties": {
+          "source": {"$ref": "#/$defs/source"},
+          "build": {"$ref": "#/$defs/build"},
+          "receipt": {"$ref": "#/$defs/receipt"},
+          "protocol_assertion": {"$ref": "#/$defs/protocol"}
+        }}},
+        {"if": {"properties": {"version": {"const": 43}}}, "then": {"properties": {"roles": {"required": ["S", "C", "F", "E"], "not": {"required": ["X"]}}}}},
+        {"if": {"properties": {"version": {"const": 44}}}, "then": {"properties": {"roles": {"required": ["S", "C", "F", "E"], "not": {"required": ["X"]}}}}},
+        {"if": {"properties": {"version": {"const": 50}}}, "then": {"properties": {"roles": {"required": ["S", "C", "F", "E", "X"]}}}}
+      ],
       "properties": {
         "status": {"enum": ["BOUND", "NOT_BOUND"]},
         "version": {"enum": [43, 44, 50]},
         "label": {"type": "string", "pattern": "^P(43|44|50)$"},
         "artifact_root": {"type": ["string", "null"]},
-        "source": {"type": "object"},
-        "build": {"type": "object"},
-        "protocol_assertion": {"type": ["object", "null"]},
-        "role_completeness": {"type": "object"},
-        "roles": {"type": "object"},
+        "source": {"anyOf": [{"$ref": "#/$defs/source"}, {"type": "null"}]},
+        "build": {"anyOf": [{"$ref": "#/$defs/build"}, {"type": "null"}]},
+        "receipt": {"anyOf": [{"$ref": "#/$defs/receipt"}, {"type": "null"}]},
+        "protocol_assertion": {"anyOf": [{"$ref": "#/$defs/protocol"}, {"type": "null"}]},
+        "role_completeness": {"$ref": "#/$defs/completeness"},
+        "roles": {
+          "type": "object", "additionalProperties": false,
+          "patternProperties": {"^(S|C|F|E|X)$": {"anyOf": [{"$ref": "#/$defs/role"}, {"$ref": "#/$defs/missing_role"}]}}
+        },
         "errors": {"type": "array", "items": {"type": "string"}}
       }
     }

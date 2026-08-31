@@ -4,12 +4,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import copy
 from pathlib import Path
 
 import pytest
+from jsonschema import Draft202012Validator
 
 from farmharness import s4_artifact_binder as binder
-from farmharness.s4_version_transition_planner import artifact_binding_contract, build_plan
+from farmharness.s4_version_transition_planner import artifact_binding_contract, audit_plan, build_plan
+
+
+def _resign(manifest: dict) -> dict:
+    value = copy.deepcopy(manifest)
+    value.pop("manifest_sha256", None)
+    value["manifest_sha256"] = hashlib.sha256(binder._canonical(value)).hexdigest()
+    return value
 
 
 def _receipt(root: Path, version: int, *, include_x: bool = False,
@@ -71,6 +80,26 @@ def test_p50_requires_product_runtime_authority_and_current_source(tmp_path: Pat
     assert any("planner-source-metadata" in error for error in row["errors"])
 
 
+def test_receipt_requires_protocol_version_authority_and_id(tmp_path: Path) -> None:
+    receipt = _receipt(tmp_path / "p44", 44)
+    receipt["protocol_assertion"].pop("version")
+    assert binder.bind_receipts([receipt])["versions"]["44"]["status"] == "NOT_BOUND"
+    receipt = _receipt(tmp_path / "p44-authority", 44)
+    receipt["build"]["authority"] = "not-authority"
+    assert binder.bind_receipts([receipt])["versions"]["44"]["status"] == "NOT_BOUND"
+    receipt = _receipt(tmp_path / "p44-id", 44)
+    receipt["build"].pop("receipt_id")
+    assert binder.bind_receipts([receipt])["versions"]["44"]["status"] == "NOT_BOUND"
+
+
+def test_unknown_receipt_descriptor_is_rejected(tmp_path: Path) -> None:
+    receipt = _receipt(tmp_path / "p44", 44)
+    receipt["roles"]["S"]["unexpected"] = "ignored?"
+    row = binder.bind_receipts([receipt])["versions"]["44"]
+    assert row["status"] == "NOT_BOUND"
+    assert any("S:descriptor:unknown:unexpected" in error for error in row["errors"])
+
+
 def test_missing_p50_x_is_fail_closed(tmp_path: Path) -> None:
     row = binder.bind_receipts([_receipt(tmp_path / "p50", 50)])["versions"]["50"]
     assert row["status"] == "NOT_BOUND"
@@ -87,6 +116,120 @@ def test_changed_file_fails_manifest_audit(tmp_path: Path) -> None:
     assert any("sha256-changed" in error for error in result["errors"])
 
 
+def test_audit_rechecks_root_privacy_executable_and_nlink(tmp_path: Path) -> None:
+    root = tmp_path / "p44"
+    manifest = binder.bind_receipts([_receipt(root, 44)])
+    root.chmod(0o770)
+    result = binder.audit_artifact_manifest(_resign(manifest))
+    assert any("artifact-root-not-private" in error for error in result["errors"])
+
+    root.chmod(0o700)
+    (root / "client/icecc").chmod(0o400)
+    result = binder.audit_artifact_manifest(_resign(manifest))
+    assert any("C:not-executable" in error for error in result["errors"])
+
+    (root / "client/icecc").chmod(0o500)
+    (root / "client/icecc").unlink()
+    (root / "client/icecc").hardlink_to(root / "scheduler/icecc-scheduler")
+    result = binder.audit_artifact_manifest(_resign(manifest))
+    assert any("C:nlink-not-one" in error or "C:aliased-inode" in error
+               for error in result["errors"])
+
+
+def test_audit_rechecks_p43_retained_hashes(monkeypatch: pytest.MonkeyPatch,
+                                            tmp_path: Path) -> None:
+    receipt = _receipt(tmp_path / "p43", 43)
+    generated = {role: descriptor["sha256"] for role, descriptor in receipt["roles"].items()}
+    monkeypatch.setitem(binder.RETAINED_ROLE_HASHES, "43", generated)
+    manifest = binder.bind_receipts([receipt])
+    manifest["versions"]["43"]["roles"]["S"]["sha256"] = "f" * 64
+    result = binder.audit_artifact_manifest(_resign(manifest), rehash=False)
+    assert result["status"] == "FAIL"
+    assert "P43:S:retained-hash-mismatch" in result["errors"]
+
+
+def test_audit_rechecks_semantic_contracts_after_resign(tmp_path: Path) -> None:
+    manifest = binder.bind_receipts([_receipt(tmp_path / "p44", 44)])
+    for field, expected in (("planner", "contract-mismatch"),
+                            ("matrix", "contract-mismatch")):
+        mutant = copy.deepcopy(manifest)
+        mutant[field][next(iter(mutant[field]))] = "changed"
+        result = binder.audit_artifact_manifest(_resign(mutant), rehash=False)
+        assert expected in " ".join(result["errors"])
+    mutant = copy.deepcopy(manifest)
+    mutant["overall"]["status"] = "READY"
+    result = binder.audit_artifact_manifest(_resign(mutant), rehash=False)
+    assert "overall:status-mismatch" in result["errors"]
+    mutant = copy.deepcopy(manifest)
+    mutant["versions"]["44"]["roles"]["C"]["new"] = True
+    result = binder.audit_artifact_manifest(_resign(mutant), rehash=False)
+    assert any("P44:C:unknown:new" in error for error in result["errors"])
+
+
+def test_audit_requires_receipt_digest_object_and_bound_rows_error_free(tmp_path: Path) -> None:
+    manifest = binder.bind_receipts([_receipt(tmp_path / "p44", 44)])
+    mutant = copy.deepcopy(manifest)
+    mutant["versions"]["44"]["receipt"] = {"bytes": 10, "sha256": "0" * 64}
+    result = binder.audit_artifact_manifest(_resign(mutant), rehash=False)
+    assert result["status"] == "FAIL"
+    assert "P44:receipt-document-invalid" in result["errors"]
+    mutant = copy.deepcopy(manifest)
+    mutant["versions"]["44"]["receipt"]["sha256"] = "0" * 64
+    result = binder.audit_artifact_manifest(_resign(mutant), rehash=False)
+    assert "P44:receipt-digest-mismatch" in result["errors"]
+    mutant = copy.deepcopy(manifest)
+    mutant["versions"]["44"]["receipt"] = {"bytes": 0, "sha256": "0" * 64}
+    result = binder.audit_artifact_manifest(_resign(mutant), rehash=False)
+    assert "P44:receipt-bytes-invalid" in result["errors"]
+    mutant = copy.deepcopy(manifest)
+    mutant["versions"]["44"]["errors"] = ["late-error"]
+    result = binder.audit_artifact_manifest(_resign(mutant), rehash=False)
+    assert "P44:bound-row-has-errors" in result["errors"]
+
+
+def test_planner_audit_rejects_binding_contract_mutation() -> None:
+    mutant = build_plan()
+    mutant["artifact_binding_contract"]["transition_count"] = 728
+    assert audit_plan(mutant)["status"] == "FAIL"
+
+
+def test_manifest_schema_is_strict_and_accepts_emitted_shape(tmp_path: Path) -> None:
+    schema = json.loads(Path(binder.__file__).with_name("s4_artifact_manifest.schema.json").read_text())
+    manifest = binder.bind_receipts([_receipt(tmp_path / "p44", 44)])
+    Draft202012Validator(schema).validate(manifest)
+    mutant = copy.deepcopy(manifest)
+    mutant["unexpected"] = True
+    assert list(Draft202012Validator(schema).iter_errors(mutant))
+
+
+def test_bind_and_audit_reject_ancestor_symlink(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    receipt = _receipt(real, 44)
+    alias = tmp_path / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+    receipt["artifact_root"] = str(alias)
+    row = binder.bind_receipts([receipt])["versions"]["44"]
+    assert row["status"] == "NOT_BOUND"
+    assert any("artifact-root:not-private-directory" in error for error in row["errors"])
+
+    manifest = binder.bind_receipts([_receipt(tmp_path / "audit-root", 44)])
+    old_root = Path(manifest["versions"]["44"]["artifact_root"])
+    moved = tmp_path / "moved-root"
+    old_root.rename(moved)
+    old_root.symlink_to(moved, target_is_directory=True)
+    result = binder.audit_artifact_manifest(_resign(manifest))
+    assert any("P44:artifact-root-invalid" in error for error in result["errors"])
+
+    manifest = binder.bind_receipts([_receipt(tmp_path / "audit-role", 44)])
+    role_root = Path(manifest["versions"]["44"]["artifact_root"])
+    client_dir = role_root / "client"
+    moved_client = tmp_path / "moved-client"
+    client_dir.rename(moved_client)
+    client_dir.symlink_to(moved_client, target_is_directory=True)
+    result = binder.audit_artifact_manifest(_resign(manifest))
+    assert any("P44:C:path-alias" in error for error in result["errors"])
+
+
 def test_symlink_and_role_alias_are_rejected(tmp_path: Path) -> None:
     receipt = _receipt(tmp_path / "p44", 44)
     root = Path(receipt["artifact_root"])
@@ -95,7 +238,7 @@ def test_symlink_and_role_alias_are_rejected(tmp_path: Path) -> None:
     target.symlink_to(root / "scheduler/icecc-scheduler")
     row = binder.bind_receipts([receipt])["versions"]["44"]
     assert row["status"] == "NOT_BOUND"
-    assert any("C:not-private-regular-file" in error for error in row["errors"])
+    assert any("C:path-alias" in error for error in row["errors"])
 
 
 def test_p43_retained_hashes_are_an_explicit_authority(monkeypatch: pytest.MonkeyPatch,
