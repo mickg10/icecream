@@ -15,7 +15,6 @@ test -x "$service" || {
     echo 'FAIL: adapter source gate requires the built service' >&2
     exit 1
 }
-
 grep -F 'outer_current_ready_lease()' "$src" >/dev/null
 grep -F 'outer_prepare_attempt_retirement' "$src" >/dev/null
 grep -F 'launch_identities' "$src" >/dev/null
@@ -50,7 +49,11 @@ if grep -F 'unlink(socket_path_.c_str())' "$src" >/dev/null \
 fi
 
 tmp_root=$(mktemp -d "${TMPDIR:-/tmp}/p50daemonsidecaradapter-source.XXXXXX")
+runtime_roots=
 cleanup() {
+    for runtime_root in $runtime_roots; do
+        rm -rf -- "$runtime_root"
+    done
     rm -rf -- "$tmp_root"
 }
 trap cleanup EXIT HUP INT TERM
@@ -111,6 +114,38 @@ link_binary() {
         ${ICECC_TEST_XXHASH_LIBS:--lxxhash} -o "$binary"
 }
 
+mutant_sidecar_pids() {
+    runtime_root=$1
+    for process_root in /proc/[0-9]*; do
+        process_exe=$(readlink "$process_root/exe" 2>/dev/null) || continue
+        test "$process_exe" = "$service" || continue
+        process_command=$(tr '\000' ' ' <"$process_root/cmdline" 2>/dev/null) || continue
+        case "$process_command" in
+            *" --socket $runtime_root/"*)
+                printf '%s\n' "${process_root##*/}"
+                ;;
+        esac
+    done
+}
+
+retire_mutant_sidecars() {
+    runtime_root=$1
+    sidecar_pids=$(mutant_sidecar_pids "$runtime_root")
+    for sidecar_pid in $sidecar_pids; do
+        kill -TERM "$sidecar_pid" 2>/dev/null
+    done
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        sidecar_pids=$(mutant_sidecar_pids "$runtime_root")
+        test -z "$sidecar_pids" && return 0
+        sleep 0.05
+    done
+    for sidecar_pid in $sidecar_pids; do
+        kill -KILL "$sidecar_pid" 2>/dev/null
+    done
+    sidecar_pids=$(mutant_sidecar_pids "$runtime_root")
+    test -z "$sidecar_pids"
+}
+
 baseline="$tmp_root/baseline"
 link_binary "$production_object" "$baseline"
 ICECC_TEST_CACHE_SERVICE="$service" timeout 60s "$baseline"
@@ -119,21 +154,35 @@ echo 'ok - current-source linked service/SCM_RIGHTS lifecycle baseline passes'
 compile_and_expect_red() {
     label=$1
     mutant=$2
+    expected_status=$3
     object="$tmp_root/$label.o"
     binary="$tmp_root/$label"
     log="$tmp_root/$label.log"
+    # Keep the socket path short enough for sockaddr_un while retaining an
+    # exact, test-owned prefix for detached-child cleanup.
+    runtime_root=$(mktemp -d /tmp/p5m.XXXXXX)
+    runtime_roots="$runtime_roots $runtime_root"
     "$cxx" "$standard" -Wall -Wextra -Werror -pthread -DHAVE_CONFIG_H \
         -I"$top_build" -I"$top_src" -I"$top_src/cache" \
         -I"$top_src/client" -I"$top_src/services" \
         ${ICECC_TEST_CPPFLAGS:-} ${ICECC_TEST_BOOST_CPPFLAGS:-} \
         -c "$mutant" -o "$object"
     link_binary "$object" "$binary"
+    # A rejected mutant can exit before its detached cache-service child.
+    # Retire only the service tied to this mutant's unique runtime root.
     set +e
-    ICECC_TEST_CACHE_SERVICE="$service" timeout 60s "$binary" >"$log" 2>&1
+    TMPDIR="$runtime_root" ICECC_TEST_CACHE_SERVICE="$service" \
+        timeout 60s "$binary" >"$log" 2>&1
     status=$?
+    retire_mutant_sidecars "$runtime_root"
+    cleanup_status=$?
     set -e
-    if test "$status" -eq 0; then
-        echo "FAIL: $label mutant survived the executable lifecycle gate" >&2
+    if test "$cleanup_status" -ne 0; then
+        echo "FAIL: $label mutant left a cache-service child" >&2
+        exit 1
+    fi
+    if test "$status" -ne "$expected_status"; then
+        echo "FAIL: $label mutant returned $status, expected $expected_status" >&2
         cat "$log" >&2
         exit 1
     fi
@@ -147,7 +196,7 @@ cmp -s "$src" "$exact_mode_mutant" && {
     echo 'FAIL: exact-mode mutant was not applied' >&2
     exit 1
 }
-compile_and_expect_red exact-mode "$exact_mode_mutant"
+compile_and_expect_red exact-mode "$exact_mode_mutant" 7
 
 same_identity_mutant="$tmp_root/same-identity.cpp"
 sed 's/config.expected_service_uid != config.expected_daemon_uid ||/false ||/' \
@@ -156,7 +205,7 @@ cmp -s "$src" "$same_identity_mutant" && {
     echo 'FAIL: same-identity mutant was not applied' >&2
     exit 1
 }
-compile_and_expect_red same-identity "$same_identity_mutant"
+compile_and_expect_red same-identity "$same_identity_mutant" 6
 
 runtime_revalidation_mutant="$tmp_root/runtime-revalidation.cpp"
 sed '/bool DaemonSidecarAdapter::runtime_nodes_valid()/! s/runtime_nodes_valid()/true/g' \
@@ -165,7 +214,7 @@ cmp -s "$src" "$runtime_revalidation_mutant" && {
     echo 'FAIL: runtime-revalidation mutant was not applied' >&2
     exit 1
 }
-compile_and_expect_red runtime-revalidation "$runtime_revalidation_mutant"
+compile_and_expect_red runtime-revalidation "$runtime_revalidation_mutant" 14
 
 inode_cleanup_mutant="$tmp_root/inode-cleanup.cpp"
 sed '0,/info.st_ino != expected_inode/s//true/' \
@@ -174,6 +223,6 @@ cmp -s "$src" "$inode_cleanup_mutant" && {
     echo 'FAIL: inode-cleanup mutant was not applied' >&2
     exit 1
 }
-compile_and_expect_red inode-cleanup "$inode_cleanup_mutant"
+compile_and_expect_red inode-cleanup "$inode_cleanup_mutant" 11
 
 echo 'PASS: daemon sidecar adapter production guards and executable mutants hold'
