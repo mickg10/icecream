@@ -598,7 +598,9 @@ def _source_commands(cell_dir: Path, cell: dict[str, str], *, depth: str,
         comparison_argv = [
             python, str((repo / "farmharness/s8_predictive_live_normalizer.py").absolute()),
             "--predictive-manifest", str(predictive_manifest),
-            "--live-manifest", str(live_manifest), "--out", str(records),
+            "--live-manifest", str(live_manifest),
+            "--calibration-metadata-manifest", str(live_target / "experiment_manifest.json"),
+            "--out", str(records),
         ]
         comparison_commands.append(_command_record(
             comparison_argv, repo, stage=stage, executable=live_executable,

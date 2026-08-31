@@ -185,6 +185,9 @@ def test_predictive_campaign_retains_all_cells_commands_hashes_and_summary(tmp_p
             "live_curve_manifest.json")
         assert "/live-output/icecream/" in comparison["argv"][
             comparison["argv"].index("--live-manifest") + 1]
+        assert comparison["argv"][
+            comparison["argv"].index("--calibration-metadata-manifest") + 1
+        ].endswith("/experiment_manifest.json")
         live_argv = commands["live"]["run"]["argv"]
         assert live_argv[live_argv.index("--timestamp") + 1] == "20260829T120000Z"
         assert state["result"]["artifacts"]
@@ -346,6 +349,10 @@ def test_all_mode_commands_are_executable_and_pin_runtime_inputs(tmp_path: Path)
     assert run_argv[run_argv.index("--container-image-id") + 1] == "sha256:" + "a" * 64
     assert run_argv[run_argv.index("--container-temp-root") + 1] == str(tmp_path)
     assert values[3][0]["executable"] is True
+    comparison_argv = [str(item) for item in values[3][0]["argv"]]
+    assert comparison_argv[
+        comparison_argv.index("--calibration-metadata-manifest") + 1
+    ].endswith("/experiment_manifest.json")
 
 
 def test_all_mode_fails_before_campaign_creation_without_live_authority(tmp_path: Path) -> None:

@@ -34,6 +34,13 @@ UNITS = {"point": "step", "channel_bytes": "bytes", "elapsed_ns": "ns"}
 SCHEDULING = {"topology": "C1F1", "assignments": [{"ordinal": 0,
                                                      "global_slot": 0}]}
 COMPARISON = comparison_descriptor("e" * 64, SCHEDULING)
+CALIBRATION_METADATA = {
+    "product_image_digest": "1" * 64,
+    "toolchain_digest": "2" * 64,
+    "output_contract_digest": "3" * 64,
+    "host_digest": "4" * 64,
+    "ordered_input_class": "ordered",
+}
 
 
 def _curve_rows(offset: int = 0) -> list[dict[str, object]]:
@@ -130,6 +137,29 @@ def test_manifest_campaign_identity_mismatch_is_rejected(tmp_path: Path) -> None
                            extra={"topology": "C1F1", "depth_class": "200", "pass_id": "a90"})
     with pytest.raises(NormalizationError, match="manifest_metadata_mismatch:depth_class"):
         normalize(predictive, live, tmp_path / "out.jsonl")
+
+
+def test_live_calibration_authority_fills_trace_free_predictive_metadata(
+        tmp_path: Path) -> None:
+    predictive = _write_manifest(tmp_path, "predictive", "predictive_sim", _curve_rows())
+    live = _write_manifest(tmp_path, "live", "live", _curve_rows(2),
+                           extra=CALIBRATION_METADATA)
+    with pytest.raises(NormalizationError, match="manifest_metadata_mismatch:host_digest"):
+        normalize(predictive, live, tmp_path / "without-authority.jsonl")
+    records = normalize(
+        predictive, live, tmp_path / "with-authority.jsonl",
+        authenticated_metadata=CALIBRATION_METADATA)
+    assert all({field: row[field] for field in CALIBRATION_METADATA} ==
+               CALIBRATION_METADATA for row in records)
+
+
+def test_calibration_authority_rejects_live_metadata_mismatch(tmp_path: Path) -> None:
+    predictive = _write_manifest(tmp_path, "predictive", "predictive_sim", _curve_rows())
+    changed = {**CALIBRATION_METADATA, "host_digest": "5" * 64}
+    live = _write_manifest(tmp_path, "live", "live", _curve_rows(2), extra=changed)
+    with pytest.raises(NormalizationError, match="authority_metadata:mismatch"):
+        normalize(predictive, live, tmp_path / "out.jsonl",
+                  authenticated_metadata=CALIBRATION_METADATA)
 
 
 def test_exact_plan_join_allows_independent_run_and_source_identity(tmp_path: Path) -> None:

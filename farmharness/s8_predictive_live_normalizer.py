@@ -73,6 +73,7 @@ HEX40 = re.compile(r"^[0-9a-fA-F]{40}$")
 SAFE_ID = re.compile(r"^[A-Za-z0-9_.-]+$")
 MAX_MANIFEST_BYTES = 1 * 1024 * 1024
 MAX_CURVE_BYTES = 64 * 1024 * 1024
+LIVE_EXPERIMENT_SCHEMA = "icecream-s8-real-c1f1-live-runner-v2"
 COMPARISON_SCHEMA = "icecream-s8-plan-capture-join-v1"
 PASS_ID = re.compile(r"^[A-Za-z0-9_.:-]+$")
 ORDERED_INPUT_CLASSES = frozenset(("ordered",))
@@ -93,6 +94,16 @@ def _validate_calibration_metadata(value: object,
         raise NormalizationError(f"{label}.ordered_input_class:invalid")
     result["ordered_input_class"] = value["ordered_input_class"]
     return result
+
+
+def load_calibration_metadata_manifest(path: Path) -> dict[str, str]:
+    """Load the measured host/toolchain authority emitted by the live runner."""
+    raw, _facts = _snapshot(path, "calibration_metadata_manifest", MAX_MANIFEST_BYTES)
+    value = parse_json(raw, "calibration_metadata_manifest")
+    if not isinstance(value, dict) or value.get("schema") != LIVE_EXPERIMENT_SCHEMA:
+        raise NormalizationError("calibration_metadata_manifest:schema_invalid")
+    return _validate_calibration_metadata(
+        value.get("calibration_metadata"), "calibration_metadata_manifest.calibration_metadata")
 
 
 def canonical_bytes(value: object) -> bytes:
@@ -679,15 +690,17 @@ def normalize(predictive_manifest: Path, live_manifest: Path, out: Path,
         raise NormalizationError("artifacts_must_use_separate_curves")
     _same_identity(p_identity, l_identity, predictive["comparison"], live["comparison"])
     _same_units(p_units, l_units)
-    _same_metadata(predictive["metadata"], live["metadata"])
     if authenticated_metadata is not None:
         authority_metadata = _validate_calibration_metadata(authenticated_metadata)
         for artifact in (predictive, live):
             metadata = artifact["metadata"]
             assert isinstance(metadata, dict)
-            if metadata and metadata != authority_metadata:
+            declared = {field: metadata[field] for field in CALIBRATION_METADATA_KEYS
+                        if field in metadata}
+            if declared and declared != authority_metadata:
                 raise NormalizationError("authority_metadata:mismatch")
-            artifact["metadata"] = authority_metadata
+            artifact["metadata"] = {**metadata, **authority_metadata}
+    _same_metadata(predictive["metadata"], live["metadata"])
     predictive_record = _normalized_record("predictive_sim", predictive)
     live_record = _normalized_record("live", live)
     comparison_record = _comparison(predictive, live, p_identity, p_units)
@@ -701,9 +714,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--predictive-manifest", type=Path, required=True)
     parser.add_argument("--live-manifest", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--calibration-metadata-manifest", type=Path)
     args = parser.parse_args(argv)
     try:
-        normalize(args.predictive_manifest.absolute(), args.live_manifest.absolute(), args.out.absolute())
+        metadata = (load_calibration_metadata_manifest(
+            args.calibration_metadata_manifest.absolute())
+                    if args.calibration_metadata_manifest is not None else None)
+        normalize(args.predictive_manifest.absolute(), args.live_manifest.absolute(),
+                  args.out.absolute(), authenticated_metadata=metadata)
     except NormalizationError as exc:
         print(f"s8_predictive_live_normalizer: {exc}", file=sys.stderr)
         return 1
