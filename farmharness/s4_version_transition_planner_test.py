@@ -76,11 +76,36 @@ class S4VersionTransitionPlannerTest(unittest.TestCase):
         self.assertEqual(contract["orders"], ["AB", "BA"])
         self.assertTrue(contract["counterbalanced"])
         self.assertEqual(len(contract["measurement_cells"]), 128)
+        self.assertEqual(contract["comparison_block_count"], 128)
+        self.assertEqual(contract["execution_run_count"], 256)
         self.assertEqual(set(arms for arms in self.plan["performance_arms"] if arms.startswith("p50_")),
                          {"p50_raw_ii_whole_legacy", "p50_zstd_tu", "p50_zstd_route", "p50_p29", "p50_grz"})
         self.assertTrue(all(item["state"] == "s50-c50-f50" and
                             item["byte_identical_required"]
                             for item in contract["measurement_cells"]))
+        block = contract["measurement_cells"][0]
+        self.assertEqual([arm["method"] for arm in block["AB"]], ["RAW_II", block["method"]])
+        self.assertEqual([arm["method"] for arm in block["BA"]], [block["method"], "RAW_II"])
+
+    def test_version_cost_blocks_are_explicit_and_cache_free(self) -> None:
+        contract = self.plan["homogeneous_version_comparison_contract"]
+        self.assertEqual(contract["comparison_block_count"], 64)
+        self.assertEqual(contract["execution_run_count"], 128)
+        self.assertEqual(contract["pairs"], [
+            "P43_WHOLE_LEGACY_vs_P50_RAW_II",
+            "P44_WHOLE_LEGACY_vs_P50_RAW_II",
+        ])
+        self.assertTrue(contract["counterbalanced"])
+        self.assertTrue(contract["no_cache"])
+        for block in contract["blocks"]:
+            self.assertEqual(len(block["AB"]), 2)
+            self.assertEqual(len(block["BA"]), 2)
+            self.assertFalse(block["cache_expected"])
+            self.assertTrue(block["byte_identical_required"])
+            self.assertEqual(block["AB"][0]["method"], "WHOLE_LEGACY")
+            self.assertEqual(block["AB"][1]["method"], "RAW_II")
+            self.assertEqual(block["BA"][0]["method"], "RAW_II")
+            self.assertEqual(block["BA"][1]["method"], "WHOLE_LEGACY")
 
     def test_each_baseline_has_six_upgrade_and_downgrade_orders(self) -> None:
         self.assertEqual({key: len(value) for key, value in self.plan["upgrade_orders"].items()},
@@ -110,6 +135,20 @@ class S4VersionTransitionPlannerTest(unittest.TestCase):
         row["cache_expected"] = False
         self.assertEqual(audit_plan(mutant)["status"], "FAIL")
 
+    def test_auditor_rejects_missing_or_reordered_baseline_arm(self) -> None:
+        for mutation in ("missing", "reordered"):
+            mutant = json.loads(json.dumps(self.plan))
+            block = mutant["execution_measurement_contract"]["measurement_cells"][0]
+            if mutation == "missing":
+                del block["BA"]
+            else:
+                block["AB"].reverse()
+            self.assertEqual(audit_plan(mutant)["status"], "FAIL", mutation)
+        mutant = json.loads(json.dumps(self.plan))
+        block = mutant["homogeneous_version_comparison_contract"]["blocks"][0]
+        block["BA"].reverse()
+        self.assertEqual(audit_plan(mutant)["status"], "FAIL")
+
     def test_cli_is_non_executing_and_emits_json(self) -> None:
         script = Path(__file__).with_name("s4_version_transition_planner.py")
         completed = subprocess.run([sys.executable, str(script), "--summary"],
@@ -118,6 +157,8 @@ class S4VersionTransitionPlannerTest(unittest.TestCase):
         self.assertEqual(summary["status"], "PASS")
         self.assertEqual(summary["state_count"], 27)
         self.assertEqual(summary["transition_count"], 729)
+        self.assertEqual(summary["comparison_block_count"], 128)
+        self.assertEqual(summary["execution_run_count"], 256)
 
 
 if __name__ == "__main__":

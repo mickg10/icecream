@@ -318,6 +318,15 @@ def _migration_orders(lower: int, upper: int, direction: str) -> list[dict[str, 
 
 def _measurement_contract() -> dict[str, Any]:
     """Return the frozen dimensions for each required P50 method arm."""
+    def arm(method: str, mode: str, *, cache_expected: bool) -> dict[str, Any]:
+        return {
+            "name": "P50_RAW_II" if method == "RAW_II" else f"P50_{method}",
+            "artifact_version": 50, "artifact": "P50",
+            "state": "s50-c50-f50", "method": method, "mode": mode,
+            "cache_expected": cache_expected, "cache_disabled": not cache_expected,
+            "byte_identical_required": True,
+        }
+
     cells = [
         {
             "id": f"p50-{method.lower()}-{depth}-{topology['id']}-{regime}-{order}",
@@ -326,6 +335,12 @@ def _measurement_contract() -> dict[str, Any]:
             "order": order, "counterbalanced_pair": f"{method}/{depth}/{topology['id']}/{regime}",
             "cache_expected": True, "remote_compile_required": True,
             "byte_identical_required": True,
+            # Both orderings are retained on every block so a consumer cannot
+            # accidentally turn an AB/BA label into a single-arm run.
+            "AB": [arm("RAW_II", "whole-legacy", cache_expected=False),
+                   arm(method, "current", cache_expected=True)],
+            "BA": [arm(method, "current", cache_expected=True),
+                   arm("RAW_II", "whole-legacy", cache_expected=False)],
         }
         for method in P50_METHODS
         for depth in P50_DEPTHS
@@ -350,12 +365,64 @@ def _measurement_contract() -> dict[str, Any]:
             "failed_or_censored_rows_retained": True,
         },
         "measurement_cells": cells,
+        "comparison_block_count": len(cells),
+        "execution_run_count": len(cells) * 2,
         "measurement_cell_count": len(cells),
         "execution": {
             "planned_only": True,
             "runner": "later S4/S5 bound runner",
             "preparation_outside_measurement": True,
             "no_mixed_version_performance": True,
+        },
+    }
+
+
+def _version_comparison_contract() -> dict[str, Any]:
+    """Build mandatory old-version-vs-P50 RAW_II comparison blocks."""
+    def arm(version: int, artifact: str) -> dict[str, Any]:
+        return {
+            "name": f"P{version}_WHOLE_LEGACY" if version != 50 else "P50_RAW_II",
+            "artifact_version": version, "artifact": artifact,
+            "state": f"s{version}-c{version}-f{version}",
+            "method": "WHOLE_LEGACY" if version != 50 else "RAW_II",
+            "mode": "legacy", "cache_expected": False, "cache_disabled": True,
+            "byte_identical_required": True,
+        }
+
+    blocks: list[dict[str, Any]] = []
+    for old_version in (43, 44):
+        for depth in P50_DEPTHS:
+            for topology in P50_TOPOLOGIES:
+                for regime in P50_REGIMES:
+                    for order in P50_ORDERS:
+                        old = arm(old_version, f"P{old_version}")
+                        current = arm(50, "P50")
+                        blocks.append({
+                            "id": f"p{old_version}-vs-p50-raw-ii-{depth}-{topology['id']}-{regime}-{order}",
+                            "comparison_pair": f"P{old_version}_WHOLE_LEGACY_vs_P50_RAW_II",
+                            "old_version": old_version, "state": f"s{old_version}-vs-s50",
+                            "depth": depth, "topology": topology["id"], "regime": regime,
+                            "order": order,
+                            "AB": [old, current], "BA": [current, old],
+                            "cache_expected": False, "p50_cache_traffic": "zero-required",
+                            "byte_identical_required": True,
+                        })
+    return {
+        "scope": "homogeneous version cost only",
+        "pairs": ["P43_WHOLE_LEGACY_vs_P50_RAW_II", "P44_WHOLE_LEGACY_vs_P50_RAW_II"],
+        "depths": list(P50_DEPTHS),
+        "topologies": [dict(topology) for topology in P50_TOPOLOGIES],
+        "regimes": list(P50_REGIMES), "orders": list(P50_ORDERS),
+        "counterbalanced": True,
+        "no_cache": True,
+        "blocks": blocks,
+        "comparison_block_count": len(blocks),
+        "execution_run_count": len(blocks) * 2,
+        "output_contract": {"byte_identical": True},
+        "optional_diagnostic": {
+            "pair": "P43_WHOLE_LEGACY_vs_P44_WHOLE_LEGACY",
+            "required": False, "accepted": False,
+            "reason": "optional diagnostic; no additional mandatory cost",
         },
     }
 
@@ -404,8 +471,9 @@ def build_plan() -> dict[str, Any]:
             "cache_disabled": False,
             "artifact_requirement": "exact current P50 binaries and cache service",
             "measurement_contract": "execution_measurement_contract",
-        }
+    }
     measurement_contract = _measurement_contract()
+    version_comparison_contract = _version_comparison_contract()
     return {
         "schema": SCHEMA,
         "source": {"integration_head": P50_SOURCE_SHA, "harness": HARNESS_INVENTORY},
@@ -430,6 +498,7 @@ def build_plan() -> dict[str, Any]:
         },
         "performance_arms": performance_arms,
         "execution_measurement_contract": measurement_contract,
+        "homogeneous_version_comparison_contract": version_comparison_contract,
         "optional_unaccepted_method_extras": OPTIONAL_UNACCEPTED_METHOD_EXTRAS,
         "mixed_version_performance": "forbidden-correctness-only",
         "upgrade_orders": upgrade_orders,
@@ -607,8 +676,71 @@ def audit_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
             errors.append(f"measurement-state:{item.get('id')}")
         if item.get("remote_compile_required") is not True or item.get("byte_identical_required") is not True:
             errors.append(f"measurement-byte-exact:{item.get('id')}")
+        def arm_signature(value: object) -> tuple[object, ...] | None:
+            if not isinstance(value, Mapping):
+                return None
+            return (value.get("name"), value.get("artifact_version"), value.get("artifact"),
+                    value.get("state"), value.get("method"), value.get("mode"),
+                    value.get("cache_expected"), value.get("cache_disabled"))
+        raw_signature = ("P50_RAW_II", 50, "P50", "s50-c50-f50", "RAW_II", "whole-legacy", False, True)
+        method_signature = (f"P50_{item.get('method')}", 50, "P50", "s50-c50-f50", item.get("method"), "current", True, False)
+        ab = item.get("AB")
+        ba = item.get("BA")
+        if (not isinstance(ab, list) or not isinstance(ba, list) or len(ab) != 2 or len(ba) != 2 or
+                tuple(arm_signature(part) for part in ab) != (raw_signature, method_signature) or
+                tuple(arm_signature(part) for part in ba) != (method_signature, raw_signature)):
+            errors.append(f"measurement-counterbalanced-arms:{item.get('id')}")
     if observed_measurements != expected_measurements:
         errors.append("measurement-grid-mismatch")
+    if contract.get("comparison_block_count") != 128 or contract.get("execution_run_count") != 256:
+        errors.append("measurement-run-count")
+
+    version_contract = plan.get("homogeneous_version_comparison_contract")
+    if not isinstance(version_contract, Mapping):
+        errors.append("version-comparison-contract-missing")
+        version_contract = {}
+    version_blocks = version_contract.get("blocks", ())
+    if (version_contract.get("comparison_block_count") != 64 or
+            version_contract.get("execution_run_count") != 128 or
+            version_contract.get("counterbalanced") is not True or
+            version_contract.get("no_cache") is not True):
+        errors.append("version-comparison-contract-count-or-policy")
+    expected_version_keys = {
+        (old, depth, topology["id"], regime, order)
+        for old in (43, 44) for depth in P50_DEPTHS
+        for topology in P50_TOPOLOGIES for regime in P50_REGIMES
+        for order in P50_ORDERS
+    }
+    observed_version_keys: set[tuple[object, ...]] = set()
+    if not isinstance(version_blocks, list) or len(version_blocks) != 64:
+        errors.append("version-comparison-block-count")
+        version_blocks = []
+    for item in version_blocks:
+        if not isinstance(item, Mapping):
+            errors.append("version-comparison-block-not-object")
+            continue
+        key = (item.get("old_version"), item.get("depth"), item.get("topology"),
+               item.get("regime"), item.get("order"))
+        observed_version_keys.add(key)
+        old = item.get("old_version")
+        old_signature = (f"P{old}_WHOLE_LEGACY", old, f"P{old}", f"s{old}-c{old}-f{old}", "WHOLE_LEGACY", "legacy", False, True)
+        p50_signature = ("P50_RAW_II", 50, "P50", "s50-c50-f50", "RAW_II", "legacy", False, True)
+        def vsignature(value: object) -> tuple[object, ...] | None:
+            if not isinstance(value, Mapping):
+                return None
+            return (value.get("name"), value.get("artifact_version"), value.get("artifact"),
+                    value.get("state"), value.get("method"), value.get("mode"),
+                    value.get("cache_expected"), value.get("cache_disabled"))
+        ab, ba = item.get("AB"), item.get("BA")
+        if (old not in (43, 44) or item.get("cache_expected") is not False or
+                item.get("p50_cache_traffic") != "zero-required" or
+                item.get("byte_identical_required") is not True or
+                not isinstance(ab, list) or not isinstance(ba, list) or len(ab) != 2 or len(ba) != 2 or
+                tuple(vsignature(part) for part in ab) != (old_signature, p50_signature) or
+                tuple(vsignature(part) for part in ba) != (p50_signature, old_signature)):
+            errors.append(f"version-comparison-arms:{item.get('id')}")
+    if observed_version_keys != expected_version_keys:
+        errors.append("version-comparison-grid-mismatch")
 
     extras = plan.get("boundary_extras", ())
     for version in BOUNDARY_VERSIONS:
@@ -628,6 +760,10 @@ def audit_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
         "downgrade_order_counts": {key: len(plan.get("downgrade_orders", {}).get(key, ())) for key in ("50_to_43", "50_to_44")},
         "performance_arm_count": len(arms),
         "p50_measurement_count": len(measurements),
+        "comparison_block_count": len(measurements),
+        "execution_run_count": len(measurements) * 2,
+        "version_comparison_block_count": len(version_blocks),
+        "version_comparison_execution_run_count": len(version_blocks) * 2,
     }
 
 
