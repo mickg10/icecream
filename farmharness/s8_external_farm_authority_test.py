@@ -119,6 +119,15 @@ def test_remote_capture_trims_cpuinfo_key_whitespace() -> None:
     assert 'tolower(key)=="model name"' in authority.REMOTE_CAPTURE_SCRIPT
 
 
+def test_remote_capture_counts_cpu_fields_and_queries_image_fields_separately() -> None:
+    assert 'n=split(a,y," ")' in authority.REMOTE_CAPTURE_SCRIPT
+    assert 'for(i=2;i<=n;i++)' in authority.REMOTE_CAPTURE_SCRIPT
+    assert 'if(total<=0) exit 1' in authority.REMOTE_CAPTURE_SCRIPT
+    assert "image_json=" not in authority.REMOTE_CAPTURE_SCRIPT
+    for field in ("Id", "Os", "Architecture", "Created"):
+        assert f"--format '{{{{.{field}}}}}'" in authority.REMOTE_CAPTURE_SCRIPT
+
+
 def test_dry_run_does_not_capture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     root = _root(tmp_path)
     monkeypatch.setattr(authority, "final_head_source_identity", lambda _root: {"commit": "a" * 40, "tree": "b" * 40})

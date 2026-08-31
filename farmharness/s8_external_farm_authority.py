@@ -322,11 +322,13 @@ model_raw=$(awk -F: '{key=$1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", key); if(t
 vendor=$(printf '%s' "$vendor_raw" | sha256sum | awk '{print $1}')
 model=$(printf '%s' "$model_raw" | sha256sum | awk '{print $1}')
 before=$(awk '/^cpu / {print; exit}' /proc/stat); started=$(date +%s%N); sleep 1; after=$(awk '/^cpu / {print; exit}' /proc/stat); ended=$(date +%s%N)
-idle=$(awk -v b="$before" -v a="$after" 'BEGIN {split(b,x," "); split(a,y," "); total=0; for(i=2;i<=NF;i++) total+=y[i]-x[i]; print (100*(y[5]-x[5])/total)}')
+idle=$(awk -v b="$before" -v a="$after" 'BEGIN {split(b,x," "); n=split(a,y," "); total=0; for(i=2;i<=n;i++) total+=y[i]-x[i]; if(total<=0) exit 1; print (100*(y[5]-x[5])/total)}')
 duration=$(awk -v a="$started" -v b="$ended" 'BEGIN {print (b-a)/1000000000}')
 baseline=$(ps -eo pid=,ppid=,comm=,stat=,etimes= --sort=pid | sha256sum | awk '{print $1}')
-image_json=$(docker image inspect --format '{{.Id}}\t{{.Os}}\t{{.Architecture}}\t{{.Created}}' "$image")
-image_id=$(printf '%s' "$image_json" | cut -f1); image_os=$(printf '%s' "$image_json" | cut -f2); image_arch=$(printf '%s' "$image_json" | cut -f3); image_created=$(printf '%s' "$image_json" | cut -f4)
+image_id=$(docker image inspect --format '{{.Id}}' "$image")
+image_os=$(docker image inspect --format '{{.Os}}' "$image")
+image_arch=$(docker image inspect --format '{{.Architecture}}' "$image")
+image_created=$(docker image inspect --format '{{.Created}}' "$image")
 printf 'S8_SCHEMA=%s\nS8_HOSTNAME=%s\nS8_MACHINE=%s\nS8_BOOT=%s\nS8_NIC=%s\nS8_VENDOR=%s\nS8_MODEL=%s\nS8_CPU=%s\nS8_IMAGE_ID=%s\nS8_IMAGE_OS=%s\nS8_IMAGE_ARCH=%s\nS8_IMAGE_CREATED=%s\nS8_LOAD=%s\nS8_CAPTURED_AT=%s\nS8_BASELINE=%s\nS8_SAMPLE_BEFORE=%s\nS8_SAMPLE_AFTER=%s\nS8_SAMPLE_DURATION=%s\nS8_SAMPLE_IDLE=%s\n' 'icecream-s8-external-host-capture-v1' "$(hostname)" "$machine" "$boot" "$nic" "$vendor" "$model" "$(nproc)" "$image_id" "$image_os" "$image_arch" "$image_created" "$(cut -d' ' -f1 /proc/loadavg)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$baseline" "$before" "$after" "$duration" "$idle"
 for rel in scheduler/icecc-scheduler daemon/iceccd client/icecc client/icecc-create-env cache/icecc-cache-service; do printf 'S8_BIN_%s=%s\n' "$rel" "$(sha256sum "$root/$rel" | awk '{print $1}')"; done
 '''
