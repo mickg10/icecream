@@ -69,6 +69,17 @@ TerminalResidualCore ==
     /\ Core!DuplicateTerminalObservation
     /\ UNCHANGED owner
 
+FinalCancelledResetRequiredState ==
+    /\ owner.phase = "closed"
+    /\ owner.stage = "cancelled"
+    /\ core.epoch = 1
+    /\ core.phase = "reset-required"
+    /\ core.resetRequired
+
+FinalCancelledResetQuiescence ==
+    /\ FinalCancelledResetRequiredState
+    /\ UNCHANGED vars
+
 (***************************************************************************
  Core-only transport/codec steps never change owner state.  The core's
  TransportNext deliberately excludes context loss and reset completion:
@@ -77,6 +88,12 @@ TerminalResidualCore ==
 ***************************************************************************)
 CoreIndependent ==
     /\ ~CompositionTerminal
+    \* At the bounded final epoch, owner cancellation is already the
+    \* terminal operation outcome.  Do not let an independent core turn that
+    \* outcome into ClassifyFault (or any other transport step) while the
+    \* route is still reset-required.  Non-final epochs retain their ordinary
+    \* classify -> offer -> ack -> reset-commit path below.
+    /\ ~FinalCancelledResetRequiredState
     /\ Core!TransportNext
     /\ UNCHANGED owner
 
@@ -204,6 +221,7 @@ CompositionNext ==
     CompositionCoreNext
     \/ TerminalStutter
     \/ TerminalFailureStutter
+    \/ FinalCancelledResetQuiescence
 
 CompositionBaseSpec ==
     CompositionInit
@@ -806,6 +824,7 @@ ContextLossWitnessReached ==
 
 WitnessClassifyCancelled ==
     /\ owner.stage = "cancelled"
+    /\ core.epoch = 0
     /\ Core!ClassifyFault
     /\ UNCHANGED owner
 
@@ -884,6 +903,86 @@ CancelResetReuseWitnessReached ==
          /\ Cardinality(owner.durableBundles) = 2
          /\ Cardinality(owner.consumedPermits) = 2
          /\ Cardinality(owner.readyEventIds) = 2 )
+
+(***************************************************************************
+ Epoch-one cancel regression.  This reuses the real T0 cancel/reset path,
+ then starts the fresh epoch-one TU and cancels it after materialization.  The
+ final reset-required state must remain quiescent: CoreIndependent must not
+ classify it into terminal-failure while the owner is cancelled.
+***************************************************************************)
+FinalCancelFreshStart ==
+    /\ core.epoch = 1
+    /\ core.nextIndex = 1
+    /\ core.phase = "aligned"
+    /\ owner.phase = "closed"
+    /\ owner.stage = "receiving"
+    /\ Core!StartTU
+    /\ UNCHANGED owner
+
+FinalCancelFreshCoreProgress ==
+    /\ core.epoch = 1
+    /\ core.nextIndex = 1
+    /\ ( \/ TerminalWitnessCCodecTouch
+         \/ TerminalWitnessCCodecReturn
+         \/ TerminalWitnessCWriterTick
+         \/ TerminalWitnessFReaderTick
+         \/ TerminalWitnessBodyComplete
+         \/ TerminalWitnessFLease
+         \/ TerminalWitnessFCodecTouch
+         \/ TerminalWitnessFCodecReturn
+         \/ TerminalWitnessMaterialize )
+    /\ UNCHANGED owner
+
+FinalCancelObserve ==
+    /\ core.epoch = 1
+    /\ core.nextIndex = 1
+    /\ ObservePreparedSync
+
+FinalCancelAfterTouch ==
+    /\ core.epoch = 1
+    /\ core.nextIndex = 1
+    /\ CancelAfterTouchSync
+
+FinalCancelResetPrefixNext ==
+    WitnessCoreHappy
+    \/ WitnessObserve
+    \/ WitnessT0Select
+    \/ WitnessT0Commit
+    \/ WitnessT0Close
+    \/ WitnessT1Cancel
+    \/ WitnessClassifyCancelled
+    \/ WitnessResetOfferCancelled
+    \/ WitnessResetAckCancelled
+    \/ WitnessResetCommitAndRetire
+
+FinalCancelWitnessNext ==
+    FinalCancelResetPrefixNext
+    \/ FinalCancelFreshStart
+    \/ FinalCancelFreshCoreProgress
+    \/ FinalCancelObserve
+    \/ FinalCancelAfterTouch
+    \/ FinalCancelledResetQuiescence
+
+FinalCancelWitnessSpec ==
+    CompositionInit
+    /\ [][FinalCancelWitnessNext]_vars
+    /\ WitnessNormalCoreFairness
+    /\ WF_vars(WitnessObserve)
+    /\ WF_vars(WitnessT0Select)
+    /\ WF_vars(WitnessT0Commit)
+    /\ WF_vars(WitnessT0Close)
+    /\ WF_vars(WitnessT1Cancel)
+    /\ WF_vars(WitnessClassifyCancelled)
+    /\ WF_vars(WitnessResetOfferCancelled)
+    /\ WF_vars(WitnessResetAckCancelled)
+    /\ WF_vars(WitnessResetCommitAndRetire)
+    /\ WF_vars(FinalCancelFreshStart)
+    /\ WF_vars(FinalCancelFreshCoreProgress)
+    /\ WF_vars(FinalCancelObserve)
+    /\ WF_vars(FinalCancelAfterTouch)
+
+FinalCancelWitnessReached ==
+    <> FinalCancelledResetRequiredState
 
 CommitWitnessNext ==
     WitnessCoreHappy

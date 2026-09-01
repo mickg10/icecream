@@ -41,3 +41,15 @@ the missing formal assets needed to reproduce and review the named rows on
 this exact b702 branch. Accepted ZSTD_ROUTE semantics remain one
 long-distance state stream per C-F relationship, with tentative per-TU state
 promoted only by its matching commit and exact retry/reset behavior.
+
+## Review-only model correction
+
+This branch adds a narrow composition-model correction after the correspondence
+audit: `CoreIndependent` is disabled for an owner-cancelled final-epoch route
+in `reset-required`; `FinalCancelledResetQuiescence` keeps that cancellation
+outcome quiescent. Non-final cancellation still uses the existing explicit
+`ClassifyFault -> ResetOffer -> ResetAck -> ResetCommitAfterOwnerCancel` path.
+The invariant `TouchedCancelRequiresReset` and all production sources remain
+unchanged. `Protocol50ZstdRouteFInputCompositionFinalCancel.cfg` is a focused
+epoch-one regression for this correction. This is review-pending
+formal-model evidence, not a production acceptance claim.
