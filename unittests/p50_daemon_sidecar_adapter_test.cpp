@@ -4,6 +4,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <poll.h>
 #include <string>
@@ -122,6 +123,24 @@ bool drive_shutdown(DaemonSidecarAdapter& adapter,
     });
 }
 
+// The source gate can hold the first authenticated sidecar at this exact
+// READY edge while it records the independently-owned process.  This is a
+// bounded test-only rendezvous; production code has no corresponding wait.
+bool hold_after_ready()
+{
+    const char* path = std::getenv("ICECC_P50_TEST_READY_HOLD");
+    if (path == nullptr || *path == '\0')
+        return true;
+    FILE* marker = std::fopen(path, "w");
+    if (marker == nullptr)
+        return false;
+    std::fprintf(marker, "pid=%lld\n", static_cast<long long>(::getpid()));
+    std::fclose(marker);
+    for (int i = 0; i < 5000 && ::access(path, F_OK) == 0; ++i)
+        ::usleep(1000);
+    return ::access(path, F_OK) != 0;
+}
+
 } // namespace
 
 int main()
@@ -193,6 +212,8 @@ int main()
             std::chrono::steady_clock::time_point{} ||
         adapter.outer_immediate_turn_required())
         return 26;
+    if (!hold_after_ready())
+        return 27;
 
     const pid_t first_pid = adapter.outer_child_pid();
     const std::string first_path = adapter.socket_path();

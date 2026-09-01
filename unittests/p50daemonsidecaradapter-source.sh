@@ -138,20 +138,36 @@ proc_starttime() {
 
 mutant_sidecar_records() {
     runtime_root=$1
+    if test -n "${interruption_ready_trace:-}" && \
+            test -s "$interruption_ready_trace"; then
+        process_pid=$(sed -n 's/.* pid=\([0-9][0-9]*\) .*/\1/p' \
+            "$interruption_ready_trace" | tail -1)
+        if test -n "$process_pid"; then
+            mutant_sidecar_record_for_pid "$runtime_root" "$process_pid" && return 0
+        fi
+    fi
     for process_root in /proc/[0-9]*; do
         process_pid=${process_root##*/}
-        process_exe=$(readlink "$process_root/exe" 2>/dev/null) || continue
-        test "$process_exe" = "$service" || continue
-        process_command=$(tr '\000' ' ' <"$process_root/cmdline" 2>/dev/null) || continue
-        case "$process_command" in *" --socket "*) ;; *) continue ;; esac
-        process_socket=$(printf '%s\n' "$process_command" |
-            sed -n 's/.* --socket \([^ ]*\).*/\1/p')
-        case "$process_socket" in "$runtime_root"/*) ;; *) continue ;; esac
-        process_socket_identity=$(stat -Lc '%d:%i' "$process_socket" 2>/dev/null) || continue
-        process_starttime=$(proc_starttime "$process_pid") || continue
-        printf '%s|%s|%s|%s|%s\n' "$process_pid" "$process_starttime" \
-            "$process_exe" "$process_socket_identity" "$process_socket"
+        mutant_sidecar_record_for_pid "$runtime_root" "$process_pid" || continue
     done
+}
+
+mutant_sidecar_record_for_pid() {
+    runtime_root=$1
+    process_pid=$2
+    process_root=/proc/$process_pid
+    test -d "$process_root" || return 1
+    process_exe=$(readlink "$process_root/exe" 2>/dev/null) || return 1
+    test "$process_exe" = "$service" || return 1
+    process_command=$(tr '\000' ' ' <"$process_root/cmdline" 2>/dev/null) || return 1
+    case "$process_command" in *" --socket "*) ;; *) return 1 ;; esac
+    process_socket=$(printf '%s\n' "$process_command" |
+        sed -n 's/.* --socket \([^ ]*\).*/\1/p')
+    case "$process_socket" in "$runtime_root"/*) ;; *) return 1 ;; esac
+    process_socket_identity=$(stat -Lc '%d:%i' "$process_socket" 2>/dev/null) || return 1
+    process_starttime=$(proc_starttime "$process_pid") || return 1
+    printf '%s|%s|%s|%s|%s\n' "$process_pid" "$process_starttime" \
+        "$process_exe" "$process_socket_identity" "$process_socket"
 }
 
 sidecar_record_matches() {
@@ -224,6 +240,7 @@ interruption_runtime_root=$(mktemp -d /tmp/p5i.XXXXXX)
 runtime_roots="$runtime_roots $interruption_runtime_root"
 interruption_log="$tmp_root/interruption.log"
 interruption_ready_trace="$tmp_root/interruption.ready"
+interruption_ready_hold="$tmp_root/interruption.hold"
 interruption_abort_trace="$tmp_root/interruption.abort"
 (
     interruption_child_pid=
@@ -255,10 +272,15 @@ interruption_abort_trace="$tmp_root/interruption.abort"
     }
     trap interruption_cleanup HUP INT TERM
     ICECC_P50_C1F1_REQUIRED=1 ICECC_P50_TEST_READY_TRACE="$interruption_ready_trace" \
+        ICECC_P50_TEST_READY_HOLD="$interruption_ready_hold" \
         TMPDIR="$interruption_runtime_root" ICECC_TEST_CACHE_SERVICE="$service" \
         "$baseline" >"$interruption_log" 2>&1 &
     interruption_child_pid=$!
     while ! test -s "$interruption_ready_trace"; do
+        kill -0 "$interruption_child_pid" 2>/dev/null || exit 1
+        sleep 0.01
+    done
+    while ! test -s "$interruption_ready_hold"; do
         kill -0 "$interruption_child_pid" 2>/dev/null || exit 1
         sleep 0.01
     done
@@ -268,11 +290,10 @@ interruption_abort_trace="$tmp_root/interruption.abort"
         sleep 0.05
         interruption_sidecar_wait=$((interruption_sidecar_wait + 1))
     done
-    test -n "$(mutant_sidecar_pids "$interruption_runtime_root")" || exit 1
-    # Freeze the exact baseline only after the sidecar record is observable;
-    # this makes the parent's interruption edge deterministic without racing
-    # service startup.
-    kill -STOP "$interruption_child_pid"
+    if test -z "$(mutant_sidecar_pids "$interruption_runtime_root")"; then
+        stop_interruption_child
+        exit 1
+    fi
     # Hold the baseline at the authenticated READY edge until the parent has
     # observed the exact sidecar record.  The parent then requests the
     # interruption, so the sidecar cannot disappear before ownership polling
