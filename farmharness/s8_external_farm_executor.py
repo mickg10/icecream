@@ -1033,6 +1033,8 @@ class SSHTransport:
         s2_process_loss = "ICECC_P50_S2_PROCESS_LOSS=1" in batch_command
         if s2_process_loss and (topology != "C1F1/100000" or profile == "RAW_II"):
             raise ExternalFarmError("s2_process_loss:requires_cached_c1f1")
+        if s2_process_loss and list(relationship_hosts) != ["q2"]:
+            raise ExternalFarmError("s2_process_loss:requires_q2_f")
         # Preserve s4's private evidence-root validation; external roots must
         # use its accepted unique naming convention.
         nonce = f"{os.getpid()}{time.monotonic_ns()}"
@@ -1396,17 +1398,21 @@ current_ready=$(grep '^READY v2 ' "$ready" | tail -1)
 before_pid=$(field "$before_ready" pid)
 after_pid=$(field "$after_ready" pid)
 current_pid=$(field "$current_ready" pid)
+after_c_guid=$(field "$after_ready" C_STORE_GUID)
+after_f_guid=$(field "$after_ready" F_STORE_GUID)
+current_c_guid=$(field "$current_ready" C_STORE_GUID)
+current_f_guid=$(field "$current_ready" F_STORE_GUID)
 parent_pid=$(tr -d '[:space:]' <{worker_root}/s2-parent.pid)
 test "$current_pid" = "$after_pid"
+test "$current_c_guid" = "$after_c_guid"
+test "$current_f_guid" = "$after_f_guid"
 current_parent_pid=$(docker exec "$container_id" cat "/proc/$current_pid/status" | awk '/^PPid:/ {{print $2}}')
 test "$current_parent_pid" = "$parent_pid"
 docker exec --user 0 "$container_id" /bin/sh -c {shlex.quote(sidecar_kill_inner)} p50-sidecar-validate "$current_pid" F /probe/work/cache-runtime-f-{relationship} validate >/dev/null
 tx_count=$(grep -c '"action":"TX_BEGIN","actor":"F"' "$trace")
 test "$tx_count" -ge 2
 before_c_guid=$(field "$before_ready" C_STORE_GUID)
-after_c_guid=$(field "$after_ready" C_STORE_GUID)
 before_f_guid=$(field "$before_ready" F_STORE_GUID)
-after_f_guid=$(field "$after_ready" F_STORE_GUID)
 printf 'S2_VERIFY before_pid=%s after_pid=%s parent_pid=%s before_c=%s after_c=%s before_f=%s after_f=%s marker_sha=%s tx_count=%s\n' "$before_pid" "$after_pid" "$parent_pid" "$before_c_guid" "$after_c_guid" "$before_f_guid" "$after_f_guid" "$marker_sha" "$tx_count"
 '''))
                 f_prewarm_scripts.append((host,

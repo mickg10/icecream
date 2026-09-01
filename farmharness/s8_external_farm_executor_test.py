@@ -452,6 +452,11 @@ def test_s2_external_seam_is_f_only_and_requires_original_compile() -> None:
     client_end = source.index("reset_path =", client_start)
     assert "ICECC_P50_TEST_ACTION_HOLD" not in source[client_start:client_end]
     assert "s2_process_loss:requires_cached_c1f1" in source
+    assert "s2_process_loss:requires_q2_f" in source
+    assert 'current_c_guid=$(field "$current_ready" C_STORE_GUID)' in source
+    assert 'current_f_guid=$(field "$current_ready" F_STORE_GUID)' in source
+    assert 'test "$current_c_guid" = "$after_c_guid"' in source
+    assert 'test "$current_f_guid" = "$after_f_guid"' in source
     assert "S2_KILL before_pid=" in source
     assert "external-s2-process-loss.json" in source
     assert "compile_once env-warm" in shell
@@ -488,6 +493,10 @@ def test_s2_external_supervisor_completes_exact_kill_and_verify_control_path(
         elif "S2_VERIFY before_pid=%s" in script:
             assert host == "q2"
             assert subprocess.run(["bash", "-n"], input=script, text=True).returncode == 0
+            assert 'current_c_guid=$(field "$current_ready" C_STORE_GUID)' in script
+            assert 'current_f_guid=$(field "$current_ready" F_STORE_GUID)' in script
+            assert 'test "$current_c_guid" = "$after_c_guid"' in script
+            assert 'test "$current_f_guid" = "$after_f_guid"' in script
             stdout = (f"S2_VERIFY before_pid={before['pid']} after_pid={after['pid']} "
                       f"parent_pid={before['parent_pid']} before_c={before['c_store_guid']} "
                       f"after_c={after['c_store_guid']} before_f={before['f_store_guid']} "
@@ -785,6 +794,20 @@ def test_s2_process_loss_rejects_ambiguous_or_cacheless_cells(
         executor.SSHTransport(authority).execute_command(
             topology=topology, relationship_hosts=hosts, profile=profile,
             product_root_remote="/product",
+            batch_command=["env", "ICECC_P50_EXTERNAL_FARM=1",
+                           "ICECC_P50_S2_PROCESS_LOSS=1",
+                           "/product/unittests/p50compilee2e-run.sh"],
+            output=tmp_path / "out")
+
+
+def test_s2_process_loss_requires_exact_q2_f(tmp_path: Path) -> None:
+    authority = _authority(tmp_path)
+    authority["placements"]["C1F1/100000"]["relationship_hosts"] = ["research7"]
+    with pytest.raises(executor.ExternalFarmError,
+                       match="s2_process_loss:requires_q2_f"):
+        executor.SSHTransport(authority).execute_command(
+            topology="C1F1/100000", relationship_hosts=["research7"],
+            profile="ZSTD_TU", product_root_remote="/product",
             batch_command=["env", "ICECC_P50_EXTERNAL_FARM=1",
                            "ICECC_P50_S2_PROCESS_LOSS=1",
                            "/product/unittests/p50compilee2e-run.sh"],
