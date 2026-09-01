@@ -27,7 +27,7 @@ class S4MethodMatrixExecutorTest(unittest.TestCase):
                 compile_source_root=Path("/compile-src"),
                 timestamp="20260831T141130Z")
             summary = json.loads((campaign / "summary.json").read_text())
-            self.assertEqual(summary["status"], "STAGED")
+            self.assertEqual(summary["status"], "NOT_READY")
             self.assertFalse(summary["execution_ready"])
             self.assertEqual(summary["comparison_blocks"], 128)
             self.assertEqual(summary["arm_runs"], 256)
@@ -42,9 +42,10 @@ class S4MethodMatrixExecutorTest(unittest.TestCase):
             self.assertEqual(first["timestamp"], "20260831T141130Z")
             self.assertEqual(first["id"], "s43-c43-f43")
             self.assertEqual(json.loads(transitions.read_text().splitlines()[0])["kind"], "transition")
-            self.assertEqual(summary["blocked_arms"], 0)
-            self.assertEqual(summary["staged_arms"], 256)
-            self.assertIsNone(summary["raw_ii_gap"])
+            self.assertEqual(summary["blocked_arms"], 256)
+            self.assertEqual(summary["staged_arms"], 0)
+            self.assertEqual(summary["raw_ii_gap"],
+                             "RAW_II witness and control-engine inputs are not bound")
             self.assertEqual(summary["split_policy"]["campaign_corpus"], "fmt")
             self.assertFalse(any("DuckDB" in str(path) or "LLVM-1238" in str(path)
                                  for path in campaign.rglob("*")))
@@ -57,9 +58,9 @@ class S4MethodMatrixExecutorTest(unittest.TestCase):
             method = json.loads((grz / "arms/GRZ/manifest.json").read_text())
             self.assertEqual(method["product_profile"], "GRZ")
             self.assertEqual(method["harness_profile"], "GRZ_RESIDUAL")
-            self.assertTrue(method["executable"])
-            self.assertNotIn("execution_blocker", method)
-            self.assertTrue(all(row["executable"] for row in method["commands"]))
+            self.assertFalse(method["executable"])
+            self.assertIn("execution_blocker", method)
+            self.assertTrue(all(not row["executable"] for row in method["commands"]))
             self.assertEqual(method["measurement"]["channel_bytes"], None)
             live = next(row for row in method["commands"] if row["stage"] == "live_run")
             self.assertIn("--profile", live["argv"])
@@ -87,14 +88,20 @@ class S4MethodMatrixExecutorTest(unittest.TestCase):
             self.assertEqual(repeat_method["repeat_predecessor"]["order"], "AB")
 
             raw = json.loads((grz / "arms/RAW_II/manifest.json").read_text())
-            self.assertEqual(raw["status"], "STAGED")
-            self.assertTrue(raw["executable"])
-            self.assertEqual(raw["harness_profile"], "ZSTD_TU")
+            self.assertEqual(raw["status"], "NOT_READY")
+            self.assertFalse(raw["executable"])
+            self.assertEqual(raw["harness_profile"], "RAW_II")
             self.assertEqual(raw["transfer_accounting"]["basis"],
                              "framed_application_wire_bytes")
             raw_live = next(row for row in raw["commands"] if row["stage"] == "live_run")
-            self.assertEqual(raw_live["argv"][raw_live["argv"].index("--profile") + 1], "ZSTD_TU")
+            self.assertEqual(raw_live["argv"][raw_live["argv"].index("--profile") + 1], "RAW_II")
             self.assertEqual(raw_live["argv"][raw_live["argv"].index("--product-profile") + 1], "RAW_II")
+            raw_producer = next(row for row in raw["commands"]
+                                if row["stage"] == "predictive_producer")
+            self.assertTrue(raw_producer["argv"][1].endswith("s8_raw_ii_predictive_producer.py"))
+            self.assertNotIn("s8_multitu_predictive_producer.py", raw_producer["argv"][1])
+            self.assertNotIn("ZSTD_TU", raw_producer["argv"])
+            self.assertNotIn("P29", raw_producer["argv"])
 
     def test_execute_fails_closed_without_running_anything(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -103,6 +110,42 @@ class S4MethodMatrixExecutorTest(unittest.TestCase):
                     output_root=Path(temp), repo=Path.cwd(), corpus="fmt", source_manifest="x",
                     source_root="x", matrix_audit=Path("x"), engine_manifest="x",
                     product_root=Path("x"), execute=True)
+
+    def test_staged_commands_bind_to_their_materialized_plans_end_to_end(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            campaign = materialize_matrix(
+                output_root=Path(temp), repo=Path.cwd(), corpus="fmt",
+                source_manifest="/inputs/{corpus}/{profile}/{regime}/{topology}.json",
+                source_root="/inputs", matrix_audit=Path("/audit.json"),
+                engine_manifest="/engine/{profile}.json", product_root=Path("/product"),
+                compile_db=Path("/compile_commands.json"),
+                compile_source_root=Path("/compile-src"), timestamp="20260831T141131Z")
+            for manifest_path in campaign.glob("experiments/*/*/*/*/*/*/arms/*/manifest.json"):
+                manifest = json.loads(manifest_path.read_text())
+                commands = {row["stage"]: row for row in manifest["commands"]}
+                planner = commands["predictive_plan"]["argv"]
+                producer = commands["predictive_producer"]["argv"]
+                plan_path = Path(planner[planner.index("--out") + 1])
+                self.assertEqual(plan_path, Path(producer[producer.index("--repeat-plan" if "--repeat-plan" in producer else "--plan") + 1]))
+                self.assertEqual(producer.count("--repeat-plan"),
+                                 1 if "repeat-full" in manifest_path.parts else 0)
+                self.assertFalse(commands["predictive_plan"]["executable"])
+                self.assertFalse(commands["predictive_producer"]["executable"])
+                if manifest["method"] == "RAW_II":
+                    self.assertTrue(producer[1].endswith("s8_raw_ii_predictive_producer.py"))
+                    self.assertNotIn("ZSTD_TU", producer)
+                    self.assertNotIn("P29", producer)
+                else:
+                    self.assertTrue(producer[1].endswith("s8_multitu_predictive_producer.py"))
+
+            compatibility = [json.loads(line) for line in
+                             (campaign / "compatibility-plan.jsonl").read_text().splitlines()]
+            self.assertEqual({row["id"] for row in compatibility},
+                             {row["id"] for row in build_plan()["compatibility_matrix"]})
+            transition = [json.loads(line) for line in
+                          (campaign / "transition-plan.jsonl").read_text().splitlines()]
+            self.assertEqual({(row["before"], row["after"]) for row in transition},
+                             {(row["before"], row["after"]) for row in build_plan()["transitions"]})
 
     def test_heldout_corpus_is_rejected_before_materialization(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -707,9 +707,13 @@ def build_plan() -> dict[str, Any]:
     }
 
 
-def audit_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
+def _audit_plan_unchecked(plan: Mapping[str, Any]) -> dict[str, Any]:
     """Audit a generated or serialized plan and return a fail-closed summary."""
     errors: list[str] = []
+    expected_source = {"integration_head": P50_SOURCE_SHA,
+                       "harness": HARNESS_INVENTORY}
+    if plan.get("source") != expected_source:
+        errors.append("source-mismatch")
     if plan.get("schema") != SCHEMA:
         errors.append("schema-mismatch")
     expected_binding = artifact_binding_contract()
@@ -729,6 +733,8 @@ def audit_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
     }
     if plan.get("legacy_comparator") != expected_legacy_comparator:
         errors.append("legacy-comparator-mismatch")
+    if plan.get("p44_cache_ambiguity") != P44_CACHE_AMBIGUITY:
+        errors.append("p44-cache-ambiguity-mismatch")
     if tuple(plan.get("roles", ())) != ROLES:
         errors.append("role-order-mismatch")
     artifact_rows = plan.get("real_artifact_versions", ())
@@ -736,7 +742,7 @@ def audit_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
             {item.get("version") for item in artifact_rows if isinstance(item, Mapping)} != {43, 44, 50}):
         errors.append("artifact-version-grid")
     for version, expected in ((43, P43_SOURCE_SHA), (44, P44_SOURCE_SHA), (50, P50_SOURCE_SHA)):
-        row = next((item for item in plan.get("real_artifact_versions", ())
+        row = next((item for item in artifact_rows
                     if isinstance(item, Mapping) and item.get("version") == version), None)
         if row is None:
             errors.append(f"missing-artifact-P{version}")
@@ -748,6 +754,8 @@ def audit_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
                 errors.append("artifact-P44-protocol-assertion-mismatch")
     states = plan.get("states", ())
     state_ids: list[str] = []
+    if plan.get("state_count") != 27:
+        errors.append("state-count-declaration")
     if not isinstance(states, list) or len(states) != 27:
         errors.append("state-count")
         states = []
@@ -792,6 +800,8 @@ def audit_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
         errors.append("coverage-mismatch")
 
     transitions = plan.get("transitions", ())
+    if plan.get("transition_count") != 729:
+        errors.append("transition-count-declaration")
     if not isinstance(transitions, list) or len(transitions) != 729:
         errors.append("transition-count")
         transitions = []
@@ -826,11 +836,19 @@ def audit_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
     if counts != {"no-op": 27, "one-role": 162, "multi-role": 540}:
         errors.append("transition-class-counts")
 
+    upgrade_orders = plan.get("upgrade_orders")
+    downgrade_orders = plan.get("downgrade_orders")
+    if not isinstance(upgrade_orders, Mapping):
+        errors.append("upgrade-orders-not-object")
+        upgrade_orders = {}
+    if not isinstance(downgrade_orders, Mapping):
+        errors.append("downgrade-orders-not-object")
+        downgrade_orders = {}
     for key, expected_start, expected_finish in (
         ("43_to_50", "s43-c43-f43", "s50-c50-f50"),
         ("44_to_50", "s44-c44-f44", "s50-c50-f50"),
     ):
-        orders = plan.get("upgrade_orders", {}).get(key, ())
+        orders = upgrade_orders.get(key, ()) if isinstance(upgrade_orders, Mapping) else ()
         if not isinstance(orders, list) or len(orders) != 6:
             errors.append(f"upgrade-order-count:{key}")
             continue
@@ -842,7 +860,7 @@ def audit_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
         ("50_to_43", "s50-c50-f50", "s43-c43-f43"),
         ("50_to_44", "s50-c50-f50", "s44-c44-f44"),
     ):
-        orders = plan.get("downgrade_orders", {}).get(key, ())
+        orders = downgrade_orders.get(key, ()) if isinstance(downgrade_orders, Mapping) else ()
         if not isinstance(orders, list) or len(orders) != 6:
             errors.append(f"downgrade-order-count:{key}")
             continue
@@ -858,11 +876,11 @@ def audit_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
         "p50_raw_ii_whole_legacy": ("s50-c50-f50", 50),
         **{f"p50_{method.lower()}": ("s50-c50-f50", 50) for method in P50_METHODS},
     }
-    if "p50_homogeneous_current" in arms:
-        errors.append("generic-p50-current-arm-forbidden")
     if not isinstance(arms, Mapping):
         errors.append("performance-arms-not-object")
         arms = {}
+    elif "p50_homogeneous_current" in arms:
+        errors.append("generic-p50-current-arm-forbidden")
     for key, (expected_state, expected_version) in required_arms.items():
         arm = arms.get(key)
         if not isinstance(arm, Mapping):
@@ -887,7 +905,11 @@ def audit_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
         errors.append("measurement-regimes")
     if tuple(contract.get("orders", ())) != P50_ORDERS or contract.get("counterbalanced") is not True:
         errors.append("measurement-counterbalance")
-    topology_ids = tuple(item.get("id") for item in contract.get("topologies", ())
+    topologies = contract.get("topologies", ())
+    if not isinstance(topologies, list):
+        errors.append("measurement-topologies-not-list")
+        topologies = []
+    topology_ids = tuple(item.get("id") for item in topologies
                          if isinstance(item, Mapping))
     if topology_ids != tuple(item["id"] for item in P50_TOPOLOGIES):
         errors.append("measurement-topologies")
@@ -981,11 +1003,18 @@ def audit_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
         errors.append("version-comparison-grid-mismatch")
 
     extras = plan.get("boundary_extras", ())
+    if not isinstance(extras, list):
+        errors.append("boundary-extras-not-list")
+        extras = []
     for version in BOUNDARY_VERSIONS:
         row = next((item for item in extras if isinstance(item, Mapping) and item.get("version") == version), None)
         if row is None or row.get("required_real_artifact") is not False or row.get("included_in_static_states") is not False:
             errors.append(f"boundary-P{version}-not-fixture-only")
 
+    coverage = plan.get("coverage")
+    live_coverage = coverage.get("live") if isinstance(coverage, Mapping) else None
+    if not isinstance(live_coverage, Mapping):
+        live_coverage = {}
     return {
         "schema": "icecream-s4-version-transition-audit-v1",
         "status": "PASS" if not errors else "FAIL",
@@ -995,12 +1024,16 @@ def audit_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
         "transition_class_counts": counts,
         "ordered_pairs_unique": len(seen_pairs),
         "compatibility_matrix_count": len(compatibility) if isinstance(compatibility, list) else 0,
-        "live_verified_state_count": len(plan.get("coverage", {}).get("live", {}).get("verified_states", []))
-        if isinstance(plan.get("coverage"), Mapping) else 0,
-        "live_missing_state_count": len(plan.get("coverage", {}).get("live", {}).get("missing_states", []))
-        if isinstance(plan.get("coverage"), Mapping) else 0,
-        "upgrade_order_counts": {key: len(plan.get("upgrade_orders", {}).get(key, ())) for key in ("43_to_50", "44_to_50")},
-        "downgrade_order_counts": {key: len(plan.get("downgrade_orders", {}).get(key, ())) for key in ("50_to_43", "50_to_44")},
+        "live_verified_state_count": len(live_coverage.get("verified_states", []))
+        if isinstance(live_coverage.get("verified_states", []), list) else 0,
+        "live_missing_state_count": len(live_coverage.get("missing_states", []))
+        if isinstance(live_coverage.get("missing_states", []), list) else 0,
+        "upgrade_order_counts": {key: len(upgrade_orders.get(key, ()))
+                                 if isinstance(upgrade_orders, Mapping) and isinstance(upgrade_orders.get(key, ()), list)
+                                 else 0 for key in ("43_to_50", "44_to_50")},
+        "downgrade_order_counts": {key: len(downgrade_orders.get(key, ()))
+                                   if isinstance(downgrade_orders, Mapping) and isinstance(downgrade_orders.get(key, ()), list)
+                                   else 0 for key in ("50_to_43", "50_to_44")},
         "performance_arm_count": len(arms),
         "p50_measurement_count": len(measurements),
         "comparison_block_count": len(measurements),
@@ -1008,6 +1041,34 @@ def audit_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
         "version_comparison_block_count": len(version_blocks),
         "version_comparison_execution_run_count": len(version_blocks) * 2,
     }
+
+
+def audit_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
+    """Audit any input without allowing malformed controls to raise.
+
+    Serialized plans are an input boundary.  A deleted, scalar, or malformed
+    control must be a normal FAIL result rather than an exception/traceback.
+    The inner auditor retains the detailed invariant checks; this guard also
+    covers future checks that accidentally dereference a malformed container.
+    """
+    if not isinstance(plan, Mapping):
+        return {
+            "schema": "icecream-s4-version-transition-audit-v1",
+            "status": "FAIL", "errors": ["plan-not-object"],
+            "state_count": 0, "transition_count": 0,
+            "transition_class_counts": {"no-op": 0, "one-role": 0, "multi-role": 0},
+            "ordered_pairs_unique": 0,
+        }
+    try:
+        return _audit_plan_unchecked(plan)
+    except (AttributeError, KeyError, IndexError, TypeError, ValueError) as exc:
+        return {
+            "schema": "icecream-s4-version-transition-audit-v1",
+            "status": "FAIL", "errors": [f"malformed-plan:{type(exc).__name__}"],
+            "state_count": 0, "transition_count": 0,
+            "transition_class_counts": {"no-op": 0, "one-role": 0, "multi-role": 0},
+            "ordered_pairs_unique": 0,
+        }
 
 
 def _json_bytes(value: object) -> bytes:

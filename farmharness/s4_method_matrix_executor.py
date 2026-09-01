@@ -35,7 +35,6 @@ RAW_II_GAP = (
     "RAW_II uses the P50 whole-legacy/no-cache path and is measured by the "
     "role-labelled legacy wire witness."
 )
-RAW_II_HARNESS_PROFILE = "ZSTD_TU"
 
 
 def _transfer_accounting(method: str) -> dict[str, object]:
@@ -74,6 +73,31 @@ def _repo_head(repo: Path) -> str:
         raise ValueError("git:head_unavailable") from exc
 
 
+def _authenticated_regular_file(path: str | Path | None) -> bool:
+    """Return true only for an existing non-aliased regular input file."""
+    if path is None:
+        return False
+    candidate = Path(path)
+    try:
+        info = candidate.lstat()
+    except OSError:
+        return False
+    return candidate.is_file() and not candidate.is_symlink() and info.st_nlink == 1
+
+
+def _authenticated_directory(path: str | Path | None) -> bool:
+    if path is None:
+        return False
+    candidate = Path(path)
+    try:
+        info = candidate.lstat()
+    except OSError:
+        return False
+    # Directory link counts include ``.``/``..`` and child directories, so
+    # unlike files they are not an identity/authenticity signal.
+    return candidate.is_dir() and not candidate.is_symlink()
+
+
 def _repeat_predecessor(root: Path, method: str) -> Path:
     """Resolve repeat-full to its sibling full arm in this campaign."""
     regime_dir, topology_dir, depth_dir, method_dir = root.parents[:4]
@@ -88,7 +112,7 @@ def _arm(method: str, block: dict[str, Any], root: Path, *, python: str,
          compile_output_root: Path | None) -> dict[str, Any]:
     """Return one arm record without touching any source or product input."""
     product_method = method
-    harness_profile = (RAW_II_HARNESS_PROFILE if method == "RAW_II" else
+    harness_profile = ("RAW_II" if method == "RAW_II" else
                        ("GRZ_RESIDUAL" if method == "GRZ" else method))
     arm_dir = root / "arms" / method
     arm_dir.mkdir(parents=True, exist_ok=True)
@@ -132,9 +156,21 @@ def _arm(method: str, block: dict[str, Any], root: Path, *, python: str,
                   "--out", str(plan)]
     if depth == "repeat-full":
         depth_args.extend(("--repeat-of", str(repeat_of)))
-    producer_args = [python, str(repo / "farmharness/s8_multitu_predictive_producer.py"),
-                     "--plan", str(first_plan), "--engine-manifest", engine_manifest,
-                     "--product-build-root", str(product_root)]
+    if method == "RAW_II":
+        # RAW_II has a dedicated producer and two mandatory authenticated
+        # inputs.  Placeholders deliberately keep this arm NOT_READY until a
+        # caller supplies real regular files; no compressed profile is used.
+        producer_args = [python, str(repo / "farmharness/s8_raw_ii_predictive_producer.py"),
+                         "--plan", str(first_plan),
+                         "--raw-ii-witness", "<raw-ii-witness-required>",
+                         "--engine-manifest", "<raw-ii-control-engine-required>",
+                         "--output-dir", str(first_result), "--depth",
+                         "full" if depth == "repeat-full" else depth,
+                         "--product-root", str(product_root)]
+    else:
+        producer_args = [python, str(repo / "farmharness/s8_multitu_predictive_producer.py"),
+                         "--plan", str(first_plan), "--engine-manifest", engine_manifest,
+                         "--product-build-root", str(product_root)]
     if depth == "repeat-full":
         producer_args.extend(("--repeat-plan", str(plan)))
     else:
@@ -169,8 +205,21 @@ def _arm(method: str, block: dict[str, Any], root: Path, *, python: str,
                                                       (f"live_curve_manifest_{segment}.json"
                                                        if segment else "live_curve_manifest.json")),
                              "--out", str(attempt / f"records{suffix}.jsonl")])
-    live_ready = compile_db is not None and compile_source_root is not None
-    reason = None if live_ready else "authenticated compile DB/source root not configured"
+    live_ready = (
+        method != "RAW_II" and
+        _authenticated_regular_file(source_manifest) and
+        _authenticated_directory(source_root) and
+        _authenticated_regular_file(engine_manifest) and
+        _authenticated_directory(product_root) and
+        _authenticated_regular_file(compile_db) and
+        _authenticated_directory(compile_source_root)
+    )
+    if method == "RAW_II":
+        reason = "RAW_II witness and control-engine inputs are not bound"
+    elif not live_ready:
+        reason = "authenticated regular source/engine/compile inputs are not bound"
+    else:
+        reason = None
     command_reason = None if live_ready else reason
     command_executable = live_ready
     commands = [
@@ -183,7 +232,8 @@ def _arm(method: str, block: dict[str, Any], root: Path, *, python: str,
                                     else f"comparison_{segment or 'full-1'}", executable=command_executable,
                                     reason=command_reason)
                     for command, (_result, segment) in zip(compare_args, compare_segments))
-    record = {**common, "status": "STAGED", "executable": command_executable,
+    record_status = "STAGED" if command_executable else ("NOT_READY" if method == "RAW_II" else "BLOCKED")
+    record = {**common, "status": record_status, "executable": command_executable,
               **({"execution_blocker": command_reason} if command_reason else {}),
               "commands": commands,
               "measurement": _measurement()}
@@ -253,7 +303,7 @@ def materialize_matrix(*, output_root: Path, repo: Path, corpus: str,
     staged = 0
     for template in contract["measurement_cells"]:
         block = {**template, "corpus": corpus}
-        harness_profile = (RAW_II_HARNESS_PROFILE
+        harness_profile = ("RAW_II"
                            if template["method"] == "RAW_II" else
                            ("GRZ_RESIDUAL" if template["method"] == "GRZ"
                             else str(template["method"])))
@@ -291,9 +341,10 @@ def materialize_matrix(*, output_root: Path, repo: Path, corpus: str,
                                   "harness_profile": row["harness_profile"]} for row in arms]}
         (block_dir / "manifest.json").write_bytes(_canonical(block_record))
         blocks += 1
-        blocked += sum(row["status"] == "BLOCKED" for row in arms)
+        blocked += sum(row["status"] in {"BLOCKED", "NOT_READY"} for row in arms)
         staged += sum(row["status"] == "STAGED" for row in arms)
-    summary = {"schema": SUMMARY_SCHEMA, "status": "STAGED",
+    summary = {"schema": SUMMARY_SCHEMA,
+               "status": "STAGED" if blocked == 0 else "NOT_READY",
                "campaign_root": str(campaign), "dry_run": True,
                "execution_ready": False,
                "source_plan_schema": plan["schema"], "split_policy": {
@@ -306,7 +357,8 @@ def materialize_matrix(*, output_root: Path, repo: Path, corpus: str,
                "compatibility_plan": "compatibility-plan.jsonl",
                "transition_plan": "transition-plan.jsonl",
                "staged_arms": staged, "blocked_arms": blocked,
-               "raw_ii_gap": None,
+               "raw_ii_gap": (None if blocked == 0 else
+                              "RAW_II witness and control-engine inputs are not bound"),
                "metrics": {"channel_bytes": "pending", "elapsed_ns": "pending",
                             "simulator_comparison": "pending"}}
     (campaign / "summary.json").write_bytes(_canonical(summary))

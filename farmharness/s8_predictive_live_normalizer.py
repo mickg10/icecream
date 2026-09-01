@@ -85,7 +85,7 @@ CONTROL_BASELINE_SCHEMA = "icecream-s8-raw-ii-control-baseline-v1"
 CONTROL_BASELINE = {
     "schema": CONTROL_BASELINE_SCHEMA,
     "profile": "RAW_II",
-    "harness_profile": "P29",
+    "harness_profile": "RAW_II",
     "mode": "whole-legacy",
     "prediction_source": "raw_ii_control_engine",
     "engine_scope": "raw_ii_control_engine",

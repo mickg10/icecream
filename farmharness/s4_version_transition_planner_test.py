@@ -197,6 +197,32 @@ class S4VersionTransitionPlannerTest(unittest.TestCase):
         block["sequence"].reverse()
         self.assertEqual(audit_plan(mutant)["status"], "FAIL")
 
+    def test_auditor_is_total_for_deleted_or_malformed_controls(self) -> None:
+        controls = (
+            ("source", None),
+            ("p44_cache_ambiguity", None),
+            ("state_count", None),
+            ("transition_count", None),
+            ("performance_arms", None),
+            ("upgrade_orders", None),
+            ("downgrade_orders", None),
+            ("boundary_extras", None),
+        )
+        for key, value in controls:
+            for replacement in ("deleted", value):
+                mutant = json.loads(json.dumps(self.plan))
+                if replacement == "deleted":
+                    del mutant[key]
+                else:
+                    mutant[key] = replacement
+                result = audit_plan(mutant)
+                self.assertEqual(result["status"], "FAIL", (key, replacement))
+                self.assertIsInstance(result["errors"], list)
+        for malformed in (None, [], "not-a-plan"):
+            result = audit_plan(malformed)
+            self.assertEqual(result["status"], "FAIL", malformed)
+            self.assertIsInstance(result["errors"], list)
+
     def test_cli_is_non_executing_and_emits_json(self) -> None:
         script = Path(__file__).with_name("s4_version_transition_planner.py")
         completed = subprocess.run([sys.executable, str(script), "--summary"],

@@ -340,7 +340,7 @@ def build_plan(source_manifest: Path, source_root: Path, matrix_audit: Path,
         plan["execution_contract"].update({
             "control_baseline": {
                 "schema": "icecream-s8-raw-ii-control-baseline-v1",
-                "profile": "RAW_II", "harness_profile": "P29",
+                "profile": "RAW_II", "harness_profile": "RAW_II",
                 "mode": "whole-legacy", "prediction_source": "raw_ii_control_engine",
                 "engine_scope": "raw_ii_control_engine",
             },
