@@ -66,6 +66,107 @@ void require(bool value, std::string_view detail) {
         fail(detail);
 }
 
+void test_action_hold_rendezvous() {
+    char root_template[] = "/tmp/p50-action-hold-XXXXXX";
+    char* root_value = ::mkdtemp(root_template);
+    require(root_value != nullptr, "cannot create action-hold test directory");
+    const std::filesystem::path root(root_value);
+    const std::filesystem::path marker = root / "marker";
+    const std::filesystem::path release = root / "release";
+    const std::filesystem::path trace_path = root / "f-action-trace.jsonl";
+
+    require(::setenv("ICECC_P50_TEST_ACTION_HOLD", "F:TX_BEGIN", 1) == 0 &&
+                ::setenv("ICECC_P50_TEST_ACTION_HOLD_MARKER",
+                         marker.c_str(), 1) == 0 &&
+                ::setenv("ICECC_P50_TEST_ACTION_HOLD_RELEASE",
+                         release.c_str(), 1) == 0 &&
+                ::setenv("ICECC_P50_TEST_ACTION_HOLD_TIMEOUT_MS", "5000", 1) == 0 &&
+                ::setenv("ICECC_P50_F_ACTION_TRACE", trace_path.c_str(), 1) == 0,
+            "cannot configure action-hold rendezvous");
+
+    std::atomic<bool> marker_observed{false};
+    std::thread releaser([&] {
+        for (size_t attempt = 0; attempt != 500; ++attempt) {
+            std::ifstream input(marker);
+            if (input) {
+                std::string header;
+                std::getline(input, header);
+                std::string json;
+                std::getline(input, json);
+                std::ifstream trace_input(trace_path);
+                std::string trace;
+                std::getline(trace_input, trace);
+                marker_observed = header.starts_with("P50_ACTION_HOLD pid=") &&
+                                  header.find(" actor=F action=TX_BEGIN") !=
+                                      std::string::npos &&
+                                  json.starts_with(
+                                      "{\"action\":\"TX_BEGIN\",\"actor\":\"F\",") &&
+                                  trace == json;
+                std::ofstream output(release);
+                output << "release\n";
+                output.close();
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    });
+
+    ActionRecord record;
+    record.actor = ActorSide::F;
+    record.action = ActionType::TX_BEGIN;
+    record.c_store_guid = Id128::from_u64(991);
+    record.f_store_guid = Id128::from_u64(992);
+    record.history_nonce = HistoryNonce{1};
+    record.rel_seq = RelSeq{2};
+    record.tu_seq = TuSeq{3};
+    ActionTrace trace;
+    trace.record(record);
+    releaser.join();
+    require(trace.valid() && marker_observed,
+            "named action did not complete its exact rendezvous");
+
+    // The marker is the one-shot fence inherited by a replacement sidecar.
+    // A second matching action must not wait again.
+    std::filesystem::remove(release);
+    const auto second_start = std::chrono::steady_clock::now();
+    trace.record(record);
+    require(trace.valid() &&
+                std::chrono::steady_clock::now() - second_start <
+                    std::chrono::milliseconds(250),
+            "one-shot action rendezvous blocked a replacement");
+
+    const std::filesystem::path stale_marker = root / "stale-marker";
+    {
+        std::ofstream output(stale_marker);
+        output << "incomplete\n";
+    }
+    require(::setenv("ICECC_P50_TEST_ACTION_HOLD_MARKER",
+                     stale_marker.c_str(), 1) == 0,
+            "cannot configure stale action-hold marker");
+    ActionTrace stale;
+    stale.record(record);
+    require(!stale.valid(), "incomplete action-hold marker was accepted");
+
+    const std::filesystem::path bad_marker = root / "bad-marker";
+    const std::filesystem::path bad_release = root / "bad-release";
+    std::filesystem::create_symlink(bad_marker, bad_release);
+    require(::setenv("ICECC_P50_TEST_ACTION_HOLD_MARKER",
+                     bad_marker.c_str(), 1) == 0 &&
+                ::setenv("ICECC_P50_TEST_ACTION_HOLD_RELEASE",
+                         bad_release.c_str(), 1) == 0,
+            "cannot configure invalid action-hold release");
+    ActionTrace invalid;
+    invalid.record(record);
+    require(!invalid.valid(), "symlink action-hold release was accepted");
+
+    ::unsetenv("ICECC_P50_TEST_ACTION_HOLD");
+    ::unsetenv("ICECC_P50_TEST_ACTION_HOLD_MARKER");
+    ::unsetenv("ICECC_P50_TEST_ACTION_HOLD_RELEASE");
+    ::unsetenv("ICECC_P50_TEST_ACTION_HOLD_TIMEOUT_MS");
+    ::unsetenv("ICECC_P50_F_ACTION_TRACE");
+    std::filesystem::remove_all(root);
+}
+
 template <class Exception, class Function>
 void require_throws(Function&& function, std::string_view detail) {
     try {
@@ -5980,6 +6081,7 @@ int main(int argc, char** argv) {
         std::cout << "p50_endpoint_test: focused P29 dialogue PASS\n";
         return 0;
     }
+    test_action_hold_rendezvous();
     test_normal_zero_and_completion_stamps();
     test_completion_stamp_correspondence();
     test_completion_live_identity_correspondence();

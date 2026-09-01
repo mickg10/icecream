@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <limits>
@@ -10,6 +12,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <fcntl.h>
+#include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 namespace icecc::p50 {
@@ -86,6 +90,193 @@ void clear_f_pending(FCheckerState& state) {
     state.materialized = false;
 }
 
+uint64_t action_hold_timeout_ms() {
+    const char* text = std::getenv("ICECC_P50_TEST_ACTION_HOLD_TIMEOUT_MS");
+    if (text == nullptr || *text == '\0')
+        return 30000;
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long long value = std::strtoull(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' || value == 0 ||
+        value > 300000)
+        throw std::runtime_error("invalid Protocol-50 action hold timeout");
+    return static_cast<uint64_t>(value);
+}
+
+void write_all(int fd, std::string_view bytes) {
+    size_t offset = 0;
+    while (offset != bytes.size()) {
+        const ssize_t written = ::write(fd, bytes.data() + offset,
+                                        bytes.size() - offset);
+        if (written > 0) {
+            offset += static_cast<size_t>(written);
+            continue;
+        }
+        if (written < 0 && errno == EINTR)
+            continue;
+        throw std::runtime_error("cannot write Protocol-50 action hold marker");
+    }
+}
+
+void sync_file(int fd, std::string_view detail) {
+    while (::fdatasync(fd) != 0) {
+        if (errno == EINTR)
+            continue;
+        throw std::runtime_error(std::string(detail));
+    }
+}
+
+void close_checked(int& fd, std::string_view detail) {
+    const int owned = fd;
+    fd = -1;
+    if (::close(owned) != 0)
+        throw std::runtime_error(std::string(detail));
+}
+
+bool selected_hold_action(const ActionRecord& record) {
+    const char* target = std::getenv("ICECC_P50_TEST_ACTION_HOLD");
+    if (target == nullptr || *target == '\0')
+        return false;
+    const std::string expected = std::string(actor_name(record.actor)) + ':' +
+                                 std::string(action_name(record.action));
+    return expected == target;
+}
+
+bool completed_hold_marker(std::string_view path, const ActionRecord& record) {
+    struct stat pathname {};
+    const std::string owned_path(path);
+    if (::lstat(owned_path.c_str(), &pathname) != 0 ||
+        !S_ISREG(pathname.st_mode) || (pathname.st_mode & 07777) != 0600 ||
+        pathname.st_nlink != 1 || pathname.st_uid != ::geteuid() ||
+        pathname.st_size <= 0 || pathname.st_size > 64 * 1024)
+        return false;
+
+    int fd = ::open(owned_path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0)
+        return false;
+    struct stat descriptor {};
+    std::string bytes;
+    bool valid = ::fstat(fd, &descriptor) == 0 &&
+                 descriptor.st_dev == pathname.st_dev &&
+                 descriptor.st_ino == pathname.st_ino &&
+                 descriptor.st_size == pathname.st_size;
+    if (valid) {
+        bytes.resize(static_cast<size_t>(pathname.st_size));
+        size_t offset = 0;
+        while (offset != bytes.size()) {
+            const ssize_t read_count =
+                ::read(fd, bytes.data() + offset, bytes.size() - offset);
+            if (read_count > 0) {
+                offset += static_cast<size_t>(read_count);
+                continue;
+            }
+            if (read_count < 0 && errno == EINTR)
+                continue;
+            valid = false;
+            break;
+        }
+    }
+    const int close_result = ::close(fd);
+    if (close_result != 0)
+        valid = false;
+    if (!valid)
+        return false;
+
+    const std::string actor(actor_name(record.actor));
+    const std::string action(action_name(record.action));
+    const std::string header_prefix = "P50_ACTION_HOLD pid=";
+    const std::string header_suffix =
+        " actor=" + actor + " action=" + action + '\n';
+    const size_t first_newline = bytes.find('\n');
+    if (!bytes.starts_with(header_prefix) || first_newline == std::string::npos ||
+        bytes.substr(0, first_newline + 1).find(header_suffix) ==
+            std::string::npos ||
+        bytes.empty() || bytes.back() != '\n' ||
+        bytes.find('\n', first_newline + 1) != bytes.size() - 1)
+        return false;
+    const size_t pid_begin = header_prefix.size();
+    const size_t pid_end = bytes.find(' ', pid_begin);
+    if (pid_end == std::string::npos || pid_end == pid_begin)
+        return false;
+    for (size_t index = pid_begin; index != pid_end; ++index) {
+        if (bytes[index] < '0' || bytes[index] > '9')
+            return false;
+    }
+    if (bytes.substr(pid_begin, pid_end - pid_begin) == "0" ||
+        bytes.substr(pid_end, first_newline + 1 - pid_end) != header_suffix)
+        return false;
+    const std::string json_prefix =
+        "{\"action\":\"" + action + "\",\"actor\":\"" + actor + "\",";
+    return bytes.substr(first_newline + 1).starts_with(json_prefix);
+}
+
+void hold_after_test_action(const ActionRecord& record) {
+    if (!selected_hold_action(record))
+        return;
+
+    const char* marker = std::getenv("ICECC_P50_TEST_ACTION_HOLD_MARKER");
+    const char* release = std::getenv("ICECC_P50_TEST_ACTION_HOLD_RELEASE");
+    if (marker == nullptr || *marker == '\0' || release == nullptr ||
+        *release == '\0' || std::string_view(marker) == release)
+        throw std::runtime_error("Protocol-50 action hold paths are incomplete");
+
+    struct stat existing {};
+    if (::lstat(marker, &existing) == 0) {
+        if (completed_hold_marker(marker, record))
+            return;
+        throw std::runtime_error("Protocol-50 action hold marker is incomplete");
+    }
+    if (errno != ENOENT)
+        throw std::runtime_error("cannot inspect Protocol-50 action hold marker");
+
+    const std::string temporary = std::string(marker) + ".tmp." +
+                                  std::to_string(::getpid());
+    int fd = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC |
+                                           O_NOFOLLOW,
+                    0600);
+    if (fd < 0) {
+        throw std::runtime_error("cannot create Protocol-50 action hold marker");
+    }
+    try {
+        const std::string header =
+            "P50_ACTION_HOLD pid=" + std::to_string(::getpid()) +
+            " actor=" + std::string(actor_name(record.actor)) +
+            " action=" + std::string(action_name(record.action)) + '\n';
+        write_all(fd, header);
+        write_all(fd, action_jsonl(record) + '\n');
+        sync_file(fd, "cannot sync Protocol-50 action hold marker");
+        close_checked(fd, "cannot close Protocol-50 action hold marker");
+        // ActionTrace is a single writer.  Publishing by rename means a
+        // watcher can never observe a partially written marker; the private
+        // per-run path is required to be absent before the daemon starts.
+        if (::rename(temporary.c_str(), marker) != 0)
+            throw std::runtime_error("cannot publish Protocol-50 action hold marker");
+    } catch (...) {
+        if (fd >= 0)
+            (void)::close(fd);
+        (void)::unlink(temporary.c_str());
+        throw;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(action_hold_timeout_ms());
+    for (;;) {
+        struct stat status {};
+        if (::lstat(release, &status) == 0) {
+            if (!S_ISREG(status.st_mode) || status.st_nlink != 1)
+                throw std::runtime_error(
+                    "Protocol-50 action hold release is not a regular file");
+            return;
+        }
+        if (errno != ENOENT)
+            throw std::runtime_error("cannot inspect Protocol-50 action hold release");
+        if (std::chrono::steady_clock::now() >= deadline)
+            throw std::runtime_error("Protocol-50 action hold timed out");
+        struct timespec delay {0, 10 * 1000 * 1000};
+        while (::nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
+    }
+}
+
 }  // namespace
 
 void ActionTrace::record(ActionRecord record) noexcept {
@@ -104,29 +295,25 @@ void ActionTrace::record(ActionRecord record) noexcept {
         const char* path = std::getenv(variable);
         if (path == nullptr || *path == '\0')
             path = std::getenv("ICECC_P50_ACTION_TRACE");
-        if (path == nullptr || *path == '\0')
-            return;
-        const std::string line = action_jsonl(emitted) + '\n';
-        const int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC |
-                                         O_NOFOLLOW,
-                               0600);
-        if (fd < 0)
-            throw std::runtime_error("cannot open Protocol-50 action trace sink");
-        size_t offset = 0;
-        while (offset != line.size()) {
-            const ssize_t written = ::write(fd, line.data() + offset,
-                                             line.size() - offset);
-            if (written > 0) {
-                offset += static_cast<size_t>(written);
-                continue;
+        if (path != nullptr && *path != '\0') {
+            const std::string line = action_jsonl(emitted) + '\n';
+            int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC |
+                                      O_NOFOLLOW,
+                            0600);
+            if (fd < 0)
+                throw std::runtime_error("cannot open Protocol-50 action trace sink");
+            try {
+                write_all(fd, line);
+                if (selected_hold_action(emitted))
+                    sync_file(fd, "cannot sync Protocol-50 action trace sink");
+                close_checked(fd, "cannot close Protocol-50 action trace sink");
+            } catch (...) {
+                if (fd >= 0)
+                    (void)::close(fd);
+                throw;
             }
-            if (written < 0 && errno == EINTR)
-                continue;
-            (void)::close(fd);
-            throw std::runtime_error("cannot write Protocol-50 action trace sink");
         }
-        if (::close(fd) != 0)
-            throw std::runtime_error("cannot close Protocol-50 action trace sink");
+        hold_after_test_action(emitted);
     } catch (...) {
         valid_ = false;
     }

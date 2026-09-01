@@ -418,6 +418,172 @@ def test_external_command_preserves_two_pass_repeat_input(monkeypatch: pytest.Mo
     assert "ICECC_P50_REPEAT_PREDICTIVE_PLAN=/tanksmall/plan-full-2.json" in command
 
 
+def test_external_command_places_s2_process_loss_before_runner(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(executor.live, "build_command", lambda *args, **kwargs: [
+        "env", "ICECC_P50_C1F1_PASSES=1",
+        "/tanksmall/unittests/p50compilee2e-run.sh"])
+    command = executor.build_external_command(
+        Path("/tanksmall/batch.jsonl"), Path("/tanksmall/plan.json"),
+        Path("/tanksmall/topology.json"), Path("/tanksmall/product"),
+        profile="ZSTD_TU", corpus="DuckDB", regime="cold", depth="100",
+        suite="C1F1/100000", workdir=Path("/tmp/p50compilee2e.external"),
+        timeout_seconds=900, s2_process_loss=True)
+    flag = command.index("ICECC_P50_S2_PROCESS_LOSS=1")
+    runner = command.index("/tanksmall/unittests/p50compilee2e-run.sh")
+    assert flag < runner
+    assert command.count("ICECC_P50_S2_PROCESS_LOSS=1") == 1
+    with pytest.raises(executor.ExternalFarmError,
+                       match="s2_process_loss:flag_invalid"):
+        executor.build_external_command(
+            Path("/tanksmall/batch.jsonl"), Path("/tanksmall/plan.json"),
+            Path("/tanksmall/topology.json"), Path("/tanksmall/product"),
+            profile="ZSTD_TU", corpus="DuckDB", regime="cold", depth="100",
+            suite="C1F1/100000", workdir=Path("/tmp/p50compilee2e.external"),
+            timeout_seconds=900, s2_process_loss=1)  # type: ignore[arg-type]
+
+
+def test_s2_external_seam_is_f_only_and_requires_original_compile() -> None:
+    source = Path(executor.__file__).read_text(encoding="utf-8")
+    shell = (Path(__file__).resolve().parents[1] / "unittests" /
+             "p50compilee2e-run.sh").read_text(encoding="utf-8")
+    assert "-e ICECC_P50_TEST_ACTION_HOLD=F:TX_BEGIN" in source
+    client_start = source.index("client_daemon =")
+    client_end = source.index("reset_path =", client_start)
+    assert "ICECC_P50_TEST_ACTION_HOLD" not in source[client_start:client_end]
+    assert "s2_process_loss:requires_cached_c1f1" in source
+    assert "S2_KILL before_pid=" in source
+    assert "external-s2-process-loss.json" in source
+    assert "compile_once env-warm" in shell
+    assert "wait \"$s2_compile_pid\"" in shell
+    assert "original compile did not recover after F sidecar loss" in shell
+    assert "original_compile_completed" in shell
+
+
+def test_s2_external_supervisor_completes_exact_kill_and_verify_control_path(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    authority = _authority(tmp_path)
+    transport = executor.SSHTransport(authority, timeout=30)
+    before = {"pid": 101, "parent_pid": 77,
+              "c_store_guid": "1" * 32, "f_store_guid": "2" * 32}
+    after = {"pid": 202, "parent_pid": 77,
+             "c_store_guid": "3" * 32, "f_store_guid": "4" * 32}
+    marker_sha = "5" * 64
+    state = {"batch": False, "kill_ready": False, "verify_ready": False}
+    calls: list[tuple[str, str]] = []
+
+    def fake_run(host: str, script: str,
+                 args: Sequence[object] = ()) -> subprocess.CompletedProcess[str]:
+        calls.append((host, script))
+        stdout = ""
+        if "stat -c %s" in script and "/scheduler.log" in script:
+            stdout = "0\n"
+        elif "S2_KILL before_pid=%s" in script:
+            assert host == "q2"
+            assert subprocess.run(["bash", "-n"], input=script, text=True).returncode == 0
+            stdout = (f"S2_KILL before_pid={before['pid']} after_pid={after['pid']} "
+                      f"parent_pid={before['parent_pid']} before_c={before['c_store_guid']} "
+                      f"after_c={after['c_store_guid']} before_f={before['f_store_guid']} "
+                      f"after_f={after['f_store_guid']} marker_sha={marker_sha}\n")
+        elif "S2_VERIFY before_pid=%s" in script:
+            assert host == "q2"
+            assert subprocess.run(["bash", "-n"], input=script, text=True).returncode == 0
+            stdout = (f"S2_VERIFY before_pid={before['pid']} after_pid={after['pid']} "
+                      f"parent_pid={before['parent_pid']} before_c={before['c_store_guid']} "
+                      f"after_c={after['c_store_guid']} before_f={before['f_store_guid']} "
+                      f"after_f={after['f_store_guid']} marker_sha={marker_sha} tx_count=3\n")
+        elif "touch " in script and "external-s2-kill.ready" in script:
+            state["kill_ready"] = True
+        elif "external-s2-process-loss.json.tmp" in script:
+            state["verify_ready"] = True
+        elif "interference-result.json" in script:
+            stdout = json.dumps({
+                "schema": executor.INTERFERENCE_SCHEMA, "status": "PASS",
+                "timing_eligible": True,
+                "phases": [{"phase": phase, "path": f"/tmp/interference-{phase}.jsonl"}
+                           for phase in ("before", "during", "after")],
+                "events": [],
+            }) + "\n"
+        else:
+            workdir = re.search(
+                r"ICECC_P50_C1F1_WORKDIR=(/tmp/p50compilee2e\.external\.[A-Za-z0-9]+)",
+                script)
+            if ("docker exec --user 0" in script and workdir is not None and
+                    "ICECC_P50_S2_PROCESS_LOSS=1" in script):
+                state["batch"] = True
+                deadline = time.monotonic() + 5
+                while not state["verify_ready"] and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert state["verify_ready"]
+                stdout = ("PASS: all-P50 C1F1\n"
+                          f"S7_WORKDIR={workdir.group(1)}\n"
+                          "S8_BATCH_METRICS max_concurrent_admitted_or_compiling_jobs=2\n")
+        return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
+
+    def fake_probe(_host: str, script: str, args: Sequence[object] = (),
+                   **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        path = str(args[0]) if args else ""
+        present = (state["batch"] and
+                   ((path.endswith("external-s2-kill.request") and
+                     not state["kill_ready"]) or
+                    (path.endswith("external-s2-verify.request") and
+                     state["kill_ready"] and not state["verify_ready"])))
+        return subprocess.CompletedProcess([], 0 if present else 1, "", "")
+
+    evidence = {
+        "schema": "icecream-s2-process-loss-v1", "status": "PASS",
+        "role": "F", "relationship": 0, "action": "TX_BEGIN",
+        "before": before, "after": after, "marker_sha256": marker_sha,
+        "marker_unchanged": True, "release_absent": True,
+        "replacement_ready": True, "scheduler_relogin": True,
+        "original_compile_completed": True, "tx_begin_records": 3,
+    }
+
+    def fake_copy(host: str, _remote: str, destination: Path,
+                  _image: str, _timeout: float) -> None:
+        destination.mkdir(parents=True, exist_ok=False)
+        if host == "q3":
+            (destination / "scheduler.container-id").write_text("a" * 64)
+            (destination / "scheduler.pid").write_text("100")
+            (destination / "c.container-id").write_text("b" * 64)
+            (destination / "c.pid").write_text("101")
+            (destination / "external-s2-process-loss.json").write_text(
+                json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n")
+        else:
+            (destination / "container-id").write_text("c" * 64)
+            (destination / "container-pid").write_text("102")
+            (destination / "f.log").write_text("")
+            (destination / "f-measured-log-offset").write_text("0")
+            for phase in ("before", "during", "after"):
+                (destination / f"interference-{phase}.jsonl").write_text(
+                    json.dumps({"phase": phase}) + "\n")
+
+    monkeypatch.setattr(transport, "run", fake_run)
+    monkeypatch.setattr(executor.s4, "run_script", fake_probe)
+    monkeypatch.setattr(executor, "_copy_remote_tree", fake_copy)
+    result = transport.execute_command(
+        topology="C1F1/100000", relationship_hosts=["q2"], profile="ZSTD_TU",
+        product_root_remote="/product",
+        batch_command=["env", "ICECC_P50_EXTERNAL_FARM=1",
+                       "ICECC_P50_S2_PROCESS_LOSS=1",
+                       "/product/unittests/p50compilee2e-run.sh"],
+        output=tmp_path / "out")
+    retained_workdir = Path(result["finalizer_input"]["workdir"])
+    try:
+        assert result["status"] == "PASS"
+        assert state == {"batch": True, "kill_ready": True, "verify_ready": True}
+        assert "s2-process-loss.json" in result["retained_artifacts"]
+        assert json.loads((tmp_path / "out" / "s2-process-loss.json").read_text()) == evidence
+        worker_launch = next(script for host, script in calls
+                             if host == "q2" and "docker run -d" in script)
+        client_launch = next(script for host, script in calls
+                             if host == "q3" and "--no-remote -m 0" in script)
+        assert "ICECC_P50_TEST_ACTION_HOLD=F:TX_BEGIN" in worker_launch
+        assert "ICECC_P50_TEST_ACTION_HOLD" not in client_launch
+    finally:
+        shutil.rmtree(retained_workdir, ignore_errors=True)
+
+
 def test_external_timeout_includes_post_measurement_references() -> None:
     assert executor.external_timeout_seconds(100, 1, False) == 2430
     assert executor.external_timeout_seconds(100, 2, False) == 4830
@@ -603,6 +769,25 @@ def test_arbitrary_true_command_cannot_be_admitted(tmp_path: Path) -> None:
             topology="C1F1/100000", relationship_hosts=["q2"], profile="ZSTD_ROUTE",
             product_root_remote="/product",
             batch_command=["env", "ICECC_P50_EXTERNAL_FARM=1", "/bin/true"],
+            output=tmp_path / "out")
+
+
+@pytest.mark.parametrize(("topology", "profile"), (
+    ("C1F20/40", "ZSTD_TU"),
+    ("C1F1/100000", "RAW_II"),
+))
+def test_s2_process_loss_rejects_ambiguous_or_cacheless_cells(
+        tmp_path: Path, topology: str, profile: str) -> None:
+    authority = _authority(tmp_path)
+    hosts = authority["placements"][topology]["relationship_hosts"]
+    with pytest.raises(executor.ExternalFarmError,
+                       match="s2_process_loss:requires_cached_c1f1"):
+        executor.SSHTransport(authority).execute_command(
+            topology=topology, relationship_hosts=hosts, profile=profile,
+            product_root_remote="/product",
+            batch_command=["env", "ICECC_P50_EXTERNAL_FARM=1",
+                           "ICECC_P50_S2_PROCESS_LOSS=1",
+                           "/product/unittests/p50compilee2e-run.sh"],
             output=tmp_path / "out")
 
 

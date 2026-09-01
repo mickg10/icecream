@@ -339,7 +339,8 @@ def build_external_command(batch_manifest: Path, predictive_plan: Path, topology
                            reference_witness: Path | None = None,
                            reference_authority: Path | None = None,
                            reference_image: Mapping[str, Any] | None = None,
-                           reference_toolchain: Mapping[str, Any] | None = None) -> list[str]:
+                           reference_toolchain: Mapping[str, Any] | None = None,
+                           s2_process_loss: bool = False) -> list[str]:
     """Build the mature runner argv and mark it for the external lifecycle."""
     runner_profile = "P29" if profile == "RAW_II" else profile
     command = live.build_command(batch_manifest, runner_profile, product_root=product_root,
@@ -369,12 +370,17 @@ def build_external_command(batch_manifest: Path, predictive_plan: Path, topology
             raise ExternalFarmError("reference_witness:compiler_identity_required")
         prefix_env.extend((f"ICECC_P50_REFERENCE_TOOLCHAIN_SHA256={reference_toolchain['sha256']}",
                            f"ICECC_P50_REFERENCE_TOOLCHAIN_BYTES={reference_toolchain['bytes']}"))
+    if type(s2_process_loss) is not bool:
+        raise ExternalFarmError("s2_process_loss:flag_invalid")
+    if s2_process_loss:
+        prefix_env.append("ICECC_P50_S2_PROCESS_LOSS=1")
     # build_command returns env assignments followed by the runner.  Keep all
     # witness assignments in env's prefix; trailing words would be script args.
     runner_index = next((i for i, value in enumerate(command)
                          if str(value).endswith("p50compilee2e-run.sh")), None)
     if runner_index is None:
-        raise ExternalFarmError("runner:command_missing")
+        raise ExternalFarmError("s2_process_loss:runner_missing" if s2_process_loss
+                                else "runner:command_missing")
     command[runner_index:runner_index] = prefix_env
     return ["env", "ICECC_P50_EXTERNAL_FARM=1", *command[1:]]
 
@@ -1024,6 +1030,9 @@ class SSHTransport:
                 not any(str(item).endswith("p50compilee2e-run.sh") for item in batch_command) or
                 any(str(item) == "/bin/true" for item in batch_command)):
             raise ExternalFarmError("transport:authenticated_batch_command_required")
+        s2_process_loss = "ICECC_P50_S2_PROCESS_LOSS=1" in batch_command
+        if s2_process_loss and (topology != "C1F1/100000" or profile == "RAW_II"):
+            raise ExternalFarmError("s2_process_loss:requires_cached_c1f1")
         # Preserve s4's private evidence-root validation; external roots must
         # use its accepted unique naming convention.
         nonce = f"{os.getpid()}{time.monotonic_ns()}"
@@ -1039,12 +1048,15 @@ class SSHTransport:
         services: list[tuple[str, str]] = []
         f_reset_scripts: list[tuple[str, str]] = []
         f_prewarm_scripts: list[tuple[str, str]] = []
+        f_s2_kill_scripts: list[tuple[str, str]] = []
+        f_s2_verify_scripts: list[tuple[str, str]] = []
         staged_roots: dict[str, str] = {}
         supervisor_stop = threading.Event()
         supervisor: threading.Thread | None = None
         supervisor_errors: list[str] = []
         cleanup_errors: list[str] = []
         first_relationship_for_host: dict[str, int] = {}
+        s2_state: dict[str, Any] = {}
         if output.exists() or output.is_symlink():
             raise ExternalFarmError("output:private_create_once_required")
         output.mkdir(parents=True, exist_ok=False)
@@ -1197,6 +1209,7 @@ PY
 pid=$1
 role=$2
 runtime=$3
+operation=${4:-kill}
 printf '%s' "$pid" | grep -Eq '^[0-9]+$'
 test -r "/proc/$pid/status" -a -r "/proc/$pid/cmdline"
 command=$(tr '\0' ' ' <"/proc/$pid/cmdline")
@@ -1207,12 +1220,16 @@ test -n "$parent" -a -r "/proc/$parent/cmdline"
 parent_command=$(tr '\0' ' ' <"/proc/$parent/cmdline")
 printf '%s\n' "$parent_command" | grep -F '/probe/product/daemon/iceccd'
 case $role in
-  C) printf '%s\n' "$parent_command" | grep -F -- '--no-remote' | grep -F -- '-N s8-p50-c' ;;
-  F) printf '%s\n' "$parent_command" | grep -F -- '-N p50-f' ;;
+  C) printf '%s\n' "$parent_command" | grep -F -- '--no-remote' | grep -Eq '(^|[[:space:]])-N[[:space:]]+s8-p50-c([[:space:]]|$)' ;;
+  F) printf '%s\n' "$parent_command" | grep -Eq '(^|[[:space:]])-N[[:space:]]+p50-f(-[0-9]+)?([[:space:]]|$)' ;;
   *) exit 77 ;;
 esac
-kill -9 "$pid"
-'''
+case $operation in
+  kill) kill -9 "$pid" ;;
+  validate) : ;;
+  *) exit 78 ;;
+esac
+            '''
             for relationship, host in enumerate(relationship_hosts):
                 service = "p50-f" if topology == "C1F1/100000" else f"p50-f-{relationship}"
                 worker_root = worker_work(relationship)
@@ -1226,6 +1243,17 @@ kill -9 "$pid"
                 ))
                 args = profile_arguments(profile, root="/probe/product",
                                          work="/probe/work", role=f"f-{relationship}")
+                s2_worker_env = ""
+                s2_worker_preflight = ""
+                if s2_process_loss and relationship == 0:
+                    s2_worker_env = (
+                        " -e ICECC_P50_TEST_ACTION_HOLD=F:TX_BEGIN"
+                        " -e ICECC_P50_TEST_ACTION_HOLD_MARKER=/probe/work/s2-action-hold.marker"
+                        " -e ICECC_P50_TEST_ACTION_HOLD_RELEASE=/probe/work/s2-action-hold.release"
+                        " -e ICECC_P50_TEST_ACTION_HOLD_TIMEOUT_MS=300000")
+                    s2_worker_preflight = (
+                        f"test ! -e {worker_root}/s2-action-hold.marker; "
+                        f"test ! -e {worker_root}/s2-action-hold.release; ")
                 worker_inner = (daemon_account +
                                 f"chown -R icecc:icecc /probe/work/envs /probe/work/cache-runtime-f-{relationship}; "
                                 f"/probe/product/daemon/iceccd -p {scheduler_port + 3 + relationship} "
@@ -1235,8 +1263,9 @@ kill -9 "$pid"
                                 f"2>>/probe/work/f-service.stderr")
                 worker = (f"set -eu; root={shlex.quote(staged_roots.get(host, root_mount))}; image={shlex.quote(self.authority['hosts'][host]['image'].get('reference', ''))}; test \"$(docker image inspect --format '{{{{.Id}}}}' \"$image\")\" = {self.authority['hosts'][host]['image']['image_id']}; mkdir -p {worker_root}/envs "
                           f"{worker_root}/cache-runtime-{('f-' + str(relationship))}; chmod 1777 {worker_root} {worker_root}/envs; chmod 700 {worker_root}/cache-runtime-{('f-' + str(relationship))}; "
+                          f"{s2_worker_preflight}"
                           f"for path in {worker_shared_files}; do : >\"$path\"; done; chmod 0666 {worker_shared_files}; "
-                          f"docker run -d --name {token}-f-{relationship} --network host --user 0 --cap-add SYS_CHROOT {profile_flag} -e ICECC_P50_RELATIONSHIP={relationship} -e ICECC_P50_F_ACTION_TRACE=/probe/work/s7-warm-f-action-trace-{relationship}.jsonl -e ICECC_P50_F_LEGACY_WIRE_TRACE=/probe/work/s7-measured-f-legacy-wire-trace-{relationship}.jsonl -e ICECC_P50_TEST_READY_TRACE=/probe/work/ready.trace {mounts_for(host)} -v {worker_root}:/probe/work:rw --entrypoint /bin/sh $image -c {shlex.quote(worker_inner)} "
+                          f"docker run -d --name {token}-f-{relationship} --network host --user 0 --cap-add SYS_CHROOT {profile_flag}{s2_worker_env} -e ICECC_P50_RELATIONSHIP={relationship} -e ICECC_P50_F_ACTION_TRACE=/probe/work/s7-warm-f-action-trace-{relationship}.jsonl -e ICECC_P50_F_LEGACY_WIRE_TRACE=/probe/work/s7-measured-f-legacy-wire-trace-{relationship}.jsonl -e ICECC_P50_TEST_READY_TRACE=/probe/work/ready.trace {mounts_for(host)} -v {worker_root}:/probe/work:rw --entrypoint /bin/sh $image -c {shlex.quote(worker_inner)} "
                           f">{worker_root}/container.stdout 2>&1; test \"$(docker inspect --format '{{{{.State.Running}}}}' {token}-f-{relationship})\" = true; docker inspect --format '{{{{.Id}}}}' {token}-f-{relationship} > {worker_root}/container-id; docker inspect --format '{{{{.State.Pid}}}}' {token}-f-{relationship} > {worker_root}/container-pid; "
                           f"printf 'S8_CONTAINER_ID=%s\\n' \"$(cat {worker_root}/container-id)\"")
                 self.run(host, worker)
@@ -1281,6 +1310,104 @@ test "$after_c_guid" != "$before_c_guid"
 test "$after_f_guid" != "$before_f_guid"
 stat -c %s {worker_root}/f.log >{worker_root}/f-measured-log-offset
 cp {worker_root}/container-id {worker_root}/rotation-after-id
+'''))
+                if s2_process_loss and relationship == 0:
+                    f_s2_kill_scripts.append((host, f'''set -eu
+marker={worker_root}/s2-action-hold.marker
+marker_in=/probe/work/s2-action-hold.marker
+release={worker_root}/s2-action-hold.release
+trace={worker_root}/s7-warm-f-action-trace-{relationship}.jsonl
+ready={worker_root}/ready.trace
+container_id=$(tr -d '[:space:]' <{worker_root}/container-id)
+printf '%s' "$container_id" | grep -Eq '^[0-9a-fA-F]{{12,64}}$'
+docker inspect --format '{{{{.State.Running}}}}' "$container_id" | grep -Fx true
+for _ in $(seq 1 600); do test -f "$marker" && break; sleep 0.1; done
+test -f "$marker" -a ! -L "$marker"
+test ! -e "$release"
+test "$(stat -c %a "$marker")" = 600
+test "$(stat -c %h "$marker")" = 1
+expected_uid=$(docker exec "$container_id" id -u icecc)
+test "$(stat -c %u "$marker")" = "$expected_uid"
+test "$(docker exec "$container_id" /bin/sh -c 'wc -l </probe/work/s2-action-hold.marker')" -eq 2
+test "$(docker exec "$container_id" /bin/sh -c 'tail -c 1 /probe/work/s2-action-hold.marker | od -An -tuC' | tr -d '[:space:]')" = 10
+header=$(docker exec "$container_id" sed -n '1p' "$marker_in")
+marker_json=$(docker exec "$container_id" sed -n '2p' "$marker_in")
+printf '%s\n' "$header" | grep -Eq '^P50_ACTION_HOLD pid=[1-9][0-9]* actor=F action=TX_BEGIN$'
+marker_pid=$(printf '%s\n' "$header" | sed -n 's/^P50_ACTION_HOLD pid=\\([1-9][0-9]*\\) actor=F action=TX_BEGIN$/\\1/p')
+printf '%s\n' "$marker_json" | python3 -c 'import json,sys; value=json.load(sys.stdin); assert value.get("actor") == "F" and value.get("action") == "TX_BEGIN"'
+grep -Fqx -- "$marker_json" "$trace"
+field() {{ printf '%s\n' "$1" | awk -v key="$2" '{{for(i=1;i<=NF;i++){{split($i,a,"="); if(a[1]==key){{print a[2]; exit}}}}}}'; }}
+before_count=$(grep -c '^READY v2 ' "$ready")
+before_ready=$(grep '^READY v2 ' "$ready" | tail -1)
+before_pid=$(field "$before_ready" pid)
+before_c_guid=$(field "$before_ready" C_STORE_GUID)
+before_f_guid=$(field "$before_ready" F_STORE_GUID)
+test "$marker_pid" = "$before_pid"
+printf '%s' "$before_c_guid" | grep -Eq '^[0-9a-f]{{32}}$'
+printf '%s' "$before_f_guid" | grep -Eq '^[0-9a-f]{{32}}$'
+parent_pid=$(docker exec "$container_id" cat "/proc/$before_pid/status" | awk '/^PPid:/ {{print $2}}')
+printf '%s' "$parent_pid" | grep -Eq '^[1-9][0-9]*$'
+marker_sha=$(docker exec "$container_id" sha256sum "$marker_in" | awk '{{print $1}}')
+docker exec --user 0 "$container_id" /bin/sh -c {shlex.quote(sidecar_kill_inner)} p50-sidecar-kill "$before_pid" F /probe/work/cache-runtime-f-{relationship} kill >/dev/null
+replacement_ready=0
+for _ in $(seq 1 600); do
+  ready_now=$(grep -c '^READY v2 ' "$ready" 2>/dev/null || true)
+  if test "${{ready_now:-0}}" -gt "$before_count"; then replacement_ready=1; break; fi
+  sleep 0.1
+done
+test "$replacement_ready" -eq 1
+after_ready=$(grep '^READY v2 ' "$ready" | tail -1)
+after_pid=$(field "$after_ready" pid)
+after_c_guid=$(field "$after_ready" C_STORE_GUID)
+after_f_guid=$(field "$after_ready" F_STORE_GUID)
+printf '%s' "$after_pid" | grep -Eq '^[1-9][0-9]*$'
+printf '%s' "$after_c_guid" | grep -Eq '^[0-9a-f]{{32}}$'
+printf '%s' "$after_f_guid" | grep -Eq '^[0-9a-f]{{32}}$'
+test "$after_pid" != "$before_pid"
+test "$after_c_guid" != "$before_c_guid"
+test "$after_f_guid" != "$before_f_guid"
+after_parent_pid=$(docker exec "$container_id" cat "/proc/$after_pid/status" | awk '/^PPid:/ {{print $2}}')
+test "$after_parent_pid" = "$parent_pid"
+docker exec --user 0 "$container_id" /bin/sh -c {shlex.quote(sidecar_kill_inner)} p50-sidecar-validate "$after_pid" F /probe/work/cache-runtime-f-{relationship} validate >/dev/null
+printf '%s\n' "$before_ready" >{worker_root}/s2-before.ready
+printf '%s\n' "$after_ready" >{worker_root}/s2-after.ready
+printf '%s\n' "$parent_pid" >{worker_root}/s2-parent.pid
+printf '%s\n' "$container_id" >{worker_root}/s2-container-id
+printf '%s\n' "$marker_sha" >{worker_root}/s2-marker.sha256
+printf 'S2_KILL before_pid=%s after_pid=%s parent_pid=%s before_c=%s after_c=%s before_f=%s after_f=%s marker_sha=%s\n' "$before_pid" "$after_pid" "$parent_pid" "$before_c_guid" "$after_c_guid" "$before_f_guid" "$after_f_guid" "$marker_sha"
+'''))
+                    f_s2_verify_scripts.append((host, f'''set -eu
+marker={worker_root}/s2-action-hold.marker
+marker_in=/probe/work/s2-action-hold.marker
+release={worker_root}/s2-action-hold.release
+trace={worker_root}/s7-warm-f-action-trace-{relationship}.jsonl
+ready={worker_root}/ready.trace
+container_id=$(tr -d '[:space:]' <{worker_root}/container-id)
+test "$container_id" = "$(tr -d '[:space:]' <{worker_root}/s2-container-id)"
+docker inspect --format '{{{{.State.Running}}}}' "$container_id" | grep -Fx true
+test -f "$marker" -a ! -L "$marker"
+test ! -e "$release"
+marker_sha=$(docker exec "$container_id" sha256sum "$marker_in" | awk '{{print $1}}')
+test "$marker_sha" = "$(tr -d '[:space:]' <{worker_root}/s2-marker.sha256)"
+field() {{ printf '%s\n' "$1" | awk -v key="$2" '{{for(i=1;i<=NF;i++){{split($i,a,"="); if(a[1]==key){{print a[2]; exit}}}}}}'; }}
+before_ready=$(cat {worker_root}/s2-before.ready)
+after_ready=$(cat {worker_root}/s2-after.ready)
+current_ready=$(grep '^READY v2 ' "$ready" | tail -1)
+before_pid=$(field "$before_ready" pid)
+after_pid=$(field "$after_ready" pid)
+current_pid=$(field "$current_ready" pid)
+parent_pid=$(tr -d '[:space:]' <{worker_root}/s2-parent.pid)
+test "$current_pid" = "$after_pid"
+current_parent_pid=$(docker exec "$container_id" cat "/proc/$current_pid/status" | awk '/^PPid:/ {{print $2}}')
+test "$current_parent_pid" = "$parent_pid"
+docker exec --user 0 "$container_id" /bin/sh -c {shlex.quote(sidecar_kill_inner)} p50-sidecar-validate "$current_pid" F /probe/work/cache-runtime-f-{relationship} validate >/dev/null
+tx_count=$(grep -c '"action":"TX_BEGIN","actor":"F"' "$trace")
+test "$tx_count" -ge 2
+before_c_guid=$(field "$before_ready" C_STORE_GUID)
+after_c_guid=$(field "$after_ready" C_STORE_GUID)
+before_f_guid=$(field "$before_ready" F_STORE_GUID)
+after_f_guid=$(field "$after_ready" F_STORE_GUID)
+printf 'S2_VERIFY before_pid=%s after_pid=%s parent_pid=%s before_c=%s after_c=%s before_f=%s after_f=%s marker_sha=%s tx_count=%s\n' "$before_pid" "$after_pid" "$parent_pid" "$before_c_guid" "$after_c_guid" "$before_f_guid" "$after_f_guid" "$marker_sha" "$tx_count"
 '''))
                 f_prewarm_scripts.append((host,
                     f"set -eu; test -s {worker_root}/s7-warm-f-action-trace-{relationship}.jsonl; "
@@ -1403,11 +1530,32 @@ printf 'S8_SIDECAR_ROTATION role=C relationship=0 before_pid=%s after_pid=%s bef
                 f"{client_work}/external-prewarm.ready", supervisor_failure_path)
             prewarm_encoded = base64.b64encode(prewarm_hook.encode()).decode()
             self.run("q3", f"printf %s {shlex.quote(prewarm_encoded)} | base64 -d >{prewarm_path}; chmod 700 {prewarm_path}")
-            self.run("q3", f"rm -f {client_work}/external-reset.request {client_work}/external-f-traces.request {client_work}/external-reset.ready {client_work}/external-f-traces.ready {supervisor_failure_path}; "
+            s2_hook_path = f"{client_work}/s2-process-loss-hook.sh"
+            if s2_process_loss:
+                s2_hook = f'''#!/bin/sh
+set -eu
+phase=${{4:-}}
+case "$phase" in
+  kill) request={client_work}/external-s2-kill.request; ready={client_work}/external-s2-kill.ready ;;
+  verify) request={client_work}/external-s2-verify.request; ready={client_work}/external-s2-verify.ready ;;
+  *) echo "FAIL: unknown S2 process-loss phase" >&2; exit 2 ;;
+esac
+test ! -e "$request"
+touch "$request"
+while test ! -f "$ready"; do
+  if test -f {supervisor_failure_path}; then cat {supervisor_failure_path} >&2; exit 1; fi
+  sleep 0.2
+done
+'''
+                s2_hook_encoded = base64.b64encode(s2_hook.encode()).decode()
+                self.run("q3", f"printf %s {shlex.quote(s2_hook_encoded)} | base64 -d >{s2_hook_path}; chmod 700 {s2_hook_path}")
+            self.run("q3", f"rm -f {client_work}/external-reset.request {client_work}/external-f-traces.request {client_work}/external-reset.ready {client_work}/external-f-traces.ready {client_work}/external-s2-kill.request {client_work}/external-s2-kill.ready {client_work}/external-s2-verify.request {client_work}/external-s2-verify.ready {client_work}/external-s2-process-loss.json {supervisor_failure_path}; "
                               f"nohup {reset_worker_path} {client_work} {topology} {profile} >{client_work}/reset-worker.stdout 2>&1 & echo $! >{client_work}/reset-worker.pid; "
                               f"nohup {collect_worker_path} {client_work} {topology} {profile} >{client_work}/collect-worker.stdout 2>&1 & echo $! >{client_work}/collect-worker.pid")
             def supervise_external_markers() -> None:
                 reset_done = prewarm_done = collection_done = False
+                s2_kill_done = not s2_process_loss
+                s2_verify_done = not s2_process_loss
                 deadline = time.monotonic() + self.timeout
                 def record_failure(message: str) -> None:
                     supervisor_errors.append(message)
@@ -1425,6 +1573,98 @@ printf 'S8_SIDECAR_ROTATION role=C relationship=0 before_pid=%s after_pid=%s bef
                         result = s4.run_script("q3", "test -f \"$1\"", [path], timeout=30)
                         return result.returncode == 0
                     try:
+                        if not s2_kill_done and exists(f"{client_work}/external-s2-kill.request"):
+                            if len(f_s2_kill_scripts) != 1:
+                                raise ExternalFarmError("s2_process_loss:kill_target_ambiguous")
+                            host, script = f_s2_kill_scripts[0]
+                            s2_worker_root = worker_work(0)
+                            self.run(host,
+                                     f"set -eu; for _ in $(seq 1 600); do test -f {s2_worker_root}/s2-action-hold.marker && exit 0; sleep 0.1; done; exit 1")
+                            scheduler_offset_text = self.run(
+                                "q3", f"stat -c %s {client_work}/scheduler.log").stdout.strip()
+                            scheduler_offset = int(scheduler_offset_text)
+                            killed = self.run(host, script)
+                            match = re.search(
+                                r"S2_KILL before_pid=([0-9]+) after_pid=([0-9]+) parent_pid=([0-9]+) "
+                                r"before_c=([0-9a-f]{32}) after_c=([0-9a-f]{32}) "
+                                r"before_f=([0-9a-f]{32}) after_f=([0-9a-f]{32}) "
+                                r"marker_sha=([0-9a-f]{64})", killed.stdout)
+                            if match is None:
+                                raise ExternalFarmError("s2_process_loss:kill_evidence_missing")
+                            advertisement = {
+                                "P29": "p29", "ZSTD_TU": "zstd_tu",
+                                "ZSTD_ROUTE": "z3_long", "GRZ_RESIDUAL": "grz",
+                            }[profile]
+                            self.run("q3", f'''set -eu
+ready=0
+for _ in $(seq 1 600); do
+  if tail -c +{scheduler_offset + 1} {client_work}/scheduler.log | grep -E 'RELOGIN p50-f.*cache=.*cache_profiles=.*{advertisement}' >/dev/null 2>&1; then ready=1; break; fi
+  sleep 0.1
+done
+test "$ready" -eq 1
+''')
+                            s2_state.update({
+                                "before": {"pid": int(match.group(1)),
+                                           "parent_pid": int(match.group(3)),
+                                           "c_store_guid": match.group(4),
+                                           "f_store_guid": match.group(6)},
+                                "after": {"pid": int(match.group(2)),
+                                          "parent_pid": int(match.group(3)),
+                                          "c_store_guid": match.group(5),
+                                          "f_store_guid": match.group(7)},
+                                "marker_sha256": match.group(8),
+                                "scheduler_relogin": True,
+                            })
+                            self.run("q3", f"touch {client_work}/external-s2-kill.ready")
+                            s2_kill_done = True
+                        if not s2_verify_done and exists(f"{client_work}/external-s2-verify.request"):
+                            if not s2_kill_done or len(f_s2_verify_scripts) != 1:
+                                raise ExternalFarmError("s2_process_loss:verify_without_kill")
+                            host, script = f_s2_verify_scripts[0]
+                            verified = self.run(host, script)
+                            match = re.search(
+                                r"S2_VERIFY before_pid=([0-9]+) after_pid=([0-9]+) parent_pid=([0-9]+) "
+                                r"before_c=([0-9a-f]{32}) after_c=([0-9a-f]{32}) "
+                                r"before_f=([0-9a-f]{32}) after_f=([0-9a-f]{32}) "
+                                r"marker_sha=([0-9a-f]{64}) tx_count=([0-9]+)", verified.stdout)
+                            if match is None or int(match.group(9)) < 2:
+                                raise ExternalFarmError("s2_process_loss:verification_evidence_missing")
+                            expected = (
+                                s2_state["before"]["pid"], s2_state["after"]["pid"],
+                                s2_state["after"]["parent_pid"],
+                                s2_state["before"]["c_store_guid"],
+                                s2_state["after"]["c_store_guid"],
+                                s2_state["before"]["f_store_guid"],
+                                s2_state["after"]["f_store_guid"],
+                                s2_state["marker_sha256"],
+                            )
+                            observed = (int(match.group(1)), int(match.group(2)), int(match.group(3)),
+                                        *match.groups()[3:8])
+                            if observed != expected:
+                                raise ExternalFarmError("s2_process_loss:identity_changed_during_verify")
+                            evidence = {
+                                "schema": "icecream-s2-process-loss-v1",
+                                "status": "PASS",
+                                "role": "F",
+                                "relationship": 0,
+                                "action": "TX_BEGIN",
+                                "before": s2_state["before"],
+                                "after": s2_state["after"],
+                                "marker_sha256": s2_state["marker_sha256"],
+                                "marker_unchanged": True,
+                                "release_absent": True,
+                                "replacement_ready": True,
+                                "scheduler_relogin": True,
+                                "original_compile_completed": True,
+                                "tx_begin_records": int(match.group(9)),
+                            }
+                            encoded_evidence = base64.b64encode(
+                                (json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n").encode()).decode()
+                            self.run(
+                                "q3",
+                                f"set -eu; printf %s {shlex.quote(encoded_evidence)} | base64 -d >{client_work}/external-s2-process-loss.json.tmp; chmod 600 {client_work}/external-s2-process-loss.json.tmp; mv {client_work}/external-s2-process-loss.json.tmp {client_work}/external-s2-process-loss.json; touch {client_work}/external-s2-verify.ready")
+                            s2_state["verified"] = True
+                            s2_verify_done = True
                         if not reset_done and exists(f"{client_work}/external-reset.request"):
                             for host, script in f_reset_scripts:
                                 self.run(host, script)
@@ -1547,11 +1787,14 @@ printf 'S8_SIDECAR_ROTATION role=C relationship=0 before_pid=%s after_pid=%s bef
                             self.run("q3", completion +
                                      f"\ntouch {client_work}/external-f-traces.ready")
                             collection_done = True
-                    except (ExternalFarmError, OSError, subprocess.SubprocessError) as exc:
+                    except (ExternalFarmError, OSError, subprocess.SubprocessError,
+                            KeyError, ValueError) as exc:
                         record_failure(str(exc))
                         return
                     time.sleep(0.2)
-                if not supervisor_stop.is_set() and (not reset_done or not collection_done):
+                if not supervisor_stop.is_set() and (
+                        not reset_done or not collection_done or
+                        not s2_kill_done or not s2_verify_done):
                     record_failure("external:marker_supervisor_timeout")
             supervisor = threading.Thread(target=supervise_external_markers, daemon=True)
             supervisor.start()
@@ -1580,6 +1823,8 @@ printf 'S8_SIDECAR_ROTATION role=C relationship=0 before_pid=%s after_pid=%s bef
                             f"ICECC_P50_EXTERNAL_COLLECT_READY={client_work}/external-f-traces.ready",
                             f"ICECC_P50_EXTERNAL_PREWARM_HOOK={prewarm_path}",
                             f"ICECC_P50_EXTERNAL_PREWARM_READY={client_work}/external-prewarm.ready"]
+            if s2_process_loss:
+                external_env.append(f"ICECC_P50_EXTERNAL_S2_HOOK={s2_hook_path}")
             command = list(batch_command)
             if command[0] == "env":
                 # build_command places its ordinary workdir assignment near
@@ -1602,6 +1847,8 @@ printf 'S8_SIDECAR_ROTATION role=C relationship=0 before_pid=%s after_pid=%s bef
             supervisor.join(timeout=30)
             if supervisor_errors:
                 raise ExternalFarmError(supervisor_errors[0])
+            if s2_process_loss and s2_state.get("verified") is not True:
+                raise ExternalFarmError("s2_process_loss:evidence_not_verified")
             witness_values: list[dict[str, Any]] = []
             for host, relationship in first_relationship_for_host.items():
                 after = self.run(host, interference_stop_script(),
@@ -1625,6 +1872,19 @@ printf 'S8_SIDECAR_ROTATION role=C relationship=0 before_pid=%s after_pid=%s bef
             _copy_remote_tree(
                 "q3", client_work, Path(client_work),
                 str(self.authority["hosts"]["q3"]["image"]["reference"]), self.timeout)
+            if s2_process_loss:
+                s2_source = Path(client_work) / "external-s2-process-loss.json"
+                _sha(s2_source)
+                try:
+                    s2_value = json.loads(s2_source.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                    raise ExternalFarmError("s2_process_loss:evidence_invalid") from exc
+                if (s2_value.get("schema") != "icecream-s2-process-loss-v1" or
+                        s2_value.get("status") != "PASS"):
+                    raise ExternalFarmError("s2_process_loss:evidence_invalid")
+                s2_retained = output / "s2-process-loss.json"
+                s2_retained.write_bytes(s2_source.read_bytes())
+                s2_retained.chmod(0o600)
             for relationship, host in enumerate(relationship_hosts):
                 _copy_remote_tree(host, worker_work(relationship),
                                   output / f"remote-f-{relationship}",
@@ -1717,6 +1977,8 @@ printf 'S8_SIDECAR_ROTATION role=C relationship=0 before_pid=%s after_pid=%s bef
                                                      "role-placement.json", "calibration-metadata.json",
                                                      "external-farm-receipt.json", "product-output.log"],
                               "output": str(output)}
+            if s2_process_loss:
+                result_payload["retained_artifacts"].append("s2-process-loss.json")
             receipt_context["result_payload"] = result_payload
             return result_payload
         except BaseException as exc:
@@ -1895,7 +2157,8 @@ def execute_and_finalize_external_cell(
         timestamp: str | None = None, artifact_sample: int = 2,
         retain_all_artifacts: bool = False,
         reference_witness: Path | None = None,
-        reference_authority: Path | None = None) -> Path:
+        reference_authority: Path | None = None,
+        s2_process_loss: bool = False) -> Path:
     """Execute one authenticated external cell and finalize it immediately.
 
     ``SSHTransport.execute`` owns remote placement, execution, retention, and
@@ -1962,7 +2225,8 @@ def execute_and_finalize_external_cell(
         reference_authority=reuse_authority,
         reference_image=(transport.authority["hosts"]["q3"]["image"]
                          if reference_witness is not None else None),
-        reference_toolchain=reference_toolchain)
+        reference_toolchain=reference_toolchain,
+        s2_process_loss=s2_process_loss)
     result = execute(
         topology=topology, relationship_hosts=relationship_hosts,
         profile=profile, batch_manifest=batch_manifest,
@@ -2046,6 +2310,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="authority snapshot used when minting/reusing a witness")
     parser.add_argument("--artifact-sample", type=int, default=2)
     parser.add_argument("--retain-all-artifacts", action="store_true")
+    parser.add_argument("--s2-process-loss", action="store_true")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
     try:
@@ -2085,7 +2350,8 @@ def main(argv: list[str] | None = None) -> int:
                 retain_all_artifacts=args.retain_all_artifacts,
                 reference_witness=(args.reference_witness.absolute()
                                    if args.reference_witness else None),
-                reference_authority=reference_authority if args.reference_witness else None)
+                reference_authority=reference_authority if args.reference_witness else None,
+                s2_process_loss=args.s2_process_loss)
             print(json.dumps({"status": "PASS", "output": str(result)},
                              sort_keys=True, separators=(",", ":")))
             return 0

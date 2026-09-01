@@ -22,9 +22,14 @@ reference_reuse=0
 reference_witness=${ICECC_P50_REFERENCE_WITNESS:-}
 reference_authority=${ICECC_P50_REFERENCE_AUTHORITY:-}
 predictive_plan=${ICECC_P50_PREDICTIVE_PLAN:-}
+s2_process_loss=${ICECC_P50_S2_PROCESS_LOSS:-0}
 case "$external_mode" in
     0|1) ;;
     *) echo "FAIL: ICECC_P50_EXTERNAL_FARM must be 0 or 1" >&2; exit 1 ;;
+esac
+case "$s2_process_loss" in
+    0|1) ;;
+    *) echo "FAIL: ICECC_P50_S2_PROCESS_LOSS must be 0 or 1" >&2; exit 1 ;;
 esac
 case "$suite" in
     C1F1/100000) relationship_count=1; slots_per_f=1; execution_slots=1 ;;
@@ -73,6 +78,17 @@ case "$profile_marker" in
         exit 1
         ;;
 esac
+if test "$s2_process_loss" = 1; then
+    if test "$external_mode" != 1 || test "$suite" != C1F1/100000 || \
+            test "$cache_enabled" -ne 1; then
+        echo "FAIL: S2 process-loss gate requires external cache-enabled C1F1" >&2
+        exit 1
+    fi
+    test -n "${ICECC_P50_EXTERNAL_S2_HOOK:-}" || {
+        echo "FAIL: S2 process-loss external hook is required" >&2
+        exit 1
+    }
+fi
 if test "$cache_enabled" -eq 0; then
     unset ICECC_P50_C1F1_REQUIRED
 fi
@@ -167,7 +183,7 @@ cleanup() {
     # Batch wrappers own their compiler child and remove their planned-lane
     # marker from an EXIT trap.  Stop them before the daemons so an interrupted
     # parallel batch cannot strand a compiler or a lane lease.
-    cleanup_pids="${batch_job_pids:-} ${service_pid:-} ${client_service_pid:-} ${client_pid:-} ${worker_pids:-} ${service_pids:-} ${worker_pid:-} ${sched_pid:-}"
+    cleanup_pids="${batch_job_pids:-} ${s2_compile_pid:-} ${service_pid:-} ${client_service_pid:-} ${client_pid:-} ${worker_pids:-} ${service_pids:-} ${worker_pid:-} ${sched_pid:-}"
     for pid in $cleanup_pids; do
         test -n "$pid" && kill "$pid" 2>/dev/null || :
     done
@@ -226,6 +242,13 @@ c_action_trace="$work/s7-warm-c-action-trace.jsonl"
 f_action_trace="$work/s7-warm-f-action-trace.jsonl"
 c_legacy_wire_trace="$work/s7-measured-c-legacy-wire-trace.jsonl"
 f_legacy_wire_trace="$work/s7-measured-f-legacy-wire-trace.jsonl"
+s2_external_evidence="$work/external-s2-process-loss.json"
+if test "$s2_process_loss" = 1; then
+    test ! -e "$s2_external_evidence" || {
+        echo "FAIL: S2 process-loss evidence path is not fresh" >&2
+        exit 1
+    }
+fi
 pick_port_pair() {
     python3 - "$suite" <<'PY'
 import secrets
@@ -1051,6 +1074,90 @@ compile_once() {
     fi
 }
 
+s2_compile_with_process_loss() {
+    s2_hook=${ICECC_P50_EXTERNAL_S2_HOOK:-}
+    test -x "$s2_hook" || {
+        echo "FAIL: S2 process-loss hook is not executable" >&2
+        return 1
+    }
+    compile_once env-warm "$work/src/environment-readiness.cpp" "" "" "" 0 0 "" &
+    s2_compile_pid=$!
+    set +e
+    "$s2_hook" "$work" "$suite" "$profile_marker" kill
+    s2_hook_status=$?
+    set -e
+    if test "$s2_hook_status" -ne 0; then
+        kill "$s2_compile_pid" 2>/dev/null || :
+        set +e
+        wait "$s2_compile_pid"
+        set -e
+        s2_compile_pid=
+        echo "FAIL: S2 process-loss kill/replacement hook failed" >&2
+        return 1
+    fi
+    set +e
+    wait "$s2_compile_pid"
+    s2_compile_status=$?
+    set -e
+    s2_compile_pid=
+    test "$s2_compile_status" -eq 0 || {
+        echo "FAIL: original compile did not recover after F sidecar loss (status $s2_compile_status)" >&2
+        return 1
+    }
+}
+
+s2_verify_process_loss() {
+    s2_hook=${ICECC_P50_EXTERNAL_S2_HOOK:-}
+    "$s2_hook" "$work" "$suite" "$profile_marker" verify || {
+        echo "FAIL: S2 process-loss final verification hook failed" >&2
+        return 1
+    }
+    if test ! -s "$s2_external_evidence" || test -L "$s2_external_evidence"; then
+        echo "FAIL: S2 process-loss evidence is missing" >&2
+        return 1
+    fi
+    python3 - "$s2_external_evidence" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+value = json.loads(path.read_text(encoding="utf-8"))
+if (value.get("schema") != "icecream-s2-process-loss-v1" or
+        value.get("status") != "PASS" or value.get("role") != "F" or
+        value.get("relationship") != 0 or value.get("action") != "TX_BEGIN"):
+    raise SystemExit("S2 process-loss evidence identity is invalid")
+for key in ("marker_unchanged", "release_absent", "replacement_ready",
+            "scheduler_relogin", "original_compile_completed"):
+    if value.get(key) is not True:
+        raise SystemExit(f"S2 process-loss evidence is missing {key}")
+marker_sha = value.get("marker_sha256")
+if not isinstance(marker_sha, str) or re.fullmatch(r"[0-9a-f]{64}", marker_sha) is None:
+    raise SystemExit("S2 process-loss marker digest is invalid")
+before = value.get("before")
+after = value.get("after")
+if not isinstance(before, dict) or not isinstance(after, dict):
+    raise SystemExit("S2 process-loss READY identities are missing")
+for identity in (before, after):
+    if (type(identity.get("pid")) is not int or identity["pid"] <= 0 or
+            type(identity.get("parent_pid")) is not int or identity["parent_pid"] <= 0):
+        raise SystemExit("S2 process-loss PID identity is invalid")
+    for key in ("c_store_guid", "f_store_guid"):
+        if not isinstance(identity.get(key), str) or re.fullmatch(r"[0-9a-f]{32}", identity[key]) is None:
+            raise SystemExit(f"S2 process-loss {key} is invalid")
+if (before["pid"] == after["pid"] or
+        before["c_store_guid"] == after["c_store_guid"] or
+        before["f_store_guid"] == after["f_store_guid"] or
+        before["parent_pid"] != after["parent_pid"]):
+    raise SystemExit("S2 process-loss replacement identity did not rotate under one F daemon")
+print("S2_PROCESS_LOSS role=F relationship=0 action=TX_BEGIN "
+      f"before_pid={before['pid']} after_pid={after['pid']} "
+      f"parent_pid={after['parent_pid']} marker_sha256={marker_sha} "
+      "original_compile_rc=0 replacement_ready=1 scheduler_relogin=1 one_shot=1")
+PY
+}
+
 # A batch always reuses this one scheduler/C/F/cache lifecycle.  Warm mode
 # first compiles the exact selected ordered manifest as prewarm work; those
 # rows remain outside measured evidence while the trace offsets below bind the
@@ -1170,7 +1277,11 @@ elif test "$suite" = C1F20/40; then
         environment_warmup_count=$((environment_warmup_count + 1))
     done
 else
-    compile_once env-warm "$work/src/environment-readiness.cpp" "" "" "" 0 0 ""
+    if test "$s2_process_loss" = 1; then
+        s2_compile_with_process_loss
+    else
+        compile_once env-warm "$work/src/environment-readiness.cpp" "" "" "" 0 0 ""
+    fi
     grep -F 'has env: false' "$work/client-compile-env-warm.log" >/dev/null || {
         echo "FAIL: F environment was not installed by the first real assignment" >&2
         exit 1
@@ -1180,6 +1291,9 @@ else
         echo "FAIL: environment-bearing assignment was not observed" >&2
         exit 1
     }
+    if test "$s2_process_loss" = 1; then
+        s2_verify_process_loss
+    fi
     echo "S8_ENV_WARMUP relationship=0 warmup_label=env-warm ready_label=env-ready warmup_has_env=false ready_has_env=true preparation_measured=0 cache_state=pre_rotation"
     environment_warmup_count=1
 fi

@@ -87,6 +87,22 @@ contract() {
     require_text "$root/unittests/p50compilee2e-run.sh" \
         'profile_advertisement=grz' || return 1
     require_text "$root/unittests/p50compilee2e-run.sh" 'profile_advertisement' || return 1
+    # S2's process-loss gate must stop the exact F sidecar only after its
+    # complete TX_BEGIN witness is published, then require the original
+    # compiler invocation and its replacement/replay to finish.
+    require_text "$root/cache/p50_actions.cpp" 'ICECC_P50_TEST_ACTION_HOLD' || return 1
+    require_text "$root/cache/p50_actions.cpp" 'sync_file(fd' || return 1
+    require_text "$root/cache/p50_actions.cpp" '::rename(temporary.c_str(), marker)' || return 1
+    require_text "$root/unittests/p50compilee2e-run.sh" 's2_compile_with_process_loss' || return 1
+    require_text "$root/unittests/p50compilee2e-run.sh" \
+        'original compile did not recover after F sidecar loss' || return 1
+    require_text "$root/unittests/p50compilee2e-run.sh" 's2_verify_process_loss' || return 1
+    require_text "$root/farmharness/s8_external_farm_executor.py" \
+        '-e ICECC_P50_TEST_ACTION_HOLD=F:TX_BEGIN' || return 1
+    require_text "$root/farmharness/s8_external_farm_executor.py" \
+        'S2_KILL before_pid=' || return 1
+    require_text "$root/farmharness/s8_external_farm_executor.py" \
+        'external-s2-process-loss.json' || return 1
     require_text "$root/client/Makefile.am" 'libp50zstdsender.a' || return 1
     require_text "$root/client/Makefile.am" 'libp50localtransport.a' || return 1
     require_text "$root/client/Makefile.am" 'libprotocol50.a' || return 1
@@ -164,6 +180,15 @@ for pair in \
     "unittests/p50compilee2e-run.sh|requires a product build configured with libbsc" \
     "unittests/p50compilee2e-run.sh|profile_advertisement=grz" \
     "unittests/p50compilee2e-run.sh|profile_advertisement" \
+    "cache/p50_actions.cpp|ICECC_P50_TEST_ACTION_HOLD" \
+    "cache/p50_actions.cpp|sync_file(fd" \
+    "cache/p50_actions.cpp|::rename(temporary.c_str(), marker)" \
+    "unittests/p50compilee2e-run.sh|s2_compile_with_process_loss" \
+    "unittests/p50compilee2e-run.sh|original compile did not recover after F sidecar loss" \
+    "unittests/p50compilee2e-run.sh|s2_verify_process_loss" \
+    "farmharness/s8_external_farm_executor.py|-e ICECC_P50_TEST_ACTION_HOLD=F:TX_BEGIN" \
+    "farmharness/s8_external_farm_executor.py|S2_KILL before_pid=" \
+    "farmharness/s8_external_farm_executor.py|external-s2-process-loss.json" \
     "client/Makefile.am|libp50zstdsender.a" \
     "cache/Makefile.am|libp50inputfd.a" \
     "cache/p50_cache_service.cpp|std::make_unique<P50ServerEndpoint>" \
