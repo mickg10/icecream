@@ -118,6 +118,76 @@ def _capability_fixture(tmp_path: Path) -> tuple[Path, str, dict[str, object]]:
     return capability_path, hashlib.sha256(capability_path.read_bytes()).hexdigest(), capability
 
 
+def _raw_authority_fixture(tmp_path: Path, inventory: Path, *, rows: str = "full",
+                           wrong_cell: bool = False) -> tuple[Path, str]:
+    """Create one authenticated RAW_II corpus/regime authority entry."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    inventory_value = json.loads(inventory.read_text())
+    corpus = inventory_value["corpus_manifests"][0]
+    manifest = Path(corpus["manifest"]["path"])
+    source_rows = []
+    for ordinal, source_path in enumerate(manifest.read_text().splitlines()):
+        path = Path(source_path)
+        raw = path.read_bytes()
+        source_rows.append({
+            "ordinal": ordinal,
+            "source_relative": str(path.resolve().relative_to(manifest.parent.resolve())),
+            "source_sha256": hashlib.sha256(raw).hexdigest(),
+            "source_bytes": len(raw),
+        })
+    if rows == "missing":
+        source_rows = source_rows[:-1]
+    witness_rows = [{**row, "c_to_f": {"compile_file_bytes": 10, "file_chunk_bytes": 20,
+                                       "end_bytes": 3, "total_bytes": 33}}
+                    for row in source_rows]
+    engine_rows = [{**row, "f_to_c_bytes": 17, "elapsed_ns": 100}
+                   for row in source_rows]
+    if rows == "duplicate":
+        witness_rows.append(witness_rows[0])
+    cell = {"corpus": corpus["manifest_id"], "profile": "RAW_II", "regime": "cold"}
+    file_cell = dict(cell)
+    if wrong_cell:
+        file_cell["regime"] = "warm"
+    witness_value = {"schema": planner.RAW_II_WITNESS_SCHEMA,
+                     "semantics": planner.RAW_II_SEMANTICS, "cell": file_cell,
+                     "formula": planner.RAW_II_FORMULA, "rows": witness_rows}
+    engine_value = {"schema": planner.RAW_II_ENGINE_SCHEMA,
+                    "semantics": planner.RAW_II_SEMANTICS, "cell": file_cell,
+                    "control_baseline": planner.RAW_II_BASELINE,
+                    "engine_scope": "raw_ii_control_engine", "model_id": "fixture-v1",
+                    "rows": engine_rows}
+    witness_path = tmp_path / "witness.json"
+    engine_path = tmp_path / "engine.json"
+    witness_path.write_bytes(planner._canonical(witness_value))
+    engine_path.write_bytes(planner._canonical(engine_value))
+    source_root = tmp_path / "producer-source"
+    source_root.mkdir()
+    source_path = source_root / planner.RAW_II_PRODUCER_SOURCE
+    source_path.write_text("# dedicated RAW_II producer fixture\n")
+    subprocess.run(["git", "init", "-q", str(source_root)], check=True)
+    subprocess.run(["git", "-C", str(source_root), "config", "user.email", "fixture@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(source_root), "config", "user.name", "fixture"], check=True)
+    subprocess.run(["git", "-C", str(source_root), "add", source_path.name], check=True)
+    subprocess.run(["git", "-C", str(source_root), "commit", "-q", "-m", "fixture"], check=True)
+    source_raw = source_path.read_bytes()
+    source = {"path": str(source_path), "bytes": len(source_raw),
+              "sha256": hashlib.sha256(source_raw).hexdigest(),
+              "commit": subprocess.check_output(["git", "-C", str(source_root), "rev-parse", "HEAD"], text=True).strip(),
+              "tree": subprocess.check_output(["git", "-C", str(source_root), "rev-parse", "HEAD^{tree}"], text=True).strip()}
+    def descriptor(path: Path) -> dict[str, object]:
+        raw = path.read_bytes()
+        return {"path": str(path), "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+    authority = {"schema": planner.RAW_II_AUTHORITY_SCHEMA, "status": "PASS",
+                 "capability": planner.RAW_II_CAPABILITY,
+                 "producer": "farmharness.s8_raw_ii_predictive_producer",
+                 "producer_source": source,
+                 "cells": [{"cell": cell, "witness": descriptor(witness_path),
+                            "engine": descriptor(engine_path)}]}
+    authority_path = tmp_path / "raw-ii-authority.json"
+    authority_path.write_bytes(planner._canonical(authority))
+    return authority_path, hashlib.sha256(authority_path.read_bytes()).hexdigest()
+
+
 def test_authenticates_all_manifests_and_preserves_order(tmp_path: Path) -> None:
     result, output, _, _, _ = _plan(tmp_path)
     authority = result["corpus_authority"]
@@ -136,7 +206,7 @@ def test_declares_distinct_methods_topologies_depths_and_statuses(tmp_path: Path
     result, output, _, _, _ = _plan(tmp_path, current=True)
     assert [item["name"] for item in result["methods"]] == list(planner.METHODS)
     assert [item["root_status"] for item in result["methods"]] == [
-        "NOT_IMPLEMENTED", "IMPLEMENTED", "IMPLEMENTED", "IMPLEMENTED", "IMPLEMENTED",
+        "IMPLEMENTED", "IMPLEMENTED", "IMPLEMENTED", "IMPLEMENTED", "IMPLEMENTED",
         "NOT_IMPLEMENTED", "NOT_IMPLEMENTED"]
     raw_method = result["methods"][0]
     assert raw_method["arm_kind"] == "control_baseline"
@@ -147,7 +217,7 @@ def test_declares_distinct_methods_topologies_depths_and_statuses(tmp_path: Path
     assert result["topologies"][1]["stream_capacity_tus"] is None
     assert result["depths"] == ["100", "200", "full-1", "state-carrying full-2"]
     assert result["counts"]["historical_image_seven_method_grid"] == 4928
-    assert result["counts"]["current_image_implemented_subset"] == 704
+    assert result["counts"]["current_image_implemented_subset"] == 880
     assert result["counts"]["descriptor_status_counts"] == {
         "READY": 0, "NOT_READY": 1232, "MISSING_EXTERNAL_AUTHORITY": 4928}
     assert result["counts"]["current_image_ready"] == 0
@@ -155,11 +225,12 @@ def test_declares_distinct_methods_topologies_depths_and_statuses(tmp_path: Path
     assert all("docker run" not in line and "simulator" not in line for line in lines)
     current_implemented = [json.loads(line) for line in lines
                            if json.loads(line)["image"]["key"] == "current-pinned"
-                           and json.loads(line)["method"] in planner.IMPLEMENTED_METHODS]
-    assert len(current_implemented) == 704
+                           and json.loads(line)["method"] in planner.IMPLEMENTED_ROOT_METHODS]
+    assert len(current_implemented) == 880
     assert {item["status"] for item in current_implemented} == {"NOT_READY"}
     assert {item["reason"] for item in current_implemented} == {
-        "required_producer_capability_not_integrated_on_planner_source"}
+        "required_producer_capability_not_integrated_on_planner_source",
+        "raw_ii_control_authority_not_integrated_on_planner_source"}
     assert result["corpus_authority"]["snapshots"]["count"] == 8261
     first = json.loads(lines[0])
     assert first["arm_kind"] == "control_baseline"
@@ -319,3 +390,70 @@ def test_capability_path_swap_fails_closed(tmp_path: Path) -> None:
     binary.symlink_to(replacement)
     with pytest.raises(planner.PlannerError, match="binary:scheduler:(unavailable|not_private_regular_file)"):
         planner._load_capability(capability_path, capability_sha)
+
+
+def test_raw_ii_authority_makes_only_exact_cells_ready(tmp_path: Path) -> None:
+    inventory, recovery, recovery_sha, matrix, matrix_sha = _authority(tmp_path / "authority")
+    authority, authority_sha = _raw_authority_fixture(tmp_path / "raw", inventory)
+    result = planner.plan_campaign(
+        inventory, recovery, recovery_sha, matrix, matrix_sha, tmp_path / "out",
+        "20260829T000000Z", current_image_name="image:tag",
+        current_image_id="sha256:" + "a" * 64,
+        raw_ii_authority_manifest=authority,
+        raw_ii_authority_manifest_sha256=authority_sha)
+    raw_ready = [json.loads(line) for line in (tmp_path / "out" / "descriptors.jsonl").read_text().splitlines()
+                 if json.loads(line)["image"]["key"] == "current-pinned" and
+                 json.loads(line)["method"] == "RAW_II" and json.loads(line)["status"] == "READY"]
+    assert len(raw_ready) == 8  # one corpus/regime, two topologies, four depths
+    assert {item["producer_capability"] for item in raw_ready} == {planner.RAW_II_CAPABILITY}
+    assert result["counts"]["current_image_ready"] == 8
+    assert planner.RAW_II_CAPABILITY != planner.CAPABILITY
+
+
+def test_raw_ii_authority_missing_cell_stays_not_ready(tmp_path: Path) -> None:
+    inventory, recovery, recovery_sha, matrix, matrix_sha = _authority(tmp_path / "authority")
+    authority, authority_sha = _raw_authority_fixture(tmp_path / "raw", inventory)
+    planner.plan_campaign(
+        inventory, recovery, recovery_sha, matrix, matrix_sha, tmp_path / "out",
+        "20260829T000000Z", current_image_name="image:tag",
+        current_image_id="sha256:" + "a" * 64,
+        raw_ii_authority_manifest=authority,
+        raw_ii_authority_manifest_sha256=authority_sha)
+    raw = [json.loads(line) for line in (tmp_path / "out" / "descriptors.jsonl").read_text().splitlines()
+           if json.loads(line)["image"]["key"] == "current-pinned" and json.loads(line)["method"] == "RAW_II"]
+    assert {item["status"] for item in raw} == {"READY", "NOT_READY"}
+    assert any(item["reason"] == "raw_ii_exact_cell_inputs_unavailable" for item in raw)
+
+
+@pytest.mark.parametrize("fixture_kwargs,match", [
+    ({"wrong_cell": True}, "scope_invalid"),
+    ({"rows": "missing"}, "coverage_incomplete"),
+    ({"rows": "duplicate"}, "duplicate_occurrence"),
+])
+def test_raw_ii_authority_rejects_wrong_or_incomplete_inputs(tmp_path: Path,
+                                                              fixture_kwargs: dict[str, object],
+                                                              match: str) -> None:
+    inventory, recovery, recovery_sha, matrix, matrix_sha = _authority(tmp_path / "authority")
+    authority, authority_sha = _raw_authority_fixture(tmp_path / "raw", inventory, **fixture_kwargs)
+    with pytest.raises(planner.PlannerError, match=match):
+        planner.plan_campaign(
+            inventory, recovery, recovery_sha, matrix, matrix_sha, tmp_path / "out",
+            "20260829T000000Z", current_image_name="image:tag",
+            current_image_id="sha256:" + "a" * 64,
+            raw_ii_authority_manifest=authority,
+            raw_ii_authority_manifest_sha256=authority_sha)
+
+
+def test_raw_ii_authority_mutated_file_fails_closed(tmp_path: Path) -> None:
+    inventory, recovery, recovery_sha, matrix, matrix_sha = _authority(tmp_path / "authority")
+    authority, authority_sha = _raw_authority_fixture(tmp_path / "raw", inventory)
+    value = json.loads(authority.read_text())
+    witness = Path(value["cells"][0]["witness"]["path"])
+    witness.write_bytes(witness.read_bytes() + b"mutated")
+    with pytest.raises(planner.PlannerError, match="witness_(bytes|sha256)_mismatch"):
+        planner.plan_campaign(
+            inventory, recovery, recovery_sha, matrix, matrix_sha, tmp_path / "out",
+            "20260829T000000Z", current_image_name="image:tag",
+            current_image_id="sha256:" + "a" * 64,
+            raw_ii_authority_manifest=authority,
+            raw_ii_authority_manifest_sha256=authority_sha)

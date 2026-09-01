@@ -26,6 +26,17 @@ RECOVERY_SCHEMA = "icecream-s8-image-authority-recovery-v1"
 MATRIX_AUDIT_SCHEMA = "icecream-s8-matrix-audit-v1"
 CAPABILITY_SCHEMA = "icecream-s8-native-live-runner-capability-v1"
 CAPABILITY = "icecream.s8.native-live-runner-v1"
+RAW_II_AUTHORITY_SCHEMA = "icecream-s8-raw-ii-planner-authority-v1"
+RAW_II_CAPABILITY = "icecream.s8.raw-ii-control-v1"
+RAW_II_PRODUCER_SOURCE = "s8_raw_ii_predictive_producer.py"
+RAW_II_WITNESS_SCHEMA = "icecream-s8-raw-ii-legacy-wire-witness-v1"
+RAW_II_ENGINE_SCHEMA = "icecream-s8-raw-ii-control-engine-v2"
+RAW_II_SEMANTICS = "s8-current-semantics-v1"
+RAW_II_FORMULA = {
+    "name": "legacy-filechunk-wire-v1",
+    "c_to_f": "compile_file_bytes+file_chunk_bytes+end_bytes",
+}
+RAW_II_BASELINE = "icecream-s8-raw-ii-control-baseline-v1"
 TIMESTAMP_RE = re.compile(r"^\d{8}T\d{6}Z$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -45,10 +56,12 @@ CORPUS_AUTHORITY = (
 METHODS = ("RAW_II", "ZSTD_TU", "ZSTD_ROUTE", "P29", "GRZ_RESIDUAL",
            "ZSTD_COHORT", "ZSTD_GLOBAL")
 EXPECTED_METHODS = METHODS
-IMPLEMENTED_METHODS = frozenset(("ZSTD_TU", "ZSTD_ROUTE", "P29", "GRZ_RESIDUAL"))
-# RAW_II remains an explicit control arm, separate from the four compressed
-# producer methods.  Its inputs must be supplied by a future control runner.
 CONTROL_METHODS = frozenset(("RAW_II",))
+# Keep the compressed producer set distinct from the whole-legacy control arm.
+# RAW_II is implemented by its own producer, but is never made a compressed
+# profile by adding it to IMPLEMENTED_METHODS.
+IMPLEMENTED_METHODS = frozenset(("ZSTD_TU", "ZSTD_ROUTE", "P29", "GRZ_RESIDUAL"))
+IMPLEMENTED_ROOT_METHODS = IMPLEMENTED_METHODS | CONTROL_METHODS
 DEPTHS = ("100", "200", "full-1", "state-carrying full-2")
 EXPECTED_DEPTHS = DEPTHS
 REGIMES = ("cold", "warm")
@@ -77,7 +90,8 @@ HISTORICAL_IMAGES = (
     ("fedora-clang-libcxx", "sha256:9ddfe0c3676ad4d0213dd965a622aad49a6c3a4b73589e874122e680641e3d90"),
 )
 HISTORICAL_GRID_COUNT = 4928
-CURRENT_IMPLEMENTED_COUNT = 704
+CURRENT_COMPRESSED_COUNT = 704
+CURRENT_IMPLEMENTED_COUNT = 880
 
 
 class PlannerError(ValueError):
@@ -497,6 +511,189 @@ def _load_capability(path: Path, expected_sha256: str) -> dict[str, object]:
             "status": "PASS"}
 
 
+def _raw_ii_occurrence(value: object, expected: dict[str, object], label: str) -> tuple[int, str, str, int]:
+    """Validate one occurrence against the planner's immutable source snapshot."""
+    if (not isinstance(value, dict) or
+            not {"ordinal", "source_relative", "source_sha256", "source_bytes"}.issubset(value)):
+        raise PlannerError(f"{label}:occurrence_invalid")
+    ordinal = value["ordinal"]
+    relative = value["source_relative"]
+    digest = value["source_sha256"]
+    size = value["source_bytes"]
+    if (type(ordinal) is not int or ordinal < 0 or not isinstance(relative, str) or
+            not relative or Path(relative).is_absolute() or
+            any(part in ("", ".", "..") for part in Path(relative).parts) or
+            not isinstance(digest, str) or not SHA256_RE.fullmatch(digest.lower()) or
+            type(size) is not int or size < 0):
+        raise PlannerError(f"{label}:occurrence_invalid")
+    observed = (ordinal, relative, digest.lower(), size)
+    expected_key = (int(expected["ordinal"]),
+                    str(expected["source_relative"]),
+                    str(expected["sha256"]).lower(), int(expected["bytes"]))
+    if observed != expected_key:
+        raise PlannerError(f"{label}:occurrence_mismatch")
+    return observed
+
+
+def _raw_ii_cell_file(path: Path, descriptor: dict[str, object], cell: dict[str, str],
+                      expected_occurrences: dict[tuple[int, str, str, int], dict[str, object]],
+                      kind: str) -> dict[str, object]:
+    """Authenticate one RAW_II witness/engine file and its complete coverage."""
+    if (not isinstance(descriptor, dict) or set(descriptor) != {"path", "bytes", "sha256"} or
+            not isinstance(descriptor["path"], str) or not Path(descriptor["path"]).is_absolute() or
+            type(descriptor["bytes"]) is not int or descriptor["bytes"] < 1 or
+            not isinstance(descriptor["sha256"], str) or
+            not SHA256_RE.fullmatch(descriptor["sha256"].lower())):
+        raise PlannerError(f"raw_ii:{kind}_descriptor_invalid:{cell['corpus']}:{cell['regime']}")
+    path = Path(descriptor["path"])
+    raw = _private_file(path, f"raw_ii_{kind}")
+    observed = {"path": str(path.resolve()), "bytes": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest()}
+    if observed["bytes"] != descriptor["bytes"]:
+        raise PlannerError(f"raw_ii:{kind}_bytes_mismatch:{cell['corpus']}:{cell['regime']}")
+    if observed["sha256"] != str(descriptor["sha256"]).lower():
+        raise PlannerError(f"raw_ii:{kind}_sha256_mismatch:{cell['corpus']}:{cell['regime']}")
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_json_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PlannerError(f"raw_ii:{kind}_invalid_json:{cell['corpus']}:{cell['regime']}") from exc
+    if not isinstance(value, dict):
+        raise PlannerError(f"raw_ii:{kind}_object_required:{cell['corpus']}:{cell['regime']}")
+    expected_schema = RAW_II_WITNESS_SCHEMA if kind == "witness" else RAW_II_ENGINE_SCHEMA
+    if (value.get("schema") != expected_schema or value.get("semantics") != RAW_II_SEMANTICS or
+            value.get("cell") != cell):
+        raise PlannerError(f"raw_ii:{kind}_scope_invalid:{cell['corpus']}:{cell['regime']}")
+    if kind == "witness" and value.get("formula") != RAW_II_FORMULA:
+        raise PlannerError(f"raw_ii:{kind}_scope_invalid:{cell['corpus']}:{cell['regime']}")
+    if kind == "engine" and value.get("control_baseline") != RAW_II_BASELINE:
+        raise PlannerError(f"raw_ii:{kind}_scope_invalid:{cell['corpus']}:{cell['regime']}")
+    if kind == "engine" and value.get("engine_scope") != "raw_ii_control_engine":
+        raise PlannerError(f"raw_ii:engine_scope_invalid:{cell['corpus']}:{cell['regime']}")
+    rows = value.get("rows")
+    if not isinstance(rows, list) or not rows:
+        raise PlannerError(f"raw_ii:{kind}_rows_invalid:{cell['corpus']}:{cell['regime']}")
+    seen: set[tuple[int, str, str, int]] = set()
+    for index, row in enumerate(rows):
+        required = {"ordinal", "source_relative", "source_sha256", "source_bytes", "c_to_f"}
+        if kind == "engine":
+            required = {"ordinal", "source_relative", "source_sha256", "source_bytes",
+                        "f_to_c_bytes", "elapsed_ns"}
+        if not isinstance(row, dict) or set(row) != required:
+            raise PlannerError(f"raw_ii:{kind}_row_invalid:{index}")
+        ordinal = row["ordinal"]
+        if (type(ordinal) is not int or ordinal < 0 or not isinstance(row["source_relative"], str) or
+                not row["source_relative"] or Path(row["source_relative"]).is_absolute() or
+                any(part in ("", ".", "..") for part in Path(row["source_relative"]).parts) or
+                not isinstance(row["source_sha256"], str) or
+                not SHA256_RE.fullmatch(row["source_sha256"].lower()) or
+                type(row["source_bytes"]) is not int or row["source_bytes"] < 0 or
+                ordinal not in {int(item["ordinal"]) for item in expected_occurrences.values()}):
+            raise PlannerError(f"raw_ii:{kind}_row_occurrence_invalid:{index}")
+        expected = expected_occurrences.get((ordinal, str(row["source_relative"]),
+                                             str(row["source_sha256"]).lower(), row["source_bytes"]))
+        if expected is None:
+            raise PlannerError(f"raw_ii:{kind}_coverage_mismatch:{index}")
+        key = _raw_ii_occurrence(row, expected, f"raw_ii:{kind}.row[{index}]")
+        if key in seen:
+            raise PlannerError(f"raw_ii:{kind}_duplicate_occurrence")
+        seen.add(key)
+        if kind == "witness":
+            c_to_f = row["c_to_f"]
+            if (not isinstance(c_to_f, dict) or set(c_to_f) != {
+                    "compile_file_bytes", "file_chunk_bytes", "end_bytes", "total_bytes"} or
+                    any(type(c_to_f[name]) is not int or c_to_f[name] <= 0
+                        for name in ("compile_file_bytes", "file_chunk_bytes", "end_bytes", "total_bytes")) or
+                    sum(c_to_f[name] for name in ("compile_file_bytes", "file_chunk_bytes", "end_bytes")) != c_to_f["total_bytes"]):
+                raise PlannerError(f"raw_ii:{kind}_wire_formula_invalid:{index}")
+        else:
+            if (type(row["f_to_c_bytes"]) is not int or row["f_to_c_bytes"] <= 0 or
+                    type(row["elapsed_ns"]) is not int or row["elapsed_ns"] <= 0):
+                raise PlannerError(f"raw_ii:{kind}_timing_invalid:{index}")
+    expected_keys = set(expected_occurrences)
+    if seen != expected_keys:
+        raise PlannerError(f"raw_ii:{kind}_coverage_incomplete:{len(seen)}:{len(expected_keys)}")
+    return {"path": observed["path"], "bytes": observed["bytes"],
+            "sha256": observed["sha256"], "schema": expected_schema,
+            "coverage": len(seen)}
+
+
+def _unique_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise PlannerError(f"raw_ii:duplicate_json_key:{key}")
+        result[key] = value
+    return result
+
+
+def _load_raw_ii_authority(path: Path, expected_sha256: str, corpora: list[dict[str, object]],
+                            snapshots: list[dict[str, object]]) -> dict[str, object]:
+    raw = _private_file(path, "raw_ii_authority")
+    if (not isinstance(expected_sha256, str) or not SHA256_RE.fullmatch(expected_sha256.lower()) or
+            hashlib.sha256(raw).hexdigest() != expected_sha256.lower()):
+        raise PlannerError("raw_ii_authority:sha256_mismatch")
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_json_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PlannerError("raw_ii_authority:invalid_json") from exc
+    if not isinstance(value, dict) or value.get("schema") != RAW_II_AUTHORITY_SCHEMA or value.get("status") != "PASS":
+        raise PlannerError("raw_ii_authority:schema_or_status_invalid")
+    if value.get("capability") != RAW_II_CAPABILITY or value.get("producer") != "farmharness.s8_raw_ii_predictive_producer":
+        raise PlannerError("raw_ii_authority:producer_identity_invalid")
+    source = value.get("producer_source")
+    if not isinstance(source, dict):
+        raise PlannerError("raw_ii_authority:producer_source_missing")
+    if Path(str(source.get("path"))).name != RAW_II_PRODUCER_SOURCE:
+        raise PlannerError("raw_ii_authority:producer_source_invalid")
+    producer_source = _authenticate_capability_source(source)
+    by_corpus: dict[str, list[dict[str, object]]] = {}
+    for snapshot in snapshots:
+        corpus_id = str(snapshot["corpus"])
+        by_corpus.setdefault(corpus_id, []).append(snapshot)
+    expected_cells = {str(item["manifest_id"]) for item in corpora}
+    cells = value.get("cells")
+    if not isinstance(cells, list):
+        raise PlannerError("raw_ii_authority:cells_invalid")
+    authenticated: dict[str, dict[str, object]] = {}
+    witness_paths: set[str] = set()
+    engine_paths: set[str] = set()
+    all_paths: set[str] = set()
+    for index, entry in enumerate(cells):
+        if not isinstance(entry, dict) or set(entry) != {"cell", "witness", "engine"}:
+            raise PlannerError(f"raw_ii_authority:cell_invalid:{index}")
+        cell = entry["cell"]
+        if (not isinstance(cell, dict) or set(cell) != {"corpus", "profile", "regime"} or
+                cell.get("profile") != "RAW_II" or cell.get("regime") not in {"cold", "warm"} or
+                cell.get("corpus") not in expected_cells):
+            raise PlannerError(f"raw_ii_authority:cell_scope_invalid:{index}")
+        key = (str(cell["corpus"]), str(cell["regime"]))
+        cell_key = f"{key[0]}/{key[1]}"
+        if cell_key in authenticated:
+            raise PlannerError(f"raw_ii_authority:duplicate_cell:{key[0]}:{key[1]}")
+        expected = {}
+        for item in by_corpus[key[0]]:
+            relative = str(Path(str(item["path"])).resolve().relative_to(Path(str(next(
+                corpus["manifest"]["path"] for corpus in corpora if corpus["manifest_id"] == key[0]))).parent.resolve()))
+            expected[(int(item["ordinal"]), relative, str(item["sha256"]).lower(), int(item["bytes"]))] = {
+                **item, "source_relative": relative}
+        witness = _raw_ii_cell_file(Path(str(entry["witness"]["path"])), entry["witness"],
+                                    {"corpus": key[0], "profile": "RAW_II", "regime": key[1]}, expected, "witness")
+        engine = _raw_ii_cell_file(Path(str(entry["engine"]["path"])), entry["engine"],
+                                   {"corpus": key[0], "profile": "RAW_II", "regime": key[1]}, expected, "engine")
+        for descriptor, paths, kind in ((witness, witness_paths, "witness"), (engine, engine_paths, "engine")):
+            if str(descriptor["path"]) in paths:
+                raise PlannerError(f"raw_ii_authority:duplicate_{kind}_path")
+            if str(descriptor["path"]) in all_paths:
+                raise PlannerError("raw_ii_authority:witness_engine_path_alias")
+            paths.add(str(descriptor["path"]))
+            all_paths.add(str(descriptor["path"]))
+        authenticated[cell_key] = {"cell": dict(cell), "witness": witness, "engine": engine}
+    return {"path": str(path.resolve()), "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
+            "schema": RAW_II_AUTHORITY_SCHEMA, "capability": RAW_II_CAPABILITY,
+            "producer": value["producer"], "producer_source": producer_source,
+            "cells": authenticated}
+
+
 def _slug(value: str) -> str:
     result = re.sub(r"[^A-Za-z0-9]+", "-", value).strip("-").lower()
     if not result:
@@ -523,7 +720,9 @@ def plan_campaign(corpus_inventory: Path, image_recovery: Path, image_recovery_s
                   matrix_audit: Path, matrix_audit_sha256: str, output_root: Path,
                   timestamp: str, current_image_name: str | None = None,
                   current_image_id: str | None = None, capability_manifest: Path | None = None,
-                  capability_manifest_sha256: str | None = None) -> dict[str, object]:
+                  capability_manifest_sha256: str | None = None,
+                  raw_ii_authority_manifest: Path | None = None,
+                  raw_ii_authority_manifest_sha256: str | None = None) -> dict[str, object]:
     if not TIMESTAMP_RE.fullmatch(timestamp):
         raise PlannerError("timestamp:expected_YYYYMMDDTHHMMSSZ")
     if METHODS != EXPECTED_METHODS:
@@ -545,16 +744,26 @@ def plan_campaign(corpus_inventory: Path, image_recovery: Path, image_recovery_s
         raise PlannerError("capability_manifest:path_and_sha256_required_together")
     if capability_manifest is not None:
         capability = _load_capability(capability_manifest, str(capability_manifest_sha256))
+    raw_ii_authority = None
+    if (raw_ii_authority_manifest is None) != (raw_ii_authority_manifest_sha256 is None):
+        raise PlannerError("raw_ii_authority:path_and_sha256_required_together")
+    if raw_ii_authority_manifest is not None:
+        raw_ii_authority = _load_raw_ii_authority(
+            raw_ii_authority_manifest, str(raw_ii_authority_manifest_sha256), corpora, snapshots)
     images = historical_images + [current]
     methods = [{
         "name": method,
-        "root_status": "IMPLEMENTED" if method in IMPLEMENTED_METHODS else "NOT_IMPLEMENTED",
+        "root_status": "IMPLEMENTED" if method in IMPLEMENTED_ROOT_METHODS else "NOT_IMPLEMENTED",
         "arm_kind": "control_baseline" if method in CONTROL_METHODS else "compressed_profile",
         "required_inputs": (["raw_ii_legacy_wire_witness", "raw_ii_engine_template"]
                             if method in CONTROL_METHODS else []),
-        "producer_capability": CAPABILITY if method in IMPLEMENTED_METHODS else None,
-        "status_reason": "native/live runner interface available on current Root" if method in IMPLEMENTED_METHODS
+        "producer_capability": (RAW_II_CAPABILITY if method in CONTROL_METHODS
+                                 else CAPABILITY if method in IMPLEMENTED_METHODS else None),
+        "status_reason": ("dedicated RAW_II control producer interface available on current Root"
+                           if method in CONTROL_METHODS else
+                           "native/live runner interface available on current Root" if method in IMPLEMENTED_METHODS
         else "method is not implemented on current Root; no alias is permitted",
+        ),
     } for method in METHODS]
     descriptors: list[dict[str, object]] = []
     result_paths: set[str] = set()
@@ -573,9 +782,20 @@ def plan_campaign(corpus_inventory: Path, image_recovery: Path, image_recovery_s
                                     "MISSING_EXTERNAL_AUTHORITY",
                                     "historical image cell is unavailable without external image authority",
                                     None)
-                            elif method not in IMPLEMENTED_METHODS:
+                            elif method not in IMPLEMENTED_ROOT_METHODS:
                                 status, reason, producer_capability = (
                                     "NOT_READY", "method_not_implemented_on_current_root", None)
+                            elif method in CONTROL_METHODS:
+                                raw_key = f"{corpus['manifest_id']}/{regime}"
+                                if raw_ii_authority is None:
+                                    status, reason, producer_capability = (
+                                        "NOT_READY", "raw_ii_control_authority_not_integrated_on_planner_source", None)
+                                elif raw_key not in raw_ii_authority["cells"]:
+                                    status, reason, producer_capability = (
+                                        "NOT_READY", "raw_ii_exact_cell_inputs_unavailable", None)
+                                else:
+                                    status, reason, producer_capability = (
+                                        "READY", "authenticated RAW_II producer/control authority", RAW_II_CAPABILITY)
                             elif capability is None:
                                 status, reason, producer_capability = (
                                     "NOT_READY", "required_producer_capability_not_integrated_on_planner_source", None)
@@ -601,6 +821,10 @@ def plan_campaign(corpus_inventory: Path, image_recovery: Path, image_recovery_s
                                                       "raw_ii_engine_template"]
                                                      if method in CONTROL_METHODS else []),
                                 "producer_capability": producer_capability, "execution": "declarative_only",
+                                "raw_ii_authority": (raw_ii_authority["cells"][
+                                    f"{corpus['manifest_id']}/{regime}"]
+                                    if method in CONTROL_METHODS and raw_ii_authority is not None and
+                                    f"{corpus['manifest_id']}/{regime}" in raw_ii_authority["cells"] else None),
                                 "campaign_timestamp": timestamp,
                                 "result_relative_directory": result_relative_directory,
                             })
@@ -609,13 +833,14 @@ def plan_campaign(corpus_inventory: Path, image_recovery: Path, image_recovery_s
     if historical_count != HISTORICAL_GRID_COUNT:
         raise PlannerError(f"planner:historical_descriptor_count:{historical_count}")
     expected_current = CURRENT_IMPLEMENTED_COUNT if current["image_id"] is not None else 0
-    if current_count != (CURRENT_IMPLEMENTED_COUNT + (len(corpora) * 3 * len(TOPOLOGIES) * len(DEPTHS) * len(REGIMES)) if current["image_id"] is not None else 0):
+    if current_count != (len(corpora) * len(METHODS) * len(TOPOLOGIES) * len(DEPTHS) * len(REGIMES)
+                         if current["image_id"] is not None else 0):
         # Current descriptors include explicit NOT_READY methods, so the
-        # implementation subset is reported separately below.
+        # implemented subset is reported separately below.
         raise PlannerError("planner:current_descriptor_count")
     current_implemented = sum(1 for item in descriptors
                               if item["image"]["key"] == "current-pinned" and
-                              item["method"] in IMPLEMENTED_METHODS)
+                              item["method"] in IMPLEMENTED_ROOT_METHODS)
     current_ready = sum(1 for item in descriptors
                         if item["image"]["key"] == "current-pinned" and item["status"] == "READY")
     if current_implemented != expected_current:
@@ -648,6 +873,7 @@ def plan_campaign(corpus_inventory: Path, image_recovery: Path, image_recovery_s
         "methods": methods, "topologies": list(TOPOLOGIES), "depths": list(DEPTHS), "regimes": list(REGIMES),
         "images": images, "image_recovery": recovery_descriptor, "matrix_audit": matrix_descriptor,
         "capability_manifest": capability,
+        "raw_ii_authority": raw_ii_authority,
         "prerequisites": {
             "canonical_32_cell_one_tu_audit": {
                 "status": "SATISFIED", "cell_count": 32,
@@ -658,6 +884,7 @@ def plan_campaign(corpus_inventory: Path, image_recovery: Path, image_recovery_s
         "counts": {
             "historical_image_seven_method_grid": HISTORICAL_GRID_COUNT,
             "current_image_implemented_subset_theoretical": CURRENT_IMPLEMENTED_COUNT,
+            "current_image_compressed_subset_theoretical": CURRENT_COMPRESSED_COUNT,
             "current_image_implemented_subset": current_implemented,
             "current_image_ready": current_ready,
             "descriptors_total": len(descriptors),
@@ -686,13 +913,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--current-image-id")
     parser.add_argument("--capability-manifest", type=Path)
     parser.add_argument("--capability-manifest-sha256")
+    parser.add_argument("--raw-ii-authority-manifest", type=Path,
+                        help="authenticated RAW_II producer source and per-cell control inputs")
+    parser.add_argument("--raw-ii-authority-manifest-sha256")
     args = parser.parse_args(argv)
     try:
         index = plan_campaign(args.corpus_inventory, args.image_recovery_report,
                               args.image_recovery_sha256, args.matrix_audit,
                               args.matrix_audit_sha256, args.output_root, args.timestamp,
                               args.current_image_name, args.current_image_id,
-                              args.capability_manifest, args.capability_manifest_sha256)
+                              args.capability_manifest, args.capability_manifest_sha256,
+                              args.raw_ii_authority_manifest,
+                              args.raw_ii_authority_manifest_sha256)
     except (PlannerError, OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"s8_campaign_planner: {exc}", file=sys.stderr)
         return 77

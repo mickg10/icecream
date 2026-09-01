@@ -8,12 +8,13 @@
     "timestamp": {"type": "string", "pattern": "^[0-9]{8}T[0-9]{6}Z$"},
     "campaign_root": {"type": "string", "minLength": 1},
     "execution": {"type": "object", "required": ["mode", "commands_emitted", "required_producer_capability"], "properties": {"mode": {"const": "declarative_only"}, "commands_emitted": {"const": false}, "required_producer_capability": {"const": "icecream.s8.native-live-runner-v1"}}},
-    "methods": {"type": "array", "minItems": 7, "maxItems": 7},
+    "methods": {"type": "array", "minItems": 7, "maxItems": 7, "items": {"type": "object", "required": ["name", "root_status", "arm_kind", "required_inputs"], "properties": {"name": {"type": "string"}, "root_status": {"enum": ["IMPLEMENTED", "NOT_IMPLEMENTED"]}, "arm_kind": {"enum": ["control_baseline", "compressed_profile"]}, "required_inputs": {"type": "array"}}}},
     "depths": {"const": ["100", "200", "full-1", "state-carrying full-2"]},
     "regimes": {"const": ["cold", "warm"]},
     "matrix_audit": {"type": "object", "required": ["path", "bytes", "sha256", "matrix"]},
     "corpus_authority": {"type": "object", "required": ["total_manifests", "total_tus", "snapshots"]},
-    "counts": {"type": "object", "required": ["historical_image_seven_method_grid", "current_image_implemented_subset_theoretical", "current_image_implemented_subset", "current_image_ready"]},
+    "raw_ii_authority": {"type": ["object", "null"], "properties": {"schema": {"const": "icecream-s8-raw-ii-planner-authority-v1"}, "capability": {"const": "icecream.s8.raw-ii-control-v1"}, "producer": {"const": "farmharness.s8_raw_ii_predictive_producer"}, "cells": {"type": "object"}}},
+    "counts": {"type": "object", "required": ["historical_image_seven_method_grid", "current_image_implemented_subset_theoretical", "current_image_compressed_subset_theoretical", "current_image_implemented_subset", "current_image_ready"]},
     "descriptors": {"type": "object", "required": ["path", "bytes", "sha256", "count"]}
   }
 }

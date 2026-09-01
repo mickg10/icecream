@@ -22,18 +22,17 @@ cells, and empty missing/invalid lists. The canonical 32-cell one-TU audit is
 a prerequisite, not a completed depth campaign.
 
 Methods are distinct: `RAW_II`, `ZSTD_TU`, `ZSTD_ROUTE`, `P29`,
-`GRZ_RESIDUAL`, `ZSTD_COHORT`, and `ZSTD_GLOBAL`. `RAW_II` is an explicit
-whole-legacy control arm, not a fifth compressed profile and not an alias for
-`P29`. Its descriptor retains the required `raw_ii_legacy_wire_witness` and
-`raw_ii_engine_template` inputs. The dedicated
+`GRZ_RESIDUAL`, `ZSTD_COHORT`, and `ZSTD_GLOBAL`. `RAW_II` is an implemented,
+explicit whole-legacy control arm, not a fifth compressed profile and not an
+alias for `P29`. Its descriptor retains the required
+`raw_ii_legacy_wire_witness` and `raw_ii_engine_template` inputs. The dedicated
 `farmharness/s8_raw_ii_predictive_producer.py` consumes those inputs: the
 witness binds C-to-F as `CompileFile + FileChunk + End`, while the separately
 scoped `raw_ii_control_engine` binds F-to-C and one elapsed service duration
-per occurrence. It never reads
-P29 predictions. Only the four implemented Root methods can become `READY`,
-and only after an authenticated producer capability manifest proves the exact
-producer source/version/binaries. The two topology records keep stream
-capacity separate from execution concurrency.
+per occurrence. It never reads P29 predictions. The four compressed methods
+use the generic producer capability; RAW_II uses its separate control
+authority. The two topology records keep stream capacity separate from
+execution concurrency.
 
 The campaign driver keeps its default four-profile grid unchanged. Select the
 control arm explicitly with `--profiles RAW_II` (or alongside compressed
@@ -73,11 +72,10 @@ python3 farmharness/s8_campaign_planner.py \
 
 With no current image ID, only the 4,928 historical descriptors are emitted
 and all are held. Supplying an exact current image content ID additionally
-emits the current dimension; its implemented subset is 704 theoretical
-descriptors but remains `NOT_READY` unless an authenticated producer capability
-manifest is supplied. The base Root planner artifact has no such integrated
-capability, so its READY count is zero. The retained Firefox giant/four-block
-extension is `NOT_RUN`.
+emits the current dimension; its compressed implemented subset is 704
+theoretical descriptors and RAW_II adds 176, for 880 implemented descriptors.
+RAW_II descriptors remain `NOT_READY` unless their exact authority cell is
+supplied. The retained Firefox giant/four-block extension is `NOT_RUN`.
 
 When available, pass `--capability-manifest PATH --capability-manifest-sha256
 SHA256`. The manifest must include source bytes/SHA-256 and the five exact
@@ -85,5 +83,14 @@ binary bytes/SHA-256 descriptors. The planner reopens every declared path with
 a no-follow descriptor, checks stable file identity while streaming, and
 requires byte-for-byte descriptor equality. The source must additionally be a
 tracked file in a clean Git worktree whose independently observed HEAD, tree,
-and committed blob match the manifest; otherwise current implemented-profile
-cells remain held (or the explicit capability input is rejected).
+and committed blob match the manifest; otherwise current compressed cells
+remain held (or the explicit capability input is rejected).
+
+For RAW_II, pass `--raw-ii-authority-manifest PATH
+--raw-ii-authority-manifest-sha256 SHA256`. The
+`icecream-s8-raw-ii-planner-authority-v1` manifest binds the dedicated
+producer source and distinct witness/control-engine files for each supplied
+`(corpus, regime)` cell. Each file is private, digest-stable, scoped to
+RAW_II, and must cover every ordered corpus occurrence exactly once. Missing
+or uncovered cells remain `NOT_READY`; P29 and compressed capability inputs
+cannot satisfy this boundary.
