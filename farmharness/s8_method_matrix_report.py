@@ -88,6 +88,23 @@ def _route_prefix(state: Mapping[str, Any]) -> bytes | None:
     return raw
 
 
+def _transaction_prefix(transaction: Mapping[str, Any], *, before: bool) -> bytes | None:
+    prefix_name = "committed_raw_prefix_before" if before else "committed_raw_prefix"
+    prefix = transaction.get(prefix_name)
+    bytes_value = transaction.get(prefix_name + "_bytes")
+    digest = transaction.get(prefix_name + "_digest")
+    if not isinstance(prefix, str) or re.fullmatch(r"[0-9a-f]*", prefix) is None:
+        return None
+    try:
+        raw = bytes.fromhex(prefix)
+    except ValueError:
+        return None
+    if (type(bytes_value) is not int or bytes_value != len(raw) or
+            not _valid_digest(digest) or digest != simulator._digest128(raw)):
+        return None
+    return raw
+
+
 def _sha256(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
@@ -257,13 +274,13 @@ def _full2_marker(manifest: Mapping[str, Any], summary: Mapping[str, Any],
     if not isinstance(relationships, Mapping) or not isinstance(predecessor_relationships, Mapping):
         return _not_proven("relationship_state_missing")
     expected_keys = {"|".join(key) for key in simulator.MatrixTopology.from_id(topology).relationship_keys}
-    first_rows: dict[tuple[str, tuple[str, str]], Mapping[str, Any]] = {}
+    ordered_rows: dict[tuple[str, tuple[str, str]], list[Mapping[str, Any]]] = {}
     for row in rows:
         key = row.get("relationship_key")
         if isinstance(key, list) and len(key) == 2 and all(isinstance(part, str) for part in key):
             method = row.get("method")
-            if isinstance(method, str):
-                first_rows.setdefault((method, (key[0], key[1])), row)
+            if method in ("ZSTD_ROUTE", "P29", "GRZ_RESIDUAL"):
+                ordered_rows.setdefault((method, (key[0], key[1])), []).append(row)
     for method in ("ZSTD_ROUTE", "P29", "GRZ_RESIDUAL"):
         current_state = relationships.get(method)
         prior_state = predecessor_relationships.get(method)
@@ -302,21 +319,53 @@ def _full2_marker(manifest: Mapping[str, Any], summary: Mapping[str, Any],
                 after_prefix = _route_prefix(after)
                 if before_prefix is None or after_prefix is None:
                     return _not_proven("zstd_route_prefix_marker_missing")
-            row = first_rows.get((method, tuple(key.split("|", 1))))
-            if (row is None or row.get("method") != method or
-                    row.get("native_tu_seq") != before["native_next_rel_seq"] or
+            current_rows = ordered_rows.get((method, tuple(key.split("|", 1))), [])
+            if not current_rows:
+                return _not_proven(f"{method.lower()}_successor_marker_mismatch")
+            ordinals = [row.get("ordinal") for row in current_rows]
+            sequences = [row.get("native_tu_seq") for row in current_rows]
+            if (any(type(ordinal) is not int for ordinal in ordinals) or
+                    any(type(sequence) is not int or sequence < 0 for sequence in sequences) or
+                    any(left >= right for left, right in zip(ordinals, ordinals[1:])) or
+                    any(left >= right for left, right in zip(sequences, sequences[1:]))):
+                return _not_proven(f"{method.lower()}_current_row_order_invalid")
+            row = current_rows[0]
+            last_row = current_rows[-1]
+            if (row.get("native_tu_seq") != before["native_next_rel_seq"] or
                     row.get("native_state_before_digest") != before["native_state_digest"]):
                 return _not_proven(f"{method.lower()}_successor_marker_mismatch")
-            transaction = row.get("product_transaction")
-            if (not isinstance(transaction, Mapping) or
-                    transaction.get("history_nonce") != before["history_nonce"] or
-                    transaction.get("route_identity") != before["route_identity"]):
-                return _not_proven(f"{method.lower()}_route_identity_successor_mismatch")
-            if method == "ZSTD_ROUTE":
-                if (transaction.get("committed_raw_prefix") != before.get("committed_raw_prefix") or
-                        transaction.get("committed_raw_prefix_bytes") != len(before_prefix or b"") or
-                        transaction.get("committed_raw_prefix_digest") != before.get("committed_raw_prefix_digest")):
-                    return _not_proven("zstd_route_prefix_successor_mismatch")
+            prior_state_digest = before["native_state_digest"]
+            prior_prefix = before_prefix
+            for current_row in current_rows:
+                transaction = current_row.get("product_transaction")
+                if (current_row.get("native_next_rel_seq") != current_row.get("native_tu_seq", -1) + 1 or
+                        current_row.get("committed") is not True or
+                        not isinstance(transaction, Mapping) or
+                        transaction.get("committed") is not True or
+                        current_row.get("native_state_before_digest") != prior_state_digest or
+                        transaction.get("state_before_digest") != prior_state_digest or
+                        not _valid_digest(transaction.get("state_digest")) or
+                        transaction.get("state_digest") != current_row.get("native_state_digest") or
+                        transaction.get("history_nonce") != before["history_nonce"] or
+                        transaction.get("route_identity") != before["route_identity"]):
+                    return _not_proven(f"{method.lower()}_current_transaction_continuity_mismatch")
+                if method == "ZSTD_ROUTE":
+                    transaction_before = _transaction_prefix(transaction, before=True)
+                    transaction_after = _transaction_prefix(transaction, before=False)
+                    if transaction_before is None or transaction_after is None or transaction_before != prior_prefix:
+                        return _not_proven("zstd_route_prefix_successor_mismatch")
+                    prior_prefix = transaction_after
+                prior_state_digest = transaction["state_digest"]
+            last_transaction = current_rows[-1]["product_transaction"]
+            if (after["native_last_tu_seq"] != current_rows[-1]["native_tu_seq"] or
+                    after["native_next_rel_seq"] != current_rows[-1]["native_next_rel_seq"] or
+                    after["native_state_digest"] != last_transaction["state_digest"]):
+                return _not_proven(f"{method.lower()}_final_state_marker_mismatch")
+            if method == "ZSTD_ROUTE" and (
+                    last_transaction.get("committed_raw_prefix") != after.get("committed_raw_prefix") or
+                    last_transaction.get("committed_raw_prefix_bytes") != after.get("committed_raw_prefix_bytes") or
+                    last_transaction.get("committed_raw_prefix_digest") != after.get("committed_raw_prefix_digest")):
+                return _not_proven("zstd_route_final_prefix_mismatch")
     return {"status": "CONTINUOUS", "predecessor_bound": True,
             "relationship_state_present": True,
             "relationship_state_methods": ["ZSTD_ROUTE", "P29", "GRZ_RESIDUAL"],

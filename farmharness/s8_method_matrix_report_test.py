@@ -139,7 +139,8 @@ def test_full2_mismatched_predecessor_stays_not_proven(tmp_path: Path) -> None:
     assert {row["full2_continuity"]["status"] for row in rows} == {"NOT_PROVEN"}
 
 
-@pytest.mark.parametrize("mutation", ("omit_next", "zero_next", "wrong_last_type"))
+@pytest.mark.parametrize("mutation", ("omit_next", "zero_next", "wrong_last_type",
+                                       "unrelated_prefix", "final_digest", "missing_last_tx"))
 def test_full2_current_state_marker_omission_partial_and_type_stay_not_proven(
         monkeypatch: pytest.MonkeyPatch, mutation: str) -> None:
     topology = "C1F1/100000"
@@ -180,21 +181,70 @@ def test_full2_current_state_marker_omission_partial_and_type_stay_not_proven(
     summary = {"relationships": {method: {key: copy.deepcopy(after_state)}
                                   for method in ("ZSTD_ROUTE", "P29", "GRZ_RESIDUAL")}}
     rows = [{"method": method, "relationship_key": ["C0", "F0"],
-             "native_tu_seq": 5, "native_state_before_digest": "a" * 32,
-             "product_transaction": {"history_nonce": 1, "route_identity": "C0->F0",
-                                      "committed_raw_prefix": prefix_hex,
-                                      "committed_raw_prefix_bytes": len(prefix),
-                                      "committed_raw_prefix_digest": prefix_digest}}
+             "ordinal": 0, "native_tu_seq": 5, "native_next_rel_seq": 6,
+             "native_state_before_digest": "a" * 32, "native_state_digest": "b" * 32,
+             "committed": True, "product_transaction": {"committed": True,
+                                      "state_before_digest": "a" * 32, "state_digest": "b" * 32,
+                                      "history_nonce": 1, "route_identity": "C0->F0",
+                                      "committed_raw_prefix": (prefix + b"next").hex(),
+                                      "committed_raw_prefix_bytes": len(prefix) + 4,
+                                      "committed_raw_prefix_digest": simulator._digest128(prefix + b"next"),
+                                      "committed_raw_prefix_before": prefix_hex,
+                                      "committed_raw_prefix_before_bytes": len(prefix),
+                                      "committed_raw_prefix_before_digest": prefix_digest}}
             for method in ("ZSTD_ROUTE", "P29", "GRZ_RESIDUAL")]
+    valid_marker = report._full2_marker(manifest, summary, rows, topology,
+                                        "state-carrying-full-2")
+    assert valid_marker["status"] == "CONTINUOUS"
     if mutation == "omit_next":
         del summary["relationships"]["P29"][key]["native_next_rel_seq"]
     elif mutation == "zero_next":
         summary["relationships"]["GRZ_RESIDUAL"][key]["native_next_rel_seq"] = 0
-    else:
+    elif mutation == "wrong_last_type":
         summary["relationships"]["ZSTD_ROUTE"][key]["native_last_tu_seq"] = "5"
+    elif mutation == "unrelated_prefix":
+        other = b"unrelated"
+        route = summary["relationships"]["ZSTD_ROUTE"][key]
+        route.update({"committed_raw_prefix": other.hex(),
+                      "committed_raw_prefix_bytes": len(other),
+                      "committed_raw_prefix_digest": simulator._digest128(other)})
+    elif mutation == "final_digest":
+        summary["relationships"]["P29"][key]["native_state_digest"] = "c" * 32
+    else:
+        del rows[0]["product_transaction"]["state_digest"]
     marker = report._full2_marker(manifest, summary, rows, topology,
                                   "state-carrying-full-2")
     assert marker["status"] == "NOT_PROVEN"
+
+
+def test_simulator_route_transaction_preserves_pre_prefix() -> None:
+    topology = "C1F1/100000"
+    matrix = simulator.MethodMatrixSimulator(
+        simulator.MatrixTopology.from_id(topology), methods=("ZSTD_ROUTE",))
+    matrix.authority["ZSTD_ROUTE"]["status"] = "READY"
+    state = simulator._RelationshipState(
+        ("C0", "F0"), history=b"prior", next_rel_seq=5,
+        last_route_id="C0->F0", history_nonce=1,
+        native_last_tu_seq=4, native_state_digest="a" * 32)
+    product = {"tu_seq": 5, "state_before_digest": "a" * 32,
+               "state_digest": "b" * 32, "transaction_digest": "d" * 32,
+               "encoded_source_bytes": 4, "simulator_execution_ns": 1}
+    matrix._native_rows["ZSTD_ROUTE"] = {0: product}
+    row = matrix._run_occurrence(
+        None, simulator.Occurrence(0, b"next"),
+        {"relationship_key": ["C0", "F0"], "relationship_index": 0,
+         "slot": 0, "global_slot": 0}, "ZSTD_ROUTE", state,
+        raw_override=b"next")
+    transaction = row["product_transaction"]
+    assert isinstance(transaction, dict)
+    assert report._transaction_prefix(transaction, before=True) == b"prior"
+    assert report._transaction_prefix(transaction, before=False) == b"priornext"
+    assert transaction["committed_raw_prefix_before"] == b"prior".hex()
+    assert transaction["committed_raw_prefix_before_bytes"] == 5
+    assert transaction["committed_raw_prefix_before_digest"] == simulator._digest128(b"prior")
+    assert transaction["committed_raw_prefix"] == b"priornext".hex()
+    assert transaction["committed_raw_prefix_bytes"] == 9
+    assert transaction["committed_raw_prefix_digest"] == simulator._digest128(b"priornext")
 
 
 def test_ratio_zero_denominator_and_wire_witness_control() -> None:

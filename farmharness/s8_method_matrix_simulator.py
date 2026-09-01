@@ -1102,9 +1102,17 @@ class MethodMatrixSimulator:
                                 "history_nonce": occurrence.history_nonce,
                                 "route_identity": f"{key[0]}->{key[1]}"})
             if method == "ZSTD_ROUTE":
-                transaction.update({"committed_raw_prefix": state.history.hex(),
-                                    "committed_raw_prefix_bytes": len(state.history),
-                                    "committed_raw_prefix_digest": _digest128(state.history)})
+                # The transaction's ordinary prefix fields are overwritten
+                # with post-commit state below.  Preserve the authenticated
+                # pre-state separately so repeat-full can bind the first
+                # current row to the predecessor without rereading payloads.
+                prefix_before = state.history
+                transaction.update({"committed_raw_prefix": prefix_before.hex(),
+                                    "committed_raw_prefix_bytes": len(prefix_before),
+                                    "committed_raw_prefix_digest": _digest128(prefix_before),
+                                    "committed_raw_prefix_before": prefix_before.hex(),
+                                    "committed_raw_prefix_before_bytes": len(prefix_before),
+                                    "committed_raw_prefix_before_digest": _digest128(prefix_before)})
             row["product_transaction"] = transaction
             state.native_last_tu_seq = int(product["tu_seq"])
             state.native_state_digest = str(product["state_digest"])
