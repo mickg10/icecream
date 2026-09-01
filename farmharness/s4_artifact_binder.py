@@ -43,6 +43,11 @@ import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+try:
+    from . import s8_depth_runner
+except ImportError:  # pragma: no cover
+    from farmharness import s8_depth_runner
+
 from farmharness.s4_version_transition_planner import (
     P43_SOURCE_SHA,
     P44_PROTOCOL_ASSERTION,
@@ -836,7 +841,11 @@ audit_manifest = audit_artifact_manifest
 
 
 def _read_json(path: Path) -> object:
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        value, _facts = s8_depth_runner._json(Path(path), "artifact_json")
+        return value
+    except s8_depth_runner.DepthPlanError as exc:
+        raise ArtifactBindingError(str(exc)) from exc
 
 
 def load_receipt(path: Path) -> Mapping[str, Any]:

@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -267,6 +268,31 @@ class S4VersionTransitionPlannerTest(unittest.TestCase):
         self.assertEqual(summary["transition_count"], 729)
         self.assertEqual(summary["comparison_block_count"], 128)
         self.assertEqual(summary["execution_run_count"], 256)
+
+    def test_cli_audit_uses_strict_json_parser(self) -> None:
+        script = Path(__file__).with_name("s4_version_transition_planner.py")
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "plan.json"
+            path.write_text(json.dumps(self.plan, separators=(",", ":")) + "\n")
+            completed = subprocess.run([sys.executable, str(script), "--audit", str(path)],
+                                       check=False, capture_output=True, text=True)
+            self.assertEqual(completed.returncode, 0)
+            summary = json.loads(completed.stdout)
+            self.assertEqual(summary["status"], "PASS")
+            self.assertEqual(summary["state_count"], 27)
+            self.assertEqual(summary["transition_count"], 729)
+
+            duplicate = path.read_text().replace(
+                '"schema":"icecream-s4-version-transition-plan-v1"',
+                '"schema":"icecream-s4-version-transition-plan-v1",'
+                '"schema":"icecream-s4-version-transition-plan-v1"', 1)
+            path.write_text(duplicate)
+            completed = subprocess.run([sys.executable, str(script), "--audit", str(path)],
+                                       check=False, capture_output=True, text=True)
+            self.assertEqual(completed.returncode, 1)
+            summary = json.loads(completed.stdout)
+            self.assertEqual(summary["status"], "FAIL")
+            self.assertIn("duplicate_json_key:schema", summary["errors"])
 
 
 if __name__ == "__main__":

@@ -22,6 +22,11 @@ import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+try:
+    from . import s8_depth_runner
+except ImportError:  # pragma: no cover
+    import s8_depth_runner
+
 
 SCHEMA = "icecream-s4-version-transition-plan-v1"
 ROLES = ("S", "C", "F")
@@ -1125,11 +1130,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.audit:
         try:
-            plan = json.loads(args.audit.read_text(encoding="utf-8"))
-            if not isinstance(plan, dict):
-                raise PlannerError("plan JSON must be an object")
+            plan, _facts = s8_depth_runner._json(args.audit.absolute(), "plan")
             result: object = audit_plan(plan)
-        except (OSError, UnicodeError, json.JSONDecodeError, PlannerError) as exc:
+        except (OSError, UnicodeError, json.JSONDecodeError,
+                s8_depth_runner.DepthPlanError, PlannerError) as exc:
             result = {"schema": "icecream-s4-version-transition-audit-v1", "status": "FAIL", "errors": [str(exc)]}
     else:
         plan = build_plan()
