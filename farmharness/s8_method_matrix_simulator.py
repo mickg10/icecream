@@ -324,7 +324,7 @@ def _libbsc_authority(root: Path) -> dict[str, object]:
     return {"status": "READY" if status else "NOT_READY", "source_root": str(source),
             "head": head, "tree": tree,
             "archive": {"sha256": AUTH_LIBBSC_ARCHIVE_SHA256, "materialized": False,
-                        "reproducible_from": "git archive --format=tar --prefix=libbsc-baffa62/ "
+                        "reproducible_from": "git archive --format=tar --prefix=libbsc-baffa62c70b6ebbecc9af14ce550e965ea247680/ "
                                              + AUTH_LIBBSC_HEAD,
                         "finding": "archive byte is not retained; SHA is provenance-only"},
             "archive_sha256": AUTH_LIBBSC_ARCHIVE_SHA256,
@@ -938,20 +938,30 @@ class MethodMatrixSimulator:
     def _status(rows: Sequence[Mapping[str, object]]) -> str:
         core = [row for row in rows if row.get("method") in CORE_METHODS]
         optional = [row for row in rows if row.get("method") not in CORE_METHODS]
-        if not core or not all(row["status"] == "READY" for row in core):
+        present = {str(row.get("method")) for row in core}
+        if present != CORE_METHODS or not all(row["status"] == "READY" for row in core):
             return "PARTIAL_NOT_READY"
         if optional and not all(row["status"] == "READY" for row in optional):
             return "CORE_COMPLETED_OPTIONALS_UNAVAILABLE"
         return "COMPLETED"
 
     @staticmethod
-    def _completion(rows: Sequence[Mapping[str, object]], methods: set[str] | frozenset[str]) -> dict[str, object]:
-        selected = [row for row in rows if row.get("method") in methods]
+    def _completion(rows: Sequence[Mapping[str, object]], methods: set[str] | frozenset[str],
+                    required: set[str] | frozenset[str] | None = None) -> dict[str, object]:
+        requested = set(methods)
+        required_methods = set(required or methods)
+        selected = [row for row in rows if row.get("method") in requested]
+        present = {str(row.get("method")) for row in selected}
+        missing = sorted(required_methods - present)
+        missing_core = sorted(CORE_METHODS - present) if requested & CORE_METHODS else []
         if not selected:
-            return {"status": "NOT_REQUESTED", "methods": sorted(methods)}
+            return {"status": "NOT_REQUESTED", "methods": [],
+                    "missing_core_methods": missing_core}
         ready = all(row.get("status") == "READY" for row in selected)
-        return {"status": "COMPLETED" if ready else "NOT_READY",
-                "methods": sorted({str(row.get("method")) for row in selected}),
+        status = ("COMPLETED" if ready and not missing else
+                  "INCOMPLETE_REQUESTED_SUBSET" if missing else "NOT_READY")
+        return {"status": status, "methods": sorted(present),
+                "missing_core_methods": missing_core,
                 "unready_methods": sorted({str(row.get("method")) for row in selected
                                             if row.get("status") != "READY"})}
 
@@ -1186,8 +1196,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--output-root", type=Path, default=Path("experiments"))
     parser.add_argument("--count", type=int, default=100)
     parser.add_argument("--depth", choices=("100", "200", "full-1", "state-carrying-full-2"))
-    parser.add_argument("--full-1-experiment", type=Path,
-                        help="legacy C1F1 predecessor; prefer topology-specific options")
     parser.add_argument("--full-1-experiment-c1f1", type=Path)
     parser.add_argument("--full-1-experiment-c1f20", type=Path)
     args = parser.parse_args(argv)

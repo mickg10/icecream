@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from s8_method_matrix_simulator import (
+    CORE_METHODS,
     MatrixError,
     MatrixTopology,
     MethodMatrixSimulator,
@@ -16,6 +18,7 @@ from s8_method_matrix_simulator import (
     _authenticated_assignment,
     firefox_occurrences,
     verify_experiment,
+    _libbsc_authority,
 )
 
 
@@ -173,6 +176,24 @@ def test_cohort_requires_its_own_authenticated_dictionary_authority() -> None:
     assert repeat_full_state_contract("ZSTD_COHORT")["survives"] is True
 
 
+@pytest.mark.parametrize("methods", [("RAW_II",), ("ZSTD_TU",), ("P29", "GRZ_RESIDUAL")])
+def test_subset_core_completion_never_claims_full_matrix(methods: tuple[str, ...]) -> None:
+    result = MethodMatrixSimulator(MatrixTopology.from_id("C1F1/100000"),
+                                   methods=methods).run([Occurrence(0, b"payload")])
+    completion = result["core_completion"]
+    assert completion["status"] != "COMPLETED"
+    assert set(completion["missing_core_methods"]) == set(CORE_METHODS) - set(methods)
+
+
+def test_libbsc_archive_provenance_reproduces_pinned_hash() -> None:
+    authority = _libbsc_authority(Path.cwd())
+    archive = authority["archive"]
+    command = str(archive["reproducible_from"]).split()
+    result = subprocess.run(command, cwd="/tanksmall/scratch/ictmp/libbsc-issue16",
+                            check=True, stdout=subprocess.PIPE)
+    assert hashlib.sha256(result.stdout).hexdigest() == archive["sha256"]
+
+
 def test_repeat_full_only_carries_declared_relationship_state() -> None:
     assert repeat_full_state_contract("RAW_II")["fields"] == []
     assert repeat_full_state_contract("ZSTD_TU")["fields"] == []
@@ -215,5 +236,6 @@ def test_native_repeat_full_carries_state_with_changed_assignment_map(tmp_path: 
             measured, repeat_full=True, prior_state=prior,
             predecessor_occurrences=predecessor,
             predecessor_assignment_authority=predecessor_authority)
-    assert result["status"] == "COMPLETED"
+    assert result["status"] == "PARTIAL_NOT_READY"
+    assert result["core_completion"]["status"] == "INCOMPLETE_REQUESTED_SUBSET"
     assert [row["product_transaction"]["tu_seq"] for row in result["rows"]] == [0, 2]

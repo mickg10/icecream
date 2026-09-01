@@ -90,7 +90,7 @@ if [ "$with_libbsc" -eq 1 ]; then
     libbsc_root=/tanksmall/scratch/ictmp/libbsc-issue16
     libbsc_head=$(git -C "$libbsc_root" rev-parse HEAD)
     libbsc_tree=$(git -C "$libbsc_root" rev-parse 'HEAD^{tree}')
-    libbsc_receipt=$(printf '{"source_root":"%s","head":"%s","tree":"%s","archive":{"sha256":"39edf31118aa546a0439a08e730a7bcab522f376fa9a715fc17a3add4c760ccf","materialized":false,"reproducible_from":"git archive --format=tar --prefix=libbsc-baffa62/ %s"},"archive_sha256":"39edf31118aa546a0439a08e730a7bcab522f376fa9a715fc17a3add4c760ccf","header":%s,"library":%s,"provenance":%s,"source_manifest":%s}' \
+    libbsc_receipt=$(printf '{"source_root":"%s","head":"%s","tree":"%s","archive":{"sha256":"39edf31118aa546a0439a08e730a7bcab522f376fa9a715fc17a3add4c760ccf","materialized":false,"reproducible_from":"git archive --format=tar --prefix=libbsc-baffa62c70b6ebbecc9af14ce550e965ea247680/ %s"},"archive_sha256":"39edf31118aa546a0439a08e730a7bcab522f376fa9a715fc17a3add4c760ccf","header":%s,"library":%s,"provenance":%s,"source_manifest":%s}' \
         "$libbsc_root" "$libbsc_head" "$libbsc_tree" \
         "$libbsc_head" \
         "$(artifact_json "$libbsc_root/libbsc/libbsc.h")" \
