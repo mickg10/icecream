@@ -49,6 +49,8 @@ MAX_TRACKED_ENTRIES = 1_000_000
 MAX_PRODUCT_WALK_ENTRIES = 1_000_000
 MAX_PRODUCT_WALK_DEPTH = 64
 MAX_PRODUCT_WALK_PATH_BYTES = 256 * 1024 * 1024
+MAX_GIT_STATUS_ENTRIES = 1_000_000
+MAX_GIT_STATUS_BYTES = 256 * 1024 * 1024
 HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
 HEX40 = re.compile(r"^[0-9a-fA-F]{40}$")
 
@@ -63,16 +65,50 @@ def _canonical(value: object) -> bytes:
 
 
 def _read(path: Path, label: str) -> tuple[dict[str, Any], dict[str, object]]:
+    fd: int | None = None
     try:
-        info = path.lstat()
-        if (stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or
-                info.st_nlink != 1):
+        flags = (os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) |
+                 getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(path, flags)
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1):
+            os.close(fd)
+            fd = None
             raise RawIIError(f"{label}:not_private_regular_file")
-        raw = path.read_bytes()
+    except OSError as exc:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise RawIIError(f"{label}:unavailable:{path}") from exc
+    try:
+        if info.st_size > MAX_BYTES:
+            raise RawIIError(f"{label}:too_large")
+        digest = hashlib.sha256()
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            block = os.read(fd, 1 << 20)
+            if not block:
+                break
+            size += len(block)
+            if size > MAX_BYTES:
+                raise RawIIError(f"{label}:too_large")
+            chunks.append(block)
+            digest.update(block)
+        after = os.fstat(fd)
+        if any(getattr(info, field) != getattr(after, field)
+               for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")):
+            raise RawIIError(f"{label}:changed_while_reading")
+        raw = b"".join(chunks)
+    except RawIIError:
+        raise
     except OSError as exc:
         raise RawIIError(f"{label}:unavailable:{path}") from exc
-    if len(raw) > MAX_BYTES:
-        raise RawIIError(f"{label}:too_large")
+    finally:
+        if fd is not None:
+            os.close(fd)
     try:
         value = json.loads(
             raw.decode("utf-8"), object_pairs_hook=_unique_keys,
@@ -83,7 +119,7 @@ def _read(path: Path, label: str) -> tuple[dict[str, Any], dict[str, object]]:
     if not isinstance(value, dict):
         raise RawIIError(f"{label}:object_required")
     return value, {"path": str(path.resolve()), "bytes": len(raw),
-                   "sha256": hashlib.sha256(raw).hexdigest()}
+                   "sha256": digest.hexdigest()}
 
 
 def _unique_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -354,7 +390,7 @@ def _git_untracked_paths(root: Path, *, ignored: bool) -> list[str]:
 
 def _git_tracked_paths(root: Path) -> set[str]:
     """Stream the tracked path set with the same bounded NUL parser."""
-    command = ["git", "-C", str(root), "ls-files", "-z"]
+    command = ["git", "-C", str(root), "ls-files", "-v", "-z"]
     process: subprocess.Popen[bytes] | None = None
     pending = bytearray()
     paths: set[str] = set()
@@ -405,7 +441,12 @@ def _git_tracked_paths(root: Path) -> set[str]:
                     raise RawIIError("product_root:tracked_inventory_too_many")
                 if enumerated_bytes > MAX_PRODUCT_WALK_PATH_BYTES:
                     raise RawIIError("product_root:tracked_inventory_too_large")
-                paths.add(os.fsdecode(raw))
+                decoded = os.fsdecode(raw)
+                if len(decoded) < 3 or decoded[1] != " ":
+                    raise RawIIError("product_root:tracked_inventory_malformed")
+                if decoded[0] in {"h", "s", "S"}:
+                    raise RawIIError("product_root:tracked_index_flags_set")
+                paths.add(decoded[2:])
         if pending:
             raise RawIIError("product_root:tracked_inventory_malformed")
         if process.wait(timeout=15) != 0:
@@ -419,47 +460,144 @@ def _git_tracked_paths(root: Path) -> set[str]:
     return paths
 
 
+def _git_status_snapshot(root: Path) -> str:
+    """Capture bounded NUL-delimited status, including ignored outputs."""
+    command = ["git", "-C", str(root), "status", "--porcelain=v1",
+               "--untracked-files=all", "--ignored", "-z"]
+    process: subprocess.Popen[bytes] | None = None
+    chunks: list[bytes] = []
+    total = 0
+    records = 0
+
+    def reap_after_failure() -> None:
+        if process is None:
+            return
+        try:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=1)
+        except (OSError, subprocess.SubprocessError):
+            try:
+                process.kill()
+                process.wait(timeout=1)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        finally:
+            if process.stdout is not None:
+                try:
+                    process.stdout.close()
+                except OSError:
+                    pass
+
+    try:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL)
+        assert process.stdout is not None
+        while True:
+            chunk = process.stdout.read(1 << 16)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_GIT_STATUS_BYTES:
+                raise RawIIError("product_root:git_status_too_large")
+            records += chunk.count(b"\0")
+            if records > MAX_GIT_STATUS_ENTRIES:
+                raise RawIIError("product_root:git_status_too_many")
+            chunks.append(chunk)
+        if process.wait(timeout=15) != 0:
+            raise RawIIError("product_root:git_status_unavailable")
+    except RawIIError:
+        reap_after_failure()
+        raise
+    except (OSError, subprocess.SubprocessError) as exc:
+        reap_after_failure()
+        raise RawIIError("product_root:git_status_unavailable") from exc
+    raw = b"".join(chunks)
+    if raw and not raw.endswith(b"\0"):
+        raise RawIIError("product_root:git_status_malformed")
+    return os.fsdecode(raw)
+
+
+def _status_is_tracked_dirty(status: str) -> bool:
+    for record in status.split("\0"):
+        if not record:
+            continue
+        if len(record) < 3 or record[2] != " ":
+            raise RawIIError("product_root:git_status_malformed")
+        if record[:3] not in {"?? ", "!! "}:
+            return True
+    return False
+
+
 def _walk_product_entries(root: Path) -> Iterator[tuple[str, stat.stat_result]]:
     """Walk product entries without following links and with explicit caps."""
-    # The stack contains only directories still to visit; it never stores the
-    # complete tree.  ``scandir`` and ``stat(follow_symlinks=False)`` preserve
-    # the node type at the instant it is observed.
-    pending: deque[tuple[Path, int]] = deque([(root, 0)])
+    # Keep an open directory FD for every pending descent.  Child opens are
+    # relative to that FD with O_NOFOLLOW|O_DIRECTORY, so a replacement of a
+    # path component cannot redirect the walk.
+    directory_flags = (os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) |
+                       getattr(os, "O_NOFOLLOW", 0) |
+                       getattr(os, "O_DIRECTORY", 0))
+    try:
+        root_fd = os.open(root, directory_flags)
+    except OSError as exc:
+        raise RawIIError("product_root:walk_unavailable") from exc
+    pending: deque[tuple[int, str, int]] = deque([(root_fd, "", 0)])
     entry_count = 0
     path_bytes = 0
-    while pending:
-        directory, depth = pending.pop()
-        if depth >= MAX_PRODUCT_WALK_DEPTH:
-            raise RawIIError("product_root:walk_depth_exceeded")
-        try:
-            iterator = os.scandir(directory)
-        except OSError as exc:
-            raise RawIIError("product_root:walk_unavailable") from exc
-        try:
-            for entry in iterator:
-                if directory == root and entry.name == ".git":
-                    continue
-                relative = os.path.relpath(entry.path, root)
-                candidate = Path(relative)
-                if (candidate.is_absolute() or
-                        any(part in ("", ".", "..") for part in candidate.parts)):
-                    raise RawIIError("product_root:walk_path_invalid")
-                encoded = os.fsencode(relative)
-                path_bytes += len(encoded)
-                if path_bytes > MAX_PRODUCT_WALK_PATH_BYTES:
-                    raise RawIIError("product_root:walk_inventory_too_large")
-                if entry_count >= MAX_PRODUCT_WALK_ENTRIES:
-                    raise RawIIError("product_root:walk_inventory_too_many")
-                try:
-                    info = entry.stat(follow_symlinks=False)
-                except OSError as exc:
-                    raise RawIIError("product_root:walk_unavailable") from exc
-                entry_count += 1
-                yield relative, info
-                if stat.S_ISDIR(info.st_mode):
-                    pending.append((Path(entry.path), depth + 1))
-        finally:
-            iterator.close()
+    try:
+        while pending:
+            directory_fd, relative_directory, depth = pending.pop()
+            if depth >= MAX_PRODUCT_WALK_DEPTH:
+                os.close(directory_fd)
+                raise RawIIError("product_root:walk_depth_exceeded")
+            try:
+                iterator = os.scandir(directory_fd)
+            except OSError as exc:
+                os.close(directory_fd)
+                raise RawIIError("product_root:walk_unavailable") from exc
+            try:
+                for entry in iterator:
+                    if not relative_directory and entry.name == ".git":
+                        continue
+                    name = os.fsdecode(entry.name)
+                    relative = (name if not relative_directory else
+                                f"{relative_directory}/{name}")
+                    candidate = Path(relative)
+                    if (candidate.is_absolute() or
+                            any(part in ("", ".", "..") for part in candidate.parts)):
+                        raise RawIIError("product_root:walk_path_invalid")
+                    encoded = os.fsencode(relative)
+                    path_bytes += len(encoded)
+                    if path_bytes > MAX_PRODUCT_WALK_PATH_BYTES:
+                        raise RawIIError("product_root:walk_inventory_too_large")
+                    if entry_count >= MAX_PRODUCT_WALK_ENTRIES:
+                        raise RawIIError("product_root:walk_inventory_too_many")
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                    except OSError as exc:
+                        raise RawIIError("product_root:walk_unavailable") from exc
+                    entry_count += 1
+                    yield relative, info
+                    if stat.S_ISDIR(info.st_mode):
+                        if not _generated_owned(info):
+                            raise RawIIError("product_root:untracked_artifact_invalid")
+                        if depth + 1 >= MAX_PRODUCT_WALK_DEPTH:
+                            raise RawIIError("product_root:walk_depth_exceeded")
+                        try:
+                            child_fd = os.open(entry.name, directory_flags,
+                                               dir_fd=directory_fd)
+                        except OSError as exc:
+                            raise RawIIError("product_root:walk_unavailable") from exc
+                        pending.append((child_fd, relative, depth + 1))
+            finally:
+                iterator.close()
+                os.close(directory_fd)
+    finally:
+        while pending:
+            try:
+                os.close(pending.pop()[0])
+            except OSError:
+                pass
 
 
 def _generated_owned(info: stat.stat_result) -> bool:
@@ -475,6 +613,8 @@ def _untracked_inventory(root: Path) -> dict[str, object]:
     walk_relatives: set[str] = set()
     for relative, info in walked:
         if relative in tracked:
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise RawIIError("product_root:tracked_artifact_invalid")
             continue
         if stat.S_ISDIR(info.st_mode):
             continue
@@ -533,14 +673,11 @@ def _git_identity_snapshot(root: Path) -> dict[str, str]:
         tree = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD^{tree}"],
                               check=True, capture_output=True, text=True,
                               timeout=15).stdout.strip()
-        status = subprocess.run(
-            ["git", "-C", str(root), "status", "--porcelain",
-             "--untracked-files=all"], check=True, capture_output=True,
-            text=True, timeout=15).stdout
     except (OSError, subprocess.SubprocessError) as exc:
         raise RawIIError("product_root:git_identity_unavailable") from exc
     if (not HEX40.fullmatch(head) or not HEX40.fullmatch(tree)):
         raise RawIIError("product_root:git_identity_invalid")
+    status = _git_status_snapshot(root)
     return {"head": head.lower(), "tree": tree.lower(), "status": status}
 
 
@@ -556,12 +693,14 @@ def _product_identity(root: Path) -> dict[str, object]:
     if Path(top).resolve() != root.resolve():
         raise RawIIError("product_root:git_identity_invalid")
     before = _git_identity_snapshot(root)
-    if any(line and not line.startswith(("?? ", "!! "))
-           for line in before["status"].splitlines()):
+    if _status_is_tracked_dirty(before["status"]):
         raise RawIIError("product_root:tracked_worktree_dirty")
     untracked = _untracked_inventory(root)
     after = _git_identity_snapshot(root)
-    if before != after:
+    second_untracked = _untracked_inventory(root)
+    final = _git_identity_snapshot(root)
+    if (before != after or after != final or
+            untracked != second_untracked):
         raise RawIIError("product_root:changed_during_inventory")
     return {"root": str(root.resolve()), "head": before["head"], "tree": before["tree"],
             "tracked_status": before["status"], "untracked": untracked}

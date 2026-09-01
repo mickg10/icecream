@@ -296,6 +296,77 @@ def test_raw_product_identity_rejects_foreign_generated_owner(
         producer._product_identity(product)
 
 
+@pytest.mark.parametrize("flag", ["assume-unchanged", "skip-worktree"])
+def test_raw_product_identity_rejects_tracked_index_bypass(
+        tmp_path: Path, flag: str) -> None:
+    product = _product_root(tmp_path)
+    subprocess.run(["git", "-C", str(product), "update-index", f"--{flag}", "tracked.txt"],
+                   check=True)
+    with pytest.raises(RawIIError, match="product_root:tracked_index_flags_set"):
+        producer._product_identity(product)
+
+
+def test_raw_product_identity_rejects_tracked_symlink(
+        tmp_path: Path) -> None:
+    product = _product_root(tmp_path)
+    target = tmp_path / "target"
+    target.write_text("target\n")
+    tracked_link = product / "tracked-link"
+    tracked_link.symlink_to(target)
+    subprocess.run(["git", "-C", str(product), "add", "tracked-link"], check=True)
+    subprocess.run(["git", "-C", str(product), "commit", "-qm", "link"], check=True)
+    with pytest.raises(RawIIError, match="product_root:tracked_artifact_invalid"):
+        producer._product_identity(product)
+
+
+def test_raw_product_identity_rechecks_generated_digest_after_first_inventory(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    product = _product_root(tmp_path)
+    generated = product / "generated-race"
+    generated.write_bytes(b"first\n")
+    original = producer._untracked_inventory
+    calls = 0
+
+    def mutate_after_first(root: Path) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        result = original(root)
+        if calls == 1:
+            generated.write_bytes(b"second\n")
+        return result
+
+    monkeypatch.setattr(producer, "_untracked_inventory", mutate_after_first)
+    with pytest.raises(RawIIError, match="product_root:changed_during_inventory"):
+        producer._product_identity(product)
+    assert calls == 2
+
+
+def test_raw_product_walk_rejects_directory_replacement(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    product = _product_root(tmp_path)
+    generated_dir = product / "generated-dir"
+    generated_dir.mkdir()
+    (generated_dir / "file").write_text("generated\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    original_open = producer.os.open
+    replaced = False
+
+    def replace_before_child_open(path: object, flags: int, *args: object,
+                                  **kwargs: object) -> int:
+        nonlocal replaced
+        if not replaced and kwargs.get("dir_fd") is not None and path == "generated-dir":
+            generated_dir.rename(tmp_path / "moved-generated-dir")
+            generated_dir.symlink_to(outside, target_is_directory=True)
+            replaced = True
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(producer.os, "open", replace_before_child_open)
+    with pytest.raises(RawIIError, match="product_root:walk_unavailable"):
+        producer._product_identity(product)
+    assert replaced
+
+
 def test_raw_product_identity_reconciles_git_omitted_generated_file(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     product = _product_root(tmp_path)
@@ -351,6 +422,47 @@ def test_raw_untracked_inventory_aborts_and_reaps_at_entry_cap(
     with pytest.raises(RawIIError, match="product_root:untracked_inventory_too_many"):
         producer._git_untracked_paths(Path("/tmp/product"), ignored=False)
     assert fake.terminated and fake.waited
+
+
+def test_raw_git_status_aborts_and_reaps_at_byte_cap(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.stdout = io.BytesIO(b"12345")
+            self.terminated = False
+            self.waited = False
+
+        def poll(self) -> int | None:
+            return 0 if self.terminated else None
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def kill(self) -> None:
+            self.terminated = True
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.waited = True
+            return 0
+
+    fake = FakeProcess()
+    monkeypatch.setattr(producer, "MAX_GIT_STATUS_BYTES", 4)
+    monkeypatch.setattr(producer.subprocess, "Popen", lambda *args, **kwargs: fake)
+    with pytest.raises(RawIIError, match="product_root:git_status_too_large"):
+        producer._git_status_snapshot(Path("/tmp/product"))
+    assert fake.terminated and fake.waited
+
+
+def test_raw_read_uses_bounded_fd_stream(monkeypatch: pytest.MonkeyPatch,
+                                        tmp_path: Path) -> None:
+    path = tmp_path / "manifest.json"
+    path.write_text('{"ok": true}\n')
+    monkeypatch.setattr(Path, "read_bytes",
+                        lambda _path: (_ for _ in ()).throw(AssertionError(
+                            "unbounded read_bytes used")))
+    value, facts = producer._read(path, "manifest")
+    assert value == {"ok": True}
+    assert facts["bytes"] == path.stat().st_size
 
 
 def test_raw_local_producer_real_finalizer_then_normalizer(tmp_path: Path,
