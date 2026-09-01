@@ -937,7 +937,12 @@ class MethodMatrixSimulator:
     @staticmethod
     def _status(rows: Sequence[Mapping[str, object]]) -> str:
         core = [row for row in rows if row.get("method") in CORE_METHODS]
-        return "COMPLETED" if core and all(row["status"] == "READY" for row in core) else "PARTIAL_NOT_READY"
+        optional = [row for row in rows if row.get("method") not in CORE_METHODS]
+        if not core or not all(row["status"] == "READY" for row in core):
+            return "PARTIAL_NOT_READY"
+        if optional and not all(row["status"] == "READY" for row in optional):
+            return "CORE_COMPLETED_OPTIONALS_UNAVAILABLE"
+        return "COMPLETED"
 
     @staticmethod
     def _completion(rows: Sequence[Mapping[str, object]], methods: set[str] | frozenset[str]) -> dict[str, object]:

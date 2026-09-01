@@ -121,6 +121,7 @@ def test_methods_do_not_alias_and_missing_authority_is_explicit() -> None:
     topology = MatrixTopology.from_id("C1F1/100000")
     simulator = MethodMatrixSimulator(topology)
     result = simulator.run([Occurrence(0, b"payload")])
+    assert result["core_completion"]["status"] == "NOT_READY"
     statuses = result["method_status"]
     assert statuses == {
         "RAW_II": "READY", "ZSTD_TU": "READY", "P29": "READY",
