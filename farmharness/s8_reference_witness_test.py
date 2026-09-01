@@ -192,13 +192,16 @@ def test_external_command_exposes_explicit_reuse_inputs(monkeypatch: pytest.Monk
         suite="C1F1/100000", workdir=Path("/tmp/p50compilee2e.external"),
         timeout_seconds=900, reference_witness=Path("/tanksmall/witness/manifest.jsonl"),
         reference_authority=Path("/tanksmall/authority.json"), reference_image=image,
-        reference_toolchain={"sha256": "c" * 64, "bytes": 42})
+        reference_toolchain={"sha256": "c" * 64, "bytes": 42},
+        s2_process_loss=True)
     assert "ICECC_P50_REFERENCE_WITNESS=/tanksmall/witness/manifest.jsonl" in command
     assert "ICECC_P50_REFERENCE_AUTHORITY=/tanksmall/authority.json" in command
     assert "ICECC_P50_REFERENCE_IMAGE_ID=sha256:" + "b" * 64 in command
+    assert command.count("ICECC_P50_S2_PROCESS_LOSS=1") == 1
     runner = command.index("/tanksmall/unittests/p50compilee2e-run.sh")
     assert all(command.index(item) < runner for item in command
                if item.startswith("ICECC_P50_REFERENCE_"))
+    assert command.index("ICECC_P50_S2_PROCESS_LOSS=1") < runner
 
 
 def test_reuse_has_no_direct_compiler_fallback_and_package_failures_cleanup(tmp_path: Path) -> None:
