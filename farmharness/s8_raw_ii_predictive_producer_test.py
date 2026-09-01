@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import subprocess
 from pathlib import Path
@@ -8,6 +9,8 @@ from pathlib import Path
 import pytest
 
 import s8_depth_runner as depth
+import s8_raw_ii_predictive_producer as producer
+import s8_real_c1f1_live_runner as live_runner
 import s8_predictive_live_normalizer as normalizer
 from s8_raw_ii_predictive_producer import (
     ENGINE_SCHEMA,
@@ -234,6 +237,159 @@ def test_raw_producer_retains_plan_snapshot_and_generated_inventory(tmp_path: Pa
     assert inventory["count"] == 1
     assert inventory["entries"][0]["path"] == generated.name
     assert inventory["entries"][0]["sha256"] == hashlib.sha256(generated.read_bytes()).hexdigest()
+
+
+def test_raw_product_identity_rejects_deterministic_toctou_mutation(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    product = _product_root(tmp_path)
+    tracked = product / "tracked.txt"
+    original = producer._untracked_inventory
+
+    def mutate_after_snapshot(root: Path) -> dict[str, object]:
+        tracked.write_text("changed after pre-snapshot\n")
+        return original(root)
+
+    monkeypatch.setattr(producer, "_untracked_inventory", mutate_after_snapshot)
+    with pytest.raises(RawIIError, match="product_root:changed_during_inventory"):
+        producer._product_identity(product)
+
+
+def test_raw_product_identity_rejects_generated_symlink(
+        tmp_path: Path) -> None:
+    product = _product_root(tmp_path)
+    target = tmp_path / "outside-generated"
+    target.write_bytes(b"generated\n")
+    (product / "generated-link").symlink_to(target)
+    with pytest.raises(RawIIError, match="product_root:untracked_artifact_invalid"):
+        producer._product_identity(product)
+
+
+def test_raw_untracked_inventory_aborts_and_reaps_at_entry_cap(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.stdout = io.BytesIO(
+                b"x\0" * (producer.MAX_UNTRACKED_ENTRIES + 1))
+            self.terminated = False
+            self.waited = False
+
+        def poll(self) -> int | None:
+            return 0 if self.terminated else None
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def kill(self) -> None:
+            self.terminated = True
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.waited = True
+            return 0
+
+    fake = FakeProcess()
+    monkeypatch.setattr(producer.subprocess, "Popen", lambda *args, **kwargs: fake)
+    with pytest.raises(RawIIError, match="product_root:untracked_inventory_too_many"):
+        producer._git_untracked_paths(Path("/tmp/product"), ignored=False)
+    assert fake.terminated and fake.waited
+
+
+def test_raw_local_producer_real_finalizer_then_normalizer(tmp_path: Path,
+                                                           monkeypatch: pytest.MonkeyPatch) -> None:
+    plan_path, _source, _digest, _size = _inputs(tmp_path)
+    plan_value = depth.build_plan(
+        tmp_path / "sources.txt", tmp_path, tmp_path / "matrix.json",
+        tmp_path / "s8-DuckDB-RAW_II-cold-20260901T000000Z-full",
+        "DuckDB", "RAW_II", "cold", "full")
+    plan_path.write_text(json.dumps(plan_value, sort_keys=True) + "\n")
+    digest = plan_value["inputs"][0]["sha256"]
+    size = plan_value["inputs"][0]["bytes"]
+    witness, engine = _control_inputs(tmp_path, plan_path, digest, size)
+    product = _product_root(tmp_path)
+    plan = json.loads(plan_path.read_text())
+    predictive_dir = Path(plan["result"]["directory"])
+    produce(plan_path, witness, engine, predictive_dir, "full", product)
+    live_tu_id = json.loads(
+        (predictive_dir / "predictive_sim.jsonl").read_text().splitlines()[0]
+    )["tu_id"]
+
+    work = tmp_path / "p50compilee2e.raw"
+    (work / "out").mkdir(parents=True)
+    (work / "input.ii").write_bytes(b"input\n")
+    (work / "out" / "remote.o").write_bytes(b"remote\n")
+    (work / "out" / "local.o").write_bytes(b"local\n")
+    (work / "client-compile-full-1-0.log").write_text("write_fd_to_server\n")
+    (work / "s7-measured-c-legacy-wire-trace.jsonl").write_text("c-wire\n")
+    (work / "s7-measured-f-legacy-wire-trace.jsonl").write_text("f-wire\n")
+    batch = tmp_path / "batch.jsonl"
+    batch.write_bytes(b"batch\n")
+    topology = tmp_path / "topology.json"
+    topology.write_text(json.dumps({"assignments": [{"relationship": 0, "f_slot": 0}]}) + "\n")
+    plan_sha = hashlib.sha256(plan_path.read_bytes()).hexdigest()
+    plan_inputs = [dict(plan["inputs"][0])]
+    rows = [{"tu_id": live_tu_id, "predictive_input": plan_inputs[0]}]
+    observation = {
+        "run": "full-1", "ordinal": 0, "tu_id": live_tu_id,
+        "preprocessed_path": str(work / "input.ii"),
+        "remote_path": str(work / "out" / "remote.o"),
+        "local_path": str(work / "out" / "local.o"),
+        "remote_sha256": hashlib.sha256((work / "out" / "remote.o").read_bytes()).hexdigest(),
+        "local_sha256": hashlib.sha256((work / "out" / "local.o").read_bytes()).hexdigest(),
+        "measured_elapsed_ns": 100, "channel_bytes": 50,
+        "wait_for_cs_ns": 10, "client_elapsed_ns": 100,
+        "returned_object_bytes": 17, "remote_bytes": 7, "local_bytes": 6,
+        "admission_start_ns": 100, "input_ready_ns": 110,
+        "compile_start_ns": 120, "compile_end_ns": 200, "witness_end_ns": 210,
+        "planned_assignment_ordinal": 0, "planned_relationship": 0,
+        "planned_admission_lane": 0, "observed_scheduler_job_id": 1,
+        "observed_f_service_identity": "p50-f", "observed_source_tu_seq": 0,
+    }
+    binary_identity = {role: hashlib.sha256(role.encode()).hexdigest()
+                       for role in ("scheduler/icecc-scheduler", "daemon/iceccd",
+                                    "client/icecc", "cache/icecc-cache-service")}
+    monkeypatch.setattr(live_runner, "load_predictive_plan",
+                        lambda *_args, **_kwargs: (plan, plan_inputs, plan_sha))
+    monkeypatch.setattr(live_runner, "load_batch_manifest", lambda *_args: rows)
+    monkeypatch.setattr(live_runner, "bind_batch_to_plan", lambda *_args: None)
+    topology_sha = hashlib.sha256(topology.read_bytes()).hexdigest()
+    monkeypatch.setattr(live_runner, "load_topology", lambda *_args: topology_sha)
+    monkeypatch.setattr(live_runner, "_retained_workdir", lambda *_args, **_kwargs: work)
+    monkeypatch.setattr(live_runner, "_environment_preparation", lambda *_args: {})
+    monkeypatch.setattr(live_runner, "_binary_identity", lambda *_args, **_kwargs: binary_identity)
+    monkeypatch.setattr(live_runner, "product_identity",
+                        lambda *_args, **_kwargs: ("a" * 40, "b" * 40,
+                                                    binary_identity, "c" * 64))
+    monkeypatch.setattr(live_runner, "_timing_rows", lambda *_args, **_kwargs: [dict(observation)])
+    monkeypatch.setattr(live_runner, "_batch_windows",
+                        lambda *_args, **_kwargs: {"full-1": {"start_ns": 100, "end_ns": 200}})
+    monkeypatch.setattr(live_runner, "_validate_product_log_evidence", lambda *_args: None)
+    monkeypatch.setattr(live_runner, "_legacy_wire_stage", lambda *_args: [{
+        "c_to_f_bytes": 33, "f_to_c_bytes": 17, "channel_bytes": 50,
+        "planned_relationship": 0, "planned_admission_lane": 0,
+        "relationship": 0, "f_slot": 0,
+    }])
+    stdout = (f"PASS: all-P50 C1F1\nS7_WORKDIR={work}\nS8_BATCH_COUNT=1\n"
+              f"S8_SUITE={live_runner.TOPOLOGY}\nS8_BATCH_PASSES=1\n"
+              "S8_BATCH_WARM=0\nS8_SCHEDULING mode=relationship-ordered execution_slots=1 "
+              "relationships=1 planned_admission_lanes_per_relationship=1\n")
+    output = live_runner.finalize(
+        stdout, 0, batch_manifest=batch, topology=topology,
+        predictive_plan=plan_path, output=tmp_path / "live-output", profile="P29",
+        product_profile="RAW_II", product_root=product, corpus="DuckDB", regime="cold",
+        depth="full", full_count=1, passes=1, timestamp="20260901T000000Z")
+    live_manifest = output / "live_curve_manifest.json"
+    records = normalizer.normalize(predictive_dir / "predictive_curve_manifest.json",
+                                   live_manifest, tmp_path / "records.jsonl")
+    assert [record["record_type"] for record in records] == [
+        "predictive_sim", "live", "comparison"]
+    assert all(record["identity"]["profile"] == "RAW_II" for record in records)
+
+    mutant = json.loads(live_manifest.read_text())
+    mutant["identity"] = dict(mutant["identity"], input_digest="e" * 64)
+    live_manifest.write_text(json.dumps(mutant, sort_keys=True) + "\n")
+    with pytest.raises(normalizer.NormalizationError,
+                       match="identity_mismatch:input_digest"):
+        normalizer.normalize(predictive_dir / "predictive_curve_manifest.json",
+                             live_manifest, tmp_path / "mutant-records.jsonl")
 
 
 def test_raw_producer_rejects_duplicate_json_keys(tmp_path: Path) -> None:

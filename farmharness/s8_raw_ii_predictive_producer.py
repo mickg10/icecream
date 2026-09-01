@@ -278,22 +278,86 @@ def _load_plan(path: Path, cell: dict[str, str], depth: str) -> tuple[dict[str, 
     return value, inputs, plan_facts
 
 
+def _git_untracked_paths(root: Path, *, ignored: bool) -> list[str]:
+    """Read NUL-delimited paths with caps applied before buffering them."""
+    command = ["git", "-C", str(root), "ls-files", "--others"]
+    if ignored:
+        command.append("--ignored")
+    command.extend(("--exclude-standard", "-z"))
+    process: subprocess.Popen[bytes] | None = None
+    pending = bytearray()
+    paths: list[str] = []
+    enumerated_bytes = 0
+
+    def reap_after_failure() -> None:
+        if process is None:
+            return
+        try:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=1)
+        except (OSError, subprocess.SubprocessError):
+            try:
+                process.kill()
+                process.wait(timeout=1)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        finally:
+            if process.stdout is not None:
+                try:
+                    process.stdout.close()
+                except OSError:
+                    pass
+
+    try:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL)
+        assert process.stdout is not None
+        while True:
+            chunk = process.stdout.read(1 << 16)
+            if not chunk:
+                break
+            if enumerated_bytes + len(pending) + len(chunk) > MAX_UNTRACKED_BYTES:
+                raise RawIIError("product_root:untracked_inventory_too_large")
+            pending.extend(chunk)
+            while True:
+                separator = pending.find(0)
+                if separator < 0:
+                    break
+                raw = bytes(pending[:separator])
+                del pending[:separator + 1]
+                if not raw:
+                    continue
+                enumerated_bytes += len(raw)
+                if len(paths) >= MAX_UNTRACKED_ENTRIES:
+                    raise RawIIError("product_root:untracked_inventory_too_many")
+                if enumerated_bytes > MAX_UNTRACKED_BYTES:
+                    raise RawIIError("product_root:untracked_inventory_too_large")
+                paths.append(os.fsdecode(raw))
+        if pending:
+            raise RawIIError("product_root:untracked_inventory_malformed")
+        if process.wait(timeout=15) != 0:
+            raise RawIIError("product_root:untracked_inventory_unavailable")
+    except RawIIError:
+        reap_after_failure()
+        raise
+    except (OSError, subprocess.SubprocessError) as exc:
+        reap_after_failure()
+        raise RawIIError("product_root:untracked_inventory_unavailable") from exc
+    return paths
+
+
 def _untracked_inventory(root: Path) -> dict[str, object]:
     """Bind bounded content identity for generated files outside HEAD."""
     try:
-        unignored = subprocess.run(
-            ["git", "-C", str(root), "ls-files", "--others",
-             "--exclude-standard", "-z"], check=True, capture_output=True,
-            timeout=15).stdout.split(b"\0")
-        ignored = subprocess.run(
-            ["git", "-C", str(root), "ls-files", "--others", "--ignored",
-             "--exclude-standard", "-z"], check=True, capture_output=True,
-            timeout=15).stdout.split(b"\0")
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise RawIIError("product_root:untracked_inventory_unavailable") from exc
-    relatives = sorted({os.fsdecode(item) for item in (*unignored, *ignored) if item})
+        relatives = sorted(set(_git_untracked_paths(root, ignored=False) +
+                               _git_untracked_paths(root, ignored=True)))
+    except RawIIError:
+        raise
     if len(relatives) > MAX_UNTRACKED_ENTRIES:
         raise RawIIError("product_root:untracked_inventory_too_many")
+    if sum(len(os.fsencode(relative)) for relative in relatives) > MAX_UNTRACKED_BYTES:
+        raise RawIIError("product_root:untracked_inventory_too_large")
     entries: list[dict[str, object]] = []
     total_bytes = 0
     for relative in relatives:
@@ -307,10 +371,7 @@ def _untracked_inventory(root: Path) -> dict[str, object]:
         except OSError as exc:
             raise RawIIError("product_root:untracked_artifact_unavailable") from exc
         if stat.S_ISLNK(info.st_mode):
-            target = os.fsencode(os.readlink(path))
-            item = {"path": relative, "kind": "symlink", "bytes": len(target),
-                    "sha256": hashlib.sha256(target).hexdigest()}
-            total_bytes += len(target)
+            raise RawIIError("product_root:untracked_artifact_invalid")
         elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
             try:
                 facts = depth_runner._digest(path, "product_root.untracked",
@@ -330,6 +391,25 @@ def _untracked_inventory(root: Path) -> dict[str, object]:
             "sha256": hashlib.sha256(raw).hexdigest()}
 
 
+def _git_identity_snapshot(root: Path) -> dict[str, str]:
+    try:
+        head = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                              check=True, capture_output=True, text=True,
+                              timeout=15).stdout.strip()
+        tree = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD^{tree}"],
+                              check=True, capture_output=True, text=True,
+                              timeout=15).stdout.strip()
+        status = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain",
+             "--untracked-files=all"], check=True, capture_output=True,
+            text=True, timeout=15).stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RawIIError("product_root:git_identity_unavailable") from exc
+    if (not HEX40.fullmatch(head) or not HEX40.fullmatch(tree)):
+        raise RawIIError("product_root:git_identity_invalid")
+    return {"head": head.lower(), "tree": tree.lower(), "status": status}
+
+
 def _product_identity(root: Path) -> dict[str, object]:
     """Read the explicit product checkout's real HEAD/tree and file inventory."""
     if not root.is_absolute() or root.is_symlink() or not root.is_dir():
@@ -337,24 +417,20 @@ def _product_identity(root: Path) -> dict[str, object]:
     try:
         top = subprocess.run(["git", "-C", str(root), "rev-parse", "--show-toplevel"],
                              check=True, capture_output=True, text=True, timeout=15).stdout.strip()
-        head = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
-                              check=True, capture_output=True, text=True, timeout=15).stdout.strip()
-        tree = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD^{tree}"],
-                              check=True, capture_output=True, text=True, timeout=15).stdout.strip()
-        status = subprocess.run(["git", "-C", str(root), "status", "--porcelain",
-                                 "--untracked-files=all"], check=True, capture_output=True,
-                                text=True, timeout=15).stdout
     except (OSError, subprocess.SubprocessError) as exc:
         raise RawIIError("product_root:git_identity_unavailable") from exc
-    if (Path(top).resolve() != root.resolve() or not HEX40.fullmatch(head) or
-            not HEX40.fullmatch(tree)):
+    if Path(top).resolve() != root.resolve():
         raise RawIIError("product_root:git_identity_invalid")
+    before = _git_identity_snapshot(root)
     if any(line and not line.startswith(("?? ", "!! "))
-           for line in status.splitlines()):
+           for line in before["status"].splitlines()):
         raise RawIIError("product_root:tracked_worktree_dirty")
     untracked = _untracked_inventory(root)
-    return {"root": str(root.resolve()), "head": head.lower(), "tree": tree.lower(),
-            "tracked_status": status, "untracked": untracked}
+    after = _git_identity_snapshot(root)
+    if before != after:
+        raise RawIIError("product_root:changed_during_inventory")
+    return {"root": str(root.resolve()), "head": before["head"], "tree": before["tree"],
+            "tracked_status": before["status"], "untracked": untracked}
 
 
 def produce(plan_path: Path, witness_path: Path, engine_path: Path, output_dir: Path,
@@ -443,8 +519,12 @@ def produce(plan_path: Path, witness_path: Path, engine_path: Path, output_dir: 
                            "service_ns": elapsed},
         })
     curve_raw = b"".join(_canonical(row) for row in rows)
-    input_digest = hashlib.sha256(_canonical({"source_manifest_sha256": plan["source_manifest"]["sha256"],
-                                              "inputs": inputs})).hexdigest()
+    # Match the live runner's plan/input contract byte-for-byte.  Curve JSON
+    # records retain their newline-delimited producer encoding, but identity
+    # digests use the shared no-newline canonical form.
+    input_digest = hashlib.sha256(normalizer.canonical_bytes(
+        {"source_manifest_sha256": plan["source_manifest"]["sha256"],
+         "inputs": inputs})).hexdigest()
     topology_digest = hashlib.sha256(_canonical(scheduling)).hexdigest()
     identity = {"corpus": cell_hint["corpus"], "profile": "RAW_II", "regime": cell_hint["regime"],
                 "split": SPLITS[cell_hint["corpus"]], "run_id": f"{output_dir.name}-{plan_facts['sha256'][:12]}",
