@@ -59,7 +59,7 @@ import hashlib,json,pathlib,re,sys
 m=pathlib.Path(sys.argv[1]); d=pathlib.Path(sys.argv[2]); out=pathlib.Path(sys.argv[3])
 rows=[json.loads(x) for x in m.read_text().splitlines() if x.strip()]
 need={'id','kind','module','config','module_sha256','config_sha256','expected_exit','expected_wait','expected','injection','injection_marker','target','antecedent','row_sha256','expected_phase'}
-if len(rows)!=86: raise SystemExit('manifest must declare exactly 86 rows')
+if len(rows)!=87: raise SystemExit('manifest must declare exactly 87 rows')
 if any(need-set(r) for r in rows): raise SystemExit('manifest semantic fields incomplete')
 if len({r['id'] for r in rows})!=len(rows): raise SystemExit('manifest duplicate identity')
 def h(p): return hashlib.sha256(p.read_bytes()).hexdigest()
