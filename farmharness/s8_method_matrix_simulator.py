@@ -38,6 +38,7 @@ SUMMARY_SCHEMA = "icecream-s8-method-matrix-summary-v1"
 METHODS = ("RAW_II", "ZSTD_TU", "P29", "GRZ_RESIDUAL", "ZSTD_ROUTE",
            "ZSTD_COHORT", "ZSTD_GLOBAL")
 READY_METHODS = frozenset(("RAW_II", "ZSTD_TU", "ZSTD_ROUTE"))
+CORE_METHODS = frozenset(("RAW_II", "ZSTD_TU", "P29", "GRZ_RESIDUAL", "ZSTD_ROUTE"))
 TOPOLOGY_IDS = ("C1F1/100000", "C1F20/40")
 DEFAULT_HISTORY_BYTES = 128 << 20
 AUTH_TRACE_SHA256 = "9fa7124f63212ccfd78f139dc05dcc5b2737ef868dc3e6878e64f609e079e960"
@@ -167,7 +168,8 @@ def _authenticated_assignment(topology_id: str, count: int, *, start: int = 0) -
                          "authority_dispatch_order": dispatch_order})
     return {"path": facts["path"], "bytes": facts["bytes"], "sha256": facts["sha256"],
             "schema": "root-matrix-v4-assignment-tsv-v1", "topology": topology_id,
-            "rows": selected, "selected_count": count}
+            "rows": selected, "selected_count": count, "authority_total_rows": len(rows),
+            "authority_capacity_slots": (100000 if topology_id == "C1F1/100000" else 40)}
 
 
 def _native_batch(occurrences: Sequence[Occurrence], topology: MatrixTopology,
@@ -320,7 +322,12 @@ def _libbsc_authority(root: Path) -> dict[str, object]:
               header_facts["sha256"] == AUTH_LIBBSC_HEADER_SHA256 and
               library_facts["sha256"] == AUTH_LIBBSC_LIBRARY_SHA256)
     return {"status": "READY" if status else "NOT_READY", "source_root": str(source),
-            "head": head, "tree": tree, "archive_sha256": AUTH_LIBBSC_ARCHIVE_SHA256,
+            "head": head, "tree": tree,
+            "archive": {"sha256": AUTH_LIBBSC_ARCHIVE_SHA256, "materialized": False,
+                        "reproducible_from": "git archive --format=tar --prefix=libbsc-baffa62/ "
+                                             + AUTH_LIBBSC_HEAD,
+                        "finding": "archive byte is not retained; SHA is provenance-only"},
+            "archive_sha256": AUTH_LIBBSC_ARCHIVE_SHA256,
             "header": header_facts, "library": library_facts,
             "provenance": provenance_facts, "source_manifest": manifest_facts,
             "reason": None if status else "MISSING_AUTHORITY: libbsc hash mismatch"}
@@ -643,7 +650,7 @@ class MethodMatrixSimulator:
         if authority["status"] == "NOT_READY":
             raise NotReady(str(authority.get("reason", "method authority unavailable")))
         if method == "RAW_II":
-            return raw, 0, 0
+            return b"", 0, 0
         if method in {"ZSTD_TU", "ZSTD_ROUTE"}:
             return self._native_codec(method, raw, state)
         raise NotReady("cohort codec has no accepted native authority")
@@ -652,7 +659,8 @@ class MethodMatrixSimulator:
             timestamp: str | None = None, repeat_full: bool = False,
             prior_state: Mapping[str, object] | None = None,
             predecessor_occurrences: Sequence[Occurrence] = (),
-            predecessor_assignment_authority: Mapping[str, object] | None = None
+            predecessor_assignment_authority: Mapping[str, object] | None = None,
+            depth: str | None = None, pass_id: str | None = None
             ) -> Path | dict[str, object]:
         if repeat_full and prior_state is None:
             raise MatrixError("repeat-full requires explicit full-1 state")
@@ -707,16 +715,31 @@ class MethodMatrixSimulator:
 
         if output_root is None:
             return self._run_memory(occurrences, assignments, states_by_method)
-        experiment = output_root.absolute() / (timestamp or _stamp())
-        if experiment.exists():
-            raise MatrixError(f"experiment already exists: {experiment}")
+        depth_label = depth or f"count-{len(occurrences)}"
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", depth_label):
+            raise MatrixError("experiment depth identity is malformed")
+        pass_label = pass_id or "pass-1"
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", pass_label):
+            raise MatrixError("experiment pass identity is malformed")
+        run_timestamp = timestamp or _stamp()
+        run_label = run_timestamp + "-" + self.topology.topology_id.replace("/", "-") + \
+            "-" + depth_label + "-" + pass_label
+        experiment = output_root.absolute() / run_label
+        suffix = 1
+        while experiment.exists():
+            experiment = output_root.absolute() / f"{run_label}-r{suffix:02d}"
+            suffix += 1
         experiment.mkdir(parents=True)
         (experiment / "bytes").mkdir()
         rows: list[dict[str, object]] = []
         for occurrence, assignment in zip(occurrences, assignments):
+            raw_cache = occurrence.raw if occurrence.source_path is None else None
             for method in self.methods:
+                if method != "RAW_II" and raw_cache is None:
+                    raw_cache = occurrence.read_raw()
                 rows.append(self._run_occurrence(experiment, occurrence, assignment,
-                                                 method, states_by_method[method][tuple(assignment["relationship_key"])]))
+                                                 method, states_by_method[method][tuple(assignment["relationship_key"])],
+                                                 raw_override=raw_cache))
         with (experiment / "occurrences.jsonl").open("wb") as stream:
             for row in rows:
                 stream.write(_canonical(row))
@@ -743,6 +766,9 @@ class MethodMatrixSimulator:
                                             "source_relative": o.source_relative,
                                             "bytes": o.byte_count(), "sha256": o.source_sha256}
                                             for o in occurrences]},
+                    "run_identity": {"timestamp": run_timestamp,
+                                     "topology": self.topology.topology_id,
+                                     "depth": depth_label, "pass": pass_label},
                     "predecessor_input_authority": ({"selected_inputs": [
                         {"ordinal": o.ordinal, "build": o.source_build,
                          "logical": o.source_logical, "source_relative": o.source_relative,
@@ -760,27 +786,36 @@ class MethodMatrixSimulator:
                     states_by_method: dict[str, dict[tuple[str, str], _RelationshipState]]) -> dict[str, object]:
         rows: list[dict[str, object]] = []
         for occurrence, assignment in zip(occurrences, assignments):
+            raw_cache = occurrence.raw if occurrence.source_path is None else None
             for method in self.methods:
                 key = tuple(assignment["relationship_key"])
+                if method != "RAW_II" and raw_cache is None:
+                    raw_cache = occurrence.read_raw()
                 rows.append(self._run_occurrence(
-                    None, occurrence, assignment, method, states_by_method[method][key]))
+                    None, occurrence, assignment, method, states_by_method[method][key],
+                    raw_override=raw_cache))
         return {"schema": SUMMARY_SCHEMA, "status": self._status(rows),
+                "core_completion": self._completion(rows, CORE_METHODS),
+                "optional_completion": self._completion(rows, set(self.methods) - CORE_METHODS),
                 "topology": self._topology_record(), "rows": rows,
                 "relationship_count": self.topology.relationship_count,
                 "method_status": {method: self.authority[method]["status"] for method in self.methods}}
 
     def _run_occurrence(self, experiment: Path | None, occurrence: Occurrence,
                         assignment: Mapping[str, object], method: str,
-                        state: _RelationshipState) -> dict[str, object]:
+                        state: _RelationshipState,
+                        raw_override: bytes | None = None) -> dict[str, object]:
         key = tuple(assignment["relationship_key"])  # type: ignore[arg-type]
         pre = _sha256(_canonical({"history": state.history.hex(), "next_rel_seq": state.next_rel_seq,
                                   "route_id": state.last_route_id, "nonce": state.history_nonce}))
         raw_path = encoded_path = None
-        raw = occurrence.read_raw()
-        raw_sha = occurrence.source_sha256 or _sha256(raw)
+        raw = (None if method == "RAW_II" and occurrence.source_path else
+               raw_override if raw_override is not None else occurrence.read_raw())
+        raw_bytes = occurrence.byte_count()
+        raw_sha = occurrence.source_sha256 or _sha256(raw or b"")
         # Raw corpus payloads remain at their authenticated immutable source;
         # experiment evidence retains source path/size/hash descriptors only.
-        if experiment is not None:
+        if experiment is not None and method != "RAW_II":
             (experiment / "bytes" / method).mkdir(exist_ok=True)
         row: dict[str, object] = {"schema": OCCURRENCE_SCHEMA, "method": method,
             "topology": self.topology.topology_id, "ordinal": occurrence.ordinal,
@@ -791,7 +826,7 @@ class MethodMatrixSimulator:
             "authority_build": assignment.get("authority_build"),
             "authority_logical": assignment.get("authority_logical"),
             "authority_dispatch_order": assignment.get("dispatch_order"),
-            "raw_bytes": len(raw), "raw_sha256": raw_sha,
+            "raw_bytes": raw_bytes, "raw_sha256": raw_sha,
             "source_relative": occurrence.source_relative, "source_sha256": occurrence.source_sha256,
             "raw_path": str(raw_path.relative_to(experiment)) if raw_path and experiment else None,
             "status": self.authority[method]["status"], "committed": False,
@@ -846,14 +881,17 @@ class MethodMatrixSimulator:
             wall_ns = cpu_ns
         else:
             encoded, cpu_ns, wall_ns = self._encode(method, raw, encode_state)
-        if experiment is not None and product is None:
+        if experiment is not None and product is None and method != "RAW_II":
             encoded_path = experiment / "bytes" / method / f"encoded-{occurrence.ordinal:06d}.bin"
             encoded_path.write_bytes(encoded)
-        row.update({"encoded_bytes": (int(product["encoded_source_bytes"]) if product is not None else len(encoded)),
-                    "encoded_sha256": (_sha256(encoded) if product is None else None),
+        row.update({"encoded_bytes": (None if method == "RAW_II" else
+                                       int(product["encoded_source_bytes"]) if product is not None else len(encoded)),
+                    "encoded_sha256": (None if method == "RAW_II" else
+                                        _sha256(encoded) if product is None else None),
                     "encoded_path": str(encoded_path.relative_to(experiment))
                     if encoded_path and experiment else None,
-                    "codec_cpu_ns": cpu_ns, "codec_wall_ns": wall_ns})
+                    "codec_cpu_ns": (None if method == "RAW_II" else cpu_ns),
+                    "codec_wall_ns": (None if method == "RAW_II" else wall_ns)})
         if method in self._native_rows and occurrence.ordinal in self._native_rows[method]:
             row["product_transaction"] = self._native_rows[method][occurrence.ordinal]
         if occurrence.commit:
@@ -869,6 +907,8 @@ class MethodMatrixSimulator:
                 row["transition"] = "committed_relationship_advance"
             elif method == "ZSTD_TU":
                 row["transition"] = "committed_tu_reset"
+            elif method in {"P29", "GRZ_RESIDUAL"}:
+                row["transition"] = "committed_native_profile"
             else:
                 row["transition"] = "committed_raw_control"
             state.pending = False
@@ -896,7 +936,19 @@ class MethodMatrixSimulator:
 
     @staticmethod
     def _status(rows: Sequence[Mapping[str, object]]) -> str:
-        return "COMPLETED" if all(row["status"] == "READY" for row in rows) else "PARTIAL_NOT_READY"
+        core = [row for row in rows if row.get("method") in CORE_METHODS]
+        return "COMPLETED" if core and all(row["status"] == "READY" for row in core) else "PARTIAL_NOT_READY"
+
+    @staticmethod
+    def _completion(rows: Sequence[Mapping[str, object]], methods: set[str] | frozenset[str]) -> dict[str, object]:
+        selected = [row for row in rows if row.get("method") in methods]
+        if not selected:
+            return {"status": "NOT_REQUESTED", "methods": sorted(methods)}
+        ready = all(row.get("status") == "READY" for row in selected)
+        return {"status": "COMPLETED" if ready else "NOT_READY",
+                "methods": sorted({str(row.get("method")) for row in selected}),
+                "unready_methods": sorted({str(row.get("method")) for row in selected
+                                            if row.get("status") != "READY"})}
 
     def _summary(self, rows: Sequence[Mapping[str, object]], experiment: Path,
                  states_by_method: Mapping[str, Mapping[tuple[str, str], _RelationshipState]]) -> dict[str, object]:
@@ -915,7 +967,8 @@ class MethodMatrixSimulator:
             selected = [row for row in rows if row.get("method") == method]
             totals[method] = {
                 "raw_bytes": sum(int(row.get("raw_bytes") or 0) for row in selected),
-                "encoded_bytes": sum(int(row.get("encoded_bytes") or 0) for row in selected),
+                "encoded_bytes": (None if method == "RAW_II" else
+                                  sum(int(row.get("encoded_bytes") or 0) for row in selected)),
                 "execution_ns": (None if method == "RAW_II" else
                                   sum(int(row.get("product_transaction", {}).get("simulator_execution_ns", 0))
                                       for row in selected)),
@@ -930,6 +983,8 @@ class MethodMatrixSimulator:
                                   if row.get("product_transaction")],
             }
         return {"schema": SUMMARY_SCHEMA, "status": self._status(rows),
+                "core_completion": self._completion(rows, CORE_METHODS),
+                "optional_completion": self._completion(rows, set(self.methods) - CORE_METHODS),
                 "experiment": str(experiment), "topology": self._topology_record(),
                 "relationship_count": self.topology.relationship_count,
                 "method_status": {method: self.authority[method]["status"] for method in self.methods},
@@ -1127,12 +1182,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--count", type=int, default=100)
     parser.add_argument("--depth", choices=("100", "200", "full-1", "state-carrying-full-2"))
     parser.add_argument("--full-1-experiment", type=Path,
-                        help="authenticated full-1 experiment for state-carrying-full-2")
+                        help="legacy C1F1 predecessor; prefer topology-specific options")
+    parser.add_argument("--full-1-experiment-c1f1", type=Path)
+    parser.add_argument("--full-1-experiment-c1f20", type=Path)
     args = parser.parse_args(argv)
     if args.firefox_trace is None:
         parser.error("--firefox-trace is required")
-    if args.depth == "state-carrying-full-2" and args.full_1_experiment is None:
-        parser.error("state-carrying-full-2 requires --full-1-experiment")
+    if args.depth == "state-carrying-full-2" and not (
+            args.full_1_experiment_c1f1 and args.full_1_experiment_c1f20):
+        parser.error("state-carrying-full-2 requires topology-specific predecessor experiments")
     count = {None: args.count, "100": 100, "200": 200, "full-1": 2498,
              "state-carrying-full-2": 2498}[args.depth]
     for topology_id in TOPOLOGY_IDS:
@@ -1142,8 +1200,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             occurrences = firefox_occurrences(args.firefox_trace, count=count,
                                                dispatch_start=dispatch_start)
             if args.depth == "state-carrying-full-2":
+                predecessor_path = {"C1F1/100000": args.full_1_experiment_c1f1,
+                                    "C1F20/40": args.full_1_experiment_c1f20}[topology_id]
                 prior_state, predecessor_authority = _authenticated_predecessor_plan(
-                    args.full_1_experiment, topology_id)
+                    predecessor_path, topology_id)
                 predecessor = firefox_occurrences(args.firefox_trace, count=count,
                                                   dispatch_start=0)
                 current_authority = _authenticated_assignment(
@@ -1152,7 +1212,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     topology, assignment_authority=current_authority).run(
                         occurrences, output_root=args.output_root, repeat_full=True,
                         prior_state=prior_state, predecessor_occurrences=predecessor,
-                        predecessor_assignment_authority=predecessor_authority)
+                        predecessor_assignment_authority=predecessor_authority,
+                        depth=args.depth)
                 assert isinstance(path, Path)
                 print(path)
                 continue
@@ -1167,7 +1228,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                                               "authenticated Firefox .ii inputs are unavailable"))
             print(path)
             continue
-        path = MethodMatrixSimulator(topology).run(occurrences, output_root=args.output_root)
+        path = MethodMatrixSimulator(topology).run(occurrences, output_root=args.output_root,
+                                                  depth=args.depth or f"count-{count}")
         assert isinstance(path, Path)
         print(path)
     return 0

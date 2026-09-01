@@ -56,6 +56,13 @@ def test_authenticated_assignment_preserves_build_boundary_and_formula() -> None
         assert item["per_f_slot"] == item["global_slot"] % 2
 
 
+def test_real_c1f20_authority_covers_all_five_builds() -> None:
+    authority = _authenticated_assignment("C1F20/40", 12490)
+    assert authority["selected_count"] == 12490
+    assert authority["rows"][2498]["authority_build"] == 1
+    assert authority["rows"][12489]["authority_logical"] == 2497
+
+
 def test_firefox_occurrence_keeps_global_dispatch_at_build_boundary() -> None:
     trace = Path("/tanksmall/scratch/ictmp/lo-s4-e50.G5KsGG/capability/distribution/firefox-corrected.compile-trace.tsv")
     occurrence = firefox_occurrences(trace, count=1, dispatch_start=2498)[0]
@@ -123,7 +130,32 @@ def test_methods_do_not_alias_and_missing_authority_is_explicit() -> None:
     rows = {row["method"]: row for row in result["rows"]}
     assert rows["ZSTD_COHORT"]["encoded_bytes"] is None
     assert rows["ZSTD_GLOBAL"]["encoded_bytes"] is None
-    assert rows["RAW_II"]["encoded_sha256"] != rows["ZSTD_TU"]["encoded_sha256"]
+    assert rows["RAW_II"]["encoded_sha256"] is None
+    assert rows["RAW_II"]["measurement_scope"] == "raw_bytes_only_no_wire_witness"
+
+
+def test_raw_control_retains_no_copy_and_runs_are_collision_safe(tmp_path: Path,
+                                                                monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "external.ii"
+    source.write_bytes(b"payload")
+    occurrence = Occurrence(0, None, source_path=str(source),
+                            source_sha256=hashlib.sha256(b"payload").hexdigest())
+    monkeypatch.setattr(Occurrence, "read_raw",
+                        lambda _self: pytest.fail("RAW_II loaded an external payload"))
+    simulator = MethodMatrixSimulator(MatrixTopology.from_id("C1F1/100000"),
+                                       methods=("RAW_II",))
+    first = simulator.run([occurrence], output_root=tmp_path,
+                          timestamp="20260901T120000Z", depth="100")
+    second = simulator.run([occurrence], output_root=tmp_path,
+                           timestamp="20260901T120000Z", depth="100")
+    assert first != second
+    for experiment in (first, second):
+        assert not list((experiment / "bytes").rglob("*"))
+        row = json.loads((experiment / "occurrences.jsonl").read_text())
+        assert row["method"] == "RAW_II"
+        assert row["encoded_bytes"] is None
+        assert row["codec_cpu_ns"] is None
+        assert row["codec_wall_ns"] is None
 
 
 def test_cohort_requires_its_own_authenticated_dictionary_authority() -> None:
