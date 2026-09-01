@@ -138,6 +138,10 @@ def test_declares_distinct_methods_topologies_depths_and_statuses(tmp_path: Path
     assert [item["root_status"] for item in result["methods"]] == [
         "NOT_IMPLEMENTED", "IMPLEMENTED", "IMPLEMENTED", "IMPLEMENTED", "IMPLEMENTED",
         "NOT_IMPLEMENTED", "NOT_IMPLEMENTED"]
+    raw_method = result["methods"][0]
+    assert raw_method["arm_kind"] == "control_baseline"
+    assert raw_method["required_inputs"] == [
+        "raw_ii_legacy_wire_witness", "raw_ii_engine_template"]
     assert result["topologies"][0]["stream_capacity_tus"] == 100000
     assert result["topologies"][1]["global_execution_slots"] == 40
     assert result["topologies"][1]["stream_capacity_tus"] is None
@@ -158,6 +162,9 @@ def test_declares_distinct_methods_topologies_depths_and_statuses(tmp_path: Path
         "required_producer_capability_not_integrated_on_planner_source"}
     assert result["corpus_authority"]["snapshots"]["count"] == 8261
     first = json.loads(lines[0])
+    assert first["arm_kind"] == "control_baseline"
+    assert first["required_inputs"] == [
+        "raw_ii_legacy_wire_witness", "raw_ii_engine_template"]
     assert first["result_relative_directory"] == (
         "experiments/icecream/s8-expanded/20260829T000000Z/"
         "debian-gcc/llvm/raw-ii/c1f1-100000/100/cold")

@@ -226,8 +226,56 @@ def test_campaign_can_select_one_profile_and_topology(tmp_path: Path) -> None:
     assert {(row["cell"]["profile"], row["cell"]["regime"], row["cell"]["topology"])
             for row in summary["cells"]} == {
                 ("P29", "cold", "C1F20/40"),
-                ("P29", "warm", "C1F20/40"),
-            }
+            ("P29", "warm", "C1F20/40"),
+        }
+
+
+def test_raw_ii_is_explicit_control_selection_and_retained_plan_only(tmp_path: Path) -> None:
+    witness = tmp_path / "raw-ii-witness.json"
+    engine = tmp_path / "raw-ii-engine-template.json"
+    witness.write_text("raw witness\n")
+    engine.write_text("raw engine template\n")
+    campaign = driver.run_campaign(
+        **_kwargs(tmp_path), execute=False, selected_profiles=("RAW_II",),
+        selected_topologies=("C1F1/100000",),
+        raw_ii_witness=witness,
+        raw_ii_engine_manifest_template=engine,
+        timestamp="20260829T120013Z")
+    summary = json.loads((campaign / "summary.json").read_text())
+    metadata = json.loads((campaign / "campaign.json").read_text())
+    assert summary["expected_cells"] == 2
+    assert summary["counts"]["STAGED"] == 2
+    assert {row["cell"]["profile"] for row in summary["cells"]} == {"RAW_II"}
+    assert metadata["config"]["selected_profiles"] == ["RAW_II"]
+    assert metadata["config"]["raw_ii_witness"] == str(witness)
+    assert metadata["config"]["raw_ii_engine_manifest_template"] == str(engine)
+    state = json.loads(next((campaign / "cells").glob("*/status.json")).read_text())
+    retained = campaign / "cells" / "DuckDB-RAW_II-cold-C1F1-100000" / "attempt-001" / "raw-ii-control-inputs.json"
+    assert state["raw_ii_control_inputs"]["path"].endswith("raw-ii-control-inputs.json")
+    assert json.loads(retained.read_text())["arm_kind"] == "control_baseline"
+
+
+def test_raw_ii_fails_closed_without_control_inputs(tmp_path: Path) -> None:
+    with pytest.raises(driver.CampaignError,
+                       match="raw_ii:control_baseline_requires_witness_and_engine_template"):
+        driver.run_campaign(**_kwargs(tmp_path), execute=False,
+                             selected_profiles=("RAW_II",),
+                             timestamp="20260829T120014Z")
+
+
+def test_raw_ii_execution_remains_held_until_control_runner_exists(tmp_path: Path) -> None:
+    witness = tmp_path / "raw-ii-witness.json"
+    engine = tmp_path / "raw-ii-engine-template.json"
+    witness.write_text("raw witness\n")
+    engine.write_text("raw engine template\n")
+    with pytest.raises(driver.CampaignError,
+                       match="raw_ii:control_baseline_execution_not_integrated"):
+        driver.run_campaign(
+            **_kwargs(tmp_path), selected_profiles=("RAW_II",),
+            raw_ii_witness=witness,
+            raw_ii_engine_manifest_template=engine,
+            timestamp="20260829T120015Z")
+    assert not list((tmp_path / "experiments").glob("s8-campaign-*"))
 
 
 def test_campaign_selection_rejects_empty_unknown_and_duplicate_values() -> None:

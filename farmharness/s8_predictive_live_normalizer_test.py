@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from s8_predictive_live_normalizer import (
+    CONTROL_BASELINE,
     MANIFEST_SCHEMA,
     NormalizationError,
     _validate_role_placement,
@@ -120,6 +121,39 @@ def test_emits_three_records_and_keeps_raw_curves(tmp_path: Path) -> None:
     assert comparison["loss_curve"][-1]["cumulative_loss"] == 16.0
     assert len(output.read_text(encoding="utf-8").splitlines()) == 3
     assert all(record["semantics"] == CURRENT_SEMANTICS for record in records)
+
+
+def test_raw_ii_requires_and_retains_explicit_control_baseline(tmp_path: Path) -> None:
+    raw_identity = dict(IDENTITY, profile="RAW_II", model_id="raw-ii-control")
+    predictive = _write_manifest(
+        tmp_path, "raw-predictive", "predictive_sim", _curve_rows(),
+        identity=raw_identity, extra={"control_baseline": CONTROL_BASELINE})
+    live = _write_manifest(
+        tmp_path, "raw-live", "live", _curve_rows(2),
+        identity=raw_identity, extra={"control_baseline": CONTROL_BASELINE})
+    records = normalize(predictive, live, tmp_path / "raw-records.jsonl")
+    assert all(record["control_baseline"] == CONTROL_BASELINE for record in records)
+
+
+def test_raw_ii_without_control_baseline_is_rejected(tmp_path: Path) -> None:
+    raw_identity = dict(IDENTITY, profile="RAW_II", model_id="raw-ii-control")
+    predictive = _write_manifest(
+        tmp_path, "raw-predictive", "predictive_sim", _curve_rows(), identity=raw_identity)
+    live = _write_manifest(
+        tmp_path, "raw-live", "live", _curve_rows(), identity=raw_identity)
+    with pytest.raises(NormalizationError,
+                       match="control_baseline:raw_ii_declaration_required"):
+        normalize(predictive, live, tmp_path / "raw-records.jsonl")
+
+
+def test_compressed_profile_cannot_claim_raw_control_baseline(tmp_path: Path) -> None:
+    predictive, live = _pair(tmp_path)
+    predictive = _write_manifest(
+        tmp_path, "raw-claim", "predictive_sim", _curve_rows(),
+        extra={"control_baseline": CONTROL_BASELINE})
+    with pytest.raises(NormalizationError,
+                       match="control_baseline:only_valid_for_raw_ii"):
+        normalize(predictive, live, tmp_path / "raw-claim-records.jsonl")
 
 
 def test_identity_and_units_are_bound_exactly(tmp_path: Path) -> None:

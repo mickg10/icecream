@@ -46,6 +46,9 @@ METHODS = ("RAW_II", "ZSTD_TU", "ZSTD_ROUTE", "P29", "GRZ_RESIDUAL",
            "ZSTD_COHORT", "ZSTD_GLOBAL")
 EXPECTED_METHODS = METHODS
 IMPLEMENTED_METHODS = frozenset(("ZSTD_TU", "ZSTD_ROUTE", "P29", "GRZ_RESIDUAL"))
+# RAW_II remains an explicit control arm, separate from the four compressed
+# producer methods.  Its inputs must be supplied by a future control runner.
+CONTROL_METHODS = frozenset(("RAW_II",))
 DEPTHS = ("100", "200", "full-1", "state-carrying full-2")
 EXPECTED_DEPTHS = DEPTHS
 REGIMES = ("cold", "warm")
@@ -546,6 +549,9 @@ def plan_campaign(corpus_inventory: Path, image_recovery: Path, image_recovery_s
     methods = [{
         "name": method,
         "root_status": "IMPLEMENTED" if method in IMPLEMENTED_METHODS else "NOT_IMPLEMENTED",
+        "arm_kind": "control_baseline" if method in CONTROL_METHODS else "compressed_profile",
+        "required_inputs": (["raw_ii_legacy_wire_witness", "raw_ii_engine_template"]
+                            if method in CONTROL_METHODS else []),
         "producer_capability": CAPABILITY if method in IMPLEMENTED_METHODS else None,
         "status_reason": "native/live runner interface available on current Root" if method in IMPLEMENTED_METHODS
         else "method is not implemented on current Root; no alias is permitted",
@@ -589,6 +595,11 @@ def plan_campaign(corpus_inventory: Path, image_recovery: Path, image_recovery_s
                                     "snapshot": corpus["snapshot"],
                                 }, "method": method, "topology": dict(topology), "depth": depth,
                                 "regime": regime, "status": status, "reason": reason,
+                                "arm_kind": ("control_baseline" if method in CONTROL_METHODS
+                                              else "compressed_profile"),
+                                "required_inputs": (["raw_ii_legacy_wire_witness",
+                                                      "raw_ii_engine_template"]
+                                                     if method in CONTROL_METHODS else []),
                                 "producer_capability": producer_capability, "execution": "declarative_only",
                                 "campaign_timestamp": timestamp,
                                 "result_relative_directory": result_relative_directory,

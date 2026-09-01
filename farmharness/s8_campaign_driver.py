@@ -28,10 +28,10 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 try:  # package invocation
-    from .s8_schema import CORPORA, PROFILES, REGIMES, SPLITS
+    from .s8_schema import CONTROL_PROFILES, CORPORA, PROFILES, REGIMES, SPLITS
     from . import s8_external_farm_executor as external_farm_executor
 except ImportError:  # direct invocation
-    from s8_schema import CORPORA, PROFILES, REGIMES, SPLITS
+    from s8_schema import CONTROL_PROFILES, CORPORA, PROFILES, REGIMES, SPLITS
     import s8_external_farm_executor as external_farm_executor
 
 
@@ -40,6 +40,7 @@ CELL_SCHEMA = "icecream-s8-campaign-cell-v3"
 SUMMARY_SCHEMA = "icecream-s8-campaign-summary-v3"
 DEPTHS = ("100", "200", "full")
 TOPOLOGIES = ("C1F1/100000", "C1F20/40")
+CAMPAIGN_PROFILES = (*PROFILES, *CONTROL_PROFILES)
 EXTERNAL_FARM_MODE = "external-farm"
 TOPOLOGY_ARGS = {"C1F1/100000": "C1F1", "C1F20/40": "C1F20"}
 CAMPAIGN_STAMP = "%Y%m%dT%H%M%SZ"
@@ -93,7 +94,7 @@ def _slug(cell: dict[str, str]) -> str:
 
 def _validate_cell(cell: dict[str, str]) -> None:
     if (set(cell) != {"corpus", "profile", "regime", "topology"} or
-            cell["corpus"] not in CORPORA or cell["profile"] not in PROFILES or
+            cell["corpus"] not in CORPORA or cell["profile"] not in CAMPAIGN_PROFILES or
             cell["regime"] not in REGIMES or cell["topology"] not in TOPOLOGIES):
         raise CampaignError("cell:undeclared")
 
@@ -124,7 +125,10 @@ def cells(corpus: str, *, selected_profiles: Sequence[str] | None = None,
           selected_topologies: Sequence[str] | None = None) -> list[dict[str, str]]:
     if corpus not in CORPORA:
         raise CampaignError("corpus:undeclared")
-    profiles = _selected_dimension("profiles", PROFILES, selected_profiles)
+    # The default remains the four-profile compressed grid.  A control arm is
+    # opt-in only through an explicit selection.
+    profiles = (tuple(PROFILES) if selected_profiles is None else
+                _selected_dimension("profiles", CAMPAIGN_PROFILES, selected_profiles))
     topologies = _selected_dimension("topologies", TOPOLOGIES, selected_topologies)
     return [{"corpus": corpus, "profile": profile, "regime": regime,
              "topology": topology}
@@ -607,6 +611,9 @@ def _source_commands(cell_dir: Path, cell: dict[str, str], *, depth: str,
                                           dict[str, object], list[dict[str, object]],
                                           list[Path]]:
     attempt = cell_dir / "attempt-001"
+    control_only = cell["profile"] in CONTROL_PROFILES
+    control_reason = ("RAW_II control runner required; predictive commands are staged only"
+                      if control_only else None)
     result_dir = attempt / f"s8-{_slug(cell)}-{campaign_stamp}"
     plan = attempt / ("depth-plan-full-1.json" if depth == "full" else "depth-plan.json")
     depth_argv = [python, str((repo / "farmharness/s8_depth_runner.py").absolute()),
@@ -636,11 +643,18 @@ def _source_commands(cell_dir: Path, cell: dict[str, str], *, depth: str,
         if paired_full:
             producer_argv.extend(["--repeat-plan", str(repeat_plan)])
             result_dirs.append(repeat_result)
-        plan_commands.append(_command_record(repeat_argv, repo, stage="predictive_plan_full_2"))
+        plan_commands.append(_command_record(
+            repeat_argv, repo, stage="predictive_plan_full_2",
+            executable=not control_only, reason=control_reason))
     if depth != "full" or not paired_full:
         producer_argv.extend(("--output-dir", str(result_dir)))
-    plan_commands.insert(0, _command_record(depth_argv, repo, stage="predictive_plan" if depth != "full" else "predictive_plan_full_1"))
-    producer_command = _command_record(producer_argv, repo, stage="predictive_producer")
+    plan_commands.insert(0, _command_record(
+        depth_argv, repo,
+        stage="predictive_plan" if depth != "full" else "predictive_plan_full_1",
+        executable=not control_only, reason=control_reason))
+    producer_command = _command_record(
+        producer_argv, repo, stage="predictive_producer",
+        executable=not control_only, reason=control_reason)
 
     # These are deliberately staged, not guessed.  A live run requires a
     # compile database and a retained source checkout that are not predictive
@@ -952,6 +966,8 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
                  external_authority_provider: Callable[[dict[str, str]], str | Path] | None = None,
                  external_authority_command: Sequence[str] | None = None,
                  external_authority_command_timeout: float = 900.0,
+                 raw_ii_witness: str | Path | None = None,
+                 raw_ii_engine_manifest_template: str | Path | None = None,
                  external_transport_factory: Callable[[dict[str, object]], object] | None = None,
                  reference_witness: str | Path | None = None,
                  reference_authority: str | Path | None = None,
@@ -973,7 +989,8 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
         raise CampaignError("mode:undeclared")
     if corpus not in CORPORA:
         raise CampaignError("corpus:undeclared")
-    selected_profiles = _selected_dimension("profiles", PROFILES, selected_profiles)
+    selected_profiles = (tuple(PROFILES) if selected_profiles is None else
+                         _selected_dimension("profiles", CAMPAIGN_PROFILES, selected_profiles))
     selected_topologies = _selected_dimension("topologies", TOPOLOGIES, selected_topologies)
     campaign_cells = cells(corpus, selected_profiles=selected_profiles,
                            selected_topologies=selected_topologies)
@@ -1007,6 +1024,24 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
     simulator_authority_path = (Path(simulator_authority).absolute()
                                  if simulator_authority else None)
     external_authority_path: Path | None = None
+    raw_cells = [cell for cell in campaign_cells if cell["profile"] in CONTROL_PROFILES]
+    raw_witness_spec = str(raw_ii_witness) if raw_ii_witness is not None else None
+    raw_engine_spec = (str(raw_ii_engine_manifest_template)
+                       if raw_ii_engine_manifest_template is not None else None)
+    if raw_cells:
+        if raw_witness_spec is None or raw_engine_spec is None:
+            raise CampaignError(
+                "raw_ii:control_baseline_requires_witness_and_engine_template")
+        if execute:
+            raise CampaignError("raw_ii:control_baseline_execution_not_integrated")
+        for raw_cell in raw_cells:
+            witness = _format_path(raw_witness_spec, raw_cell)
+            engine = _format_path(raw_engine_spec, raw_cell)
+            try:
+                _private_file(witness, "raw_ii_witness")
+                _private_file(engine, "raw_ii_engine_manifest")
+            except CampaignError as exc:
+                raise CampaignError(f"raw_ii:control_input_invalid:{exc}") from exc
     if mode == EXTERNAL_FARM_MODE:
         authority_sources = sum(item is not None for item in (
             external_farm_authority, external_authority_provider,
@@ -1069,6 +1104,8 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
         "external_authority_command": (list(external_authority_command)
                                         if external_authority_command is not None else None),
         "external_authority_command_timeout": external_authority_command_timeout,
+        "raw_ii_witness": raw_witness_spec,
+        "raw_ii_engine_manifest_template": raw_engine_spec,
         "selected_profiles": list(selected_profiles),
         "selected_topologies": list(selected_topologies),
         "dimensions": {"profiles": list(selected_profiles), "regimes": list(REGIMES),
@@ -1134,6 +1171,18 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
         source_manifest = _format_path(source_manifest_spec, cell)
         source_root = _format_path(source_root_spec, cell)
         engine_manifest = _format_path(engine_manifest_template, cell)
+        raw_control_record: dict[str, object] | None = None
+        if cell["profile"] in CONTROL_PROFILES:
+            assert raw_witness_spec is not None and raw_engine_spec is not None
+            raw_control_record = {
+                "schema": "icecream-s8-raw-ii-control-inputs-v1",
+                "arm_kind": "control_baseline",
+                "cell": cell,
+                "legacy_wire_witness": _private_file(
+                    _format_path(raw_witness_spec, cell), "raw_ii_witness"),
+                "engine_template": _private_file(
+                    _format_path(raw_engine_spec, cell), "raw_ii_engine_manifest"),
+            }
         plan_cmds, producer_cmd, live_cmds, comparison_cmd, result_dirs = _source_commands(
             cell_dir, cell, depth=depth, source_manifest=source_manifest,
             source_root=source_root, matrix_audit=matrix_audit, engine_manifest=engine_manifest,
@@ -1171,12 +1220,22 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
         commands = {"predictive_plan": plan_cmds, "predictive_producer": producer_cmd,
                     "live": live_cmds, "comparison": comparison_cmd}
         _write_new(attempt_dir / "commands.json", canonical(commands))
+        if raw_control_record is not None:
+            _write_new(attempt_dir / "raw-ii-control-inputs.json",
+                       canonical(raw_control_record))
         status: dict[str, Any] = {"schema": CELL_SCHEMA, "cell": cell, "cell_id": cell_label,
                                   "split": SPLITS[corpus], "status": "RUNNING", "attempt": attempt_no,
                                   "started_utc": datetime.now(timezone.utc).isoformat(),
                                   "commands": {"path": str((attempt_dir / "commands.json").relative_to(campaign)),
                                                "sha256": hashlib.sha256((attempt_dir / "commands.json").read_bytes()).hexdigest()},
                                   "history": old.get("history", [])}
+        if raw_control_record is not None:
+            status["raw_ii_control_inputs"] = {
+                "path": str((attempt_dir / "raw-ii-control-inputs.json").relative_to(campaign)),
+                "bytes": (attempt_dir / "raw-ii-control-inputs.json").stat().st_size,
+                "sha256": hashlib.sha256(
+                    (attempt_dir / "raw-ii-control-inputs.json").read_bytes()).hexdigest(),
+            }
         _replace_json(state_path, status)
         if not execute:
             status["status"] = "STAGED"
@@ -1517,6 +1576,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--external-farm-authority-command", type=shlex.split,
                         help="quoted argv template producing {output} authority before each external cell")
     parser.add_argument("--external-farm-authority-command-timeout", type=float, default=900.0)
+    parser.add_argument("--raw-ii-witness", type=Path,
+                        help="attempt input for the explicit RAW_II legacy-wire control arm")
+    parser.add_argument("--raw-ii-engine-manifest-template",
+                        help="per-cell engine-template path for the explicit RAW_II control arm")
     parser.add_argument("--plan-only", action="store_true",
                         help="retain the full matrix and staged commands without executing predictive cells")
     parser.add_argument("--mode", choices=("predictive-only", "all", EXTERNAL_FARM_MODE),
@@ -1556,7 +1619,9 @@ def main(argv: list[str] | None = None) -> int:
                                 artifact_sample=args.artifact_sample,
                                 retain_all_artifacts=args.retain_all_artifacts,
                                 external_authority_command=args.external_farm_authority_command,
-                                external_authority_command_timeout=args.external_farm_authority_command_timeout)
+                                external_authority_command_timeout=args.external_farm_authority_command_timeout,
+                                raw_ii_witness=args.raw_ii_witness,
+                                raw_ii_engine_manifest_template=args.raw_ii_engine_manifest_template)
     except CampaignError as exc:
         print(f"s8_campaign_driver: {exc}", file=sys.stderr)
         return 2

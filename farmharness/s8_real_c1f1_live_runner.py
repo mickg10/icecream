@@ -2984,6 +2984,8 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                           "execution_scope": execution_scope,
                           **({"role_placement": role_placement}
                              if role_placement is not None else {}),
+                          **({"control_baseline": normalizer.CONTROL_BASELINE}
+                             if raw_ii else {}),
                           "provenance": {"mode": "live", "producer": "s8_real_c1f1_live_runner", "trace_free": False},
                           "evidence": {"results_sha256": hashlib.sha256(summary_raw).hexdigest(),
                                        "evidence_manifest_sha256": evidence_manifest_sha,
@@ -2999,6 +3001,8 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                     "provenance": manifest_value["provenance"], "manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
                     "curve_sha256": hashlib.sha256(curve_raw).hexdigest(), "rows": curve,
                     "metadata": normalizer._validate_manifest_metadata(manifest_value),
+                    "control_baseline": (normalizer.CONTROL_BASELINE
+                                          if raw_ii else None),
                     "execution_scope": execution_scope,
                     "role_placement": role_placement,
                     "evidence": manifest_value["evidence"]}

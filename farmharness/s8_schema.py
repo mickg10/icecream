@@ -5,6 +5,10 @@ from __future__ import annotations
 
 CORPORA = ("fmt", "RocksDB", "DuckDB", "LLVM-1238")
 PROFILES = ("ZSTD_TU", "ZSTD_ROUTE", "P29", "GRZ_RESIDUAL")
+# RAW_II is an explicit whole-legacy control arm.  It is intentionally kept
+# outside PROFILES: the latter is the four-profile compressed calibration
+# contract consumed by the predictive engine and the 32-cell audit.
+CONTROL_PROFILES = ("RAW_II",)
 REGIMES = ("cold", "warm")
 TOPOLOGIES = ("C1F1", "C1F20")
 DEPTH_CLASSES = ("100", "200", "full", "repeat-full", "legacy")

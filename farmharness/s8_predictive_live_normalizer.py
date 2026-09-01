@@ -28,11 +28,11 @@ from pathlib import Path
 from typing import Any
 
 try:  # Works both as a module and as a directly invoked harness script.
-    from .s8_schema import (CORPORA, CURRENT_SEMANTICS, DEPTH_CLASSES, PROFILES,
-                            REGIMES, SPLITS, TOPOLOGIES)
+    from .s8_schema import (CONTROL_PROFILES, CORPORA, CURRENT_SEMANTICS,
+                            DEPTH_CLASSES, PROFILES, REGIMES, SPLITS, TOPOLOGIES)
 except ImportError:  # pragma: no cover - exercised by direct script runners.
-    from s8_schema import (CORPORA, CURRENT_SEMANTICS, DEPTH_CLASSES, PROFILES,
-                           REGIMES, SPLITS, TOPOLOGIES)
+    from s8_schema import (CONTROL_PROFILES, CORPORA, CURRENT_SEMANTICS,
+                           DEPTH_CLASSES, PROFILES, REGIMES, SPLITS, TOPOLOGIES)
 
 
 MANIFEST_SCHEMA = "icecream-s8-curve-manifest-v1"
@@ -40,7 +40,7 @@ RECORD_SCHEMA = "icecream-s8-predictive-live-record-v1"
 SEMANTICS = CURRENT_SEMANTICS
 MANIFEST_KEYS = {"schema", "identity", "units", "curve", "provenance"}
 OPTIONAL_MANIFEST_KEYS = {"evidence", "comparison", "topology", "depth_class", "pass_id",
-                          "execution_scope", "role_placement"}
+                          "execution_scope", "role_placement", "control_baseline"}
 CALIBRATION_METADATA_KEYS = {
     "product_image_digest", "toolchain_digest", "output_contract_digest",
     "host_digest", "ordered_input_class",
@@ -81,6 +81,14 @@ ORDERED_INPUT_CLASSES = frozenset(("ordered",))
 EXECUTION_SCOPES = frozenset(("loopback_correctness_only", "external_farm_timing"))
 ROLE_PLACEMENT_SCHEMA = "icecream-s8-role-placement-v1"
 ROLE_PLACEMENT_MODES = frozenset(("co_resident_loopback", "external_farm"))
+CONTROL_BASELINE_SCHEMA = "icecream-s8-raw-ii-control-baseline-v1"
+CONTROL_BASELINE = {
+    "schema": CONTROL_BASELINE_SCHEMA,
+    "profile": "RAW_II",
+    "harness_profile": "P29",
+    "mode": "whole-legacy",
+    "prediction_source": "explicit_control_manifest",
+}
 
 
 class NormalizationError(ValueError):
@@ -244,7 +252,9 @@ def _validate_identity(value: object) -> dict[str, str]:
     split = value["split"]
     if split not in {"calibration", "held_out_validation"}:
         raise NormalizationError("identity.split:must_be_calibration_or_held_out_validation")
-    if result["corpus"] not in CORPORA or result["profile"] not in PROFILES or result["regime"] not in REGIMES:
+    if (result["corpus"] not in CORPORA or
+            result["profile"] not in (*PROFILES, *CONTROL_PROFILES) or
+            result["regime"] not in REGIMES):
         raise NormalizationError("identity:cell_not_declared")
     if split != SPLITS[result["corpus"]]:
         raise NormalizationError("identity.split:cell_policy_mismatch")
@@ -254,6 +264,18 @@ def _validate_identity(value: object) -> dict[str, str]:
     result["input_digest"] = _sha(value["input_digest"], "identity.input_digest")
     result["topology_digest"] = _sha(value["topology_digest"], "identity.topology_digest")
     return result
+
+
+def _validate_control_baseline(value: object, identity: dict[str, str]) -> dict[str, str] | None:
+    """Require an explicit RAW_II declaration; never infer it from P29."""
+    profile = identity["profile"]
+    if profile == "RAW_II":
+        if value != CONTROL_BASELINE:
+            raise NormalizationError("control_baseline:raw_ii_declaration_required")
+        return dict(CONTROL_BASELINE)
+    if value is not None:
+        raise NormalizationError("control_baseline:only_valid_for_raw_ii")
+    return None
 
 
 def _validate_units(value: object) -> dict[str, str]:
@@ -566,6 +588,7 @@ def _load_manifest(path: Path, mode: str) -> dict[str, object]:
     units = _validate_units(value["units"])
     provenance = _validate_provenance(value["provenance"], mode)
     metadata = _validate_manifest_metadata(value)
+    control_baseline = _validate_control_baseline(value.get("control_baseline"), identity)
     execution_scope = _validate_execution_scope(value.get("execution_scope"), mode)
     role_placement = _validate_role_placement(value.get("role_placement"), mode)
     evidence = (_validate_evidence(value["evidence"])
@@ -584,6 +607,7 @@ def _load_manifest(path: Path, mode: str) -> dict[str, object]:
         "provenance": provenance,
         "evidence": evidence,
         "metadata": metadata,
+        "control_baseline": control_baseline,
         "execution_scope": execution_scope,
         "role_placement": role_placement,
         "manifest_sha256": facts["sha256"],
@@ -623,6 +647,11 @@ def _same_metadata(left: dict[str, str], right: dict[str, str]) -> None:
         for field in sorted(set(left) | set(right)):
             if left.get(field) != right.get(field):
                 raise NormalizationError(f"manifest_metadata_mismatch:{field}")
+
+
+def _same_control_baseline(left: object, right: object) -> None:
+    if left != right:
+        raise NormalizationError("control_baseline:mismatch")
 
 
 def _comparison(predicted: dict[str, object], observed: dict[str, object], identity: dict[str, str], units: dict[str, str]) -> dict[str, object]:
@@ -687,6 +716,8 @@ def _comparison(predicted: dict[str, object], observed: dict[str, object], ident
         **({"role_placement": observed["role_placement"]}
            if observed.get("role_placement") is not None else {}),
         **predicted["metadata"],
+        **({"control_baseline": predicted["control_baseline"]}
+           if predicted.get("control_baseline") is not None else {}),
         **({"comparison": predicted["comparison"]}
            if predicted.get("comparison") is not None else {}),
         "units": units,
@@ -718,6 +749,8 @@ def _normalized_record(mode: str, artifact: dict[str, object]) -> dict[str, obje
         **({"role_placement": artifact["role_placement"]}
            if artifact.get("role_placement") is not None else {}),
         **artifact["metadata"],
+        **({"control_baseline": artifact["control_baseline"]}
+           if artifact.get("control_baseline") is not None else {}),
         **({"comparison": artifact["comparison"]}
            if artifact.get("comparison") is not None else {}),
         "units": units,
@@ -780,6 +813,7 @@ def normalize(predictive_manifest: Path, live_manifest: Path, out: Path,
                 raise NormalizationError("authority_metadata:mismatch")
             artifact["metadata"] = {**metadata, **authority_metadata}
     _same_metadata(predictive["metadata"], live["metadata"])
+    _same_control_baseline(predictive["control_baseline"], live["control_baseline"])
     predictive_record = _normalized_record("predictive_sim", predictive)
     live_record = _normalized_record("live", live)
     comparison_record = _comparison(predictive, live, p_identity, p_units)
