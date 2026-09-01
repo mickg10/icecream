@@ -2239,12 +2239,21 @@ def _action_stage_paths(c_path: Path, f_path: Path, expected_count: int,
     return [item for item in result if item is not None]
 
 
+def _external_measured_f_action_trace(work: Path,
+                                      external_farm: bool) -> Path:
+    """Select the measured F trace name owned by the execution transport."""
+    return work / ("s7-warm-f-action-trace.jsonl" if external_farm else
+                   "s7-measured-f-action-trace.jsonl")
+
+
 def _action_stage(work: Path, expected_count: int,
                   assignments: list[dict[str, Any]] | None = None,
-                  suite: str = TOPOLOGY) -> list[dict[str, Any]]:
+                  suite: str = TOPOLOGY,
+                  f_action_trace: Path | None = None) -> list[dict[str, Any]]:
     # These are the post-prewarm slices emitted by the shell gate.  Reading
     # the full warm trace would admit prewarm transactions as measurements.
     return _action_stage_paths(work / "s7-measured-c-action-trace.jsonl",
+                               f_action_trace or
                                work / "s7-measured-f-action-trace.jsonl",
                                expected_count, assignments, suite)
 
@@ -2604,8 +2613,11 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                 normalizer._validate_role_placement(role_placement, "live")
             except normalizer.NormalizationError as exc:
                 raise LiveRunnerError("role_placement:local_identity_invalid") from exc
+    measured_f_action_trace = _external_measured_f_action_trace(
+        work, external_binding is not None)
     stages = (_legacy_wire_stage(work, observations, assignments, suite)
-              if raw_ii else _action_stage(work, len(observations), assignments, suite))
+              if raw_ii else _action_stage(work, len(observations), assignments, suite,
+                                           measured_f_action_trace))
     if len(stages) != len(observations):
         _fail("action_trace:stage_count_mismatch")
     for observation, action in zip(observations, stages, strict=True):
@@ -2726,14 +2738,20 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     if (repeat_predictive_plan is not None and
             retained_repeat_plan_sha != repeat_plan_sha):
         _fail("repeat_predictive_plan:snapshot_changed_during_copy")
-    trace_paths = [] if raw_ii else [work / "s7-measured-c-action-trace.jsonl",
-                                     work / "s7-measured-f-action-trace.jsonl"]
+    trace_paths: list[tuple[Path, str]] = ([] if raw_ii else [
+        (work / "s7-measured-c-action-trace.jsonl",
+         "s7-measured-c-action-trace.jsonl"),
+        (measured_f_action_trace, "s7-measured-f-action-trace.jsonl"),
+    ])
     if regime == "warm" and not raw_ii:
-        trace_paths.extend((work / "s7-prewarm-c-action-trace.jsonl", work / "s7-prewarm-f-action-trace.jsonl"))
-    for path in trace_paths:
+        trace_paths.extend(((work / "s7-prewarm-c-action-trace.jsonl",
+                             "s7-prewarm-c-action-trace.jsonl"),
+                            (work / "s7-prewarm-f-action-trace.jsonl",
+                             "s7-prewarm-f-action-trace.jsonl")))
+    for path, retained_name in trace_paths:
         if not path.is_file():
             _fail(f"action_trace:retained_file_missing:{path.name}")
-        shutil.copy2(path, retained / path.name)
+        shutil.copy2(path, retained / retained_name)
     wire_paths = [work / "s7-measured-c-legacy-wire-trace.jsonl"]
     wire_paths.extend(sorted(work.glob("s7-measured-f-legacy-wire-trace-*.jsonl"))
                         if suite == PARALLEL_TOPOLOGY else
@@ -2755,7 +2773,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     # Logs are product evidence, not caller-provided measurements.  Preserve
     # every lifecycle log so assignment and timing rows can be audited later.
     for path in sorted(work.glob("*.log")):
-        if path.is_file() and path.name not in {p.name for p in trace_paths}:
+        if path.is_file() and path.name not in {p.name for p, _ in trace_paths}:
             shutil.copy2(path, retained / path.name)
     assignment_raw = _canonical({"suite": suite, "assignments": assignments}) + b"\n"
     _write_new(retained / "assignment-witness.json", assignment_raw)

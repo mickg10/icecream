@@ -1304,7 +1304,9 @@ def test_external_finalizer_propagates_scope_placement_and_authority(
     predictive_plan = tmp_path / "predictive-plan.json"; predictive_plan.write_bytes(b"plan\n")
     work = tmp_path / "p50compilee2e.external"; work.mkdir()
     (work / "s7-measured-c-action-trace.jsonl").write_bytes(b"c-action\n")
-    (work / "s7-measured-f-action-trace.jsonl").write_bytes(b"f-action\n")
+    # External collection owns the live F sink name.  Finalization must retain
+    # that measured stream under the canonical S8 evidence name.
+    (work / "s7-warm-f-action-trace.jsonl").write_bytes(b"f-action\n")
     rows = [{"tu_id": "tu-0"}]
     plan = {"source_manifest": {"sha256": "a" * 64},
             "scheduling": {"topology": runner.TOPOLOGY,
@@ -1360,6 +1362,8 @@ def test_external_finalizer_propagates_scope_placement_and_authority(
     assert loaded_curve["execution_scope"] == runner.EXTERNAL_FARM_EXECUTION_SCOPE
     assert experiment["external_farm"]["manifest"]["sha256"] == hashlib.sha256(manifest.read_bytes()).hexdigest()
     assert (output / "product-evidence" / "external-farm-authority.json").is_file()
+    assert (output / "product-evidence" /
+            "s7-measured-f-action-trace.jsonl").read_bytes() == b"f-action\n"
 
 
 def test_parallel_batch_window_requires_real_overlap() -> None:
