@@ -323,6 +323,23 @@ def _validate_idle_cooldown(value: object, label: str, *, minimum: float,
     return normalized
 
 
+def _cooldown_required_hosts(
+    *, include_research6: bool,
+    mappings: Mapping[str, Sequence[str]] | None,
+) -> set[str]:
+    """Return hosts whose transient idle state can block this authority."""
+    chosen = (relationship_mappings(include_research6=include_research6)
+              if mappings is None else mappings)
+    required = {"q3"}
+    # Keep malformed mappings on build_authority's fail-closed path.  This
+    # selector only decides whether an exact host-not-idle disposition may
+    # receive cooldown; it is not a second mapping validator.
+    for values in chosen.values():
+        if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
+            required.update(host for host in HOSTS if host in values)
+    return required
+
+
 def capture_and_build_authority(
     *, root: Path, remote_roots: Mapping[str, str], descriptor_dir: Path,
     output: Path, include_research6: bool = False,
@@ -356,6 +373,8 @@ def capture_and_build_authority(
     monotonic_fn = time.monotonic if monotonic_fn is None else monotonic_fn
     stderr = sys.stderr if stderr is None else stderr
 
+    required_hosts = _cooldown_required_hosts(
+        include_research6=include_research6, mappings=mappings)
     captures = {host: capture_fn(host, remote_roots[host], timeout=capture_timeout)
                 for host in HOSTS}
     try:
@@ -364,7 +383,9 @@ def capture_and_build_authority(
             output=output, include_research6=include_research6,
             mappings=mappings)
     except AuthorityError as exc:
-        if str(exc) != "placement:host_not_idle:q3" or timeout == 0:
+        match = re.fullmatch(r"placement:host_not_idle:([^:]+)", str(exc))
+        failed_host = match.group(1) if match else None
+        if failed_host not in required_hosts or timeout == 0:
             raise
         last_error = exc
 
@@ -372,18 +393,21 @@ def capture_and_build_authority(
     while True:
         remaining = deadline - monotonic_fn()
         if remaining <= 0:
-            print("s8 authority cooldown timeout: host=q3 disposition="
-                  "placement:host_not_idle:q3", file=stderr, flush=True)
+            print(f"s8 authority cooldown timeout: host={failed_host} "
+                  f"disposition=placement:host_not_idle:{failed_host}",
+                  file=stderr, flush=True)
             raise last_error
         wait = min(interval, remaining)
-        print(f"s8 authority cooldown wait: host=q3 seconds={wait:.3f} "
-              "disposition=placement:host_not_idle:q3", file=stderr, flush=True)
+        print(f"s8 authority cooldown wait: host={failed_host} seconds={wait:.3f} "
+              f"disposition=placement:host_not_idle:{failed_host}",
+              file=stderr, flush=True)
         sleep_fn(wait)
         try:
-            captures["q3"] = capture_fn("q3", remote_roots["q3"],
-                                         timeout=capture_timeout)
+            captures[failed_host] = capture_fn(
+                failed_host, remote_roots[failed_host], timeout=capture_timeout)
         except AuthorityError as exc:
-            print(f"s8 authority cooldown capture failed: host=q3 error={exc}",
+            print(f"s8 authority cooldown capture failed: host={failed_host} "
+                  f"error={exc}",
                   file=stderr, flush=True)
             raise
         try:
@@ -392,11 +416,15 @@ def capture_and_build_authority(
                 output=output, include_research6=include_research6,
                 mappings=mappings)
         except AuthorityError as exc:
-            if str(exc) != "placement:host_not_idle:q3":
+            match = re.fullmatch(r"placement:host_not_idle:([^:]+)", str(exc))
+            next_host = match.group(1) if match else None
+            if next_host not in required_hosts:
                 raise
             last_error = exc
-            print("s8 authority cooldown still not idle: host=q3 "
-                  "disposition=placement:host_not_idle:q3", file=stderr, flush=True)
+            failed_host = next_host
+            print(f"s8 authority cooldown still not idle: host={failed_host} "
+                  f"disposition=placement:host_not_idle:{failed_host}",
+                  file=stderr, flush=True)
 
 
 # Read-only remote capture: /proc, /sys, role files and Docker image inspect.

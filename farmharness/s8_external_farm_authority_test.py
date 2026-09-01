@@ -214,11 +214,10 @@ def test_idle_cooldown_times_out_without_publishing_partial_outputs(tmp_path: Pa
     assert not (tmp_path / "d").exists()
 
 
-def test_idle_cooldown_does_not_retry_other_non_idle_placement_errors(tmp_path: Path) -> None:
+def test_idle_cooldown_does_not_retry_other_placement_errors(tmp_path: Path) -> None:
     root = _root(tmp_path)
     now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
     captures = _captures(now, root)
-    captures["q2"] = _with_idle(captures["q2"], 80.0)
     clock = _Clock()
     calls: list[str] = []
     stderr = io.StringIO()
@@ -227,16 +226,87 @@ def test_idle_cooldown_does_not_retry_other_non_idle_placement_errors(tmp_path: 
         calls.append(host)
         return captures[host]
 
-    with pytest.raises(authority.AuthorityError, match="host_not_idle:q2"):
+    with pytest.raises(authority.AuthorityError, match="C1F20/40:mapping_invalid"):
         authority.capture_and_build_authority(
             root=root, remote_roots=_remote_roots(), descriptor_dir=tmp_path / "d",
             output=tmp_path / "a.json", idle_cooldown_timeout=10.0,
             idle_cooldown_interval=1.0, capture_fn=fake_capture,
-            sleep_fn=clock.sleep, monotonic_fn=clock.monotonic, stderr=stderr)
+            sleep_fn=clock.sleep, monotonic_fn=clock.monotonic, stderr=stderr,
+            mappings={"C1F1/100000": ["q2"], "C1F20/40": ["q2"]})
     assert calls == list(authority.HOSTS)
     assert clock.sleeps == []
     assert stderr.getvalue() == ""
     assert not (tmp_path / "a.json").exists()
+
+
+def test_idle_cooldown_recaptures_required_q2(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    captures = _captures(now, root)
+    busy_q2 = _with_idle(captures["q2"], 80.0)
+    clock = _Clock()
+    calls: list[str] = []
+
+    def fake_capture(host: str, _remote_root: str, *, timeout: float) -> dict[str, object]:
+        calls.append(host)
+        return busy_q2 if host == "q2" and calls.count("q2") == 1 else captures[host]
+
+    value = authority.capture_and_build_authority(
+        root=root, remote_roots=_remote_roots(), descriptor_dir=tmp_path / "d",
+        output=tmp_path / "a.json", idle_cooldown_timeout=2.0,
+        idle_cooldown_interval=1.0, capture_fn=fake_capture,
+        sleep_fn=clock.sleep, monotonic_fn=clock.monotonic, stderr=io.StringIO())
+    assert value["schema"] == authority.SCHEMA
+    assert calls == ["q3", "q2", "research6", "research7", "q2"]
+    assert clock.sleeps == [1.0]
+
+
+def test_idle_cooldown_times_out_for_required_research7(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    captures = _captures(now, root)
+    captures["research7"] = _with_idle(captures["research7"], 80.0)
+    clock = _Clock()
+    calls: list[str] = []
+    stderr = io.StringIO()
+
+    def fake_capture(host: str, _remote_root: str, *, timeout: float) -> dict[str, object]:
+        calls.append(host)
+        return captures[host]
+
+    with pytest.raises(authority.AuthorityError, match="host_not_idle:research7"):
+        authority.capture_and_build_authority(
+            root=root, remote_roots=_remote_roots(), descriptor_dir=tmp_path / "d",
+            output=tmp_path / "a.json", idle_cooldown_timeout=2.0,
+            idle_cooldown_interval=1.0, capture_fn=fake_capture,
+            sleep_fn=clock.sleep, monotonic_fn=clock.monotonic, stderr=stderr)
+    assert calls == ["q3", "q2", "research6", "research7", "research7", "research7"]
+    assert clock.sleeps == [1.0, 1.0]
+    assert "host=research7" in stderr.getvalue()
+    assert not (tmp_path / "a.json").exists()
+    assert not (tmp_path / "d").exists()
+
+
+def test_excluded_research6_hold_does_not_trigger_cooldown(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    captures = _captures(now, root)
+    captures["research6"] = _with_idle(captures["research6"], 80.0)
+    clock = _Clock()
+    calls: list[str] = []
+
+    def fake_capture(host: str, _remote_root: str, *, timeout: float) -> dict[str, object]:
+        calls.append(host)
+        return captures[host]
+
+    value = authority.capture_and_build_authority(
+        root=root, remote_roots=_remote_roots(), descriptor_dir=tmp_path / "d",
+        output=tmp_path / "a.json", idle_cooldown_timeout=10.0,
+        idle_cooldown_interval=1.0, capture_fn=fake_capture,
+        sleep_fn=clock.sleep, monotonic_fn=clock.monotonic, stderr=io.StringIO())
+    assert value["hosts"]["research6"]["idle"]["status"] == "HOLD"
+    assert calls == list(authority.HOSTS)
+    assert clock.sleeps == []
 
 
 @pytest.mark.parametrize(

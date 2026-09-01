@@ -43,7 +43,10 @@ and descriptor arguments:
 
 The absolute generator path above is the pinned final-head checkout used by
 the campaign. `--idle-cooldown-timeout` is a bounded opt-in window (seconds)
-for the named transient `placement:host_not_idle:q3` disposition; the
-generator recaptures q3 at the requested interval and emits each wait
-diagnostic on stderr. The default timeout is `0` (single-shot), and identity,
-binary, schema, capture, and other placement errors never retry.
+for the named transient `placement:host_not_idle:<host>` disposition; the
+generator recaptures only the failing host at the requested interval when it
+is required by the selected placement (q3 is always required). An excluded
+research6 HOLD is retained without blocking the default map. Every wait
+diagnostic is emitted on stderr. The default timeout is `0` (single-shot),
+and identity, binary, schema, capture, and other placement errors never
+retry.
