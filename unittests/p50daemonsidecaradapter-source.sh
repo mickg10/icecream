@@ -10,6 +10,7 @@ standard=${ICECC_TEST_CXX_STANDARD_FLAG:--std=c++20}
 src="$top_src/cache/p50_daemon_sidecar_adapter.cpp"
 header="$top_src/cache/p50_daemon_sidecar_adapter.h"
 test_source="$top_src/unittests/p50_daemon_sidecar_adapter_test.cpp"
+cleanup_source="$top_src/unittests/p50daemonsidecaradapter-source.sh"
 
 test -x "$service" || {
     echo 'FAIL: adapter source gate requires the built service' >&2
@@ -36,6 +37,8 @@ grep -F 'outer_prepare_attempt_retirement' "$header" >/dev/null
 grep -F 'outer_commit_attempt_replacement' "$header" >/dev/null
 grep -F 'outer_close_logical_input_lease' "$header" >/dev/null
 grep -F 'AttemptLeafRetirementJoin' "$header" >/dev/null
+grep -F 'retire_mutant_sidecars "$runtime_root" || cleanup_status=1' "$cleanup_source" >/dev/null
+grep -F 'TMPDIR="$baseline_runtime_root"' "$cleanup_source" >/dev/null
 
 if grep -E 'daemon/main\.cpp|signal\(|sigaction\(|listen_unix\(' "$src" "$header" >/dev/null; then
     echo 'FAIL: adapter acquired daemon-main, signal-handler, or public-listener ownership' >&2
@@ -51,10 +54,18 @@ fi
 tmp_root=$(mktemp -d "${TMPDIR:-/tmp}/p50daemonsidecaradapter-source.XXXXXX")
 runtime_roots=
 cleanup() {
+    cleanup_status=0
     for runtime_root in $runtime_roots; do
-        rm -rf -- "$runtime_root"
+        # The adapter deliberately leaves teardown to the outer-loop owner;
+        # this test must retire a detached child even when the test process is
+        # interrupted before compile_and_expect_red can do its normal cleanup.
+        if command -v retire_mutant_sidecars >/dev/null 2>&1; then
+            retire_mutant_sidecars "$runtime_root" || cleanup_status=1
+        fi
+        rm -rf -- "$runtime_root" || cleanup_status=1
     done
-    rm -rf -- "$tmp_root"
+    rm -rf -- "$tmp_root" || cleanup_status=1
+    return "$cleanup_status"
 }
 trap cleanup EXIT HUP INT TERM
 
@@ -146,9 +157,11 @@ retire_mutant_sidecars() {
     test -z "$sidecar_pids"
 }
 
+baseline_runtime_root=$(mktemp -d "${TMPDIR:-/tmp}/p50daemonsidecaradapter-baseline.XXXXXX")
+runtime_roots="$runtime_roots $baseline_runtime_root"
 baseline="$tmp_root/baseline"
 link_binary "$production_object" "$baseline"
-ICECC_TEST_CACHE_SERVICE="$service" timeout 60s "$baseline"
+TMPDIR="$baseline_runtime_root" ICECC_TEST_CACHE_SERVICE="$service" timeout 60s "$baseline"
 echo 'ok - current-source linked service/SCM_RIGHTS lifecycle baseline passes'
 
 compile_and_expect_red() {
