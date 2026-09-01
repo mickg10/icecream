@@ -85,12 +85,12 @@ def _stamp() -> str:
 def _authority_file(path: Path, finding: str) -> dict[str, object]:
     result: dict[str, object] = {"path": str(path), "finding": finding}
     try:
-        raw = path.read_bytes()
-    except OSError:
+        _raw, facts = _private_bytes(path, finding)
+    except (OSError, MatrixError):
         result["available"] = False
         result["sha256"] = None
         return result
-    result.update({"available": True, "bytes": len(raw), "sha256": _sha256(raw)})
+    result.update({"available": True, "bytes": facts["bytes"], "sha256": facts["sha256"]})
     return result
 
 
@@ -115,10 +115,13 @@ def _private_bytes(path: Path, label: str) -> tuple[bytes, dict[str, object]]:
                 break
             chunks.append(chunk)
         raw = b"".join(chunks)
+        after = os.fstat(fd)
     finally:
         os.close(fd)
-    if len(raw) != info.st_size:
-        raise MatrixError(f"{label}:size_changed:{path}")
+    if (len(raw) != info.st_size or after.st_dev != info.st_dev or
+            after.st_ino != info.st_ino or after.st_nlink != info.st_nlink or
+            after.st_size != info.st_size):
+        raise MatrixError(f"{label}:identity_changed:{path}")
     return raw, {"path": str(path), "bytes": len(raw), "sha256": _sha256(raw)}
 
 
@@ -257,9 +260,13 @@ def _native_batch(occurrences: Sequence[Occurrence], topology: MatrixTopology,
 def _native_receipt(root: Path) -> tuple[dict[str, object] | None, dict[str, object]]:
     receipt_path = root / "cache" / "sim" / ".p50sim-build.json"
     binary = root / "cache" / "sim" / ".p50sim.bin"
-    receipt_facts = _authority_file(receipt_path, "native p50sim build receipt")
     try:
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt_raw, receipt_facts_full = _private_bytes(receipt_path, "native p50sim build receipt")
+    except MatrixError:
+        return None, {"path": str(receipt_path), "available": False, "sha256": None}
+    receipt_facts = {key: receipt_facts_full[key] for key in ("path", "bytes", "sha256")}
+    try:
+        receipt = json.loads(receipt_raw.decode("utf-8"))
         binary_facts = _private_digest(binary, "native p50sim binary")
         head = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"],
                                        text=True, timeout=10).strip()
@@ -267,7 +274,24 @@ def _native_receipt(root: Path) -> tuple[dict[str, object] | None, dict[str, obj
                                        text=True, timeout=10).strip()
     except (OSError, json.JSONDecodeError, MatrixError):
         return None, receipt_facts
-    if (receipt.get("schema") != "icecream-p50sim-build-v1" or
+    declared_inputs = receipt.get("inputs", {})
+    input_paths = {"p50sim_source": root / "cache" / "sim" / "p50sim.cpp",
+                   "config_h": root / "config.h",
+                   "cache_makefile": root / "cache" / "Makefile",
+                   "services_makefile": root / "services" / "Makefile"}
+    inputs_match = isinstance(declared_inputs, Mapping)
+    for name, path in input_paths.items():
+        if not inputs_match:
+            break
+        try:
+            current = _private_digest(path, "native receipt input")
+        except MatrixError:
+            inputs_match = False
+            break
+        declared = declared_inputs.get(name)
+        inputs_match = isinstance(declared, Mapping) and all(
+            declared.get(field) == current.get(field) for field in ("path", "bytes", "sha256"))
+    if (receipt.get("schema") != "icecream-p50sim-build-v1" or not inputs_match or
             receipt.get("source", {}).get("head") != head or
             receipt.get("source", {}).get("tree") != tree or
             receipt.get("binary", {}).get("path") != str(binary) or
@@ -966,7 +990,8 @@ def firefox_occurrences(trace: Path, *, count: int = 100, dispatch_start: int = 
     """Load Firefox inputs only after trace, corpus, and every file authenticate."""
     if type(count) is not int or count <= 0 or type(dispatch_start) is not int or dispatch_start < 0:
         raise MatrixError("requested count must be positive")
-    trace_facts = _private_digest(trace, "trace")
+    trace_raw, trace_facts_full = _private_bytes(trace, "trace")
+    trace_facts = {key: trace_facts_full[key] for key in ("path", "bytes", "sha256")}
     if trace_facts["sha256"] != AUTH_TRACE_SHA256:
         raise MatrixError("trace:authenticated_digest_mismatch")
     manifest_raw, manifest_facts = _private_bytes(corpus_manifest, "corpus_manifest")
@@ -994,7 +1019,6 @@ def firefox_occurrences(trace: Path, *, count: int = 100, dispatch_start: int = 
         # and size are checked for each selected input below (bounded canary).
         manifest_paths[relative] = {"path": str(resolved)}
     trace_occurrences: list[Occurrence] = []
-    trace_raw, _ = _private_bytes(trace, "trace")
     reader = csv.DictReader(trace_raw.decode("utf-8").splitlines(), delimiter="\t")
     try:
         for row in reader:
