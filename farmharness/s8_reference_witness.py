@@ -11,6 +11,7 @@ match its retained witness byte-for-byte.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -525,23 +526,41 @@ def package_files(package_manifest: Path) -> list[Path]:
     ]
 
 
-def create_package(package_dir: Path, *, cell: Mapping[str, Any], batch_manifest: Path,
-                   predictive_plan: Path, authority: Path, product: Mapping[str, Any],
-                   rows: Sequence[Mapping[str, Any]], direct_objects: Sequence[Path],
-                   remote_objects: Sequence[Path]) -> Path:
-    """Create a new package only from a terminal PASS direct/remote pair."""
+_VALIDATED_CELL_TOKEN = object()
+
+
+@dataclass(frozen=True)
+class _ValidatedCellPackage:
+    """Private hand-off from the authenticated cell gate to the byte writer."""
+
+    token: object
+    package_dir: Path
+    cell: Mapping[str, Any]
+    batch_manifest: Path
+    predictive_plan: Path
+    authority: Path
+    product: Mapping[str, Any]
+    rows: Sequence[Mapping[str, Any]]
+    direct_objects: Sequence[Path]
+    remote_objects: Sequence[Path]
+    batch_descriptor: Mapping[str, Any]
+    plan_descriptor: Mapping[str, Any]
+    source_descriptor: Mapping[str, Any]
+    authority_descriptor: Mapping[str, Any]
+
+
+def _write_validated_package(package: _ValidatedCellPackage) -> Path:
+    """Atomically serialize a package after the retained-cell attestation."""
+    if package.token is not _VALIDATED_CELL_TOKEN:
+        raise ReferenceWitnessError("witness_package:authenticated_cell_required")
+    package_dir = package.package_dir
     if package_dir.exists() or package_dir.is_symlink() or not package_dir.is_absolute():
         raise ReferenceWitnessError("witness_package:output_must_be_new_absolute_directory")
-    if len(rows) != len(direct_objects) or len(rows) != len(remote_objects):
+    if (len(package.rows) != len(package.direct_objects) or
+            len(package.rows) != len(package.remote_objects)):
         raise ReferenceWitnessError("witness_package:occurrence_count_mismatch")
-    plan, source_desc = _plan_identity(predictive_plan)
-    batch_desc = descriptor(batch_manifest, "batch_manifest")
-    plan_desc = descriptor(predictive_plan, "predictive_plan")
-    authority_value = _json(authority, "authority")
-    if not isinstance(authority_value, dict):
-        raise ReferenceWitnessError("authority:object_required")
-    product_identity = _validate_product(product, "witness_package.product")
-    bindings = _compile_bindings(rows, "witness")
+    product_identity = _validate_product(package.product, "witness_package.product")
+    bindings = _compile_bindings(package.rows, "witness")
     package_parent = package_dir.parent
     package_parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=f".{package_dir.name}.", dir=package_parent))
@@ -549,7 +568,8 @@ def create_package(package_dir: Path, *, cell: Mapping[str, Any], batch_manifest
     try:
         objects = temporary / "objects"; objects.mkdir()
         records: list[dict[str, Any]] = []
-        for index, (binding, direct_path, remote_path) in enumerate(zip(bindings, direct_objects, remote_objects, strict=True)):
+        for index, (binding, direct_path, remote_path) in enumerate(zip(
+                bindings, package.direct_objects, package.remote_objects, strict=True)):
             direct_raw, direct_sha, direct_bytes = snapshot(Path(direct_path), f"direct_reference:{index}")
             remote_raw, remote_sha, remote_bytes = snapshot(Path(remote_path), f"remote_object:{index}")
             if direct_raw != remote_raw or direct_sha != remote_sha or direct_bytes != remote_bytes:
@@ -559,12 +579,14 @@ def create_package(package_dir: Path, *, cell: Mapping[str, Any], batch_manifest
             destination_desc = {"path": f"objects/{index}.o", "sha256": direct_sha, "bytes": direct_bytes}
             records.append({"kind": "occurrence", **binding, "direct_reference": destination_desc,
                             "remote_object": dict(destination_desc)})
+        # PASS is an invariant of _ValidatedCellPackage, which can only be
+        # minted after create_from_cell authenticates the retained cell.
         header: dict[str, Any] = {"kind": "package", "schema": PACKAGE_SCHEMA,
-                                  "terminal_status": "PASS", "cell": dict(cell),
-                                  "batch_manifest": batch_desc, "predictive_plan": plan_desc,
-                                  "source_manifest": source_desc,
-                                  "authority": {**descriptor(authority, "authority"),
-                                                "identity_sha256": _authority_identity(authority_value)},
+                                  "terminal_status": "PASS", "cell": dict(package.cell),
+                                  "batch_manifest": dict(package.batch_descriptor),
+                                  "predictive_plan": dict(package.plan_descriptor),
+                                  "source_manifest": dict(package.source_descriptor),
+                                  "authority": dict(package.authority_descriptor),
                                   "product": json.loads(json.dumps(product_identity)),
                                   "record_count": len(records)}
         package_digest = _package_digest(temporary, header, records)
@@ -579,6 +601,15 @@ def create_package(package_dir: Path, *, cell: Mapping[str, Any], batch_manifest
         if not published:
             shutil.rmtree(temporary, ignore_errors=True)
     return package_dir / "manifest.jsonl"
+
+
+def create_package(*_args: Any, **_kwargs: Any) -> Path:
+    """Reject the removed raw packaging API.
+
+    New packages must come from ``create_from_cell`` so terminal PASS and all
+    retained evidence are authenticated before any bytes are published.
+    """
+    raise ReferenceWitnessError("witness_package:authenticated_cell_required")
 
 
 def create_from_cell(cell_output: Path, *, authority: Path, package_dir: Path) -> Path:
@@ -622,13 +653,27 @@ def create_from_cell(cell_output: Path, *, authority: Path, package_dir: Path) -
     depth = experiment.get("depth")
     if not isinstance(depth, (str, int)):
         raise ReferenceWitnessError("cell:depth_missing")
-    return create_package(
-        package_dir, cell={**dict(cell), "depth": depth,
-                           "topology": experiment.get("topology")},
-        batch_manifest=batch, predictive_plan=plan, authority=authority,
-        product={"image": dict(product_image),
-                 "toolchain": dict(toolchain_identity)},
-        rows=rows, direct_objects=direct, remote_objects=remote)
+    authority_value = _json(authority, "authority")
+    if not isinstance(authority_value, dict):
+        raise ReferenceWitnessError("authority:object_required")
+    validated = _ValidatedCellPackage(
+        token=_VALIDATED_CELL_TOKEN,
+        package_dir=package_dir,
+        cell={**dict(cell), "depth": depth, "topology": experiment.get("topology")},
+        batch_manifest=batch,
+        predictive_plan=plan,
+        authority=authority,
+        product={"image": dict(product_image), "toolchain": dict(toolchain_identity)},
+        rows=rows,
+        direct_objects=direct,
+        remote_objects=remote,
+        batch_descriptor=descriptor(batch, "batch_manifest"),
+        plan_descriptor=descriptor(plan, "predictive_plan"),
+        source_descriptor=_plan_identity(plan)[1],
+        authority_descriptor={**descriptor(authority, "authority"),
+                             "identity_sha256": _authority_identity(authority_value)},
+    )
+    return _write_validated_package(validated)
 
 
 def _cli() -> int:

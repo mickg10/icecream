@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -53,14 +54,61 @@ def _fixture(tmp_path: Path) -> tuple[dict[str, object], Path, Path, Path, Path,
 
 def _make(tmp_path: Path):
     row, authority, plan, batch, direct, remote = _fixture(tmp_path)
+    cell_output = tmp_path / "cell"
+    evidence_dir = cell_output / "product-evidence"
+    evidence_dir.mkdir(parents=True)
+    retained_batch = evidence_dir / "batch-manifest.jsonl"
+    retained_plan = evidence_dir / "predictive-plan.json"
+    shutil.copy2(batch, retained_batch)
+    shutil.copy2(plan, retained_plan)
+    shutil.copy2(direct, evidence_dir / "local-full-1-0.o")
+    shutil.copy2(remote, evidence_dir / "remote-full-1-0.o")
+    cell = {"corpus": "DuckDB", "profile": "ZSTD_ROUTE", "regime": "cold"}
+    image = {"reference": "image", "image_id": "sha256:" + "b" * 64,
+             "architecture": "amd64", "os": "linux", "created": "now"}
+    binaries = {"usr/bin/g++": "a" * 64}
+    experiment = {"schema": "icecream-s7-live-experiment-v1", "cell": cell,
+                  "runtime_image": image, "binary_sha256": binaries,
+                  "source_commit": "c" * 40, "source_tree": "d" * 40,
+                  "runner_sha256": "e" * 64, "remote_compile_required": True,
+                  "execution_environment": "external_farm_product_build",
+                  "artifact_retention": {"mode": "all"}, "depth": 1,
+                  "topology": "single"}
+    results_raw = b'{"status":"PASS"}\n'
+    (cell_output / "results.jsonl").write_bytes(results_raw)
+    remote_desc = witness.descriptor(evidence_dir / "remote-full-1-0.o", "fixture.remote")
+    timing_raw = (json.dumps({"ordinal": 0, "tu_id": row["tu_id"], "cell": cell,
+                              "remote_compile": True,
+                              "object_sha256": remote_desc["sha256"],
+                              "returned_object_bytes": remote_desc["bytes"]},
+                             sort_keys=True, separators=(",", ":")) + "\n").encode()
+    (cell_output / "timing.jsonl").write_bytes(timing_raw)
+    batch_desc = witness.descriptor(retained_batch, "fixture.batch")
+    plan_desc = witness.descriptor(retained_plan, "fixture.plan")
+    evidence = {"schema": "icecream-s7-live-evidence-v2", "cell": cell,
+                "source_commit": experiment["source_commit"],
+                "source_tree": experiment["source_tree"],
+                "runner": {"name": "p50compilee2e-run.sh", "sha256": "e" * 64},
+                "remote_compile_required": True,
+                "execution_environment": "external_farm_product_build",
+                "runtime_image": image, "binary_sha256": binaries,
+                "input_manifest": {"path": "product-evidence/batch-manifest.jsonl",
+                                    "sha256": batch_desc["sha256"], "bytes": batch_desc["bytes"]},
+                "predictive_plan": {"path": "product-evidence/predictive-plan.json",
+                                    "sha256": plan_desc["sha256"], "bytes": plan_desc["bytes"]},
+                "evidence": {"results": {"path": "results.jsonl",
+                                           "sha256": witness.hashlib.sha256(results_raw).hexdigest(),
+                                           "bytes": len(results_raw)},
+                             "timing": {"path": "timing.jsonl",
+                                        "sha256": witness.hashlib.sha256(timing_raw).hexdigest(),
+                                        "bytes": len(timing_raw)}}}
+    evidence["evidence_sha256"] = witness.hashlib.sha256(
+        witness._canonical({k: v for k, v in evidence.items() if k != "evidence_sha256"})
+    ).hexdigest()
+    (cell_output / "evidence.json").write_bytes(witness._canonical(evidence) + b"\n")
+    (cell_output / "experiment_manifest.json").write_bytes(witness._canonical(experiment) + b"\n")
     package = tmp_path / "witness"
-    manifest = witness.create_package(
-        package, cell={"corpus": "DuckDB", "profile": "ZSTD_ROUTE", "regime": "cold", "depth": 1},
-        batch_manifest=batch, predictive_plan=plan, authority=authority,
-        product={"image": {"reference": "image", "image_id": "sha256:" + "b" * 64,
-                            "architecture": "amd64", "os": "linux", "created": "now"},
-                 "toolchain": {"sha256": "a" * 64, "bytes": 10}},
-        rows=[row], direct_objects=[direct], remote_objects=[remote])
+    manifest = witness.create_from_cell(cell_output, authority=authority, package_dir=package)
     return row, authority, plan, batch, direct, remote, manifest
 
 
@@ -107,7 +155,7 @@ def test_direct_remote_mismatch_never_publishes_a_package(tmp_path: Path) -> Non
     row, authority, plan, batch, direct, remote = _fixture(tmp_path)
     remote.write_bytes(b"not-the-reference")
     package = tmp_path / "witness"
-    with pytest.raises(witness.ReferenceWitnessError, match="direct_remote_not_identical"):
+    with pytest.raises(witness.ReferenceWitnessError, match="authenticated_cell_required"):
         witness.create_package(
             package, cell={"corpus": "DuckDB", "profile": "ZSTD_ROUTE", "regime": "cold", "depth": 1},
             batch_manifest=batch, predictive_plan=plan, authority=authority,
@@ -115,6 +163,20 @@ def test_direct_remote_mismatch_never_publishes_a_package(tmp_path: Path) -> Non
                                 "architecture": "amd64", "os": "linux", "created": "now"},
                      "toolchain": {"sha256": "a" * 64, "bytes": 10}},
             rows=[row], direct_objects=[direct], remote_objects=[remote])
+    assert not package.exists()
+
+
+def test_synthetic_equal_files_and_fabricated_metadata_cannot_publish(tmp_path: Path) -> None:
+    _row, authority, plan, batch, direct, remote = _fixture(tmp_path)
+    package = tmp_path / "synthetic-witness"
+    with pytest.raises(witness.ReferenceWitnessError, match="authenticated_cell_required"):
+        witness.create_package(
+            package, cell={"corpus": "DuckDB", "profile": "ZSTD_ROUTE", "regime": "cold", "depth": 1},
+            batch_manifest=batch, predictive_plan=plan, authority=authority,
+            product={"image": {"reference": "fabricated", "image_id": "sha256:" + "b" * 64,
+                                "architecture": "amd64", "os": "linux", "created": "fabricated"},
+                     "toolchain": {"sha256": "a" * 64, "bytes": 10}},
+            rows=[_row], direct_objects=[direct], remote_objects=[remote])
     assert not package.exists()
 
 
