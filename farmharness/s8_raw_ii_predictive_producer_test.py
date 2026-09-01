@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
+import socket
 import subprocess
 from pathlib import Path
 
@@ -261,6 +263,64 @@ def test_raw_product_identity_rejects_generated_symlink(
     target.write_bytes(b"generated\n")
     (product / "generated-link").symlink_to(target)
     with pytest.raises(RawIIError, match="product_root:untracked_artifact_invalid"):
+        producer._product_identity(product)
+
+
+@pytest.mark.parametrize("node_kind", ["fifo", "socket"])
+def test_raw_product_identity_rejects_generated_nonregular(
+        tmp_path: Path, node_kind: str) -> None:
+    product = _product_root(tmp_path)
+    path = product / f"generated-{node_kind}"
+    listener: socket.socket | None = None
+    if node_kind == "fifo":
+        os.mkfifo(path)
+    else:
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(path))
+    try:
+        with pytest.raises(RawIIError, match="product_root:untracked_artifact_invalid"):
+            producer._product_identity(product)
+    finally:
+        if listener is not None:
+            listener.close()
+
+
+def test_raw_product_identity_rejects_foreign_generated_owner(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    product = _product_root(tmp_path)
+    generated = product / "generated-owner"
+    generated.write_bytes(b"generated\n")
+    current_uid = os.geteuid()
+    monkeypatch.setattr(producer.os, "geteuid", lambda: current_uid + 1)
+    with pytest.raises(RawIIError, match="product_root:untracked_artifact_invalid"):
+        producer._product_identity(product)
+
+
+def test_raw_product_identity_reconciles_git_omitted_generated_file(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    product = _product_root(tmp_path)
+    generated = product / "generated-omitted"
+    generated.write_bytes(b"generated\n")
+    original = producer._git_untracked_paths
+
+    def omit_generated(root: Path, *, ignored: bool) -> list[str]:
+        return [] if root == product else original(root, ignored=ignored)
+
+    monkeypatch.setattr(producer, "_git_untracked_paths", omit_generated)
+    with pytest.raises(RawIIError, match="product_root:untracked_inventory_changed"):
+        producer._product_identity(product)
+
+
+def test_raw_product_identity_rejects_walk_depth_cap(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    product = _product_root(tmp_path)
+    nested = product
+    for index in range(4):
+        nested /= f"generated-dir-{index}"
+        nested.mkdir()
+    (nested / "generated.txt").write_text("generated\n")
+    monkeypatch.setattr(producer, "MAX_PRODUCT_WALK_DEPTH", 3)
+    with pytest.raises(RawIIError, match="product_root:walk_depth_exceeded"):
         producer._product_identity(product)
 
 

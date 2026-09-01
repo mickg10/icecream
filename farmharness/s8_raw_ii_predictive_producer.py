@@ -17,8 +17,9 @@ import re
 import stat
 import subprocess
 import sys
+from collections import deque
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 try:
     from . import s8_depth_runner as depth_runner
@@ -44,6 +45,10 @@ ENGINE_SCOPE = "raw_ii_control_engine"
 MAX_BYTES = 64 * 1024 * 1024
 MAX_UNTRACKED_ENTRIES = 4096
 MAX_UNTRACKED_BYTES = 256 * 1024 * 1024
+MAX_TRACKED_ENTRIES = 1_000_000
+MAX_PRODUCT_WALK_ENTRIES = 1_000_000
+MAX_PRODUCT_WALK_DEPTH = 64
+MAX_PRODUCT_WALK_PATH_BYTES = 256 * 1024 * 1024
 HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
 HEX40 = re.compile(r"^[0-9a-fA-F]{40}$")
 
@@ -347,13 +352,140 @@ def _git_untracked_paths(root: Path, *, ignored: bool) -> list[str]:
     return paths
 
 
+def _git_tracked_paths(root: Path) -> set[str]:
+    """Stream the tracked path set with the same bounded NUL parser."""
+    command = ["git", "-C", str(root), "ls-files", "-z"]
+    process: subprocess.Popen[bytes] | None = None
+    pending = bytearray()
+    paths: set[str] = set()
+    enumerated_bytes = 0
+
+    def reap_after_failure() -> None:
+        if process is None:
+            return
+        try:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=1)
+        except (OSError, subprocess.SubprocessError):
+            try:
+                process.kill()
+                process.wait(timeout=1)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        finally:
+            if process.stdout is not None:
+                try:
+                    process.stdout.close()
+                except OSError:
+                    pass
+
+    try:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL)
+        assert process.stdout is not None
+        while True:
+            chunk = process.stdout.read(1 << 16)
+            if not chunk:
+                break
+            if (enumerated_bytes + len(pending) + len(chunk) >
+                    MAX_PRODUCT_WALK_PATH_BYTES):
+                raise RawIIError("product_root:tracked_inventory_too_large")
+            pending.extend(chunk)
+            while True:
+                separator = pending.find(0)
+                if separator < 0:
+                    break
+                raw = bytes(pending[:separator])
+                del pending[:separator + 1]
+                if not raw:
+                    continue
+                enumerated_bytes += len(raw)
+                if len(paths) >= MAX_TRACKED_ENTRIES:
+                    raise RawIIError("product_root:tracked_inventory_too_many")
+                if enumerated_bytes > MAX_PRODUCT_WALK_PATH_BYTES:
+                    raise RawIIError("product_root:tracked_inventory_too_large")
+                paths.add(os.fsdecode(raw))
+        if pending:
+            raise RawIIError("product_root:tracked_inventory_malformed")
+        if process.wait(timeout=15) != 0:
+            raise RawIIError("product_root:tracked_inventory_unavailable")
+    except RawIIError:
+        reap_after_failure()
+        raise
+    except (OSError, subprocess.SubprocessError) as exc:
+        reap_after_failure()
+        raise RawIIError("product_root:tracked_inventory_unavailable") from exc
+    return paths
+
+
+def _walk_product_entries(root: Path) -> Iterator[tuple[str, stat.stat_result]]:
+    """Walk product entries without following links and with explicit caps."""
+    # The stack contains only directories still to visit; it never stores the
+    # complete tree.  ``scandir`` and ``stat(follow_symlinks=False)`` preserve
+    # the node type at the instant it is observed.
+    pending: deque[tuple[Path, int]] = deque([(root, 0)])
+    entry_count = 0
+    path_bytes = 0
+    while pending:
+        directory, depth = pending.pop()
+        if depth >= MAX_PRODUCT_WALK_DEPTH:
+            raise RawIIError("product_root:walk_depth_exceeded")
+        try:
+            iterator = os.scandir(directory)
+        except OSError as exc:
+            raise RawIIError("product_root:walk_unavailable") from exc
+        try:
+            for entry in iterator:
+                if directory == root and entry.name == ".git":
+                    continue
+                relative = os.path.relpath(entry.path, root)
+                candidate = Path(relative)
+                if (candidate.is_absolute() or
+                        any(part in ("", ".", "..") for part in candidate.parts)):
+                    raise RawIIError("product_root:walk_path_invalid")
+                encoded = os.fsencode(relative)
+                path_bytes += len(encoded)
+                if path_bytes > MAX_PRODUCT_WALK_PATH_BYTES:
+                    raise RawIIError("product_root:walk_inventory_too_large")
+                if entry_count >= MAX_PRODUCT_WALK_ENTRIES:
+                    raise RawIIError("product_root:walk_inventory_too_many")
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                except OSError as exc:
+                    raise RawIIError("product_root:walk_unavailable") from exc
+                entry_count += 1
+                yield relative, info
+                if stat.S_ISDIR(info.st_mode):
+                    pending.append((Path(entry.path), depth + 1))
+        finally:
+            iterator.close()
+
+
+def _generated_owned(info: stat.stat_result) -> bool:
+    return (info.st_uid == os.geteuid() and info.st_gid == os.getegid())
+
+
 def _untracked_inventory(root: Path) -> dict[str, object]:
     """Bind bounded content identity for generated files outside HEAD."""
-    try:
-        relatives = sorted(set(_git_untracked_paths(root, ignored=False) +
+    git_relatives = sorted(set(_git_untracked_paths(root, ignored=False) +
                                _git_untracked_paths(root, ignored=True)))
-    except RawIIError:
-        raise
+    tracked = _git_tracked_paths(root)
+    walked = _walk_product_entries(root)
+    walk_relatives: set[str] = set()
+    for relative, info in walked:
+        if relative in tracked:
+            continue
+        if stat.S_ISDIR(info.st_mode):
+            continue
+        walk_relatives.add(relative)
+        if not _generated_owned(info):
+            raise RawIIError("product_root:untracked_artifact_invalid")
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise RawIIError("product_root:untracked_artifact_invalid")
+    if walk_relatives != set(git_relatives):
+        raise RawIIError("product_root:untracked_inventory_changed")
+    relatives = git_relatives
     if len(relatives) > MAX_UNTRACKED_ENTRIES:
         raise RawIIError("product_root:untracked_inventory_too_many")
     if sum(len(os.fsencode(relative)) for relative in relatives) > MAX_UNTRACKED_BYTES:
@@ -370,6 +502,8 @@ def _untracked_inventory(root: Path) -> dict[str, object]:
             info = path.lstat()
         except OSError as exc:
             raise RawIIError("product_root:untracked_artifact_unavailable") from exc
+        if not _generated_owned(info):
+            raise RawIIError("product_root:untracked_artifact_invalid")
         if stat.S_ISLNK(info.st_mode):
             raise RawIIError("product_root:untracked_artifact_invalid")
         elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
