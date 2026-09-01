@@ -14,6 +14,7 @@ EXTRA_DIST = README.md \
 	tests/stress \
 	tests/webgui \
 	capability/grouprlz/p29_online_s1.h \
+	capability/grouprlz/alpha_line_codec.h \
 	capability/grouprlz/runway-census.tsv \
 	capability/distribution/firefox-corrected.compile-trace.tsv \
 	distro_installed_identity.sh \
