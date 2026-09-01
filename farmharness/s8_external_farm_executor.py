@@ -24,9 +24,11 @@ from typing import Any, Mapping, Sequence
 
 try:
     from . import s4_multihost_c1f4 as s4
+    from . import s8_reference_witness as reference_witness_module
     from . import s8_real_c1f1_live_runner as live
 except ImportError:  # pragma: no cover
     import s4_multihost_c1f4 as s4
+    import s8_reference_witness as reference_witness_module
     import s8_real_c1f1_live_runner as live
 
 ROLE_PLACEMENT_SCHEMA = "icecream-s8-role-placement-v1"
@@ -333,7 +335,10 @@ def build_external_command(batch_manifest: Path, predictive_plan: Path, topology
                            product_root: Path, *, profile: str, corpus: str,
                            regime: str, depth: str, suite: str, workdir: Path,
                            timeout_seconds: int, passes: int = 1,
-                           repeat_predictive_plan: Path | None = None) -> list[str]:
+                           repeat_predictive_plan: Path | None = None,
+                           reference_witness: Path | None = None,
+                           reference_authority: Path | None = None,
+                           reference_image: Mapping[str, Any] | None = None) -> list[str]:
     """Build the mature runner argv and mark it for the external lifecycle."""
     runner_profile = "P29" if profile == "RAW_II" else profile
     command = live.build_command(batch_manifest, runner_profile, product_root=product_root,
@@ -344,6 +349,18 @@ def build_external_command(batch_manifest: Path, predictive_plan: Path, topology
                                  passes=passes, product_profile=("RAW_II" if profile == "RAW_II" else None))
     if repeat_predictive_plan is not None:
         command.append(f"ICECC_P50_REPEAT_PREDICTIVE_PLAN={repeat_predictive_plan}")
+    if reference_witness is not None:
+        if (reference_authority is None or reference_image is None or
+                not all(key in reference_image for key in
+                        ("image_id", "reference", "architecture", "os", "created"))):
+            raise ExternalFarmError("reference_witness:authority_and_image_required")
+        command.extend((f"ICECC_P50_REFERENCE_WITNESS={reference_witness}",
+                        f"ICECC_P50_REFERENCE_AUTHORITY={reference_authority}",
+                        f"ICECC_P50_REFERENCE_IMAGE_ID={reference_image['image_id']}",
+                        f"ICECC_P50_REFERENCE_IMAGE_REFERENCE={reference_image['reference']}",
+                        f"ICECC_P50_REFERENCE_IMAGE_ARCHITECTURE={reference_image['architecture']}",
+                        f"ICECC_P50_REFERENCE_IMAGE_OS={reference_image['os']}",
+                        f"ICECC_P50_REFERENCE_IMAGE_CREATED={reference_image['created']}"))
     return ["env", "ICECC_P50_EXTERNAL_FARM=1", *command[1:]]
 
 
@@ -1861,7 +1878,9 @@ def execute_and_finalize_external_cell(
         product_root: Path, product_root_remote: str | None = None,
         repeat_predictive_plan: Path | None = None, passes: int = 1,
         timestamp: str | None = None, artifact_sample: int = 2,
-        retain_all_artifacts: bool = False) -> Path:
+        retain_all_artifacts: bool = False,
+        reference_witness: Path | None = None,
+        reference_authority: Path | None = None) -> Path:
     """Execute one authenticated external cell and finalize it immediately.
 
     ``SSHTransport.execute`` owns remote placement, execution, retention, and
@@ -1879,6 +1898,30 @@ def execute_and_finalize_external_cell(
         profile=profile, regime=regime, depth=depth, suite=topology)
     timeout_seconds = external_timeout_seconds(
         len(rows), passes, regime == "warm")
+    if reference_authority is not None and reference_witness is None:
+        raise ExternalFarmError("reference_authority:requires_reference_witness")
+    reuse_authority = reference_authority
+    if reference_witness is not None:
+        if reuse_authority is None:
+            authority_value_path = transport.authority.get("path")
+            if not isinstance(authority_value_path, str):
+                raise ExternalFarmError("reference_witness:authority_path_missing")
+            reuse_authority = Path(authority_value_path)
+        image = transport.authority.get("hosts", {}).get("q3", {}).get("image")
+        if not isinstance(image, Mapping):
+            raise ExternalFarmError("reference_witness:compiler_image_missing")
+        try:
+            reference_witness_module.validate_reuse(
+                reference_witness, batch_manifest=batch_manifest,
+                predictive_plan=predictive_plan, authority=reuse_authority,
+                image_identity=image)
+            staged_witness_files = reference_witness_module.package_files(reference_witness)
+        except reference_witness_module.ReferenceWitnessError as exc:
+            raise ExternalFarmError(f"reference_witness:validation_failed:{exc}") from exc
+        if not reuse_authority.is_file():
+            raise ExternalFarmError("reference_witness:authority_unavailable")
+    else:
+        staged_witness_files = []
     # Campaign factories may construct the transport with its conservative
     # 900-second default.  The lifecycle budget includes warm prewarm and the
     # paired local-reference passes, so use it for the marker supervisor and
@@ -1890,7 +1933,11 @@ def execute_and_finalize_external_cell(
         profile=profile, corpus=corpus, regime=regime, depth=depth,
         suite=topology, workdir=Path("/tmp/p50compilee2e.external"),
         timeout_seconds=timeout_seconds, passes=passes,
-        repeat_predictive_plan=repeat_predictive_plan)
+        repeat_predictive_plan=repeat_predictive_plan,
+        reference_witness=reference_witness,
+        reference_authority=reuse_authority,
+        reference_image=(transport.authority["hosts"]["q3"]["image"]
+                         if reference_witness is not None else None))
     result = execute(
         topology=topology, relationship_hosts=relationship_hosts,
         profile=profile, batch_manifest=batch_manifest,
@@ -1898,8 +1945,9 @@ def execute_and_finalize_external_cell(
         corpus=corpus, regime=regime, depth=depth, output=output,
         product_root_remote=product_root_remote or str(product_root.absolute()),
         batch_command=command, host_product_root=product_root,
-        extra_stage_paths=((repeat_predictive_plan,)
-                           if repeat_predictive_plan is not None else ()))
+        extra_stage_paths=tuple(
+            ([repeat_predictive_plan] if repeat_predictive_plan is not None else []) +
+            staged_witness_files + ([reuse_authority] if reuse_authority is not None else [])))
     if (not isinstance(result, Mapping) or result.get("status") != "PASS" or
             not isinstance(result.get("finalizer_input"), Mapping)):
         raise ExternalFarmError("adapter:finalizer_input_missing")

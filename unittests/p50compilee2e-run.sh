@@ -18,6 +18,10 @@ warm=${ICECC_P50_C1F1_WARM:-0}
 passes=${ICECC_P50_C1F1_PASSES:-2}
 topology=${ICECC_P50_TOPOLOGY:-}
 external_mode=${ICECC_P50_EXTERNAL_FARM:-0}
+reference_reuse=0
+reference_witness=${ICECC_P50_REFERENCE_WITNESS:-}
+reference_authority=${ICECC_P50_REFERENCE_AUTHORITY:-}
+predictive_plan=${ICECC_P50_PREDICTIVE_PLAN:-}
 case "$external_mode" in
     0|1) ;;
     *) echo "FAIL: ICECC_P50_EXTERNAL_FARM must be 0 or 1" >&2; exit 1 ;;
@@ -578,6 +582,36 @@ test -n "$envtar" || {
 envtar_sha256=$(sha256sum "$envtar" | awk '{print $1}')
 envtar_bytes=$(stat -c %s "$envtar")
 
+# A reuse cell is admitted only after the retained package and every current
+# input/command/authority/toolchain snapshot has been checked.  The validator
+# writes an ordinal-to-object map in this private workdir; it never invokes a
+# compiler.  A missing or changed witness is a hard failure, never a direct
+# reference fallback.
+if test -n "$reference_witness"; then
+    test "$external_mode" = 1 && test -n "$batch_manifest" && test -n "$predictive_plan" && \
+        test -n "$reference_authority" && test -n "${ICECC_P50_REFERENCE_IMAGE_ID:-}" && \
+        test -n "${ICECC_P50_REFERENCE_IMAGE_REFERENCE:-}" && \
+        test -n "${ICECC_P50_REFERENCE_IMAGE_ARCHITECTURE:-}" && \
+        test -n "${ICECC_P50_REFERENCE_IMAGE_OS:-}" && \
+        test -n "${ICECC_P50_REFERENCE_IMAGE_CREATED:-}" || {
+        echo "FAIL: reference reuse requires external batch, plan, authority, and image identity" >&2
+        exit 1
+    }
+    python3 "$src/farmharness/s8_reference_witness.py" verify \
+        --package "$reference_witness" --batch-manifest "$batch_manifest" \
+        --predictive-plan "$predictive_plan" --authority "$reference_authority" \
+        --image-id "$ICECC_P50_REFERENCE_IMAGE_ID" \
+        --image-reference "$ICECC_P50_REFERENCE_IMAGE_REFERENCE" \
+        --image-architecture "$ICECC_P50_REFERENCE_IMAGE_ARCHITECTURE" \
+        --image-os "$ICECC_P50_REFERENCE_IMAGE_OS" \
+        --image-created "$ICECC_P50_REFERENCE_IMAGE_CREATED" \
+        --toolchain "$envtar" --output "$work/reference-reuse-map.json" || {
+        echo "FAIL: authenticated reference witness reuse validation failed" >&2
+        exit 1
+    }
+    reference_reuse=1
+fi
+
 # A root container still runs the production daemon's normal privilege drop.
 # Let an explicit test account own the private tree so the daemon can create
 # its log and sidecar runtime files after that drop.  No account is selected
@@ -986,6 +1020,11 @@ compile_once() {
         # Defer q3's byte-identical reference until the remote batch barrier.
         printf '%s\n' "$input_path" "$item_compile_db" "$item_compile_source" \
             "$item_compile_output" "$local_obj" "$remote_obj" >"$work/local-pending-$label"
+    elif test "$reference_reuse" = 1; then
+        # This is a transport copy used only to satisfy the mature finalizer's
+        # local-object path contract.  The retained object is checked against
+        # the remote result at the batch barrier below; no compiler is run.
+        cp -- "$remote_obj" "$local_obj"
     elif test -n "$item_compile_db"; then
         eval "g++ $local_compile_args"
     else
@@ -1516,8 +1555,42 @@ if test -n "$batch_manifest"; then
                 output_ref=$(sed -n '4p' "$reference")
                 local_ref=$(sed -n '5p' "$reference")
                 remote_ref=$(sed -n '6p' "$reference")
+                remote_sha=$(sha256sum "$remote_ref" | awk '{print $1}')
+                remote_bytes=$(stat -c %s "$remote_ref")
                 local_witness_start_ns=$(date +%s%N)
-                if test -n "$db_ref"; then
+                if test "$reference_reuse" = 1; then
+                    witness_object=$(python3 - "$work/reference-reuse-map.json" "$ordinal_ref" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+matches = [row for row in value.get("records", [])
+           if row.get("ordinal") == int(sys.argv[2])]
+if len(matches) != 1:
+    raise SystemExit("reference witness ordinal missing or duplicated")
+print(matches[0]["object_path"])
+PY
+                    ) || { echo "FAIL: reference witness lookup failed ($run_label-$ordinal_ref)" >&2; exit 1; }
+                    test -f "$witness_object" && test ! -L "$witness_object" || {
+                        echo "FAIL: retained reference object unavailable ($run_label-$ordinal_ref)" >&2; exit 1;
+                    }
+                    cmp -s "$remote_ref" "$witness_object" || {
+                        echo "FAIL: remote object differs from retained reference witness ($run_label-$ordinal_ref)" >&2
+                        exit 1
+                    }
+                    witness_sha=$(sha256sum "$witness_object" | awk '{print $1}')
+                    witness_bytes=$(stat -c %s "$witness_object")
+                    test "$witness_sha" = "$remote_sha" && test "$witness_bytes" -eq "$remote_bytes" || {
+                        echo "FAIL: retained reference witness descriptor differs ($run_label-$ordinal_ref)" >&2
+                        exit 1
+                    }
+                    cp -- "$witness_object" "$local_ref"
+                    local_ref_sha="$witness_sha"
+                    local_ref_bytes="$witness_bytes"
+                    echo "S8_REFERENCE_REUSE package_sha256=$(python3 - "$work/reference-reuse-map.json" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["package_digest"])
+PY
+                    ) run=$run_label ordinal=$ordinal_ref remote_sha256=$remote_sha remote_bytes=$remote_bytes witness_sha256=$witness_sha witness_bytes=$witness_bytes"
+                elif test -n "$db_ref"; then
                     local_ref_args=$(compile_args_for "$db_ref" "$source_ref" "$output_ref" "$input_ref" "$local_ref")
                     eval "g++ $local_ref_args"
                 else
