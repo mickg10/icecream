@@ -94,13 +94,14 @@ SH_LOG_COMPILER = $(SHELL)
 AM_CPPFLAGS = -I$(top_srcdir)/client -I$(top_srcdir)/services -I$(top_srcdir)/ \
 	$(LIBZSTD_CFLAGS) $(LIBBSC_CFLAGS)
 P50_CLIENT_LINK_LIBS = ../client/libp50zstdsender.a \
-	../cache/libp50endpoint.a ../cache/libp50adoptedoutcomewriter.a \
+	../cache/libp50localtransport.a ../cache/libp50endpoint.a \
+	../cache/libp50adoptedoutcomewriter.a \
 	../cache/libprotocol50.a \
 	../services/libicecc.la $(LIBZSTD_LIBS) $(LIBBSC_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 testargs_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 testargs_LDADD = ../client/libclient.a $(P50_CLIENT_LINK_LIBS)
 p50wire_LDADD = ../cache/libprotocol50.a ../services/libicecc.la
-p50slice0_LDADD = ../cache/libprotocol50.a ../services/libicecc.la
+p50slice0_LDADD = ../cache/libprotocol50.a ../services/libicecc.la $(LIBBSC_LIBS)
 p50zstd_LDADD = ../cache/libprotocol50.a ../services/libicecc.la $(LIBZSTD_LIBS)
 p50zstdwindow_LDADD = ../cache/libprotocol50.a ../services/libicecc.la $(LIBZSTD_LIBS)
 p50inputrecord_LDADD = ../cache/libprotocol50.a ../services/libicecc.la \
@@ -221,7 +222,7 @@ p50s3realprocess_LDFLAGS = $(BOOST_LDFLAGS)
 p50s3realprocess_LDADD = ../cache/libp50endpoint.a \
 	../cache/libp50adoptedoutcomewriter.a ../cache/libprotocol50.a \
 	../services/libicecc.la \
-	$(LIBZSTD_LIBS) $(BOOST_LIBS)
+	$(LIBZSTD_LIBS) $(LIBBSC_LIBS) $(BOOST_LIBS)
 p50zstd_SOURCES = p50_zstd_test.cpp
 p50profile_SOURCES = p50_profile_test.cpp
 p50profile_LDADD = ../cache/libprotocol50.a ../services/libicecc.la $(LIBZSTD_LIBS) $(LIBBSC_LIBS)

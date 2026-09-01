@@ -53,12 +53,12 @@ for needle in \
 done
 grep -F 'handle_cache_session' "$daemon" >/dev/null
 grep -F 'cache_advertisement_snapshot().present()' "$daemon" >/dev/null
-grep -F 'dispatcher->dispatch' "$daemon" >/dev/null
+grep -F 'cache_adapter->dispatcher()->dispatch(' "$daemon" >/dev/null
 grep -F 'poll_cache_adapter();' "$daemon" >/dev/null
 grep -F 'exact_public_tcp_listener' "$daemon" >/dev/null
 grep -F 'SO_ACCEPTCONN' "$daemon" >/dev/null
 grep -F 'scheduler_cache_snapshot_valid = false' "$daemon" >/dev/null
-grep -F 'cache_adapter->shutdown(&update)' "$daemon" >/dev/null
+grep -F 'cache_adapter->outer_request_shutdown(&update)' "$daemon" >/dev/null
 grep -F 'connection_leases.revalidate' "$daemon" >/dev/null
 grep -F 'handoff_acknowledged' "$impl" "$header" >/dev/null
 grep -F 'trailing_byte_barrier' "$impl" "$header" >/dev/null
@@ -148,6 +148,7 @@ echo 'ok - daemon cache-dispatch source boundary holds without Git metadata'
 
 grep -F 'detail::wait_for_io' "$src/cache/p50_local_transport.cpp" >/dev/null
 grep -F 'detail::wait_for_io' "$src/cache/p50_fd_handoff.cpp" >/dev/null
-grep -F '(POLLERR | POLLHUP | POLLNVAL)' "$src/cache/p50_local_transport.h" >/dev/null
+grep -F '(POLLERR | POLLNVAL)' "$src/cache/p50_local_transport.h" >/dev/null
+grep -F 'if ((descriptor.revents & POLLHUP)' "$src/cache/p50_local_transport.h" >/dev/null
 echo 'ok - transport terminal poll conditions are explicit'
 echo 'ok - daemon cache-dispatch source and mutant gates hold'
