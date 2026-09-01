@@ -224,6 +224,7 @@ interruption_runtime_root=$(mktemp -d /tmp/p5i.XXXXXX)
 runtime_roots="$runtime_roots $interruption_runtime_root"
 interruption_log="$tmp_root/interruption.log"
 interruption_ready_trace="$tmp_root/interruption.ready"
+interruption_abort_trace="$tmp_root/interruption.abort"
 (
     interruption_child_pid=
     stop_interruption_child() {
@@ -261,10 +262,25 @@ interruption_ready_trace="$tmp_root/interruption.ready"
         kill -0 "$interruption_child_pid" 2>/dev/null || exit 1
         sleep 0.01
     done
-    # Freeze the exact baseline at the authenticated READY edge.  This makes
-    # the parent-side interruption deterministic while leaving the sidecar
-    # and its socket available for ownership-scoped discovery.
+    interruption_sidecar_wait=0
+    while test -z "$(mutant_sidecar_pids "$interruption_runtime_root")" && \
+            test "$interruption_sidecar_wait" -lt 40; do
+        sleep 0.05
+        interruption_sidecar_wait=$((interruption_sidecar_wait + 1))
+    done
+    test -n "$(mutant_sidecar_pids "$interruption_runtime_root")" || exit 1
+    # Freeze the exact baseline only after the sidecar record is observable;
+    # this makes the parent's interruption edge deterministic without racing
+    # service startup.
     kill -STOP "$interruption_child_pid"
+    # Hold the baseline at the authenticated READY edge until the parent has
+    # observed the exact sidecar record.  The parent then requests the
+    # interruption, so the sidecar cannot disappear before ownership polling
+    # has established the target.
+    while ! test -e "$interruption_abort_trace"; do
+        kill -0 "$interruption_child_pid" 2>/dev/null || exit 1
+        sleep 0.01
+    done
     stop_interruption_child
     interruption_status=0
     retire_mutant_sidecars "$interruption_runtime_root" || exit 1
@@ -288,6 +304,7 @@ if test -z "$interruption_sidecar_pids"; then
     cat "$interruption_log" >&2
     exit 1
 fi
+: >"$interruption_abort_trace"
 kill -TERM "$interruption_wrapper_pid"
 set +e
 wait "$interruption_wrapper_pid"
