@@ -16,7 +16,7 @@ def _file(path: Path, data: bytes) -> dict[str, object]:
 
 def _derived(root: Path, *, corpus="fmt", profile="ZSTD_TU", regime="cold",
              topology="C1F1/100000", depth_class="100", pass_id="full-1",
-             parent="accepted") -> Path:
+             parent="accepted", timing_eligible=True) -> Path:
     out = root / parent
     out.mkdir(parents=True)
     records = _file(out / "records.jsonl", b"records\n")
@@ -36,6 +36,22 @@ def _derived(root: Path, *, corpus="fmt", profile="ZSTD_TU", regime="cold",
         "live_curve_manifest": live, "source_experiment_manifest": source,
         "predictive_plan_sha256": "a" * 64,
     }
+    if timing_eligible:
+        manifest.update({
+            "execution_scope": "external_farm_timing",
+            "calibration_eligible": True,
+            "measurement_method": profile,
+            "product_profile": "GRZ" if profile == "GRZ_RESIDUAL" else profile,
+            "role_placement": {
+                "schema": "icecream-s8-role-placement-v1",
+                "mode": "external_farm",
+                "c_host_digest": "b" * 64,
+                "scheduler_host_digest": "b" * 64,
+                "f_host_digests": ["c" * 64],
+                "roles_disjoint": True,
+                "timing_eligible": True,
+            },
+        })
     path = out / "experiment_manifest.json"
     path.write_bytes(_canonical(manifest))
     return path
@@ -63,6 +79,26 @@ def test_full_two_uses_repeat_pass_and_rejects_duplicate_context(tmp_path: Path)
     _derived(duplicate, parent="two")
     with pytest.raises(LossInputError, match="duplicate_context"):
         build(duplicate, tmp_path / "duplicate-out.json")
+
+
+def test_loopback_diagnostic_cannot_shadow_external_timing_context(tmp_path: Path) -> None:
+    _derived(tmp_path, parent="old-loopback", timing_eligible=False)
+    accepted = _derived(tmp_path, parent="external")
+    output = build(tmp_path, tmp_path / "out.json")
+    entries = json.loads(output.read_text())["entries"]
+    passed = [row for row in entries if row["status"] == "PASS"]
+    assert len(passed) == 1
+    assert passed[0]["records"]["path"].endswith("external/records.jsonl")
+    assert accepted.is_file()
+
+
+def test_claimed_external_timing_requires_disjoint_placement(tmp_path: Path) -> None:
+    manifest_path = _derived(tmp_path)
+    manifest = json.loads(manifest_path.read_text())
+    manifest["role_placement"]["timing_eligible"] = False
+    manifest_path.write_bytes(_canonical(manifest))
+    with pytest.raises(LossInputError, match="role_placement_invalid"):
+        build(tmp_path, tmp_path / "out.json")
 
 
 def test_rejects_quarantined_candidate_and_existing_output(tmp_path: Path) -> None:

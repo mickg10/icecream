@@ -132,6 +132,37 @@ def _context(manifest: dict[str, Any], path: Path) -> tuple[tuple[str, str, str,
     corpus, profile, regime = (cell.get("corpus"), cell.get("profile"), cell.get("regime"))
     if corpus not in CALIBRATION_CORPORA or profile not in PROFILES or regime not in REGIMES:
         raise LossInputError(f"derived:{path}:calibration_cell_invalid")
+    if manifest.get("execution_scope") != "external_farm_timing":
+        raise LossInputError(f"derived:{path}:execution_scope_not_timing_eligible")
+    if manifest.get("calibration_eligible") is not True:
+        raise LossInputError(f"derived:{path}:calibration_ineligible")
+    if manifest.get("measurement_method") != profile:
+        raise LossInputError(f"derived:{path}:measurement_method_mismatch")
+    expected_product = "GRZ" if profile == "GRZ_RESIDUAL" else profile
+    if manifest.get("product_profile") != expected_product:
+        raise LossInputError(f"derived:{path}:product_profile_mismatch")
+    placement = manifest.get("role_placement")
+    placement_fields = {
+        "schema", "mode", "c_host_digest", "scheduler_host_digest",
+        "f_host_digests", "roles_disjoint", "timing_eligible",
+    }
+    if not isinstance(placement, dict) or set(placement) != placement_fields:
+        raise LossInputError(f"derived:{path}:role_placement_invalid")
+    c_digest = placement.get("c_host_digest")
+    scheduler_digest = placement.get("scheduler_host_digest")
+    f_digests = placement.get("f_host_digests")
+    if (placement.get("schema") != "icecream-s8-role-placement-v1" or
+            placement.get("mode") != "external_farm" or
+            placement.get("roles_disjoint") is not True or
+            placement.get("timing_eligible") is not True or
+            not isinstance(c_digest, str) or HEX64.fullmatch(c_digest) is None or
+            not isinstance(scheduler_digest, str) or HEX64.fullmatch(scheduler_digest) is None or
+            not isinstance(f_digests, list) or not f_digests or
+            any(not isinstance(value, str) or HEX64.fullmatch(value) is None
+                for value in f_digests) or
+            len(f_digests) != len(set(f_digests)) or c_digest in f_digests or
+            scheduler_digest in f_digests):
+        raise LossInputError(f"derived:{path}:role_placement_invalid")
     split = manifest.get("split")
     if split != "calibration":
         raise LossInputError(f"derived:{path}:split_invalid")
@@ -177,6 +208,12 @@ def _scan(root: Path) -> dict[tuple[str, str, str, str, str, str], dict[str, Any
         with path.open("rb") as stream:
             manifest = _parse(stream.read(), f"derived_manifest:{path}")
         if not isinstance(manifest, dict) or manifest.get("schema") != DERIVED_SCHEMA:
+            continue
+        # Historical single-host/loopback packages remain useful correctness
+        # diagnostics, but they are deliberately outside the timing model.
+        # Ignore them before context de-duplication so an old diagnostic can
+        # never shadow a later external-farm measurement for the same cell.
+        if manifest.get("execution_scope") != "external_farm_timing":
             continue
         key, value = _context(manifest, path)
         # Authenticate that every accepted record remains inside the derived
