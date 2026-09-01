@@ -268,11 +268,9 @@ def _private_bytes(path: Path, label: str) -> tuple[bytes, dict[str, object]]:
 
 
 def _stream_route_prefixes(selected: object, assignment: object, root: Path,
-                           *, initial: Mapping[str, bytes] | None = None,
-                           predecessor_selected: object | None = None,
+                           *, predecessor_selected: object | None = None,
                            predecessor_assignment: object | None = None,
                            max_history_bytes: int = DEFAULT_HISTORY_BYTES,
-                           retain_histories: bool = False,
                            label: str = "route_input") -> tuple[
                                dict[int, dict[str, object]],
                                dict[str, object], list[dict[str, object]]]:
@@ -333,12 +331,7 @@ def _stream_route_prefixes(selected: object, assignment: object, root: Path,
     effective_limit = min(max_history_bytes, 1 << MAX_HISTORY_WINDOW_LOG)
     for relation, relation_entries in entries.items():
         relationship_key = "C0|F" + str(relation)
-        if relation in predecessor_entries and initial:
-            raise MatrixError(label + ":duplicate_initial_predecessor_state")
-        starting = initial.get(relationship_key, b"") if initial else b""
-        if not isinstance(starting, bytes) or len(starting) > effective_limit:
-            raise MatrixError(label + ":initial_prefix_invalid")
-        history = bytearray(starting)
+        history = bytearray()
         for is_current, stream_entries in ((False, predecessor_entries.get(relation, [])),
                                            (True, relation_entries)):
             for index, item, _assignment_row in stream_entries:
@@ -364,8 +357,7 @@ def _stream_route_prefixes(selected: object, assignment: object, root: Path,
                         "logical": item.get("logical"), "source_relative": relative,
                         "bytes": file_facts["bytes"], "sha256": file_facts["sha256"],
                         "source_path": str(path), "source_digest128": _digest128(raw)}
-        final[relationship_key] = (history if retain_histories
-                                   else _prefix_descriptor(history))
+        final[relationship_key] = _prefix_descriptor(history)
     facts = [facts_by_index[index] for index in range(len(selected))]
     return observations, final, facts
 
@@ -1508,7 +1500,6 @@ def verify_experiment(experiment: Path) -> dict[str, object]:
         if not isinstance(selected, list):
             raise MatrixError("verifier:input_authority_invalid")
         assignment = manifest.get("assignment_authority")
-        initial_route: dict[str, bytes] | None = None
         predecessor_selected: object | None = None
         predecessor_assignment: object | None = None
         predecessor_input_authority = manifest.get("predecessor_input_authority")
@@ -1530,7 +1521,7 @@ def verify_experiment(experiment: Path) -> dict[str, object]:
                 predecessor_selected=(predecessor_selected if isinstance(predecessor_selected, list)
                                       and predecessor_selected else None),
                 predecessor_assignment=predecessor_assignment,
-                initial=initial_route, label="verifier_route")
+                label="verifier_route")
         else:
             for item in selected:
                 if not isinstance(item, Mapping):
