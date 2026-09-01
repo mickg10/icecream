@@ -248,7 +248,10 @@ def _native_batch(occurrences: Sequence[Occurrence], topology: MatrixTopology,
             raise MatrixError("native product predecessor batch is incomplete or reordered")
         if set(result) != set(range(len(occurrences))):
             raise MatrixError("native product batch is incomplete or reordered")
-        return result
+        # The native endpoint numbers each manifest segment from zero.  The
+        # experiment row retains the authenticated global dispatch identity,
+        # so re-key the measured segment by occurrence ordinal at this seam.
+        return {occurrences[index].ordinal: item for index, item in result.items()}
 
 
 def _native_receipt(root: Path) -> tuple[dict[str, object] | None, dict[str, object]]:
