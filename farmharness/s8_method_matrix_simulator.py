@@ -302,7 +302,8 @@ def _stream_route_prefixes(selected: object, assignment: object, root: Path,
             relation: [] for relation in range(relationship_count)}
         for index, (item, assignment_row) in enumerate(zip(stream, assignment_rows)):
             if (not isinstance(item, Mapping) or not isinstance(assignment_row, Mapping) or
-                    item.get("ordinal") != index):
+                    type(item.get("ordinal")) is not int or
+                    item.get("ordinal") != assignment_row.get("dispatch_order")):
                 raise MatrixError(stream_label + ":identity_invalid")
             relative = item.get("source_relative")
             if (not isinstance(relative, str) or Path(relative).is_absolute() or
@@ -356,7 +357,7 @@ def _stream_route_prefixes(selected: object, assignment: object, root: Path,
                 _append_bounded_history_in_place(history, raw, effective_limit)
                 after = _prefix_descriptor(history)
                 if is_current:
-                    observations[index] = {"relationship_key": ["C0", "F" + str(relation)],
+                    observations[item["ordinal"]] = {"relationship_key": ["C0", "F" + str(relation)],
                                            "before": before, "after": after}
                     facts_by_index[index] = {
                         "ordinal": item.get("ordinal"), "build": item.get("build"),
@@ -488,7 +489,10 @@ def _native_batch(occurrences: Sequence[Occurrence], topology: MatrixTopology,
                 raise MatrixError("native product output schema invalid")
             if any(isinstance(key, str) and key.startswith("committed_raw_prefix")
                    for key in item):
-                raise MatrixError("native product output prefix body forbidden")
+                allowed = {"committed_raw_prefix_before_descriptor",
+                           "committed_raw_prefix_descriptor"}
+                if any(key not in allowed for key in item):
+                    raise MatrixError("native product output prefix body forbidden")
             marker = (segment, index)
             if marker in seen:
                 raise MatrixError("native product output duplicate ordinal")
@@ -520,6 +524,10 @@ def _native_batch(occurrences: Sequence[Occurrence], topology: MatrixTopology,
             digest_fields = ("state_before_digest", "state_digest", "transaction_digest")
             if any(not _digest128_text(item.get(field)) for field in digest_fields):
                 raise MatrixError("native product output digest invalid")
+            if method == "ZSTD_ROUTE" and (
+                    not _valid_prefix_descriptor(item.get("committed_raw_prefix_before_descriptor")) or
+                    not _valid_prefix_descriptor(item.get("committed_raw_prefix_descriptor"))):
+                raise MatrixError("native product output route descriptor invalid")
             expected_seq = relation_last_seq.get(relation, 0)
             if item.get("tu_seq") != expected_seq:
                 raise MatrixError("native product output relationship TU sequence invalid")
@@ -854,6 +862,7 @@ class _RelationshipState:
     pending: bool = False
     native_last_tu_seq: int | None = None
     native_state_digest: str | None = None
+    prefix_descriptor: dict[str, object] | None = None
 
 
 def assign_relationships(topology: MatrixTopology, occurrences: Sequence[Occurrence],
@@ -1025,11 +1034,20 @@ class MethodMatrixSimulator:
                     key = tuple(str(key_text).split("|", 1))
                     if key not in states_by_method[method] or not isinstance(value, Mapping):
                         raise MatrixError("repeat-full relationship identity is invalid")
-                    history = value.get("_runtime_history", b"")
+                    # Native full2 owns route continuation inside one p50sim
+                    # process; Python never carries its prefix payload.  The
+                    # bounded in-memory hook exists only for synthetic tests.
+                    history = (value.get("_runtime_history", b"")
+                               if not (method == "ZSTD_ROUTE" and
+                                       self._native_rows.get(method)) else b"")
                     if (not isinstance(history, (bytes, bytearray)) or
                             len(history) > self.max_history_bytes):
                         raise MatrixError("repeat-full committed prefix exceeds bound")
                     states_by_method[method][key].history = history
+                    if method == "ZSTD_ROUTE":
+                        descriptor = value.get("committed_raw_prefix_descriptor")
+                        if _valid_prefix_descriptor(descriptor):
+                            states_by_method[method][key].prefix_descriptor = dict(descriptor)
                     states_by_method[method][key].next_rel_seq = int(value.get("next_rel_seq", 0))
                     if method in STATEFUL_METHODS:
                         native_seq = value.get("native_last_tu_seq")
@@ -1254,7 +1272,17 @@ class MethodMatrixSimulator:
             transaction.update({"native_next_rel_seq": int(product["tu_seq"]) + 1,
                                 "history_nonce": occurrence.history_nonce,
                                 "route_identity": f"{key[0]}->{key[1]}"})
-            if method == "ZSTD_ROUTE":
+            native_route_descriptor = (method == "ZSTD_ROUTE" and
+                                       product.get("profile") == "ZSTD_ROUTE")
+            if native_route_descriptor:
+                if (not _valid_prefix_descriptor(product.get("committed_raw_prefix_before_descriptor")) or
+                        not _valid_prefix_descriptor(product.get("committed_raw_prefix_descriptor"))):
+                    raise MatrixError("native route descriptor is missing or malformed")
+                transaction.update({
+                    "committed_raw_prefix_before_descriptor":
+                        product["committed_raw_prefix_before_descriptor"],
+                    "committed_raw_prefix_descriptor": product["committed_raw_prefix_descriptor"]})
+            elif method == "ZSTD_ROUTE":
                 # The transaction's ordinary prefix fields are overwritten
                 # with post-commit state below.  Preserve the authenticated
                 # pre-state separately so repeat-full can bind the first
@@ -1265,6 +1293,9 @@ class MethodMatrixSimulator:
                                     "committed_raw_prefix_descriptor":
                                     _prefix_descriptor(prefix_before)})
             row["product_transaction"] = transaction
+            if method == "ZSTD_ROUTE" and native_route_descriptor:
+                row["pre_state_digest"] = product["state_before_digest"]
+                state.prefix_descriptor = dict(product["committed_raw_prefix_descriptor"])
             state.native_last_tu_seq = int(product["tu_seq"])
             state.native_state_digest = str(product["state_digest"])
             if method in STATEFUL_METHODS:
@@ -1287,10 +1318,14 @@ class MethodMatrixSimulator:
                     "codec_wall_ns": (None if method == "RAW_II" else wall_ns)})
         if occurrence.commit:
             if method in {"ZSTD_ROUTE", "ZSTD_COHORT"}:
-                encode_state.history = _append_bounded_history(
-                    encode_state.history, raw, self.max_history_bytes)
+                native_route_descriptor = (method == "ZSTD_ROUTE" and product is not None and
+                                           product.get("profile") == "ZSTD_ROUTE")
+                if not native_route_descriptor:
+                    encode_state.history = _append_bounded_history(
+                        encode_state.history, raw, self.max_history_bytes)
                 encode_state.next_rel_seq += 1
-                state.history = encode_state.history
+                if not native_route_descriptor:
+                    state.history = encode_state.history
                 state.next_rel_seq = encode_state.next_rel_seq
                 state.reset_count = encode_state.reset_count
                 state.history_nonce = encode_state.history_nonce
@@ -1316,10 +1351,12 @@ class MethodMatrixSimulator:
             transaction = row["product_transaction"]
             if isinstance(transaction, dict):
                 transaction["committed_state_digest"] = state.native_state_digest
-                if method == "ZSTD_ROUTE":
+                if method == "ZSTD_ROUTE" and product.get("profile") != "ZSTD_ROUTE":
                     transaction["committed_raw_prefix_descriptor"] = _prefix_descriptor(state.history)
         post = _state_digest(state.history, state.next_rel_seq,
                              state.last_route_id, state.history_nonce)
+        if product is not None and method == "ZSTD_ROUTE" and product.get("profile") == "ZSTD_ROUTE":
+            post = str(product["state_digest"])
         row["post_state_digest"] = post
         return row
 
@@ -1367,7 +1404,9 @@ class MethodMatrixSimulator:
                  states_by_method: Mapping[str, Mapping[tuple[str, str], _RelationshipState]]) -> dict[str, object]:
         relationships = {
             method: {"|".join(key): {"next_rel_seq": state.next_rel_seq,
-                "committed_raw_prefix_descriptor": _prefix_descriptor(state.history),
+                "committed_raw_prefix_descriptor": (
+                    dict(state.prefix_descriptor) if method == "ZSTD_ROUTE" and
+                    state.prefix_descriptor is not None else _prefix_descriptor(state.history)),
                 "history_nonce": state.history_nonce,
                 "route_identity": state.last_route_id,
                 "reset_count": state.reset_count,
@@ -1443,7 +1482,9 @@ def verify_experiment(experiment: Path) -> dict[str, object]:
         raise MatrixError("verifier:summary_schema_invalid")
     def has_prefix_body(value: object) -> bool:
         if isinstance(value, Mapping):
-            return any(key == "committed_raw_prefix" or has_prefix_body(item)
+            return any((isinstance(key, str) and key.startswith("committed_raw_prefix") and
+                        key not in {"committed_raw_prefix_before_descriptor",
+                                    "committed_raw_prefix_descriptor"}) or has_prefix_body(item)
                        for key, item in value.items())
         if isinstance(value, list):
             return any(has_prefix_body(item) for item in value)
@@ -1852,19 +1893,7 @@ def _authenticated_predecessor_plan(
                                       source_build=int(assignment_row["authority_build"]),
                                       source_logical=logical,
                                       source_digest128=str(fact["source_digest128"])))
-    _observations, route_histories, _facts = _stream_route_prefixes(
-        selected_inputs, authority, Path(str(input_authority["corpus_root"])),
-        retain_histories=True, label="repeat_full_predecessor_route")
     summary_relationships = summary.get("relationships", {})
-    route_summary = summary_relationships.get("ZSTD_ROUTE") if isinstance(summary_relationships, Mapping) else None
-    if not isinstance(route_summary, Mapping):
-        raise MatrixError("repeat-full predecessor route summary is incomplete")
-    for relationship_key, history in route_histories.items():
-        descriptor = _prefix_descriptor(history)
-        state = route_summary.get(relationship_key)
-        if (not isinstance(state, Mapping) or
-                state.get("committed_raw_prefix_descriptor") != descriptor):
-            raise MatrixError("repeat-full predecessor route summary changed")
     prior_state = dict(summary)
     prior_relationships = summary_relationships if isinstance(summary_relationships, Mapping) else {}
     prior_state["relationships"] = {
@@ -1873,10 +1902,6 @@ def _authenticated_predecessor_plan(
         for method, states in prior_relationships.items()
         if isinstance(states, Mapping)
     }
-    for key, history in route_histories.items():
-        value = prior_state["relationships"]["ZSTD_ROUTE"][key]
-        if isinstance(value, dict):
-            value["_runtime_history"] = history
     return prior_state, dict(authority), occurrences
 
 

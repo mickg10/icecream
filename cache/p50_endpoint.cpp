@@ -933,6 +933,7 @@ struct P50PreparationAuthority::Impl {
     bool entry_exhausted = false;
     uint64_t retained_bytes = 0;
     std::vector<uint8_t> committed_route_history;
+    Digest128 committed_route_history_digest = digest128(std::span<const uint8_t>{});
     std::optional<uint64_t> uncommitted_route_entry;
 #if defined(ICECC_P50_WITH_LIBBSC)
     std::optional<uint64_t> uncommitted_grz_entry;
@@ -1191,6 +1192,8 @@ void P50PreparationAuthority::commit(PreparedTuHandle handle) {
             impl_->committed_route_history.insert(impl_->committed_route_history.end(),
                                                   entry.raw.begin(), entry.raw.end());
         }
+        impl_->committed_route_history_digest = digest128(
+            std::span<const uint8_t>(impl_->committed_route_history));
         entry.committed = true;
         impl_->uncommitted_route_entry.reset();
     }
@@ -1340,6 +1343,11 @@ size_t P50PreparationAuthority::route_history_bytes() const {
         return impl_->grz_codec.retained_history_bytes();
 #endif
     return impl_->committed_route_history.size();
+}
+
+Digest128 P50PreparationAuthority::route_history_digest() const {
+    impl_->owner.check();
+    return impl_->committed_route_history_digest;
 }
 
 size_t P50PreparationAuthority::route_history_entries() const {

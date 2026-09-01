@@ -496,6 +496,8 @@ void write_batch_row(std::ostream& output, std::string_view segment,
                      const CompletionLog& completions, const ActionTrace& actions,
                      const P50ClientEndpoint& client_endpoint,
                      const std::optional<Digest128>& expected_before,
+                     size_t prefix_before_bytes, const Digest128& prefix_before_digest,
+                     size_t prefix_after_bytes, const Digest128& prefix_after_digest,
                      std::chrono::steady_clock::duration elapsed,
                      ProfileId profile) {
     const Digest128 raw_digest = icecc::digest128(input);
@@ -582,7 +584,16 @@ void write_batch_row(std::ostream& output, std::string_view segment,
            << ",\"state_before_digest\":\"" << icecc::digest128_hex(state_before)
            << "\",\"state_digest\":\"" << icecc::digest128_hex(state_after)
            << "\",\"transaction_digest\":\"" << icecc::digest128_hex(tx_digest)
-           << "\",\"committed\":true}\n";
+           << "\",\"committed\":true";
+    if (profile == ProfileId::Z3_LONG) {
+        output << ",\"committed_raw_prefix_before_descriptor\":{\"schema\":\"icecream-s8-route-prefix-descriptor-v1\",\"bytes\":"
+               << prefix_before_bytes << ",\"digest128\":\""
+               << icecc::digest128_hex(prefix_before_digest)
+               << "\"},\"committed_raw_prefix_descriptor\":{\"schema\":\"icecream-s8-route-prefix-descriptor-v1\",\"bytes\":"
+               << prefix_after_bytes << ",\"digest128\":\""
+               << icecc::digest128_hex(prefix_after_digest) << "\"}";
+    }
+    output << "}\n";
     if (!output)
         throw std::runtime_error("cannot write batch output");
 }
@@ -670,6 +681,8 @@ void run_batch(const Arguments& arguments) {
             relation.completions.clear();
             const std::optional<Digest128> expected_before =
                 retains_relationship_state ? relation.last_state_digest : std::nullopt;
+            const size_t prefix_before_bytes = relation.authority->route_history_bytes();
+            const Digest128 prefix_before_digest = relation.authority->route_history_digest();
             auto prepared = relation.authority->prepare(
                 PrepareRequestKey{1, ++relation.request_token}, input);
             if (!prepared)
@@ -694,9 +707,13 @@ void run_batch(const Arguments& arguments) {
             const std::string relation_id =
                 "c1f" + std::to_string(relationship_count) + "-r" +
                 (assignments[index] < 10 ? "0" : "") + std::to_string(assignments[index]);
+            const size_t prefix_after_bytes = relation.authority->route_history_bytes();
+            const Digest128 prefix_after_digest = relation.authority->route_history_digest();
             write_batch_row(output, segment, relation_id, index, relationship_tu_seq, input,
                             client_result, server_result, relation.completions,
-                            relation.actions, *relation.client, expected_before, elapsed, profile);
+                            relation.actions, *relation.client, expected_before,
+                            prefix_before_bytes, prefix_before_digest,
+                            prefix_after_bytes, prefix_after_digest, elapsed, profile);
             for (const ActionRecord& action : relation.actions.records()) {
                 if (action.action == ActionType::COMMIT_ACCEPTED &&
                     action.raw_digest == icecc::digest128(input)) {

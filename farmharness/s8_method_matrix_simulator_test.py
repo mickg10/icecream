@@ -392,15 +392,19 @@ def test_experiment_evidence_rejects_duplicate_nonfinite_and_symlink(tmp_path: P
         verify_experiment(experiment)
 
     manifest.write_bytes(original)
-    body_row = original_occurrences.replace(b'"authority":',
-                                            b'"committed_raw_prefix":"forbidden","authority":', 1)
-    occurrences.write_bytes(body_row)
-    value = json.loads(original)
-    value["artifacts"]["occurrences.jsonl"] = {
-        "bytes": len(body_row), "sha256": hashlib.sha256(body_row).hexdigest()}
-    manifest.write_bytes(json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n")
-    with pytest.raises(MatrixError, match="route_prefix_body_forbidden"):
-        verify_experiment(experiment)
+    for legacy_key in (b'"committed_raw_prefix"',
+                       b'"committed_raw_prefix_before"',
+                       b'"committed_raw_prefix_bytes"',
+                       b'"committed_raw_prefix_digest"'):
+        body_row = original_occurrences.replace(
+            b'"authority":', legacy_key + b':"forbidden","authority":', 1)
+        occurrences.write_bytes(body_row)
+        value = json.loads(original)
+        value["artifacts"]["occurrences.jsonl"] = {
+            "bytes": len(body_row), "sha256": hashlib.sha256(body_row).hexdigest()}
+        manifest.write_bytes(json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n")
+        with pytest.raises(MatrixError, match="route_prefix_body_forbidden"):
+            verify_experiment(experiment)
 
     occurrences.write_bytes(original_occurrences)
     manifest.write_bytes(original)
