@@ -16,10 +16,16 @@ FULL_MATRIX=$(printenv FULL_MATRIX 2>/dev/null || true); test -n "$FULL_MATRIX" 
 TLC_WORKERS=$(printenv TLC_WORKERS 2>/dev/null || true); test -n "$TLC_WORKERS" || TLC_WORKERS=1
 TLC_SEED=$(printenv TLC_SEED 2>/dev/null || true); test -n "$TLC_SEED" || TLC_SEED=1
 TLC_FP_INDEX=$(printenv TLC_FP_INDEX 2>/dev/null || true); test -n "$TLC_FP_INDEX" || TLC_FP_INDEX=0
+SEARCH_MODE=$(printenv TLC_SEARCH_MODE 2>/dev/null || true); test -n "$SEARCH_MODE" || SEARCH_MODE=bfs
+DFID_MAX=$(printenv TLC_DFID_MAX 2>/dev/null || true); test -n "$DFID_MAX" || DFID_MAX=0
 EXP=$(printenv ZSTD_ROUTE_EXPERIMENTS_ROOT 2>/dev/null || true)
 test -n "$EXP" || EXP=/tanksmall/scratch/ictmp/experiments/icecream/zstd-route-finput-composition-v5
 case "$TIMEOUT" in ''|*[!0-9]*) exit 2;; esac
-test "$TIMEOUT" -gt 0 -a "$TIMEOUT" -le 300 || exit 2
+case "$SEARCH_MODE" in
+  bfs) test "$DFID_MAX" -eq 0 || exit 2; test "$TIMEOUT" -gt 0 -a "$TIMEOUT" -le 300 || exit 2;;
+  dfid) case "$DFID_MAX" in ''|*[!0-9]*) exit 2;; esac; test "$DFID_MAX" -ge 2 -a "$DFID_MAX" -le 10000 || exit 2; test "$TIMEOUT" -gt 0 -a "$TIMEOUT" -le 3600 || exit 2;;
+  *) exit 2;;
+esac
 test -n "$JAR" || { echo 'FAIL: TLA2TOOLS_JAR is required' >&2; exit 2; }
 case "$JAR" in /*) ;; *) echo 'FAIL: TLA2TOOLS_JAR must be absolute' >&2; exit 2;; esac
 test -f "$JAR" || { echo 'FAIL: pinned TLC JAR is absent' >&2; exit 2; }
@@ -52,10 +58,16 @@ RESUME=$(printenv RESUME 2>/dev/null || true); test -n "$RESUME" || RESUME=0
 if test -e "$STATE" && test "$RESUME" != 1; then echo 'FAIL: existing state path; use RESUME=1' >&2; exit 2; fi
 mkdir -p "$STATE/rows" "$STATE/states" "$STATE/java-tmp" "$STATE/inputs/config"
 COMMIT=$(git -C "$ROOT" rev-parse HEAD); TREE=$(git -C "$ROOT" rev-parse 'HEAD^{tree}'); PARENT=$(git -C "$ROOT" rev-parse HEAD^)
-export COMMIT TREE PARENT TIMEOUT JAR JSHA SPEC SPEC_SHA PINNED RESUME TLC_WORKERS TLC_SEED TLC_FP_INDEX FULL_MATRIX IDS
+export COMMIT TREE PARENT TIMEOUT JAR JSHA SPEC SPEC_SHA PINNED RESUME TLC_WORKERS TLC_SEED TLC_FP_INDEX FULL_MATRIX IDS SEARCH_MODE DFID_MAX
+SEARCH_ARGS=
+JAVA_ARGS='-XX:+UseParallelGC'
+if test "$SEARCH_MODE" = dfid; then
+  SEARCH_ARGS="-dfid $DFID_MAX"
+  JAVA_ARGS='-Xms512m -Xmx4g -XX:+UseParallelGC'
+fi
 
 python3 - "$MANIFEST" "$D" "$STATE/config.list" <<'PY'
-import hashlib,json,pathlib,re,sys
+import hashlib,json,os,pathlib,re,sys
 m=pathlib.Path(sys.argv[1]); d=pathlib.Path(sys.argv[2]); out=pathlib.Path(sys.argv[3])
 rows=[json.loads(x) for x in m.read_text().splitlines() if x.strip()]
 need={'id','kind','module','config','module_sha256','config_sha256','expected_exit','expected_wait','expected','injection','injection_marker','target','antecedent','row_sha256','expected_phase'}
@@ -65,6 +77,9 @@ if len({r['id'] for r in rows})!=len(rows): raise SystemExit('manifest duplicate
 def h(p): return hashlib.sha256(p.read_bytes()).hexdigest()
 def rh(r): return hashlib.sha256(json.dumps({k:v for k,v in r.items() if k!='row_sha256'},sort_keys=True,separators=(',',':')).encode()).hexdigest()
 cfgs=[]; hashes=[]
+requested={x for x in os.environ['IDS'].split(',') if x}
+def selected_row(row_id):
+    return row_id in requested if requested else (os.environ['FULL_MATRIX'] == '1' or row_id == 'composition-general-safety')
 for r in rows:
     mp=d/r['module']; cp=d/r['config']
     if not mp.is_file() or not cp.is_file(): raise SystemExit('missing manifest file '+r['id'])
@@ -77,6 +92,8 @@ for r in rows:
         if r.get('antecedent_state_position','last') not in {'last','previous'}: raise SystemExit('bad antecedent state position '+r['id'])
         if any(not isinstance(k,str) or '.' not in k for k in r['antecedent_state']): raise SystemExit('bad antecedent state key '+r['id'])
     mt=mp.read_text(errors='replace'); ct=cp.read_text(errors='replace')
+    if selected_row(r['id']) and os.environ['SEARCH_MODE'] == 'dfid' and re.search(r'(?m)^\s*PROPERT(?:Y|IES)\b',ct):
+        raise SystemExit('DFID mode cannot check liveness-property row '+r['id'])
     marker=r['injection_marker']
     if marker!='none' and marker not in mt+ct: raise SystemExit('marker not source-bound '+r['id'])
     if ('mutant' in r['kind'] or r['injection']=='reachable') and (not r['target'] or not r['antecedent']):
@@ -105,9 +122,11 @@ printf '%s  %s\n' "$JSHA" "$JAR" >"$STATE/tool.sha256"
 printf '%s  %s\n' "$SPEC_SHA" "$SPEC" >"$STATE/spec.sha256"
 printf '%s\n' \
   "TLA2TOOLS_JAR=$JAR" "ROW_TIMEOUT_SECONDS=$TIMEOUT" "TLC_WORKERS=$TLC_WORKERS" \
-  "TLC_SEED=$TLC_SEED" "TLC_FP_INDEX=$TLC_FP_INDEX" "FULL_MATRIX=$FULL_MATRIX" "ROW_IDS=$IDS" \
+  "TLC_SEED=$TLC_SEED" "TLC_FP_INDEX=$TLC_FP_INDEX" "TLC_SEARCH_MODE=$SEARCH_MODE" "TLC_DFID_MAX=$DFID_MAX" \
+  "FULL_MATRIX=$FULL_MATRIX" "ROW_IDS=$IDS" \
   "ROOT=$ROOT" "MANIFEST=$MANIFEST" \
-  "COMMAND=(cd $D && timeout --signal=TERM --kill-after=2s TIMEOUTs java -XX:+UseParallelGC -cp TLA2TOOLS_JAR tlc2.TLC -workers TLC_WORKERS -seed TLC_SEED -fp TLC_FP_INDEX -coverage 1 -metadir STATE/states/ROW_ID -config ROW_CONFIG ROW_MODULE)" \
+  "JAVA_ARGS=$JAVA_ARGS" "SEARCH_ARGS=$SEARCH_ARGS" \
+  "COMMAND=(cd $D && timeout --signal=TERM --kill-after=2s TIMEOUTs java JAVA_ARGS -cp TLA2TOOLS_JAR tlc2.TLC -workers TLC_WORKERS -seed TLC_SEED -fp TLC_FP_INDEX -coverage 1 SEARCH_ARGS -metadir STATE/states/ROW_ID -config ROW_CONFIG ROW_MODULE)" \
   >"$STATE/commands.txt"
 printf '%s\n' 'BigOracle issue16 follow-up comments 5447981767 and 5448067827 were not available in the frozen local evidence set; interpretation remains HOLD pending external ruling.' >"$STATE/issue16-ruling.txt"
 
@@ -116,7 +135,7 @@ set +e
 SANY_RC=$?
 set -e
 test "$SANY_RC" -eq 0 && SANY_STATUS=pass || SANY_STATUS=fail
-export SANY_RC SANY_STATUS
+export SANY_RC SANY_STATUS SEARCH_MODE DFID_MAX JAVA_ARGS SEARCH_ARGS
 python3 - "$STATE/provenance.json" "$D/run_zstd_route_finput_composition_tlc.sh" "$MANIFEST" <<'PY'
 import hashlib,json,os,pathlib,subprocess,time,sys
 def h(p): return hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
@@ -125,6 +144,8 @@ json.dump({'source_commit':os.environ['COMMIT'],'source_tree':os.environ['TREE']
  'spec_path':os.environ['SPEC'],'spec_sha256':os.environ['SPEC_SHA'],
  'runner_sha256':h(sys.argv[2]),'manifest_sha256':h(sys.argv[3]),
  'java':subprocess.run(['java','-version'],capture_output=True,text=True).stderr.splitlines()[:1],
+ 'search_mode':os.environ['SEARCH_MODE'],'dfid_max':int(os.environ['DFID_MAX']),
+ 'java_args':os.environ['JAVA_ARGS'],'search_args':os.environ['SEARCH_ARGS'],
  'tool_available':True,'sany_status':os.environ['SANY_STATUS'],'sany_raw_exit':int(os.environ['SANY_RC']),
  'utc_start':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),'timeout_seconds':int(os.environ['TIMEOUT']),
  'workers':os.environ['TLC_WORKERS'],'seed':os.environ['TLC_SEED'],'fp_index':os.environ['TLC_FP_INDEX']},
@@ -150,14 +171,14 @@ runrow() {
   rc=125; signal=none
   set +e
   (cd "$D" && /usr/bin/time -f 'elapsed_seconds=%e\nmax_rss_kb=%M\nuser_seconds=%U\nsys_seconds=%S' -o "$resource" \
-    timeout --signal=TERM --kill-after=2s "$TIMEOUT"s java -XX:+UseParallelGC -cp "$JAR" \
-    tlc2.TLC -workers "$TLC_WORKERS" -seed "$TLC_SEED" -fp "$TLC_FP_INDEX" -coverage 1 \
+    timeout --signal=TERM --kill-after=2s "$TIMEOUT"s java $JAVA_ARGS -cp "$JAR" \
+    tlc2.TLC -workers "$TLC_WORKERS" -seed "$TLC_SEED" -fp "$TLC_FP_INDEX" -coverage 1 $SEARCH_ARGS \
     -metadir "$STATE/states/$id" -config "$cfg" "$mod") >"$so" 2>"$se"
   rc=$?
   set -e
   case "$rc" in 124|137|143) signal=timeout;; esac
   end=$(date -u +%Y-%m-%dT%H:%M:%SZ); me=$(python3 -c 'import time; print(time.monotonic())')
-  python3 - "$out" "$row" "$rc" "$signal" "$start" "$end" "$ms" "$me" "$so" "$se" "$resource" "$D" "$STATE" <<'PY'
+python3 - "$out" "$row" "$rc" "$signal" "$start" "$end" "$ms" "$me" "$so" "$se" "$resource" "$D" "$STATE" <<'PY'
 import hashlib,json,pathlib,re,sys,os
 out=pathlib.Path(sys.argv[1]); r=json.loads(sys.argv[2]); rc=int(sys.argv[3]); sig=sys.argv[4]
 so=pathlib.Path(sys.argv[9]); se=pathlib.Path(sys.argv[10]); rp=pathlib.Path(sys.argv[11]); root=pathlib.Path(sys.argv[12]); state=pathlib.Path(sys.argv[13])
@@ -178,7 +199,14 @@ for line in rp.read_text(errors='replace').splitlines():
   except ValueError: resource[k]=v
 st['resource']=resource
 nums=re.findall(r'(?m)^\s*(\d+) states generated, (\d+) distinct states found, (\d+) states left on queue\.?',text)
-if nums: st['generated_states'],st['distinct_states'],st['queue_depth']=map(int,nums[-1])
+dfid_nums=re.findall(r'(?m)^\s*(\d+) states generated, (\d+) distinct states found\.?',text)
+levels=[int(x) for x in re.findall(r'(?m)^Starting level (\d+):',text)]
+st['dfid_levels_observed']=levels
+st['dfid_last_level']=levels[-1] if levels else None
+st['dfid_reached_limit']=bool(os.environ['SEARCH_MODE']=='dfid' and levels and levels[-1] >= int(os.environ['DFID_MAX']))
+if os.environ['SEARCH_MODE']=='dfid' and dfid_nums:
+ st['generated_states'],st['distinct_states']=map(int,dfid_nums[-1]); st['queue_depth']=None
+elif nums: st['generated_states'],st['distinct_states'],st['queue_depth']=map(int,nums[-1])
 else: st['generated_states']=st['distinct_states']=0; st['queue_depth']=None
 depths=re.findall(r'(?mi)^The depth of the complete state graph(?: search)? is (\d+)\.',text)
 st['max_depth']=int(depths[-1]) if depths else None
@@ -325,7 +353,12 @@ elif phase=='temporal': target_diag=first=='Error: Temporal properties were viol
 elif phase=='deadlock': target_diag=first=='Error: Deadlock reached.'
 else: target_diag=clean
 st['diagnostic_result']=target_diag; st['expected_exit_match']=rc==int(r['expected_exit'])
-st['complete_state_space']=bool(clean and st['queue_depth']==0 and nums)
+if os.environ['SEARCH_MODE']=='dfid':
+ # TLC reports ordinary success at DFID_MAX even when deeper states exist.
+ # Only a clean stop strictly before the configured bound is exact.
+ st['complete_state_space']=bool(clean and st['dfid_last_level'] is not None and not st['dfid_reached_limit'])
+else:
+ st['complete_state_space']=bool(clean and st['queue_depth']==0 and nums)
 st['required_properties_proven']=bool(clean and (not req or dclass=='clean-completion'))
 if req and int(r['expected_exit'])==0:
  st['target_coverage_observed']=st['required_properties_proven']
@@ -352,7 +385,7 @@ else:
  elif dclass in {'no-diagnostic','tool-or-runtime','syntax-semantic'}: st['status']='fail'; reasons.append('unexpected diagnostic class')
  else: st['status']='fail'; reasons.append('completed control did not match exact expected result')
 st['status_reasons']=reasons
-st['full_argv']=['java','-XX:+UseParallelGC','-cp',os.environ['JAR'],'tlc2.TLC','-workers',os.environ['TLC_WORKERS'],'-seed',os.environ['TLC_SEED'],'-fp',os.environ['TLC_FP_INDEX'],'-coverage','1','-metadir',str(state/'states'/r['id']),'-config',r['config'],r['module']]
+st['full_argv']=['java']+os.environ['JAVA_ARGS'].split()+['-cp',os.environ['JAR'],'tlc2.TLC','-workers',os.environ['TLC_WORKERS'],'-seed',os.environ['TLC_SEED'],'-fp',os.environ['TLC_FP_INDEX'],'-coverage','1']+os.environ['SEARCH_ARGS'].split()+['-metadir',str(state/'states'/r['id']),'-config',r['config'],r['module']]
 st['cwd']=str(root/'cache/formal')
 out.write_text(json.dumps(st,sort_keys=True)+'\n')
 PY
@@ -367,10 +400,15 @@ PY
 SELF=$(printenv RUNNER_SELF_CONTROLS 2>/dev/null || true); test -n "$SELF" || SELF=1
 if test "$SELF" = 1; then
   python3 - "$STATE/self-controls.txt" <<'PY'
-def decide(r,rc,signal,clean,queue,target,ant,coverage,first):
+def decide(r,rc,signal,clean,queue,target,ant,coverage,first,search='bfs',last_level=None,dfid_max=0):
  if rc==125: return 'not-started'
  if signal=='timeout': return 'hold-timeout'
- if r['expected_exit']==0: return 'pass' if rc==0 and clean and queue==0 and target and ant and coverage and first=='clean' else 'hold'
+ if r['expected_exit']==0:
+  if search=='dfid':
+   complete=clean and last_level is not None and last_level < dfid_max
+  else:
+   complete=clean and queue==0
+  return 'pass' if rc==0 and complete and target and ant and coverage and first=='clean' else 'hold'
  return 'pass' if rc==r['expected_exit'] and first==r['expected_phase'] and target and ant and coverage else 'fail'
 cases=[
  ({'expected_exit':0,'expected_phase':'clean'},0,'none',True,0,True,True,True,'clean'),
@@ -385,8 +423,10 @@ assert decide(*cases[0])=='pass'
 assert decide(*cases[1])!='pass' and decide(*cases[2])!='pass' and decide(*cases[3])!='pass'
 assert decide(*cases[4])=='pass' and decide(*cases[5])!='pass'
 assert decide(*cases[6])=='hold-timeout' and decide(*cases[7])=='not-started'
-open(__import__('sys').argv[1],'w').write('SELF_CONTROLS pass wrong-exit wrong-diagnostic zero-count-coverage unrelated-first timeout resume clean-success\n')
-print('SELF_CONTROLS pass wrong-exit wrong-diagnostic zero-count-coverage unrelated-first timeout resume clean-success')
+assert decide({'expected_exit':0,'expected_phase':'clean'},0,'none',True,None,True,True,True,'clean','dfid',2,3)=='pass'
+assert decide({'expected_exit':0,'expected_phase':'clean'},0,'none',True,None,True,True,True,'clean','dfid',3,3)=='hold'
+open(__import__('sys').argv[1],'w').write('SELF_CONTROLS pass wrong-exit wrong-diagnostic zero-count-coverage unrelated-first timeout resume clean-success dfid-early-complete dfid-limit-hold\n')
+print('SELF_CONTROLS pass wrong-exit wrong-diagnostic zero-count-coverage unrelated-first timeout resume clean-success dfid-early-complete dfid-limit-hold')
 PY
 fi
 
@@ -402,12 +442,12 @@ for x in m.read_text().splitlines():
 c={x:sum(r['status']==x for r in rows) for x in ('pass','hold','hold-timeout','fail','not-started')}
 selected=sum(r['status']!='not-started' for r in rows); full=selected==len(rows)
 status='PASS' if full and c['hold']==c['hold-timeout']==c['fail']==c['not-started']==0 and os.environ['SANY_STATUS']=='pass' else 'HOLD'
-json.dump({'status':status,'sany_status':os.environ['SANY_STATUS'],'sany_raw_exit':int(os.environ['SANY_RC']),'declared_rows':len(rows),'selected_rows':selected,'complete_matrix':full,'counts':c,'utc_end':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())},open(s/'suite-summary.json','w'),sort_keys=True,indent=2)
+json.dump({'status':status,'sany_status':os.environ['SANY_STATUS'],'sany_raw_exit':int(os.environ['SANY_RC']),'declared_rows':len(rows),'selected_rows':selected,'complete_matrix':full,'counts':c,'search_mode':os.environ['SEARCH_MODE'],'dfid_max':int(os.environ['DFID_MAX']),'utc_end':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())},open(s/'suite-summary.json','w'),sort_keys=True,indent=2)
 PY
 python3 - "$STATE/REPORT.md" "$STATE/suite-summary.json" <<'PY'
 import json,os,sys
 s=json.load(open(sys.argv[2]))
-open(sys.argv[1],'w').write('# S6 ZSTD_ROUTE/FInput composition V5 execution evidence\n\nNeutral formal-model, protocol-engineering, reproducibility and functional-QA evidence only. No S6/product/profile, candidate, merge, landing, tag, deployment or publication authority.\n\n- Commit: %s\n- Tree: %s\n- Sole direct parent: %s\n- Pinned TLC SHA-256: %s\n- Correction spec SHA-256: %s\n- SANY: %s (raw exit %s)\n- Declared/selected rows: %s/%s\n- Matrix status: %s\n- Counts: %s\n- BigOracle issue16 interpretation: HOLD; requested comments 5447981767 and 5448067827 were unavailable in frozen local evidence.\n\nPositive rows require clean completion, zero queue, exact target/property coverage and all declared witness coverage. Controls require exact exit/diagnostic order, source-bound changed marker, nonzero attributable antecedent coverage and target coverage. Timeout and incomplete rows remain HOLD.\n'%(os.environ['COMMIT'],os.environ['TREE'],os.environ['PARENT'],os.environ['JSHA'],os.environ['SPEC_SHA'],s['sany_status'],s['sany_raw_exit'],s['selected_rows'],s['declared_rows'],s['status'],json.dumps(s['counts'],sort_keys=True)))
+open(sys.argv[1],'w').write('# S6 ZSTD_ROUTE/FInput composition V5 execution evidence\n\nNeutral formal-model, protocol-engineering, reproducibility and functional-QA evidence only. No S6/product/profile, candidate, merge, landing, tag, deployment or publication authority.\n\n- Commit: %s\n- Tree: %s\n- Sole direct parent: %s\n- Pinned TLC SHA-256: %s\n- Correction spec SHA-256: %s\n- Search mode: %s (DFID max %s)\n- SANY: %s (raw exit %s)\n- Declared/selected rows: %s/%s\n- Matrix status: %s\n- Counts: %s\n- BigOracle issue16 interpretation: HOLD; requested comments 5447981767 and 5448067827 were unavailable in frozen local evidence.\n\nPositive rows require clean completion, zero queue (BFS), or a clean DFID stop strictly before the configured maximum depth, exact target/property coverage and all declared witness coverage. Controls require exact exit/diagnostic order, source-bound changed marker, nonzero attributable antecedent coverage and target coverage. Timeout, max-depth-limited, and incomplete rows remain HOLD.\n'%(os.environ['COMMIT'],os.environ['TREE'],os.environ['PARENT'],os.environ['JSHA'],os.environ['SPEC_SHA'],os.environ['SEARCH_MODE'],os.environ['DFID_MAX'],s['sany_status'],s['sany_raw_exit'],s['selected_rows'],s['declared_rows'],s['status'],json.dumps(s['counts'],sort_keys=True)))
 PY
 
 tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner -cf "$STATE/source-archive-1.tar" -C "$STATE/inputs" .
