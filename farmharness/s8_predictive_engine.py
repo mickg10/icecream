@@ -24,13 +24,15 @@ from typing import Any
 
 try:  # Works both as a module and as a directly invoked harness script.
     from .s8_schema import (
-        CALIBRATION_CORPORA, CORPORA, CURRENT_SEMANTICS, DECLARED_CELLS,
-        HELD_OUT_CORPORA, PROFILES, REGIMES, SPLITS, TOPOLOGIES, DEPTH_CLASSES,
+        ALL_CORPORA, ALL_SPLITS, CALIBRATION_CORPORA, CORPORA, CURRENT_SEMANTICS,
+        DECLARED_CELLS, HELD_OUT_CORPORA, PROFILES, REGIMES, SPLITS, TOPOLOGIES,
+        DEPTH_CLASSES,
     )
 except ImportError:  # pragma: no cover - exercised by direct script runners.
     from s8_schema import (
-        CALIBRATION_CORPORA, CORPORA, CURRENT_SEMANTICS, DECLARED_CELLS,
-        HELD_OUT_CORPORA, PROFILES, REGIMES, SPLITS, TOPOLOGIES, DEPTH_CLASSES,
+        ALL_CORPORA, ALL_SPLITS, CALIBRATION_CORPORA, CORPORA, CURRENT_SEMANTICS,
+        DECLARED_CELLS, HELD_OUT_CORPORA, PROFILES, REGIMES, SPLITS, TOPOLOGIES,
+        DEPTH_CLASSES,
     )
 
 # Compatibility name for callers constructing the default fmt calibration
@@ -85,6 +87,14 @@ CORPUS_MODELS = {
     "DuckDB": {"compile_factor": 1.25},
     "LLVM-1238": {"compile_factor": 1.38},
 }
+# Expanded corpora use the same explicit causal model contract but have no
+# calibration factors.  Their outputs are descriptive-only and remain outside
+# the canonical loss/accuracy/freeze inputs.
+EXPANDED_CORPUS_MODELS = {
+    corpus: {"compile_factor": 1.00}
+    for corpus in ALL_CORPORA if corpus not in CORPORA
+}
+ALL_CORPUS_MODELS = {**CORPUS_MODELS, **EXPANDED_CORPUS_MODELS}
 PROFILE_MODELS = {
     "ZSTD_TU": {"compression_factor": 1.00, "result_fraction": 0.12,
                 "uplink_factor": 1.00, "downlink_factor": 1.00,
@@ -565,10 +575,10 @@ def load_inputs(manifest_path: Path) -> tuple[dict[str, object], bytes, dict[str
     cell = value["cell"]
     if not isinstance(cell, dict) or set(cell) != {"corpus", "profile", "regime"}:
         raise PredictionError("manifest:cell_invalid")
-    if (cell["corpus"] not in CORPORA or cell["profile"] not in PROFILES or
+    if (cell["corpus"] not in ALL_CORPORA or cell["profile"] not in PROFILES or
             cell["regime"] not in REGIMES):
         raise PredictionError("manifest:cell_not_declared")
-    if value["split"] != SPLITS[cell["corpus"]] or value["predictive_mode"] is not True:
+    if value["split"] != ALL_SPLITS[cell["corpus"]] or value["predictive_mode"] is not True:
         raise PredictionError("manifest:cell_split_or_predictive_mode_invalid")
     base = manifest_path.parent
     input_path = _artifact_path(base, value["input"], "input")
@@ -649,7 +659,7 @@ def _predict_curve(raw: bytes, topology: dict[str, object], cell: dict[str, str]
     t = topology["topology"]
     assert isinstance(t, dict)
     c_workers, f_workers = int(t["c_workers"]), int(t["f_workers"])
-    corpus_model = CORPUS_MODELS[cell["corpus"]]
+    corpus_model = ALL_CORPUS_MODELS[cell["corpus"]]
     profile_model = PROFILE_MODELS[cell["profile"]]
     regime_model = REGIME_MODELS[cell["regime"]]
     channel_model = CHANNEL_MODELS[t["cache_channel"]]
@@ -921,6 +931,8 @@ def predict(manifest_path: Path, out_path: Path, sim_binary: Path | None = None,
     """
     del sim_binary
     manifest, input_raw, input_facts, topology_facts, manifest_sha, topology, cell = load_inputs(manifest_path)
+    if calibration_bundle is not None and cell["corpus"] not in CORPORA:
+        raise PredictionError("expanded_descriptive:calibration_not_permitted")
     calibration = load_calibration_bundle(calibration_bundle) if calibration_bundle is not None else None
     resolved_calibration_topology = (_resolve_calibration_topology(topology, calibration_topology)
                                      if calibration is not None else calibration_topology)
@@ -943,7 +955,7 @@ def predict(manifest_path: Path, out_path: Path, sim_binary: Path | None = None,
             "version": calibration["model_id"] if calibration is not None else BASE_MODEL["id"],
             "base_model_id": BASE_MODEL["id"],
             "route_trace_consumed": False, "action_trace_input": False,
-            "model_assumptions": {"base": BASE_MODEL, "corpus": CORPUS_MODELS[cell["corpus"]],
+            "model_assumptions": {"base": BASE_MODEL, "corpus": ALL_CORPUS_MODELS[cell["corpus"]],
                                   "profile": PROFILE_MODELS[cell["profile"]],
                                   "regime": REGIME_MODELS[cell["regime"]]},
             **({"calibration": {

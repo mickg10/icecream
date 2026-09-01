@@ -209,10 +209,9 @@ def _finite_float(value: str, label: str) -> float:
 
 
 def _cell(corpus: str, profile: str, regime: str) -> dict[str, str]:
-    # Expanded corpora are admitted only to the dedicated RAW_II descriptive
-    # control.  Compressed profiles remain canonical four-corpus cells.
-    corpus_allowed = corpus in CORPORA or (
-        corpus in ALL_CORPORA and profile in CONTROL_PROFILES)
+    # Expanded corpora are admitted to the descriptive execution scope.  They
+    # remain outside DECLARED_CELLS and canonical calibration/accuracy.
+    corpus_allowed = corpus in ALL_CORPORA
     if (not corpus_allowed or profile not in (*PROFILES, *CONTROL_PROFILES) or
             regime not in REGIMES):
         raise DepthPlanError("cell:undeclared")
@@ -319,13 +318,13 @@ def _matrix_precondition(path: Path, cell: dict[str, str]) -> dict[str, Any]:
     # RAW_II is an explicit control profile outside the four-profile matrix;
     # it still consumes the strict parser and summary authentication, while
     # compressed profiles require every canonical cell before planning.
-    if cell["profile"] in CONTROL_PROFILES:
+    if cell["profile"] in CONTROL_PROFILES or cell["corpus"] not in CORPORA:
         _validate_matrix_summary(value)
     else:
         _validate_matrix_audit(value)
     cells = value.get("cells")
     cell_id = "/".join(cell[field] for field in ("corpus", "profile", "regime"))
-    if (cell["profile"] not in CONTROL_PROFILES and
+    if (cell["profile"] not in CONTROL_PROFILES and cell["corpus"] in CORPORA and
             (not isinstance(cells, list) or not any(
                 isinstance(row, dict) and row.get("cell") == cell_id and
                 row.get("split") == SPLITS[cell["corpus"]] for row in cells))):

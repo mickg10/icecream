@@ -16,7 +16,7 @@ from s8_predictive_engine import (
     new_relationship_state, predict_sequential, PredictionError,
 )
 from s8_multitu_predictive_producer import MultiTUPredictiveError, produce, produce_pair
-from s8_schema import CORPORA, PROFILES, REGIMES, SPLITS
+from s8_schema import ALL_SPLITS, CORPORA, PROFILES, REGIMES, SPLITS
 
 
 def _write(path: Path, raw: bytes | str) -> None:
@@ -56,7 +56,7 @@ def _template(path: Path, cell: dict[str, str]) -> Path:
                             "bytes": p.stat().st_size}
     manifest = {
         "schema": MANIFEST_SCHEMA, "semantics": SEMANTICS, "cell": cell,
-        "split": SPLITS[cell["corpus"]], "predictive_mode": True,
+        "split": ALL_SPLITS[cell["corpus"]], "predictive_mode": True,
         "input": descriptor(input_path), "topology_state": descriptor(topology_path),
     }
     manifest_path = path / "engine-manifest.json"
@@ -77,13 +77,14 @@ def _source(tmp_path: Path, count: int) -> tuple[Path, Path]:
 
 
 def _plan(tmp_path: Path, count: int, depth: int | str, suffix: str,
-          regime: str = "cold", profile: str = "P29", topology: str = "C1F1") -> Path:
+          regime: str = "cold", profile: str = "P29", topology: str = "C1F1",
+          corpus: str = "DuckDB") -> Path:
     root, manifest = _source(tmp_path, count)
     matrix = tmp_path / "matrix.json"
     _matrix(matrix)
-    result_dir = tmp_path / f"s8-DuckDB-{profile}-{regime}-20260829T000000Z-{suffix}"
+    result_dir = tmp_path / f"s8-{corpus}-{profile}-{regime}-20260829T000000Z-{suffix}"
     value = depth_runner.build_plan(manifest, root, matrix, result_dir,
-                                    "DuckDB", profile, regime, depth, topology=topology)
+                                    corpus, profile, regime, depth, topology=topology)
     plan_path = tmp_path / f"{suffix}-plan.json"
     _write(plan_path, canonical_bytes(value) + b"\n")
     return plan_path
@@ -180,6 +181,22 @@ def test_producer_emits_100_ordered_points_and_continuous_relationship(tmp_path:
         row["channel_bytes"]["total"] for row in rows)
     assert result["live_observation"].startswith("not_emitted")
     assert not (output / "live_summary.jsonl").exists()
+
+
+def test_expanded_compressed_curve_is_descriptive_and_canonical_consumer_rejects(
+        tmp_path: Path) -> None:
+    plan_path = _plan(tmp_path / "opencv", 3, 3, "expanded", profile="ZSTD_TU",
+                      corpus="OpenCV")
+    manifest = _template(tmp_path / "template-opencv",
+                         {"corpus": "OpenCV", "profile": "ZSTD_TU", "regime": "cold"})
+    result = _produce(plan_path, manifest)
+    output = Path(json.loads(plan_path.read_bytes())["result"]["directory"])
+    curve_manifest = output / "predictive_curve_manifest.json"
+    value = json.loads(curve_manifest.read_bytes())
+    assert result["identity"]["split"] == "expanded_descriptive"
+    assert value["identity"]["split"] == "expanded_descriptive"
+    with pytest.raises(normalizer.NormalizationError, match="identity.split"):
+        normalizer._load_manifest(curve_manifest, "predictive_sim")
 
 
 def test_short_corpus_repeated_build_occurrences_produce_distinct_curve_points(

@@ -28,13 +28,13 @@ try:
     from . import s8_depth_runner as depth_runner
     from . import s8_predictive_engine as engine
     from . import s8_predictive_live_normalizer as normalizer
-    from .s8_schema import CURRENT_SEMANTICS, CORPORA, PROFILES, REGIMES, SPLITS
+    from .s8_schema import ALL_CORPORA, ALL_SPLITS, CORPORA, CURRENT_SEMANTICS, PROFILES, REGIMES
     from .s8_predictive_live_normalizer import MANIFEST_SCHEMA as CURVE_MANIFEST_SCHEMA
 except ImportError:  # pragma: no cover
     import s8_depth_runner as depth_runner
     import s8_predictive_engine as engine
     import s8_predictive_live_normalizer as normalizer
-    from s8_schema import CURRENT_SEMANTICS, CORPORA, PROFILES, REGIMES, SPLITS
+    from s8_schema import ALL_CORPORA, ALL_SPLITS, CORPORA, CURRENT_SEMANTICS, PROFILES, REGIMES
     from s8_predictive_live_normalizer import MANIFEST_SCHEMA as CURVE_MANIFEST_SCHEMA
 
 
@@ -164,12 +164,16 @@ def _descriptor(path: Path, label: str) -> dict[str, object]:
 def _check_cell(plan: dict[str, object]) -> dict[str, str]:
     cell = plan.get("cell")
     if (not isinstance(cell, dict) or set(cell) != {"corpus", "profile", "regime"} or
-            cell.get("corpus") not in CORPORA or cell.get("profile") not in PROFILES or
+            cell.get("corpus") not in ALL_CORPORA or cell.get("profile") not in PROFILES or
             cell.get("regime") not in REGIMES):
         raise MultiTUPredictiveError("plan:cell_invalid")
-    expected = SPLITS[cell["corpus"]]
+    expected = ALL_SPLITS[cell["corpus"]]
     if plan.get("split") != expected:
         raise MultiTUPredictiveError("plan:split_policy_mismatch")
+    expected_scope = ("canonical_s8" if cell["corpus"] in CORPORA
+                     else "expanded_descriptive")
+    if plan.get("evaluation_scope") != expected_scope:
+        raise MultiTUPredictiveError("plan:evaluation_scope_mismatch")
     return {key: str(cell[key]) for key in ("corpus", "profile", "regime")}
 
 
@@ -908,7 +912,7 @@ def _emit_product_segment(plan: dict[str, object], plan_facts: dict[str, object]
     curve_raw = b"".join(canonical_bytes(row) + b"\n" for row in rows)
     curve_sha = hashlib.sha256(curve_raw).hexdigest()
     identity = {"corpus": cell["corpus"], "profile": cell["profile"],
-                "regime": cell["regime"], "split": SPLITS[cell["corpus"]],
+                "regime": cell["regime"], "split": ALL_SPLITS[cell["corpus"]],
                 "run_id": f"{directory.name}-{plan_facts['plan']['sha256'][:12]}",
                 "source_commit": source_commit, "source_tree": source_tree,
                 "input_digest": input_digest, "topology_digest": topology_digest,
@@ -926,7 +930,7 @@ def _emit_product_segment(plan: dict[str, object], plan_facts: dict[str, object]
                                      "trace_free": True}}
     curve_manifest_raw = canonical_bytes(curve_manifest) + b"\n"
     producer = {"schema": SCHEMA, "semantics": SEMANTICS, "cell": cell,
-                "split": SPLITS[cell["corpus"]], "identity": identity,
+                "split": ALL_SPLITS[cell["corpus"]], "identity": identity,
                 "request": plan["request"], "paired_continuation": continuation,
                 "excluded_prewarms": excluded_prewarms,
                 "plan": {"path": plan_facts["plan"]["path"],
@@ -1010,8 +1014,10 @@ def produce(plan_path: Path, engine_manifest: Path, product_build_root: Path,
         product_build_root, sim_binary)
     _require_profile_build(cell, build_facts)
     manifest, _template_raw, _template_input, topology_facts, template_sha, topology, template_cell = engine.load_inputs(engine_manifest)
-    if template_cell != cell or manifest["split"] != SPLITS[cell["corpus"]]:
+    if template_cell != cell or manifest["split"] != ALL_SPLITS[cell["corpus"]]:
         raise MultiTUPredictiveError("engine_manifest:cell_or_split_mismatch")
+    if calibration_bundle is not None and cell["corpus"] not in CORPORA:
+        raise MultiTUPredictiveError("expanded_descriptive:calibration_not_permitted")
     calibration = (engine.load_calibration_bundle(calibration_bundle)
                    if calibration_bundle is not None else None)
     if calibration is not None:
@@ -1040,7 +1046,7 @@ def produce(plan_path: Path, engine_manifest: Path, product_build_root: Path,
     input_digest = hashlib.sha256(canonical_bytes(aggregate_input)).hexdigest()
     run_id = f"{output_dir.name}-{plan_facts['plan']['sha256'][:12]}"
     identity = {"corpus": cell["corpus"], "profile": cell["profile"],
-                "regime": cell["regime"], "split": SPLITS[cell["corpus"]],
+                "regime": cell["regime"], "split": ALL_SPLITS[cell["corpus"]],
                 "run_id": run_id, "source_commit": source_commit,
                 "source_tree": source_tree, "input_digest": input_digest,
                 "topology_digest": topology_digest, "model_id": model_id}
@@ -1114,8 +1120,10 @@ def produce_pair(first_plan_path: Path, repeat_plan_path: Path, engine_manifest:
         product_build_root, sim_binary)
     _require_profile_build(cell, build_facts)
     manifest, _template_raw, _template_input, topology_facts, template_sha, topology, template_cell = engine.load_inputs(engine_manifest)
-    if template_cell != cell or manifest["split"] != SPLITS[cell["corpus"]]:
+    if template_cell != cell or manifest["split"] != ALL_SPLITS[cell["corpus"]]:
         raise MultiTUPredictiveError("engine_manifest:cell_or_split_mismatch")
+    if calibration_bundle is not None and cell["corpus"] not in CORPORA:
+        raise MultiTUPredictiveError("expanded_descriptive:calibration_not_permitted")
     calibration = (engine.load_calibration_bundle(calibration_bundle)
                    if calibration_bundle is not None else None)
     if calibration is not None:
