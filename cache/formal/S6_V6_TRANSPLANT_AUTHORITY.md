@@ -29,8 +29,12 @@ uses only core-05, core-18, core-19, the general composition row, and the five
 composition safety deletion rows.
 
 The runner has one local, review-only delta from its c06a7cfe blob: when
-S6_TRANSPLANT_REVIEW=1 it requires HEAD to equal b702a35cf4060a560135d488e51b2d39d2fd3526
-and requires this authority map. The normal exact-V6-parent gate is unchanged.
+S6_TRANSPLANT_REVIEW=1 it requires b702a35cf4060a560135d488e51b2d39d2fd3526
+to be the merge-base ancestor and requires this authority map. The normal
+exact-V6-parent gate is unchanged.
+The review runner also classifies TLC's initial-invariant diagnostic form
+Error: The invariant of NAME is equal to FALSE as initial-invariant; this is
+diagnostic normalization only and does not alter expected exits or properties.
 
 The transplant is intentionally not a production implementation. It supplies
 the missing formal assets needed to reproduce and review the named rows on

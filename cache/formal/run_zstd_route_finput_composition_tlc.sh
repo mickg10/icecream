@@ -188,7 +188,7 @@ st['observed_diagnostics']=list(dict.fromkeys(errors+(['Model checking completed
 st['first_failure_diagnostic']=errors[0] if errors else None
 first=st['first_failure_diagnostic'] or ''
 if not first: dclass='clean-completion' if clean else ('timeout' if sig=='timeout' else 'no-diagnostic')
-elif first.startswith('Error: Invariant '): dclass='initial-invariant' if r.get('expected_phase')=='initial-invariant' or 'initial state' in first else 'invariant'
+elif first.startswith('Error: Invariant ') or first.startswith('Error: The invariant of '): dclass='initial-invariant' if r.get('expected_phase')=='initial-invariant' or 'initial state' in first else 'invariant'
 elif first.startswith('Error: Temporal properties were violated.'): dclass='temporal'
 elif first.startswith('Error: Deadlock reached.'): dclass='deadlock'
 elif 'Parsing or semantic analysis failed' in text or 'unexpected exception' in first: dclass='syntax-semantic'
