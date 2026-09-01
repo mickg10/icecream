@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -150,9 +151,11 @@ def _raw_authority_fixture(tmp_path: Path, inventory: Path, *, rows: str = "full
         file_cell["regime"] = "warm"
     witness_value = {"schema": planner.RAW_II_WITNESS_SCHEMA,
                      "semantics": planner.RAW_II_SEMANTICS, "cell": file_cell,
+                     "split": "held_out_validation",
                      "formula": planner.RAW_II_FORMULA, "rows": witness_rows}
     engine_value = {"schema": planner.RAW_II_ENGINE_SCHEMA,
                     "semantics": planner.RAW_II_SEMANTICS, "cell": file_cell,
+                    "split": "held_out_validation",
                     "control_baseline": planner.RAW_II_BASELINE,
                     "engine_scope": "raw_ii_control_engine", "model_id": "fixture-v1",
                     "rows": engine_rows}
@@ -457,3 +460,196 @@ def test_raw_ii_authority_mutated_file_fails_closed(tmp_path: Path) -> None:
             current_image_id="sha256:" + "a" * 64,
             raw_ii_authority_manifest=authority,
             raw_ii_authority_manifest_sha256=authority_sha)
+
+
+@pytest.mark.parametrize(("kind", "field", "match"), [
+    ("witness", "split", "scope_invalid"),
+    ("engine", "split", "scope_invalid"),
+    ("engine", "model_id", "model_id_invalid"),
+])
+def test_raw_ii_authority_matches_producer_contract(tmp_path: Path, kind: str,
+                                                     field: str, match: str) -> None:
+    inventory, recovery, recovery_sha, matrix, matrix_sha = _authority(tmp_path / "authority")
+    authority, authority_sha = _raw_authority_fixture(tmp_path / "raw", inventory)
+    value = json.loads(authority.read_text())
+    file_path = Path(value["cells"][0][kind]["path"])
+    file_value = json.loads(file_path.read_text())
+    file_value.pop(field)
+    file_path.write_bytes(planner._canonical(file_value))
+    value["cells"][0][kind] = {
+        "path": str(file_path), "bytes": file_path.stat().st_size,
+        "sha256": hashlib.sha256(file_path.read_bytes()).hexdigest(),
+    }
+    authority.write_bytes(planner._canonical(value))
+    with pytest.raises(planner.PlannerError, match=match):
+        planner.plan_campaign(
+            inventory, recovery, recovery_sha, matrix, matrix_sha, tmp_path / "out",
+            "20260829T000000Z", current_image_name="image:tag",
+            current_image_id="sha256:" + "a" * 64,
+            raw_ii_authority_manifest=authority,
+            raw_ii_authority_manifest_sha256=hashlib.sha256(authority.read_bytes()).hexdigest())
+
+
+def test_raw_ii_authority_rejects_witness_engine_split_substitution(tmp_path: Path) -> None:
+    inventory, recovery, recovery_sha, matrix, matrix_sha = _authority(tmp_path / "authority")
+    authority, _ = _raw_authority_fixture(tmp_path / "raw", inventory)
+    value = json.loads(authority.read_text())
+    engine_path = Path(value["cells"][0]["engine"]["path"])
+    engine_value = json.loads(engine_path.read_text())
+    engine_value["split"] = "calibration"
+    engine_path.write_bytes(planner._canonical(engine_value))
+    value["cells"][0]["engine"] = {
+        "path": str(engine_path), "bytes": engine_path.stat().st_size,
+        "sha256": hashlib.sha256(engine_path.read_bytes()).hexdigest(),
+    }
+    authority.write_bytes(planner._canonical(value))
+    with pytest.raises(planner.PlannerError, match="split_mismatch"):
+        planner.plan_campaign(
+            inventory, recovery, recovery_sha, matrix, matrix_sha, tmp_path / "out",
+            "20260829T000000Z", current_image_name="image:tag",
+            current_image_id="sha256:" + "a" * 64,
+            raw_ii_authority_manifest=authority,
+            raw_ii_authority_manifest_sha256=hashlib.sha256(authority.read_bytes()).hexdigest())
+
+
+@pytest.mark.parametrize(("mutation", "match"), [
+    ("commit", "source_identity_invalid"),
+    ("path", "producer_source_invalid"),
+])
+def test_raw_ii_authority_malformed_source_is_planner_error(tmp_path: Path,
+                                                             mutation: str, match: str) -> None:
+    inventory, recovery, recovery_sha, matrix, matrix_sha = _authority(tmp_path / "authority")
+    authority, _ = _raw_authority_fixture(tmp_path / "raw", inventory)
+    value = json.loads(authority.read_text())
+    if mutation == "commit":
+        value["producer_source"].pop("commit")
+    else:
+        value["producer_source"].pop("path")
+    authority.write_bytes(planner._canonical(value))
+    with pytest.raises(planner.PlannerError, match=match):
+        planner.plan_campaign(
+            inventory, recovery, recovery_sha, matrix, matrix_sha, tmp_path / "out",
+            "20260829T000000Z", current_image_name="image:tag",
+            current_image_id="sha256:" + "a" * 64,
+            raw_ii_authority_manifest=authority,
+            raw_ii_authority_manifest_sha256=hashlib.sha256(authority.read_bytes()).hexdigest())
+
+
+@pytest.mark.parametrize("mutation", ["witness_descriptor", "cell_type"])
+def test_raw_ii_authority_malformed_nested_types_are_planner_error(
+        tmp_path: Path, mutation: str) -> None:
+    inventory, recovery, recovery_sha, matrix, matrix_sha = _authority(tmp_path / "authority")
+    authority, _ = _raw_authority_fixture(tmp_path / "raw", inventory)
+    value = json.loads(authority.read_text())
+    if mutation == "witness_descriptor":
+        value["cells"][0]["witness"] = None
+        match = "cell_file_descriptor_invalid"
+    else:
+        value["cells"][0]["cell"]["corpus"] = []
+        match = "cell_scope_invalid"
+    authority.write_bytes(planner._canonical(value))
+    with pytest.raises(planner.PlannerError, match=match):
+        planner.plan_campaign(
+            inventory, recovery, recovery_sha, matrix, matrix_sha, tmp_path / "out",
+            "20260829T000000Z", current_image_name="image:tag",
+            current_image_id="sha256:" + "a" * 64,
+            raw_ii_authority_manifest=authority,
+            raw_ii_authority_manifest_sha256=hashlib.sha256(authority.read_bytes()).hexdigest())
+
+
+def test_raw_ii_authority_symlink_swap_and_in_place_mutation_fail_closed(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    inventory, recovery, recovery_sha, matrix, matrix_sha = _authority(tmp_path / "authority")
+    authority, _ = _raw_authority_fixture(tmp_path / "raw", inventory)
+    value = json.loads(authority.read_text())
+    target = Path(value["cells"][0]["witness"]["path"])
+    replacement = target.with_name("replacement.json")
+    replacement.write_bytes(target.read_bytes())
+    target.unlink()
+    target.symlink_to(replacement)
+    with pytest.raises(planner.PlannerError, match="raw_ii_witness:not_private_regular_file"):
+        planner.plan_campaign(
+            inventory, recovery, recovery_sha, matrix, matrix_sha, tmp_path / "out-symlink",
+            "20260829T000000Z", current_image_name="image:tag",
+            current_image_id="sha256:" + "a" * 64,
+            raw_ii_authority_manifest=authority,
+            raw_ii_authority_manifest_sha256=hashlib.sha256(authority.read_bytes()).hexdigest())
+
+    authority, _ = _raw_authority_fixture(tmp_path / "raw2", inventory)
+    value = json.loads(authority.read_text())
+    target = Path(value["cells"][0]["witness"]["path"])
+    original_open = planner.os.open
+    original_read = planner.os.read
+    opened: dict[int, Path] = {}
+    changed = False
+
+    def tracked_open(path: object, flags: int, *args: object) -> int:
+        fd = original_open(path, flags, *args)
+        opened[fd] = Path(path)
+        return fd
+
+    def mutate_read(fd: int, size: int) -> bytes:
+        nonlocal changed
+        result = original_read(fd, size)
+        if not changed and opened.get(fd) == target and result:
+            changed = True
+            target.write_bytes(target.read_bytes() + b"mutated")
+        return result
+
+    monkeypatch.setattr(planner.os, "open", tracked_open)
+    monkeypatch.setattr(planner.os, "read", mutate_read)
+    with pytest.raises(planner.PlannerError,
+                       match="raw_ii_witness:(mutated_during_read|not_private_regular_file)"):
+        planner.plan_campaign(
+            inventory, recovery, recovery_sha, matrix, matrix_sha, tmp_path / "out-mutated",
+            "20260829T000000Z", current_image_name="image:tag",
+            current_image_id="sha256:" + "a" * 64,
+            raw_ii_authority_manifest=authority,
+            raw_ii_authority_manifest_sha256=hashlib.sha256(authority.read_bytes()).hexdigest())
+
+
+def test_raw_ii_authority_swap_after_open_fails_closed(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    inventory, recovery, recovery_sha, matrix, matrix_sha = _authority(tmp_path / "authority")
+    authority, _ = _raw_authority_fixture(tmp_path / "raw", inventory)
+    value = json.loads(authority.read_text())
+    target = Path(value["cells"][0]["witness"]["path"])
+    replacement = target.with_name("replacement.json")
+    replacement.write_bytes(target.read_bytes())
+    original_open = planner.os.open
+    swapped = False
+
+    def swap_after_open(path: object, flags: int, *args: object) -> int:
+        nonlocal swapped
+        fd = original_open(path, flags, *args)
+        if not swapped and Path(path) == target:
+            swapped = True
+            os.replace(replacement, target)
+        return fd
+
+    monkeypatch.setattr(planner.os, "open", swap_after_open)
+    with pytest.raises(planner.PlannerError,
+                       match="raw_ii_witness:(mutated_during_read|not_private_regular_file)"):
+        planner.plan_campaign(
+            inventory, recovery, recovery_sha, matrix, matrix_sha, tmp_path / "out",
+            "20260829T000000Z", current_image_name="image:tag",
+            current_image_id="sha256:" + "a" * 64,
+            raw_ii_authority_manifest=authority,
+            raw_ii_authority_manifest_sha256=hashlib.sha256(authority.read_bytes()).hexdigest())
+
+
+def test_raw_ii_source_mutation_after_git_check_fails_closed(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    capability_path, capability_sha, capability = _capability_fixture(tmp_path)
+    source = Path(capability["source"]["path"])
+    original = planner._git_output
+
+    def mutate_after_status(repo: Path, args: list[str], label: str) -> str:
+        result = original(repo, args, label)
+        if label == "source_git_status_unavailable":
+            source.write_bytes(source.read_bytes() + b"mutated-after-git-check")
+        return result
+
+    monkeypatch.setattr(planner, "_git_output", mutate_after_status)
+    with pytest.raises(planner.PlannerError, match="source_mutated_during_authentication"):
+        planner._load_capability(capability_path, capability_sha)

@@ -37,6 +37,7 @@ RAW_II_FORMULA = {
     "c_to_f": "compile_file_bytes+file_chunk_bytes+end_bytes",
 }
 RAW_II_BASELINE = "icecream-s8-raw-ii-control-baseline-v1"
+RAW_II_SPLITS = frozenset(("calibration", "held_out_validation"))
 TIMESTAMP_RE = re.compile(r"^\d{8}T\d{6}Z$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -179,6 +180,13 @@ def _snapshot_file(path: Path, root: Path, label: str) -> tuple[dict[str, object
 
 def _snapshot_descriptor(path: Path, label: str) -> tuple[dict[str, object], Path]:
     """Hash a declared capability artifact without following its final path."""
+    _, snapshot, resolved = _read_snapshot_descriptor(path, label)
+    return snapshot, resolved
+
+
+def _read_snapshot_descriptor(path: Path, label: str, *, keep_bytes: bool = False
+                              ) -> tuple[bytes, dict[str, object], Path]:
+    """Read and hash one private regular file through a stable descriptor."""
     try:
         path_info = path.lstat()
     except OSError as exc:
@@ -201,11 +209,14 @@ def _snapshot_descriptor(path: Path, label: str) -> tuple[dict[str, object], Pat
                 (before.st_dev, before.st_ino) != (path_info.st_dev, path_info.st_ino)):
             raise PlannerError(f"{label}:not_private_regular_file:{path}")
         digest = hashlib.sha256()
+        chunks: list[bytes] = []
         size = 0
         while True:
             chunk = os.read(fd, 1024 * 1024)
             if not chunk:
                 break
+            if keep_bytes:
+                chunks.append(chunk)
             digest.update(chunk)
             size += len(chunk)
         after = os.fstat(fd)
@@ -227,8 +238,9 @@ def _snapshot_descriptor(path: Path, label: str) -> tuple[dict[str, object], Pat
             raise PlannerError(f"{label}:mutated_during_read:{path}")
     finally:
         os.close(fd)
-    return {"path": str(path), "resolved_path": str(resolved), "bytes": size,
-            "sha256": digest.hexdigest()}, resolved
+    raw = b"".join(chunks)
+    return raw, {"path": str(path), "resolved_path": str(resolved), "bytes": size,
+                 "sha256": digest.hexdigest()}, resolved
 
 
 def _git_output(repo: Path, args: list[str], label: str) -> str:
@@ -241,6 +253,20 @@ def _git_output(repo: Path, args: list[str], label: str) -> str:
 
 
 def _authenticate_capability_source(source: dict[str, object]) -> dict[str, object]:
+    if (not isinstance(source, dict) or
+            not {"path", "bytes", "sha256", "commit"}.issubset(source) or
+            set(source) - {"path", "bytes", "sha256", "commit", "tree"} or
+            not isinstance(source.get("path"), str) or
+            not Path(source["path"]).is_absolute() or
+            type(source.get("bytes")) is not int or source["bytes"] <= 0 or
+            not isinstance(source.get("sha256"), str) or
+            not SHA256_RE.fullmatch(source["sha256"].lower()) or
+            not isinstance(source.get("commit"), str) or
+            not re.fullmatch(r"[0-9a-f]{40}", source["commit"].lower()) or
+            (source.get("tree") is not None and
+             (not isinstance(source.get("tree"), str) or
+              not re.fullmatch(r"[0-9a-f]{40}", source["tree"].lower())))):
+        raise PlannerError("capability_manifest:source_identity_invalid")
     source_path = Path(str(source["path"]))
     if not source_path.is_absolute():
         raise PlannerError("capability_manifest:source_path_not_absolute")
@@ -281,6 +307,15 @@ def _authenticate_capability_source(source: dict[str, object]) -> dict[str, obje
         raise PlannerError("capability_manifest:source_git_blob_unavailable") from exc
     if len(committed) != snapshot["bytes"] or hashlib.sha256(committed).hexdigest() != snapshot["sha256"]:
         raise PlannerError("capability_manifest:source_git_blob_mismatch")
+    final_snapshot, final_resolved = _snapshot_descriptor(
+        source_path, "capability_manifest:source_final")
+    if (final_resolved != resolved or final_snapshot["bytes"] != snapshot["bytes"] or
+            final_snapshot["sha256"] != snapshot["sha256"]):
+        raise PlannerError("capability_manifest:source_mutated_during_authentication")
+    final_status = _git_output(repo, ["status", "--porcelain", "--untracked-files=no"],
+                               "source_git_final_status_unavailable")
+    if final_status:
+        raise PlannerError("capability_manifest:source_git_dirty")
     return {**source, "path": str(source_path), "resolved_path": str(resolved),
             "bytes": snapshot["bytes"], "sha256": snapshot["sha256"],
             "git": {"root": str(repo), "head": head, "tree": tree,
@@ -535,7 +570,7 @@ def _raw_ii_occurrence(value: object, expected: dict[str, object], label: str) -
     return observed
 
 
-def _raw_ii_cell_file(path: Path, descriptor: dict[str, object], cell: dict[str, str],
+def _raw_ii_cell_file(descriptor: object, cell: dict[str, str],
                       expected_occurrences: dict[tuple[int, str, str, int], dict[str, object]],
                       kind: str) -> dict[str, object]:
     """Authenticate one RAW_II witness/engine file and its complete coverage."""
@@ -546,9 +581,9 @@ def _raw_ii_cell_file(path: Path, descriptor: dict[str, object], cell: dict[str,
             not SHA256_RE.fullmatch(descriptor["sha256"].lower())):
         raise PlannerError(f"raw_ii:{kind}_descriptor_invalid:{cell['corpus']}:{cell['regime']}")
     path = Path(descriptor["path"])
-    raw = _private_file(path, f"raw_ii_{kind}")
-    observed = {"path": str(path.resolve()), "bytes": len(raw),
-                "sha256": hashlib.sha256(raw).hexdigest()}
+    raw, snapshot, _ = _read_snapshot_descriptor(path, f"raw_ii_{kind}", keep_bytes=True)
+    observed = {"path": snapshot["path"], "bytes": snapshot["bytes"],
+                "sha256": snapshot["sha256"]}
     if observed["bytes"] != descriptor["bytes"]:
         raise PlannerError(f"raw_ii:{kind}_bytes_mismatch:{cell['corpus']}:{cell['regime']}")
     if observed["sha256"] != str(descriptor["sha256"]).lower():
@@ -560,8 +595,11 @@ def _raw_ii_cell_file(path: Path, descriptor: dict[str, object], cell: dict[str,
     if not isinstance(value, dict):
         raise PlannerError(f"raw_ii:{kind}_object_required:{cell['corpus']}:{cell['regime']}")
     expected_schema = RAW_II_WITNESS_SCHEMA if kind == "witness" else RAW_II_ENGINE_SCHEMA
-    if (value.get("schema") != expected_schema or value.get("semantics") != RAW_II_SEMANTICS or
-            value.get("cell") != cell):
+    if (value.get("schema") != expected_schema or
+            value.get("semantics") != RAW_II_SEMANTICS or
+            value.get("cell") != cell or
+            type(value.get("split")) is not str or
+            value.get("split") not in RAW_II_SPLITS):
         raise PlannerError(f"raw_ii:{kind}_scope_invalid:{cell['corpus']}:{cell['regime']}")
     if kind == "witness" and value.get("formula") != RAW_II_FORMULA:
         raise PlannerError(f"raw_ii:{kind}_scope_invalid:{cell['corpus']}:{cell['regime']}")
@@ -569,6 +607,9 @@ def _raw_ii_cell_file(path: Path, descriptor: dict[str, object], cell: dict[str,
         raise PlannerError(f"raw_ii:{kind}_scope_invalid:{cell['corpus']}:{cell['regime']}")
     if kind == "engine" and value.get("engine_scope") != "raw_ii_control_engine":
         raise PlannerError(f"raw_ii:engine_scope_invalid:{cell['corpus']}:{cell['regime']}")
+    if kind == "engine" and (not isinstance(value.get("model_id"), str) or
+                              re.fullmatch(r"[A-Za-z0-9_.-]+", value["model_id"]) is None):
+        raise PlannerError(f"raw_ii:engine_model_id_invalid:{cell['corpus']}:{cell['regime']}")
     rows = value.get("rows")
     if not isinstance(rows, list) or not rows:
         raise PlannerError(f"raw_ii:{kind}_rows_invalid:{cell['corpus']}:{cell['regime']}")
@@ -614,7 +655,7 @@ def _raw_ii_cell_file(path: Path, descriptor: dict[str, object], cell: dict[str,
         raise PlannerError(f"raw_ii:{kind}_coverage_incomplete:{len(seen)}:{len(expected_keys)}")
     return {"path": observed["path"], "bytes": observed["bytes"],
             "sha256": observed["sha256"], "schema": expected_schema,
-            "coverage": len(seen)}
+            "coverage": len(seen), "split": value["split"]}
 
 
 def _unique_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -658,14 +699,21 @@ def _load_raw_ii_authority(path: Path, expected_sha256: str, corpora: list[dict[
     witness_paths: set[str] = set()
     engine_paths: set[str] = set()
     all_paths: set[str] = set()
+    corpus_splits: dict[str, str] = {}
     for index, entry in enumerate(cells):
         if not isinstance(entry, dict) or set(entry) != {"cell", "witness", "engine"}:
             raise PlannerError(f"raw_ii_authority:cell_invalid:{index}")
         cell = entry["cell"]
         if (not isinstance(cell, dict) or set(cell) != {"corpus", "profile", "regime"} or
-                cell.get("profile") != "RAW_II" or cell.get("regime") not in {"cold", "warm"} or
-                cell.get("corpus") not in expected_cells):
+            type(cell.get("corpus")) is not str or
+            type(cell.get("profile")) is not str or
+            type(cell.get("regime")) is not str or
+            cell.get("profile") != "RAW_II" or cell.get("regime") not in {"cold", "warm"} or
+            cell.get("corpus") not in expected_cells):
             raise PlannerError(f"raw_ii_authority:cell_scope_invalid:{index}")
+        if (not isinstance(entry.get("witness"), dict) or
+                not isinstance(entry.get("engine"), dict)):
+            raise PlannerError(f"raw_ii_authority:cell_file_descriptor_invalid:{index}")
         key = (str(cell["corpus"]), str(cell["regime"]))
         cell_key = f"{key[0]}/{key[1]}"
         if cell_key in authenticated:
@@ -676,10 +724,17 @@ def _load_raw_ii_authority(path: Path, expected_sha256: str, corpora: list[dict[
                 corpus["manifest"]["path"] for corpus in corpora if corpus["manifest_id"] == key[0]))).parent.resolve()))
             expected[(int(item["ordinal"]), relative, str(item["sha256"]).lower(), int(item["bytes"]))] = {
                 **item, "source_relative": relative}
-        witness = _raw_ii_cell_file(Path(str(entry["witness"]["path"])), entry["witness"],
-                                    {"corpus": key[0], "profile": "RAW_II", "regime": key[1]}, expected, "witness")
-        engine = _raw_ii_cell_file(Path(str(entry["engine"]["path"])), entry["engine"],
-                                   {"corpus": key[0], "profile": "RAW_II", "regime": key[1]}, expected, "engine")
+        witness = _raw_ii_cell_file(
+            entry["witness"], {"corpus": key[0], "profile": "RAW_II", "regime": key[1]},
+            expected, "witness")
+        engine = _raw_ii_cell_file(
+            entry["engine"], {"corpus": key[0], "profile": "RAW_II", "regime": key[1]},
+            expected, "engine")
+        if witness["split"] != engine["split"]:
+            raise PlannerError(f"raw_ii_authority:split_mismatch:{key[0]}:{key[1]}")
+        previous_split = corpus_splits.setdefault(key[0], str(witness["split"]))
+        if previous_split != witness["split"]:
+            raise PlannerError(f"raw_ii_authority:corpus_split_mismatch:{key[0]}")
         for descriptor, paths, kind in ((witness, witness_paths, "witness"), (engine, engine_paths, "engine")):
             if str(descriptor["path"]) in paths:
                 raise PlannerError(f"raw_ii_authority:duplicate_{kind}_path")

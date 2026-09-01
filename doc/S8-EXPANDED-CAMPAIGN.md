@@ -91,6 +91,8 @@ For RAW_II, pass `--raw-ii-authority-manifest PATH
 `icecream-s8-raw-ii-planner-authority-v1` manifest binds the dedicated
 producer source and distinct witness/control-engine files for each supplied
 `(corpus, regime)` cell. Each file is private, digest-stable, scoped to
-RAW_II, and must cover every ordered corpus occurrence exactly once. Missing
-or uncovered cells remain `NOT_READY`; P29 and compressed capability inputs
-cannot satisfy this boundary.
+RAW_II, declares the calibration/held-out split required by the producer, and
+must cover every ordered corpus occurrence exactly once. The control-engine
+manifest also requires a valid `[A-Za-z0-9_.-]+` model ID. Missing or
+uncovered cells remain `NOT_READY`; P29 and compressed capability inputs cannot
+satisfy this boundary.
