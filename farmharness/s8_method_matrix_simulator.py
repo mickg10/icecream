@@ -122,20 +122,23 @@ def _private_bytes(path: Path, label: str) -> tuple[bytes, dict[str, object]]:
     return raw, {"path": str(path), "bytes": len(raw), "sha256": _sha256(raw)}
 
 
-def _authenticated_assignment(topology_id: str, count: int) -> dict[str, object]:
+def _authenticated_assignment(topology_id: str, count: int, *, start: int = 0) -> dict[str, object]:
+    if type(start) is not int or start < 0:
+        raise MatrixError("assignment:start_invalid")
     path = AUTH_ASSIGNMENT_PATHS[topology_id]
     assignment_raw, facts = _private_bytes(path, "assignment")
     if facts["sha256"] != AUTH_ASSIGNMENT_SHA256[topology_id]:
         raise MatrixError("assignment:authenticated_digest_mismatch")
     rows = list(csv.DictReader(assignment_raw.decode("utf-8").splitlines(), delimiter="\t"))
-    if not rows or len(rows) < count:
+    if not rows or len(rows) < start + count:
         raise MatrixError("assignment:too_short")
     selected: list[dict[str, object]] = []
     expected_relations = 1 if topology_id == "C1F1/100000" else 20
-    for ordinal, row in enumerate(rows[:count]):
+    for ordinal, row in enumerate(rows[start:start + count]):
         try:
-            if int(row["dispatch_order"]) != ordinal or \
-                    ("tu_seq" in row and int(row["tu_seq"]) != ordinal):
+            dispatch_order = int(row["dispatch_order"])
+            if dispatch_order != start + ordinal or \
+                    ("tu_seq" in row and int(row["tu_seq"]) != dispatch_order):
                 raise MatrixError("assignment:dispatch_order_invalid")
             relation = int(row["worker"])
             # C1F20's two dispatch lanes are authenticated in compiler_slot;
@@ -155,16 +158,20 @@ def _authenticated_assignment(topology_id: str, count: int) -> dict[str, object]
             raise MatrixError("assignment:global_slot_outside_relationships")
         selected.append({"ordinal": ordinal, "global_slot": global_slot,
                          "f_relationship": expected_relation, "per_f_slot": expected_slot,
-                         "dispatch_order": ordinal, "authority_worker": relation,
+                         "dispatch_order": dispatch_order, "authority_worker": relation,
                          "authority_slot": slot, "authority_build": int(row.get("build", 0)),
-                         "authority_logical": int(row.get("logical", ordinal))})
+            "authority_logical": int(row.get("logical", ordinal)),
+                         "authority_dispatch_order": dispatch_order})
     return {"path": facts["path"], "bytes": facts["bytes"], "sha256": facts["sha256"],
             "schema": "root-matrix-v4-assignment-tsv-v1", "topology": topology_id,
             "rows": selected, "selected_count": count}
 
 
 def _native_batch(occurrences: Sequence[Occurrence], topology: MatrixTopology,
-                  assignment: Mapping[str, object], method: str) -> dict[int, dict[str, object]]:
+                  assignment: Mapping[str, object], method: str,
+                  *, predecessor_occurrences: Sequence[Occurrence] = (),
+                  predecessor_assignment: Mapping[str, object] | None = None
+                  ) -> dict[int, dict[str, object]]:
     """Run the actual endpoint transaction for every selected TU."""
     root = Path(__file__).resolve().parents[1]
     binary = root / "cache" / "sim" / ".p50sim.bin"
@@ -173,33 +180,72 @@ def _native_batch(occurrences: Sequence[Occurrence], topology: MatrixTopology,
     rows = assignment.get("rows")
     if not isinstance(rows, list) or len(rows) != len(occurrences):
         raise MatrixError("assignment authority/stream length mismatch")
+    if predecessor_occurrences and (predecessor_assignment is None or
+                                    not predecessor_assignment.get("rows")):
+        raise MatrixError("repeat-full predecessor assignment authority is missing")
+    predecessor_rows = (predecessor_assignment or {}).get("rows", [])
+    if not isinstance(predecessor_rows, list) or len(predecessor_rows) != len(predecessor_occurrences):
+        raise MatrixError("repeat-full predecessor assignment/stream length mismatch")
     with tempfile.TemporaryDirectory(prefix="s8-product-batch-") as scratch:
         scratch_path = Path(scratch)
         manifest = scratch_path / "inputs.manifest"
         mapping = scratch_path / "assignments.map"
+        manifest_2 = scratch_path / "inputs-2.manifest"
+        mapping_2 = scratch_path / "assignments-2.map"
         output = scratch_path / "output.jsonl"
-        manifest.write_text("".join((occurrence.source_path or "") + "\n"
-                                     for occurrence in occurrences), encoding="utf-8")
-        mapping.write_text("cardinality=" + str(topology.relationship_count) + "\n" +
-                           "".join(str(int(item["f_relationship"])) + "\n" for item in rows),
-                           encoding="ascii")
+        def write_segment(manifest_path: Path, mapping_path: Path,
+                          segment_occurrences: Sequence[Occurrence],
+                          segment_rows: list[object]) -> None:
+            if any(not occurrence.source_path for occurrence in segment_occurrences):
+                raise MatrixError("native batch requires authenticated source paths")
+            manifest_path.write_text("".join(str(occurrence.source_path) + "\n"
+                                               for occurrence in segment_occurrences),
+                                     encoding="utf-8")
+            mapping_path.write_text("cardinality=" + str(topology.relationship_count) + "\n" +
+                                    "".join(str(int(item["f_relationship"])) + "\n"
+                                            for item in segment_rows), encoding="ascii")
+        write_segment(manifest, mapping, occurrences, rows)
+        command = [str(binary), "--batch-manifest", str(manifest),
+                   "--batch-assignment-map", str(mapping)]
+        if predecessor_occurrences:
+            write_segment(manifest_2, mapping_2, predecessor_occurrences, predecessor_rows)
+            # The native endpoint processes its first manifest before its
+            # second manifest; pass full-1 first so relationship state carries
+            # into the measured full-2 segment.
+            command = [str(binary), "--batch-manifest", str(manifest_2),
+                       "--batch-assignment-map", str(mapping_2),
+                       "--batch-manifest-2", str(manifest),
+                       "--batch-assignment-map-2", str(mapping)]
+        command += ["--batch-output", str(output), "--batch-allow-repeated-inputs", "1"]
         environment = dict(os.environ)
         environment["ICECC_P50_PROFILE"] = method
         completed = subprocess.run(
-            [str(binary), "--batch-manifest", str(manifest), "--batch-assignment-map", str(mapping),
-             "--batch-output", str(output), "--batch-allow-repeated-inputs", "1"],
+            command,
             env=environment, check=False,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600)
         if completed.returncode != 0:
             raise NotReady("native product transaction failed: " +
                            completed.stderr.decode("utf-8", "replace")[:300])
         result: dict[int, dict[str, object]] = {}
+        predecessor_result: dict[int, dict[str, object]] = {}
+        expected_segment = "full-2" if predecessor_occurrences else "full-1"
         for line in output.read_text(encoding="utf-8").splitlines():
             item = json.loads(line)
+            segment = item.get("segment")
+            if segment not in {"full-1", "full-2"}:
+                continue
             ordinal = int(item["tu_index"])
-            if item.get("committed") is not True or item.get("raw_bytes") != occurrences[ordinal].byte_count():
+            segment_occurrences = (predecessor_occurrences if segment == "full-1" and
+                                   predecessor_occurrences else occurrences)
+            if ordinal >= len(segment_occurrences) or item.get("committed") is not True or \
+                    item.get("raw_bytes") != segment_occurrences[ordinal].byte_count():
                 raise MatrixError("native product commit/input binding invalid")
-            result[ordinal] = item
+            if segment == expected_segment:
+                result[ordinal] = item
+            else:
+                predecessor_result[ordinal] = item
+        if predecessor_occurrences and set(predecessor_result) != set(range(len(predecessor_occurrences))):
+            raise MatrixError("native product predecessor batch is incomplete or reordered")
         if set(result) != set(range(len(occurrences))):
             raise MatrixError("native product batch is incomplete or reordered")
         return result
@@ -380,7 +426,7 @@ class MatrixTopology:
             if relation >= len(self.f_store_guids):
                 raise MatrixError("assignment relationship outside topology")
             guid = self.f_store_guids[relation]
-            if item.get("ordinal") != ordinal or item.get("dispatch_order") != ordinal:
+            if item.get("ordinal") != ordinal:
                 raise MatrixError("assignment dispatch order changed")
         else:
             if f_store_guid is None:
@@ -467,8 +513,10 @@ def assign_relationships(topology: MatrixTopology, occurrences: Sequence[Occurre
                         authority: Mapping[str, object] | None = None) -> list[dict[str, object]]:
     """Deterministically map ordered TUs to C/F relationships."""
     assignments = []
-    for occurrence in occurrences:
-        assignments.append(topology.assignment(occurrence.ordinal,
+    for stream_index, occurrence in enumerate(occurrences):
+        # Assignment ordinal is local to this authenticated segment.  The
+        # occurrence retains the global dispatch/tu_seq identity separately.
+        assignments.append(topology.assignment(stream_index,
                                                 occurrence.f_store_guid,
                                                 occurrence.slot, authority))
     return assignments
@@ -575,12 +623,19 @@ class MethodMatrixSimulator:
 
     def run(self, occurrences: Sequence[Occurrence], *, output_root: Path | None = None,
             timestamp: str | None = None, repeat_full: bool = False,
-            prior_state: Mapping[str, object] | None = None) -> Path | dict[str, object]:
+            prior_state: Mapping[str, object] | None = None,
+            predecessor_occurrences: Sequence[Occurrence] = (),
+            predecessor_assignment_authority: Mapping[str, object] | None = None
+            ) -> Path | dict[str, object]:
         if repeat_full and prior_state is None:
             raise MatrixError("repeat-full requires explicit full-1 state")
+        if repeat_full and (not predecessor_occurrences or
+                            predecessor_assignment_authority is None):
+            raise MatrixError("repeat-full requires authenticated full-1 inputs and assignment")
         if self.assignment_authority.get("status") == "UNBOUND":
+            start = occurrences[0].ordinal if occurrences else 0
             self.assignment_authority = _authenticated_assignment(
-                self.topology.topology_id, len(occurrences))
+                self.topology.topology_id, len(occurrences), start=start)
         if (self.assignment_authority.get("topology") != self.topology.topology_id or
                 int(self.assignment_authority.get("selected_count", len(occurrences))) < len(occurrences)):
             raise MatrixError("assignment authority does not cover stream")
@@ -590,7 +645,9 @@ class MethodMatrixSimulator:
                 if method in {"ZSTD_TU", "P29", "GRZ_RESIDUAL", "ZSTD_ROUTE"} and \
                         self.authority[method]["status"] == "READY":
                     self._native_rows[method] = _native_batch(
-                        occurrences, self.topology, self.assignment_authority, method)
+                        occurrences, self.topology, self.assignment_authority, method,
+                        predecessor_occurrences=predecessor_occurrences if repeat_full else (),
+                        predecessor_assignment=predecessor_assignment_authority if repeat_full else None)
         # Relationship state is method-local.  Sharing this map across methods
         # would make a route prefix leak into a cohort/TU arm and falsely turn
         # distinct methods into aliases.
@@ -659,6 +716,13 @@ class MethodMatrixSimulator:
                                             "source_relative": o.source_relative,
                                             "bytes": o.byte_count(), "sha256": o.source_sha256}
                                             for o in occurrences]},
+                    "predecessor_input_authority": ({"selected_inputs": [
+                        {"ordinal": o.ordinal, "build": o.source_build,
+                         "logical": o.source_logical, "source_relative": o.source_relative,
+                         "bytes": o.byte_count(), "sha256": o.source_sha256}
+                        for o in predecessor_occurrences],
+                        "assignment": predecessor_assignment_authority}
+                        if predecessor_occurrences else None),
                     "artifacts": descriptors,
                     "row_order": [{"ordinal": row["ordinal"], "method": row["method"]}
                                   for row in rows]}
@@ -695,8 +759,11 @@ class MethodMatrixSimulator:
             "topology": self.topology.topology_id, "ordinal": occurrence.ordinal,
             "relationship_key": list(key), "relationship_index": assignment["relationship_index"],
             "slot": assignment["slot"], "global_slot": assignment["global_slot"],
-            "authority_worker": self.assignment_authority.get("rows", [])[occurrence.ordinal].get("authority_worker")
-                if isinstance(self.assignment_authority.get("rows"), list) and occurrence.ordinal < len(self.assignment_authority.get("rows", [])) else None,
+            "authority_worker": assignment.get("authority_worker"),
+            "authority_slot": assignment.get("authority_slot"),
+            "authority_build": assignment.get("authority_build"),
+            "authority_logical": assignment.get("authority_logical"),
+            "authority_dispatch_order": assignment.get("dispatch_order"),
             "raw_bytes": len(raw), "raw_sha256": raw_sha,
             "source_relative": occurrence.source_relative, "source_sha256": occurrence.source_sha256,
             "raw_path": str(raw_path.relative_to(experiment)) if raw_path and experiment else None,
@@ -890,11 +957,11 @@ def verify_experiment(experiment: Path) -> dict[str, object]:
             "artifacts": len(declared)}
 
 
-def firefox_occurrences(trace: Path, *, count: int = 100,
+def firefox_occurrences(trace: Path, *, count: int = 100, dispatch_start: int = 0,
                         corpus_root: Path = AUTH_CORPUS_ROOT,
                         corpus_manifest: Path = AUTH_CORPUS_MANIFEST) -> list[Occurrence]:
     """Load Firefox inputs only after trace, corpus, and every file authenticate."""
-    if type(count) is not int or count <= 0:
+    if type(count) is not int or count <= 0 or type(dispatch_start) is not int or dispatch_start < 0:
         raise MatrixError("requested count must be positive")
     trace_facts = _private_digest(trace, "trace")
     if trace_facts["sha256"] != AUTH_TRACE_SHA256:
@@ -955,14 +1022,14 @@ def firefox_occurrences(trace: Path, *, count: int = 100,
     # Join the authenticated global dispatch authority to trace logical rows.
     # This supports build boundaries and repeat-full without treating a
     # logical reset as a new dispatch identity.
-    authority = _authenticated_assignment("C1F1/100000", count)
+    authority = _authenticated_assignment("C1F1/100000", count, start=dispatch_start)
     result: list[Occurrence] = []
     for item in authority["rows"]:  # type: ignore[union-attr]
         logical = int(item["authority_logical"])
         if logical >= len(trace_occurrences):
             raise MatrixError("assignment:trace_logical_out_of_range")
         base = trace_occurrences[logical]
-        result.append(Occurrence(ordinal=int(item["ordinal"]), raw=base.raw,
+        result.append(Occurrence(ordinal=int(item["dispatch_order"]), raw=base.raw,
                                  source_relative=base.source_relative,
                                  source_sha256=base.source_sha256,
                                  source_path=base.source_path,
@@ -999,22 +1066,63 @@ def write_not_ready_canary(output_root: Path, trace: Path, *, topology: MatrixTo
     return experiment
 
 
+def _authenticated_predecessor_plan(path: Path, topology_id: str) -> tuple[dict[str, object], dict[str, object]]:
+    """Load only authenticated full-1 state/plan; payloads stay external."""
+    try:
+        manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+        summary = json.loads((path / "summary.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise MatrixError("repeat-full predecessor manifest/summary is unavailable") from exc
+    if (manifest.get("schema") != SCHEMA or summary.get("schema") != SUMMARY_SCHEMA or
+            manifest.get("topology", {}).get("id") != topology_id or
+            manifest.get("repeat_full") is not False):
+        raise MatrixError("repeat-full predecessor is not an authenticated full-1 experiment")
+    authority = manifest.get("assignment_authority")
+    if not isinstance(authority, Mapping) or authority.get("topology") != topology_id:
+        raise MatrixError("repeat-full predecessor assignment authority is missing")
+    expected = AUTH_ASSIGNMENT_SHA256[topology_id]
+    facts = _private_digest(Path(str(authority.get("path", ""))), "predecessor_assignment")
+    if facts.get("sha256") != expected or authority.get("sha256") != expected:
+        raise MatrixError("repeat-full predecessor assignment authority changed")
+    return summary, dict(authority)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--firefox-trace", type=Path)
     parser.add_argument("--output-root", type=Path, default=Path("experiments"))
     parser.add_argument("--count", type=int, default=100)
     parser.add_argument("--depth", choices=("100", "200", "full-1", "state-carrying-full-2"))
+    parser.add_argument("--full-1-experiment", type=Path,
+                        help="authenticated full-1 experiment for state-carrying-full-2")
     args = parser.parse_args(argv)
     if args.firefox_trace is None:
         parser.error("--firefox-trace is required")
-    if args.depth == "state-carrying-full-2":
-        parser.error("state-carrying-full-2 requires an authenticated full-1 predecessor plan")
-    count = {None: args.count, "100": 100, "200": 200, "full-1": 2498}[args.depth]
+    if args.depth == "state-carrying-full-2" and args.full_1_experiment is None:
+        parser.error("state-carrying-full-2 requires --full-1-experiment")
+    count = {None: args.count, "100": 100, "200": 200, "full-1": 2498,
+             "state-carrying-full-2": 2498}[args.depth]
     for topology_id in TOPOLOGY_IDS:
         topology = MatrixTopology.from_id(topology_id)
         try:
-            occurrences = firefox_occurrences(args.firefox_trace, count=count)
+            dispatch_start = 2498 if args.depth == "state-carrying-full-2" else 0
+            occurrences = firefox_occurrences(args.firefox_trace, count=count,
+                                               dispatch_start=dispatch_start)
+            if args.depth == "state-carrying-full-2":
+                prior_state, predecessor_authority = _authenticated_predecessor_plan(
+                    args.full_1_experiment, topology_id)
+                predecessor = firefox_occurrences(args.firefox_trace, count=count,
+                                                  dispatch_start=0)
+                current_authority = _authenticated_assignment(
+                    topology_id, count, start=dispatch_start)
+                path = MethodMatrixSimulator(
+                    topology, assignment_authority=current_authority).run(
+                        occurrences, output_root=args.output_root, repeat_full=True,
+                        prior_state=prior_state, predecessor_occurrences=predecessor,
+                        predecessor_assignment_authority=predecessor_authority)
+                assert isinstance(path, Path)
+                print(path)
+                continue
             reason = ""
         except MatrixError as exc:
             occurrences = []

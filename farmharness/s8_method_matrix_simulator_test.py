@@ -13,6 +13,7 @@ from s8_method_matrix_simulator import (
     assign_relationships,
     repeat_full_state_contract,
     _authenticated_assignment,
+    firefox_occurrences,
     verify_experiment,
 )
 
@@ -52,6 +53,15 @@ def test_authenticated_assignment_preserves_build_boundary_and_formula() -> None
     for item in authority["rows"][:100]:
         assert item["f_relationship"] == item["global_slot"] // 2
         assert item["per_f_slot"] == item["global_slot"] % 2
+
+
+def test_firefox_occurrence_keeps_global_dispatch_at_build_boundary() -> None:
+    trace = Path("/tanksmall/scratch/ictmp/lo-s4-e50.G5KsGG/capability/distribution/firefox-corrected.compile-trace.tsv")
+    occurrence = firefox_occurrences(trace, count=1, dispatch_start=2498)[0]
+    assert occurrence.ordinal == 2498
+    assert occurrence.source_build == 1
+    assert occurrence.source_logical == 0
+    assert occurrence.raw is None
 
 
 def test_route_uses_fresh_frames_and_only_commit_advances_prefix(tmp_path: Path) -> None:
