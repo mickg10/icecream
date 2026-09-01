@@ -21,10 +21,12 @@ from typing import Any
 
 try:
     from .s4_version_transition_planner import audit_plan, build_plan
+    from . import s8_depth_runner
     from .s8_campaign_driver import TOPOLOGY_ARGS, _command_record, _safe
     from .s8_schema import CALIBRATION_CORPORA, SPLITS
 except ImportError:  # pragma: no cover
     from s4_version_transition_planner import audit_plan, build_plan
+    import s8_depth_runner
     from s8_campaign_driver import TOPOLOGY_ARGS, _command_record, _safe
     from s8_schema import CALIBRATION_CORPORA, SPLITS
 
@@ -103,20 +105,12 @@ def _matrix_audit_gate(path: Path) -> tuple[bool, str | None]:
     if not _authenticated_regular_file(path):
         return False, "matrix audit is not an authenticated regular file"
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
-        return False, "matrix audit is unreadable or malformed"
-    if not isinstance(value, dict) or value.get("schema") != "icecream-s8-matrix-audit-v1":
-        return False, "matrix audit schema is not icecream-s8-matrix-audit-v1"
-    if value.get("status") != "PASS":
-        return False, "matrix audit status is not PASS"
-    matrix = value.get("matrix")
-    if (not isinstance(matrix, dict) or matrix.get("expected_cells") != 32 or
-            matrix.get("completed_cells") != 32 or matrix.get("missing_cells") != [] or
-            matrix.get("invalid_candidates") != [] or
-            matrix.get("calibration_cells") != 16 or
-            matrix.get("held_out_validation_cells") != 16):
-        return False, "matrix audit PASS record is incomplete"
+        value, _facts = s8_depth_runner._json(path, "matrix_audit")
+        s8_depth_runner._validate_matrix_audit(value)
+    except s8_depth_runner.DepthPlanError as exc:
+        if str(exc) == "matrix_audit:not_complete_pass":
+            return False, "matrix audit status is not PASS"
+        return False, str(exc)
     return True, None
 
 

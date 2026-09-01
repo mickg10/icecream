@@ -10,9 +10,23 @@ from pathlib import Path
 
 from farmharness.s4_method_matrix_executor import (
     RAW_II_GAP,
+    _matrix_audit_gate,
     materialize_matrix,
 )
 from farmharness.s4_version_transition_planner import build_plan
+from farmharness.s8_schema import CORPORA, PROFILES, REGIMES, SPLITS
+
+
+def _complete_matrix() -> dict[str, object]:
+    return {
+        "schema": "icecream-s8-matrix-audit-v1", "status": "PASS",
+        "matrix": {"expected_cells": 32, "completed_cells": 32,
+                    "missing_cells": [], "invalid_candidates": [],
+                    "calibration_cells": 16, "held_out_validation_cells": 16},
+        "cells": [{"cell": f"{corpus}/{profile}/{regime}",
+                   "split": SPLITS[corpus], "status": "PASS"}
+                  for corpus in CORPORA for profile in PROFILES for regime in REGIMES],
+    }
 
 
 class S4MethodMatrixExecutorTest(unittest.TestCase):
@@ -159,13 +173,7 @@ class S4MethodMatrixExecutorTest(unittest.TestCase):
             engine_manifest = root / "engine.json"
             engine_manifest.write_text("{}\n")
             matrix_audit = root / "matrix.json"
-            matrix_audit.write_text(json.dumps({
-                "schema": "icecream-s8-matrix-audit-v1", "status": "PASS",
-                "matrix": {"expected_cells": 32, "completed_cells": 32,
-                            "missing_cells": [], "invalid_candidates": [],
-                            "calibration_cells": 16, "held_out_validation_cells": 16},
-                "cells": [],
-            }) + "\n")
+            matrix_audit.write_text(json.dumps(_complete_matrix()) + "\n")
             compile_db = root / "compile_commands.json"
             compile_db.write_text("[]\n")
             compile_source = root / "compile-src"
@@ -202,6 +210,68 @@ class S4MethodMatrixExecutorTest(unittest.TestCase):
             self.assertEqual(blocked["status"], "BLOCKED")
             self.assertFalse(blocked["executable"])
             self.assertIn("matrix audit status is not PASS", blocked["execution_blocker"])
+
+    def test_matrix_audit_gate_rejects_forged_or_malformed_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "matrix.json"
+            valid = _complete_matrix()
+
+            def check(value: object) -> None:
+                path.write_text(json.dumps(value, allow_nan=True) + "\n")
+                self.assertEqual(_matrix_audit_gate(path)[0], False)
+
+            forged = {**valid, "cells": []}
+            check(forged)
+
+            missing = _complete_matrix()
+            missing["cells"] = list(missing["cells"][:-1])  # type: ignore[index]
+            check(missing)
+
+            duplicate = _complete_matrix()
+            duplicate_cells = list(duplicate["cells"])  # type: ignore[arg-type]
+            duplicate_cells[-1] = duplicate_cells[0]
+            duplicate["cells"] = duplicate_cells
+            check(duplicate)
+
+            extra = _complete_matrix()
+            extra_cells = list(extra["cells"])  # type: ignore[arg-type]
+            extra_cells[-1] = {"cell": "fmt/RAW_II/cold", "split": "calibration",
+                               "status": "PASS"}
+            extra["cells"] = extra_cells
+            check(extra)
+
+            malformed = _complete_matrix()
+            malformed["status"] = "BROKEN"
+            check(malformed)
+            for index, field in enumerate(("profile", "corpus", "regime")):
+                malformed = _complete_matrix()
+                cell = dict(malformed["cells"][index])  # type: ignore[index]
+                parts = cell["cell"].split("/")
+                parts[{"corpus": 0, "profile": 1, "regime": 2}[field]] = "INVALID"
+                cell["cell"] = "/".join(parts)
+                malformed["cells"][index] = cell  # type: ignore[index]
+                check(malformed)
+            malformed_status = _complete_matrix()
+            malformed_status["cells"][0]["status"] = "FAIL"  # type: ignore[index]
+            check(malformed_status)
+
+            duplicate_key = json.dumps(_complete_matrix(), separators=(",", ":"))
+            duplicate_key = duplicate_key.replace('"status":"PASS"',
+                                                    '"status":"PASS","status":"PASS"', 1)
+            path.write_text(duplicate_key + "\n")
+            self.assertFalse(_matrix_audit_gate(path)[0])
+
+            nonfinite = _complete_matrix()
+            nonfinite["nonfinite"] = float("nan")
+            check(nonfinite)
+            overflow = _complete_matrix()
+            overflow["nonfinite"] = "1e999"
+            raw = json.dumps(overflow).replace('"1e999"', "1e999")
+            path.write_text(raw + "\n")
+            self.assertFalse(_matrix_audit_gate(path)[0])
+
+            path.write_text(json.dumps(_complete_matrix()) + "\n")
+            self.assertEqual(_matrix_audit_gate(path), (True, None))
 
     def test_heldout_corpus_is_rejected_before_materialization(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

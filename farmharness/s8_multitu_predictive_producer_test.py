@@ -25,7 +25,8 @@ def _write(path: Path, raw: bytes | str) -> None:
 
 
 def _matrix(path: Path) -> None:
-    cells = [{"cell": f"{corpus}/{profile}/{regime}", "split": SPLITS[corpus]}
+    cells = [{"cell": f"{corpus}/{profile}/{regime}", "split": SPLITS[corpus],
+              "status": "PASS"}
              for corpus in CORPORA for profile in PROFILES for regime in REGIMES]
     value = {
         "schema": depth_runner.MATRIX_AUDIT_SCHEMA, "status": "PASS",

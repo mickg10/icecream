@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -21,10 +22,12 @@ from typing import Any
 
 try:
     from .s8_schema import (CONTROL_PROFILES, CORPORA, CURRENT_SEMANTICS,
-                            DEPTH_CLASSES, PROFILES, REGIMES, SPLITS)
+                            DECLARED_CELLS, DEPTH_CLASSES, PROFILES, REGIMES,
+                            SPLITS)
 except ImportError:  # pragma: no cover
     from s8_schema import (CONTROL_PROFILES, CORPORA, CURRENT_SEMANTICS,
-                           DEPTH_CLASSES, PROFILES, REGIMES, SPLITS)
+                           DECLARED_CELLS, DEPTH_CLASSES, PROFILES, REGIMES,
+                           SPLITS)
 
 
 SCHEMA = "icecream-s8-depth-run-plan-v1"
@@ -176,6 +179,7 @@ def _json(path: Path, label: str) -> tuple[dict[str, Any], dict[str, Any]]:
     try:
         value = json.loads(path.read_bytes().decode("utf-8"),
                           object_pairs_hook=_unique_keys,
+                          parse_float=lambda token: _finite_float(token, label),
                           parse_constant=lambda token: (_ for _ in ()).throw(
                               DepthPlanError(f"{label}:non_finite")))
     except DepthPlanError:
@@ -194,6 +198,14 @@ def _unique_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
             raise DepthPlanError(f"duplicate_json_key:{key}")
         result[key] = value
     return result
+
+
+def _finite_float(value: str, label: str) -> float:
+    """Reject both non-finite JSON constants and exponent overflow."""
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise DepthPlanError(f"{label}:non_finite")
+    return parsed
 
 
 def _cell(corpus: str, profile: str, regime: str) -> dict[str, str]:
@@ -237,17 +249,76 @@ def _manifest_inputs(path: Path, source_root: Path, label: str) -> tuple[list[di
     return paths, facts
 
 
-def _matrix_precondition(path: Path, cell: dict[str, str]) -> dict[str, Any]:
-    value, facts = _json(path, "matrix_audit")
+def _validate_matrix_summary(value: object) -> None:
+    """Validate the authenticated summary fields of an S8 matrix audit."""
+    if not isinstance(value, dict):
+        raise DepthPlanError("matrix_audit:object_required")
     if value.get("schema") != MATRIX_AUDIT_SCHEMA or value.get("status") != "PASS":
         raise DepthPlanError("matrix_audit:not_complete_pass")
     matrix = value.get("matrix")
-    if (not isinstance(matrix, dict) or matrix.get("expected_cells") != 32 or
-            matrix.get("completed_cells") != 32 or matrix.get("missing_cells") != [] or
-            matrix.get("invalid_candidates") != [] or
-            matrix.get("calibration_cells") != 16 or
-            matrix.get("held_out_validation_cells") != 16):
+    if not isinstance(matrix, dict):
         raise DepthPlanError("matrix_audit:32_cell_precondition_failed")
+    expected_counts = {
+        "expected_cells": 32, "completed_cells": 32,
+        "calibration_cells": 16, "held_out_validation_cells": 16,
+    }
+    if any(type(matrix.get(key)) is not int or matrix.get(key) != expected
+           for key, expected in expected_counts.items()):
+        raise DepthPlanError("matrix_audit:32_cell_precondition_failed")
+    if matrix.get("missing_cells") != [] or matrix.get("invalid_candidates") != []:
+        raise DepthPlanError("matrix_audit:32_cell_precondition_failed")
+
+
+def _validate_matrix_audit(value: object) -> None:
+    """Validate the complete, canonical 32-cell S8 matrix audit.
+
+    Counts are only a summary.  Readiness requires the authenticated rows to
+    contain each declared corpus/profile/regime cell exactly once, with the
+    canonical split and PASS status.  This is shared by the depth planner and
+    the S4 materializer so they cannot disagree about readiness.
+    """
+    _validate_matrix_summary(value)
+
+    assert isinstance(value, dict)  # narrowed by _validate_matrix_summary
+    cells = value.get("cells")
+    expected_cells = tuple((cell["corpus"], cell["profile"], cell["regime"])
+                           for cell in DECLARED_CELLS)
+    if not isinstance(cells, list) or len(cells) != len(expected_cells):
+        raise DepthPlanError("matrix_audit:canonical_cells_invalid")
+    expected = {"/".join(cell) for cell in expected_cells}
+    observed: list[str] = []
+    for index, row in enumerate(cells):
+        if not isinstance(row, dict):
+            raise DepthPlanError(f"matrix_audit:cell_row_invalid:{index}")
+        if row.get("status") != "PASS":
+            raise DepthPlanError(f"matrix_audit:cell_status_invalid:{index}")
+        cell_id = row.get("cell")
+        if not isinstance(cell_id, str) or cell_id.count("/") != 2:
+            raise DepthPlanError(f"matrix_audit:cell_invalid:{index}")
+        parts = tuple(cell_id.split("/"))
+        if parts not in expected_cells:
+            raise DepthPlanError(f"matrix_audit:cell_undeclared:{cell_id}")
+        corpus, _profile, _regime = parts
+        if row.get("split") != SPLITS[corpus]:
+            raise DepthPlanError(f"matrix_audit:cell_split_invalid:{cell_id}")
+        observed.append(cell_id)
+    if len(set(observed)) != len(observed):
+        raise DepthPlanError("matrix_audit:cell_duplicate")
+    missing = expected - set(observed)
+    extra = set(observed) - expected
+    if missing or extra:
+        raise DepthPlanError("matrix_audit:cell_set_incomplete")
+
+
+def _matrix_precondition(path: Path, cell: dict[str, str]) -> dict[str, Any]:
+    value, facts = _json(path, "matrix_audit")
+    # RAW_II is an explicit control profile outside the four-profile matrix;
+    # it still consumes the strict parser and summary authentication, while
+    # compressed profiles require every canonical cell before planning.
+    if cell["profile"] in CONTROL_PROFILES:
+        _validate_matrix_summary(value)
+    else:
+        _validate_matrix_audit(value)
     cells = value.get("cells")
     cell_id = "/".join(cell[field] for field in ("corpus", "profile", "regime"))
     if (cell["profile"] not in CONTROL_PROFILES and
