@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
@@ -642,6 +643,55 @@ def test_external_mode_executes_then_finalizes_and_authenticates_comparison(
     assert external_calls[0]["batch_manifest"]
     assert external_calls[0]["predictive_plan"]
     assert external_calls[0]["topology_file"]
+
+
+def test_external_campaign_bootstrap_then_reuse_options_reach_cell_runner(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _authority_value, authority_path = _external_test_setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(driver, "_live_run_lock", lambda _value: nullcontext())
+    calls: list[dict[str, object]] = []
+
+    def external_runner(_transport: object, **kwargs: object) -> Path:
+        calls.append(kwargs)
+        output = Path(kwargs["output"])
+        target = (output / "icecream" / str(kwargs["topology"]).replace("/", "-") /
+                  str(kwargs["timestamp"]) / str(kwargs["profile"]))
+        target.mkdir(parents=True, exist_ok=True)
+        result = target / "live_curve_manifest.json"
+        result.write_text("{}\n")
+        return result
+
+    def mint(_cell: Path, *, authority: Path, package_dir: Path) -> Path:
+        assert authority == authority_path
+        package_dir.mkdir(parents=True)
+        manifest = package_dir / "manifest.jsonl"
+        manifest.write_text("fixture\n")
+        return manifest
+
+    monkeypatch.setattr(driver.external_farm_executor.reference_witness_module,
+                        "create_from_cell", mint)
+    first_kwargs = _all_kwargs(tmp_path)
+    first_kwargs["output_root"] = tmp_path / "first"
+    driver.run_campaign(
+        **first_kwargs, mode=driver.EXTERNAL_FARM_MODE,
+        selected_profiles=["ZSTD_ROUTE"], selected_topologies=["C1F1/100000"],
+        external_farm_authority=authority_path, external_cell_runner=external_runner,
+        external_transport_factory=lambda value: {"authority": value},
+        command_runner=_all_runner_factory()[0], timestamp="20260901T130000Z",
+        reference_witness_output=tmp_path / "witness")
+    assert len(calls) == 2 and calls[0]["retain_all_artifacts"] is True
+
+    second_kwargs = dict(first_kwargs)
+    second_kwargs["output_root"] = tmp_path / "second"
+    driver.run_campaign(
+        **second_kwargs, mode=driver.EXTERNAL_FARM_MODE,
+        selected_profiles=["ZSTD_ROUTE"], selected_topologies=["C1F1/100000"],
+        external_farm_authority=authority_path, external_cell_runner=external_runner,
+        external_transport_factory=lambda value: {"authority": value},
+        command_runner=_all_runner_factory()[0], timestamp="20260901T130001Z",
+        reference_witness=tmp_path / "witness", reference_authority=authority_path)
+    assert len(calls) == 4
+    assert calls[2]["reference_witness"] == tmp_path / "witness"
 
 
 def test_external_static_authority_is_reloaded_and_stale_capture_fails_closed(

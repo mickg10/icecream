@@ -338,7 +338,8 @@ def build_external_command(batch_manifest: Path, predictive_plan: Path, topology
                            repeat_predictive_plan: Path | None = None,
                            reference_witness: Path | None = None,
                            reference_authority: Path | None = None,
-                           reference_image: Mapping[str, Any] | None = None) -> list[str]:
+                           reference_image: Mapping[str, Any] | None = None,
+                           reference_toolchain: Mapping[str, Any] | None = None) -> list[str]:
     """Build the mature runner argv and mark it for the external lifecycle."""
     runner_profile = "P29" if profile == "RAW_II" else profile
     command = live.build_command(batch_manifest, runner_profile, product_root=product_root,
@@ -347,20 +348,34 @@ def build_external_command(batch_manifest: Path, predictive_plan: Path, topology
                                  suite=suite, workdir=workdir,
                                  timeout_seconds=timeout_seconds,
                                  passes=passes, product_profile=("RAW_II" if profile == "RAW_II" else None))
+    prefix_env: list[str] = []
     if repeat_predictive_plan is not None:
-        command.append(f"ICECC_P50_REPEAT_PREDICTIVE_PLAN={repeat_predictive_plan}")
+        prefix_env.append(f"ICECC_P50_REPEAT_PREDICTIVE_PLAN={repeat_predictive_plan}")
     if reference_witness is not None:
         if (reference_authority is None or reference_image is None or
                 not all(key in reference_image for key in
                         ("image_id", "reference", "architecture", "os", "created"))):
             raise ExternalFarmError("reference_witness:authority_and_image_required")
-        command.extend((f"ICECC_P50_REFERENCE_WITNESS={reference_witness}",
+        prefix_env.extend((f"ICECC_P50_REFERENCE_WITNESS={reference_witness}",
                         f"ICECC_P50_REFERENCE_AUTHORITY={reference_authority}",
                         f"ICECC_P50_REFERENCE_IMAGE_ID={reference_image['image_id']}",
                         f"ICECC_P50_REFERENCE_IMAGE_REFERENCE={reference_image['reference']}",
                         f"ICECC_P50_REFERENCE_IMAGE_ARCHITECTURE={reference_image['architecture']}",
                         f"ICECC_P50_REFERENCE_IMAGE_OS={reference_image['os']}",
                         f"ICECC_P50_REFERENCE_IMAGE_CREATED={reference_image['created']}"))
+        if (not isinstance(reference_toolchain, Mapping) or
+                not isinstance(reference_toolchain.get("sha256"), str) or
+                type(reference_toolchain.get("bytes")) is not int):
+            raise ExternalFarmError("reference_witness:compiler_identity_required")
+        prefix_env.extend((f"ICECC_P50_REFERENCE_TOOLCHAIN_SHA256={reference_toolchain['sha256']}",
+                           f"ICECC_P50_REFERENCE_TOOLCHAIN_BYTES={reference_toolchain['bytes']}"))
+    # build_command returns env assignments followed by the runner.  Keep all
+    # witness assignments in env's prefix; trailing words would be script args.
+    runner_index = next((i for i, value in enumerate(command)
+                         if str(value).endswith("p50compilee2e-run.sh")), None)
+    if runner_index is None:
+        raise ExternalFarmError("runner:command_missing")
+    command[runner_index:runner_index] = prefix_env
     return ["env", "ICECC_P50_EXTERNAL_FARM=1", *command[1:]]
 
 
@@ -1908,13 +1923,19 @@ def execute_and_finalize_external_cell(
                 raise ExternalFarmError("reference_witness:authority_path_missing")
             reuse_authority = Path(authority_value_path)
         image = transport.authority.get("hosts", {}).get("q3", {}).get("image")
-        if not isinstance(image, Mapping):
+        binaries = transport.authority.get("hosts", {}).get("q3", {}).get("binaries")
+        if not isinstance(image, Mapping) or not isinstance(binaries, Mapping):
             raise ExternalFarmError("reference_witness:compiler_image_missing")
+        try:
+            reference_toolchain = reference_witness_module.stable_toolchain_identity(image, binaries)
+        except reference_witness_module.ReferenceWitnessError as exc:
+            raise ExternalFarmError(f"reference_witness:compiler_identity_invalid:{exc}") from exc
         try:
             reference_witness_module.validate_reuse(
                 reference_witness, batch_manifest=batch_manifest,
                 predictive_plan=predictive_plan, authority=reuse_authority,
-                image_identity=image)
+                image_identity=image,
+                toolchain_identity=reference_toolchain)
             staged_witness_files = reference_witness_module.package_files(reference_witness)
         except reference_witness_module.ReferenceWitnessError as exc:
             raise ExternalFarmError(f"reference_witness:validation_failed:{exc}") from exc
@@ -1922,12 +1943,15 @@ def execute_and_finalize_external_cell(
             raise ExternalFarmError("reference_witness:authority_unavailable")
     else:
         staged_witness_files = []
+        reference_toolchain = None
     # Campaign factories may construct the transport with its conservative
     # 900-second default.  The lifecycle budget includes warm prewarm and the
     # paired local-reference passes, so use it for the marker supervisor and
     # every bounded transport operation as well.
     if isinstance(transport, SSHTransport) and transport.timeout < timeout_seconds:
         transport.timeout = timeout_seconds
+    # The stable compiler/image content identity is authenticated before
+    # staging; the runner receives its digest, never an env-tar digest.
     command = build_external_command(
         batch_manifest, predictive_plan, topology_file, product_root,
         profile=profile, corpus=corpus, regime=regime, depth=depth,
@@ -1937,7 +1961,8 @@ def execute_and_finalize_external_cell(
         reference_witness=reference_witness,
         reference_authority=reuse_authority,
         reference_image=(transport.authority["hosts"]["q3"]["image"]
-                         if reference_witness is not None else None))
+                         if reference_witness is not None else None),
+        reference_toolchain=reference_toolchain)
     result = execute(
         topology=topology, relationship_hosts=relationship_hosts,
         profile=profile, batch_manifest=batch_manifest,
@@ -2015,6 +2040,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--regime", default="cold")
     parser.add_argument("--depth", default="100")
     parser.add_argument("--passes", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--reference-witness", type=Path,
+                        help="authenticated manifest.jsonl for compiler-free reuse")
+    parser.add_argument("--reference-authority", type=Path,
+                        help="authority snapshot used when minting/reusing a witness")
+    parser.add_argument("--artifact-sample", type=int, default=2)
+    parser.add_argument("--retain-all-artifacts", action="store_true")
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
     try:
@@ -2038,26 +2069,25 @@ def main(argv: list[str] | None = None) -> int:
                 suite=args.topology)
             timeout_seconds = external_timeout_seconds(
                 len(rows), args.passes, args.regime == "warm")
-            command = build_external_command(
-                args.batch_manifest.absolute(), args.predictive_plan.absolute(),
-                args.topology_file.absolute(), args.product_root.absolute(),
-                profile=args.profile, corpus=args.corpus, regime=args.regime,
-                depth=args.depth, suite=args.topology,
-                workdir=Path("/tmp/p50compilee2e.external"),
-                timeout_seconds=timeout_seconds,
-                passes=args.passes, repeat_predictive_plan=(args.repeat_predictive_plan.absolute()
-                                                            if args.repeat_predictive_plan else None))
-            extra_plans = ()
-            result = SSHTransport(authority, timeout=timeout_seconds).execute(
+            reference_authority = args.reference_authority.absolute() if args.reference_authority else args.authority.absolute()
+            result = execute_and_finalize_external_cell(
+                SSHTransport(authority, timeout=timeout_seconds),
                 topology=args.topology, relationship_hosts=hosts, profile=args.profile,
                 batch_manifest=args.batch_manifest.absolute(),
                 predictive_plan=args.predictive_plan.absolute(),
                 topology_file=args.topology_file.absolute(), corpus=args.corpus,
                 regime=args.regime, depth=args.depth, output=args.output.absolute(),
-                product_root_remote=args.product_root_remote or str(args.product_root.absolute()),
-                batch_command=command, host_product_root=args.product_root.absolute(),
-                extra_stage_paths=extra_plans)
-            print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+                product_root=args.product_root.absolute(),
+                product_root_remote=args.product_root_remote,
+                repeat_predictive_plan=(args.repeat_predictive_plan.absolute()
+                                        if args.repeat_predictive_plan else None),
+                passes=args.passes, artifact_sample=args.artifact_sample,
+                retain_all_artifacts=args.retain_all_artifacts,
+                reference_witness=(args.reference_witness.absolute()
+                                   if args.reference_witness else None),
+                reference_authority=reference_authority if args.reference_witness else None)
+            print(json.dumps({"status": "PASS", "output": str(result)},
+                             sort_keys=True, separators=(",", ":")))
             return 0
         print(json.dumps(plan, sort_keys=True, separators=(",", ":")))
         return 0

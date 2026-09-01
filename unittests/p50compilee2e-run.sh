@@ -593,7 +593,9 @@ if test -n "$reference_witness"; then
         test -n "${ICECC_P50_REFERENCE_IMAGE_REFERENCE:-}" && \
         test -n "${ICECC_P50_REFERENCE_IMAGE_ARCHITECTURE:-}" && \
         test -n "${ICECC_P50_REFERENCE_IMAGE_OS:-}" && \
-        test -n "${ICECC_P50_REFERENCE_IMAGE_CREATED:-}" || {
+        test -n "${ICECC_P50_REFERENCE_IMAGE_CREATED:-}" && \
+        test -n "${ICECC_P50_REFERENCE_TOOLCHAIN_SHA256:-}" && \
+        test -n "${ICECC_P50_REFERENCE_TOOLCHAIN_BYTES:-}" || {
         echo "FAIL: reference reuse requires external batch, plan, authority, and image identity" >&2
         exit 1
     }
@@ -605,7 +607,9 @@ if test -n "$reference_witness"; then
         --image-architecture "$ICECC_P50_REFERENCE_IMAGE_ARCHITECTURE" \
         --image-os "$ICECC_P50_REFERENCE_IMAGE_OS" \
         --image-created "$ICECC_P50_REFERENCE_IMAGE_CREATED" \
-        --toolchain "$envtar" --output "$work/reference-reuse-map.json" || {
+        --toolchain-sha256 "$ICECC_P50_REFERENCE_TOOLCHAIN_SHA256" \
+        --toolchain-bytes "$ICECC_P50_REFERENCE_TOOLCHAIN_BYTES" \
+        --output "$work/reference-reuse-map.json" || {
         echo "FAIL: authenticated reference witness reuse validation failed" >&2
         exit 1
     }
@@ -1590,11 +1594,14 @@ import json, sys
 print(json.load(open(sys.argv[1], encoding="utf-8"))["package_digest"])
 PY
                     ) run=$run_label ordinal=$ordinal_ref remote_sha256=$remote_sha remote_bytes=$remote_bytes witness_sha256=$witness_sha witness_bytes=$witness_bytes"
-                elif test -n "$db_ref"; then
+                elif test "$reference_reuse" -eq 0 && test -n "$db_ref"; then
                     local_ref_args=$(compile_args_for "$db_ref" "$source_ref" "$output_ref" "$input_ref" "$local_ref")
                     eval "g++ $local_ref_args"
-                else
+                elif test "$reference_reuse" -eq 0; then
                     g++ -std=c++17 -O2 -c "$input_ref" -o "$local_ref"
+                else
+                    echo "FAIL: reference reuse did not produce a witness object" >&2
+                    exit 1
                 fi
                 cmp -s "$remote_ref" "$local_ref" || {
                     echo "FAIL: post-measurement local reference differs ($run_label-$ordinal_ref)" >&2

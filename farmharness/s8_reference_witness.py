@@ -122,16 +122,25 @@ def _compile_entry_output(entry: Mapping[str, Any]) -> Path | None:
 def _compile_bindings(rows: Sequence[Mapping[str, Any]], label: str) -> list[dict[str, Any]]:
     caches: dict[str, tuple[str, list[Any]]] = {}
     result: list[dict[str, Any]] = []
+    seen_tu_ids: set[str] = set()
     for ordinal, row in enumerate(rows):
-        required = {"source", "source_relative", "sha256", "predictive_input",
+        required = {"tu_id", "source", "source_relative", "sha256", "predictive_input",
                     "compile_db", "compile_db_sha256", "compile_source", "compile_output"}
         if not required.issubset(row):
             raise ReferenceWitnessError(f"{label}:{ordinal}:compile_binding_missing")
+        tu_id = row.get("tu_id")
+        source_relative = row.get("source_relative")
+        payload = row["predictive_input"]
+        if (not isinstance(tu_id, str) or not tu_id or tu_id in seen_tu_ids or
+                not isinstance(source_relative, str) or not source_relative or
+                ("ordinal" in row and row.get("ordinal") != ordinal) or
+                not isinstance(payload, Mapping) or payload.get("ordinal") != ordinal):
+            raise ReferenceWitnessError(f"{label}:{ordinal}:occurrence_identity_invalid")
+        seen_tu_ids.add(tu_id)
         source = Path(str(row["source"]))
         source_desc = descriptor(source, f"{label}:{ordinal}.source")
         if source_desc["sha256"] != _digest(row["sha256"], f"{label}:{ordinal}.source_sha256"):
             raise ReferenceWitnessError(f"{label}:{ordinal}:source_digest_mismatch")
-        payload = row["predictive_input"]
         if not isinstance(payload, Mapping):
             raise ReferenceWitnessError(f"{label}:{ordinal}:input_invalid")
         input_path = Path(str(payload.get("path", "")))
@@ -168,8 +177,9 @@ def _compile_bindings(rows: Sequence[Mapping[str, Any]], label: str) -> list[dic
             raise ReferenceWitnessError(f"{label}:{ordinal}:compile_argv_empty")
         compile_identity = {"directory": str(entry["directory"]), "argv": argv,
                             "source": str(source.resolve()), "output": str(output_path)}
-        result.append({"occurrence": {"ordinal": ordinal,
-                                       "source_relative": row["source_relative"],
+        result.append({"occurrence": {"ordinal": ordinal, "tu_id": tu_id,
+                                       "source_relative": source_relative,
+                                       "predictive_source_relative": payload["source_relative"],
                                        "sha256": source_desc["sha256"],
                                        "bytes": source_desc["bytes"]},
                        "input": {"path": str(input_path.resolve()),
@@ -201,12 +211,115 @@ def _validate_product(value: object, label: str = "product") -> dict[str, Any]:
             image.get("architecture") != "amd64" or image.get("os") != "linux"):
         raise ReferenceWitnessError(f"{label}.image:identity_invalid")
     image_id = str(image["image_id"])
+    if not image_id.startswith("sha256:"):
+        raise ReferenceWitnessError(f"{label}.image.image_id:identity_invalid")
     _digest(image_id.removeprefix("sha256:"), f"{label}.image.image_id")
-    if (not isinstance(toolchain, Mapping) or set(toolchain) != {"sha256", "bytes"} or
+    if (not isinstance(toolchain, Mapping) or set(toolchain) not in ({"sha256", "bytes"},
+                                                                       {"sha256", "bytes", "content"}) or
             type(toolchain.get("bytes")) is not int or toolchain["bytes"] <= 0):
         raise ReferenceWitnessError(f"{label}.toolchain:identity_invalid")
     _digest(toolchain.get("sha256"), f"{label}.toolchain.sha256")
+    if "content" in toolchain and not isinstance(toolchain["content"], Mapping):
+        raise ReferenceWitnessError(f"{label}.toolchain.content_invalid")
     return {"image": dict(image), "toolchain": dict(toolchain)}
+
+
+def stable_toolchain_identity(image: Mapping[str, Any], binaries: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a stable compiler/image content identity, never an env tar hash."""
+    product_image = _validate_product({"image": dict(image),
+                                       "toolchain": {"sha256": "a" * 64, "bytes": 1}},
+                                      "compiler_identity")["image"]
+    if not isinstance(binaries, Mapping) or not binaries:
+        raise ReferenceWitnessError("compiler_identity:binaries_missing")
+    normalized = {}
+    for name, digest in sorted(binaries.items()):
+        if not isinstance(name, str) or not name or not isinstance(digest, str):
+            raise ReferenceWitnessError("compiler_identity:binaries_invalid")
+        normalized[name] = _digest(digest, f"compiler_identity.binaries.{name}")
+    content = {"image": product_image, "binaries": normalized}
+    raw = _canonical(content)
+    return {"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw),
+            "content": content}
+
+
+def _validate_cell_attestation(cell_output: Path, experiment: Mapping[str, Any],
+                               results_raw: bytes, batch: Path, plan: Path,
+                               rows: Sequence[Mapping[str, Any]],
+                               remote_objects: Sequence[Path]) -> dict[str, Any]:
+    """Require the finalized PASS/evidence/timing identity before minting."""
+    evidence_path = cell_output / "evidence.json"
+    evidence = _json(evidence_path, "cell.evidence")
+    if evidence.get("schema") != "icecream-s7-live-evidence-v2":
+        raise ReferenceWitnessError("cell.evidence:schema_invalid")
+    if evidence.get("cell") != experiment.get("cell"):
+        raise ReferenceWitnessError("cell.evidence:cell_mismatch")
+    declared_hash = evidence.get("evidence_sha256")
+    clean = dict(evidence); clean.pop("evidence_sha256", None)
+    if declared_hash != hashlib.sha256(_canonical(clean)).hexdigest():
+        raise ReferenceWitnessError("cell.evidence:self_digest_mismatch")
+    for field in ("source_commit", "source_tree"):
+        value = evidence.get(field)
+        if (not isinstance(value, str) or len(value) != 40 or
+                any(ch not in HEX64 for ch in value.lower())):
+            raise ReferenceWitnessError(f"cell.evidence:{field}_invalid")
+        if experiment.get(field) != value:
+            raise ReferenceWitnessError(f"cell.evidence:{field}_mismatch")
+    runner = evidence.get("runner")
+    if (not isinstance(runner, Mapping) or runner.get("name") != "p50compilee2e-run.sh" or
+            not isinstance(runner.get("sha256"), str) or
+            len(runner["sha256"]) != 64):
+        raise ReferenceWitnessError("cell.evidence:runner_invalid")
+    _digest(runner["sha256"], "cell.evidence.runner.sha256")
+    if experiment.get("runner_sha256") != runner["sha256"]:
+        raise ReferenceWitnessError("cell.evidence:runner_mismatch")
+    if experiment.get("remote_compile_required") is not True:
+        raise ReferenceWitnessError("cell.evidence:remote_compile_required")
+    if experiment.get("execution_environment") != "external_farm_product_build":
+        raise ReferenceWitnessError("cell.evidence:execution_environment_invalid")
+    if (not isinstance(evidence.get("runtime_image"), Mapping) or
+            not isinstance(experiment.get("runtime_image"), Mapping) or
+            evidence.get("runtime_image") != experiment.get("runtime_image") or
+            evidence.get("binary_sha256") != experiment.get("binary_sha256")):
+        raise ReferenceWitnessError("cell.evidence:compiler_identity_mismatch")
+    input_desc = evidence.get("input_manifest")
+    expected_batch = descriptor(batch, "cell.batch_manifest")
+    if (not isinstance(input_desc, Mapping) or input_desc.get("path") != "product-evidence/batch-manifest.jsonl" or
+            input_desc.get("sha256") != expected_batch["sha256"] or input_desc.get("bytes") != expected_batch["bytes"]):
+        raise ReferenceWitnessError("cell.evidence:input_manifest_mismatch")
+    plan_desc = evidence.get("predictive_plan")
+    expected_plan = descriptor(plan, "cell.predictive_plan")
+    if (not isinstance(plan_desc, Mapping) or plan_desc.get("path") != "product-evidence/predictive-plan.json" or
+            plan_desc.get("sha256") != expected_plan["sha256"] or plan_desc.get("bytes") != expected_plan["bytes"]):
+        raise ReferenceWitnessError("cell.evidence:predictive_plan_mismatch")
+    result_desc = evidence.get("evidence", {}).get("results") if isinstance(evidence.get("evidence"), Mapping) else None
+    actual_result = hashlib.sha256(results_raw).hexdigest()
+    if (not isinstance(result_desc, Mapping) or result_desc.get("path") != "results.jsonl" or
+            result_desc.get("sha256") != actual_result or result_desc.get("bytes") != len(results_raw)):
+        raise ReferenceWitnessError("cell.evidence:results_mismatch")
+    timing_desc = evidence.get("evidence", {}).get("timing") if isinstance(evidence.get("evidence"), Mapping) else None
+    timing_path = cell_output / "timing.jsonl"
+    timing_raw, timing_sha, timing_bytes = snapshot(timing_path, "cell.timing")
+    if (not isinstance(timing_desc, Mapping) or timing_desc.get("path") != "timing.jsonl" or
+            timing_desc.get("sha256") != timing_sha or timing_desc.get("bytes") != timing_bytes):
+        raise ReferenceWitnessError("cell.evidence:timing_mismatch")
+    if experiment.get("artifact_retention", {}).get("mode") != "all":
+        raise ReferenceWitnessError("cell:all_artifacts_required")
+    try:
+        timing_rows = [json.loads(line) for line in timing_raw.decode("utf-8").splitlines() if line.strip()]
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReferenceWitnessError("cell.timing:invalid_jsonl") from exc
+    if len(timing_rows) != len(rows):
+        raise ReferenceWitnessError("cell.timing:occurrence_count_mismatch")
+    for ordinal, (timing, remote) in enumerate(zip(timing_rows, remote_objects, strict=True)):
+        if (not isinstance(timing, Mapping) or timing.get("ordinal") != ordinal or
+                timing.get("tu_id") != rows[ordinal].get("tu_id") or
+                timing.get("cell") != experiment.get("cell") or
+                timing.get("remote_compile") is not True):
+            raise ReferenceWitnessError(f"cell.timing:{ordinal}:identity_invalid")
+        _raw, digest, size = snapshot(remote, f"cell.remote_object:{ordinal}")
+        if timing.get("object_sha256") != digest or timing.get("returned_object_bytes", size) != size:
+            raise ReferenceWitnessError(f"cell.timing:{ordinal}:object_mismatch")
+    return evidence
 
 
 def _read_rows(path: Path) -> list[dict[str, Any]]:
@@ -218,6 +331,20 @@ def _read_rows(path: Path) -> list[dict[str, Any]]:
     if not values or any(not isinstance(item, dict) for item in values):
         raise ReferenceWitnessError("batch_manifest:rows_invalid")
     return values
+
+
+def _load_batch_rows(path: Path, expected_count: int) -> list[dict[str, Any]]:
+    """Use the live runner's canonical batch validator before witness work."""
+    try:
+        try:
+            from . import s8_real_c1f1_live_runner as live  # type: ignore
+        except ImportError:  # pragma: no cover - direct script invocation
+            import s8_real_c1f1_live_runner as live  # type: ignore
+        return live.load_batch_manifest(path, expected_count)
+    except Exception as exc:
+        if isinstance(exc, ReferenceWitnessError):
+            raise
+        raise ReferenceWitnessError(f"batch_manifest:canonical_validation_failed:{exc}") from exc
 
 
 def _plan_identity(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -273,11 +400,17 @@ def _validate_records(package: Path, header: Mapping[str, Any], records: Sequenc
     if _package_digest(package, header, records) != package_digest:
         raise ReferenceWitnessError("witness_package:package_digest_mismatch")
     ordinals: list[int] = []
+    tu_ids: set[str] = set()
     for index, record in enumerate(records):
         occurrence = record.get("occurrence")
-        if not isinstance(occurrence, Mapping) or occurrence.get("ordinal") != index:
+        if (not isinstance(occurrence, Mapping) or occurrence.get("ordinal") != index or
+                not isinstance(occurrence.get("tu_id"), str) or
+                occurrence["tu_id"] in tu_ids or
+                not isinstance(occurrence.get("source_relative"), str) or
+                not isinstance(occurrence.get("predictive_source_relative"), str)):
             raise ReferenceWitnessError(f"witness_record:{index}:ordinal_invalid")
         ordinals.append(index)
+        tu_ids.add(occurrence["tu_id"])
         direct = record.get("direct_reference")
         remote = record.get("remote_object")
         if (not isinstance(direct, Mapping) or not isinstance(remote, Mapping) or
@@ -291,11 +424,12 @@ def _validate_records(package: Path, header: Mapping[str, Any], records: Sequenc
 
 def validate_reuse(package_manifest: Path, *, batch_manifest: Path, predictive_plan: Path,
                    authority: Path, image_identity: Mapping[str, Any] | None = None,
-                   toolchain: Path | None = None) -> dict[str, Any]:
+                   toolchain: Path | None = None,
+                   toolchain_identity: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Validate a package against current paths and return a shell-safe map."""
     package, header, records = _package_lines(package_manifest)
     _validate_records(package, header, records)
-    rows = _read_rows(batch_manifest)
+    rows = _load_batch_rows(batch_manifest, len(records))
     plan, source_desc = _plan_identity(predictive_plan)
     authority_value = _json(authority, "authority")
     if not isinstance(authority_value, dict):
@@ -340,8 +474,15 @@ def validate_reuse(package_manifest: Path, *, batch_manifest: Path, predictive_p
     if image_identity is not None and expected_product.get("image") != dict(image_identity):
         raise ReferenceWitnessError("reuse:compiler_image_mismatch")
     if toolchain is not None:
-        toolchain_desc = descriptor(toolchain, "toolchain")
-        if expected_product.get("toolchain") != {"sha256": toolchain_desc["sha256"], "bytes": toolchain_desc["bytes"]}:
+        raise ReferenceWitnessError("reuse:archive_toolchain_identity_unsupported")
+    if toolchain_identity is not None:
+        if (not isinstance(toolchain_identity.get("sha256"), str) or
+                type(toolchain_identity.get("bytes")) is not int or
+                expected_product.get("toolchain", {}).get("sha256") != toolchain_identity["sha256"] or
+                expected_product.get("toolchain", {}).get("bytes") != toolchain_identity["bytes"] or
+                ("content" in expected_product.get("toolchain", {}) and
+                 "content" in toolchain_identity and
+                 expected_product["toolchain"].get("content") != toolchain_identity.get("content"))):
             raise ReferenceWitnessError("reuse:toolchain_mismatch")
     records_out = []
     for record in records:
@@ -404,37 +545,39 @@ def create_package(package_dir: Path, *, cell: Mapping[str, Any], batch_manifest
     package_parent = package_dir.parent
     package_parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=f".{package_dir.name}.", dir=package_parent))
-    objects = temporary / "objects"; objects.mkdir()
-    records: list[dict[str, Any]] = []
-    for index, (binding, direct_path, remote_path) in enumerate(zip(bindings, direct_objects, remote_objects, strict=True)):
-        direct_raw, direct_sha, direct_bytes = snapshot(Path(direct_path), f"direct_reference:{index}")
-        remote_raw, remote_sha, remote_bytes = snapshot(Path(remote_path), f"remote_object:{index}")
-        if direct_raw != remote_raw or direct_sha != remote_sha or direct_bytes != remote_bytes:
-            raise ReferenceWitnessError(f"witness:{index}:direct_remote_not_identical")
-        destination = objects / f"{index}.o"
-        destination.write_bytes(direct_raw)
-        destination_desc = {"path": f"objects/{index}.o", "sha256": direct_sha, "bytes": direct_bytes}
-        records.append({"kind": "occurrence", **binding, "direct_reference": destination_desc,
-                        "remote_object": dict(destination_desc)})
-    header: dict[str, Any] = {"kind": "package", "schema": PACKAGE_SCHEMA,
-                              "terminal_status": "PASS", "cell": dict(cell),
-                              "batch_manifest": batch_desc, "predictive_plan": plan_desc,
-                              "source_manifest": source_desc,
-                              "authority": {**descriptor(authority, "authority"),
-                                            "identity_sha256": _authority_identity(authority_value)},
-                              "product": json.loads(json.dumps(product_identity)),
-                              "record_count": len(records)}
-    package_digest = _package_digest(temporary, header, records)
-    header["package_digest"] = package_digest
-    for record in records:
-        record["witness_package_digest"] = package_digest
-    manifest = temporary / "manifest.jsonl"
-    manifest.write_bytes(b"".join(_canonical(item) + b"\n" for item in [header, *records]))
+    published = False
     try:
+        objects = temporary / "objects"; objects.mkdir()
+        records: list[dict[str, Any]] = []
+        for index, (binding, direct_path, remote_path) in enumerate(zip(bindings, direct_objects, remote_objects, strict=True)):
+            direct_raw, direct_sha, direct_bytes = snapshot(Path(direct_path), f"direct_reference:{index}")
+            remote_raw, remote_sha, remote_bytes = snapshot(Path(remote_path), f"remote_object:{index}")
+            if direct_raw != remote_raw or direct_sha != remote_sha or direct_bytes != remote_bytes:
+                raise ReferenceWitnessError(f"witness:{index}:direct_remote_not_identical")
+            destination = objects / f"{index}.o"
+            destination.write_bytes(direct_raw)
+            destination_desc = {"path": f"objects/{index}.o", "sha256": direct_sha, "bytes": direct_bytes}
+            records.append({"kind": "occurrence", **binding, "direct_reference": destination_desc,
+                            "remote_object": dict(destination_desc)})
+        header: dict[str, Any] = {"kind": "package", "schema": PACKAGE_SCHEMA,
+                                  "terminal_status": "PASS", "cell": dict(cell),
+                                  "batch_manifest": batch_desc, "predictive_plan": plan_desc,
+                                  "source_manifest": source_desc,
+                                  "authority": {**descriptor(authority, "authority"),
+                                                "identity_sha256": _authority_identity(authority_value)},
+                                  "product": json.loads(json.dumps(product_identity)),
+                                  "record_count": len(records)}
+        package_digest = _package_digest(temporary, header, records)
+        header["package_digest"] = package_digest
+        for record in records:
+            record["witness_package_digest"] = package_digest
+        manifest = temporary / "manifest.jsonl"
+        manifest.write_bytes(b"".join(_canonical(item) + b"\n" for item in [header, *records]))
         os.replace(temporary, package_dir)
-    except OSError:
-        shutil.rmtree(temporary, ignore_errors=True)
-        raise
+        published = True
+    finally:
+        if not published:
+            shutil.rmtree(temporary, ignore_errors=True)
     return package_dir / "manifest.jsonl"
 
 
@@ -448,7 +591,9 @@ def create_from_cell(cell_output: Path, *, authority: Path, package_dir: Path) -
     cell_output = cell_output.resolve()
     experiment_path = cell_output / "experiment_manifest.json"
     experiment = _json(experiment_path, "cell.experiment_manifest")
-    results = _read_rows(cell_output / "results.jsonl")
+    results_path = cell_output / "results.jsonl"
+    results_raw, _results_sha, _results_bytes = snapshot(results_path, "cell.results")
+    results = _read_rows(results_path)
     if len(results) != 1 or results[0].get("status") != "PASS":
         raise ReferenceWitnessError("cell:terminal_pass_required")
     cell = experiment.get("cell") if isinstance(experiment, Mapping) else None
@@ -456,18 +601,10 @@ def create_from_cell(cell_output: Path, *, authority: Path, package_dir: Path) -
         raise ReferenceWitnessError("cell:identity_missing")
     product_image = experiment.get("runtime_image")
     if not isinstance(product_image, Mapping):
-        authority_value = _json(authority, "authority")
-        try:
-            product_image = authority_value["hosts"]["q3"]["image"]
-        except (KeyError, TypeError) as exc:
-            raise ReferenceWitnessError("cell:compiler_image_missing") from exc
-    preparation = experiment.get("environment_preparation")
-    if (not isinstance(preparation, Mapping) or not isinstance(preparation.get("archive_sha256"), str) or
-            type(preparation.get("archive_bytes")) is not int or preparation["archive_bytes"] <= 0):
-        raise ReferenceWitnessError("cell:toolchain_identity_missing")
+        raise ReferenceWitnessError("cell:compiler_image_missing")
     batch = cell_output / "product-evidence" / "batch-manifest.jsonl"
     plan = cell_output / "product-evidence" / "predictive-plan.json"
-    rows = _read_rows(batch)
+    rows = _load_batch_rows(batch, len(_read_rows(batch)))
     count = len(rows)
     direct: list[Path] = []
     remote: list[Path] = []
@@ -477,6 +614,11 @@ def create_from_cell(cell_output: Path, *, authority: Path, package_dir: Path) -
         direct.append(direct_path); remote.append(remote_path)
         snapshot(direct_path, f"cell.local_object:{ordinal}")
         snapshot(remote_path, f"cell.remote_object:{ordinal}")
+    _validate_cell_attestation(cell_output, experiment, results_raw, batch, plan, rows, remote)
+    binaries = experiment.get("binary_sha256")
+    if not isinstance(product_image, Mapping) or not isinstance(binaries, Mapping):
+        raise ReferenceWitnessError("cell:compiler_identity_missing")
+    toolchain_identity = stable_toolchain_identity(product_image, binaries)
     depth = experiment.get("depth")
     if not isinstance(depth, (str, int)):
         raise ReferenceWitnessError("cell:depth_missing")
@@ -485,8 +627,7 @@ def create_from_cell(cell_output: Path, *, authority: Path, package_dir: Path) -
                            "topology": experiment.get("topology")},
         batch_manifest=batch, predictive_plan=plan, authority=authority,
         product={"image": dict(product_image),
-                 "toolchain": {"sha256": preparation["archive_sha256"],
-                               "bytes": preparation["archive_bytes"]}},
+                 "toolchain": dict(toolchain_identity)},
         rows=rows, direct_objects=direct, remote_objects=remote)
 
 
@@ -503,7 +644,10 @@ def _cli() -> int:
     verify.add_argument("--image-architecture", required=True)
     verify.add_argument("--image-os", required=True)
     verify.add_argument("--image-created", required=True)
-    verify.add_argument("--toolchain", type=Path, required=True)
+    verify.add_argument("--toolchain", type=Path,
+                        help="deprecated archive identity; rejected for reuse")
+    verify.add_argument("--toolchain-sha256")
+    verify.add_argument("--toolchain-bytes", type=int)
     verify.add_argument("--output", type=Path, required=True)
     create = sub.add_parser("create")
     create.add_argument("--cell-output", type=Path, required=True)
@@ -512,6 +656,9 @@ def _cli() -> int:
     args = parser.parse_args()
     try:
         if args.command == "verify":
+            if (args.toolchain is not None or args.toolchain_sha256 is None or
+                    args.toolchain_bytes is None):
+                raise ReferenceWitnessError("reuse:stable_toolchain_identity_required")
             result = validate_reuse(args.package, batch_manifest=args.batch_manifest,
                                     predictive_plan=args.predictive_plan, authority=args.authority,
                                     image_identity={"reference": args.image_reference,
@@ -519,7 +666,10 @@ def _cli() -> int:
                                                     "architecture": args.image_architecture,
                                                     "os": args.image_os,
                                                     "created": args.image_created},
-                                    toolchain=args.toolchain)
+                                    toolchain=args.toolchain,
+                                    toolchain_identity=({"sha256": args.toolchain_sha256,
+                                                         "bytes": args.toolchain_bytes}
+                                                        if args.toolchain_sha256 is not None else None))
             args.output.write_bytes(_canonical(result) + b"\n")
             return 0
         if args.command == "create":

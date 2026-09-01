@@ -129,7 +129,42 @@ def test_external_command_exposes_explicit_reuse_inputs(monkeypatch: pytest.Monk
         profile="ZSTD_ROUTE", corpus="DuckDB", regime="cold", depth="100",
         suite="C1F1/100000", workdir=Path("/tmp/p50compilee2e.external"),
         timeout_seconds=900, reference_witness=Path("/tanksmall/witness/manifest.jsonl"),
-        reference_authority=Path("/tanksmall/authority.json"), reference_image=image)
+        reference_authority=Path("/tanksmall/authority.json"), reference_image=image,
+        reference_toolchain={"sha256": "c" * 64, "bytes": 42})
     assert "ICECC_P50_REFERENCE_WITNESS=/tanksmall/witness/manifest.jsonl" in command
     assert "ICECC_P50_REFERENCE_AUTHORITY=/tanksmall/authority.json" in command
     assert "ICECC_P50_REFERENCE_IMAGE_ID=sha256:" + "b" * 64 in command
+    runner = command.index("/tanksmall/unittests/p50compilee2e-run.sh")
+    assert all(command.index(item) < runner for item in command
+               if item.startswith("ICECC_P50_REFERENCE_"))
+
+
+def test_reuse_has_no_direct_compiler_fallback_and_package_failures_cleanup(tmp_path: Path) -> None:
+    runner_source = (Path(witness.__file__).parents[1] / "unittests" /
+                     "p50compilee2e-run.sh").read_text(encoding="utf-8")
+    assert 'elif test "$reference_reuse" -eq 0 && test -n "$db_ref"; then' in runner_source
+    assert 'elif test "$reference_reuse" -eq 0; then' in runner_source
+    assert 'FAIL: reference reuse did not produce a witness object' in runner_source
+    _row, authority, plan, batch, direct, remote = _fixture(tmp_path)
+    package = tmp_path / "witness"
+    remote.write_bytes(b"different")
+    with pytest.raises(witness.ReferenceWitnessError):
+        witness.create_package(
+            package, cell={"corpus": "DuckDB", "profile": "ZSTD_ROUTE", "regime": "cold", "depth": 1},
+            batch_manifest=batch, predictive_plan=plan, authority=authority,
+            product={"image": {"reference": "image", "image_id": "sha256:" + "b" * 64,
+                                "architecture": "amd64", "os": "linux", "created": "now"},
+                     "toolchain": {"sha256": "a" * 64, "bytes": 10}},
+            rows=[_row], direct_objects=[direct], remote_objects=[remote])
+    assert not package.exists()
+
+
+def test_stable_compiler_identity_is_content_bound_not_archive_bound() -> None:
+    image = {"reference": "image", "image_id": "sha256:" + "b" * 64,
+             "architecture": "amd64", "os": "linux", "created": "now"}
+    first = witness.stable_toolchain_identity(image, {"usr/bin/g++": "a" * 64})
+    second = witness.stable_toolchain_identity(image, {"usr/bin/g++": "a" * 64})
+    changed = witness.stable_toolchain_identity(image, {"usr/bin/g++": "c" * 64})
+    assert first == second
+    assert first["sha256"] != changed["sha256"]
+    assert "content" in first and "image" in first["content"]

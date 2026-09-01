@@ -953,6 +953,11 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
                  external_authority_command: Sequence[str] | None = None,
                  external_authority_command_timeout: float = 900.0,
                  external_transport_factory: Callable[[dict[str, object]], object] | None = None,
+                 reference_witness: str | Path | None = None,
+                 reference_authority: str | Path | None = None,
+                 reference_witness_output: Path | None = None,
+                 artifact_sample: int = 2,
+                 retain_all_artifacts: bool = False,
                  timestamp: str | None = None,
                  container_image: str | None = PINNED_IMAGE,
                  container_image_id: str | None = None,
@@ -985,6 +990,19 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
     compile_db_path = Path(compile_db).absolute() if compile_db else None
     compile_source_path = Path(compile_source_root).absolute() if compile_source_root else None
     compile_output_path = Path(compile_output_root).absolute() if compile_output_root else None
+    reference_witness_path = Path(reference_witness).absolute() if reference_witness else None
+    reference_authority_path = Path(reference_authority).absolute() if reference_authority else None
+    reference_witness_output_path = (Path(reference_witness_output).absolute()
+                                     if reference_witness_output else None)
+    if mode == EXTERNAL_FARM_MODE:
+        for value, label in ((reference_witness_path, "reference_witness"),
+                             (reference_authority_path, "reference_authority"),
+                             (reference_witness_output_path, "reference_witness_output")):
+            if value is not None and not value.is_absolute():
+                raise CampaignError(f"external_farm:{label}_absolute_required")
+        if (reference_witness_output_path is not None and reference_witness_path is None and
+                reference_witness_output_path.exists()):
+            raise CampaignError("external_farm:reference_witness_output_exists")
     container_temp_path = Path(container_temp_root).absolute() if container_temp_root else None
     simulator_authority_path = (Path(simulator_authority).absolute()
                                  if simulator_authority else None)
@@ -1041,6 +1059,12 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
         "simulator_authority": str(simulator_authority_path) if simulator_authority_path else None,
         "external_farm_authority": str(external_authority_path)
         if external_authority_path is not None else None,
+        "reference_witness": str(reference_witness_path) if reference_witness_path else None,
+        "reference_authority": str(reference_authority_path) if reference_authority_path else None,
+        "reference_witness_output": (str(reference_witness_output_path)
+                                      if reference_witness_output_path else None),
+        "artifact_sample": artifact_sample,
+        "retain_all_artifacts": retain_all_artifacts,
         "external_authority_provider": external_authority_provider is not None,
         "external_authority_command": (list(external_authority_command)
                                         if external_authority_command is not None else None),
@@ -1257,9 +1281,22 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
                     transport = factory(authority)
                     cell_runner = (external_cell_runner or
                                    external_farm_executor.execute_and_finalize_external_cell)
+                    cell_kwargs: dict[str, object] = {}
+                    if reference_witness is not None:
+                        cell_kwargs.update(reference_witness=reference_witness_path,
+                                           reference_authority=reference_authority_path)
+                    if (reference_witness_output_path is not None and reference_witness_path is None and
+                            not reference_witness_output_path.exists()):
+                        # A first accepted cell is the only honest bootstrap:
+                        # retain every object so the package can be minted.
+                        cell_kwargs["retain_all_artifacts"] = True
+                    elif retain_all_artifacts:
+                        cell_kwargs["retain_all_artifacts"] = True
+                    if artifact_sample != 2:
+                        cell_kwargs["artifact_sample"] = artifact_sample
                     try:
                         with _live_run_lock(None):
-                            cell_runner(
+                            cell_result = cell_runner(
                                 transport, topology=cell["topology"],
                                 relationship_hosts=None, profile=cell["profile"],
                                 batch_manifest=prep_dir / "batch-manifest.jsonl",
@@ -1270,7 +1307,18 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
                                 product_root=product_build_root,
                                 repeat_predictive_plan=repeat_plan,
                                 passes=2 if depth == "full" else 1,
-                                timestamp=stamp)
+                                timestamp=stamp, **cell_kwargs)
+                        if (reference_witness_output_path is not None and reference_witness_path is None and
+                                not reference_witness_output_path.exists()):
+                            if reference_witness_output_path.exists():
+                                raise CampaignError("external_farm:reference_witness_output_exists")
+                            try:
+                                external_farm_executor.reference_witness_module.create_from_cell(
+                                    live_out.parent, authority=authority_path,
+                                    package_dir=reference_witness_output_path)
+                            except (external_farm_executor.reference_witness_module.ReferenceWitnessError,
+                                    OSError) as exc:
+                                raise CampaignError(f"external_farm:reference_witness_create_failed:{exc}") from exc
                     except external_farm_executor.ExternalFarmError as exc:
                         raise CampaignError(f"external_farm:{exc}") from exc
                 elif error is None:
@@ -1461,6 +1509,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--simulator-authority", type=Path)
     parser.add_argument("--external-farm-authority", type=Path,
                         help="private authenticated authority for --mode external-farm")
+    parser.add_argument("--reference-witness", type=Path)
+    parser.add_argument("--reference-authority", type=Path)
+    parser.add_argument("--reference-witness-output", type=Path)
+    parser.add_argument("--artifact-sample", type=int, default=2)
+    parser.add_argument("--retain-all-artifacts", action="store_true")
     parser.add_argument("--external-farm-authority-command", type=shlex.split,
                         help="quoted argv template producing {output} authority before each external cell")
     parser.add_argument("--external-farm-authority-command-timeout", type=float, default=900.0)
@@ -1497,6 +1550,11 @@ def main(argv: list[str] | None = None) -> int:
                                                      if args.topologies is not None else None),
                                 simulator_authority=args.simulator_authority,
                                 external_farm_authority=args.external_farm_authority,
+                                reference_witness=args.reference_witness,
+                                reference_authority=args.reference_authority,
+                                reference_witness_output=args.reference_witness_output,
+                                artifact_sample=args.artifact_sample,
+                                retain_all_artifacts=args.retain_all_artifacts,
                                 external_authority_command=args.external_farm_authority_command,
                                 external_authority_command_timeout=args.external_farm_authority_command_timeout)
     except CampaignError as exc:
