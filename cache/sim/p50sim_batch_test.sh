@@ -96,6 +96,33 @@ assert [row["segment"] for row in rows] == ["full-1", "full-1", "full-2", "full-
 assert rows[2]["tu_seq"] == 2 and rows[2]["state_before_digest"] == rows[1]["state_digest"]
 PY
 
+# A batch larger than the F InputRecordStore record bound must remain
+# successful: each committed compiler-visible record is closed and collected
+# before the next TU, while the relationship state continues across rows.
+: > "$work/retention.manifest"
+: > "$work/retention.map"
+printf '%s\n' cardinality=1 >> "$work/retention.map"
+for n in $(seq 0 4096); do
+    printf 'retention-%s\n' "$n" > "$work/retention-$n.ii"
+    printf '%s\n' "$work/retention-$n.ii" >> "$work/retention.manifest"
+    printf '0\n' >> "$work/retention.map"
+done
+ICECC_P50_PROFILE=ZSTD_TU "$sim" --batch-manifest "$work/retention.manifest" \
+    --batch-assignment-map "$work/retention.map" --batch-output "$work/retention.jsonl"
+test "$(wc -l < "$work/retention.jsonl")" -eq 4097
+
+ICECC_P50_PROFILE=P29 "$sim" --batch-manifest "$work/manifest" \
+    --batch-assignment-map "$work/map1" --batch-manifest-2 "$work/manifest" \
+    --batch-assignment-map-2 "$work/map1" --batch-output "$work/p29-pair.jsonl"
+python3 - "$work/p29-pair.jsonl" <<'PY'
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1])]
+assert [row["segment"] for row in rows] == ["full-1", "full-1", "full-2", "full-2"]
+assert rows[2]["tu_seq"] == 2
+assert rows[2]["state_before_digest"] == rows[1]["state_digest"]
+assert rows[3]["state_before_digest"] == rows[2]["state_digest"]
+PY
+
 ICECC_P50_PROFILE=ZSTD_ROUTE "$sim" --batch-manifest "$work/manifest" \
     --batch-assignment-map "$work/map1" --batch-manifest-2 "$work/manifest" \
     --batch-assignment-map-2 "$work/map1" --batch-manifest-3 "$work/manifest" \

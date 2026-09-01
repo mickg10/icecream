@@ -488,6 +488,33 @@ struct BatchRelation {
     std::optional<Digest128> last_state_digest;
 };
 
+std::string_view client_status_name(ClientRunStatus status) {
+    switch (status) {
+    case ClientRunStatus::Committed: return "Committed";
+    case ClientRunStatus::Disconnected: return "Disconnected";
+    case ClientRunStatus::DeadlineExceeded: return "DeadlineExceeded";
+    case ClientRunStatus::TerminalError: return "TerminalError";
+    }
+    return "unknown";
+}
+
+std::string_view server_status_name(ServerRunStatus status) {
+    switch (status) {
+    case ServerRunStatus::Completed: return "Completed";
+    case ServerRunStatus::Disconnected: return "Disconnected";
+    case ServerRunStatus::TerminalError: return "TerminalError";
+    case ServerRunStatus::DeadlineExceeded: return "DeadlineExceeded";
+    }
+    return "unknown";
+}
+
+std::string bounded_context(std::string_view value) {
+    constexpr size_t kContextLimit = 256;
+    if (value.size() <= kContextLimit)
+        return std::string(value);
+    return std::string(value.substr(0, kContextLimit)) + "...";
+}
+
 void write_batch_row(std::ostream& output, std::string_view segment,
                      std::string_view relation_id, size_t index,
                      size_t expected_tu_seq,
@@ -676,6 +703,9 @@ void run_batch(const Arguments& arguments) {
                              const std::vector<size_t>& assignments) {
         for (size_t index = 0; index < manifest.size(); ++index) {
             BatchRelation& relation = relations[assignments[index]];
+            const std::string relation_id =
+                "c1f" + std::to_string(relationship_count) + "-r" +
+                (assignments[index] < 10 ? "0" : "") + std::to_string(assignments[index]);
             const std::vector<uint8_t> input = read_bytes(manifest[index]);
             relation.actions.clear();
             relation.completions.clear();
@@ -702,11 +732,35 @@ void run_batch(const Arguments& arguments) {
             const ClientRunResult client_result = client_future.get();
             if (client_result.status != ClientRunStatus::Committed ||
                 server_result.status != ServerRunStatus::Completed ||
+                !client_result.committed_input || !server_result.committed_input ||
+                client_result.committed_input != server_result.committed_input ||
                 !relation.actions.valid() || !relation.completions.valid())
-                throw std::runtime_error("product batch TU did not commit on both endpoints");
-            const std::string relation_id =
-                "c1f" + std::to_string(relationship_count) + "-r" +
-                (assignments[index] < 10 ? "0" : "") + std::to_string(assignments[index]);
+            {
+                const P50ServerOwnerUsage usage = relation.server->owner_usage();
+                std::ostringstream detail;
+                detail << "product batch TU did not commit on both endpoints"
+                       << " (segment=" << bounded_context(segment)
+                       << ",index=" << index
+                       << ",path=" << bounded_context(manifest[index])
+                       << ",relationship=" << relation_id
+                       << ",client_status=" << client_status_name(client_result.status)
+                       << ",server_status=" << server_status_name(server_result.status)
+                       << ",client_error="
+                       << (client_result.terminal_error
+                               ? bounded_context(client_result.terminal_error->detail) : "none")
+                       << ",server_error="
+                       << (server_result.terminal_error
+                               ? bounded_context(server_result.terminal_error->detail) : "none")
+                       << ",actions_valid=" << relation.actions.valid()
+                       << ",action_records=" << relation.actions.records().size()
+                       << ",completions_valid=" << relation.completions.valid()
+                       << ",completion_records=" << relation.completions.completions().size()
+                       << ",owner_retained_records=" << usage.retained_input_records
+                       << ",owner_retained_bytes=" << usage.retained_input_bytes
+                       << ",owner_live_sessions=" << usage.live_sessions
+                       << ",owner_namespaces=" << usage.namespaces << ")";
+                throw std::runtime_error(detail.str());
+            }
             const size_t prefix_after_bytes = relation.authority->route_history_bytes();
             const Digest128 prefix_after_digest = relation.authority->route_history_digest();
             write_batch_row(output, segment, relation_id, index, relationship_tu_seq, input,
@@ -714,6 +768,10 @@ void run_batch(const Arguments& arguments) {
                             relation.actions, *relation.client, expected_before,
                             prefix_before_bytes, prefix_before_digest,
                             prefix_after_bytes, prefix_after_digest, elapsed, profile);
+            output.flush();
+            if (!output)
+                throw std::runtime_error("cannot flush batch output before input reclamation");
+
             for (const ActionRecord& action : relation.actions.records()) {
                 if (action.action == ActionType::COMMIT_ACCEPTED &&
                     action.raw_digest == icecc::digest128(input)) {
@@ -721,6 +779,30 @@ void run_batch(const Arguments& arguments) {
                         relation.last_state_digest = action.state_digest;
                     break;
                 }
+            }
+
+            // The batch row has authenticated and persisted the exact
+            // compiler-visible key.  Retire that logical input lease before
+            // reading the next TU.  This reclaims F InputRecordStore bytes;
+            // relationship/profile state remains owned by the endpoint and
+            // preparation authority for repeat/full-2 continuity.
+            if (!server_result.committed_input)
+                throw std::runtime_error(
+                    "product batch committed row has no compiler input key (relationship=" +
+                    relation_id + ")");
+            relation.server->close_input_job(*server_result.committed_input);
+            relation.server->collect_input_garbage();
+            const P50ServerOwnerUsage usage = relation.server->owner_usage();
+            if (usage.retained_input_records != 0 || usage.retained_input_bytes != 0) {
+                std::ostringstream detail;
+                detail << "product batch input reclamation left retained records"
+                       << " (segment=" << bounded_context(segment)
+                       << ",index=" << index
+                       << ",path=" << bounded_context(manifest[index])
+                       << ",relationship=" << relation_id
+                       << ",retained_records=" << usage.retained_input_records
+                       << ",retained_bytes=" << usage.retained_input_bytes << ")";
+                throw std::runtime_error(detail.str());
             }
             if (relation.authority->release(prepared) != 0 ||
                 relation.authority->live_entry_count() != 0 ||
