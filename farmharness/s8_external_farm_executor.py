@@ -42,6 +42,11 @@ TOPOLOGIES = {"C1F1/100000": (1, 1), "C1F20/40": (20, 2)}
 PROFILES = ("P29", "ZSTD_TU", "ZSTD_ROUTE", "GRZ_RESIDUAL", "RAW_II")
 IDLE_LOAD_THRESHOLD = 0.50
 MIN_IDLE_PERCENT = 95.0
+INTERFERENCE_SCHEMA = "icecream-s8-f-interference-v2"
+# A cell-local witness does not need 100 Hz sampling.  The root's cumulative
+# child CPU counters retain short-lived work between these bounded samples.
+INTERFERENCE_POLL_SECONDS = 1.0
+INTERFERENCE_ROOT_REDISCOVERY_SECONDS = 5.0
 
 
 class ExternalFarmError(ValueError):
@@ -449,6 +454,359 @@ def interference_delta(before: int, after: int, *, limit: int = 100) -> int:
     return delta
 
 
+def validate_interference_result(result: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate the fail-closed result emitted by the F-host monitor."""
+    phases = result.get("phases") if isinstance(result, Mapping) else None
+    events = result.get("events") if isinstance(result, Mapping) else None
+    if (not isinstance(result, Mapping) or result.get("schema") != INTERFERENCE_SCHEMA or
+            result.get("status") not in {"PASS", "FAIL"} or
+            type(result.get("timing_eligible")) is not bool or
+            not isinstance(events, list) or
+            any(not isinstance(event, str) or not event for event in events) or
+            not isinstance(phases, list) or len(phases) != 3 or
+            any(not isinstance(phase, Mapping) for phase in phases) or
+            [phase.get("phase") for phase in phases] != ["before", "during", "after"] or
+            any(Path(str(phase.get("path", ""))).name !=
+                f"interference-{phase['phase']}.jsonl" for phase in phases)):
+        raise ExternalFarmError("evidence:interference_result_invalid")
+    if (result["status"] != "PASS" or result["timing_eligible"] is not True or
+            events or result.get("reason") is not None):
+        raise ExternalFarmError("evidence:background_farm_activity")
+    return dict(result)
+
+
+# Runs outside Docker on each selected F host.  /proc starttime is paired
+# with every PID so a recycled PID can never be mistaken for the P50 daemon.
+# Parent child-CPU counters retain evidence for a compiler that starts and
+# exits between scans.  The monitor only owns its marker/PID files.
+INTERFERENCE_MONITOR_PROGRAM = r'''import hashlib, json, pathlib, sys, time
+SCHEMA = "icecream-s8-f-interference-v2"
+root = pathlib.Path(sys.argv[1])
+owner_pid, owner_start = int(sys.argv[2]), int(sys.argv[3])
+expected_physical, expected_boot = sys.argv[4], sys.argv[5]
+poll_seconds = float(sys.argv[6])
+root_rediscovery_seconds = float(sys.argv[7])
+stop_path = root / "interference-stop"
+before_path = root / "interference-before.jsonl"
+during_path = root / "interference-during.jsonl"
+after_path = root / "interference-after.jsonl"
+result_path = root / "interference-result.json"
+
+def digest(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(65536), b""):
+            h.update(block)
+    return h.hexdigest()
+
+def host_identity():
+    boot = digest("/proc/sys/kernel/random/boot_id")
+    machine = digest("/etc/machine-id")
+    rows = []
+    for path in sorted(pathlib.Path("/sys/class/net").glob("*")):
+        if path.name == "lo":
+            continue
+        try:
+            real, mac = str(path.resolve()), (path / "address").read_text().strip()
+        except (OSError, UnicodeError):
+            continue
+        if "/virtual/" in real or not mac or mac == "00:00:00:00:00:00":
+            continue
+        rows.append(f"{path.name}:{mac}:{real}")
+    nic = hashlib.sha256(("\n".join(rows) + "\n").encode()).hexdigest()
+    physical_input = {"machine_id_sha256": machine, "nic_identity_sha256": nic}
+    physical = hashlib.sha256(json.dumps(
+        physical_input, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return physical, boot
+
+def read_stat(pid):
+    try:
+        text = pathlib.Path(f"/proc/{pid}/stat").read_text()
+        tail = text[text.rfind(")") + 2:].split()
+        # tail[0] is state; these are proc(5) fields after pid and comm.
+        return {"pid": pid, "starttime": int(tail[19]), "ppid": int(tail[1]),
+                "cpu_ticks": int(tail[11]) + int(tail[12]),
+                "child_cpu_ticks": int(tail[13]) + int(tail[14])}
+    except (OSError, UnicodeError, ValueError, IndexError):
+        return None
+
+def command(pid):
+    try:
+        return pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().replace(
+            b"\0", b" ").decode(errors="replace").strip()
+    except (OSError, UnicodeError):
+        return ""
+
+def discover_processes():
+    """Discover roots/tree infrequently; ordinary polls never scan /proc."""
+    rows = {}
+    by_parent = {}
+    for path in pathlib.Path("/proc").glob("[0-9]*"):
+        try:
+            pid = int(path.name)
+        except ValueError:
+            continue
+        row = read_stat(pid)
+        if row is not None:
+            rows[pid] = row
+            by_parent.setdefault(row["ppid"], []).append(pid)
+    ordinary_roots = {}
+    for pid, row in rows.items():
+        process_command = command(pid)
+        if "iceccd" in process_command and "-N farm-qbox" in process_command:
+            ordinary_roots[pid] = row
+    return rows, ordinary_roots, by_parent
+
+def descendants(rows, by_parent, root_pids):
+    result = {}
+    pending = list(root_pids)
+    while pending:
+        parent = pending.pop()
+        for pid in by_parent.get(parent, ()):
+            row = rows.get(pid)
+            if row is None or pid in result:
+                continue
+            result[pid] = row
+            pending.append(pid)
+    return result
+
+def snapshot_rows(owner_row, owner_descendant_rows, root_rows, descendant_rows):
+    rows = {}
+    if owner_row is not None:
+        row = dict(owner_row)
+        row["kind"] = "executor_f"
+        rows[owner_row["pid"]] = row
+    for (pid, starttime), source in owner_descendant_rows.items():
+        if source is None or source["starttime"] != starttime:
+            continue
+        row = dict(source)
+        row["kind"] = "executor_f"
+        rows[pid] = row
+    for pid, source in root_rows.items():
+        row = dict(source)
+        row["kind"] = "ordinary_daemon"
+        rows[pid] = row
+    for (pid, starttime), source in descendant_rows.items():
+        if source is None or source["starttime"] != starttime:
+            continue
+        row = dict(source)
+        row["kind"] = "ordinary_child"
+        rows[pid] = row
+    return rows
+
+def write_snapshot(path, phase, identity, rows, event=None):
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps({"schema": SCHEMA, "phase": phase,
+                                 "captured_at_ns": time.time_ns(),
+                                 "physical_host_digest": identity[0],
+                                 "boot_id_digest": identity[1],
+                                 "owner": {"pid": owner_pid, "starttime": owner_start},
+                                 "rows": list(rows.values()), "event": event},
+                            sort_keys=True, separators=(",", ":")) + "\n")
+
+try:
+    identity = host_identity()
+except (OSError, UnicodeError):
+    identity = ("", "")
+if identity != (expected_physical, expected_boot):
+    result = {"schema": SCHEMA, "status": "FAIL", "timing_eligible": False,
+              "reason": "host_identity_changed", "phases": []}
+    result_path.write_text(json.dumps(result, sort_keys=True) + "\n")
+    raise SystemExit(77)
+all_rows, discovered_roots, by_parent = discover_processes()
+owner = all_rows.get(owner_pid)
+if owner is None or owner["starttime"] != owner_start:
+    result = {"schema": SCHEMA, "status": "FAIL", "timing_eligible": False,
+              "reason": "executor_identity_missing", "phases": []}
+    result_path.write_text(json.dumps(result, sort_keys=True) + "\n")
+    raise SystemExit(77)
+root_state = {pid: {"starttime": row["starttime"],
+                    "baseline_child_cpu": row["child_cpu_ticks"]}
+              for pid, row in discovered_roots.items()}
+initial_descendants = descendants(all_rows, by_parent, root_state)
+initial_descendants = {(pid, row["starttime"]): row
+                       for pid, row in initial_descendants.items()}
+descendant_baselines = {key: row["cpu_ticks"]
+                        for key, row in initial_descendants.items()}
+initial_owner_descendants = descendants(all_rows, by_parent, [owner_pid])
+initial_owner_descendants = {(pid, row["starttime"]): row
+                             for pid, row in initial_owner_descendants.items()}
+owner_descendant_baselines = {key: row["cpu_ticks"]
+                              for key, row in initial_owner_descendants.items()}
+events = []
+for path in (before_path, during_path, after_path):
+    path.write_text("", encoding="utf-8")
+write_snapshot(before_path, "before", identity,
+               snapshot_rows(owner, initial_owner_descendants,
+                             discovered_roots, initial_descendants))
+last_summary = 0.0
+last_event = None
+last_rediscovery = time.monotonic()
+while not stop_path.exists():
+    time.sleep(poll_seconds)
+    event = None
+    owner = read_stat(owner_pid)
+    if owner is None or owner["starttime"] != owner_start:
+        event = "executor_identity_lost_or_pid_reused"
+    current_owner_descendants = {}
+    for key in owner_descendant_baselines:
+        pid, starttime = key
+        row = read_stat(pid)
+        if row is not None and row["starttime"] == starttime:
+            current_owner_descendants[key] = row
+        elif row is not None:
+            event = "executor_child_pid_reused"
+    current_roots = {}
+    for pid, state in root_state.items():
+        row = read_stat(pid)
+        if row is None:
+            event = "ordinary_root_disappeared"
+            continue
+        if row["starttime"] != state["starttime"]:
+            event = "ordinary_root_pid_reused"
+            continue
+        current_roots[pid] = row
+        if row["child_cpu_ticks"] > state["baseline_child_cpu"]:
+            event = "ordinary_child_cpu"
+    current_descendants = {}
+    for key, baseline_ticks in descendant_baselines.items():
+        pid, starttime = key
+        row = read_stat(pid)
+        if row is None:
+            continue
+        if row["starttime"] != starttime:
+            event = "ordinary_child_pid_reused"
+            continue
+        current_descendants[key] = row
+        if row["cpu_ticks"] > baseline_ticks:
+            event = "ordinary_child_running"
+    now = time.monotonic()
+    if now - last_rediscovery >= root_rediscovery_seconds:
+        all_rows, discovered_roots, by_parent = discover_processes()
+        for pid, row in discovered_roots.items():
+            state = root_state.get(pid)
+            if state is not None and state["starttime"] != row["starttime"]:
+                event = "ordinary_root_pid_reused"
+            elif state is None:
+                root_state[pid] = {"starttime": row["starttime"],
+                                   "baseline_child_cpu": row["child_cpu_ticks"]}
+                event = "ordinary_root_started"
+        discovered_descendants = descendants(all_rows, by_parent, root_state)
+        for pid, row in discovered_descendants.items():
+            key = (pid, row["starttime"])
+            if key not in descendant_baselines:
+                descendant_baselines[key] = row["cpu_ticks"]
+                event = "ordinary_child_started"
+            current_descendants[key] = row
+        discovered_owner_descendants = descendants(all_rows, by_parent, [owner_pid])
+        for pid, row in discovered_owner_descendants.items():
+            key = (pid, row["starttime"])
+            if key not in owner_descendant_baselines:
+                owner_descendant_baselines[key] = row["cpu_ticks"]
+            current_owner_descendants[key] = row
+        last_rediscovery = now
+    if event is not None and event != last_event:
+        events.append(event)
+    if ((event is not None and event != last_event) or
+            now - last_summary >= 1.0):
+        write_snapshot(during_path, "during", identity,
+                       snapshot_rows(owner, current_owner_descendants,
+                                     current_roots, current_descendants), event=event)
+        last_summary = now
+    if event is not None:
+        last_event = event
+owner = read_stat(owner_pid)
+if owner is None or owner["starttime"] != owner_start:
+    events.append("executor_identity_lost_or_pid_reused")
+# Close the final one-second sampling edge explicitly.  A stopped/restarted
+# ordinary daemon, or reaped child CPU after the last loop sample, still makes
+# the timing cell ineligible.
+for pid, state in root_state.items():
+    row = read_stat(pid)
+    if row is None:
+        events.append("ordinary_root_disappeared")
+    elif row["starttime"] != state["starttime"]:
+        events.append("ordinary_root_pid_reused")
+    elif row["child_cpu_ticks"] > state["baseline_child_cpu"]:
+        events.append("ordinary_child_cpu")
+if not during_path.stat().st_size:
+    write_snapshot(during_path, "during", identity,
+                   snapshot_rows(owner, current_owner_descendants,
+                                 current_roots, current_descendants),
+                   event=events[-1] if events else None)
+try:
+    final_identity = host_identity()
+except (OSError, UnicodeError):
+    final_identity = ("", "")
+if final_identity != (expected_physical, expected_boot):
+    events.append("host_identity_changed" if final_identity != ("", "")
+                  else "host_identity_unreadable")
+write_snapshot(after_path, "after", final_identity,
+               snapshot_rows(owner, current_owner_descendants,
+                             current_roots, current_descendants),
+               event=events[-1] if events else None)
+reason = events[0] if events else None
+result = {"schema": SCHEMA, "status": "FAIL" if reason else "PASS",
+          "timing_eligible": not bool(reason), "reason": reason, "events": events,
+          "phases": [{"phase": phase, "path": str(path)} for phase, path in (
+              ("before", before_path), ("during", during_path), ("after", after_path))]}
+result_path.write_text(json.dumps(result, sort_keys=True) + "\n")
+raise SystemExit(77 if reason else 0)
+'''
+
+
+def interference_start_script() -> str:
+    """Start the selected-F monitor and take its authenticated baseline."""
+    program = base64.b64encode(INTERFERENCE_MONITOR_PROGRAM.encode()).decode()
+    return f'''set -eu
+root=$1; expected_physical=$2; expected_boot=$3
+owner_pid=$(tr -d '[:space:]' <"$root/container-pid")
+printf '%s' "$owner_pid" | grep -Eq '^[0-9]+$'
+owner_start=$(awk '{{print $22}}' "/proc/$owner_pid/stat")
+printf '%s' "$owner_start" | grep -Eq '^[0-9]+$'
+printf %s {shlex.quote(program)} | base64 -d >"$root/interference-monitor.py"
+chmod 700 "$root/interference-monitor.py"
+rm -f "$root/interference-stop" "$root/interference-result.json" "$root/interference-monitor.pid"
+nohup python3 "$root/interference-monitor.py" "$root" "$owner_pid" "$owner_start" "$expected_physical" "$expected_boot" {INTERFERENCE_POLL_SECONDS} {INTERFERENCE_ROOT_REDISCOVERY_SECONDS} >"$root/interference-monitor.stdout" 2>&1 &
+monitor_pid=$!
+printf '%s\\n' "$monitor_pid" >"$root/interference-monitor.pid"
+monitor_start=$(awk '{{print $22}}' "/proc/$monitor_pid/stat")
+printf '%s\\n' "$monitor_start" >"$root/interference-monitor-starttime"
+for _ in $(seq 1 100); do test -s "$root/interference-before.jsonl" && exit 0; sleep 0.05; done
+exit 77
+'''
+
+
+def interference_stop_script() -> str:
+    """Stop only this cell's monitor and enforce its timing result."""
+    return '''set -eu
+root=$1
+test -s "$root/interference-monitor.pid"
+monitor_pid=$(tr -d '[:space:]' <"$root/interference-monitor.pid")
+printf '%s' "$monitor_pid" | grep -Eq '^[0-9]+$'
+touch "$root/interference-stop"
+for _ in $(seq 1 300); do
+  test -s "$root/interference-result.json" && break
+  sleep 0.05
+done
+test -s "$root/interference-result.json"
+for phase in before during after; do
+  test -s "$root/interference-$phase.jsonl"
+done
+python3 - "$root/interference-result.json" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+if (value.get("schema") != "icecream-s8-f-interference-v2" or
+        value.get("status") != "PASS" or
+        value.get("timing_eligible") is not True or
+        [row.get("phase") for row in value.get("phases", [])] != ["before", "during", "after"]):
+    raise SystemExit(77)
+PY
+kill -0 "$monitor_pid" 2>/dev/null && exit 77 || true
+cat "$root/interference-result.json"
+'''
+
+
 def compile_database_argv(entry: Mapping[str, Any], *, staged_input: Path,
                           output: Path) -> list[str]:
     """Bind the authenticated compile-database argv to staged `.ii` input."""
@@ -654,6 +1012,7 @@ class SSHTransport:
         supervisor: threading.Thread | None = None
         supervisor_errors: list[str] = []
         cleanup_errors: list[str] = []
+        first_relationship_for_host: dict[str, int] = {}
         if output.exists() or output.is_symlink():
             raise ExternalFarmError("output:private_create_once_required")
         output.mkdir(parents=True, exist_ok=False)
@@ -768,23 +1127,6 @@ while [ "$#" -gt 0 ]; do
   got=$(sha256sum "$root/$rel" | awk '{print $1}')
   test "$got" = "$expected" || fail "role:$rel" "$got" "$expected"
 done
-'''
-            witness = r'''set -eu
-root=$1; phase=$2
-ticks=0
-for pid in $(ps -eo pid=,args= | awk '$0 ~ /iceccd/ && $0 ~ /-N farm-qbox/ {print $1}'); do
-  stat=$(cat "/proc/$pid/stat" 2>/dev/null || true)
-  set -- $stat
-  test "$#" -ge 15 || continue
-  ticks=$((ticks + $14 + $15))
-done
-printf '%s %s\n' "$phase" "$ticks" >"$root/interference-$phase"
-if test "$phase" = after; then
-  before=$(awk '{print $2}' "$root/interference-before")
-  printf 'S8_F_INTERFERENCE before=%s after=%s\n' "$before" "$ticks"
-else
-  printf 'S8_F_INTERFERENCE phase=before ticks=%s\n' "$ticks"
-fi
 '''
             port_gate = r'''set -eu
 python3 - "$@" <<'PY'
@@ -914,8 +1256,6 @@ cp {worker_root}/container-id {worker_root}/rotation-after-id
                     f": >{worker_root}/s7-warm-f-action-trace-{relationship}.jsonl; : >{worker_root}/s7-measured-f-legacy-wire-trace-{relationship}.jsonl"))
             first_relationship_for_host = {host: relationship_hosts.index(host)
                                            for host in dict.fromkeys(relationship_hosts)}
-            for host, relationship in first_relationship_for_host.items():
-                self.run(host, witness, [worker_work(relationship), "before"])
             c_args = profile_arguments(profile, root="/probe/product",
                                        work="/probe/work", role="c")
             client_inner = (daemon_account +
@@ -1185,6 +1525,15 @@ printf 'S8_SIDECAR_ROTATION role=C relationship=0 before_pid=%s after_pid=%s bef
             supervisor.start()
             self.run("q3", readiness_gate(profile, f"{client_work}/scheduler.log",
                                             relationships=TOPOLOGIES[topology][0]))
+            # Establish the F-host baseline immediately before the measured
+            # P50 cell.  The monitor stays alive through the entire batch and
+            # records a final after snapshot before it is reaped.
+            for host, relationship in first_relationship_for_host.items():
+                self.run(host, interference_start_script(), [
+                    worker_work(relationship),
+                    self.authority["hosts"][host]["physical_host_digest"],
+                    self.authority["hosts"][host]["boot_id_digest"],
+                ])
             external_env = [f"ICECC_P50_C1F1_WORKDIR={client_work}",
                             f"ICECC_P50_EXTERNAL_SCHED_PORT={scheduler_port}",
                             f"ICECC_P50_EXTERNAL_SCHEDULER_LOG={client_work}/scheduler.log",
@@ -1221,15 +1570,20 @@ printf 'S8_SIDECAR_ROTATION role=C relationship=0 before_pid=%s after_pid=%s bef
             supervisor.join(timeout=30)
             if supervisor_errors:
                 raise ExternalFarmError(supervisor_errors[0])
-            witness_values: list[dict[str, int]] = []
+            witness_values: list[dict[str, Any]] = []
             for host, relationship in first_relationship_for_host.items():
-                after = self.run(host, witness, [worker_work(relationship), "after"])
-                match = re.search(r"before=([0-9]+) after=([0-9]+)", after.stdout)
-                if not match:
-                    raise ExternalFarmError("evidence:interference_witness_missing")
-                delta = interference_delta(int(match.group(1)), int(match.group(2)))
+                after = self.run(host, interference_stop_script(),
+                                 [worker_work(relationship)])
+                try:
+                    witness = validate_interference_result(
+                        json.loads(after.stdout.strip().splitlines()[-1]))
+                except (ExternalFarmError, json.JSONDecodeError, IndexError) as exc:
+                    raise ExternalFarmError("evidence:interference_witness_missing") from exc
                 witness_values.append({"host": host, "relationship": relationship,
-                                       "delta_ticks": delta})
+                                       "schema": INTERFERENCE_SCHEMA,
+                                       "timing_eligible": witness["timing_eligible"],
+                                       "events": witness.get("events", []),
+                                       "phases": witness["phases"]})
             metrics = observed_batch_metrics(result.stdout, topology)
             overlap_required(topology, metrics)
             # Preserve the daemon work trees before unique-resource cleanup;
@@ -1256,6 +1610,23 @@ printf 'S8_SIDECAR_ROTATION role=C relationship=0 before_pid=%s after_pid=%s bef
                     raise ExternalFarmError(f"evidence:f_log_invalid:{relationship}") from exc
                 if re.search(rb"start_install_environment|handle_transfer_env", measured_log):
                     raise ExternalFarmError(f"evidence:f_environment_install_measured:{relationship}")
+                witness = next((item for item in witness_values
+                                if item["relationship"] == relationship), None)
+                if witness is not None:
+                    phase_refs: list[dict[str, Any]] = []
+                    for phase in ("before", "during", "after"):
+                        phase_path = f"interference-{phase}.jsonl"
+                        evidence_path = f_evidence / phase_path
+                        if (not evidence_path.is_file() or evidence_path.is_symlink() or
+                                evidence_path.stat().st_size <= 0):
+                            raise ExternalFarmError(
+                                f"evidence:interference_phase_missing:{relationship}:{phase}")
+                        sha, size = _sha(evidence_path)
+                        phase_refs.append({"path": str(evidence_path.relative_to(output)),
+                                           "sha256": sha, "bytes": size})
+                    witness["phases"] = phase_refs
+                    witness["physical_host_digest"] = self.authority["hosts"][host]["physical_host_digest"]
+                    witness["boot_id_digest"] = self.authority["hosts"][host]["boot_id_digest"]
             cohort = cohort_digest(self.authority, topology, relationship_hosts)
             (output / "calibration-metadata.json").write_text(
                 json.dumps({"host_digest": cohort, "cohort_digest": cohort,
@@ -1332,6 +1703,8 @@ printf 'S8_SIDECAR_ROTATION role=C relationship=0 before_pid=%s after_pid=%s bef
             targets = [("q3", f"{client_work}/reset-worker.pid"),
                        ("q3", f"{client_work}/collect-worker.pid"),
                        ("q3", f"{client_work}/c.container-id")]
+            targets = [(host, f"{worker_work(relationship)}/interference-monitor.pid")
+                       for host, relationship in first_relationship_for_host.items()] + targets
             targets.extend((host, f"{worker_work(i)}/container-id")
                            for i, (host, _service) in enumerate(services))
             targets.append(("q3", f"{client_work}/scheduler.container-id"))
@@ -1342,9 +1715,23 @@ id=$(tr -d '[:space:]' <"$path")
 printf '%s' "$id" | grep -Eq '^[0-9a-fA-F]{12,64}$' || exit 77
 docker rm -f "$id" >/dev/null 2>&1 || true
 '''
+            monitor_cleanup = '''set -eu
+path=$1; test -f "$path" || exit 0
+root=${path%/interference-monitor.pid}
+pid=$(tr -d '[:space:]' <"$path")
+start=$(tr -d '[:space:]' <"$root/interference-monitor-starttime")
+printf '%s' "$pid" | grep -Eq '^[0-9]+$'
+printf '%s' "$start" | grep -Eq '^[0-9]+$'
+current=$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || true)
+test -n "$current" && test "$current" = "$start" || exit 0
+touch "$root/interference-stop"
+kill "$pid" 2>/dev/null || true
+'''
             for host, path in targets:
                 try:
-                    if path.endswith(".pid"):
+                    if path.endswith("interference-monitor.pid"):
+                        self.run(host, monitor_cleanup, [path])
+                    elif path.endswith(".pid"):
                         self.run(host, '''set -eu
 path=$1; test -f "$path" || exit 0
 pid=$(tr -d '[:space:]' <"$path")

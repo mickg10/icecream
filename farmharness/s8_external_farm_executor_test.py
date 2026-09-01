@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shlex
 import shutil
 import subprocess
+import sys
+import time
 import datetime as dt
 from pathlib import Path
 from typing import Sequence
@@ -167,6 +170,174 @@ def test_interference_witness_allows_keepalive_tick_but_holds_material_work() ->
         executor.interference_delta(10, 111)
 
 
+def _local_monitor_identity() -> tuple[str, str]:
+    boot = hashlib.sha256(Path("/proc/sys/kernel/random/boot_id").read_bytes()).hexdigest()
+    machine = hashlib.sha256(Path("/etc/machine-id").read_bytes()).hexdigest()
+    rows: list[str] = []
+    for path in sorted(Path("/sys/class/net").glob("*")):
+        if path.name == "lo":
+            continue
+        try:
+            real, mac = str(path.resolve()), (path / "address").read_text().strip()
+        except OSError:
+            continue
+        if "/virtual/" in real or not mac or mac == "00:00:00:00:00:00":
+            continue
+        rows.append(f"{path.name}:{mac}:{real}")
+    nic = hashlib.sha256(("\n".join(rows) + "\n").encode()).hexdigest()
+    physical = hashlib.sha256(json.dumps(
+        {"machine_id_sha256": machine, "nic_identity_sha256": nic},
+        sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return physical, boot
+
+
+def _run_local_monitor(tmp_path: Path, competitor: str | None,
+                       *, kill_owner: bool = False,
+                       competitor_before_monitor: bool = False,
+                       settle_seconds: float = 0.5) -> tuple[dict[str, object], int]:
+    root = tmp_path / "monitor-root"
+    root.mkdir()
+    owner = subprocess.Popen(["sleep", "5"])
+    (root / "container-pid").write_text(str(owner.pid))
+    physical, boot = _local_monitor_identity()
+    child = None
+    if competitor is not None and competitor_before_monitor:
+        child = subprocess.Popen([sys.executable, "-c", competitor])
+    start = subprocess.run(
+        ["bash", "-s", "--", str(root), physical, boot],
+        input=executor.interference_start_script(), text=True,
+        capture_output=True, check=False, timeout=5)
+    assert start.returncode == 0, start.stderr
+    if competitor is not None and not competitor_before_monitor:
+        child = subprocess.Popen([sys.executable, "-c", competitor])
+        time.sleep(settle_seconds)
+    elif competitor_before_monitor:
+        time.sleep(settle_seconds)
+    if kill_owner:
+        owner.terminate()
+        owner.wait(timeout=5)
+        time.sleep(0.1)
+    stop = subprocess.run(
+        ["bash", "-s", "--", str(root)],
+        input=executor.interference_stop_script(), text=True,
+        capture_output=True, check=False, timeout=5)
+    if child is not None:
+        child.wait(timeout=5)
+    owner.terminate(); owner.wait(timeout=5)
+    return json.loads((root / "interference-result.json").read_text()), stop.returncode
+
+
+def test_interference_monitor_rejects_short_lived_competing_child(tmp_path: Path) -> None:
+    competitor = (
+        "import subprocess,time\n"
+        "# iceccd -N farm-qbox\n"
+        "time.sleep(.30)\n"
+        "subprocess.run([__import__('sys').executable, '-c', 'x=0\\nwhile x < 10000000: x += 1'])\n"
+        "time.sleep(1.5)\n"
+    )
+    result, stop_rc = _run_local_monitor(
+        tmp_path, competitor, competitor_before_monitor=True, settle_seconds=2.0)
+    assert stop_rc != 0
+    assert result["status"] == "FAIL"
+    assert result["timing_eligible"] is False
+    # The child is deliberately gone before the first useful stop boundary;
+    # this is the reaped-work witness, not a live-process discovery race.
+    assert result["reason"] == "ordinary_child_cpu"
+    assert [row["phase"] for row in result["phases"]] == ["before", "during", "after"]
+
+
+def _proc_cpu_ticks(pid: int) -> int:
+    text = Path(f"/proc/{pid}/stat").read_text()
+    tail = text[text.rfind(")") + 2:].split()
+    return int(tail[11]) + int(tail[12])
+
+
+def test_interference_monitor_uses_cached_roots_and_edge_identity_checks() -> None:
+    source = executor.INTERFERENCE_MONITOR_PROGRAM
+    assert executor.INTERFERENCE_POLL_SECONDS >= 0.5
+    assert executor.INTERFERENCE_ROOT_REDISCOVERY_SECONDS >= 5.0
+    assert 'pathlib.Path("/proc").glob("[0-9]*")' in source
+    assert "time.sleep(poll_seconds)" in source
+    assert "child_cpu_ticks" in source
+    assert "host_identity() != (expected_physical, expected_boot)" not in source
+    assert source.count("host_identity()") == 3  # definition + before + after
+
+
+def test_interference_monitor_idle_cpu_is_below_two_percent(tmp_path: Path) -> None:
+    root = tmp_path / "monitor-root"
+    root.mkdir()
+    owner = subprocess.Popen(["sleep", "10"])
+    (root / "container-pid").write_text(str(owner.pid))
+    physical, boot = _local_monitor_identity()
+    start = subprocess.run(
+        ["bash", "-s", "--", str(root), physical, boot],
+        input=executor.interference_start_script(), text=True,
+        capture_output=True, check=False, timeout=5)
+    assert start.returncode == 0, start.stderr
+    monitor_pid = int((root / "interference-monitor.pid").read_text())
+    ticks_before = _proc_cpu_ticks(monitor_pid)
+    sample_seconds = 5.0
+    time.sleep(sample_seconds)
+    ticks_after = _proc_cpu_ticks(monitor_pid)
+    stop = subprocess.run(
+        ["bash", "-s", "--", str(root)],
+        input=executor.interference_stop_script(), text=True,
+        capture_output=True, check=False, timeout=5)
+    owner.terminate(); owner.wait(timeout=5)
+    assert stop.returncode == 0, stop.stderr
+    clock_ticks = int(os.sysconf("SC_CLK_TCK"))
+    cpu_seconds = (ticks_after - ticks_before) / clock_ticks
+    assert cpu_seconds / sample_seconds < 0.02, \
+        f"idle interference monitor used {cpu_seconds:.3f}s CPU in {sample_seconds:.1f}s"
+
+
+def test_interference_monitor_allows_idle_ordinary_daemon(tmp_path: Path) -> None:
+    result, stop_rc = _run_local_monitor(
+        tmp_path, "import time\n# iceccd -N farm-qbox\ntime.sleep(.5)\n")
+    assert stop_rc == 0
+    assert result["status"] == "PASS"
+    assert result["timing_eligible"] is True
+
+
+def test_interference_result_rejects_executor_identity_or_pid_reuse() -> None:
+    valid = {"schema": executor.INTERFERENCE_SCHEMA, "status": "PASS",
+             "timing_eligible": True, "reason": None, "events": [],
+             "phases": [{"phase": phase, "path": f"/tmp/interference-{phase}.jsonl"}
+                        for phase in ("before", "during", "after")]}
+    for reason in ("executor_identity_lost_or_pid_reused", "executor_pid_reused"):
+        invalid = dict(valid, status="FAIL", timing_eligible=False, reason=reason)
+        with pytest.raises(executor.ExternalFarmError, match="background_farm_activity"):
+            executor.validate_interference_result(invalid)
+
+
+def test_interference_result_rejects_pass_with_hidden_event() -> None:
+    invalid = {"schema": executor.INTERFERENCE_SCHEMA, "status": "PASS",
+               "timing_eligible": True, "reason": None,
+               "events": ["ordinary_child_cpu"],
+               "phases": [{"phase": phase,
+                            "path": f"/tmp/interference-{phase}.jsonl"}
+                           for phase in ("before", "during", "after")]}
+    with pytest.raises(executor.ExternalFarmError, match="background_farm_activity"):
+        executor.validate_interference_result(invalid)
+
+
+def test_interference_monitor_rejects_executor_identity_loss(tmp_path: Path) -> None:
+    result, stop_rc = _run_local_monitor(tmp_path, None, kill_owner=True)
+    assert stop_rc != 0
+    assert result["status"] == "FAIL"
+    assert result["timing_eligible"] is False
+    assert result["reason"] == "executor_identity_lost_or_pid_reused"
+
+
+def test_interference_monitor_cleanup_reaps_only_its_monitor(tmp_path: Path) -> None:
+    result, stop_rc = _run_local_monitor(tmp_path, None)
+    assert stop_rc == 0 and result["timing_eligible"] is True
+    root = tmp_path / "monitor-root"
+    monitor_pid = int((root / "interference-monitor.pid").read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(monitor_pid, 0)
+
+
 def test_f_to_c_is_returned_object_for_compressed_and_legacy_ledger_for_raw() -> None:
     assert executor.f_to_c_bytes("ZSTD_ROUTE", remote_object_bytes=41, f_action_stage_bytes=999) == 41
     assert executor.f_to_c_bytes("RAW_II", remote_object_bytes=41, f_action_stage_bytes=999,
@@ -311,8 +482,14 @@ def test_concrete_transport_invokes_q3_c_scheduler_and_non_q3_f(tmp_path: Path, 
     calls: list[tuple[str, str]] = []
     def fake_run(host: str, script: str, args: Sequence[object] = ()) -> subprocess.CompletedProcess[str]:
         calls.append((host, script))
-        if "S8_F_INTERFERENCE" in script:
-            stdout = "S8_F_INTERFERENCE before=1 after=2\n"
+        if "interference-result.json" in script:
+            stdout = json.dumps({
+                "schema": executor.INTERFERENCE_SCHEMA, "status": "PASS",
+                "timing_eligible": True,
+                "phases": [{"phase": phase, "path": f"/tmp/interference-{phase}.jsonl"}
+                           for phase in ("before", "during", "after")],
+                "events": [],
+            }) + "\n"
         else:
             workdir = re.search(
                 r"ICECC_P50_C1F1_WORKDIR=(/tmp/p50compilee2e\.external\.[A-Za-z0-9]+)",
@@ -340,6 +517,9 @@ def test_concrete_transport_invokes_q3_c_scheduler_and_non_q3_f(tmp_path: Path, 
             (destination / "container-pid").write_text("102")
             (destination / "f.log").write_text("")
             (destination / "f-measured-log-offset").write_text("0")
+            for phase in ("before", "during", "after"):
+                (destination / f"interference-{phase}.jsonl").write_text(
+                    json.dumps({"phase": phase}) + "\n")
     monkeypatch.setattr(executor, "_copy_remote_tree", fake_copy)
     result = transport.execute_command(topology="C1F1/100000", relationship_hosts=["q2"],
                                        profile="ZSTD_ROUTE", product_root_remote="/product",
