@@ -288,6 +288,25 @@ interruption_log="$tmp_root/interruption.log"
 interruption_ready_trace="$tmp_root/interruption.ready"
 interruption_ready_hold="$tmp_root/interruption.hold"
 interruption_abort_trace="$tmp_root/interruption.abort"
+# The parent shell performs every ownership poll and final retirement call;
+# keep the fallback prohibition in this scope, not only in the child env.
+export ICECC_P50_TEST_FORBID_PROC_FALLBACK=1
+interruption_ready_trace_missing="$tmp_root/interruption.ready.missing"
+: >"$interruption_ready_trace_missing"
+interruption_ready_trace="$interruption_ready_trace_missing"
+ready_fallback_error="$tmp_root/ready-fallback.error"
+if mutant_sidecar_records "$interruption_runtime_root" \
+        >"$tmp_root/ready-fallback.output" 2>"$ready_fallback_error"; then
+    echo 'FAIL: deleted READY trace reached sidecar ownership discovery' >&2
+    exit 1
+fi
+grep -qF 'forbidden /proc fallback' "$ready_fallback_error" || {
+    echo 'FAIL: deleted READY trace did not fail specifically at the fallback guard' >&2
+    cat "$ready_fallback_error" >&2
+    exit 1
+}
+echo 'ok - deleted READY trace is RED at the parent fallback guard'
+interruption_ready_trace="$tmp_root/interruption.ready"
 (
     interruption_child_pid=
     stop_interruption_child() {
@@ -358,8 +377,28 @@ interruption_abort_trace="$tmp_root/interruption.abort"
 interruption_wrapper_pid=$!
 interruption_sidecar_pids=
 interruption_poll=0
+while test ! -s "$interruption_ready_trace" && \
+        kill -0 "$interruption_wrapper_pid" 2>/dev/null && \
+        test "$interruption_poll" -lt 200; do
+    sleep 0.05
+    interruption_poll=$((interruption_poll + 1))
+done
+if test ! -s "$interruption_ready_trace"; then
+    kill -TERM "$interruption_wrapper_pid" 2>/dev/null || :
+    wait "$interruption_wrapper_pid" 2>/dev/null || :
+    echo 'FAIL: interruption regression did not publish a complete READY trace' >&2
+    cat "$interruption_log" >&2
+    exit 1
+fi
+interruption_poll=0
 while test "$interruption_poll" -lt 200; do
-    interruption_sidecar_pids=$(mutant_sidecar_pids "$interruption_runtime_root")
+    if interruption_sidecar_records=$(mutant_sidecar_records "$interruption_runtime_root"); then
+        interruption_sidecar_pids=$(printf '%s\n' "$interruption_sidecar_records" |
+            cut -d'|' -f1)
+    else
+        echo 'FAIL: interruption READY identity did not resolve to its exact sidecar' >&2
+        exit 1
+    fi
     test -n "$interruption_sidecar_pids" && break
     kill -0 "$interruption_wrapper_pid" 2>/dev/null || break
     sleep 0.05
