@@ -169,6 +169,8 @@ def test_full2_current_state_marker_omission_partial_and_type_stay_not_proven(
                             "assignment_authority": assignment}
     predecessor_summary = {"schema": simulator.SUMMARY_SCHEMA,
                            "topology": {"id": topology},
+                           "c_authorities": {method: {"native_next_tu_seq": 5}
+                                             for method in ("ZSTD_ROUTE", "P29", "GRZ_RESIDUAL")},
                            "relationships": {method: {key: copy.deepcopy(prior_state)}
                                              for method in ("ZSTD_ROUTE", "P29", "GRZ_RESIDUAL")}}
     monkeypatch.setattr(simulator, "verify_experiment", lambda path: {
@@ -178,10 +180,13 @@ def test_full2_current_state_marker_omission_partial_and_type_stay_not_proven(
         "experiment": predecessor_path, "manifest_sha256": "c" * 64,
         "run_identity": predecessor_identity, "selected_inputs": [],
         "assignment": assignment}, "assignment_authority": {"topology": topology}}
-    summary = {"relationships": {method: {key: copy.deepcopy(after_state)}
+    summary = {"c_authorities": {method: {"native_next_tu_seq": 6}
+                                  for method in ("ZSTD_ROUTE", "P29", "GRZ_RESIDUAL")},
+               "relationships": {method: {key: copy.deepcopy(after_state)}
                                   for method in ("ZSTD_ROUTE", "P29", "GRZ_RESIDUAL")}}
     rows = [{"method": method, "relationship_key": ["C0", "F0"],
-             "ordinal": 0, "native_tu_seq": 5, "native_next_rel_seq": 6,
+             "ordinal": 0, "native_tu_seq": 5, "native_next_tu_seq": 6,
+             "native_next_rel_seq": 6,
              "native_state_before_digest": "a" * 32, "native_state_digest": "b" * 32,
              "committed": True, "product_transaction": {"committed": True,
                                       "state_before_digest": "a" * 32, "state_digest": "b" * 32,

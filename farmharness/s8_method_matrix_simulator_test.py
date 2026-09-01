@@ -625,6 +625,113 @@ def test_repeat_full_only_carries_declared_relationship_state() -> None:
     assert repeat_full_state_contract("RAW_II")["fields"] == []
     assert repeat_full_state_contract("ZSTD_TU")["fields"] == []
     assert "committed_raw_prefix_descriptor" in repeat_full_state_contract("ZSTD_ROUTE")["fields"]
+    assert "c_authorities.native_next_tu_seq" in repeat_full_state_contract("ZSTD_ROUTE")["fields"]
+
+
+def _fake_native_batch_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provide a deterministic product-output seam without building p50sim."""
+    original_is_file = Path.is_file
+    monkeypatch.setattr(Path, "is_file", lambda path: (
+        True if path.name == ".p50sim.bin" else original_is_file(path)))
+
+    def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        output = Path(command[command.index("--batch-output") + 1])
+        segments: list[tuple[str, Path, Path]] = [("full-1",
+            Path(command[command.index("--batch-manifest") + 1]),
+            Path(command[command.index("--batch-assignment-map") + 1]))]
+        if "--batch-manifest-2" in command:
+            segments.append(("full-2",
+                Path(command[command.index("--batch-manifest-2") + 1]),
+                Path(command[command.index("--batch-assignment-map-2") + 1])))
+        state: dict[int, str] = {}
+        global_tu = 0
+        lines: list[str] = []
+        for segment, manifest, mapping in segments:
+            paths = manifest.read_text().splitlines()
+            assignment_rows = mapping.read_text().splitlines()[1:]
+            for index, (path_text, relation_text) in enumerate(zip(paths, assignment_rows)):
+                raw = Path(path_text).read_bytes()
+                relation = int(relation_text)
+                rel_seq = 0 if relation not in state else 1
+                before = state.get(relation, "a" * 32)
+                after = ("b" if relation == 0 else "c") * 32
+                state[relation] = after
+                lines.append(json.dumps({
+                    "schema": "icecream-p50sim-batch-v1", "segment": segment,
+                    "profile": kwargs["env"]["ICECC_P50_PROFILE"],
+                    "relationship_id": f"c1f20-r{relation:02d}", "rel_seq": rel_seq,
+                    "tu_index": index, "tu_seq": global_tu,
+                    "raw_bytes": len(raw), "raw_digest": simulator_module._digest128(raw),
+                    "encoded_source_bytes": 1, "c_to_f_bytes": 1, "f_to_c_bytes": 1,
+                    "simulator_execution_ns": 1, "state_before_digest": before,
+                    "state_digest": after, "transaction_digest": "d" * 32,
+                    "committed": True}))
+                global_tu += 1
+        output.write_text("\n".join(lines) + "\n")
+        return subprocess.CompletedProcess(command, 0, b"", b"")
+
+    monkeypatch.setattr(simulator_module.subprocess, "run", run)
+
+
+def test_native_batch_requires_one_global_tu_seq_across_interleaved_relationships(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    topology = MatrixTopology.from_id("C1F20/40")
+    paths = []
+    for index in range(4):
+        path = tmp_path / f"{index}.ii"
+        path.write_bytes(f"payload-{index}".encode())
+        paths.append(path)
+    occurrences = [Occurrence(index, None, source_path=str(path), source_relative=path.name,
+                               source_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                               source_digest128=simulator_module._digest128(path.read_bytes()))
+                   for index, path in enumerate(paths)]
+    rows = [{"ordinal": index, "global_slot": relation * 2,
+             "f_relationship": relation, "per_f_slot": 0,
+             "dispatch_order": index, "authority_dispatch_order": index,
+             "authority_rel_seq": rel}
+            for index, (relation, rel) in enumerate(((0, 0), (1, 0), (0, 1), (1, 1)))]
+    assignment = {"status": "READY", "topology": topology.topology_id,
+                  "selected_count": 4, "rows": rows}
+    _fake_native_batch_runner(monkeypatch)
+    output = simulator_module._native_batch(occurrences, topology, assignment, "P29")
+    assert [item["tu_seq"] for item in output.values()] == [0, 1, 2, 3]
+    assert [item["_native_rel_seq"] for item in output.values()] == [0, 0, 1, 1]
+    assert [item["_native_next_tu_seq"] for item in output.values()] == [1, 2, 3, 4]
+
+
+def test_native_full2_keeps_global_next_tu_separate_from_route_rel_seq(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    topology = MatrixTopology.from_id("C1F20/40")
+    paths = []
+    for index in range(4):
+        path = tmp_path / f"{index}.ii"
+        path.write_bytes(f"payload-{index}".encode())
+        paths.append(path)
+    def occurrence(index: int) -> Occurrence:
+        path = paths[index]
+        raw = path.read_bytes()
+        return Occurrence(index, None, source_path=str(path), source_relative=path.name,
+                          source_sha256=hashlib.sha256(raw).hexdigest(),
+                          source_digest128=simulator_module._digest128(raw))
+    def authority(relations: tuple[tuple[int, int], ...]) -> dict[str, object]:
+        return {"status": "READY", "topology": topology.topology_id,
+                "selected_count": len(relations), "rows": [
+                    {"ordinal": index, "global_slot": relation * 2,
+                     "f_relationship": relation, "per_f_slot": 0,
+                     "dispatch_order": index, "authority_dispatch_order": index,
+                     "authority_rel_seq": rel}
+                    for index, (relation, rel) in enumerate(relations)]}
+    _fake_native_batch_runner(monkeypatch)
+    output = simulator_module._native_batch(
+        # The current segment starts on F0 although the predecessor's global
+        # last TU was on F1; route-local last TU must not seed C-wide TU_SEQ.
+        [occurrence(2), occurrence(3)], topology, authority(((0, 1), (1, 1))), "P29",
+        predecessor_occurrences=[occurrence(0), occurrence(1)],
+        predecessor_assignment=authority(((0, 0), (1, 0))))
+    measured = list(output.values())
+    assert [item["tu_seq"] for item in measured] == [2, 3]
+    assert [item["_native_rel_seq"] for item in measured] == [1, 1]
+    assert [item["_native_next_tu_seq"] for item in measured] == [3, 4]
 
 
 def test_native_repeat_full_carries_state_with_changed_assignment_map(tmp_path: Path) -> None:
@@ -669,7 +776,7 @@ def test_native_repeat_full_carries_state_with_changed_assignment_map(tmp_path: 
             predecessor_assignment_authority=predecessor_authority)
     assert result["status"] == "PARTIAL_NOT_READY"
     assert result["core_completion"]["status"] == "INCOMPLETE_REQUESTED_SUBSET"
-    assert [row["product_transaction"]["tu_seq"] for row in result["rows"]] == [0, 2]
+    assert [row["product_transaction"]["tu_seq"] for row in result["rows"]] == [2, 3]
     assert all(row["wire_witnessed"] is True for row in result["rows"])
     assert all(row["product_transaction"]["route_identity"] ==
                f"{row['relationship_key'][0]}->{row['relationship_key'][1]}"
@@ -709,8 +816,7 @@ def test_stateful_native_profiles_carry_three_tu_successor(
     output = simulator_module._native_batch(
         measured, topology, second, method,
         predecessor_occurrences=predecessor, predecessor_assignment=first)
-    assert [row["tu_seq"] for row in output.values()] == (
-        [3, 4, 5] if topology_id == "C1F1/100000" else [0, 3, 1])
+    assert [row["tu_seq"] for row in output.values()] == [3, 4, 5]
     assert all(row["committed"] is True for row in output.values())
 
 

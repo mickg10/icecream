@@ -284,6 +284,27 @@ def _full2_marker(manifest: Mapping[str, Any], summary: Mapping[str, Any],
         if (not isinstance(current_state, Mapping) or not isinstance(prior_state, Mapping) or
                 set(current_state) != expected_keys or set(prior_state) != expected_keys):
             return _not_proven(f"{method.lower()}_relationship_state_incomplete")
+        # C-wide TU continuation is a single method authority, not a
+        # relationship-local counter.  Every relationship's observation must
+        # bind to the same predecessor/current authority marker.
+        c_authorities = summary.get("c_authorities", {})
+        predecessor_c_authorities = predecessor_summary.get("c_authorities", {})
+        current_c = c_authorities.get(method) if isinstance(c_authorities, Mapping) else None
+        prior_c = (predecessor_c_authorities.get(method)
+                   if isinstance(predecessor_c_authorities, Mapping) else None)
+        if (not isinstance(prior_c, Mapping) or type(prior_c.get("native_next_tu_seq")) is not int or
+                prior_c["native_next_tu_seq"] <= 0 or
+                not isinstance(current_c, Mapping) or type(current_c.get("native_next_tu_seq")) is not int or
+                current_c["native_next_tu_seq"] <= prior_c["native_next_tu_seq"] or
+                current_c["native_next_tu_seq"] != prior_c["native_next_tu_seq"] + len(
+                    [row for row in rows if row.get("method") == method])):
+            return _not_proven(f"{method.lower()}_c_wide_tu_authority_missing")
+        method_rows = [row for row in rows if row.get("method") == method]
+        for index, current_row in enumerate(method_rows):
+            expected_tu = prior_c["native_next_tu_seq"] + index
+            if (current_row.get("native_tu_seq") != expected_tu or
+                    current_row.get("native_next_tu_seq") != expected_tu + 1):
+                return _not_proven(f"{method.lower()}_global_tu_sequence_invalid")
         for key in expected_keys:
             before = prior_state[key]
             after = current_state[key]
@@ -291,7 +312,6 @@ def _full2_marker(manifest: Mapping[str, Any], summary: Mapping[str, Any],
             if (not isinstance(before, Mapping) or not isinstance(after, Mapping) or
                     type(before.get("native_last_tu_seq")) is not int or
                     type(before.get("native_next_rel_seq")) is not int or
-                    before["native_last_tu_seq"] + 1 != before["native_next_rel_seq"] or
                     before["native_next_rel_seq"] <= 0 or
                     not _valid_digest(before.get("native_state_digest")) or
                     type(before.get("history_nonce")) is not int or
@@ -301,7 +321,6 @@ def _full2_marker(manifest: Mapping[str, Any], summary: Mapping[str, Any],
                     before["route_identity"] != expected_route_identity or
                     type(after.get("native_last_tu_seq")) is not int or
                     type(after.get("native_next_rel_seq")) is not int or
-                    after["native_last_tu_seq"] + 1 != after["native_next_rel_seq"] or
                     after["native_next_rel_seq"] <= 0 or
                     not _valid_digest(after.get("native_state_digest")) or
                     type(after.get("history_nonce")) is not int or
@@ -311,7 +330,7 @@ def _full2_marker(manifest: Mapping[str, Any], summary: Mapping[str, Any],
                     after["route_identity"] != expected_route_identity or
                     after["history_nonce"] != before["history_nonce"] or
                     after["route_identity"] != before["route_identity"] or
-                    after["native_last_tu_seq"] < before["native_next_rel_seq"]):
+                    after["native_last_tu_seq"] < before["native_last_tu_seq"]):
                 return _not_proven(f"{method.lower()}_native_state_marker_missing")
             before_prefix = after_prefix = None
             if method == "ZSTD_ROUTE":
@@ -331,14 +350,16 @@ def _full2_marker(manifest: Mapping[str, Any], summary: Mapping[str, Any],
                 return _not_proven(f"{method.lower()}_current_row_order_invalid")
             row = current_rows[0]
             last_row = current_rows[-1]
-            if (row.get("native_tu_seq") != before["native_next_rel_seq"] or
+            if (row.get("native_next_rel_seq") != before["native_next_rel_seq"] + 1 or
                     row.get("native_state_before_digest") != before["native_state_digest"]):
                 return _not_proven(f"{method.lower()}_successor_marker_mismatch")
             prior_state_digest = before["native_state_digest"]
             prior_prefix = before_prefix
-            for current_row in current_rows:
+            for row_index, current_row in enumerate(current_rows):
                 transaction = current_row.get("product_transaction")
-                if (current_row.get("native_next_rel_seq") != current_row.get("native_tu_seq", -1) + 1 or
+                if (current_row.get("native_next_rel_seq") !=
+                        (current_rows[row_index - 1].get("native_next_rel_seq") + 1
+                         if row_index else before["native_next_rel_seq"] + 1) or
                         current_row.get("committed") is not True or
                         not isinstance(transaction, Mapping) or
                         transaction.get("committed") is not True or

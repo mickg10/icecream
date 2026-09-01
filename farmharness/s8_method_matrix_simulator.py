@@ -400,14 +400,14 @@ def _authenticated_assignment(topology_id: str, count: int, *, start: int = 0) -
     for ordinal, row in enumerate(rows[start:start + count]):
         try:
             dispatch_order = int(row["dispatch_order"])
-            if dispatch_order != start + ordinal or \
-                    ("tu_seq" in row and int(row["tu_seq"]) != dispatch_order):
+            authority_tu_seq = int(row.get("tu_seq", dispatch_order))
+            if dispatch_order != start + ordinal or authority_tu_seq != dispatch_order:
                 raise MatrixError("assignment:dispatch_order_invalid")
             relation = int(row["worker"])
             # C1F20's two dispatch lanes are authenticated in compiler_slot;
             # C1F1's retained map has one relationship and no lane column.
             slot = int(row.get("compiler_slot", row.get("slot", "0")))
-        except (KeyError, ValueError) as exc:
+        except (KeyError, TypeError, ValueError) as exc:
             raise MatrixError("assignment:row_invalid") from exc
         if not 0 <= relation < expected_relations:
             raise MatrixError("assignment:relationship_invalid")
@@ -419,12 +419,21 @@ def _authenticated_assignment(topology_id: str, count: int, *, start: int = 0) -
         expected_slot = global_slot % 2 if expected_relations == 20 else global_slot
         if expected_relation >= expected_relations:
             raise MatrixError("assignment:global_slot_outside_relationships")
+        try:
+            authority_rel_seq = (int(row["rel_seq"]) if row.get("rel_seq") is not None
+                                 else None)
+        except (TypeError, ValueError) as exc:
+            raise MatrixError("assignment:relationship_sequence_invalid") from exc
+        if authority_rel_seq is not None and authority_rel_seq < 0:
+            raise MatrixError("assignment:relationship_sequence_invalid")
         selected.append({"ordinal": ordinal, "global_slot": global_slot,
                          "f_relationship": expected_relation, "per_f_slot": expected_slot,
                          "dispatch_order": dispatch_order, "authority_worker": relation,
                          "authority_slot": slot, "authority_build": int(row.get("build", 0)),
             "authority_logical": int(row.get("logical", ordinal)),
-                         "authority_dispatch_order": dispatch_order})
+                         "authority_dispatch_order": dispatch_order,
+                         "authority_tu_seq": authority_tu_seq,
+                         "authority_rel_seq": authority_rel_seq})
     return {"path": facts["path"], "bytes": facts["bytes"], "sha256": facts["sha256"],
             "schema": "root-matrix-v4-assignment-tsv-v1", "topology": topology_id,
             "rows": selected, "selected_count": count, "authority_total_rows": len(rows),
@@ -503,7 +512,12 @@ def _native_batch(occurrences: Sequence[Occurrence], topology: MatrixTopology,
         result: dict[int, dict[str, object]] = {}
         predecessor_result: dict[int, dict[str, object]] = {}
         seen: set[tuple[str, int]] = set()
-        relation_last_seq: dict[int, int] = {}
+        # TU_SEQ is allocated by the C-wide product authority, so it is one
+        # contiguous sequence over the interleaved C1F20 dispatch stream.
+        # REL_SEQ remains relationship-local and is checked independently
+        # against the authenticated assignment rows below.
+        global_next_tu_seq = 0
+        relation_next_rel_seq: dict[int, int] = {}
         relation_last_state: dict[int, str] = {}
         expected_profile = "GRZ_RESIDUAL" if method == "GRZ_RESIDUAL" else method
         stateful_method = method in STATEFUL_METHODS
@@ -548,15 +562,36 @@ def _native_batch(occurrences: Sequence[Occurrence], topology: MatrixTopology,
                     not _valid_prefix_descriptor(item.get("committed_raw_prefix_before_descriptor")) or
                     not _valid_prefix_descriptor(item.get("committed_raw_prefix_descriptor"))):
                 raise MatrixError("native product output route descriptor invalid")
-            expected_seq = relation_last_seq.get(relation, 0)
-            if item.get("tu_seq") != expected_seq:
-                raise MatrixError("native product output relationship TU sequence invalid")
+            nonlocal global_next_tu_seq
+            if item.get("tu_seq") != global_next_tu_seq:
+                raise MatrixError("native product output global TU sequence invalid")
+            authority_rel_seq = row.get("authority_rel_seq")
+            if authority_rel_seq is not None and (
+                    type(authority_rel_seq) is not int or authority_rel_seq < 0):
+                raise MatrixError("native product assignment REL sequence invalid")
+            if topology.relationship_count > 1 and authority_rel_seq is None:
+                raise MatrixError("native product assignment REL sequence is missing")
+            expected_rel_seq = (int(authority_rel_seq) if authority_rel_seq is not None
+                                else relation_next_rel_seq.get(relation, 0))
+            if expected_rel_seq != relation_next_rel_seq.get(relation, 0):
+                raise MatrixError("native product relationship REL sequence invalid")
+            # The product emits REL_SEQ independently of its C-wide TU_SEQ.
+            # Do not reconstruct it from TU_SEQ; omission is not continuity.
+            if (type(item.get("rel_seq")) is not int or
+                    item.get("rel_seq") != expected_rel_seq):
+                raise MatrixError("native product output relationship REL sequence invalid")
             before = str(item["state_before_digest"])
             if stateful_method and relation in relation_last_state and before != relation_last_state[relation]:
                 raise MatrixError("native product output state continuity invalid")
-            relation_last_seq[relation] = expected_seq + 1
+            relation_next_rel_seq[relation] = expected_rel_seq + 1
             if stateful_method:
                 relation_last_state[relation] = str(item["state_digest"])
+            # These are in-memory continuity annotations.  They are consumed
+            # by row/state assembly but never exposed as product evidence.
+            item["_native_rel_seq"] = int(item["rel_seq"])  # type: ignore[index]
+            item["_native_next_rel_seq"] = expected_rel_seq + 1  # type: ignore[index]
+            item["_native_next_tu_seq"] = global_next_tu_seq + 1  # type: ignore[index]
+            global_next_tu_seq += 1
         expected_segment = "full-2" if predecessor_occurrences else "full-1"
         output_raw, _output_facts = _private_bytes(output, "native_batch_output")
         try:
@@ -805,7 +840,18 @@ class MatrixTopology:
         return {"ordinal": ordinal, "f_store_guid": guid, "slot": slot,
                 "relationship_key": list(key),
                 "relationship_index": self.f_store_guids.index(guid),
-                "global_slot": (self.f_store_guids.index(guid) * int(self.slots_per_f) + slot)}
+                "global_slot": (self.f_store_guids.index(guid) * int(self.slots_per_f) + slot),
+                "authority_worker": item.get("authority_worker") if authority is not None else None,
+                "authority_slot": item.get("authority_slot") if authority is not None else None,
+                "authority_build": item.get("authority_build") if authority is not None else None,
+                "authority_logical": item.get("authority_logical") if authority is not None else None,
+                "dispatch_order": item.get("dispatch_order") if authority is not None else None,
+                "authority_dispatch_order": item.get("authority_dispatch_order")
+                if authority is not None else None,
+                "authority_tu_seq": item.get("authority_tu_seq")
+                if authority is not None else None,
+                "authority_rel_seq": item.get("authority_rel_seq")
+                if authority is not None else None}
 
 
 @dataclass(frozen=True)
@@ -881,6 +927,7 @@ class _RelationshipState:
     reset_count: int = 0
     pending: bool = False
     native_last_tu_seq: int | None = None
+    native_next_rel_seq: int | None = None
     native_state_digest: str | None = None
     prefix_descriptor: dict[str, object] | None = None
 
@@ -901,7 +948,8 @@ def assign_relationships(topology: MatrixTopology, occurrences: Sequence[Occurre
 def repeat_full_state_contract(method: str) -> dict[str, object]:
     """State permitted to survive full-1 into repeat-full."""
     if method in STATEFUL_METHODS:
-        fields = ["native_last_tu_seq", "native_next_rel_seq", "native_state_digest",
+        fields = ["c_authorities.native_next_tu_seq", "native_last_tu_seq",
+                  "native_next_rel_seq", "native_state_digest",
                   "history_nonce", "route_identity"]
         if method == "ZSTD_ROUTE":
             fields.append("committed_raw_prefix_descriptor")
@@ -1044,6 +1092,9 @@ class MethodMatrixSimulator:
             carried = prior_state.get("relationships", {})
             if not isinstance(carried, Mapping):
                 raise MatrixError("repeat-full prior relationship state is malformed")
+            carried_c_authorities = prior_state.get("c_authorities", {})
+            if not isinstance(carried_c_authorities, Mapping):
+                raise MatrixError("repeat-full prior C authority state is missing")
             for method in allowed:
                 # State is method-specific; only the declared surviving route
                 # continuation is loaded.  TU/RAW state is intentionally absent.
@@ -1071,14 +1122,15 @@ class MethodMatrixSimulator:
                     states_by_method[method][key].next_rel_seq = int(value.get("next_rel_seq", 0))
                     if method in STATEFUL_METHODS:
                         native_seq = value.get("native_last_tu_seq")
-                        native_next = value.get("native_next_rel_seq")
+                        native_next_rel = value.get("native_next_rel_seq")
                         native_digest = value.get("native_state_digest")
                         if native_seq is not None:
-                            if (type(native_seq) is not int or type(native_next) is not int or
-                                    native_next != native_seq + 1 or
+                            if (type(native_seq) is not int or type(native_next_rel) is not int or
+                                    native_next_rel <= 0 or
                                     not _digest128_text(native_digest)):
                                 raise MatrixError("repeat-full native relationship state is malformed")
                             states_by_method[method][key].native_last_tu_seq = native_seq
+                            states_by_method[method][key].native_next_rel_seq = native_next_rel
                             states_by_method[method][key].native_state_digest = str(native_digest)
 
             # The native endpoint is the authority for a product continuation,
@@ -1087,6 +1139,15 @@ class MethodMatrixSimulator:
                 prior_relationships = carried.get(method, {})
                 if not isinstance(prior_relationships, Mapping):
                     raise MatrixError("repeat-full native predecessor state is missing")
+                c_authority = carried_c_authorities.get(method)
+                first_product = (self._native_rows.get(method, {}).get(occurrences[0].ordinal)
+                                 if occurrences else None)
+                if first_product is not None:
+                    if (not isinstance(c_authority, Mapping) or
+                            type(c_authority.get("native_next_tu_seq")) is not int or
+                            c_authority["native_next_tu_seq"] <= 0 or
+                            first_product.get("tu_seq") != c_authority["native_next_tu_seq"]):
+                        raise MatrixError("repeat-full native C-wide TU successor is invalid")
                 checked: set[tuple[str, str]] = set()
                 for occurrence, assignment in zip(occurrences, assignments):
                     key = tuple(assignment["relationship_key"])
@@ -1105,7 +1166,7 @@ class MethodMatrixSimulator:
                         # verifier above.
                         continue
                     if (not isinstance(prior, Mapping) or
-                            prior.get("native_next_rel_seq") != product.get("tu_seq") or
+                            prior.get("native_next_rel_seq") != product.get("_native_rel_seq") or
                             prior.get("native_state_digest") != product.get("state_before_digest")):
                         raise MatrixError("repeat-full native predecessor successor is invalid")
 
@@ -1231,7 +1292,8 @@ class MethodMatrixSimulator:
             "wire_witnessed": False,
             "encoded_bytes": None, "encoded_sha256": None, "encoded_path": None,
             "codec_cpu_ns": None, "codec_wall_ns": None, "transition": "not_run",
-            "native_tu_seq": None, "native_next_rel_seq": None,
+            "native_tu_seq": None, "native_next_tu_seq": None,
+            "native_next_rel_seq": None,
             "native_state_before_digest": None, "native_state_digest": None,
             "native_transaction_digest": None,
             "pre_state_digest": pre, "post_state_digest": pre,
@@ -1283,13 +1345,33 @@ class MethodMatrixSimulator:
             wall_ns = cpu_ns
             row["measurement_scope"] = "native_endpoint_transaction"
             row["wire_witnessed"] = True
-            row.update({"native_tu_seq": int(product["tu_seq"]),
-                        "native_next_rel_seq": int(product["tu_seq"]) + 1,
+            native_tu_seq = int(product["tu_seq"])
+            native_rel_seq = product.get("_native_rel_seq")
+            if native_rel_seq is None:
+                # Directly injected bounded canaries predate the batch
+                # annotation; use only relationship-local Python state as a
+                # compatibility fallback, never the global TU_SEQ.
+                native_rel_seq = state.native_next_rel_seq
+                if native_rel_seq is None:
+                    native_rel_seq = state.next_rel_seq
+            if type(native_rel_seq) is not int or native_rel_seq < 0:
+                raise MatrixError("native product relationship REL sequence is missing")
+            native_next_tu_seq = product.get("_native_next_tu_seq", native_tu_seq + 1)
+            if type(native_next_tu_seq) is not int or native_next_tu_seq != native_tu_seq + 1:
+                raise MatrixError("native product global TU continuation is invalid")
+            native_next_rel_seq = product.get("_native_next_rel_seq", native_rel_seq + 1)
+            if type(native_next_rel_seq) is not int or native_next_rel_seq != native_rel_seq + 1:
+                raise MatrixError("native product relationship REL continuation is invalid")
+            row.update({"native_tu_seq": native_tu_seq,
+                        "native_next_tu_seq": native_next_tu_seq,
+                        "native_next_rel_seq": native_next_rel_seq,
                         "native_state_before_digest": product["state_before_digest"],
                         "native_state_digest": product["state_digest"],
                         "native_transaction_digest": product["transaction_digest"]})
-            transaction = dict(product)
-            transaction.update({"native_next_rel_seq": int(product["tu_seq"]) + 1,
+            transaction = {key: value for key, value in product.items()
+                           if not str(key).startswith("_")}
+            transaction.update({"native_next_tu_seq": native_next_tu_seq,
+                                "native_next_rel_seq": native_next_rel_seq,
                                 "history_nonce": occurrence.history_nonce,
                                 "route_identity": f"{key[0]}->{key[1]}"})
             native_route_descriptor = (method == "ZSTD_ROUTE" and
@@ -1316,13 +1398,14 @@ class MethodMatrixSimulator:
             if method == "ZSTD_ROUTE" and native_route_descriptor:
                 row["pre_state_digest"] = product["state_before_digest"]
                 state.prefix_descriptor = dict(product["committed_raw_prefix_descriptor"])
-            state.native_last_tu_seq = int(product["tu_seq"])
+            state.native_last_tu_seq = native_tu_seq
+            state.native_next_rel_seq = native_next_rel_seq
             state.native_state_digest = str(product["state_digest"])
             if method in STATEFUL_METHODS:
                 state.last_route_id = f"{key[0]}->{key[1]}"
                 state.history_nonce = occurrence.history_nonce
                 if method != "ZSTD_ROUTE":
-                    state.next_rel_seq = int(product["tu_seq"]) + 1
+                    state.next_rel_seq = native_next_rel_seq
         else:
             encoded, cpu_ns, wall_ns = self._encode(method, raw, encode_state)
         if experiment is not None and product is None and method != "RAW_II":
@@ -1431,15 +1514,19 @@ class MethodMatrixSimulator:
                 "route_identity": state.last_route_id,
                 "reset_count": state.reset_count,
                 "native_last_tu_seq": state.native_last_tu_seq,
-                "native_next_rel_seq": (None if state.native_last_tu_seq is None
-                                         else state.native_last_tu_seq + 1),
+                "native_next_rel_seq": state.native_next_rel_seq,
                 "native_state_digest": state.native_state_digest}
                 for key, state in states.items()}
             for method, states in states_by_method.items()
         }
         totals = {}
+        c_authorities = {}
         for method in self.methods:
             selected = [row for row in rows if row.get("method") == method]
+            native_tu = [row.get("native_tu_seq") for row in selected
+                         if type(row.get("native_tu_seq")) is int]
+            c_authorities[method] = {
+                "native_next_tu_seq": (max(native_tu) + 1 if native_tu else None)}
             totals[method] = {
                 "raw_bytes": sum(int(row.get("raw_bytes") or 0) for row in selected),
                 "encoded_bytes": (None if method == "RAW_II" else
@@ -1464,6 +1551,7 @@ class MethodMatrixSimulator:
                 "experiment": str(experiment), "topology": self._topology_record(),
                 "relationship_count": self.topology.relationship_count,
                 "method_status": {method: self.authority[method]["status"] for method in self.methods},
+                "c_authorities": c_authorities,
                 "occurrence_rows": len(rows),
                 "committed_rows": sum(bool(row["committed"]) for row in rows),
                 "totals": totals,
@@ -1849,25 +1937,38 @@ def _authenticated_predecessor_plan(
     relationships_all = summary.get("relationships", {})
     if not isinstance(relationships_all, Mapping):
         raise MatrixError("repeat-full predecessor relationship state is incomplete")
+    c_authorities = summary.get("c_authorities", {})
+    if not isinstance(c_authorities, Mapping):
+        raise MatrixError("repeat-full predecessor C-wide TU authority is incomplete")
+    for method in STATEFUL_METHODS:
+        authority_state = c_authorities.get(method)
+        if (not isinstance(authority_state, Mapping) or
+                type(authority_state.get("native_next_tu_seq")) is not int or
+                authority_state["native_next_tu_seq"] <= 0):
+            raise MatrixError("repeat-full predecessor C-wide TU authority is incomplete")
     for method in STATEFUL_METHODS:
         relationships = relationships_all.get(method, {})
         if (not isinstance(relationships, Mapping) or
                 set(relationships) != expected_relationships):
             raise MatrixError("repeat-full predecessor relationship state is incomplete")
+        authority_next = c_authorities[method]["native_next_tu_seq"]
+        relationship_last_tus: list[int] = []
         for value in relationships.values():
             if (not isinstance(value, Mapping) or
                     type(value.get("native_last_tu_seq")) is not int or
                     type(value.get("native_next_rel_seq")) is not int or
-                    value["native_last_tu_seq"] + 1 != value["native_next_rel_seq"] or
                     value["native_next_rel_seq"] <= 0 or
                     not _digest128_text(value.get("native_state_digest")) or
                     type(value.get("history_nonce")) is not int or value["history_nonce"] <= 0 or
                     not isinstance(value.get("route_identity"), str) or not value["route_identity"]):
                 raise MatrixError("repeat-full predecessor native state is incomplete")
+            relationship_last_tus.append(int(value["native_last_tu_seq"]))
             if method == "ZSTD_ROUTE":
                 descriptor = value.get("committed_raw_prefix_descriptor")
                 if not _valid_prefix_descriptor(descriptor):
                     raise MatrixError("repeat-full predecessor route prefix is incomplete")
+        if max(relationship_last_tus, default=-1) != authority_next - 1:
+            raise MatrixError("repeat-full predecessor C-wide TU authority is inconsistent")
     if (summary.get("experiment") != str(path) or
             summary.get("topology", {}).get("id") != topology_id or
             summary.get("status") not in {"COMPLETED", "CORE_COMPLETED_OPTIONALS_UNAVAILABLE"} or
