@@ -136,15 +136,61 @@ proc_starttime() {
     printf '%s\n' "${20}"
 }
 
+ready_trace_pid() {
+    ready_trace=$1
+    test -s "$ready_trace" || return 1
+    ready_line_count=$(wc -l <"$ready_trace" | tr -d '[:space:]')
+    test "$ready_line_count" = 1 || return 1
+    ready_line=$(cat "$ready_trace") || return 1
+    printf '%s\n' "$ready_line" | grep -Eq \
+        '^READY v2 generation=[^[:space:]]+ attempt=[^[:space:]]+ F_STORE_GENERATION=[^[:space:]]+ DERIVATION_VERSION=[^[:space:]]+ pid=[0-9]+ C_STORE_GUID=[0-9A-Fa-f]+ F_STORE_GUID=[0-9A-Fa-f]+ PATH=[^[:space:]]+ DIGEST=[0-9A-Fa-f]+ DEV=[0-9]+ INO=[0-9]+$' || return 1
+    ready_pid=$(printf '%s\n' "$ready_line" |
+        sed -n 's/.* pid=\([0-9][0-9]*\) .*/\1/p')
+    test -n "$ready_pid" || return 1
+    printf '%s\n' "$ready_pid"
+}
+
+# Keep parser controls local and deterministic.  They exercise the exact
+# full READY v2 record emitted by the service without launching a second
+# process or contacting a remote host.
+ready_trace_valid="$tmp_root/ready-trace-valid"
+cat >"$ready_trace_valid" <<'EOF'
+READY v2 generation=1 attempt=1 F_STORE_GENERATION=1 DERIVATION_VERSION=1 pid=42 C_STORE_GUID=00112233445566778899aabbccddeeff F_STORE_GUID=ffeeddccbbaa99887766554433221100 PATH=/tmp/p50-ready.sock DIGEST=00112233445566778899aabbccdd DEV=1 INO=2
+EOF
+test "$(ready_trace_pid "$ready_trace_valid")" = 42
+ready_trace_red() {
+    ready_mutant_label=$1
+    ready_mutant_path=$2
+    if ready_trace_pid "$ready_mutant_path" >/dev/null 2>&1; then
+        echo "FAIL: READY parser accepted $ready_mutant_label" >&2
+        exit 1
+    fi
+    echo "ok - READY parser rejects $ready_mutant_label"
+}
+ready_trace_empty="$tmp_root/ready-trace-empty"
+: >"$ready_trace_empty"
+ready_trace_red zero-record "$ready_trace_empty"
+ready_trace_duplicate="$tmp_root/ready-trace-duplicate"
+cat "$ready_trace_valid" "$ready_trace_valid" >"$ready_trace_duplicate"
+ready_trace_red duplicate-record "$ready_trace_duplicate"
+ready_trace_no_pid="$tmp_root/ready-trace-no-pid"
+sed 's/ pid=42 / worker=42 /' "$ready_trace_valid" >"$ready_trace_no_pid"
+ready_trace_red missing-pid "$ready_trace_no_pid"
+ready_trace_malformed="$tmp_root/ready-trace-malformed"
+sed 's/^READY v2 /READY v1 /' "$ready_trace_valid" >"$ready_trace_malformed"
+ready_trace_red malformed-record "$ready_trace_malformed"
+
 mutant_sidecar_records() {
     runtime_root=$1
     if test -n "${interruption_ready_trace:-}" && \
             test -s "$interruption_ready_trace"; then
-        process_pid=$(sed -n 's/^pid=\([0-9][0-9]*\)$/\1/p' \
-            "$interruption_ready_trace" | tail -1)
-        if test -n "$process_pid"; then
-            mutant_sidecar_record_for_pid "$runtime_root" "$process_pid" && return 0
-        fi
+        process_pid=$(ready_trace_pid "$interruption_ready_trace") || return 1
+        mutant_sidecar_record_for_pid "$runtime_root" "$process_pid" && return 0
+        return 1
+    fi
+    if test "${ICECC_P50_TEST_FORBID_PROC_FALLBACK:-0}" = 1; then
+        echo 'FAIL: sidecar ownership discovery used forbidden /proc fallback' >&2
+        return 1
     fi
     for process_root in /proc/[0-9]*; do
         process_pid=${process_root##*/}
@@ -273,6 +319,7 @@ interruption_abort_trace="$tmp_root/interruption.abort"
     trap interruption_cleanup HUP INT TERM
     ICECC_P50_C1F1_REQUIRED=1 ICECC_P50_TEST_READY_TRACE="$interruption_ready_trace" \
         ICECC_P50_TEST_READY_HOLD="$interruption_ready_hold" \
+        ICECC_P50_TEST_FORBID_PROC_FALLBACK=1 \
         TMPDIR="$interruption_runtime_root" ICECC_TEST_CACHE_SERVICE="$service" \
         "$baseline" >"$interruption_log" 2>&1 &
     interruption_child_pid=$!
