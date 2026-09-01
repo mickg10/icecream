@@ -143,6 +143,11 @@ struct Arguments {
     std::string batch_assignment_map_3;
     std::string batch_output;
     bool batch_allow_repeated_inputs = false;
+    std::string codec_method;
+    std::string codec_prefix;
+    std::string codec_output;
+    uint64_t codec_rel_seq = 0;
+    uint64_t codec_tu_seq = 0;
 };
 
 ProfileId selected_profile() {
@@ -231,6 +236,18 @@ Arguments parse(int argc, char** argv) {
                 throw std::invalid_argument(
                     "--batch-allow-repeated-inputs must be 0 or 1");
             result.batch_allow_repeated_inputs = value == "1";
+        } else if (option == "--codec-method")
+            result.codec_method = argv[++index];
+        else if (option == "--codec-prefix")
+            result.codec_prefix = argv[++index];
+        else if (option == "--codec-output")
+            result.codec_output = argv[++index];
+        else if (option == "--codec-rel-seq") {
+            try { result.codec_rel_seq = std::stoull(argv[++index]); }
+            catch (...) { throw std::invalid_argument("invalid --codec-rel-seq"); }
+        } else if (option == "--codec-tu-seq") {
+            try { result.codec_tu_seq = std::stoull(argv[++index]); }
+            catch (...) { throw std::invalid_argument("invalid --codec-tu-seq"); }
         }
         else
             throw std::invalid_argument("unknown option " + option);
@@ -243,6 +260,16 @@ Arguments parse(int argc, char** argv) {
                        !result.batch_assignment_map_3.empty() ||
                        !result.batch_output.empty() ||
                        result.batch_allow_repeated_inputs;
+    const bool codec = !result.codec_method.empty() || !result.codec_output.empty() ||
+                       !result.codec_prefix.empty();
+    if (codec) {
+        if (result.codec_method != "ZSTD_TU" && result.codec_method != "ZSTD_ROUTE")
+            throw std::invalid_argument("codec mode requires ZSTD_TU or ZSTD_ROUTE");
+        if (result.input.empty() || result.codec_output.empty() || batch ||
+            !result.actions.empty() || !result.summary.empty())
+            throw std::invalid_argument("codec mode requires --input/--codec-output only");
+        return result;
+    }
     if (batch) {
         if (result.batch_manifest.empty() || result.batch_assignment_map.empty() ||
             result.batch_output.empty() || !result.input.empty() ||
@@ -277,6 +304,34 @@ Arguments parse(int argc, char** argv) {
             warm ? "warm replay does not accept --input" :
                    "--input, --actions, and --summary are required");
     return result;
+}
+
+void run_codec(const Arguments& arguments) {
+    const std::vector<uint8_t> input = read_bytes(arguments.input);
+    std::vector<uint8_t> prefix;
+    if (!arguments.codec_prefix.empty())
+        prefix = read_bytes(arguments.codec_prefix);
+    const ZstdTuLimits limits{std::numeric_limits<uint64_t>::max(),
+                              std::numeric_limits<uint64_t>::max(), 27,
+                              uint64_t{128} << 20};
+    const Digest128 pre_state{};
+    std::vector<uint8_t> encoded;
+    if (arguments.codec_method == "ZSTD_ROUTE") {
+        ZstdRouteCodec codec(3);
+        encoded = codec.encode(HistoryNonce{1}, RelSeq{arguments.codec_rel_seq},
+                               TuSeq{arguments.codec_tu_seq}, pre_state, prefix,
+                               input, limits).body;
+    } else {
+        ZstdTuCodec codec(3);
+        encoded = codec.encode(HistoryNonce{1}, RelSeq{arguments.codec_rel_seq},
+                              TuSeq{arguments.codec_tu_seq}, pre_state, input,
+                              limits).body;
+    }
+    std::ofstream output(arguments.codec_output, std::ios::binary | std::ios::trunc);
+    if (!output) throw std::runtime_error("cannot open codec output");
+    output.write(reinterpret_cast<const char*>(encoded.data()),
+                 static_cast<std::streamsize>(encoded.size()));
+    if (!output) throw std::runtime_error("cannot write codec output");
 }
 
 std::string id_hex(const Id128& id) {
@@ -668,6 +723,10 @@ void run_batch(const Arguments& arguments) {
 int main(int argc, char** argv) {
     try {
         const Arguments arguments = parse(argc, argv);
+        if (!arguments.codec_method.empty()) {
+            run_codec(arguments);
+            return 0;
+        }
         if (!arguments.batch_manifest.empty()) {
             run_batch(arguments);
             return 0;
