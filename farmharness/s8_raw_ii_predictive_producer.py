@@ -33,8 +33,8 @@ DepthPlanError = depth_runner.DepthPlanError
 build_schedule = depth_runner.build_schedule
 
 
-SCHEMA = "icecream-s8-raw-ii-predictive-producer-v1"
-ENGINE_SCHEMA = "icecream-s8-raw-ii-control-engine-v1"
+SCHEMA = "icecream-s8-raw-ii-predictive-producer-v2"
+ENGINE_SCHEMA = "icecream-s8-raw-ii-control-engine-v2"
 WITNESS_SCHEMA = "icecream-s8-raw-ii-legacy-wire-witness-v1"
 FORMULA = {
     "name": "legacy-filechunk-wire-v1",
@@ -42,6 +42,8 @@ FORMULA = {
 }
 ENGINE_SCOPE = "raw_ii_control_engine"
 MAX_BYTES = 64 * 1024 * 1024
+MAX_UNTRACKED_ENTRIES = 4096
+MAX_UNTRACKED_BYTES = 256 * 1024 * 1024
 HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
 HEX40 = re.compile(r"^[0-9a-fA-F]{40}$")
 
@@ -114,12 +116,6 @@ def _occurrence_key(ordinal: object, source_relative: object,
     return ordinal, relative, normalized_digest, source_bytes
 
 
-def _nonnegative(value: object, label: str) -> int:
-    if type(value) is not int or value < 0:
-        raise RawIIError(f"{label}:nonnegative_integer_required")
-    return value
-
-
 def _positive(value: object, label: str) -> int:
     if type(value) is not int or value <= 0:
         raise RawIIError(f"{label}:positive_integer_required")
@@ -172,7 +168,7 @@ def _load_witness(path: Path, cell: dict[str, str]) -> tuple[dict[tuple[int, str
     return result, facts
 
 
-def _load_engine(path: Path, cell: dict[str, str]) -> tuple[str, dict[tuple[int, str, str, int], tuple[int, int, int, int]], dict[str, object]]:
+def _load_engine(path: Path, cell: dict[str, str]) -> tuple[str, dict[tuple[int, str, str, int], tuple[int, int]], dict[str, object]]:
     value, facts = _read(path, "raw_ii_engine_manifest")
     if (value.get("schema") != ENGINE_SCHEMA or value.get("semantics") != CURRENT_SEMANTICS or
             value.get("cell") != cell or value.get("split") != SPLITS[cell["corpus"]] or
@@ -189,8 +185,7 @@ def _load_engine(path: Path, cell: dict[str, str]) -> tuple[str, dict[tuple[int,
     for index, row in enumerate(rows):
         if (not isinstance(row, dict) or set(row) != {
                 "ordinal", "source_relative", "source_sha256", "source_bytes",
-                "f_to_c_bytes", "source_service_ns", "execution_service_ns",
-                "elapsed_ns"}):
+                "f_to_c_bytes", "elapsed_ns"}):
             raise RawIIError(f"raw_ii_engine_manifest:row_invalid:{index}")
         key = _occurrence_key(row["ordinal"], row["source_relative"],
                               row["source_sha256"], row["source_bytes"],
@@ -198,22 +193,14 @@ def _load_engine(path: Path, cell: dict[str, str]) -> tuple[str, dict[tuple[int,
         if key in result:
             raise RawIIError("raw_ii_engine_manifest:duplicate_occurrence")
         f_to_c = _positive(row["f_to_c_bytes"], f"raw_ii_engine_manifest.row[{index}].f_to_c_bytes")
-        source_service = _nonnegative(
-            row["source_service_ns"],
-            f"raw_ii_engine_manifest.row[{index}].source_service_ns")
-        execution_service = _nonnegative(
-            row["execution_service_ns"],
-            f"raw_ii_engine_manifest.row[{index}].execution_service_ns")
         elapsed = _positive(row["elapsed_ns"],
                             f"raw_ii_engine_manifest.row[{index}].elapsed_ns")
-        if source_service + execution_service != elapsed:
-            raise RawIIError(f"raw_ii_engine_manifest.row[{index}].service_formula_mismatch")
-        result[key] = (f_to_c, source_service, execution_service, elapsed)
+        result[key] = (f_to_c, elapsed)
     return model_id, result, facts
 
 
 def _load_plan(path: Path, cell: dict[str, str], depth: str) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, object]]:
-    value, facts = _read(path, "plan")
+    value, plan_facts = _read(path, "plan")
     if value.get("schema") != "icecream-s8-depth-run-plan-v1" or value.get("semantics") != CURRENT_SEMANTICS:
         raise RawIIError("plan:schema_invalid")
     if value.get("cell") != cell or value.get("split") != SPLITS[cell["corpus"]]:
@@ -277,10 +264,10 @@ def _load_plan(path: Path, cell: dict[str, str], depth: str) -> tuple[dict[str, 
                                    f"plan.expected[{index}]") or item["path"] != expected["path"]:
             raise RawIIError(f"plan:input_descriptor_mismatch:{index}")
         try:
-            facts = depth_runner._digest(Path(item["path"]), f"plan.input[{index}]")
+            input_facts = depth_runner._digest(Path(item["path"]), f"plan.input[{index}]")
         except DepthPlanError as exc:
             raise RawIIError(f"plan:input_unavailable:{index}") from exc
-        if facts["sha256"] != key[2] or facts["bytes"] != key[3]:
+        if input_facts["sha256"] != key[2] or input_facts["bytes"] != key[3]:
             raise RawIIError(f"plan:input_changed:{index}")
     try:
         expected = build_schedule(inputs, str(scheduling["topology"]), str(scheduling["depth_class"]))
@@ -288,11 +275,63 @@ def _load_plan(path: Path, cell: dict[str, str], depth: str) -> tuple[dict[str, 
         raise RawIIError("plan:scheduling_invalid") from exc
     if scheduling != expected:
         raise RawIIError("plan:scheduling_authentication_failed")
-    return value, inputs, {"path": facts["path"], "bytes": facts["bytes"], "sha256": facts["sha256"]}
+    return value, inputs, plan_facts
 
 
-def _product_identity(root: Path) -> dict[str, str]:
-    """Read the explicit product checkout's real HEAD and tree identity."""
+def _untracked_inventory(root: Path) -> dict[str, object]:
+    """Bind bounded content identity for generated files outside HEAD."""
+    try:
+        unignored = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "--others",
+             "--exclude-standard", "-z"], check=True, capture_output=True,
+            timeout=15).stdout.split(b"\0")
+        ignored = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "--others", "--ignored",
+             "--exclude-standard", "-z"], check=True, capture_output=True,
+            timeout=15).stdout.split(b"\0")
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RawIIError("product_root:untracked_inventory_unavailable") from exc
+    relatives = sorted({os.fsdecode(item) for item in (*unignored, *ignored) if item})
+    if len(relatives) > MAX_UNTRACKED_ENTRIES:
+        raise RawIIError("product_root:untracked_inventory_too_many")
+    entries: list[dict[str, object]] = []
+    total_bytes = 0
+    for relative in relatives:
+        candidate = Path(relative)
+        if candidate.is_absolute() or any(part in ("", ".", "..")
+                                          for part in candidate.parts):
+            raise RawIIError("product_root:untracked_path_invalid")
+        path = root.joinpath(candidate)
+        try:
+            info = path.lstat()
+        except OSError as exc:
+            raise RawIIError("product_root:untracked_artifact_unavailable") from exc
+        if stat.S_ISLNK(info.st_mode):
+            target = os.fsencode(os.readlink(path))
+            item = {"path": relative, "kind": "symlink", "bytes": len(target),
+                    "sha256": hashlib.sha256(target).hexdigest()}
+            total_bytes += len(target)
+        elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+            try:
+                facts = depth_runner._digest(path, "product_root.untracked",
+                                             MAX_UNTRACKED_BYTES)
+            except DepthPlanError as exc:
+                raise RawIIError("product_root:untracked_artifact_invalid") from exc
+            total_bytes += int(facts["bytes"])
+            item = {"path": relative, "kind": "file", "bytes": facts["bytes"],
+                    "sha256": facts["sha256"]}
+        else:
+            raise RawIIError("product_root:untracked_artifact_invalid")
+        if total_bytes > MAX_UNTRACKED_BYTES:
+            raise RawIIError("product_root:untracked_inventory_too_large")
+        entries.append(item)
+    raw = _canonical(entries)
+    return {"entries": entries, "count": len(entries), "bytes": total_bytes,
+            "sha256": hashlib.sha256(raw).hexdigest()}
+
+
+def _product_identity(root: Path) -> dict[str, object]:
+    """Read the explicit product checkout's real HEAD/tree and file inventory."""
     if not root.is_absolute() or root.is_symlink() or not root.is_dir():
         raise RawIIError("product_root:unavailable")
     try:
@@ -303,14 +342,19 @@ def _product_identity(root: Path) -> dict[str, str]:
         tree = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD^{tree}"],
                               check=True, capture_output=True, text=True, timeout=15).stdout.strip()
         status = subprocess.run(["git", "-C", str(root), "status", "--porcelain",
-                                 "--untracked-files=no"], check=True, capture_output=True,
+                                 "--untracked-files=all"], check=True, capture_output=True,
                                 text=True, timeout=15).stdout
     except (OSError, subprocess.SubprocessError) as exc:
         raise RawIIError("product_root:git_identity_unavailable") from exc
     if (Path(top).resolve() != root.resolve() or not HEX40.fullmatch(head) or
-            not HEX40.fullmatch(tree) or status):
+            not HEX40.fullmatch(tree)):
         raise RawIIError("product_root:git_identity_invalid")
-    return {"root": str(root.resolve()), "head": head.lower(), "tree": tree.lower()}
+    if any(line and not line.startswith(("?? ", "!! "))
+           for line in status.splitlines()):
+        raise RawIIError("product_root:tracked_worktree_dirty")
+    untracked = _untracked_inventory(root)
+    return {"root": str(root.resolve()), "head": head.lower(), "tree": tree.lower(),
+            "tracked_status": status, "untracked": untracked}
 
 
 def produce(plan_path: Path, witness_path: Path, engine_path: Path, output_dir: Path,
@@ -357,14 +401,13 @@ def produce(plan_path: Path, witness_path: Path, engine_path: Path, output_dir: 
             len(assignments) != len(inputs)):
         raise RawIIError("plan:scheduling_runtime_invalid")
     slot_available = [0] * slots
-    relationship_ready: dict[int, int] = {}
     rows: list[dict[str, object]] = []
     for ordinal, item in enumerate(inputs):
         key = _occurrence_key(item["ordinal"], item["source_relative"],
                               item["sha256"], item["bytes"],
                               f"plan.inputs[{ordinal}]")
         c_to_f = int(witness[key]["c_to_f_bytes"])
-        f_to_c, source_service, execution_service, elapsed = engine_rows[key]
+        f_to_c, elapsed = engine_rows[key]
         assignment = assignments[ordinal]
         if (not isinstance(assignment, dict) or assignment.get("ordinal") != ordinal or
                 type(assignment.get("global_slot")) is not int or
@@ -376,13 +419,9 @@ def produce(plan_path: Path, witness_path: Path, engine_path: Path, output_dir: 
         global_slot = assignment["global_slot"]
         relationship = assignment["f_relationship"]
         slot_admission = slot_available[global_slot]
-        relationship_before = relationship_ready.get(relationship, 0)
-        source_start = max(slot_admission, relationship_before)
-        source_finish = source_start + source_service
-        execution_start = source_finish
-        finish = execution_start + execution_service
+        source_start = slot_admission
+        finish = source_start + elapsed
         slot_available[global_slot] = finish
-        relationship_ready[relationship] = source_finish
         cumulative_c += c_to_f
         cumulative_f += f_to_c
         cumulative_channel += c_to_f + f_to_c
@@ -400,11 +439,7 @@ def produce(plan_path: Path, witness_path: Path, engine_path: Path, output_dir: 
                             "throughput_bytes_per_s": cumulative_channel * 1_000_000_000 / cumulative_elapsed},
             "scheduling": {"global_slot": global_slot, "f_relationship": relationship,
                            "per_f_slot": assignment["per_f_slot"],
-                           "source_start_ns": source_start, "source_finish_ns": source_finish,
-                           "source_service_ns": source_service,
-                           "execution_start_ns": execution_start,
-                           "execution_finish_ns": finish,
-                           "execution_service_ns": execution_service,
+                           "start_ns": source_start, "finish_ns": finish,
                            "service_ns": elapsed},
         })
     curve_raw = b"".join(_canonical(row) for row in rows)

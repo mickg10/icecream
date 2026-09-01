@@ -71,6 +71,14 @@ def _measurement_descriptor(harness_profile: str,
         _fail("product_profile:undeclared")
     raw_ii = effective == RAW_II_PROFILE
     return (RAW_II_PROFILE if raw_ii else harness_profile, effective, not raw_ii)
+
+
+def _plan_identity_profile(harness_profile: str,
+                           product_profile: str | None) -> str:
+    """Return the profile carried by plans and retained experiment records."""
+    _method, effective, _eligible = _measurement_descriptor(harness_profile,
+                                                             product_profile)
+    return effective if effective == RAW_II_PROFILE else harness_profile
 RELATIONSHIP_COUNT = {TOPOLOGY: 1, PARALLEL_TOPOLOGY: 20}
 SLOTS_PER_F = {TOPOLOGY: 1, PARALLEL_TOPOLOGY: 2}
 SCRIPT = Path(__file__).resolve().parents[1] / "unittests/p50compilee2e-run.sh"
@@ -1375,7 +1383,8 @@ def build_command(batch_manifest: Path, profile: str,
     effective_timeout = derive_timeout(count, passes, regime == "warm", timeout_seconds)
     if predictive_plan is None or not predictive_plan.is_absolute() or not predictive_plan.is_file() or predictive_plan.is_symlink():
         _fail("predictive_plan:unavailable")
-    load_predictive_plan(predictive_plan, corpus=corpus, profile=profile,
+    plan_profile = _plan_identity_profile(profile, product_profile)
+    load_predictive_plan(predictive_plan, corpus=corpus, profile=plan_profile,
                          regime=regime, depth=depth)
     if not batch_manifest.is_absolute() or not batch_manifest.is_file() or batch_manifest.is_symlink():
         _fail("batch_manifest:unavailable")
@@ -2491,8 +2500,9 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
         _fail("run_options:invalid")
     expected_count = selected_count(depth, full_count)
     effective_timeout = derive_timeout(expected_count, passes, regime == "warm", timeout_seconds)
+    plan_profile = _plan_identity_profile(profile, product_profile)
     plan, plan_inputs, plan_sha = load_predictive_plan(
-        predictive_plan, corpus=corpus, profile=profile, regime=regime, depth=depth)
+        predictive_plan, corpus=corpus, profile=plan_profile, regime=regime, depth=depth)
     repeat_plan: dict[str, Any] | None = None
     repeat_plan_sha: str | None = None
     if repeat_predictive_plan is not None:
@@ -2501,7 +2511,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
         repeat_plan, _repeat_inputs, repeat_plan_sha = load_repeat_predictive_plan(
             repeat_predictive_plan, first_path=predictive_plan, first_plan=plan,
             first_inputs=plan_inputs, first_sha=plan_sha, corpus=corpus,
-            profile=profile, regime=regime)
+            profile=plan_profile, regime=regime)
     elif depth == "full" and passes == 2:
         _fail("repeat_predictive_plan:required_for_full_two_pass")
     if full_count is None and depth == "full":
@@ -2787,7 +2797,8 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
                 shutil.copy2(source, retained / source.name)
             log = work / f"client-compile-{item['run']}-{item['ordinal']}.log"
             shutil.copy2(log, retained / log.name)
-    cell = f"{corpus}/{profile}/{regime}"
+    identity_profile = effective_product_profile if raw_ii else profile
+    cell = f"{corpus}/{identity_profile}/{regime}"
     split = SPLITS[corpus]
     summary_value = {"schema": "icecream-s7-live-cell-v1",
                      "cell": cell, "split": split, "status": "PASS",
@@ -2960,12 +2971,11 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     evidence_manifest_sha = hashlib.sha256(evidence_raw).hexdigest()
     records: list[dict[str, Any]] = []
     manifests: dict[str, str] = {}
-    identity_profile = effective_product_profile if raw_ii else profile
     for run in run_names:
         selected = [row for row in observations if row["run"] == run]
         curve = _live_curve_rows(
             selected, rows,
-            {"corpus": corpus, "profile": profile, "regime": regime},
+            {"corpus": corpus, "profile": identity_profile, "regime": regime},
             batch_windows[run]["start_ns"],
         )
         curve_raw = b"".join(_canonical(row) + b"\n" for row in curve)
@@ -3012,7 +3022,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     _write_new(target / "live_curve.jsonl", (target / "live_curve_full-1.jsonl").read_bytes())
     _write_new(target / "live_curve_manifest.json", (target / "live_curve_manifest_full-1.json").read_bytes())
     _write_new(target / "records.jsonl", b"".join(_canonical(record) + b"\n" for record in records))
-    experiment = {"schema": SCHEMA, "cell": {"corpus": corpus, "profile": profile, "regime": regime},
+    experiment = {"schema": SCHEMA, "cell": {"corpus": corpus, "profile": identity_profile, "regime": regime},
                   "measurement_method": measurement_method,
                   "product_profile": effective_product_profile,
                   "calibration_eligible": calibration_eligible,
@@ -3181,8 +3191,9 @@ def main(argv: list[str] | None = None) -> int:
     repeat_predictive_plan = (args.repeat_predictive_plan.absolute()
                               if args.repeat_predictive_plan is not None else None)
     topology = args.topology.absolute()
+    plan_profile = _plan_identity_profile(args.profile, args.product_profile)
     _plan, plan_inputs, _plan_sha = load_predictive_plan(
-        predictive_plan, corpus=args.corpus, profile=args.profile,
+        predictive_plan, corpus=args.corpus, profile=plan_profile,
         regime=args.regime, depth=args.depth)
     if repeat_predictive_plan is not None:
         if args.depth != "full" or args.passes != 2:
@@ -3190,7 +3201,7 @@ def main(argv: list[str] | None = None) -> int:
         load_repeat_predictive_plan(
             repeat_predictive_plan, first_path=predictive_plan, first_plan=_plan,
             first_inputs=plan_inputs, first_sha=_plan_sha, corpus=args.corpus,
-            profile=args.profile, regime=args.regime)
+            profile=plan_profile, regime=args.regime)
     elif args.depth == "full" and args.passes == 2:
         _fail("repeat_predictive_plan:required_for_full_two_pass")
     if args.depth == "full":

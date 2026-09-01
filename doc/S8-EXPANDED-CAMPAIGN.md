@@ -28,7 +28,8 @@ whole-legacy control arm, not a fifth compressed profile and not an alias for
 `raw_ii_engine_template` inputs. The dedicated
 `farmharness/s8_raw_ii_predictive_producer.py` consumes those inputs: the
 witness binds C-to-F as `CompileFile + FileChunk + End`, while the separately
-scoped `raw_ii_control_engine` binds F-to-C and elapsed values. It never reads
+scoped `raw_ii_control_engine` binds F-to-C and one elapsed service duration
+per occurrence. It never reads
 P29 predictions. Only the four implemented Root methods can become `READY`,
 and only after an authenticated producer capability manifest proves the exact
 producer source/version/binaries. The two topology records keep stream
@@ -48,14 +49,14 @@ Each witness and control-engine row is keyed by the complete occurrence
 identity `(ordinal, source_relative, source_sha256, source_bytes)`. This keeps
 distinct translation units with identical content distinct, and the producer
 re-snapshots the plan's source manifest and inputs immediately before use. The
-control-engine schema supplies `source_service_ns` and `execution_service_ns`
-whose sum is `elapsed_ns`; the producer applies the authenticated plan's
-global-slot/relationship schedule and reports C1F20 makespan rather than a
-serial sum. Predictive RAW_II commands receive an explicit clean Git product
-root (`--product-root`); emitted source commit/tree identities are the actual
-product `HEAD` and `HEAD^{tree}`, never derived placeholders. `P29` may appear
-only as the mature shell selector; all plan, curve, and comparison identities
-remain `RAW_II`.
+v2 control-engine schema supplies one authenticated `elapsed_ns` service
+duration per occurrence; the producer applies the authenticated plan's
+global-slot schedule and reports C1F20 makespan rather than a serial sum.
+Predictive RAW_II commands receive an explicit Git product root
+(`--product-root`); emitted source commit/tree identities are the actual
+product `HEAD` and `HEAD^{tree}`, with a bounded digest of generated files
+outside `HEAD`. `P29` may appear only as the mature shell selector; all plan,
+curve, and comparison identities remain `RAW_II`.
 
 Example declarative invocation (the timestamp is caller-owned and immutable):
 

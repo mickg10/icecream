@@ -64,8 +64,7 @@ def _control_inputs(tmp_path: Path, plan_path: Path, digest: str, size: int) -> 
         "engine_scope": "raw_ii_control_engine", "model_id": "raw-control-v1",
         "rows": [{"ordinal": item["ordinal"], "source_relative": item["source_relative"],
                   "source_sha256": item["sha256"], "source_bytes": item["bytes"],
-                  "f_to_c_bytes": 17, "source_service_ns": 40,
-                  "execution_service_ns": 61, "elapsed_ns": 101}
+                  "f_to_c_bytes": 17, "elapsed_ns": 101}
                  for item in occurrences],
     }, sort_keys=True) + "\n")
     return witness, engine
@@ -176,8 +175,7 @@ def test_raw_producer_keys_duplicate_content_by_occurrence_and_parallel_makespan
         engine_rows.append({
             "ordinal": item["ordinal"], "source_relative": item["source_relative"],
             "source_sha256": item["sha256"], "source_bytes": item["bytes"],
-            "f_to_c_bytes": 17, "source_service_ns": 10,
-            "execution_service_ns": 90, "elapsed_ns": 100})
+            "f_to_c_bytes": 17, "elapsed_ns": 100})
     witness = tmp_path / "witness.json"
     witness.write_text(json.dumps({"schema": WITNESS_SCHEMA,
                                    "semantics": normalizer.SEMANTICS,
@@ -198,11 +196,44 @@ def test_raw_producer_keys_duplicate_content_by_occurrence_and_parallel_makespan
     assert len({row["occurrence"]["sha256"] for row in rows}) == 1
     assert len({row["occurrence"]["source_relative"] for row in rows}) == 4
     assert [row["scheduling"]["global_slot"] for row in rows[:4]] == [0, 1, 2, 3]
-    assert [row["cumulative"]["elapsed_ns"] for row in rows[:4]] == [100, 110, 110, 110]
+    assert [row["cumulative"]["elapsed_ns"] for row in rows[:4]] == [100, 100, 100, 100]
     assert rows[-1]["cumulative"]["elapsed_ns"] < 100 * 100
     producer = json.loads((output / "producer_manifest.json").read_text())
     assert producer["scheduling"]["makespan_ns"] == rows[-1]["cumulative"]["elapsed_ns"]
     assert producer["scheduling"]["serial_service_ns"] == 100 * 100
+
+
+def test_raw_producer_engine_v2_rejects_split_service_fields(tmp_path: Path) -> None:
+    plan, _source, digest, size = _inputs(tmp_path)
+    witness, engine = _control_inputs(tmp_path, plan, digest, size)
+    value = json.loads(engine.read_text())
+    value["rows"][0]["source_service_ns"] = 40
+    engine.write_text(json.dumps(value) + "\n")
+    with pytest.raises(RawIIError, match="engine_manifest:row_invalid"):
+        produce(plan, witness, engine,
+                Path(json.loads(plan.read_text())["result"]["directory"]), "100",
+                _product_root(tmp_path))
+
+
+def test_raw_producer_retains_plan_snapshot_and_generated_inventory(tmp_path: Path) -> None:
+    plan, _source, digest, size = _inputs(tmp_path)
+    witness, engine = _control_inputs(tmp_path, plan, digest, size)
+    product = _product_root(tmp_path)
+    generated = product / "generated-object.bin"
+    generated.write_bytes(b"generated product output\n")
+    output = Path(json.loads(plan.read_text())["result"]["directory"])
+    produce(plan, witness, engine, output, "100", product)
+    value = json.loads((output / "producer_manifest.json").read_text())
+    plan_facts = value["plan"]
+    assert plan_facts == {
+        "path": str(plan.resolve()),
+        "bytes": plan.stat().st_size,
+        "sha256": hashlib.sha256(plan.read_bytes()).hexdigest(),
+    }
+    inventory = value["product_git"]["untracked"]
+    assert inventory["count"] == 1
+    assert inventory["entries"][0]["path"] == generated.name
+    assert inventory["entries"][0]["sha256"] == hashlib.sha256(generated.read_bytes()).hexdigest()
 
 
 def test_raw_producer_rejects_duplicate_json_keys(tmp_path: Path) -> None:

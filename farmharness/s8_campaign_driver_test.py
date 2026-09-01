@@ -326,8 +326,7 @@ def test_raw_ii_local_campaign_binds_plan_producer_and_live_identity(
         engine_rows = [{
             "ordinal": ordinal, "source_relative": "tu.cc",
             "source_sha256": source_sha, "source_bytes": source_bytes,
-            "f_to_c_bytes": 17, "source_service_ns": 40,
-            "execution_service_ns": 60, "elapsed_ns": 100}
+            "f_to_c_bytes": 17, "elapsed_ns": 100}
             for ordinal in range(100)]
         cell = {"corpus": "fmt", "profile": "RAW_II", "regime": regime}
         (tmp_path / f"witness-{regime}.json").write_text(json.dumps({
@@ -338,7 +337,7 @@ def test_raw_ii_local_campaign_binds_plan_producer_and_live_identity(
                 "c_to_f": "compile_file_bytes+file_chunk_bytes+end_bytes"},
             "rows": witness_rows}, sort_keys=True) + "\n")
         (tmp_path / f"engine-{regime}.json").write_text(json.dumps({
-            "schema": "icecream-s8-raw-ii-control-engine-v1",
+            "schema": "icecream-s8-raw-ii-control-engine-v2",
             "semantics": "s8-current-semantics-v1", "cell": cell,
             "split": "calibration",
             "control_baseline": normalizer.CONTROL_BASELINE,
