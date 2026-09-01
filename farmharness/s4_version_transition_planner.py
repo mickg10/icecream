@@ -707,9 +707,52 @@ def build_plan() -> dict[str, Any]:
     }
 
 
+CANONICAL_PLAN_VARIABLE_PATHS: frozenset[tuple[str, ...]] = frozenset()
+
+
+def _canonical_plan_differences(expected: object, actual: object,
+                                path: tuple[str, ...] = ()) -> list[str]:
+    """Return bounded structural differences for the emitted plan schema."""
+    if path in CANONICAL_PLAN_VARIABLE_PATHS:
+        return []
+    if isinstance(expected, dict):
+        if not isinstance(actual, Mapping):
+            return [".".join(path) or "<root>"]
+        differences: list[str] = []
+        expected_keys = set(expected)
+        actual_keys = set(actual)
+        for key in sorted(expected_keys - actual_keys):
+            differences.append(".".join((*path, str(key))))
+        for key in sorted(actual_keys - expected_keys):
+            differences.append(".".join((*path, str(key))))
+        for key in sorted(expected_keys & actual_keys):
+            differences.extend(_canonical_plan_differences(
+                expected[key], actual[key], (*path, str(key))))
+            if len(differences) >= 64:
+                return differences[:64]
+        return differences
+    if isinstance(expected, list):
+        if not isinstance(actual, list) or len(actual) != len(expected):
+            return [".".join(path) or "<root>"]
+        differences = []
+        for index, (expected_item, actual_item) in enumerate(zip(expected, actual)):
+            differences.extend(_canonical_plan_differences(
+                expected_item, actual_item, (*path, str(index))))
+            if len(differences) >= 64:
+                return differences[:64]
+        return differences
+    return [] if expected == actual and type(expected) is type(actual) else [".".join(path) or "<root>"]
+
+
 def _audit_plan_unchecked(plan: Mapping[str, Any]) -> dict[str, Any]:
     """Audit a generated or serialized plan and return a fail-closed summary."""
     errors: list[str] = []
+    # The planner emits one canonical structure.  Compare every required
+    # field recursively so a deleted nested contract cannot pass merely
+    # because a summary count still happens to match.  No variable evidence
+    # paths are currently admitted; future exceptions must be named above.
+    for path in _canonical_plan_differences(build_plan(), plan):
+        errors.append(f"canonical-plan:{path}")
     expected_source = {"integration_head": P50_SOURCE_SHA,
                        "harness": HARNESS_INVENTORY}
     if plan.get("source") != expected_source:
@@ -1061,7 +1104,7 @@ def audit_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
         }
     try:
         return _audit_plan_unchecked(plan)
-    except (AttributeError, KeyError, IndexError, TypeError, ValueError) as exc:
+    except Exception as exc:  # malformed serialized controls must never escape
         return {
             "schema": "icecream-s4-version-transition-audit-v1",
             "status": "FAIL", "errors": [f"malformed-plan:{type(exc).__name__}"],

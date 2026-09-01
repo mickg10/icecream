@@ -98,6 +98,28 @@ def _authenticated_directory(path: str | Path | None) -> bool:
     return candidate.is_dir() and not candidate.is_symlink()
 
 
+def _matrix_audit_gate(path: Path) -> tuple[bool, str | None]:
+    """Validate the immutable S8 matrix precondition before staging arms."""
+    if not _authenticated_regular_file(path):
+        return False, "matrix audit is not an authenticated regular file"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
+        return False, "matrix audit is unreadable or malformed"
+    if not isinstance(value, dict) or value.get("schema") != "icecream-s8-matrix-audit-v1":
+        return False, "matrix audit schema is not icecream-s8-matrix-audit-v1"
+    if value.get("status") != "PASS":
+        return False, "matrix audit status is not PASS"
+    matrix = value.get("matrix")
+    if (not isinstance(matrix, dict) or matrix.get("expected_cells") != 32 or
+            matrix.get("completed_cells") != 32 or matrix.get("missing_cells") != [] or
+            matrix.get("invalid_candidates") != [] or
+            matrix.get("calibration_cells") != 16 or
+            matrix.get("held_out_validation_cells") != 16):
+        return False, "matrix audit PASS record is incomplete"
+    return True, None
+
+
 def _repeat_predecessor(root: Path, method: str) -> Path:
     """Resolve repeat-full to its sibling full arm in this campaign."""
     regime_dir, topology_dir, depth_dir, method_dir = root.parents[:4]
@@ -109,7 +131,8 @@ def _arm(method: str, block: dict[str, Any], root: Path, *, python: str,
          repo: Path, source_manifest: str, source_root: str,
          matrix_audit: Path, engine_manifest: str, product_root: Path,
          compile_db: Path | None, compile_source_root: Path | None,
-         compile_output_root: Path | None) -> dict[str, Any]:
+         compile_output_root: Path | None,
+         matrix_audit_ready: bool, matrix_audit_reason: str | None) -> dict[str, Any]:
     """Return one arm record without touching any source or product input."""
     product_method = method
     harness_profile = ("RAW_II" if method == "RAW_II" else
@@ -164,7 +187,7 @@ def _arm(method: str, block: dict[str, Any], root: Path, *, python: str,
                          "--plan", str(first_plan),
                          "--raw-ii-witness", "<raw-ii-witness-required>",
                          "--engine-manifest", "<raw-ii-control-engine-required>",
-                         "--output-dir", str(first_result), "--depth",
+                         "--depth",
                          "full" if depth == "repeat-full" else depth,
                          "--product-root", str(product_root)]
     else:
@@ -207,6 +230,7 @@ def _arm(method: str, block: dict[str, Any], root: Path, *, python: str,
                              "--out", str(attempt / f"records{suffix}.jsonl")])
     live_ready = (
         method != "RAW_II" and
+        matrix_audit_ready and
         _authenticated_regular_file(source_manifest) and
         _authenticated_directory(source_root) and
         _authenticated_regular_file(engine_manifest) and
@@ -216,6 +240,8 @@ def _arm(method: str, block: dict[str, Any], root: Path, *, python: str,
     )
     if method == "RAW_II":
         reason = "RAW_II witness and control-engine inputs are not bound"
+    elif not matrix_audit_ready:
+        reason = matrix_audit_reason or "matrix audit is not a complete PASS record"
     elif not live_ready:
         reason = "authenticated regular source/engine/compile inputs are not bound"
     else:
@@ -278,6 +304,7 @@ def materialize_matrix(*, output_root: Path, repo: Path, corpus: str,
     if audit_plan(plan).get("status") != "PASS":
         raise ValueError("s4_plan:audit_failed")
     contract = plan["execution_measurement_contract"]
+    matrix_audit_ready, matrix_audit_reason = _matrix_audit_gate(matrix_audit.absolute())
     stamp = timestamp or _stamp()
     campaign = output_root.absolute() / f"s4-method-matrix-{stamp}"
     campaign.mkdir(parents=True)
@@ -327,7 +354,9 @@ def materialize_matrix(*, output_root: Path, repo: Path, corpus: str,
                              matrix_audit=matrix_audit.absolute(),
                              engine_manifest=block_engine_manifest, product_root=product_root.absolute(),
                              compile_db=compile_db, compile_source_root=compile_source_root,
-                             compile_output_root=compile_output_root))
+                             compile_output_root=compile_output_root,
+                             matrix_audit_ready=matrix_audit_ready,
+                             matrix_audit_reason=matrix_audit_reason))
         block_record = {"schema": "icecream-s4-method-comparison-block-v1",
                         "id": template["id"], "corpus": corpus,
                         "split": SPLITS[corpus], "method": template["method"],

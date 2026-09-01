@@ -123,6 +123,44 @@ def test_raw_producer_binds_legacy_formula_and_normalizer(tmp_path: Path) -> Non
                for record in records)
 
 
+def test_raw_paired_repeat_cli_binds_each_plan_output_and_rejects_reuse(
+        tmp_path: Path) -> None:
+    first_100, _source, _digest, _size = _inputs(tmp_path)
+    first_value = json.loads(first_100.read_text())
+    full_output = tmp_path / "s8-DuckDB-RAW_II-cold-20260901T030000Z"
+    full = depth.build_plan(
+        Path(first_value["source_manifest"]["path"]),
+        Path(first_value["source_root"]),
+        Path(first_value["matrix_precondition"]["path"]),
+        full_output, "DuckDB", "RAW_II", "cold", "full", topology="C1F1")
+    full_plan = tmp_path / "depth-plan-full.json"
+    full_plan.write_text(json.dumps(full, sort_keys=True) + "\n")
+
+    repeat_output = tmp_path / "s8-DuckDB-RAW_II-cold-20260901T030001Z"
+    repeat = depth.build_plan(
+        Path(json.loads(first_100.read_text())["source_manifest"]["path"]),
+        Path(json.loads(first_100.read_text())["source_root"]),
+        Path(json.loads(first_100.read_text())["matrix_precondition"]["path"]),
+        repeat_output, "DuckDB", "RAW_II", "cold", "repeat-full",
+        repeat_of=full_plan, topology="C1F1")
+    repeat_plan = tmp_path / "depth-plan-repeat.json"
+    repeat_plan.write_text(json.dumps(repeat, sort_keys=True) + "\n")
+    digest = full["inputs"][0]["sha256"]
+    size = full["inputs"][0]["bytes"]
+    witness, engine = _control_inputs(tmp_path, full_plan, digest, size)
+    product = _product_root(tmp_path)
+    args = ["--plan", str(full_plan), "--repeat-plan", str(repeat_plan),
+            "--raw-ii-witness", str(witness), "--engine-manifest", str(engine),
+            "--depth", "full", "--product-root", str(product)]
+    assert producer.main(args) == 0
+    assert (full_output / "predictive_curve_manifest.json").is_file()
+    assert (repeat_output / "predictive_curve_manifest.json").is_file()
+
+    # A second invocation must fail at the producer's new-output boundary;
+    # paired mode must never reinterpret --repeat-plan as an output override.
+    assert producer.main(args) == 2
+
+
 def test_raw_producer_rejects_formula_or_engine_scope_mutation(tmp_path: Path) -> None:
     plan, _source, digest, size = _inputs(tmp_path)
     witness, engine = _control_inputs(tmp_path, plan, digest, size)

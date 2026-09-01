@@ -835,22 +835,42 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--raw-ii-witness", type=Path, required=True)
     parser.add_argument("--engine-manifest", type=Path, required=True)
     parser.add_argument("--product-root", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--repeat-plan", type=Path)
     parser.add_argument("--depth", choices=("100", "200", "full"), required=True)
     args = parser.parse_args(argv)
     try:
-        produce(args.plan.absolute(), args.raw_ii_witness.absolute(), args.engine_manifest.absolute(),
-                args.output_dir.absolute(), args.depth, args.product_root.absolute())
+        plan_path = args.plan.absolute()
+        witness_path = args.raw_ii_witness.absolute()
+        engine_path = args.engine_manifest.absolute()
+        product_root = args.product_root.absolute()
         if args.repeat_plan is not None:
-            repeat_value, _repeat_facts = _read(args.repeat_plan.absolute(), "repeat_plan")
+            # Paired full runs are plan-bound: each plan owns its output
+            # directory.  Supplying the first output directory alongside a
+            # repeat plan would re-run full-1 into an existing result and
+            # fail closed at the output boundary.
+            if args.output_dir is not None:
+                raise RawIIError("repeat_full:output_dir_is_plan_bound")
+            first_value, _first_facts = _read(plan_path, "plan")
+            first_result = first_value.get("result")
+            if (not isinstance(first_result, dict) or
+                    not isinstance(first_result.get("directory"), str)):
+                raise RawIIError("plan:result_directory_invalid")
+            repeat_path = args.repeat_plan.absolute()
+            repeat_value, _repeat_facts = _read(repeat_path, "repeat_plan")
             repeat_result = repeat_value.get("result")
             if (not isinstance(repeat_result, dict) or
                     not isinstance(repeat_result.get("directory"), str)):
                 raise RawIIError("repeat_plan:result_directory_invalid")
-            produce(args.repeat_plan.absolute(), args.raw_ii_witness.absolute(),
-                    args.engine_manifest.absolute(), Path(repeat_result["directory"]),
-                    "repeat-full", args.product_root.absolute())
+            produce(plan_path, witness_path, engine_path, Path(first_result["directory"]),
+                    args.depth, product_root)
+            produce(repeat_path, witness_path, engine_path, Path(repeat_result["directory"]),
+                    "repeat-full", product_root)
+        else:
+            if args.output_dir is None:
+                raise RawIIError("output_dir:required_without_repeat_plan")
+            produce(plan_path, witness_path, engine_path, args.output_dir.absolute(),
+                    args.depth, product_root)
     except RawIIError as exc:
         print(f"s8_raw_ii_predictive_producer: {exc}", file=sys.stderr)
         return 2

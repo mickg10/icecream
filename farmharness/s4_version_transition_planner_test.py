@@ -223,6 +223,40 @@ class S4VersionTransitionPlannerTest(unittest.TestCase):
             self.assertEqual(result["status"], "FAIL", malformed)
             self.assertIsInstance(result["errors"], list)
 
+    def test_auditor_rejects_any_canonical_contract_deletion_or_mutation(self) -> None:
+        paths = (
+            ("transition_class_counts",),
+            ("homogeneous_states",),
+            ("homogeneous_version_arms",),
+            ("optional_unaccepted_method_extras", "ZSTD_COHORT"),
+            ("mixed_version_performance",),
+            ("migration_orders",),
+            ("execution_measurement_contract", "method_contracts", "ZSTD_TU"),
+            ("homogeneous_version_comparison_contract", "pairs"),
+            ("performance_arms", "p50_raw_ii_whole_legacy"),
+            ("upgrade_orders", "43_to_50"),
+            ("real_artifact_versions", 0, "source_commit"),
+            ("states", 0, "tuple"),
+            ("transitions", 0, "classification"),
+        )
+
+        def mutate(value: dict, path: tuple[object, ...], *, delete: bool) -> None:
+            current = value
+            for key in path[:-1]:
+                current = current[key]
+            if delete:
+                del current[path[-1]]
+            else:
+                current[path[-1]] = None
+
+        for path in paths:
+            for delete in (True, False):
+                mutant = json.loads(json.dumps(self.plan))
+                mutate(mutant, path, delete=delete)
+                result = audit_plan(mutant)
+                self.assertEqual(result["status"], "FAIL", (path, delete))
+                self.assertIsInstance(result["errors"], list)
+
     def test_cli_is_non_executing_and_emits_json(self) -> None:
         script = Path(__file__).with_name("s4_version_transition_planner.py")
         completed = subprocess.run([sys.executable, str(script), "--summary"],

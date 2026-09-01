@@ -129,6 +129,8 @@ class S4MethodMatrixExecutorTest(unittest.TestCase):
                 self.assertEqual(plan_path, Path(producer[producer.index("--repeat-plan" if "--repeat-plan" in producer else "--plan") + 1]))
                 self.assertEqual(producer.count("--repeat-plan"),
                                  1 if "repeat-full" in manifest_path.parts else 0)
+                if "repeat-full" in manifest_path.parts:
+                    self.assertNotIn("--output-dir", producer)
                 self.assertFalse(commands["predictive_plan"]["executable"])
                 self.assertFalse(commands["predictive_producer"]["executable"])
                 if manifest["method"] == "RAW_II":
@@ -146,6 +148,60 @@ class S4MethodMatrixExecutorTest(unittest.TestCase):
                           (campaign / "transition-plan.jsonl").read_text().splitlines()]
             self.assertEqual({(row["before"], row["after"]) for row in transition},
                              {(row["before"], row["after"]) for row in build_plan()["transitions"]})
+
+    def test_matrix_audit_gate_requires_authenticated_complete_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source_root = root / "sources"
+            source_root.mkdir()
+            source_manifest = root / "sources.txt"
+            source_manifest.write_text("placeholder\n")
+            engine_manifest = root / "engine.json"
+            engine_manifest.write_text("{}\n")
+            matrix_audit = root / "matrix.json"
+            matrix_audit.write_text(json.dumps({
+                "schema": "icecream-s8-matrix-audit-v1", "status": "PASS",
+                "matrix": {"expected_cells": 32, "completed_cells": 32,
+                            "missing_cells": [], "invalid_candidates": [],
+                            "calibration_cells": 16, "held_out_validation_cells": 16},
+                "cells": [],
+            }) + "\n")
+            compile_db = root / "compile_commands.json"
+            compile_db.write_text("[]\n")
+            compile_source = root / "compile-src"
+            compile_source.mkdir()
+            product = root / "product"
+            product.mkdir()
+
+            campaign = materialize_matrix(
+                output_root=root, repo=Path.cwd(), corpus="fmt",
+                source_manifest=str(source_manifest), source_root=str(source_root),
+                matrix_audit=matrix_audit, engine_manifest=str(engine_manifest),
+                product_root=product, compile_db=compile_db,
+                compile_source_root=compile_source, timestamp="20260831T141132Z")
+            grz_path = campaign / "experiments/fmt/GRZ/full/C1F1-100000/cold/AB/arms/GRZ/manifest.json"
+            grz = json.loads(grz_path.read_text())
+            self.assertEqual(grz["status"], "STAGED")
+            self.assertTrue(grz["executable"])
+
+            matrix_audit.write_text(json.dumps({
+                "schema": "icecream-s8-matrix-audit-v1", "status": "INCOMPLETE",
+                "matrix": {"expected_cells": 32, "completed_cells": 31,
+                            "missing_cells": ["missing"], "invalid_candidates": [],
+                            "calibration_cells": 16, "held_out_validation_cells": 15},
+                "cells": [],
+            }) + "\n")
+            blocked_campaign = materialize_matrix(
+                output_root=root, repo=Path.cwd(), corpus="fmt",
+                source_manifest=str(source_manifest), source_root=str(source_root),
+                matrix_audit=matrix_audit, engine_manifest=str(engine_manifest),
+                product_root=product, compile_db=compile_db,
+                compile_source_root=compile_source, timestamp="20260831T141133Z")
+            blocked = json.loads((blocked_campaign /
+                                  "experiments/fmt/GRZ/full/C1F1-100000/cold/AB/arms/GRZ/manifest.json").read_text())
+            self.assertEqual(blocked["status"], "BLOCKED")
+            self.assertFalse(blocked["executable"])
+            self.assertIn("matrix audit status is not PASS", blocked["execution_blocker"])
 
     def test_heldout_corpus_is_rejected_before_materialization(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
