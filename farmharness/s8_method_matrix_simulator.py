@@ -117,6 +117,17 @@ def _valid_prefix_descriptor(value: object, *, limit: int = 1 << MAX_HISTORY_WIN
             0 <= int(value["bytes"]) <= limit and _digest128_text(value.get("digest128")))
 
 
+def _validate_native_prefix_keys(item: Mapping[str, object], method: str) -> None:
+    prefix_keys = {key for key in item
+                   if isinstance(key, str) and key.startswith("committed_raw_prefix")}
+    allowed = {"committed_raw_prefix_before_descriptor", "committed_raw_prefix_descriptor"}
+    if method == "ZSTD_ROUTE":
+        if prefix_keys != allowed:
+            raise MatrixError("native product output route descriptor keys invalid")
+    elif prefix_keys:
+        raise MatrixError("native product output prefix body forbidden")
+
+
 def _state_digest(history: bytes | bytearray, next_rel_seq: int,
                   route_id: str | None, nonce: int) -> str:
     return _sha256(_canonical({"prefix": _prefix_descriptor(history),
@@ -332,6 +343,7 @@ def _stream_route_prefixes(selected: object, assignment: object, root: Path,
     for relation, relation_entries in entries.items():
         relationship_key = "C0|F" + str(relation)
         history = bytearray()
+        before_descriptor = _prefix_descriptor(history)
         for is_current, stream_entries in ((False, predecessor_entries.get(relation, [])),
                                            (True, relation_entries)):
             for index, item, _assignment_row in stream_entries:
@@ -346,9 +358,10 @@ def _stream_route_prefixes(selected: object, assignment: object, root: Path,
                 if (file_facts["sha256"] != item.get("sha256") or
                         file_facts["bytes"] != item.get("bytes")):
                     raise MatrixError(label + ":input_mutated")
-                before = _prefix_descriptor(history)
+                before = before_descriptor
                 _append_bounded_history_in_place(history, raw, effective_limit)
                 after = _prefix_descriptor(history)
+                before_descriptor = after
                 if is_current:
                     observations[item["ordinal"]] = {"relationship_key": ["C0", "F" + str(relation)],
                                            "before": before, "after": after}
@@ -479,12 +492,7 @@ def _native_batch(occurrences: Sequence[Occurrence], topology: MatrixTopology,
                           segment_rows: Sequence[object]) -> None:
             if not isinstance(item, Mapping) or item.get("schema") != "icecream-p50sim-batch-v1":
                 raise MatrixError("native product output schema invalid")
-            if any(isinstance(key, str) and key.startswith("committed_raw_prefix")
-                   for key in item):
-                allowed = {"committed_raw_prefix_before_descriptor",
-                           "committed_raw_prefix_descriptor"}
-                if any(key not in allowed for key in item):
-                    raise MatrixError("native product output prefix body forbidden")
+            _validate_native_prefix_keys(item, method)
             marker = (segment, index)
             if marker in seen:
                 raise MatrixError("native product output duplicate ordinal")

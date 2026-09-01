@@ -458,6 +458,25 @@ def test_native_batch_rejects_duplicate_output_ordinal(tmp_path: Path,
         simulator_module._native_batch([occurrence], topology, assignment, "ZSTD_TU")
 
 
+def test_native_route_prefix_key_set_is_exact_and_nonroute_has_none() -> None:
+    route = {"schema": "icecream-p50sim-batch-v1",
+             "committed_raw_prefix_before_descriptor": {},
+             "committed_raw_prefix_descriptor": {}}
+    simulator_module._validate_native_prefix_keys(route, "ZSTD_ROUTE")
+    for key in ("committed_raw_prefix_before", "committed_raw_prefix_extra"):
+        forged = dict(route)
+        forged[key] = {}
+        with pytest.raises(MatrixError, match="descriptor keys invalid"):
+            simulator_module._validate_native_prefix_keys(forged, "ZSTD_ROUTE")
+    missing = dict(route)
+    del missing["committed_raw_prefix_descriptor"]
+    with pytest.raises(MatrixError, match="descriptor keys invalid"):
+        simulator_module._validate_native_prefix_keys(missing, "ZSTD_ROUTE")
+    with pytest.raises(MatrixError, match="prefix body forbidden"):
+        simulator_module._validate_native_prefix_keys(
+            {"committed_raw_prefix_descriptor": {}}, "P29")
+
+
 @pytest.mark.parametrize("field", ("profile", "relationship_id", "tu_seq",
                                     "raw_digest", "state_digest"))
 def test_native_batch_rejects_mutated_identity_fields(
