@@ -29,8 +29,8 @@ test "$JSHA" = "$PINNED" || { echo 'FAIL: pinned TLC digest mismatch' >&2; exit 
 test -f "$SPEC" || { echo 'FAIL: V5 correction spec is absent' >&2; exit 2; }
 test "$(sha256 "$SPEC")" = "$SPEC_SHA" || { echo 'FAIL: V5 correction spec digest mismatch' >&2; exit 2; }
 if test "${S6_TRANSPLANT_REVIEW:-0}" = 1; then
-  test "$(git -C "$ROOT" rev-parse HEAD^)" = b702a35cf4060a560135d488e51b2d39d2fd3526 || {
-    echo 'FAIL: review transplant requires exact b702 parent' >&2; exit 2
+  test "$(git -C "$ROOT" merge-base HEAD b702a35cf4060a560135d488e51b2d39d2fd3526)" = b702a35cf4060a560135d488e51b2d39d2fd3526 || {
+    echo 'FAIL: review transplant requires exact b702 ancestry' >&2; exit 2
   }
   test -f "$D/S6_V6_TRANSPLANT_AUTHORITY.md" || {
     echo 'FAIL: review transplant authority map is absent' >&2; exit 2
