@@ -357,12 +357,30 @@ def _full2_marker(manifest: Mapping[str, Any], summary: Mapping[str, Any],
             prior_prefix = before_prefix
             for row_index, current_row in enumerate(current_rows):
                 transaction = current_row.get("product_transaction")
-                if (current_row.get("native_next_rel_seq") !=
-                        (current_rows[row_index - 1].get("native_next_rel_seq") + 1
-                         if row_index else before["native_next_rel_seq"] + 1) or
+                previous_next_rel = (current_rows[row_index - 1].get("native_next_rel_seq")
+                                     if row_index else before.get("native_next_rel_seq"))
+                native_next_rel = current_row.get("native_next_rel_seq")
+                rel_seq = current_row.get("rel_seq")
+                transaction_tu = (transaction.get("tu_seq")
+                                  if isinstance(transaction, Mapping) else None)
+                transaction_rel = (transaction.get("rel_seq")
+                                   if isinstance(transaction, Mapping) else None)
+                transaction_next_rel = (transaction.get("native_next_rel_seq")
+                                        if isinstance(transaction, Mapping) else None)
+                if (type(previous_next_rel) is not int or
+                        type(native_next_rel) is not int or
+                        type(rel_seq) is not int or
+                        native_next_rel != previous_next_rel + 1 or
+                        native_next_rel != rel_seq + 1 or
                         current_row.get("committed") is not True or
                         not isinstance(transaction, Mapping) or
                         transaction.get("committed") is not True or
+                        type(transaction_tu) is not int or
+                        transaction_tu != current_row.get("native_tu_seq") or
+                        type(transaction_rel) is not int or
+                        transaction_rel != rel_seq or
+                        type(transaction_next_rel) is not int or
+                        transaction_next_rel != native_next_rel or
                         current_row.get("native_state_before_digest") != prior_state_digest or
                         transaction.get("state_before_digest") != prior_state_digest or
                         not _valid_digest(transaction.get("state_digest")) or

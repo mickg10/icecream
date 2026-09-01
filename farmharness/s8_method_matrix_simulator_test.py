@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -445,7 +447,8 @@ def test_native_batch_rejects_duplicate_output_ordinal(tmp_path: Path,
                   "selected_count": 1, "rows": [{
                       "ordinal": 0, "global_slot": 0, "f_relationship": 0,
                       "per_f_slot": 0, "dispatch_order": 0,
-                      "authority_dispatch_order": 0}]}
+                      "authority_dispatch_order": 0, "authority_tu_seq": 0}]}
+    _fake_native_batch_runner(monkeypatch)
     original_run = simulator_module.subprocess.run
 
     def duplicate_output(*args: object, **kwargs: object) -> object:
@@ -644,28 +647,38 @@ def _fake_native_batch_runner(monkeypatch: pytest.MonkeyPatch) -> None:
                 Path(command[command.index("--batch-manifest-2") + 1]),
                 Path(command[command.index("--batch-assignment-map-2") + 1])))
         state: dict[int, str] = {}
+        next_rel: dict[int, int] = {}
         global_tu = 0
         lines: list[str] = []
         for segment, manifest, mapping in segments:
             paths = manifest.read_text().splitlines()
-            assignment_rows = mapping.read_text().splitlines()[1:]
+            mapping_lines = mapping.read_text().splitlines()
+            cardinality = int(mapping_lines[0].split("=", 1)[1])
+            assignment_rows = mapping_lines[1:]
             for index, (path_text, relation_text) in enumerate(zip(paths, assignment_rows)):
                 raw = Path(path_text).read_bytes()
                 relation = int(relation_text)
-                rel_seq = 0 if relation not in state else 1
+                rel_seq = next_rel.get(relation, 0)
+                next_rel[relation] = rel_seq + 1
                 before = state.get(relation, "a" * 32)
                 after = ("b" if relation == 0 else "c") * 32
                 state[relation] = after
-                lines.append(json.dumps({
+                item = {
                     "schema": "icecream-p50sim-batch-v1", "segment": segment,
                     "profile": kwargs["env"]["ICECC_P50_PROFILE"],
-                    "relationship_id": f"c1f20-r{relation:02d}", "rel_seq": rel_seq,
+                    "relationship_id": f"c1f{cardinality}-r{relation:02d}", "rel_seq": rel_seq,
                     "tu_index": index, "tu_seq": global_tu,
                     "raw_bytes": len(raw), "raw_digest": simulator_module._digest128(raw),
                     "encoded_source_bytes": 1, "c_to_f_bytes": 1, "f_to_c_bytes": 1,
                     "simulator_execution_ns": 1, "state_before_digest": before,
                     "state_digest": after, "transaction_digest": "d" * 32,
-                    "committed": True}))
+                    "committed": True}
+                if kwargs["env"]["ICECC_P50_PROFILE"] == "ZSTD_ROUTE":
+                    empty = {"schema": simulator_module.PREFIX_DESCRIPTOR_SCHEMA,
+                             "bytes": 0, "digest128": simulator_module._digest128(b"")}
+                    item["committed_raw_prefix_before_descriptor"] = empty
+                    item["committed_raw_prefix_descriptor"] = empty
+                lines.append(json.dumps(item))
                 global_tu += 1
         output.write_text("\n".join(lines) + "\n")
         return subprocess.CompletedProcess(command, 0, b"", b"")
@@ -688,7 +701,7 @@ def test_native_batch_requires_one_global_tu_seq_across_interleaved_relationship
     rows = [{"ordinal": index, "global_slot": relation * 2,
              "f_relationship": relation, "per_f_slot": 0,
              "dispatch_order": index, "authority_dispatch_order": index,
-             "authority_rel_seq": rel}
+             "authority_tu_seq": index, "authority_rel_seq": rel}
             for index, (relation, rel) in enumerate(((0, 0), (1, 0), (0, 1), (1, 1)))]
     assignment = {"status": "READY", "topology": topology.topology_id,
                   "selected_count": 4, "rows": rows}
@@ -697,6 +710,56 @@ def test_native_batch_requires_one_global_tu_seq_across_interleaved_relationship
     assert [item["tu_seq"] for item in output.values()] == [0, 1, 2, 3]
     assert [item["_native_rel_seq"] for item in output.values()] == [0, 0, 1, 1]
     assert [item["_native_next_tu_seq"] for item in output.values()] == [1, 2, 3, 4]
+
+
+def test_native_batch_binds_nonzero_tu_seq_to_assignment_authority(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    topology = MatrixTopology.from_id("C1F20/40")
+    paths = []
+    for index in range(2):
+        path = tmp_path / f"nonzero-{index}.ii"
+        path.write_bytes(f"payload-{index}".encode())
+        paths.append(path)
+    occurrences = [Occurrence(index + 100, None, source_path=str(path), source_relative=path.name,
+                               source_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                               source_digest128=simulator_module._digest128(path.read_bytes()))
+                   for index, path in enumerate(paths)]
+    rows = [{"ordinal": index, "global_slot": relation * 2,
+             "f_relationship": relation, "per_f_slot": 0,
+             "dispatch_order": 100 + index, "authority_dispatch_order": 100 + index,
+             "authority_tu_seq": 100 + index, "authority_rel_seq": 0}
+            for index, relation in enumerate((0, 1))]
+    assignment = {"status": "READY", "topology": topology.topology_id,
+                  "selected_count": 2, "rows": rows}
+    _fake_native_batch_runner(monkeypatch)
+    base_runner = simulator_module.subprocess.run
+
+    def shifted_runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        result = base_runner(command, **kwargs)
+        output = Path(command[command.index("--batch-output") + 1])
+        lines = []
+        for line in output.read_text().splitlines():
+            item = json.loads(line)
+            item["tu_seq"] += 100
+            lines.append(json.dumps(item))
+        output.write_text("\n".join(lines) + "\n")
+        return result
+
+    monkeypatch.setattr(simulator_module.subprocess, "run", shifted_runner)
+    output = simulator_module._native_batch(occurrences, topology, assignment, "P29")
+    assert [item["tu_seq"] for item in output.values()] == [100, 101]
+
+    def mismatched_runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        result = shifted_runner(command, **kwargs)
+        output = Path(command[command.index("--batch-output") + 1])
+        item = json.loads(output.read_text().splitlines()[0])
+        item["tu_seq"] += 1
+        output.write_text(json.dumps(item) + "\n")
+        return result
+
+    monkeypatch.setattr(simulator_module.subprocess, "run", mismatched_runner)
+    with pytest.raises(MatrixError, match="TU sequence"):
+        simulator_module._native_batch(occurrences, topology, assignment, "P29")
 
 
 def test_native_full2_keeps_global_next_tu_separate_from_route_rel_seq(
@@ -713,34 +776,83 @@ def test_native_full2_keeps_global_next_tu_separate_from_route_rel_seq(
         return Occurrence(index, None, source_path=str(path), source_relative=path.name,
                           source_sha256=hashlib.sha256(raw).hexdigest(),
                           source_digest128=simulator_module._digest128(raw))
-    def authority(relations: tuple[tuple[int, int], ...]) -> dict[str, object]:
+    def authority(relations: tuple[tuple[int, int], ...], start: int = 0) -> dict[str, object]:
         return {"status": "READY", "topology": topology.topology_id,
                 "selected_count": len(relations), "rows": [
                     {"ordinal": index, "global_slot": relation * 2,
                      "f_relationship": relation, "per_f_slot": 0,
-                     "dispatch_order": index, "authority_dispatch_order": index,
+                     "dispatch_order": start + index, "authority_dispatch_order": start + index,
+                     "authority_tu_seq": start + index,
                      "authority_rel_seq": rel}
                     for index, (relation, rel) in enumerate(relations)]}
     _fake_native_batch_runner(monkeypatch)
     output = simulator_module._native_batch(
         # The current segment starts on F0 although the predecessor's global
         # last TU was on F1; route-local last TU must not seed C-wide TU_SEQ.
-        [occurrence(2), occurrence(3)], topology, authority(((0, 1), (1, 1))), "P29",
+        [occurrence(2), occurrence(3)], topology, authority(((0, 1), (1, 1)), 2), "P29",
         predecessor_occurrences=[occurrence(0), occurrence(1)],
-        predecessor_assignment=authority(((0, 0), (1, 0))))
+        predecessor_assignment=authority(((0, 0), (1, 0)), 0))
     measured = list(output.values())
     assert [item["tu_seq"] for item in measured] == [2, 3]
     assert [item["_native_rel_seq"] for item in measured] == [1, 1]
     assert [item["_native_next_tu_seq"] for item in measured] == [3, 4]
 
 
-def test_native_repeat_full_carries_state_with_changed_assignment_map(tmp_path: Path) -> None:
+def test_codec_mode_uses_c_wide_tu_allocator_not_relationship_rel_seq(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    matrix = MethodMatrixSimulator(MatrixTopology.from_id("C1F20/40"),
+                                   methods=("ZSTD_TU",))
+    state = simulator_module._RelationshipState(("C0", "F0"), next_rel_seq=17)
+    matrix._native_codec_next_tu_seq["ZSTD_TU"] = 41
+    captured: list[list[str]] = []
+    original_lstat = Path.lstat
+    original_access = os.access
+    original_private_bytes = simulator_module._private_bytes
+
+    def fake_lstat(path: Path) -> object:
+        if path.name == ".p50sim.bin":
+            return SimpleNamespace(st_mode=stat.S_IFREG, st_nlink=1)
+        return original_lstat(path)
+
+    def fake_private_bytes(path: Path, label: str) -> tuple[bytes, dict[str, object]]:
+        if path.name == ".p50sim-build.json":
+            raw = json.dumps({"schema": "icecream-p50sim-build-v1",
+                              "binary": {"path": str(path.parent / ".p50sim.bin"),
+                                         "sha256": "e" * 64}}).encode()
+            return raw, {"path": str(path), "bytes": len(raw), "sha256": simulator_module._sha256(raw)}
+        return original_private_bytes(path, label)
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        captured.append(command)
+        output = Path(command[command.index("--codec-output") + 1])
+        output.write_bytes(b"encoded")
+        return subprocess.CompletedProcess(command, 0, b"", b"")
+
+    monkeypatch.setattr(Path, "lstat", fake_lstat)
+    monkeypatch.setattr(os, "access", lambda path, mode: True
+                        if Path(path).name == ".p50sim.bin" else original_access(path, mode))
+    monkeypatch.setattr(simulator_module, "_private_bytes", fake_private_bytes)
+    monkeypatch.setattr(simulator_module, "_private_digest",
+                        lambda path, label: {"path": str(path), "bytes": 0, "sha256": "e" * 64})
+    monkeypatch.setattr(simulator_module.subprocess, "run", fake_run)
+    matrix._native_codec("ZSTD_TU", b"first", state)
+    state.next_rel_seq = 18
+    matrix._native_codec("ZSTD_TU", b"second", state)
+    assert [command[command.index("--codec-tu-seq") + 1] for command in captured] == ["41", "42"]
+    assert [command[command.index("--codec-rel-seq") + 1] for command in captured] == ["17", "18"]
+
+
+def test_native_repeat_full_carries_state_with_changed_assignment_map(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     topology = MatrixTopology.from_id("C1F20/40")
 
-    def assignment_row(index: int, relationship: int) -> dict[str, object]:
+    def assignment_row(index: int, relationship: int, tu_seq: int | None = None,
+                       rel_seq: int | None = None) -> dict[str, object]:
         return {"ordinal": index, "global_slot": relationship * 2,
                 "f_relationship": relationship, "per_f_slot": 0,
                 "dispatch_order": index, "authority_dispatch_order": index,
+                "authority_tu_seq": index if tu_seq is None else tu_seq,
+                "authority_rel_seq": index if rel_seq is None else rel_seq,
                 "authority_worker": relationship, "authority_slot": 0,
                 "authority_build": index // 2, "authority_logical": index}
 
@@ -761,16 +873,20 @@ def test_native_repeat_full_carries_state_with_changed_assignment_map(tmp_path: 
     predecessor_authority = {"status": "READY", "topology": "C1F20/40",
         "selected_count": 2, "rows": [assignment_row(0, 0), assignment_row(1, 0)]}
     measured_authority = {"status": "READY", "topology": "C1F20/40",
-        "selected_count": 2, "rows": [assignment_row(0, 1), assignment_row(1, 0)]}
+        "selected_count": 2, "rows": [assignment_row(0, 1, 2), assignment_row(1, 0, 3, 2)]}
     empty_descriptor = {"schema": simulator_module.PREFIX_DESCRIPTOR_SCHEMA, "bytes": 0,
                         "digest128": simulator_module._digest128(b"")}
-    prior = {"relationships": {"ZSTD_ROUTE": {
+    prior = {"c_authorities": {"ZSTD_ROUTE": {"native_next_tu_seq": 2}},
+             "relationships": {"ZSTD_ROUTE": {
         "C0|F0": {"committed_raw_prefix_descriptor": empty_descriptor,
                   "_runtime_history": b"", "next_rel_seq": 0},
         "C0|F1": {"committed_raw_prefix_descriptor": empty_descriptor,
                   "_runtime_history": b"", "next_rel_seq": 0}}}}
-    result = MethodMatrixSimulator(
-        topology, methods=("ZSTD_ROUTE",), assignment_authority=measured_authority).run(
+    matrix = MethodMatrixSimulator(
+        topology, methods=("ZSTD_ROUTE",), assignment_authority=measured_authority)
+    matrix.authority["ZSTD_ROUTE"]["status"] = "READY"
+    _fake_native_batch_runner(monkeypatch)
+    result = matrix.run(
             measured, repeat_full=True, prior_state=prior,
             predecessor_occurrences=predecessor,
             predecessor_assignment_authority=predecessor_authority)
@@ -788,7 +904,11 @@ def test_native_repeat_full_carries_state_with_changed_assignment_map(tmp_path: 
 @pytest.mark.parametrize("topology_id", ("C1F1/100000", "C1F20/40"))
 @pytest.mark.parametrize("method", ("ZSTD_ROUTE", "P29", "GRZ_RESIDUAL"))
 def test_stateful_native_profiles_carry_three_tu_successor(
-        tmp_path: Path, topology_id: str, method: str) -> None:
+        tmp_path: Path, topology_id: str, method: str,
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    # Exercise the batch lifecycle without requiring an untracked native build
+    # in this isolated Python-only worktree.
+    _fake_native_batch_runner(monkeypatch)
     topology = MatrixTopology.from_id(topology_id)
     paths = []
     for index in range(6):
@@ -802,17 +922,27 @@ def test_stateful_native_profiles_carry_three_tu_successor(
                           source_sha256=hashlib.sha256(raw).hexdigest(),
                           source_digest128=simulator_module._digest128(raw))
 
-    def authority(relations: list[int]) -> dict[str, object]:
+    def authority(relations: list[int], start: int = 0,
+                  prior_rel: dict[int, int] | None = None) -> dict[str, object]:
+        next_rel = dict(prior_rel or {})
+        rows = []
+        for index, relation in enumerate(relations):
+            rel_seq = next_rel.get(relation, 0)
+            next_rel[relation] = rel_seq + 1
+            rows.append({"ordinal": index,
+                         "global_slot": relation * (2 if topology_id == "C1F20/40" else 100000),
+                         "f_relationship": relation, "per_f_slot": 0,
+                         "dispatch_order": start + index, "authority_dispatch_order": start + index,
+                         "authority_tu_seq": start + index,
+                         "authority_rel_seq": rel_seq})
         return {"status": "READY", "topology": topology_id, "selected_count": 3,
-                "rows": [{"ordinal": index, "global_slot": relation * (2 if topology_id == "C1F20/40" else 100000),
-                           "f_relationship": relation, "per_f_slot": 0,
-                           "dispatch_order": index, "authority_dispatch_order": index}
-                          for index, relation in enumerate(relations)]}
+                "rows": rows}
 
     predecessor = [occurrence(index) for index in range(3)]
     measured = [occurrence(index) for index in range(3, 6)]
     first = authority([0, 0, 0])
-    second = authority([1, 0, 1]) if topology_id == "C1F20/40" else authority([0, 0, 0])
+    second = (authority([1, 0, 1], 3, {0: 3, 1: 0}) if topology_id == "C1F20/40"
+              else authority([0, 0, 0], 3, {0: 3}))
     output = simulator_module._native_batch(
         measured, topology, second, method,
         predecessor_occurrences=predecessor, predecessor_assignment=first)

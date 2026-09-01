@@ -140,7 +140,10 @@ def test_full2_mismatched_predecessor_stays_not_proven(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("mutation", ("omit_next", "zero_next", "wrong_last_type",
-                                       "unrelated_prefix", "final_digest", "missing_last_tx"))
+                                       "unrelated_prefix", "final_digest", "missing_last_tx",
+                                       "missing_row_rel", "missing_transaction_tu",
+                                       "wrong_transaction_rel", "missing_transaction_next_rel",
+                                       "wrong_transaction_next_rel", "wrong_c_authority"))
 def test_full2_current_state_marker_omission_partial_and_type_stay_not_proven(
         monkeypatch: pytest.MonkeyPatch, mutation: str) -> None:
     topology = "C1F1/100000"
@@ -185,10 +188,12 @@ def test_full2_current_state_marker_omission_partial_and_type_stay_not_proven(
                "relationships": {method: {key: copy.deepcopy(after_state)}
                                   for method in ("ZSTD_ROUTE", "P29", "GRZ_RESIDUAL")}}
     rows = [{"method": method, "relationship_key": ["C0", "F0"],
-             "ordinal": 0, "native_tu_seq": 5, "native_next_tu_seq": 6,
+             "ordinal": 0, "rel_seq": 5, "native_tu_seq": 5, "native_next_tu_seq": 6,
              "native_next_rel_seq": 6,
              "native_state_before_digest": "a" * 32, "native_state_digest": "b" * 32,
-             "committed": True, "product_transaction": {"committed": True,
+            "committed": True, "product_transaction": {"committed": True,
+                                      "tu_seq": 5, "rel_seq": 5,
+                                      "native_next_rel_seq": 6,
                                       "state_before_digest": "a" * 32, "state_digest": "b" * 32,
                                       "history_nonce": 1, "route_identity": "C0->F0",
                                       "committed_raw_prefix_descriptor":
@@ -216,6 +221,18 @@ def test_full2_current_state_marker_omission_partial_and_type_stay_not_proven(
             "digest128": simulator._digest128(other)}
     elif mutation == "final_digest":
         summary["relationships"]["P29"][key]["native_state_digest"] = "c" * 32
+    elif mutation == "missing_row_rel":
+        del rows[0]["rel_seq"]
+    elif mutation == "missing_transaction_tu":
+        del rows[0]["product_transaction"]["tu_seq"]
+    elif mutation == "wrong_transaction_rel":
+        rows[0]["product_transaction"]["rel_seq"] = 6
+    elif mutation == "missing_transaction_next_rel":
+        del rows[0]["product_transaction"]["native_next_rel_seq"]
+    elif mutation == "wrong_transaction_next_rel":
+        rows[0]["product_transaction"]["native_next_rel_seq"] = 7
+    elif mutation == "wrong_c_authority":
+        summary["c_authorities"]["P29"]["native_next_tu_seq"] = 7
     else:
         del rows[0]["product_transaction"]["state_digest"]
     marker = report._full2_marker(manifest, summary, rows, topology,

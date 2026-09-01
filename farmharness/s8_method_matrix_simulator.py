@@ -516,7 +516,7 @@ def _native_batch(occurrences: Sequence[Occurrence], topology: MatrixTopology,
         # contiguous sequence over the interleaved C1F20 dispatch stream.
         # REL_SEQ remains relationship-local and is checked independently
         # against the authenticated assignment rows below.
-        global_next_tu_seq = 0
+        global_next_tu_seq: int | None = None
         relation_next_rel_seq: dict[int, int] = {}
         relation_last_state: dict[int, str] = {}
         expected_profile = "GRZ_RESIDUAL" if method == "GRZ_RESIDUAL" else method
@@ -563,8 +563,14 @@ def _native_batch(occurrences: Sequence[Occurrence], topology: MatrixTopology,
                     not _valid_prefix_descriptor(item.get("committed_raw_prefix_descriptor"))):
                 raise MatrixError("native product output route descriptor invalid")
             nonlocal global_next_tu_seq
-            if item.get("tu_seq") != global_next_tu_seq:
-                raise MatrixError("native product output global TU sequence invalid")
+            authority_tu_seq = row.get("authority_tu_seq")
+            if type(authority_tu_seq) is not int or authority_tu_seq < 0:
+                raise MatrixError("native product assignment TU sequence is missing or invalid")
+            expected_tu_seq = int(authority_tu_seq)
+            if global_next_tu_seq is not None and expected_tu_seq != global_next_tu_seq:
+                raise MatrixError("native product assignment global TU sequence invalid")
+            if item.get("tu_seq") != expected_tu_seq:
+                raise MatrixError("native product output TU sequence authority mismatch")
             authority_rel_seq = row.get("authority_rel_seq")
             if authority_rel_seq is not None and (
                     type(authority_rel_seq) is not int or authority_rel_seq < 0):
@@ -590,8 +596,8 @@ def _native_batch(occurrences: Sequence[Occurrence], topology: MatrixTopology,
             # by row/state assembly but never exposed as product evidence.
             item["_native_rel_seq"] = int(item["rel_seq"])  # type: ignore[index]
             item["_native_next_rel_seq"] = expected_rel_seq + 1  # type: ignore[index]
-            item["_native_next_tu_seq"] = global_next_tu_seq + 1  # type: ignore[index]
-            global_next_tu_seq += 1
+            item["_native_next_tu_seq"] = expected_tu_seq + 1  # type: ignore[index]
+            global_next_tu_seq = expected_tu_seq + 1
         expected_segment = "full-2" if predecessor_occurrences else "full-1"
         output_raw, _output_facts = _private_bytes(output, "native_batch_output")
         try:
@@ -980,6 +986,10 @@ class MethodMatrixSimulator:
         self.assignment_authority = dict(assignment_authority or {
             "status": "UNBOUND", "topology": topology.topology_id})
         self._native_rows: dict[str, dict[int, dict[str, object]]] = {}
+        # Codec-mode is only a bounded parity seam, but it must still use the
+        # product's C-wide TU allocator rather than a relationship REL_SEQ.
+        self._native_codec_next_tu_seq: dict[str, int] = {
+            method: 0 for method in self.methods}
         if cohort_dictionary is not None:
             if not cohort_dictionary or self.cohort_authority.get("status") != "READY":
                 raise NotReady("ZSTD_COHORT requires an independently authenticated dictionary authority")
@@ -1022,9 +1032,10 @@ class MethodMatrixSimulator:
                 input_file = Path(scratch) / "input.bin"
                 output_file = Path(scratch) / "encoded.bin"
                 input_file.write_bytes(raw)
+                global_tu_seq = self._native_codec_next_tu_seq.get(method, 0)
                 args = [str(binary), "--codec-method", method, "--input", str(input_file),
                         "--codec-output", str(output_file), "--codec-rel-seq",
-                        str(state.next_rel_seq), "--codec-tu-seq", str(state.next_rel_seq)]
+                        str(state.next_rel_seq), "--codec-tu-seq", str(global_tu_seq)]
                 if method == "ZSTD_ROUTE" and state.history:
                     prefix_file = Path(scratch) / "prefix.bin"
                     prefix_file.write_bytes(state.history)
@@ -1036,6 +1047,7 @@ class MethodMatrixSimulator:
                     raise NotReady("native product codec rejected authenticated input: " +
                                    completed.stderr.decode("utf-8", "replace")[:200])
                 encoded, _encoded_facts = _private_bytes(output_file, "native codec output")
+                self._native_codec_next_tu_seq[method] = global_tu_seq + 1
                 return encoded, time.process_time_ns() - started_cpu, time.perf_counter_ns() - started_wall
         except (OSError, subprocess.SubprocessError) as exc:
             raise NotReady("native product codec unavailable") from exc
@@ -1064,6 +1076,18 @@ class MethodMatrixSimulator:
         if repeat_full and (not predecessor_occurrences or
                             predecessor_assignment_authority is None):
             raise MatrixError("repeat-full requires authenticated full-1 inputs and assignment")
+        self._native_codec_next_tu_seq = {method: 0 for method in self.methods}
+        predecessor_identity = None
+        if predecessor_occurrences and output_root is not None:
+            candidate = prior_state.get("_predecessor_identity") if prior_state else None
+            if (not isinstance(candidate, Mapping) or
+                    not isinstance(candidate.get("experiment"), str) or
+                    not candidate.get("experiment") or
+                    not isinstance(candidate.get("manifest_sha256"), str) or
+                    not re.fullmatch(r"[0-9a-f]{64}", candidate["manifest_sha256"]) or
+                    not isinstance(candidate.get("run_identity"), Mapping)):
+                raise MatrixError("repeat-full predecessor identity is missing")
+            predecessor_identity = candidate
         if self.assignment_authority.get("status") == "UNBOUND":
             start = occurrences[0].ordinal if occurrences else 0
             self.assignment_authority = _authenticated_assignment(
@@ -1095,6 +1119,12 @@ class MethodMatrixSimulator:
             carried_c_authorities = prior_state.get("c_authorities", {})
             if not isinstance(carried_c_authorities, Mapping):
                 raise MatrixError("repeat-full prior C authority state is missing")
+            for method in self.methods:
+                authority_state = carried_c_authorities.get(method)
+                if isinstance(authority_state, Mapping) and type(
+                        authority_state.get("native_next_tu_seq")) is int:
+                    self._native_codec_next_tu_seq[method] = authority_state[
+                        "native_next_tu_seq"]
             for method in allowed:
                 # State is method-specific; only the declared surviving route
                 # continuation is loaded.  TU/RAW state is intentionally absent.
@@ -1226,11 +1256,15 @@ class MethodMatrixSimulator:
                     "run_identity": {"timestamp": run_timestamp,
                                      "topology": self.topology.topology_id,
                                      "depth": depth_label, "pass": pass_label},
-                    "predecessor_input_authority": ({"selected_inputs": [
-                        {"ordinal": o.ordinal, "build": o.source_build,
-                         "logical": o.source_logical, "source_relative": o.source_relative,
-                         "bytes": o.byte_count(), "sha256": o.source_sha256}
-                        for o in predecessor_occurrences],
+                    "predecessor_input_authority": ({
+                        "experiment": predecessor_identity["experiment"],
+                        "manifest_sha256": predecessor_identity["manifest_sha256"],
+                        "run_identity": dict(predecessor_identity["run_identity"]),
+                        "selected_inputs": [
+                            {"ordinal": o.ordinal, "build": o.source_build,
+                             "logical": o.source_logical, "source_relative": o.source_relative,
+                             "bytes": o.byte_count(), "sha256": o.source_sha256}
+                            for o in predecessor_occurrences],
                         "assignment": predecessor_assignment_authority}
                         if predecessor_occurrences else None),
                     "artifacts": descriptors,
@@ -1270,6 +1304,9 @@ class MethodMatrixSimulator:
                raw_override if raw_override is not None else occurrence.read_raw())
         raw_bytes = occurrence.byte_count()
         raw_sha = occurrence.source_sha256 or _sha256(raw or b"")
+        row_rel_seq = (assignment.get("authority_rel_seq")
+                       if assignment.get("authority_rel_seq") is not None
+                       else occurrence.rel_seq)
         # Raw corpus payloads remain at their authenticated immutable source;
         # experiment evidence retains source path/size/hash descriptors only.
         if experiment is not None and method != "RAW_II":
@@ -1283,6 +1320,7 @@ class MethodMatrixSimulator:
             "authority_build": assignment.get("authority_build"),
             "authority_logical": assignment.get("authority_logical"),
             "authority_dispatch_order": assignment.get("dispatch_order"),
+            "rel_seq": row_rel_seq,
             "raw_bytes": raw_bytes, "raw_sha256": raw_sha,
             "source_relative": occurrence.source_relative, "source_sha256": occurrence.source_sha256,
             "raw_path": str(raw_path.relative_to(experiment)) if raw_path and experiment else None,
@@ -1805,6 +1843,8 @@ def firefox_occurrences(trace: Path, *, topology_id: str | None = None,
                                  source_path=base.source_path,
                                  source_build=int(item["authority_build"]),
                                  source_logical=logical,
+                                 rel_seq=(int(item["authority_rel_seq"])
+                                          if item.get("authority_rel_seq") is not None else None),
                                  source_digest128=base.source_digest128))
     return result
 
@@ -2012,6 +2052,8 @@ def _authenticated_predecessor_plan(
                                       source_path=str(fact["source_path"]),
                                       source_build=int(assignment_row["authority_build"]),
                                       source_logical=logical,
+                                      rel_seq=(int(assignment_row["authority_rel_seq"])
+                                               if assignment_row.get("authority_rel_seq") is not None else None),
                                       source_digest128=str(fact["source_digest128"])))
     summary_relationships = summary.get("relationships", {})
     prior_state = dict(summary)
@@ -2021,6 +2063,17 @@ def _authenticated_predecessor_plan(
                  for key, value in states.items()}
         for method, states in prior_relationships.items()
         if isinstance(states, Mapping)
+    }
+    manifest_facts = verified.get("manifest_facts")
+    verified_experiment = verified.get("experiment")
+    if (not isinstance(manifest_facts, Mapping) or
+            not isinstance(manifest_facts.get("sha256"), str) or
+            not isinstance(verified_experiment, str) or not verified_experiment):
+        raise MatrixError("repeat-full predecessor verified identity is incomplete")
+    prior_state["_predecessor_identity"] = {
+        "experiment": verified_experiment,
+        "manifest_sha256": manifest_facts["sha256"],
+        "run_identity": dict(run_identity),
     }
     return prior_state, dict(authority), occurrences
 
