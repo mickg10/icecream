@@ -182,6 +182,110 @@ def test_experiment_verifier_rejects_deletion_and_mutation(tmp_path: Path) -> No
         verify_experiment(experiment)
 
 
+def test_experiment_evidence_rejects_duplicate_nonfinite_and_symlink(tmp_path: Path) -> None:
+    experiment = MethodMatrixSimulator(
+        MatrixTopology.from_id("C1F1/100000"), methods=("RAW_II",)).run(
+            [Occurrence(0, b"payload")], output_root=tmp_path,
+            timestamp="20260901T120000Z", depth="100")
+    manifest = experiment / "manifest.json"
+    original = manifest.read_bytes()
+    duplicate = original.replace(
+        b'"schema":"icecream-s8-method-matrix-simulator-v1"',
+        b'"schema":"forged","schema":"icecream-s8-method-matrix-simulator-v1"', 1)
+    manifest.write_bytes(duplicate)
+    with pytest.raises(MatrixError, match="json:duplicate_key:schema"):
+        verify_experiment(experiment)
+    manifest.write_bytes(original)
+
+    occurrences = experiment / "occurrences.jsonl"
+    original_occurrences = occurrences.read_bytes()
+    changed = occurrences.read_bytes().replace(b'"authority":', b'"x":NaN,"authority":', 1)
+    occurrences.write_bytes(changed)
+    value = json.loads(original)
+    value["artifacts"]["occurrences.jsonl"] = {
+        "bytes": len(changed), "sha256": hashlib.sha256(changed).hexdigest()}
+    manifest.write_bytes(json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n")
+    with pytest.raises(MatrixError, match="json:nonfinite:NaN"):
+        verify_experiment(experiment)
+
+    occurrences.write_bytes(original_occurrences)
+    manifest.write_bytes(original)
+    value = json.loads(original)
+    value["input_authority"]["selected_inputs"] = [{
+        "ordinal": 0, "build": 0, "logical": 0, "source_relative": "../outside",
+        "bytes": 7, "sha256": "f" * 64}]
+    manifest.write_bytes(json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n")
+    with pytest.raises(MatrixError, match="input_descriptor_invalid"):
+        verify_experiment(experiment)
+
+    manifest.write_bytes(original)
+    escape = tmp_path / "outside-artifact"
+    escape.write_bytes(b"outside")
+    (experiment / "bytes" / "escape.bin").symlink_to(escape)
+    with pytest.raises(MatrixError, match="artifact_symlink"):
+        verify_experiment(experiment)
+
+
+def test_native_batch_rejects_duplicate_output_ordinal(tmp_path: Path,
+                                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "unit.ii"
+    source.write_bytes(b"native payload")
+    raw = source.read_bytes()
+    occurrence = Occurrence(0, None, source_path=str(source), source_relative=source.name,
+                            source_sha256=hashlib.sha256(raw).hexdigest(),
+                            source_digest128=simulator_module._digest128(raw))
+    topology = MatrixTopology.from_id("C1F1/100000")
+    assignment = {"status": "READY", "topology": topology.topology_id,
+                  "selected_count": 1, "rows": [{
+                      "ordinal": 0, "global_slot": 0, "f_relationship": 0,
+                      "per_f_slot": 0, "dispatch_order": 0,
+                      "authority_dispatch_order": 0}]}
+    original_run = simulator_module.subprocess.run
+
+    def duplicate_output(*args: object, **kwargs: object) -> object:
+        result = original_run(*args, **kwargs)
+        command = args[0] if args else kwargs["args"]
+        output = Path(str(command[command.index("--batch-output") + 1]))
+        output.write_bytes(output.read_bytes() + output.read_bytes())
+        return result
+
+    monkeypatch.setattr(simulator_module.subprocess, "run", duplicate_output)
+    with pytest.raises(MatrixError, match="duplicate ordinal"):
+        simulator_module._native_batch([occurrence], topology, assignment, "ZSTD_TU")
+
+
+@pytest.mark.parametrize("field", ("profile", "relationship_id", "tu_seq",
+                                    "raw_digest", "state_digest"))
+def test_native_batch_rejects_mutated_identity_fields(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str) -> None:
+    source = tmp_path / "unit.ii"
+    source.write_bytes(b"native payload")
+    raw = source.read_bytes()
+    occurrence = Occurrence(0, None, source_path=str(source), source_relative=source.name,
+                            source_sha256=hashlib.sha256(raw).hexdigest(),
+                            source_digest128=simulator_module._digest128(raw))
+    topology = MatrixTopology.from_id("C1F1/100000")
+    assignment = {"status": "READY", "topology": topology.topology_id,
+                  "selected_count": 1, "rows": [{"ordinal": 0, "f_relationship": 0,
+                  "per_f_slot": 0, "dispatch_order": 0, "authority_dispatch_order": 0}]}
+    original_run = simulator_module.subprocess.run
+
+    def mutate_output(*args: object, **kwargs: object) -> object:
+        result = original_run(*args, **kwargs)
+        command = args[0] if args else kwargs["args"]
+        output = Path(str(command[command.index("--batch-output") + 1]))
+        value = json.loads(output.read_text())
+        value[field] = ("P29" if field == "profile" else
+                        "bad" if field == "relationship_id" else
+                        1 if field == "tu_seq" else "0" * 32)
+        output.write_text(json.dumps(value) + "\n")
+        return result
+
+    monkeypatch.setattr(simulator_module.subprocess, "run", mutate_output)
+    with pytest.raises(MatrixError):
+        simulator_module._native_batch([occurrence], topology, assignment, "ZSTD_TU")
+
+
 def test_not_ready_runs_are_collision_safe_and_identity_bound(tmp_path: Path,
                                                               monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(simulator_module, "_stamp", lambda: "20260901T120000Z")
@@ -278,6 +382,42 @@ def test_native_repeat_full_carries_state_with_changed_assignment_map(tmp_path: 
     assert result["core_completion"]["status"] == "INCOMPLETE_REQUESTED_SUBSET"
     assert [row["product_transaction"]["tu_seq"] for row in result["rows"]] == [0, 2]
     assert all(row["wire_witnessed"] is True for row in result["rows"])
+
+
+@pytest.mark.parametrize("topology_id", ("C1F1/100000", "C1F20/40"))
+@pytest.mark.parametrize("method", ("ZSTD_ROUTE", "P29", "GRZ_RESIDUAL"))
+def test_stateful_native_profiles_carry_three_tu_successor(
+        tmp_path: Path, topology_id: str, method: str) -> None:
+    topology = MatrixTopology.from_id(topology_id)
+    paths = []
+    for index in range(6):
+        path = tmp_path / f"{topology_id.replace('/', '-')}-{index}.ii"
+        path.write_bytes(f"state-{index}\n".encode())
+        paths.append(path)
+
+    def occurrence(index: int) -> Occurrence:
+        raw = paths[index].read_bytes()
+        return Occurrence(index, None, source_path=str(paths[index]), source_relative=paths[index].name,
+                          source_sha256=hashlib.sha256(raw).hexdigest(),
+                          source_digest128=simulator_module._digest128(raw))
+
+    def authority(relations: list[int]) -> dict[str, object]:
+        return {"status": "READY", "topology": topology_id, "selected_count": 3,
+                "rows": [{"ordinal": index, "global_slot": relation * (2 if topology_id == "C1F20/40" else 100000),
+                           "f_relationship": relation, "per_f_slot": 0,
+                           "dispatch_order": index, "authority_dispatch_order": index}
+                          for index, relation in enumerate(relations)]}
+
+    predecessor = [occurrence(index) for index in range(3)]
+    measured = [occurrence(index) for index in range(3, 6)]
+    first = authority([0, 0, 0])
+    second = authority([1, 0, 1]) if topology_id == "C1F20/40" else authority([0, 0, 0])
+    output = simulator_module._native_batch(
+        measured, topology, second, method,
+        predecessor_occurrences=predecessor, predecessor_assignment=first)
+    assert [row["tu_seq"] for row in output.values()] == (
+        [3, 4, 5] if topology_id == "C1F1/100000" else [0, 3, 1])
+    assert all(row["committed"] is True for row in output.values())
 
 
 def test_synthetic_codec_is_not_claimed_as_wire_evidence(tmp_path: Path) -> None:

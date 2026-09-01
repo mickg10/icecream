@@ -589,6 +589,12 @@ void write_batch_row(std::ostream& output, std::string_view segment,
 
 void run_batch(const Arguments& arguments) {
     const ProfileId profile = selected_profile();
+    const bool retains_relationship_state =
+        profile == ProfileId::Z3_LONG || profile == ProfileId::P29
+#if defined(ICECC_P50_WITH_LIBBSC)
+        || profile == ProfileId::GRZ
+#endif
+        ;
     const std::vector<std::string> first = read_batch_manifest(
         arguments.batch_manifest, arguments.batch_allow_repeated_inputs);
     size_t relationship_count = 0;
@@ -662,7 +668,8 @@ void run_batch(const Arguments& arguments) {
             const std::vector<uint8_t> input = read_bytes(manifest[index]);
             relation.actions.clear();
             relation.completions.clear();
-            const std::optional<Digest128> expected_before = relation.last_state_digest;
+            const std::optional<Digest128> expected_before =
+                retains_relationship_state ? relation.last_state_digest : std::nullopt;
             auto prepared = relation.authority->prepare(
                 PrepareRequestKey{1, ++relation.request_token}, input);
             if (!prepared)
@@ -693,7 +700,8 @@ void run_batch(const Arguments& arguments) {
             for (const ActionRecord& action : relation.actions.records()) {
                 if (action.action == ActionType::COMMIT_ACCEPTED &&
                     action.raw_digest == icecc::digest128(input)) {
-                    relation.last_state_digest = action.state_digest;
+                    if (retains_relationship_state)
+                        relation.last_state_digest = action.state_digest;
                     break;
                 }
             }

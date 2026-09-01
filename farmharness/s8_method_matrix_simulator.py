@@ -39,6 +39,7 @@ METHODS = ("RAW_II", "ZSTD_TU", "P29", "GRZ_RESIDUAL", "ZSTD_ROUTE",
            "ZSTD_COHORT", "ZSTD_GLOBAL")
 READY_METHODS = frozenset(("RAW_II", "ZSTD_TU", "ZSTD_ROUTE"))
 CORE_METHODS = frozenset(("RAW_II", "ZSTD_TU", "P29", "GRZ_RESIDUAL", "ZSTD_ROUTE"))
+STATEFUL_METHODS = frozenset(("ZSTD_ROUTE", "P29", "GRZ_RESIDUAL"))
 TOPOLOGY_IDS = ("C1F1/100000", "C1F20/40")
 DEFAULT_HISTORY_BYTES = 128 << 20
 AUTH_TRACE_SHA256 = "9fa7124f63212ccfd78f139dc05dcc5b2737ef868dc3e6878e64f609e079e960"
@@ -74,9 +75,87 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _digest128(data: bytes) -> str:
+    try:
+        import xxhash
+    except ImportError as exc:
+        raise MatrixError("native digest authority unavailable: xxhash") from exc
+    return xxhash.xxh3_128_hexdigest(data)
+
+
+def _digest128_text(value: object) -> bool:
+    return (isinstance(value, str) and value != "0" * 32 and
+            bool(re.fullmatch(r"[0-9a-f]{32}", value)))
+
+
 def _canonical(value: object) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":"),
                        ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
+
+
+def _strict_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise MatrixError("json:duplicate_key:" + key)
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> object:
+    raise MatrixError("json:nonfinite:" + value)
+
+
+def _strict_json(raw: bytes, label: str) -> object:
+    try:
+        return json.loads(raw.decode("utf-8"), object_pairs_hook=_strict_pairs,
+                          parse_constant=_reject_json_constant)
+    except (UnicodeDecodeError, json.JSONDecodeError, MatrixError) as exc:
+        if isinstance(exc, MatrixError):
+            raise
+        raise MatrixError(label + ":invalid_json") from exc
+
+
+def _private_experiment_file(experiment: Path, relative: str, label: str) -> Path:
+    if not isinstance(relative, str) or not relative or Path(relative).is_absolute():
+        raise MatrixError(label + ":path_invalid")
+    parts = Path(relative).parts
+    if any(part in ("", ".", "..") for part in parts):
+        raise MatrixError(label + ":path_invalid")
+    root = experiment.resolve(strict=True)
+    path = experiment / relative
+    try:
+        if path.resolve(strict=True).relative_to(root) != Path(relative):
+            raise MatrixError(label + ":path_outside_experiment")
+    except ValueError as exc:
+        raise MatrixError(label + ":path_outside_experiment") from exc
+    return path
+
+
+def _experiment_files(experiment: Path) -> dict[str, tuple[bytes, dict[str, object]]]:
+    try:
+        info = experiment.lstat()
+    except OSError as exc:
+        raise MatrixError("verifier:experiment_unavailable") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise MatrixError("verifier:experiment_not_private_directory")
+    files: dict[str, tuple[bytes, dict[str, object]]] = {}
+    for path in experiment.rglob("*"):
+        if path == experiment / "manifest.json":
+            continue
+        try:
+            child = path.lstat()
+        except OSError as exc:
+            raise MatrixError("verifier:artifact_unavailable") from exc
+        if stat.S_ISLNK(child.st_mode):
+            raise MatrixError("verifier:artifact_symlink")
+        if stat.S_ISDIR(child.st_mode):
+            continue
+        if not stat.S_ISREG(child.st_mode) or child.st_nlink != 1:
+            raise MatrixError("verifier:artifact_not_private_regular")
+        relative = str(path.relative_to(experiment))
+        files[relative] = _private_bytes(path, "verifier_artifact")
+    return files
 
 
 def _stamp() -> str:
@@ -233,18 +312,62 @@ def _native_batch(occurrences: Sequence[Occurrence], topology: MatrixTopology,
                            completed.stderr.decode("utf-8", "replace")[:300])
         result: dict[int, dict[str, object]] = {}
         predecessor_result: dict[int, dict[str, object]] = {}
+        seen: set[tuple[str, int]] = set()
+        relation_last_seq: dict[int, int] = {}
+        relation_last_state: dict[int, str] = {}
+        expected_profile = "GRZ_RESIDUAL" if method == "GRZ_RESIDUAL" else method
+        stateful_method = method in STATEFUL_METHODS
+        def validate_item(item: object, segment: str, index: int,
+                          segment_occurrences: Sequence[Occurrence],
+                          segment_rows: Sequence[object]) -> None:
+            if not isinstance(item, Mapping) or item.get("schema") != "icecream-p50sim-batch-v1":
+                raise MatrixError("native product output schema invalid")
+            marker = (segment, index)
+            if marker in seen:
+                raise MatrixError("native product output duplicate ordinal")
+            seen.add(marker)
+            if index < 0 or index >= len(segment_occurrences):
+                raise MatrixError("native product output ordinal invalid")
+            row = segment_rows[index]
+            if not isinstance(row, Mapping):
+                raise MatrixError("native product assignment row invalid")
+            relation = int(row["f_relationship"])
+            expected_relation_id = f"c1f{topology.relationship_count}-r{relation:02d}"
+            if (item.get("segment") != segment or item.get("tu_index") != index or
+                    item.get("profile") != expected_profile or
+                    item.get("relationship_id") != expected_relation_id or
+                    item.get("committed") is not True):
+                raise MatrixError("native product output identity binding invalid")
+            occurrence = segment_occurrences[index]
+            raw_digest = occurrence.source_digest128
+            if raw_digest is None:
+                raw_digest = _digest128(occurrence.read_raw())
+            if item.get("raw_bytes") != occurrence.byte_count() or item.get("raw_digest") != raw_digest:
+                raise MatrixError("native product output raw binding invalid")
+            digest_fields = ("state_before_digest", "state_digest", "transaction_digest")
+            if any(not _digest128_text(item.get(field)) for field in digest_fields):
+                raise MatrixError("native product output digest invalid")
+            expected_seq = relation_last_seq.get(relation, 0)
+            if item.get("tu_seq") != expected_seq:
+                raise MatrixError("native product output relationship TU sequence invalid")
+            before = str(item["state_before_digest"])
+            if stateful_method and relation in relation_last_state and before != relation_last_state[relation]:
+                raise MatrixError("native product output state continuity invalid")
+            relation_last_seq[relation] = expected_seq + 1
+            if stateful_method:
+                relation_last_state[relation] = str(item["state_digest"])
         expected_segment = "full-2" if predecessor_occurrences else "full-1"
-        for line in output.read_text(encoding="utf-8").splitlines():
-            item = json.loads(line)
+        output_raw, _output_facts = _private_bytes(output, "native_batch_output")
+        for line in output_raw.decode("utf-8").splitlines():
+            item = _strict_json(line.encode("utf-8"), "native_batch_output")
             segment = item.get("segment")
             if segment not in {"full-1", "full-2"}:
                 continue
             ordinal = int(item["tu_index"])
             segment_occurrences = (predecessor_occurrences if segment == "full-1" and
                                    predecessor_occurrences else occurrences)
-            if ordinal >= len(segment_occurrences) or item.get("committed") is not True or \
-                    item.get("raw_bytes") != segment_occurrences[ordinal].byte_count():
-                raise MatrixError("native product commit/input binding invalid")
+            segment_rows = predecessor_rows if segment == "full-1" and predecessor_occurrences else rows
+            validate_item(item, segment, ordinal, segment_occurrences, segment_rows)
             if segment == expected_segment:
                 result[ordinal] = item
             else:
@@ -268,7 +391,9 @@ def _native_receipt(root: Path) -> tuple[dict[str, object] | None, dict[str, obj
         return None, {"path": str(receipt_path), "available": False, "sha256": None}
     receipt_facts = {key: receipt_facts_full[key] for key in ("path", "bytes", "sha256")}
     try:
-        receipt = json.loads(receipt_raw.decode("utf-8"))
+        receipt = _strict_json(receipt_raw, "native_receipt")
+        if not isinstance(receipt, Mapping):
+            raise MatrixError("native_receipt:schema_invalid")
         binary_facts = _private_digest(binary, "native p50sim binary")
         head = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"],
                                        text=True, timeout=10).strip()
@@ -490,6 +615,7 @@ class Occurrence:
     source_path: str | None = None
     source_build: int | None = None
     source_logical: int | None = None
+    source_digest128: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.ordinal) is not int or self.ordinal < 0:
@@ -504,6 +630,8 @@ class Occurrence:
             raise MatrixError("history nonce must be positive")
         if self.rel_seq is not None and (type(self.rel_seq) is not int or self.rel_seq < 0):
             raise MatrixError("REL_SEQ must be a non-negative integer")
+        if self.source_digest128 is not None and not _digest128_text(self.source_digest128):
+            raise MatrixError("source digest128 is malformed")
 
     @classmethod
     def from_path(cls, ordinal: int, path: Path, **kwargs: object) -> "Occurrence":
@@ -516,7 +644,8 @@ class Occurrence:
         if expected_sha256 is not None and digest != expected_sha256:
             raise MatrixError("authenticated input digest changed")
         return cls(ordinal, raw, source_relative=kwargs.pop("source_relative", None),
-                   source_sha256=digest, source_path=str(path), **kwargs)
+                   source_sha256=digest, source_path=str(path),
+                   source_digest128=_digest128(raw), **kwargs)
 
     def byte_count(self) -> int:
         if self.raw is not None:
@@ -541,6 +670,8 @@ class _RelationshipState:
     history_nonce: int = 1
     reset_count: int = 0
     pending: bool = False
+    native_last_tu_seq: int | None = None
+    native_state_digest: str | None = None
 
 
 def assign_relationships(topology: MatrixTopology, occurrences: Sequence[Occurrence],
@@ -558,9 +689,12 @@ def assign_relationships(topology: MatrixTopology, occurrences: Sequence[Occurre
 
 def repeat_full_state_contract(method: str) -> dict[str, object]:
     """State permitted to survive full-1 into repeat-full."""
-    if method == "ZSTD_ROUTE":
-        return {"survives": True, "fields": ["committed_raw_prefix", "history_nonce",
-                                               "next_rel_seq", "route_identity"]}
+    if method in STATEFUL_METHODS:
+        fields = ["native_last_tu_seq", "native_next_rel_seq", "native_state_digest",
+                  "history_nonce", "route_identity"]
+        if method == "ZSTD_ROUTE":
+            fields.insert(0, "committed_raw_prefix")
+        return {"survives": True, "fields": fields}
     if method == "ZSTD_COHORT":
         return {"survives": True, "fields": ["cohort_dictionary_identity",
                                                "committed_relationship_continuation"]}
@@ -608,14 +742,18 @@ class MethodMatrixSimulator:
         receipt_path = binary.parent / ".p50sim-build.json"
         try:
             info = binary.lstat()
-            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+            receipt_raw, _receipt_facts = _private_bytes(receipt_path, "native p50sim build receipt")
+            receipt = _strict_json(receipt_raw, "native_receipt")
+            if not isinstance(receipt, Mapping):
+                raise MatrixError("native_receipt:schema_invalid")
+        except (OSError, json.JSONDecodeError, MatrixError) as exc:
             raise NotReady("MISSING_AUTHORITY: native p50sim binary/receipt") from exc
         if (stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or
                 info.st_nlink != 1 or not os.access(binary, os.X_OK) or
                 receipt.get("schema") != "icecream-p50sim-build-v1" or
                 receipt.get("binary", {}).get("path") != str(binary) or
-                receipt.get("binary", {}).get("sha256") != _sha256(binary.read_bytes())):
+                receipt.get("binary", {}).get("sha256") != _private_digest(
+                    binary, "native p50sim binary")["sha256"]):
             raise NotReady("MISSING_AUTHORITY: native p50sim receipt is stale")
         prefix_file = None
         input_file = None
@@ -638,7 +776,7 @@ class MethodMatrixSimulator:
                 if completed.returncode != 0 or not output_file.is_file():
                     raise NotReady("native product codec rejected authenticated input: " +
                                    completed.stderr.decode("utf-8", "replace")[:200])
-                encoded = output_file.read_bytes()
+                encoded, _encoded_facts = _private_bytes(output_file, "native codec output")
                 return encoded, time.process_time_ns() - started_cpu, time.perf_counter_ns() - started_wall
         except (OSError, subprocess.SubprocessError) as exc:
             raise NotReady("native product codec unavailable") from exc
@@ -712,6 +850,45 @@ class MethodMatrixSimulator:
                         raise MatrixError("repeat-full committed prefix exceeds bound")
                     states_by_method[method][key].history = history
                     states_by_method[method][key].next_rel_seq = int(value.get("next_rel_seq", 0))
+                    if method in STATEFUL_METHODS:
+                        native_seq = value.get("native_last_tu_seq")
+                        native_next = value.get("native_next_rel_seq")
+                        native_digest = value.get("native_state_digest")
+                        if native_seq is not None:
+                            if (type(native_seq) is not int or type(native_next) is not int or
+                                    native_next != native_seq + 1 or
+                                    not _digest128_text(native_digest)):
+                                raise MatrixError("repeat-full native relationship state is malformed")
+                            states_by_method[method][key].native_last_tu_seq = native_seq
+                            states_by_method[method][key].native_state_digest = str(native_digest)
+
+            # The native endpoint is the authority for a product continuation,
+            # but the retained full-1 summary must bind that continuation too.
+            for method in STATEFUL_METHODS & set(self.methods):
+                prior_relationships = carried.get(method, {})
+                if not isinstance(prior_relationships, Mapping):
+                    raise MatrixError("repeat-full native predecessor state is missing")
+                checked: set[tuple[str, str]] = set()
+                for occurrence, assignment in zip(occurrences, assignments):
+                    key = tuple(assignment["relationship_key"])
+                    if key in checked:
+                        continue
+                    product = self._native_rows.get(method, {}).get(occurrence.ordinal)
+                    if product is None:
+                        continue
+                    checked.add(key)
+                    prior = prior_relationships.get("|".join(key))
+                    if (isinstance(prior, Mapping) and
+                            prior.get("native_state_digest") is None):
+                        # Legacy in-memory controls may provide only the
+                        # Python route state; persisted full-1 experiments are
+                        # required to carry native fields by the predecessor
+                        # verifier above.
+                        continue
+                    if (not isinstance(prior, Mapping) or
+                            prior.get("native_next_rel_seq") != product.get("tu_seq") or
+                            prior.get("native_state_digest") != product.get("state_before_digest")):
+                        raise MatrixError("repeat-full native predecessor successor is invalid")
 
         if output_root is None:
             return self._run_memory(occurrences, assignments, states_by_method)
@@ -835,6 +1012,9 @@ class MethodMatrixSimulator:
             "wire_witnessed": False,
             "encoded_bytes": None, "encoded_sha256": None, "encoded_path": None,
             "codec_cpu_ns": None, "codec_wall_ns": None, "transition": "not_run",
+            "native_tu_seq": None, "native_next_rel_seq": None,
+            "native_state_before_digest": None, "native_state_digest": None,
+            "native_transaction_digest": None,
             "pre_state_digest": pre, "post_state_digest": pre,
             "authority": self.authority[method]}
         if self.authority[method]["status"] not in {"READY"}:
@@ -882,6 +1062,18 @@ class MethodMatrixSimulator:
             wall_ns = cpu_ns
             row["measurement_scope"] = "native_endpoint_transaction"
             row["wire_witnessed"] = True
+            row.update({"native_tu_seq": int(product["tu_seq"]),
+                        "native_next_rel_seq": int(product["tu_seq"]) + 1,
+                        "native_state_before_digest": product["state_before_digest"],
+                        "native_state_digest": product["state_digest"],
+                        "native_transaction_digest": product["transaction_digest"]})
+            state.native_last_tu_seq = int(product["tu_seq"])
+            state.native_state_digest = str(product["state_digest"])
+            if method in STATEFUL_METHODS:
+                state.last_route_id = f"{key[0]}->{key[1]}"
+                state.history_nonce = occurrence.history_nonce
+                if method != "ZSTD_ROUTE":
+                    state.next_rel_seq = int(product["tu_seq"]) + 1
         else:
             encoded, cpu_ns, wall_ns = self._encode(method, raw, encode_state)
         if experiment is not None and product is None and method != "RAW_II":
@@ -976,7 +1168,11 @@ class MethodMatrixSimulator:
                 "history_nonce": state.history_nonce,
                 "route_identity": state.last_route_id,
                 "committed_raw_prefix_bytes": len(state.history),
-                "reset_count": state.reset_count}
+                "reset_count": state.reset_count,
+                "native_last_tu_seq": state.native_last_tu_seq,
+                "native_next_rel_seq": (None if state.native_last_tu_seq is None
+                                         else state.native_last_tu_seq + 1),
+                "native_state_digest": state.native_state_digest}
                 for key, state in states.items()}
             for method, states in states_by_method.items()
         }
@@ -1016,24 +1212,44 @@ class MethodMatrixSimulator:
 def verify_experiment(experiment: Path) -> dict[str, object]:
     """Verify canonical descriptors, row order, and byte artifacts fail closed."""
     try:
-        manifest = json.loads((experiment / "manifest.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        manifest_raw, _manifest_facts = _private_bytes(experiment / "manifest.json",
+                                                       "verifier_manifest")
+        manifest = _strict_json(manifest_raw, "verifier_manifest")
+    except (OSError, MatrixError) as exc:
+        if isinstance(exc, MatrixError):
+            raise
         raise MatrixError("verifier:manifest_unavailable") from exc
-    if manifest.get("schema") != SCHEMA or not isinstance(manifest.get("artifacts"), dict):
+    if not isinstance(manifest, Mapping) or manifest.get("schema") != SCHEMA or \
+            not isinstance(manifest.get("artifacts"), dict):
         raise MatrixError("verifier:manifest_schema_invalid")
-    actual_names = {str(p.relative_to(experiment)) for p in experiment.rglob("*")
-                    if p.is_file() and p.name != "manifest.json"}
+    files = _experiment_files(experiment)
+    files.pop("manifest.json", None)
+    actual_names = set(files)
     declared = set(manifest["artifacts"])
     if actual_names != declared:
         raise MatrixError("verifier:artifact_added_or_deleted")
     for name, descriptor in manifest["artifacts"].items():
-        path = experiment / name
-        if (not isinstance(descriptor, Mapping) or descriptor.get("bytes") != path.stat().st_size or
-                descriptor.get("sha256") != _sha256(path.read_bytes())):
+        if (not isinstance(descriptor, Mapping) or not isinstance(name, str) or
+                name not in files or descriptor.get("bytes") != files[name][1]["bytes"] or
+                descriptor.get("sha256") != files[name][1]["sha256"]):
             raise MatrixError("verifier:artifact_mutated:" + name)
+        _private_experiment_file(experiment, name, "verifier_artifact")
+    if "summary.json" not in files or "occurrences.jsonl" not in files:
+        raise MatrixError("verifier:required_artifact_missing")
+    summary = _strict_json(files["summary.json"][0], "verifier_summary")
+    if not isinstance(summary, Mapping) or summary.get("schema") != SUMMARY_SCHEMA:
+        raise MatrixError("verifier:summary_schema_invalid")
     input_authority = manifest.get("input_authority")
+    input_facts: list[dict[str, object]] = []
     if isinstance(input_authority, Mapping):
-        root = Path(str(input_authority.get("corpus_root", AUTH_CORPUS_ROOT))).resolve()
+        root_path = Path(str(input_authority.get("corpus_root", AUTH_CORPUS_ROOT)))
+        try:
+            root_info = root_path.lstat()
+            root = root_path.resolve(strict=True)
+        except OSError as exc:
+            raise MatrixError("verifier:input_root_unavailable") from exc
+        if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+            raise MatrixError("verifier:input_root_invalid")
         selected = input_authority.get("selected_inputs", [])
         if not isinstance(selected, list):
             raise MatrixError("verifier:input_authority_invalid")
@@ -1050,15 +1266,32 @@ def verify_experiment(experiment: Path) -> dict[str, object]:
                 continue
             if not isinstance(item.get("source_relative"), str):
                 raise MatrixError("verifier:input_descriptor_invalid")
-            path = root / str(item["source_relative"])
-            facts = _private_digest(path, "verifier_input")
+            relative = str(item["source_relative"])
+            if Path(relative).is_absolute() or any(part in ("", ".", "..")
+                                                   for part in Path(relative).parts):
+                raise MatrixError("verifier:input_descriptor_invalid")
+            path = root / relative
+            try:
+                if path.resolve(strict=True).relative_to(root) != Path(relative):
+                    raise MatrixError("verifier:input_outside_root")
+            except ValueError as exc:
+                raise MatrixError("verifier:input_outside_root") from exc
+            raw, facts = _private_bytes(path, "verifier_input")
             if facts["sha256"] != item.get("sha256") or facts["bytes"] != item.get("bytes"):
                 raise MatrixError("verifier:external_input_mutated")
+            input_facts.append({"ordinal": item.get("ordinal"), "build": item.get("build"),
+                                "logical": item.get("logical"), "source_relative": relative,
+                                "bytes": facts["bytes"], "sha256": facts["sha256"],
+                                "source_path": str(path), "source_digest128": _digest128(raw)})
     try:
-        rows = [json.loads(line) for line in
-                (experiment / "occurrences.jsonl").read_text(encoding="utf-8").splitlines()]
-    except (OSError, json.JSONDecodeError) as exc:
+        rows = [_strict_json(line.encode("utf-8"), "verifier_occurrence") for line in
+                files["occurrences.jsonl"][0].decode("utf-8").splitlines()]
+    except (UnicodeDecodeError, MatrixError) as exc:
+        if isinstance(exc, MatrixError):
+            raise
         raise MatrixError("verifier:occurrences_invalid") from exc
+    if any(not isinstance(row, Mapping) for row in rows):
+        raise MatrixError("verifier:occurrences_invalid")
     order = [{"ordinal": row.get("ordinal"), "method": row.get("method")} for row in rows]
     if order != manifest.get("row_order"):
         raise MatrixError("verifier:row_reordered_or_changed")
@@ -1067,11 +1300,17 @@ def verify_experiment(experiment: Path) -> dict[str, object]:
             name = row.get(field)
             digest_field = "raw_sha256" if field == "raw_path" else "encoded_sha256"
             if name is not None:
+                if not isinstance(name, str) or name not in files:
+                    raise MatrixError("verifier:row_artifact_binding_invalid")
                 descriptor = manifest["artifacts"].get(name)
-                if descriptor is None or descriptor.get("sha256") != row.get(digest_field):
+                if (descriptor is None or descriptor.get("sha256") != row.get(digest_field) or
+                        files[name][1]["sha256"] != row.get(digest_field)):
                     raise MatrixError("verifier:row_artifact_binding_invalid")
     return {"status": "PASS", "experiment": str(experiment), "rows": len(rows),
-            "artifacts": len(declared)}
+            "artifacts": len(declared), "manifest": dict(manifest),
+            "summary": dict(summary), "rows_data": list(rows),
+            "artifact_facts": {name: facts for name, (_raw, facts) in files.items()},
+            "input_facts": input_facts}
 
 
 def firefox_occurrences(trace: Path, *, count: int = 100, dispatch_start: int = 0,
@@ -1131,7 +1370,8 @@ def firefox_occurrences(trace: Path, *, count: int = 100, dispatch_start: int = 
             trace_occurrences.append(Occurrence(ordinal=logical, raw=None,
                                      source_relative=relative, source_sha256=str(facts["sha256"]),
                                      source_path=str(raw_path),
-                                     source_logical=logical))
+                                     source_logical=logical,
+                                     source_digest128=_digest128(raw)))
     except csv.Error as exc:
         raise MatrixError("trace:invalid_tsv") from exc
     if not trace_occurrences:
@@ -1151,7 +1391,8 @@ def firefox_occurrences(trace: Path, *, count: int = 100, dispatch_start: int = 
                                  source_sha256=base.source_sha256,
                                  source_path=base.source_path,
                                  source_build=int(item["authority_build"]),
-                                 source_logical=logical))
+                                 source_logical=logical,
+                                 source_digest128=base.source_digest128))
     return result
 
 
@@ -1194,18 +1435,65 @@ def write_not_ready_canary(output_root: Path, trace: Path, *, topology: MatrixTo
     return experiment
 
 
-def _authenticated_predecessor_plan(path: Path, topology_id: str) -> tuple[dict[str, object], dict[str, object]]:
-    """Load only authenticated full-1 state/plan; payloads stay external."""
+def _trace_input_sequence(trace: Path, count: int) -> list[dict[str, object]]:
+    """Read authenticated trace/corpus membership without payload reads."""
+    trace_raw, trace_facts = _private_bytes(trace, "trace")
+    if trace_facts["sha256"] != AUTH_TRACE_SHA256:
+        raise MatrixError("trace:authenticated_digest_mismatch")
+    manifest_raw, manifest_facts = _private_bytes(AUTH_CORPUS_MANIFEST, "corpus_manifest")
+    if manifest_facts["sha256"] != AUTH_CORPUS_MANIFEST_SHA256:
+        raise MatrixError("corpus_manifest:authenticated_digest_mismatch")
+    root = AUTH_CORPUS_ROOT.resolve(strict=True)
+    members: set[str] = set()
+    for line in manifest_raw.decode("utf-8").splitlines():
+        if not line or line != line.strip():
+            raise MatrixError("corpus_manifest:line_format_invalid")
+        candidate = Path(line)
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        try:
+            relative = str(candidate.resolve(strict=True).relative_to(root))
+        except (OSError, ValueError) as exc:
+            raise MatrixError("corpus_manifest:path_outside_root") from exc
+        members.add(relative)
+    rows: list[dict[str, object]] = []
+    try:
+        reader = csv.DictReader(trace_raw.decode("utf-8").splitlines(), delimiter="\t")
+        for row in reader:
+            if len(rows) >= count:
+                break
+            relative = row.get("ii_relative", "")
+            if (not relative or Path(relative).is_absolute() or
+                    any(part in ("", ".", "..") for part in Path(relative).parts) or
+                    relative not in members):
+                raise MatrixError("trace:input_not_bound_to_corpus_manifest")
+            try:
+                logical = int(row["logical"])
+                expected = int(row["raw_bytes"])
+            except (KeyError, ValueError) as exc:
+                raise MatrixError("trace:row_invalid") from exc
+            if logical != len(rows) or expected <= 0:
+                raise MatrixError("trace:row_invalid")
+            rows.append({"logical": logical, "source_relative": relative,
+                         "bytes": expected})
+    except UnicodeDecodeError as exc:
+        raise MatrixError("trace:invalid_tsv") from exc
+    if len(rows) != count:
+        raise MatrixError("trace:requested_rows_unavailable")
+    return rows
+
+
+def _authenticated_predecessor_plan(
+        path: Path, topology_id: str, *, trace: Path | None = None
+        ) -> tuple[dict[str, object], dict[str, object], list[Occurrence]]:
+    """Load one strictly verified full-1 state/plan and lazy inputs."""
     if not path.is_dir():
         raise MatrixError("repeat-full predecessor experiment is unavailable")
-    # This is the single experiment verifier used by the normal replay path;
-    # do not create a weaker predecessor-only integrity checker.
-    verify_experiment(path)
-    try:
-        manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
-        summary = json.loads((path / "summary.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise MatrixError("repeat-full predecessor manifest/summary is unavailable") from exc
+    verified = verify_experiment(path)
+    manifest = verified.get("manifest")
+    summary = verified.get("summary")
+    if not isinstance(manifest, Mapping) or not isinstance(summary, Mapping):
+        raise MatrixError("repeat-full predecessor manifest/summary is unavailable")
     run_identity = manifest.get("run_identity")
     if (manifest.get("schema") != SCHEMA or manifest.get("experiment") != path.name or
             summary.get("schema") != SUMMARY_SCHEMA or
@@ -1213,44 +1501,93 @@ def _authenticated_predecessor_plan(path: Path, topology_id: str) -> tuple[dict[
             manifest.get("repeat_full") is not False or
             not isinstance(run_identity, Mapping) or
             run_identity.get("topology") != topology_id or
-            run_identity.get("depth") != "full-1"):
+            run_identity.get("depth") != "full-1" or
+            run_identity.get("pass") not in {"pass-1", "full-1"} or
+            not isinstance(run_identity.get("timestamp"), str)):
         raise MatrixError("repeat-full predecessor is not an authenticated full-1 experiment")
+    rows = verified.get("rows_data")
+    methods = manifest.get("methods", [])
     artifacts = manifest.get("artifacts")
     if (not isinstance(artifacts, Mapping) or
             not isinstance(artifacts.get("summary.json"), Mapping) or
             not isinstance(artifacts.get("occurrences.jsonl"), Mapping) or
-            int(summary.get("occurrence_rows", 0)) <= 0 or
-            not manifest.get("row_order")):
+            not isinstance(methods, list) or any(not isinstance(method, str) for method in methods) or
+            len(methods) != len(set(methods)) or
+            not isinstance(rows, list) or int(summary.get("occurrence_rows", 0)) != len(rows) or
+            len(rows) != 2498 * len(methods) or not manifest.get("row_order") or
+            not set(methods).issuperset(STATEFUL_METHODS)):
         raise MatrixError("repeat-full predecessor artifacts/state are incomplete")
-    relationships = summary.get("relationships", {}).get("ZSTD_ROUTE", {})
     expected_relationships = {"|".join(key) for key in MatrixTopology.from_id(topology_id).relationship_keys}
-    if (not isinstance(relationships, Mapping) or
-            set(relationships) != expected_relationships or
-            not all(isinstance(value, Mapping) and int(value.get("next_rel_seq", 0)) > 0
-                    for value in relationships.values())):
+    relationships_all = summary.get("relationships", {})
+    if not isinstance(relationships_all, Mapping):
         raise MatrixError("repeat-full predecessor relationship state is incomplete")
+    for method in STATEFUL_METHODS:
+        relationships = relationships_all.get(method, {})
+        if (not isinstance(relationships, Mapping) or
+                set(relationships) != expected_relationships):
+            raise MatrixError("repeat-full predecessor relationship state is incomplete")
+        for value in relationships.values():
+            if (not isinstance(value, Mapping) or
+                    type(value.get("native_last_tu_seq")) is not int or
+                    type(value.get("native_next_rel_seq")) is not int or
+                    value["native_last_tu_seq"] + 1 != value["native_next_rel_seq"] or
+                    value["native_next_rel_seq"] <= 0 or
+                    not _digest128_text(value.get("native_state_digest")) or
+                    type(value.get("history_nonce")) is not int or value["history_nonce"] <= 0 or
+                    not isinstance(value.get("route_identity"), str) or not value["route_identity"]):
+                raise MatrixError("repeat-full predecessor native state is incomplete")
+            if method == "ZSTD_ROUTE":
+                try:
+                    prefix = bytes.fromhex(str(value.get("committed_raw_prefix", "")))
+                except ValueError as exc:
+                    raise MatrixError("repeat-full predecessor route prefix is incomplete") from exc
+                if value.get("committed_raw_prefix_bytes") != len(prefix):
+                    raise MatrixError("repeat-full predecessor route prefix is incomplete")
     if (summary.get("experiment") != str(path) or
             summary.get("topology", {}).get("id") != topology_id or
+            summary.get("status") not in {"COMPLETED", "CORE_COMPLETED_OPTIONALS_UNAVAILABLE"} or
             int(summary.get("relationship_count", 0)) != len(expected_relationships)):
         raise MatrixError("repeat-full predecessor summary binding is invalid")
     authority = manifest.get("assignment_authority")
     if not isinstance(authority, Mapping) or authority.get("topology") != topology_id:
         raise MatrixError("repeat-full predecessor assignment authority is missing")
-    expected = AUTH_ASSIGNMENT_SHA256[topology_id]
-    facts = _private_digest(Path(str(authority.get("path", ""))), "predecessor_assignment")
-    if facts.get("sha256") != expected or authority.get("sha256") != expected:
+    expected_assignment = _authenticated_assignment(topology_id, 2498, start=0)
+    if (authority.get("path") != expected_assignment.get("path") or
+            authority.get("bytes") != expected_assignment.get("bytes") or
+            authority.get("sha256") != expected_assignment.get("sha256") or
+            authority.get("rows") != expected_assignment.get("rows") or
+            authority.get("selected_count") != 2498 or
+            authority.get("authority_total_rows") != expected_assignment.get("authority_total_rows")):
         raise MatrixError("repeat-full predecessor assignment authority changed")
-    if int(authority.get("selected_count", 0)) != 2498 or \
-            int(authority.get("authority_total_rows", 0)) < 2498:
-        raise MatrixError("repeat-full predecessor assignment slice is incomplete")
     input_authority = manifest.get("input_authority")
     selected_inputs = input_authority.get("selected_inputs", []) if isinstance(input_authority, Mapping) else []
     if (not isinstance(input_authority, Mapping) or
             input_authority.get("trace_sha256") != AUTH_TRACE_SHA256 or
             input_authority.get("corpus_manifest_sha256") != AUTH_CORPUS_MANIFEST_SHA256 or
-            len(selected_inputs) != 2498):
+            len(selected_inputs) != 2498 or trace is None):
         raise MatrixError("repeat-full predecessor input authority is incomplete")
-    return summary, dict(authority)
+    trace_rows = _trace_input_sequence(trace, 2498)
+    facts = verified.get("input_facts")
+    if not isinstance(facts, list) or len(facts) != 2498:
+        raise MatrixError("repeat-full predecessor input facts are incomplete")
+    occurrences: list[Occurrence] = []
+    for index, (item, fact, assignment_row) in enumerate(zip(
+            selected_inputs, facts, expected_assignment["rows"])):
+        logical = int(assignment_row["authority_logical"])
+        trace_item = trace_rows[logical]
+        expected = {"ordinal": index, "build": int(assignment_row["authority_build"]),
+                    "logical": logical, "source_relative": trace_item["source_relative"],
+                    "bytes": trace_item["bytes"], "sha256": fact["sha256"]}
+        if (item != expected or fact.get("source_relative") != expected["source_relative"] or
+                fact.get("bytes") != expected["bytes"]):
+            raise MatrixError("repeat-full predecessor input sequence is not authenticated")
+        occurrences.append(Occurrence(index, None, source_relative=str(fact["source_relative"]),
+                                      source_sha256=str(fact["sha256"]),
+                                      source_path=str(fact["source_path"]),
+                                      source_build=int(assignment_row["authority_build"]),
+                                      source_logical=logical,
+                                      source_digest128=str(fact["source_digest128"])))
+    return dict(summary), dict(authority), occurrences
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1278,10 +1615,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.depth == "state-carrying-full-2":
                 predecessor_path = {"C1F1/100000": args.full_1_experiment_c1f1,
                                     "C1F20/40": args.full_1_experiment_c1f20}[topology_id]
-                prior_state, predecessor_authority = _authenticated_predecessor_plan(
-                    predecessor_path, topology_id)
-                predecessor = firefox_occurrences(args.firefox_trace, count=count,
-                                                  dispatch_start=0)
+                prior_state, predecessor_authority, predecessor = _authenticated_predecessor_plan(
+                    predecessor_path, topology_id, trace=args.firefox_trace)
                 current_authority = _authenticated_assignment(
                     topology_id, count, start=dispatch_start)
                 path = MethodMatrixSimulator(
