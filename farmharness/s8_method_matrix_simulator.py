@@ -54,6 +54,11 @@ AUTH_ASSIGNMENT_PATHS = {
     "C1F20/40": AUTH_ASSIGNMENT_ROOT / "assignments-1c20f-40total.tsv",
 }
 AUTH_P50_ZSTD_SHA256 = "a367316c1ee51ebe2559eacae8d4ab0eab938565a03e408ebbeb0df07a6c9bec"
+AUTH_LIBBSC_HEAD = "baffa62c70b6ebbecc9af14ce550e965ea247680"
+AUTH_LIBBSC_TREE = "1e35539f6c626639f66b9a83a84bc21b2cd84418"
+AUTH_LIBBSC_ARCHIVE_SHA256 = "39edf31118aa546a0439a08e730a7bcab522f376fa9a715fc17a3add4c760ccf"
+AUTH_LIBBSC_LIBRARY_SHA256 = "b7446c05a46405cd85eb4ca4d2615350c29e7b9d3ce758e528b37a622c944879"
+AUTH_LIBBSC_HEADER_SHA256 = "27dfa3fc8f383aff80e5fb3bcb79efd5d73918784b55fa1f46f8b373c9c965de"
 
 
 class MatrixError(ValueError):
@@ -223,6 +228,31 @@ def _native_receipt(root: Path) -> tuple[dict[str, object] | None, dict[str, obj
     return receipt, receipt_facts
 
 
+def _libbsc_authority(root: Path) -> dict[str, object]:
+    source = Path("/tanksmall/scratch/ictmp/libbsc-issue16")
+    header = source / "libbsc" / "libbsc.h"
+    library = source / "build-gcc2" / "libbsc.a"
+    provenance = root / "vendor" / "libbsc" / "PROVENANCE"
+    manifest = root / "vendor" / "libbsc" / "SOURCE-MANIFEST.sha256"
+    try:
+        head = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+        tree = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD^{tree}"], text=True).strip()
+        header_facts = _private_digest(header, "libbsc_header")
+        library_facts = _private_digest(library, "libbsc_library")
+        provenance_facts = _private_digest(provenance, "libbsc_provenance")
+        manifest_facts = _private_digest(manifest, "libbsc_manifest")
+    except (OSError, subprocess.SubprocessError, MatrixError):
+        return {"status": "NOT_READY", "reason": "MISSING_AUTHORITY: libbsc source/build facts"}
+    status = (head == AUTH_LIBBSC_HEAD and tree == AUTH_LIBBSC_TREE and
+              header_facts["sha256"] == AUTH_LIBBSC_HEADER_SHA256 and
+              library_facts["sha256"] == AUTH_LIBBSC_LIBRARY_SHA256)
+    return {"status": "READY" if status else "NOT_READY", "source_root": str(source),
+            "head": head, "tree": tree, "archive_sha256": AUTH_LIBBSC_ARCHIVE_SHA256,
+            "header": header_facts, "library": library_facts,
+            "provenance": provenance_facts, "source_manifest": manifest_facts,
+            "reason": None if status else "MISSING_AUTHORITY: libbsc hash mismatch"}
+
+
 def method_authority(method: str) -> dict[str, object]:
     """Return the method's explicit implementation/status authority."""
     if method not in METHODS:
@@ -233,13 +263,14 @@ def method_authority(method: str) -> dict[str, object]:
     planner = root / "farmharness" / "s4_version_transition_planner.py"
     native_binary = root / "cache" / "sim" / ".p50sim.bin"
     receipt, receipt_facts = _native_receipt(root)
+    libbsc = _libbsc_authority(root)
     if method == "RAW_II":
         return {"status": "READY", "kind": "whole-legacy-control",
                 "authority": [_authority_file(product,
                     "RAW_II is a raw framed application-wire control; no zstd state")],
                 "contract": "raw bytes in both directions are measured by the control witness"}
     if method == "ZSTD_TU":
-        status = "READY" if product_facts.get("sha256") == AUTH_P50_ZSTD_SHA256 else "NOT_READY"
+        status = "READY" if product_facts.get("sha256") == AUTH_P50_ZSTD_SHA256 and receipt is not None else "NOT_READY"
         return {"status": status, "kind": "product-profile",
                 "authority": [product_facts,
                     _authority_file(root / "cache" / "sim" / ".p50sim-build.json",
@@ -248,9 +279,9 @@ def method_authority(method: str) -> dict[str, object]:
                     _authority_file(product,
                     "ZstdTuCodec resets session and parameters for each independent TU")],
                 "contract": "independent level-3 frame/context per TU",
-                "reason": None if status == "READY" else "MISSING_AUTHORITY: p50_zstd source changed"}
+                "reason": None if status == "READY" else "MISSING_AUTHORITY: exact native receipt/binary/source"}
     if method == "ZSTD_ROUTE":
-        status = "READY" if product_facts.get("sha256") == AUTH_P50_ZSTD_SHA256 else "NOT_READY"
+        status = "READY" if product_facts.get("sha256") == AUTH_P50_ZSTD_SHA256 and receipt is not None else "NOT_READY"
         return {"status": status, "kind": "product-profile",
                 "authority": [product_facts,
                     _authority_file(root / "cache" / "sim" / ".p50sim-build.json",
@@ -259,13 +290,15 @@ def method_authority(method: str) -> dict[str, object]:
                     _authority_file(product,
                     "ZstdRouteCodec resets a fresh level-3 frame and refPrefixes committed raw history")],
                 "contract": "one bounded-prefix frame per TU; commit advances relationship state",
-                "reason": None if status == "READY" else "MISSING_AUTHORITY: p50_zstd source changed"}
+                "reason": None if status == "READY" else "MISSING_AUTHORITY: exact native receipt/binary/source"}
     if method in {"P29", "GRZ_RESIDUAL"}:
         ready = receipt is not None and (method != "GRZ_RESIDUAL" or
-                                         receipt.get("configuration", {}).get("with_libbsc") == 1)
+                                         receipt.get("configuration", {}).get("with_libbsc") == 1) and \
+                (method != "GRZ_RESIDUAL" or libbsc.get("status") == "READY")
         return {"status": "READY" if ready else "NOT_READY", "kind": "product-profile",
                 "authority": [product_facts,
-                    receipt_facts, _authority_file(native_binary, "native product profile binary")],
+                    receipt_facts, _authority_file(native_binary, "native product profile binary"),
+                    *([libbsc] if method == "GRZ_RESIDUAL" else [])],
                 "contract": "native p50sim profile batch; no Python approximation",
                 "reason": None if ready else ("MISSING_AUTHORITY: authenticated libbsc build receipt"
                     if method == "GRZ_RESIDUAL" else "MISSING_AUTHORITY: native p50sim receipt")}
@@ -781,12 +814,28 @@ class MethodMatrixSimulator:
                 for key, state in states.items()}
             for method, states in states_by_method.items()
         }
+        totals = {}
+        for method in self.methods:
+            selected = [row for row in rows if row.get("method") == method]
+            totals[method] = {
+                "raw_bytes": sum(int(row.get("raw_bytes") or 0) for row in selected),
+                "encoded_bytes": sum(int(row.get("encoded_bytes") or 0) for row in selected),
+                "c_to_f_bytes": sum(int(row.get("product_transaction", {}).get("c_to_f_bytes", 0))
+                                     for row in selected),
+                "f_to_c_bytes": sum(int(row.get("product_transaction", {}).get("f_to_c_bytes", 0))
+                                     for row in selected),
+                "execution_ns": sum(int(row.get("product_transaction", {}).get("simulator_execution_ns", 0))
+                                     for row in selected),
+                "state_digests": [row.get("product_transaction", {}).get("state_digest") for row in selected
+                                  if row.get("product_transaction")],
+            }
         return {"schema": SUMMARY_SCHEMA, "status": self._status(rows),
                 "experiment": str(experiment), "topology": self._topology_record(),
                 "relationship_count": self.topology.relationship_count,
                 "method_status": {method: self.authority[method]["status"] for method in self.methods},
                 "occurrence_rows": len(rows),
                 "committed_rows": sum(bool(row["committed"]) for row in rows),
+                "totals": totals,
                 "relationships": relationships}
 
 
@@ -955,20 +1004,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--firefox-trace", type=Path)
     parser.add_argument("--output-root", type=Path, default=Path("experiments"))
     parser.add_argument("--count", type=int, default=100)
+    parser.add_argument("--depth", choices=("100", "200", "full-1", "state-carrying-full-2"))
     args = parser.parse_args(argv)
     if args.firefox_trace is None:
         parser.error("--firefox-trace is required")
+    if args.depth == "state-carrying-full-2":
+        parser.error("state-carrying-full-2 requires an authenticated full-1 predecessor plan")
+    count = {None: args.count, "100": 100, "200": 200, "full-1": 2498}[args.depth]
     for topology_id in TOPOLOGY_IDS:
         topology = MatrixTopology.from_id(topology_id)
         try:
-            occurrences = firefox_occurrences(args.firefox_trace, count=args.count)
+            occurrences = firefox_occurrences(args.firefox_trace, count=count)
             reason = ""
         except MatrixError as exc:
             occurrences = []
             reason = str(exc)
         if not occurrences:
             path = write_not_ready_canary(args.output_root, args.firefox_trace,
-                                          topology=topology, count=args.count,
+                                          topology=topology, count=count,
                                           reason="MISSING_AUTHORITY: " + (reason or
                                               "authenticated Firefox .ii inputs are unavailable"))
             print(path)

@@ -106,7 +106,7 @@ def test_methods_do_not_alias_and_missing_authority_is_explicit() -> None:
     statuses = result["method_status"]
     assert statuses == {
         "RAW_II": "READY", "ZSTD_TU": "READY", "P29": "READY",
-        "GRZ_RESIDUAL": "NOT_READY", "ZSTD_ROUTE": "READY",
+        "GRZ_RESIDUAL": "READY", "ZSTD_ROUTE": "READY",
         "ZSTD_COHORT": "NOT_READY", "ZSTD_GLOBAL": "NOT_IMPLEMENTED",
     }
     rows = {row["method"]: row for row in result["rows"]}
