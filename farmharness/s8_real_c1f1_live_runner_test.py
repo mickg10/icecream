@@ -1243,6 +1243,9 @@ def test_external_binding_rejects_disconnected_worker_host_digest(
 
 @pytest.mark.parametrize("mutation", [
     lambda value: value["hosts"].pop("research7"),
+    lambda value: value["hosts"]["q3"].pop("image"),
+    lambda value: value["hosts"]["q3"]["image"].update(
+        {"image_id": runner.EXTERNAL_FARM_IMAGE_CONFIG}),
     lambda value: value["placements"][runner.PARALLEL_TOPOLOGY].update(
         {"relationship_hosts": ["q2"] * 20}),
     lambda value: value["hosts"]["q2"]["binaries"].update(
@@ -1368,12 +1371,13 @@ def test_external_finalizer_propagates_scope_placement_and_authority(
         "S8_SCHEDULING mode=relationship-ordered execution_slots=1 relationships=1 "
         "planned_admission_lanes_per_relationship=1\n")
     external = _external_input(tmp_path, manifest, authority, work, stdout)
+    expected_image = json.loads(authority.read_text())["hosts"]["q3"]["image"]
     output = runner.finalize(
         "mutated caller text", 0, batch_manifest=batch_manifest, topology=topology,
         predictive_plan=predictive_plan, output=tmp_path / "output", profile="GRZ_RESIDUAL",
         product_root=tmp_path, corpus="DuckDB", regime="cold", depth="full", full_count=1,
         passes=1, timestamp="20260831T000000Z", execution_environment="external_farm_product_build",
-        external_farm=external)
+        runtime_image=expected_image, external_farm=external)
     evidence = json.loads((output / "evidence.json").read_text())
     curve_manifest = json.loads((output / "live_curve_manifest.json").read_text())
     experiment = json.loads((output / "experiment_manifest.json").read_text())
@@ -1384,6 +1388,8 @@ def test_external_finalizer_propagates_scope_placement_and_authority(
     assert "external_farm" not in curve_manifest
     assert loaded_curve["execution_scope"] == runner.EXTERNAL_FARM_EXECUTION_SCOPE
     assert experiment["external_farm"]["manifest"]["sha256"] == hashlib.sha256(manifest.read_bytes()).hexdigest()
+    assert evidence["runtime_image"] == expected_image
+    assert experiment["runtime_image"] == expected_image
     assert (output / "product-evidence" / "external-farm-authority.json").is_file()
     assert (output / "product-evidence" /
             "s7-measured-f-action-trace.jsonl").read_bytes() == b"f-action\n"

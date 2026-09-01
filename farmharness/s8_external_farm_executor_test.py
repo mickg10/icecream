@@ -816,7 +816,11 @@ def test_s2_process_loss_requires_exact_q2_f(tmp_path: Path) -> None:
 
 def test_external_cell_adapter_finalizes_immediately_after_execution(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    authority = {"placements": {"C1F1/100000": {"relationship_hosts": ["q2"]}}}
+    image = {"reference": executor.s4.PINNED_IMAGE,
+             "image_id": executor.s4.EXPECTED_IMAGE_ID,
+             "architecture": "amd64", "os": "linux", "created": "now"}
+    authority = {"placements": {"C1F1/100000": {"relationship_hosts": ["q2"]}},
+                 "hosts": {"q3": {"image": image}}}
     events: list[str] = []
     calls: dict[str, object] = {}
     finalizer_input = {"manifest_path": str(tmp_path / "manifest.json")}
@@ -866,12 +870,57 @@ def test_external_cell_adapter_finalizes_immediately_after_execution(
     assert finalize_kwargs["execution_environment"] == "external_farm_product_build"
     assert finalize_kwargs["output"] == tmp_path / "output"
     assert finalize_kwargs["suite"] == "C1F1/100000"
+    assert finalize_kwargs["runtime_image"] == image
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda image: image.pop("image_id"),
+    lambda image: image.update({"image_id": executor.s4.EXPECTED_IMAGE_CONFIG_ID}),
+])
+def test_external_cell_adapter_rejects_missing_or_mismatched_compiler_image(
+        mutation: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    image = {"reference": executor.s4.PINNED_IMAGE,
+             "image_id": executor.s4.EXPECTED_IMAGE_ID,
+             "architecture": "amd64", "os": "linux", "created": "now"}
+    mutation(image)  # type: ignore[operator]
+    authority = {"placements": {"C1F1/100000": {"relationship_hosts": ["q2"]}},
+                 "hosts": {"q3": {"image": image}}}
+
+    calls = {"execute": 0, "finalize": 0}
+
+    class FakeTransport:
+        def __init__(self) -> None:
+            self.authority = authority
+
+        def execute(self, **_kwargs: object) -> dict[str, object]:
+            calls["execute"] += 1
+            return {"status": "PASS", "finalizer_input": {"fixture": True}}
+
+    monkeypatch.setattr(executor, "validate_batch_inputs",
+                        lambda *args, **kwargs: ([{"input": "one"}], []))
+    monkeypatch.setattr(executor, "build_external_command",
+                        lambda *args, **kwargs: ["env", "ICECC_P50_EXTERNAL_FARM=1",
+                                                 "/product/unittests/p50compilee2e-run.sh"])
+    monkeypatch.setattr(executor.live, "finalize",
+                        lambda *args, **kwargs: calls.__setitem__("finalize", calls["finalize"] + 1))
+    with pytest.raises(executor.ExternalFarmError, match="authority:q3:image_invalid"):
+        executor.execute_and_finalize_external_cell(
+            FakeTransport(), topology="C1F1/100000", relationship_hosts=["q2"],
+            profile="ZSTD_ROUTE", batch_manifest=tmp_path / "batch.jsonl",
+            predictive_plan=tmp_path / "plan.json", topology_file=tmp_path / "topology.json",
+            corpus="DuckDB", regime="cold", depth="100", output=tmp_path / "output",
+            product_root=tmp_path / "product")
+    assert calls == {"execute": 0, "finalize": 0}
 
 
 def test_external_cell_adapter_rejects_execution_without_finalizer_input(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    image = {"reference": executor.s4.PINNED_IMAGE,
+             "image_id": executor.s4.EXPECTED_IMAGE_ID,
+             "architecture": "amd64", "os": "linux", "created": "now"}
     class FakeTransport:
-        authority = {"placements": {"C1F1/100000": {"relationship_hosts": ["q2"]}}}
+        authority = {"placements": {"C1F1/100000": {"relationship_hosts": ["q2"]}},
+                     "hosts": {"q3": {"image": image}}}
 
         def execute(self, **_kwargs: object) -> dict[str, object]:
             return {"status": "PASS"}

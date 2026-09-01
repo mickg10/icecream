@@ -207,6 +207,22 @@ def _validate_authority(authority: Mapping[str, Any]) -> None:
             raise ExternalFarmError(f"authority:placements:{suite}:invalid")
 
 
+def compiler_image_identity(authority: Mapping[str, Any]) -> dict[str, str]:
+    """Return the exact q3 compiler image identity for finalizer handoff."""
+    hosts = authority.get("hosts")
+    q3 = hosts.get("q3") if isinstance(hosts, Mapping) else None
+    image = q3.get("image") if isinstance(q3, Mapping) else None
+    if (not isinstance(image, Mapping) or
+            set(image) != {"reference", "image_id", "architecture", "os", "created"} or
+            image.get("reference") != s4.PINNED_IMAGE or
+            image.get("image_id") != s4.EXPECTED_IMAGE_ID or
+            image.get("architecture") != "amd64" or image.get("os") != "linux" or
+            not isinstance(image.get("created"), str) or not image["created"]):
+        raise ExternalFarmError("authority:q3:image_invalid")
+    return {key: str(image[key]) for key in
+            ("reference", "image_id", "architecture", "os", "created")}
+
+
 def load_authority(path: Path) -> dict[str, Any]:
     value = _load_private_json(path, "authority")
     _validate_authority(value)
@@ -2180,6 +2196,9 @@ def execute_and_finalize_external_cell(
     rows, _assignments = validate_batch_inputs(
         batch_manifest, predictive_plan, topology_file, corpus=corpus,
         profile=profile, regime=regime, depth=depth, suite=topology)
+    # Authenticate the compiler image before constructing a command or
+    # staging inputs; malformed authority must not start an external cell.
+    compiler_image = compiler_image_identity(transport.authority)
     timeout_seconds = external_timeout_seconds(
         len(rows), passes, regime == "warm")
     if reference_authority is not None and reference_witness is None:
@@ -2258,6 +2277,7 @@ def execute_and_finalize_external_cell(
             retain_all_artifacts=retain_all_artifacts,
             timeout_seconds=timeout_seconds,
             execution_environment="external_farm_product_build",
+            runtime_image=compiler_image,
             external_farm=result["finalizer_input"], timestamp=timestamp,
             suite=topology)
     except live.LiveRunnerError as exc:

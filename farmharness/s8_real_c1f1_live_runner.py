@@ -2469,6 +2469,16 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
         if execution_environment != "external_farm_product_build":
             _fail("external_farm:execution_environment_invalid")
         external_binding = _external_farm_binding(external_input, suite)
+        # External execution owns the compiler image identity.  The transport
+        # already authenticated the fresh authority above; carry the q3
+        # compiler image into the retained evidence instead of leaving the
+        # optional local-launch value as null.
+        compiler_image = external_binding["hosts"]["q3"].get("image")
+        if not isinstance(compiler_image, Mapping):
+            _fail("external_farm:compiler_image_missing")
+        if runtime_image is not None and runtime_image != compiler_image:
+            _fail("external_farm:compiler_image_mismatch")
+        runtime_image = dict(compiler_image)
         external_stdout = Path(external_input.stdout_path).read_text(encoding="utf-8")
         stdout = external_stdout
     measurement_method, effective_product_profile, calibration_eligible = \

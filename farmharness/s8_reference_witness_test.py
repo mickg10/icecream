@@ -114,6 +114,11 @@ def _make(tmp_path: Path):
 
 def test_create_and_reuse_resnapshots_authority_and_every_binding(tmp_path: Path) -> None:
     row, authority, plan, batch, _direct, remote, manifest = _make(tmp_path)
+    header = json.loads(manifest.read_text(encoding="utf-8").splitlines()[0])
+    assert header["product"]["image"] == {
+        "reference": "image", "image_id": "sha256:" + "b" * 64,
+        "architecture": "amd64", "os": "linux", "created": "now",
+    }
     # Idle observations are volatile, but the authority identity remains the
     # same. Reuse therefore records the new full authority snapshot safely.
     authority.write_text(authority.read_text(encoding="utf-8").replace('"status": "PASS"', '"status": "HOLD"'), encoding="utf-8")
@@ -122,6 +127,25 @@ def test_create_and_reuse_resnapshots_authority_and_every_binding(tmp_path: Path
                                       image_identity={"reference": "image", "image_id": "sha256:" + "b" * 64,
                                                       "architecture": "amd64", "os": "linux", "created": "now"})
     assert plan_data["mode"] == "reuse"
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda value: value.pop("runtime_image"),
+    lambda value: value["runtime_image"].update({"image_id": "sha256:" + "c" * 64}),
+])
+def test_cell_compiler_image_identity_is_required_and_exact(
+        tmp_path: Path, mutation: object) -> None:
+    _row, authority, _plan, _batch, _direct, _remote, _manifest = _make(tmp_path)
+    experiment_path = tmp_path / "cell" / "experiment_manifest.json"
+    experiment = json.loads(experiment_path.read_text(encoding="utf-8"))
+    mutation(experiment)  # type: ignore[operator]
+    experiment_path.write_bytes(witness._canonical(experiment) + b"\n")
+    package = tmp_path / "mutated-witness"
+    with pytest.raises(witness.ReferenceWitnessError,
+                       match="compiler_image_missing|compiler_identity_mismatch"):
+        witness.create_from_cell(tmp_path / "cell", authority=authority,
+                                 package_dir=package)
+    assert not package.exists()
 
 
 def test_reuse_accepts_volatile_authority_and_rejects_remote_bytes(tmp_path: Path) -> None:
