@@ -200,6 +200,29 @@ def _native_batch(occurrences: Sequence[Occurrence], topology: MatrixTopology,
         return result
 
 
+def _native_receipt(root: Path) -> tuple[dict[str, object] | None, dict[str, object]]:
+    receipt_path = root / "cache" / "sim" / ".p50sim-build.json"
+    binary = root / "cache" / "sim" / ".p50sim.bin"
+    receipt_facts = _authority_file(receipt_path, "native p50sim build receipt")
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        binary_facts = _private_digest(binary, "native p50sim binary")
+        head = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"],
+                                       text=True, timeout=10).strip()
+        tree = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD^{tree}"],
+                                       text=True, timeout=10).strip()
+    except (OSError, json.JSONDecodeError, MatrixError):
+        return None, receipt_facts
+    if (receipt.get("schema") != "icecream-p50sim-build-v1" or
+            receipt.get("source", {}).get("head") != head or
+            receipt.get("source", {}).get("tree") != tree or
+            receipt.get("binary", {}).get("path") != str(binary) or
+            receipt.get("binary", {}).get("sha256") != binary_facts["sha256"] or
+            receipt.get("binary", {}).get("bytes") != binary_facts["bytes"]):
+        return None, receipt_facts
+    return receipt, receipt_facts
+
+
 def method_authority(method: str) -> dict[str, object]:
     """Return the method's explicit implementation/status authority."""
     if method not in METHODS:
@@ -209,6 +232,7 @@ def method_authority(method: str) -> dict[str, object]:
     product_facts = _authority_file(product, "authenticated product p50_zstd source")
     planner = root / "farmharness" / "s4_version_transition_planner.py"
     native_binary = root / "cache" / "sim" / ".p50sim.bin"
+    receipt, receipt_facts = _native_receipt(root)
     if method == "RAW_II":
         return {"status": "READY", "kind": "whole-legacy-control",
                 "authority": [_authority_file(product,
@@ -237,12 +261,14 @@ def method_authority(method: str) -> dict[str, object]:
                 "contract": "one bounded-prefix frame per TU; commit advances relationship state",
                 "reason": None if status == "READY" else "MISSING_AUTHORITY: p50_zstd source changed"}
     if method in {"P29", "GRZ_RESIDUAL"}:
-        return {"status": "NOT_READY", "kind": "product-profile",
+        ready = receipt is not None and (method != "GRZ_RESIDUAL" or
+                                         receipt.get("configuration", {}).get("with_libbsc") == 1)
+        return {"status": "READY" if ready else "NOT_READY", "kind": "product-profile",
                 "authority": [product_facts,
-                    _authority_file(root / "cache" / "sim" / ".p50sim-build.json",
-                                    "native product profile receipt")],
-                "contract": "native p50sim profile required; no Python approximation",
-                "reason": "INCOMPLETE: profile payload-output seam is not retained by this successor"}
+                    receipt_facts, _authority_file(native_binary, "native product profile binary")],
+                "contract": "native p50sim profile batch; no Python approximation",
+                "reason": None if ready else ("MISSING_AUTHORITY: authenticated libbsc build receipt"
+                    if method == "GRZ_RESIDUAL" else "MISSING_AUTHORITY: native p50sim receipt")}
     if method == "ZSTD_COHORT":
         return {"status": "NOT_READY", "kind": "unaccepted-extra",
                 "authority": [_authority_file(planner,
@@ -528,7 +554,8 @@ class MethodMatrixSimulator:
         assignments = assign_relationships(self.topology, occurrences, self.assignment_authority)
         if occurrences and all(occurrence.source_path for occurrence in occurrences):
             for method in self.methods:
-                if method in {"ZSTD_TU", "ZSTD_ROUTE"}:
+                if method in {"ZSTD_TU", "P29", "GRZ_RESIDUAL", "ZSTD_ROUTE"} and \
+                        self.authority[method]["status"] == "READY":
                     self._native_rows[method] = _native_batch(
                         occurrences, self.topology, self.assignment_authority, method)
         # Relationship state is method-local.  Sharing this map across methods
@@ -675,6 +702,11 @@ class MethodMatrixSimulator:
                     f"route order expected REL_SEQ {encode_state.next_rel_seq}, got {occurrence.rel_seq}"
                 )
         product = self._native_rows.get(method, {}).get(occurrence.ordinal)
+        if method in {"P29", "GRZ_RESIDUAL"} and product is None:
+            row["status"] = "NOT_READY"
+            row["reason"] = "native batch requires authenticated source-path inputs"
+            row["authority"] = self.authority[method]
+            return row
         if product is not None:
             # Batch endpoint output is the authoritative full-stream
             # measurement.  Do not launch a second native process per TU or
