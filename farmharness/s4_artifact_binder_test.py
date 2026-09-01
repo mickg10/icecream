@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import copy
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -270,6 +272,14 @@ def test_receipt_can_join_an_exact_role_manifest(tmp_path: Path) -> None:
     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
     loaded = binder.load_receipt(receipt_path)
     assert binder.bind_receipts([loaded])["versions"]["44"]["status"] == "BOUND"
+
+
+def test_artifact_binder_direct_cli_help_imports_strict_parser() -> None:
+    script = Path(binder.__file__)
+    completed = subprocess.run([sys.executable, str(script), "--help"],
+                               check=False, capture_output=True, text=True)
+    assert completed.returncode == 0
+    assert "usage:" in completed.stdout
 
 
 def test_planner_embeds_binding_contract() -> None:

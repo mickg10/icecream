@@ -46,15 +46,24 @@ from typing import Any, Mapping, Sequence
 try:
     from . import s8_depth_runner
 except ImportError:  # pragma: no cover
-    from farmharness import s8_depth_runner
+    import s8_depth_runner
 
-from farmharness.s4_version_transition_planner import (
-    P43_SOURCE_SHA,
-    P44_PROTOCOL_ASSERTION,
-    P44_SOURCE_SHA,
-    P50_SOURCE_SHA as P50_PLANNER_SOURCE_SHA,
-    RETAINED_ROLE_HASHES,
-)
+try:
+    from .s4_version_transition_planner import (
+        P43_SOURCE_SHA,
+        P44_PROTOCOL_ASSERTION,
+        P44_SOURCE_SHA,
+        P50_SOURCE_SHA as P50_PLANNER_SOURCE_SHA,
+        RETAINED_ROLE_HASHES,
+    )
+except ImportError:  # pragma: no cover
+    from s4_version_transition_planner import (
+        P43_SOURCE_SHA,
+        P44_PROTOCOL_ASSERTION,
+        P44_SOURCE_SHA,
+        P50_SOURCE_SHA as P50_PLANNER_SOURCE_SHA,
+        RETAINED_ROLE_HASHES,
+    )
 
 
 RECEIPT_SCHEMA = "icecream-s4-build-receipt-v1"
