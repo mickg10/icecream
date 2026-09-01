@@ -290,6 +290,7 @@ def _full2_marker(manifest: Mapping[str, Any], summary: Mapping[str, Any],
         for key in expected_keys:
             before = prior_state[key]
             after = current_state[key]
+            expected_route_identity = key.replace("|", "->")
             if (not isinstance(before, Mapping) or not isinstance(after, Mapping) or
                     type(before.get("native_last_tu_seq")) is not int or
                     type(before.get("native_next_rel_seq")) is not int or
@@ -300,6 +301,7 @@ def _full2_marker(manifest: Mapping[str, Any], summary: Mapping[str, Any],
                     before["history_nonce"] <= 0 or
                     not isinstance(before.get("route_identity"), str) or
                     not before["route_identity"] or
+                    before["route_identity"] != expected_route_identity or
                     type(after.get("native_last_tu_seq")) is not int or
                     type(after.get("native_next_rel_seq")) is not int or
                     after["native_last_tu_seq"] + 1 != after["native_next_rel_seq"] or
@@ -309,6 +311,7 @@ def _full2_marker(manifest: Mapping[str, Any], summary: Mapping[str, Any],
                     after["history_nonce"] <= 0 or
                     not isinstance(after.get("route_identity"), str) or
                     not after["route_identity"] or
+                    after["route_identity"] != expected_route_identity or
                     after["history_nonce"] != before["history_nonce"] or
                     after["route_identity"] != before["route_identity"] or
                     after["native_last_tu_seq"] < before["native_next_rel_seq"]):
@@ -347,7 +350,7 @@ def _full2_marker(manifest: Mapping[str, Any], summary: Mapping[str, Any],
                         not _valid_digest(transaction.get("state_digest")) or
                         transaction.get("state_digest") != current_row.get("native_state_digest") or
                         transaction.get("history_nonce") != before["history_nonce"] or
-                        transaction.get("route_identity") != before["route_identity"]):
+                        transaction.get("route_identity") != expected_route_identity):
                     return _not_proven(f"{method.lower()}_current_transaction_continuity_mismatch")
                 if method == "ZSTD_ROUTE":
                     transaction_before = _transaction_prefix(transaction, before=True)
