@@ -1038,7 +1038,17 @@ def verify_experiment(experiment: Path) -> dict[str, object]:
         if not isinstance(selected, list):
             raise MatrixError("verifier:input_authority_invalid")
         for item in selected:
-            if not isinstance(item, Mapping) or not isinstance(item.get("source_relative"), str):
+            if not isinstance(item, Mapping):
+                raise MatrixError("verifier:input_descriptor_invalid")
+            # In-memory synthetic controls intentionally have no external
+            # source descriptor; they are not predecessor candidates.  Real
+            # Firefox experiments must carry and authenticate both path and
+            # digest below.
+            if item.get("source_relative") is None:
+                if item.get("sha256") is not None:
+                    raise MatrixError("verifier:input_descriptor_invalid")
+                continue
+            if not isinstance(item.get("source_relative"), str):
                 raise MatrixError("verifier:input_descriptor_invalid")
             path = root / str(item["source_relative"])
             facts = _private_digest(path, "verifier_input")
@@ -1197,7 +1207,8 @@ def _authenticated_predecessor_plan(path: Path, topology_id: str) -> tuple[dict[
     except (OSError, json.JSONDecodeError) as exc:
         raise MatrixError("repeat-full predecessor manifest/summary is unavailable") from exc
     run_identity = manifest.get("run_identity")
-    if (manifest.get("schema") != SCHEMA or summary.get("schema") != SUMMARY_SCHEMA or
+    if (manifest.get("schema") != SCHEMA or manifest.get("experiment") != path.name or
+            summary.get("schema") != SUMMARY_SCHEMA or
             manifest.get("topology", {}).get("id") != topology_id or
             manifest.get("repeat_full") is not False or
             not isinstance(run_identity, Mapping) or
@@ -1212,12 +1223,15 @@ def _authenticated_predecessor_plan(path: Path, topology_id: str) -> tuple[dict[
             not manifest.get("row_order")):
         raise MatrixError("repeat-full predecessor artifacts/state are incomplete")
     relationships = summary.get("relationships", {}).get("ZSTD_ROUTE", {})
+    expected_relationships = {"|".join(key) for key in MatrixTopology.from_id(topology_id).relationship_keys}
     if (not isinstance(relationships, Mapping) or
-            len(relationships) != MatrixTopology.from_id(topology_id).relationship_count or
+            set(relationships) != expected_relationships or
             not all(isinstance(value, Mapping) and int(value.get("next_rel_seq", 0)) > 0
                     for value in relationships.values())):
         raise MatrixError("repeat-full predecessor relationship state is incomplete")
-    if summary.get("experiment") != str(path):
+    if (summary.get("experiment") != str(path) or
+            summary.get("topology", {}).get("id") != topology_id or
+            int(summary.get("relationship_count", 0)) != len(expected_relationships)):
         raise MatrixError("repeat-full predecessor summary binding is invalid")
     authority = manifest.get("assignment_authority")
     if not isinstance(authority, Mapping) or authority.get("topology") != topology_id:

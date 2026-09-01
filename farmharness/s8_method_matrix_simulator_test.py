@@ -164,6 +164,24 @@ def test_raw_control_retains_no_copy_and_runs_are_collision_safe(tmp_path: Path,
         assert row["codec_wall_ns"] is None
 
 
+def test_experiment_verifier_rejects_deletion_and_mutation(tmp_path: Path) -> None:
+    experiment = MethodMatrixSimulator(
+        MatrixTopology.from_id("C1F1/100000"), methods=("ZSTD_TU",)).run(
+            [Occurrence(0, b"payload")], output_root=tmp_path,
+            timestamp="20260901T120000Z", depth="100")
+    assert verify_experiment(experiment)["status"] == "PASS"
+    occurrences = experiment / "occurrences.jsonl"
+    original = occurrences.read_bytes()
+    occurrences.unlink()
+    with pytest.raises(MatrixError, match="artifact_added_or_deleted"):
+        verify_experiment(experiment)
+    occurrences.write_bytes(original)
+    summary = experiment / "summary.json"
+    summary.write_bytes(summary.read_bytes() + b"\n")
+    with pytest.raises(MatrixError, match="artifact_mutated:summary.json"):
+        verify_experiment(experiment)
+
+
 def test_not_ready_runs_are_collision_safe_and_identity_bound(tmp_path: Path,
                                                               monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(simulator_module, "_stamp", lambda: "20260901T120000Z")
