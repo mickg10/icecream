@@ -122,11 +122,6 @@ link_binary() {
         ${ICECC_TEST_XXHASH_LIBS:--lxxhash} -o "$binary"
 }
 
-mutant_sidecar_pids() {
-    runtime_root=$1
-    mutant_sidecar_records "$runtime_root" | cut -d'|' -f1
-}
-
 proc_starttime() {
     ms_pid=$1
     ms_stat=$(cat "/proc/$ms_pid/stat" 2>/dev/null) || return 1
@@ -186,7 +181,9 @@ mutant_sidecar_records() {
             test -s "$interruption_ready_trace"; then
         process_pid=$(ready_trace_pid "$interruption_ready_trace") || return 1
         mutant_sidecar_record_for_pid "$runtime_root" "$process_pid" && return 0
-        return 1
+        # A valid READY owner that has already exited is an empty result;
+        # malformed/duplicate READY input returned above is the parser error.
+        return 0
     fi
     if test "${ICECC_P50_TEST_FORBID_PROC_FALLBACK:-0}" = 1; then
         echo 'FAIL: sidecar ownership discovery used forbidden /proc fallback' >&2
@@ -240,7 +237,19 @@ sidecar_record_matches() {
 
 retire_mutant_sidecars() {
     runtime_root=$1
-    sidecar_records=$(mutant_sidecar_records "$runtime_root")
+    sidecar_record_file=$(mktemp "$tmp_root/sidecar-records.XXXXXX") || return 1
+    if mutant_sidecar_records "$runtime_root" >"$sidecar_record_file"; then
+        if sidecar_records=$(cat "$sidecar_record_file"); then
+            :
+        else
+            rm -f -- "$sidecar_record_file"
+            return 1
+        fi
+    else
+        rm -f -- "$sidecar_record_file"
+        return 1
+    fi
+    rm -f -- "$sidecar_record_file" || return 1
     for sidecar_record in $sidecar_records; do
         sidecar_record_matches "$sidecar_record" || continue
         sidecar_pid=${sidecar_record%%|*}
@@ -269,6 +278,24 @@ retire_mutant_sidecars() {
     done
     test -z "$remaining_records"
 }
+
+# A malformed READY frame must remain a hard parser error through the cleanup
+# owner too; an empty `cut` result is not an acceptable success signal.
+interruption_ready_trace="$ready_trace_malformed"
+if mutant_sidecar_records "$tmp_root/no-runtime" \
+        >"$tmp_root/poll-parser.output" 2>"$tmp_root/poll-parser.error"; then
+    echo 'FAIL: malformed READY trace was accepted by polling' >&2
+    exit 1
+fi
+echo 'ok - malformed READY trace status propagates through polling'
+if ICECC_P50_TEST_FORBID_PROC_FALLBACK=1 \
+        retire_mutant_sidecars "$tmp_root/no-runtime" \
+        >"$tmp_root/cleanup-parser.output" 2>"$tmp_root/cleanup-parser.error"; then
+    echo 'FAIL: malformed READY trace was accepted by cleanup' >&2
+    exit 1
+fi
+echo 'ok - malformed READY trace status propagates through cleanup'
+unset interruption_ready_trace
 
 # Keep the runtime prefix short enough for the adapter's sockaddr_un path
 # contract; the unique directory name still scopes exact child cleanup.
@@ -351,12 +378,19 @@ interruption_ready_trace="$tmp_root/interruption.ready"
         sleep 0.01
     done
     interruption_sidecar_wait=0
-    while test -z "$(mutant_sidecar_pids "$interruption_runtime_root")" && \
-            test "$interruption_sidecar_wait" -lt 40; do
+    while test "$interruption_sidecar_wait" -lt 40; do
+        if interruption_wrapper_records=$(mutant_sidecar_records "$interruption_runtime_root"); then
+            interruption_wrapper_pids=$(printf '%s\n' "$interruption_wrapper_records" |
+                cut -d'|' -f1)
+        else
+            stop_interruption_child
+            exit 1
+        fi
+        test -n "$interruption_wrapper_pids" && break
         sleep 0.05
         interruption_sidecar_wait=$((interruption_sidecar_wait + 1))
     done
-    if test -z "$(mutant_sidecar_pids "$interruption_runtime_root")"; then
+    if test -z "$interruption_wrapper_pids"; then
         stop_interruption_child
         exit 1
     fi
@@ -417,8 +451,20 @@ set +e
 wait "$interruption_wrapper_pid"
 interruption_status=$?
 set -e
+interruption_final_records_file=$(mktemp "$tmp_root/interruption-final-records.XXXXXX")
+if mutant_sidecar_records "$interruption_runtime_root" >"$interruption_final_records_file"; then
+    if interruption_final_records=$(cat "$interruption_final_records_file"); then
+        interruption_final_pids=$(printf '%s\n' "$interruption_final_records" |
+            cut -d'|' -f1)
+    else
+        interruption_final_pids=parser-output-error
+    fi
+else
+    interruption_final_pids=parser-error
+fi
+rm -f -- "$interruption_final_records_file"
 if test "$interruption_status" -ne 0 || \
-        test -n "$(mutant_sidecar_pids "$interruption_runtime_root")" || \
+        test -n "$interruption_final_pids" || \
         test -e "$interruption_runtime_root"; then
     echo "FAIL: interrupted baseline left cache sidecar/runtime (status $interruption_status)" >&2
     cat "$interruption_log" >&2
