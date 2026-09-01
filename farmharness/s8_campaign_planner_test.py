@@ -568,6 +568,40 @@ def test_raw_ii_authority_deleted_top_level_fails_closed(tmp_path: Path) -> None
             raw_ii_authority_manifest_sha256=authority_sha)
 
 
+def test_raw_ii_authority_post_read_self_symlink_cli_is_exit77_no_traceback(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    inventory, recovery, recovery_sha, matrix, matrix_sha = _authority(tmp_path / "authority")
+    authority, authority_sha = _raw_authority_fixture(tmp_path / "raw", inventory)
+    original_read = planner._read_snapshot_descriptor
+
+    def replace_after_read(path: Path, label: str, *, keep_bytes: bool = False):
+        result = original_read(path, label, keep_bytes=keep_bytes)
+        if label == "raw_ii_authority":
+            path.unlink()
+            path.symlink_to(path.name)
+        return result
+
+    monkeypatch.setattr(planner, "_read_snapshot_descriptor", replace_after_read)
+    result = planner.main([
+        "--corpus-inventory", str(inventory),
+        "--image-recovery-report", str(recovery),
+        "--image-recovery-sha256", recovery_sha,
+        "--matrix-audit", str(matrix),
+        "--matrix-audit-sha256", matrix_sha,
+        "--output-root", str(tmp_path / "out"),
+        "--timestamp", "20260829T000000Z",
+        "--current-image-name", "image:tag",
+        "--current-image-id", "sha256:" + "a" * 64,
+        "--raw-ii-authority-manifest", str(authority),
+        "--raw-ii-authority-manifest-sha256", authority_sha,
+    ])
+    captured = capsys.readouterr()
+    assert result == 77
+    assert "path_changed_after_read" in captured.err
+    assert "Traceback" not in captured.err
+    assert captured.out == ""
+
+
 @pytest.mark.parametrize("kind", ["witness", "engine"])
 def test_raw_ii_authority_deleted_cell_artifact_fails_closed(tmp_path: Path,
                                                               kind: str) -> None:
@@ -615,6 +649,17 @@ def test_raw_ii_manifest_mapping_matches_shared_producer_contract() -> None:
     assert all(observed[key] is None for key in observed if key not in expected)
     assert set(expected.values()) == set(planner.RAW_II_SUPPORTED_CORPORA)
     assert set(expected) == {"corpus", "corpus2", "corpus3", "corpus7"}
+
+
+@pytest.mark.parametrize(("manifest_id", "project", "tu_count"), [
+    ("corpus4", "fmt", 50),
+    ("evil", "DuckDB", 689),
+    ("corpus5", "LLVM-1238", 1238),
+])
+def test_raw_ii_manifest_mapping_rejects_project_count_spoof(
+        manifest_id: str, project: str, tu_count: int) -> None:
+    assert planner._producer_corpus_for_manifest({
+        "manifest_id": manifest_id, "project": project, "tu_count": tu_count}) is None
 
 
 def test_raw_ii_authority_validates_12490_occurrences_without_quadratic_scan(

@@ -16,6 +16,7 @@ import re
 import stat
 import subprocess
 import sys
+from types import MappingProxyType
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +47,12 @@ RAW_II_BASELINE = _normalizer.CONTROL_BASELINE
 RAW_II_ENGINE_SCOPE = _raw_ii_producer.ENGINE_SCOPE
 RAW_II_SPLITS = dict(_s8_schema.SPLITS)
 RAW_II_SUPPORTED_CORPORA = tuple(_s8_schema.CORPORA)
+RAW_II_MANIFEST_TO_PRODUCER = MappingProxyType({
+    "corpus": "LLVM-1238",
+    "corpus2": "RocksDB",
+    "corpus3": "DuckDB",
+    "corpus7": "fmt",
+})
 RAW_II_AUTHORITY_KEYS = frozenset({
     "schema", "status", "capability", "producer", "producer_source", "cells"})
 TIMESTAMP_RE = re.compile(r"^\d{8}T\d{6}Z$")
@@ -254,7 +261,9 @@ def _read_snapshot_descriptor(path: Path, label: str, *, keep_bytes: bool = Fals
         os.close(fd)
     raw = b"".join(chunks)
     return raw, {"path": str(path), "resolved_path": str(resolved), "bytes": size,
-                 "sha256": digest.hexdigest()}, resolved
+                 "sha256": digest.hexdigest(),
+                 "identity": (before.st_dev, before.st_ino, before.st_size,
+                              before.st_mtime_ns, before.st_ctime_ns)}, resolved
 
 
 def _git_output(repo: Path, args: list[str], label: str) -> str:
@@ -695,26 +704,24 @@ def _unique_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
 def _producer_corpus_for_manifest(corpus: dict[str, object]) -> str | None:
     """Map only authoritative planner identities to producer cell names."""
     manifest_id = corpus.get("manifest_id")
-    project = corpus.get("project")
-    tu_count = corpus.get("tu_count")
-    if (not isinstance(manifest_id, str) or not isinstance(project, str) or
-            type(tu_count) is not int):
+    if not isinstance(manifest_id, str):
         return None
-    if project in RAW_II_SUPPORTED_CORPORA:
-        return project
-    # The retained LLVM authority calls this manifest ``corpus``/``LLVM``;
-    # the producer's immutable cell contract names the same corpus LLVM-1238.
-    if manifest_id == "corpus" and project == "LLVM" and tu_count == 1238:
-        candidate = next((name for name in RAW_II_SUPPORTED_CORPORA
-                          if name == "LLVM-1238"), None)
-        return candidate
-    return None
+    return RAW_II_MANIFEST_TO_PRODUCER.get(manifest_id)
 
 
 def _load_raw_ii_authority(path: Path, expected_sha256: str, corpora: list[dict[str, object]],
                             snapshots: list[dict[str, object]]) -> dict[str, object]:
     raw, authority_snapshot, _ = _read_snapshot_descriptor(
         path, "raw_ii_authority", keep_bytes=True)
+    try:
+        path_after_read = path.lstat()
+    except (OSError, RuntimeError) as exc:
+        raise PlannerError(f"raw_ii_authority:path_changed_after_read:{path}") from exc
+    if (stat.S_ISLNK(path_after_read.st_mode) or
+            (path_after_read.st_dev, path_after_read.st_ino,
+             path_after_read.st_size, path_after_read.st_mtime_ns,
+             path_after_read.st_ctime_ns) != authority_snapshot["identity"]):
+        raise PlannerError(f"raw_ii_authority:path_changed_after_read:{path}")
     if (not isinstance(expected_sha256, str) or not SHA256_RE.fullmatch(expected_sha256.lower()) or
             authority_snapshot["sha256"] != expected_sha256.lower()):
         raise PlannerError("raw_ii_authority:sha256_mismatch")
@@ -808,7 +815,8 @@ def _load_raw_ii_authority(path: Path, expected_sha256: str, corpora: list[dict[
             all_paths.add(str(descriptor["path"]))
         authenticated[cell_key] = {"cell": dict(cell), "witness": witness, "engine": engine,
                                    "planner_manifest_id": manifest_id}
-    return {"path": str(path.resolve()), "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
+    return {"path": str(authority_snapshot["resolved_path"]),
+            "bytes": authority_snapshot["bytes"], "sha256": authority_snapshot["sha256"],
             "schema": RAW_II_AUTHORITY_SCHEMA, "capability": RAW_II_CAPABILITY,
             "producer": value["producer"], "producer_source": producer_source,
             "cells": authenticated}
