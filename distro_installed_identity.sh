@@ -126,7 +126,11 @@ if [ "$DISTRO" = ubuntu24 ] && [ -n "${S1B_APT_CACHE:-}" ]; then
         *) echo "FAIL: S1B_APT_CACHE must be an absolute host path" >&2; exit 2 ;;
     esac
     mkdir -p "$S1B_APT_CACHE/lists" "$S1B_APT_CACHE/archives"
-    APT_CACHE_MOUNTS="-v $S1B_APT_CACHE/lists:/var/lib/apt/lists -v $S1B_APT_CACHE/archives:/var/cache/apt/archives"
+    APT_NO_CLEAN="$S1B_APT_CACHE/docker-clean"
+    if [ ! -e "$APT_NO_CLEAN" ]; then
+        printf '%s\n' '# Gate-owned cache: replace the image cleanup hook so downloaded .debs survive for later rows.' > "$APT_NO_CLEAN"
+    fi
+    APT_CACHE_MOUNTS="-v $S1B_APT_CACHE/lists:/var/lib/apt/lists -v $S1B_APT_CACHE/archives:/var/cache/apt/archives -v $APT_NO_CLEAN:/etc/apt/apt.conf.d/docker-clean:ro"
     [ "${S1B_APT_CACHE_READY:-false}" = true ] && APT_CACHE_READY=true
 fi
 RUN_SUFFIX="$MODE"
@@ -327,7 +331,7 @@ case "$DISTRO" in
             DEP_INSTALL="dependency_bootstrap() {
                 dep_attempt=1
                 while [ \"\$dep_attempt\" -le 3 ]; do
-                    if DEBIAN_FRONTEND=noninteractive apt-get install -y $DEP_PACKAGES > /build/dependency-bootstrap.log 2>&1; then
+                    if DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Post-Invoke::= -o APT::Update::Post-Invoke::= install -y $DEP_PACKAGES > /build/dependency-bootstrap.log 2>&1; then
                         return 0
                     fi
                     if [ \"\$dep_attempt\" = 3 ]; then
@@ -343,7 +347,7 @@ case "$DISTRO" in
             DEP_INSTALL="dependency_bootstrap() {
                 dep_attempt=1
                 while [ \"\$dep_attempt\" -le 3 ]; do
-                    if apt-get update > /build/dependency-bootstrap.log 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y $DEP_PACKAGES >> /build/dependency-bootstrap.log 2>&1; then
+                    if apt-get -o DPkg::Post-Invoke::= -o APT::Update::Post-Invoke::= update > /build/dependency-bootstrap.log 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Post-Invoke::= -o APT::Update::Post-Invoke::= install -y $DEP_PACKAGES >> /build/dependency-bootstrap.log 2>&1; then
                         return 0
                     fi
                     if [ \"\$dep_attempt\" = 3 ]; then
