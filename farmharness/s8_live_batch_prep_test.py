@@ -206,7 +206,7 @@ def test_short_corpus_repetitions_share_one_compile_binding_per_source(
     manifest.write_text("\n".join(manifest_lines) + "\n")
     matrix = tmp_path / "matrix.json"
     cells = [{"cell": f"{corpus_name}/{profile}/{regime}",
-              "split": SPLITS[corpus_name]}
+              "split": SPLITS[corpus_name], "status": "PASS"}
              for corpus_name in CORPORA for profile in PROFILES for regime in REGIMES]
     matrix.write_text(json.dumps({
         "schema": depth_runner.MATRIX_AUDIT_SCHEMA, "status": "PASS",
