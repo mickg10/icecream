@@ -18,3 +18,23 @@ batch manifest, predictive plan, topology assignment, and a mature
 external-capable batch command.  The adapter retains product output,
 authority, role placement, scheduler/C/F work trees, service map, and logs.
 It does not admit local loopback elapsed time as timing evidence.
+
+For a multi-cell campaign, use the campaign driver's per-cell refresh command
+so authority freshness is measured immediately before each external cell. The
+command is an argv template (not a shell string) and must contain `{output}`;
+the driver supplies a unique private attempt path. `{corpus}`, `{profile}`,
+`{regime}`, `{topology}`, `{cell}`, and `{authority}` are also available. The
+command's argv, exit status, stdout, stderr, and hashes are retained in the
+cell attempt. A static `--external-farm-authority` may be supplied instead for
+a single-cell/API run, but it cannot be combined with a refresh command or
+provider.
+
+For example, pass an authority capture command with its required remote-root
+and descriptor arguments:
+
+```sh
+--mode external-farm \
+--external-farm-authority-command "python3 farmharness/s8_external_farm_authority.py \
+  --execute --root /path/to/final-head --output {output} \
+  --descriptor-dir /private/descriptors ..."
+```

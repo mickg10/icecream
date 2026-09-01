@@ -25,12 +25,14 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 try:  # package invocation
     from .s8_schema import CORPORA, PROFILES, REGIMES, SPLITS
+    from . import s8_external_farm_executor as external_farm_executor
 except ImportError:  # direct invocation
     from s8_schema import CORPORA, PROFILES, REGIMES, SPLITS
+    import s8_external_farm_executor as external_farm_executor
 
 
 SCHEMA = "icecream-s8-campaign-driver-v3"
@@ -38,6 +40,7 @@ CELL_SCHEMA = "icecream-s8-campaign-cell-v3"
 SUMMARY_SCHEMA = "icecream-s8-campaign-summary-v3"
 DEPTHS = ("100", "200", "full")
 TOPOLOGIES = ("C1F1/100000", "C1F20/40")
+EXTERNAL_FARM_MODE = "external-farm"
 TOPOLOGY_ARGS = {"C1F1/100000": "C1F1", "C1F20/40": "C1F20"}
 CAMPAIGN_STAMP = "%Y%m%dT%H%M%SZ"
 STAMP_RE = re.compile(r"^\d{8}T\d{6}Z$")
@@ -193,6 +196,65 @@ def _private_file(path: Path, label: str) -> dict[str, object]:
             info.st_nlink != 1):
         raise CampaignError(f"{label}:not_private_regular_file")
     return _sha(path)
+
+
+AUTHORITY_REFRESH_SCHEMA = "icecream-s8-campaign-authority-refresh-v1"
+
+
+def _authority_refresh(
+        command_template: Sequence[str], cell: dict[str, str], attempt_dir: Path,
+        *, timeout: float) -> tuple[Path, dict[str, object]]:
+    """Run a bounded argv-only authority refresh and retain all diagnostics."""
+    output = attempt_dir / "external-farm-authority.json"
+    values = {**cell, "cell": _cell_id(cell), "output": str(output),
+              "authority": str(output)}
+    try:
+        command = [str(item).format(**values) for item in command_template]
+    except (KeyError, ValueError) as exc:
+        raise CampaignError("external_farm:authority_command_template_invalid") from exc
+    if (not command or any(not item or "\n" in item or "\0" in item for item in command)
+            or not any(token in {"{output}", "{authority}"} for token in command_template)):
+        raise CampaignError("external_farm:authority_command_output_required")
+    stdout_path = attempt_dir / "external-authority-refresh.stdout"
+    stderr_path = attempt_dir / "external-authority-refresh.stderr"
+    record_path = attempt_dir / "external-authority-refresh.json"
+    try:
+        completed = subprocess.run(
+            command, cwd=attempt_dir, capture_output=True, text=True,
+            check=False, timeout=timeout)
+        returncode = completed.returncode
+        stdout_value = completed.stdout or ""
+        stderr_value = completed.stderr or ""
+    except subprocess.TimeoutExpired as exc:
+        returncode = None
+        stdout_value = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        stderr_value = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        stderr_value += ("\n" if stderr_value else "") + f"authority refresh timed out after {timeout:g}s\n"
+    except OSError as exc:
+        returncode = None
+        stdout_value = ""
+        stderr_value = f"authority refresh could not execute: {exc}\n"
+    _write_new(stdout_path, stdout_value.encode("utf-8", errors="replace"))
+    _write_new(stderr_path, stderr_value.encode("utf-8", errors="replace"))
+    refresh: dict[str, object] = {
+        "schema": AUTHORITY_REFRESH_SCHEMA,
+        "command": {"argv": command, "display": shlex.join(command),
+                     "shell": False, "cwd": str(attempt_dir)},
+        "returncode": returncode,
+        "stdout": _sha(stdout_path), "stderr": _sha(stderr_path),
+    }
+    if output.is_file() and not output.is_symlink():
+        refresh["authority"] = _sha(output)
+    _write_new(record_path, canonical(refresh))
+    if returncode is None:
+        raise CampaignError("external_farm:authority_refresh_failed:unavailable")
+    if returncode != 0:
+        raise CampaignError(f"external_farm:authority_refresh_failed:{returncode}")
+    try:
+        _private_file(output, "external_farm_authority")
+    except CampaignError as exc:
+        raise CampaignError(f"external_farm:authority_refresh_output_invalid:{exc}") from exc
+    return output, refresh
 
 
 def _validate_simulator_authority(path: Path, repo: Path) -> dict[str, object]:
@@ -508,7 +570,8 @@ def _source_commands(cell_dir: Path, cell: dict[str, str], *, depth: str,
                      compile_source_root: Path | None, compile_output_root: Path | None,
                      repo: Path, container_image: str | None = None,
                      container_image_id: str | None = None,
-                     container_temp_root: Path | None = None) -> tuple[list[dict[str, object]], dict[str, object],
+                     container_temp_root: Path | None = None,
+                     external_mode: bool = False) -> tuple[list[dict[str, object]], dict[str, object],
                                           dict[str, object], list[dict[str, object]],
                                           list[Path]]:
     attempt = cell_dir / "attempt-001"
@@ -592,7 +655,10 @@ def _source_commands(cell_dir: Path, cell: dict[str, str], *, depth: str,
     if compile_source_root is None:
         missing.append("compile-source-root")
     live_executable = not missing and container_image_id is not None and container_temp_root is not None
+    comparison_executable = live_executable or (external_mode and not missing)
     reason = "live inputs not configured: " + ", ".join(missing) if missing else "live execution staged by request"
+    run_reason = ("external farm adapter owns execution"
+                  if external_mode else reason)
     comparison_commands = []
     for stage, predictive_manifest, live_manifest, records in comparison_specs:
         comparison_argv = [
@@ -603,15 +669,15 @@ def _source_commands(cell_dir: Path, cell: dict[str, str], *, depth: str,
             "--out", str(records),
         ]
         comparison_commands.append(_command_record(
-            comparison_argv, repo, stage=stage, executable=live_executable,
-            reason=None if live_executable else "requires authenticated live curve"))
+            comparison_argv, repo, stage=stage, executable=comparison_executable,
+            reason=None if comparison_executable else "requires authenticated live curve"))
     return (plan_commands, producer_command,
             {"prepare": _command_record(prep_argv, repo, stage="live_prepare",
-                                         executable=live_executable,
-                                         reason=None if live_executable else reason),
+                                         executable=live_executable or (external_mode and not missing),
+                                         reason=None if live_executable or (external_mode and not missing) else reason),
              "run": _command_record(live_argv, repo, stage="live_run",
                                      executable=live_executable,
-                                     reason=None if live_executable else reason)},
+                                     reason=None if live_executable else run_reason)},
             comparison_commands, result_dirs)
 
 
@@ -824,6 +890,12 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
                  execute: bool = True,
                  mode: str = "predictive-only",
                  command_runner: Callable[[dict[str, object], Path, Path, Path], int] | None = None,
+                 external_farm_authority: str | Path | None = None,
+                 external_cell_runner: Callable[..., Path] | None = None,
+                 external_authority_provider: Callable[[dict[str, str]], str | Path] | None = None,
+                 external_authority_command: Sequence[str] | None = None,
+                 external_authority_command_timeout: float = 900.0,
+                 external_transport_factory: Callable[[dict[str, object]], object] | None = None,
                  timestamp: str | None = None,
                  container_image: str | None = PINNED_IMAGE,
                  container_image_id: str | None = None,
@@ -835,23 +907,55 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
     """Run a campaign, or resume it without rewriting prior attempts."""
     if depth not in DEPTHS:
         raise CampaignError("depth:undeclared")
-    if mode not in ("predictive-only", "all"):
+    if mode not in ("predictive-only", "all", EXTERNAL_FARM_MODE):
         raise CampaignError("mode:undeclared")
     if corpus not in CORPORA:
         raise CampaignError("corpus:undeclared")
-    if mode == "all" and SPLITS[corpus] == "held_out_validation":
+    if mode in ("all", EXTERNAL_FARM_MODE) and SPLITS[corpus] == "held_out_validation":
         raise CampaignError("live_preflight:all_mode_is_calibration_only")
     repo = repo.absolute()
     python = python or sys.executable
     source_manifest_spec, source_root_spec = str(source_manifest), str(source_root)
     matrix_audit = matrix_audit.absolute()
-    product_build_root = product_build_root.absolute()
+    product_build_root_input = Path(product_build_root)
+    if mode == EXTERNAL_FARM_MODE and not product_build_root_input.is_absolute():
+        raise CampaignError("external_farm:product_root_absolute_required")
+    product_build_root = product_build_root_input.absolute()
     compile_db_path = Path(compile_db).absolute() if compile_db else None
     compile_source_path = Path(compile_source_root).absolute() if compile_source_root else None
     compile_output_path = Path(compile_output_root).absolute() if compile_output_root else None
     container_temp_path = Path(container_temp_root).absolute() if container_temp_root else None
     simulator_authority_path = (Path(simulator_authority).absolute()
                                  if simulator_authority else None)
+    external_authority_path: Path | None = None
+    if mode == EXTERNAL_FARM_MODE:
+        authority_sources = sum(item is not None for item in (
+            external_farm_authority, external_authority_provider,
+            external_authority_command))
+        if authority_sources == 0:
+            raise CampaignError("external_farm:authority_required")
+        if authority_sources > 1:
+            raise CampaignError("external_farm:authority_sources_ambiguous")
+        if (type(external_authority_command_timeout) not in (int, float) or
+                not 0 < external_authority_command_timeout <= 21600):
+            raise CampaignError("external_farm:authority_command_timeout_invalid")
+        if (external_authority_command is not None and
+                (isinstance(external_authority_command, (str, bytes)) or
+                 not external_authority_command or
+                 any(not isinstance(item, str) for item in external_authority_command))):
+            raise CampaignError("external_farm:authority_command_invalid")
+        if external_farm_authority is not None:
+            authority_input = Path(external_farm_authority)
+            if not authority_input.is_absolute():
+                raise CampaignError("external_farm:authority_absolute_required")
+            external_authority_path = authority_input.absolute()
+            try:
+                _private_file(external_authority_path, "external_farm_authority")
+            except CampaignError as exc:
+                raise CampaignError(f"external_farm:authority_invalid:{exc}") from exc
+        if (product_build_root_input.is_symlink() or
+                not product_build_root.is_dir() or product_build_root.is_symlink()):
+            raise CampaignError("external_farm:product_root_unavailable")
     live_authority: dict[str, object] | None = None
     if mode == "all" and execute:
         live_authority = _validate_live_prerequisites(
@@ -874,6 +978,12 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
         "container_image_id": container_image_id.lower() if isinstance(container_image_id, str) else None,
         "container_temp_root": str(container_temp_path) if container_temp_path else None,
         "simulator_authority": str(simulator_authority_path) if simulator_authority_path else None,
+        "external_farm_authority": str(external_authority_path)
+        if external_authority_path is not None else None,
+        "external_authority_provider": external_authority_provider is not None,
+        "external_authority_command": (list(external_authority_command)
+                                        if external_authority_command is not None else None),
+        "external_authority_command_timeout": external_authority_command_timeout,
         "dimensions": {"profiles": list(PROFILES), "regimes": list(REGIMES),
                        "topologies": list(TOPOLOGIES)}}
     if resume is None:
@@ -884,6 +994,10 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
                     "campaign_root": str(campaign), "git": identity, "config": config,
                     "mode": mode if execute else "plan-only", "staged_stages": ["live", "comparison"],
                     "live_authority": live_authority,
+                    "external_farm_authority": (
+                        str(external_authority_path)
+                        if external_authority_path is not None else
+                        ("provider" if external_authority_provider is not None else "command")),
                     "config_sha256": hashlib.sha256(canonical(config)).hexdigest(),
                     "matrix": {"corpus": corpus, "profiles": list(PROFILES),
                                "regimes": list(REGIMES), "topologies": list(TOPOLOGIES),
@@ -941,7 +1055,8 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
             compile_output_root=compile_output_path, repo=repo,
             container_image=container_image if mode == "all" else None,
             container_image_id=container_image_id if mode == "all" else None,
-            container_temp_root=container_temp_path if mode == "all" else None)
+            container_temp_root=container_temp_path if mode == "all" else None,
+            external_mode=mode == EXTERNAL_FARM_MODE)
         # _source_commands uses attempt-001 as a stable template. Rebase every
         # generated path to this attempt so retries cannot overwrite outputs.
         def rebase(value: object) -> object:
@@ -1008,7 +1123,7 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
         except KeyboardInterrupt:
             interrupted = True
             error = "campaign:interrupted"
-        if error is None and mode == "all":
+        if error is None and mode in ("all", EXTERNAL_FARM_MODE):
             # Live execution is intentionally sequential.  Preparation may
             # produce the authenticated batch/topology handoff, but only the
             # lock-and-gate immediately around live_run owns the measurement.
@@ -1026,7 +1141,71 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
                     prep_names = {str(item["path"]) for item in _artifact_tree(prep_dir)}
                     if not {"batch-manifest.jsonl", "topology.json"}.issubset(prep_names):
                         raise CampaignError("live_prepare:required_artifact_missing")
-                if error is None:
+                if error is None and mode == EXTERNAL_FARM_MODE:
+                    refresh_record: dict[str, object] | None = None
+                    if external_authority_command is not None:
+                        try:
+                            authority_path, refresh_record = _authority_refresh(
+                                external_authority_command, cell, attempt_dir,
+                                timeout=external_authority_command_timeout)
+                        except CampaignError:
+                            refresh_path = attempt_dir / "external-authority-refresh.json"
+                            if refresh_path.is_file():
+                                status["external_farm_authority_refresh"] = _load_json(refresh_path)
+                                _replace_json(state_path, status)
+                            raise
+                        status["external_farm_authority_refresh"] = refresh_record
+                        _replace_json(state_path, status)
+                    else:
+                        try:
+                            authority_value: str | Path | None = (
+                                external_authority_provider(cell)
+                                if external_authority_provider is not None else external_authority_path)
+                        except Exception as exc:  # a provider must fail closed
+                            raise CampaignError("external_farm:authority_provider_failed") from exc
+                        if authority_value is None:
+                            raise CampaignError("external_farm:authority_required")
+                        authority_path = Path(authority_value)
+                    if not authority_path.is_absolute():
+                        raise CampaignError("external_farm:authority_absolute_required")
+                    authority_path = authority_path.absolute()
+                    try:
+                        authority_facts = _private_file(
+                            authority_path, "external_farm_authority")
+                        authority = external_farm_executor.load_authority(authority_path)
+                    except (CampaignError, external_farm_executor.ExternalFarmError, OSError) as exc:
+                        raise CampaignError(f"external_farm:authority_invalid:{exc}") from exc
+                    status["external_farm_authority"] = authority_facts
+                    _replace_json(state_path, status)
+                    live_argv = [str(item) for item in live_run["argv"]]  # type: ignore[index]
+                    live_out = Path(live_argv[live_argv.index("--output") + 1])
+                    plan_argv = [str(item) for item in plan_cmds[0]["argv"]]
+                    plan_path = Path(plan_argv[plan_argv.index("--out") + 1])
+                    repeat_plan = None
+                    if depth == "full":
+                        repeat_argv = [str(item) for item in plan_cmds[1]["argv"]]
+                        repeat_plan = Path(repeat_argv[repeat_argv.index("--out") + 1])
+                    factory = external_transport_factory or external_farm_executor.SSHTransport
+                    transport = factory(authority)
+                    cell_runner = (external_cell_runner or
+                                   external_farm_executor.execute_and_finalize_external_cell)
+                    try:
+                        with _live_run_lock(None):
+                            cell_runner(
+                                transport, topology=cell["topology"],
+                                relationship_hosts=None, profile=cell["profile"],
+                                batch_manifest=prep_dir / "batch-manifest.jsonl",
+                                predictive_plan=plan_path,
+                                topology_file=prep_dir / "topology.json",
+                                corpus=cell["corpus"], regime=cell["regime"],
+                                depth=depth, output=live_out,
+                                product_root=product_build_root,
+                                repeat_predictive_plan=repeat_plan,
+                                passes=2 if depth == "full" else 1,
+                                timestamp=stamp)
+                    except external_farm_executor.ExternalFarmError as exc:
+                        raise CampaignError(f"external_farm:{exc}") from exc
+                elif error is None:
                     assert container_temp_path is not None
                     with _live_run_lock(container_temp_path):
                         gate = idle_host_gate or _host_is_idle
@@ -1099,7 +1278,7 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
             try:
                 live_evidence = ({key: value for key, value in result.items()
                                   if key in {"live", "comparisons"}}
-                                 if mode == "all" and result is not None else {})
+                                 if mode in ("all", EXTERNAL_FARM_MODE) and result is not None else {})
                 segments: list[dict[str, Any]] = []
                 for result_dir in result_dirs:
                     result_dir = Path(result_dir)
@@ -1170,7 +1349,7 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
         # Update summary after each cell so a killed process can resume with a
         # truthful partial view.
         _replace_json(campaign / "summary.json", _summary(campaign, records, config))
-        if interrupted or (mode == "all" and error is not None):
+        if interrupted or (mode in ("all", EXTERNAL_FARM_MODE) and error is not None):
             # The failed/interrupted attempt is retained as-is.  Remaining
             # cells stay PENDING until an explicitly requested retry/resume.
             break
@@ -1208,10 +1387,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--container-image-id")
     parser.add_argument("--container-temp-root", type=Path)
     parser.add_argument("--simulator-authority", type=Path)
+    parser.add_argument("--external-farm-authority", type=Path,
+                        help="private authenticated authority for --mode external-farm")
+    parser.add_argument("--external-farm-authority-command", type=shlex.split,
+                        help="quoted argv template producing {output} authority before each external cell")
+    parser.add_argument("--external-farm-authority-command-timeout", type=float, default=900.0)
     parser.add_argument("--plan-only", action="store_true",
                         help="retain the full matrix and staged commands without executing predictive cells")
-    parser.add_argument("--mode", choices=("predictive-only", "all"), default="predictive-only",
-                        help="run predictive cells, or execute serialized live and comparison stages")
+    parser.add_argument("--mode", choices=("predictive-only", "all", EXTERNAL_FARM_MODE),
+                        default="predictive-only",
+                        help="run predictive cells, local live/comparison stages, or external-farm live/comparison stages")
     parser.add_argument("--repo", type=Path, default=Path.cwd())
     parser.add_argument("--python", default=sys.executable)
     args = parser.parse_args(argv)
@@ -1228,7 +1413,10 @@ def main(argv: list[str] | None = None) -> int:
                                 mode=args.mode, container_image=args.container_image,
                                 container_image_id=args.container_image_id,
                                 container_temp_root=args.container_temp_root,
-                                simulator_authority=args.simulator_authority)
+                                simulator_authority=args.simulator_authority,
+                                external_farm_authority=args.external_farm_authority,
+                                external_authority_command=args.external_farm_authority_command,
+                                external_authority_command_timeout=args.external_farm_authority_command_timeout)
     except CampaignError as exc:
         print(f"s8_campaign_driver: {exc}", file=sys.stderr)
         return 2

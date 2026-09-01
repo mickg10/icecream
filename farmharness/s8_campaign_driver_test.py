@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -497,6 +498,276 @@ def test_all_mode_refuses_heldout_corpus_even_with_other_inputs(tmp_path: Path) 
             **kwargs, mode="all", container_image_id="sha256:" + "a" * 64,
             container_temp_root=tmp_path, simulator_authority=tmp_path / "sim.json",
             timestamp="20260831T120023Z")
+
+
+def _external_test_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[
+        dict[str, object], Path]:
+    product = tmp_path / "product"
+    product.mkdir()
+    authority_path = tmp_path / "external-authority.json"
+    authority_path.write_text("fixture\n")
+    authority: dict[str, object] = {
+        "schema": "icecream-s8-external-farm-authority-v1",
+        "path": str(authority_path), "sha256": "a" * 64, "bytes": 8,
+        "placements": {"C1F1/100000": {"relationship_hosts": ["q2"]}},
+    }
+    monkeypatch.setattr(driver.external_farm_executor, "load_authority",
+                        lambda _path: authority)
+    return authority, authority_path
+
+
+def test_external_mode_executes_then_finalizes_and_authenticates_comparison(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _authority_value, authority_path = _external_test_setup(tmp_path, monkeypatch)
+    command_runner, calls = _all_runner_factory()
+    external_calls: list[dict[str, object]] = []
+    authority_requests: list[dict[str, str]] = []
+
+    def authority_provider(cell: dict[str, str]) -> Path:
+        authority_requests.append(cell.copy())
+        return authority_path
+
+    def external_runner(
+            _transport: object, *, topology: str, relationship_hosts: object,
+            profile: str, batch_manifest: Path, predictive_plan: Path,
+            topology_file: Path, corpus: str, regime: str, depth: str,
+            output: Path, product_root: Path,
+            repeat_predictive_plan: Path | None, passes: int,
+            timestamp: str | None, artifact_sample: int = 2,
+            retain_all_artifacts: bool = False) -> Path:
+        kwargs = {"topology": topology, "relationship_hosts": relationship_hosts,
+                  "profile": profile, "batch_manifest": batch_manifest,
+                  "predictive_plan": predictive_plan, "topology_file": topology_file,
+                  "corpus": corpus, "regime": regime, "depth": depth,
+                  "output": output, "product_root": product_root,
+                  "repeat_predictive_plan": repeat_predictive_plan, "passes": passes,
+                  "timestamp": timestamp, "artifact_sample": artifact_sample,
+                  "retain_all_artifacts": retain_all_artifacts}
+        external_calls.append(kwargs)
+        suite = topology.replace("/", "-")
+        target = output / "icecream" / suite / str(timestamp) / profile
+        target.mkdir(parents=True, exist_ok=True)
+        manifest = target / "live_curve_manifest.json"
+        manifest.write_text("{}\n")
+        return manifest
+
+    kwargs = _all_kwargs(tmp_path)
+    campaign = driver.run_campaign(
+        **kwargs, mode=driver.EXTERNAL_FARM_MODE,
+        external_authority_provider=authority_provider,
+        external_cell_runner=external_runner,
+        external_transport_factory=lambda value: {"authority": value},
+        command_runner=command_runner, timestamp="20260901T120000Z")
+    summary = json.loads((campaign / "summary.json").read_text())
+    assert summary["status"] == "PASS"
+    assert summary["counts"]["PASS"] == 16
+    assert calls[:3] == ["predictive_plan", "predictive_producer", "live_prepare"]
+    assert len(external_calls) == 16
+    assert len(authority_requests) == 16
+    state_path = next((campaign / "cells").glob("*/status.json"))
+    state = json.loads(state_path.read_text())
+    assert state["status"] == "PASS"
+    assert state["result"]["live"]["path"].endswith("live_curve_manifest.json")
+    assert state["result"]["comparisons"][0]["record_type"] == "comparison"
+    metadata = json.loads((campaign / "campaign.json").read_text())
+    assert metadata["config"]["mode"] == driver.EXTERNAL_FARM_MODE
+    assert metadata["config"]["external_farm_authority"] is None
+    assert metadata["config"]["external_authority_provider"] is True
+    assert metadata["external_farm_authority"] == "provider"
+    assert state["external_farm_authority"] == {
+        "path": str(authority_path), "bytes": 8,
+        "sha256": hashlib.sha256(authority_path.read_bytes()).hexdigest()}
+    commands = json.loads((state_path.parent / "attempt-001" / "commands.json").read_text())
+    assert commands["live"]["run"]["executable"] is False
+    assert commands["live"]["run"]["reason"] == "external farm adapter owns execution"
+    assert commands["comparison"][0]["executable"] is True
+    assert external_calls[0]["batch_manifest"]
+    assert external_calls[0]["predictive_plan"]
+    assert external_calls[0]["topology_file"]
+
+
+def test_external_static_authority_is_reloaded_and_stale_capture_fails_closed(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    authority, authority_path = _external_test_setup(tmp_path, monkeypatch)
+    loads: list[Path] = []
+
+    def load_authority(path: Path) -> dict[str, object]:
+        loads.append(path)
+        if len(loads) > 1:
+            raise driver.external_farm_executor.ExternalFarmError("authority:idle_stale")
+        return authority
+
+    monkeypatch.setattr(driver.external_farm_executor, "load_authority", load_authority)
+    command_runner, _ = _all_runner_factory()
+
+    def external_runner(_transport: object, **kwargs: object) -> Path:
+        output = Path(kwargs["output"])
+        target = (output / "icecream" / str(kwargs["topology"]).replace("/", "-") /
+                  str(kwargs["timestamp"]) / str(kwargs["profile"]))
+        target.mkdir(parents=True, exist_ok=True)
+        result = target / "live_curve_manifest.json"
+        result.write_text("{}\n")
+        return result
+
+    campaign = driver.run_campaign(
+        **_all_kwargs(tmp_path), mode=driver.EXTERNAL_FARM_MODE,
+        external_farm_authority=authority_path,
+        external_cell_runner=external_runner,
+        external_transport_factory=lambda value: {"authority": value},
+        command_runner=command_runner, timestamp="20260901T120000Z")
+    summary = json.loads((campaign / "summary.json").read_text())
+    assert len(loads) == 2
+    assert summary["counts"] == {
+        "FAIL": 1, "INTERRUPTED": 0, "PASS": 1, "PENDING": 14,
+        "RUNNING": 0, "STAGED": 0}
+
+
+def test_external_authority_command_refreshes_per_attempt_without_shell(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _authority_value, _static_authority_path = _external_test_setup(tmp_path, monkeypatch)
+    refresh_calls: list[list[str]] = []
+    original_run = driver.subprocess.run
+
+    def fake_run(argv: list[str], *args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if "--output" not in argv:
+            return original_run(argv, *args, **kwargs)
+        assert kwargs.get("shell") is not True
+        refresh_calls.append(argv)
+        output = Path(argv[argv.index("--output") + 1])
+        output.write_text("fixture authority\n")
+        return subprocess.CompletedProcess(argv, 0, "refresh stdout\n", "refresh stderr\n")
+
+    monkeypatch.setattr(driver.subprocess, "run", fake_run)
+    command_runner, _ = _all_runner_factory()
+
+    def external_runner(_transport: object, **kwargs: object) -> Path:
+        output = Path(kwargs["output"])
+        target = (output / "icecream" / str(kwargs["topology"]).replace("/", "-") /
+                  str(kwargs["timestamp"]) / str(kwargs["profile"]))
+        target.mkdir(parents=True, exist_ok=True)
+        result = target / "live_curve_manifest.json"
+        result.write_text("{}\n")
+        return result
+
+    campaign = driver.run_campaign(
+        **_all_kwargs(tmp_path), mode=driver.EXTERNAL_FARM_MODE,
+        external_authority_command=("python3", "authority.py", "--output", "{output}",
+                                     "--cell", "{cell}"),
+        external_cell_runner=external_runner,
+        external_transport_factory=lambda value: {"authority": value},
+        command_runner=command_runner, timestamp="20260901T120002Z")
+    assert len(refresh_calls) == 16
+    assert all("{output}" not in call and "{cell}" not in call for call in refresh_calls)
+    state_path = next((campaign / "cells").glob("*/status.json"))
+    state = json.loads(state_path.read_text())
+    attempt = state_path.parent / "attempt-001"
+    refresh = state["external_farm_authority_refresh"]
+    assert refresh["schema"] == driver.AUTHORITY_REFRESH_SCHEMA
+    assert refresh["returncode"] == 0
+    assert refresh["command"]["argv"][0] == "python3"
+    assert refresh["command"]["shell"] is False
+    assert refresh["command"]["cwd"] == str(attempt)
+    assert refresh["stdout"]["path"].endswith("external-authority-refresh.stdout")
+    assert refresh["stderr"]["path"].endswith("external-authority-refresh.stderr")
+    assert refresh["authority"]["path"].endswith("external-farm-authority.json")
+    assert state["external_farm_authority"]["path"].endswith("external-farm-authority.json")
+    assert (attempt / "external-authority-refresh.json").is_file()
+
+
+def test_external_mode_resume_keeps_failed_attempt_and_retries_explicitly(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _authority_value, authority_path = _external_test_setup(tmp_path, monkeypatch)
+    command_runner, _ = _all_runner_factory()
+    external_attempts: list[Path] = []
+
+    def failing_external(_transport: object, **kwargs: object) -> Path:
+        external_attempts.append(Path(kwargs["output"]))
+        raise driver.external_farm_executor.ExternalFarmError("fixture_failure")
+
+    kwargs = _all_kwargs(tmp_path)
+    campaign = driver.run_campaign(
+        **kwargs, mode=driver.EXTERNAL_FARM_MODE,
+        external_farm_authority=authority_path,
+        external_cell_runner=failing_external,
+        external_transport_factory=lambda value: {"authority": value},
+        command_runner=command_runner, timestamp="20260901T120001Z")
+    summary = json.loads((campaign / "summary.json").read_text())
+    assert summary["counts"]["FAIL"] == 1
+    assert summary["counts"]["PENDING"] == 15
+    failed_state_path = next(path for path in (campaign / "cells").glob("*/status.json")
+                             if json.loads(path.read_text())["status"] == "FAIL")
+    no_retry_runner, _ = _all_runner_factory()
+    resumed = driver.run_campaign(
+        **kwargs, mode=driver.EXTERNAL_FARM_MODE, resume=campaign,
+        external_farm_authority=authority_path,
+        external_cell_runner=failing_external,
+        external_transport_factory=lambda value: {"authority": value},
+        command_runner=no_retry_runner)
+    assert resumed == campaign
+    assert len(external_attempts) == 2
+    assert not failed_state_path.parent.joinpath("attempt-002").exists()
+
+    success_runner, _ = _all_runner_factory()
+
+    def successful_external(_transport: object, **kwargs: object) -> Path:
+        external_attempts.append(Path(kwargs["output"]))
+        output = Path(kwargs["output"])
+        target = (output / "icecream" / str(kwargs["topology"]).replace("/", "-") /
+                  str(kwargs["timestamp"]) / str(kwargs["profile"]))
+        target.mkdir(parents=True, exist_ok=True)
+        result = target / "live_curve_manifest.json"
+        result.write_text("{}\n")
+        return result
+
+    driver.run_campaign(
+        **kwargs, mode=driver.EXTERNAL_FARM_MODE, resume=campaign,
+        retry_failed=True, external_farm_authority=authority_path,
+        external_cell_runner=successful_external,
+        external_transport_factory=lambda value: {"authority": value},
+        command_runner=success_runner)
+    summary = json.loads((campaign / "summary.json").read_text())
+    assert summary["status"] == "PASS"
+    assert len(external_attempts) == 18
+    assert failed_state_path.parent.joinpath("attempt-001").is_dir()
+    assert failed_state_path.parent.joinpath("attempt-002").is_dir()
+    state = json.loads(failed_state_path.read_text())
+    assert state["status"] == "PASS"
+    assert any(item["status"] == "FAIL" for item in state["history"])
+
+
+def test_external_mode_requires_private_authority_and_product_root(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    kwargs = _kwargs(tmp_path, corpus="fmt", product_build_root=tmp_path / "product")
+    with pytest.raises(driver.CampaignError, match="authority_required"):
+        driver.run_campaign(**kwargs, mode=driver.EXTERNAL_FARM_MODE,
+                            timestamp="20260901T120002Z")
+    authority_path = tmp_path / "authority.json"
+    authority_path.write_text("fixture\n")
+    monkeypatch.setattr(driver.external_farm_executor, "load_authority",
+                        lambda _path: {})
+    with pytest.raises(driver.CampaignError, match="product_root_unavailable"):
+        driver.run_campaign(
+            **kwargs, mode=driver.EXTERNAL_FARM_MODE,
+            external_farm_authority=authority_path,
+            timestamp="20260901T120003Z")
+    assert not list((tmp_path / "experiments").glob("s8-campaign-*"))
+
+    product = tmp_path / "product"
+    product.mkdir()
+    with pytest.raises(driver.CampaignError, match="authority_sources_ambiguous"):
+        driver.run_campaign(
+            **_kwargs(tmp_path, corpus="fmt", product_build_root=product),
+            mode=driver.EXTERNAL_FARM_MODE,
+            external_farm_authority=authority_path,
+            external_authority_command=("python3", "authority.py", "--output", "{output}"),
+            timestamp="20260901T120004Z")
+    with pytest.raises(driver.CampaignError, match="authority_sources_ambiguous"):
+        driver.run_campaign(
+            **_kwargs(tmp_path, corpus="fmt", product_build_root=product),
+            mode=driver.EXTERNAL_FARM_MODE,
+            external_farm_authority=authority_path,
+            external_authority_provider=lambda _cell: authority_path,
+            timestamp="20260901T120005Z")
 
 
 def test_comparison_authentication_requires_normalizer_record(tmp_path: Path) -> None:
