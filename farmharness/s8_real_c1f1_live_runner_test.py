@@ -331,6 +331,23 @@ def test_per_tu_profile_evidence_is_required(tmp_path: Path) -> None:
         runner._validate_product_log_evidence(tmp_path, observation, "P29")
 
 
+def test_grz_residual_evidence_uses_declared_harness_profile(tmp_path: Path) -> None:
+    (tmp_path / "client-compile-full-1-0.log").write_text(
+        "GRZ_RESIDUAL\n")
+    (tmp_path / "f.log").write_text("CACHE_SESSION\n")
+    observation = [{"run": "full-1", "ordinal": 0,
+                    "planned_relationship": 0,
+                    "observed_f_service_identity": "p50-f"}]
+
+    # GRZ_RESIDUAL is the declared S8 identity; GRZ is only its product
+    # environment alias and must not become a separately accepted profile.
+    runner._validate_product_log_evidence(tmp_path, observation, "GRZ_RESIDUAL")
+    with pytest.raises(runner.LiveRunnerError, match="profile:undeclared"):
+        runner._validate_product_log_evidence(tmp_path, observation, "GRZ")
+    with pytest.raises(runner.LiveRunnerError, match="product_profile_evidence_missing"):
+        runner._validate_product_log_evidence(tmp_path, observation, "P29")
+
+
 def test_environment_preparation_requires_each_private_relationship(tmp_path: Path) -> None:
     work = tmp_path / "p50compilee2e.ready"
     work.mkdir()
@@ -1329,7 +1346,13 @@ def test_external_finalizer_propagates_scope_placement_and_authority(
     monkeypatch.setattr(runner, "_timing_rows", lambda *_args: [])
     monkeypatch.setattr(runner, "_batch_windows",
                         lambda *_args: {"full-1": {"start_ns": 1, "end_ns": 2}})
-    monkeypatch.setattr(runner, "_validate_product_log_evidence", lambda *_args: None)
+    validated_profiles: list[str] = []
+
+    def validate_product_log_evidence(*args: object) -> None:
+        validated_profiles.append(args[-1])
+
+    monkeypatch.setattr(runner, "_validate_product_log_evidence",
+                        validate_product_log_evidence)
     monkeypatch.setattr(runner, "_action_stage", lambda *_args: [])
     metadata = {"product_image_digest": "7" * 64, "toolchain_digest": "5" * 64,
                 "output_contract_digest": "6" * 64, "host_digest": "8" * 64,
@@ -1347,7 +1370,7 @@ def test_external_finalizer_propagates_scope_placement_and_authority(
     external = _external_input(tmp_path, manifest, authority, work, stdout)
     output = runner.finalize(
         "mutated caller text", 0, batch_manifest=batch_manifest, topology=topology,
-        predictive_plan=predictive_plan, output=tmp_path / "output", profile="ZSTD_TU",
+        predictive_plan=predictive_plan, output=tmp_path / "output", profile="GRZ_RESIDUAL",
         product_root=tmp_path, corpus="DuckDB", regime="cold", depth="full", full_count=1,
         passes=1, timestamp="20260831T000000Z", execution_environment="external_farm_product_build",
         external_farm=external)
@@ -1364,6 +1387,7 @@ def test_external_finalizer_propagates_scope_placement_and_authority(
     assert (output / "product-evidence" / "external-farm-authority.json").is_file()
     assert (output / "product-evidence" /
             "s7-measured-f-action-trace.jsonl").read_bytes() == b"f-action\n"
+    assert validated_profiles == ["GRZ_RESIDUAL"]
 
 
 def test_parallel_batch_window_requires_real_overlap() -> None:

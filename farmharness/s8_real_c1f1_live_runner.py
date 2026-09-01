@@ -2572,7 +2572,10 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     observations = _timing_rows(stdout, rows, work, passes, assignments, suite,
                                 reported_workdir)
     batch_windows = _batch_windows(stdout, observations, rows, passes, suite)
-    _validate_product_log_evidence(work, observations, effective_product_profile)
+    # Product execution uses the GRZ alias, but evidence is declared by the
+    # harness profile.  Keep the original profile here so GRZ_RESIDUAL stays
+    # distinct in identity and validation while product accounting remains GRZ.
+    _validate_product_log_evidence(work, observations, profile)
     calibration_metadata: dict[str, str] | None = None
     host_descriptor_binding: dict[str, object] | None = None
     role_placement: dict[str, object] | None = None
