@@ -10,6 +10,7 @@ import s8_method_matrix_simulator as simulator_module
 
 from s8_method_matrix_simulator import (
     CORE_METHODS,
+    DEFAULT_CLI_METHODS,
     MatrixError,
     MatrixTopology,
     MethodMatrixSimulator,
@@ -70,11 +71,94 @@ def test_real_c1f20_authority_covers_all_five_builds() -> None:
 
 def test_firefox_occurrence_keeps_global_dispatch_at_build_boundary() -> None:
     trace = Path("/tanksmall/scratch/ictmp/lo-s4-e50.G5KsGG/capability/distribution/firefox-corrected.compile-trace.tsv")
-    occurrence = firefox_occurrences(trace, count=1, dispatch_start=2498)[0]
+    occurrence = firefox_occurrences(trace, topology_id="C1F20/40", count=1,
+                                     dispatch_start=2498)[0]
     assert occurrence.ordinal == 2498
     assert occurrence.source_build == 1
     assert occurrence.source_logical == 0
     assert occurrence.raw is None
+
+
+def test_firefox_loader_uses_requested_topology_at_repeat_boundary(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "unit.ii"
+    source.write_bytes(b"x")
+    trace = tmp_path / "trace.tsv"
+    trace.write_text("logical\tjob_id\tii_relative\tactual_input\traw_bytes\n"
+                     "0\tjob\tunit.ii\tactual\t1\n")
+    manifest = tmp_path / "manifest.txt"
+    manifest.write_text("unit.ii\n")
+    monkeypatch.setattr(simulator_module, "AUTH_TRACE_SHA256",
+                        hashlib.sha256(trace.read_bytes()).hexdigest())
+    monkeypatch.setattr(simulator_module, "AUTH_CORPUS_MANIFEST_SHA256",
+                        hashlib.sha256(manifest.read_bytes()).hexdigest())
+    calls: list[tuple[str, int, int]] = []
+
+    def assignment(topology_id: str, count: int, *, start: int = 0) -> dict[str, object]:
+        calls.append((topology_id, count, start))
+        return {"rows": [{"authority_logical": 0, "dispatch_order": 2498,
+                           "authority_build": 1}], "selected_count": count,
+                "topology": topology_id}
+
+    monkeypatch.setattr(simulator_module, "_authenticated_assignment", assignment)
+    rows = firefox_occurrences(trace, topology_id="C1F20/40", count=1,
+                               dispatch_start=2498, corpus_root=tmp_path,
+                               corpus_manifest=manifest)
+    assert calls == [("C1F20/40", 1, 2498)]
+    assert rows[0].ordinal == 2498
+    assert rows[0].source_build == 1
+    assert rows[0].source_logical == 0
+
+
+def test_cli_method_selection_is_stable_duplicate_free_and_core_default() -> None:
+    assert DEFAULT_CLI_METHODS == (
+        "RAW_II", "ZSTD_TU", "P29", "GRZ_RESIDUAL", "ZSTD_ROUTE")
+    assert simulator_module._validate_method_selection(DEFAULT_CLI_METHODS) == DEFAULT_CLI_METHODS
+    with pytest.raises(MatrixError, match="duplicates"):
+        simulator_module._validate_method_selection(("RAW_II", "RAW_II"))
+    with pytest.raises(MatrixError, match="one or more"):
+        simulator_module._validate_method_selection(())
+
+
+def test_not_ready_canary_retains_only_selected_methods(tmp_path: Path) -> None:
+    experiment = write_not_ready_canary(
+        tmp_path, tmp_path / "missing.tsv", topology=MatrixTopology.from_id("C1F1/100000"),
+        count=100, reason="missing", methods=DEFAULT_CLI_METHODS)
+    manifest = json.loads((experiment / "manifest.json").read_text())
+    assert manifest["methods"] == list(DEFAULT_CLI_METHODS)
+
+
+def test_cli_threads_topology_and_methods_into_not_ready_path(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    loader_calls: list[tuple[str, int, int]] = []
+    canary_methods: list[tuple[str, ...]] = []
+
+    def no_inputs(trace: Path, *, topology_id: str, count: int,
+                  dispatch_start: int, **kwargs: object) -> list[Occurrence]:
+        loader_calls.append((topology_id, count, dispatch_start))
+        return []
+
+    def canary(*args: object, methods: tuple[str, ...], **kwargs: object) -> Path:
+        canary_methods.append(methods)
+        return tmp_path / f"canary-{len(canary_methods)}"
+
+    monkeypatch.setattr(simulator_module, "firefox_occurrences", no_inputs)
+    monkeypatch.setattr(simulator_module, "write_not_ready_canary", canary)
+    assert simulator_module.main([
+        "--firefox-trace", str(tmp_path / "trace.tsv"), "--output-root", str(tmp_path),
+        "--depth", "100", "--methods", "RAW_II", "ZSTD_TU",
+    ]) == 0
+    assert loader_calls == [("C1F1/100000", 100, 0), ("C1F20/40", 100, 0)]
+    assert canary_methods == [("RAW_II", "ZSTD_TU"), ("RAW_II", "ZSTD_TU")]
+    capsys.readouterr()
+
+
+def test_cli_rejects_duplicate_methods(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit, match="2"):
+        simulator_module.main([
+            "--firefox-trace", str(tmp_path / "trace.tsv"),
+            "--methods", "RAW_II", "RAW_II",
+        ])
 
 
 def test_route_uses_fresh_frames_and_only_commit_advances_prefix(tmp_path: Path) -> None:

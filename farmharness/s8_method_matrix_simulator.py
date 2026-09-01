@@ -12,6 +12,10 @@ one level-3 frame is made for every TU, with a bounded committed raw prefix
 used as the frame prefix.  A failed/tentative occurrence never advances that
 prefix.  Cohort and global are kept separate from route and fail closed unless
 their own authority is supplied.
+
+The command-line runner measures the five core methods by default.  Optional
+methods can be requested explicitly with ``--methods``; the selection is
+ordered, duplicate-free, and is retained in NOT_READY canaries.
 """
 
 from __future__ import annotations
@@ -37,6 +41,7 @@ OCCURRENCE_SCHEMA = "icecream-s8-method-occurrence-v1"
 SUMMARY_SCHEMA = "icecream-s8-method-matrix-summary-v1"
 METHODS = ("RAW_II", "ZSTD_TU", "P29", "GRZ_RESIDUAL", "ZSTD_ROUTE",
            "ZSTD_COHORT", "ZSTD_GLOBAL")
+DEFAULT_CLI_METHODS = ("RAW_II", "ZSTD_TU", "P29", "GRZ_RESIDUAL", "ZSTD_ROUTE")
 READY_METHODS = frozenset(("RAW_II", "ZSTD_TU", "ZSTD_ROUTE"))
 CORE_METHODS = frozenset(("RAW_II", "ZSTD_TU", "P29", "GRZ_RESIDUAL", "ZSTD_ROUTE"))
 STATEFUL_METHODS = frozenset(("ZSTD_ROUTE", "P29", "GRZ_RESIDUAL"))
@@ -69,6 +74,16 @@ class MatrixError(ValueError):
 
 class NotReady(MatrixError):
     """A method was requested without its independent authority."""
+
+
+def _validate_method_selection(methods: Iterable[str]) -> tuple[str, ...]:
+    selected = tuple(methods)
+    if not selected or any(not isinstance(method, str) or method not in METHODS
+                           for method in selected):
+        raise MatrixError("methods must contain one or more known method names")
+    if len(selected) != len(set(selected)):
+        raise MatrixError("methods must not contain duplicates")
+    return selected
 
 
 def _sha256(data: bytes) -> str:
@@ -1341,10 +1356,20 @@ def verify_experiment(experiment: Path) -> dict[str, object]:
             "input_facts": input_facts}
 
 
-def firefox_occurrences(trace: Path, *, count: int = 100, dispatch_start: int = 0,
+def firefox_occurrences(trace: Path, *, topology_id: str | None = None,
+                        topology: MatrixTopology | str | None = None,
+                        count: int = 100, dispatch_start: int = 0,
                         corpus_root: Path = AUTH_CORPUS_ROOT,
                         corpus_manifest: Path = AUTH_CORPUS_MANIFEST) -> list[Occurrence]:
     """Load Firefox inputs only after trace, corpus, and every file authenticate."""
+    if topology is not None:
+        selected_topology = (topology.topology_id if isinstance(topology, MatrixTopology)
+                             else str(topology))
+        if topology_id is not None and topology_id != selected_topology:
+            raise MatrixError("topology identity arguments disagree")
+        topology_id = selected_topology
+    if topology_id not in TOPOLOGY_IDS:
+        raise MatrixError("firefox occurrence loader requires an explicit topology authority")
     if type(count) is not int or count <= 0 or type(dispatch_start) is not int or dispatch_start < 0:
         raise MatrixError("requested count must be positive")
     trace_raw, trace_facts_full = _private_bytes(trace, "trace")
@@ -1407,7 +1432,7 @@ def firefox_occurrences(trace: Path, *, count: int = 100, dispatch_start: int = 
     # Join the authenticated global dispatch authority to trace logical rows.
     # This supports build boundaries and repeat-full without treating a
     # logical reset as a new dispatch identity.
-    authority = _authenticated_assignment("C1F1/100000", count, start=dispatch_start)
+    authority = _authenticated_assignment(topology_id, count, start=dispatch_start)
     result: list[Occurrence] = []
     for item in authority["rows"]:  # type: ignore[union-attr]
         logical = int(item["authority_logical"])
@@ -1426,7 +1451,8 @@ def firefox_occurrences(trace: Path, *, count: int = 100, dispatch_start: int = 
 
 def write_not_ready_canary(output_root: Path, trace: Path, *, topology: MatrixTopology,
                            count: int, reason: str, depth: str | None = None,
-                           pass_id: str | None = None) -> Path:
+                           pass_id: str | None = None,
+                           methods: Iterable[str] = METHODS) -> Path:
     """Write an immutable readiness experiment when Firefox inputs are absent."""
     run_timestamp = _stamp()
     depth_label = depth or f"count-{count}"
@@ -1440,18 +1466,20 @@ def write_not_ready_canary(output_root: Path, trace: Path, *, topology: MatrixTo
         suffix += 1
     experiment.mkdir(parents=True, exist_ok=False)
     (experiment / "occurrences.jsonl").write_bytes(b"")
-    authority = {method: method_authority(method) for method in METHODS}
+    selected_methods = tuple(methods)
+    _validate_method_selection(selected_methods)
+    authority = {method: method_authority(method) for method in selected_methods}
     manifest = {"schema": SCHEMA, "status": "NOT_READY", "topology": {
         "id": topology.topology_id, "relationship_count": topology.relationship_count,
         "slots_per_f": topology.slots_per_f, "global_slots": topology.global_slots},
-        "methods": list(METHODS), "input_authority": {"trace": str(trace),
+        "methods": list(selected_methods), "input_authority": {"trace": str(trace),
         "trace_exists": trace.is_file(), "requested_tus": count}, "authority": authority,
         "reason": reason, "run_identity": {"timestamp": run_timestamp,
         "topology": topology.topology_id, "depth": depth_label, "pass": pass_label}}
     (experiment / "manifest.json").write_bytes(_canonical(manifest))
     (experiment / "summary.json").write_bytes(_canonical({
         "schema": SUMMARY_SCHEMA, "status": "NOT_READY", "experiment": str(experiment),
-        "reason": reason, "method_status": {method: authority[method]["status"] for method in METHODS},
+        "reason": reason, "method_status": {method: authority[method]["status"] for method in selected_methods},
         "relationship_count": topology.relationship_count, "occurrence_rows": 0}))
     artifacts = {}
     for path in (experiment / "occurrences.jsonl", experiment / "summary.json"):
@@ -1624,11 +1652,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--output-root", type=Path, default=Path("experiments"))
     parser.add_argument("--count", type=int, default=100)
     parser.add_argument("--depth", choices=("100", "200", "full-1", "state-carrying-full-2"))
+    parser.add_argument("--methods", nargs="+", default=list(DEFAULT_CLI_METHODS),
+                        metavar="METHOD")
     parser.add_argument("--full-1-experiment-c1f1", type=Path)
     parser.add_argument("--full-1-experiment-c1f20", type=Path)
     args = parser.parse_args(argv)
     if args.firefox_trace is None:
         parser.error("--firefox-trace is required")
+    try:
+        methods = _validate_method_selection(args.methods)
+    except MatrixError as exc:
+        parser.error(str(exc))
     if args.depth == "state-carrying-full-2" and not (
             args.full_1_experiment_c1f1 and args.full_1_experiment_c1f20):
         parser.error("state-carrying-full-2 requires topology-specific predecessor experiments")
@@ -1638,7 +1672,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         topology = MatrixTopology.from_id(topology_id)
         try:
             dispatch_start = 2498 if args.depth == "state-carrying-full-2" else 0
-            occurrences = firefox_occurrences(args.firefox_trace, count=count,
+            occurrences = firefox_occurrences(args.firefox_trace, topology_id=topology_id,
+                                               count=count,
                                                dispatch_start=dispatch_start)
             if args.depth == "state-carrying-full-2":
                 predecessor_path = {"C1F1/100000": args.full_1_experiment_c1f1,
@@ -1648,7 +1683,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 current_authority = _authenticated_assignment(
                     topology_id, count, start=dispatch_start)
                 path = MethodMatrixSimulator(
-                    topology, assignment_authority=current_authority).run(
+                    topology, methods=methods, assignment_authority=current_authority).run(
                         occurrences, output_root=args.output_root, repeat_full=True,
                         prior_state=prior_state, predecessor_occurrences=predecessor,
                         predecessor_assignment_authority=predecessor_authority,
@@ -1665,11 +1700,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                                           topology=topology, count=count,
                                           reason="MISSING_AUTHORITY: " + (reason or
                                               "authenticated Firefox .ii inputs are unavailable"),
-                                          depth=args.depth or f"count-{count}")
+                                          depth=args.depth or f"count-{count}", methods=methods)
             print(path)
             continue
-        path = MethodMatrixSimulator(topology).run(occurrences, output_root=args.output_root,
-                                                  depth=args.depth or f"count-{count}")
+        path = MethodMatrixSimulator(topology, methods=methods).run(
+            occurrences, output_root=args.output_root,
+            depth=args.depth or f"count-{count}")
         assert isinstance(path, Path)
         print(path)
     return 0
