@@ -74,7 +74,7 @@ case "${4:-}" in
             icecc|icecc-create-env|iceccd|iceccd-competing|icecc-scheduler|icecc-scheduler-competing|libicecc.a|icecc.pc|icecc.pc-competing|image-digest|package-inventory|build-log) ;;
             *) echo "unknown --corrupt-control artifact: $CORRUPT_ARTIFACT" >&2
                exit 2 ;;
-        esac
+    esac
         ;;
     "") ;;
     *) echo "unknown 4th argument: ${4}" >&2; exit 2 ;;
@@ -135,11 +135,104 @@ if [ "$DISTRO" = ubuntu24 ] && [ -n "${S1B_APT_CACHE:-}" ]; then
             exit 2
             ;;
     esac
-    mkdir -p "$S1B_APT_CACHE/lists" "$S1B_APT_CACHE/archives"
+    case "$S1B_APT_CACHE" in
+        */|*//*)
+            echo "FAIL: S1B_APT_CACHE is not canonically spelled" >&2
+            exit 2
+            ;;
+    esac
+    # The cache is mounted into a root container and is also used as a
+    # host-side write target.  Lexical checks alone permit an alias such as
+    # /tmp/cache-link -> /some/other/tree (and a symlink in lists/archives),
+    # so inspect every existing component before creating anything.  Reject
+    # dot components too: they make the operator-supplied spelling differ
+    # from the canonical path whose ownership is being checked.
+    cache_walk=/
+    cache_remaining=${S1B_APT_CACHE#/}
+    while [ -n "$cache_remaining" ]; do
+        case "$cache_remaining" in
+            */*)
+                cache_part=${cache_remaining%%/*}
+                cache_remaining=${cache_remaining#*/}
+                ;;
+            *)
+                cache_part=$cache_remaining
+                cache_remaining=
+                ;;
+        esac
+        case "$cache_part" in
+            '') continue ;;
+            .)
+                echo "FAIL: S1B_APT_CACHE contains a dot path component" >&2
+                exit 2
+                ;;
+            ..)
+                echo "FAIL: S1B_APT_CACHE contains a dot-dot path component" >&2
+                exit 2
+                ;;
+        esac
+        cache_walk=$cache_walk$cache_part
+        if [ -L "$cache_walk" ]; then
+            echo "FAIL: S1B_APT_CACHE contains a symlink component: $cache_walk" >&2
+            exit 2
+        fi
+        if [ -e "$cache_walk" ] && [ ! -d "$cache_walk" ]; then
+            echo "FAIL: S1B_APT_CACHE component is not a directory: $cache_walk" >&2
+            exit 2
+        fi
+        cache_walk=$cache_walk/
+    done
+    cache_existing=$S1B_APT_CACHE
+    while [ ! -e "$cache_existing" ] && [ "$cache_existing" != / ]; do
+        cache_existing=${cache_existing%/*}
+        [ -n "$cache_existing" ] || cache_existing=/
+    done
+    cache_canonical_parent=$(readlink -f -- "$cache_existing" 2>/dev/null) || {
+        echo "FAIL: S1B_APT_CACHE parent cannot be canonicalized" >&2
+        exit 2
+    }
+    [ -d "$cache_canonical_parent" ] || {
+        echo "FAIL: S1B_APT_CACHE canonical parent is not a directory" >&2
+        exit 2
+    }
+    for cache_entry in "$S1B_APT_CACHE/lists" "$S1B_APT_CACHE/archives"; do
+        if [ -L "$cache_entry" ]; then
+            echo "FAIL: S1B_APT_CACHE entry is a symlink: $cache_entry" >&2
+            exit 2
+        fi
+        if [ -e "$cache_entry" ] && [ ! -d "$cache_entry" ]; then
+            echo "FAIL: S1B_APT_CACHE entry is not a directory: $cache_entry" >&2
+            exit 2
+        fi
+    done
     APT_NO_CLEAN="$S1B_APT_CACHE/docker-clean"
+    if [ -L "$APT_NO_CLEAN" ] ||
+       { [ -e "$APT_NO_CLEAN" ] && [ ! -f "$APT_NO_CLEAN" ]; }; then
+        echo "FAIL: S1B_APT_CACHE docker-clean must be a regular file, not a symlink or directory" >&2
+        exit 2
+    fi
+    mkdir -p "$S1B_APT_CACHE/lists" "$S1B_APT_CACHE/archives"
+    cache_canonical=$(readlink -f -- "$S1B_APT_CACHE" 2>/dev/null) || {
+        echo "FAIL: S1B_APT_CACHE cannot be canonicalized after creation" >&2
+        exit 2
+    }
+    if [ "$cache_canonical" != "$S1B_APT_CACHE" ]; then
+        echo "FAIL: S1B_APT_CACHE canonical path differs from requested path" >&2
+        exit 2
+    fi
+    for cache_entry in "$S1B_APT_CACHE/lists" "$S1B_APT_CACHE/archives"; do
+        if [ -L "$cache_entry" ] || [ ! -d "$cache_entry" ]; then
+            echo "FAIL: S1B_APT_CACHE entry changed during creation: $cache_entry" >&2
+            exit 2
+        fi
+    done
     if [ ! -e "$APT_NO_CLEAN" ]; then
         printf '%s\n' '# Gate-owned cache: replace the image cleanup hook so downloaded .debs survive for later rows.' > "$APT_NO_CLEAN"
     fi
+    [ -f "$APT_NO_CLEAN" ] && [ ! -L "$APT_NO_CLEAN" ] || {
+        echo "FAIL: S1B_APT_CACHE docker-clean changed to a non-regular file" >&2
+        exit 2
+    }
     APT_CACHE_MOUNTS="-v $S1B_APT_CACHE/lists:/var/lib/apt/lists -v $S1B_APT_CACHE/archives:/var/cache/apt/archives -v $APT_NO_CLEAN:/etc/apt/apt.conf.d/docker-clean:ro"
     [ "${S1B_APT_CACHE_READY:-false}" = true ] && APT_CACHE_READY=true
 fi

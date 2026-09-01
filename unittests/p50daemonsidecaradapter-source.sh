@@ -140,7 +140,7 @@ mutant_sidecar_records() {
     runtime_root=$1
     if test -n "${interruption_ready_trace:-}" && \
             test -s "$interruption_ready_trace"; then
-        process_pid=$(sed -n 's/.* pid=\([0-9][0-9]*\) .*/\1/p' \
+        process_pid=$(sed -n 's/^pid=\([0-9][0-9]*\)$/\1/p' \
             "$interruption_ready_trace" | tail -1)
         if test -n "$process_pid"; then
             mutant_sidecar_record_for_pid "$runtime_root" "$process_pid" && return 0

@@ -21,6 +21,7 @@ TESTS += p50sidecarlifecycle p50sidecarlifecycle-source.sh p50sidecarlifecycle-m
 TESTS += p50connectionprovenance
 TESTS += p50daemonsidecaradapter
 TESTS += p50daemonsidecaradapter-source.sh
+TESTS += s1bcachepath-source.sh
 TESTS += p50daemonsidecaradapter-sanitize.sh
 TESTS += p50daemonpositive-source.sh p50daemonpositive-run.sh
 TESTS += p50inputfd-source.sh p50inputfd-sanitize.sh
@@ -486,6 +487,7 @@ EXTRA_DIST += p50s2restartreplay-source.sh p50_s2_restart_replay_sanitize.sh
 EXTRA_DIST += p50sidecarsupervisor-sanitize.sh p50sidecarlifecycle-source.sh \
 	p50sidecarlifecycle-mutants.sh p50sidecarlifecycle-sanitize.sh
 EXTRA_DIST += p50daemonsidecaradapter-source.sh p50daemonsidecaradapter-sanitize.sh
+EXTRA_DIST += s1bcachepath-source.sh
 EXTRA_DIST += p50profile-source.sh p50_profile_sanitize.sh
 EXTRA_DIST += p50compilee2e-source.sh p50compilee2e-run.sh p50profile-selection-source.sh
 EXTRA_DIST += p50completionflow-source.py
