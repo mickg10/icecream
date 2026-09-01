@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import copy
 from pathlib import Path
 
 import pytest
@@ -136,6 +137,64 @@ def test_full2_mismatched_predecessor_stays_not_proven(tmp_path: Path) -> None:
     output = report.build_report([experiment], tmp_path / "reports")
     rows = [json.loads(line) for line in (output / "results.jsonl").read_text().splitlines()]
     assert {row["full2_continuity"]["status"] for row in rows} == {"NOT_PROVEN"}
+
+
+@pytest.mark.parametrize("mutation", ("omit_next", "zero_next", "wrong_last_type"))
+def test_full2_current_state_marker_omission_partial_and_type_stay_not_proven(
+        monkeypatch: pytest.MonkeyPatch, mutation: str) -> None:
+    topology = "C1F1/100000"
+    key = "C0|F0"
+    prefix = b"prior"
+    prefix_hex = prefix.hex()
+    prefix_digest = simulator._digest128(prefix)
+    prior_state = {"native_last_tu_seq": 4, "native_next_rel_seq": 5,
+                   "native_state_digest": "a" * 32, "history_nonce": 1,
+                   "route_identity": "C0->F0", "committed_raw_prefix": prefix_hex,
+                   "committed_raw_prefix_bytes": len(prefix),
+                   "committed_raw_prefix_digest": prefix_digest}
+    after_state = {"native_last_tu_seq": 5, "native_next_rel_seq": 6,
+                   "native_state_digest": "b" * 32, "history_nonce": 1,
+                   "route_identity": "C0->F0", "committed_raw_prefix": (prefix + b"next").hex(),
+                   "committed_raw_prefix_bytes": len(prefix) + 4,
+                   "committed_raw_prefix_digest": simulator._digest128(prefix + b"next")}
+    predecessor_path = "/tmp/s8-full1-fixture"
+    predecessor_identity = {"timestamp": "20260901T120000Z", "topology": topology,
+                            "depth": "full-1", "pass": "full-1"}
+    assignment = {"topology": topology, "rows": []}
+    predecessor_manifest = {"schema": simulator.SCHEMA, "experiment": "s8-full1-fixture",
+                            "repeat_full": False, "topology": {"id": topology},
+                            "run_identity": predecessor_identity,
+                            "input_authority": {"selected_inputs": []},
+                            "assignment_authority": assignment}
+    predecessor_summary = {"schema": simulator.SUMMARY_SCHEMA,
+                           "topology": {"id": topology},
+                           "relationships": {method: {key: copy.deepcopy(prior_state)}
+                                             for method in ("ZSTD_ROUTE", "P29", "GRZ_RESIDUAL")}}
+    monkeypatch.setattr(simulator, "verify_experiment", lambda path: {
+        "experiment": predecessor_path, "manifest": predecessor_manifest,
+        "summary": predecessor_summary, "manifest_facts": {"sha256": "c" * 64}})
+    manifest = {"repeat_full": True, "predecessor_input_authority": {
+        "experiment": predecessor_path, "manifest_sha256": "c" * 64,
+        "run_identity": predecessor_identity, "selected_inputs": [],
+        "assignment": assignment}, "assignment_authority": {"topology": topology}}
+    summary = {"relationships": {method: {key: copy.deepcopy(after_state)}
+                                  for method in ("ZSTD_ROUTE", "P29", "GRZ_RESIDUAL")}}
+    rows = [{"method": method, "relationship_key": ["C0", "F0"],
+             "native_tu_seq": 5, "native_state_before_digest": "a" * 32,
+             "product_transaction": {"history_nonce": 1, "route_identity": "C0->F0",
+                                      "committed_raw_prefix": prefix_hex,
+                                      "committed_raw_prefix_bytes": len(prefix),
+                                      "committed_raw_prefix_digest": prefix_digest}}
+            for method in ("ZSTD_ROUTE", "P29", "GRZ_RESIDUAL")]
+    if mutation == "omit_next":
+        del summary["relationships"]["P29"][key]["native_next_rel_seq"]
+    elif mutation == "zero_next":
+        summary["relationships"]["GRZ_RESIDUAL"][key]["native_next_rel_seq"] = 0
+    else:
+        summary["relationships"]["ZSTD_ROUTE"][key]["native_last_tu_seq"] = "5"
+    marker = report._full2_marker(manifest, summary, rows, topology,
+                                  "state-carrying-full-2")
+    assert marker["status"] == "NOT_PROVEN"
 
 
 def test_ratio_zero_denominator_and_wire_witness_control() -> None:

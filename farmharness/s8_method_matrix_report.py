@@ -72,6 +72,22 @@ def _valid_digest(value: object) -> bool:
             re.fullmatch(r"[0-9a-f]{32}", value) is not None)
 
 
+def _route_prefix(state: Mapping[str, Any]) -> bytes | None:
+    prefix = state.get("committed_raw_prefix")
+    if not isinstance(prefix, str) or re.fullmatch(r"[0-9a-f]*", prefix) is None:
+        return None
+    try:
+        raw = bytes.fromhex(prefix)
+    except ValueError:
+        return None
+    if (type(state.get("committed_raw_prefix_bytes")) is not int or
+            state["committed_raw_prefix_bytes"] != len(raw) or
+            not _valid_digest(state.get("committed_raw_prefix_digest")) or
+            state["committed_raw_prefix_digest"] != simulator._digest128(raw)):
+        return None
+    return raw
+
+
 def _sha256(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
@@ -258,14 +274,34 @@ def _full2_marker(manifest: Mapping[str, Any], summary: Mapping[str, Any],
             before = prior_state[key]
             after = current_state[key]
             if (not isinstance(before, Mapping) or not isinstance(after, Mapping) or
+                    type(before.get("native_last_tu_seq")) is not int or
                     type(before.get("native_next_rel_seq")) is not int or
+                    before["native_last_tu_seq"] + 1 != before["native_next_rel_seq"] or
+                    before["native_next_rel_seq"] <= 0 or
                     not _valid_digest(before.get("native_state_digest")) or
                     type(before.get("history_nonce")) is not int or
+                    before["history_nonce"] <= 0 or
                     not isinstance(before.get("route_identity"), str) or
+                    not before["route_identity"] or
                     type(after.get("native_last_tu_seq")) is not int or
+                    type(after.get("native_next_rel_seq")) is not int or
+                    after["native_last_tu_seq"] + 1 != after["native_next_rel_seq"] or
+                    after["native_next_rel_seq"] <= 0 or
                     not _valid_digest(after.get("native_state_digest")) or
+                    type(after.get("history_nonce")) is not int or
+                    after["history_nonce"] <= 0 or
+                    not isinstance(after.get("route_identity"), str) or
+                    not after["route_identity"] or
+                    after["history_nonce"] != before["history_nonce"] or
+                    after["route_identity"] != before["route_identity"] or
                     after["native_last_tu_seq"] < before["native_next_rel_seq"]):
                 return _not_proven(f"{method.lower()}_native_state_marker_missing")
+            before_prefix = after_prefix = None
+            if method == "ZSTD_ROUTE":
+                before_prefix = _route_prefix(before)
+                after_prefix = _route_prefix(after)
+                if before_prefix is None or after_prefix is None:
+                    return _not_proven("zstd_route_prefix_marker_missing")
             row = first_rows.get((method, tuple(key.split("|", 1))))
             if (row is None or row.get("method") != method or
                     row.get("native_tu_seq") != before["native_next_rel_seq"] or
@@ -277,13 +313,9 @@ def _full2_marker(manifest: Mapping[str, Any], summary: Mapping[str, Any],
                     transaction.get("route_identity") != before["route_identity"]):
                 return _not_proven(f"{method.lower()}_route_identity_successor_mismatch")
             if method == "ZSTD_ROUTE":
-                try:
-                    prefix = bytes.fromhex(str(after.get("committed_raw_prefix", "")))
-                except ValueError:
-                    return _not_proven("zstd_route_prefix_marker_missing")
-                if after.get("committed_raw_prefix_bytes") != len(prefix):
-                    return _not_proven("zstd_route_prefix_marker_missing")
-                if transaction.get("committed_raw_prefix") != before.get("committed_raw_prefix"):
+                if (transaction.get("committed_raw_prefix") != before.get("committed_raw_prefix") or
+                        transaction.get("committed_raw_prefix_bytes") != len(before_prefix or b"") or
+                        transaction.get("committed_raw_prefix_digest") != before.get("committed_raw_prefix_digest")):
                     return _not_proven("zstd_route_prefix_successor_mismatch")
     return {"status": "CONTINUOUS", "predecessor_bound": True,
             "relationship_state_present": True,
@@ -453,7 +485,8 @@ def _method_result(experiment: Path, manifest: Mapping[str, Any], summary: Mappi
 
 
 def _load_experiment(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any],
-                                          dict[str, Any], tuple[str, str, str], str]:
+                                          dict[str, Any], tuple[str, str, str], str,
+                                          dict[str, Any]]:
     path = path.absolute()
     try:
         root_info = path.lstat()
@@ -517,7 +550,7 @@ def _load_experiment(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]], 
     marker = _full2_marker(manifest, summary, [dict(row) for row in occurrences],
                            str(topology), str(depth))
     return (dict(manifest), [dict(row) for row in occurrences], dict(summary), grouped,
-            (str(topology), str(depth), pass_id), str(manifest_facts["sha256"]))
+            (str(topology), str(depth), pass_id), str(manifest_facts["sha256"]), marker)
 
 
 def build_report(experiments: Sequence[Path], output_root: Path) -> Path:
@@ -527,12 +560,11 @@ def build_report(experiments: Sequence[Path], output_root: Path) -> Path:
     seen_keys: set[tuple[str, str, str]] = set()
     sources: list[dict[str, Any]] = []
     for path in experiments:
-        manifest, _occurrences, summary, grouped, identity, manifest_sha256 = _load_experiment(path)
+        manifest, _occurrences, summary, grouped, identity, manifest_sha256, marker = _load_experiment(path)
         if identity in seen_keys:
             raise ReportError("duplicate_experiment_key:" + "/".join(identity))
         seen_keys.add(identity)
         topology, depth, pass_id = identity
-        marker = _full2_marker(manifest, summary, _occurrences, topology, depth)
         sources.append({"experiment": str(path.absolute()), "manifest_sha256": manifest_sha256,
                         "run_identity": {"topology": topology, "depth": depth, "pass": pass_id}})
         records.extend(_method_result(path.absolute(), manifest, summary, grouped, method,

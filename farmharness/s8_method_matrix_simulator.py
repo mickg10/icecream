@@ -1103,7 +1103,8 @@ class MethodMatrixSimulator:
                                 "route_identity": f"{key[0]}->{key[1]}"})
             if method == "ZSTD_ROUTE":
                 transaction.update({"committed_raw_prefix": state.history.hex(),
-                                    "committed_raw_prefix_bytes": len(state.history)})
+                                    "committed_raw_prefix_bytes": len(state.history),
+                                    "committed_raw_prefix_digest": _digest128(state.history)})
             row["product_transaction"] = transaction
             state.native_last_tu_seq = int(product["tu_seq"])
             state.native_state_digest = str(product["state_digest"])
@@ -1158,6 +1159,7 @@ class MethodMatrixSimulator:
                 if method == "ZSTD_ROUTE":
                     transaction["committed_raw_prefix"] = state.history.hex()
                     transaction["committed_raw_prefix_bytes"] = len(state.history)
+                    transaction["committed_raw_prefix_digest"] = _digest128(state.history)
         post = _sha256(_canonical({"history": state.history.hex(), "next_rel_seq": state.next_rel_seq,
                                    "route_id": state.last_route_id, "nonce": state.history_nonce}))
         row["post_state_digest"] = post
@@ -1208,6 +1210,7 @@ class MethodMatrixSimulator:
         relationships = {
             method: {"|".join(key): {"next_rel_seq": state.next_rel_seq,
                 "committed_raw_prefix": state.history.hex(),
+                "committed_raw_prefix_digest": _digest128(state.history),
                 "history_nonce": state.history_nonce,
                 "route_identity": state.last_route_id,
                 "committed_raw_prefix_bytes": len(state.history),
