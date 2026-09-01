@@ -9,6 +9,23 @@ from pathlib import Path
 import pytest
 
 import s8_campaign_planner as planner
+import s8_schema as schema
+
+
+def test_canonical_32_contract_is_unchanged_and_expanded_scope_is_disjoint() -> None:
+    assert schema.CORPORA == ("fmt", "RocksDB", "DuckDB", "LLVM-1238")
+    assert len(schema.DECLARED_CELLS) == 32
+    assert {tuple(cell[field] for field in ("corpus", "profile", "regime"))
+            for cell in schema.DECLARED_CELLS} == {
+                (corpus, profile, regime)
+                for corpus in schema.CORPORA for profile in schema.PROFILES
+                for regime in schema.REGIMES
+            }
+    assert set(schema.SPLITS) == set(schema.CORPORA)
+    assert set(schema.EXPANDED_ONLY_CORPORA).isdisjoint(schema.CORPORA)
+    assert schema.ALL_CORPORA == schema.CORPORA + schema.EXPANDED_ONLY_CORPORA
+    assert all(schema.ALL_SPLITS[corpus] == schema.EXPANDED_DESCRIPTIVE_SPLIT
+               for corpus in schema.EXPANDED_ONLY_CORPORA)
 
 
 def _authority(tmp_path: Path) -> tuple[Path, Path, str, Path, str]:
@@ -120,11 +137,12 @@ def _capability_fixture(tmp_path: Path) -> tuple[Path, str, dict[str, object]]:
 
 
 def _raw_authority_fixture(tmp_path: Path, inventory: Path, *, rows: str = "full",
-                           wrong_cell: bool = False) -> tuple[Path, str]:
+                           wrong_cell: bool = False, manifest_id: str = "corpus") -> tuple[Path, str]:
     """Create one authenticated RAW_II corpus/regime authority entry."""
     tmp_path.mkdir(parents=True, exist_ok=True)
     inventory_value = json.loads(inventory.read_text())
-    corpus = inventory_value["corpus_manifests"][0]
+    corpus = next(item for item in inventory_value["corpus_manifests"]
+                  if item["manifest_id"] == manifest_id)
     manifest = Path(corpus["manifest"]["path"])
     source_rows = []
     for ordinal, source_path in enumerate(manifest.read_text().splitlines()):
@@ -155,11 +173,11 @@ def _raw_authority_fixture(tmp_path: Path, inventory: Path, *, rows: str = "full
         file_cell["regime"] = "warm"
     witness_value = {"schema": planner.RAW_II_WITNESS_SCHEMA,
                      "semantics": planner.RAW_II_SEMANTICS, "cell": file_cell,
-                     "split": "held_out_validation",
+                     "split": planner.RAW_II_SPLITS[producer_corpus],
                      "formula": planner.RAW_II_FORMULA, "rows": witness_rows}
     engine_value = {"schema": planner.RAW_II_ENGINE_SCHEMA,
                     "semantics": planner.RAW_II_SEMANTICS, "cell": file_cell,
-                    "split": "held_out_validation",
+                    "split": planner.RAW_II_SPLITS[producer_corpus],
                     "control_baseline": planner.RAW_II_BASELINE,
                     "engine_scope": "raw_ii_control_engine", "model_id": "fixture-v1",
                     "rows": engine_rows}
@@ -207,6 +225,26 @@ def test_authenticates_all_manifests_and_preserves_order(tmp_path: Path) -> None
         str(tmp_path / "authority" / "snapshots" / "corpus" / "tu-0001.ii")]
     assert json.loads((output / "campaign-index.json").read_text())["counts"]["historical_image_seven_method_grid"] == 4928
     assert len((output / "descriptors.jsonl").read_text().splitlines()) == 4928
+
+
+def test_expanded_descriptors_are_descriptive_and_live_gate_stays_hold(tmp_path: Path) -> None:
+    result, output, _, _, _ = _plan(tmp_path, current=True)
+    rows = [json.loads(line) for line in
+            (output / "descriptors.jsonl").read_text().splitlines()]
+    expanded = [row for row in rows
+                if row["corpus"]["project"] in planner.EXPANDED_ONLY_CORPORA and
+                row["image"]["key"] == "current-pinned"]
+    canonical = [row for row in rows
+                 if row["corpus"]["project"] not in planner.EXPANDED_ONLY_CORPORA and
+                 row["image"]["key"] == "current-pinned"]
+    assert expanded
+    assert {row["split"] for row in expanded} == {"expanded_descriptive"}
+    assert {row["evaluation_scope"] for row in expanded} == {"expanded_descriptive"}
+    assert {row["live_authority_status"] for row in expanded} == {"HOLD"}
+    assert {row["status"] for row in expanded} == {"NOT_READY"}
+    assert {row["evaluation_scope"] for row in canonical} == {"canonical_s8"}
+    assert {row["split"] for row in canonical} == {"calibration", "held_out_validation"}
+    assert result["corpus_scope"]["expanded_accuracy_claims"] is False
 
 
 def test_declares_distinct_methods_topologies_depths_and_statuses(tmp_path: Path) -> None:
@@ -417,6 +455,29 @@ def test_raw_ii_authority_makes_only_exact_cells_ready(tmp_path: Path) -> None:
     assert planner.RAW_II_CAPABILITY != planner.CAPABILITY
 
 
+def test_expanded_raw_ii_authority_is_admitted_descriptively(tmp_path: Path) -> None:
+    inventory, recovery, recovery_sha, matrix, matrix_sha = _authority(tmp_path / "authority")
+    authority, authority_sha = _raw_authority_fixture(
+        tmp_path / "raw", inventory, manifest_id="corpus4")
+    result = planner.plan_campaign(
+        inventory, recovery, recovery_sha, matrix, matrix_sha, tmp_path / "out",
+        "20260901T000000Z", current_image_name="image:tag",
+        current_image_id="sha256:" + "a" * 64,
+        raw_ii_authority_manifest=authority,
+        raw_ii_authority_manifest_sha256=authority_sha)
+    rows = [json.loads(line) for line in
+            (tmp_path / "out" / "descriptors.jsonl").read_text().splitlines()
+            if json.loads(line)["image"]["key"] == "current-pinned" and
+            json.loads(line)["corpus"]["manifest_id"] == "corpus4" and
+            json.loads(line)["method"] == "RAW_II"]
+    assert len(rows) == 16
+    assert {row["status"] for row in rows} == {"READY", "NOT_READY"}
+    assert {row["split"] for row in rows} == {"expanded_descriptive"}
+    assert {row["evaluation_scope"] for row in rows} == {"expanded_descriptive"}
+    assert {row["live_authority_status"] for row in rows} == {"HOLD"}
+    assert result["raw_ii_authority"]["cells"]["corpus4/cold"]["cell"]["corpus"] == "abseil+protobuf"
+
+
 def test_raw_ii_authority_missing_cell_stays_not_ready(tmp_path: Path) -> None:
     inventory, recovery, recovery_sha, matrix, matrix_sha = _authority(tmp_path / "authority")
     authority, authority_sha = _raw_authority_fixture(tmp_path / "raw", inventory)
@@ -618,7 +679,7 @@ def test_raw_ii_authority_deleted_cell_artifact_fails_closed(tmp_path: Path,
             raw_ii_authority_manifest_sha256=authority_sha)
 
 
-def test_raw_ii_authority_unmapped_manifest_cannot_be_ready(tmp_path: Path) -> None:
+def test_raw_ii_authority_manifest_id_must_use_producer_label(tmp_path: Path) -> None:
     inventory, recovery, recovery_sha, matrix, matrix_sha = _authority(tmp_path / "authority")
     authority, _ = _raw_authority_fixture(tmp_path / "raw", inventory)
     value = json.loads(authority.read_text())
@@ -632,13 +693,17 @@ def test_raw_ii_authority_unmapped_manifest_cannot_be_ready(tmp_path: Path) -> N
             raw_ii_authority_manifest=authority,
             raw_ii_authority_manifest_sha256=hashlib.sha256(authority.read_bytes()).hexdigest())
     assert planner._producer_corpus_for_manifest({
-        "manifest_id": "corpus4", "project": "abseil+protobuf", "tu_count": 700}) is None
+        "manifest_id": "corpus4", "project": "abseil+protobuf", "tu_count": 700
+    }) == "abseil+protobuf"
 
 
 def test_raw_ii_manifest_mapping_matches_shared_producer_contract() -> None:
     expected = {
         "corpus": "LLVM-1238", "corpus2": "RocksDB",
-        "corpus3": "DuckDB", "corpus7": "fmt",
+        "corpus3": "DuckDB", "corpus4": "abseil+protobuf",
+        "corpus5": "OpenCV", "corpus6": "Godot", "corpus7": "fmt",
+        "corpus8": "spdlog", "corpus9": "Catch2",
+        "corpus10": "nlohmann-json", "corpus11": "range-v3",
     }
     observed = {
         manifest_id: planner._producer_corpus_for_manifest({
@@ -646,9 +711,8 @@ def test_raw_ii_manifest_mapping_matches_shared_producer_contract() -> None:
         for manifest_id, project, count in planner.CORPUS_AUTHORITY
     }
     assert {key: observed[key] for key in expected} == expected
-    assert all(observed[key] is None for key in observed if key not in expected)
     assert set(expected.values()) == set(planner.RAW_II_SUPPORTED_CORPORA)
-    assert set(expected) == {"corpus", "corpus2", "corpus3", "corpus7"}
+    assert set(expected) == {item[0] for item in planner.CORPUS_AUTHORITY}
 
 
 @pytest.mark.parametrize(("manifest_id", "project", "tu_count"), [

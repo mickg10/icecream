@@ -22,9 +22,22 @@ from s8_raw_ii_predictive_producer import (
     WITNESS_SCHEMA,
     produce,
 )
+from s8_schema import ALL_SPLITS
 
 
-def _inputs(tmp_path: Path) -> tuple[Path, Path, str, int]:
+def test_raw_cell_validation_accepts_expanded_descriptive_corpora_only_for_raw_ii() -> None:
+    for corpus in ("abseil+protobuf", "OpenCV", "Godot", "spdlog", "Catch2",
+                   "nlohmann-json", "range-v3"):
+        cell = producer._cell({"corpus": corpus, "profile": "RAW_II", "regime": "cold"},
+                              "expanded")
+        assert cell["corpus"] == corpus
+        assert ALL_SPLITS[corpus] == "expanded_descriptive"
+    with pytest.raises(RawIIError, match="cell_invalid"):
+        producer._cell({"corpus": "OpenCV", "profile": "P29", "regime": "cold"},
+                       "expanded")
+
+
+def _inputs(tmp_path: Path, corpus: str = "DuckDB") -> tuple[Path, Path, str, int]:
     source = tmp_path / "tu.cc"
     source.write_bytes(b"int main() { return 0; }\n")
     source_manifest = tmp_path / "sources.txt"
@@ -39,7 +52,7 @@ def _inputs(tmp_path: Path) -> tuple[Path, Path, str, int]:
     }) + "\n")
     result = tmp_path / "s8-DuckDB-RAW_II-cold-20260901T000000Z"
     plan = depth.build_plan(source_manifest, tmp_path, matrix, result,
-                            "DuckDB", "RAW_II", "cold", 100, topology="C1F1")
+                            corpus, "RAW_II", "cold", 100, topology="C1F1")
     plan_path = tmp_path / "depth-plan.json"
     plan_path.write_text(json.dumps(plan, sort_keys=True) + "\n")
     digest = plan["inputs"][0]["sha256"]
@@ -48,13 +61,14 @@ def _inputs(tmp_path: Path) -> tuple[Path, Path, str, int]:
 
 
 def _control_inputs(tmp_path: Path, plan_path: Path, digest: str, size: int) -> tuple[Path, Path]:
-    cell = {"corpus": "DuckDB", "profile": "RAW_II", "regime": "cold"}
     plan = json.loads(plan_path.read_text())
+    cell = plan["cell"]
+    split = ALL_SPLITS[cell["corpus"]]
     occurrences = plan["inputs"]
     witness = tmp_path / "witness.json"
     witness.write_text(json.dumps({
         "schema": WITNESS_SCHEMA, "semantics": normalizer.SEMANTICS,
-        "cell": cell, "split": "held_out_validation", "formula": FORMULA,
+        "cell": cell, "split": split, "formula": FORMULA,
         "rows": [{"ordinal": item["ordinal"], "source_relative": item["source_relative"],
                   "source_sha256": item["sha256"], "source_bytes": item["bytes"],
                   "c_to_f": {"compile_file_bytes": 10, "file_chunk_bytes": 20,
@@ -64,7 +78,7 @@ def _control_inputs(tmp_path: Path, plan_path: Path, digest: str, size: int) -> 
     engine = tmp_path / "engine.json"
     engine.write_text(json.dumps({
         "schema": ENGINE_SCHEMA, "semantics": normalizer.SEMANTICS,
-        "cell": cell, "split": "held_out_validation",
+        "cell": cell, "split": split,
         "control_baseline": normalizer.CONTROL_BASELINE,
         "engine_scope": "raw_ii_control_engine", "model_id": "raw-control-v1",
         "rows": [{"ordinal": item["ordinal"], "source_relative": item["source_relative"],
@@ -73,6 +87,16 @@ def _control_inputs(tmp_path: Path, plan_path: Path, digest: str, size: int) -> 
                  for item in occurrences],
     }, sort_keys=True) + "\n")
     return witness, engine
+
+
+def test_expanded_raw_producer_keeps_descriptive_scope(tmp_path: Path) -> None:
+    plan, _source, digest, size = _inputs(tmp_path, corpus="OpenCV")
+    witness, engine = _control_inputs(tmp_path, plan, digest, size)
+    output = Path(json.loads(plan.read_text())["result"]["directory"])
+    produced = produce(plan, witness, engine, output, "100", _product_root(tmp_path))
+    assert produced["cell"]["corpus"] == "OpenCV"
+    assert produced["identity"]["split"] == "expanded_descriptive"
+    assert json.loads((output / "predictive_curve_manifest.json").read_text())["identity"]["split"] == "expanded_descriptive"
 
 
 def _product_root(tmp_path: Path) -> Path:

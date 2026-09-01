@@ -24,11 +24,11 @@ from typing import Any, Iterator
 try:
     from . import s8_depth_runner as depth_runner
     from . import s8_predictive_live_normalizer as normalizer
-    from .s8_schema import CORPORA, CONTROL_PROFILES, CURRENT_SEMANTICS, REGIMES, SPLITS
+    from .s8_schema import ALL_CORPORA, ALL_SPLITS, CONTROL_PROFILES, CURRENT_SEMANTICS, REGIMES
 except ImportError:  # pragma: no cover
     import s8_depth_runner as depth_runner
     import s8_predictive_live_normalizer as normalizer
-    from s8_schema import CORPORA, CONTROL_PROFILES, CURRENT_SEMANTICS, REGIMES, SPLITS
+    from s8_schema import ALL_CORPORA, ALL_SPLITS, CONTROL_PROFILES, CURRENT_SEMANTICS, REGIMES
 
 DepthPlanError = depth_runner.DepthPlanError
 build_schedule = depth_runner.build_schedule
@@ -165,7 +165,7 @@ def _positive(value: object, label: str) -> int:
 
 def _cell(value: object, label: str) -> dict[str, str]:
     if (not isinstance(value, dict) or set(value) != {"corpus", "profile", "regime"} or
-            value.get("corpus") not in CORPORA or
+            value.get("corpus") not in ALL_CORPORA or
             value.get("profile") not in CONTROL_PROFILES or
             value.get("regime") not in REGIMES):
         raise RawIIError(f"{label}:cell_invalid")
@@ -187,7 +187,7 @@ def _wire_total(value: object, label: str) -> int:
 def _load_witness(path: Path, cell: dict[str, str]) -> tuple[dict[tuple[int, str, str, int], dict[str, object]], dict[str, object]]:
     value, facts = _read(path, "raw_ii_witness")
     if (value.get("schema") != WITNESS_SCHEMA or value.get("semantics") != CURRENT_SEMANTICS or
-            value.get("cell") != cell or value.get("split") != SPLITS[cell["corpus"]] or
+            value.get("cell") != cell or value.get("split") != ALL_SPLITS[cell["corpus"]] or
             value.get("formula") != FORMULA):
         raise RawIIError("raw_ii_witness:scope_or_formula_invalid")
     rows = value.get("rows")
@@ -212,7 +212,7 @@ def _load_witness(path: Path, cell: dict[str, str]) -> tuple[dict[tuple[int, str
 def _load_engine(path: Path, cell: dict[str, str]) -> tuple[str, dict[tuple[int, str, str, int], tuple[int, int]], dict[str, object]]:
     value, facts = _read(path, "raw_ii_engine_manifest")
     if (value.get("schema") != ENGINE_SCHEMA or value.get("semantics") != CURRENT_SEMANTICS or
-            value.get("cell") != cell or value.get("split") != SPLITS[cell["corpus"]] or
+            value.get("cell") != cell or value.get("split") != ALL_SPLITS[cell["corpus"]] or
             value.get("control_baseline") != normalizer.CONTROL_BASELINE or
             value.get("engine_scope") != ENGINE_SCOPE):
         raise RawIIError("raw_ii_engine_manifest:scope_invalid")
@@ -244,8 +244,12 @@ def _load_plan(path: Path, cell: dict[str, str], depth: str) -> tuple[dict[str, 
     value, plan_facts = _read(path, "plan")
     if value.get("schema") != "icecream-s8-depth-run-plan-v1" or value.get("semantics") != CURRENT_SEMANTICS:
         raise RawIIError("plan:schema_invalid")
-    if value.get("cell") != cell or value.get("split") != SPLITS[cell["corpus"]]:
+    if value.get("cell") != cell or value.get("split") != ALL_SPLITS[cell["corpus"]]:
         raise RawIIError("plan:cell_mismatch")
+    expected_scope = ("canonical_s8" if cell["corpus"] in depth_runner.CORPORA
+                      else "expanded_descriptive")
+    if value.get("evaluation_scope") != expected_scope:
+        raise RawIIError("plan:evaluation_scope_invalid")
     request = value.get("request")
     expected_depth: object = int(depth) if depth.isdigit() else depth
     if not isinstance(request, dict) or request.get("depth") != expected_depth:
@@ -800,7 +804,7 @@ def produce(plan_path: Path, witness_path: Path, engine_path: Path, output_dir: 
          "inputs": inputs})).hexdigest()
     topology_digest = hashlib.sha256(_canonical(scheduling)).hexdigest()
     identity = {"corpus": cell_hint["corpus"], "profile": "RAW_II", "regime": cell_hint["regime"],
-                "split": SPLITS[cell_hint["corpus"]], "run_id": f"{output_dir.name}-{plan_facts['sha256'][:12]}",
+                "split": ALL_SPLITS[cell_hint["corpus"]], "run_id": f"{output_dir.name}-{plan_facts['sha256'][:12]}",
                 "source_commit": product["head"], "source_tree": product["tree"],
                 "input_digest": input_digest, "topology_digest": topology_digest, "model_id": model_id}
     comparison = normalizer.comparison_descriptor(plan_facts["sha256"], scheduling)

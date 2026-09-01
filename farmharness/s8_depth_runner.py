@@ -21,13 +21,13 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from .s8_schema import (CONTROL_PROFILES, CORPORA, CURRENT_SEMANTICS,
-                            DECLARED_CELLS, DEPTH_CLASSES, PROFILES, REGIMES,
-                            SPLITS)
+    from .s8_schema import (ALL_CORPORA, ALL_SPLITS, CONTROL_PROFILES, CORPORA,
+                            CURRENT_SEMANTICS, DECLARED_CELLS, DEPTH_CLASSES,
+                            PROFILES, REGIMES, SPLITS)
 except ImportError:  # pragma: no cover
-    from s8_schema import (CONTROL_PROFILES, CORPORA, CURRENT_SEMANTICS,
-                           DECLARED_CELLS, DEPTH_CLASSES, PROFILES, REGIMES,
-                           SPLITS)
+    from s8_schema import (ALL_CORPORA, ALL_SPLITS, CONTROL_PROFILES, CORPORA,
+                           CURRENT_SEMANTICS, DECLARED_CELLS, DEPTH_CLASSES,
+                           PROFILES, REGIMES, SPLITS)
 
 
 SCHEMA = "icecream-s8-depth-run-plan-v1"
@@ -209,7 +209,11 @@ def _finite_float(value: str, label: str) -> float:
 
 
 def _cell(corpus: str, profile: str, regime: str) -> dict[str, str]:
-    if (corpus not in CORPORA or profile not in (*PROFILES, *CONTROL_PROFILES) or
+    # Expanded corpora are admitted only to the dedicated RAW_II descriptive
+    # control.  Compressed profiles remain canonical four-corpus cells.
+    corpus_allowed = corpus in CORPORA or (
+        corpus in ALL_CORPORA and profile in CONTROL_PROFILES)
+    if (not corpus_allowed or profile not in (*PROFILES, *CONTROL_PROFILES) or
             regime not in REGIMES):
         raise DepthPlanError("cell:undeclared")
     return {"corpus": corpus, "profile": profile, "regime": regime}
@@ -379,9 +383,12 @@ def build_plan(source_manifest: Path, source_root: Path, matrix_audit: Path,
     source = {"root": str(source_root.resolve()),
               "manifest": {"path": manifest_facts["path"], "sha256": manifest_facts["sha256"],
                            "bytes": manifest_facts["bytes"], "entries": len(all_inputs)}}
+    evaluation_scope = ("canonical_s8" if corpus in CORPORA else
+                        "expanded_descriptive")
     plan: dict[str, Any] = {
         "schema": SCHEMA, "semantics": CURRENT_SEMANTICS,
-        "cell": cell, "split": SPLITS[corpus],
+        "cell": cell, "split": ALL_SPLITS[corpus],
+        "evaluation_scope": evaluation_scope,
         "request": {"depth": depth, "depth_class": depth_class,
                     "requested_curve_points": requested_points, "base_matrix_cells": 32,
                     "source_selection": source_selection},
@@ -404,6 +411,7 @@ def build_plan(source_manifest: Path, source_root: Path, matrix_audit: Path,
             "timeout_policy": TIMEOUT_POLICY,
             "warm_prewarm": regime == "warm",
             "warm_prewarm_segments": 1 if regime == "warm" else 0,
+            "evaluation_scope": evaluation_scope,
             "note": "The producer invokes one authenticated product batch over the ordered TU sequence and binds the aggregate input digest; live observations are never synthesized.",
         },
     }
@@ -442,7 +450,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--matrix-audit", type=Path, required=True)
     parser.add_argument("--result-dir", type=Path, required=True)
-    parser.add_argument("--corpus", choices=CORPORA, required=True)
+    parser.add_argument("--corpus", choices=ALL_CORPORA, required=True)
     parser.add_argument("--profile", choices=(*PROFILES, *CONTROL_PROFILES), required=True)
     parser.add_argument("--regime", choices=REGIMES, required=True)
     parser.add_argument("--depth", choices=("100", "200", "full", "repeat-full"), required=True)

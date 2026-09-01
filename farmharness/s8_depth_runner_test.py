@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 import s8_depth_runner as runner
-from s8_schema import CORPORA, PROFILES, REGIMES, SPLITS
+from s8_schema import ALL_SPLITS, CORPORA, PROFILES, REGIMES, SPLITS
 
 
 def _write(path: Path, raw: bytes | str) -> None:
@@ -81,6 +81,24 @@ def test_short_corpus_repeats_explicit_build_occurrences_for_100_and_200(tmp_pat
             "tail_entries": 0,
             "occurrence_identity": "ordinal_plus_source_relative_plus_sha256_plus_bytes",
         }
+
+
+def test_expanded_corpus_is_raw_descriptive_only(tmp_path: Path) -> None:
+    source_root, manifest = _inputs(tmp_path, 1)
+    matrix = tmp_path / "matrix.json"
+    _matrix(matrix)
+    plan = runner.build_plan(
+        manifest, source_root, matrix,
+        tmp_path / "s8-abseil-raw-cold-20260901T000000Z-100",
+        "abseil+protobuf", "RAW_II", "cold", 100)
+    assert plan["split"] == ALL_SPLITS["abseil+protobuf"] == "expanded_descriptive"
+    assert plan["evaluation_scope"] == "expanded_descriptive"
+    assert plan["execution_contract"]["evaluation_scope"] == "expanded_descriptive"
+    with pytest.raises(runner.DepthPlanError, match="cell:undeclared"):
+        runner.build_plan(
+            manifest, source_root, matrix,
+            tmp_path / "s8-abseil-zstd-cold-20260901T000001Z-100",
+            "abseil+protobuf", "ZSTD_TU", "cold", 100)
 
 
 def test_repeat_full_requires_matching_prior_full_plan(tmp_path: Path) -> None:

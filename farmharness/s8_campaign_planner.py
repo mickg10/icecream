@@ -45,14 +45,6 @@ RAW_II_SEMANTICS = _s8_schema.CURRENT_SEMANTICS
 RAW_II_FORMULA = _raw_ii_producer.FORMULA
 RAW_II_BASELINE = _normalizer.CONTROL_BASELINE
 RAW_II_ENGINE_SCOPE = _raw_ii_producer.ENGINE_SCOPE
-RAW_II_SPLITS = dict(_s8_schema.SPLITS)
-RAW_II_SUPPORTED_CORPORA = tuple(_s8_schema.CORPORA)
-RAW_II_MANIFEST_TO_PRODUCER = MappingProxyType({
-    "corpus": "LLVM-1238",
-    "corpus2": "RocksDB",
-    "corpus3": "DuckDB",
-    "corpus7": "fmt",
-})
 RAW_II_AUTHORITY_KEYS = frozenset({
     "schema", "status", "capability", "producer", "producer_source", "cells"})
 TIMESTAMP_RE = re.compile(r"^\d{8}T\d{6}Z$")
@@ -71,6 +63,32 @@ CORPUS_AUTHORITY = (
     ("corpus10", "nlohmann-json", 99),
     ("corpus11", "range-v3", 259),
 )
+# This is an immutable identity map, not a project-name heuristic.  The
+# manifest ID and its exact project/size record are both authenticated below;
+# expanded entries remain descriptive-only and are never canonical S8 cells.
+RAW_II_MANIFEST_TO_PRODUCER = MappingProxyType({
+    "corpus": "LLVM-1238",
+    "corpus2": "RocksDB",
+    "corpus3": "DuckDB",
+    "corpus4": "abseil+protobuf",
+    "corpus5": "OpenCV",
+    "corpus6": "Godot",
+    "corpus7": "fmt",
+    "corpus8": "spdlog",
+    "corpus9": "Catch2",
+    "corpus10": "nlohmann-json",
+    "corpus11": "range-v3",
+})
+RAW_II_MANIFEST_PROJECT_LABELS = MappingProxyType({
+    manifest_id: project for manifest_id, project, _count in CORPUS_AUTHORITY
+})
+RAW_II_MANIFEST_COUNTS = MappingProxyType({
+    manifest_id: count for manifest_id, _project, count in CORPUS_AUTHORITY
+})
+RAW_II_SPLITS = dict(_s8_schema.ALL_SPLITS)
+RAW_II_SUPPORTED_CORPORA = tuple(_s8_schema.ALL_CORPORA)
+EXPANDED_ONLY_CORPORA = tuple(_s8_schema.EXPANDED_ONLY_CORPORA)
+ALL_CORPORA = tuple(_s8_schema.ALL_CORPORA)
 METHODS = ("RAW_II", "ZSTD_TU", "ZSTD_ROUTE", "P29", "GRZ_RESIDUAL",
            "ZSTD_COHORT", "ZSTD_GLOBAL")
 EXPECTED_METHODS = METHODS
@@ -702,9 +720,18 @@ def _unique_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 
 def _producer_corpus_for_manifest(corpus: dict[str, object]) -> str | None:
-    """Map only authoritative planner identities to producer cell names."""
+    """Map an exact immutable manifest identity to its producer cell name.
+
+    In particular, never infer a producer name from ``project`` alone: a
+    caller that swaps a manifest ID, project label, or TU count is rejected.
+    """
+    if not isinstance(corpus, dict):
+        return None
     manifest_id = corpus.get("manifest_id")
-    if not isinstance(manifest_id, str):
+    if (not isinstance(manifest_id, str) or
+            manifest_id not in RAW_II_MANIFEST_TO_PRODUCER or
+            corpus.get("project") != RAW_II_MANIFEST_PROJECT_LABELS[manifest_id] or
+            corpus.get("tu_count") != RAW_II_MANIFEST_COUNTS[manifest_id]):
         return None
     return RAW_II_MANIFEST_TO_PRODUCER.get(manifest_id)
 
@@ -829,6 +856,16 @@ def _slug(value: str) -> str:
     return result
 
 
+def _evaluation_scope(corpus: dict[str, object]) -> str:
+    """Return the scope label for an authenticated corpus identity."""
+    producer_name = _producer_corpus_for_manifest(corpus)
+    if producer_name in _s8_schema.CORPORA:
+        return "canonical_s8"
+    if producer_name in _s8_schema.EXPANDED_ONLY_CORPORA:
+        return _s8_schema.EXPANDED_DESCRIPTIVE_SPLIT
+    raise PlannerError(f"corpus:unsupported_manifest:{corpus.get('manifest_id')}")
+
+
 def _result_relative_directory(timestamp: str, image: dict[str, object], corpus: dict[str, object],
                                method: str, topology: dict[str, object], depth: str, regime: str) -> str:
     return "/".join(("experiments", "icecream", "s8-expanded", timestamp,
@@ -899,6 +936,11 @@ def plan_campaign(corpus_inventory: Path, image_recovery: Path, image_recovery_s
         if image["key"] == "current-pinned" and image["image_id"] is None:
             continue
         for corpus in corpora:
+            evaluation_scope = _evaluation_scope(corpus)
+            producer_name = _producer_corpus_for_manifest(corpus)
+            split = (_s8_schema.SPLITS[producer_name]
+                     if evaluation_scope == "canonical_s8"
+                     else _s8_schema.EXPANDED_DESCRIPTIVE_SPLIT)
             for method in METHODS:
                 for topology in TOPOLOGIES:
                     for depth in DEPTHS:
@@ -942,7 +984,14 @@ def plan_campaign(corpus_inventory: Path, image_recovery: Path, image_recovery_s
                                     "manifest": corpus["manifest"], "source_commit": corpus["source_commit"],
                                     "snapshot": corpus["snapshot"],
                                 }, "method": method, "topology": dict(topology), "depth": depth,
-                                "regime": regime, "status": status, "reason": reason,
+                                "regime": regime, "split": split,
+                                "evaluation_scope": evaluation_scope,
+                                # A predictive RAW_II input does not prove a
+                                # corresponding live observation.  Keep that
+                                # gate explicit for both canonical and
+                                # descriptive benchmark descriptors.
+                                "live_authority_status": "HOLD",
+                                "status": status, "reason": reason,
                                 "arm_kind": ("control_baseline" if method in CONTROL_METHODS
                                               else "compressed_profile"),
                                 "required_inputs": (["raw_ii_legacy_wire_witness",
@@ -992,6 +1041,13 @@ def plan_campaign(corpus_inventory: Path, image_recovery: Path, image_recovery_s
     index: dict[str, object] = {
         "schema": SCHEMA, "timestamp": timestamp, "campaign_root": str(output_root),
         "layout": "experiments/icecream/s8-expanded/<timestamp>/<image>/<corpus>/<method>/<topology>/<depth>/<regime>",
+        "corpus_scope": {
+            "canonical": list(_s8_schema.CORPORA),
+            "expanded_only": list(_s8_schema.EXPANDED_ONLY_CORPORA),
+            "all": list(_s8_schema.ALL_CORPORA),
+            "expanded_split": _s8_schema.EXPANDED_DESCRIPTIVE_SPLIT,
+            "expanded_accuracy_claims": False,
+        },
         "execution": {"mode": "declarative_only", "commands_emitted": False,
                        "required_producer_capability": CAPABILITY},
         "corpus_authority": {"inventory": corpus_descriptor, "total_manifests": len(corpora),

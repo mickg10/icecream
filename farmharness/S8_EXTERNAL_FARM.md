@@ -19,6 +19,15 @@ external-capable batch command.  The adapter retains product output,
 authority, role placement, scheduler/C/F work trees, service map, and logs.
 It does not admit local loopback elapsed time as timing evidence.
 
+The canonical S8 accuracy contract remains the four corpora in
+`s8_schema.CORPORA` (32 cells with calibration/held-out validation splits).
+The campaign planner also inventories corpus4, corpus5, corpus6, corpus8,
+corpus9, corpus10, and corpus11 through immutable manifest-ID mappings. Those
+seven project labels are emitted only with the `expanded_descriptive` scope;
+they cannot enter canonical calibration, held-out loss/accuracy, or the 32-cell
+matrix. Missing RAW_II witness/engine inputs remain `NOT_READY`, and a
+separate live observation remains `HOLD`.
+
 For a multi-cell campaign, use the campaign driver's per-cell refresh command
 so authority freshness is measured immediately before each external cell. The
 command is an argv template (not a shell string) and must contain `{output}`;

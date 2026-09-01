@@ -2,11 +2,12 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "icecream-s8-expanded-campaign-v1",
   "type": "object",
-  "required": ["schema", "timestamp", "campaign_root", "execution", "corpus_authority", "methods", "topologies", "depths", "regimes", "images", "image_recovery", "matrix_audit", "prerequisites", "counts", "descriptors"],
+  "required": ["schema", "timestamp", "campaign_root", "corpus_scope", "execution", "corpus_authority", "methods", "topologies", "depths", "regimes", "images", "image_recovery", "matrix_audit", "prerequisites", "counts", "descriptors"],
   "properties": {
     "schema": {"const": "icecream-s8-expanded-campaign-v1"},
     "timestamp": {"type": "string", "pattern": "^[0-9]{8}T[0-9]{6}Z$"},
     "campaign_root": {"type": "string", "minLength": 1},
+    "corpus_scope": {"type": "object", "required": ["canonical", "expanded_only", "all", "expanded_split", "expanded_accuracy_claims"], "properties": {"canonical": {"const": ["fmt", "RocksDB", "DuckDB", "LLVM-1238"]}, "expanded_only": {"const": ["abseil+protobuf", "OpenCV", "Godot", "spdlog", "Catch2", "nlohmann-json", "range-v3"]}, "all": {"const": ["fmt", "RocksDB", "DuckDB", "LLVM-1238", "abseil+protobuf", "OpenCV", "Godot", "spdlog", "Catch2", "nlohmann-json", "range-v3"]}, "expanded_split": {"const": "expanded_descriptive"}, "expanded_accuracy_claims": {"const": false}}},
     "execution": {"type": "object", "required": ["mode", "commands_emitted", "required_producer_capability"], "properties": {"mode": {"const": "declarative_only"}, "commands_emitted": {"const": false}, "required_producer_capability": {"const": "icecream.s8.native-live-runner-v1"}}},
     "methods": {"type": "array", "minItems": 7, "maxItems": 7, "items": {"type": "object", "required": ["name", "root_status", "arm_kind", "required_inputs"], "properties": {"name": {"type": "string"}, "root_status": {"enum": ["IMPLEMENTED", "NOT_IMPLEMENTED"]}, "arm_kind": {"enum": ["control_baseline", "compressed_profile"]}, "required_inputs": {"type": "array"}}}},
     "depths": {"const": ["100", "200", "full-1", "state-carrying full-2"]},
