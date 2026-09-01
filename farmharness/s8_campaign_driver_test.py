@@ -289,6 +289,140 @@ def test_raw_ii_predictive_control_executes_dedicated_producer(tmp_path: Path) -
     live_argv = live_commands["run"]["argv"]
     assert live_argv[live_argv.index("--profile") + 1] == "P29"
     assert live_argv[live_argv.index("--product-profile") + 1] == "RAW_II"
+    commands = json.loads(next((campaign / "cells").glob("*/attempt-001/commands.json")).read_text())
+    assert commands["predictive_plan"][0]["executable"] is True
+    assert commands["predictive_producer"]["executable"] is True
+    producer_argv = commands["predictive_producer"]["argv"]
+    assert producer_argv[producer_argv.index("--product-root") + 1] == str(tmp_path / "product")
+
+
+def test_raw_ii_local_campaign_binds_plan_producer_and_live_identity(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise the RAW path locally; the live callback is a retained fixture."""
+    import s8_predictive_live_normalizer as normalizer
+
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source = source_root / "tu.cc"
+    source.write_bytes(b"int main() { return 0; }\n")
+    (source_root / "RAW_II.txt").write_text(str(source) + "\n")
+    matrix = tmp_path / "matrix.json"
+    matrix.write_text(json.dumps({
+        "schema": "icecream-s8-matrix-audit-v1", "status": "PASS",
+        "matrix": {"expected_cells": 32, "completed_cells": 32,
+                    "missing_cells": [], "invalid_candidates": [],
+                    "calibration_cells": 16, "held_out_validation_cells": 16},
+        "cells": [],
+    }) + "\n")
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    source_bytes = source.stat().st_size
+    for regime in ("cold", "warm"):
+        witness_rows = [{
+            "ordinal": ordinal, "source_relative": "tu.cc",
+            "source_sha256": source_sha, "source_bytes": source_bytes,
+            "c_to_f": {"compile_file_bytes": 10, "file_chunk_bytes": 20,
+                       "end_bytes": 3, "total_bytes": 33}}
+            for ordinal in range(100)]
+        engine_rows = [{
+            "ordinal": ordinal, "source_relative": "tu.cc",
+            "source_sha256": source_sha, "source_bytes": source_bytes,
+            "f_to_c_bytes": 17, "source_service_ns": 40,
+            "execution_service_ns": 60, "elapsed_ns": 100}
+            for ordinal in range(100)]
+        cell = {"corpus": "fmt", "profile": "RAW_II", "regime": regime}
+        (tmp_path / f"witness-{regime}.json").write_text(json.dumps({
+            "schema": "icecream-s8-raw-ii-legacy-wire-witness-v1",
+            "semantics": "s8-current-semantics-v1", "cell": cell,
+            "split": "calibration", "formula": {
+                "name": "legacy-filechunk-wire-v1",
+                "c_to_f": "compile_file_bytes+file_chunk_bytes+end_bytes"},
+            "rows": witness_rows}, sort_keys=True) + "\n")
+        (tmp_path / f"engine-{regime}.json").write_text(json.dumps({
+            "schema": "icecream-s8-raw-ii-control-engine-v1",
+            "semantics": "s8-current-semantics-v1", "cell": cell,
+            "split": "calibration",
+            "control_baseline": normalizer.CONTROL_BASELINE,
+            "engine_scope": "raw_ii_control_engine", "model_id": "raw-control-v1",
+            "rows": engine_rows}, sort_keys=True) + "\n")
+    product = tmp_path / "product"
+    product.mkdir()
+    (product / "product.txt").write_text("product\n")
+    subprocess.run(["git", "init", "-q", str(product)], check=True)
+    subprocess.run(["git", "-C", str(product), "config", "user.email", "raw@test.invalid"], check=True)
+    subprocess.run(["git", "-C", str(product), "config", "user.name", "RAW test"], check=True)
+    subprocess.run(["git", "-C", str(product), "add", "product.txt"], check=True)
+    subprocess.run(["git", "-C", str(product), "commit", "-qm", "product"], check=True)
+    authority = tmp_path / "authority.json"
+    authority.write_text("{}\n")
+    monkeypatch.setattr(driver, "LIVE_LOCK_PATH", tmp_path / "live.lock")
+    monkeypatch.setattr(driver.external_farm_executor, "load_authority", lambda _path: {})
+
+    def local_runner(command: dict[str, object], _cwd: Path, stdout: Path, stderr: Path) -> int:
+        stage = str(command["stage"])
+        argv = [str(item) for item in command["argv"]]  # type: ignore[index]
+        stdout.parent.mkdir(parents=True, exist_ok=True)
+        if stage.startswith("predictive_plan") or stage == "predictive_producer":
+            completed = subprocess.run(argv, stdout=stdout.open("ab"), stderr=stderr.open("ab"),
+                                       check=False)
+            return completed.returncode
+        if stage == "live_prepare":
+            output = Path(argv[argv.index("--output") + 1])
+            output.mkdir(parents=True, exist_ok=True)
+            (output / "batch-manifest.jsonl").write_text("{}\n")
+            (output / "topology.json").write_text("{}\n")
+            return 0
+        if stage.startswith("comparison"):
+            output = Path(argv[argv.index("--out") + 1])
+            normalizer.normalize(Path(argv[argv.index("--predictive-manifest") + 1]),
+                                 Path(argv[argv.index("--live-manifest") + 1]), output)
+            return 0
+        raise AssertionError(stage)
+
+    def external_fixture(_transport: object, **kwargs: object) -> Path:
+        output = Path(kwargs["output"])
+        target = (output / "icecream" / str(kwargs["topology"]).replace("/", "-") /
+                  str(kwargs["timestamp"]) / "RAW_II")
+        target.mkdir(parents=True, exist_ok=True)
+        plan = json.loads(Path(kwargs["predictive_plan"]).read_text())
+        predictive = Path(plan["result"]["directory"])
+        curve = target / "live_curve.jsonl"
+        curve.write_bytes((predictive / "predictive_sim.jsonl").read_bytes())
+        manifest = json.loads((predictive / "predictive_curve_manifest.json").read_text())
+        manifest["curve"] = {"path": curve.name,
+                              "sha256": hashlib.sha256(curve.read_bytes()).hexdigest(),
+                              "bytes": curve.stat().st_size}
+        manifest["provenance"] = {"mode": "live", "producer": "local-raw-fixture",
+                                   "trace_free": False}
+        live_manifest = target / "live_curve_manifest.json"
+        live_manifest.write_text(json.dumps(manifest, sort_keys=True) + "\n")
+        return live_manifest
+
+    kwargs = _kwargs(
+        tmp_path, repo=Path(__file__).resolve().parents[1], corpus="fmt",
+        source_manifest=str(source_root / "{profile}.txt"),
+        source_root=source_root, matrix_audit=matrix, product_build_root=product,
+        compile_db=tmp_path / "compile_commands.json",
+        compile_source_root=source_root,
+        raw_ii_witness=str(tmp_path / "witness-{regime}.json"),
+        raw_ii_engine_manifest_template=str(tmp_path / "engine-{regime}.json"),
+        selected_profiles=("RAW_II",), selected_topologies=("C1F1/100000",))
+    campaign = driver.run_campaign(
+        **kwargs, mode=driver.EXTERNAL_FARM_MODE,
+        external_farm_authority=authority,
+        external_cell_runner=external_fixture,
+        external_transport_factory=lambda value: {"authority": value},
+        command_runner=local_runner, timestamp="20260901T120020Z")
+    summary = json.loads((campaign / "summary.json").read_text())
+    assert summary["status"] == "PASS"
+    assert summary["counts"]["PASS"] == 2
+    state_path = next((campaign / "cells").glob("*/status.json"))
+    state = json.loads(state_path.read_text())
+    commands = json.loads((state_path.parent / "attempt-001" / "commands.json").read_text())
+    assert commands["predictive_plan"][0]["executable"] is True
+    assert commands["predictive_producer"]["executable"] is True
+    assert "--product-root" in commands["predictive_producer"]["argv"]
+    assert state["result"]["live"]["path"].endswith("/RAW_II/live_curve_manifest.json")
+    assert state["result"]["comparisons"][0]["identity"]["profile"] == "RAW_II"
 
 
 def test_campaign_selection_rejects_empty_unknown_and_duplicate_values() -> None:

@@ -121,7 +121,7 @@ def select_inputs(all_inputs: list[dict[str, Any]],
             "source_manifest_entries": source_entries,
             "complete_build_cycles": complete_cycles,
             "tail_entries": tail_entries,
-            "occurrence_identity": "global_ordinal_plus_source_digest",
+            "occurrence_identity": "ordinal_plus_source_relative_plus_sha256_plus_bytes",
         }
         return selected, selection
     if depth not in ("full", "repeat-full"):
@@ -132,7 +132,7 @@ def select_inputs(all_inputs: list[dict[str, Any]],
         "source_manifest_entries": len(all_inputs),
         "complete_build_cycles": 1,
         "tail_entries": 0,
-        "occurrence_identity": "global_ordinal_plus_source_digest",
+        "occurrence_identity": "ordinal_plus_source_relative_plus_sha256_plus_bytes",
     }
 
 

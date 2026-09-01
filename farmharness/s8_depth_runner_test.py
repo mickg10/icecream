@@ -78,7 +78,7 @@ def test_short_corpus_repeats_explicit_build_occurrences_for_100_and_200(tmp_pat
             "source_manifest_entries": 50,
             "complete_build_cycles": cycles,
             "tail_entries": 0,
-            "occurrence_identity": "global_ordinal_plus_source_digest",
+            "occurrence_identity": "ordinal_plus_source_relative_plus_sha256_plus_bytes",
         }
 
 

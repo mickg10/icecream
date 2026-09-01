@@ -44,6 +44,19 @@ execution still requires the regular authenticated farm authority and live
 finalizer. A normalizer record for RAW_II must carry the exact
 `icecream-s8-raw-ii-control-baseline-v1` declaration on both manifests.
 
+Each witness and control-engine row is keyed by the complete occurrence
+identity `(ordinal, source_relative, source_sha256, source_bytes)`. This keeps
+distinct translation units with identical content distinct, and the producer
+re-snapshots the plan's source manifest and inputs immediately before use. The
+control-engine schema supplies `source_service_ns` and `execution_service_ns`
+whose sum is `elapsed_ns`; the producer applies the authenticated plan's
+global-slot/relationship schedule and reports C1F20 makespan rather than a
+serial sum. Predictive RAW_II commands receive an explicit clean Git product
+root (`--product-root`); emitted source commit/tree identities are the actual
+product `HEAD` and `HEAD^{tree}`, never derived placeholders. `P29` may appear
+only as the mature shell selector; all plan, curve, and comparison identities
+remain `RAW_II`.
+
 Example declarative invocation (the timestamp is caller-owned and immutable):
 
 ```sh

@@ -23,16 +23,19 @@ from typing import Any
 
 try:
     from . import s8_predictive_live_normalizer as schema
-    from .s8_schema import CORPORA, PROFILES, REGIMES, SPLITS
+    from .s8_schema import CONTROL_PROFILES, CORPORA, PROFILES, REGIMES, SPLITS
 except ImportError:  # pragma: no cover
     import s8_predictive_live_normalizer as schema
-    from s8_schema import CORPORA, PROFILES, REGIMES, SPLITS
+    from s8_schema import CONTROL_PROFILES, CORPORA, PROFILES, REGIMES, SPLITS
 
 
 RECORD_SCHEMA = "icecream-s8-predictive-live-record-v1"
 RECORD_TYPES = ("predictive_sim", "live", "comparison")
 CELLS = tuple((corpus, profile, regime)
               for corpus in CORPORA for profile in PROFILES for regime in REGIMES)
+RECORD_CELLS = CELLS + tuple(
+    (corpus, profile, regime)
+    for corpus in CORPORA for profile in CONTROL_PROFILES for regime in REGIMES)
 EXCLUDED_PARTS = frozenset({"supplemental", "legacy", "old", "control", "mutation"})
 HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
 
@@ -118,7 +121,7 @@ def _cell(value: object, label: str) -> tuple[str, str, str]:
         raise AuditError(f"{label}:invalid_cell")
     if not all(isinstance(part, str) for part in parts):
         raise AuditError(f"{label}:invalid_cell")
-    if parts not in CELLS:
+    if parts not in RECORD_CELLS:
         raise AuditError(f"{label}:undeclared_cell")
     return parts  # type: ignore[return-value]
 

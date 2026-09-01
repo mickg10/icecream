@@ -632,7 +632,7 @@ def _source_commands(cell_dir: Path, cell: dict[str, str], *, depth: str,
             python, str((repo / "farmharness/s8_raw_ii_predictive_producer.py").absolute()),
             "--plan", str(plan), "--raw-ii-witness", str(raw_ii_witness),
             "--engine-manifest", str(engine_manifest), "--output-dir", str(result_dir),
-            "--depth", depth,
+            "--depth", depth, "--product-root", str(product_root),
         ]
     plan_commands: list[dict[str, object]] = []
     result_dirs = [result_dir]
@@ -654,16 +654,16 @@ def _source_commands(cell_dir: Path, cell: dict[str, str], *, depth: str,
             result_dirs.append(repeat_result)
         plan_commands.append(_command_record(
             repeat_argv, repo, stage="predictive_plan_full_2",
-            executable=not control_only, reason=control_reason))
+            executable=True, reason=control_reason))
     if depth != "full" or not paired_full:
         producer_argv.extend(("--output-dir", str(result_dir)))
     plan_commands.insert(0, _command_record(
         depth_argv, repo,
         stage="predictive_plan" if depth != "full" else "predictive_plan_full_1",
-        executable=not control_only, reason=control_reason))
+        executable=True, reason=control_reason))
     producer_command = _command_record(
         producer_argv, repo, stage="predictive_producer",
-        executable=not control_only, reason=control_reason)
+        executable=True, reason=control_reason)
 
     # These are deliberately staged, not guessed.  A live run requires a
     # compile database and a retained source checkout that are not predictive
@@ -1416,8 +1416,11 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
                 if error is None:
                     live_argv = [str(item) for item in live_run["argv"]]  # type: ignore[index]
                     live_out = Path(live_argv[live_argv.index("--output") + 1])
+                    output_profile = (live_argv[live_argv.index("--product-profile") + 1]
+                                      if "--product-profile" in live_argv else
+                                      live_argv[live_argv.index("--profile") + 1])
                     target = (live_out / "icecream" / cell["topology"].replace("/", "-") /
-                              stamp / cell["profile"])
+                              stamp / output_profile)
                     live_names = {str(item["path"]) for item in _artifact_tree(target)}
                     if "live_curve_manifest.json" not in live_names:
                         raise CampaignError("live_run:authenticated_curve_missing")
