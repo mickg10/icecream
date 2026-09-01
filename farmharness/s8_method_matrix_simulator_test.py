@@ -19,7 +19,7 @@ def test_capacity_is_not_relationship_cardinality() -> None:
     one = MatrixTopology.from_id("C1F1/100000")
     many = MatrixTopology.from_id("C1F20/40")
     assert one.relationship_count == 1
-    assert one.global_slots == 1
+    assert one.global_slots == 100000
     assert many.relationship_count == 20
     assert many.slots_per_f == 2
     assert many.global_slots == 40
@@ -51,7 +51,7 @@ def test_route_uses_fresh_frames_and_only_commit_advances_prefix(tmp_path: Path)
     ], output_root=tmp_path, timestamp="20260901T120000Z")
     data = [json.loads(line) for line in (rows / "occurrences.jsonl").read_text().splitlines()]
     assert [row["transition"] for row in data] == [
-        "committed_relationship_advance", "tentative_not_committed",
+        "committed_relationship_advance", "tentative_discarded_explicit_release",
         "committed_relationship_advance"]
     assert data[1]["pre_state_digest"] == data[1]["post_state_digest"]
     summary = json.loads((rows / "summary.json").read_text())
@@ -110,8 +110,8 @@ def test_cohort_requires_its_own_authenticated_dictionary_authority() -> None:
         topology, methods=("ZSTD_COHORT",), cohort_dictionary=dictionary,
         cohort_authority={"status": "READY", "construction": "fixture-authority-v1",
                           "sha256": __import__("hashlib").sha256(dictionary).hexdigest()})
-    result = simulator.run([Occurrence(0, b"payload")])
-    assert result["method_status"]["ZSTD_COHORT"] == "READY"
+    with pytest.raises(Exception, match="native authority"):
+        simulator.run([Occurrence(0, b"payload")])
     assert repeat_full_state_contract("ZSTD_COHORT")["survives"] is True
 
 

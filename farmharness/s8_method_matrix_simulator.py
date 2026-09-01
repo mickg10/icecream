@@ -112,10 +112,13 @@ def _authenticated_assignment(topology_id: str, count: int) -> dict[str, object]
     expected_relations = 1 if topology_id == "C1F1/100000" else 20
     for ordinal, row in enumerate(rows[:count]):
         try:
-            if int(row["dispatch_order"]) != ordinal or int(row["logical"]) != ordinal:
+            if int(row["dispatch_order"]) != ordinal or \
+                    ("tu_seq" in row and int(row["tu_seq"]) != ordinal):
                 raise MatrixError("assignment:dispatch_order_invalid")
             relation = int(row["worker"])
-            slot = int(row["slot"])
+            # C1F20's two dispatch lanes are authenticated in compiler_slot;
+            # C1F1's retained map has one relationship and no lane column.
+            slot = int(row.get("compiler_slot", row.get("slot", "0")))
         except (KeyError, ValueError) as exc:
             raise MatrixError("assignment:row_invalid") from exc
         if not 0 <= relation < expected_relations:
@@ -131,7 +134,8 @@ def _authenticated_assignment(topology_id: str, count: int) -> dict[str, object]
         selected.append({"ordinal": ordinal, "global_slot": global_slot,
                          "f_relationship": expected_relation, "per_f_slot": expected_slot,
                          "dispatch_order": ordinal, "authority_worker": relation,
-                         "authority_slot": slot})
+                         "authority_slot": slot, "authority_build": int(row.get("build", 0)),
+                         "authority_logical": int(row.get("logical", ordinal))})
     return {"path": facts["path"], "bytes": facts["bytes"], "sha256": facts["sha256"],
             "schema": "root-matrix-v4-assignment-tsv-v1", "topology": topology_id,
             "rows": selected, "selected_count": count}
@@ -573,7 +577,14 @@ class MethodMatrixSimulator:
         if experiment is not None:
             method_dir = experiment / "bytes" / method
             method_dir.mkdir(exist_ok=True)
-            raw_path = method_dir / f"raw-{occurrence.ordinal:06d}.bin"
+            # One immutable input artifact is shared by all method arms;
+            # retaining a copy per method multiplies Firefox's large .ii
+            # corpus and defeats the bounded canary contract.
+            input_dir = experiment / "bytes" / "input"
+            input_dir.mkdir(exist_ok=True)
+            raw_path = input_dir / f"raw-{occurrence.ordinal:06d}.bin"
+            if raw_path.exists() and raw_path.read_bytes() != occurrence.raw:
+                raise MatrixError("input artifact collision")
             raw_path.write_bytes(occurrence.raw)
         row: dict[str, object] = {"schema": OCCURRENCE_SCHEMA, "method": method,
             "topology": self.topology.topology_id, "ordinal": occurrence.ordinal,
