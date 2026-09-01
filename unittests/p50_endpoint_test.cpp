@@ -515,7 +515,8 @@ void test_zstd_route_endpoint_continuation_and_retry() {
         run_pair(client, server, failed_prepared, disconnect);
     require(disconnected.client.status == ClientRunStatus::Disconnected &&
                 disconnected.server.status == ServerRunStatus::Disconnected &&
-                client.has_active_transaction(),
+                client.has_active_transaction() &&
+                client.endpoint.next_rel_seq().value == 2,
             "ZSTD_ROUTE failed TU did not retain exact retry identity");
     const PairResult retried = run_pair(client, server, failed_prepared);
     require(retried.client.status == ClientRunStatus::Committed &&

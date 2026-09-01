@@ -43,6 +43,11 @@ SCENARIOS = (
     "explicit_f_reset_clean_recovery",
 )
 FOCUSED_RETRY_GATES = (
+    # This endpoint binary is the non-live replacement for the removed
+    # abort_retry_no_route_advance scenario: its ZSTD_ROUTE test disconnects
+    # after a transaction has started, then asserts the route cursor is
+    # unchanged before the exact retry commits.
+    "unittests/p50endpoint",
     "unittests/p50routeowner",
     "unittests/p50zstdsender",
 )
