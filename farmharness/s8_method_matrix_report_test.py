@@ -78,10 +78,64 @@ def test_mutated_verified_artifact_is_rejected(tmp_path: Path) -> None:
         report.build_report([experiment], tmp_path / "reports")
 
 
+def test_verified_bundle_is_single_read_under_post_verify_mutation(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    experiment = _experiment(tmp_path / "source", pass_id="original")
+    original_verify = simulator.verify_experiment
+
+    def verify_then_mutate(path: Path) -> dict[str, object]:
+        bundle = original_verify(path)
+        manifest = json.loads((path / "manifest.json").read_text())
+        manifest["run_identity"]["pass"] = "forged"
+        (path / "manifest.json").write_text(json.dumps(manifest) + "\n")
+        return bundle
+
+    monkeypatch.setattr(simulator, "verify_experiment", verify_then_mutate)
+    output = report.build_report([experiment], tmp_path / "reports")
+    rows = [json.loads(line) for line in (output / "results.jsonl").read_text().splitlines()]
+    assert {row["pass"] for row in rows} == {"original"}
+
+
+@pytest.mark.parametrize("timestamp", [None, "2026-09-01T12:00:00Z"])
+def test_missing_or_malformed_timestamp_is_clean_cli_reject(
+        tmp_path: Path, capsys: pytest.CaptureFixture[str], timestamp: str | None) -> None:
+    experiment = _experiment(tmp_path / "source")
+    manifest = experiment / "manifest.json"
+    value = json.loads(manifest.read_text())
+    if timestamp is None:
+        del value["run_identity"]["timestamp"]
+    else:
+        value["run_identity"]["timestamp"] = timestamp
+    manifest.write_text(json.dumps(value) + "\n")
+    rc = report.main([str(experiment), "--output-root", str(tmp_path / "reports")])
+    assert rc == 2
+    assert "run_identity" in capsys.readouterr().err
+
+
 def test_full2_requires_continuity_marker(tmp_path: Path) -> None:
     experiment = _experiment(tmp_path / "source", depth="state-carrying-full-2")
-    with pytest.raises(report.ReportError, match="full2:predecessor_continuity_marker_missing"):
-        report.build_report([experiment], tmp_path / "reports")
+    output = report.build_report([experiment], tmp_path / "reports")
+    rows = [json.loads(line) for line in (output / "results.jsonl").read_text().splitlines()]
+    assert {row["full2_continuity"]["status"] for row in rows} == {"NOT_PROVEN"}
+    assert json.loads((output / "summary.json").read_text())["status"] == \
+        "INCOMPLETE_REQUESTED_MATRIX"
+
+
+def test_full2_mismatched_predecessor_stays_not_proven(tmp_path: Path) -> None:
+    predecessor = _experiment(tmp_path / "predecessor", depth="full-1", pass_id="full1")
+    experiment = _experiment(tmp_path / "current", depth="state-carrying-full-2")
+    manifest_path = experiment / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["repeat_full"] = True
+    manifest["predecessor_input_authority"] = {
+        "experiment": str(predecessor), "manifest_sha256": "0" * 64,
+        "run_identity": {"timestamp": "20260901T120000Z", "topology": "C1F1/100000",
+                          "depth": "full-1", "pass": "full1"},
+        "selected_inputs": [], "assignment": {"topology": "C1F1/100000"}}
+    manifest_path.write_text(json.dumps(manifest) + "\n")
+    output = report.build_report([experiment], tmp_path / "reports")
+    rows = [json.loads(line) for line in (output / "results.jsonl").read_text().splitlines()]
+    assert {row["full2_continuity"]["status"] for row in rows} == {"NOT_PROVEN"}
 
 
 def test_ratio_zero_denominator_and_wire_witness_control() -> None:

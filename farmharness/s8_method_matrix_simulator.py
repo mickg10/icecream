@@ -1351,6 +1351,7 @@ def verify_experiment(experiment: Path) -> dict[str, object]:
                     raise MatrixError("verifier:row_artifact_binding_invalid")
     return {"status": "PASS", "experiment": str(experiment), "rows": len(rows),
             "artifacts": len(declared), "manifest": dict(manifest),
+            "manifest_facts": dict(_manifest_facts),
             "summary": dict(summary), "rows_data": list(rows),
             "artifact_facts": {name: facts for name, (_raw, facts) in files.items()},
             "input_facts": input_facts}

@@ -14,6 +14,7 @@ import csv
 import hashlib
 import json
 import os
+import re
 import stat
 import sys
 from datetime import datetime, timezone
@@ -27,6 +28,7 @@ except ImportError:  # Direct script/PYTHONPATH invocation.
 
 
 REPORT_SCHEMA = "icecream-s8-method-matrix-report-v1"
+UTC_SECOND = re.compile(r"^[0-9]{8}T[0-9]{6}Z$")
 TOPOLOGIES = ("C1F1/100000", "C1F20/40")
 DEPTHS = ("100", "200", "full-1", "state-carrying-full-2")
 METHODS = tuple(simulator.METHODS)
@@ -44,6 +46,30 @@ ROW_STATUSES = frozenset(("READY", "NOT_READY", "NOT_IMPLEMENTED"))
 
 class ReportError(ValueError):
     """Input or output does not satisfy the report contract."""
+
+
+def _valid_run_identity(value: object, *, topology: str | None = None,
+                        depth: str | None = None) -> bool:
+    if not isinstance(value, Mapping) or set(value) != {"timestamp", "topology", "depth", "pass"}:
+        return False
+    timestamp = value.get("timestamp")
+    if (not isinstance(timestamp, str) or UTC_SECOND.fullmatch(timestamp) is None or
+            not isinstance(value.get("topology"), str) or
+            not isinstance(value.get("depth"), str) or
+            not isinstance(value.get("pass"), str) or
+            not re.fullmatch(r"[A-Za-z0-9_.-]+", value["pass"])):
+        return False
+    try:
+        datetime.strptime(timestamp, "%Y%m%dT%H%M%SZ")
+    except ValueError:
+        return False
+    return ((topology is None or value["topology"] == topology) and
+            (depth is None or value["depth"] == depth))
+
+
+def _valid_digest(value: object) -> bool:
+    return (isinstance(value, str) and value != "0" * 32 and
+            re.fullmatch(r"[0-9a-f]{32}", value) is not None)
 
 
 def _sha256(raw: bytes) -> str:
@@ -92,10 +118,6 @@ def _json(raw: bytes, label: str) -> Any:
                               ReportError(f"{label}:nonfinite:{value}")))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ReportError(f"{label}:invalid_json") from exc
-
-
-def _read_json(path: Path, label: str) -> Any:
-    return _json(_private_bytes(path, label), label)
 
 
 def _int_or_none(value: Any, field: str, *, nonnegative: bool = True) -> int | None:
@@ -147,28 +169,120 @@ def _topology_record(manifest: Mapping[str, Any], topology: str) -> tuple[int, i
     return int(expected["relationship_count"]), int(expected["global_slots"])
 
 
+def _not_proven(reason: str) -> dict[str, Any]:
+    return {"status": "NOT_PROVEN", "predecessor_bound": False,
+            "relationship_state_present": False, "relationship_state_methods": [],
+            "reason": reason}
+
+
 def _full2_marker(manifest: Mapping[str, Any], summary: Mapping[str, Any],
-                  topology: str, depth: str) -> dict[str, Any]:
+                  rows: Sequence[Mapping[str, Any]], topology: str, depth: str,
+                  ) -> dict[str, Any]:
     if depth != "state-carrying-full-2":
         return {"status": "NOT_APPLICABLE", "predecessor_bound": False,
                 "relationship_state_present": False}
     predecessor = manifest.get("predecessor_input_authority")
+    if manifest.get("repeat_full") is not True or not isinstance(predecessor, Mapping):
+        return _not_proven("repeat_full_predecessor_declaration_missing")
+    predecessor_path = predecessor.get("experiment")
+    predecessor_digest = predecessor.get("manifest_sha256")
+    predecessor_identity = predecessor.get("run_identity")
+    selected_inputs = predecessor.get("selected_inputs")
+    predecessor_assignment = predecessor.get("assignment")
+    if (not isinstance(predecessor_path, str) or not predecessor_path or
+            not isinstance(predecessor_digest, str) or
+            not re.fullmatch(r"[0-9a-f]{64}", predecessor_digest) or
+            not isinstance(predecessor_identity, Mapping) or
+            not isinstance(selected_inputs, list) or
+            not isinstance(predecessor_assignment, Mapping)):
+        return _not_proven("predecessor_identity_binding_missing")
+    try:
+        predecessor_bundle = simulator.verify_experiment(Path(predecessor_path))
+    except Exception:
+        return _not_proven("predecessor_experiment_not_verified")
+    if not isinstance(predecessor_bundle, Mapping):
+        return _not_proven("predecessor_verified_bundle_invalid")
+    predecessor_manifest = predecessor_bundle.get("manifest")
+    predecessor_summary = predecessor_bundle.get("summary")
+    predecessor_facts = predecessor_bundle.get("manifest_facts")
+    if (not isinstance(predecessor_manifest, Mapping) or
+            not isinstance(predecessor_summary, Mapping) or
+            not isinstance(predecessor_facts, Mapping) or
+            predecessor_facts.get("sha256") != predecessor_digest or
+            predecessor_bundle.get("experiment") != predecessor_path):
+        return _not_proven("predecessor_manifest_digest_mismatch")
+    predecessor_run_identity = predecessor_manifest.get("run_identity")
+    if (predecessor_manifest.get("schema") != simulator.SCHEMA or
+            predecessor_manifest.get("experiment") != Path(predecessor_path).name or
+            predecessor_manifest.get("repeat_full") is not False or
+            predecessor_manifest.get("topology", {}).get("id") != topology or
+            predecessor_run_identity != dict(predecessor_identity) or
+            not _valid_run_identity(predecessor_run_identity, topology=topology,
+                                    depth="full-1") or
+            predecessor_summary.get("schema") != simulator.SUMMARY_SCHEMA or
+            predecessor_summary.get("topology", {}).get("id") != topology):
+        return _not_proven("predecessor_run_identity_mismatch")
+    predecessor_inputs = predecessor_manifest.get("input_authority", {}).get("selected_inputs", [])
+    predecessor_authority = predecessor_manifest.get("assignment_authority")
+    if (selected_inputs != predecessor_inputs or predecessor_assignment != predecessor_authority):
+        return _not_proven("predecessor_input_assignment_mismatch")
+    current_authority = manifest.get("assignment_authority")
+    if not isinstance(current_authority, Mapping) or current_authority.get("topology") != topology:
+        return _not_proven("current_assignment_authority_missing")
     relationships = summary.get("relationships", {})
-    route = relationships.get("ZSTD_ROUTE", {}) if isinstance(relationships, Mapping) else {}
-    predecessor_assignment = (predecessor.get("assignment")
-                              if isinstance(predecessor, Mapping) else None)
-    selected_inputs = predecessor.get("selected_inputs") if isinstance(predecessor, Mapping) else None
-    bound = (isinstance(predecessor, Mapping) and isinstance(selected_inputs, list) and
-             bool(selected_inputs) and isinstance(predecessor_assignment, Mapping) and
-             predecessor_assignment.get("topology") == topology)
-    state = (isinstance(route, Mapping) and bool(route) and
-             all(isinstance(value, Mapping) and type(value.get("next_rel_seq")) is int and
-                 value["next_rel_seq"] > 0 for value in route.values()))
-    if manifest.get("repeat_full") is not True or not bound or not state:
-        raise ReportError("full2:predecessor_continuity_marker_missing")
+    predecessor_relationships = predecessor_summary.get("relationships", {})
+    if not isinstance(relationships, Mapping) or not isinstance(predecessor_relationships, Mapping):
+        return _not_proven("relationship_state_missing")
+    expected_keys = {"|".join(key) for key in simulator.MatrixTopology.from_id(topology).relationship_keys}
+    first_rows: dict[tuple[str, tuple[str, str]], Mapping[str, Any]] = {}
+    for row in rows:
+        key = row.get("relationship_key")
+        if isinstance(key, list) and len(key) == 2 and all(isinstance(part, str) for part in key):
+            method = row.get("method")
+            if isinstance(method, str):
+                first_rows.setdefault((method, (key[0], key[1])), row)
+    for method in ("ZSTD_ROUTE", "P29", "GRZ_RESIDUAL"):
+        current_state = relationships.get(method)
+        prior_state = predecessor_relationships.get(method)
+        if (not isinstance(current_state, Mapping) or not isinstance(prior_state, Mapping) or
+                set(current_state) != expected_keys or set(prior_state) != expected_keys):
+            return _not_proven(f"{method.lower()}_relationship_state_incomplete")
+        for key in expected_keys:
+            before = prior_state[key]
+            after = current_state[key]
+            if (not isinstance(before, Mapping) or not isinstance(after, Mapping) or
+                    type(before.get("native_next_rel_seq")) is not int or
+                    not _valid_digest(before.get("native_state_digest")) or
+                    type(before.get("history_nonce")) is not int or
+                    not isinstance(before.get("route_identity"), str) or
+                    type(after.get("native_last_tu_seq")) is not int or
+                    not _valid_digest(after.get("native_state_digest")) or
+                    after["native_last_tu_seq"] < before["native_next_rel_seq"]):
+                return _not_proven(f"{method.lower()}_native_state_marker_missing")
+            row = first_rows.get((method, tuple(key.split("|", 1))))
+            if (row is None or row.get("method") != method or
+                    row.get("native_tu_seq") != before["native_next_rel_seq"] or
+                    row.get("native_state_before_digest") != before["native_state_digest"]):
+                return _not_proven(f"{method.lower()}_successor_marker_mismatch")
+            transaction = row.get("product_transaction")
+            if (not isinstance(transaction, Mapping) or
+                    transaction.get("history_nonce") != before["history_nonce"] or
+                    transaction.get("route_identity") != before["route_identity"]):
+                return _not_proven(f"{method.lower()}_route_identity_successor_mismatch")
+            if method == "ZSTD_ROUTE":
+                try:
+                    prefix = bytes.fromhex(str(after.get("committed_raw_prefix", "")))
+                except ValueError:
+                    return _not_proven("zstd_route_prefix_marker_missing")
+                if after.get("committed_raw_prefix_bytes") != len(prefix):
+                    return _not_proven("zstd_route_prefix_marker_missing")
+                if transaction.get("committed_raw_prefix") != before.get("committed_raw_prefix"):
+                    return _not_proven("zstd_route_prefix_successor_mismatch")
     return {"status": "CONTINUOUS", "predecessor_bound": True,
             "relationship_state_present": True,
-            "relationship_state_methods": ["ZSTD_ROUTE"]}
+            "relationship_state_methods": ["ZSTD_ROUTE", "P29", "GRZ_RESIDUAL"],
+            "predecessor_experiment": predecessor_path,
+            "predecessor_manifest_sha256": predecessor_digest}
 
 
 def _validate_rows(rows: Sequence[Any], manifest: Mapping[str, Any], topology: str,
@@ -263,7 +377,7 @@ def _validate_summary_totals(summary: Mapping[str, Any],
 def _method_result(experiment: Path, manifest: Mapping[str, Any], summary: Mapping[str, Any],
                    grouped: Mapping[str, Sequence[Mapping[str, Any]]], method: str,
                    topology: str, depth: str, pass_id: str, timestamp: str,
-                   marker: Mapping[str, Any]) -> dict[str, Any]:
+                   marker: Mapping[str, Any], manifest_sha256: str | None = None) -> dict[str, Any]:
     rows = list(grouped.get(method, ()))
     status_map = summary.get("method_status", {})
     status = status_map.get(method) if isinstance(status_map, Mapping) else None
@@ -314,7 +428,7 @@ def _method_result(experiment: Path, manifest: Mapping[str, Any], summary: Mappi
     return {
         "schema": REPORT_SCHEMA,
         "source_experiment": str(experiment),
-        "source_manifest_sha256": _sha256(_private_bytes(experiment / "manifest.json", "manifest")),
+        "source_manifest_sha256": manifest_sha256,
         "topology": topology,
         "relationship_count": EXPECTED_TOPOLOGY[topology]["relationship_count"],
         "capacity": EXPECTED_TOPOLOGY[topology]["global_slots"],
@@ -332,7 +446,7 @@ def _method_result(experiment: Path, manifest: Mapping[str, Any], summary: Mappi
 
 
 def _load_experiment(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any],
-                                          dict[str, Any], tuple[str, str, str]]:
+                                          dict[str, Any], tuple[str, str, str], str]:
     path = path.absolute()
     try:
         root_info = path.lstat()
@@ -341,11 +455,19 @@ def _load_experiment(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]], 
     if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
         raise ReportError("experiment:not_private_directory")
     try:
-        simulator.verify_experiment(path)
+        verified = simulator.verify_experiment(path)
     except Exception as exc:
         raise ReportError(f"experiment_verification_failed:{path}:{exc}") from exc
-    manifest = _read_json(path / "manifest.json", "manifest")
-    summary = _read_json(path / "summary.json", "summary")
+    if not isinstance(verified, Mapping):
+        raise ReportError("experiment_verification_failed:verified_bundle_invalid")
+    manifest = verified.get("manifest")
+    summary = verified.get("summary")
+    occurrences = verified.get("rows_data")
+    manifest_facts = verified.get("manifest_facts")
+    if (not isinstance(manifest, Mapping) or not isinstance(summary, Mapping) or
+            not isinstance(occurrences, list) or not isinstance(manifest_facts, Mapping) or
+            not isinstance(manifest_facts.get("sha256"), str)):
+        raise ReportError("experiment_verification_failed:verified_bundle_incomplete")
     if not isinstance(manifest, Mapping) or manifest.get("schema") != simulator.SCHEMA:
         raise ReportError("manifest:schema_invalid")
     if not isinstance(summary, Mapping) or summary.get("schema") != simulator.SUMMARY_SCHEMA:
@@ -353,8 +475,13 @@ def _load_experiment(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]], 
     identity = manifest.get("run_identity")
     if not isinstance(identity, Mapping):
         raise ReportError("manifest:run_identity_missing")
+    if not _valid_run_identity(identity):
+        raise ReportError("manifest:run_identity_keys_invalid")
+    timestamp = identity.get("timestamp")
     topology, depth, pass_id = (identity.get("topology"), identity.get("depth"), identity.get("pass"))
-    if topology not in TOPOLOGIES or depth not in DEPTHS or not isinstance(pass_id, str) or not pass_id:
+    if (not isinstance(topology, str) or topology not in TOPOLOGIES or
+            not isinstance(depth, str) or depth not in DEPTHS or
+            not isinstance(pass_id, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", pass_id)):
         raise ReportError("manifest:run_identity_dimension_invalid")
     _topology_record(manifest, str(topology))
     summary_topology = summary.get("topology")
@@ -376,26 +503,14 @@ def _load_experiment(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]], 
     method_status = summary.get("method_status")
     if not isinstance(method_status, Mapping) or any(method not in method_status for method in methods):
         raise ReportError("summary:method_status_missing")
-    occurrences = _read_jsonl(path / "occurrences.jsonl", "occurrences")
     if summary.get("occurrence_rows") != len(occurrences):
         raise ReportError("summary:occurrence_count_mismatch")
     grouped = _validate_rows(occurrences, manifest, str(topology), path)
     _validate_summary_totals(summary, grouped)
-    marker = _full2_marker(manifest, summary, str(topology), str(depth))
-    return dict(manifest), occurrences, dict(summary), grouped, (str(topology), str(depth), pass_id)
-
-
-def _read_jsonl(path: Path, label: str) -> list[dict[str, Any]]:
-    raw = _private_bytes(path, label)
-    rows: list[dict[str, Any]] = []
-    for index, line in enumerate(raw.splitlines(), 1):
-        if not line.strip():
-            raise ReportError(f"{label}:blank_line:{index}")
-        value = _json(line, f"{label}:{index}")
-        if not isinstance(value, Mapping):
-            raise ReportError(f"{label}:{index}:row_not_object")
-        rows.append(dict(value))
-    return rows
+    marker = _full2_marker(manifest, summary, [dict(row) for row in occurrences],
+                           str(topology), str(depth))
+    return (dict(manifest), [dict(row) for row in occurrences], dict(summary), grouped,
+            (str(topology), str(depth), pass_id), str(manifest_facts["sha256"]))
 
 
 def build_report(experiments: Sequence[Path], output_root: Path) -> Path:
@@ -405,18 +520,17 @@ def build_report(experiments: Sequence[Path], output_root: Path) -> Path:
     seen_keys: set[tuple[str, str, str]] = set()
     sources: list[dict[str, Any]] = []
     for path in experiments:
-        manifest, _occurrences, summary, grouped, identity = _load_experiment(path)
+        manifest, _occurrences, summary, grouped, identity, manifest_sha256 = _load_experiment(path)
         if identity in seen_keys:
             raise ReportError("duplicate_experiment_key:" + "/".join(identity))
         seen_keys.add(identity)
         topology, depth, pass_id = identity
-        marker = _full2_marker(manifest, summary, topology, depth)
-        manifest_sha = _sha256(_private_bytes(path.absolute() / "manifest.json", "manifest"))
-        sources.append({"experiment": str(path.absolute()), "manifest_sha256": manifest_sha,
+        marker = _full2_marker(manifest, summary, _occurrences, topology, depth)
+        sources.append({"experiment": str(path.absolute()), "manifest_sha256": manifest_sha256,
                         "run_identity": {"topology": topology, "depth": depth, "pass": pass_id}})
         records.extend(_method_result(path.absolute(), manifest, summary, grouped, method,
                                       topology, depth, pass_id, str(manifest["run_identity"]["timestamp"]),
-                                      marker) for method in METHODS)
+                                      marker, manifest_sha256) for method in METHODS)
     records.sort(key=lambda row: (row["topology"], DEPTH_ORDER[row["depth"]], row["pass"],
                                   METHOD_ORDER[row["method"]]))
     covered = {(row["topology"], row["depth"]) for row in records}
