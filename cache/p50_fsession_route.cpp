@@ -104,6 +104,16 @@ bool RouteAdmissionOwner::mark_reconcile_required(const RouteSessionLease& lease
     return true;
 }
 
+bool RouteAdmissionOwner::mark_reset_required(const RouteSessionLease& lease) {
+    // A touched, pre-commit endpoint has an invalidated route context, not an
+    // uncertain durable outcome.  Keep this transition distinct from
+    // ReconcileRequired, which is reserved for post-commit uncertainty.
+    if (state_ != RouteAdmissionState::Active || !lease_current(lease))
+        return false;
+    state_ = RouteAdmissionState::ResetRequired;
+    return true;
+}
+
 void RouteAdmissionOwner::resolve_and_release() noexcept {
     if (state_ != RouteAdmissionState::ReconcileRequired &&
         state_ != RouteAdmissionState::ResetRequired)

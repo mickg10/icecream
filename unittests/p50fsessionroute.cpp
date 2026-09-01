@@ -143,26 +143,47 @@ int main() {
     auto lease_b = route.reserve(op_b, run_b, established(11, 0xAB), refusal);
     check(lease_b.has_value(), "B admits with the exact committed successor");
 
-    // ReconcileRequired keeps the route inadmissible until resolved.
+    // A touched pre-commit endpoint invalidates the route context and requires
+    // reset before reuse.  It is a distinct owner state from post-commit
+    // reconciliation.
     check(route.activate(*lease_b), "B activates");
-    check(route.mark_reconcile_required(*lease_b), "B enters ReconcileRequired");
+    check(route.mark_reset_required(*lease_b), "B enters ResetRequired");
     const auto op_c = operation_identity(inc, 3);
     check(!route.reserve(op_c, run_identity(inc, 3), established(11, 0xAB),
                          refusal)
                .has_value() &&
               refusal == RouteRefusal::RouteBusy,
-          "next-TU C inadmissible while B is ReconcileRequired");
+          "next-TU C inadmissible while B is ResetRequired");
     const uint64_t gen_b = lease_b->route_owner_generation();
     route.resolve_and_release();
     check(!route.event_current(gen_b, op_b),
-          "late B event stale after resolve (generation advanced)");
+          "late B event stale after reset resolve (generation advanced)");
     auto lease_c = route.reserve(op_c, run_identity(inc, 3),
                                  established(11, 0xAB), refusal);
-    check(lease_c.has_value(), "C admits after reconcile resolution");
+    check(lease_c.has_value(), "C admits after reset resolution");
+
+    // ReconcileRequired keeps the route inadmissible after a committed
+    // operation until its durable outcome is resolved.
+    check(route.activate(*lease_c), "C activates");
+    check(route.mark_reconcile_required(*lease_c),
+          "C enters ReconcileRequired");
+    const auto op_d = operation_identity(inc, 4);
+    check(!route.reserve(op_d, run_identity(inc, 4), established(11, 0xAB),
+                         refusal)
+               .has_value() &&
+              refusal == RouteRefusal::RouteBusy,
+          "next-TU D inadmissible while C is ReconcileRequired");
+    const uint64_t gen_c = lease_c->route_owner_generation();
+    route.resolve_and_release();
+    check(!route.event_current(gen_c, op_c),
+          "late C event stale after reconcile resolve (generation advanced)");
+    auto lease_d = route.reserve(op_d, run_identity(inc, 4),
+                                 established(11, 0xAB), refusal);
+    check(lease_d.has_value(), "D admits after reconcile resolution");
 
     // A moved-from lease loses authority.
-    RouteSessionLease moved = std::move(*lease_c);
-    check(moved.valid() && !lease_c->valid(), "lease authority is move-only");
+    RouteSessionLease moved = std::move(*lease_d);
+    check(moved.valid() && !lease_d->valid(), "lease authority is move-only");
 
     if (g_fail != 0) {
         std::fprintf(stderr, "%d failure(s)\n", g_fail);

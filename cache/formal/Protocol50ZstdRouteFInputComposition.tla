@@ -91,10 +91,25 @@ CoreIndependent ==
     \* At the bounded final epoch, owner cancellation is already the
     \* terminal operation outcome.  Do not let an independent core turn that
     \* outcome into ClassifyFault (or any other transport step) while the
-    \* route is still reset-required.  Non-final epochs retain their ordinary
+    \* route is still reset-required.  Non-final epochs use the explicit
     \* classify -> offer -> ack -> reset-commit path below.
-    /\ ~FinalCancelledResetRequiredState
+    /\ ~(owner.phase = "closed" /\ owner.stage = "cancelled"
+         /\ core.phase = "reset-required" /\ core.resetRequired)
     /\ Core!TransportNext
+    /\ UNCHANGED owner
+
+(***************************************************************************
+ Once the F-input owner has linearized a touched cancellation, reset
+ classification/offer/ack are still core-owned state transitions, but they
+ may not race as independent transport work with the closed owner.  Keep
+ those transitions on this explicit composition edge so the owner-retire
+ handoff remains the only route-reset completion boundary.
+***************************************************************************)
+OwnerCancelledResetProgress ==
+    /\ owner.phase = "closed"
+    /\ owner.stage = "cancelled"
+    /\ core.epoch < 1
+    /\ (Core!ClassifyFault \/ Core!ResetOffer \/ Core!ResetAck)
     /\ UNCHANGED owner
 
 ContextLossWithoutPreparedOwner ==
@@ -185,6 +200,7 @@ RejectStaleOwnerEvent ==
 
 CompositionCoreNext ==
     CoreIndependent
+    \/ OwnerCancelledResetProgress
     \/ ContextLossWithoutPreparedOwner
     \/ ContextLossAfterPreparedSync
     \/ ObservePreparedSync

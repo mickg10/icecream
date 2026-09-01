@@ -143,6 +143,10 @@ public:
     [[nodiscard]] bool settle_and_release(const RouteSessionLease& lease);
     // Any live state -> ReconcileRequired (e.g. control loss after commit).
     [[nodiscard]] bool mark_reconcile_required(const RouteSessionLease& lease);
+    // Active -> ResetRequired when endpoint work touched the route context
+    // before a durable commit; reset must complete before the route can be
+    // reused.  A committed operation uses reconciliation instead.
+    [[nodiscard]] bool mark_reset_required(const RouteSessionLease& lease);
     // ReconcileRequired/ResetRequired -> Idle after the owner resolves it; the
     // generation advances so late events from the old operation are stale.
     void resolve_and_release() noexcept;
