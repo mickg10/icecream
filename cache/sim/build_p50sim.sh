@@ -85,13 +85,25 @@ artifact_json() {
         printf 'null'
     fi
 }
+libbsc_receipt=null
+if [ "$with_libbsc" -eq 1 ]; then
+    libbsc_root=/tanksmall/scratch/ictmp/libbsc-issue16
+    libbsc_head=$(git -C "$libbsc_root" rev-parse HEAD)
+    libbsc_tree=$(git -C "$libbsc_root" rev-parse 'HEAD^{tree}')
+    libbsc_receipt=$(printf '{"source_root":"%s","head":"%s","tree":"%s","archive_sha256":"39edf31118aa546a0439a08e730a7bcab522f376fa9a715fc17a3add4c760ccf","header":%s,"library":%s,"provenance":%s,"source_manifest":%s}' \
+        "$libbsc_root" "$libbsc_head" "$libbsc_tree" \
+        "$(artifact_json "$libbsc_root/libbsc/libbsc.h")" \
+        "$(artifact_json "$libbsc_root/build-gcc2/libbsc.a")" \
+        "$(artifact_json "$build_root/vendor/libbsc/PROVENANCE")" \
+        "$(artifact_json "$build_root/vendor/libbsc/SOURCE-MANIFEST.sha256")")
+fi
 compiler_path=$(command -v "$cxx" || printf '%s' "$cxx")
 compiler_version=$($cxx --version 2>/dev/null | head -n 1 | tr '\n' ' ')
-printf '{"schema":"icecream-p50sim-build-v1","source":{"root":"%s","head":"%s","tree":"%s","tracked_clean":true},"binary":{"path":"%s","sha256":"%s","bytes":%s},"inputs":{"build_script":%s,"p50sim_source":%s,"config_h":%s,"cache_makefile":%s,"services_makefile":%s},"configuration":{"with_libbsc":%s,"make_mode":"%s","dependency_root":"%s","compiler_path":"%s","compiler_version":"%s"}}\n' \
+printf '{"schema":"icecream-p50sim-build-v1","source":{"root":"%s","head":"%s","tree":"%s","tracked_clean":true},"binary":{"path":"%s","sha256":"%s","bytes":%s},"inputs":{"build_script":%s,"p50sim_source":%s,"config_h":%s,"cache_makefile":%s,"services_makefile":%s},"libbsc":%s,"configuration":{"with_libbsc":%s,"make_mode":"%s","dependency_root":"%s","compiler_path":"%s","compiler_version":"%s"}}\n' \
     "$git_root" "$source_commit" "$source_tree" "$output" "$(sha256_file "$output")" "$(bytes_file "$output")" \
     "$(artifact_json "$sim_dir/build_p50sim.sh")" "$(artifact_json "$sim_dir/p50sim.cpp")" \
     "$(artifact_json "$build_root/config.h")" "$(artifact_json "$build_root/cache/Makefile")" \
-    "$(artifact_json "$build_root/services/Makefile")" "$with_libbsc" \
+    "$(artifact_json "$build_root/services/Makefile")" "$libbsc_receipt" "$with_libbsc" \
     "$(if [ -f "$build_root/cache/Makefile" ] && [ -f "$build_root/services/Makefile" ]; then printf product_make; else printf direct_sources; fi)" \
     "$dep_root" "$compiler_path" "$compiler_version" > "$receipt_temporary"
 mv "$receipt_temporary" "$receipt"
