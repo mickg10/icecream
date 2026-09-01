@@ -138,7 +138,7 @@ ready_trace_pid() {
     test "$ready_line_count" = 1 || return 1
     ready_line=$(cat "$ready_trace") || return 1
     printf '%s\n' "$ready_line" | grep -Eq \
-        '^READY v2 generation=[^[:space:]]+ attempt=[^[:space:]]+ F_STORE_GENERATION=[^[:space:]]+ DERIVATION_VERSION=[^[:space:]]+ pid=[0-9]+ C_STORE_GUID=[0-9A-Fa-f]+ F_STORE_GUID=[0-9A-Fa-f]+ PATH=[^[:space:]]+ DIGEST=[0-9A-Fa-f]+ DEV=[0-9]+ INO=[0-9]+$' || return 1
+        '^READY v2 generation=[1-9][0-9]* attempt=[1-9][0-9]* F_STORE_GENERATION=[1-9][0-9]* DERIVATION_VERSION=1 pid=[1-9][0-9]* C_STORE_GUID=[0-9A-Fa-f]{32} F_STORE_GUID=[0-9A-Fa-f]{32} PATH=[^[:space:]]+ DIGEST=[0-9A-Fa-f]{32} DEV=[1-9][0-9]* INO=[1-9][0-9]*$' || return 1
     ready_pid=$(printf '%s\n' "$ready_line" |
         sed -n 's/.* pid=\([0-9][0-9]*\) .*/\1/p')
     test -n "$ready_pid" || return 1
@@ -150,7 +150,7 @@ ready_trace_pid() {
 # process or contacting a remote host.
 ready_trace_valid="$tmp_root/ready-trace-valid"
 cat >"$ready_trace_valid" <<'EOF'
-READY v2 generation=1 attempt=1 F_STORE_GENERATION=1 DERIVATION_VERSION=1 pid=42 C_STORE_GUID=00112233445566778899aabbccddeeff F_STORE_GUID=ffeeddccbbaa99887766554433221100 PATH=/tmp/p50-ready.sock DIGEST=00112233445566778899aabbccdd DEV=1 INO=2
+READY v2 generation=1 attempt=1 F_STORE_GENERATION=1 DERIVATION_VERSION=1 pid=42 C_STORE_GUID=00112233445566778899aabbccddeeff F_STORE_GUID=ffeeddccbbaa99887766554433221100 PATH=/tmp/p50-ready.sock DIGEST=00112233445566778899aabbccddeeff DEV=1 INO=2
 EOF
 test "$(ready_trace_pid "$ready_trace_valid")" = 42
 ready_trace_red() {
@@ -174,16 +174,34 @@ ready_trace_red missing-pid "$ready_trace_no_pid"
 ready_trace_malformed="$tmp_root/ready-trace-malformed"
 sed 's/^READY v2 /READY v1 /' "$ready_trace_valid" >"$ready_trace_malformed"
 ready_trace_red malformed-record "$ready_trace_malformed"
+ready_trace_generation_bogus="$tmp_root/ready-trace-generation-bogus"
+sed 's/generation=1 /generation=bogus /' "$ready_trace_valid" >"$ready_trace_generation_bogus"
+ready_trace_red nonnumeric-generation "$ready_trace_generation_bogus"
+ready_trace_pid_zero="$tmp_root/ready-trace-pid-zero"
+sed 's/ pid=42 / pid=0 /' "$ready_trace_valid" >"$ready_trace_pid_zero"
+ready_trace_red zero-pid "$ready_trace_pid_zero"
+ready_trace_dev_zero="$tmp_root/ready-trace-dev-zero"
+sed 's/ DEV=1 / DEV=0 /' "$ready_trace_valid" >"$ready_trace_dev_zero"
+ready_trace_red zero-device "$ready_trace_dev_zero"
+ready_trace_ino_zero="$tmp_root/ready-trace-ino-zero"
+sed 's/ INO=2$/ INO=0/' "$ready_trace_valid" >"$ready_trace_ino_zero"
+ready_trace_red zero-inode "$ready_trace_ino_zero"
 
 mutant_sidecar_records() {
     runtime_root=$1
     if test -n "${interruption_ready_trace:-}" && \
             test -s "$interruption_ready_trace"; then
         process_pid=$(ready_trace_pid "$interruption_ready_trace") || return 1
-        mutant_sidecar_record_for_pid "$runtime_root" "$process_pid" && return 0
+        if mutant_sidecar_record_for_pid "$runtime_root" "$process_pid"; then
+            return 0
+        else
+            record_status=$?
+        fi
         # A valid READY owner that has already exited is an empty result;
-        # malformed/duplicate READY input returned above is the parser error.
-        return 0
+        # an existing owner with wrong executable/socket/starttime/stat
+        # identity is a hard error and must not be treated as empty.
+        test -d "/proc/$process_pid" || return 0
+        return "$record_status"
     fi
     if test "${ICECC_P50_TEST_FORBID_PROC_FALLBACK:-0}" = 1; then
         echo 'FAIL: sidecar ownership discovery used forbidden /proc fallback' >&2
@@ -193,6 +211,35 @@ mutant_sidecar_records() {
         process_pid=${process_root##*/}
         mutant_sidecar_record_for_pid "$runtime_root" "$process_pid" || continue
     done
+}
+
+records_to_pids() {
+    records_input=$1
+    pids_output=$2
+    : >"$pids_output" || return 1
+    while IFS= read -r sidecar_record; do
+        test -n "$sidecar_record" || continue
+        record_pid=${sidecar_record%%|*}
+        record_rest=${sidecar_record#*|}
+        test "$record_rest" != "$sidecar_record" || return 1
+        record_start=${record_rest%%|*}
+        record_rest=${record_rest#*|}
+        test -n "$record_start" || return 1
+        test "$record_rest" != "$record_start" || return 1
+        record_exe=${record_rest%%|*}
+        record_rest=${record_rest#*|}
+        test -n "$record_exe" || return 1
+        test "$record_rest" != "$record_exe" || return 1
+        record_socket_identity=${record_rest%%|*}
+        record_socket_path=${record_rest#*|}
+        test -n "$record_socket_identity" || return 1
+        test "$record_socket_path" != "$record_rest" || return 1
+        test -n "$record_socket_path" || return 1
+        case "$record_pid" in ''|0|*[!0-9]*) return 1 ;; esac
+        case "$record_start" in ''|*[!0-9]*) return 1 ;; esac
+        case "$record_socket_identity" in *:*) ;; *) return 1 ;; esac
+        printf '%s\n' "$record_pid" >>"$pids_output" || return 1
+    done <"$records_input"
 }
 
 mutant_sidecar_record_for_pid() {
@@ -212,6 +259,28 @@ mutant_sidecar_record_for_pid() {
     printf '%s|%s|%s|%s|%s\n' "$process_pid" "$process_starttime" \
         "$process_exe" "$process_socket_identity" "$process_socket"
 }
+
+# A READY PID that is still alive must be rejected when it is not the cache
+# service, or when its command/socket ownership cannot be authenticated.
+ready_trace_live_pid="$tmp_root/ready-trace-live-pid"
+sed "s/ pid=42 / pid=$$ /" "$ready_trace_valid" >"$ready_trace_live_pid"
+interruption_ready_trace="$ready_trace_live_pid"
+if mutant_sidecar_records "$tmp_root/no-runtime" \
+        >"$tmp_root/wrong-service.output" 2>"$tmp_root/wrong-service.error"; then
+    echo 'FAIL: READY PID for the wrong service was accepted' >&2
+    exit 1
+fi
+echo 'ok - READY PID for the wrong service is rejected'
+service_before_ownership_test=$service
+service=$(readlink "/proc/$$/exe")
+if mutant_sidecar_records "$tmp_root/no-runtime" \
+        >"$tmp_root/ownership.output" 2>"$tmp_root/ownership.error"; then
+    echo 'FAIL: READY PID without authenticated socket ownership was accepted' >&2
+    exit 1
+fi
+service=$service_before_ownership_test
+echo 'ok - READY PID without authenticated socket ownership is rejected'
+unset interruption_ready_trace
 
 sidecar_record_matches() {
     ms_record=$1
@@ -295,6 +364,14 @@ if ICECC_P50_TEST_FORBID_PROC_FALLBACK=1 \
     exit 1
 fi
 echo 'ok - malformed READY trace status propagates through cleanup'
+if mutant_sidecar_records "$tmp_root/no-runtime" \
+        >"$tmp_root/final-parser.output" 2>"$tmp_root/final-parser.error" && \
+        records_to_pids "$tmp_root/final-parser.output" \
+            "$tmp_root/final-parser.pids"; then
+    echo 'FAIL: malformed READY trace reached final PID extraction' >&2
+    exit 1
+fi
+echo 'ok - malformed READY trace cannot reach final PID extraction'
 unset interruption_ready_trace
 
 # Keep the runtime prefix short enough for the adapter's sockaddr_un path
@@ -334,6 +411,25 @@ grep -qF 'forbidden /proc fallback' "$ready_fallback_error" || {
 }
 echo 'ok - deleted READY trace is RED at the parent fallback guard'
 interruption_ready_trace="$tmp_root/interruption.ready"
+
+# Parent-side failures must terminate and reap the exact wrapper owner.  Keep
+# this helper argument-based so it cannot accidentally signal a sibling or a
+# process group.
+stop_interruption_wrapper() {
+    wrapper_pid=$1
+    kill -CONT "$wrapper_pid" 2>/dev/null || :
+    kill -TERM "$wrapper_pid" 2>/dev/null || :
+    wait "$wrapper_pid" 2>/dev/null || :
+}
+sleep 60 &
+interruption_orphan_test_pid=$!
+stop_interruption_wrapper "$interruption_orphan_test_pid"
+if kill -0 "$interruption_orphan_test_pid" 2>/dev/null; then
+    echo 'FAIL: parent wrapper cleanup left an orphan' >&2
+    exit 1
+fi
+echo 'ok - parent wrapper cleanup terminates and reaps the exact owner'
+
 (
     interruption_child_pid=
     stop_interruption_child() {
@@ -377,12 +473,30 @@ interruption_ready_trace="$tmp_root/interruption.ready"
         kill -0 "$interruption_child_pid" 2>/dev/null || exit 1
         sleep 0.01
     done
+    interruption_wrapper_record_file=$(mktemp "$tmp_root/interruption-wrapper-records.XXXXXX") || {
+        stop_interruption_child
+        exit 1
+    }
+    interruption_wrapper_pids_file=$(mktemp "$tmp_root/interruption-wrapper-pids.XXXXXX") || {
+        rm -f -- "$interruption_wrapper_record_file"
+        stop_interruption_child
+        exit 1
+    }
     interruption_sidecar_wait=0
     while test "$interruption_sidecar_wait" -lt 40; do
-        if interruption_wrapper_records=$(mutant_sidecar_records "$interruption_runtime_root"); then
-            interruption_wrapper_pids=$(printf '%s\n' "$interruption_wrapper_records" |
-                cut -d'|' -f1)
+        if mutant_sidecar_records "$interruption_runtime_root" \
+                >"$interruption_wrapper_record_file" && \
+                records_to_pids "$interruption_wrapper_record_file" \
+                    "$interruption_wrapper_pids_file"; then
+            if interruption_wrapper_pids=$(cat "$interruption_wrapper_pids_file"); then
+                :
+            else
+                rm -f -- "$interruption_wrapper_record_file" "$interruption_wrapper_pids_file"
+                stop_interruption_child
+                exit 1
+            fi
         else
+            rm -f -- "$interruption_wrapper_record_file" "$interruption_wrapper_pids_file"
             stop_interruption_child
             exit 1
         fi
@@ -391,9 +505,11 @@ interruption_ready_trace="$tmp_root/interruption.ready"
         interruption_sidecar_wait=$((interruption_sidecar_wait + 1))
     done
     if test -z "$interruption_wrapper_pids"; then
+        rm -f -- "$interruption_wrapper_record_file" "$interruption_wrapper_pids_file"
         stop_interruption_child
         exit 1
     fi
+    rm -f -- "$interruption_wrapper_record_file" "$interruption_wrapper_pids_file" || exit 1
     # Hold the baseline at the authenticated READY edge until the parent has
     # observed the exact sidecar record.  The parent then requests the
     # interruption, so the sidecar cannot disappear before ownership polling
@@ -410,6 +526,15 @@ interruption_ready_trace="$tmp_root/interruption.ready"
 ) &
 interruption_wrapper_pid=$!
 interruption_sidecar_pids=
+interruption_parent_record_file=$(mktemp "$tmp_root/interruption-parent-records.XXXXXX") || {
+    stop_interruption_wrapper "$interruption_wrapper_pid"
+    exit 1
+}
+interruption_parent_pids_file=$(mktemp "$tmp_root/interruption-parent-pids.XXXXXX") || {
+    rm -f -- "$interruption_parent_record_file"
+    stop_interruption_wrapper "$interruption_wrapper_pid"
+    exit 1
+}
 interruption_poll=0
 while test ! -s "$interruption_ready_trace" && \
         kill -0 "$interruption_wrapper_pid" 2>/dev/null && \
@@ -418,18 +543,29 @@ while test ! -s "$interruption_ready_trace" && \
     interruption_poll=$((interruption_poll + 1))
 done
 if test ! -s "$interruption_ready_trace"; then
-    kill -TERM "$interruption_wrapper_pid" 2>/dev/null || :
-    wait "$interruption_wrapper_pid" 2>/dev/null || :
+    rm -f -- "$interruption_parent_record_file" "$interruption_parent_pids_file"
+    stop_interruption_wrapper "$interruption_wrapper_pid"
     echo 'FAIL: interruption regression did not publish a complete READY trace' >&2
     cat "$interruption_log" >&2
     exit 1
 fi
 interruption_poll=0
 while test "$interruption_poll" -lt 200; do
-    if interruption_sidecar_records=$(mutant_sidecar_records "$interruption_runtime_root"); then
-        interruption_sidecar_pids=$(printf '%s\n' "$interruption_sidecar_records" |
-            cut -d'|' -f1)
+    if mutant_sidecar_records "$interruption_runtime_root" \
+            >"$interruption_parent_record_file" && \
+            records_to_pids "$interruption_parent_record_file" \
+                "$interruption_parent_pids_file"; then
+        if interruption_sidecar_pids=$(cat "$interruption_parent_pids_file"); then
+            :
+        else
+            rm -f -- "$interruption_parent_record_file" "$interruption_parent_pids_file"
+            stop_interruption_wrapper "$interruption_wrapper_pid"
+            echo 'FAIL: interruption READY PID extraction failed' >&2
+            exit 1
+        fi
     else
+        rm -f -- "$interruption_parent_record_file" "$interruption_parent_pids_file"
+        stop_interruption_wrapper "$interruption_wrapper_pid"
         echo 'FAIL: interruption READY identity did not resolve to its exact sidecar' >&2
         exit 1
     fi
@@ -439,8 +575,8 @@ while test "$interruption_poll" -lt 200; do
     interruption_poll=$((interruption_poll + 1))
 done
 if test -z "$interruption_sidecar_pids"; then
-    kill -TERM "$interruption_wrapper_pid" 2>/dev/null || :
-    wait "$interruption_wrapper_pid" 2>/dev/null || :
+    rm -f -- "$interruption_parent_record_file" "$interruption_parent_pids_file"
+    stop_interruption_wrapper "$interruption_wrapper_pid"
     echo 'FAIL: interruption regression did not observe a live cache sidecar' >&2
     cat "$interruption_log" >&2
     exit 1
@@ -452,17 +588,19 @@ wait "$interruption_wrapper_pid"
 interruption_status=$?
 set -e
 interruption_final_records_file=$(mktemp "$tmp_root/interruption-final-records.XXXXXX")
-if mutant_sidecar_records "$interruption_runtime_root" >"$interruption_final_records_file"; then
-    if interruption_final_records=$(cat "$interruption_final_records_file"); then
-        interruption_final_pids=$(printf '%s\n' "$interruption_final_records" |
-            cut -d'|' -f1)
+interruption_final_pids_file=$(mktemp "$tmp_root/interruption-final-pids.XXXXXX")
+if mutant_sidecar_records "$interruption_runtime_root" >"$interruption_final_records_file" && \
+        records_to_pids "$interruption_final_records_file" "$interruption_final_pids_file"; then
+    if interruption_final_pids=$(cat "$interruption_final_pids_file"); then
+        :
     else
         interruption_final_pids=parser-output-error
     fi
 else
     interruption_final_pids=parser-error
 fi
-rm -f -- "$interruption_final_records_file"
+rm -f -- "$interruption_parent_record_file" "$interruption_parent_pids_file" \
+    "$interruption_final_records_file" "$interruption_final_pids_file"
 if test "$interruption_status" -ne 0 || \
         test -n "$interruption_final_pids" || \
         test -e "$interruption_runtime_root"; then
