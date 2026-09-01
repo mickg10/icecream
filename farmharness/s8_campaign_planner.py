@@ -19,6 +19,15 @@ import sys
 from pathlib import Path
 from typing import Any
 
+try:  # Works both as a package module and as a direct harness script.
+    from . import s8_raw_ii_predictive_producer as _raw_ii_producer
+    from . import s8_predictive_live_normalizer as _normalizer
+    from . import s8_schema as _s8_schema
+except ImportError:  # pragma: no cover - exercised by direct script runners.
+    import s8_raw_ii_predictive_producer as _raw_ii_producer
+    import s8_predictive_live_normalizer as _normalizer
+    import s8_schema as _s8_schema
+
 
 SCHEMA = "icecream-s8-expanded-campaign-v1"
 DESCRIPTOR_SCHEMA = "icecream-s8-campaign-descriptor-v1"
@@ -29,15 +38,16 @@ CAPABILITY = "icecream.s8.native-live-runner-v1"
 RAW_II_AUTHORITY_SCHEMA = "icecream-s8-raw-ii-planner-authority-v1"
 RAW_II_CAPABILITY = "icecream.s8.raw-ii-control-v1"
 RAW_II_PRODUCER_SOURCE = "s8_raw_ii_predictive_producer.py"
-RAW_II_WITNESS_SCHEMA = "icecream-s8-raw-ii-legacy-wire-witness-v1"
-RAW_II_ENGINE_SCHEMA = "icecream-s8-raw-ii-control-engine-v2"
-RAW_II_SEMANTICS = "s8-current-semantics-v1"
-RAW_II_FORMULA = {
-    "name": "legacy-filechunk-wire-v1",
-    "c_to_f": "compile_file_bytes+file_chunk_bytes+end_bytes",
-}
-RAW_II_BASELINE = "icecream-s8-raw-ii-control-baseline-v1"
-RAW_II_SPLITS = frozenset(("calibration", "held_out_validation"))
+RAW_II_WITNESS_SCHEMA = _raw_ii_producer.WITNESS_SCHEMA
+RAW_II_ENGINE_SCHEMA = _raw_ii_producer.ENGINE_SCHEMA
+RAW_II_SEMANTICS = _s8_schema.CURRENT_SEMANTICS
+RAW_II_FORMULA = _raw_ii_producer.FORMULA
+RAW_II_BASELINE = _normalizer.CONTROL_BASELINE
+RAW_II_ENGINE_SCOPE = _raw_ii_producer.ENGINE_SCOPE
+RAW_II_SPLITS = dict(_s8_schema.SPLITS)
+RAW_II_SUPPORTED_CORPORA = tuple(_s8_schema.CORPORA)
+RAW_II_AUTHORITY_KEYS = frozenset({
+    "schema", "status", "capability", "producer", "producer_source", "cells"})
 TIMESTAMP_RE = re.compile(r"^\d{8}T\d{6}Z$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -106,7 +116,7 @@ def _canonical(value: Any) -> bytes:
 def _private_file(path: Path, label: str) -> bytes:
     try:
         info = path.lstat()
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         raise PlannerError(f"{label}:unavailable:{path}") from exc
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
         raise PlannerError(f"{label}:not_private_regular_file:{path}")
@@ -145,17 +155,21 @@ def _snapshot_file(path: Path, root: Path, label: str) -> tuple[dict[str, object
     try:
         resolved = path.resolve(strict=True)
         resolved.relative_to(root.resolve())
-    except (OSError, ValueError) as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         raise PlannerError(f"{label}:resolved_escape:{path}") from exc
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, flags)
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         raise PlannerError(f"{label}:unavailable:{path}") from exc
     try:
         before = os.fstat(fd)
+        try:
+            current_resolved = path.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise PlannerError(f"{label}:unavailable:{path}") from exc
         if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or
-                resolved != path.resolve(strict=True)):
+                resolved != current_resolved):
             raise PlannerError(f"{label}:not_private_regular_file:{path}")
         digest = hashlib.sha256()
         size = 0
@@ -189,19 +203,19 @@ def _read_snapshot_descriptor(path: Path, label: str, *, keep_bytes: bool = Fals
     """Read and hash one private regular file through a stable descriptor."""
     try:
         path_info = path.lstat()
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         raise PlannerError(f"{label}:unavailable:{path}") from exc
     if (stat.S_ISLNK(path_info.st_mode) or not stat.S_ISREG(path_info.st_mode) or
             path_info.st_nlink != 1):
         raise PlannerError(f"{label}:not_private_regular_file:{path}")
     try:
         resolved = path.resolve(strict=True)
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         raise PlannerError(f"{label}:unavailable:{path}") from exc
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, flags)
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         raise PlannerError(f"{label}:unavailable:{path}") from exc
     try:
         before = os.fstat(fd)
@@ -570,7 +584,7 @@ def _raw_ii_occurrence(value: object, expected: dict[str, object], label: str) -
     return observed
 
 
-def _raw_ii_cell_file(descriptor: object, cell: dict[str, str],
+def _raw_ii_cell_file(descriptor: object, cell: dict[str, str], expected_split: str,
                       expected_occurrences: dict[tuple[int, str, str, int], dict[str, object]],
                       kind: str) -> dict[str, object]:
     """Authenticate one RAW_II witness/engine file and its complete coverage."""
@@ -589,23 +603,33 @@ def _raw_ii_cell_file(descriptor: object, cell: dict[str, str],
     if observed["sha256"] != str(descriptor["sha256"]).lower():
         raise PlannerError(f"raw_ii:{kind}_sha256_mismatch:{cell['corpus']}:{cell['regime']}")
     try:
-        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_json_keys)
+        value = json.loads(
+            raw.decode("utf-8"), object_pairs_hook=_unique_json_keys,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                PlannerError(f"raw_ii:{kind}_non_finite_json:{token}")))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise PlannerError(f"raw_ii:{kind}_invalid_json:{cell['corpus']}:{cell['regime']}") from exc
     if not isinstance(value, dict):
         raise PlannerError(f"raw_ii:{kind}_object_required:{cell['corpus']}:{cell['regime']}")
     expected_schema = RAW_II_WITNESS_SCHEMA if kind == "witness" else RAW_II_ENGINE_SCHEMA
-    if (value.get("schema") != expected_schema or
+    expected_top_level = ({"schema", "semantics", "cell", "split", "formula", "rows"}
+                          if kind == "witness" else
+                          {"schema", "semantics", "cell", "split", "control_baseline",
+                           "engine_scope", "model_id", "rows"})
+    if kind == "engine" and "model_id" not in value:
+        raise PlannerError(f"raw_ii:engine_model_id_invalid:{cell['corpus']}:{cell['regime']}")
+    if (set(value) != expected_top_level or
+            value.get("schema") != expected_schema or
             value.get("semantics") != RAW_II_SEMANTICS or
             value.get("cell") != cell or
             type(value.get("split")) is not str or
-            value.get("split") not in RAW_II_SPLITS):
+            value.get("split") != expected_split):
         raise PlannerError(f"raw_ii:{kind}_scope_invalid:{cell['corpus']}:{cell['regime']}")
     if kind == "witness" and value.get("formula") != RAW_II_FORMULA:
         raise PlannerError(f"raw_ii:{kind}_scope_invalid:{cell['corpus']}:{cell['regime']}")
     if kind == "engine" and value.get("control_baseline") != RAW_II_BASELINE:
         raise PlannerError(f"raw_ii:{kind}_scope_invalid:{cell['corpus']}:{cell['regime']}")
-    if kind == "engine" and value.get("engine_scope") != "raw_ii_control_engine":
+    if kind == "engine" and value.get("engine_scope") != RAW_II_ENGINE_SCOPE:
         raise PlannerError(f"raw_ii:engine_scope_invalid:{cell['corpus']}:{cell['regime']}")
     if kind == "engine" and (not isinstance(value.get("model_id"), str) or
                               re.fullmatch(r"[A-Za-z0-9_.-]+", value["model_id"]) is None):
@@ -613,6 +637,8 @@ def _raw_ii_cell_file(descriptor: object, cell: dict[str, str],
     rows = value.get("rows")
     if not isinstance(rows, list) or not rows:
         raise PlannerError(f"raw_ii:{kind}_rows_invalid:{cell['corpus']}:{cell['regime']}")
+    expected_keys = set(expected_occurrences)
+    expected_ordinals = {key[0] for key in expected_keys}
     seen: set[tuple[int, str, str, int]] = set()
     for index, row in enumerate(rows):
         required = {"ordinal", "source_relative", "source_sha256", "source_bytes", "c_to_f"}
@@ -628,7 +654,7 @@ def _raw_ii_cell_file(descriptor: object, cell: dict[str, str],
                 not isinstance(row["source_sha256"], str) or
                 not SHA256_RE.fullmatch(row["source_sha256"].lower()) or
                 type(row["source_bytes"]) is not int or row["source_bytes"] < 0 or
-                ordinal not in {int(item["ordinal"]) for item in expected_occurrences.values()}):
+                ordinal not in expected_ordinals):
             raise PlannerError(f"raw_ii:{kind}_row_occurrence_invalid:{index}")
         expected = expected_occurrences.get((ordinal, str(row["source_relative"]),
                                              str(row["source_sha256"]).lower(), row["source_bytes"]))
@@ -650,7 +676,6 @@ def _raw_ii_cell_file(descriptor: object, cell: dict[str, str],
             if (type(row["f_to_c_bytes"]) is not int or row["f_to_c_bytes"] <= 0 or
                     type(row["elapsed_ns"]) is not int or row["elapsed_ns"] <= 0):
                 raise PlannerError(f"raw_ii:{kind}_timing_invalid:{index}")
-    expected_keys = set(expected_occurrences)
     if seen != expected_keys:
         raise PlannerError(f"raw_ii:{kind}_coverage_incomplete:{len(seen)}:{len(expected_keys)}")
     return {"path": observed["path"], "bytes": observed["bytes"],
@@ -667,17 +692,41 @@ def _unique_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
+def _producer_corpus_for_manifest(corpus: dict[str, object]) -> str | None:
+    """Map only authoritative planner identities to producer cell names."""
+    manifest_id = corpus.get("manifest_id")
+    project = corpus.get("project")
+    tu_count = corpus.get("tu_count")
+    if (not isinstance(manifest_id, str) or not isinstance(project, str) or
+            type(tu_count) is not int):
+        return None
+    if project in RAW_II_SUPPORTED_CORPORA:
+        return project
+    # The retained LLVM authority calls this manifest ``corpus``/``LLVM``;
+    # the producer's immutable cell contract names the same corpus LLVM-1238.
+    if manifest_id == "corpus" and project == "LLVM" and tu_count == 1238:
+        candidate = next((name for name in RAW_II_SUPPORTED_CORPORA
+                          if name == "LLVM-1238"), None)
+        return candidate
+    return None
+
+
 def _load_raw_ii_authority(path: Path, expected_sha256: str, corpora: list[dict[str, object]],
                             snapshots: list[dict[str, object]]) -> dict[str, object]:
-    raw = _private_file(path, "raw_ii_authority")
+    raw, authority_snapshot, _ = _read_snapshot_descriptor(
+        path, "raw_ii_authority", keep_bytes=True)
     if (not isinstance(expected_sha256, str) or not SHA256_RE.fullmatch(expected_sha256.lower()) or
-            hashlib.sha256(raw).hexdigest() != expected_sha256.lower()):
+            authority_snapshot["sha256"] != expected_sha256.lower()):
         raise PlannerError("raw_ii_authority:sha256_mismatch")
     try:
-        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_json_keys)
+        value = json.loads(
+            raw.decode("utf-8"), object_pairs_hook=_unique_json_keys,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                PlannerError(f"raw_ii_authority:non_finite_json:{token}")))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise PlannerError("raw_ii_authority:invalid_json") from exc
-    if not isinstance(value, dict) or value.get("schema") != RAW_II_AUTHORITY_SCHEMA or value.get("status") != "PASS":
+    if (not isinstance(value, dict) or set(value) != RAW_II_AUTHORITY_KEYS or
+            value.get("schema") != RAW_II_AUTHORITY_SCHEMA or value.get("status") != "PASS"):
         raise PlannerError("raw_ii_authority:schema_or_status_invalid")
     if value.get("capability") != RAW_II_CAPABILITY or value.get("producer") != "farmharness.s8_raw_ii_predictive_producer":
         raise PlannerError("raw_ii_authority:producer_identity_invalid")
@@ -691,7 +740,16 @@ def _load_raw_ii_authority(path: Path, expected_sha256: str, corpora: list[dict[
     for snapshot in snapshots:
         corpus_id = str(snapshot["corpus"])
         by_corpus.setdefault(corpus_id, []).append(snapshot)
-    expected_cells = {str(item["manifest_id"]) for item in corpora}
+    manifest_to_producer = {
+        str(item["manifest_id"]): _producer_corpus_for_manifest(item)
+        for item in corpora}
+    producer_to_manifest = {
+        producer: manifest for manifest, producer in manifest_to_producer.items()
+        if producer is not None}
+    if len(producer_to_manifest) != len([item for item in manifest_to_producer.values()
+                                        if item is not None]):
+        raise PlannerError("raw_ii_authority:corpus_mapping_ambiguous")
+    expected_cells = set(producer_to_manifest)
     cells = value.get("cells")
     if not isinstance(cells, list):
         raise PlannerError("raw_ii_authority:cells_invalid")
@@ -714,27 +772,33 @@ def _load_raw_ii_authority(path: Path, expected_sha256: str, corpora: list[dict[
         if (not isinstance(entry.get("witness"), dict) or
                 not isinstance(entry.get("engine"), dict)):
             raise PlannerError(f"raw_ii_authority:cell_file_descriptor_invalid:{index}")
-        key = (str(cell["corpus"]), str(cell["regime"]))
+        producer_corpus = str(cell["corpus"])
+        manifest_id = producer_to_manifest.get(producer_corpus)
+        if manifest_id is None or producer_corpus not in RAW_II_SUPPORTED_CORPORA:
+            raise PlannerError(f"raw_ii_authority:corpus_mapping_invalid:{producer_corpus}")
+        key = (manifest_id, str(cell["regime"]))
         cell_key = f"{key[0]}/{key[1]}"
         if cell_key in authenticated:
             raise PlannerError(f"raw_ii_authority:duplicate_cell:{key[0]}:{key[1]}")
         expected = {}
-        for item in by_corpus[key[0]]:
+        for item in by_corpus[manifest_id]:
             relative = str(Path(str(item["path"])).resolve().relative_to(Path(str(next(
                 corpus["manifest"]["path"] for corpus in corpora if corpus["manifest_id"] == key[0]))).parent.resolve()))
             expected[(int(item["ordinal"]), relative, str(item["sha256"]).lower(), int(item["bytes"]))] = {
                 **item, "source_relative": relative}
         witness = _raw_ii_cell_file(
-            entry["witness"], {"corpus": key[0], "profile": "RAW_II", "regime": key[1]},
+            entry["witness"], {"corpus": producer_corpus, "profile": "RAW_II", "regime": key[1]},
+            RAW_II_SPLITS[producer_corpus],
             expected, "witness")
         engine = _raw_ii_cell_file(
-            entry["engine"], {"corpus": key[0], "profile": "RAW_II", "regime": key[1]},
+            entry["engine"], {"corpus": producer_corpus, "profile": "RAW_II", "regime": key[1]},
+            RAW_II_SPLITS[producer_corpus],
             expected, "engine")
         if witness["split"] != engine["split"]:
-            raise PlannerError(f"raw_ii_authority:split_mismatch:{key[0]}:{key[1]}")
-        previous_split = corpus_splits.setdefault(key[0], str(witness["split"]))
+            raise PlannerError(f"raw_ii_authority:split_mismatch:{manifest_id}:{key[1]}")
+        previous_split = corpus_splits.setdefault(manifest_id, str(witness["split"]))
         if previous_split != witness["split"]:
-            raise PlannerError(f"raw_ii_authority:corpus_split_mismatch:{key[0]}")
+            raise PlannerError(f"raw_ii_authority:corpus_split_mismatch:{manifest_id}")
         for descriptor, paths, kind in ((witness, witness_paths, "witness"), (engine, engine_paths, "engine")):
             if str(descriptor["path"]) in paths:
                 raise PlannerError(f"raw_ii_authority:duplicate_{kind}_path")
@@ -742,7 +806,8 @@ def _load_raw_ii_authority(path: Path, expected_sha256: str, corpora: list[dict[
                 raise PlannerError("raw_ii_authority:witness_engine_path_alias")
             paths.add(str(descriptor["path"]))
             all_paths.add(str(descriptor["path"]))
-        authenticated[cell_key] = {"cell": dict(cell), "witness": witness, "engine": engine}
+        authenticated[cell_key] = {"cell": dict(cell), "witness": witness, "engine": engine,
+                                   "planner_manifest_id": manifest_id}
     return {"path": str(path.resolve()), "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
             "schema": RAW_II_AUTHORITY_SCHEMA, "capability": RAW_II_CAPABILITY,
             "producer": value["producer"], "producer_source": producer_source,

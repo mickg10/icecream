@@ -145,7 +145,11 @@ def _raw_authority_fixture(tmp_path: Path, inventory: Path, *, rows: str = "full
                    for row in source_rows]
     if rows == "duplicate":
         witness_rows.append(witness_rows[0])
-    cell = {"corpus": corpus["manifest_id"], "profile": "RAW_II", "regime": "cold"}
+    producer_corpus = planner._producer_corpus_for_manifest({
+        "manifest_id": corpus["manifest_id"], "project": corpus["project"],
+        "tu_count": corpus["tu_count"]})
+    assert producer_corpus is not None
+    cell = {"corpus": producer_corpus, "profile": "RAW_II", "regime": "cold"}
     file_cell = dict(cell)
     if wrong_cell:
         file_cell["regime"] = "warm"
@@ -503,13 +507,145 @@ def test_raw_ii_authority_rejects_witness_engine_split_substitution(tmp_path: Pa
         "sha256": hashlib.sha256(engine_path.read_bytes()).hexdigest(),
     }
     authority.write_bytes(planner._canonical(value))
-    with pytest.raises(planner.PlannerError, match="split_mismatch"):
+    with pytest.raises(planner.PlannerError, match="scope_invalid"):
         planner.plan_campaign(
             inventory, recovery, recovery_sha, matrix, matrix_sha, tmp_path / "out",
             "20260829T000000Z", current_image_name="image:tag",
             current_image_id="sha256:" + "a" * 64,
             raw_ii_authority_manifest=authority,
             raw_ii_authority_manifest_sha256=hashlib.sha256(authority.read_bytes()).hexdigest())
+
+
+@pytest.mark.parametrize("mutation", ["unexpected", "non_finite"])
+def test_raw_ii_authority_top_level_is_exact_and_finite(tmp_path: Path,
+                                                        mutation: str) -> None:
+    inventory, recovery, recovery_sha, matrix, matrix_sha = _authority(tmp_path / "authority")
+    authority, _ = _raw_authority_fixture(tmp_path / "raw", inventory)
+    value = json.loads(authority.read_text())
+    if mutation == "unexpected":
+        value["unexpected"] = True
+        match = "schema_or_status_invalid"
+        authority.write_bytes(planner._canonical(value))
+    else:
+        value["status"] = float("nan")
+        match = "non_finite_json"
+        authority.write_text(json.dumps(value, sort_keys=True) + "\n")
+    with pytest.raises(planner.PlannerError, match=match):
+        planner.plan_campaign(
+            inventory, recovery, recovery_sha, matrix, matrix_sha, tmp_path / "out",
+            "20260829T000000Z", current_image_name="image:tag",
+            current_image_id="sha256:" + "a" * 64,
+            raw_ii_authority_manifest=authority,
+            raw_ii_authority_manifest_sha256=hashlib.sha256(authority.read_bytes()).hexdigest())
+
+
+def test_raw_ii_authority_top_level_symlink_fails_closed(tmp_path: Path) -> None:
+    inventory, recovery, recovery_sha, matrix, matrix_sha = _authority(tmp_path / "authority")
+    authority, _ = _raw_authority_fixture(tmp_path / "raw", inventory)
+    replacement = authority.with_name("authority-copy.json")
+    replacement.write_bytes(authority.read_bytes())
+    authority.unlink()
+    authority.symlink_to(replacement)
+    with pytest.raises(planner.PlannerError, match="raw_ii_authority:not_private_regular_file"):
+        planner.plan_campaign(
+            inventory, recovery, recovery_sha, matrix, matrix_sha, tmp_path / "out",
+            "20260829T000000Z", current_image_name="image:tag",
+            current_image_id="sha256:" + "a" * 64,
+            raw_ii_authority_manifest=authority,
+            raw_ii_authority_manifest_sha256="0" * 64)
+
+
+def test_raw_ii_authority_deleted_top_level_fails_closed(tmp_path: Path) -> None:
+    inventory, recovery, recovery_sha, matrix, matrix_sha = _authority(tmp_path / "authority")
+    authority, authority_sha = _raw_authority_fixture(tmp_path / "raw", inventory)
+    authority.unlink()
+    with pytest.raises(planner.PlannerError, match="raw_ii_authority:unavailable"):
+        planner.plan_campaign(
+            inventory, recovery, recovery_sha, matrix, matrix_sha, tmp_path / "out",
+            "20260829T000000Z", current_image_name="image:tag",
+            current_image_id="sha256:" + "a" * 64,
+            raw_ii_authority_manifest=authority,
+            raw_ii_authority_manifest_sha256=authority_sha)
+
+
+@pytest.mark.parametrize("kind", ["witness", "engine"])
+def test_raw_ii_authority_deleted_cell_artifact_fails_closed(tmp_path: Path,
+                                                              kind: str) -> None:
+    inventory, recovery, recovery_sha, matrix, matrix_sha = _authority(tmp_path / "authority")
+    authority, authority_sha = _raw_authority_fixture(tmp_path / "raw", inventory)
+    value = json.loads(authority.read_text())
+    Path(value["cells"][0][kind]["path"]).unlink()
+    with pytest.raises(planner.PlannerError, match=f"raw_ii_{kind}:unavailable"):
+        planner.plan_campaign(
+            inventory, recovery, recovery_sha, matrix, matrix_sha, tmp_path / "out",
+            "20260829T000000Z", current_image_name="image:tag",
+            current_image_id="sha256:" + "a" * 64,
+            raw_ii_authority_manifest=authority,
+            raw_ii_authority_manifest_sha256=authority_sha)
+
+
+def test_raw_ii_authority_unmapped_manifest_cannot_be_ready(tmp_path: Path) -> None:
+    inventory, recovery, recovery_sha, matrix, matrix_sha = _authority(tmp_path / "authority")
+    authority, _ = _raw_authority_fixture(tmp_path / "raw", inventory)
+    value = json.loads(authority.read_text())
+    value["cells"][0]["cell"]["corpus"] = "corpus4"
+    authority.write_bytes(planner._canonical(value))
+    with pytest.raises(planner.PlannerError, match="cell_scope_invalid"):
+        planner.plan_campaign(
+            inventory, recovery, recovery_sha, matrix, matrix_sha, tmp_path / "out",
+            "20260829T000000Z", current_image_name="image:tag",
+            current_image_id="sha256:" + "a" * 64,
+            raw_ii_authority_manifest=authority,
+            raw_ii_authority_manifest_sha256=hashlib.sha256(authority.read_bytes()).hexdigest())
+    assert planner._producer_corpus_for_manifest({
+        "manifest_id": "corpus4", "project": "abseil+protobuf", "tu_count": 700}) is None
+
+
+def test_raw_ii_manifest_mapping_matches_shared_producer_contract() -> None:
+    expected = {
+        "corpus": "LLVM-1238", "corpus2": "RocksDB",
+        "corpus3": "DuckDB", "corpus7": "fmt",
+    }
+    observed = {
+        manifest_id: planner._producer_corpus_for_manifest({
+            "manifest_id": manifest_id, "project": project, "tu_count": count})
+        for manifest_id, project, count in planner.CORPUS_AUTHORITY
+    }
+    assert {key: observed[key] for key in expected} == expected
+    assert all(observed[key] is None for key in observed if key not in expected)
+    assert set(expected.values()) == set(planner.RAW_II_SUPPORTED_CORPORA)
+    assert set(expected) == {"corpus", "corpus2", "corpus3", "corpus7"}
+
+
+def test_raw_ii_authority_validates_12490_occurrences_without_quadratic_scan(
+        tmp_path: Path) -> None:
+    count = 12490
+    digest = "1" * 64
+    expected = {
+        (ordinal, f"tu-{ordinal:05d}.cc", digest, 1): {
+            "ordinal": ordinal, "source_relative": f"tu-{ordinal:05d}.cc",
+            "sha256": digest, "bytes": 1,
+        }
+        for ordinal in range(count)
+    }
+    rows = [{
+        "ordinal": ordinal, "source_relative": f"tu-{ordinal:05d}.cc",
+        "source_sha256": digest, "source_bytes": 1,
+        "c_to_f": {"compile_file_bytes": 1, "file_chunk_bytes": 1,
+                   "end_bytes": 1, "total_bytes": 3},
+    } for ordinal in range(count)]
+    value = {"schema": planner.RAW_II_WITNESS_SCHEMA,
+             "semantics": planner.RAW_II_SEMANTICS,
+             "cell": {"corpus": "fmt", "profile": "RAW_II", "regime": "cold"},
+             "split": "calibration", "formula": planner.RAW_II_FORMULA,
+             "rows": rows}
+    path = tmp_path / "large-witness.json"
+    path.write_bytes(planner._canonical(value))
+    descriptor = {"path": str(path), "bytes": path.stat().st_size,
+                  "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    result = planner._raw_ii_cell_file(
+        descriptor, value["cell"], "calibration", expected, "witness")
+    assert result["coverage"] == count
 
 
 @pytest.mark.parametrize(("mutation", "match"), [
