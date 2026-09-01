@@ -5,12 +5,15 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import re
 import stat
 import subprocess
+import sys
+import time
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence, TextIO
 
 try:
     from . import s4_multihost_c1f4 as s4
@@ -31,6 +34,8 @@ IMAGE_CONFIG = s4.EXPECTED_IMAGE_CONFIG_ID
 IDLE_LOAD_THRESHOLD = 0.50
 MIN_IDLE_PERCENT = 95.0
 MAX_CAPTURE_AGE_SECONDS = 300.0
+MAX_IDLE_COOLDOWN_TIMEOUT_SECONDS = 600.0
+MAX_IDLE_COOLDOWN_INTERVAL_SECONDS = 60.0
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
 ISO_UTC = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
@@ -308,6 +313,92 @@ def build_authority(*, root: Path, captures: Mapping[str, Mapping[str, object]],
     return authority
 
 
+def _validate_idle_cooldown(value: object, label: str, *, minimum: float,
+                            maximum: float) -> float:
+    if type(value) not in (int, float) or not math.isfinite(float(value)):
+        raise AuthorityError(f"{label}:invalid")
+    normalized = float(value)
+    if normalized < minimum or normalized > maximum:
+        raise AuthorityError(f"{label}:invalid")
+    return normalized
+
+
+def capture_and_build_authority(
+    *, root: Path, remote_roots: Mapping[str, str], descriptor_dir: Path,
+    output: Path, include_research6: bool = False,
+    mappings: Mapping[str, Sequence[str]] | None = None,
+    capture_timeout: float = 120.0,
+    idle_cooldown_timeout: float = 0.0,
+    idle_cooldown_interval: float = 1.0,
+    capture_fn: Callable[..., dict[str, object]] | None = None,
+    sleep_fn: Callable[[float], None] | None = None,
+    monotonic_fn: Callable[[], float] | None = None,
+    stderr: TextIO | None = None,
+) -> dict[str, object]:
+    """Capture hosts and publish an authority, with a q3 idle cooldown only.
+
+    A zero cooldown timeout is deliberately single-shot.  When enabled, only
+    the transient q3 placement disposition is retried; capture, identity,
+    binary, schema, and all other placement failures remain fail-closed.
+    ``capture_fn``, ``sleep_fn``, and ``monotonic_fn`` are small test seams;
+    production callers use the defaults.
+    """
+    timeout = _validate_idle_cooldown(
+        idle_cooldown_timeout, "idle_cooldown_timeout", minimum=0.0,
+        maximum=MAX_IDLE_COOLDOWN_TIMEOUT_SECONDS)
+    interval = _validate_idle_cooldown(
+        idle_cooldown_interval, "idle_cooldown_interval", minimum=0.001,
+        maximum=MAX_IDLE_COOLDOWN_INTERVAL_SECONDS)
+    if set(remote_roots) != set(HOSTS):
+        raise AuthorityError("capture:host_set_invalid")
+    capture_fn = capture_host if capture_fn is None else capture_fn
+    sleep_fn = time.sleep if sleep_fn is None else sleep_fn
+    monotonic_fn = time.monotonic if monotonic_fn is None else monotonic_fn
+    stderr = sys.stderr if stderr is None else stderr
+
+    captures = {host: capture_fn(host, remote_roots[host], timeout=capture_timeout)
+                for host in HOSTS}
+    try:
+        return build_authority(
+            root=root, captures=captures, descriptor_dir=descriptor_dir,
+            output=output, include_research6=include_research6,
+            mappings=mappings)
+    except AuthorityError as exc:
+        if str(exc) != "placement:host_not_idle:q3" or timeout == 0:
+            raise
+        last_error = exc
+
+    deadline = monotonic_fn() + timeout
+    while True:
+        remaining = deadline - monotonic_fn()
+        if remaining <= 0:
+            print("s8 authority cooldown timeout: host=q3 disposition="
+                  "placement:host_not_idle:q3", file=stderr, flush=True)
+            raise last_error
+        wait = min(interval, remaining)
+        print(f"s8 authority cooldown wait: host=q3 seconds={wait:.3f} "
+              "disposition=placement:host_not_idle:q3", file=stderr, flush=True)
+        sleep_fn(wait)
+        try:
+            captures["q3"] = capture_fn("q3", remote_roots["q3"],
+                                         timeout=capture_timeout)
+        except AuthorityError as exc:
+            print(f"s8 authority cooldown capture failed: host=q3 error={exc}",
+                  file=stderr, flush=True)
+            raise
+        try:
+            return build_authority(
+                root=root, captures=captures, descriptor_dir=descriptor_dir,
+                output=output, include_research6=include_research6,
+                mappings=mappings)
+        except AuthorityError as exc:
+            if str(exc) != "placement:host_not_idle:q3":
+                raise
+            last_error = exc
+            print("s8 authority cooldown still not idle: host=q3 "
+                  "disposition=placement:host_not_idle:q3", file=stderr, flush=True)
+
+
 # Read-only remote capture: /proc, /sys, role files and Docker image inspect.
 # It intentionally has no Docker/Icecream lifecycle operation or remote write.
 REMOTE_CAPTURE_SCRIPT = r'''set -eu
@@ -396,6 +487,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--include-research6", action="store_true")
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument("--idle-cooldown-timeout", type=float, default=0.0,
+                        help="bounded q3 host-not-idle cooldown in seconds (default: 0)")
+    parser.add_argument("--idle-cooldown-interval", type=float, default=1.0,
+                        help="q3 cooldown polling interval in seconds (default: 1)")
     args = parser.parse_args(argv)
     try:
         root = args.root.absolute()
@@ -418,12 +513,13 @@ def main(argv: list[str] | None = None) -> int:
         if set(remote) != set(HOSTS):
             parser.error("--remote-root host set must be q3,q2,research6,research7")
         final_head_role_hashes(root)
-        captures = {host: capture_host(host, remote[host], timeout=args.timeout)
-                    for host in HOSTS}
-        authority = build_authority(root=root, captures=captures,
-                                    descriptor_dir=args.descriptor_dir.absolute(),
-                                    output=args.output.absolute(),
-                                    include_research6=args.include_research6)
+        authority = capture_and_build_authority(
+            root=root, remote_roots=remote,
+            descriptor_dir=args.descriptor_dir.absolute(),
+            output=args.output.absolute(), include_research6=args.include_research6,
+            capture_timeout=args.timeout,
+            idle_cooldown_timeout=args.idle_cooldown_timeout,
+            idle_cooldown_interval=args.idle_cooldown_interval)
         print(canonical(authority).decode(), end="")
         return 0
     except AuthorityError as exc:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import io
 from pathlib import Path
 
 import pytest
@@ -133,3 +134,131 @@ def test_dry_run_does_not_capture(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     monkeypatch.setattr(authority, "final_head_source_identity", lambda _root: {"commit": "a" * 40, "tree": "b" * 40})
     value = authority.dry_run(root=root)
     assert value["status"] == "DRY_RUN" and value["execute_required"] is True
+
+
+def _with_idle(capture: dict[str, object], idle: float) -> dict[str, object]:
+    value = dict(capture)
+    sample = dict(capture["cpu_sample"])
+    sample["idle_percent"] = idle
+    value["cpu_sample"] = sample
+    value["cpu_sample_digest"] = authority.digest(authority.canonical(sample))
+    return value
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def _remote_roots() -> dict[str, str]:
+    return {host: "/roles" for host in authority.HOSTS}
+
+
+def test_idle_cooldown_recaptures_q3_until_authority_can_publish(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    captures = _captures(now, root)
+    busy_q3 = _with_idle(captures["q3"], 80.0)
+    clock = _Clock()
+    calls: list[str] = []
+    stderr = io.StringIO()
+
+    def fake_capture(host: str, _remote_root: str, *, timeout: float) -> dict[str, object]:
+        calls.append(host)
+        return busy_q3 if host == "q3" and calls.count("q3") == 1 else captures[host]
+
+    value = authority.capture_and_build_authority(
+        root=root, remote_roots=_remote_roots(), descriptor_dir=tmp_path / "d",
+        output=tmp_path / "a.json", idle_cooldown_timeout=2.0,
+        idle_cooldown_interval=1.0, capture_fn=fake_capture,
+        sleep_fn=clock.sleep, monotonic_fn=clock.monotonic, stderr=stderr)
+    assert value["schema"] == authority.SCHEMA
+    assert calls == ["q3", "q2", "research6", "research7", "q3"]
+    assert clock.sleeps == [1.0]
+    assert "placement:host_not_idle:q3" in stderr.getvalue()
+    assert (tmp_path / "a.json").is_file()
+    assert (tmp_path / "d" / "q3-descriptor.json").is_file()
+
+
+def test_idle_cooldown_times_out_without_publishing_partial_outputs(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    captures = _captures(now, root)
+    busy_q3 = _with_idle(captures["q3"], 80.0)
+    clock = _Clock()
+    calls: list[str] = []
+    stderr = io.StringIO()
+
+    def fake_capture(host: str, _remote_root: str, *, timeout: float) -> dict[str, object]:
+        calls.append(host)
+        return busy_q3 if host == "q3" else captures[host]
+
+    with pytest.raises(authority.AuthorityError, match="host_not_idle:q3"):
+        authority.capture_and_build_authority(
+            root=root, remote_roots=_remote_roots(), descriptor_dir=tmp_path / "d",
+            output=tmp_path / "a.json", idle_cooldown_timeout=2.0,
+            idle_cooldown_interval=1.0, capture_fn=fake_capture,
+            sleep_fn=clock.sleep, monotonic_fn=clock.monotonic, stderr=stderr)
+    assert calls == ["q3", "q2", "research6", "research7", "q3", "q3"]
+    assert clock.sleeps == [1.0, 1.0]
+    assert "cooldown timeout" in stderr.getvalue()
+    assert not (tmp_path / "a.json").exists()
+    assert not (tmp_path / "d").exists()
+
+
+def test_idle_cooldown_does_not_retry_other_non_idle_placement_errors(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    captures = _captures(now, root)
+    captures["q2"] = _with_idle(captures["q2"], 80.0)
+    clock = _Clock()
+    calls: list[str] = []
+    stderr = io.StringIO()
+
+    def fake_capture(host: str, _remote_root: str, *, timeout: float) -> dict[str, object]:
+        calls.append(host)
+        return captures[host]
+
+    with pytest.raises(authority.AuthorityError, match="host_not_idle:q2"):
+        authority.capture_and_build_authority(
+            root=root, remote_roots=_remote_roots(), descriptor_dir=tmp_path / "d",
+            output=tmp_path / "a.json", idle_cooldown_timeout=10.0,
+            idle_cooldown_interval=1.0, capture_fn=fake_capture,
+            sleep_fn=clock.sleep, monotonic_fn=clock.monotonic, stderr=stderr)
+    assert calls == list(authority.HOSTS)
+    assert clock.sleeps == []
+    assert stderr.getvalue() == ""
+    assert not (tmp_path / "a.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("timeout", "interval", "error"),
+    [(-1.0, 1.0, "idle_cooldown_timeout:invalid"),
+     (0.0, 0.0, "idle_cooldown_interval:invalid"),
+     (authority.MAX_IDLE_COOLDOWN_TIMEOUT_SECONDS + 1, 1.0,
+      "idle_cooldown_timeout:invalid")],
+)
+def test_idle_cooldown_bounds_fail_before_capture(
+    tmp_path: Path, timeout: float, interval: float, error: str) -> None:
+    root = _root(tmp_path)
+    called = False
+
+    def unexpected_capture(*_args: object, **_kwargs: object) -> dict[str, object]:
+        nonlocal called
+        called = True
+        raise AssertionError("capture must not run")
+
+    with pytest.raises(authority.AuthorityError, match=error):
+        authority.capture_and_build_authority(
+            root=root, remote_roots=_remote_roots(), descriptor_dir=tmp_path / "d",
+            output=tmp_path / "a.json", idle_cooldown_timeout=timeout,
+            idle_cooldown_interval=interval, capture_fn=unexpected_capture)
+    assert called is False

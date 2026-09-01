@@ -34,7 +34,16 @@ and descriptor arguments:
 
 ```sh
 --mode external-farm \
---external-farm-authority-command "python3 farmharness/s8_external_farm_authority.py \
+--external-farm-authority-command "python3 \
+/tanksmall/scratch/ictmp/wt-p50-c-route-owner-root-20260828/farmharness/s8_external_farm_authority.py \
   --execute --root /path/to/final-head --output {output} \
-  --descriptor-dir /private/descriptors ..."
+  --descriptor-dir /private/descriptors \
+  --idle-cooldown-timeout 30 --idle-cooldown-interval 2 ..."
 ```
+
+The absolute generator path above is the pinned final-head checkout used by
+the campaign. `--idle-cooldown-timeout` is a bounded opt-in window (seconds)
+for the named transient `placement:host_not_idle:q3` disposition; the
+generator recaptures q3 at the requested interval and emits each wait
+diagnostic on stderr. The default timeout is `0` (single-shot), and identity,
+binary, schema, capture, and other placement errors never retry.
