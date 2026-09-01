@@ -223,7 +223,7 @@ def test_large_route_rows_keep_fixed_size_prefix_evidence() -> None:
     rows = []
     for ordinal in range(100):
         matrix._native_rows["ZSTD_ROUTE"] = {ordinal: {
-            "tu_seq": ordinal, "state_before_digest": "a" * 32,
+            "tu_seq": ordinal, "rel_seq": ordinal, "state_before_digest": "a" * 32,
             "state_digest": "b" * 32, "transaction_digest": "d" * 32,
             "encoded_source_bytes": 1 << 20, "simulator_execution_ns": 1}}
         rows.append(matrix._run_occurrence(
@@ -255,7 +255,7 @@ def test_route_bytearray_runtime_state_does_not_advance_on_tentative_row() -> No
     matrix.authority["ZSTD_ROUTE"]["status"] = "READY"
     state = simulator_module._RelationshipState(("C0", "F0"), history=bytearray(b"seed"))
     matrix._native_rows["ZSTD_ROUTE"] = {0: {
-        "tu_seq": 0, "state_before_digest": "a" * 32,
+        "tu_seq": 0, "rel_seq": 0, "state_before_digest": "a" * 32,
         "state_digest": "b" * 32, "transaction_digest": "d" * 32,
         "encoded_source_bytes": 1, "simulator_execution_ns": 1}}
     matrix._run_occurrence(
@@ -294,7 +294,7 @@ state = s._RelationshipState(("C0", "F0"))
 rows = []
 for ordinal in range(COUNT):
     matrix._native_rows["ZSTD_ROUTE"] = {ordinal: {
-        "tu_seq": ordinal, "state_before_digest": "a" * 32,
+        "tu_seq": ordinal, "rel_seq": ordinal, "state_before_digest": "a" * 32,
         "state_digest": "b" * 32, "transaction_digest": "d" * 32,
         "encoded_source_bytes": 1, "simulator_execution_ns": 1}}
     rows.append(matrix._run_occurrence(
@@ -803,7 +803,7 @@ def test_codec_mode_uses_c_wide_tu_allocator_not_relationship_rel_seq(
     matrix = MethodMatrixSimulator(MatrixTopology.from_id("C1F20/40"),
                                    methods=("ZSTD_TU",))
     state = simulator_module._RelationshipState(("C0", "F0"), next_rel_seq=17)
-    matrix._native_codec_next_tu_seq["ZSTD_TU"] = 41
+    assignment = {"authority_tu_seq": 41}
     captured: list[list[str]] = []
     original_lstat = Path.lstat
     original_access = os.access
@@ -835,9 +835,12 @@ def test_codec_mode_uses_c_wide_tu_allocator_not_relationship_rel_seq(
     monkeypatch.setattr(simulator_module, "_private_digest",
                         lambda path, label: {"path": str(path), "bytes": 0, "sha256": "e" * 64})
     monkeypatch.setattr(simulator_module.subprocess, "run", fake_run)
-    matrix._native_codec("ZSTD_TU", b"first", state)
+    matrix._native_codec("ZSTD_TU", b"first", state,
+                         authority_tu_seq=assignment["authority_tu_seq"])
     state.next_rel_seq = 18
-    matrix._native_codec("ZSTD_TU", b"second", state)
+    assignment["authority_tu_seq"] = 42
+    matrix._native_codec("ZSTD_TU", b"second", state,
+                         authority_tu_seq=assignment["authority_tu_seq"])
     assert [command[command.index("--codec-tu-seq") + 1] for command in captured] == ["41", "42"]
     assert [command[command.index("--codec-rel-seq") + 1] for command in captured] == ["17", "18"]
 
@@ -899,6 +902,83 @@ def test_native_repeat_full_carries_state_with_changed_assignment_map(
                for row in result["rows"])
     assert all(row["product_transaction"]["history_nonce"] == 1
                for row in result["rows"])
+
+
+def test_in_memory_full2_keeps_c_wide_tu_and_route_rel_continuity(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    topology = MatrixTopology.from_id("C1F1/100000")
+    paths = []
+    for index, payload in enumerate((b"previous", b"current")):
+        path = tmp_path / f"memory-{index}.ii"
+        path.write_bytes(payload)
+        paths.append(path)
+
+    def occurrence(index: int) -> Occurrence:
+        raw = paths[index].read_bytes()
+        return Occurrence(index, None, source_path=str(paths[index]),
+                          source_relative=paths[index].name,
+                          source_sha256=hashlib.sha256(raw).hexdigest(),
+                          source_digest128=simulator_module._digest128(raw))
+
+    def assignment(start: int) -> dict[str, object]:
+        return {"status": "READY", "topology": topology.topology_id,
+                "selected_count": 1, "rows": [{
+                    "ordinal": 0, "global_slot": 0, "f_relationship": 0,
+                    "per_f_slot": 0, "dispatch_order": start,
+                    "authority_dispatch_order": start,
+                    "authority_tu_seq": start}]}
+
+    empty = {"schema": simulator_module.PREFIX_DESCRIPTOR_SCHEMA, "bytes": 0,
+             "digest128": simulator_module._digest128(b"")}
+    prior = {"c_authorities": {"ZSTD_ROUTE": {"native_next_tu_seq": 1}},
+             "relationships": {"ZSTD_ROUTE": {"C0|F0": {
+                 "committed_raw_prefix_descriptor": empty,
+                 "_runtime_history": b"", "next_rel_seq": 1,
+                 "native_last_tu_seq": 0, "native_next_rel_seq": 1,
+                 "native_state_digest": "b" * 32,
+                 "history_nonce": 1, "route_identity": "C0->F0"}}}}
+    matrix = MethodMatrixSimulator(topology, methods=("ZSTD_ROUTE",),
+                                   assignment_authority=assignment(1))
+    matrix.authority["ZSTD_ROUTE"]["status"] = "READY"
+    _fake_native_batch_runner(monkeypatch)
+    result = matrix.run([occurrence(1)], repeat_full=True, prior_state=prior,
+                        predecessor_occurrences=[occurrence(0)],
+                        predecessor_assignment_authority=assignment(0))
+    row = result["rows"][0]
+    assert row["native_tu_seq"] == 1
+    assert row["rel_seq"] == 1
+    assert result["c_authorities"]["ZSTD_ROUTE"]["native_next_tu_seq"] == 2
+
+
+@pytest.mark.parametrize("mutation", ("missing_public", "wrong_public",
+                                       "missing_both", "wrong_internal"))
+def test_direct_native_product_rel_evidence_fails_closed(
+        mutation: str) -> None:
+    matrix = MethodMatrixSimulator(MatrixTopology.from_id("C1F1/100000"),
+                                   methods=("P29",))
+    matrix.authority["P29"]["status"] = "READY"
+    product: dict[str, object] = {
+        "tu_seq": 0, "rel_seq": 1, "_native_rel_seq": 1,
+        "state_before_digest": "a" * 32, "state_digest": "b" * 32,
+        "transaction_digest": "d" * 32, "encoded_source_bytes": 1,
+        "simulator_execution_ns": 1, "committed": True}
+    if mutation == "missing_public":
+        del product["rel_seq"]
+    elif mutation == "wrong_public":
+        product["rel_seq"] = 2
+    elif mutation == "missing_both":
+        del product["rel_seq"]
+        del product["_native_rel_seq"]
+    elif mutation == "wrong_internal":
+        product["_native_rel_seq"] = 2
+    matrix._native_rows["P29"] = {0: product}
+    state = simulator_module._RelationshipState(
+        ("C0", "F0"), next_rel_seq=1, native_next_rel_seq=1)
+    assignment = {"relationship_key": ["C0", "F0"], "relationship_index": 0,
+                  "slot": 0, "global_slot": 0}
+    with pytest.raises(MatrixError, match="REL"):
+        matrix._run_occurrence(None, Occurrence(0, b"payload"), assignment,
+                               "P29", state, raw_override=b"payload")
 
 
 @pytest.mark.parametrize("topology_id", ("C1F1/100000", "C1F20/40"))

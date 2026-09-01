@@ -240,6 +240,77 @@ def test_full2_current_state_marker_omission_partial_and_type_stay_not_proven(
     assert marker["status"] == "NOT_PROVEN"
 
 
+def test_full2_marker_c1f20_checks_c_wide_tu_and_each_route_rel(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    topology = "C1F20/40"
+    keys = [f"C0|F{index}" for index in range(20)]
+    methods = ("ZSTD_ROUTE", "P29", "GRZ_RESIDUAL")
+    empty = {"schema": simulator.PREFIX_DESCRIPTOR_SCHEMA, "bytes": 0,
+             "digest128": simulator._digest128(b"")}
+    prior: dict[str, dict[str, object]] = {}
+    after: dict[str, dict[str, object]] = {}
+    rows: list[dict[str, object]] = []
+    for index, key in enumerate(keys):
+        before_digest = f"{index + 1:032x}"
+        after_digest = f"{index + 101:032x}"
+        prior[key] = {"native_last_tu_seq": index,
+                      "native_next_rel_seq": 1,
+                      "native_state_digest": before_digest,
+                      "history_nonce": 1, "route_identity": key.replace("|", "->"),
+                      "committed_raw_prefix_descriptor": empty}
+        after[key] = {"native_last_tu_seq": index + 20,
+                      "native_next_rel_seq": 2,
+                      "native_state_digest": after_digest,
+                      "history_nonce": 1, "route_identity": key.replace("|", "->"),
+                      "committed_raw_prefix_descriptor": empty}
+        for method in methods:
+            transaction = {"committed": True, "tu_seq": index + 20,
+                           "rel_seq": 1, "native_next_rel_seq": 2,
+                           "state_before_digest": before_digest,
+                           "state_digest": after_digest, "history_nonce": 1,
+                           "route_identity": key.replace("|", "->")}
+            if method == "ZSTD_ROUTE":
+                transaction["committed_raw_prefix_before_descriptor"] = empty
+                transaction["committed_raw_prefix_descriptor"] = empty
+            rows.append({"method": method, "relationship_key": key.split("|"),
+                         "ordinal": index, "rel_seq": 1,
+                         "native_tu_seq": index + 20,
+                         "native_next_tu_seq": index + 21,
+                         "native_next_rel_seq": 2, "committed": True,
+                         "native_state_before_digest": before_digest,
+                         "native_state_digest": after_digest,
+                         "product_transaction": transaction})
+    predecessor_path = "/tmp/s8-c1f20-full1-fixture"
+    identity = {"timestamp": "20260901T120000Z", "topology": topology,
+                "depth": "full-1", "pass": "full-1"}
+    assignment = {"topology": topology, "rows": []}
+    predecessor_manifest = {"schema": simulator.SCHEMA,
+                            "experiment": Path(predecessor_path).name,
+                            "repeat_full": False, "topology": {"id": topology},
+                            "run_identity": identity,
+                            "input_authority": {"selected_inputs": []},
+                            "assignment_authority": assignment}
+    predecessor_summary = {"schema": simulator.SUMMARY_SCHEMA,
+                           "topology": {"id": topology},
+                           "c_authorities": {method: {"native_next_tu_seq": 20}
+                                             for method in methods},
+                           "relationships": {method: copy.deepcopy(prior)
+                                             for method in methods}}
+    monkeypatch.setattr(simulator, "verify_experiment", lambda path: {
+        "experiment": predecessor_path, "manifest": predecessor_manifest,
+        "summary": predecessor_summary, "manifest_facts": {"sha256": "c" * 64}})
+    manifest = {"repeat_full": True, "predecessor_input_authority": {
+        "experiment": predecessor_path, "manifest_sha256": "c" * 64,
+        "run_identity": identity, "selected_inputs": [], "assignment": assignment},
+        "assignment_authority": {"topology": topology}}
+    summary = {"c_authorities": {method: {"native_next_tu_seq": 40}
+                                  for method in methods},
+               "relationships": {method: copy.deepcopy(after) for method in methods}}
+    marker = report._full2_marker(manifest, summary, rows, topology,
+                                  "state-carrying-full-2")
+    assert marker["status"] == "CONTINUOUS"
+
+
 def test_simulator_route_transaction_preserves_pre_prefix() -> None:
     topology = "C1F1/100000"
     matrix = simulator.MethodMatrixSimulator(
@@ -248,8 +319,8 @@ def test_simulator_route_transaction_preserves_pre_prefix() -> None:
     state = simulator._RelationshipState(
         ("C0", "F0"), history=b"prior", next_rel_seq=5,
         last_route_id="C0->F0", history_nonce=1,
-        native_last_tu_seq=4, native_state_digest="a" * 32)
-    product = {"tu_seq": 5, "state_before_digest": "a" * 32,
+        native_last_tu_seq=4, native_next_rel_seq=5, native_state_digest="a" * 32)
+    product = {"tu_seq": 5, "rel_seq": 5, "state_before_digest": "a" * 32,
                "state_digest": "b" * 32, "transaction_digest": "d" * 32,
                "encoded_source_bytes": 4, "simulator_execution_ns": 1}
     matrix._native_rows["ZSTD_ROUTE"] = {0: product}

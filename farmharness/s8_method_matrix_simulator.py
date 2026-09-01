@@ -988,8 +988,8 @@ class MethodMatrixSimulator:
         self._native_rows: dict[str, dict[int, dict[str, object]]] = {}
         # Codec-mode is only a bounded parity seam, but it must still use the
         # product's C-wide TU allocator rather than a relationship REL_SEQ.
-        self._native_codec_next_tu_seq: dict[str, int] = {
-            method: 0 for method in self.methods}
+        self._native_codec_next_tu_seq: dict[str, int | None] = {
+            method: None for method in self.methods}
         if cohort_dictionary is not None:
             if not cohort_dictionary or self.cohort_authority.get("status") != "READY":
                 raise NotReady("ZSTD_COHORT requires an independently authenticated dictionary authority")
@@ -1005,7 +1005,10 @@ class MethodMatrixSimulator:
                 "contract": "immutable shared dictionary plus independent relationship continuation",
             }
 
-    def _native_codec(self, method: str, raw: bytes, state: _RelationshipState) -> tuple[bytes, int, int]:
+    def _native_codec(self, method: str, raw: bytes, state: _RelationshipState,
+                      *, authority_tu_seq: object) -> tuple[bytes, int, int]:
+        if type(authority_tu_seq) is not int or authority_tu_seq < 0:
+            raise MatrixError("native codec assignment TU sequence is missing or invalid")
         root = Path(__file__).resolve().parents[1]
         binary = root / "cache" / "sim" / ".p50sim.bin"
         receipt_path = binary.parent / ".p50sim-build.json"
@@ -1032,7 +1035,10 @@ class MethodMatrixSimulator:
                 input_file = Path(scratch) / "input.bin"
                 output_file = Path(scratch) / "encoded.bin"
                 input_file.write_bytes(raw)
-                global_tu_seq = self._native_codec_next_tu_seq.get(method, 0)
+                global_tu_seq = self._native_codec_next_tu_seq.get(method)
+                if global_tu_seq is not None and global_tu_seq != authority_tu_seq:
+                    raise MatrixError("native codec assignment global TU sequence invalid")
+                global_tu_seq = authority_tu_seq
                 args = [str(binary), "--codec-method", method, "--input", str(input_file),
                         "--codec-output", str(output_file), "--codec-rel-seq",
                         str(state.next_rel_seq), "--codec-tu-seq", str(global_tu_seq)]
@@ -1052,7 +1058,8 @@ class MethodMatrixSimulator:
         except (OSError, subprocess.SubprocessError) as exc:
             raise NotReady("native product codec unavailable") from exc
 
-    def _encode(self, method: str, raw: bytes, state: _RelationshipState) -> tuple[bytes, int, int]:
+    def _encode(self, method: str, raw: bytes, state: _RelationshipState,
+                *, assignment: Mapping[str, object]) -> tuple[bytes, int, int]:
         authority = self.authority[method]
         if authority["status"] == "NOT_IMPLEMENTED":
             raise NotReady("ZSTD_GLOBAL is NOT_IMPLEMENTED and is not aliased")
@@ -1061,7 +1068,8 @@ class MethodMatrixSimulator:
         if method == "RAW_II":
             return b"", 0, 0
         if method in {"ZSTD_TU", "ZSTD_ROUTE"}:
-            return self._native_codec(method, raw, state)
+            return self._native_codec(method, raw, state,
+                                      authority_tu_seq=assignment.get("authority_tu_seq"))
         raise NotReady("cohort codec has no accepted native authority")
 
     def run(self, occurrences: Sequence[Occurrence], *, output_root: Path | None = None,
@@ -1076,7 +1084,7 @@ class MethodMatrixSimulator:
         if repeat_full and (not predecessor_occurrences or
                             predecessor_assignment_authority is None):
             raise MatrixError("repeat-full requires authenticated full-1 inputs and assignment")
-        self._native_codec_next_tu_seq = {method: 0 for method in self.methods}
+        self._native_codec_next_tu_seq = {method: None for method in self.methods}
         predecessor_identity = None
         if predecessor_occurrences and output_root is not None:
             candidate = prior_state.get("_predecessor_identity") if prior_state else None
@@ -1285,12 +1293,12 @@ class MethodMatrixSimulator:
                 rows.append(self._run_occurrence(
                     None, occurrence, assignment, method, states_by_method[method][key],
                     raw_override=raw_cache))
-        return {"schema": SUMMARY_SCHEMA, "status": self._status(rows),
-                "core_completion": self._completion(rows, CORE_METHODS),
-                "optional_completion": self._completion(rows, set(self.methods) - CORE_METHODS),
-                "topology": self._topology_record(), "rows": rows,
-                "relationship_count": self.topology.relationship_count,
-                "method_status": {method: self.authority[method]["status"] for method in self.methods}}
+        # Keep the same C-wide continuation contract as persisted runs.  This
+        # is derived solely from committed native product rows; codec bytes or
+        # Python relationship state cannot manufacture a TU authority.
+        summary = self._summary(rows, Path("."), states_by_method)
+        summary["rows"] = rows
+        return summary
 
     def _run_occurrence(self, experiment: Path | None, occurrence: Occurrence,
                         assignment: Mapping[str, object], method: str,
@@ -1386,14 +1394,27 @@ class MethodMatrixSimulator:
             native_tu_seq = int(product["tu_seq"])
             native_rel_seq = product.get("_native_rel_seq")
             if native_rel_seq is None:
-                # Directly injected bounded canaries predate the batch
-                # annotation; use only relationship-local Python state as a
-                # compatibility fallback, never the global TU_SEQ.
-                native_rel_seq = state.native_next_rel_seq
-                if native_rel_seq is None:
-                    native_rel_seq = state.next_rel_seq
+                # A direct product canary may provide the public REL field,
+                # but Python relationship state is never evidence of a native
+                # REL allocation.  Batch output must carry _native_rel_seq.
+                native_rel_seq = product.get("rel_seq")
             if type(native_rel_seq) is not int or native_rel_seq < 0:
                 raise MatrixError("native product relationship REL sequence is missing")
+            public_product_rel = product.get("rel_seq")
+            if type(public_product_rel) is not int or public_product_rel != native_rel_seq:
+                raise MatrixError("native product relationship REL sequence mismatch")
+            authority_rel_seq = assignment.get("authority_rel_seq")
+            if (authority_rel_seq is not None and
+                    (type(authority_rel_seq) is not int or
+                     native_rel_seq != authority_rel_seq)):
+                raise MatrixError("native product relationship REL authority mismatch")
+            if authority_rel_seq is None:
+                expected_state_rel = (state.native_next_rel_seq
+                                      if state.native_next_rel_seq is not None
+                                      else state.next_rel_seq)
+                if native_rel_seq != expected_state_rel:
+                    raise MatrixError("native product relationship REL continuity invalid")
+            row["rel_seq"] = native_rel_seq
             native_next_tu_seq = product.get("_native_next_tu_seq", native_tu_seq + 1)
             if type(native_next_tu_seq) is not int or native_next_tu_seq != native_tu_seq + 1:
                 raise MatrixError("native product global TU continuation is invalid")
@@ -1445,7 +1466,8 @@ class MethodMatrixSimulator:
                 if method != "ZSTD_ROUTE":
                     state.next_rel_seq = native_next_rel_seq
         else:
-            encoded, cpu_ns, wall_ns = self._encode(method, raw, encode_state)
+            encoded, cpu_ns, wall_ns = self._encode(
+                method, raw, encode_state, assignment=assignment)
         if experiment is not None and product is None and method != "RAW_II":
             encoded_path = experiment / "bytes" / method / f"encoded-{occurrence.ordinal:06d}.bin"
             encoded_path.write_bytes(encoded)
