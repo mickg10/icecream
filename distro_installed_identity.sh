@@ -112,6 +112,23 @@ mkdir -p "$WORK"
 WORK=$(CDPATH= cd -- "$WORK" && pwd)
 BUILD="$WORK/build"
 DESTDIR="$WORK/destdir"
+# Ubuntu's dependency bootstrap is deliberately shared across the normal
+# sentinel run and the later corruption rows.  The cache contains only apt
+# lists and downloaded .debs; every identity check still starts from the
+# committed, digest-pinned image and installs into its own container root.
+# Keep the mount optional so the producer remains directly runnable outside
+# the gate (and so ubuntu22/fedora40 retain their existing paths).
+APT_CACHE_MOUNTS=""
+APT_CACHE_READY=false
+if [ "$DISTRO" = ubuntu24 ] && [ -n "${S1B_APT_CACHE:-}" ]; then
+    case "$S1B_APT_CACHE" in
+        /*) ;;
+        *) echo "FAIL: S1B_APT_CACHE must be an absolute host path" >&2; exit 2 ;;
+    esac
+    mkdir -p "$S1B_APT_CACHE/lists" "$S1B_APT_CACHE/archives"
+    APT_CACHE_MOUNTS="-v $S1B_APT_CACHE/lists:/var/lib/apt/lists -v $S1B_APT_CACHE/archives:/var/cache/apt/archives"
+    [ "${S1B_APT_CACHE_READY:-false}" = true ] && APT_CACHE_READY=true
+fi
 RUN_SUFFIX="$MODE"
 [ "$SENTINEL_CONTROL" = true ] && RUN_SUFFIX="${MODE}-sentinel"
 [ "$MODE" = corrupt-control ] && RUN_SUFFIX="${MODE}-${CORRUPT_ARTIFACT}"
@@ -302,7 +319,43 @@ case "$DISTRO" in
         PINNED_IMAGE_REF=ubuntu@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
         PINNED_IMAGE_ID=sha256:a6f81fb630d51837271b89f8193810a5fc493fa4f30a55d7ebcdb3a66f3cc63a
         DEP_PACKAGES='g++ gcc make autoconf automake libtool pkg-config libzstd-dev liblzo2-dev libarchive-dev libboost-dev libcap-ng-dev libxxhash-dev binutils'
-        DEP_INSTALL="apt-get update >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y $DEP_PACKAGES >/dev/null 2>&1"
+        # The first normal run bootstraps the shared host cache.  Matrix rows
+        # then reuse its lists/deb payloads, while the bounded retry still
+        # handles a transient mirror failure.  Exhausting retries remains a
+        # hard setup failure: no corruption row can be reported PASS.
+        if [ "$APT_CACHE_READY" = true ]; then
+            DEP_INSTALL="dependency_bootstrap() {
+                dep_attempt=1
+                while [ \"\$dep_attempt\" -le 3 ]; do
+                    if DEBIAN_FRONTEND=noninteractive apt-get install -y $DEP_PACKAGES > /build/dependency-bootstrap.log 2>&1; then
+                        return 0
+                    fi
+                    if [ \"\$dep_attempt\" = 3 ]; then
+                        cat /build/dependency-bootstrap.log >&2
+                        return 100
+                    fi
+                    dep_attempt=\$((dep_attempt + 1))
+                    sleep 2
+                done
+            }
+            dependency_bootstrap"
+        else
+            DEP_INSTALL="dependency_bootstrap() {
+                dep_attempt=1
+                while [ \"\$dep_attempt\" -le 3 ]; do
+                    if apt-get update > /build/dependency-bootstrap.log 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y $DEP_PACKAGES >> /build/dependency-bootstrap.log 2>&1; then
+                        return 0
+                    fi
+                    if [ \"\$dep_attempt\" = 3 ]; then
+                        cat /build/dependency-bootstrap.log >&2
+                        return 100
+                    fi
+                    dep_attempt=\$((dep_attempt + 1))
+                    sleep 2
+                done
+            }
+            dependency_bootstrap"
+        fi
         DEP_QUERY='dpkg-query -W -f '\''${Package}=${Version}\n'\'' '"$DEP_PACKAGES"' 2>/dev/null'
         ;;
     fedora40)
@@ -466,7 +519,7 @@ if [ "$MODE" = normal ]; then
     else
         :
     fi
-    if docker run --name "$CONTAINER_NAME" --pull=never -v "$SRC:/src:ro" -v "$BUILD:/build" -v "$DESTDIR:/destdir" -u 0:0 "$IMAGE_REF" bash -c "
+    if docker run --name "$CONTAINER_NAME" --pull=never -v "$SRC:/src:ro" -v "$BUILD:/build" -v "$DESTDIR:/destdir" -u 0:0 $APT_CACHE_MOUNTS "$IMAGE_REF" bash -c "
         set -e
         # empty_root(): clear every top-level entry under \\\$root, then
         # verify NOTHING remains (not just trust the rm) -- an explicit,
@@ -594,7 +647,7 @@ elif [ "$MODE" = corrupt-control ]; then
     }
     fact reused_destdir_wiped "false (deliberate -- this is the per-artifact corruption control)"
     fact corrupt_artifact "$CORRUPT_ARTIFACT"
-    if docker run --rm --pull=never -v "$BUILD:/build" -v "$DESTDIR:/destdir" -u 0:0 "$IMAGE_REF" bash -c "
+    if docker run --rm --pull=never -v "$BUILD:/build" -v "$DESTDIR:/destdir" -u 0:0 $APT_CACHE_MOUNTS "$IMAGE_REF" bash -c "
         set -e
         $DEP_INSTALL
         case '$CORRUPT_ARTIFACT' in

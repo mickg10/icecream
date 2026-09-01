@@ -139,6 +139,17 @@ dist_build() {
 }
 
 rm -rf "$WORK"; mkdir -p "$WORK/source" "$WORK/build"
+# Ubuntu24's normal sentinel run is the single bounded dependency bootstrap
+# for the matrix below.  Only apt metadata and downloaded packages are
+# shared; the producer still runs every row from the exact digest-pinned
+# image and installs into that row's fresh container root.  A missing cache
+# remains a setup RED, never a mutant PASS.
+if [ "$MATRIX_DISTRO" = ubuntu24 ]; then
+    S1B_APT_CACHE="$WORK/ubuntu24-apt-cache"
+    mkdir -p "$S1B_APT_CACHE/lists" "$S1B_APT_CACHE/archives"
+    export S1B_APT_CACHE
+    export S1B_APT_CACHE_READY=false
+fi
 git -C "$REPO" archive "$COMMIT" | tar -x -C "$WORK/source" || { echo "RED: archive failed"; exit 1; }
 if find "$WORK/source" -name .git -print -quit | grep -q .; then
     echo "RED: git-archive extraction at $WORK/source contains a .git entry -- expected none"; exit 1
@@ -354,6 +365,15 @@ sentinel_gate_one_distro() {
     if ! python3 "$FACTS_VALIDATOR" "$GREEN_WORK/facts-normal-sentinel.txt"; then
         echo "RED ($d): unmutated run's installed-artifact fact roster is invalid" >&2
         return 1
+    fi
+    if [ "$d" = ubuntu24 ] && [ -n "${S1B_APT_CACHE:-}" ]; then
+        if ! find "$S1B_APT_CACHE/lists" -type f -print -quit | grep -q . || \
+           ! find "$S1B_APT_CACHE/archives" -type f -name '*.deb' -print -quit | grep -q .; then
+            echo "RED ($d): normal sentinel did not produce a complete shared apt cache (lists and .debs required)" >&2
+            return 1
+        fi
+        export S1B_APT_CACHE_READY=true
+        echo "GREEN ($d): bounded dependency bootstrap cache ready for matrix rows at $S1B_APT_CACHE"
     fi
     FACTS_MUTANT="$WORK/facts-key-mutant-$d.txt"
     python3 - "$GREEN_WORK/facts-normal-sentinel.txt" "$FACTS_MUTANT" <<'PY'
