@@ -150,14 +150,14 @@ def test_full2_current_state_marker_omission_partial_and_type_stay_not_proven(
     prefix_digest = simulator._digest128(prefix)
     prior_state = {"native_last_tu_seq": 4, "native_next_rel_seq": 5,
                    "native_state_digest": "a" * 32, "history_nonce": 1,
-                   "route_identity": "C0->F0", "committed_raw_prefix": prefix_hex,
-                   "committed_raw_prefix_bytes": len(prefix),
-                   "committed_raw_prefix_digest": prefix_digest}
+                   "route_identity": "C0->F0", "committed_raw_prefix_descriptor":
+                   {"schema": simulator.PREFIX_DESCRIPTOR_SCHEMA, "bytes": len(prefix),
+                    "digest128": prefix_digest}}
     after_state = {"native_last_tu_seq": 5, "native_next_rel_seq": 6,
                    "native_state_digest": "b" * 32, "history_nonce": 1,
-                   "route_identity": "C0->F0", "committed_raw_prefix": (prefix + b"next").hex(),
-                   "committed_raw_prefix_bytes": len(prefix) + 4,
-                   "committed_raw_prefix_digest": simulator._digest128(prefix + b"next")}
+                   "route_identity": "C0->F0", "committed_raw_prefix_descriptor":
+                   {"schema": simulator.PREFIX_DESCRIPTOR_SCHEMA, "bytes": len(prefix) + 4,
+                    "digest128": simulator._digest128(prefix + b"next")}}
     predecessor_path = "/tmp/s8-full1-fixture"
     predecessor_identity = {"timestamp": "20260901T120000Z", "topology": topology,
                             "depth": "full-1", "pass": "full-1"}
@@ -186,12 +186,13 @@ def test_full2_current_state_marker_omission_partial_and_type_stay_not_proven(
              "committed": True, "product_transaction": {"committed": True,
                                       "state_before_digest": "a" * 32, "state_digest": "b" * 32,
                                       "history_nonce": 1, "route_identity": "C0->F0",
-                                      "committed_raw_prefix": (prefix + b"next").hex(),
-                                      "committed_raw_prefix_bytes": len(prefix) + 4,
-                                      "committed_raw_prefix_digest": simulator._digest128(prefix + b"next"),
-                                      "committed_raw_prefix_before": prefix_hex,
-                                      "committed_raw_prefix_before_bytes": len(prefix),
-                                      "committed_raw_prefix_before_digest": prefix_digest}}
+                                      "committed_raw_prefix_descriptor":
+                                      {"schema": simulator.PREFIX_DESCRIPTOR_SCHEMA,
+                                       "bytes": len(prefix) + 4,
+                                       "digest128": simulator._digest128(prefix + b"next")},
+                                      "committed_raw_prefix_before_descriptor":
+                                      {"schema": simulator.PREFIX_DESCRIPTOR_SCHEMA,
+                                       "bytes": len(prefix), "digest128": prefix_digest}}}
             for method in ("ZSTD_ROUTE", "P29", "GRZ_RESIDUAL")]
     valid_marker = report._full2_marker(manifest, summary, rows, topology,
                                         "state-carrying-full-2")
@@ -205,9 +206,9 @@ def test_full2_current_state_marker_omission_partial_and_type_stay_not_proven(
     elif mutation == "unrelated_prefix":
         other = b"unrelated"
         route = summary["relationships"]["ZSTD_ROUTE"][key]
-        route.update({"committed_raw_prefix": other.hex(),
-                      "committed_raw_prefix_bytes": len(other),
-                      "committed_raw_prefix_digest": simulator._digest128(other)})
+        route["committed_raw_prefix_descriptor"] = {
+            "schema": simulator.PREFIX_DESCRIPTOR_SCHEMA, "bytes": len(other),
+            "digest128": simulator._digest128(other)}
     elif mutation == "final_digest":
         summary["relationships"]["P29"][key]["native_state_digest"] = "c" * 32
     else:
@@ -237,14 +238,16 @@ def test_simulator_route_transaction_preserves_pre_prefix() -> None:
         raw_override=b"next")
     transaction = row["product_transaction"]
     assert isinstance(transaction, dict)
-    assert report._transaction_prefix(transaction, before=True) == b"prior"
-    assert report._transaction_prefix(transaction, before=False) == b"priornext"
-    assert transaction["committed_raw_prefix_before"] == b"prior".hex()
-    assert transaction["committed_raw_prefix_before_bytes"] == 5
-    assert transaction["committed_raw_prefix_before_digest"] == simulator._digest128(b"prior")
-    assert transaction["committed_raw_prefix"] == b"priornext".hex()
-    assert transaction["committed_raw_prefix_bytes"] == 9
-    assert transaction["committed_raw_prefix_digest"] == simulator._digest128(b"priornext")
+    assert report._transaction_prefix(transaction, before=True) == (
+        5, simulator._digest128(b"prior"))
+    assert report._transaction_prefix(transaction, before=False) == (
+        9, simulator._digest128(b"priornext"))
+    assert transaction["committed_raw_prefix_before_descriptor"] == {
+        "schema": simulator.PREFIX_DESCRIPTOR_SCHEMA, "bytes": 5,
+        "digest128": simulator._digest128(b"prior")}
+    assert transaction["committed_raw_prefix_descriptor"] == {
+        "schema": simulator.PREFIX_DESCRIPTOR_SCHEMA, "bytes": 9,
+        "digest128": simulator._digest128(b"priornext")}
 
 
 def test_ratio_zero_denominator_and_wire_witness_control() -> None:

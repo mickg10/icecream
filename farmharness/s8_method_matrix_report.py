@@ -72,37 +72,34 @@ def _valid_digest(value: object) -> bool:
             re.fullmatch(r"[0-9a-f]{32}", value) is not None)
 
 
-def _route_prefix(state: Mapping[str, Any]) -> bytes | None:
-    prefix = state.get("committed_raw_prefix")
-    if not isinstance(prefix, str) or re.fullmatch(r"[0-9a-f]*", prefix) is None:
+def _route_prefix(state: Mapping[str, Any]) -> tuple[int, str] | None:
+    descriptor = state.get("committed_raw_prefix_descriptor")
+    if (not isinstance(descriptor, Mapping) or
+            set(descriptor) != {"schema", "bytes", "digest128"} or
+            descriptor.get("schema") != simulator.PREFIX_DESCRIPTOR_SCHEMA):
         return None
-    try:
-        raw = bytes.fromhex(prefix)
-    except ValueError:
+    bytes_value = descriptor.get("bytes")
+    digest = descriptor.get("digest128")
+    if (type(bytes_value) is not int or not 0 <= bytes_value <= (1 << simulator.MAX_HISTORY_WINDOW_LOG) or
+            not _valid_digest(digest)):
         return None
-    if (type(state.get("committed_raw_prefix_bytes")) is not int or
-            state["committed_raw_prefix_bytes"] != len(raw) or
-            not _valid_digest(state.get("committed_raw_prefix_digest")) or
-            state["committed_raw_prefix_digest"] != simulator._digest128(raw)):
-        return None
-    return raw
+    return bytes_value, str(digest)
 
 
-def _transaction_prefix(transaction: Mapping[str, Any], *, before: bool) -> bytes | None:
-    prefix_name = "committed_raw_prefix_before" if before else "committed_raw_prefix"
-    prefix = transaction.get(prefix_name)
-    bytes_value = transaction.get(prefix_name + "_bytes")
-    digest = transaction.get(prefix_name + "_digest")
-    if not isinstance(prefix, str) or re.fullmatch(r"[0-9a-f]*", prefix) is None:
+def _transaction_prefix(transaction: Mapping[str, Any], *, before: bool) -> tuple[int, str] | None:
+    descriptor_name = ("committed_raw_prefix_before_descriptor" if before
+                       else "committed_raw_prefix_descriptor")
+    descriptor = transaction.get(descriptor_name)
+    if (not isinstance(descriptor, Mapping) or
+            set(descriptor) != {"schema", "bytes", "digest128"} or
+            descriptor.get("schema") != simulator.PREFIX_DESCRIPTOR_SCHEMA):
         return None
-    try:
-        raw = bytes.fromhex(prefix)
-    except ValueError:
+    bytes_value = descriptor.get("bytes")
+    digest = descriptor.get("digest128")
+    if (type(bytes_value) is not int or not 0 <= bytes_value <= (1 << simulator.MAX_HISTORY_WINDOW_LOG) or
+            not _valid_digest(digest)):
         return None
-    if (type(bytes_value) is not int or bytes_value != len(raw) or
-            not _valid_digest(digest) or digest != simulator._digest128(raw)):
-        return None
-    return raw
+    return bytes_value, str(digest)
 
 
 def _sha256(raw: bytes) -> str:
@@ -365,9 +362,8 @@ def _full2_marker(manifest: Mapping[str, Any], summary: Mapping[str, Any],
                     after["native_state_digest"] != last_transaction["state_digest"]):
                 return _not_proven(f"{method.lower()}_final_state_marker_mismatch")
             if method == "ZSTD_ROUTE" and (
-                    last_transaction.get("committed_raw_prefix") != after.get("committed_raw_prefix") or
-                    last_transaction.get("committed_raw_prefix_bytes") != after.get("committed_raw_prefix_bytes") or
-                    last_transaction.get("committed_raw_prefix_digest") != after.get("committed_raw_prefix_digest")):
+                    last_transaction.get("committed_raw_prefix_descriptor") !=
+                    after.get("committed_raw_prefix_descriptor")):
                 return _not_proven("zstd_route_final_prefix_mismatch")
     return {"status": "CONTINUOUS", "predecessor_bound": True,
             "relationship_state_present": True,

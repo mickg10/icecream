@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -176,7 +178,9 @@ def test_route_uses_fresh_frames_and_only_commit_advances_prefix(tmp_path: Path)
     assert data[1]["pre_state_digest"] == data[1]["post_state_digest"]
     summary = json.loads((rows / "summary.json").read_text())
     assert summary["relationships"]["ZSTD_ROUTE"]["C0|F0"]["next_rel_seq"] == 2
-    assert summary["relationships"]["ZSTD_ROUTE"]["C0|F0"]["committed_raw_prefix_bytes"] == 8
+    descriptor = summary["relationships"]["ZSTD_ROUTE"]["C0|F0"]["committed_raw_prefix_descriptor"]
+    assert descriptor["schema"] == simulator_module.PREFIX_DESCRIPTOR_SCHEMA
+    assert descriptor["bytes"] == 8
     # A fresh encoded frame is retained for every occurrence, including the
     # rejected candidate; no endless stream is emitted by this contract.
     assert len(list((rows / "bytes" / "ZSTD_ROUTE").glob("encoded-*.bin"))) == 3
@@ -204,6 +208,91 @@ def test_route_reset_rebind_requires_new_nonce_and_preserves_order() -> None:
     ])
     assert result["rows"][2]["transition"] == "committed_relationship_advance"
     assert result["rows"][2]["post_state_digest"] != result["rows"][1]["post_state_digest"]
+
+
+def test_large_route_rows_keep_fixed_size_prefix_evidence() -> None:
+    topology = MatrixTopology.from_id("C1F1/100000")
+    matrix = MethodMatrixSimulator(topology, methods=("ZSTD_ROUTE",), max_history_bytes=1024)
+    matrix.authority["ZSTD_ROUTE"]["status"] = "READY"
+    state = simulator_module._RelationshipState(("C0", "F0"), history=b"",
+                                                  last_route_id="C0->F0")
+    rows = []
+    for ordinal in range(100):
+        matrix._native_rows["ZSTD_ROUTE"] = {ordinal: {
+            "tu_seq": ordinal, "state_before_digest": "a" * 32,
+            "state_digest": "b" * 32, "transaction_digest": "d" * 32,
+            "encoded_source_bytes": 1 << 20, "simulator_execution_ns": 1}}
+        rows.append(matrix._run_occurrence(
+            None, Occurrence(ordinal, b"x" * (1 << 20)),
+            {"relationship_key": ["C0", "F0"], "relationship_index": 0,
+             "slot": 0, "global_slot": 0}, "ZSTD_ROUTE", state,
+            raw_override=b"x" * (1 << 20)))
+    raw = ("\n".join(json.dumps(row, separators=(",", ":")) for row in rows)).encode()
+    assert len(raw) < 400_000
+    half = ("\n".join(json.dumps(row, separators=(",", ":")) for row in rows[:50])).encode()
+    assert len(raw) < 2 * len(half) + 1_000
+
+    def contains_body(value: object) -> bool:
+        if isinstance(value, dict):
+            return any(key == "committed_raw_prefix" or contains_body(item)
+                       for key, item in value.items())
+        if isinstance(value, list):
+            return any(contains_body(item) for item in value)
+        return False
+
+    assert not contains_body(rows)
+    assert all(row["product_transaction"]["committed_raw_prefix_descriptor"]["bytes"] == 1024
+               for row in rows)
+
+
+def test_route_bytearray_runtime_state_does_not_advance_on_tentative_row() -> None:
+    matrix = MethodMatrixSimulator(MatrixTopology.from_id("C1F1/100000"),
+                                   methods=("ZSTD_ROUTE",), max_history_bytes=8)
+    matrix.authority["ZSTD_ROUTE"]["status"] = "READY"
+    state = simulator_module._RelationshipState(("C0", "F0"), history=bytearray(b"seed"))
+    matrix._native_rows["ZSTD_ROUTE"] = {0: {
+        "tu_seq": 0, "state_before_digest": "a" * 32,
+        "state_digest": "b" * 32, "transaction_digest": "d" * 32,
+        "encoded_source_bytes": 1, "simulator_execution_ns": 1}}
+    matrix._run_occurrence(
+        None, Occurrence(0, b"candidate", commit=False),
+        {"relationship_key": ["C0", "F0"], "relationship_index": 0,
+         "slot": 0, "global_slot": 0}, "ZSTD_ROUTE", state,
+        raw_override=b"candidate")
+    assert state.history == bytearray(b"seed")
+
+
+@pytest.mark.parametrize("count", (32, 64, 128))
+def test_subprocess_route_prefix_evidence_is_bounded_and_linear(count: int) -> None:
+    code = r'''
+import json, resource
+import s8_method_matrix_simulator as s
+
+topology = s.MatrixTopology.from_id("C1F1/100000")
+matrix = s.MethodMatrixSimulator(topology, methods=("ZSTD_ROUTE",), max_history_bytes=1024)
+matrix.authority["ZSTD_ROUTE"]["status"] = "READY"
+state = s._RelationshipState(("C0", "F0"))
+rows = []
+for ordinal in range(COUNT):
+    matrix._native_rows["ZSTD_ROUTE"] = {ordinal: {
+        "tu_seq": ordinal, "state_before_digest": "a" * 32,
+        "state_digest": "b" * 32, "transaction_digest": "d" * 32,
+        "encoded_source_bytes": 1, "simulator_execution_ns": 1}}
+    rows.append(matrix._run_occurrence(
+        None, s.Occurrence(ordinal, b"x" * (1 << 20)),
+        {"relationship_key": ["C0", "F0"], "relationship_index": 0,
+         "slot": 0, "global_slot": 0}, "ZSTD_ROUTE", state,
+        raw_override=b"x" * (1 << 20)))
+wire = ("\n".join(json.dumps(row, separators=(",", ":")) for row in rows)).encode()
+assert b'"committed_raw_prefix":' not in wire
+print(json.dumps({"bytes": len(wire), "rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}))
+'''.replace("COUNT", str(count))
+    completed = subprocess.run([sys.executable, "-c", code], check=True,
+                               capture_output=True, text=True,
+                               env={**os.environ, "PYTHONPATH": str(Path(__file__).parent)})
+    result = json.loads(completed.stdout)
+    assert result["bytes"] < count * 5_000
+    assert result["rss_kib"] < 256 * 1024
 
 
 def test_methods_do_not_alias_and_missing_authority_is_explicit() -> None:
@@ -302,6 +391,18 @@ def test_experiment_evidence_rejects_duplicate_nonfinite_and_symlink(tmp_path: P
     with pytest.raises(MatrixError, match="input_descriptor_invalid"):
         verify_experiment(experiment)
 
+    manifest.write_bytes(original)
+    body_row = original_occurrences.replace(b'"authority":',
+                                            b'"committed_raw_prefix":"forbidden","authority":', 1)
+    occurrences.write_bytes(body_row)
+    value = json.loads(original)
+    value["artifacts"]["occurrences.jsonl"] = {
+        "bytes": len(body_row), "sha256": hashlib.sha256(body_row).hexdigest()}
+    manifest.write_bytes(json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n")
+    with pytest.raises(MatrixError, match="route_prefix_body_forbidden"):
+        verify_experiment(experiment)
+
+    occurrences.write_bytes(original_occurrences)
     manifest.write_bytes(original)
     escape = tmp_path / "outside-artifact"
     escape.write_bytes(b"outside")
@@ -423,7 +524,7 @@ def test_libbsc_archive_provenance_reproduces_pinned_hash() -> None:
 def test_repeat_full_only_carries_declared_relationship_state() -> None:
     assert repeat_full_state_contract("RAW_II")["fields"] == []
     assert repeat_full_state_contract("ZSTD_TU")["fields"] == []
-    assert "committed_raw_prefix" in repeat_full_state_contract("ZSTD_ROUTE")["fields"]
+    assert "committed_raw_prefix_descriptor" in repeat_full_state_contract("ZSTD_ROUTE")["fields"]
 
 
 def test_native_repeat_full_carries_state_with_changed_assignment_map(tmp_path: Path) -> None:
@@ -454,9 +555,13 @@ def test_native_repeat_full_carries_state_with_changed_assignment_map(tmp_path: 
         "selected_count": 2, "rows": [assignment_row(0, 0), assignment_row(1, 0)]}
     measured_authority = {"status": "READY", "topology": "C1F20/40",
         "selected_count": 2, "rows": [assignment_row(0, 1), assignment_row(1, 0)]}
+    empty_descriptor = {"schema": simulator_module.PREFIX_DESCRIPTOR_SCHEMA, "bytes": 0,
+                        "digest128": simulator_module._digest128(b"")}
     prior = {"relationships": {"ZSTD_ROUTE": {
-        "C0|F0": {"committed_raw_prefix": "", "next_rel_seq": 0},
-        "C0|F1": {"committed_raw_prefix": "", "next_rel_seq": 0}}}}
+        "C0|F0": {"committed_raw_prefix_descriptor": empty_descriptor,
+                  "_runtime_history": b"", "next_rel_seq": 0},
+        "C0|F1": {"committed_raw_prefix_descriptor": empty_descriptor,
+                  "_runtime_history": b"", "next_rel_seq": 0}}}}
     result = MethodMatrixSimulator(
         topology, methods=("ZSTD_ROUTE",), assignment_authority=measured_authority).run(
             measured, repeat_full=True, prior_state=prior,

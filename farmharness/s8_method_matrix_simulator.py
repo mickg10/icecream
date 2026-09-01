@@ -47,6 +47,8 @@ CORE_METHODS = frozenset(("RAW_II", "ZSTD_TU", "P29", "GRZ_RESIDUAL", "ZSTD_ROUT
 STATEFUL_METHODS = frozenset(("ZSTD_ROUTE", "P29", "GRZ_RESIDUAL"))
 TOPOLOGY_IDS = ("C1F1/100000", "C1F20/40")
 DEFAULT_HISTORY_BYTES = 128 << 20
+MAX_HISTORY_WINDOW_LOG = 27
+PREFIX_DESCRIPTOR_SCHEMA = "icecream-s8-route-prefix-descriptor-v1"
 AUTH_TRACE_SHA256 = "9fa7124f63212ccfd78f139dc05dcc5b2737ef868dc3e6878e64f609e079e960"
 AUTH_CORPUS_MANIFEST_SHA256 = "cbca563b6efe3255382db61b490ba948f3d2cdc0d95b793317f7d0134ec6f3fa"
 AUTH_ASSIGNMENT_SHA256 = {
@@ -101,6 +103,51 @@ def _digest128(data: bytes) -> str:
 def _digest128_text(value: object) -> bool:
     return (isinstance(value, str) and value != "0" * 32 and
             bool(re.fullmatch(r"[0-9a-f]{32}", value)))
+
+
+def _prefix_descriptor(history: bytes | bytearray) -> dict[str, object]:
+    """Return fixed-size evidence for a bounded route prefix."""
+    return {"schema": PREFIX_DESCRIPTOR_SCHEMA, "bytes": len(history),
+            "digest128": _digest128(history)}
+
+
+def _valid_prefix_descriptor(value: object, *, limit: int = 1 << MAX_HISTORY_WINDOW_LOG) -> bool:
+    return (isinstance(value, Mapping) and set(value) == {"schema", "bytes", "digest128"} and
+            value.get("schema") == PREFIX_DESCRIPTOR_SCHEMA and type(value.get("bytes")) is int and
+            0 <= int(value["bytes"]) <= limit and _digest128_text(value.get("digest128")))
+
+
+def _state_digest(history: bytes | bytearray, next_rel_seq: int,
+                  route_id: str | None, nonce: int) -> str:
+    return _sha256(_canonical({"prefix": _prefix_descriptor(history),
+                               "next_rel_seq": next_rel_seq,
+                               "route_id": route_id, "nonce": nonce}))
+
+
+def _append_bounded_history(history: bytes | bytearray, raw: bytes, limit: int
+                            ) -> bytes | bytearray:
+    """Append without materializing the old history plus the new payload."""
+    if isinstance(history, bytearray):
+        _append_bounded_history_in_place(history, raw, limit)
+        return history
+    if len(raw) >= limit:
+        return raw[-limit:]
+    keep = max(0, limit - len(raw))
+    return history[-keep:] + raw
+
+
+def _append_bounded_history_in_place(history: bytearray, raw: bytes, limit: int) -> None:
+    """Append to verifier state without ever growing beyond the suffix bound."""
+    if len(raw) >= limit:
+        history.clear()
+        history.extend(raw[-limit:])
+        return
+    keep = max(0, limit - len(raw))
+    if keep == 0:
+        history.clear()
+    elif len(history) > keep:
+        del history[:-keep]
+    history.extend(raw)
 
 
 def _canonical(value: object) -> bytes:
@@ -220,6 +267,108 @@ def _private_bytes(path: Path, label: str) -> tuple[bytes, dict[str, object]]:
     return raw, {"path": str(path), "bytes": len(raw), "sha256": _sha256(raw)}
 
 
+def _stream_route_prefixes(selected: object, assignment: object, root: Path,
+                           *, initial: Mapping[str, bytes] | None = None,
+                           predecessor_selected: object | None = None,
+                           predecessor_assignment: object | None = None,
+                           max_history_bytes: int = DEFAULT_HISTORY_BYTES,
+                           retain_histories: bool = False,
+                           label: str = "route_input") -> tuple[
+                               dict[int, dict[str, object]],
+                               dict[str, object], list[dict[str, object]]]:
+    """Authenticate inputs once while reconstructing fixed-size route evidence."""
+    def build_entries(stream: object, stream_assignment: object, stream_label: str
+                      ) -> tuple[dict[int, list[tuple[int, Mapping[str, object], Mapping[str, object]]]], int]:
+        if not isinstance(stream, list) or not isinstance(stream_assignment, Mapping):
+            raise MatrixError(stream_label + ":authority_missing")
+        assignment_rows = stream_assignment.get("rows")
+        if not isinstance(assignment_rows, list) or len(assignment_rows) != len(stream):
+            raise MatrixError(stream_label + ":assignment_length_invalid")
+        topology_id = stream_assignment.get("topology")
+        if topology_id not in TOPOLOGY_IDS:
+            raise MatrixError(stream_label + ":topology_invalid")
+        relationship_count = 1 if topology_id == "C1F1/100000" else 20
+        if assignment_rows:
+            try:
+                start = int(assignment_rows[0]["dispatch_order"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise MatrixError(stream_label + ":assignment_row_invalid") from exc
+            expected_assignment = _authenticated_assignment(topology_id, len(stream), start=start)
+            if any(stream_assignment.get(field) != expected_assignment.get(field)
+                   for field in ("path", "bytes", "sha256", "rows", "selected_count",
+                                 "authority_total_rows")):
+                raise MatrixError(stream_label + ":assignment_not_authenticated")
+        entries: dict[int, list[tuple[int, Mapping[str, object], Mapping[str, object]]]] = {
+            relation: [] for relation in range(relationship_count)}
+        for index, (item, assignment_row) in enumerate(zip(stream, assignment_rows)):
+            if (not isinstance(item, Mapping) or not isinstance(assignment_row, Mapping) or
+                    item.get("ordinal") != index):
+                raise MatrixError(stream_label + ":identity_invalid")
+            relative = item.get("source_relative")
+            if (not isinstance(relative, str) or Path(relative).is_absolute() or
+                    any(part in ("", ".", "..") for part in Path(relative).parts)):
+                raise MatrixError(stream_label + ":input_descriptor_invalid")
+            try:
+                relation = int(assignment_row["f_relationship"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise MatrixError(stream_label + ":assignment_row_invalid") from exc
+            if relation < 0 or relation >= relationship_count:
+                raise MatrixError(stream_label + ":assignment_row_invalid")
+            entries[relation].append((index, item, assignment_row))
+        return entries, relationship_count
+
+    if type(max_history_bytes) is not int or max_history_bytes <= 0:
+        raise MatrixError(label + ":history_bound_invalid")
+    entries, relationship_count = build_entries(selected, assignment, label)
+    predecessor_entries: dict[int, list[tuple[int, Mapping[str, object], Mapping[str, object]]]] = {}
+    if predecessor_selected is not None:
+        predecessor_entries, predecessor_count = build_entries(
+            predecessor_selected, predecessor_assignment, label + "_predecessor")
+        if predecessor_count != relationship_count:
+            raise MatrixError(label + ":predecessor_topology_invalid")
+    observations: dict[int, dict[str, object]] = {}
+    final: dict[str, object] = {}
+    facts_by_index: dict[int, dict[str, object]] = {}
+    effective_limit = min(max_history_bytes, 1 << MAX_HISTORY_WINDOW_LOG)
+    for relation, relation_entries in entries.items():
+        relationship_key = "C0|F" + str(relation)
+        if relation in predecessor_entries and initial:
+            raise MatrixError(label + ":duplicate_initial_predecessor_state")
+        starting = initial.get(relationship_key, b"") if initial else b""
+        if not isinstance(starting, bytes) or len(starting) > effective_limit:
+            raise MatrixError(label + ":initial_prefix_invalid")
+        history = bytearray(starting)
+        for is_current, stream_entries in ((False, predecessor_entries.get(relation, [])),
+                                           (True, relation_entries)):
+            for index, item, _assignment_row in stream_entries:
+                relative = str(item["source_relative"])
+                path = root / relative
+                try:
+                    if path.resolve(strict=True).relative_to(root) != Path(relative):
+                        raise MatrixError(label + ":path_outside_root")
+                except (OSError, ValueError) as exc:
+                    raise MatrixError(label + ":path_outside_root") from exc
+                raw, file_facts = _private_bytes(path, label + "_input")
+                if (file_facts["sha256"] != item.get("sha256") or
+                        file_facts["bytes"] != item.get("bytes")):
+                    raise MatrixError(label + ":input_mutated")
+                before = _prefix_descriptor(history)
+                _append_bounded_history_in_place(history, raw, effective_limit)
+                after = _prefix_descriptor(history)
+                if is_current:
+                    observations[index] = {"relationship_key": ["C0", "F" + str(relation)],
+                                           "before": before, "after": after}
+                    facts_by_index[index] = {
+                        "ordinal": item.get("ordinal"), "build": item.get("build"),
+                        "logical": item.get("logical"), "source_relative": relative,
+                        "bytes": file_facts["bytes"], "sha256": file_facts["sha256"],
+                        "source_path": str(path), "source_digest128": _digest128(raw)}
+        final[relationship_key] = (history if retain_histories
+                                   else _prefix_descriptor(history))
+    facts = [facts_by_index[index] for index in range(len(selected))]
+    return observations, final, facts
+
+
 def _authenticated_assignment(topology_id: str, count: int, *, start: int = 0) -> dict[str, object]:
     if type(start) is not int or start < 0:
         raise MatrixError("assignment:start_invalid")
@@ -337,6 +486,9 @@ def _native_batch(occurrences: Sequence[Occurrence], topology: MatrixTopology,
                           segment_rows: Sequence[object]) -> None:
             if not isinstance(item, Mapping) or item.get("schema") != "icecream-p50sim-batch-v1":
                 raise MatrixError("native product output schema invalid")
+            if any(isinstance(key, str) and key.startswith("committed_raw_prefix")
+                   for key in item):
+                raise MatrixError("native product output prefix body forbidden")
             marker = (segment, index)
             if marker in seen:
                 raise MatrixError("native product output duplicate ordinal")
@@ -694,7 +846,7 @@ class Occurrence:
 @dataclass
 class _RelationshipState:
     key: tuple[str, str]
-    history: bytes = b""
+    history: bytes | bytearray = b""
     next_rel_seq: int = 0
     last_route_id: str | None = None
     history_nonce: int = 1
@@ -723,7 +875,7 @@ def repeat_full_state_contract(method: str) -> dict[str, object]:
         fields = ["native_last_tu_seq", "native_next_rel_seq", "native_state_digest",
                   "history_nonce", "route_identity"]
         if method == "ZSTD_ROUTE":
-            fields.insert(0, "committed_raw_prefix")
+            fields.append("committed_raw_prefix_descriptor")
         return {"survives": True, "fields": fields}
     if method == "ZSTD_COHORT":
         return {"survives": True, "fields": ["cohort_dictionary_identity",
@@ -745,7 +897,7 @@ class MethodMatrixSimulator:
         self.methods = tuple(methods)
         if not self.methods or any(method not in METHODS for method in self.methods):
             raise MatrixError("methods contain an unknown or empty method")
-        self.max_history_bytes = max_history_bytes
+        self.max_history_bytes = min(max_history_bytes, 1 << MAX_HISTORY_WINDOW_LOG)
         self.cohort_dictionary = cohort_dictionary
         self.cohort_authority = dict(cohort_authority or {})
         self.assignment_authority = dict(assignment_authority or {
@@ -873,10 +1025,9 @@ class MethodMatrixSimulator:
                     key = tuple(str(key_text).split("|", 1))
                     if key not in states_by_method[method] or not isinstance(value, Mapping):
                         raise MatrixError("repeat-full relationship identity is invalid")
-                    history = value.get("committed_raw_prefix", b"")
-                    if isinstance(history, str):
-                        history = bytes.fromhex(history)
-                    if not isinstance(history, bytes) or len(history) > self.max_history_bytes:
+                    history = value.get("_runtime_history", b"")
+                    if (not isinstance(history, (bytes, bytearray)) or
+                            len(history) > self.max_history_bytes):
                         raise MatrixError("repeat-full committed prefix exceeds bound")
                     states_by_method[method][key].history = history
                     states_by_method[method][key].next_rel_seq = int(value.get("next_rel_seq", 0))
@@ -1013,8 +1164,8 @@ class MethodMatrixSimulator:
                         state: _RelationshipState,
                         raw_override: bytes | None = None) -> dict[str, object]:
         key = tuple(assignment["relationship_key"])  # type: ignore[arg-type]
-        pre = _sha256(_canonical({"history": state.history.hex(), "next_rel_seq": state.next_rel_seq,
-                                  "route_id": state.last_route_id, "nonce": state.history_nonce}))
+        pre = _state_digest(state.history, state.next_rel_seq,
+                            state.last_route_id, state.history_nonce)
         raw_path = encoded_path = None
         raw = (None if method == "RAW_II" and occurrence.source_path else
                raw_override if raw_override is not None else occurrence.read_raw())
@@ -1054,7 +1205,9 @@ class MethodMatrixSimulator:
         # Preparation is tentative until the terminal commit witness arrives.
         # Encode against a copy so a rejected candidate cannot rebind a route,
         # consume a reset nonce, or advance REL_SEQ.
-        encode_state = _RelationshipState(key, state.history, state.next_rel_seq,
+        history_copy = (bytearray(state.history) if isinstance(state.history, bytearray)
+                        and not occurrence.commit else state.history)
+        encode_state = _RelationshipState(key, history_copy, state.next_rel_seq,
                                           state.last_route_id, state.history_nonce,
                                           state.reset_count, state.pending)
         if method in {"ZSTD_ROUTE", "ZSTD_COHORT"}:
@@ -1107,12 +1260,10 @@ class MethodMatrixSimulator:
                 # pre-state separately so repeat-full can bind the first
                 # current row to the predecessor without rereading payloads.
                 prefix_before = state.history
-                transaction.update({"committed_raw_prefix": prefix_before.hex(),
-                                    "committed_raw_prefix_bytes": len(prefix_before),
-                                    "committed_raw_prefix_digest": _digest128(prefix_before),
-                                    "committed_raw_prefix_before": prefix_before.hex(),
-                                    "committed_raw_prefix_before_bytes": len(prefix_before),
-                                    "committed_raw_prefix_before_digest": _digest128(prefix_before)})
+                transaction.update({"committed_raw_prefix_before_descriptor":
+                                    _prefix_descriptor(prefix_before),
+                                    "committed_raw_prefix_descriptor":
+                                    _prefix_descriptor(prefix_before)})
             row["product_transaction"] = transaction
             state.native_last_tu_seq = int(product["tu_seq"])
             state.native_state_digest = str(product["state_digest"])
@@ -1136,7 +1287,8 @@ class MethodMatrixSimulator:
                     "codec_wall_ns": (None if method == "RAW_II" else wall_ns)})
         if occurrence.commit:
             if method in {"ZSTD_ROUTE", "ZSTD_COHORT"}:
-                encode_state.history = (encode_state.history + raw)[-self.max_history_bytes:]
+                encode_state.history = _append_bounded_history(
+                    encode_state.history, raw, self.max_history_bytes)
                 encode_state.next_rel_seq += 1
                 state.history = encode_state.history
                 state.next_rel_seq = encode_state.next_rel_seq
@@ -1165,11 +1317,9 @@ class MethodMatrixSimulator:
             if isinstance(transaction, dict):
                 transaction["committed_state_digest"] = state.native_state_digest
                 if method == "ZSTD_ROUTE":
-                    transaction["committed_raw_prefix"] = state.history.hex()
-                    transaction["committed_raw_prefix_bytes"] = len(state.history)
-                    transaction["committed_raw_prefix_digest"] = _digest128(state.history)
-        post = _sha256(_canonical({"history": state.history.hex(), "next_rel_seq": state.next_rel_seq,
-                                   "route_id": state.last_route_id, "nonce": state.history_nonce}))
+                    transaction["committed_raw_prefix_descriptor"] = _prefix_descriptor(state.history)
+        post = _state_digest(state.history, state.next_rel_seq,
+                             state.last_route_id, state.history_nonce)
         row["post_state_digest"] = post
         return row
 
@@ -1217,11 +1367,9 @@ class MethodMatrixSimulator:
                  states_by_method: Mapping[str, Mapping[tuple[str, str], _RelationshipState]]) -> dict[str, object]:
         relationships = {
             method: {"|".join(key): {"next_rel_seq": state.next_rel_seq,
-                "committed_raw_prefix": state.history.hex(),
-                "committed_raw_prefix_digest": _digest128(state.history),
+                "committed_raw_prefix_descriptor": _prefix_descriptor(state.history),
                 "history_nonce": state.history_nonce,
                 "route_identity": state.last_route_id,
-                "committed_raw_prefix_bytes": len(state.history),
                 "reset_count": state.reset_count,
                 "native_last_tu_seq": state.native_last_tu_seq,
                 "native_next_rel_seq": (None if state.native_last_tu_seq is None
@@ -1293,8 +1441,19 @@ def verify_experiment(experiment: Path) -> dict[str, object]:
     summary = _strict_json(files["summary.json"][0], "verifier_summary")
     if not isinstance(summary, Mapping) or summary.get("schema") != SUMMARY_SCHEMA:
         raise MatrixError("verifier:summary_schema_invalid")
+    def has_prefix_body(value: object) -> bool:
+        if isinstance(value, Mapping):
+            return any(key == "committed_raw_prefix" or has_prefix_body(item)
+                       for key, item in value.items())
+        if isinstance(value, list):
+            return any(has_prefix_body(item) for item in value)
+        return False
+    if has_prefix_body(manifest) or has_prefix_body(summary):
+        raise MatrixError("verifier:route_prefix_body_forbidden")
     input_authority = manifest.get("input_authority")
     input_facts: list[dict[str, object]] = []
+    route_observations: dict[int, dict[str, object]] = {}
+    route_final_histories: dict[str, object] = {}
     if isinstance(input_authority, Mapping):
         root_path = Path(str(input_authority.get("corpus_root", AUTH_CORPUS_ROOT)))
         try:
@@ -1307,36 +1466,41 @@ def verify_experiment(experiment: Path) -> dict[str, object]:
         selected = input_authority.get("selected_inputs", [])
         if not isinstance(selected, list):
             raise MatrixError("verifier:input_authority_invalid")
-        for item in selected:
-            if not isinstance(item, Mapping):
-                raise MatrixError("verifier:input_descriptor_invalid")
-            # In-memory synthetic controls intentionally have no external
-            # source descriptor; they are not predecessor candidates.  Real
-            # Firefox experiments must carry and authenticate both path and
-            # digest below.
-            if item.get("source_relative") is None:
-                if item.get("sha256") is not None:
+        assignment = manifest.get("assignment_authority")
+        initial_route: dict[str, bytes] | None = None
+        predecessor_selected: object | None = None
+        predecessor_assignment: object | None = None
+        predecessor_input_authority = manifest.get("predecessor_input_authority")
+        if manifest.get("repeat_full") is True:
+            if (not isinstance(predecessor_input_authority, Mapping) or
+                    not isinstance(predecessor_input_authority.get("selected_inputs"), list) or
+                    not isinstance(predecessor_input_authority.get("assignment"), Mapping)):
+                raise MatrixError("verifier:predecessor_route_authority_missing")
+            predecessor_selected = predecessor_input_authority["selected_inputs"]
+            predecessor_assignment = predecessor_input_authority["assignment"]
+            if predecessor_selected:
+                if not all(isinstance(item, Mapping) and item.get("source_relative") is not None
+                           for item in predecessor_selected):
+                    raise MatrixError("verifier:predecessor_route_inputs_missing")
+        if selected and all(isinstance(item, Mapping) and
+                            item.get("source_relative") is not None for item in selected):
+            route_observations, route_final_histories, input_facts = _stream_route_prefixes(
+                selected, assignment, root,
+                predecessor_selected=(predecessor_selected if isinstance(predecessor_selected, list)
+                                      and predecessor_selected else None),
+                predecessor_assignment=predecessor_assignment,
+                initial=initial_route, label="verifier_route")
+        else:
+            for item in selected:
+                if not isinstance(item, Mapping):
                     raise MatrixError("verifier:input_descriptor_invalid")
-                continue
-            if not isinstance(item.get("source_relative"), str):
+                # In-memory synthetic controls intentionally have no external
+                # source descriptor; they are not predecessor candidates.
+                if item.get("source_relative") is None:
+                    if item.get("sha256") is not None:
+                        raise MatrixError("verifier:input_descriptor_invalid")
+                    continue
                 raise MatrixError("verifier:input_descriptor_invalid")
-            relative = str(item["source_relative"])
-            if Path(relative).is_absolute() or any(part in ("", ".", "..")
-                                                   for part in Path(relative).parts):
-                raise MatrixError("verifier:input_descriptor_invalid")
-            path = root / relative
-            try:
-                if path.resolve(strict=True).relative_to(root) != Path(relative):
-                    raise MatrixError("verifier:input_outside_root")
-            except ValueError as exc:
-                raise MatrixError("verifier:input_outside_root") from exc
-            raw, facts = _private_bytes(path, "verifier_input")
-            if facts["sha256"] != item.get("sha256") or facts["bytes"] != item.get("bytes"):
-                raise MatrixError("verifier:external_input_mutated")
-            input_facts.append({"ordinal": item.get("ordinal"), "build": item.get("build"),
-                                "logical": item.get("logical"), "source_relative": relative,
-                                "bytes": facts["bytes"], "sha256": facts["sha256"],
-                                "source_path": str(path), "source_digest128": _digest128(raw)})
     try:
         rows = [_strict_json(line.encode("utf-8"), "verifier_occurrence") for line in
                 files["occurrences.jsonl"][0].decode("utf-8").splitlines()]
@@ -1346,6 +1510,8 @@ def verify_experiment(experiment: Path) -> dict[str, object]:
         raise MatrixError("verifier:occurrences_invalid") from exc
     if any(not isinstance(row, Mapping) for row in rows):
         raise MatrixError("verifier:occurrences_invalid")
+    if has_prefix_body(rows):
+        raise MatrixError("verifier:route_prefix_body_forbidden")
     order = [{"ordinal": row.get("ordinal"), "method": row.get("method")} for row in rows]
     if order != manifest.get("row_order"):
         raise MatrixError("verifier:row_reordered_or_changed")
@@ -1360,6 +1526,40 @@ def verify_experiment(experiment: Path) -> dict[str, object]:
                 if (descriptor is None or descriptor.get("sha256") != row.get(digest_field) or
                         files[name][1]["sha256"] != row.get(digest_field)):
                     raise MatrixError("verifier:row_artifact_binding_invalid")
+    route_rows = [row for row in rows if row.get("method") == "ZSTD_ROUTE"]
+    if route_observations and route_rows:
+        seen_route_ordinals: set[int] = set()
+        for row in route_rows:
+            ordinal = row.get("ordinal")
+            if type(ordinal) is not int or ordinal in seen_route_ordinals or ordinal not in route_observations:
+                raise MatrixError("verifier:route_prefix_row_identity_invalid")
+            seen_route_ordinals.add(ordinal)
+            expected = route_observations[ordinal]
+            if row.get("relationship_key") != expected["relationship_key"]:
+                raise MatrixError("verifier:route_prefix_relationship_invalid")
+            transaction = row.get("product_transaction")
+            if not isinstance(transaction, Mapping):
+                raise MatrixError("verifier:route_prefix_descriptor_missing")
+            for suffix, descriptor_name in (("_before", "before"), ("", "after")):
+                field = ("committed_raw_prefix_before_descriptor" if suffix else
+                         "committed_raw_prefix_descriptor")
+                transaction_descriptor = transaction.get(field)
+                descriptor = expected[descriptor_name]
+                if transaction_descriptor != descriptor:
+                    raise MatrixError("verifier:route_prefix_descriptor_mismatch")
+        if seen_route_ordinals != set(route_observations):
+            raise MatrixError("verifier:route_prefix_rows_incomplete")
+        relationships = summary.get("relationships")
+        route_summary = relationships.get("ZSTD_ROUTE") if isinstance(relationships, Mapping) else None
+        if not isinstance(route_summary, Mapping):
+            raise MatrixError("verifier:route_prefix_summary_missing")
+        for relationship_key, history in route_final_histories.items():
+            state = route_summary.get(relationship_key)
+            descriptor = (history if isinstance(history, Mapping)
+                          else _prefix_descriptor(history))
+            if (not isinstance(state, Mapping) or
+                    state.get("committed_raw_prefix_descriptor") != descriptor):
+                raise MatrixError("verifier:route_prefix_summary_mismatch")
     return {"status": "PASS", "experiment": str(experiment), "rows": len(rows),
             "artifacts": len(declared), "manifest": dict(manifest),
             "manifest_facts": dict(_manifest_facts),
@@ -1605,11 +1805,8 @@ def _authenticated_predecessor_plan(
                     not isinstance(value.get("route_identity"), str) or not value["route_identity"]):
                 raise MatrixError("repeat-full predecessor native state is incomplete")
             if method == "ZSTD_ROUTE":
-                try:
-                    prefix = bytes.fromhex(str(value.get("committed_raw_prefix", "")))
-                except ValueError as exc:
-                    raise MatrixError("repeat-full predecessor route prefix is incomplete") from exc
-                if value.get("committed_raw_prefix_bytes") != len(prefix):
+                descriptor = value.get("committed_raw_prefix_descriptor")
+                if not _valid_prefix_descriptor(descriptor):
                     raise MatrixError("repeat-full predecessor route prefix is incomplete")
     if (summary.get("experiment") != str(path) or
             summary.get("topology", {}).get("id") != topology_id or
@@ -1655,7 +1852,32 @@ def _authenticated_predecessor_plan(
                                       source_build=int(assignment_row["authority_build"]),
                                       source_logical=logical,
                                       source_digest128=str(fact["source_digest128"])))
-    return dict(summary), dict(authority), occurrences
+    _observations, route_histories, _facts = _stream_route_prefixes(
+        selected_inputs, authority, Path(str(input_authority["corpus_root"])),
+        retain_histories=True, label="repeat_full_predecessor_route")
+    summary_relationships = summary.get("relationships", {})
+    route_summary = summary_relationships.get("ZSTD_ROUTE") if isinstance(summary_relationships, Mapping) else None
+    if not isinstance(route_summary, Mapping):
+        raise MatrixError("repeat-full predecessor route summary is incomplete")
+    for relationship_key, history in route_histories.items():
+        descriptor = _prefix_descriptor(history)
+        state = route_summary.get(relationship_key)
+        if (not isinstance(state, Mapping) or
+                state.get("committed_raw_prefix_descriptor") != descriptor):
+            raise MatrixError("repeat-full predecessor route summary changed")
+    prior_state = dict(summary)
+    prior_relationships = summary_relationships if isinstance(summary_relationships, Mapping) else {}
+    prior_state["relationships"] = {
+        method: {key: dict(value) if isinstance(value, Mapping) else value
+                 for key, value in states.items()}
+        for method, states in prior_relationships.items()
+        if isinstance(states, Mapping)
+    }
+    for key, history in route_histories.items():
+        value = prior_state["relationships"]["ZSTD_ROUTE"][key]
+        if isinstance(value, dict):
+            value["_runtime_history"] = history
+    return prior_state, dict(authority), occurrences
 
 
 def main(argv: Sequence[str] | None = None) -> int:
