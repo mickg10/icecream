@@ -382,6 +382,11 @@ def test_native_repeat_full_carries_state_with_changed_assignment_map(tmp_path: 
     assert result["core_completion"]["status"] == "INCOMPLETE_REQUESTED_SUBSET"
     assert [row["product_transaction"]["tu_seq"] for row in result["rows"]] == [0, 2]
     assert all(row["wire_witnessed"] is True for row in result["rows"])
+    assert all(row["product_transaction"]["route_identity"] ==
+               f"{row['relationship_key'][0]}->{row['relationship_key'][1]}"
+               for row in result["rows"])
+    assert all(row["product_transaction"]["history_nonce"] == 1
+               for row in result["rows"])
 
 
 @pytest.mark.parametrize("topology_id", ("C1F1/100000", "C1F20/40"))

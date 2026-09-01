@@ -331,9 +331,15 @@ def _native_batch(occurrences: Sequence[Occurrence], topology: MatrixTopology,
             row = segment_rows[index]
             if not isinstance(row, Mapping):
                 raise MatrixError("native product assignment row invalid")
-            relation = int(row["f_relationship"])
+            try:
+                relation = int(row["f_relationship"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise MatrixError("native product assignment row invalid") from exc
             expected_relation_id = f"c1f{topology.relationship_count}-r{relation:02d}"
-            if (item.get("segment") != segment or item.get("tu_index") != index or
+            if (type(item.get("tu_index")) is not int or
+                    type(item.get("tu_seq")) is not int or
+                    type(item.get("raw_bytes")) is not int or
+                    item.get("segment") != segment or item.get("tu_index") != index or
                     item.get("profile") != expected_profile or
                     item.get("relationship_id") != expected_relation_id or
                     item.get("committed") is not True):
@@ -358,12 +364,21 @@ def _native_batch(occurrences: Sequence[Occurrence], topology: MatrixTopology,
                 relation_last_state[relation] = str(item["state_digest"])
         expected_segment = "full-2" if predecessor_occurrences else "full-1"
         output_raw, _output_facts = _private_bytes(output, "native_batch_output")
-        for line in output_raw.decode("utf-8").splitlines():
+        try:
+            output_lines = output_raw.decode("utf-8").splitlines()
+        except UnicodeDecodeError as exc:
+            raise MatrixError("native product output is not UTF-8") from exc
+        for line in output_lines:
             item = _strict_json(line.encode("utf-8"), "native_batch_output")
+            if not isinstance(item, Mapping):
+                raise MatrixError("native product output schema invalid")
             segment = item.get("segment")
             if segment not in {"full-1", "full-2"}:
-                continue
-            ordinal = int(item["tu_index"])
+                raise MatrixError("native product output segment invalid")
+            try:
+                ordinal = int(item["tu_index"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise MatrixError("native product output ordinal invalid") from exc
             segment_occurrences = (predecessor_occurrences if segment == "full-1" and
                                    predecessor_occurrences else occurrences)
             segment_rows = predecessor_rows if segment == "full-1" and predecessor_occurrences else rows
@@ -1067,6 +1082,14 @@ class MethodMatrixSimulator:
                         "native_state_before_digest": product["state_before_digest"],
                         "native_state_digest": product["state_digest"],
                         "native_transaction_digest": product["transaction_digest"]})
+            transaction = dict(product)
+            transaction.update({"native_next_rel_seq": int(product["tu_seq"]) + 1,
+                                "history_nonce": occurrence.history_nonce,
+                                "route_identity": f"{key[0]}->{key[1]}"})
+            if method == "ZSTD_ROUTE":
+                transaction.update({"committed_raw_prefix": state.history.hex(),
+                                    "committed_raw_prefix_bytes": len(state.history)})
+            row["product_transaction"] = transaction
             state.native_last_tu_seq = int(product["tu_seq"])
             state.native_state_digest = str(product["state_digest"])
             if method in STATEFUL_METHODS:
@@ -1087,8 +1110,6 @@ class MethodMatrixSimulator:
                     if encoded_path and experiment else None,
                     "codec_cpu_ns": (None if method == "RAW_II" else cpu_ns),
                     "codec_wall_ns": (None if method == "RAW_II" else wall_ns)})
-        if method in self._native_rows and occurrence.ordinal in self._native_rows[method]:
-            row["product_transaction"] = self._native_rows[method][occurrence.ordinal]
         if occurrence.commit:
             if method in {"ZSTD_ROUTE", "ZSTD_COHORT"}:
                 encode_state.history = (encode_state.history + raw)[-self.max_history_bytes:]
@@ -1115,6 +1136,13 @@ class MethodMatrixSimulator:
             else:
                 state.pending = False
                 row["transition"] = "tentative_discarded_explicit_release"
+        if product is not None:
+            transaction = row["product_transaction"]
+            if isinstance(transaction, dict):
+                transaction["committed_state_digest"] = state.native_state_digest
+                if method == "ZSTD_ROUTE":
+                    transaction["committed_raw_prefix"] = state.history.hex()
+                    transaction["committed_raw_prefix_bytes"] = len(state.history)
         post = _sha256(_canonical({"history": state.history.hex(), "next_rel_seq": state.next_rel_seq,
                                    "route_id": state.last_route_id, "nonce": state.history_nonce}))
         row["post_state_digest"] = post
