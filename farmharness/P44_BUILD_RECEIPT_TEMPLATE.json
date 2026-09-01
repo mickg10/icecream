@@ -4,12 +4,12 @@
   "label": "P44",
   "artifact_root": "/private/absolute/path/to/p44-build-root",
   "source": {
-    "commit": "8c8cb881f8f5f8b7c10a608885f1b66e8e6ee7d3",
+    "commit": "16b48c2bf2715a8eff329ee124bd52bd4731db29",
     "tree": "RECORD_EXACT_40_HEX_SOURCE_TREE",
     "repository": "/private/absolute/path/to/p44-source-checkout"
   },
   "build": {
-    "source_commit": "8c8cb881f8f5f8b7c10a608885f1b66e8e6ee7d3",
+    "source_commit": "16b48c2bf2715a8eff329ee124bd52bd4731db29",
     "source_tree": "RECORD_EXACT_40_HEX_SOURCE_TREE",
     "authority": "release-build",
     "receipt_id": "RECORD_UNIQUE_RECEIPT_ID",

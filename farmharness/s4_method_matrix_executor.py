@@ -61,6 +61,11 @@ def _canonical(value: object) -> bytes:
                        ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
 
 
+def _jsonl_bytes(rows: list[dict[str, Any]]) -> bytes:
+    """Encode deterministic JSONL without executing or reading workloads."""
+    return b"".join(_canonical(row) for row in rows)
+
+
 def _repo_head(repo: Path) -> str:
     try:
         return subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"],
@@ -226,6 +231,23 @@ def materialize_matrix(*, output_root: Path, repo: Path, corpus: str,
     stamp = timestamp or _stamp()
     campaign = output_root.absolute() / f"s4-method-matrix-{stamp}"
     campaign.mkdir(parents=True)
+    # Keep compatibility and ordered-transition planning records beside the
+    # timestamped experiment tree.  These records are declarative; a later
+    # runner must bind every row to an audited artifact receipt.
+    compatibility_rows = [
+        {"schema": "icecream-s4-compatibility-experiment-v1",
+         "timestamp": stamp, "campaign": campaign.name, "kind": "state",
+         **row}
+        for row in plan["compatibility_matrix"]
+    ]
+    transition_rows = [
+        {"schema": "icecream-s4-transition-experiment-v1",
+         "timestamp": stamp, "campaign": campaign.name, "kind": "transition",
+         **row}
+        for row in plan["transitions"]
+    ]
+    (campaign / "compatibility-plan.jsonl").write_bytes(_jsonl_bytes(compatibility_rows))
+    (campaign / "transition-plan.jsonl").write_bytes(_jsonl_bytes(transition_rows))
     blocks = 0
     blocked = 0
     staged = 0
@@ -279,6 +301,10 @@ def materialize_matrix(*, output_root: Path, repo: Path, corpus: str,
                    "allowed_corpora": list(sorted(CALIBRATION_CORPORA)),
                    "held_out_corpora": ["DuckDB", "LLVM-1238"]},
                "comparison_blocks": blocks, "arm_runs": blocks * 2,
+               "compatibility_states": len(compatibility_rows),
+               "transition_rows": len(transition_rows),
+               "compatibility_plan": "compatibility-plan.jsonl",
+               "transition_plan": "transition-plan.jsonl",
                "staged_arms": staged, "blocked_arms": blocked,
                "raw_ii_gap": None,
                "metrics": {"channel_bytes": "pending", "elapsed_ns": "pending",

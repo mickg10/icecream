@@ -18,6 +18,7 @@ from farmharness.s4_version_transition_planner import (
     STATIC_STATES,
     audit_plan,
     build_plan,
+    compatibility_for_state,
     state_id,
 )
 
@@ -34,6 +35,47 @@ class S4VersionTransitionPlannerTest(unittest.TestCase):
         self.assertEqual(rows[50]["source_commit"], P50_SOURCE_SHA)
         self.assertEqual(rows[44]["protocol_assertion"]["text"], P44_PROTOCOL_ASSERTION)
         self.assertNotEqual(rows[43]["source_commit"], rows[44]["source_commit"])
+
+    def test_protocol_history_proves_both_legacy_comparators(self) -> None:
+        self.assertEqual(self.plan["legacy_comparator"]["status"], "BOTH_P43_AND_P44")
+        self.assertEqual(self.plan["legacy_comparator"]["versions"], [43, 44])
+        history = {row["version"]: row for row in self.plan["protocol_history"]}
+        self.assertEqual(history[43]["source_commit"], P43_SOURCE_SHA)
+        self.assertEqual(history[44]["source_commit"], P44_SOURCE_SHA)
+        self.assertEqual(history[44]["assertion"], P44_PROTOCOL_ASSERTION)
+        self.assertEqual(history[50]["assertion"], "#define PROTOCOL_VERSION 50")
+
+    def test_compatibility_matrix_has_pairwise_negotiation_and_distinct_arms(self) -> None:
+        matrix = {row["id"]: row for row in self.plan["compatibility_matrix"]}
+        self.assertEqual(len(matrix), 27)
+        legacy = matrix["s43-c50-f44"]
+        self.assertEqual(legacy["negotiated_protocols"], {"S-C": 43, "S-F": 43, "C-F": 44})
+        self.assertEqual(legacy["expected_behavior"], "LEGACY_FALLBACK")
+        self.assertFalse(legacy["feature_negotiation"]["p50_methods"])
+        for method in ("RAW_II", "ZSTD_TU", "ZSTD_ROUTE", "P29", "GRZ"):
+            self.assertEqual(legacy["method_arms"][method]["availability"], "unavailable")
+            self.assertEqual(legacy["method_arms"][method]["fallback"], "WHOLE_LEGACY")
+        current = matrix["s50-c50-f50"]
+        self.assertEqual(current["expected_behavior"], "P50_METHODS")
+        self.assertTrue(all(current["method_arms"][method]["availability"] == "supported"
+                            for method in ("RAW_II", "ZSTD_TU", "ZSTD_ROUTE", "P29", "GRZ")))
+        self.assertEqual(current["artifact_identities"]["S"]["runtime_source_commit"],
+                         self.plan["source"]["harness"]["runner_p50_build_source_sha"])
+
+    def test_auditor_rejects_compatibility_or_identity_deletion(self) -> None:
+        mutant = json.loads(json.dumps(self.plan))
+        del mutant["compatibility_matrix"][0]["method_arms"]["P29"]
+        self.assertEqual(audit_plan(mutant)["status"], "FAIL")
+        mutant = json.loads(json.dumps(self.plan))
+        del mutant["states"][0]["compatibility"]
+        self.assertEqual(audit_plan(mutant)["status"], "FAIL")
+        mutant = json.loads(json.dumps(self.plan))
+        mutant["compatibility_matrix"][0]["artifact_identities"]["S"]["version"] = 44
+        self.assertEqual(audit_plan(mutant)["status"], "FAIL")
+
+    def test_unsupported_protocol_triple_fails_closed(self) -> None:
+        with self.assertRaises(ValueError):
+            compatibility_for_state((43, 45, 50))
 
     def test_static_grid_and_ordered_pair_grid(self) -> None:
         self.assertEqual(len(STATIC_STATES), 27)

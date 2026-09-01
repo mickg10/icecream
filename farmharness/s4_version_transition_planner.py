@@ -44,9 +44,23 @@ P50_TOPOLOGIES: tuple[dict[str, Any], ...] = (
 # P43: it is the distinct proto/cache lineage and its comm.h assertion is
 # checked in the repository from which this plan was prepared.
 P43_SOURCE_SHA = "cd74801e0fa4e83e3ae254ca1d7fe98642f36b89"
-P44_SOURCE_SHA = "8c8cb881f8f5f8b7c10a608885f1b66e8e6ee7d3"
+P44_SOURCE_SHA = "16b48c2bf2715a8eff329ee124bd52bd4731db29"
 P50_SOURCE_SHA = "0aa537f746d41386aed49a88905406a2514b76f5"
 P44_PROTOCOL_ASSERTION = "#define PROTOCOL_VERSION 44"
+P43_PROTOCOL_SOURCE_SHA = P43_SOURCE_SHA
+P44_PROTOCOL_SOURCE_SHA = P44_SOURCE_SHA
+P50_PROTOCOL_SOURCE_SHA = "3d1468ede438e4badb6aff52ff6368dfc62c7e02"
+PROTOCOL_HISTORY: tuple[dict[str, Any], ...] = (
+    {"version": 43, "source_commit": P43_PROTOCOL_SOURCE_SHA,
+     "assertion": "#define PROTOCOL_VERSION 43",
+     "evidence": "release commit: Update version to 1.4 for release"},
+    {"version": 44, "source_commit": P44_PROTOCOL_SOURCE_SHA,
+     "assertion": P44_PROTOCOL_ASSERTION,
+     "evidence": "protocol bump 43 -> 44: reserve all local slots for full LTO"},
+    {"version": 50, "source_commit": P50_PROTOCOL_SOURCE_SHA,
+     "assertion": "#define PROTOCOL_VERSION 50",
+     "evidence": "protocol bump 44 -> 50: carry scheduler assignment identity"},
+)
 
 # Inventory from farmharness/s4_real_cells.py at the planning head.  These
 # are contracts, not evidence that a final artifact has already been built.
@@ -104,6 +118,21 @@ P50_METHOD_CONTRACTS: dict[str, dict[str, Any]] = {
     "P29": {"source_profile": "P29", "implemented": True},
     "GRZ": {"source_profile": "GRZ_RESIDUAL", "implemented": True,
             "build_requirement": "exact current P50 build with ICECC_P50_WITH_LIBBSC"},
+}
+
+# These are ordinary-link capabilities, not feature-bit aliases.  CacheWire
+# and the P50 assignment/input tails are admitted only at the exact negotiated
+# protocol 50 gate in services/comm.h.  All three ordinary links still retain
+# the historical FileChunk transport at protocol 43/44 (and at a mixed
+# negotiated value), which is the required compatibility fallback.
+COMPATIBILITY_METHODS = ("WHOLE_LEGACY", "RAW_II", *P50_METHODS)
+LINKS = ("S-C", "S-F", "C-F")
+P50_FEATURES = {
+    "assignment_identity": "S-C and C-F negotiated protocol 50",
+    "cache_advertisement": "S-F negotiated protocol 50",
+    "cache_handoff": "S-C negotiated protocol 50",
+    "source_arm": "S-F and C-F negotiated protocol 50",
+    "cache_session": "C-F negotiated protocol 50",
 }
 
 # These names occur in historical/planning material but are absent from the
@@ -211,6 +240,11 @@ def expected_cache_engagement(state: Sequence[int]) -> bool:
     return all_p50(state)
 
 
+def compatibility_for_state(state: Sequence[int]) -> dict[str, Any]:
+    """Return one exact compatibility row, rejecting unsupported versions."""
+    return _compatibility_descriptor(parse_state(state))
+
+
 def artifact_binding_contract() -> dict[str, Any]:
     """Describe the receipt boundary used by the later S4 matrix runner.
 
@@ -229,9 +263,11 @@ def artifact_binding_contract() -> dict[str, Any]:
         "transition_count": 729,
         "p43_source_commit": P43_SOURCE_SHA,
         "p44_source_commit": P44_SOURCE_SHA,
+        "p44_protocol_source_commit": P44_PROTOCOL_SOURCE_SHA,
         # P50_SOURCE_SHA is planner metadata.  The runtime receipt must use
         # the independent product build authority retained by real_cells.
         "p50_planner_source_commit": P50_SOURCE_SHA,
+        "p50_protocol_source_commit": P50_PROTOCOL_SOURCE_SHA,
         "p50_runtime_source_commit": HARNESS_INVENTORY["runner_p50_build_source_sha"],
         "p44_status_without_receipt": "NOT_BOUND",
         "protocol_assertions": {
@@ -257,8 +293,9 @@ def _artifact_contract(version: int) -> dict[str, Any]:
     if version == 44:
         return {
             "version": 44, "label": "P44", "source_commit": P44_SOURCE_SHA,
-            "release_tag": None, "authority": "exact-proto-cache-lineage",
+            "release_tag": None, "authority": "exact-protocol-introduction-commit",
             "protocol_assertion": {"path": "services/comm.h", "text": P44_PROTOCOL_ASSERTION},
+            "protocol_source_commit": P44_PROTOCOL_SOURCE_SHA,
             "required_real_artifact": True,
             "runtime_identity": "true-P44-binaries",
             "runtime_required": True, "cache_mode": "legacy-only-until-reviewed",
@@ -293,9 +330,106 @@ def _boundary_contract(version: int) -> dict[str, Any]:
     }
 
 
+def _artifact_identity(version: int, role: str) -> dict[str, Any]:
+    """Return a non-ambiguous identity for one role in a state.
+
+    A source commit is not treated as a binary digest.  P44 has no retained
+    digest set and therefore remains receipt-required; P50's runtime source
+    authority is the separately retained BASE_SHA build used by the real-cell
+    harness.
+    """
+    source_commit = {43: P43_SOURCE_SHA, 44: P44_SOURCE_SHA,
+                     50: P50_SOURCE_SHA}[version]
+    runtime_commit = (HARNESS_INVENTORY["runner_p50_build_source_sha"]
+                      if version == 50 else source_commit)
+    digest = RETAINED_ROLE_HASHES.get(str(version), {}).get(role)
+    if version == 50:
+        digest = RETAINED_ROLE_HASHES["50_runner_build"].get(role)
+    return {
+        "version": version, "label": f"P{version}", "role": role,
+        "source_commit": source_commit,
+        "runtime_source_commit": runtime_commit,
+        "binary_sha256": digest,
+        "identity_status": "digest-bound" if digest else "receipt-required",
+        "artifact_identity": f"P{version}/{role}",
+    }
+
+
+def _compatibility_descriptor(state: tuple[int, int, int]) -> dict[str, Any]:
+    """Describe exactly what a concrete S/C/F triple may negotiate.
+
+    Protocol negotiation is pairwise min(max-version), matching
+    ``MsgChannel::update_state``.  P50 methods are intentionally separate
+    entries: a profile is never inferred from another profile's availability.
+    """
+    scheduler, client, worker = state
+    negotiated = {
+        "S-C": min(scheduler, client),
+        "S-F": min(scheduler, worker),
+        "C-F": min(client, worker),
+    }
+    p50_ready = state == (50, 50, 50)
+    methods: dict[str, dict[str, Any]] = {
+        "WHOLE_LEGACY": {
+            "availability": "supported",
+            "transport": "COMPILE_FILE_FILE_CHUNK",
+            "cache": "disabled",
+            "fallback": None,
+        },
+        "RAW_II": {
+            "availability": "supported" if p50_ready else "unavailable",
+            "transport": "COMPILE_FILE_FILE_CHUNK" if p50_ready else None,
+            "cache": "disabled",
+            "fallback": None if p50_ready else "WHOLE_LEGACY",
+            "reason": None if p50_ready else "requires-all-roles-protocol-50",
+        },
+    }
+    for method in P50_METHODS:
+        methods[method] = {
+            "availability": "supported" if p50_ready else "unavailable",
+            "transport": "P50_CACHE_WIRE" if p50_ready else None,
+            "cache": "required" if p50_ready else "forbidden",
+            "fallback": None if p50_ready else "WHOLE_LEGACY",
+            "reason": None if p50_ready else "requires-all-roles-protocol-50",
+            "profile": P50_METHOD_CONTRACTS[method]["source_profile"],
+            **({"build_requirement": P50_METHOD_CONTRACTS[method]["build_requirement"]}
+               if "build_requirement" in P50_METHOD_CONTRACTS[method] else {}),
+            "profile_selection": "exact-advertisement-required" if p50_ready else "not-negotiated",
+        }
+    return {
+        "id": state_id(state), "tuple": list(state),
+        "roles": {role: value for role, value in zip(ROLES, state)},
+        "artifact_identities": {role: _artifact_identity(value, role)
+                                for role, value in zip(ROLES, state)},
+        "negotiated_protocols": negotiated,
+        "protocol_negotiation": {
+            link: {"local_versions": [state[ROLES.index(link[0])],
+                                        state[ROLES.index(link[2])]],
+                   "negotiated": value,
+                   "rule": "minimum-of-peer-maximums"}
+            for link, value in negotiated.items()
+        },
+        "feature_negotiation": {
+            "legacy_file_transport": True,
+            "assignment_identity": negotiated["S-C"] == 50 and negotiated["C-F"] == 50,
+            "cache_advertisement": negotiated["S-F"] == 50,
+            "cache_handoff": negotiated["S-C"] == 50,
+            "source_arm": negotiated["S-F"] == 50 and negotiated["C-F"] == 50,
+            "cache_session": negotiated["C-F"] == 50,
+            "p50_methods": p50_ready,
+            "fallback": "legacy-file-chunk" if not p50_ready else "none",
+        },
+        "method_arms": methods,
+        "expected_behavior": "P50_METHODS" if p50_ready else "LEGACY_FALLBACK",
+        "cache_traffic": "expected" if p50_ready else "zero-required",
+        "remote_output": "byte-exact-required",
+    }
+
+
 def _state_descriptor(state: tuple[int, int, int]) -> dict[str, Any]:
     cache = all_p50(state)
     partial = any(value == 50 for value in state) and not cache
+    compatibility = _compatibility_descriptor(state)
     return {
         "id": state_id(state),
         "roles": {role: value for role, value in zip(ROLES, state)},
@@ -309,6 +443,7 @@ def _state_descriptor(state: tuple[int, int, int]) -> dict[str, Any]:
         "remote_output": "byte-exact-required",
         "legacy_wire": "not-required" if cache else "byte-exact-required",
         "old_p44_cache_behavior": "UNRESOLVED" if state == (44, 44, 44) else "not-applicable",
+        "compatibility": compatibility,
     }
 
 
@@ -510,6 +645,19 @@ def build_plan() -> dict[str, Any]:
         "schema": SCHEMA,
         "source": {"integration_head": P50_SOURCE_SHA, "harness": HARNESS_INVENTORY},
         "artifact_binding_contract": artifact_binding_contract(),
+        "protocol_history": [dict(item) for item in PROTOCOL_HISTORY],
+        "legacy_comparator": {
+            "status": "BOTH_P43_AND_P44",
+            "versions": [43, 44],
+            "method": "WHOLE_LEGACY",
+            "cache": "disabled",
+            "evidence": {
+                "P43": {"source_commit": P43_PROTOCOL_SOURCE_SHA,
+                        "assertion": "#define PROTOCOL_VERSION 43"},
+                "P44": {"source_commit": P44_PROTOCOL_SOURCE_SHA,
+                        "assertion": P44_PROTOCOL_ASSERTION},
+            },
+        },
         "roles": list(ROLES),
         "real_artifact_versions": [
             _artifact_contract(version) for version in REAL_VERSIONS
@@ -519,6 +667,22 @@ def build_plan() -> dict[str, Any]:
         ],
         "p44_cache_ambiguity": P44_CACHE_AMBIGUITY,
         "states": states,
+        "compatibility_matrix": [_compatibility_descriptor(state)
+                                  for state in STATIC_STATES],
+        "compatibility_matrix_count": len(STATIC_STATES),
+        "coverage": {
+            "local": {
+                "planner_matrix": "tested",
+                "state_count": len(STATIC_STATES),
+                "transition_count": len(ORDERED_STATE_PAIRS),
+                "method_matrix": "staged-only",
+            },
+            "live": {
+                "verified_states": [],
+                "missing_states": [state_id(state) for state in STATIC_STATES],
+                "note": "No live result artifact is present in this source tree",
+            },
+        },
         "state_count": len(states),
         "transitions": transitions,
         "transition_count": len(transitions),
@@ -551,8 +715,26 @@ def audit_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
     expected_binding = artifact_binding_contract()
     if plan.get("artifact_binding_contract") != expected_binding:
         errors.append("artifact-binding-contract-mismatch")
+    if plan.get("protocol_history") != [dict(item) for item in PROTOCOL_HISTORY]:
+        errors.append("protocol-history-mismatch")
+    expected_legacy_comparator = {
+        "status": "BOTH_P43_AND_P44", "versions": [43, 44],
+        "method": "WHOLE_LEGACY", "cache": "disabled",
+        "evidence": {
+            "P43": {"source_commit": P43_PROTOCOL_SOURCE_SHA,
+                    "assertion": "#define PROTOCOL_VERSION 43"},
+            "P44": {"source_commit": P44_PROTOCOL_SOURCE_SHA,
+                    "assertion": P44_PROTOCOL_ASSERTION},
+        },
+    }
+    if plan.get("legacy_comparator") != expected_legacy_comparator:
+        errors.append("legacy-comparator-mismatch")
     if tuple(plan.get("roles", ())) != ROLES:
         errors.append("role-order-mismatch")
+    artifact_rows = plan.get("real_artifact_versions", ())
+    if (not isinstance(artifact_rows, list) or
+            {item.get("version") for item in artifact_rows if isinstance(item, Mapping)} != {43, 44, 50}):
+        errors.append("artifact-version-grid")
     for version, expected in ((43, P43_SOURCE_SHA), (44, P44_SOURCE_SHA), (50, P50_SOURCE_SHA)):
         row = next((item for item in plan.get("real_artifact_versions", ())
                     if isinstance(item, Mapping) and item.get("version") == version), None)
@@ -585,10 +767,29 @@ def audit_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
                 errors.append(f"state-byte-exact:{state_id(parsed)}")
             if not expected_cache and item.get("p50_cache_traffic") != "zero-required":
                 errors.append(f"state-p50-traffic:{state_id(parsed)}")
+            if item.get("compatibility") != _compatibility_descriptor(parsed):
+                errors.append(f"state-compatibility:{state_id(parsed)}")
         except PlannerError as exc:
             errors.append(f"state-invalid:{exc}")
     if frozenset(state_ids) != frozenset(state_id(state) for state in STATIC_STATES) and len(state_ids) == 27:
         errors.append("state-grid-mismatch")
+
+    expected_compatibility = [_compatibility_descriptor(state)
+                              for state in STATIC_STATES]
+    compatibility = plan.get("compatibility_matrix")
+    if (not isinstance(compatibility, list) or
+            plan.get("compatibility_matrix_count") != len(expected_compatibility) or
+            compatibility != expected_compatibility):
+        errors.append("compatibility-matrix-mismatch")
+    expected_coverage = {
+        "local": {"planner_matrix": "tested", "state_count": 27,
+                   "transition_count": 729, "method_matrix": "staged-only"},
+        "live": {"verified_states": [],
+                 "missing_states": [state_id(state) for state in STATIC_STATES],
+                 "note": "No live result artifact is present in this source tree"},
+    }
+    if plan.get("coverage") != expected_coverage:
+        errors.append("coverage-mismatch")
 
     transitions = plan.get("transitions", ())
     if not isinstance(transitions, list) or len(transitions) != 729:
@@ -793,6 +994,11 @@ def audit_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
         "transition_count": len(transitions),
         "transition_class_counts": counts,
         "ordered_pairs_unique": len(seen_pairs),
+        "compatibility_matrix_count": len(compatibility) if isinstance(compatibility, list) else 0,
+        "live_verified_state_count": len(plan.get("coverage", {}).get("live", {}).get("verified_states", []))
+        if isinstance(plan.get("coverage"), Mapping) else 0,
+        "live_missing_state_count": len(plan.get("coverage", {}).get("live", {}).get("missing_states", []))
+        if isinstance(plan.get("coverage"), Mapping) else 0,
         "upgrade_order_counts": {key: len(plan.get("upgrade_orders", {}).get(key, ())) for key in ("43_to_50", "44_to_50")},
         "downgrade_order_counts": {key: len(plan.get("downgrade_orders", {}).get(key, ())) for key in ("50_to_43", "50_to_44")},
         "performance_arm_count": len(arms),

@@ -15,7 +15,7 @@ accepted as a P50 runtime build.
 
 ## Exact P44 receipt recipe (non-executing)
 
-Build P44 from commit `8c8cb881f8f5f8b7c10a608885f1b66e8e6ee7d3` in a private
+Build P44 from commit `16b48c2bf2715a8eff329ee124bd52bd4731db29` in a private
 checkout, record the checkout tree, build options and output root, and record
 the byte count and SHA-256 of each regular file. Copy those facts into
 `P44_BUILD_RECEIPT_TEMPLATE.json`; replace every `RECORD_*` value. Confirm

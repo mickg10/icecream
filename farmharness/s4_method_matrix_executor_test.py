@@ -31,6 +31,17 @@ class S4MethodMatrixExecutorTest(unittest.TestCase):
             self.assertFalse(summary["execution_ready"])
             self.assertEqual(summary["comparison_blocks"], 128)
             self.assertEqual(summary["arm_runs"], 256)
+            self.assertEqual(summary["compatibility_states"], 27)
+            self.assertEqual(summary["transition_rows"], 729)
+            compatibility = campaign / summary["compatibility_plan"]
+            transitions = campaign / summary["transition_plan"]
+            self.assertEqual(len(compatibility.read_text().splitlines()), 27)
+            self.assertEqual(len(transitions.read_text().splitlines()), 729)
+            first = json.loads(compatibility.read_text().splitlines()[0])
+            self.assertEqual(first["schema"], "icecream-s4-compatibility-experiment-v1")
+            self.assertEqual(first["timestamp"], "20260831T141130Z")
+            self.assertEqual(first["id"], "s43-c43-f43")
+            self.assertEqual(json.loads(transitions.read_text().splitlines()[0])["kind"], "transition")
             self.assertEqual(summary["blocked_arms"], 0)
             self.assertEqual(summary["staged_arms"], 256)
             self.assertIsNone(summary["raw_ii_gap"])
