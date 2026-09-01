@@ -1879,6 +1879,12 @@ def execute_and_finalize_external_cell(
         profile=profile, regime=regime, depth=depth, suite=topology)
     timeout_seconds = external_timeout_seconds(
         len(rows), passes, regime == "warm")
+    # Campaign factories may construct the transport with its conservative
+    # 900-second default.  The lifecycle budget includes warm prewarm and the
+    # paired local-reference passes, so use it for the marker supervisor and
+    # every bounded transport operation as well.
+    if isinstance(transport, SSHTransport) and transport.timeout < timeout_seconds:
+        transport.timeout = timeout_seconds
     command = build_external_command(
         batch_manifest, predictive_plan, topology_file, product_root,
         profile=profile, corpus=corpus, regime=regime, depth=depth,

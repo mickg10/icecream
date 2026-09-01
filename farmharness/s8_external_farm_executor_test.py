@@ -429,6 +429,35 @@ def test_external_timeout_includes_post_measurement_references() -> None:
             executor.external_timeout_seconds(invalid, 1, False)
 
 
+def test_warm_cell_expands_default_transport_to_lifecycle_budget(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    transport = executor.SSHTransport(_authority(tmp_path), timeout=900)
+    rows = [{"input": str(index)} for index in range(100)]
+    observed: dict[str, int] = {}
+    monkeypatch.setattr(executor, "validate_batch_inputs",
+                        lambda *args, **kwargs: (rows, []))
+    monkeypatch.setattr(executor, "build_external_command",
+                        lambda *args, **kwargs: [
+                            "env", "ICECC_P50_EXTERNAL_FARM=1",
+                            "/product/unittests/p50compilee2e-run.sh"])
+
+    def fake_execute(**_kwargs: object) -> dict[str, object]:
+        observed["timeout"] = int(transport.timeout)
+        return {"status": "PASS", "finalizer_input": {"manifest_path": "fixture"}}
+
+    transport.execute = fake_execute  # type: ignore[method-assign]
+    monkeypatch.setattr(executor.live, "finalize", lambda *args, **kwargs: tmp_path / "done")
+    result = executor.execute_and_finalize_external_cell(
+        transport, topology="C1F1/100000", relationship_hosts=["q2"],
+        profile="ZSTD_ROUTE", batch_manifest=tmp_path / "batch.jsonl",
+        predictive_plan=tmp_path / "plan.json", topology_file=tmp_path / "topology.json",
+        corpus="DuckDB", regime="warm", depth="100", output=tmp_path / "output",
+        product_root=tmp_path / "product")
+    assert result == tmp_path / "done"
+    assert observed["timeout"] == executor.external_timeout_seconds(100, 1, True)
+    assert observed["timeout"] > 900
+
+
 def test_service_map_heredoc_is_composable(tmp_path: Path) -> None:
     guid = "ab" * 16
     (tmp_path / "f-trace-0.jsonl").write_text(json.dumps(

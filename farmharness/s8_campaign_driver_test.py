@@ -793,6 +793,43 @@ def test_external_mode_resume_keeps_failed_attempt_and_retries_explicitly(
     assert any(item["status"] == "FAIL" for item in state["history"])
 
 
+@pytest.mark.parametrize(
+    "failure", [subprocess.TimeoutExpired(["external-cell"], 900),
+                 subprocess.CalledProcessError(17, ["external-cell"])],
+    ids=["timeout", "subprocess-error"],
+)
+def test_external_subprocess_failure_is_terminal_and_retained(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        failure: subprocess.SubprocessError) -> None:
+    _authority_value, authority_path = _external_test_setup(tmp_path, monkeypatch)
+    command_runner, calls = _all_runner_factory()
+
+    def failing_external(_transport: object, **_kwargs: object) -> Path:
+        raise failure
+
+    campaign = driver.run_campaign(
+        **_all_kwargs(tmp_path), mode=driver.EXTERNAL_FARM_MODE,
+        external_farm_authority=authority_path,
+        external_cell_runner=failing_external,
+        external_transport_factory=lambda value: {"authority": value},
+        command_runner=command_runner, timestamp="20260901T120005Z")
+    summary = json.loads((campaign / "summary.json").read_text())
+    assert summary["status"] == "PARTIAL_FAILURE"
+    assert summary["counts"]["FAIL"] == 1
+    assert summary["counts"]["RUNNING"] == 0
+    assert calls[:3] == ["predictive_plan", "predictive_producer", "live_prepare"]
+    state_path = next((campaign / "cells").glob("*/status.json"))
+    state = json.loads(state_path.read_text())
+    assert state["status"] == "FAIL"
+    assert state["failure_record"]["path"].endswith("/failure.json")
+    failure_path = state_path.parent / "attempt-001" / "failure.json"
+    record = json.loads(failure_path.read_text())
+    assert record["status"] == "FAIL"
+    assert record["error_type"] == type(failure).__name__
+    campaign_status = json.loads((campaign / "campaign-status.json").read_text())
+    assert campaign_status["status"] == "PARTIAL_FAILURE"
+
+
 def test_external_mode_requires_private_authority_and_product_root(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     kwargs = _kwargs(tmp_path, corpus="fmt", product_build_root=tmp_path / "product")

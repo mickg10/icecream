@@ -729,6 +729,25 @@ def _run_command(command: dict[str, object], cwd: Path, stdout: Path, stderr: Pa
     return int(completed.returncode)
 
 
+def _write_failure_record(attempt_dir: Path, cell: dict[str, str], attempt_no: int,
+                          error: str, error_type: str | None = None) -> dict[str, object]:
+    """Retain a terminal cell failure independently of mutable status JSON."""
+    failure = {
+        "schema": "icecream-s8-campaign-failure-v1", "status": "FAIL",
+        "cell": cell, "attempt": attempt_no, "error": error,
+        "error_type": error_type or "CampaignError",
+        "retained_artifacts": sorted(
+            str(path.relative_to(attempt_dir))
+            for path in attempt_dir.rglob("*")
+            if path.is_file() and path.name != "failure.json"),
+    }
+    path = attempt_dir / "failure.json"
+    _write_new(path, canonical(failure))
+    record = _sha(path)
+    record["path"] = str(path)
+    return record
+
+
 def _load_json(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text())
@@ -1156,8 +1175,10 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
         stdout, stderr = attempt_dir / "stdout.log", attempt_dir / "stderr.log"
         result: dict[str, Any] | None = None
         error: str | None = None
+        error_type: str | None = None
         interrupted = False
         try:
+            stage = "campaign"
             for command in plan_cmds + [producer_cmd]:
                 stage = str(command["stage"])
                 rc = runner(command, repo, stdout, stderr)
@@ -1167,6 +1188,9 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
         except KeyboardInterrupt:
             interrupted = True
             error = "campaign:interrupted"
+        except (OSError, subprocess.SubprocessError) as exc:
+            error = f"{stage}:execution_failed:{exc}"
+            error_type = type(exc).__name__
         if error is None and mode in ("all", EXTERNAL_FARM_MODE):
             # Live execution is intentionally sequential.  Preparation may
             # produce the authenticated batch/topology handoff, but only the
@@ -1316,8 +1340,9 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
             except KeyboardInterrupt:
                 interrupted = True
                 error = "campaign:interrupted"
-            except (CampaignError, OSError, ValueError) as exc:
+            except (CampaignError, OSError, ValueError, subprocess.SubprocessError) as exc:
                 error = f"live:{exc}"
+                error_type = type(exc).__name__
         if error is None:
             try:
                 live_evidence = ({key: value for key, value in result.items()
@@ -1368,6 +1393,9 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
         else:
             status.update(status="FAIL", error=error)
         status["ended_utc"] = datetime.now(timezone.utc).isoformat()
+        if status["status"] == "FAIL":
+            status["failure_record"] = _write_failure_record(
+                attempt_dir, cell, attempt_no, str(error), error_type)
         result_record = {"schema": "icecream-s8-campaign-result-v2", "cell": cell,
                          "identity": _experiment_identity(
                              cell, split=SPLITS[corpus], depth_class=depth,
