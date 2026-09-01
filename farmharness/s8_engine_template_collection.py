@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Collect the 16 retained calibration engine templates into one immutable tree.
+"""Collect retained S8 engine templates into one immutable tree.
 
 The retained S7 packages already contain authenticated predictive manifests,
-inputs, and topology declarations for every calibration corpus/profile/regime
-bucket.  This tool validates those packages against the current predictive
-engine schema and copies only the three engine inputs into a uniform path that
-the S8 campaign driver can address with one format string.  It never runs the
-simulator, product, Docker, or a benchmark.
+inputs, and topology declarations for the declared calibration or explicitly
+selected held-out corpus/profile/regime buckets.  This tool validates those
+packages against the current predictive engine schema and copies only the
+three engine inputs into a uniform path that the S8 campaign driver can address
+with one format string.  It never runs the simulator, product, Docker, or a
+benchmark.  Calibration remains the default scope; held-out collection must
+be explicitly selected.
 """
 
 from __future__ import annotations
@@ -24,19 +26,29 @@ from typing import Any, Iterable, Mapping, Sequence
 
 try:  # package invocation
     from . import s8_predictive_engine as engine
-    from .s8_schema import CALIBRATION_CORPORA, PROFILES, REGIMES
+    from .s8_schema import (CALIBRATION_CORPORA, CORPORA, HELD_OUT_CORPORA,
+                            PROFILES, REGIMES)
 except ImportError:  # direct invocation
     import s8_predictive_engine as engine
-    from s8_schema import CALIBRATION_CORPORA, PROFILES, REGIMES
+    from s8_schema import (CALIBRATION_CORPORA, CORPORA, HELD_OUT_CORPORA,
+                           PROFILES, REGIMES)
 
 
 SCHEMA = "icecream-s8-engine-template-collection-v1"
 PACKAGE_SCHEMA = "icecream-s8-retained-s7-package-v1"
 TEMPLATE = "engines/{corpus}/{profile}-{regime}/engine-manifest.json"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+CALIBRATION_ORDER = tuple(corpus for corpus in CORPORA if corpus in CALIBRATION_CORPORA)
+HELD_OUT_ORDER = tuple(corpus for corpus in CORPORA if corpus in HELD_OUT_CORPORA)
 EXPECTED_CELLS = tuple(
     (corpus, profile, regime)
-    for corpus in CALIBRATION_CORPORA
+    for corpus in CALIBRATION_ORDER
+    for profile in PROFILES
+    for regime in REGIMES
+)
+HELD_OUT_CELLS = tuple(
+    (corpus, profile, regime)
+    for corpus in HELD_OUT_ORDER
     for profile in PROFILES
     for regime in REGIMES
 )
@@ -130,21 +142,24 @@ def _relative_artifact(root: Path, descriptor: object, label: str
     return current, raw, facts
 
 
-def _cell(value: object, label: str) -> tuple[str, str, str]:
+def _cell(value: object, label: str,
+          expected_cells: tuple[tuple[str, str, str], ...] = EXPECTED_CELLS
+          ) -> tuple[str, str, str]:
     if not isinstance(value, str):
         raise CollectionError(f"{label}:cell_invalid")
     parts = tuple(value.split("/"))
-    if parts not in EXPECTED_CELLS:
-        raise CollectionError(f"{label}:cell_not_calibration:{value}")
+    if parts not in expected_cells:
+        raise CollectionError(f"{label}:cell_not_in_scope:{value}")
     return parts  # type: ignore[return-value]
 
 
-def _package(path: Path) -> dict[str, object]:
+def _package(path: Path, expected_cells: tuple[tuple[str, str, str], ...] = EXPECTED_CELLS,
+             split: str = "calibration") -> dict[str, object]:
     raw, package_facts = _snapshot(path, "package_manifest")
     value = _parse(raw, "package_manifest")
     if value.get("schema") != PACKAGE_SCHEMA or value.get("status") != "PASS":
         raise CollectionError("package_manifest:not_pass")
-    cell = _cell(value.get("cell"), "package_manifest")
+    cell = _cell(value.get("cell"), "package_manifest", expected_cells)
     files = value.get("files")
     if not isinstance(files, Mapping):
         raise CollectionError("package_manifest:files_invalid")
@@ -159,7 +174,7 @@ def _package(path: Path) -> dict[str, object]:
     except engine.PredictionError as exc:
         raise CollectionError(f"predictive_manifest:{exc}") from exc
     observed = (loaded_cell["corpus"], loaded_cell["profile"], loaded_cell["regime"])
-    if observed != cell or loaded.get("split") != "calibration":
+    if observed != cell or loaded.get("split") != split:
         raise CollectionError("predictive_manifest:cell_or_split_mismatch")
     return {
         "cell": cell,
@@ -188,7 +203,8 @@ def _write_new(path: Path, raw: bytes) -> dict[str, object]:
             "sha256": hashlib.sha256(raw).hexdigest()}
 
 
-def collect(package_manifests: Iterable[Path], output: Path) -> Path:
+def collect(package_manifests: Iterable[Path], output: Path, *,
+            corpora: Iterable[str] = CALIBRATION_CORPORA) -> Path:
     """Validate exactly 16 packages and atomically publish a uniform collection."""
     output = Path(output).absolute()
     _reject_symlink_ancestors(output.parent, "output_parent")
@@ -196,16 +212,24 @@ def collect(package_manifests: Iterable[Path], output: Path) -> Path:
         raise CollectionError("output:already_exists")
     if not output.parent.is_dir() or output.parent.is_symlink():
         raise CollectionError("output:parent_invalid")
+    selected_corpora = tuple(corpora)
+    selected_set = frozenset(selected_corpora)
+    if (len(selected_corpora) != len(selected_set) or
+            selected_set not in (CALIBRATION_CORPORA, HELD_OUT_CORPORA)):
+        raise CollectionError("corpora:scope_must_be_calibration_or_held_out")
+    expected_cells = (EXPECTED_CELLS if selected_set == CALIBRATION_CORPORA
+                      else HELD_OUT_CELLS)
+    split = "calibration" if selected_set == CALIBRATION_CORPORA else "held_out_validation"
     rows: dict[tuple[str, str, str], dict[str, object]] = {}
     for path in package_manifests:
-        row = _package(Path(path).absolute())
+        row = _package(Path(path).absolute(), expected_cells, split)
         cell = row["cell"]
         assert isinstance(cell, tuple)
         if cell in rows:
             raise CollectionError(f"package_manifest:duplicate_cell:{'/'.join(cell)}")
         rows[cell] = row
-    missing = sorted(set(EXPECTED_CELLS) - set(rows))
-    extra = sorted(set(rows) - set(EXPECTED_CELLS))
+    missing = sorted(set(expected_cells) - set(rows))
+    extra = sorted(set(rows) - set(expected_cells))
     if missing or extra:
         raise CollectionError(
             "package_manifest:cell_set_mismatch:missing=" + ",".join("/".join(v) for v in missing) +
@@ -217,7 +241,7 @@ def collect(package_manifests: Iterable[Path], output: Path) -> Path:
     temporary.mkdir(mode=0o700)
     entries: list[dict[str, object]] = []
     try:
-        for cell in EXPECTED_CELLS:
+        for cell in expected_cells:
             corpus, profile, regime = cell
             row = rows[cell]
             directory = temporary / "engines" / corpus / f"{profile}-{regime}"
@@ -238,6 +262,7 @@ def collect(package_manifests: Iterable[Path], output: Path) -> Path:
             "schema": SCHEMA,
             "status": "PASS",
             "cell_count": len(entries),
+            "scope": split,
             "engine_manifest_template": TEMPLATE,
             "cells": entries,
         }
@@ -270,13 +295,18 @@ def audit(manifest_path: Path) -> dict[str, object]:
     if (not isinstance(digest, str) or not HEX64.fullmatch(digest) or
             hashlib.sha256(canonical(unsigned)).hexdigest() != digest):
         errors.append("collection_sha256:mismatch")
+    split = value.get("scope", "calibration")
+    if split not in ("calibration", "held_out_validation"):
+        errors.append("collection:scope_invalid")
+        split = "calibration"
+    expected_cells = (EXPECTED_CELLS if split == "calibration" else HELD_OUT_CELLS)
     if (value.get("schema") != SCHEMA or value.get("status") != "PASS" or
-            value.get("cell_count") != len(EXPECTED_CELLS) or
+            value.get("cell_count") != len(expected_cells) or
             value.get("engine_manifest_template") != TEMPLATE):
         errors.append("collection:metadata_invalid")
     entries = value.get("cells")
     seen: set[tuple[str, str, str]] = set()
-    if not isinstance(entries, list) or len(entries) != len(EXPECTED_CELLS):
+    if not isinstance(entries, list) or len(entries) != len(expected_cells):
         errors.append("collection:cells_invalid")
         entries = []
     for index, entry in enumerate(entries):
@@ -287,7 +317,7 @@ def audit(manifest_path: Path) -> dict[str, object]:
             if not isinstance(c, Mapping) or set(c) != {"corpus", "profile", "regime"}:
                 raise CollectionError("entry:cell_invalid")
             cell = (c["corpus"], c["profile"], c["regime"])
-            if cell not in EXPECTED_CELLS or cell in seen:
+            if cell not in expected_cells or cell in seen:
                 raise CollectionError("entry:cell_duplicate_or_unknown")
             seen.add(cell)
             expected = TEMPLATE.format(corpus=cell[0], profile=cell[1], regime=cell[2])
@@ -320,11 +350,11 @@ def audit(manifest_path: Path) -> dict[str, object]:
                 raise CollectionError("entry:source_package_changed")
             loaded, *_rest, loaded_cell = engine.load_inputs(engine_path)
             if ((loaded_cell["corpus"], loaded_cell["profile"], loaded_cell["regime"]) != cell or
-                    loaded.get("split") != "calibration"):
+                    loaded.get("split") != split):
                 raise CollectionError("entry:engine_cell_mismatch")
         except (CollectionError, engine.PredictionError, OSError, KeyError) as exc:
             errors.append(f"cell[{index}]:{exc}")
-    if seen != set(EXPECTED_CELLS):
+    if seen != set(expected_cells):
         errors.append("collection:cell_set_incomplete")
     return {"schema": SCHEMA, "status": "PASS" if not errors else "FAIL",
             "manifest": facts, "errors": errors,
@@ -344,8 +374,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--package-root", type=Path)
+    group.add_argument("--package-manifest", type=Path, nargs="+")
     group.add_argument("--audit", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--scope", choices=("calibration", "held_out_validation"),
+                        default="calibration")
     args = parser.parse_args(argv)
     try:
         if args.audit is not None:
@@ -353,7 +386,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             if args.output is None:
                 raise CollectionError("output:required")
-            manifest = collect(discover(args.package_root), args.output)
+            packages = (args.package_manifest if args.package_manifest is not None
+                        else discover(args.package_root))
+            corpora = (CALIBRATION_CORPORA if args.scope == "calibration"
+                       else HELD_OUT_CORPORA)
+            manifest = collect(packages, args.output, corpora=corpora)
             result = audit(manifest)
     except (CollectionError, OSError, UnicodeError, json.JSONDecodeError) as exc:
         result = {"schema": SCHEMA, "status": "FAIL", "errors": [str(exc)]}

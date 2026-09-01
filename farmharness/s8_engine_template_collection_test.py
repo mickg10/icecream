@@ -19,7 +19,7 @@ def _descriptor(path: Path, raw: bytes) -> dict[str, object]:
             "sha256": hashlib.sha256(raw).hexdigest()}
 
 
-def _package(root: Path, cell: tuple[str, str, str]) -> Path:
+def _package(root: Path, cell: tuple[str, str, str], *, split: str = "calibration") -> Path:
     corpus, profile, regime = cell
     root.mkdir(parents=True)
     input_raw = ("/".join(cell) + "\n").encode()
@@ -40,7 +40,7 @@ def _package(root: Path, cell: tuple[str, str, str]) -> Path:
     manifest = {
         "schema": MANIFEST_SCHEMA, "semantics": SEMANTICS,
         "cell": {"corpus": corpus, "profile": profile, "regime": regime},
-        "split": "calibration", "predictive_mode": True,
+        "split": split, "predictive_mode": True,
         "input": _descriptor(input_path, input_raw),
         "topology_state": _descriptor(topology_path, topology_raw),
     }
@@ -119,5 +119,20 @@ def test_heldout_package_cannot_enter_collection(tmp_path: Path) -> None:
     value = json.loads(packages[0].read_text())
     value["cell"] = "DuckDB/ZSTD_TU/cold"
     packages[0].write_bytes(_canonical(value))
-    with pytest.raises(collection.CollectionError, match="cell_not_calibration"):
+    with pytest.raises(collection.CollectionError, match="cell_not_in_scope"):
         collection.collect(packages, tmp_path / "out")
+
+
+def test_collects_explicit_heldout_extension_and_audits(tmp_path: Path) -> None:
+    packages = [_package(tmp_path / "heldout" / f"p{index}", cell,
+                          split="held_out_validation")
+                for index, cell in enumerate(collection.HELD_OUT_CELLS)]
+    output = tmp_path / "experiments" / "s8-engine-templates-heldout-20260901T140000Z"
+    output.parent.mkdir()
+    manifest = collection.collect(packages, output,
+                                  corpora=collection.HELD_OUT_CORPORA)
+    result = collection.audit(manifest)
+    assert result["status"] == "PASS"
+    value = json.loads(manifest.read_text())
+    assert value["scope"] == "held_out_validation"
+    assert value["cell_count"] == 16
