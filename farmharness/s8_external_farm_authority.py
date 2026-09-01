@@ -402,14 +402,19 @@ def capture_and_build_authority(
               f"disposition=placement:host_not_idle:{failed_host}",
               file=stderr, flush=True)
         sleep_fn(wait)
+        next_captures: dict[str, dict[str, object]] = {}
         try:
-            captures[failed_host] = capture_fn(
-                failed_host, remote_roots[failed_host], timeout=capture_timeout)
+            for host in HOSTS:
+                next_captures[host] = capture_fn(
+                    host, remote_roots[host], timeout=capture_timeout)
         except AuthorityError as exc:
-            print(f"s8 authority cooldown capture failed: host={failed_host} "
+            print(f"s8 authority cooldown capture failed: host={host} "
                   f"error={exc}",
                   file=stderr, flush=True)
             raise
+        # Do not reuse any member of the previous snapshot: an authority
+        # round is valid only when every host was recaptured successfully.
+        captures = next_captures
         try:
             return build_authority(
                 root=root, captures=captures, descriptor_dir=descriptor_dir,

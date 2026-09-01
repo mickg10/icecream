@@ -181,7 +181,8 @@ def test_idle_cooldown_recaptures_q3_until_authority_can_publish(tmp_path: Path)
         idle_cooldown_interval=1.0, capture_fn=fake_capture,
         sleep_fn=clock.sleep, monotonic_fn=clock.monotonic, stderr=stderr)
     assert value["schema"] == authority.SCHEMA
-    assert calls == ["q3", "q2", "research6", "research7", "q3"]
+    assert calls == ["q3", "q2", "research6", "research7",
+                     "q3", "q2", "research6", "research7"]
     assert clock.sleeps == [1.0]
     assert "placement:host_not_idle:q3" in stderr.getvalue()
     assert (tmp_path / "a.json").is_file()
@@ -207,7 +208,7 @@ def test_idle_cooldown_times_out_without_publishing_partial_outputs(tmp_path: Pa
             output=tmp_path / "a.json", idle_cooldown_timeout=2.0,
             idle_cooldown_interval=1.0, capture_fn=fake_capture,
             sleep_fn=clock.sleep, monotonic_fn=clock.monotonic, stderr=stderr)
-    assert calls == ["q3", "q2", "research6", "research7", "q3", "q3"]
+    assert calls == ["q3", "q2", "research6", "research7"] * 3
     assert clock.sleeps == [1.0, 1.0]
     assert "cooldown timeout" in stderr.getvalue()
     assert not (tmp_path / "a.json").exists()
@@ -257,8 +258,40 @@ def test_idle_cooldown_recaptures_required_q2(tmp_path: Path) -> None:
         idle_cooldown_interval=1.0, capture_fn=fake_capture,
         sleep_fn=clock.sleep, monotonic_fn=clock.monotonic, stderr=io.StringIO())
     assert value["schema"] == authority.SCHEMA
-    assert calls == ["q3", "q2", "research6", "research7", "q2"]
+    assert calls == ["q3", "q2", "research6", "research7"] * 2
     assert clock.sleeps == [1.0]
+
+
+def test_idle_cooldown_restarts_with_full_snapshot_after_host_changes(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    captures = _captures(now, root)
+    busy_q3 = _with_idle(captures["q3"], 80.0)
+    busy_q2 = _with_idle(captures["q2"], 80.0)
+    clock = _Clock()
+    calls: list[str] = []
+
+    def fake_capture(host: str, _remote_root: str, *, timeout: float) -> dict[str, object]:
+        round_index = len(calls) // len(authority.HOSTS)
+        calls.append(host)
+        if round_index == 0 and host == "q3":
+            return busy_q3
+        if round_index == 1 and host == "q2":
+            return busy_q2
+        return captures[host]
+
+    value = authority.capture_and_build_authority(
+        root=root, remote_roots=_remote_roots(), descriptor_dir=tmp_path / "d",
+        output=tmp_path / "a.json", idle_cooldown_timeout=3.0,
+        idle_cooldown_interval=1.0, capture_fn=fake_capture,
+        sleep_fn=clock.sleep, monotonic_fn=clock.monotonic,
+        stderr=io.StringIO())
+    assert value["schema"] == authority.SCHEMA
+    assert calls == list(authority.HOSTS) * 3
+    assert clock.sleeps == [1.0, 1.0]
+    assert (tmp_path / "a.json").is_file()
 
 
 def test_idle_cooldown_times_out_for_required_research7(tmp_path: Path) -> None:
@@ -280,7 +313,7 @@ def test_idle_cooldown_times_out_for_required_research7(tmp_path: Path) -> None:
             output=tmp_path / "a.json", idle_cooldown_timeout=2.0,
             idle_cooldown_interval=1.0, capture_fn=fake_capture,
             sleep_fn=clock.sleep, monotonic_fn=clock.monotonic, stderr=stderr)
-    assert calls == ["q3", "q2", "research6", "research7", "research7", "research7"]
+    assert calls == ["q3", "q2", "research6", "research7"] * 3
     assert clock.sleeps == [1.0, 1.0]
     assert "host=research7" in stderr.getvalue()
     assert not (tmp_path / "a.json").exists()

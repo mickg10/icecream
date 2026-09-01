@@ -35,18 +35,20 @@ and descriptor arguments:
 ```sh
 --mode external-farm \
 --external-farm-authority-command "python3 \
-/tanksmall/scratch/ictmp/wt-p50-c-route-owner-root-20260828/farmharness/s8_external_farm_authority.py \
+/path/to/final-head/farmharness/s8_external_farm_authority.py \
   --execute --root /path/to/final-head --output {output} \
-  --descriptor-dir /private/descriptors \
+  --descriptor-dir {output}.descriptors \
   --idle-cooldown-timeout 30 --idle-cooldown-interval 2 ..."
 ```
 
-The absolute generator path above is the pinned final-head checkout used by
-the campaign. `--idle-cooldown-timeout` is a bounded opt-in window (seconds)
+The absolute generator path above must be from the same pinned final-head
+checkout used by the campaign, and `{output}.descriptors` keeps descriptors
+private to that attempt. `--idle-cooldown-timeout` is a bounded opt-in window
+(seconds)
 for the named transient `placement:host_not_idle:<host>` disposition; the
-generator recaptures only the failing host at the requested interval when it
-is required by the selected placement (q3 is always required). An excluded
-research6 HOLD is retained without blocking the default map. Every wait
-diagnostic is emitted on stderr. The default timeout is `0` (single-shot),
-and identity, binary, schema, capture, and other placement errors never
-retry.
+generator recaptures all four hosts at the requested interval when the
+failing host is required by the selected placement (q3 is always required).
+An excluded research6 HOLD is retained without blocking the default map.
+Every wait diagnostic is emitted on stderr. The default timeout is `0`
+(single-shot), and identity, binary, schema, capture, and other placement
+errors never retry.
