@@ -10,7 +10,6 @@ standard=${ICECC_TEST_CXX_STANDARD_FLAG:--std=c++20}
 src="$top_src/cache/p50_daemon_sidecar_adapter.cpp"
 header="$top_src/cache/p50_daemon_sidecar_adapter.h"
 test_source="$top_src/unittests/p50_daemon_sidecar_adapter_test.cpp"
-cleanup_source="$top_src/unittests/p50daemonsidecaradapter-source.sh"
 
 test -x "$service" || {
     echo 'FAIL: adapter source gate requires the built service' >&2
@@ -37,8 +36,6 @@ grep -F 'outer_prepare_attempt_retirement' "$header" >/dev/null
 grep -F 'outer_commit_attempt_replacement' "$header" >/dev/null
 grep -F 'outer_close_logical_input_lease' "$header" >/dev/null
 grep -F 'AttemptLeafRetirementJoin' "$header" >/dev/null
-grep -F 'retire_mutant_sidecars "$runtime_root" || cleanup_status=1' "$cleanup_source" >/dev/null
-grep -F 'TMPDIR="$baseline_runtime_root"' "$cleanup_source" >/dev/null
 
 if grep -E 'daemon/main\.cpp|signal\(|sigaction\(|listen_unix\(' "$src" "$header" >/dev/null; then
     echo 'FAIL: adapter acquired daemon-main, signal-handler, or public-listener ownership' >&2
@@ -157,12 +154,85 @@ retire_mutant_sidecars() {
     test -z "$sidecar_pids"
 }
 
-baseline_runtime_root=$(mktemp -d "${TMPDIR:-/tmp}/p50daemonsidecaradapter-baseline.XXXXXX")
+# Keep the runtime prefix short enough for the adapter's sockaddr_un path
+# contract; the unique directory name still scopes exact child cleanup.
+baseline_runtime_root=$(mktemp -d /tmp/p5b.XXXXXX)
 runtime_roots="$runtime_roots $baseline_runtime_root"
 baseline="$tmp_root/baseline"
 link_binary "$production_object" "$baseline"
 TMPDIR="$baseline_runtime_root" ICECC_TEST_CACHE_SERVICE="$service" timeout 60s "$baseline"
 echo 'ok - current-source linked service/SCM_RIGHTS lifecycle baseline passes'
+
+# Interrupt a live baseline and prove that its exact socket-owned sidecar is
+# retired.  The wrapper owns only this child and runtime root; it never sends
+# a broad process or process-group signal.
+interruption_runtime_root=$(mktemp -d /tmp/p5i.XXXXXX)
+runtime_roots="$runtime_roots $interruption_runtime_root"
+interruption_log="$tmp_root/interruption.log"
+interruption_ready_trace="$tmp_root/interruption.ready"
+(
+    interruption_child_pid=
+    interruption_cleanup() {
+        if test -n "$interruption_child_pid"; then
+            # The child is stopped only after the service's authenticated READY
+            # trace, so resume it before delivering the interruption signal.
+            kill -CONT "$interruption_child_pid" 2>/dev/null || :
+            kill -TERM "$interruption_child_pid" 2>/dev/null || :
+            wait "$interruption_child_pid" 2>/dev/null || :
+        fi
+        retire_mutant_sidecars "$interruption_runtime_root" || exit 1
+        rm -rf -- "$interruption_runtime_root" || exit 1
+        exit 0
+    }
+    trap interruption_cleanup HUP INT TERM
+    ICECC_P50_C1F1_REQUIRED=1 ICECC_P50_TEST_READY_TRACE="$interruption_ready_trace" \
+        TMPDIR="$interruption_runtime_root" ICECC_TEST_CACHE_SERVICE="$service" \
+        "$baseline" >"$interruption_log" 2>&1 &
+    interruption_child_pid=$!
+    while ! test -s "$interruption_ready_trace"; do
+        kill -0 "$interruption_child_pid" 2>/dev/null || exit 1
+        sleep 0.01
+    done
+    # Freeze the exact baseline at the authenticated READY edge.  This makes
+    # the parent-side interruption deterministic while leaving the sidecar
+    # and its socket available for ownership-scoped discovery.
+    kill -STOP "$interruption_child_pid"
+    wait "$interruption_child_pid"
+    interruption_status=$?
+    retire_mutant_sidecars "$interruption_runtime_root" || exit 1
+    rm -rf -- "$interruption_runtime_root" || exit 1
+    exit "$interruption_status"
+) &
+interruption_wrapper_pid=$!
+interruption_sidecar_pids=
+interruption_poll=0
+while test "$interruption_poll" -lt 200; do
+    interruption_sidecar_pids=$(mutant_sidecar_pids "$interruption_runtime_root")
+    test -n "$interruption_sidecar_pids" && break
+    kill -0 "$interruption_wrapper_pid" 2>/dev/null || break
+    sleep 0.05
+    interruption_poll=$((interruption_poll + 1))
+done
+if test -z "$interruption_sidecar_pids"; then
+    kill -TERM "$interruption_wrapper_pid" 2>/dev/null || :
+    wait "$interruption_wrapper_pid" 2>/dev/null || :
+    echo 'FAIL: interruption regression did not observe a live cache sidecar' >&2
+    cat "$interruption_log" >&2
+    exit 1
+fi
+kill -TERM "$interruption_wrapper_pid"
+set +e
+wait "$interruption_wrapper_pid"
+interruption_status=$?
+set -e
+if test "$interruption_status" -ne 0 || \
+        test -n "$(mutant_sidecar_pids "$interruption_runtime_root")" || \
+        test -e "$interruption_runtime_root"; then
+    echo "FAIL: interrupted baseline left cache sidecar/runtime (status $interruption_status)" >&2
+    cat "$interruption_log" >&2
+    exit 1
+fi
+echo 'ok - forced interruption retires the exact live cache sidecar'
 
 compile_and_expect_red() {
     label=$1
