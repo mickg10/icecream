@@ -172,7 +172,9 @@ def _check_cell(plan: dict[str, object]) -> dict[str, str]:
         raise MultiTUPredictiveError("plan:split_policy_mismatch")
     expected_scope = ("canonical_s8" if cell["corpus"] in CORPORA
                      else "expanded_descriptive")
-    if plan.get("evaluation_scope") != expected_scope:
+    declared_scope = plan.get("evaluation_scope")
+    if ((declared_scope is not None and declared_scope != expected_scope) or
+            (cell["corpus"] not in CORPORA and declared_scope != expected_scope)):
         raise MultiTUPredictiveError("plan:evaluation_scope_mismatch")
     return {key: str(cell[key]) for key in ("corpus", "profile", "regime")}
 

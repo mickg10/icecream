@@ -185,7 +185,7 @@ def test_producer_emits_100_ordered_points_and_continuous_relationship(tmp_path:
 
 def test_expanded_compressed_curve_is_descriptive_and_canonical_consumer_rejects(
         tmp_path: Path) -> None:
-    plan_path = _plan(tmp_path / "opencv", 3, 3, "expanded", profile="ZSTD_TU",
+    plan_path = _plan(tmp_path / "opencv", 3, 100, "expanded", profile="ZSTD_TU",
                       corpus="OpenCV")
     manifest = _template(tmp_path / "template-opencv",
                          {"corpus": "OpenCV", "profile": "ZSTD_TU", "regime": "cold"})
