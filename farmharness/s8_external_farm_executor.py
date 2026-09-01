@@ -1466,6 +1466,68 @@ rmdir -- "$path"
             _finish_cleanup(cleanup_errors, primary_error)
 
 
+def execute_and_finalize_external_cell(
+        transport: SSHTransport, *, topology: str,
+        relationship_hosts: Sequence[str] | None, profile: str,
+        batch_manifest: Path, predictive_plan: Path, topology_file: Path,
+        corpus: str, regime: str, depth: str, output: Path,
+        product_root: Path, product_root_remote: str | None = None,
+        repeat_predictive_plan: Path | None = None, passes: int = 1,
+        timestamp: str | None = None, artifact_sample: int = 2,
+        retain_all_artifacts: bool = False) -> Path:
+    """Execute one authenticated external cell and finalize it immediately.
+
+    ``SSHTransport.execute`` owns remote placement, execution, retention, and
+    cleanup.  ``live.finalize`` owns the mature timing/action evidence path.
+    This helper is the deliberately small handoff between those contracts:
+    it does not reinterpret remote output or create a second finalizer.
+    """
+    execute = getattr(transport, "execute", None)
+    if not callable(execute) or not isinstance(getattr(transport, "authority", None), Mapping):
+        raise ExternalFarmError("adapter:transport_invalid")
+    if relationship_hosts is None:
+        relationship_hosts = selected_hosts(transport.authority, topology, None)
+    rows, _assignments = validate_batch_inputs(
+        batch_manifest, predictive_plan, topology_file, corpus=corpus,
+        profile=profile, regime=regime, depth=depth, suite=topology)
+    timeout_seconds = external_timeout_seconds(
+        len(rows), passes, regime == "warm")
+    command = build_external_command(
+        batch_manifest, predictive_plan, topology_file, product_root,
+        profile=profile, corpus=corpus, regime=regime, depth=depth,
+        suite=topology, workdir=Path("/tmp/p50compilee2e.external"),
+        timeout_seconds=timeout_seconds, passes=passes,
+        repeat_predictive_plan=repeat_predictive_plan)
+    result = execute(
+        topology=topology, relationship_hosts=relationship_hosts,
+        profile=profile, batch_manifest=batch_manifest,
+        predictive_plan=predictive_plan, topology_file=topology_file,
+        corpus=corpus, regime=regime, depth=depth, output=output,
+        product_root_remote=product_root_remote or str(product_root.absolute()),
+        batch_command=command, host_product_root=product_root,
+        extra_stage_paths=((repeat_predictive_plan,)
+                           if repeat_predictive_plan is not None else ()))
+    if (not isinstance(result, Mapping) or result.get("status") != "PASS" or
+            not isinstance(result.get("finalizer_input"), Mapping)):
+        raise ExternalFarmError("adapter:finalizer_input_missing")
+    try:
+        return live.finalize(
+            "", 0, batch_manifest=batch_manifest, topology=topology_file,
+            predictive_plan=predictive_plan, output=output, profile=profile,
+            product_root=product_root,
+            repeat_predictive_plan=repeat_predictive_plan,
+            product_profile=("RAW_II" if profile == "RAW_II" else None),
+            corpus=corpus, regime=regime, depth=depth, passes=passes,
+            artifact_sample=artifact_sample,
+            retain_all_artifacts=retain_all_artifacts,
+            timeout_seconds=timeout_seconds,
+            execution_environment="external_farm_product_build",
+            external_farm=result["finalizer_input"], timestamp=timestamp,
+            suite=topology)
+    except live.LiveRunnerError as exc:
+        raise ExternalFarmError(f"adapter:finalize_failed:{exc}") from exc
+
+
 def build_plan(authority: Mapping[str, Any], topology: str,
                relationship_hosts: Sequence[str], profile: str) -> dict[str, Any]:
     placement = role_placement(authority, topology, relationship_hosts)

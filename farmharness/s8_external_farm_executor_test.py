@@ -395,3 +395,81 @@ def test_arbitrary_true_command_cannot_be_admitted(tmp_path: Path) -> None:
             product_root_remote="/product",
             batch_command=["env", "ICECC_P50_EXTERNAL_FARM=1", "/bin/true"],
             output=tmp_path / "out")
+
+
+def test_external_cell_adapter_finalizes_immediately_after_execution(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    authority = {"placements": {"C1F1/100000": {"relationship_hosts": ["q2"]}}}
+    events: list[str] = []
+    calls: dict[str, object] = {}
+    finalizer_input = {"manifest_path": str(tmp_path / "manifest.json")}
+
+    class FakeTransport:
+        def __init__(self) -> None:
+            self.authority = authority
+
+        def execute(self, **kwargs: object) -> dict[str, object]:
+            events.append("execute")
+            calls["execute"] = kwargs
+            return {"status": "PASS", "finalizer_input": finalizer_input}
+
+    monkeypatch.setattr(
+        executor, "validate_batch_inputs",
+        lambda *args, **kwargs: ([{"input": "one"}], []))
+    monkeypatch.setattr(
+        executor, "build_external_command",
+        lambda *args, **kwargs: ["env", "ICECC_P50_EXTERNAL_FARM=1",
+                                 "/product/unittests/p50compilee2e-run.sh"])
+
+    def fake_finalize(*args: object, **kwargs: object) -> Path:
+        events.append("finalize")
+        calls["finalize_args"] = args
+        calls["finalize"] = kwargs
+        return tmp_path / "finalized"
+
+    monkeypatch.setattr(executor.live, "finalize", fake_finalize)
+    transport = FakeTransport()
+    result = executor.execute_and_finalize_external_cell(
+        transport, topology="C1F1/100000", relationship_hosts=None,
+        profile="ZSTD_ROUTE", batch_manifest=tmp_path / "batch.jsonl",
+        predictive_plan=tmp_path / "plan.json", topology_file=tmp_path / "topology.json",
+        corpus="DuckDB", regime="cold", depth="100", output=tmp_path / "output",
+        product_root=tmp_path / "product", timestamp="20260901T120000Z")
+
+    assert result == tmp_path / "finalized"
+    assert events == ["execute", "finalize"]
+    execute_kwargs = calls["execute"]
+    assert isinstance(execute_kwargs, dict)
+    assert execute_kwargs["relationship_hosts"] == ["q2"]
+    assert execute_kwargs["batch_command"] == [
+        "env", "ICECC_P50_EXTERNAL_FARM=1", "/product/unittests/p50compilee2e-run.sh"]
+    finalize_kwargs = calls["finalize"]
+    assert isinstance(finalize_kwargs, dict)
+    assert finalize_kwargs["external_farm"] is finalizer_input
+    assert finalize_kwargs["execution_environment"] == "external_farm_product_build"
+    assert finalize_kwargs["output"] == tmp_path / "output"
+    assert finalize_kwargs["suite"] == "C1F1/100000"
+
+
+def test_external_cell_adapter_rejects_execution_without_finalizer_input(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeTransport:
+        authority = {"placements": {"C1F1/100000": {"relationship_hosts": ["q2"]}}}
+
+        def execute(self, **_kwargs: object) -> dict[str, object]:
+            return {"status": "PASS"}
+
+    monkeypatch.setattr(
+        executor, "validate_batch_inputs",
+        lambda *args, **kwargs: ([{"input": "one"}], []))
+    monkeypatch.setattr(
+        executor, "build_external_command",
+        lambda *args, **kwargs: ["env", "ICECC_P50_EXTERNAL_FARM=1",
+                                 "/product/unittests/p50compilee2e-run.sh"])
+    with pytest.raises(executor.ExternalFarmError, match="finalizer_input_missing"):
+        executor.execute_and_finalize_external_cell(
+            FakeTransport(), topology="C1F1/100000", relationship_hosts=["q2"],
+            profile="ZSTD_ROUTE", batch_manifest=tmp_path / "batch.jsonl",
+            predictive_plan=tmp_path / "plan.json", topology_file=tmp_path / "topology.json",
+            corpus="DuckDB", regime="cold", depth="100", output=tmp_path / "output",
+            product_root=tmp_path / "product")
