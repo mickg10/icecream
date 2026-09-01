@@ -35,7 +35,8 @@ from typing import Any, Iterable, Mapping, Sequence
 SCHEMA = "icecream-s8-method-matrix-simulator-v1"
 OCCURRENCE_SCHEMA = "icecream-s8-method-occurrence-v1"
 SUMMARY_SCHEMA = "icecream-s8-method-matrix-summary-v1"
-METHODS = ("RAW_II", "ZSTD_TU", "ZSTD_ROUTE", "ZSTD_COHORT", "ZSTD_GLOBAL")
+METHODS = ("RAW_II", "ZSTD_TU", "P29", "GRZ_RESIDUAL", "ZSTD_ROUTE",
+           "ZSTD_COHORT", "ZSTD_GLOBAL")
 READY_METHODS = frozenset(("RAW_II", "ZSTD_TU", "ZSTD_ROUTE"))
 TOPOLOGY_IDS = ("C1F1/100000", "C1F20/40")
 DEFAULT_HISTORY_BYTES = 128 << 20
@@ -89,23 +90,39 @@ def _authority_file(path: Path, finding: str) -> dict[str, object]:
 
 
 def _private_digest(path: Path, label: str) -> dict[str, object]:
+    return {key: value for key, value in _private_bytes(path, label)[1].items()
+            if key in ("path", "bytes", "sha256")}
+
+
+def _private_bytes(path: Path, label: str) -> tuple[bytes, dict[str, object]]:
     try:
-        info = path.lstat()
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except OSError as exc:
         raise MatrixError(f"{label}:missing:{path}") from exc
-    if (stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or
-            info.st_nlink != 1):
-        raise MatrixError(f"{label}:not_private_regular:{path}")
-    raw = path.read_bytes()
-    return {"path": str(path), "bytes": len(raw), "sha256": _sha256(raw)}
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise MatrixError(f"{label}:not_private_regular:{path}")
+        chunks = []
+        while True:
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+    finally:
+        os.close(fd)
+    if len(raw) != info.st_size:
+        raise MatrixError(f"{label}:size_changed:{path}")
+    return raw, {"path": str(path), "bytes": len(raw), "sha256": _sha256(raw)}
 
 
 def _authenticated_assignment(topology_id: str, count: int) -> dict[str, object]:
     path = AUTH_ASSIGNMENT_PATHS[topology_id]
-    facts = _private_digest(path, "assignment")
+    assignment_raw, facts = _private_bytes(path, "assignment")
     if facts["sha256"] != AUTH_ASSIGNMENT_SHA256[topology_id]:
         raise MatrixError("assignment:authenticated_digest_mismatch")
-    rows = list(csv.DictReader(path.read_text(encoding="utf-8").splitlines(), delimiter="\t"))
+    rows = list(csv.DictReader(assignment_raw.decode("utf-8").splitlines(), delimiter="\t"))
     if not rows or len(rows) < count:
         raise MatrixError("assignment:too_short")
     selected: list[dict[str, object]] = []
@@ -165,7 +182,8 @@ def _native_batch(occurrences: Sequence[Occurrence], topology: MatrixTopology,
         environment["ICECC_P50_PROFILE"] = method
         completed = subprocess.run(
             [str(binary), "--batch-manifest", str(manifest), "--batch-assignment-map", str(mapping),
-             "--batch-output", str(output)], env=environment, check=False,
+             "--batch-output", str(output), "--batch-allow-repeated-inputs", "1"],
+            env=environment, check=False,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600)
         if completed.returncode != 0:
             raise NotReady("native product transaction failed: " +
@@ -190,6 +208,7 @@ def method_authority(method: str) -> dict[str, object]:
     product = root / "cache" / "p50_zstd.cpp"
     product_facts = _authority_file(product, "authenticated product p50_zstd source")
     planner = root / "farmharness" / "s4_version_transition_planner.py"
+    native_binary = root / "cache" / "sim" / ".p50sim.bin"
     if method == "RAW_II":
         return {"status": "READY", "kind": "whole-legacy-control",
                 "authority": [_authority_file(product,
@@ -201,6 +220,7 @@ def method_authority(method: str) -> dict[str, object]:
                 "authority": [product_facts,
                     _authority_file(root / "cache" / "sim" / ".p50sim-build.json",
                     "native product codec receipt"),
+                    _authority_file(native_binary, "native product codec binary"),
                     _authority_file(product,
                     "ZstdTuCodec resets session and parameters for each independent TU")],
                 "contract": "independent level-3 frame/context per TU",
@@ -211,10 +231,18 @@ def method_authority(method: str) -> dict[str, object]:
                 "authority": [product_facts,
                     _authority_file(root / "cache" / "sim" / ".p50sim-build.json",
                     "native product codec receipt"),
+                    _authority_file(native_binary, "native product codec binary"),
                     _authority_file(product,
                     "ZstdRouteCodec resets a fresh level-3 frame and refPrefixes committed raw history")],
                 "contract": "one bounded-prefix frame per TU; commit advances relationship state",
                 "reason": None if status == "READY" else "MISSING_AUTHORITY: p50_zstd source changed"}
+    if method in {"P29", "GRZ_RESIDUAL"}:
+        return {"status": "NOT_READY", "kind": "product-profile",
+                "authority": [product_facts,
+                    _authority_file(root / "cache" / "sim" / ".p50sim-build.json",
+                                    "native product profile receipt")],
+                "contract": "native p50sim profile required; no Python approximation",
+                "reason": "INCOMPLETE: profile payload-output seam is not retained by this successor"}
     if method == "ZSTD_COHORT":
         return {"status": "NOT_READY", "kind": "unaccepted-extra",
                 "authority": [_authority_file(planner,
@@ -319,6 +347,8 @@ class Occurrence:
     source_relative: str | None = None
     source_sha256: str | None = None
     source_path: str | None = None
+    source_build: int | None = None
+    source_logical: int | None = None
 
     def __post_init__(self) -> None:
         if type(self.ordinal) is not int or self.ordinal < 0:
@@ -334,15 +364,12 @@ class Occurrence:
 
     @classmethod
     def from_path(cls, ordinal: int, path: Path, **kwargs: object) -> "Occurrence":
-        info = path.lstat()
-        if not path.is_file() or path.is_symlink() or info.st_nlink != 1:
-            raise MatrixError(f"source is not an authenticated private regular file: {path}")
-        raw = path.read_bytes()
+        raw, facts = _private_bytes(path, "occurrence")
         expected_size = kwargs.pop("expected_size", None)
         expected_sha256 = kwargs.pop("expected_sha256", None)
         if expected_size is not None and len(raw) != expected_size:
             raise MatrixError("authenticated input size changed")
-        digest = _sha256(raw)
+        digest = str(facts["sha256"])
         if expected_sha256 is not None and digest != expected_sha256:
             raise MatrixError("authenticated input digest changed")
         return cls(ordinal, raw, source_relative=kwargs.pop("source_relative", None),
@@ -547,6 +574,14 @@ class MethodMatrixSimulator:
                     "relationship_count": self.topology.relationship_count,
                     "capacity_is_concurrency": True,
                     "assignment_authority": self.assignment_authority,
+                    "input_authority": {"trace_sha256": AUTH_TRACE_SHA256,
+                                        "corpus_manifest_sha256": AUTH_CORPUS_MANIFEST_SHA256,
+                                        "corpus_root": str(AUTH_CORPUS_ROOT),
+                                        "selected_inputs": [{"ordinal": o.ordinal,
+                                            "build": o.source_build, "logical": o.source_logical,
+                                            "source_relative": o.source_relative,
+                                            "bytes": len(o.raw), "sha256": o.source_sha256}
+                                            for o in occurrences]},
                     "artifacts": descriptors,
                     "row_order": [{"ordinal": row["ordinal"], "method": row["method"]}
                                   for row in rows]}
@@ -574,22 +609,17 @@ class MethodMatrixSimulator:
                                   "route_id": state.last_route_id, "nonce": state.history_nonce}))
         raw_path = encoded_path = None
         raw_sha = _sha256(occurrence.raw)
+        # Raw corpus payloads remain at their authenticated immutable source;
+        # experiment evidence retains source path/size/hash descriptors only.
         if experiment is not None:
-            method_dir = experiment / "bytes" / method
-            method_dir.mkdir(exist_ok=True)
-            # One immutable input artifact is shared by all method arms;
-            # retaining a copy per method multiplies Firefox's large .ii
-            # corpus and defeats the bounded canary contract.
-            input_dir = experiment / "bytes" / "input"
-            input_dir.mkdir(exist_ok=True)
-            raw_path = input_dir / f"raw-{occurrence.ordinal:06d}.bin"
-            if raw_path.exists() and raw_path.read_bytes() != occurrence.raw:
-                raise MatrixError("input artifact collision")
-            raw_path.write_bytes(occurrence.raw)
+            (experiment / "bytes" / method).mkdir(exist_ok=True)
         row: dict[str, object] = {"schema": OCCURRENCE_SCHEMA, "method": method,
             "topology": self.topology.topology_id, "ordinal": occurrence.ordinal,
             "relationship_key": list(key), "relationship_index": assignment["relationship_index"],
-            "slot": occurrence.slot, "raw_bytes": len(occurrence.raw), "raw_sha256": raw_sha,
+            "slot": assignment["slot"], "global_slot": assignment["global_slot"],
+            "authority_worker": self.assignment_authority.get("rows", [])[occurrence.ordinal].get("authority_worker")
+                if isinstance(self.assignment_authority.get("rows"), list) and occurrence.ordinal < len(self.assignment_authority.get("rows", [])) else None,
+            "raw_bytes": len(occurrence.raw), "raw_sha256": raw_sha,
             "source_relative": occurrence.source_relative, "source_sha256": occurrence.source_sha256,
             "raw_path": str(raw_path.relative_to(experiment)) if raw_path and experiment else None,
             "status": self.authority[method]["status"], "committed": False,
@@ -626,11 +656,22 @@ class MethodMatrixSimulator:
                 raise MatrixError(
                     f"route order expected REL_SEQ {encode_state.next_rel_seq}, got {occurrence.rel_seq}"
                 )
-        encoded, cpu_ns, wall_ns = self._encode(method, occurrence.raw, encode_state)
-        if experiment is not None:
+        product = self._native_rows.get(method, {}).get(occurrence.ordinal)
+        if product is not None:
+            # Batch endpoint output is the authoritative full-stream
+            # measurement.  Do not launch a second native process per TU or
+            # materialize 75GB of Firefox payloads; bounded codec mode remains
+            # available for focused parity probes.
+            encoded = b""
+            cpu_ns = int(product["simulator_execution_ns"])
+            wall_ns = cpu_ns
+        else:
+            encoded, cpu_ns, wall_ns = self._encode(method, occurrence.raw, encode_state)
+        if experiment is not None and product is None:
             encoded_path = experiment / "bytes" / method / f"encoded-{occurrence.ordinal:06d}.bin"
             encoded_path.write_bytes(encoded)
-        row.update({"encoded_bytes": len(encoded), "encoded_sha256": _sha256(encoded),
+        row.update({"encoded_bytes": (int(product["encoded_source_bytes"]) if product is not None else len(encoded)),
+                    "encoded_sha256": (_sha256(encoded) if product is None else None),
                     "encoded_path": str(encoded_path.relative_to(experiment))
                     if encoded_path and experiment else None,
                     "codec_cpu_ns": cpu_ns, "codec_wall_ns": wall_ns})
@@ -717,6 +758,19 @@ def verify_experiment(experiment: Path) -> dict[str, object]:
         if (not isinstance(descriptor, Mapping) or descriptor.get("bytes") != path.stat().st_size or
                 descriptor.get("sha256") != _sha256(path.read_bytes())):
             raise MatrixError("verifier:artifact_mutated:" + name)
+    input_authority = manifest.get("input_authority")
+    if isinstance(input_authority, Mapping):
+        root = Path(str(input_authority.get("corpus_root", AUTH_CORPUS_ROOT))).resolve()
+        selected = input_authority.get("selected_inputs", [])
+        if not isinstance(selected, list):
+            raise MatrixError("verifier:input_authority_invalid")
+        for item in selected:
+            if not isinstance(item, Mapping) or not isinstance(item.get("source_relative"), str):
+                raise MatrixError("verifier:input_descriptor_invalid")
+            path = root / str(item["source_relative"])
+            facts = _private_digest(path, "verifier_input")
+            if facts["sha256"] != item.get("sha256") or facts["bytes"] != item.get("bytes"):
+                raise MatrixError("verifier:external_input_mutated")
     try:
         rows = [json.loads(line) for line in
                 (experiment / "occurrences.jsonl").read_text(encoding="utf-8").splitlines()]
@@ -746,7 +800,7 @@ def firefox_occurrences(trace: Path, *, count: int = 100,
     trace_facts = _private_digest(trace, "trace")
     if trace_facts["sha256"] != AUTH_TRACE_SHA256:
         raise MatrixError("trace:authenticated_digest_mismatch")
-    manifest_facts = _private_digest(corpus_manifest, "corpus_manifest")
+    manifest_raw, manifest_facts = _private_bytes(corpus_manifest, "corpus_manifest")
     if manifest_facts["sha256"] != AUTH_CORPUS_MANIFEST_SHA256:
         raise MatrixError("corpus_manifest:authenticated_digest_mismatch")
     root = corpus_root.resolve()
@@ -754,7 +808,7 @@ def firefox_occurrences(trace: Path, *, count: int = 100,
     if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
         raise MatrixError("corpus_root:not_private_directory")
     manifest_paths: dict[str, dict[str, object]] = {}
-    for line in corpus_manifest.read_text(encoding="utf-8").splitlines():
+    for line in manifest_raw.decode("utf-8").splitlines():
         if not line or line != line.strip():
             raise MatrixError("corpus_manifest:line_format_invalid")
         candidate = Path(line)
@@ -770,12 +824,11 @@ def firefox_occurrences(trace: Path, *, count: int = 100,
         # Membership is authenticated by the retained manifest digest; hash
         # and size are checked for each selected input below (bounded canary).
         manifest_paths[relative] = {"path": str(resolved)}
-    result: list[Occurrence] = []
-    with trace.open(newline="", encoding="utf-8") as stream:
-        reader = csv.DictReader(stream, delimiter="\t")
+    trace_occurrences: list[Occurrence] = []
+    trace_raw, _ = _private_bytes(trace, "trace")
+    reader = csv.DictReader(trace_raw.decode("utf-8").splitlines(), delimiter="\t")
+    try:
         for row in reader:
-            if len(result) >= count:
-                break
             relative = row.get("ii_relative", "")
             if not relative or Path(relative).is_absolute() or relative.startswith("../"):
                 raise MatrixError("trace:ii_relative_invalid")
@@ -785,18 +838,35 @@ def firefox_occurrences(trace: Path, *, count: int = 100,
                 expected = int(row["raw_bytes"])
             except (KeyError, ValueError) as exc:
                 raise MatrixError("trace:row_invalid") from exc
-            if logical != len(result) or relative not in manifest_paths:
+            if logical != len(trace_occurrences) or relative not in manifest_paths:
                 raise MatrixError("trace:input_not_bound_to_corpus_manifest")
-            facts = _private_digest(raw_path, "corpus_input")
-            if facts["bytes"] != expected:
-                raise MatrixError("trace:raw_bytes_mismatch")
             occurrence = Occurrence.from_path(logical, raw_path,
                                                expected_size=expected,
-                                               expected_sha256=str(facts["sha256"]),
                                                source_relative=relative)
-            result.append(occurrence)
-    if len(result) != count:
+            trace_occurrences.append(Occurrence(ordinal=logical, raw=occurrence.raw,
+                                     source_relative=relative, source_sha256=occurrence.source_sha256,
+                                     source_path=occurrence.source_path,
+                                     source_logical=logical))
+    except csv.Error as exc:
+        raise MatrixError("trace:invalid_tsv") from exc
+    if not trace_occurrences:
         raise MatrixError("trace:requested_rows_unavailable")
+    # Join the authenticated global dispatch authority to trace logical rows.
+    # This supports build boundaries and repeat-full without treating a
+    # logical reset as a new dispatch identity.
+    authority = _authenticated_assignment("C1F1/100000", count)
+    result: list[Occurrence] = []
+    for item in authority["rows"]:  # type: ignore[union-attr]
+        logical = int(item["authority_logical"])
+        if logical >= len(trace_occurrences):
+            raise MatrixError("assignment:trace_logical_out_of_range")
+        base = trace_occurrences[logical]
+        result.append(Occurrence(ordinal=int(item["ordinal"]), raw=base.raw,
+                                 source_relative=base.source_relative,
+                                 source_sha256=base.source_sha256,
+                                 source_path=base.source_path,
+                                 source_build=int(item["authority_build"]),
+                                 source_logical=logical))
     return result
 
 

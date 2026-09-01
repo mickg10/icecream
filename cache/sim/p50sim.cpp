@@ -606,9 +606,9 @@ void run_batch(const Arguments& arguments) {
                                                     second.size(), &second_relationship_count);
         if (second_relationship_count != relationship_count)
             throw std::invalid_argument("repeat segment relationship cardinality differs");
-        if (second_assignments.size() != first_assignments.size() ||
-            second_assignments != first_assignments)
-            throw std::invalid_argument("repeat segment assignment map differs from segment one");
+        // A repeat build may legitimately dispatch the same TUs to different
+        // relationships/slots.  Cardinality and range are checked by
+        // read_batch_assignments; relationship state is retained by index.
     }
     if (!arguments.batch_manifest_3.empty()) {
         third = read_batch_manifest(arguments.batch_manifest_3,
@@ -618,9 +618,6 @@ void run_batch(const Arguments& arguments) {
             arguments.batch_assignment_map_3, third.size(), &third_relationship_count);
         if (third_relationship_count != relationship_count)
             throw std::invalid_argument("third segment relationship cardinality differs");
-        if (third_assignments.size() != first_assignments.size() ||
-            third_assignments != first_assignments)
-            throw std::invalid_argument("third segment assignment map differs from segment one");
     }
     std::ofstream output(arguments.batch_output, std::ios::binary | std::ios::trunc);
     if (!output)

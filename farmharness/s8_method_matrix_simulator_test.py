@@ -12,6 +12,8 @@ from s8_method_matrix_simulator import (
     Occurrence,
     assign_relationships,
     repeat_full_state_contract,
+    _authenticated_assignment,
+    verify_experiment,
 )
 
 
@@ -39,6 +41,16 @@ def test_deterministic_assignment_has_exactly_twenty_relationships() -> None:
     assert first == second
     assert len({tuple(item["relationship_key"]) for item in first}) == 20
     assert {item["slot"] for item in first} == {0, 1}
+
+
+def test_authenticated_assignment_preserves_build_boundary_and_formula() -> None:
+    authority = _authenticated_assignment("C1F20/40", 2499)
+    assert authority["rows"][2497]["authority_logical"] == 2497
+    assert authority["rows"][2498]["authority_build"] == 1
+    assert authority["rows"][2498]["authority_logical"] == 0
+    for item in authority["rows"][:100]:
+        assert item["f_relationship"] == item["global_slot"] // 2
+        assert item["per_f_slot"] == item["global_slot"] % 2
 
 
 def test_route_uses_fresh_frames_and_only_commit_advances_prefix(tmp_path: Path) -> None:
@@ -92,7 +104,8 @@ def test_methods_do_not_alias_and_missing_authority_is_explicit() -> None:
     result = simulator.run([Occurrence(0, b"payload")])
     statuses = result["method_status"]
     assert statuses == {
-        "RAW_II": "READY", "ZSTD_TU": "READY", "ZSTD_ROUTE": "READY",
+        "RAW_II": "READY", "ZSTD_TU": "READY", "P29": "NOT_READY",
+        "GRZ_RESIDUAL": "NOT_READY", "ZSTD_ROUTE": "READY",
         "ZSTD_COHORT": "NOT_READY", "ZSTD_GLOBAL": "NOT_IMPLEMENTED",
     }
     rows = {row["method"]: row for row in result["rows"]}
