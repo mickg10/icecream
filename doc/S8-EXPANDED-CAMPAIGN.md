@@ -16,6 +16,13 @@ four historical image IDs are accepted only through the immutable recovery
 report and remain `MISSING_EXTERNAL_AUTHORITY`; they are never replaced by a
 local image. An exact current image content ID may be supplied separately.
 
+All 11 retained corpora may be used for descriptive depth runs of the four
+implemented compressed profiles when their exact source, engine, product, and
+image authority is present. The seven expanded-only corpora are tagged
+`expanded_descriptive`; they have no calibration or held-out accuracy meaning,
+never enter the canonical 32-cell loss/freeze inputs, and remain `NOT_READY` or
+`HOLD` when any required authority is absent.
+
 The `s8-matrix-audit-v1` prerequisite is independently rehashed and must be
 PASS with 32/32 completed cells, 16/16 calibration cells, 16/16 held-out
 cells, and empty missing/invalid lists. The canonical 32-cell one-TU audit is
