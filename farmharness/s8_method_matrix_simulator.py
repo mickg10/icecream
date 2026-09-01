@@ -324,7 +324,9 @@ class MatrixTopology:
             if item.get("ordinal") != ordinal or item.get("dispatch_order") != ordinal:
                 raise MatrixError("assignment dispatch order changed")
         else:
-            guid = f_store_guid or self.f_store_guids[ordinal % self.relationship_count]
+            if f_store_guid is None:
+                raise MatrixError("authenticated assignment authority is required")
+            guid = f_store_guid
         key = self.relationship_for(guid, slot)
         return {"ordinal": ordinal, "f_store_guid": guid, "slot": slot,
                 "relationship_key": list(key),

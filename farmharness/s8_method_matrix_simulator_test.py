@@ -36,8 +36,9 @@ def test_capacity_is_not_relationship_cardinality() -> None:
 def test_deterministic_assignment_has_exactly_twenty_relationships() -> None:
     topology = MatrixTopology.from_id("C1F20/40", c_store_guid="C-guid")
     occurrences = [Occurrence(i, b"payload", slot=i % 2) for i in range(100)]
-    first = assign_relationships(topology, occurrences)
-    second = assign_relationships(topology, occurrences)
+    authority = _authenticated_assignment("C1F20/40", 100)
+    first = assign_relationships(topology, occurrences, authority)
+    second = assign_relationships(topology, occurrences, authority)
     assert first == second
     assert len({tuple(item["relationship_key"]) for item in first}) == 20
     assert {item["slot"] for item in first} == {0, 1}
