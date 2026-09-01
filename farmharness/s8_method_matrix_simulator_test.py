@@ -46,7 +46,7 @@ def test_route_uses_fresh_frames_and_only_commit_advances_prefix(tmp_path: Path)
     simulator = MethodMatrixSimulator(topology, methods=("ZSTD_ROUTE",), max_history_bytes=8)
     rows = simulator.run([
         Occurrence(0, b"A" * 32),
-        Occurrence(1, b"B" * 32, commit=False),
+        Occurrence(1, b"B" * 32, commit=False, release=True),
         Occurrence(2, b"C" * 32),
     ], output_root=tmp_path, timestamp="20260901T120000Z")
     data = [json.loads(line) for line in (rows / "occurrences.jsonl").read_text().splitlines()]
@@ -60,6 +60,13 @@ def test_route_uses_fresh_frames_and_only_commit_advances_prefix(tmp_path: Path)
     # A fresh encoded frame is retained for every occurrence, including the
     # rejected candidate; no endless stream is emitted by this contract.
     assert len(list((rows / "bytes" / "ZSTD_ROUTE").glob("encoded-*.bin"))) == 3
+
+
+def test_unreleased_preparation_blocks_until_explicit_release() -> None:
+    simulator = MethodMatrixSimulator(MatrixTopology.from_id("C1F1/100000"),
+                                       methods=("RAW_II",))
+    with pytest.raises(MatrixError, match="pending preparation"):
+        simulator.run([Occurrence(0, b"a", commit=False), Occurrence(1, b"b")])
 
 
 def test_route_reset_rebind_requires_new_nonce_and_preserves_order() -> None:
