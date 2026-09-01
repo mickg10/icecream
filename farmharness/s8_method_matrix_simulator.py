@@ -341,7 +341,7 @@ def method_authority(method: str) -> dict[str, object]:
         return {"status": "READY", "kind": "whole-legacy-control",
                 "authority": [_authority_file(product,
                     "RAW_II is a raw framed application-wire control; no zstd state")],
-                "contract": "raw bytes in both directions are measured by the control witness"}
+                "contract": "raw byte-size control only; endpoint wire/time is not witnessed"}
     if method == "ZSTD_TU":
         status = "READY" if product_facts.get("sha256") == AUTH_P50_ZSTD_SHA256 and receipt is not None else "NOT_READY"
         return {"status": status, "kind": "product-profile",
@@ -795,6 +795,8 @@ class MethodMatrixSimulator:
             "source_relative": occurrence.source_relative, "source_sha256": occurrence.source_sha256,
             "raw_path": str(raw_path.relative_to(experiment)) if raw_path and experiment else None,
             "status": self.authority[method]["status"], "committed": False,
+            "measurement_scope": ("raw_bytes_only_no_wire_witness" if method == "RAW_II"
+                                   else "native_endpoint_transaction"),
             "encoded_bytes": None, "encoded_sha256": None, "encoded_path": None,
             "codec_cpu_ns": None, "codec_wall_ns": None, "transition": "not_run",
             "pre_state_digest": pre, "post_state_digest": pre,
@@ -914,12 +916,16 @@ class MethodMatrixSimulator:
             totals[method] = {
                 "raw_bytes": sum(int(row.get("raw_bytes") or 0) for row in selected),
                 "encoded_bytes": sum(int(row.get("encoded_bytes") or 0) for row in selected),
-                "c_to_f_bytes": sum(int(row.get("product_transaction", {}).get("c_to_f_bytes", 0))
-                                     for row in selected),
-                "f_to_c_bytes": sum(int(row.get("product_transaction", {}).get("f_to_c_bytes", 0))
-                                     for row in selected),
-                "execution_ns": sum(int(row.get("product_transaction", {}).get("simulator_execution_ns", 0))
-                                     for row in selected),
+                "execution_ns": (None if method == "RAW_II" else
+                                  sum(int(row.get("product_transaction", {}).get("simulator_execution_ns", 0))
+                                      for row in selected)),
+                "wire_witnessed": method != "RAW_II",
+                "c_to_f_bytes": (None if method == "RAW_II" else
+                                  sum(int(row.get("product_transaction", {}).get("c_to_f_bytes", 0))
+                                      for row in selected)),
+                "f_to_c_bytes": (None if method == "RAW_II" else
+                                  sum(int(row.get("product_transaction", {}).get("f_to_c_bytes", 0))
+                                      for row in selected)),
                 "state_digests": [row.get("product_transaction", {}).get("state_digest") for row in selected
                                   if row.get("product_transaction")],
             }
