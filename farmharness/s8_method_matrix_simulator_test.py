@@ -262,6 +262,21 @@ def test_route_bytearray_runtime_state_does_not_advance_on_tentative_row() -> No
     assert state.history == bytearray(b"seed")
 
 
+def test_route_verifier_binds_global_dispatch_ordinal_at_full2_boundary(tmp_path: Path) -> None:
+    source = tmp_path / "boundary.ii"
+    source.write_bytes(b"boundary")
+    authority = _authenticated_assignment("C1F1/100000", 1, start=2498)
+    item = {"ordinal": 2498, "source_relative": source.name,
+            "bytes": source.stat().st_size,
+            "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+    observations, _final, _facts = simulator_module._stream_route_prefixes(
+        [item], authority, tmp_path, label="boundary")
+    assert set(observations) == {2498}
+    item["ordinal"] = 0
+    with pytest.raises(MatrixError, match="identity_invalid"):
+        simulator_module._stream_route_prefixes([item], authority, tmp_path, label="boundary")
+
+
 @pytest.mark.parametrize("count", (32, 64, 128))
 def test_subprocess_route_prefix_evidence_is_bounded_and_linear(count: int) -> None:
     code = r'''
