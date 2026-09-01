@@ -87,7 +87,8 @@ CONTROL_BASELINE = {
     "profile": "RAW_II",
     "harness_profile": "P29",
     "mode": "whole-legacy",
-    "prediction_source": "explicit_control_manifest",
+    "prediction_source": "raw_ii_control_engine",
+    "engine_scope": "raw_ii_control_engine",
 }
 
 

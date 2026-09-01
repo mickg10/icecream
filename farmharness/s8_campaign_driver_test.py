@@ -263,19 +263,32 @@ def test_raw_ii_fails_closed_without_control_inputs(tmp_path: Path) -> None:
                              timestamp="20260829T120014Z")
 
 
-def test_raw_ii_execution_remains_held_until_control_runner_exists(tmp_path: Path) -> None:
+def test_raw_ii_predictive_control_executes_dedicated_producer(tmp_path: Path) -> None:
     witness = tmp_path / "raw-ii-witness.json"
     engine = tmp_path / "raw-ii-engine-template.json"
     witness.write_text("raw witness\n")
     engine.write_text("raw engine template\n")
-    with pytest.raises(driver.CampaignError,
-                       match="raw_ii:control_baseline_execution_not_integrated"):
-        driver.run_campaign(
-            **_kwargs(tmp_path), selected_profiles=("RAW_II",),
-            raw_ii_witness=witness,
-            raw_ii_engine_manifest_template=engine,
-            timestamp="20260829T120015Z")
-    assert not list((tmp_path / "experiments").glob("s8-campaign-*"))
+    runner, calls = _runner_factory()
+    campaign = driver.run_campaign(
+        **_kwargs(tmp_path), selected_profiles=("RAW_II",),
+        raw_ii_witness=witness,
+        raw_ii_engine_manifest_template=engine,
+        command_runner=runner, timestamp="20260829T120015Z")
+    summary = json.loads((campaign / "summary.json").read_text())
+    assert summary["status"] == "PASS"
+    assert summary["expected_cells"] == 4
+    assert len(calls) == 8
+    producer_calls = [argv for stage, argv in calls if stage == "predictive_producer"]
+    assert producer_calls and all("s8_raw_ii_predictive_producer.py" in argv[1]
+                                  for argv in producer_calls)
+    assert all("s8_multitu_predictive_producer.py" not in argv[1]
+               and str(engine) in argv[argv.index("--engine-manifest") + 1]
+               and str(witness) in argv[argv.index("--raw-ii-witness") + 1]
+               for argv in producer_calls)
+    live_commands = json.loads(next((campaign / "cells").glob("*/attempt-001/commands.json")).read_text())["live"]
+    live_argv = live_commands["run"]["argv"]
+    assert live_argv[live_argv.index("--profile") + 1] == "P29"
+    assert live_argv[live_argv.index("--product-profile") + 1] == "RAW_II"
 
 
 def test_campaign_selection_rejects_empty_unknown_and_duplicate_values() -> None:

@@ -25,19 +25,23 @@ Methods are distinct: `RAW_II`, `ZSTD_TU`, `ZSTD_ROUTE`, `P29`,
 `GRZ_RESIDUAL`, `ZSTD_COHORT`, and `ZSTD_GLOBAL`. `RAW_II` is an explicit
 whole-legacy control arm, not a fifth compressed profile and not an alias for
 `P29`. Its descriptor retains the required `raw_ii_legacy_wire_witness` and
-`raw_ii_engine_template` inputs. Only the four implemented Root methods can
-become `READY`, and only after an authenticated producer capability manifest
-proves the exact producer source/version/binaries. The two topology records
-keep stream capacity separate from execution concurrency.
+`raw_ii_engine_template` inputs. The dedicated
+`farmharness/s8_raw_ii_predictive_producer.py` consumes those inputs: the
+witness binds C-to-F as `CompileFile + FileChunk + End`, while the separately
+scoped `raw_ii_control_engine` binds F-to-C and elapsed values. It never reads
+P29 predictions. Only the four implemented Root methods can become `READY`,
+and only after an authenticated producer capability manifest proves the exact
+producer source/version/binaries. The two topology records keep stream
+capacity separate from execution concurrency.
 
 The campaign driver keeps its default four-profile grid unchanged. Select the
 control arm explicitly with `--profiles RAW_II` (or alongside compressed
 profiles), and provide both `--raw-ii-witness PATH` and
 `--raw-ii-engine-manifest-template PATH`. Missing or non-private inputs fail
-closed. RAW_II execution remains held until a control runner binds those
-inputs into an authenticated legacy-wire plan; the driver only stages this
-selection today and never substitutes P29 predictions implicitly. A normalizer
-record for RAW_II must carry the exact
+closed. Predictive execution invokes the dedicated producer and emits the
+same curve-manifest shape consumed by the comparison boundary; external live
+execution still requires the regular authenticated farm authority and live
+finalizer. A normalizer record for RAW_II must carry the exact
 `icecream-s8-raw-ii-control-baseline-v1` declaration on both manifests.
 
 Example declarative invocation (the timestamp is caller-owned and immutable):

@@ -607,13 +607,13 @@ def _source_commands(cell_dir: Path, cell: dict[str, str], *, depth: str,
                      repo: Path, container_image: str | None = None,
                      container_image_id: str | None = None,
                      container_temp_root: Path | None = None,
-                     external_mode: bool = False) -> tuple[list[dict[str, object]], dict[str, object],
+                     external_mode: bool = False,
+                     raw_ii_witness: Path | None = None) -> tuple[list[dict[str, object]], dict[str, object],
                                           dict[str, object], list[dict[str, object]],
                                           list[Path]]:
     attempt = cell_dir / "attempt-001"
     control_only = cell["profile"] in CONTROL_PROFILES
-    control_reason = ("RAW_II control runner required; predictive commands are staged only"
-                      if control_only else None)
+    control_reason = None
     result_dir = attempt / f"s8-{_slug(cell)}-{campaign_stamp}"
     plan = attempt / ("depth-plan-full-1.json" if depth == "full" else "depth-plan.json")
     depth_argv = [python, str((repo / "farmharness/s8_depth_runner.py").absolute()),
@@ -625,6 +625,15 @@ def _source_commands(cell_dir: Path, cell: dict[str, str], *, depth: str,
     producer_argv = [python, str((repo / "farmharness/s8_multitu_predictive_producer.py").absolute()),
                      "--plan", str(plan), "--engine-manifest", str(engine_manifest),
                      "--product-build-root", str(product_root)]
+    if control_only:
+        if raw_ii_witness is None:
+            raise CampaignError("raw_ii:witness_required")
+        producer_argv = [
+            python, str((repo / "farmharness/s8_raw_ii_predictive_producer.py").absolute()),
+            "--plan", str(plan), "--raw-ii-witness", str(raw_ii_witness),
+            "--engine-manifest", str(engine_manifest), "--output-dir", str(result_dir),
+            "--depth", depth,
+        ]
     plan_commands: list[dict[str, object]] = []
     result_dirs = [result_dir]
     # The producer owns the warm lifecycle too: warm full is an authenticated
@@ -673,11 +682,16 @@ def _source_commands(cell_dir: Path, cell: dict[str, str], *, depth: str,
     live_argv = [python, str((repo / "farmharness/s8_real_c1f1_live_runner.py").absolute()),
                  "--batch-manifest", str(prep_dir / "batch-manifest.jsonl"),
                  "--predictive-plan", str(plan), "--topology", str(prep_dir / "topology.json"),
-                 "--suite", cell["topology"], "--profile", cell["profile"],
+                 "--suite", cell["topology"], "--profile",
+                 ("P29" if control_only else cell["profile"]),
                  "--product-root", str(product_root), "--corpus", cell["corpus"],
                  "--regime", cell["regime"], "--depth", depth, "--passes", "2" if depth == "full" else "1",
                  "--output", str(live_out), "--timestamp", campaign_stamp,
                  "--execute"]
+    if control_only:
+        # P29 is only the mature runner's harness selector; the explicit
+        # product-profile keeps the measured arm whole-legacy RAW_II.
+        live_argv.extend(("--product-profile", "RAW_II"))
     if container_image is not None:
         live_argv.extend(("--container-image", container_image))
     if container_image_id is not None:
@@ -1040,8 +1054,6 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
                 _private_file(engine, "raw_ii_engine_manifest")
             except CampaignError as exc:
                 raise CampaignError(f"raw_ii:control_input_invalid:{exc}") from exc
-        if execute:
-            raise CampaignError("raw_ii:control_baseline_execution_not_integrated")
     if mode == EXTERNAL_FARM_MODE:
         authority_sources = sum(item is not None for item in (
             external_farm_authority, external_authority_provider,
@@ -1170,7 +1182,12 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
         attempt_dir.mkdir()
         source_manifest = _format_path(source_manifest_spec, cell)
         source_root = _format_path(source_root_spec, cell)
-        engine_manifest = _format_path(engine_manifest_template, cell)
+        engine_manifest = _format_path(
+            raw_engine_spec if cell["profile"] in CONTROL_PROFILES and raw_engine_spec is not None
+            else engine_manifest_template, cell)
+        raw_witness_path = (_format_path(raw_witness_spec, cell)
+                            if cell["profile"] in CONTROL_PROFILES and raw_witness_spec is not None
+                            else None)
         raw_control_record: dict[str, object] | None = None
         if cell["profile"] in CONTROL_PROFILES:
             assert raw_witness_spec is not None and raw_engine_spec is not None
@@ -1192,7 +1209,8 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
             container_image=container_image if mode == "all" else None,
             container_image_id=container_image_id if mode == "all" else None,
             container_temp_root=container_temp_path if mode == "all" else None,
-            external_mode=mode == EXTERNAL_FARM_MODE)
+            external_mode=mode == EXTERNAL_FARM_MODE,
+            raw_ii_witness=raw_witness_path)
         # _source_commands uses attempt-001 as a stable template. Rebase every
         # generated path to this attempt so retries cannot overwrite outputs.
         def rebase(value: object) -> object:

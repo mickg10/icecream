@@ -2960,6 +2960,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
     evidence_manifest_sha = hashlib.sha256(evidence_raw).hexdigest()
     records: list[dict[str, Any]] = []
     manifests: dict[str, str] = {}
+    identity_profile = effective_product_profile if raw_ii else profile
     for run in run_names:
         selected = [row for row in observations if row["run"] == run]
         curve = _live_curve_rows(
@@ -2971,7 +2972,7 @@ def finalize(stdout: str, returncode: int, *, batch_manifest: Path, topology: Pa
         curve_name = f"live_curve_{run}.jsonl"
         manifest_name = f"live_curve_manifest_{run}.json"
         manifest_value = {"schema": normalizer.MANIFEST_SCHEMA,
-                          "identity": {"corpus": corpus, "profile": profile, "regime": regime,
+                          "identity": {"corpus": corpus, "profile": identity_profile, "regime": regime,
                                         "split": split, "run_id": run,
                                         "source_commit": commit, "source_tree": tree,
                                         "input_digest": input_sha, "topology_digest": topology_sha,

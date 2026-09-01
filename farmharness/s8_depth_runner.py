@@ -20,9 +20,11 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from .s8_schema import CORPORA, CURRENT_SEMANTICS, DEPTH_CLASSES, PROFILES, REGIMES, SPLITS
+    from .s8_schema import (CONTROL_PROFILES, CORPORA, CURRENT_SEMANTICS,
+                            DEPTH_CLASSES, PROFILES, REGIMES, SPLITS)
 except ImportError:  # pragma: no cover
-    from s8_schema import CORPORA, CURRENT_SEMANTICS, DEPTH_CLASSES, PROFILES, REGIMES, SPLITS
+    from s8_schema import (CONTROL_PROFILES, CORPORA, CURRENT_SEMANTICS,
+                           DEPTH_CLASSES, PROFILES, REGIMES, SPLITS)
 
 
 SCHEMA = "icecream-s8-depth-run-plan-v1"
@@ -195,7 +197,8 @@ def _unique_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 
 def _cell(corpus: str, profile: str, regime: str) -> dict[str, str]:
-    if corpus not in CORPORA or profile not in PROFILES or regime not in REGIMES:
+    if (corpus not in CORPORA or profile not in (*PROFILES, *CONTROL_PROFILES) or
+            regime not in REGIMES):
         raise DepthPlanError("cell:undeclared")
     return {"corpus": corpus, "profile": profile, "regime": regime}
 
@@ -247,9 +250,10 @@ def _matrix_precondition(path: Path, cell: dict[str, str]) -> dict[str, Any]:
         raise DepthPlanError("matrix_audit:32_cell_precondition_failed")
     cells = value.get("cells")
     cell_id = "/".join(cell[field] for field in ("corpus", "profile", "regime"))
-    if (not isinstance(cells, list) or not any(
-            isinstance(row, dict) and row.get("cell") == cell_id and
-            row.get("split") == SPLITS[cell["corpus"]] for row in cells)):
+    if (cell["profile"] not in CONTROL_PROFILES and
+            (not isinstance(cells, list) or not any(
+                isinstance(row, dict) and row.get("cell") == cell_id and
+                row.get("split") == SPLITS[cell["corpus"]] for row in cells))):
         raise DepthPlanError(f"matrix_audit:cell_missing:{cell_id}")
     return {"path": facts["path"], "sha256": facts["sha256"], "bytes": facts["bytes"],
             "schema": value["schema"], "status": value["status"]}
@@ -318,8 +322,11 @@ def build_plan(source_manifest: Path, source_root: Path, matrix_audit: Path,
                     "raw_jsonl": ["predictive_sim.jsonl", "live_summary.jsonl", "records.jsonl"],
                     "records": "records.jsonl", "experiment_manifest": "experiment_manifest.json"},
         "execution_contract": {
-            "status": "READY_MULTI_TU_PREDICTOR",
-            "producer": "farmharness.s8_multitu_predictive_producer",
+            "status": ("READY_RAW_II_CONTROL" if profile in CONTROL_PROFILES
+                        else "READY_MULTI_TU_PREDICTOR"),
+            "producer": ("farmharness.s8_raw_ii_predictive_producer"
+                         if profile in CONTROL_PROFILES
+                         else "farmharness.s8_multitu_predictive_producer"),
             "producer_points": requested_points,
             "live_observation": "separate_authenticated_curve_required",
             "required": "authenticated predictive curve over the ordered TU sequence",
@@ -329,6 +336,20 @@ def build_plan(source_manifest: Path, source_root: Path, matrix_audit: Path,
             "note": "The producer invokes one authenticated product batch over the ordered TU sequence and binds the aggregate input digest; live observations are never synthesized.",
         },
     }
+    if profile in CONTROL_PROFILES:
+        plan["execution_contract"].update({
+            "control_baseline": {
+                "schema": "icecream-s8-raw-ii-control-baseline-v1",
+                "profile": "RAW_II", "harness_profile": "P29",
+                "mode": "whole-legacy", "prediction_source": "raw_ii_control_engine",
+                "engine_scope": "raw_ii_control_engine",
+            },
+            "wire_formula": "legacy-filechunk-wire-v1",
+            "cache": "disabled",
+            "note": ("The RAW_II control producer binds the exact legacy wire witness "
+                      "for C-to-F and the separately scoped control engine for "
+                      "F-to-C/elapsed; no compressed prediction is substituted."),
+        })
     if repeat_of is not None:
         plan["repeat_of"] = repeat_facts
     return plan
@@ -351,7 +372,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--matrix-audit", type=Path, required=True)
     parser.add_argument("--result-dir", type=Path, required=True)
     parser.add_argument("--corpus", choices=CORPORA, required=True)
-    parser.add_argument("--profile", choices=PROFILES, required=True)
+    parser.add_argument("--profile", choices=(*PROFILES, *CONTROL_PROFILES), required=True)
     parser.add_argument("--regime", choices=REGIMES, required=True)
     parser.add_argument("--depth", choices=("100", "200", "full", "repeat-full"), required=True)
     parser.add_argument("--repeat-of", type=Path)
