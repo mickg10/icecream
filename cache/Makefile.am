@@ -61,7 +61,8 @@ libprotocol50_a_SOURCES = \
 
 AM_CPPFLAGS = -I$(top_srcdir) $(LIBZSTD_CFLAGS) $(LIBBSC_CFLAGS)
 libp50endpoint_a_SOURCES = p50_endpoint.cpp p50_endpoint.h \
-	p50_endpoint_run_cancel.cpp p50_endpoint_run_cancel.h
+	p50_endpoint_run_cancel.cpp p50_endpoint_run_cancel.h \
+	p50_p29_residual.h
 libp50endpoint_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 
 # Unit-only compatibility object for the pre-existing endpoint behavioral
