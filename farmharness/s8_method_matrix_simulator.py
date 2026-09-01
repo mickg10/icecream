@@ -192,7 +192,7 @@ def _native_batch(occurrences: Sequence[Occurrence], topology: MatrixTopology,
         for line in output.read_text(encoding="utf-8").splitlines():
             item = json.loads(line)
             ordinal = int(item["tu_index"])
-            if item.get("committed") is not True or item.get("raw_bytes") != len(occurrences[ordinal].raw):
+            if item.get("committed") is not True or item.get("raw_bytes") != occurrences[ordinal].byte_count():
                 raise MatrixError("native product commit/input binding invalid")
             result[ordinal] = item
         if set(result) != set(range(len(occurrences))):
@@ -335,7 +335,7 @@ class MatrixTopology:
 @dataclass(frozen=True)
 class Occurrence:
     ordinal: int
-    raw: bytes
+    raw: bytes | None
     f_store_guid: str | None = None
     slot: int = 0
     route_id: str | None = None
@@ -353,8 +353,10 @@ class Occurrence:
     def __post_init__(self) -> None:
         if type(self.ordinal) is not int or self.ordinal < 0:
             raise MatrixError("occurrence ordinal must be non-negative")
-        if not isinstance(self.raw, bytes) or not self.raw:
+        if self.raw is not None and (not isinstance(self.raw, bytes) or not self.raw):
             raise MatrixError("occurrence raw payload must be non-empty bytes")
+        if self.raw is None and not self.source_path:
+            raise MatrixError("lazy occurrence requires an authenticated source path")
         if type(self.slot) is not int or self.slot < 0:
             raise MatrixError("occurrence slot must be non-negative")
         if type(self.history_nonce) is not int or self.history_nonce <= 0:
@@ -374,6 +376,19 @@ class Occurrence:
             raise MatrixError("authenticated input digest changed")
         return cls(ordinal, raw, source_relative=kwargs.pop("source_relative", None),
                    source_sha256=digest, source_path=str(path), **kwargs)
+
+    def byte_count(self) -> int:
+        if self.raw is not None:
+            return len(self.raw)
+        return int(os.stat(self.source_path, follow_symlinks=False).st_size)  # type: ignore[arg-type]
+
+    def read_raw(self) -> bytes:
+        if self.raw is not None:
+            return self.raw
+        raw, facts = _private_bytes(Path(self.source_path), "occurrence")  # type: ignore[arg-type]
+        if facts["sha256"] != self.source_sha256:
+            raise MatrixError("authenticated input changed")
+        return raw
 
 
 @dataclass
@@ -580,7 +595,7 @@ class MethodMatrixSimulator:
                                         "selected_inputs": [{"ordinal": o.ordinal,
                                             "build": o.source_build, "logical": o.source_logical,
                                             "source_relative": o.source_relative,
-                                            "bytes": len(o.raw), "sha256": o.source_sha256}
+                                            "bytes": o.byte_count(), "sha256": o.source_sha256}
                                             for o in occurrences]},
                     "artifacts": descriptors,
                     "row_order": [{"ordinal": row["ordinal"], "method": row["method"]}
@@ -608,7 +623,8 @@ class MethodMatrixSimulator:
         pre = _sha256(_canonical({"history": state.history.hex(), "next_rel_seq": state.next_rel_seq,
                                   "route_id": state.last_route_id, "nonce": state.history_nonce}))
         raw_path = encoded_path = None
-        raw_sha = _sha256(occurrence.raw)
+        raw = occurrence.read_raw()
+        raw_sha = occurrence.source_sha256 or _sha256(raw)
         # Raw corpus payloads remain at their authenticated immutable source;
         # experiment evidence retains source path/size/hash descriptors only.
         if experiment is not None:
@@ -619,7 +635,7 @@ class MethodMatrixSimulator:
             "slot": assignment["slot"], "global_slot": assignment["global_slot"],
             "authority_worker": self.assignment_authority.get("rows", [])[occurrence.ordinal].get("authority_worker")
                 if isinstance(self.assignment_authority.get("rows"), list) and occurrence.ordinal < len(self.assignment_authority.get("rows", [])) else None,
-            "raw_bytes": len(occurrence.raw), "raw_sha256": raw_sha,
+            "raw_bytes": len(raw), "raw_sha256": raw_sha,
             "source_relative": occurrence.source_relative, "source_sha256": occurrence.source_sha256,
             "raw_path": str(raw_path.relative_to(experiment)) if raw_path and experiment else None,
             "status": self.authority[method]["status"], "committed": False,
@@ -666,7 +682,7 @@ class MethodMatrixSimulator:
             cpu_ns = int(product["simulator_execution_ns"])
             wall_ns = cpu_ns
         else:
-            encoded, cpu_ns, wall_ns = self._encode(method, occurrence.raw, encode_state)
+            encoded, cpu_ns, wall_ns = self._encode(method, raw, encode_state)
         if experiment is not None and product is None:
             encoded_path = experiment / "bytes" / method / f"encoded-{occurrence.ordinal:06d}.bin"
             encoded_path.write_bytes(encoded)
@@ -679,7 +695,7 @@ class MethodMatrixSimulator:
             row["product_transaction"] = self._native_rows[method][occurrence.ordinal]
         if occurrence.commit:
             if method in {"ZSTD_ROUTE", "ZSTD_COHORT"}:
-                encode_state.history = (encode_state.history + occurrence.raw)[-self.max_history_bytes:]
+                encode_state.history = (encode_state.history + raw)[-self.max_history_bytes:]
                 encode_state.next_rel_seq += 1
                 state.history = encode_state.history
                 state.next_rel_seq = encode_state.next_rel_seq
@@ -829,6 +845,8 @@ def firefox_occurrences(trace: Path, *, count: int = 100,
     reader = csv.DictReader(trace_raw.decode("utf-8").splitlines(), delimiter="\t")
     try:
         for row in reader:
+            if len(trace_occurrences) >= min(count, 2498):
+                break
             relative = row.get("ii_relative", "")
             if not relative or Path(relative).is_absolute() or relative.startswith("../"):
                 raise MatrixError("trace:ii_relative_invalid")
@@ -840,12 +858,12 @@ def firefox_occurrences(trace: Path, *, count: int = 100,
                 raise MatrixError("trace:row_invalid") from exc
             if logical != len(trace_occurrences) or relative not in manifest_paths:
                 raise MatrixError("trace:input_not_bound_to_corpus_manifest")
-            occurrence = Occurrence.from_path(logical, raw_path,
-                                               expected_size=expected,
-                                               source_relative=relative)
-            trace_occurrences.append(Occurrence(ordinal=logical, raw=occurrence.raw,
-                                     source_relative=relative, source_sha256=occurrence.source_sha256,
-                                     source_path=occurrence.source_path,
+            raw, facts = _private_bytes(raw_path, "corpus_input")
+            if len(raw) != expected:
+                raise MatrixError("trace:raw_bytes_mismatch")
+            trace_occurrences.append(Occurrence(ordinal=logical, raw=None,
+                                     source_relative=relative, source_sha256=str(facts["sha256"]),
+                                     source_path=str(raw_path),
                                      source_logical=logical))
     except csv.Error as exc:
         raise MatrixError("trace:invalid_tsv") from exc
