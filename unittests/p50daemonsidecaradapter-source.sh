@@ -124,34 +124,88 @@ link_binary() {
 
 mutant_sidecar_pids() {
     runtime_root=$1
+    mutant_sidecar_records "$runtime_root" | cut -d'|' -f1
+}
+
+proc_starttime() {
+    ms_pid=$1
+    ms_stat=$(cat "/proc/$ms_pid/stat" 2>/dev/null) || return 1
+    ms_rest=${ms_stat##*)}
+    set -- $ms_rest
+    test "$#" -ge 20 || return 1
+    printf '%s\n' "${20}"
+}
+
+mutant_sidecar_records() {
+    runtime_root=$1
     for process_root in /proc/[0-9]*; do
+        process_pid=${process_root##*/}
         process_exe=$(readlink "$process_root/exe" 2>/dev/null) || continue
         test "$process_exe" = "$service" || continue
         process_command=$(tr '\000' ' ' <"$process_root/cmdline" 2>/dev/null) || continue
-        case "$process_command" in
-            *" --socket $runtime_root/"*)
-                printf '%s\n' "${process_root##*/}"
-                ;;
-        esac
+        case "$process_command" in *" --socket "*) ;; *) continue ;; esac
+        process_socket=$(printf '%s\n' "$process_command" |
+            sed -n 's/.* --socket \([^ ]*\).*/\1/p')
+        case "$process_socket" in "$runtime_root"/*) ;; *) continue ;; esac
+        process_socket_identity=$(stat -Lc '%d:%i' "$process_socket" 2>/dev/null) || continue
+        process_starttime=$(proc_starttime "$process_pid") || continue
+        printf '%s|%s|%s|%s|%s\n' "$process_pid" "$process_starttime" \
+            "$process_exe" "$process_socket_identity" "$process_socket"
     done
+}
+
+sidecar_record_matches() {
+    ms_record=$1
+    ms_pid=${ms_record%%|*}; ms_rest=${ms_record#*|}
+    ms_start=${ms_rest%%|*}; ms_rest=${ms_rest#*|}
+    ms_exe=${ms_rest%%|*}; ms_rest=${ms_rest#*|}
+    ms_socket_identity=${ms_rest%%|*}; ms_socket=${ms_rest#*|}
+    test -d "/proc/$ms_pid" || return 1
+    test "$(readlink "/proc/$ms_pid/exe" 2>/dev/null || :)" = "$ms_exe" || return 1
+    test "$(proc_starttime "$ms_pid" 2>/dev/null || :)" = "$ms_start" || return 1
+    ms_command=$(tr '\000' ' ' <"/proc/$ms_pid/cmdline" 2>/dev/null) || return 1
+    case "$ms_command" in
+        *" --socket $ms_socket "*) ;;
+        *)
+            case "$ms_command" in
+                *" --socket $ms_socket") ;; *) return 1 ;;
+            esac
+            ;;
+    esac
+    test "$(stat -Lc '%d:%i' "$ms_socket" 2>/dev/null || :)" = \
+        "$ms_socket_identity"
 }
 
 retire_mutant_sidecars() {
     runtime_root=$1
-    sidecar_pids=$(mutant_sidecar_pids "$runtime_root")
-    for sidecar_pid in $sidecar_pids; do
-        kill -TERM "$sidecar_pid" 2>/dev/null
+    sidecar_records=$(mutant_sidecar_records "$runtime_root")
+    for sidecar_record in $sidecar_records; do
+        sidecar_record_matches "$sidecar_record" || continue
+        sidecar_pid=${sidecar_record%%|*}
+        kill -TERM "$sidecar_pid" 2>/dev/null || :
     done
+    remaining_records=$sidecar_records
     for _ in 1 2 3 4 5 6 7 8 9 10; do
-        sidecar_pids=$(mutant_sidecar_pids "$runtime_root")
-        test -z "$sidecar_pids" && return 0
+        still_matching=
+        for sidecar_record in $remaining_records; do
+            sidecar_record_matches "$sidecar_record" || continue
+            still_matching="$still_matching $sidecar_record"
+        done
+        remaining_records=$still_matching
+        test -z "$remaining_records" && return 0
         sleep 0.05
     done
-    for sidecar_pid in $sidecar_pids; do
-        kill -KILL "$sidecar_pid" 2>/dev/null
+    for sidecar_record in $remaining_records; do
+        sidecar_record_matches "$sidecar_record" || continue
+        sidecar_pid=${sidecar_record%%|*}
+        kill -KILL "$sidecar_pid" 2>/dev/null || :
     done
-    sidecar_pids=$(mutant_sidecar_pids "$runtime_root")
-    test -z "$sidecar_pids"
+    remaining_records=
+    for sidecar_record in $sidecar_records; do
+        sidecar_record_matches "$sidecar_record" || continue
+        remaining_records="$remaining_records $sidecar_record"
+    done
+    test -z "$remaining_records"
 }
 
 # Keep the runtime prefix short enough for the adapter's sockaddr_un path
@@ -172,14 +226,28 @@ interruption_log="$tmp_root/interruption.log"
 interruption_ready_trace="$tmp_root/interruption.ready"
 (
     interruption_child_pid=
-    interruption_cleanup() {
-        if test -n "$interruption_child_pid"; then
-            # The child is stopped only after the service's authenticated READY
-            # trace, so resume it before delivering the interruption signal.
-            kill -CONT "$interruption_child_pid" 2>/dev/null || :
-            kill -TERM "$interruption_child_pid" 2>/dev/null || :
-            wait "$interruption_child_pid" 2>/dev/null || :
+    stop_interruption_child() {
+        if test -z "$interruption_child_pid"; then
+            return 0
         fi
+        # Do not let a broken test binary make the cleanup regression hang.
+        # TERM is preferred; after a bounded grace period KILL is sent only
+        # while the exact wrapper-owned child PID is still present.
+        kill -CONT "$interruption_child_pid" 2>/dev/null || :
+        kill -TERM "$interruption_child_pid" 2>/dev/null || :
+        interruption_wait=0
+        while kill -0 "$interruption_child_pid" 2>/dev/null && \
+                test "$interruption_wait" -lt 40; do
+            sleep 0.05
+            interruption_wait=$((interruption_wait + 1))
+        done
+        if kill -0 "$interruption_child_pid" 2>/dev/null; then
+            kill -KILL "$interruption_child_pid" 2>/dev/null || :
+        fi
+        wait "$interruption_child_pid" 2>/dev/null || :
+    }
+    interruption_cleanup() {
+        stop_interruption_child
         retire_mutant_sidecars "$interruption_runtime_root" || exit 1
         rm -rf -- "$interruption_runtime_root" || exit 1
         exit 0
@@ -197,8 +265,8 @@ interruption_ready_trace="$tmp_root/interruption.ready"
     # the parent-side interruption deterministic while leaving the sidecar
     # and its socket available for ownership-scoped discovery.
     kill -STOP "$interruption_child_pid"
-    wait "$interruption_child_pid"
-    interruption_status=$?
+    stop_interruption_child
+    interruption_status=0
     retire_mutant_sidecars "$interruption_runtime_root" || exit 1
     rm -rf -- "$interruption_runtime_root" || exit 1
     exit "$interruption_status"

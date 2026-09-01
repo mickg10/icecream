@@ -125,6 +125,16 @@ if [ "$DISTRO" = ubuntu24 ] && [ -n "${S1B_APT_CACHE:-}" ]; then
         /*) ;;
         *) echo "FAIL: S1B_APT_CACHE must be an absolute host path" >&2; exit 2 ;;
     esac
+    case "$S1B_APT_CACHE" in
+        *[!A-Za-z0-9_./-]*)
+            echo "FAIL: S1B_APT_CACHE contains unsafe path characters" >&2
+            exit 2
+            ;;
+        /|/tmp|/var|/home|/root)
+            echo "FAIL: S1B_APT_CACHE is an unsafe broad directory" >&2
+            exit 2
+            ;;
+    esac
     mkdir -p "$S1B_APT_CACHE/lists" "$S1B_APT_CACHE/archives"
     APT_NO_CLEAN="$S1B_APT_CACHE/docker-clean"
     if [ ! -e "$APT_NO_CLEAN" ]; then
@@ -331,7 +341,7 @@ case "$DISTRO" in
             DEP_INSTALL="dependency_bootstrap() {
                 dep_attempt=1
                 while [ \"\$dep_attempt\" -le 3 ]; do
-                    if DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Post-Invoke::= -o APT::Update::Post-Invoke::= install -y $DEP_PACKAGES > /build/dependency-bootstrap.log 2>&1; then
+                    if timeout 180s env DEBIAN_FRONTEND=noninteractive apt-get --no-download -o DPkg::Post-Invoke::= -o APT::Update::Post-Invoke::= install -y $DEP_PACKAGES > /build/dependency-bootstrap.log 2>&1; then
                         return 0
                     fi
                     if [ \"\$dep_attempt\" = 3 ]; then
@@ -347,7 +357,7 @@ case "$DISTRO" in
             DEP_INSTALL="dependency_bootstrap() {
                 dep_attempt=1
                 while [ \"\$dep_attempt\" -le 3 ]; do
-                    if apt-get -o DPkg::Post-Invoke::= -o APT::Update::Post-Invoke::= update > /build/dependency-bootstrap.log 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Post-Invoke::= -o APT::Update::Post-Invoke::= install -y $DEP_PACKAGES >> /build/dependency-bootstrap.log 2>&1; then
+                    if timeout 180s apt-get -o DPkg::Post-Invoke::= -o APT::Update::Post-Invoke::= update > /build/dependency-bootstrap.log 2>&1 && timeout 180s env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Post-Invoke::= -o APT::Update::Post-Invoke::= install -y $DEP_PACKAGES >> /build/dependency-bootstrap.log 2>&1; then
                         return 0
                     fi
                     if [ \"\$dep_attempt\" = 3 ]; then
@@ -377,6 +387,19 @@ case "$DISTRO" in
         ;;
 esac
 set -- $DEP_PACKAGES; DEP_PACKAGE_COUNT=$#
+if [ "$DISTRO" = ubuntu24 ] && [ "$APT_CACHE_READY" = true ]; then
+    cached_deb_count=$(find "$S1B_APT_CACHE/archives" -type f -name '*.deb' -print 2>/dev/null | wc -l)
+    case "$cached_deb_count" in
+        ''|*[!0-9]*)
+            echo "FAIL: $DISTRO apt cache payload count is not numeric" >&2
+            exit 1
+            ;;
+    esac
+    if [ "$cached_deb_count" -lt "$DEP_PACKAGE_COUNT" ]; then
+        echo "FAIL: $DISTRO apt cache has $cached_deb_count .deb payloads; $DEP_PACKAGE_COUNT direct packages required" >&2
+        exit 1
+    fi
+fi
 
 if [ "$MODE" = corrupt-control ] && [ "$CORRUPT_ARTIFACT" = image-digest ]; then
     # Substitute a KNOWN-locally-built-only image for JUST this digest

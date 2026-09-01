@@ -109,6 +109,7 @@ for arg in "${@:5}"; do
 done
 
 S1B_MEMBERS="distro_installed_identity.sh distro_installed_identity_gates.sh s1b_validate_installed_facts.py distro_probe.sh S1B_EXIT_MANIFEST.md"
+S1B_APT_REQUIRED_DEBS=14
 DIST_IMAGE=icecream/farm-node:ubuntu22-gcc11-boost174
 S1B_DIST_CONFIGURE_ARGS=${S1B_DIST_CONFIGURE_ARGS:---without-man}
 S1B_SOURCE_DATE_EPOCH=$(git -C "$REPO" show -s --format=%ct "$COMMIT")
@@ -367,9 +368,10 @@ sentinel_gate_one_distro() {
         return 1
     fi
     if [ "$d" = ubuntu24 ] && [ -n "${S1B_APT_CACHE:-}" ]; then
+        cached_deb_count=$(find "$S1B_APT_CACHE/archives" -type f -name '*.deb' -print 2>/dev/null | wc -l)
         if ! find "$S1B_APT_CACHE/lists" -type f -print -quit | grep -q . || \
-           ! find "$S1B_APT_CACHE/archives" -type f -name '*.deb' -print -quit | grep -q .; then
-            echo "RED ($d): normal sentinel did not produce a complete shared apt cache (lists and .debs required)" >&2
+           [ "$cached_deb_count" -lt "$S1B_APT_REQUIRED_DEBS" ]; then
+            echo "RED ($d): normal sentinel did not produce a complete shared apt cache (lists and at least $S1B_APT_REQUIRED_DEBS .debs required)" >&2
             return 1
         fi
         export S1B_APT_CACHE_READY=true
