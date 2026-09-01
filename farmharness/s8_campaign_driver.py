@@ -1032,8 +1032,6 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
         if raw_witness_spec is None or raw_engine_spec is None:
             raise CampaignError(
                 "raw_ii:control_baseline_requires_witness_and_engine_template")
-        if execute:
-            raise CampaignError("raw_ii:control_baseline_execution_not_integrated")
         for raw_cell in raw_cells:
             witness = _format_path(raw_witness_spec, raw_cell)
             engine = _format_path(raw_engine_spec, raw_cell)
@@ -1042,6 +1040,8 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
                 _private_file(engine, "raw_ii_engine_manifest")
             except CampaignError as exc:
                 raise CampaignError(f"raw_ii:control_input_invalid:{exc}") from exc
+        if execute:
+            raise CampaignError("raw_ii:control_baseline_execution_not_integrated")
     if mode == EXTERNAL_FARM_MODE:
         authority_sources = sum(item is not None for item in (
             external_farm_authority, external_authority_provider,
