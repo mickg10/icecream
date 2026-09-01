@@ -212,19 +212,26 @@ def _full2_marker(manifest: Mapping[str, Any], summary: Mapping[str, Any],
             predecessor_bundle.get("experiment") != predecessor_path):
         return _not_proven("predecessor_manifest_digest_mismatch")
     predecessor_run_identity = predecessor_manifest.get("run_identity")
-    if (predecessor_manifest.get("schema") != simulator.SCHEMA or
+    predecessor_topology = predecessor_manifest.get("topology")
+    predecessor_summary_topology = predecessor_summary.get("topology")
+    if (not isinstance(predecessor_topology, Mapping) or
+            not isinstance(predecessor_summary_topology, Mapping) or
+            predecessor_manifest.get("schema") != simulator.SCHEMA or
             predecessor_manifest.get("experiment") != Path(predecessor_path).name or
             predecessor_manifest.get("repeat_full") is not False or
-            predecessor_manifest.get("topology", {}).get("id") != topology or
+            predecessor_topology.get("id") != topology or
             predecessor_run_identity != dict(predecessor_identity) or
             not _valid_run_identity(predecessor_run_identity, topology=topology,
                                     depth="full-1") or
             predecessor_summary.get("schema") != simulator.SUMMARY_SCHEMA or
-            predecessor_summary.get("topology", {}).get("id") != topology):
+            predecessor_summary_topology.get("id") != topology):
         return _not_proven("predecessor_run_identity_mismatch")
-    predecessor_inputs = predecessor_manifest.get("input_authority", {}).get("selected_inputs", [])
+    predecessor_input_authority = predecessor_manifest.get("input_authority")
+    predecessor_inputs = (predecessor_input_authority.get("selected_inputs", [])
+                          if isinstance(predecessor_input_authority, Mapping) else None)
     predecessor_authority = predecessor_manifest.get("assignment_authority")
-    if (selected_inputs != predecessor_inputs or predecessor_assignment != predecessor_authority):
+    if (not isinstance(predecessor_inputs, list) or
+            selected_inputs != predecessor_inputs or predecessor_assignment != predecessor_authority):
         return _not_proven("predecessor_input_assignment_mismatch")
     current_authority = manifest.get("assignment_authority")
     if not isinstance(current_authority, Mapping) or current_authority.get("topology") != topology:
