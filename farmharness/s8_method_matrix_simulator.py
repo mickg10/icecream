@@ -1391,7 +1391,12 @@ class MethodMatrixSimulator:
             wall_ns = cpu_ns
             row["measurement_scope"] = "native_endpoint_transaction"
             row["wire_witnessed"] = True
-            native_tu_seq = int(product["tu_seq"])
+            native_tu_seq = product.get("tu_seq")
+            authority_tu_seq = assignment.get("authority_tu_seq")
+            if (type(native_tu_seq) is not int or native_tu_seq < 0 or
+                    type(authority_tu_seq) is not int or authority_tu_seq < 0 or
+                    native_tu_seq != authority_tu_seq):
+                raise MatrixError("native product TU sequence authority mismatch")
             native_rel_seq = product.get("_native_rel_seq")
             if native_rel_seq is None:
                 # A direct product canary may provide the public REL field,

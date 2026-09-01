@@ -229,7 +229,7 @@ def test_large_route_rows_keep_fixed_size_prefix_evidence() -> None:
         rows.append(matrix._run_occurrence(
             None, Occurrence(ordinal, b"x" * (1 << 20)),
             {"relationship_key": ["C0", "F0"], "relationship_index": 0,
-             "slot": 0, "global_slot": 0}, "ZSTD_ROUTE", state,
+             "slot": 0, "global_slot": 0, "authority_tu_seq": ordinal}, "ZSTD_ROUTE", state,
             raw_override=b"x" * (1 << 20)))
     raw = ("\n".join(json.dumps(row, separators=(",", ":")) for row in rows)).encode()
     assert len(raw) < 400_000
@@ -261,7 +261,7 @@ def test_route_bytearray_runtime_state_does_not_advance_on_tentative_row() -> No
     matrix._run_occurrence(
         None, Occurrence(0, b"candidate", commit=False),
         {"relationship_key": ["C0", "F0"], "relationship_index": 0,
-         "slot": 0, "global_slot": 0}, "ZSTD_ROUTE", state,
+         "slot": 0, "global_slot": 0, "authority_tu_seq": 0}, "ZSTD_ROUTE", state,
         raw_override=b"candidate")
     assert state.history == bytearray(b"seed")
 
@@ -300,7 +300,7 @@ for ordinal in range(COUNT):
     rows.append(matrix._run_occurrence(
         None, s.Occurrence(ordinal, b"x" * (1 << 20)),
         {"relationship_key": ["C0", "F0"], "relationship_index": 0,
-         "slot": 0, "global_slot": 0}, "ZSTD_ROUTE", state,
+         "slot": 0, "global_slot": 0, "authority_tu_seq": ordinal}, "ZSTD_ROUTE", state,
         raw_override=b"x" * (1 << 20)))
 wire = ("\n".join(json.dumps(row, separators=(",", ":")) for row in rows)).encode()
 assert b'"committed_raw_prefix":' not in wire
@@ -975,10 +975,56 @@ def test_direct_native_product_rel_evidence_fails_closed(
     state = simulator_module._RelationshipState(
         ("C0", "F0"), next_rel_seq=1, native_next_rel_seq=1)
     assignment = {"relationship_key": ["C0", "F0"], "relationship_index": 0,
-                  "slot": 0, "global_slot": 0}
+                  "slot": 0, "global_slot": 0, "authority_tu_seq": 0}
     with pytest.raises(MatrixError, match="REL"):
         matrix._run_occurrence(None, Occurrence(0, b"payload"), assignment,
                                "P29", state, raw_override=b"payload")
+
+
+@pytest.mark.parametrize("mutation", (
+    "missing_product", "string_product", "bool_product", "mismatch_product",
+    "missing_authority", "string_authority", "bool_authority", "mismatch_authority",
+    "valid_nonzero"))
+def test_direct_native_product_tu_evidence_binds_assignment(
+        mutation: str) -> None:
+    matrix = MethodMatrixSimulator(MatrixTopology.from_id("C1F1/100000"),
+                                   methods=("P29",))
+    matrix.authority["P29"]["status"] = "READY"
+    product: dict[str, object] = {
+        "tu_seq": 41, "rel_seq": 1, "_native_rel_seq": 1,
+        "state_before_digest": "a" * 32, "state_digest": "b" * 32,
+        "transaction_digest": "d" * 32, "encoded_source_bytes": 1,
+        "simulator_execution_ns": 1, "committed": True}
+    assignment: dict[str, object] = {
+        "relationship_key": ["C0", "F0"], "relationship_index": 0,
+        "slot": 0, "global_slot": 0, "authority_tu_seq": 41}
+    if mutation == "missing_product":
+        del product["tu_seq"]
+    elif mutation == "string_product":
+        product["tu_seq"] = "41"
+    elif mutation == "bool_product":
+        product["tu_seq"] = True
+    elif mutation == "mismatch_product":
+        product["tu_seq"] = 42
+    elif mutation == "missing_authority":
+        del assignment["authority_tu_seq"]
+    elif mutation == "string_authority":
+        assignment["authority_tu_seq"] = "41"
+    elif mutation == "bool_authority":
+        assignment["authority_tu_seq"] = True
+    elif mutation == "mismatch_authority":
+        assignment["authority_tu_seq"] = 42
+    matrix._native_rows["P29"] = {0: product}
+    state = simulator_module._RelationshipState(
+        ("C0", "F0"), next_rel_seq=1, native_next_rel_seq=1)
+    if mutation == "valid_nonzero":
+        row = matrix._run_occurrence(None, Occurrence(0, b"payload"), assignment,
+                                     "P29", state, raw_override=b"payload")
+        assert row["native_tu_seq"] == 41
+    else:
+        with pytest.raises(MatrixError, match="TU sequence"):
+            matrix._run_occurrence(None, Occurrence(0, b"payload"), assignment,
+                                   "P29", state, raw_override=b"payload")
 
 
 @pytest.mark.parametrize("topology_id", ("C1F1/100000", "C1F20/40"))

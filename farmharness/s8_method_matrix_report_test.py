@@ -327,7 +327,7 @@ def test_simulator_route_transaction_preserves_pre_prefix() -> None:
     row = matrix._run_occurrence(
         None, simulator.Occurrence(0, b"next"),
         {"relationship_key": ["C0", "F0"], "relationship_index": 0,
-         "slot": 0, "global_slot": 0}, "ZSTD_ROUTE", state,
+         "slot": 0, "global_slot": 0, "authority_tu_seq": 5}, "ZSTD_ROUTE", state,
         raw_override=b"next")
     transaction = row["product_transaction"]
     assert isinstance(transaction, dict)
