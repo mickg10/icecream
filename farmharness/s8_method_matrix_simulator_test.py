@@ -16,6 +16,7 @@ from s8_method_matrix_simulator import (
     MatrixError,
     MatrixTopology,
     MethodMatrixSimulator,
+    NotReady,
     Occurrence,
     assign_relationships,
     repeat_full_state_contract,
@@ -23,6 +24,7 @@ from s8_method_matrix_simulator import (
     firefox_occurrences,
     verify_experiment,
     _libbsc_authority,
+    _native_batch_timeout_seconds,
     write_not_ready_canary,
 )
 
@@ -456,6 +458,66 @@ def test_native_batch_rejects_duplicate_output_ordinal(tmp_path: Path,
     monkeypatch.setattr(simulator_module.subprocess, "run", duplicate_output)
     with pytest.raises(MatrixError, match="duplicate ordinal"):
         simulator_module._native_batch([occurrence], topology, assignment, "ZSTD_TU")
+
+
+@pytest.mark.parametrize(("transaction_count", "expected_timeout"), (
+    pytest.param(3, 600, id="three"),
+    pytest.param(100, 1000, id="depth100"),
+    pytest.param(200, 2000, id="depth200"),
+    pytest.param(2498, 24980, id="full1"),
+    pytest.param(4996, 49960, id="full2"),
+))
+def test_native_batch_timeout_scales_with_authenticated_transaction_count(
+        transaction_count: int, expected_timeout: int) -> None:
+    assert _native_batch_timeout_seconds(transaction_count) == expected_timeout
+
+
+def test_native_batch_timeout_is_fail_closed_and_includes_full2_segments(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source_paths = []
+    for index in range(6):
+        source = tmp_path / f"unit-{index}.ii"
+        source.write_bytes(f"native payload {index}".encode())
+        source_paths.append(source)
+
+    def occurrence(index: int) -> Occurrence:
+        raw = source_paths[index].read_bytes()
+        return Occurrence(index, None, source_path=str(source_paths[index]),
+                          source_relative=source_paths[index].name,
+                          source_sha256=hashlib.sha256(raw).hexdigest(),
+                          source_digest128=simulator_module._digest128(raw))
+
+    topology = MatrixTopology.from_id("C1F20/40")
+
+    def assignment() -> dict[str, object]:
+        return {"status": "READY", "topology": topology.topology_id,
+                "selected_count": 3,
+                "rows": [{"ordinal": index, "global_slot": 0,
+                           "f_relationship": 0, "per_f_slot": 0,
+                           "dispatch_order": index,
+                           "authority_dispatch_order": index}
+                          for index in range(3)]}
+
+    binary = (Path(simulator_module.__file__).resolve().parents[1] /
+              "cache" / "sim" / ".p50sim.bin")
+    original_is_file = Path.is_file
+
+    def is_file(path: Path) -> bool:
+        return path == binary or original_is_file(path)
+
+    def timeout(*args: object, **kwargs: object) -> object:
+        assert kwargs["timeout"] == 600
+        command = args[0] if args else kwargs["args"]
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(Path, "is_file", is_file)
+    monkeypatch.setattr(simulator_module.subprocess, "run", timeout)
+    with pytest.raises(NotReady,
+                       match=r"method=P29 transactions=6 timeout=600s"):
+        simulator_module._native_batch(
+            [occurrence(index) for index in range(3, 6)], topology, assignment(), "P29",
+            predecessor_occurrences=[occurrence(index) for index in range(3)],
+            predecessor_assignment=assignment())
 
 
 def test_native_route_prefix_key_set_is_exact_and_nonroute_has_none() -> None:

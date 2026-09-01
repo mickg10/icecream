@@ -48,6 +48,8 @@ STATEFUL_METHODS = frozenset(("ZSTD_ROUTE", "P29", "GRZ_RESIDUAL"))
 TOPOLOGY_IDS = ("C1F1/100000", "C1F20/40")
 DEFAULT_HISTORY_BYTES = 128 << 20
 MAX_HISTORY_WINDOW_LOG = 27
+NATIVE_BATCH_TIMEOUT_FLOOR_SECONDS = 600
+NATIVE_BATCH_SECONDS_PER_TRANSACTION = 10
 PREFIX_DESCRIPTOR_SCHEMA = "icecream-s8-route-prefix-descriptor-v1"
 AUTH_TRACE_SHA256 = "9fa7124f63212ccfd78f139dc05dcc5b2737ef868dc3e6878e64f609e079e960"
 AUTH_CORPUS_MANIFEST_SHA256 = "cbca563b6efe3255382db61b490ba948f3d2cdc0d95b793317f7d0134ec6f3fa"
@@ -76,6 +78,14 @@ class MatrixError(ValueError):
 
 class NotReady(MatrixError):
     """A method was requested without its independent authority."""
+
+
+def _native_batch_timeout_seconds(transaction_count: int) -> int:
+    """Return the deterministic native timeout for an authenticated batch."""
+    if type(transaction_count) is not int or transaction_count < 0:
+        raise MatrixError("native batch transaction count invalid")
+    return max(NATIVE_BATCH_TIMEOUT_FLOOR_SECONDS,
+               NATIVE_BATCH_SECONDS_PER_TRANSACTION * transaction_count)
 
 
 def _validate_method_selection(methods: Iterable[str]) -> tuple[str, ...]:
@@ -440,6 +450,8 @@ def _native_batch(occurrences: Sequence[Occurrence], topology: MatrixTopology,
     predecessor_rows = (predecessor_assignment or {}).get("rows", [])
     if not isinstance(predecessor_rows, list) or len(predecessor_rows) != len(predecessor_occurrences):
         raise MatrixError("repeat-full predecessor assignment/stream length mismatch")
+    transaction_count = len(occurrences) + len(predecessor_occurrences)
+    timeout_seconds = _native_batch_timeout_seconds(transaction_count)
     with tempfile.TemporaryDirectory(prefix="s8-product-batch-") as scratch:
         scratch_path = Path(scratch)
         manifest = scratch_path / "inputs.manifest"
@@ -473,10 +485,18 @@ def _native_batch(occurrences: Sequence[Occurrence], topology: MatrixTopology,
         command += ["--batch-output", str(output), "--batch-allow-repeated-inputs", "1"]
         environment = dict(os.environ)
         environment["ICECC_P50_PROFILE"] = method
-        completed = subprocess.run(
-            command,
-            env=environment, check=False,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600)
+        try:
+            completed = subprocess.run(
+                command,
+                env=environment, check=False,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            raise NotReady(
+                "native product batch timed out: "
+                f"method={method} transactions={transaction_count} "
+                f"timeout={timeout_seconds}s"
+            ) from None
         if completed.returncode != 0:
             raise NotReady("native product transaction failed: " +
                            completed.stderr.decode("utf-8", "replace")[:300])
