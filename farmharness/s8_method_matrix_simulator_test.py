@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import s8_method_matrix_simulator as simulator_module
 
 from s8_method_matrix_simulator import (
     CORE_METHODS,
@@ -19,6 +20,7 @@ from s8_method_matrix_simulator import (
     firefox_occurrences,
     verify_experiment,
     _libbsc_authority,
+    write_not_ready_canary,
 )
 
 
@@ -162,6 +164,24 @@ def test_raw_control_retains_no_copy_and_runs_are_collision_safe(tmp_path: Path,
         assert row["codec_wall_ns"] is None
 
 
+def test_not_ready_runs_are_collision_safe_and_identity_bound(tmp_path: Path,
+                                                              monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(simulator_module, "_stamp", lambda: "20260901T120000Z")
+    trace = tmp_path / "missing.tsv"
+    first = write_not_ready_canary(tmp_path, trace,
+        topology=MatrixTopology.from_id("C1F1/100000"), count=100,
+        depth="100", reason="missing")
+    second = write_not_ready_canary(tmp_path, trace,
+        topology=MatrixTopology.from_id("C1F1/100000"), count=100,
+        depth="100", reason="missing")
+    assert first != second
+    assert first.name.endswith("-100-not-ready")
+    assert second.name.endswith("-r01")
+    identity = json.loads((first / "manifest.json").read_text())["run_identity"]
+    assert identity == {"timestamp": "20260901T120000Z", "topology": "C1F1/100000",
+                        "depth": "100", "pass": "not-ready"}
+
+
 def test_cohort_requires_its_own_authenticated_dictionary_authority() -> None:
     topology = MatrixTopology.from_id("C1F1/100000")
     with pytest.raises(Exception, match="dictionary authority"):
@@ -239,3 +259,17 @@ def test_native_repeat_full_carries_state_with_changed_assignment_map(tmp_path: 
     assert result["status"] == "PARTIAL_NOT_READY"
     assert result["core_completion"]["status"] == "INCOMPLETE_REQUESTED_SUBSET"
     assert [row["product_transaction"]["tu_seq"] for row in result["rows"]] == [0, 2]
+    assert all(row["wire_witnessed"] is True for row in result["rows"])
+
+
+def test_synthetic_codec_is_not_claimed_as_wire_evidence(tmp_path: Path) -> None:
+    experiment = MethodMatrixSimulator(
+        MatrixTopology.from_id("C1F1/100000"), methods=("ZSTD_TU",)).run(
+            [Occurrence(0, b"payload")], output_root=tmp_path,
+            timestamp="20260901T120000Z", depth="100")
+    row = json.loads((experiment / "occurrences.jsonl").read_text())
+    summary = json.loads((experiment / "summary.json").read_text())
+    assert row["measurement_scope"] == "native_codec_witnessed"
+    assert row["wire_witnessed"] is False
+    assert "product_transaction" not in row
+    assert summary["totals"]["ZSTD_TU"]["wire_witnessed"] is False

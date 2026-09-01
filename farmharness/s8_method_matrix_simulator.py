@@ -831,7 +831,8 @@ class MethodMatrixSimulator:
             "raw_path": str(raw_path.relative_to(experiment)) if raw_path and experiment else None,
             "status": self.authority[method]["status"], "committed": False,
             "measurement_scope": ("raw_bytes_only_no_wire_witness" if method == "RAW_II"
-                                   else "native_endpoint_transaction"),
+                                   else "native_codec_witnessed"),
+            "wire_witnessed": False,
             "encoded_bytes": None, "encoded_sha256": None, "encoded_path": None,
             "codec_cpu_ns": None, "codec_wall_ns": None, "transition": "not_run",
             "pre_state_digest": pre, "post_state_digest": pre,
@@ -879,6 +880,8 @@ class MethodMatrixSimulator:
             encoded = b""
             cpu_ns = int(product["simulator_execution_ns"])
             wall_ns = cpu_ns
+            row["measurement_scope"] = "native_endpoint_transaction"
+            row["wire_witnessed"] = True
         else:
             encoded, cpu_ns, wall_ns = self._encode(method, raw, encode_state)
         if experiment is not None and product is None and method != "RAW_II":
@@ -987,7 +990,8 @@ class MethodMatrixSimulator:
                 "execution_ns": (None if method == "RAW_II" else
                                   sum(int(row.get("product_transaction", {}).get("simulator_execution_ns", 0))
                                       for row in selected)),
-                "wire_witnessed": method != "RAW_II",
+                "wire_witnessed": bool(selected) and all(
+                    bool(row.get("wire_witnessed")) for row in selected),
                 "c_to_f_bytes": (None if method == "RAW_II" else
                                   sum(int(row.get("product_transaction", {}).get("c_to_f_bytes", 0))
                                       for row in selected)),
@@ -1142,9 +1146,19 @@ def firefox_occurrences(trace: Path, *, count: int = 100, dispatch_start: int = 
 
 
 def write_not_ready_canary(output_root: Path, trace: Path, *, topology: MatrixTopology,
-                           count: int, reason: str) -> Path:
+                           count: int, reason: str, depth: str | None = None,
+                           pass_id: str | None = None) -> Path:
     """Write an immutable readiness experiment when Firefox inputs are absent."""
-    experiment = output_root.absolute() / f"{_stamp()}-{topology.topology_id.split('/')[0]}"
+    run_timestamp = _stamp()
+    depth_label = depth or f"count-{count}"
+    pass_label = pass_id or "not-ready"
+    run_label = run_timestamp + "-" + topology.topology_id.replace("/", "-") + \
+        "-" + depth_label + "-" + pass_label
+    experiment = output_root.absolute() / run_label
+    suffix = 1
+    while experiment.exists():
+        experiment = output_root.absolute() / f"{run_label}-r{suffix:02d}"
+        suffix += 1
     experiment.mkdir(parents=True, exist_ok=False)
     (experiment / "occurrences.jsonl").write_bytes(b"")
     authority = {method: method_authority(method) for method in METHODS}
@@ -1153,7 +1167,8 @@ def write_not_ready_canary(output_root: Path, trace: Path, *, topology: MatrixTo
         "slots_per_f": topology.slots_per_f, "global_slots": topology.global_slots},
         "methods": list(METHODS), "input_authority": {"trace": str(trace),
         "trace_exists": trace.is_file(), "requested_tus": count}, "authority": authority,
-        "reason": reason}
+        "reason": reason, "run_identity": {"timestamp": run_timestamp,
+        "topology": topology.topology_id, "depth": depth_label, "pass": pass_label}}
     (experiment / "manifest.json").write_bytes(_canonical(manifest))
     (experiment / "summary.json").write_bytes(_canonical({
         "schema": SUMMARY_SCHEMA, "status": "NOT_READY", "experiment": str(experiment),
@@ -1171,15 +1186,39 @@ def write_not_ready_canary(output_root: Path, trace: Path, *, topology: MatrixTo
 
 def _authenticated_predecessor_plan(path: Path, topology_id: str) -> tuple[dict[str, object], dict[str, object]]:
     """Load only authenticated full-1 state/plan; payloads stay external."""
+    if not path.is_dir():
+        raise MatrixError("repeat-full predecessor experiment is unavailable")
+    # This is the single experiment verifier used by the normal replay path;
+    # do not create a weaker predecessor-only integrity checker.
+    verify_experiment(path)
     try:
         manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
         summary = json.loads((path / "summary.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise MatrixError("repeat-full predecessor manifest/summary is unavailable") from exc
+    run_identity = manifest.get("run_identity")
     if (manifest.get("schema") != SCHEMA or summary.get("schema") != SUMMARY_SCHEMA or
             manifest.get("topology", {}).get("id") != topology_id or
-            manifest.get("repeat_full") is not False):
+            manifest.get("repeat_full") is not False or
+            not isinstance(run_identity, Mapping) or
+            run_identity.get("topology") != topology_id or
+            run_identity.get("depth") != "full-1"):
         raise MatrixError("repeat-full predecessor is not an authenticated full-1 experiment")
+    artifacts = manifest.get("artifacts")
+    if (not isinstance(artifacts, Mapping) or
+            not isinstance(artifacts.get("summary.json"), Mapping) or
+            not isinstance(artifacts.get("occurrences.jsonl"), Mapping) or
+            int(summary.get("occurrence_rows", 0)) <= 0 or
+            not manifest.get("row_order")):
+        raise MatrixError("repeat-full predecessor artifacts/state are incomplete")
+    relationships = summary.get("relationships", {}).get("ZSTD_ROUTE", {})
+    if (not isinstance(relationships, Mapping) or
+            len(relationships) != MatrixTopology.from_id(topology_id).relationship_count or
+            not all(isinstance(value, Mapping) and int(value.get("next_rel_seq", 0)) > 0
+                    for value in relationships.values())):
+        raise MatrixError("repeat-full predecessor relationship state is incomplete")
+    if summary.get("experiment") != str(path):
+        raise MatrixError("repeat-full predecessor summary binding is invalid")
     authority = manifest.get("assignment_authority")
     if not isinstance(authority, Mapping) or authority.get("topology") != topology_id:
         raise MatrixError("repeat-full predecessor assignment authority is missing")
@@ -1187,6 +1226,16 @@ def _authenticated_predecessor_plan(path: Path, topology_id: str) -> tuple[dict[
     facts = _private_digest(Path(str(authority.get("path", ""))), "predecessor_assignment")
     if facts.get("sha256") != expected or authority.get("sha256") != expected:
         raise MatrixError("repeat-full predecessor assignment authority changed")
+    if int(authority.get("selected_count", 0)) != 2498 or \
+            int(authority.get("authority_total_rows", 0)) < 2498:
+        raise MatrixError("repeat-full predecessor assignment slice is incomplete")
+    input_authority = manifest.get("input_authority")
+    selected_inputs = input_authority.get("selected_inputs", []) if isinstance(input_authority, Mapping) else []
+    if (not isinstance(input_authority, Mapping) or
+            input_authority.get("trace_sha256") != AUTH_TRACE_SHA256 or
+            input_authority.get("corpus_manifest_sha256") != AUTH_CORPUS_MANIFEST_SHA256 or
+            len(selected_inputs) != 2498):
+        raise MatrixError("repeat-full predecessor input authority is incomplete")
     return summary, dict(authority)
 
 
@@ -1238,7 +1287,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             path = write_not_ready_canary(args.output_root, args.firefox_trace,
                                           topology=topology, count=count,
                                           reason="MISSING_AUTHORITY: " + (reason or
-                                              "authenticated Firefox .ii inputs are unavailable"))
+                                              "authenticated Firefox .ii inputs are unavailable"),
+                                          depth=args.depth or f"count-{count}")
             print(path)
             continue
         path = MethodMatrixSimulator(topology).run(occurrences, output_root=args.output_root,
