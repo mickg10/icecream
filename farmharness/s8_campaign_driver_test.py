@@ -194,6 +194,64 @@ def test_predictive_campaign_retains_all_cells_commands_hashes_and_summary(tmp_p
         assert state["result"]["artifacts"]
 
 
+def test_campaign_can_select_c1f1_only_without_changing_default_grid(tmp_path: Path) -> None:
+    runner, calls = _runner_factory()
+    campaign = driver.run_campaign(
+        **_kwargs(tmp_path), selected_topologies=("C1F1/100000",),
+        command_runner=runner, timestamp="20260829T120010Z")
+    summary = json.loads((campaign / "summary.json").read_text())
+    metadata = json.loads((campaign / "campaign.json").read_text())
+    assert summary["status"] == "PASS"
+    assert summary["expected_cells"] == 8
+    assert summary["counts"]["PASS"] == 8
+    assert len(calls) == 16
+    assert metadata["config"]["selected_profiles"] == list(driver.PROFILES)
+    assert metadata["config"]["selected_topologies"] == ["C1F1/100000"]
+    assert metadata["matrix"]["expected_cells"] == 8
+    assert all(row["cell"]["topology"] == "C1F1/100000"
+               for row in summary["cells"])
+
+
+def test_campaign_can_select_one_profile_and_topology(tmp_path: Path) -> None:
+    runner, calls = _runner_factory()
+    campaign = driver.run_campaign(
+        **_kwargs(tmp_path), selected_profiles=("P29",),
+        selected_topologies=("C1F20/40",), command_runner=runner,
+        timestamp="20260829T120011Z")
+    summary = json.loads((campaign / "summary.json").read_text())
+    assert summary["expected_cells"] == 2
+    assert summary["counts"]["PASS"] == 2
+    assert len(calls) == 4
+    assert {(row["cell"]["profile"], row["cell"]["regime"], row["cell"]["topology"])
+            for row in summary["cells"]} == {
+                ("P29", "cold", "C1F20/40"),
+                ("P29", "warm", "C1F20/40"),
+            }
+
+
+def test_campaign_selection_rejects_empty_unknown_and_duplicate_values() -> None:
+    with pytest.raises(driver.CampaignError, match="profiles:selection_empty"):
+        driver.cells("fmt", selected_profiles=())
+    with pytest.raises(driver.CampaignError, match="topologies:undeclared"):
+        driver.cells("fmt", selected_topologies=("C1F99/1",))
+    with pytest.raises(driver.CampaignError, match="profiles:selection_duplicate"):
+        driver.cells("fmt", selected_profiles=("P29", "P29"))
+    with pytest.raises(driver.CampaignError, match="topologies:selection_invalid"):
+        driver.cells("fmt", selected_topologies="C1F1/100000")  # type: ignore[arg-type]
+
+
+def test_resume_rejects_changed_selected_dimensions(tmp_path: Path) -> None:
+    runner, _ = _runner_factory()
+    original = _kwargs(tmp_path, selected_profiles=("P29",),
+                       selected_topologies=("C1F1/100000",))
+    campaign = driver.run_campaign(**original, command_runner=runner,
+                                   timestamp="20260829T120012Z")
+    changed = _kwargs(tmp_path, selected_profiles=("GRZ_RESIDUAL",),
+                      selected_topologies=("C1F1/100000",))
+    with pytest.raises(driver.CampaignError, match="configuration_mismatch"):
+        driver.run_campaign(**changed, resume=campaign, command_runner=runner)
+
+
 def test_campaign_failure_is_honest_and_resume_keeps_old_attempt(tmp_path: Path) -> None:
     failing_runner, _ = _runner_factory(fail_producer=4)
     kwargs = _kwargs(tmp_path)

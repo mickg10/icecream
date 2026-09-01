@@ -98,12 +98,37 @@ def _validate_cell(cell: dict[str, str]) -> None:
         raise CampaignError("cell:undeclared")
 
 
-def cells(corpus: str) -> list[dict[str, str]]:
+def _selected_dimension(name: str, declared: Sequence[str],
+                        selected: Sequence[str] | None) -> tuple[str, ...]:
+    if selected is None:
+        return tuple(declared)
+    if isinstance(selected, (str, bytes)):
+        raise CampaignError(f"{name}:selection_invalid")
+    values = list(selected)
+    if not values:
+        raise CampaignError(f"{name}:selection_empty")
+    if any(not isinstance(value, str) or not value for value in values):
+        raise CampaignError(f"{name}:selection_invalid")
+    if len(set(values)) != len(values):
+        raise CampaignError(f"{name}:selection_duplicate")
+    unknown = [value for value in values if value not in declared]
+    if unknown:
+        raise CampaignError(f"{name}:undeclared:{unknown[0]}")
+    # Canonical declaration order makes equivalent CLI permutations produce
+    # identical cells, manifests, and resume identities.
+    selected_set = set(values)
+    return tuple(value for value in declared if value in selected_set)
+
+
+def cells(corpus: str, *, selected_profiles: Sequence[str] | None = None,
+          selected_topologies: Sequence[str] | None = None) -> list[dict[str, str]]:
     if corpus not in CORPORA:
         raise CampaignError("corpus:undeclared")
+    profiles = _selected_dimension("profiles", PROFILES, selected_profiles)
+    topologies = _selected_dimension("topologies", TOPOLOGIES, selected_topologies)
     return [{"corpus": corpus, "profile": profile, "regime": regime,
              "topology": topology}
-            for profile in PROFILES for regime in REGIMES for topology in TOPOLOGIES]
+            for profile in profiles for regime in REGIMES for topology in topologies]
 
 
 def _format_path(spec: str | Path, cell: dict[str, str]) -> Path:
@@ -113,6 +138,13 @@ def _format_path(spec: str | Path, cell: dict[str, str]) -> Path:
         return Path(str(spec).format(**values)).expanduser().absolute()
     except (KeyError, ValueError) as exc:
         raise CampaignError(f"path_template:invalid:{spec}") from exc
+
+
+def _csv_selection(value: str) -> list[str]:
+    values = [item.strip() for item in value.split(",")]
+    if not values or any(not item for item in values):
+        raise argparse.ArgumentTypeError("selection values must be nonempty")
+    return values
 
 
 def _write_new(path: Path, raw: bytes) -> None:
@@ -710,7 +742,11 @@ def _load_json(path: Path) -> dict[str, Any]:
 def _summary(campaign: Path, cell_records: list[dict[str, Any]], config: dict[str, object]) -> dict[str, object]:
     by_cell = {str(row.get("cell_id", row.get("cell"))): row for row in cell_records}
     complete_records: list[dict[str, Any]] = []
-    for cell in cells(str(config["corpus"])):
+    dimensions = config.get("dimensions")
+    selected_profiles = dimensions.get("profiles") if isinstance(dimensions, dict) else None
+    selected_topologies = dimensions.get("topologies") if isinstance(dimensions, dict) else None
+    for cell in cells(str(config["corpus"]), selected_profiles=selected_profiles,
+                      selected_topologies=selected_topologies):
         complete_records.append(by_cell.get(_cell_id(cell),
                                             {"cell": cell, "cell_id": _cell_id(cell),
                                              "status": "PENDING"}))
@@ -889,6 +925,8 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
                  compile_output_root: str | Path | None = None,
                  execute: bool = True,
                  mode: str = "predictive-only",
+                 selected_profiles: Sequence[str] | None = None,
+                 selected_topologies: Sequence[str] | None = None,
                  command_runner: Callable[[dict[str, object], Path, Path, Path], int] | None = None,
                  external_farm_authority: str | Path | None = None,
                  external_cell_runner: Callable[..., Path] | None = None,
@@ -911,6 +949,10 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
         raise CampaignError("mode:undeclared")
     if corpus not in CORPORA:
         raise CampaignError("corpus:undeclared")
+    selected_profiles = _selected_dimension("profiles", PROFILES, selected_profiles)
+    selected_topologies = _selected_dimension("topologies", TOPOLOGIES, selected_topologies)
+    campaign_cells = cells(corpus, selected_profiles=selected_profiles,
+                           selected_topologies=selected_topologies)
     if mode in ("all", EXTERNAL_FARM_MODE) and SPLITS[corpus] == "held_out_validation":
         raise CampaignError("live_preflight:all_mode_is_calibration_only")
     repo = repo.absolute()
@@ -984,8 +1026,10 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
         "external_authority_command": (list(external_authority_command)
                                         if external_authority_command is not None else None),
         "external_authority_command_timeout": external_authority_command_timeout,
-        "dimensions": {"profiles": list(PROFILES), "regimes": list(REGIMES),
-                       "topologies": list(TOPOLOGIES)}}
+        "selected_profiles": list(selected_profiles),
+        "selected_topologies": list(selected_topologies),
+        "dimensions": {"profiles": list(selected_profiles), "regimes": list(REGIMES),
+                       "topologies": list(selected_topologies)}}
     if resume is None:
         requested_stamp = timestamp or _stamp()
         campaign = _new_campaign_root(output_root, requested_stamp)
@@ -999,9 +1043,9 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
                         if external_authority_path is not None else
                         ("provider" if external_authority_provider is not None else "command")),
                     "config_sha256": hashlib.sha256(canonical(config)).hexdigest(),
-                    "matrix": {"corpus": corpus, "profiles": list(PROFILES),
-                               "regimes": list(REGIMES), "topologies": list(TOPOLOGIES),
-                               "depth": depth, "expected_cells": len(cells(corpus))}}
+                    "matrix": {"corpus": corpus, "profiles": list(selected_profiles),
+                               "regimes": list(REGIMES), "topologies": list(selected_topologies),
+                               "depth": depth, "expected_cells": len(campaign_cells)}}
         _write_new(campaign / "campaign.json", canonical(metadata))
     else:
         campaign = resume.absolute()
@@ -1015,7 +1059,7 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
     runner = command_runner or _run_command
     records: list[dict[str, Any]] = []
     stamp = str(metadata["created_utc"])
-    for cell in cells(corpus):
+    for cell in campaign_cells:
         _validate_cell(cell)
         cell_label = _cell_id(cell)
         cell_dir = campaign / "cells" / _slug(cell)
@@ -1355,7 +1399,7 @@ def run_campaign(*, output_root: Path, repo: Path, corpus: str, depth: str,
             break
     # Include untouched prior states when an early skip left records sparse.
     all_records = []
-    for cell in cells(corpus):
+    for cell in campaign_cells:
         all_records.append(_cell_state(campaign / "cells" / _slug(cell) / "status.json"))
     summary = _summary(campaign, all_records, config)
     _replace_json(campaign / "summary.json", summary)
@@ -1397,6 +1441,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--mode", choices=("predictive-only", "all", EXTERNAL_FARM_MODE),
                         default="predictive-only",
                         help="run predictive cells, local live/comparison stages, or external-farm live/comparison stages")
+    parser.add_argument("--profiles", action="append", type=_csv_selection,
+                        metavar="PROFILE[,PROFILE...]",
+                        help="select profiles; repeat or use comma-separated values (default: all)")
+    parser.add_argument("--topologies", action="append", type=_csv_selection,
+                        metavar="TOPOLOGY[,TOPOLOGY...]",
+                        help="select topologies; repeat or use comma-separated values (default: all)")
     parser.add_argument("--repo", type=Path, default=Path.cwd())
     parser.add_argument("--python", default=sys.executable)
     args = parser.parse_args(argv)
@@ -1413,6 +1463,10 @@ def main(argv: list[str] | None = None) -> int:
                                 mode=args.mode, container_image=args.container_image,
                                 container_image_id=args.container_image_id,
                                 container_temp_root=args.container_temp_root,
+                                selected_profiles=([item for group in args.profiles or [] for item in group]
+                                                   if args.profiles is not None else None),
+                                selected_topologies=([item for group in args.topologies or [] for item in group]
+                                                     if args.topologies is not None else None),
                                 simulator_authority=args.simulator_authority,
                                 external_farm_authority=args.external_farm_authority,
                                 external_authority_command=args.external_farm_authority_command,
