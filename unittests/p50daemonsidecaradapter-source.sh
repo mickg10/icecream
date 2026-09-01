@@ -230,16 +230,75 @@ records_to_pids() {
         record_rest=${record_rest#*|}
         test -n "$record_exe" || return 1
         test "$record_rest" != "$record_exe" || return 1
-        record_socket_identity=${record_rest%%|*}
+        record_listener_identity=${record_rest%%|*}
+        record_rest=${record_rest#*|}
+        record_path_identity=${record_rest%%|*}
         record_socket_path=${record_rest#*|}
-        test -n "$record_socket_identity" || return 1
+        test -n "$record_listener_identity" || return 1
+        test "$record_rest" != "$record_listener_identity" || return 1
+        test -n "$record_path_identity" || return 1
         test "$record_socket_path" != "$record_rest" || return 1
         test -n "$record_socket_path" || return 1
         case "$record_pid" in ''|0|*[!0-9]*) return 1 ;; esac
         case "$record_start" in ''|*[!0-9]*) return 1 ;; esac
-        case "$record_socket_identity" in *:*) ;; *) return 1 ;; esac
+        case "$record_listener_identity" in *:*) ;; *) return 1 ;; esac
+        case "$record_path_identity" in ENOENT|*:*) ;; *) return 1 ;; esac
         printf '%s\n' "$record_pid" >>"$pids_output" || return 1
     done <"$records_input"
+}
+
+malformed_sidecar_records="$tmp_root/malformed-sidecar-records"
+malformed_sidecar_pids="$tmp_root/malformed-sidecar-pids"
+printf '%s\n' '12|34|/service|not-an-identity|ENOENT|/tmp/socket' \
+    >"$malformed_sidecar_records"
+if records_to_pids "$malformed_sidecar_records" "$malformed_sidecar_pids"; then
+    echo 'FAIL: malformed listener identity reached PID extraction' >&2
+    exit 1
+fi
+printf '%s\n' '12|34|/service|8:9|ENOENT' >"$malformed_sidecar_records"
+if records_to_pids "$malformed_sidecar_records" "$malformed_sidecar_pids"; then
+    echo 'FAIL: truncated sidecar record reached PID extraction' >&2
+    exit 1
+fi
+echo 'ok - malformed sidecar records cannot reach PID extraction'
+
+listener_socket_identity_for_pid() {
+    listener_pid=$1
+    listener_socket=$2
+    test -n "$listener_socket" || return 1
+    listener_fd_root=/proc/$listener_pid/fd
+    listener_count=0
+    listener_identity=
+    for listener_fd_path in "$listener_fd_root"/[0-9]*; do
+        test -e "$listener_fd_path" || continue
+        listener_fd_target=$(readlink "$listener_fd_path" 2>/dev/null) || continue
+        case "$listener_fd_target" in
+            socket:\[[0-9]*\]) ;;
+            *) continue ;;
+        esac
+        listener_socket_inode=${listener_fd_target#socket:[}
+        listener_socket_inode=${listener_socket_inode%]}
+        case "$listener_socket_inode" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        # The fd itself is the retained identity.  Bind its kernel socket
+        # inode to the exact --socket pathname through /proc/net/unix; the
+        # filesystem socket-node inode is a different inode namespace and
+        # cannot be compared directly with the fd identity.
+        if ! awk -v inode="$listener_socket_inode" -v path="$listener_socket" \
+                'NR > 1 && $4 == "00010000" && $5 == "0001" &&
+                 $6 == "01" && $7 == inode && $8 == path { found = 1 }
+                 END { exit(found ? 0 : 1) }' \
+                "/proc/$listener_pid/net/unix" 2>/dev/null; then
+            continue
+        fi
+        listener_fd_identity=$(stat -Lc '%d:%i' "$listener_fd_path" 2>/dev/null) || return 1
+        case "$listener_fd_identity" in *:*) ;; *) return 1 ;; esac
+        listener_count=$((listener_count + 1))
+        listener_identity=$listener_fd_identity
+    done
+    test "$listener_count" = 1 || return 1
+    printf '%s\n' "$listener_identity"
 }
 
 mutant_sidecar_record_for_pid() {
@@ -254,10 +313,24 @@ mutant_sidecar_record_for_pid() {
     process_socket=$(printf '%s\n' "$process_command" |
         sed -n 's/.* --socket \([^ ]*\).*/\1/p')
     case "$process_socket" in "$runtime_root"/*) ;; *) return 1 ;; esac
-    process_socket_identity=$(stat -Lc '%d:%i' "$process_socket" 2>/dev/null) || return 1
     process_starttime=$(proc_starttime "$process_pid") || return 1
-    printf '%s|%s|%s|%s|%s\n' "$process_pid" "$process_starttime" \
-        "$process_exe" "$process_socket_identity" "$process_socket"
+    process_listener_identity=$(listener_socket_identity_for_pid \
+        "$process_pid" "$process_socket") || return 1
+    if process_socket_info=$(stat -c '%F|%d:%i' "$process_socket" 2>/dev/null); then
+        process_socket_type=${process_socket_info%%|*}
+        process_socket_identity=${process_socket_info#*|}
+        test "$process_socket_type" = 'socket' || return 1
+        case "$process_socket_identity" in *:*) ;; *) return 1 ;; esac
+    else
+        # A rejected mutant can unlink the pathname while retaining the
+        # listener fd.  ENOENT is safe only with that independently captured
+        # listener identity; other existing/non-socket nodes remain RED.
+        test ! -e "$process_socket" || return 1
+        process_socket_identity=ENOENT
+    fi
+    printf '%s|%s|%s|%s|%s|%s\n' "$process_pid" "$process_starttime" \
+        "$process_exe" "$process_listener_identity" "$process_socket_identity" \
+        "$process_socket"
 }
 
 # A READY PID that is still alive must be rejected when it is not the cache
@@ -282,11 +355,12 @@ service=$service_before_ownership_test
 echo 'ok - READY PID without authenticated socket ownership is rejected'
 unset interruption_ready_trace
 
-sidecar_record_matches() {
+sidecar_process_matches() {
     ms_record=$1
     ms_pid=${ms_record%%|*}; ms_rest=${ms_record#*|}
     ms_start=${ms_rest%%|*}; ms_rest=${ms_rest#*|}
     ms_exe=${ms_rest%%|*}; ms_rest=${ms_rest#*|}
+    ms_listener_identity=${ms_rest%%|*}; ms_rest=${ms_rest#*|}
     ms_socket_identity=${ms_rest%%|*}; ms_socket=${ms_rest#*|}
     test -d "/proc/$ms_pid" || return 1
     test "$(readlink "/proc/$ms_pid/exe" 2>/dev/null || :)" = "$ms_exe" || return 1
@@ -300,24 +374,59 @@ sidecar_record_matches() {
             esac
             ;;
     esac
-    test "$(stat -Lc '%d:%i' "$ms_socket" 2>/dev/null || :)" = \
-        "$ms_socket_identity"
+}
+
+sidecar_record_matches() {
+    ms_record=$1
+    ms_pid=${ms_record%%|*}; ms_rest=${ms_record#*|}
+    ms_start=${ms_rest%%|*}; ms_rest=${ms_rest#*|}
+    ms_exe=${ms_rest%%|*}; ms_rest=${ms_rest#*|}
+    ms_listener_identity=${ms_rest%%|*}; ms_rest=${ms_rest#*|}
+    ms_socket_identity=${ms_rest%%|*}; ms_socket=${ms_rest#*|}
+    sidecar_process_matches "$ms_record" || return 1
+    test "$(listener_socket_identity_for_pid \
+        "$ms_pid" "$ms_socket" 2>/dev/null || :)" = \
+        "$ms_listener_identity" || return 1
+    if test "$ms_socket_identity" = ENOENT; then
+        # A record made after pathname removal remains valid only while the
+        # retained listener identity above is still exact.
+        test ! -e "$ms_socket"
+        return $?
+    fi
+    if ms_socket_info=$(stat -c '%F|%d:%i' "$ms_socket" 2>/dev/null); then
+        ms_socket_type=${ms_socket_info%%|*}
+        ms_current_socket_identity=${ms_socket_info#*|}
+        test "$ms_socket_type" = 'socket' || return 1
+        test "$ms_current_socket_identity" = "$ms_socket_identity"
+        return $?
+    fi
+    # ENOENT is the sole pathname failure admitted by the retained listener
+    # identity check above.  A permission/error or replacement node is RED.
+    test ! -e "$ms_socket"
 }
 
 retire_mutant_sidecars() {
     runtime_root=$1
     sidecar_record_file=$(mktemp "$tmp_root/sidecar-records.XXXXXX") || return 1
-    if mutant_sidecar_records "$runtime_root" >"$sidecar_record_file"; then
-        if sidecar_records=$(cat "$sidecar_record_file"); then
-            :
+    sidecar_records=
+    # Give a detached rejected mutant a short, bounded publication window;
+    # otherwise a late attempt-2 launch could appear after an empty scan.
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        if mutant_sidecar_records "$runtime_root" >"$sidecar_record_file"; then
+            if sidecar_records=$(cat "$sidecar_record_file"); then
+                :
+            else
+                rm -f -- "$sidecar_record_file"
+                return 1
+            fi
         else
             rm -f -- "$sidecar_record_file"
             return 1
         fi
-    else
-        rm -f -- "$sidecar_record_file"
-        return 1
-    fi
+        test -n "$sidecar_records" && break
+        test -n "${interruption_ready_trace:-}" && break
+        sleep 0.05
+    done
     rm -f -- "$sidecar_record_file" || return 1
     for sidecar_record in $sidecar_records; do
         sidecar_record_matches "$sidecar_record" || continue
@@ -328,7 +437,10 @@ retire_mutant_sidecars() {
     for _ in 1 2 3 4 5 6 7 8 9 10; do
         still_matching=
         for sidecar_record in $remaining_records; do
-            sidecar_record_matches "$sidecar_record" || continue
+            # Keep exact process identity in the survivor set even if the
+            # listener vanished during teardown; that condition must fail the
+            # gate rather than silently treating a live service as gone.
+            sidecar_process_matches "$sidecar_record" || continue
             still_matching="$still_matching $sidecar_record"
         done
         remaining_records=$still_matching
@@ -336,17 +448,36 @@ retire_mutant_sidecars() {
         sleep 0.05
     done
     for sidecar_record in $remaining_records; do
-        sidecar_record_matches "$sidecar_record" || continue
+        sidecar_process_matches "$sidecar_record" || continue
         sidecar_pid=${sidecar_record%%|*}
         kill -KILL "$sidecar_pid" 2>/dev/null || :
     done
     remaining_records=
     for sidecar_record in $sidecar_records; do
-        sidecar_record_matches "$sidecar_record" || continue
+        sidecar_process_matches "$sidecar_record" || continue
         remaining_records="$remaining_records $sidecar_record"
     done
     test -z "$remaining_records"
 }
+
+# If an exact process remains after both signals, losing its listener must not
+# make the final census report success.  This pure-shell control exercises the
+# retirement decision without launching or signalling a real process.
+if (
+    simulated_listener_lost=0
+    mutant_sidecar_records() {
+        printf '%s\n' '123|456|/service|8:9|ENOENT|/tmp/simulated.sock'
+    }
+    sidecar_record_matches() { test "$simulated_listener_lost" = 0; }
+    sidecar_process_matches() { return 0; }
+    kill() { simulated_listener_lost=1; return 0; }
+    sleep() { :; }
+    retire_mutant_sidecars "$tmp_root/simulated-survivor"
+); then
+    echo 'FAIL: exact process survivor was hidden by listener loss' >&2
+    exit 1
+fi
+echo 'ok - final cleanup census retains an exact process after listener loss'
 
 # A malformed READY frame must remain a hard parser error through the cleanup
 # owner too; an empty `cut` result is not an acceptable success signal.
@@ -581,6 +712,25 @@ if test -z "$interruption_sidecar_pids"; then
     cat "$interruption_log" >&2
     exit 1
 fi
+interruption_socket_path=$(sed -n '1p' "$interruption_parent_record_file" |
+    cut -d'|' -f6)
+case "$interruption_socket_path" in
+    /tmp/p5i.*/*) ;;
+    *)
+        echo 'FAIL: interruption record escaped its runtime root' >&2
+        exit 1
+        ;;
+esac
+interruption_sidecar_pid=$(sed -n '1p' "$interruption_parent_record_file" |
+    cut -d'|' -f1)
+if listener_socket_identity_for_pid "$interruption_sidecar_pid" \
+        "$interruption_socket_path.not-owned" >/dev/null 2>&1; then
+    echo 'FAIL: listener identity was not bound to its --socket pathname' >&2
+    exit 1
+fi
+echo 'ok - listener identity is bound to the exact --socket pathname'
+rm -f -- "$interruption_socket_path"
+echo 'ok - interruption cleanup retains listener identity after pathname removal'
 : >"$interruption_abort_trace"
 kill -TERM "$interruption_wrapper_pid"
 set +e
@@ -609,6 +759,11 @@ if test "$interruption_status" -ne 0 || \
     exit 1
 fi
 echo 'ok - forced interruption retires the exact live cache sidecar'
+# The READY trace above belongs only to the interrupted baseline.  Mutant
+# cleanup must return to its own runtime-root-scoped /proc inventory so a
+# detached attempt-2 service cannot be hidden behind the dead baseline PID.
+unset interruption_ready_trace
+unset ICECC_P50_TEST_FORBID_PROC_FALLBACK
 
 compile_and_expect_red() {
     label=$1
