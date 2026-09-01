@@ -584,12 +584,18 @@ def read_stat(pid):
     except (OSError, UnicodeError, ValueError, IndexError):
         return None
 
-def command(pid):
+def arguments(pid):
     try:
-        return pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().replace(
-            b"\0", b" ").decode(errors="replace").strip()
+        raw = pathlib.Path(f"/proc/{pid}/cmdline").read_bytes()
+        return [part.decode(errors="replace") for part in raw.split(b"\0") if part]
     except (OSError, UnicodeError):
-        return ""
+        return []
+
+def is_ordinary_daemon(argv):
+    if not argv or pathlib.Path(argv[0]).name != "iceccd":
+        return False
+    return any(argv[index] == "-N" and argv[index + 1] == "farm-qbox"
+               for index in range(len(argv) - 1))
 
 def discover_processes():
     """Discover roots/tree infrequently; ordinary polls never scan /proc."""
@@ -606,8 +612,7 @@ def discover_processes():
             by_parent.setdefault(row["ppid"], []).append(pid)
     ordinary_roots = {}
     for pid, row in rows.items():
-        process_command = command(pid)
-        if "iceccd" in process_command and "-N farm-qbox" in process_command:
+        if is_ordinary_daemon(arguments(pid)):
             ordinary_roots[pid] = row
     return rows, ordinary_roots, by_parent
 

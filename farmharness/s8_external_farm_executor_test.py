@@ -197,7 +197,7 @@ def _run_local_monitor(tmp_path: Path, competitor: str | None,
                        settle_seconds: float = 0.5) -> tuple[dict[str, object], int]:
     root = tmp_path / "monitor-root"
     root.mkdir()
-    owner = subprocess.Popen(["sleep", "5"])
+    owner = subprocess.Popen(["sleep", "10"])
     (root / "container-pid").write_text(str(owner.pid))
     physical, boot = _local_monitor_identity()
     child = None
@@ -227,16 +227,25 @@ def _run_local_monitor(tmp_path: Path, competitor: str | None,
     return json.loads((root / "interference-result.json").read_text()), stop.returncode
 
 
+def _ordinary_daemon_program(payload: str) -> str:
+    return (
+        "import os\n"
+        f"os.execv({sys.executable!r}, "
+        f"['iceccd', '-c', {payload!r}, '-N', 'farm-qbox'])\n"
+    )
+
+
 def test_interference_monitor_rejects_short_lived_competing_child(tmp_path: Path) -> None:
-    competitor = (
+    payload = (
         "import subprocess,time\n"
-        "# iceccd -N farm-qbox\n"
         "time.sleep(.30)\n"
-        "subprocess.run([__import__('sys').executable, '-c', 'x=0\\nwhile x < 10000000: x += 1'])\n"
+        f"subprocess.run([{sys.executable!r}, '-c', "
+        "'x=0\\nwhile x < 10000000: x += 1'])\n"
         "time.sleep(1.5)\n"
     )
     result, stop_rc = _run_local_monitor(
-        tmp_path, competitor, competitor_before_monitor=True, settle_seconds=2.0)
+        tmp_path, _ordinary_daemon_program(payload),
+        competitor_before_monitor=True, settle_seconds=2.0)
     assert stop_rc != 0
     assert result["status"] == "FAIL"
     assert result["timing_eligible"] is False
@@ -293,7 +302,17 @@ def test_interference_monitor_idle_cpu_is_below_two_percent(tmp_path: Path) -> N
 
 def test_interference_monitor_allows_idle_ordinary_daemon(tmp_path: Path) -> None:
     result, stop_rc = _run_local_monitor(
-        tmp_path, "import time\n# iceccd -N farm-qbox\ntime.sleep(.5)\n")
+        tmp_path, _ordinary_daemon_program("import time\ntime.sleep(.5)\n"))
+    assert stop_rc == 0
+    assert result["status"] == "PASS"
+    assert result["timing_eligible"] is True
+
+
+def test_interference_monitor_ignores_diagnostic_command_text(tmp_path: Path) -> None:
+    result, stop_rc = _run_local_monitor(
+        tmp_path,
+        "import time\n# diagnostic mentions iceccd -N farm-qbox\ntime.sleep(6)\n",
+        settle_seconds=5.5)
     assert stop_rc == 0
     assert result["status"] == "PASS"
     assert result["timing_eligible"] is True
