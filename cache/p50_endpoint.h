@@ -184,6 +184,15 @@ struct PrepareRequestKey {
     auto operator<=>(const PrepareRequestKey&) const = default;
 };
 
+// C-wide preparation is shared, but route-profile planning is relationship
+// scoped.  The F generation fences a replacement route from its predecessor.
+struct PreparationRouteKey {
+    FStoreGuid f_store_guid{};
+    uint64_t f_store_generation = 0;
+    ProfileId profile = ProfileId::ZSTD_TU;
+    auto operator<=>(const PreparationRouteKey&) const = default;
+};
+
 struct PreparationAuthorityLimits {
     size_t max_live_entries = 4096;
     uint64_t max_retained_encoded_bytes = uint64_t{512} << 20;
@@ -228,12 +237,17 @@ public:
 
     PreparedTuHandle prepare(PrepareRequestKey request,
                              std::span<const uint8_t> exact_input);
+    PreparedTuHandle prepare_for_route(PreparationRouteKey route,
+                                       PrepareRequestKey request,
+                                       std::span<const uint8_t> exact_input);
     uint64_t retain(PreparedTuHandle handle);
     uint64_t release(PreparedTuHandle handle);
     void commit(PreparedTuHandle handle);
     // Bind a fresh GRZ authority to the transport's authenticated initial
     // route cursor before its first prepared TU is admitted.
     void prime_grz_initial_state(HistoryNonce history_nonce);
+    void prime_grz_initial_state(PreparationRouteKey route,
+                                 HistoryNonce history_nonce);
     // Rebuild the one uncommitted GRZ TU after an acknowledged F route reset.
     // Exact-route retries never call this hook, so their committed encoder
     // state remains available for byte-exact replay.
@@ -243,12 +257,24 @@ public:
     [[nodiscard]] CStoreGuid c_store_guid() const;
     [[nodiscard]] ZstdTuLimits zstd_limits() const;
     [[nodiscard]] bool contains(PreparedTuHandle handle) const;
+    // Exposes the authenticated C-wide identity carried by a prepared route
+    // view; all forks of one request must report the same value.
+    [[nodiscard]] TuSeq prepared_tu_seq(PreparedTuHandle handle) const;
+    [[nodiscard]] ProfileId prepared_profile(PreparedTuHandle handle) const;
     [[nodiscard]] size_t live_entry_count() const;
     [[nodiscard]] uint64_t retained_encoded_bytes() const;
     [[nodiscard]] size_t route_history_bytes() const;
+    [[nodiscard]] size_t route_history_bytes(PreparationRouteKey route) const;
     [[nodiscard]] Digest128 route_history_digest() const;
+    [[nodiscard]] Digest128 route_history_digest(PreparationRouteKey route) const;
     [[nodiscard]] size_t route_history_entries() const;
+    [[nodiscard]] size_t route_history_entries(PreparationRouteKey route) const;
     [[nodiscard]] ProfileId profile() const;
+
+    // Route owners call this only after all handles for the relationship have
+    // been released.  It drops matcher/history state without touching the
+    // C-wide immutable catalogue or TU allocator.
+    [[nodiscard]] bool reset_route(PreparationRouteKey route) noexcept;
 
 private:
     PreparedInputPtr resolve(PreparedTuHandle handle) const;
@@ -407,7 +433,9 @@ public:
                                    on_run_admitted = {},
                                std::function<void(EndpointCancelPermit,
                                                   EndpointTerminalResult)>
-                                   on_run_terminal = {});
+                                   on_run_terminal = {},
+                               std::optional<PreparationRouteKey> route =
+                                   std::nullopt);
     ~P50ClientEndpoint();
     P50ClientEndpoint(const P50ClientEndpoint&) = delete;
     P50ClientEndpoint& operator=(const P50ClientEndpoint&) = delete;

@@ -17,6 +17,8 @@
 
 namespace icecc::p50 {
 
+class P50PreparationAuthority;
+
 struct BytesPayload {
     std::vector<uint8_t> bytes;
     auto operator<=>(const BytesPayload&) const = default;
@@ -277,8 +279,21 @@ public:
         const ImmutableObjectStore& objects, std::span<const Key64> roots) const;
 
 private:
-    uint32_t dense_region(Key64 key);
+    friend class P50PreparationAuthority;
+    // One C-store TU identity allocator shared by every relationship view.
+    // The preparation authority is the sole caller and chooses no external
+    // identity; it advances this allocator exactly once per C-wide record.
     TuSeq allocate_tu_seq();
+    uint32_t dense_region(Key64 key);
+    PreparedTUPtr prepare_tu_at_seq(std::span<const uint8_t> exact_input,
+                                    std::span<const Key64> regions,
+                                    TuSeq tu_seq);
+    // Build the immutable C-wide representation with an already allocated
+    // identity.  Only the C preparation authority may call this; it never
+    // advances the allocator or permits an external TU_SEQ choice.
+    PreparedTUPtr prepare_from_regions_at_seq(
+        std::span<const std::vector<uint8_t>> region_bytes,
+        std::optional<TuSeq> tu_seq);
 
     CObjectArena arena_;
     p29::OnlineS1::Config s1_config_;

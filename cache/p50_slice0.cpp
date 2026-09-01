@@ -954,6 +954,12 @@ uint32_t CAuthority::dense_region(Key64 key) {
 
 PreparedTUPtr CAuthority::prepare_tu(std::span<const uint8_t> exact_input,
                                      std::span<const Key64> regions) {
+    return prepare_tu_at_seq(exact_input, regions, allocate_tu_seq());
+}
+
+PreparedTUPtr CAuthority::prepare_tu_at_seq(
+    std::span<const uint8_t> exact_input, std::span<const Key64> regions,
+    TuSeq tu_seq) {
     const std::vector<uint8_t> materialized = materialize(arena_.objects(), regions);
     if (materialized.size() != exact_input.size() ||
         !std::equal(materialized.begin(), materialized.end(), exact_input.begin()))
@@ -962,7 +968,7 @@ PreparedTUPtr CAuthority::prepare_tu(std::span<const uint8_t> exact_input,
     dense.reserve(regions.size());
     for (Key64 key : regions) dense.push_back(dense_region(key));
     auto prepared = std::make_shared<PreparedTU>();
-    prepared->tu_seq = allocate_tu_seq();
+    prepared->tu_seq = tu_seq;
     prepared->raw_bytes = exact_input.size();
     prepared->raw_digest = digest128(exact_input);
     prepared->regions.assign(regions.begin(), regions.end());
@@ -972,6 +978,12 @@ PreparedTUPtr CAuthority::prepare_tu(std::span<const uint8_t> exact_input,
 
 PreparedTUPtr CAuthority::prepare_from_regions(
     std::span<const std::vector<uint8_t>> region_bytes) {
+    return prepare_from_regions_at_seq(region_bytes, std::nullopt);
+}
+
+PreparedTUPtr CAuthority::prepare_from_regions_at_seq(
+    std::span<const std::vector<uint8_t>> region_bytes,
+    std::optional<TuSeq> tu_seq) {
     std::vector<Key64> regions;
     std::vector<uint8_t> exact;
     regions.reserve(region_bytes.size());
@@ -981,7 +993,8 @@ PreparedTUPtr CAuthority::prepare_from_regions(
         regions.push_back(arena_.intern_children(ObjectType::Region, children));
         exact.insert(exact.end(), bytes.begin(), bytes.end());
     }
-    return prepare_tu(exact, regions);
+    return prepare_tu_at_seq(exact, regions,
+                             tu_seq.has_value() ? *tu_seq : allocate_tu_seq());
 }
 
 Key64 CAuthority::dense_region_key(uint32_t id) const { return dense_to_region_.at(id); }

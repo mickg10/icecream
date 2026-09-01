@@ -91,6 +91,9 @@ class P50ZstdSourceSender {
 public:
     P50ZstdSourceSender(CStoreGuid c_store_guid, PrepareRequestKey request,
                         ZstdSourceTransferConfig config = {});
+    P50ZstdSourceSender(std::shared_ptr<P50PreparationAuthority> authority,
+                        PreparationRouteKey route, PrepareRequestKey request,
+                        ZstdSourceTransferConfig config = {});
     ~P50ZstdSourceSender();
     P50ZstdSourceSender(const P50ZstdSourceSender&) = delete;
     P50ZstdSourceSender& operator=(const P50ZstdSourceSender&) = delete;

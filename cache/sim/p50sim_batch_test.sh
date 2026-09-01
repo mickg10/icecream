@@ -28,6 +28,7 @@ assert route[1]["state_before_digest"] == route[0]["state_digest"]
 assert route[1]["transaction_digest"] != route[0]["transaction_digest"]
 assert route[1]["c_store_guid"] == route[0]["c_store_guid"]
 assert route[1]["f_store_guid"] == route[0]["f_store_guid"]
+assert [row["rel_seq"] for row in route] == [0, 1]
 assert route[1]["c_to_f_bytes"] != tu[1]["c_to_f_bytes"] or route[1]["state_digest"] != tu[1]["state_digest"]
 PY
 
@@ -55,25 +56,29 @@ assert [row["tu_index"] for row in rows] == [0, 1, 2, 3]
 assert [row["tu_seq"] for row in rows] == [0, 1, 2, 3]
 assert rows[0]["raw_digest"] == rows[2]["raw_digest"]
 assert rows[0]["transaction_digest"] != rows[2]["transaction_digest"]
+assert [row["rel_seq"] for row in rows] == [0, 1, 2, 3]
 PY
 
-for n in 0 1 2 3 4 5 6 7 8 9; do
+for n in $(seq 0 19); do
     printf 'unit-%s\n' "$n" > "$work/$n.ii"
     printf '%s\n' "$work/$n.ii" >> "$work/manifest20"
 done
 {
     printf '%s\n' cardinality=20
-    seq 0 9
+    seq 0 19
 } > "$work/map20"
 ICECC_P50_PROFILE=ZSTD_TU "$sim" --batch-manifest "$work/manifest20" \
     --batch-assignment-map "$work/map20" --batch-output "$work/route20.jsonl"
 python3 - "$work/route20.jsonl" <<'PY'
 import json, sys
 rows = [json.loads(line) for line in open(sys.argv[1])]
-assert len(rows) == 10
-assert {row["relationship_id"] for row in rows} == {f"c1f20-r{i:02d}" for i in range(10)}
-assert len({row["f_store_guid"] for row in rows}) == 10
+assert len(rows) == 20
+assert {row["relationship_id"] for row in rows} == {f"c1f20-r{i:02d}" for i in range(20)}
+assert len({row["f_store_guid"] for row in rows}) == 20
 assert len({row["c_store_guid"] for row in rows}) == 1
+assert [row["tu_seq"] for row in rows] == list(range(20))
+assert [row["rel_seq"] for row in rows] == [0] * 20
+assert len({row["state_digest"] for row in rows}) == 20
 PY
 
 ICECC_P50_PROFILE=P29 "$sim" --batch-manifest "$work/manifest" \
@@ -82,6 +87,15 @@ test "$(wc -l < "$work/p29.jsonl")" -eq 2
 if ICECC_P50_PROFILE=GRZ_RESIDUAL "$sim" --batch-manifest "$work/manifest" \
        --batch-assignment-map "$work/map1" --batch-output "$work/grz.jsonl" 2>"$work/grz.err"; then
     test "$(wc -l < "$work/grz.jsonl")" -eq 2
+    ICECC_P50_PROFILE=GRZ_RESIDUAL "$sim" --batch-manifest "$work/manifest20" \
+        --batch-assignment-map "$work/map20" --batch-output "$work/grz20.jsonl"
+    python3 - "$work/grz20.jsonl" <<'PY'
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1])]
+assert len(rows) == 20
+assert [row["tu_seq"] for row in rows] == list(range(20))
+assert [row["rel_seq"] for row in rows] == [0] * 20
+PY
 else
     grep -q 'requires a simulator built with --with-libbsc' "$work/grz.err"
 fi
@@ -93,7 +107,27 @@ python3 - "$work/pair.jsonl" <<'PY'
 import json, sys
 rows = [json.loads(line) for line in open(sys.argv[1])]
 assert [row["segment"] for row in rows] == ["full-1", "full-1", "full-2", "full-2"]
+assert [row["tu_seq"] for row in rows] == [0, 1, 2, 3]
+assert [row["rel_seq"] for row in rows] == [0, 1, 2, 3]
 assert rows[2]["tu_seq"] == 2 and rows[2]["state_before_digest"] == rows[1]["state_digest"]
+PY
+
+# Interleaved relationships retain independent REL_SEQ while the C authority
+# continues one global TU_SEQ stream.
+printf '%s\n%s\n%s\n%s\n' "$work/a.ii" "$work/b.ii" "$work/a.ii" "$work/b.ii" > "$work/interleaved.manifest"
+printf '%s\n%s\n%s\n%s\n%s\n' cardinality=20 0 1 0 1 > "$work/interleaved.map"
+ICECC_P50_PROFILE=ZSTD_ROUTE "$sim" --batch-manifest "$work/interleaved.manifest" \
+    --batch-assignment-map "$work/interleaved.map" --batch-allow-repeated-inputs 1 \
+    --batch-output "$work/interleaved.jsonl"
+python3 - "$work/interleaved.jsonl" <<'PY'
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1])]
+assert [row["tu_seq"] for row in rows] == [0, 1, 2, 3]
+assert [row["rel_seq"] for row in rows] == [0, 0, 1, 1]
+by_route = {}
+for row in rows:
+    by_route.setdefault(row["relationship_id"], []).append(row["rel_seq"])
+assert sorted(by_route.values()) == [[0, 1], [0, 1]]
 PY
 
 # A batch larger than the F InputRecordStore record bound must remain

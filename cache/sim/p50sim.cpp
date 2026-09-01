@@ -478,13 +478,12 @@ std::vector<size_t> read_batch_assignments(const std::string& path,
 }
 
 struct BatchRelation {
-    std::shared_ptr<P50PreparationAuthority> authority;
+    PreparationRouteKey route{};
     std::unique_ptr<P50ServerEndpoint> server;
     std::unique_ptr<P50ClientEndpoint> client;
     ActionTrace actions{256};
     CompletionLog completions{256};
     uint64_t request_token = 0;
-    uint64_t tu_count = 0;
     std::optional<Digest128> last_state_digest;
 };
 
@@ -533,6 +532,8 @@ void write_batch_row(std::ostream& output, std::string_view segment,
     Digest128 action_raw_digest{};
     Digest128 state_before{};
     Digest128 state_after{};
+    RelSeq begin_rel_seq{};
+    RelSeq commit_rel_seq{};
     uint64_t encoded_source_bytes = 0;
     bool tx_begin_found = false;
     bool commit_found = false;
@@ -543,6 +544,7 @@ void write_batch_row(std::ostream& output, std::string_view segment,
             tx_digest = position->transaction_digest;
             action_raw_digest = position->raw_digest;
             state_after = position->state_digest;
+            commit_rel_seq = position->rel_seq;
             commit_found = true;
         }
         if (position->actor == ActorSide::C &&
@@ -550,6 +552,7 @@ void write_batch_row(std::ostream& output, std::string_view segment,
             position->tu_seq.value == expected_tu_seq) {
             state_before = position->state_digest;
             begin_tx_digest = position->transaction_digest;
+            begin_rel_seq = position->rel_seq;
             encoded_source_bytes = position->stage_bytes;
             tx_begin_found = true;
         }
@@ -578,8 +581,10 @@ void write_batch_row(std::ostream& output, std::string_view segment,
         !client.committed_input || !server.committed_input ||
         client.committed_input != server.committed_input ||
         client.committed_input->tu_seq.value != expected_tu_seq || action_raw_digest != raw_digest ||
-        !tx_begin_found || !commit_found || digest_is_zero(begin_tx_digest) ||
-        begin_tx_digest != tx_digest || digest_is_zero(tx_digest) || digest_is_zero(state_after) ||
+        !tx_begin_found || !commit_found || !client.committed_commit ||
+        begin_tx_digest != tx_digest || begin_rel_seq != commit_rel_seq ||
+        begin_rel_seq != client.committed_commit->rel_seq ||
+        digest_is_zero(tx_digest) || digest_is_zero(state_after) ||
         c_writes != f_reads || f_writes != c_reads) {
         std::ostringstream detail;
         detail << "product completion did not authenticate exact TU (client="
@@ -590,6 +595,7 @@ void write_batch_row(std::ostream& output, std::string_view segment,
                << ",seq=" << (client.committed_input ?
                                   std::to_string(client.committed_input->tu_seq.value) : "none")
                << ",index=" << expected_tu_seq << ",raw=" << (action_raw_digest == raw_digest)
+               << ",rel=" << begin_rel_seq.value << "/" << commit_rel_seq.value
                << ",tx_begin=" << tx_begin_found << ",commit=" << commit_found
                << ",wire=" << (c_writes == f_reads && f_writes == c_reads) << ")";
         throw std::runtime_error(detail.str());
@@ -598,6 +604,7 @@ void write_batch_row(std::ostream& output, std::string_view segment,
            << segment << "\",\"profile\":\"" << selected_profile_label()
            << "\",\"relationship_id\":\"" << relation_id << "\",\"tu_index\":"
            << index << ",\"tu_seq\":" << client.committed_input->tu_seq.value
+           << ",\"rel_seq\":" << begin_rel_seq.value
            << ",\"c_store_guid\":\"" << id_hex(client_endpoint.c_store_guid())
            << "\",\"f_store_guid\":\""
            << id_hex(client_endpoint.f_store_guid().value_or(FStoreGuid{})) << "\""
@@ -670,6 +677,11 @@ void run_batch(const Arguments& arguments) {
     EndpointCaps caps{};
     caps.profile = profile;
     caps.supported_profiles = profile_bit(profile);
+    PreparationAuthorityLimits authority_limits{};
+    authority_limits.max_live_entries = 1;
+    auto authority = std::make_shared<P50PreparationAuthority>(
+        arguments.c_store_guid, caps.zstd, authority_limits,
+        kCurrentProductCompressionLevel, profile);
     asio::io_context context;
     tcp::acceptor acceptor(context,
                            tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0));
@@ -680,25 +692,23 @@ void run_batch(const Arguments& arguments) {
         const FStoreGuid f_guid = relation_guid(arguments.f_store_guid, relation);
         relations.emplace_back();
         BatchRelation& item = relations.back();
-        PreparationAuthorityLimits authority_limits{};
-        // The batch engine executes one TU at a time per relationship.  Match
-        // the live sender lifecycle and make a missing post-commit release
-        // fail on the next TU instead of accumulating preparations until the
-        // retained-byte ceiling is reached.
-        authority_limits.max_live_entries = 1;
-        item.authority = std::make_shared<P50PreparationAuthority>(
-            arguments.c_store_guid, caps.zstd, authority_limits,
-            kCurrentProductCompressionLevel, profile);
+        item.route = PreparationRouteKey{f_guid, 1, profile};
         P50ServerEndpointConfig config;
         config.input_job_state = [](CStoreGuid, const TxBegin&, const TxCommit&,
                                     std::span<const uint8_t>) { return InputJobState::Open; };
         item.server = std::make_unique<P50ServerEndpoint>(f_guid, caps,
                                                            &item.completions, &item.actions,
                                                            std::move(config));
-        item.client = std::make_unique<P50ClientEndpoint>(item.authority, caps,
+        item.client = std::make_unique<P50ClientEndpoint>(authority, caps,
                                                            arguments.history_nonce,
-                                                           &item.completions, &item.actions);
+                                                           &item.completions, &item.actions,
+                                                           std::nullopt,
+                                                           std::function<void(EndpointCancelPermit)>{},
+                                                           std::function<void(EndpointCancelPermit,
+                                                                              EndpointTerminalResult)>{},
+                                                           item.route);
     }
+    uint64_t global_tu_seq = 0;
     const auto process = [&](std::string_view segment, const std::vector<std::string>& manifest,
                              const std::vector<size_t>& assignments) {
         for (size_t index = 0; index < manifest.size(); ++index) {
@@ -711,13 +721,16 @@ void run_batch(const Arguments& arguments) {
             relation.completions.clear();
             const std::optional<Digest128> expected_before =
                 retains_relationship_state ? relation.last_state_digest : std::nullopt;
-            const size_t prefix_before_bytes = relation.authority->route_history_bytes();
-            const Digest128 prefix_before_digest = relation.authority->route_history_digest();
-            auto prepared = relation.authority->prepare(
-                PrepareRequestKey{1, ++relation.request_token}, input);
+            const size_t prefix_before_bytes = authority->route_history_bytes(relation.route);
+            const Digest128 prefix_before_digest = authority->route_history_digest(relation.route);
+            const uint64_t expected_tu_seq = global_tu_seq;
+            auto prepared = authority->prepare_for_route(
+                relation.route,
+                PrepareRequestKey{static_cast<uint64_t>(assignments[index] + 1),
+                                  ++relation.request_token}, input);
             if (!prepared)
                 throw std::runtime_error("product preparation returned an invalid handle");
-            const size_t relationship_tu_seq = static_cast<size_t>(relation.tu_count++);
+            ++global_tu_seq;
             context.restart();
             const auto started = std::chrono::steady_clock::now();
             auto server_future = asio::co_spawn(context,
@@ -761,9 +774,9 @@ void run_batch(const Arguments& arguments) {
                        << ",owner_namespaces=" << usage.namespaces << ")";
                 throw std::runtime_error(detail.str());
             }
-            const size_t prefix_after_bytes = relation.authority->route_history_bytes();
-            const Digest128 prefix_after_digest = relation.authority->route_history_digest();
-            write_batch_row(output, segment, relation_id, index, relationship_tu_seq, input,
+            const size_t prefix_after_bytes = authority->route_history_bytes(relation.route);
+            const Digest128 prefix_after_digest = authority->route_history_digest(relation.route);
+            write_batch_row(output, segment, relation_id, index, expected_tu_seq, input,
                             client_result, server_result, relation.completions,
                             relation.actions, *relation.client, expected_before,
                             prefix_before_bytes, prefix_before_digest,
@@ -804,9 +817,9 @@ void run_batch(const Arguments& arguments) {
                        << ",retained_bytes=" << usage.retained_input_bytes << ")";
                 throw std::runtime_error(detail.str());
             }
-            if (relation.authority->release(prepared) != 0 ||
-                relation.authority->live_entry_count() != 0 ||
-                relation.authority->retained_encoded_bytes() != 0)
+            if (authority->release(prepared) != 0 ||
+                authority->live_entry_count() != 0 ||
+                authority->retained_encoded_bytes() != 0)
                 throw std::runtime_error(
                     "product batch retained a committed preparation");
         }
@@ -851,11 +864,6 @@ int main(int argc, char** argv) {
             caps.profile);
         const std::vector<uint8_t> prewarm_input = warm
             ? read_bytes(arguments.prewarm_input) : std::vector<uint8_t>{};
-        const PreparedTuHandle prewarm_prepared = warm
-            ? authority->prepare(PrepareRequestKey{1, 1}, prewarm_input)
-            : PreparedTuHandle{};
-        if (warm && !prewarm_prepared)
-            throw std::runtime_error("Protocol-50 preparation returned an invalid handle");
 
         P50ServerEndpointConfig config;
         config.input_job_state = [](CStoreGuid, const TxBegin&, const TxCommit&,
@@ -863,6 +871,15 @@ int main(int argc, char** argv) {
         P50ServerEndpoint server(arguments.f_store_guid, caps,
                                  &completions, &actions, std::move(config));
         P50ClientEndpoint client(authority, caps, arguments.history_nonce, &completions, &actions);
+
+        // The endpoint binds the GRZ route's initial state.  Prepare only
+        // after that binding so warm execution cannot create a stale legacy
+        // route before the relationship endpoint exists.
+        const PreparedTuHandle prewarm_prepared = warm
+            ? authority->prepare(PrepareRequestKey{1, 1}, prewarm_input)
+            : PreparedTuHandle{};
+        if (warm && !prewarm_prepared)
+            throw std::runtime_error("Protocol-50 preparation returned an invalid handle");
 
         asio::io_context context;
         tcp::acceptor acceptor(context, tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0));

@@ -74,11 +74,14 @@ private:
     using Sender = std::unique_ptr<P50ZstdSourceSender>;
 
     [[nodiscard]] ZstdSourceTransferResult invalid() const noexcept;
+    [[nodiscard]] PreparationRouteKey route_key(
+        const P50RouteRelationship& relationship) const noexcept;
     Sender& get_or_create(const P50RouteRelationship& relationship,
                           PrepareRequestKey request,
                           std::chrono::steady_clock::time_point deadline);
 
     P50RouteOwnerConfig config_{};
+    std::shared_ptr<P50PreparationAuthority> authority_;
     std::map<P50RouteRelationship, Sender> owners_;
 };
 

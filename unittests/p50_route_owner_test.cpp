@@ -109,6 +109,100 @@ ZstdSourceTransferResult route_call(
     return transfer_result.get();
 }
 
+void test_same_request_route_fork_wire() {
+    P50PreparationAuthority authority(
+        Id128::from_u64(190), config().endpoint_caps.zstd,
+        config().authority_limits, config().compression_level, ProfileId::P29);
+    const PreparationRouteKey route0{Id128::from_u64(290), 1, ProfileId::P29};
+    const PreparationRouteKey route1{Id128::from_u64(291), 1, ProfileId::P29};
+    const PrepareRequestKey fork_request{7900, 1};
+    const std::vector<uint8_t> source{'f', 'o', 'r', 'k', '\n'};
+    const auto h0 = authority.prepare_for_route(route0, fork_request, source);
+    const auto h1 = authority.prepare_for_route(route1, fork_request, source);
+    CHECK(authority.prepared_tu_seq(h0).value == authority.prepared_tu_seq(h1).value);
+    CHECK(authority.prepared_profile(h0) == ProfileId::P29);
+    CHECK(authority.prepared_profile(h1) == ProfileId::P29);
+
+    asio::io_context context;
+    tcp::acceptor acceptor0(context, {asio::ip::address_v4::loopback(), 0});
+    tcp::acceptor acceptor1(context, {asio::ip::address_v4::loopback(), 0});
+    EndpointCaps server_caps;
+    server_caps.profile = ProfileId::P29;
+    server_caps.supported_profiles = kOperationalProfileMask;
+    server_caps.zstd = config().endpoint_caps.zstd;
+    const P50ServerEndpointConfig server_config{
+        .input_job_state = [](CStoreGuid, const TxBegin&, const TxCommit&,
+                              std::span<const uint8_t>) { return InputJobState::Open; }};
+    P50ServerEndpoint server0(Id128::from_u64(290), server_caps, nullptr, nullptr,
+                              server_config);
+    P50ServerEndpoint server1(Id128::from_u64(291), server_caps, nullptr, nullptr,
+                              server_config);
+    ActionTrace actions0;
+    ActionTrace actions1;
+    // The endpoint must use the same authority as the prepared handles; build
+    // the two route views with a shared C authority and retain independent
+    // endpoint cursors for the wire proof.
+    auto authority_ptr = std::shared_ptr<P50PreparationAuthority>(
+        &authority, [](P50PreparationAuthority*) {});
+    EndpointCaps mismatch_caps = server_caps;
+    mismatch_caps.profile = ProfileId::ZSTD_TU;
+    P50ClientEndpoint mismatch_endpoint(authority_ptr, mismatch_caps,
+                                         HistoryNonce{1});
+    asio::io_context mismatch_context;
+    tcp::acceptor mismatch_acceptor(
+        mismatch_context, {asio::ip::address_v4::loopback(), 0});
+    auto mismatch_future = asio::co_spawn(
+        mismatch_context,
+        mismatch_endpoint.run(mismatch_acceptor.local_endpoint(), h0, {},
+                               std::chrono::steady_clock::now() + std::chrono::seconds(10)),
+        asio::use_future);
+    mismatch_context.poll();
+    CHECK(mismatch_future.wait_for(std::chrono::seconds(0)) ==
+          std::future_status::ready);
+    bool mismatch_rejected = false;
+    try {
+        (void)mismatch_future.get();
+    } catch (const std::invalid_argument&) {
+        mismatch_rejected = true;
+    }
+    CHECK(mismatch_rejected);
+    context.restart();
+    P50ClientEndpoint endpoint0(authority_ptr, server_caps, HistoryNonce{1}, nullptr,
+                                &actions0);
+    P50ClientEndpoint endpoint1(authority_ptr, server_caps, HistoryNonce{1}, nullptr,
+                                &actions1);
+    auto server_future0 = asio::co_spawn(context, server0.accept_one(acceptor0), asio::use_future);
+    auto server_future1 = asio::co_spawn(context, server1.accept_one(acceptor1), asio::use_future);
+    auto client_future0 = asio::co_spawn(
+        context, endpoint0.run(acceptor0.local_endpoint(), h0, {},
+                               std::chrono::steady_clock::now() + std::chrono::seconds(10)),
+        asio::use_future);
+    auto client_future1 = asio::co_spawn(
+        context, endpoint1.run(acceptor1.local_endpoint(), h1, {},
+                               std::chrono::steady_clock::now() + std::chrono::seconds(10)),
+        asio::use_future);
+    context.run();
+    const auto result0 = client_future0.get();
+    const auto result1 = client_future1.get();
+    CHECK(server_future0.get().status == ServerRunStatus::Completed);
+    CHECK(server_future1.get().status == ServerRunStatus::Completed);
+    CHECK(result0.status == ClientRunStatus::Committed);
+    CHECK(result1.status == ClientRunStatus::Committed);
+    CHECK(result0.committed_commit->tu_seq == result1.committed_commit->tu_seq);
+    CHECK(result0.committed_commit->raw_digest == result1.committed_commit->raw_digest);
+    CHECK(result0.committed_commit->rel_seq.value == 0);
+    CHECK(result1.committed_commit->rel_seq.value == 0);
+    CHECK(result0.committed_commit->transaction_digest != Digest128{});
+    CHECK(result1.committed_commit->transaction_digest != Digest128{});
+    CHECK(endpoint0.next_rel_seq().value == 1);
+    CHECK(endpoint1.next_rel_seq().value == 1);
+    CHECK(endpoint0.state_digest() == result0.committed_commit->post_state_digest);
+    CHECK(endpoint1.state_digest() == result1.committed_commit->post_state_digest);
+    CHECK(authority.release(h0) == 0);
+    CHECK(authority.release(h1) == 0);
+    CHECK(actions0.valid() && actions1.valid());
+}
+
 void test_long_lived_relationship_owner() {
     asio::io_context context;
     tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
@@ -130,6 +224,16 @@ void test_long_lived_relationship_owner() {
                                    {7001, 1}, first);
     CHECK(first_result.status == ZstdSourceTransferStatus::Committed);
     CHECK(first_result.committed_input->tu_seq.value == 0);
+    const auto different_c = relationship(102, 201, 1);
+    context.restart();
+    auto rejected_c = asio::co_spawn(
+        context,
+        owner.transfer(different_c, {7000, 1}, acceptor.local_endpoint(),
+                       std::chrono::steady_clock::now() + std::chrono::seconds(10), first),
+        asio::use_future);
+    context.run();
+    CHECK(rejected_c.get().status == ZstdSourceTransferStatus::InvalidRequest);
+    CHECK(owner.owner_count() == 1 && owner.owns(first_route));
     auto second_result = route_call(context, owner, server, acceptor, first_route,
                                     {7001, 2}, second);
     CHECK(second_result.status == ZstdSourceTransferStatus::Committed);
@@ -177,30 +281,67 @@ void test_long_lived_relationship_owner() {
     CHECK(fourth_result.status == ZstdSourceTransferStatus::Committed);
     CHECK(fourth_result.committed_input->tu_seq.value == 3);
 
-    // A different F relationship gets an independent sender and TU0.
+    // A different F relationship gets an independent route, while TU_SEQ is
+    // allocated from the one C authority and continues globally.
     const auto second_route = relationship(101, 202, 1);
     server.reset_store(Id128::from_u64(202));
     auto other_f = route_call(context, owner, server, acceptor, second_route,
                               {7002, 1}, first);
     CHECK(other_f.status == ZstdSourceTransferStatus::Committed);
-    CHECK(other_f.committed_input->tu_seq.value == 0);
+    CHECK(other_f.committed_input->tu_seq.value == 4);
     CHECK(owner.owner_count() == 2);
 
-    // A different profile is also isolated.  ZSTD_TU retains only the
-    // relationship's TU sequence; each payload is still compressed alone.
-    const auto tu_route = relationship(101, 203, 1, ProfileId::ZSTD_TU);
+    const auto cross_profile = relationship(101, 203, 1, ProfileId::ZSTD_TU);
     server.reset_store(Id128::from_u64(203));
-    auto tu = route_call(context, owner, server, acceptor, tu_route, {7003, 1}, first);
-    CHECK(tu.status == ZstdSourceTransferStatus::Committed);
-    CHECK(tu.committed_input->tu_seq.value == 0);
-    auto tu_successor = route_call(context, owner, server, acceptor, tu_route,
-                                   {7003, 2}, second);
-    CHECK(tu_successor.status == ZstdSourceTransferStatus::Committed);
-    CHECK(tu_successor.committed_input->tu_seq.value == 1);
-    CHECK(owner.owns(tu_route) && owner.owner_count() == 3);
+    auto cross = route_call(context, owner, server, acceptor, cross_profile,
+                            {7003, 1}, first);
+    CHECK(cross.status == ZstdSourceTransferStatus::Committed);
+    CHECK(cross.committed_input->tu_seq.value == 5);
+    CHECK(owner.owner_count() == 3);
 
-    // Explicit F generation reset drops old route history; the new generation
-    // recreates a sender at TU0.
+    // The same C-wide prepared record can be viewed through another profile
+    // while the first view is live.  The route identities remain separate,
+    // but the authenticated TU identity is shared.
+    P50PreparationAuthority direct_authority(
+        Id128::from_u64(180), config().endpoint_caps.zstd,
+        config().authority_limits, config().compression_level,
+        ProfileId::ZSTD_TU);
+    const PreparationRouteKey direct_zstd{Id128::from_u64(280), 1,
+                                          ProfileId::ZSTD_TU};
+    const PreparationRouteKey direct_p29{Id128::from_u64(281), 1,
+                                         ProfileId::P29};
+    const PrepareRequestKey fork_request{7800, 1};
+    const auto zstd_view = direct_authority.prepare_for_route(
+        direct_zstd, fork_request, first);
+    const auto p29_view = direct_authority.prepare_for_route(
+        direct_p29, fork_request, first);
+    CHECK(direct_authority.prepared_tu_seq(zstd_view).value == 0);
+    CHECK(direct_authority.prepared_tu_seq(p29_view).value == 0);
+    CHECK(direct_authority.prepared_profile(zstd_view) == ProfileId::ZSTD_TU);
+    CHECK(direct_authority.prepared_profile(p29_view) == ProfileId::P29);
+    CHECK(direct_authority.live_entry_count() == 2);
+    CHECK(!direct_authority.reset_route(direct_zstd));
+    CHECK(direct_authority.release(zstd_view) == 0);
+    CHECK(direct_authority.release(p29_view) == 0);
+    CHECK(direct_authority.reset_route(direct_zstd));
+
+    P50PreparationAuthority p29_first_authority(
+        Id128::from_u64(181), config().endpoint_caps.zstd,
+        config().authority_limits, config().compression_level,
+        ProfileId::P29);
+    const auto p29_first = p29_first_authority.prepare_for_route(
+        direct_p29, {7801, 1}, first);
+    CHECK(p29_first_authority.prepared_tu_seq(p29_first).value == 0);
+    CHECK(p29_first_authority.prepared_profile(p29_first) == ProfileId::P29);
+    CHECK(p29_first_authority.release(p29_first) == 0);
+    const auto zstd_after_p29 = p29_first_authority.prepare_for_route(
+        direct_zstd, {7802, 1}, first);
+    CHECK(p29_first_authority.prepared_tu_seq(zstd_after_p29).value == 1);
+    CHECK(p29_first_authority.prepared_profile(zstd_after_p29) == ProfileId::ZSTD_TU);
+    CHECK(p29_first_authority.release(zstd_after_p29) == 0);
+
+    // Explicit F generation reset drops old route history; the replacement
+    // route does not rewind the C-wide allocator.
     owner.reset_f_store(Id128::from_u64(201), 2);
     CHECK(!owner.owns(first_route) && owner.owner_count() == 2);
     const auto replacement_route = relationship(101, 201, 2);
@@ -208,7 +349,7 @@ void test_long_lived_relationship_owner() {
     auto replacement = route_call(context, owner, server, acceptor,
                                    replacement_route, {7004, 1}, first);
     CHECK(replacement.status == ZstdSourceTransferStatus::Committed);
-    CHECK(replacement.committed_input->tu_seq.value == 0);
+    CHECK(replacement.committed_input->tu_seq.value == 6);
     owner.reset();
     CHECK(owner.owner_count() == 0);
 }
@@ -275,13 +416,15 @@ void test_p29_relationship_owner() {
     CHECK(retried.status == ZstdSourceTransferStatus::Committed);
     CHECK(retried.committed_input->tu_seq.value == 2);
 
-    // A different relationship is isolated and starts at TU0; an unsupported
-    // profile fails closed without allocating an owner.
-    const auto different = relationship(142, 241, 1, ProfileId::P29);
+    // A different F relationship in the same C store has an independent route
+    // but shares TU_SEQ; an unsupported profile fails closed without allocating
+    // an owner.  Different-C rejection is covered above without an accept.
+    const auto different = relationship(141, 242, 1, ProfileId::P29);
+    server.reset_store(Id128::from_u64(242));
     auto isolated = route_call(context, owner, server, acceptor, different,
                                {7102, 1}, repeated);
     CHECK(isolated.status == ZstdSourceTransferStatus::Committed);
-    CHECK(isolated.committed_input->tu_seq.value == 0);
+    CHECK(isolated.committed_input->tu_seq.value == 3);
     const auto unsupported = relationship(143, 241, 1, static_cast<ProfileId>(99));
     context.restart();
     auto rejected = asio::co_spawn(
@@ -292,16 +435,16 @@ void test_p29_relationship_owner() {
     context.run();
     CHECK(rejected.get().status == ZstdSourceTransferStatus::InvalidRequest);
 
-    // Resetting the F generation drops both P29 owners; the replacement starts
-    // from TU0 and does not inherit either relationship's route history.
+    // Resetting the F generation drops both P29 route views; the replacement
+    // starts fresh route history without rewinding TU_SEQ.
     owner.reset_f_store(Id128::from_u64(241), 2);
-    CHECK(owner.owner_count() == 0);
-    server.reset_store(Id128::from_u64(242));
-    const auto replacement = relationship(141, 242, 2, ProfileId::P29);
+    CHECK(owner.owner_count() == 1);
+    server.reset_store(Id128::from_u64(243));
+    const auto replacement = relationship(141, 243, 2, ProfileId::P29);
     auto reset = route_call(context, owner, server, acceptor, replacement,
                             {7104, 1}, repeated);
     CHECK(reset.status == ZstdSourceTransferStatus::Committed);
-    CHECK(reset.committed_input->tu_seq.value == 0);
+    CHECK(reset.committed_input->tu_seq.value == 4);
 }
 
 #if defined(ICECC_P50_WITH_LIBBSC)
@@ -339,6 +482,7 @@ void test_grz_relationship_owner() {
 int main() {
     test_source_transfer_operation_wire();
     test_long_lived_relationship_owner();
+    test_same_request_route_fork_wire();
     test_relationship_validation();
     test_p29_relationship_owner();
 #if defined(ICECC_P50_WITH_LIBBSC)

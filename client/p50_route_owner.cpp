@@ -56,14 +56,28 @@ P50CRouteOwner::Sender& P50CRouteOwner::get_or_create(
     if (position != owners_.end())
         return position->second;
 
+    if (!authority_) {
+        authority_ = std::make_shared<P50PreparationAuthority>(
+            relationship.c_store_guid, config_.endpoint_caps.zstd,
+            config_.authority_limits, config_.compression_level,
+            config_.endpoint_caps.profile);
+    } else if (authority_->c_store_guid() != relationship.c_store_guid) {
+        throw std::invalid_argument("route belongs to another C store");
+    }
     ZstdSourceTransferConfig config =
         sender_config(config_, relationship.profile, deadline);
     auto sender = std::make_unique<P50ZstdSourceSender>(
-        relationship.c_store_guid, request, std::move(config));
+        authority_, route_key(relationship), request, std::move(config));
     const auto [inserted, ignored] =
         owners_.emplace(relationship, std::move(sender));
     (void)ignored;
     return inserted->second;
+}
+
+PreparationRouteKey P50CRouteOwner::route_key(
+    const P50RouteRelationship& relationship) const noexcept {
+    return {relationship.f_store_guid, relationship.f_store_generation,
+            relationship.profile};
 }
 
 boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
@@ -71,15 +85,20 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
     boost::asio::ip::tcp::endpoint remote,
     std::chrono::steady_clock::time_point deadline,
     std::span<const uint8_t> source) {
-    if (!relationship.valid() || request.producer_session == 0 ||
+    if (!relationship.valid() ||
+        request.producer_session == 0 ||
         request.request_token == 0 || remote.port() == 0 ||
         remote.address().is_unspecified())
         co_return invalid();
 
-    Sender& sender = get_or_create(relationship, request, deadline);
-    // Every stable C/F relationship owns the TU sequence.  ZSTD_TU still
-    // compresses each source independently; retaining its sender prevents a
-    // later wrapper from reusing (C_GUID, TU0).
+    P50ZstdSourceSender* sender = nullptr;
+    try {
+        sender = get_or_create(relationship, request, deadline).get();
+    } catch (const std::invalid_argument&) {
+        co_return invalid();
+    }
+    // The sender retains only this relationship's route view and retry
+    // ledger; TU identity is allocated by the shared C authority.
     co_return co_await sender->transfer_route(remote, request, deadline, source);
 }
 
@@ -88,11 +107,17 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
     ConnectedFdFactory connection,
     std::chrono::steady_clock::time_point deadline,
     std::span<const uint8_t> source) {
-    if (!relationship.valid() || request.producer_session == 0 ||
+    if (!relationship.valid() ||
+        request.producer_session == 0 ||
         request.request_token == 0 || !connection)
         co_return invalid();
 
-    Sender& sender = get_or_create(relationship, request, deadline);
+    P50ZstdSourceSender* sender = nullptr;
+    try {
+        sender = get_or_create(relationship, request, deadline).get();
+    } catch (const std::invalid_argument&) {
+        co_return invalid();
+    }
     co_return co_await sender->transfer_route(
         std::move(connection), request, deadline, source);
 }
@@ -102,15 +127,25 @@ void P50CRouteOwner::reset_f_store(FStoreGuid f_store_guid,
     if (f_store_guid == FStoreGuid{} || new_f_store_generation == 0)
         return;
     for (auto position = owners_.begin(); position != owners_.end();) {
-        if (position->first.f_store_guid == f_store_guid)
-            position = owners_.erase(position);
-        else
+        if (position->first.f_store_guid == f_store_guid) {
+            const PreparationRouteKey key = route_key(position->first);
+            if (!authority_ || authority_->reset_route(key))
+                position = owners_.erase(position);
+            else
+                ++position;
+        } else
             ++position;
     }
 }
 
 void P50CRouteOwner::reset() noexcept {
-    owners_.clear();
+    for (auto position = owners_.begin(); position != owners_.end();) {
+        const PreparationRouteKey key = route_key(position->first);
+        if (!authority_ || authority_->reset_route(key))
+            position = owners_.erase(position);
+        else
+            ++position;
+    }
 }
 
 bool P50CRouteOwner::owns(

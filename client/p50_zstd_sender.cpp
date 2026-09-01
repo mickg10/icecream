@@ -112,6 +112,35 @@ struct P50ZstdSourceSender::Impl {
             authority, config.endpoint_caps, HistoryNonce{1});
     }
 
+    Impl(std::shared_ptr<P50PreparationAuthority> authority_value,
+         PreparationRouteKey route_value, PrepareRequestKey request_value,
+         ZstdSourceTransferConfig config_value)
+        : c_guid(authority_value ? authority_value->c_store_guid() : CStoreGuid{}),
+          request(request_value), config(std::move(config_value)),
+          authority(std::move(authority_value)), route(std::move(route_value)),
+          route_bound(true) {
+        if (!authority || c_guid == CStoreGuid{})
+            throw std::invalid_argument("sender requires a C preparation authority");
+        if (!nonzero_request(request))
+            throw std::invalid_argument("request/session identity is zero");
+        validate_zstd_tu_limits(config.endpoint_caps.zstd);
+        if (config.maximum_duration <= Clock::duration::zero() ||
+            config.maximum_duration > std::chrono::seconds(300))
+            throw std::invalid_argument("sender deadline duration is invalid");
+        if (config.max_completed_requests == 0)
+            throw std::invalid_argument("sender completed-request limit is zero");
+        if (config.deadline == Clock::time_point{})
+            throw std::invalid_argument("sender requires an absolute deadline");
+        if (config.endpoint_caps.zstd.max_raw_bytes > SIZE_MAX)
+            throw std::invalid_argument("ZSTD_TU raw limit does not fit this process");
+        if (config.endpoint_caps.zstd != authority->zstd_limits())
+            throw std::invalid_argument("sender and shared authority capabilities differ");
+        endpoint = std::make_unique<P50ClientEndpoint>(
+            authority, config.endpoint_caps, HistoryNonce{1}, nullptr, nullptr,
+            std::nullopt, std::function<void(EndpointCancelPermit)>{},
+            std::function<void(EndpointCancelPermit, EndpointTerminalResult)>{}, route);
+    }
+
     ZstdSourceTransferResult invalid(ZstdSourceTransferStatus status) const {
         ZstdSourceTransferResult result;
         result.status = status;
@@ -178,6 +207,8 @@ struct P50ZstdSourceSender::Impl {
     PrepareRequestKey request{};
     ZstdSourceTransferConfig config{};
     std::shared_ptr<P50PreparationAuthority> authority;
+    PreparationRouteKey route{};
+    bool route_bound = false;
     std::unique_ptr<P50ClientEndpoint> endpoint;
     std::map<PrepareRequestKey, CompletedRequest> completed;
     bool used = false;
@@ -187,6 +218,13 @@ P50ZstdSourceSender::P50ZstdSourceSender(CStoreGuid c_store_guid,
                                          PrepareRequestKey request,
                                          ZstdSourceTransferConfig config)
     : impl_(std::make_unique<Impl>(c_store_guid, request, std::move(config))) {}
+
+P50ZstdSourceSender::P50ZstdSourceSender(
+    std::shared_ptr<P50PreparationAuthority> authority,
+    PreparationRouteKey route, PrepareRequestKey request,
+    ZstdSourceTransferConfig config)
+    : impl_(std::make_unique<Impl>(std::move(authority), route, request,
+                                   std::move(config))) {}
 
 P50ZstdSourceSender::~P50ZstdSourceSender() = default;
 
@@ -333,7 +371,9 @@ P50ZstdSourceSender::transfer_bytes(
 
     PreparedTuHandle prepared;
     try {
-        prepared = impl_->authority->prepare(request, *source);
+        prepared = impl_->route_bound
+            ? impl_->authority->prepare_for_route(impl_->route, request, *source)
+            : impl_->authority->prepare(request, *source);
     } catch (const std::invalid_argument&) {
         co_return impl_->invalid(ZstdSourceTransferStatus::InvalidRequest);
     } catch (const std::length_error&) {
