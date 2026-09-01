@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -143,3 +144,43 @@ def test_repeat_full_only_carries_declared_relationship_state() -> None:
     assert repeat_full_state_contract("RAW_II")["fields"] == []
     assert repeat_full_state_contract("ZSTD_TU")["fields"] == []
     assert "committed_raw_prefix" in repeat_full_state_contract("ZSTD_ROUTE")["fields"]
+
+
+def test_native_repeat_full_carries_state_with_changed_assignment_map(tmp_path: Path) -> None:
+    topology = MatrixTopology.from_id("C1F20/40")
+
+    def assignment_row(index: int, relationship: int) -> dict[str, object]:
+        return {"ordinal": index, "global_slot": relationship * 2,
+                "f_relationship": relationship, "per_f_slot": 0,
+                "dispatch_order": index, "authority_dispatch_order": index,
+                "authority_worker": relationship, "authority_slot": 0,
+                "authority_build": index // 2, "authority_logical": index}
+
+    paths = []
+    for index, payload in enumerate((b"a" * 32, b"b" * 32, b"c" * 32, b"d" * 32)):
+        path = tmp_path / f"{index}.ii"
+        path.write_bytes(payload)
+        paths.append(path)
+
+    def occurrence(index: int) -> Occurrence:
+        raw = paths[index].read_bytes()
+        return Occurrence(index, None, source_path=str(paths[index]),
+                          source_sha256=hashlib.sha256(raw).hexdigest(),
+                          source_relative=paths[index].name)
+
+    predecessor = [occurrence(0), occurrence(1)]
+    measured = [occurrence(2), occurrence(3)]
+    predecessor_authority = {"status": "READY", "topology": "C1F20/40",
+        "selected_count": 2, "rows": [assignment_row(0, 0), assignment_row(1, 0)]}
+    measured_authority = {"status": "READY", "topology": "C1F20/40",
+        "selected_count": 2, "rows": [assignment_row(0, 1), assignment_row(1, 0)]}
+    prior = {"relationships": {"ZSTD_ROUTE": {
+        "C0|F0": {"committed_raw_prefix": "", "next_rel_seq": 0},
+        "C0|F1": {"committed_raw_prefix": "", "next_rel_seq": 0}}}}
+    result = MethodMatrixSimulator(
+        topology, methods=("ZSTD_ROUTE",), assignment_authority=measured_authority).run(
+            measured, repeat_full=True, prior_state=prior,
+            predecessor_occurrences=predecessor,
+            predecessor_assignment_authority=predecessor_authority)
+    assert result["status"] == "COMPLETED"
+    assert [row["product_transaction"]["tu_seq"] for row in result["rows"]] == [0, 2]
