@@ -14,6 +14,9 @@
 #include <zstd.h>
 
 #include "libbsc.h"
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 
 #include <algorithm>
 #include <cstddef>
@@ -68,6 +71,32 @@ struct DecodedFrame {
     Kind kind = Kind::Zstd3;
     std::size_t wire_bytes = 0;
     Bytes raw;
+};
+
+// Product residual coding runs on one owner thread per transaction.  libbsc's
+// LZP, BWT, and block-coder stages otherwise fan out over OpenMP worker threads
+// inside every call.  That is the only nondeterministic execution on the codec
+// path; pin each libbsc call to one thread.  The multithreading feature flag is
+// kept so the block format (aux BWT indexes) stays byte-identical to the
+// accepted evidence; only the execution width changes.
+class SingleThreadLibbscScope {
+public:
+    SingleThreadLibbscScope() {
+#if defined(_OPENMP)
+        saved_ = omp_get_max_threads();
+        omp_set_num_threads(1);
+#endif
+    }
+    ~SingleThreadLibbscScope() {
+#if defined(_OPENMP)
+        omp_set_num_threads(saved_ > 0 ? saved_ : 1);
+#endif
+    }
+    SingleThreadLibbscScope(const SingleThreadLibbscScope &) = delete;
+    SingleThreadLibbscScope &operator=(const SingleThreadLibbscScope &) = delete;
+
+private:
+    int saved_ = 1;
 };
 
 class Codec {
@@ -181,6 +210,7 @@ private:
     }
 
     Bytes encode_bsc(const std::uint8_t *input, std::size_t size) {
+        const SingleThreadLibbscScope single_thread;
         Bytes output;
         std::size_t offset = 0;
         while (offset < size) {
@@ -209,6 +239,7 @@ private:
     }
 
     Bytes decode_bsc(const std::uint8_t *payload, std::size_t payload_size) {
+        const SingleThreadLibbscScope single_thread;
         Bytes output;
         std::size_t offset = 0;
         while (offset < payload_size) {
