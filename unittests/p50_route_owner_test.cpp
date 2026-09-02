@@ -203,6 +203,35 @@ void test_same_request_route_fork_wire() {
     CHECK(actions0.valid() && actions1.valid());
 }
 
+void test_multiroute_release_lifetime() {
+    P50PreparationAuthority authority(
+        Id128::from_u64(191), config().endpoint_caps.zstd,
+        config().authority_limits, config().compression_level, ProfileId::P29);
+    const PrepareRequestKey request{7901, 1};
+    const std::vector<uint8_t> source{'m', 'u', 'l', 't', 'i', '-', 'r', 'o',
+                                      'u', 't', 'e', '\n'};
+    std::vector<PreparationRouteKey> routes;
+    std::vector<PreparedTuHandle> handles;
+    routes.reserve(20);
+    handles.reserve(20);
+    for (uint64_t index = 0; index != 20; ++index) {
+        routes.push_back(
+            {Id128::from_u64(300 + index), 1, ProfileId::P29});
+        handles.push_back(authority.prepare_for_route(routes.back(), request, source));
+        CHECK(authority.prepared_tu_seq(handles.back()).value == 0);
+    }
+    CHECK(authority.live_entry_count() == handles.size());
+    const std::vector<size_t> release_order{
+        19, 0, 18, 1, 17, 2, 16, 3, 15, 4,
+        14, 5, 13, 6, 12, 7, 11, 8, 10, 9};
+    for (size_t index : release_order)
+        CHECK(authority.release(handles[index]) == 0);
+    CHECK(authority.live_entry_count() == 0);
+    CHECK(authority.retained_encoded_bytes() == 0);
+    for (const auto& route : routes)
+        CHECK(authority.reset_route(route));
+}
+
 void test_long_lived_relationship_owner() {
     asio::io_context context;
     tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
@@ -483,6 +512,7 @@ int main() {
     test_source_transfer_operation_wire();
     test_long_lived_relationship_owner();
     test_same_request_route_fork_wire();
+    test_multiroute_release_lifetime();
     test_relationship_validation();
     test_p29_relationship_owner();
 #if defined(ICECC_P50_WITH_LIBBSC)

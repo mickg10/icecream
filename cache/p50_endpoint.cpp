@@ -1201,11 +1201,13 @@ uint64_t P50PreparationAuthority::release(PreparedTuHandle handle) {
     }
 #endif
     impl_->retained_bytes -= entry.retained_bytes;
+    const PreparationRouteKey route_key = entry.route;
+    const PrepareRequestKey request = entry.request;
     const std::shared_ptr<Impl::Shared> shared = entry.shared;
     impl_->entries.erase(position);
-    shared->entries.erase(entry.route);
+    shared->entries.erase(route_key);
     if (shared->entries.empty())
-        impl_->requests.erase(entry.request);
+        impl_->requests.erase(request);
     return 0;
 }
 
