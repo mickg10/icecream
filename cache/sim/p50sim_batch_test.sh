@@ -87,6 +87,7 @@ test "$(wc -l < "$work/p29.jsonl")" -eq 2
 if ICECC_P50_PROFILE=GRZ_RESIDUAL "$sim" --batch-manifest "$work/manifest" \
        --batch-assignment-map "$work/map1" --batch-output "$work/grz.jsonl" 2>"$work/grz.err"; then
     test "$(wc -l < "$work/grz.jsonl")" -eq 2
+    grz_available=1
     ICECC_P50_PROFILE=GRZ_RESIDUAL "$sim" --batch-manifest "$work/manifest20" \
         --batch-assignment-map "$work/map20" --batch-output "$work/grz20.jsonl"
     python3 - "$work/grz20.jsonl" <<'PY'
@@ -97,6 +98,7 @@ assert [row["tu_seq"] for row in rows] == list(range(20))
 assert [row["rel_seq"] for row in rows] == [0] * 20
 PY
 else
+    grz_available=0
     grep -q 'requires a simulator built with --with-libbsc' "$work/grz.err"
 fi
 
@@ -169,3 +171,61 @@ assert [row["segment"] for row in rows] == [
 assert rows[2]["state_before_digest"] == rows[1]["state_digest"]
 assert rows[4]["state_before_digest"] == rows[3]["state_digest"]
 PY
+
+# Real-input GRZ_RESIDUAL long control (finding F12).  The C1F1 Full-1 GRZ
+# arm at e58ed450 failed in the allocator while committing row 339 of 2,498
+# although every short control stayed silent, so a bounded real-input replay
+# is retained here as an opt-in gate.  Supply an authenticated C1F1 full-1
+# manifest.json (P50SIM_GRZ_REAL_MANIFEST); the first N selected inputs
+# (P50SIM_GRZ_REAL_ROWS, default 341 so the control passes the failing row)
+# are replayed through GRZ_RESIDUAL on one relationship and must produce a
+# clean exit with exactly N rows.  P50SIM_GRZ_REAL_EXPECTED names retained
+# rows (native-output.jsonl) that every replayed row must match field by
+# field; P50SIM_GRZ_REAL_DETERMINISM=1 replays the manifest a second time and
+# requires the two row streams to be identical in every content field.
+if [ -n "${P50SIM_GRZ_REAL_MANIFEST:-}" ] && [ "$grz_available" = 1 ]; then
+    real_rows=${P50SIM_GRZ_REAL_ROWS:-341}
+    python3 - "$P50SIM_GRZ_REAL_MANIFEST" "$real_rows" "$work/real.manifest" "$work/real.map" <<'PY'
+import json, os, sys
+manifest = json.load(open(sys.argv[1]))
+authority = manifest["input_authority"]
+root = authority.get("corpus_root", "")
+rows = int(sys.argv[2])
+selected = authority["selected_inputs"][:rows]
+if len(selected) != rows:
+    raise SystemExit("manifest has only %d selected inputs" % len(selected))
+paths = [os.path.join(root, entry["source_relative"]) for entry in selected]
+missing = [path for path in paths if not os.path.isfile(path)]
+if missing:
+    raise SystemExit("missing input " + missing[0])
+open(sys.argv[3], "w").write("".join(path + "\n" for path in paths))
+open(sys.argv[4], "w").write("cardinality=1\n" + "".join("0\n" for _ in paths))
+PY
+    ICECC_P50_PROFILE=GRZ_RESIDUAL "$sim" --batch-manifest "$work/real.manifest" \
+        --batch-assignment-map "$work/real.map" --batch-allow-repeated-inputs 1 \
+        --batch-output "$work/real-grz.jsonl"
+    test "$(wc -l < "$work/real-grz.jsonl")" -eq "$real_rows"
+    real_compare() {
+        python3 - "$1" "$2" <<'PY'
+import json, sys
+expected = [json.loads(line) for line in open(sys.argv[1])]
+got = [json.loads(line) for line in open(sys.argv[2])]
+fields = ("tu_seq", "rel_seq", "raw_bytes", "raw_digest", "encoded_source_bytes",
+          "c_to_f_bytes", "f_to_c_bytes", "state_before_digest", "state_digest",
+          "transaction_digest")
+for index, (want, have) in enumerate(zip(expected, got)):
+    for field in fields:
+        assert have.get(field) == want.get(field), (index, field, want.get(field), have.get(field))
+PY
+    }
+    if [ -n "${P50SIM_GRZ_REAL_EXPECTED:-}" ]; then
+        real_compare "$P50SIM_GRZ_REAL_EXPECTED" "$work/real-grz.jsonl"
+    fi
+    if [ "${P50SIM_GRZ_REAL_DETERMINISM:-0}" = 1 ]; then
+        ICECC_P50_PROFILE=GRZ_RESIDUAL "$sim" --batch-manifest "$work/real.manifest" \
+            --batch-assignment-map "$work/real.map" --batch-allow-repeated-inputs 1 \
+            --batch-output "$work/real-grz-2.jsonl"
+        test "$(wc -l < "$work/real-grz-2.jsonl")" -eq "$real_rows"
+        real_compare "$work/real-grz.jsonl" "$work/real-grz-2.jsonl"
+    fi
+fi
