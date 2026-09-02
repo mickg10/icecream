@@ -8,6 +8,7 @@
 
 #include <chrono>
 #include <future>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -230,6 +231,103 @@ void test_multiroute_release_lifetime() {
     CHECK(authority.retained_encoded_bytes() == 0);
     for (const auto& route : routes)
         CHECK(authority.reset_route(route));
+}
+
+void test_tu_seq_reservation_and_exhaustion() {
+    ZstdTuLimits tight = config().endpoint_caps.zstd;
+    tight.max_encoded_body_bytes = 32;
+    P50PreparationAuthority authority(
+        Id128::from_u64(192), tight, config().authority_limits,
+        config().compression_level, ProfileId::ZSTD_TU);
+    const PreparationRouteKey route{Id128::from_u64(392), 1,
+                                    ProfileId::ZSTD_TU};
+    const PrepareRequestKey request{7902, 1};
+    std::vector<uint8_t> incompressible(4096);
+    uint32_t state = 0x12345678U;
+    for (auto& byte : incompressible) {
+        state = state * 1664525U + 1013904223U;
+        byte = static_cast<uint8_t>(state >> 24);
+    }
+
+    // Encoding fails after the C-wide sequence was reserved.  The failed
+    // attempt leaves no request/entry behind, so the exact request can retry
+    // and receives TU0; the next distinct admitted request receives TU1.
+    bool encoding_failed = false;
+    try {
+        (void)authority.prepare_for_route(route, request, incompressible);
+    } catch (const std::length_error&) {
+        encoding_failed = true;
+    }
+    CHECK(encoding_failed);
+    CHECK(authority.live_entry_count() == 0 &&
+          authority.retained_encoded_bytes() == 0);
+    const std::vector<uint8_t> retry_input{'r', 'e', 't', 'r', 'y'};
+    const auto retry = authority.prepare_for_route(route, request, retry_input);
+    CHECK(authority.prepared_tu_seq(retry).value == 0);
+    CHECK(authority.release(retry) == 0);
+    const auto next = authority.prepare_for_route(
+        route, PrepareRequestKey{7902, 2}, std::span<const uint8_t>(retry_input));
+    CHECK(authority.prepared_tu_seq(next).value == 1);
+    CHECK(authority.release(next) == 0);
+
+    // P29 builds its residual body before retained-byte admission.  A body
+    // that is too large for that admission bound therefore exercises the
+    // post-encode rollback path; a smaller retry of the same request still
+    // starts at the unconsumed TU0.
+    PreparationAuthorityLimits post_limits = config().authority_limits;
+    post_limits.max_retained_encoded_bytes = 512;
+    P50PreparationAuthority post_admission(
+        Id128::from_u64(194), config().endpoint_caps.zstd, post_limits,
+        config().compression_level, ProfileId::P29);
+    const PreparationRouteKey post_route{Id128::from_u64(394), 1,
+                                         ProfileId::P29};
+    incompressible.back() = '\n';
+    bool post_admission_failed = false;
+    try {
+        (void)post_admission.prepare_for_route(
+            post_route, PrepareRequestKey{7904, 1}, incompressible);
+    } catch (const std::length_error&) {
+        post_admission_failed = true;
+    }
+    CHECK(post_admission_failed);
+    CHECK(post_admission.live_entry_count() == 0 &&
+          post_admission.retained_encoded_bytes() == 0);
+    const std::vector<uint8_t> post_retry_input{'p', 'o', 's', 't', '\n'};
+    const auto post_retry = post_admission.prepare_for_route(
+        post_route, PrepareRequestKey{7904, 1}, post_retry_input);
+    CHECK(post_admission.prepared_tu_seq(post_retry).value == 0);
+    CHECK(post_admission.release(post_retry) == 0);
+
+    // A nonzero start can be consumed exactly once.  A second route/profile
+    // view of that same request uses the consumed identity, while a distinct
+    // request fails closed at exhaustion.
+    P50PreparationAuthority exhausted(
+        Id128::from_u64(193), config().endpoint_caps.zstd,
+        config().authority_limits, config().compression_level,
+        ProfileId::ZSTD_TU, TuSeq{std::numeric_limits<uint64_t>::max()});
+    const PreparationRouteKey zstd_route{Id128::from_u64(393), 1,
+                                         ProfileId::ZSTD_TU};
+    const PreparationRouteKey p29_route{Id128::from_u64(394), 1,
+                                        ProfileId::P29};
+    const std::vector<uint8_t> source{'m', 'a', 'x', '\n'};
+    const auto max_zstd = exhausted.prepare_for_route(
+        zstd_route, PrepareRequestKey{7903, 1}, source);
+    const auto max_p29 = exhausted.prepare_for_route(
+        p29_route, PrepareRequestKey{7903, 1}, source);
+    CHECK(exhausted.prepared_tu_seq(max_zstd).value ==
+          std::numeric_limits<uint64_t>::max());
+    CHECK(exhausted.prepared_tu_seq(max_p29) ==
+          exhausted.prepared_tu_seq(max_zstd));
+    CHECK(exhausted.release(max_zstd) == 0);
+    CHECK(exhausted.release(max_p29) == 0);
+    bool exhausted_failed = false;
+    try {
+        (void)exhausted.prepare_for_route(
+            zstd_route, PrepareRequestKey{7903, 2}, source);
+    } catch (const std::overflow_error&) {
+        exhausted_failed = true;
+    }
+    CHECK(exhausted_failed);
 }
 
 void test_long_lived_relationship_owner() {
@@ -513,6 +611,7 @@ int main() {
     test_long_lived_relationship_owner();
     test_same_request_route_fork_wire();
     test_multiroute_release_lifetime();
+    test_tu_seq_reservation_and_exhaustion();
     test_relationship_validation();
     test_p29_relationship_owner();
 #if defined(ICECC_P50_WITH_LIBBSC)

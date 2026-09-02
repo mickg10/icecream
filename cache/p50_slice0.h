@@ -251,7 +251,8 @@ class CAuthority {
 public:
     explicit CAuthority(CStoreGuid guid,
                         p29::OnlineS1::Config config = p29::OnlineS1::Config{},
-                        uint16_t generation = 0, uint64_t first_ordinal = 1);
+                        uint16_t generation = 0, uint64_t first_ordinal = 1,
+                        TuSeq first_tu_seq = {});
 
     Key64 intern_bytes(ObjectType type, std::span<const uint8_t> payload) {
         return arena_.intern_bytes(type, payload);
@@ -284,6 +285,11 @@ private:
     // The preparation authority is the sole caller and chooses no external
     // identity; it advances this allocator exactly once per C-wide record.
     TuSeq allocate_tu_seq();
+    // Reserve and commit are split so a failed preparation never consumes a
+    // C-wide identity.  Both are owner-thread operations; commit accepts only
+    // the currently reserved successor and cannot roll back a published TU.
+    TuSeq reserve_tu_seq() const;
+    void commit_tu_seq(TuSeq reserved);
     uint32_t dense_region(Key64 key);
     PreparedTUPtr prepare_tu_at_seq(std::span<const uint8_t> exact_input,
                                     std::span<const Key64> regions,

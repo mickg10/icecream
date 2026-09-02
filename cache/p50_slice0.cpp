@@ -926,16 +926,29 @@ const ImmutableObject& CObjectArena::object(Key64 key) const {
 }
 
 CAuthority::CAuthority(CStoreGuid guid, p29::OnlineS1::Config config,
-                       uint16_t generation, uint64_t first_ordinal)
-    : arena_(guid, generation, first_ordinal), s1_config_(config) {}
+                       uint16_t generation, uint64_t first_ordinal,
+                       TuSeq first_tu_seq)
+    : arena_(guid, generation, first_ordinal), s1_config_(config),
+      next_tu_seq_(first_tu_seq.value) {}
 
-TuSeq CAuthority::allocate_tu_seq() {
-    if (tu_seq_exhausted_) throw std::overflow_error("TU_SEQ space exhausted");
-    const TuSeq result{next_tu_seq_};
+TuSeq CAuthority::reserve_tu_seq() const {
+    if (tu_seq_exhausted_)
+        throw std::overflow_error("TU_SEQ space exhausted");
+    return TuSeq{next_tu_seq_};
+}
+
+void CAuthority::commit_tu_seq(TuSeq reserved) {
+    if (tu_seq_exhausted_ || reserved.value != next_tu_seq_)
+        throw std::logic_error("TU_SEQ reservation is no longer current");
     if (next_tu_seq_ == std::numeric_limits<uint64_t>::max())
         tu_seq_exhausted_ = true;
     else
         ++next_tu_seq_;
+}
+
+TuSeq CAuthority::allocate_tu_seq() {
+    const TuSeq result = reserve_tu_seq();
+    commit_tu_seq(result);
     return result;
 }
 

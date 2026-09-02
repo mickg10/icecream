@@ -230,7 +230,8 @@ public:
         ZstdTuLimits zstd_limits = {uint64_t{64} << 20, uint64_t{2} << 30},
                                      PreparationAuthorityLimits authority_limits = {},
                                      int compression_level = 1,
-                                     ProfileId profile = ProfileId::ZSTD_TU);
+                                     ProfileId profile = ProfileId::ZSTD_TU,
+                                     TuSeq first_tu_seq = {});
     ~P50PreparationAuthority();
     P50PreparationAuthority(const P50PreparationAuthority&) = delete;
     P50PreparationAuthority& operator=(const P50PreparationAuthority&) = delete;

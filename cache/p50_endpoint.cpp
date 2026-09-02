@@ -889,7 +889,7 @@ struct P50PreparationAuthority::Impl {
 
     Impl(CStoreGuid c_store_guid_value, ZstdTuLimits zstd_limits_value,
          PreparationAuthorityLimits authority_limits_value, int compression_level,
-         ProfileId profile_value)
+         ProfileId profile_value, TuSeq first_tu_seq)
         : c_guid(c_store_guid_value), zstd_limits(zstd_limits_value),
           authority_limits(authority_limits_value), codec(compression_level),
           identity(std::make_shared<const uint8_t>(0)), route_codec(3),
@@ -907,7 +907,8 @@ struct P50PreparationAuthority::Impl {
 #endif
             )
             throw std::invalid_argument("preparation authority profile is unsupported");
-        p29_authority = std::make_unique<CAuthority>(c_guid);
+        p29_authority = std::make_unique<CAuthority>(c_guid, p29::OnlineS1::Config{},
+                                                      0, 1, first_tu_seq);
     }
 
     static PreparationRouteKey legacy_route(ProfileId profile) {
@@ -970,9 +971,9 @@ struct P50PreparationAuthority::Impl {
 P50PreparationAuthority::P50PreparationAuthority(
     CStoreGuid c_store_guid, ZstdTuLimits zstd_limits,
     PreparationAuthorityLimits authority_limits, int compression_level,
-    ProfileId profile)
+    ProfileId profile, TuSeq first_tu_seq)
     : impl_(std::make_unique<Impl>(c_store_guid, zstd_limits, authority_limits,
-                                   compression_level, profile)) {}
+                                   compression_level, profile, first_tu_seq)) {}
 
 P50PreparationAuthority::~P50PreparationAuthority() = default;
 
@@ -992,6 +993,7 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
         throw std::length_error("P50 raw input exceeds the local cap");
     const Digest128 raw_digest = digest128(exact_input);
     std::shared_ptr<Impl::Shared> shared;
+    std::optional<TuSeq> reserved_tu_seq;
     if (const auto request_position = impl_->requests.find(request);
         request_position != impl_->requests.end()) {
         shared = request_position->second;
@@ -1027,9 +1029,11 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
         shared->raw_bytes = exact_input.size();
         shared->raw_digest = raw_digest;
         shared->raw.assign(exact_input.begin(), exact_input.end());
-        // TU_SEQ is allocated exactly once at C-wide request admission,
-        // before any profile-specific view is encoded.
-        shared->tu_seq = impl_->p29_authority->allocate_tu_seq();
+        // Reserve exactly once at C-wide request admission.  The reservation
+        // is committed only after encoding and all retained-entry bookkeeping
+        // succeeds, so a failed attempt leaves the same TU_SEQ for retry.
+        reserved_tu_seq = impl_->p29_authority->reserve_tu_seq();
+        shared->tu_seq = *reserved_tu_seq;
     }
     const TuSeq tu_seq = shared->tu_seq;
     const uint64_t entry_id = impl_->next_entry_candidate();
@@ -1138,6 +1142,8 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
             route.uncommitted_grz_entry = entry_id;
 #endif
         impl_->consume_entry();
+        if (reserved_tu_seq)
+            impl_->p29_authority->commit_tu_seq(*reserved_tu_seq);
         return PreparedTuHandle(impl_->identity, entry_id);
     } catch (...) {
         if (p29_active_started && route.p29_route)
