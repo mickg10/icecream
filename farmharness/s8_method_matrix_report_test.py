@@ -18,6 +18,18 @@ def _experiment(tmp_path: Path, *, timestamp: str = "20260901T120000Z",
           timestamp=timestamp, depth=depth, pass_id=pass_id)
 
 
+def _producer_identity(*, head: str = "a" * 40) -> dict[str, object]:
+    return {
+        "schema": report.PRODUCER_IDENTITY_SCHEMA,
+        "source": {"head": head, "tree": "b" * 40},
+        "p50sim_binary": {"path": "/product/cache/sim/.p50sim.bin",
+                           "bytes": 123, "sha256": "c" * 64},
+        "build_receipt": {"schema": "icecream-p50sim-build-v1",
+                           "path": "/product/cache/sim/.p50sim-build.json",
+                           "bytes": 456, "sha256": "d" * 64},
+    }
+
+
 def test_report_has_one_row_per_method_and_raw_is_descriptor_only(tmp_path: Path) -> None:
     experiment = _experiment(tmp_path / "source")
     output = report.build_report([experiment], tmp_path / "reports")
@@ -122,6 +134,47 @@ def test_full2_requires_continuity_marker(tmp_path: Path) -> None:
         "INCOMPLETE_REQUESTED_MATRIX"
 
 
+def test_full2_continuity_failure_is_listed_as_missing_evidence(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    experiment = (tmp_path / "source").absolute()
+    identity = ("C1F1/100000", "state-carrying-full-2", "p")
+    marker = {"status": "NOT_PROVEN", "predecessor_bound": False,
+              "relationship_state_present": False,
+              "reason": "producer_identity_binding_missing"}
+    manifest = {"methods": list(report.METHODS),
+                "run_identity": {"timestamp": "20260901T120000Z",
+                                 "topology": identity[0], "depth": identity[1],
+                                 "pass": identity[2]}}
+
+    def fake_load(_path: Path):
+        return manifest, [], {}, {}, identity, "a" * 64, marker
+
+    def fake_result(path: Path, _manifest, _summary, _grouped, method: str,
+                    topology: str, depth: str, pass_id: str, timestamp: str,
+                    continuity: dict[str, object], manifest_sha256: str):
+        return {"schema": report.REPORT_SCHEMA, "source_experiment": str(path),
+                "source_manifest_sha256": manifest_sha256, "topology": topology,
+                "relationship_count": 1, "capacity": 100000, "depth": depth,
+                "pass": pass_id, "run_timestamp": timestamp, "run_identity": {},
+                "method": method, "classification": "core" if method in report.CORE_METHODS
+                else "optional", "status": "READY", "reason": None,
+                "raw_bytes": 1, "encoded_bytes": None if method == "RAW_II" else 1,
+                "c_to_f_bytes": None if method == "RAW_II" else 1,
+                "f_to_c_bytes": None if method == "RAW_II" else 1,
+                "execution_ns": None if method == "RAW_II" else 1,
+                "wire_witnessed": method != "RAW_II", "compression_ratio": None,
+                "byte_reduction_fraction": None, "ratio_reason": None,
+                "full2_continuity": dict(continuity)}
+
+    monkeypatch.setattr(report, "_load_experiment", fake_load)
+    monkeypatch.setattr(report, "_method_result", fake_result)
+    output = report.build_report([experiment], tmp_path / "reports")
+    summary = json.loads((output / "summary.json").read_text())
+    assert summary["status"] == "INCOMPLETE_REQUESTED_MATRIX"
+    assert {item["reason"] for item in summary["missing_core_evidence"]} == {
+        "full2_continuity_not_proven"}
+
+
 def test_full2_mismatched_predecessor_stays_not_proven(tmp_path: Path) -> None:
     predecessor = _experiment(tmp_path / "predecessor", depth="full-1", pass_id="full1")
     experiment = _experiment(tmp_path / "current", depth="state-carrying-full-2")
@@ -143,7 +196,11 @@ def test_full2_mismatched_predecessor_stays_not_proven(tmp_path: Path) -> None:
                                        "unrelated_prefix", "final_digest", "missing_last_tx",
                                        "missing_row_rel", "missing_transaction_tu",
                                        "wrong_transaction_rel", "missing_transaction_next_rel",
-                                       "wrong_transaction_next_rel", "wrong_c_authority"))
+                                       "wrong_transaction_next_rel", "wrong_c_authority",
+                                       "missing_current_producer", "missing_predecessor_producer",
+                                       "relocated_producer", "binary_mutation", "binary_bytes_mutation",
+                                       "malformed_producer",
+                                       "internal_authority_mismatch"))
 def test_full2_current_state_marker_omission_partial_and_type_stay_not_proven(
         monkeypatch: pytest.MonkeyPatch, mutation: str) -> None:
     topology = "C1F1/100000"
@@ -176,6 +233,13 @@ def test_full2_current_state_marker_omission_partial_and_type_stay_not_proven(
                                              for method in ("ZSTD_ROUTE", "P29", "GRZ_RESIDUAL")},
                            "relationships": {method: {key: copy.deepcopy(prior_state)}
                                              for method in ("ZSTD_ROUTE", "P29", "GRZ_RESIDUAL")}}
+    producer = _producer_identity()
+    predecessor_manifest["producer_identity"] = {
+        method: copy.deepcopy(producer)
+        for method in ("ZSTD_ROUTE", "P29", "GRZ_RESIDUAL")}
+    predecessor_manifest["authority"] = {
+        method: {"producer_identity": copy.deepcopy(producer)}
+        for method in ("ZSTD_ROUTE", "P29", "GRZ_RESIDUAL")}
     monkeypatch.setattr(simulator, "verify_experiment", lambda path: {
         "experiment": predecessor_path, "manifest": predecessor_manifest,
         "summary": predecessor_summary, "manifest_facts": {"sha256": "c" * 64}})
@@ -183,6 +247,12 @@ def test_full2_current_state_marker_omission_partial_and_type_stay_not_proven(
         "experiment": predecessor_path, "manifest_sha256": "c" * 64,
         "run_identity": predecessor_identity, "selected_inputs": [],
         "assignment": assignment}, "assignment_authority": {"topology": topology}}
+    manifest["producer_identity"] = {
+        method: copy.deepcopy(producer)
+        for method in ("ZSTD_ROUTE", "P29", "GRZ_RESIDUAL")}
+    manifest["authority"] = {
+        method: {"producer_identity": copy.deepcopy(producer)}
+        for method in ("ZSTD_ROUTE", "P29", "GRZ_RESIDUAL")}
     summary = {"c_authorities": {method: {"native_next_tu_seq": 6}
                                   for method in ("ZSTD_ROUTE", "P29", "GRZ_RESIDUAL")},
                "relationships": {method: {key: copy.deepcopy(after_state)}
@@ -207,6 +277,10 @@ def test_full2_current_state_marker_omission_partial_and_type_stay_not_proven(
     valid_marker = report._full2_marker(manifest, summary, rows, topology,
                                         "state-carrying-full-2")
     assert valid_marker["status"] == "CONTINUOUS"
+    assert valid_marker["compatibility_basis"] == "bit_identical_p50sim"
+    assert valid_marker["producer_identity"]["current"]["P29"] == producer
+    assert valid_marker["producer_identity"]["predecessor"]["P29"] == producer
+    expected_status = "NOT_PROVEN"
     if mutation == "omit_next":
         del summary["relationships"]["P29"][key]["native_next_rel_seq"]
     elif mutation == "zero_next":
@@ -233,11 +307,40 @@ def test_full2_current_state_marker_omission_partial_and_type_stay_not_proven(
         rows[0]["product_transaction"]["native_next_rel_seq"] = 7
     elif mutation == "wrong_c_authority":
         summary["c_authorities"]["P29"]["native_next_tu_seq"] = 7
+    elif mutation == "missing_current_producer":
+        del manifest["producer_identity"]
+    elif mutation == "missing_predecessor_producer":
+        del predecessor_manifest["producer_identity"]
+    elif mutation == "relocated_producer":
+        relocated = _producer_identity(head="e" * 40)
+        relocated["source"]["tree"] = "f" * 40
+        relocated["p50sim_binary"]["path"] = "/relocated/cache/.p50sim.bin"
+        relocated["build_receipt"]["path"] = "/relocated/cache/.p50sim-build.json"
+        relocated["build_receipt"]["sha256"] = "f" * 64
+        manifest["producer_identity"]["P29"] = relocated
+        manifest["authority"]["P29"]["producer_identity"] = copy.deepcopy(relocated)
+        expected_status = "CONTINUOUS"
+    elif mutation == "binary_mutation":
+        changed = copy.deepcopy(producer)
+        changed["p50sim_binary"]["sha256"] = "e" * 64
+        manifest["producer_identity"]["P29"] = changed
+        manifest["authority"]["P29"]["producer_identity"] = copy.deepcopy(changed)
+    elif mutation == "binary_bytes_mutation":
+        changed = copy.deepcopy(producer)
+        changed["p50sim_binary"]["bytes"] += 1
+        manifest["producer_identity"]["P29"] = changed
+        manifest["authority"]["P29"]["producer_identity"] = copy.deepcopy(changed)
+    elif mutation == "malformed_producer":
+        manifest["producer_identity"]["P29"].pop("build_receipt")
+    elif mutation == "internal_authority_mismatch":
+        manifest["authority"]["P29"]["producer_identity"] = _producer_identity(head="e" * 40)
     else:
         del rows[0]["product_transaction"]["state_digest"]
     marker = report._full2_marker(manifest, summary, rows, topology,
                                   "state-carrying-full-2")
-    assert marker["status"] == "NOT_PROVEN"
+    assert marker["status"] == expected_status
+    if expected_status == "CONTINUOUS":
+        assert marker["compatibility_basis"] == "bit_identical_p50sim"
 
 
 def test_full2_marker_c1f20_checks_c_wide_tu_and_each_route_rel(
@@ -290,6 +393,11 @@ def test_full2_marker_c1f20_checks_c_wide_tu_and_each_route_rel(
                             "run_identity": identity,
                             "input_authority": {"selected_inputs": []},
                             "assignment_authority": assignment}
+    producer = _producer_identity()
+    predecessor_manifest["producer_identity"] = {
+        method: copy.deepcopy(producer) for method in methods}
+    predecessor_manifest["authority"] = {
+        method: {"producer_identity": copy.deepcopy(producer)} for method in methods}
     predecessor_summary = {"schema": simulator.SUMMARY_SCHEMA,
                            "topology": {"id": topology},
                            "c_authorities": {method: {"native_next_tu_seq": 20}
@@ -303,6 +411,10 @@ def test_full2_marker_c1f20_checks_c_wide_tu_and_each_route_rel(
         "experiment": predecessor_path, "manifest_sha256": "c" * 64,
         "run_identity": identity, "selected_inputs": [], "assignment": assignment},
         "assignment_authority": {"topology": topology}}
+    manifest["producer_identity"] = {
+        method: copy.deepcopy(producer) for method in methods}
+    manifest["authority"] = {
+        method: {"producer_identity": copy.deepcopy(producer)} for method in methods}
     summary = {"c_authorities": {method: {"native_next_tu_seq": 40}
                                   for method in methods},
                "relationships": {method: copy.deepcopy(after) for method in methods}}

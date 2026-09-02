@@ -71,6 +71,7 @@ AUTH_LIBBSC_TREE = "1e35539f6c626639f66b9a83a84bc21b2cd84418"
 AUTH_LIBBSC_ARCHIVE_SHA256 = "39edf31118aa546a0439a08e730a7bcab522f376fa9a715fc17a3add4c760ccf"
 AUTH_LIBBSC_LIBRARY_SHA256 = "b7446c05a46405cd85eb4ca4d2615350c29e7b9d3ce758e528b37a622c944879"
 AUTH_LIBBSC_HEADER_SHA256 = "27dfa3fc8f383aff80e5fb3bcb79efd5d73918784b55fa1f46f8b373c9c965de"
+PRODUCER_IDENTITY_SCHEMA = "icecream-s8-native-producer-identity-v1"
 
 
 class MatrixError(ValueError):
@@ -868,6 +869,44 @@ def _native_receipt(root: Path) -> tuple[dict[str, object] | None, dict[str, obj
         receipt = _strict_json(receipt_raw, "native_receipt")
         if not isinstance(receipt, Mapping):
             raise MatrixError("native_receipt:schema_invalid")
+        # Validate every nested authority container before any chained
+        # ``.get`` below.  A syntactically valid receipt is not necessarily a
+        # structurally valid receipt; malformed producer metadata must remain
+        # NOT_READY rather than escaping an AttributeError.
+        source = receipt.get("source")
+        binary_descriptor = receipt.get("binary")
+        declared_inputs = receipt.get("inputs")
+        configuration = receipt.get("configuration")
+        libbsc = receipt.get("libbsc")
+        if ("libbsc" not in receipt or
+                not isinstance(source, Mapping) or
+                not isinstance(binary_descriptor, Mapping) or
+                not isinstance(declared_inputs, Mapping) or
+                not isinstance(configuration, Mapping) or
+                (libbsc is not None and not isinstance(libbsc, Mapping))):
+            raise MatrixError("native_receipt:nested_schema_invalid")
+        if (set(configuration) != {"with_libbsc", "make_mode", "dependency_root",
+                                   "compiler_path", "compiler_version"} or
+                type(configuration.get("with_libbsc")) is not int or
+                configuration.get("with_libbsc") not in (0, 1) or
+                not isinstance(configuration.get("make_mode"), str) or
+                not isinstance(configuration.get("dependency_root"), str) or
+                not isinstance(configuration.get("compiler_path"), str) or
+                not isinstance(configuration.get("compiler_version"), str) or
+                not configuration.get("compiler_version")):
+            raise MatrixError("native_receipt:configuration_invalid")
+        if configuration["with_libbsc"] == 0 and libbsc is not None:
+            raise MatrixError("native_receipt:libbsc_configuration_mismatch")
+        if configuration["with_libbsc"] == 1:
+            if (not isinstance(libbsc, Mapping) or
+                    not {"source_root", "head", "tree", "archive", "archive_sha256",
+                         "header", "library", "provenance", "source_manifest"}.issubset(libbsc) or
+                    not all(isinstance(libbsc.get(field), str) and libbsc.get(field)
+                            for field in ("source_root", "head", "tree", "archive_sha256")) or
+                    not isinstance(libbsc.get("archive"), Mapping) or
+                    not all(isinstance(libbsc.get(field), Mapping)
+                            for field in ("header", "library", "provenance", "source_manifest"))):
+                raise MatrixError("native_receipt:libbsc_invalid")
         binary_facts = _private_digest(binary, "native p50sim binary")
         head = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"],
                                        text=True, timeout=10).strip()
@@ -875,7 +914,6 @@ def _native_receipt(root: Path) -> tuple[dict[str, object] | None, dict[str, obj
                                        text=True, timeout=10).strip()
     except (OSError, json.JSONDecodeError, MatrixError):
         return None, receipt_facts
-    declared_inputs = receipt.get("inputs", {})
     input_paths = {"p50sim_source": root / "cache" / "sim" / "p50sim.cpp",
                    "config_h": root / "config.h",
                    "cache_makefile": root / "cache" / "Makefile",
@@ -893,13 +931,56 @@ def _native_receipt(root: Path) -> tuple[dict[str, object] | None, dict[str, obj
         inputs_match = isinstance(declared, Mapping) and all(
             declared.get(field) == current.get(field) for field in ("path", "bytes", "sha256"))
     if (receipt.get("schema") != "icecream-p50sim-build-v1" or not inputs_match or
-            receipt.get("source", {}).get("head") != head or
-            receipt.get("source", {}).get("tree") != tree or
-            receipt.get("binary", {}).get("path") != str(binary) or
-            receipt.get("binary", {}).get("sha256") != binary_facts["sha256"] or
-            receipt.get("binary", {}).get("bytes") != binary_facts["bytes"]):
+            source.get("head") != head or source.get("tree") != tree or
+            binary_descriptor.get("path") != str(binary) or
+            binary_descriptor.get("sha256") != binary_facts["sha256"] or
+            binary_descriptor.get("bytes") != binary_facts["bytes"]):
         return None, receipt_facts
     return receipt, receipt_facts
+
+
+def _native_producer_identity(
+        receipt: Mapping[str, object] | None,
+        receipt_facts: Mapping[str, object]) -> dict[str, object] | None:
+    """Return the exact native producer identity retained by an experiment.
+
+    ``_native_receipt`` has already authenticated the receipt against the
+    current source tree and binary.  This is the compact, additive descriptor
+    persisted into experiment metadata so a repeat run can bind both sides to
+    the same producer without retaining the receipt body.
+    """
+    if not isinstance(receipt, Mapping):
+        return None
+    source = receipt.get("source")
+    binary = receipt.get("binary")
+    if (not isinstance(source, Mapping) or not isinstance(binary, Mapping) or
+            source.get("head") is None or source.get("tree") is None or
+            not isinstance(source.get("head"), str) or
+            not re.fullmatch(r"[0-9a-f]{40}", source["head"]) or
+            not isinstance(source.get("tree"), str) or
+            not re.fullmatch(r"[0-9a-f]{40}", source["tree"]) or
+            not isinstance(binary.get("path"), str) or not binary["path"] or
+            type(binary.get("bytes")) is not int or binary["bytes"] <= 0 or
+            not isinstance(binary.get("sha256"), str) or
+            not re.fullmatch(r"[0-9a-f]{64}", binary["sha256"]) or
+            not isinstance(receipt_facts.get("path"), str) or
+            not receipt_facts["path"] or
+            type(receipt_facts.get("bytes")) is not int or
+            receipt_facts["bytes"] <= 0 or
+            not isinstance(receipt_facts.get("sha256"), str) or
+            not re.fullmatch(r"[0-9a-f]{64}", receipt_facts["sha256"]) or
+            receipt.get("schema") != "icecream-p50sim-build-v1"):
+        return None
+    return {
+        "schema": PRODUCER_IDENTITY_SCHEMA,
+        "source": {"head": source["head"], "tree": source["tree"]},
+        "p50sim_binary": {"path": binary["path"], "bytes": binary["bytes"],
+                           "sha256": binary["sha256"]},
+        "build_receipt": {"schema": receipt["schema"],
+                           "path": receipt_facts["path"],
+                           "bytes": receipt_facts["bytes"],
+                           "sha256": receipt_facts["sha256"]},
+    }
 
 
 def _libbsc_authority(root: Path) -> dict[str, object]:
@@ -943,6 +1024,7 @@ def method_authority(method: str) -> dict[str, object]:
     native_binary = root / "cache" / "sim" / ".p50sim.bin"
     receipt, receipt_facts = _native_receipt(root)
     libbsc = _libbsc_authority(root)
+    producer_identity = _native_producer_identity(receipt, receipt_facts)
     if method == "RAW_II":
         return {"status": "READY", "kind": "whole-legacy-control",
                 "authority": [_authority_file(product,
@@ -957,6 +1039,7 @@ def method_authority(method: str) -> dict[str, object]:
                     _authority_file(native_binary, "native product codec binary"),
                     _authority_file(product,
                     "ZstdTuCodec resets session and parameters for each independent TU")],
+                "producer_identity": producer_identity,
                 "contract": "independent level-3 frame/context per TU",
                 "reason": None if status == "READY" else "MISSING_AUTHORITY: exact native receipt/binary/source"}
     if method == "ZSTD_ROUTE":
@@ -968,6 +1051,7 @@ def method_authority(method: str) -> dict[str, object]:
                     _authority_file(native_binary, "native product codec binary"),
                     _authority_file(product,
                     "ZstdRouteCodec resets a fresh level-3 frame and refPrefixes committed raw history")],
+                "producer_identity": producer_identity,
                 "contract": "one bounded-prefix frame per TU; commit advances relationship state",
                 "reason": None if status == "READY" else "MISSING_AUTHORITY: exact native receipt/binary/source"}
     if method in {"P29", "GRZ_RESIDUAL"}:
@@ -978,6 +1062,7 @@ def method_authority(method: str) -> dict[str, object]:
                 "authority": [product_facts,
                     receipt_facts, _authority_file(native_binary, "native product profile binary"),
                     *([libbsc] if method == "GRZ_RESIDUAL" else [])],
+                "producer_identity": producer_identity,
                 "contract": "native p50sim profile batch; no Python approximation",
                 "reason": None if ready else ("MISSING_AUTHORITY: authenticated libbsc build receipt"
                     if method == "GRZ_RESIDUAL" else "MISSING_AUTHORITY: native p50sim receipt")}
@@ -1246,8 +1331,9 @@ class MethodMatrixSimulator:
         if (stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or
                 info.st_nlink != 1 or not os.access(binary, os.X_OK) or
                 receipt.get("schema") != "icecream-p50sim-build-v1" or
-                receipt.get("binary", {}).get("path") != str(binary) or
-                receipt.get("binary", {}).get("sha256") != _private_digest(
+                not isinstance(receipt.get("binary"), Mapping) or
+                receipt["binary"].get("path") != str(binary) or
+                receipt["binary"].get("sha256") != _private_digest(
                     binary, "native p50sim binary")["sha256"]):
             raise NotReady("MISSING_AUTHORITY: native p50sim receipt is stale")
         prefix_file = None
@@ -1467,6 +1553,11 @@ class MethodMatrixSimulator:
                 stream.write(_canonical(row))
         summary = self._summary(rows, experiment, states_by_method)
         (experiment / "summary.json").write_bytes(_canonical(summary))
+        producer_identities = {
+            method: self.authority[method]["producer_identity"]
+            for method in self.methods
+            if isinstance(self.authority[method].get("producer_identity"), Mapping)
+        }
         descriptors = {}
         for path in sorted(p for p in experiment.rglob("*") if p.is_file() and p.name != "manifest.json"):
             raw = path.read_bytes()
@@ -1475,6 +1566,7 @@ class MethodMatrixSimulator:
         manifest = {"schema": SCHEMA, "experiment": experiment.name,
                     "topology": self._topology_record(), "methods": list(self.methods),
                     "authority": self.authority, "repeat_full": repeat_full,
+                    "producer_identity": producer_identities,
                     "repeat_full_state_contract": {
                         method: repeat_full_state_contract(method) for method in self.methods},
                     "relationship_count": self.topology.relationship_count,

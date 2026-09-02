@@ -33,6 +33,7 @@ TOPOLOGIES = ("C1F1/100000", "C1F20/40")
 DEPTHS = ("100", "200", "full-1", "state-carrying-full-2")
 METHODS = tuple(simulator.METHODS)
 CORE_METHODS = frozenset(simulator.CORE_METHODS)
+STATEFUL_METHODS = frozenset(simulator.STATEFUL_METHODS)
 METHOD_ORDER = {name: index for index, name in enumerate(METHODS)}
 DEPTH_ORDER = {name: index for index, name in enumerate(DEPTHS)}
 EXPECTED_TOPOLOGY = {
@@ -42,6 +43,7 @@ EXPECTED_TOPOLOGY = {
                  "global_slots": 40},
 }
 ROW_STATUSES = frozenset(("READY", "NOT_READY", "NOT_IMPLEMENTED"))
+PRODUCER_IDENTITY_SCHEMA = simulator.PRODUCER_IDENTITY_SCHEMA
 
 
 class ReportError(ValueError):
@@ -205,6 +207,48 @@ def _not_proven(reason: str) -> dict[str, Any]:
             "reason": reason}
 
 
+def _valid_producer_identity(value: object) -> bool:
+    """Validate the compact identity emitted by the native simulator seam."""
+    if not isinstance(value, Mapping) or set(value) != {
+            "schema", "source", "p50sim_binary", "build_receipt"}:
+        return False
+    if value.get("schema") != PRODUCER_IDENTITY_SCHEMA:
+        return False
+    source = value.get("source")
+    binary = value.get("p50sim_binary")
+    receipt = value.get("build_receipt")
+    return (
+        isinstance(source, Mapping) and set(source) == {"head", "tree"} and
+        isinstance(source.get("head"), str) and
+        re.fullmatch(r"[0-9a-f]{40}", source["head"]) is not None and
+        isinstance(source.get("tree"), str) and
+        re.fullmatch(r"[0-9a-f]{40}", source["tree"]) is not None and
+        isinstance(binary, Mapping) and set(binary) == {"path", "bytes", "sha256"} and
+        isinstance(binary.get("path"), str) and bool(binary["path"]) and
+        type(binary.get("bytes")) is int and binary["bytes"] > 0 and
+        isinstance(binary.get("sha256"), str) and
+        re.fullmatch(r"[0-9a-f]{64}", binary["sha256"]) is not None and
+        isinstance(receipt, Mapping) and
+        set(receipt) == {"schema", "path", "bytes", "sha256"} and
+        receipt.get("schema") == "icecream-p50sim-build-v1" and
+        isinstance(receipt.get("path"), str) and bool(receipt["path"]) and
+        type(receipt.get("bytes")) is int and receipt["bytes"] > 0 and
+        isinstance(receipt.get("sha256"), str) and
+        re.fullmatch(r"[0-9a-f]{64}", receipt["sha256"]) is not None)
+
+
+def _producer_identities(manifest: Mapping[str, Any]) -> dict[str, dict[str, Any]] | None:
+    value = manifest.get("producer_identity")
+    if not isinstance(value, Mapping):
+        return None
+    result: dict[str, dict[str, Any]] = {}
+    for method, identity in value.items():
+        if method not in METHODS or not _valid_producer_identity(identity):
+            return None
+        result[str(method)] = dict(identity)
+    return result
+
+
 def _full2_marker(manifest: Mapping[str, Any], summary: Mapping[str, Any],
                   rows: Sequence[Mapping[str, Any]], topology: str, depth: str,
                   ) -> dict[str, Any]:
@@ -256,6 +300,36 @@ def _full2_marker(manifest: Mapping[str, Any], summary: Mapping[str, Any],
             predecessor_summary.get("schema") != simulator.SUMMARY_SCHEMA or
             predecessor_summary_topology.get("id") != topology):
         return _not_proven("predecessor_run_identity_mismatch")
+    current_producers = _producer_identities(manifest)
+    predecessor_producers = _producer_identities(predecessor_manifest)
+    if current_producers is None or predecessor_producers is None:
+        return _not_proven("producer_identity_binding_missing")
+    current_authority = manifest.get("authority")
+    predecessor_authority = predecessor_manifest.get("authority")
+    if not isinstance(current_authority, Mapping) or not isinstance(predecessor_authority, Mapping):
+        return _not_proven("producer_identity_internal_authority_missing")
+    for producer_method in STATEFUL_METHODS:
+        current_producer = current_producers.get(producer_method)
+        predecessor_producer = predecessor_producers.get(producer_method)
+        if current_producer is None or predecessor_producer is None:
+            return _not_proven(f"{producer_method.lower()}_producer_identity_missing")
+        # Native method authority retains the same compact identity.  When
+        # present, compare it as an internal consistency check so a manifest
+        # cannot claim a producer that disagrees with its method authority.
+        for authority, producer, label in (
+                (current_authority, current_producer, "current"),
+                (predecessor_authority, predecessor_producer, "predecessor")):
+            method_authority = authority.get(producer_method)
+            if (not isinstance(method_authority, Mapping) or
+                    not _valid_producer_identity(method_authority.get("producer_identity")) or
+                    method_authority.get("producer_identity") != producer):
+                return _not_proven(
+                    f"{producer_method.lower()}_{label}_producer_identity_internal_mismatch")
+        current_binary = current_producer["p50sim_binary"]
+        predecessor_binary = predecessor_producer["p50sim_binary"]
+        if (current_binary["sha256"] != predecessor_binary["sha256"] or
+                current_binary["bytes"] != predecessor_binary["bytes"]):
+            return _not_proven(f"{producer_method.lower()}_p50sim_binary_mismatch")
     predecessor_input_authority = predecessor_manifest.get("input_authority")
     predecessor_inputs = (predecessor_input_authority.get("selected_inputs", [])
                           if isinstance(predecessor_input_authority, Mapping) else None)
@@ -408,7 +482,10 @@ def _full2_marker(manifest: Mapping[str, Any], summary: Mapping[str, Any],
             "relationship_state_present": True,
             "relationship_state_methods": ["ZSTD_ROUTE", "P29", "GRZ_RESIDUAL"],
             "predecessor_experiment": predecessor_path,
-            "predecessor_manifest_sha256": predecessor_digest}
+            "predecessor_manifest_sha256": predecessor_digest,
+            "compatibility_basis": "bit_identical_p50sim",
+            "producer_identity": {"predecessor": predecessor_producers,
+                                   "current": current_producers}}
 
 
 def _validate_rows(rows: Sequence[Any], manifest: Mapping[str, Any], topology: str,
@@ -653,7 +730,8 @@ def build_report(experiments: Sequence[Path], output_root: Path) -> Path:
         seen_keys.add(identity)
         topology, depth, pass_id = identity
         sources.append({"experiment": str(path.absolute()), "manifest_sha256": manifest_sha256,
-                        "run_identity": {"topology": topology, "depth": depth, "pass": pass_id}})
+                        "run_identity": {"topology": topology, "depth": depth, "pass": pass_id},
+                        "producer_identity": manifest.get("producer_identity", {})})
         records.extend(_method_result(path.absolute(), manifest, summary, grouped, method,
                                       topology, depth, pass_id, str(manifest["run_identity"]["timestamp"]),
                                       marker, manifest_sha256) for method in METHODS)
@@ -663,21 +741,36 @@ def build_report(experiments: Sequence[Path], output_root: Path) -> Path:
     required = {(topology, depth) for topology in TOPOLOGIES for depth in DEPTHS}
     missing = [{"topology": topology, "depth": depth} for topology, depth in sorted(
         required - covered, key=lambda item: (TOPOLOGIES.index(item[0]), DEPTH_ORDER[item[1]]))]
-    complete_experiments = all(
-        all(row["status"] == "READY" and
-            (row["method"] == "RAW_II" or row["wire_witnessed"])
-            for row in records
-            if row["source_experiment"] == source["experiment"] and row["method"] in CORE_METHODS)
-        and {row["method"] for row in records if row["source_experiment"] == source["experiment"]} >= CORE_METHODS
-        for source in sources)
+    complete_experiments = True
+    for source in sources:
+        source_rows = [row for row in records
+                       if row["source_experiment"] == source["experiment"]]
+        core_rows = [row for row in source_rows if row["method"] in CORE_METHODS]
+        core_ready = (
+            {row["method"] for row in source_rows} >= CORE_METHODS and
+            all(row["status"] == "READY" and
+                (row["method"] == "RAW_II" or row["wire_witnessed"])
+                for row in core_rows))
+        depth = source["run_identity"]["depth"]
+        continuity_ready = (
+            depth != "state-carrying-full-2" or
+            all(row.get("full2_continuity", {}).get("status") == "CONTINUOUS"
+                for row in core_rows))
+        if not core_ready or not continuity_ready:
+            complete_experiments = False
     missing_core_evidence = [
         {"experiment": source["experiment"], "method": row["method"],
-         "reason": ("method_not_ready" if row["status"] != "READY"
-                    else "product_transaction_wire_witness_unavailable")}
+         "reason": ("method_not_ready" if row["status"] != "READY" else
+                    "full2_continuity_not_proven"
+                    if source["run_identity"]["depth"] == "state-carrying-full-2" and
+                    row.get("full2_continuity", {}).get("status") != "CONTINUOUS" else
+                    "product_transaction_wire_witness_unavailable")}
         for source in sources for row in records
         if row["source_experiment"] == source["experiment"] and row["method"] in CORE_METHODS
         and (row["status"] != "READY" or
-             (row["method"] != "RAW_II" and not row["wire_witnessed"]))]
+             (row["method"] != "RAW_II" and not row["wire_witnessed"]) or
+             (source["run_identity"]["depth"] == "state-carrying-full-2" and
+              row.get("full2_continuity", {}).get("status") != "CONTINUOUS"))]
     matrix_status = "COMPLETE" if not missing and complete_experiments else "INCOMPLETE_REQUESTED_MATRIX"
     summary = {
         "schema": REPORT_SCHEMA, "status": matrix_status,

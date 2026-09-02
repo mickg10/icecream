@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import copy
 import os
 import stat
 import subprocess
@@ -26,6 +27,7 @@ from s8_method_matrix_simulator import (
     firefox_occurrences,
     verify_experiment,
     _libbsc_authority,
+    _native_producer_identity,
     _native_batch_timeout_seconds,
     write_not_ready_canary,
 )
@@ -73,6 +75,165 @@ def test_real_c1f20_authority_covers_all_five_builds() -> None:
     assert authority["selected_count"] == 12490
     assert authority["rows"][2498]["authority_build"] == 1
     assert authority["rows"][12489]["authority_logical"] == 2497
+
+
+def test_native_producer_identity_is_compact_and_fail_closed() -> None:
+    receipt = {"schema": "icecream-p50sim-build-v1",
+               "source": {"head": "a" * 40, "tree": "b" * 40},
+               "binary": {"path": "/product/.p50sim.bin", "bytes": 12,
+                           "sha256": "c" * 64}}
+    facts = {"path": "/product/.p50sim-build.json", "bytes": 34,
+             "sha256": "d" * 64}
+    identity = _native_producer_identity(receipt, facts)
+    assert identity == {
+        "schema": simulator_module.PRODUCER_IDENTITY_SCHEMA,
+        "source": {"head": "a" * 40, "tree": "b" * 40},
+        "p50sim_binary": {"path": "/product/.p50sim.bin", "bytes": 12,
+                           "sha256": "c" * 64},
+        "build_receipt": {"schema": "icecream-p50sim-build-v1",
+                           "path": "/product/.p50sim-build.json", "bytes": 34,
+                           "sha256": "d" * 64}}
+    malformed = dict(receipt)
+    malformed["source"] = {"head": "not-a-head", "tree": "b" * 40}
+    assert _native_producer_identity(malformed, facts) is None
+
+
+def _native_receipt_fixture(root: Path) -> dict[str, object]:
+    return {
+        "schema": "icecream-p50sim-build-v1",
+        "source": {"root": str(root), "head": "a" * 40,
+                   "tree": "b" * 40, "tracked_clean": True},
+        "binary": {"path": str(root / "cache/sim/.p50sim.bin"),
+                   "sha256": "e" * 64, "bytes": 1},
+        "inputs": {name: {"path": str(root / name), "sha256": "e" * 64,
+                          "bytes": 1}
+                   for name in ("p50sim_source", "config_h", "cache_makefile",
+                                "services_makefile")},
+        "libbsc": None,
+        "configuration": {"with_libbsc": 0, "make_mode": "direct_sources",
+                           "dependency_root": "/deps", "compiler_path": "/bin/c++",
+                           "compiler_version": "compiler"},
+    }
+
+
+@pytest.mark.parametrize(("field", "replacement"), (
+    pytest.param("source", "bad", id="source-string"),
+    pytest.param("source", [], id="source-list"),
+    pytest.param("source", None, id="source-null"),
+    pytest.param("binary", "bad", id="binary-string"),
+    pytest.param("binary", [], id="binary-list"),
+    pytest.param("binary", None, id="binary-null"),
+    pytest.param("inputs", "bad", id="inputs-string"),
+    pytest.param("inputs", [], id="inputs-list"),
+    pytest.param("inputs", None, id="inputs-null"),
+    pytest.param("configuration", "bad", id="configuration-string"),
+    pytest.param("configuration", [], id="configuration-list"),
+    pytest.param("configuration", None, id="configuration-null"),
+    pytest.param("configuration", {}, id="configuration-empty-map"),
+    pytest.param("libbsc", "bad", id="libbsc-string"),
+    pytest.param("libbsc", [], id="libbsc-list"),
+    pytest.param("libbsc", {}, id="libbsc-empty-map"),
+))
+def test_native_receipt_nested_mutations_fail_closed_without_exception(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str,
+        replacement: object) -> None:
+    root = tmp_path / "root"
+    receipt_path = root / "cache/sim/.p50sim-build.json"
+    valid = _native_receipt_fixture(root)
+    mutated = copy.deepcopy(valid)
+    mutated[field] = replacement
+    raw = simulator_module._canonical(mutated)
+    facts = {"path": str(receipt_path), "bytes": len(raw),
+             "sha256": simulator_module._sha256(raw)}
+
+    def fake_private_bytes(path: Path, _label: str):
+        assert path == receipt_path
+        return raw, facts
+
+    monkeypatch.setattr(simulator_module, "_private_bytes", fake_private_bytes)
+    monkeypatch.setattr(simulator_module, "_private_digest",
+                        lambda path, _label: {"path": str(path), "bytes": 1,
+                                              "sha256": "e" * 64})
+    monkeypatch.setattr(simulator_module.subprocess, "check_output",
+                        lambda command, **_kwargs: ("a" * 40 if command[-1] == "HEAD"
+                                                     else "b" * 40).encode())
+    receipt, returned_facts = simulator_module._native_receipt(root)
+    assert receipt is None
+    assert returned_facts == facts
+
+
+@pytest.mark.parametrize("field", ("source", "binary", "inputs", "configuration", "libbsc"))
+def test_native_receipt_nested_deletion_fails_closed(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str) -> None:
+    root = tmp_path / "root"
+    receipt_path = root / "cache/sim/.p50sim-build.json"
+    mutated = _native_receipt_fixture(root)
+    del mutated[field]
+    raw = simulator_module._canonical(mutated)
+    facts = {"path": str(receipt_path), "bytes": len(raw),
+             "sha256": simulator_module._sha256(raw)}
+    monkeypatch.setattr(simulator_module, "_private_bytes",
+                        lambda path, _label: (raw, facts) if path == receipt_path
+                        else pytest.fail("unexpected authority read"))
+    receipt, returned_facts = simulator_module._native_receipt(root)
+    assert receipt is None
+    assert returned_facts == facts
+
+
+@pytest.mark.parametrize("method", ("ZSTD_TU", "P29", "GRZ_RESIDUAL"))
+def test_method_authority_malformed_receipt_is_not_ready(
+        monkeypatch: pytest.MonkeyPatch, method: str) -> None:
+    monkeypatch.setattr(simulator_module, "_native_receipt",
+                        lambda _root: (None, {"available": False, "sha256": None}))
+    authority = simulator_module.method_authority(method)
+    assert authority["status"] == "NOT_READY"
+    assert authority.get("producer_identity") is None
+
+
+def test_method_authority_consumes_fail_closed_receipt_parser(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_root = tmp_path / "root"
+    receipt_path = fake_root / "cache/sim/.p50sim-build.json"
+    receipt = _native_receipt_fixture(fake_root)
+    receipt["source"] = "malformed-source"
+    raw = simulator_module._canonical(receipt)
+    facts = {"path": str(receipt_path), "bytes": len(raw),
+             "sha256": simulator_module._sha256(raw)}
+    original_private_bytes = simulator_module._private_bytes
+
+    def fake_private_bytes(path: Path, label: str):
+        if path == receipt_path:
+            return raw, facts
+        return original_private_bytes(path, label)
+
+    monkeypatch.setattr(simulator_module, "_private_bytes", fake_private_bytes)
+    original_native_receipt = simulator_module._native_receipt
+    monkeypatch.setattr(simulator_module, "_native_receipt",
+                        lambda _root: original_native_receipt(fake_root))
+    authority = simulator_module.method_authority("P29")
+    assert authority["status"] == "NOT_READY"
+    assert authority.get("producer_identity") is None
+
+
+def test_persisted_experiment_retains_native_producer_identity(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    identity = {"schema": simulator_module.PRODUCER_IDENTITY_SCHEMA,
+                "source": {"head": "a" * 40, "tree": "b" * 40},
+                "p50sim_binary": {"path": "/product/.p50sim.bin", "bytes": 12,
+                                   "sha256": "c" * 64},
+                "build_receipt": {"schema": "icecream-p50sim-build-v1",
+                                   "path": "/product/.p50sim-build.json", "bytes": 34,
+                                   "sha256": "d" * 64}}
+    monkeypatch.setattr(simulator_module, "method_authority",
+                        lambda _method: {"status": "NOT_READY",
+                                         "reason": "fixture",
+                                         "producer_identity": identity})
+    experiment = MethodMatrixSimulator(
+        MatrixTopology.from_id("C1F1/100000"), methods=("ZSTD_ROUTE",)).run(
+            [Occurrence(0, b"payload")], output_root=tmp_path,
+            timestamp="20260902T120000Z")
+    manifest = json.loads((experiment / "manifest.json").read_text())
+    assert manifest["producer_identity"] == {"ZSTD_ROUTE": identity}
 
 
 def test_firefox_occurrence_keeps_global_dispatch_at_build_boundary() -> None:
