@@ -14,9 +14,9 @@
 #include <zstd.h>
 
 #include "libbsc.h"
-#if defined(_OPENMP)
+// omp.h is usable without -fopenmp, and every consumer of this header links
+// libgomp through LIBBSC_LIBS; the product compile line has no OpenMP flag.
 #include <omp.h>
-#endif
 
 #include <algorithm>
 #include <cstddef>
@@ -82,15 +82,11 @@ struct DecodedFrame {
 class SingleThreadLibbscScope {
 public:
     SingleThreadLibbscScope() {
-#if defined(_OPENMP)
         saved_ = omp_get_max_threads();
         omp_set_num_threads(1);
-#endif
     }
     ~SingleThreadLibbscScope() {
-#if defined(_OPENMP)
         omp_set_num_threads(saved_ > 0 ? saved_ : 1);
-#endif
     }
     SingleThreadLibbscScope(const SingleThreadLibbscScope &) = delete;
     SingleThreadLibbscScope &operator=(const SingleThreadLibbscScope &) = delete;
