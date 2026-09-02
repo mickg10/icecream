@@ -26,6 +26,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -245,6 +246,164 @@ def _stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
+NATIVE_FAILURE_SCHEMA = "icecream-s8-native-batch-failure-v1"
+NATIVE_FAILURE_STDERR_BYTES = 4096
+
+
+def _native_stderr_classification(raw: bytes) -> str:
+    """Classify bounded child diagnostics without making them readiness evidence."""
+    text = raw.decode("utf-8", "replace").lower()
+    if not text.strip():
+        return "empty"
+    if "asan" in text or "ubsan" in text or "invalid next size" in text:
+        return "allocator_or_sanitizer"
+    if "timeout" in text or "timed out" in text:
+        return "timeout"
+    if "json" in text or "protocol" in text or "output" in text:
+        return "protocol_or_output"
+    return "stderr"
+
+
+def _bounded_capture(path: Path, limit: int) -> tuple[bytes, bool]:
+    """Read only limit+1 bytes from a private child capture."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return b"", False
+    try:
+        raw = os.read(fd, limit + 1)
+    finally:
+        os.close(fd)
+    return raw[:limit], len(raw) > limit
+
+
+def _native_failure_artifact(
+        output_root: Path | None, topology: MatrixTopology, method: str,
+        transaction_count: int, timeout_seconds: int, valid_lines: Sequence[str],
+        valid_items: Sequence[Mapping[str, object]], stderr: bytes,
+        *, terminal_kind: str, returncode: int | None = None,
+        signal_name: str | None = None, output_reason: str | None = None,
+        depth: str = "100", pass_id: str | None = None,
+        timestamp: str | None = None,
+        authority: Mapping[str, object] | None = None,
+        stderr_truncated: bool = False) -> Path | None:
+    """Persist a failed native prefix in the normal immutable experiment layout."""
+    if output_root is None:
+        return None
+    root = output_root.absolute()
+    root.mkdir(parents=True, exist_ok=True)
+    run_timestamp = timestamp or _stamp()
+    run_label = (run_timestamp + "-" + topology.topology_id.replace("/", "-") +
+                 "-native-failure-" + method)
+    experiment = root / run_label
+    suffix = 1
+    while experiment.exists():
+        experiment = root / f"{run_label}-r{suffix:02d}"
+        suffix += 1
+    experiment.mkdir(parents=True, exist_ok=False)
+    failure_pass = pass_id or ("failure-" + method)
+    if suffix > 1:
+        failure_pass += f"-r{suffix - 1:02d}"
+
+    bounded_stderr = bytes(stderr[:NATIVE_FAILURE_STDERR_BYTES])
+    def aggregate(items: Sequence[Mapping[str, object]]) -> dict[str, object]:
+        return {
+            "valid_rows": len(items),
+            "raw_bytes": sum(value.get("raw_bytes", 0) for value in items
+                              if type(value.get("raw_bytes")) is int and value.get("raw_bytes", 0) >= 0),
+            "encoded_source_bytes": sum(value.get("encoded_source_bytes", 0) for value in items
+                                         if type(value.get("encoded_source_bytes")) is int and
+                                         value.get("encoded_source_bytes", 0) >= 0),
+            "c_to_f_bytes": sum(value.get("c_to_f_bytes", 0) for value in items
+                                 if type(value.get("c_to_f_bytes")) is int and value.get("c_to_f_bytes", 0) >= 0),
+            "f_to_c_bytes": sum(value.get("f_to_c_bytes", 0) for value in items
+                                 if type(value.get("f_to_c_bytes")) is int and value.get("f_to_c_bytes", 0) >= 0),
+            "simulator_execution_ns": sum(value.get("simulator_execution_ns", 0) for value in items
+                                           if type(value.get("simulator_execution_ns")) is int and
+                                           value.get("simulator_execution_ns", 0) >= 0),
+        }
+
+    segment_metrics = {segment: aggregate([item for item in valid_items
+                                           if item.get("segment") == segment])
+                       for segment in ("full-1", "full-2")}
+    metrics = {
+        "valid_rows": len(valid_items),
+        "raw_bytes": sum(value.get("raw_bytes", 0) for value in valid_items
+                          if type(value.get("raw_bytes")) is int and value.get("raw_bytes", 0) >= 0),
+        "encoded_source_bytes": sum(value.get("encoded_source_bytes", 0) for value in valid_items
+                                     if type(value.get("encoded_source_bytes")) is int and
+                                     value.get("encoded_source_bytes", 0) >= 0),
+        "c_to_f_bytes": sum(value.get("c_to_f_bytes", 0) for value in valid_items
+                             if type(value.get("c_to_f_bytes")) is int and value.get("c_to_f_bytes", 0) >= 0),
+        "f_to_c_bytes": sum(value.get("f_to_c_bytes", 0) for value in valid_items
+                             if type(value.get("f_to_c_bytes")) is int and value.get("f_to_c_bytes", 0) >= 0),
+        "simulator_execution_ns": sum(value.get("simulator_execution_ns", 0) for value in valid_items
+                                       if type(value.get("simulator_execution_ns")) is int and
+                                       value.get("simulator_execution_ns", 0) >= 0),
+        "valid_rows_by_segment": {segment: values["valid_rows"]
+                                  for segment, values in segment_metrics.items()},
+        "segments": segment_metrics,
+        "last_tu_seq": (valid_items[-1].get("tu_seq") if valid_items else None),
+        "last_rel_seq": (valid_items[-1].get("rel_seq") if valid_items else None),
+    }
+    terminal = {"kind": terminal_kind, "returncode": returncode,
+                "signal": signal_name, "timeout_seconds": timeout_seconds,
+                "stderr_classification": _native_stderr_classification(bounded_stderr),
+                "stderr_bytes": len(bounded_stderr),
+                "stderr_limit": NATIVE_FAILURE_STDERR_BYTES,
+                "stderr_truncated": stderr_truncated}
+    if output_reason:
+        terminal["output_classification"] = output_reason[:160]
+    reason = "native_product_batch_failed:" + terminal_kind
+    if returncode is not None:
+        reason += f":returncode={returncode}"
+    if signal_name:
+        reason += ":signal=" + signal_name
+    reason += ":stderr=" + terminal["stderr_classification"]
+    if output_reason:
+        reason += ":" + output_reason[:160]
+    failure = {"schema": NATIVE_FAILURE_SCHEMA, "status": "NOT_READY",
+               "outcome": "FAILED", "method": method,
+               "topology": topology.topology_id,
+               "transaction_count": transaction_count, "metrics": metrics,
+               "terminal": terminal, "reason": reason[:512],
+               "authority": dict(authority) if isinstance(authority, Mapping) else {}}
+
+    (experiment / "occurrences.jsonl").write_bytes(b"")
+    native_output = ("\n".join(valid_lines) + ("\n" if valid_lines else "")).encode("utf-8")
+    (experiment / "native-output.jsonl").write_bytes(native_output)
+    (experiment / "native-stderr.txt").write_bytes(bounded_stderr)
+    (experiment / "native-failure.json").write_bytes(_canonical(failure))
+    summary = {"schema": SUMMARY_SCHEMA, "status": "NOT_READY",
+               "experiment": str(experiment), "reason": reason[:512],
+               "method_status": {method: "NOT_READY"}, "relationship_count": topology.relationship_count,
+               "occurrence_rows": 0, "committed_rows": 0, "native_failure": failure,
+               "native_metrics": metrics}
+    (experiment / "summary.json").write_bytes(_canonical(summary))
+    artifacts: dict[str, dict[str, object]] = {}
+    for path in sorted(path for path in experiment.iterdir()
+                       if path.is_file() and path.name != "manifest.json"):
+        raw = path.read_bytes()
+        artifacts[path.name] = {"bytes": len(raw), "sha256": _sha256(raw)}
+    manifest = {"schema": SCHEMA, "status": "NOT_READY", "experiment": experiment.name,
+                "topology": {"id": topology.topology_id,
+                             "relationship_count": topology.relationship_count,
+                             "slots_per_f": topology.slots_per_f,
+                             "global_slots": topology.global_slots},
+                "methods": [method], "authority": {method: dict(authority)
+                                                      if isinstance(authority, Mapping) else {}},
+                "failure_authority": {method: dict(authority)
+                                      if isinstance(authority, Mapping) else {}},
+                "failure_method_status": {method: "NOT_READY"},
+                "reason": reason[:512], "native_failure": failure,
+                "run_identity": {"timestamp": run_timestamp,
+                                  "topology": topology.topology_id,
+                                  "depth": depth, "pass": failure_pass},
+                "artifacts": artifacts, "row_order": []}
+    (experiment / "manifest.json").write_bytes(_canonical(manifest))
+    return experiment
+
+
 def _authority_file(path: Path, finding: str) -> dict[str, object]:
     result: dict[str, object] = {"path": str(path), "finding": finding}
     try:
@@ -443,7 +602,11 @@ def _authenticated_assignment(topology_id: str, count: int, *, start: int = 0) -
 def _native_batch(occurrences: Sequence[Occurrence], topology: MatrixTopology,
                   assignment: Mapping[str, object], method: str,
                   *, predecessor_occurrences: Sequence[Occurrence] = (),
-                  predecessor_assignment: Mapping[str, object] | None = None
+                  predecessor_assignment: Mapping[str, object] | None = None,
+                  failure_output_root: Path | None = None,
+                  failure_depth: str = "100", failure_pass: str | None = None,
+                  failure_timestamp: str | None = None,
+                  failure_authority: Mapping[str, object] | None = None
                   ) -> dict[int, dict[str, object]]:
     """Run the actual endpoint transaction for every selected TU."""
     root = Path(__file__).resolve().parents[1]
@@ -494,21 +657,41 @@ def _native_batch(occurrences: Sequence[Occurrence], topology: MatrixTopology,
         command += ["--batch-output", str(output), "--batch-allow-repeated-inputs", "1"]
         environment = dict(os.environ)
         environment["ICECC_P50_PROFILE"] = method
+        stderr_capture = scratch_path / "stderr.capture"
+        terminal_kind: str | None = None
+        terminal_returncode: int | None = None
+        terminal_signal: str | None = None
+        terminal_stderr = b""
+        stderr_truncated = False
         try:
-            completed = subprocess.run(
-                command,
-                env=environment, check=False,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            raise NotReady(
-                "native product batch timed out: "
-                f"method={method} transactions={transaction_count} "
-                f"timeout={timeout_seconds}s"
-            ) from None
-        if completed.returncode != 0:
-            raise NotReady("native product transaction failed: " +
-                           completed.stderr.decode("utf-8", "replace")[:300])
+            with stderr_capture.open("wb") as stderr_stream:
+                completed = subprocess.run(
+                    command,
+                    env=environment, check=False,
+                    stdout=subprocess.DEVNULL, stderr=stderr_stream,
+                    timeout=timeout_seconds)
+        except subprocess.TimeoutExpired as exc:
+            terminal_kind = "timeout"
+            fallback_stderr = (exc.stderr if isinstance(exc.stderr, bytes)
+                               else str(exc.stderr or "").encode("utf-8", "replace"))
+        else:
+            fallback_stderr = (completed.stderr if isinstance(completed.stderr, bytes)
+                               else str(completed.stderr or "").encode("utf-8", "replace"))
+            if completed.returncode != 0:
+                terminal_returncode = int(completed.returncode)
+                if terminal_returncode < 0:
+                    terminal_kind = "signal"
+                    try:
+                        terminal_signal = signal.Signals(-terminal_returncode).name
+                    except ValueError:
+                        terminal_signal = f"SIG{-terminal_returncode}"
+                else:
+                    terminal_kind = "exit"
+        terminal_stderr, stderr_truncated = _bounded_capture(
+            stderr_capture, NATIVE_FAILURE_STDERR_BYTES)
+        if not terminal_stderr and fallback_stderr:
+            terminal_stderr = fallback_stderr[:NATIVE_FAILURE_STDERR_BYTES]
+            stderr_truncated = len(fallback_stderr) > NATIVE_FAILURE_STDERR_BYTES
         result: dict[int, dict[str, object]] = {}
         predecessor_result: dict[int, dict[str, object]] = {}
         seen: set[tuple[str, int]] = set()
@@ -599,34 +782,74 @@ def _native_batch(occurrences: Sequence[Occurrence], topology: MatrixTopology,
             item["_native_next_tu_seq"] = expected_tu_seq + 1  # type: ignore[index]
             global_next_tu_seq = expected_tu_seq + 1
         expected_segment = "full-2" if predecessor_occurrences else "full-1"
-        output_raw, _output_facts = _private_bytes(output, "native_batch_output")
+        output_reason: str | None = None
+        valid_lines: list[str] = []
+        valid_items: list[Mapping[str, object]] = []
         try:
-            output_lines = output_raw.decode("utf-8").splitlines()
-        except UnicodeDecodeError as exc:
-            raise MatrixError("native product output is not UTF-8") from exc
-        for line in output_lines:
-            item = _strict_json(line.encode("utf-8"), "native_batch_output")
-            if not isinstance(item, Mapping):
-                raise MatrixError("native product output schema invalid")
-            segment = item.get("segment")
-            if segment not in {"full-1", "full-2"}:
-                raise MatrixError("native product output segment invalid")
-            try:
-                ordinal = int(item["tu_index"])
-            except (KeyError, TypeError, ValueError) as exc:
-                raise MatrixError("native product output ordinal invalid") from exc
-            segment_occurrences = (predecessor_occurrences if segment == "full-1" and
-                                   predecessor_occurrences else occurrences)
-            segment_rows = predecessor_rows if segment == "full-1" and predecessor_occurrences else rows
-            validate_item(item, segment, ordinal, segment_occurrences, segment_rows)
-            if segment == expected_segment:
-                result[ordinal] = item
-            else:
-                predecessor_result[ordinal] = item
+            output_raw, _output_facts = _private_bytes(output, "native_batch_output")
+        except MatrixError as exc:
+            output_raw = b""
+            output_reason = "output_unavailable:" + str(exc)[:120]
+        if output_reason is None:
+            output_lines = output_raw.splitlines()
+        if output_reason is None:
+            for line_number, raw_line in enumerate(output_lines, start=1):
+                try:
+                    line = raw_line.decode("utf-8")
+                    item = _strict_json(line.encode("utf-8"), "native_batch_output")
+                    if not isinstance(item, Mapping):
+                        raise MatrixError("native product output schema invalid")
+                    segment = item.get("segment")
+                    if segment not in {"full-1", "full-2"}:
+                        raise MatrixError("native product output segment invalid")
+                    try:
+                        ordinal = int(item["tu_index"])
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise MatrixError("native product output ordinal invalid") from exc
+                    segment_occurrences = (predecessor_occurrences if segment == "full-1" and
+                                           predecessor_occurrences else occurrences)
+                    segment_rows = (predecessor_rows if segment == "full-1" and
+                                    predecessor_occurrences else rows)
+                    validate_item(item, segment, ordinal, segment_occurrences, segment_rows)
+                except MatrixError as exc:
+                    output_reason = f"malformed_output:line={line_number}:{str(exc)[:120]}"
+                    break
+                except UnicodeDecodeError:
+                    output_reason = f"malformed_output:line={line_number}:invalid_utf8"
+                    break
+                valid_lines.append(line)
+                valid_items.append(item)
+                if segment == expected_segment:
+                    result[ordinal] = item
+                else:
+                    predecessor_result[ordinal] = item
         if predecessor_occurrences and set(predecessor_result) != set(range(len(predecessor_occurrences))):
-            raise MatrixError("native product predecessor batch is incomplete or reordered")
+            output_reason = output_reason or "incomplete_output:predecessor_segment"
         if set(result) != set(range(len(occurrences))):
-            raise MatrixError("native product batch is incomplete or reordered")
+            output_reason = output_reason or "incomplete_output:measured_segment"
+        if terminal_kind is not None or output_reason is not None:
+            artifact = _native_failure_artifact(
+                failure_output_root, topology, method, transaction_count, timeout_seconds,
+                valid_lines, valid_items, terminal_stderr,
+                terminal_kind=terminal_kind or "output", returncode=terminal_returncode,
+                signal_name=terminal_signal, output_reason=output_reason,
+                depth=failure_depth, pass_id=failure_pass, timestamp=failure_timestamp,
+                authority=failure_authority, stderr_truncated=stderr_truncated)
+            reason = "native product batch failed"
+            reason += ":" + (terminal_kind or "output")
+            if terminal_kind == "timeout":
+                reason += (f":method={method} transactions={transaction_count} "
+                           f"timeout={timeout_seconds}s")
+            if terminal_returncode is not None:
+                reason += f":returncode={terminal_returncode}"
+            if terminal_signal:
+                reason += ":signal=" + terminal_signal
+            reason += ":stderr=" + _native_stderr_classification(terminal_stderr)
+            if output_reason:
+                reason += ":" + output_reason[:160]
+            if artifact is not None:
+                reason += ":artifact=" + str(artifact)
+            raise NotReady(reason[:700]) from None
         # The native endpoint numbers each manifest segment from zero.  The
         # experiment row retains the authenticated global dispatch identity,
         # so re-key the measured segment by occurrence ordinal at this seam.
@@ -1084,6 +1307,14 @@ class MethodMatrixSimulator:
         if repeat_full and (not predecessor_occurrences or
                             predecessor_assignment_authority is None):
             raise MatrixError("repeat-full requires authenticated full-1 inputs and assignment")
+        depth_label = depth or f"count-{len(occurrences)}"
+        pass_label = pass_id or "pass-1"
+        run_timestamp = timestamp or _stamp()
+        if output_root is not None:
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+", depth_label):
+                raise MatrixError("experiment depth identity is malformed")
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+", pass_label):
+                raise MatrixError("experiment pass identity is malformed")
         self._native_codec_next_tu_seq = {method: None for method in self.methods}
         predecessor_identity = None
         if predecessor_occurrences and output_root is not None:
@@ -1111,7 +1342,10 @@ class MethodMatrixSimulator:
                     self._native_rows[method] = _native_batch(
                         occurrences, self.topology, self.assignment_authority, method,
                         predecessor_occurrences=predecessor_occurrences if repeat_full else (),
-                        predecessor_assignment=predecessor_assignment_authority if repeat_full else None)
+                        predecessor_assignment=predecessor_assignment_authority if repeat_full else None,
+                        failure_output_root=output_root, failure_depth=depth_label,
+                        failure_pass=pass_label, failure_timestamp=run_timestamp,
+                        failure_authority=self.authority[method])
         # Relationship state is method-local.  Sharing this map across methods
         # would make a route prefix leak into a cohort/TU arm and falsely turn
         # distinct methods into aliases.
@@ -1210,13 +1444,6 @@ class MethodMatrixSimulator:
 
         if output_root is None:
             return self._run_memory(occurrences, assignments, states_by_method)
-        depth_label = depth or f"count-{len(occurrences)}"
-        if not re.fullmatch(r"[A-Za-z0-9_.-]+", depth_label):
-            raise MatrixError("experiment depth identity is malformed")
-        pass_label = pass_id or "pass-1"
-        if not re.fullmatch(r"[A-Za-z0-9_.-]+", pass_label):
-            raise MatrixError("experiment pass identity is malformed")
-        run_timestamp = timestamp or _stamp()
         run_label = run_timestamp + "-" + self.topology.topology_id.replace("/", "-") + \
             "-" + depth_label + "-" + pass_label
         experiment = output_root.absolute() / run_label

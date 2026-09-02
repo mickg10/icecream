@@ -523,6 +523,230 @@ def test_native_batch_timeout_is_fail_closed_and_includes_full2_segments(
             predecessor_assignment=assignment())
 
 
+def _partial_native_inputs(tmp_path: Path) -> tuple[list[Occurrence], MatrixTopology,
+                                                     dict[str, object]]:
+    topology = MatrixTopology.from_id("C1F20/40")
+    occurrences: list[Occurrence] = []
+    rows: list[dict[str, object]] = []
+    for index, relation in enumerate((0, 1)):
+        source = tmp_path / f"partial-{index}.ii"
+        source.write_bytes(f"partial payload {index}".encode())
+        raw = source.read_bytes()
+        occurrences.append(Occurrence(
+            index, None, source_path=str(source), source_relative=source.name,
+            source_sha256=hashlib.sha256(raw).hexdigest(),
+            source_digest128=simulator_module._digest128(raw)))
+        rows.append({"ordinal": index, "global_slot": relation * 2,
+                     "f_relationship": relation, "per_f_slot": 0,
+                     "dispatch_order": index, "authority_dispatch_order": index,
+                     "authority_tu_seq": index, "authority_rel_seq": 0})
+    return occurrences, topology, {"status": "READY", "topology": topology.topology_id,
+                                  "selected_count": len(rows), "rows": rows}
+
+
+def _failure_experiment(root: Path) -> Path:
+    experiments = sorted(root.glob("*-native-failure-*"))
+    assert len(experiments) == 1
+    return experiments[0]
+
+
+def test_native_batch_preserves_valid_prefix_when_child_exits_nonzero(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    occurrences, topology, assignment = _partial_native_inputs(tmp_path)
+    _fake_native_batch_runner(monkeypatch)
+    original_run = simulator_module.subprocess.run
+
+    def failed_after_prefix(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        original = original_run(command, **kwargs)
+        output = Path(command[command.index("--batch-output") + 1])
+        lines = output.read_text().splitlines()
+        output.write_text("\n".join(lines) + "\n")
+        return subprocess.CompletedProcess(command, 9, b"", b"worker stopped after prefix" + b"x" * 10000)
+
+    monkeypatch.setattr(simulator_module.subprocess, "run", failed_after_prefix)
+    with pytest.raises(NotReady, match=r"exit:returncode=9"):
+        simulator_module._native_batch(occurrences, topology, assignment, "P29",
+                                       failure_output_root=tmp_path,
+                                       failure_authority={"status": "READY",
+                                                          "binary": "authenticated"})
+    experiment = _failure_experiment(tmp_path)
+    preserved = (experiment / "native-output.jsonl").read_text().splitlines()
+    assert len(preserved) == 2
+    failure = json.loads((experiment / "native-failure.json").read_text())
+    assert failure["status"] == "NOT_READY"
+    assert failure["outcome"] == "FAILED"
+    assert failure["terminal"]["kind"] == "exit"
+    assert failure["terminal"]["returncode"] == 9
+    assert failure["terminal"]["stderr_classification"] == "stderr"
+    assert failure["metrics"]["valid_rows"] == 2
+    assert failure["metrics"]["simulator_execution_ns"] == 2
+    assert failure["metrics"]["valid_rows_by_segment"] == {"full-1": 2, "full-2": 0}
+    assert json.loads((experiment / "manifest.json").read_text())["authority"]["P29"] == {
+        "status": "READY", "binary": "authenticated"}
+    assert len((experiment / "native-stderr.txt").read_bytes()) == 4096
+    assert json.loads((experiment / "manifest.json").read_text())["failure_method_status"] == {
+        "P29": "NOT_READY"}
+    assert json.loads((experiment / "summary.json").read_text())["status"] == "NOT_READY"
+    assert verify_experiment(experiment)["status"] == "PASS"
+
+
+def test_native_batch_real_child_diagnostics_are_bounded(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    occurrences, topology, assignment = _partial_native_inputs(tmp_path)
+    binary = (Path(simulator_module.__file__).resolve().parents[1] /
+              "cache" / "sim" / ".p50sim.bin")
+    original_is_file = Path.is_file
+    monkeypatch.setattr(Path, "is_file", lambda path: (
+        True if path == binary else original_is_file(path)))
+    original_run = simulator_module.subprocess.run
+
+    def real_diagnostics(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        assert kwargs["stdout"] is subprocess.DEVNULL
+        assert kwargs["stderr"] is not subprocess.PIPE
+        code = "import sys; sys.stderr.write('d' * 1000000); sys.exit(17)"
+        return original_run([sys.executable, "-c", code], env=kwargs["env"], check=False,
+                            stdout=kwargs["stdout"], stderr=kwargs["stderr"],
+                            timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(simulator_module.subprocess, "run", real_diagnostics)
+    with pytest.raises(NotReady, match=r"exit:returncode=17"):
+        simulator_module._native_batch(occurrences, topology, assignment, "P29",
+                                       failure_output_root=tmp_path)
+    experiment = _failure_experiment(tmp_path)
+    assert len((experiment / "native-stderr.txt").read_bytes()) == 4096
+    failure = json.loads((experiment / "native-failure.json").read_text())
+    assert failure["terminal"]["kind"] == "exit"
+    assert failure["terminal"]["returncode"] == 17
+    assert failure["terminal"]["stderr_bytes"] == 4096
+    assert failure["terminal"]["stderr_limit"] == 4096
+    assert failure["terminal"]["stderr_truncated"] is True
+    assert verify_experiment(experiment)["status"] == "PASS"
+
+
+def test_native_batch_preserves_prefix_and_records_malformed_last_row(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    occurrences, topology, assignment = _partial_native_inputs(tmp_path)
+    _fake_native_batch_runner(monkeypatch)
+    original_run = simulator_module.subprocess.run
+
+    def malformed_last(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        original = original_run(command, **kwargs)
+        output = Path(command[command.index("--batch-output") + 1])
+        first = output.read_text().splitlines()[0]
+        output.write_text(first + "\n{\"schema\":\n")
+        return subprocess.CompletedProcess(command, 0, b"", b"")
+
+    monkeypatch.setattr(simulator_module.subprocess, "run", malformed_last)
+    with pytest.raises(NotReady, match="malformed_output"):
+        simulator_module._native_batch(occurrences, topology, assignment, "P29",
+                                       failure_output_root=tmp_path)
+    experiment = _failure_experiment(tmp_path)
+    assert len((experiment / "native-output.jsonl").read_text().splitlines()) == 1
+    failure = json.loads((experiment / "native-failure.json").read_text())
+    assert failure["terminal"]["kind"] == "output"
+    assert failure["terminal"]["output_classification"].startswith("malformed_output:line=2")
+    assert failure["metrics"]["valid_rows"] == 1
+    assert verify_experiment(experiment)["status"] == "PASS"
+
+
+def test_native_batch_preserves_prefix_on_timeout_and_bounds_stderr(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    occurrences, topology, assignment = _partial_native_inputs(tmp_path)
+    _fake_native_batch_runner(monkeypatch)
+    original_run = simulator_module.subprocess.run
+
+    def timed_out(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        original_run(command, **kwargs)
+        output = Path(command[command.index("--batch-output") + 1])
+        output.write_text(output.read_text().splitlines()[0] + "\n")
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"], stderr=b"timeout worker")
+
+    monkeypatch.setattr(simulator_module.subprocess, "run", timed_out)
+    with pytest.raises(NotReady, match=r"timeout:method=P29 transactions=2 timeout=600s"):
+        simulator_module._native_batch(occurrences, topology, assignment, "P29",
+                                       failure_output_root=tmp_path)
+    experiment = _failure_experiment(tmp_path)
+    assert len((experiment / "native-output.jsonl").read_text().splitlines()) == 1
+    failure = json.loads((experiment / "native-failure.json").read_text())
+    assert failure["terminal"]["kind"] == "timeout"
+    assert failure["terminal"]["stderr_classification"] == "timeout"
+    assert verify_experiment(experiment)["status"] == "PASS"
+
+
+def test_native_batch_failure_binds_full2_identity_and_separate_metrics(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "pre").mkdir()
+    predecessor, topology, predecessor_assignment = _partial_native_inputs(tmp_path / "pre")
+    # Recreate the helper's inputs under the already-created parent and give
+    # the measured segment the authenticated continuation TU/REL markers.
+    (tmp_path / "measured").mkdir()
+    measured, _topology, measured_assignment = _partial_native_inputs(tmp_path / "measured")
+    for index, row in enumerate(measured_assignment["rows"]):
+        row["authority_tu_seq"] = index + 2
+        row["authority_rel_seq"] = 1
+    _fake_native_batch_runner(monkeypatch)
+    original_run = simulator_module.subprocess.run
+
+    def failed_full2(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        original_run(command, **kwargs)
+        return subprocess.CompletedProcess(command, 4, b"", b"full2 stopped")
+
+    monkeypatch.setattr(simulator_module.subprocess, "run", failed_full2)
+    with pytest.raises(NotReady, match=r"exit:returncode=4"):
+        simulator_module._native_batch(
+            measured, topology, measured_assignment, "P29",
+            predecessor_occurrences=predecessor,
+            predecessor_assignment=predecessor_assignment,
+            failure_output_root=tmp_path, failure_depth="state-carrying-full-2",
+            failure_pass="pass-2", failure_timestamp="20260902T010203Z",
+            failure_authority={"status": "READY", "receipt": "source-bound"})
+    experiment = _failure_experiment(tmp_path)
+    manifest = json.loads((experiment / "manifest.json").read_text())
+    assert manifest["run_identity"] == {
+        "timestamp": "20260902T010203Z", "topology": "C1F20/40",
+        "depth": "state-carrying-full-2", "pass": "pass-2"}
+    failure = json.loads((experiment / "native-failure.json").read_text())
+    assert failure["metrics"]["valid_rows_by_segment"] == {"full-1": 2, "full-2": 2}
+    assert failure["metrics"]["segments"]["full-1"]["simulator_execution_ns"] == 2
+    assert failure["metrics"]["segments"]["full-2"]["simulator_execution_ns"] == 2
+    assert manifest["authority"]["P29"] == {"status": "READY", "receipt": "source-bound"}
+    assert json.loads((experiment / "summary.json").read_text())["status"] == "NOT_READY"
+    assert verify_experiment(experiment)["status"] == "PASS"
+
+
+def test_native_batch_zero_exit_missing_output_persists_typed_failure(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    occurrences, topology, assignment = _partial_native_inputs(tmp_path)
+    _fake_native_batch_runner(monkeypatch)
+    original_run = simulator_module.subprocess.run
+
+    def missing_output(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        result = original_run(command, **kwargs)
+        Path(command[command.index("--batch-output") + 1]).unlink()
+        return result
+
+    monkeypatch.setattr(simulator_module.subprocess, "run", missing_output)
+    with pytest.raises(NotReady, match="output:stderr=empty"):
+        simulator_module._native_batch(occurrences, topology, assignment, "P29",
+                                       failure_output_root=tmp_path)
+    experiment = _failure_experiment(tmp_path)
+    failure = json.loads((experiment / "native-failure.json").read_text())
+    assert failure["terminal"]["kind"] == "output"
+    assert failure["terminal"]["output_classification"].startswith("output_unavailable:")
+    assert failure["metrics"]["valid_rows"] == 0
+    assert verify_experiment(experiment)["status"] == "PASS"
+
+
+def test_native_batch_success_does_not_create_failure_artifact(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    occurrences, topology, assignment = _partial_native_inputs(tmp_path)
+    _fake_native_batch_runner(monkeypatch)
+    result = simulator_module._native_batch(occurrences, topology, assignment, "P29",
+                                            failure_output_root=tmp_path)
+    assert len(result) == 2
+    assert not list(tmp_path.glob("*-native-failure-*"))
+
+
 def test_native_route_prefix_key_set_is_exact_and_nonroute_has_none() -> None:
     route = {"schema": "icecream-p50sim-batch-v1",
              "committed_raw_prefix_before_descriptor": {},
