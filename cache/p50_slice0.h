@@ -12,6 +12,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -273,9 +274,14 @@ public:
     [[nodiscard]] p29::OnlineS1::Config s1_config() const { return s1_config_; }
     [[nodiscard]] Key64 dense_region_key(uint32_t id) const;
     [[nodiscard]] Key64 block_key(uint32_t id) const;
+    [[nodiscard]] size_t dense_region_count() const { return dense_to_region_.size(); }
+    [[nodiscard]] size_t published_block_count() const { return block_keys_.size(); }
+    [[nodiscard]] std::span<const uint32_t> block_regions(uint32_t id) const {
+        return std::span<const uint32_t>(block_catalogue_.block(id).regions);
+    }
     void publish_new_p29_blocks();
     [[nodiscard]] std::vector<Key64> transitive_manifest(
-        std::span<const Key64> roots) const;
+        std::span<const p29::Ref> roots) const;
     [[nodiscard]] std::vector<uint8_t> materialize(
         const ImmutableObjectStore& objects, std::span<const Key64> roots) const;
 
@@ -374,7 +380,7 @@ private:
     Digest128 state_digest_{};
     std::unique_ptr<p29::OnlineS1> matcher_;
     std::optional<CActiveTx> active_;
-    std::set<Key64> acknowledged_objects_;
+    std::unordered_set<Key64, Key64Hash> acknowledged_objects_;
     ActionTrace* trace_ = nullptr;
 };
 

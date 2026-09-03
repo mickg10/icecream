@@ -6,7 +6,6 @@
 #include <bit>
 #include <cstring>
 #include <fstream>
-#include <functional>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -90,35 +89,67 @@ struct P29ResidualLine {
     uint64_t bytes = 0;
 };
 
+std::vector<p29::Ref> region_root_refs(std::span<const uint32_t> regions) {
+    std::vector<p29::Ref> result;
+    result.reserve(regions.size());
+    for (uint32_t region : regions)
+        result.push_back({p29::RefKind::Region, region});
+    return result;
+}
+
 std::vector<std::pair<Key64, std::vector<uint8_t>>> residual_line_objects(
-    const ImmutableObjectStore& objects, std::span<const Key64> roots,
-    const std::set<Key64>& acknowledged) {
+    const CAuthority& authority, std::span<const p29::Ref> roots,
+    const std::unordered_set<Key64, Key64Hash>& acknowledged) {
     std::vector<std::pair<Key64, std::vector<uint8_t>>> result;
-    std::set<Key64> seen;
-    std::function<void(Key64)> visit = [&](Key64 key) {
-        const ImmutableObject* object = objects.find(key);
-        if (!object) throw std::logic_error("P29 C residual root references an absent object");
-        if (object->key.type() == ObjectType::Block) {
-            const auto* block = std::get_if<ChildrenPayload>(&object->payload);
-            if (!block) throw std::logic_error("P29 C Block is not a child object");
-            for (Key64 child : block->children) visit(child);
-            return;
+    std::vector<uint8_t> seen_regions(authority.dense_region_count(), 0);
+    std::vector<uint8_t> seen_blocks(authority.published_block_count(), 0);
+    std::unordered_set<Key64, Key64Hash> seen_lines;
+    seen_lines.reserve(seen_regions.size());
+
+    std::vector<p29::Ref> pending;
+    pending.reserve(roots.size());
+    for (auto root = roots.rbegin(); root != roots.rend(); ++root)
+        pending.push_back(*root);
+
+    while (!pending.empty()) {
+        const p29::Ref ref = pending.back();
+        pending.pop_back();
+        if (ref.kind == p29::RefKind::Block) {
+            if (ref.id >= seen_blocks.size())
+                throw std::logic_error("P29 C residual root references an absent Block");
+            if (seen_blocks[ref.id]) continue;
+            seen_blocks[ref.id] = 1;
+            const ImmutableObject& object = authority.arena().object(
+                authority.block_key(ref.id));
+            if (object.key.type() != ObjectType::Block ||
+                !std::holds_alternative<ChildrenPayload>(object.payload))
+                throw std::logic_error("P29 C Block is not a child object");
+            const auto& children = authority.block_regions(ref.id);
+            for (auto child = children.rbegin(); child != children.rend(); ++child)
+                pending.push_back({p29::RefKind::Region, *child});
+            continue;
         }
-        if (object->key.type() != ObjectType::Region)
+        if (ref.kind != p29::RefKind::Region || ref.id >= seen_regions.size())
             throw std::logic_error("P29 C residual root is not a Region or Block");
-        const auto* region = std::get_if<ChildrenPayload>(&object->payload);
+        if (seen_regions[ref.id]) continue;
+        seen_regions[ref.id] = 1;
+        const ImmutableObject& object = authority.arena().object(
+            authority.dense_region_key(ref.id));
+        const auto* region = object.key.type() == ObjectType::Region
+                                 ? std::get_if<ChildrenPayload>(&object.payload)
+                                 : nullptr;
         if (!region || region->children.size() != 1)
             throw std::logic_error("P29 C Region does not contain one Line");
         const Key64 line_key = region->children.front();
-        if (acknowledged.contains(line_key) || !seen.insert(line_key).second) return;
-        const ImmutableObject* line_object = objects.find(line_key);
+        if (acknowledged.contains(line_key) || !seen_lines.insert(line_key).second)
+            continue;
+        const ImmutableObject* line_object = authority.arena().objects().find(line_key);
         const auto* line = line_object
                                ? std::get_if<BytesPayload>(&line_object->payload)
                                : nullptr;
         if (!line) throw std::logic_error("P29 C Region child is not a Line payload");
         result.emplace_back(line_key, line->bytes);
-    };
-    for (Key64 root : roots) visit(root);
+    }
     return result;
 }
 
@@ -1095,16 +1126,58 @@ void CAuthority::publish_new_p29_blocks() {
 }
 
 std::vector<Key64> CAuthority::transitive_manifest(
-    std::span<const Key64> roots) const {
-    std::set<Key64> seen;
-    std::function<void(Key64)> visit = [&](Key64 key) {
-        if (!seen.insert(key).second) return;
+    std::span<const p29::Ref> roots) const {
+    std::vector<uint8_t> seen_regions(dense_to_region_.size(), 0);
+    std::vector<uint8_t> seen_blocks(block_keys_.size(), 0);
+    std::vector<Key64> result;
+    result.reserve(roots.size());
+
+    std::vector<p29::Ref> pending;
+    pending.reserve(roots.size());
+    for (auto root = roots.rbegin(); root != roots.rend(); ++root)
+        pending.push_back(*root);
+
+    while (!pending.empty()) {
+        const p29::Ref ref = pending.back();
+        pending.pop_back();
+        if (ref.kind == p29::RefKind::Block) {
+            if (ref.id >= seen_blocks.size())
+                throw std::logic_error("P29 manifest root references an absent Block");
+            if (seen_blocks[ref.id]) continue;
+            seen_blocks[ref.id] = 1;
+            const Key64 key = block_key(ref.id);
+            const ImmutableObject& object = arena_.object(key);
+            if (object.key.type() != ObjectType::Block ||
+                !std::holds_alternative<ChildrenPayload>(object.payload))
+                throw std::logic_error("P29 manifest Block is not a child object");
+            result.push_back(key);
+            const auto& children = block_catalogue_.block(ref.id).regions;
+            for (auto child = children.rbegin(); child != children.rend(); ++child)
+                pending.push_back({p29::RefKind::Region, *child});
+            continue;
+        }
+        if (ref.kind != p29::RefKind::Region || ref.id >= seen_regions.size())
+            throw std::logic_error("P29 manifest root is not a Region or Block");
+        if (seen_regions[ref.id]) continue;
+        seen_regions[ref.id] = 1;
+        const Key64 key = dense_region_key(ref.id);
         const ImmutableObject& object = arena_.object(key);
-        if (const auto* children = std::get_if<ChildrenPayload>(&object.payload))
-            for (Key64 child : children->children) visit(child);
-    };
-    for (Key64 root : roots) visit(root);
-    return {seen.begin(), seen.end()};
+        const auto* region = object.key.type() == ObjectType::Region
+                                 ? std::get_if<ChildrenPayload>(&object.payload)
+                                 : nullptr;
+        if (!region || region->children.size() != 1)
+            throw std::logic_error("P29 manifest Region does not contain one Line");
+        const Key64 line_key = region->children.front();
+        const ImmutableObject& line = arena_.object(line_key);
+        if (line.key.type() != ObjectType::Line ||
+            !std::holds_alternative<BytesPayload>(line.payload))
+            throw std::logic_error("P29 manifest Region child is not a Line payload");
+        result.push_back(key);
+        result.push_back(line_key);
+    }
+    std::sort(result.begin(), result.end());
+    result.erase(std::unique(result.begin(), result.end()), result.end());
+    return result;
 }
 
 std::vector<uint8_t> CAuthority::materialize(
@@ -1126,8 +1199,8 @@ CRoute::~CRoute() = default;
 std::vector<uint8_t> CRoute::residual_input(const PreparedTUPtr& prepared) const {
     if (!prepared) throw std::invalid_argument("cannot inspect a null PreparedTU");
     std::vector<uint8_t> result;
-    const auto lines = residual_line_objects(authority_.arena().objects(), prepared->regions,
-                                             acknowledged_objects_);
+    const std::vector<p29::Ref> roots = region_root_refs(prepared->dense_regions);
+    const auto lines = residual_line_objects(authority_, roots, acknowledged_objects_);
     for (const auto& [key, bytes] : lines) {
         (void)key;
         result.insert(result.end(), bytes.begin(), bytes.end());
@@ -1147,24 +1220,29 @@ const CActiveTx& CRoute::begin(const PreparedTUPtr& prepared,
         authority_.publish_new_p29_blocks();
         CActiveTx active;
         active.prepared = prepared;
+        std::vector<p29::Ref> independent_roots;
+        std::span<const p29::Ref> closure_roots;
         if (root_mode == P29RootMode::RouteHistory) {
             active.root.reserve(plan.root.size());
             for (const p29::Ref& ref : plan.root)
                 active.root.push_back(ref.kind == p29::RefKind::Region
                                           ? authority_.dense_region_key(ref.id)
                                           : authority_.block_key(ref.id));
+            closure_roots = std::span<const p29::Ref>(plan.root);
         } else if (root_mode == P29RootMode::HistoryIndependent) {
             active.root = prepared->regions;
+            independent_roots = region_root_refs(prepared->dense_regions);
+            closure_roots = std::span<const p29::Ref>(independent_roots);
         } else {
             throw std::invalid_argument("unsupported P29 root mode");
         }
-        active.manifest = authority_.transitive_manifest(active.root);
+        active.manifest = authority_.transitive_manifest(closure_roots);
         active.dict = encode_key_vector(active.manifest);
         const std::vector<uint8_t> root_bytes = encode_key_vector(active.root);
         active.body = residual_body
                           ? encode_p29_residual_body(
                                 root_bytes,
-                                residual_line_objects(authority_.arena().objects(), active.root,
+                                residual_line_objects(authority_, closure_roots,
                                                       acknowledged_objects_))
                           : root_bytes;
         active.region_count = prepared->regions.size();
