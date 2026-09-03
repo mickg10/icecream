@@ -417,6 +417,16 @@ size_t Key64Hash::operator()(Key64 value) const noexcept {
     return std::hash<uint64_t>{}(value.wire_value());
 }
 
+size_t Digest128Hash::operator()(const Digest128& value) const noexcept {
+    uint64_t first = 0;
+    uint64_t second = 0;
+    std::memcpy(&first, value.bytes.data(), sizeof(first));
+    std::memcpy(&second, value.bytes.data() + sizeof(first), sizeof(second));
+    const size_t a = std::hash<uint64_t>{}(first);
+    const size_t b = std::hash<uint64_t>{}(second);
+    return a ^ (b + size_t{0x9e3779b9} + (a << 6) + (a >> 2));
+}
+
 MessageType message_type(const Message& message) {
     return std::visit([](const auto& value) -> MessageType {
         using T = std::decay_t<decltype(value)>;

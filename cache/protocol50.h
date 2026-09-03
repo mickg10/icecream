@@ -96,6 +96,10 @@ struct Key64Hash {
     size_t operator()(Key64 value) const noexcept;
 };
 
+struct Digest128Hash {
+    size_t operator()(const Digest128& value) const noexcept;
+};
+
 constexpr uint16_t kProtocolVersion = 50;
 constexpr uint32_t kInitialMaxFramePayload = 1U << 20;
 // TX_BEGIN is the largest fixed-size mandatory V1 control payload.

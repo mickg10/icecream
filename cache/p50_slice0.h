@@ -65,9 +65,11 @@ struct ObjectApplied {
 class ImmutableObjectStore {
 public:
     ObjectApplyResult apply(const ImmutableObject& object);
+    ObjectApplyResult apply(ImmutableObject&& object);
     [[nodiscard]] const ImmutableObject* find(Key64 key) const;
     [[nodiscard]] bool contains(Key64 key) const { return find(key) != nullptr; }
     [[nodiscard]] size_t size() const { return objects_.size(); }
+    void reserve(size_t count) { objects_.reserve(count); }
     void clear() { objects_.clear(); }
 
 private:
@@ -83,6 +85,7 @@ public:
 
     Key64 intern_bytes(ObjectType type, std::span<const uint8_t> payload);
     Key64 intern_children(ObjectType type, std::span<const Key64> payload);
+    void reserve_for_tu(size_t expected_lines);
     GenerationAdvanceResult advance_generation();
 
     [[nodiscard]] const ImmutableObject& object(Key64 key) const;
@@ -102,7 +105,7 @@ private:
     uint64_t first_ordinal_ = 1;
     std::array<uint64_t, 32> next_ordinal_{};
     ImmutableObjectStore objects_;
-    std::map<Digest128, std::vector<Key64>> content_index_;
+    std::unordered_map<Digest128, std::vector<Key64>, Digest128Hash> content_index_;
 };
 
 // The resource owner is deliberately independent from a C/F relationship.
@@ -310,6 +313,9 @@ private:
     PreparedTUPtr prepare_tu_at_seq(std::span<const uint8_t> exact_input,
                                     std::span<const Key64> regions,
                                     TuSeq tu_seq);
+    void reserve_for_tu(size_t expected_lines) {
+        arena_.reserve_for_tu(expected_lines);
+    }
     // Build the immutable C-wide representation with an already allocated
     // identity.  Only the C preparation authority may call this; it never
     // advances the allocator or permits an external TU_SEQ choice.

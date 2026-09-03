@@ -505,6 +505,16 @@ ObjectApplyResult ImmutableObjectStore::apply(const ImmutableObject& object) {
     return ObjectApplyResult::Duplicate;
 }
 
+ObjectApplyResult ImmutableObjectStore::apply(ImmutableObject&& object) {
+    if (!object.valid_shape()) throw std::invalid_argument("invalid immutable object");
+    const Key64 key = object.key;
+    auto [position, inserted] = objects_.try_emplace(key, std::move(object));
+    if (inserted) return ObjectApplyResult::Applied;
+    if (position->second != object)
+        throw std::logic_error("Key64 already names different immutable content");
+    return ObjectApplyResult::Duplicate;
+}
+
 const ImmutableObject* ImmutableObjectStore::find(Key64 key) const {
     const auto position = objects_.find(key);
     return position == objects_.end() ? nullptr : &position->second;
@@ -513,6 +523,9 @@ const ImmutableObject* ImmutableObjectStore::find(Key64 key) const {
 CObjectArena::CObjectArena(CStoreGuid guid, uint16_t generation,
                            uint64_t first_ordinal)
     : guid_(guid), generation_(generation), first_ordinal_(first_ordinal) {
+    // XXH3-128 distributes content digests uniformly. A short collision chain
+    // keeps this index cheaper than the former tree without a bucket per key.
+    content_index_.max_load_factor(4.0F);
     if (generation > KeyLayoutV1::generation_value_mask)
         throw std::invalid_argument("Key64 generation exceeds KeyLayoutV1");
     if (first_ordinal == 0 || first_ordinal > KeyLayoutV1::ordinal_mask)
@@ -550,7 +563,7 @@ Key64 CObjectArena::install(ObjectType type, ObjectPayload payload) {
     if (const auto existing = find_equal(type, payload, digest)) return *existing;
     const Key64 key = allocate(type);
     ImmutableObject object{key, std::move(payload), digest};
-    objects_.apply(object);
+    objects_.apply(std::move(object));
     content_index_[digest].push_back(key);
     return key;
 }
@@ -572,6 +585,11 @@ Key64 CObjectArena::intern_children(ObjectType type,
     ImmutableObject shape{*probe, candidate, object_digest(type, candidate)};
     if (!shape.valid_shape()) throw std::invalid_argument("invalid child object shape");
     return install(type, std::move(candidate));
+}
+
+void CObjectArena::reserve_for_tu(size_t expected_lines) {
+    objects_.reserve(expected_lines);
+    content_index_.reserve(expected_lines);
 }
 
 GenerationAdvanceResult CObjectArena::advance_generation() {
@@ -1123,6 +1141,7 @@ PreparedTUPtr CAuthority::prepare_from_regions(
 PreparedTUPtr CAuthority::prepare_from_regions_at_seq(
     std::span<const std::vector<uint8_t>> region_bytes,
     std::optional<TuSeq> tu_seq) {
+    reserve_for_tu(region_bytes.size());
     std::vector<Key64> regions;
     std::vector<uint8_t> exact;
     regions.reserve(region_bytes.size());
