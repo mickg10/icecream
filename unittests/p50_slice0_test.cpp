@@ -55,6 +55,12 @@ std::vector<std::vector<uint8_t>> regions(
     return result;
 }
 
+Key64 intern_region(CAuthority& authority, std::string_view text) {
+    const Key64 line = authority.intern_bytes(ObjectType::Line, bytes(text));
+    const std::array<Key64, 1> children{line};
+    return authority.intern_children(ObjectType::Region, children);
+}
+
 struct Pair {
     CAuthority c;
     FStore f;
@@ -146,6 +152,66 @@ void test_key_limits_and_mixed_generations() {
     require(pair.f.contains(pair.c.guid(), old_region) &&
                 pair.f.contains(pair.c.guid(), new_region),
             "old and new generations did not coexist on F");
+}
+
+void test_p29_preparation_verification_modes() {
+    CAuthority authority(Id128::from_u64(20));
+    require(authority.verification() == CAuthority::Verification::StreamedDigest,
+            "P29 preparation did not default to streamed verification");
+    const Key64 alpha = intern_region(authority, "alpha\n");
+    const Key64 bravo = intern_region(authority, "bravo\n");
+    const std::array<Key64, 1> alpha_root{alpha};
+    const std::array<Key64, 1> bravo_root{bravo};
+    const std::array<Key64, 2> ordered{alpha, bravo};
+    const std::array<Key64, 2> reordered{bravo, alpha};
+    const std::vector<uint8_t> alpha_bravo = bytes("alpha\nbravo\n");
+
+    require(authority.prepare_tu(bytes("alpha\n"), alpha_root) != nullptr,
+            "streamed verification rejected an exact Region composition");
+    require_throws<std::invalid_argument>(
+        [&] { (void)authority.prepare_tu(bytes("alpha\n"), bravo_root); },
+        "streamed digest accepted equal-length changed Region bytes");
+    require_throws<std::invalid_argument>(
+        [&] { (void)authority.prepare_tu(alpha_bravo, alpha_root); },
+        "streamed verification accepted a dropped Region");
+    require_throws<std::invalid_argument>(
+        [&] { (void)authority.prepare_tu(alpha_bravo, reordered); },
+        "streamed digest accepted reordered Regions");
+
+    authority.set_verification(CAuthority::Verification::FullMaterialization);
+    require(authority.verification() == CAuthority::Verification::FullMaterialization,
+            "P29 full-materialization verification switch did not latch");
+    require(authority.prepare_tu(alpha_bravo, ordered) != nullptr,
+            "full materialization rejected an exact Region composition");
+    require_throws<std::invalid_argument>(
+        [&] { (void)authority.prepare_tu(bytes("alpha\n"), bravo_root); },
+        "full materialization accepted equal-length changed Region bytes");
+
+    Pair end_to_end(nullptr, 21, 22);
+    const PreparedTUPtr prepared = end_to_end.c.prepare_from_regions(
+        regions({"alpha\n", "bravo\n"}));
+    const CActiveTx& active = end_to_end.route.begin(
+        prepared, P29RootMode::HistoryIndependent);
+    const Need need = start(end_to_end, active);
+    const std::vector<ImmutableObject> fill = end_to_end.route.build_fill(need);
+    end_to_end.f.append_body(end_to_end.session, active.body);
+    bool corrupted_line = false;
+    for (const ImmutableObject& object : fill) {
+        if (!corrupted_line && object.key.type() == ObjectType::Line) {
+            std::vector<uint8_t> changed =
+                std::get<BytesPayload>(object.payload).bytes;
+            changed.front() ^= 1;
+            end_to_end.f.apply_object(
+                end_to_end.session, ImmutableObject::bytes(object.key, changed));
+            corrupted_line = true;
+        } else {
+            end_to_end.f.apply_object(end_to_end.session, object);
+        }
+    }
+    require(corrupted_line, "end-to-end P29 digest fixture changed no Line");
+    require_throws<std::logic_error>(
+        [&] { (void)end_to_end.f.materialize_and_verify(end_to_end.session); },
+        "F accepted a same-size Line corruption against the declared raw digest");
 }
 
 void test_global_resource_owner_and_caught_slot_mutant() {
@@ -1005,6 +1071,7 @@ void test_canonical_action_trace() {
 
 int main() {
     test_key_limits_and_mixed_generations();
+    test_p29_preparation_verification_modes();
     test_global_resource_owner_and_caught_slot_mutant();
     test_tu_seq_is_not_route_order();
     test_separate_preparation_real_interning_and_p29();

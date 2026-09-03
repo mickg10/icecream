@@ -250,10 +250,16 @@ using PreparedTUPtr = std::shared_ptr<const PreparedTU>;
 
 class CAuthority {
 public:
+    enum class Verification : uint8_t {
+        StreamedDigest,
+        FullMaterialization,
+    };
+
     explicit CAuthority(CStoreGuid guid,
                         p29::OnlineS1::Config config = p29::OnlineS1::Config{},
                         uint16_t generation = 0, uint64_t first_ordinal = 1,
-                        TuSeq first_tu_seq = {});
+                        TuSeq first_tu_seq = {},
+                        Verification verification = Verification::StreamedDigest);
 
     Key64 intern_bytes(ObjectType type, std::span<const uint8_t> payload) {
         return arena_.intern_bytes(type, payload);
@@ -263,6 +269,8 @@ public:
     }
     GenerationAdvanceResult advance_generation() { return arena_.advance_generation(); }
 
+    // Rejects unless the ordered Region/Line composition has the exact input
+    // length and digest. FullMaterialization adds a bytewise debug assertion.
     PreparedTUPtr prepare_tu(std::span<const uint8_t> exact_input,
                              std::span<const Key64> regions);
     PreparedTUPtr prepare_from_regions(
@@ -279,6 +287,8 @@ public:
     [[nodiscard]] std::span<const uint32_t> block_regions(uint32_t id) const {
         return std::span<const uint32_t>(block_catalogue_.block(id).regions);
     }
+    void set_verification(Verification verification) { verification_ = verification; }
+    [[nodiscard]] Verification verification() const { return verification_; }
     void publish_new_p29_blocks();
     [[nodiscard]] std::vector<Key64> transitive_manifest(
         std::span<const p29::Ref> roots) const;
@@ -315,6 +325,7 @@ private:
     std::vector<Key64> block_keys_;
     uint64_t next_tu_seq_ = 0;
     bool tu_seq_exhausted_ = false;
+    Verification verification_ = Verification::StreamedDigest;
 };
 
 struct Need {

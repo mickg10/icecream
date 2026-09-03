@@ -977,6 +977,12 @@ P50PreparationAuthority::P50PreparationAuthority(
 
 P50PreparationAuthority::~P50PreparationAuthority() = default;
 
+void P50PreparationAuthority::set_p29_verification(
+    CAuthority::Verification verification) {
+    impl_->owner.require();
+    impl_->p29_authority->set_verification(verification);
+}
+
 PreparedTuHandle P50PreparationAuthority::prepare(PrepareRequestKey request,
                                                    std::span<const uint8_t> exact_input) {
     return prepare_for_route(Impl::legacy_route(impl_->profile), request, exact_input);

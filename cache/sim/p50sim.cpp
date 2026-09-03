@@ -143,6 +143,7 @@ struct Arguments {
     std::string batch_assignment_map_3;
     std::string batch_output;
     bool batch_allow_repeated_inputs = false;
+    bool p29_verify_materialization = false;
     std::string codec_method;
     std::string codec_prefix;
     std::string codec_output;
@@ -186,6 +187,10 @@ Arguments parse(int argc, char** argv) {
     Arguments result;
     for (int index = 1; index < argc; ++index) {
         const std::string option = argv[index];
+        if (option == "--p29-verify-materialization") {
+            result.p29_verify_materialization = true;
+            continue;
+        }
         if (index + 1 >= argc)
             throw std::invalid_argument("missing value for " + option);
         if (option == "--input")
@@ -266,7 +271,8 @@ Arguments parse(int argc, char** argv) {
         if (result.codec_method != "ZSTD_TU" && result.codec_method != "ZSTD_ROUTE")
             throw std::invalid_argument("codec mode requires ZSTD_TU or ZSTD_ROUTE");
         if (result.input.empty() || result.codec_output.empty() || batch ||
-            !result.actions.empty() || !result.summary.empty())
+            !result.actions.empty() || !result.summary.empty() ||
+            result.p29_verify_materialization)
             throw std::invalid_argument("codec mode requires --input/--codec-output only");
         return result;
     }
@@ -685,6 +691,12 @@ void run_batch(const Arguments& arguments) {
     auto authority = std::make_shared<P50PreparationAuthority>(
         arguments.c_store_guid, caps.zstd, authority_limits,
         kCurrentProductCompressionLevel, profile);
+    if (arguments.p29_verify_materialization) {
+        if (profile != ProfileId::P29)
+            throw std::invalid_argument(
+                "--p29-verify-materialization requires ICECC_P50_PROFILE=P29");
+        authority->set_p29_verification(CAuthority::Verification::FullMaterialization);
+    }
     asio::io_context context;
     tcp::acceptor acceptor(context,
                            tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0));
@@ -868,6 +880,13 @@ int main(int argc, char** argv) {
             arguments.c_store_guid, caps.zstd,
             PreparationAuthorityLimits{}, kCurrentProductCompressionLevel,
             caps.profile);
+        if (arguments.p29_verify_materialization) {
+            if (caps.profile != ProfileId::P29)
+                throw std::invalid_argument(
+                    "--p29-verify-materialization requires ICECC_P50_PROFILE=P29");
+            authority->set_p29_verification(
+                CAuthority::Verification::FullMaterialization);
+        }
         const std::vector<uint8_t> prewarm_input = warm
             ? read_bytes(arguments.prewarm_input) : std::vector<uint8_t>{};
 

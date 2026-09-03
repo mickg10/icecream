@@ -241,6 +241,9 @@ public:
     PreparedTuHandle prepare_for_route(PreparationRouteKey route,
                                        PrepareRequestKey request,
                                        std::span<const uint8_t> exact_input);
+    // Test/simulator-only verification strength for P29 preparation. The
+    // streamed digest remains mandatory in both modes.
+    void set_p29_verification(CAuthority::Verification verification);
     uint64_t retain(PreparedTuHandle handle);
     uint64_t release(PreparedTuHandle handle);
     void commit(PreparedTuHandle handle);

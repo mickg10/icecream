@@ -1028,9 +1028,9 @@ const ImmutableObject& CObjectArena::object(Key64 key) const {
 
 CAuthority::CAuthority(CStoreGuid guid, p29::OnlineS1::Config config,
                        uint16_t generation, uint64_t first_ordinal,
-                       TuSeq first_tu_seq)
+                       TuSeq first_tu_seq, Verification verification)
     : arena_(guid, generation, first_ordinal), s1_config_(config),
-      next_tu_seq_(first_tu_seq.value) {}
+      next_tu_seq_(first_tu_seq.value), verification_(verification) {}
 
 TuSeq CAuthority::reserve_tu_seq() const {
     if (tu_seq_exhausted_)
@@ -1074,17 +1074,42 @@ PreparedTUPtr CAuthority::prepare_tu(std::span<const uint8_t> exact_input,
 PreparedTUPtr CAuthority::prepare_tu_at_seq(
     std::span<const uint8_t> exact_input, std::span<const Key64> regions,
     TuSeq tu_seq) {
-    const std::vector<uint8_t> materialized = materialize(arena_.objects(), regions);
-    if (materialized.size() != exact_input.size() ||
-        !std::equal(materialized.begin(), materialized.end(), exact_input.begin()))
+    const Digest128 exact_digest = digest128(exact_input);
+    Digest128Builder composed;
+    uint64_t total = 0;
+    for (Key64 key : regions) {
+        const ImmutableObject& region = arena_.object(key);
+        const auto* children = region.key.type() == ObjectType::Region
+                                   ? std::get_if<ChildrenPayload>(&region.payload)
+                                   : nullptr;
+        if (!children || children->children.size() != 1)
+            throw std::invalid_argument("PreparedTU Region does not contain one Line");
+        const ImmutableObject& line = arena_.object(children->children.front());
+        const auto* bytes = line.key.type() == ObjectType::Line
+                                ? std::get_if<BytesPayload>(&line.payload)
+                                : nullptr;
+        if (!bytes)
+            throw std::invalid_argument("PreparedTU Region child is not a Line payload");
+        composed.append(bytes->bytes);
+        if (bytes->bytes.size() > std::numeric_limits<uint64_t>::max() - total)
+            throw std::overflow_error("PreparedTU composed byte count exceeds u64");
+        total += bytes->bytes.size();
+    }
+    if (total != exact_input.size() || composed.finish() != exact_digest)
         throw std::invalid_argument("PreparedTU Regions do not reproduce exact input");
+    if (verification_ == Verification::FullMaterialization) {
+        const std::vector<uint8_t> materialized = materialize(arena_.objects(), regions);
+        if (materialized.size() != exact_input.size() ||
+            !std::equal(materialized.begin(), materialized.end(), exact_input.begin()))
+            throw std::invalid_argument("PreparedTU Regions do not reproduce exact input");
+    }
     std::vector<uint32_t> dense;
     dense.reserve(regions.size());
     for (Key64 key : regions) dense.push_back(dense_region(key));
     auto prepared = std::make_shared<PreparedTU>();
     prepared->tu_seq = tu_seq;
     prepared->raw_bytes = exact_input.size();
-    prepared->raw_digest = digest128(exact_input);
+    prepared->raw_digest = exact_digest;
     prepared->regions.assign(regions.begin(), regions.end());
     prepared->dense_regions = std::move(dense);
     return prepared;
