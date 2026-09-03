@@ -3,6 +3,8 @@
 #include "capability/grouprlz/alpha_line_codec.h"
 
 #include <algorithm>
+#include <bit>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <limits>
@@ -14,6 +16,60 @@ namespace icecc::p50 {
 namespace {
 
 constexpr std::array<uint8_t, 4> kP29ResidualMagic{'P', '2', '9', 'R'};
+
+constexpr uint32_t byte_swap32(uint32_t value) noexcept {
+    return ((value & 0x000000ffU) << 24) |
+           ((value & 0x0000ff00U) << 8) |
+           ((value & 0x00ff0000U) >> 8) |
+           ((value & 0xff000000U) >> 24);
+}
+
+constexpr uint64_t byte_swap64(uint64_t value) noexcept {
+    return ((value & 0x00000000000000ffULL) << 56) |
+           ((value & 0x000000000000ff00ULL) << 40) |
+           ((value & 0x0000000000ff0000ULL) << 24) |
+           ((value & 0x00000000ff000000ULL) << 8) |
+           ((value & 0x000000ff00000000ULL) >> 8) |
+           ((value & 0x0000ff0000000000ULL) >> 24) |
+           ((value & 0x00ff000000000000ULL) >> 40) |
+           ((value & 0xff00000000000000ULL) >> 56);
+}
+
+template <typename T>
+constexpr T host_to_big_endian(T value) noexcept {
+    static_assert(sizeof(T) == sizeof(uint32_t) || sizeof(T) == sizeof(uint64_t));
+    static_assert(std::endian::native == std::endian::little ||
+                  std::endian::native == std::endian::big);
+    if constexpr (std::endian::native == std::endian::little) {
+        if constexpr (sizeof(T) == sizeof(uint32_t))
+            return static_cast<T>(byte_swap32(static_cast<uint32_t>(value)));
+        else
+            return static_cast<T>(byte_swap64(static_cast<uint64_t>(value)));
+    }
+    return value;
+}
+
+void store_u32be(uint8_t* output, uint32_t value) noexcept {
+    const uint32_t encoded = host_to_big_endian(value);
+    std::memcpy(output, &encoded, sizeof(encoded));
+}
+
+void store_u64be(uint8_t* output, uint64_t value) noexcept {
+    const uint64_t encoded = host_to_big_endian(value);
+    std::memcpy(output, &encoded, sizeof(encoded));
+}
+
+uint32_t load_u32be(const uint8_t* input) noexcept {
+    uint32_t encoded = 0;
+    std::memcpy(&encoded, input, sizeof(encoded));
+    return host_to_big_endian(encoded);
+}
+
+uint64_t load_u64be(const uint8_t* input) noexcept {
+    uint64_t encoded = 0;
+    std::memcpy(&encoded, input, sizeof(encoded));
+    return host_to_big_endian(encoded);
+}
 
 void append_u64le(std::vector<uint8_t>& out, uint64_t value) {
     for (unsigned shift = 0; shift != 64; shift += 8)
@@ -204,20 +260,31 @@ bool byte_object(ObjectType type) {
 }
 
 std::vector<uint8_t> encode_payload(ObjectType type, const ObjectPayload& payload) {
-    std::vector<uint8_t> result;
-    const auto append_u64 = [&](uint64_t value) {
-        for (int shift = 56; shift >= 0; shift -= 8)
-            result.push_back(static_cast<uint8_t>(value >> shift));
-    };
+    constexpr size_t header_bytes = 1 + sizeof(uint64_t);
     if (const auto* bytes = std::get_if<BytesPayload>(&payload)) {
-        result.push_back(0);
-        append_u64(bytes->bytes.size());
-        result.insert(result.end(), bytes->bytes.begin(), bytes->bytes.end());
-    } else {
-        const auto& children = std::get<ChildrenPayload>(payload).children;
-        result.push_back(1);
-        append_u64(children.size());
-        for (Key64 child : children) append_u64(child.wire_value());
+        if (bytes->bytes.size() > std::numeric_limits<size_t>::max() - header_bytes)
+            throw std::overflow_error("canonical byte payload exceeds addressable size");
+        std::vector<uint8_t> result(header_bytes + bytes->bytes.size());
+        result[0] = 0;
+        store_u64be(result.data() + 1, bytes->bytes.size());
+        if (!bytes->bytes.empty())
+            std::memcpy(result.data() + header_bytes, bytes->bytes.data(),
+                        bytes->bytes.size());
+        (void)type;
+        return result;
+    }
+
+    const auto& children = std::get<ChildrenPayload>(payload).children;
+    if (children.size() >
+        (std::numeric_limits<size_t>::max() - header_bytes) / sizeof(uint64_t))
+        throw std::overflow_error("canonical child payload exceeds addressable size");
+    std::vector<uint8_t> result(header_bytes + children.size() * sizeof(uint64_t));
+    result[0] = 1;
+    store_u64be(result.data() + 1, children.size());
+    size_t offset = header_bytes;
+    for (Key64 child : children) {
+        store_u64be(result.data() + offset, child.wire_value());
+        offset += sizeof(uint64_t);
     }
     (void)type;
     return result;
@@ -226,8 +293,8 @@ std::vector<uint8_t> encode_payload(ObjectType type, const ObjectPayload& payloa
 uint64_t read_u64(std::span<const uint8_t> bytes, size_t& offset) {
     if (bytes.size() - offset < 8)
         throw std::invalid_argument("canonical object payload ended early");
-    uint64_t result = 0;
-    for (unsigned i = 0; i != 8; ++i) result = (result << 8) | bytes[offset++];
+    const uint64_t result = load_u64be(bytes.data() + offset);
+    offset += sizeof(uint64_t);
     return result;
 }
 
@@ -298,30 +365,33 @@ std::vector<uint8_t> encode_key_vector(std::span<const Key64> keys) {
     if (keys.empty()) return {};
     if (keys.size() > std::numeric_limits<uint32_t>::max())
         throw std::overflow_error("Key64 vector exceeds u32 count");
-    std::vector<uint8_t> result;
-    result.reserve(4 + keys.size() * 8);
+    constexpr size_t count_bytes = sizeof(uint32_t);
+    if (keys.size() >
+        (std::numeric_limits<size_t>::max() - count_bytes) / sizeof(uint64_t))
+        throw std::overflow_error("Key64 vector exceeds addressable size");
+    std::vector<uint8_t> result(count_bytes + keys.size() * sizeof(uint64_t));
     const uint32_t count = static_cast<uint32_t>(keys.size());
-    for (int shift = 24; shift >= 0; shift -= 8)
-        result.push_back(static_cast<uint8_t>(count >> shift));
-    for (Key64 key : keys)
-        for (int shift = 56; shift >= 0; shift -= 8)
-            result.push_back(static_cast<uint8_t>(key.wire_value() >> shift));
+    store_u32be(result.data(), count);
+    size_t offset = count_bytes;
+    for (Key64 key : keys) {
+        store_u64be(result.data() + offset, key.wire_value());
+        offset += sizeof(uint64_t);
+    }
     return result;
 }
 
 std::vector<Key64> decode_key_vector(std::span<const uint8_t> bytes) {
     if (bytes.empty()) return {};
     if (bytes.size() < 4) throw std::invalid_argument("key vector ended before count");
-    uint32_t count = 0;
-    for (unsigned i = 0; i != 4; ++i) count = (count << 8) | bytes[i];
+    const uint32_t count = load_u32be(bytes.data());
     if (bytes.size() != 4 + uint64_t(count) * 8)
         throw std::invalid_argument("key vector length does not match count");
     std::vector<Key64> result;
     result.reserve(count);
     size_t offset = 4;
     for (uint32_t i = 0; i != count; ++i) {
-        uint64_t raw = 0;
-        for (unsigned j = 0; j != 8; ++j) raw = (raw << 8) | bytes[offset++];
+        const uint64_t raw = load_u64be(bytes.data() + offset);
+        offset += sizeof(uint64_t);
         const auto key = Key64::from_wire(raw);
         if (!key) throw std::invalid_argument("key vector contains invalid Key64");
         result.push_back(*key);
