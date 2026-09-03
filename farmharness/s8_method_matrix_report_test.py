@@ -472,6 +472,7 @@ def test_native_transaction_is_the_only_wire_witness(tmp_path: Path) -> None:
             "encoded_bytes": 5, "codec_cpu_ns": 1, "codec_wall_ns": 1,
             "wire_witnessed": True, "status": "READY",
             "product_transaction": {"c_to_f_bytes": 5, "f_to_c_bytes": 7,
+                                     "prepare_ns": 13,
                                      "simulator_execution_ns": 11}}
     grouped = report._validate_rows([base], {}, "C1F1/100000", Path("."))
     manifest = {"methods": ["ZSTD_TU"], "authority": {}}
@@ -483,4 +484,16 @@ def test_native_transaction_is_the_only_wire_witness(tmp_path: Path) -> None:
     assert result["wire_witnessed"] is True
     assert result["c_to_f_bytes"] == 5
     assert result["f_to_c_bytes"] == 7
+    assert result["prepare_ns"] == 13
     assert result["execution_ns"] == 11
+    assert result["total_execution_ns"] == 24
+
+    legacy = copy.deepcopy(base)
+    del legacy["product_transaction"]["prepare_ns"]
+    legacy_grouped = report._validate_rows([legacy], {}, "C1F1/100000", Path("."))
+    legacy_result = report._method_result(
+        tmp_path, manifest, summary, legacy_grouped, "ZSTD_TU",
+        "C1F1/100000", "100", "p", "t", {"status": "NOT_APPLICABLE"})
+    assert legacy_result["prepare_ns"] is None
+    assert legacy_result["execution_ns"] == 11
+    assert legacy_result["total_execution_ns"] is None

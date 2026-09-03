@@ -524,6 +524,7 @@ void write_batch_row(std::ostream& output, std::string_view segment,
                      const std::optional<Digest128>& expected_before,
                      size_t prefix_before_bytes, const Digest128& prefix_before_digest,
                      size_t prefix_after_bytes, const Digest128& prefix_after_digest,
+                     std::chrono::steady_clock::duration prepare_elapsed,
                      std::chrono::steady_clock::duration elapsed,
                      ProfileId profile) {
     const Digest128 raw_digest = icecc::digest128(input);
@@ -612,7 +613,9 @@ void write_batch_row(std::ostream& output, std::string_view segment,
            << icecc::digest128_hex(raw_digest) << "\",\"encoded_source_bytes\":"
            << encoded_source_bytes << ",\"c_to_f_bytes\":" << c_writes
            << ",\"f_to_c_bytes\":" << f_writes << ",\"peer_c_read_bytes\":" << c_reads
-           << ",\"peer_f_read_bytes\":" << f_reads << ",\"simulator_execution_ns\":"
+           << ",\"peer_f_read_bytes\":" << f_reads << ",\"prepare_ns\":"
+           << std::chrono::duration_cast<std::chrono::nanoseconds>(prepare_elapsed).count()
+           << ",\"simulator_execution_ns\":"
            << std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()
            << ",\"action_records\":" << actions.records().size()
            << ",\"state_before_digest\":\"" << icecc::digest128_hex(state_before)
@@ -724,10 +727,12 @@ void run_batch(const Arguments& arguments) {
             const size_t prefix_before_bytes = authority->route_history_bytes(relation.route);
             const Digest128 prefix_before_digest = authority->route_history_digest(relation.route);
             const uint64_t expected_tu_seq = global_tu_seq;
+            const auto prepare_started = std::chrono::steady_clock::now();
             auto prepared = authority->prepare_for_route(
                 relation.route,
                 PrepareRequestKey{static_cast<uint64_t>(assignments[index] + 1),
                                   ++relation.request_token}, input);
+            const auto prepare_elapsed = std::chrono::steady_clock::now() - prepare_started;
             if (!prepared)
                 throw std::runtime_error("product preparation returned an invalid handle");
             ++global_tu_seq;
@@ -780,7 +785,8 @@ void run_batch(const Arguments& arguments) {
                             client_result, server_result, relation.completions,
                             relation.actions, *relation.client, expected_before,
                             prefix_before_bytes, prefix_before_digest,
-                            prefix_after_bytes, prefix_after_digest, elapsed, profile);
+                            prefix_after_bytes, prefix_after_digest,
+                            prepare_elapsed, elapsed, profile);
             output.flush();
             if (!output)
                 throw std::runtime_error("cannot flush batch output before input reclamation");

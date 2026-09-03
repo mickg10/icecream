@@ -526,6 +526,9 @@ def _validate_rows(rows: Sequence[Any], manifest: Mapping[str, Any], topology: s
         if isinstance(transaction, Mapping):
             for field in ("c_to_f_bytes", "f_to_c_bytes", "simulator_execution_ns"):
                 _int_or_none(transaction.get(field), field)
+            if ("prepare_ns" in transaction and
+                    _int_or_none(transaction.get("prepare_ns"), "prepare_ns") is None):
+                raise ReportError("row:prepare_ns:invalid_integer")
         if method == "RAW_II":
             if any(row.get(field) is not None for field in
                    ("encoded_bytes", "codec_cpu_ns", "codec_wall_ns")):
@@ -567,10 +570,20 @@ def _validate_summary_totals(summary: Mapping[str, Any],
             raise ReportError(f"summary:wire_witness_mismatch:{method}")
         if wire:
             transactions = [row["product_transaction"] for row in rows]
+            prepare_present = ["prepare_ns" in tx for tx in transactions]
+            if any(prepare_present) and not all(prepare_present):
+                raise ReportError(f"summary:prepare_ns_mixed_availability:{method}")
+            prepare_ns = (sum(int(tx["prepare_ns"]) for tx in transactions)
+                          if transactions and all(prepare_present) else None)
+            execution_ns = sum(int(tx.get("simulator_execution_ns", 0))
+                               for tx in transactions)
             expected = {
                 "c_to_f_bytes": sum(int(tx.get("c_to_f_bytes", 0)) for tx in transactions),
                 "f_to_c_bytes": sum(int(tx.get("f_to_c_bytes", 0)) for tx in transactions),
-                "execution_ns": sum(int(tx.get("simulator_execution_ns", 0)) for tx in transactions),
+                "prepare_ns": prepare_ns,
+                "execution_ns": execution_ns,
+                "total_execution_ns": (prepare_ns + execution_ns
+                                       if prepare_ns is not None else None),
             }
             for field, value in expected.items():
                 if total.get(field) != value:
@@ -623,8 +636,14 @@ def _method_result(experiment: Path, manifest: Mapping[str, Any], summary: Mappi
                      for tx in transactions)
         execution = sum(_int_or_none(tx.get("simulator_execution_ns"), "execution_ns") or 0
                         for tx in transactions)
+        prepare_values = [_int_or_none(tx.get("prepare_ns"), "prepare_ns")
+                          for tx in transactions]
+        prepare = (sum(value for value in prepare_values if value is not None)
+                   if prepare_values and all(value is not None for value in prepare_values)
+                   else None)
+        total_execution = prepare + execution if prepare is not None else None
     else:
-        c_to_f = f_to_c = execution = None
+        c_to_f = f_to_c = prepare = execution = total_execution = None
         if reason is None and method != "RAW_II":
             reason = "product_transaction_wire_witness_unavailable"
     ratio, reduction, ratio_reason = _ratio(raw, encoded)
@@ -641,7 +660,9 @@ def _method_result(experiment: Path, manifest: Mapping[str, Any], summary: Mappi
         "method": method, "classification": "core" if method in CORE_METHODS else "optional",
         "status": status, "reason": reason,
         "raw_bytes": raw, "encoded_bytes": encoded,
-        "c_to_f_bytes": c_to_f, "f_to_c_bytes": f_to_c, "execution_ns": execution,
+        "c_to_f_bytes": c_to_f, "f_to_c_bytes": f_to_c,
+        "prepare_ns": prepare, "execution_ns": execution,
+        "total_execution_ns": total_execution,
         "wire_witnessed": wire, "compression_ratio": ratio,
         "byte_reduction_fraction": reduction, "ratio_reason": ratio_reason,
         "full2_continuity": dict(marker),
@@ -809,12 +830,13 @@ def build_report(experiments: Sequence[Path], output_root: Path) -> Path:
                              for key, value in row.items()})
     lines = ["# S8 method matrix report", "", f"Status: **{matrix_status}**", "",
              "The loss curve is a transparent tabular point set by depth; no fitted model is used.", "",
-             "| topology | depth | pass | method | status | raw | encoded | C→F | F→C | execution ns | ratio | reduction | reason |",
-             "|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|"]
+             "| topology | depth | pass | method | status | raw | encoded | C→F | F→C | prepare ns | exchange ns | total ns | ratio | reduction | reason |",
+             "|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
     for row in records:
         values = [row.get(key) for key in ("topology", "depth", "pass", "method", "status",
                                             "raw_bytes", "encoded_bytes", "c_to_f_bytes",
-                                            "f_to_c_bytes", "execution_ns", "compression_ratio",
+                                            "f_to_c_bytes", "prepare_ns", "execution_ns",
+                                            "total_execution_ns", "compression_ratio",
                                             "byte_reduction_fraction", "reason")]
         lines.append("| " + " | ".join("" if value is None else str(value).replace("|", "\\|")
                                          for value in values) + " |")

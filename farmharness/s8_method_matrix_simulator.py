@@ -307,7 +307,17 @@ def _native_failure_artifact(
         failure_pass += f"-r{suffix - 1:02d}"
 
     bounded_stderr = bytes(stderr[:NATIVE_FAILURE_STDERR_BYTES])
+    def complete_total(items: Sequence[Mapping[str, object]], field: str) -> int | None:
+        values = [item.get(field) for item in items]
+        if not values or any(type(value) is not int or value < 0 for value in values):
+            return None
+        return sum(int(value) for value in values)
+
     def aggregate(items: Sequence[Mapping[str, object]]) -> dict[str, object]:
+        prepare_ns = complete_total(items, "prepare_ns")
+        execution_ns = sum(value.get("simulator_execution_ns", 0) for value in items
+                           if type(value.get("simulator_execution_ns")) is int and
+                           value.get("simulator_execution_ns", 0) >= 0)
         return {
             "valid_rows": len(items),
             "raw_bytes": sum(value.get("raw_bytes", 0) for value in items
@@ -319,14 +329,20 @@ def _native_failure_artifact(
                                  if type(value.get("c_to_f_bytes")) is int and value.get("c_to_f_bytes", 0) >= 0),
             "f_to_c_bytes": sum(value.get("f_to_c_bytes", 0) for value in items
                                  if type(value.get("f_to_c_bytes")) is int and value.get("f_to_c_bytes", 0) >= 0),
-            "simulator_execution_ns": sum(value.get("simulator_execution_ns", 0) for value in items
-                                           if type(value.get("simulator_execution_ns")) is int and
-                                           value.get("simulator_execution_ns", 0) >= 0),
+            "prepare_ns": prepare_ns,
+            "simulator_execution_ns": execution_ns,
+            "total_execution_ns": (prepare_ns + execution_ns
+                                   if prepare_ns is not None and execution_ns is not None else None),
         }
 
     segment_metrics = {segment: aggregate([item for item in valid_items
                                            if item.get("segment") == segment])
                        for segment in ("full-1", "full-2")}
+    metrics_prepare_ns = complete_total(valid_items, "prepare_ns")
+    metrics_execution_ns = sum(
+        value.get("simulator_execution_ns", 0) for value in valid_items
+        if type(value.get("simulator_execution_ns")) is int and
+        value.get("simulator_execution_ns", 0) >= 0)
     metrics = {
         "valid_rows": len(valid_items),
         "raw_bytes": sum(value.get("raw_bytes", 0) for value in valid_items
@@ -338,9 +354,10 @@ def _native_failure_artifact(
                              if type(value.get("c_to_f_bytes")) is int and value.get("c_to_f_bytes", 0) >= 0),
         "f_to_c_bytes": sum(value.get("f_to_c_bytes", 0) for value in valid_items
                              if type(value.get("f_to_c_bytes")) is int and value.get("f_to_c_bytes", 0) >= 0),
-        "simulator_execution_ns": sum(value.get("simulator_execution_ns", 0) for value in valid_items
-                                       if type(value.get("simulator_execution_ns")) is int and
-                                       value.get("simulator_execution_ns", 0) >= 0),
+        "prepare_ns": metrics_prepare_ns,
+        "simulator_execution_ns": metrics_execution_ns,
+        "total_execution_ns": (metrics_prepare_ns + metrics_execution_ns
+                               if metrics_prepare_ns is not None else None),
         "valid_rows_by_segment": {segment: values["valid_rows"]
                                   for segment, values in segment_metrics.items()},
         "segments": segment_metrics,
@@ -733,6 +750,9 @@ def _native_batch(occurrences: Sequence[Occurrence], topology: MatrixTopology,
                     item.get("relationship_id") != expected_relation_id or
                     item.get("committed") is not True):
                 raise MatrixError("native product output identity binding invalid")
+            if ("prepare_ns" in item and
+                    (type(item.get("prepare_ns")) is not int or item["prepare_ns"] < 0)):
+                raise MatrixError("native product output prepare duration invalid")
             occurrence = segment_occurrences[index]
             raw_digest = occurrence.source_digest128
             if raw_digest is None:
@@ -1907,6 +1927,16 @@ class MethodMatrixSimulator:
         c_authorities = {}
         for method in self.methods:
             selected = [row for row in rows if row.get("method") == method]
+            transactions = [row.get("product_transaction") for row in selected
+                            if isinstance(row.get("product_transaction"), Mapping)]
+            prepare_values = [transaction.get("prepare_ns") for transaction in transactions]
+            prepare_ns = (sum(int(value) for value in prepare_values)
+                          if len(transactions) == len(selected) and transactions and
+                          all(type(value) is int and value >= 0 for value in prepare_values)
+                          else None)
+            execution_ns = (None if method == "RAW_II" else
+                            sum(int(transaction.get("simulator_execution_ns", 0))
+                                for transaction in transactions))
             native_tu = [row.get("native_tu_seq") for row in selected
                          if type(row.get("native_tu_seq")) is int]
             c_authorities[method] = {
@@ -1915,9 +1945,10 @@ class MethodMatrixSimulator:
                 "raw_bytes": sum(int(row.get("raw_bytes") or 0) for row in selected),
                 "encoded_bytes": (None if method == "RAW_II" else
                                   sum(int(row.get("encoded_bytes") or 0) for row in selected)),
-                "execution_ns": (None if method == "RAW_II" else
-                                  sum(int(row.get("product_transaction", {}).get("simulator_execution_ns", 0))
-                                      for row in selected)),
+                "prepare_ns": prepare_ns,
+                "execution_ns": execution_ns,
+                "total_execution_ns": (prepare_ns + execution_ns
+                                       if prepare_ns is not None and execution_ns is not None else None),
                 "wire_witnessed": bool(selected) and all(
                     bool(row.get("wire_witnessed")) for row in selected),
                 "c_to_f_bytes": (None if method == "RAW_II" else
