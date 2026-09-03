@@ -1,0 +1,507 @@
+{
+  "schema": "codec-golden-manifest-v1",
+  "corpus_rule": "gate corpora >= 1000 TUs; goldens are identity and smoke inputs only",
+  "base_commit": "db9870d903be76694b01158303cf9e438f802120",
+  "base_tree": "5125e4a4e80f6ecf57d85e7e2270bb20b3725840",
+  "product_binary_sha256": "fe5afdc9ffd5f9f9ab7d4cd4f98ab277dc2cfeb073830d8e9ad7d75df68de40b",
+  "generator": {
+    "probe_fix_commit": "17ea8ece",
+    "reference_product_manifest_sha256": "7177ed8c5e9af6545a1a75129225be2efcb3d4ccf1860a4a97024b78413e9b44",
+    "determinism": "two complete corrected cuts agreed on all 77 product stream SHA-256 values",
+    "command": "codec_probe --list inputs/list.txt --count 999 --dump product --json product/report.jsonl"
+  },
+  "input_authority": {
+    "manifest": "s8-corrected-method-matrix/20260901T162524Z/full-1-retry-902f28d0-20260901T185923Z/20260901T212236Z-C1F1-100000-full-1-pass-1/manifest.json",
+    "real_inputs": 8,
+    "synthetic_inputs": 3,
+    "excerpt_cap_bytes": 4194304
+  },
+  "research": {
+    "commit": "56fff4e40f7ba67befa983772a29e2813233fcf2",
+    "stock_sink_sha256": "755deb8773271ad66da81d5ad4e123da1c220e1ba4c93df48a5ca07c9d113be8",
+    "cap25_sink_sha256": "d2cf61b955dd0625f4cb207e6ed6b4e5439fa89ed826a4c61acf30efafe7be7b",
+    "v1_command": "codec50-sink --manifest MANIFEST --z 3 --mixed-regions --direct-ordinals --stable-root-tags --s1-max-chain 1024 --route-s1 1",
+    "note": "research vectors are identity/smoke witnesses; effectiveness is not claimed by Phase 0"
+  },
+  "input_count": 11,
+  "stream_count": 84,
+  "inputs": [
+    {
+      "path": "inputs/real-00.ii",
+      "bytes": 4193693,
+      "sha256": "70d334c1a37d15c79cc5f64287763c44cfa9a02a57a570df599bd6ad11705b60"
+    },
+    {
+      "path": "inputs/real-01.ii",
+      "bytes": 4194298,
+      "sha256": "9ea73dbd9ef3153973d194d4febec84f9850b2e8b3553c2f4b4309de25aed8d3"
+    },
+    {
+      "path": "inputs/real-02.ii",
+      "bytes": 4194292,
+      "sha256": "732541491eecabb95f61664d72d03b028750499e4ec3df17941b334dc215e732"
+    },
+    {
+      "path": "inputs/real-03.ii",
+      "bytes": 4194243,
+      "sha256": "4a7231ced7b5e6702d8091ac96dd694af25b9b09dc0fe62da72b37ab6880aa8d"
+    },
+    {
+      "path": "inputs/real-04.ii",
+      "bytes": 4194279,
+      "sha256": "065d62aede62f74b3b705d3e47e27b31ea1b9dd9dbf334d4e8c8cc9031bfe0d5"
+    },
+    {
+      "path": "inputs/real-05.ii",
+      "bytes": 4194271,
+      "sha256": "29211f9b20ed3bccb9d9724efd0ce0ec74634faae68ce5c12252a841dbbcf6d3"
+    },
+    {
+      "path": "inputs/real-06.ii",
+      "bytes": 4194275,
+      "sha256": "dde524db627ccb440743ac8ae037f26ccc9ff6e0c6cce41f7241f7d67de00f67"
+    },
+    {
+      "path": "inputs/real-07.ii",
+      "bytes": 4194264,
+      "sha256": "3ecd66badf154adcc2b57f83964e825ddb5c3595d1e904914f6078deb42d8db8"
+    },
+    {
+      "path": "inputs/synthetic-repeat.ii",
+      "bytes": 2400000,
+      "sha256": "fc1840993c3c951c60abf581a6031b509bba98f26cfec732ffc55a15270ec97d"
+    },
+    {
+      "path": "inputs/synthetic-unique.ii",
+      "bytes": 5578130,
+      "sha256": "5b56f56265b20676f31412bb863c3200332b8591b38fb6776cc2e0afd8c008f8"
+    },
+    {
+      "path": "inputs/synthetic-blank-heavy.ii",
+      "bytes": 3213780,
+      "sha256": "563ccb621b731c6a24e2fa4a96ba2f672df50c949c0b80294d5dc6750e6dee3c"
+    }
+  ],
+  "streams": [
+    {
+      "name": "product/p29/0000.dict",
+      "bytes": 847076,
+      "sha256": "025a4f5dc02b52f52535bd2f716adef0c3d67f699e44484f89c7c54b8b91b224"
+    },
+    {
+      "name": "product/p29/0000.body",
+      "bytes": 2401698,
+      "sha256": "7bb976352743f72450b809df3341680ac67d7ff706900c042f840750da63fd54"
+    },
+    {
+      "name": "product/p29/0000.need",
+      "bytes": 105916,
+      "sha256": "43c977f4d1d1a801f5bfb47b5ff238a50638ff9f1e30f0e6a61380f9d905ee5a"
+    },
+    {
+      "name": "product/p29/0000.fill",
+      "bytes": 3017694,
+      "sha256": "7baf6ee6962b9789d76278025a895f8f69868eb832e2cd6f10e5c2921ef8d006"
+    },
+    {
+      "name": "product/tu/0000.body",
+      "bytes": 603549,
+      "sha256": "aead91ed9e5e1025b743ccfdb3af673cc8ab4d633b84110e6f3843fa8f2a1763"
+    },
+    {
+      "name": "product/route/0000.body",
+      "bytes": 603549,
+      "sha256": "aead91ed9e5e1025b743ccfdb3af673cc8ab4d633b84110e6f3843fa8f2a1763"
+    },
+    {
+      "name": "product/grz/0000.body",
+      "bytes": 1388870,
+      "sha256": "e199a75676d9a4d101a3e8316ffce5447d558664e0e21853200e9a10a3c50789"
+    },
+    {
+      "name": "product/p29/0001.dict",
+      "bytes": 861068,
+      "sha256": "ffad1c96590f037f35eff27203400ea8bd705460cff874dd62cb3e3bceb3abaf"
+    },
+    {
+      "name": "product/p29/0001.body",
+      "bytes": 186496,
+      "sha256": "83ffc06c4c7dfa3e99fd1a05921de4b3296322bfd56a255b67e53eb7a871f6e7"
+    },
+    {
+      "name": "product/p29/0001.need",
+      "bytes": 9970,
+      "sha256": "50f0012b3346a1704071b7dbf89ea7d92df488e3eb996d03e19e3a7de87f2553"
+    },
+    {
+      "name": "product/p29/0001.fill",
+      "bytes": 1285715,
+      "sha256": "ee3e1bf35b71b9b78d4f38e07733334ea857e4d6c911291e7c1e7efdc02947c2"
+    },
+    {
+      "name": "product/tu/0001.body",
+      "bytes": 601683,
+      "sha256": "01eb684d0697f73518773256fc7c2264da33b90445d87e05693e919e46fc6298"
+    },
+    {
+      "name": "product/route/0001.body",
+      "bytes": 56241,
+      "sha256": "16d15bd5aa1d9e7c75298a6197f615c96825e422c887f985854acad6d403e7e2"
+    },
+    {
+      "name": "product/grz/0001.body",
+      "bytes": 701281,
+      "sha256": "9a09fa72350ce2c626c18113936acd5b0b25ca6d3c828d0a01b20156e0e5dc79"
+    },
+    {
+      "name": "product/p29/0002.dict",
+      "bytes": 857108,
+      "sha256": "c7ce560dc8c549854bca97f590e7d9d8ea7968690e2991b6dcca4d9f3f9ddc2f"
+    },
+    {
+      "name": "product/p29/0002.body",
+      "bytes": 5684,
+      "sha256": "9ae9d840735763acb17c5a3348e6c4f14f833fc6adf9136d743408e6f5bcb89a"
+    },
+    {
+      "name": "product/p29/0002.need",
+      "bytes": 320,
+      "sha256": "3fd4834a26774224c86fee215757882eb443c9fdc3d05fd07abef832b982dc6e"
+    },
+    {
+      "name": "product/p29/0002.fill",
+      "bytes": 1067338,
+      "sha256": "037707b5e7e7ab214494ea4674d12214a7d5b2eee88225f925343c9733c7d2ee"
+    },
+    {
+      "name": "product/tu/0002.body",
+      "bytes": 601021,
+      "sha256": "f6df5458117baf3ef12f55051ea7bf65c248b21ad6fbaf83c33b67f7acf58787"
+    },
+    {
+      "name": "product/route/0002.body",
+      "bytes": 5116,
+      "sha256": "a32d103ece9bca5a3c8ea42409ed12f38d59b726c7807ac0219aea752c05f6e9"
+    },
+    {
+      "name": "product/grz/0002.body",
+      "bytes": 616467,
+      "sha256": "93650ddd3f69603b0aa6124d56b84158dcf068b3d48c86886d26fb0be75b9081"
+    },
+    {
+      "name": "product/p29/0003.dict",
+      "bytes": 862460,
+      "sha256": "1e3a8af1afcdf4a5d7be7a9d2a7329315c85b74de872f51c84f8fe570ae9ab47"
+    },
+    {
+      "name": "product/p29/0003.body",
+      "bytes": 58888,
+      "sha256": "03e530a4bdb8629bd274aa1e4ab4cd62a76c72f0a5d42c988209174780c62f27"
+    },
+    {
+      "name": "product/p29/0003.need",
+      "bytes": 3265,
+      "sha256": "e7de4aa7ed05defb793451f760d9b90c233941e598ce448b04f8177778eba6d6"
+    },
+    {
+      "name": "product/p29/0003.fill",
+      "bytes": 1134014,
+      "sha256": "cd93c78fc8dc624bd15fa3a7a645f6474a0195a900959538dc903a983570442b"
+    },
+    {
+      "name": "product/tu/0003.body",
+      "bytes": 600643,
+      "sha256": "2668c51031d8e8a6f7f4b83d1bc47057ac8ccde3500932233ee1845cd8aa3a23"
+    },
+    {
+      "name": "product/route/0003.body",
+      "bytes": 32448,
+      "sha256": "0e78f9959ab2f00f27f61ae7f3af6363da02a95667f794a27f6810219dba8d0e"
+    },
+    {
+      "name": "product/grz/0003.body",
+      "bytes": 537203,
+      "sha256": "0f784abd3f176881a5db0db6c2caffd4f89c93bc1de432476f661b716c07e64f"
+    },
+    {
+      "name": "product/p29/0004.dict",
+      "bytes": 856724,
+      "sha256": "02a0118f0454cb01609f867ddc08740c280247da2ef1e58ae0a8ca029d4f254c"
+    },
+    {
+      "name": "product/p29/0004.body",
+      "bytes": 765,
+      "sha256": "a748b6eef3274786f7f4b264c2c57b15be770a7b6df99c40d848ab209e08fc51"
+    },
+    {
+      "name": "product/p29/0004.need",
+      "bytes": 77,
+      "sha256": "79f2072ad9d0dcecfe0113384d344fde72ee9b1f2ebe99354ea5c3c753f9c727"
+    },
+    {
+      "name": "product/p29/0004.fill",
+      "bytes": 1062041,
+      "sha256": "512d0441ace6e85b6a6197a0c973dfb338e6f585116a56416462ff57549b34f3"
+    },
+    {
+      "name": "product/tu/0004.body",
+      "bytes": 601225,
+      "sha256": "dfb60ae4292d86d0a0b131745e63432b623954297b083e2731273dcc599a9757"
+    },
+    {
+      "name": "product/route/0004.body",
+      "bytes": 3906,
+      "sha256": "01c8138b80f32ffb19cdbcf28f4d018abc8b960c67cd40e05b793d8fa9c155eb"
+    },
+    {
+      "name": "product/grz/0004.body",
+      "bytes": 530598,
+      "sha256": "548f82d904c5a23f5aff284d710339df28137b32af8ae55dce38f2ad7a526224"
+    },
+    {
+      "name": "product/p29/0005.dict",
+      "bytes": 856628,
+      "sha256": "4d87e7b672929513798d95b7eddae74f3ec7d727aaba832b47ea8e9e09e9e1dd"
+    },
+    {
+      "name": "product/p29/0005.body",
+      "bytes": 334,
+      "sha256": "e29cb70212b96d3c6a28d6323edaaa86b5245766513d1aae7b758d81a2be8d96"
+    },
+    {
+      "name": "product/p29/0005.need",
+      "bytes": 49,
+      "sha256": "4599f9abbf300ad13e3fcfd0994f64692125508e73c805d0bf92397c806e7108"
+    },
+    {
+      "name": "product/p29/0005.fill",
+      "bytes": 1061085,
+      "sha256": "b06d8626eaa558c2989bc2a93ff2520e2cd9f7a9cd1299efe3940604d135f122"
+    },
+    {
+      "name": "product/tu/0005.body",
+      "bytes": 601288,
+      "sha256": "1094017d10f0692ecebd3e2f6b3b1a9d8c8b8636c36fca3216001503914a9cee"
+    },
+    {
+      "name": "product/route/0005.body",
+      "bytes": 467,
+      "sha256": "d062ceddf9ee48f5100767adac181d8623fb04d99b4aa1f97b3e72d5a895b658"
+    },
+    {
+      "name": "product/grz/0005.body",
+      "bytes": 707561,
+      "sha256": "274cbcdf3ace1b510b244a4fb44e815e7ec59447ea4908e88599861d27ee703d"
+    },
+    {
+      "name": "product/p29/0006.dict",
+      "bytes": 844012,
+      "sha256": "db0dd13d4bf534cdc118ffd0d7b9ba2f6cfacb7b080d2289051b96de452b1d77"
+    },
+    {
+      "name": "product/p29/0006.body",
+      "bytes": 164334,
+      "sha256": "99021600ff36aa6da1af141e615cdc7d6587a62f3ff987535d20fb473482cafb"
+    },
+    {
+      "name": "product/p29/0006.need",
+      "bytes": 8514,
+      "sha256": "050703a414805a35dec4160fc11c0be336aacc14cff62453223a3838b9c56438"
+    },
+    {
+      "name": "product/p29/0006.fill",
+      "bytes": 1241162,
+      "sha256": "0ad7d4d5286c1881e78c8edaca988e8bdd3894609181b2691c9f9cd5c435fb5f"
+    },
+    {
+      "name": "product/tu/0006.body",
+      "bytes": 596882,
+      "sha256": "558a0f850a9f895d2ce343042276ecd50028712827e473a3cd78f804d6f47262"
+    },
+    {
+      "name": "product/route/0006.body",
+      "bytes": 66236,
+      "sha256": "1180b8995b0ff9da98fb641289c27229c5a21d489a6da0083cc40e7b83cde0c7"
+    },
+    {
+      "name": "product/grz/0006.body",
+      "bytes": 691015,
+      "sha256": "c067060ebba1a6df2f82d4492ab664ad5b740663f36fb267a2a6195d98848dd2"
+    },
+    {
+      "name": "product/p29/0007.dict",
+      "bytes": 857620,
+      "sha256": "75d01ea37540b022015835f4707132efd713eb4df0bf3862b667a9689a574252"
+    },
+    {
+      "name": "product/p29/0007.body",
+      "bytes": 5129,
+      "sha256": "c16df2c3d2b2cc290e37506d4bdff4ee00468863c151525c85174c4ff6e6100f"
+    },
+    {
+      "name": "product/p29/0007.need",
+      "bytes": 272,
+      "sha256": "223d5d032231a7862f32cc2975553bf3d44e484f7bbb67f2e9c067a8030eeaed"
+    },
+    {
+      "name": "product/p29/0007.fill",
+      "bytes": 972722,
+      "sha256": "26b45699c8a6e5f85c688e624947ba8a669c7dfbb60a85d9d87ca5a6c2f02a1b"
+    },
+    {
+      "name": "product/tu/0007.body",
+      "bytes": 601210,
+      "sha256": "9545a077e3af4487362302a77b0a479e1b607a1c5339f9c3c3146a806b62ddec"
+    },
+    {
+      "name": "product/route/0007.body",
+      "bytes": 19965,
+      "sha256": "351fab4c8213c5559ab7189fef7b7e4319bb1707496ca9dae26d183877865598"
+    },
+    {
+      "name": "product/grz/0007.body",
+      "bytes": 733835,
+      "sha256": "4fc9c70b861a54c57492700b09e754ffcde28dea898ffc351b286dfb40f22642"
+    },
+    {
+      "name": "product/p29/0008.dict",
+      "bytes": 92,
+      "sha256": "9c9e06b0cdf09417432c941afc004d94ee8a6865473508242a87390e57ff23de"
+    },
+    {
+      "name": "product/p29/0008.body",
+      "bytes": 254,
+      "sha256": "1dce69de9bf6d38809692275c3d733e46432d7e49f7fc373360559afd8b6fbfa"
+    },
+    {
+      "name": "product/p29/0008.need",
+      "bytes": 51,
+      "sha256": "ae95dd28a4c4758a922ed9ffc1e81647dddd0b1a51c0c4877d93fa6ce410e369"
+    },
+    {
+      "name": "product/p29/0008.fill",
+      "bytes": 1600294,
+      "sha256": "f1eb37deb76314a3e4957ff7bc5457af773e51e31ddd795e42ca07eaaab28a6d"
+    },
+    {
+      "name": "product/tu/0008.body",
+      "bytes": 282,
+      "sha256": "316e7c4d52db6ccfc29c96f8ad4aaccda19ef7007b334b13c45a1ba0d17e8ff5"
+    },
+    {
+      "name": "product/route/0008.body",
+      "bytes": 272,
+      "sha256": "66b3b69021b8ed80e5618c6e4a611d9afa3bcd7f1142e85a33916bfd9ac6d164"
+    },
+    {
+      "name": "product/grz/0008.body",
+      "bytes": 703,
+      "sha256": "ece0c7cecc6b8838f2176525ca1de248f1806e72c23c375b988b4cc556e7b285"
+    },
+    {
+      "name": "product/p29/0009.dict",
+      "bytes": 1920004,
+      "sha256": "abce08d1322ce51f9dd0075325f8c2668719a8858e328bbc6c37057310ae4192"
+    },
+    {
+      "name": "product/p29/0009.body",
+      "bytes": 3537958,
+      "sha256": "ed47c0460affdbf92d7d458cbe8738781f6606091a8e9e244d8c46c2097555b5"
+    },
+    {
+      "name": "product/p29/0009.need",
+      "bytes": 240032,
+      "sha256": "c8caf4aaeb1571a20b6f26753f85e5613ad890d82f84ae58528217210b77e5dd"
+    },
+    {
+      "name": "product/p29/0009.fill",
+      "bytes": 6840000,
+      "sha256": "b53a27478f0a630bd239d870653edd0b99c24c1ec9a3fe316b4f20c7eb4f188a"
+    },
+    {
+      "name": "product/tu/0009.body",
+      "bytes": 1111014,
+      "sha256": "e1378d00ed79a5f68d4258f5102d717e14b2013147675866a6c4c8460c14e051"
+    },
+    {
+      "name": "product/route/0009.body",
+      "bytes": 1111483,
+      "sha256": "f495c84af26d8deb10a71873a72164bc70fbdee3a82c9b17b5a8e4f4b49e3a8b"
+    },
+    {
+      "name": "product/grz/0009.body",
+      "bytes": 848634,
+      "sha256": "483d3a64f9280f90664fc8414119d5a0a2664b039983641dd3c71ea8e3bc8f5a"
+    },
+    {
+      "name": "product/p29/0010.dict",
+      "bytes": 1918292,
+      "sha256": "ee5d7ca134fbca363a80ae5a50d5a2787dd75611a0a67918d3183c6c2ca49d96"
+    },
+    {
+      "name": "product/p29/0010.body",
+      "bytes": 3987117,
+      "sha256": "be1a3f9a1c17fdfb1e2b201a9d92da95b9572523f2dfbd88634281876dbc73ec"
+    },
+    {
+      "name": "product/p29/0010.need",
+      "bytes": 239818,
+      "sha256": "707f2b1a7a0f338b37534dcfd68cad6bcfbbcfd76f6a2c116220b0526d69b71c"
+    },
+    {
+      "name": "product/p29/0010.fill",
+      "bytes": 6836594,
+      "sha256": "aad0cd84354a6aedf959b0b149993f1094bc088131898c702d7f63734cecdaad"
+    },
+    {
+      "name": "product/tu/0010.body",
+      "bytes": 524062,
+      "sha256": "62e0d2aaf732ebe165997eb9ff1b0258517456bedfc7318dc282391687f27407"
+    },
+    {
+      "name": "product/route/0010.body",
+      "bytes": 526673,
+      "sha256": "1a3f5da884608ae259c65a34d33ddd8329727b99fd3b423cfb8e002bc79c8c5d"
+    },
+    {
+      "name": "product/grz/0010.body",
+      "bytes": 359820,
+      "sha256": "49f82aab482b1fb7198948974dfddd8daa1825220dc99c9f83e15c28f484e12b"
+    },
+    {
+      "name": "research/grz2g.container",
+      "bytes": 1749449,
+      "sha256": "5aa26634bc1e9226167f0ef19ef0a9e8b4263ca0af0b2775630a91edd9e098e4"
+    },
+    {
+      "name": "research/phase0-11-cf.bin",
+      "bytes": 2715032,
+      "sha256": "1faa77b7fb745cc8cd054f9950cdfcb3e8ce15dc07dd384e55f7d332fe0d0989"
+    },
+    {
+      "name": "research/phase0-11-fc.bin",
+      "bytes": 286431,
+      "sha256": "83616f1cf7f130ebdc6b6303d2dd3ceb6bfc20ed0f5d1dd513f2c41f8ddf8960"
+    },
+    {
+      "name": "research/v1core-cf.bin",
+      "bytes": 4181383,
+      "sha256": "fbf744db2340d052610e5dcd86d8bb6866449b38140517e713863053620f6fb5"
+    },
+    {
+      "name": "research/v1core-fc.bin",
+      "bytes": 45732,
+      "sha256": "c16189fc04fbb7f6a0cac7f3514614993b5d536aa51179fe55674254f545d04a"
+    },
+    {
+      "name": "research/fmt100-cf.bin",
+      "bytes": 966169,
+      "sha256": "66b4acd840fee096ab29838d4e84d6a263c7ad35f2f39f0964d0ad254e8cdfad"
+    },
+    {
+      "name": "research/fmt100-fc.bin",
+      "bytes": 75618,
+      "sha256": "ff6d3ec9aba15e51e9f14e123770656ec8fb2c448354a6ac96ebd108cb914b61"
+    }
+  ]
+}

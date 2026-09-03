@@ -56,6 +56,7 @@ TESTS += p50_adopted_outcome_writer-run.sh \
 	p50_adopted_socket_lease-run.sh \
 	p50endpoint-mutants.sh p50inputrecord-mutants.sh \
 	p50endpoint-sanitize.sh
+TESTS += codec_parity codec_provider
 AM_TESTS_ENVIRONMENT = \
 	ICECC_TEST_BUILDDIR='$(abs_builddir)'; export ICECC_TEST_BUILDDIR; \
 	ICECC_TEST_TOP_BUILDDIR='$(abs_top_builddir)'; export ICECC_TEST_TOP_BUILDDIR; \
@@ -202,8 +203,15 @@ check_PROGRAMS += p50sidecarlifecycle
 check_PROGRAMS += p50daemoncontrol
 check_PROGRAMS += p50cachefdseam
 check_PROGRAMS += assignment_identity_test
+check_PROGRAMS += codec_parity codec_provider
 assignment_identity_test_SOURCES = assignment_identity_test.cpp
 assignment_identity_test_LDADD = ../services/libicecc.la
+codec_parity_SOURCES = codec_parity_test.cpp
+codec_parity_LDADD = ../cache/libprotocol50.a ../services/libicecc.la \
+	$(LIBZSTD_LIBS) $(LIBBSC_LIBS)
+codec_provider_SOURCES = codec_provider_test.cpp
+codec_provider_LDADD = ../cache/libprotocol50.a ../services/libicecc.la \
+	$(LIBZSTD_LIBS) $(LIBBSC_LIBS)
 p50wire_SOURCES = p50_wire_test.cpp
 p50sourceingress_SOURCES = p50_source_ingress_test.cpp
 p50sourceingress_CXXFLAGS = -pthread

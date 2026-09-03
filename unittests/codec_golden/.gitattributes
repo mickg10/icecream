@@ -1,0 +1,4 @@
+inputs/** binary
+product/** binary
+research/*.bin binary
+research/*.container binary
