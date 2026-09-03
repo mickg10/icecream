@@ -1067,9 +1067,7 @@ std::vector<uint8_t> CRoute::residual_input(const PreparedTUPtr& prepared) const
 
 const CActiveTx& CRoute::begin(const PreparedTUPtr& prepared,
                                P29RootMode root_mode,
-                               std::span<const uint8_t> residual,
                                bool residual_body) {
-    (void)residual; // C owns the exact line composition; callers cannot inject a second copy.
     if (!prepared) throw std::invalid_argument("cannot route a null PreparedTU");
     if (active_) throw std::logic_error("C route already has one ACTIVE_TX");
     if (next_rel_seq_.value == std::numeric_limits<uint64_t>::max())

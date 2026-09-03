@@ -346,7 +346,7 @@ public:
     const CActiveTx& begin(
         const PreparedTUPtr& prepared,
         P29RootMode root_mode = P29RootMode::RouteHistory,
-        std::span<const uint8_t> residual = {}, bool residual_body = false);
+        bool residual_body = false);
     // Bytes not covered by this route's acknowledged immutable line objects.
     // This is the only source admitted to the residual-group codec.
     std::vector<uint8_t> residual_input(const PreparedTUPtr& prepared) const;

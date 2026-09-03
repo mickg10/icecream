@@ -1065,17 +1065,11 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
             if (shared->p29_source->tu_seq != tu_seq)
                 throw std::logic_error("P29 shared TU identity changed");
             const PreparedTUPtr p29_prepared = shared->p29_source;
-            residual_group::Codec residual_codec;
-            residual_group::Kind residual_kind = residual_group::Kind::Zstd3;
-            const std::vector<uint8_t> residual_input =
-                route.p29_route->residual_input(p29_prepared);
-            const std::vector<uint8_t> residual = residual_codec.encode(
-                residual_input.data(), residual_input.size(), &residual_kind);
             const P29RootMode root_mode = route.p29_route->next_rel_seq().value == 0
                                               ? P29RootMode::HistoryIndependent
                                               : P29RootMode::RouteHistory;
             const CActiveTx& active = route.p29_route->begin(
-                p29_prepared, root_mode, residual, true);
+                p29_prepared, root_mode, /*residual_body=*/true);
             p29_active_started = true;
             std::vector<FillRecord> fills;
             fills.reserve(active.manifest.size());

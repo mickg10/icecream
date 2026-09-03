@@ -17,6 +17,12 @@ namespace {
 
 using namespace icecc::p50;
 
+using RouteBegin = decltype(&CRoute::begin);
+static_assert(std::is_invocable_r_v<const CActiveTx&, RouteBegin, CRoute&,
+                                    const PreparedTUPtr&, P29RootMode, bool>);
+static_assert(!std::is_invocable_v<RouteBegin, CRoute&, const PreparedTUPtr&,
+                                   P29RootMode, std::span<const uint8_t>, bool>);
+
 [[noreturn]] void fail(std::string_view text) {
     std::cerr << "p50_slice0_test: " << text << '\n';
     std::exit(1);
@@ -299,7 +305,7 @@ void test_p29_current_tu_residual_and_block_controls() {
 
     const PreparedTUPtr first = pair.c.prepare_from_regions(input);
     const CActiveTx& first_active = pair.route.begin(
-        first, P29RootMode::HistoryIndependent, residual, true);
+        first, P29RootMode::HistoryIndependent, true);
     require(first_active.region_count == input.size() && first_active.block_use_count > 0,
             "P29 current-TU admission did not expose repeated Regions and Block use");
     const Need first_need = start(pair, first_active);
@@ -313,7 +319,7 @@ void test_p29_current_tu_residual_and_block_controls() {
         Pair missing_structure;
         const CActiveTx& active = missing_structure.route.begin(
             missing_structure.c.prepare_from_regions(input),
-            P29RootMode::HistoryIndependent, residual, true);
+            P29RootMode::HistoryIndependent, true);
         const Need need = start(missing_structure, active);
         const std::vector<ImmutableObject> fill = missing_structure.route.build_fill(need);
         require(fill.size() > 1, "P29 missing-structure fixture has one object");
@@ -328,7 +334,7 @@ void test_p29_current_tu_residual_and_block_controls() {
         Pair missing_residual;
         const CActiveTx& active = missing_residual.route.begin(
             missing_residual.c.prepare_from_regions(input),
-            P29RootMode::HistoryIndependent, residual, true);
+            P29RootMode::HistoryIndependent, true);
         const Need need = start(missing_residual, active);
         for (const ImmutableObject& object : missing_residual.route.build_fill(need))
             missing_residual.f.apply_object(missing_residual.session, object);
@@ -351,11 +357,11 @@ void test_p29_current_tu_residual_and_block_controls() {
     Pair warm;
     const PreparedTUPtr warm_first = warm.c.prepare_from_regions(input);
     const CActiveTx& warm_active = warm.route.begin(
-        warm_first, P29RootMode::HistoryIndependent, residual, true);
+        warm_first, P29RootMode::HistoryIndependent, true);
     finish(warm, warm_active);
     const PreparedTUPtr warm_second = warm.c.prepare_from_regions(input);
     const CActiveTx& warm_second_active = warm.route.begin(
-        warm_second, P29RootMode::RouteHistory, {}, true);
+        warm_second, P29RootMode::RouteHistory, true);
     require(warm_second_active.body.size() > 1,
             "P29 same-route second TU did not emit a complete frame");
     finish(warm, warm_second_active);
@@ -363,7 +369,7 @@ void test_p29_current_tu_residual_and_block_controls() {
     Pair different_route;
     const CActiveTx& isolated_active = different_route.route.begin(
         different_route.c.prepare_from_regions(input),
-        P29RootMode::HistoryIndependent, residual, true);
+        P29RootMode::HistoryIndependent, true);
     require(isolated_active.body == first_active.body,
             "P29 different route changed its independent structural/literal frame");
     finish(different_route, isolated_active);
@@ -371,11 +377,11 @@ void test_p29_current_tu_residual_and_block_controls() {
     Pair retry;
     const PreparedTUPtr retry_prepared = retry.c.prepare_from_regions(input);
     const CActiveTx& retry_active = retry.route.begin(
-        retry_prepared, P29RootMode::HistoryIndependent, residual, true);
+        retry_prepared, P29RootMode::HistoryIndependent, true);
     const std::vector<uint8_t> retry_body = retry_active.body;
     retry.route.abandon_active();
     const CActiveTx& retry_again = retry.route.begin(
-        retry_prepared, P29RootMode::HistoryIndependent, residual, true);
+        retry_prepared, P29RootMode::HistoryIndependent, true);
     require(retry_again.body == retry_body,
             "P29 abort/retry changed its authoritative literal frame");
     finish(retry, retry_again);
@@ -384,10 +390,8 @@ void test_p29_current_tu_residual_and_block_controls() {
     const std::vector<uint8_t> second_residual_input = pair.route.residual_input(second);
     require(second_residual_input.empty(),
             "P29 RouteHistory did not recognize acknowledged repeated lines");
-    const std::vector<uint8_t> second_residual =
-        codec.encode(second_residual_input.data(), second_residual_input.size(), &selected);
     const CActiveTx& second_active = pair.route.begin(
-        second, P29RootMode::RouteHistory, second_residual, true);
+        second, P29RootMode::RouteHistory, true);
     require(second_active.block_use_count > 0 &&
                 std::any_of(second_active.root.begin(), second_active.root.end(),
                             [](Key64 key) { return key.type() == ObjectType::Block; }),
