@@ -23,6 +23,8 @@ import json, sys
 route = [json.loads(line) for line in open(sys.argv[1])]
 tu = [json.loads(line) for line in open(sys.argv[2])]
 assert len(route) == len(tu) == 2
+assert all(type(row.get("prepare_ns")) is int and row["prepare_ns"] >= 0
+           for rows in (route, tu) for row in rows)
 assert route[0]["relationship_id"] == "c1f1-r00"
 assert route[1]["state_before_digest"] == route[0]["state_digest"]
 assert route[1]["transaction_digest"] != route[0]["transaction_digest"]

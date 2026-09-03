@@ -331,8 +331,8 @@ def _native_failure_artifact(
                                  if type(value.get("f_to_c_bytes")) is int and value.get("f_to_c_bytes", 0) >= 0),
             "prepare_ns": prepare_ns,
             "simulator_execution_ns": execution_ns,
-            "total_execution_ns": (prepare_ns + execution_ns
-                                   if prepare_ns is not None and execution_ns is not None else None),
+            "codec_ns": (prepare_ns + execution_ns
+                         if prepare_ns is not None and execution_ns is not None else None),
         }
 
     segment_metrics = {segment: aggregate([item for item in valid_items
@@ -356,8 +356,8 @@ def _native_failure_artifact(
                              if type(value.get("f_to_c_bytes")) is int and value.get("f_to_c_bytes", 0) >= 0),
         "prepare_ns": metrics_prepare_ns,
         "simulator_execution_ns": metrics_execution_ns,
-        "total_execution_ns": (metrics_prepare_ns + metrics_execution_ns
-                               if metrics_prepare_ns is not None else None),
+        "codec_ns": (metrics_prepare_ns + metrics_execution_ns
+                     if metrics_prepare_ns is not None else None),
         "valid_rows_by_segment": {segment: values["valid_rows"]
                                   for segment, values in segment_metrics.items()},
         "segments": segment_metrics,
@@ -1947,8 +1947,8 @@ class MethodMatrixSimulator:
                                   sum(int(row.get("encoded_bytes") or 0) for row in selected)),
                 "prepare_ns": prepare_ns,
                 "execution_ns": execution_ns,
-                "total_execution_ns": (prepare_ns + execution_ns
-                                       if prepare_ns is not None and execution_ns is not None else None),
+                "codec_ns": (prepare_ns + execution_ns
+                             if prepare_ns is not None and execution_ns is not None else None),
                 "wire_witnessed": bool(selected) and all(
                     bool(row.get("wire_witnessed")) for row in selected),
                 "c_to_f_bytes": (None if method == "RAW_II" else

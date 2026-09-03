@@ -582,8 +582,8 @@ def _validate_summary_totals(summary: Mapping[str, Any],
                 "f_to_c_bytes": sum(int(tx.get("f_to_c_bytes", 0)) for tx in transactions),
                 "prepare_ns": prepare_ns,
                 "execution_ns": execution_ns,
-                "total_execution_ns": (prepare_ns + execution_ns
-                                       if prepare_ns is not None else None),
+                "codec_ns": (prepare_ns + execution_ns
+                             if prepare_ns is not None else None),
             }
             for field, value in expected.items():
                 if total.get(field) != value:
@@ -641,9 +641,9 @@ def _method_result(experiment: Path, manifest: Mapping[str, Any], summary: Mappi
         prepare = (sum(value for value in prepare_values if value is not None)
                    if prepare_values and all(value is not None for value in prepare_values)
                    else None)
-        total_execution = prepare + execution if prepare is not None else None
+        codec = prepare + execution if prepare is not None else None
     else:
-        c_to_f = f_to_c = prepare = execution = total_execution = None
+        c_to_f = f_to_c = prepare = execution = codec = None
         if reason is None and method != "RAW_II":
             reason = "product_transaction_wire_witness_unavailable"
     ratio, reduction, ratio_reason = _ratio(raw, encoded)
@@ -662,7 +662,7 @@ def _method_result(experiment: Path, manifest: Mapping[str, Any], summary: Mappi
         "raw_bytes": raw, "encoded_bytes": encoded,
         "c_to_f_bytes": c_to_f, "f_to_c_bytes": f_to_c,
         "prepare_ns": prepare, "execution_ns": execution,
-        "total_execution_ns": total_execution,
+        "codec_ns": codec,
         "wire_witnessed": wire, "compression_ratio": ratio,
         "byte_reduction_fraction": reduction, "ratio_reason": ratio_reason,
         "full2_continuity": dict(marker),
@@ -830,13 +830,13 @@ def build_report(experiments: Sequence[Path], output_root: Path) -> Path:
                              for key, value in row.items()})
     lines = ["# S8 method matrix report", "", f"Status: **{matrix_status}**", "",
              "The loss curve is a transparent tabular point set by depth; no fitted model is used.", "",
-             "| topology | depth | pass | method | status | raw | encoded | C→F | F→C | prepare ns | exchange ns | total ns | ratio | reduction | reason |",
+             "| topology | depth | pass | method | status | raw | encoded | C→F | F→C | prepare ns | exchange ns | codec ns | ratio | reduction | reason |",
              "|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
     for row in records:
         values = [row.get(key) for key in ("topology", "depth", "pass", "method", "status",
                                             "raw_bytes", "encoded_bytes", "c_to_f_bytes",
                                             "f_to_c_bytes", "prepare_ns", "execution_ns",
-                                            "total_execution_ns", "compression_ratio",
+                                            "codec_ns", "compression_ratio",
                                             "byte_reduction_fraction", "reason")]
         lines.append("| " + " | ".join("" if value is None else str(value).replace("|", "\\|")
                                          for value in values) + " |")

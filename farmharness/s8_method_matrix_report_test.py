@@ -486,7 +486,7 @@ def test_native_transaction_is_the_only_wire_witness(tmp_path: Path) -> None:
     assert result["f_to_c_bytes"] == 7
     assert result["prepare_ns"] == 13
     assert result["execution_ns"] == 11
-    assert result["total_execution_ns"] == 24
+    assert result["codec_ns"] == 24
 
     legacy = copy.deepcopy(base)
     del legacy["product_transaction"]["prepare_ns"]
@@ -496,4 +496,4 @@ def test_native_transaction_is_the_only_wire_witness(tmp_path: Path) -> None:
         "C1F1/100000", "100", "p", "t", {"status": "NOT_APPLICABLE"})
     assert legacy_result["prepare_ns"] is None
     assert legacy_result["execution_ns"] == 11
-    assert legacy_result["total_execution_ns"] is None
+    assert legacy_result["codec_ns"] is None
