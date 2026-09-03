@@ -208,7 +208,7 @@ then the four encoded streams in the declared order.  Source:
 The final frame is `GEND` u32le followed by total raw bytes, group count,
 match count, and stream digest as four u64le values (`grz2g.cpp:541-545`).
 
-## Research P29 frame stream and proposed product P29 wire v1
+## P29 wire v1 core (Phase 3b)
 
 The research sink frame is type u8, payload length u32le, then exact payload
 bytes (`codec50-sink.cpp:315-387` at `56fff4e4`).  General frame kinds are:
@@ -227,29 +227,104 @@ bytes (`codec50-sink.cpp:315-387` at `56fff4e4`).  General frame kinds are:
 | 31 | FALLBACK_REPLY | 0xfd | ACK |
 | 0xfe | TU_END | 0xff | BUILD_CLOSE |
 
-For tuple `p29_wire_v1`, direct ordinals require mixed-region known-line
-state.  The exact per-TU C-to-F sequence is ROOT(1), BLOCKDEF(2),
-FILL_CTRL(8), FILL_LIT(9), PATHDEF(5), TU_END(0xfe); F-to-C is NEED(3),
-TU_END(0xfe).  The retained `v1core-*.bin` witnesses contain 120 C-to-F and
-40 F-to-C frames for 20 TUs.
+Phase 3b implements this inner stream in `cache/codec/p29_wire.h` without a
+Protocol-50 call site or advertised profile.  It consumes the Phase-3a
+`P29Interner` and uses `OnlineS1{min_match=3,max_chain=1024,hash_bits=22}`.
+No `Key64` appears in the inner wire.  Product carriage, peer negotiation,
+resource-model accounting, and a `kP29WireV1` capability remain later landing
+work.
 
-ROOT is a zstd-3 frame of a minimal-varint typed-tag program: Region `r` is
-`2*r`, Block `b` is `2*b+1`.  BLOCKDEF is a zstd-3 direct-block manifest:
-count, then id and kind; kind `1` carries source and length for a copy from
-F's region stream, while kind `0` carries a length and that many child Region
-ids.  NEED is zstd-3 of missing-Region count, ids, and terminator zero.
-FILL_CTRL carries requested Regions' line-id compositions; FILL_LIT carries
-unknown line bytes through the residual-group codec; PATHDEF is zstd-3 of new
-marker paths.  No `Key64` appears in this inner wire.
+Every inner frame is kind u8, payload length u32le, then the exact payload.
+ROOT and TU_END are unconditional.  BLOCKDEF, NEED, FILL_CTRL, FILL_LIT, and
+PATHDEF are present only when nonempty.  A committed TU therefore has these
+ordered streams (brackets mean conditional):
 
-Product carriage for v1 is reserved, not implemented in Phase 0: BODY will
-carry ROOT plus BLOCKDEF, NEED will carry typed Region ids, and FILL will carry
-FILL_CTRL, FILL_LIT, then PATHDEF.  A definition not requested by F is a hard
-protocol error.  The product transaction and commit envelope remains the
-Protocol-50 format above.
+- C BODY: `ROOT [BLOCKDEF]`
+- F NEED: `[NEED]`
+- C FILL: `[FILL_CTRL] [FILL_LIT] [PATHDEF] TU_END`
+- F close: `TU_END`
 
-Tuple values are frozen in `cache/codec/tuples.h`.  The authoritative v1
-sequence and tuple are `cache/codec/P29-WIRE-V1-LIFT-PLAN.md:20-38` in the
-DeepImplementer research branch at `6663e440`; the retained stream hashes are
-in this golden manifest.  Those small vectors prove identity only.  Any G3
-or effectiveness verdict requires at least 1,000 TUs.
+ROOT, BLOCKDEF, NEED, and PATHDEF payloads are independent zstd-3 messages.
+FILL_CTRL and FILL_LIT are two separate continuing zstd-3 streams with the
+content-size field disabled.  Each nonempty TU ends in `ZSTD_e_flush`; an
+explicit final close adds `ZSTD_e_end`.  FILL's TU_END has one payload byte:
+bit 0 records a FILL_CTRL segment and bit 1 a FILL_LIT segment.  F's closing
+TU_END has an empty payload.  Opcode 3 and every general research frame kind
+outside this core are forbidden.
+
+### ROOT and BLOCKDEF raw payloads
+
+ROOT is a sequence of minimal unsigned LEB128 typed tags.  Region `r` is
+`2*r`; Block `b` is `2*b+1`.
+
+BLOCKDEF begins with definition count.  Each definition is Block id, kind,
+then one of:
+
+- kind 0: child count followed by that many Region ids;
+- kind 1: source occurrence offset and Region count, copying a preceding
+  contiguous range of F's committed occurrence stream.
+
+Definitions occur in first-use order.  A Block already known by F may not be
+redefined.  Every Root Region and every Block child must be known already or
+defined by the matching FILL before TU_END.
+
+### NEED raw payload
+
+NEED is missing-Region count, those Region ids in first-use closure order,
+then a zero terminator.  BLOCKDEF presence makes NEED present even when the
+missing-Region count is zero.  C validates the complete list and rejects any
+unsolicited, reordered, extra, or absent request.
+
+### FILL_CTRL and FILL_LIT raw payloads
+
+FILL_CTRL starts with the requested-Region count.  For each Region, it stores
+the exact raw byte length followed by operations until exactly that length is
+materialized.  FILL_LIT is the shared literal-byte stream consumed by
+operations 0 and 6.  The allowed operation program is:
+
+| Opcode | Operands | Meaning |
+| ---: | --- | --- |
+| 0 | literal length | Copy that many bytes from FILL_LIT. |
+| 1 | source-Region zigzag delta, offset, length | Copy a verified Line view and publish it as the next public Line. |
+| 2 | public-Line id | Copy a previously published Line view. |
+| 4 | Path id, line number, flag count, flag bytes | Reconstruct a preprocessor line marker. |
+| 5 | Path id, source-Line id | Copy that exact Line from an allowed system source. |
+| 6 | Path id, source-Line id, prefix, suffix, middle length | Copy source prefix and suffix around middle bytes from FILL_LIT. |
+
+Opcode 1's delta is `source_region-current_region`.  Public-Line zero is a
+sentinel and never appears on the wire.  Opcode 5 or 6 is legal only for an
+exact Path under `/usr/include/`, `/usr/lib/gcc/`, or `/usr/local/include/`.
+The provider supplies immutable source bytes and complete line offsets;
+missing, malformed, or out-of-range source views fail the TU.  Valid but
+different host source bytes are detected by the outer transaction's raw
+digest/materialization check and the TU is abandoned.
+
+PATHDEF is a sequence of path-byte-length followed by exact path bytes.  Its
+frame is physically after the continuing streams, but F stages and validates
+it before interpreting marker/source operations.
+
+### State and transaction law
+
+All persistent route state belongs to the provider.  C owns Path ids,
+per-Line mixed state, the next public-Line id, and its mirrors of F-known
+Regions and Blocks.  F owns Paths, immutable per-committed-TU Region byte
+segments and Region views, public-Line views, Blocks, and the occurrence
+stream.  The serializer/deserializer allow exactly one pending TU.
+
+BODY, NEED, decoded definitions, and materialization remain staged.  Commit
+first verifies the captured provider-state base, pre-reserves every append,
+publishes immutable Regions/Blocks through the provider, then applies the
+redo.  Abandon discards the redo and resets both continuing zstd contexts, so
+a resend starts fresh segments.  Committing every TU without abandon is byte
+identical to research revision `56fff4e40f7ba67befa983772a29e2813233fcf2`.
+
+`P29WireLimits` bounds Region/Block/Path/public-Line ordinals, Region and TU
+bytes, Block children, occurrence count, decompressed messages, and continuing
+stream output.  Frame order, minimal closure, requested identities, lengths,
+source bounds, and trailing bytes are all checked before provider state moves.
+
+The retained `v1core-*.bin` witnesses contain 120 C-to-F and 40 F-to-C frames
+for 20 TUs.  The additional warm, fmt, edited-turn, 2,498-TU Firefox, and
+1,000+1,000 Firefox-turn witnesses bind full streams in both directions.
+Those byte vectors establish identity; any G3/effectiveness verdict still
+requires at least 1,000 TUs.
