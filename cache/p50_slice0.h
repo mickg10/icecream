@@ -37,6 +37,10 @@ constexpr uint16_t kP29KeyVectorEncoding = 1;
 // per-TU alpha/residual composition.  Line bytes are absent from FILL and
 // reconstructed independently at F from this authoritative composition.
 constexpr uint16_t kP29ResidualBodyEncoding = 2;
+// P29V1 BODY is the nested ROOT/BLOCKDEF frame stream. Its empty DICT
+// descriptor carries the C system-source fingerprint in the digest field;
+// the distinct encoding makes that deliberate exception unambiguous.
+constexpr uint16_t kP29WireV1BodyEncoding = 3;
 
 struct ImmutableObject {
     Key64 key{};
@@ -197,6 +201,15 @@ public:
     void finish_tu(CStoreGuid c_store_guid);
     void begin_install(CStoreGuid c_store_guid, Key64 key, Digest128 content_digest,
                        uint64_t bytes, size_t slot, bool retry = false);
+    // Validate the two installs that make one P29V1 route-dictionary/input
+    // publication before either staged object becomes resident.  The owner
+    // still publishes P29Segment first so a visible input never names missing
+    // dictionary state.
+    void preflight_publish_pair(CStoreGuid c_store_guid,
+                                Key64 segment_key, size_t segment_slot,
+                                Digest128 segment_digest,
+                                Key64 input_key, size_t input_slot,
+                                Digest128 input_digest) const;
     void publish(CStoreGuid c_store_guid, Key64 key, size_t slot,
                  Digest128 content_digest);
     void pin(CStoreGuid c_store_guid, Key64 key);
@@ -216,6 +229,8 @@ public:
     [[nodiscard]] size_t live_namespace_count() const;
     [[nodiscard]] size_t free_staging_slots() const;
     [[nodiscard]] std::optional<size_t> first_free_staging_slot() const;
+    [[nodiscard]] bool install_retry_required(CStoreGuid c_store_guid,
+                                              Key64 key) const;
     void release(CStoreGuid c_store_guid, Key64 key);
 
     // Exposed only so the out-of-line implementation can keep the model's
@@ -263,6 +278,9 @@ public:
                         uint16_t generation = 0, uint64_t first_ordinal = 1,
                         TuSeq first_tu_seq = {},
                         Verification verification = Verification::StreamedDigest);
+    ~CAuthority();
+    CAuthority(const CAuthority&) = delete;
+    CAuthority& operator=(const CAuthority&) = delete;
 
     Key64 intern_bytes(ObjectType type, std::span<const uint8_t> payload) {
         return arena_.intern_bytes(type, payload);
@@ -292,6 +310,9 @@ public:
     }
     void set_verification(Verification verification) { verification_ = verification; }
     [[nodiscard]] Verification verification() const { return verification_; }
+    [[nodiscard]] bool p29v1_runnable() const noexcept;
+    [[nodiscard]] uint64_t p29v1_interner_reserved_bytes() const noexcept;
+    [[nodiscard]] uint64_t p29v1_interner_committed_bytes() const noexcept;
     void publish_new_p29_blocks();
     [[nodiscard]] std::vector<Key64> transitive_manifest(
         std::span<const p29::Ref> roots) const;
@@ -322,6 +343,12 @@ private:
     PreparedTUPtr prepare_from_regions_at_seq(
         std::span<const std::vector<uint8_t>> region_bytes,
         std::optional<TuSeq> tu_seq);
+    void enable_p29v1(uint64_t max_interner_reserved_bytes,
+                      uint64_t max_tu_bytes);
+    PreparedTUPtr prepare_p29v1_at_seq(std::span<const uint8_t> exact_input,
+                                       TuSeq tu_seq);
+
+    struct P29V1State;
 
     CObjectArena arena_;
     p29::OnlineS1::Config s1_config_;
@@ -332,6 +359,9 @@ private:
     uint64_t next_tu_seq_ = 0;
     bool tu_seq_exhausted_ = false;
     Verification verification_ = Verification::StreamedDigest;
+    std::unique_ptr<P29V1State> p29v1_;
+
+    friend class CRoute;
 };
 
 struct Need {
@@ -370,10 +400,18 @@ public:
         const PreparedTUPtr& prepared,
         P29RootMode root_mode = P29RootMode::RouteHistory,
         bool residual_body = false);
+    const CActiveTx& begin_v1(const PreparedTUPtr& prepared,
+                              Digest128 system_source_fingerprint,
+                              uint64_t max_route_state_bytes);
     // Bytes not covered by this route's acknowledged immutable line objects.
     // This is the only source admitted to the residual-group codec.
     std::vector<uint8_t> residual_input(const PreparedTUPtr& prepared) const;
     std::vector<ImmutableObject> build_fill(const Need& need) const;
+    std::span<const uint8_t> build_fill_v1(
+        uint64_t flags, std::span<const uint8_t> inner_need);
+    void restart_v1_for_transport_retry();
+    void reset_v1_route(FStoreGuid f_store_guid,
+                        HistoryNonce history_nonce);
     void accept_commit(const TxCommit& committed,
                        ActionType action = ActionType::COMMIT_ACCEPTED);
     void abandon_active();
@@ -384,6 +422,7 @@ public:
     [[nodiscard]] HistoryNonce history_nonce() const { return history_nonce_; }
     [[nodiscard]] RelSeq next_rel_seq() const { return next_rel_seq_; }
     [[nodiscard]] Digest128 state_digest() const { return state_digest_; }
+    [[nodiscard]] uint64_t p29v1_route_state_bytes() const noexcept;
 
 private:
     friend ReconnectResult reconnect(CRoute&, FStore&, HistoryNonce);
@@ -398,6 +437,8 @@ private:
     std::unique_ptr<p29::OnlineS1> matcher_;
     std::optional<CActiveTx> active_;
     std::unordered_set<Key64, Key64Hash> acknowledged_objects_;
+    struct P29V1State;
+    std::unique_ptr<P29V1State> p29v1_;
     ActionTrace* trace_ = nullptr;
 };
 
@@ -411,7 +452,9 @@ struct SessionHandle {
 class FStore {
 public:
     explicit FStore(FStoreGuid guid, uint64_t first_session_serial = 1,
-                    ActionTrace* trace = nullptr);
+                    ActionTrace* trace = nullptr,
+                    uint64_t p29v1_max_tu_bytes = uint64_t{1} << 30,
+                    Digest128 system_source_fingerprint = {});
     ~FStore();
     FStore(const FStore&) = delete;
     FStore& operator=(const FStore&) = delete;
@@ -429,9 +472,17 @@ public:
     ObjectApplied apply_object(SessionHandle session, const ImmutableObject& object);
     std::vector<ObjectApplied> append_fill(SessionHandle session,
                                            const FillMessage& message);
+    [[nodiscard]] std::vector<uint8_t> p29v1_need_frames(SessionHandle session) const;
+    [[nodiscard]] bool p29v1_system_source_reuse(SessionHandle session) const;
+    void append_fill_v1(SessionHandle session,
+                        std::vector<uint8_t> inner_fill);
     void finish_fill(SessionHandle session) const;
     std::vector<uint8_t> materialize_and_verify(SessionHandle session);
     TxCommit commit_input(SessionHandle session);
+    void abandon_input(SessionHandle session) noexcept;
+
+    [[nodiscard]] uint64_t pending_segment_bytes(SessionHandle session) const noexcept;
+    [[nodiscard]] Digest128 pending_segment_digest(SessionHandle session) const noexcept;
 
     void forget_route(SessionHandle session);
     void destructive_cache_reset(FStoreGuid new_guid);
@@ -444,6 +495,7 @@ private:
     struct Namespace;
     Namespace& require_namespace(SessionHandle session);
     const Namespace& require_namespace(SessionHandle session) const;
+    void abandon_pending(Namespace& space) noexcept;
     void append_component(SessionHandle session, bool dict,
                           std::span<const uint8_t> bytes);
     void record(ActionType action, SessionHandle session, const TxBegin* begin,
@@ -457,7 +509,27 @@ private:
     bool session_serial_exhausted_ = false;
     std::unordered_map<CStoreGuid, std::unique_ptr<Namespace>, Id128Hash> namespaces_;
     ActionTrace* trace_ = nullptr;
+    uint64_t p29v1_max_tu_bytes_ = uint64_t{1} << 30;
+    Digest128 system_source_fingerprint_{};
 };
+
+// Start the process-wide P29V1 system-source fingerprint worker.  Product
+// startup calls this before advertising readiness; it never waits for the
+// filesystem scan.  An absolute cache directory enables the persistent
+// metadata-keyed digest cache.  Empty/invalid paths retain safe uncached
+// operation.
+void start_p29_system_source_fingerprint(
+    std::string cache_directory = {}) noexcept;
+
+// Simulator-only synchronization: product request paths never call this.
+// It returns immediately when no worker was started.
+void wait_p29_system_source_fingerprint() noexcept;
+
+// Nonblocking snapshot used only by the P29V1 profile guard.  Until the
+// background worker publishes a complete result this returns zero and turns
+// source reuse off.  Enumeration/hash failures likewise publish zero without
+// making any other profile unavailable.
+[[nodiscard]] Digest128 p29_system_source_fingerprint() noexcept;
 
 enum class ReconnectOutcome {
     ExactMatch,

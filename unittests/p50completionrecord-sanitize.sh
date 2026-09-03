@@ -12,10 +12,11 @@ trap 'rm -rf "$work"' EXIT HUP INT TERM
     -fsanitize=address,undefined,leak -fno-omit-frame-pointer \
     -DHAVE_CONFIG_H -I"$build" -I"$root" -I"$root/daemon" \
     -I"$root/client" -I"$root/services" \
-    ${ICECC_TEST_CPPFLAGS:-} ${ICECC_TEST_LIBZSTD_CFLAGS:-} \
+    ${ICECC_TEST_CPPFLAGS:-} ${ICECC_TEST_LIBCAP_NG_CFLAGS:-} \
+    ${ICECC_TEST_LIBZSTD_CFLAGS:-} \
     "$root/unittests/p50_completion_record_test.cpp" \
     "$root/daemon/p50_completion_record.cpp" \
-    "$build/services/.libs/libicecc.a" -llzo2 \
+    "$build/services/.libs/libicecc.a" ${ICECC_TEST_LIBCAP_NG_LIBS:-} -llzo2 \
     ${ICECC_TEST_LIBZSTD_LIBS:--lzstd} \
     ${ICECC_TEST_XXHASH_LIBS:--lxxhash} ${ICECC_TEST_LDFLAGS:-} \
     -o "$work/p50completionrecord"

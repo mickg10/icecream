@@ -2,6 +2,7 @@
 
 #include "p50_zstd.h"
 #include "p50_slice0.h"
+#include "codec/p29_wire.h"
 
 // P29 is the reviewed CW_P29_BSC_Z3_M64 implementation from
 // capability/grouprlz/p29_online_s1.h (SHA-256
@@ -13,6 +14,7 @@
 #include "p50_grz.h"
 #endif
 
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -188,6 +190,280 @@ private:
     State state_ = State::Idle;
 };
 
+class P29V1LiveDialogue {
+public:
+    enum class State { Idle, ReceivingBody, BodyClosed, Materialized, Terminal };
+
+    explicit P29V1LiveDialogue(ProfileDialogueConfig config)
+        : negotiated_profiles_(config.negotiated_profiles),
+          max_tu_bytes_(config.max_raw_bytes),
+          need_inner_bound_(need_bound(config.max_raw_bytes)),
+          fill_inner_bound_(fill_bound(config.max_raw_bytes)),
+          store_(FStoreGuid::from_u64(UINT64_C(0x50323956314c4956)), 1,
+                 nullptr, config.max_raw_bytes,
+                 p29_system_source_fingerprint()),
+          c_guid_(config.c_store_guid) {
+        if (max_tu_bytes_ == 0 ||
+            max_tu_bytes_ > std::numeric_limits<size_t>::max())
+            throw std::invalid_argument("P29V1 max TU bytes are not addressable");
+    }
+
+    void begin(const TxBegin& value) {
+        if (value.profile != ProfileId::P29V1 ||
+            value.p29_root_mode != P29RootMode::RouteHistory ||
+            value.dict.encoding != kP29V1FingerprintDictEncoding ||
+            value.dict.encoded_bytes != 0 || value.dict.decoded_bytes != 0 ||
+            value.body.encoding != kP29WireV1BodyEncoding ||
+            value.raw_bytes > max_tu_bytes_)
+            fail("P29V1 TX_BEGIN is invalid");
+        if ((negotiated_profiles_ & profile_bit(ProfileId::P29V1)) == 0)
+            fail("P29V1 was not negotiated");
+        if (state_ != State::Idle)
+            fail("P29V1 TX_BEGIN arrived while dialogue is active");
+        try {
+            if (c_guid_ == CStoreGuid{})
+                c_guid_ = c_guid_from_begin(value);
+            if (!session_) {
+                session_ = store_.connect(c_guid_);
+                const SessionState route = store_.resume(*session_);
+                if (!route.route_present)
+                    store_.start_route(*session_, value.history_nonce,
+                                       value.pre_state_digest);
+            }
+            store_.begin(*session_, value);
+            begin_ = value;
+            body_bytes_ = 0;
+            body_complete_ = false;
+            need_sent_ = false;
+            need_inner_.clear();
+            fill_decoder_.emplace(fill_inner_bound_);
+            state_ = State::ReceivingBody;
+        } catch (...) {
+            terminalize();
+            throw;
+        }
+    }
+
+    void append_dict(const DictMessage& message) {
+        require_receiving();
+        if (!message.bytes.empty())
+            fail("P29V1 DICT must remain empty");
+    }
+
+    void append_body(const BodyMessage& message) {
+        require_receiving();
+        try {
+            if (message.bytes.size() > begin_.body.encoded_bytes - body_bytes_)
+                fail("P29V1 BODY exceeds TX_BEGIN descriptor");
+            store_.append_body(*session_, message.bytes);
+            body_bytes_ += message.bytes.size();
+            if (body_bytes_ == begin_.body.encoded_bytes) {
+                need_inner_ = store_.p29v1_need_frames(*session_);
+                body_complete_ = true;
+            }
+        } catch (...) {
+            terminalize();
+            throw;
+        }
+    }
+
+    std::vector<NeedMessage> need_messages(size_t max_payload) {
+        require_receiving();
+        if (!body_complete_ || need_sent_)
+            return {};
+        try {
+            const uint64_t flags =
+                store_.p29v1_system_source_reuse(*session_)
+                    ? kP29V1SystemSourceReuseFlag
+                    : 0;
+            std::vector<NeedMessage> result = encode_p29v1_need_messages(
+                flags, need_inner_, max_payload, need_inner_bound_);
+            need_sent_ = true;
+            return result;
+        } catch (...) {
+            terminalize();
+            throw;
+        }
+    }
+
+    void receive_need(const NeedMessage&) {
+        fail("P29V1 F received an unexpected NEED");
+    }
+
+    void receive_fill(const FillMessage& message) {
+        require_receiving();
+        if (!body_complete_ || !need_sent_ || !fill_decoder_)
+            fail("P29V1 FILL preceded BODY or NEED");
+        try {
+            fill_decoder_->push(message);
+            if (fill_decoder_->complete()) {
+                store_.append_fill_v1(*session_,
+                                      fill_decoder_->take_inner_frames());
+                state_ = State::BodyClosed;
+            }
+        } catch (...) {
+            terminalize();
+            throw;
+        }
+    }
+
+    std::vector<uint8_t> materialize() {
+        if (!session_ || state_ != State::BodyClosed)
+            fail("P29V1 input cannot materialize before FILL closure");
+        try {
+            std::vector<uint8_t> result =
+                store_.materialize_and_verify(*session_);
+            state_ = State::Materialized;
+            return result;
+        } catch (...) {
+            terminalize();
+            throw;
+        }
+    }
+
+    void commit_visible(const TxCommit& commit) {
+        if (!session_ || state_ != State::Materialized)
+            fail("P29V1 commit precedes materialization");
+        try {
+            if (store_.commit_input(*session_) != commit)
+                fail("P29V1 TX_COMMIT does not close the materialized input");
+            clear_per_tu();
+            state_ = State::Idle;
+        } catch (...) {
+            terminalize();
+            throw;
+        }
+    }
+
+    void discard_tentative() noexcept {
+        if (session_)
+            store_.abandon_input(*session_);
+        clear_per_tu();
+        if (state_ != State::Terminal)
+            state_ = State::Idle;
+    }
+
+    void disconnect() noexcept {
+        terminalize();
+    }
+
+    void reset() {
+        if (session_) {
+            store_.abandon_input(*session_);
+            try {
+                store_.forget_route(*session_);
+                store_.disconnect(*session_);
+                session_.reset();
+            } catch (...) {
+                terminalize();
+                throw;
+            }
+        }
+        clear_per_tu();
+        state_ = State::Idle;
+    }
+
+    [[nodiscard]] State state() const noexcept { return state_; }
+    [[nodiscard]] bool terminal() const noexcept {
+        return state_ == State::Terminal;
+    }
+    [[nodiscard]] size_t pending_body_bytes() const noexcept {
+        return body_bytes_;
+    }
+    [[nodiscard]] uint64_t pending_segment_bytes() const noexcept {
+        return session_ && state_ == State::Materialized
+                   ? store_.pending_segment_bytes(*session_)
+                   : 0;
+    }
+    [[nodiscard]] Digest128 pending_segment_digest() const noexcept {
+        return session_ && state_ == State::Materialized
+                   ? store_.pending_segment_digest(*session_)
+                   : Digest128{};
+    }
+    [[nodiscard]] uint64_t window_limit_bytes() const noexcept {
+        return max_tu_bytes_;
+    }
+    [[nodiscard]] const TxBegin* active_begin() const noexcept {
+        return state_ == State::Idle || state_ == State::Terminal ? nullptr
+                                                                  : &begin_;
+    }
+
+private:
+    static uint64_t need_bound(uint64_t max_tu_bytes) {
+        codec::P29WireLimits limits;
+        limits.max_tu_bytes = static_cast<size_t>(std::min<uint64_t>(
+            max_tu_bytes, std::numeric_limits<size_t>::max()));
+        limits.max_region_bytes = limits.max_tu_bytes;
+        return codec::p29v1_need_inner_bound(limits);
+    }
+
+    static uint64_t fill_bound(uint64_t max_tu_bytes) {
+        codec::P29WireLimits limits;
+        limits.max_tu_bytes = static_cast<size_t>(std::min<uint64_t>(
+            max_tu_bytes, std::numeric_limits<size_t>::max()));
+        limits.max_region_bytes = limits.max_tu_bytes;
+        return codec::p29v1_fill_inner_bound(limits);
+    }
+
+    static CStoreGuid c_guid_from_begin(const TxBegin& begin) {
+        Digest128Builder digest;
+        digest.append("icecc-p50-p29v1-c-guid-v1");
+        digest.append(begin.raw_digest.bytes);
+        CStoreGuid result;
+        result.bytes = digest.finish().bytes;
+        if (result == CStoreGuid{})
+            result.bytes.back() = 1;
+        return result;
+    }
+
+    [[noreturn]] void fail(const char* message) {
+        terminalize();
+        throw std::logic_error(message);
+    }
+
+    void require_receiving() {
+        if (!session_ || state_ != State::ReceivingBody)
+            fail("P29V1 dialogue is not receiving a transaction");
+    }
+
+    void clear_per_tu() noexcept {
+        begin_ = {};
+        body_bytes_ = 0;
+        body_complete_ = false;
+        need_sent_ = false;
+        need_inner_.clear();
+        fill_decoder_.reset();
+    }
+
+    void terminalize() noexcept {
+        if (session_) {
+            store_.abandon_input(*session_);
+            try {
+                store_.disconnect(*session_);
+            } catch (...) {
+            }
+            session_.reset();
+        }
+        clear_per_tu();
+        state_ = State::Terminal;
+    }
+
+    uint32_t negotiated_profiles_ = 0;
+    uint64_t max_tu_bytes_ = 0;
+    uint64_t need_inner_bound_ = 0;
+    uint64_t fill_inner_bound_ = 0;
+    FStore store_;
+    CStoreGuid c_guid_{};
+    std::optional<SessionHandle> session_;
+    TxBegin begin_{};
+    size_t body_bytes_ = 0;
+    bool body_complete_ = false;
+    bool need_sent_ = false;
+    std::vector<uint8_t> need_inner_;
+    std::optional<P29V1FillStreamDecoder> fill_decoder_;
+    State state_ = State::Idle;
+};
+
 ProfileDialogueState map_state(ZstdTuDialogue::State state) noexcept {
     switch (state) {
     case ZstdTuDialogue::State::Idle:
@@ -290,6 +566,102 @@ uint64_t window_p29(const void* object) noexcept {
 
 const TxBegin* active_p29(const void* object) noexcept {
     return static_cast<const P29LiveDialogue*>(object)->active_begin();
+}
+
+void destroy_p29v1(void* object) noexcept {
+    delete static_cast<P29V1LiveDialogue*>(object);
+}
+
+void begin_p29v1(void* object, const TxBegin& begin) {
+    static_cast<P29V1LiveDialogue*>(object)->begin(begin);
+}
+
+void append_dict_p29v1(void* object, const DictMessage& message) {
+    static_cast<P29V1LiveDialogue*>(object)->append_dict(message);
+}
+
+void append_body_p29v1(void* object, const BodyMessage& message) {
+    static_cast<P29V1LiveDialogue*>(object)->append_body(message);
+}
+
+std::vector<NeedMessage> need_p29v1(void* object, size_t max_payload) {
+    return static_cast<P29V1LiveDialogue*>(object)->need_messages(max_payload);
+}
+
+void receive_need_p29v1(void* object, const NeedMessage& message) {
+    static_cast<P29V1LiveDialogue*>(object)->receive_need(message);
+}
+
+void receive_fill_p29v1(void* object, const FillMessage& message) {
+    static_cast<P29V1LiveDialogue*>(object)->receive_fill(message);
+}
+
+std::vector<uint8_t> materialize_p29v1(void* object) {
+    return static_cast<P29V1LiveDialogue*>(object)->materialize();
+}
+
+void commit_visible_p29v1(void* object, const TxCommit& commit) {
+    static_cast<P29V1LiveDialogue*>(object)->commit_visible(commit);
+}
+
+void discard_p29v1(void* object) noexcept {
+    static_cast<P29V1LiveDialogue*>(object)->discard_tentative();
+}
+
+void disconnect_p29v1(void* object) noexcept {
+    static_cast<P29V1LiveDialogue*>(object)->disconnect();
+}
+
+void reset_p29v1(void* object) {
+    static_cast<P29V1LiveDialogue*>(object)->reset();
+}
+
+ProfileDialogueState state_p29v1(const void* object) noexcept {
+    switch (static_cast<const P29V1LiveDialogue*>(object)->state()) {
+    case P29V1LiveDialogue::State::Idle: return ProfileDialogueState::Idle;
+    case P29V1LiveDialogue::State::ReceivingBody:
+        return ProfileDialogueState::ReceivingBody;
+    case P29V1LiveDialogue::State::BodyClosed:
+        return ProfileDialogueState::BodyClosed;
+    case P29V1LiveDialogue::State::Materialized:
+        return ProfileDialogueState::Materialized;
+    case P29V1LiveDialogue::State::Terminal:
+        return ProfileDialogueState::Terminal;
+    }
+    return ProfileDialogueState::Terminal;
+}
+
+bool terminal_p29v1(const void* object) noexcept {
+    return static_cast<const P29V1LiveDialogue*>(object)->terminal();
+}
+
+ProfileCommitState commit_state_p29v1(const void* object) noexcept {
+    const auto state = static_cast<const P29V1LiveDialogue*>(object)->state();
+    return state == P29V1LiveDialogue::State::ReceivingBody ||
+                   state == P29V1LiveDialogue::State::BodyClosed ||
+                   state == P29V1LiveDialogue::State::Materialized
+               ? ProfileCommitState::Tentative
+               : ProfileCommitState::Committed;
+}
+
+size_t pending_body_bytes_p29v1(const void* object) noexcept {
+    return static_cast<const P29V1LiveDialogue*>(object)->pending_body_bytes();
+}
+
+uint64_t pending_segment_bytes_p29v1(const void* object) noexcept {
+    return static_cast<const P29V1LiveDialogue*>(object)->pending_segment_bytes();
+}
+
+Digest128 pending_segment_digest_p29v1(const void* object) noexcept {
+    return static_cast<const P29V1LiveDialogue*>(object)->pending_segment_digest();
+}
+
+uint64_t window_limit_bytes_p29v1(const void* object) noexcept {
+    return static_cast<const P29V1LiveDialogue*>(object)->window_limit_bytes();
+}
+
+const TxBegin* active_begin_p29v1(const void* object) noexcept {
+    return static_cast<const P29V1LiveDialogue*>(object)->active_begin();
 }
 
 ProfileDialogueState map_route_state(ZstdRouteDialogue::State state) noexcept {
@@ -535,6 +907,30 @@ const ProfileDialogueVTable kP29VTable{
     .active_begin = active_p29,
 };
 
+const ProfileDialogueVTable kP29V1VTable{
+    .profile = ProfileId::P29V1,
+    .destroy = destroy_p29v1,
+    .begin = begin_p29v1,
+    .append_dict = append_dict_p29v1,
+    .append_body = append_body_p29v1,
+    .need_messages = need_p29v1,
+    .receive_need = receive_need_p29v1,
+    .receive_fill = receive_fill_p29v1,
+    .materialize = materialize_p29v1,
+    .commit_visible = commit_visible_p29v1,
+    .discard_tentative = discard_p29v1,
+    .disconnect = disconnect_p29v1,
+    .reset = reset_p29v1,
+    .state = state_p29v1,
+    .terminal = terminal_p29v1,
+    .commit_state = commit_state_p29v1,
+    .pending_body_bytes = pending_body_bytes_p29v1,
+    .pending_segment_bytes = pending_segment_bytes_p29v1,
+    .pending_segment_digest = pending_segment_digest_p29v1,
+    .window_limit_bytes = window_limit_bytes_p29v1,
+    .active_begin = active_begin_p29v1,
+};
+
 const ProfileDialogueVTable kZstdRouteVTable{
     .profile = ProfileId::Z3_LONG,
     .destroy = destroy_route,
@@ -633,6 +1029,9 @@ ProfileDialogue make_profile_dialogue(ProfileId profile, ProfileDialogueConfig c
         return ProfileDialogue(&kP29VTable,
                                new P29LiveDialogue(config.negotiated_profiles,
                                                    config.c_store_guid));
+    case ProfileId::P29V1:
+        return ProfileDialogue(&kP29V1VTable,
+                               new P29V1LiveDialogue(config));
     case ProfileId::ZSTD_TU:
         return ProfileDialogue(&kZstdTuVTable,
                                new ZstdTuDialogue(config.negotiated_profiles,

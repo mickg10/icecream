@@ -252,6 +252,17 @@ void test_roundtrip_and_exact_echo()
     REQUIRE(!make_pair(PROTOCOL_VERSION).left->send_msg(
                 P50SourceArmMsg(p29_mode_mismatch)),
             "source-arm rejects a P29/GRZ mode mismatch");
+    static_assert(P50_SOURCE_MODE_P29V1 != P50_SOURCE_MODE_P29);
+    P50SourceArmFields p29v1 = request.arm;
+    p29v1.cache_profile = CACHE_PROFILE_P29V1;
+    p29v1.source_mode = P50_SOURCE_MODE_P29V1;
+    REQUIRE(make_pair(PROTOCOL_VERSION).left->send_msg(P50SourceArmMsg(p29v1)),
+            "source-arm accepts the exact P29V1 profile/mode pair");
+    P50SourceArmFields p29v1_mode_mismatch = p29v1;
+    p29v1_mode_mismatch.source_mode = P50_SOURCE_MODE_P29;
+    REQUIRE(!make_pair(PROTOCOL_VERSION).left->send_msg(
+                P50SourceArmMsg(p29v1_mode_mismatch)),
+            "source-arm rejects a P29V1/P29 mode mismatch");
 #if defined(ICECC_P50_WITH_LIBBSC)
     P50SourceArmFields grz = request.arm;
     grz.cache_profile = CACHE_PROFILE_GRZ;

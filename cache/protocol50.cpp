@@ -22,6 +22,8 @@ std::string_view profile_name(ProfileId profile) {
         return "z3_long";
     case ProfileId::Z3_SHARED_LONG:
         return "z3_shared_long";
+    case ProfileId::P29V1:
+        return "p29_v1";
     }
     return "unknown";
 }
@@ -31,7 +33,7 @@ namespace {
 bool known_object_type(ObjectType type) {
     const uint8_t value = static_cast<uint8_t>(type);
     return value >= static_cast<uint8_t>(ObjectType::Atom) &&
-           value <= static_cast<uint8_t>(ObjectType::Blob);
+           value <= static_cast<uint8_t>(ObjectType::P29Segment);
 }
 
 bool known_message_type(MessageType type) {
@@ -42,13 +44,16 @@ bool known_message_type(MessageType type) {
 
 bool known_profile(ProfileId profile) {
     return profile == ProfileId::P29 || profile == ProfileId::ZSTD_TU ||
-           profile == ProfileId::GRZ || profile == ProfileId::Z3_LONG;
+           profile == ProfileId::GRZ || profile == ProfileId::Z3_LONG ||
+           profile == ProfileId::P29V1;
 }
 
 bool valid_root_mode(ProfileId profile, P29RootMode mode) {
     if (profile == ProfileId::P29)
         return mode == P29RootMode::RouteHistory ||
                mode == P29RootMode::HistoryIndependent;
+    if (profile == ProfileId::P29V1)
+        return mode == P29RootMode::RouteHistory;
     return known_profile(profile) && mode == P29RootMode::NotApplicable;
 }
 
@@ -732,6 +737,198 @@ const std::vector<Key64>& NeedStreamDecoder::keys() const {
 
 void NeedStreamDecoder::finish() const { (void)keys(); }
 
+namespace {
+
+constexpr uint8_t kP29InnerNeed = 3;
+constexpr uint8_t kP29InnerPathDefinition = 5;
+constexpr uint8_t kP29InnerFillControl = 8;
+constexpr uint8_t kP29InnerFillLiteral = 9;
+constexpr uint8_t kP29InnerTuEnd = 0xfe;
+constexpr size_t kP29InnerHeaderBytes = 5;
+
+uint32_t p29_inner_length(std::span<const uint8_t> bytes, size_t offset) {
+    if (bytes.size() - offset < kP29InnerHeaderBytes)
+        throw std::invalid_argument("P29V1 inner stream ended mid-header");
+    uint32_t result = 0;
+    for (unsigned byte = 0; byte != 4; ++byte)
+        result |= uint32_t(bytes[offset + 1 + byte]) << (8 * byte);
+    return result;
+}
+
+void validate_p29v1_need_inner(std::span<const uint8_t> bytes) {
+    size_t offset = 0;
+    unsigned frames = 0;
+    bool saw_need = false;
+    while (offset < bytes.size()) {
+        if (frames == 2)
+            throw std::invalid_argument("P29V1 NEED inner stream has excess frames");
+        const uint8_t kind = bytes[offset];
+        const uint32_t length = p29_inner_length(bytes, offset);
+        offset += kP29InnerHeaderBytes;
+        if (length > bytes.size() - offset)
+            throw std::invalid_argument("P29V1 NEED inner frame is truncated");
+        if (frames == 0 && kind == kP29InnerNeed) {
+            if (length == 0)
+                throw std::invalid_argument("P29V1 inner NEED frame is empty");
+            saw_need = true;
+        } else if (kind == kP29InnerTuEnd) {
+            if (length != 0 || offset + length != bytes.size() ||
+                (frames != 0 && !(frames == 1 && saw_need)))
+                throw std::invalid_argument("P29V1 NEED TU_END is not canonical");
+        } else {
+            throw std::invalid_argument("P29V1 NEED inner frame order is invalid");
+        }
+        offset += length;
+        ++frames;
+    }
+    if (frames == 0 || bytes[bytes.size() - kP29InnerHeaderBytes] != kP29InnerTuEnd)
+        throw std::invalid_argument("P29V1 NEED inner stream lacks TU_END");
+}
+
+void validate_p29v1_fill_inner(std::span<const uint8_t> bytes) {
+    size_t offset = 0;
+    unsigned frames = 0;
+    int last_rank = -1;
+    uint8_t observed_mask = 0;
+    bool saw_end = false;
+    while (offset < bytes.size()) {
+        if (frames == 4)
+            throw std::invalid_argument("P29V1 FILL inner stream has excess frames");
+        const uint8_t kind = bytes[offset];
+        const uint32_t length = p29_inner_length(bytes, offset);
+        offset += kP29InnerHeaderBytes;
+        if (length > bytes.size() - offset)
+            throw std::invalid_argument("P29V1 FILL inner frame is truncated");
+        if (kind == kP29InnerTuEnd) {
+            if (saw_end || length != 1 || offset + length != bytes.size())
+                throw std::invalid_argument("P29V1 FILL TU_END is not canonical");
+            const uint8_t declared_mask = bytes[offset];
+            if ((declared_mask & ~uint8_t{3}) != 0 ||
+                declared_mask != observed_mask)
+                throw std::invalid_argument("P29V1 FILL TU_END mask differs from frames");
+            saw_end = true;
+        } else {
+            int rank = -1;
+            if (kind == kP29InnerFillControl) {
+                rank = 0;
+                observed_mask |= 1;
+            } else if (kind == kP29InnerFillLiteral) {
+                rank = 1;
+                observed_mask |= 2;
+            } else if (kind == kP29InnerPathDefinition) {
+                rank = 2;
+            } else {
+                throw std::invalid_argument("P29V1 FILL inner frame kind is invalid");
+            }
+            if (saw_end || rank <= last_rank)
+                throw std::invalid_argument("P29V1 FILL inner frame order is invalid");
+            last_rank = rank;
+        }
+        offset += length;
+        ++frames;
+    }
+    if (!saw_end)
+        throw std::invalid_argument("P29V1 FILL inner stream lacks TU_END");
+}
+
+template <class MessageValue, class Prefix>
+std::vector<MessageValue> encode_p29v1_fragments(
+    std::span<const uint8_t> inner_frames, size_t max_payload,
+    size_t first_prefix_bytes, Prefix&& prefix) {
+    if (max_payload < first_prefix_bytes || max_payload > kInitialMaxFramePayload)
+        throw std::invalid_argument("P29V1 payload cap cannot carry its prefix");
+    Encoder first;
+    prefix(first);
+    const size_t first_bytes =
+        std::min(inner_frames.size(), max_payload - first_prefix_bytes);
+    first.bytes(inner_frames.first(first_bytes));
+    std::vector<MessageValue> result;
+    result.push_back({first.take()});
+    size_t offset = first_bytes;
+    while (offset < inner_frames.size()) {
+        const size_t chunk = std::min(max_payload, inner_frames.size() - offset);
+        result.push_back({std::vector<uint8_t>(inner_frames.begin() + offset,
+                                               inner_frames.begin() + offset + chunk)});
+        offset += chunk;
+    }
+    return result;
+}
+
+void append_p29v1_continuation(std::vector<uint8_t>& destination,
+                               std::span<const uint8_t> source,
+                               uint64_t expected_bytes) {
+    if (source.empty() && destination.size() != expected_bytes)
+        throw std::invalid_argument("P29V1 continuation made no progress");
+    if (destination.size() > expected_bytes ||
+        source.size() > expected_bytes - destination.size())
+        throw std::invalid_argument("P29V1 stream exceeds its declared length");
+    if (source.size() > destination.max_size() - destination.size())
+        throw std::overflow_error("P29V1 stream exceeds addressable size");
+    destination.insert(destination.end(), source.begin(), source.end());
+}
+
+} // namespace
+
+std::vector<NeedMessage> encode_p29v1_need_messages(
+    uint64_t flags, std::span<const uint8_t> inner_frames, size_t max_payload,
+    uint64_t max_inner_bytes) {
+    if ((flags & ~kP29V1SystemSourceReuseFlag) != 0)
+        throw std::invalid_argument("P29V1 NEED flags are invalid");
+    if (inner_frames.size() > max_inner_bytes)
+        throw std::length_error("P29V1 NEED inner stream exceeds its bound");
+    validate_p29v1_need_inner(inner_frames);
+    return encode_p29v1_fragments<NeedMessage>(
+        inner_frames, max_payload, 16, [=](Encoder& first) {
+            first.u64(flags);
+            first.u64(inner_frames.size());
+        });
+}
+
+P29V1NeedStreamDecoder::P29V1NeedStreamDecoder(uint64_t max_inner_bytes)
+    : max_inner_bytes_(max_inner_bytes) {
+    if (max_inner_bytes == 0)
+        throw std::invalid_argument("P29V1 NEED inner bound is zero");
+}
+
+void P29V1NeedStreamDecoder::push(const NeedMessage& message) {
+    if (complete())
+        throw std::invalid_argument("P29V1 received a second NEED stream");
+    size_t offset = 0;
+    if (!started_) {
+        Decoder header(message.bytes);
+        flags_ = header.u64();
+        expected_bytes_ = header.u64();
+        if ((flags_ & ~kP29V1SystemSourceReuseFlag) != 0)
+            throw std::invalid_argument("P29V1 NEED flags are invalid");
+        if (expected_bytes_ > max_inner_bytes_ || expected_bytes_ > inner_.max_size())
+            throw std::length_error("P29V1 NEED declaration exceeds its bound");
+        inner_.reserve(static_cast<size_t>(expected_bytes_));
+        offset = 16;
+        started_ = true;
+    }
+    append_p29v1_continuation(
+        inner_, std::span<const uint8_t>(message.bytes).subspan(offset),
+        expected_bytes_);
+}
+
+bool P29V1NeedStreamDecoder::complete() const {
+    return started_ && inner_.size() == expected_bytes_;
+}
+
+uint64_t P29V1NeedStreamDecoder::flags() const {
+    (void)inner_frames();
+    return flags_;
+}
+
+const std::vector<uint8_t>& P29V1NeedStreamDecoder::inner_frames() const {
+    if (!complete())
+        throw std::logic_error("P29V1 NEED stream is incomplete");
+    validate_p29v1_need_inner(inner_);
+    return inner_;
+}
+
+void P29V1NeedStreamDecoder::finish() const { (void)inner_frames(); }
+
 std::vector<FillMessage> encode_fill_messages(std::span<const FillRecord> records,
                                                size_t max_payload) {
     if (max_payload == 0 || max_payload > kInitialMaxFramePayload)
@@ -808,6 +1005,60 @@ void FillStreamDecoder::finish() const {
     if (!buffer_.empty()) throw std::invalid_argument("FILL stream ended mid-record");
 }
 
+std::vector<FillMessage> encode_p29v1_fill_messages(
+    std::span<const uint8_t> inner_frames, size_t max_payload,
+    uint64_t max_inner_bytes) {
+    if (inner_frames.size() > max_inner_bytes)
+        throw std::length_error("P29V1 FILL inner stream exceeds its bound");
+    validate_p29v1_fill_inner(inner_frames);
+    return encode_p29v1_fragments<FillMessage>(
+        inner_frames, max_payload, 8, [=](Encoder& first) {
+            first.u64(inner_frames.size());
+        });
+}
+
+P29V1FillStreamDecoder::P29V1FillStreamDecoder(uint64_t max_inner_bytes)
+    : max_inner_bytes_(max_inner_bytes) {
+    if (max_inner_bytes == 0)
+        throw std::invalid_argument("P29V1 FILL inner bound is zero");
+}
+
+void P29V1FillStreamDecoder::push(const FillMessage& message) {
+    if (complete())
+        throw std::invalid_argument("P29V1 received a second FILL stream");
+    size_t offset = 0;
+    if (!started_) {
+        Decoder header(message.bytes);
+        expected_bytes_ = header.u64();
+        if (expected_bytes_ > max_inner_bytes_ || expected_bytes_ > inner_.max_size())
+            throw std::length_error("P29V1 FILL declaration exceeds its bound");
+        inner_.reserve(static_cast<size_t>(expected_bytes_));
+        offset = 8;
+        started_ = true;
+    }
+    append_p29v1_continuation(
+        inner_, std::span<const uint8_t>(message.bytes).subspan(offset),
+        expected_bytes_);
+}
+
+bool P29V1FillStreamDecoder::complete() const {
+    return started_ && inner_.size() == expected_bytes_;
+}
+
+const std::vector<uint8_t>& P29V1FillStreamDecoder::inner_frames() const {
+    if (!complete())
+        throw std::logic_error("P29V1 FILL stream is incomplete");
+    validate_p29v1_fill_inner(inner_);
+    return inner_;
+}
+
+std::vector<uint8_t> P29V1FillStreamDecoder::take_inner_frames() {
+    (void)inner_frames();
+    return std::move(inner_);
+}
+
+void P29V1FillStreamDecoder::finish() const { (void)inner_frames(); }
+
 ComponentDescriptor describe_component(uint16_t encoding,
                                        std::span<const uint8_t> encoded,
                                        uint64_t decoded_bytes) {
@@ -819,8 +1070,16 @@ Digest128 compute_transaction_digest(const TxBegin& begin,
                                      std::span<const uint8_t> body) {
     if (!valid_root_mode(begin.profile, begin.p29_root_mode))
         throw std::invalid_argument("transaction profile/root mode is invalid");
-    if (dict.size() != begin.dict.encoded_bytes || digest128(dict) != begin.dict.digest ||
-        body.size() != begin.body.encoded_bytes || digest128(body) != begin.body.digest)
+    const bool fingerprint_dict =
+        begin.profile == ProfileId::P29V1 &&
+        begin.dict.encoding == kP29V1FingerprintDictEncoding &&
+        begin.dict.encoded_bytes == 0 && begin.dict.decoded_bytes == 0 &&
+        dict.empty();
+    if ((!fingerprint_dict &&
+         (dict.size() != begin.dict.encoded_bytes ||
+          digest128(dict) != begin.dict.digest)) ||
+        body.size() != begin.body.encoded_bytes ||
+        digest128(body) != begin.body.digest)
         throw std::invalid_argument("transaction component does not match its descriptor");
     Digest128Builder out;
     out.append("ICECC-P50-TX-V1");

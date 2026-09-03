@@ -29,7 +29,7 @@ fi
 for pattern in \
     'P50_CACHE_SESSION_CLAIM = 0x50f00012' \
     'P50_CACHE_SESSION_OUTCOME = 0x50f00013' \
-    'inline constexpr std::array<uint32_t, 6> values' \
+    'inline constexpr std::array<uint32_t, 7> values' \
     'Msg::P50_CACHE_SESSION_CLAIM' \
     'Msg::P50_CACHE_SESSION_OUTCOME' \
     'static_assert(unique(), "Protocol-50 private ordinary message collision")' \

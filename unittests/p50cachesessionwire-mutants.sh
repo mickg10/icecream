@@ -25,13 +25,14 @@ compile_mutant() {
     output=$1
     # shellcheck disable=SC2086
     "$cxx" "$standard" -O0 -g -Wall -Wextra -Wpedantic -Werror \
-        ${ICECC_TEST_CPPFLAGS:-} \
+        ${ICECC_TEST_CPPFLAGS:-} ${ICECC_TEST_LIBCAP_NG_CFLAGS:-} \
         -I"$build/tree" -I"$build/tree/services" -I"$src" \
         -I"$src/services" -I"$top_build" \
         "$build/tree/unittests/p50_cache_session_wire_test.cpp" \
         "$build/tree/services/comm.cpp" \
         "$build/tree/services/p50_cache_session_wire.cpp" \
         "$archive" ${ICECC_TEST_LDFLAGS:-} \
+        ${ICECC_TEST_LIBCAP_NG_LIBS:-} \
         ${ICECC_TEST_LIBS:--llzo2} \
         ${ICECC_TEST_LIBZSTD_LIBS:--lzstd} \
         ${ICECC_TEST_XXHASH_LIBS:--lxxhash} -ldl -pthread \

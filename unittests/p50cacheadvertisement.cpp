@@ -706,18 +706,22 @@ static void test_declared_profiles_are_inert()
     static_assert(static_cast<uint16_t>(ProfileId::GRZ) == 3);
     static_assert(static_cast<uint16_t>(ProfileId::Z3_LONG) == 4);
     static_assert(static_cast<uint16_t>(ProfileId::Z3_SHARED_LONG) == 5);
+    static_assert(static_cast<uint16_t>(ProfileId::P29V1) == 6);
     static_assert(profile_bit(ProfileId::P29) == CACHE_PROFILE_P29);
     static_assert(profile_bit(ProfileId::ZSTD_TU) == CACHE_PROFILE_ZSTD_TU);
     static_assert(profile_bit(ProfileId::GRZ) == CACHE_PROFILE_GRZ);
     static_assert(profile_bit(ProfileId::Z3_LONG) == CACHE_PROFILE_Z3_LONG);
     static_assert(profile_bit(ProfileId::Z3_SHARED_LONG)
                   == CACHE_PROFILE_Z3_SHARED_LONG);
+    static_assert(profile_bit(ProfileId::P29V1) == CACHE_PROFILE_P29V1);
     static_assert((kKnownProfileMask & profile_bit(ProfileId::Z3_LONG)) != 0);
     static_assert((kKnownProfileMask & profile_bit(ProfileId::Z3_SHARED_LONG)) == 0);
     static_assert((CACHE_ADVERTISABLE_PROFILE_MASK
                    & CACHE_PROFILE_Z3_LONG) != 0);
     static_assert((CACHE_ADVERTISABLE_PROFILE_MASK
                    & CACHE_PROFILE_Z3_SHARED_LONG) == 0);
+    static_assert((CACHE_ADVERTISABLE_PROFILE_MASK
+                   & CACHE_PROFILE_P29V1) != 0);
     REQUIRE(profile_name(ProfileId::Z3_LONG) == "z3_long"
                 && profile_name(ProfileId::Z3_SHARED_LONG) == "z3_shared_long",
             "streaming profile IDs have stable declared labels");

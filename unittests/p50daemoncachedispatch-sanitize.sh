@@ -40,14 +40,14 @@ lzo_lib=${ICECC_TEST_LZO_LIB:-}
 if [ -z "$lzo_lib" ] && [ -f /lib/x86_64-linux-gnu/liblzo2.so.2 ]; then
     lzo_lib=/lib/x86_64-linux-gnu/liblzo2.so.2
 fi
-extra_cflags=${ICECC_TEST_LIBZSTD_CFLAGS:-}
+extra_cflags="${ICECC_TEST_LIBZSTD_CFLAGS:-} ${ICECC_TEST_LIBCAP_NG_CFLAGS:-}"
 extra_libs="${ICECC_TEST_LIBZSTD_LIBS:--lzstd} ${ICECC_TEST_XXHASH_LIBS:--lxxhash}"
 if [ -n "$lzo_lib" ]; then
     extra_libs="$extra_libs $lzo_lib"
 else
     extra_libs="$extra_libs -llzo2"
 fi
-extra_libs="$extra_libs -ldl"
+extra_libs="$extra_libs ${ICECC_TEST_LIBCAP_NG_LIBS:-} -ldl"
 
 "$cxx" "$standard" $cxxflags $cppflags $extra_cflags \
     -Wall -Wextra -Wpedantic -Werror -pthread \

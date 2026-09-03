@@ -7,8 +7,8 @@ namespace icecc::p50 {
 namespace {
 
 bool supported_profile(ProfileId profile) noexcept {
-    if (profile == ProfileId::P29 || profile == ProfileId::ZSTD_TU ||
-        profile == ProfileId::Z3_LONG)
+    if (profile == ProfileId::P29 || profile == ProfileId::P29V1 ||
+        profile == ProfileId::ZSTD_TU || profile == ProfileId::Z3_LONG)
         return true;
 #if defined(ICECC_P50_WITH_LIBBSC)
     if (profile == ProfileId::GRZ)

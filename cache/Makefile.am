@@ -98,6 +98,12 @@ libp50adoptedoutcomewriter_a_SOURCES = p50_adopted_outcome_writer.cpp \
 libp50adoptedoutcomewriter_a_CPPFLAGS = $(AM_CPPFLAGS)
 
 EXTRA_DIST = \
+	codec/FORMAT.md \
+	codec/README.md \
+	codec/p29_intern.h \
+	codec/p29_wire.h \
+	codec/provider.h \
+	codec/tuples.h \
 	p50_control_operation.h \
 	p50_daemon_control.h \
 	p50_daemon_control.cpp \

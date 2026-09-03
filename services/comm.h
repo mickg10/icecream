@@ -586,21 +586,24 @@ bool send_cache_session_ready(
 
 /* Stable CacheWire profile bits.  P29/ZSTD_TU/GRZ are existing protocol
    labels.  Z3_LONG and Z3_SHARED_LONG reserve the two simple streaming
-   profiles without making either codec implemented or negotiable. */
+   profiles; P29V1 is the runnable provider-owned route codec. */
 const uint32_t CACHE_PROFILE_P29 = ( UINT32_C(1) << 0 );
 const uint32_t CACHE_PROFILE_ZSTD_TU = ( UINT32_C(1) << 1 );
 const uint32_t CACHE_PROFILE_GRZ = ( UINT32_C(1) << 2 );
 const uint32_t CACHE_PROFILE_Z3_LONG = ( UINT32_C(1) << 3 );
 const uint32_t CACHE_PROFILE_Z3_SHARED_LONG = ( UINT32_C(1) << 4 );
+const uint32_t CACHE_PROFILE_P29V1 = ( UINT32_C(1) << 5 );
 /* The first runnable route codec is exposed under its source-path name. */
 const uint32_t CACHE_PROFILE_ZSTD_ROUTE = CACHE_PROFILE_Z3_LONG;
 const uint32_t CACHE_DECLARED_PROFILE_MASK =
     CACHE_PROFILE_P29 | CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_GRZ
-    | CACHE_PROFILE_Z3_LONG | CACHE_PROFILE_Z3_SHARED_LONG;
+    | CACHE_PROFILE_Z3_LONG | CACHE_PROFILE_Z3_SHARED_LONG
+    | CACHE_PROFILE_P29V1;
 /* The endpoint advertises only runnable product dialogues.  GRZ is included
    only in builds that linked the reviewed libbsc residual implementation. */
 const uint32_t CACHE_ADVERTISABLE_PROFILE_MASK =
-    CACHE_PROFILE_P29 | CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE
+    CACHE_PROFILE_P29 | CACHE_PROFILE_P29V1 | CACHE_PROFILE_ZSTD_TU |
+    CACHE_PROFILE_ZSTD_ROUTE
 #if defined(ICECC_P50_WITH_LIBBSC)
     | CACHE_PROFILE_GRZ
 #endif
@@ -612,6 +615,7 @@ const uint32_t CACHE_ADVERTISABLE_PROFILE_MASK =
 enum class P50CacheProfileRequest : uint8_t {
     Default,
     P29,
+    P29V1,
     ZSTD_TU,
     ZSTD_ROUTE,
     GRZ_RESIDUAL,
@@ -628,6 +632,8 @@ inline P50CacheProfileRequest p50_cache_profile_request_from_env() noexcept
         return P50CacheProfileRequest::ZSTD_TU;
     if (requested == "P29")
         return P50CacheProfileRequest::P29;
+    if (requested == "P29V1" || requested == "P29_V1")
+        return P50CacheProfileRequest::P29V1;
     if (requested == "ZSTD_ROUTE")
         return P50CacheProfileRequest::ZSTD_ROUTE;
     if (requested == "GRZ" || requested == "GRZ_RESIDUAL")
@@ -657,6 +663,10 @@ inline constexpr uint32_t p50_select_cache_profile(
                    : 0;
     case P50CacheProfileRequest::P29:
         return (advertised & CACHE_PROFILE_P29) != 0 ? CACHE_PROFILE_P29 : 0;
+    case P50CacheProfileRequest::P29V1:
+        return (advertised & CACHE_PROFILE_P29V1) != 0
+                   ? CACHE_PROFILE_P29V1
+                   : 0;
     case P50CacheProfileRequest::GRZ_RESIDUAL:
         return (advertised & CACHE_PROFILE_GRZ) != 0
                    ? CACHE_PROFILE_GRZ
@@ -673,13 +683,16 @@ inline constexpr uint32_t P50_SOURCE_MODE_ZSTD_TU = UINT32_C(1);
 inline constexpr uint32_t P50_SOURCE_MODE_ZSTD_ROUTE = UINT32_C(2);
 inline constexpr uint32_t P50_SOURCE_MODE_GRZ_RESIDUAL = UINT32_C(3);
 inline constexpr uint32_t P50_SOURCE_MODE_P29 = UINT32_C(4);
+inline constexpr uint32_t P50_SOURCE_MODE_P29V1 = UINT32_C(5);
 
 inline constexpr bool p50_source_profile_mode_valid(uint32_t profile,
                                                      uint32_t source_mode) noexcept
 {
     return (profile == CACHE_PROFILE_ZSTD_TU &&
-            source_mode == P50_SOURCE_MODE_ZSTD_TU) ||
+           source_mode == P50_SOURCE_MODE_ZSTD_TU) ||
            (profile == CACHE_PROFILE_P29 && source_mode == P50_SOURCE_MODE_P29) ||
+           (profile == CACHE_PROFILE_P29V1 &&
+            source_mode == P50_SOURCE_MODE_P29V1) ||
            (profile == CACHE_PROFILE_ZSTD_ROUTE &&
             source_mode == P50_SOURCE_MODE_ZSTD_ROUTE)
 #if defined(ICECC_P50_WITH_LIBBSC)
@@ -693,6 +706,7 @@ inline constexpr bool p50_source_profile_selection_valid(uint32_t profiles) noex
 {
     return profiles == CACHE_PROFILE_ZSTD_TU ||
            profiles == CACHE_PROFILE_ZSTD_ROUTE || profiles == CACHE_PROFILE_P29
+           || profiles == CACHE_PROFILE_P29V1
 #if defined(ICECC_P50_WITH_LIBBSC)
            || profiles == CACHE_PROFILE_GRZ
 #endif

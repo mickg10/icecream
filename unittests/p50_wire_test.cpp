@@ -69,6 +69,7 @@ void test_digest128_contract() {
 void test_key_layout_v1() {
     static_assert(profile_bit(ProfileId::P29) == 1);
     static_assert(profile_bit(ProfileId::GRZ) == 4);
+    static_assert(profile_bit(ProfileId::P29V1) == 32);
     static_assert(profile_bit(static_cast<ProfileId>(0)) == 0);
     static_assert(profile_bit(static_cast<ProfileId>(32)) ==
                   (uint32_t{1} << 31));
@@ -81,9 +82,10 @@ void test_key_layout_v1() {
     static_assert(sizeof(HistoryNonce) == sizeof(uint64_t));
 
     const auto maximum = Key64::make(
-        ObjectType::Blob, static_cast<uint16_t>(KeyLayoutV1::generation_value_mask),
+        ObjectType::P29Segment,
+        static_cast<uint16_t>(KeyLayoutV1::generation_value_mask),
         KeyLayoutV1::ordinal_mask);
-    require(maximum && maximum->type() == ObjectType::Blob &&
+    require(maximum && maximum->type() == ObjectType::P29Segment &&
                 maximum->generation() == KeyLayoutV1::generation_value_mask &&
                 maximum->ordinal() == KeyLayoutV1::ordinal_mask,
             "KeyLayoutV1 maximum did not round-trip");
@@ -96,6 +98,106 @@ void test_key_layout_v1() {
     require(!Key64::from_wire(0), "zero wire Key64 must be invalid");
     require(!Key64::from_wire((uint64_t{31} << KeyLayoutV1::type_shift) | 1),
             "unassigned object type must be invalid");
+}
+
+void append_p29_inner(std::vector<uint8_t>& output, uint8_t kind,
+                      std::span<const uint8_t> payload) {
+    output.push_back(kind);
+    for (unsigned byte = 0; byte != 4; ++byte)
+        output.push_back(static_cast<uint8_t>(payload.size() >> (8 * byte)));
+    output.insert(output.end(), payload.begin(), payload.end());
+}
+
+void test_p29v1_outer_streams() {
+    std::vector<uint8_t> need_inner;
+    const std::vector<uint8_t> compressed_need(211, 0x5a);
+    append_p29_inner(need_inner, 3, compressed_need);
+    append_p29_inner(need_inner, 0xfe, {});
+    const auto needs = encode_p29v1_need_messages(
+        kP29V1SystemSourceReuseFlag, need_inner, 23, need_inner.size());
+    require(needs.size() > 3, "P29V1 NEED did not fragment at a small cap");
+    P29V1NeedStreamDecoder need_decoder(need_inner.size());
+    for (const NeedMessage& message : needs)
+        need_decoder.push(message);
+    need_decoder.finish();
+    require(need_decoder.flags() == kP29V1SystemSourceReuseFlag &&
+                need_decoder.inner_frames() == need_inner,
+            "P29V1 NEED fragments did not round-trip exactly");
+    require_throws<std::invalid_argument>(
+        [&] { need_decoder.push(NeedMessage{{}}); },
+        "P29V1 accepted a second NEED stream");
+    require_throws<std::invalid_argument>(
+        [&] { (void)encode_p29v1_need_messages(2, need_inner, 64, 4096); },
+        "P29V1 accepted an unknown NEED flag");
+    require_throws<std::length_error>(
+        [&] {
+            (void)encode_p29v1_need_messages(0, need_inner, 64,
+                                             need_inner.size() - 1);
+        },
+        "P29V1 accepted an oversized NEED inner stream");
+    std::vector<uint8_t> no_need_end;
+    append_p29_inner(no_need_end, 3, compressed_need);
+    require_throws<std::invalid_argument>(
+        [&] { (void)encode_p29v1_need_messages(0, no_need_end, 64, 4096); },
+        "P29V1 accepted NEED without TU_END");
+    P29V1NeedStreamDecoder short_need(need_inner.size());
+    for (size_t index = 0; index + 1 < needs.size(); ++index)
+        short_need.push(needs[index]);
+    require_throws<std::logic_error>([&] { short_need.finish(); },
+                                     "P29V1 accepted a truncated NEED stream");
+
+    std::vector<uint8_t> fill_inner;
+    const std::vector<uint8_t> control(307, 0x11);
+    const std::vector<uint8_t> literal(509, 0x22);
+    const std::vector<uint8_t> paths(71, 0x33);
+    append_p29_inner(fill_inner, 8, control);
+    append_p29_inner(fill_inner, 9, literal);
+    append_p29_inner(fill_inner, 5, paths);
+    const std::array<uint8_t, 1> mask{3};
+    append_p29_inner(fill_inner, 0xfe, mask);
+    const auto fills =
+        encode_p29v1_fill_messages(fill_inner, 19, fill_inner.size());
+    require(fills.size() > 20, "P29V1 FILL did not fragment at a small cap");
+    P29V1FillStreamDecoder fill_decoder(fill_inner.size());
+    for (const FillMessage& message : fills)
+        fill_decoder.push(message);
+    fill_decoder.finish();
+    require(fill_decoder.inner_frames() == fill_inner,
+            "P29V1 FILL fragments did not round-trip exactly");
+    require_throws<std::invalid_argument>(
+        [&] { fill_decoder.push(FillMessage{{}}); },
+        "P29V1 accepted a second FILL stream");
+    require_throws<std::length_error>(
+        [&] {
+            (void)encode_p29v1_fill_messages(fill_inner, 64,
+                                             fill_inner.size() - 1);
+        },
+        "P29V1 accepted an oversized FILL inner stream");
+    std::vector<uint8_t> wrong_order;
+    append_p29_inner(wrong_order, 9, literal);
+    append_p29_inner(wrong_order, 8, control);
+    append_p29_inner(wrong_order, 0xfe, mask);
+    require_throws<std::invalid_argument>(
+        [&] { (void)encode_p29v1_fill_messages(wrong_order, 64, 4096); },
+        "P29V1 accepted reordered FILL frames");
+    std::vector<uint8_t> wrong_mask;
+    append_p29_inner(wrong_mask, 8, control);
+    const std::array<uint8_t, 1> literal_only_mask{2};
+    append_p29_inner(wrong_mask, 0xfe, literal_only_mask);
+    require_throws<std::invalid_argument>(
+        [&] { (void)encode_p29v1_fill_messages(wrong_mask, 64, 4096); },
+        "P29V1 accepted a FILL mask that differs from its frames");
+
+    // The new profile uses existing descriptor fields; the legacy handshake
+    // payloads remain byte-for-byte fixed-length for old readers.
+    SessionHello hello;
+    hello.c_store_guid = Id128::from_u64(0x2901);
+    require(encode_payload(Message{hello}).size() == 36,
+            "P29V1 changed the legacy SESSION_HELLO payload");
+    SessionState state;
+    state.f_store_guid = Id128::from_u64(0x2902);
+    require(encode_payload(Message{state}).size() == 67,
+            "P29V1 changed the legacy SESSION_STATE payload");
 }
 
 std::vector<Message> all_messages() {
@@ -708,6 +810,7 @@ int main() {
     test_ten_messages_and_four_byte_parser();
     test_need_delta_stream();
     test_fill_records_cross_every_boundary();
+    test_p29v1_outer_streams();
     test_non_circular_closure();
     std::cout << "p50_wire_test: all wire and closure gates passed\n";
     return 0;

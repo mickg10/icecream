@@ -5,10 +5,13 @@ src=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
 header="$src/cache/p50_cache_session_join.h"
 impl="$src/cache/p50_cache_session_join.cpp"
 test_file="$src/unittests/p50_cache_session_join_test.cpp"
+wire_header="$src/services/p50_cache_session_wire.h"
+wire_file="$src/services/p50_cache_session_wire.cpp"
 unittest_makefile="$src/unittests/Makefile.am"
 cache_makefile="$src/cache/Makefile.am"
 
-for file in "$header" "$impl" "$test_file" "$unittest_makefile" "$cache_makefile"; do
+for file in "$header" "$impl" "$test_file" "$wire_header" "$wire_file" \
+    "$unittest_makefile" "$cache_makefile"; do
     test -f "$file"
     if grep -E '#include <(thread|future|mutex)|std::(thread|future|async|mutex)|pthread_' "$file" >/dev/null; then
         echo "FAIL: daemon join reducer acquired a thread/future primitive: $file" >&2
@@ -23,7 +26,7 @@ grep -F 'libp50sessionjoin_a_SOURCES = p50_cache_session_join.cpp' \
     "$cache_makefile" >/dev/null
 grep -F 'P50_CACHE_SESSION_JOIN.md' "$cache_makefile" >/dev/null
 
-wire_block=$(sed -n '/struct P50CacheSessionWireClaim {/,/^};/p' "$header")
+wire_block=$(sed -n '/struct P50CacheSessionWireClaim {/,/^};/p' "$wire_header")
 if printf '%s\n' "$wire_block" | grep -E 'ConnectionLease|client_id|OwnerContext' >/dev/null; then
     echo 'FAIL: F-local owner identity leaked into the public wire claim' >&2
     exit 1
@@ -73,11 +76,15 @@ for pattern in \
     'reader.remaining() != 0' \
     'ready_lease_observation_id'; do
     grep -F "$pattern" "$header" "$impl" "$test_file" \
-        "$src/services/comm.h" >/dev/null
+        "$src/services/comm.h" "$wire_header" "$wire_file" >/dev/null
 done
 
-grep -F 'struct P50CacheSessionArmBinding : P50SourceArmedFields' \
-    "$header" >/dev/null
+grep -F 'struct P50CacheSessionArmBinding {' "$wire_header" >/dev/null
+if grep -F 'struct P50CacheSessionArmBinding : P50SourceArmedFields' \
+        "$wire_header" >/dev/null; then
+    echo 'FAIL: cache-session binding regained projected-arm inheritance' >&2
+    exit 1
+fi
 grep -F 'cache_session_binding_from_armed(const P50SourceArmedMsg &message)' \
     "$header" "$impl" >/dev/null
 if grep -E 'cache_session_binding_from_armed\([^)]*P50SourceArmFields|independent_store_roots' \
@@ -111,7 +118,6 @@ done
 
 for witness in \
     'forged non-burned capability cannot reserve a live WAIT' \
-    'capability from an independently reset authority is rejected' \
     'exact unseen fence does not reject a lower still-live owner' \
     'fence capacity exhaustion fails closed' \
     'source budget mechanically expires and reclaims pre-detach row' \

@@ -369,6 +369,20 @@ void remove_test_lease_root(const std::string& root) {
     CHECK(::rmdir(root.c_str()) == 0);
 }
 
+void remove_p29_fingerprint_cache(const std::string& root) {
+    for (const char* name : {"p29-system-source-fingerprint-v1.cache",
+                             "p29-system-source-fingerprint-v1.lock"}) {
+        const std::string path = root + "/" + name;
+        struct stat info{};
+        if (::lstat(path.c_str(), &info) != 0) {
+            CHECK(errno == ENOENT);
+            continue;
+        }
+        CHECK(S_ISREG(info.st_mode));
+        CHECK(::unlink(path.c_str()) == 0);
+    }
+}
+
 Config structured_config(const char* mode, const std::string& root,
                          const std::shared_ptr<LaunchIdentityAllocator>& allocator,
                          uint32_t max_restarts = 3) {
@@ -504,6 +518,7 @@ void structured_actual_service_publishes_prebound_ready() {
     CHECK(::access(stale_socket.c_str(), F_OK) != 0);
     supervisor.shutdown();
     CHECK(::access(lease.socket_path.c_str(), F_OK) != 0);
+    remove_p29_fingerprint_cache(root);
     CHECK(::rmdir(root.c_str()) == 0);
 }
 

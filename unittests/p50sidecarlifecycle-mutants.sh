@@ -37,21 +37,26 @@ for mutant_name in pgid store-generation allocator-store-generation lease-store-
     elif test "$mutant_name" = group-domain; then
         perl -0pi -e 's@bool SidecarLifecycle::exact_group_absent\(\n    const LifecycleObservation& observation\) const noexcept \{.*?\n\}@bool SidecarLifecycle::exact_group_absent(\n    const LifecycleObservation& observation) const noexcept {\n    return leader_reaped_ && observation.group == GroupObservation::Gone &&\n           observation.observed_pgid == process_group_;\n}@s' "$tmp/mutant.cpp"
     elif test "$mutant_name" = fabricated-lease; then
-        perl -0pi -e 's/group_domain_ = kill_domain_verifier_->capture\(child_pid_,\s*process_group_\);/group_domain_ = observation.group_domain;/s' "$tmp/mutant.cpp"
+        # The launcher now captures the opaque lease outside this pure
+        # reducer.  Delete the reducer's exact observed-vs-captured token join
+        # so the permissive wrong-lease witness must redden.
+        sed -i 's/!(observation.group_domain == \*group_domain_)/false/' \
+            "$tmp/mutant.cpp"
     elif test "$mutant_name" = over-capacity; then
         sed -i 's/state_->owners.size() >= SharedState::kMaximumOwners/false/g' "$tmp/mutant.cpp"
         sed -i 's/state_->slots.size() >= SharedState::kMaximumOwners/false/g' "$tmp/mutant.cpp"
     elif test "$mutant_name" = discarded-registration; then
         sed -i '0,/state_->owners.erase(iterator);/s//if (false) state_->owners.erase(iterator);/' "$tmp/mutant.cpp"
     elif test "$mutant_name" = socket-substitution; then
-        # Keep the substitution bypass syntactically valid so the behavioral
-        # witness, rather than the compiler, kills this true mutant.
-        sed -i '/if (::lstat(lease.socket_path.c_str(), \&listener) != 0 ||/,/listener.st_ino != lease.listener_inode)/c\    if (false)' "$tmp/mutant.cpp"
+        # The outer loop now owns lstat and supplies the observed node to this
+        # pure reducer.  Delete the exact observed-inode join.
+        sed -i 's/observation.observed_inode != lease.listener_inode/false/' \
+            "$tmp/mutant.cpp"
     elif test "$mutant_name" = group-proof-required; then
-        # A permissive observation must not authorize teardown before the
-        # reducer has captured a group lease for the fork.  Restore the
-        # fail-closed branch to true to make this semantic mutant executable.
-        perl -0pi -e 's/if \(!group_proof_required_\)\n        return false;/if (!group_proof_required_)\n        return true;/' "$tmp/mutant.cpp"
+        # Delete the fork transition's proof requirement.  A later exact
+        # group/path observation must then remain unable to release capacity.
+        sed -i 's/group_proof_required_ = true;/group_proof_required_ = false;/g' \
+            "$tmp/mutant.cpp"
     elif test "$mutant_name" = owner-key; then
         sed -i 's/event\.owner != owner_key()/false/' "$tmp/mutant.cpp"
     else

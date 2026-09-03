@@ -121,6 +121,11 @@ done
 
 # This probe selects header-only Boost.System, so only BOOST_CPPFLAGS may retain
 # the explicit prefix.  No product link needs the Boost library directory.
+# Keep this object-basename list aligned with the target-specific
+# *_CPPFLAGS assignments in cache/, client/, and unittests/Makefile.am.  The
+# no-slash suffix prevents this test's own icecc-boost-* directory name from
+# accidentally whitelisting every compile command.
+icecc_boost_consumers='(^|[[:space:]/])(icecc_cache_service-|libp50endpoint_a-|libp50endpointtesthooks_a-|icecc-|libclient_a-|libp50zstdsender_a-|p50endpoint-|p50s3realprocess-|p50zstdsender-|p50compilebinding-|p50routeowner-|p50cacheservice-)[^/[:space:]]*\.(o|lo)([[:space:]]|$)'
 grep -F "BOOST_CPPFLAGS='-isystem $icecc_test_prefix/include " \
     "$icecc_test_build/config.log" >/dev/null
 grep -F "BOOST_LDFLAGS=''" \
@@ -155,7 +160,7 @@ if ! grep -F -- "-isystem $icecc_test_prefix/include" \
 fi
 if grep -F -- "-isystem $icecc_test_prefix/include" \
         "$icecc_test_root/build.log" | grep -Ev \
-        'libp50endpoint_a-|p50endpoint-p50_endpoint_test' >/dev/null || \
+        "$icecc_boost_consumers" >/dev/null || \
         grep -F -- "-L$icecc_test_prefix/lib" \
         "$icecc_test_root/build.log" >/dev/null; then
     echo "a build target inherited the unused Boost library prefix" >&2

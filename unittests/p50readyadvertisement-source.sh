@@ -33,6 +33,8 @@ require 'CACHE_PROFILE_ZSTD_ROUTE' "$impl" \
     'presence projects the implemented ZSTD_ROUTE capability'
 require 'CACHE_PROFILE_P29' "$impl" \
     'presence projects the implemented P29 capability'
+require 'CACHE_PROFILE_P29V1' "$impl" \
+    'presence projects the implemented P29V1 capability'
 require 'CACHE_PROFILE_ZSTD_TU' "$impl" \
     'presence retains the legacy ZSTD_TU capability'
 require 'Error::CounterRegression' "$impl" \

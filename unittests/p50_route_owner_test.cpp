@@ -574,6 +574,43 @@ void test_p29_relationship_owner() {
     CHECK(reset.committed_input->tu_seq.value == 4);
 }
 
+void test_p29v1_relationship_owner() {
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    EndpointCaps server_caps;
+    server_caps.profile = ProfileId::P29V1;
+    server_caps.supported_profiles = kOperationalProfileMask;
+    server_caps.zstd = config().endpoint_caps.zstd;
+    P50ServerEndpoint server(Id128::from_u64(260), server_caps, nullptr, nullptr,
+                             P50ServerEndpointConfig{
+                                 .input_job_state = [](CStoreGuid, const TxBegin&,
+                                                       const TxCommit&,
+                                                       std::span<const uint8_t>) {
+                                     return InputJobState::Open;
+                                 }});
+
+    // Keep the owner's primary/default profile at ZSTD_ROUTE.  The explicit
+    // P29V1 relationship must lazily enable the shared C interner and retain
+    // its route state without requiring a P29V1-only authority at startup.
+    P50CRouteOwner owner(config());
+    const auto route = relationship(161, 261, 1, ProfileId::P29V1);
+    const std::vector<uint8_t> repeated{
+        '#', ' ', '1', ' ', '"', 'a', '"', '\n',
+        'p', '2', '9', 'v', '1', '\n'};
+
+    const auto first = route_call(context, owner, server, acceptor, route,
+                                  {7301, 1}, repeated);
+    CHECK(first.status == ZstdSourceTransferStatus::Committed);
+    CHECK(first.profile == ProfileId::P29V1);
+    CHECK(first.committed_input->tu_seq.value == 0);
+    const auto second = route_call(context, owner, server, acceptor, route,
+                                   {7301, 2}, repeated);
+    CHECK(second.status == ZstdSourceTransferStatus::Committed);
+    CHECK(second.profile == ProfileId::P29V1);
+    CHECK(second.committed_input->tu_seq.value == 1);
+    CHECK(owner.owner_count() == 1 && owner.owns(route));
+}
+
 #if defined(ICECC_P50_WITH_LIBBSC)
 void test_grz_relationship_owner() {
     asio::io_context context;
@@ -614,6 +651,7 @@ int main() {
     test_tu_seq_reservation_and_exhaustion();
     test_relationship_validation();
     test_p29_relationship_owner();
+    test_p29v1_relationship_owner();
 #if defined(ICECC_P50_WITH_LIBBSC)
     test_grz_relationship_owner();
 #endif

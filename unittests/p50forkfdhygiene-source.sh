@@ -62,7 +62,7 @@ grep -F 'forkfd::sweep' "$serve" >/dev/null
 grep -F 'before reset_debug/work_it' "$serve" >/dev/null
 grep -F 'compiler_input_source' "$serve" >/dev/null
 grep -F 'ForkSourceLease' "$main" "$serve" >/dev/null
-grep -F 'it MUST erase it before this TOCOMPILE/fork' "$main" >/dev/null
+grep -F 'client->p50_input_fd = -1' "$main" >/dev/null
 grep -F 'explicitly HOLD' "$doc" >/dev/null
 grep -F 'p50_fork_fd_hygiene.cpp' "$makefile" >/dev/null
 echo 'PASS: exact fork descriptor hygiene source anchors'

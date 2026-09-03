@@ -34,7 +34,8 @@ bool valid_deadline(Clock::time_point deadline, Clock::duration maximum_duration
 }
 
 bool route_history_profile(ProfileId profile) noexcept {
-    if (profile == ProfileId::P29 || profile == ProfileId::Z3_LONG)
+    if (profile == ProfileId::P29 || profile == ProfileId::P29V1 ||
+        profile == ProfileId::Z3_LONG)
         return true;
 #if defined(ICECC_P50_WITH_LIBBSC)
     if (profile == ProfileId::GRZ)

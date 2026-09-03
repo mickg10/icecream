@@ -10,6 +10,7 @@ grep -F 'ICECC_P50_PROFILE' "$comm" >/dev/null
 grep -F 'P50CacheProfileRequest::ZSTD_TU' "$comm" >/dev/null
 grep -F 'P50CacheProfileRequest::ZSTD_ROUTE' "$comm" >/dev/null
 grep -F 'P50CacheProfileRequest::P29' "$comm" >/dev/null
+grep -F 'P50CacheProfileRequest::P29V1' "$comm" >/dev/null
 grep -F 'P50CacheProfileRequest::Unsupported' "$comm" >/dev/null
 grep -F 'p50_select_cache_profile' "$comm" "$scheduler" "$test" >/dev/null
 grep -F 'p50_cache_profile_request_from_env' "$scheduler" "$test" >/dev/null
@@ -26,4 +27,4 @@ if grep -nE 'ZSTD_COHORT|CACHE_PROFILE_COHORT' "$comm" "$scheduler" "$test" >/de
     exit 1
 fi
 
-echo 'PASS: explicit P29/TU/ROUTE profile selection source gates hold'
+echo 'PASS: explicit P29/P29V1/TU/ROUTE profile selection source gates hold'

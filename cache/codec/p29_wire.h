@@ -19,6 +19,13 @@
 #include <utility>
 #include <vector>
 
+#if defined(ICECC_P50SIM_ALLOCATION_COUNTER)
+extern "C" unsigned
+icecc_p50sim_p29_allocation_scope_enter(unsigned entry) noexcept;
+extern "C" void
+icecc_p50sim_p29_allocation_scope_leave(unsigned previous) noexcept;
+#endif
+
 namespace icecc::codec {
 
 enum class P29WireKind : std::uint8_t {
@@ -49,6 +56,25 @@ struct P29WireLimits {
   std::size_t max_block_children = std::size_t{1} << 27;
   std::size_t max_occurrences = std::size_t{1} << 30;
 };
+
+[[nodiscard]] inline std::size_t
+p29v1_need_inner_bound(const P29WireLimits &limits) {
+  const std::size_t occurrence_bound =
+      limits.max_occurrences >
+              (std::numeric_limits<std::size_t>::max() - 20) / 5
+          ? std::numeric_limits<std::size_t>::max()
+          : 20 + 5 * limits.max_occurrences;
+  return std::min(limits.max_tu_bytes, occurrence_bound);
+}
+
+[[nodiscard]] inline std::size_t
+p29v1_fill_inner_bound(const P29WireLimits &limits) {
+  constexpr std::size_t path_allowance = std::size_t{1} << 20;
+  if (limits.max_tu_bytes >
+      (std::numeric_limits<std::size_t>::max() - path_allowance) / 2)
+    return std::numeric_limits<std::size_t>::max();
+  return 2 * limits.max_tu_bytes + path_allowance;
+}
 
 struct P29MixedCLineState {
   std::uint32_t source_region = std::numeric_limits<std::uint32_t>::max();
@@ -92,10 +118,12 @@ struct P29SenderRouteState {
   std::size_t known_region_count = 0;
   std::size_t known_block_count = 0;
   std::uint64_t revision = 0;
+  bool system_source_reuse = false;
   bool operator==(const P29SenderRouteState &) const = default;
 };
 
 struct P29ReceiverRouteState {
+  std::unordered_map<std::string, std::uint32_t> path_ids;
   std::vector<std::string> paths;
   // One immutable byte segment per committed TU.  Moving the staged segment
   // at commit avoids recopying every historical Region while preserving a
@@ -109,8 +137,40 @@ struct P29ReceiverRouteState {
   std::size_t known_region_count = 0;
   std::size_t known_block_count = 0;
   std::uint64_t revision = 0;
+  bool system_source_reuse = false;
   bool operator==(const P29ReceiverRouteState &) const = default;
 };
+
+static_assert(sizeof(P29MixedCLineState) == 12);
+
+// Stable logical accounting for sender route state. Both path containers own
+// their own string, so charge both copies; allocator-specific bucket/node
+// slack is deliberately not part of the cross-build resource contract.
+[[nodiscard]] inline std::uint64_t
+p29_sender_route_state_bytes(const P29SenderRouteState &state) noexcept {
+  std::uint64_t result = 0;
+  const auto add = [&result](std::uint64_t bytes) {
+    result = bytes > std::numeric_limits<std::uint64_t>::max() - result
+                 ? std::numeric_limits<std::uint64_t>::max()
+                 : result + bytes;
+  };
+  const auto multiply = [](std::uint64_t count,
+                           std::uint64_t width) noexcept {
+    return count != 0 &&
+                   width > std::numeric_limits<std::uint64_t>::max() / count
+               ? std::numeric_limits<std::uint64_t>::max()
+               : count * width;
+  };
+  add(multiply(state.paths.size(), sizeof(std::string)));
+  add(multiply(state.path_ids.size(),
+               sizeof(std::string) + sizeof(std::uint32_t)));
+  for (const std::string &path : state.paths)
+    add(multiply(path.size(), 2));
+  add(multiply(state.mixed_lines.size(), sizeof(P29MixedCLineState)));
+  add(state.fknown_regions.size());
+  add(state.fknown_blocks.size());
+  return result;
+}
 
 template <class P>
 concept P29SenderProvider = requires(P provider, std::string_view path) {
@@ -149,6 +209,36 @@ concept P29WireDictionary = requires(const D dictionary, std::uint32_t id) {
 };
 
 namespace p29_wire_detail {
+
+#if defined(ICECC_P50SIM_ALLOCATION_COUNTER)
+enum class P29AllocationEntry : unsigned {
+  SenderBeginTu,
+  SenderAnswerNeed,
+  SenderCommit,
+  SenderAbandon,
+  ReceiverReceiveBody,
+  ReceiverReceiveFill,
+  ReceiverTakeMaterialized,
+  ReceiverCommit,
+  ReceiverAbandon,
+};
+
+class P29AllocationScope {
+public:
+  explicit P29AllocationScope(P29AllocationEntry entry) noexcept
+      : previous_(icecc_p50sim_p29_allocation_scope_enter(
+            static_cast<unsigned>(entry))) {
+  }
+  ~P29AllocationScope() {
+    icecc_p50sim_p29_allocation_scope_leave(previous_);
+  }
+  P29AllocationScope(const P29AllocationScope &) = delete;
+  P29AllocationScope &operator=(const P29AllocationScope &) = delete;
+
+private:
+  unsigned previous_;
+};
+#endif
 
 constexpr std::uint64_t kTagIdLimit = std::uint64_t{1} << 31;
 
@@ -646,6 +736,12 @@ public:
   P29Serializer(Provider &provider, const Dictionary &dictionary)
       : provider_(provider), dictionary_(dictionary), matcher_({3, 1024, 22}) {}
 
+  P29Serializer(Provider &provider, const Dictionary &dictionary,
+                p29::OnlineS1::Config config,
+                p29::BlockCatalogue &catalogue)
+      : provider_(provider), dictionary_(dictionary),
+        matcher_(config, catalogue) {}
+
   [[nodiscard]] bool has_pending() const { return pending_.active; }
 
   [[nodiscard]] const std::vector<std::uint8_t> &captured_body() const {
@@ -658,13 +754,55 @@ public:
     return pending_.fill;
   }
 
+  [[nodiscard]] std::size_t root_reference_count() const {
+    require_pending();
+    return pending_.plan->root.size();
+  }
+
+  // Project the logical committed route state while the TU is still
+  // tentative. Callers enforce their hard route budget before exposing FILL,
+  // so a peer can never commit a successor that C later rejects for size.
+  [[nodiscard]] std::uint64_t pending_route_state_bytes() const {
+    require_pending();
+    const P29SenderRouteState &state = provider_.sender_route();
+    std::uint64_t result = p29_sender_route_state_bytes(state);
+    const auto add = [&result](std::uint64_t bytes) {
+      result = bytes > std::numeric_limits<std::uint64_t>::max() - result
+                   ? std::numeric_limits<std::uint64_t>::max()
+                   : result + bytes;
+    };
+    const auto multiply = [](std::uint64_t count,
+                             std::uint64_t width) noexcept {
+      return count != 0 &&
+                     width > std::numeric_limits<std::uint64_t>::max() / count
+                 ? std::numeric_limits<std::uint64_t>::max()
+                 : count * width;
+    };
+    for (const std::string &path : pending_.new_paths) {
+      add(sizeof(std::string) * 2 + sizeof(std::uint32_t));
+      add(multiply(path.size(), 2));
+    }
+    if (pending_.final_mixed_lines > state.mixed_lines.size())
+      add(multiply(pending_.final_mixed_lines - state.mixed_lines.size(),
+                   sizeof(P29MixedCLineState)));
+    if (pending_.final_known_regions > state.fknown_regions.size())
+      add(pending_.final_known_regions - state.fknown_regions.size());
+    if (pending_.final_known_blocks > state.fknown_blocks.size())
+      add(pending_.final_known_blocks - state.fknown_blocks.size());
+    return result;
+  }
+
   [[nodiscard]] std::vector<std::uint8_t>
   begin_tu(std::span<const std::uint32_t> regions) {
+#if defined(ICECC_P50SIM_ALLOCATION_COUNTER)
+    p29_wire_detail::P29AllocationScope allocation_scope(
+        p29_wire_detail::P29AllocationEntry::SenderBeginTu);
+#endif
     if (pending_.active)
       fail("P29 serializer already has a pending TU");
     if (control_encoder_.closed() || literal_encoder_.closed())
       fail("P29 serializer entropy stream is closed");
-    pending_ = {};
+    clear_pending();
     pending_.active = true;
     snapshot_base();
     try {
@@ -688,14 +826,18 @@ public:
     } catch (...) {
       if (matcher_.has_pending())
         matcher_.abort();
-      pending_ = {};
+      clear_pending();
       throw;
     }
   }
 
-  [[nodiscard]] std::vector<std::uint8_t>
+  [[nodiscard]] const std::vector<std::uint8_t> &
   answer_need(std::span<const std::uint8_t> need_frames,
               bool close_entropy = false) {
+#if defined(ICECC_P50SIM_ALLOCATION_COUNTER)
+    p29_wire_detail::P29AllocationScope allocation_scope(
+        p29_wire_detail::P29AllocationEntry::SenderAnswerNeed);
+#endif
     require_pending();
     if (pending_.fill_ready)
       fail("P29 serializer answered NEED twice");
@@ -712,6 +854,10 @@ public:
   }
 
   void commit() {
+#if defined(ICECC_P50SIM_ALLOCATION_COUNTER)
+    p29_wire_detail::P29AllocationScope allocation_scope(
+        p29_wire_detail::P29AllocationEntry::SenderCommit);
+#endif
     require_pending();
     if (!pending_.fill_ready)
       fail("P29 serializer commit precedes FILL");
@@ -753,16 +899,20 @@ public:
     state.known_block_count += pending_.known_blocks.size();
     ++state.revision;
     matcher_.commit();
-    pending_ = {};
+    clear_pending();
   }
 
   void abandon() {
+#if defined(ICECC_P50SIM_ALLOCATION_COUNTER)
+    p29_wire_detail::P29AllocationScope allocation_scope(
+        p29_wire_detail::P29AllocationEntry::SenderAbandon);
+#endif
     require_pending();
     if (matcher_.has_pending())
       matcher_.abort();
     control_encoder_.reset();
     literal_encoder_.reset();
-    pending_ = {};
+    clear_pending();
   }
 
   [[nodiscard]] const p29::BlockCatalogue &catalogue() const {
@@ -812,6 +962,45 @@ private:
   void require_pending() const {
     if (!pending_.active)
       fail("P29 serializer has no pending TU");
+  }
+
+  void clear_pending() noexcept {
+#if defined(ICECC_P29V1_MUTANT_NO_RETENTION)
+    pending_ = {};
+    return;
+#endif
+    pending_.active = false;
+    pending_.fill_ready = false;
+    pending_.close_entropy = false;
+    pending_.base_revision = 0;
+    pending_.base_paths = 0;
+    pending_.base_mixed_lines = 0;
+    pending_.base_known_regions = 0;
+    pending_.base_known_blocks = 0;
+    pending_.base_known_region_count = 0;
+    pending_.base_known_block_count = 0;
+    pending_.base_next_public = 1;
+    pending_.final_mixed_lines = 0;
+    pending_.final_known_regions = 0;
+    pending_.final_known_blocks = 0;
+    pending_.plan = nullptr;
+    pending_.required_regions.clear();
+    pending_.required_blocks.clear();
+    pending_.manifest_blocks.clear();
+    pending_.missing_regions.clear();
+    pending_.known_regions.clear();
+    pending_.known_blocks.clear();
+    pending_.new_paths.clear();
+    pending_.new_path_ids.clear();
+    pending_.line_changes.clear();
+    pending_.line_change_index.clear();
+    pending_.next_public = 1;
+    pending_.root_raw.clear();
+    pending_.control_raw.clear();
+    pending_.literal_raw.clear();
+    pending_.path_raw.clear();
+    pending_.body.clear();
+    pending_.fill.clear();
   }
 
   void snapshot_base() {
@@ -1023,7 +1212,8 @@ private:
         region_marker_ok =
             parse_marker(dictionary_.line(lines.front()), region_marker);
       P29SourceTextView region_source;
-      if (region_marker_ok && system_source_path(region_marker.path))
+      if (provider_.sender_route().system_source_reuse && region_marker_ok &&
+          system_source_path(region_marker.path))
         region_source = provider_.source_text(region_marker.path);
 
       std::uint32_t offset = 0;
@@ -1222,13 +1412,22 @@ public:
     return pending_.close;
   }
 
+  [[nodiscard]] std::size_t root_reference_count() const {
+    require_pending();
+    return pending_.root.size();
+  }
+
   [[nodiscard]] std::vector<std::uint8_t>
   receive_body(std::span<const std::uint8_t> body) {
+#if defined(ICECC_P50SIM_ALLOCATION_COUNTER)
+    p29_wire_detail::P29AllocationScope allocation_scope(
+        p29_wire_detail::P29AllocationEntry::ReceiverReceiveBody);
+#endif
     if (pending_.active)
       fail("P29 deserializer already has a pending TU");
     if (control_decoder_.closed() || literal_decoder_.closed())
       fail("P29 deserializer entropy stream is closed");
-    pending_ = {};
+    clear_pending();
     pending_.active = true;
     snapshot_base();
     try {
@@ -1236,13 +1435,17 @@ public:
       build_need();
       return pending_.need;
     } catch (...) {
-      pending_ = {};
+      clear_pending();
       throw;
     }
   }
 
   [[nodiscard]] std::span<const std::uint8_t>
   receive_fill(std::span<const std::uint8_t> fill, bool close_entropy = false) {
+#if defined(ICECC_P50SIM_ALLOCATION_COUNTER)
+    p29_wire_detail::P29AllocationScope allocation_scope(
+        p29_wire_detail::P29AllocationEntry::ReceiverReceiveFill);
+#endif
     require_pending();
     if (pending_.fill_ready)
       fail("P29 deserializer received FILL twice");
@@ -1253,13 +1456,77 @@ public:
     return pending_.materialized;
   }
 
+  [[nodiscard]] std::vector<std::uint8_t> take_materialized() {
+#if defined(ICECC_P50SIM_ALLOCATION_COUNTER)
+    p29_wire_detail::P29AllocationScope allocation_scope(
+        p29_wire_detail::P29AllocationEntry::ReceiverTakeMaterialized);
+#endif
+    require_pending();
+    if (!pending_.fill_ready)
+      fail("P29 materialization precedes FILL");
+    return std::move(pending_.materialized);
+  }
+
+#if defined(ICECC_P29V1_MUTANT_DOUBLE_MATERIALIZE)
+  struct MutantMaterialization {
+    std::vector<std::uint8_t> bytes;
+    std::vector<std::uint32_t> occurrences;
+  };
+
+  [[nodiscard]] MutantMaterialization rematerialize_for_mutant() const {
+    require_pending();
+    if (!pending_.fill_ready)
+      fail("P29 mutant rematerialization precedes FILL");
+    const P29WireLimits limits = provider_.wire_limits();
+    MutantMaterialization result;
+    result.bytes.reserve(pending_.materialized.size());
+    result.occurrences.reserve(pending_.occurrences.size());
+    const auto append_region = [&](std::uint32_t id) {
+      const auto bytes = region_bytes(id);
+      if (result.bytes.size() > limits.max_tu_bytes ||
+          bytes.size() > limits.max_tu_bytes - result.bytes.size() ||
+          bytes.size() > std::numeric_limits<std::size_t>::max() -
+                             result.bytes.size())
+        fail("P29 mutant materialized TU exceeds addressable size");
+      result.bytes.insert(result.bytes.end(), bytes.begin(), bytes.end());
+      result.occurrences.push_back(id);
+    };
+    for (const RootReference &reference : pending_.root) {
+      if (!reference.block) {
+        append_region(reference.id);
+      } else {
+        for (std::uint32_t child : block_children(reference.id))
+          append_region(child);
+      }
+    }
+    return result;
+  }
+
+  [[nodiscard]] std::size_t mutant_occurrence_count() const {
+    require_pending();
+    return pending_.occurrences.size();
+  }
+#endif
+
+  [[nodiscard]] std::span<const std::uint8_t> pending_segment() const {
+    require_pending();
+    if (!pending_.fill_ready)
+      fail("P29 segment observation precedes FILL");
+    return pending_.region_data;
+  }
+
   void commit() {
+#if defined(ICECC_P50SIM_ALLOCATION_COUNTER)
+    p29_wire_detail::P29AllocationScope allocation_scope(
+        p29_wire_detail::P29AllocationEntry::ReceiverCommit);
+#endif
     require_pending();
     if (!pending_.fill_ready)
       fail("P29 deserializer commit precedes FILL");
     P29ReceiverRouteState &state = provider_.receiver_route();
     if (state.revision != pending_.base_revision ||
         state.paths.size() != pending_.base_paths ||
+        state.path_ids.size() != pending_.base_paths ||
         state.region_segments.size() != pending_.base_region_segments ||
         state.regions.size() != pending_.base_regions ||
         state.public_lines.size() != pending_.base_public_lines ||
@@ -1277,6 +1544,19 @@ public:
       added_block_children += block.children.size();
     p29_wire_detail::reserve_geometric(
         state.paths, state.paths.size() + pending_.new_paths.size());
+    state.path_ids.reserve(state.path_ids.size() + pending_.new_paths.size());
+    std::unordered_map<std::string, std::uint32_t> staged_path_ids;
+    staged_path_ids.reserve(pending_.new_paths.size());
+    for (std::size_t index = 0; index < pending_.new_paths.size(); ++index) {
+      const std::size_t wide_id = state.paths.size() + index;
+      if (wide_id > std::numeric_limits<std::uint32_t>::max() ||
+          state.path_ids.contains(pending_.new_paths[index]) ||
+          !staged_path_ids
+               .emplace(pending_.new_paths[index],
+                        static_cast<std::uint32_t>(wide_id))
+               .second)
+        fail("P29 receiver Path index conflicts");
+    }
     p29_wire_detail::reserve_geometric(state.region_segments,
                                        state.region_segments.size() + 1);
     p29_wire_detail::reserve_geometric(state.public_lines,
@@ -1318,6 +1598,9 @@ public:
       throw;
     }
 
+    state.path_ids.merge(staged_path_ids);
+    if (!staged_path_ids.empty())
+      fail("P29 receiver Path index redo conflicts");
     for (std::string &path : pending_.new_paths)
       state.paths.push_back(std::move(path));
     if (state.regions.size() < region_slots)
@@ -1347,14 +1630,18 @@ public:
     state.known_region_count += pending_.regions.size();
     state.known_block_count += pending_.blocks.size();
     ++state.revision;
-    pending_ = {};
+    clear_pending();
   }
 
   void abandon() {
+#if defined(ICECC_P50SIM_ALLOCATION_COUNTER)
+    p29_wire_detail::P29AllocationScope allocation_scope(
+        p29_wire_detail::P29AllocationEntry::ReceiverAbandon);
+#endif
     require_pending();
     control_decoder_.reset();
     literal_decoder_.reset();
-    pending_ = {};
+    clear_pending();
   }
 
 private:
@@ -1395,6 +1682,7 @@ private:
     std::vector<StagedBlock> blocks;
     std::unordered_map<std::uint32_t, std::size_t> block_index;
     std::vector<std::string> new_paths;
+    std::unordered_map<std::string, std::uint32_t> new_path_ids;
     std::vector<StagedRegion> regions;
     std::vector<std::uint8_t> region_data;
     std::unordered_map<std::uint32_t, std::size_t> region_index;
@@ -1414,8 +1702,46 @@ private:
       fail("P29 deserializer has no pending TU");
   }
 
+  void clear_pending() noexcept {
+#if defined(ICECC_P29V1_MUTANT_NO_RETENTION)
+    pending_ = {};
+    return;
+#endif
+    pending_.active = false;
+    pending_.fill_ready = false;
+    pending_.close_entropy = false;
+    pending_.base_revision = 0;
+    pending_.base_paths = 0;
+    pending_.base_region_segments = 0;
+    pending_.base_regions = 0;
+    pending_.base_public_lines = 0;
+    pending_.base_blocks = 0;
+    pending_.base_block_children = 0;
+    pending_.base_occurrences = 0;
+    pending_.base_known_region_count = 0;
+    pending_.base_known_block_count = 0;
+    pending_.root.clear();
+    pending_.required_regions.clear();
+    pending_.required_blocks.clear();
+    pending_.missing_regions.clear();
+    pending_.blocks.clear();
+    pending_.block_index.clear();
+    pending_.new_paths.clear();
+    pending_.new_path_ids.clear();
+    pending_.regions.clear();
+    pending_.region_data.clear();
+    pending_.region_index.clear();
+    pending_.public_lines.clear();
+    pending_.occurrences.clear();
+    pending_.need.clear();
+    pending_.close.clear();
+    pending_.materialized.clear();
+  }
+
   void snapshot_base() {
     const P29ReceiverRouteState &state = provider_.receiver_route();
+    if (state.path_ids.size() != state.paths.size())
+      fail("P29 receiver Path index differs from its arena");
     pending_.base_revision = state.revision;
     pending_.base_paths = state.paths.size();
     pending_.base_region_segments = state.region_segments.size();
@@ -1603,7 +1929,8 @@ private:
     const std::vector<std::uint8_t> raw =
         messages_.decode(encoded, provider_.wire_limits().max_tu_bytes);
     Cursor cursor(raw);
-    const auto &committed = provider_.receiver_route().paths;
+    const P29ReceiverRouteState &state = provider_.receiver_route();
+    const auto &committed = state.paths;
     while (!cursor.empty()) {
       const std::uint64_t length = cursor.varint();
       if (length > cursor.remaining())
@@ -1613,9 +1940,12 @@ private:
       std::string path(bytes.size(), '\0');
       if (!bytes.empty())
         std::memcpy(path.data(), bytes.data(), bytes.size());
-      if (std::find(committed.begin(), committed.end(), path) !=
-              committed.end() ||
-          std::find(paths.begin(), paths.end(), path) != paths.end())
+      const std::size_t wide_id = committed.size() + paths.size();
+      if (state.path_ids.contains(path) ||
+          wide_id > std::numeric_limits<std::uint32_t>::max() ||
+          !pending_.new_path_ids
+               .emplace(path, static_cast<std::uint32_t>(wide_id))
+               .second)
         fail("P29 PATHDEF redefines a Path");
       if (committed.size() + paths.size() >= provider_.wire_limits().max_paths)
         fail("P29 Path space exceeds provider limit");
@@ -1806,6 +2136,8 @@ private:
           pending_.region_data.insert(pending_.region_data.end(),
                                       marker.begin(), marker.end());
         } else if (opcode == 5) {
+          if (!provider_.receiver_route().system_source_reuse)
+            fail("P29 system-source reuse was not negotiated");
           const std::string_view source_path = path(control.varint());
           const std::uint64_t line_id = control.varint();
           if (!system_source_path(source_path) ||
@@ -1825,6 +2157,8 @@ private:
             pending_.region_data.insert(pending_.region_data.end(),
                                         bytes.begin(), bytes.end());
         } else if (opcode == 6) {
+          if (!provider_.receiver_route().system_source_reuse)
+            fail("P29 system-source reuse was not negotiated");
           const std::string_view source_path = path(control.varint());
           const std::uint64_t line_id = control.varint();
           const std::uint64_t prefix = control.varint();
@@ -1879,31 +2213,37 @@ private:
 
   void materialize() {
     const P29WireLimits limits = provider_.wire_limits();
-    auto append_region = [&](std::uint32_t id) {
+    auto append_region = [&](std::vector<std::uint8_t> &output,
+                             bool record_occurrence, std::uint32_t id) {
       const auto bytes = region_bytes(id);
-      if (pending_.materialized.size() > limits.max_tu_bytes ||
-          bytes.size() > limits.max_tu_bytes - pending_.materialized.size() ||
+      if (output.size() > limits.max_tu_bytes ||
+          bytes.size() > limits.max_tu_bytes - output.size() ||
           bytes.size() > std::numeric_limits<std::size_t>::max() -
-                             pending_.materialized.size())
+                             output.size())
         fail("P29 materialized TU exceeds addressable size");
       if (!bytes.empty())
-        pending_.materialized.insert(pending_.materialized.end(), bytes.begin(),
-                                     bytes.end());
-      if (provider_.receiver_route().occurrences.size() +
-              pending_.occurrences.size() >=
-          limits.max_occurrences)
-        fail("P29 occurrence stream exceeds provider limit");
-      pending_.occurrences.push_back(id);
-    };
-    for (const RootReference &reference : pending_.root) {
-      if (!reference.block) {
-        append_region(reference.id);
-      } else {
-        const auto children = block_children(reference.id);
-        for (std::uint32_t child : children)
-          append_region(child);
+        output.insert(output.end(), bytes.begin(), bytes.end());
+      if (record_occurrence) {
+        if (provider_.receiver_route().occurrences.size() +
+                pending_.occurrences.size() >=
+            limits.max_occurrences)
+          fail("P29 occurrence stream exceeds provider limit");
+        pending_.occurrences.push_back(id);
       }
-    }
+    };
+    const auto assemble = [&](std::vector<std::uint8_t> &output,
+                              bool record_occurrences) {
+      for (const RootReference &reference : pending_.root) {
+        if (!reference.block) {
+          append_region(output, record_occurrences, reference.id);
+        } else {
+          const auto children = block_children(reference.id);
+          for (std::uint32_t child : children)
+            append_region(output, record_occurrences, child);
+        }
+      }
+    };
+    assemble(pending_.materialized, true);
   }
 
   void parse_fill(std::span<const std::uint8_t> fill, bool close_entropy) {
@@ -1959,6 +2299,8 @@ private:
       literal_decoder_.close_without_frame();
     decode_regions(control_raw, literal_raw);
     materialize();
+    if (pending_.region_data.size() > pending_.materialized.size())
+      fail("P29 staged Region segment exceeds materialized TU");
   }
 
   Provider &provider_;

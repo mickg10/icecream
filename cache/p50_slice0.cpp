@@ -1,15 +1,32 @@
 #include "p50_slice0.h"
 #include "p50_p29_residual.h"
+#include "codec/p29_intern.h"
+#include "codec/p29_wire.h"
 #include "capability/grouprlz/alpha_line_codec.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
+#include <cerrno>
+#include <condition_variable>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <system_error>
+#include <thread>
+#include <tuple>
 #include <utility>
+
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace icecc::p50 {
 namespace {
@@ -444,7 +461,674 @@ bool same_commit(const TxCommit& commit, const CActiveTx& active) {
 
 bool same_begin(const TxBegin& left, const TxBegin& right) { return left == right; }
 
+struct P29CachedSourceText {
+    bool attempted = false;
+    bool available = false;
+    std::vector<uint8_t> bytes;
+    std::vector<uint32_t> offsets;
+};
+
+class P29SourceTextCache {
+public:
+    codec::P29SourceTextView get(std::string_view path) {
+        auto position = sources_.find(path);
+        bool inserted = false;
+        if (position == sources_.end()) {
+            auto result = sources_.try_emplace(std::string(path));
+            position = result.first;
+            inserted = result.second;
+        }
+        P29CachedSourceText& source = position->second;
+        if (inserted || !source.attempted)
+            load(position->first, source);
+        return {source.available, source.bytes, source.offsets};
+    }
+
+private:
+    static void load(const std::string& path, P29CachedSourceText& source) {
+        source.attempted = true;
+        source.offsets.assign(1, 0);
+        if (!codec::p29_wire_detail::system_source_path(path))
+            return;
+        std::error_code error;
+        const uintmax_t wide_size = std::filesystem::file_size(path, error);
+        if (error || wide_size > std::numeric_limits<uint32_t>::max())
+            return;
+        const size_t size = static_cast<size_t>(wide_size);
+        std::ifstream input(path, std::ios::binary);
+        if (!input)
+            return;
+        source.bytes.resize(size);
+        if (size != 0 &&
+            !input.read(reinterpret_cast<char*>(source.bytes.data()),
+                        static_cast<std::streamsize>(size))) {
+            source.bytes.clear();
+            return;
+        }
+        source.offsets.reserve(size / 32 + 2);
+        for (size_t index = 0; index < source.bytes.size(); ++index)
+            if (source.bytes[index] == '\n')
+                source.offsets.push_back(static_cast<uint32_t>(index + 1));
+        if (source.offsets.back() != source.bytes.size())
+            source.offsets.push_back(static_cast<uint32_t>(source.bytes.size()));
+        source.available = true;
+    }
+
+    std::map<std::string, P29CachedSourceText, std::less<>> sources_;
+};
+
+Digest128 hash_regular_file(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input)
+        throw std::runtime_error("cannot open P29 system source");
+    Digest128Builder digest;
+    std::array<uint8_t, 64 * 1024> buffer{};
+    while (input) {
+        input.read(reinterpret_cast<char*>(buffer.data()), buffer.size());
+        const std::streamsize count = input.gcount();
+        if (count > 0)
+            digest.append(std::span<const uint8_t>(
+                buffer.data(), static_cast<size_t>(count)));
+    }
+    if (!input.eof())
+        throw std::runtime_error("cannot read P29 system source");
+    return digest.finish();
+}
+
+struct P29FingerprintFile {
+    std::string path;
+    uint64_t size = 0;
+    int64_t mtime_ns = 0;
+    Digest128 digest{};
+};
+
+using P29FingerprintCacheKey =
+    std::tuple<std::string, uint64_t, int64_t>;
+using P29FingerprintCache =
+    std::map<P29FingerprintCacheKey, Digest128>;
+
+constexpr std::string_view kP29FingerprintCacheMagic =
+    "ICECC-P29-SYSTEM-SOURCE-CACHE-V1";
+constexpr std::string_view kP29FingerprintCacheFile =
+    "p29-system-source-fingerprint-v1.cache";
+constexpr std::string_view kP29FingerprintLockFile =
+    "p29-system-source-fingerprint-v1.lock";
+constexpr uint64_t kP29FingerprintMaximumCacheBytes = uint64_t{128} << 20;
+constexpr uint64_t kP29FingerprintMaximumCacheEntries = uint64_t{1} << 20;
+constexpr uint64_t kP29FingerprintMaximumPathBytes = uint64_t{1} << 20;
+
+struct P29OwnedFd {
+    int value = -1;
+    ~P29OwnedFd() {
+        if (value >= 0)
+            (void)::close(value);
+    }
+    P29OwnedFd() = default;
+    explicit P29OwnedFd(int fd) : value(fd) {}
+    P29OwnedFd(const P29OwnedFd&) = delete;
+    P29OwnedFd& operator=(const P29OwnedFd&) = delete;
+    P29OwnedFd(P29OwnedFd&& other) noexcept : value(other.value) {
+        other.value = -1;
+    }
+    P29OwnedFd& operator=(P29OwnedFd&& other) noexcept {
+        if (this != &other) {
+            if (value >= 0)
+                (void)::close(value);
+            value = other.value;
+            other.value = -1;
+        }
+        return *this;
+    }
+};
+
+struct P29CacheLock {
+    P29OwnedFd directory;
+    P29OwnedFd lock;
+
+    ~P29CacheLock() {
+        if (lock.value >= 0)
+            (void)::flock(lock.value, LOCK_UN);
+    }
+
+    P29CacheLock() = default;
+    P29CacheLock(const P29CacheLock&) = delete;
+    P29CacheLock& operator=(const P29CacheLock&) = delete;
+    P29CacheLock(P29CacheLock&&) noexcept = default;
+    P29CacheLock& operator=(P29CacheLock&&) noexcept = default;
+
+    [[nodiscard]] bool valid() const noexcept {
+        return directory.value >= 0 && lock.value >= 0;
+    }
+};
+
+void append_u64(std::vector<uint8_t>& output, uint64_t value) {
+    for (unsigned shift = 0; shift != 64; shift += 8)
+        output.push_back(static_cast<uint8_t>(value >> shift));
+}
+
+bool consume_u64(std::span<const uint8_t> input, size_t& cursor,
+                 uint64_t& value) noexcept {
+    if (input.size() - cursor < 8)
+        return false;
+    value = 0;
+    for (unsigned shift = 0; shift != 64; shift += 8)
+        value |= static_cast<uint64_t>(input[cursor++]) << shift;
+    return true;
+}
+
+P29FingerprintFile inspect_p29_source_file(const std::string& path) {
+    struct stat info {};
+    if (::stat(path.c_str(), &info) != 0 || !S_ISREG(info.st_mode) ||
+        info.st_size < 0)
+        throw std::runtime_error("cannot stat P29 system source");
+#if defined(__APPLE__)
+    const auto seconds = info.st_mtimespec.tv_sec;
+    const auto nanoseconds = info.st_mtimespec.tv_nsec;
+#else
+    const auto seconds = info.st_mtim.tv_sec;
+    const auto nanoseconds = info.st_mtim.tv_nsec;
+#endif
+    if (seconds < 0 || nanoseconds < 0 || nanoseconds >= 1000000000L ||
+        static_cast<uint64_t>(seconds) >
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) /
+                UINT64_C(1000000000))
+        throw std::runtime_error("P29 system source timestamp is invalid");
+    return P29FingerprintFile{
+        path, static_cast<uint64_t>(info.st_size),
+        static_cast<int64_t>(seconds) * INT64_C(1000000000) +
+            static_cast<int64_t>(nanoseconds),
+        {}};
+}
+
+std::vector<P29FingerprintFile> enumerate_p29_system_sources() {
+    namespace fs = std::filesystem;
+    static constexpr std::array<std::string_view, 3> roots{
+        "/usr/include/", "/usr/lib/gcc/", "/usr/local/include/"};
+    std::vector<P29FingerprintFile> files;
+    for (const std::string_view root : roots) {
+        std::error_code error;
+        if (!fs::exists(root, error)) {
+            if (error)
+                throw std::runtime_error("cannot inspect P29 system source root");
+            continue;
+        }
+        fs::recursive_directory_iterator current(
+            fs::path(root), fs::directory_options::skip_permission_denied, error);
+        const fs::recursive_directory_iterator end;
+        if (error)
+            throw std::runtime_error("cannot enumerate P29 system source root");
+        while (current != end) {
+            const fs::directory_entry entry = *current;
+            const bool regular = entry.is_regular_file(error);
+            if (error)
+                throw std::runtime_error("cannot stat P29 system source");
+            if (regular) {
+                const std::string path =
+                    entry.path().lexically_normal().generic_string();
+                files.push_back(inspect_p29_source_file(path));
+            }
+            current.increment(error);
+            if (error)
+                throw std::runtime_error("cannot enumerate P29 system source root");
+        }
+    }
+    std::sort(files.begin(), files.end(),
+              [](const P29FingerprintFile& left,
+                 const P29FingerprintFile& right) {
+                  return left.path < right.path;
+              });
+    files.erase(std::unique(files.begin(), files.end(),
+                            [](const P29FingerprintFile& left,
+                               const P29FingerprintFile& right) {
+                                return left.path == right.path;
+                            }),
+                files.end());
+    return files;
+}
+
+P29CacheLock lock_p29_fingerprint_cache(
+    const std::string& cache_directory) noexcept {
+    P29CacheLock result;
+    if (cache_directory.empty() || cache_directory.front() != '/' ||
+        cache_directory.find('\0') != std::string::npos)
+        return result;
+    result.directory.value = ::open(
+        cache_directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (result.directory.value < 0)
+        return result;
+    result.lock.value = ::openat(
+        result.directory.value, std::string(kP29FingerprintLockFile).c_str(),
+        O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (result.lock.value < 0)
+        return result;
+    if (::flock(result.lock.value, LOCK_EX) != 0) {
+        (void)::close(result.lock.value);
+        result.lock.value = -1;
+        return result;
+    }
+    return result;
+}
+
+std::vector<uint8_t> read_p29_cache_bytes(int directory_fd) {
+    P29OwnedFd input(::openat(
+        directory_fd, std::string(kP29FingerprintCacheFile).c_str(),
+        O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+    if (input.value < 0)
+        return {};
+    struct stat info {};
+    if (::fstat(input.value, &info) != 0 || !S_ISREG(info.st_mode) ||
+        info.st_size < 0 ||
+        static_cast<uint64_t>(info.st_size) >
+            kP29FingerprintMaximumCacheBytes)
+        return {};
+    std::vector<uint8_t> bytes(static_cast<size_t>(info.st_size));
+    size_t offset = 0;
+    while (offset != bytes.size()) {
+        const ssize_t count = ::pread(input.value, bytes.data() + offset,
+                                      bytes.size() - offset,
+                                      static_cast<off_t>(offset));
+        if (count > 0) {
+            offset += static_cast<size_t>(count);
+            continue;
+        }
+        if (count < 0 && errno == EINTR)
+            continue;
+        return {};
+    }
+    return bytes;
+}
+
+P29FingerprintCache read_p29_fingerprint_cache(int directory_fd) {
+    const std::vector<uint8_t> bytes = read_p29_cache_bytes(directory_fd);
+    const std::span<const uint8_t> input(bytes);
+    if (input.size() < kP29FingerprintCacheMagic.size() + 8 ||
+        !std::equal(kP29FingerprintCacheMagic.begin(),
+                    kP29FingerprintCacheMagic.end(), input.begin()))
+        return {};
+    size_t cursor = kP29FingerprintCacheMagic.size();
+    uint64_t count = 0;
+    if (!consume_u64(input, cursor, count) ||
+        count > kP29FingerprintMaximumCacheEntries)
+        return {};
+    P29FingerprintCache result;
+    for (uint64_t index = 0; index != count; ++index) {
+        uint64_t path_bytes = 0;
+        uint64_t size = 0;
+        uint64_t encoded_mtime = 0;
+        if (!consume_u64(input, cursor, path_bytes) ||
+            !consume_u64(input, cursor, size) ||
+            !consume_u64(input, cursor, encoded_mtime) ||
+            path_bytes > kP29FingerprintMaximumPathBytes ||
+            input.size() - cursor < Digest128{}.bytes.size() ||
+            input.size() - cursor - Digest128{}.bytes.size() < path_bytes)
+            return {};
+        Digest128 digest{};
+        std::copy_n(input.begin() + static_cast<std::ptrdiff_t>(cursor),
+                    digest.bytes.size(), digest.bytes.begin());
+        cursor += digest.bytes.size();
+        std::string path(
+            reinterpret_cast<const char*>(input.data() + cursor),
+            static_cast<size_t>(path_bytes));
+        cursor += static_cast<size_t>(path_bytes);
+        if (!result.emplace(P29FingerprintCacheKey{
+                                std::move(path), size,
+                                static_cast<int64_t>(encoded_mtime)},
+                            digest)
+                 .second)
+            return {};
+    }
+    return cursor == input.size() ? result : P29FingerprintCache{};
+}
+
+bool write_all(int fd, std::span<const uint8_t> bytes) noexcept {
+    size_t offset = 0;
+    while (offset != bytes.size()) {
+        const ssize_t count =
+            ::write(fd, bytes.data() + offset, bytes.size() - offset);
+        if (count > 0) {
+            offset += static_cast<size_t>(count);
+            continue;
+        }
+        if (count < 0 && errno == EINTR)
+            continue;
+        return false;
+    }
+    return true;
+}
+
+void persist_p29_fingerprint_cache(
+    int directory_fd, const std::vector<P29FingerprintFile>& files) noexcept {
+    try {
+        std::vector<uint8_t> bytes;
+        size_t estimate = kP29FingerprintCacheMagic.size() + 8;
+        for (const P29FingerprintFile& file : files) {
+            if (file.path.size() > kP29FingerprintMaximumPathBytes ||
+                estimate > kP29FingerprintMaximumCacheBytes - 40 -
+                               file.path.size())
+                return;
+            estimate += 40 + file.path.size();
+        }
+        bytes.reserve(estimate);
+        bytes.insert(bytes.end(), kP29FingerprintCacheMagic.begin(),
+                     kP29FingerprintCacheMagic.end());
+        append_u64(bytes, files.size());
+        for (const P29FingerprintFile& file : files) {
+            append_u64(bytes, file.path.size());
+            append_u64(bytes, file.size);
+            append_u64(bytes, static_cast<uint64_t>(file.mtime_ns));
+            bytes.insert(bytes.end(), file.digest.bytes.begin(),
+                         file.digest.bytes.end());
+            bytes.insert(bytes.end(), file.path.begin(), file.path.end());
+        }
+
+        static std::atomic<uint64_t> next_temporary{1};
+        std::string temporary;
+        P29OwnedFd output;
+        for (unsigned attempt = 0; attempt != 8 && output.value < 0; ++attempt) {
+            temporary = ".p29-system-source-fingerprint-v1.tmp." +
+                        std::to_string(static_cast<long long>(::getpid())) + "." +
+                        std::to_string(next_temporary.fetch_add(
+                            1, std::memory_order_relaxed));
+            output.value = ::openat(
+                directory_fd, temporary.c_str(),
+                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+        }
+        if (output.value < 0)
+            return;
+        if (!write_all(output.value, bytes) || ::fsync(output.value) != 0) {
+            (void)::unlinkat(directory_fd, temporary.c_str(), 0);
+            return;
+        }
+        if (::close(output.value) != 0) {
+            output.value = -1;
+            (void)::unlinkat(directory_fd, temporary.c_str(), 0);
+            return;
+        }
+        output.value = -1;
+        if (::renameat(directory_fd, temporary.c_str(), directory_fd,
+                       std::string(kP29FingerprintCacheFile).c_str()) != 0) {
+            (void)::unlinkat(directory_fd, temporary.c_str(), 0);
+            return;
+        }
+        (void)::fsync(directory_fd);
+    } catch (...) {
+    }
+}
+
+Digest128 compute_p29_system_source_fingerprint(
+    const std::string& cache_directory) {
+    P29CacheLock cache_lock =
+        lock_p29_fingerprint_cache(cache_directory);
+    const P29FingerprintCache cache =
+        cache_lock.valid()
+            ? read_p29_fingerprint_cache(cache_lock.directory.value)
+            : P29FingerprintCache{};
+    std::vector<P29FingerprintFile> files = enumerate_p29_system_sources();
+    if (files.empty())
+        return {};
+    for (P29FingerprintFile& file : files) {
+        bool stable = false;
+        for (unsigned attempt = 0; attempt != 2 && !stable; ++attempt) {
+            const auto position = cache.find(P29FingerprintCacheKey{
+                file.path, file.size, file.mtime_ns});
+            file.digest = position == cache.end()
+                              ? hash_regular_file(file.path)
+                              : position->second;
+            const P29FingerprintFile verified =
+                inspect_p29_source_file(file.path);
+            stable = verified.size == file.size &&
+                     verified.mtime_ns == file.mtime_ns;
+            if (!stable) {
+                file.size = verified.size;
+                file.mtime_ns = verified.mtime_ns;
+            }
+        }
+        if (!stable)
+            throw std::runtime_error(
+                "P29 system source changed during fingerprinting");
+    }
+    Digest128Builder fingerprint;
+    fingerprint.append("ICECC-P29-SYSTEM-SOURCE-V1");
+    fingerprint.append_u64(files.size());
+    for (const P29FingerprintFile& file : files) {
+        fingerprint.append_u64(file.path.size());
+        fingerprint.append(file.path);
+        fingerprint.append_digest(file.digest);
+    }
+    Digest128 result = fingerprint.finish();
+    if (result == Digest128{})
+        result.bytes.back() = 1;
+    if (cache_lock.valid())
+        persist_p29_fingerprint_cache(cache_lock.directory.value, files);
+    return result;
+}
+
+class P29FingerprintState {
+public:
+    void start(std::string cache_directory) {
+        std::lock_guard lock(mutex_);
+        if (phase_ != Phase::Idle)
+            return;
+        phase_ = Phase::Running;
+        try {
+            std::thread([this, cache = std::move(cache_directory)] {
+                Digest128 result{};
+                try {
+                    result = compute_p29_system_source_fingerprint(cache);
+                } catch (...) {
+                }
+                {
+                    std::lock_guard publish(mutex_);
+                    fingerprint_ = result;
+                    phase_ = Phase::Ready;
+                }
+                ready_.notify_all();
+            }).detach();
+        } catch (...) {
+            fingerprint_ = {};
+            phase_ = Phase::Ready;
+            ready_.notify_all();
+        }
+    }
+
+    void wait() {
+        std::unique_lock lock(mutex_);
+        if (phase_ == Phase::Idle)
+            return;
+        ready_.wait(lock, [this] { return phase_ == Phase::Ready; });
+    }
+
+    [[nodiscard]] Digest128 snapshot() const {
+        std::lock_guard lock(mutex_);
+        return phase_ == Phase::Ready ? fingerprint_ : Digest128{};
+    }
+
+private:
+    enum class Phase { Idle, Running, Ready };
+    mutable std::mutex mutex_;
+    std::condition_variable ready_;
+    Phase phase_ = Phase::Idle;
+    Digest128 fingerprint_{};
+};
+
+P29FingerprintState& p29_fingerprint_state() {
+    // The worker is process-scoped and may still be finishing while static
+    // teardown begins.  Deliberately retain this tiny synchronization object
+    // until process exit so a detached worker never observes a dead owner.
+    static P29FingerprintState* state = new P29FingerprintState;
+    return *state;
+}
+
+class P29MmapInternProvider {
+public:
+    explicit P29MmapInternProvider(size_t budget) : budget_(budget) {}
+
+    [[noreturn]] static void fail(const char* reason) {
+        throw std::length_error(reason);
+    }
+
+    bool try_reserve_interner(size_t bytes) {
+        if (bytes > budget_ - reserved_)
+            return false;
+        reserved_ += bytes;
+        return true;
+    }
+
+    void* allocate_interner(codec::P29InternAllocation, size_t bytes, size_t) {
+        if (bytes > reserved_ - live_)
+            return nullptr;
+        void* result = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (result == MAP_FAILED)
+            return nullptr;
+#if defined(MADV_HUGEPAGE)
+        (void)::madvise(result, bytes, MADV_HUGEPAGE);
+#endif
+        live_ += bytes;
+        return result;
+    }
+
+    void deallocate_interner(codec::P29InternAllocation, void* pointer,
+                             size_t bytes, size_t) noexcept {
+        if (pointer != nullptr)
+            (void)::munmap(pointer, bytes);
+        live_ -= bytes;
+    }
+
+    void release_interner_reservation(size_t bytes) noexcept {
+        reserved_ -= bytes;
+    }
+
+    void report_interner_usage(size_t reserved, size_t committed) {
+        if (reserved != reserved_)
+            throw std::logic_error("P29 interner reservation accounting differs");
+        committed_ = committed;
+    }
+
+    void publish_line(uint32_t, std::span<const uint8_t>) {}
+    void publish_region(uint32_t, std::span<const uint32_t>) {}
+
+    [[nodiscard]] size_t reserved() const noexcept { return reserved_; }
+    [[nodiscard]] size_t committed() const noexcept { return committed_; }
+
+private:
+    size_t budget_ = 0;
+    size_t reserved_ = 0;
+    size_t live_ = 0;
+    size_t committed_ = 0;
+};
+
+static_assert(codec::P29InternProvider<P29MmapInternProvider>);
+
+class P29SenderProvider {
+public:
+    explicit P29SenderProvider(size_t max_tu_bytes) {
+        limits_.max_tu_bytes = max_tu_bytes;
+        limits_.max_region_bytes = max_tu_bytes;
+    }
+
+    [[noreturn]] static void fail(const char* reason) {
+        throw std::invalid_argument(reason);
+    }
+
+    codec::P29SenderRouteState& sender_route() { return route_; }
+    codec::P29SourceTextView source_text(std::string_view path) {
+        return sources_.get(path);
+    }
+    codec::P29WireLimits wire_limits() { return limits_; }
+
+private:
+    codec::P29SenderRouteState route_;
+    codec::P29WireLimits limits_;
+    P29SourceTextCache sources_;
+};
+
+static_assert(codec::P29SenderProvider<P29SenderProvider>);
+
+class P29ReceiverProvider {
+public:
+    explicit P29ReceiverProvider(size_t max_tu_bytes) {
+        limits_.max_tu_bytes = max_tu_bytes;
+        limits_.max_region_bytes = max_tu_bytes;
+    }
+
+    [[noreturn]] static void fail(const char* reason) {
+        throw std::invalid_argument(reason);
+    }
+
+    codec::P29ReceiverRouteState& receiver_route() { return route_; }
+    codec::P29SourceTextView source_text(std::string_view path) {
+        return sources_.get(path);
+    }
+    codec::P29WireLimits wire_limits() { return limits_; }
+
+    void begin_wire_publish() {
+        if (publishing_)
+            fail("P29 receiver publication is already active");
+        publishing_ = true;
+    }
+    void publish_wire_region(uint32_t, std::span<const uint8_t>) {
+        if (!publishing_)
+            fail("P29 receiver Region publication is inactive");
+    }
+    void publish_wire_block(uint32_t, std::span<const uint32_t>) {
+        if (!publishing_)
+            fail("P29 receiver Block publication is inactive");
+    }
+    void commit_wire_publish() {
+        if (!publishing_)
+            fail("P29 receiver publication is inactive");
+        publishing_ = false;
+    }
+    void abandon_wire_publish() noexcept { publishing_ = false; }
+
+private:
+    codec::P29ReceiverRouteState route_;
+    codec::P29WireLimits limits_;
+    P29SourceTextCache sources_;
+    bool publishing_ = false;
+};
+
+static_assert(codec::P29ReceiverProvider<P29ReceiverProvider>);
+
+uint64_t sender_route_bytes(const codec::P29SenderRouteState& state) noexcept {
+    return codec::p29_sender_route_state_bytes(state);
+}
+
+struct P29FRouteCodec {
+    explicit P29FRouteCodec(size_t max_tu_bytes)
+        : provider(max_tu_bytes), deserializer(provider) {}
+
+    P29ReceiverProvider provider;
+    codec::P29Deserializer<P29ReceiverProvider> deserializer;
+    std::optional<bool> fixed_system_source_reuse;
+    bool terminal = false;
+};
+
 }  // namespace
+
+void start_p29_system_source_fingerprint(
+    std::string cache_directory) noexcept {
+    try {
+        p29_fingerprint_state().start(std::move(cache_directory));
+    } catch (...) {
+    }
+}
+
+void wait_p29_system_source_fingerprint() noexcept {
+    try {
+        p29_fingerprint_state().wait();
+    } catch (...) {
+    }
+}
+
+Digest128 p29_system_source_fingerprint() noexcept {
+    try {
+        return p29_fingerprint_state().snapshot();
+    } catch (...) {
+        return {};
+    }
+}
 
 ImmutableObject ImmutableObject::bytes(Key64 key,
                                        std::span<const uint8_t> payload) {
@@ -774,6 +1458,24 @@ void GlobalResourceModel::begin_install(CStoreGuid c_store_guid, Key64 key,
     if (!space.live || !space.active || !key.valid() || bytes == 0 ||
         key.generation() != space.generation)
         throw std::logic_error("invalid global install identity");
+    size_t installing_objects = 0;
+    for (const auto& [unused_key, candidate] : space.objects) {
+        (void)unused_key;
+        if (candidate.state == GlobalObjectState::Installing)
+            ++installing_objects;
+    }
+    if (installing_objects >= 2)
+        throw std::length_error("namespace staging-object bound exceeded");
+    if (key.type() == ObjectType::P29Segment) {
+        const auto input_key = Key64::make(
+            ObjectType::Blob, key.generation(), key.ordinal());
+        const auto input = input_key ? space.objects.find(*input_key)
+                                     : space.objects.end();
+        if (input == space.objects.end() ||
+            input->second.state != GlobalObjectState::Installing)
+            throw std::logic_error(
+                "P29Segment install lacks same-TU Blob staging");
+    }
     auto& object = space.objects[key];
     if (object.state != GlobalObjectState::Absent || (!retry && object.attempts != 0) ||
         (retry && (!object.crashed || object.attempts != 1)))
@@ -803,6 +1505,67 @@ void GlobalResourceModel::begin_install(CStoreGuid c_store_guid, Key64 key,
     emit({retry ? GlobalActionType::ARENA_RETRY_INSTALLING : GlobalActionType::ARENA_INSTALLING,
           c_store_guid, {}, space.generation, key, static_cast<uint32_t>(slot), bytes, 0,
           content_digest});
+}
+
+void GlobalResourceModel::preflight_publish_pair(
+    CStoreGuid c_store_guid, Key64 segment_key, size_t segment_slot,
+    Digest128 segment_digest, Key64 input_key, size_t input_slot,
+    Digest128 input_digest) const {
+    const Namespace& space = require_namespace(c_store_guid);
+    if (!space.live || !space.active || segment_key == input_key ||
+        segment_slot == input_slot ||
+        segment_key.type() != ObjectType::P29Segment ||
+        input_key.type() != ObjectType::Blob ||
+        segment_key.generation() != input_key.generation() ||
+        segment_key.ordinal() != input_key.ordinal())
+        throw std::logic_error(
+            "global pair preflight does not identify one P29V1 TU");
+
+    const auto segment_position = space.objects.find(segment_key);
+    const auto input_position = space.objects.find(input_key);
+    if (segment_position == space.objects.end() ||
+        input_position == space.objects.end() ||
+        segment_position->second.state != GlobalObjectState::Installing ||
+        input_position->second.state != GlobalObjectState::Installing)
+        throw std::logic_error(
+            "global pair preflight requires two INSTALLING objects");
+    const Object& segment = segment_position->second;
+    const Object& input = input_position->second;
+    const auto segment_owner = slots_.find(segment_slot);
+    const auto input_owner = slots_.find(input_slot);
+    if (segment_owner == slots_.end() || input_owner == slots_.end() ||
+        segment_owner->second != std::pair{c_store_guid, segment_key} ||
+        input_owner->second != std::pair{c_store_guid, input_key})
+        throw std::logic_error(
+            "global pair preflight lost staging ownership");
+    if (segment.content_digest != segment_digest ||
+        input.content_digest != input_digest)
+        throw std::logic_error(
+            "global pair preflight observed changed content");
+
+    uint64_t addition = 0;
+    if (!checked_add(segment.bytes, input.bytes,
+                     std::numeric_limits<uint64_t>::max()))
+        throw std::length_error("global pair byte count overflows");
+    addition = segment.bytes + input.bytes;
+    uint64_t namespace_bytes = 0;
+    for (const auto& [unused, candidate] : space.objects) {
+        (void)unused;
+        if (candidate.state == GlobalObjectState::Present ||
+            candidate.state == GlobalObjectState::Pinned) {
+            if (!checked_add(namespace_bytes, candidate.bytes,
+                             std::numeric_limits<uint64_t>::max()))
+                throw std::length_error(
+                    "global namespace resident byte count overflows");
+            namespace_bytes += candidate.bytes;
+        }
+    }
+    if (!faults_.ignore_namespace_cap &&
+        !checked_add(namespace_bytes, addition, limits_.max_namespace_bytes))
+        throw std::length_error("global namespace byte cap exceeded");
+    if (!faults_.ignore_aggregate_cap &&
+        !checked_add(resident_bytes(), addition, limits_.max_aggregate_bytes))
+        throw std::length_error("global aggregate byte cap exceeded");
 }
 
 void GlobalResourceModel::publish(CStoreGuid c_store_guid, Key64 key, size_t slot,
@@ -965,17 +1728,31 @@ std::optional<std::string> GlobalResourceModel::check_invariants() const {
     std::map<size_t, std::pair<CStoreGuid, Key64>> reverse;
     for (const auto& [guid, space] : namespaces_) {
         uint64_t namespace_bytes = 0;
+        size_t installing_objects = 0;
         for (const auto& [key, object] : space->objects) {
             if (object.state == GlobalObjectState::Present || object.state == GlobalObjectState::Pinned)
                 namespace_bytes += object.bytes;
             if (object.state == GlobalObjectState::Installing) {
+                ++installing_objects;
                 if (!reverse.emplace(object.slot, std::pair{guid, key}).second)
                     return "multiple INSTALLING objects own one staging slot";
                 const auto owner = slots_.find(object.slot);
                 if (owner == slots_.end() || owner->second != std::pair{guid, key})
                     return "INSTALLING object does not own its staging slot";
+                if (key.type() == ObjectType::P29Segment) {
+                    const auto input_key = Key64::make(
+                        ObjectType::Blob, key.generation(), key.ordinal());
+                    const auto input =
+                        input_key ? space->objects.find(*input_key)
+                                  : space->objects.end();
+                    if (input == space->objects.end() ||
+                        input->second.state != GlobalObjectState::Installing)
+                        return "P29Segment INSTALLING object lacks same-TU Blob";
+                }
             }
         }
+        if (installing_objects > 2)
+            return "namespace has more than two staged objects";
         if (namespace_bytes > limits_.max_namespace_bytes) return "namespace byte cap exceeded";
     }
     if (reverse.size() != slots_.size()) return "staging slot has no INSTALLING owner";
@@ -1023,6 +1800,15 @@ std::optional<size_t> GlobalResourceModel::first_free_staging_slot() const {
     return std::nullopt;
 }
 
+bool GlobalResourceModel::install_retry_required(
+    CStoreGuid c_store_guid, Key64 key) const {
+    const Namespace& space = require_namespace(c_store_guid);
+    const auto position = space.objects.find(key);
+    return position != space.objects.end() &&
+           position->second.state == GlobalObjectState::Absent &&
+           position->second.crashed && position->second.attempts == 1;
+}
+
 void GlobalResourceModel::release(CStoreGuid c_store_guid, Key64 key) {
     Namespace& space = require_namespace(c_store_guid);
     const auto position = space.objects.find(key);
@@ -1044,11 +1830,120 @@ const ImmutableObject& CObjectArena::object(Key64 key) const {
     return *result;
 }
 
+struct CAuthority::P29V1State {
+    static codec::P29InternLayout select_layout(uint64_t budget) {
+        const codec::P29InternLayout firefox = codec::P29InternLayout::firefox();
+        if (codec::p29_interner_reservation(firefox) <= budget)
+            return firefox;
+        const codec::P29InternLayout probe = codec::P29InternLayout::probe();
+        if (codec::p29_interner_reservation(probe) <= budget)
+            return probe;
+        throw std::length_error("P29V1 interner budget admits no production layout");
+    }
+
+    P29V1State(uint64_t budget, uint64_t max_tu)
+        : provider(static_cast<size_t>(std::min<uint64_t>(
+              budget, std::numeric_limits<size_t>::max()))),
+          layout(select_layout(budget)), interner(provider, layout),
+          max_tu_bytes(max_tu) {}
+
+    P29MmapInternProvider provider;
+    codec::P29InternLayout layout;
+    codec::P29Interner<P29MmapInternProvider> interner;
+    uint64_t max_tu_bytes = 0;
+    bool runnable = true;
+};
+
 CAuthority::CAuthority(CStoreGuid guid, p29::OnlineS1::Config config,
                        uint16_t generation, uint64_t first_ordinal,
                        TuSeq first_tu_seq, Verification verification)
     : arena_(guid, generation, first_ordinal), s1_config_(config),
       next_tu_seq_(first_tu_seq.value), verification_(verification) {}
+
+CAuthority::~CAuthority() = default;
+
+void CAuthority::enable_p29v1(uint64_t max_interner_reserved_bytes,
+                              uint64_t max_tu_bytes) {
+    if (p29v1_)
+        throw std::logic_error("P29V1 interner was already enabled");
+    if (max_tu_bytes == 0 || max_tu_bytes > std::numeric_limits<size_t>::max())
+        throw std::length_error("P29V1 TU limit is not addressable");
+    p29v1_ = std::make_unique<P29V1State>(max_interner_reserved_bytes,
+                                         max_tu_bytes);
+}
+
+bool CAuthority::p29v1_runnable() const noexcept {
+    return p29v1_ && p29v1_->runnable;
+}
+
+uint64_t CAuthority::p29v1_interner_reserved_bytes() const noexcept {
+    return p29v1_ ? p29v1_->provider.reserved() : 0;
+}
+
+uint64_t CAuthority::p29v1_interner_committed_bytes() const noexcept {
+    return p29v1_ ? p29v1_->provider.committed() : 0;
+}
+
+PreparedTUPtr CAuthority::prepare_p29v1_at_seq(
+    std::span<const uint8_t> exact_input, TuSeq tu_seq) {
+    if (!p29v1_ || !p29v1_->runnable)
+        throw std::logic_error("P29V1 is not runnable until daemon restart");
+    if (exact_input.size() > p29v1_->max_tu_bytes)
+        throw std::length_error("P29V1 input exceeds its TU limit");
+    try {
+        auto prepared = std::make_shared<PreparedTU>();
+        prepared->dense_regions.reserve(exact_input.size() / 32 + 1);
+        p29v1_->interner.process(exact_input, prepared->dense_regions);
+#if defined(ICECC_P29V1_MUTANT_PER_LINE_OBJECTS)
+        // Deliberately restore the v0 per-Line object work.  Performance
+        // evidence must make this regression conspicuous without changing
+        // the P29V1 wire representation.
+        for (const uint32_t region_id : prepared->dense_regions) {
+            for (const uint32_t line_id :
+                 p29v1_->interner.region_lines(region_id)) {
+                (void)arena_.intern_bytes(
+                    ObjectType::Line, p29v1_->interner.line(line_id));
+            }
+        }
+#endif
+        Digest128Builder composed;
+        uint64_t total = 0;
+        for (const uint32_t id : prepared->dense_regions) {
+            const std::span<const uint8_t> region =
+                p29v1_->interner.region_bytes(id);
+            if (region.size() > std::numeric_limits<uint64_t>::max() - total)
+                throw std::overflow_error("P29V1 composed input exceeds u64");
+            total += region.size();
+            composed.append(region);
+        }
+        const Digest128 exact_digest = digest128(exact_input);
+        if (total != exact_input.size() || composed.finish() != exact_digest)
+            throw std::logic_error("P29V1 interner did not reproduce exact input");
+        if (verification_ == Verification::FullMaterialization) {
+            size_t offset = 0;
+            for (const uint32_t id : prepared->dense_regions) {
+                const std::span<const uint8_t> region =
+                    p29v1_->interner.region_bytes(id);
+                if (region.size() > exact_input.size() - offset ||
+                    !std::equal(region.begin(), region.end(),
+                                exact_input.begin() + static_cast<ptrdiff_t>(offset)))
+                    throw std::logic_error(
+                        "P29V1 interner materialization differs from exact input");
+                offset += region.size();
+            }
+            if (offset != exact_input.size())
+                throw std::logic_error(
+                    "P29V1 interner materialization length differs");
+        }
+        prepared->tu_seq = tu_seq;
+        prepared->raw_bytes = exact_input.size();
+        prepared->raw_digest = exact_digest;
+        return prepared;
+    } catch (...) {
+        p29v1_->runnable = false;
+        throw;
+    }
+}
 
 TuSeq CAuthority::reserve_tu_seq() const {
     if (tu_seq_exhausted_)
@@ -1229,6 +2124,23 @@ std::vector<uint8_t> CAuthority::materialize(
     return materialize_objects(objects, roots);
 }
 
+struct CRoute::P29V1State {
+    P29V1State(CAuthority& authority, uint64_t max_route_bytes)
+        : provider(static_cast<size_t>(authority.p29v1_->max_tu_bytes)),
+          serializer(provider, authority.p29v1_->interner,
+                     authority.s1_config(), authority.block_catalogue()),
+          max_route_state_bytes(max_route_bytes) {}
+
+    P29SenderProvider provider;
+    codec::P29Serializer<P29SenderProvider,
+                         codec::P29Interner<P29MmapInternProvider>> serializer;
+    std::optional<bool> fixed_system_source_reuse;
+    std::vector<uint8_t> answered_need;
+    uint64_t max_route_state_bytes = 0;
+    bool fill_answered = false;
+    bool terminal = false;
+};
+
 CRoute::CRoute(CAuthority& authority, FStoreGuid f_store_guid,
                HistoryNonce history_nonce, ActionTrace* trace)
     : authority_(authority), f_store_guid_(f_store_guid),
@@ -1239,6 +2151,10 @@ CRoute::CRoute(CAuthority& authority, FStoreGuid f_store_guid,
       trace_(trace) {}
 
 CRoute::~CRoute() = default;
+
+uint64_t CRoute::p29v1_route_state_bytes() const noexcept {
+    return p29v1_ ? sender_route_bytes(p29v1_->provider.sender_route()) : 0;
+}
 
 std::vector<uint8_t> CRoute::residual_input(const PreparedTUPtr& prepared) const {
     if (!prepared) throw std::invalid_argument("cannot inspect a null PreparedTU");
@@ -1317,6 +2233,62 @@ const CActiveTx& CRoute::begin(const PreparedTUPtr& prepared,
     return *active_;
 }
 
+const CActiveTx& CRoute::begin_v1(
+    const PreparedTUPtr& prepared, Digest128 system_source_fingerprint,
+    uint64_t max_route_state_bytes) {
+    if (!prepared)
+        throw std::invalid_argument("cannot route a null P29V1 PreparedTU");
+    if (active_)
+        throw std::logic_error("C route already has one ACTIVE_TX");
+    if (next_rel_seq_.value == std::numeric_limits<uint64_t>::max())
+        throw std::overflow_error("REL_SEQ space exhausted");
+    if (!authority_.p29v1_runnable())
+        throw std::logic_error("P29V1 is not runnable until daemon restart");
+    if (!p29v1_)
+        p29v1_ = std::make_unique<P29V1State>(authority_, max_route_state_bytes);
+    if (p29v1_->terminal)
+        throw std::logic_error("P29V1 route is not runnable until daemon restart");
+    if (p29v1_->max_route_state_bytes != max_route_state_bytes)
+        throw std::logic_error("P29V1 route-state limit changed");
+
+    try {
+        CActiveTx active;
+        active.prepared = prepared;
+        active.body = p29v1_->serializer.begin_tu(prepared->dense_regions);
+        active.region_count = prepared->dense_regions.size();
+        active.begin.history_nonce = history_nonce_;
+        active.begin.rel_seq = next_rel_seq_;
+        active.begin.tu_seq = prepared->tu_seq;
+        active.begin.profile = ProfileId::P29V1;
+        active.begin.p29_root_mode = P29RootMode::RouteHistory;
+        active.begin.pre_state_digest = state_digest_;
+        active.begin.dict = {kP29V1FingerprintDictEncoding, 0, 0,
+                             system_source_fingerprint};
+        active.begin.body = describe_component(
+            kP29WireV1BodyEncoding, active.body,
+            p29v1_->serializer.root_reference_count());
+        active.begin.raw_bytes = prepared->raw_bytes;
+        active.begin.raw_digest = prepared->raw_digest;
+        active.begin.transaction_digest = compute_transaction_digest(
+            active.begin, std::span<const uint8_t>{}, active.body);
+        active_ = std::move(active);
+        p29v1_->answered_need.clear();
+        p29v1_->fill_answered = false;
+        record(ActionType::TX_BEGIN, *active_);
+        return *active_;
+    } catch (...) {
+        if (p29v1_->serializer.has_pending()) {
+            try {
+                p29v1_->serializer.abandon();
+            } catch (...) {
+            }
+        }
+        p29v1_->terminal = true;
+        active_.reset();
+        throw;
+    }
+}
+
 std::vector<ImmutableObject> CRoute::build_fill(const Need& need) const {
     if (!active_) throw std::logic_error("C route has no ACTIVE_TX");
     if (need.history_nonce != active_->begin.history_nonce ||
@@ -1337,6 +2309,97 @@ std::vector<ImmutableObject> CRoute::build_fill(const Need& need) const {
         result.push_back(authority_.arena().object(key));
     }
     return result;
+}
+
+std::span<const uint8_t> CRoute::build_fill_v1(
+    uint64_t flags, std::span<const uint8_t> inner_need) {
+    if (!active_ || active_->begin.profile != ProfileId::P29V1 || !p29v1_ ||
+        p29v1_->terminal)
+        throw std::logic_error("C route has no runnable P29V1 ACTIVE_TX");
+    try {
+        if ((flags & ~kP29V1SystemSourceReuseFlag) != 0)
+            throw std::invalid_argument("P29V1 NEED flags are invalid");
+        if (inner_need.size() < 5 ||
+            inner_need[inner_need.size() - 5] !=
+                static_cast<uint8_t>(codec::P29WireKind::TuEnd) ||
+            std::any_of(inner_need.end() - 4, inner_need.end(),
+                        [](uint8_t value) { return value != 0; }))
+            throw std::invalid_argument("P29V1 NEED has no exact TU_END");
+        const bool reuse = (flags & kP29V1SystemSourceReuseFlag) != 0;
+        if (p29v1_->fixed_system_source_reuse &&
+            *p29v1_->fixed_system_source_reuse != reuse)
+            throw std::logic_error(
+                "P29V1 system-source reuse changed on the route");
+        if (!p29v1_->fixed_system_source_reuse)
+            p29v1_->fixed_system_source_reuse = reuse;
+
+        if (p29v1_->fill_answered) {
+            if (!std::equal(p29v1_->answered_need.begin(),
+                            p29v1_->answered_need.end(), inner_need.begin(),
+                            inner_need.end()))
+                throw std::logic_error("P29V1 replay NEED differs");
+            return p29v1_->serializer.captured_fill();
+        }
+        p29v1_->provider.sender_route().system_source_reuse = reuse;
+        const std::span<const uint8_t> codec_need =
+            inner_need.first(inner_need.size() - 5);
+        const std::vector<uint8_t>& fill =
+            p29v1_->serializer.answer_need(codec_need, false);
+        p29v1_->answered_need.assign(inner_need.begin(), inner_need.end());
+        p29v1_->fill_answered = true;
+        if (p29v1_->serializer.pending_route_state_bytes() >
+            p29v1_->max_route_state_bytes)
+            throw std::length_error("P29V1 route state exceeds its budget");
+        return fill;
+    } catch (...) {
+        if (p29v1_->serializer.has_pending()) {
+            try {
+                p29v1_->serializer.abandon();
+            } catch (...) {
+            }
+        }
+        p29v1_->terminal = true;
+        active_.reset();
+        throw;
+    }
+}
+
+void CRoute::restart_v1_for_transport_retry() {
+    if (!active_ || active_->begin.profile != ProfileId::P29V1 || !p29v1_ ||
+        p29v1_->terminal)
+        throw std::logic_error(
+            "C route has no runnable P29V1 transaction to retry");
+    try {
+        if (p29v1_->serializer.has_pending())
+            p29v1_->serializer.abandon();
+        const std::vector<uint8_t> body =
+            p29v1_->serializer.begin_tu(active_->prepared->dense_regions);
+        if (body != active_->body ||
+            p29v1_->serializer.root_reference_count() !=
+                active_->begin.body.decoded_bytes)
+            throw std::logic_error(
+                "P29V1 transport retry changed the frozen BODY");
+        p29v1_->answered_need.clear();
+        p29v1_->fill_answered = false;
+    } catch (...) {
+        if (p29v1_->serializer.has_pending()) {
+            try {
+                p29v1_->serializer.abandon();
+            } catch (...) {
+            }
+        }
+        p29v1_->terminal = true;
+        active_.reset();
+        throw;
+    }
+}
+
+void CRoute::reset_v1_route(FStoreGuid f_store_guid,
+                            HistoryNonce history_nonce) {
+    if (!active_ || active_->begin.profile != ProfileId::P29V1)
+        throw std::logic_error(
+            "C route has no active P29V1 transaction to reset");
+    reset_history(f_store_guid, history_nonce);
 }
 
 void CRoute::record(ActionType action, const CActiveTx& active) {
@@ -1370,8 +2433,22 @@ void CRoute::accept_commit(const TxCommit& committed, ActionType action) {
         throw std::invalid_argument("invalid commit action");
     if (!same_commit(committed, *active_))
         throw std::logic_error("TX_COMMIT does not close C's ACTIVE_TX");
-    acknowledged_objects_.insert(active_->manifest.begin(), active_->manifest.end());
-    matcher_->commit();
+    if (active_->begin.profile == ProfileId::P29V1) {
+        if (!p29v1_ || p29v1_->terminal)
+            throw std::logic_error("P29V1 route cannot accept a commit");
+        try {
+            p29v1_->serializer.commit();
+            if (p29v1_route_state_bytes() > p29v1_->max_route_state_bytes)
+                throw std::logic_error(
+                    "P29V1 committed route state exceeded its preflight");
+        } catch (...) {
+            p29v1_->terminal = true;
+            throw;
+        }
+    } else {
+        acknowledged_objects_.insert(active_->manifest.begin(), active_->manifest.end());
+        matcher_->commit();
+    }
     state_digest_ = committed.post_state_digest;
     record(action, *active_);
     ++next_rel_seq_.value;
@@ -1381,7 +2458,12 @@ void CRoute::accept_commit(const TxCommit& committed, ActionType action) {
 void CRoute::abandon_active() {
     if (!active_) return;
     record(ActionType::TX_ABORTED, *active_);
-    matcher_->abort();
+    if (active_->begin.profile == ProfileId::P29V1) {
+        if (p29v1_ && p29v1_->serializer.has_pending())
+            p29v1_->serializer.abandon();
+    } else {
+        matcher_->abort();
+    }
     active_.reset();
 }
 
@@ -1396,6 +2478,7 @@ void CRoute::reset_history(FStoreGuid f_store_guid, HistoryNonce history_nonce) 
     acknowledged_objects_.clear();
     matcher_ = std::make_unique<p29::OnlineS1>(authority_.s1_config(),
                                                authority_.block_catalogue());
+    p29v1_.reset();
 }
 
 struct FStore::Namespace {
@@ -1415,6 +2498,10 @@ struct FStore::Namespace {
         std::set<Key64> remaining;
         FillStreamDecoder partial_fill;
         std::optional<std::vector<uint8_t>> materialized;
+        std::vector<uint8_t> p29v1_need;
+        std::vector<uint8_t> p29v1_fill;
+        Digest128 p29v1_segment_digest{};
+        bool p29v1_materialized = false;
     };
 
     struct Route {
@@ -1423,6 +2510,7 @@ struct FStore::Namespace {
         Digest128 state_digest{};
         std::optional<TxCommit> last_commit;
         std::optional<FPending> pending;
+        std::unique_ptr<P29FRouteCodec> p29v1;
     };
 
     bool established = false;
@@ -1431,13 +2519,35 @@ struct FStore::Namespace {
     std::optional<Route> route;
 };
 
-FStore::FStore(FStoreGuid guid, uint64_t first_session_serial, ActionTrace* trace)
-    : guid_(guid), next_session_serial_(first_session_serial), trace_(trace) {
+FStore::FStore(FStoreGuid guid, uint64_t first_session_serial, ActionTrace* trace,
+               uint64_t p29v1_max_tu_bytes,
+               Digest128 system_source_fingerprint)
+    : guid_(guid), next_session_serial_(first_session_serial), trace_(trace),
+      p29v1_max_tu_bytes_(p29v1_max_tu_bytes),
+      system_source_fingerprint_(system_source_fingerprint) {
     if (first_session_serial == 0)
         throw std::invalid_argument("first session serial must be nonzero");
+    if (p29v1_max_tu_bytes_ == 0 ||
+        p29v1_max_tu_bytes_ > std::numeric_limits<size_t>::max())
+        throw std::invalid_argument("P29V1 F-store TU limit is not addressable");
 }
 
 FStore::~FStore() = default;
+
+void FStore::abandon_pending(Namespace& space) noexcept {
+    if (!space.route || !space.route->pending)
+        return;
+    Namespace::Route& route = *space.route;
+    if (route.pending->begin.profile == ProfileId::P29V1 && route.p29v1 &&
+        route.p29v1->deserializer.has_pending()) {
+        try {
+            route.p29v1->deserializer.abandon();
+        } catch (...) {
+            route.p29v1->terminal = true;
+        }
+    }
+    route.pending.reset();
+}
 
 void FStore::record(ActionType action, SessionHandle session, const TxBegin* begin,
                     std::optional<Key64> key, Digest128 content_digest,
@@ -1485,7 +2595,7 @@ SessionHandle FStore::connect(CStoreGuid c_store_guid) {
     if (inserted) position->second = std::make_unique<Namespace>();
     Namespace& space = *position->second;
     const bool replaces = space.active_session_serial != 0;
-    if (space.route) space.route->pending.reset();
+    abandon_pending(space);
     space.active_session_serial = serial;
     const SessionHandle session{c_store_guid, guid_, serial};
     record(replaces ? ActionType::SESSION_REPLACED : ActionType::SESSION_OPENED,
@@ -1495,7 +2605,7 @@ SessionHandle FStore::connect(CStoreGuid c_store_guid) {
 
 void FStore::disconnect(SessionHandle session) {
     Namespace& space = require_namespace(session);
-    if (space.route) space.route->pending.reset();
+    abandon_pending(space);
     record(ActionType::SESSION_DISCONNECTED, session, nullptr);
     space.active_session_serial = 0;
 }
@@ -1537,14 +2647,24 @@ void FStore::begin(SessionHandle session, const TxBegin& begin, bool replay) {
     if (begin.history_nonce != route.history_nonce || begin.rel_seq != route.next_rel_seq ||
         begin.pre_state_digest != route.state_digest)
         throw std::logic_error("TX_BEGIN does not match F's route cursor");
-    if (begin.profile != ProfileId::P29 ||
-        (begin.p29_root_mode != P29RootMode::RouteHistory &&
-         begin.p29_root_mode != P29RootMode::HistoryIndependent))
+    const bool p29v1 = begin.profile == ProfileId::P29V1;
+    if (!p29v1 &&
+        (begin.profile != ProfileId::P29 ||
+         (begin.p29_root_mode != P29RootMode::RouteHistory &&
+          begin.p29_root_mode != P29RootMode::HistoryIndependent)))
         throw std::invalid_argument("TX_BEGIN profile/root mode is unsupported in M1");
-    if (begin.dict.encoding != kP29KeyVectorEncoding ||
-        (begin.body.encoding != kP29KeyVectorEncoding &&
-         begin.body.encoding != kP29ResidualBodyEncoding))
+    if (!p29v1 &&
+        (begin.dict.encoding != kP29KeyVectorEncoding ||
+         (begin.body.encoding != kP29KeyVectorEncoding &&
+          begin.body.encoding != kP29ResidualBodyEncoding)))
         throw std::invalid_argument("P29 DICT/BODY encoding is unsupported");
+    if (p29v1 &&
+        (begin.p29_root_mode != P29RootMode::RouteHistory ||
+         begin.dict.encoding != kP29V1FingerprintDictEncoding ||
+         begin.dict.encoded_bytes != 0 || begin.dict.decoded_bytes != 0 ||
+         begin.body.encoding != kP29WireV1BodyEncoding ||
+         begin.raw_bytes > p29v1_max_tu_bytes_))
+        throw std::invalid_argument("P29V1 TX_BEGIN descriptors are invalid");
     if (route.next_rel_seq.value == std::numeric_limits<uint64_t>::max())
         throw std::overflow_error("F REL_SEQ space exhausted");
     if (route.pending) {
@@ -1552,11 +2672,32 @@ void FStore::begin(SessionHandle session, const TxBegin& begin, bool replay) {
             throw std::logic_error("F route already has a different ACTIVE_TX");
         return;
     }
+    if (p29v1) {
+        if (!route.p29v1)
+            route.p29v1 = std::make_unique<P29FRouteCodec>(
+                static_cast<size_t>(p29v1_max_tu_bytes_));
+        if (route.p29v1->terminal)
+            throw std::logic_error("P29V1 receiver is terminal until route reset");
+        const bool reuse = begin.dict.digest != Digest128{} &&
+                           begin.dict.digest == system_source_fingerprint_;
+        if (route.p29v1->fixed_system_source_reuse &&
+            *route.p29v1->fixed_system_source_reuse != reuse) {
+            route.p29v1->terminal = true;
+            throw std::logic_error("P29V1 system-source reuse changed on the route");
+        }
+        if (!route.p29v1->fixed_system_source_reuse)
+            route.p29v1->fixed_system_source_reuse = reuse;
+        route.p29v1->provider.receiver_route().system_source_reuse = reuse;
+    }
     route.pending.emplace(begin);
     record(replay ? ActionType::ACTIVE_REPLAYED : ActionType::TX_BEGIN,
            session, &begin);
-    if (begin.dict.encoded_bytes == 0)
+    if (p29v1) {
+        route.pending->dict_complete = true;
+        record(ActionType::DICT_COMPLETE, session, &begin);
+    } else if (begin.dict.encoded_bytes == 0) {
         append_component(session, true, std::span<const uint8_t>{});
+    }
     if (begin.body.encoded_bytes == 0)
         append_component(session, false, std::span<const uint8_t>{});
 }
@@ -1581,6 +2722,39 @@ void FStore::append_component(SessionHandle session, bool dict,
     if (digest128(target) != descriptor.digest)
         throw std::logic_error("component digest does not match TX_BEGIN");
     complete = true;
+    if (pending.begin.profile == ProfileId::P29V1) {
+        if (dict)
+            throw std::logic_error("P29V1 received a DICT component");
+        if (!space.route->p29v1 || space.route->p29v1->terminal)
+            throw std::logic_error("P29V1 receiver state is unavailable");
+        try {
+            pending.p29v1_need =
+                space.route->p29v1->deserializer.receive_body(target);
+            pending.p29v1_need.push_back(
+                static_cast<uint8_t>(codec::P29WireKind::TuEnd));
+            pending.p29v1_need.insert(pending.p29v1_need.end(), 4, 0);
+            if (space.route->p29v1->deserializer.root_reference_count() !=
+                descriptor.decoded_bytes)
+                throw std::logic_error(
+                    "P29V1 BODY decoded count differs from its descriptor");
+            if (compute_transaction_digest(pending.begin, {}, pending.body) !=
+                pending.begin.transaction_digest)
+                throw std::logic_error(
+                    "P29V1 transaction digest does not match its components");
+            record(ActionType::BODY_COMPLETE, session, &pending.begin);
+            record(ActionType::NEED_RECORDED, session, &pending.begin);
+            return;
+        } catch (...) {
+            space.route->p29v1->terminal = true;
+            if (space.route->p29v1->deserializer.has_pending()) {
+                try {
+                    space.route->p29v1->deserializer.abandon();
+                } catch (...) {
+                }
+            }
+            throw;
+        }
+    }
     if (dict) {
         pending.manifest = decode_key_vector(target);
         if (pending.manifest.size() != descriptor.decoded_bytes)
@@ -1648,6 +2822,39 @@ Need FStore::need(SessionHandle session) const {
             {pending.requested.begin(), pending.requested.end()}};
 }
 
+std::vector<uint8_t> FStore::p29v1_need_frames(SessionHandle session) const {
+    const Namespace& space = require_namespace(session);
+    if (!space.route || !space.route->pending ||
+        space.route->pending->begin.profile != ProfileId::P29V1 ||
+        !space.route->pending->body_complete ||
+        space.route->pending->p29v1_need.empty())
+        throw std::logic_error("P29V1 NEED is unavailable before exact BODY");
+    return space.route->pending->p29v1_need;
+}
+
+bool FStore::p29v1_system_source_reuse(SessionHandle session) const {
+    const Namespace& space = require_namespace(session);
+    if (!space.route || !space.route->pending || !space.route->p29v1 ||
+        space.route->pending->begin.profile != ProfileId::P29V1 ||
+        !space.route->p29v1->fixed_system_source_reuse)
+        throw std::logic_error("P29V1 reuse decision is unavailable");
+    return *space.route->p29v1->fixed_system_source_reuse;
+}
+
+void FStore::append_fill_v1(SessionHandle session,
+                            std::vector<uint8_t> inner_fill) {
+    Namespace& space = require_namespace(session);
+    if (!space.route || !space.route->pending ||
+        space.route->pending->begin.profile != ProfileId::P29V1)
+        throw std::logic_error("P29V1 FILL has no active transaction");
+    Namespace::FPending& pending = *space.route->pending;
+    if (!pending.p29v1_fill.empty())
+        throw std::logic_error("P29V1 FILL was received twice");
+    if (inner_fill.empty())
+        throw std::invalid_argument("P29V1 FILL inner stream is empty");
+    pending.p29v1_fill = std::move(inner_fill);
+}
+
 ObjectApplied FStore::apply_object(SessionHandle session,
                                    const ImmutableObject& object) {
     Namespace& space = require_namespace(session);
@@ -1696,6 +2903,56 @@ std::vector<uint8_t> FStore::materialize_and_verify(SessionHandle session) {
     if (!space.route || !space.route->pending)
         throw std::logic_error("F route has no ACTIVE_TX to materialize");
     Namespace::FPending& pending = *space.route->pending;
+    if (pending.begin.profile == ProfileId::P29V1) {
+        if (!space.route->p29v1 || space.route->p29v1->terminal ||
+            !pending.dict_complete || !pending.body_complete ||
+            pending.p29v1_fill.empty())
+            throw std::logic_error(
+                "P29V1 input cannot materialize before BODY, NEED, and FILL");
+        try {
+            (void)space.route->p29v1->deserializer.receive_fill(
+                pending.p29v1_fill, false);
+#if defined(ICECC_P29V1_MUTANT_DOUBLE_MATERIALIZE)
+            const auto scratch =
+                space.route->p29v1->deserializer.rematerialize_for_mutant();
+            if (scratch.bytes.size() != pending.begin.raw_bytes ||
+                digest128(scratch.bytes) != pending.begin.raw_digest ||
+                scratch.occurrences.size() !=
+                    space.route->p29v1->deserializer.mutant_occurrence_count() ||
+                compute_transaction_digest(pending.begin, {}, pending.body) !=
+                    pending.begin.transaction_digest)
+                throw std::logic_error(
+                    "P29V1 mutant rematerialization does not match TX_BEGIN");
+#endif
+            std::vector<uint8_t> result =
+                space.route->p29v1->deserializer.take_materialized();
+            if (result.size() != pending.begin.raw_bytes ||
+                digest128(result) != pending.begin.raw_digest ||
+                compute_transaction_digest(pending.begin, {}, pending.body) !=
+                    pending.begin.transaction_digest)
+                throw std::logic_error(
+                    "P29V1 materialized input does not match TX_BEGIN exactly");
+            const std::span<const uint8_t> segment =
+                space.route->p29v1->deserializer.pending_segment();
+            if (segment.size() > result.size())
+                throw std::logic_error(
+                    "P29V1 staged segment exceeds materialized input");
+            pending.p29v1_segment_digest =
+                segment.empty() ? Digest128{} : digest128(segment);
+            pending.p29v1_materialized = true;
+            record(ActionType::INPUT_MATERIALIZED, session, &pending.begin);
+            return result;
+        } catch (...) {
+            space.route->p29v1->terminal = true;
+            if (space.route->p29v1->deserializer.has_pending()) {
+                try {
+                    space.route->p29v1->deserializer.abandon();
+                } catch (...) {
+                }
+            }
+            throw;
+        }
+    }
     pending.partial_fill.finish();
     if (!pending.dict_complete || !pending.body_complete)
         throw std::logic_error("input cannot materialize before DICT, BODY, and Need finish");
@@ -1743,6 +3000,35 @@ std::vector<uint8_t> FStore::materialize_and_verify(SessionHandle session) {
 
 TxCommit FStore::commit_input(SessionHandle session) {
     Namespace& space = require_namespace(session);
+    if (space.route && space.route->pending &&
+        space.route->pending->begin.profile == ProfileId::P29V1) {
+        Namespace::Route& route = *space.route;
+        Namespace::FPending& pending = *route.pending;
+        if (!pending.p29v1_materialized || !route.p29v1 ||
+            route.p29v1->terminal)
+            throw std::logic_error("exact P29V1 input has not materialized");
+        const TxBegin begin = pending.begin;
+        if (route.next_rel_seq.value == std::numeric_limits<uint64_t>::max())
+            throw std::overflow_error("F REL_SEQ space exhausted");
+        TxCommit commit{begin.history_nonce, begin.rel_seq, begin.tu_seq,
+                        begin.transaction_digest, begin.raw_digest,
+                        compute_post_state_digest(begin.pre_state_digest,
+                                                  begin.history_nonce,
+                                                  begin.rel_seq, begin.tu_seq,
+                                                  begin.transaction_digest)};
+        try {
+            route.p29v1->deserializer.commit();
+        } catch (...) {
+            route.p29v1->terminal = true;
+            throw;
+        }
+        route.state_digest = commit.post_state_digest;
+        ++route.next_rel_seq.value;
+        route.last_commit = commit;
+        record(ActionType::INPUT_COMMITTED, session, &begin);
+        route.pending.reset();
+        return commit;
+    }
     if (!space.route || !space.route->pending ||
         !space.route->pending->materialized)
         throw std::logic_error("exact input has not materialized");
@@ -1762,6 +3048,40 @@ TxCommit FStore::commit_input(SessionHandle session) {
     record(ActionType::INPUT_COMMITTED, session, &begin);
     route.pending.reset();
     return commit;
+}
+
+void FStore::abandon_input(SessionHandle session) noexcept {
+    try {
+        Namespace& space = require_namespace(session);
+        abandon_pending(space);
+    } catch (...) {
+    }
+}
+
+uint64_t FStore::pending_segment_bytes(SessionHandle session) const noexcept {
+    try {
+        const Namespace& space = require_namespace(session);
+        if (!space.route || !space.route->pending ||
+            space.route->pending->begin.profile != ProfileId::P29V1 ||
+            !space.route->pending->p29v1_materialized || !space.route->p29v1)
+            return 0;
+        return space.route->p29v1->deserializer.pending_segment().size();
+    } catch (...) {
+        return 0;
+    }
+}
+
+Digest128 FStore::pending_segment_digest(SessionHandle session) const noexcept {
+    try {
+        const Namespace& space = require_namespace(session);
+        if (!space.route || !space.route->pending ||
+            space.route->pending->begin.profile != ProfileId::P29V1 ||
+            !space.route->pending->p29v1_materialized)
+            return {};
+        return space.route->pending->p29v1_segment_digest;
+    } catch (...) {
+        return {};
+    }
 }
 
 void FStore::forget_route(SessionHandle session) {

@@ -17,10 +17,12 @@ test -f "$archive"
 # shellcheck disable=SC2086
 "$cxx" "$standard" -O1 -g -Wall -Wextra -Wpedantic -Werror \
     -fsanitize=address,undefined -fno-omit-frame-pointer \
-    ${ICECC_TEST_CPPFLAGS:-} -I"$src" -I"$src/services" -I"$top_build" \
+    ${ICECC_TEST_CPPFLAGS:-} ${ICECC_TEST_LIBCAP_NG_CFLAGS:-} \
+    -I"$src" -I"$src/services" -I"$top_build" \
     "$src/unittests/p50_cache_session_wire_test.cpp" \
     "$src/services/comm.cpp" "$src/services/p50_cache_session_wire.cpp" \
     "$archive" ${ICECC_TEST_LDFLAGS:-} \
+    ${ICECC_TEST_LIBCAP_NG_LIBS:-} \
     ${ICECC_TEST_LIBS:--llzo2} \
     ${ICECC_TEST_LIBZSTD_LIBS:--lzstd} \
     ${ICECC_TEST_XXHASH_LIBS:--lxxhash} -ldl -pthread \

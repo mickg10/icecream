@@ -466,9 +466,10 @@ sidecar::P5coEndpointHandoff flush_p5co_for_endpoint(
 struct TestClient {
     explicit TestClient(CStoreGuid c_store_guid, EndpointCaps caps = {},
                         HistoryNonce first_history_nonce = HistoryNonce{1},
-                        CompletionLog* completions = nullptr, ActionTrace* actions = nullptr)
+                        CompletionLog* completions = nullptr, ActionTrace* actions = nullptr,
+                        PreparationAuthorityLimits authority_limits = {})
         : authority(std::make_shared<P50PreparationAuthority>(
-              c_store_guid, caps.zstd, PreparationAuthorityLimits{}, 1,
+              c_store_guid, caps.zstd, authority_limits, 1,
               caps.profile)),
           endpoint(authority, caps, first_history_nonce, completions, actions) {}
 
@@ -794,6 +795,241 @@ void test_p29_endpoint_route_dialogue_lifetime() {
             "P29 endpoint reset did not clear the old F route namespace");
 }
 
+void test_p29v1_endpoint_route_dialogue_lifetime() {
+    const P5coStoreGuids guids = p5co_store_guids(230);
+    EndpointCaps caps;
+    caps.profile = ProfileId::P29V1;
+    caps.zstd.max_raw_bytes = 1U << 20;
+    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    GlobalResourceTrace global_trace;
+    P50ServerEndpointConfig config;
+    config.global_resource_trace = &global_trace;
+    P50ServerEndpoint server(guids.f, caps, nullptr, nullptr,
+                             std::move(config));
+    PreparationAuthorityLimits authority_limits;
+    authority_limits.max_interner_reserved_bytes = UINT64_C(1044398080);
+    TestClient client(guids.c, caps, HistoryNonce{1}, nullptr, nullptr,
+                      authority_limits);
+    const std::vector<uint8_t> repeated = bytes(
+        "# 1 \"/tmp/p29v1-fixture.cc\"\n"
+        "same-line\nsame-line\nsame-line\nsame-line\ntail\n");
+
+    const PairResult first = run_pair(client, server, admit(client, repeated));
+    const std::optional<std::vector<uint8_t>> first_input =
+        copy_input(server, guids.c);
+    if (first.client.status != ClientRunStatus::Committed ||
+        first.server.status != ServerRunStatus::Completed ||
+        first_input != repeated || client.endpoint.next_rel_seq().value != 1) {
+        std::cerr << "P29V1 first diagnostic: client_status="
+                  << static_cast<unsigned>(first.client.status)
+                  << " server_status="
+                  << static_cast<unsigned>(first.server.status)
+                  << " exact=" << (first_input == repeated)
+                  << " next_rel=" << client.endpoint.next_rel_seq().value;
+        if (first.client.terminal_error)
+            std::cerr << " client_error=" << first.client.terminal_error->detail;
+        if (first.server.terminal_error)
+            std::cerr << " server_error=" << first.server.terminal_error->detail;
+        std::cerr << '\n';
+    }
+    require(first.client.status == ClientRunStatus::Committed &&
+                first.server.status == ServerRunStatus::Completed &&
+                first_input == repeated &&
+                client.endpoint.next_rel_seq().value == 1,
+            "P29V1 endpoint first TU did not commit exact route state");
+    std::optional<size_t> segment_present;
+    std::optional<size_t> blob_present;
+    Key64 segment_key;
+    Key64 blob_key;
+    for (size_t index = 0; index < global_trace.records().size(); ++index) {
+        const GlobalActionRecord& record = global_trace.records()[index];
+        if (record.action != GlobalActionType::ARENA_PRESENT)
+            continue;
+        if (record.key.type() == ObjectType::P29Segment) {
+            segment_present = index;
+            segment_key = record.key;
+        } else if (record.key.type() == ObjectType::Blob) {
+            blob_present = index;
+            blob_key = record.key;
+        }
+    }
+    require(segment_present && blob_present &&
+                *segment_present < *blob_present &&
+                segment_key.generation() == blob_key.generation() &&
+                segment_key.ordinal() == blob_key.ordinal(),
+            "P29V1 did not publish its same-TU segment before the input Blob");
+
+    require(first.server.committed_input.has_value(),
+            "P29V1 open job did not expose its committed input lease");
+    server.close_input_job(*first.server.committed_input);
+    server.collect_input_garbage();
+    require(server.owner_usage().retained_input_records == 0 &&
+                server.owner_usage().retained_input_bytes == 0 &&
+                !server.global_resource_invariant_for_test(),
+            "P29V1 Blob collection rejected its surviving route segment");
+    const auto first_segment_release = std::find_if(
+        global_trace.records().begin(), global_trace.records().end(),
+        [segment_key](const GlobalActionRecord& record) {
+            return record.action == GlobalActionType::ARENA_RELEASED &&
+                   record.key == segment_key;
+        });
+    require(first_segment_release == global_trace.records().end(),
+            "P29V1 Blob collection prematurely released route dictionary state");
+
+    const PairResult second = run_pair(client, server, admit(client, repeated));
+    require(second.client.status == ClientRunStatus::Committed &&
+                second.server.status == ServerRunStatus::Completed &&
+                copy_input(server, guids.c) == repeated &&
+                client.endpoint.next_rel_seq().value == 2,
+            "P29V1 endpoint same-route TU2 lost the committed codec state");
+
+    const std::vector<uint8_t> retry_input = bytes(
+        "# 1 \"/tmp/p29v1-retry.cc\"\nretry-v1\nretry-v1\n");
+    const PreparedTuHandle retry_handle = admit(client, retry_input);
+    EndpointIoControl disconnect;
+    disconnect.close_before_write = MessageType::FILL;
+    const PairResult interrupted =
+        run_pair(client, server, retry_handle, disconnect);
+    require(interrupted.client.status == ClientRunStatus::Disconnected &&
+                interrupted.server.status == ServerRunStatus::Disconnected &&
+                client.has_active_transaction() &&
+                client.endpoint.next_rel_seq().value == 2,
+            "P29V1 interrupted FILL did not retain exact retry identity");
+    const PairResult retried = run_pair(client, server, retry_handle);
+    const std::optional<std::vector<uint8_t>> retried_input =
+        copy_input(server, guids.c);
+    if (retried.client.status != ClientRunStatus::Committed ||
+        retried.server.status != ServerRunStatus::Completed ||
+        retried_input != retry_input ||
+        client.endpoint.next_rel_seq().value != 3) {
+        std::cerr << "P29V1 retry diagnostic: client_status="
+                  << static_cast<unsigned>(retried.client.status)
+                  << " server_status="
+                  << static_cast<unsigned>(retried.server.status)
+                  << " exact=" << (retried_input == retry_input)
+                  << " next_rel=" << client.endpoint.next_rel_seq().value;
+        if (retried.client.terminal_error)
+            std::cerr << " client_error="
+                      << retried.client.terminal_error->detail;
+        if (retried.server.terminal_error)
+            std::cerr << " server_error="
+                      << retried.server.terminal_error->detail;
+        std::cerr << '\n';
+    }
+    require(retried.client.status == ClientRunStatus::Committed &&
+                retried.server.status == ServerRunStatus::Completed &&
+                retried_input == retry_input &&
+                client.endpoint.next_rel_seq().value == 3,
+            "P29V1 exact retry did not reproduce and commit the input");
+
+    server.reset_store(
+        FStoreGuid::from_u64(UINT64_C(0x5032395631525354)));
+    const std::vector<uint8_t> after_reset = bytes("after-p29v1-reset\n");
+    const PairResult reset =
+        run_pair(client, server, admit(client, after_reset));
+    const std::optional<std::vector<uint8_t>> reset_input =
+        copy_input(server, guids.c);
+    if (reset.client.status != ClientRunStatus::Committed ||
+        reset.client.reconnect != EndpointReconnectOutcome::ColdFStore ||
+        reset.server.status != ServerRunStatus::Completed ||
+        reset_input != after_reset || client.endpoint.next_rel_seq().value != 1) {
+        std::cerr << "P29V1 reset diagnostic: client_status="
+                  << static_cast<unsigned>(reset.client.status)
+                  << " reconnect="
+                  << static_cast<unsigned>(reset.client.reconnect)
+                  << " server_status="
+                  << static_cast<unsigned>(reset.server.status)
+                  << " exact=" << (reset_input == after_reset)
+                  << " next_rel=" << client.endpoint.next_rel_seq().value;
+        if (reset.client.terminal_error)
+            std::cerr << " client_error=" << reset.client.terminal_error->detail;
+        if (reset.server.terminal_error)
+            std::cerr << " server_error=" << reset.server.terminal_error->detail;
+        std::cerr << '\n';
+    }
+    require(reset.client.status == ClientRunStatus::Committed &&
+                reset.client.reconnect == EndpointReconnectOutcome::ColdFStore &&
+                reset.server.status == ServerRunStatus::Completed &&
+                reset_input == after_reset &&
+                client.endpoint.next_rel_seq().value == 1,
+            "P29V1 cold-store reset did not rebuild both codec routes");
+
+    GlobalResourceTrace closed_trace;
+    P50ServerEndpointConfig closed_config;
+    closed_config.global_resource_trace = &closed_trace;
+    closed_config.input_job_state =
+        [](CStoreGuid, const TxBegin&, const TxCommit&,
+           std::span<const uint8_t>) { return InputJobState::Closed; };
+    const P5coStoreGuids closed_guids = p5co_store_guids(231);
+    P50ServerEndpoint closed_server(closed_guids.f, caps, nullptr, nullptr,
+                                    std::move(closed_config));
+    TestClient closed_client(closed_guids.c, caps, HistoryNonce{1}, nullptr,
+                             nullptr, authority_limits);
+    const PairResult closed = run_pair(
+        closed_client, closed_server, admit(closed_client, repeated));
+    require(closed.client.status == ClientRunStatus::Committed &&
+                closed.server.status == ServerRunStatus::Completed &&
+                closed.server.completed_input.has_value() &&
+                !closed.server.committed_input &&
+                closed_server.owner_usage().retained_input_records == 0 &&
+                !closed_server.global_resource_invariant_for_test(),
+            "P29V1 closed job did not commit without a resident Blob");
+    const auto closed_segment_present = std::find_if(
+        closed_trace.records().begin(), closed_trace.records().end(),
+        [](const GlobalActionRecord& record) {
+            return record.action == GlobalActionType::ARENA_PRESENT &&
+                   record.key.type() == ObjectType::P29Segment;
+        });
+    const auto closed_blob_crashed = std::find_if(
+        closed_trace.records().begin(), closed_trace.records().end(),
+        [](const GlobalActionRecord& record) {
+            return record.action == GlobalActionType::INSTALL_CRASHED &&
+                   record.key.type() == ObjectType::Blob;
+        });
+    const auto closed_blob_present = std::find_if(
+        closed_trace.records().begin(), closed_trace.records().end(),
+        [](const GlobalActionRecord& record) {
+            return record.action == GlobalActionType::ARENA_PRESENT &&
+                   record.key.type() == ObjectType::Blob;
+        });
+    require(closed_segment_present != closed_trace.records().end() &&
+                closed_blob_crashed != closed_trace.records().end() &&
+                closed_blob_present == closed_trace.records().end(),
+            "P29V1 closed job did not publish Segment and crash Blob");
+    closed_server.collect_input_garbage();
+    require(!closed_server.global_resource_invariant_for_test(),
+            "P29V1 closed-job garbage collection broke global invariants");
+
+    GlobalResourceTrace capped_trace;
+    P50ServerEndpointConfig capped_config;
+    capped_config.global_resource_trace = &capped_trace;
+    const P5coStoreGuids capped_guids = p5co_store_guids(232);
+    P50ServerEndpoint capped_server(capped_guids.f, caps, nullptr, nullptr,
+                                    std::move(capped_config));
+    PreparationAuthorityLimits capped_limits = authority_limits;
+    capped_limits.max_route_state_bytes = 1;
+    TestClient capped_client(capped_guids.c, caps, HistoryNonce{1}, nullptr,
+                             nullptr, capped_limits);
+    const PairResult capped = run_pair(
+        capped_client, capped_server, admit(capped_client, repeated));
+    require(capped.client.status == ClientRunStatus::TerminalError &&
+                capped.server.status == ServerRunStatus::Disconnected &&
+                capped.client.terminal_error.has_value() &&
+                capped.client.terminal_error->detail.find(
+                    "P29V1 route state exceeds its budget") !=
+                    std::string::npos &&
+                capped_server.owner_usage().retained_input_records == 0 &&
+                !capped_server.global_resource_invariant_for_test(),
+            "P29V1 projected route cap did not reject before FILL publication");
+    const bool capped_published = std::any_of(
+        capped_trace.records().begin(), capped_trace.records().end(),
+        [](const GlobalActionRecord& record) {
+            return record.action == GlobalActionType::ARENA_PRESENT;
+        });
+    require(!capped_published,
+            "P29V1 projected route-cap failure published receiver state");
+}
+
 void test_s3_resource_storm_product_path() {
     const char* requested = std::getenv("ICECC_P50_S3_RESOURCE_STORM");
     const bool storm_only = requested != nullptr &&
@@ -1031,6 +1267,10 @@ PairResult run_adopted_pair(P50ClientEndpoint& client, P50ServerEndpoint& server
                     "native accepted fd was not adopted");
             require((::fcntl(adopted->native_handle(), F_GETFD) & FD_CLOEXEC) != 0,
                     "native adoption did not establish CLOEXEC");
+            tcp::no_delay no_delay;
+            adopted->get_option(no_delay, adopt_error);
+            require(!adopt_error && no_delay.value(),
+                    "native adoption did not disable Nagle");
             if (consumed_fd != nullptr)
                 *consumed_fd = adopted->native_handle();
             boost::system::error_code close_error;
@@ -6078,7 +6318,8 @@ int main(int argc, char** argv) {
     }
     if (std::getenv("ICECC_P50_P29_DIALOGUE_FOCUS") != nullptr) {
         test_p29_endpoint_route_dialogue_lifetime();
-        std::cout << "p50_endpoint_test: focused P29 dialogue PASS\n";
+        test_p29v1_endpoint_route_dialogue_lifetime();
+        std::cout << "p50_endpoint_test: focused P29/P29V1 dialogue PASS\n";
         return 0;
     }
     test_action_hold_rendezvous();
@@ -6124,6 +6365,7 @@ int main(int argc, char** argv) {
     test_grz_endpoint_roundtrip();
 #endif
     test_p29_endpoint_route_dialogue_lifetime();
+    test_p29v1_endpoint_route_dialogue_lifetime();
     test_live_global_resource_trace();
     test_automatic_action_trace_is_complete_past_1024_records();
     if (s3_resource_storm_requested())

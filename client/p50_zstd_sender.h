@@ -85,7 +85,7 @@ using ConnectedFdFactory =
 // Direct ZSTD_TU transfer calls are one-shot.  The assignment-bound
 // transfer_route overloads may retain the sender so one stable C/F relationship
 // advances TU identity while each ZSTD_TU payload remains independently
-// compressed.  P29/ZSTD_ROUTE and dependency-enabled GRZ additionally retain
+// compressed.  P29/P29V1/ZSTD_ROUTE and dependency-enabled GRZ additionally retain
 // compression history for sequential transfers.
 class P50ZstdSourceSender {
 public:

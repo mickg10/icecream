@@ -57,6 +57,12 @@ void test_exact_mode_admission() {
     CHECK(p50_zstd_selected_profile(mutant,
                                     PROTOCOL_VERSION_CACHE_ADVERTISEMENT) ==
           std::optional<ProfileId>{ProfileId::P29});
+    mutant.cache_profile_mask = CACHE_PROFILE_P29V1;
+    CHECK(p50_zstd_compile_admissible(mutant,
+                                      PROTOCOL_VERSION_CACHE_ADVERTISEMENT));
+    CHECK(p50_zstd_selected_profile(mutant,
+                                    PROTOCOL_VERSION_CACHE_ADVERTISEMENT) ==
+          std::optional<ProfileId>{ProfileId::P29V1});
     mutant.cache_profile_mask = CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE;
     CHECK(!p50_zstd_compile_admissible(mutant,
                                        PROTOCOL_VERSION_CACHE_ADVERTISEMENT));
@@ -103,6 +109,14 @@ void test_explicit_profile_selection() {
                                    P50CacheProfileRequest::P29) == CACHE_PROFILE_P29);
     CHECK(p50_select_cache_profile(CACHE_PROFILE_ZSTD_TU,
                                    P50CacheProfileRequest::P29) == 0);
+
+    CHECK(::setenv("ICECC_P50_PROFILE", "P29V1", 1) == 0);
+    CHECK(p50_cache_profile_request_from_env() == P50CacheProfileRequest::P29V1);
+    CHECK(p50_select_cache_profile(CACHE_PROFILE_P29V1,
+                                   P50CacheProfileRequest::P29V1) ==
+          CACHE_PROFILE_P29V1);
+    CHECK(p50_select_cache_profile(CACHE_PROFILE_P29,
+                                   P50CacheProfileRequest::P29V1) == 0);
 
     CHECK(::setenv("ICECC_P50_PROFILE", "UNSUPPORTED_PROFILE", 1) == 0);
     CHECK(p50_cache_profile_request_from_env() ==
@@ -192,6 +206,9 @@ void test_authenticated_sidecar_result_binds_real_identity() {
     const auto p29 = bind_compile_input(job, ProfileId::P29, transfer);
     CHECK(p29.has_value());
     CHECK(p29->profile == CompileInputIdentity::P29Profile);
+    const auto p29v1 = bind_compile_input(job, ProfileId::P29V1, transfer);
+    CHECK(p29v1.has_value());
+    CHECK(p29v1->profile == CompileInputIdentity::P29V1Profile);
 
     transfer.attempts = 3;
     CHECK(!bind_compile_input(job, ProfileId::GRZ, transfer));

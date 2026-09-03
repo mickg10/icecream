@@ -174,8 +174,8 @@ require_count 1 'if (wrapper_cache_eligible && usecs_cache_handoff_admissible(*m
 # to that same selected hostname, commits ZSTD_TU before CompileFile, and binds
 # the resulting immutable selector.  The endpoint triple still may not leak
 # backwards into scheduler scoring or the generic compiler-input reader.
-require_count 1 'p50_zstd_compile_admissible(' client/remote.cpp \
-    'the production client has one exact P50 source-mode admission site'
+require_count 1 'p50_zstd_selected_profile(' client/remote.cpp \
+    'the production client has one exact P50 profile selection/admission site'
 require_count 1 'assignment.cache_endpoint_port' client/remote.cpp \
     'the cache connection reads the selected UseCS endpoint exactly once'
 require_count 1 'job.setCompileInputIdentity(*identity);' client/remote.cpp \

@@ -30,6 +30,8 @@ std::optional<ProfileId> p50_zstd_selected_profile(
         return std::nullopt;
     if (assignment.cache_profile_mask == CACHE_PROFILE_P29)
         return ProfileId::P29;
+    if (assignment.cache_profile_mask == CACHE_PROFILE_P29V1)
+        return ProfileId::P29V1;
     if (assignment.cache_profile_mask == CACHE_PROFILE_ZSTD_ROUTE)
         return ProfileId::Z3_LONG;
     if (assignment.cache_profile_mask == CACHE_PROFILE_GRZ)
@@ -77,6 +79,7 @@ std::optional<CompileInputIdentity> bind_compile_input(
         return std::nullopt;
 
     if (transfer.profile != ProfileId::P29 &&
+        transfer.profile != ProfileId::P29V1 &&
         transfer.profile != ProfileId::ZSTD_TU &&
         transfer.profile != ProfileId::Z3_LONG)
         return std::nullopt;
@@ -84,6 +87,8 @@ std::optional<CompileInputIdentity> bind_compile_input(
     CompileInputIdentity identity;
     identity.profile = transfer.profile == ProfileId::P29
                            ? CompileInputIdentity::P29Profile
+                       : transfer.profile == ProfileId::P29V1
+                           ? CompileInputIdentity::P29V1Profile
                            : CompileInputIdentity::ZstdTuProfile;
     identity.c_store_guid = transfer.committed_input->c_store_guid.bytes;
     identity.tu_seq = transfer.committed_input->tu_seq.value;
@@ -107,13 +112,16 @@ std::optional<CompileInputIdentity> bind_compile_input(
         transfer.attempts == 0 || transfer.attempts > 2)
         return std::nullopt;
 
-    if (profile != ProfileId::P29 && profile != ProfileId::ZSTD_TU &&
+    if (profile != ProfileId::P29 && profile != ProfileId::P29V1 &&
+        profile != ProfileId::ZSTD_TU &&
         profile != ProfileId::Z3_LONG && profile != ProfileId::GRZ)
         return std::nullopt;
 
     CompileInputIdentity identity;
     identity.profile = profile == ProfileId::P29
                            ? CompileInputIdentity::P29Profile
+                       : profile == ProfileId::P29V1
+                           ? CompileInputIdentity::P29V1Profile
                            : CompileInputIdentity::ZstdTuProfile;
     identity.c_store_guid = transfer.c_store_guid.bytes;
     identity.tu_seq = transfer.tu_seq;

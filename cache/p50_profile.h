@@ -61,6 +61,8 @@ struct ProfileDialogueVTable {
     bool (*terminal)(const void*) noexcept = nullptr;
     ProfileCommitState (*commit_state)(const void*) noexcept = nullptr;
     size_t (*pending_body_bytes)(const void*) noexcept = nullptr;
+    uint64_t (*pending_segment_bytes)(const void*) noexcept = nullptr;
+    Digest128 (*pending_segment_digest)(const void*) noexcept = nullptr;
     uint64_t (*window_limit_bytes)(const void*) noexcept = nullptr;
     const TxBegin* (*active_begin)(const void*) noexcept = nullptr;
 };
@@ -85,7 +87,8 @@ public:
     void append_dict(const DictMessage& message) { table_->append_dict(object_, message); }
     void append_body(const BodyMessage& message) { table_->append_body(object_, message); }
     [[nodiscard]] std::vector<NeedMessage> need_messages(size_t max_payload) {
-        return table_->need_messages(object_, max_payload);
+        return table_->need_messages ? table_->need_messages(object_, max_payload)
+                                     : std::vector<NeedMessage>{};
     }
     void receive_need(const NeedMessage& message) { table_->receive_need(object_, message); }
     void receive_fill(const FillMessage& message) { table_->receive_fill(object_, message); }
@@ -104,6 +107,16 @@ public:
     }
     [[nodiscard]] size_t pending_body_bytes() const noexcept {
         return table_->pending_body_bytes(object_);
+    }
+    [[nodiscard]] uint64_t pending_segment_bytes() const noexcept {
+        return table_->pending_segment_bytes
+                   ? table_->pending_segment_bytes(object_)
+                   : 0;
+    }
+    [[nodiscard]] Digest128 pending_segment_digest() const noexcept {
+        return table_->pending_segment_digest
+                   ? table_->pending_segment_digest(object_)
+                   : Digest128{};
     }
     [[nodiscard]] uint64_t window_limit_bytes() const noexcept {
         return table_->window_limit_bytes(object_);

@@ -299,6 +299,66 @@ void test_global_resource_owner_and_caught_slot_mutant() {
             "LRU mutant was not caught by the post-eviction global invariant");
 }
 
+void test_p29v1_pair_preflight_and_segment_residency() {
+    const CStoreGuid c_guid = Id128::from_u64(504);
+    const Key64 blob = *Key64::make(ObjectType::Blob, 0, 7);
+    const Key64 segment = *Key64::make(ObjectType::P29Segment, 0, 7);
+    Digest128 blob_digest{};
+    Digest128 segment_digest{};
+    blob_digest.bytes.front() = 1;
+    segment_digest.bytes.front() = 2;
+
+    GlobalResourceLimits too_small{
+        .max_aggregate_bytes = 7,
+        .max_namespace_bytes = 7,
+        .max_staging_bytes = 8,
+        .max_total_bytes = 15,
+        .max_generation = 1,
+        .max_staging_slots = 2,
+    };
+    GlobalResourceModel rejected(too_small);
+    rejected.admit(c_guid);
+    rejected.start_tu(c_guid);
+    rejected.begin_install(c_guid, blob, blob_digest, 4, 0);
+    rejected.begin_install(c_guid, segment, segment_digest, 4, 1);
+    require_throws<std::length_error>(
+        [&] {
+            rejected.preflight_publish_pair(
+                c_guid, segment, 1, segment_digest, blob, 0, blob_digest);
+        },
+        "P29V1 pair preflight allowed its segment to publish before a "
+        "capacity failure on the Blob");
+    require(rejected.resident_bytes() == 0 &&
+                rejected.staging_bytes() == 8 &&
+                !rejected.check_invariants(),
+            "rejected P29V1 pair preflight changed visible owner state");
+    rejected.crash_install(c_guid, segment, 1);
+    rejected.crash_install(c_guid, blob, 0);
+    rejected.finish_tu(c_guid);
+
+    GlobalResourceLimits exact_fit = too_small;
+    exact_fit.max_aggregate_bytes = 8;
+    exact_fit.max_namespace_bytes = 8;
+    GlobalResourceModel accepted(exact_fit);
+    accepted.admit(c_guid);
+    accepted.start_tu(c_guid);
+    accepted.begin_install(c_guid, blob, blob_digest, 4, 0);
+    accepted.begin_install(c_guid, segment, segment_digest, 4, 1);
+    accepted.preflight_publish_pair(
+        c_guid, segment, 1, segment_digest, blob, 0, blob_digest);
+    accepted.publish(c_guid, segment, 1, segment_digest);
+    accepted.publish(c_guid, blob, 0, blob_digest);
+    accepted.finish_tu(c_guid);
+    accepted.release(c_guid, blob);
+    require(accepted.resident_bytes() == 4 &&
+                !accepted.check_invariants(),
+            "resident P29V1 route segment incorrectly required its collected Blob");
+    accepted.release(c_guid, segment);
+    require(accepted.resident_bytes() == 0 &&
+                !accepted.check_invariants(),
+            "P29V1 segment release left global owner residue");
+}
+
 void test_tu_seq_is_not_route_order() {
     Pair pair;
     const PreparedTUPtr tu0 = pair.c.prepare_from_regions(regions({"zero\n"}));
@@ -372,6 +432,7 @@ void test_p29_current_tu_residual_and_block_controls() {
     const PreparedTUPtr first = pair.c.prepare_from_regions(input);
     const CActiveTx& first_active = pair.route.begin(
         first, P29RootMode::HistoryIndependent, true);
+    const std::vector<uint8_t> first_body = first_active.body;
     require(first_active.region_count == input.size() && first_active.block_use_count > 0,
             "P29 current-TU admission did not expose repeated Regions and Block use");
     const Need first_need = start(pair, first_active);
@@ -436,7 +497,7 @@ void test_p29_current_tu_residual_and_block_controls() {
     const CActiveTx& isolated_active = different_route.route.begin(
         different_route.c.prepare_from_regions(input),
         P29RootMode::HistoryIndependent, true);
-    require(isolated_active.body == first_active.body,
+    require(isolated_active.body == first_body,
             "P29 different route changed its independent structural/literal frame");
     finish(different_route, isolated_active);
 
@@ -1073,6 +1134,7 @@ int main() {
     test_key_limits_and_mixed_generations();
     test_p29_preparation_verification_modes();
     test_global_resource_owner_and_caught_slot_mutant();
+    test_p29v1_pair_preflight_and_segment_residency();
     test_tu_seq_is_not_route_order();
     test_separate_preparation_real_interning_and_p29();
     test_p29_current_tu_residual_and_block_controls();

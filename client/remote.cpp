@@ -286,6 +286,8 @@ std::optional<uint32_t> p50_profile_wire(
     switch (profile) {
     case icecc::p50::ProfileId::P29:
         return CACHE_PROFILE_P29;
+    case icecc::p50::ProfileId::P29V1:
+        return CACHE_PROFILE_P29V1;
     case icecc::p50::ProfileId::ZSTD_TU:
         return CACHE_PROFILE_ZSTD_TU;
     case icecc::p50::ProfileId::Z3_LONG:
@@ -303,6 +305,8 @@ std::optional<uint32_t> p50_source_mode_wire(
     switch (profile) {
     case icecc::p50::ProfileId::P29:
         return P50_SOURCE_MODE_P29;
+    case icecc::p50::ProfileId::P29V1:
+        return P50_SOURCE_MODE_P29V1;
     case icecc::p50::ProfileId::ZSTD_TU:
         return P50_SOURCE_MODE_ZSTD_TU;
     case icecc::p50::ProfileId::Z3_LONG:
@@ -901,20 +905,35 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
         }
 
         {
-            p50_input = icecc::p50::p50_zstd_compile_admissible(
-                *usecs, cserver->protocol);
-            const std::optional<icecc::p50::ProfileId> p50_profile = p50_input
-                ? icecc::p50::p50_zstd_selected_profile(*usecs, cserver->protocol)
-                : std::nullopt;
-            const char *const p50_profile_name =
-                p50_profile == icecc::p50::ProfileId::P29
-                    ? "P29"
-                    : (p50_profile == icecc::p50::ProfileId::Z3_LONG
-                           ? "ZSTD_ROUTE"
-                           : (p50_profile == icecc::p50::ProfileId::GRZ
-                                  ? "GRZ_RESIDUAL"
-                                  : "ZSTD_TU"));
-            p50_input = p50_profile.has_value();
+            const std::optional<icecc::p50::ProfileId> selected_p50_profile =
+                icecc::p50::p50_zstd_selected_profile(*usecs,
+                                                       cserver->protocol);
+            p50_input = selected_p50_profile.has_value();
+            icecc::p50::ProfileId p50_profile =
+                icecc::p50::ProfileId::ZSTD_TU;
+            const char *p50_profile_name = "ZSTD_TU";
+            if (selected_p50_profile) {
+                p50_profile = *selected_p50_profile;
+                switch (p50_profile) {
+                case icecc::p50::ProfileId::P29:
+                    p50_profile_name = "P29";
+                    break;
+                case icecc::p50::ProfileId::P29V1:
+                    p50_profile_name = "P29V1";
+                    break;
+                case icecc::p50::ProfileId::Z3_LONG:
+                    p50_profile_name = "ZSTD_ROUTE";
+                    break;
+                case icecc::p50::ProfileId::GRZ:
+                    p50_profile_name = "GRZ_RESIDUAL";
+                    break;
+                case icecc::p50::ProfileId::ZSTD_TU:
+                    break;
+                case icecc::p50::ProfileId::Z3_SHARED_LONG:
+                    p50_profile_name = "Z3_SHARED_LONG";
+                    break;
+                }
+            }
             if (getenv("ICECC_P50_C1F1_REQUIRED") != nullptr && !p50_input)
                 throw remote_error(
                     105,
@@ -938,9 +957,9 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
 
                 const icecc::p50::local::P50SourceTransferResult transfer =
                     transfer_p50_source(job, *usecs, *local_daemon,
-                                        std::move(source), *p50_profile);
+                                        std::move(source), p50_profile);
                 const std::optional<CompileInputIdentity> identity =
-                    icecc::p50::bind_compile_input(job, *p50_profile, transfer);
+                    icecc::p50::bind_compile_input(job, p50_profile, transfer);
                 if (!identity.has_value()) {
                     log_warning() << p50_profile_name
                                   << " cache source transfer failed closed (status "

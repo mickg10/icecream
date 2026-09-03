@@ -1,6 +1,7 @@
 #include "cache/p50_daemon_sidecar_adapter.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
@@ -25,6 +26,23 @@ bool exact_node(const std::string& path, mode_t mode, bool directory,
            (directory ? S_ISDIR(info.st_mode) : S_ISSOCK(info.st_mode)) &&
            (info.st_mode & 07777) == mode && info.st_uid == uid &&
            info.st_gid == gid;
+}
+
+bool remove_p29_fingerprint_cache(const std::string& root)
+{
+    for (const char* name : {"p29-system-source-fingerprint-v1.cache",
+                             "p29-system-source-fingerprint-v1.lock"}) {
+        const std::string path = root + "/" + name;
+        struct stat info{};
+        if (::lstat(path.c_str(), &info) != 0) {
+            if (errno == ENOENT)
+                continue;
+            return false;
+        }
+        if (!S_ISREG(info.st_mode) || ::unlink(path.c_str()) != 0)
+            return false;
+    }
+    return true;
 }
 
 int poll_timeout(DaemonSidecarAdapter& adapter,
@@ -314,7 +332,7 @@ int main()
     if (!drive_shutdown(parked_adapter, reaper, parked_update))
         return 24;
 
-    if (::rmdir(directory) != 0)
+    if (!remove_p29_fingerprint_cache(root) || ::rmdir(directory) != 0)
         return 25;
     std::puts("p50 daemon sidecar adapter outer lifecycle: ok");
     return 0;

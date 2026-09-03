@@ -176,6 +176,10 @@ struct EndpointIoControl {
     // Product callers leave it unset; it proves the owner timer cannot be
     // starved by a blocked codec worker.
     std::function<void()> before_materialize_on_worker;
+    // Simulator/test-only observation after one complete message has been
+    // written successfully. It receives an immutable message copy and cannot
+    // change product framing or endpoint state.
+    std::function<void(ActorSide, const Message&)> outbound_message_observer;
 };
 
 struct PrepareRequestKey {
@@ -196,6 +200,8 @@ struct PreparationRouteKey {
 struct PreparationAuthorityLimits {
     size_t max_live_entries = 4096;
     uint64_t max_retained_encoded_bytes = uint64_t{512} << 20;
+    uint64_t max_interner_reserved_bytes = UINT64_C(2463121408);
+    uint64_t max_route_state_bytes = uint64_t{1} << 30;
     auto operator<=>(const PreparationAuthorityLimits&) const = default;
 };
 
@@ -241,6 +247,13 @@ public:
     PreparedTuHandle prepare_for_route(PreparationRouteKey route,
                                        PrepareRequestKey request,
                                        std::span<const uint8_t> exact_input);
+    std::span<const uint8_t> answer_p29v1_need(
+        PreparedTuHandle handle, uint64_t flags,
+        std::span<const uint8_t> inner_need);
+    void restart_p29v1_transport_retry(PreparedTuHandle handle);
+    PreparedInputPtr reset_p29v1_route(PreparedTuHandle handle,
+                                       FStoreGuid f_store_guid,
+                                       HistoryNonce history_nonce);
     // Test/simulator-only verification strength for P29 preparation. The
     // streamed digest remains mandatory in both modes.
     void set_p29_verification(CAuthority::Verification verification);
@@ -267,6 +280,10 @@ public:
     [[nodiscard]] ProfileId prepared_profile(PreparedTuHandle handle) const;
     [[nodiscard]] size_t live_entry_count() const;
     [[nodiscard]] uint64_t retained_encoded_bytes() const;
+    [[nodiscard]] uint64_t p29v1_interner_reserved_bytes() const;
+    [[nodiscard]] uint64_t p29v1_interner_committed_bytes() const;
+    [[nodiscard]] uint64_t p29v1_route_state_bytes(
+        PreparationRouteKey route) const;
     [[nodiscard]] size_t route_history_bytes() const;
     [[nodiscard]] size_t route_history_bytes(PreparationRouteKey route) const;
     [[nodiscard]] Digest128 route_history_digest() const;
@@ -354,6 +371,10 @@ enum class ServerRunStatus : uint8_t {
 struct ServerRunResult {
     ServerRunStatus status = ServerRunStatus::Disconnected;
     uint64_t session_serial = 0;
+    // Codec work performed on F after receiving profile data: applying FILL
+    // fragments plus exact materialization/verification. Queueing, network
+    // waits, selector callbacks, and owner-side publication are excluded.
+    uint64_t f_apply_materialize_ns = 0;
     std::optional<CStoreGuid> c_store_guid;
     // candidate_input is set before the job-state selector. completed_input is
     // set only after exact publication/closed-commit validation succeeds.
@@ -534,6 +555,8 @@ public:
     size_t cancel_all_for_incarnation(const SidecarLaunchIdentity& incarnation) noexcept;
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
     void request_cancel_for_test() noexcept;
+    [[nodiscard]] std::optional<std::string>
+    global_resource_invariant_for_test() const;
 #endif
 
     void reset_store(FStoreGuid new_guid);

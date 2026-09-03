@@ -955,8 +955,11 @@ public:
         return ack_matches_lease &&
                ((input.profile == CompileInputIdentity::P29Profile &&
                  p50_source_arm_fields->cache_profile == CACHE_PROFILE_P29) ||
+                (input.profile == CompileInputIdentity::P29V1Profile &&
+                 p50_source_arm_fields->cache_profile == CACHE_PROFILE_P29V1) ||
                 (input.profile == CompileInputIdentity::ZstdTuProfile &&
-                 p50_source_arm_fields->cache_profile != CACHE_PROFILE_P29)) &&
+                 p50_source_arm_fields->cache_profile != CACHE_PROFILE_P29 &&
+                 p50_source_arm_fields->cache_profile != CACHE_PROFILE_P29V1)) &&
                input.c_store_guid == p50_source_arm_fields->c_store_guid &&
                input.attempt_id == p50_source_arm_fields->compiler_attempt &&
                input.request_id == p50_source_arm_fields->source_request_id;
@@ -7689,11 +7692,13 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
                 continue;
             const CompileInputIdentity &input = job->compileInputIdentity();
             if (!input.validPresent() ||
-                ((input.profile != CompileInputIdentity::P29Profile &&
-                  input.profile != CompileInputIdentity::ZstdTuProfile) ||
-                 (input.profile == CompileInputIdentity::P29Profile
-                      ? arm.cache_profile != CACHE_PROFILE_P29
-                      : arm.cache_profile == CACHE_PROFILE_P29)) ||
+                !((input.profile == CompileInputIdentity::P29Profile &&
+                   arm.cache_profile == CACHE_PROFILE_P29) ||
+                  (input.profile == CompileInputIdentity::P29V1Profile &&
+                   arm.cache_profile == CACHE_PROFILE_P29V1) ||
+                  (input.profile == CompileInputIdentity::ZstdTuProfile &&
+                   arm.cache_profile != CACHE_PROFILE_P29 &&
+                   arm.cache_profile != CACHE_PROFILE_P29V1)) ||
                 input.c_store_guid != arm.c_store_guid ||
                 input.attempt_id != arm.compiler_attempt ||
                 input.request_id != arm.source_request_id)
@@ -7862,11 +7867,15 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
         }
         client->last_known_job_id = job->jobID();
         trace() << "P50 CompileFile attached exact "
-                << (arm.cache_profile == CACHE_PROFILE_ZSTD_ROUTE
+                << (arm.cache_profile == CACHE_PROFILE_P29
+                        ? "P29"
+                        : (arm.cache_profile == CACHE_PROFILE_P29V1
+                               ? "P29V1"
+                        : (arm.cache_profile == CACHE_PROFILE_ZSTD_ROUTE
                         ? "ZSTD_ROUTE"
                         : (arm.cache_profile == CACHE_PROFILE_GRZ
                                ? "GRZ_RESIDUAL"
-                               : "ZSTD_TU"))
+                               : "ZSTD_TU"))))
                 << " input for job "
                 << job->jobID() << endl;
         return true;

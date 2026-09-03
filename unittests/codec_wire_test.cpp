@@ -180,7 +180,11 @@ public:
   WireProvider()
       : arena_(Product ? std::make_unique<icecc::p50::CObjectArena>(
                              icecc::p50::CStoreGuid::from_u64(0x2901))
-                       : nullptr) {}
+                       : nullptr) {
+    // The retained research goldens were cut for a homogeneous pair.
+    sender_.system_source_reuse = true;
+    receiver_.system_source_reuse = true;
+  }
 
   [[noreturn]] static void fail(const char *reason) {
     throw std::invalid_argument(reason);
@@ -452,8 +456,9 @@ run_dialogue(const Corpus &corpus,
         std::chrono::duration<double>(Clock::now() - start).count();
 
     start = Clock::now();
-    const std::span<const std::uint8_t> materialized =
-        deserializer.receive_fill(fill, close);
+    (void)deserializer.receive_fill(fill, close);
+    const std::vector<std::uint8_t> materialized =
+        deserializer.take_materialized();
     const double fill_seconds =
         std::chrono::duration<double>(Clock::now() - start).count();
     result.receiver_fill_seconds += fill_seconds;
@@ -870,6 +875,13 @@ void run_wire_controls(const Corpus &corpus,
                         std::vector<std::uint8_t>(expected_source.begin(),
                                                   expected_source.end()));
   };
+  expect_fill_failure(
+      body, make_fill(source_control(5, expected_source.size()), {}, system_paths),
+      "system-source Line without negotiated reuse",
+      [&](ResearchProvider &provider) {
+        valid_source_setup(provider);
+        provider.receiver_route().system_source_reuse = false;
+      });
   expect_fill_failure(body,
                       make_fill(source_control(5, 1, 99), {}, system_paths),
                       "out-of-range system-source Line", valid_source_setup);

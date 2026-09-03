@@ -16,6 +16,8 @@ cppflags=${ICECC_TEST_CPPFLAGS:-${CPPFLAGS:-}}
 ldflags=${ICECC_TEST_LDFLAGS:-${LDFLAGS:-}}
 libs=${ICECC_TEST_LIBS:-${LIBS:-}}
 boost_cppflags=${ICECC_TEST_BOOST_CPPFLAGS:-${BOOST_CPPFLAGS:-}}
+boost_ldflags=${ICECC_TEST_BOOST_LDFLAGS:-${BOOST_LDFLAGS:-}}
+boost_libs=${ICECC_TEST_BOOST_LIBS:-${BOOST_LIBS:-}}
 binary=$(mktemp "$build_dir/p50cacheservice-sanitize.XXXXXX")
 cleanup() {
     rm -f -- "$binary"
@@ -40,22 +42,29 @@ fi
 
 "$cxx" "$standard" $cxxflags $cppflags \
     $boost_cppflags ${ICECC_TEST_LIBZSTD_CFLAGS:-} \
-    ${ICECC_TEST_XXHASH_CFLAGS:-} \
-    -Wall -Wextra -Wpedantic -Werror -pthread \
-    -DICECC_P50_CACHE_SERVICE_NO_MAIN -fsanitize=address,undefined,leak \
+    ${ICECC_TEST_LIBBSC_CFLAGS:-} ${ICECC_TEST_XXHASH_CFLAGS:-} \
+    -Wall -Wextra -Wpedantic -Werror -Wno-mismatched-new-delete -pthread \
+    -DICECC_P50_CACHE_SERVICE_NO_MAIN -DICECC_P50_ENDPOINT_TEST_HOOKS \
+    -fsanitize=address,undefined,leak \
     -fno-omit-frame-pointer -I"$test_srcdir/../cache" \
     -I"$test_srcdir/../services" -I"$test_srcdir/.." \
-    $ldflags \
+    $ldflags $boost_ldflags \
     "$test_srcdir/p50cacheservice.cpp" \
     "$test_srcdir/../cache/p50_cache_service.cpp" \
+    "$test_srcdir/../client/p50_route_owner.cpp" \
+    "$test_srcdir/../client/p50_zstd_sender.cpp" \
+    "$build_dir/../cache/libp50endpointtesthooks.a" \
     "$build_dir/../cache/libp50endpoint.a" \
+    "$build_dir/../cache/libp50adoptedoutcomewriter.a" \
     "$build_dir/../cache/libp50inputfd.a" \
     "$build_dir/../cache/libp50inputlifecycle.a" \
     "$build_dir/../cache/libprotocol50.a" \
     "$build_dir/../cache/libp50localtransport.a" \
     "$build_dir/../services/.libs/libicecc.a" \
     $dep_ldflags ${ICECC_TEST_LIBZSTD_LIBS:--lzstd} \
-    ${ICECC_TEST_XXHASH_LIBS:--lxxhash} $lzo_lib -ldl $libs -o "$binary"
+    ${ICECC_TEST_LIBBSC_LIBS:-} ${ICECC_TEST_XXHASH_LIBS:--lxxhash} \
+    ${ICECC_TEST_LIBCAP_NG_LIBS:-} $boost_libs $lzo_lib -ldl $libs \
+    -o "$binary"
 
 ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
 UBSAN_OPTIONS=halt_on_error=1 \

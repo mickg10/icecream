@@ -2,6 +2,7 @@
 #include "p50_slice0.h"
 
 #include "p50_adopted_outcome_writer.h"
+#include "codec/p29_wire.h"
 #include "p50_grz.h"
 #include "p50_p29_residual.h"
 
@@ -21,6 +22,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <fcntl.h>
 #include <limits>
 #include <map>
@@ -39,6 +41,20 @@ namespace {
 
 namespace asio = boost::asio;
 using tcp = asio::ip::tcp;
+
+uint64_t elapsed_nanoseconds(
+    std::chrono::steady_clock::time_point started) noexcept {
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - started)
+                             .count();
+    return elapsed > 0 ? static_cast<uint64_t>(elapsed) : 0;
+}
+
+void add_saturating(uint64_t& target, uint64_t value) noexcept {
+    target = value > std::numeric_limits<uint64_t>::max() - target
+                 ? std::numeric_limits<uint64_t>::max()
+                 : target + value;
+}
 
 std::vector<std::vector<uint8_t>> p29_line_regions(std::span<const uint8_t> input) {
     std::vector<std::vector<uint8_t>> regions;
@@ -90,8 +106,8 @@ void validate_caps(const EndpointCaps& caps) {
     if (caps.wire.max_fill_record_bytes < 32)
         throw std::invalid_argument("endpoint FILL-record cap is too small");
     validate_zstd_tu_limits(caps.zstd);
-    if (caps.profile != ProfileId::P29 && caps.profile != ProfileId::ZSTD_TU &&
-        caps.profile != ProfileId::Z3_LONG
+    if (caps.profile != ProfileId::P29 && caps.profile != ProfileId::P29V1 &&
+        caps.profile != ProfileId::ZSTD_TU && caps.profile != ProfileId::Z3_LONG
 #if defined(ICECC_P50_WITH_LIBBSC)
         && caps.profile != ProfileId::GRZ
 #endif
@@ -105,8 +121,18 @@ void validate_caps(const EndpointCaps& caps) {
 }
 
 GlobalResourceLimits global_resource_limits(const P50ServerOwnerLimits& limits) {
-    const uint64_t aggregate = limits.max_retained_input_bytes;
-    const uint64_t staging = limits.max_pending_raw_bytes;
+    if (limits.max_retained_input_bytes >
+            std::numeric_limits<uint64_t>::max() / 2 ||
+        limits.max_pending_raw_bytes >
+            std::numeric_limits<uint64_t>::max() / 2 ||
+        limits.max_live_sessions >
+            std::numeric_limits<size_t>::max() / 2)
+        throw std::overflow_error(
+            "P29V1 global resource limits cannot be doubled");
+    // Every retained P29V1 input may own one equally bounded receiver segment,
+    // and every live P29V1 TU may stage both objects before either is visible.
+    const uint64_t aggregate = 2 * limits.max_retained_input_bytes;
+    const uint64_t staging = 2 * limits.max_pending_raw_bytes;
     const uint64_t total = staging > std::numeric_limits<uint64_t>::max() - aggregate
                                ? std::numeric_limits<uint64_t>::max()
                                : aggregate + staging;
@@ -115,7 +141,7 @@ GlobalResourceLimits global_resource_limits(const P50ServerOwnerLimits& limits) 
             .max_staging_bytes = staging,
             .max_total_bytes = total,
             .max_generation = KeyLayoutV1::generation_value_mask,
-            .max_staging_slots = limits.max_live_sessions};
+            .max_staging_slots = 2 * limits.max_live_sessions};
 }
 
 CompletionStamp with_operation(CompletionStamp stamp, AsyncOperationKind operation) {
@@ -358,6 +384,7 @@ struct ServerMaterializationCompletion {
     std::shared_ptr<ProfileDialogue> dialogue;
     InputRecordStore::PreparedPublish prepared_input;
     std::exception_ptr failure;
+    uint64_t materialize_ns = 0;
 };
 
 // A worker may outlive both the endpoint coroutine and its io_context.  Keep
@@ -518,12 +545,17 @@ async_materialize(ServerMaterializationJob job,
                        .commit = job.commit,
                        .dialogue = std::move(job.dialogue),
                        .prepared_input = {},
-                       .failure = {}};
+                       .failure = {},
+                       .materialize_ns = 0};
                    try {
                        if (job.before_materialize)
                            job.before_materialize();
+                       const auto materialize_started =
+                           std::chrono::steady_clock::now();
                        std::vector<uint8_t> exact =
                            completion.dialogue->materialize();
+                       completion.materialize_ns =
+                           elapsed_nanoseconds(materialize_started);
                        completion.prepared_input =
                            InputRecordStore::prepare_publish(
                                job.c_store_guid, job.begin, job.commit,
@@ -637,6 +669,14 @@ asio::awaitable<void> async_connect(tcp::socket& socket, const tcp::endpoint& re
     verify(expected);
     if (error)
         throw boost::system::system_error(error);
+#if !defined(ICECC_P29V1_MUTANT_NO_NODELAY)
+    // Protocol 50 is an interactive request/response dialogue with small
+    // frames.  Nagle plus delayed ACK otherwise adds roughly one timer tick
+    // to every transaction.
+    socket.set_option(tcp::no_delay(true), error);
+    if (error)
+        throw boost::system::system_error(error);
+#endif
 }
 
 template <class Verify>
@@ -649,6 +689,11 @@ asio::awaitable<void> async_accept(tcp::acceptor& acceptor, tcp::socket& socket,
     verify(expected);
     if (error)
         throw boost::system::system_error(error);
+#if !defined(ICECC_P29V1_MUTANT_NO_NODELAY)
+    socket.set_option(tcp::no_delay(true), error);
+    if (error)
+        throw boost::system::system_error(error);
+#endif
 }
 
 template <class Verify>
@@ -682,6 +727,8 @@ asio::awaitable<void> async_write_message(tcp::socket& socket, Message message,
             throw boost::system::system_error(error);
         offset += written;
     }
+    if (control.outbound_message_observer)
+        control.outbound_message_observer(stamp.actor, message);
     if (control.close_after_write == type) {
         control.close_after_write.reset();
         close_now(socket);
@@ -863,6 +910,7 @@ struct P50PreparationAuthority::Impl {
         Digest128 grz_state_digest{};
 #endif
         std::unique_ptr<CRoute> p29_route;
+        Digest128 p29v1_system_source_fingerprint{};
     };
 
     // One request/input record is C-wide.  A route view below carries only
@@ -898,10 +946,12 @@ struct P50PreparationAuthority::Impl {
             throw std::invalid_argument("C preparation authority GUID zero is reserved");
         validate_zstd_tu_limits(zstd_limits);
         if (authority_limits.max_live_entries == 0 ||
-            authority_limits.max_retained_encoded_bytes == 0)
+            authority_limits.max_retained_encoded_bytes == 0 ||
+            authority_limits.max_interner_reserved_bytes == 0 ||
+            authority_limits.max_route_state_bytes == 0)
             throw std::invalid_argument("preparation-authority limits must be nonzero");
-        if (profile != ProfileId::P29 && profile != ProfileId::ZSTD_TU &&
-            profile != ProfileId::Z3_LONG
+        if (profile != ProfileId::P29 && profile != ProfileId::P29V1 &&
+            profile != ProfileId::ZSTD_TU && profile != ProfileId::Z3_LONG
 #if defined(ICECC_P50_WITH_LIBBSC)
             && profile != ProfileId::GRZ
 #endif
@@ -909,6 +959,17 @@ struct P50PreparationAuthority::Impl {
             throw std::invalid_argument("preparation authority profile is unsupported");
         p29_authority = std::make_unique<CAuthority>(c_guid, p29::OnlineS1::Config{},
                                                       0, 1, first_tu_seq);
+        if (profile == ProfileId::P29V1)
+            ensure_p29v1();
+    }
+
+    void ensure_p29v1() {
+        if (p29v1_enabled)
+            return;
+        p29_authority->enable_p29v1(
+            authority_limits.max_interner_reserved_bytes,
+            zstd_limits.max_raw_bytes);
+        p29v1_enabled = true;
     }
 
     static PreparationRouteKey legacy_route(ProfileId profile) {
@@ -920,7 +981,8 @@ struct P50PreparationAuthority::Impl {
         if (key.f_store_guid == FStoreGuid{} || key.f_store_generation == 0)
             throw std::invalid_argument("preparation route identity is zero");
         if (key.profile != ProfileId::ZSTD_TU &&
-            key.profile != ProfileId::Z3_LONG && key.profile != ProfileId::P29
+            key.profile != ProfileId::Z3_LONG && key.profile != ProfileId::P29 &&
+            key.profile != ProfileId::P29V1
 #if defined(ICECC_P50_WITH_LIBBSC)
             && key.profile != ProfileId::GRZ
 #endif
@@ -930,7 +992,16 @@ struct P50PreparationAuthority::Impl {
         if (found != routes.end()) return *found->second;
         auto state = std::make_unique<RouteState>();
         state->profile = key.profile;
-        if (key.profile == ProfileId::P29)
+        if (key.profile == ProfileId::P29V1) {
+            ensure_p29v1();
+            // A relationship that starts before the asynchronous daemon
+            // fingerprint is ready remains reuse-off for its lifetime.  A
+            // later relationship may capture the completed fingerprint;
+            // neither relationship can change its reuse decision mid-route.
+            state->p29v1_system_source_fingerprint =
+                p29_system_source_fingerprint();
+        }
+        if (key.profile == ProfileId::P29 || key.profile == ProfileId::P29V1)
             state->p29_route = std::make_unique<CRoute>(
                 *p29_authority, key.f_store_guid, HistoryNonce{1});
         RouteState& result = *state;
@@ -962,6 +1033,7 @@ struct P50PreparationAuthority::Impl {
     uint64_t retained_bytes = 0;
     ZstdRouteCodec route_codec;
     std::unique_ptr<CAuthority> p29_authority;
+    bool p29v1_enabled = false;
     std::map<PreparationRouteKey, std::unique_ptr<RouteState>> routes;
     ProfileId profile = ProfileId::ZSTD_TU;
     std::map<PrepareRequestKey, std::shared_ptr<Shared>> requests;
@@ -992,7 +1064,6 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
     PreparationRouteKey route_key, PrepareRequestKey request,
     std::span<const uint8_t> exact_input) {
     impl_->owner.require();
-    Impl::RouteState& route = impl_->route_state(route_key);
     if (request.producer_session == 0 || request.request_token == 0)
         throw std::invalid_argument("PrepareRequestKey zero fields are reserved");
     if (exact_input.size() > impl_->zstd_limits.max_raw_bytes)
@@ -1012,7 +1083,13 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
             return PreparedTuHandle(impl_->identity, route_entry->second);
     }
 
-    if ((route.profile == ProfileId::Z3_LONG || route.profile == ProfileId::P29) &&
+    // Do not allocate route state or pin an asynchronous P29V1 fingerprint for
+    // a malformed request.  Once admitted, the route captures its fingerprint
+    // exactly once and cannot change its reuse decision mid-relationship.
+    Impl::RouteState& route = impl_->route_state(route_key);
+
+    if ((route.profile == ProfileId::Z3_LONG || route.profile == ProfileId::P29 ||
+         route.profile == ProfileId::P29V1) &&
         route.uncommitted_route_entry.has_value())
         throw std::logic_error(
             "selected route profile requires its predecessor to commit before preparing the next TU");
@@ -1088,6 +1165,21 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
             prepared = std::make_shared<const PreparedInputEnvelope>(
                 PreparedInputEnvelope{active.begin, active.dict, active.body,
                                       std::move(fills)});
+        } else if (route.profile == ProfileId::P29V1) {
+            if (!shared->p29_source) {
+                shared->p29_source =
+                    impl_->p29_authority->prepare_p29v1_at_seq(
+                        exact_input, shared->tu_seq);
+            }
+            if (shared->p29_source->tu_seq != tu_seq)
+                throw std::logic_error("P29V1 shared TU identity changed");
+            const CActiveTx& active = route.p29_route->begin_v1(
+                shared->p29_source,
+                route.p29v1_system_source_fingerprint,
+                impl_->authority_limits.max_route_state_bytes);
+            p29_active_started = true;
+            prepared = std::make_shared<const PreparedInputEnvelope>(
+                PreparedInputEnvelope{active.begin, {}, active.body, {}});
 #if defined(ICECC_P50_WITH_LIBBSC)
         } else if (route.profile == ProfileId::GRZ) {
             const ZstdTuEnvelope envelope = route.grz_codec.encode(
@@ -1135,7 +1227,7 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
         retained_added = true;
         if (route.profile == ProfileId::Z3_LONG)
             route.uncommitted_route_entry = entry_id;
-        if (route.profile == ProfileId::P29)
+        if (route.profile == ProfileId::P29 || route.profile == ProfileId::P29V1)
             route.uncommitted_route_entry = entry_id;
 #if defined(ICECC_P50_WITH_LIBBSC)
         if (route.profile == ProfileId::GRZ)
@@ -1155,7 +1247,8 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
             impl_->requests.erase(request);
         if (entry_added)
             impl_->entries.erase(entry_id);
-        if ((route.profile == ProfileId::Z3_LONG || route.profile == ProfileId::P29) &&
+        if ((route.profile == ProfileId::Z3_LONG || route.profile == ProfileId::P29 ||
+             route.profile == ProfileId::P29V1) &&
             route.uncommitted_route_entry == entry_id)
             route.uncommitted_route_entry.reset();
 #if defined(ICECC_P50_WITH_LIBBSC)
@@ -1167,6 +1260,92 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
 #endif
         throw;
     }
+}
+
+std::span<const uint8_t> P50PreparationAuthority::answer_p29v1_need(
+    PreparedTuHandle handle, uint64_t flags,
+    std::span<const uint8_t> inner_need) {
+    impl_->owner.require();
+    if (handle.authority_.lock() != impl_->identity || handle.entry_id_ == 0)
+        throw std::invalid_argument(
+            "prepared-TU handle does not belong to this C authority");
+    const auto position = impl_->entries.find(handle.entry_id_);
+    if (position == impl_->entries.end())
+        throw std::invalid_argument("prepared-TU handle has been released");
+    Impl::Entry& entry = position->second;
+    if (entry.route.profile != ProfileId::P29V1 || entry.committed)
+        throw std::invalid_argument("prepared-TU handle is not active P29V1");
+    Impl::RouteState& route = impl_->route_state(entry.route);
+    if (!route.p29_route ||
+        route.uncommitted_route_entry != handle.entry_id_)
+        throw std::logic_error("P29V1 NEED does not identify the route successor");
+    return route.p29_route->build_fill_v1(flags, inner_need);
+}
+
+void P50PreparationAuthority::restart_p29v1_transport_retry(
+    PreparedTuHandle handle) {
+    impl_->owner.require();
+    if (handle.authority_.lock() != impl_->identity || handle.entry_id_ == 0)
+        throw std::invalid_argument(
+            "prepared-TU handle does not belong to this C authority");
+    const auto position = impl_->entries.find(handle.entry_id_);
+    if (position == impl_->entries.end())
+        throw std::invalid_argument("prepared-TU handle has been released");
+    Impl::Entry& entry = position->second;
+    if (entry.route.profile != ProfileId::P29V1 || entry.committed)
+        throw std::invalid_argument(
+            "prepared-TU handle is not active P29V1");
+    Impl::RouteState& route = impl_->route_state(entry.route);
+    if (!route.p29_route ||
+        route.uncommitted_route_entry != handle.entry_id_)
+        throw std::logic_error(
+            "P29V1 retry does not identify the route successor");
+    route.p29_route->restart_v1_for_transport_retry();
+}
+
+PreparedInputPtr P50PreparationAuthority::reset_p29v1_route(
+    PreparedTuHandle handle, FStoreGuid f_store_guid,
+    HistoryNonce history_nonce) {
+    impl_->owner.require();
+    if (handle.authority_.lock() != impl_->identity || handle.entry_id_ == 0)
+        throw std::invalid_argument(
+            "prepared-TU handle does not belong to this C authority");
+    auto position = impl_->entries.find(handle.entry_id_);
+    if (position == impl_->entries.end())
+        throw std::invalid_argument("prepared-TU handle has been released");
+    Impl::Entry& entry = position->second;
+    if (entry.route.profile != ProfileId::P29V1 || entry.committed ||
+        f_store_guid == FStoreGuid{} || history_nonce.value == 0)
+        throw std::invalid_argument(
+            "P29V1 route reset identity is invalid");
+    Impl::RouteState& route = impl_->route_state(entry.route);
+    if (!route.p29_route ||
+        route.uncommitted_route_entry != handle.entry_id_ ||
+        !entry.shared->p29_source)
+        throw std::logic_error(
+            "P29V1 route reset does not identify its prepared successor");
+
+    route.p29_route->reset_v1_route(f_store_guid, history_nonce);
+    const CActiveTx& active = route.p29_route->begin_v1(
+        entry.shared->p29_source,
+        route.p29v1_system_source_fingerprint,
+        impl_->authority_limits.max_route_state_bytes);
+    PreparedInputPtr replacement =
+        std::make_shared<const PreparedInputEnvelope>(
+            PreparedInputEnvelope{active.begin, {}, active.body, {}});
+    const uint64_t retained = static_cast<uint64_t>(replacement->body.size());
+    const uint64_t other_retained = impl_->retained_bytes - entry.retained_bytes;
+    if (retained > impl_->authority_limits.max_retained_encoded_bytes ||
+        other_retained >
+            impl_->authority_limits.max_retained_encoded_bytes - retained) {
+        route.p29_route->abandon_active();
+        throw std::length_error(
+            "C preparation authority reached its retained-byte bound");
+    }
+    impl_->retained_bytes = other_retained + retained;
+    entry.retained_bytes = retained;
+    entry.prepared = replacement;
+    return replacement;
 }
 
 uint64_t P50PreparationAuthority::retain(PreparedTuHandle handle) {
@@ -1192,11 +1371,15 @@ uint64_t P50PreparationAuthority::release(PreparedTuHandle handle) {
     Impl::RouteState& route = impl_->route_state(entry.route);
     if (--entry.references != 0)
         return entry.references;
-    if ((entry.route.profile == ProfileId::Z3_LONG || entry.route.profile == ProfileId::P29) && !entry.committed &&
+    if ((entry.route.profile == ProfileId::Z3_LONG ||
+         entry.route.profile == ProfileId::P29 ||
+         entry.route.profile == ProfileId::P29V1) &&
+        !entry.committed &&
         route.uncommitted_route_entry == handle.entry_id_)
     {
         route.uncommitted_route_entry.reset();
-        if (entry.route.profile == ProfileId::P29 && route.p29_route)
+        if ((entry.route.profile == ProfileId::P29 ||
+             entry.route.profile == ProfileId::P29V1) && route.p29_route)
             route.p29_route->abandon_active();
     }
 #if defined(ICECC_P50_WITH_LIBBSC)
@@ -1252,7 +1435,8 @@ void P50PreparationAuthority::commit(PreparedTuHandle handle) {
         entry.committed = true;
         route.uncommitted_route_entry.reset();
     }
-    if (entry.route.profile == ProfileId::P29 && !entry.committed) {
+    if ((entry.route.profile == ProfileId::P29 ||
+         entry.route.profile == ProfileId::P29V1) && !entry.committed) {
         if (route.uncommitted_route_entry != handle.entry_id_)
             throw std::logic_error("P29 commit is not its prepared successor");
         const auto commit = TxCommit{entry.prepared->begin.history_nonce,
@@ -1419,6 +1603,23 @@ uint64_t P50PreparationAuthority::retained_encoded_bytes() const {
     return impl_->retained_bytes;
 }
 
+uint64_t P50PreparationAuthority::p29v1_interner_reserved_bytes() const {
+    impl_->owner.check();
+    return impl_->p29_authority->p29v1_interner_reserved_bytes();
+}
+
+uint64_t P50PreparationAuthority::p29v1_interner_committed_bytes() const {
+    impl_->owner.check();
+    return impl_->p29_authority->p29v1_interner_committed_bytes();
+}
+
+uint64_t P50PreparationAuthority::p29v1_route_state_bytes(
+    PreparationRouteKey route_key) const {
+    impl_->owner.check();
+    const Impl::RouteState& route = impl_->route_state(route_key);
+    return route.p29_route ? route.p29_route->p29v1_route_state_bytes() : 0;
+}
+
 size_t P50PreparationAuthority::route_history_bytes() const {
     return route_history_bytes(Impl::legacy_route(impl_->profile));
 }
@@ -1520,6 +1721,19 @@ void P50PreparationAuthority::validate_begin(const TxBegin& begin) const {
             begin.dict.encoded_bytes > impl_->zstd_limits.max_encoded_body_bytes)
             throw std::length_error("prepared P29 input exceeds authority limits");
     }
+    else if (begin.profile == ProfileId::P29V1) {
+        if (begin.p29_root_mode != P29RootMode::RouteHistory ||
+            begin.dict.encoding != kP29V1FingerprintDictEncoding ||
+            begin.dict.encoded_bytes != 0 || begin.dict.decoded_bytes != 0 ||
+            begin.body.encoding != kP29WireV1BodyEncoding)
+            throw std::invalid_argument(
+                "prepared P29V1 profile differs from authority");
+        if (begin.raw_bytes > impl_->zstd_limits.max_raw_bytes ||
+            begin.body.encoded_bytes >
+                impl_->zstd_limits.max_encoded_body_bytes)
+            throw std::length_error(
+                "prepared P29V1 input exceeds authority limits");
+    }
     else {
         throw std::invalid_argument("prepared profile is unsupported");
     }
@@ -1538,6 +1752,7 @@ struct P50ClientEndpoint::Impl {
         PreparedInputPtr prepared;
         PreparedTuHandle handle;
         TxBegin begin;
+        bool p29v1_transport_retry = false;
     };
 
     Impl(std::shared_ptr<P50PreparationAuthority> preparation_value, EndpointCaps cap_value,
@@ -1746,12 +1961,16 @@ struct P50ServerEndpoint::Impl {
         bool materializing = false;
         bool global_tu_started = false;
         bool global_staged = false;
+        bool global_segment_staged = false;
         CStoreGuid global_c_guid{};
         Key64 global_key{};
+        Key64 global_segment_key{};
         size_t global_slot = 0;
+        size_t global_segment_slot = 0;
         uint64_t reserved_encoded_bytes = 0;
         uint64_t reserved_raw_bytes = 0;
         uint64_t reserved_window_bytes = 0;
+        uint64_t fill_apply_ns = 0;
     };
 
     struct PreparedBegin {
@@ -1763,6 +1982,7 @@ struct P50ServerEndpoint::Impl {
         TxBegin begin;
         TxCommit commit;
         InputRecordStore::PreparedPublish prepared_input;
+        uint64_t f_apply_materialize_ns = 0;
     };
 
     struct Route {
@@ -1773,6 +1993,11 @@ struct P50ServerEndpoint::Impl {
         std::optional<TxBegin> interrupted;
         std::optional<Pending> pending;
         std::shared_ptr<ProfileDialogue> dialogue;
+        std::optional<ProfileId> dialogue_profile;
+        // The authenticated Protocol-50 cursor survives payload eviction, but
+        // a discarded continuing codec cannot honestly mirror that cursor.
+        // Advertise no route until HISTORY_RESET replaces it.
+        bool codec_history_reset_required = false;
     };
 
     struct Namespace {
@@ -1782,6 +2007,7 @@ struct P50ServerEndpoint::Impl {
         std::optional<HistoryNonce> nonce_high_water;
         std::optional<Route> route;
         std::optional<InputRecordKey> last_input;
+        std::vector<Key64> p29v1_segments;
     };
 
     struct Revision {
@@ -1931,14 +2157,53 @@ struct P50ServerEndpoint::Impl {
         return *key;
     }
 
+    Key64 global_segment_key(TuSeq tu_seq) const {
+        if (tu_seq.value == KeyLayoutV1::ordinal_mask)
+            throw std::overflow_error(
+                "P29V1 segment key ordinal space exhausted");
+        const auto key = Key64::make(
+            ObjectType::P29Segment,
+            static_cast<uint16_t>(config.endpoint_generation),
+            tu_seq.value + 1);
+        if (!key)
+            throw std::overflow_error(
+                "P29V1 segment key cannot be represented");
+        return *key;
+    }
+
+    void release_p29v1_segments(CStoreGuid c_guid, Namespace& space) {
+        for (const Key64 key : space.p29v1_segments)
+            global_resources->release(c_guid, key);
+        space.p29v1_segments.clear();
+    }
+
+    void invalidate_p29v1_codec(CStoreGuid c_guid, Namespace& space) {
+        if (!space.route ||
+            space.route->dialogue_profile != ProfileId::P29V1)
+            return;
+        release_p29v1_segments(c_guid, space);
+        if (space.route->dialogue) {
+            space.route->dialogue->reset();
+            space.route->dialogue.reset();
+        }
+        space.route->dialogue_profile.reset();
+        space.route->codec_history_reset_required = true;
+    }
+
     void finish_global_pending(Pending& pending, bool crash) {
+        if (pending.global_segment_staged && crash) {
+            global_resources->crash_install(
+                pending.global_c_guid, pending.global_segment_key,
+                pending.global_segment_slot);
+            pending.global_segment_staged = false;
+        }
         if (pending.global_staged && crash) {
             global_resources->crash_install(pending.global_c_guid,
                                             pending.global_key,
                                             pending.global_slot);
             pending.global_staged = false;
         }
-        if (pending.global_staged)
+        if (pending.global_staged || pending.global_segment_staged)
             throw std::logic_error("global pending object was not completed");
         if (pending.global_tu_started) {
             global_resources->finish_tu(pending.global_c_guid);
@@ -2001,8 +2266,14 @@ struct P50ServerEndpoint::Impl {
                 "F endpoint selected a live namespace for LRU eviction");
         for (const InputRecordKey key : input_records.namespace_keys(c_guid))
             global_resources->release(c_guid, global_key(key.tu_seq));
+        Namespace& space = namespaces.at(c_guid);
         input_records.evict_namespace(c_guid);
-        namespaces.at(c_guid).last_input.reset();
+        space.last_input.reset();
+        // Input payload eviction never destroys the authenticated outer
+        // Protocol-50 cursor. P29V1's receiver dictionary does depend on its
+        // charged segments, so discard only that codec and force the normal
+        // HISTORY_RESET reconciliation on the next connection.
+        invalidate_p29v1_codec(c_guid, space);
     }
 
     void release_collected_global_inputs(
@@ -2274,8 +2545,9 @@ struct P50ServerEndpoint::Impl {
             return result;
         const Namespace& space = position->second;
         result.namespace_present = space.established;
-        result.route_present = space.route.has_value();
-        if (space.route) {
+        result.route_present = space.route.has_value() &&
+                               !space.route->codec_history_reset_required;
+        if (result.route_present) {
             result.history_nonce = space.route->nonce;
             result.next_rel_seq = space.route->next_rel;
             result.state_digest = space.route->state;
@@ -2389,6 +2661,9 @@ struct P50ServerEndpoint::Impl {
             release_pending(*space.route->pending);
             space.route->pending.reset();
         }
+        if (space.route && space.route->dialogue_profile == ProfileId::P29V1 &&
+            space.route->dialogue && space.route->dialogue->terminal())
+            invalidate_p29v1_codec(*session.c_guid, space);
         record(ActionType::SESSION_DISCONNECTED, session);
         space.active_session = 0;
         touch_namespace_on_disconnect(*session.c_guid, space);
@@ -2403,8 +2678,9 @@ struct P50ServerEndpoint::Impl {
         result.limits = selection.limits;
         result.f_store_guid = f_guid;
         result.namespace_present = space.established;
-        result.route_present = space.route.has_value();
-        if (space.route) {
+        result.route_present = space.route.has_value() &&
+                               !space.route->codec_history_reset_required;
+        if (result.route_present) {
             result.history_nonce = space.route->nonce;
             result.next_rel_seq = space.route->next_rel;
             result.state_digest = space.route->state;
@@ -2441,6 +2717,7 @@ struct P50ServerEndpoint::Impl {
     void reset_history(const Session& session, const HistoryReset& reset) {
         Namespace& space = require(session);
         validate_history_reset(*session.c_guid, &space, reset);
+        invalidate_p29v1_codec(*session.c_guid, space);
         space.established = true;
         space.nonce_high_water = reset.history_nonce;
         space.route = Route{.nonce = reset.history_nonce,
@@ -2449,7 +2726,9 @@ struct P50ServerEndpoint::Impl {
                             .last_commit = std::nullopt,
                             .interrupted = std::nullopt,
                             .pending = std::nullopt,
-                            .dialogue = nullptr};
+                            .dialogue = nullptr,
+                            .dialogue_profile = std::nullopt,
+                            .codec_history_reset_required = false};
         record(ActionType::HISTORY_RESET, session);
     }
 
@@ -2459,6 +2738,9 @@ struct P50ServerEndpoint::Impl {
         if (!space.route)
             throw std::logic_error("TX_BEGIN arrived before HISTORY_RESET");
         const Route& route = *space.route;
+        if (route.codec_history_reset_required)
+            throw std::logic_error(
+                "TX_BEGIN arrived before required codec HISTORY_RESET");
         if (begin.history_nonce != route.nonce || begin.rel_seq != route.next_rel ||
             begin.pre_state_digest != route.state)
             throw std::logic_error("TX_BEGIN differs from the F route cursor");
@@ -2485,7 +2767,9 @@ struct P50ServerEndpoint::Impl {
                                       .max_raw_bytes = caps.zstd.max_raw_bytes,
                                       .max_window_log = caps.zstd.max_window_log,
                                       .max_history_bytes = caps.zstd.max_history_bytes}));
-        if ((begin.profile == ProfileId::P29 || begin.profile == ProfileId::Z3_LONG
+        if ((begin.profile == ProfileId::P29 ||
+             begin.profile == ProfileId::P29V1 ||
+             begin.profile == ProfileId::Z3_LONG
 #if defined(ICECC_P50_WITH_LIBBSC)
              || begin.profile == ProfileId::GRZ
 #endif
@@ -2513,15 +2797,21 @@ struct P50ServerEndpoint::Impl {
         if (route.interrupted && route.interrupted != prepared.pending.begin)
             throw StaleCompletion();
         if (prepared.pending.begin.profile == ProfileId::P29 ||
+            prepared.pending.begin.profile == ProfileId::P29V1 ||
             prepared.pending.begin.profile == ProfileId::Z3_LONG
 #if defined(ICECC_P50_WITH_LIBBSC)
             || prepared.pending.begin.profile == ProfileId::GRZ
 #endif
             ) {
-            if (!route.dialogue)
+            if (!route.dialogue) {
                 route.dialogue = prepared.pending.dialogue;
-            else
+                route.dialogue_profile = prepared.pending.begin.profile;
+            } else {
+                if (route.dialogue_profile != prepared.pending.begin.profile)
+                    throw std::logic_error(
+                        "persistent profile changed without HISTORY_RESET");
                 prepared.pending.dialogue = route.dialogue;
+            }
         }
         const TxBegin begin = prepared.pending.begin;
         prepared.pending.dialogue->begin(begin);
@@ -2591,7 +2881,11 @@ struct P50ServerEndpoint::Impl {
         Namespace& space = require(session);
         if (!space.route || !space.route->pending)
             throw std::logic_error("FILL has no F active transaction");
-        space.route->pending->dialogue->receive_fill(message);
+        Pending& pending = *space.route->pending;
+        const auto started = std::chrono::steady_clock::now();
+        pending.dialogue->receive_fill(message);
+        add_saturating(pending.fill_apply_ns,
+                       elapsed_nanoseconds(started));
     }
 
     bool body_complete(const Session& session) const {
@@ -2652,9 +2946,50 @@ struct P50ServerEndpoint::Impl {
             completion.prepared_input.key() !=
                 InputRecordKey{*session.c_guid, pending.begin.tu_seq})
             throw StaleCompletion();
+        if (pending.begin.profile == ProfileId::P29V1) {
+            const uint64_t segment_bytes =
+                pending.dialogue->pending_segment_bytes();
+            const Digest128 segment_digest =
+                pending.dialogue->pending_segment_digest();
+            if (segment_bytes > pending.begin.raw_bytes ||
+                (segment_bytes == 0) != (segment_digest == Digest128{}))
+                throw std::logic_error(
+                    "P29V1 pending segment observation is invalid");
+            if (segment_bytes != 0) {
+                try {
+                    if (!pending.global_staged)
+                        throw std::logic_error(
+                            "P29V1 segment lacks its staged input record");
+                    space.p29v1_segments.reserve(
+                        space.p29v1_segments.size() + 1);
+                    const auto slot =
+                        global_resources->first_free_staging_slot();
+                    if (!slot)
+                        throw std::length_error(
+                            "F endpoint P29V1 staging-slot pool is exhausted");
+                    pending.global_segment_key =
+                        global_segment_key(pending.begin.tu_seq);
+                    pending.global_segment_slot = *slot;
+                    const bool retry =
+                        global_resources->install_retry_required(
+                            *session.c_guid, pending.global_segment_key);
+                    global_resources->begin_install(
+                        *session.c_guid, pending.global_segment_key,
+                        segment_digest, segment_bytes, *slot, retry);
+                    pending.global_segment_staged = true;
+                } catch (...) {
+                    pending.dialogue->discard_tentative();
+                    release_pending(pending);
+                    throw;
+                }
+            }
+        }
         record(ActionType::INPUT_MATERIALIZED, session, &pending.begin);
+        uint64_t f_apply_materialize_ns = pending.fill_apply_ns;
+        add_saturating(f_apply_materialize_ns, completion.materialize_ns);
         return MaterializedInput{completion.begin, completion.commit,
-                                 std::move(completion.prepared_input)};
+                                 std::move(completion.prepared_input),
+                                 f_apply_materialize_ns};
     }
 
     InputJobState select_materialized_job_state(
@@ -2699,6 +3034,31 @@ struct P50ServerEndpoint::Impl {
             !input_records.contains(input_key))
             ensure_input_capacity(*session.c_guid,
                                   materialized.begin.raw_bytes);
+        if (pending.global_segment_staged) {
+            const Digest128 segment_digest =
+                pending.dialogue->pending_segment_digest();
+            if (std::find(space.p29v1_segments.begin(),
+                          space.p29v1_segments.end(),
+                          pending.global_segment_key) !=
+                space.p29v1_segments.end())
+                throw std::logic_error(
+                    "P29V1 segment key was already published");
+            if (job_state == InputJobState::Open) {
+                if (!pending.global_staged)
+                    throw std::logic_error(
+                        "P29V1 pair publication lost its staged input");
+                global_resources->preflight_publish_pair(
+                    *session.c_guid, pending.global_segment_key,
+                    pending.global_segment_slot, segment_digest,
+                    pending.global_key, pending.global_slot,
+                    materialized.begin.raw_digest);
+            }
+            global_resources->publish(
+                *session.c_guid, pending.global_segment_key,
+                pending.global_segment_slot, segment_digest);
+            pending.global_segment_staged = false;
+            space.p29v1_segments.push_back(pending.global_segment_key);
+        }
         if (pending.global_staged) {
             if (job_state == InputJobState::Open)
                 global_resources->publish(*session.c_guid, pending.global_key,
@@ -3156,6 +3516,11 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
                 reset_retry = impl_->preparation->reset_grz_route(
                     impl_->queued_handle, replacement_nonce);
 #endif
+            if (impl_->caps.profile == ProfileId::P29V1 &&
+                established_relationship)
+                reset_retry = impl_->preparation->reset_p29v1_route(
+                    impl_->queued_handle, peer.f_store_guid,
+                    replacement_nonce);
             if (impl_->active) {
                 if (same_f) {
                     impl_->record(ActionType::TX_ABORTED, impl_->active->begin, serial,
@@ -3173,6 +3538,14 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
             impl_->state = replacement_state;
             impl_->route_known = true;
             session.provisional_nonce.reset();
+        }
+
+        if (exact && impl_->active &&
+            impl_->active->begin.profile == ProfileId::P29V1 &&
+            impl_->active->p29v1_transport_retry) {
+            impl_->preparation->restart_p29v1_transport_retry(
+                impl_->active->handle);
+            impl_->active->p29v1_transport_retry = false;
         }
 
         if (!impl_->active) {
@@ -3239,6 +3612,45 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
                 socket, impl_->active->prepared->body, frame_cap,
                 impl_->stamp(session, AsyncOperationKind::WriteFragment), impl_->completions,
                 control, verify);
+        } else if (begin.profile == ProfileId::P29V1) {
+            co_await async_write_component<BodyMessage>(
+                socket, impl_->active->prepared->body, frame_cap,
+                impl_->stamp(session, AsyncOperationKind::WriteFragment),
+                impl_->completions, control, verify);
+            codec::P29WireLimits wire_limits;
+            wire_limits.max_tu_bytes = static_cast<size_t>(
+                impl_->caps.zstd.max_raw_bytes);
+            wire_limits.max_region_bytes = wire_limits.max_tu_bytes;
+            P29V1NeedStreamDecoder need_decoder(
+                codec::p29v1_need_inner_bound(wire_limits));
+            for (;;) {
+                Frame need_frame = co_await async_read_frame(
+                    socket, frame_cap,
+                    impl_->stamp(session, AsyncOperationKind::ReadHeader),
+                    impl_->completions, verify);
+                if (need_frame.type == MessageType::ERROR)
+                    throw ClientTerminalResult(
+                        decode_as<ErrorMessage>(need_frame), frame_cap);
+                if (need_frame.type != MessageType::NEED)
+                    throw std::invalid_argument(
+                        "P29V1 expected NEED before FILL");
+                need_decoder.push(decode_as<NeedMessage>(need_frame));
+                if (need_decoder.complete())
+                    break;
+            }
+            const std::span<const uint8_t> inner_fill =
+                impl_->preparation->answer_p29v1_need(
+                    impl_->active->handle, need_decoder.flags(),
+                    need_decoder.inner_frames());
+            const std::vector<FillMessage> fills =
+                encode_p29v1_fill_messages(
+                    inner_fill, frame_cap,
+                    codec::p29v1_fill_inner_bound(wire_limits));
+            for (const FillMessage& fill : fills)
+                co_await async_write_message(
+                    socket, fill, frame_cap,
+                    impl_->stamp(session, AsyncOperationKind::WriteFragment),
+                    impl_->completions, control, verify);
         } else {
             co_await async_write_component<BodyMessage>(
                 socket, impl_->active->prepared->body, frame_cap,
@@ -3313,6 +3725,11 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
         result.status = ClientRunStatus::DeadlineExceeded;
         result.observation = ClientRunObservation::DeadlineExpired;
     }
+    if (!io->committed && impl_->active &&
+        impl_->active->begin.profile == ProfileId::P29V1 &&
+        (result.status == ClientRunStatus::Disconnected ||
+         result.status == ClientRunStatus::DeadlineExceeded))
+        impl_->active->p29v1_transport_retry = true;
     boost::system::error_code timer_error;
     io->timer.cancel(timer_error);
     if (impl_->active_session == serial)
@@ -3407,6 +3824,13 @@ std::optional<tcp::socket> P50ServerEndpoint::adopt_connected_fd(
             error = asio::error::operation_not_supported;
             return std::nullopt;
         }
+#if !defined(ICECC_P29V1_MUTANT_NO_NODELAY)
+        socket.set_option(tcp::no_delay(true), error);
+        if (error) {
+            close_now(socket);
+            return std::nullopt;
+        }
+#endif
         return socket;
     } catch (...) {
         close_native_fd(fd);
@@ -3734,20 +4158,25 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
             switch (component.type) {
             case MessageType::DICT:
                 impl_->append_dict(session, decode_as<DictMessage>(component));
-                if (impl_->namespaces.at(*session.c_guid).route->pending->begin.profile ==
-                    ProfileId::P29) {
-                    const std::vector<NeedMessage> needs =
-                        impl_->namespaces.at(*session.c_guid).route->pending->dialogue->
-                            need_messages(selection.limits.max_frame_payload);
-                    for (const NeedMessage& need : needs)
-                        co_await async_write_message(
-                            socket, need, selection.limits.max_frame_payload,
-                            impl_->stamp(session, AsyncOperationKind::WriteFragment),
-                            impl_->completions, control, verify);
-                }
+                for (const NeedMessage& need :
+                     impl_->namespaces.at(*session.c_guid)
+                         .route->pending->dialogue->need_messages(
+                             selection.limits.max_frame_payload))
+                    co_await async_write_message(
+                        socket, need, selection.limits.max_frame_payload,
+                        impl_->stamp(session, AsyncOperationKind::WriteFragment),
+                        impl_->completions, control, verify);
                 break;
             case MessageType::BODY:
                 impl_->append_body(session, decode_as<BodyMessage>(component));
+                for (const NeedMessage& need :
+                     impl_->namespaces.at(*session.c_guid)
+                         .route->pending->dialogue->need_messages(
+                             selection.limits.max_frame_payload))
+                    co_await async_write_message(
+                        socket, need, selection.limits.max_frame_payload,
+                        impl_->stamp(session, AsyncOperationKind::WriteFragment),
+                        impl_->completions, control, verify);
                 break;
             case MessageType::NEED:
                 impl_->receive_need(session, decode_as<NeedMessage>(component));
@@ -3772,6 +4201,8 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
         Impl::MaterializedInput materialized =
             impl_->finish_materialization(
                 session, std::move(materialization_completion));
+        result.f_apply_materialize_ns =
+            materialized.f_apply_materialize_ns;
         const InputJobState job_state =
             impl_->select_materialized_job_state(session, materialized);
         // The selector is a product callback and may run for arbitrarily long.
@@ -3855,6 +4286,12 @@ void P50ServerEndpoint::request_cancel_for_test() noexcept {
         close_now(impl_->active_io->socket);
     }
 }
+
+std::optional<std::string>
+P50ServerEndpoint::global_resource_invariant_for_test() const {
+    impl_->owner.check();
+    return impl_->global_resources->check_invariants();
+}
 #endif
 
 void P50ServerEndpoint::reset_store(FStoreGuid new_guid) {
@@ -3869,6 +4306,7 @@ void P50ServerEndpoint::reset_store(FStoreGuid new_guid) {
                 space.route->pending->dialogue->discard_tentative();
             impl_->release_pending(*space.route->pending);
         }
+        impl_->invalidate_p29v1_codec(guid, space);
         if (space.active_session != 0) {
             Impl::Session invalidated{.serial = space.active_session,
                                       .f_guid = impl_->f_guid,

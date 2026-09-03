@@ -524,18 +524,27 @@ void attempt_authority_requires_burn_and_scope() {
 
   const auto first = c_authority.burn(value);
   const auto second = c_authority.burn(value);
-  CHECK(first.has_value() && second.has_value() &&
-            table.reserve_claim(P50CacheSessionWireClaim{value, *first},
-                                exact_owner, now) ==
-                P50CacheSessionJoinDecision::Reserved &&
-            table.release_pre_detach_for_retry(
-                P50CacheSessionWireClaim{value, *first}, exact_owner, now) ==
-                P50CacheSessionJoinDecision::RetryAllowed &&
-            table.reserve_claim(P50CacheSessionWireClaim{value, *second},
-                                exact_owner, now) ==
-                P50CacheSessionJoinDecision::Reserved &&
-            !c_authority.burn(value),
-        "only two burned ordinals are consumable per exact C arm");
+  CHECK(first.has_value() && second.has_value(),
+        "exact C arm burns both bounded attempt capabilities");
+  if (first && second) {
+    const P50CacheSessionWireClaim first_claim{value, *first};
+    CHECK(table.reserve_claim(first_claim, exact_owner, now) ==
+              P50CacheSessionJoinDecision::Reserved,
+          "first burned capability reserves the exact live WAIT");
+    auto invalid_ordinal = first_claim;
+    invalid_ordinal.attempt.ordinal = 0;
+    CHECK(!invalid_ordinal.valid() &&
+              table.reserve_claim(invalid_ordinal, exact_owner, now) ==
+                  P50CacheSessionJoinDecision::Invalid,
+          "invalid claim is rejected before duplicate-capability lookup");
+    CHECK(table.release_pre_detach_for_retry(first_claim, exact_owner, now) ==
+                  P50CacheSessionJoinDecision::RetryAllowed &&
+              table.reserve_claim(P50CacheSessionWireClaim{value, *second},
+                                  exact_owner, now) ==
+                  P50CacheSessionJoinDecision::Reserved &&
+              !c_authority.burn(value),
+          "only two burned ordinals are consumable per exact C arm");
+  }
 }
 
 void exact_retirement_fence_is_bounded() {

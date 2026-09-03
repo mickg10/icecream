@@ -1,4 +1,5 @@
 #include "../p50_endpoint.h"
+#include "../codec/p29_wire.h"
 #include "../../services/digest128.h"
 
 #include <boost/asio/co_spawn.hpp>
@@ -6,21 +7,99 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/use_future.hpp>
 
-#include <cstdint>
 #include <array>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cctype>
+#include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
+#include <new>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#if defined(ICECC_P50SIM_ALLOCATION_COUNTER)
+namespace {
+std::atomic<bool> p50sim_count_allocations_enabled{false};
+std::atomic<uint64_t> p50sim_allocation_count{0};
+std::atomic<uint64_t> p50sim_p29_allocation_count{0};
+constexpr unsigned p50sim_p29_allocation_entry_count = 9;
+constexpr unsigned p50sim_p29_allocation_entry_none =
+    p50sim_p29_allocation_entry_count;
+std::array<std::atomic<uint64_t>, p50sim_p29_allocation_entry_count>
+    p50sim_p29_allocation_entries{};
+thread_local unsigned p50sim_p29_allocation_entry =
+    p50sim_p29_allocation_entry_none;
+
+void record_p50sim_allocation() noexcept {
+    if (p50sim_count_allocations_enabled.load(std::memory_order_relaxed)) {
+        p50sim_allocation_count.fetch_add(1, std::memory_order_relaxed);
+        if (p50sim_p29_allocation_entry <
+            p50sim_p29_allocation_entry_count) {
+            p50sim_p29_allocation_count.fetch_add(1,
+                                                  std::memory_order_relaxed);
+            p50sim_p29_allocation_entries[p50sim_p29_allocation_entry]
+                .fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
+}  // namespace
+
+extern "C" unsigned
+icecc_p50sim_p29_allocation_scope_enter(unsigned entry) noexcept {
+    const unsigned previous = p50sim_p29_allocation_entry;
+    p50sim_p29_allocation_entry = entry;
+    return previous;
+}
+
+extern "C" void
+icecc_p50sim_p29_allocation_scope_leave(unsigned previous) noexcept {
+    p50sim_p29_allocation_entry = previous;
+}
+
+void* operator new(std::size_t size) {
+    if (void* result = std::malloc(size == 0 ? 1 : size)) {
+        record_p50sim_allocation();
+        return result;
+    }
+    throw std::bad_alloc();
+}
+
+void* operator new[](std::size_t size) { return ::operator new(size); }
+void operator delete(void* value) noexcept { std::free(value); }
+void operator delete[](void* value) noexcept { std::free(value); }
+void operator delete(void* value, std::size_t) noexcept { std::free(value); }
+void operator delete[](void* value, std::size_t) noexcept { std::free(value); }
+
+void* operator new(std::size_t size, std::align_val_t alignment) {
+    void* result = nullptr;
+    const std::size_t bytes = size == 0 ? 1 : size;
+    if (::posix_memalign(&result, static_cast<std::size_t>(alignment), bytes) != 0)
+        throw std::bad_alloc();
+    record_p50sim_allocation();
+    return result;
+}
+
+void* operator new[](std::size_t size, std::align_val_t alignment) {
+    return ::operator new(size, alignment);
+}
+void operator delete(void* value, std::align_val_t) noexcept { std::free(value); }
+void operator delete[](void* value, std::align_val_t) noexcept { std::free(value); }
+void operator delete(void* value, std::size_t, std::align_val_t) noexcept {
+    std::free(value);
+}
+void operator delete[](void* value, std::size_t, std::align_val_t) noexcept {
+    std::free(value);
+}
+#endif
 
 namespace asio = boost::asio;
 using tcp = asio::ip::tcp;
@@ -46,6 +125,20 @@ std::vector<uint8_t> read_bytes(const std::string& path) {
     if (!bytes.empty() && !input.read(reinterpret_cast<char*>(bytes.data()), size))
         throw std::runtime_error("cannot read input manifest payload");
     return bytes;
+}
+
+void write_bytes(const std::string& path, std::span<const uint8_t> bytes) {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output)
+        throw std::runtime_error("cannot open P29V1 inner-stream output");
+    if (bytes.size() >
+        static_cast<size_t>(std::numeric_limits<std::streamsize>::max()))
+        throw std::length_error("P29V1 inner-stream output is too large");
+    if (!bytes.empty())
+        output.write(reinterpret_cast<const char*>(bytes.data()),
+                     static_cast<std::streamsize>(bytes.size()));
+    if (!output)
+        throw std::runtime_error("cannot write P29V1 inner-stream output");
 }
 
 template <typename Guid> bool parse_guid(std::string_view text, Guid& result) {
@@ -144,6 +237,10 @@ struct Arguments {
     std::string batch_output;
     bool batch_allow_repeated_inputs = false;
     bool p29_verify_materialization = false;
+    bool count_allocations = false;
+    std::string p29_fingerprint_cache_directory;
+    std::string p29_inner_cf_output;
+    std::string p29_inner_fc_output;
     std::string codec_method;
     std::string codec_prefix;
     std::string codec_output;
@@ -158,6 +255,8 @@ ProfileId selected_profile() {
     const std::string value(requested);
     if (value == "P29")
         return ProfileId::P29;
+    if (value == "P29V1" || value == "P29_V1")
+        return ProfileId::P29V1;
     if (value == "ZSTD_TU")
         return ProfileId::ZSTD_TU;
     if (value == "ZSTD_ROUTE")
@@ -180,6 +279,8 @@ std::string_view selected_profile_label() {
     const std::string_view value(requested);
     if (value == "GRZ" || value == "GRZ_RESIDUAL")
         return "GRZ_RESIDUAL";
+    if (value == "P29_V1")
+        return "P29V1";
     return value;
 }
 
@@ -189,6 +290,10 @@ Arguments parse(int argc, char** argv) {
         const std::string option = argv[index];
         if (option == "--p29-verify-materialization") {
             result.p29_verify_materialization = true;
+            continue;
+        }
+        if (option == "--count-allocations") {
+            result.count_allocations = true;
             continue;
         }
         if (index + 1 >= argc)
@@ -235,6 +340,12 @@ Arguments parse(int argc, char** argv) {
             result.batch_assignment_map_3 = argv[++index];
         else if (option == "--batch-output")
             result.batch_output = argv[++index];
+        else if (option == "--p29-fingerprint-cache-directory")
+            result.p29_fingerprint_cache_directory = argv[++index];
+        else if (option == "--p29-inner-cf-output")
+            result.p29_inner_cf_output = argv[++index];
+        else if (option == "--p29-inner-fc-output")
+            result.p29_inner_fc_output = argv[++index];
         else if (option == "--batch-allow-repeated-inputs") {
             const std::string value = argv[++index];
             if (value != "0" && value != "1")
@@ -257,6 +368,10 @@ Arguments parse(int argc, char** argv) {
         else
             throw std::invalid_argument("unknown option " + option);
     }
+    if (!result.p29_fingerprint_cache_directory.empty() &&
+        result.p29_fingerprint_cache_directory.front() != '/')
+        throw std::invalid_argument(
+            "--p29-fingerprint-cache-directory must be absolute");
     const bool batch = !result.batch_manifest.empty() ||
                        !result.batch_manifest_2.empty() ||
                        !result.batch_manifest_3.empty() ||
@@ -264,7 +379,10 @@ Arguments parse(int argc, char** argv) {
                        !result.batch_assignment_map_2.empty() ||
                        !result.batch_assignment_map_3.empty() ||
                        !result.batch_output.empty() ||
-                       result.batch_allow_repeated_inputs;
+                       !result.p29_inner_cf_output.empty() ||
+                       !result.p29_inner_fc_output.empty() ||
+                       result.batch_allow_repeated_inputs ||
+                       result.count_allocations;
     const bool codec = !result.codec_method.empty() || !result.codec_output.empty() ||
                        !result.codec_prefix.empty();
     if (codec) {
@@ -272,7 +390,9 @@ Arguments parse(int argc, char** argv) {
             throw std::invalid_argument("codec mode requires ZSTD_TU or ZSTD_ROUTE");
         if (result.input.empty() || result.codec_output.empty() || batch ||
             !result.actions.empty() || !result.summary.empty() ||
-            result.p29_verify_materialization)
+            result.p29_verify_materialization ||
+            result.count_allocations ||
+            !result.p29_fingerprint_cache_directory.empty())
             throw std::invalid_argument("codec mode requires --input/--codec-output only");
         return result;
     }
@@ -295,6 +415,15 @@ Arguments parse(int argc, char** argv) {
             throw std::invalid_argument("--batch-assignment-map-3 requires --batch-manifest-3");
         if (!result.batch_manifest_3.empty() && result.batch_manifest_2.empty())
             throw std::invalid_argument("--batch-manifest-3 requires --batch-manifest-2");
+        if (result.p29_inner_cf_output.empty() !=
+            result.p29_inner_fc_output.empty())
+            throw std::invalid_argument(
+                "P29V1 inner capture requires both CF and FC output paths");
+#if !defined(ICECC_P50SIM_ALLOCATION_COUNTER)
+        if (result.count_allocations)
+            throw std::invalid_argument(
+                "--count-allocations requires an allocation-counter build");
+#endif
         return result;
     }
     const bool warm = !result.prewarm_input.empty() || !result.measured_input.empty() ||
@@ -493,6 +622,104 @@ struct BatchRelation {
     std::optional<Digest128> last_state_digest;
 };
 
+class P29V1InnerTrace {
+public:
+    explicit P29V1InnerTrace(uint64_t max_tu_bytes) {
+        if (max_tu_bytes == 0 ||
+            max_tu_bytes > std::numeric_limits<size_t>::max())
+            throw std::invalid_argument(
+                "P29V1 trace TU limit is not addressable");
+        icecc::codec::P29WireLimits limits;
+        limits.max_tu_bytes = static_cast<size_t>(max_tu_bytes);
+        limits.max_region_bytes = limits.max_tu_bytes;
+        need_bound_ = icecc::codec::p29v1_need_inner_bound(limits);
+        fill_bound_ = icecc::codec::p29v1_fill_inner_bound(limits);
+    }
+
+    void observe(ActorSide actor, const Message& message) {
+        if (actor == ActorSide::C) {
+            if (const auto* begin = std::get_if<TxBegin>(&message)) {
+                if (begin->profile != ProfileId::P29V1 || active_ || need_ || fill_)
+                    throw std::logic_error(
+                        "P29V1 inner trace observed an invalid TX_BEGIN boundary");
+                active_ = true;
+                ++begins_;
+                return;
+            }
+            if (const auto* body = std::get_if<BodyMessage>(&message)) {
+                require_active();
+                append(cf_, body->bytes);
+                return;
+            }
+            if (const auto* fill = std::get_if<FillMessage>(&message)) {
+                require_active();
+                if (!fill_)
+                    fill_.emplace(fill_bound_);
+                fill_->push(*fill);
+                if (fill_->complete()) {
+                    append(cf_, fill_->inner_frames());
+                    fill_.reset();
+                }
+                return;
+            }
+        } else {
+            if (const auto* need = std::get_if<NeedMessage>(&message)) {
+                require_active();
+                if (!need_)
+                    need_.emplace(need_bound_);
+                need_->push(*need);
+                if (need_->complete()) {
+                    append(fc_, need_->inner_frames());
+                    need_.reset();
+                }
+                return;
+            }
+            if (std::holds_alternative<TxCommit>(message)) {
+                require_active();
+                if (need_ || fill_)
+                    throw std::logic_error(
+                        "P29V1 inner trace reached commit mid-continuation");
+                active_ = false;
+                ++commits_;
+            }
+        }
+    }
+
+    void finish() const {
+        if (active_ || need_ || fill_ || begins_ != commits_)
+            throw std::logic_error(
+                "P29V1 inner trace ended outside an exact TU boundary");
+    }
+
+    [[nodiscard]] std::span<const uint8_t> cf() const noexcept { return cf_; }
+    [[nodiscard]] std::span<const uint8_t> fc() const noexcept { return fc_; }
+
+private:
+    static void append(std::vector<uint8_t>& target,
+                       std::span<const uint8_t> bytes) {
+        if (bytes.size() > target.max_size() - target.size())
+            throw std::overflow_error(
+                "P29V1 inner trace exceeds addressable size");
+        target.insert(target.end(), bytes.begin(), bytes.end());
+    }
+
+    void require_active() const {
+        if (!active_)
+            throw std::logic_error(
+                "P29V1 inner trace observed data outside a transaction");
+    }
+
+    uint64_t need_bound_ = 0;
+    uint64_t fill_bound_ = 0;
+    std::optional<P29V1NeedStreamDecoder> need_;
+    std::optional<P29V1FillStreamDecoder> fill_;
+    std::vector<uint8_t> cf_;
+    std::vector<uint8_t> fc_;
+    uint64_t begins_ = 0;
+    uint64_t commits_ = 0;
+    bool active_ = false;
+};
+
 std::string_view client_status_name(ClientRunStatus status) {
     switch (status) {
     case ClientRunStatus::Committed: return "Committed";
@@ -532,7 +759,13 @@ void write_batch_row(std::ostream& output, std::string_view segment,
                      size_t prefix_after_bytes, const Digest128& prefix_after_digest,
                      std::chrono::steady_clock::duration prepare_elapsed,
                      std::chrono::steady_clock::duration elapsed,
-                     ProfileId profile) {
+                     uint64_t p29v1_interner_reserved_bytes,
+                     uint64_t p29v1_interner_committed_bytes,
+                     ProfileId profile,
+                     std::optional<uint64_t> allocations,
+                     std::optional<uint64_t> p29v1_codec_allocations,
+                     std::optional<std::array<uint64_t, 9>>
+                         p29v1_codec_allocation_entries) {
     const Digest128 raw_digest = icecc::digest128(input);
     Digest128 tx_digest{};
     Digest128 begin_tx_digest{};
@@ -623,11 +856,43 @@ void write_batch_row(std::ostream& output, std::string_view segment,
            << std::chrono::duration_cast<std::chrono::nanoseconds>(prepare_elapsed).count()
            << ",\"simulator_execution_ns\":"
            << std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()
+           << ",\"f_apply_materialize_ns\":"
+           << server.f_apply_materialize_ns
+           << ",\"p29v1_interner_reserved_bytes\":"
+           << p29v1_interner_reserved_bytes
+           << ",\"p29v1_interner_committed_bytes\":"
+           << p29v1_interner_committed_bytes
+           << ",\"negotiated_profile_mask\":" << profile_bit(profile)
+           << ",\"system_source_reuse\":"
+           << (profile == ProfileId::P29V1 &&
+                       !digest_is_zero(p29_system_source_fingerprint())
+                   ? "true"
+                   : "false")
            << ",\"action_records\":" << actions.records().size()
            << ",\"state_before_digest\":\"" << icecc::digest128_hex(state_before)
            << "\",\"state_digest\":\"" << icecc::digest128_hex(state_after)
            << "\",\"transaction_digest\":\"" << icecc::digest128_hex(tx_digest)
            << "\",\"committed\":true";
+    if (allocations)
+        output << ",\"allocations\":" << *allocations;
+    if (p29v1_codec_allocations)
+        output << ",\"p29v1_codec_allocations\":"
+               << *p29v1_codec_allocations;
+    if (p29v1_codec_allocation_entries) {
+        static constexpr std::array<std::string_view, 9> names{
+            "sender_begin_tu", "sender_answer_need", "sender_commit",
+            "sender_abandon", "receiver_receive_body",
+            "receiver_receive_fill", "receiver_take_materialized",
+            "receiver_commit", "receiver_abandon"};
+        output << ",\"p29v1_codec_allocation_entries\":{";
+        for (size_t index = 0; index != names.size(); ++index) {
+            if (index != 0)
+                output << ',';
+            output << '\"' << names[index] << "\":"
+                   << (*p29v1_codec_allocation_entries)[index];
+        }
+        output << '}';
+    }
     if (profile == ProfileId::Z3_LONG) {
         output << ",\"committed_raw_prefix_before_descriptor\":{\"schema\":\"icecream-s8-route-prefix-descriptor-v1\",\"bytes\":"
                << prefix_before_bytes << ",\"digest128\":\""
@@ -643,8 +908,13 @@ void write_batch_row(std::ostream& output, std::string_view segment,
 
 void run_batch(const Arguments& arguments) {
     const ProfileId profile = selected_profile();
+#if defined(ICECC_P50SIM_ALLOCATION_COUNTER)
+    p50sim_count_allocations_enabled.store(arguments.count_allocations,
+                                           std::memory_order_relaxed);
+#endif
     const bool retains_relationship_state =
-        profile == ProfileId::Z3_LONG || profile == ProfileId::P29
+        profile == ProfileId::Z3_LONG || profile == ProfileId::P29 ||
+        profile == ProfileId::P29V1
 #if defined(ICECC_P50_WITH_LIBBSC)
         || profile == ProfileId::GRZ
 #endif
@@ -691,10 +961,13 @@ void run_batch(const Arguments& arguments) {
     auto authority = std::make_shared<P50PreparationAuthority>(
         arguments.c_store_guid, caps.zstd, authority_limits,
         kCurrentProductCompressionLevel, profile);
+    std::optional<P29V1InnerTrace> inner_trace;
+    if (!arguments.p29_inner_cf_output.empty())
+        inner_trace.emplace(caps.zstd.max_raw_bytes);
     if (arguments.p29_verify_materialization) {
-        if (profile != ProfileId::P29)
+        if (profile != ProfileId::P29 && profile != ProfileId::P29V1)
             throw std::invalid_argument(
-                "--p29-verify-materialization requires ICECC_P50_PROFILE=P29");
+                "--p29-verify-materialization requires a P29 profile");
         authority->set_p29_verification(CAuthority::Verification::FullMaterialization);
     }
     asio::io_context context;
@@ -739,6 +1012,18 @@ void run_batch(const Arguments& arguments) {
             const size_t prefix_before_bytes = authority->route_history_bytes(relation.route);
             const Digest128 prefix_before_digest = authority->route_history_digest(relation.route);
             const uint64_t expected_tu_seq = global_tu_seq;
+#if defined(ICECC_P50SIM_ALLOCATION_COUNTER)
+            const uint64_t p29v1_codec_allocations_before =
+                p50sim_p29_allocation_count.load(std::memory_order_relaxed);
+            std::array<uint64_t, p50sim_p29_allocation_entry_count>
+                p29v1_codec_allocation_entries_before{};
+            for (size_t entry = 0;
+                 entry != p29v1_codec_allocation_entries_before.size();
+                 ++entry)
+                p29v1_codec_allocation_entries_before[entry] =
+                    p50sim_p29_allocation_entries[entry].load(
+                        std::memory_order_relaxed);
+#endif
             const auto prepare_started = std::chrono::steady_clock::now();
             auto prepared = authority->prepare_for_route(
                 relation.route,
@@ -750,16 +1035,60 @@ void run_batch(const Arguments& arguments) {
             ++global_tu_seq;
             context.restart();
             const auto started = std::chrono::steady_clock::now();
+#if defined(ICECC_P50SIM_ALLOCATION_COUNTER)
+            const uint64_t allocations_before =
+                p50sim_allocation_count.load(std::memory_order_relaxed);
+#endif
+            EndpointIoControl server_control;
+            EndpointIoControl client_control;
+            if (inner_trace) {
+                const auto observe = [&inner_trace](ActorSide actor,
+                                                    const Message& message) {
+                    inner_trace->observe(actor, message);
+                };
+                server_control.outbound_message_observer = observe;
+                client_control.outbound_message_observer = observe;
+            }
             auto server_future = asio::co_spawn(context,
-                                                relation.server->accept_one(acceptor),
+                                                relation.server->accept_one(
+                                                    acceptor,
+                                                    std::move(server_control)),
                                                 asio::use_future);
             auto client_future = asio::co_spawn(context,
-                                                relation.client->run(endpoint, prepared),
+                                                relation.client->run(
+                                                    endpoint, prepared,
+                                                    std::move(client_control)),
                                                 asio::use_future);
             context.run();
             const auto elapsed = std::chrono::steady_clock::now() - started;
             const ServerRunResult server_result = server_future.get();
             const ClientRunResult client_result = client_future.get();
+            std::optional<uint64_t> allocations;
+            std::optional<uint64_t> p29v1_codec_allocations;
+            std::optional<std::array<uint64_t, 9>>
+                p29v1_codec_allocation_entries;
+#if defined(ICECC_P50SIM_ALLOCATION_COUNTER)
+            if (arguments.count_allocations) {
+                const uint64_t after =
+                    p50sim_allocation_count.load(std::memory_order_relaxed);
+                allocations = after - allocations_before;
+                const uint64_t p29v1_codec_after =
+                    p50sim_p29_allocation_count.load(std::memory_order_relaxed);
+                p29v1_codec_allocations =
+                    p29v1_codec_after - p29v1_codec_allocations_before;
+                p29v1_codec_allocation_entries.emplace();
+                for (size_t entry = 0;
+                     entry != p29v1_codec_allocation_entries->size();
+                     ++entry) {
+                    const uint64_t entry_after =
+                        p50sim_p29_allocation_entries[entry].load(
+                            std::memory_order_relaxed);
+                    (*p29v1_codec_allocation_entries)[entry] =
+                        entry_after -
+                        p29v1_codec_allocation_entries_before[entry];
+                }
+            }
+#endif
             if (client_result.status != ClientRunStatus::Committed ||
                 server_result.status != ServerRunStatus::Completed ||
                 !client_result.committed_input || !server_result.committed_input ||
@@ -798,7 +1127,11 @@ void run_batch(const Arguments& arguments) {
                             relation.actions, *relation.client, expected_before,
                             prefix_before_bytes, prefix_before_digest,
                             prefix_after_bytes, prefix_after_digest,
-                            prepare_elapsed, elapsed, profile);
+                            prepare_elapsed, elapsed,
+                            authority->p29v1_interner_reserved_bytes(),
+                            authority->p29v1_interner_committed_bytes(),
+                            profile, allocations, p29v1_codec_allocations,
+                            p29v1_codec_allocation_entries);
             output.flush();
             if (!output)
                 throw std::runtime_error("cannot flush batch output before input reclamation");
@@ -851,6 +1184,11 @@ void run_batch(const Arguments& arguments) {
         if (!second.empty())
             process("full-2", second, second_assignments);
     }
+    if (inner_trace) {
+        inner_trace->finish();
+        write_bytes(arguments.p29_inner_cf_output, inner_trace->cf());
+        write_bytes(arguments.p29_inner_fc_output, inner_trace->fc());
+    }
 }
 
 }  // namespace
@@ -861,6 +1199,23 @@ int main(int argc, char** argv) {
         if (!arguments.codec_method.empty()) {
             run_codec(arguments);
             return 0;
+        }
+        const ProfileId profile = selected_profile();
+        if (!arguments.p29_fingerprint_cache_directory.empty() &&
+            profile != ProfileId::P29V1)
+            throw std::invalid_argument(
+                "--p29-fingerprint-cache-directory requires P29V1");
+        if (!arguments.p29_inner_cf_output.empty() &&
+            profile != ProfileId::P29V1)
+            throw std::invalid_argument(
+                "P29V1 inner capture requires ICECC_P50_PROFILE=P29V1");
+        if (profile == ProfileId::P29V1) {
+            start_p29_system_source_fingerprint(
+                arguments.p29_fingerprint_cache_directory);
+            // The simulator is an offline measurement harness.  Waiting here
+            // keeps its P29V1 byte goldens deterministic while the product
+            // daemon remains strictly zero-until-ready and nonblocking.
+            wait_p29_system_source_fingerprint();
         }
         if (!arguments.batch_manifest.empty()) {
             run_batch(arguments);
@@ -881,9 +1236,10 @@ int main(int argc, char** argv) {
             PreparationAuthorityLimits{}, kCurrentProductCompressionLevel,
             caps.profile);
         if (arguments.p29_verify_materialization) {
-            if (caps.profile != ProfileId::P29)
+            if (caps.profile != ProfileId::P29 &&
+                caps.profile != ProfileId::P29V1)
                 throw std::invalid_argument(
-                    "--p29-verify-materialization requires ICECC_P50_PROFILE=P29");
+                    "--p29-verify-materialization requires a P29 profile");
             authority->set_p29_verification(
                 CAuthority::Verification::FullMaterialization);
         }

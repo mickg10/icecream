@@ -72,6 +72,21 @@ constexpr int kMaxBacklog = 16;
 // This is a hard concurrent cap, not a per-connection unbounded thread fork.
 constexpr size_t kMaxControlWorkers = 64;
 
+std::string daemon_cache_directory_from_socket(
+    std::string_view socket_path) {
+    const size_t leaf_separator = socket_path.rfind('/');
+    if (leaf_separator == std::string_view::npos || leaf_separator == 0)
+        return {};
+    const std::string_view attempt_directory =
+        socket_path.substr(0, leaf_separator);
+    const size_t root_separator = attempt_directory.rfind('/');
+    if (root_separator == std::string_view::npos)
+        return {};
+    return root_separator == 0
+               ? std::string("/")
+               : std::string(attempt_directory.substr(0, root_separator));
+}
+
 void append_ready_test_trace(std::string_view message) noexcept {
     const char* required = ::getenv("ICECC_P50_C1F1_REQUIRED");
     const char* path = ::getenv("ICECC_P50_TEST_READY_TRACE");
@@ -1305,6 +1320,8 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
         profile = ProfileId::Z3_LONG;
     else if (arm.cache_profile == CACHE_PROFILE_P29)
         profile = ProfileId::P29;
+    else if (arm.cache_profile == CACHE_PROFILE_P29V1)
+        profile = ProfileId::P29V1;
     else if (arm.cache_profile == CACHE_PROFILE_ZSTD_TU)
         profile = ProfileId::ZSTD_TU;
 #if defined(ICECC_P50_WITH_LIBBSC)
@@ -2396,6 +2413,17 @@ int run(const Options& options) noexcept {
     if (prebound && !prove_prebound_listener_after_drop(listener_owner.fd,
                                                         effective_options.socket_path))
         return 2;
+    // Start the system-source digest after the credential transition but
+    // before READY.  The worker is deliberately asynchronous: early P29V1
+    // relationships observe a zero fingerprint and disable reuse rather than
+    // delaying the first cache request.  Structured launches persist their
+    // per-file digest cache in the daemon-owned runtime directory, one level
+    // above the per-incarnation attempt leaf.
+    start_p29_system_source_fingerprint(
+        structured_launch.active
+            ? daemon_cache_directory_from_socket(
+                  effective_options.socket_path)
+            : std::string{});
     if (!prebound) {
         const int listener = local::listen_unix(effective_options.socket_path,
                                                 effective_options.backlog, &listen_status);

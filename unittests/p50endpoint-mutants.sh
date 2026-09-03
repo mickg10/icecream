@@ -16,6 +16,7 @@ input_record_object=${ICECC_TEST_INPUT_RECORD_OBJECT:-}
 services_la=${ICECC_TEST_SERVICES_LA:-$top_build/services/libicecc.la}
 work=$(mktemp -d "${TMPDIR:-/tmp}/p50-endpoint-mutants.XXXXXX")
 trap 'rm -rf "$work"' EXIT HUP INT TERM
+run_cancel_object="$work/p50_endpoint_run_cancel.o"
 
 for required in "$libtool" "$test_object" "$baseline" "$adopted_archive" \
     "$local_archive" "$protocol_archive" "$services_la"; do
@@ -24,6 +25,16 @@ done
 
 ICECC_P50_ENDPOINT_MUTANT_FOCUS=1 timeout 30s "$baseline" \
     >"$work/baseline.log" 2>&1
+
+# The endpoint delegates run cancellation to a separate production
+# translation unit. Mutants replace only p50_endpoint.cpp, so compile the
+# unchanged delegate once and link it into every witness.
+# shellcheck disable=SC2086
+"$cxx" "$standard" -O0 -g -Wall -Wextra -Wpedantic \
+    -Wno-mismatched-new-delete -DHAVE_CONFIG_H \
+    ${ICECC_TEST_CPPFLAGS:-} ${ICECC_TEST_BOOST_CPPFLAGS:-} \
+    -I"$top_build" -I"$src" -I"$src/cache" -I"$src/services" \
+    -c "$src/cache/p50_endpoint_run_cancel.cpp" -o "$run_cancel_object"
 
 mutate() {
     name=$1
@@ -113,17 +124,20 @@ compile_mutant() {
     # shellcheck disable=SC2086
     "$cxx" "$standard" -O0 -g -Wall -Wextra -Wpedantic \
         -Wno-mismatched-new-delete -DHAVE_CONFIG_H \
+        -DICECC_P50_ENDPOINT_TEST_HOOKS \
         ${ICECC_TEST_CPPFLAGS:-} ${ICECC_TEST_BOOST_CPPFLAGS:-} \
-        ${ICECC_TEST_LIBZSTD_CFLAGS:-} ${ICECC_TEST_XXHASH_CFLAGS:-} \
+        ${ICECC_TEST_LIBZSTD_CFLAGS:-} ${ICECC_TEST_LIBBSC_CFLAGS:-} \
+        ${ICECC_TEST_XXHASH_CFLAGS:-} \
         -I"$top_build" -I"$src" -I"$src/cache" -I"$src/services" \
         -c "$source" -o "$object"
     # shellcheck disable=SC2086
     "$libtool" --tag=CXX --mode=link "$cxx" "$standard" -O0 -g \
         ${ICECC_TEST_LDFLAGS:-} ${ICECC_TEST_BOOST_LDFLAGS:-} \
         -pthread -o "$output" "$test_object" "$object" \
-        $input_record_object "$adopted_archive" "$local_archive" \
+        "$run_cancel_object" $input_record_object "$adopted_archive" "$local_archive" \
         "$protocol_archive" "$services_la" \
-        ${ICECC_TEST_LIBZSTD_LIBS:-} ${ICECC_TEST_XXHASH_LIBS:-} \
+        ${ICECC_TEST_LIBZSTD_LIBS:-} ${ICECC_TEST_LIBBSC_LIBS:-} \
+        ${ICECC_TEST_XXHASH_LIBS:-} ${ICECC_TEST_LIBCAP_NG_LIBS:-} \
         ${ICECC_TEST_BOOST_LIBS:-} ${ICECC_TEST_LIBS:-} >/dev/null
 }
 

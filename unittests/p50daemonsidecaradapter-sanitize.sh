@@ -18,6 +18,7 @@ trap 'rm -f "$out"' EXIT HUP INT TERM
     -DHAVE_CONFIG_H -DICECC_P50_DAEMON_SIDECAR_ADAPTER_TEST_HOOKS \
     -I"$top_build" -I"$top_src" -I"$top_src/client" -I"$top_src/services" \
     ${ICECC_TEST_CPPFLAGS:-} ${ICECC_TEST_BOOST_CPPFLAGS:-} \
+    ${ICECC_TEST_LIBCAP_NG_CFLAGS:-} \
     "$top_src/unittests/p50_daemon_sidecar_adapter_test.cpp" \
     "$top_src/cache/p50_daemon_sidecar_adapter.cpp" \
     "$top_src/cache/p50_daemon_cache_dispatch.cpp" \
@@ -30,7 +31,8 @@ trap 'rm -f "$out"' EXIT HUP INT TERM
     "$top_src/cache/p50_sidecar_supervisor.cpp" \
     "$top_src/cache/p50_ready_advertisement.cpp" \
     "$top_build/cache/libprotocol50.a" \
-    "$top_build/services/.libs/libicecc.a" -llzo2 \
+    "$top_build/services/.libs/libicecc.a" \
+    ${ICECC_TEST_LIBCAP_NG_LIBS:-} -llzo2 \
     ${ICECC_TEST_LIBZSTD_LIBS:--lzstd} \
     ${ICECC_TEST_XXHASH_LIBS:--lxxhash} ${ICECC_TEST_LDFLAGS:-} \
     -o "$out"
