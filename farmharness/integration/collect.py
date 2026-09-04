@@ -779,11 +779,12 @@ def _parse_logins(
         instance = by_name[name]
         cache = CACHE_LOGIN_RE.search(line)
         if cache is None:
-            if "cache=off" in line:
+            if instance["version"] < 50 or "cache=off" in line:
                 # A clean cache-service shutdown causes the daemon to publish
                 # a final cache=off RELOGIN while collection freezes C/F/S.
                 # Preserve any earlier authenticated capability login; for a
-                # genuinely legacy worker, cache=off remains its only record.
+                # genuinely legacy worker, a pre-50 RELOGIN naturally has no
+                # cache fields and is normalized to the same empty surface.
                 latest.setdefault(
                     name,
                     {

@@ -9,6 +9,7 @@ import pytest
 from farmharness.integration import farmtest
 from farmharness.integration.collect import (
     CollectError,
+    _parse_logins,
     collect_bundle,
     load_verified_bundle,
 )
@@ -269,6 +270,30 @@ def test_collection_refuses_a_commit_without_exact_wire_byte_counts(
 
     with pytest.raises(CollectError, match="committed source-result has no wire bytes"):
         collect_bundle(farm, scenario, plan, sync_remote=False)
+
+
+def test_pre50_login_without_cache_fields_is_normalized_as_legacy(tmp_path: Path) -> None:
+    evidence = tmp_path / "evidence"
+    log = evidence / "diagnostics" / "scheduler-host" / "S1.log" / "scheduler.log"
+    log.parent.mkdir(parents=True)
+    log.write_text(
+        "[1] RELOGIN F1(x86_64): [environment(x86_64), ]\n",
+        encoding="utf-8",
+    )
+    plan = {
+        "topology": {
+            "instances": [
+                {"host": "scheduler-host", "name": "S1", "role": "S", "version": 43},
+                {"host": "worker-host", "name": "F1", "role": "F", "version": 43},
+            ]
+        }
+    }
+
+    logins, revisions, ports = _parse_logins(evidence, plan)
+
+    assert logins == [{"cache_profiles": [], "instance": "F1", "protocol": 43}]
+    assert revisions == {}
+    assert ports == {}
 
 
 class _LiveCollection:
