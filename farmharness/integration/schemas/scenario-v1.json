@@ -1,0 +1,171 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://icecream.dev/schemas/icefarm-scenario-v1.json",
+  "title": "Icecream controlled-farm scenario",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "id",
+    "shape",
+    "images",
+    "instances",
+    "workload",
+    "network",
+    "timeline",
+    "expect",
+    "controls",
+    "timeouts"
+  ],
+  "properties": {
+    "schema": {"const": "icefarm-scenario-v1"},
+    "id": {"$ref": "#/$defs/name"},
+    "shape": {
+      "enum": ["-", "SCF", "S'CF", "S'FC'", "S'C'F'", "S'[FF'][CC']", "S'[F'F''][C']", "all", "mixed"]
+    },
+    "images": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {"$ref": "#/$defs/name"},
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 180,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._/@:+-]*$"
+      }
+    },
+    "instances": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/instance"}
+    },
+    "workload": {"$ref": "#/$defs/workload"},
+    "network": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["shaping"],
+      "properties": {
+        "shaping": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/shaping"}
+        }
+      }
+    },
+    "timeline": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/event"}
+    },
+    "expect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["exact", "engagement", "wedges", "error106_max", "tail_to_incapable", "reuse", "wall_s_max"],
+      "properties": {
+        "exact": {"enum": ["all", "none", "report"]},
+        "engagement": {"type": "string", "minLength": 1},
+        "wedges": {"type": "integer", "minimum": 0},
+        "error106_max": {"type": "integer", "minimum": 0},
+        "tail_to_incapable": {"type": "integer", "minimum": 0},
+        "reuse": {"type": "string", "minLength": 1},
+        "wall_s_max": {"type": ["number", "null"], "exclusiveMinimum": 0}
+      }
+    },
+    "controls": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^H[1-5]$"}
+    },
+    "timeouts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["images_s", "up_s", "turn_s", "collect_s", "down_s"],
+      "properties": {
+        "images_s": {"type": "integer", "minimum": 1},
+        "up_s": {"type": "integer", "minimum": 1},
+        "turn_s": {"type": "integer", "minimum": 1},
+        "collect_s": {"type": "integer", "minimum": 1},
+        "down_s": {"type": "integer", "minimum": 1}
+      }
+    }
+  },
+  "$defs": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "environment": {
+      "type": "object",
+      "propertyNames": {"pattern": "^[A-Z_][A-Z0-9_]*$"},
+      "additionalProperties": {"type": "string", "maxLength": 4096}
+    },
+    "instance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "role", "host", "image"],
+      "properties": {
+        "name": {"$ref": "#/$defs/name"},
+        "role": {"enum": ["S", "F", "C"]},
+        "host": {"$ref": "#/$defs/name"},
+        "image": {"$ref": "#/$defs/name"},
+        "env": {"$ref": "#/$defs/environment"},
+        "slots": {"type": "integer", "minimum": 1}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"role": {"const": "F"}}},
+          "then": {"required": ["slots"]}
+        }
+      ]
+    },
+    "workload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["driver", "corpus", "turns", "jobs", "clients", "repeat", "oracle"],
+      "properties": {
+        "driver": {"enum": ["cmake-project", "ii-manifest", "tu-manifest"]},
+        "corpus": {"$ref": "#/$defs/name"},
+        "turns": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 32}
+        },
+        "jobs": {"type": "integer", "minimum": 1},
+        "clients": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/name"}
+        },
+        "repeat": {"type": "integer", "minimum": 1},
+        "oracle": {"const": "local-sha"}
+      }
+    },
+    "shaping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["instance", "rate", "delay_ms"],
+      "properties": {
+        "instance": {"$ref": "#/$defs/name"},
+        "rate": {"type": "string", "pattern": "^[1-9][0-9]*(kbit|mbit|gbit)$"},
+        "delay_ms": {"type": "integer", "minimum": 0, "maximum": 60000}
+      }
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trigger", "action"],
+      "properties": {
+        "trigger": {"type": "string", "minLength": 1, "maxLength": 100},
+        "action": {"enum": ["upgrade", "downgrade", "restart", "kill -9", "env_set", "netem_set", "disk_fill", "header_edit"]},
+        "instance": {"$ref": "#/$defs/name"},
+        "image": {"$ref": "#/$defs/name"},
+        "env": {"$ref": "#/$defs/environment"},
+        "rate": {"type": "string", "pattern": "^[1-9][0-9]*(kbit|mbit|gbit)$"},
+        "delay_ms": {"type": "integer", "minimum": 0, "maximum": 60000},
+        "path": {"type": "string", "minLength": 1, "maxLength": 4096}
+      }
+    }
+  }
+}

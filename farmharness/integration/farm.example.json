@@ -1,0 +1,121 @@
+{
+  "schema": "icefarm-farm-v1",
+  "hub": {
+    "results_root": "/tanksmall/scratch/ictmp/experiments/icecream/integration"
+  },
+  "registry": {
+    "host": "tt-quietbox3",
+    "port": 5000,
+    "mode": "auto"
+  },
+  "netname_prefix": "icefarm",
+  "port_range": [23000, 23999],
+  "hosts": [
+    {
+      "name": "tt-quietbox3",
+      "ssh": "mickg10@10.0.27.101",
+      "docker_context": "q3",
+      "lan_ip": "10.0.27.101",
+      "arch": "x86_64",
+      "cores": 32,
+      "mem_gb": 256,
+      "scratch_root": "/home/mickg10/farm-scratch",
+      "roles_allowed": ["S", "F", "C"],
+      "sudo": true,
+      "netem": true,
+      "shared_lan": "10.0.27.0/24"
+    },
+    {
+      "name": "tt-quietbox2",
+      "ssh": "mickg10@100.91.242.69",
+      "docker_context": "q2",
+      "lan_ip": "10.0.27.212",
+      "arch": "x86_64",
+      "cores": 32,
+      "mem_gb": 256,
+      "scratch_root": "/home/mickg10/farm-scratch",
+      "roles_allowed": ["F", "C"],
+      "sudo": true,
+      "netem": false,
+      "shared_lan": "10.0.27.0/24"
+    },
+    {
+      "name": "research6",
+      "ssh": "mickg@research6",
+      "docker_context": "r6",
+      "lan_ip": "10.0.27.56",
+      "arch": "x86_64",
+      "cores": 20,
+      "mem_gb": 128,
+      "scratch_root": "/home/mickg/farm-scratch",
+      "roles_allowed": ["F", "C"],
+      "sudo": false,
+      "netem": false,
+      "shared_lan": "10.0.27.0/24"
+    }
+  ],
+  "corpora": {
+    "fmt-100": {
+      "kind": "tu-manifest",
+      "tus": 50,
+      "repeat": 2,
+      "manifest": "/tanksmall/scratch/ictmp/corpus7/manifest.txt",
+      "manifest_sha256": "c362761c3a7e45af984ffd561c772783ab4f27efda7eb6f24afd84223e8233d0",
+      "root": "/tanksmall/scratch/ictmp/corpus7/CMakeFiles"
+    },
+    "firefox-1000": {
+      "kind": "tu-manifest",
+      "tus": 1000,
+      "turn_a_manifest": "/tanksmall/scratch/ictmp/experiments/icecream/p29v1-final-matrix-root-20260903/turnA.manifest",
+      "turn_b_manifest": "/tanksmall/scratch/ictmp/experiments/icecream/p29v1-final-matrix-root-20260903/turnB.manifest",
+      "normalized_manifest_sha256": "fa5db2c4609ddcbeaa22f4f3dc471d6870be165dae6427ea7dffb058a676404e",
+      "pair_index_sha256": "6c97c19991cc2ff78cfb0d52272e4ef5d8fc6c1455952e35bc44a05c2d069c44",
+      "root": "/tanksmall/scratch/ictmp/src3/gecko-dev"
+    }
+  },
+  "protected": {
+    "process_patterns": ["bigfarm"],
+    "never_touch_labels_other_than": "icefarm.*"
+  },
+  "authority": {
+    "schema": "icecream-newgen-farm-authority-v1",
+    "hosts": {
+      "tt-quietbox3": {"class": "submission", "address": "10.0.27.101"},
+      "tt-quietbox2": {"class": "worker", "address": "10.0.27.212"},
+      "research6": {"class": "orchestration", "address": "10.0.27.56"}
+    },
+    "role_stores": {
+      "43": {
+        "scheduler": {"sha256": "0000000000000000000000000000000000000000000000000000000000000000"},
+        "client": {"sha256": "0000000000000000000000000000000000000000000000000000000000000000"},
+        "daemon": {"sha256": "0000000000000000000000000000000000000000000000000000000000000000"}
+      },
+      "50": {
+        "scheduler": {"sha256": "0000000000000000000000000000000000000000000000000000000000000000"},
+        "client": {"sha256": "0000000000000000000000000000000000000000000000000000000000000000"},
+        "daemon": {"sha256": "0000000000000000000000000000000000000000000000000000000000000000"}
+      }
+    },
+    "images": {
+      "p43-1.4.0": {
+        "commit": "cd74801e0fa4e83e3ae254ca1d7fe98642f36b89",
+        "archive_sha256": "c0f95d5f3729972acb6522746c847aa88419a0021f43f6cc1de7ba71bbe02ccd",
+        "id": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "p50-4c994915": {
+        "commit": "4c99491560709e16860e346762aa297316412648",
+        "archive_sha256": "fa2c0d37697a7abff5fb3f64343f8d126f3476c1f7e8999f1543aa76923909d7",
+        "id": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "p50s2-624702e9": {
+        "commit": "624702e98f60f453f9be5d406b6da45730eae1ee",
+        "archive_sha256": "337480192fb3ed44e4aa9c12c450482d989fec3101412558a1fece725e2a347b",
+        "id": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    "topologies": {
+      "C1F1": {"f_relationships": 1, "slots_per_f": 24},
+      "C1F2": {"f_relationships": 2, "slots_per_f": 24}
+    }
+  }
+}

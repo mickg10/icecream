@@ -1,0 +1,251 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://icecream.dev/schemas/icefarm-farm-v1.json",
+  "title": "Icecream controlled farm specification",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "hub",
+    "registry",
+    "netname_prefix",
+    "port_range",
+    "hosts",
+    "corpora",
+    "protected",
+    "authority"
+  ],
+  "properties": {
+    "schema": {"const": "icefarm-farm-v1"},
+    "hub": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["results_root"],
+      "properties": {
+        "results_root": {"type": "string", "pattern": "^/", "minLength": 2}
+      }
+    },
+    "registry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host", "port", "mode"],
+      "properties": {
+        "host": {"$ref": "#/$defs/name"},
+        "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "mode": {"enum": ["registry", "save-load", "auto"]}
+      }
+    },
+    "netname_prefix": {"$ref": "#/$defs/name"},
+    "port_range": {
+      "type": "array",
+      "prefixItems": [
+        {"type": "integer", "minimum": 1024, "maximum": 65535},
+        {"type": "integer", "minimum": 1024, "maximum": 65535}
+      ],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "hosts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/host"}
+    },
+    "corpora": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {"$ref": "#/$defs/name"},
+      "additionalProperties": {"$ref": "#/$defs/corpus"}
+    },
+    "protected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["process_patterns", "never_touch_labels_other_than"],
+      "properties": {
+        "process_patterns": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "pattern": "\\S"}
+        },
+        "never_touch_labels_other_than": {"const": "icefarm.*"}
+      }
+    },
+    "authority": {"$ref": "#/$defs/authority"},
+    "s8_capture": {"type": "object"}
+  },
+  "$defs": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "ssh",
+        "lan_ip",
+        "arch",
+        "cores",
+        "mem_gb",
+        "scratch_root",
+        "roles_allowed",
+        "sudo",
+        "netem",
+        "shared_lan"
+      ],
+      "properties": {
+        "name": {"$ref": "#/$defs/name"},
+        "ssh": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 255,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9._:-]*$"
+        },
+        "docker_context": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+        },
+        "lan_ip": {"type": "string", "minLength": 3, "maxLength": 64},
+        "arch": {"type": "string", "minLength": 1, "maxLength": 32},
+        "cores": {"type": "integer", "minimum": 1},
+        "mem_gb": {"type": "integer", "minimum": 1},
+        "scratch_root": {"type": "string", "pattern": "^/", "minLength": 2},
+        "roles_allowed": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"enum": ["S", "F", "C"]}
+        },
+        "sudo": {"type": "boolean"},
+        "netem": {"type": "boolean"},
+        "shared_lan": {"type": "string", "minLength": 3, "maxLength": 80}
+      }
+    },
+    "corpus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "tus"],
+      "properties": {
+        "kind": {"enum": ["cmake-project", "ii-manifest", "tu-manifest"]},
+        "hub_path": {"type": "string", "pattern": "^/", "minLength": 2},
+        "tus": {"type": "integer", "minimum": 1},
+        "repeat": {"type": "integer", "minimum": 1},
+        "root": {"type": "string", "pattern": "^/", "minLength": 2},
+        "manifest": {"type": "string", "pattern": "^/", "minLength": 2},
+        "manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "turn_a": {"type": "string", "minLength": 1},
+        "turn_b": {"type": "string", "minLength": 1},
+        "turn_a_manifest": {"type": "string", "pattern": "^/", "minLength": 2},
+        "turn_b_manifest": {"type": "string", "pattern": "^/", "minLength": 2},
+        "normalized_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "pair_index_sha256": {"$ref": "#/$defs/sha256"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"kind": {"const": "cmake-project"}}},
+          "then": {"required": ["hub_path"]}
+        },
+        {
+          "if": {"properties": {"kind": {"const": "ii-manifest"}}},
+          "then": {"required": ["hub_path", "turn_a", "turn_b"]}
+        },
+        {
+          "if": {"properties": {"kind": {"const": "tu-manifest"}}},
+          "then": {"required": ["root"]}
+        }
+      ]
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "image_label": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 180,
+      "pattern": "^p(43|44|50)(s[0-9]+)?-[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "hosts", "role_stores", "images", "topologies"],
+      "properties": {
+        "schema": {"const": "icecream-newgen-farm-authority-v1"},
+        "hosts": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {"$ref": "#/$defs/name"},
+          "additionalProperties": {"$ref": "#/$defs/authority_host"}
+        },
+        "role_stores": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {"pattern": "^(43|44|50)$"},
+          "additionalProperties": {"$ref": "#/$defs/role_store"}
+        },
+        "images": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {"$ref": "#/$defs/image_label"},
+          "additionalProperties": {"$ref": "#/$defs/image_binding"}
+        },
+        "topologies": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {"$ref": "#/$defs/name"},
+          "additionalProperties": {"$ref": "#/$defs/topology"}
+        }
+      }
+    },
+    "authority_host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["class", "address"],
+      "properties": {
+        "class": {"enum": ["submission", "orchestration", "worker"]},
+        "address": {"type": "string", "minLength": 1, "maxLength": 255}
+      }
+    },
+    "role_store": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scheduler", "client", "daemon"],
+      "properties": {
+        "scheduler": {"$ref": "#/$defs/role_binary"},
+        "client": {"$ref": "#/$defs/role_binary"},
+        "daemon": {"$ref": "#/$defs/role_binary"}
+      }
+    },
+    "role_binary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256"],
+      "properties": {"sha256": {"$ref": "#/$defs/sha256"}}
+    },
+    "image_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit", "archive_sha256"],
+      "properties": {
+        "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "archive_sha256": {"$ref": "#/$defs/sha256"},
+        "id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      }
+    },
+    "topology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["f_relationships", "slots_per_f"],
+      "properties": {
+        "f_relationships": {"type": "integer", "minimum": 1},
+        "slots_per_f": {"type": "integer", "minimum": 1}
+      }
+    }
+  }
+}

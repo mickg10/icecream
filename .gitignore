@@ -63,6 +63,8 @@ compile_commands.json
 cache/sim/.p50sim.bin*
 cache/sim/.p50sim-build.json*
 farmharness/__pycache__/
+farmharness/integration/**/__pycache__/
+farmharness/integration/farm.local.json
 .vs*
 package_builder/**/out/
 aidocs/
