@@ -103,6 +103,7 @@
 #include "logging.h"
 #include "utf8.h"
 #include "statewriter.h"
+#include "client_queue_order.h"
 #include <comm.h>
 #include "load.h"
 #include "environment.h"
@@ -1087,20 +1088,7 @@ public:
     }
     Client *get_earliest_client(Client::Status s) const {
         // TODO: possibly speed this up in adding some sorted lists
-        Client *client = nullptr;
-        int min_client_id = 0;
-        uint32_t min_niceness = std::numeric_limits<uint32_t>::max();
-
-        for (auto it : *this) {
-            if (it.second->status == s && (!min_client_id || min_client_id > it.second->client_id)
-                && it.second->niceness < min_niceness ) {
-                client = it.second;
-                min_client_id = client->client_id;
-                min_niceness = client->niceness;
-            }
-        }
-
-        return client;
+        return icecc::daemon_queue::select_earliest(*this, s);
     }
 };
 

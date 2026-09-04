@@ -56,6 +56,7 @@ TESTS += p50_adopted_outcome_writer-run.sh \
 	p50endpoint-mutants.sh p50profile-digest-mutants.sh p50inputrecord-mutants.sh \
 	p50endpoint-sanitize.sh
 TESTS += codec_parity codec_provider codec_intern codec_wire
+TESTS += daemonqueue
 AM_TESTS_ENVIRONMENT = \
 	ICECC_TEST_BUILDDIR='$(abs_builddir)'; export ICECC_TEST_BUILDDIR; \
 	ICECC_TEST_TOP_BUILDDIR='$(abs_top_builddir)'; export ICECC_TEST_TOP_BUILDDIR; \
@@ -203,6 +204,8 @@ check_PROGRAMS += p50daemoncontrol
 check_PROGRAMS += p50cachefdseam
 check_PROGRAMS += assignment_identity_test
 check_PROGRAMS += codec_parity codec_provider codec_intern codec_wire
+check_PROGRAMS += daemonqueue
+daemonqueue_SOURCES = daemonqueue.cpp
 assignment_identity_test_SOURCES = assignment_identity_test.cpp
 assignment_identity_test_LDADD = ../services/libicecc.la
 codec_parity_SOURCES = codec_parity_test.cpp

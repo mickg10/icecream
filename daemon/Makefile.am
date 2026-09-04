@@ -45,6 +45,7 @@ AM_LIBTOOLFLAGS = --silent
 EXTRA_DIST = P50_FORK_FD_HYGIENE.md
 
 noinst_HEADERS = \
+	client_queue_order.h \
 	compiler_input.h \
 	p50_task_count.h \
 	p50_fork_fd_hygiene.h \
