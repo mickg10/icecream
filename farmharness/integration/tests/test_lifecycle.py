@@ -58,13 +58,13 @@ def _inspect_document(farm, label: str) -> dict[str, object]:
 def _farm_scenario_plan(tmp_path: Path, *, up_s: int = 5):
     farm = load_farm_spec(INTEGRATION / "farm.example.json")
     farm.data["hub"]["results_root"] = str(tmp_path)
-    label = "p50s2-624702e9"
+    scenario = load_scenario_spec(INTEGRATION / "scenarios" / "S00-smoke.json", farm)
+    label = scenario.data["images"]["new"]
     document = _inspect_document(farm, label)
     identity = _image_identity(
         CommandResult(0, json.dumps(document), ""), "test image"
     )
     farm.data["authority"]["images"][label]["closure_sha256"] = identity.closure_sha256
-    scenario = load_scenario_spec(INTEGRATION / "scenarios" / "S00-smoke.json", farm)
     scenario.data["timeouts"]["up_s"] = up_s
     plan = farmtest.build_plan(farm, scenario, run_id="unit-run")
     return farm, scenario, plan

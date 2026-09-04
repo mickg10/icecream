@@ -20,7 +20,22 @@ except ImportError:  # Direct execution from this directory.
 
 SCHEMA_PATH = Path(__file__).with_name("schemas") / "scenario-v1.json"
 PROFILES = frozenset(("P29V1", "ZSTD_TU", "ZSTD_ROUTE"))
-RUNNER_ENV = frozenset(("ICECC_NETNAME", "ICECC_SCHEDULER", "ICECC_TEST_SOCKET", "ICECC_VERSION"))
+RUNNER_ENV = frozenset(
+    (
+        "ICECC_NETNAME",
+        "ICECC_P50_COMPILE_IDENTITY_TRACE",
+        "ICECC_P50_C_ACTION_TRACE",
+        "ICECC_P50_C_LEGACY_WIRE_TRACE",
+        "ICECC_P50_F_ACTION_TRACE",
+        "ICECC_P50_F_LEGACY_WIRE_TRACE",
+        "ICECC_P50_SOURCE_RESULT_TRACE",
+        "ICECC_P50_TEST_LIFECYCLE_TRACE",
+        "ICECC_P50_TEST_READY_TRACE",
+        "ICECC_SCHEDULER",
+        "ICECC_TEST_SOCKET",
+        "ICECC_VERSION",
+    )
+)
 IMAGE_GENERATION_RE = re.compile(r"^p(43|44|50)(?:s[0-9]+)?(?:-|$)", re.IGNORECASE)
 ENVIRONMENT_KEY_RE = re.compile(r"[A-Z_][A-Z0-9_]*")
 SAFE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -212,6 +227,12 @@ def load_scenario_spec(path: str | Path, farm: FarmSpec) -> ScenarioSpec:
         raise ScenarioSpecError(f"$.workload.corpus: undeclared corpus {workload['corpus']!r}")
     if workload["driver"] != corpus["kind"]:
         raise ScenarioSpecError("$.workload.driver: does not match the declared corpus kind")
+    allowed_turns = {"A"} if "manifest" in corpus else {"A", "B"}
+    unknown_turns = sorted(set(workload["turns"]) - allowed_turns)
+    if unknown_turns:
+        raise ScenarioSpecError(
+            f"$.workload.turns: corpus does not define turns {unknown_turns!r}"
+        )
     for client in workload["clients"]:
         instance = next((item for item in role_instances["C"] if item["name"] == client), None)
         if instance is None:

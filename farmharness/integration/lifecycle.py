@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Iterable, Protocol
+from typing import Any, Callable, Iterable, Mapping, Protocol
 
 try:
     from .farm_spec import FarmSpec
@@ -317,7 +317,11 @@ def _manifest_lines(path: Path) -> list[Path]:
     result: list[Path] = []
     for index, line in enumerate(lines):
         candidate = Path(line)
-        if not candidate.is_absolute() or "\0" in line or not candidate.is_file():
+        if (
+            not candidate.is_absolute()
+            or any(ord(character) < 32 or ord(character) == 127 for character in line)
+            or not candidate.is_file()
+        ):
             raise PreflightRefusal(
                 f"corpus manifest {path} line {index + 1} is not an existing absolute file"
             )
@@ -1317,6 +1321,8 @@ def collect_diagnostics(
     recorder: Recorder,
     factory: CommandFactory,
     destination: Path,
+    *,
+    container_ids: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Best-effort diagnostic capture that never replaces the original error."""
 
@@ -1327,9 +1333,14 @@ def collect_diagnostics(
         host_dir = destination / host_name
         host_dir.mkdir(parents=True, exist_ok=True)
         container = f"icefarm-{plan['run_id']}-{instance['name']}"
+        container_target = (
+            container_ids.get(instance["name"], container)
+            if container_ids is not None
+            else container
+        )
         for kind, args in (
-            ("inspect", ("container", "inspect", container)),
-            ("logs", ("container", "logs", container)),
+            ("inspect", ("container", "inspect", container_target)),
+            ("logs", ("container", "logs", container_target)),
         ):
             try:
                 result = recorder.invoke(

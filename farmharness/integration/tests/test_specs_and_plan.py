@@ -242,6 +242,37 @@ def test_plan_commands_are_argv_only_and_label_scoped() -> None:
     assert all("icefarm.run=argv-check" in item["argv"] for item in starts)
 
 
+def test_scheduler_fence_follows_resolved_relationship_law() -> None:
+    assert farmtest._assignment_fence_mode(
+        {"relationships": [{"cache_expected": False}]}
+    ) is None
+    assert farmtest._assignment_fence_mode(
+        {
+            "relationships": [
+                {"cache_expected": True},
+                {"cache_expected": False},
+            ]
+        }
+    ) == "enforcing-compat"
+    assert farmtest._assignment_fence_mode(
+        {
+            "relationships": [
+                {"cache_expected": True},
+                {"cache_expected": True},
+            ]
+        }
+    ) == "strict-nonce"
+
+    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    scenario = load_scenario_spec(INTEGRATION / "scenarios" / "S00-smoke.json", farm)
+    plan = farmtest.build_plan(farm, scenario, run_id="strict-fence")
+    scheduler = next(
+        command for command in plan["commands"] if command["phase"] == "up.start-s"
+    )
+    index = scheduler["argv"].index("--assignment-fence-mode")
+    assert scheduler["argv"][index + 1] == "strict-nonce"
+
+
 @pytest.mark.parametrize("profile", ("P29V1", "ZSTD_TU", "ZSTD_ROUTE"))
 def test_owner_kept_profiles_resolve(profile: str, tmp_path: Path) -> None:
     farm, scenario = _documents()
@@ -328,7 +359,8 @@ def test_real_up_is_fail_closed_before_transport(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     farm, _scenario = _documents()
-    del farm["authority"]["images"]["p50s2-624702e9"]["closure_sha256"]
+    label = _scenario["images"]["new"]
+    del farm["authority"]["images"][label]["closure_sha256"]
     farm_path = tmp_path / "farm-without-runtime-closure.json"
     farm_path.write_text(json.dumps(farm), encoding="utf-8")
     args = [

@@ -100,6 +100,13 @@ def test_each_source_archive_matches_immutable_authority(label: str, tmp_path: P
     assert archive.is_file()
 
 
+def test_scheduler_entrypoint_accepts_only_named_assignment_fence_modes() -> None:
+    entrypoint = (INTEGRATION / "docker" / "entry-scheduler.sh").read_text()
+    assert "--assignment-fence-mode" in entrypoint
+    assert "legacy|advisory|enforcing-compat|strict-nonce" in entrypoint
+    assert 'set -- "$@" --assignment-fence-mode "$assignment_fence_mode"' in entrypoint
+
+
 def test_archive_hash_mismatch_is_removed_and_refused(tmp_path: Path) -> None:
     binding = image_bindings(_farm(), ["p50s2-624702e9"])[0]
     bad = dataclasses.replace(binding, archive_sha256="f" * 64)

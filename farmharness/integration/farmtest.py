@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Spec-driven controlled-farm runner (I1: validation, plan, fake up)."""
+"""Spec-driven controlled-farm lifecycle, workload, and evidence runner."""
 
 from __future__ import annotations
 
@@ -13,22 +13,28 @@ from typing import Any
 
 try:
     from farmharness import newgen_farm_env
+    from .collect import COLLECT_SCHEMA, CollectError, collect_bundle, load_verified_bundle
     from .farm_spec import FarmSpec, FarmSpecError, load_farm_spec
     from .images import ImageError, build_and_distribute
-    from .lifecycle import LifecycleError, PreflightRefusal, bring_up, down_from_state
+    from .lifecycle import LifecycleError, PreflightRefusal, bring_up, bundle_root, down_from_state
     from .remote import FakeRecorder, PlannedCommand, RemoteError, docker_argv, execute, ssh_argv
     from .scenario_spec import ScenarioSpec, ScenarioSpecError, load_scenario_spec
     from .schema_validation import canonical_bytes
+    from .report import ReportError, report_bundle, verify_bundle
+    from .workload import WorkloadError, run_workload
 except ImportError:  # Executed as ./farmtest.py.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import newgen_farm_env
 
+    from collect import COLLECT_SCHEMA, CollectError, collect_bundle, load_verified_bundle
     from farm_spec import FarmSpec, FarmSpecError, load_farm_spec
     from images import ImageError, build_and_distribute
-    from lifecycle import LifecycleError, PreflightRefusal, bring_up, down_from_state
+    from lifecycle import LifecycleError, PreflightRefusal, bring_up, bundle_root, down_from_state
     from remote import FakeRecorder, PlannedCommand, RemoteError, docker_argv, execute, ssh_argv
     from scenario_spec import ScenarioSpec, ScenarioSpecError, load_scenario_spec
     from schema_validation import canonical_bytes
+    from report import ReportError, report_bundle, verify_bundle
+    from workload import WorkloadError, run_workload
 
 
 PLAN_SCHEMA = "icefarm-plan-v1"
@@ -147,6 +153,19 @@ def _env_args(environment: dict[str, str]) -> list[str]:
     return result
 
 
+def _assignment_fence_mode(topology: dict[str, Any]) -> str | None:
+    """Select the scheduler fence from the resolved relationship law."""
+
+    cache_expected = [
+        relationship["cache_expected"] for relationship in topology["relationships"]
+    ]
+    if not any(cache_expected):
+        return None
+    if all(cache_expected):
+        return "strict-nonce"
+    return "enforcing-compat"
+
+
 def _planned_commands(
     farm: FarmSpec,
     scenario: ScenarioSpec,
@@ -167,6 +186,21 @@ def _planned_commands(
         host = farm.hosts[instance["host"]]
         root = PurePosixPath(host["scratch_root"]) / "icefarm" / run_id / instance["name"]
         directories = [str(root / leaf) for leaf in ("cache", "tmp", "log", "results")]
+        if instance["role"] == "C":
+            closure_sha256 = instance["image"].get("closure_sha256")
+            if not isinstance(closure_sha256, str):
+                raise PlanError(
+                    f"client image {instance['image']['label']} has no captured runtime closure"
+                )
+            directories.append(
+                str(
+                    PurePosixPath(host["scratch_root"])
+                    / "icefarm"
+                    / "oracle"
+                    / scenario.data["workload"]["corpus"]
+                    / closure_sha256
+                )
+            )
         commands.append(
             PlannedCommand(
                 sequence=sequence,
@@ -203,7 +237,31 @@ def _planned_commands(
             "ICECC_TEST_SOCKET": f"/tmp/{netname}-{instance['name']}.sock",
         }
         if instance["role"] == "C":
-            environment["ICECC_SCHEDULER"] = scheduler_addr
+            closure_sha256 = instance["image"].get("closure_sha256")
+            if not isinstance(closure_sha256, str):
+                raise PlanError(
+                    f"client image {instance['image']['label']} has no captured runtime closure"
+                )
+            environment.update(
+                {
+                    "ICECC_P50_COMPILE_IDENTITY_TRACE": "/results/compile-identity.jsonl",
+                    "ICECC_P50_C_ACTION_TRACE": "/results/c-action.jsonl",
+                    "ICECC_P50_C_LEGACY_WIRE_TRACE": "/results/c-legacy-wire.jsonl",
+                    "ICECC_P50_SOURCE_RESULT_TRACE": "/results/source-result.jsonl",
+                    "ICECC_P50_TEST_LIFECYCLE_TRACE": "/results/c-lifecycle.trace",
+                    "ICECC_P50_TEST_READY_TRACE": "/results/c-ready.trace",
+                    "ICECC_SCHEDULER": scheduler_addr,
+                }
+            )
+        elif instance["role"] == "F":
+            environment.update(
+                {
+                    "ICECC_P50_F_ACTION_TRACE": "/results/f-action.jsonl",
+                    "ICECC_P50_F_LEGACY_WIRE_TRACE": "/results/f-legacy-wire.jsonl",
+                    "ICECC_P50_TEST_LIFECYCLE_TRACE": "/results/f-lifecycle.trace",
+                    "ICECC_P50_TEST_READY_TRACE": "/results/f-ready.trace",
+                }
+            )
         if len(environment["ICECC_TEST_SOCKET"].encode("ascii")) > 107:
             raise PlanError(
                 f"instance {instance['name']!r} ICECC_TEST_SOCKET exceeds the 107-byte Unix limit"
@@ -217,6 +275,28 @@ def _planned_commands(
             (root / "results", "/results"),
         ):
             args.extend(("--mount", f"type=bind,src={source},dst={target}"))
+        if instance["role"] == "C":
+            corpus_root = (
+                PurePosixPath(host["scratch_root"])
+                / "icefarm"
+                / "corpora"
+                / scenario.data["workload"]["corpus"]
+            )
+            oracle_root = (
+                PurePosixPath(host["scratch_root"])
+                / "icefarm"
+                / "oracle"
+                / scenario.data["workload"]["corpus"]
+                / closure_sha256
+            )
+            args.extend(
+                (
+                    "--mount",
+                    f"type=bind,src={corpus_root},dst=/corpus,readonly",
+                    "--mount",
+                    f"type=bind,src={oracle_root},dst=/oracle",
+                )
+            )
         args.extend(_env_args(environment))
         entrypoint = {
             "S": "/opt/icecream/entry-scheduler.sh",
@@ -232,6 +312,9 @@ def _planned_commands(
         )
         if instance["role"] == "S":
             args.extend(("--port", str(scheduler_port), "--netname", netname))
+            fence_mode = _assignment_fence_mode(topology)
+            if fence_mode is not None:
+                args.extend(("--assignment-fence-mode", fence_mode))
         elif instance["role"] == "F":
             args.extend(
                 (
@@ -330,11 +413,14 @@ def fake_up(plan: dict[str, Any]) -> list[dict[str, Any]]:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("plan", "up", "down"):
+    for command in ("plan", "up", "run", "collect", "verify", "down", "report"):
         child = subparsers.add_parser(command)
         child.add_argument("--farm", required=True)
         child.add_argument("--scenario", required=True)
-        child.add_argument("--run-id", required=command == "down")
+        child.add_argument(
+            "--run-id",
+            required=command in ("run", "collect", "verify", "down", "report"),
+        )
         if command == "up":
             child.add_argument("--fake-recorder", action="store_true")
             child.add_argument("--reap-stale", type=float, metavar="HOURS")
@@ -392,6 +478,38 @@ def main(argv: list[str] | None = None) -> int:
             receipt = down_from_state(farm, plan)
             print(json.dumps(receipt, indent=2, sort_keys=True))
             return 0
+        if args.command == "run":
+            receipt = run_workload(farm, scenario, plan)
+            print(json.dumps(receipt, indent=2, sort_keys=True))
+            return 0
+        if args.command == "collect":
+            bundle = collect_bundle(farm, scenario, plan)
+            receipt = {
+                "artifacts": len(bundle["artifacts"]),
+                "jobs": len(bundle["rows"]),
+                "run_id": plan["run_id"],
+                "schema": COLLECT_SCHEMA,
+                "sha256sums_sha256": bundle["checksum_policy"]["sha256sums_sha256"],
+                "status": "COLLECTED",
+            }
+            print(json.dumps(receipt, indent=2, sort_keys=True))
+            return 0
+        if args.command in ("verify", "report"):
+            root = bundle_root(farm, plan["run_id"])
+            retained = load_verified_bundle(root)
+            if (
+                retained.get("farm_digest") != farm.digest
+                or retained.get("scenario_digest") != scenario.digest
+                or retained.get("topology_digest") != plan["topology_digest"]
+            ):
+                raise CollectError("bundle does not belong to the requested farm/scenario plan")
+            if args.command == "verify":
+                verdict = verify_bundle(root)
+                print(json.dumps(verdict, indent=2, sort_keys=True))
+                return 0 if verdict["status"] == "PASS" else 1
+            verdict, report = report_bundle(root)
+            print(report, end="")
+            return 0 if verdict["status"] == "PASS" else 1
         print(render_plan(plan), end="")
         return 0
     except PreflightRefusal as exc:
@@ -400,7 +518,14 @@ def main(argv: list[str] | None = None) -> int:
     except (FarmSpecError, ScenarioSpecError, PlanError) as exc:
         print(f"farmtest refused: {exc}", file=sys.stderr)
         return 3
-    except (ImageError, LifecycleError, RemoteError) as exc:
+    except (
+        CollectError,
+        ImageError,
+        LifecycleError,
+        RemoteError,
+        ReportError,
+        WorkloadError,
+    ) as exc:
         print(f"farmtest harness failure: {exc}", file=sys.stderr)
         return 2
 
