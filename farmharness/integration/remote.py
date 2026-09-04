@@ -102,7 +102,7 @@ class SubprocessTransport:
         if result.returncode != 0:
             raise RemoteError(
                 f"command {command.sequence} failed rc={result.returncode} on {command.host}: "
-                f"{(result.stderr or result.stdout)[-400:].strip()}"
+                f"{(result.stderr or result.stdout)[-4000:].strip()}"
             )
         return result
 

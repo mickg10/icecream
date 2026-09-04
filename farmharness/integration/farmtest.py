@@ -14,7 +14,8 @@ from typing import Any
 try:
     from farmharness import newgen_farm_env
     from .farm_spec import FarmSpec, FarmSpecError, load_farm_spec
-    from .remote import FakeRecorder, PlannedCommand, docker_argv, execute, ssh_argv
+    from .images import ImageError, build_and_distribute
+    from .remote import FakeRecorder, PlannedCommand, RemoteError, docker_argv, execute, ssh_argv
     from .scenario_spec import ScenarioSpec, ScenarioSpecError, load_scenario_spec
     from .schema_validation import canonical_bytes
 except ImportError:  # Executed as ./farmtest.py.
@@ -22,7 +23,8 @@ except ImportError:  # Executed as ./farmtest.py.
     import newgen_farm_env
 
     from farm_spec import FarmSpec, FarmSpecError, load_farm_spec
-    from remote import FakeRecorder, PlannedCommand, docker_argv, execute, ssh_argv
+    from images import ImageError, build_and_distribute
+    from remote import FakeRecorder, PlannedCommand, RemoteError, docker_argv, execute, ssh_argv
     from scenario_spec import ScenarioSpec, ScenarioSpecError, load_scenario_spec
     from schema_validation import canonical_bytes
 
@@ -288,6 +290,11 @@ def _parser() -> argparse.ArgumentParser:
         child.add_argument("--run-id")
         if command == "up":
             child.add_argument("--fake-recorder", action="store_true")
+    images = subparsers.add_parser("images")
+    images.add_argument("--farm", required=True)
+    images.add_argument("--labels")
+    images.add_argument("--repo", default=str(Path(__file__).resolve().parents[2]))
+    images.add_argument("--output")
     return parser
 
 
@@ -295,6 +302,26 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         farm = load_farm_spec(args.farm)
+        if args.command == "images":
+            labels = (
+                [item for item in args.labels.split(",") if item]
+                if args.labels
+                else sorted(farm.data["authority"]["images"])
+            )
+            output = Path(args.output) if args.output else (
+                Path(farm.data["hub"]["results_root"])
+                / "images"
+                / farm.digest[:12]
+                / "images.json"
+            )
+            receipt = build_and_distribute(
+                farm,
+                labels,
+                repo=Path(args.repo),
+                output=output,
+            )
+            print(json.dumps(receipt, indent=2, sort_keys=True))
+            return 0
         scenario = load_scenario_spec(args.scenario, farm)
         plan = build_plan(farm, scenario, run_id=args.run_id)
         if args.command == "up":
@@ -310,6 +337,9 @@ def main(argv: list[str] | None = None) -> int:
     except (FarmSpecError, ScenarioSpecError, PlanError) as exc:
         print(f"farmtest refused: {exc}", file=sys.stderr)
         return 3
+    except (ImageError, RemoteError) as exc:
+        print(f"farmtest image failure: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
