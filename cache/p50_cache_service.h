@@ -15,6 +15,7 @@
 #include <future>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -180,6 +181,12 @@ private:
     boost::asio::io_context context_;
     std::unique_ptr<P50ServerEndpoint> endpoint_;
     std::unique_ptr<P50CRouteOwner> route_owner_;
+    // P50CRouteOwner retains one sender per C/F/profile relationship and its
+    // preparation authority permits only one uncommitted successor.  Source
+    // requests arrive on independent bounded control workers, so serialize
+    // them here under their unchanged absolute deadline before touching that
+    // single-owner state.  This also bounds buffered source memory to one TU.
+    std::timed_mutex source_transfer_mutex_;
     EndpointWorkGuard endpoint_work_guard_;
     std::thread endpoint_owner_thread_;
     std::atomic<bool> endpoint_owner_failed_{false};

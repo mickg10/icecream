@@ -1227,6 +1227,15 @@ maybe_build_local(MsgChannel *local_daemon, UseCSMsg *usecs, CompileJob &job,
     remote_daemon = usecs->hostname;
 
     if (usecs->hostname == "127.0.0.1") {
+        // The scheduler-local fast path lives inside build_remote(), so the
+        // outer fallback guards in main.cpp never see it.  A strict all-P50
+        // cell must reject this selection before creating a local object.
+        if (getenv("ICECC_P50_C1F1_REQUIRED") != nullptr) {
+            log_error() << "strict all-P50 run refuses scheduler-selected localhost"
+                        << endl;
+            ret = EXIT_DISTCC_FAILED;
+            return true;
+        }
         // If this is a test build, do local builds on the local daemon
         // that has --no-remote, use remote building for the remaining ones.
         if (getenv("ICECC_TEST_REMOTEBUILD") && usecs->port != 0 )

@@ -30,6 +30,8 @@ for pair in \
     "$impl|structured_launch.c_store_guid" \
     "$impl|structured_launch.f_store_guid" \
     "$impl|kMaxControlWorkers = 64" \
+    "$impl|kSourceTransferLockPoll" \
+    "$impl|source_transfer_lock.try_lock_until" \
     "$impl|#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS" \
     "$impl|endpoint_->request_cancel_for_test()" \
     "$impl|structured_launch.f_store_generation" \
@@ -40,6 +42,7 @@ for pair in \
     "$impl|runtime_config.f_store_guid = structured_launch.active" \
     "$impl|ICECC_CACHE_SERVICE_EXPECTED_DERIVATION_VERSION" \
     "$header|RuntimeConfig" \
+    "$header|std::timed_mutex source_transfer_mutex_" \
     "$test_file|legacy_store_identity_launches" \
     "$test_file|test_runtime_store_identity_is_explicit_and_role_tagged" \
     "$test_file|authenticated_control_farm_accepts_twenty_and_stops" \
@@ -116,6 +119,9 @@ for pair in \
     "$impl|send_cache_session_ready(adopted.get(), deadline)" \
     "$impl|endpoint_->run_adopted" \
     "$impl|busy_.test_and_set" \
+    "$impl|source_transfer_mutex_" \
+    "$impl|std::min(transfer_deadline, now + kSourceTransferLockPoll)" \
+    "$impl|release source_transfer_mutex_ and admit a successor concurrently" \
     "$impl|cancel_endpoint_run()" \
     "$control|kControlOperationVersionV3" \
     "$control|ControlCancelTargetRole::CSource" \

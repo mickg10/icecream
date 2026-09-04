@@ -1294,6 +1294,24 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
         !source.valid())
         return source_transfer_error(1);
 
+    const auto transfer_deadline = deadline.as_steady_time_point();
+    std::unique_lock<std::timed_mutex> source_transfer_lock(
+        source_transfer_mutex_, std::defer_lock);
+    constexpr auto kSourceTransferLockPoll = std::chrono::milliseconds(50);
+    for (;;) {
+        if (stop_requested_.load(std::memory_order_acquire))
+            return source_transfer_error(7);
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= transfer_deadline)
+            return source_transfer_error(7);
+        if (source_transfer_lock.try_lock_until(
+                std::min(transfer_deadline, now + kSourceTransferLockPoll)))
+            break;
+    }
+    if (stop_requested_.load(std::memory_order_acquire) ||
+        std::chrono::steady_clock::now() >= transfer_deadline)
+        return source_transfer_error(7);
+
     P50SourceArmFields arm;
     arm.wire_job_id = request.wire_job_id;
     arm.assignment_epoch = request.assignment_epoch;
@@ -1331,7 +1349,6 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
 
     const PrepareRequestKey route_request{arm.assignment_epoch,
                                           arm.assignment_nonce};
-    const auto transfer_deadline = deadline.as_steady_time_point();
 
     struct PendingFd {
         int fd = -1;
@@ -1451,8 +1468,15 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     // CacheWire.  A bounded grace lets the owner coroutine publish its typed
     // terminal result without allowing a control worker to wait forever.
     const auto wait_limit = transfer_deadline + config_.cancellation_grace;
-    if (result.wait_until(wait_limit) != std::future_status::ready)
-        return source_transfer_error(7);
+    if (result.wait_until(wait_limit) != std::future_status::ready) {
+        // The coroutine still owns the retained route state.  Returning would
+        // release source_transfer_mutex_ and admit a successor concurrently
+        // with that live operation, recreating the overlap this gate forbids.
+        // Retire the supervised sidecar instead of exposing ambiguous state.
+        if (config_.fail_stop)
+            config_.fail_stop();
+        std::_Exit(125);
+    }
     return result.get();
 }
 

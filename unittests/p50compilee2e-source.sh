@@ -41,6 +41,8 @@ contract() {
     # The required-mode knob is a fail-closed contract: a missing sidecar or
     # P50 route must fail the requested test, never silently use FileChunk.
     require_text "$root/client/remote.cpp" 'ICECC_P50_C1F1_REQUIRED' || return 1
+    require_text "$root/client/remote.cpp" \
+        'strict all-P50 run refuses scheduler-selected localhost' || return 1
     require_text "$root/client/remote.cpp" 'ICECC_P50_C1F1_TIMEOUT' || return 1
     require_text "$root/daemon/workit.cpp" 'ICECC_P50_C1F1_REQUIRED' || return 1
     require_text "$root/client/remote.cpp" 'job.setCompileInputIdentity(*identity)' || return 1
@@ -152,6 +154,7 @@ for pair in \
     "daemon/serve.cpp|ZSTD_TU" \
     "daemon/workit.cpp|ZSTD_TU" \
     "client/remote.cpp|ICECC_P50_C1F1_REQUIRED" \
+    "client/remote.cpp|strict all-P50 run refuses scheduler-selected localhost" \
     "daemon/workit.cpp|ICECC_P50_C1F1_REQUIRED" \
     "client/remote.cpp|job.setCompileInputIdentity(*identity)" \
     "client/remote.cpp|P50CacheSessionFdRequestMsg(fd_request)" \
