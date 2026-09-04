@@ -15,6 +15,7 @@ try:
     from farmharness import newgen_farm_env
     from .farm_spec import FarmSpec, FarmSpecError, load_farm_spec
     from .images import ImageError, build_and_distribute
+    from .lifecycle import LifecycleError, PreflightRefusal, bring_up, down_from_state
     from .remote import FakeRecorder, PlannedCommand, RemoteError, docker_argv, execute, ssh_argv
     from .scenario_spec import ScenarioSpec, ScenarioSpecError, load_scenario_spec
     from .schema_validation import canonical_bytes
@@ -24,6 +25,7 @@ except ImportError:  # Executed as ./farmtest.py.
 
     from farm_spec import FarmSpec, FarmSpecError, load_farm_spec
     from images import ImageError, build_and_distribute
+    from lifecycle import LifecycleError, PreflightRefusal, bring_up, down_from_state
     from remote import FakeRecorder, PlannedCommand, RemoteError, docker_argv, execute, ssh_argv
     from scenario_spec import ScenarioSpec, ScenarioSpecError, load_scenario_spec
     from schema_validation import canonical_bytes
@@ -119,6 +121,25 @@ def _container_name(run_id: str, instance: str) -> str:
     return f"icefarm-{run_id}-{instance}"
 
 
+def _allocated_ports(
+    farm: FarmSpec, topology: dict[str, Any]
+) -> dict[str, Any]:
+    start, end = farm.data["port_range"]
+    peers = sorted(
+        item["name"] for item in topology["instances"] if item["role"] != "S"
+    )
+    last = start + 1 + len(peers)
+    if last > end:
+        raise PlanError(
+            f"port_range needs {2 + len(peers)} ports for scheduler/control and instances"
+        )
+    return {
+        "instances": {name: start + 2 + index for index, name in enumerate(peers)},
+        "scheduler": start,
+        "scheduler_control": start + 1,
+    }
+
+
 def _env_args(environment: dict[str, str]) -> list[str]:
     result: list[str] = []
     for key, value in sorted(environment.items()):
@@ -127,14 +148,18 @@ def _env_args(environment: dict[str, str]) -> list[str]:
 
 
 def _planned_commands(
-    farm: FarmSpec, scenario: ScenarioSpec, topology: dict[str, Any], run_id: str
+    farm: FarmSpec,
+    scenario: ScenarioSpec,
+    topology: dict[str, Any],
+    ports: dict[str, Any],
+    run_id: str,
 ) -> list[PlannedCommand]:
     commands: list[PlannedCommand] = []
     timeout = scenario.data["timeouts"]["up_s"]
     sequence = 0
 
     scheduler = next(item for item in topology["instances"] if item["role"] == "S")
-    scheduler_port = farm.data["port_range"][0]
+    scheduler_port = ports["scheduler"]
     scheduler_addr = f"{scheduler['address']}:{scheduler_port}"
     netname = f"{farm.data['netname_prefix']}-{run_id}"
 
@@ -162,6 +187,7 @@ def _planned_commands(
         args = [
             "run",
             "--detach",
+            "--pull=never",
             "--name",
             _container_name(run_id, instance["name"]),
             "--label",
@@ -176,6 +202,8 @@ def _planned_commands(
             "ICECC_NETNAME": netname,
             "ICECC_TEST_SOCKET": f"/tmp/{netname}-{instance['name']}.sock",
         }
+        if instance["role"] == "C":
+            environment["ICECC_SCHEDULER"] = scheduler_addr
         if len(environment["ICECC_TEST_SOCKET"].encode("ascii")) > 107:
             raise PlanError(
                 f"instance {instance['name']!r} ICECC_TEST_SOCKET exceeds the 107-byte Unix limit"
@@ -209,6 +237,10 @@ def _planned_commands(
                 (
                     "--scheduler",
                     scheduler_addr,
+                    "--netname",
+                    netname,
+                    "--port",
+                    str(ports["instances"][instance["name"]]),
                     "--slots",
                     str(instance["slots"]),
                     "--name",
@@ -216,7 +248,19 @@ def _planned_commands(
                 )
             )
         else:
-            args.extend(("--scheduler", scheduler_addr, "--idle"))
+            args.extend(
+                (
+                    "--scheduler",
+                    scheduler_addr,
+                    "--netname",
+                    netname,
+                    "--port",
+                    str(ports["instances"][instance["name"]]),
+                    "--name",
+                    instance["name"],
+                    "--idle",
+                )
+            )
         transport = "docker-context" if host.get("docker_context") else "ssh-docker"
         commands.append(
             PlannedCommand(
@@ -237,19 +281,22 @@ def build_plan(
     farm: FarmSpec, scenario: ScenarioSpec, *, run_id: str | None = None
 ) -> dict[str, Any]:
     topology = resolve_topology(farm, scenario)
+    ports = _allocated_ports(farm, topology)
     selected_run_id = run_id or f"plan-{topology['topology_digest'][:12]}"
     if RUN_ID_RE.fullmatch(selected_run_id) is None or selected_run_id in (".", ".."):
         raise PlanError("run id must be 1-80 safe, non-dot filename/label characters")
-    commands = _planned_commands(farm, scenario, topology, selected_run_id)
+    commands = _planned_commands(farm, scenario, topology, ports, selected_run_id)
     return {
         "commands": [command.as_dict() for command in commands],
         "farm": str(farm.path),
         "farm_digest": farm.digest,
         "icefarm_env": _resolver_environment(farm, scenario),
+        "ports": ports,
         "run_id": selected_run_id,
         "scenario": str(scenario.path),
         "schema": PLAN_SCHEMA,
         "scenario_digest": scenario.digest,
+        "timeouts": dict(sorted(scenario.data["timeouts"].items())),
         "topology": topology,
         "topology_digest": topology["topology_digest"],
     }
@@ -283,13 +330,14 @@ def fake_up(plan: dict[str, Any]) -> list[dict[str, Any]]:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("plan", "up"):
+    for command in ("plan", "up", "down"):
         child = subparsers.add_parser(command)
         child.add_argument("--farm", required=True)
         child.add_argument("--scenario", required=True)
-        child.add_argument("--run-id")
+        child.add_argument("--run-id", required=command == "down")
         if command == "up":
             child.add_argument("--fake-recorder", action="store_true")
+            child.add_argument("--reap-stale", type=float, metavar="HOURS")
     images = subparsers.add_parser("images")
     images.add_argument("--farm", required=True)
     images.add_argument("--labels")
@@ -325,20 +373,35 @@ def main(argv: list[str] | None = None) -> int:
         scenario = load_scenario_spec(args.scenario, farm)
         plan = build_plan(farm, scenario, run_id=args.run_id)
         if args.command == "up":
-            if not args.fake_recorder:
-                print("farmtest up is unavailable until lifecycle I3; no command executed", file=sys.stderr)
-                return 2
-            recorded = fake_up(plan)
-            if recorded != plan["commands"]:
-                print("farmtest internal error: fake recorder diverged from plan", file=sys.stderr)
-                return 2
+            if args.fake_recorder:
+                recorded = fake_up(plan)
+                if recorded != plan["commands"]:
+                    print("farmtest internal error: fake recorder diverged from plan", file=sys.stderr)
+                    return 2
+                print(render_plan(plan), end="")
+                return 0
+            receipt = bring_up(
+                farm,
+                scenario,
+                plan,
+                reap_stale_hours=args.reap_stale,
+            )
+            print(json.dumps(receipt, indent=2, sort_keys=True))
+            return 0
+        if args.command == "down":
+            receipt = down_from_state(farm, plan)
+            print(json.dumps(receipt, indent=2, sort_keys=True))
+            return 0
         print(render_plan(plan), end="")
         return 0
+    except PreflightRefusal as exc:
+        print(f"farmtest refused: {exc}", file=sys.stderr)
+        return 3
     except (FarmSpecError, ScenarioSpecError, PlanError) as exc:
         print(f"farmtest refused: {exc}", file=sys.stderr)
         return 3
-    except (ImageError, RemoteError) as exc:
-        print(f"farmtest image failure: {exc}", file=sys.stderr)
+    except (ImageError, LifecycleError, RemoteError) as exc:
+        print(f"farmtest harness failure: {exc}", file=sys.stderr)
         return 2
 
 

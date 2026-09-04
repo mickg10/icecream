@@ -27,6 +27,6 @@ test -n "$netname"
 exec /opt/icecream/sbin/icecc-scheduler \
     -p "$port" \
     -n "$netname" \
-    -u "$(id -u icecc)" \
+    -u icecc \
     -l /var/log/icecream/scheduler.log \
-    -vv
+    -vvv

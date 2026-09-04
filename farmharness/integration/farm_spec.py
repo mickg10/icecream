@@ -219,6 +219,12 @@ def load_farm_spec(path: str | Path) -> FarmSpec:
             f"$.authority.images.{label}.archive_sha256",
             SHA256_RE,
         )
+        if "closure_sha256" in image:
+            _exact_digest(
+                image["closure_sha256"],
+                f"$.authority.images.{label}.closure_sha256",
+                SHA256_RE,
+            )
         if "id" in image:
             _exact_digest(image["id"], f"$.authority.images.{label}.id", IMAGE_ID_RE)
     for name in authority["topologies"]:

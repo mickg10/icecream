@@ -324,18 +324,24 @@ def test_fake_recorder_never_invokes_subprocess(monkeypatch: pytest.MonkeyPatch)
     assert invoked is False
 
 
-def test_real_up_is_fail_closed_before_transport(capsys: pytest.CaptureFixture[str]) -> None:
+def test_real_up_is_fail_closed_before_transport(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    farm, _scenario = _documents()
+    del farm["authority"]["images"]["p50s2-624702e9"]["closure_sha256"]
+    farm_path = tmp_path / "farm-without-runtime-closure.json"
+    farm_path.write_text(json.dumps(farm), encoding="utf-8")
     args = [
         "up",
         "--farm",
-        str(INTEGRATION / "farm.example.json"),
+        str(farm_path),
         "--scenario",
         str(INTEGRATION / "scenarios" / "S00-smoke.json"),
     ]
-    assert farmtest.main(args) == 2
+    assert farmtest.main(args) == 3
     output = capsys.readouterr()
     assert output.out == ""
-    assert "unavailable until lifecycle I3" in output.err
+    assert "no captured runtime closure" in output.err
 
 
 def test_subprocess_transport_declares_shell_false(monkeypatch: pytest.MonkeyPatch) -> None:

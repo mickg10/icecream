@@ -177,6 +177,7 @@ def _pinned_image(authority: Mapping[str, Any], label: str) -> dict[str, Any]:
     commit = entry.get("commit")
     archive = entry.get("archive_sha256")
     image_id = entry.get("id")
+    closure = entry.get("closure_sha256")
     if not isinstance(commit, str) or COMMIT_RE.fullmatch(commit) is None:
         _refuse(f"image {label!r} has no immutable commit (rule 1)")
     if not isinstance(archive, str) or SHA256_RE.fullmatch(archive) is None:
@@ -185,12 +186,19 @@ def _pinned_image(authority: Mapping[str, Any], label: str) -> dict[str, Any]:
         not isinstance(image_id, str) or IMAGE_ID_RE.fullmatch(image_id) is None
     ):
         _refuse(f"image {label!r} has an invalid config id")
-    return {
+    if closure is not None and (
+        not isinstance(closure, str) or SHA256_RE.fullmatch(closure) is None
+    ):
+        _refuse(f"image {label!r} has an invalid runtime closure")
+    result = {
         "archive_sha256": archive,
         "commit": commit,
         "id": image_id,
         "label": label,
     }
+    if closure is not None:
+        result["closure_sha256"] = closure
+    return result
 
 
 def _corpus_binding(corpus: Mapping[str, Any]) -> dict[str, Any]:

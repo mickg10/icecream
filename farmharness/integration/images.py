@@ -46,6 +46,7 @@ class ImageBinding:
     label: str
     commit: str
     archive_sha256: str
+    expected_closure: str | None
     expected_id: str | None
     reference: str
 
@@ -124,6 +125,7 @@ def image_bindings(farm: FarmSpec, labels: Iterable[str]) -> list[ImageBinding]:
                 label=label,
                 commit=entry["commit"],
                 archive_sha256=entry["archive_sha256"],
+                expected_closure=entry.get("closure_sha256"),
                 expected_id=entry.get("id"),
                 reference=_runtime_reference(farm, label),
             )
@@ -254,6 +256,14 @@ def build_image(
         raise ImageError(
             f"hub image id mismatch for {binding.label}: "
             f"expected {binding.expected_id}, got {observed.native_id}"
+        )
+    if (
+        binding.expected_closure is not None
+        and observed.closure_sha256 != binding.expected_closure
+    ):
+        raise ImageError(
+            f"hub image closure mismatch for {binding.label}: "
+            f"expected {binding.expected_closure}, got {observed.closure_sha256}"
         )
     return observed
 

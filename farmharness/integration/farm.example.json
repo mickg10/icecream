@@ -99,15 +99,18 @@
     "images": {
       "p43-1.4.0": {
         "commit": "cd74801e0fa4e83e3ae254ca1d7fe98642f36b89",
-        "archive_sha256": "c0f95d5f3729972acb6522746c847aa88419a0021f43f6cc1de7ba71bbe02ccd"
+        "archive_sha256": "c0f95d5f3729972acb6522746c847aa88419a0021f43f6cc1de7ba71bbe02ccd",
+        "closure_sha256": "dfda517d43efa92b1045113e308e780937b96d9cd9db1044c3e5bb1864bb59ff"
       },
       "p50-4c994915": {
         "commit": "4c99491560709e16860e346762aa297316412648",
-        "archive_sha256": "fa2c0d37697a7abff5fb3f64343f8d126f3476c1f7e8999f1543aa76923909d7"
+        "archive_sha256": "fa2c0d37697a7abff5fb3f64343f8d126f3476c1f7e8999f1543aa76923909d7",
+        "closure_sha256": "f34efd0958cd6dbfc4f93ae6be632c10fae21c30f86e33db6f3b1e2c04633463"
       },
       "p50s2-624702e9": {
         "commit": "624702e98f60f453f9be5d406b6da45730eae1ee",
-        "archive_sha256": "337480192fb3ed44e4aa9c12c450482d989fec3101412558a1fece725e2a347b"
+        "archive_sha256": "337480192fb3ed44e4aa9c12c450482d989fec3101412558a1fece725e2a347b",
+        "closure_sha256": "6f1983596d3a39477e8a0938fd24b69c696c1e37bbf738de1dfc5a2e957bd5a1"
       }
     },
     "topologies": {

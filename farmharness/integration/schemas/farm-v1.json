@@ -235,6 +235,7 @@
       "properties": {
         "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
         "archive_sha256": {"$ref": "#/$defs/sha256"},
+        "closure_sha256": {"$ref": "#/$defs/sha256"},
         "id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
       }
     },

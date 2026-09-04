@@ -82,7 +82,10 @@ class ScriptedRecorder:
 
 
 def _farm():
-    return load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    for image in farm.data["authority"]["images"].values():
+        image["closure_sha256"] = GOOD_IDENTITY.closure_sha256
+    return farm
 
 
 @pytest.mark.parametrize(
@@ -163,6 +166,23 @@ def test_preexisting_expected_hub_id_mismatch_is_refused(tmp_path: Path) -> None
     )
     recorder = RecordingTransport(ScriptedRecorder())
     with pytest.raises(ImageError, match="hub image id mismatch"):
+        build_image(
+            farm,
+            binding,
+            tmp_path,
+            recorder,
+            CommandFactory(),
+            timeout_s=10,
+        )
+
+
+def test_preexisting_expected_hub_closure_mismatch_is_refused(tmp_path: Path) -> None:
+    farm = _farm()
+    binding = dataclasses.replace(
+        image_bindings(farm, ["p50s2-624702e9"])[0], expected_closure="f" * 64
+    )
+    recorder = RecordingTransport(ScriptedRecorder())
+    with pytest.raises(ImageError, match="hub image closure mismatch"):
         build_image(
             farm,
             binding,

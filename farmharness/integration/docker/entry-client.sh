@@ -2,6 +2,9 @@
 set -eu
 
 scheduler=
+netname=
+port=
+node_name=
 idle=false
 while test "$#" -gt 0
 do
@@ -15,6 +18,21 @@ do
             idle=true
             shift
             ;;
+        --netname)
+            test "$#" -ge 2
+            netname=$2
+            shift 2
+            ;;
+        --port)
+            test "$#" -ge 2
+            port=$2
+            shift 2
+            ;;
+        --name)
+            test "$#" -ge 2
+            node_name=$2
+            shift 2
+            ;;
         *)
             echo "entry-client: unsupported argument: $1" >&2
             exit 64
@@ -22,6 +40,9 @@ do
     esac
 done
 test -n "$scheduler"
+test -n "$netname"
+test -n "$port"
+test -n "$node_name"
 test "$idle" = true
 
 install -d -m 1777 /var/cache/icecream/envs /var/log/icecream
@@ -30,13 +51,15 @@ chown -R icecc:icecc /var/cache/icecream
 
 set -- \
     -s "$scheduler" \
+    -n "$netname" \
+    -p "$port" \
     -m 0 \
     --no-remote \
-    -N client \
-    -u "$(id -u icecc)" \
+    -N "$node_name" \
+    -u icecc \
     -b /var/cache/icecream/envs \
     -l /var/log/icecream/client-daemon.log \
-    -vv
+    -vvv
 if test -x /opt/icecream/sbin/icecc-cache-service
 then
     set -- "$@" \
