@@ -103,7 +103,7 @@ struct P50ZstdSourceSender::Impl {
             c_guid, config.endpoint_caps.zstd, config.authority_limits,
             config.compression_level, config.endpoint_caps.profile);
         endpoint = std::make_unique<P50ClientEndpoint>(
-            authority, config.endpoint_caps, HistoryNonce{1});
+            authority, config.endpoint_caps, HistoryNonce{1}, &wire_completions);
     }
 
     Impl(std::shared_ptr<P50PreparationAuthority> authority_value,
@@ -130,7 +130,7 @@ struct P50ZstdSourceSender::Impl {
         if (config.endpoint_caps.zstd != authority->zstd_limits())
             throw std::invalid_argument("sender and shared authority capabilities differ");
         endpoint = std::make_unique<P50ClientEndpoint>(
-            authority, config.endpoint_caps, HistoryNonce{1}, nullptr, nullptr,
+            authority, config.endpoint_caps, HistoryNonce{1}, &wire_completions, nullptr,
             std::nullopt, std::function<void(EndpointCancelPermit)>{},
             std::function<void(EndpointCancelPermit, EndpointTerminalResult)>{}, route);
     }
@@ -184,6 +184,31 @@ struct P50ZstdSourceSender::Impl {
         (void)position;
     }
 
+    void bind_wire_evidence(ZstdSourceTransferResult& result) const noexcept {
+        if (!wire_completions.valid())
+            return;
+        uint64_t c_to_f_bytes = 0;
+        uint64_t f_to_c_bytes = 0;
+        for (const AsyncCompletion& completion : wire_completions.completions()) {
+            if (completion.stamp.actor != ActorSide::C)
+                continue;
+            uint64_t* total = nullptr;
+            if (completion.stamp.operation == AsyncOperationKind::WriteFragment)
+                total = &c_to_f_bytes;
+            else if (completion.stamp.operation == AsyncOperationKind::ReadHeader ||
+                     completion.stamp.operation == AsyncOperationKind::ReadPayload)
+                total = &f_to_c_bytes;
+            if (total != nullptr) {
+                if (completion.transferred_bytes >
+                    std::numeric_limits<uint64_t>::max() - *total)
+                    return;
+                *total += completion.transferred_bytes;
+            }
+        }
+        result.c_to_f_bytes = c_to_f_bytes;
+        result.f_to_c_bytes = f_to_c_bytes;
+    }
+
     PrepareRequestKey begin_transfer() {
         if (config.endpoint_caps.profile == ProfileId::ZSTD_TU) {
             if (used) throw std::logic_error("sender is one-shot");
@@ -203,6 +228,7 @@ struct P50ZstdSourceSender::Impl {
     std::shared_ptr<P50PreparationAuthority> authority;
     PreparationRouteKey route{};
     bool route_bound = false;
+    CompletionLog wire_completions;
     std::unique_ptr<P50ClientEndpoint> endpoint;
     std::map<PrepareRequestKey, CompletedRequest> completed;
     bool used = false;
@@ -363,6 +389,10 @@ P50ZstdSourceSender::transfer_bytes(
     if (impl_->completed.size() >= impl_->config.max_completed_requests)
         co_return impl_->invalid(ZstdSourceTransferStatus::Unavailable);
 
+    // One route owner serializes its transfers. Retain only this operation's
+    // completions so byte accounting is bounded and includes either retry.
+    impl_->wire_completions.clear();
+
     PreparedTuHandle prepared;
     try {
         prepared = impl_->route_bound
@@ -414,6 +444,20 @@ P50ZstdSourceSender::transfer_bytes(
         if (run.status == ClientRunStatus::Committed) {
             ZstdSourceTransferResult result = impl_->committed_from_witness(
                 run, source->size(), raw_digest, attempt);
+            impl_->bind_wire_evidence(result);
+            if (result.status == ZstdSourceTransferStatus::Committed &&
+                result.profile == ProfileId::P29V1) {
+                try {
+                    result.system_source_reuse =
+                        impl_->authority->p29v1_system_source_reuse(prepared);
+                } catch (...) {
+                    result.status =
+                        ZstdSourceTransferStatus::CommittedIdentityUnavailable;
+                }
+                if (!result.system_source_reuse.has_value())
+                    result.status =
+                        ZstdSourceTransferStatus::CommittedIdentityUnavailable;
+            }
             // Endpoint commit consumes the transaction but intentionally does
             // not own the preparation reference.  Release it only after the
             // commit witness is frozen; failed runs retain the exact handle
@@ -421,8 +465,8 @@ P50ZstdSourceSender::transfer_bytes(
             try {
                 (void)impl_->authority->release(prepared);
             } catch (...) {
-                co_return impl_->invalid(
-                    ZstdSourceTransferStatus::CommittedIdentityUnavailable);
+                result.status =
+                    ZstdSourceTransferStatus::CommittedIdentityUnavailable;
             }
             if (result.status != ZstdSourceTransferStatus::Committed)
                 co_return result;
@@ -437,6 +481,7 @@ P50ZstdSourceSender::transfer_bytes(
             ZstdSourceTransferResult result =
                 impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
             result.attempts = attempt;
+            impl_->bind_wire_evidence(result);
             co_return result;
         }
         if (run.status == ClientRunStatus::TerminalError) {
@@ -444,12 +489,14 @@ P50ZstdSourceSender::transfer_bytes(
                 impl_->invalid(ZstdSourceTransferStatus::TerminalError);
             result.attempts = attempt;
             result.terminal_error = run.terminal_error;
+            impl_->bind_wire_evidence(result);
             co_return result;
         }
         if (attempt == 2) {
             ZstdSourceTransferResult result =
                 impl_->invalid(ZstdSourceTransferStatus::RetryExhausted);
             result.attempts = attempt;
+            impl_->bind_wire_evidence(result);
             co_return result;
         }
     }

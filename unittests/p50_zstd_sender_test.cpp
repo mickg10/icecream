@@ -92,6 +92,9 @@ void test_exact_network_transfer() {
     CHECK(result.raw_bytes == source.size());
     CHECK(result.raw_digest == icecc::digest128(source));
     CHECK(result.attempts == 1);
+    CHECK(result.c_to_f_bytes > source.size());
+    CHECK(result.f_to_c_bytes > 0);
+    CHECK(!result.system_source_reuse.has_value());
 }
 
 void test_owned_fd_and_fail_closed_validation() {
@@ -149,6 +152,9 @@ void test_adopted_fd_factory_exact_transfer() {
     CHECK(result.committed_input->c_store_guid == Id128::from_u64(7011));
     CHECK(result.raw_digest == icecc::digest128(source));
     CHECK(result.attempts == 1);
+    CHECK(result.c_to_f_bytes > source.size());
+    CHECK(result.f_to_c_bytes > 0);
+    CHECK(!result.system_source_reuse.has_value());
     CHECK(calls == 1);
 }
 

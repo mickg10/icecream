@@ -55,6 +55,13 @@ struct ZstdSourceTransferResult {
     Digest128 raw_digest{};
     uint8_t attempts = 0;
     std::optional<ErrorMessage> terminal_error;
+    // Exact CacheWire bytes observed by the C endpoint, including frame
+    // headers and bounded retries. These diagnostic witnesses do not grant
+    // transfer authority.
+    uint64_t c_to_f_bytes = 0;
+    uint64_t f_to_c_bytes = 0;
+    // Present only for P29V1 after the route pins its two fingerprints.
+    std::optional<bool> system_source_reuse;
 };
 
 struct ZstdSourceTransferConfig {

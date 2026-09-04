@@ -247,6 +247,8 @@ public:
         PreparedTuHandle handle, std::span<const uint8_t> inner_need);
     [[nodiscard]] Digest128 p29v1_system_source_fingerprint(
         PreparedTuHandle handle) const;
+    [[nodiscard]] std::optional<bool> p29v1_system_source_reuse(
+        PreparedTuHandle handle) const;
     void pin_p29v1_system_source_reuse(PreparedTuHandle handle,
                                        Digest128 f_fingerprint);
     void restart_p29v1_transport_retry(PreparedTuHandle handle);

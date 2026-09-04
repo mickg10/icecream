@@ -72,6 +72,8 @@ constexpr int kMaxBacklog = 16;
 // This is a hard concurrent cap, not a per-connection unbounded thread fork.
 constexpr size_t kMaxControlWorkers = 64;
 
+std::string bytes_hex(std::span<const uint8_t> bytes);
+
 std::string daemon_cache_directory_from_socket(
     std::string_view socket_path) {
     const size_t leaf_separator = socket_path.rfind('/');
@@ -100,6 +102,75 @@ void append_ready_test_trace(std::string_view message) noexcept {
     while (offset < message.size()) {
         const ssize_t written = ::write(fd, message.data() + offset,
                                         message.size() - offset);
+        if (written > 0) {
+            offset += static_cast<size_t>(written);
+            continue;
+        }
+        if (written < 0 && errno == EINTR)
+            continue;
+        break;
+    }
+    (void)::close(fd);
+}
+
+void append_source_result_trace(
+    const local::P50SourceTransferRequest& request,
+    CStoreGuid c_store_guid,
+    ProfileId profile,
+    const ZstdSourceTransferResult& transfer) noexcept {
+    const char* path = ::getenv("ICECC_P50_SOURCE_RESULT_TRACE");
+    if (path == nullptr || *path == '\0')
+        return;
+    const std::string_view label =
+        profile == ProfileId::P29V1
+            ? std::string_view("P29V1")
+            : profile == ProfileId::ZSTD_TU
+                  ? std::string_view("ZSTD_TU")
+                  : profile == ProfileId::ZSTD_ROUTE
+                        ? std::string_view("ZSTD_ROUTE")
+                        : std::string_view("UNKNOWN");
+    const char* reuse = "null";
+    if (transfer.system_source_reuse.has_value())
+        reuse = *transfer.system_source_reuse ? "true" : "false";
+    const std::string c_guid = bytes_hex(std::span<const uint8_t>(
+        c_store_guid.bytes.data(), c_store_guid.bytes.size()));
+    char line[1024];
+    const int length = std::snprintf(
+        line, sizeof(line),
+        "{\"schema\":\"icecream-p50-source-result-v1\","
+        "\"wire_job_id\":%llu,\"logical_job\":%llu,"
+        "\"assignment_epoch\":%llu,\"assignment_nonce\":%llu,"
+        "\"c_store_guid\":\"%s\","
+        "\"profile\":\"%.*s\",\"status\":%u,\"attempts\":%u,"
+        "\"tu_seq\":%llu,\"raw_bytes\":%llu,"
+        "\"c_to_f_bytes\":%llu,\"f_to_c_bytes\":%llu,"
+        "\"system_source_reuse\":%s}\n",
+        static_cast<unsigned long long>(request.wire_job_id),
+        static_cast<unsigned long long>(request.logical_job),
+        static_cast<unsigned long long>(request.assignment_epoch),
+        static_cast<unsigned long long>(request.assignment_nonce),
+        c_guid.c_str(),
+        static_cast<int>(label.size()), label.data(),
+        static_cast<unsigned>(transfer.status),
+        static_cast<unsigned>(transfer.attempts),
+        static_cast<unsigned long long>(
+            transfer.committed_input.has_value()
+                ? transfer.committed_input->tu_seq.value
+                : 0),
+        static_cast<unsigned long long>(transfer.raw_bytes),
+        static_cast<unsigned long long>(transfer.c_to_f_bytes),
+        static_cast<unsigned long long>(transfer.f_to_c_bytes), reuse);
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(line))
+        return;
+    const int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC |
+                                   O_NOFOLLOW,
+                          0600);
+    if (fd < 0)
+        return;
+    size_t offset = 0;
+    while (offset < static_cast<size_t>(length)) {
+        const ssize_t written = ::write(
+            fd, line + offset, static_cast<size_t>(length) - offset);
         if (written > 0) {
             offset += static_cast<size_t>(written);
             continue;
@@ -399,8 +470,6 @@ bool parse_listener_fd(OwnedFd& listener) noexcept {
     listener.fd = fd;
     return true;
 }
-
-std::string bytes_hex(std::span<const uint8_t> bytes);
 
 struct StructuredLaunch {
     bool active = false;
@@ -1449,14 +1518,18 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
              expected_c_guid = config_.c_store_guid]() mutable
                 -> asio::awaitable<void> {
                 local::P50SourceTransferResult value = source_transfer_error(4);
+                ZstdSourceTransferResult observed;
                 try {
-                    const ZstdSourceTransferResult transfer = co_await route_owner_->transfer(
+                    observed = co_await route_owner_->transfer(
                         relationship, route_request, connection, transfer_deadline,
                         std::span<const uint8_t>(*source_bytes));
-                    value = source_transfer_result(transfer, expected_c_guid);
+                    value = source_transfer_result(observed, expected_c_guid);
                 } catch (...) {
                     value = source_transfer_error(5);
                 }
+                append_source_result_trace(request, expected_c_guid,
+                                           relationship.profile,
+                                           observed);
                 completion->set_value(value);
                 co_return;
             },

@@ -1666,6 +1666,10 @@ uint64_t CRoute::p29v1_route_state_bytes() const noexcept {
     return p29v1_ ? sender_route_bytes(p29v1_->provider.sender_route()) : 0;
 }
 
+std::optional<bool> CRoute::p29v1_system_source_reuse() const noexcept {
+    return p29v1_ ? p29v1_->fixed_system_source_reuse : std::nullopt;
+}
+
 const CActiveTx& CRoute::begin_v1(
     const PreparedTUPtr& prepared, uint64_t max_route_state_bytes) {
     if (!prepared)

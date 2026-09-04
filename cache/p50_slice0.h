@@ -331,6 +331,7 @@ public:
     [[nodiscard]] RelSeq next_rel_seq() const { return next_rel_seq_; }
     [[nodiscard]] Digest128 state_digest() const { return state_digest_; }
     [[nodiscard]] uint64_t p29v1_route_state_bytes() const noexcept;
+    [[nodiscard]] std::optional<bool> p29v1_system_source_reuse() const noexcept;
 
 private:
     void reset_history(FStoreGuid f_store_guid, HistoryNonce history_nonce);

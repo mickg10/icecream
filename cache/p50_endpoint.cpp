@@ -1199,6 +1199,22 @@ Digest128 P50PreparationAuthority::p29v1_system_source_fingerprint(
     return route->second->p29v1_system_source_fingerprint;
 }
 
+std::optional<bool> P50PreparationAuthority::p29v1_system_source_reuse(
+    PreparedTuHandle handle) const {
+    impl_->owner.require();
+    if (handle.authority_.lock() != impl_->identity || handle.entry_id_ == 0)
+        throw std::invalid_argument(
+            "prepared-TU handle does not belong to this C authority");
+    const auto position = impl_->entries.find(handle.entry_id_);
+    if (position == impl_->entries.end() ||
+        position->second.route.profile != ProfileId::P29V1)
+        throw std::invalid_argument("prepared-TU handle is not P29V1");
+    const auto route = impl_->routes.find(position->second.route);
+    if (route == impl_->routes.end() || !route->second->p29_route)
+        throw std::logic_error("P29V1 route state is absent");
+    return route->second->p29_route->p29v1_system_source_reuse();
+}
+
 void P50PreparationAuthority::pin_p29v1_system_source_reuse(
     PreparedTuHandle handle, Digest128 f_fingerprint) {
     impl_->owner.require();

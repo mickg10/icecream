@@ -609,11 +609,17 @@ void test_p29v1_relationship_owner() {
     CHECK(first.status == ZstdSourceTransferStatus::Committed);
     CHECK(first.profile == ProfileId::P29V1);
     CHECK(first.committed_input->tu_seq.value == 0);
+    CHECK(first.c_to_f_bytes > repeated.size());
+    CHECK(first.f_to_c_bytes > 0);
+    CHECK(first.system_source_reuse.has_value());
     const auto second = route_call(context, owner, server, acceptor, route,
                                    {7301, 2}, repeated);
     CHECK(second.status == ZstdSourceTransferStatus::Committed);
     CHECK(second.profile == ProfileId::P29V1);
     CHECK(second.committed_input->tu_seq.value == 1);
+    CHECK(second.c_to_f_bytes > 0);
+    CHECK(second.f_to_c_bytes > 0);
+    CHECK(second.system_source_reuse == first.system_source_reuse);
     CHECK(owner.owner_count() == 1 && owner.owns(route));
 }
 
