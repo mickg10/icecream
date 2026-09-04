@@ -14,6 +14,7 @@
 namespace icecc::p50 {
 
 class InputAttachmentCore;
+class VerifiedMaterialization;
 
 // Input identity is deliberately independent of compiler ATTEMPT_ID. A
 // replacement compiler on the same F attaches to the same exact input without
@@ -101,6 +102,15 @@ public:
     [[nodiscard]] static PreparedPublish prepare_publish(
         CStoreGuid c_store_guid, const TxBegin& begin,
         const TxCommit& commit, std::vector<uint8_t> exact_input);
+
+    // Product profile dialogues have already checked the exact byte length and
+    // digest while reconstructing the TU.  Consume their move-only proof so
+    // publication can retain those same bytes without a duplicate whole-input
+    // digest pass.  The ordinary prepare_publish() API remains independently
+    // validating for callers without such a proof.
+    [[nodiscard]] static PreparedPublish prepare_verified_publish(
+        CStoreGuid c_store_guid, const TxBegin& begin,
+        const TxCommit& commit, VerifiedMaterialization materialization);
 
     // Allocation-free owner transition for an open logical job. The map's
     // bucket arena was reserved at store construction, and the node was
@@ -196,9 +206,15 @@ private:
     using Records =
         std::unordered_map<InputRecordKey, Entry, InputRecordKeyHash>;
 
+    static void validate_commit_identity(const TxBegin& begin,
+                                         const TxCommit& commit,
+                                         std::span<const uint8_t> exact_input);
     static void validate_commit(const TxBegin& begin,
                                 const TxCommit& commit,
                                 std::span<const uint8_t> exact_input);
+    static PreparedPublish prepare_validated_publish(
+        CStoreGuid c_store_guid, const TxBegin& begin,
+        const TxCommit& commit, std::vector<uint8_t> exact_input);
     static void validate_existing(const Entry& entry,
                                   const TxBegin& begin,
                                   const TxCommit& commit,

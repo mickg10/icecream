@@ -273,21 +273,21 @@ def test_warm_replay_retains_tu_traces_identity_and_stage_ledger(tmp_path: Path)
          "--s7-artifacts", str(artifacts), "--s7-output", str(tmp_path / "output")],
         text=True, capture_output=True, check=False)
     assert result.returncode == 0, result.stderr
-    assert len(read_jsonl(tmp_path / "output" / "prewarm-actions.jsonl")) == 11
+    assert len(read_jsonl(tmp_path / "output" / "prewarm-actions.jsonl")) == 9
     measured = read_jsonl(tmp_path / "output" / "measured-actions.jsonl")
-    assert len(measured) == 10
+    assert len(measured) == 8
     assert {row["tu_seq"] for row in measured if row["action"] == "TX_BEGIN"} == {1}
     identity = json.loads((tmp_path / "output" / "identities.json").read_text())
     assert identity["prewarm_tu_seq"] == 0
     assert identity["measured_tu_seq"] == 1
-    assert len(read_jsonl(tmp_path / "output" / "stage-ledger.jsonl")) == 21
+    assert len(read_jsonl(tmp_path / "output" / "stage-ledger.jsonl")) == 17
 
 
 def test_warm_deletion_control_reddens_measured_trace(tmp_path: Path) -> None:
     artifacts = warm_scenario_tree(tmp_path / "artifacts")
     measured = artifacts / "measured-actions.jsonl"
     rows = [json.loads(line) for line in measured.read_bytes().splitlines()]
-    rows = [row for row in rows if row["action"] != "NEED_RECORDED"]
+    rows = [row for row in rows if row["action"] != "BODY_COMPLETE"]
     measured.write_text("".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows))
     result = subprocess.run(
         [str(HERE / "p50sim"), "--s7-cell", "fmt/ZSTD_TU/warm",

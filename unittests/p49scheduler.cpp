@@ -445,6 +445,14 @@ static AssignPrepareMsg *wait_prepare(MsgChannel *worker)
         wait_type(worker, Msg::ASSIGN_PREPARE, 3000));
 }
 
+static JobDoneMsg job_done_for(const UseCSMsg &use, int exitcode,
+                               unsigned int flags)
+{
+    return JobDoneMsg(use.job_id, exitcode, flags, 0,
+                      use.assignmentEpoch(), use.assignmentNonce(),
+                      use.cGuid(), use.tuSeq());
+}
+
 static void run_enforcing(const std::string &binary,
                           const std::string &directory)
 {
@@ -503,8 +511,8 @@ static void run_enforcing(const std::string &binary,
             "duplicate READY cannot expose a second UseCS");
 
     if (first_use) {
-        submitter->send_msg(JobDoneMsg(first_use->job_id, 1,
-                                       JobDoneMsg::FROM_SUBMITTER));
+        submitter->send_msg(job_done_for(*first_use, 1,
+                                         JobDoneMsg::FROM_SUBMITTER));
     }
     RevokeBeforeStartMsg *first_revoke = dynamic_cast<RevokeBeforeStartMsg *>(
         wait_type(worker, Msg::REVOKE_BEFORE_START, 3000));
@@ -561,9 +569,9 @@ static void run_enforcing(const std::string &binary,
     REQUIRE(no_type(worker, Msg::ASSIGN_PREPARE, 350),
             "claim outcome retains ownership until ordinary completion");
     delete claimed_probe;
-    if (first_revoke) {
-        worker->send_msg(JobDoneMsg(first_revoke->wire_id, 0,
-                                    JobDoneMsg::FROM_SERVER));
+    if (first_revoke && first_use) {
+        worker->send_msg(job_done_for(*first_use, 0,
+                                      JobDoneMsg::FROM_SERVER));
     }
 
     ConfCSMsg *reuse_conf = nullptr;
@@ -604,14 +612,14 @@ static void run_enforcing(const std::string &binary,
         worker->send_msg(AssignReadyMsg(second->epoch(), second->wire_id,
                                         second->nonce()));
     }
-    if (second_revoke) {
+    if (second_revoke && second_use) {
         worker->send_msg(RevokeResultMsg(second_revoke->epoch(),
                                          second_revoke->wire_id,
                                          second_revoke->nonce(),
                                          RevokeResultMsg::ClaimedOrLater));
         worker->send_msg(JobBeginMsg(second_revoke->wire_id, 0));
-        worker->send_msg(JobDoneMsg(second_revoke->wire_id, 0,
-                                    JobDoneMsg::FROM_SERVER));
+        worker->send_msg(job_done_for(*second_use, 0,
+                                      JobDoneMsg::FROM_SERVER));
     }
     usleep(100 * 1000);
 
@@ -734,7 +742,8 @@ static void run_prepare_credit(const std::string &binary,
 
     if (first) {
         first_submitter->send_msg(JobDoneMsg(
-            first->wire_id, 1, JobDoneMsg::FROM_SUBMITTER));
+            first->wire_id, 1, JobDoneMsg::FROM_SUBMITTER, 0,
+            first->epoch(), first->nonce(), first->epoch(), 0));
     }
     RevokeBeforeStartMsg *revoke = dynamic_cast<RevokeBeforeStartMsg *>(
         wait_type(worker, Msg::REVOKE_BEFORE_START, 3000));
@@ -881,8 +890,7 @@ static void run_advisory(const std::string &binary,
             "Advisory sends PREPARE without READY-gating UseCS");
     if (use) {
         worker->send_msg(JobBeginMsg(use->job_id, 0));
-        worker->send_msg(JobDoneMsg(use->job_id, 0,
-                                    JobDoneMsg::FROM_SERVER));
+        worker->send_msg(job_done_for(*use, 0, JobDoneMsg::FROM_SERVER));
     }
     delete use;
     delete prepare;
@@ -950,9 +958,15 @@ static void run_strict_nonce(const std::string &binary,
     int worker_port = 0;
     int worker_listener = bind_port(0, &worker_port);
     if (worker_listener >= 0) listen(worker_listener, 16);
+    int cache_port = 0;
+    int cache_sentinel = bind_port(0, &cache_port);
+    if (cache_sentinel >= 0) listen(cache_sentinel, 4);
     ConfCSMsg *worker_conf = nullptr;
     MsgChannel *worker = login_host(port, "strict-worker", true, worker_port,
-                                    &worker_conf);
+                                    &worker_conf, nullptr, 1, 0,
+                                    static_cast<uint32_t>(cache_port),
+                                    CACHE_WIRE_REVISION,
+                                    CACHE_PROFILE_ZSTD_TU);
     REQUIRE(worker && worker_conf
                 && worker_conf->fence_mode == ConfCSMsg::StrictNonce
                 && worker_conf->epoch() != 0,
@@ -989,13 +1003,14 @@ static void run_strict_nonce(const std::string &binary,
             "strict UseCS carries the already-authorized full tuple");
     if (use) {
         worker->send_msg(JobBeginMsg(use->job_id, 0));
-        worker->send_msg(JobDoneMsg(use->job_id, 0, JobDoneMsg::FROM_SERVER));
+        worker->send_msg(job_done_for(*use, 0, JobDoneMsg::FROM_SERVER));
     }
     delete use;
     delete prepare_wire;
     delete submitter;
     delete worker;
     if (worker_listener >= 0) close(worker_listener);
+    if (cache_sentinel >= 0) close(cache_sentinel);
 
     /* Link versions only exclude an incompatible path; they never choose or
        weaken the operator's global mode.  The old worker receives a LEGACY
@@ -1069,7 +1084,7 @@ static void run_disabled(const std::string &binary, const std::string &directory
 
     if (use) {
         worker->send_msg(JobBeginMsg(use->job_id, 0));
-        worker->send_msg(JobDoneMsg(use->job_id, 0, JobDoneMsg::FROM_SERVER));
+        worker->send_msg(job_done_for(*use, 0, JobDoneMsg::FROM_SERVER));
     }
     delete use;
     delete submitter;
@@ -1098,14 +1113,14 @@ static void run_cache_advertisement(const std::string &binary,
     MsgChannel *worker = login_host(
         port, "cache-ad-worker", true, worker_port, &worker_conf,
         nullptr, 1, 0, static_cast<uint32_t>(cache_port),
-        CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU);
+        CACHE_WIRE_REVISION, CACHE_PROFILE_ZSTD_TU);
     REQUIRE(worker && worker_conf && cache_sentinel >= 0,
             "fake ready F logs in with a production cache advertisement");
     delete worker_conf;
 
     const std::string endpoint = "cache=127.0.0.1:"
         + std::to_string(cache_port)
-        + " cache_wire=v1 cache_protocol=50 cache_profiles=zstd_tu";
+        + " cache_wire=v1 cache_protocol=1 cache_profiles=zstd_tu";
     std::string list = control_text(port, "listcs");
     REQUIRE(list.find("cache-ad-worker") != std::string::npos
                 && list.find(endpoint) != std::string::npos,
@@ -1140,7 +1155,7 @@ static void run_cache_advertisement(const std::string &binary,
             "scheduler and submitter never connect to the inert cache endpoint");
     if (use) {
         worker->send_msg(JobBeginMsg(use->job_id, 0));
-        worker->send_msg(JobDoneMsg(use->job_id, 0, JobDoneMsg::FROM_SERVER));
+        worker->send_msg(job_done_for(*use, 0, JobDoneMsg::FROM_SERVER));
     }
     delete use;
 
@@ -1226,7 +1241,7 @@ static void run_cache_handoff_identity_bound(const std::string &binary,
     MsgChannel *worker_a = login_host(
         port, "cache-bound-a", true, worker_a_port, &a_conf,
         nullptr, 1, 0, static_cast<uint32_t>(cache_a_port),
-        CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU);
+        CACHE_WIRE_REVISION, CACHE_PROFILE_ZSTD_TU);
     REQUIRE(worker_a && a_conf && a_conf->fence_mode == ConfCSMsg::Advisory,
             "distractor candidate F_A logs in with its own valid cache advertisement");
     delete a_conf;
@@ -1235,7 +1250,7 @@ static void run_cache_handoff_identity_bound(const std::string &binary,
     MsgChannel *worker_b = login_host(
         port, "cache-bound-b", true, worker_b_port, &b_conf,
         nullptr, 1, 0, static_cast<uint32_t>(cache_b_port),
-        CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU);
+        CACHE_WIRE_REVISION, CACHE_PROFILE_ZSTD_TU);
     REQUIRE(worker_b && b_conf && b_conf->fence_mode == ConfCSMsg::Advisory,
             "candidate F_B logs in with its own DIFFERENT valid cache advertisement");
     delete b_conf;
@@ -1255,13 +1270,13 @@ static void run_cache_handoff_identity_bound(const std::string &binary,
     REQUIRE(use_b && use_b->hasAssignmentIdentity(),
             "S2: Advisory mode assigns a complete identity before dispatch");
     REQUIRE(use_b && use_b->cache_endpoint_port == static_cast<uint32_t>(cache_b_port)
-                && use_b->cache_protocol == CACHE_WIRE_PROTOCOL_V1
+                && use_b->cache_protocol == CACHE_WIRE_REVISION
                 && use_b->cache_profile_mask == CACHE_PROFILE_ZSTD_TU,
             "S2: with a complete identity, the handoff tail faithfully "
             "carries the SELECTED F's (B's) snapshot, never A's");
     if (use_b) {
         worker_b->send_msg(JobBeginMsg(use_b->job_id, 0));
-        worker_b->send_msg(JobDoneMsg(use_b->job_id, 0, JobDoneMsg::FROM_SERVER));
+        worker_b->send_msg(job_done_for(*use_b, 0, JobDoneMsg::FROM_SERVER));
     }
     delete use_b;
 
@@ -1272,7 +1287,7 @@ static void run_cache_handoff_identity_bound(const std::string &binary,
     a_swapped.max_kids = 1;
     a_swapped.chroot_possible = true;
     a_swapped.setCacheAdvertisement(static_cast<uint32_t>(cache_b_port),
-                                    CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU);
+                                    CACHE_WIRE_REVISION, CACHE_PROFILE_ZSTD_TU);
     REQUIRE(worker_a && worker_a->send_msg(a_swapped),
             "F_A relogins advertising F_B's old cache port");
     delete wait_type(worker_a, Msg::CS_CONF, 3000);
@@ -1284,7 +1299,7 @@ static void run_cache_handoff_identity_bound(const std::string &binary,
     b_swapped.max_kids = 1;
     b_swapped.chroot_possible = true;
     b_swapped.setCacheAdvertisement(static_cast<uint32_t>(cache_a_port),
-                                    CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU);
+                                    CACHE_WIRE_REVISION, CACHE_PROFILE_ZSTD_TU);
     REQUIRE(worker_b && worker_b->send_msg(b_swapped),
             "F_B relogins advertising F_A's old cache port");
     delete wait_type(worker_b, Msg::CS_CONF, 3000);
@@ -1302,7 +1317,7 @@ static void run_cache_handoff_identity_bound(const std::string &binary,
             "not a value cached from B's first Login");
     if (use_b2) {
         worker_b->send_msg(JobBeginMsg(use_b2->job_id, 0));
-        worker_b->send_msg(JobDoneMsg(use_b2->job_id, 0, JobDoneMsg::FROM_SERVER));
+        worker_b->send_msg(job_done_for(*use_b2, 0, JobDoneMsg::FROM_SERVER));
     }
     delete use_b2;
 
@@ -1348,7 +1363,7 @@ static void run_cache_handoff_below_p50(const std::string &binary,
     MsgChannel *worker = login_host(
         port, "cache-handoff-p48-worker", true, worker_port, &worker_conf,
         p48_channel, 1, 0, static_cast<uint32_t>(cache_port),
-        CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU);
+        CACHE_WIRE_REVISION, CACHE_PROFILE_ZSTD_TU);
     REQUIRE(worker && worker_conf && cache_sentinel >= 0,
             "P48 worker logs in even though its cache advertisement cannot "
             "be sent");
@@ -1369,7 +1384,7 @@ static void run_cache_handoff_below_p50(const std::string &binary,
             "advertisement, so its UseCS handoff tail is wholly absent");
     if (use) {
         worker->send_msg(JobBeginMsg(use->job_id, 0));
-        worker->send_msg(JobDoneMsg(use->job_id, 0, JobDoneMsg::FROM_SERVER));
+        worker->send_msg(job_done_for(*use, 0, JobDoneMsg::FROM_SERVER));
     }
     delete use;
     delete submitter;
@@ -1423,7 +1438,7 @@ static void run_old_peer(const std::string &binary, const std::string &directory
 
     if (use) {
         worker->send_msg(JobBeginMsg(use->job_id, 0));
-        worker->send_msg(JobDoneMsg(use->job_id, 0, JobDoneMsg::FROM_SERVER));
+        worker->send_msg(job_done_for(*use, 0, JobDoneMsg::FROM_SERVER));
     }
     delete use;
     delete submitter;

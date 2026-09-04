@@ -215,16 +215,16 @@ void wait_success(pid_t child, int expected_exit = 0) {
 void generation_wrap_gate() {
     const CStoreGuid old_c = Id128::from_u64(801);
     const CStoreGuid new_c = Id128::from_u64(802);
-    CAuthority old_authority(old_c, {}, KeyLayoutV1::generation_value_mask);
+    CObjectArena old_arena(old_c, KeyLayoutV1::generation_value_mask);
     const std::array<uint8_t, 5> payload{'w', 'r', 'a', 'p', '!'};
-    const Key64 old_key = old_authority.intern_bytes(ObjectType::Line, payload);
-    require(old_authority.advance_generation() == GenerationAdvanceResult::GuidFlipRequired,
+    const Key64 old_key = old_arena.intern_bytes(ObjectType::Line, payload);
+    require(old_arena.advance_generation() == GenerationAdvanceResult::GuidFlipRequired,
             "generation wrap did not stop admission");
-    CAuthority replacement(new_c);
+    CObjectArena replacement(new_c);
     const Key64 replacement_key = replacement.intern_bytes(ObjectType::Line, payload);
-    require(old_authority.guid() != replacement.guid(), "C GUID was reused at wrap");
-    require(old_authority.arena().object(old_key).canonical_payload() ==
-                replacement.arena().object(replacement_key).canonical_payload(),
+    require(old_arena.guid() != replacement.guid(), "C GUID was reused at wrap");
+    require(old_arena.object(old_key).canonical_payload() ==
+                replacement.object(replacement_key).canonical_payload(),
             "replacement did not retain exact bytes");
 
     P50ServerEndpoint f_endpoint(Id128::from_u64(803));

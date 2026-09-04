@@ -82,7 +82,7 @@ struct P50SourceTransferRequest {
                selected_f_host.find('\0') == std::string::npos &&
                selected_f_ordinary_port != 0 && selected_f_ordinary_port <= UINT16_MAX &&
                selected_f_cache_port != 0 && selected_f_cache_port <= UINT16_MAX &&
-               cache_protocol == CACHE_WIRE_PROTOCOL_V1 &&
+               cache_protocol == CACHE_WIRE_REVISION &&
                p50_source_profile_mode_valid(cache_profile, source_mode) &&
                logical_job != 0 && compiler_attempt != 0 && source_request_id != 0;
     }

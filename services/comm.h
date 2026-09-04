@@ -96,8 +96,12 @@ struct P50LegacyWireIdentity {
 
     [[nodiscard]] bool valid() const noexcept
     {
-        return job_id != 0 && assignment_epoch != 0 &&
-               assignment_nonce != 0 && c_guid != 0;
+        const bool assignment_absent = assignment_epoch == 0 &&
+                                       assignment_nonce == 0;
+        const bool assignment_complete = assignment_epoch != 0 &&
+                                         assignment_nonce != 0;
+        return job_id != 0 && c_guid != 0 &&
+               (assignment_absent || assignment_complete);
     }
 
     auto operator<=>(const P50LegacyWireIdentity &) const = default;
@@ -560,10 +564,10 @@ const int NODE_FEATURE_ENV_XZ = ( 1 << 0 );
 // The remote node is capable of unpacking environment compressed as .tar.zst .
 const int NODE_FEATURE_ENV_ZSTD = ( 1 << 1 );
 
-/* CacheWire is a separate protocol from the ordinary Icecream link.  The
-   historical endpoint implementation calls its first wire version 50; user
-   facing output qualifies that value as CacheWire v1. */
-const uint32_t CACHE_WIRE_PROTOCOL_V1 = 50;
+/* CacheWire has a revision space independent of the ordinary Icecream link.
+   Revision 1 is the first deployable shape; ordinary peers still negotiate
+   Icecream protocol 50 before these fields are present. */
+inline constexpr uint32_t CACHE_WIRE_REVISION = 1;
 
 /* Raw four-byte transition witness sent by the F sidecar only after it has
    accepted ownership of the detached ordinary socket.  This is not an
@@ -584,42 +588,30 @@ inline constexpr size_t P50_CACHE_FD_LEASE_BYTES = 64;
 bool send_cache_session_ready(
     int fd, std::chrono::steady_clock::time_point deadline) noexcept;
 
-/* Stable CacheWire profile bits.  P29/ZSTD_TU/GRZ are existing protocol
-   labels.  Z3_LONG and Z3_SHARED_LONG reserve the two simple streaming
-   profiles; P29V1 is the runnable provider-owned route codec. */
-const uint32_t CACHE_PROFILE_P29 = ( UINT32_C(1) << 0 );
-const uint32_t CACHE_PROFILE_ZSTD_TU = ( UINT32_C(1) << 1 );
-const uint32_t CACHE_PROFILE_GRZ = ( UINT32_C(1) << 2 );
-const uint32_t CACHE_PROFILE_Z3_LONG = ( UINT32_C(1) << 3 );
-const uint32_t CACHE_PROFILE_Z3_SHARED_LONG = ( UINT32_C(1) << 4 );
-const uint32_t CACHE_PROFILE_P29V1 = ( UINT32_C(1) << 5 );
-/* The first runnable route codec is exposed under its source-path name. */
-const uint32_t CACHE_PROFILE_ZSTD_ROUTE = CACHE_PROFILE_Z3_LONG;
-const uint32_t CACHE_DECLARED_PROFILE_MASK =
-    CACHE_PROFILE_P29 | CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_GRZ
-    | CACHE_PROFILE_Z3_LONG | CACHE_PROFILE_Z3_SHARED_LONG
-    | CACHE_PROFILE_P29V1;
-/* The endpoint advertises only runnable product dialogues.  GRZ is included
-   only in builds that linked the reviewed libbsc residual implementation. */
-const uint32_t CACHE_ADVERTISABLE_PROFILE_MASK =
-    CACHE_PROFILE_P29 | CACHE_PROFILE_P29V1 | CACHE_PROFILE_ZSTD_TU |
-    CACHE_PROFILE_ZSTD_ROUTE
-#if defined(ICECC_P50_WITH_LIBBSC)
-    | CACHE_PROFILE_GRZ
-#endif
-    ;
+/* Registry values are scoped to CACHE_WIRE_REVISION. */
+inline constexpr uint32_t CACHE_PROFILE_P29V1 = (UINT32_C(1) << 0);
+inline constexpr uint32_t CACHE_PROFILE_ZSTD_TU = (UINT32_C(1) << 1);
+inline constexpr uint32_t CACHE_PROFILE_ZSTD_ROUTE = (UINT32_C(1) << 2);
+inline constexpr uint32_t CACHE_DECLARED_PROFILE_MASK =
+    CACHE_PROFILE_P29V1 | CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE;
+inline constexpr uint32_t CACHE_ADVERTISABLE_PROFILE_MASK =
+    CACHE_DECLARED_PROFILE_MASK;
 
 /* An optional scheduler-local request chooses the one source profile carried
-   in each assignment.  An absent request preserves the historical ROUTE-first
-   preference; an explicit request never falls back to another profile. */
+   in each assignment. An explicit request never falls back to another profile. */
 enum class P50CacheProfileRequest : uint8_t {
     Default,
-    P29,
     P29V1,
     ZSTD_TU,
     ZSTD_ROUTE,
-    GRZ_RESIDUAL,
+    Off,
     Unsupported,
+};
+
+inline constexpr std::array<uint32_t, 3> P50_DEFAULT_PROFILE_ORDER{
+    CACHE_PROFILE_P29V1,
+    CACHE_PROFILE_ZSTD_TU,
+    CACHE_PROFILE_ZSTD_ROUTE,
 };
 
 inline P50CacheProfileRequest p50_cache_profile_request_from_env() noexcept
@@ -630,14 +622,12 @@ inline P50CacheProfileRequest p50_cache_profile_request_from_env() noexcept
     const std::string_view requested(value);
     if (requested == "ZSTD_TU")
         return P50CacheProfileRequest::ZSTD_TU;
-    if (requested == "P29")
-        return P50CacheProfileRequest::P29;
-    if (requested == "P29V1" || requested == "P29_V1")
+    if (requested == "P29V1")
         return P50CacheProfileRequest::P29V1;
     if (requested == "ZSTD_ROUTE")
         return P50CacheProfileRequest::ZSTD_ROUTE;
-    if (requested == "GRZ" || requested == "GRZ_RESIDUAL")
-        return P50CacheProfileRequest::GRZ_RESIDUAL;
+    if (requested == "OFF")
+        return P50CacheProfileRequest::Off;
     return P50CacheProfileRequest::Unsupported;
 }
 
@@ -648,11 +638,10 @@ inline constexpr uint32_t p50_select_cache_profile(
         return 0;
     switch (request) {
     case P50CacheProfileRequest::Default:
-        return (advertised & CACHE_PROFILE_ZSTD_ROUTE) != 0
-                   ? CACHE_PROFILE_ZSTD_ROUTE
-                   : ((advertised & CACHE_PROFILE_ZSTD_TU) != 0
-                          ? CACHE_PROFILE_ZSTD_TU
-                          : 0);
+        for (const uint32_t profile : P50_DEFAULT_PROFILE_ORDER)
+            if ((advertised & profile) != 0)
+                return profile;
+        return 0;
     case P50CacheProfileRequest::ZSTD_TU:
         return (advertised & CACHE_PROFILE_ZSTD_TU) != 0
                    ? CACHE_PROFILE_ZSTD_TU
@@ -661,16 +650,11 @@ inline constexpr uint32_t p50_select_cache_profile(
         return (advertised & CACHE_PROFILE_ZSTD_ROUTE) != 0
                    ? CACHE_PROFILE_ZSTD_ROUTE
                    : 0;
-    case P50CacheProfileRequest::P29:
-        return (advertised & CACHE_PROFILE_P29) != 0 ? CACHE_PROFILE_P29 : 0;
     case P50CacheProfileRequest::P29V1:
         return (advertised & CACHE_PROFILE_P29V1) != 0
                    ? CACHE_PROFILE_P29V1
                    : 0;
-    case P50CacheProfileRequest::GRZ_RESIDUAL:
-        return (advertised & CACHE_PROFILE_GRZ) != 0
-                   ? CACHE_PROFILE_GRZ
-                   : 0;
+    case P50CacheProfileRequest::Off:
     case P50CacheProfileRequest::Unsupported:
         return 0;
     }
@@ -679,38 +663,26 @@ inline constexpr uint32_t p50_select_cache_profile(
 
 /* Source-arm mode values are deliberately closed to the runnable source
    profiles and are never accepted independently of cache_profile. */
-inline constexpr uint32_t P50_SOURCE_MODE_ZSTD_TU = UINT32_C(1);
-inline constexpr uint32_t P50_SOURCE_MODE_ZSTD_ROUTE = UINT32_C(2);
-inline constexpr uint32_t P50_SOURCE_MODE_GRZ_RESIDUAL = UINT32_C(3);
-inline constexpr uint32_t P50_SOURCE_MODE_P29 = UINT32_C(4);
-inline constexpr uint32_t P50_SOURCE_MODE_P29V1 = UINT32_C(5);
+inline constexpr uint32_t P50_SOURCE_MODE_P29V1 = UINT32_C(1);
+inline constexpr uint32_t P50_SOURCE_MODE_ZSTD_TU = UINT32_C(2);
+inline constexpr uint32_t P50_SOURCE_MODE_ZSTD_ROUTE = UINT32_C(3);
 
 inline constexpr bool p50_source_profile_mode_valid(uint32_t profile,
                                                      uint32_t source_mode) noexcept
 {
-    return (profile == CACHE_PROFILE_ZSTD_TU &&
-           source_mode == P50_SOURCE_MODE_ZSTD_TU) ||
-           (profile == CACHE_PROFILE_P29 && source_mode == P50_SOURCE_MODE_P29) ||
-           (profile == CACHE_PROFILE_P29V1 &&
+    return (profile == CACHE_PROFILE_P29V1 &&
             source_mode == P50_SOURCE_MODE_P29V1) ||
+           (profile == CACHE_PROFILE_ZSTD_TU &&
+            source_mode == P50_SOURCE_MODE_ZSTD_TU) ||
            (profile == CACHE_PROFILE_ZSTD_ROUTE &&
-            source_mode == P50_SOURCE_MODE_ZSTD_ROUTE)
-#if defined(ICECC_P50_WITH_LIBBSC)
-           || (profile == CACHE_PROFILE_GRZ &&
-               source_mode == P50_SOURCE_MODE_GRZ_RESIDUAL)
-#endif
-           ;
+            source_mode == P50_SOURCE_MODE_ZSTD_ROUTE);
 }
 
 inline constexpr bool p50_source_profile_selection_valid(uint32_t profiles) noexcept
 {
-    return profiles == CACHE_PROFILE_ZSTD_TU ||
-           profiles == CACHE_PROFILE_ZSTD_ROUTE || profiles == CACHE_PROFILE_P29
-           || profiles == CACHE_PROFILE_P29V1
-#if defined(ICECC_P50_WITH_LIBBSC)
-           || profiles == CACHE_PROFILE_GRZ
-#endif
-           ;
+    return profiles == CACHE_PROFILE_P29V1 ||
+           profiles == CACHE_PROFILE_ZSTD_TU ||
+           profiles == CACHE_PROFILE_ZSTD_ROUTE;
 }
 
 /* The one ordinary-link request used by the compiler-side cache seam.  This
@@ -765,13 +737,21 @@ inline bool cache_advertisement_is_wholly_absent(uint32_t port, uint32_t protoco
 {
     return port == 0 && protocol == 0 && profile_mask == 0;
 }
-inline bool cache_advertisement_is_valid_present(uint32_t port, uint32_t protocol,
-                                                  uint32_t profile_mask)
+inline bool cache_advertisement_is_well_formed_present(
+    uint32_t port, uint32_t protocol, uint32_t profile_mask)
 {
     return port > 0 && port <= UINT16_MAX
-        && protocol == CACHE_WIRE_PROTOCOL_V1
+        && protocol > 0 && protocol <= UINT16_MAX
         && profile_mask != 0
         && (profile_mask & ~CACHE_ADVERTISABLE_PROFILE_MASK) == 0;
+}
+inline bool cache_advertisement_is_valid_present(uint32_t port,
+                                                  uint32_t protocol,
+                                                  uint32_t profile_mask)
+{
+    return cache_advertisement_is_well_formed_present(port, protocol,
+                                                       profile_mask)
+        && protocol == CACHE_WIRE_REVISION;
 }
 
 /* WIRE-AUDIT (three-bucket field classification, BigOracle, owner-ruling
@@ -1435,7 +1415,7 @@ struct P50SourceArmFields {
                selected_f_ordinary_port <= UINT16_MAX &&
                selected_f_cache_port != 0 &&
                selected_f_cache_port <= UINT16_MAX &&
-               cache_protocol == CACHE_WIRE_PROTOCOL_V1 &&
+               cache_protocol == CACHE_WIRE_REVISION &&
                p50_source_profile_mode_valid(cache_profile, source_mode) &&
                logical_job != 0 &&
                compiler_attempt != 0 && c_store_generation != 0 &&

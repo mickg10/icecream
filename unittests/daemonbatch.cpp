@@ -390,7 +390,7 @@ int main(int argc, char **argv)
     for (int i = 0; i < 3 && sent_all; ++i) {
         UseCSMsg use("x86_64", "10.11.12.13", 3632u, dec[i].jid, dec[i].env,
                      client_id, dec[i].matched, dec[i].epoch, dec[i].nonce,
-                     dec[i].cache_port, CACHE_WIRE_PROTOCOL_V1,
+                     dec[i].cache_port, CACHE_WIRE_REVISION,
                      CACHE_PROFILE_ZSTD_TU);
         sent_all = sched->send_msg(use);
     }
@@ -468,11 +468,11 @@ int main(int argc, char **argv)
     const uint32_t attack_cache_port = UINT32_C(0x0000cafe);
     sched->send_msg(UseCSMsg("x86_64", "10.11.12.13", 3632u, 5001u, true, client_id,
                              UINT32_C(99), attack_epoch, attack_nonce,
-                             attack_cache_port, CACHE_WIRE_PROTOCOL_V1,
+                             attack_cache_port, CACHE_WIRE_REVISION,
                              CACHE_PROFILE_ZSTD_TU)); // duplicate, cache-present attack
     sched->send_msg(UseCSMsg("x86_64", "10.11.12.13", 3632u, 5003u, true, client_id,
                              UINT32_C(99), attack_epoch, attack_nonce,
-                             attack_cache_port, CACHE_WIRE_PROTOCOL_V1,
+                             attack_cache_port, CACHE_WIRE_REVISION,
                              CACHE_PROFILE_ZSTD_TU)); // excess, cache-present attack
     std::vector<SeenUseCS> extra = capture_use_cs(client, 1, 2000);
     REQUIRE(extra.empty(),
@@ -537,7 +537,7 @@ int main(int argc, char **argv)
         UseCSMsg use_e("x86_64", "10.11.12.13", 3632u, UINT32_C(5100), true,
                        client_e_id, UINT32_C(44), UINT64_C(0x5300000000000044),
                        UINT64_C(0xbbbb000000000044), UINT32_C(0x0000ca44),
-                       CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU);
+                       CACHE_WIRE_REVISION, CACHE_PROFILE_ZSTD_TU);
         sent_to_dead_client = sched->send_msg(use_e);
     }
     REQUIRE(sent_to_dead_client,

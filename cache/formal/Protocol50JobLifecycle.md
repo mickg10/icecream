@@ -131,7 +131,9 @@ COMMITTED_INPUT_EVICTED
 F_CACHE_RESTARTED
 ```
 
-The cache model retains DICT/Need/Fill and commit actions. A trace checker joins at `INPUT_COMMITTED`/`COMMITTED_INPUT_RETAINED`; neither model duplicates the other’s state.
+The cache model retains BODY/Need/Fill and commit actions. A trace checker joins
+at `INPUT_COMMITTED`/`COMMITTED_INPUT_RETAINED`; neither model duplicates the
+other's state.
 
 ## Run
 

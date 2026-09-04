@@ -2,6 +2,7 @@
 #include "p50_control_operation.h"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstdio>
 #include <fcntl.h>
@@ -32,6 +33,9 @@ constexpr bool kSealedMemfdBuildSupport = false;
 #endif
 
 constexpr size_t kMaterializationChunkBytes = 64u * 1024u;
+constexpr size_t kAttachmentResultBytes = 16;
+constexpr uint16_t kAttachmentResultVersion = 1;
+constexpr std::array<uint8_t, 4> kAttachmentResultMagic{'P', '5', 'I', 'R'};
 
 #if defined(ICECC_P50_INPUT_FD_ATTACHMENT_TEST_HOOKS)
 InputMaterializationProgressTestHook materialization_progress_test_hook = nullptr;
@@ -55,6 +59,95 @@ bool decode_request(std::span<const uint8_t> wire, local::Identity identity,
     request.request_id = operation.request_id;
     request.identity = identity;
     return true;
+}
+
+void put_u16(uint8_t* output, uint16_t value) noexcept {
+    output[0] = static_cast<uint8_t>(value >> 8);
+    output[1] = static_cast<uint8_t>(value);
+}
+
+void put_u64(uint8_t* output, uint64_t value) noexcept {
+    for (size_t index = 0; index != sizeof(value); ++index)
+        output[index] = static_cast<uint8_t>(value >> (56 - index * 8));
+}
+
+uint16_t get_u16(const uint8_t* input) noexcept {
+    return static_cast<uint16_t>(input[0] << 8 | input[1]);
+}
+
+uint64_t get_u64(const uint8_t* input) noexcept {
+    uint64_t value = 0;
+    for (size_t index = 0; index != sizeof(value); ++index)
+        value = (value << 8) | input[index];
+    return value;
+}
+
+bool attachment_result_status_valid(InputFdAttachmentStatus status) noexcept {
+    switch (status) {
+    case InputFdAttachmentStatus::Accepted:
+    case InputFdAttachmentStatus::InvalidArgument:
+    case InputFdAttachmentStatus::UnsupportedPlatform:
+    case InputFdAttachmentStatus::MalformedRequest:
+    case InputFdAttachmentStatus::UnknownRecord:
+    case InputFdAttachmentStatus::StaleIdentity:
+    case InputFdAttachmentStatus::Timeout:
+    case InputFdAttachmentStatus::MaterializationFailed:
+        return true;
+    case InputFdAttachmentStatus::PeerUnauthenticated:
+    case InputFdAttachmentStatus::HandshakeFailed:
+    case InputFdAttachmentStatus::Disconnected:
+    case InputFdAttachmentStatus::HandoffFailed:
+        return false;
+    }
+    return false;
+}
+
+std::vector<uint8_t> encode_attachment_result(
+    uint64_t request_id, InputFdAttachmentStatus status) {
+    if (request_id == 0 || !attachment_result_status_valid(status))
+        return {};
+    std::vector<uint8_t> wire(kAttachmentResultBytes, 0);
+    std::copy(kAttachmentResultMagic.begin(), kAttachmentResultMagic.end(),
+              wire.begin());
+    put_u16(wire.data() + 4, kAttachmentResultVersion);
+    put_u16(wire.data() + 6, static_cast<uint16_t>(status));
+    put_u64(wire.data() + 8, request_id);
+    return wire;
+}
+
+bool decode_attachment_result(std::span<const uint8_t> wire,
+                              uint64_t expected_request_id,
+                              InputFdAttachmentStatus& status) noexcept {
+    if (wire.size() != kAttachmentResultBytes || expected_request_id == 0 ||
+        !std::equal(kAttachmentResultMagic.begin(), kAttachmentResultMagic.end(),
+                    wire.begin()) ||
+        get_u16(wire.data() + 4) != kAttachmentResultVersion ||
+        get_u64(wire.data() + 8) != expected_request_id)
+        return false;
+    const auto decoded = static_cast<InputFdAttachmentStatus>(
+        get_u16(wire.data() + 6));
+    if (!attachment_result_status_valid(decoded))
+        return false;
+    status = decoded;
+    return true;
+}
+
+local::Status send_attachment_result(
+    local::Connection& connection, local::Identity identity,
+    uint64_t request_id, InputFdAttachmentStatus status,
+    std::chrono::steady_clock::time_point deadline) noexcept {
+    try {
+        std::vector<uint8_t> payload =
+            encode_attachment_result(request_id, status);
+        if (payload.empty())
+            return local::Status::InvalidArgument;
+        return connection.send_until(
+            local::Frame{local::kProtocolVersion, local::MessageType::Data,
+                         identity, std::move(payload)},
+            deadline);
+    } catch (...) {
+        return local::Status::InvalidArgument;
+    }
 }
 
 InputFdAttachmentStatus status_for_local(local::Status status) noexcept {
@@ -429,29 +522,53 @@ InputFdAttachmentResult InputFdAttachmentService::serve_request(
         return rejected(InputFdAttachmentStatus::InvalidArgument);
     if (connection.verify_peer_credentials(expected_peer) != local::Status::Ok)
         return rejected(InputFdAttachmentStatus::PeerUnauthenticated);
-    if (queued_data(connection.native_handle()))
+    if (queued_data(connection.native_handle())) {
+        (void)send_attachment_result(
+            connection, expected_identity, request.request_id,
+            InputFdAttachmentStatus::MalformedRequest, deadline);
         return rejected(InputFdAttachmentStatus::MalformedRequest);
-    if (std::chrono::steady_clock::now() >= deadline)
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
         return rejected(InputFdAttachmentStatus::Timeout);
+    }
 
     InputCursor cursor;
     try {
         cursor = provider_(request.key);
     } catch (...) {
+        (void)send_attachment_result(
+            connection, expected_identity, request.request_id,
+            InputFdAttachmentStatus::UnknownRecord, deadline);
         return rejected(InputFdAttachmentStatus::UnknownRecord);
     }
-    if (!cursor)
+    if (!cursor) {
+        (void)send_attachment_result(
+            connection, expected_identity, request.request_id,
+            InputFdAttachmentStatus::UnknownRecord, deadline);
         return rejected(InputFdAttachmentStatus::UnknownRecord);
+    }
 
     InputFdAttachmentStatus materialization_status =
         InputFdAttachmentStatus::MaterializationFailed;
     const int fd = materialize(std::move(cursor), max_materialized_bytes_,
                                deadline, materialization_status);
-    if (fd < 0)
+    if (fd < 0) {
+        (void)send_attachment_result(connection, expected_identity,
+                                     request.request_id,
+                                     materialization_status, deadline);
         return rejected(materialization_status);
+    }
     if (std::chrono::steady_clock::now() >= deadline) {
         (void)::close(fd);
         return rejected(InputFdAttachmentStatus::Timeout);
+    }
+
+    const local::Status result_status = send_attachment_result(
+        connection, expected_identity, request.request_id,
+        InputFdAttachmentStatus::Accepted, deadline);
+    if (result_status != local::Status::Ok) {
+        (void)::close(fd);
+        return rejected(status_for_local(result_status));
     }
 
     local::FdHandoffSender sender{local::HandoffFd(fd)};
@@ -499,6 +616,26 @@ InputFdAttachmentResult InputFdAttachmentClient::attach(
     status = connection.send_until(request_frame, deadline);
     if (status != local::Status::Ok)
         return rejected(status_for_local(status));
+
+    local::Frame result_frame;
+    status = connection.receive_until(result_frame, deadline);
+    if (status != local::Status::Ok)
+        return rejected(status_for_local(status));
+    const local::Status result_identity =
+        local::validate_identity(result_frame, request.identity);
+    InputFdAttachmentStatus attachment_status =
+        InputFdAttachmentStatus::MalformedRequest;
+    if (result_frame.type != local::MessageType::Data ||
+        result_identity != local::Status::Ok ||
+        !decode_attachment_result(result_frame.payload, request.request_id,
+                                  attachment_status)) {
+        return rejected(result_identity == local::Status::StaleGeneration ||
+                                result_identity == local::Status::IdentityMismatch
+                            ? InputFdAttachmentStatus::StaleIdentity
+                            : InputFdAttachmentStatus::MalformedRequest);
+    }
+    if (attachment_status != InputFdAttachmentStatus::Accepted)
+        return rejected(attachment_status);
 
     local::FdHandoffReceiver receiver;
     const local::HandoffRequest handoff_request{

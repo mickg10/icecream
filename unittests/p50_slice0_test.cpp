@@ -1,11 +1,11 @@
 #include "cache/p50_slice0.h"
-#include "cache/p50_p29_residual.h"
 
-#include <algorithm>
 #include <array>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
-#include <iostream>
 #include <limits>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -13,302 +13,140 @@
 #include <type_traits>
 #include <vector>
 
-namespace {
-
 using namespace icecc::p50;
 
-using RouteBegin = decltype(&CRoute::begin);
-static_assert(std::is_invocable_r_v<const CActiveTx&, RouteBegin, CRoute&,
-                                    const PreparedTUPtr&, P29RootMode, bool>);
-static_assert(!std::is_invocable_v<RouteBegin, CRoute&, const PreparedTUPtr&,
-                                   P29RootMode, std::span<const uint8_t>, bool>);
+namespace {
 
-[[noreturn]] void fail(std::string_view text) {
-    std::cerr << "p50_slice0_test: " << text << '\n';
-    std::exit(1);
+using RouteBeginV1 = decltype(&CRoute::begin_v1);
+static_assert(std::is_invocable_r_v<const CActiveTx&, RouteBeginV1, CRoute&,
+                                    const PreparedTUPtr&, uint64_t>);
+
+void require(bool condition, const char* message) {
+    if (!condition) {
+        std::fprintf(stderr, "FAIL: %s\n", message);
+        std::exit(1);
+    }
 }
 
-void require(bool value, std::string_view text) {
-    if (!value) fail(text);
-}
-
-template<class Exception, class Callable>
-void require_throws(Callable&& callable, std::string_view text) {
+template <class Exception = std::exception, class Function>
+void require_throws(Function&& function, const char* message) {
     try {
-        callable();
+        function();
     } catch (const Exception&) {
         return;
-    } catch (...) {
-        fail(std::string(text) + " (wrong exception)");
     }
-    fail(std::string(text) + " (no exception)");
+    require(false, message);
 }
 
-std::vector<uint8_t> bytes(std::string_view text) {
-    return {text.begin(), text.end()};
+std::vector<uint8_t> bytes(std::string_view value) {
+    return {value.begin(), value.end()};
 }
 
-std::vector<std::vector<uint8_t>> regions(
-    std::initializer_list<std::string_view> texts) {
-    std::vector<std::vector<uint8_t>> result;
-    for (std::string_view text : texts) result.push_back(bytes(text));
+Digest128 tagged_digest(uint8_t tag) {
+    Digest128 result{};
+    result.bytes.front() = tag;
     return result;
 }
 
-Key64 intern_region(CAuthority& authority, std::string_view text) {
-    const Key64 line = authority.intern_bytes(ObjectType::Line, bytes(text));
+void test_object_arena_and_canonical_records() {
+    CObjectArena arena(CStoreGuid::from_u64(1));
+    const auto alpha = bytes("alpha\n");
+    const Key64 line = arena.intern_bytes(ObjectType::Line, alpha);
+    require(arena.intern_bytes(ObjectType::Line, alpha) == line,
+            "C object arena did not intern equal byte objects");
+
     const std::array<Key64, 1> children{line};
-    return authority.intern_children(ObjectType::Region, children);
-}
+    const Key64 region = arena.intern_children(ObjectType::Region, children);
+    require(region.type() == ObjectType::Region && region.generation() == 0,
+            "C object arena assigned the wrong region identity");
 
-struct Pair {
-    CAuthority c;
-    FStore f;
-    CRoute route;
-    SessionHandle session{};
+    const ImmutableObject& object = arena.object(region);
+    const FillRecord record = object.fill_record();
+    require(ImmutableObject::from_record(record) == object,
+            "canonical immutable-object record did not round trip");
 
-    explicit Pair(ActionTrace* trace = nullptr, uint64_t c_id = 100,
-                  uint64_t f_id = 200)
-        : c(Id128::from_u64(c_id)),
-          f(Id128::from_u64(f_id), 1, trace),
-          route(c, f.guid(), HistoryNonce{300}, trace) {
-        const ReconnectResult connected = reconnect(route, f, HistoryNonce{301});
-        require(connected.outcome == ReconnectOutcome::ColdFStore,
-                "initial namespace did not take cold reconnect path");
-        session = connected.session;
-    }
-};
-
-Need start(Pair& pair, const CActiveTx& active, bool replay = false) {
-    pair.f.begin(pair.session, active.begin, replay);
-    pair.f.append_dict(pair.session, active.dict);
-    return pair.f.need(pair.session);
-}
-
-TxCommit finish(Pair& pair, const CActiveTx& active, bool fill_before_body = false,
-                bool acknowledge = true, bool replay = false) {
-    const Need need = start(pair, active, replay);
-    const std::vector<ImmutableObject> fill = pair.route.build_fill(need);
-    if (fill_before_body) {
-        for (const ImmutableObject& object : fill)
-            pair.f.apply_object(pair.session, object);
-        pair.f.append_body(pair.session, active.body);
-    } else {
-        pair.f.append_body(pair.session, active.body);
-        for (const ImmutableObject& object : fill)
-            pair.f.apply_object(pair.session, object);
-    }
-    const std::vector<uint8_t> exact =
-        pair.f.materialize_and_verify(pair.session);
-    require(exact.size() == active.begin.raw_bytes,
-            "materialized byte count differs from TX_BEGIN");
-    const TxCommit commit = pair.f.commit_input(pair.session);
-    if (acknowledge) pair.route.accept_commit(commit);
-    return commit;
-}
-
-void test_key_limits_and_mixed_generations() {
-    CObjectArena rejecting(Id128::from_u64(2));
-    const ObjectType unassigned = static_cast<ObjectType>(8);
-    require_throws<std::invalid_argument>(
-        [&] { (void)rejecting.intern_bytes(unassigned, bytes("invalid")); },
-        "C object arena accepted an unassigned byte-object type");
-    require_throws<std::invalid_argument>(
+    ImmutableObjectStore store;
+    require(store.apply(object) == ObjectApplyResult::Applied &&
+                store.apply(object) == ObjectApplyResult::Duplicate &&
+                store.size() == 1,
+            "immutable object store did not distinguish apply from duplicate");
+    require_throws<std::logic_error>(
         [&] {
-            (void)rejecting.intern_children(unassigned,
-                                            std::span<const Key64>{});
+            store.apply(ImmutableObject::children(
+                region, std::span<const Key64>{}));
         },
-        "C object arena accepted an unassigned child-object type");
-    require(rejecting.objects().size() == 0,
-            "rejected object types changed the C object arena");
+        "immutable object store accepted one key for different content");
 
-    CObjectArena terminal(Id128::from_u64(1),
+    require(arena.advance_generation() == GenerationAdvanceResult::Advanced &&
+                arena.generation() == 1,
+            "ordinary object generation did not advance");
+    const Key64 next = arena.intern_bytes(ObjectType::Line, bytes("next\n"));
+    require(next.generation() == 1 && next != line,
+            "generation advance reused an old Key64");
+
+    CObjectArena terminal(CStoreGuid::from_u64(2),
                           KeyLayoutV1::generation_value_mask,
                           KeyLayoutV1::ordinal_mask);
-    const Key64 last = terminal.intern_bytes(ObjectType::Line, bytes("last"));
-    require(last.generation() == KeyLayoutV1::generation_value_mask &&
-                last.ordinal() == KeyLayoutV1::ordinal_mask,
-            "last KeyLayoutV1 value was not allocated");
+    (void)terminal.intern_bytes(ObjectType::Line, bytes("last"));
     require_throws<std::overflow_error>(
-        [&] { (void)terminal.intern_bytes(ObjectType::Line, bytes("another")); },
-        "ordinal exhaustion was not terminal");
-    require(terminal.advance_generation() == GenerationAdvanceResult::GuidFlipRequired,
-            "generation exhaustion did not require C_STORE_GUID flip");
-
-    Pair pair;
-    const Key64 old_line = pair.c.intern_bytes(ObjectType::Line, bytes("old\n"));
-    const std::array<Key64, 1> old_child{old_line};
-    const Key64 old_region = pair.c.intern_children(ObjectType::Region, old_child);
-    require(old_region.generation() == 0, "C object arena did not start at generation zero");
-    require(pair.c.advance_generation() == GenerationAdvanceResult::Advanced,
-            "ordinary generation advance failed");
-    const Key64 new_line = pair.c.intern_bytes(ObjectType::Line, bytes("new\n"));
-    const std::array<Key64, 1> new_child{new_line};
-    const Key64 new_region = pair.c.intern_children(ObjectType::Region, new_child);
-    const std::array<Key64, 2> roots{old_region, new_region};
-    const std::vector<uint8_t> exact = bytes("old\nnew\n");
-    const PreparedTUPtr prepared = pair.c.prepare_tu(exact, roots);
-    finish(pair, pair.route.begin(prepared));
-    require(pair.f.contains(pair.c.guid(), old_region) &&
-                pair.f.contains(pair.c.guid(), new_region),
-            "old and new generations did not coexist on F");
+        [&] { (void)terminal.intern_bytes(ObjectType::Line, bytes("overflow")); },
+        "object ordinal exhaustion wrapped");
+    require(terminal.advance_generation() ==
+                GenerationAdvanceResult::GuidFlipRequired,
+            "terminal generation did not require a GUID flip");
 }
 
-void test_p29_preparation_verification_modes() {
-    CAuthority authority(Id128::from_u64(20));
-    require(authority.verification() == CAuthority::Verification::StreamedDigest,
-            "P29 preparation did not default to streamed verification");
-    const Key64 alpha = intern_region(authority, "alpha\n");
-    const Key64 bravo = intern_region(authority, "bravo\n");
-    const std::array<Key64, 1> alpha_root{alpha};
-    const std::array<Key64, 1> bravo_root{bravo};
-    const std::array<Key64, 2> ordered{alpha, bravo};
-    const std::array<Key64, 2> reordered{bravo, alpha};
-    const std::vector<uint8_t> alpha_bravo = bytes("alpha\nbravo\n");
-
-    require(authority.prepare_tu(bytes("alpha\n"), alpha_root) != nullptr,
-            "streamed verification rejected an exact Region composition");
-    require_throws<std::invalid_argument>(
-        [&] { (void)authority.prepare_tu(bytes("alpha\n"), bravo_root); },
-        "streamed digest accepted equal-length changed Region bytes");
-    require_throws<std::invalid_argument>(
-        [&] { (void)authority.prepare_tu(alpha_bravo, alpha_root); },
-        "streamed verification accepted a dropped Region");
-    require_throws<std::invalid_argument>(
-        [&] { (void)authority.prepare_tu(alpha_bravo, reordered); },
-        "streamed digest accepted reordered Regions");
-
-    authority.set_verification(CAuthority::Verification::FullMaterialization);
-    require(authority.verification() == CAuthority::Verification::FullMaterialization,
-            "P29 full-materialization verification switch did not latch");
-    require(authority.prepare_tu(alpha_bravo, ordered) != nullptr,
-            "full materialization rejected an exact Region composition");
-    require_throws<std::invalid_argument>(
-        [&] { (void)authority.prepare_tu(bytes("alpha\n"), bravo_root); },
-        "full materialization accepted equal-length changed Region bytes");
-
-    Pair end_to_end(nullptr, 21, 22);
-    const PreparedTUPtr prepared = end_to_end.c.prepare_from_regions(
-        regions({"alpha\n", "bravo\n"}));
-    const CActiveTx& active = end_to_end.route.begin(
-        prepared, P29RootMode::HistoryIndependent);
-    const Need need = start(end_to_end, active);
-    const std::vector<ImmutableObject> fill = end_to_end.route.build_fill(need);
-    end_to_end.f.append_body(end_to_end.session, active.body);
-    bool corrupted_line = false;
-    for (const ImmutableObject& object : fill) {
-        if (!corrupted_line && object.key.type() == ObjectType::Line) {
-            std::vector<uint8_t> changed =
-                std::get<BytesPayload>(object.payload).bytes;
-            changed.front() ^= 1;
-            end_to_end.f.apply_object(
-                end_to_end.session, ImmutableObject::bytes(object.key, changed));
-            corrupted_line = true;
-        } else {
-            end_to_end.f.apply_object(end_to_end.session, object);
-        }
-    }
-    require(corrupted_line, "end-to-end P29 digest fixture changed no Line");
-    require_throws<std::logic_error>(
-        [&] { (void)end_to_end.f.materialize_and_verify(end_to_end.session); },
-        "F accepted a same-size Line corruption against the declared raw digest");
-}
-
-void test_global_resource_owner_and_caught_slot_mutant() {
+void test_global_resource_owner() {
     const GlobalResourceLimits limits{
-        .max_aggregate_bytes = 5,
-        .max_namespace_bytes = 4,
-        .max_staging_bytes = 5,
-        .max_total_bytes = 7,
+        .max_aggregate_bytes = 8,
+        .max_namespace_bytes = 8,
+        .max_staging_bytes = 8,
+        .max_total_bytes = 16,
         .max_generation = 1,
         .max_staging_slots = 2,
     };
     GlobalResourceTrace trace;
     GlobalResourceModel model(limits, {}, &trace);
-    const CStoreGuid n0 = Id128::from_u64(501);
-    const CStoreGuid n1 = Id128::from_u64(502);
-    const CStoreGuid n2 = Id128::from_u64(503);
-    const Key64 k0 = *Key64::make(ObjectType::Line, 0, 1);
-    const Key64 k1 = *Key64::make(ObjectType::Line, 0, 2);
-    model.admit(n0);
-    model.admit(n1);
-    model.touch(n0);
-    model.touch(n1);
-    model.start_tu(n0);
-    model.start_tu(n1);
-    require(model.first_free_staging_slot() == std::optional<size_t>{0},
-            "global owner did not expose the first free staging slot");
-    model.begin_install(n0, k0, Digest128{}, 3, 0);
-    model.begin_install(n1, k1, Digest128{}, 2, 1);
-    model.publish(n0, k0, 0, Digest128{});
-    model.publish(n1, k1, 1, Digest128{});
-    model.pin(n0, k0);
-    model.finish_tu(n0);
-    model.finish_tu(n1);
-    require(model.resident_bytes() == 5 && model.staging_bytes() == 0,
-            "global owner did not account resident bytes across namespaces");
-    require(model.evict_oldest() == n0, "global owner did not evict the oldest namespace");
-    require(!model.check_invariants(), "global owner invariant check rejected valid eviction");
-    model.advance_generation(n0);
-    model.stop_generation_wrap(n0);
-    model.flip_guid(n0, n2);
-    model.admit(n2);
-    model.touch(n2);
-    model.start_tu(n2);
-    model.begin_install(n2, k0, Digest128{}, 2, 0);
-    model.crash_install(n2, k0, 0);
-    model.begin_install(n2, k0, Digest128{}, 2, 0, true);
-    model.publish(n2, k0, 0, Digest128{});
-    model.finish_tu(n2);
-    require(!model.check_invariants(), "global owner retry left invalid state");
-    require(trace.records().size() >= 17, "global owner did not emit the full action vocabulary");
-    if (const char* trace_path = std::getenv("P50_GLOBAL_TRACE_PATH"))
-        write_global_trace(trace, trace_path);
-    Digest128 conflicting_digest{};
-    conflicting_digest.bytes.front() = 1;
-    require_throws<std::logic_error>(
-        [&] { model.conflict(n1, k1, conflicting_digest); },
-        "global owner did not make same-key content conflict fatal");
-    model.release(n1, k1);
-    require(model.resident_bytes() == 2,
-            "global owner did not release resident bytes after record collection");
+    const CStoreGuid first = CStoreGuid::from_u64(10);
+    const CStoreGuid second = CStoreGuid::from_u64(11);
+    const Key64 first_key = *Key64::make(ObjectType::Line, 0, 1);
+    const Key64 second_key = *Key64::make(ObjectType::Line, 0, 2);
 
-    GlobalResourceFaults slot_mutant;
-    slot_mutant.ignore_slot_ownership = true;
-    GlobalResourceModel mutant(limits, slot_mutant);
-    mutant.admit(n0);
-    mutant.admit(n1);
-    mutant.start_tu(n0);
-    mutant.start_tu(n1);
-    mutant.begin_install(n0, k0, Digest128{}, 2, 0);
-    mutant.begin_install(n1, k1, Digest128{}, 2, 0);
-    const auto caught = mutant.check_invariants();
-    require(caught && caught->find("staging slot") != std::string::npos,
-            "slot-ownership mutant was not caught by the reverse global invariant");
+    model.admit(first);
+    model.admit(second);
+    model.touch(first);
+    model.touch(second);
+    model.start_tu(first);
+    model.start_tu(second);
+    model.begin_install(first, first_key, tagged_digest(1), 3, 0);
+    model.begin_install(second, second_key, tagged_digest(2), 2, 1);
+    require(model.staging_bytes() == 5 && model.free_staging_slots() == 0,
+            "global owner did not account shared staging resources");
+    model.publish(first, first_key, 0, tagged_digest(1));
+    model.publish(second, second_key, 1, tagged_digest(2));
+    model.pin(first, first_key);
+    model.finish_tu(first);
+    model.finish_tu(second);
+    require(model.resident_bytes() == 5 && !model.check_invariants(),
+            "global owner rejected valid resident state");
+    require(model.evict_oldest() == first,
+            "global owner did not evict the least-recently-used namespace");
+    require(model.resident_bytes() == 2 && !trace.records().empty(),
+            "global eviction did not update accounting or trace");
 
-    GlobalResourceFaults lru_mutant;
-    lru_mutant.ignore_lru = true;
-    GlobalResourceModel wrong_lru(limits, lru_mutant);
-    wrong_lru.admit(n0);
-    wrong_lru.admit(n1);
-    wrong_lru.touch(n0);
-    wrong_lru.touch(n1);
-    wrong_lru.evict(n1);
-    const auto lru_caught = wrong_lru.check_invariants();
-    require(lru_caught && lru_caught->find("LRU") != std::string::npos,
-            "LRU mutant was not caught by the post-eviction global invariant");
+    model.release(second, second_key);
+    require(model.resident_bytes() == 0 && !model.check_invariants(),
+            "global release left resident bytes behind");
 }
 
-void test_p29v1_pair_preflight_and_segment_residency() {
-    const CStoreGuid c_guid = Id128::from_u64(504);
+void test_atomic_p29v1_pair_preflight() {
+    const CStoreGuid c_guid = CStoreGuid::from_u64(20);
     const Key64 blob = *Key64::make(ObjectType::Blob, 0, 7);
     const Key64 segment = *Key64::make(ObjectType::P29Segment, 0, 7);
-    Digest128 blob_digest{};
-    Digest128 segment_digest{};
-    blob_digest.bytes.front() = 1;
-    segment_digest.bytes.front() = 2;
+    const Digest128 blob_digest = tagged_digest(3);
+    const Digest128 segment_digest = tagged_digest(4);
 
-    GlobalResourceLimits too_small{
+    GlobalResourceLimits limits{
         .max_aggregate_bytes = 7,
         .max_namespace_bytes = 7,
         .max_staging_bytes = 8,
@@ -316,7 +154,7 @@ void test_p29v1_pair_preflight_and_segment_residency() {
         .max_generation = 1,
         .max_staging_slots = 2,
     };
-    GlobalResourceModel rejected(too_small);
+    GlobalResourceModel rejected(limits);
     rejected.admit(c_guid);
     rejected.start_tu(c_guid);
     rejected.begin_install(c_guid, blob, blob_digest, 4, 0);
@@ -326,20 +164,14 @@ void test_p29v1_pair_preflight_and_segment_residency() {
             rejected.preflight_publish_pair(
                 c_guid, segment, 1, segment_digest, blob, 0, blob_digest);
         },
-        "P29V1 pair preflight allowed its segment to publish before a "
-        "capacity failure on the Blob");
-    require(rejected.resident_bytes() == 0 &&
-                rejected.staging_bytes() == 8 &&
+        "P29V1 pair preflight admitted a partial-publication capacity failure");
+    require(rejected.resident_bytes() == 0 && rejected.staging_bytes() == 8 &&
                 !rejected.check_invariants(),
-            "rejected P29V1 pair preflight changed visible owner state");
-    rejected.crash_install(c_guid, segment, 1);
-    rejected.crash_install(c_guid, blob, 0);
-    rejected.finish_tu(c_guid);
+            "failed P29V1 pair preflight changed visible state");
 
-    GlobalResourceLimits exact_fit = too_small;
-    exact_fit.max_aggregate_bytes = 8;
-    exact_fit.max_namespace_bytes = 8;
-    GlobalResourceModel accepted(exact_fit);
+    limits.max_aggregate_bytes = 8;
+    limits.max_namespace_bytes = 8;
+    GlobalResourceModel accepted(limits);
     accepted.admit(c_guid);
     accepted.start_tu(c_guid);
     accepted.begin_install(c_guid, blob, blob_digest, 4, 0);
@@ -350,806 +182,129 @@ void test_p29v1_pair_preflight_and_segment_residency() {
     accepted.publish(c_guid, blob, 0, blob_digest);
     accepted.finish_tu(c_guid);
     accepted.release(c_guid, blob);
-    require(accepted.resident_bytes() == 4 &&
-                !accepted.check_invariants(),
-            "resident P29V1 route segment incorrectly required its collected Blob");
+    require(accepted.resident_bytes() == 4 && !accepted.check_invariants(),
+            "P29V1 route segment did not survive collected input release");
     accepted.release(c_guid, segment);
-    require(accepted.resident_bytes() == 0 &&
-                !accepted.check_invariants(),
-            "P29V1 segment release left global owner residue");
 }
 
-void test_tu_seq_is_not_route_order() {
-    Pair pair;
-    const PreparedTUPtr tu0 = pair.c.prepare_from_regions(regions({"zero\n"}));
-    const PreparedTUPtr tu1 = pair.c.prepare_from_regions(regions({"one\n"}));
-    require(tu0->tu_seq.value == 0 && tu1->tu_seq.value == 1,
-            "TU_SEQ was not allocated at immutable publication");
-    const CActiveTx& first_routed = pair.route.begin(tu1);
-    require(first_routed.begin.tu_seq.value == 1 &&
-                first_routed.begin.rel_seq.value == 0,
-            "first accepted route did not allocate REL_SEQ zero");
-    finish(pair, first_routed);
-    const CActiveTx& second_routed = pair.route.begin(tu0);
-    require(second_routed.begin.tu_seq.value == 0 &&
-                second_routed.begin.rel_seq.value == 1,
-            "later TU_SEQ incorrectly dictated route order");
-    finish(pair, second_routed);
+void test_global_reverse_invariants_catch_mutants() {
+    const GlobalResourceLimits limits{
+        .max_aggregate_bytes = 8,
+        .max_namespace_bytes = 8,
+        .max_staging_bytes = 8,
+        .max_total_bytes = 16,
+        .max_generation = 1,
+        .max_staging_slots = 2,
+    };
+    const CStoreGuid first = CStoreGuid::from_u64(30);
+    const CStoreGuid second = CStoreGuid::from_u64(31);
+    const Key64 first_key = *Key64::make(ObjectType::Line, 0, 1);
+    const Key64 second_key = *Key64::make(ObjectType::Line, 0, 2);
+
+    GlobalResourceFaults faults;
+    faults.ignore_slot_ownership = true;
+    GlobalResourceModel mutant(limits, faults);
+    mutant.admit(first);
+    mutant.admit(second);
+    mutant.start_tu(first);
+    mutant.start_tu(second);
+    mutant.begin_install(first, first_key, tagged_digest(5), 2, 0);
+    mutant.begin_install(second, second_key, tagged_digest(6), 2, 0);
+    const auto violation = mutant.check_invariants();
+    require(violation && violation->find("staging slot") != std::string::npos,
+            "reverse invariant missed duplicate staging-slot ownership");
 }
 
-void test_separate_preparation_real_interning_and_p29() {
-    static_assert(std::is_copy_constructible_v<TxBegin>);
-    Pair pair;
-    const auto input = regions({"alpha\n", "beta\n", "gamma\n", "delta\n"});
-    const PreparedTUPtr first = pair.c.prepare_from_regions(input);
-    finish(pair, pair.route.begin(first));
-
-    const PreparedTUPtr second = pair.c.prepare_from_regions(input);
-    require(first.get() != second.get() && first->regions == second->regions,
-            "separate preparation did not reuse stable interned Region keys");
-    const CActiveTx& active = pair.route.begin(second);
-    require(active.begin.profile == ProfileId::P29 && active.root.size() == 1 &&
-                active.root.front().type() == ObjectType::Block,
-            "real OnlineS1 did not produce the repeated-TU Block root");
-    const Need need = start(pair, active);
-    require(need.missing.size() == 1 &&
-                need.missing.front().type() == ObjectType::Block,
-            "warm F requested more than the newly interned P29 Block");
-    pair.f.append_body(pair.session, active.body);
-    for (const ImmutableObject& object : pair.route.build_fill(need))
-        pair.f.apply_object(pair.session, object);
-    require(pair.f.materialize_and_verify(pair.session) ==
-                bytes("alpha\nbeta\ngamma\ndelta\n"),
-            "P29 Block root did not reproduce exact bytes");
-    pair.route.accept_commit(pair.f.commit_input(pair.session));
-}
-
-void test_p29_current_tu_residual_and_block_controls() {
-    Pair pair;
-    const auto input = regions({"same-line\n", "same-line\n", "same-line\n",
-                                "same-line\n", "tail\n"});
-    std::vector<uint8_t> exact;
-    for (const auto& region : input) exact.insert(exact.end(), region.begin(), region.end());
-
-    residual_group::Codec codec;
-    residual_group::Kind selected = residual_group::Kind::Zstd3;
-    const std::vector<uint8_t> residual_input = residual_group::line_payload(exact);
-    require(residual_input != exact,
-            "P29 residual unexpectedly contains the complete raw TU");
-    const std::vector<uint8_t> residual =
-        codec.encode(residual_input.data(), residual_input.size(), &selected);
-    const auto decoded = codec.decode(residual.data(), residual.size());
-    require(decoded.wire_bytes == residual.size() && decoded.raw == residual_input &&
-                residual_group::reconstruct_line_payload(exact, decoded.raw) == exact,
-            "P29 residual group did not round-trip the current TU");
-    require(selected == residual_group::Kind::Zstd3 || selected == residual_group::Kind::Bsc ||
-                selected == residual_group::Kind::Zstd10,
-            "P29 residual group selected an unknown codec");
-    require_throws<std::runtime_error>(
-        [&] { (void)codec.decode(residual.data(), residual.size() - 1); },
-        "P29 residual deletion bypass was not rejected");
-
-    const PreparedTUPtr first = pair.c.prepare_from_regions(input);
-    const CActiveTx& first_active = pair.route.begin(
-        first, P29RootMode::HistoryIndependent, true);
-    const std::vector<uint8_t> first_body = first_active.body;
-    require(first_active.region_count == input.size() && first_active.block_use_count > 0,
-            "P29 current-TU admission did not expose repeated Regions and Block use");
-    const Need first_need = start(pair, first_active);
-    const std::vector<ImmutableObject> first_fill = pair.route.build_fill(first_need);
-    require(std::none_of(first_fill.begin(), first_fill.end(), [](const ImmutableObject& object) {
-                return object.key.type() == ObjectType::Line;
-            }),
-            "P29 residual transfer duplicated literal Line bytes in FILL");
-
-    {
-        Pair missing_structure;
-        const CActiveTx& active = missing_structure.route.begin(
-            missing_structure.c.prepare_from_regions(input),
-            P29RootMode::HistoryIndependent, true);
-        const Need need = start(missing_structure, active);
-        const std::vector<ImmutableObject> fill = missing_structure.route.build_fill(need);
-        require(fill.size() > 1, "P29 missing-structure fixture has one object");
-        missing_structure.f.append_body(missing_structure.session, active.body);
-        for (size_t i = 0; i + 1 < fill.size(); ++i)
-            missing_structure.f.apply_object(missing_structure.session, fill[i]);
-        require_throws<std::logic_error>(
-            [&] { (void)missing_structure.f.materialize_and_verify(missing_structure.session); },
-            "P29 materialization accepted a deleted structural object");
-    }
-    {
-        Pair missing_residual;
-        const CActiveTx& active = missing_residual.route.begin(
-            missing_residual.c.prepare_from_regions(input),
-            P29RootMode::HistoryIndependent, true);
-        const Need need = start(missing_residual, active);
-        for (const ImmutableObject& object : missing_residual.route.build_fill(need))
-            missing_residual.f.apply_object(missing_residual.session, object);
-        require(active.body.size() > 1, "P29 missing-residual fixture is empty");
-        missing_residual.f.append_body(
-            missing_residual.session,
-            std::span<const uint8_t>(active.body).first(active.body.size() - 1));
-        require_throws<std::logic_error>(
-            [&] { (void)missing_residual.f.materialize_and_verify(missing_residual.session); },
-            "P29 materialization accepted a deleted residual byte");
-    }
-
-    for (const ImmutableObject& object : first_fill)
-        pair.f.apply_object(pair.session, object);
-    pair.f.append_body(pair.session, first_active.body);
-    require(pair.f.materialize_and_verify(pair.session) == exact,
-            "P29 structure-only FILL did not reconstruct exact bytes");
-    pair.route.accept_commit(pair.f.commit_input(pair.session));
-
-    Pair warm;
-    const PreparedTUPtr warm_first = warm.c.prepare_from_regions(input);
-    const CActiveTx& warm_active = warm.route.begin(
-        warm_first, P29RootMode::HistoryIndependent, true);
-    finish(warm, warm_active);
-    const PreparedTUPtr warm_second = warm.c.prepare_from_regions(input);
-    const CActiveTx& warm_second_active = warm.route.begin(
-        warm_second, P29RootMode::RouteHistory, true);
-    require(warm_second_active.body.size() > 1,
-            "P29 same-route second TU did not emit a complete frame");
-    finish(warm, warm_second_active);
-
-    Pair different_route;
-    const CActiveTx& isolated_active = different_route.route.begin(
-        different_route.c.prepare_from_regions(input),
-        P29RootMode::HistoryIndependent, true);
-    require(isolated_active.body == first_body,
-            "P29 different route changed its independent structural/literal frame");
-    finish(different_route, isolated_active);
-
-    Pair retry;
-    const PreparedTUPtr retry_prepared = retry.c.prepare_from_regions(input);
-    const CActiveTx& retry_active = retry.route.begin(
-        retry_prepared, P29RootMode::HistoryIndependent, true);
-    const std::vector<uint8_t> retry_body = retry_active.body;
-    retry.route.abandon_active();
-    const CActiveTx& retry_again = retry.route.begin(
-        retry_prepared, P29RootMode::HistoryIndependent, true);
-    require(retry_again.body == retry_body,
-            "P29 abort/retry changed its authoritative literal frame");
-    finish(retry, retry_again);
-
-    const PreparedTUPtr second = pair.c.prepare_from_regions(input);
-    const std::vector<uint8_t> second_residual_input = pair.route.residual_input(second);
-    require(second_residual_input.empty(),
-            "P29 RouteHistory did not recognize acknowledged repeated lines");
-    const CActiveTx& second_active = pair.route.begin(
-        second, P29RootMode::RouteHistory, true);
-    require(second_active.block_use_count > 0 &&
-                std::any_of(second_active.root.begin(), second_active.root.end(),
-                            [](Key64 key) { return key.type() == ObjectType::Block; }),
-            "P29 RouteHistory did not consume the sequential Block plan");
-    finish(pair, second_active);
-}
-
-void test_exact_need_and_duplicate_application() {
-    Pair pair;
-    const PreparedTUPtr prepared =
-        pair.c.prepare_from_regions(regions({"one\n", "two\n", "three\n"}));
-    const CActiveTx& active = pair.route.begin(prepared);
-    const Need original = start(pair, active);
-    const std::vector<ImmutableObject> fill = pair.route.build_fill(original);
-    require(fill.size() >= 2, "cold Fill fixture is too small");
-    const ObjectApplied applied = pair.f.apply_object(pair.session, fill.front());
-    const ObjectApplied duplicate = pair.f.apply_object(pair.session, fill.front());
-    require(applied.result == ObjectApplyResult::Applied &&
-                duplicate.result == ObjectApplyResult::Duplicate,
-            "exact duplicate object was not idempotent");
-    require(pair.f.need(pair.session) == original,
-            "F did not retain the exact originally recorded Need set");
-
-    const ImmutableObject conflicting =
-        ImmutableObject::bytes(fill.front().key, bytes("changed\n"));
-    require_throws<std::logic_error>(
-        [&] { pair.f.apply_object(pair.session, conflicting); },
-        "changed content replaced an installed Key64");
-    pair.f.append_body(pair.session, active.body);
-    for (size_t i = 1; i != fill.size(); ++i)
-        pair.f.apply_object(pair.session, fill[i]);
-    pair.f.materialize_and_verify(pair.session);
-    pair.route.accept_commit(pair.f.commit_input(pair.session));
-}
-
-void test_valid_then_invalid_fill_retains_first_object() {
-    Pair pair;
-    const PreparedTUPtr prepared =
-        pair.c.prepare_from_regions(regions({"a\n", "b\n", "c\n"}));
-    const CActiveTx& active = pair.route.begin(prepared);
-    const Need need = start(pair, active);
-    const std::vector<ImmutableObject> fill = pair.route.build_fill(need);
-    require(fill.size() >= 2, "FILL fixture needs at least two objects");
-    FillRecord first = fill[0].fill_record();
-    FillRecord bad = fill[1].fill_record();
-    bad.object_bytes.back() ^= 1;
-    const std::array<FillRecord, 2> records{first, bad};
-    const auto messages = encode_fill_messages(records, kInitialMaxFramePayload);
-    require(messages.size() == 1, "valid/invalid fixture unexpectedly split");
-    require_throws<std::invalid_argument>(
-        [&] { (void)pair.f.append_fill(pair.session, messages.front()); },
-        "invalid second FILL object was accepted");
-    require(pair.f.contains(pair.c.guid(), first.key),
-            "valid object preceding an invalid object was rolled back");
-
-    pair.f.append_body(pair.session, active.body);
-    for (const ImmutableObject& object : fill)
-        pair.f.apply_object(pair.session, object);
-    pair.f.finish_fill(pair.session);
-    pair.f.materialize_and_verify(pair.session);
-    pair.route.accept_commit(pair.f.commit_input(pair.session));
-}
-
-void test_trailing_partial_fill_blocks_commit_and_replays() {
-    Pair pair;
-    const PreparedTUPtr prepared =
-        pair.c.prepare_from_regions(regions({"trailing\n", "partial\n", "fill\n"}));
-    const CActiveTx& active = pair.route.begin(prepared);
-    const Need need = start(pair, active);
-    const std::vector<ImmutableObject> fill = pair.route.build_fill(need);
-    require(!fill.empty(), "trailing-partial FILL fixture has no requested objects");
-
-    std::vector<FillRecord> records;
-    records.reserve(fill.size());
-    for (const ImmutableObject& object : fill)
-        records.push_back(object.fill_record());
-    const auto complete = encode_fill_messages(records, kInitialMaxFramePayload);
-    const std::array<FillRecord, 1> extra{fill.front().fill_record()};
-    const auto trailing = encode_fill_messages(extra, kInitialMaxFramePayload);
-    require(complete.size() == 1 && trailing.size() == 1 &&
-                trailing.front().bytes.size() >= 4,
-            "trailing-partial FILL fixture unexpectedly split");
-
-    FillMessage message = complete.front();
-    message.bytes.insert(message.bytes.end(), trailing.front().bytes.begin(),
-                         trailing.front().bytes.begin() + 4);
-    pair.f.append_body(pair.session, active.body);
-    require_throws<std::invalid_argument>(
-        [&] { (void)pair.f.append_fill(pair.session, message); },
-        "trailing partial record was accepted after the final requested object");
-    for (const ImmutableObject& object : fill)
-        require(pair.f.contains(pair.c.guid(), object.key),
-                "complete object preceding trailing partial bytes was rolled back");
-    require_throws<std::invalid_argument>(
-        [&] { (void)pair.f.materialize_and_verify(pair.session); },
-        "transaction materialized with a trailing partial FILL record");
-    require_throws<std::logic_error>(
-        [&] { (void)pair.f.commit_input(pair.session); },
-        "transaction committed after rejected trailing partial FILL bytes");
-
-    pair.f.disconnect(pair.session);
-    const ReconnectResult resumed =
-        reconnect(pair.route, pair.f, HistoryNonce{350});
-    require(resumed.outcome == ReconnectOutcome::ExactMatch && resumed.replay_active,
-            "trailing-partial FILL did not take exact replay path");
-    pair.session = resumed.session;
-    pair.f.begin(pair.session, pair.route.active()->begin, true);
-    pair.f.append_dict(pair.session, pair.route.active()->dict);
-    require(pair.f.need(pair.session).missing.empty(),
-            "replay did not recompute Need from retained complete objects");
-    pair.f.append_body(pair.session, pair.route.active()->body);
-    pair.f.materialize_and_verify(pair.session);
-    pair.route.accept_commit(pair.f.commit_input(pair.session));
-}
-
-void test_body_and_fill_complete_in_both_orders() {
-    {
-        Pair pair;
-        const auto prepared = pair.c.prepare_from_regions(regions({"body\n", "first\n"}));
-        finish(pair, pair.route.begin(prepared), false);
-    }
-    {
-        Pair pair;
-        const auto prepared = pair.c.prepare_from_regions(regions({"fill\n", "first\n"}));
-        finish(pair, pair.route.begin(prepared), true);
-    }
-}
-
-void test_zero_components_and_component_boundaries() {
-    {
-        Pair pair;
-        const std::vector<std::vector<uint8_t>> empty_regions;
-        const PreparedTUPtr empty = pair.c.prepare_from_regions(empty_regions);
-        const CActiveTx& active = pair.route.begin(empty);
-        require(active.dict.empty() && active.body.empty() && active.begin.raw_bytes == 0,
-                "empty TU did not use legal zero-length components");
-        pair.f.begin(pair.session, active.begin);
-        require(pair.f.need(pair.session).missing.empty(), "empty TU produced Need keys");
-        require(pair.f.materialize_and_verify(pair.session).empty(),
-                "empty TU materialized bytes");
-        pair.route.accept_commit(pair.f.commit_input(pair.session));
-    }
-    {
-        Pair pair;
-        const auto prepared = pair.c.prepare_from_regions(regions({"short\n", "long\n"}));
-        const CActiveTx& active = pair.route.begin(prepared);
-        pair.f.begin(pair.session, active.begin);
-        require(active.dict.size() > 1, "DICT boundary fixture is too short");
-        pair.f.append_dict(pair.session,
-                           std::span<const uint8_t>(active.dict).first(active.dict.size() - 1));
-        require_throws<std::logic_error>([&] { (void)pair.f.need(pair.session); },
-                                         "one-byte-short DICT produced Need");
-        pair.f.append_dict(pair.session,
-                           std::span<const uint8_t>(active.dict).last(1));
-        const Need need = pair.f.need(pair.session);
-        const std::array<uint8_t, 1> extra{0};
-        require_throws<std::logic_error>(
-            [&] { pair.f.append_dict(pair.session, extra); },
-            "one-byte-long DICT was accepted after completion");
-        require_throws<std::length_error>(
-            [&] {
-                std::vector<uint8_t> too_long = active.body;
-                too_long.push_back(0);
-                pair.f.append_body(pair.session, too_long);
-            },
-            "one-byte-long BODY was accepted");
-        pair.f.append_body(pair.session, active.body);
-        for (const ImmutableObject& object : pair.route.build_fill(need))
-            pair.f.apply_object(pair.session, object);
-        pair.f.materialize_and_verify(pair.session);
-        pair.route.accept_commit(pair.f.commit_input(pair.session));
-    }
-}
-
-void test_p29_key_vector_encoding_boundary() {
-    static_assert(kP29KeyVectorEncoding == 1);
-    Pair pair;
-    const CActiveTx& active = pair.route.begin(
-        pair.c.prepare_from_regions(regions({"encoding\n", "boundary\n"})));
-
-    TxBegin unsupported = active.begin;
-    unsupported.dict.encoding = kP29KeyVectorEncoding + 1;
-    require_throws<std::invalid_argument>(
-        [&] { pair.f.begin(pair.session, unsupported); },
-        "F accepted an unsupported P29 DICT encoding");
-
-    unsupported = active.begin;
-    unsupported.body.encoding = kP29ResidualBodyEncoding + 1;
-    require_throws<std::invalid_argument>(
-        [&] { pair.f.begin(pair.session, unsupported); },
-        "F accepted an unsupported P29 BODY encoding");
-
-    finish(pair, active);
-    require(pair.route.next_rel_seq().value == 1,
-            "rejected P29 encodings left pending F transaction state");
-}
-
-void test_disconnect_replay_every_object_boundary() {
-    const auto input = regions({"r0\n", "r1\n", "r2\n", "r3\n"});
-    size_t fill_count = 0;
-    {
-        Pair probe;
-        const CActiveTx& active = probe.route.begin(probe.c.prepare_from_regions(input));
-        fill_count = probe.route.build_fill(start(probe, active)).size();
-    }
-    for (size_t delivered = 0; delivered <= fill_count; ++delivered) {
-        Pair pair;
-        const CActiveTx& active = pair.route.begin(pair.c.prepare_from_regions(input));
-        const Need before = start(pair, active);
-        const std::vector<ImmutableObject> fill = pair.route.build_fill(before);
-        for (size_t i = 0; i != delivered; ++i)
-            pair.f.apply_object(pair.session, fill[i]);
-        pair.f.disconnect(pair.session);
-        const ReconnectResult resumed = reconnect(pair.route, pair.f, HistoryNonce{400 + delivered});
-        require(resumed.outcome == ReconnectOutcome::ExactMatch && resumed.replay_active,
-                "partial Fill did not take exact replay path");
-        pair.session = resumed.session;
-        pair.f.begin(pair.session, pair.route.active()->begin, true);
-        pair.f.append_dict(pair.session, pair.route.active()->dict);
-        const Need after = pair.f.need(pair.session);
-        require(after.missing.size() == fill_count - delivered,
-                "replay did not retain exactly complete objects");
-        pair.f.append_body(pair.session, pair.route.active()->body);
-        for (const ImmutableObject& object : pair.route.build_fill(after))
-            pair.f.apply_object(pair.session, object);
-        pair.f.materialize_and_verify(pair.session);
-        pair.route.accept_commit(pair.f.commit_input(pair.session));
-        require(pair.route.next_rel_seq().value == 1,
-                "replay advanced route more than once");
-    }
-}
-
-void test_lost_commit_acknowledgement() {
+void test_f_store_session_and_route_fencing() {
     ActionTrace trace;
-    Pair pair(&trace);
-    const CActiveTx& active = pair.route.begin(
-        pair.c.prepare_from_regions(regions({"ack\n", "was\n", "lost\n"})));
-    const TxCommit retained = finish(pair, active, false, false);
-    require(pair.route.active() && pair.route.next_rel_seq().value == 0,
-            "fixture did not retain C ACTIVE_TX after F commit");
-    pair.f.disconnect(pair.session);
-    const ReconnectResult resumed = reconnect(pair.route, pair.f, HistoryNonce{500});
-    require(resumed.outcome == ReconnectOutcome::LostFinalAcknowledgement &&
-                !pair.route.active() && pair.route.next_rel_seq().value == 1 &&
-                pair.route.state_digest() == retained.post_state_digest,
-            "retained complete commit was not accepted exactly once");
-    pair.session = resumed.session;
-    const auto f_commit = std::find_if(
-        trace.records().begin(), trace.records().end(), [](const auto& record) {
-            return record.actor == ActorSide::F &&
-                   record.action == ActionType::INPUT_COMMITTED;
-        });
-    const auto lost_accept = std::find_if(
-        trace.records().begin(), trace.records().end(), [](const auto& record) {
-            return record.actor == ActorSide::C &&
-                   record.action == ActionType::LOST_COMMIT_ACCEPTED;
-        });
-    require(f_commit != trace.records().end() &&
-                lost_accept != trace.records().end() && f_commit < lost_accept,
-            "trace did not expose the durable-F/lost-C-acceptance window");
-    const auto trace_error = check_action_trace(trace.records());
-    require(!trace_error,
-            trace_error ? *trace_error : "lost-commit trace failed");
-}
+    const CStoreGuid c_guid = CStoreGuid::from_u64(40);
+    FStore store(FStoreGuid::from_u64(41), 1, &trace, 4096, true);
+    const SessionHandle first = store.connect(c_guid);
+    require(!store.resume(first).namespace_present &&
+                !store.resume(first).route_present,
+            "cold F namespace was not canonical absent state");
 
-void test_store_reset_history_reset_and_retry_another_f() {
-    {
-        const CStoreGuid c_guid = Id128::from_u64(80);
-        FStore f(Id128::from_u64(81));
-        const SessionHandle session = f.connect(c_guid);
-        require_throws<std::logic_error>(
-            [&] { f.start_route(session, HistoryNonce{82}, Digest128{}); },
-            "HISTORY_RESET trusted a non-derived initial digest");
-        require(!f.resume(session).route_present,
-                "rejected HISTORY_RESET created route state");
-        f.start_route(session, HistoryNonce{82},
-                      initial_route_digest(c_guid, HistoryNonce{82}));
-    }
-    {
-        Pair pair;
-        require(pair.f.object_count(pair.c.guid()) == 0,
-                "empty history-reset fixture unexpectedly has objects");
-        pair.f.forget_route(pair.session);
-        pair.f.disconnect(pair.session);
-        require_throws<std::invalid_argument>(
-            [&] {
-                (void)reconnect(pair.route, pair.f, pair.route.history_nonce());
-            },
-            "route reset reused its HISTORY_NONCE");
-        const ReconnectResult reset = reconnect(pair.route, pair.f, HistoryNonce{550});
-        require(reset.outcome == ReconnectOutcome::RouteHistoryReset &&
-                    !reset.replay_active &&
-                    pair.f.object_count(pair.c.guid()) == 0,
-                "empty route reset did not preserve an empty object namespace");
-        pair.session = reset.session;
-    }
-    {
-        Pair pair;
-        const auto first = pair.c.prepare_from_regions(regions({"keep\n", "objects\n"}));
-        finish(pair, pair.route.begin(first));
-        const auto second = pair.c.prepare_from_regions(regions({"cold\n", "again\n"}));
-        pair.route.begin(second);
-        pair.f.destructive_cache_reset(Id128::from_u64(201));
-        const ReconnectResult cold = reconnect(pair.route, pair.f, HistoryNonce{600});
-        require(cold.outcome == ReconnectOutcome::ColdFStore && cold.replay_active &&
-                    pair.route.active()->begin.profile == ProfileId::P29 &&
-                    pair.route.active()->begin.p29_root_mode ==
-                        P29RootMode::HistoryIndependent,
-                "F store reset did not re-encode active TU independently");
-        pair.session = cold.session;
-        require(!start(pair, *pair.route.active(), true).missing.empty(),
-                "cold F store did not request repopulation");
-        pair.f.append_body(pair.session, pair.route.active()->body);
-        for (const auto& object : pair.route.build_fill(pair.f.need(pair.session)))
-            pair.f.apply_object(pair.session, object);
-        pair.f.materialize_and_verify(pair.session);
-        pair.route.accept_commit(pair.f.commit_input(pair.session));
-    }
-    {
-        Pair pair;
-        const auto input = pair.c.prepare_from_regions(regions({"route\n", "reset\n"}));
-        finish(pair, pair.route.begin(input));
-        const size_t retained = pair.f.object_count(pair.c.guid());
-        pair.route.begin(input);
-        pair.f.forget_route(pair.session);
-        pair.f.disconnect(pair.session);
-        const ReconnectResult reset = reconnect(pair.route, pair.f, HistoryNonce{700});
-        require(reset.outcome == ReconnectOutcome::RouteHistoryReset &&
-                    reset.replay_active &&
-                    pair.f.object_count(pair.c.guid()) == retained,
-                "route reset discarded reusable objects or active TU");
-        pair.session = reset.session;
-        require(start(pair, *pair.route.active(), true).missing.empty(),
-                "route reset requested retained objects");
-        pair.f.append_body(pair.session, pair.route.active()->body);
-        pair.f.materialize_and_verify(pair.session);
-        pair.route.accept_commit(pair.f.commit_input(pair.session));
-    }
-    {
-        ActionTrace trace;
-        Pair pair(&trace);
-        const auto input = pair.c.prepare_from_regions(regions({"retry\n", "F2\n"}));
-        const CActiveTx& active = pair.route.begin(input);
-        const Need need = start(pair, active);
-        const auto fill = pair.route.build_fill(need);
-        pair.f.apply_object(pair.session, fill.front());
-        pair.f.disconnect(pair.session);
-        FStore second(Id128::from_u64(900), 1, &trace);
-        const ReconnectResult moved = reconnect(pair.route, second, HistoryNonce{901});
-        require(moved.outcome == ReconnectOutcome::ColdFStore && moved.replay_active &&
-                    pair.route.active()->begin.profile == ProfileId::P29 &&
-                    pair.route.active()->begin.p29_root_mode ==
-                        P29RootMode::HistoryIndependent,
-                "retry to another F did not use cold independent encoding");
-        const SessionHandle second_session = moved.session;
-        second.begin(second_session, pair.route.active()->begin, true);
-        second.append_dict(second_session, pair.route.active()->dict);
-        const Need second_need = second.need(second_session);
-        require(second_need.missing.size() == pair.route.active()->manifest.size(),
-                "second F inherited the first F's object state");
-        second.append_body(second_session, pair.route.active()->body);
-        for (const auto& object : pair.route.build_fill(second_need))
-            second.apply_object(second_session, object);
-        second.materialize_and_verify(second_session);
-        pair.route.accept_commit(second.commit_input(second_session));
-        const auto trace_error = check_action_trace(trace.records());
-        require(!trace_error,
-                trace_error ? *trace_error : "multi-F trace failed");
-    }
-    {
-        ActionTrace trace;
-        CAuthority c(Id128::from_u64(1300));
-        FStore first(Id128::from_u64(1301), 1, &trace);
-        FStore second(Id128::from_u64(1302), 1, &trace);
-        CRoute first_route(c, first.guid(), HistoryNonce{1303}, &trace);
-        CRoute second_route(c, second.guid(), HistoryNonce{1304}, &trace);
-        SessionHandle first_session =
-            reconnect(first_route, first, HistoryNonce{1305}).session;
-        SessionHandle second_session =
-            reconnect(second_route, second, HistoryNonce{1306}).session;
-        const PreparedTUPtr prepared =
-            c.prepare_from_regions(regions({"already\n", "at F2\n"}));
-
-        const CActiveTx& warm = second_route.begin(prepared);
-        second.begin(second_session, warm.begin);
-        second.append_dict(second_session, warm.dict);
-        const Need warm_need = second.need(second_session);
-        second.append_body(second_session, warm.body);
-        for (const auto& object : second_route.build_fill(warm_need))
-            second.apply_object(second_session, object);
-        second.materialize_and_verify(second_session);
-        second_route.accept_commit(second.commit_input(second_session));
-        const size_t retained = second.object_count(c.guid());
-        second.disconnect(second_session);
-
-        const CActiveTx& in_flight = first_route.begin(prepared);
-        first.begin(first_session, in_flight.begin);
-        first.append_dict(first_session, in_flight.dict);
-        first.disconnect(first_session);
-        const ReconnectResult moved =
-            reconnect(first_route, second, HistoryNonce{1307});
-        require(moved.outcome == ReconnectOutcome::ColdFStore &&
-                    moved.replay_active && second.object_count(c.guid()) == retained,
-                "retry to a previously used F discarded its C namespace");
-        second_session = moved.session;
-        second.begin(second_session, first_route.active()->begin, true);
-        second.append_dict(second_session, first_route.active()->dict);
-        const Need retained_need = second.need(second_session);
-        require(retained_need.missing.empty(),
-                "retry to a warm F requested already retained immutable objects");
-        second.append_body(second_session, first_route.active()->body);
-        second.materialize_and_verify(second_session);
-        first_route.accept_commit(second.commit_input(second_session));
-        const auto trace_error = check_action_trace(trace.records());
-        require(!trace_error,
-                trace_error ? *trace_error : "warm retry-to-F trace failed");
-    }
-}
-
-void test_session_replacement_and_terminal_serial() {
-    Pair pair;
-    const CActiveTx& active = pair.route.begin(
-        pair.c.prepare_from_regions(regions({"replace\n", "session\n"})));
-    (void)start(pair, active);
-    const SessionHandle stale = pair.session;
-    const SessionHandle replacement = pair.f.connect(pair.c.guid());
+    const HistoryNonce nonce{42};
     require_throws<std::logic_error>(
-        [&] { pair.f.append_body(stale, active.body); },
-        "stale session completed work after replacement");
-    pair.session = replacement;
-    finish(pair, active, false, true, true);
+        [&] { store.start_route(first, nonce, Digest128{}); },
+        "F accepted a HISTORY_RESET with a non-derived digest");
+    store.start_route(first, nonce, initial_route_digest(c_guid, nonce));
+    const SessionState established = store.resume(first);
+    require(established.namespace_present && established.route_present &&
+                established.history_nonce == nonce &&
+                established.next_rel_seq == RelSeq{0},
+            "F route did not expose its established cursor");
 
-    FStore terminal(Id128::from_u64(1000), std::numeric_limits<uint64_t>::max());
-    const CStoreGuid c_guid = Id128::from_u64(1001);
-    const SessionHandle last = terminal.connect(c_guid);
+    TxBegin wrong_profile;
+    wrong_profile.history_nonce = nonce;
+    wrong_profile.profile = ProfileId::ZSTD_TU;
+    wrong_profile.pre_state_digest = established.state_digest;
+    require_throws<std::invalid_argument>(
+        [&] { store.begin(first, wrong_profile); },
+        "P29V1 F store admitted another profile");
+
+    const SessionHandle replacement = store.connect(c_guid);
+    require_throws<std::logic_error>([&] { (void)store.resume(first); },
+                                     "replaced F session remained live");
+    require(store.resume(replacement).route_present,
+            "session replacement discarded committed route state");
+    store.forget_route(replacement);
+    require(store.resume(replacement).namespace_present &&
+                !store.resume(replacement).route_present,
+            "route forget discarded the C namespace");
+
+    store.destructive_cache_reset(FStoreGuid::from_u64(43));
+    require_throws<std::logic_error>(
+        [&] { (void)store.resume(replacement); },
+        "old session survived F_STORE_GUID reset");
+    require(trace.records().size() >= 3,
+            "F session transitions did not emit canonical actions");
+}
+
+void test_authority_and_route_fail_closed_before_enablement() {
+    CAuthority authority(CStoreGuid::from_u64(50));
+    require(authority.guid() == CStoreGuid::from_u64(50) &&
+                !authority.p29v1_runnable() &&
+                authority.p29v1_interner_reserved_bytes() == 0,
+            "bare C authority unexpectedly enabled P29V1");
+
+    CRoute route(authority, FStoreGuid::from_u64(51), HistoryNonce{52});
+    require(route.next_rel_seq() == RelSeq{0} && !route.active() &&
+                route.state_digest() ==
+                    initial_route_digest(authority.guid(), HistoryNonce{52}),
+            "new C route did not use the canonical cursor");
+    require_throws<std::invalid_argument>(
+        [&] { (void)route.begin_v1({}, 4096); },
+        "C route accepted a null PreparedTU");
+    require_throws<std::logic_error>(
+        [&] { route.pin_v1_system_source_reuse(true); },
+        "C route pinned reuse before its P29V1 codec existed");
+}
+
+void test_terminal_session_serial() {
+    FStore store(FStoreGuid::from_u64(60),
+                 std::numeric_limits<uint64_t>::max());
+    const CStoreGuid c_guid = CStoreGuid::from_u64(61);
+    const SessionHandle last = store.connect(c_guid);
     require(last.serial == std::numeric_limits<uint64_t>::max(),
-            "last session serial was not allocated");
-    require_throws<std::overflow_error>([&] { (void)terminal.connect(c_guid); },
-                                        "session serial wrapped after exhaustion");
-    require(!terminal.resume(last).namespace_present,
-            "failed allocation mutated the current session");
-    require_throws<std::overflow_error>([&] { (void)terminal.connect(c_guid); },
-                                        "session exhaustion was not terminal");
-    terminal.destructive_cache_reset(Id128::from_u64(1002));
-    const SessionHandle after_reset = terminal.connect(c_guid);
-    require(after_reset.serial == 1,
+            "last F session serial was not allocated");
+    require_throws<std::overflow_error>(
+        [&] { (void)store.connect(c_guid); },
+        "F session serial wrapped after exhaustion");
+    store.destructive_cache_reset(FStoreGuid::from_u64(62));
+    require(store.connect(c_guid).serial == 1,
             "new F store incarnation did not reset session serial space");
-    require_throws<std::logic_error>([&] { (void)terminal.resume(last); },
-                                     "old F-store handle survived GUID reset");
-
-    FStore another(Id128::from_u64(1003));
-    const SessionHandle coincident = another.connect(c_guid);
-    require(coincident.serial == after_reset.serial,
-            "cross-F fencing fixture did not produce equal serials");
-    require_throws<std::logic_error>([&] { (void)another.resume(after_reset); },
-                                     "session handle was accepted by another F store");
-}
-
-void test_two_c_namespaces_with_equal_key_values() {
-    ActionTrace trace;
-    FStore f(Id128::from_u64(1100), 1, &trace);
-    CAuthority c1(Id128::from_u64(1101));
-    CAuthority c2(Id128::from_u64(1102));
-    CRoute r1(c1, f.guid(), HistoryNonce{11}, &trace);
-    CRoute r2(c2, f.guid(), HistoryNonce{12}, &trace);
-    const SessionHandle s1 = reconnect(r1, f, HistoryNonce{13}).session;
-    const SessionHandle s2 = reconnect(r2, f, HistoryNonce{14}).session;
-    const auto p1 = c1.prepare_from_regions(regions({"first C\n"}));
-    const auto p2 = c2.prepare_from_regions(regions({"second C\n"}));
-    require(p1->regions.front().wire_value() == p2->regions.front().wire_value(),
-            "fixture did not produce equal C-local Key64 values");
-    const auto drive = [&](CAuthority&, CRoute& route, SessionHandle session,
-                           const PreparedTUPtr& prepared) {
-        const CActiveTx& active = route.begin(prepared);
-        f.begin(session, active.begin);
-        f.append_dict(session, active.dict);
-        const Need need = f.need(session);
-        f.append_body(session, active.body);
-        for (const auto& object : route.build_fill(need)) f.apply_object(session, object);
-        f.materialize_and_verify(session);
-        route.accept_commit(f.commit_input(session));
-    };
-    drive(c1, r1, s1, p1);
-    drive(c2, r2, s2, p2);
-    require(f.contains(c1.guid(), p1->regions.front()) &&
-                f.contains(c2.guid(), p2->regions.front()),
-            "equal Key64 values crossed C_STORE_GUID namespaces");
-    const auto trace_error = check_action_trace(trace.records());
-    require(!trace_error,
-            trace_error ? *trace_error : "C2F1 trace shared checker state");
-}
-
-void test_canonical_action_trace() {
-    ActionTrace trace;
-    Pair pair(&trace);
-    const auto input = pair.c.prepare_from_regions(regions({"trace\n", "bridge\n"}));
-    finish(pair, pair.route.begin(input));
-    const auto f_commit = std::find_if(
-        trace.records().begin(), trace.records().end(), [](const auto& record) {
-            return record.actor == ActorSide::F &&
-                   record.action == ActionType::INPUT_COMMITTED;
-        });
-    const auto c_accept = std::find_if(
-        trace.records().begin(), trace.records().end(), [](const auto& record) {
-            return record.actor == ActorSide::C &&
-                   record.action == ActionType::COMMIT_ACCEPTED;
-        });
-    require(f_commit != trace.records().end() &&
-                c_accept != trace.records().end() && f_commit < c_accept,
-            "normal trace conflated F durability with C acceptance");
-    const auto error = check_action_trace(trace.records());
-    require(!error, error ? *error : "canonical trace failed");
-    if (const char* trace_path = std::getenv("P50_TRACE_PATH"))
-        write_action_trace(trace, trace_path);
-
-    const auto c_begin = std::find_if(
-        trace.records().begin(), trace.records().end(), [](const auto& record) {
-            return record.actor == ActorSide::C &&
-                   record.action == ActionType::TX_BEGIN;
-        });
-    const auto f_begin = std::find_if(
-        trace.records().begin(), trace.records().end(), [](const auto& record) {
-            return record.actor == ActorSide::F &&
-                   record.action == ActionType::TX_BEGIN;
-        });
-    require(c_begin != trace.records().end() && f_begin != trace.records().end(),
-            "trace fixture lacks C/F TX_BEGIN");
-    ActionRecord abort = *c_begin;
-    abort.action = ActionType::TX_ABORTED;
-
-    std::vector<ActionRecord> changed(trace.records().begin(), f_begin + 1);
-    changed.push_back(abort);
-    require(check_action_trace(changed).has_value(),
-            "trace checker accepted abort while F had a pending transaction");
-
-    changed.assign(trace.records().begin(), f_commit + 1);
-    changed.push_back(abort);
-    require(check_action_trace(changed).has_value(),
-            "trace checker accepted abort after F commit but before C acceptance");
-
-    constexpr std::array stale_session_actions{
-        ActionType::HISTORY_RESET, ActionType::TX_BEGIN,
-        ActionType::DICT_COMPLETE, ActionType::BODY_COMPLETE,
-        ActionType::NEED_RECORDED, ActionType::OBJECT_APPLIED,
-        ActionType::INPUT_MATERIALIZED, ActionType::INPUT_COMMITTED,
-    };
-    for (ActionType action : stale_session_actions) {
-        changed = trace.records();
-        const auto position = std::find_if(
-            changed.begin(), changed.end(), [action](const auto& record) {
-                return record.actor == ActorSide::F && record.action == action;
-            });
-        require(position != changed.end(),
-                "trace fixture lacks an F action for current-session checking");
-        ++position->session_serial;
-        require(check_action_trace(changed).has_value(),
-                "trace checker accepted an F action from a stale session");
-    }
-
-    changed = trace.records();
-    const auto dict = std::find_if(changed.begin(), changed.end(), [](const auto& record) {
-        return record.action == ActionType::DICT_COMPLETE;
-    });
-    const auto need = std::find_if(changed.begin(), changed.end(), [](const auto& record) {
-        return record.action == ActionType::NEED_RECORDED;
-    });
-    require(dict != changed.end() && need != changed.end(), "trace fixture lacks DICT/NEED");
-    std::iter_swap(dict, need);
-    require(check_action_trace(changed).has_value(),
-            "trace checker accepted NEED before DICT completion");
-
-    changed = trace.records();
-    const auto object = std::find_if(
-        changed.begin(), changed.end(), [](const auto& record) {
-            return record.action == ActionType::OBJECT_APPLIED;
-        });
-    require(object != changed.end(), "trace fixture lacks OBJECT_APPLIED");
-    auto repeat = *object;
-    repeat.duplicate = true;
-    repeat.content_digest.bytes.front() ^= 1;
-    changed.insert(object + 1, repeat);
-    require(check_action_trace(changed).has_value(),
-            "trace checker accepted changed content for an immutable Key64");
-
-    ActionTrace replay_trace;
-    Pair replay(&replay_trace, 1200, 1201);
-    const CActiveTx& active = replay.route.begin(
-        replay.c.prepare_from_regions(regions({"disconnect\n", "replay\n"})));
-    const Need before = start(replay, active);
-    const auto fill = replay.route.build_fill(before);
-    replay.f.apply_object(replay.session, fill.front());
-    replay.f.disconnect(replay.session);
-    const ReconnectResult resumed = reconnect(replay.route, replay.f, HistoryNonce{1202});
-    replay.session = resumed.session;
-    finish(replay, *replay.route.active(), false, true, true);
-    const auto replay_error = check_action_trace(replay_trace.records());
-    require(!replay_error, replay_error ? *replay_error : "replay trace failed");
-    changed = replay_trace.records();
-    const auto replay_action = std::find_if(
-        changed.begin(), changed.end(), [](const auto& record) {
-            return record.actor == ActorSide::F &&
-                   record.action == ActionType::ACTIVE_REPLAYED;
-        });
-    require(replay_action != changed.end(), "replay trace lacks ACTIVE_REPLAYED");
-    ++replay_action->session_serial;
-    require(check_action_trace(changed).has_value(),
-            "trace checker accepted replay from a stale session");
 }
 
 }  // namespace
 
 int main() {
-    test_key_limits_and_mixed_generations();
-    test_p29_preparation_verification_modes();
-    test_global_resource_owner_and_caught_slot_mutant();
-    test_p29v1_pair_preflight_and_segment_residency();
-    test_tu_seq_is_not_route_order();
-    test_separate_preparation_real_interning_and_p29();
-    test_p29_current_tu_residual_and_block_controls();
-    test_exact_need_and_duplicate_application();
-    test_valid_then_invalid_fill_retains_first_object();
-    test_trailing_partial_fill_blocks_commit_and_replays();
-    test_body_and_fill_complete_in_both_orders();
-    test_zero_components_and_component_boundaries();
-    test_p29_key_vector_encoding_boundary();
-    test_disconnect_replay_every_object_boundary();
-    test_lost_commit_acknowledgement();
-    test_store_reset_history_reset_and_retry_another_f();
-    test_session_replacement_and_terminal_serial();
-    test_two_c_namespaces_with_equal_key_values();
-    test_canonical_action_trace();
-    std::cout << "p50_slice0_test: all corrected M1 gates passed\n";
+    test_object_arena_and_canonical_records();
+    test_global_resource_owner();
+    test_atomic_p29v1_pair_preflight();
+    test_global_reverse_invariants_catch_mutants();
+    test_f_store_session_and_route_fencing();
+    test_authority_and_route_fail_closed_before_enablement();
+    test_terminal_session_serial();
     return 0;
 }

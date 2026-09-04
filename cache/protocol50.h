@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -104,15 +105,13 @@ struct Digest128Hash {
     size_t operator()(const Digest128& value) const noexcept;
 };
 
-constexpr uint16_t kProtocolVersion = 50;
+// CacheWire has its own revision space.  The ordinary Icecream connection
+// remains protocol 50; revision 1 is the first deployable CacheWire shape.
+constexpr uint16_t kP50WireRevision = 1;
 constexpr uint32_t kInitialMaxFramePayload = 1U << 20;
 // TX_BEGIN is the largest fixed-size mandatory V1 control payload.
-constexpr uint32_t kMandatoryControlFramePayload = 152;
+constexpr uint32_t kMandatoryControlFramePayload = 116;
 constexpr uint64_t kInitialMaxFillRecordBytes = uint64_t{1} << 32;
-// P29V1 deliberately carries the pair fingerprint in the digest field of an
-// otherwise empty DICT descriptor. Keeping the encoding in the protocol layer
-// lets transaction-digest validation recognize that one explicit exception.
-constexpr uint16_t kP29V1FingerprintDictEncoding = 4;
 
 enum class MessageType : uint8_t {
     SESSION_HELLO = 1,
@@ -120,11 +119,24 @@ enum class MessageType : uint8_t {
     HISTORY_RESET = 3,
     ERROR = 4,
     TX_BEGIN = 5,
-    DICT = 6,
-    BODY = 7,
-    NEED = 8,
-    FILL = 9,
-    TX_COMMIT = 10,
+    BODY = 6,
+    NEED = 7,
+    FILL = 8,
+    TX_COMMIT = 9,
+};
+
+enum class ErrorCode : uint16_t {
+    WIRE_REVISION_MISMATCH = 4,
+};
+
+class ProtocolError : public std::invalid_argument {
+public:
+    ProtocolError(ErrorCode code, std::string message)
+        : std::invalid_argument(std::move(message)), code_(code) {}
+    [[nodiscard]] ErrorCode code() const noexcept { return code_; }
+
+private:
+    ErrorCode code_;
 };
 
 struct ComponentDescriptor {
@@ -136,12 +148,9 @@ struct ComponentDescriptor {
 };
 
 enum class ProfileId : uint16_t {
-    P29 = 1,
+    P29V1 = 1,
     ZSTD_TU = 2,
-    GRZ = 3,
-    Z3_LONG = 4,
-    Z3_SHARED_LONG = 5,
-    P29V1 = 6,
+    ZSTD_ROUTE = 3,
 };
 
 std::string_view profile_name(ProfileId profile);
@@ -151,30 +160,12 @@ constexpr uint32_t profile_bit(ProfileId profile) {
     return value >= 1 && value <= 32 ? uint32_t{1} << (value - 1) : 0;
 }
 
-constexpr uint32_t kM1SupportedProfiles = profile_bit(ProfileId::P29);
-constexpr uint32_t kKnownProfileMask = profile_bit(ProfileId::P29) |
-                                       profile_bit(ProfileId::ZSTD_TU) |
-                                       profile_bit(ProfileId::GRZ) |
-                                       profile_bit(ProfileId::Z3_LONG) |
-                                       profile_bit(ProfileId::P29V1);
-constexpr uint32_t kDeclaredProfileMask = kKnownProfileMask |
-                                          profile_bit(ProfileId::Z3_SHARED_LONG);
-// Z3_LONG is the operational name of the first route profile. The legacy
-// profile census remains separate; session negotiation admits only codecs
-// built into this executable (GRZ requires the scoped libbsc option).
-constexpr uint32_t kOperationalProfileMask =
-    profile_bit(ProfileId::P29) | profile_bit(ProfileId::ZSTD_TU) |
-    profile_bit(ProfileId::Z3_LONG) | profile_bit(ProfileId::P29V1)
-#if defined(ICECC_P50_WITH_LIBBSC)
-    | profile_bit(ProfileId::GRZ)
-#endif
-    ;
-
-enum class P29RootMode : uint16_t {
-    NotApplicable = 0,
-    RouteHistory = 1,
-    HistoryIndependent = 2,
-};
+constexpr uint32_t kDefaultSupportedProfiles =
+    profile_bit(ProfileId::P29V1) | profile_bit(ProfileId::ZSTD_TU) |
+    profile_bit(ProfileId::ZSTD_ROUTE);
+constexpr uint32_t kKnownProfileMask = kDefaultSupportedProfiles;
+constexpr uint32_t kDeclaredProfileMask = kKnownProfileMask;
+constexpr uint32_t kOperationalProfileMask = kKnownProfileMask;
 
 struct SessionLimits {
     uint32_t max_frame_payload = kInitialMaxFramePayload;
@@ -183,8 +174,8 @@ struct SessionLimits {
 };
 
 struct SessionSelection {
-    uint16_t protocol = kProtocolVersion;
-    uint32_t negotiated_profiles = kM1SupportedProfiles;
+    uint16_t wire_revision = kP50WireRevision;
+    uint32_t negotiated_profiles = kDefaultSupportedProfiles;
     SessionLimits limits{};
     auto operator<=>(const SessionSelection&) const = default;
 };
@@ -200,19 +191,20 @@ struct TxCommit {
 };
 
 struct SessionHello {
-    uint16_t min_protocol = kProtocolVersion;
-    uint16_t max_protocol = kProtocolVersion;
+    uint16_t wire_revision = kP50WireRevision;
     CStoreGuid c_store_guid{};
-    uint32_t supported_profiles = kM1SupportedProfiles;
+    Digest128 system_source_fingerprint{};
+    uint32_t supported_profiles = kDefaultSupportedProfiles;
     SessionLimits limits{};
     auto operator<=>(const SessionHello&) const = default;
 };
 
 struct SessionState {
-    uint16_t selected_protocol = kProtocolVersion;
-    uint32_t negotiated_profiles = kM1SupportedProfiles;
+    uint16_t wire_revision = kP50WireRevision;
+    uint32_t negotiated_profiles = kDefaultSupportedProfiles;
     SessionLimits limits{};
     FStoreGuid f_store_guid{};
+    Digest128 system_source_fingerprint{};
     bool namespace_present = false;
     bool route_present = false;
     HistoryNonce history_nonce{};
@@ -238,10 +230,8 @@ struct TxBegin {
     HistoryNonce history_nonce{};
     RelSeq rel_seq{};
     TuSeq tu_seq{};
-    ProfileId profile = ProfileId::P29;
-    P29RootMode p29_root_mode = P29RootMode::RouteHistory;
+    ProfileId profile = ProfileId::P29V1;
     Digest128 pre_state_digest{};
-    ComponentDescriptor dict{};
     ComponentDescriptor body{};
     uint64_t raw_bytes = 0;
     Digest128 raw_digest{};
@@ -255,15 +245,9 @@ void validate_session_state(const SessionHello& hello,
 
 SessionSelection negotiate_session(
     const SessionHello& hello,
-    uint16_t server_min_protocol = kProtocolVersion,
-    uint16_t server_max_protocol = kProtocolVersion,
-    uint32_t server_profiles = kM1SupportedProfiles,
+    uint16_t server_wire_revision = kP50WireRevision,
+    uint32_t server_profiles = kDefaultSupportedProfiles,
     SessionLimits server_limits = SessionLimits{});
-
-struct DictMessage {
-    std::vector<uint8_t> bytes;
-    auto operator<=>(const DictMessage&) const = default;
-};
 
 struct BodyMessage {
     std::vector<uint8_t> bytes;
@@ -281,8 +265,8 @@ struct FillMessage {
 };
 
 using Message = std::variant<SessionHello, SessionState, HistoryReset, ErrorMessage,
-                             TxBegin, DictMessage, BodyMessage, NeedMessage,
-                             FillMessage, TxCommit>;
+                             TxBegin, BodyMessage, NeedMessage, FillMessage,
+                             TxCommit>;
 
 struct Frame {
     MessageType type = MessageType::ERROR;
@@ -345,11 +329,11 @@ private:
 
 // P29V1 carries its already-framed inner NEED stream through one or more
 // ordinary Protocol-50 NEED messages. The first outer payload prefixes the
-// route-stable flags and exact inner length; continuations are raw bytes.
-constexpr uint64_t kP29V1SystemSourceReuseFlag = uint64_t{1};
+// exact inner length; continuations are raw bytes. System-source reuse is
+// pinned by SESSION_HELLO/SESSION_STATE rather than repeated per transaction.
 
 std::vector<NeedMessage> encode_p29v1_need_messages(
-    uint64_t flags, std::span<const uint8_t> inner_frames, size_t max_payload,
+    std::span<const uint8_t> inner_frames, size_t max_payload,
     uint64_t max_inner_bytes);
 
 class P29V1NeedStreamDecoder {
@@ -357,14 +341,12 @@ public:
     explicit P29V1NeedStreamDecoder(uint64_t max_inner_bytes);
     void push(const NeedMessage& message);
     [[nodiscard]] bool complete() const;
-    [[nodiscard]] uint64_t flags() const;
     [[nodiscard]] const std::vector<uint8_t>& inner_frames() const;
     void finish() const;
 
 private:
     uint64_t max_inner_bytes_ = 0;
     bool started_ = false;
-    uint64_t flags_ = 0;
     uint64_t expected_bytes_ = 0;
     std::vector<uint8_t> inner_;
 };
@@ -416,7 +398,6 @@ ComponentDescriptor describe_component(uint16_t encoding,
                                        std::span<const uint8_t> encoded,
                                        uint64_t decoded_bytes);
 Digest128 compute_transaction_digest(const TxBegin& begin,
-                                     std::span<const uint8_t> dict,
                                      std::span<const uint8_t> body);
 Digest128 compute_post_state_digest(Digest128 pre_state, HistoryNonce history_nonce,
                                     RelSeq rel_seq, TuSeq tu_seq,

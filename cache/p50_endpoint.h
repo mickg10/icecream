@@ -46,16 +46,11 @@ struct EndpointCaps {
     auto operator<=>(const EndpointCaps&) const = default;
 };
 
-/* One immutable prepared source.  ZSTD profiles populate BODY only; P29
-   populates a key-vector DICT, a root-vector/residual BODY, and the exact
-   object records which answer the F-side Need.  Keeping the two
-   representations in one envelope lets the endpoint reducer remain
-   profile-neutral without treating P29 as a compressed ZSTD variant. */
+/* One immutable prepared source. Revision 1 has exactly one BODY component;
+   interactive P29V1 NEED/FILL state remains owned by its route codec. */
 struct PreparedInputEnvelope {
     TxBegin begin;
-    std::vector<uint8_t> dict;
     std::vector<uint8_t> body;
-    std::vector<FillRecord> p29_fill_records;
 };
 using PreparedInputPtr = std::shared_ptr<const PreparedInputEnvelope>;
 
@@ -165,7 +160,8 @@ struct EndpointIoControl {
     // validator AND its production callsite with a wire-valid but
     // unnegotiated begin. The retained prepared record is never mutated.
     // Product callers leave it unset.
-    std::function<TxBegin(const TxBegin&)> outbound_begin_transform;
+    std::function<TxBegin(const TxBegin&, std::span<const uint8_t>)>
+        outbound_begin_transform;
     // Test-only cancellation linearization hook immediately before the first
     // CacheWire write becomes possible.  It receives no endpoint state;
     // product callers leave it unset.  This lets the deletion gate prove the
@@ -248,29 +244,18 @@ public:
                                        PrepareRequestKey request,
                                        std::span<const uint8_t> exact_input);
     std::span<const uint8_t> answer_p29v1_need(
-        PreparedTuHandle handle, uint64_t flags,
-        std::span<const uint8_t> inner_need);
+        PreparedTuHandle handle, std::span<const uint8_t> inner_need);
+    [[nodiscard]] Digest128 p29v1_system_source_fingerprint(
+        PreparedTuHandle handle) const;
+    void pin_p29v1_system_source_reuse(PreparedTuHandle handle,
+                                       Digest128 f_fingerprint);
     void restart_p29v1_transport_retry(PreparedTuHandle handle);
     PreparedInputPtr reset_p29v1_route(PreparedTuHandle handle,
                                        FStoreGuid f_store_guid,
                                        HistoryNonce history_nonce);
-    // Test/simulator-only verification strength for P29 preparation. The
-    // streamed digest remains mandatory in both modes.
-    void set_p29_verification(CAuthority::Verification verification);
     uint64_t retain(PreparedTuHandle handle);
     uint64_t release(PreparedTuHandle handle);
     void commit(PreparedTuHandle handle);
-    // Bind a fresh GRZ authority to the transport's authenticated initial
-    // route cursor before its first prepared TU is admitted.
-    void prime_grz_initial_state(HistoryNonce history_nonce);
-    void prime_grz_initial_state(PreparationRouteKey route,
-                                 HistoryNonce history_nonce);
-    // Rebuild the one uncommitted GRZ TU after an acknowledged F route reset.
-    // Exact-route retries never call this hook, so their committed encoder
-    // state remains available for byte-exact replay.
-    PreparedInputPtr reset_grz_route(PreparedTuHandle handle,
-                                     HistoryNonce history_nonce);
-
     [[nodiscard]] CStoreGuid c_store_guid() const;
     [[nodiscard]] ZstdTuLimits zstd_limits() const;
     [[nodiscard]] bool contains(PreparedTuHandle handle) const;

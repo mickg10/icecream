@@ -148,9 +148,8 @@ static bool wait_for_job_done_and_positive_cache_login(
             job_done = true;
         auto *login = dynamic_cast<LoginMsg *>(message);
         if (login != nullptr && login->cache_endpoint_port == port &&
-            login->cache_protocol == CACHE_WIRE_PROTOCOL_V1 &&
-            login->cache_profile_mask ==
-                (CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE))
+            login->cache_protocol == CACHE_WIRE_REVISION &&
+            login->cache_profile_mask == CACHE_ADVERTISABLE_PROFILE_MASK)
             positive_login = true;
         delete message;
     }
@@ -241,7 +240,7 @@ static P50SourceArmFields source_arm(uint32_t wire_id, uint64_t epoch,
     arm.selected_f_host = "127.0.0.1";
     arm.selected_f_ordinary_port = 0; // filled from Login below
     arm.selected_f_cache_port = cache_port;
-    arm.cache_protocol = CACHE_WIRE_PROTOCOL_V1;
+    arm.cache_protocol = CACHE_WIRE_REVISION;
     arm.cache_profile = CACHE_PROFILE_ZSTD_TU;
     arm.logical_job = wire_id;
     arm.compiler_attempt = nonce;
@@ -261,6 +260,10 @@ static CompileJob *pending_compile(const P50SourceArmFields& arm)
     auto *job = new CompileJob;
     job->setJobID(arm.wire_job_id);
     job->setAssignmentIdentity(arm.assignment_epoch, arm.assignment_nonce);
+    // Protocol-50's F-side wire audit requires the historical compile
+    // identity as well as the P50 InputRecord selector. The scheduler epoch
+    // is a stable nonzero fixture C_GUID; TU_SEQ zero is valid.
+    job->setCompileIdentity(arm.assignment_epoch, 0);
     job->setLanguage(CompileJob::Lang_CXX);
     job->setEnvironmentVersion("__test");
     CompileInputIdentity input;
@@ -273,12 +276,27 @@ static CompileJob *pending_compile(const P50SourceArmFields& arm)
 }
 
 static bool wait_one_job_done(MsgChannel *scheduler, uint32_t expected,
-                              int timeout_msec)
+                              int timeout_msec, int expected_exitcode = -1)
 {
     Msg *message = wait_for_type(scheduler, Msg::JOB_DONE, timeout_msec);
     auto *done = dynamic_cast<JobDoneMsg *>(message);
     const bool match = done != nullptr && done->job_id == expected &&
-                       done->is_from_server();
+                       done->is_from_server() &&
+                       (expected_exitcode < 0 ||
+                        done->exitcode == expected_exitcode);
+    if (!match) {
+        if (done == nullptr) {
+            std::fprintf(stderr,
+                         "diagnostic: expected JobDone job=%u exit=%d; observed none\n",
+                         expected, expected_exitcode);
+        } else {
+            std::fprintf(stderr,
+                         "diagnostic: expected JobDone job=%u exit=%d; "
+                         "observed job=%u exit=%d from_server=%d\n",
+                         expected, expected_exitcode, done->job_id,
+                         done->exitcode, done->is_from_server() ? 1 : 0);
+        }
+    }
     delete message;
     return match;
 }
@@ -370,9 +388,8 @@ static bool run_live_test(const char *iceccd_path, const char *cache_service_pat
     auto *positive = dynamic_cast<LoginMsg *>(positive_message);
     const bool positive_ok = positive != nullptr &&
         positive->cache_endpoint_port == static_cast<uint32_t>(daemon_port) &&
-        positive->cache_protocol == CACHE_WIRE_PROTOCOL_V1 &&
-        positive->cache_profile_mask ==
-            (CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE);
+        positive->cache_protocol == CACHE_WIRE_REVISION &&
+        positive->cache_profile_mask == CACHE_ADVERTISABLE_PROFILE_MASK;
     REQUIRE(positive_ok, "runtime READY sidecar publishes exact F advertisement");
     const uint32_t cache_port = positive_ok ? positive->cache_endpoint_port : 0;
     delete positive_message;
@@ -418,8 +435,8 @@ static bool run_live_test(const char *iceccd_path, const char *cache_service_pat
                 silent_ack->source_budget_msec <= P50SourceArmedFields::MaxSourceBudgetMsec,
             "runtime ACK proves WAIT owner installed with F generation and bounded budget");
     delete silent_ack_message;
-    REQUIRE(wait_one_job_done(scheduler, silent_id, 5000),
-            "silent owner deadline sweep sends one worker JobDone");
+    REQUIRE(wait_one_job_done(scheduler, silent_id, 5000, 149),
+            "silent owner deadline sweep sends one worker JobDone with deadline status");
     REQUIRE(wait_eof(silent, 1000),
             "silent owner is closed after deadline without peer activity");
     REQUIRE(no_job_done(scheduler, silent_id, 300),
@@ -590,9 +607,10 @@ static bool run_live_test(const char *iceccd_path, const char *cache_service_pat
     REQUIRE(no_job_done(scheduler, replay_id, 300),
             "runtime fresh wrapper has no duplicate settlement");
 
-    // Buffered/later CompileFile: the exact same claimant is retained in
-    // WAIT, never enters TOCOMPILE, and is eventually settled by the same
-    // deadline rather than becoming operationally unreachable.
+    // A CompileFile without a preceding successful CACHE_SESSION cannot gain
+    // a record later. The sidecar's authoritative UnknownRecord response is
+    // terminal for this attempt: fail closed immediately, release the claim,
+    // and do not let the older source deadline settle it a second time.
     const uint32_t buffered_id = 7006;
     const uint64_t buffered_nonce = UINT64_C(0x7006000000000001);
     REQUIRE(prepare(buffered_id, buffered_nonce),
@@ -610,10 +628,16 @@ static bool run_live_test(const char *iceccd_path, const char *cache_service_pat
                 dynamic_cast<P50SourceArmedMsg *>(buffered_ack)->f_store_generation != 0,
             "runtime buffered owner ACKs before CompileFile processing with F generation");
     delete buffered_ack;
-    REQUIRE(no_job_done(scheduler, buffered_id, 75),
-            "runtime pending CompileFile is not prematurely terminalized or forked");
-    REQUIRE(wait_one_job_done(scheduler, buffered_id, 3000),
-            "runtime pending CompileFile remains reachable until deadline settlement");
+    Msg *buffered_end = wait_for_type(buffered, Msg::END, 1000);
+    REQUIRE(buffered_end != nullptr,
+            "runtime UnknownRecord sends exactly one terminal End to the wrapper");
+    delete buffered_end;
+    REQUIRE(wait_one_job_done(scheduler, buffered_id, 2000, 146),
+            "runtime UnknownRecord settles immediately with record-authoritative status");
+    REQUIRE(wait_eof(buffered, 1000),
+            "runtime UnknownRecord erases and closes the source owner");
+    REQUIRE(no_job_done(scheduler, buffered_id, 3500),
+            "runtime UnknownRecord has no later deadline settlement");
     delete buffered;
 
     const uint32_t duplicate_compile_id = 7007;
@@ -655,6 +679,13 @@ static bool run_live_test(const char *iceccd_path, const char *cache_service_pat
     }
     delete scheduler;
     ::close(scheduler_listener);
+    if (failures != 0) {
+        std::ifstream daemon_log(log);
+        std::string contents((std::istreambuf_iterator<char>(daemon_log)),
+                             std::istreambuf_iterator<char>());
+        std::fprintf(stderr, "diagnostic: retained daemon log %s\n%s\n",
+                     log.c_str(), contents.c_str());
+    }
     std::filesystem::remove_all(root);
     return failures == 0;
 }

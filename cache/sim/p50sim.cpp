@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
@@ -24,7 +25,12 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #if defined(ICECC_P50SIM_ALLOCATION_COUNTER)
 namespace {
@@ -112,18 +118,66 @@ namespace {
 // P50PreparationAuthority's older level-1 unit-test default.
 constexpr int kCurrentProductCompressionLevel = 3;
 
+class InputFd {
+public:
+    explicit InputFd(const std::string& path)
+        : value_(::open(path.c_str(), O_RDONLY | O_CLOEXEC)) {
+        if (value_ < 0)
+            throw std::system_error(
+                errno, std::generic_category(),
+                "cannot open input manifest payload: " + path);
+    }
+
+    ~InputFd() {
+        if (value_ >= 0)
+            ::close(value_);
+    }
+
+    InputFd(const InputFd&) = delete;
+    InputFd& operator=(const InputFd&) = delete;
+
+    [[nodiscard]] int get() const noexcept { return value_; }
+
+private:
+    int value_ = -1;
+};
+
+void read_bytes(const std::string& path, std::vector<uint8_t>& bytes) {
+    const InputFd input(path);
+    struct stat status {};
+    if (::fstat(input.get(), &status) != 0)
+        throw std::system_error(
+            errno, std::generic_category(),
+            "cannot determine input manifest payload size: " + path);
+    if (status.st_size < 0 ||
+        static_cast<uintmax_t>(status.st_size) >
+            std::numeric_limits<size_t>::max())
+        throw std::length_error("input manifest payload is too large: " + path);
+    bytes.resize(static_cast<size_t>(status.st_size));
+    size_t offset = 0;
+    while (offset < bytes.size()) {
+        const size_t request = std::min(
+            bytes.size() - offset,
+            static_cast<size_t>(std::numeric_limits<ssize_t>::max()));
+        const ssize_t received =
+            ::pread(input.get(), bytes.data() + offset, request,
+                    static_cast<off_t>(offset));
+        if (received < 0) {
+            if (errno == EINTR)
+                continue;
+            throw std::system_error(errno, std::generic_category(),
+                                    "cannot read input manifest payload: " + path);
+        }
+        if (received == 0)
+            throw std::runtime_error(
+                "input manifest payload shortened while reading: " + path);
+        offset += static_cast<size_t>(received);
+    }
+}
+
 std::vector<uint8_t> read_bytes(const std::string& path) {
-    std::ifstream input(path, std::ios::binary);
-    if (!input)
-        throw std::runtime_error("cannot open input manifest payload");
-    input.seekg(0, std::ios::end);
-    const std::streamoff size = input.tellg();
-    if (size < 0)
-        throw std::runtime_error("cannot determine input manifest payload size");
-    input.seekg(0, std::ios::beg);
-    std::vector<uint8_t> bytes(static_cast<size_t>(size));
-    if (!bytes.empty() && !input.read(reinterpret_cast<char*>(bytes.data()), size))
-        throw std::runtime_error("cannot read input manifest payload");
+    std::vector<uint8_t> bytes;
+    read_bytes(path, bytes);
     return bytes;
 }
 
@@ -159,6 +213,7 @@ template <typename Guid> bool parse_guid(std::string_view text, Guid& result) {
 }
 
 void write_summary(const std::string& path, std::span<const uint8_t> input,
+                   const Digest128& raw_digest,
                    const ClientRunResult& client, const ServerRunResult& server,
                    const CompletionLog& completions, const ActionTrace& actions,
                    ProfileId profile) {
@@ -185,7 +240,7 @@ void write_summary(const std::string& path, std::span<const uint8_t> input,
     output << "{\"schema\":\"icecream-p50sim-execution-v1\",\"profile\":\""
            << profile_name(profile) << "\","
            << "\"raw_bytes\":" << input.size() << ","
-           << "\"raw_digest\":\"" << icecc::digest128_hex(icecc::digest128(input))
+           << "\"raw_digest\":\"" << icecc::digest128_hex(raw_digest)
            << "\",\"client_status\":\""
            << (client.status == ClientRunStatus::Committed ? "Committed" :
                client.status == ClientRunStatus::Disconnected ? "Disconnected" :
@@ -236,7 +291,6 @@ struct Arguments {
     std::string batch_assignment_map_3;
     std::string batch_output;
     bool batch_allow_repeated_inputs = false;
-    bool p29_verify_materialization = false;
     bool count_allocations = false;
     std::string p29_fingerprint_cache_directory;
     std::string p29_inner_cf_output;
@@ -253,22 +307,12 @@ ProfileId selected_profile() {
     if (requested == nullptr || *requested == '\0')
         return ProfileId::ZSTD_TU;
     const std::string value(requested);
-    if (value == "P29")
-        return ProfileId::P29;
-    if (value == "P29V1" || value == "P29_V1")
+    if (value == "P29V1")
         return ProfileId::P29V1;
     if (value == "ZSTD_TU")
         return ProfileId::ZSTD_TU;
     if (value == "ZSTD_ROUTE")
-        return ProfileId::Z3_LONG;
-    if (value == "GRZ" || value == "GRZ_RESIDUAL") {
-#if defined(ICECC_P50_WITH_LIBBSC)
-        return ProfileId::GRZ;
-#else
-        throw std::invalid_argument(
-            "GRZ_RESIDUAL requires a simulator built with --with-libbsc");
-#endif
-    }
+        return ProfileId::ZSTD_ROUTE;
     throw std::invalid_argument("unsupported ICECC_P50_PROFILE: " + value);
 }
 
@@ -276,22 +320,13 @@ std::string_view selected_profile_label() {
     const char* requested = std::getenv("ICECC_P50_PROFILE");
     if (requested == nullptr || *requested == '\0')
         return "ZSTD_TU";
-    const std::string_view value(requested);
-    if (value == "GRZ" || value == "GRZ_RESIDUAL")
-        return "GRZ_RESIDUAL";
-    if (value == "P29_V1")
-        return "P29V1";
-    return value;
+    return requested;
 }
 
 Arguments parse(int argc, char** argv) {
     Arguments result;
     for (int index = 1; index < argc; ++index) {
         const std::string option = argv[index];
-        if (option == "--p29-verify-materialization") {
-            result.p29_verify_materialization = true;
-            continue;
-        }
         if (option == "--count-allocations") {
             result.count_allocations = true;
             continue;
@@ -390,7 +425,6 @@ Arguments parse(int argc, char** argv) {
             throw std::invalid_argument("codec mode requires ZSTD_TU or ZSTD_ROUTE");
         if (result.input.empty() || result.codec_output.empty() || batch ||
             !result.actions.empty() || !result.summary.empty() ||
-            result.p29_verify_materialization ||
             result.count_allocations ||
             !result.p29_fingerprint_cache_directory.empty())
             throw std::invalid_argument("codec mode requires --input/--codec-output only");
@@ -751,6 +785,7 @@ void write_batch_row(std::ostream& output, std::string_view segment,
                      std::string_view relation_id, size_t index,
                      size_t expected_tu_seq,
                      const std::vector<uint8_t>& input,
+                     const Digest128& raw_digest,
                      const ClientRunResult& client, const ServerRunResult& server,
                      const CompletionLog& completions, const ActionTrace& actions,
                      const P50ClientEndpoint& client_endpoint,
@@ -766,7 +801,6 @@ void write_batch_row(std::ostream& output, std::string_view segment,
                      std::optional<uint64_t> p29v1_codec_allocations,
                      std::optional<std::array<uint64_t, 9>>
                          p29v1_codec_allocation_entries) {
-    const Digest128 raw_digest = icecc::digest128(input);
     Digest128 tx_digest{};
     Digest128 begin_tx_digest{};
     Digest128 action_raw_digest{};
@@ -893,7 +927,7 @@ void write_batch_row(std::ostream& output, std::string_view segment,
         }
         output << '}';
     }
-    if (profile == ProfileId::Z3_LONG) {
+    if (profile == ProfileId::ZSTD_ROUTE) {
         output << ",\"committed_raw_prefix_before_descriptor\":{\"schema\":\"icecream-s8-route-prefix-descriptor-v1\",\"bytes\":"
                << prefix_before_bytes << ",\"digest128\":\""
                << icecc::digest128_hex(prefix_before_digest)
@@ -913,12 +947,7 @@ void run_batch(const Arguments& arguments) {
                                            std::memory_order_relaxed);
 #endif
     const bool retains_relationship_state =
-        profile == ProfileId::Z3_LONG || profile == ProfileId::P29 ||
-        profile == ProfileId::P29V1
-#if defined(ICECC_P50_WITH_LIBBSC)
-        || profile == ProfileId::GRZ
-#endif
-        ;
+        profile == ProfileId::ZSTD_ROUTE || profile == ProfileId::P29V1;
     const std::vector<std::string> first = read_batch_manifest(
         arguments.batch_manifest, arguments.batch_allow_repeated_inputs);
     size_t relationship_count = 0;
@@ -964,12 +993,6 @@ void run_batch(const Arguments& arguments) {
     std::optional<P29V1InnerTrace> inner_trace;
     if (!arguments.p29_inner_cf_output.empty())
         inner_trace.emplace(caps.zstd.max_raw_bytes);
-    if (arguments.p29_verify_materialization) {
-        if (profile != ProfileId::P29 && profile != ProfileId::P29V1)
-            throw std::invalid_argument(
-                "--p29-verify-materialization requires a P29 profile");
-        authority->set_p29_verification(CAuthority::Verification::FullMaterialization);
-    }
     asio::io_context context;
     tcp::acceptor acceptor(context,
                            tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0));
@@ -999,12 +1022,14 @@ void run_batch(const Arguments& arguments) {
     uint64_t global_tu_seq = 0;
     const auto process = [&](std::string_view segment, const std::vector<std::string>& manifest,
                              const std::vector<size_t>& assignments) {
+        std::vector<uint8_t> input;
         for (size_t index = 0; index < manifest.size(); ++index) {
             BatchRelation& relation = relations[assignments[index]];
             const std::string relation_id =
                 "c1f" + std::to_string(relationship_count) + "-r" +
                 (assignments[index] < 10 ? "0" : "") + std::to_string(assignments[index]);
-            const std::vector<uint8_t> input = read_bytes(manifest[index]);
+            read_bytes(manifest[index], input);
+            const Digest128 raw_digest = icecc::digest128(input);
             relation.actions.clear();
             relation.completions.clear();
             const std::optional<Digest128> expected_before =
@@ -1122,7 +1147,8 @@ void run_batch(const Arguments& arguments) {
             }
             const size_t prefix_after_bytes = authority->route_history_bytes(relation.route);
             const Digest128 prefix_after_digest = authority->route_history_digest(relation.route);
-            write_batch_row(output, segment, relation_id, index, expected_tu_seq, input,
+            write_batch_row(output, segment, relation_id, index,
+                            expected_tu_seq, input, raw_digest,
                             client_result, server_result, relation.completions,
                             relation.actions, *relation.client, expected_before,
                             prefix_before_bytes, prefix_before_digest,
@@ -1138,7 +1164,7 @@ void run_batch(const Arguments& arguments) {
 
             for (const ActionRecord& action : relation.actions.records()) {
                 if (action.action == ActionType::COMMIT_ACCEPTED &&
-                    action.raw_digest == icecc::digest128(input)) {
+                    action.raw_digest == raw_digest) {
                     if (retains_relationship_state)
                         relation.last_state_digest = action.state_digest;
                     break;
@@ -1225,6 +1251,7 @@ int main(int argc, char** argv) {
         const std::vector<uint8_t> input = warm
             ? read_bytes(arguments.measured_input)
             : read_bytes(arguments.input);
+        const Digest128 raw_digest = icecc::digest128(input);
 
         ActionTrace actions(1024);
         CompletionLog completions(4096);
@@ -1235,14 +1262,6 @@ int main(int argc, char** argv) {
             arguments.c_store_guid, caps.zstd,
             PreparationAuthorityLimits{}, kCurrentProductCompressionLevel,
             caps.profile);
-        if (arguments.p29_verify_materialization) {
-            if (caps.profile != ProfileId::P29 &&
-                caps.profile != ProfileId::P29V1)
-                throw std::invalid_argument(
-                    "--p29-verify-materialization requires a P29 profile");
-            authority->set_p29_verification(
-                CAuthority::Verification::FullMaterialization);
-        }
         const std::vector<uint8_t> prewarm_input = warm
             ? read_bytes(arguments.prewarm_input) : std::vector<uint8_t>{};
 
@@ -1253,9 +1272,8 @@ int main(int argc, char** argv) {
                                  &completions, &actions, std::move(config));
         P50ClientEndpoint client(authority, caps, arguments.history_nonce, &completions, &actions);
 
-        // The endpoint binds the GRZ route's initial state.  Prepare only
-        // after that binding so warm execution cannot create a stale legacy
-        // route before the relationship endpoint exists.
+        // Prepare only after the relationship endpoint exists so warm
+        // execution cannot create stale route state.
         const PreparedTuHandle prewarm_prepared = warm
             ? authority->prepare(PrepareRequestKey{1, 1}, prewarm_input)
             : PreparedTuHandle{};
@@ -1320,7 +1338,8 @@ int main(int argc, char** argv) {
                                std::span<const ActionRecord>(actions.records().data() + measured_begin,
                                                              measured_end - measured_begin));
         }
-        write_summary(arguments.summary, input, client_result, server_result,
+        write_summary(arguments.summary, input, raw_digest,
+                      client_result, server_result,
                       completions, actions, caps.profile);
         return 0;
     } catch (const std::exception& error) {

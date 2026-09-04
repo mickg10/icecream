@@ -12,18 +12,12 @@ namespace icecc::p50 {
 
 std::string_view profile_name(ProfileId profile) {
     switch (profile) {
-    case ProfileId::P29:
-        return "p29";
-    case ProfileId::ZSTD_TU:
-        return "zstd_tu";
-    case ProfileId::GRZ:
-        return "grz";
-    case ProfileId::Z3_LONG:
-        return "z3_long";
-    case ProfileId::Z3_SHARED_LONG:
-        return "z3_shared_long";
     case ProfileId::P29V1:
         return "p29_v1";
+    case ProfileId::ZSTD_TU:
+        return "zstd_tu";
+    case ProfileId::ZSTD_ROUTE:
+        return "zstd_route";
     }
     return "unknown";
 }
@@ -43,18 +37,8 @@ bool known_message_type(MessageType type) {
 }
 
 bool known_profile(ProfileId profile) {
-    return profile == ProfileId::P29 || profile == ProfileId::ZSTD_TU ||
-           profile == ProfileId::GRZ || profile == ProfileId::Z3_LONG ||
-           profile == ProfileId::P29V1;
-}
-
-bool valid_root_mode(ProfileId profile, P29RootMode mode) {
-    if (profile == ProfileId::P29)
-        return mode == P29RootMode::RouteHistory ||
-               mode == P29RootMode::HistoryIndependent;
-    if (profile == ProfileId::P29V1)
-        return mode == P29RootMode::RouteHistory;
-    return known_profile(profile) && mode == P29RootMode::NotApplicable;
+    return profile == ProfileId::P29V1 || profile == ProfileId::ZSTD_TU ||
+           profile == ProfileId::ZSTD_ROUTE;
 }
 
 void validate_limits(const SessionLimits& limits) {
@@ -67,8 +51,8 @@ void validate_limits(const SessionLimits& limits) {
 }
 
 void validate_hello(const SessionHello& hello) {
-    if (hello.min_protocol == 0 || hello.min_protocol > hello.max_protocol)
-        throw std::invalid_argument("session protocol range is invalid");
+    if (hello.wire_revision == 0)
+        throw std::invalid_argument("SESSION_HELLO wire revision zero is reserved");
     if (hello.c_store_guid == CStoreGuid{})
         throw std::invalid_argument("SESSION_HELLO C_STORE_GUID zero is reserved");
     if (hello.supported_profiles == 0)
@@ -84,15 +68,18 @@ void validate_commit(const TxCommit& commit) {
 void validate_tx_begin_intrinsic(const TxBegin& begin) {
     if (begin.history_nonce.value == 0)
         throw std::invalid_argument("TX_BEGIN HISTORY_NONCE zero is reserved");
-    if (!valid_root_mode(begin.profile, begin.p29_root_mode))
-        throw std::invalid_argument("TX_BEGIN profile/root mode is invalid");
+    if (!known_profile(begin.profile))
+        throw std::invalid_argument("TX_BEGIN profile is invalid");
 }
 
 void validate_session_state_intrinsic(const SessionState& state) {
-    if (state.selected_protocol != kProtocolVersion || state.negotiated_profiles == 0 ||
+    if (state.wire_revision == 0 || state.negotiated_profiles == 0)
+        throw std::invalid_argument(
+            "SESSION_STATE wire revision and profile mask must be nonzero");
+    if (state.wire_revision == kP50WireRevision &&
         (state.negotiated_profiles & ~kOperationalProfileMask) != 0)
         throw std::invalid_argument(
-            "SESSION_STATE selected an unimplemented protocol or profile mask");
+            "SESSION_STATE selected an unimplemented profile mask");
     if (state.f_store_guid == FStoreGuid{})
         throw std::invalid_argument("SESSION_STATE F_STORE_GUID zero is reserved");
     validate_limits(state.limits);
@@ -322,11 +309,10 @@ void validate_session_state(const SessionHello& hello,
                             const SessionState& received_state) {
     validate_hello(hello);
     validate_session_state_intrinsic(received_state);
-    if (received_state.selected_protocol != kProtocolVersion ||
-        hello.min_protocol > kProtocolVersion ||
-        hello.max_protocol < kProtocolVersion)
-        throw std::invalid_argument(
-            "SESSION_STATE did not select implemented Protocol 50");
+    if (received_state.wire_revision != hello.wire_revision)
+        throw ProtocolError(
+            ErrorCode::WIRE_REVISION_MISMATCH,
+            "SESSION_STATE wire revision differs from SESSION_HELLO");
     if ((received_state.negotiated_profiles & hello.supported_profiles) !=
         received_state.negotiated_profiles)
         throw std::invalid_argument(
@@ -342,25 +328,23 @@ void validate_session_state(const SessionHello& hello,
 }
 
 SessionSelection negotiate_session(const SessionHello& hello,
-                                   uint16_t server_min_protocol,
-                                   uint16_t server_max_protocol,
+                                   uint16_t server_wire_revision,
                                    uint32_t server_profiles,
                                    SessionLimits server_limits) {
     validate_hello(hello);
-    if (server_min_protocol == 0 || server_min_protocol > server_max_protocol)
-        throw std::invalid_argument("session protocol range is reversed");
+    if (server_wire_revision == 0)
+        throw std::invalid_argument("server wire revision zero is reserved");
     validate_limits(server_limits);
-    if (hello.min_protocol > kProtocolVersion ||
-        hello.max_protocol < kProtocolVersion ||
-        server_min_protocol > kProtocolVersion ||
-        server_max_protocol < kProtocolVersion)
-        throw std::invalid_argument(
-            "peers do not both implement Protocol 50");
+    if (hello.wire_revision != server_wire_revision ||
+        server_wire_revision != kP50WireRevision)
+        throw ProtocolError(
+            ErrorCode::WIRE_REVISION_MISMATCH,
+            "CacheWire revisions do not match");
 
     const uint32_t common = hello.supported_profiles & server_profiles &
                             kOperationalProfileMask;
     if (common == 0) throw std::invalid_argument("session profiles do not overlap");
-    return {kProtocolVersion, common,
+    return {kP50WireRevision, common,
             {std::min(hello.limits.max_frame_payload,
                       server_limits.max_frame_payload),
              std::min(hello.limits.max_fill_record_bytes,
@@ -440,7 +424,6 @@ MessageType message_type(const Message& message) {
         if constexpr (std::is_same_v<T, HistoryReset>) return MessageType::HISTORY_RESET;
         if constexpr (std::is_same_v<T, ErrorMessage>) return MessageType::ERROR;
         if constexpr (std::is_same_v<T, TxBegin>) return MessageType::TX_BEGIN;
-        if constexpr (std::is_same_v<T, DictMessage>) return MessageType::DICT;
         if constexpr (std::is_same_v<T, BodyMessage>) return MessageType::BODY;
         if constexpr (std::is_same_v<T, NeedMessage>) return MessageType::NEED;
         if constexpr (std::is_same_v<T, FillMessage>) return MessageType::FILL;
@@ -454,19 +437,20 @@ std::vector<uint8_t> encode_payload(const Message& message) {
         using T = std::decay_t<decltype(value)>;
         if constexpr (std::is_same_v<T, SessionHello>) {
             validate_hello(value);
-            out.u16(value.min_protocol);
-            out.u16(value.max_protocol);
+            out.u16(value.wire_revision);
             out.id(value.c_store_guid);
+            out.digest(value.system_source_fingerprint);
             out.u32(value.supported_profiles);
             out.u32(value.limits.max_frame_payload);
             out.u64(value.limits.max_fill_record_bytes);
         } else if constexpr (std::is_same_v<T, SessionState>) {
             validate_session_state_intrinsic(value);
-            out.u16(value.selected_protocol);
+            out.u16(value.wire_revision);
             out.u32(value.negotiated_profiles);
             out.u32(value.limits.max_frame_payload);
             out.u64(value.limits.max_fill_record_bytes);
             out.id(value.f_store_guid);
+            out.digest(value.system_source_fingerprint);
             out.u8((value.namespace_present ? 1 : 0) |
                    (value.route_present ? 2 : 0) |
                    (value.last_commit ? 4 : 0));
@@ -488,15 +472,12 @@ std::vector<uint8_t> encode_payload(const Message& message) {
             out.u64(value.rel_seq.value);
             out.u64(value.tu_seq.value);
             out.u16(static_cast<uint16_t>(value.profile));
-            out.u16(static_cast<uint16_t>(value.p29_root_mode));
             out.digest(value.pre_state_digest);
-            encode_descriptor(out, value.dict);
             encode_descriptor(out, value.body);
             out.u64(value.raw_bytes);
             out.digest(value.raw_digest);
             out.digest(value.transaction_digest);
-        } else if constexpr (std::is_same_v<T, DictMessage> ||
-                             std::is_same_v<T, BodyMessage> ||
+        } else if constexpr (std::is_same_v<T, BodyMessage> ||
                              std::is_same_v<T, NeedMessage> ||
                              std::is_same_v<T, FillMessage>) {
             out.bytes(value.bytes);
@@ -513,9 +494,9 @@ Message decode_payload(MessageType type, std::span<const uint8_t> payload) {
     switch (type) {
     case MessageType::SESSION_HELLO: {
         SessionHello value;
-        value.min_protocol = in.u16();
-        value.max_protocol = in.u16();
+        value.wire_revision = in.u16();
         value.c_store_guid = in.id();
+        value.system_source_fingerprint = in.digest();
         value.supported_profiles = in.u32();
         value.limits.max_frame_payload = in.u32();
         value.limits.max_fill_record_bytes = in.u64();
@@ -525,11 +506,12 @@ Message decode_payload(MessageType type, std::span<const uint8_t> payload) {
     }
     case MessageType::SESSION_STATE: {
         SessionState value;
-        value.selected_protocol = in.u16();
+        value.wire_revision = in.u16();
         value.negotiated_profiles = in.u32();
         value.limits.max_frame_payload = in.u32();
         value.limits.max_fill_record_bytes = in.u64();
         value.f_store_guid = in.id();
+        value.system_source_fingerprint = in.digest();
         const uint8_t flags = in.u8();
         if (flags & ~uint8_t{7}) throw std::invalid_argument("SESSION_STATE flags are invalid");
         value.namespace_present = flags & 1;
@@ -564,9 +546,7 @@ Message decode_payload(MessageType type, std::span<const uint8_t> payload) {
         value.rel_seq.value = in.u64();
         value.tu_seq.value = in.u64();
         value.profile = static_cast<ProfileId>(in.u16());
-        value.p29_root_mode = static_cast<P29RootMode>(in.u16());
         value.pre_state_digest = in.digest();
-        value.dict = decode_descriptor(in);
         value.body = decode_descriptor(in);
         value.raw_bytes = in.u64();
         value.raw_digest = in.digest();
@@ -575,7 +555,6 @@ Message decode_payload(MessageType type, std::span<const uint8_t> payload) {
         validate_tx_begin_intrinsic(value);
         return value;
     }
-    case MessageType::DICT: return DictMessage{in.bytes(in.remaining())};
     case MessageType::BODY: return BodyMessage{in.bytes(in.remaining())};
     case MessageType::NEED: return NeedMessage{in.bytes(in.remaining())};
     case MessageType::FILL: return FillMessage{in.bytes(in.remaining())};
@@ -870,16 +849,13 @@ void append_p29v1_continuation(std::vector<uint8_t>& destination,
 } // namespace
 
 std::vector<NeedMessage> encode_p29v1_need_messages(
-    uint64_t flags, std::span<const uint8_t> inner_frames, size_t max_payload,
+    std::span<const uint8_t> inner_frames, size_t max_payload,
     uint64_t max_inner_bytes) {
-    if ((flags & ~kP29V1SystemSourceReuseFlag) != 0)
-        throw std::invalid_argument("P29V1 NEED flags are invalid");
     if (inner_frames.size() > max_inner_bytes)
         throw std::length_error("P29V1 NEED inner stream exceeds its bound");
     validate_p29v1_need_inner(inner_frames);
     return encode_p29v1_fragments<NeedMessage>(
-        inner_frames, max_payload, 16, [=](Encoder& first) {
-            first.u64(flags);
+        inner_frames, max_payload, 8, [=](Encoder& first) {
             first.u64(inner_frames.size());
         });
 }
@@ -896,14 +872,11 @@ void P29V1NeedStreamDecoder::push(const NeedMessage& message) {
     size_t offset = 0;
     if (!started_) {
         Decoder header(message.bytes);
-        flags_ = header.u64();
         expected_bytes_ = header.u64();
-        if ((flags_ & ~kP29V1SystemSourceReuseFlag) != 0)
-            throw std::invalid_argument("P29V1 NEED flags are invalid");
         if (expected_bytes_ > max_inner_bytes_ || expected_bytes_ > inner_.max_size())
             throw std::length_error("P29V1 NEED declaration exceeds its bound");
         inner_.reserve(static_cast<size_t>(expected_bytes_));
-        offset = 16;
+        offset = 8;
         started_ = true;
     }
     append_p29v1_continuation(
@@ -913,11 +886,6 @@ void P29V1NeedStreamDecoder::push(const NeedMessage& message) {
 
 bool P29V1NeedStreamDecoder::complete() const {
     return started_ && inner_.size() == expected_bytes_;
-}
-
-uint64_t P29V1NeedStreamDecoder::flags() const {
-    (void)inner_frames();
-    return flags_;
 }
 
 const std::vector<uint8_t>& P29V1NeedStreamDecoder::inner_frames() const {
@@ -1066,35 +1034,22 @@ ComponentDescriptor describe_component(uint16_t encoding,
 }
 
 Digest128 compute_transaction_digest(const TxBegin& begin,
-                                     std::span<const uint8_t> dict,
                                      std::span<const uint8_t> body) {
-    if (!valid_root_mode(begin.profile, begin.p29_root_mode))
-        throw std::invalid_argument("transaction profile/root mode is invalid");
-    const bool fingerprint_dict =
-        begin.profile == ProfileId::P29V1 &&
-        begin.dict.encoding == kP29V1FingerprintDictEncoding &&
-        begin.dict.encoded_bytes == 0 && begin.dict.decoded_bytes == 0 &&
-        dict.empty();
-    if ((!fingerprint_dict &&
-         (dict.size() != begin.dict.encoded_bytes ||
-          digest128(dict) != begin.dict.digest)) ||
-        body.size() != begin.body.encoded_bytes ||
+    if (!known_profile(begin.profile))
+        throw std::invalid_argument("transaction profile is invalid");
+    if (body.size() != begin.body.encoded_bytes ||
         digest128(body) != begin.body.digest)
         throw std::invalid_argument("transaction component does not match its descriptor");
     Digest128Builder out;
-    out.append("ICECC-P50-TX-V1");
+    out.append("ICECC-P50-TX-R1");
     out.append_u64(begin.history_nonce.value);
     out.append_u64(begin.rel_seq.value);
     out.append_u64(begin.tu_seq.value);
     out.append_u16(static_cast<uint16_t>(begin.profile));
-    out.append_u16(static_cast<uint16_t>(begin.p29_root_mode));
     append_digest_field(out, begin.pre_state_digest);
-    append_descriptor(out, begin.dict);
     append_descriptor(out, begin.body);
     out.append_u64(begin.raw_bytes);
     append_digest_field(out, begin.raw_digest);
-    out.append_u64(dict.size());
-    out.append(dict);
     out.append_u64(body.size());
     out.append(body);
     return out.finish();

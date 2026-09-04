@@ -41,8 +41,9 @@ require "$makefile" 'libp50readyadvertisement.a'
 require "$makefile" 'libp50sidecarsupervisor.a'
 require "$runtime_test" 'initial Login is canonical cache absence before ConfCS/READY'
 require "$runtime_test" 'LOGIN_ATTEMPT cannot dispatch cache while scheduler is inactive'
-require "$runtime_test" 'one-shot handoff publishes withdrawal first'
-require "$runtime_test" 'fresh authenticated relationship republishes presence second'
+require "$runtime_test" 'source-arm owner is acknowledged before CACHE_SESSION'
+require "$runtime_test" 'authenticated one-shot handoff keeps the adopted session live'
+require "$runtime_test" 'accepted handoff keeps the READY advertisement stable'
 require "$runtime_test" 'orderly shutdown withdraws before scheduler teardown'
 
 if grep -F 'apply_inert_cache_advertisement' "$daemon" >/dev/null \

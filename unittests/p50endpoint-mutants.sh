@@ -126,7 +126,7 @@ compile_mutant() {
         -Wno-mismatched-new-delete -DHAVE_CONFIG_H \
         -DICECC_P50_ENDPOINT_TEST_HOOKS \
         ${ICECC_TEST_CPPFLAGS:-} ${ICECC_TEST_BOOST_CPPFLAGS:-} \
-        ${ICECC_TEST_LIBZSTD_CFLAGS:-} ${ICECC_TEST_LIBBSC_CFLAGS:-} \
+        ${ICECC_TEST_LIBZSTD_CFLAGS:-} \
         ${ICECC_TEST_XXHASH_CFLAGS:-} \
         -I"$top_build" -I"$src" -I"$src/cache" -I"$src/services" \
         -c "$source" -o "$object"
@@ -136,7 +136,7 @@ compile_mutant() {
         -pthread -o "$output" "$test_object" "$object" \
         "$run_cancel_object" $input_record_object "$adopted_archive" "$local_archive" \
         "$protocol_archive" "$services_la" \
-        ${ICECC_TEST_LIBZSTD_LIBS:-} ${ICECC_TEST_LIBBSC_LIBS:-} \
+        ${ICECC_TEST_LIBZSTD_LIBS:-} \
         ${ICECC_TEST_XXHASH_LIBS:-} ${ICECC_TEST_LIBCAP_NG_LIBS:-} \
         ${ICECC_TEST_BOOST_LIBS:-} ${ICECC_TEST_LIBS:-} >/dev/null
 }

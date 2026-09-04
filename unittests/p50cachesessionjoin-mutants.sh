@@ -20,14 +20,14 @@ compile_mutant() {
     # shellcheck disable=SC2086
     "$libtool" --tag=CXX --mode=link "$cxx" "$standard" -O0 -g \
         -Wall -Wextra -Wpedantic -Werror ${ICECC_TEST_CPPFLAGS:-} \
-        ${ICECC_TEST_LIBBSC_CFLAGS:-} ${ICECC_TEST_LIBCAP_NG_CFLAGS:-} \
+        ${ICECC_TEST_LIBCAP_NG_CFLAGS:-} \
         -I"$src" -I"$src/cache" -I"$src/services" -I"$top_build" \
         "$src/unittests/p50_cache_session_join_test.cpp" "$mutant" \
         "$src/daemon/connection_provenance.cpp" \
         "$top_build/cache/libprotocol50.a" \
         "$top_build/services/libicecc.la" \
         ${ICECC_TEST_LDFLAGS:-} ${ICECC_TEST_LIBZSTD_LIBS:-} \
-        ${ICECC_TEST_LIBBSC_LIBS:-} ${ICECC_TEST_XXHASH_LIBS:-} \
+        ${ICECC_TEST_XXHASH_LIBS:-} \
         ${ICECC_TEST_LIBCAP_NG_LIBS:-} -pthread -o "$output" >/dev/null
 }
 
@@ -39,7 +39,7 @@ compile_wire_mutant() {
     # shellcheck disable=SC2086
     "$libtool" --tag=CXX --mode=link "$cxx" "$standard" -O0 -g \
         -Wall -Wextra -Wpedantic -Werror ${ICECC_TEST_CPPFLAGS:-} \
-        ${ICECC_TEST_LIBBSC_CFLAGS:-} ${ICECC_TEST_LIBCAP_NG_CFLAGS:-} \
+        ${ICECC_TEST_LIBCAP_NG_CFLAGS:-} \
         -I"$src" -I"$src/cache" -I"$src/services" -I"$top_build" \
         "$src/unittests/p50_cache_session_join_test.cpp" \
         "$src/cache/p50_cache_session_join.cpp" "$mutant" \
@@ -47,7 +47,7 @@ compile_wire_mutant() {
         "$top_build/cache/libprotocol50.a" \
         "$top_build/services/libicecc.la" \
         ${ICECC_TEST_LDFLAGS:-} ${ICECC_TEST_LIBZSTD_LIBS:-} \
-        ${ICECC_TEST_LIBBSC_LIBS:-} ${ICECC_TEST_XXHASH_LIBS:-} \
+        ${ICECC_TEST_XXHASH_LIBS:-} \
         ${ICECC_TEST_LIBCAP_NG_LIBS:-} -pthread -o "$output" >/dev/null
 }
 

@@ -40,41 +40,17 @@ if test "$suite" = C1F20/40 && test -z "$topology"; then
     echo "FAIL: C1F20/40 requires an authenticated topology" >&2
     exit 1
 fi
-grz_product_configured() {
-    # GRZ is a product capability, not merely a selector spelling.  Require
-    # both configure's feature definition and the generated cache product
-    # makefile's libbsc compile/link inputs before starting the live gate.
-    test -f "$build/config.h" || return 1
-    grep -F '#define ICECC_P50_WITH_LIBBSC 1' "$build/config.h" >/dev/null \
-        || return 1
-    test -f "$build/cache/Makefile" || return 1
-    grep -E '^LIBBSC_CFLAGS = .*ICECC_P50_WITH_LIBBSC' \
-        "$build/cache/Makefile" >/dev/null || return 1
-    grep -E '^LIBBSC_LIBS = .*(libbsc\.a|-lbsc)' \
-        "$build/cache/Makefile" >/dev/null || return 1
-}
 cache_enabled=1
 case "$profile_marker" in
     RAW_II)
         cache_enabled=0
         profile_advertisement=none
         ;;
-    P29) profile_advertisement=p29 ;;
+    P29V1) profile_advertisement=p29v1 ;;
     ZSTD_TU) profile_advertisement=zstd_tu ;;
-    ZSTD_ROUTE) profile_advertisement=z3_long ;;
-    GRZ|GRZ_RESIDUAL)
-        grz_product_configured || {
-            echo "FAIL: ICECC_P50_PROFILE=$profile_marker requires a product build configured with libbsc" >&2
-            exit 1
-        }
-        # The client emits the canonical production profile marker for both
-        # accepted environment aliases; the scheduler advertises its wire
-        # capability spelling separately.
-        profile_marker=GRZ_RESIDUAL
-        profile_advertisement=grz
-        ;;
+    ZSTD_ROUTE) profile_advertisement=zstd_route ;;
     *)
-        echo "FAIL: ICECC_P50_PROFILE must be P29, ZSTD_TU, ZSTD_ROUTE, GRZ, or GRZ_RESIDUAL" >&2
+        echo "FAIL: ICECC_P50_PROFILE must be P29V1, ZSTD_TU, ZSTD_ROUTE, or RAW_II" >&2
         exit 1
         ;;
 esac
@@ -154,7 +130,11 @@ if test -n "${ICECC_P50_C1F1_WORKDIR:-}"; then
         mkdir -p "$work"
     fi
 else
-    work=$(CDPATH= cd -- "$(mktemp -d "${TMPDIR:-/tmp}/p50compilee2e.XXXXXX")" && pwd)
+    # The sidecar's attempt leaf adds 43 characters and cache.sock adds 11;
+    # a long build-system TMPDIR can therefore exceed sockaddr_un.sun_path
+    # before the test starts. Keep this real-process socket namespace short;
+    # large farm corpora/build outputs use their separately managed scratch.
+    work=$(CDPATH= cd -- "$(mktemp -d /tmp/p5e.XXXXXX)" && pwd)
 fi
 # The scheduler changes to its configured service account before opening the
 # requested log.  Keep the test root traversable and pre-create only that log

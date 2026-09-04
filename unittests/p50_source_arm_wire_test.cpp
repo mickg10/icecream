@@ -107,7 +107,7 @@ P50SourceArmFields arm()
     value.selected_f_host = "worker.example";
     value.selected_f_ordinary_port = 10245;
     value.selected_f_cache_port = 10246;
-    value.cache_protocol = CACHE_WIRE_PROTOCOL_V1;
+    value.cache_protocol = CACHE_WIRE_REVISION;
     value.cache_profile = CACHE_PROFILE_ZSTD_TU;
     value.logical_job = 19;
     value.compiler_attempt = UINT64_C(0x2122232425262728);
@@ -194,9 +194,9 @@ void test_roundtrip_and_exact_echo()
     REQUIRE(request_wire == hex_fixture(
                 "0000008750f000100000000701020304050607081112131415161718"
                 "0000000f776f726b65722e6578616d706c650000002805000028060000"
-                "003200000002000000000000001321222324252627283132333435363738"
+                "000100000002000000000000001321222324252627283132333435363738"
                 "0000000000000001404142434445464748494a4b4c4d4e4f515253545556"
-                "575800000001"
+                "575800000002"
                 "61626364656667687172737475767778"),
             "source-arm stable Protocol-50 fixture bytes remain unchanged");
     Msg *request_base = decode_frame(request_wire);
@@ -209,9 +209,9 @@ void test_roundtrip_and_exact_echo()
     REQUIRE(reply_wire == hex_fixture(
                 "000000e350f000110000000701020304050607081112131415161718"
                 "0000000f776f726b65722e6578616d706c650000002805000028060000"
-                "003200000002000000000000001321222324252627283132333435363738"
+                "000100000002000000000000001321222324252627283132333435363738"
                 "0000000000000001404142434445464748494a4b4c4d4e4f515253545556"
-                "575800000001"
+                "575800000002"
                 "616263646566676871727374757677788182838485868788919293949596"
                 "9798999a9b9c9d9e9fa0d0d1d2d3d4d5d6d7d8d9dadbdcdddedf"
                 "0000000000000001"
@@ -241,35 +241,19 @@ void test_roundtrip_and_exact_echo()
     REQUIRE(!make_pair(PROTOCOL_VERSION).left->send_msg(
                 P50SourceArmMsg(route_mode_mismatch)),
             "source-arm rejects a ZSTD_ROUTE/TU mode mismatch");
-    static_assert(P50_SOURCE_MODE_GRZ_RESIDUAL != P50_SOURCE_MODE_P29);
-    P50SourceArmFields p29 = request.arm;
-    p29.cache_profile = CACHE_PROFILE_P29;
-    p29.source_mode = P50_SOURCE_MODE_P29;
-    REQUIRE(make_pair(PROTOCOL_VERSION).left->send_msg(P50SourceArmMsg(p29)),
-            "source-arm accepts the exact P29 profile/mode pair");
-    P50SourceArmFields p29_mode_mismatch = p29;
-    p29_mode_mismatch.source_mode = P50_SOURCE_MODE_GRZ_RESIDUAL;
-    REQUIRE(!make_pair(PROTOCOL_VERSION).left->send_msg(
-                P50SourceArmMsg(p29_mode_mismatch)),
-            "source-arm rejects a P29/GRZ mode mismatch");
-    static_assert(P50_SOURCE_MODE_P29V1 != P50_SOURCE_MODE_P29);
+    static_assert(P50_SOURCE_MODE_P29V1 == 1);
+    static_assert(P50_SOURCE_MODE_ZSTD_TU == 2);
+    static_assert(P50_SOURCE_MODE_ZSTD_ROUTE == 3);
     P50SourceArmFields p29v1 = request.arm;
     p29v1.cache_profile = CACHE_PROFILE_P29V1;
     p29v1.source_mode = P50_SOURCE_MODE_P29V1;
     REQUIRE(make_pair(PROTOCOL_VERSION).left->send_msg(P50SourceArmMsg(p29v1)),
             "source-arm accepts the exact P29V1 profile/mode pair");
     P50SourceArmFields p29v1_mode_mismatch = p29v1;
-    p29v1_mode_mismatch.source_mode = P50_SOURCE_MODE_P29;
+    p29v1_mode_mismatch.source_mode = P50_SOURCE_MODE_ZSTD_ROUTE;
     REQUIRE(!make_pair(PROTOCOL_VERSION).left->send_msg(
                 P50SourceArmMsg(p29v1_mode_mismatch)),
-            "source-arm rejects a P29V1/P29 mode mismatch");
-#if defined(ICECC_P50_WITH_LIBBSC)
-    P50SourceArmFields grz = request.arm;
-    grz.cache_profile = CACHE_PROFILE_GRZ;
-    grz.source_mode = P50_SOURCE_MODE_GRZ_RESIDUAL;
-    REQUIRE(make_pair(PROTOCOL_VERSION).left->send_msg(P50SourceArmMsg(grz)),
-            "source-arm accepts the exact dependency-enabled GRZ profile/mode pair");
-#endif
+            "source-arm rejects a P29V1/ROUTE mode mismatch");
     delete request_base;
     delete reply_base;
 }
@@ -385,7 +369,7 @@ void test_rejects_malformed_and_legacy()
             "role-tag-only F StoreIdentity with a zero root is refused");
 
     P50SourceArmFields unknown_profile = request.arm;
-    unknown_profile.cache_profile = CACHE_PROFILE_GRZ;
+    unknown_profile.cache_profile = UINT32_C(0x00000008);
     REQUIRE(!make_pair(PROTOCOL_VERSION).left->send_msg(
                 P50SourceArmMsg(unknown_profile)),
             "non-advertisable cache profile is refused before framing");

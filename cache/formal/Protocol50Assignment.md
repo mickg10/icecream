@@ -201,7 +201,7 @@ network timing
 reserved-entry leases
 environment transfer
 cache-source Protocol 50 transactions
-P29 or GRZ
+profile codec mechanics
 multi-F routing policy
 ```
 

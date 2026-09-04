@@ -9,6 +9,7 @@
  */
 #include "config.h"
 #include "comm.h"
+#include "../cache/p50_incarnation_identity.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -22,6 +23,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -125,6 +127,20 @@ static bool wait_eof(MsgChannel *channel, int timeout_msec)
     return channel != nullptr && channel->at_eof();
 }
 
+static bool no_terminal_socket_event(MsgChannel *channel, int timeout_msec)
+{
+    if (channel == nullptr || channel->fd < 0)
+        return false;
+    pollfd descriptor{channel->fd, 0, 0};
+    int result = -1;
+    do {
+        result = ::poll(&descriptor, 1, timeout_msec);
+    } while (result < 0 && errno == EINTR);
+    return result == 0 ||
+           (result > 0 &&
+            (descriptor.revents & (POLLHUP | POLLERR | POLLNVAL)) == 0);
+}
+
 static bool wait_child(pid_t pid, int timeout_msec, int *status)
 {
     const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_msec);
@@ -146,9 +162,35 @@ static bool absent(const LoginMsg *login)
 static bool present(const LoginMsg *login, uint32_t port)
 {
     return login != nullptr && login->cache_endpoint_port == port
-        && login->cache_protocol == CACHE_WIRE_PROTOCOL_V1
-        && login->cache_profile_mask ==
-               (CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE);
+        && login->cache_protocol == CACHE_WIRE_REVISION
+        && login->cache_profile_mask == CACHE_ADVERTISABLE_PROFILE_MASK;
+}
+
+static P50SourceArmFields source_arm(uint32_t wire_id, uint64_t epoch,
+                                     uint64_t nonce, uint32_t daemon_port,
+                                     uint32_t cache_port)
+{
+    P50SourceArmFields arm;
+    arm.wire_job_id = wire_id;
+    arm.assignment_epoch = epoch;
+    arm.assignment_nonce = nonce;
+    arm.selected_f_host = "127.0.0.1";
+    arm.selected_f_ordinary_port = daemon_port;
+    arm.selected_f_cache_port = cache_port;
+    arm.cache_protocol = CACHE_WIRE_REVISION;
+    arm.cache_profile = CACHE_PROFILE_ZSTD_TU;
+    arm.logical_job = wire_id;
+    arm.compiler_attempt = nonce;
+    arm.c_store_generation = 1;
+    arm.c_store_derivation_version =
+        icecc::p50::kStoreIdentityDerivationVersion;
+    arm.c_store_guid[0] = 0x11;
+    arm.c_store_guid[1] = 0x22;
+    arm.source_request_id = nonce;
+    arm.source_mode = P50_SOURCE_MODE_ZSTD_TU;
+    arm.c_control_generation = 1;
+    arm.c_control_attempt = nonce;
+    return arm;
 }
 #endif
 
@@ -244,7 +286,8 @@ int main(int argc, char **argv)
             "LOGIN_ATTEMPT cannot dispatch cache while scheduler is inactive");
     delete premature;
 
-    const ConfCSMsg activate(UINT64_C(0x5000000000000001), ConfCSMsg::Legacy);
+    const uint64_t epoch = UINT64_C(0x5000000000000001);
+    const ConfCSMsg activate(epoch, ConfCSMsg::StrictNonce);
     REQUIRE(scheduler && scheduler->send_msg(activate),
             "first ConfCS activates the scheduler session");
     Msg *positive_message = wait_for_type(scheduler, Msg::LOGIN, 10000);
@@ -253,26 +296,46 @@ int main(int argc, char **argv)
             "real READY/authenticated sidecar publishes exact positive advertisement");
     delete positive_message;
 
+    const uint32_t wire_id = 7101;
+    const uint64_t nonce = UINT64_C(0x7101000000000001);
+    REQUIRE(scheduler && scheduler->send_msg(
+                AssignPrepareMsg(epoch, wire_id, nonce, 1)),
+            "source-arm PREPARE reaches the production daemon");
+    Msg *ready_message = wait_for_type(scheduler, Msg::ASSIGN_READY, 5000);
+    auto *ready = dynamic_cast<AssignReadyMsg *>(ready_message);
+    REQUIRE(ready != nullptr && ready->wire_id == wire_id &&
+                ready->epoch() == epoch && ready->nonce() == nonce,
+            "production daemon accepts the exact source-arm assignment");
+    delete ready_message;
+
     MsgChannel *ordinary = connect_tcp_bounded(daemon_port, 5000);
     REQUIRE(ordinary != nullptr, "ordinary Protocol-50 client reached the real public listener");
+    const P50SourceArmFields arm = source_arm(
+        wire_id, epoch, nonce, static_cast<uint32_t>(daemon_port),
+        static_cast<uint32_t>(daemon_port));
+    REQUIRE(ordinary && ordinary->send_msg(P50SourceArmMsg(arm)),
+            "exact source arm entered the production daemon path");
+    Msg *armed_message = wait_for_type(ordinary, Msg::P50_SOURCE_ARMED, 5000);
+    auto *armed = dynamic_cast<P50SourceArmedMsg *>(armed_message);
+    REQUIRE(armed != nullptr && armed->arm == arm &&
+                armed->f_store_generation != 0,
+            "source-arm owner is acknowledged before CACHE_SESSION");
+    delete armed_message;
     REQUIRE(ordinary && ordinary->send_msg(CacheSessionMsg()),
             "real CACHE_SESSION entered the production daemon path");
-
-    Msg *withdrawn_message = wait_for_type(scheduler, Msg::LOGIN, 5000);
-    LoginMsg *withdrawn = dynamic_cast<LoginMsg *>(withdrawn_message);
-    REQUIRE(absent(withdrawn), "one-shot handoff publishes withdrawal first");
-    delete withdrawn_message;
-    // The sidecar deliberately keeps the adopted P50 session active.  End
-    // this synthetic empty session before asking it to accept the fresh daemon
-    // control relationship; a real transaction reaches the same boundary at
-    // its terminal frame.
+    // CACHE_SESSION changes this descriptor from framed icecream messages to
+    // raw CacheWire.  Observe only terminal fd state; parsing the raw stream
+    // as MsgChannel framing would manufacture a bogus oversized message.
+    REQUIRE(no_terminal_socket_event(ordinary, 250),
+            "authenticated one-shot handoff keeps the adopted session live");
+    Msg *spurious_login = wait_for_type(scheduler, Msg::LOGIN, 250);
+    REQUIRE(spurious_login == nullptr,
+            "accepted handoff keeps the READY advertisement stable");
+    delete spurious_login;
+    // End the synthetic empty session.  The immutable READY listener remains
+    // eligible for later TUs; shutdown below is the next advertisement edge.
     delete ordinary;
     ordinary = nullptr;
-    Msg *recovered_message = wait_for_type(scheduler, Msg::LOGIN, 5000);
-    LoginMsg *recovered = dynamic_cast<LoginMsg *>(recovered_message);
-    REQUIRE(present(recovered, static_cast<uint32_t>(daemon_port)),
-            "fresh authenticated relationship republishes presence second");
-    delete recovered_message;
 
     ::kill(daemon_pid, SIGTERM);
     Msg *shutdown_message = wait_for_type(scheduler, Msg::LOGIN, 5000);

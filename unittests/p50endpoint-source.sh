@@ -177,13 +177,13 @@ grep -F 'stale P5CO operation completion advanced the endpoint' \
     "$src/unittests/p50_endpoint_test.cpp" >/dev/null
 grep -F 'records_.reserve(max_records_)' \
     "$src/cache/p50_input_record.cpp" >/dev/null
-grep -F 'InputRecordStore::prepare_publish' \
+grep -F 'InputRecordStore::prepare_verified_publish' \
     "$src/cache/p50_input_record.cpp" >/dev/null
 grep -F 'records_.insert(std::move(prepared.state_->node))' \
     "$src/cache/p50_input_record.cpp" >/dev/null
 grep -F 'prepared InputRecord commit allocated at linearization' \
     "$src/unittests/p50_input_record_test.cpp" >/dev/null
-grep -F 'p50endpoint-mutants.sh p50inputrecord-mutants.sh' \
+grep -F 'p50endpoint-mutants.sh p50profile-digest-mutants.sh p50inputrecord-mutants.sh' \
     "$src/unittests/Makefile.am" >/dev/null
 grep -F 'post-hello C cancellation silently authorized an abort' \
     "$src/unittests/p50_endpoint_test.cpp" >/dev/null

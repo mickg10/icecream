@@ -79,8 +79,7 @@ std::vector<uint8_t> declared_window_frame(std::span<const uint8_t> input,
 TxBegin describe(TxBegin begin, std::span<const uint8_t> body) {
     begin.body = describe_component(kZstdTuBodyEncoding, body,
                                     begin.raw_bytes);
-    begin.transaction_digest = compute_transaction_digest(
-        begin, std::span<const uint8_t>{}, body);
+    begin.transaction_digest = compute_transaction_digest(begin, body);
     return begin;
 }
 

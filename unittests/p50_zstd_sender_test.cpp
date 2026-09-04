@@ -40,7 +40,7 @@ ZstdSourceTransferConfig config() {
 ZstdSourceTransferConfig route_config() {
     ZstdSourceTransferConfig result = config();
     result.compression_level = 3;
-    result.endpoint_caps.profile = ProfileId::Z3_LONG;
+    result.endpoint_caps.profile = ProfileId::ZSTD_ROUTE;
     return result;
 }
 
@@ -156,7 +156,7 @@ void test_route_sender_reuses_relationship_for_two_transfers() {
     asio::io_context context;
     tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
     EndpointCaps caps;
-    caps.profile = ProfileId::Z3_LONG;
+    caps.profile = ProfileId::ZSTD_ROUTE;
     caps.zstd.max_raw_bytes = 1U << 20;
     caps.zstd.max_encoded_body_bytes = 1U << 20;
     P50ServerEndpointConfig server_config;
@@ -219,7 +219,7 @@ void test_route_completed_ledger_releases_live_entry() {
     asio::io_context context;
     tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
     EndpointCaps caps;
-    caps.profile = ProfileId::Z3_LONG;
+    caps.profile = ProfileId::ZSTD_ROUTE;
     caps.zstd.max_raw_bytes = 1U << 20;
     caps.zstd.max_encoded_body_bytes = 1U << 20;
     P50ServerEndpointConfig server_config;
@@ -325,7 +325,7 @@ void test_route_failed_transfer_is_not_completed() {
     asio::io_context context;
     tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
     EndpointCaps caps;
-    caps.profile = ProfileId::Z3_LONG;
+    caps.profile = ProfileId::ZSTD_ROUTE;
     caps.zstd.max_raw_bytes = 1U << 20;
     caps.zstd.max_encoded_body_bytes = 1U << 20;
     P50ServerEndpointConfig server_config;
@@ -354,7 +354,7 @@ void test_explicit_route_operations_bind_request_and_deadline() {
     asio::io_context context;
     tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
     EndpointCaps caps;
-    caps.profile = ProfileId::Z3_LONG;
+    caps.profile = ProfileId::ZSTD_ROUTE;
     caps.zstd.max_raw_bytes = 1U << 20;
     caps.zstd.max_encoded_body_bytes = 1U << 20;
     P50ServerEndpointConfig server_config;
@@ -516,7 +516,7 @@ void test_explicit_route_retry_preserves_exact_preparation() {
     asio::io_context context;
     tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
     EndpointCaps caps;
-    caps.profile = ProfileId::Z3_LONG;
+    caps.profile = ProfileId::ZSTD_ROUTE;
     caps.zstd.max_raw_bytes = 1U << 20;
     caps.zstd.max_encoded_body_bytes = 1U << 20;
     P50ServerEndpointConfig server_config;

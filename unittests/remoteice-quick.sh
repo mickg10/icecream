@@ -78,10 +78,50 @@ fail() {
 }
 
 cleanup() {
-    [ -n "${LOCAL_PID:-}" ] && kill "$LOCAL_PID" 2>/dev/null
-    [ -n "${REMOTE_PID:-}" ] && kill "$REMOTE_PID" 2>/dev/null
-    [ -n "${SCHED_PID:-}" ] && kill "$SCHED_PID" 2>/dev/null
-    wait 2>/dev/null
+    cache_children=""
+    for parent in ${LOCAL_PID:-} ${REMOTE_PID:-}; do
+        children_path="/proc/$parent/task/$parent/children"
+        [ -r "$children_path" ] || continue
+        for child in $(cat "$children_path" 2>/dev/null); do
+            [ "$(readlink "/proc/$child/exe" 2>/dev/null)" = \
+                "$top/cache/icecc-cache-service" ] || continue
+            cache_children="$cache_children $child"
+        done
+    done
+    owned_children="${LOCAL_PID:-} ${REMOTE_PID:-} ${SCHED_PID:-}"
+    for pid in $owned_children; do
+        kill -TERM "$pid" 2>/dev/null || true
+    done
+    for pid in $cache_children; do
+        [ "$(readlink "/proc/$pid/exe" 2>/dev/null)" = \
+            "$top/cache/icecc-cache-service" ] && \
+            kill -TERM "$pid" 2>/dev/null || true
+    done
+    for _ in $(seq 1 50); do
+        live=0
+        for pid in $owned_children; do
+            kill -0 "$pid" 2>/dev/null && live=1
+        done
+        for pid in $cache_children; do
+            if [ "$(readlink "/proc/$pid/exe" 2>/dev/null)" = \
+                    "$top/cache/icecc-cache-service" ]; then
+                live=1
+            fi
+        done
+        [ "$live" -eq 0 ] && break
+        sleep 0.1
+    done
+    for pid in $owned_children; do
+        kill -KILL "$pid" 2>/dev/null || true
+    done
+    for pid in $cache_children; do
+        [ "$(readlink "/proc/$pid/exe" 2>/dev/null)" = \
+            "$top/cache/icecc-cache-service" ] && \
+            kill -KILL "$pid" 2>/dev/null || true
+    done
+    for pid in $owned_children; do
+        wait "$pid" 2>/dev/null || true
+    done
     rm -rf "$sockdir" "$work"
 }
 trap cleanup EXIT
@@ -113,6 +153,27 @@ if [ "$(id -u)" = 0 ]; then
     id -u icecc >/dev/null 2>&1 && ICEUSER=icecc
     chown "$ICEUSER" "$work/envs-remote" "$work/envs-local"
 fi
+
+# STRICT_NONCE is the all-P50 row: the scheduler intentionally withholds a
+# READY assignment until the selected worker has re-logged with a live cache
+# endpoint.  Give both daemons their production sidecars; the submitter's is
+# local-only, while the worker's positive advertisement releases READY.
+REMOTE_CACHE_ARGS=()
+LOCAL_CACHE_ARGS=()
+if [ "$ASSIGNMENT_FENCE_MODE" = strict-nonce ]; then
+    CACHE_SERVICE="$top/cache/icecc-cache-service"
+    [ -x "$CACHE_SERVICE" ] || skip "built cache service is unavailable"
+    mkdir -p "$sockdir/cache-remote" "$sockdir/cache-local"
+    chmod 0700 "$sockdir/cache-remote" "$sockdir/cache-local"
+    if [ "$(id -u)" = 0 ]; then
+        chown "$ICEUSER" "$sockdir/cache-remote" "$sockdir/cache-local"
+    fi
+    REMOTE_CACHE_ARGS=(--cache-service "$CACHE_SERVICE"
+                       --cache-runtime-dir "$sockdir/cache-remote")
+    LOCAL_CACHE_ARGS=(--cache-service "$CACHE_SERVICE"
+                      --cache-runtime-dir "$sockdir/cache-local")
+    export ICECC_P50_C1F1_REQUIRED=1
+fi
 ( cd "$work/env" && timeout 120 bash "$top/client/icecc-create-env" "$(command -v gcc)" \
       >"$work/create-env.log" 2>&1 )
 ENVTAR=$(ls "$work"/env/*.tar.gz 2>/dev/null | head -1)
@@ -130,12 +191,14 @@ SCHED_PID=$!
 ICECC_TEST_SOCKET="$sockdir/remote" \
 "$top/daemon/iceccd" -p "$REMOTE_PORT" -m 2 -s "127.0.0.1:$SCHED_PORT" \
     -n "$NETNAME" -N remoteq -b "$work/envs-remote" $USERFLAG \
+    "${REMOTE_CACHE_ARGS[@]}" \
     -l "$work/remote.log" -vvv &
 REMOTE_PID=$!
 
 ICECC_TEST_SOCKET="$sockdir/local" \
 "$top/daemon/iceccd" --no-remote -m 0 -s "127.0.0.1:$SCHED_PORT" \
     -n "$NETNAME" -N localq -b "$work/envs-local" $USERFLAG \
+    "${LOCAL_CACHE_ARGS[@]}" \
     -l "$work/local.log" -vvv &
 LOCAL_PID=$!
 

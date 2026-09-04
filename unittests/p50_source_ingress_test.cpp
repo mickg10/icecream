@@ -27,7 +27,7 @@ P50SourceArmFields arm() {
     P50SourceArmFields a;
     a.wire_job_id = 1; a.assignment_epoch = 2; a.assignment_nonce = 3;
     a.selected_f_host = "selected-f"; a.selected_f_ordinary_port = 4100;
-    a.selected_f_cache_port = 4200; a.cache_protocol = CACHE_WIRE_PROTOCOL_V1;
+    a.selected_f_cache_port = 4200; a.cache_protocol = CACHE_WIRE_REVISION;
     a.cache_profile = CACHE_PROFILE_ZSTD_TU; a.logical_job = 4;
     a.compiler_attempt = 5; a.c_store_generation = 6;
     a.c_store_derivation_version = kStoreIdentityDerivationVersion;

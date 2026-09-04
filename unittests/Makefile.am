@@ -31,7 +31,6 @@ TESTS += p50inputlifecycle
 TESTS += p50compilebinding p50routeowner
 TESTS += p50compilee2e-source.sh p50compilee2e-run.sh p50resultdisposition
 TESTS += p50profile-selection-source.sh
-TESTS += p50grz-source.sh
 TESTS += p50_completion_record
 TESTS += p50daemontaskcount p50daemontaskcount-source.sh
 TESTS += p50forkfdhygiene p50forkfdhygiene-source.sh p50forkfdhygiene-mutants.sh p50_fork_fd_hygiene_sanitize.sh p50forkfdhygiene-oot.sh p50forkfdhygiene-package.sh
@@ -54,7 +53,7 @@ TESTS += p50_adopted_outcome_writer-run.sh \
 	p50_adopted_outcome_writer-source.sh \
 	p50_adopted_outcome_writer-sanitize.sh \
 	p50_adopted_socket_lease-run.sh \
-	p50endpoint-mutants.sh p50inputrecord-mutants.sh \
+	p50endpoint-mutants.sh p50profile-digest-mutants.sh p50inputrecord-mutants.sh \
 	p50endpoint-sanitize.sh
 TESTS += codec_parity codec_provider codec_intern codec_wire
 AM_TESTS_ENVIRONMENT = \
@@ -87,28 +86,26 @@ AM_TESTS_ENVIRONMENT = \
 	ICECC_TEST_LIBARCHIVE_LIBS='$(LIBARCHIVE_LIBS)'; export ICECC_TEST_LIBARCHIVE_LIBS; \
 	ICECC_TEST_LIBZSTD_CFLAGS='$(LIBZSTD_CFLAGS)'; export ICECC_TEST_LIBZSTD_CFLAGS; \
 	ICECC_TEST_LIBZSTD_LIBS='$(LIBZSTD_LIBS)'; export ICECC_TEST_LIBZSTD_LIBS; \
-	ICECC_TEST_LIBBSC_CFLAGS='$(LIBBSC_CFLAGS)'; export ICECC_TEST_LIBBSC_CFLAGS; \
-	ICECC_TEST_LIBBSC_LIBS='$(LIBBSC_LIBS)'; export ICECC_TEST_LIBBSC_LIBS; \
 	ICECC_TEST_XXHASH_CFLAGS='$(XXHASH_CFLAGS)'; export ICECC_TEST_XXHASH_CFLAGS; \
 	ICECC_TEST_XXHASH_LIBS='$(XXHASH_LIBS)'; export ICECC_TEST_XXHASH_LIBS;
 TEST_EXTENSIONS = .sh
 SH_LOG_COMPILER = $(SHELL)
 
 AM_CPPFLAGS = -I$(top_srcdir)/client -I$(top_srcdir)/services -I$(top_srcdir)/ \
-	$(LIBZSTD_CFLAGS) $(LIBBSC_CFLAGS)
+	$(LIBZSTD_CFLAGS)
 P50_CLIENT_LINK_LIBS = ../client/libp50zstdsender.a \
 	../cache/libp50localtransport.a ../cache/libp50endpoint.a \
 	../cache/libp50adoptedoutcomewriter.a \
 	../cache/libprotocol50.a \
-	../services/libicecc.la $(LIBZSTD_LIBS) $(LIBBSC_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
+	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 testargs_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 testargs_LDADD = ../client/libclient.a $(P50_CLIENT_LINK_LIBS)
 p50wire_LDADD = ../cache/libprotocol50.a ../services/libicecc.la
-p50slice0_LDADD = ../cache/libprotocol50.a ../services/libicecc.la $(LIBBSC_LIBS)
+p50slice0_LDADD = ../cache/libprotocol50.a ../services/libicecc.la
 p50zstd_LDADD = ../cache/libprotocol50.a ../services/libicecc.la $(LIBZSTD_LIBS)
 p50zstdwindow_LDADD = ../cache/libprotocol50.a ../services/libicecc.la $(LIBZSTD_LIBS)
 p50inputrecord_LDADD = ../cache/libprotocol50.a ../services/libicecc.la \
-	$(XXHASH_LIBS)
+	$(LIBZSTD_LIBS) $(XXHASH_LIBS)
 p50inputrecordlate_LDADD = ../cache/libprotocol50.a ../services/libicecc.la \
 	$(XXHASH_LIBS)
 p50inputrecordreopen_LDADD = ../cache/libprotocol50.a ../services/libicecc.la \
@@ -121,7 +118,7 @@ p50endpoint_LDADD = ../cache/libp50endpointtesthooks.a \
 	../cache/libp50adoptedoutcomewriter.a \
 	../cache/libp50localtransport.a ../cache/libprotocol50.a \
 	../services/libicecc.la \
-	$(LIBZSTD_LIBS) $(LIBBSC_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
+	$(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 p50localtransport_SOURCES = p50_local_transport_test.cpp ../cache/p50_local_transport.cpp
 p50localtransport_CPPFLAGS = $(AM_CPPFLAGS) -DICECC_P50_LOCAL_TRANSPORT_TEST_HOOKS
 p50localtransport_CXXFLAGS = -pthread
@@ -210,16 +207,16 @@ assignment_identity_test_SOURCES = assignment_identity_test.cpp
 assignment_identity_test_LDADD = ../services/libicecc.la
 codec_parity_SOURCES = codec_parity_test.cpp
 codec_parity_LDADD = ../cache/libprotocol50.a ../services/libicecc.la \
-	$(LIBZSTD_LIBS) $(LIBBSC_LIBS)
+	$(LIBZSTD_LIBS)
 codec_provider_SOURCES = codec_provider_test.cpp
 codec_provider_LDADD = ../cache/libprotocol50.a ../services/libicecc.la \
-	$(LIBZSTD_LIBS) $(LIBBSC_LIBS)
+	$(LIBZSTD_LIBS)
 codec_intern_SOURCES = codec_intern_test.cpp
 codec_intern_LDADD = ../cache/libprotocol50.a ../services/libicecc.la \
-	$(LIBZSTD_LIBS) $(LIBBSC_LIBS)
+	$(LIBZSTD_LIBS)
 codec_wire_SOURCES = codec_wire_test.cpp
 codec_wire_LDADD = ../cache/libprotocol50.a ../services/libicecc.la \
-	$(LIBZSTD_LIBS) $(LIBBSC_LIBS)
+	$(LIBZSTD_LIBS)
 p50wire_SOURCES = p50_wire_test.cpp
 p50sourceingress_SOURCES = p50_source_ingress_test.cpp
 p50sourceingress_CXXFLAGS = -pthread
@@ -238,10 +235,11 @@ p50s3realprocess_LDFLAGS = $(BOOST_LDFLAGS)
 p50s3realprocess_LDADD = ../cache/libp50endpoint.a \
 	../cache/libp50adoptedoutcomewriter.a ../cache/libprotocol50.a \
 	../services/libicecc.la \
-	$(LIBZSTD_LIBS) $(LIBBSC_LIBS) $(BOOST_LIBS)
+	$(LIBZSTD_LIBS) $(BOOST_LIBS)
 p50zstd_SOURCES = p50_zstd_test.cpp
 p50profile_SOURCES = p50_profile_test.cpp
-p50profile_LDADD = ../cache/libprotocol50.a ../services/libicecc.la $(LIBZSTD_LIBS) $(LIBBSC_LIBS)
+p50profile_CPPFLAGS = $(AM_CPPFLAGS) -DICECC_P50_PROFILE_TEST_HOOKS
+p50profile_LDADD = ../cache/libprotocol50.a ../services/libicecc.la $(LIBZSTD_LIBS)
 p50zstdwindow_SOURCES = p50_zstd_window_test.cpp
 p50inputrecord_SOURCES = p50_input_record_test.cpp
 p50inputrecordlate_SOURCES = p50_input_record_late_commit_test.cpp
@@ -276,21 +274,21 @@ p50zstdsender_CXXFLAGS = -pthread
 p50zstdsender_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 p50zstdsender_LDADD = ../client/libp50zstdsender.a ../cache/libp50endpoint.a \
 	../cache/libp50adoptedoutcomewriter.a ../cache/libprotocol50.a \
-	../services/libicecc.la $(LIBZSTD_LIBS) $(LIBBSC_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
+	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 p50compilebinding_SOURCES = p50_compile_binding_test.cpp
 p50compilebinding_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 p50compilebinding_CXXFLAGS = -pthread
 p50compilebinding_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 p50compilebinding_LDADD = ../client/libp50zstdsender.a ../cache/libp50endpoint.a \
 	../cache/libp50adoptedoutcomewriter.a ../cache/libprotocol50.a \
-	../services/libicecc.la $(LIBZSTD_LIBS) $(LIBBSC_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
+	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 p50routeowner_SOURCES = p50_route_owner_test.cpp
 p50routeowner_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 p50routeowner_CXXFLAGS = -pthread
 p50routeowner_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 p50routeowner_LDADD = ../client/libp50zstdsender.a ../cache/libp50endpoint.a \
 	../cache/libp50adoptedoutcomewriter.a ../cache/libprotocol50.a \
-	../services/libicecc.la $(LIBZSTD_LIBS) $(LIBBSC_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
+	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 p50resultdisposition_SOURCES = p50_result_disposition_test.cpp
 p50resultdisposition_CXXFLAGS = -pthread
 p50resultdisposition_LDFLAGS = -pthread
@@ -390,7 +388,7 @@ p50assignment_LDADD = ../services/libicecc.la
 p50cacheadvertisement_SOURCES = p50cacheadvertisement.cpp
 p50cacheadvertisement_CXXFLAGS = -pthread
 p50cacheadvertisement_LDFLAGS = -pthread
-p50cacheadvertisement_LDADD = ../cache/libprotocol50.a ../services/libicecc.la $(LIBBSC_LIBS)
+p50cacheadvertisement_LDADD = ../cache/libprotocol50.a ../services/libicecc.la
 p50cachesession_SOURCES = p50cachesession.cpp
 p50cachesession_CXXFLAGS = -pthread
 p50cachesession_LDFLAGS = -pthread
@@ -453,7 +451,7 @@ p50cacheservice_LDADD = ../cache/libp50endpointtesthooks.a \
 	../cache/libp50adoptedoutcomewriter.a ../cache/libp50inputfd.a \
 	../cache/libp50inputlifecycle.a \
 	../cache/libprotocol50.a ../cache/libp50localtransport.a \
-	../services/libicecc.la $(LIBZSTD_LIBS) $(LIBBSC_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
+	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 p50cacheservice_DEPENDENCIES = ../cache/icecc-cache-service \
 	../cache/libp50endpointtesthooks.a \
 	../cache/libp50inputfd.a ../cache/libp50inputlifecycle.a readyclose_shim.so
@@ -529,7 +527,7 @@ EXTRA_DIST += p50endpointcancel-run.sh \
 	p50_adopted_outcome_writer_test.cpp \
 	p50_adopted_socket_lease-run.sh \
 	p50_adopted_socket_lease_test.cpp \
-	p50endpoint-mutants.sh p50inputrecord-mutants.sh \
+	p50endpoint-mutants.sh p50profile-digest-mutants.sh p50inputrecord-mutants.sh \
 	p50endpoint-sanitize.sh
 # Make the tests also print the test log if they fail.
 check: export VERBOSE=1

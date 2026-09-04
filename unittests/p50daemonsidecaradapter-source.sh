@@ -66,6 +66,16 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
+forget_runtime_root() {
+    forgotten_root=$1
+    retained_roots=
+    for retained_root in $runtime_roots; do
+        test "$retained_root" = "$forgotten_root" || \
+            retained_roots="$retained_roots $retained_root"
+    done
+    runtime_roots=$retained_roots
+}
+
 # The production object must contain no test-only counter/overflow hook.
 production_object="$tmp_root/production.o"
 "$cxx" "$standard" -Wall -Wextra -Werror -pthread -DHAVE_CONFIG_H \
@@ -795,6 +805,11 @@ compile_and_expect_red() {
         echo "FAIL: $label mutant left a cache-service child" >&2
         exit 1
     fi
+    # Exact retirement above has already proved this mutant owns no survivor.
+    # Remove it from the EXIT-trap inventory instead of repeating the bounded
+    # 20-scan publication wait for an already-settled runtime root.
+    rm -rf -- "$runtime_root"
+    forget_runtime_root "$runtime_root"
     if test "$status" -ne "$expected_status"; then
         echo "FAIL: $label mutant returned $status, expected $expected_status" >&2
         cat "$log" >&2

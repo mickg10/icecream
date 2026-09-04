@@ -16,7 +16,6 @@ ACTIONS = {
     "HISTORY_RESET",
     "TX_BEGIN",
     "TX_ABORTED",
-    "DICT_COMPLETE",
     "BODY_COMPLETE",
     "NEED_RECORDED",
     "OBJECT_APPLIED",
@@ -43,7 +42,6 @@ def check(path: Path) -> None:
                 "route": None,
                 "last_history_nonce": None,
                 "pending": None,
-                "dict": False,
                 "body": False,
                 "need": False,
                 "requested": set(),
@@ -69,7 +67,6 @@ def check(path: Path) -> None:
         f.update(
             {
                 "pending": None,
-                "dict": False,
                 "body": False,
                 "need": False,
                 "requested": set(),
@@ -290,29 +287,18 @@ def check(path: Path) -> None:
                 )
             c["active"] = None
 
-        elif action == "DICT_COMPLETE":
-            if (
-                not current_f_session(row, f)
-                or f["pending"] != tx
-                or f["dict"]
-            ):
-                raise ValueError(
-                    f"line {index}: DICT does not match F pending/current session"
-                )
-            f["dict"] = True
-
         elif action == "NEED_RECORDED":
             keys = row["need_keys"]
             if (
                 not current_f_session(row, f)
                 or f["pending"] != tx
-                or not f["dict"]
+                or not f["body"]
                 or f["need"]
                 or keys != sorted(set(keys))
                 or row["remaining_need"] != len(keys)
             ):
                 raise ValueError(
-                    f"line {index}: Need precedes exact DICT/current session"
+                    f"line {index}: Need precedes exact BODY/current session"
                 )
             f["need"] = True
             f["requested"] = set(keys)
@@ -361,7 +347,7 @@ def check(path: Path) -> None:
             if (
                 not current_f_session(row, f)
                 or f["pending"] != tx
-                or not (f["dict"] and f["body"] and f["need"])
+                or not (f["body"] and f["need"])
                 or f["remaining"]
                 or f["materialized"]
             ):

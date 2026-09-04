@@ -41,14 +41,14 @@ P50SourceArm arm() {
     result.selected_f_host = "f.example";
     result.selected_f_ordinary_port = 8765;
     result.selected_f_cache_port = 9876;
-    result.cache_protocol = 50;
+    result.cache_protocol = icecc::p50::kP50WireRevision;
     result.cache_profile = 2;
     result.logical_job = 19;
     result.attempt_id = 23;
     result.c_store_generation = 29;
     result.c_store_guid.bytes[15] = 31;
     result.source_request_id = 37;
-    result.source_mode = 1;
+    result.source_mode = 2;
     return result;
 }
 
@@ -95,7 +95,7 @@ void wire_fixture() {
     require(!encoded.empty(), "valid source arm did not encode");
     require(encoded.size() < 64u * 1024u, "source arm exceeded fixture cap");
     require(hex(encoded) ==
-                "503530410032000100000065000000110102030405060708111213141516171800000009662e6578616d706c650000223d00002694000000320000000200000000000000130000000000000017000000000000001d0000000000000000000000000000001f000000000000002500000001",
+                "503530410032000100000065000000110102030405060708111213141516171800000009662e6578616d706c650000223d00002694000000010000000200000000000000130000000000000017000000000000001d0000000000000000000000000000001f000000000000002500000002",
             "source arm wire fixture drifted");
     require(encoded[0] == 'P' && encoded[1] == '5' && encoded[2] == '0' &&
                 encoded[3] == 'A',
@@ -108,7 +108,7 @@ void wire_fixture() {
     const auto ready_wire = icecc::p50::encode_input_ready(ready);
     require(!ready_wire.empty(), "valid input ready did not encode");
     require(hex(ready_wire) ==
-                "5035304100320002000000ad000000110102030405060708111213141516171800000009662e6578616d706c650000223d00002694000000320000000200000000000000130000000000000017000000000000001d0000000000000000000000000000001f0000000000000025000000010000000000000029000000000000002b0000000000000000000000000000002f00000000000000000000000000000035000000000000003b00000000000000250000000000000043",
+                "5035304100320002000000ad000000110102030405060708111213141516171800000009662e6578616d706c650000223d00002694000000010000000200000000000000130000000000000017000000000000001d0000000000000000000000000000001f0000000000000025000000020000000000000029000000000000002b0000000000000000000000000000002f00000000000000000000000000000035000000000000003b00000000000000250000000000000043",
             "input-ready wire fixture drifted");
     const auto ready_decoded = icecc::p50::decode_input_ready(ready_wire);
     require(ready_decoded.has_value() && *ready_decoded == ready,
@@ -131,6 +131,23 @@ void wire_fixture() {
     wrong_phase[7] = 2;
     require(!icecc::p50::decode_source_arm(wrong_phase),
             "input-ready phase was accepted as source arm");
+
+    P50SourceArm wrong_cache_revision = source_arm;
+    wrong_cache_revision.cache_protocol = 50;
+    require(!wrong_cache_revision.valid() &&
+                icecc::p50::encode_source_arm(wrong_cache_revision).empty(),
+            "ordinary protocol number was accepted as a CacheWire revision");
+    P50SourceArm mismatched_profile_mode = source_arm;
+    mismatched_profile_mode.source_mode = 1;
+    require(!mismatched_profile_mode.valid() &&
+                icecc::p50::encode_source_arm(mismatched_profile_mode).empty(),
+            "mismatched source profile and mode were accepted");
+    P50SourceArm unknown_profile_mode = source_arm;
+    unknown_profile_mode.cache_profile = 8;
+    unknown_profile_mode.source_mode = 4;
+    require(!unknown_profile_mode.valid() &&
+                icecc::p50::encode_source_arm(unknown_profile_mode).empty(),
+            "unknown source profile and mode were accepted");
 }
 
 void arm_ack_order() {

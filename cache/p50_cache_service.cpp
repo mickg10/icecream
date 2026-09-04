@@ -1317,17 +1317,11 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
 
     ProfileId profile = ProfileId::ZSTD_TU;
     if (arm.cache_profile == CACHE_PROFILE_ZSTD_ROUTE)
-        profile = ProfileId::Z3_LONG;
-    else if (arm.cache_profile == CACHE_PROFILE_P29)
-        profile = ProfileId::P29;
+        profile = ProfileId::ZSTD_ROUTE;
     else if (arm.cache_profile == CACHE_PROFILE_P29V1)
         profile = ProfileId::P29V1;
     else if (arm.cache_profile == CACHE_PROFILE_ZSTD_TU)
         profile = ProfileId::ZSTD_TU;
-#if defined(ICECC_P50_WITH_LIBBSC)
-    else if (arm.cache_profile == CACHE_PROFILE_GRZ)
-        profile = ProfileId::GRZ;
-#endif
     else
         return source_transfer_error(2);
     const auto source_bytes = read_source_fd(

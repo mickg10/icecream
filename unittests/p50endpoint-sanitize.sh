@@ -24,14 +24,14 @@ compile() {
         -fsanitize=address,undefined -fno-omit-frame-pointer -DHAVE_CONFIG_H \
         -DICECC_P50_ENDPOINT_TEST_HOOKS \
         ${ICECC_TEST_CPPFLAGS:-} ${ICECC_TEST_BOOST_CPPFLAGS:-} \
-        ${ICECC_TEST_LIBZSTD_CFLAGS:-} ${ICECC_TEST_LIBBSC_CFLAGS:-} \
+        ${ICECC_TEST_LIBZSTD_CFLAGS:-} \
         ${ICECC_TEST_XXHASH_CFLAGS:-} \
         -I"$top_build" -I"$src" -I"$src/cache" -I"$src/services" \
         "$@" "$top_build/cache/libp50localtransport.a" \
         "$top_build/cache/libprotocol50.a" \
         "$top_build/services/libicecc.la" \
         ${ICECC_TEST_LDFLAGS:-} ${ICECC_TEST_BOOST_LDFLAGS:-} \
-        ${ICECC_TEST_LIBZSTD_LIBS:-} ${ICECC_TEST_LIBBSC_LIBS:-} \
+        ${ICECC_TEST_LIBZSTD_LIBS:-} \
         ${ICECC_TEST_XXHASH_LIBS:-} ${ICECC_TEST_LIBCAP_NG_LIBS:-} \
         ${ICECC_TEST_BOOST_LIBS:-} ${ICECC_TEST_LIBS:-} \
         -fsanitize=address,undefined -pthread -o "$output" >/dev/null

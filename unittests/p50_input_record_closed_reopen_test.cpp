@@ -51,14 +51,13 @@ ExactTransaction transaction_for(TuSeq tu_seq,
     begin.rel_seq = rel_seq;
     begin.tu_seq = tu_seq;
     begin.profile = ProfileId::ZSTD_TU;
-    begin.p29_root_mode = P29RootMode::NotApplicable;
     begin.pre_state_digest = pre_state;
-    begin.dict = describe_component(0, std::span<const uint8_t>{}, 0);
-    begin.body = describe_component(1, encoded_body, exact_input.size());
+    begin.body = describe_component(
+        static_cast<uint16_t>(ProfileId::ZSTD_TU), encoded_body,
+        exact_input.size());
     begin.raw_bytes = exact_input.size();
     begin.raw_digest = icecc::digest128(exact_input);
-    begin.transaction_digest = compute_transaction_digest(
-        begin, std::span<const uint8_t>{}, encoded_body);
+    begin.transaction_digest = compute_transaction_digest(begin, encoded_body);
 
     TxCommit commit{
         begin.history_nonce,

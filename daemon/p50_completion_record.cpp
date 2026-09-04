@@ -55,9 +55,9 @@ bool valid_record(const P50CompletionRecord& record) {
                static_cast<uint32_t>(record.result_status) &&
            record.job_id != 0 && record.assignment_epoch != 0 &&
            record.assignment_nonce != 0 &&
-           (record.input_profile == CompileInputIdentity::ZstdTuProfile ||
-            record.input_profile == CompileInputIdentity::P29Profile ||
-            record.input_profile == CompileInputIdentity::P29V1Profile) &&
+           (record.input_profile == CompileInputIdentity::P29V1Profile ||
+            record.input_profile == CompileInputIdentity::ZstdTuProfile ||
+            record.input_profile == CompileInputIdentity::ZstdRouteProfile) &&
            nonzero(record.c_store_guid) &&
            record.attempt_id == record.assignment_nonce &&
            record.request_id == record.assignment_nonce;

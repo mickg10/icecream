@@ -223,7 +223,7 @@ daemon::P50CacheSessionOutcome p5co_adopted_outcome(
     arm.selected_f_host = "f.p50-endpoint.test";
     arm.selected_f_ordinary_port = 10250;
     arm.selected_f_cache_port = 10251;
-    arm.cache_protocol = CACHE_WIRE_PROTOCOL_V1;
+    arm.cache_protocol = CACHE_WIRE_REVISION;
     arm.cache_profile = CACHE_PROFILE_ZSTD_TU;
     arm.logical_job = 2001;
     arm.compiler_attempt = 2101;
@@ -585,7 +585,7 @@ void report_resource_checkpoint(std::string_view label,
 void test_zstd_route_endpoint_continuation_and_retry() {
     const P5coStoreGuids guids = p5co_store_guids(211);
     EndpointCaps caps;
-    caps.profile = ProfileId::Z3_LONG;
+    caps.profile = ProfileId::ZSTD_ROUTE;
     caps.zstd.max_raw_bytes = 1U << 20;
     caps.zstd.max_encoded_body_bytes = 1U << 20;
     P50ServerEndpoint server(guids.f, caps);
@@ -629,7 +629,7 @@ void test_zstd_route_endpoint_continuation_and_retry() {
 
 void test_zstd_route_authority_bounded_history() {
     EndpointCaps caps;
-    caps.profile = ProfileId::Z3_LONG;
+    caps.profile = ProfileId::ZSTD_ROUTE;
     caps.zstd.max_raw_bytes = 2U << 20;
     caps.zstd.max_encoded_body_bytes = 2U << 20;
     caps.zstd.max_window_log = 12;
@@ -638,7 +638,7 @@ void test_zstd_route_authority_bounded_history() {
     authority_limits.max_live_entries = 1;
     authority_limits.max_retained_encoded_bytes = 8U << 20;
     P50PreparationAuthority authority(Id128::from_u64(18001), caps.zstd,
-                                      authority_limits, 3, ProfileId::Z3_LONG);
+                                      authority_limits, 3, ProfileId::ZSTD_ROUTE);
 
     for (uint64_t index = 0; index != 129; ++index) {
         const std::vector<uint8_t> input(1U << 20,
@@ -655,144 +655,6 @@ void test_zstd_route_authority_bounded_history() {
                     authority.retained_encoded_bytes() == 0,
                 "route authority did not release the committed preparation");
     }
-}
-
-#if defined(ICECC_P50_WITH_LIBBSC)
-void test_grz_endpoint_roundtrip() {
-    const P5coStoreGuids guids = p5co_store_guids(229);
-    EndpointCaps caps;
-    caps.profile = ProfileId::GRZ;
-    caps.zstd.max_raw_bytes = 1U << 20;
-    caps.zstd.max_encoded_body_bytes = 1U << 20;
-    P50ServerEndpoint server(guids.f, caps);
-    // A non-default first nonce must bind both the transport cursor and the
-    // C GRZ preparation authority; preparation must not fall back to nonce 1.
-    TestClient client(guids.c, caps, HistoryNonce{37});
-    const std::vector<uint8_t> before_reset = bytes(
-        "GRZ endpoint authority must validate its own residual begin\n");
-    const PairResult first = run_pair(client, server, admit(client, before_reset));
-    require(first.client.status == ClientRunStatus::Committed &&
-                first.server.status == ServerRunStatus::Completed &&
-                copy_input(server, guids.c) == before_reset &&
-                client.endpoint.next_rel_seq().value == 1,
-            "GRZ endpoint failed its first real sender-to-endpoint round trip");
-
-    // A transport disconnect is not a route reset.  F keeps the committed
-    // dialogue, so the exact retry must use the retained C/F GRZ history.
-    const std::vector<uint8_t> exact_retry = bytes(
-        "GRZ ordinary reconnect must retain the committed predecessor\n");
-    const PreparedTuHandle retry_handle = admit(client, exact_retry);
-    EndpointIoControl disconnect;
-    disconnect.close_before_write = MessageType::BODY;
-    const PairResult disconnected = run_pair(client, server, retry_handle, disconnect);
-    require(disconnected.client.status == ClientRunStatus::Disconnected &&
-                disconnected.server.status == ServerRunStatus::Disconnected &&
-                client.has_active_transaction() &&
-                client.endpoint.next_rel_seq().value == 1,
-            "GRZ ordinary disconnect did not retain exact retry state");
-    const PairResult retried = run_pair(client, server, retry_handle);
-    require(retried.client.status == ClientRunStatus::Committed &&
-                retried.client.reconnect == EndpointReconnectOutcome::ExactMatch &&
-                retried.server.status == ServerRunStatus::Completed &&
-                copy_input(server, guids.c) == exact_retry &&
-                client.endpoint.next_rel_seq().value == 2,
-            "GRZ ordinary reconnect did not retain committed dialogue history");
-
-    // An acknowledged F-store replacement is a cold route reset.  The C
-    // authority must rebuild the uncommitted GRZ body against the new empty
-    // route before sending REL_SEQ zero.
-    const std::vector<uint8_t> after_reset = bytes(
-        "GRZ acknowledged cold reset must re-prime the C encoder\n");
-    const PreparedTuHandle reset_handle = admit(client, after_reset);
-    const PairResult interrupted = run_pair(client, server, reset_handle, disconnect);
-    require(interrupted.client.status == ClientRunStatus::Disconnected &&
-                interrupted.server.status == ServerRunStatus::Disconnected &&
-                client.has_active_transaction(),
-            "GRZ reset fixture did not retain its interrupted transaction");
-    server.reset_store(FStoreGuid::from_u64(UINT64_C(0x47525a434f4c4452)));
-    const PairResult reset = run_pair(client, server, reset_handle);
-    require(reset.client.status == ClientRunStatus::Committed &&
-                reset.client.reconnect == EndpointReconnectOutcome::ColdFStore &&
-                reset.server.status == ServerRunStatus::Completed &&
-                copy_input(server, guids.c) == after_reset &&
-                client.endpoint.next_rel_seq().value == 1,
-            "GRZ acknowledged cold reset did not rebuild the C encoder route");
-
-    const std::vector<uint8_t> continuation = bytes(
-        "GRZ post-reset continuation must use the rebuilt anchor history\n");
-    const PairResult continued = run_pair(client, server, admit(client, continuation));
-    require(continued.client.status == ClientRunStatus::Committed &&
-                continued.client.reconnect == EndpointReconnectOutcome::ExactMatch &&
-                continued.server.status == ServerRunStatus::Completed &&
-                copy_input(server, guids.c) == continuation &&
-                client.endpoint.next_rel_seq().value == 2,
-            "GRZ post-reset continuation did not preserve the new route history");
-}
-#endif
-
-void test_p29_endpoint_route_dialogue_lifetime() {
-    const P5coStoreGuids guids = p5co_store_guids(227);
-    EndpointCaps caps;
-    caps.profile = ProfileId::P29;
-    caps.zstd.max_raw_bytes = 1U << 20;
-    caps.zstd.max_encoded_body_bytes = 1U << 20;
-    P50ServerEndpoint server(guids.f, caps);
-    TestClient client(guids.c, caps);
-    const std::vector<uint8_t> repeated = bytes(
-        "same-line\nsame-line\nsame-line\nsame-line\ntail\n");
-
-    const PreparedTuHandle first_prepared = admit(client, repeated);
-    const PairResult first = run_pair(client, server, first_prepared);
-    require(first.client.status == ClientRunStatus::Committed &&
-                first.server.status == ServerRunStatus::Completed &&
-                copy_input(server, guids.c) == repeated &&
-                client.endpoint.next_rel_seq().value == 1,
-            "P29 endpoint first TU did not commit exact route state");
-
-    // This second TU is prepared by the same C authority and sent to the
-    // same F namespace.  A fresh F dialogue would lose the committed route
-    // matcher and fail the route-history body/Need exchange.
-    const PreparedTuHandle second_prepared = admit(client, repeated);
-    const PairResult second = run_pair(client, server, second_prepared);
-    require(second.client.status == ClientRunStatus::Committed &&
-                second.server.status == ServerRunStatus::Completed &&
-                copy_input(server, guids.c) == repeated &&
-                client.endpoint.next_rel_seq().value == 2,
-            "P29 endpoint same-route TU2 did not observe committed TU1 state");
-
-    // A different C namespace must receive an independent P29 dialogue and
-    // cannot inherit the first route's matcher/history.
-    TestClient different(p5co_store_guids(228).c, caps);
-    const PairResult isolated = run_pair(different, server, admit(different, repeated));
-    require(isolated.client.status == ClientRunStatus::Committed &&
-                isolated.server.status == ServerRunStatus::Completed &&
-                copy_input(server, different.c_store_guid()) == repeated &&
-                different.endpoint.next_rel_seq().value == 1,
-            "P29 endpoint different route reused same-route dialogue state");
-
-    const PreparedTuHandle failed_prepared = admit(client, bytes("retry-p29\nretry-p29\n"));
-    EndpointIoControl disconnect;
-    disconnect.close_before_write = MessageType::BODY;
-    const PairResult failed = run_pair(client, server, failed_prepared, disconnect);
-    require(failed.client.status == ClientRunStatus::Disconnected &&
-                failed.server.status == ServerRunStatus::Disconnected &&
-                client.has_active_transaction() && client.endpoint.next_rel_seq().value == 2,
-            "P29 endpoint abort advanced the committed route cursor");
-    const PairResult retried = run_pair(client, server, failed_prepared);
-    require(retried.client.status == ClientRunStatus::Committed &&
-                retried.server.status == ServerRunStatus::Completed &&
-                client.endpoint.next_rel_seq().value == 3,
-            "P29 endpoint retry did not discard tentative dialogue state");
-
-    const FStoreGuid replacement = FStoreGuid::from_u64(UINT64_C(0x5032395253455431));
-    const std::vector<uint8_t> after_reset_input = bytes("after-p29-reset\n");
-    server.reset_store(replacement);
-    const PairResult after_reset = run_pair(client, server, admit(client, after_reset_input));
-    require(after_reset.client.status == ClientRunStatus::Committed &&
-                after_reset.server.status == ServerRunStatus::Completed &&
-                copy_input(server, guids.c) == after_reset_input &&
-                client.endpoint.next_rel_seq().value == 1,
-            "P29 endpoint reset did not clear the old F route namespace");
 }
 
 void test_p29v1_endpoint_route_dialogue_lifetime() {
@@ -1030,6 +892,39 @@ void test_p29v1_endpoint_route_dialogue_lifetime() {
             "P29V1 projected route-cap failure published receiver state");
 }
 
+void test_profile_materialized_result_digest_gates() {
+    uint64_t identity = 19000;
+    for (const ProfileId profile : {ProfileId::P29V1, ProfileId::ZSTD_TU,
+                                    ProfileId::ZSTD_ROUTE}) {
+        EndpointCaps caps;
+        caps.profile = profile;
+        caps.zstd.max_raw_bytes = 1U << 20;
+        caps.zstd.max_encoded_body_bytes = 1U << 20;
+        const CStoreGuid c_guid = Id128::from_u64(identity++);
+        P50ServerEndpoint server(Id128::from_u64(identity++), caps);
+        TestClient client(c_guid, caps);
+        const std::vector<uint8_t> input = bytes(
+            "# 1 \"/tmp/profile-digest-mutant.cc\"\n"
+            "same materialized bytes\nsame materialized bytes\n");
+        const PreparedTuHandle prepared = admit(client, input);
+        EndpointIoControl corrupt;
+        corrupt.outbound_begin_transform =
+            [](const TxBegin& original, std::span<const uint8_t> body) {
+                TxBegin changed = original;
+                changed.raw_digest.bytes[0] ^= 0x80;
+                changed.transaction_digest =
+                    compute_transaction_digest(changed, body);
+                return changed;
+            };
+        const PairResult rejected =
+            run_pair(client, server, prepared, corrupt);
+        require(rejected.server.status == ServerRunStatus::TerminalError &&
+                    !copy_input(server, c_guid).has_value(),
+                std::string(profile_name(profile)) +
+                    " accepted or published materialized bytes whose digest differed");
+    }
+}
+
 void test_s3_resource_storm_product_path() {
     const char* requested = std::getenv("ICECC_P50_S3_RESOURCE_STORM");
     const bool storm_only = requested != nullptr &&
@@ -1197,7 +1092,7 @@ void test_automatic_action_trace_is_complete_past_1024_records() {
     {
         P50ServerEndpoint server(Id128::from_u64(15101));
         TestClient client(Id128::from_u64(15102));
-        for (uint64_t index = 0; index != 129; ++index) {
+        for (uint64_t index = 0; index != 180; ++index) {
             const std::vector<uint8_t> input{
                 static_cast<uint8_t>(index),
                 static_cast<uint8_t>(index >> 8),
@@ -1225,7 +1120,7 @@ void test_automatic_action_trace_is_complete_past_1024_records() {
     const std::string contents((std::istreambuf_iterator<char>(trace)),
                                std::istreambuf_iterator<char>());
     require(static_cast<size_t>(std::count(contents.begin(), contents.end(), '\n')) > 1024 &&
-                contents.find("\"tu_seq\":128") != std::string::npos,
+                contents.find("\"tu_seq\":179") != std::string::npos,
             "automatically owned action trace truncated after 1024 records");
     require(::unlink(trace_path) == 0,
             "automatic action-trace fixture could not remove its trace");
@@ -2603,8 +2498,7 @@ TxBegin make_begin(const ZstdTuEnvelope& prepared, HistoryNonce nonce, Digest128
     begin.history_nonce = nonce;
     begin.rel_seq = rel;
     begin.pre_state_digest = pre_state;
-    begin.transaction_digest = compute_transaction_digest(
-        begin, std::span<const uint8_t>{}, prepared.body);
+    begin.transaction_digest = compute_transaction_digest(begin, prepared.body);
     return begin;
 }
 
@@ -2713,8 +2607,7 @@ asio::awaitable<void> raw_incompatible_hello(tcp::endpoint remote, CStoreGuid c_
     SessionHello hello;
     hello.c_store_guid = c_guid;
     // Use a reserved profile bit so this remains deliberately incompatible
-    // when every currently implemented profile, including dependency-gated
-    // GRZ, is enabled.
+    // when every currently implemented revision-1 profile is enabled.
     hello.supported_profiles = uint32_t{1} << 31;
     co_await raw_write(socket, hello);
     const Frame terminal = co_await raw_read(socket, hello.limits.max_frame_payload);
@@ -2879,13 +2772,11 @@ asio::awaitable<InterruptedRawTu> raw_terminal_body_failure(
         std::fill(sent_body.begin(), sent_body.end(), uint8_t{0});
         begin.body = describe_component(kZstdTuBodyEncoding, sent_body,
                                         begin.raw_bytes);
-        begin.transaction_digest = compute_transaction_digest(
-            begin, std::span<const uint8_t>{}, sent_body);
+        begin.transaction_digest = compute_transaction_digest(begin, sent_body);
         prepared.body = sent_body;
     } else if (scenario == TerminalBodyFailure::RawDigest) {
         begin.raw_digest.bytes[0] ^= 0x80;
-        begin.transaction_digest = compute_transaction_digest(
-            begin, std::span<const uint8_t>{}, sent_body);
+        begin.transaction_digest = compute_transaction_digest(begin, sent_body);
     }
 
     co_await raw_write(socket, begin);
@@ -3047,7 +2938,7 @@ asio::awaitable<void> raw_wait_for_close(tcp::socket& socket) {
 }
 
 enum class ResetAckMutation {
-    SelectedProtocol,
+    WireRevision,
     ProfileMask,
     FrameLimit,
     FillLimit,
@@ -3071,7 +2962,7 @@ asio::awaitable<void> raw_bad_reset_ack_peer(tcp::acceptor& acceptor,
         co_await raw_read(socket, kInitialMaxFramePayload));
 
     SessionState initial;
-    initial.selected_protocol = kProtocolVersion;
+    initial.wire_revision = kP50WireRevision;
     initial.negotiated_profiles = profile_bit(ProfileId::ZSTD_TU);
     initial.limits = hello.limits;
     initial.f_store_guid = scripted.f_guid;
@@ -3094,7 +2985,7 @@ asio::awaitable<void> raw_bad_reset_ack_peer(tcp::acceptor& acceptor,
         // Use the other runnable source profile so the peer can encode the
         // state and the client, rather than the fixture itself, observes the
         // negotiated-profile mismatch.
-        ack.negotiated_profiles = profile_bit(ProfileId::Z3_LONG);
+        ack.negotiated_profiles = profile_bit(ProfileId::ZSTD_ROUTE);
         co_await raw_write(socket, ack);
     } else if (mutation == ResetAckMutation::FrameLimit) {
         require(ack.limits.max_frame_payload > kMandatoryControlFramePayload,
@@ -3109,7 +3000,7 @@ asio::awaitable<void> raw_bad_reset_ack_peer(tcp::acceptor& acceptor,
     } else {
         std::vector<uint8_t> frame = encode_frame(ack);
         frame[4] = 0;
-        frame[5] = static_cast<uint8_t>(kProtocolVersion + 1);
+        frame[5] = static_cast<uint8_t>(kP50WireRevision + 1);
         co_await raw_write_bytes(socket, frame);
     }
     co_await raw_wait_for_close(socket);
@@ -3149,7 +3040,7 @@ asio::awaitable<void> raw_route_mismatch_peer(tcp::acceptor& acceptor,
         co_await raw_read(socket, kInitialMaxFramePayload));
 
     SessionState state;
-    state.selected_protocol = kProtocolVersion;
+    state.wire_revision = kP50WireRevision;
     state.negotiated_profiles = profile_bit(ProfileId::ZSTD_TU);
     state.limits = hello.limits;
     state.f_store_guid = scripted.f_guid;
@@ -3176,7 +3067,7 @@ asio::awaitable<void> raw_zero_f_store_state_peer(tcp::acceptor& acceptor) {
         co_await raw_read(socket, kInitialMaxFramePayload));
 
     SessionState state;
-    state.selected_protocol = kProtocolVersion;
+    state.wire_revision = kP50WireRevision;
     state.negotiated_profiles = profile_bit(ProfileId::ZSTD_TU);
     state.limits = hello.limits;
     state.f_store_guid = Id128::from_u64(6000);
@@ -3198,7 +3089,7 @@ asio::awaitable<void> raw_zero_c_store_hello(tcp::endpoint remote) {
     hello.supported_profiles = profile_bit(ProfileId::ZSTD_TU);
     std::vector<uint8_t> frame = encode_frame(Message{hello});
     constexpr size_t frame_header_bytes = 4;
-    constexpr size_t c_guid_payload_offset = 2 + 2;
+    constexpr size_t c_guid_payload_offset = 2;
     std::fill_n(frame.begin() + frame_header_bytes + c_guid_payload_offset,
                 16, uint8_t{0});
     co_await raw_write_bytes(socket, frame);
@@ -3282,7 +3173,6 @@ enum class RawCase {
     TransactionDigest,
     RawDigest,
     WrongProfile,
-    WrongRoot,
     WrongEncoding,
     FrameContentSize,
     TrailingByte,
@@ -3324,68 +3214,54 @@ asio::awaitable<RawCaseResult> run_raw_case(tcp::endpoint remote, CStoreGuid c_g
             begin.raw_bytes = 1;
             const std::array<uint8_t, 1> one_raw{0};
             begin.raw_digest = icecc::digest128(one_raw);
-            begin.transaction_digest = compute_transaction_digest(
-                begin, std::span<const uint8_t>{}, body);
+            begin.transaction_digest = compute_transaction_digest(begin, body);
         } else if (scenario == RawCase::DecodedCap) {
             begin.raw_bytes = server_caps.zstd.max_raw_bytes + 1;
             begin.body.decoded_bytes = begin.raw_bytes;
-            begin.transaction_digest = compute_transaction_digest(
-                begin, std::span<const uint8_t>{}, body);
+            begin.transaction_digest = compute_transaction_digest(begin, body);
         } else if (scenario == RawCase::WrongProfile) {
             raw_begin_frame = encode_frame(begin);
             raw_begin_frame[4 + 24] = 0;
-            raw_begin_frame[4 + 25] = static_cast<uint8_t>(ProfileId::P29);
-            raw_begin_frame[4 + 26] = 0;
-            raw_begin_frame[4 + 27] = static_cast<uint8_t>(P29RootMode::HistoryIndependent);
-        } else if (scenario == RawCase::WrongRoot) {
-            raw_begin_frame = encode_frame(begin);
-            raw_begin_frame[4 + 26] = 0;
-            raw_begin_frame[4 + 27] = static_cast<uint8_t>(P29RootMode::HistoryIndependent);
+            raw_begin_frame[4 + 25] = static_cast<uint8_t>(ProfileId::P29V1);
         } else if (scenario == RawCase::WrongEncoding) {
             begin.body.encoding = 77;
-            begin.transaction_digest = compute_transaction_digest(
-                begin, std::span<const uint8_t>{}, body);
+            begin.transaction_digest = compute_transaction_digest(begin, body);
         } else if (scenario == RawCase::ComponentDigest) {
             begin.body.digest.bytes[0] ^= 0x80;
         } else if (scenario == RawCase::TransactionDigest) {
             begin.transaction_digest.bytes[0] ^= 0x80;
         } else if (scenario == RawCase::RawDigest) {
             begin.raw_digest.bytes[0] ^= 0x80;
-            begin.transaction_digest = compute_transaction_digest(
-                begin, std::span<const uint8_t>{}, body);
+            begin.transaction_digest = compute_transaction_digest(begin, body);
         } else if (scenario == RawCase::FrameContentSize) {
             ++begin.raw_bytes;
             begin.body.decoded_bytes = begin.raw_bytes;
-            begin.transaction_digest = compute_transaction_digest(
-                begin, std::span<const uint8_t>{}, body);
+            begin.transaction_digest = compute_transaction_digest(begin, body);
         } else if (scenario == RawCase::TrailingByte) {
             body.push_back(0xa5);
             begin.body =
                 describe_component(kZstdTuBodyEncoding, body, begin.raw_bytes);
-            begin.transaction_digest = compute_transaction_digest(
-                begin, std::span<const uint8_t>{}, body);
+            begin.transaction_digest = compute_transaction_digest(begin, body);
         } else if (scenario == RawCase::AppendedEmptyFrame) {
             const std::vector<uint8_t> appended = standalone_zstd_frame({});
             body.insert(body.end(), appended.begin(), appended.end());
             begin.body =
                 describe_component(kZstdTuBodyEncoding, body, begin.raw_bytes);
-            begin.transaction_digest = compute_transaction_digest(
-                begin, std::span<const uint8_t>{}, body);
+            begin.transaction_digest = compute_transaction_digest(begin, body);
         } else if (scenario == RawCase::AppendedNonemptyFrame) {
             const std::vector<uint8_t> appended =
                 standalone_zstd_frame(bytes("second frame"));
             body.insert(body.end(), appended.begin(), appended.end());
             begin.body =
                 describe_component(kZstdTuBodyEncoding, body, begin.raw_bytes);
-            begin.transaction_digest = compute_transaction_digest(
-                begin, std::span<const uint8_t>{}, body);
+            begin.transaction_digest = compute_transaction_digest(begin, body);
         }
         if (raw_begin_frame.empty())
             co_await raw_write(socket, begin);
         else
             co_await raw_write_bytes(socket, raw_begin_frame);
         if (scenario == RawCase::DescriptorCap || scenario == RawCase::DecodedCap ||
-            scenario == RawCase::WrongProfile || scenario == RawCase::WrongRoot ||
+            scenario == RawCase::WrongProfile ||
             scenario == RawCase::WrongEncoding) {
             // The descriptor itself is rejected before any component allocation.
         } else {
@@ -4724,7 +4600,7 @@ void test_same_f_route_reset() {
 void test_reset_ack_equality_and_terminal_result() {
     const FStoreGuid f_guid = Id128::from_u64(570);
     for (const ResetAckMutation mutation :
-         {ResetAckMutation::SelectedProtocol, ResetAckMutation::ProfileMask,
+         {ResetAckMutation::WireRevision, ResetAckMutation::ProfileMask,
           ResetAckMutation::FrameLimit, ResetAckMutation::FillLimit}) {
         TestClient client(Id128::from_u64(571 + static_cast<uint8_t>(mutation)));
         const std::vector<uint8_t> input = bytes("reset acknowledgement equality\n");
@@ -5029,8 +4905,8 @@ void test_handshake_binding_and_namespace_rules() {
 
 // Port of the transplant lane's unique mask-law assertions onto the accepted
 // production endpoint (bigoracle S1 transplant ruling, bounded convergence):
-// a TX_BEGIN whose profile is intrinsically valid on the wire (GRZ carries
-// its canonical NotApplicable root mode) but outside the session's negotiated
+// a TX_BEGIN whose profile is intrinsically valid on the wire but outside the
+// session's negotiated
 // mask must be rejected by the endpoint's own negotiated-mask law -- bound by
 // EXACT detail text, because the ZSTD_TU shape validator behind it rejects
 // the same frame with a different text ("transaction is not a ZSTD_TU
@@ -5043,14 +4919,14 @@ asio::awaitable<void> raw_unnegotiated_begin_rejected(tcp::endpoint remote,
     const auto executor = co_await asio::this_coro::executor;
     tcp::socket socket(executor);
     RawRoute open = co_await raw_open(socket, remote, c_guid);
-    if ((open.state.negotiated_profiles & profile_bit(ProfileId::GRZ)) != 0)
-        throw std::logic_error("fixture requires GRZ outside the negotiated mask");
+    if ((open.state.negotiated_profiles & profile_bit(ProfileId::P29V1)) != 0)
+        throw std::logic_error("fixture requires P29V1 outside the negotiated mask");
     SessionState route = co_await raw_reset(socket, open, HistoryNonce{771});
     const ZstdTuEnvelope prepared = encode_zstd_tu(
         HistoryNonce{1}, RelSeq{0}, TuSeq{41}, Digest128{}, input);
     TxBegin begin = make_begin(prepared, route.history_nonce, route.state_digest,
                                route.next_rel_seq);
-    begin.profile = ProfileId::GRZ;
+    begin.profile = ProfileId::P29V1;
     co_await raw_write(socket, begin);
     // No further traffic: a server that wrongly admits this begin sees EOF
     // with an open transaction and fails through a DIFFERENT detail text, so
@@ -5153,7 +5029,7 @@ void test_client_outbound_mask_law() {
     const ZstdTuEnvelope shaped = encode_zstd_tu(
         HistoryNonce{1}, RelSeq{0}, TuSeq{77}, Digest128{}, input);
     TxBegin crafted = make_begin(shaped, HistoryNonce{1}, Digest128{});
-    crafted.profile = ProfileId::GRZ;  // wire-valid, outside the ZSTD_TU-only mask
+    crafted.profile = ProfileId::P29V1;  // wire-valid, outside the TU-only mask
     bool rejected_by_the_mask_law = false;
     try {
         require_outbound_profile_negotiated(profile_bit(ProfileId::ZSTD_TU), crafted);
@@ -5165,7 +5041,7 @@ void test_client_outbound_mask_law() {
     require(rejected_by_the_mask_law,
             "client outbound mask law did not reject an unnegotiated begin copy");
     require_outbound_profile_negotiated(profile_bit(ProfileId::ZSTD_TU) |
-                                            profile_bit(ProfileId::GRZ),
+                                            profile_bit(ProfileId::P29V1),
                                         crafted);  // negotiated -> must not throw
 
     const std::vector<uint8_t> second_input = bytes("outbound mask law: follow-up commit\n");
@@ -5180,7 +5056,7 @@ void test_client_outbound_mask_law() {
 
 // local-oracle's 414a917e HOLD closure: the production CLIENT CALLSITE of the
 // outbound mask law, exercised end-to-end. The copied-begin control hook
-// flips the coroutine's own outbound TX_BEGIN copy to wire-valid GRZ after
+// flips the coroutine's own outbound TX_BEGIN copy to wire-valid P29V1 after
 // construction and before validation/send; the production validator must
 // reject through the production call, the fake F must observe complete
 // silence after route establishment (no TX_BEGIN/BODY frame ever arrives),
@@ -5196,7 +5072,7 @@ asio::awaitable<void> raw_established_then_silent_peer(tcp::acceptor& acceptor,
         co_await raw_read(socket, kInitialMaxFramePayload));
 
     SessionState fresh;
-    fresh.selected_protocol = kProtocolVersion;
+    fresh.wire_revision = kP50WireRevision;
     fresh.negotiated_profiles = profile_bit(ProfileId::ZSTD_TU);
     fresh.limits = hello.limits;
     fresh.f_store_guid = f_guid;
@@ -5222,10 +5098,11 @@ void test_client_outbound_callsite_law() {
     const std::vector<uint8_t> input = bytes("callsite law: prepared survives local rejection\n");
     const PreparedTuHandle prepared = admit(client, input);
 
-    EndpointIoControl grz_control;
-    grz_control.outbound_begin_transform = [](const TxBegin& begin) {
+    EndpointIoControl unnegotiated_control;
+    unnegotiated_control.outbound_begin_transform = [](
+        const TxBegin& begin, std::span<const uint8_t>) {
         TxBegin crafted = begin;
-        crafted.profile = ProfileId::GRZ;  // wire-valid, unnegotiated
+        crafted.profile = ProfileId::P29V1;  // wire-valid, unnegotiated
         return crafted;
     };
     const ClientRunResult rejected = run_client_with_raw_peer(
@@ -5233,7 +5110,7 @@ void test_client_outbound_callsite_law() {
         [&](tcp::acceptor& acceptor) {
             return raw_established_then_silent_peer(acceptor, Id128::from_u64(921));
         },
-        grz_control);
+        unnegotiated_control);
     require(rejected.status == ClientRunStatus::TerminalError &&
                 rejected.terminal_error &&
                 rejected.terminal_error->detail ==
@@ -5645,7 +5522,6 @@ void test_component_and_allocation_caps() {
                     std::tuple{RawCase::TransactionDigest, "transaction digest", uint64_t{807}},
                     std::tuple{RawCase::RawDigest, "raw digest", uint64_t{808}},
                     std::tuple{RawCase::WrongProfile, "profile", uint64_t{809}},
-                    std::tuple{RawCase::WrongRoot, "root mode", uint64_t{810}},
                     std::tuple{RawCase::WrongEncoding, "encoding", uint64_t{811}},
                     std::tuple{RawCase::FrameContentSize, "zstd frame size", uint64_t{812}},
                     std::tuple{RawCase::TrailingByte, "trailing zstd byte", uint64_t{813}},
@@ -5892,10 +5768,10 @@ asio::awaitable<void> raw_f_serve_and_commit(tcp::acceptor& acceptor, FStoreGuid
     const SessionHello hello =
         raw_decode<SessionHello>(co_await raw_read(socket, kInitialMaxFramePayload));
     const SessionSelection selection =
-        negotiate_session(hello, kProtocolVersion, kProtocolVersion, kKnownProfileMask);
+        negotiate_session(hello, kP50WireRevision, kKnownProfileMask);
     const uint32_t cap = selection.limits.max_frame_payload;
     SessionState fresh;
-    fresh.selected_protocol = selection.protocol;
+    fresh.wire_revision = selection.wire_revision;
     fresh.negotiated_profiles = selection.negotiated_profiles;
     fresh.limits = selection.limits;
     fresh.f_store_guid = f_guid;
@@ -5943,9 +5819,9 @@ asio::awaitable<void> raw_f_exact_retry(tcp::acceptor& acceptor, FStoreGuid same
     const SessionHello hello =
         raw_decode<SessionHello>(co_await raw_read(socket, kInitialMaxFramePayload));
     const SessionSelection selection =
-        negotiate_session(hello, kProtocolVersion, kProtocolVersion, kKnownProfileMask);
+        negotiate_session(hello, kP50WireRevision, kKnownProfileMask);
     SessionState peer;
-    peer.selected_protocol = selection.protocol;
+    peer.wire_revision = selection.wire_revision;
     peer.negotiated_profiles = selection.negotiated_profiles;
     peer.limits = selection.limits;
     peer.f_store_guid = same_f_guid;
@@ -6110,10 +5986,10 @@ asio::awaitable<void> raw_f_receive_then_drop(tcp::acceptor& acceptor, FStoreGui
     const SessionHello hello =
         raw_decode<SessionHello>(co_await raw_read(socket, kInitialMaxFramePayload));
     const SessionSelection selection =
-        negotiate_session(hello, kProtocolVersion, kProtocolVersion, kKnownProfileMask);
+        negotiate_session(hello, kP50WireRevision, kKnownProfileMask);
     const uint32_t cap = selection.limits.max_frame_payload;
     SessionState fresh;
-    fresh.selected_protocol = selection.protocol;
+    fresh.wire_revision = selection.wire_revision;
     fresh.negotiated_profiles = selection.negotiated_profiles;
     fresh.limits = selection.limits;
     fresh.f_store_guid = f_guid;
@@ -6151,9 +6027,9 @@ asio::awaitable<void> raw_f_present_last_commit(tcp::acceptor& acceptor, FStoreG
     const SessionHello hello =
         raw_decode<SessionHello>(co_await raw_read(socket, kInitialMaxFramePayload));
     const SessionSelection selection =
-        negotiate_session(hello, kProtocolVersion, kProtocolVersion, kKnownProfileMask);
+        negotiate_session(hello, kP50WireRevision, kKnownProfileMask);
     SessionState peer;
-    peer.selected_protocol = selection.protocol;
+    peer.wire_revision = selection.wire_revision;
     peer.negotiated_profiles = selection.negotiated_profiles;
     peer.limits = selection.limits;
     peer.f_store_guid = f_guid;
@@ -6317,9 +6193,13 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (std::getenv("ICECC_P50_P29_DIALOGUE_FOCUS") != nullptr) {
-        test_p29_endpoint_route_dialogue_lifetime();
         test_p29v1_endpoint_route_dialogue_lifetime();
-        std::cout << "p50_endpoint_test: focused P29/P29V1 dialogue PASS\n";
+        std::cout << "p50_endpoint_test: focused P29V1 dialogue PASS\n";
+        return 0;
+    }
+    if (std::getenv("ICECC_P50_PROFILE_DIGEST_MUTANT_FOCUS") != nullptr) {
+        test_profile_materialized_result_digest_gates();
+        std::cout << "p50_endpoint_test: focused profile digest gates PASS\n";
         return 0;
     }
     test_action_hold_rendezvous();
@@ -6361,10 +6241,6 @@ int main(int argc, char** argv) {
     test_two_client_one_server_isolation();
     test_zstd_route_endpoint_continuation_and_retry();
     test_zstd_route_authority_bounded_history();
-#if defined(ICECC_P50_WITH_LIBBSC)
-    test_grz_endpoint_roundtrip();
-#endif
-    test_p29_endpoint_route_dialogue_lifetime();
     test_p29v1_endpoint_route_dialogue_lifetime();
     test_live_global_resource_trace();
     test_automatic_action_trace_is_complete_past_1024_records();

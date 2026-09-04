@@ -86,7 +86,7 @@ P50CacheSessionArmBinding binding(uint64_t observation, uint32_t wire_job_id) {
   arm.selected_f_host = "f.example.test";
   arm.selected_f_ordinary_port = 10250;
   arm.selected_f_cache_port = 10251;
-  arm.cache_protocol = CACHE_WIRE_PROTOCOL_V1;
+  arm.cache_protocol = CACHE_WIRE_REVISION;
   arm.cache_profile = CACHE_PROFILE_ZSTD_TU;
   arm.logical_job = 3000 + wire_job_id;
   arm.compiler_attempt = 4000 + wire_job_id;
@@ -158,9 +158,9 @@ void wire_roundtrip_and_bounds() {
   const auto wire = encode_cache_session_wire_claim(exact);
   CHECK(wire == hex_fixture(
       "5035434c00010001000000db0000000100000000000003e900000000000007d1"
-      "0000000f662e6578616d706c652e74657374000000280a0000280b0000003200"
+      "0000000f662e6578616d706c652e74657374000000280a0000280b0000000100"
       "0000020000000000000bb90000000000000fa1000000000000003d0000000000"
-      "0000010102030405060708090a0b0c0d0e0f1000000000000013890000000100"
+      "0000010102030405060708090a0b0c0d0e0f1000000000000013890000000200"
       "0000000000005000000000000000010000000000000051000000000000000200"
       "0000000000005ba122232425262728292a2b2c2d2e2f30000000000000000100"
       "00000000000064000013880000000001000000000000000000000000000064"
@@ -201,7 +201,7 @@ void wire_roundtrip_and_bounds() {
         "nonzero reserved full-ACK word is rejected");
 
   auto bad = exact;
-  bad.binding.arm.cache_profile = CACHE_PROFILE_P29;
+  bad.binding.arm.cache_profile = CACHE_PROFILE_P29V1;
   CHECK(!bad.valid() && encode_cache_session_wire_claim(bad).empty(),
         "unsupported profile is rejected before composing wire");
   bad = exact;

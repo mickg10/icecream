@@ -17,20 +17,12 @@
 namespace icecc::p50 {
 namespace {
 
-ComponentDescriptor empty_dict_descriptor() {
-    return describe_component(kZstdTuNoDictionaryEncoding,
-                              std::span<const uint8_t>{}, 0);
-}
-
 void validate_begin_shape(const TxBegin& begin, ZstdTuLimits limits) {
     validate_zstd_tu_limits(limits);
-    if (begin.profile != ProfileId::ZSTD_TU ||
-        begin.p29_root_mode != P29RootMode::NotApplicable)
+    if (begin.profile != ProfileId::ZSTD_TU)
         throw std::invalid_argument("transaction is not a ZSTD_TU profile");
     if (begin.rel_seq.value == std::numeric_limits<uint64_t>::max())
         throw std::overflow_error("ZSTD_TU begins at terminal REL_SEQ");
-    if (begin.dict != empty_dict_descriptor())
-        throw std::invalid_argument("ZSTD_TU DICT is not canonically empty");
     if (begin.body.encoding != kZstdTuBodyEncoding)
         throw std::invalid_argument("ZSTD_TU BODY encoding is invalid");
     if (begin.body.encoded_bytes == 0)
@@ -144,16 +136,14 @@ ZstdTuEnvelope ZstdTuCodec::encode(HistoryNonce history_nonce, RelSeq rel_seq,
     result.begin.rel_seq = rel_seq;
     result.begin.tu_seq = tu_seq;
     result.begin.profile = ProfileId::ZSTD_TU;
-    result.begin.p29_root_mode = P29RootMode::NotApplicable;
     result.begin.pre_state_digest = pre_state_digest;
-    result.begin.dict = empty_dict_descriptor();
     result.begin.body = describe_component(kZstdTuBodyEncoding, encoded,
                                            exact_input.size());
     result.begin.raw_bytes = exact_input.size();
     result.begin.raw_digest = icecc::digest128(exact_input);
     result.body = std::move(encoded);
     result.begin.transaction_digest = compute_transaction_digest(
-        result.begin, std::span<const uint8_t>{}, result.body);
+        result.begin, result.body);
     return result;
 }
 
@@ -178,8 +168,8 @@ std::vector<uint8_t> ZstdTuCodec::decode(const TxBegin& begin,
         throw std::invalid_argument("ZSTD_TU BODY length differs from TX_BEGIN");
     if (icecc::digest128(encoded_body) != begin.body.digest)
         throw std::invalid_argument("ZSTD_TU encoded BODY digest differs");
-    if (compute_transaction_digest(begin, std::span<const uint8_t>{},
-                                   encoded_body) != begin.transaction_digest)
+    if (compute_transaction_digest(begin, encoded_body) !=
+        begin.transaction_digest)
         throw std::invalid_argument("ZSTD_TU transaction digest differs");
 
     const size_t initialized = ZSTD_initDStream(contexts_->decompress);
@@ -238,13 +228,10 @@ namespace {
 
 void validate_route_begin_shape(const TxBegin& begin, ZstdTuLimits limits) {
     validate_zstd_tu_limits(limits);
-    if (begin.profile != ProfileId::Z3_LONG ||
-        begin.p29_root_mode != P29RootMode::NotApplicable)
+    if (begin.profile != ProfileId::ZSTD_ROUTE)
         throw std::invalid_argument("transaction is not a ZSTD_ROUTE profile");
     if (begin.rel_seq.value == std::numeric_limits<uint64_t>::max())
         throw std::overflow_error("ZSTD_ROUTE begins at terminal REL_SEQ");
-    if (begin.dict != empty_dict_descriptor())
-        throw std::invalid_argument("ZSTD_ROUTE DICT is not canonically empty");
     if (begin.body.encoding != kZstdRouteBodyEncoding ||
         begin.body.encoded_bytes == 0)
         throw std::invalid_argument("ZSTD_ROUTE BODY encoding is invalid");
@@ -358,17 +345,15 @@ ZstdRouteEnvelope ZstdRouteCodec::encode(
     result.begin.history_nonce = history_nonce;
     result.begin.rel_seq = rel_seq;
     result.begin.tu_seq = tu_seq;
-    result.begin.profile = ProfileId::Z3_LONG;
-    result.begin.p29_root_mode = P29RootMode::NotApplicable;
+    result.begin.profile = ProfileId::ZSTD_ROUTE;
     result.begin.pre_state_digest = pre_state_digest;
-    result.begin.dict = empty_dict_descriptor();
     result.begin.body = describe_component(kZstdRouteBodyEncoding, encoded,
                                            exact_input.size());
     result.begin.raw_bytes = exact_input.size();
     result.begin.raw_digest = icecc::digest128(exact_input);
     result.body = std::move(encoded);
     result.begin.transaction_digest = compute_transaction_digest(
-        result.begin, std::span<const uint8_t>{}, result.body);
+        result.begin, result.body);
     return result;
 }
 
@@ -395,7 +380,7 @@ std::vector<uint8_t> ZstdRouteCodec::decode(
     validate_route_begin_shape(begin, limits);
     if (encoded_body.size() != begin.body.encoded_bytes ||
         icecc::digest128(encoded_body) != begin.body.digest ||
-        compute_transaction_digest(begin, std::span<const uint8_t>{}, encoded_body) !=
+        compute_transaction_digest(begin, encoded_body) !=
             begin.transaction_digest)
         throw std::invalid_argument("ZSTD_ROUTE BODY or transaction digest differs");
     if (predecessor_history.size() > route_history_limit(limits))
@@ -464,10 +449,6 @@ void ZstdRouteDialogue::begin(const TxBegin& begin_value) {
     }
     active_ = begin_value;
     state_ = State::ReceivingBody;
-}
-
-void ZstdRouteDialogue::append_dict(const DictMessage&) {
-    protocol_error("ZSTD_ROUTE received DICT after its empty stream was closed");
 }
 
 void ZstdRouteDialogue::append_body(const BodyMessage& message) {
@@ -607,11 +588,6 @@ void ZstdTuDialogue::begin(const TxBegin& begin_value) {
     }
     active_ = begin_value;
     state_ = State::ReceivingBody;
-}
-
-void ZstdTuDialogue::append_dict(const DictMessage& message) {
-    (void)message;
-    protocol_error("ZSTD_TU received DICT after its empty stream was closed");
 }
 
 void ZstdTuDialogue::append_body(const BodyMessage& message) {

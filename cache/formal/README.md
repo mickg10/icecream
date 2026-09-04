@@ -243,9 +243,8 @@ SESSION_DISCONNECTED
 HISTORY_RESET
 TX_BEGIN
 TX_ABORTED
-DICT_COMPLETE
-NEED_RECORDED
 BODY_COMPLETE
+NEED_RECORDED
 OBJECT_APPLIED
 INPUT_MATERIALIZED
 INPUT_COMMITTED
@@ -334,4 +333,7 @@ No TLC success is claimed for a changed model until those exact-head runs are po
 
 ## Deliberate exclusions
 
-The formal lane does not model compression bytes, frame parsing, preprocessing time, scheduler policy, bandwidth, compiler-environment transfer internals, P29 grammar construction, or GRZ parsing. Those remain parser, codec, simulator, and farm-test responsibilities.
+The formal lane does not model compression bytes, frame parsing, preprocessing
+time, scheduler policy, bandwidth, compiler-environment transfer internals, or
+P29V1 grammar construction. Those remain parser, codec, simulator, and
+farm-test responsibilities.

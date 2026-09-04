@@ -23,7 +23,7 @@ CompileJob assigned_job(uint64_t epoch = 101, uint64_t nonce = 202) {
 
 UseCSMsg admissible_assignment() {
     return UseCSMsg{"x86_64", "127.0.0.1", 10245, 33, true, 9, 0,
-                    101, 202, 10246, CACHE_WIRE_PROTOCOL_V1,
+                    101, 202, 10246, CACHE_WIRE_REVISION,
                     CACHE_PROFILE_ZSTD_TU};
 }
 
@@ -40,7 +40,7 @@ void test_exact_mode_admission() {
                                       PROTOCOL_VERSION_CACHE_ADVERTISEMENT));
     CHECK(p50_zstd_selected_profile(assignment,
                                     PROTOCOL_VERSION_CACHE_ADVERTISEMENT) ==
-          std::optional<ProfileId>{ProfileId::Z3_LONG});
+          std::optional<ProfileId>{ProfileId::ZSTD_ROUTE});
 
     UseCSMsg mutant = assignment;
     mutant.assignment_nonce_hi = mutant.assignment_nonce_lo = 0;
@@ -51,12 +51,6 @@ void test_exact_mode_admission() {
     CHECK(!p50_zstd_compile_admissible(mutant,
                                        PROTOCOL_VERSION_CACHE_ADVERTISEMENT));
     mutant = assignment;
-    mutant.cache_profile_mask = CACHE_PROFILE_P29;
-    CHECK(p50_zstd_compile_admissible(mutant,
-                                      PROTOCOL_VERSION_CACHE_ADVERTISEMENT));
-    CHECK(p50_zstd_selected_profile(mutant,
-                                    PROTOCOL_VERSION_CACHE_ADVERTISEMENT) ==
-          std::optional<ProfileId>{ProfileId::P29});
     mutant.cache_profile_mask = CACHE_PROFILE_P29V1;
     CHECK(p50_zstd_compile_admissible(mutant,
                                       PROTOCOL_VERSION_CACHE_ADVERTISEMENT));
@@ -81,11 +75,12 @@ void test_explicit_profile_selection() {
     CHECK(::unsetenv("ICECC_P50_PROFILE") == 0);
     CHECK(p50_cache_profile_request_from_env() ==
           P50CacheProfileRequest::Default);
-    const uint32_t advertised =
-        CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE;
+    const uint32_t advertised = CACHE_PROFILE_P29V1 |
+                                CACHE_PROFILE_ZSTD_TU |
+                                CACHE_PROFILE_ZSTD_ROUTE;
     CHECK(p50_select_cache_profile(advertised,
                                    P50CacheProfileRequest::Default) ==
-          CACHE_PROFILE_ZSTD_ROUTE);
+          CACHE_PROFILE_P29V1);
 
     CHECK(::setenv("ICECC_P50_PROFILE", "ZSTD_TU", 1) == 0);
     CHECK(p50_cache_profile_request_from_env() ==
@@ -102,20 +97,16 @@ void test_explicit_profile_selection() {
           CACHE_PROFILE_ZSTD_ROUTE);
     CHECK(p50_select_cache_profile(CACHE_PROFILE_ZSTD_TU,
                                    P50CacheProfileRequest::ZSTD_ROUTE) == 0);
-    CHECK(p50_cache_profile_request_from_env() != P50CacheProfileRequest::P29);
     CHECK(::setenv("ICECC_P50_PROFILE", "P29", 1) == 0);
-    CHECK(p50_cache_profile_request_from_env() == P50CacheProfileRequest::P29);
-    CHECK(p50_select_cache_profile(CACHE_PROFILE_P29,
-                                   P50CacheProfileRequest::P29) == CACHE_PROFILE_P29);
-    CHECK(p50_select_cache_profile(CACHE_PROFILE_ZSTD_TU,
-                                   P50CacheProfileRequest::P29) == 0);
+    CHECK(p50_cache_profile_request_from_env() ==
+          P50CacheProfileRequest::Unsupported);
 
     CHECK(::setenv("ICECC_P50_PROFILE", "P29V1", 1) == 0);
     CHECK(p50_cache_profile_request_from_env() == P50CacheProfileRequest::P29V1);
     CHECK(p50_select_cache_profile(CACHE_PROFILE_P29V1,
                                    P50CacheProfileRequest::P29V1) ==
           CACHE_PROFILE_P29V1);
-    CHECK(p50_select_cache_profile(CACHE_PROFILE_P29,
+    CHECK(p50_select_cache_profile(CACHE_PROFILE_ZSTD_TU,
                                    P50CacheProfileRequest::P29V1) == 0);
 
     CHECK(::setenv("ICECC_P50_PROFILE", "UNSUPPORTED_PROFILE", 1) == 0);
@@ -123,7 +114,7 @@ void test_explicit_profile_selection() {
           P50CacheProfileRequest::Unsupported);
     CHECK(p50_select_cache_profile(advertised,
                                    P50CacheProfileRequest::Unsupported) == 0);
-    CHECK(p50_select_cache_profile(advertised | CACHE_PROFILE_Z3_SHARED_LONG,
+    CHECK(p50_select_cache_profile(advertised | UINT32_C(0x00000008),
                                    P50CacheProfileRequest::ZSTD_ROUTE) == 0);
     CHECK(::unsetenv("ICECC_P50_PROFILE") == 0);
 }
@@ -177,7 +168,7 @@ void test_only_exact_commit_binds_compile_selector() {
     mutant.attempts = 3;
     CHECK(!bind_compile_input(job, guid, mutant));
     mutant = transfer;
-    mutant.profile = ProfileId::GRZ;
+    mutant.profile = static_cast<ProfileId>(4);
     CHECK(!bind_compile_input(job, guid, mutant));
     CHECK(!bind_compile_input(CompileJob{}, guid, transfer));
 }
@@ -193,9 +184,9 @@ void test_authenticated_sidecar_result_binds_real_identity() {
     transfer.raw_digest = icecc::digest128("sidecar source");
     transfer.attempts = 1;
 
-    const auto identity = bind_compile_input(job, ProfileId::Z3_LONG, transfer);
+    const auto identity = bind_compile_input(job, ProfileId::ZSTD_ROUTE, transfer);
     CHECK(identity.has_value());
-    CHECK(identity->profile == CompileInputIdentity::ZstdTuProfile);
+    CHECK(identity->profile == CompileInputIdentity::ZstdRouteProfile);
     CHECK(identity->c_store_guid == guid.bytes);
     CHECK(identity->tu_seq == 0);
     CHECK(identity->raw_bytes == transfer.raw_bytes);
@@ -203,15 +194,12 @@ void test_authenticated_sidecar_result_binds_real_identity() {
     CHECK(identity->attempt_id == job.assignmentNonce());
     CHECK(identity->request_id == job.assignmentNonce());
 
-    const auto p29 = bind_compile_input(job, ProfileId::P29, transfer);
-    CHECK(p29.has_value());
-    CHECK(p29->profile == CompileInputIdentity::P29Profile);
     const auto p29v1 = bind_compile_input(job, ProfileId::P29V1, transfer);
     CHECK(p29v1.has_value());
     CHECK(p29v1->profile == CompileInputIdentity::P29V1Profile);
 
     transfer.attempts = 3;
-    CHECK(!bind_compile_input(job, ProfileId::GRZ, transfer));
+    CHECK(!bind_compile_input(job, static_cast<ProfileId>(4), transfer));
     transfer.attempts = 1;
     transfer.code = local::SourceTransferResultCode::Error;
     CHECK(!bind_compile_input(job, ProfileId::ZSTD_TU, transfer));

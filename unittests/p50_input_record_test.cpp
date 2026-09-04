@@ -1,4 +1,6 @@
 #include "cache/p50_input_record.h"
+#include "cache/p50_profile.h"
+#include "cache/p50_zstd.h"
 
 #include <algorithm>
 #include <array>
@@ -100,14 +102,13 @@ ExactTransaction transaction_for(TuSeq tu_seq,
     begin.rel_seq = rel_seq;
     begin.tu_seq = tu_seq;
     begin.profile = ProfileId::ZSTD_TU;
-    begin.p29_root_mode = P29RootMode::NotApplicable;
     begin.pre_state_digest = icecc::digest128("input-record-pre-state");
-    begin.dict = describe_component(0, std::span<const uint8_t>{}, 0);
-    begin.body = describe_component(1, encoded_body, exact_input.size());
+    begin.body = describe_component(
+        static_cast<uint16_t>(ProfileId::ZSTD_TU), encoded_body,
+        exact_input.size());
     begin.raw_bytes = exact_input.size();
     begin.raw_digest = icecc::digest128(exact_input);
-    begin.transaction_digest = compute_transaction_digest(
-        begin, std::span<const uint8_t>{}, encoded_body);
+    begin.transaction_digest = compute_transaction_digest(begin, encoded_body);
 
     TxCommit commit{
         begin.history_nonce,
@@ -151,6 +152,87 @@ InputPublishResult commit_without_allocations(
         allocation_probe::enabled = false;
         throw;
     }
+}
+
+TxCommit commit_for(const TxBegin& begin) {
+    return {
+        begin.history_nonce,
+        begin.rel_seq,
+        begin.tu_seq,
+        begin.transaction_digest,
+        begin.raw_digest,
+        compute_post_state_digest(begin.pre_state_digest, begin.history_nonce,
+                                  begin.rel_seq, begin.tu_seq,
+                                  begin.transaction_digest),
+    };
+}
+
+VerifiedMaterialization verified_zstd_tu(
+    const ZstdTuEnvelope& envelope, uint64_t max_raw_bytes) {
+    ProfileDialogue dialogue = ProfileDialogue::create(
+        ProfileId::ZSTD_TU,
+        {
+            .negotiated_profiles = profile_bit(ProfileId::ZSTD_TU),
+            .c_store_guid = CStoreGuid::from_u64(700),
+            .max_encoded_body_bytes = uint64_t{1} << 20,
+            .max_raw_bytes = max_raw_bytes,
+            .max_window_log = 20,
+            .max_history_bytes = uint64_t{1} << 20,
+        });
+    dialogue.begin(envelope.begin);
+    dialogue.append_body(BodyMessage{envelope.body});
+    return dialogue.materialize_verified();
+}
+
+void test_verified_materialization_binds_begin_commit_and_bytes() {
+    static_assert(!std::is_copy_constructible_v<VerifiedMaterialization>);
+    static_assert(!std::is_copy_assignable_v<VerifiedMaterialization>);
+    static_assert(std::is_nothrow_move_constructible_v<VerifiedMaterialization>);
+
+    const CStoreGuid c_guid = CStoreGuid::from_u64(701);
+    const std::vector<uint8_t> input = bytes(64 * 1024, 37);
+    const ZstdTuLimits codec_limits{uint64_t{1} << 20,
+                                    uint64_t{1} << 20, 20,
+                                    uint64_t{1} << 20};
+    const ZstdTuEnvelope envelope = encode_zstd_tu(
+        HistoryNonce{23}, RelSeq{4}, TuSeq{702},
+        icecc::digest128("verified-publish-pre-state"), input, 1,
+        codec_limits);
+    const TxCommit commit = commit_for(envelope.begin);
+
+    TxBegin wrong_begin = envelope.begin;
+    wrong_begin.tu_seq = TuSeq{wrong_begin.tu_seq.value + 1};
+    require_throws<std::invalid_argument>(
+        [&] {
+            (void)InputRecordStore::prepare_verified_publish(
+                c_guid, wrong_begin, commit,
+                verified_zstd_tu(envelope, codec_limits.max_raw_bytes));
+        },
+        "verified materialization was accepted for a different TX_BEGIN");
+
+    TxCommit wrong_commit = commit;
+    wrong_commit.raw_digest.bytes[0] ^= 0x80;
+    require_throws<std::invalid_argument>(
+        [&] {
+            (void)InputRecordStore::prepare_verified_publish(
+                c_guid, envelope.begin, wrong_commit,
+                verified_zstd_tu(envelope, codec_limits.max_raw_bytes));
+        },
+        "verified materialization was accepted for a different TX_COMMIT");
+
+    InputRecordStore store(2, uint64_t{1} << 20);
+    InputRecordStore::PreparedPublish prepared =
+        InputRecordStore::prepare_verified_publish(
+            c_guid, envelope.begin, commit,
+            verified_zstd_tu(envelope, codec_limits.max_raw_bytes));
+    require(std::ranges::equal(prepared.exact_input(), input),
+            "verified publication authority changed reconstructed bytes");
+    require(store.commit_prepared(std::move(prepared)) ==
+                InputPublishResult::Published,
+            "matching verified materialization did not publish");
+    InputCursor retained = store.attach({c_guid, envelope.begin.tu_seq});
+    require(drain(retained, 997) == input,
+            "verified publication retained bytes other than the ZSTD_TU result");
 }
 
 void test_prepared_publish_is_exact_one_shot_and_allocation_free() {
@@ -615,6 +697,7 @@ void test_guid_flip_capacity_failure_then_retry() {
 }  // namespace
 
 int main() {
+    test_verified_materialization_binds_begin_commit_and_bytes();
     test_prepared_publish_is_exact_one_shot_and_allocation_free();
     test_prepared_capacity_failure_is_transactional();
     test_prepared_closed_job_observation_never_reopens();

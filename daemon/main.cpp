@@ -953,13 +953,12 @@ public:
             acknowledgement.f_store_derivation_version ==
                 p50_source_f_lease->store_derivation_version;
         return ack_matches_lease &&
-               ((input.profile == CompileInputIdentity::P29Profile &&
-                 p50_source_arm_fields->cache_profile == CACHE_PROFILE_P29) ||
-                (input.profile == CompileInputIdentity::P29V1Profile &&
+               ((input.profile == CompileInputIdentity::P29V1Profile &&
                  p50_source_arm_fields->cache_profile == CACHE_PROFILE_P29V1) ||
                 (input.profile == CompileInputIdentity::ZstdTuProfile &&
-                 p50_source_arm_fields->cache_profile != CACHE_PROFILE_P29 &&
-                 p50_source_arm_fields->cache_profile != CACHE_PROFILE_P29V1)) &&
+                 p50_source_arm_fields->cache_profile == CACHE_PROFILE_ZSTD_TU) ||
+                (input.profile == CompileInputIdentity::ZstdRouteProfile &&
+                 p50_source_arm_fields->cache_profile == CACHE_PROFILE_ZSTD_ROUTE)) &&
                input.c_store_guid == p50_source_arm_fields->c_store_guid &&
                input.attempt_id == p50_source_arm_fields->compiler_attempt &&
                input.request_id == p50_source_arm_fields->source_request_id;
@@ -7665,6 +7664,29 @@ bool Daemon::handle_compile_done(Client *client)
     return false;
 }
 
+static int p50_attachment_failure_exit_code(
+    icecc::p50::InputFdAttachmentStatus status) noexcept
+{
+    using Status = icecc::p50::InputFdAttachmentStatus;
+    switch (status) {
+    case Status::InvalidArgument:
+    case Status::UnsupportedPlatform:
+    case Status::MalformedRequest:
+    case Status::UnknownRecord:
+    case Status::StaleIdentity:
+    case Status::MaterializationFailed:
+        return 146; // authoritative record/identity refusal
+    case Status::Accepted:
+    case Status::PeerUnauthenticated:
+    case Status::HandshakeFailed:
+    case Status::Timeout:
+    case Status::Disconnected:
+    case Status::HandoffFailed:
+        return 152; // sidecar transport or malformed accepted handoff
+    }
+    return 152;
+}
+
 bool Daemon::handle_compile_file(Client *client, Msg *msg)
 {
     CompileJob *job = dynamic_cast<CompileFileMsg *>(msg)->takeJob();
@@ -7692,13 +7714,12 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
                 continue;
             const CompileInputIdentity &input = job->compileInputIdentity();
             if (!input.validPresent() ||
-                !((input.profile == CompileInputIdentity::P29Profile &&
-                   arm.cache_profile == CACHE_PROFILE_P29) ||
-                  (input.profile == CompileInputIdentity::P29V1Profile &&
+                !((input.profile == CompileInputIdentity::P29V1Profile &&
                    arm.cache_profile == CACHE_PROFILE_P29V1) ||
                   (input.profile == CompileInputIdentity::ZstdTuProfile &&
-                   arm.cache_profile != CACHE_PROFILE_P29 &&
-                   arm.cache_profile != CACHE_PROFILE_P29V1)) ||
+                   arm.cache_profile == CACHE_PROFILE_ZSTD_TU) ||
+                  (input.profile == CompileInputIdentity::ZstdRouteProfile &&
+                   arm.cache_profile == CACHE_PROFILE_ZSTD_ROUTE)) ||
                 input.c_store_guid != arm.c_store_guid ||
                 input.attempt_id != arm.compiler_attempt ||
                 input.request_id != arm.source_request_id)
@@ -7815,7 +7836,8 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
                           << static_cast<unsigned>(attached.status) << ")" << endl;
             delete job;
             (void)client->channel->send_msg(EndMsg());
-            handle_end(client, 146);
+            handle_end(client,
+                       p50_attachment_failure_exit_code(attached.status));
             return false;
         }
         const P50SourceArmFields &arm = *client->p50_source_arm_fields;
@@ -7867,15 +7889,11 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
         }
         client->last_known_job_id = job->jobID();
         trace() << "P50 CompileFile attached exact "
-                << (arm.cache_profile == CACHE_PROFILE_P29
-                        ? "P29"
-                        : (arm.cache_profile == CACHE_PROFILE_P29V1
+                << (arm.cache_profile == CACHE_PROFILE_P29V1
                                ? "P29V1"
                         : (arm.cache_profile == CACHE_PROFILE_ZSTD_ROUTE
                         ? "ZSTD_ROUTE"
-                        : (arm.cache_profile == CACHE_PROFILE_GRZ
-                               ? "GRZ_RESIDUAL"
-                               : "ZSTD_TU"))))
+                        : "ZSTD_TU"))
                 << " input for job "
                 << job->jobID() << endl;
         return true;
@@ -10167,6 +10185,14 @@ int Daemon::working_loop()
         if (!cache_shutdown_started) {
             reconnect();
             poll_cache_adapter();
+        } else if (cache_adapter != nullptr) {
+            // Shutdown still owns one serialized adapter action per daemon
+            // turn.  poll_cache_adapter() normally opens that quota, but it
+            // is deliberately disabled once shutdown starts so it cannot
+            // reconnect or republish.  Keep only the begin-turn reset here;
+            // answer_client_requests() performs the one poll/advance below.
+            (void)cache_adapter->outer_begin_turn(
+                std::chrono::steady_clock::now(), nullptr);
         }
         answer_client_requests();
         maybe_dump_state();

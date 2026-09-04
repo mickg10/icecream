@@ -3,8 +3,6 @@
 
 #include "p50_adopted_outcome_writer.h"
 #include "codec/p29_wire.h"
-#include "p50_grz.h"
-#include "p50_p29_residual.h"
 
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/post.hpp>
@@ -56,19 +54,6 @@ void add_saturating(uint64_t& target, uint64_t value) noexcept {
                  : target + value;
 }
 
-std::vector<std::vector<uint8_t>> p29_line_regions(std::span<const uint8_t> input) {
-    std::vector<std::vector<uint8_t>> regions;
-    size_t begin = 0;
-    for (size_t at = 0; at < input.size(); ++at) {
-        if (input[at] != '\n') continue;
-        regions.emplace_back(input.begin() + begin, input.begin() + at + 1);
-        begin = at + 1;
-    }
-    if (begin != input.size())
-        regions.emplace_back(input.begin() + begin, input.end());
-    return regions;
-}
-
 class SingleThreadOwner {
 public:
     void require() const {
@@ -106,12 +91,9 @@ void validate_caps(const EndpointCaps& caps) {
     if (caps.wire.max_fill_record_bytes < 32)
         throw std::invalid_argument("endpoint FILL-record cap is too small");
     validate_zstd_tu_limits(caps.zstd);
-    if (caps.profile != ProfileId::P29 && caps.profile != ProfileId::P29V1 &&
-        caps.profile != ProfileId::ZSTD_TU && caps.profile != ProfileId::Z3_LONG
-#if defined(ICECC_P50_WITH_LIBBSC)
-        && caps.profile != ProfileId::GRZ
-#endif
-        )
+    if (caps.profile != ProfileId::P29V1 &&
+        caps.profile != ProfileId::ZSTD_TU &&
+        caps.profile != ProfileId::ZSTD_ROUTE)
         throw std::invalid_argument("endpoint profile is unsupported");
     if (caps.supported_profiles == 0 ||
         (caps.supported_profiles & ~kOperationalProfileMask) != 0)
@@ -552,12 +534,12 @@ async_materialize(ServerMaterializationJob job,
                            job.before_materialize();
                        const auto materialize_started =
                            std::chrono::steady_clock::now();
-                       std::vector<uint8_t> exact =
-                           completion.dialogue->materialize();
+                       VerifiedMaterialization exact =
+                           completion.dialogue->materialize_verified();
                        completion.materialize_ns =
                            elapsed_nanoseconds(materialize_started);
                        completion.prepared_input =
-                           InputRecordStore::prepare_publish(
+                           InputRecordStore::prepare_verified_publish(
                                job.c_store_guid, job.begin, job.commit,
                                std::move(exact));
                    } catch (...) {
@@ -858,10 +840,7 @@ ActionRecord action_record(ActionType action, ActorSide actor, CStoreGuid c_guid
             record.state_digest = begin->pre_state_digest;
         switch (action) {
         case ActionType::TX_BEGIN:
-            record.stage_bytes = begin->dict.encoded_bytes + begin->body.encoded_bytes;
-            break;
-        case ActionType::DICT_COMPLETE:
-            record.stage_bytes = begin->dict.encoded_bytes;
+            record.stage_bytes = begin->body.encoded_bytes;
             break;
         case ActionType::BODY_COMPLETE:
             record.stage_bytes = begin->body.encoded_bytes;
@@ -902,13 +881,6 @@ struct P50PreparationAuthority::Impl {
         std::vector<uint8_t> committed_route_history;
         Digest128 committed_route_history_digest = digest128(std::span<const uint8_t>{});
         std::optional<uint64_t> uncommitted_route_entry;
-#if defined(ICECC_P50_WITH_LIBBSC)
-        GrzResidualCodec grz_codec;
-        std::optional<uint64_t> uncommitted_grz_entry;
-        HistoryNonce grz_history_nonce{1};
-        RelSeq grz_next_rel{};
-        Digest128 grz_state_digest{};
-#endif
         std::unique_ptr<CRoute> p29_route;
         Digest128 p29v1_system_source_fingerprint{};
     };
@@ -950,15 +922,12 @@ struct P50PreparationAuthority::Impl {
             authority_limits.max_interner_reserved_bytes == 0 ||
             authority_limits.max_route_state_bytes == 0)
             throw std::invalid_argument("preparation-authority limits must be nonzero");
-        if (profile != ProfileId::P29 && profile != ProfileId::P29V1 &&
-            profile != ProfileId::ZSTD_TU && profile != ProfileId::Z3_LONG
-#if defined(ICECC_P50_WITH_LIBBSC)
-            && profile != ProfileId::GRZ
-#endif
-            )
+        if (profile != ProfileId::P29V1 &&
+            profile != ProfileId::ZSTD_TU &&
+            profile != ProfileId::ZSTD_ROUTE)
             throw std::invalid_argument("preparation authority profile is unsupported");
-        p29_authority = std::make_unique<CAuthority>(c_guid, p29::OnlineS1::Config{},
-                                                      0, 1, first_tu_seq);
+        p29_authority = std::make_unique<CAuthority>(
+            c_guid, p29::OnlineS1::Config{}, first_tu_seq);
         if (profile == ProfileId::P29V1)
             ensure_p29v1();
     }
@@ -981,12 +950,8 @@ struct P50PreparationAuthority::Impl {
         if (key.f_store_guid == FStoreGuid{} || key.f_store_generation == 0)
             throw std::invalid_argument("preparation route identity is zero");
         if (key.profile != ProfileId::ZSTD_TU &&
-            key.profile != ProfileId::Z3_LONG && key.profile != ProfileId::P29 &&
-            key.profile != ProfileId::P29V1
-#if defined(ICECC_P50_WITH_LIBBSC)
-            && key.profile != ProfileId::GRZ
-#endif
-            )
+            key.profile != ProfileId::ZSTD_ROUTE &&
+            key.profile != ProfileId::P29V1)
             throw std::invalid_argument("preparation route profile is unsupported");
         auto found = routes.find(key);
         if (found != routes.end()) return *found->second;
@@ -1001,7 +966,7 @@ struct P50PreparationAuthority::Impl {
             state->p29v1_system_source_fingerprint =
                 p29_system_source_fingerprint();
         }
-        if (key.profile == ProfileId::P29 || key.profile == ProfileId::P29V1)
+        if (key.profile == ProfileId::P29V1)
             state->p29_route = std::make_unique<CRoute>(
                 *p29_authority, key.f_store_guid, HistoryNonce{1});
         RouteState& result = *state;
@@ -1049,12 +1014,6 @@ P50PreparationAuthority::P50PreparationAuthority(
 
 P50PreparationAuthority::~P50PreparationAuthority() = default;
 
-void P50PreparationAuthority::set_p29_verification(
-    CAuthority::Verification verification) {
-    impl_->owner.require();
-    impl_->p29_authority->set_verification(verification);
-}
-
 PreparedTuHandle P50PreparationAuthority::prepare(PrepareRequestKey request,
                                                    std::span<const uint8_t> exact_input) {
     return prepare_for_route(Impl::legacy_route(impl_->profile), request, exact_input);
@@ -1088,16 +1047,11 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
     // exactly once and cannot change its reuse decision mid-relationship.
     Impl::RouteState& route = impl_->route_state(route_key);
 
-    if ((route.profile == ProfileId::Z3_LONG || route.profile == ProfileId::P29 ||
+    if ((route.profile == ProfileId::ZSTD_ROUTE ||
          route.profile == ProfileId::P29V1) &&
         route.uncommitted_route_entry.has_value())
         throw std::logic_error(
             "selected route profile requires its predecessor to commit before preparing the next TU");
-#if defined(ICECC_P50_WITH_LIBBSC)
-    if (route.profile == ProfileId::GRZ && route.uncommitted_grz_entry.has_value())
-        throw std::logic_error(
-            "GRZ_RESIDUAL requires its predecessor to commit before preparing the next TU");
-#endif
 
     if (impl_->entries.size() >= impl_->authority_limits.max_live_entries)
         throw std::length_error("C preparation authority reached its live-entry bound");
@@ -1131,74 +1085,34 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
                 HistoryNonce{1}, RelSeq{0}, tu_seq, Digest128{}, exact_input,
                 admission_limits);
             prepared = std::make_shared<const PreparedInputEnvelope>(
-                PreparedInputEnvelope{envelope.begin, {}, envelope.body, {}});
-        } else if (route.profile == ProfileId::Z3_LONG) {
+                PreparedInputEnvelope{envelope.begin, envelope.body});
+        } else if (route.profile == ProfileId::ZSTD_ROUTE) {
             const ZstdRouteEnvelope envelope = impl_->route_codec.encode(
                 HistoryNonce{1}, RelSeq{0}, tu_seq, Digest128{},
                 std::span<const uint8_t>(route.committed_route_history), exact_input,
                 admission_limits);
             prepared = std::make_shared<const PreparedInputEnvelope>(
-                PreparedInputEnvelope{envelope.begin, {}, envelope.body, {}});
-        } else if (route.profile == ProfileId::P29) {
-            std::vector<std::vector<uint8_t>> regions = p29_line_regions(exact_input);
-            if (!shared->p29_source) {
-                shared->p29_source = impl_->p29_authority->prepare_from_regions_at_seq(
-                    regions, shared->tu_seq);
-            }
-            if (shared->p29_source->tu_seq != tu_seq)
-                throw std::logic_error("P29 shared TU identity changed");
-            const PreparedTUPtr p29_prepared = shared->p29_source;
-            const P29RootMode root_mode = route.p29_route->next_rel_seq().value == 0
-                                              ? P29RootMode::HistoryIndependent
-                                              : P29RootMode::RouteHistory;
-            const CActiveTx& active = route.p29_route->begin(
-                p29_prepared, root_mode, /*residual_body=*/true);
-            p29_active_started = true;
-            std::vector<FillRecord> fills;
-            fills.reserve(active.manifest.size());
-            for (Key64 key : active.manifest) {
-                if (active.begin.body.encoding == kP29ResidualBodyEncoding &&
-                    key.type() == ObjectType::Line)
-                    continue;
-                fills.push_back(impl_->p29_authority->arena().object(key).fill_record());
-            }
-            prepared = std::make_shared<const PreparedInputEnvelope>(
-                PreparedInputEnvelope{active.begin, active.dict, active.body,
-                                      std::move(fills)});
+                PreparedInputEnvelope{envelope.begin, envelope.body});
         } else if (route.profile == ProfileId::P29V1) {
             if (!shared->p29_source) {
                 shared->p29_source =
                     impl_->p29_authority->prepare_p29v1_at_seq(
-                        exact_input, shared->tu_seq);
+                        exact_input, shared->tu_seq, shared->raw_digest);
             }
             if (shared->p29_source->tu_seq != tu_seq)
                 throw std::logic_error("P29V1 shared TU identity changed");
             const CActiveTx& active = route.p29_route->begin_v1(
                 shared->p29_source,
-                route.p29v1_system_source_fingerprint,
                 impl_->authority_limits.max_route_state_bytes);
             p29_active_started = true;
             prepared = std::make_shared<const PreparedInputEnvelope>(
-                PreparedInputEnvelope{active.begin, {}, active.body, {}});
-#if defined(ICECC_P50_WITH_LIBBSC)
-        } else if (route.profile == ProfileId::GRZ) {
-            const ZstdTuEnvelope envelope = route.grz_codec.encode(
-                route.grz_history_nonce, route.grz_next_rel, tu_seq,
-                route.grz_state_digest, exact_input,
-                admission_limits);
-            prepared = std::make_shared<const PreparedInputEnvelope>(
-                PreparedInputEnvelope{envelope.begin, {}, envelope.body, {}});
-#endif
+                PreparedInputEnvelope{active.begin, active.body});
         } else {
             throw std::logic_error("preparation authority profile is not runnable");
         }
     } catch (...) {
         if (p29_active_started && route.p29_route)
             route.p29_route->abandon_active();
-#if defined(ICECC_P50_WITH_LIBBSC)
-        if (route.profile == ProfileId::GRZ)
-            route.grz_codec.discard();
-#endif
         throw;
     }
 
@@ -1225,14 +1139,9 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
         impl_->requests.emplace(request, shared);
         impl_->retained_bytes += retained;
         retained_added = true;
-        if (route.profile == ProfileId::Z3_LONG)
+        if (route.profile == ProfileId::ZSTD_ROUTE ||
+            route.profile == ProfileId::P29V1)
             route.uncommitted_route_entry = entry_id;
-        if (route.profile == ProfileId::P29 || route.profile == ProfileId::P29V1)
-            route.uncommitted_route_entry = entry_id;
-#if defined(ICECC_P50_WITH_LIBBSC)
-        if (route.profile == ProfileId::GRZ)
-            route.uncommitted_grz_entry = entry_id;
-#endif
         impl_->consume_entry();
         if (reserved_tu_seq)
             impl_->p29_authority->commit_tu_seq(*reserved_tu_seq);
@@ -1247,24 +1156,16 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
             impl_->requests.erase(request);
         if (entry_added)
             impl_->entries.erase(entry_id);
-        if ((route.profile == ProfileId::Z3_LONG || route.profile == ProfileId::P29 ||
+        if ((route.profile == ProfileId::ZSTD_ROUTE ||
              route.profile == ProfileId::P29V1) &&
             route.uncommitted_route_entry == entry_id)
             route.uncommitted_route_entry.reset();
-#if defined(ICECC_P50_WITH_LIBBSC)
-        if (route.profile == ProfileId::GRZ) {
-            if (route.uncommitted_grz_entry == entry_id)
-                route.uncommitted_grz_entry.reset();
-            route.grz_codec.discard();
-        }
-#endif
         throw;
     }
 }
 
 std::span<const uint8_t> P50PreparationAuthority::answer_p29v1_need(
-    PreparedTuHandle handle, uint64_t flags,
-    std::span<const uint8_t> inner_need) {
+    PreparedTuHandle handle, std::span<const uint8_t> inner_need) {
     impl_->owner.require();
     if (handle.authority_.lock() != impl_->identity || handle.entry_id_ == 0)
         throw std::invalid_argument(
@@ -1279,7 +1180,43 @@ std::span<const uint8_t> P50PreparationAuthority::answer_p29v1_need(
     if (!route.p29_route ||
         route.uncommitted_route_entry != handle.entry_id_)
         throw std::logic_error("P29V1 NEED does not identify the route successor");
-    return route.p29_route->build_fill_v1(flags, inner_need);
+    return route.p29_route->build_fill_v1(inner_need);
+}
+
+Digest128 P50PreparationAuthority::p29v1_system_source_fingerprint(
+    PreparedTuHandle handle) const {
+    impl_->owner.require();
+    if (handle.authority_.lock() != impl_->identity || handle.entry_id_ == 0)
+        throw std::invalid_argument(
+            "prepared-TU handle does not belong to this C authority");
+    const auto position = impl_->entries.find(handle.entry_id_);
+    if (position == impl_->entries.end() ||
+        position->second.route.profile != ProfileId::P29V1)
+        throw std::invalid_argument("prepared-TU handle is not P29V1");
+    const auto route = impl_->routes.find(position->second.route);
+    if (route == impl_->routes.end())
+        throw std::logic_error("P29V1 route state is absent");
+    return route->second->p29v1_system_source_fingerprint;
+}
+
+void P50PreparationAuthority::pin_p29v1_system_source_reuse(
+    PreparedTuHandle handle, Digest128 f_fingerprint) {
+    impl_->owner.require();
+    if (handle.authority_.lock() != impl_->identity || handle.entry_id_ == 0)
+        throw std::invalid_argument(
+            "prepared-TU handle does not belong to this C authority");
+    const auto position = impl_->entries.find(handle.entry_id_);
+    if (position == impl_->entries.end() || position->second.committed ||
+        position->second.route.profile != ProfileId::P29V1)
+        throw std::invalid_argument("prepared-TU handle is not active P29V1");
+    Impl::RouteState& route = impl_->route_state(position->second.route);
+    if (!route.p29_route ||
+        route.uncommitted_route_entry != handle.entry_id_)
+        throw std::logic_error(
+            "P29V1 fingerprint does not identify the route successor");
+    const Digest128 c_fingerprint = route.p29v1_system_source_fingerprint;
+    route.p29_route->pin_v1_system_source_reuse(
+        c_fingerprint != Digest128{} && c_fingerprint == f_fingerprint);
 }
 
 void P50PreparationAuthority::restart_p29v1_transport_retry(
@@ -1328,11 +1265,10 @@ PreparedInputPtr P50PreparationAuthority::reset_p29v1_route(
     route.p29_route->reset_v1_route(f_store_guid, history_nonce);
     const CActiveTx& active = route.p29_route->begin_v1(
         entry.shared->p29_source,
-        route.p29v1_system_source_fingerprint,
         impl_->authority_limits.max_route_state_bytes);
     PreparedInputPtr replacement =
         std::make_shared<const PreparedInputEnvelope>(
-            PreparedInputEnvelope{active.begin, {}, active.body, {}});
+            PreparedInputEnvelope{active.begin, active.body});
     const uint64_t retained = static_cast<uint64_t>(replacement->body.size());
     const uint64_t other_retained = impl_->retained_bytes - entry.retained_bytes;
     if (retained > impl_->authority_limits.max_retained_encoded_bytes ||
@@ -1371,24 +1307,15 @@ uint64_t P50PreparationAuthority::release(PreparedTuHandle handle) {
     Impl::RouteState& route = impl_->route_state(entry.route);
     if (--entry.references != 0)
         return entry.references;
-    if ((entry.route.profile == ProfileId::Z3_LONG ||
-         entry.route.profile == ProfileId::P29 ||
+    if ((entry.route.profile == ProfileId::ZSTD_ROUTE ||
          entry.route.profile == ProfileId::P29V1) &&
         !entry.committed &&
         route.uncommitted_route_entry == handle.entry_id_)
     {
         route.uncommitted_route_entry.reset();
-        if ((entry.route.profile == ProfileId::P29 ||
-             entry.route.profile == ProfileId::P29V1) && route.p29_route)
+        if (entry.route.profile == ProfileId::P29V1 && route.p29_route)
             route.p29_route->abandon_active();
     }
-#if defined(ICECC_P50_WITH_LIBBSC)
-    if (entry.route.profile == ProfileId::GRZ && !entry.committed &&
-        route.uncommitted_grz_entry == handle.entry_id_) {
-        route.uncommitted_grz_entry.reset();
-        route.grz_codec.discard();
-    }
-#endif
     impl_->retained_bytes -= entry.retained_bytes;
     const PreparationRouteKey route_key = entry.route;
     const PrepareRequestKey request = entry.request;
@@ -1409,7 +1336,7 @@ void P50PreparationAuthority::commit(PreparedTuHandle handle) {
         throw std::invalid_argument("prepared-TU handle has been released");
     auto& entry = position->second;
     Impl::RouteState& route = impl_->route_state(entry.route);
-    if (entry.route.profile == ProfileId::Z3_LONG && !entry.committed) {
+    if (entry.route.profile == ProfileId::ZSTD_ROUTE && !entry.committed) {
         if (route.uncommitted_route_entry != handle.entry_id_)
             throw std::logic_error("ZSTD_ROUTE commit is not its prepared successor");
         const size_t limit = static_cast<size_t>(std::min<uint64_t>(
@@ -1435,10 +1362,9 @@ void P50PreparationAuthority::commit(PreparedTuHandle handle) {
         entry.committed = true;
         route.uncommitted_route_entry.reset();
     }
-    if ((entry.route.profile == ProfileId::P29 ||
-         entry.route.profile == ProfileId::P29V1) && !entry.committed) {
+    if (entry.route.profile == ProfileId::P29V1 && !entry.committed) {
         if (route.uncommitted_route_entry != handle.entry_id_)
-            throw std::logic_error("P29 commit is not its prepared successor");
+            throw std::logic_error("P29V1 commit is not its prepared successor");
         const auto commit = TxCommit{entry.prepared->begin.history_nonce,
                                      entry.prepared->begin.rel_seq,
                                      entry.prepared->begin.tu_seq,
@@ -1454,107 +1380,6 @@ void P50PreparationAuthority::commit(PreparedTuHandle handle) {
         entry.committed = true;
         route.uncommitted_route_entry.reset();
     }
-#if defined(ICECC_P50_WITH_LIBBSC)
-    if (entry.route.profile == ProfileId::GRZ && !entry.committed) {
-        if (route.uncommitted_grz_entry != handle.entry_id_)
-            throw std::logic_error("GRZ_RESIDUAL commit is not its prepared successor");
-        route.grz_codec.commit();
-        route.grz_state_digest = compute_post_state_digest(
-            entry.prepared->begin.pre_state_digest,
-            entry.prepared->begin.history_nonce,
-            entry.prepared->begin.rel_seq,
-            entry.prepared->begin.tu_seq,
-            entry.prepared->begin.transaction_digest);
-        if (route.grz_next_rel.value == std::numeric_limits<uint64_t>::max())
-            throw std::overflow_error("GRZ_RESIDUAL REL_SEQ exhausted");
-        ++route.grz_next_rel.value;
-        entry.committed = true;
-        route.uncommitted_grz_entry.reset();
-    }
-#endif
-}
-
-void P50PreparationAuthority::prime_grz_initial_state(HistoryNonce history_nonce) {
-    prime_grz_initial_state(Impl::legacy_route(impl_->profile), history_nonce);
-}
-
-void P50PreparationAuthority::prime_grz_initial_state(
-    PreparationRouteKey route_key, HistoryNonce history_nonce) {
-    impl_->owner.require();
-#if defined(ICECC_P50_WITH_LIBBSC)
-    if (route_key.profile != ProfileId::GRZ)
-        return;
-    Impl::RouteState& route = impl_->route_state(route_key);
-    if (route.uncommitted_grz_entry.has_value() ||
-        route.grz_next_rel.value != 0 || route.grz_state_digest != Digest128{})
-        throw std::logic_error("GRZ_RESIDUAL initial state was already used");
-    const Digest128 initial_state = initial_route_digest(impl_->c_guid, history_nonce);
-    route.grz_codec.prime_initial_state(history_nonce, initial_state);
-    route.grz_history_nonce = history_nonce;
-    route.grz_state_digest = initial_state;
-#else
-    (void)route_key;
-    (void)history_nonce;
-#endif
-}
-
-PreparedInputPtr P50PreparationAuthority::reset_grz_route(
-    PreparedTuHandle handle, HistoryNonce history_nonce) {
-    impl_->owner.require();
-#if defined(ICECC_P50_WITH_LIBBSC)
-    if (history_nonce.value == 0)
-        throw std::invalid_argument("GRZ route reset HISTORY_NONCE is zero");
-    if (handle.authority_.lock() != impl_->identity || handle.entry_id_ == 0)
-        throw std::invalid_argument("prepared-TU handle does not belong to this C authority");
-    const auto position = impl_->entries.find(handle.entry_id_);
-    if (position == impl_->entries.end())
-        throw std::invalid_argument("prepared-TU handle has been released");
-    Impl::Entry& entry = position->second;
-    if (entry.route.profile != ProfileId::GRZ)
-        throw std::invalid_argument("GRZ route reset selected a non-GRZ route");
-    Impl::RouteState& route = impl_->route_state(entry.route);
-    if (entry.committed || route.uncommitted_grz_entry != handle.entry_id_)
-        throw std::logic_error(
-            "GRZ route reset requires its one uncommitted transaction");
-
-    const uint64_t old_retained = entry.retained_bytes;
-    if (old_retained > impl_->retained_bytes)
-        throw std::logic_error("GRZ authority retained-byte accounting underflow");
-    const uint64_t retained_room =
-        impl_->authority_limits.max_retained_encoded_bytes -
-        (impl_->retained_bytes - old_retained);
-    if (retained_room == 0)
-        throw std::length_error("C preparation authority reached its retained-byte bound");
-
-    ZstdTuLimits admission_limits = impl_->zstd_limits;
-    admission_limits.max_encoded_body_bytes =
-        std::min(admission_limits.max_encoded_body_bytes, retained_room);
-    const Digest128 reset_state = initial_route_digest(impl_->c_guid, history_nonce);
-    // Build against a fresh codec first.  If admission fails, the old
-    // uncommitted retry remains intact and can still be reconciled.
-    GrzResidualCodec rebuilt;
-    rebuilt.prime_initial_state(history_nonce, reset_state);
-    const GrzResidualEnvelope envelope = rebuilt.encode(
-        history_nonce, RelSeq{0}, entry.prepared->begin.tu_seq, reset_state,
-        entry.shared->raw, admission_limits);
-    const uint64_t retained = static_cast<uint64_t>(envelope.body.size());
-    if (retained > retained_room)
-        throw std::length_error("C preparation authority reached its retained-byte bound");
-    const PreparedInputPtr prepared = std::make_shared<const PreparedInputEnvelope>(
-        PreparedInputEnvelope{envelope.begin, {}, envelope.body, {}});
-
-    route.grz_codec = std::move(rebuilt);
-    route.grz_history_nonce = history_nonce;
-    route.grz_next_rel = RelSeq{0};
-    route.grz_state_digest = reset_state;
-    impl_->retained_bytes = impl_->retained_bytes - old_retained + retained;
-    entry.retained_bytes = retained;
-    entry.prepared = prepared;
-    return prepared;
-#else
-    (void)history_nonce;
-    return resolve(handle);
-#endif
 }
 
 CStoreGuid P50PreparationAuthority::c_store_guid() const {
@@ -1628,10 +1453,6 @@ size_t P50PreparationAuthority::route_history_bytes(
     PreparationRouteKey route_key) const {
     impl_->owner.check();
     const Impl::RouteState& route = impl_->route_state(route_key);
-#if defined(ICECC_P50_WITH_LIBBSC)
-    if (route.profile == ProfileId::GRZ)
-        return route.grz_codec.retained_history_bytes();
-#endif
     return route.committed_route_history.size();
 }
 
@@ -1653,10 +1474,6 @@ size_t P50PreparationAuthority::route_history_entries(
     PreparationRouteKey route_key) const {
     impl_->owner.check();
     const Impl::RouteState& route = impl_->route_state(route_key);
-#if defined(ICECC_P50_WITH_LIBBSC)
-    if (route.profile == ProfileId::GRZ)
-        return route.grz_codec.retained_history_bytes() == 0 ? 0 : 1;
-#endif
     return route.committed_route_history.empty() ? 0 : 1;
 }
 
@@ -1697,35 +1514,20 @@ void P50PreparationAuthority::validate_begin(const TxBegin& begin) const {
     impl_->owner.require();
     if (begin.profile == ProfileId::ZSTD_TU)
         validate_zstd_tu_begin(begin, impl_->zstd_limits);
-    else if (begin.profile == ProfileId::Z3_LONG) {
+    else if (begin.profile == ProfileId::ZSTD_ROUTE) {
         // The route envelope has already been validated by its codec; retain
         // the profile and cap checks at the authority boundary as well.
         validate_zstd_tu_limits(impl_->zstd_limits);
+        if (begin.body.encoding != kZstdRouteBodyEncoding)
+            throw std::invalid_argument(
+                "prepared ZSTD_ROUTE profile differs from authority");
         if (begin.body.encoded_bytes > impl_->zstd_limits.max_encoded_body_bytes ||
             begin.raw_bytes > impl_->zstd_limits.max_raw_bytes)
             throw std::length_error("prepared route exceeds authority limits");
     }
-#if defined(ICECC_P50_WITH_LIBBSC)
-    else if (begin.profile == ProfileId::GRZ) {
-        validate_grz_residual_begin(begin, impl_->zstd_limits);
-    }
-#endif
-    else if (begin.profile == ProfileId::P29) {
-        if (begin.p29_root_mode == P29RootMode::NotApplicable ||
-            begin.dict.encoding != kP29KeyVectorEncoding ||
-            (begin.body.encoding != kP29KeyVectorEncoding &&
-             begin.body.encoding != kP29ResidualBodyEncoding))
-            throw std::invalid_argument("prepared P29 profile differs from authority");
-        if (begin.raw_bytes > impl_->zstd_limits.max_raw_bytes ||
-            begin.body.encoded_bytes > impl_->zstd_limits.max_encoded_body_bytes ||
-            begin.dict.encoded_bytes > impl_->zstd_limits.max_encoded_body_bytes)
-            throw std::length_error("prepared P29 input exceeds authority limits");
-    }
     else if (begin.profile == ProfileId::P29V1) {
-        if (begin.p29_root_mode != P29RootMode::RouteHistory ||
-            begin.dict.encoding != kP29V1FingerprintDictEncoding ||
-            begin.dict.encoded_bytes != 0 || begin.dict.decoded_bytes != 0 ||
-            begin.body.encoding != kP29WireV1BodyEncoding)
+        if (begin.body.encoding !=
+            static_cast<uint16_t>(ProfileId::P29V1))
             throw std::invalid_argument(
                 "prepared P29V1 profile differs from authority");
         if (begin.raw_bytes > impl_->zstd_limits.max_raw_bytes ||
@@ -1782,10 +1584,7 @@ struct P50ClientEndpoint::Impl {
                 "C endpoint and preparation authority use different ZSTD_TU caps");
         if (first_nonce.value == 0)
             throw std::invalid_argument("first endpoint HISTORY_NONCE must be nonzero");
-        if (route)
-            preparation->prime_grz_initial_state(*route, first_nonce);
-        else
-            preparation->prime_grz_initial_state(first_nonce);
+        (void)route;
     }
 
     uint64_t allocate_session() {
@@ -1895,14 +1694,12 @@ struct P50ClientEndpoint::Impl {
         value.begin.rel_seq = next_rel;
         value.begin.tu_seq = prepared->begin.tu_seq;
         value.begin.profile = prepared->begin.profile;
-        value.begin.p29_root_mode = prepared->begin.p29_root_mode;
         value.begin.pre_state_digest = state;
-        value.begin.dict = prepared->begin.dict;
         value.begin.body = prepared->begin.body;
         value.begin.raw_bytes = prepared->begin.raw_bytes;
         value.begin.raw_digest = prepared->begin.raw_digest;
         value.begin.transaction_digest =
-            compute_transaction_digest(value.begin, prepared->dict, prepared->body);
+            compute_transaction_digest(value.begin, prepared->body);
         preparation->validate_begin(value.begin);
         active = std::move(value);
         record(ActionType::TX_BEGIN, active->begin, serial, active->begin.pre_state_digest);
@@ -1989,6 +1786,9 @@ struct P50ServerEndpoint::Impl {
         HistoryNonce nonce{};
         RelSeq next_rel{};
         Digest128 state{};
+        Digest128 c_system_source_fingerprint{};
+        Digest128 f_system_source_fingerprint{};
+        bool system_source_reuse = false;
         std::optional<TxCommit> last_commit;
         std::optional<TxBegin> interrupted;
         std::optional<Pending> pending;
@@ -2023,6 +1823,8 @@ struct P50ServerEndpoint::Impl {
         uint64_t candidate_revision = 0;
         HistoryNonce candidate_nonce{};
         RelSeq candidate_rel{};
+        Digest128 candidate_c_fingerprint{};
+        Digest128 candidate_f_fingerprint{};
         bool activated = false;
     };
 
@@ -2033,6 +1835,8 @@ struct P50ServerEndpoint::Impl {
         std::optional<sidecar::AbsoluteMonotonicDeadline> deadline;
         std::optional<CStoreGuid> c_guid;
         uint64_t candidate_revision = 0;
+        Digest128 candidate_c_fingerprint{};
+        Digest128 candidate_f_fingerprint{};
         std::optional<SessionState> candidate_state;
         bool activated = false;
     };
@@ -2534,13 +2338,15 @@ struct P50ServerEndpoint::Impl {
             ++revision.value;
     }
 
-    SessionState snapshot(CStoreGuid c_guid, SessionSelection selection) const {
+    SessionState snapshot(const SessionHello& hello,
+                          SessionSelection selection) const {
         SessionState result;
-        result.selected_protocol = selection.protocol;
+        result.wire_revision = selection.wire_revision;
         result.negotiated_profiles = selection.negotiated_profiles;
         result.limits = selection.limits;
         result.f_store_guid = f_guid;
-        const auto position = namespaces.find(c_guid);
+        result.system_source_fingerprint = p29_system_source_fingerprint();
+        const auto position = namespaces.find(hello.c_store_guid);
         if (position == namespaces.end())
             return result;
         const Namespace& space = position->second;
@@ -2548,6 +2354,12 @@ struct P50ServerEndpoint::Impl {
         result.route_present = space.route.has_value() &&
                                !space.route->codec_history_reset_required;
         if (result.route_present) {
+            if (hello.system_source_fingerprint !=
+                space.route->c_system_source_fingerprint)
+                throw std::logic_error(
+                    "SESSION_HELLO fingerprint changed on an existing route");
+            result.system_source_fingerprint =
+                space.route->f_system_source_fingerprint;
             result.history_nonce = space.route->nonce;
             result.next_rel_seq = space.route->next_rel;
             result.state_digest = space.route->state;
@@ -2556,19 +2368,23 @@ struct P50ServerEndpoint::Impl {
         return result;
     }
 
-    SessionState stage(Session& session, CStoreGuid c_guid,
+    SessionState stage(Session& session, const SessionHello& hello,
                        SessionSelection selection) {
         require_incarnation(session);
-        if (c_guid == CStoreGuid{})
+        if (hello.c_store_guid == CStoreGuid{})
             throw std::invalid_argument("SESSION_HELLO C_STORE_GUID zero is reserved");
-        const uint64_t revision = current_revision(c_guid);
-        SessionState state = snapshot(c_guid, selection);
-        session.c_guid = c_guid;
+        const uint64_t revision = current_revision(hello.c_store_guid);
+        SessionState state = snapshot(hello, selection);
+        session.c_guid = hello.c_store_guid;
         session.candidate_revision = revision;
+        session.candidate_c_fingerprint = hello.system_source_fingerprint;
+        session.candidate_f_fingerprint = state.system_source_fingerprint;
         session.candidate_state = state;
         LiveSession& live = live_sessions.at(session.serial);
-        live.c_guid = c_guid;
+        live.c_guid = hello.c_store_guid;
         live.candidate_revision = revision;
+        live.candidate_c_fingerprint = hello.system_source_fingerprint;
+        live.candidate_f_fingerprint = state.system_source_fingerprint;
         if (state.route_present) {
             live.candidate_nonce = state.history_nonce;
             live.candidate_rel = state.next_rel_seq;
@@ -2673,14 +2489,17 @@ struct P50ServerEndpoint::Impl {
     SessionState session_state(const Session& session, SessionSelection selection) const {
         const Namespace& space = require(session);
         SessionState result;
-        result.selected_protocol = selection.protocol;
+        result.wire_revision = selection.wire_revision;
         result.negotiated_profiles = selection.negotiated_profiles;
         result.limits = selection.limits;
         result.f_store_guid = f_guid;
+        result.system_source_fingerprint = p29_system_source_fingerprint();
         result.namespace_present = space.established;
         result.route_present = space.route.has_value() &&
                                !space.route->codec_history_reset_required;
         if (result.route_present) {
+            result.system_source_fingerprint =
+                space.route->f_system_source_fingerprint;
             result.history_nonce = space.route->nonce;
             result.next_rel_seq = space.route->next_rel;
             result.state_digest = space.route->state;
@@ -2723,6 +2542,14 @@ struct P50ServerEndpoint::Impl {
         space.route = Route{.nonce = reset.history_nonce,
                             .next_rel = RelSeq{0},
                             .state = reset.initial_state_digest,
+                            .c_system_source_fingerprint =
+                                session.candidate_c_fingerprint,
+                            .f_system_source_fingerprint =
+                                session.candidate_f_fingerprint,
+                            .system_source_reuse =
+                                session.candidate_c_fingerprint != Digest128{} &&
+                                session.candidate_c_fingerprint ==
+                                    session.candidate_f_fingerprint,
                             .last_commit = std::nullopt,
                             .interrupted = std::nullopt,
                             .pending = std::nullopt,
@@ -2763,17 +2590,14 @@ struct P50ServerEndpoint::Impl {
                 begin.profile,
                 ProfileDialogueConfig{.negotiated_profiles = negotiated_profiles,
                                       .c_store_guid = c_store_guid,
+                                      .system_source_reuse =
+                                          route.system_source_reuse,
                                       .max_encoded_body_bytes = caps.zstd.max_encoded_body_bytes,
                                       .max_raw_bytes = caps.zstd.max_raw_bytes,
                                       .max_window_log = caps.zstd.max_window_log,
                                       .max_history_bytes = caps.zstd.max_history_bytes}));
-        if ((begin.profile == ProfileId::P29 ||
-             begin.profile == ProfileId::P29V1 ||
-             begin.profile == ProfileId::Z3_LONG
-#if defined(ICECC_P50_WITH_LIBBSC)
-             || begin.profile == ProfileId::GRZ
-#endif
-             ) && route.dialogue)
+        if ((begin.profile == ProfileId::P29V1 ||
+             begin.profile == ProfileId::ZSTD_ROUTE) && route.dialogue)
             result.pending.dialogue = route.dialogue;
         return result;
     }
@@ -2796,13 +2620,8 @@ struct P50ServerEndpoint::Impl {
             throw std::logic_error("F endpoint already has one active transaction");
         if (route.interrupted && route.interrupted != prepared.pending.begin)
             throw StaleCompletion();
-        if (prepared.pending.begin.profile == ProfileId::P29 ||
-            prepared.pending.begin.profile == ProfileId::P29V1 ||
-            prepared.pending.begin.profile == ProfileId::Z3_LONG
-#if defined(ICECC_P50_WITH_LIBBSC)
-            || prepared.pending.begin.profile == ProfileId::GRZ
-#endif
-            ) {
+        if (prepared.pending.begin.profile == ProfileId::P29V1 ||
+            prepared.pending.begin.profile == ProfileId::ZSTD_ROUTE) {
             if (!route.dialogue) {
                 route.dialogue = prepared.pending.dialogue;
                 route.dialogue_profile = prepared.pending.begin.profile;
@@ -2840,8 +2659,6 @@ struct P50ServerEndpoint::Impl {
         route.interrupted.reset();
         route.pending = std::move(prepared.pending);
         record(replay ? ActionType::ACTIVE_REPLAYED : ActionType::TX_BEGIN, session, &begin);
-        record(ActionType::DICT_COMPLETE, session, &begin);
-        record(ActionType::NEED_RECORDED, session, &begin);
         return replay;
     }
 
@@ -2861,13 +2678,6 @@ struct P50ServerEndpoint::Impl {
         pending.dialogue->append_body(message);
         if (pending.dialogue->state() == ProfileDialogueState::BodyClosed)
             record(ActionType::BODY_COMPLETE, session, &pending.begin);
-    }
-
-    void append_dict(const Session& session, const DictMessage& message) {
-        Namespace& space = require(session);
-        if (!space.route || !space.route->pending)
-            throw std::logic_error("DICT has no F active transaction");
-        space.route->pending->dialogue->append_dict(message);
     }
 
     void receive_need(const Session& session, const NeedMessage& message) {
@@ -3377,6 +3187,13 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
         hello.c_store_guid = impl_->c_guid;
         hello.supported_profiles = profile_bit(impl_->caps.profile);
         hello.limits = impl_->caps.wire;
+        if (impl_->caps.profile == ProfileId::P29V1) {
+            const PreparedTuHandle fingerprint_handle =
+                impl_->active ? impl_->active->handle : impl_->queued_handle;
+            hello.system_source_fingerprint =
+                impl_->preparation->p29v1_system_source_fingerprint(
+                    fingerprint_handle);
+        }
         if (control.before_first_remote_write)
             control.before_first_remote_write();
         // From this point a completed, partial, or locally interrupted write
@@ -3401,6 +3218,8 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
             return received;
         });
         terminal_cap = peer.limits.max_frame_payload;
+        Digest128 negotiated_f_fingerprint =
+            peer.system_source_fingerprint;
 
         const bool knew_f = impl_->f_guid.has_value();
         const bool same_f = knew_f && *impl_->f_guid == peer.f_store_guid;
@@ -3498,10 +3317,12 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
                                                peer.limits.max_frame_payload);
                 SessionState received = decode_as<SessionState>(reset_ack_frame);
                 validate_session_state(hello, received);
-                if (received.selected_protocol != peer.selected_protocol ||
+                if (received.wire_revision != peer.wire_revision ||
                     received.negotiated_profiles != peer.negotiated_profiles ||
                     received.limits != peer.limits || !received.namespace_present ||
                     !received.route_present || received.f_store_guid != peer.f_store_guid ||
+                    received.system_source_fingerprint !=
+                        peer.system_source_fingerprint ||
                     received.history_nonce != replacement_nonce ||
                     received.next_rel_seq != replacement_rel ||
                     received.state_digest != replacement_state || received.last_commit)
@@ -3509,13 +3330,9 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
                         "HISTORY_RESET acknowledgement differs from the new route");
                 return received;
             });
-            (void)reset_ack;
+            negotiated_f_fingerprint =
+                reset_ack.system_source_fingerprint;
             PreparedInputPtr reset_retry = retry;
-#if defined(ICECC_P50_WITH_LIBBSC)
-            if (impl_->caps.profile == ProfileId::GRZ)
-                reset_retry = impl_->preparation->reset_grz_route(
-                    impl_->queued_handle, replacement_nonce);
-#endif
             if (impl_->caps.profile == ProfileId::P29V1 &&
                 established_relationship)
                 reset_retry = impl_->preparation->reset_p29v1_route(
@@ -3548,6 +3365,13 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
             impl_->active->p29v1_transport_retry = false;
         }
 
+        if (impl_->caps.profile == ProfileId::P29V1) {
+            const PreparedTuHandle fingerprint_handle =
+                impl_->active ? impl_->active->handle : impl_->queued_handle;
+            impl_->preparation->pin_p29v1_system_source_reuse(
+                fingerprint_handle, negotiated_f_fingerprint);
+        }
+
         if (!impl_->active) {
             if (!impl_->queued)
                 throw std::logic_error("route reconciliation lost queued work");
@@ -3559,60 +3383,15 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
         }
         TxBegin begin = impl_->active->begin;
         if (control.outbound_begin_transform)
-            begin = control.outbound_begin_transform(begin);
+            begin = control.outbound_begin_transform(
+                begin, impl_->active->prepared->body);
         require_outbound_profile_negotiated(peer.negotiated_profiles, begin);
         const uint32_t frame_cap = peer.limits.max_frame_payload;
         co_await async_write_message(socket, begin, frame_cap,
                                      impl_->stamp(session, AsyncOperationKind::WriteFragment),
                                      impl_->completions, control, verify);
 
-        if (begin.profile == ProfileId::P29) {
-            co_await async_write_component<DictMessage>(
-                socket, impl_->active->prepared->dict, frame_cap,
-                impl_->stamp(session, AsyncOperationKind::WriteFragment), impl_->completions,
-                control, verify);
-            NeedStreamDecoder need_decoder;
-            for (;;) {
-                Frame need_frame = co_await async_read_frame(
-                    socket, frame_cap,
-                    impl_->stamp(session, AsyncOperationKind::ReadHeader), impl_->completions,
-                    verify);
-                if (need_frame.type == MessageType::ERROR)
-                    throw ClientTerminalResult(decode_as<ErrorMessage>(need_frame), frame_cap);
-                if (need_frame.type != MessageType::NEED)
-                    throw std::invalid_argument("P29 expected NEED before FILL");
-                need_decoder.push(decode_as<NeedMessage>(need_frame));
-                if (need_decoder.complete())
-                    break;
-            }
-            std::map<Key64, const FillRecord*> available;
-            for (const FillRecord& record : impl_->active->prepared->p29_fill_records)
-                available.emplace(record.key, &record);
-            std::vector<FillRecord> selected;
-            selected.reserve(need_decoder.keys().size());
-            for (Key64 key : need_decoder.keys()) {
-                // A residual P29 BODY is authoritative for Line bytes.  Those
-                // keys remain in NEED so F can validate the residual's exact
-                // ownership, but must not be repeated through FILL.
-                if (impl_->active->begin.body.encoding == kP29ResidualBodyEncoding &&
-                    key.type() == ObjectType::Line)
-                    continue;
-                const auto position = available.find(key);
-                if (position == available.end())
-                    throw std::logic_error("P29 Need requested an unprepared object");
-                selected.push_back(*position->second);
-            }
-            const std::vector<FillMessage> fills = encode_fill_messages(selected, frame_cap);
-            for (const FillMessage& fill : fills)
-                co_await async_write_message(
-                    socket, fill, frame_cap,
-                    impl_->stamp(session, AsyncOperationKind::WriteFragment),
-                    impl_->completions, control, verify);
-            co_await async_write_component<BodyMessage>(
-                socket, impl_->active->prepared->body, frame_cap,
-                impl_->stamp(session, AsyncOperationKind::WriteFragment), impl_->completions,
-                control, verify);
-        } else if (begin.profile == ProfileId::P29V1) {
+        if (begin.profile == ProfileId::P29V1) {
             co_await async_write_component<BodyMessage>(
                 socket, impl_->active->prepared->body, frame_cap,
                 impl_->stamp(session, AsyncOperationKind::WriteFragment),
@@ -3640,8 +3419,7 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
             }
             const std::span<const uint8_t> inner_fill =
                 impl_->preparation->answer_p29v1_need(
-                    impl_->active->handle, need_decoder.flags(),
-                    need_decoder.inner_frames());
+                    impl_->active->handle, need_decoder.inner_frames());
             const std::vector<FillMessage> fills =
                 encode_p29v1_fill_messages(
                     inner_fill, frame_cap,
@@ -4114,9 +3892,9 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
         result.c_store_guid = hello.c_store_guid;
         reply_cap = std::min(reply_cap, hello.limits.max_frame_payload);
         const SessionSelection selection =
-            negotiate_session(hello, kProtocolVersion, kProtocolVersion,
+            negotiate_session(hello, kP50WireRevision,
                               impl_->caps.supported_profiles, impl_->caps.wire);
-        SessionState state = impl_->stage(session, hello.c_store_guid, selection);
+        SessionState state = impl_->stage(session, hello, selection);
         co_await async_write_message(socket, state, selection.limits.max_frame_payload,
                                      impl_->stamp(session, AsyncOperationKind::WriteFragment),
                                      impl_->completions, control, verify);
@@ -4151,32 +3929,31 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
                 socket, selection.limits.max_frame_payload,
                 impl_->stamp(session, AsyncOperationKind::ReadHeader), impl_->completions, verify);
             // The reducer owns message ordering, while the selected profile
-            // owns DICT/BODY/NEED/FILL semantics. ZSTD_TU deliberately rejects
+            // owns BODY/NEED/FILL semantics. ZSTD_TU deliberately rejects
             // the interactive messages through its adapter; future profiles
             // can implement the same bidirectional dialogue without a new
             // concrete-profile branch here.
             switch (component.type) {
-            case MessageType::DICT:
-                impl_->append_dict(session, decode_as<DictMessage>(component));
-                for (const NeedMessage& need :
-                     impl_->namespaces.at(*session.c_guid)
-                         .route->pending->dialogue->need_messages(
-                             selection.limits.max_frame_payload))
-                    co_await async_write_message(
-                        socket, need, selection.limits.max_frame_payload,
-                        impl_->stamp(session, AsyncOperationKind::WriteFragment),
-                        impl_->completions, control, verify);
-                break;
             case MessageType::BODY:
                 impl_->append_body(session, decode_as<BodyMessage>(component));
-                for (const NeedMessage& need :
-                     impl_->namespaces.at(*session.c_guid)
-                         .route->pending->dialogue->need_messages(
-                             selection.limits.max_frame_payload))
+                {
+                    auto& pending = *impl_->namespaces.at(*session.c_guid)
+                                         .route->pending;
+                    const std::vector<NeedMessage> needs =
+                        pending.dialogue->need_messages(
+                            selection.limits.max_frame_payload);
+                    if (!needs.empty()) {
+                        impl_->record(ActionType::BODY_COMPLETE, session,
+                                      &pending.begin);
+                        impl_->record(ActionType::NEED_RECORDED, session,
+                                      &pending.begin);
+                    }
+                    for (const NeedMessage& need : needs)
                     co_await async_write_message(
                         socket, need, selection.limits.max_frame_payload,
                         impl_->stamp(session, AsyncOperationKind::WriteFragment),
                         impl_->completions, control, verify);
+                }
                 break;
             case MessageType::NEED:
                 impl_->receive_need(session, decode_as<NeedMessage>(component));
@@ -4237,6 +4014,9 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
                             ? ServerRunStatus::DeadlineExceeded
                             : ServerRunStatus::Disconnected;
         co_return result;
+    } catch (const ProtocolError& error) {
+        terminal_error = bounded_error(static_cast<uint16_t>(error.code()),
+                                       error.what(), reply_cap);
     } catch (const std::exception& error) {
         terminal_error = bounded_error(impl_->config.protocol_error_code,
                                        error.what(), reply_cap);

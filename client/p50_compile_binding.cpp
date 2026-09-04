@@ -6,6 +6,11 @@
 #include <string_view>
 
 namespace icecc::p50 {
+static_assert(CACHE_WIRE_REVISION == kP50WireRevision);
+static_assert(CACHE_PROFILE_P29V1 == profile_bit(ProfileId::P29V1));
+static_assert(CACHE_PROFILE_ZSTD_TU == profile_bit(ProfileId::ZSTD_TU));
+static_assert(CACHE_PROFILE_ZSTD_ROUTE == profile_bit(ProfileId::ZSTD_ROUTE));
+
 namespace {
 
 bool nonzero(CStoreGuid value) noexcept {
@@ -25,17 +30,13 @@ std::optional<ProfileId> p50_zstd_selected_profile(
     if (compiler_protocol != PROTOCOL_VERSION_CACHE_ADVERTISEMENT ||
         assignment.hostname.empty() || assignment.port == 0 ||
         !usecs_cache_handoff_admissible(assignment) ||
-        assignment.cache_protocol != CACHE_WIRE_PROTOCOL_V1 ||
+        assignment.cache_protocol != CACHE_WIRE_REVISION ||
         !p50_source_profile_selection_valid(assignment.cache_profile_mask))
         return std::nullopt;
-    if (assignment.cache_profile_mask == CACHE_PROFILE_P29)
-        return ProfileId::P29;
     if (assignment.cache_profile_mask == CACHE_PROFILE_P29V1)
         return ProfileId::P29V1;
     if (assignment.cache_profile_mask == CACHE_PROFILE_ZSTD_ROUTE)
-        return ProfileId::Z3_LONG;
-    if (assignment.cache_profile_mask == CACHE_PROFILE_GRZ)
-        return ProfileId::GRZ;
+        return ProfileId::ZSTD_ROUTE;
     return ProfileId::ZSTD_TU;
 }
 
@@ -78,18 +79,13 @@ std::optional<CompileInputIdentity> bind_compile_input(
         transfer.attempts == 0 || transfer.attempts > 2)
         return std::nullopt;
 
-    if (transfer.profile != ProfileId::P29 &&
-        transfer.profile != ProfileId::P29V1 &&
+    if (transfer.profile != ProfileId::P29V1 &&
         transfer.profile != ProfileId::ZSTD_TU &&
-        transfer.profile != ProfileId::Z3_LONG)
+        transfer.profile != ProfileId::ZSTD_ROUTE)
         return std::nullopt;
 
     CompileInputIdentity identity;
-    identity.profile = transfer.profile == ProfileId::P29
-                           ? CompileInputIdentity::P29Profile
-                       : transfer.profile == ProfileId::P29V1
-                           ? CompileInputIdentity::P29V1Profile
-                           : CompileInputIdentity::ZstdTuProfile;
+    identity.profile = static_cast<uint32_t>(transfer.profile);
     identity.c_store_guid = transfer.committed_input->c_store_guid.bytes;
     identity.tu_seq = transfer.committed_input->tu_seq.value;
     identity.raw_bytes = transfer.raw_bytes;
@@ -112,17 +108,12 @@ std::optional<CompileInputIdentity> bind_compile_input(
         transfer.attempts == 0 || transfer.attempts > 2)
         return std::nullopt;
 
-    if (profile != ProfileId::P29 && profile != ProfileId::P29V1 &&
-        profile != ProfileId::ZSTD_TU &&
-        profile != ProfileId::Z3_LONG && profile != ProfileId::GRZ)
+    if (profile != ProfileId::P29V1 && profile != ProfileId::ZSTD_TU &&
+        profile != ProfileId::ZSTD_ROUTE)
         return std::nullopt;
 
     CompileInputIdentity identity;
-    identity.profile = profile == ProfileId::P29
-                           ? CompileInputIdentity::P29Profile
-                       : profile == ProfileId::P29V1
-                           ? CompileInputIdentity::P29V1Profile
-                           : CompileInputIdentity::ZstdTuProfile;
+    identity.profile = static_cast<uint32_t>(profile);
     identity.c_store_guid = transfer.c_store_guid.bytes;
     identity.tu_seq = transfer.tu_seq;
     identity.raw_bytes = transfer.raw_bytes;

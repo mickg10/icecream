@@ -195,7 +195,8 @@ static void test_absent_present_and_mutations()
     }
     {
         ResultDispositionMsg changed = original;
-        ++changed.compile_input.profile;
+        changed.compile_input.profile =
+            CompileInputIdentity::ZstdRouteProfile + 1;
         REQUIRE(!changed.valid_payload() && !changed.same_identity(original),
                 "profile mutation is rejected and changes disposition identity");
     }

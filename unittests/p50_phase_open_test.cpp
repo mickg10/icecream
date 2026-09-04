@@ -1,4 +1,5 @@
 #include "cache/p50_phase_open.h"
+#include "../services/comm.h"
 
 #include <chrono>
 #include <cstdint>
@@ -30,14 +31,14 @@ P50SourceArm arm() {
     result.selected_f_host = "f.example";
     result.selected_f_ordinary_port = 8765;
     result.selected_f_cache_port = 9876;
-    result.cache_protocol = 50;
-    result.cache_profile = 2;
+    result.cache_protocol = CACHE_WIRE_REVISION;
+    result.cache_profile = CACHE_PROFILE_ZSTD_TU;
     result.logical_job = 107;
     result.attempt_id = 109;
     result.c_store_generation = 113;
     result.c_store_guid.bytes[15] = 127;
     result.source_request_id = 131;
-    result.source_mode = 1;
+    result.source_mode = P50_SOURCE_MODE_ZSTD_TU;
     return result;
 }
 
@@ -145,7 +146,8 @@ void global_offer_replay() {
     require(receiver_one.phase_open(open) == OfferDecision::ExactReplay,
             "phase-open replay across receiver was not idempotent");
     AttachmentPhaseOpen wrong = open;
-    wrong.source_arm.cache_profile++;
+    wrong.source_arm.cache_profile = CACHE_PROFILE_P29V1;
+    wrong.source_arm.source_mode = P50_SOURCE_MODE_P29V1;
     require(receiver_one.phase_open(wrong) == OfferDecision::Conflict,
             "wrong phase-open arm/profile was accepted");
 

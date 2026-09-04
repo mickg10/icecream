@@ -69,11 +69,6 @@
 #include "fastest.h"
 #include "jobidallocator.h"
 
-#if defined(ICECC_P50_WITH_LIBBSC)
-static_assert((CACHE_ADVERTISABLE_PROFILE_MASK & CACHE_PROFILE_GRZ) != 0,
-              "the scheduler must parse CacheWire profiles after config.h");
-#endif
-
 /* TODO:
    * leak check
    * are all filedescs closed when done?
@@ -2944,7 +2939,7 @@ static bool handle_login(CompileServer *cs, Msg *_m)
    three-word UseCS cache-handoff tail (see UseCSMsg's cache_endpoint_port /
    cache_protocol / cache_profile_mask).  Applies exactly the same
    absent-or-present law LoginMsg::valid_payload enforces on the way in
-   (cache_advertisement_is_valid_present): a snapshot that is not fully
+   (cache_advertisement_is_well_formed_present): a snapshot that is not fully
    valid projects as wholly absent, never partially or incorrectly
    advertised.
 
@@ -2975,13 +2970,14 @@ static void project_cache_handoff(const CompileServer *cs, uint32_t wire_job_id,
     const uint32_t mask = cs->cacheProfileMask();
     // Login advertises runnable capabilities, while the assignment tail must
     // carry one negotiated profile.  An explicit scheduler request is exact;
-    // an absent request retains the ROUTE-first default.  Unknown bits and
+    // an absent request retains the P29V1-first default.  Unknown bits and
     // unavailable requests remain absent rather than silently switching.
     const auto request = p50_cache_profile_request_from_env();
     const uint32_t selected_mask =
         p50_select_cache_profile(mask, request);
     if (identity_complete &&
-        cache_advertisement_is_valid_present(port, protocol, selected_mask)) {
+        cache_advertisement_is_well_formed_present(port, protocol,
+                                                    selected_mask)) {
         out_port = port;
         out_protocol = protocol;
         out_mask = selected_mask;
@@ -3041,7 +3037,7 @@ static bool handle_relogin(MsgChannel *mc, Msg *_m)
             job->assignmentPhase() != Job::ASSIGNMENT_READY ||
             job->assignmentReplySent())
             continue;
-        if (!cache_advertisement_is_valid_present(
+        if (!cache_advertisement_is_well_formed_present(
                 cs->cacheEndpointPort(), cs->cacheProtocol(),
                 cs->cacheProfileMask()))
             continue;
@@ -3112,7 +3108,7 @@ static bool handle_assignment_ready(CompileServer *cs, Msg *_m)
         job->submitter()->testCutNextFlushAfter(0);
         job->server()->testCutNextFlushAfter(0);
     }
-    const bool cache_ready = cache_advertisement_is_valid_present(
+    const bool cache_ready = cache_advertisement_is_well_formed_present(
         cs->cacheEndpointPort(), cs->cacheProtocol(), cs->cacheProfileMask());
     if (job->assignmentPolicy() == Job::ASSIGNMENT_STRICT_NONCE && !cache_ready) {
         trace() << "holding strict READY job " << job->id()

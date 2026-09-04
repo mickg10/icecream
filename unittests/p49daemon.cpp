@@ -102,11 +102,15 @@ static MsgChannel *connect_daemon(const std::string &path)
 
 static bool send_claim(MsgChannel *client, uint32_t wire_id,
                        uint64_t epoch = 0, uint64_t nonce = 0,
-                       const char *environment = "p49-test-environment")
+                       const char *environment = "p49-test-environment",
+                       uint64_t c_guid = 0, uint64_t tu_seq = 0)
 {
     CompileJob job;
     job.setJobID(wire_id);
     job.setAssignmentIdentity(epoch, nonce);
+    job.setCompileIdentity(c_guid != 0 ? c_guid
+                                      : UINT64_C(0x5049000000000001),
+                           tu_seq);
     job.setCompilerName("g++");
     job.setLanguage(CompileJob::Lang_CXX);
     job.setEnvironmentVersion(environment);
@@ -699,7 +703,8 @@ int main(int argc, char **argv)
     Msg *get_wire = wait_type(scheduler, Msg::GET_CS, 3000);
     GetCSMsg *get = dynamic_cast<GetCSMsg *>(get_wire);
     const uint32_t local_client_id = get ? get->client_id : 0;
-    REQUIRE(get && scheduler->send_msg(NoCSMsg(1501, local_client_id)),
+    REQUIRE(get && scheduler->send_msg(NoCSMsg(
+                1501, local_client_id, 0, 0, strict_epoch, 0)),
             "scheduler selects local NoCS in strict mode");
     delete get_wire;
     Msg *use_wire = wait_type(local, Msg::USE_CS, 3000);
@@ -707,7 +712,11 @@ int main(int argc, char **argv)
     REQUIRE(local_use && !local_use->hasAssignmentIdentity(),
             "local decision carries wholly absent assignment identity");
     const bool local_sent = local_use
-        && send_claim(local, local_use->job_id, 0, 0, "__client");
+        && local_use->cGuid() == strict_epoch
+        && send_claim(local, local_use->job_id,
+                      local_use->assignmentEpoch(),
+                      local_use->assignmentNonce(), "__client",
+                      local_use->cGuid(), local_use->tuSeq());
     delete use_wire;
     Msg *local_begin = local_sent
         ? wait_type(scheduler, Msg::JOB_BEGIN, 3000) : nullptr;

@@ -825,18 +825,58 @@ int main(int argc, char **argv)
        dispatch credit is released by.  A frozen submitter never enqueues
        here, which is precisely why its credit stays held.  */
     std::mutex confirm_mutex;
+    struct DispatchIdentity {
+        uint64_t assignment_epoch;
+        uint64_t assignment_nonce;
+        uint64_t c_guid;
+        uint64_t tu_seq;
+    };
     struct Confirm {
         unsigned int job_id;
         bool begin;
         bool done;
         unsigned int real_msec;   // reported compile time when done
         unsigned int out_uncompressed;   // >= 4096 to reach add_job_stats' body
+        DispatchIdentity identity;
     };
+    std::map<unsigned int, DispatchIdentity> dispatch_identities;
     std::vector<Confirm> to_confirm;
+    /* Protocol 50 gives every remote assignment a scheduler-owned compile
+       identity.  A real worker returns it on JobDone; this fake must do the
+       same or the scheduler correctly evicts it and every later scheduler
+       assertion merely measures the resulting local-fallback cascade. */
+    auto remember_use = [&](UseCSMsg *use) -> UseCSMsg * {
+        if (use) {
+            std::lock_guard<std::mutex> lock(confirm_mutex);
+            dispatch_identities[use->job_id] = DispatchIdentity{
+                use->assignmentEpoch(), use->assignmentNonce(),
+                use->cGuid(), use->tuSeq()};
+        }
+        return use;
+    };
     auto enqueue_confirm = [&](unsigned int job_id, bool begin, bool done,
                                unsigned int real_msec) {
         std::lock_guard<std::mutex> lock(confirm_mutex);
-        to_confirm.push_back(Confirm{job_id, begin, done, real_msec, 8192});
+        const auto identity = dispatch_identities.find(job_id);
+        if (identity == dispatch_identities.end()) {
+            fprintf(stderr, "# missing wire identity for remote job %u\n", job_id);
+            return;
+        }
+        to_confirm.push_back(Confirm{job_id, begin, done, real_msec, 8192,
+                                     identity->second});
+    };
+    auto stamp_done = [&](JobDoneMsg &done, unsigned int job_id) -> bool {
+        std::lock_guard<std::mutex> lock(confirm_mutex);
+        const auto identity = dispatch_identities.find(job_id);
+        if (identity == dispatch_identities.end()) {
+            fprintf(stderr, "# missing wire identity for terminal job %u\n", job_id);
+            return false;
+        }
+        done.setAssignmentIdentity(identity->second.assignment_epoch,
+                                   identity->second.assignment_nonce);
+        done.setCompileIdentity(identity->second.c_guid,
+                                identity->second.tu_seq);
+        return true;
     };
     auto confirm_job = [&](unsigned int job_id) {
         enqueue_confirm(job_id, true, true, 0);
@@ -921,7 +961,10 @@ int main(int argc, char **argv)
                        their slots, exactly like a real dead client.  Modes
                        that hold a slot busy enqueue the begin half only.  */
                     if (c.done) {
-                        JobDoneMsg jd(c.job_id, 0, JobDoneMsg::FROM_SERVER);
+                        JobDoneMsg jd(c.job_id, 0, JobDoneMsg::FROM_SERVER, 0,
+                                      c.identity.assignment_epoch,
+                                      c.identity.assignment_nonce,
+                                      c.identity.c_guid, c.identity.tu_seq);
                         jd.real_msec = c.real_msec;
                         jd.user_msec = c.real_msec;
                         jd.out_uncompressed = c.out_uncompressed;
@@ -1120,7 +1163,7 @@ int main(int argc, char **argv)
             if (m) {
                 if (MSG_IS(m, USE_CS) || MSG_IS(m, NO_CS)) {
                     ++healthy_replies;
-                    UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                    UseCSMsg *u = remember_use(dynamic_cast<UseCSMsg *>(m));
                     if (u) {
                         confirm_job(u->job_id);
                     }
@@ -1259,7 +1302,7 @@ int main(int argc, char **argv)
                 continue;
             }
             if (MSG_IS(m, USE_CS)) {
-                UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                UseCSMsg *u = remember_use(dynamic_cast<UseCSMsg *>(m));
                 if (u) {
                     confirm_job(u->job_id);   // release the dispatch credit
                 }
@@ -1352,7 +1395,7 @@ int main(int argc, char **argv)
                     continue;
                 }
                 if (MSG_IS(m, USE_CS)) {
-                    UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                    UseCSMsg *u = remember_use(dynamic_cast<UseCSMsg *>(m));
                     if (u && u->client_id == 201) {
                         confirm_job(u->job_id);
                         ++repliesB;
@@ -1380,7 +1423,7 @@ int main(int argc, char **argv)
                 }
                 unsigned jid = 0, cid = 0;
                 if (MSG_IS(m, USE_CS)) {
-                    UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                    UseCSMsg *u = remember_use(dynamic_cast<UseCSMsg *>(m));
                     if (u) { jid = u->job_id; cid = u->client_id; }
                 } else if (MSG_IS(m, NO_CS)) {
                     NoCSMsg *n = dynamic_cast<NoCSMsg *>(m);
@@ -1454,7 +1497,7 @@ int main(int argc, char **argv)
                 if (!m) { continue; }
                 unsigned jid = 0;
                 if (MSG_IS(m, USE_CS)) {
-                    UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                    UseCSMsg *u = remember_use(dynamic_cast<UseCSMsg *>(m));
                     if (u && u->client_id == 501) { jid = u->job_id; }
                 } else if (MSG_IS(m, NO_CS)) {
                     NoCSMsg *n = dynamic_cast<NoCSMsg *>(m);
@@ -1611,7 +1654,7 @@ int main(int argc, char **argv)
                         continue;
                     }
                     if (MSG_IS(m, USE_CS)) {
-                        UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                        UseCSMsg *u = remember_use(dynamic_cast<UseCSMsg *>(m));
                         if (u && u->client_id == 401) { confirm_job(u->job_id); ++got; }
                     } else if (MSG_IS(m, NO_CS)) {
                         NoCSMsg *n = dynamic_cast<NoCSMsg *>(m);
@@ -1675,7 +1718,7 @@ int main(int argc, char **argv)
                     Msg *m = ch->get_msg(2);
                     if (!m) { continue; }
                     if (MSG_IS(m, USE_CS)) {
-                        UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                        UseCSMsg *u = remember_use(dynamic_cast<UseCSMsg *>(m));
                         if (u && u->client_id == cid) {
                             confirm_job(u->job_id);
                             ++*counter;
@@ -1725,10 +1768,12 @@ int main(int argc, char **argv)
                         Msg *m = ch->get_msg(1);
                         if (!m) { continue; }
                         if (MSG_IS(m, USE_CS)) {
-                            UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                            UseCSMsg *u = remember_use(dynamic_cast<UseCSMsg *>(m));
                             if (u && u->client_id == cid) {
                                 JobDoneMsg bounce(u->job_id, 107, JobDoneMsg::FROM_SUBMITTER);
-                                ch->send_msg(bounce);
+                                if (stamp_done(bounce, u->job_id)) {
+                                    ch->send_msg(bounce);
+                                }
                             }
                         }
                         delete m;
@@ -1918,7 +1963,7 @@ int main(int argc, char **argv)
                     if (!m) { continue; }
                     unsigned cid = 0;
                     if (MSG_IS(m, USE_CS)) {
-                        UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                        UseCSMsg *u = remember_use(dynamic_cast<UseCSMsg *>(m));
                         if (u) { cid = u->client_id; if (cid == 9500u + i) { jid = u->job_id; } }
                         if (u && cid != 9500u + i) { confirm_job(u->job_id); }
                     } else if (MSG_IS(m, NO_CS)) {
@@ -2051,11 +2096,13 @@ int main(int argc, char **argv)
                         Msg *m = subF->get_msg(1);
                         if (!m) { continue; }
                         if (MSG_IS(m, USE_CS)) {
-                            UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                            UseCSMsg *u = remember_use(dynamic_cast<UseCSMsg *>(m));
                             if (u && u->client_id == 601) {
                                 ++stray601;
                                 JobDoneMsg bounce(u->job_id, 107, JobDoneMsg::FROM_SUBMITTER);
-                                subF->send_msg(bounce);
+                                if (stamp_done(bounce, u->job_id)) {
+                                    subF->send_msg(bounce);
+                                }
                             }
                         }
                         delete m;
@@ -2074,7 +2121,7 @@ int main(int argc, char **argv)
                         Msg *m = subF->get_msg(2);
                         if (!m) { continue; }
                         if (MSG_IS(m, USE_CS)) {
-                            UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                            UseCSMsg *u = remember_use(dynamic_cast<UseCSMsg *>(m));
                             if (u && u->client_id == 602) { confirm_job(u->job_id); ++got; }
                         }
                         delete m;
@@ -2099,7 +2146,7 @@ int main(int argc, char **argv)
                         Msg *m = subF->get_msg(2);
                         if (!m) { continue; }
                         if (MSG_IS(m, USE_CS)) {
-                            UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                            UseCSMsg *u = remember_use(dynamic_cast<UseCSMsg *>(m));
                             if (u && u->client_id == 603) {
                                 dispatched.push_back(u->job_id);
                                 tp = Clock::now();
@@ -2146,7 +2193,7 @@ int main(int argc, char **argv)
                         Msg *m = subF->get_msg(2);
                         if (!m) { continue; }
                         if (MSG_IS(m, USE_CS)) {
-                            UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                            UseCSMsg *u = remember_use(dynamic_cast<UseCSMsg *>(m));
                             if (u && u->client_id == 604) { confirm_job(u->job_id); ++got; }
                         }
                         delete m;
@@ -2170,7 +2217,7 @@ int main(int argc, char **argv)
                         Msg *m = subF->get_msg(2);
                         if (!m) { continue; }
                         if (MSG_IS(m, USE_CS)) {
-                            UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                            UseCSMsg *u = remember_use(dynamic_cast<UseCSMsg *>(m));
                             if (u && u->client_id == 605) {
                                 dispatched605.push_back(u->job_id);
                                 tp = Clock::now();
@@ -2198,10 +2245,12 @@ int main(int argc, char **argv)
                             Msg *m = subF->get_msg(1);
                             if (!m) { continue; }
                             if (MSG_IS(m, USE_CS)) {
-                                UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                                UseCSMsg *u = remember_use(dynamic_cast<UseCSMsg *>(m));
                                 if (u && u->client_id == 605) {
                                     JobDoneMsg bounce(u->job_id, 107, JobDoneMsg::FROM_SUBMITTER);
-                                    subF->send_msg(bounce);
+                                    if (stamp_done(bounce, u->job_id)) {
+                                        subF->send_msg(bounce);
+                                    }
                                 }
                             }
                             delete m;
@@ -2233,7 +2282,7 @@ int main(int argc, char **argv)
                             Msg *m = subF->get_msg(2);
                             if (!m) { continue; }
                             if (MSG_IS(m, USE_CS)) {
-                                UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                                UseCSMsg *u = remember_use(dynamic_cast<UseCSMsg *>(m));
                                 if (u && u->client_id == 606) { confirm_job(u->job_id); ++got; }
                             }
                             delete m;
@@ -2258,7 +2307,7 @@ int main(int argc, char **argv)
                         Msg *m = subF->get_msg(2);
                         if (!m) { continue; }
                         if (MSG_IS(m, USE_CS)) {
-                            UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                            UseCSMsg *u = remember_use(dynamic_cast<UseCSMsg *>(m));
                             if (u && u->client_id == 607) {
                                 dispatched607.push_back(u->job_id);
                                 tp = Clock::now();
@@ -2278,7 +2327,8 @@ int main(int argc, char **argv)
                        exactly the messages that stall.  */
                     for (unsigned jid : dispatched607) {
                         JobDoneMsg bounce(jid, 107, JobDoneMsg::FROM_SUBMITTER);
-                        REQUIRE(subF->send_msg(bounce), "107 bounce sent");
+                        REQUIRE(stamp_done(bounce, jid) && subF->send_msg(bounce),
+                                "107 bounce sent");
                     }
                     {
                         long long left = -1;
@@ -2302,7 +2352,7 @@ int main(int argc, char **argv)
                             Msg *m = subF->get_msg(2);
                             if (!m) { continue; }
                             if (MSG_IS(m, USE_CS)) {
-                                UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                                UseCSMsg *u = remember_use(dynamic_cast<UseCSMsg *>(m));
                                 if (u && u->client_id == 608) { confirm_job(u->job_id); ++got; }
                             }
                             delete m;
@@ -2364,7 +2414,7 @@ int main(int argc, char **argv)
                 }
                 unsigned jid = 0, got_cid = 0;
                 if (MSG_IS(m, USE_CS)) {
-                    UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                    UseCSMsg *u = remember_use(dynamic_cast<UseCSMsg *>(m));
                     if (u) { jid = u->job_id; got_cid = u->client_id; }
                 } else if (MSG_IS(m, NO_CS)) {
                     NoCSMsg *n = dynamic_cast<NoCSMsg *>(m);
@@ -2443,7 +2493,7 @@ int main(int argc, char **argv)
                     continue;
                 }
                 if (MSG_IS(m, USE_CS)) {
-                    UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                    UseCSMsg *u = remember_use(dynamic_cast<UseCSMsg *>(m));
                     if (u) { first_jid = u->job_id; first_cid = u->client_id; }
                 } else if (MSG_IS(m, NO_CS)) {
                     NoCSMsg *n = dynamic_cast<NoCSMsg *>(m);
@@ -2516,12 +2566,16 @@ int main(int argc, char **argv)
                 }
                 for (unsigned jid : don) {
                     JobDoneMsg jd(jid, 0, JobDoneMsg::FROM_SERVER);
-                    if (!csB->send_msg(jd)) { csB_alive = false; return; }
+                    if (!stamp_done(jd, jid) || !csB->send_msg(jd)) {
+                        csB_alive = false;
+                        return;
+                    }
                 }
                 for (unsigned jid : batch) {
                     JobBeginMsg jb(jid, 1);
                     JobDoneMsg jd(jid, 0, JobDoneMsg::FROM_SERVER);
-                    if (!csB->send_msg(jb) || !csB->send_msg(jd)) {
+                    if (!stamp_done(jd, jid)
+                            || !csB->send_msg(jb) || !csB->send_msg(jd)) {
                         csB_alive = false;
                         return;
                     }
@@ -2556,7 +2610,8 @@ int main(int argc, char **argv)
             while ((occ1 == 0 || occ2 == 0) && secs_since(t0) < 30) {
                 Msg *m = sub->get_msg(2);
                 if (!m) { continue; }
-                UseCSMsg *u = MSG_IS(m, USE_CS) ? dynamic_cast<UseCSMsg *>(m) : nullptr;
+                UseCSMsg *u = MSG_IS(m, USE_CS)
+                    ? remember_use(dynamic_cast<UseCSMsg *>(m)) : nullptr;
                 if (u && u->client_id == 8000) { occ1 = u->job_id; }
                 if (u && u->client_id == 8005) { occ2 = u->job_id; }
                 delete m;
@@ -2581,7 +2636,7 @@ int main(int argc, char **argv)
                 Msg *m = sub->get_msg(2);
                 if (!m) { continue; }
                 if (MSG_IS(m, USE_CS)) {
-                    UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                    UseCSMsg *u = remember_use(dynamic_cast<UseCSMsg *>(m));
                     if (u && u->client_id == 8002) { arm_jid = u->job_id; arm_port = u->port; }
                     else if (u && u->client_id == 8001) { ++head_replies; }
                 } else if (MSG_IS(m, NO_CS)) {
@@ -2614,7 +2669,7 @@ int main(int argc, char **argv)
                 Msg *m = sub->get_msg(2);
                 if (!m) { continue; }
                 if (MSG_IS(m, USE_CS)) {
-                    UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                    UseCSMsg *u = remember_use(dynamic_cast<UseCSMsg *>(m));
                     if (u && u->client_id == 8001) { head_jid = u->job_id; }
                 }
                 delete m;
@@ -2650,7 +2705,8 @@ int main(int argc, char **argv)
                 while (secs_since(t0) < 30) {
                     Msg *m = sub->get_msg(2);
                     if (!m) { continue; }
-                    UseCSMsg *u = MSG_IS(m, USE_CS) ? dynamic_cast<UseCSMsg *>(m) : nullptr;
+                    UseCSMsg *u = MSG_IS(m, USE_CS)
+                        ? remember_use(dynamic_cast<UseCSMsg *>(m)) : nullptr;
                     if (u && u->client_id == cid) {
                         const unsigned jid = u->job_id;
                         const unsigned cport = u->port;
@@ -2684,7 +2740,8 @@ int main(int argc, char **argv)
                 while (occ3 == 0 && secs_since(t0) < 30) {
                     Msg *m = sub->get_msg(2);
                     if (!m) { continue; }
-                    UseCSMsg *u = MSG_IS(m, USE_CS) ? dynamic_cast<UseCSMsg *>(m) : nullptr;
+                    UseCSMsg *u = MSG_IS(m, USE_CS)
+                        ? remember_use(dynamic_cast<UseCSMsg *>(m)) : nullptr;
                     if (u && u->client_id == 8200) { occ3 = u->job_id; occ3port = u->port; }
                     delete m;
                 }
@@ -2714,7 +2771,8 @@ int main(int argc, char **argv)
                 while (held < 6 && secs_since(t0) < 30) {
                     Msg *m = sub->get_msg(2);
                     if (!m) { continue; }
-                    UseCSMsg *u = MSG_IS(m, USE_CS) ? dynamic_cast<UseCSMsg *>(m) : nullptr;
+                    UseCSMsg *u = MSG_IS(m, USE_CS)
+                        ? remember_use(dynamic_cast<UseCSMsg *>(m)) : nullptr;
                     if (u && u->client_id >= 8500 && u->client_id <= 8505) {
                         if (u->client_id == 8500) { occB1 = u->job_id; }
                         if (u->client_id == 8501) { occB2 = u->job_id; }
@@ -2775,7 +2833,8 @@ int main(int argc, char **argv)
                 while (arm2_jid == 0 && secs_since(t0) < 20) {
                     Msg *m = sub->get_msg(2);
                     if (!m) { continue; }
-                    UseCSMsg *u = MSG_IS(m, USE_CS) ? dynamic_cast<UseCSMsg *>(m) : nullptr;
+                    UseCSMsg *u = MSG_IS(m, USE_CS)
+                        ? remember_use(dynamic_cast<UseCSMsg *>(m)) : nullptr;
                     if (u && u->client_id == 8300) { arm2_jid = u->job_id; arm2_port = u->port; }
                     delete m;
                 }
@@ -2797,7 +2856,8 @@ int main(int argc, char **argv)
                 while (win_jid == 0 && secs_since(t0) < 30) {
                     Msg *m = subE->get_msg(2);
                     if (!m) { continue; }
-                    UseCSMsg *u = MSG_IS(m, USE_CS) ? dynamic_cast<UseCSMsg *>(m) : nullptr;
+                    UseCSMsg *u = MSG_IS(m, USE_CS)
+                        ? remember_use(dynamic_cast<UseCSMsg *>(m)) : nullptr;
                     if (u && u->client_id == 8400) { win_jid = u->job_id; }
                     delete m;
                 }
@@ -3044,7 +3104,7 @@ int main(int argc, char **argv)
                 if (!m) { continue; }
                 unsigned jid = 0, got = 0;
                 if (MSG_IS(m, USE_CS)) {
-                    UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                    UseCSMsg *u = remember_use(dynamic_cast<UseCSMsg *>(m));
                     if (u) { jid = u->job_id; got = u->client_id; }
                 } else if (MSG_IS(m, NO_CS)) {
                     NoCSMsg *n = dynamic_cast<NoCSMsg *>(m);
@@ -3107,7 +3167,8 @@ int main(int argc, char **argv)
             REQUIRE(jobs_before >= 1, "the worker holds the sibling's reservation");
 
             JobDoneMsg jd(long_job, 0, JobDoneMsg::FROM_SERVER);
-            REQUIRE(cs->send_msg(jd), "long sibling's completion sent");
+            REQUIRE(stamp_done(jd, long_job) && cs->send_msg(jd),
+                    "long sibling's completion sent");
 
             bool gone = false;
             const Clock::time_point t0 = Clock::now();
@@ -3192,7 +3253,8 @@ int main(int argc, char **argv)
             const long long jobs_before_done = worker_job_count(port, "fakecs");
 
             JobDoneMsg jd(frozen_job, 0, JobDoneMsg::FROM_SERVER);
-            REQUIRE(cs->send_msg(jd), "late JobDone for the thawed wrapper sent");
+            REQUIRE(stamp_done(jd, frozen_job) && cs->send_msg(jd),
+                    "late JobDone for the thawed wrapper sent");
             bool ended = false;
             const Clock::time_point t1 = Clock::now();
             while (!ended && secs_since(t1) < 15) {
@@ -3597,7 +3659,7 @@ int main(int argc, char **argv)
                 Msg *m = subP->get_msg(2);
                 if (!m) { continue; }
                 if (MSG_IS(m, USE_CS)) {
-                    UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                    UseCSMsg *u = remember_use(dynamic_cast<UseCSMsg *>(m));
                     if (u && u->client_id == 8802) { pjid = u->job_id; }
                 }
                 delete m;
@@ -3861,7 +3923,7 @@ int main(int argc, char **argv)
                 Msg *m = subT->get_msg(2);
                 if (!m) { continue; }
                 if (MSG_IS(m, USE_CS)) {
-                    UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                    UseCSMsg *u = remember_use(dynamic_cast<UseCSMsg *>(m));
                     if (u && u->client_id == 7700) { jid = u->job_id; }
                 }
                 delete m;
@@ -3970,7 +4032,8 @@ int main(int argc, char **argv)
             REQUIRE(subT2->send_msg(login), "replacement submitter logged in");
             usleep(300 * 1000);
             JobDoneMsg stale(jid, 0, JobDoneMsg::FROM_SUBMITTER);
-            REQUIRE(subT2->send_msg(stale), "stale non-worker completion sent");
+            REQUIRE(stamp_done(stale, jid) && subT2->send_msg(stale),
+                    "stale non-worker completion sent");
         }
         {
             long long rejects = -1;
@@ -4060,7 +4123,7 @@ int main(int argc, char **argv)
                 Msg *m = subT2->get_msg(2);
                 if (!m) { continue; }
                 if (MSG_IS(m, USE_CS)) {
-                    UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                    UseCSMsg *u = remember_use(dynamic_cast<UseCSMsg *>(m));
                     if (u && u->client_id == 7701) { jid3 = u->job_id; }
                 }
                 delete m;
@@ -4117,7 +4180,7 @@ int main(int argc, char **argv)
                         Msg *m = subU->get_msg(2);
                         if (!m) { continue; }
                         if (MSG_IS(m, USE_CS)) {
-                            UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                            UseCSMsg *u = remember_use(dynamic_cast<UseCSMsg *>(m));
                             if (u && u->client_id == 7800) { jid2 = u->job_id; }
                         }
                         delete m;
@@ -4216,7 +4279,8 @@ int main(int argc, char **argv)
             while (frozen_job == 0 && secs_since(t0) < 30) {
                 Msg *m = sub->get_msg(2);
                 if (!m) { continue; }
-                UseCSMsg *u = MSG_IS(m, USE_CS) ? dynamic_cast<UseCSMsg *>(m) : nullptr;
+                UseCSMsg *u = MSG_IS(m, USE_CS)
+                    ? remember_use(dynamic_cast<UseCSMsg *>(m)) : nullptr;
                 if (u && u->client_id == frozen_cid) { frozen_job = u->job_id; }
                 delete m;   /* deliberately NOT confirmed: the wrapper is frozen */
             }
@@ -4241,7 +4305,7 @@ int main(int argc, char **argv)
                 if (!m) { continue; }
                 unsigned jid = 0, got_cid = 0;
                 if (MSG_IS(m, USE_CS)) {
-                    UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                    UseCSMsg *u = remember_use(dynamic_cast<UseCSMsg *>(m));
                     if (u) { jid = u->job_id; got_cid = u->client_id; }
                 } else if (MSG_IS(m, NO_CS)) {
                     NoCSMsg *n = dynamic_cast<NoCSMsg *>(m);
@@ -4331,7 +4395,10 @@ int main(int argc, char **argv)
                         if (!csC->send_msg(jb)) { csC_alive = false; return; }
                     } else {
                         JobDoneMsg jd(e.first, 0, JobDoneMsg::FROM_SERVER);
-                        if (!csC->send_msg(jd)) { csC_alive = false; return; }
+                        if (!stamp_done(jd, e.first) || !csC->send_msg(jd)) {
+                            csC_alive = false;
+                            return;
+                        }
                     }
                 }
                 if (secs_since(last_stats) > 10) {
@@ -4367,7 +4434,7 @@ int main(int argc, char **argv)
                 Msg *m = sub->get_msg(2);
                 if (!m) { continue; }
                 if (MSG_IS(m, USE_CS)) {
-                    UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+                    UseCSMsg *u = remember_use(dynamic_cast<UseCSMsg *>(m));
                     if (u && u->client_id == cid) {
                         *jid_out = u->job_id;
                         *port_out = u->port;
@@ -4856,7 +4923,7 @@ int main(int argc, char **argv)
         }
         last_progress = Clock::now();
         if (MSG_IS(m, USE_CS)) {
-            UseCSMsg *u = dynamic_cast<UseCSMsg *>(m);
+            UseCSMsg *u = remember_use(dynamic_cast<UseCSMsg *>(m));
             if (u && u->port == kCsPort && u->client_id >= 1
                     && u->client_id <= (unsigned)njobs) {
                 ++replies[u->client_id];

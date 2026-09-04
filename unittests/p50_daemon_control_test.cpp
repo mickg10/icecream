@@ -35,7 +35,7 @@ ControlOperation source_operation() {
     arm.selected_f_host = "worker.example";
     arm.selected_f_ordinary_port = 10245;
     arm.selected_f_cache_port = 10246;
-    arm.cache_protocol = CACHE_WIRE_PROTOCOL_V1;
+    arm.cache_protocol = CACHE_WIRE_REVISION;
     arm.cache_profile = CACHE_PROFILE_ZSTD_TU;
     arm.logical_job = 19;
     arm.compiler_attempt = 20;

@@ -82,7 +82,6 @@ ClearOverlay(st) ==
     [st EXCEPT
         !.pendingOp = NoOp,
         !.pendingToken = NoToken,
-        !.dictDone = FALSE,
         !.needRecorded = FALSE,
         !.requested = {},
         !.missing = {},
@@ -109,7 +108,6 @@ Init ==
          cActiveOp           |-> NoOp,
          pendingOp           |-> NoOp,
          pendingToken        |-> NoToken,
-         dictDone            |-> FALSE,
          needRecorded        |-> FALSE,
          requested           |-> {},
          missing             |-> {},
@@ -206,7 +204,6 @@ F_TX_BEGIN(op) ==
        /\ s' = [s EXCEPT
                     !.pendingOp = op,
                     !.pendingToken = s.sessionToken,
-                    !.dictDone = FALSE,
                     !.needRecorded = FALSE,
                     !.requested = {},
                     !.missing = {},
@@ -223,13 +220,6 @@ TX_ABORTED(op) ==
     /\ (MutantAbortAfterCommit \/ ~s.commitUnacked)
     /\ s' = [s EXCEPT !.cActiveOp = NoOp]
 
-DICT_COMPLETE(op) ==
-    /\ op \in RealOps
-    /\ op = s.pendingOp
-    /\ CurrentSession(s, OpF(op), s.pendingToken)
-    /\ ~s.dictDone
-    /\ s' = [s EXCEPT !.dictDone = TRUE]
-
 NEED_RECORDED(op) ==
     LET f == OpF(op)
         required == TuObjects(OpTu(op))
@@ -237,7 +227,7 @@ NEED_RECORDED(op) ==
     IN /\ op \in RealOps
        /\ op = s.pendingOp
        /\ CurrentSession(s, f, s.pendingToken)
-       /\ s.dictDone
+       /\ s.bodyDone
        /\ ~s.needRecorded
        /\ s' = [s EXCEPT
                     !.needRecorded = TRUE,
@@ -302,7 +292,6 @@ INPUT_MATERIALIZED(op) ==
     IN /\ op \in RealOps
        /\ op = s.pendingOp
        /\ CurrentSession(s, f, s.pendingToken)
-       /\ s.dictDone
        /\ s.needRecorded
        /\ s.bodyDone
        /\ s.missing = {}
@@ -335,8 +324,8 @@ INPUT_COMMITTED(callbackOp) ==
                     !.badCommit =
                         s.badCommit \/
                         callbackOp # current \/
-                        ~(s.dictDone /\ s.needRecorded /\
-                          s.bodyDone /\ s.missing = {} /\
+                        ~(s.needRecorded /\ s.bodyDone /\
+                          s.missing = {} /\
                           s.materialized)]
 
 COMMIT_ACCEPTED(f, tok, op) ==
@@ -395,7 +384,6 @@ Next ==
     \/ \E op \in RealOps : F_TX_BEGIN(op)
     \/ \E op \in RealOps : ACTIVE_REPLAYED(op)
     \/ \E op \in RealOps : TX_ABORTED(op)
-    \/ \E op \in RealOps : DICT_COMPLETE(op)
     \/ \E op \in RealOps : NEED_RECORDED(op)
     \/ \E op \in RealOps : BODY_COMPLETE(op)
     \/ \E op \in RealOps, o \in Objects : OBJECT_APPLIED(op, o)
@@ -430,7 +418,6 @@ TypeOK ==
     /\ s.cActiveOp \in Ops
     /\ s.pendingOp \in Ops
     /\ s.pendingToken \in Tokens \cup {NoToken}
-    /\ s.dictDone \in BOOLEAN
     /\ s.needRecorded \in BOOLEAN
     /\ s.requested \subseteq Objects
     /\ s.missing \subseteq Objects

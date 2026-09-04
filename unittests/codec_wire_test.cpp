@@ -779,6 +779,8 @@ void run_wire_controls(const Corpus &corpus,
     P29Deserializer<ResearchProvider> deserializer(provider);
     (void)deserializer.receive_body(body);
     (void)deserializer.receive_fill(literal_fill, true);
+    require(deserializer.pending_segment_digest() == icecc::digest128(abc),
+            "streamed Region-segment digest differs from exact bytes");
     deserializer.commit();
     const P29ReceiverRouteState committed = provider.receiver_route();
     bool rejected = false;
@@ -801,6 +803,8 @@ void run_wire_controls(const Corpus &corpus,
     const std::vector<std::uint8_t> empty_fill = make_fill(empty_control, {});
     require(deserializer.receive_fill(empty_fill, true).empty(),
             "empty Region materialized bytes");
+    require(deserializer.pending_segment_digest() == icecc::Digest128{},
+            "empty Region segment has a nonzero digest");
     deserializer.commit();
     require(provider.receiver_route().known_region_count == 1,
             "empty Region did not commit");

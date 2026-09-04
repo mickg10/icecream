@@ -1,4 +1,5 @@
 #include "p50_input_record.h"
+#include "p50_profile.h"
 
 #include <algorithm>
 #include <functional>
@@ -82,7 +83,7 @@ InputRecordStore::InputRecordStore(size_t max_records,
     records_.reserve(max_records_);
 }
 
-void InputRecordStore::validate_commit(
+void InputRecordStore::validate_commit_identity(
     const TxBegin& begin, const TxCommit& commit,
     std::span<const uint8_t> exact_input) {
     if (begin.rel_seq.value == std::numeric_limits<uint64_t>::max())
@@ -106,6 +107,12 @@ void InputRecordStore::validate_commit(
         exact_input.size() != static_cast<size_t>(begin.raw_bytes))
         throw std::invalid_argument(
             "InputRecord exact input length differs from TX_BEGIN");
+}
+
+void InputRecordStore::validate_commit(
+    const TxBegin& begin, const TxCommit& commit,
+    std::span<const uint8_t> exact_input) {
+    validate_commit_identity(begin, commit, exact_input);
     if (icecc::digest128(exact_input) != begin.raw_digest)
         throw std::invalid_argument(
             "InputRecord exact input digest differs from TX_BEGIN");
@@ -139,6 +146,26 @@ InputRecordStore::PreparedPublish InputRecordStore::prepare_publish(
         throw std::invalid_argument("InputRecord C_STORE_GUID zero is reserved");
 
     validate_commit(begin, commit, exact_input);
+    return prepare_validated_publish(c_store_guid, begin, commit,
+                                     std::move(exact_input));
+}
+
+InputRecordStore::PreparedPublish InputRecordStore::prepare_verified_publish(
+    CStoreGuid c_store_guid, const TxBegin& begin, const TxCommit& commit,
+    VerifiedMaterialization materialization) {
+    if (c_store_guid == CStoreGuid{})
+        throw std::invalid_argument("InputRecord C_STORE_GUID zero is reserved");
+    if (materialization.begin_ != begin)
+        throw std::invalid_argument(
+            "verified InputRecord materialization differs from TX_BEGIN");
+    validate_commit_identity(begin, commit, materialization.exact_input_);
+    return prepare_validated_publish(
+        c_store_guid, begin, commit, std::move(materialization.exact_input_));
+}
+
+InputRecordStore::PreparedPublish InputRecordStore::prepare_validated_publish(
+    CStoreGuid c_store_guid, const TxBegin& begin, const TxCommit& commit,
+    std::vector<uint8_t> exact_input) {
     const InputRecordKey key{c_store_guid, begin.tu_seq};
     auto mutable_backing =
         std::make_shared<std::vector<uint8_t>>(std::move(exact_input));

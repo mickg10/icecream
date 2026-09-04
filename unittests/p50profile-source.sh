@@ -27,7 +27,7 @@ grep -F 'make_profile_dialogue' "$profile" >/dev/null
 grep -F 'new ZstdTuDialogue' "$profile" >/dev/null
 grep -F 'impl_->receive_need' "$endpoint" >/dev/null
 grep -F 'impl_->receive_fill' "$endpoint" >/dev/null
-grep -F 'impl_->append_dict' "$endpoint" >/dev/null
+grep -F 'impl_->append_body' "$endpoint" >/dev/null
 grep -F 'pending.dialogue->commit_visible(materialized.commit)' "$endpoint" >/dev/null
 grep -F 'space.route->pending->dialogue->discard_tentative()' "$endpoint" >/dev/null
 grep -F 'P50_PROFILE_INTERFACE.md' "$src/cache/Makefile.am" >/dev/null
@@ -44,4 +44,4 @@ fi
 echo 'ok - pending transaction owns only the type-erased profile dialogue'
 echo 'ok - concrete profile construction is confined to the profile adapter'
 echo 'ok - deletion-sensitive concrete ownership mutant reddens'
-echo 'PASS: frozen profile vtable source gate'
+echo 'PASS: revision-1 profile vtable source gate'

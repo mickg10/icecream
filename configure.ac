@@ -437,57 +437,6 @@ AC_SUBST(LZO_LDADD)
 
 PKG_CHECK_MODULES([LIBZSTD], [libzstd >= 1.4.0])
 
-dnl GRZ_RESIDUAL is intentionally opt-in.  A build without the reviewed
-dnl libbsc BWT implementation must not advertise registry id 3.
-AC_ARG_WITH([libbsc],
-    [AS_HELP_STRING([--with-libbsc[=PREFIX]],
-        [enable GRZ_RESIDUAL with the pinned libbsc BWT source (default: no)])],
-    [libbsc_prefix="$withval"], [libbsc_prefix="no"])
-LIBBSC_CFLAGS=${LIBBSC_CFLAGS-}
-LIBBSC_LIBS=${LIBBSC_LIBS-}
-AS_IF([test "x$libbsc_prefix" != xno], [
-    AS_IF([test "x$libbsc_prefix" != xyes], [
-        AS_IF([test -z "$LIBBSC_CFLAGS"], [
-            LIBBSC_CFLAGS="-I$libbsc_prefix/libbsc"
-        ])
-        AS_IF([test -z "$LIBBSC_LIBS"], [
-            AS_IF([test -f "$libbsc_prefix/build-gcc2/libbsc.a"], [
-                LIBBSC_LIBS="$libbsc_prefix/build-gcc2/libbsc.a -fopenmp"
-            ], [
-                LIBBSC_LIBS="-L$libbsc_prefix/lib -lbsc"
-            ])
-        ])
-    ])
-    icecc_libbsc_save_CPPFLAGS="$CPPFLAGS"
-    icecc_libbsc_save_LIBS="$LIBS"
-    CPPFLAGS="$LIBBSC_CFLAGS $CPPFLAGS"
-    LIBS="$LIBBSC_LIBS $LIBS"
-    AC_CHECK_HEADERS([libbsc.h], [],
-        [AC_MSG_ERROR([--with-libbsc requires libbsc.h from the reviewed libbsc source])])
-    AC_LINK_IFELSE([AC_LANG_PROGRAM([[#include <stddef.h>
-                                      #include <libbsc.h>]], [[
-        if (bsc_init(LIBBSC_FEATURE_FASTMODE) != LIBBSC_NO_ERROR) return 1;
-        unsigned char input[64] = {}, output[64 + LIBBSC_HEADER_SIZE] = {};
-        (void)bsc_compress(input, output, 64, LIBBSC_DEFAULT_LZPHASHSIZE,
-                           LIBBSC_DEFAULT_LZPMINLEN, LIBBSC_BLOCKSORTER_BWT,
-                           LIBBSC_CODER_QLFC_ADAPTIVE, LIBBSC_FEATURE_FASTMODE);
-        return 0;
-    ]])], [
-        AC_DEFINE([ICECC_P50_WITH_LIBBSC], [1],
-                  [Build the GRZ_RESIDUAL profile with libbsc BWT])
-        LIBBSC_CFLAGS="$LIBBSC_CFLAGS -DICECC_P50_WITH_LIBBSC"
-        AC_MSG_NOTICE([GRZ_RESIDUAL enabled with libbsc: $LIBBSC_LIBS])
-    ], [AC_MSG_ERROR([--with-libbsc was requested but libbsc BWT could not be linked])])
-    CPPFLAGS="$icecc_libbsc_save_CPPFLAGS"
-    LIBS="$icecc_libbsc_save_LIBS"
-], [
-    LIBBSC_CFLAGS=
-    LIBBSC_LIBS=
-    AC_MSG_NOTICE([GRZ_RESIDUAL disabled: libbsc was not requested])
-])
-AC_SUBST([LIBBSC_CFLAGS])
-AC_SUBST([LIBBSC_LIBS])
-
 dnl Protocol-50 bounds decompression before allocation with this exact API.
 dnl Check the selected header and library together: a version string alone does
 dnl not prove that the enum and entry point are available in both.

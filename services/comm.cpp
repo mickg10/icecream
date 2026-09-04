@@ -2329,7 +2329,7 @@ Msg *MsgChannel::get_msg(int timeout, bool eofAllowed)
        after this return, so retain that one frame until the binding occurs. */
     const uint64_t frame_bytes =
         inmsglen + (text_based ? 0 : sizeof(uint32_t));
-    if (type == Msg::COMPILE_FILE &&
+    if (type == Msg::COMPILE_FILE && protocol >= PROTOCOL_VERSION &&
         p50_legacy_wire_role == P50LegacyWireRole::F) {
         P50LegacyWireIdentity identity;
         const auto *compile = dynamic_cast<const CompileFileMsg *>(m);
@@ -5133,11 +5133,8 @@ bool LoginMsg::valid_payload() const
         return false;
     const bool absent = cache_endpoint_port == 0
         && cache_protocol == 0 && cache_profile_mask == 0;
-    const bool present = cache_endpoint_port > 0
-        && cache_endpoint_port <= UINT16_MAX
-        && cache_protocol == CACHE_WIRE_PROTOCOL_V1
-        && cache_profile_mask != 0
-        && (cache_profile_mask & ~CACHE_ADVERTISABLE_PROFILE_MASK) == 0;
+    const bool present = cache_advertisement_is_well_formed_present(
+        cache_endpoint_port, cache_protocol, cache_profile_mask);
     return absent || present;
 }
 

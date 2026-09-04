@@ -32,16 +32,6 @@ struct ChildrenPayload {
 
 using ObjectPayload = std::variant<BytesPayload, ChildrenPayload>;
 
-constexpr uint16_t kP29KeyVectorEncoding = 1;
-// BODY carries deterministic Root/Block/Region control and one canonical
-// per-TU alpha/residual composition.  Line bytes are absent from FILL and
-// reconstructed independently at F from this authoritative composition.
-constexpr uint16_t kP29ResidualBodyEncoding = 2;
-// P29V1 BODY is the nested ROOT/BLOCKDEF frame stream. Its empty DICT
-// descriptor carries the C system-source fingerprint in the digest field;
-// the distinct encoding makes that deliberate exception unambiguous.
-constexpr uint16_t kP29WireV1BodyEncoding = 3;
-
 struct ImmutableObject {
     Key64 key{};
     ObjectPayload payload;
@@ -256,7 +246,6 @@ struct PreparedTU {
     TuSeq tu_seq{};
     uint64_t raw_bytes = 0;
     Digest128 raw_digest{};
-    std::vector<Key64> regions;
 
 private:
     friend class CAuthority;
@@ -268,125 +257,52 @@ using PreparedTUPtr = std::shared_ptr<const PreparedTU>;
 
 class CAuthority {
 public:
-    enum class Verification : uint8_t {
-        StreamedDigest,
-        FullMaterialization,
-    };
-
     explicit CAuthority(CStoreGuid guid,
                         p29::OnlineS1::Config config = p29::OnlineS1::Config{},
-                        uint16_t generation = 0, uint64_t first_ordinal = 1,
-                        TuSeq first_tu_seq = {},
-                        Verification verification = Verification::StreamedDigest);
+                        TuSeq first_tu_seq = {});
     ~CAuthority();
     CAuthority(const CAuthority&) = delete;
     CAuthority& operator=(const CAuthority&) = delete;
 
-    Key64 intern_bytes(ObjectType type, std::span<const uint8_t> payload) {
-        return arena_.intern_bytes(type, payload);
-    }
-    Key64 intern_children(ObjectType type, std::span<const Key64> payload) {
-        return arena_.intern_children(type, payload);
-    }
-    GenerationAdvanceResult advance_generation() { return arena_.advance_generation(); }
-
-    // Rejects unless the ordered Region/Line composition has the exact input
-    // length and digest. FullMaterialization adds a bytewise debug assertion.
-    PreparedTUPtr prepare_tu(std::span<const uint8_t> exact_input,
-                             std::span<const Key64> regions);
-    PreparedTUPtr prepare_from_regions(
-        std::span<const std::vector<uint8_t>> region_bytes);
-
-    [[nodiscard]] const CStoreGuid& guid() const { return arena_.guid(); }
-    [[nodiscard]] const CObjectArena& arena() const { return arena_; }
+    [[nodiscard]] const CStoreGuid& guid() const { return guid_; }
     [[nodiscard]] p29::BlockCatalogue& block_catalogue() { return block_catalogue_; }
     [[nodiscard]] p29::OnlineS1::Config s1_config() const { return s1_config_; }
-    [[nodiscard]] Key64 dense_region_key(uint32_t id) const;
-    [[nodiscard]] Key64 block_key(uint32_t id) const;
-    [[nodiscard]] size_t dense_region_count() const { return dense_to_region_.size(); }
-    [[nodiscard]] size_t published_block_count() const { return block_keys_.size(); }
-    [[nodiscard]] std::span<const uint32_t> block_regions(uint32_t id) const {
-        return std::span<const uint32_t>(block_catalogue_.block(id).regions);
-    }
-    void set_verification(Verification verification) { verification_ = verification; }
-    [[nodiscard]] Verification verification() const { return verification_; }
     [[nodiscard]] bool p29v1_runnable() const noexcept;
     [[nodiscard]] uint64_t p29v1_interner_reserved_bytes() const noexcept;
     [[nodiscard]] uint64_t p29v1_interner_committed_bytes() const noexcept;
-    void publish_new_p29_blocks();
-    [[nodiscard]] std::vector<Key64> transitive_manifest(
-        std::span<const p29::Ref> roots) const;
-    [[nodiscard]] std::vector<uint8_t> materialize(
-        const ImmutableObjectStore& objects, std::span<const Key64> roots) const;
-
 private:
     friend class P50PreparationAuthority;
-    // One C-store TU identity allocator shared by every relationship view.
-    // The preparation authority is the sole caller and chooses no external
-    // identity; it advances this allocator exactly once per C-wide record.
-    TuSeq allocate_tu_seq();
     // Reserve and commit are split so a failed preparation never consumes a
     // C-wide identity.  Both are owner-thread operations; commit accepts only
     // the currently reserved successor and cannot roll back a published TU.
     TuSeq reserve_tu_seq() const;
     void commit_tu_seq(TuSeq reserved);
-    uint32_t dense_region(Key64 key);
-    PreparedTUPtr prepare_tu_at_seq(std::span<const uint8_t> exact_input,
-                                    std::span<const Key64> regions,
-                                    TuSeq tu_seq);
-    void reserve_for_tu(size_t expected_lines) {
-        arena_.reserve_for_tu(expected_lines);
-    }
-    // Build the immutable C-wide representation with an already allocated
-    // identity.  Only the C preparation authority may call this; it never
-    // advances the allocator or permits an external TU_SEQ choice.
-    PreparedTUPtr prepare_from_regions_at_seq(
-        std::span<const std::vector<uint8_t>> region_bytes,
-        std::optional<TuSeq> tu_seq);
     void enable_p29v1(uint64_t max_interner_reserved_bytes,
                       uint64_t max_tu_bytes);
     PreparedTUPtr prepare_p29v1_at_seq(std::span<const uint8_t> exact_input,
-                                       TuSeq tu_seq);
+                                       TuSeq tu_seq,
+                                       Digest128 exact_digest);
 
     struct P29V1State;
 
-    CObjectArena arena_;
+    CStoreGuid guid_{};
     p29::OnlineS1::Config s1_config_;
     p29::BlockCatalogue block_catalogue_;
-    std::unordered_map<Key64, uint32_t, Key64Hash> region_to_dense_;
-    std::vector<Key64> dense_to_region_;
-    std::vector<Key64> block_keys_;
     uint64_t next_tu_seq_ = 0;
     bool tu_seq_exhausted_ = false;
-    Verification verification_ = Verification::StreamedDigest;
     std::unique_ptr<P29V1State> p29v1_;
 
     friend class CRoute;
 };
 
-struct Need {
-    HistoryNonce history_nonce{};
-    RelSeq rel_seq{};
-    TuSeq tu_seq{};
-    Digest128 transaction_digest{};
-    std::vector<Key64> missing;
-    auto operator<=>(const Need&) const = default;
-};
-
 struct CActiveTx {
     PreparedTUPtr prepared;
     TxBegin begin;
-    std::vector<uint8_t> dict;
     std::vector<uint8_t> body;
-    std::vector<Key64> root;
-    std::vector<Key64> manifest;
     size_t region_count = 0;
     size_t block_use_count = 0;
     size_t new_block_count = 0;
 };
-
-class FStore;
-struct ReconnectResult;
 
 class CRoute {
 public:
@@ -396,19 +312,11 @@ public:
     CRoute(const CRoute&) = delete;
     CRoute& operator=(const CRoute&) = delete;
 
-    const CActiveTx& begin(
-        const PreparedTUPtr& prepared,
-        P29RootMode root_mode = P29RootMode::RouteHistory,
-        bool residual_body = false);
     const CActiveTx& begin_v1(const PreparedTUPtr& prepared,
-                              Digest128 system_source_fingerprint,
                               uint64_t max_route_state_bytes);
-    // Bytes not covered by this route's acknowledged immutable line objects.
-    // This is the only source admitted to the residual-group codec.
-    std::vector<uint8_t> residual_input(const PreparedTUPtr& prepared) const;
-    std::vector<ImmutableObject> build_fill(const Need& need) const;
+    void pin_v1_system_source_reuse(bool reuse);
     std::span<const uint8_t> build_fill_v1(
-        uint64_t flags, std::span<const uint8_t> inner_need);
+        std::span<const uint8_t> inner_need);
     void restart_v1_for_transport_retry();
     void reset_v1_route(FStoreGuid f_store_guid,
                         HistoryNonce history_nonce);
@@ -425,7 +333,6 @@ public:
     [[nodiscard]] uint64_t p29v1_route_state_bytes() const noexcept;
 
 private:
-    friend ReconnectResult reconnect(CRoute&, FStore&, HistoryNonce);
     void reset_history(FStoreGuid f_store_guid, HistoryNonce history_nonce);
     void record(ActionType action, const CActiveTx& active);
 
@@ -434,9 +341,7 @@ private:
     HistoryNonce history_nonce_{};
     RelSeq next_rel_seq_{};
     Digest128 state_digest_{};
-    std::unique_ptr<p29::OnlineS1> matcher_;
     std::optional<CActiveTx> active_;
-    std::unordered_set<Key64, Key64Hash> acknowledged_objects_;
     struct P29V1State;
     std::unique_ptr<P29V1State> p29v1_;
     ActionTrace* trace_ = nullptr;
@@ -454,7 +359,7 @@ public:
     explicit FStore(FStoreGuid guid, uint64_t first_session_serial = 1,
                     ActionTrace* trace = nullptr,
                     uint64_t p29v1_max_tu_bytes = uint64_t{1} << 30,
-                    Digest128 system_source_fingerprint = {});
+                    bool p29v1_system_source_reuse = false);
     ~FStore();
     FStore(const FStore&) = delete;
     FStore& operator=(const FStore&) = delete;
@@ -466,17 +371,11 @@ public:
                      Digest128 initial_state_digest);
 
     void begin(SessionHandle session, const TxBegin& begin, bool replay = false);
-    void append_dict(SessionHandle session, std::span<const uint8_t> bytes);
     void append_body(SessionHandle session, std::span<const uint8_t> bytes);
-    [[nodiscard]] Need need(SessionHandle session) const;
-    ObjectApplied apply_object(SessionHandle session, const ImmutableObject& object);
-    std::vector<ObjectApplied> append_fill(SessionHandle session,
-                                           const FillMessage& message);
     [[nodiscard]] std::vector<uint8_t> p29v1_need_frames(SessionHandle session) const;
     [[nodiscard]] bool p29v1_system_source_reuse(SessionHandle session) const;
     void append_fill_v1(SessionHandle session,
                         std::vector<uint8_t> inner_fill);
-    void finish_fill(SessionHandle session) const;
     std::vector<uint8_t> materialize_and_verify(SessionHandle session);
     TxCommit commit_input(SessionHandle session);
     void abandon_input(SessionHandle session) noexcept;
@@ -488,15 +387,12 @@ public:
     void destructive_cache_reset(FStoreGuid new_guid);
 
     [[nodiscard]] const FStoreGuid& guid() const { return guid_; }
-    [[nodiscard]] size_t object_count(CStoreGuid c_store_guid) const;
-    [[nodiscard]] bool contains(CStoreGuid c_store_guid, Key64 key) const;
-
 private:
     struct Namespace;
     Namespace& require_namespace(SessionHandle session);
     const Namespace& require_namespace(SessionHandle session) const;
     void abandon_pending(Namespace& space) noexcept;
-    void append_component(SessionHandle session, bool dict,
+    void append_component(SessionHandle session,
                           std::span<const uint8_t> bytes);
     void record(ActionType action, SessionHandle session, const TxBegin* begin,
                 std::optional<Key64> key = std::nullopt,
@@ -510,7 +406,7 @@ private:
     std::unordered_map<CStoreGuid, std::unique_ptr<Namespace>, Id128Hash> namespaces_;
     ActionTrace* trace_ = nullptr;
     uint64_t p29v1_max_tu_bytes_ = uint64_t{1} << 30;
-    Digest128 system_source_fingerprint_{};
+    bool p29v1_system_source_reuse_ = false;
 };
 
 // Start the process-wide P29V1 system-source fingerprint worker.  Product
@@ -530,21 +426,5 @@ void wait_p29_system_source_fingerprint() noexcept;
 // source reuse off.  Enumeration/hash failures likewise publish zero without
 // making any other profile unavailable.
 [[nodiscard]] Digest128 p29_system_source_fingerprint() noexcept;
-
-enum class ReconnectOutcome {
-    ExactMatch,
-    LostFinalAcknowledgement,
-    ColdFStore,
-    RouteHistoryReset,
-};
-
-struct ReconnectResult {
-    ReconnectOutcome outcome = ReconnectOutcome::ExactMatch;
-    SessionHandle session{};
-    bool replay_active = false;
-};
-
-ReconnectResult reconnect(CRoute& c_route, FStore& f_store,
-                          HistoryNonce fresh_history_nonce);
 
 }  // namespace icecc::p50

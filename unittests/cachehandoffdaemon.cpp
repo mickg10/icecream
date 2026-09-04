@@ -419,7 +419,7 @@ int main(int argc, char **argv)
     UseCSMsg reply("x86_64", "127.0.0.1", observed_daemon_port,
                    wire_job_id, false, remote_client_id, expected_matched_job_id,
                    assignment_epoch, assignment_nonce,
-                   expected_cache_port, CACHE_WIRE_PROTOCOL_V1,
+                   expected_cache_port, CACHE_WIRE_REVISION,
                    CACHE_PROFILE_ZSTD_TU);
     if (scheduler && forwarded) {
         REQUIRE(scheduler->send_msg(reply),
@@ -439,7 +439,7 @@ int main(int argc, char **argv)
             "S2: the local rewrite changes only derived host reachability");
     REQUIRE(client_use && client_use->hasCacheAdvertisement()
                 && client_use->cache_endpoint_port == expected_cache_port
-                && client_use->cache_protocol == CACHE_WIRE_PROTOCOL_V1
+                && client_use->cache_protocol == CACHE_WIRE_REVISION
                 && client_use->cache_profile_mask == CACHE_PROFILE_ZSTD_TU,
             "S2: the local-rewrite relay carries the SAME validated cache "
             "triple -- port/protocol/mask unchanged by the host rewrite");
@@ -509,7 +509,7 @@ int main(int argc, char **argv)
                      remote_wire_job_id, remote_got_env, client_c_forwarded_id,
                      remote_matched_job_id,
                      remote_assignment_epoch, remote_assignment_nonce,
-                     remote_cache_port, CACHE_WIRE_PROTOCOL_V1,
+                     remote_cache_port, CACHE_WIRE_REVISION,
                      CACHE_PROFILE_ZSTD_TU);
     reply_c.setCompileIdentity(remote_c_guid, remote_tu_seq);
     if (scheduler && forwarded_c) {
@@ -544,7 +544,7 @@ int main(int argc, char **argv)
             "S2: assignment and compile identities survive the remote-worker relay unchanged");
     REQUIRE(client_c_use && client_c_use->hasCacheAdvertisement()
                 && client_c_use->cache_endpoint_port == remote_cache_port
-                && client_c_use->cache_protocol == CACHE_WIRE_PROTOCOL_V1
+                && client_c_use->cache_protocol == CACHE_WIRE_REVISION
                 && client_c_use->cache_profile_mask == CACHE_PROFILE_ZSTD_TU,
             "S2: the remote-worker relay carries the SAME validated cache "
             "triple -- port/protocol/mask survive the actual client wire "
@@ -686,7 +686,7 @@ int main(int argc, char **argv)
         UseCSMsg reply_b("x86_64", "127.0.0.1", observed_daemon_port,
                          UINT32_C(0x00005202), true, forwarded_b->client_id, 0,
                          /* assignment_epoch */ 0, /* assignment_nonce */ 0,
-                         expected_cache_port, CACHE_WIRE_PROTOCOL_V1,
+                         expected_cache_port, CACHE_WIRE_REVISION,
                          CACHE_PROFILE_ZSTD_TU);
         REQUIRE(!scheduler->send_msg(reply_b),
                 "S2: the wire refuses a valid-tail, identity-less UseCS "

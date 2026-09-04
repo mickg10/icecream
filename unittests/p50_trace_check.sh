@@ -25,7 +25,9 @@ expect_reject() {
     fi
 }
 
-P50_TRACE_PATH="$trace_file" ./p50slice0 >/dev/null
+ICECC_P50_ACTION_TRACE="$trace_file" \
+ICECC_P50_P29_DIALOGUE_FOCUS=1 \
+    ./p50endpoint >/dev/null
 "$PYTHON" "$checker" "$trace_file"
 
 "$PYTHON" - "$trace_file" "$workdir" <<'PY'
@@ -81,16 +83,25 @@ need_index = next(i for i, row in enumerate(need_rows)
 need_rows[need_index]["remaining_need"] += 1
 write("bad-need.jsonl", need_rows)
 
-content_rows = copy.deepcopy(rows)
-for index, row in enumerate(content_rows):
-    if row["action"] == "OBJECT_APPLIED":
-        changed = dict(row)
-        changed["duplicate"] = True
-        changed["content_digest"] = flip_hex(row["content_digest"])
-        content_rows.insert(index + 1, changed)
-        break
-else:
-    raise SystemExit("canonical trace lacks OBJECT_APPLIED")
+content_rows = [
+    record("SESSION_OPENED", serial=1),
+    record("HISTORY_RESET", serial=1, nonce=10, state="s0"),
+    record("TX_BEGIN", actor="C", serial=0, nonce=10, rel=0, tu=7,
+           tx="tx", raw="raw", state="s0"),
+    record("TX_BEGIN", serial=1, nonce=10, rel=0, tu=7,
+           tx="tx", raw="raw", state="s0"),
+    record("BODY_COMPLETE", serial=1, nonce=10, rel=0, tu=7,
+           tx="tx", raw="raw", state="s0"),
+    record("NEED_RECORDED", serial=1, nonce=10, rel=0, tu=7,
+           tx="tx", raw="raw", state="s0", need_keys=[9],
+           remaining_need=1),
+    record("OBJECT_APPLIED", serial=1, nonce=10, rel=0, tu=7,
+           tx="tx", raw="raw", state="s0", key64=9,
+           content_digest="content-a", remaining_need=0),
+    record("OBJECT_APPLIED", serial=1, nonce=10, rel=0, tu=7,
+           tx="tx", raw="raw", state="s0", key64=9,
+           content_digest="content-b", remaining_need=0, duplicate=True),
+]
 write("changed-object.jsonl", content_rows)
 
 pending_rows = copy.deepcopy(rows)
@@ -115,7 +126,7 @@ write("commit-abort.jsonl", commit_rows)
 
 digest_rows = copy.deepcopy(rows)
 digest_index = next(i for i, row in enumerate(digest_rows)
-                    if row["action"] == "DICT_COMPLETE")
+                    if row["action"] == "BODY_COMPLETE")
 digest_rows[digest_index]["transaction_digest"] = flip_hex(
     digest_rows[digest_index]["transaction_digest"])
 write("wrong-operation-digest.jsonl", digest_rows)
@@ -168,7 +179,7 @@ write("second-reset.jsonl", [
 PY
 
 expect_reject "$workdir/bad-need.jsonl" \
-    'Need precedes exact DICT' 'inexact Need mutation'
+    'Need precedes exact BODY' 'inexact Need mutation'
 expect_reject "$workdir/changed-object.jsonl" \
     'Key64 changed immutable content' 'immutable-content mutation'
 expect_reject "$workdir/pending-abort.jsonl" \
@@ -176,7 +187,7 @@ expect_reject "$workdir/pending-abort.jsonl" \
 expect_reject "$workdir/commit-abort.jsonl" \
     'C abort after durable F commit before acceptance' 'abort after durable commit'
 expect_reject "$workdir/wrong-operation-digest.jsonl" \
-    'DICT does not match F pending/current session' 'same-cursor digest ABA'
+    'BODY does not match F pending/current session' 'same-cursor digest ABA'
 expect_reject "$workdir/cursor-reuse.jsonl" \
     '(C TX_BEGIN missed its cursor|second C active transaction)' \
     'route-cursor reuse'

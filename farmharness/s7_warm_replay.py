@@ -92,7 +92,7 @@ def combine(c_rows: list[dict[str, object]], f_rows: list[dict[str, object]]) ->
 
     def transaction(row: dict[str, object]) -> bool:
         return row.get("action") in {
-            "TX_BEGIN", "ACTIVE_REPLAYED", "DICT_COMPLETE", "NEED_RECORDED",
+            "TX_BEGIN", "ACTIVE_REPLAYED", "NEED_RECORDED",
             "OBJECT_APPLIED", "BODY_COMPLETE", "INPUT_MATERIALIZED",
             "INPUT_COMMITTED", "COMMIT_ACCEPTED", "LOST_COMMIT_ACCEPTED",
         }
@@ -267,7 +267,7 @@ def main(argv: list[str] | None = None) -> int:
         shutil.copytree(scenario, control_scenario)
         control_path = control_scenario / "measured-actions.jsonl"
         write_rows(control_path, [row for row in read_rows(control_path, "control measured trace", None)
-                                  if row.get("action") != "NEED_RECORDED"])
+                                  if row.get("action") != "BODY_COMPLETE"])
         control_command = [sys.executable, str(sim), "--s7-cell", args.cell,
                            "--s7-artifacts", str(control_scenario),
                            "--s7-output", str(out / "control-replay")]

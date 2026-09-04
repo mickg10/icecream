@@ -185,7 +185,7 @@ P50CacheSessionWireClaim exact_claim() {
   arm.selected_f_host = "f.example.test";
   arm.selected_f_ordinary_port = 10250;
   arm.selected_f_cache_port = 10251;
-  arm.cache_protocol = CACHE_WIRE_PROTOCOL_V1;
+  arm.cache_protocol = CACHE_WIRE_REVISION;
   arm.cache_profile = CACHE_PROFILE_ZSTD_TU;
   arm.logical_job = 20;
   arm.compiler_attempt = 21;

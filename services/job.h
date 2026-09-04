@@ -47,14 +47,14 @@ public:
 /* Protocol-50 compiler-input selector carried by CompileFileMsg.  This
    deliberately mirrors only the immutable identity needed to attach an
    already-committed InputRecord; the cache endpoint types remain outside the
-   historical services library.  Profiles 1, 2, and 6 are the stable P29,
-   ZSTD_TU, and P29V1 registry values.  A legacy compile has the one canonical
-   all-zero representation. */
+   historical services library. Registry values are scoped to CacheWire
+   revision 1: P29V1=1, ZSTD_TU=2, and ZSTD_ROUTE=3. A legacy compile has the
+   one canonical all-zero representation. */
 struct CompileInputIdentity
 {
+    static constexpr uint32_t P29V1Profile = 1;
     static constexpr uint32_t ZstdTuProfile = 2;
-    static constexpr uint32_t P29Profile = 1;
-    static constexpr uint32_t P29V1Profile = 6;
+    static constexpr uint32_t ZstdRouteProfile = 3;
 
     uint32_t profile = 0;
     std::array<uint8_t, 16> c_store_guid{};
@@ -78,8 +78,8 @@ struct CompileInputIdentity
         /* TU_SEQ zero and an all-zero content digest are valid values.  The
            namespace GUID and the two replay/ownership identities reserve
            zero, so presence cannot be confused with the legacy encoding. */
-        return (profile == ZstdTuProfile || profile == P29Profile ||
-                profile == P29V1Profile) && c_store_guid != zero
+        return (profile == P29V1Profile || profile == ZstdTuProfile ||
+                profile == ZstdRouteProfile) && c_store_guid != zero
             && attempt_id != 0 && request_id != 0;
     }
 };
@@ -88,7 +88,8 @@ struct CompileInputIdentity
 
    BOUND: the pre-existing assignment epoch/nonce/wire-id remains the ordinary
    assignment authority.  For a nonzero selector, profile is restricted to a
-   stable compiler-input registry value (P29, ZSTD_TU, or P29V1);
+   revision-scoped compiler-input registry value (P29V1, ZSTD_TU, or
+   ZSTD_ROUTE);
    C_STORE_GUID, TU_SEQ, raw length/digest, ATTEMPT_ID, and REQUEST_ID are
    serialized and recovered byte-exact, and the selector is admitted only
    alongside a complete nonzero assignment identity.

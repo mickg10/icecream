@@ -55,8 +55,9 @@ struct P50InputReady {
 };
 
 // Stable, length-delimited Protocol-50 fixtures.  This is a fixture codec for
-// the two-phase seam, not a new negotiated protocol.  Version 1 is deliberately
-// the existing Protocol-50 number (50); legacy peers never enter this codec.
+// the two-phase seam, not a new negotiated protocol.  Its framing version is
+// deliberately the ordinary Protocol-50 number (50); the arm's cache_protocol
+// field independently carries CacheWire revision 1.
 enum class P50SourceWirePhase : uint16_t {
     Arm = 1,
     InputReady = 2,

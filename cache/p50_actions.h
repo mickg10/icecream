@@ -18,7 +18,6 @@ enum class ActionType : uint8_t {
     HISTORY_RESET,
     TX_BEGIN,
     TX_ABORTED,
-    DICT_COMPLETE,
     BODY_COMPLETE,
     NEED_RECORDED,
     OBJECT_APPLIED,

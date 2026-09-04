@@ -6,7 +6,7 @@ Protocol-50 compiler-attempt and retained-input lifecycle.
 
 The cache-transaction model proves that INPUT_COMMITTED publishes exact input.
 This model starts at that boundary and deliberately does not duplicate
-DICT/NEED/FILL, route history, or object publication.
+BODY/NEED/FILL, route history, or object publication.
 
 Key separation:
 

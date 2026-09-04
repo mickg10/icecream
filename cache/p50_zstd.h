@@ -12,14 +12,11 @@
 
 namespace icecc::p50 {
 
-// Component encodings are interpreted within the selected profile.
-constexpr uint16_t kZstdTuNoDictionaryEncoding = 0;
-constexpr uint16_t kZstdTuBodyEncoding = 1;
-// ZSTD_ROUTE uses the same empty descriptor and component encoding as
-// ZSTD_TU. Its body is an independently terminated frame with a bounded
-// exact-raw route prefix.
-constexpr uint16_t kZstdRouteNoDictionaryEncoding = kZstdTuNoDictionaryEncoding;
-constexpr uint16_t kZstdRouteBodyEncoding = kZstdTuBodyEncoding;
+// Revision-1 BODY encodings are the selected profile identifiers.
+constexpr uint16_t kZstdTuBodyEncoding =
+    static_cast<uint16_t>(ProfileId::ZSTD_TU);
+constexpr uint16_t kZstdRouteBodyEncoding =
+    static_cast<uint16_t>(ProfileId::ZSTD_ROUTE);
 
 struct ZstdTuLimits {
     uint64_t max_encoded_body_bytes = 0;
@@ -139,7 +136,6 @@ public:
 
     ZstdRouteDialogue(uint32_t negotiated_profiles, ZstdTuLimits limits);
     void begin(const TxBegin& begin_value);
-    void append_dict(const DictMessage& message);
     void append_body(const BodyMessage& message);
     void receive_need(const NeedMessage& message);
     void receive_fill(const FillMessage& message);
@@ -197,9 +193,7 @@ public:
     // Whole-TU replay uses a newly reconciled dialogue/session instance.
     void begin(const TxBegin& begin);
 
-    // ZSTD_TU has a descriptor-complete empty DICT and no Need/Fill exchange.
-    // Receiving any of those messages is terminal for the session.
-    void append_dict(const DictMessage& message);
+    // ZSTD_TU has no Need/Fill exchange. Receiving either message is terminal.
     void append_body(const BodyMessage& message);
     void receive_need(const NeedMessage& message);
     void receive_fill(const FillMessage& message);

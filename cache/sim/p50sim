@@ -151,8 +151,8 @@ def combine_process_traces(c_rows: list[dict[str, object]],
 
     def transaction(row: dict[str, object]) -> bool:
         return row.get("action") in {
-            "TX_BEGIN", "ACTIVE_REPLAYED", "DICT_COMPLETE", "NEED_RECORDED",
-            "OBJECT_APPLIED", "BODY_COMPLETE", "INPUT_MATERIALIZED",
+            "TX_BEGIN", "ACTIVE_REPLAYED", "BODY_COMPLETE", "NEED_RECORDED",
+            "OBJECT_APPLIED", "INPUT_MATERIALIZED",
             "INPUT_COMMITTED", "COMMIT_ACCEPTED", "LOST_COMMIT_ACCEPTED",
         }
 

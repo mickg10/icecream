@@ -27,7 +27,10 @@ for command in timeout g++ bash python3; do
     }
 done
 
-work=$(mktemp -d "${TMPDIR:-/tmp}/p50completionflow.XXXXXX")
+# The sidecar appends an identity-rich attempt leaf below this directory.
+# Keep the socket namespace below sockaddr_un.sun_path even when the caller's
+# TMPDIR is a long out-of-tree build path.
+work=$(mktemp -d /tmp/p5c.XXXXXX)
 cleanup() {
     for pid in "${service_pid:-}" "${client_service_pid:-}" "${client_pid:-}" "${worker_pid:-}" "${sched_pid:-}"; do
         test -n "$pid" && kill "$pid" 2>/dev/null || :

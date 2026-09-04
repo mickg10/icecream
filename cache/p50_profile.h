@@ -6,9 +6,35 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace icecc::p50 {
+
+class InputRecordStore;
+
+// Move-only proof that a concrete profile reconstructed and verified these
+// exact bytes against one active TX_BEGIN.  Only ProfileDialogue can mint the
+// proof, and only InputRecordStore can inspect it.  This lets the publication
+// seam avoid hashing a large TU a second time without turning "already
+// verified" into a forgeable boolean parameter.
+class VerifiedMaterialization final {
+public:
+    VerifiedMaterialization(VerifiedMaterialization&&) noexcept = default;
+    VerifiedMaterialization& operator=(VerifiedMaterialization&&) noexcept = default;
+    VerifiedMaterialization(const VerifiedMaterialization&) = delete;
+    VerifiedMaterialization& operator=(const VerifiedMaterialization&) = delete;
+
+private:
+    VerifiedMaterialization(TxBegin begin, std::vector<uint8_t> exact_input)
+        : begin_(std::move(begin)), exact_input_(std::move(exact_input)) {}
+
+    TxBegin begin_{};
+    std::vector<uint8_t> exact_input_;
+
+    friend class ProfileDialogue;
+    friend class InputRecordStore;
+};
 
 // The transaction engine owns this stable, profile-neutral state vocabulary.
 // Profile implementations may use a different internal state machine, but
@@ -24,6 +50,7 @@ enum class ProfileDialogueState : uint8_t {
 struct ProfileDialogueConfig {
     uint32_t negotiated_profiles = 0;
     CStoreGuid c_store_guid{};
+    bool system_source_reuse = false;
     // Profile-neutral resource contract. Adapters translate these values to
     // codec-specific limits; the transaction engine never does.
     uint64_t max_encoded_body_bytes = 0;
@@ -41,10 +68,9 @@ enum class ProfileCommitState : uint8_t {
 // transaction engine never names, allocates, or destroys a concrete profile
 // dialogue; adding a profile adds one vtable/factory implementation instead.
 struct ProfileDialogueVTable {
-    ProfileId profile = ProfileId::P29;
+    ProfileId profile = ProfileId::P29V1;
     void (*destroy)(void*) noexcept = nullptr;
     void (*begin)(void*, const TxBegin&) = nullptr;
-    void (*append_dict)(void*, const DictMessage&) = nullptr;
     void (*append_body)(void*, const BodyMessage&) = nullptr;
     std::vector<NeedMessage> (*need_messages)(void*, size_t) = nullptr;
     void (*receive_need)(void*, const NeedMessage&) = nullptr;
@@ -80,11 +106,20 @@ public:
     [[nodiscard]] static ProfileDialogue create(ProfileId profile,
                                                  ProfileDialogueConfig config);
 
+#ifdef ICECC_P50_PROFILE_TEST_HOOKS
+    // Unit-only construction seam for adversarial vtables. Product builds do
+    // not expose a way to mint a dialogue outside the retained profile
+    // factory, and VerifiedMaterialization remains constructible only here.
+    [[nodiscard]] static ProfileDialogue create_for_test(
+        const ProfileDialogueVTable* table, void* object) noexcept {
+        return ProfileDialogue(table, object);
+    }
+#endif
+
     [[nodiscard]] explicit operator bool() const noexcept { return object_ != nullptr; }
     [[nodiscard]] ProfileId profile() const noexcept { return table_->profile; }
 
     void begin(const TxBegin& begin_value) { table_->begin(object_, begin_value); }
-    void append_dict(const DictMessage& message) { table_->append_dict(object_, message); }
     void append_body(const BodyMessage& message) { table_->append_body(object_, message); }
     [[nodiscard]] std::vector<NeedMessage> need_messages(size_t max_payload) {
         return table_->need_messages ? table_->need_messages(object_, max_payload)
@@ -93,6 +128,7 @@ public:
     void receive_need(const NeedMessage& message) { table_->receive_need(object_, message); }
     void receive_fill(const FillMessage& message) { table_->receive_fill(object_, message); }
     [[nodiscard]] std::vector<uint8_t> materialize() { return table_->materialize(object_); }
+    [[nodiscard]] VerifiedMaterialization materialize_verified();
     void commit_visible(const TxCommit& commit) { table_->commit_visible(object_, commit); }
     void discard_tentative() noexcept { table_->discard_tentative(object_); }
     void disconnect() noexcept { table_->disconnect(object_); }

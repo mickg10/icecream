@@ -30,7 +30,6 @@ iceccd_LDADD = \
 	../cache/libp50localtransport.a \
 	../services/libicecc.la \
 	$(LIBZSTD_LIBS) \
-	$(LIBBSC_LIBS) \
 	$(XXHASH_LIBS) \
 	$(LIB_KINFO) \
 	$(LIBCAP_NG_LIBS) \

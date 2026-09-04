@@ -349,14 +349,14 @@ int main() {
         arm.selected_f_host = "127.0.0.1";
         arm.selected_f_ordinary_port = 10245;
         arm.selected_f_cache_port = 10246;
-        arm.cache_protocol = 50;
-        arm.cache_profile = 1;
+        arm.cache_protocol = CACHE_WIRE_REVISION;
+        arm.cache_profile = CACHE_PROFILE_P29V1;
         arm.logical_job = 1;
         arm.attempt_id = 1;
         arm.c_store_generation = 1;
         arm.c_store_guid = icecc::p50::CStoreGuid::from_u64(1);
         arm.source_request_id = outcome.request.request_id;
-        arm.source_mode = 1;
+        arm.source_mode = P50_SOURCE_MODE_P29V1;
         const auto phase_wire = dispatcher.emit_attachment_phase_open(outcome, arm);
         CHECK(phase_wire.has_value(),
               "phase-open projection requires ACK plus trailing-byte barrier");

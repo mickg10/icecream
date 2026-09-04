@@ -1,8 +1,6 @@
 #include "p50_slice0.h"
-#include "p50_p29_residual.h"
 #include "codec/p29_intern.h"
 #include "codec/p29_wire.h"
-#include "capability/grouprlz/alpha_line_codec.h"
 
 #include <algorithm>
 #include <atomic>
@@ -30,8 +28,6 @@
 
 namespace icecc::p50 {
 namespace {
-
-constexpr std::array<uint8_t, 4> kP29ResidualMagic{'P', '2', '9', 'R'};
 
 constexpr uint32_t byte_swap32(uint32_t value) noexcept {
     return ((value & 0x000000ffU) << 24) |
@@ -65,240 +61,15 @@ constexpr T host_to_big_endian(T value) noexcept {
     return value;
 }
 
-void store_u32be(uint8_t* output, uint32_t value) noexcept {
-    const uint32_t encoded = host_to_big_endian(value);
-    std::memcpy(output, &encoded, sizeof(encoded));
-}
-
 void store_u64be(uint8_t* output, uint64_t value) noexcept {
     const uint64_t encoded = host_to_big_endian(value);
     std::memcpy(output, &encoded, sizeof(encoded));
-}
-
-uint32_t load_u32be(const uint8_t* input) noexcept {
-    uint32_t encoded = 0;
-    std::memcpy(&encoded, input, sizeof(encoded));
-    return host_to_big_endian(encoded);
 }
 
 uint64_t load_u64be(const uint8_t* input) noexcept {
     uint64_t encoded = 0;
     std::memcpy(&encoded, input, sizeof(encoded));
     return host_to_big_endian(encoded);
-}
-
-void append_u64le(std::vector<uint8_t>& out, uint64_t value) {
-    for (unsigned shift = 0; shift != 64; shift += 8)
-        out.push_back(static_cast<uint8_t>(value >> shift));
-}
-
-uint64_t read_u64le(std::span<const uint8_t> bytes, size_t& offset) {
-    if (bytes.size() - offset < 8)
-        throw std::invalid_argument("P29 residual BODY ended before its length");
-    uint64_t result = 0;
-    for (unsigned shift = 0; shift != 64; shift += 8)
-        result |= uint64_t(bytes[offset++]) << shift;
-    return result;
-}
-
-struct P29ResidualLine {
-    Key64 key{};
-    uint64_t bytes = 0;
-};
-
-std::vector<p29::Ref> region_root_refs(std::span<const uint32_t> regions) {
-    std::vector<p29::Ref> result;
-    result.reserve(regions.size());
-    for (uint32_t region : regions)
-        result.push_back({p29::RefKind::Region, region});
-    return result;
-}
-
-std::vector<std::pair<Key64, std::vector<uint8_t>>> residual_line_objects(
-    const CAuthority& authority, std::span<const p29::Ref> roots,
-    const std::unordered_set<Key64, Key64Hash>& acknowledged) {
-    std::vector<std::pair<Key64, std::vector<uint8_t>>> result;
-    std::vector<uint8_t> seen_regions(authority.dense_region_count(), 0);
-    std::vector<uint8_t> seen_blocks(authority.published_block_count(), 0);
-    std::unordered_set<Key64, Key64Hash> seen_lines;
-    seen_lines.reserve(seen_regions.size());
-
-    std::vector<p29::Ref> pending;
-    pending.reserve(roots.size());
-    for (auto root = roots.rbegin(); root != roots.rend(); ++root)
-        pending.push_back(*root);
-
-    while (!pending.empty()) {
-        const p29::Ref ref = pending.back();
-        pending.pop_back();
-        if (ref.kind == p29::RefKind::Block) {
-            if (ref.id >= seen_blocks.size())
-                throw std::logic_error("P29 C residual root references an absent Block");
-            if (seen_blocks[ref.id]) continue;
-            seen_blocks[ref.id] = 1;
-            const ImmutableObject& object = authority.arena().object(
-                authority.block_key(ref.id));
-            if (object.key.type() != ObjectType::Block ||
-                !std::holds_alternative<ChildrenPayload>(object.payload))
-                throw std::logic_error("P29 C Block is not a child object");
-            const auto& children = authority.block_regions(ref.id);
-            for (auto child = children.rbegin(); child != children.rend(); ++child)
-                pending.push_back({p29::RefKind::Region, *child});
-            continue;
-        }
-        if (ref.kind != p29::RefKind::Region || ref.id >= seen_regions.size())
-            throw std::logic_error("P29 C residual root is not a Region or Block");
-        if (seen_regions[ref.id]) continue;
-        seen_regions[ref.id] = 1;
-        const ImmutableObject& object = authority.arena().object(
-            authority.dense_region_key(ref.id));
-        const auto* region = object.key.type() == ObjectType::Region
-                                 ? std::get_if<ChildrenPayload>(&object.payload)
-                                 : nullptr;
-        if (!region || region->children.size() != 1)
-            throw std::logic_error("P29 C Region does not contain one Line");
-        const Key64 line_key = region->children.front();
-        if (acknowledged.contains(line_key) || !seen_lines.insert(line_key).second)
-            continue;
-        const ImmutableObject* line_object = authority.arena().objects().find(line_key);
-        const auto* line = line_object
-                               ? std::get_if<BytesPayload>(&line_object->payload)
-                               : nullptr;
-        if (!line) throw std::logic_error("P29 C Region child is not a Line payload");
-        result.emplace_back(line_key, line->bytes);
-    }
-    return result;
-}
-
-std::vector<uint8_t> encode_p29_residual_body(
-    std::span<const uint8_t> root,
-    const std::vector<std::pair<Key64, std::vector<uint8_t>>>& lines) {
-    std::vector<uint8_t> alpha_raw;
-    uint64_t alpha_control_size = 0;
-    uint64_t alpha_data_size = 0;
-    std::vector<alpha_line::Slice> alpha_lines;
-    alpha_lines.reserve(lines.size());
-    std::vector<uint64_t> line_sizes;
-    line_sizes.reserve(lines.size());
-    for (const auto& [key, bytes] : lines) {
-        (void)key;
-        if (bytes.size() > std::numeric_limits<uint32_t>::max())
-            throw std::length_error("P29 residual Line exceeds its bounded size");
-        alpha_lines.push_back({bytes.data(), static_cast<uint32_t>(bytes.size())});
-        line_sizes.push_back(bytes.size());
-    }
-    if (!alpha_lines.empty()) {
-        const std::vector<uint32_t> gaps(alpha_lines.size() + 1, 0);
-        const alpha_line::Encoded encoded = alpha_line::encode(alpha_lines, gaps, {}, false);
-        if (!encoded.valid)
-            throw std::logic_error("P29 alpha line composition failed");
-        alpha_control_size = encoded.control.size();
-        alpha_data_size = encoded.data.size();
-        append_u64le(alpha_raw, encoded.control.size());
-        append_u64le(alpha_raw, encoded.data.size());
-        alpha_raw.insert(alpha_raw.end(), encoded.control.begin(), encoded.control.end());
-        alpha_raw.insert(alpha_raw.end(), encoded.data.begin(), encoded.data.end());
-    }
-    residual_group::Codec codec;
-    residual_group::Kind selected = residual_group::Kind::Zstd3;
-    const std::vector<uint8_t> residual_wire =
-        alpha_raw.empty() ? std::vector<uint8_t>{}
-                          : codec.encode(alpha_raw.data(), alpha_raw.size(), &selected);
-    std::vector<uint8_t> result;
-    result.reserve(kP29ResidualMagic.size() + 40 + root.size() + lines.size() * 16 +
-                   residual_wire.size());
-    result.insert(result.end(), kP29ResidualMagic.begin(), kP29ResidualMagic.end());
-    append_u64le(result, root.size());
-    append_u64le(result, lines.size());
-    append_u64le(result, alpha_control_size);
-    append_u64le(result, alpha_data_size);
-    append_u64le(result, residual_wire.size());
-    result.insert(result.end(), root.begin(), root.end());
-    for (size_t i = 0; i != lines.size(); ++i) {
-        append_u64le(result, lines[i].first.wire_value());
-        append_u64le(result, line_sizes[i]);
-    }
-    result.insert(result.end(), residual_wire.begin(), residual_wire.end());
-    return result;
-}
-
-struct P29ResidualBody {
-    std::vector<uint8_t> root;
-    std::vector<uint8_t> residual;
-    std::vector<P29ResidualLine> lines;
-};
-
-P29ResidualBody decode_p29_residual_body(std::span<const uint8_t> bytes) {
-    if (bytes.size() < kP29ResidualMagic.size() + 40 ||
-        !std::equal(kP29ResidualMagic.begin(), kP29ResidualMagic.end(), bytes.begin()))
-        throw std::invalid_argument("P29 BODY is not a residual-group envelope");
-    size_t offset = kP29ResidualMagic.size();
-    const uint64_t root_size = read_u64le(bytes, offset);
-    const uint64_t line_count = read_u64le(bytes, offset);
-    const uint64_t alpha_control_size = read_u64le(bytes, offset);
-    const uint64_t alpha_data_size = read_u64le(bytes, offset);
-    const uint64_t residual_size = read_u64le(bytes, offset);
-    if (line_count > (bytes.size() - offset) / 16 ||
-        root_size > bytes.size() - offset - line_count * 16 ||
-        residual_size > bytes.size() - offset - line_count * 16 - root_size ||
-        offset + root_size + line_count * 16 + residual_size != bytes.size())
-        throw std::invalid_argument("P29 residual BODY lengths are not exact");
-    P29ResidualBody result;
-    result.root.assign(bytes.begin() + offset, bytes.begin() + offset + root_size);
-    offset += static_cast<size_t>(root_size);
-    result.lines.reserve(static_cast<size_t>(line_count));
-    std::set<Key64> line_keys;
-    uint64_t total_line_bytes = 0;
-    for (uint64_t i = 0; i != line_count; ++i) {
-        const Key64 key = Key64::from_wire(read_u64le(bytes, offset)).value_or(Key64{});
-        const uint64_t line_size = read_u64le(bytes, offset);
-        if (!key.valid() || key.type() != ObjectType::Line ||
-            !line_keys.insert(key).second ||
-            line_size > std::numeric_limits<uint32_t>::max() ||
-            total_line_bytes > std::numeric_limits<uint64_t>::max() - line_size)
-            throw std::invalid_argument("P29 residual Line definition is invalid");
-        total_line_bytes += line_size;
-        result.lines.push_back({key, line_size});
-    }
-    result.residual.assign(bytes.begin() + offset, bytes.end());
-    if (line_count == 0) {
-        if (alpha_control_size != 0 || alpha_data_size != 0 || residual_size != 0)
-            throw std::invalid_argument("P29 empty residual has unexpected payload");
-        return result;
-    }
-    if (residual_size == 0 || alpha_control_size == 0)
-        throw std::invalid_argument("P29 residual line payload is incomplete");
-    residual_group::Codec codec;
-    const residual_group::DecodedFrame frame =
-        codec.decode(result.residual.data(), result.residual.size());
-    if (frame.wire_bytes != result.residual.size())
-        throw std::invalid_argument("P29 residual frame has trailing bytes");
-    const size_t alpha_header = 16;
-    if (frame.raw.size() != alpha_header + alpha_control_size + alpha_data_size)
-        throw std::invalid_argument("P29 alpha composition extent differs");
-    size_t alpha_offset = 0;
-    const uint64_t encoded_control_size = read_u64le(frame.raw, alpha_offset);
-    const uint64_t encoded_data_size = read_u64le(frame.raw, alpha_offset);
-    if (encoded_control_size != alpha_control_size || encoded_data_size != alpha_data_size)
-        throw std::invalid_argument("P29 alpha composition lengths differ");
-    std::vector<uint8_t> control(frame.raw.begin() + alpha_offset,
-                                 frame.raw.begin() + alpha_offset + alpha_control_size);
-    alpha_offset += static_cast<size_t>(alpha_control_size);
-    std::vector<uint8_t> data(frame.raw.begin() + alpha_offset, frame.raw.end());
-    std::vector<uint8_t> decoded;
-    std::string error;
-    if (!alpha_line::decode(control, data, decoded, error))
-        throw std::invalid_argument("P29 alpha line composition is invalid: " + error);
-    size_t decoded_offset = 0;
-    for (const P29ResidualLine& line : result.lines) {
-        if (line.bytes > decoded.size() - decoded_offset)
-            throw std::invalid_argument("P29 alpha line payload is truncated");
-        decoded_offset += static_cast<size_t>(line.bytes);
-    }
-    if (decoded_offset != decoded.size())
-        throw std::invalid_argument("P29 alpha line payload has trailing bytes");
-    result.residual = std::move(decoded);
-    return result;
 }
 
 bool byte_object(ObjectType type) {
@@ -376,75 +147,6 @@ Digest128 object_digest(ObjectType type, const ObjectPayload& payload) {
     out.append_u64(encoded.size());
     out.append(encoded);
     return out.finish();
-}
-
-void append_materialized(const ImmutableObjectStore& objects, Key64 key,
-                         std::set<Key64>& visiting, std::set<Key64>& reached,
-                         std::vector<uint8_t>& output) {
-    const ImmutableObject* object = objects.find(key);
-    if (!object) throw std::logic_error("materialization references a missing object");
-    if (!visiting.insert(key).second)
-        throw std::logic_error("immutable object graph contains a cycle");
-    reached.insert(key);
-    if (const auto* bytes = std::get_if<BytesPayload>(&object->payload)) {
-        if (bytes->bytes.size() > output.max_size() - output.size())
-            throw std::overflow_error("materialized input exceeds addressable size");
-        output.insert(output.end(), bytes->bytes.begin(), bytes->bytes.end());
-    } else {
-        for (Key64 child : std::get<ChildrenPayload>(object->payload).children)
-            append_materialized(objects, child, visiting, reached, output);
-    }
-    visiting.erase(key);
-}
-
-std::vector<uint8_t> materialize_objects(const ImmutableObjectStore& objects,
-                                         std::span<const Key64> roots,
-                                         std::set<Key64>* reached = nullptr) {
-    std::set<Key64> visiting;
-    std::set<Key64> local_reached;
-    std::vector<uint8_t> result;
-    for (Key64 root : roots)
-        append_materialized(objects, root, visiting, local_reached, result);
-    if (reached) *reached = std::move(local_reached);
-    return result;
-}
-
-std::vector<uint8_t> encode_key_vector(std::span<const Key64> keys) {
-    if (keys.empty()) return {};
-    if (keys.size() > std::numeric_limits<uint32_t>::max())
-        throw std::overflow_error("Key64 vector exceeds u32 count");
-    constexpr size_t count_bytes = sizeof(uint32_t);
-    if (keys.size() >
-        (std::numeric_limits<size_t>::max() - count_bytes) / sizeof(uint64_t))
-        throw std::overflow_error("Key64 vector exceeds addressable size");
-    std::vector<uint8_t> result(count_bytes + keys.size() * sizeof(uint64_t));
-    const uint32_t count = static_cast<uint32_t>(keys.size());
-    store_u32be(result.data(), count);
-    size_t offset = count_bytes;
-    for (Key64 key : keys) {
-        store_u64be(result.data() + offset, key.wire_value());
-        offset += sizeof(uint64_t);
-    }
-    return result;
-}
-
-std::vector<Key64> decode_key_vector(std::span<const uint8_t> bytes) {
-    if (bytes.empty()) return {};
-    if (bytes.size() < 4) throw std::invalid_argument("key vector ended before count");
-    const uint32_t count = load_u32be(bytes.data());
-    if (bytes.size() != 4 + uint64_t(count) * 8)
-        throw std::invalid_argument("key vector length does not match count");
-    std::vector<Key64> result;
-    result.reserve(count);
-    size_t offset = 4;
-    for (uint32_t i = 0; i != count; ++i) {
-        const uint64_t raw = load_u64be(bytes.data() + offset);
-        offset += sizeof(uint64_t);
-        const auto key = Key64::from_wire(raw);
-        if (!key) throw std::invalid_argument("key vector contains invalid Key64");
-        result.push_back(*key);
-    }
-    return result;
 }
 
 bool same_commit(const TxCommit& commit, const CActiveTx& active) {
@@ -1855,10 +1557,9 @@ struct CAuthority::P29V1State {
 };
 
 CAuthority::CAuthority(CStoreGuid guid, p29::OnlineS1::Config config,
-                       uint16_t generation, uint64_t first_ordinal,
-                       TuSeq first_tu_seq, Verification verification)
-    : arena_(guid, generation, first_ordinal), s1_config_(config),
-      next_tu_seq_(first_tu_seq.value), verification_(verification) {}
+                       TuSeq first_tu_seq)
+    : guid_(guid), s1_config_(config),
+      next_tu_seq_(first_tu_seq.value) {}
 
 CAuthority::~CAuthority() = default;
 
@@ -1885,7 +1586,8 @@ uint64_t CAuthority::p29v1_interner_committed_bytes() const noexcept {
 }
 
 PreparedTUPtr CAuthority::prepare_p29v1_at_seq(
-    std::span<const uint8_t> exact_input, TuSeq tu_seq) {
+    std::span<const uint8_t> exact_input, TuSeq tu_seq,
+    Digest128 exact_digest) {
     if (!p29v1_ || !p29v1_->runnable)
         throw std::logic_error("P29V1 is not runnable until daemon restart");
     if (exact_input.size() > p29v1_->max_tu_bytes)
@@ -1894,47 +1596,21 @@ PreparedTUPtr CAuthority::prepare_p29v1_at_seq(
         auto prepared = std::make_shared<PreparedTU>();
         prepared->dense_regions.reserve(exact_input.size() / 32 + 1);
         p29v1_->interner.process(exact_input, prepared->dense_regions);
-#if defined(ICECC_P29V1_MUTANT_PER_LINE_OBJECTS)
-        // Deliberately restore the v0 per-Line object work.  Performance
-        // evidence must make this regression conspicuous without changing
-        // the P29V1 wire representation.
-        for (const uint32_t region_id : prepared->dense_regions) {
-            for (const uint32_t line_id :
-                 p29v1_->interner.region_lines(region_id)) {
-                (void)arena_.intern_bytes(
-                    ObjectType::Line, p29v1_->interner.line(line_id));
-            }
-        }
-#endif
-        Digest128Builder composed;
-        uint64_t total = 0;
+        size_t offset = 0;
         for (const uint32_t id : prepared->dense_regions) {
             const std::span<const uint8_t> region =
                 p29v1_->interner.region_bytes(id);
-            if (region.size() > std::numeric_limits<uint64_t>::max() - total)
-                throw std::overflow_error("P29V1 composed input exceeds u64");
-            total += region.size();
-            composed.append(region);
-        }
-        const Digest128 exact_digest = digest128(exact_input);
-        if (total != exact_input.size() || composed.finish() != exact_digest)
-            throw std::logic_error("P29V1 interner did not reproduce exact input");
-        if (verification_ == Verification::FullMaterialization) {
-            size_t offset = 0;
-            for (const uint32_t id : prepared->dense_regions) {
-                const std::span<const uint8_t> region =
-                    p29v1_->interner.region_bytes(id);
-                if (region.size() > exact_input.size() - offset ||
-                    !std::equal(region.begin(), region.end(),
-                                exact_input.begin() + static_cast<ptrdiff_t>(offset)))
-                    throw std::logic_error(
-                        "P29V1 interner materialization differs from exact input");
-                offset += region.size();
-            }
-            if (offset != exact_input.size())
+            if (region.size() > exact_input.size() - offset ||
+                (!region.empty() &&
+                 std::memcmp(region.data(), exact_input.data() + offset,
+                             region.size()) != 0))
                 throw std::logic_error(
-                    "P29V1 interner materialization length differs");
+                    "P29V1 interner materialization differs from exact input");
+            offset += region.size();
         }
+        if (offset != exact_input.size())
+            throw std::logic_error(
+                "P29V1 interner materialization length differs");
         prepared->tu_seq = tu_seq;
         prepared->raw_bytes = exact_input.size();
         prepared->raw_digest = exact_digest;
@@ -1960,170 +1636,6 @@ void CAuthority::commit_tu_seq(TuSeq reserved) {
         ++next_tu_seq_;
 }
 
-TuSeq CAuthority::allocate_tu_seq() {
-    const TuSeq result = reserve_tu_seq();
-    commit_tu_seq(result);
-    return result;
-}
-
-uint32_t CAuthority::dense_region(Key64 key) {
-    if (key.type() != ObjectType::Region || !arena_.objects().contains(key))
-        throw std::invalid_argument("PreparedTU root is not a C Region object");
-    const auto found = region_to_dense_.find(key);
-    if (found != region_to_dense_.end()) return found->second;
-    if (dense_to_region_.size() >= std::numeric_limits<uint32_t>::max())
-        throw std::overflow_error("dense Region space exceeds P29 u32");
-    const uint32_t id = static_cast<uint32_t>(dense_to_region_.size());
-    dense_to_region_.push_back(key);
-    region_to_dense_.emplace(key, id);
-    return id;
-}
-
-PreparedTUPtr CAuthority::prepare_tu(std::span<const uint8_t> exact_input,
-                                     std::span<const Key64> regions) {
-    return prepare_tu_at_seq(exact_input, regions, allocate_tu_seq());
-}
-
-PreparedTUPtr CAuthority::prepare_tu_at_seq(
-    std::span<const uint8_t> exact_input, std::span<const Key64> regions,
-    TuSeq tu_seq) {
-    const Digest128 exact_digest = digest128(exact_input);
-    Digest128Builder composed;
-    uint64_t total = 0;
-    for (Key64 key : regions) {
-        const ImmutableObject& region = arena_.object(key);
-        const auto* children = region.key.type() == ObjectType::Region
-                                   ? std::get_if<ChildrenPayload>(&region.payload)
-                                   : nullptr;
-        if (!children || children->children.size() != 1)
-            throw std::invalid_argument("PreparedTU Region does not contain one Line");
-        const ImmutableObject& line = arena_.object(children->children.front());
-        const auto* bytes = line.key.type() == ObjectType::Line
-                                ? std::get_if<BytesPayload>(&line.payload)
-                                : nullptr;
-        if (!bytes)
-            throw std::invalid_argument("PreparedTU Region child is not a Line payload");
-        composed.append(bytes->bytes);
-        if (bytes->bytes.size() > std::numeric_limits<uint64_t>::max() - total)
-            throw std::overflow_error("PreparedTU composed byte count exceeds u64");
-        total += bytes->bytes.size();
-    }
-    if (total != exact_input.size() || composed.finish() != exact_digest)
-        throw std::invalid_argument("PreparedTU Regions do not reproduce exact input");
-    if (verification_ == Verification::FullMaterialization) {
-        const std::vector<uint8_t> materialized = materialize(arena_.objects(), regions);
-        if (materialized.size() != exact_input.size() ||
-            !std::equal(materialized.begin(), materialized.end(), exact_input.begin()))
-            throw std::invalid_argument("PreparedTU Regions do not reproduce exact input");
-    }
-    std::vector<uint32_t> dense;
-    dense.reserve(regions.size());
-    for (Key64 key : regions) dense.push_back(dense_region(key));
-    auto prepared = std::make_shared<PreparedTU>();
-    prepared->tu_seq = tu_seq;
-    prepared->raw_bytes = exact_input.size();
-    prepared->raw_digest = exact_digest;
-    prepared->regions.assign(regions.begin(), regions.end());
-    prepared->dense_regions = std::move(dense);
-    return prepared;
-}
-
-PreparedTUPtr CAuthority::prepare_from_regions(
-    std::span<const std::vector<uint8_t>> region_bytes) {
-    return prepare_from_regions_at_seq(region_bytes, std::nullopt);
-}
-
-PreparedTUPtr CAuthority::prepare_from_regions_at_seq(
-    std::span<const std::vector<uint8_t>> region_bytes,
-    std::optional<TuSeq> tu_seq) {
-    reserve_for_tu(region_bytes.size());
-    std::vector<Key64> regions;
-    std::vector<uint8_t> exact;
-    regions.reserve(region_bytes.size());
-    for (const auto& bytes : region_bytes) {
-        const Key64 line = arena_.intern_bytes(ObjectType::Line, bytes);
-        const std::array<Key64, 1> children{line};
-        regions.push_back(arena_.intern_children(ObjectType::Region, children));
-        exact.insert(exact.end(), bytes.begin(), bytes.end());
-    }
-    return prepare_tu_at_seq(exact, regions,
-                             tu_seq.has_value() ? *tu_seq : allocate_tu_seq());
-}
-
-Key64 CAuthority::dense_region_key(uint32_t id) const { return dense_to_region_.at(id); }
-Key64 CAuthority::block_key(uint32_t id) const { return block_keys_.at(id); }
-
-void CAuthority::publish_new_p29_blocks() {
-    while (block_keys_.size() < block_catalogue_.size()) {
-        const p29::Block& block = block_catalogue_.block(
-            static_cast<uint32_t>(block_keys_.size()));
-        std::vector<Key64> children;
-        children.reserve(block.regions.size());
-        for (uint32_t id : block.regions) children.push_back(dense_region_key(id));
-        block_keys_.push_back(arena_.intern_children(ObjectType::Block, children));
-    }
-}
-
-std::vector<Key64> CAuthority::transitive_manifest(
-    std::span<const p29::Ref> roots) const {
-    std::vector<uint8_t> seen_regions(dense_to_region_.size(), 0);
-    std::vector<uint8_t> seen_blocks(block_keys_.size(), 0);
-    std::vector<Key64> result;
-    result.reserve(roots.size());
-
-    std::vector<p29::Ref> pending;
-    pending.reserve(roots.size());
-    for (auto root = roots.rbegin(); root != roots.rend(); ++root)
-        pending.push_back(*root);
-
-    while (!pending.empty()) {
-        const p29::Ref ref = pending.back();
-        pending.pop_back();
-        if (ref.kind == p29::RefKind::Block) {
-            if (ref.id >= seen_blocks.size())
-                throw std::logic_error("P29 manifest root references an absent Block");
-            if (seen_blocks[ref.id]) continue;
-            seen_blocks[ref.id] = 1;
-            const Key64 key = block_key(ref.id);
-            const ImmutableObject& object = arena_.object(key);
-            if (object.key.type() != ObjectType::Block ||
-                !std::holds_alternative<ChildrenPayload>(object.payload))
-                throw std::logic_error("P29 manifest Block is not a child object");
-            result.push_back(key);
-            const auto& children = block_catalogue_.block(ref.id).regions;
-            for (auto child = children.rbegin(); child != children.rend(); ++child)
-                pending.push_back({p29::RefKind::Region, *child});
-            continue;
-        }
-        if (ref.kind != p29::RefKind::Region || ref.id >= seen_regions.size())
-            throw std::logic_error("P29 manifest root is not a Region or Block");
-        if (seen_regions[ref.id]) continue;
-        seen_regions[ref.id] = 1;
-        const Key64 key = dense_region_key(ref.id);
-        const ImmutableObject& object = arena_.object(key);
-        const auto* region = object.key.type() == ObjectType::Region
-                                 ? std::get_if<ChildrenPayload>(&object.payload)
-                                 : nullptr;
-        if (!region || region->children.size() != 1)
-            throw std::logic_error("P29 manifest Region does not contain one Line");
-        const Key64 line_key = region->children.front();
-        const ImmutableObject& line = arena_.object(line_key);
-        if (line.key.type() != ObjectType::Line ||
-            !std::holds_alternative<BytesPayload>(line.payload))
-            throw std::logic_error("P29 manifest Region child is not a Line payload");
-        result.push_back(key);
-        result.push_back(line_key);
-    }
-    std::sort(result.begin(), result.end());
-    result.erase(std::unique(result.begin(), result.end()), result.end());
-    return result;
-}
-
-std::vector<uint8_t> CAuthority::materialize(
-    const ImmutableObjectStore& objects, std::span<const Key64> roots) const {
-    return materialize_objects(objects, roots);
-}
-
 struct CRoute::P29V1State {
     P29V1State(CAuthority& authority, uint64_t max_route_bytes)
         : provider(static_cast<size_t>(authority.p29v1_->max_tu_bytes)),
@@ -2146,8 +1658,6 @@ CRoute::CRoute(CAuthority& authority, FStoreGuid f_store_guid,
     : authority_(authority), f_store_guid_(f_store_guid),
       history_nonce_(history_nonce),
       state_digest_(initial_route_digest(authority.guid(), history_nonce)),
-      matcher_(std::make_unique<p29::OnlineS1>(authority.s1_config(),
-                                               authority.block_catalogue())),
       trace_(trace) {}
 
 CRoute::~CRoute() = default;
@@ -2156,86 +1666,8 @@ uint64_t CRoute::p29v1_route_state_bytes() const noexcept {
     return p29v1_ ? sender_route_bytes(p29v1_->provider.sender_route()) : 0;
 }
 
-std::vector<uint8_t> CRoute::residual_input(const PreparedTUPtr& prepared) const {
-    if (!prepared) throw std::invalid_argument("cannot inspect a null PreparedTU");
-    std::vector<uint8_t> result;
-    const std::vector<p29::Ref> roots = region_root_refs(prepared->dense_regions);
-    const auto lines = residual_line_objects(authority_, roots, acknowledged_objects_);
-    for (const auto& [key, bytes] : lines) {
-        (void)key;
-        result.insert(result.end(), bytes.begin(), bytes.end());
-    }
-    return result;
-}
-
-const CActiveTx& CRoute::begin(const PreparedTUPtr& prepared,
-                               P29RootMode root_mode,
-                               bool residual_body) {
-    if (!prepared) throw std::invalid_argument("cannot route a null PreparedTU");
-    if (active_) throw std::logic_error("C route already has one ACTIVE_TX");
-    if (next_rel_seq_.value == std::numeric_limits<uint64_t>::max())
-        throw std::overflow_error("REL_SEQ space exhausted");
-    try {
-        const p29::TuPlan& plan = matcher_->prepare(prepared->dense_regions);
-        authority_.publish_new_p29_blocks();
-        CActiveTx active;
-        active.prepared = prepared;
-        std::vector<p29::Ref> independent_roots;
-        std::span<const p29::Ref> closure_roots;
-        if (root_mode == P29RootMode::RouteHistory) {
-            active.root.reserve(plan.root.size());
-            for (const p29::Ref& ref : plan.root)
-                active.root.push_back(ref.kind == p29::RefKind::Region
-                                          ? authority_.dense_region_key(ref.id)
-                                          : authority_.block_key(ref.id));
-            closure_roots = std::span<const p29::Ref>(plan.root);
-        } else if (root_mode == P29RootMode::HistoryIndependent) {
-            active.root = prepared->regions;
-            independent_roots = region_root_refs(prepared->dense_regions);
-            closure_roots = std::span<const p29::Ref>(independent_roots);
-        } else {
-            throw std::invalid_argument("unsupported P29 root mode");
-        }
-        active.manifest = authority_.transitive_manifest(closure_roots);
-        active.dict = encode_key_vector(active.manifest);
-        const std::vector<uint8_t> root_bytes = encode_key_vector(active.root);
-        active.body = residual_body
-                          ? encode_p29_residual_body(
-                                root_bytes,
-                                residual_line_objects(authority_, closure_roots,
-                                                      acknowledged_objects_))
-                          : root_bytes;
-        active.region_count = prepared->regions.size();
-        active.block_use_count = plan.block_uses.size();
-        active.new_block_count = plan.new_blocks.size();
-        active.begin.history_nonce = history_nonce_;
-        active.begin.rel_seq = next_rel_seq_;
-        active.begin.tu_seq = prepared->tu_seq;
-        active.begin.profile = ProfileId::P29;
-        active.begin.p29_root_mode = root_mode;
-        active.begin.pre_state_digest = state_digest_;
-        active.begin.dict = describe_component(kP29KeyVectorEncoding, active.dict,
-                                               active.manifest.size());
-        active.begin.body = describe_component(
-            residual_body ? kP29ResidualBodyEncoding : kP29KeyVectorEncoding,
-            active.body, active.root.size());
-        active.begin.raw_bytes = prepared->raw_bytes;
-        active.begin.raw_digest = prepared->raw_digest;
-        active.begin.transaction_digest = compute_transaction_digest(
-            active.begin, active.dict, active.body);
-        active_ = std::move(active);
-        record(ActionType::TX_BEGIN, *active_);
-    } catch (...) {
-        if (matcher_->has_pending()) matcher_->abort();
-        active_.reset();
-        throw;
-    }
-    return *active_;
-}
-
 const CActiveTx& CRoute::begin_v1(
-    const PreparedTUPtr& prepared, Digest128 system_source_fingerprint,
-    uint64_t max_route_state_bytes) {
+    const PreparedTUPtr& prepared, uint64_t max_route_state_bytes) {
     if (!prepared)
         throw std::invalid_argument("cannot route a null P29V1 PreparedTU");
     if (active_)
@@ -2260,17 +1692,14 @@ const CActiveTx& CRoute::begin_v1(
         active.begin.rel_seq = next_rel_seq_;
         active.begin.tu_seq = prepared->tu_seq;
         active.begin.profile = ProfileId::P29V1;
-        active.begin.p29_root_mode = P29RootMode::RouteHistory;
         active.begin.pre_state_digest = state_digest_;
-        active.begin.dict = {kP29V1FingerprintDictEncoding, 0, 0,
-                             system_source_fingerprint};
         active.begin.body = describe_component(
-            kP29WireV1BodyEncoding, active.body,
+            static_cast<uint16_t>(ProfileId::P29V1), active.body,
             p29v1_->serializer.root_reference_count());
         active.begin.raw_bytes = prepared->raw_bytes;
         active.begin.raw_digest = prepared->raw_digest;
         active.begin.transaction_digest = compute_transaction_digest(
-            active.begin, std::span<const uint8_t>{}, active.body);
+            active.begin, active.body);
         active_ = std::move(active);
         p29v1_->answered_need.clear();
         p29v1_->fill_answered = false;
@@ -2289,49 +1718,34 @@ const CActiveTx& CRoute::begin_v1(
     }
 }
 
-std::vector<ImmutableObject> CRoute::build_fill(const Need& need) const {
-    if (!active_) throw std::logic_error("C route has no ACTIVE_TX");
-    if (need.history_nonce != active_->begin.history_nonce ||
-        need.rel_seq != active_->begin.rel_seq || need.tu_seq != active_->begin.tu_seq ||
-        need.transaction_digest != active_->begin.transaction_digest)
-        throw std::logic_error("Need does not identify C's ACTIVE_TX");
-    if (!std::is_sorted(need.missing.begin(), need.missing.end()) ||
-        std::adjacent_find(need.missing.begin(), need.missing.end()) != need.missing.end())
-        throw std::logic_error("Need is not an exact sorted set");
-    std::vector<ImmutableObject> result;
-    result.reserve(need.missing.size());
-    for (Key64 key : need.missing) {
-        if (!std::binary_search(active_->manifest.begin(), active_->manifest.end(), key))
-            throw std::logic_error("Need requests a key outside the manifest");
-        if (key.type() == ObjectType::Line &&
-            active_->begin.body.encoding == kP29ResidualBodyEncoding)
-            continue; // Line bytes are carried exactly once by the residual composition.
-        result.push_back(authority_.arena().object(key));
+void CRoute::pin_v1_system_source_reuse(bool reuse) {
+    if (!p29v1_ || p29v1_->terminal)
+        throw std::logic_error("P29V1 route is unavailable for reuse pinning");
+    if (p29v1_->fixed_system_source_reuse &&
+        *p29v1_->fixed_system_source_reuse != reuse) {
+        p29v1_->terminal = true;
+        throw std::logic_error(
+            "P29V1 system-source reuse changed on the route");
     }
-    return result;
+    p29v1_->fixed_system_source_reuse = reuse;
+    p29v1_->provider.sender_route().system_source_reuse = reuse;
 }
 
 std::span<const uint8_t> CRoute::build_fill_v1(
-    uint64_t flags, std::span<const uint8_t> inner_need) {
+    std::span<const uint8_t> inner_need) {
     if (!active_ || active_->begin.profile != ProfileId::P29V1 || !p29v1_ ||
         p29v1_->terminal)
         throw std::logic_error("C route has no runnable P29V1 ACTIVE_TX");
     try {
-        if ((flags & ~kP29V1SystemSourceReuseFlag) != 0)
-            throw std::invalid_argument("P29V1 NEED flags are invalid");
         if (inner_need.size() < 5 ||
             inner_need[inner_need.size() - 5] !=
                 static_cast<uint8_t>(codec::P29WireKind::TuEnd) ||
             std::any_of(inner_need.end() - 4, inner_need.end(),
                         [](uint8_t value) { return value != 0; }))
             throw std::invalid_argument("P29V1 NEED has no exact TU_END");
-        const bool reuse = (flags & kP29V1SystemSourceReuseFlag) != 0;
-        if (p29v1_->fixed_system_source_reuse &&
-            *p29v1_->fixed_system_source_reuse != reuse)
-            throw std::logic_error(
-                "P29V1 system-source reuse changed on the route");
         if (!p29v1_->fixed_system_source_reuse)
-            p29v1_->fixed_system_source_reuse = reuse;
+            throw std::logic_error(
+                "P29V1 system-source reuse was not pinned at HISTORY_RESET");
 
         if (p29v1_->fill_answered) {
             if (!std::equal(p29v1_->answered_need.begin(),
@@ -2340,7 +1754,6 @@ std::span<const uint8_t> CRoute::build_fill_v1(
                 throw std::logic_error("P29V1 replay NEED differs");
             return p29v1_->serializer.captured_fill();
         }
-        p29v1_->provider.sender_route().system_source_reuse = reuse;
         const std::span<const uint8_t> codec_need =
             inner_need.first(inner_need.size() - 5);
         const std::vector<uint8_t>& fill =
@@ -2433,21 +1846,17 @@ void CRoute::accept_commit(const TxCommit& committed, ActionType action) {
         throw std::invalid_argument("invalid commit action");
     if (!same_commit(committed, *active_))
         throw std::logic_error("TX_COMMIT does not close C's ACTIVE_TX");
-    if (active_->begin.profile == ProfileId::P29V1) {
-        if (!p29v1_ || p29v1_->terminal)
-            throw std::logic_error("P29V1 route cannot accept a commit");
-        try {
-            p29v1_->serializer.commit();
-            if (p29v1_route_state_bytes() > p29v1_->max_route_state_bytes)
-                throw std::logic_error(
-                    "P29V1 committed route state exceeded its preflight");
-        } catch (...) {
-            p29v1_->terminal = true;
-            throw;
-        }
-    } else {
-        acknowledged_objects_.insert(active_->manifest.begin(), active_->manifest.end());
-        matcher_->commit();
+    if (active_->begin.profile != ProfileId::P29V1 || !p29v1_ ||
+        p29v1_->terminal)
+        throw std::logic_error("P29V1 route cannot accept a commit");
+    try {
+        p29v1_->serializer.commit();
+        if (p29v1_route_state_bytes() > p29v1_->max_route_state_bytes)
+            throw std::logic_error(
+                "P29V1 committed route state exceeded its preflight");
+    } catch (...) {
+        p29v1_->terminal = true;
+        throw;
     }
     state_digest_ = committed.post_state_digest;
     record(action, *active_);
@@ -2458,12 +1867,8 @@ void CRoute::accept_commit(const TxCommit& committed, ActionType action) {
 void CRoute::abandon_active() {
     if (!active_) return;
     record(ActionType::TX_ABORTED, *active_);
-    if (active_->begin.profile == ProfileId::P29V1) {
-        if (p29v1_ && p29v1_->serializer.has_pending())
-            p29v1_->serializer.abandon();
-    } else {
-        matcher_->abort();
-    }
+    if (p29v1_ && p29v1_->serializer.has_pending())
+        p29v1_->serializer.abandon();
     active_.reset();
 }
 
@@ -2475,9 +1880,6 @@ void CRoute::reset_history(FStoreGuid f_store_guid, HistoryNonce history_nonce) 
     history_nonce_ = history_nonce;
     next_rel_seq_ = RelSeq{0};
     state_digest_ = initial_route_digest(authority_.guid(), history_nonce_);
-    acknowledged_objects_.clear();
-    matcher_ = std::make_unique<p29::OnlineS1>(authority_.s1_config(),
-                                               authority_.block_catalogue());
     p29v1_.reset();
 }
 
@@ -2485,19 +1887,8 @@ struct FStore::Namespace {
     struct FPending {
         explicit FPending(TxBegin value) : begin(std::move(value)) {}
         TxBegin begin;
-        std::vector<uint8_t> dict;
         std::vector<uint8_t> body;
-        std::vector<uint8_t> residual;
-        std::vector<P29ResidualLine> residual_lines;
-        bool dict_complete = false;
         bool body_complete = false;
-        std::vector<Key64> manifest;
-        std::vector<Key64> root;
-        std::set<Key64> acknowledged_before;
-        std::set<Key64> requested;
-        std::set<Key64> remaining;
-        FillStreamDecoder partial_fill;
-        std::optional<std::vector<uint8_t>> materialized;
         std::vector<uint8_t> p29v1_need;
         std::vector<uint8_t> p29v1_fill;
         Digest128 p29v1_segment_digest{};
@@ -2515,16 +1906,15 @@ struct FStore::Namespace {
 
     bool established = false;
     uint64_t active_session_serial = 0;
-    ImmutableObjectStore objects;
     std::optional<Route> route;
 };
 
 FStore::FStore(FStoreGuid guid, uint64_t first_session_serial, ActionTrace* trace,
                uint64_t p29v1_max_tu_bytes,
-               Digest128 system_source_fingerprint)
+               bool p29v1_system_source_reuse)
     : guid_(guid), next_session_serial_(first_session_serial), trace_(trace),
       p29v1_max_tu_bytes_(p29v1_max_tu_bytes),
-      system_source_fingerprint_(system_source_fingerprint) {
+      p29v1_system_source_reuse_(p29v1_system_source_reuse) {
     if (first_session_serial == 0)
         throw std::invalid_argument("first session serial must be nonzero");
     if (p29v1_max_tu_bytes_ == 0 ||
@@ -2647,23 +2037,9 @@ void FStore::begin(SessionHandle session, const TxBegin& begin, bool replay) {
     if (begin.history_nonce != route.history_nonce || begin.rel_seq != route.next_rel_seq ||
         begin.pre_state_digest != route.state_digest)
         throw std::logic_error("TX_BEGIN does not match F's route cursor");
-    const bool p29v1 = begin.profile == ProfileId::P29V1;
-    if (!p29v1 &&
-        (begin.profile != ProfileId::P29 ||
-         (begin.p29_root_mode != P29RootMode::RouteHistory &&
-          begin.p29_root_mode != P29RootMode::HistoryIndependent)))
-        throw std::invalid_argument("TX_BEGIN profile/root mode is unsupported in M1");
-    if (!p29v1 &&
-        (begin.dict.encoding != kP29KeyVectorEncoding ||
-         (begin.body.encoding != kP29KeyVectorEncoding &&
-          begin.body.encoding != kP29ResidualBodyEncoding)))
-        throw std::invalid_argument("P29 DICT/BODY encoding is unsupported");
-    if (p29v1 &&
-        (begin.p29_root_mode != P29RootMode::RouteHistory ||
-         begin.dict.encoding != kP29V1FingerprintDictEncoding ||
-         begin.dict.encoded_bytes != 0 || begin.dict.decoded_bytes != 0 ||
-         begin.body.encoding != kP29WireV1BodyEncoding ||
-         begin.raw_bytes > p29v1_max_tu_bytes_))
+    if (begin.profile != ProfileId::P29V1 ||
+        begin.body.encoding != static_cast<uint16_t>(ProfileId::P29V1) ||
+        begin.raw_bytes > p29v1_max_tu_bytes_)
         throw std::invalid_argument("P29V1 TX_BEGIN descriptors are invalid");
     if (route.next_rel_seq.value == std::numeric_limits<uint64_t>::max())
         throw std::overflow_error("F REL_SEQ space exhausted");
@@ -2672,154 +2048,80 @@ void FStore::begin(SessionHandle session, const TxBegin& begin, bool replay) {
             throw std::logic_error("F route already has a different ACTIVE_TX");
         return;
     }
-    if (p29v1) {
-        if (!route.p29v1)
-            route.p29v1 = std::make_unique<P29FRouteCodec>(
-                static_cast<size_t>(p29v1_max_tu_bytes_));
-        if (route.p29v1->terminal)
-            throw std::logic_error("P29V1 receiver is terminal until route reset");
-        const bool reuse = begin.dict.digest != Digest128{} &&
-                           begin.dict.digest == system_source_fingerprint_;
-        if (route.p29v1->fixed_system_source_reuse &&
-            *route.p29v1->fixed_system_source_reuse != reuse) {
-            route.p29v1->terminal = true;
-            throw std::logic_error("P29V1 system-source reuse changed on the route");
-        }
-        if (!route.p29v1->fixed_system_source_reuse)
-            route.p29v1->fixed_system_source_reuse = reuse;
-        route.p29v1->provider.receiver_route().system_source_reuse = reuse;
+    if (!route.p29v1)
+        route.p29v1 = std::make_unique<P29FRouteCodec>(
+            static_cast<size_t>(p29v1_max_tu_bytes_));
+    if (route.p29v1->terminal)
+        throw std::logic_error("P29V1 receiver is terminal until route reset");
+    const bool reuse = p29v1_system_source_reuse_;
+    if (route.p29v1->fixed_system_source_reuse &&
+        *route.p29v1->fixed_system_source_reuse != reuse) {
+        route.p29v1->terminal = true;
+        throw std::logic_error("P29V1 system-source reuse changed on the route");
     }
+    if (!route.p29v1->fixed_system_source_reuse)
+        route.p29v1->fixed_system_source_reuse = reuse;
+    route.p29v1->provider.receiver_route().system_source_reuse = reuse;
     route.pending.emplace(begin);
     record(replay ? ActionType::ACTIVE_REPLAYED : ActionType::TX_BEGIN,
            session, &begin);
-    if (p29v1) {
-        route.pending->dict_complete = true;
-        record(ActionType::DICT_COMPLETE, session, &begin);
-    } else if (begin.dict.encoded_bytes == 0) {
-        append_component(session, true, std::span<const uint8_t>{});
-    }
     if (begin.body.encoded_bytes == 0)
-        append_component(session, false, std::span<const uint8_t>{});
+        append_component(session, std::span<const uint8_t>{});
 }
 
-void FStore::append_component(SessionHandle session, bool dict,
+void FStore::append_component(SessionHandle session,
                               std::span<const uint8_t> bytes) {
     Namespace& space = require_namespace(session);
     if (!space.route || !space.route->pending)
-        throw std::logic_error("component data has no F ACTIVE_TX");
+        throw std::logic_error("BODY data has no F ACTIVE_TX");
     Namespace::FPending& pending = *space.route->pending;
-    std::vector<uint8_t>& target = dict ? pending.dict : pending.body;
-    bool& complete = dict ? pending.dict_complete : pending.body_complete;
-    const ComponentDescriptor& descriptor = dict ? pending.begin.dict : pending.begin.body;
-    if (complete) {
-        if (!bytes.empty()) throw std::logic_error("component received bytes after completion");
+    const ComponentDescriptor& descriptor = pending.begin.body;
+    if (pending.body_complete) {
+        if (!bytes.empty())
+            throw std::logic_error("BODY received bytes after completion");
         return;
     }
-    if (bytes.size() > descriptor.encoded_bytes - target.size())
-        throw std::length_error("component exceeds its declared byte count");
-    target.insert(target.end(), bytes.begin(), bytes.end());
-    if (target.size() != descriptor.encoded_bytes) return;
-    if (digest128(target) != descriptor.digest)
-        throw std::logic_error("component digest does not match TX_BEGIN");
-    complete = true;
-    if (pending.begin.profile == ProfileId::P29V1) {
-        if (dict)
-            throw std::logic_error("P29V1 received a DICT component");
-        if (!space.route->p29v1 || space.route->p29v1->terminal)
-            throw std::logic_error("P29V1 receiver state is unavailable");
-        try {
-            pending.p29v1_need =
-                space.route->p29v1->deserializer.receive_body(target);
-            pending.p29v1_need.push_back(
-                static_cast<uint8_t>(codec::P29WireKind::TuEnd));
-            pending.p29v1_need.insert(pending.p29v1_need.end(), 4, 0);
-            if (space.route->p29v1->deserializer.root_reference_count() !=
-                descriptor.decoded_bytes)
-                throw std::logic_error(
-                    "P29V1 BODY decoded count differs from its descriptor");
-            if (compute_transaction_digest(pending.begin, {}, pending.body) !=
-                pending.begin.transaction_digest)
-                throw std::logic_error(
-                    "P29V1 transaction digest does not match its components");
-            record(ActionType::BODY_COMPLETE, session, &pending.begin);
-            record(ActionType::NEED_RECORDED, session, &pending.begin);
-            return;
-        } catch (...) {
-            space.route->p29v1->terminal = true;
-            if (space.route->p29v1->deserializer.has_pending()) {
-                try {
-                    space.route->p29v1->deserializer.abandon();
-                } catch (...) {
-                }
-            }
-            throw;
-        }
-    }
-    if (dict) {
-        pending.manifest = decode_key_vector(target);
-        if (pending.manifest.size() != descriptor.decoded_bytes)
-            throw std::logic_error("DICT decoded count does not match its descriptor");
-        if (!std::is_sorted(pending.manifest.begin(), pending.manifest.end()) ||
-            std::adjacent_find(pending.manifest.begin(), pending.manifest.end()) !=
-                pending.manifest.end())
-            throw std::logic_error("DICT manifest is not an exact sorted set");
-        for (Key64 key : pending.manifest)
-            if (space.objects.contains(key))
-                pending.acknowledged_before.insert(key);
-            else
-                pending.requested.insert(key);
-        pending.remaining = pending.requested;
-        record(ActionType::DICT_COMPLETE, session, &pending.begin);
-        const std::vector<Key64> exact_need(pending.requested.begin(),
-                                            pending.requested.end());
-        record(ActionType::NEED_RECORDED, session, &pending.begin, std::nullopt,
-               {}, pending.remaining.size(), false, exact_need);
-    } else {
-        std::vector<uint8_t> root_bytes;
-        if (descriptor.encoding == kP29ResidualBodyEncoding) {
-            const P29ResidualBody composite = decode_p29_residual_body(target);
-            root_bytes = composite.root;
-            pending.residual = composite.residual;
-            pending.residual_lines = composite.lines;
-            // BODY is authoritative for residual Line bytes.  Remove those
-            // keys from the pending FILL remainder while retaining them in
-            // `requested` for the exact residual ownership check below.
-            for (const P29ResidualLine& line : pending.residual_lines)
-                pending.remaining.erase(line.key);
-        } else {
-            root_bytes = target;
-        }
-        pending.root = decode_key_vector(root_bytes);
-        if (pending.root.size() != descriptor.decoded_bytes)
-            throw std::logic_error("BODY decoded count does not match its descriptor");
-        record(ActionType::BODY_COMPLETE, session, &pending.begin);
-    }
-    if (pending.dict_complete && pending.body_complete) {
-        if (compute_transaction_digest(pending.begin, pending.dict, pending.body) !=
+    if (pending.body.size() > descriptor.encoded_bytes ||
+        bytes.size() > descriptor.encoded_bytes - pending.body.size())
+        throw std::length_error("BODY exceeds its declared byte count");
+    pending.body.insert(pending.body.end(), bytes.begin(), bytes.end());
+    if (pending.body.size() != descriptor.encoded_bytes)
+        return;
+    if (digest128(pending.body) != descriptor.digest)
+        throw std::logic_error("BODY digest does not match TX_BEGIN");
+    pending.body_complete = true;
+    if (!space.route->p29v1 || space.route->p29v1->terminal)
+        throw std::logic_error("P29V1 receiver state is unavailable");
+    try {
+        pending.p29v1_need =
+            space.route->p29v1->deserializer.receive_body(pending.body);
+        pending.p29v1_need.push_back(
+            static_cast<uint8_t>(codec::P29WireKind::TuEnd));
+        pending.p29v1_need.insert(pending.p29v1_need.end(), 4, 0);
+        if (space.route->p29v1->deserializer.root_reference_count() !=
+            descriptor.decoded_bytes)
+            throw std::logic_error(
+                "P29V1 BODY decoded count differs from its descriptor");
+        if (compute_transaction_digest(pending.begin, pending.body) !=
             pending.begin.transaction_digest)
-            throw std::logic_error("transaction digest does not match its exact components");
-        for (Key64 root : pending.root)
-            if (!std::binary_search(pending.manifest.begin(), pending.manifest.end(), root))
-                throw std::logic_error("BODY root is outside the DICT manifest");
+            throw std::logic_error(
+                "P29V1 transaction digest does not match its BODY");
+        record(ActionType::BODY_COMPLETE, session, &pending.begin);
+        record(ActionType::NEED_RECORDED, session, &pending.begin);
+    } catch (...) {
+        space.route->p29v1->terminal = true;
+        if (space.route->p29v1->deserializer.has_pending()) {
+            try {
+                space.route->p29v1->deserializer.abandon();
+            } catch (...) {
+            }
+        }
+        throw;
     }
-}
-
-void FStore::append_dict(SessionHandle session, std::span<const uint8_t> bytes) {
-    append_component(session, true, bytes);
 }
 
 void FStore::append_body(SessionHandle session, std::span<const uint8_t> bytes) {
-    append_component(session, false, bytes);
-}
-
-Need FStore::need(SessionHandle session) const {
-    const Namespace& space = require_namespace(session);
-    if (!space.route || !space.route->pending || !space.route->pending->dict_complete)
-        throw std::logic_error("Need is unavailable before the exact DICT");
-    const Namespace::FPending& pending = *space.route->pending;
-    return {pending.begin.history_nonce, pending.begin.rel_seq, pending.begin.tu_seq,
-            pending.begin.transaction_digest,
-            {pending.requested.begin(), pending.requested.end()}};
+    append_component(session, bytes);
 }
 
 std::vector<uint8_t> FStore::p29v1_need_frames(SessionHandle session) const {
@@ -2855,183 +2157,69 @@ void FStore::append_fill_v1(SessionHandle session,
     pending.p29v1_fill = std::move(inner_fill);
 }
 
-ObjectApplied FStore::apply_object(SessionHandle session,
-                                   const ImmutableObject& object) {
-    Namespace& space = require_namespace(session);
-    if (!space.route || !space.route->pending ||
-        !space.route->pending->dict_complete)
-        throw std::logic_error("object application has no exact active Need");
-    Namespace::FPending& pending = *space.route->pending;
-    if (!pending.requested.contains(object.key))
-        throw std::logic_error("object was not in F's recorded Need set");
-    const bool still_missing = pending.remaining.contains(object.key);
-    const ObjectApplyResult result = space.objects.apply(object);
-    if (still_missing) pending.remaining.erase(object.key);
-    if (!still_missing && result != ObjectApplyResult::Duplicate)
-        throw std::logic_error("closed Need key was unexpectedly absent");
-    record(ActionType::OBJECT_APPLIED, session, &pending.begin, object.key,
-           object.content_digest, pending.remaining.size(),
-           result == ObjectApplyResult::Duplicate);
-    return {object.key, object.content_digest, result};
-}
-
-std::vector<ObjectApplied> FStore::append_fill(SessionHandle session,
-                                               const FillMessage& message) {
-    Namespace& space = require_namespace(session);
-    if (!space.route || !space.route->pending)
-        throw std::logic_error("FILL has no F ACTIVE_TX");
-    Namespace::FPending& pending = *space.route->pending;
-    const std::vector<FillRecord> records =
-        pending.partial_fill.push(message);
-    std::vector<ObjectApplied> result;
-    result.reserve(records.size());
-    for (const FillRecord& record : records)
-        result.push_back(apply_object(session, ImmutableObject::from_record(record)));
-    if (pending.remaining.empty()) pending.partial_fill.finish();
-    return result;
-}
-
-void FStore::finish_fill(SessionHandle session) const {
-    const Namespace& space = require_namespace(session);
-    if (!space.route || !space.route->pending)
-        throw std::logic_error("FILL has no F ACTIVE_TX");
-    space.route->pending->partial_fill.finish();
-}
-
 std::vector<uint8_t> FStore::materialize_and_verify(SessionHandle session) {
     Namespace& space = require_namespace(session);
     if (!space.route || !space.route->pending)
         throw std::logic_error("F route has no ACTIVE_TX to materialize");
     Namespace::FPending& pending = *space.route->pending;
-    if (pending.begin.profile == ProfileId::P29V1) {
-        if (!space.route->p29v1 || space.route->p29v1->terminal ||
-            !pending.dict_complete || !pending.body_complete ||
-            pending.p29v1_fill.empty())
-            throw std::logic_error(
-                "P29V1 input cannot materialize before BODY, NEED, and FILL");
-        try {
-            (void)space.route->p29v1->deserializer.receive_fill(
-                pending.p29v1_fill, false);
+    if (pending.begin.profile != ProfileId::P29V1 || !space.route->p29v1 ||
+        space.route->p29v1->terminal || !pending.body_complete ||
+        pending.p29v1_fill.empty())
+        throw std::logic_error(
+            "P29V1 input cannot materialize before BODY, NEED, and FILL");
+    try {
+        (void)space.route->p29v1->deserializer.receive_fill(
+            pending.p29v1_fill, false,
+            static_cast<size_t>(pending.begin.raw_bytes));
 #if defined(ICECC_P29V1_MUTANT_DOUBLE_MATERIALIZE)
-            const auto scratch =
-                space.route->p29v1->deserializer.rematerialize_for_mutant();
-            if (scratch.bytes.size() != pending.begin.raw_bytes ||
-                digest128(scratch.bytes) != pending.begin.raw_digest ||
-                scratch.occurrences.size() !=
-                    space.route->p29v1->deserializer.mutant_occurrence_count() ||
-                compute_transaction_digest(pending.begin, {}, pending.body) !=
-                    pending.begin.transaction_digest)
-                throw std::logic_error(
-                    "P29V1 mutant rematerialization does not match TX_BEGIN");
+        const auto scratch =
+            space.route->p29v1->deserializer.rematerialize_for_mutant();
+        if (scratch.bytes.size() != pending.begin.raw_bytes ||
+            digest128(scratch.bytes) != pending.begin.raw_digest ||
+            scratch.occurrences.size() !=
+                space.route->p29v1->deserializer.mutant_occurrence_count() ||
+            compute_transaction_digest(pending.begin, pending.body) !=
+                pending.begin.transaction_digest)
+            throw std::logic_error(
+                "P29V1 mutant rematerialization does not match TX_BEGIN");
 #endif
-            std::vector<uint8_t> result =
-                space.route->p29v1->deserializer.take_materialized();
-            if (result.size() != pending.begin.raw_bytes ||
-                digest128(result) != pending.begin.raw_digest ||
-                compute_transaction_digest(pending.begin, {}, pending.body) !=
-                    pending.begin.transaction_digest)
-                throw std::logic_error(
-                    "P29V1 materialized input does not match TX_BEGIN exactly");
-            const std::span<const uint8_t> segment =
-                space.route->p29v1->deserializer.pending_segment();
-            if (segment.size() > result.size())
-                throw std::logic_error(
-                    "P29V1 staged segment exceeds materialized input");
-            pending.p29v1_segment_digest =
-                segment.empty() ? Digest128{} : digest128(segment);
-            pending.p29v1_materialized = true;
-            record(ActionType::INPUT_MATERIALIZED, session, &pending.begin);
-            return result;
-        } catch (...) {
-            space.route->p29v1->terminal = true;
-            if (space.route->p29v1->deserializer.has_pending()) {
-                try {
-                    space.route->p29v1->deserializer.abandon();
-                } catch (...) {
-                }
+        std::vector<uint8_t> result =
+            space.route->p29v1->deserializer.take_materialized();
+        if (result.size() != pending.begin.raw_bytes ||
+            digest128(result) != pending.begin.raw_digest ||
+            compute_transaction_digest(pending.begin, pending.body) !=
+                pending.begin.transaction_digest)
+            throw std::logic_error(
+                "P29V1 materialized input does not match TX_BEGIN exactly");
+        const std::span<const uint8_t> segment =
+            space.route->p29v1->deserializer.pending_segment();
+        if (segment.size() > result.size())
+            throw std::logic_error(
+                "P29V1 staged segment exceeds materialized input");
+        pending.p29v1_segment_digest =
+            space.route->p29v1->deserializer.pending_segment_digest();
+        pending.p29v1_materialized = true;
+        record(ActionType::INPUT_MATERIALIZED, session, &pending.begin);
+        return result;
+    } catch (...) {
+        space.route->p29v1->terminal = true;
+        if (space.route->p29v1->deserializer.has_pending()) {
+            try {
+                space.route->p29v1->deserializer.abandon();
+            } catch (...) {
             }
-            throw;
         }
+        throw;
     }
-    pending.partial_fill.finish();
-    if (!pending.dict_complete || !pending.body_complete)
-        throw std::logic_error("input cannot materialize before DICT, BODY, and Need finish");
-    if (pending.begin.body.encoding == kP29ResidualBodyEncoding) {
-        size_t residual_offset = 0;
-        for (const P29ResidualLine& line : pending.residual_lines) {
-            if (!pending.requested.contains(line.key))
-                throw std::logic_error("P29 residual Line was not in F's exact Need");
-            if (line.bytes > pending.residual.size() - residual_offset)
-                throw std::logic_error("P29 residual Line ended during reconstruction");
-            const std::span<const uint8_t> bytes(pending.residual.data() + residual_offset,
-                                                  static_cast<size_t>(line.bytes));
-            const ImmutableObject object = ImmutableObject::bytes(line.key, bytes);
-            const ObjectApplyResult applied = space.objects.apply(object);
-            pending.remaining.erase(line.key);
-            record(ActionType::OBJECT_APPLIED, session, &pending.begin, line.key,
-                   object.content_digest, pending.remaining.size(),
-                   applied == ObjectApplyResult::Duplicate);
-            residual_offset += static_cast<size_t>(line.bytes);
-        }
-        if (residual_offset != pending.residual.size())
-            throw std::logic_error("P29 residual Line has trailing bytes");
-    }
-    if (!pending.remaining.empty())
-        throw std::logic_error("input cannot materialize before DICT, BODY, and Need finish");
-    if (pending.materialized)
-        throw std::logic_error("input was already materialized for this transaction");
-    if (compute_transaction_digest(pending.begin, pending.dict, pending.body) !=
-        pending.begin.transaction_digest)
-        throw std::logic_error("transaction digest changed before materialization");
-    std::set<Key64> reached;
-    const std::vector<uint8_t> object_result =
-        materialize_objects(space.objects, pending.root, &reached);
-    if (!std::equal(reached.begin(), reached.end(), pending.manifest.begin(),
-                    pending.manifest.end()))
-        throw std::logic_error("DICT is not the exact transitive object closure");
-    const std::vector<uint8_t> result = object_result;
-    if (result.size() != pending.begin.raw_bytes ||
-        digest128(result) != pending.begin.raw_digest)
-        throw std::logic_error("materialized input does not match TX_BEGIN exactly");
-    pending.materialized = result;
-    record(ActionType::INPUT_MATERIALIZED, session, &pending.begin);
-    return result;
 }
 
 TxCommit FStore::commit_input(SessionHandle session) {
     Namespace& space = require_namespace(session);
-    if (space.route && space.route->pending &&
-        space.route->pending->begin.profile == ProfileId::P29V1) {
-        Namespace::Route& route = *space.route;
-        Namespace::FPending& pending = *route.pending;
-        if (!pending.p29v1_materialized || !route.p29v1 ||
-            route.p29v1->terminal)
-            throw std::logic_error("exact P29V1 input has not materialized");
-        const TxBegin begin = pending.begin;
-        if (route.next_rel_seq.value == std::numeric_limits<uint64_t>::max())
-            throw std::overflow_error("F REL_SEQ space exhausted");
-        TxCommit commit{begin.history_nonce, begin.rel_seq, begin.tu_seq,
-                        begin.transaction_digest, begin.raw_digest,
-                        compute_post_state_digest(begin.pre_state_digest,
-                                                  begin.history_nonce,
-                                                  begin.rel_seq, begin.tu_seq,
-                                                  begin.transaction_digest)};
-        try {
-            route.p29v1->deserializer.commit();
-        } catch (...) {
-            route.p29v1->terminal = true;
-            throw;
-        }
-        route.state_digest = commit.post_state_digest;
-        ++route.next_rel_seq.value;
-        route.last_commit = commit;
-        record(ActionType::INPUT_COMMITTED, session, &begin);
-        route.pending.reset();
-        return commit;
-    }
     if (!space.route || !space.route->pending ||
-        !space.route->pending->materialized)
-        throw std::logic_error("exact input has not materialized");
+        space.route->pending->begin.profile != ProfileId::P29V1 ||
+        !space.route->pending->p29v1_materialized || !space.route->p29v1 ||
+        space.route->p29v1->terminal)
+        throw std::logic_error("exact P29V1 input has not materialized");
     Namespace::Route& route = *space.route;
     const TxBegin begin = route.pending->begin;
     if (route.next_rel_seq.value == std::numeric_limits<uint64_t>::max())
@@ -3042,6 +2230,12 @@ TxCommit FStore::commit_input(SessionHandle session) {
                                               begin.history_nonce, begin.rel_seq,
                                               begin.tu_seq,
                                               begin.transaction_digest)};
+    try {
+        route.p29v1->deserializer.commit();
+    } catch (...) {
+        route.p29v1->terminal = true;
+        throw;
+    }
     route.state_digest = commit.post_state_digest;
     ++route.next_rel_seq.value;
     route.last_commit = commit;
@@ -3101,16 +2295,6 @@ void FStore::destructive_cache_reset(FStoreGuid new_guid) {
     session_serial_exhausted_ = false;
 }
 
-size_t FStore::object_count(CStoreGuid c_store_guid) const {
-    const auto position = namespaces_.find(c_store_guid);
-    return position == namespaces_.end() ? 0 : position->second->objects.size();
-}
-
-bool FStore::contains(CStoreGuid c_store_guid, Key64 key) const {
-    const auto position = namespaces_.find(c_store_guid);
-    return position != namespaces_.end() && position->second->objects.contains(key);
-}
-
 FStore::Namespace& FStore::require_namespace(SessionHandle session) {
     const auto position = namespaces_.find(session.c_store_guid);
     if (session.f_store_guid != guid_ || position == namespaces_.end() ||
@@ -3127,49 +2311,6 @@ const FStore::Namespace& FStore::require_namespace(SessionHandle session) const 
         position->second->active_session_serial != session.serial)
         throw std::logic_error("stale or unknown F session");
     return *position->second;
-}
-
-ReconnectResult reconnect(CRoute& c_route, FStore& f_store,
-                          HistoryNonce fresh_history_nonce) {
-    ReconnectResult result;
-    result.session = f_store.connect(c_route.c_store_guid());
-    const SessionState state = f_store.resume(result.session);
-    if (state.f_store_guid != c_route.f_store_guid() || !state.namespace_present) {
-        const PreparedTUPtr retry = c_route.active_ ? c_route.active_->prepared : nullptr;
-        c_route.reset_history(state.f_store_guid, fresh_history_nonce);
-        if (state.route_present) f_store.forget_route(result.session);
-        f_store.start_route(result.session, c_route.history_nonce(),
-                            c_route.state_digest());
-        if (retry) c_route.begin(retry, P29RootMode::HistoryIndependent);
-        result.outcome = ReconnectOutcome::ColdFStore;
-        result.replay_active = c_route.active().has_value();
-        return result;
-    }
-    if (state.route_present && state.history_nonce == c_route.history_nonce() &&
-        state.next_rel_seq == c_route.next_rel_seq() &&
-        state.state_digest == c_route.state_digest()) {
-        result.outcome = ReconnectOutcome::ExactMatch;
-        result.replay_active = c_route.active().has_value();
-        return result;
-    }
-    if (state.route_present && c_route.active() && state.last_commit &&
-        state.history_nonce == c_route.history_nonce() &&
-        state.next_rel_seq.value == c_route.active()->begin.rel_seq.value + 1 &&
-        state.state_digest == state.last_commit->post_state_digest &&
-        same_commit(*state.last_commit, *c_route.active())) {
-        c_route.accept_commit(*state.last_commit, ActionType::LOST_COMMIT_ACCEPTED);
-        result.outcome = ReconnectOutcome::LostFinalAcknowledgement;
-        return result;
-    }
-    const PreparedTUPtr retry = c_route.active_ ? c_route.active_->prepared : nullptr;
-    c_route.reset_history(state.f_store_guid, fresh_history_nonce);
-    if (state.route_present) f_store.forget_route(result.session);
-    f_store.start_route(result.session, c_route.history_nonce(),
-                        c_route.state_digest());
-    if (retry) c_route.begin(retry, P29RootMode::HistoryIndependent);
-    result.outcome = ReconnectOutcome::RouteHistoryReset;
-    result.replay_active = c_route.active().has_value();
-    return result;
 }
 
 }  // namespace icecc::p50

@@ -1,4 +1,5 @@
 #include "cache/p50_reverse_fd_retry.h"
+#include "../services/comm.h"
 
 #include <chrono>
 #include <fcntl.h>
@@ -26,14 +27,14 @@ P50SourceArm arm() {
     value.selected_f_host = "f.example";
     value.selected_f_ordinary_port = 8765;
     value.selected_f_cache_port = 9876;
-    value.cache_protocol = 50;
-    value.cache_profile = 2;
+    value.cache_protocol = CACHE_WIRE_REVISION;
+    value.cache_profile = CACHE_PROFILE_ZSTD_TU;
     value.logical_job = 19;
     value.attempt_id = 23;
     value.c_store_generation = 29;
     value.c_store_guid.bytes[15] = 31;
     value.source_request_id = 37;
-    value.source_mode = 1;
+    value.source_mode = P50_SOURCE_MODE_ZSTD_TU;
     return value;
 }
 

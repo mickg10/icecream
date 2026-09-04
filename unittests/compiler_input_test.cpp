@@ -388,6 +388,35 @@ void test_p50_legacy_compile_file_conservation()
     unlink(f_path);
 }
 
+void test_pre_p50_compile_file_remains_legacy()
+{
+    ChannelPair pair = make_channel_pair();
+    pair.sender->protocol = 49;
+    pair.receiver->protocol = 49;
+    pair.receiver->set_p50_legacy_wire_role(P50LegacyWireRole::F);
+
+    CompileJob job;
+    job.setJobID(17);
+    job.setCompilerName("g++");
+    job.setLanguage(CompileJob::Lang_CXX);
+    job.setEnvironmentVersion("legacy-env");
+    job.setTargetPlatform("x86_64");
+    job.setInputFile("legacy.ii");
+    job.setOutputFile("legacy.o");
+    CompileFileMsg compile(&job);
+    REQUIRE(pair.sender->send_msg(compile),
+            "P49 client sends the unchanged legacy CompileFile shape");
+    Msg *wire = pair.receiver->get_msg(5, true);
+    CompileFileMsg *decoded = dynamic_cast<CompileFileMsg *>(wire);
+    CompileJob *received = decoded ? decoded->takeJob() : nullptr;
+    REQUIRE(received && received->jobID() == 17
+                && !received->hasAssignmentIdentity()
+                && !received->hasCompileIdentity(),
+            "new F accepts a real pre-P50 CompileFile without a P50 witness");
+    delete received;
+    delete wire;
+}
+
 void test_buffering_short_writes_end_and_accounting()
 {
     ChannelPair pair = make_channel_pair();
@@ -623,5 +652,6 @@ int main()
     test_p50_descriptor_and_identity_rejections();
     test_p50_legacy_wire_witness();
     test_p50_legacy_compile_file_conservation();
+    test_pre_p50_compile_file_remains_legacy();
     return failures == 0 ? 0 : 1;
 }

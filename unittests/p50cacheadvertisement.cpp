@@ -71,7 +71,7 @@ static LoginMsg fixture_login()
     login.max_kids = UINT32_C(0x01020304);
     login.noremote = false;
     login.chroot_possible = true;
-    login.setCacheAdvertisement(UINT32_C(0x0000beef), CACHE_WIRE_PROTOCOL_V1,
+    login.setCacheAdvertisement(UINT32_C(0x0000beef), CACHE_WIRE_REVISION,
                                 CACHE_PROFILE_ZSTD_TU);
     return login;
 }
@@ -212,7 +212,7 @@ static void test_p50_round_trip_and_validation()
     Msg *wire = pair.right->get_msg(2, true);
     LoginMsg *decoded = dynamic_cast<LoginMsg *>(wire);
     REQUIRE(decoded && decoded->cache_endpoint_port == UINT32_C(0x0000beef)
-                && decoded->cache_protocol == CACHE_WIRE_PROTOCOL_V1
+                && decoded->cache_protocol == CACHE_WIRE_REVISION
                 && decoded->cache_profile_mask == CACHE_PROFILE_ZSTD_TU,
             "P50 Login round-trips the exact three-word advertisement");
     delete wire;
@@ -236,15 +236,15 @@ static void test_p50_round_trip_and_validation()
         uint32_t profiles;
         const char *name;
     } invalid[] = {
-        {0, CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU,
+        {0, CACHE_WIRE_REVISION, CACHE_PROFILE_ZSTD_TU,
          "zero port with positive capability"},
-        {70000, CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU,
+        {70000, CACHE_WIRE_REVISION, CACHE_PROFILE_ZSTD_TU,
          "port outside TCP range"},
         {10245, 0, CACHE_PROFILE_ZSTD_TU, "missing cache protocol"},
-        {10245, CACHE_WIRE_PROTOCOL_V1, 0, "missing cache profile"},
-        {10245, CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_Z3_SHARED_LONG,
-         "non-runnable z3_shared_long endpoint"},
-        {10245, CACHE_WIRE_PROTOCOL_V1, UINT32_C(0x80000000),
+        {10245, CACHE_WIRE_REVISION, 0, "missing cache profile"},
+        {10245, CACHE_WIRE_REVISION, UINT32_C(0x00000008),
+         "removed revision-one profile bit"},
+        {10245, CACHE_WIRE_REVISION, UINT32_C(0x80000000),
          "unknown profile bit"},
     };
     for (const Invalid& value : invalid) {
@@ -286,7 +286,7 @@ static UseCSMsg fixture_usecs()
     UseCSMsg use("x86_64", "cache-worker", UINT32_C(0x00002805),
                  UINT32_C(0x0000beef), true, UINT32_C(7), UINT32_C(0),
                  UINT64_C(0x1020304050607080), UINT64_C(0x8877665544332211),
-                 UINT32_C(0x0000cafe), CACHE_WIRE_PROTOCOL_V1,
+                 UINT32_C(0x0000cafe), CACHE_WIRE_REVISION,
                  CACHE_PROFILE_ZSTD_TU);
     return use;
 }
@@ -379,7 +379,7 @@ static void test_usecs_p50_round_trip_and_validation()
     Msg *wire = pair.right->get_msg(2, true);
     UseCSMsg *decoded = dynamic_cast<UseCSMsg *>(wire);
     REQUIRE(decoded && decoded->cache_endpoint_port == UINT32_C(0x0000cafe)
-                && decoded->cache_protocol == CACHE_WIRE_PROTOCOL_V1
+                && decoded->cache_protocol == CACHE_WIRE_REVISION
                 && decoded->cache_profile_mask == CACHE_PROFILE_ZSTD_TU
                 && decoded->hostname == "cache-worker"
                 && decoded->assignmentEpoch() == UINT64_C(0x1020304050607080)
@@ -409,17 +409,17 @@ static void test_usecs_p50_round_trip_and_validation()
         uint32_t profiles;
         const char *name;
     } invalid[] = {
-        {0, CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU,
+        {0, CACHE_WIRE_REVISION, CACHE_PROFILE_ZSTD_TU,
          "zero port with positive capability"},
-        {70000, CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU,
+        {70000, CACHE_WIRE_REVISION, CACHE_PROFILE_ZSTD_TU,
          "port outside TCP range"},
         {10245, 0, CACHE_PROFILE_ZSTD_TU, "missing cache protocol"},
         {10245, UINT32_C(49), CACHE_PROFILE_ZSTD_TU,
          "stale pre-CacheWire protocol number"},
-        {10245, CACHE_WIRE_PROTOCOL_V1, 0, "missing cache profile"},
-        {10245, CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_Z3_SHARED_LONG,
-         "non-runnable z3_shared_long endpoint"},
-        {10245, CACHE_WIRE_PROTOCOL_V1, UINT32_C(0x80000000),
+        {10245, CACHE_WIRE_REVISION, 0, "missing cache profile"},
+        {10245, CACHE_WIRE_REVISION, UINT32_C(0x00000008),
+         "removed revision-one profile bit"},
+        {10245, CACHE_WIRE_REVISION, UINT32_C(0x80000000),
          "unknown profile bit"},
     };
     for (const Invalid& value : invalid) {
@@ -546,12 +546,12 @@ static void test_usecs_identity_binding_law()
         // triple is added on top.  Neutralizing that one clause must flip
         // exactly THIS row green, while the three partial rows above stay
         // red for their own, unrelated reason.
-        {job_id, 0, 0, cache_port, CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU,
+        {job_id, 0, 0, cache_port, CACHE_WIRE_REVISION, CACHE_PROFILE_ZSTD_TU,
          false,
          "both identity words absent, cache VALID-PRESENT (discriminator)"},
         // Valid complete baseline (also covered by the round-trip test
         // above; repeated here so every identity-law row sits together).
-        {job_id, epoch, nonce, cache_port, CACHE_WIRE_PROTOCOL_V1,
+        {job_id, epoch, nonce, cache_port, CACHE_WIRE_REVISION,
          CACHE_PROFILE_ZSTD_TU, true,
          "complete identity, cache VALID-PRESENT (baseline)"},
     };
@@ -631,15 +631,15 @@ static void test_daemon_cache_handoff_admissible_helper()
         bool expect_admissible;
         const char *name;
     } rows[] = {
-        {job_id, epoch, nonce, cache_port, CACHE_WIRE_PROTOCOL_V1,
+        {job_id, epoch, nonce, cache_port, CACHE_WIRE_REVISION,
          CACHE_PROFILE_ZSTD_TU, true, "complete identity, cache present (baseline)"},
-        {0, epoch, nonce, cache_port, CACHE_WIRE_PROTOCOL_V1,
+        {0, epoch, nonce, cache_port, CACHE_WIRE_REVISION,
          CACHE_PROFILE_ZSTD_TU, false,
          "zero job_id, epoch+nonce present, cache present -- the row "
          "job_id!=0's omission let through"},
-        {job_id, 0, nonce, cache_port, CACHE_WIRE_PROTOCOL_V1,
+        {job_id, 0, nonce, cache_port, CACHE_WIRE_REVISION,
          CACHE_PROFILE_ZSTD_TU, false, "zero epoch, cache present"},
-        {job_id, epoch, 0, cache_port, CACHE_WIRE_PROTOCOL_V1,
+        {job_id, epoch, 0, cache_port, CACHE_WIRE_REVISION,
          CACHE_PROFILE_ZSTD_TU, false, "zero nonce, cache present"},
         {job_id, 0, 0, 0, 0, 0, false,
          "wholly absent cache triple (nothing to retain either way)"},
@@ -675,15 +675,15 @@ static void test_cache_advertisement_predicate_matches_projection_law()
         uint32_t profiles;
         const char *name;
     } mixed[] = {
-        {0, CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU,
+        {0, CACHE_WIRE_REVISION, CACHE_PROFILE_ZSTD_TU,
          "zero port, live protocol+mask"},
         {10245, 0, CACHE_PROFILE_ZSTD_TU, "live port+mask, zero protocol"},
-        {10245, CACHE_WIRE_PROTOCOL_V1, 0, "live port+protocol, zero mask"},
+        {10245, CACHE_WIRE_REVISION, 0, "live port+protocol, zero mask"},
         {10245, 49, CACHE_PROFILE_ZSTD_TU,
          "live port+mask, stale pre-CacheWire protocol"},
-        {10245, CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_Z3_SHARED_LONG,
-         "live port+protocol, non-runnable profile"},
-        {70000, CACHE_WIRE_PROTOCOL_V1, CACHE_PROFILE_ZSTD_TU,
+        {10245, CACHE_WIRE_REVISION, UINT32_C(0x00000008),
+         "live port+protocol, removed profile bit"},
+        {70000, CACHE_WIRE_REVISION, CACHE_PROFILE_ZSTD_TU,
          "out-of-range port, live protocol+mask"},
     };
     for (const Mixed& value : mixed) {
@@ -699,69 +699,57 @@ static void test_cache_advertisement_predicate_matches_projection_law()
     }
 }
 
-static void test_declared_profiles_are_inert()
+static void test_revision_one_profile_registry()
 {
-    static_assert(static_cast<uint16_t>(ProfileId::P29) == 1);
+    static_assert(static_cast<uint16_t>(ProfileId::P29V1) == 1);
     static_assert(static_cast<uint16_t>(ProfileId::ZSTD_TU) == 2);
-    static_assert(static_cast<uint16_t>(ProfileId::GRZ) == 3);
-    static_assert(static_cast<uint16_t>(ProfileId::Z3_LONG) == 4);
-    static_assert(static_cast<uint16_t>(ProfileId::Z3_SHARED_LONG) == 5);
-    static_assert(static_cast<uint16_t>(ProfileId::P29V1) == 6);
-    static_assert(profile_bit(ProfileId::P29) == CACHE_PROFILE_P29);
-    static_assert(profile_bit(ProfileId::ZSTD_TU) == CACHE_PROFILE_ZSTD_TU);
-    static_assert(profile_bit(ProfileId::GRZ) == CACHE_PROFILE_GRZ);
-    static_assert(profile_bit(ProfileId::Z3_LONG) == CACHE_PROFILE_Z3_LONG);
-    static_assert(profile_bit(ProfileId::Z3_SHARED_LONG)
-                  == CACHE_PROFILE_Z3_SHARED_LONG);
+    static_assert(static_cast<uint16_t>(ProfileId::ZSTD_ROUTE) == 3);
     static_assert(profile_bit(ProfileId::P29V1) == CACHE_PROFILE_P29V1);
-    static_assert((kKnownProfileMask & profile_bit(ProfileId::Z3_LONG)) != 0);
-    static_assert((kKnownProfileMask & profile_bit(ProfileId::Z3_SHARED_LONG)) == 0);
-    static_assert((CACHE_ADVERTISABLE_PROFILE_MASK
-                   & CACHE_PROFILE_Z3_LONG) != 0);
-    static_assert((CACHE_ADVERTISABLE_PROFILE_MASK
-                   & CACHE_PROFILE_Z3_SHARED_LONG) == 0);
-    static_assert((CACHE_ADVERTISABLE_PROFILE_MASK
-                   & CACHE_PROFILE_P29V1) != 0);
-    REQUIRE(profile_name(ProfileId::Z3_LONG) == "z3_long"
-                && profile_name(ProfileId::Z3_SHARED_LONG) == "z3_shared_long",
-            "streaming profile IDs have stable declared labels");
+    static_assert(profile_bit(ProfileId::ZSTD_TU) == CACHE_PROFILE_ZSTD_TU);
+    static_assert(profile_bit(ProfileId::ZSTD_ROUTE)
+                  == CACHE_PROFILE_ZSTD_ROUTE);
+    static_assert(kKnownProfileMask == UINT32_C(0x00000007));
+    static_assert(CACHE_ADVERTISABLE_PROFILE_MASK == kKnownProfileMask);
+    REQUIRE(profile_name(ProfileId::P29V1) == "p29_v1"
+                && profile_name(ProfileId::ZSTD_TU) == "zstd_tu"
+                && profile_name(ProfileId::ZSTD_ROUTE) == "zstd_route",
+            "revision-one profile IDs and labels are exact");
 
     {
         SessionHello hello;
         hello.c_store_guid = Id128::from_u64(91);
-        hello.supported_profiles = profile_bit(ProfileId::Z3_LONG);
+        hello.supported_profiles = profile_bit(ProfileId::ZSTD_ROUTE);
         const SessionSelection selected = negotiate_session(
-            hello, kProtocolVersion, kProtocolVersion, kKnownProfileMask);
-        REQUIRE(selected.negotiated_profiles == profile_bit(ProfileId::Z3_LONG),
-                "implemented ZSTD_ROUTE profile negotiates");
+            hello, kP50WireRevision, profile_bit(ProfileId::ZSTD_ROUTE));
+        REQUIRE(selected.negotiated_profiles == profile_bit(ProfileId::ZSTD_ROUTE),
+                "revision-one ZSTD_ROUTE profile negotiates");
     }
 
     {
         SessionHello hello;
         hello.c_store_guid = Id128::from_u64(92);
-        hello.supported_profiles = profile_bit(ProfileId::Z3_SHARED_LONG);
+        hello.supported_profiles = UINT32_C(0x00000008);
         bool negotiation_rejected = false;
         try {
-            (void)negotiate_session(hello, kProtocolVersion, kProtocolVersion,
-                                    kKnownProfileMask);
+            (void)negotiate_session(hello, kP50WireRevision,
+                                    UINT32_C(0x00000008));
         } catch (const std::invalid_argument&) {
             negotiation_rejected = true;
         }
         REQUIRE(negotiation_rejected,
-                "unimplemented ZSTD_SHARED_ROUTE profile cannot negotiate");
+                "a removed revision-one profile bit cannot negotiate");
 
         TxBegin begin;
         begin.history_nonce = HistoryNonce{1};
-        begin.profile = ProfileId::Z3_SHARED_LONG;
-        begin.p29_root_mode = P29RootMode::NotApplicable;
+        begin.profile = static_cast<ProfileId>(4);
         bool transaction_rejected = false;
         try {
-            (void)compute_transaction_digest(begin, {}, {});
+            (void)compute_transaction_digest(begin, {});
         } catch (const std::invalid_argument&) {
             transaction_rejected = true;
         }
         REQUIRE(transaction_rejected,
-                "declared streaming profile cannot enter a transaction");
+                "a removed revision-one profile cannot enter a transaction");
     }
 }
 
@@ -774,7 +762,7 @@ int main()
     test_usecs_identity_binding_law();
     test_daemon_cache_handoff_admissible_helper();
     test_cache_advertisement_predicate_matches_projection_law();
-    test_declared_profiles_are_inert();
+    test_revision_one_profile_registry();
     std::fprintf(stderr, "%s: %d failure(s)\n",
                  failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;

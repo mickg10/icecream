@@ -111,7 +111,8 @@ public:
 
     // Handles exactly one authenticated request.  deadline is absolute and
     // covers credential verification, both handshake frames, the request,
-    // complete memfd creation, FD reply, and its ACK.
+    // the authenticated typed result, complete memfd creation, FD reply, and
+    // its ACK. A non-Accepted result terminates before SCM_RIGHTS handoff.
     [[nodiscard]] InputFdAttachmentResult serve(
         local::Connection& connection, local::Identity expected_identity,
         const local::CredentialExpectation& expected_peer,

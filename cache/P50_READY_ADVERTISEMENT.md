@@ -8,10 +8,9 @@ It does not start a process, own a socket, send a Login, or modify
 The controller publishes only two kinds of snapshots:
 
 * absent: `(0, 0, 0)`;
-* present: `(public daemon TCP port, CACHE_WIRE_PROTOCOL_V1,
-  CACHE_PROFILE_P29 | CACHE_PROFILE_P29V1 | CACHE_PROFILE_ZSTD_TU |
-  CACHE_PROFILE_ZSTD_ROUTE)`, plus `CACHE_PROFILE_GRZ` in a
-  dependency-enabled build.
+* present: `(public daemon TCP port, CACHE_WIRE_REVISION,
+  CACHE_PROFILE_P29V1 | CACHE_PROFILE_ZSTD_TU |
+  CACHE_PROFILE_ZSTD_ROUTE)`.
 
 Presence requires all of the following in one observation: the daemon's
 public listener is bound to a valid TCP port, the supervisor is exactly
@@ -35,9 +34,8 @@ absence before any recovered presence, even when crash and recovery were
 compressed into one adapter poll.  A counter regression, saturation, or
 invalid bound port fails closed.
 
-This checkpoint intentionally leaves Login wiring inert. The production adapter
-must apply each returned transition in order and reannounce it to every live
-scheduler connection.  It must also recreate a supervisor with an incremented
-attempt for each sidecar incarnation, retain the shared launch-identity
-allocator across controller recreation, and retain the checked cumulative
-post-READY-exit count.
+The production adapter applies each returned transition in order and
+reannounces it to every live scheduler connection. It recreates a supervisor
+with an incremented attempt for each sidecar incarnation, retains the shared
+launch-identity allocator across controller recreation, and retains the checked
+cumulative post-READY-exit count.

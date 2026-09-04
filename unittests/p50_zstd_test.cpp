@@ -52,8 +52,7 @@ TxBegin describe_modified_body(TxBegin begin,
                                std::span<const uint8_t> body) {
     begin.body = describe_component(kZstdTuBodyEncoding, body,
                                     begin.raw_bytes);
-    begin.transaction_digest = compute_transaction_digest(
-        begin, std::span<const uint8_t>{}, body);
+    begin.transaction_digest = compute_transaction_digest(begin, body);
     return begin;
 }
 
@@ -83,10 +82,8 @@ void test_round_trip_and_persistent_dialogue() {
     const std::vector<uint8_t> input = sample_input();
     const ZstdTuEnvelope first = encode_zstd_tu(
         HistoryNonce{10}, RelSeq{0}, TuSeq{20}, icecc::digest128("pre"), input);
-    require(first.begin.profile == ProfileId::ZSTD_TU &&
-                first.begin.p29_root_mode == P29RootMode::NotApplicable &&
-                first.begin.dict.encoded_bytes == 0 && !first.body.empty(),
-            "encoder did not produce canonical ZSTD_TU components");
+    require(first.begin.profile == ProfileId::ZSTD_TU && !first.body.empty(),
+            "encoder did not produce a canonical ZSTD_TU BODY");
     require(decode_zstd_tu(first.begin, first.body, limits()) == input,
             "direct ZSTD_TU decode changed exact input");
 
@@ -197,26 +194,25 @@ void test_digest_and_shape_gates() {
     TxBegin wrong_raw = envelope.begin;
     wrong_raw.raw_digest = icecc::digest128("wrong raw");
     wrong_raw.transaction_digest = compute_transaction_digest(
-        wrong_raw, std::span<const uint8_t>{}, envelope.body);
+        wrong_raw, envelope.body);
     require_throws<std::invalid_argument>(
         [&] { (void)decode_zstd_tu(wrong_raw, envelope.body, limits()); },
         "raw digest mismatch was accepted");
 
-    TxBegin nonempty_dict = envelope.begin;
-    const std::array<uint8_t, 1> byte{7};
-    nonempty_dict.dict = describe_component(1, byte, 1);
-    nonempty_dict.transaction_digest = compute_transaction_digest(
-        nonempty_dict, byte, envelope.body);
+    TxBegin wrong_encoding = envelope.begin;
+    wrong_encoding.body.encoding = kZstdRouteBodyEncoding;
+    wrong_encoding.transaction_digest = compute_transaction_digest(
+        wrong_encoding, envelope.body);
     require_throws<std::invalid_argument>(
         [&] {
-            (void)decode_zstd_tu(nonempty_dict, envelope.body, limits());
+            (void)decode_zstd_tu(wrong_encoding, envelope.body, limits());
         },
-        "ZSTD_TU accepted a nonempty DICT");
+        "ZSTD_TU accepted another profile's BODY encoding");
 
     TxBegin terminal_rel = envelope.begin;
     terminal_rel.rel_seq = {std::numeric_limits<uint64_t>::max()};
     terminal_rel.transaction_digest = compute_transaction_digest(
-        terminal_rel, std::span<const uint8_t>{}, envelope.body);
+        terminal_rel, envelope.body);
     require_throws<std::overflow_error>(
         [&] { (void)decode_zstd_tu(terminal_rel, envelope.body, limits()); },
         "ZSTD_TU accepted terminal REL_SEQ");
@@ -246,7 +242,7 @@ void test_caps_and_terminal_dialogue_errors() {
         "zero encoded cap was accepted");
 
     {
-        ZstdTuDialogue dialogue(profile_bit(ProfileId::P29), limits());
+        ZstdTuDialogue dialogue(profile_bit(ProfileId::P29V1), limits());
         require_throws<std::invalid_argument>([&] { dialogue.begin(envelope.begin); },
                                               "unnegotiated ZSTD_TU began");
         require(dialogue.terminal(), "unnegotiated profile was not terminal");
@@ -284,14 +280,6 @@ void test_caps_and_terminal_dialogue_errors() {
             [&] { dialogue.append_body(BodyMessage{}); },
             "extra empty BODY after closure was accepted");
         require(dialogue.terminal(), "post-closure BODY was not terminal");
-    }
-    {
-        ZstdTuDialogue dialogue(profile_bit(ProfileId::ZSTD_TU), limits());
-        dialogue.begin(envelope.begin);
-        require_throws<std::invalid_argument>(
-            [&] { dialogue.append_dict(DictMessage{}); },
-            "DICT after canonical empty closure was accepted");
-        require(dialogue.terminal(), "unexpected DICT was not terminal");
     }
     {
         ZstdTuDialogue dialogue(profile_bit(ProfileId::ZSTD_TU), limits());

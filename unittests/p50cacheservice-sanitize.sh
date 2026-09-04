@@ -42,7 +42,7 @@ fi
 
 "$cxx" "$standard" $cxxflags $cppflags \
     $boost_cppflags ${ICECC_TEST_LIBZSTD_CFLAGS:-} \
-    ${ICECC_TEST_LIBBSC_CFLAGS:-} ${ICECC_TEST_XXHASH_CFLAGS:-} \
+    ${ICECC_TEST_XXHASH_CFLAGS:-} \
     -Wall -Wextra -Wpedantic -Werror -Wno-mismatched-new-delete -pthread \
     -DICECC_P50_CACHE_SERVICE_NO_MAIN -DICECC_P50_ENDPOINT_TEST_HOOKS \
     -fsanitize=address,undefined,leak \
@@ -62,7 +62,7 @@ fi
     "$build_dir/../cache/libp50localtransport.a" \
     "$build_dir/../services/.libs/libicecc.a" \
     $dep_ldflags ${ICECC_TEST_LIBZSTD_LIBS:--lzstd} \
-    ${ICECC_TEST_LIBBSC_LIBS:-} ${ICECC_TEST_XXHASH_LIBS:--lxxhash} \
+    ${ICECC_TEST_XXHASH_LIBS:--lxxhash} \
     ${ICECC_TEST_LIBCAP_NG_LIBS:-} $boost_libs $lzo_lib -ldl $libs \
     -o "$binary"
 

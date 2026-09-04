@@ -20,7 +20,8 @@ void require(bool value, std::string_view message) {
 }
 
 template <class Callable>
-void require_error(Callable&& callable, ErrorCode expected, std::string_view message) {
+void require_error(Callable&& callable, s3::ErrorCode expected,
+                   std::string_view message) {
     try {
         callable();
     } catch (const PersistenceError& error) {
@@ -59,7 +60,7 @@ void state_machine_and_retry_reclaims_staging() {
 
     const auto retry = core.begin_install(id, "k", payload);
     core.publish(retry.ticket);
-    require_error([&] { core.publish(install.ticket); }, ErrorCode::InvalidInstall,
+    require_error([&] { core.publish(install.ticket); }, s3::ErrorCode::InvalidInstall,
                   "a crashed install ticket was accepted after retry");
     require(core.find(id, "k")->state == ObjectState::Present,
             "INSTALLING did not transition to PRESENT");
@@ -88,10 +89,10 @@ void immutable_conflict_is_sticky_and_same_content_is_idempotent() {
     const auto duplicate = core.begin_install(id, "same-key", first);
     require(duplicate.already_present, "same immutable content was not idempotent");
     require_error([&] { (void)core.begin_install(id, "same-key", second); },
-                  ErrorCode::ContentConflict,
+                  s3::ErrorCode::ContentConflict,
                   "same-key/different-content was not rejected fatally");
     require(core.terminal(), "content conflict did not enter terminal state");
-    require_error([&] { core.touch(id); }, ErrorCode::Terminal,
+    require_error([&] { core.touch(id); }, s3::ErrorCode::Terminal,
                   "terminal conflict allowed a later mutation");
     const auto view = core.find(id, "same-key");
     require(view && view->payload == first, "conflict modified immutable content");
@@ -137,7 +138,8 @@ void whole_namespace_global_lru_evicts_only_idle_namespace() {
     blocked.publish(blocked.begin_install(pinned, "p", bytes("22")).ticket);
     blocked.pin(pinned, "p");
     const auto candidate = blocked.begin_install(resident, "candidate", bytes("33"));
-    require_error([&] { blocked.publish(candidate.ticket); }, ErrorCode::CapacityExceeded,
+    require_error([&] { blocked.publish(candidate.ticket); },
+                  s3::ErrorCode::CapacityExceeded,
                   "pinned namespace was used as an eviction victim");
     require(blocked.find(pinned, "p")->state == ObjectState::Pinned,
             "failed capacity check changed pinned state");
@@ -162,7 +164,7 @@ void generation_is_part_of_arena_identity() {
 void invalid_namespace_and_atomic_capacity_failure_are_rejected() {
     PersistenceCore invalid;
     require_error([&] { invalid.admit(NamespaceId{}); },
-                  ErrorCode::InvalidTransition,
+                  s3::ErrorCode::InvalidTransition,
                   "zero C_GUID namespace was admitted");
 
     PersistenceCore core(Limits{3, 3, 16, 16});
@@ -177,7 +179,7 @@ void invalid_namespace_and_atomic_capacity_failure_are_rejected() {
     core.admit(incoming);
     const auto candidate = core.begin_install(incoming, "incoming", bytes("333"));
     require_error([&] { core.publish(candidate.ticket); },
-                  ErrorCode::CapacityExceeded,
+                  s3::ErrorCode::CapacityExceeded,
                   "insufficient global capacity was accepted");
     require(core.has_namespace(first) && core.has_namespace(second),
             "failed capacity preflight evicted a namespace partially");

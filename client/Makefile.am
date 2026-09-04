@@ -24,7 +24,7 @@ icecc_LDADD = \
 	../cache/libp50adoptedoutcomewriter.a \
 	../cache/libprotocol50.a \
 	../services/libicecc.la \
-	$(LIBZSTD_LIBS) $(LIBBSC_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
+	$(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 icecc_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 icecc_CXXFLAGS = -pthread
 icecc_LDFLAGS = $(BOOST_LDFLAGS) -pthread
@@ -44,7 +44,7 @@ libclient_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 libp50zstdsender_a_SOURCES = p50_zstd_sender.cpp p50_zstd_sender.h \
 	p50_route_owner.cpp p50_route_owner.h \
 	p50_compile_binding.cpp p50_compile_binding.h
-libp50zstdsender_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS) $(LIBBSC_CFLAGS)
+libp50zstdsender_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 
 EXTRA_DIST = $(bin_SCRIPTS) P50_ZSTD_SENDER.md
 

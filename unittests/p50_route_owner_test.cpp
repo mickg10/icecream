@@ -25,7 +25,7 @@ void check(bool value, const char* expression) {
 
 #define CHECK(expression) check((expression), #expression)
 
-P50RouteOwnerConfig config(ProfileId profile = ProfileId::Z3_LONG) {
+P50RouteOwnerConfig config(ProfileId profile = ProfileId::ZSTD_ROUTE) {
     P50RouteOwnerConfig result;
     result.endpoint_caps.profile = profile;
     result.endpoint_caps.supported_profiles = kOperationalProfileMask;
@@ -36,7 +36,7 @@ P50RouteOwnerConfig config(ProfileId profile = ProfileId::Z3_LONG) {
 }
 
 P50RouteRelationship relationship(uint64_t c, uint64_t f, uint64_t generation,
-                                  ProfileId profile = ProfileId::Z3_LONG) {
+                                  ProfileId profile = ProfileId::ZSTD_ROUTE) {
     return P50RouteRelationship{Id128::from_u64(c), Id128::from_u64(f), generation,
                                 profile};
 }
@@ -49,7 +49,7 @@ void test_source_transfer_operation_wire() {
     arm.selected_f_host = "127.0.0.1";
     arm.selected_f_ordinary_port = 8765;
     arm.selected_f_cache_port = 8766;
-    arm.cache_protocol = CACHE_WIRE_PROTOCOL_V1;
+    arm.cache_protocol = CACHE_WIRE_REVISION;
     arm.cache_profile = CACHE_PROFILE_ZSTD_ROUTE;
     arm.logical_job = 5;
     arm.compiler_attempt = 6;
@@ -113,22 +113,22 @@ ZstdSourceTransferResult route_call(
 void test_same_request_route_fork_wire() {
     P50PreparationAuthority authority(
         Id128::from_u64(190), config().endpoint_caps.zstd,
-        config().authority_limits, config().compression_level, ProfileId::P29);
-    const PreparationRouteKey route0{Id128::from_u64(290), 1, ProfileId::P29};
-    const PreparationRouteKey route1{Id128::from_u64(291), 1, ProfileId::P29};
+        config().authority_limits, config().compression_level, ProfileId::P29V1);
+    const PreparationRouteKey route0{Id128::from_u64(290), 1, ProfileId::P29V1};
+    const PreparationRouteKey route1{Id128::from_u64(291), 1, ProfileId::P29V1};
     const PrepareRequestKey fork_request{7900, 1};
     const std::vector<uint8_t> source{'f', 'o', 'r', 'k', '\n'};
     const auto h0 = authority.prepare_for_route(route0, fork_request, source);
     const auto h1 = authority.prepare_for_route(route1, fork_request, source);
     CHECK(authority.prepared_tu_seq(h0).value == authority.prepared_tu_seq(h1).value);
-    CHECK(authority.prepared_profile(h0) == ProfileId::P29);
-    CHECK(authority.prepared_profile(h1) == ProfileId::P29);
+    CHECK(authority.prepared_profile(h0) == ProfileId::P29V1);
+    CHECK(authority.prepared_profile(h1) == ProfileId::P29V1);
 
     asio::io_context context;
     tcp::acceptor acceptor0(context, {asio::ip::address_v4::loopback(), 0});
     tcp::acceptor acceptor1(context, {asio::ip::address_v4::loopback(), 0});
     EndpointCaps server_caps;
-    server_caps.profile = ProfileId::P29;
+    server_caps.profile = ProfileId::P29V1;
     server_caps.supported_profiles = kOperationalProfileMask;
     server_caps.zstd = config().endpoint_caps.zstd;
     const P50ServerEndpointConfig server_config{
@@ -207,7 +207,7 @@ void test_same_request_route_fork_wire() {
 void test_multiroute_release_lifetime() {
     P50PreparationAuthority authority(
         Id128::from_u64(191), config().endpoint_caps.zstd,
-        config().authority_limits, config().compression_level, ProfileId::P29);
+        config().authority_limits, config().compression_level, ProfileId::P29V1);
     const PrepareRequestKey request{7901, 1};
     const std::vector<uint8_t> source{'m', 'u', 'l', 't', 'i', '-', 'r', 'o',
                                       'u', 't', 'e', '\n'};
@@ -217,7 +217,7 @@ void test_multiroute_release_lifetime() {
     handles.reserve(20);
     for (uint64_t index = 0; index != 20; ++index) {
         routes.push_back(
-            {Id128::from_u64(300 + index), 1, ProfileId::P29});
+            {Id128::from_u64(300 + index), 1, ProfileId::P29V1});
         handles.push_back(authority.prepare_for_route(routes.back(), request, source));
         CHECK(authority.prepared_tu_seq(handles.back()).value == 0);
     }
@@ -270,22 +270,28 @@ void test_tu_seq_reservation_and_exhaustion() {
     CHECK(authority.prepared_tu_seq(next).value == 1);
     CHECK(authority.release(next) == 0);
 
-    // P29 builds its residual body before retained-byte admission.  A body
+    // P29V1 builds its body before retained-byte admission. A body
     // that is too large for that admission bound therefore exercises the
     // post-encode rollback path; a smaller retry of the same request still
     // starts at the unconsumed TU0.
     PreparationAuthorityLimits post_limits = config().authority_limits;
-    post_limits.max_retained_encoded_bytes = 512;
+    post_limits.max_retained_encoded_bytes = 64;
     P50PreparationAuthority post_admission(
         Id128::from_u64(194), config().endpoint_caps.zstd, post_limits,
-        config().compression_level, ProfileId::P29);
+        config().compression_level, ProfileId::P29V1);
     const PreparationRouteKey post_route{Id128::from_u64(394), 1,
-                                         ProfileId::P29};
-    incompressible.back() = '\n';
+                                         ProfileId::P29V1};
+    std::vector<uint8_t> p29_many_regions;
+    for (size_t index = 0; index != 256; ++index) {
+        p29_many_regions.push_back('#');
+        p29_many_regions.push_back(' ');
+        p29_many_regions.push_back(static_cast<uint8_t>('A' + index % 26));
+        p29_many_regions.push_back('\n');
+    }
     bool post_admission_failed = false;
     try {
         (void)post_admission.prepare_for_route(
-            post_route, PrepareRequestKey{7904, 1}, incompressible);
+            post_route, PrepareRequestKey{7904, 1}, p29_many_regions);
     } catch (const std::length_error&) {
         post_admission_failed = true;
     }
@@ -308,7 +314,7 @@ void test_tu_seq_reservation_and_exhaustion() {
     const PreparationRouteKey zstd_route{Id128::from_u64(393), 1,
                                          ProfileId::ZSTD_TU};
     const PreparationRouteKey p29_route{Id128::from_u64(394), 1,
-                                        ProfileId::P29};
+                                        ProfileId::P29V1};
     const std::vector<uint8_t> source{'m', 'a', 'x', '\n'};
     const auto max_zstd = exhausted.prepare_for_route(
         zstd_route, PrepareRequestKey{7903, 1}, source);
@@ -436,7 +442,7 @@ void test_long_lived_relationship_owner() {
     const PreparationRouteKey direct_zstd{Id128::from_u64(280), 1,
                                           ProfileId::ZSTD_TU};
     const PreparationRouteKey direct_p29{Id128::from_u64(281), 1,
-                                         ProfileId::P29};
+                                         ProfileId::P29V1};
     const PrepareRequestKey fork_request{7800, 1};
     const auto zstd_view = direct_authority.prepare_for_route(
         direct_zstd, fork_request, first);
@@ -445,7 +451,7 @@ void test_long_lived_relationship_owner() {
     CHECK(direct_authority.prepared_tu_seq(zstd_view).value == 0);
     CHECK(direct_authority.prepared_tu_seq(p29_view).value == 0);
     CHECK(direct_authority.prepared_profile(zstd_view) == ProfileId::ZSTD_TU);
-    CHECK(direct_authority.prepared_profile(p29_view) == ProfileId::P29);
+    CHECK(direct_authority.prepared_profile(p29_view) == ProfileId::P29V1);
     CHECK(direct_authority.live_entry_count() == 2);
     CHECK(!direct_authority.reset_route(direct_zstd));
     CHECK(direct_authority.release(zstd_view) == 0);
@@ -455,11 +461,11 @@ void test_long_lived_relationship_owner() {
     P50PreparationAuthority p29_first_authority(
         Id128::from_u64(181), config().endpoint_caps.zstd,
         config().authority_limits, config().compression_level,
-        ProfileId::P29);
+        ProfileId::P29V1);
     const auto p29_first = p29_first_authority.prepare_for_route(
         direct_p29, {7801, 1}, first);
     CHECK(p29_first_authority.prepared_tu_seq(p29_first).value == 0);
-    CHECK(p29_first_authority.prepared_profile(p29_first) == ProfileId::P29);
+    CHECK(p29_first_authority.prepared_profile(p29_first) == ProfileId::P29V1);
     CHECK(p29_first_authority.release(p29_first) == 0);
     const auto zstd_after_p29 = p29_first_authority.prepare_for_route(
         direct_zstd, {7802, 1}, first);
@@ -498,11 +504,11 @@ void test_relationship_validation() {
     CHECK(owner.owner_count() == 0);
 }
 
-void test_p29_relationship_owner() {
+void test_p29v1_retry_and_reset_owner() {
     asio::io_context context;
     tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
     EndpointCaps server_caps;
-    server_caps.profile = ProfileId::P29;
+    server_caps.profile = ProfileId::P29V1;
     server_caps.supported_profiles = kOperationalProfileMask;
     P50ServerEndpoint server(Id128::from_u64(240), server_caps, nullptr, nullptr,
                              P50ServerEndpointConfig{
@@ -511,8 +517,8 @@ void test_p29_relationship_owner() {
                                                        std::span<const uint8_t>) {
                                      return InputJobState::Open;
                                  }});
-    P50CRouteOwner owner(config(ProfileId::P29));
-    const auto route = relationship(141, 241, 1, ProfileId::P29);
+    P50CRouteOwner owner(config(ProfileId::P29V1));
+    const auto route = relationship(141, 241, 1, ProfileId::P29V1);
     const std::vector<uint8_t> repeated{'p', '2', '9', '\n', 'p', '2', '9', '\n'};
 
     auto first = route_call(context, owner, server, acceptor, route, {7101, 1}, repeated);
@@ -546,7 +552,7 @@ void test_p29_relationship_owner() {
     // A different F relationship in the same C store has an independent route
     // but shares TU_SEQ; an unsupported profile fails closed without allocating
     // an owner.  Different-C rejection is covered above without an accept.
-    const auto different = relationship(141, 242, 1, ProfileId::P29);
+    const auto different = relationship(141, 242, 1, ProfileId::P29V1);
     server.reset_store(Id128::from_u64(242));
     auto isolated = route_call(context, owner, server, acceptor, different,
                                {7102, 1}, repeated);
@@ -562,12 +568,12 @@ void test_p29_relationship_owner() {
     context.run();
     CHECK(rejected.get().status == ZstdSourceTransferStatus::InvalidRequest);
 
-    // Resetting the F generation drops both P29 route views; the replacement
+    // Resetting the F generation drops both P29V1 route views; the replacement
     // starts fresh route history without rewinding TU_SEQ.
     owner.reset_f_store(Id128::from_u64(241), 2);
     CHECK(owner.owner_count() == 1);
     server.reset_store(Id128::from_u64(243));
-    const auto replacement = relationship(141, 243, 2, ProfileId::P29);
+    const auto replacement = relationship(141, 243, 2, ProfileId::P29V1);
     auto reset = route_call(context, owner, server, acceptor, replacement,
                             {7104, 1}, repeated);
     CHECK(reset.status == ZstdSourceTransferStatus::Committed);
@@ -611,36 +617,6 @@ void test_p29v1_relationship_owner() {
     CHECK(owner.owner_count() == 1 && owner.owns(route));
 }
 
-#if defined(ICECC_P50_WITH_LIBBSC)
-void test_grz_relationship_owner() {
-    asio::io_context context;
-    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
-    EndpointCaps server_caps;
-    server_caps.profile = ProfileId::GRZ;
-    server_caps.supported_profiles = kOperationalProfileMask;
-    P50ServerEndpoint server(Id128::from_u64(250), server_caps, nullptr, nullptr,
-                             P50ServerEndpointConfig{
-                                 .input_job_state = [](CStoreGuid, const TxBegin&,
-                                                       const TxCommit&,
-                                                       std::span<const uint8_t>) {
-                                     return InputJobState::Open;
-                                 }});
-    P50CRouteOwner owner(config(ProfileId::GRZ));
-    const auto route = relationship(151, 251, 1, ProfileId::GRZ);
-    const std::vector<uint8_t> first{'g', 'r', 'z', '-', 't', 'u', '0', '\n'};
-    const std::vector<uint8_t> second{'g', 'r', 'z', '-', 't', 'u', '1', '\n'};
-
-    auto first_result = route_call(context, owner, server, acceptor, route,
-                                   {7201, 1}, first);
-    CHECK(first_result.status == ZstdSourceTransferStatus::Committed);
-    CHECK(first_result.committed_input->tu_seq.value == 0);
-    auto second_result = route_call(context, owner, server, acceptor, route,
-                                    {7201, 2}, second);
-    CHECK(second_result.status == ZstdSourceTransferStatus::Committed);
-    CHECK(second_result.committed_input->tu_seq.value == 1);
-}
-#endif
-
 }  // namespace
 
 int main() {
@@ -650,9 +626,6 @@ int main() {
     test_multiroute_release_lifetime();
     test_tu_seq_reservation_and_exhaustion();
     test_relationship_validation();
-    test_p29_relationship_owner();
+    test_p29v1_retry_and_reset_owner();
     test_p29v1_relationship_owner();
-#if defined(ICECC_P50_WITH_LIBBSC)
-    test_grz_relationship_owner();
-#endif
 }

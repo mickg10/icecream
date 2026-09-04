@@ -1,6 +1,7 @@
 #pragma once
 
 #include "capability/grouprlz/p29_online_s1.h"
+#include "services/digest128.h"
 
 #include <zstd.h>
 
@@ -1441,7 +1442,8 @@ public:
   }
 
   [[nodiscard]] std::span<const std::uint8_t>
-  receive_fill(std::span<const std::uint8_t> fill, bool close_entropy = false) {
+  receive_fill(std::span<const std::uint8_t> fill, bool close_entropy = false,
+               std::size_t expected_materialized_bytes = 0) {
 #if defined(ICECC_P50SIM_ALLOCATION_COUNTER)
     p29_wire_detail::P29AllocationScope allocation_scope(
         p29_wire_detail::P29AllocationEntry::ReceiverReceiveFill);
@@ -1449,7 +1451,14 @@ public:
     require_pending();
     if (pending_.fill_ready)
       fail("P29 deserializer received FILL twice");
+    if (expected_materialized_bytes > provider_.wire_limits().max_tu_bytes)
+      fail("P29 expected materialization exceeds provider TU limit");
+    if (expected_materialized_bytes > pending_.materialized.capacity())
+      pending_.materialized.reserve(expected_materialized_bytes);
     parse_fill(fill, close_entropy);
+    if (expected_materialized_bytes != 0 &&
+        pending_.materialized.size() != expected_materialized_bytes)
+      fail("P29 materialized TU differs from its expected length");
     pending_.fill_ready = true;
     pending_.close_entropy = close_entropy;
     p29_wire_detail::append_frame(pending_.close, P29WireKind::TuEnd, {});
@@ -1513,6 +1522,13 @@ public:
     if (!pending_.fill_ready)
       fail("P29 segment observation precedes FILL");
     return pending_.region_data;
+  }
+
+  [[nodiscard]] Digest128 pending_segment_digest() const {
+    require_pending();
+    if (!pending_.fill_ready)
+      fail("P29 segment digest observation precedes FILL");
+    return pending_.segment_digest;
   }
 
   void commit() {
@@ -1685,6 +1701,7 @@ private:
     std::unordered_map<std::string, std::uint32_t> new_path_ids;
     std::vector<StagedRegion> regions;
     std::vector<std::uint8_t> region_data;
+    Digest128 segment_digest{};
     std::unordered_map<std::uint32_t, std::size_t> region_index;
     std::vector<P29MixedFLineView> public_lines;
     std::vector<std::uint32_t> occurrences;
@@ -1730,6 +1747,7 @@ private:
     pending_.new_path_ids.clear();
     pending_.regions.clear();
     pending_.region_data.clear();
+    pending_.segment_digest = {};
     pending_.region_index.clear();
     pending_.public_lines.clear();
     pending_.occurrences.clear();
@@ -2044,6 +2062,7 @@ private:
     }
     Cursor control(control_raw);
     Cursor literal(literal_raw);
+    Digest128Builder segment_digest;
     if (control.varint() != pending_.missing_regions.size())
       fail("P29 mixed Region count differs");
     const P29WireLimits limits = provider_.wire_limits();
@@ -2204,11 +2223,18 @@ private:
         if (pending_.region_data.size() > region_end)
           fail("P29 mixed Region overruns its declared length");
       }
+      if (region.length != 0)
+        segment_digest.append(
+            std::span<const std::uint8_t>(pending_.region_data)
+                .subspan(region.offset, region.length));
       pending_.region_index.emplace(id, pending_.regions.size());
       pending_.regions.push_back(std::move(region));
     }
     if (!control.empty() || !literal.empty())
       fail("P29 mixed Region streams have trailing bytes");
+    pending_.segment_digest = pending_.region_data.empty()
+                                  ? Digest128{}
+                                  : segment_digest.finish();
   }
 
   void materialize() {

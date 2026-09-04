@@ -89,9 +89,6 @@ assert [row["rel_seq"] for row in rows] == [0] * 20
 assert len({row["state_digest"] for row in rows}) == 20
 PY
 
-ICECC_P50_PROFILE=P29 "$sim" --batch-manifest "$work/manifest" \
-    --batch-assignment-map "$work/map1" --batch-output "$work/p29.jsonl"
-test "$(wc -l < "$work/p29.jsonl")" -eq 2
 ICECC_P50_PROFILE=P29V1 "$sim" --batch-manifest "$work/manifest" \
     --batch-assignment-map "$work/map1" --batch-output "$work/p29v1.jsonl" \
     --p29-fingerprint-cache-directory "$work/fingerprint-cache" \
@@ -108,7 +105,7 @@ assert rows[1]["state_before_digest"] == rows[0]["state_digest"]
 assert all(row["p29v1_interner_reserved_bytes"] > 0 and
            row["p29v1_interner_committed_bytes"] > 0
            for row in rows)
-assert all(row["negotiated_profile_mask"] == 32 and
+assert all(row["negotiated_profile_mask"] == 1 and
            row["system_source_reuse"] is True for row in rows)
 def frames(path):
     data = open(path, "rb").read()
@@ -180,24 +177,6 @@ test "$(sha256sum "$work/phase0.cf" | awk '{print $1}')" = \
     ebaa60acf1abfd2afbbf7892927479680df1ada2fada9edeea5613fba16a828b
 test "$(sha256sum "$work/phase0.fc" | awk '{print $1}')" = \
     83616f1cf7f130ebdc6b6303d2dd3ceb6bfc20ed0f5d1dd513f2c41f8ddf8960
-if ICECC_P50_PROFILE=GRZ_RESIDUAL "$sim" --batch-manifest "$work/manifest" \
-       --batch-assignment-map "$work/map1" --batch-output "$work/grz.jsonl" 2>"$work/grz.err"; then
-    test "$(wc -l < "$work/grz.jsonl")" -eq 2
-    grz_available=1
-    ICECC_P50_PROFILE=GRZ_RESIDUAL "$sim" --batch-manifest "$work/manifest20" \
-        --batch-assignment-map "$work/map20" --batch-output "$work/grz20.jsonl"
-    python3 - "$work/grz20.jsonl" <<'PY'
-import json, sys
-rows = [json.loads(line) for line in open(sys.argv[1])]
-assert len(rows) == 20
-assert [row["tu_seq"] for row in rows] == list(range(20))
-assert [row["rel_seq"] for row in rows] == [0] * 20
-PY
-else
-    grz_available=0
-    grep -q 'requires a simulator built with --with-libbsc' "$work/grz.err"
-fi
-
 ICECC_P50_PROFILE=ZSTD_ROUTE "$sim" --batch-manifest "$work/manifest" \
     --batch-assignment-map "$work/map1" --batch-manifest-2 "$work/manifest" \
     --batch-assignment-map-2 "$work/map1" --batch-output "$work/pair.jsonl"
@@ -243,18 +222,6 @@ ICECC_P50_PROFILE=ZSTD_TU "$sim" --batch-manifest "$work/retention.manifest" \
     --batch-assignment-map "$work/retention.map" --batch-output "$work/retention.jsonl"
 test "$(wc -l < "$work/retention.jsonl")" -eq 4097
 
-ICECC_P50_PROFILE=P29 "$sim" --batch-manifest "$work/manifest" \
-    --batch-assignment-map "$work/map1" --batch-manifest-2 "$work/manifest" \
-    --batch-assignment-map-2 "$work/map1" --batch-output "$work/p29-pair.jsonl"
-python3 - "$work/p29-pair.jsonl" <<'PY'
-import json, sys
-rows = [json.loads(line) for line in open(sys.argv[1])]
-assert [row["segment"] for row in rows] == ["full-1", "full-1", "full-2", "full-2"]
-assert rows[2]["tu_seq"] == 2
-assert rows[2]["state_before_digest"] == rows[1]["state_digest"]
-assert rows[3]["state_before_digest"] == rows[2]["state_digest"]
-PY
-
 ICECC_P50_PROFILE=ZSTD_ROUTE "$sim" --batch-manifest "$work/manifest" \
     --batch-assignment-map "$work/map1" --batch-manifest-2 "$work/manifest" \
     --batch-assignment-map-2 "$work/map1" --batch-manifest-3 "$work/manifest" \
@@ -267,61 +234,3 @@ assert [row["segment"] for row in rows] == [
 assert rows[2]["state_before_digest"] == rows[1]["state_digest"]
 assert rows[4]["state_before_digest"] == rows[3]["state_digest"]
 PY
-
-# Real-input GRZ_RESIDUAL long control (finding F12).  The C1F1 Full-1 GRZ
-# arm at e58ed450 failed in the allocator while committing row 339 of 2,498
-# although every short control stayed silent, so a bounded real-input replay
-# is retained here as an opt-in gate.  Supply an authenticated C1F1 full-1
-# manifest.json (P50SIM_GRZ_REAL_MANIFEST); the first N selected inputs
-# (P50SIM_GRZ_REAL_ROWS, default 341 so the control passes the failing row)
-# are replayed through GRZ_RESIDUAL on one relationship and must produce a
-# clean exit with exactly N rows.  P50SIM_GRZ_REAL_EXPECTED names retained
-# rows (native-output.jsonl) that every replayed row must match field by
-# field; P50SIM_GRZ_REAL_DETERMINISM=1 replays the manifest a second time and
-# requires the two row streams to be identical in every content field.
-if [ -n "${P50SIM_GRZ_REAL_MANIFEST:-}" ] && [ "$grz_available" = 1 ]; then
-    real_rows=${P50SIM_GRZ_REAL_ROWS:-341}
-    python3 - "$P50SIM_GRZ_REAL_MANIFEST" "$real_rows" "$work/real.manifest" "$work/real.map" <<'PY'
-import json, os, sys
-manifest = json.load(open(sys.argv[1]))
-authority = manifest["input_authority"]
-root = authority.get("corpus_root", "")
-rows = int(sys.argv[2])
-selected = authority["selected_inputs"][:rows]
-if len(selected) != rows:
-    raise SystemExit("manifest has only %d selected inputs" % len(selected))
-paths = [os.path.join(root, entry["source_relative"]) for entry in selected]
-missing = [path for path in paths if not os.path.isfile(path)]
-if missing:
-    raise SystemExit("missing input " + missing[0])
-open(sys.argv[3], "w").write("".join(path + "\n" for path in paths))
-open(sys.argv[4], "w").write("cardinality=1\n" + "".join("0\n" for _ in paths))
-PY
-    ICECC_P50_PROFILE=GRZ_RESIDUAL "$sim" --batch-manifest "$work/real.manifest" \
-        --batch-assignment-map "$work/real.map" --batch-allow-repeated-inputs 1 \
-        --batch-output "$work/real-grz.jsonl"
-    test "$(wc -l < "$work/real-grz.jsonl")" -eq "$real_rows"
-    real_compare() {
-        python3 - "$1" "$2" <<'PY'
-import json, sys
-expected = [json.loads(line) for line in open(sys.argv[1])]
-got = [json.loads(line) for line in open(sys.argv[2])]
-fields = ("tu_seq", "rel_seq", "raw_bytes", "raw_digest", "encoded_source_bytes",
-          "c_to_f_bytes", "f_to_c_bytes", "state_before_digest", "state_digest",
-          "transaction_digest")
-for index, (want, have) in enumerate(zip(expected, got)):
-    for field in fields:
-        assert have.get(field) == want.get(field), (index, field, want.get(field), have.get(field))
-PY
-    }
-    if [ -n "${P50SIM_GRZ_REAL_EXPECTED:-}" ]; then
-        real_compare "$P50SIM_GRZ_REAL_EXPECTED" "$work/real-grz.jsonl"
-    fi
-    if [ "${P50SIM_GRZ_REAL_DETERMINISM:-0}" = 1 ]; then
-        ICECC_P50_PROFILE=GRZ_RESIDUAL "$sim" --batch-manifest "$work/real.manifest" \
-            --batch-assignment-map "$work/real.map" --batch-allow-repeated-inputs 1 \
-            --batch-output "$work/real-grz-2.jsonl"
-        test "$(wc -l < "$work/real-grz-2.jsonl")" -eq "$real_rows"
-        real_compare "$work/real-grz.jsonl" "$work/real-grz-2.jsonl"
-    fi
-fi

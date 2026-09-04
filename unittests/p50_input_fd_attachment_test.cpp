@@ -50,14 +50,12 @@ Transaction transaction_for(TuSeq tu_seq, std::span<const uint8_t> input) {
     begin.rel_seq = RelSeq{2};
     begin.tu_seq = tu_seq;
     begin.profile = ProfileId::ZSTD_TU;
-    begin.p29_root_mode = P29RootMode::NotApplicable;
     begin.pre_state_digest = icecc::digest128("input-fd-pre-state");
-    begin.dict = describe_component(0, std::span<const uint8_t>{}, 0);
-    begin.body = describe_component(1, body, input.size());
+    begin.body = describe_component(
+        static_cast<uint16_t>(ProfileId::ZSTD_TU), body, input.size());
     begin.raw_bytes = input.size();
     begin.raw_digest = icecc::digest128(input);
-    begin.transaction_digest = compute_transaction_digest(
-        begin, std::span<const uint8_t>{}, body);
+    begin.transaction_digest = compute_transaction_digest(begin, body);
     TxCommit commit{
         begin.history_nonce,
         begin.rel_seq,
@@ -196,9 +194,8 @@ int main() {
         socket_path, InputFdRequest{identity, missing, owner, 3}, peer,
         std::chrono::steady_clock::now() + std::chrono::seconds(5));
     require(!missing_result.fd.valid() &&
-                (missing_result.status == InputFdAttachmentStatus::Disconnected ||
-                 missing_result.status == InputFdAttachmentStatus::UnknownRecord),
-            "missing record did not fail closed");
+                missing_result.status == InputFdAttachmentStatus::UnknownRecord,
+            "missing record did not return its authenticated typed refusal");
 
     InputFdAttachmentResult slow = InputFdAttachmentClient::attach(
         socket_path, InputFdRequest{identity, key, owner, 4}, peer,

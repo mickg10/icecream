@@ -79,13 +79,9 @@ contract() {
     # Every supported selector must remain a live S7 profile cell.  The
     # runner maps the wire-level capability spelling separately from the
     # positive profile marker emitted by the client.
-    require_text "$root/unittests/p50compilee2e-run.sh" 'P29) profile_advertisement=p29' || return 1
-    require_text "$root/unittests/p50compilee2e-run.sh" 'GRZ|GRZ_RESIDUAL)' || return 1
-    require_text "$root/unittests/p50compilee2e-run.sh" 'ICECC_P50_WITH_LIBBSC' || return 1
-    require_text "$root/unittests/p50compilee2e-run.sh" \
-        'requires a product build configured with libbsc' || return 1
-    require_text "$root/unittests/p50compilee2e-run.sh" \
-        'profile_advertisement=grz' || return 1
+    require_text "$root/unittests/p50compilee2e-run.sh" 'P29V1) profile_advertisement=p29v1' || return 1
+    require_text "$root/unittests/p50compilee2e-run.sh" 'ZSTD_TU) profile_advertisement=zstd_tu' || return 1
+    require_text "$root/unittests/p50compilee2e-run.sh" 'ZSTD_ROUTE) profile_advertisement=zstd_route' || return 1
     require_text "$root/unittests/p50compilee2e-run.sh" 'profile_advertisement' || return 1
     # S2's process-loss gate must stop the exact F sidecar only after its
     # complete TX_BEGIN witness is published, then require the original
@@ -174,11 +170,9 @@ for pair in \
     "unittests/p50compilee2e-run.sh|ICECC_P50_F_ACTION_TRACE=" \
     "unittests/p50compilee2e-run.sh|s7-prewarm-c-action-trace.jsonl" \
     "unittests/p50compilee2e-run.sh|s7-measured-f-action-trace.jsonl" \
-    "unittests/p50compilee2e-run.sh|P29) profile_advertisement=p29" \
-    "unittests/p50compilee2e-run.sh|GRZ|GRZ_RESIDUAL)" \
-    "unittests/p50compilee2e-run.sh|ICECC_P50_WITH_LIBBSC" \
-    "unittests/p50compilee2e-run.sh|requires a product build configured with libbsc" \
-    "unittests/p50compilee2e-run.sh|profile_advertisement=grz" \
+    "unittests/p50compilee2e-run.sh|P29V1) profile_advertisement=p29v1" \
+    "unittests/p50compilee2e-run.sh|ZSTD_TU) profile_advertisement=zstd_tu" \
+    "unittests/p50compilee2e-run.sh|ZSTD_ROUTE) profile_advertisement=zstd_route" \
     "unittests/p50compilee2e-run.sh|profile_advertisement" \
     "cache/p50_actions.cpp|ICECC_P50_TEST_ACTION_HOLD" \
     "cache/p50_actions.cpp|sync_file(fd" \

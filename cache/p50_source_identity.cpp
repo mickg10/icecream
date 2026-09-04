@@ -167,14 +167,23 @@ bool start(Reader& reader, P50SourceWirePhase phase,
 }  // namespace
 
 bool P50SourceArm::valid() const noexcept {
+    const bool source_mode_known =
+        source_mode >= static_cast<uint32_t>(ProfileId::P29V1) &&
+        source_mode <= static_cast<uint32_t>(ProfileId::ZSTD_ROUTE);
+    const uint32_t source_profile_bit =
+        source_mode_known
+            ? profile_bit(static_cast<ProfileId>(source_mode))
+            : 0;
     return wire_job_id != 0 && assignment_epoch != 0 && assignment_nonce != 0 &&
            !selected_f_host.empty() && selected_f_host.size() <= UINT16_MAX &&
            selected_f_ordinary_port != 0 &&
            selected_f_ordinary_port <= UINT16_MAX && selected_f_cache_port != 0 &&
-           selected_f_cache_port <= UINT16_MAX && cache_protocol == 50 &&
-           cache_profile != 0 && logical_job != 0 && attempt_id != 0 &&
+           selected_f_cache_port <= UINT16_MAX &&
+           cache_protocol == kP50WireRevision && cache_profile != 0 &&
+           (cache_profile & ~kKnownProfileMask) == 0 && source_mode_known &&
+           cache_profile == source_profile_bit && logical_job != 0 && attempt_id != 0 &&
            c_store_generation != 0 && c_store_guid != CStoreGuid{} &&
-           source_request_id != 0 && source_mode != 0;
+           source_request_id != 0;
 }
 
 bool P50InputReady::valid() const noexcept {

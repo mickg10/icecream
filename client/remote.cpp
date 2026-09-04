@@ -284,38 +284,28 @@ std::optional<uint32_t> p50_profile_wire(
     icecc::p50::ProfileId profile) noexcept
 {
     switch (profile) {
-    case icecc::p50::ProfileId::P29:
-        return CACHE_PROFILE_P29;
     case icecc::p50::ProfileId::P29V1:
         return CACHE_PROFILE_P29V1;
     case icecc::p50::ProfileId::ZSTD_TU:
         return CACHE_PROFILE_ZSTD_TU;
-    case icecc::p50::ProfileId::Z3_LONG:
+    case icecc::p50::ProfileId::ZSTD_ROUTE:
         return CACHE_PROFILE_ZSTD_ROUTE;
-    case icecc::p50::ProfileId::GRZ:
-        return CACHE_PROFILE_GRZ;
-    default:
-        return std::nullopt;
     }
+    return std::nullopt;
 }
 
 std::optional<uint32_t> p50_source_mode_wire(
     icecc::p50::ProfileId profile) noexcept
 {
     switch (profile) {
-    case icecc::p50::ProfileId::P29:
-        return P50_SOURCE_MODE_P29;
     case icecc::p50::ProfileId::P29V1:
         return P50_SOURCE_MODE_P29V1;
     case icecc::p50::ProfileId::ZSTD_TU:
         return P50_SOURCE_MODE_ZSTD_TU;
-    case icecc::p50::ProfileId::Z3_LONG:
+    case icecc::p50::ProfileId::ZSTD_ROUTE:
         return P50_SOURCE_MODE_ZSTD_ROUTE;
-    case icecc::p50::ProfileId::GRZ:
-        return P50_SOURCE_MODE_GRZ_RESIDUAL;
-    default:
-        return std::nullopt;
     }
+    return std::nullopt;
 }
 
 icecc::p50::local::P50SourceTransferResult p50_transfer_error(
@@ -915,22 +905,13 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
             if (selected_p50_profile) {
                 p50_profile = *selected_p50_profile;
                 switch (p50_profile) {
-                case icecc::p50::ProfileId::P29:
-                    p50_profile_name = "P29";
-                    break;
                 case icecc::p50::ProfileId::P29V1:
                     p50_profile_name = "P29V1";
                     break;
-                case icecc::p50::ProfileId::Z3_LONG:
+                case icecc::p50::ProfileId::ZSTD_ROUTE:
                     p50_profile_name = "ZSTD_ROUTE";
                     break;
-                case icecc::p50::ProfileId::GRZ:
-                    p50_profile_name = "GRZ_RESIDUAL";
-                    break;
                 case icecc::p50::ProfileId::ZSTD_TU:
-                    break;
-                case icecc::p50::ProfileId::Z3_SHARED_LONG:
-                    p50_profile_name = "Z3_SHARED_LONG";
                     break;
                 }
             }

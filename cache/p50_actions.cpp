@@ -63,7 +63,6 @@ struct FCheckerState {
     RelSeq next_rel{};
     Digest128 state_digest{};
     std::optional<TxIdentity> pending;
-    bool dict_complete = false;
     bool body_complete = false;
     bool need_recorded = false;
     std::set<Key64> requested;
@@ -82,7 +81,6 @@ struct RelationshipCheckerState {
 
 void clear_f_pending(FCheckerState& state) {
     state.pending.reset();
-    state.dict_complete = false;
     state.body_complete = false;
     state.need_recorded = false;
     state.requested.clear();
@@ -336,7 +334,6 @@ std::string_view action_name(ActionType action) {
     case ActionType::HISTORY_RESET: return "HISTORY_RESET";
     case ActionType::TX_BEGIN: return "TX_BEGIN";
     case ActionType::TX_ABORTED: return "TX_ABORTED";
-    case ActionType::DICT_COMPLETE: return "DICT_COMPLETE";
     case ActionType::BODY_COMPLETE: return "BODY_COMPLETE";
     case ActionType::NEED_RECORDED: return "NEED_RECORDED";
     case ActionType::OBJECT_APPLIED: return "OBJECT_APPLIED";
@@ -530,12 +527,6 @@ std::optional<std::string> check_action_trace(std::span<const ActionRecord> reco
                 return error("C aborted before accepting F's durable commit");
             c.active.reset();
             break;
-        case ActionType::DICT_COMPLETE:
-            if (!current_f_session() || !f.pending ||
-                *f.pending != tx_identity(record) || f.dict_complete)
-                return error("DICT completion does not name F's pending transaction");
-            f.dict_complete = true;
-            break;
         case ActionType::BODY_COMPLETE:
             if (!current_f_session() || !f.pending ||
                 *f.pending != tx_identity(record) || f.body_complete)
@@ -544,9 +535,9 @@ std::optional<std::string> check_action_trace(std::span<const ActionRecord> reco
             break;
         case ActionType::NEED_RECORDED:
             if (!current_f_session() || !f.pending ||
-                *f.pending != tx_identity(record) || !f.dict_complete ||
+                *f.pending != tx_identity(record) || !f.body_complete ||
                 f.need_recorded)
-                return error("NEED was recorded before the exact DICT");
+                return error("NEED was recorded before the exact BODY");
             if (!std::is_sorted(record.need_keys.begin(), record.need_keys.end()) ||
                 std::adjacent_find(record.need_keys.begin(), record.need_keys.end()) !=
                     record.need_keys.end() ||
@@ -579,8 +570,8 @@ std::optional<std::string> check_action_trace(std::span<const ActionRecord> reco
             break;
         case ActionType::INPUT_MATERIALIZED:
             if (!current_f_session() || !f.pending ||
-                *f.pending != tx_identity(record) || !f.dict_complete ||
-                !f.body_complete || !f.need_recorded || !f.remaining.empty() ||
+                *f.pending != tx_identity(record) || !f.body_complete ||
+                (f.need_recorded && !f.remaining.empty()) ||
                 f.materialized)
                 return error("input materialized before all prerequisites completed");
             f.materialized = true;
