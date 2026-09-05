@@ -118,7 +118,9 @@ void append_source_result_trace(
     const local::P50SourceTransferRequest& request,
     CStoreGuid c_store_guid,
     ProfileId profile,
-    const ZstdSourceTransferResult& transfer) noexcept {
+    const ZstdSourceTransferResult& transfer,
+    uint64_t source_mutex_wait_ns,
+    uint64_t source_mutex_service_ns) noexcept {
     const char* path = ::getenv("ICECC_P50_SOURCE_RESULT_TRACE");
     if (path == nullptr || *path == '\0')
         return;
@@ -147,6 +149,8 @@ void append_source_result_trace(
         "\"tu_seq\":%llu,\"raw_bytes\":%llu,"
         "\"raw_digest\":\"%s\","
         "\"c_to_f_bytes\":%llu,\"f_to_c_bytes\":%llu,"
+        "\"source_mutex_wait_ns\":%llu,"
+        "\"source_mutex_service_ns\":%llu,"
         "\"system_source_reuse\":%s}\n",
         static_cast<unsigned long long>(request.wire_job_id),
         static_cast<unsigned long long>(request.logical_job),
@@ -163,7 +167,9 @@ void append_source_result_trace(
         static_cast<unsigned long long>(transfer.raw_bytes),
         raw_digest.c_str(),
         static_cast<unsigned long long>(transfer.c_to_f_bytes),
-        static_cast<unsigned long long>(transfer.f_to_c_bytes), reuse);
+        static_cast<unsigned long long>(transfer.f_to_c_bytes),
+        static_cast<unsigned long long>(source_mutex_wait_ns),
+        static_cast<unsigned long long>(source_mutex_service_ns), reuse);
     if (length <= 0 || static_cast<size_t>(length) >= sizeof(line))
         return;
     const int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC |
@@ -1392,6 +1398,7 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
         return source_transfer_error(1);
 
     const auto transfer_deadline = deadline.as_steady_time_point();
+    const auto source_mutex_wait_start = std::chrono::steady_clock::now();
     std::unique_lock<std::timed_mutex> source_transfer_lock(
         source_transfer_mutex_, std::defer_lock);
     constexpr auto kSourceTransferLockPoll = std::chrono::milliseconds(50);
@@ -1405,6 +1412,15 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                 std::min(transfer_deadline, now + kSourceTransferLockPoll)))
             break;
     }
+    const auto source_mutex_service_start = std::chrono::steady_clock::now();
+    const auto source_mutex_wait_elapsed =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            source_mutex_service_start - source_mutex_wait_start)
+            .count();
+    const uint64_t source_mutex_wait_ns =
+        source_mutex_wait_elapsed > 0
+            ? static_cast<uint64_t>(source_mutex_wait_elapsed)
+            : 0;
     if (stop_requested_.load(std::memory_order_acquire) ||
         std::chrono::steady_clock::now() >= transfer_deadline)
         return source_transfer_error(7);
@@ -1584,7 +1600,8 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
             context_,
             [this, relationship, request, connection, transfer_deadline,
              source_bytes = *source_bytes, completion, route_request,
-             expected_c_guid = config_.c_store_guid]() mutable
+             expected_c_guid = config_.c_store_guid, source_mutex_wait_ns,
+             source_mutex_service_start]() mutable
                 -> asio::awaitable<void> {
                 local::P50SourceTransferResult value = source_transfer_error(4);
                 ZstdSourceTransferResult observed;
@@ -1621,9 +1638,18 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                         true, std::memory_order_release);
                     value = source_transfer_result(observed, expected_c_guid);
                 }
-                append_source_result_trace(request, expected_c_guid,
-                                           relationship.profile,
-                                           observed);
+                const auto source_mutex_service_elapsed =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() -
+                        source_mutex_service_start)
+                        .count();
+                const uint64_t source_mutex_service_ns =
+                    source_mutex_service_elapsed > 0
+                        ? static_cast<uint64_t>(source_mutex_service_elapsed)
+                        : 0;
+                append_source_result_trace(
+                    request, expected_c_guid, relationship.profile, observed,
+                    source_mutex_wait_ns, source_mutex_service_ns);
                 completion->set_value(value);
                 co_return;
             },

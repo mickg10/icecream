@@ -619,6 +619,11 @@ if (source.get("wire_job_id") != first["job_id"] or source.get("status") != 0 or
         source.get("raw_bytes") != first["raw_bytes"] or
         source.get("raw_digest") != first["raw_digest"]):
     raise SystemExit(f"FAIL: C-sidecar committed-source witness does not join the first marker: source={source} first={first}")
+for field in ("source_mutex_wait_ns", "source_mutex_service_ns"):
+    if type(source.get(field)) is not int or source[field] < 0:
+        raise SystemExit(f"FAIL: committed-source mutex timing is invalid for {field}: {source}")
+if source["source_mutex_service_ns"] == 0:
+    raise SystemExit(f"FAIL: committed-source mutex service timing is empty: {source}")
 
 if second.get("record") != "fresh-legacy-local-assignment":
     raise SystemExit(f"FAIL: missing scheduler-local retry record: {second}")

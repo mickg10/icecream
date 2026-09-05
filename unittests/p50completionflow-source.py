@@ -231,9 +231,21 @@ def check_cache_service(source: str) -> None:
     source_trace = section(source, "void append_source_result_trace(",
                            "void append_terminal_lifecycle_test_trace(")
     for token in ("transfer.raw_digest", "digest128_hex",
-                  '"raw_digest\\\":\\\"%s'):
+                  '"raw_digest\\\":\\\"%s',
+                  '"source_mutex_wait_ns\\\":%llu',
+                  '"source_mutex_service_ns\\\":%llu'):
         require(token in source_trace,
                 f"C-side source-result trace omits {token}")
+    transfer = section(source, "SidecarRuntime::transfer_source_on_owner(",
+                       "bool SidecarRuntime::bind_route_endpoint_identity(")
+    ordered(transfer,
+            "const auto source_mutex_wait_start = std::chrono::steady_clock::now();",
+            "source_transfer_lock.try_lock_until(",
+            "const auto source_mutex_service_start = std::chrono::steady_clock::now();",
+            "source_mutex_service_start - source_mutex_wait_start",
+            "std::chrono::steady_clock::now() -\n                        source_mutex_service_start",
+            "append_source_result_trace(",
+            "completion->set_value(value)")
     helper = section(source, "void append_terminal_lifecycle_test_trace(",
                      "volatile sig_atomic_t g_stop_requested")
     for token in ("ICECC_P50_C1F1_REQUIRED",
@@ -415,6 +427,10 @@ def deletion_mutants(files: dict[str, str]) -> None:
         ("cache_service", "c_store_guid=%s", "c_store_guid=deleted"),
         ("cache_service", '"raw_digest\\\":\\\"%s',
          '"raw_digest_deleted\\\":\\\"%s'),
+        ("cache_service", '"source_mutex_wait_ns\\\":%llu',
+         '"source_mutex_wait_deleted\\\":%llu'),
+        ("cache_service", '"source_mutex_service_ns\\\":%llu',
+         '"source_mutex_service_deleted\\\":%llu'),
         ("cache_service", "ICECC_P50_TEST_READY_TRACE", "READY_TRACE_DELETED"),
         ("cache_service", "if (mutated && decision.collect_record)\n                    endpoint_->collect_input_garbage();",
          "if (mutated && decision.collect_record)\n                    collect_deleted();"),
