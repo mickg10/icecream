@@ -73,13 +73,24 @@ static int reserve_port_pair()
     return 0;
 }
 
-static int tcp_connect(int port, int receive_buffer = 0)
+static int tcp_connect(int port, int receive_buffer = 0,
+                       const char *source_address = nullptr)
 {
     const int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     if (receive_buffer > 0) {
         setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
                    &receive_buffer, sizeof(receive_buffer));
+    }
+    if (source_address != nullptr) {
+        sockaddr_in local {};
+        local.sin_family = AF_INET;
+        local.sin_port = 0;
+        if (inet_pton(AF_INET, source_address, &local.sin_addr) != 1 ||
+            bind(fd, reinterpret_cast<sockaddr *>(&local), sizeof(local)) != 0) {
+            close(fd);
+            return -1;
+        }
     }
     sockaddr_in address {};
     address.sin_family = AF_INET;
@@ -174,11 +185,12 @@ static pid_t start_p48_proxy(int scheduler_port, int *proxy_port)
 }
 
 static MsgChannel *connect_scheduler(int port, int timeout_msec = 5000,
-                                     int receive_buffer = 0)
+                                     int receive_buffer = 0,
+                                     const char *source_address = nullptr)
 {
     const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_msec);
     while (Clock::now() < deadline) {
-        int fd = tcp_connect(port, receive_buffer);
+        int fd = tcp_connect(port, receive_buffer, source_address);
         if (fd >= 0) {
             sockaddr_in peer {};
             peer.sin_family = AF_INET;
@@ -310,6 +322,39 @@ static pid_t start_scheduler(const std::string &binary, int port,
     _exit(127);
 }
 
+static pid_t start_cache_routing_scheduler(const std::string &binary, int port,
+                                           const std::string &log_path,
+                                           const char *mode = "advisory")
+{
+    pid_t child = fork();
+    if (child != 0) return child;
+    signal(SIGPIPE, SIG_DFL);
+    setenv("ICECC_TESTS", "1", 1);
+    setenv("ICECC_TEST_JOB_ID_DOMAIN", "64", 1);
+    setenv("ICECC_P50_PROFILE", "P29V1", 1);
+    FILE *log = std::fopen(log_path.c_str(), "w");
+    if (log) {
+        dup2(fileno(log), STDOUT_FILENO);
+        dup2(fileno(log), STDERR_FILENO);
+    }
+    char port_text[16];
+    std::snprintf(port_text, sizeof(port_text), "%d", port);
+    char netname[64];
+    std::snprintf(netname, sizeof(netname), "p50-route-test-%ld-%d",
+                  static_cast<long>(getpid()), port);
+    if (mode) {
+        execl(binary.c_str(), binary.c_str(), "-p", port_text, "-n", netname,
+              "-r", "--assignment-fence-mode", mode,
+              "--max-outstanding-dispatches", "32", "-a", "least_busy",
+              "-vvv", (char *)nullptr);
+    } else {
+        execl(binary.c_str(), binary.c_str(), "-p", port_text, "-n", netname,
+              "-r", "--max-outstanding-dispatches", "32", "-a", "least_busy",
+              "-vvv", (char *)nullptr);
+    }
+    _exit(127);
+}
+
 static bool stop_scheduler(pid_t child)
 {
     kill(child, SIGTERM);
@@ -380,6 +425,25 @@ static bool request_job(MsgChannel *submitter, uint32_t client_id,
     return submitter->send_msg(request);
 }
 
+static bool request_cache_job(MsgChannel *submitter, uint32_t client_id,
+                              const std::string &affinity_host = std::string(),
+                              uint32_t affinity_port = 0,
+                              uint32_t affinity_profiles = 0)
+{
+    GetCSMsg request(
+        Environments { std::make_pair(std::string("x86_64"),
+                                      std::string("p49-test-env")) },
+        "p50-route-test.cpp", CompileJob::Lang_CXX, 1, "x86_64", 0,
+        std::string(), 0, 0, 0);
+    request.client_id = client_id;
+    request.cache_protocol = CACHE_WIRE_REVISION;
+    request.cache_profile_mask = CACHE_ADVERTISABLE_PROFILE_MASK;
+    request.cache_affinity_profile_mask = affinity_profiles;
+    request.cache_affinity_port = affinity_port;
+    request.cache_affinity_host = affinity_host;
+    return submitter->send_msg(request);
+}
+
 /* Forces pick_server's early "user wants to test/prefer one specific
    daemon" path (scheduler.cpp): CompileServer::matches() accepts either the
    Login nodename or the numeric peer address, so the nodename passed to
@@ -393,6 +457,8 @@ static bool request_job_preferring(MsgChannel *submitter, uint32_t client_id,
         "p49-test.cpp", CompileJob::Lang_CXX, 1, "x86_64", 0,
         preferred_host, 0, 0, 0);
     request.client_id = client_id;
+    request.cache_protocol = CACHE_WIRE_REVISION;
+    request.cache_profile_mask = CACHE_ADVERTISABLE_PROFILE_MASK;
     return submitter->send_msg(request);
 }
 
@@ -1332,6 +1398,351 @@ static void run_cache_handoff_identity_bound(const std::string &binary,
             "identity-bound cache-handoff scheduler stopped cleanly");
 }
 
+static void run_cache_routing_preference(const std::string &binary,
+                                         const std::string &directory)
+{
+    const int port = reserve_port_pair();
+    const std::string log = directory + "/cache-routing-preference.log";
+    pid_t scheduler = start_cache_routing_scheduler(binary, port, log);
+    REQUIRE(port != 0 && scheduler > 0,
+            "cache-routing mixed-pool scheduler process launched");
+
+    int worker_a_port = 0;
+    int worker_a_listener = bind_port(0, &worker_a_port);
+    if (worker_a_listener >= 0) listen(worker_a_listener, 16);
+    int cache_a_port = 0;
+    int cache_a_sentinel = bind_port(0, &cache_a_port);
+    if (cache_a_sentinel >= 0) listen(cache_a_sentinel, 4);
+
+    int worker_b_port = 0;
+    int worker_b_listener = bind_port(0, &worker_b_port);
+    if (worker_b_listener >= 0) listen(worker_b_listener, 16);
+    int cache_b_port = 0;
+    int cache_b_sentinel = bind_port(0, &cache_b_port);
+    if (cache_b_sentinel >= 0) listen(cache_b_sentinel, 4);
+
+    int legacy_port = 0;
+    int legacy_listener = bind_port(0, &legacy_port);
+    if (legacy_listener >= 0) listen(legacy_listener, 16);
+
+    ConfCSMsg *configuration = nullptr;
+    MsgChannel *worker_a = login_host(
+        port, "cache-route-a", true, worker_a_port, &configuration,
+        nullptr, 1, 0, static_cast<uint32_t>(cache_a_port),
+        CACHE_WIRE_REVISION, CACHE_PROFILE_P29V1);
+    delete configuration;
+    configuration = nullptr;
+    MsgChannel *worker_b = login_host(
+        port, "cache-route-b", true, worker_b_port, &configuration,
+        nullptr, 1, 0, static_cast<uint32_t>(cache_b_port),
+        CACHE_WIRE_REVISION, CACHE_PROFILE_P29V1);
+    delete configuration;
+    configuration = nullptr;
+    MsgChannel *legacy_worker = login_host(
+        port, "cache-route-legacy", true, legacy_port, &configuration);
+    delete configuration;
+    configuration = nullptr;
+    MsgChannel *submitter = login_host(
+        port, "cache-route-submit", false, 0, &configuration);
+    delete configuration;
+    REQUIRE(worker_a && worker_b && legacy_worker && submitter &&
+                cache_a_sentinel >= 0 && cache_b_sentinel >= 0,
+            "two compatible workers and one legacy worker join the mixed pool");
+
+    REQUIRE(submitter && request_cache_job(
+                submitter, 6099, "127.0.0.1",
+                static_cast<uint32_t>(cache_a_port), CACHE_PROFILE_P29V1),
+            "cache-capable C submits a stale ordinary-port affinity hint");
+    UseCSMsg *stale_port_use = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    MsgChannel *stale_port_worker = stale_port_use &&
+            stale_port_use->port == static_cast<uint32_t>(worker_b_port)
+        ? worker_b : worker_a;
+    AssignPrepareMsg *stale_port_prepare = wait_prepare(stale_port_worker);
+    REQUIRE(stale_port_use && stale_port_prepare &&
+                stale_port_use->port != static_cast<uint32_t>(cache_a_port) &&
+                stale_port_use->hasCacheAdvertisement(),
+            "stale-port affinity falls back immediately to a compatible free worker");
+    if (stale_port_use) {
+        stale_port_worker->send_msg(JobBeginMsg(stale_port_use->job_id, 0));
+        stale_port_worker->send_msg(job_done_for(
+            *stale_port_use, 0, JobDoneMsg::FROM_SERVER));
+    }
+    delete stale_port_use;
+    delete stale_port_prepare;
+
+    REQUIRE(submitter && request_cache_job(
+                submitter, 6100, "127.0.0.1",
+                static_cast<uint32_t>(worker_b_port), CACHE_PROFILE_ZSTD_TU),
+            "cache-capable C submits an affinity hint for a non-selected profile");
+    UseCSMsg *wrong_profile_use = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    MsgChannel *wrong_profile_worker = wrong_profile_use &&
+            wrong_profile_use->port == static_cast<uint32_t>(worker_b_port)
+        ? worker_b : worker_a;
+    AssignPrepareMsg *wrong_profile_prepare = wait_prepare(wrong_profile_worker);
+    REQUIRE(wrong_profile_use && wrong_profile_prepare &&
+                wrong_profile_use->cache_profile_mask == CACHE_PROFILE_P29V1,
+            "profile-mismatched affinity falls back immediately without changing the selected profile");
+    if (wrong_profile_use) {
+        wrong_profile_worker->send_msg(JobBeginMsg(wrong_profile_use->job_id, 0));
+        wrong_profile_worker->send_msg(job_done_for(
+            *wrong_profile_use, 0, JobDoneMsg::FROM_SERVER));
+    }
+    delete wrong_profile_use;
+    delete wrong_profile_prepare;
+
+    /* Both workers are accepted from 127.0.0.1.  The warm authority must
+       therefore include the selected worker's ordinary port: a host-only
+       hint would alias A and B and leave this choice to list order. */
+    REQUIRE(submitter && request_cache_job(
+                submitter, 6101, "127.0.0.1",
+                static_cast<uint32_t>(worker_b_port), CACHE_PROFILE_P29V1),
+            "cache-capable C requests its exact known warm worker endpoint");
+    AssignPrepareMsg *prepare_b = wait_prepare(worker_b);
+    UseCSMsg *use_b = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(prepare_b && use_b &&
+                use_b->port == static_cast<uint32_t>(worker_b_port) &&
+                use_b->cache_endpoint_port == static_cast<uint32_t>(cache_b_port) &&
+                use_b->cache_profile_mask == CACHE_PROFILE_P29V1,
+            "a free compatible warm worker wins before other compatible and legacy workers");
+    if (use_b)
+        worker_b->send_msg(JobBeginMsg(use_b->job_id, 0));
+
+    REQUIRE(submitter && request_cache_job(submitter, 6102),
+            "cache-capable C requests while its warm worker is full");
+    AssignPrepareMsg *prepare_a = wait_prepare(worker_a);
+    UseCSMsg *use_a = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(prepare_a && use_a &&
+                use_a->port == static_cast<uint32_t>(worker_a_port) &&
+                use_a->cache_endpoint_port == static_cast<uint32_t>(cache_a_port) &&
+                use_a->cache_profile_mask == CACHE_PROFILE_P29V1,
+            "another genuinely-free compatible worker wins when the warm one is full");
+    if (use_a)
+        worker_a->send_msg(JobBeginMsg(use_a->job_id, 0));
+
+    REQUIRE(submitter && request_cache_job(submitter, 6103),
+            "cache-capable C requests after every compatible real slot is full");
+    AssignPrepareMsg *prepare_legacy = wait_prepare(legacy_worker);
+    UseCSMsg *use_legacy = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(prepare_legacy && use_legacy &&
+                use_legacy->port == static_cast<uint32_t>(legacy_port) &&
+                !use_legacy->hasCacheAdvertisement(),
+            "full compatible workers never starve an immediately-free legacy worker");
+
+    if (use_b) {
+        worker_b->send_msg(job_done_for(*use_b, 0, JobDoneMsg::FROM_SERVER));
+    }
+    if (use_a) {
+        worker_a->send_msg(job_done_for(*use_a, 0, JobDoneMsg::FROM_SERVER));
+    }
+    if (use_legacy) {
+        legacy_worker->send_msg(JobBeginMsg(use_legacy->job_id, 0));
+        legacy_worker->send_msg(job_done_for(*use_legacy, 0,
+                                             JobDoneMsg::FROM_SERVER));
+    }
+    delete use_b;
+    delete use_a;
+    delete use_legacy;
+    delete prepare_b;
+    delete prepare_a;
+    delete prepare_legacy;
+    delete submitter;
+    delete worker_a;
+    delete worker_b;
+    delete legacy_worker;
+    if (worker_a_listener >= 0) close(worker_a_listener);
+    if (worker_b_listener >= 0) close(worker_b_listener);
+    if (legacy_listener >= 0) close(legacy_listener);
+    if (cache_a_sentinel >= 0) close(cache_a_sentinel);
+    if (cache_b_sentinel >= 0) close(cache_b_sentinel);
+    REQUIRE(stop_scheduler(scheduler),
+            "cache-routing mixed-pool scheduler stopped cleanly");
+    REQUIRE(file_contains(log, "P50_WARM_HINT_OVERRIDE job=") &&
+                file_contains(log, "warm=1 compatible_free=2 idle_excluded=1"),
+            "warm affinity overriding an idle compatible worker emits an S80 diagnostic");
+}
+
+static void run_cache_affinity_uses_exact_serialized_host(
+    const std::string &binary, const std::string &directory)
+{
+    const int port = reserve_port_pair();
+    const std::string log = directory + "/cache-affinity-exact-host.log";
+    pid_t scheduler = start_cache_routing_scheduler(binary, port, log);
+    REQUIRE(port != 0 && scheduler > 0,
+            "exact-host affinity scheduler process launched");
+
+    int shared_worker_port = 0;
+    int worker_listener = bind_port(0, &shared_worker_port);
+    if (worker_listener >= 0) listen(worker_listener, 16);
+    int cache_a_port = 0;
+    int cache_a_sentinel = bind_port(0, &cache_a_port);
+    if (cache_a_sentinel >= 0) listen(cache_a_sentinel, 4);
+    int cache_b_port = 0;
+    int cache_b_sentinel = bind_port(0, &cache_b_port);
+    if (cache_b_sentinel >= 0) listen(cache_b_sentinel, 4);
+
+    ConfCSMsg *configuration = nullptr;
+    MsgChannel *worker_a = login_host(
+        port, "affinity-real-a", true, shared_worker_port, &configuration,
+        nullptr, 2, 0, static_cast<uint32_t>(cache_a_port),
+        CACHE_WIRE_REVISION, CACHE_PROFILE_P29V1);
+    delete configuration;
+    configuration = nullptr;
+
+    // F-B arrives from a different peer address but deliberately chooses a
+    // Login nodeName equal to F-A's canonical peer name.  It also advertises
+    // the same ordinary port/profile, so only exact serialized-host matching
+    // can distinguish the retained endpoint.
+    MsgChannel *worker_b_connection =
+        connect_scheduler(port, 5000, 0, "127.0.0.2");
+    MsgChannel *worker_b = worker_b_connection
+        ? login_host(port, "127.0.0.1", true, shared_worker_port,
+                     &configuration, worker_b_connection, 1, 0,
+                     static_cast<uint32_t>(cache_b_port), CACHE_WIRE_REVISION,
+                     CACHE_PROFILE_P29V1)
+        : nullptr;
+    delete configuration;
+    configuration = nullptr;
+    MsgChannel *submitter = login_host(
+        port, "affinity-exact-submit", false, 0, &configuration);
+    delete configuration;
+    REQUIRE(worker_a && worker_b && submitter && worker_listener >= 0 &&
+                cache_a_sentinel >= 0 && cache_b_sentinel >= 0,
+            "two address-distinct workers with a colliding Login nodeName joined");
+
+    // Keep one of A's two slots occupied.  If the cache-affinity predicate
+    // widens through CompileServer::matches(), least_busy will choose idle B.
+    REQUIRE(submitter && request_job_preferring(
+                submitter, 6199, "affinity-real-a"),
+            "one exact F-A slot is occupied before the collision probe");
+    UseCSMsg *busy_use = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    AssignPrepareMsg *busy_prepare = wait_prepare(worker_a);
+    REQUIRE(busy_use && busy_prepare && busy_use->hostname == "127.0.0.1" &&
+                busy_use->cache_endpoint_port ==
+                    static_cast<uint32_t>(cache_a_port),
+            "preferred-node setup selected the real F-A peer");
+    if (busy_use && worker_a)
+        worker_a->send_msg(JobBeginMsg(busy_use->job_id, 0));
+
+    REQUIRE(submitter && request_cache_job(
+                submitter, 6200, "127.0.0.1",
+                static_cast<uint32_t>(shared_worker_port),
+                CACHE_PROFILE_P29V1),
+            "warm probe echoes F-A's serialized host/port/profile identity");
+    UseCSMsg *warm_use = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    MsgChannel *selected_worker =
+        warm_use && warm_use->hostname == "127.0.0.2" ? worker_b : worker_a;
+    AssignPrepareMsg *warm_prepare = wait_prepare(selected_worker);
+    REQUIRE(warm_use && warm_prepare && warm_use->hostname == "127.0.0.1" &&
+                warm_use->cache_endpoint_port ==
+                    static_cast<uint32_t>(cache_a_port),
+            "colliding F-B nodeName cannot impersonate F-A's canonical warm host");
+    if (warm_use && selected_worker) {
+        selected_worker->send_msg(JobBeginMsg(warm_use->job_id, 0));
+        selected_worker->send_msg(job_done_for(
+            *warm_use, 0, JobDoneMsg::FROM_SERVER));
+    }
+    if (busy_use && worker_a)
+        worker_a->send_msg(job_done_for(
+            *busy_use, 0, JobDoneMsg::FROM_SERVER));
+
+    delete warm_prepare;
+    delete busy_prepare;
+    delete warm_use;
+    delete busy_use;
+    delete submitter;
+    delete worker_b;
+    delete worker_a;
+    if (worker_listener >= 0) close(worker_listener);
+    if (cache_a_sentinel >= 0) close(cache_a_sentinel);
+    if (cache_b_sentinel >= 0) close(cache_b_sentinel);
+    REQUIRE(stop_scheduler(scheduler),
+            "exact-host affinity scheduler stopped cleanly");
+}
+
+static void run_legacy_cache_routing_neutrality(const std::string &binary,
+                                                const std::string &directory)
+{
+    const int port = reserve_port_pair();
+    const std::string log = directory + "/cache-routing-legacy-neutrality.log";
+    pid_t scheduler = start_cache_routing_scheduler(binary, port, log, nullptr);
+    REQUIRE(port != 0 && scheduler > 0,
+            "legacy least-busy scheduler process launched for cache-neutrality gate");
+
+    int cache_worker_port = 0;
+    int cache_worker_listener = bind_port(0, &cache_worker_port);
+    if (cache_worker_listener >= 0) listen(cache_worker_listener, 16);
+    int cache_endpoint_port = 0;
+    int cache_endpoint_sentinel = bind_port(0, &cache_endpoint_port);
+    if (cache_endpoint_sentinel >= 0) listen(cache_endpoint_sentinel, 4);
+    int legacy_worker_port = 0;
+    int legacy_worker_listener = bind_port(0, &legacy_worker_port);
+    if (legacy_worker_listener >= 0) listen(legacy_worker_listener, 16);
+
+    ConfCSMsg *configuration = nullptr;
+    MsgChannel *cache_worker = login_host(
+        port, "legacy-neutral-cache", true, cache_worker_port, &configuration,
+        nullptr, 2, 0, static_cast<uint32_t>(cache_endpoint_port),
+        CACHE_WIRE_REVISION, CACHE_PROFILE_P29V1);
+    delete configuration;
+    configuration = nullptr;
+    MsgChannel *legacy_worker = login_host(
+        port, "legacy-neutral-old", true, legacy_worker_port, &configuration);
+    delete configuration;
+    configuration = nullptr;
+    MsgChannel *submitter = login_host(
+        port, "legacy-neutral-submit", false, 0, &configuration);
+    delete configuration;
+    REQUIRE(cache_worker && legacy_worker && submitter &&
+                cache_endpoint_sentinel >= 0,
+            "cache-capable and legacy workers join a legacy scheduler");
+
+    REQUIRE(submitter && request_job_preferring(
+                submitter, 6201, "legacy-neutral-cache"),
+            "one legacy assignment occupies half of the cache-capable worker");
+    UseCSMsg *occupied = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(occupied &&
+                occupied->port == static_cast<uint32_t>(cache_worker_port),
+            "preferred legacy assignment reaches the cache-capable worker");
+    if (occupied)
+        cache_worker->send_msg(JobBeginMsg(occupied->job_id, 0));
+
+    REQUIRE(submitter && request_cache_job(submitter, 6202),
+            "cache-shaped request is submitted while scheduler mode remains legacy");
+    UseCSMsg *selected = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(selected &&
+                selected->port == static_cast<uint32_t>(legacy_worker_port) &&
+                !selected->hasCacheAdvertisement(),
+            "legacy mode ignores cache preference and preserves least-busy selection");
+
+    if (occupied)
+        cache_worker->send_msg(job_done_for(*occupied, 0,
+                                            JobDoneMsg::FROM_SERVER));
+    if (selected) {
+        legacy_worker->send_msg(JobBeginMsg(selected->job_id, 0));
+        legacy_worker->send_msg(job_done_for(*selected, 0,
+                                             JobDoneMsg::FROM_SERVER));
+    }
+    delete occupied;
+    delete selected;
+    delete submitter;
+    delete cache_worker;
+    delete legacy_worker;
+    if (cache_worker_listener >= 0) close(cache_worker_listener);
+    if (legacy_worker_listener >= 0) close(legacy_worker_listener);
+    if (cache_endpoint_sentinel >= 0) close(cache_endpoint_sentinel);
+    REQUIRE(stop_scheduler(scheduler),
+            "legacy cache-neutrality scheduler stopped cleanly");
+}
+
 static void run_cache_handoff_below_p50(const std::string &binary,
                                         const std::string &directory)
 {
@@ -1454,8 +1865,11 @@ int main(int argc, char **argv)
         std::fprintf(stderr, "usage: %s <icecc-scheduler>\n", argv[0]);
         return 2;
     }
-    char directory_template[] = "/tmp/icecream-p49-scheduler.XXXXXX";
-    char *directory = mkdtemp(directory_template);
+    const char *temporary_root = std::getenv("TMPDIR");
+    std::string directory_template =
+        std::string(temporary_root && temporary_root[0] ? temporary_root : "/tmp")
+        + "/icecream-p49-scheduler.XXXXXX";
+    char *directory = mkdtemp(&directory_template[0]);
     if (!directory) return 2;
     std::fprintf(stderr, "retained work directory: %s\n", directory);
     signal(SIGPIPE, SIG_IGN);
@@ -1468,6 +1882,9 @@ int main(int argc, char **argv)
     run_disabled(argv[1], directory);
     run_cache_advertisement(argv[1], directory);
     run_cache_handoff_identity_bound(argv[1], directory);
+    run_cache_routing_preference(argv[1], directory);
+    run_cache_affinity_uses_exact_serialized_host(argv[1], directory);
+    run_legacy_cache_routing_neutrality(argv[1], directory);
     run_cache_handoff_below_p50(argv[1], directory);
     run_old_peer(argv[1], directory);
     std::fprintf(stderr, "%s: %d failure(s)\n",

@@ -154,6 +154,19 @@ static Bytes append_word(Bytes bytes, uint32_t value)
     return bytes;
 }
 
+static Bytes remove_tail_bytes(Bytes bytes, size_t removed)
+{
+    if (bytes.size() < sizeof(uint32_t) + removed) return {};
+    uint32_t network_length = 0;
+    std::memcpy(&network_length, bytes.data(), sizeof(network_length));
+    const uint32_t length = ntohl(network_length);
+    if (length < removed) return {};
+    bytes.resize(bytes.size() - removed);
+    network_length = htonl(length - static_cast<uint32_t>(removed));
+    std::memcpy(bytes.data(), &network_length, sizeof(network_length));
+    return bytes;
+}
+
 static bool decoder_rejects(const Bytes& bytes)
 {
     Pair pair = make_pair(50);
@@ -279,6 +292,204 @@ static void test_p50_round_trip_and_validation()
     set_tail_word(malformed, 1, UINT32_C(0x80000000));
     REQUIRE(decoder_rejects(malformed),
             "decoder rejects unknown profile advertisement");
+}
+
+static GetCSMsg fixture_getcs()
+{
+    Environments environments;
+    environments.push_back(std::make_pair(std::string("x86_64"),
+                                           std::string("cache-env")));
+    GetCSMsg request(environments, "/build/cache-input.cpp",
+                     CompileJob::Lang_CXX, UINT32_C(1), "x86_64",
+                     UINT32_C(0), "", 50, UINT32_C(0), 0);
+    request.client_id = UINT32_C(17);
+    request.cache_protocol = CACHE_WIRE_REVISION;
+    request.cache_profile_mask = CACHE_ADVERTISABLE_PROFILE_MASK;
+    request.cache_affinity_profile_mask = CACHE_PROFILE_P29V1;
+    request.cache_affinity_port = UINT32_C(10245);
+    request.cache_affinity_host = "warm-cache-worker";
+    return request;
+}
+
+static Bytes encode_getcs_frame(int protocol, const GetCSMsg& request)
+{
+    Pair pair = make_pair(protocol);
+    if (!pair.left->send_msg(request)) return {};
+    uint32_t network_length = 0;
+    if (recv(pair.right->fd, &network_length, sizeof(network_length), MSG_WAITALL)
+            != static_cast<ssize_t>(sizeof(network_length))) {
+        return {};
+    }
+    const uint32_t length = ntohl(network_length);
+    Bytes bytes(sizeof(network_length) + length);
+    std::memcpy(bytes.data(), &network_length, sizeof(network_length));
+    if (recv(pair.right->fd, bytes.data() + sizeof(network_length), length,
+             MSG_WAITALL) != static_cast<ssize_t>(length)) {
+        return {};
+    }
+    return bytes;
+}
+
+static bool getcs_decoder_rejects(const Bytes& bytes)
+{
+    Pair pair = make_pair(50);
+    const bool wrote = !bytes.empty()
+        && send(pair.left->fd, bytes.data(), bytes.size(), 0)
+            == static_cast<ssize_t>(bytes.size());
+    Msg *decoded = wrote ? pair.right->get_msg(2, true) : nullptr;
+    const bool rejected = wrote && !decoded;
+    delete decoded;
+    return rejected;
+}
+
+static void test_getcs_cache_request_wire_and_laws()
+{
+    GetCSMsg request = fixture_getcs();
+    GetCSMsg absent = request;
+    absent.cache_protocol = 0;
+    absent.cache_profile_mask = 0;
+    absent.cache_affinity_profile_mask = 0;
+    absent.cache_affinity_port = 0;
+    absent.cache_affinity_host.clear();
+
+    const Bytes p49_present_object = encode_getcs_frame(49, request);
+    const Bytes p49_absent_object = encode_getcs_frame(49, absent);
+    REQUIRE(!p49_present_object.empty()
+                && p49_present_object == p49_absent_object,
+            "P49 GetCS bytes are unchanged by protocol-50 client capability state");
+
+    Pair old_pair = make_pair(49);
+    REQUIRE(old_pair.left->send_msg(request),
+            "populated client capability object emits on a P49 link");
+    Msg *wire = old_pair.right->get_msg(2, true);
+    GetCSMsg *decoded = dynamic_cast<GetCSMsg *>(wire);
+    REQUIRE(decoded && decoded->cache_protocol == 0
+                && decoded->cache_profile_mask == 0
+                && decoded->cache_affinity_profile_mask == 0
+                && decoded->cache_affinity_port == 0
+                && decoded->cache_affinity_host.empty(),
+            "P49 GetCS decoder receives canonical client capability absence");
+    delete wire;
+
+    const Bytes p50_absent = encode_getcs_frame(50, absent);
+    REQUIRE(p50_absent.size() == p49_absent_object.size()
+                + 5 * sizeof(uint32_t) + 1,
+            "P50 GetCS appends four words and one bounded empty string");
+
+    Pair pair = make_pair(50);
+    REQUIRE(pair.left->send_msg(request),
+            "P50 GetCS carries a valid client capability and warm hint");
+    wire = pair.right->get_msg(2, true);
+    decoded = dynamic_cast<GetCSMsg *>(wire);
+    REQUIRE(decoded && decoded->cache_protocol == CACHE_WIRE_REVISION
+                && decoded->cache_profile_mask == CACHE_ADVERTISABLE_PROFILE_MASK
+                && decoded->cache_affinity_profile_mask == CACHE_PROFILE_P29V1
+                && decoded->cache_affinity_port == UINT32_C(10245)
+                && decoded->cache_affinity_host == "warm-cache-worker",
+            "P50 GetCS round-trips the exact capability and warm hint");
+    delete wire;
+
+    Pair absent_pair = make_pair(50);
+    REQUIRE(absent_pair.left->send_msg(absent),
+            "P50 GetCS accepts canonical all-zero client capability absence");
+    wire = absent_pair.right->get_msg(2, true);
+    decoded = dynamic_cast<GetCSMsg *>(wire);
+    REQUIRE(decoded && decoded->cache_protocol == 0
+                && decoded->cache_profile_mask == 0
+                && decoded->cache_affinity_profile_mask == 0
+                && decoded->cache_affinity_port == 0
+                && decoded->cache_affinity_host.empty(),
+            "P50 absent client capability remains wholly canonical");
+    delete wire;
+
+    const struct Invalid {
+        uint32_t protocol;
+        uint32_t profiles;
+        uint32_t affinity_profiles;
+        uint32_t affinity_port;
+        const char *affinity_host;
+        const char *name;
+    } invalid[] = {
+        {0, CACHE_PROFILE_P29V1, 0, 0, "", "profile without revision"},
+        {CACHE_WIRE_REVISION, 0, 0, 0, "", "revision without profiles"},
+        {CACHE_WIRE_REVISION, UINT32_C(0x80000000), 0, 0, "",
+         "unknown client profile"},
+        {CACHE_WIRE_REVISION, CACHE_PROFILE_P29V1,
+         CACHE_PROFILE_ZSTD_TU, 10245, "warm-cache-worker",
+         "affinity outside client capabilities"},
+        {CACHE_WIRE_REVISION, CACHE_PROFILE_P29V1,
+         CACHE_PROFILE_P29V1, 10245, "", "affinity profile without host"},
+        {CACHE_WIRE_REVISION, CACHE_PROFILE_P29V1,
+         CACHE_PROFILE_P29V1, 0, "warm-cache-worker",
+         "affinity host without port"},
+        {CACHE_WIRE_REVISION, CACHE_PROFILE_P29V1,
+         0, 10245, "warm-cache-worker", "affinity host without profile"},
+        {CACHE_WIRE_REVISION, CACHE_PROFILE_P29V1,
+         CACHE_PROFILE_P29V1, 70000, "warm-cache-worker",
+         "affinity port outside TCP range"},
+    };
+    for (const Invalid& value : invalid) {
+        GetCSMsg malformed = absent;
+        malformed.cache_protocol = value.protocol;
+        malformed.cache_profile_mask = value.profiles;
+        malformed.cache_affinity_profile_mask = value.affinity_profiles;
+        malformed.cache_affinity_port = value.affinity_port;
+        malformed.cache_affinity_host = value.affinity_host;
+        Pair send_pair = make_pair(50);
+        char label[176];
+        std::snprintf(label, sizeof(label),
+                      "GetCS encoder rejects %s", value.name);
+        REQUIRE(!send_pair.left->send_msg(malformed), label);
+    }
+
+    REQUIRE(getcs_decoder_rejects(remove_tail_bytes(p50_absent, 21)),
+            "P50 GetCS decoder rejects a wholly omitted capability tail");
+    REQUIRE(getcs_decoder_rejects(remove_tail_bytes(p50_absent, 1)),
+            "P50 GetCS decoder rejects a truncated affinity string");
+    REQUIRE(getcs_decoder_rejects(append_word(p50_absent, UINT32_C(0))),
+            "P50 GetCS decoder rejects bytes after the exact request tail");
+
+    const P50CacheClientCapability enabled =
+        p50_cache_client_capability_from_mode("on", 50);
+    REQUIRE(enabled.protocol == CACHE_WIRE_REVISION
+                && enabled.profile_mask == CACHE_ADVERTISABLE_PROFILE_MASK,
+            "C mode on advertises exactly the retained revision-one profiles");
+    REQUIRE(p50_cache_client_capability_from_mode(nullptr, 50) == enabled,
+            "C protocol-50 mode defaults on when the kill-switch variable is absent");
+    REQUIRE(p50_cache_client_capability_from_mode("off", 50) ==
+                P50CacheClientCapability{}
+                && p50_cache_client_capability_from_mode("invalid", 50) ==
+                    P50CacheClientCapability{}
+                && p50_cache_client_capability_from_mode("on", 49) ==
+                    P50CacheClientCapability{},
+            "C mode off, invalid, and old-wrapper paths fail closed");
+
+    REQUIRE(p50_select_pair_cache_profile(
+                CACHE_WIRE_REVISION,
+                CACHE_PROFILE_P29V1 | CACHE_PROFILE_ZSTD_TU,
+                CACHE_WIRE_REVISION,
+                CACHE_PROFILE_P29V1 | CACHE_PROFILE_ZSTD_ROUTE,
+                P50CacheProfileRequest::Default) == CACHE_PROFILE_P29V1,
+            "pair selection applies the default order to the exact intersection");
+    REQUIRE(p50_select_pair_cache_profile(
+                CACHE_WIRE_REVISION, CACHE_ADVERTISABLE_PROFILE_MASK,
+                CACHE_WIRE_REVISION,
+                CACHE_PROFILE_P29V1 | CACHE_PROFILE_ZSTD_ROUTE,
+                P50CacheProfileRequest::ZSTD_ROUTE) == CACHE_PROFILE_ZSTD_ROUTE,
+            "pair selection honors an available exact scheduler request");
+    REQUIRE(p50_select_pair_cache_profile(
+                CACHE_WIRE_REVISION, CACHE_PROFILE_P29V1,
+                CACHE_WIRE_REVISION, CACHE_PROFILE_ZSTD_TU,
+                P50CacheProfileRequest::Default) == 0
+                && p50_select_pair_cache_profile(
+                    CACHE_WIRE_REVISION, CACHE_PROFILE_P29V1,
+                    CACHE_WIRE_REVISION, CACHE_PROFILE_P29V1,
+                    P50CacheProfileRequest::ZSTD_ROUTE) == 0
+                && p50_select_pair_cache_profile(
+                    CACHE_WIRE_REVISION + 1, CACHE_PROFILE_P29V1,
+                    CACHE_WIRE_REVISION, CACHE_PROFILE_P29V1,
+                    P50CacheProfileRequest::Default) == 0,
+            "disjoint, unavailable-exact, and revision-skew pairs remain legacy");
 }
 
 static UseCSMsg fixture_usecs()
@@ -417,6 +628,9 @@ static void test_usecs_p50_round_trip_and_validation()
         {10245, UINT32_C(49), CACHE_PROFILE_ZSTD_TU,
          "stale pre-CacheWire protocol number"},
         {10245, CACHE_WIRE_REVISION, 0, "missing cache profile"},
+        {10245, CACHE_WIRE_REVISION,
+         CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE,
+         "multiple profiles in one assignment"},
         {10245, CACHE_WIRE_REVISION, UINT32_C(0x00000008),
          "removed revision-one profile bit"},
         {10245, CACHE_WIRE_REVISION, UINT32_C(0x80000000),
@@ -493,8 +707,8 @@ static void test_usecs_p50_round_trip_and_validation()
     malformed_wire = valid;
     set_tail_word(malformed_wire, 1,
                   CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE);
-    REQUIRE(!decoder_rejects(malformed_wire),
-            "decoder accepts the implemented TU+ROUTE cache-profile advertisement");
+    REQUIRE(decoder_rejects(malformed_wire),
+            "UseCS decoder rejects multiple profiles in one assignment");
     malformed_wire = valid;
     set_tail_word(malformed_wire, 1, UINT32_C(0x80000000));
     REQUIRE(decoder_rejects(malformed_wire),
@@ -633,6 +847,9 @@ static void test_daemon_cache_handoff_admissible_helper()
     } rows[] = {
         {job_id, epoch, nonce, cache_port, CACHE_WIRE_REVISION,
          CACHE_PROFILE_ZSTD_TU, true, "complete identity, cache present (baseline)"},
+        {job_id, epoch, nonce, cache_port, CACHE_WIRE_REVISION,
+         CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE, false,
+         "multiple profiles in one assignment"},
         {0, epoch, nonce, cache_port, CACHE_WIRE_REVISION,
          CACHE_PROFILE_ZSTD_TU, false,
          "zero job_id, epoch+nonce present, cache present -- the row "
@@ -657,8 +874,106 @@ static void test_daemon_cache_handoff_admissible_helper()
     }
 }
 
+static void test_cache_handoff_completion_binding()
+{
+    const uint32_t job_id = UINT32_C(0x5201);
+    const uint64_t epoch = UINT64_C(0x5200000000000001);
+    const uint64_t nonce = UINT64_C(0x1122334455667788);
+    const uint64_t c_guid = UINT64_C(0x8877665544332211);
+    const uint64_t tu_seq = UINT64_C(0x19);
+    const uint32_t base_flags =
+        static_cast<uint32_t>(JobDoneMsg::FROM_SUBMITTER) |
+        static_cast<uint32_t>(JobDoneMsg::P50CacheRouteObservation);
+    const JobDoneMsg exact(
+        job_id, 0, base_flags, 0, epoch, nonce, c_guid, tu_seq);
+    REQUIRE(p50_cache_handoff_completion_matches(
+                exact, job_id, epoch, nonce, c_guid, tu_seq,
+                CACHE_PROFILE_P29V1),
+            "exact successful submitter completion may advance the warm hint");
+
+    const JobDoneMsg wrong_job(job_id + 1, 0, base_flags, 0, epoch, nonce,
+                               c_guid, tu_seq);
+    const JobDoneMsg wrong_epoch(job_id, 0, base_flags, 0, epoch + 1, nonce,
+                                 c_guid, tu_seq);
+    const JobDoneMsg wrong_nonce(job_id, 0, base_flags, 0, epoch, nonce + 1,
+                                 c_guid, tu_seq);
+    const JobDoneMsg wrong_c_guid(job_id, 0, base_flags, 0, epoch, nonce,
+                                  c_guid + 1, tu_seq);
+    const JobDoneMsg wrong_tu(job_id, 0, base_flags, 0, epoch, nonce,
+                              c_guid, tu_seq + 1);
+    const JobDoneMsg failed(job_id, 1, base_flags, 0, epoch, nonce,
+                            c_guid, tu_seq);
+    const JobDoneMsg from_server(job_id, 0, JobDoneMsg::FROM_SERVER, 0,
+                                 epoch, nonce, c_guid, tu_seq);
+    const JobDoneMsg ordinary_submitter(
+        job_id, 0, JobDoneMsg::FROM_SUBMITTER, 0, epoch, nonce,
+        c_guid, tu_seq);
+    const JobDoneMsg observation_with_unknown_flag(
+        job_id, 0,
+        base_flags |
+            static_cast<uint32_t>(JobDoneMsg::UnknownJobId),
+        0, epoch, nonce, c_guid, tu_seq);
+    const JobDoneMsg permanent(
+        job_id, 106,
+        base_flags |
+            static_cast<uint32_t>(
+                JobDoneMsg::P50PermanentLocalCapabilityFailure),
+        0, epoch, nonce, c_guid, tu_seq);
+    const JobDoneMsg replacement(
+        job_id, 106,
+        base_flags |
+            static_cast<uint32_t>(
+                JobDoneMsg::P50LocalSidecarReplacementRequired),
+        0, epoch, nonce, c_guid, tu_seq);
+    const auto matches = [&](const JobDoneMsg& value) {
+        return p50_cache_handoff_completion_matches(
+            value, job_id, epoch, nonce, c_guid, tu_seq,
+            CACHE_PROFILE_P29V1);
+    };
+    REQUIRE(!matches(wrong_job) && !matches(wrong_epoch) &&
+                !matches(wrong_nonce) && !matches(wrong_c_guid) &&
+                !matches(wrong_tu) && !matches(failed) &&
+                !matches(from_server) && !matches(ordinary_submitter) &&
+                !matches(observation_with_unknown_flag) &&
+                !p50_cache_handoff_completion_matches(
+                    exact, 0, epoch, nonce, c_guid, tu_seq,
+                    CACHE_PROFILE_P29V1) &&
+                !p50_cache_handoff_completion_matches(
+                    exact, job_id, 0, nonce, c_guid, tu_seq,
+                    CACHE_PROFILE_P29V1) &&
+                !p50_cache_handoff_completion_matches(
+                    exact, job_id, epoch, 0, c_guid, tu_seq,
+                    CACHE_PROFILE_P29V1),
+            "wrong job, epoch, nonce, result, origin, message kind, flags, or absent binding cannot advance the warm hint");
+    REQUIRE(p50_cache_route_observation_kind(
+                failed, job_id, epoch, nonce, c_guid, tu_seq,
+                CACHE_PROFILE_P29V1) ==
+                P50CacheRouteObservationKind::Failure &&
+                p50_cache_route_observation_kind(
+                    permanent, job_id, epoch, nonce, c_guid, tu_seq,
+                    CACHE_PROFILE_P29V1) ==
+                    P50CacheRouteObservationKind::PermanentLocalProfileFailure &&
+                p50_cache_route_observation_kind(
+                    permanent, job_id, epoch, nonce, c_guid, tu_seq,
+                    CACHE_PROFILE_ZSTD_TU) ==
+                    P50CacheRouteObservationKind::Invalid &&
+                p50_cache_route_observation_kind(
+                    replacement, job_id, epoch, nonce, c_guid, tu_seq,
+                    CACHE_PROFILE_ZSTD_ROUTE) ==
+                    P50CacheRouteObservationKind::
+                        LocalSidecarReplacementRequired,
+            "generic, permanent-profile, and whole-sidecar replacement observations remain distinct");
+}
+
 static void test_cache_advertisement_predicate_matches_projection_law()
 {
+    REQUIRE(cache_advertisement_is_valid_present(
+                10245, CACHE_WIRE_REVISION,
+                CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE) &&
+                !cache_assignment_is_valid_present(
+                    10245, CACHE_WIRE_REVISION,
+                    CACHE_PROFILE_ZSTD_TU | CACHE_PROFILE_ZSTD_ROUTE),
+            "Login capability sets and singleton UseCS assignments were conflated");
     /* scheduler/scheduler.cpp's project_cache_handoff and UseCSMsg's own
        wire validator both resolve a retained/received snapshot through
        exactly this pair of predicates.  A live CompileServer can never
@@ -757,10 +1072,12 @@ int main()
 {
     test_legacy_bytes();
     test_p50_round_trip_and_validation();
+    test_getcs_cache_request_wire_and_laws();
     test_usecs_legacy_bytes();
     test_usecs_p50_round_trip_and_validation();
     test_usecs_identity_binding_law();
     test_daemon_cache_handoff_admissible_helper();
+    test_cache_handoff_completion_binding();
     test_cache_advertisement_predicate_matches_projection_law();
     test_revision_one_profile_registry();
     std::fprintf(stderr, "%s: %d failure(s)\n",

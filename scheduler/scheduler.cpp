@@ -1441,8 +1441,7 @@ static void credit_dispatch_credit(Job *job)
    scoring/selection slice that unittests/p50cacheadvertisement-source.sh
    greps (lines 1..~2841).  job is already dispatched to job->server() by
    every caller of this function. */
-static void project_cache_handoff(const CompileServer *cs, uint32_t wire_job_id,
-                                  uint64_t assignment_epoch, uint64_t assignment_nonce,
+static void project_cache_handoff(const Job *job,
                                   uint32_t &out_port, uint32_t &out_protocol,
                                   uint32_t &out_mask);
 
@@ -1452,8 +1451,7 @@ static bool send_remote_dispatch_reply(Job *job)
     assert(job->submitter());
     assert(job->server());
     uint32_t cache_port = 0, cache_protocol = 0, cache_mask = 0;
-    project_cache_handoff(job->server(), job->id(), job->assignmentEpoch(),
-                          job->assignmentNonce(), cache_port, cache_protocol, cache_mask);
+    project_cache_handoff(job, cache_port, cache_protocol, cache_mask);
     UseCSMsg reply(job->dispatchPlatform(), job->server()->name,
                    job->server()->remotePort(), job->id(),
                    job->dispatchGotEnv(), job->localClientId(),
@@ -1791,6 +1789,10 @@ static AdmitResult admit_request_jobs(CompileServer *submitter, PendingExpansion
         job->setMinimalHostVersion(m.minimal_host_version);
         job->setRequiredFeatures(m.required_features);
         job->setNiceness(max(0, min(20,int(m.niceness))));
+        job->setCacheRequest(m.cache_protocol, m.cache_profile_mask,
+                             m.cache_affinity_profile_mask,
+                             m.cache_affinity_port,
+                             m.cache_affinity_host);
         req.staged.push_back(job);
         std::ostream &dbg = log_info();
         dbg << "NEW " << job->id() << " client="
@@ -2045,6 +2047,78 @@ static list<CompileServer *> filter_ineligible_servers(Job *job)
             return true;
         });
     return eligible;
+}
+
+static uint32_t selected_cache_profile(const Job *job,
+                                       const CompileServer *cs,
+                                       P50CacheProfileRequest request)
+{
+    if (job == nullptr || cs == nullptr || cs == job->submitter() ||
+        !IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, cs) ||
+        !cache_advertisement_is_valid_present(
+            cs->cacheEndpointPort(), cs->cacheProtocol(),
+            cs->cacheProfileMask()))
+        return 0;
+    return p50_select_pair_cache_profile(
+        job->cacheProtocol(), job->cacheProfileMask(),
+        cs->cacheProtocol(), cs->cacheProfileMask(), request);
+}
+
+/* Soft rollout preference with a hard liveness escape.  Restrict selection
+   to cache-compatible new workers only while at least one such worker has a
+   real compile slot free (preload capacity does not count).  Once all are
+   full, retain the entire legacy eligible set, so an old/incompatible worker
+   can make progress rather than a request waiting for cache capacity.  A
+   compatible warm-host hint is applied only inside that same free set. */
+static void prefer_cache_compatible_servers(
+    const Job *job, list<CompileServer *> &eligible)
+{
+    // Cache routing is an assignment-bound P50 policy.  Legacy dispatch has
+    // no epoch/nonce with which to bind a handoff, so it must retain both the
+    // cost and the ordering semantics of the historical selector.
+    if (!assignment_mode_prepares())
+        return;
+
+    const P50CacheProfileRequest request =
+        p50_cache_profile_request_from_env();
+    list<CompileServer *> compatible_free;
+    for (CompileServer *const cs : eligible) {
+        if (cs->currentJobCount() < cs->maxJobs() &&
+            selected_cache_profile(job, cs, request) != 0)
+            compatible_free.push_back(cs);
+    }
+    if (compatible_free.empty())
+        return;
+
+    const string &affinity_host = job->cacheAffinityHost();
+    list<CompileServer *> warm;
+    size_t idle_compatible_excluded = 0;
+    if (!affinity_host.empty()) {
+        for (CompileServer *const cs : compatible_free) {
+            const uint32_t selected =
+                selected_cache_profile(job, cs, request);
+            const bool matches_affinity =
+                // UseCS serializes CompileServer::name as the canonical warm
+                // host key.  CompileServer::matches() also accepts the
+                // unauthenticated Login nodeName and would let a colliding
+                // worker impersonate that retained endpoint.
+                cs->name == affinity_host &&
+                cs->remotePort() == job->cacheAffinityPort() &&
+                (job->cacheAffinityProfileMask() & selected) != 0;
+            if (matches_affinity) {
+                warm.push_back(cs);
+            } else if (cs->currentJobCount() == 0) {
+                ++idle_compatible_excluded;
+            }
+        }
+    }
+    if (!warm.empty() && idle_compatible_excluded != 0) {
+        trace() << "P50_WARM_HINT_OVERRIDE job=" << job->id()
+                << " warm=" << warm.size()
+                << " compatible_free=" << compatible_free.size()
+                << " idle_excluded=" << idle_compatible_excluded << endl;
+    }
+    eligible.swap(warm.empty() ? compatible_free : warm);
 }
 
 static CompileServer *pick_server_random(list<CompileServer *> &eligible)
@@ -2303,6 +2377,8 @@ static CompileServer *pick_server(Job *job, SchedulerAlgorithmName schedulerAlgo
 
         return nullptr;
     }
+
+    prefer_cache_compatible_servers(job, eligible);
 
     // Don't bother running an algorithm if we don't need to.
     if ( eligible.size() == 0 ) {
@@ -2958,13 +3034,15 @@ static bool handle_login(CompileServer *cs, Msg *_m)
    unittests/p50cacheadvertisement-source.sh, which greps the file's
    selection slice (up to roughly here) for this function's getters and
    requires none be found there. */
-static void project_cache_handoff(const CompileServer *cs, uint32_t wire_job_id,
-                                  uint64_t assignment_epoch, uint64_t assignment_nonce,
+static void project_cache_handoff(const Job *job,
                                   uint32_t &out_port, uint32_t &out_protocol,
                                   uint32_t &out_mask)
 {
-    const bool identity_complete = wire_job_id != 0 && assignment_epoch != 0
-        && assignment_nonce != 0;
+    assert(job != nullptr);
+    const CompileServer *const cs = job->server();
+    assert(cs != nullptr);
+    const bool identity_complete = job->id() != 0 &&
+        job->assignmentEpoch() != 0 && job->assignmentNonce() != 0;
     const uint32_t port = cs->cacheEndpointPort();
     const uint32_t protocol = cs->cacheProtocol();
     const uint32_t mask = cs->cacheProfileMask();
@@ -2973,11 +3051,10 @@ static void project_cache_handoff(const CompileServer *cs, uint32_t wire_job_id,
     // an absent request retains the P29V1-first default.  Unknown bits and
     // unavailable requests remain absent rather than silently switching.
     const auto request = p50_cache_profile_request_from_env();
-    const uint32_t selected_mask =
-        p50_select_cache_profile(mask, request);
+    const uint32_t selected_mask = selected_cache_profile(job, cs, request);
     if (identity_complete &&
-        cache_advertisement_is_well_formed_present(port, protocol,
-                                                    selected_mask)) {
+        cache_advertisement_is_valid_present(port, protocol, mask) &&
+        selected_mask != 0) {
         out_port = port;
         out_protocol = protocol;
         out_mask = selected_mask;

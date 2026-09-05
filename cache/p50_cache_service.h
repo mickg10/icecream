@@ -14,6 +14,7 @@
 #include <atomic>
 #include <future>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -51,6 +52,15 @@ struct RuntimeConfig {
     std::optional<SidecarLaunchIdentity> sidecar_launch;
     size_t max_live_handoffs = 1;
     size_t max_input_lifecycle_replays = 8192;
+    size_t max_route_completed_requests = 4096;
+    size_t max_route_relationships = 256;
+    size_t max_route_endpoint_identities = 256;
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    // Injected at the real route prepare boundary after F has acknowledged
+    // arm/CacheSession.  Test builds use this to prove owner poison reaches
+    // SidecarRuntime's process-wide pre-open fence; production has no field.
+    std::function<void()> before_route_prepare_for_test;
+#endif
     std::chrono::milliseconds cancellation_grace{100};
     // Test/supervision seam: an injected owner failure is handled exactly like
     // an unexpected exception escaping the endpoint executor.  Production
@@ -155,8 +165,33 @@ public:
         return busy_.test(std::memory_order_relaxed) ? 1u : 0u;
     }
     [[nodiscard]] FStoreGuid f_store_guid() const noexcept { return config_.f_store_guid; }
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    // Seeds the bounded endpoint map without opening an F connection.  Test
+    // builds use this only while no source transfer is active.
+    [[nodiscard]] bool seed_route_endpoint_identity_for_test(
+        std::string host, uint32_t cache_port, FStoreGuid guid,
+        uint64_t generation) noexcept;
+    // Seeds both the authenticated endpoint binding and one retained profile
+    // relationship without opening F.  Tests use this to prove that a known
+    // endpoint/new-profile capacity refusal occurs before any network work.
+    [[nodiscard]] bool seed_route_relationship_for_test(
+        std::string host, uint32_t cache_port, FStoreGuid guid,
+        uint64_t generation, ProfileId profile) noexcept;
+#endif
 
 private:
+    struct RouteEndpointKey {
+        std::string host;
+        uint32_t cache_port = 0;
+        auto operator<=>(const RouteEndpointKey&) const = default;
+    };
+
+    struct RouteStoreIdentity {
+        FStoreGuid guid{};
+        uint64_t generation = 0;
+        auto operator<=>(const RouteStoreIdentity&) const = default;
+    };
+
     struct EndpointOwnerResult {
         RuntimeStatus status = RuntimeStatus::EndpointFailed;
         std::optional<ServerRunResult> endpoint;
@@ -175,18 +210,29 @@ private:
     void release_endpoint_run() noexcept;
     void cancel_active_control() noexcept;
     void close_active_control() noexcept;
+    [[nodiscard]] bool bind_route_endpoint_identity(
+        const RouteEndpointKey& endpoint,
+        RouteStoreIdentity observed) noexcept;
 
     RuntimeConfig config_;
     InputLifecycleRegistry input_lifecycle_;
     boost::asio::io_context context_;
     std::unique_ptr<P50ServerEndpoint> endpoint_;
     std::unique_ptr<P50CRouteOwner> route_owner_;
+    // Endpoint address is the stable scheduler-facing relationship key.  Its
+    // exact authenticated F incarnation is owner-affine and bounded; a change
+    // retires every old-profile route before the successor is admitted.
+    std::map<RouteEndpointKey, RouteStoreIdentity> route_endpoint_identities_;
     // P50CRouteOwner retains one sender per C/F/profile relationship and its
     // preparation authority permits only one uncommitted successor.  Source
     // requests arrive on independent bounded control workers, so serialize
     // them here under their unchanged absolute deadline before touching that
     // single-owner state.  This also bounds buffered source memory to one TU.
     std::timed_mutex source_transfer_mutex_;
+    // This is the outermost opener fence.  P50CRouteOwner also retains its
+    // own latch, but transfer_source_on_owner must refuse before it connects
+    // to or arms any F after whole-sidecar replacement becomes necessary.
+    std::atomic<bool> route_replacement_required_{false};
     EndpointWorkGuard endpoint_work_guard_;
     std::thread endpoint_owner_thread_;
     std::atomic<bool> endpoint_owner_failed_{false};

@@ -141,6 +141,34 @@ static bool no_terminal_socket_event(MsgChannel *channel, int timeout_msec)
             (descriptor.revents & (POLLHUP | POLLERR | POLLNVAL)) == 0);
 }
 
+static int process_fd_count(pid_t pid)
+{
+    std::error_code error;
+    const std::filesystem::path directory =
+        std::filesystem::path("/proc") / std::to_string(pid) / "fd";
+    std::filesystem::directory_iterator position(directory, error);
+    const std::filesystem::directory_iterator end;
+    if (error) return -1;
+    int count = 0;
+    while (position != end) {
+        ++count;
+        position.increment(error);
+        if (error) return -1;
+    }
+    return count;
+}
+
+static int wait_for_fd_count_at_most(pid_t pid, int maximum, int timeout_msec)
+{
+    const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_msec);
+    int observed = process_fd_count(pid);
+    while (observed > maximum && Clock::now() < deadline) {
+        ::usleep(20000);
+        observed = process_fd_count(pid);
+    }
+    return observed;
+}
+
 static bool wait_child(pid_t pid, int timeout_msec, int *status)
 {
     const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_msec);
@@ -296,46 +324,122 @@ int main(int argc, char **argv)
             "real READY/authenticated sidecar publishes exact positive advertisement");
     delete positive_message;
 
-    const uint32_t wire_id = 7101;
-    const uint64_t nonce = UINT64_C(0x7101000000000001);
-    REQUIRE(scheduler && scheduler->send_msg(
-                AssignPrepareMsg(epoch, wire_id, nonce, 1)),
-            "source-arm PREPARE reaches the production daemon");
-    Msg *ready_message = wait_for_type(scheduler, Msg::ASSIGN_READY, 5000);
-    auto *ready = dynamic_cast<AssignReadyMsg *>(ready_message);
-    REQUIRE(ready != nullptr && ready->wire_id == wire_id &&
-                ready->epoch() == epoch && ready->nonce() == nonce,
-            "production daemon accepts the exact source-arm assignment");
-    delete ready_message;
+    const int baseline_daemon_fds = process_fd_count(daemon_pid);
+    REQUIRE(baseline_daemon_fds > 0,
+            "real daemon descriptor baseline is observable");
 
-    MsgChannel *ordinary = connect_tcp_bounded(daemon_port, 5000);
-    REQUIRE(ordinary != nullptr, "ordinary Protocol-50 client reached the real public listener");
-    const P50SourceArmFields arm = source_arm(
-        wire_id, epoch, nonce, static_cast<uint32_t>(daemon_port),
-        static_cast<uint32_t>(daemon_port));
-    REQUIRE(ordinary && ordinary->send_msg(P50SourceArmMsg(arm)),
-            "exact source arm entered the production daemon path");
-    Msg *armed_message = wait_for_type(ordinary, Msg::P50_SOURCE_ARMED, 5000);
-    auto *armed = dynamic_cast<P50SourceArmedMsg *>(armed_message);
-    REQUIRE(armed != nullptr && armed->arm == arm &&
-                armed->f_store_generation != 0,
+    // The removed implementation opened and retained one second P5FS control
+    // relationship for every authoritative CacheSession.  Its table was
+    // bounded at 64, so 65 sequential handoffs are the smallest production
+    // witness that distinguishes the single authoritative path from that
+    // shadow-owner design.
+    constexpr size_t kAuthoritativeSessionCount = 65;
+    size_t authoritative_sessions = 0;
+    bool sequence_valid = baseline_daemon_fds > 0;
+    bool first_prepare = false;
+    bool first_ready = false;
+    bool first_connected = false;
+    bool first_arm_sent = false;
+    bool first_armed = false;
+    bool first_cache_session_sent = false;
+    bool first_adopted_live = false;
+    for (size_t index = 0; sequence_valid &&
+                           index != kAuthoritativeSessionCount; ++index) {
+        const uint32_t wire_id = static_cast<uint32_t>(7101 + index);
+        const uint64_t nonce = UINT64_C(0x7101000000000001) + index;
+        const bool prepared = scheduler && scheduler->send_msg(
+            AssignPrepareMsg(epoch, wire_id, nonce, 1));
+        if (index == 0) first_prepare = prepared;
+        if (!prepared) {
+            sequence_valid = false;
+            break;
+        }
+
+        Msg *ready_message = wait_for_type(scheduler, Msg::ASSIGN_READY, 5000);
+        auto *ready = dynamic_cast<AssignReadyMsg *>(ready_message);
+        const bool ready_valid = ready != nullptr && ready->wire_id == wire_id &&
+            ready->epoch() == epoch && ready->nonce() == nonce;
+        if (index == 0) first_ready = ready_valid;
+        delete ready_message;
+        if (!ready_valid) {
+            sequence_valid = false;
+            break;
+        }
+
+        MsgChannel *ordinary = connect_tcp_bounded(daemon_port, 5000);
+        if (index == 0) first_connected = ordinary != nullptr;
+        if (ordinary == nullptr) {
+            sequence_valid = false;
+            break;
+        }
+        const P50SourceArmFields arm = source_arm(
+            wire_id, epoch, nonce, static_cast<uint32_t>(daemon_port),
+            static_cast<uint32_t>(daemon_port));
+        const bool arm_sent = ordinary->send_msg(P50SourceArmMsg(arm));
+        if (index == 0) first_arm_sent = arm_sent;
+        if (!arm_sent) {
+            delete ordinary;
+            sequence_valid = false;
+            break;
+        }
+        Msg *armed_message = wait_for_type(ordinary, Msg::P50_SOURCE_ARMED, 5000);
+        auto *armed = dynamic_cast<P50SourceArmedMsg *>(armed_message);
+        const bool armed_valid = armed != nullptr && armed->arm == arm &&
+            armed->f_store_generation != 0;
+        if (index == 0) first_armed = armed_valid;
+        delete armed_message;
+        if (!armed_valid) {
+            delete ordinary;
+            sequence_valid = false;
+            break;
+        }
+        const bool cache_session_sent = ordinary->send_msg(CacheSessionMsg());
+        if (index == 0) first_cache_session_sent = cache_session_sent;
+        if (!cache_session_sent) {
+            delete ordinary;
+            sequence_valid = false;
+            break;
+        }
+        // CACHE_SESSION changes this descriptor from framed icecream messages
+        // to raw CacheWire.  A shadow-owner capacity refusal closes it here;
+        // an accepted authoritative handoff remains live until this test ends
+        // the intentionally empty raw session.
+        const bool adopted_live = no_terminal_socket_event(ordinary, 50);
+        if (index == 0) first_adopted_live = adopted_live;
+        delete ordinary;
+        if (!adopted_live) {
+            sequence_valid = false;
+            break;
+        }
+        ++authoritative_sessions;
+        // Let the endpoint owner consume EOF and release its one live handoff
+        // before presenting the next sequential session.
+        ::usleep(20000);
+    }
+    REQUIRE(first_prepare, "source-arm PREPARE reaches the production daemon");
+    REQUIRE(first_ready, "production daemon accepts the exact source-arm assignment");
+    REQUIRE(first_connected,
+            "ordinary Protocol-50 client reached the real public listener");
+    REQUIRE(first_arm_sent, "exact source arm entered the production daemon path");
+    REQUIRE(first_armed,
             "source-arm owner is acknowledged before CACHE_SESSION");
-    delete armed_message;
-    REQUIRE(ordinary && ordinary->send_msg(CacheSessionMsg()),
+    REQUIRE(first_cache_session_sent,
             "real CACHE_SESSION entered the production daemon path");
-    // CACHE_SESSION changes this descriptor from framed icecream messages to
-    // raw CacheWire.  Observe only terminal fd state; parsing the raw stream
-    // as MsgChannel framing would manufacture a bogus oversized message.
-    REQUIRE(no_terminal_socket_event(ordinary, 250),
+    REQUIRE(first_adopted_live,
             "authenticated one-shot handoff keeps the adopted session live");
+    REQUIRE(sequence_valid &&
+                authoritative_sessions == kAuthoritativeSessionCount,
+            "more than 64 sequential authoritative CacheSessions remain accepted");
+
+    const int settled_daemon_fds = wait_for_fd_count_at_most(
+        daemon_pid, baseline_daemon_fds + 2, 5000);
+    REQUIRE(settled_daemon_fds >= 0 &&
+                settled_daemon_fds <= baseline_daemon_fds + 2,
+            "authoritative CacheSessions leave no retained P5FS descriptors");
     Msg *spurious_login = wait_for_type(scheduler, Msg::LOGIN, 250);
     REQUIRE(spurious_login == nullptr,
             "accepted handoff keeps the READY advertisement stable");
     delete spurious_login;
-    // End the synthetic empty session.  The immutable READY listener remains
-    // eligible for later TUs; shutdown below is the next advertisement edge.
-    delete ordinary;
-    ordinary = nullptr;
 
     ::kill(daemon_pid, SIGTERM);
     Msg *shutdown_message = wait_for_type(scheduler, Msg::LOGIN, 5000);

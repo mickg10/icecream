@@ -18,6 +18,7 @@ warm=${ICECC_P50_C1F1_WARM:-0}
 passes=${ICECC_P50_C1F1_PASSES:-2}
 topology=${ICECC_P50_TOPOLOGY:-}
 external_mode=${ICECC_P50_EXTERNAL_FARM:-0}
+worker_scheduler_host=${ICECC_P50_C1F1_WORKER_SCHEDULER_HOST:-}
 reference_reuse=0
 reference_witness=${ICECC_P50_REFERENCE_WITNESS:-}
 reference_authority=${ICECC_P50_REFERENCE_AUTHORITY:-}
@@ -27,6 +28,17 @@ case "$external_mode" in
     0|1) ;;
     *) echo "FAIL: ICECC_P50_EXTERNAL_FARM must be 0 or 1" >&2; exit 1 ;;
 esac
+if test "$external_mode" = 0; then
+    # 127.0.0.1 is the protocol sentinel for scheduler-selected local
+    # fallback.  A real F sharing this gate's network namespace must register
+    # through an explicit ordinary address so its UseCS cannot alias it.
+    case "$worker_scheduler_host" in
+        ""|localhost|127.*|0.0.0.0|::1)
+            echo "SKIP: ICECC_P50_C1F1_WORKER_SCHEDULER_HOST must be an explicit non-loopback IPv4 address" >&2
+            exit 77
+            ;;
+    esac
+fi
 case "$s2_process_loss" in
     0|1) ;;
     *) echo "FAIL: ICECC_P50_S2_PROCESS_LOSS must be 0 or 1" >&2; exit 1 ;;
@@ -115,6 +127,26 @@ command -v bash >/dev/null 2>&1 || {
     echo "SKIP: bash is required for the generated icecc-create-env tool" >&2
     exit 77
 }
+command -v python3 >/dev/null 2>&1 || {
+    echo "SKIP: python3 is required to validate the worker scheduler address" >&2
+    exit 77
+}
+if test "$external_mode" = 0 && ! python3 - "$worker_scheduler_host" <<'PY'
+import ipaddress
+import sys
+
+try:
+    address = ipaddress.IPv4Address(sys.argv[1])
+except ipaddress.AddressValueError:
+    raise SystemExit(1)
+if (address.is_loopback or address.is_unspecified or address.is_multicast or
+        address.is_reserved or address.is_link_local):
+    raise SystemExit(1)
+PY
+then
+    echo "SKIP: ICECC_P50_C1F1_WORKER_SCHEDULER_HOST is not an ordinary IPv4 address" >&2
+    exit 77
+fi
 
 if test -n "${ICECC_P50_C1F1_WORKDIR:-}"; then
     work=$ICECC_P50_C1F1_WORKDIR
@@ -670,7 +702,7 @@ if test "$suite" = C1F20/40; then
                 ICECC_P50_F_LEGACY_WIRE_TRACE="$f_wire_trace" \
                 ICECC_P50_RELATIONSHIP="$relationship" \
                 "$build/daemon/iceccd" "$@" -p "$worker_port" -m 2 \
-                -s "127.0.0.1:$port_sched" -n "$network" -N "p50-f-$relationship" \
+                -s "$worker_scheduler_host:$port_sched" -n "$network" -N "p50-f-$relationship" \
                 -b "$work/envs-f-$relationship" -l "$work/f-$relationship.log" -vvv \
                 --cache-service "$build/cache/icecc-cache-service" \
                 --cache-runtime-dir "$work/cache-runtime-f-$relationship" &
@@ -681,7 +713,7 @@ if test "$suite" = C1F20/40; then
                 ICECC_P50_F_LEGACY_WIRE_TRACE="$f_wire_trace" \
                 ICECC_P50_RELATIONSHIP="$relationship" \
                 "$build/daemon/iceccd" "$@" -p "$worker_port" -m 2 \
-                -s "127.0.0.1:$port_sched" -n "$network" -N "p50-f-$relationship" \
+                -s "$worker_scheduler_host:$port_sched" -n "$network" -N "p50-f-$relationship" \
                 -b "$work/envs-f-$relationship" -l "$work/f-$relationship.log" -vvv &
         fi
         worker_pid=$!
@@ -694,7 +726,7 @@ else
         ICECC_P50_C_ACTION_TRACE="$f_action_trace" ICECC_P50_F_ACTION_TRACE="$f_action_trace" \
         ICECC_P50_TEST_READY_TRACE="$work/ready-f.trace" \
         "$build/daemon/iceccd" "$@" -p "$port_worker" -m 1 \
-        -s "127.0.0.1:$port_sched" -n "$network" -N p50-f \
+        -s "$worker_scheduler_host:$port_sched" -n "$network" -N p50-f \
         -b "$work/envs-f" -l "$work/f.log" -vvv \
             --cache-service "$build/cache/icecc-cache-service" \
             --cache-runtime-dir "$work/cache-runtime-f" &
@@ -704,7 +736,7 @@ else
             ICECC_P50_C_ACTION_TRACE="$f_action_trace" ICECC_P50_F_ACTION_TRACE="$f_action_trace" \
             ICECC_P50_TEST_READY_TRACE="$work/ready-f.trace" \
             "$build/daemon/iceccd" "$@" -p "$port_worker" -m 1 \
-            -s "127.0.0.1:$port_sched" -n "$network" -N p50-f \
+            -s "$worker_scheduler_host:$port_sched" -n "$network" -N p50-f \
             -b "$work/envs-f" -l "$work/f.log" -vvv &
     fi
     worker_pid=$!
@@ -748,6 +780,25 @@ test "${logins:-0}" -ge "$required_logins" || {
     echo "FAIL: real C1F1 daemons did not register" >&2
     exit 1
 }
+ordinary_accepts=$(grep -F -c "accepted $worker_scheduler_host" "$work/scheduler.log" 2>/dev/null || true)
+test "${ordinary_accepts:-0}" -ge "$relationship_count" || {
+    echo "FAIL: scheduler did not accept every F through the required ordinary address" >&2
+    exit 1
+}
+if test "$suite" = C1F20/40; then
+    for relationship in $(seq 0 19); do
+        grep -F "I am known as $worker_scheduler_host" \
+            "$work/f-$relationship.log" >/dev/null || {
+            echo "FAIL: F relationship $relationship did not receive the required ordinary address from S" >&2
+            exit 1
+        }
+    done
+else
+    grep -F "I am known as $worker_scheduler_host" "$work/f.log" >/dev/null || {
+        echo "FAIL: F did not receive the required ordinary address from S" >&2
+        exit 1
+    }
+fi
 
 # The cache executable must be alive as a child of the production daemon
 # wiring. Merely checking that the file exists would permit a mechanism-only

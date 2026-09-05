@@ -141,6 +141,21 @@ struct P50ZstdSourceSender::Impl {
         return result;
     }
 
+    void require_replacement(ZstdSourceTransferResult& result,
+                             bool persistent_route) noexcept {
+        if (!persistent_route)
+            return;
+        route_replacement_required = true;
+        result.replacement_required = true;
+    }
+
+    ZstdSourceTransferResult replacement(
+        ZstdSourceTransferStatus status, bool persistent_route) noexcept {
+        ZstdSourceTransferResult result = invalid(status);
+        require_replacement(result, persistent_route);
+        return result;
+    }
+
     ZstdSourceTransferResult committed_from_witness(
         const ClientRunResult& run, uint64_t raw_bytes, Digest128 raw_digest,
         uint8_t attempts) const {
@@ -232,6 +247,7 @@ struct P50ZstdSourceSender::Impl {
     std::unique_ptr<P50ClientEndpoint> endpoint;
     std::map<PrepareRequestKey, CompletedRequest> completed;
     bool used = false;
+    bool route_replacement_required = false;
 };
 
 P50ZstdSourceSender::P50ZstdSourceSender(CStoreGuid c_store_guid,
@@ -386,8 +402,16 @@ P50ZstdSourceSender::transfer_bytes(
     } catch (const std::invalid_argument&) {
         co_return impl_->invalid(ZstdSourceTransferStatus::InvalidRequest);
     }
+    /* Exact completed replay remains connection-free even after the bounded
+       ledger reaches its ceiling.  A distinct request cannot be admitted:
+       make that capacity boundary a sticky cold-replacement request rather
+       than silently disabling P50 for the remainder of the process. */
+    if (explicit_route && impl_->route_replacement_required)
+        co_return impl_->replacement(ZstdSourceTransferStatus::Unavailable,
+                                     explicit_route);
     if (impl_->completed.size() >= impl_->config.max_completed_requests)
-        co_return impl_->invalid(ZstdSourceTransferStatus::Unavailable);
+        co_return impl_->replacement(ZstdSourceTransferStatus::Unavailable,
+                                     explicit_route);
 
     // One route owner serializes its transfers. Retain only this operation's
     // completions so byte accounting is bounded and includes either retry.
@@ -395,22 +419,37 @@ P50ZstdSourceSender::transfer_bytes(
 
     PreparedTuHandle prepared;
     try {
+        if (impl_->config.before_prepare_for_route_for_test)
+            impl_->config.before_prepare_for_route_for_test();
         prepared = impl_->route_bound
             ? impl_->authority->prepare_for_route(impl_->route, request, *source)
             : impl_->authority->prepare(request, *source);
+    } catch (const P50RoutePoisoned&) {
+        // begin_v1() throws this only after terminalizing retained route
+        // state.  Preserve that typed ownership boundary: a wrapper cannot
+        // reinterpret it as bad input or continue through the same sidecar.
+        co_return impl_->replacement(ZstdSourceTransferStatus::TerminalError,
+                                     explicit_route);
     } catch (const std::invalid_argument&) {
         co_return impl_->invalid(ZstdSourceTransferStatus::InvalidRequest);
     } catch (const std::length_error&) {
         co_return impl_->invalid(ZstdSourceTransferStatus::SourceError);
     } catch (const std::logic_error&) {
         // A relationship permits only one uncommitted successor.  A later
-        // wrapper must retry that exact request rather than crashing the
-        // long-lived owner or advancing around it.
-        co_return impl_->invalid(ZstdSourceTransferStatus::InvalidRequest);
+        // wrapper may be the first observer after its predecessor died before
+        // publishing the poisoned-route result.  Escalate the retained
+        // ambiguity to the same sticky cold-replacement path.
+        co_return impl_->replacement(ZstdSourceTransferStatus::InvalidRequest,
+                                     explicit_route);
     }
     for (uint8_t attempt = 1; attempt <= 2; ++attempt) {
-        if (Clock::now() >= deadline)
-            co_return impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
+        if (Clock::now() >= deadline) {
+            ZstdSourceTransferResult result =
+                impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
+            result.attempts = static_cast<uint8_t>(attempt - 1);
+            impl_->require_replacement(result, explicit_route);
+            co_return result;
+        }
         ClientRunResult run;
         try {
             if (std::holds_alternative<boost::asio::ip::tcp::endpoint>(target)) {
@@ -423,7 +462,11 @@ P50ZstdSourceSender::transfer_bytes(
                     connected_fd = std::get<ConnectedFdFactory>(target)(
                         deadline);
                 } catch (...) {
-                    co_return impl_->invalid(ZstdSourceTransferStatus::TerminalError);
+                    ZstdSourceTransferResult result =
+                        impl_->invalid(ZstdSourceTransferStatus::TerminalError);
+                    result.attempts = attempt;
+                    impl_->require_replacement(result, explicit_route);
+                    co_return result;
                 }
                 if (connected_fd < 0) {
                     run.status = Clock::now() >= deadline
@@ -435,7 +478,11 @@ P50ZstdSourceSender::transfer_bytes(
                 }
             }
         } catch (...) {
-            co_return impl_->invalid(ZstdSourceTransferStatus::TerminalError);
+            ZstdSourceTransferResult result =
+                impl_->invalid(ZstdSourceTransferStatus::TerminalError);
+            result.attempts = attempt;
+            impl_->require_replacement(result, explicit_route);
+            co_return result;
         }
         // A validated commit is authoritative even when its completion races
         // the deadline boundary.  The endpoint freezes this witness before
@@ -468,12 +515,19 @@ P50ZstdSourceSender::transfer_bytes(
                 result.status =
                     ZstdSourceTransferStatus::CommittedIdentityUnavailable;
             }
-            if (result.status != ZstdSourceTransferStatus::Committed)
+            if (result.status != ZstdSourceTransferStatus::Committed) {
+                impl_->require_replacement(result, explicit_route);
                 co_return result;
+            }
             try {
                 impl_->remember_completed(request, *source, raw_digest, result);
             } catch (const std::length_error&) {
-                co_return impl_->invalid(ZstdSourceTransferStatus::Unavailable);
+                co_return impl_->replacement(
+                    ZstdSourceTransferStatus::Unavailable, explicit_route);
+            } catch (...) {
+                co_return impl_->replacement(
+                    ZstdSourceTransferStatus::CommittedIdentityUnavailable,
+                    explicit_route);
             }
             co_return result;
         }
@@ -482,6 +536,7 @@ P50ZstdSourceSender::transfer_bytes(
                 impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
             result.attempts = attempt;
             impl_->bind_wire_evidence(result);
+            impl_->require_replacement(result, explicit_route);
             co_return result;
         }
         if (run.status == ClientRunStatus::TerminalError) {
@@ -490,6 +545,7 @@ P50ZstdSourceSender::transfer_bytes(
             result.attempts = attempt;
             result.terminal_error = run.terminal_error;
             impl_->bind_wire_evidence(result);
+            impl_->require_replacement(result, explicit_route);
             co_return result;
         }
         if (attempt == 2) {
@@ -497,10 +553,12 @@ P50ZstdSourceSender::transfer_bytes(
                 impl_->invalid(ZstdSourceTransferStatus::RetryExhausted);
             result.attempts = attempt;
             impl_->bind_wire_evidence(result);
+            impl_->require_replacement(result, explicit_route);
             co_return result;
         }
     }
-    co_return impl_->invalid(ZstdSourceTransferStatus::RetryExhausted);
+    co_return impl_->replacement(ZstdSourceTransferStatus::RetryExhausted,
+                                 explicit_route);
 }
 
 }  // namespace icecc::p50

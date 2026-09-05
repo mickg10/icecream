@@ -285,8 +285,11 @@ int main(int argc, char **argv)
     }
     signal(SIGPIPE, SIG_IGN);
 
-    char temp_template[] = "/tmp/icecream-g4-batch.XXXXXX";
-    char *temp = mkdtemp(temp_template);
+    const char *temporary_root = std::getenv("TMPDIR");
+    std::string temp_template =
+        std::string(temporary_root && temporary_root[0] ? temporary_root : "/tmp")
+        + "/icecream-g4-batch.XXXXXX";
+    char *temp = mkdtemp(&temp_template[0]);
     if (!temp) {
         perror("mkdtemp");
         return 2;
@@ -353,6 +356,8 @@ int main(int argc, char **argv)
     REQUIRE(client != nullptr, "batch client connected");
     GetCSMsg batch(Environments(), "batch.cpp", CompileJob::Lang_CXX,
                    3, "x86_64", 0, std::string(), 0, 0, 0);
+    batch.cache_protocol = CACHE_WIRE_REVISION;
+    batch.cache_profile_mask = CACHE_ADVERTISABLE_PROFILE_MASK;
     REQUIRE(client && client->send_msg(batch), "batch client sent GetCS(count=3)");
 
     /* The daemon forwards the GetCS to S; read it and answer with three
@@ -363,6 +368,12 @@ int main(int argc, char **argv)
     const uint32_t client_id = fwd_getcs ? fwd_getcs->client_id : 0;
     const uint32_t fwd_count = fwd_getcs ? fwd_getcs->count : 0;
     REQUIRE(fwd_count == 3, "forwarded GetCS preserved count=3");
+    REQUIRE(fwd_getcs && fwd_getcs->cache_protocol == 0 &&
+                fwd_getcs->cache_profile_mask == 0 &&
+                fwd_getcs->cache_affinity_profile_mask == 0 &&
+                fwd_getcs->cache_affinity_port == 0 &&
+                fwd_getcs->cache_affinity_host.empty(),
+            "count>1 request is projected to canonical cache absence");
     delete fwd;
 
     /* Three distinct decisions with VARYING got_env (so a hardcoded

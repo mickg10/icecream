@@ -101,6 +101,8 @@ extern void invocation_timing_mark_finish(int exitcode,
         InvocationOutcome outcome = InvocationCompilerCompleted);
 extern void invocation_timing_set_scheduler_job_id(uint32_t job_id);
 extern void invocation_timing_set_compile_job_id(uint32_t job_id);
+extern void invocation_timing_replace_assignment_ids(
+    uint32_t scheduler_job_id, uint32_t compile_job_id);
 extern bool invocation_timing_send(MsgChannel *local_daemon);
 
 /* in remote.cpp */
@@ -132,7 +134,9 @@ extern bool compiler_get_arch_flags(const CompileJob& job, bool march, bool mcpu
     std::list<std::string>& args);
 
 /* In remote.cpp - permill is the probability it will be compiled three times */
-extern int build_remote(CompileJob &job, MsgChannel *scheduler, const Environments &envs, int permill);
+extern int build_remote(CompileJob &job, MsgChannel *scheduler,
+                        const Environments &envs, int permill,
+                        bool request_p50 = true);
 
 /* safeguard.cpp */
 // We allow several recursions if icerun is involved, just in case icerun is e.g. used to invoke a script

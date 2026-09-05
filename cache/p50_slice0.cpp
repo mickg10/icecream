@@ -1709,6 +1709,16 @@ const CActiveTx& CRoute::begin_v1(
         p29v1_->fill_answered = false;
         record(ActionType::TX_BEGIN, *active_);
         return *active_;
+    } catch (const std::exception& error) {
+        if (p29v1_->serializer.has_pending()) {
+            try {
+                p29v1_->serializer.abandon();
+            } catch (...) {
+            }
+        }
+        p29v1_->terminal = true;
+        active_.reset();
+        throw P50RoutePoisoned(error.what());
     } catch (...) {
         if (p29v1_->serializer.has_pending()) {
             try {
@@ -1718,7 +1728,7 @@ const CActiveTx& CRoute::begin_v1(
         }
         p29v1_->terminal = true;
         active_.reset();
-        throw;
+        throw P50RoutePoisoned("P29V1 route failed while beginning a TU");
     }
 }
 
@@ -1824,6 +1834,7 @@ void CRoute::record(ActionType action, const CActiveTx& active) {
     ActionRecord record;
     record.action = action;
     record.actor = ActorSide::C;
+    record.profile = active.begin.profile;
     record.c_store_guid = authority_.guid();
     record.f_store_guid = f_store_guid_;
     record.history_nonce = active.begin.history_nonce;
@@ -1910,7 +1921,8 @@ struct FStore::Namespace {
 
     bool established = false;
     uint64_t active_session_serial = 0;
-    std::optional<Route> route;
+    std::optional<ProfileId> active_profile;
+    std::map<ProfileId, Route> routes;
 };
 
 FStore::FStore(FStoreGuid guid, uint64_t first_session_serial, ActionTrace* trace,
@@ -1928,10 +1940,11 @@ FStore::FStore(FStoreGuid guid, uint64_t first_session_serial, ActionTrace* trac
 
 FStore::~FStore() = default;
 
-void FStore::abandon_pending(Namespace& space) noexcept {
-    if (!space.route || !space.route->pending)
+void FStore::abandon_pending(Namespace& space, ProfileId profile) noexcept {
+    const auto position = space.routes.find(profile);
+    if (position == space.routes.end() || !position->second.pending)
         return;
-    Namespace::Route& route = *space.route;
+    Namespace::Route& route = position->second;
     if (route.pending->begin.profile == ProfileId::P29V1 && route.p29v1 &&
         route.p29v1->deserializer.has_pending()) {
         try {
@@ -1951,6 +1964,7 @@ void FStore::record(ActionType action, SessionHandle session, const TxBegin* beg
     ActionRecord record;
     record.action = action;
     record.actor = ActorSide::F;
+    record.profile = session.profile;
     record.c_store_guid = session.c_store_guid;
     record.f_store_guid = guid_;
     record.session_serial = session.serial;
@@ -1960,10 +1974,13 @@ void FStore::record(ActionType action, SessionHandle session, const TxBegin* beg
     record.remaining_need = remaining_need;
     record.duplicate = duplicate;
     const auto position = namespaces_.find(session.c_store_guid);
-    if (position != namespaces_.end() && position->second->route) {
-        record.history_nonce = position->second->route->history_nonce;
-        record.rel_seq = position->second->route->next_rel_seq;
-        record.state_digest = position->second->route->state_digest;
+    if (position != namespaces_.end()) {
+        const auto route = position->second->routes.find(session.profile);
+        if (route != position->second->routes.end()) {
+            record.history_nonce = route->second.history_nonce;
+            record.rel_seq = route->second.next_rel_seq;
+            record.state_digest = route->second.state_digest;
+        }
     }
     if (begin) {
         record.history_nonce = begin->history_nonce;
@@ -1977,7 +1994,9 @@ void FStore::record(ActionType action, SessionHandle session, const TxBegin* beg
     trace_->record(std::move(record));
 }
 
-SessionHandle FStore::connect(CStoreGuid c_store_guid) {
+SessionHandle FStore::connect(CStoreGuid c_store_guid, ProfileId profile) {
+    if ((profile_bit(profile) & kOperationalProfileMask) == 0)
+        throw std::invalid_argument("F session profile is not operational");
     if (session_serial_exhausted_)
         throw std::overflow_error("session serial space exhausted until F store reset");
     const uint64_t serial = next_session_serial_;
@@ -1989,9 +2008,11 @@ SessionHandle FStore::connect(CStoreGuid c_store_guid) {
     if (inserted) position->second = std::make_unique<Namespace>();
     Namespace& space = *position->second;
     const bool replaces = space.active_session_serial != 0;
-    abandon_pending(space);
+    if (space.active_profile)
+        abandon_pending(space, *space.active_profile);
     space.active_session_serial = serial;
-    const SessionHandle session{c_store_guid, guid_, serial};
+    space.active_profile = profile;
+    const SessionHandle session{c_store_guid, guid_, serial, profile};
     record(replaces ? ActionType::SESSION_REPLACED : ActionType::SESSION_OPENED,
            session, nullptr);
     return session;
@@ -1999,9 +2020,10 @@ SessionHandle FStore::connect(CStoreGuid c_store_guid) {
 
 void FStore::disconnect(SessionHandle session) {
     Namespace& space = require_namespace(session);
-    abandon_pending(space);
+    abandon_pending(space, session.profile);
     record(ActionType::SESSION_DISCONNECTED, session, nullptr);
     space.active_session_serial = 0;
+    space.active_profile.reset();
 }
 
 SessionState FStore::resume(SessionHandle session) const {
@@ -2009,12 +2031,13 @@ SessionState FStore::resume(SessionHandle session) const {
     SessionState result;
     result.f_store_guid = guid_;
     result.namespace_present = space.established;
-    result.route_present = space.route.has_value();
-    if (space.route) {
-        result.history_nonce = space.route->history_nonce;
-        result.next_rel_seq = space.route->next_rel_seq;
-        result.state_digest = space.route->state_digest;
-        result.last_commit = space.route->last_commit;
+    const auto route = space.routes.find(session.profile);
+    result.route_present = route != space.routes.end();
+    if (route != space.routes.end()) {
+        result.history_nonce = route->second.history_nonce;
+        result.next_rel_seq = route->second.next_rel_seq;
+        result.state_digest = route->second.state_digest;
+        result.last_commit = route->second.last_commit;
     }
     return result;
 }
@@ -2022,26 +2045,32 @@ SessionState FStore::resume(SessionHandle session) const {
 void FStore::start_route(SessionHandle session, HistoryNonce history_nonce,
                          Digest128 initial_state_digest) {
     Namespace& space = require_namespace(session);
-    if (space.route) throw std::logic_error("F route already exists");
+    if (space.routes.contains(session.profile))
+        throw std::logic_error("F profile route already exists");
     if (initial_state_digest !=
         initial_route_digest(session.c_store_guid, history_nonce))
         throw std::logic_error("HISTORY_RESET initial digest was not derived from its route");
     space.established = true;
-    space.route = Namespace::Route{};
-    space.route->history_nonce = history_nonce;
-    space.route->state_digest = initial_state_digest;
+    auto [route, inserted] =
+        space.routes.try_emplace(session.profile);
+    if (!inserted)
+        throw std::logic_error("F profile route already exists");
+    route->second.history_nonce = history_nonce;
+    route->second.state_digest = initial_state_digest;
     record(ActionType::HISTORY_RESET, session, nullptr);
 }
 
 void FStore::begin(SessionHandle session, const TxBegin& begin, bool replay) {
     Namespace& space = require_namespace(session);
-    if (!space.established || !space.route)
+    const auto selected = space.routes.find(session.profile);
+    if (!space.established || selected == space.routes.end())
         throw std::logic_error("F route has not been established");
-    Namespace::Route& route = *space.route;
+    Namespace::Route& route = selected->second;
     if (begin.history_nonce != route.history_nonce || begin.rel_seq != route.next_rel_seq ||
         begin.pre_state_digest != route.state_digest)
         throw std::logic_error("TX_BEGIN does not match F's route cursor");
-    if (begin.profile != ProfileId::P29V1 ||
+    if (begin.profile != session.profile ||
+        session.profile != ProfileId::P29V1 ||
         begin.body.encoding != static_cast<uint16_t>(ProfileId::P29V1) ||
         begin.raw_bytes > p29v1_max_tu_bytes_)
         throw std::invalid_argument("P29V1 TX_BEGIN descriptors are invalid");
@@ -2076,9 +2105,11 @@ void FStore::begin(SessionHandle session, const TxBegin& begin, bool replay) {
 void FStore::append_component(SessionHandle session,
                               std::span<const uint8_t> bytes) {
     Namespace& space = require_namespace(session);
-    if (!space.route || !space.route->pending)
+    const auto selected = space.routes.find(session.profile);
+    if (selected == space.routes.end() || !selected->second.pending)
         throw std::logic_error("BODY data has no F ACTIVE_TX");
-    Namespace::FPending& pending = *space.route->pending;
+    Namespace::Route& route = selected->second;
+    Namespace::FPending& pending = *route.pending;
     const ComponentDescriptor& descriptor = pending.begin.body;
     if (pending.body_complete) {
         if (!bytes.empty())
@@ -2094,15 +2125,15 @@ void FStore::append_component(SessionHandle session,
     if (digest128(pending.body) != descriptor.digest)
         throw std::logic_error("BODY digest does not match TX_BEGIN");
     pending.body_complete = true;
-    if (!space.route->p29v1 || space.route->p29v1->terminal)
+    if (!route.p29v1 || route.p29v1->terminal)
         throw std::logic_error("P29V1 receiver state is unavailable");
     try {
         pending.p29v1_need =
-            space.route->p29v1->deserializer.receive_body(pending.body);
+            route.p29v1->deserializer.receive_body(pending.body);
         pending.p29v1_need.push_back(
             static_cast<uint8_t>(codec::P29WireKind::TuEnd));
         pending.p29v1_need.insert(pending.p29v1_need.end(), 4, 0);
-        if (space.route->p29v1->deserializer.root_reference_count() !=
+        if (route.p29v1->deserializer.root_reference_count() !=
             descriptor.decoded_bytes)
             throw std::logic_error(
                 "P29V1 BODY decoded count differs from its descriptor");
@@ -2113,10 +2144,10 @@ void FStore::append_component(SessionHandle session,
         record(ActionType::BODY_COMPLETE, session, &pending.begin);
         record(ActionType::NEED_RECORDED, session, &pending.begin);
     } catch (...) {
-        space.route->p29v1->terminal = true;
-        if (space.route->p29v1->deserializer.has_pending()) {
+        route.p29v1->terminal = true;
+        if (route.p29v1->deserializer.has_pending()) {
             try {
-                space.route->p29v1->deserializer.abandon();
+                route.p29v1->deserializer.abandon();
             } catch (...) {
             }
         }
@@ -2130,30 +2161,34 @@ void FStore::append_body(SessionHandle session, std::span<const uint8_t> bytes) 
 
 std::vector<uint8_t> FStore::p29v1_need_frames(SessionHandle session) const {
     const Namespace& space = require_namespace(session);
-    if (!space.route || !space.route->pending ||
-        space.route->pending->begin.profile != ProfileId::P29V1 ||
-        !space.route->pending->body_complete ||
-        space.route->pending->p29v1_need.empty())
+    const auto selected = space.routes.find(session.profile);
+    if (selected == space.routes.end() || !selected->second.pending ||
+        selected->second.pending->begin.profile != ProfileId::P29V1 ||
+        !selected->second.pending->body_complete ||
+        selected->second.pending->p29v1_need.empty())
         throw std::logic_error("P29V1 NEED is unavailable before exact BODY");
-    return space.route->pending->p29v1_need;
+    return selected->second.pending->p29v1_need;
 }
 
 bool FStore::p29v1_system_source_reuse(SessionHandle session) const {
     const Namespace& space = require_namespace(session);
-    if (!space.route || !space.route->pending || !space.route->p29v1 ||
-        space.route->pending->begin.profile != ProfileId::P29V1 ||
-        !space.route->p29v1->fixed_system_source_reuse)
+    const auto selected = space.routes.find(session.profile);
+    if (selected == space.routes.end() || !selected->second.pending ||
+        !selected->second.p29v1 ||
+        selected->second.pending->begin.profile != ProfileId::P29V1 ||
+        !selected->second.p29v1->fixed_system_source_reuse)
         throw std::logic_error("P29V1 reuse decision is unavailable");
-    return *space.route->p29v1->fixed_system_source_reuse;
+    return *selected->second.p29v1->fixed_system_source_reuse;
 }
 
 void FStore::append_fill_v1(SessionHandle session,
                             std::vector<uint8_t> inner_fill) {
     Namespace& space = require_namespace(session);
-    if (!space.route || !space.route->pending ||
-        space.route->pending->begin.profile != ProfileId::P29V1)
+    const auto selected = space.routes.find(session.profile);
+    if (selected == space.routes.end() || !selected->second.pending ||
+        selected->second.pending->begin.profile != ProfileId::P29V1)
         throw std::logic_error("P29V1 FILL has no active transaction");
-    Namespace::FPending& pending = *space.route->pending;
+    Namespace::FPending& pending = *selected->second.pending;
     if (!pending.p29v1_fill.empty())
         throw std::logic_error("P29V1 FILL was received twice");
     if (inner_fill.empty())
@@ -2163,32 +2198,34 @@ void FStore::append_fill_v1(SessionHandle session,
 
 std::vector<uint8_t> FStore::materialize_and_verify(SessionHandle session) {
     Namespace& space = require_namespace(session);
-    if (!space.route || !space.route->pending)
+    const auto selected = space.routes.find(session.profile);
+    if (selected == space.routes.end() || !selected->second.pending)
         throw std::logic_error("F route has no ACTIVE_TX to materialize");
-    Namespace::FPending& pending = *space.route->pending;
-    if (pending.begin.profile != ProfileId::P29V1 || !space.route->p29v1 ||
-        space.route->p29v1->terminal || !pending.body_complete ||
+    Namespace::Route& route = selected->second;
+    Namespace::FPending& pending = *route.pending;
+    if (pending.begin.profile != ProfileId::P29V1 || !route.p29v1 ||
+        route.p29v1->terminal || !pending.body_complete ||
         pending.p29v1_fill.empty())
         throw std::logic_error(
             "P29V1 input cannot materialize before BODY, NEED, and FILL");
     try {
-        (void)space.route->p29v1->deserializer.receive_fill(
+        (void)route.p29v1->deserializer.receive_fill(
             pending.p29v1_fill, false,
             static_cast<size_t>(pending.begin.raw_bytes));
 #if defined(ICECC_P29V1_MUTANT_DOUBLE_MATERIALIZE)
         const auto scratch =
-            space.route->p29v1->deserializer.rematerialize_for_mutant();
+            route.p29v1->deserializer.rematerialize_for_mutant();
         if (scratch.bytes.size() != pending.begin.raw_bytes ||
             digest128(scratch.bytes) != pending.begin.raw_digest ||
             scratch.occurrences.size() !=
-                space.route->p29v1->deserializer.mutant_occurrence_count() ||
+                route.p29v1->deserializer.mutant_occurrence_count() ||
             compute_transaction_digest(pending.begin, pending.body) !=
                 pending.begin.transaction_digest)
             throw std::logic_error(
                 "P29V1 mutant rematerialization does not match TX_BEGIN");
 #endif
         std::vector<uint8_t> result =
-            space.route->p29v1->deserializer.take_materialized();
+            route.p29v1->deserializer.take_materialized();
         if (result.size() != pending.begin.raw_bytes ||
             digest128(result) != pending.begin.raw_digest ||
             compute_transaction_digest(pending.begin, pending.body) !=
@@ -2196,20 +2233,20 @@ std::vector<uint8_t> FStore::materialize_and_verify(SessionHandle session) {
             throw std::logic_error(
                 "P29V1 materialized input does not match TX_BEGIN exactly");
         const std::span<const uint8_t> segment =
-            space.route->p29v1->deserializer.pending_segment();
+            route.p29v1->deserializer.pending_segment();
         if (segment.size() > result.size())
             throw std::logic_error(
                 "P29V1 staged segment exceeds materialized input");
         pending.p29v1_segment_digest =
-            space.route->p29v1->deserializer.pending_segment_digest();
+            route.p29v1->deserializer.pending_segment_digest();
         pending.p29v1_materialized = true;
         record(ActionType::INPUT_MATERIALIZED, session, &pending.begin);
         return result;
     } catch (...) {
-        space.route->p29v1->terminal = true;
-        if (space.route->p29v1->deserializer.has_pending()) {
+        route.p29v1->terminal = true;
+        if (route.p29v1->deserializer.has_pending()) {
             try {
-                space.route->p29v1->deserializer.abandon();
+                route.p29v1->deserializer.abandon();
             } catch (...) {
             }
         }
@@ -2219,12 +2256,13 @@ std::vector<uint8_t> FStore::materialize_and_verify(SessionHandle session) {
 
 TxCommit FStore::commit_input(SessionHandle session) {
     Namespace& space = require_namespace(session);
-    if (!space.route || !space.route->pending ||
-        space.route->pending->begin.profile != ProfileId::P29V1 ||
-        !space.route->pending->p29v1_materialized || !space.route->p29v1 ||
-        space.route->p29v1->terminal)
+    const auto selected = space.routes.find(session.profile);
+    if (selected == space.routes.end() || !selected->second.pending ||
+        selected->second.pending->begin.profile != ProfileId::P29V1 ||
+        !selected->second.pending->p29v1_materialized ||
+        !selected->second.p29v1 || selected->second.p29v1->terminal)
         throw std::logic_error("exact P29V1 input has not materialized");
-    Namespace::Route& route = *space.route;
+    Namespace::Route& route = selected->second;
     const TxBegin begin = route.pending->begin;
     if (route.next_rel_seq.value == std::numeric_limits<uint64_t>::max())
         throw std::overflow_error("F REL_SEQ space exhausted");
@@ -2251,7 +2289,7 @@ TxCommit FStore::commit_input(SessionHandle session) {
 void FStore::abandon_input(SessionHandle session) noexcept {
     try {
         Namespace& space = require_namespace(session);
-        abandon_pending(space);
+        abandon_pending(space, session.profile);
     } catch (...) {
     }
 }
@@ -2259,11 +2297,13 @@ void FStore::abandon_input(SessionHandle session) noexcept {
 uint64_t FStore::pending_segment_bytes(SessionHandle session) const noexcept {
     try {
         const Namespace& space = require_namespace(session);
-        if (!space.route || !space.route->pending ||
-            space.route->pending->begin.profile != ProfileId::P29V1 ||
-            !space.route->pending->p29v1_materialized || !space.route->p29v1)
+        const auto selected = space.routes.find(session.profile);
+        if (selected == space.routes.end() || !selected->second.pending ||
+            selected->second.pending->begin.profile != ProfileId::P29V1 ||
+            !selected->second.pending->p29v1_materialized ||
+            !selected->second.p29v1)
             return 0;
-        return space.route->p29v1->deserializer.pending_segment().size();
+        return selected->second.p29v1->deserializer.pending_segment().size();
     } catch (...) {
         return 0;
     }
@@ -2272,11 +2312,12 @@ uint64_t FStore::pending_segment_bytes(SessionHandle session) const noexcept {
 Digest128 FStore::pending_segment_digest(SessionHandle session) const noexcept {
     try {
         const Namespace& space = require_namespace(session);
-        if (!space.route || !space.route->pending ||
-            space.route->pending->begin.profile != ProfileId::P29V1 ||
-            !space.route->pending->p29v1_materialized)
+        const auto selected = space.routes.find(session.profile);
+        if (selected == space.routes.end() || !selected->second.pending ||
+            selected->second.pending->begin.profile != ProfileId::P29V1 ||
+            !selected->second.pending->p29v1_materialized)
             return {};
-        return space.route->pending->p29v1_segment_digest;
+        return selected->second.pending->p29v1_segment_digest;
     } catch (...) {
         return {};
     }
@@ -2284,9 +2325,11 @@ Digest128 FStore::pending_segment_digest(SessionHandle session) const noexcept {
 
 void FStore::forget_route(SessionHandle session) {
     Namespace& space = require_namespace(session);
-    if (space.route && space.route->pending)
+    const auto selected = space.routes.find(session.profile);
+    if (selected != space.routes.end() && selected->second.pending)
         throw std::logic_error("HISTORY_RESET is only legal outside ACTIVE_TX");
-    space.route.reset();
+    if (selected != space.routes.end())
+        space.routes.erase(selected);
     space.established = true;
 }
 
@@ -2303,7 +2346,8 @@ FStore::Namespace& FStore::require_namespace(SessionHandle session) {
     const auto position = namespaces_.find(session.c_store_guid);
     if (session.f_store_guid != guid_ || position == namespaces_.end() ||
         session.serial == 0 ||
-        position->second->active_session_serial != session.serial)
+        position->second->active_session_serial != session.serial ||
+        position->second->active_profile != session.profile)
         throw std::logic_error("stale or unknown F session");
     return *position->second;
 }
@@ -2312,7 +2356,8 @@ const FStore::Namespace& FStore::require_namespace(SessionHandle session) const 
     const auto position = namespaces_.find(session.c_store_guid);
     if (session.f_store_guid != guid_ || position == namespaces_.end() ||
         session.serial == 0 ||
-        position->second->active_session_serial != session.serial)
+        position->second->active_session_serial != session.serial ||
+        position->second->active_profile != session.profile)
         throw std::logic_error("stale or unknown F session");
     return *position->second;
 }

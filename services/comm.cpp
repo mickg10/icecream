@@ -4154,6 +4154,11 @@ GetCSMsg::GetCSMsg(const Environments &envs, const std::string &f,
     , client_count(_client_count)
     , niceness(_niceness)
     , command_summary(_command_summary)
+    , cache_protocol(0)
+    , cache_profile_mask(0)
+    , cache_affinity_profile_mask(0)
+    , cache_affinity_port(0)
+    , cache_request_tail_valid(true)
 {
     // These have been introduced in protocol version 42.
     if( required_features & ( NODE_FEATURE_ENV_XZ | NODE_FEATURE_ENV_ZSTD ))
@@ -4213,6 +4218,31 @@ void GetCSMsg::fill_from_channel(MsgChannel *c)
     } else {
         command_summary.clear();
     }
+
+    cache_protocol = 0;
+    cache_profile_mask = 0;
+    cache_affinity_profile_mask = 0;
+    cache_affinity_port = 0;
+    cache_affinity_host.clear();
+    cache_request_tail_valid = true;
+    if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, c)) {
+        /* The protocol-50 request tail is mandatory.  Its string makes the
+           byte count variable, so bound it before reading and require exact
+           frame exhaustion afterwards. */
+        if (c->current_message_bytes_remaining() <
+            5 * sizeof(uint32_t) + 1) {
+            cache_request_tail_valid = false;
+            return;
+        }
+        *c >> cache_protocol;
+        *c >> cache_profile_mask;
+        *c >> cache_affinity_profile_mask;
+        *c >> cache_affinity_port;
+        cache_request_tail_valid = c->read_bounded_string(
+            cache_affinity_host, P50_CACHE_AFFINITY_HOST_MAX);
+        if (c->current_message_bytes_remaining() != 0)
+            cache_request_tail_valid = false;
+    }
 }
 
 void GetCSMsg::send_to_channel(MsgChannel *c) const
@@ -4257,6 +4287,22 @@ void GetCSMsg::send_to_channel(MsgChannel *c) const
     if (IS_PROTOCOL_VERSION(46, c)) {
         *c << command_summary;
     }
+    if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, c)) {
+        *c << cache_protocol;
+        *c << cache_profile_mask;
+        *c << cache_affinity_profile_mask;
+        *c << cache_affinity_port;
+        *c << cache_affinity_host;
+    }
+}
+
+bool GetCSMsg::valid_payload() const
+{
+    return cache_request_tail_valid &&
+        p50_cache_client_request_is_valid(
+            cache_protocol, cache_profile_mask,
+            cache_affinity_profile_mask, cache_affinity_port,
+            cache_affinity_host);
 }
 
 void UseCSMsg::fill_from_channel(MsgChannel *c)
@@ -4369,7 +4415,7 @@ bool UseCSMsg::valid_payload() const
     const bool assignment_complete = job_id != 0 && epoch_present && nonce_present;
     const bool cache_absent = cache_advertisement_is_wholly_absent(
         cache_endpoint_port, cache_protocol, cache_profile_mask);
-    const bool cache_present = cache_advertisement_is_valid_present(
+    const bool cache_present = cache_assignment_is_valid_present(
         cache_endpoint_port, cache_protocol, cache_profile_mask);
     return cache_tail_valid
         && (assignment_absent || assignment_complete)

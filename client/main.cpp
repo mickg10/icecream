@@ -677,7 +677,39 @@ int main(int argc, char **argv)
             int rate = s ? atoi(s) : 0;
 
             invocation_timing_mark_enqueue("remote");
-            ret = build_remote(job, local_daemon, envs, rate);
+            bool p50_legacy_retry = false;
+            for (;;) {
+                try {
+                    ret = build_remote(job, local_daemon, envs, rate,
+                                       !p50_legacy_retry);
+                    break;
+                } catch (const remote_error &error) {
+                    const bool strict_p50 =
+                        getenv("ICECC_P50_C1F1_REQUIRED") != nullptr;
+                    if (error.errorCode != 106 || p50_legacy_retry || strict_p50)
+                        throw;
+
+                    /* The failed cache assignment has already been closed by
+                       F with its exact terminal JobDone.  End the submitter
+                       proxy without emitting a duplicate settlement, then use
+                       a new wrapper connection/client id for a genuinely fresh
+                       GetCS.  Its cache request is canonical absence, so the C
+                       daemon and scheduler can only select a legacy assignment.
+                       A failure of this second assignment escapes the loop and
+                       follows the existing one-time local fallback below. */
+                    log_warning()
+                        << "P50 assignment failed; requesting one fresh legacy remote assignment"
+                        << endl;
+                    (void)local_daemon->send_msg(EndMsg());
+                    delete local_daemon;
+                    local_daemon = get_local_daemon();
+                    if (!local_daemon)
+                        throw client_error(
+                            24,
+                            "Error 24 - unable to reconnect for P50 legacy retry");
+                    p50_legacy_retry = true;
+                }
+            }
             invocation_timing_mark_finish(ret);
             invocation_timing_send(local_daemon);
 

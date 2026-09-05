@@ -43,6 +43,14 @@ contract() {
     require_text "$root/client/remote.cpp" 'ICECC_P50_C1F1_REQUIRED' || return 1
     require_text "$root/client/remote.cpp" \
         'strict all-P50 run refuses scheduler-selected localhost' || return 1
+    require_text "$root/unittests/p50compilee2e-run.sh" \
+        'worker_scheduler_host=${ICECC_P50_C1F1_WORKER_SCHEDULER_HOST:-}' || return 1
+    require_text "$root/unittests/p50compilee2e-run.sh" \
+        '-s "$worker_scheduler_host:$port_sched"' || return 1
+    require_text "$root/unittests/p50compilee2e-run.sh" \
+        'accepted $worker_scheduler_host' || return 1
+    require_text "$root/unittests/p50compilee2e-run.sh" \
+        'I am known as $worker_scheduler_host' || return 1
     require_text "$root/client/remote.cpp" 'ICECC_P50_C1F1_TIMEOUT' || return 1
     require_text "$root/daemon/workit.cpp" 'ICECC_P50_C1F1_REQUIRED' || return 1
     require_text "$root/client/remote.cpp" 'job.setCompileInputIdentity(*identity)' || return 1
@@ -155,6 +163,10 @@ for pair in \
     "daemon/workit.cpp|ZSTD_TU" \
     "client/remote.cpp|ICECC_P50_C1F1_REQUIRED" \
     "client/remote.cpp|strict all-P50 run refuses scheduler-selected localhost" \
+    "unittests/p50compilee2e-run.sh|worker_scheduler_host=\${ICECC_P50_C1F1_WORKER_SCHEDULER_HOST:-}" \
+    "unittests/p50compilee2e-run.sh|-s \"\$worker_scheduler_host:\$port_sched\"" \
+    "unittests/p50compilee2e-run.sh|accepted \$worker_scheduler_host" \
+    "unittests/p50compilee2e-run.sh|I am known as \$worker_scheduler_host" \
     "daemon/workit.cpp|ICECC_P50_C1F1_REQUIRED" \
     "client/remote.cpp|job.setCompileInputIdentity(*identity)" \
     "client/remote.cpp|P50CacheSessionFdRequestMsg(fd_request)" \

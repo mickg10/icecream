@@ -29,7 +29,7 @@ grep -F 'impl_->receive_need' "$endpoint" >/dev/null
 grep -F 'impl_->receive_fill' "$endpoint" >/dev/null
 grep -F 'impl_->append_body' "$endpoint" >/dev/null
 grep -F 'pending.dialogue->commit_visible(materialized.commit)' "$endpoint" >/dev/null
-grep -F 'space.route->pending->dialogue->discard_tentative()' "$endpoint" >/dev/null
+grep -F 'route.pending->dialogue->discard_tentative()' "$endpoint" >/dev/null
 grep -F 'P50_PROFILE_INTERFACE.md' "$src/cache/Makefile.am" >/dev/null
 
 mutant=$(mktemp "${TMPDIR:-/tmp}/p50profile-mutant.XXXXXX")

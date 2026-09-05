@@ -23,12 +23,22 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
 namespace icecc::p50 {
 
 class GlobalResourceTrace;
+
+/* A C-side P29V1 authority failed while reserving/initializing its permanent
+   interner.  This exception is intentionally narrower than length_error:
+   callers may disable only P29V1 for the current supervised READY lease, while
+   ordinary per-TU size errors and transport failures remain retryable. */
+class P29V1CapabilityUnavailable : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 namespace sidecar {
 class P5coEndpointHandoff;

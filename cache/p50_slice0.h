@@ -10,6 +10,7 @@
 #include <optional>
 #include <set>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -17,6 +18,14 @@
 #include <vector>
 
 namespace icecc::p50 {
+
+// Thrown only after a C route operation has made that route permanently
+// non-runnable.  Callers must distinguish it from ordinary input validation
+// or size errors and replace the whole supervised C sidecar immediately.
+class P50RoutePoisoned : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 class P50PreparationAuthority;
 
@@ -352,6 +361,7 @@ struct SessionHandle {
     CStoreGuid c_store_guid{};
     FStoreGuid f_store_guid{};
     uint64_t serial = 0;
+    ProfileId profile = ProfileId::P29V1;
     auto operator<=>(const SessionHandle&) const = default;
 };
 
@@ -365,7 +375,8 @@ public:
     FStore(const FStore&) = delete;
     FStore& operator=(const FStore&) = delete;
 
-    SessionHandle connect(CStoreGuid c_store_guid);
+    SessionHandle connect(CStoreGuid c_store_guid,
+                          ProfileId profile = ProfileId::P29V1);
     void disconnect(SessionHandle session);
     [[nodiscard]] SessionState resume(SessionHandle session) const;
     void start_route(SessionHandle session, HistoryNonce history_nonce,
@@ -392,7 +403,7 @@ private:
     struct Namespace;
     Namespace& require_namespace(SessionHandle session);
     const Namespace& require_namespace(SessionHandle session) const;
-    void abandon_pending(Namespace& space) noexcept;
+    void abandon_pending(Namespace& space, ProfileId profile) noexcept;
     void append_component(SessionHandle session,
                           std::span<const uint8_t> bytes);
     void record(ActionType action, SessionHandle session, const TxBegin* begin,

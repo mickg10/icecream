@@ -50,7 +50,7 @@
      result back via dump_internals (GetInternalStatus) -- the only way an
      external test process can observe one Client's private field.
 
-   Usage: cachehandoffdaemon <iceccd>
+   Usage: cachehandoffdaemon <iceccd> <icecc-cache-service>
 */
 #include "comm.h"
 
@@ -68,6 +68,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 #include <string>
 
 using Clock = std::chrono::steady_clock;
@@ -277,25 +279,57 @@ static bool wait_child(pid_t pid, int timeout_msec, int *status)
     return false;
 }
 
+static bool wait_file_contains(const std::string &path,
+                               const std::string &needle,
+                               int timeout_msec)
+{
+    const Clock::time_point deadline = Clock::now()
+        + std::chrono::milliseconds(timeout_msec);
+    while (Clock::now() < deadline) {
+        std::ifstream input(path);
+        std::ostringstream contents;
+        contents << input.rdbuf();
+        if (contents.str().find(needle) != std::string::npos) {
+            return true;
+        }
+        usleep(20 * 1000);
+    }
+    return false;
+}
+
+static std::string read_file_contents(const std::string &path)
+{
+    std::ifstream input(path);
+    std::ostringstream contents;
+    contents << input.rdbuf();
+    return contents.str();
+}
+
 int main(int argc, char **argv)
 {
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s <iceccd>\n", argv[0]);
+    if (argc != 3) {
+        fprintf(stderr, "usage: %s <iceccd> <icecc-cache-service>\n", argv[0]);
         return 2;
     }
     signal(SIGPIPE, SIG_IGN);
 
-    char temp_template[] = "/tmp/icecream-s2-daemon-relay.XXXXXX";
-    char *temp = mkdtemp(temp_template);
+    const char *temporary_root = std::getenv("TMPDIR");
+    std::string temp_template =
+        std::string(temporary_root && temporary_root[0] ? temporary_root : "/tmp")
+        + "/icecream-s2-daemon-relay.XXXXXX";
+    char *temp = mkdtemp(&temp_template[0]);
     if (!temp) {
         perror("mkdtemp");
         return 2;
     }
     const std::string work(temp);
     const std::string envdir = work + "/envs";
+    const std::string runtime = work + "/cache-runtime";
     const std::string socket_path = work + "/iceccd.sock";
     const std::string daemon_log = work + "/iceccd.log";
+    const std::string ready_trace = work + "/ready.trace";
     mkdir(envdir.c_str(), 0700);
+    mkdir(runtime.c_str(), 0700);
     fprintf(stderr, "retained work directory: %s\n", work.c_str());
 
     const int scheduler_port = reserve_port();
@@ -318,6 +352,8 @@ int main(int argc, char **argv)
         snprintf(daemon_port_text, sizeof(daemon_port_text), "%d", daemon_port);
         setenv("ICECC_TESTS", "1", 1);
         setenv("ICECC_TEST_SOCKET", socket_path.c_str(), 1);
+        setenv("ICECC_P50_MODE", "on", 1);
+        setenv("ICECC_P50_TEST_READY_TRACE", ready_trace.c_str(), 1);
         /* S2 Gap 3 (BigOracle d23d9c5d HOLD): arms the NoCS-site poison/
            record hook (see test_poison_cache_handoff_if_armed's own
            comment in daemon/main.cpp) for Client D below.  Client A/B/C
@@ -334,6 +370,7 @@ int main(int argc, char **argv)
         execl(argv[1], argv[1], "-m", "2", "-p", daemon_port_text,
               "-s", scheduler_spec, "-n", "s2-relay-gate", "-N", "s2-relay-daemon",
               "-b", envdir.c_str(), "-l", daemon_log.c_str(),
+              "--cache-service", argv[2], "--cache-runtime-dir", runtime.c_str(),
               "-v", "-v", "-v", static_cast<char *>(nullptr));
         perror("execl iceccd");
         _exit(127);
@@ -364,10 +401,16 @@ int main(int argc, char **argv)
     const uint32_t observed_daemon_port = login ? login->port : 0;
     delete login_wire;
     if (scheduler) {
-        const ConfCSMsg legacy_config(UINT64_C(0x5200000000000001), ConfCSMsg::Legacy);
-        REQUIRE(scheduler->send_msg(legacy_config),
+        const ConfCSMsg advisory_config(UINT64_C(0x5200000000000001),
+                                        ConfCSMsg::Advisory);
+        REQUIRE(scheduler->send_msg(advisory_config),
                 "fake scheduler activated the session");
     }
+    REQUIRE(wait_file_contains(daemon_log, "cache sidecar adapter state=2", 10000),
+            "authenticated local cache sidecar reached READY before C capability publication");
+    REQUIRE(wait_file_contains(ready_trace, "READY v2 ", 5000),
+            "C sidecar emitted its exact READY-lease witness");
+    const std::string initial_ready_witness = read_file_contents(ready_trace);
 
     /* S2 (BigOracle, 5th gap): consume client_id=1 with a throwaway
        connection before Client A, so Client A's own (daemon-assigned,
@@ -396,6 +439,8 @@ int main(int argc, char **argv)
     REQUIRE(client != nullptr, "local client A connected");
     GetCSMsg request(Environments(), "s2-relay.cpp", CompileJob::Lang_CXX,
                      1, "x86_64", 0, std::string(), 0, 0, 0);
+    request.cache_protocol = CACHE_WIRE_REVISION;
+    request.cache_profile_mask = CACHE_ADVERTISABLE_PROFILE_MASK;
     REQUIRE(client && client->send_msg(request),
             "local client A requested one assignment");
 
@@ -404,6 +449,13 @@ int main(int argc, char **argv)
     GetCSMsg *forwarded = forwarded_wire ? dynamic_cast<GetCSMsg *>(forwarded_wire)
                                          : nullptr;
     REQUIRE(forwarded != nullptr, "fake scheduler received the forwarded GetCS");
+    REQUIRE(forwarded && forwarded->cache_protocol == CACHE_WIRE_REVISION
+                && forwarded->cache_profile_mask ==
+                    CACHE_ADVERTISABLE_PROFILE_MASK
+                && forwarded->cache_affinity_profile_mask == 0
+                && forwarded->cache_affinity_port == 0
+                && forwarded->cache_affinity_host.empty(),
+            "C daemon authors enabled capabilities and starts without a warm hint");
     REQUIRE(forwarded && forwarded->client_id != UINT32_C(1),
             "S2 Gap 5: client A's real daemon-assigned client_id is NOT "
             "1 -- the throwaway connection above did its job, so a "
@@ -459,6 +511,14 @@ int main(int argc, char **argv)
             "matched_job_id, epoch, and nonce all survive exactly");
     delete client_wire;
 
+    JobDoneMsg successful_done(
+        wire_job_id, 0,
+        static_cast<uint32_t>(JobDoneMsg::FROM_SUBMITTER) |
+            static_cast<uint32_t>(JobDoneMsg::P50CacheRouteObservation), 0,
+        assignment_epoch, assignment_nonce);
+    REQUIRE(client && client->send_msg(successful_done),
+            "client A reports the local-only successful cache-route observation");
+
     /* Client C: the scheduler selects a REMOTE host as F -- hostname/port
        matching neither this daemon's own remote-observed identity nor
        127.0.0.1, so msg->hostname == remote_name && msg->port ==
@@ -475,6 +535,8 @@ int main(int argc, char **argv)
     REQUIRE(client_c != nullptr, "local client C connected");
     GetCSMsg request_c(Environments(), "s2-relay-c.cpp", CompileJob::Lang_CXX,
                        1, "x86_64", 0, std::string(), 0, 0, 0);
+    request_c.cache_protocol = CACHE_WIRE_REVISION;
+    request_c.cache_profile_mask = CACHE_ADVERTISABLE_PROFILE_MASK;
     REQUIRE(client_c && client_c->send_msg(request_c),
             "local client C requested a third assignment");
 
@@ -484,6 +546,21 @@ int main(int argc, char **argv)
         ? dynamic_cast<GetCSMsg *>(forwarded_c_wire) : nullptr;
     REQUIRE(forwarded_c != nullptr,
             "fake scheduler received client C's forwarded GetCS");
+    const bool self_endpoint_is_schedulable = observed_daemon_port != 0;
+    REQUIRE(forwarded_c &&
+                forwarded_c->cache_protocol == CACHE_WIRE_REVISION &&
+                forwarded_c->cache_profile_mask ==
+                    CACHE_ADVERTISABLE_PROFILE_MASK &&
+                (self_endpoint_is_schedulable
+                     ? forwarded_c->cache_affinity_profile_mask ==
+                           CACHE_PROFILE_ZSTD_TU &&
+                           forwarded_c->cache_affinity_port ==
+                               observed_daemon_port &&
+                           forwarded_c->cache_affinity_host == "127.0.0.1"
+                     : forwarded_c->cache_affinity_profile_mask == 0 &&
+                           forwarded_c->cache_affinity_port == 0 &&
+                           forwarded_c->cache_affinity_host.empty()),
+            "next GetCS carries an exact host/ordinary-port/profile warm hint only for a schedulable endpoint");
 
     const std::string remote_f_host = "192.0.2.77";
     const uint32_t remote_f_port = UINT32_C(54321);
@@ -551,6 +628,17 @@ int main(int argc, char **argv)
             "vehicle (send_msg(*msg)), not just c->usecsmsg's introspection "
             "copy");
     delete client_c_wire;
+
+    JobDoneMsg remote_successful_observation(
+        remote_wire_job_id, 0,
+        static_cast<uint32_t>(JobDoneMsg::FROM_SUBMITTER) |
+            static_cast<uint32_t>(JobDoneMsg::P50CacheRouteObservation), 0,
+        remote_assignment_epoch, remote_assignment_nonce,
+        remote_c_guid, remote_tu_seq);
+    REQUIRE(client_c && client_c->send_msg(remote_successful_observation),
+            "remote client C reports an exact successful cache-route observation");
+    REQUIRE(client_c && !request_internals(client_c, 5000).empty(),
+            "a same-channel status round trip orders the successful observation before the scheduler bounce");
     delete client_c;
 
     /* A real compiler wrapper can disconnect after receiving UseCS but before
@@ -571,6 +659,71 @@ int main(int argc, char **argv)
                 && client_c_done->tuSeq() == remote_tu_seq,
             "submitter teardown settles the exact retained UseCS assignment and compile identity");
     delete client_c_done_wire;
+
+    /* A scheduler bounce is not a C-sidecar incarnation change.  Drop the
+       active fake-S connection, accept the daemon's reconnect, and submit a
+       GetCS while that connection is still only a LOGIN_ATTEMPT.  ConfCS must
+       re-drive it with the original capability and the warm remote-F hint;
+       the exact READY trace must remain byte-identical, proving no new PID,
+       lease, or C/F store identity was minted merely because S disappeared. */
+    delete scheduler;
+    scheduler = nullptr;
+    Msg *relogin_wire = nullptr;
+    scheduler = accept_login_channel(listener, 15000, &relogin_wire);
+    LoginMsg *relogin = relogin_wire
+        ? dynamic_cast<LoginMsg *>(relogin_wire) : nullptr;
+    REQUIRE(scheduler != nullptr && relogin != nullptr,
+            "iceccd reconnected to fake S after the established-session bounce");
+    REQUIRE(relogin && !relogin->hasCacheAdvertisement(),
+            "reconnecting Login remains canonically cache-absent before ConfCS");
+    delete relogin_wire;
+
+    MsgChannel *client_bounce = connect_unix_bounded(socket_path, 5000);
+    REQUIRE(client_bounce != nullptr,
+            "post-bounce client connected during the scheduler LOGIN_ATTEMPT");
+    GetCSMsg request_bounce(Environments(), "s-bounce.cpp",
+                            CompileJob::Lang_CXX, 1, "x86_64", 0,
+                            std::string(), 0, 0, 0);
+    request_bounce.cache_protocol = CACHE_WIRE_REVISION;
+    request_bounce.cache_profile_mask = CACHE_ADVERTISABLE_PROFILE_MASK;
+    REQUIRE(client_bounce && client_bounce->send_msg(request_bounce),
+            "post-bounce client submitted a P50-capable GetCS before ConfCS");
+
+    const ConfCSMsg bounce_config(UINT64_C(0x5200000000000003),
+                                  ConfCSMsg::Advisory);
+    REQUIRE(scheduler && scheduler->send_msg(bounce_config),
+            "fake S activated the replacement scheduler session");
+    Msg *forwarded_bounce_wire = scheduler
+        ? wait_for_type(scheduler, Msg::GET_CS, 5000) : nullptr;
+    GetCSMsg *forwarded_bounce = forwarded_bounce_wire
+        ? dynamic_cast<GetCSMsg *>(forwarded_bounce_wire) : nullptr;
+    REQUIRE(forwarded_bounce != nullptr,
+            "held post-bounce GetCS was re-driven immediately after ConfCS");
+    REQUIRE(forwarded_bounce &&
+                forwarded_bounce->cache_protocol == CACHE_WIRE_REVISION &&
+                forwarded_bounce->cache_profile_mask ==
+                    CACHE_ADVERTISABLE_PROFILE_MASK &&
+                forwarded_bounce->cache_affinity_profile_mask ==
+                    CACHE_PROFILE_ZSTD_TU &&
+                forwarded_bounce->cache_affinity_port == remote_f_port &&
+                forwarded_bounce->cache_affinity_host == remote_f_host,
+            "same READY lease preserves capability and exact warm affinity across an S bounce");
+    REQUIRE(read_file_contents(ready_trace) == initial_ready_witness,
+            "S bounce preserved the exact sidecar PID, ReadyLease, and C/F store identities");
+
+    if (scheduler && forwarded_bounce) {
+        NoCSMsg no_cs_bounce(UINT32_C(0x00005205),
+                             forwarded_bounce->client_id);
+        REQUIRE(scheduler->send_msg(no_cs_bounce),
+                "fake S resolved the post-bounce probe with NoCS");
+    }
+    delete forwarded_bounce_wire;
+    Msg *client_bounce_wire = client_bounce
+        ? wait_for_type(client_bounce, Msg::USE_CS, 5000) : nullptr;
+    REQUIRE(client_bounce_wire != nullptr,
+            "post-bounce probe received its bounded local fallback");
+    delete client_bounce_wire;
+    delete client_bounce;
 
     /* Client D (BigOracle d23d9c5d HOLD, Gap 3 -- reused-client clearing,
        doubling as the blueprint's "Focused test"): Daemon::scheduler_no_cs
@@ -614,6 +767,12 @@ int main(int argc, char **argv)
         ? dynamic_cast<GetCSMsg *>(forwarded_d_wire) : nullptr;
     REQUIRE(forwarded_d != nullptr,
             "fake scheduler received client D's forwarded GetCS");
+    REQUIRE(forwarded_d && forwarded_d->cache_protocol == 0
+                && forwarded_d->cache_profile_mask == 0
+                && forwarded_d->cache_affinity_profile_mask == 0
+                && forwarded_d->cache_affinity_port == 0
+                && forwarded_d->cache_affinity_host.empty(),
+            "canonical wrapper absence is a per-job downward opt-out even when the C daemon is enabled and has a warm hint");
 
     if (scheduler && forwarded_d) {
         NoCSMsg no_cs_reply(UINT32_C(0x00005204), forwarded_d->client_id);
@@ -672,6 +831,8 @@ int main(int argc, char **argv)
     REQUIRE(client_b != nullptr, "local client B connected");
     GetCSMsg request_b(Environments(), "s2-relay-b.cpp", CompileJob::Lang_CXX,
                        1, "x86_64", 0, std::string(), 0, 0, 0);
+    request_b.cache_protocol = CACHE_WIRE_REVISION;
+    request_b.cache_profile_mask = CACHE_ADVERTISABLE_PROFILE_MASK;
     REQUIRE(client_b && client_b->send_msg(request_b),
             "local client B requested a second assignment");
 

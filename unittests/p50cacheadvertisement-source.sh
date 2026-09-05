@@ -1,5 +1,5 @@
 #!/bin/sh
-# Deletion-sensitive scope gate for the inert Login-only advertisement.
+# Deletion-sensitive gate for protocol-50 capability negotiation and routing.
 set -eu
 
 src=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
@@ -41,9 +41,9 @@ require_absent() {
     echo "ok - $label"
 }
 
-require_count 6 'IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, c)' \
+require_count 8 'IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, c)' \
     services/comm.cpp \
-    'Login, UseCS, and CompileFile P50 tails each gate both read and write at protocol 50'
+    'Login, GetCS, UseCS, and CompileFile P50 tails each gate read and write at protocol 50'
 require_count 1 'current_message_end = intogo_old + inmsglen' \
     services/comm.cpp 'decoder records the current frame boundary'
 require_count 1 'if (c->current_message_bytes_remaining() < 3 * sizeof(uint32_t)) {' \
@@ -60,6 +60,10 @@ require_count 1 'const size_t remaining = c->current_message_bytes_remaining();'
     services/comm.cpp 'UseCS decode captures the remaining-bytes mandatory-tail input'
 require_count 1 'if (remaining != 3 * sizeof(uint32_t)) {' services/comm.cpp \
     'UseCS decode requires exactly the three-word tail, matching Login'
+require_count 1 'cache_request_tail_valid = c->read_bounded_string(' \
+    services/comm.cpp 'GetCS decodes its warm host through the bounded string reader'
+require_count 1 'p50_cache_client_request_is_valid(' services/comm.cpp \
+    'GetCS payload validation uses the canonical client-request law'
 require_count 1 'const bool absent = cache_endpoint_port == 0' \
     services/comm.cpp 'Login payload has a canonical whole-absence branch'
 require_count 1 'const bool present = cache_advertisement_is_well_formed_present(' \
@@ -70,12 +74,6 @@ require_count 3 'apply_cache_advertisement' daemon/main.cpp \
     'real daemon applies the canonical sidecar snapshot at definition, login, and shutdown reannouncement'
 require_count 2 'cs->setCacheAdvertisement(m->cache_endpoint_port, m->cache_protocol,' \
     scheduler/scheduler.cpp 'scheduler retains initial and replacement Login snapshots'
-require_count 2 'it->cacheEndpointPort()' scheduler/scheduler.cpp \
-    'scheduler reads endpoint port only for listcs visibility'
-require_count 1 'it->cacheProtocol()' scheduler/scheduler.cpp \
-    'scheduler reads cache protocol only for listcs visibility'
-require_count 1 'it->cacheProfileMask()' scheduler/scheduler.cpp \
-    'scheduler reads cache profiles only for listcs visibility'
 require_count 1 'P29V1 = 1' cache/protocol50.h \
     'P29V1 has revision-1 profile ID 1'
 require_count 1 'ZSTD_TU = 2' cache/protocol50.h \
@@ -83,20 +81,28 @@ require_count 1 'ZSTD_TU = 2' cache/protocol50.h \
 require_count 1 'ZSTD_ROUTE = 3' cache/protocol50.h \
     'ZSTD_ROUTE has revision-1 profile ID 3'
 
-# The server-selection half of scheduler.cpp ends at handle_login.  New cache
-# metadata must not become eligibility, scoring, or assignment input.  S2's
-# post-selection UseCS cache-handoff fill (project_cache_handoff) is defined
-# right after handle_login, so this boundary also proves that fill is
-# textually outside the selection/scoring code: send_remote_dispatch_reply
-# (inside the slice) only ever CALLS project_cache_handoff by name -- the
-# getters themselves are read nowhere before the cutoff.
-selection_slice=$(sed -n '1,2841p' "$src/scheduler/scheduler.cpp")
-if printf '%s\n' "$selection_slice" \
-        | grep -E 'cacheEndpointPort|cacheProtocol\(|cacheProfileMask' >/dev/null; then
-    echo 'FAIL: cache advertisement leaked into scheduler selection' >&2
-    exit 1
-fi
-echo 'ok - cache advertisement is absent from scheduler selection'
+# Stage 4: C/F capability compatibility is now a deliberate selection input,
+# but only through one bounded preference layer.  A genuinely-free compatible
+# worker is preferred; when none exists the original eligible set is retained.
+require_count 1 'static uint32_t selected_cache_profile(' scheduler/scheduler.cpp \
+    'scheduler has one canonical C/F profile-intersection helper'
+require_count 1 'static void prefer_cache_compatible_servers(' scheduler/scheduler.cpp \
+    'scheduler has one bounded cache preference layer'
+require_count 1 'if (!assignment_mode_prepares())' scheduler/scheduler.cpp \
+    'legacy assignment mode bypasses cache-aware selection completely'
+require_count 1 'cs->currentJobCount() < cs->maxJobs() &&' scheduler/scheduler.cpp \
+    'cache preference requires a genuine free slot rather than preload capacity'
+require_count 1 'if (compatible_free.empty())' scheduler/scheduler.cpp \
+    'absence of compatible free capacity preserves the legacy eligible set'
+require_count 1 'prefer_cache_compatible_servers(job, eligible);' scheduler/scheduler.cpp \
+    'server selection applies the bounded preference exactly once'
+require_count 1 'job->setCacheRequest(m.cache_protocol, m.cache_profile_mask,' \
+    scheduler/scheduler.cpp 'decoded C capabilities are retained on every admitted job'
+require_count 1 'cs->remotePort() == job->cacheAffinityPort() &&' \
+    scheduler/scheduler.cpp \
+    'warm preference binds the hinted host to the selected F ordinary port'
+require_count 1 'p50_select_pair_cache_profile(' services/comm.h \
+    'the canonical pair law selects only from the exact C/F intersection'
 
 # S2: the UseCS tail encode/decode are gated at PROTOCOL_VERSION_CACHE_ADVERTISEMENT,
 # exactly like LoginMsg's, but scoped to UseCSMsg's own methods so this cannot
@@ -172,6 +178,70 @@ require_count 1 'inline bool usecs_cache_handoff_admissible' services/comm.h \
     'the daemon defensive re-check is a pure, independently testable helper'
 require_count 1 'if (wrapper_cache_eligible && usecs_cache_handoff_admissible(*msg)) {' daemon/main.cpp \
     'scheduler_use_cs retains the cache handoff only via that helper'
+require_count 1 'bool Daemon::cache_client_service_ready() noexcept' daemon/main.cpp \
+    'daemon has one authenticated C-side cache readiness predicate'
+require_count 4 'cache_client_service_ready()' daemon/main.cpp \
+    'one declaration/definition and both wire boundaries use current C-side readiness'
+require_count 1 'bool Daemon::cache_client_sidecar_ready() noexcept' daemon/main.cpp \
+    'daemon separates C-sidecar lease health from scheduler publication readiness'
+require_count 4 'cache_client_sidecar_ready()' daemon/main.cpp \
+    'sidecar lease health is used by its declaration, definition, scheduler gate, and held-request admission'
+reconcile_slice=$(sed -n '/^void Daemon::reconcile_cache_route_state()/,/^}/p' \
+    "$src/daemon/main.cpp")
+if printf '%s\n' "$reconcile_slice" | grep -E \
+        'scheduler_session_active|scheduler != nullptr' >/dev/null; then
+    echo 'FAIL: C route ownership must not depend on scheduler connectivity' >&2
+    exit 1
+fi
+echo 'ok - C route ownership is bound only to the authenticated sidecar ReadyLease'
+poll_inactive_slice=$(sed -n '/if (!scheduler_cache_owner || scheduler == nullptr) {/,/^    }/p' \
+    "$src/daemon/main.cpp")
+if printf '%s\n' "$poll_inactive_slice" | grep -F \
+        'outer_request_replacement' >/dev/null; then
+    echo 'FAIL: scheduler loss must not replace a healthy C sidecar' >&2
+    exit 1
+fi
+echo 'ok - scheduler loss suppresses publication without replacing the C sidecar'
+waiter_lease_slice=$(sed -n '/^bool Daemon::invalidate_p50_source_waiters_for_lease()/,/^}/p' \
+    "$src/daemon/main.cpp")
+if printf '%s\n' "$waiter_lease_slice" | grep -E \
+        'scheduler_session_active|scheduler != nullptr|cache_advertisement_snapshot' >/dev/null; then
+    echo 'FAIL: armed input ownership must survive scheduler loss on the same ReadyLease' >&2
+    exit 1
+fi
+echo 'ok - armed input ownership is invalidated only by C-sidecar ReadyLease change'
+require_count 1 'umsg->count == 1 && client->connection_provenance.cache_eligible() &&' daemon/main.cpp \
+    'only a provenance-authenticated singleton request may publish C capability'
+require_count 1 'client_cache_capability.protocol == msg->cache_protocol' daemon/main.cpp \
+    'the C kill switch also gates a scheduler-supplied handoff at relay time'
+require_count 1 'cache_capability.profile_mask &= umsg->cache_profile_mask;' daemon/main.cpp \
+    'the C daemon authorizes only the wrapper-requested capability intersection'
+require_count 1 'getcs.cache_profile_mask = CACHE_ADVERTISABLE_PROFILE_MASK;' client/remote.cpp \
+    'a new wrapper explicitly opts an ordinary scalar request into retained profiles'
+require_count 1 'ret = build_remote(job, local_daemon, envs, rate,' client/main.cpp \
+    'the wrapper owns one bounded P50-to-legacy reassignment loop'
+require_count 1 '!p50_legacy_retry);' client/main.cpp \
+    'the fresh retry sends canonical cache-capability absence'
+require_count 1 'Each build_remote() call owns one fresh scheduler assignment attempt.' \
+    client/remote.cpp \
+    'every fresh assignment attempt canonicalizes reused CompileJob input state'
+fresh_attempt_clear_line=$(grep -n -F \
+    'job.clearCompileInputIdentity();' "$src/client/remote.cpp" | head -n 1 | cut -d: -f1)
+first_local_branch_line=$(grep -n -F \
+    'if (!maybe_build_local(local_daemon, usecs, job, ret)) {' \
+    "$src/client/remote.cpp" | head -n 1 | cut -d: -f1)
+if test -z "$fresh_attempt_clear_line" || test -z "$first_local_branch_line" || \
+        test "$fresh_attempt_clear_line" -ge "$first_local_branch_line"; then
+    echo 'FAIL: fresh attempt must clear CompileInputIdentity before the local/remote branch' >&2
+    exit 1
+fi
+echo 'ok - fresh retry clears stale P50 input before scheduler-local admission'
+require_count 1 'cache_affinity_profile_mask = cl->cacheHandoff.cacheProfileMask;' daemon/main.cpp \
+    'successful cache-capable completion retains one soft warm-route hint'
+require_count 1 'cache_affinity_port = cl->cacheHandoff.ordinaryPort;' daemon/main.cpp \
+    'the retained warm-route hint includes the exact selected F ordinary port'
+require_count 1 'p50_cache_route_observation_kind(' daemon/main.cpp \
+    'warm-hint and typed failure retention are bound to the exact submitter observation'
 
 # M3 now consumes the post-selection UseCS projection.  The exact selected
 # assignment is the sole client authority: remote.cpp admits it once, connects
@@ -186,9 +256,8 @@ require_count 1 'job.setCompileInputIdentity(*identity);' client/remote.cpp \
     'a validated committed InputRecord binds CompileFile before it is sent'
 require_absent \
     'cache_endpoint_port|cacheProtocol\(|cacheProfileMask|CACHE_PROFILE_Z3_(LONG|SHARED_LONG)' \
-    'cache endpoint metadata remains absent from scheduler scoring and generic input readers' \
-    "$src/daemon/compiler_input.cpp" "$src/daemon/compiler_input.h" \
-    "$src/scheduler/job.cpp" "$src/scheduler/job.h"
+    'cache endpoint metadata remains absent from generic compiler-input readers' \
+    "$src/daemon/compiler_input.cpp" "$src/daemon/compiler_input.h"
 
 require_text "$src/cache/p50_zstd.cpp" 'ZstdRouteCodec' \
     'ZSTD_ROUTE codec implementation remains in the product path'
@@ -207,4 +276,4 @@ if grep -R -n 'z3_shared_long_b1' "$src/services" "$src/cache" \
 fi
 echo 'ok - z3_shared_long_b1 remains experiment-only'
 
-echo 'PASS: Login cache advertisement remains non-selecting and source selection uses only the exact assignment handoff'
+echo 'PASS: protocol-50 routing uses bounded C/F capability preference with legacy escape'

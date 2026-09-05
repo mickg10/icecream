@@ -59,6 +59,7 @@
 #include "cache/p50_control_operation.h"
 #include "cache/p50_daemon_control.h"
 #include "cache/p50_sidecar_supervisor.h"
+#include "services/digest128.h"
 #include "services/util.h"
 #include "pipes.h"
 
@@ -120,6 +121,55 @@ void append_p50_compile_identity_trace(const CompileJob &job,
     }
     (void)::close(fd);
 }
+
+#ifdef ICECC_P50_COMPLETION_TEST_HOOKS
+void append_p50_fresh_legacy_local_trace(const CompileJob &job,
+                                         const UseCSMsg &assignment) noexcept
+{
+    const char *enabled = ::getenv("ICECC_P50_TEST_FRESH_LEGACY_RETRY");
+    const char *path = ::getenv("ICECC_P50_TEST_FRESH_LEGACY_RETRY_TRACE");
+    if (enabled == nullptr || std::string(enabled) != "1" || path == nullptr ||
+        *path == '\0')
+        return;
+
+    const CompileInputIdentity &input = job.compileInputIdentity();
+    char line[768];
+    const int length = ::snprintf(
+        line, sizeof(line),
+        "{\"record\":\"fresh-legacy-local-assignment\",\"job_id\":%u,"
+        "\"assignment_epoch\":%llu,\"assignment_nonce\":%llu,"
+        "\"c_guid\":%llu,\"tu_seq\":%llu,\"input_profile\":%u,"
+        "\"input_present\":%u,\"cache_protocol\":%u,"
+        "\"cache_profile_mask\":%u,\"hostname\":\"%s\",\"port\":%u}\n",
+        job.jobID(),
+        static_cast<unsigned long long>(job.assignmentEpoch()),
+        static_cast<unsigned long long>(job.assignmentNonce()),
+        static_cast<unsigned long long>(job.cGuid()),
+        static_cast<unsigned long long>(job.tuSeq()), input.profile,
+        job.usesP50Input() ? 1U : 0U, assignment.cache_protocol,
+        assignment.cache_profile_mask, assignment.hostname.c_str(),
+        assignment.port);
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(line))
+        return;
+
+    const int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return;
+    size_t offset = 0;
+    while (offset < static_cast<size_t>(length)) {
+        const ssize_t written = ::write(fd, line + offset,
+                                        static_cast<size_t>(length) - offset);
+        if (written > 0) {
+            offset += static_cast<size_t>(written);
+            continue;
+        }
+        if (written < 0 && errno == EINTR)
+            continue;
+        break;
+    }
+    (void)::close(fd);
+}
+#endif
 
 class TempSourceFile
 {
@@ -728,10 +778,22 @@ static void discard_p50_output_file(MsgChannel *cserver)
     }
 }
 
+struct P50RemoteAttemptObservation {
+    bool selected = false;
+    bool transfer_attempted = false;
+    bool accepted = false;
+    bool permanent_local_profile_failure = false;
+    bool local_sidecar_replacement_required = false;
+    uint32_t profile_mask = 0;
+};
+
 static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_daemon,
                             const string &environment, const string &version_file,
-                            const char *preproc_file, bool output)
+                            const char *preproc_file, bool output,
+                            P50RemoteAttemptObservation *p50_observation = nullptr)
 {
+    if (p50_observation != nullptr)
+        *p50_observation = {};
     string hostname = usecs->hostname;
     unsigned int port = usecs->port;
     int job_id = usecs->job_id;
@@ -754,6 +816,7 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
     bool p50_result_received = false;
     bool p50_disposition_attempted = false;
     bool p50_disposition_sent = false;
+    bool p50_accepted_disposition_sent = false;
 
     auto send_p50_disposition = [&](ResultDispositionMsg::Disposition disposition) {
         if (!p50_input || p50_disposition_attempted)
@@ -762,11 +825,17 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
         if (cserver == nullptr)
             return false;
 
+#ifdef ICECC_P50_COMPLETION_TEST_HOOKS
         /* The real C1F1 terminal-flow gate needs the ordinary worker parser,
            not a codec double, to observe malformed and disconnected first
-           witnesses.  Arm these two faults only under the existing explicit
+           witnesses.  Arm those two faults only under the existing explicit
            C1F1-required test environment and only where production would send
-           Accepted after receiving every output byte. */
+           Accepted after receiving every output byte.  The fresh legacy retry
+           gate is necessarily separate: strict C1F1 correctly refuses that
+           retry.  It closes the same real result channel, publishes a bounded
+           test barrier, and returns the actual send-failure result so the
+           production 107 -> 106 normalization and retry loop remain under
+           test rather than being simulated by the harness. */
         const char *required = getenv("ICECC_P50_C1F1_REQUIRED");
         const char *test_hook = getenv("ICECC_P50_TEST_DISPOSITION");
         if (disposition == ResultDispositionMsg::Accepted &&
@@ -788,8 +857,93 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                 return true;
             }
         }
+        const char *retry_gate =
+            getenv("ICECC_P50_TEST_FRESH_LEGACY_RETRY");
+        const char *retry_barrier =
+            getenv("ICECC_P50_TEST_FRESH_LEGACY_RETRY_BARRIER");
+        if (disposition == ResultDispositionMsg::Accepted &&
+            status == 0 && p50_result_received &&
+            job.compileInputIdentity().validPresent() && required == nullptr &&
+            retry_gate != nullptr &&
+            string(retry_gate) == "1" && test_hook != nullptr &&
+            string(test_hook) == "accepted-send-fail" &&
+            retry_barrier != nullptr && *retry_barrier != '\0') {
+            trace() << "P50 terminal test forcing Accepted send failure for job "
+                    << job.jobID() << "\n";
+            delete cserver;
+            cserver = nullptr;
+
+            const CompileInputIdentity &input = job.compileInputIdentity();
+            icecc::Digest128 input_guid;
+            input_guid.bytes = input.c_store_guid;
+            icecc::Digest128 raw_digest;
+            raw_digest.bytes = input.raw_digest;
+            const string input_guid_hex = icecc::digest128_hex(input_guid);
+            const string raw_digest_hex = icecc::digest128_hex(raw_digest);
+            char marker[1024];
+            const int marker_length = ::snprintf(
+                marker, sizeof(marker),
+                "{\"record\":\"p50-accepted-send-failure\",\"job_id\":%u,"
+                "\"assignment_epoch\":%llu,\"assignment_nonce\":%llu,"
+                "\"c_guid\":%llu,\"tu_seq\":%llu,\"input_present\":1,"
+                "\"input_profile\":%u,\"input_c_store_guid\":\"%s\","
+                "\"input_tu_seq\":%llu,\"raw_bytes\":%llu,"
+                "\"raw_digest\":\"%s\",\"attempt_id\":%llu,"
+                "\"request_id\":%llu}\n",
+                job.jobID(),
+                static_cast<unsigned long long>(job.assignmentEpoch()),
+                static_cast<unsigned long long>(job.assignmentNonce()),
+                static_cast<unsigned long long>(job.cGuid()),
+                static_cast<unsigned long long>(job.tuSeq()), input.profile,
+                input_guid_hex.c_str(),
+                static_cast<unsigned long long>(input.tu_seq),
+                static_cast<unsigned long long>(input.raw_bytes),
+                raw_digest_hex.c_str(),
+                static_cast<unsigned long long>(input.attempt_id),
+                static_cast<unsigned long long>(input.request_id));
+            const int marker_fd = ::open(
+                retry_barrier,
+                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+            if (marker_fd >= 0 && marker_length > 0 &&
+                static_cast<size_t>(marker_length) < sizeof(marker)) {
+                size_t offset = 0;
+                while (offset < static_cast<size_t>(marker_length)) {
+                    const ssize_t written = ::write(
+                        marker_fd, marker + offset,
+                        static_cast<size_t>(marker_length) - offset);
+                    if (written > 0) {
+                        offset += static_cast<size_t>(written);
+                        continue;
+                    }
+                    if (written < 0 && errno == EINTR)
+                        continue;
+                    break;
+                }
+            }
+            if (marker_fd >= 0)
+                (void)::close(marker_fd);
+
+            const string release_path = string(retry_barrier) + ".release";
+            const auto release_deadline = std::chrono::steady_clock::now() +
+                std::chrono::seconds(30);
+            while (::access(release_path.c_str(), F_OK) != 0 &&
+                   std::chrono::steady_clock::now() < release_deadline) {
+                (void)::poll(nullptr, 0, 10);
+            }
+            if (::access(release_path.c_str(), F_OK) != 0) {
+                log_warning()
+                    << "P50 fresh legacy retry test barrier timed out for job "
+                    << job.jobID() << endl;
+            }
+            p50_disposition_sent = false;
+            return false;
+        }
+#endif
         const ResultDispositionMsg result_disposition(job, disposition);
         p50_disposition_sent = cserver->send_msg(result_disposition);
+        if (p50_disposition_sent &&
+            disposition == ResultDispositionMsg::Accepted)
+            p50_accepted_disposition_sent = true;
         if (!p50_disposition_sent) {
             log_warning() << "failed sending terminal P50 result disposition for job "
                           << job.jobID() << endl;
@@ -904,6 +1058,14 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
             const char *p50_profile_name = "ZSTD_TU";
             if (selected_p50_profile) {
                 p50_profile = *selected_p50_profile;
+                if (p50_observation != nullptr) {
+                    const std::optional<uint32_t> selected_profile_mask =
+                        p50_profile_wire(p50_profile);
+                    p50_observation->selected =
+                        selected_profile_mask.has_value();
+                    p50_observation->profile_mask =
+                        selected_profile_mask.value_or(0);
+                }
                 switch (p50_profile) {
                 case icecc::p50::ProfileId::P29V1:
                     p50_profile_name = "P29V1";
@@ -936,12 +1098,28 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                     return cpp_status;
                 }
 
+                if (p50_observation != nullptr)
+                    p50_observation->transfer_attempted = true;
                 const icecc::p50::local::P50SourceTransferResult transfer =
                     transfer_p50_source(job, *usecs, *local_daemon,
                                         std::move(source), p50_profile);
                 const std::optional<CompileInputIdentity> identity =
                     icecc::p50::bind_compile_input(job, p50_profile, transfer);
                 if (!identity.has_value()) {
+                    if (p50_observation != nullptr &&
+                        p50_profile == icecc::p50::ProfileId::P29V1 &&
+                        transfer.error_code == static_cast<uint16_t>(
+                            icecc::p50::local::SourceTransferErrorCode::
+                                PermanentLocalProfileUnavailable)) {
+                        p50_observation->permanent_local_profile_failure = true;
+                    }
+                    if (p50_observation != nullptr &&
+                        transfer.error_code == static_cast<uint16_t>(
+                            icecc::p50::local::SourceTransferErrorCode::
+                                RouteReplacementRequired)) {
+                        p50_observation->local_sidecar_replacement_required =
+                            true;
+                    }
                     log_warning() << p50_profile_name
                                   << " cache source transfer failed closed (status "
                                   << static_cast<unsigned>(transfer.code)
@@ -1150,6 +1328,8 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                 107,
                 "Error 107 - failed to acknowledge complete P50 remote result");
         }
+        if (p50_observation != nullptr && p50_input)
+            p50_observation->accepted = p50_accepted_disposition_sent;
 
     } catch (...) {
         /* Once CompileResultMsg exists, any local exception before Accepted
@@ -1247,6 +1427,9 @@ maybe_build_local(MsgChannel *local_daemon, UseCSMsg *usecs, CompileJob &job,
         if (!usecs->applyAssignmentTo(&job)) {
             throw client_error(29, "Error 29 - malformed assignment identity");
         }
+#ifdef ICECC_P50_COMPLETION_TEST_HOOKS
+        append_p50_fresh_legacy_local_trace(job, *usecs);
+#endif
         job.setEnvironmentVersion("__client");
         CompileFileMsg compile_file(&job);
 
@@ -1324,9 +1507,19 @@ static unsigned int requiredRemoteFeatures()
     return features;
 }
 
-int build_remote(CompileJob &job, MsgChannel *local_daemon, const Environments &_envs, int permill)
+int build_remote(CompileJob &job, MsgChannel *local_daemon,
+                 const Environments &_envs, int permill,
+                 bool request_p50)
 {
     srand(time(nullptr) + getpid());
+
+    /* Each build_remote() call owns one fresh scheduler assignment attempt.
+       The bounded legacy retry deliberately reuses the wrapper's CompileJob,
+       so discard any P50 InputRecord identity committed by its predecessor
+       before either the scheduler-local or ordinary remote path can inspect
+       and serialize the job.  A newly selected P50 path binds its own exact
+       identity later in build_remote_int(). */
+    job.clearCompileInputIdentity();
 
     int torepeat = 1;
     bool has_split_dwarf = job.dwarfFissionEnabled();
@@ -1377,6 +1570,19 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon, const Environments &
                        minimalRemoteVersion(job), requiredRemoteFeatures(),
                        get_niceness(), 0, invocation_cmdline);
 
+        /* A new protocol-50 wrapper explicitly opts into the cache profiles it
+           understands.  Canonical absence is reserved for the one bounded
+           legacy reassignment after a failed P50 attempt (and for older
+           wrappers, whose newly-decoded fields default to zero).  The local C
+           daemon remains authoritative: it intersects this request with its
+           own kill-switch-controlled capability before forwarding GetCS. */
+        if (request_p50 &&
+            IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT,
+                                local_daemon)) {
+            getcs.cache_protocol = CACHE_WIRE_REVISION;
+            getcs.cache_profile_mask = CACHE_ADVERTISABLE_PROFILE_MASK;
+        }
+
         trace() << "asking for host to use" << endl;
         if (!local_daemon->send_msg(getcs)) {
             log_warning() << "asked for CS" << endl;
@@ -1384,23 +1590,98 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon, const Environments &
         }
 
         UseCSMsg *usecs = get_server(local_daemon);
-        invocation_timing_set_scheduler_job_id(usecs->job_id);
-        invocation_timing_set_compile_job_id(usecs->job_id);
+        if (request_p50) {
+            invocation_timing_set_scheduler_job_id(usecs->job_id);
+            invocation_timing_set_compile_job_id(usecs->job_id);
+        } else {
+            invocation_timing_replace_assignment_ids(
+                usecs->job_id, usecs->job_id);
+        }
         invocation_timing_mark_start(usecs->hostname == "127.0.0.1"
                                      ? string("local_via_scheduler")
                                      : string("remote"));
         int ret;
+        P50RemoteAttemptObservation p50_observation;
+        bool p50_observation_published = false;
+        const auto publish_p50_observation = [&]() {
+            if (p50_observation_published || !p50_observation.selected ||
+                !p50_observation.transfer_attempted ||
+                !p50_source_profile_selection_valid(
+                    p50_observation.profile_mask) ||
+                !IS_PROTOCOL_VERSION(
+                    PROTOCOL_VERSION_CACHE_ADVERTISEMENT, local_daemon))
+                return;
+            uint32_t flags =
+                static_cast<uint32_t>(JobDoneMsg::FROM_SUBMITTER) |
+                static_cast<uint32_t>(
+                    JobDoneMsg::P50CacheRouteObservation);
+            if (!p50_observation.accepted &&
+                p50_observation.permanent_local_profile_failure) {
+                flags |= static_cast<uint32_t>(
+                    JobDoneMsg::P50PermanentLocalCapabilityFailure);
+            } else if (!p50_observation.accepted &&
+                       p50_observation.local_sidecar_replacement_required) {
+                flags |= static_cast<uint32_t>(
+                    JobDoneMsg::P50LocalSidecarReplacementRequired);
+            }
+            JobDoneMsg observation(
+                usecs->job_id, p50_observation.accepted ? 0 : 106,
+                flags, 0, usecs->assignmentEpoch(), usecs->assignmentNonce(),
+                usecs->cGuid(), usecs->tuSeq());
+            p50_observation_published = true;
+            if (!local_daemon->send_msg(observation)) {
+                log_warning()
+                    << "could not publish P50 cache-route observation"
+                    << endl;
+            }
+        };
 
         try {
-            if (!maybe_build_local(local_daemon, usecs, job, ret))
+            if (!maybe_build_local(local_daemon, usecs, job, ret)) {
                 ret = build_remote_int(job, usecs, local_daemon,
                                        version_map[usecs->host_platform],
                                        versionfile_map[usecs->host_platform],
-                                       nullptr, true);
+                                       nullptr, true, &p50_observation);
+            }
+        } catch (const remote_error &) {
+            publish_p50_observation();
+            delete usecs;
+            throw;
+        } catch (const client_error &error) {
+            /* Once a cache-selected F closes or corrupts the ordinary result
+               stream, the assignment is terminal at F/S and cannot be reused.
+               Normalize only those transport/protocol failures into the same
+               bounded P50-retry class as a pre-CompileFile transfer refusal.
+               Local input/output errors retain their historical local-fallback
+               behavior. */
+            const bool p50_assignment = usecs->hasCacheAdvertisement();
+            const bool p50_transport_failure =
+                error.errorCode == 2 || error.errorCode == 6 ||
+                error.errorCode == 8 || error.errorCode == 9 ||
+                error.errorCode == 13 || error.errorCode == 14 ||
+                error.errorCode == 19 || error.errorCode == 20 ||
+                error.errorCode == 23 || error.errorCode == 107;
+            publish_p50_observation();
+            delete usecs;
+            if (p50_assignment && p50_transport_failure) {
+                log_warning() << "normalizing P50 client error "
+                              << error.errorCode << " to Error 106 for a fresh assignment"
+                              << endl;
+                throw remote_error(
+                    106,
+                    "Error 106 - P50 worker transport failed before exact completion");
+            }
+            throw;
         } catch(...) {
+            publish_p50_observation();
             delete usecs;
             throw;
         }
+
+        /* Accepted is authoritative only after the real disposition frame was
+           sent.  The malformed/disconnect hooks deliberately never set that
+           fact, so they publish failure and can never warm the route. */
+        publish_p50_observation();
 
         delete usecs;
         return ret;

@@ -62,6 +62,11 @@ struct ZstdSourceTransferResult {
     uint64_t f_to_c_bytes = 0;
     // Present only for P29V1 after the route pins its two fingerprints.
     std::optional<bool> system_source_reuse;
+    // A long-lived sender sets this after any post-prepare outcome whose C/F
+    // commit state is ambiguous, or when its bounded replay ledger is full.
+    // It is sticky for the route: the supervised C sidecar must be replaced
+    // before another distinct request may open F.
+    bool replacement_required = false;
 };
 
 struct ZstdSourceTransferConfig {
@@ -77,6 +82,9 @@ struct ZstdSourceTransferConfig {
     std::chrono::steady_clock::duration maximum_duration =
         std::chrono::seconds(300);
     int compression_level = 1;
+    // Deterministic unit-test seam for the typed route-poison boundary.
+    // Product callers always leave this empty.
+    std::function<void()> before_prepare_for_route_for_test;
 };
 
 // Called once per bounded attempt.  The callback returns ownership of one

@@ -35,7 +35,7 @@ def ordered(source: str, *tokens: str) -> None:
         offset = found + len(token)
 
 
-def check_client(source: str) -> None:
+def check_client(source: str, makefile: str) -> None:
     flow = section(source, "static int build_remote_int(", "static string\nmd5_for_file")
     require(flow.count("p50_disposition_attempted = true;") == 1,
             "submitter does not enforce one disposition attempt")
@@ -74,6 +74,48 @@ def check_client(source: str) -> None:
     require('selected == "disconnect"' in flow and
             "delete cserver;" in flow and "cserver = nullptr;" in flow,
             "disconnect real-runtime witness is missing")
+    require(source.count("#ifdef ICECC_P50_COMPLETION_TEST_HOOKS") == 3,
+            "completion fault/trace code is not fully compile-time isolated")
+    require("check_PROGRAMS = icecc-p50-completion-test" in makefile and
+            "-DICECC_P50_COMPLETION_TEST_HOOKS" in makefile and
+            "icecc_p50_completion_test_SOURCES = main.cpp remote.cpp" in makefile,
+            "fresh-retry seam does not have a check-only client target")
+    completion_hooks = section(
+        flow,
+        "#ifdef ICECC_P50_COMPLETION_TEST_HOOKS\n        /* The real C1F1",
+        "#endif\n        const ResultDispositionMsg")
+    for token in (
+            'const char *test_hook = getenv("ICECC_P50_TEST_DISPOSITION")',
+            'selected == "malformed"',
+            "cserver->send_msg(EndMsg())",
+            'selected == "disconnect"',
+            'string(test_hook) == "accepted-send-fail"',
+            'string(retry_gate) == "1"',
+            "status == 0 && p50_result_received",
+            "job.compileInputIdentity().validPresent()",
+            "delete cserver;",
+            "cserver = nullptr;",
+            '"input_present\\\":1',
+            '"input_c_store_guid\\\":\\\"%s',
+            '"input_tu_seq\\\":%llu',
+            '"raw_bytes\\\":%llu',
+            '"raw_digest\\\":\\\"%s',
+            '"attempt_id\\\":%llu',
+            '"request_id\\\":%llu',
+            "p50_disposition_sent = false;",
+            "return false;"):
+        require(token in completion_hooks,
+                f"check-only completion fault seam omits {token}")
+    local_flow = section(source, "static bool\nmaybe_build_local(",
+                         "// Minimal version of remote host")
+    ordered(local_flow,
+            "usecs->applyAssignmentTo(&job)",
+            "append_p50_fresh_legacy_local_trace(job, *usecs);",
+            "CompileFileMsg compile_file(&job);",
+            "local_daemon->send_msg(compile_file)")
+    require("normalizing P50 client error " in source and
+            "error.errorCode == 107" in source,
+            "107 is not observably normalized into the bounded retry class")
 
 
 def check_worker(serve: str, record: str) -> None:
@@ -162,23 +204,41 @@ def check_parent(source: str) -> None:
     require("attachment.fd.valid()" in settlement and
             "unexpectedly reattached consumed lease" in settlement,
             "post-settlement exact-owner probe is not fail-closed")
+    legacy = section(source, "if (job->usesP50Input()) {",
+                     "client->job = job;")
+    require("P50 compiler input attachment unavailable" in legacy,
+            "present unarmed P50 input no longer fails before local compilation")
+    ordered(source,
+            "client->job = job;",
+            "if (!job->usesP50Input()",
+            "legacy CompileFile admitted canonical input for job",
+            "set_p50_legacy_wire_identity(identity)")
 
 
 def check_cache_service(source: str) -> None:
     ready_trace = section(source, "void append_ready_test_trace(",
                           "void append_terminal_lifecycle_test_trace(")
-    for token in ("ICECC_P50_C1F1_REQUIRED", "ICECC_P50_TEST_READY_TRACE",
-                  "O_APPEND", "O_CLOEXEC", "::write(fd"):
+    for token in ("ICECC_P50_TEST_READY_TRACE", "O_APPEND", "O_CLOEXEC",
+                  "::write(fd"):
         require(token in ready_trace, f"sidecar READY evidence omits {token}")
+    require("ICECC_P50_C1F1_REQUIRED" not in ready_trace,
+            "READY evidence must be opted in by its path, not workload strictness")
     ready = section(source, "bool write_ready_lease(",
                     "bool capture_listener_identity(")
     ordered(ready, "const bool written = write_exact(fd, message);",
             "if (written)", "append_ready_test_trace(message);",
             "return written;")
+    source_trace = section(source, "void append_source_result_trace(",
+                           "void append_terminal_lifecycle_test_trace(")
+    for token in ("transfer.raw_digest", "digest128_hex",
+                  '"raw_digest\\\":\\\"%s'):
+        require(token in source_trace,
+                f"C-side source-result trace omits {token}")
     helper = section(source, "void append_terminal_lifecycle_test_trace(",
                      "volatile sig_atomic_t g_stop_requested")
     for token in ("ICECC_P50_C1F1_REQUIRED",
                   "ICECC_P50_TEST_LIFECYCLE_TRACE",
+                  "c_store_guid=%s", "input_tu=%llu",
                   "before_records=%zu", "after_records=%zu",
                   "before_bytes=%llu", "after_bytes=%llu",
                   "O_APPEND", "O_CLOEXEC"):
@@ -196,6 +256,41 @@ def check_cache_service(source: str) -> None:
 
 
 def check_runtime_gate(source: str) -> None:
+    worker_launch = section(
+        source,
+        'ICECC_TEST_SOCKET="$work/worker.sock"',
+        "worker_pid=$!")
+    require("ICECC_P50_C1F1_REQUIRED=1" in worker_launch,
+            "F daemon launch is not strict for the authoritative P50 cells")
+    require('-s "$worker_scheduler_host:$port_sched"' in worker_launch and
+            '-s "127.0.0.1:$port_sched"' not in worker_launch,
+            "F daemon does not register through the explicit ordinary address")
+
+    client_launch = section(
+        source,
+        'ICECC_TEST_SOCKET="$work/client.sock" \\\n    ICECC_P50_SOURCE_RESULT_TRACE="$work/source-result.jsonl"',
+        "client_pid=$!")
+    require("ICECC_P50_C1F1_REQUIRED" not in client_launch,
+            "C daemon inherited strict mode and would refuse the intentional legacy retry")
+    require('-s "127.0.0.1:$port_sched"' in client_launch,
+            "C daemon no longer preserves loopback registration")
+
+    retry_launch = section(
+        source,
+        'retry_marker="$work/fresh-retry.barrier"',
+        "retry_wrapper_pid=$!")
+    require("ICECC_P50_C1F1_REQUIRED" not in retry_launch,
+            "fresh retry wrapper is strict and cannot exercise the 107/106 legacy retry")
+
+    injected_fault_launch = section(
+        source,
+        "    malformed|disconnect)",
+        "    *)")
+    require('timeout "$timeout_s" "$work/bin/icecc"' in injected_fault_launch,
+            "malformed/disconnect cells do not use the isolated check-only wrapper")
+    require('timeout "$timeout_s" "$build/client/icecc"' not in injected_fault_launch,
+            "malformed/disconnect fault injection still invokes the production wrapper")
+
     for token in ("run_remote_cell accepted accepted",
                   "run_remote_cell definitive definitive",
                   "run_remote_cell malformed malformed",
@@ -213,14 +308,47 @@ def check_runtime_gate(source: str) -> None:
                   "--identity-trace \"$work/compile-identity.jsonl\"",
                   'statuses != {"c_guid": "PASS", "tu_seq": "PASS"}',
                   "p50_runtime_evidence.py", "runtime.json",
-                  "did not retain incomplete rows as HOLD"):
+                  "did not retain incomplete rows as HOLD",
+                  'ICECC_P50_TEST_DISPOSITION=accepted-send-fail',
+                  'ICECC_P50_TEST_FRESH_LEGACY_RETRY_BARRIER="$retry_marker"',
+                  'ICECC_P50_SOURCE_RESULT_TRACE="$work/source-result.jsonl"',
+                  "ICECC_P50_C1F1_WORKER_SCHEDULER_HOST",
+                  "ipaddress.IPv4Address",
+                  'ln -s "$build/client/icecc-p50-completion-test" "$work/bin/icecc"',
+                  'readlink -f "$work/bin/icecc"',
+                  'timeout "$timeout_s" "$work/bin/icecc"',
+                  'accepted $worker_scheduler_host',
+                  'I am known as $worker_scheduler_host',
+                  'rm -f -- "$retry_remote_obj"',
+                  'wait_for_count 3 \'action 1 status applied reason handle_end\'',
+                  'wait_for_count 1 "END $first_retry_job status=0 .* server=p50-f"',
+                  'wait_for_count 1 \'remove daemon p50-f\'',
+                  ': >"$retry_release"',
+                  "fresh-legacy-local-assignment",
+                  "C-sidecar committed-source witness does not join the first marker",
+                  'source.get("raw_digest") != first["raw_digest"]',
+                  'input_present") != 0',
+                  'type(second.get("port")) is not int or second["port"] != 0',
+                  'scheduler_payload = "\\n".join(',
+                  're.sub(r"^\\[\\d+\\] \\d{4}-\\d{2}-\\d{2} '
+                  '\\d{2}:\\d{2}:\\d{2}: ", "", line)',
+                  "legacy CompileFile admitted canonical input for job",
+                  'strings "$build/client/icecc"',
+                  'strings "$build/client/icecc-p50-completion-test"'):
         require(token in source, f"real terminal/reclaim matrix omits {token}")
     ordered(source,
             "run_remote_cell malformed malformed",
             "restart_cache_sidecar",
             "run_remote_cell disconnect disconnect",
             "restart_cache_sidecar",
-            "PASS: real P50 Accepted/DefinitiveCancel/malformed/disconnect")
+            'retry_marker="$work/fresh-retry.barrier"',
+            "ICECC_P50_TEST_DISPOSITION=accepted-send-fail",
+            'rm -f -- "$retry_remote_obj"',
+            'wait_for_count 1 "END $first_retry_job',
+            'kill -TERM "$old_worker_pid"',
+            'wait_for_count 1 \'remove daemon p50-f\'',
+            ': >"$retry_release"',
+            "PASS: real P50 terminal lifecycle plus 107/106 fresh scheduler-local retry")
 
 
 def check_record(header: str, source: str) -> None:
@@ -243,7 +371,7 @@ def check_record(header: str, source: str) -> None:
 
 
 def check_all(files: dict[str, str]) -> None:
-    check_client(files["client"])
+    check_client(files["client"], files["client_make"])
     check_worker(files["serve"], files["record_h"] + files["record_cpp"])
     check_parent(files["main"])
     check_record(files["record_h"], files["record_cpp"])
@@ -260,6 +388,8 @@ def deletion_mutants(files: dict[str, str]) -> None:
          "false"),
         ("client", 'selected == "malformed"', "false"),
         ("client", 'selected == "disconnect"', "false"),
+        ("client", "status == 0 && p50_result_received", "false"),
+        ("client", "append_p50_fresh_legacy_local_trace(job, *usecs);", ""),
         ("client", "append_p50_compile_identity_trace(job, *crmsg);", ""),
         ("serve", "write(out_fd, job_stat, sizeof(job_stat))", "write_deleted()"),
         ("serve", "rmsg.status = ret;", "status_binding_deleted();"),
@@ -276,17 +406,47 @@ def deletion_mutants(files: dict[str, str]) -> None:
         ("main", "p50_completion_matches_retained_lease(", "lease_check_deleted("),
         ("main", "cache_adapter->outer_immediate_turn_required()", "false"),
         ("main", "ICECC_P50_TEST_POST_TERMINAL_ATTACH", "PROBE_DELETED"),
+        ("main", "legacy CompileFile admitted canonical input for job", "TRACE_DELETED"),
         ("record_h", "static_assert(kLegacyCompletionStatsWireSize == 32", "static_assert(true"),
         ("record_cpp", "flags | O_NONBLOCK", "flags"),
         ("record_cpp", "if (count != 0)", "if (false)"),
         ("record_cpp", "record.request_id == record.assignment_nonce", "true"),
         ("cache_service", "ICECC_P50_TEST_LIFECYCLE_TRACE", "TRACE_DELETED"),
+        ("cache_service", "c_store_guid=%s", "c_store_guid=deleted"),
+        ("cache_service", '"raw_digest\\\":\\\"%s',
+         '"raw_digest_deleted\\\":\\\"%s'),
         ("cache_service", "ICECC_P50_TEST_READY_TRACE", "READY_TRACE_DELETED"),
         ("cache_service", "if (mutated && decision.collect_record)\n                    endpoint_->collect_input_garbage();",
          "if (mutated && decision.collect_record)\n                    collect_deleted();"),
         ("runtime_gate", "kill -9 \"$old_pid\"", "kill_deleted"),
+        ("runtime_gate",
+         'ICECC_TEST_SOCKET="$work/worker.sock" ICECC_P50_C1F1_REQUIRED=1',
+         'ICECC_TEST_SOCKET="$work/worker.sock"'),
+        ("runtime_gate", '-s "$worker_scheduler_host:$port_sched"',
+         '-s "127.0.0.1:$port_sched"'),
+        ("runtime_gate", 'I am known as $worker_scheduler_host',
+         'ordinary_address_deleted'),
+        ("runtime_gate",
+         'ln -s "$build/client/icecc-p50-completion-test" "$work/bin/icecc"',
+         'ln -s "$build/client/icecc" "$work/bin/icecc"'),
+        ("runtime_gate",
+         'ICECC_TEST_SOCKET="$work/client.sock" \\\n    ICECC_P50_SOURCE_RESULT_TRACE="$work/source-result.jsonl"',
+         'ICECC_TEST_SOCKET="$work/client.sock" ICECC_P50_C1F1_REQUIRED=1 \\\n    ICECC_P50_SOURCE_RESULT_TRACE="$work/source-result.jsonl"'),
+        ("runtime_gate",
+         'retry_marker="$work/fresh-retry.barrier"',
+         'retry_marker="$work/fresh-retry.barrier"\nICECC_P50_C1F1_REQUIRED=1'),
         ("runtime_gate", "--identity-trace \"$work/compile-identity.jsonl\"", ""),
         ("runtime_gate", "run_remote_cell disconnect disconnect", "disconnect_deleted"),
+        ("runtime_gate", 'rm -f -- "$retry_remote_obj"', ""),
+        ("runtime_gate", 'source.get("raw_digest") != first["raw_digest"]',
+         "False"),
+        ("runtime_gate",
+         'type(second.get("port")) is not int or second["port"] != 0',
+         "False"),
+        ("runtime_gate", 'scheduler_payload = "\\n".join(',
+         'scheduler_payload = scheduler\n# deleted normalization: "\\n".join('),
+        ("runtime_gate", 'wait_for_count 1 \'remove daemon p50-f\'', "wait_deleted"),
+        ("client_make", "-DICECC_P50_COMPLETION_TEST_HOOKS", ""),
     )
     for filename, old, new in mutations:
         require(old in files[filename], f"mutant anchor missing: {filename}: {old}")
@@ -302,6 +462,7 @@ def deletion_mutants(files: dict[str, str]) -> None:
 def main() -> int:
     files = {
         "client": (ROOT / "client/remote.cpp").read_text(),
+        "client_make": (ROOT / "client/Makefile.am").read_text(),
         "serve": (ROOT / "daemon/serve.cpp").read_text(),
         "main": (ROOT / "daemon/main.cpp").read_text(),
         "record_h": (ROOT / "daemon/p50_completion_record.h").read_text(),

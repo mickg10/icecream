@@ -126,6 +126,18 @@ void invocation_timing_set_compile_job_id(uint32_t job_id)
     }
 }
 
+void invocation_timing_replace_assignment_ids(
+    uint32_t scheduler_job_id, uint32_t compile_job_id)
+{
+    /* A bounded P50 failure obtains a genuinely fresh legacy assignment.
+       Replace only the assignment identities so the one invocation's phase
+       timestamps and total wall interval remain continuous across attempts. */
+    if (scheduler_job_id != 0)
+        invocation_timing.scheduler_job_id = scheduler_job_id;
+    if (compile_job_id != 0)
+        invocation_timing.compile_job_id = compile_job_id;
+}
+
 bool invocation_timing_send(MsgChannel *local_daemon)
 {
     /* Validity comes from the phase flag, not from a nonzero value: a

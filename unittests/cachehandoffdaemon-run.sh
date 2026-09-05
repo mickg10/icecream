@@ -5,4 +5,6 @@
 src_dir=$(dirname "$0")
 build_dir=${ICECC_TEST_BUILDDIR:-$src_dir}
 top_build_dir=${ICECC_TEST_TOP_BUILDDIR:-$build_dir/..}
-exec "$build_dir/cachehandoffdaemon" "$top_build_dir/daemon/iceccd"
+exec "$build_dir/cachehandoffdaemon" \
+    "$top_build_dir/daemon/iceccd" \
+    "$top_build_dir/cache/icecc-cache-service"

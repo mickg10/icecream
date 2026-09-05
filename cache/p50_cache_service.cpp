@@ -90,10 +90,11 @@ std::string daemon_cache_directory_from_socket(
 }
 
 void append_ready_test_trace(std::string_view message) noexcept {
-    const char* required = ::getenv("ICECC_P50_C1F1_REQUIRED");
     const char* path = ::getenv("ICECC_P50_TEST_READY_TRACE");
-    if (required == nullptr || std::strcmp(required, "1") != 0 ||
-        path == nullptr || *path == '\0')
+    /* Supplying a private trace path is itself the opt-in.  Readiness is an
+       infrastructure witness needed before canaries and must not depend on a
+       workload's later strict-C1F1 policy knob. */
+    if (path == nullptr || *path == '\0')
         return;
     const int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
     if (fd < 0)
@@ -134,6 +135,7 @@ void append_source_result_trace(
         reuse = *transfer.system_source_reuse ? "true" : "false";
     const std::string c_guid = bytes_hex(std::span<const uint8_t>(
         c_store_guid.bytes.data(), c_store_guid.bytes.size()));
+    const std::string raw_digest = icecc::digest128_hex(transfer.raw_digest);
     char line[1024];
     const int length = std::snprintf(
         line, sizeof(line),
@@ -143,6 +145,7 @@ void append_source_result_trace(
         "\"c_store_guid\":\"%s\","
         "\"profile\":\"%.*s\",\"status\":%u,\"attempts\":%u,"
         "\"tu_seq\":%llu,\"raw_bytes\":%llu,"
+        "\"raw_digest\":\"%s\","
         "\"c_to_f_bytes\":%llu,\"f_to_c_bytes\":%llu,"
         "\"system_source_reuse\":%s}\n",
         static_cast<unsigned long long>(request.wire_job_id),
@@ -158,6 +161,7 @@ void append_source_result_trace(
                 ? transfer.committed_input->tu_seq.value
                 : 0),
         static_cast<unsigned long long>(transfer.raw_bytes),
+        raw_digest.c_str(),
         static_cast<unsigned long long>(transfer.c_to_f_bytes),
         static_cast<unsigned long long>(transfer.f_to_c_bytes), reuse);
     if (length <= 0 || static_cast<size_t>(length) >= sizeof(line))
@@ -193,11 +197,15 @@ void append_terminal_lifecycle_test_trace(
         path == nullptr || *path == '\0')
         return;
 
+    const std::string c_store_guid = bytes_hex(std::span<const uint8_t>(
+        request.key.c_store_guid.bytes.data(),
+        request.key.c_store_guid.bytes.size()));
     char line[1024];
     const int length = std::snprintf(
         line, sizeof(line),
         "P50_LIFECYCLE pid=%lld generation=%llu attempt=%llu job=%llu "
-        "epoch=%llu nonce=%llu request=%llu action=%u status=%u "
+        "epoch=%llu nonce=%llu c_store_guid=%s input_tu=%llu request=%llu "
+        "action=%u status=%u "
         "before_records=%zu before_bytes=%llu after_records=%zu "
         "after_bytes=%llu\n",
         static_cast<long long>(::getpid()),
@@ -206,6 +214,8 @@ void append_terminal_lifecycle_test_trace(
         static_cast<unsigned long long>(request.owner.logical_job),
         static_cast<unsigned long long>(request.owner.assignment_epoch),
         static_cast<unsigned long long>(request.owner.assignment_nonce),
+        c_store_guid.c_str(),
+        static_cast<unsigned long long>(request.key.tu_seq.value),
         static_cast<unsigned long long>(request.operation_id),
         static_cast<unsigned int>(request.action),
         static_cast<unsigned int>(status),
@@ -1210,6 +1220,9 @@ RuntimeConfig validate_runtime_config(RuntimeConfig config) {
         throw std::invalid_argument("sidecar runtime supports exactly one live handoff");
     if (config.endpoint_config.owner_limits.max_retained_input_records == 0 ||
         config.max_input_lifecycle_replays == 0 ||
+        config.max_route_completed_requests == 0 ||
+        config.max_route_relationships == 0 ||
+        config.max_route_endpoint_identities == 0 ||
         config.cancellation_grace <= std::chrono::milliseconds::zero())
         throw std::invalid_argument(
             "sidecar runtime bounds must be nonzero");
@@ -1231,6 +1244,11 @@ local::P50SourceTransferResult source_transfer_error(uint16_t code,
 
 local::P50SourceTransferResult source_transfer_result(
     const ZstdSourceTransferResult& transfer, CStoreGuid expected_c_guid) noexcept {
+    if (transfer.replacement_required) {
+        return source_transfer_error(static_cast<uint16_t>(
+            local::SourceTransferErrorCode::RouteReplacementRequired),
+            transfer.attempts);
+    }
     if (transfer.status != ZstdSourceTransferStatus::Committed ||
         !transfer.committed_input.has_value() ||
         transfer.raw_bytes == 0 || transfer.raw_digest == Digest128{} ||
@@ -1340,7 +1358,17 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
         config_.endpoint_config);
     P50RouteOwnerConfig route_config;
     route_config.endpoint_caps = config_.endpoint_caps;
+    route_config.max_completed_requests = config_.max_route_completed_requests;
+    route_config.max_relationships = config_.max_route_relationships;
     route_config.compression_level = 3;
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+    route_config.before_prepare_for_route_for_test =
+        std::move(config_.before_route_prepare_for_test);
+#else
+    if (route_config.before_prepare_for_route_for_test)
+        throw std::logic_error(
+            "production sidecar cannot install the route-poison test hook");
+#endif
     route_owner_ = std::make_unique<P50CRouteOwner>(std::move(route_config));
     endpoint_owner_thread_ = std::thread([this] { endpoint_owner_loop(); });
 }
@@ -1380,6 +1408,29 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     if (stop_requested_.load(std::memory_order_acquire) ||
         std::chrono::steady_clock::now() >= transfer_deadline)
         return source_transfer_error(7);
+    if (route_replacement_required_.load(std::memory_order_acquire))
+        return source_transfer_error(static_cast<uint16_t>(
+            local::SourceTransferErrorCode::RouteReplacementRequired));
+
+    // Capacity is decidable from the immutable selected endpoint before
+    // reading C's source or opening/claiming F.  Refuse a novel endpoint at
+    // the process-lifetime bound without creating the detached F owner that
+    // the later identity-binding check exists to protect.
+    std::optional<RouteStoreIdentity> known_endpoint_identity;
+    for (const auto& [endpoint, identity] : route_endpoint_identities_) {
+        if (endpoint.host == request.selected_f_host &&
+            endpoint.cache_port == request.selected_f_cache_port) {
+            known_endpoint_identity = identity;
+            break;
+        }
+    }
+    if (!known_endpoint_identity.has_value() &&
+        route_endpoint_identities_.size() >=
+            config_.max_route_endpoint_identities) {
+        route_replacement_required_.store(true, std::memory_order_release);
+        return source_transfer_error(static_cast<uint16_t>(
+            local::SourceTransferErrorCode::RouteReplacementRequired));
+    }
 
     P50SourceArmFields arm;
     arm.wire_job_id = request.wire_job_id;
@@ -1411,6 +1462,24 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
         profile = ProfileId::ZSTD_TU;
     else
         return source_transfer_error(2);
+
+    // For an already authenticated endpoint, its exact F incarnation and the
+    // requested profile make the relationship key knowable before opening F.
+    // Do not claim/arm a worker when the bounded owner table cannot retain
+    // that new key.  A novel endpoint cannot use this preflight: its address
+    // may name an already retained incarnation, which is learned only from
+    // the authenticated arm acknowledgement.
+    if (known_endpoint_identity.has_value()) {
+        const P50RouteRelationship known_relationship{
+            config_.c_store_guid, known_endpoint_identity->guid,
+            known_endpoint_identity->generation, profile};
+        if (!route_owner_->owns(known_relationship) &&
+            route_owner_->owner_count() >= config_.max_route_relationships) {
+            route_replacement_required_.store(true, std::memory_order_release);
+            return source_transfer_error(static_cast<uint16_t>(
+                local::SourceTransferErrorCode::RouteReplacementRequired));
+        }
+    }
     const auto source_bytes = read_source_fd(
         source.get(), config_.endpoint_caps.zstd.max_raw_bytes);
     if (!source_bytes.has_value())
@@ -1520,12 +1589,37 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                 local::P50SourceTransferResult value = source_transfer_error(4);
                 ZstdSourceTransferResult observed;
                 try {
-                    observed = co_await route_owner_->transfer(
-                        relationship, route_request, connection, transfer_deadline,
-                        std::span<const uint8_t>(*source_bytes));
+                    const RouteEndpointKey endpoint_key{
+                        request.selected_f_host, request.selected_f_cache_port};
+                    const RouteStoreIdentity store_identity{
+                        relationship.f_store_guid,
+                        relationship.f_store_generation};
+                    if (!bind_route_endpoint_identity(endpoint_key,
+                                                      store_identity)) {
+                        observed.status = ZstdSourceTransferStatus::Unavailable;
+                        observed.profile = relationship.profile;
+                        observed.replacement_required = true;
+                    } else {
+                        observed = co_await route_owner_->transfer(
+                            relationship, route_request, connection,
+                            transfer_deadline,
+                            std::span<const uint8_t>(*source_bytes));
+                    }
+                    if (observed.replacement_required)
+                        route_replacement_required_.store(
+                            true, std::memory_order_release);
                     value = source_transfer_result(observed, expected_c_guid);
+                } catch (const P29V1CapabilityUnavailable&) {
+                    value = source_transfer_error(static_cast<uint16_t>(
+                        local::SourceTransferErrorCode::
+                            PermanentLocalProfileUnavailable));
                 } catch (...) {
-                    value = source_transfer_error(5);
+                    observed.status = ZstdSourceTransferStatus::TerminalError;
+                    observed.profile = relationship.profile;
+                    observed.replacement_required = true;
+                    route_replacement_required_.store(
+                        true, std::memory_order_release);
+                    value = source_transfer_result(observed, expected_c_guid);
                 }
                 append_source_result_trace(request, expected_c_guid,
                                            relationship.profile,
@@ -1535,7 +1629,9 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
             },
             asio::detached);
     } catch (...) {
-        return source_transfer_error(6);
+        route_replacement_required_.store(true, std::memory_order_release);
+        return source_transfer_error(static_cast<uint16_t>(
+            local::SourceTransferErrorCode::RouteReplacementRequired));
     }
     // The route owner uses the same absolute deadline for connect, arm, and
     // CacheWire.  A bounded grace lets the owner coroutine publish its typed
@@ -1551,6 +1647,36 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
         std::_Exit(125);
     }
     return result.get();
+}
+
+bool SidecarRuntime::bind_route_endpoint_identity(
+    const RouteEndpointKey& endpoint,
+    RouteStoreIdentity observed) noexcept {
+    if (!route_owner_ || endpoint.host.empty() || endpoint.cache_port == 0 ||
+        observed.guid == FStoreGuid{} || observed.generation == 0)
+        return false;
+    const auto position = route_endpoint_identities_.find(endpoint);
+    if (position == route_endpoint_identities_.end()) {
+        if (route_endpoint_identities_.size() >=
+            config_.max_route_endpoint_identities)
+            return false;
+        try {
+            return route_endpoint_identities_.emplace(endpoint, observed).second;
+        } catch (...) {
+            return false;
+        }
+    }
+    if (position->second == observed)
+        return true;
+
+    // The map still names the predecessor until every one of its profile
+    // owners is retired.  Passing the newly observed GUID here would leak old
+    // history into the successor incarnation.
+    if (!route_owner_->reset_f_store_exact(position->second.guid,
+                                           position->second.generation))
+        return false;
+    position->second = observed;
+    return true;
 }
 
 SidecarRuntime::~SidecarRuntime() {
@@ -2275,6 +2401,35 @@ void SidecarRuntime::fsession_close(std::shared_ptr<FSessionPump> pump) noexcept
 size_t SidecarRuntime::live_fsession_operations() const noexcept {
     return fsession_live_.load(std::memory_order_acquire);
 }
+
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+bool SidecarRuntime::seed_route_endpoint_identity_for_test(
+    std::string host, uint32_t cache_port, FStoreGuid guid,
+    uint64_t generation) noexcept {
+    std::unique_lock<std::timed_mutex> lock(source_transfer_mutex_,
+                                            std::try_to_lock);
+    if (!lock.owns_lock())
+        return false;
+    return bind_route_endpoint_identity(
+        RouteEndpointKey{std::move(host), cache_port},
+        RouteStoreIdentity{guid, generation});
+}
+
+bool SidecarRuntime::seed_route_relationship_for_test(
+    std::string host, uint32_t cache_port, FStoreGuid guid,
+    uint64_t generation, ProfileId profile) noexcept {
+    std::unique_lock<std::timed_mutex> lock(source_transfer_mutex_,
+                                            std::try_to_lock);
+    if (!lock.owns_lock() || !route_owner_)
+        return false;
+    const RouteEndpointKey endpoint{std::move(host), cache_port};
+    const RouteStoreIdentity identity{guid, generation};
+    if (!bind_route_endpoint_identity(endpoint, identity))
+        return false;
+    return route_owner_->seed_relationship_for_test(P50RouteRelationship{
+        config_.c_store_guid, guid, generation, profile});
+}
+#endif
 
 void SidecarRuntime::cancel_endpoint_run() noexcept {
     // The permit is captured at admission and posted to the endpoint owner;
