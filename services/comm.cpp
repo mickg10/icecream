@@ -123,6 +123,25 @@ bool append_p50_legacy_wire_trace(const char *path, const std::string &line) noe
     return ::close(fd) == 0;
 }
 
+bool append_p50_legacy_wire_trace(int fd, const std::string &line) noexcept
+{
+    if (fd < 0)
+        return false;
+    size_t offset = 0;
+    while (offset != line.size()) {
+        const ssize_t written = ::write(fd, line.data() + offset,
+                                        line.size() - offset);
+        if (written > 0) {
+            offset += static_cast<size_t>(written);
+            continue;
+        }
+        if (written < 0 && errno == EINTR)
+            continue;
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 namespace {
@@ -1684,6 +1703,11 @@ MsgChannel::MsgChannel(int _fd, struct sockaddr *_a, socklen_t _l, bool text)
 
 MsgChannel::~MsgChannel()
 {
+    if (p50_legacy_wire_trace_fd >= 0) {
+        (void)close(p50_legacy_wire_trace_fd);
+        p50_legacy_wire_trace_fd = -1;
+    }
+
     if (fd >= 0) {
         if ((-1 == close(fd)) && (errno != EBADF)){
             log_perror("close failed");
@@ -1743,6 +1767,20 @@ bool MsgChannel::set_p50_legacy_wire_identity(
         p50_legacy_pending_compile_file.reset();
     }
     return true;
+}
+
+bool MsgChannel::p50_legacy_wire_prepare_trace() noexcept
+{
+    if (!p50_legacy_wire_identity_set || p50_legacy_wire_completed)
+        return false;
+    if (p50_legacy_wire_trace_fd >= 0)
+        return true;
+    const char *path = p50_legacy_wire_trace_path(p50_legacy_wire_role);
+    if (path == nullptr)
+        return true;
+    p50_legacy_wire_trace_fd = ::open(
+        path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0600);
+    return p50_legacy_wire_trace_fd >= 0;
 }
 
 void MsgChannel::p50_legacy_note_received(Msg::Value type,
@@ -1819,6 +1857,9 @@ bool MsgChannel::p50_legacy_wire_complete() noexcept
         static_cast<unsigned long long>(p50_legacy_f_to_c_received));
     if (length <= 0 || static_cast<size_t>(length) >= sizeof(line))
         return false;
+    if (p50_legacy_wire_trace_fd >= 0)
+        return append_p50_legacy_wire_trace(
+            p50_legacy_wire_trace_fd, std::string(line, length));
     return append_p50_legacy_wire_trace(path, std::string(line, length));
 }
 

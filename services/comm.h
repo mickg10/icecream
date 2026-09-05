@@ -1016,6 +1016,7 @@ public:
     }
     bool set_p50_legacy_wire_identity(
         const P50LegacyWireIdentity &identity) noexcept;
+    bool p50_legacy_wire_prepare_trace() noexcept;
     bool p50_legacy_wire_complete() noexcept;
 
     // Consume the one terminal STATUS_TEXT, if any, that set_error() fetched
@@ -1187,6 +1188,7 @@ protected:
     P50LegacyWireIdentity p50_legacy_wire_identity{};
     bool p50_legacy_wire_identity_set = false;
     bool p50_legacy_wire_completed = false;
+    int p50_legacy_wire_trace_fd = -1;
     uint64_t p50_legacy_c_to_f_sent = 0;
     uint64_t p50_legacy_c_to_f_received = 0;
     uint64_t p50_legacy_f_to_c_sent = 0;
