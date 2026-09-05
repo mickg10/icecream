@@ -922,7 +922,8 @@ struct P50PreparationAuthority::Impl {
 
     Impl(CStoreGuid c_store_guid_value, ZstdTuLimits zstd_limits_value,
          PreparationAuthorityLimits authority_limits_value, int compression_level,
-         ProfileId profile_value, TuSeq first_tu_seq)
+         ProfileId profile_value, TuSeq first_tu_seq,
+         P29InternerFaultInjection fault_injection)
         : c_guid(c_store_guid_value), zstd_limits(zstd_limits_value),
           authority_limits(authority_limits_value), codec(compression_level),
           identity(std::make_shared<const uint8_t>(0)), route_codec(3),
@@ -940,7 +941,8 @@ struct P50PreparationAuthority::Impl {
             profile != ProfileId::ZSTD_ROUTE)
             throw std::invalid_argument("preparation authority profile is unsupported");
         p29_authority = std::make_unique<CAuthority>(
-            c_guid, p29::OnlineS1::Config{}, first_tu_seq);
+            c_guid, p29::OnlineS1::Config{}, first_tu_seq,
+            fault_injection);
         if (profile == ProfileId::P29V1)
             ensure_p29v1();
     }
@@ -1026,8 +1028,18 @@ P50PreparationAuthority::P50PreparationAuthority(
     CStoreGuid c_store_guid, ZstdTuLimits zstd_limits,
     PreparationAuthorityLimits authority_limits, int compression_level,
     ProfileId profile, TuSeq first_tu_seq)
+    : P50PreparationAuthority(
+          c_store_guid, zstd_limits, authority_limits, compression_level,
+          profile, first_tu_seq, P29InternerFaultInjection::Disabled) {}
+
+P50PreparationAuthority::P50PreparationAuthority(
+    CStoreGuid c_store_guid, ZstdTuLimits zstd_limits,
+    PreparationAuthorityLimits authority_limits, int compression_level,
+    ProfileId profile, TuSeq first_tu_seq,
+    P29InternerFaultInjection fault_injection)
     : impl_(std::make_unique<Impl>(c_store_guid, zstd_limits, authority_limits,
-                                   compression_level, profile, first_tu_seq)) {}
+                                   compression_level, profile, first_tu_seq,
+                                   fault_injection)) {}
 
 P50PreparationAuthority::~P50PreparationAuthority() = default;
 

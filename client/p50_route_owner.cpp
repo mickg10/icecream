@@ -71,7 +71,8 @@ P50CRouteOwner::Sender& P50CRouteOwner::get_or_create(
         authority_ = std::make_shared<P50PreparationAuthority>(
             relationship.c_store_guid, config_.endpoint_caps.zstd,
             config_.authority_limits, config_.compression_level,
-            config_.endpoint_caps.profile);
+            config_.endpoint_caps.profile, TuSeq{},
+            config_.p29_interner_fault_injection);
     } else if (authority_->c_store_guid() != relationship.c_store_guid) {
         throw std::invalid_argument("route belongs to another C store");
     }

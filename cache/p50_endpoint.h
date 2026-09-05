@@ -244,6 +244,11 @@ public:
                                      int compression_level = 1,
                                      ProfileId profile = ProfileId::ZSTD_TU,
                                      TuSeq first_tu_seq = {});
+    P50PreparationAuthority(
+        CStoreGuid c_store_guid, ZstdTuLimits zstd_limits,
+        PreparationAuthorityLimits authority_limits, int compression_level,
+        ProfileId profile, TuSeq first_tu_seq,
+        P29InternerFaultInjection fault_injection);
     ~P50PreparationAuthority();
     P50PreparationAuthority(const P50PreparationAuthority&) = delete;
     P50PreparationAuthority& operator=(const P50PreparationAuthority&) = delete;

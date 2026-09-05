@@ -36,6 +36,11 @@
 
 namespace icecc::p50::service {
 
+// Unset is the production default. Any configured value other than the one
+// deliberately supported live-farm fault is malformed and must prevent READY.
+[[nodiscard]] bool parse_p29_interner_fault_injection(
+    const char* value, P29InternerFaultInjection& result) noexcept;
+
 // Explicit state/configuration for the sidecar's one endpoint owner.  The
 // service never creates a public listener: the daemon accepts the ordinary
 // TCP link and passes that connected descriptor over the private control
@@ -55,6 +60,8 @@ struct RuntimeConfig {
     size_t max_route_completed_requests = 4096;
     size_t max_route_relationships = 256;
     size_t max_route_endpoint_identities = 256;
+    P29InternerFaultInjection p29_interner_fault_injection =
+        P29InternerFaultInjection::Disabled;
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
     // Injected at the real route prepare boundary after F has acknowledged
     // arm/CacheSession.  Test builds use this to prove owner poison reaches

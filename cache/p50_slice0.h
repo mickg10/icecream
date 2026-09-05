@@ -264,11 +264,22 @@ private:
 
 using PreparedTUPtr = std::shared_ptr<const PreparedTU>;
 
+// Deliberately narrow live-farm fault injection. The only enabled mode fires
+// once at the real P29 interner boundary; ordinary fail-closed owner state
+// then makes P29V1 unavailable until the READY lease is replaced.
+enum class P29InternerFaultInjection : uint8_t {
+    Disabled = 0,
+    FailOnce,
+};
+
 class CAuthority {
 public:
     explicit CAuthority(CStoreGuid guid,
                         p29::OnlineS1::Config config = p29::OnlineS1::Config{},
                         TuSeq first_tu_seq = {});
+    CAuthority(CStoreGuid guid, p29::OnlineS1::Config config,
+               TuSeq first_tu_seq,
+               P29InternerFaultInjection fault_injection);
     ~CAuthority();
     CAuthority(const CAuthority&) = delete;
     CAuthority& operator=(const CAuthority&) = delete;
@@ -299,6 +310,8 @@ private:
     p29::BlockCatalogue block_catalogue_;
     uint64_t next_tu_seq_ = 0;
     bool tu_seq_exhausted_ = false;
+    P29InternerFaultInjection p29v1_fault_injection_ =
+        P29InternerFaultInjection::Disabled;
     std::unique_ptr<P29V1State> p29v1_;
 
     friend class CRoute;

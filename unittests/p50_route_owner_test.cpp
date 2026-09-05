@@ -792,6 +792,44 @@ void test_p29v1_relationship_owner() {
     CHECK(owner.owner_count() == 1 && owner.owns(route));
 }
 
+void test_interner_fault_is_sticky_only_for_p29v1() {
+    P50RouteOwnerConfig owner_config = config(ProfileId::P29V1);
+    P50PreparationAuthority authority(
+        Id128::from_u64(191), owner_config.endpoint_caps.zstd,
+        owner_config.authority_limits, owner_config.compression_level,
+        ProfileId::P29V1, TuSeq{}, P29InternerFaultInjection::FailOnce);
+    const PreparationRouteKey p29_route{
+        Id128::from_u64(291), 1, ProfileId::P29V1};
+    const std::vector<uint8_t> source{
+        '#', ' ', '1', ' ', '"', 'f', 'a', 'u', 'l', 't', '"', '\n',
+        's', 'a', 'm', 'e', '\n', 's', 'a', 'm', 'e', '\n'};
+
+    bool first_typed = false;
+    try {
+        (void)authority.prepare_for_route(p29_route, {7601, 1}, source);
+    } catch (const P29V1CapabilityUnavailable&) {
+        first_typed = true;
+    }
+    CHECK(first_typed);
+
+    bool second_typed = false;
+    try {
+        (void)authority.prepare_for_route(p29_route, {7601, 2}, source);
+    } catch (const P29V1CapabilityUnavailable&) {
+        second_typed = true;
+    }
+    CHECK(second_typed);
+
+    const PreparationRouteKey zstd_route{
+        Id128::from_u64(292), 1, ProfileId::ZSTD_TU};
+    const PreparedTuHandle zstd =
+        authority.prepare_for_route(zstd_route, {7601, 3}, source);
+    CHECK(authority.prepared_profile(zstd) == ProfileId::ZSTD_TU);
+    CHECK(authority.prepared_tu_seq(zstd) == TuSeq{0});
+    authority.commit(zstd);
+    CHECK(authority.release(zstd) == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -805,4 +843,5 @@ int main() {
     test_p29v1_relationship_owner();
     test_relationship_table_cap_requests_replacement();
     test_typed_poison_catch_is_owner_wide();
+    test_interner_fault_is_sticky_only_for_p29v1();
 }

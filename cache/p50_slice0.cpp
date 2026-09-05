@@ -7,6 +7,7 @@
 #include <bit>
 #include <cerrno>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -1543,23 +1544,34 @@ struct CAuthority::P29V1State {
         throw std::length_error("P29V1 interner budget admits no production layout");
     }
 
-    P29V1State(uint64_t budget, uint64_t max_tu)
+    P29V1State(uint64_t budget, uint64_t max_tu,
+               P29InternerFaultInjection fault_injection)
         : provider(static_cast<size_t>(std::min<uint64_t>(
               budget, std::numeric_limits<size_t>::max()))),
           layout(select_layout(budget)), interner(provider, layout),
-          max_tu_bytes(max_tu) {}
+          max_tu_bytes(max_tu),
+          inject_failure_once(
+              fault_injection == P29InternerFaultInjection::FailOnce) {}
 
     P29MmapInternProvider provider;
     codec::P29InternLayout layout;
     codec::P29Interner<P29MmapInternProvider> interner;
     uint64_t max_tu_bytes = 0;
+    bool inject_failure_once = false;
     bool runnable = true;
 };
 
 CAuthority::CAuthority(CStoreGuid guid, p29::OnlineS1::Config config,
                        TuSeq first_tu_seq)
+    : CAuthority(guid, config, first_tu_seq,
+                 P29InternerFaultInjection::Disabled) {}
+
+CAuthority::CAuthority(CStoreGuid guid, p29::OnlineS1::Config config,
+                       TuSeq first_tu_seq,
+                       P29InternerFaultInjection fault_injection)
     : guid_(guid), s1_config_(config),
-      next_tu_seq_(first_tu_seq.value) {}
+      next_tu_seq_(first_tu_seq.value),
+      p29v1_fault_injection_(fault_injection) {}
 
 CAuthority::~CAuthority() = default;
 
@@ -1570,7 +1582,8 @@ void CAuthority::enable_p29v1(uint64_t max_interner_reserved_bytes,
     if (max_tu_bytes == 0 || max_tu_bytes > std::numeric_limits<size_t>::max())
         throw std::length_error("P29V1 TU limit is not addressable");
     p29v1_ = std::make_unique<P29V1State>(max_interner_reserved_bytes,
-                                         max_tu_bytes);
+                                         max_tu_bytes,
+                                         p29v1_fault_injection_);
 }
 
 bool CAuthority::p29v1_runnable() const noexcept {
@@ -1596,6 +1609,16 @@ PreparedTUPtr CAuthority::prepare_p29v1_at_seq(
         auto prepared = std::make_shared<PreparedTU>();
         prepared->dense_regions.reserve(exact_input.size() / 32 + 1);
         p29v1_->interner.process(exact_input, prepared->dense_regions);
+        if (p29v1_->inject_failure_once) {
+            p29v1_->inject_failure_once = false;
+            std::fputs(
+                "{\"schema\":\"icecream-p50-fault-v1\","
+                "\"fault\":\"p29-interner-fail-once\","
+                "\"outcome\":\"fired\"}\n",
+                stderr);
+            std::fflush(stderr);
+            throw std::runtime_error("injected P29V1 interner failure");
+        }
         size_t offset = 0;
         for (const uint32_t id : prepared->dense_regions) {
             const std::span<const uint8_t> region =

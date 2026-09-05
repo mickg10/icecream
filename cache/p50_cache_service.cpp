@@ -39,6 +39,18 @@
 #include <vector>
 
 namespace icecc::p50::service {
+
+bool parse_p29_interner_fault_injection(
+    const char* value, P29InternerFaultInjection& result) noexcept {
+    result = P29InternerFaultInjection::Disabled;
+    if (value == nullptr)
+        return true;
+    if (std::strcmp(value, "P29_INTERNER_FAIL_ONCE") != 0)
+        return false;
+    result = P29InternerFaultInjection::FailOnce;
+    return true;
+}
+
 namespace {
 
 namespace asio = boost::asio;
@@ -1367,6 +1379,8 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
     route_config.max_completed_requests = config_.max_route_completed_requests;
     route_config.max_relationships = config_.max_route_relationships;
     route_config.compression_level = 3;
+    route_config.p29_interner_fault_injection =
+        config_.p29_interner_fault_injection;
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
     route_config.before_prepare_for_route_for_test =
         std::move(config_.before_route_prepare_for_test);
@@ -2710,6 +2724,13 @@ int run(const Options& options) noexcept {
         return 2;
     }
     RuntimeConfig runtime_config;
+    const char* p29_fault = ::getenv("ICECC_P50_FAULT_INJECTION");
+    if (!parse_p29_interner_fault_injection(
+            p29_fault, runtime_config.p29_interner_fault_injection)) {
+        cleanup_listener(listener, effective_options.socket_path, identity,
+                         prebound);
+        return 2;
+    }
     // The store identity is explicit launch state allocated by the supervisor;
     // it is independent of the control launch identity and rotates on every
     // restart. Never derive it from generation/attempt or a local clock.

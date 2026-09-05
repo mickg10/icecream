@@ -728,6 +728,20 @@ service::RuntimeConfig test_runtime_config() {
     return config;
 }
 
+void test_p29_fault_environment_is_exact() {
+    P29InternerFaultInjection parsed = P29InternerFaultInjection::FailOnce;
+    CHECK(service::parse_p29_interner_fault_injection(nullptr, parsed));
+    CHECK(parsed == P29InternerFaultInjection::Disabled);
+    CHECK(service::parse_p29_interner_fault_injection(
+        "P29_INTERNER_FAIL_ONCE", parsed));
+    CHECK(parsed == P29InternerFaultInjection::FailOnce);
+    CHECK(!service::parse_p29_interner_fault_injection("", parsed));
+    CHECK(parsed == P29InternerFaultInjection::Disabled);
+    CHECK(!service::parse_p29_interner_fault_injection(
+        "P29_INTERNER_FAIL_ALWAYS", parsed));
+    CHECK(parsed == P29InternerFaultInjection::Disabled);
+}
+
 SidecarLaunchIdentity test_sidecar_launch(StoreIdentityRoot root) {
     SidecarLaunchIdentity launch;
     launch.identity = {7, 1};
@@ -1514,6 +1528,55 @@ void test_route_poison_latches_before_successor_f_open() {
     CHECK(::close(successor_listener) == 0);
 }
 
+void test_interner_fault_returns_permanent_profile_unavailable() {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 9;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.p29_interner_fault_injection =
+        P29InternerFaultInjection::FailOnce;
+    service::SidecarRuntime runtime(std::move(config));
+
+    StoreIdentityRoot remote_root{};
+    remote_root.bytes[14] = 0x54;
+    const FStoreGuid remote_guid = f_store_guid_for_root(remote_root);
+    uint16_t port = 0;
+    const int listener = loopback_listener(port);
+    SourceArmServerObservation observation;
+    std::thread server([&] {
+        serve_one_source_arm(listener, remote_guid, 12, observation);
+    });
+
+    char source_path[] = "/tmp/p50-interner-fault-XXXXXX";
+    const int source_fd = ::mkstemp(source_path);
+    CHECK(source_fd >= 0);
+    const std::array<uint8_t, 12> source{
+        'p', '2', '9', '-', 'f', 'a', 'u', 'l', 't', '\n', 'x', '\n'};
+    CHECK(write_all(source_fd, source));
+    CHECK(::unlink(source_path) == 0);
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+        std::chrono::steady_clock::now() + std::chrono::seconds(4),
+        clock.clock_domain_id, clock.time_namespace_id);
+    const local::P50SourceTransferResult result =
+        runtime.transfer_source_on_owner(
+            source_transfer_request(port, 111, CACHE_PROFILE_P29V1),
+            deadline, local::HandoffFd(source_fd));
+    server.join();
+
+    CHECK(result.code == local::SourceTransferResultCode::Error);
+    CHECK(result.error_code == static_cast<uint16_t>(
+        local::SourceTransferErrorCode::PermanentLocalProfileUnavailable));
+    CHECK(observation.accepted && observation.protocol_50 &&
+          observation.arm_received && observation.armed_sent &&
+          observation.cache_session_received && observation.ready_sent &&
+          observation.eof_without_cachewire);
+}
+
 int connect_after_sidecar_ready(uint16_t port) {
     const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0)
@@ -2022,6 +2085,8 @@ int main() {
         test_route_endpoint_cap_refuses_before_f_open();
         test_known_endpoint_relationship_cap_refuses_before_f_open();
         test_route_poison_latches_before_successor_f_open();
+        test_interner_fault_returns_permanent_profile_unavailable();
+        test_p29_fault_environment_is_exact();
         structured_launch_is_complete_and_fail_closed();
         structured_c_guid_is_strict();
         test_runtime_identity_disconnect_and_endpoint_failure();
