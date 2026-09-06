@@ -24,6 +24,8 @@ check_contract() {
         'ConnectionProvenance p50_source_arm_provenance' \
         'p50_source_deadline_msec' \
         'p50_source_compile_pending' \
+        'const std::optional<P50SourceArmFields> precompile_source_identity' \
+        ': precompile_source_identity' \
         'authorize_source_arm_claim' \
         'bind_source_assignment_for_settlement' \
         'take_invalid_p50_source_arm_identity' \
@@ -133,6 +135,12 @@ fi
 sed 's/if (expire_p50_source_waiters()) {/if (false) {/g' "$daemon" >"$mutant"
 if check_contract "$mutant"; then
     echo 'FAIL: silent-expiry sweep deletion mutant survived' >&2
+    exit 1
+fi
+
+sed 's/: precompile_source_identity/: std::nullopt/g' "$daemon" >"$mutant"
+if check_contract "$mutant"; then
+    echo 'FAIL: pre-compile terminal identity deletion mutant survived' >&2
     exit 1
 fi
 

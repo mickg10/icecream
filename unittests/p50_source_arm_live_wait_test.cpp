@@ -301,6 +301,45 @@ static bool wait_one_job_done(MsgChannel *scheduler, uint32_t expected,
     return match;
 }
 
+static bool wait_one_precompile_job_done(
+    MsgChannel *scheduler, const P50SourceArmFields& expected,
+    int timeout_msec, int expected_exitcode)
+{
+    Msg *message = wait_for_type(scheduler, Msg::JOB_DONE, timeout_msec);
+    auto *done = dynamic_cast<JobDoneMsg *>(message);
+    const bool match = done != nullptr &&
+        done->job_id == expected.wire_job_id && done->is_from_server() &&
+        done->exitcode == expected_exitcode &&
+        done->assignmentEpoch() == expected.assignment_epoch &&
+        done->assignmentNonce() == expected.assignment_nonce &&
+        done->cGuid() == 0 && done->tuSeq() == 0;
+    if (!match) {
+        if (done == nullptr) {
+            std::fprintf(stderr,
+                         "diagnostic: expected exact pre-compile JobDone job=%u; "
+                         "observed none\n",
+                         expected.wire_job_id);
+        } else {
+            std::fprintf(stderr,
+                         "diagnostic: expected exact pre-compile JobDone "
+                         "job=%u exit=%d epoch=%llu nonce=%llu compile=0/0; "
+                         "observed job=%u exit=%d from_server=%d epoch=%llu "
+                         "nonce=%llu compile=%llu/%llu\n",
+                         expected.wire_job_id, expected_exitcode,
+                         static_cast<unsigned long long>(expected.assignment_epoch),
+                         static_cast<unsigned long long>(expected.assignment_nonce),
+                         done->job_id, done->exitcode,
+                         done->is_from_server() ? 1 : 0,
+                         static_cast<unsigned long long>(done->assignmentEpoch()),
+                         static_cast<unsigned long long>(done->assignmentNonce()),
+                         static_cast<unsigned long long>(done->cGuid()),
+                         static_cast<unsigned long long>(done->tuSeq()));
+        }
+    }
+    delete message;
+    return match;
+}
+
 static bool no_job_done(MsgChannel *scheduler, uint32_t unexpected,
                         int timeout_msec)
 {
@@ -435,8 +474,9 @@ static bool run_live_test(const char *iceccd_path, const char *cache_service_pat
                 silent_ack->source_budget_msec <= P50SourceArmedFields::MaxSourceBudgetMsec,
             "runtime ACK proves WAIT owner installed with F generation and bounded budget");
     delete silent_ack_message;
-    REQUIRE(wait_one_job_done(scheduler, silent_id, 5000, 149),
-            "silent owner deadline sweep sends one worker JobDone with deadline status");
+    REQUIRE(wait_one_precompile_job_done(
+                scheduler, silent_arm, 5000, 149),
+            "silent owner deadline sends one exact fenced worker JobDone with absent compile identity");
     REQUIRE(wait_eof(silent, 1000),
             "silent owner is closed after deadline without peer activity");
     REQUIRE(no_job_done(scheduler, silent_id, 300),

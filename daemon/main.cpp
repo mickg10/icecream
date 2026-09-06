@@ -8401,6 +8401,16 @@ void Daemon::handle_end(Client *client, int exitcode)
     trace() << "handle_end " << client->dump() << endl;
     trace() << dump_internals() << endl;
 #endif
+    /* A source-arm owner exists before CompileFile creates a CompileJob and
+       has no retained UseCS on the worker-side wrapper.  Snapshot its fenced
+       scheduler identity before the teardown below clears the arm.  The
+       pre-compile JobDone intentionally keeps C_GUID/TU_SEQ absent: F has not
+       received the scheduler's compile identity at this boundary. */
+    const std::optional<P50SourceArmFields> precompile_source_identity =
+        client->status == Client::WAITP50INPUT &&
+                client->p50_source_arm_fields.has_value()
+            ? client->p50_source_arm_fields
+            : std::nullopt;
     // A normal disconnect, worker failure, scheduler loss, or retry says only
     // that this assignment attempt is over.  It must not terminally close the
     // logical job; an explicit result disposition does that before handle_end.
@@ -8583,10 +8593,14 @@ void Daemon::handle_end(Client *client, int exitcode)
                 : retained_usecs ? retained_usecs->tuSeq() : 0;
             const uint64_t assignment_epoch = client->job
                 ? client->job->assignmentEpoch()
-                : retained_usecs ? retained_usecs->assignmentEpoch() : 0;
+                : retained_usecs ? retained_usecs->assignmentEpoch()
+                : precompile_source_identity
+                    ? precompile_source_identity->assignment_epoch : 0;
             const uint64_t assignment_nonce = client->job
                 ? client->job->assignmentNonce()
-                : retained_usecs ? retained_usecs->assignmentNonce() : 0;
+                : retained_usecs ? retained_usecs->assignmentNonce()
+                : precompile_source_identity
+                    ? precompile_source_identity->assignment_nonce : 0;
             JobDoneMsg msg(job_id, exitcode, flag, clients.size(),
                            assignment_epoch, assignment_nonce, c_guid, tu_seq);
             if( use_client_id ) {
