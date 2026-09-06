@@ -394,12 +394,33 @@ def test_snapshot_materializer_receipt_requires_exact_keyset_and_types(tmp_path:
 
 @pytest.mark.parametrize(
     "filename",
-    ("S80-p29v1.json", "S80-zstd-tu.json", "S80-zstd-route.json", "S80-legacy.json"),
+    (
+        "S40-full-newgen-engagement.json",
+        "S80-p29v1.json",
+        "S80-zstd-tu.json",
+        "S80-zstd-route.json",
+        "S80-legacy.json",
+    ),
 )
-def test_same_snapshot_is_selected_by_all_s80_arms(filename: str) -> None:
+def test_reuse_and_performance_scenarios_select_the_stable_f_snapshot(
+    filename: str,
+) -> None:
     farm = _snapshot_farm()
-    scenario = _snapshot_scenario(farm, filename)
+    scenario = load_scenario_spec(INTEGRATION / "scenarios" / filename, farm)
     plan = farmtest.build_plan(farm, scenario, run_id="snapshot-s80-unit")
     clients = [item for item in plan["topology"]["instances"] if item["role"] == "C"]
     assert len(clients) == 1
     assert clients[0]["system_source_snapshot"]["name"] == "stable-f-source"
+
+
+def test_s40_fmt_records_conservative_cross_system_non_reuse() -> None:
+    farm = _snapshot_farm()
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / "S40-engagement-fmt.json", farm
+    )
+    plan = farmtest.build_plan(farm, scenario, run_id="snapshot-s40-fmt-unit")
+    clients = [item for item in plan["topology"]["instances"] if item["role"] == "C"]
+    assert len(clients) == 1
+    assert "system_source_snapshot" not in clients[0]
+    assert scenario.data["timeline"] == []
+    assert scenario.data["expect"]["reuse"] == "all-false-when-p29v1"

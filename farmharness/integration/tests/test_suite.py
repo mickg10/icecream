@@ -72,6 +72,8 @@ def _s80_suite_tree(tmp_path: Path) -> Path:
         (INTEGRATION / "scenarios" / "S40-full-newgen-engagement.json").read_text()
     )
     base["instances"] = [item for item in base["instances"] if item["name"] != "F2"]
+    base["timeline"] = []
+    base["expect"].pop("reuse_pairs")
     base["expect"]["reuse"] = "none-when-legacy"
     for arm, scenario_id in arm_ids.items():
         scenario = json.loads(json.dumps(base))

@@ -46,22 +46,14 @@
     "oracle": "local-sha"
   },
   "network": {"shaping": []},
-  "timeline": [
-    {
-      "trigger": "job 24",
-      "action": "header_edit",
-      "instance": "F2",
-      "path": "/usr/include/stdio.h"
-    }
-  ],
+  "timeline": [],
   "expect": {
     "exact": "all",
     "engagement": "expected(c,f)",
     "wedges": 0,
     "error106_max": 0,
     "tail_to_incapable": 0,
-    "reuse": "all-true-when-p29v1",
-    "reuse_pairs": {"C1/F1": true, "C1/F2": false},
+    "reuse": "all-false-when-p29v1",
     "wall_s_max": null
   },
   "controls": [],

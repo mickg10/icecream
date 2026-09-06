@@ -309,7 +309,7 @@ def test_paired_workload_materializes_only_b_between_sequential_turns(
     farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path)
     scenario = load_scenario_spec(
-        INTEGRATION / "scenarios" / "S40-full-newgen-engagement.json", farm
+        INTEGRATION / "scenarios" / "S80-p29v1.json", farm
     )
     plan = farmtest.build_plan(farm, scenario, run_id="paired-unit")
     scripted = PairedWorkloadRecorder()

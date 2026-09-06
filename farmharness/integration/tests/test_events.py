@@ -449,7 +449,7 @@ def test_header_edit_is_scoped_drained_and_rejoined_with_fingerprint_receipt(
     farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path)
     scenario = load_scenario_spec(
-        INTEGRATION / "scenarios" / "S40-engagement-fmt.json", farm
+        INTEGRATION / "scenarios" / "S40-full-newgen-engagement.json", farm
     )
     plan = farmtest.build_plan(farm, scenario, run_id="event-unit")
     recorder = HeaderEditRecorder(plan)
