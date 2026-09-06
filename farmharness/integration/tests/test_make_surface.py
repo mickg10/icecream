@@ -100,10 +100,54 @@ def test_image_make_target_is_scratch_routed() -> None:
         in retained
     )
 
+    source_backed = subprocess.run(
+        (
+            "make",
+            "--no-print-directory",
+            "-n",
+            "integration_images",
+            "ICEFARM_SOURCE_ARCHIVE_DIR=/tanksmall/scratch/ictmp/source-inventory",
+        ),
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert (
+        '--source-archive-dir "/tanksmall/scratch/ictmp/source-inventory"'
+        in source_backed
+    )
+
+
+def test_source_archive_make_target_is_explicit_and_scratch_routed() -> None:
+    result = subprocess.run(
+        (
+            "make",
+            "--no-print-directory",
+            "-n",
+            "integration_source_archives",
+            "ICEFARM_SOURCE_ARCHIVE_DIR=/tanksmall/scratch/ictmp/source-inventory",
+        ),
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert 'ICEFARM_TMPDIR="/tmp/i"' in result.stdout
+    assert "farmharness.integration.farmtest source-archives" in result.stdout
+    assert '--output-dir "/tanksmall/scratch/ictmp/source-inventory"' in result.stdout
+    assert (
+        '--labels "p43-1.4.0,p50s2-5b2e5801,p50s4-89917385,'
+        'p50s4-b42d65e8,p50s4-h3-tail-mutant,'
+        'p50s30-f-refusal-mutant-candidate,'
+        'p50s90-f-revision-2-candidate"'
+    ) in result.stdout
+
 
 def test_autotools_source_exposes_the_same_required_targets() -> None:
     text = (ROOT / "Makefile.am").read_text(encoding="utf-8")
     for target in (
+        "integration_source_archives",
         "integration_images",
         "integration_smoke",
         "integration_controls",
@@ -122,6 +166,8 @@ def test_autotools_source_exposes_the_same_required_targets() -> None:
     assert image_target.count("farmharness.integration.farmtest images") == 2
     assert image_target.count("--foundations") == 1
     assert "ICEFARM_SEALED_LABELS" in text
+    assert "ICEFARM_SOURCE_LABELS" in text
+    assert "ICEFARM_SOURCE_ARCHIVE_DIR" in text
     assert "p50s30-f-refusal-mutant-candidate" not in image_target
     assert "p50s90-f-revision-2-candidate" not in image_target
     assert "foundations.json" in image_target

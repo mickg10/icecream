@@ -34,6 +34,7 @@ try:
         ImageError,
         build_and_distribute,
         build_and_distribute_foundations,
+        export_source_archive_inventory,
         foundation_targets_for_scenario,
     )
     from .layout import instance_root, oracle_root, runtime_root, toolchain_root
@@ -98,6 +99,7 @@ except ImportError:  # Executed as ./farmtest.py.
         ImageError,
         build_and_distribute,
         build_and_distribute_foundations,
+        export_source_archive_inventory,
         foundation_targets_for_scenario,
     )
     from layout import instance_root, oracle_root, runtime_root, toolchain_root
@@ -2286,6 +2288,14 @@ def _parser() -> argparse.ArgumentParser:
     images.add_argument("--scenario")
     images.add_argument("--repo", default=str(Path(__file__).resolve().parents[2]))
     images.add_argument("--output")
+    images.add_argument("--source-archive-dir")
+    source_archives = subparsers.add_parser("source-archives")
+    source_archives.add_argument("--farm", required=True)
+    source_archives.add_argument("--labels")
+    source_archives.add_argument(
+        "--repo", default=str(Path(__file__).resolve().parents[2])
+    )
+    source_archives.add_argument("--output-dir", required=True)
     authority = subparsers.add_parser("authority")
     authority_commands = authority.add_subparsers(
         dest="authority_command", required=True
@@ -2339,6 +2349,20 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(receipt, indent=2, sort_keys=True))
             return 0 if receipt["status"] == "PASS" else 1
         farm = load_farm_spec(args.farm)
+        if args.command == "source-archives":
+            labels = (
+                [item for item in args.labels.split(",") if item]
+                if args.labels
+                else sorted(farm.data["authority"]["images"])
+            )
+            receipt = export_source_archive_inventory(
+                farm,
+                labels,
+                repo=Path(args.repo),
+                output_dir=Path(args.output_dir),
+            )
+            print(json.dumps(receipt, indent=2, sort_keys=True))
+            return 0
         if args.command == "suite":
             suite = load_suite_spec(args.suite)
             selected = (
@@ -2392,6 +2416,10 @@ def main(argv: list[str] | None = None) -> int:
                     raise PlanError(
                         "--labels and --foundations are separate image modes"
                     )
+                if args.source_archive_dir:
+                    raise PlanError(
+                        "--source-archive-dir applies only to product images"
+                    )
                 targets = None
                 if args.scenario:
                     selected_scenario = load_scenario_spec(args.scenario, farm)
@@ -2436,6 +2464,11 @@ def main(argv: list[str] | None = None) -> int:
                 labels,
                 repo=Path(args.repo),
                 output=output,
+                source_archive_dir=(
+                    Path(args.source_archive_dir)
+                    if args.source_archive_dir
+                    else None
+                ),
             )
             print(json.dumps(receipt, indent=2, sort_keys=True))
             return 0

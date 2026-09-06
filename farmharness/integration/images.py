@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -15,6 +16,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Protocol
 
 try:
+    from .image_transport import ZSTD_LEVEL, ZSTD_LONG, ZSTD_THREADS
     from .farm_spec import FarmSpec
     from .remote import (
         CommandResult,
@@ -25,6 +27,7 @@ try:
     )
     from .schema_validation import canonical_bytes
 except ImportError:  # Direct execution from this directory.
+    from image_transport import ZSTD_LEVEL, ZSTD_LONG, ZSTD_THREADS
     from farm_spec import FarmSpec
     from remote import (
         CommandResult,
@@ -39,6 +42,7 @@ except ImportError:  # Direct execution from this directory.
 IMAGE_RECEIPT_SCHEMA = "icefarm-images-v1"
 FOUNDATION_IMAGE_RECEIPT_SCHEMA = "icefarm-foundation-images-v1"
 IMAGE_TRANSPORT_SCHEMA = "icefarm-docker-save-zstd-v1"
+SOURCE_ARCHIVE_INVENTORY_SCHEMA = "icefarm-source-archive-inventory-v1"
 DOCKER_DIR = Path(__file__).with_name("docker")
 IMAGE_TRANSPORT_HELPER = Path(__file__).with_name("image_transport.py")
 DOCKER_FILES = (
@@ -321,13 +325,180 @@ def image_bindings(farm: FarmSpec, labels: Iterable[str]) -> list[ImageBinding]:
     return result
 
 
-def create_source_archive(repo: Path, binding: ImageBinding, destination: Path) -> None:
-    """Write exactly ``git archive <binding.commit>`` and verify its authority hash."""
+def _source_archive_identity(binding: ImageBinding) -> tuple[str, str]:
+    return (
+        binding.base_commit or binding.commit,
+        binding.base_archive_sha256 or binding.archive_sha256,
+    )
+
+
+def _inventory_source_archive(
+    source_archive_dir: Path, binding: ImageBinding
+) -> tuple[Path, dict[str, Any]]:
+    source_commit, source_archive_sha256 = _source_archive_identity(binding)
+    if not source_archive_dir.is_absolute():
+        raise ImageError("source archive inventory directory must be absolute")
+    root = source_archive_dir
+    if root.is_symlink() or not root.is_dir():
+        raise ImageError(
+            f"source archive inventory is not a regular absolute directory: {root}"
+        )
+    inventory_path = root / "inventory.json"
+    if inventory_path.is_symlink() or not inventory_path.is_file():
+        raise ImageError(f"source archive inventory is missing: {inventory_path}")
+    try:
+        inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ImageError(f"invalid source archive inventory: {exc}") from exc
+    if not isinstance(inventory, dict) or inventory.get("schema") != (
+        SOURCE_ARCHIVE_INVENTORY_SCHEMA
+    ):
+        raise ImageError("source archive inventory has the wrong schema")
+    labels = inventory.get("labels")
+    archives = inventory.get("archives")
+    expected_label = {
+        "source_archive_sha256": source_archive_sha256,
+        "source_commit": source_commit,
+    }
+    if not isinstance(labels, dict) or labels.get(binding.label) != expected_label:
+        raise ImageError(
+            f"source archive inventory does not bind {binding.label} to its authority"
+        )
+    expected_name = f"{source_archive_sha256}.tar.zst"
+    artifact = archives.get(source_archive_sha256) if isinstance(archives, dict) else None
+    zstd = artifact.get("zstd") if isinstance(artifact, dict) else None
+    if (
+        not isinstance(artifact, dict)
+        or artifact.get("file") != expected_name
+        or re.fullmatch(r"[0-9a-f]{64}", str(artifact.get("sha256"))) is None
+        or not isinstance(artifact.get("bytes"), int)
+        or isinstance(artifact.get("bytes"), bool)
+        or artifact["bytes"] <= 0
+        or artifact.get("source_sha256") != source_archive_sha256
+        or not isinstance(artifact.get("source_bytes"), int)
+        or isinstance(artifact.get("source_bytes"), bool)
+        or artifact["source_bytes"] <= 0
+        or not isinstance(zstd, dict)
+        or zstd.get("check") is not True
+        or zstd.get("level") != ZSTD_LEVEL
+        or zstd.get("long") != ZSTD_LONG
+        or zstd.get("threads") != ZSTD_THREADS
+        or not isinstance(zstd.get("version"), str)
+        or not zstd["version"]
+    ):
+        raise ImageError(
+            f"source archive inventory has invalid artifact {source_archive_sha256}"
+        )
+    source = root / expected_name
+    if source.is_symlink() or not source.is_file():
+        raise ImageError(f"source archive inventory artifact is missing: {source}")
+    try:
+        source_bytes = source.stat().st_size
+    except OSError as exc:
+        raise ImageError(
+            f"cannot stat source archive inventory artifact: {source}: {exc}"
+        ) from exc
+    if source_bytes != artifact["bytes"]:
+        raise ImageError(
+            f"source archive inventory size mismatch for {binding.label}"
+        )
+    return source, artifact
+
+
+def _materialize_inventory_source_archive(
+    source_archive_dir: Path, binding: ImageBinding, destination: Path
+) -> None:
+    source, artifact = _inventory_source_archive(source_archive_dir, binding)
+    _source_commit, expected_sha256 = _source_archive_identity(binding)
+    compressed_digest = hashlib.sha256()
+    try:
+        descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            observed = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(observed.st_mode)
+                or observed.st_size != artifact["bytes"]
+            ):
+                raise ImageError(
+                    f"source archive inventory artifact changed for {binding.label}"
+                )
+            with os.fdopen(descriptor, "rb", closefd=False) as source_stream:
+                with destination.open("xb") as destination_stream:
+                    for block in iter(
+                        lambda: source_stream.read(1024 * 1024), b""
+                    ):
+                        compressed_digest.update(block)
+                    if compressed_digest.hexdigest() != artifact["sha256"]:
+                        raise ImageError(
+                            f"compressed source archive mismatch for {binding.label}"
+                        )
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    decoded = subprocess.run(
+                        [
+                            "zstd",
+                            "-q",
+                            "-d",
+                            f"--long={ZSTD_LONG}",
+                            "-c",
+                        ],
+                        stdin=descriptor,
+                        stdout=destination_stream,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                        shell=False,
+                    )
+                    if decoded.returncode != 0:
+                        details = decoded.stderr.decode("utf-8", "replace")[-2000:]
+                        raise ImageError(
+                            f"cannot decode source archive for {binding.label}: "
+                            f"{details.strip()}"
+                        )
+        finally:
+            os.close(descriptor)
+    except (OSError, ImageError) as exc:
+        destination.unlink(missing_ok=True)
+        if isinstance(exc, ImageError):
+            raise
+        raise ImageError(
+            f"cannot copy source archive inventory artifact for {binding.label}: {exc}"
+        ) from exc
+    try:
+        observed_bytes = destination.stat().st_size
+        observed_sha256 = _sha256(destination)
+    except OSError as exc:
+        destination.unlink(missing_ok=True)
+        raise ImageError(
+            f"cannot verify decoded source archive for {binding.label}: {exc}"
+        ) from exc
+    if (
+        observed_bytes != artifact["source_bytes"]
+        or observed_sha256 != expected_sha256
+    ):
+        destination.unlink(missing_ok=True)
+        raise ImageError(
+            f"source archive mismatch for {binding.label}: "
+            f"expected {artifact['source_bytes']} bytes/{expected_sha256}, "
+            f"got {observed_bytes} bytes/{observed_sha256}"
+        )
+
+
+def create_source_archive(
+    repo: Path,
+    binding: ImageBinding,
+    destination: Path,
+    *,
+    source_archive_dir: Path | None = None,
+) -> None:
+    """Materialize the exact authority-bound Git archive for one image."""
 
     repo = repo.resolve()
     destination = destination.resolve()
-    source_commit = binding.base_commit or binding.commit
-    source_archive_sha256 = binding.base_archive_sha256 or binding.archive_sha256
+    source_commit, source_archive_sha256 = _source_archive_identity(binding)
+    if source_archive_dir is not None:
+        _materialize_inventory_source_archive(
+            source_archive_dir, binding, destination
+        )
+        return
     try:
         subprocess.run(
             ["git", "cat-file", "-e", f"{source_commit}^{{commit}}"],
@@ -359,9 +530,156 @@ def create_source_archive(repo: Path, binding: ImageBinding, destination: Path) 
         )
 
 
-def prepare_build_context(repo: Path, binding: ImageBinding, context: Path) -> None:
+def _compress_source_archive(source: Path, destination: Path) -> dict[str, Any]:
+    try:
+        version = subprocess.run(
+            ["zstd", "--version"],
+            check=True,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            shell=False,
+        ).stdout.strip()
+        compressed = subprocess.run(
+            [
+                "zstd",
+                "-q",
+                f"-{ZSTD_LEVEL}",
+                f"--long={ZSTD_LONG}",
+                f"--threads={ZSTD_THREADS}",
+                "--check",
+                str(source),
+                "-o",
+                str(destination),
+            ],
+            check=False,
+            capture_output=True,
+            shell=False,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        destination.unlink(missing_ok=True)
+        raise ImageError(f"cannot run source archive zstd transport: {exc}") from exc
+    if compressed.returncode != 0:
+        destination.unlink(missing_ok=True)
+        details = compressed.stderr.decode("utf-8", "replace")[-2000:]
+        raise ImageError(
+            f"source archive zstd transport failed: {details.strip()}"
+        )
+    with destination.open("r+b") as stream:
+        os.fsync(stream.fileno())
+    return {
+        "bytes": destination.stat().st_size,
+        "file": destination.name,
+        "sha256": _sha256(destination),
+        "source_bytes": source.stat().st_size,
+        "source_sha256": _sha256(source),
+        "zstd": {
+            "check": True,
+            "level": ZSTD_LEVEL,
+            "long": ZSTD_LONG,
+            "threads": ZSTD_THREADS,
+            "version": version,
+        },
+    }
+
+
+def export_source_archive_inventory(
+    farm: FarmSpec,
+    labels: Iterable[str],
+    *,
+    repo: Path,
+    output_dir: Path,
+) -> dict[str, Any]:
+    """Export a write-once inventory for image builds without Git history."""
+
+    bindings = image_bindings(farm, labels)
+    if not output_dir.is_absolute():
+        raise ImageError("source archive inventory output must be absolute")
+    if output_dir.exists() or output_dir.is_symlink():
+        raise ImageError(f"source archive inventory output already exists: {output_dir}")
+    try:
+        output_dir.parent.mkdir(parents=True, exist_ok=True)
+        if output_dir.parent.is_symlink() or not output_dir.parent.is_dir():
+            raise ImageError(
+                "source archive inventory parent must be a regular directory"
+            )
+        output_dir.mkdir()
+    except FileExistsError as exc:
+        raise ImageError(
+            f"source archive inventory output already exists: {output_dir}"
+        ) from exc
+    except OSError as exc:
+        raise ImageError(
+            f"cannot create source archive inventory output {output_dir}: {exc}"
+        ) from exc
+    try:
+        archives: dict[str, dict[str, Any]] = {}
+        label_entries: dict[str, dict[str, str]] = {}
+        for binding in bindings:
+            source_commit, source_archive_sha256 = _source_archive_identity(binding)
+            if source_archive_sha256 not in archives:
+                raw_archive = output_dir / f".{source_archive_sha256}.tar.raw"
+                compressed_archive = (
+                    output_dir / f"{source_archive_sha256}.tar.zst"
+                )
+                try:
+                    create_source_archive(repo, binding, raw_archive)
+                    archives[source_archive_sha256] = _compress_source_archive(
+                        raw_archive, compressed_archive
+                    )
+                    if archives[source_archive_sha256]["source_sha256"] != (
+                        source_archive_sha256
+                    ):
+                        raise ImageError(
+                            f"source archive changed before compression for {binding.label}"
+                        )
+                    compressed_archive.chmod(0o444)
+                finally:
+                    raw_archive.unlink(missing_ok=True)
+            label_entries[binding.label] = {
+                "source_archive_sha256": source_archive_sha256,
+                "source_commit": source_commit,
+            }
+        inventory = {
+            "archives": archives,
+            "labels": label_entries,
+            "schema": SOURCE_ARCHIVE_INVENTORY_SCHEMA,
+        }
+        inventory_path = output_dir / "inventory.json"
+        with inventory_path.open("xb") as stream:
+            stream.write(canonical_bytes(inventory))
+            stream.flush()
+            os.fsync(stream.fileno())
+        directory = os.open(output_dir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except ImageError:
+        shutil.rmtree(output_dir, ignore_errors=True)
+        raise
+    except OSError as exc:
+        shutil.rmtree(output_dir, ignore_errors=True)
+        raise ImageError(
+            f"cannot write source archive inventory {output_dir}: {exc}"
+        ) from exc
+    return inventory
+
+
+def prepare_build_context(
+    repo: Path,
+    binding: ImageBinding,
+    context: Path,
+    *,
+    source_archive_dir: Path | None = None,
+) -> None:
     context.mkdir(parents=True, exist_ok=False)
-    create_source_archive(repo, binding, context / "source.tar")
+    create_source_archive(
+        repo,
+        binding,
+        context / "source.tar",
+        source_archive_dir=source_archive_dir,
+    )
     for name in DOCKER_FILES:
         source = DOCKER_DIR / name
         if not source.is_file():
@@ -511,6 +829,7 @@ def ensure_product_image(
     commands: CommandFactory,
     *,
     timeout_s: int,
+    source_archive_dir: Path | None = None,
 ) -> tuple[ImageIdentity, bool]:
     """Reuse an authority-bound hub image or build it from immutable source."""
 
@@ -536,7 +855,12 @@ def ensure_product_image(
         ):
             return current, False
 
-    prepare_build_context(repo, binding, context)
+    prepare_build_context(
+        repo,
+        binding,
+        context,
+        source_archive_dir=source_archive_dir,
+    )
     return (
         build_image(
             farm,
@@ -1454,6 +1778,7 @@ def build_and_distribute(
     repo: Path,
     output: Path,
     recorder: RecordingTransport | None = None,
+    source_archive_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Build each authority label and atomically write a distribution receipt."""
 
@@ -1478,6 +1803,7 @@ def build_and_distribute(
                 transport,
                 commands,
                 timeout_s=timeout_s,
+                source_archive_dir=source_archive_dir,
             )
             daemon_role_sha256 = None
             if binding.kind == "daemon-mutant":

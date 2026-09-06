@@ -276,7 +276,7 @@ def test_daemon_image_receipt_retains_observed_role_hash(tmp_path: Path, monkeyp
     closure = "a" * 64
     monkeypatch.setattr(
         "farmharness.integration.images.prepare_build_context",
-        lambda *_args: None,
+        lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(
         "farmharness.integration.images.build_image",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,7 @@ from farmharness.integration.images import (
     create_source_archive,
     distribute_image,
     ensure_product_image,
+    export_source_archive_inventory,
     foundation_targets_for_farm,
     foundation_targets_for_scenario,
     image_bindings,
@@ -198,6 +200,253 @@ def test_archive_hash_mismatch_is_removed_and_refused(tmp_path: Path) -> None:
     assert not archive.exists()
 
 
+def _write_source_inventory(
+    root: Path, binding, payload: bytes, *, corrupt: bool = False
+) -> Path:
+    source_commit = binding.base_commit or binding.commit
+    source_archive_sha256 = binding.base_archive_sha256 or binding.archive_sha256
+    root.mkdir()
+    raw = root / "source.raw"
+    raw.write_bytes(payload)
+    artifact = root / f"{source_archive_sha256}.tar.zst"
+    subprocess.run(
+        [
+            "zstd",
+            "-q",
+            "-19",
+            "--long=31",
+            "--threads=8",
+            "--check",
+            str(raw),
+            "-o",
+            str(artifact),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    raw.unlink()
+    compressed_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    if corrupt:
+        damaged = bytearray(artifact.read_bytes())
+        damaged[-1] ^= 1
+        artifact.write_bytes(damaged)
+    inventory = {
+        "archives": {
+            source_archive_sha256: {
+                "bytes": artifact.stat().st_size,
+                "file": artifact.name,
+                "sha256": compressed_sha256,
+                "source_bytes": len(payload),
+                "source_sha256": source_archive_sha256,
+                "zstd": {
+                    "check": True,
+                    "level": 19,
+                    "long": 31,
+                    "threads": 8,
+                    "version": "test-zstd-v1",
+                },
+            }
+        },
+        "labels": {
+            binding.label: {
+                "source_archive_sha256": source_archive_sha256,
+                "source_commit": source_commit,
+            }
+        },
+        "schema": "icefarm-source-archive-inventory-v1",
+    }
+    (root / "inventory.json").write_text(
+        json.dumps(inventory, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    return root
+
+
+@pytest.mark.parametrize("mutant", (False, True))
+def test_source_release_inventory_supplies_exact_archive_without_git(
+    tmp_path: Path, mutant: bool
+) -> None:
+    payload = b"exact-authority-bound-source-archive"
+    digest = hashlib.sha256(payload).hexdigest()
+    if mutant:
+        original = image_bindings(
+            _farm(), ["p50s30-f-refusal-mutant-candidate"]
+        )[0]
+        binding = dataclasses.replace(
+            original,
+            base_commit="b" * 40,
+            base_archive_sha256=digest,
+        )
+    else:
+        original = image_bindings(_farm(), ["p50s2-624702e9"])[0]
+        binding = dataclasses.replace(
+            original,
+            commit="a" * 40,
+            archive_sha256=digest,
+        )
+    inventory = _write_source_inventory(tmp_path / "inventory", binding, payload)
+    destination = tmp_path / "source.tar"
+
+    create_source_archive(
+        tmp_path / "no-git-repository",
+        binding,
+        destination,
+        source_archive_dir=inventory,
+    )
+
+    assert destination.read_bytes() == payload
+
+
+def test_source_release_inventory_corruption_is_removed_and_refused(
+    tmp_path: Path,
+) -> None:
+    expected = b"expected-archive"
+    digest = hashlib.sha256(expected).hexdigest()
+    binding = dataclasses.replace(
+        image_bindings(_farm(), ["p50s2-624702e9"])[0],
+        commit="a" * 40,
+        archive_sha256=digest,
+    )
+    inventory = _write_source_inventory(
+        tmp_path / "inventory", binding, expected, corrupt=True
+    )
+    destination = tmp_path / "source.tar"
+
+    with pytest.raises(ImageError, match="compressed source archive mismatch"):
+        create_source_archive(
+            tmp_path / "no-git-repository",
+            binding,
+            destination,
+            source_archive_dir=inventory,
+        )
+
+    assert not destination.exists()
+
+
+def test_source_release_inventory_refuses_symlink_artifact(tmp_path: Path) -> None:
+    payload = b"exact-authority-bound-source-archive"
+    digest = hashlib.sha256(payload).hexdigest()
+    binding = dataclasses.replace(
+        image_bindings(_farm(), ["p50s2-624702e9"])[0],
+        commit="a" * 40,
+        archive_sha256=digest,
+    )
+    inventory = _write_source_inventory(tmp_path / "inventory", binding, payload)
+    artifact = inventory / f"{digest}.tar.zst"
+    target = tmp_path / "artifact-target.tar.zst"
+    artifact.replace(target)
+    artifact.symlink_to(target)
+
+    with pytest.raises(ImageError, match="artifact is missing"):
+        create_source_archive(
+            tmp_path / "no-git-repository",
+            binding,
+            tmp_path / "source.tar",
+            source_archive_dir=inventory,
+        )
+
+
+def test_source_release_inventory_directory_must_be_absolute(tmp_path: Path) -> None:
+    binding = image_bindings(_farm(), ["p50s2-624702e9"])[0]
+    with pytest.raises(ImageError, match="directory must be absolute"):
+        create_source_archive(
+            tmp_path / "no-git-repository",
+            binding,
+            tmp_path / "source.tar",
+            source_archive_dir=Path("relative-source-inventory"),
+        )
+
+
+def test_source_archive_export_directory_must_be_absolute(tmp_path: Path) -> None:
+    with pytest.raises(ImageError, match="output must be absolute"):
+        export_source_archive_inventory(
+            _farm(),
+            ["p50s2-624702e9"],
+            repo=tmp_path,
+            output_dir=Path("relative-source-inventory"),
+        )
+
+
+def test_exported_source_inventory_replays_without_git(tmp_path: Path) -> None:
+    farm = _farm()
+    label = "p50s4-b42d65e8"
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "config", "user.name", "Icefarm Test"],
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "icefarm-test@example.invalid"],
+        cwd=repository,
+        check=True,
+    )
+    (repository / "source.cpp").write_text(
+        "int source_inventory_fixture = 1;\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "add", "source.cpp"], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "source fixture"],
+        cwd=repository,
+        check=True,
+    )
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    expected_archive = tmp_path / "expected.tar"
+    with expected_archive.open("wb") as stream:
+        subprocess.run(
+            ["git", "archive", "--format=tar", commit],
+            cwd=repository,
+            check=True,
+            stdout=stream,
+        )
+    archive_sha256 = hashlib.sha256(expected_archive.read_bytes()).hexdigest()
+    farm.data["authority"]["images"][label]["commit"] = commit
+    farm.data["authority"]["images"][label]["archive_sha256"] = archive_sha256
+    binding = image_bindings(farm, [label])[0]
+    inventory_dir = tmp_path / "source-inventory"
+
+    inventory = export_source_archive_inventory(
+        farm,
+        [label],
+        repo=repository,
+        output_dir=inventory_dir,
+    )
+
+    assert inventory["schema"] == "icefarm-source-archive-inventory-v1"
+    assert set(inventory["archives"]) == {archive_sha256}
+    archive = inventory_dir / f"{archive_sha256}.tar.zst"
+    assert archive.stat().st_mode & 0o222 == 0
+    artifact = inventory["archives"][archive_sha256]
+    assert artifact["source_sha256"] == archive_sha256
+    assert artifact["zstd"]["level"] == 19
+    assert artifact["zstd"]["long"] == 31
+    assert artifact["zstd"]["threads"] == 8
+    assert artifact["zstd"]["check"] is True
+    destination = tmp_path / "replayed-source.tar"
+    create_source_archive(
+        tmp_path / "no-git-repository",
+        binding,
+        destination,
+        source_archive_dir=inventory_dir,
+    )
+    assert hashlib.sha256(destination.read_bytes()).hexdigest() == archive_sha256
+    with pytest.raises(ImageError, match="output already exists"):
+        export_source_archive_inventory(
+            farm,
+            [label],
+            repo=repository,
+            output_dir=inventory_dir,
+        )
+
+
 def test_unknown_or_duplicate_labels_are_refused() -> None:
     farm = _farm()
     with pytest.raises(ImageError, match="immutable authority map"):
@@ -338,7 +587,14 @@ def test_uncaptured_candidate_product_image_is_always_rebuilt(
     recorder = RecordingTransport(ScriptedRecorder())
     prepared: list[tuple[Path, object, Path]] = []
 
-    def prepare(repo: Path, selected: object, context: Path) -> None:
+    def prepare(
+        repo: Path,
+        selected: object,
+        context: Path,
+        *,
+        source_archive_dir: Path | None = None,
+    ) -> None:
+        assert source_archive_dir is None
         prepared.append((repo, selected, context))
         context.mkdir(parents=True)
         (context / "source.tar").write_bytes(b"source-archive-fixture")
@@ -487,8 +743,13 @@ def test_farmtest_images_cli_selects_only_requested_authority_labels(
 ) -> None:
     observed: dict[str, object] = {}
 
-    def fake_build(farm, labels, *, repo, output):
-        observed.update(labels=list(labels), repo=repo, output=output)
+    def fake_build(farm, labels, *, repo, output, source_archive_dir):
+        observed.update(
+            labels=list(labels),
+            repo=repo,
+            output=output,
+            source_archive_dir=source_archive_dir,
+        )
         return {"schema": "icefarm-images-v1", "images": {}}
 
     monkeypatch.setattr(farmtest, "build_and_distribute", fake_build)
@@ -501,6 +762,8 @@ def test_farmtest_images_cli_selects_only_requested_authority_labels(
             "p43-1.4.0,p50s2-624702e9",
             "--repo",
             str(REPO),
+            "--source-archive-dir",
+            str(tmp_path / "source-inventory"),
             "--output",
             str(tmp_path / "images.json"),
         ]
@@ -509,7 +772,68 @@ def test_farmtest_images_cli_selects_only_requested_authority_labels(
     assert observed["labels"] == ["p43-1.4.0", "p50s2-624702e9"]
     assert observed["repo"] == REPO
     assert observed["output"] == tmp_path / "images.json"
+    assert observed["source_archive_dir"] == tmp_path / "source-inventory"
     assert '"schema": "icefarm-images-v1"' in capsys.readouterr().out
+
+
+def test_farmtest_source_archives_cli_exports_only_requested_labels(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_export(farm, labels, *, repo, output_dir):
+        observed.update(labels=list(labels), repo=repo, output_dir=output_dir)
+        return {
+            "archives": {},
+            "labels": {},
+            "schema": "icefarm-source-archive-inventory-v1",
+        }
+
+    monkeypatch.setattr(farmtest, "export_source_archive_inventory", fake_export)
+    output_dir = tmp_path / "source-inventory"
+    rc = farmtest.main(
+        [
+            "source-archives",
+            "--farm",
+            str(farm_fixture.example_farm_path()),
+            "--labels",
+            "p50s4-89917385,p50s4-b42d65e8",
+            "--repo",
+            str(REPO),
+            "--output-dir",
+            str(output_dir),
+        ]
+    )
+
+    assert rc == 0
+    assert observed == {
+        "labels": ["p50s4-89917385", "p50s4-b42d65e8"],
+        "output_dir": output_dir,
+        "repo": REPO,
+    }
+    assert '"schema": "icefarm-source-archive-inventory-v1"' in (
+        capsys.readouterr().out
+    )
+
+
+def test_farmtest_foundations_refuse_product_source_inventory(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = farmtest.main(
+        [
+            "images",
+            "--farm",
+            str(farm_fixture.example_farm_path()),
+            "--foundations",
+            "--source-archive-dir",
+            str(tmp_path / "source-inventory"),
+        ]
+    )
+
+    assert rc == 3
+    assert "applies only to product images" in capsys.readouterr().err
 
 
 def test_foundation_packager_keeps_four_clients_distinct_and_targets_only_selected_host(
