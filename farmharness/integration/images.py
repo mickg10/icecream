@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import resource
 import shutil
 import stat
 import subprocess
@@ -43,6 +44,8 @@ IMAGE_RECEIPT_SCHEMA = "icefarm-images-v1"
 FOUNDATION_IMAGE_RECEIPT_SCHEMA = "icefarm-foundation-images-v1"
 IMAGE_TRANSPORT_SCHEMA = "icefarm-docker-save-zstd-v1"
 SOURCE_ARCHIVE_INVENTORY_SCHEMA = "icefarm-source-archive-inventory-v1"
+MAX_SOURCE_ARCHIVE_BYTES = 1024 * 1024 * 1024
+SOURCE_ARCHIVE_DECODE_TIMEOUT_S = 300
 DOCKER_DIR = Path(__file__).with_name("docker")
 IMAGE_TRANSPORT_HELPER = Path(__file__).with_name("image_transport.py")
 DOCKER_FILES = (
@@ -378,6 +381,7 @@ def _inventory_source_archive(
         or not isinstance(artifact.get("source_bytes"), int)
         or isinstance(artifact.get("source_bytes"), bool)
         or artifact["source_bytes"] <= 0
+        or artifact["source_bytes"] > MAX_SOURCE_ARCHIVE_BYTES
         or not isinstance(zstd, dict)
         or zstd.get("check") is not True
         or zstd.get("level") != ZSTD_LEVEL
@@ -433,29 +437,45 @@ def _materialize_inventory_source_archive(
                             f"compressed source archive mismatch for {binding.label}"
                         )
                     os.lseek(descriptor, 0, os.SEEK_SET)
-                    decoded = subprocess.run(
-                        [
-                            "zstd",
-                            "-q",
-                            "-d",
-                            f"--long={ZSTD_LONG}",
-                            "-c",
-                        ],
-                        stdin=descriptor,
-                        stdout=destination_stream,
-                        stderr=subprocess.PIPE,
-                        check=False,
-                        shell=False,
-                    )
+                    try:
+                        decoded = subprocess.run(
+                            [
+                                "zstd",
+                                "-q",
+                                "-d",
+                                f"--long={ZSTD_LONG}",
+                                "-c",
+                            ],
+                            stdin=descriptor,
+                            stdout=destination_stream,
+                            stderr=subprocess.DEVNULL,
+                            check=False,
+                            shell=False,
+                            timeout=SOURCE_ARCHIVE_DECODE_TIMEOUT_S,
+                            preexec_fn=lambda: resource.setrlimit(
+                                resource.RLIMIT_FSIZE,
+                                (
+                                    artifact["source_bytes"],
+                                    artifact["source_bytes"],
+                                ),
+                            ),
+                        )
+                    except subprocess.TimeoutExpired as exc:
+                        raise ImageError(
+                            f"source archive decoder timed out for {binding.label} "
+                            f"after {SOURCE_ARCHIVE_DECODE_TIMEOUT_S}s"
+                        ) from exc
                     if decoded.returncode != 0:
-                        details = decoded.stderr.decode("utf-8", "replace")[-2000:]
+                        decoded_bytes = os.fstat(destination_stream.fileno()).st_size
                         raise ImageError(
                             f"cannot decode source archive for {binding.label}: "
-                            f"{details.strip()}"
+                            f"decoded_bytes={decoded_bytes} "
+                            f"limit={artifact['source_bytes']} "
+                            f"returncode={decoded.returncode}"
                         )
         finally:
             os.close(descriptor)
-    except (OSError, ImageError) as exc:
+    except (OSError, subprocess.SubprocessError, ImageError) as exc:
         destination.unlink(missing_ok=True)
         if isinstance(exc, ImageError):
             raise

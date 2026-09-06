@@ -3,14 +3,17 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import os
+import re
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
 
 from farmharness.integration.tests import farm_fixture
 
-from farmharness.integration import farmtest
+from farmharness.integration import farmtest, images as images_module
 from farmharness.integration.farm_spec import load_farm_spec
 from farmharness.integration.images import (
     CommandFactory,
@@ -201,7 +204,12 @@ def test_archive_hash_mismatch_is_removed_and_refused(tmp_path: Path) -> None:
 
 
 def _write_source_inventory(
-    root: Path, binding, payload: bytes, *, corrupt: bool = False
+    root: Path,
+    binding,
+    payload: bytes,
+    *,
+    corrupt: bool = False,
+    declared_source_bytes: int | None = None,
 ) -> Path:
     source_commit = binding.base_commit or binding.commit
     source_archive_sha256 = binding.base_archive_sha256 or binding.archive_sha256
@@ -236,7 +244,11 @@ def _write_source_inventory(
                 "bytes": artifact.stat().st_size,
                 "file": artifact.name,
                 "sha256": compressed_sha256,
-                "source_bytes": len(payload),
+                "source_bytes": (
+                    len(payload)
+                    if declared_source_bytes is None
+                    else declared_source_bytes
+                ),
                 "source_sha256": source_archive_sha256,
                 "zstd": {
                     "check": True,
@@ -321,6 +333,132 @@ def test_source_release_inventory_corruption_is_removed_and_refused(
         )
 
     assert not destination.exists()
+
+
+def test_source_release_decoder_cannot_exceed_declared_size(tmp_path: Path) -> None:
+    expected = b"e" * 128
+    oversized = b"o" * 4096
+    digest = hashlib.sha256(expected).hexdigest()
+    binding = dataclasses.replace(
+        image_bindings(_farm(), ["p50s2-624702e9"])[0],
+        commit="a" * 40,
+        archive_sha256=digest,
+    )
+    inventory = _write_source_inventory(
+        tmp_path / "inventory",
+        binding,
+        oversized,
+        declared_source_bytes=len(expected),
+    )
+    destination = tmp_path / "source.tar"
+
+    with pytest.raises(ImageError, match="cannot decode source archive") as error:
+        create_source_archive(
+            tmp_path / "no-git-repository",
+            binding,
+            destination,
+            source_archive_dir=inventory,
+        )
+
+    decoded = re.search(r"decoded_bytes=(\d+)", str(error.value))
+    assert decoded is not None
+    assert int(decoded.group(1)) <= len(expected)
+    assert not destination.exists()
+
+
+def test_source_release_wrong_decoded_hash_is_removed_and_refused(
+    tmp_path: Path,
+) -> None:
+    expected = b"e" * 128
+    wrong = b"w" * len(expected)
+    digest = hashlib.sha256(expected).hexdigest()
+    binding = dataclasses.replace(
+        image_bindings(_farm(), ["p50s2-624702e9"])[0],
+        commit="a" * 40,
+        archive_sha256=digest,
+    )
+    inventory = _write_source_inventory(tmp_path / "inventory", binding, wrong)
+    destination = tmp_path / "source.tar"
+
+    with pytest.raises(ImageError, match="source archive mismatch"):
+        create_source_archive(
+            tmp_path / "no-git-repository",
+            binding,
+            destination,
+            source_archive_dir=inventory,
+        )
+
+    assert not destination.exists()
+
+
+def test_source_release_hung_decoder_is_killed_and_reaped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = b"exact-authority-bound-source-archive"
+    digest = hashlib.sha256(payload).hexdigest()
+    binding = dataclasses.replace(
+        image_bindings(_farm(), ["p50s2-624702e9"])[0],
+        commit="a" * 40,
+        archive_sha256=digest,
+    )
+    inventory = _write_source_inventory(tmp_path / "inventory", binding, payload)
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    decoder = fake_bin / "zstd"
+    decoder.write_text(
+        "#!/usr/bin/python3\n"
+        "import os, pathlib, time\n"
+        "pathlib.Path(os.environ['ICEFARM_TEST_DECODER_PID']).write_text(str(os.getpid()))\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    decoder.chmod(0o755)
+    pid_file = tmp_path / "decoder.pid"
+    monkeypatch.setenv("PATH", str(fake_bin))
+    monkeypatch.setenv("ICEFARM_TEST_DECODER_PID", str(pid_file))
+    monkeypatch.setattr(images_module, "SOURCE_ARCHIVE_DECODE_TIMEOUT_S", 0.2)
+    destination = tmp_path / "source.tar"
+
+    started = time.monotonic()
+    with pytest.raises(ImageError, match="decoder timed out"):
+        create_source_archive(
+            tmp_path / "no-git-repository",
+            binding,
+            destination,
+            source_archive_dir=inventory,
+        )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 3
+    assert pid_file.is_file()
+    decoder_pid = int(pid_file.read_text(encoding="utf-8"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(decoder_pid, 0)
+    assert not destination.exists()
+
+
+def test_source_release_declared_size_has_a_fixed_ceiling(tmp_path: Path) -> None:
+    payload = b"exact-authority-bound-source-archive"
+    digest = hashlib.sha256(payload).hexdigest()
+    binding = dataclasses.replace(
+        image_bindings(_farm(), ["p50s2-624702e9"])[0],
+        commit="a" * 40,
+        archive_sha256=digest,
+    )
+    inventory = _write_source_inventory(
+        tmp_path / "inventory",
+        binding,
+        payload,
+        declared_source_bytes=images_module.MAX_SOURCE_ARCHIVE_BYTES + 1,
+    )
+
+    with pytest.raises(ImageError, match="invalid artifact"):
+        create_source_archive(
+            tmp_path / "no-git-repository",
+            binding,
+            tmp_path / "source.tar",
+            source_archive_dir=inventory,
+        )
 
 
 def test_source_release_inventory_refuses_symlink_artifact(tmp_path: Path) -> None:
