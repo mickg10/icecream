@@ -3892,6 +3892,12 @@ def _process_count(evidence: Path, instance: Mapping[str, Any], sessions: int) -
     return 1 if sessions > 0 else 0
 
 
+def _nearest_rank(values: list[int], percentile: int) -> int:
+    ordered = sorted(values)
+    index = max(0, (len(ordered) * percentile + 99) // 100 - 1)
+    return ordered[index]
+
+
 def _validate_orphan_recovery_markers(
     raw_jobs: list[dict[str, Any]], events: list[dict[str, Any]]
 ) -> None:
@@ -4104,12 +4110,15 @@ def _observations(
         turn_mutex = [item for item in source_mutex["records"] if item["turn"] == turn]
         first_dispatch_ms = min(item["dispatch_ms"] for item in turn_lifecycle)
         last_terminal_ms = max(terminal_times)
+        job_walls = [row["wall_ms"] for row in turn_rows]
         turn_observations[turn] = {
             "c_to_f_bytes": sum(row["c_to_f_bytes"] for row in turn_rows),
             "exact_objects": sum(row["exact"] is True for row in turn_rows),
             "f_to_c_bytes": sum(row["f_to_c_bytes"] for row in turn_rows),
             "first_dispatch_ms": first_dispatch_ms,
             "jobs": len(turn_rows),
+            "job_wall_p95_ms": _nearest_rank(job_walls, 95),
+            "job_wall_p99_ms": _nearest_rank(job_walls, 99),
             "last_terminal_ms": last_terminal_ms,
             "source_mutex_records": len(turn_mutex),
             "source_mutex_service_ns": sum(item["service_ns"] for item in turn_mutex),

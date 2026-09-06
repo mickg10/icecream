@@ -35,6 +35,8 @@ def _cells() -> list[dict[str, object]]:
                 "exact_objects": jobs,
                 "f_to_c_bytes": 1000,
                 "jobs": jobs,
+                "job_wall_p95_ms": 90 + repetition,
+                "job_wall_p99_ms": 99 + repetition,
                 "source_mutex_records": jobs if p50 else 0,
                 "source_mutex_service_ns": 500_000_000 if p50 else 0,
                 "source_mutex_wait_ns": 2_000_000 if p50 else 0,
@@ -65,6 +67,8 @@ def test_s80_requires_p29_to_win_every_headline_turn() -> None:
         report["arms"]["P29V1"]["turns"]["A"]["median_source_mutex_service_ns"]
         == 500_000_000
     )
+    assert report["arms"]["P29V1"]["turns"]["A"]["median_job_wall_p95_ms"] == 92
+    assert report["arms"]["P29V1"]["turns"]["A"]["median_job_wall_p99_ms"] == 101
     assert set(report["arms"]["P29V1"]["turns"]["A"]["scores"]) == {
         "10000000000",
         "1000000000",
@@ -211,6 +215,12 @@ def test_s80_legacy_cell_requires_conserved_wire_records() -> None:
                 cells[3]["turns"]["A"].__setitem__("f_to_c_bytes", 0),
             ),
             "has no wire-byte evidence",
+        ),
+        (
+            lambda cells: cells[0]["turns"]["A"].__setitem__(
+                "job_wall_p99_ms", 1
+            ),
+            "invalid tail-latency evidence",
         ),
     ),
 )

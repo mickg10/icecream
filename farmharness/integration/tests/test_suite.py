@@ -1048,6 +1048,8 @@ def test_s80_runs_twelve_fresh_cells_and_retains_score(
                 "exact_objects": 1,
                 "f_to_c_bytes": 10,
                 "jobs": 1,
+                "job_wall_p95_ms": arm_wall,
+                "job_wall_p99_ms": arm_wall,
                 "source_mutex_records": 0 if arm == "legacy" else 1,
                 "source_mutex_service_ns": 0 if arm == "legacy" else 1,
                 "source_mutex_wait_ns": 0,

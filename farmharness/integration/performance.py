@@ -41,6 +41,8 @@ TURN_FIELDS = frozenset(
         "wall_ms",
         "c_to_f_bytes",
         "f_to_c_bytes",
+        "job_wall_p95_ms",
+        "job_wall_p99_ms",
         "source_mutex_records",
         "source_mutex_wait_ns",
         "source_mutex_service_ns",
@@ -147,8 +149,8 @@ def render_s80_report(report: Mapping[str, Any]) -> str:
         "",
         f"Verdict: **{report['status']}**",
         "",
-        "| Arm | Turn | Median wall (ms) | Median wire (bytes) | Mutex wait (ns) | Mutex service (ns) | 1 Gbit/s | 100 Mbit/s | 10 Gbit/s | 25 Mbit/s |",
-        "|---|:---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Arm | Turn | Median wall (ms) | Job p95/p99 (ms) | Median wire (bytes) | Mutex wait (ns) | Mutex service (ns) | 1 Gbit/s | 100 Mbit/s | 10 Gbit/s | 25 Mbit/s |",
+        "|---|:---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     rates = (1_000_000_000, 100_000_000, 10_000_000_000, 25_000_000)
     for arm in ARMS:
@@ -160,6 +162,8 @@ def render_s80_report(report: Mapping[str, Any]) -> str:
             ]
             lines.append(
                 f"| {arm} | {turn} | {values['median_wall_ms']} | "
+                f"{values['median_job_wall_p95_ms']}/"
+                f"{values['median_job_wall_p99_ms']} | "
                 f"{values['median_wire_bytes']} | "
                 f"{values['median_source_mutex_wait_ns']} | "
                 f"{values['median_source_mutex_service_ns']} | "
@@ -272,6 +276,11 @@ def _validated_turn(
         raise S80EvidenceError(f"{label} contains nonexact or missing objects")
     if result["c_to_f_bytes"] + result["f_to_c_bytes"] == 0:
         raise S80EvidenceError(f"{label} has no wire-byte evidence")
+    if (
+        result["job_wall_p95_ms"] == 0
+        or result["job_wall_p99_ms"] < result["job_wall_p95_ms"]
+    ):
+        raise S80EvidenceError(f"{label} has invalid tail-latency evidence")
     if arm == "legacy":
         if any(
             result[field] != 0
@@ -370,6 +379,12 @@ def score_s80_cells(cells: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             for link_bps, values in effective.items():
                 scores[(arm, turn, link_bps)] = median(values)
             turns_report[turn] = {
+                "median_job_wall_p95_ms": median(
+                    row["job_wall_p95_ms"] for row in turn_rows
+                ),
+                "median_job_wall_p99_ms": median(
+                    row["job_wall_p99_ms"] for row in turn_rows
+                ),
                 "median_source_mutex_service_ns": median(
                     row["source_mutex_service_ns"] for row in turn_rows
                 ),
@@ -385,6 +400,8 @@ def score_s80_cells(cells: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
                         "c_to_f_bytes": row["c_to_f_bytes"],
                         "f_to_c_bytes": row["f_to_c_bytes"],
                         "jobs": row["jobs"],
+                        "job_wall_p95_ms": row["job_wall_p95_ms"],
+                        "job_wall_p99_ms": row["job_wall_p99_ms"],
                         "repetition": cell["repetition"],
                         "run_id": cell["run_id"],
                         "source_mutex_records": row["source_mutex_records"],
