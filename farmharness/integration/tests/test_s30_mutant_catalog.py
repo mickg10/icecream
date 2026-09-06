@@ -24,8 +24,8 @@ def test_s30_mutant_f_refusal_is_a_checked_in_single_cell() -> None:
         )
     )
     assert scenario["shape"] == "S'C'F'"
-    assert scenario["images"]["new"] == "p50s4-0c820e79"
-    assert scenario["images"]["mutant"] == "p50s30-f-refusal-0c820e79"
+    assert scenario["images"]["new"] == "p50s4-2deb91d6"
+    assert scenario["images"]["mutant"] == "p50s30-f-refusal-2deb91d6"
     assert scenario["expect"]["exact"] == "all"
     assert scenario["expect"]["error106_max"] == 100
     assert scenario["expect"]["reuse"] == "none-when-legacy"
@@ -41,6 +41,6 @@ def test_s30_mutant_f_resolves_the_hash_bound_unpromoted_candidate() -> None:
         item for item in plan["topology"]["instances"] if item["role"] == "F"
     )
 
-    assert worker["image"]["label"] == "p50s30-f-refusal-0c820e79"
+    assert worker["image"]["label"] == "p50s30-f-refusal-2deb91d6"
     assert worker["image"]["kind"] == "daemon-mutant"
     assert "closure_sha256" not in worker["image"]

@@ -75,10 +75,12 @@ def test_image_make_target_is_scratch_routed() -> None:
     assert result.stdout.count("--foundations") == 1
     assert (
         '--labels "p43-1.4.0,p50s2-5b2e5801,p50s4-89917385,'
-        'p50s4-b42d65e8,p50s4-0c820e79,p50s4-h3-tail-mutant"'
+        'p50s4-b42d65e8,p50s4-0c820e79,p50s4-2deb91d6,'
+        'p50s4-h3-tail-mutant"'
     ) in result.stdout
     assert "p50s30-f-refusal-mutant-candidate" not in result.stdout
     assert "p50s30-f-refusal-0c820e79" not in result.stdout
+    assert "p50s30-f-refusal-2deb91d6" not in result.stdout
     assert "p50s90-f-revision-2-candidate" not in result.stdout
     assert '--repo "' in result.stdout
 
@@ -139,9 +141,11 @@ def test_source_archive_make_target_is_explicit_and_scratch_routed() -> None:
     assert '--output-dir "/tanksmall/scratch/ictmp/source-inventory"' in result.stdout
     assert (
         '--labels "p43-1.4.0,p50s2-5b2e5801,p50s4-89917385,'
-        'p50s4-b42d65e8,p50s4-0c820e79,p50s4-h3-tail-mutant,'
+        'p50s4-b42d65e8,p50s4-0c820e79,p50s4-2deb91d6,'
+        'p50s4-h3-tail-mutant,'
         'p50s30-f-refusal-mutant-candidate,'
         'p50s30-f-refusal-0c820e79,'
+        'p50s30-f-refusal-2deb91d6,'
         'p50s90-f-revision-2-candidate"'
     ) in result.stdout
 

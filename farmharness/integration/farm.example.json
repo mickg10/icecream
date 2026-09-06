@@ -218,7 +218,7 @@
       "50": {
         "scheduler": {"sha256": "ab1e6034b51401210fcf6bce637930e3dd9fdc0043e7f6da6aae5cb60d28e882"},
         "client": {"sha256": "533b80375e8c233e5efcda959a0f83c29ffdaafa799a67770960c57e59b191b1"},
-        "daemon": {"sha256": "4cc93666e5418e33a6a4c18353b8988af4d99f7913165fa72e405a01aada6493"}
+        "daemon": {"sha256": "0e9c1f0176f76ac7512bbabcca88a12837d2ec6d84c83ac22173e3d007e339ed"}
       }
     },
     "images": {
@@ -270,6 +270,12 @@
         "closure_sha256": "6b9d7ee5e0718795e304fa5d96def5ab33ca832d2e875e7798d05b3638c312fb",
         "id": "sha256:118239914901f20003d0824d46754bb6c24c9fc8c5a74e365a27522f6eddb402"
       },
+      "p50s4-2deb91d6": {
+        "commit": "2deb91d66eb7808fbe5ebf945eab9f52844a1201",
+        "archive_sha256": "f6e7ca49a4458d1c69955a2224287837707a90dfd8a47d6438bab8818dd8de6e",
+        "closure_sha256": "eb7a7b841e780486b9fe725c02efb52797330946197e2b34932d8652e4153ce4",
+        "id": "sha256:d1078f2f65a09b209971e44df32941eaa454ed5681299f78bf5013287a37431a"
+      },
       "p50s4-b42d65e8": {
         "commit": "b42d65e8ac9e90e05ee6d3a19cd371a40dad3277",
         "archive_sha256": "cf40a12d679d3e8b06e8df8b2f336127f69a4e1b46995e4bb8546de0ec742b98",
@@ -313,6 +319,23 @@
         "patch_sha256": "4b1963c4081e2d0f20800db53363940c1ebea128ccdb3665691b270224a7306c",
         "recipe_schema": "icefarm-daemon-mutant-recipe-v1",
         "recipe_sha256": "cdc9cbbf8cca71a168c747bb925e626305b776076dbe7f0764320b743b7dd865"
+      },
+      "p50s30-f-refusal-2deb91d6": {
+        "kind": "daemon-mutant",
+        "base_image": "p50s4-2deb91d6",
+        "base_commit": "2deb91d66eb7808fbe5ebf945eab9f52844a1201",
+        "base_archive_sha256": "f6e7ca49a4458d1c69955a2224287837707a90dfd8a47d6438bab8818dd8de6e",
+        "commit": "2deb91d66eb7808fbe5ebf945eab9f52844a1201",
+        "archive_sha256": "f8afe761894724c11a25e86533661d19a9893badc13139dfe59f1600c45cf075",
+        "patch_path": "mutants/daemon-session-refuse.patch",
+        "patch_sha256": "4b1963c4081e2d0f20800db53363940c1ebea128ccdb3665691b270224a7306c",
+        "recipe_schema": "icefarm-daemon-mutant-recipe-v1",
+        "recipe_sha256": "f8afe761894724c11a25e86533661d19a9893badc13139dfe59f1600c45cf075",
+        "role_overrides": {
+          "daemon": {
+            "sha256": "0e9c1f0176f76ac7512bbabcca88a12837d2ec6d84c83ac22173e3d007e339ed"
+          }
+        }
       },
       "p50s4-h3-tail-mutant": {
         "kind": "scheduler-mutant",
