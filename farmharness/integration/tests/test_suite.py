@@ -426,11 +426,13 @@ def test_suite_replay_authenticates_manifest_plan_and_aggregate_status(
         suite_run_id="replay-suite",
         _prepared=prepared,
     )
-    monkeypatch.setattr(
-        farmtest,
-        "load_verified_bundle",
-        lambda root: retained_by_run[Path(root).name],
-    )
+    loaded_bundle_paths: list[Path] = []
+
+    def load_retained(root: Path) -> dict:
+        loaded_bundle_paths.append(Path(root))
+        return retained_by_run[Path(root).name]
+
+    monkeypatch.setattr(farmtest, "load_verified_bundle", load_retained)
     monkeypatch.setattr(
         farmtest,
         "replay_bundle",
@@ -444,6 +446,10 @@ def test_suite_replay_authenticates_manifest_plan_and_aggregate_status(
     receipt = farmtest.replay_suite(suite_root)
 
     assert result["execution_manifest"]["suite"] == suite.data
+    assert loaded_bundle_paths[:2] == [
+        tmp_path / "results" / "results" / "replay-cell-1",
+        tmp_path / "results" / "results" / "replay-cell-2",
+    ]
     assert receipt["cells"] == 2
     assert receipt["suite_status"] == "PASS"
     assert receipt["status"] == "REPRODUCED"

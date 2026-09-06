@@ -2058,7 +2058,7 @@ def _replay_suite_node(
             if not isinstance(cell, dict):
                 raise ReportError("suite cell result is not an object")
             run_id = identity["run_id"]
-            bundle_path = root.parent.parent / run_id
+            bundle_path = root.parent.parent / "results" / run_id
             if (
                 cell.get("index") != index + 1
                 or cell.get("run_id") != run_id
