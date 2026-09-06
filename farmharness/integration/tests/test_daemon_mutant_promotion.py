@@ -213,12 +213,29 @@ def test_promotion_cli_writes_valid_uncaptured_output_once(tmp_path: Path) -> No
     ]) == 3
 
 
-def test_promotion_cli_refuses_non_object_receipt_and_dangling_symlink(
-    tmp_path: Path,
+def test_promotion_cli_refuses_non_object_receipt(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    farm_path = INTEGRATION / "farm.local.json"
+    farm_path = INTEGRATION / "farm.example.json"
     receipt_path = tmp_path / "images.json"
     receipt_path.write_text("[]", encoding="utf-8")
+    output = tmp_path / "farm-promoted.json"
+    assert farmtest.main([
+        "authority", "promote-daemon-mutant",
+        "--farm", str(farm_path), "--receipt", str(receipt_path),
+        "--label", LABEL, "--output", str(output),
+    ]) == 3
+    assert "image receipt must be a JSON object" in capsys.readouterr().err
+    assert not output.exists()
+
+
+def test_promotion_cli_refuses_dangling_symlink_output(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    farm_path = INTEGRATION / "farm.example.json"
+    farm = load_farm_spec(farm_path)
+    receipt_path = tmp_path / "images.json"
+    receipt_path.write_text(json.dumps(_receipt(farm)), encoding="utf-8")
     output = tmp_path / "missing-target"
     output.symlink_to(tmp_path / "does-not-exist")
     assert farmtest.main([
@@ -226,6 +243,7 @@ def test_promotion_cli_refuses_non_object_receipt_and_dangling_symlink(
         "--farm", str(farm_path), "--receipt", str(receipt_path),
         "--label", LABEL, "--output", str(output),
     ]) == 3
+    assert "promotion output already exists" in capsys.readouterr().err
     assert output.is_symlink()
 
 
