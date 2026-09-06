@@ -220,6 +220,53 @@ def test_scenario_orchestration_verifies_before_down_and_reports_after(
     assert order == ["up", "run", "collect", "verify", "down", "report"]
 
 
+def test_s30_scenario_drains_source_arms_before_collection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    farm, scenario, _old_plan = _cell(tmp_path)
+    scenario.data["id"] = "S30-mutant-f-refusal"
+    plan = farmtest.build_plan(farm, scenario, run_id="s30-drain-unit")
+    order: list[str] = []
+    monkeypatch.setattr(
+        farmtest, "bring_up", lambda *args, **kwargs: order.append("up")
+    )
+    monkeypatch.setattr(
+        farmtest, "run_workload", lambda *args, **kwargs: order.append("run")
+    )
+    monkeypatch.setattr(
+        farmtest, "_drain_s30_source_arms", lambda: order.append("drain")
+    )
+    monkeypatch.setattr(
+        farmtest, "collect_bundle", lambda *args, **kwargs: order.append("collect")
+    )
+    monkeypatch.setattr(
+        farmtest, "verify_bundle", lambda *args, **kwargs: order.append("verify")
+    )
+    monkeypatch.setattr(
+        farmtest, "down_from_state", lambda *args, **kwargs: order.append("down")
+    )
+
+    def report(*_args, **_kwargs):
+        order.append("report")
+        return {"status": "PASS"}, "evidence\n"
+
+    monkeypatch.setattr(farmtest, "report_bundle", report)
+
+    verdict, rendered = farmtest.run_scenario(farm, scenario, plan)
+
+    assert verdict == {"status": "PASS"}
+    assert rendered == "evidence\n"
+    assert order == ["up", "run", "drain", "collect", "verify", "down", "report"]
+
+
+def test_s30_source_arm_drain_uses_bounded_production_deadline_margin() -> None:
+    sleeps: list[float] = []
+
+    farmtest._drain_s30_source_arms(sleeper=sleeps.append)
+
+    assert sleeps == [65.0]
+
+
 def test_scenario_orchestration_tears_down_after_workload_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

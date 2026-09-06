@@ -11,6 +11,7 @@ import os
 import re
 import secrets
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -746,6 +747,15 @@ def new_run_id() -> str:
     return f"{timestamp}-{secrets.token_hex(3)}"
 
 
+S30_SOURCE_ARM_DRAIN_SECONDS = 65.0
+
+
+def _drain_s30_source_arms(*, sleeper: Any = time.sleep) -> None:
+    """Let abandoned P50 source arms emit their fail-closed worker terminals."""
+
+    sleeper(S30_SOURCE_ARM_DRAIN_SECONDS)
+
+
 def run_scenario(
     farm: FarmSpec,
     scenario: ScenarioSpec,
@@ -766,6 +776,8 @@ def run_scenario(
         )
         up = True
         run_workload(farm, scenario, plan)
+        if scenario.data.get("id") == "S30-mutant-f-refusal":
+            _drain_s30_source_arms()
         collect_bundle(farm, scenario, plan)
         verify_bundle(bundle_root(farm, plan["run_id"]))
     except BaseException as exc:
