@@ -12,7 +12,7 @@ ICEFARM_IMAGE_RECEIPT_DIR ?=
 ICEFARM_SOURCE_ARCHIVE_DIR ?=
 
 .PHONY: integration_source_archives integration_images integration_smoke integration_controls \
-	integration_ladder integration_twobuild integration_full
+	integration_ladder integration_twobuild integration_full protocol50-formal
 integration_source_archives:
 	@test -n "$(strip $(ICEFARM_SOURCE_ARCHIVE_DIR))" || { \
 		echo "set ICEFARM_SOURCE_ARCHIVE_DIR to a new output directory" >&2; exit 2; }
@@ -53,6 +53,12 @@ integration_full:
 	@$(ICEFARM_TMP_ENV) $(ICEFARM_PYTHON) -m farmharness.integration.farmtest suite \
 		--farm "$(FARM)" --suite farmharness/integration/suites/full.json \
 		--stop-on-fail
+
+# This target intentionally works in an unconfigured source release.  The
+# aggregate runner authenticates the TLC jar and gives every lane a unique,
+# retained state directory below the caller-selected scratch root.
+protocol50-formal:
+	@$(ICEFARM_TMP_ENV) $(ICEFARM_PYTHON) cache/formal/run_formal_aggregate.py
 
 .PHONY: docker_build docker_test
 docker_build:

@@ -5,9 +5,19 @@ set -eu
 D=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 ROOT=$(CDPATH='' cd -- "$D/../.." && pwd)
 MANIFEST=$D/s6_mutation_manifest.jsonl
+PORTABLE=$(printenv S6_PORTABLE_EXECUTION 2>/dev/null || true)
+test -n "$PORTABLE" || PORTABLE=0
+case "$PORTABLE" in 0|1) ;; *) echo 'FAIL: S6_PORTABLE_EXECUTION must be 0 or 1' >&2; exit 2;; esac
 SPEC=$(printenv S6_V5_SPEC_PATH 2>/dev/null || true)
-test -n "$SPEC" || SPEC=/tmp/s6-zstd-route-finput-v5-correction-spec-20260828.md
-SPEC_SHA=70051b06bbb9e74fc743696ce1387fafe39731fc47c2a4641bb7e634c3809dd0
+if test "$PORTABLE" = 1; then
+  test -n "$SPEC" || SPEC=$D/PORTABLE_EXECUTION_AUTHORITY.md
+  SPEC_SHA=ccdc0f727740f7ca9d692f96b8d6445325aea927a76f7e345aa9a587a6e9e62e
+  EXECUTION_MODE=portable-source
+else
+  test -n "$SPEC" || SPEC=/tmp/s6-zstd-route-finput-v5-correction-spec-20260828.md
+  SPEC_SHA=70051b06bbb9e74fc743696ce1387fafe39731fc47c2a4641bb7e634c3809dd0
+  EXECUTION_MODE=historical-review
+fi
 PINNED=936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
 JAR=$(printenv TLA2TOOLS_JAR 2>/dev/null || true)
 TIMEOUT=$(printenv ROW_TIMEOUT_SECONDS 2>/dev/null || true); test -n "$TIMEOUT" || TIMEOUT=60
@@ -34,7 +44,15 @@ JSHA=$(sha256 "$JAR")
 test "$JSHA" = "$PINNED" || { echo 'FAIL: pinned TLC digest mismatch' >&2; exit 2; }
 test -f "$SPEC" || { echo 'FAIL: V5 correction spec is absent' >&2; exit 2; }
 test "$(sha256 "$SPEC")" = "$SPEC_SHA" || { echo 'FAIL: V5 correction spec digest mismatch' >&2; exit 2; }
-if test "${S6_TRANSPLANT_REVIEW:-0}" = 1; then
+if test "$PORTABLE" = 1; then
+  test "${S6_TRANSPLANT_REVIEW:-0}" = 0 || {
+    echo 'FAIL: portable execution and historical transplant review are mutually exclusive' >&2; exit 2
+  }
+  COMMIT=portable-$(sha256 "$MANIFEST")
+  TREE=packaged-inputs
+  PARENT=not-applicable
+  SUBJECT_CLEAN=null
+elif test "${S6_TRANSPLANT_REVIEW:-0}" = 1; then
   test "$(git -C "$ROOT" merge-base HEAD b702a35cf4060a560135d488e51b2d39d2fd3526)" = b702a35cf4060a560135d488e51b2d39d2fd3526 || {
     echo 'FAIL: review transplant requires exact b702 ancestry' >&2; exit 2
   }
@@ -46,19 +64,24 @@ else
     echo 'FAIL: exact V6 base required' >&2; exit 2
   }
 fi
-PARENTS=$(git -C "$ROOT" rev-list --parents -n1 HEAD)
-set -- $PARENTS
-test "$#" -eq 2 || { echo 'FAIL: reviewed commit must have one parent' >&2; exit 2; }
-test -z "$(git -C "$ROOT" status --porcelain --untracked-files=all)" || {
-  echo 'FAIL: subject worktree is not clean' >&2; exit 2
-}
+if test "$PORTABLE" = 0; then
+  PARENTS=$(git -C "$ROOT" rev-list --parents -n1 HEAD)
+  set -- $PARENTS
+  test "$#" -eq 2 || { echo 'FAIL: reviewed commit must have one parent' >&2; exit 2; }
+  test -z "$(git -C "$ROOT" status --porcelain --untracked-files=all)" || {
+    echo 'FAIL: subject worktree is not clean' >&2; exit 2
+  }
+  COMMIT=$(git -C "$ROOT" rev-parse HEAD)
+  TREE=$(git -C "$ROOT" rev-parse 'HEAD^{tree}')
+  PARENT=$(git -C "$ROOT" rev-parse HEAD^)
+  SUBJECT_CLEAN=true
+fi
 STATE=$(printenv ZSTD_ROUTE_FINPUT_COMPOSITION_STATE_ROOT 2>/dev/null || true)
 test -n "$STATE" || STATE=$EXP/$(date -u +%Y%m%dT%H%M%SZ)
 RESUME=$(printenv RESUME 2>/dev/null || true); test -n "$RESUME" || RESUME=0
 if test -e "$STATE" && test "$RESUME" != 1; then echo 'FAIL: existing state path; use RESUME=1' >&2; exit 2; fi
 mkdir -p "$STATE/rows" "$STATE/states" "$STATE/java-tmp" "$STATE/inputs/config"
-COMMIT=$(git -C "$ROOT" rev-parse HEAD); TREE=$(git -C "$ROOT" rev-parse 'HEAD^{tree}'); PARENT=$(git -C "$ROOT" rev-parse HEAD^)
-export COMMIT TREE PARENT TIMEOUT JAR JSHA SPEC SPEC_SHA PINNED RESUME TLC_WORKERS TLC_SEED TLC_FP_INDEX FULL_MATRIX IDS SEARCH_MODE DFID_MAX
+export COMMIT TREE PARENT SUBJECT_CLEAN EXECUTION_MODE TIMEOUT JAR JSHA SPEC SPEC_SHA PINNED RESUME TLC_WORKERS TLC_SEED TLC_FP_INDEX FULL_MATRIX IDS SEARCH_MODE DFID_MAX
 SEARCH_ARGS=
 JAVA_ARGS='-XX:+UseParallelGC'
 if test "$SEARCH_MODE" = dfid; then
@@ -140,7 +163,8 @@ python3 - "$STATE/provenance.json" "$D/run_zstd_route_finput_composition_tlc.sh"
 import hashlib,json,os,pathlib,subprocess,time,sys
 def h(p): return hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
 json.dump({'source_commit':os.environ['COMMIT'],'source_tree':os.environ['TREE'],'source_parent':os.environ['PARENT'],
- 'subject_clean':True,'jar_path':os.environ['JAR'],'jar_sha256':os.environ['JSHA'],
+ 'subject_clean':None if os.environ['SUBJECT_CLEAN']=='null' else os.environ['SUBJECT_CLEAN']=='true',
+ 'execution_mode':os.environ['EXECUTION_MODE'],'jar_path':os.environ['JAR'],'jar_sha256':os.environ['JSHA'],
  'spec_path':os.environ['SPEC'],'spec_sha256':os.environ['SPEC_SHA'],
  'runner_sha256':h(sys.argv[2]),'manifest_sha256':h(sys.argv[3]),
  'java':subprocess.run(['java','-version'],capture_output=True,text=True).stderr.splitlines()[:1],
@@ -447,7 +471,7 @@ PY
 python3 - "$STATE/REPORT.md" "$STATE/suite-summary.json" <<'PY'
 import json,os,sys
 s=json.load(open(sys.argv[2]))
-open(sys.argv[1],'w').write('# S6 ZSTD_ROUTE/FInput composition V5 execution evidence\n\nNeutral formal-model, protocol-engineering, reproducibility and functional-QA evidence only. No S6/product/profile, candidate, merge, landing, tag, deployment or publication authority.\n\n- Commit: %s\n- Tree: %s\n- Sole direct parent: %s\n- Pinned TLC SHA-256: %s\n- Correction spec SHA-256: %s\n- Search mode: %s (DFID max %s)\n- SANY: %s (raw exit %s)\n- Declared/selected rows: %s/%s\n- Matrix status: %s\n- Counts: %s\n- BigOracle issue16 interpretation: HOLD; requested comments 5447981767 and 5448067827 were unavailable in frozen local evidence.\n\nPositive rows require clean completion, zero queue (BFS), or a clean DFID stop strictly before the configured maximum depth, exact target/property coverage and all declared witness coverage. Controls require exact exit/diagnostic order, source-bound changed marker, nonzero attributable antecedent coverage and target coverage. Timeout, max-depth-limited, and incomplete rows remain HOLD.\n'%(os.environ['COMMIT'],os.environ['TREE'],os.environ['PARENT'],os.environ['JSHA'],os.environ['SPEC_SHA'],os.environ['SEARCH_MODE'],os.environ['DFID_MAX'],s['sany_status'],s['sany_raw_exit'],s['selected_rows'],s['declared_rows'],s['status'],json.dumps(s['counts'],sort_keys=True)))
+open(sys.argv[1],'w').write('# S6 ZSTD_ROUTE/FInput composition V5 execution evidence\n\nNeutral formal-model, protocol-engineering, reproducibility and functional-QA evidence only. No S6/product/profile, candidate, merge, landing, tag, deployment or publication authority.\n\n- Execution mode: %s\n- Commit/source identity: %s\n- Tree: %s\n- Sole direct parent: %s\n- Pinned TLC SHA-256: %s\n- Execution authority SHA-256: %s\n- Search mode: %s (DFID max %s)\n- SANY: %s (raw exit %s)\n- Declared/selected rows: %s/%s\n- Matrix status: %s\n- Counts: %s\n- BigOracle issue16 interpretation: HOLD; requested comments 5447981767 and 5448067827 were unavailable in frozen local evidence.\n\nPositive rows require clean completion, zero queue (BFS), or a clean DFID stop strictly before the configured maximum depth, exact target/property coverage and all declared witness coverage. Controls require exact exit/diagnostic order, source-bound changed marker, nonzero attributable antecedent coverage and target coverage. Timeout, max-depth-limited, and incomplete rows remain HOLD.\n'%(os.environ['EXECUTION_MODE'],os.environ['COMMIT'],os.environ['TREE'],os.environ['PARENT'],os.environ['JSHA'],os.environ['SPEC_SHA'],os.environ['SEARCH_MODE'],os.environ['DFID_MAX'],s['sany_status'],s['sany_raw_exit'],s['selected_rows'],s['declared_rows'],s['status'],json.dumps(s['counts'],sort_keys=True)))
 PY
 
 tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner -cf "$STATE/source-archive-1.tar" -C "$STATE/inputs" .

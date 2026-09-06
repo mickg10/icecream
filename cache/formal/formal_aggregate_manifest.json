@@ -1,0 +1,154 @@
+{
+  "schema": "icecream-p50-formal-aggregate-v1",
+  "tool": {
+    "name": "tla2tools.jar",
+    "sha256": "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
+  },
+  "lanes": [
+    {
+      "id": "core",
+      "runner": "run_tlc.sh",
+      "timeout_seconds": 10800,
+      "rows": [
+        {"id": "cache", "module": "Protocol50.tla", "config": "Protocol50.cfg", "outcome": "clean", "marker": "== cache =="},
+        {"id": "job", "module": "Protocol50JobLifecycle.tla", "config": "Protocol50JobLifecycle.cfg", "outcome": "clean", "marker": "== job =="},
+        {"id": "reconnect", "module": "Protocol50Reconnect.tla", "config": "Protocol50Reconnect.cfg", "outcome": "clean", "marker": "== reconnect =="},
+        {"id": "multiroute", "module": "Protocol50MultiRoute.tla", "config": "Protocol50MultiRoute.cfg", "outcome": "clean", "marker": "== multiroute =="},
+        {"id": "job-restart-progress", "module": "Protocol50JobLifecycle.tla", "config": "Protocol50JobRestartProgress.cfg", "outcome": "clean", "marker": "== job-restart-progress =="},
+        {"id": "incarnation", "module": "Protocol50IncarnationBridge.tla", "config": "Protocol50IncarnationBridge.cfg", "outcome": "clean", "marker": "== incarnation =="},
+        {"id": "incarnation-progress", "module": "Protocol50IncarnationBridge.tla", "config": "Protocol50IncarnationProgress.cfg", "outcome": "clean", "marker": "== incarnation-progress =="},
+        {"id": "assignment", "module": "Protocol50Assignment.tla", "config": "Protocol50Assignment.cfg", "outcome": "clean", "marker": "== assignment =="},
+        {"id": "assignment-restart-progress", "module": "Protocol50Assignment.tla", "config": "Protocol50AssignmentRestart.cfg", "outcome": "clean", "marker": "== assignment-restart-progress =="},
+        {"id": "assignment-ordering", "module": "Protocol50AssignmentOrdering.tla", "config": "Protocol50AssignmentOrdering.cfg", "outcome": "clean", "marker": "== assignment-ordering =="},
+        {"id": "abort-mutant", "module": "Protocol50.tla", "config": "Protocol50AbortMutant.cfg", "outcome": "expected-failure", "invariant": "CommitReconciliationWitness", "marker": "== abort-mutant ("},
+        {"id": "relseq-mutant", "module": "Protocol50.tla", "config": "Protocol50RelSeqMutant.cfg", "outcome": "expected-failure", "invariant": "ActiveSequenceHasRoom", "marker": "== relseq-mutant ("},
+        {"id": "operation-digest-mutant", "module": "Protocol50.tla", "config": "Protocol50OperationDigestMutant.cfg", "outcome": "expected-failure", "invariant": "CommitOnlyAfterExactMaterialization", "marker": "== operation-digest-mutant ("},
+        {"id": "job-lease-mutant", "module": "Protocol50JobLifecycle.tla", "config": "Protocol50JobLeaseMutant.cfg", "outcome": "expected-failure", "invariant": "CommittedInputForOpenJobKeepsLease", "marker": "== job-lease-mutant ("},
+        {"id": "job-cancel-lease-mutant", "module": "Protocol50JobLifecycle.tla", "config": "Protocol50JobCancelLeaseMutant.cfg", "outcome": "expected-failure", "invariant": "CommittedInputForOpenJobKeepsLease", "marker": "== job-cancel-lease-mutant ("},
+        {"id": "job-ownership-mutant", "module": "Protocol50JobLifecycle.tla", "config": "Protocol50JobOwnershipMutant.cfg", "outcome": "expected-failure", "invariant": "AuthorizedAttemptOwnsIndependentInput", "marker": "== job-ownership-mutant ("},
+        {"id": "reconnect-same-guid-mutant", "module": "Protocol50Reconnect.tla", "config": "Protocol50ReconnectSameGuidMutant.cfg", "outcome": "expected-failure", "invariant": "ColdRetirementHasProof", "marker": "== reconnect-same-guid-mutant ("},
+        {"id": "reconnect-active-reset-mutant", "module": "Protocol50Reconnect.tla", "config": "Protocol50ReconnectActiveResetMutant.cfg", "outcome": "expected-failure", "invariant": "UnresolvedActiveNotDiscarded", "marker": "== reconnect-active-reset-mutant ("},
+        {"id": "reconnect-repeat-reset-mutant", "module": "Protocol50Reconnect.tla", "config": "Protocol50ReconnectRepeatResetMutant.cfg", "outcome": "expected-failure", "invariant": "AtMostOneResetPerSession", "marker": "== reconnect-repeat-reset-mutant ("},
+        {"id": "multiroute-move-mutant", "module": "Protocol50MultiRoute.tla", "config": "Protocol50MultiRouteMoveMutant.cfg", "outcome": "expected-failure", "invariant": "CrossRouteForkPreservesSource", "marker": "== multiroute-move-mutant ("},
+        {"id": "multiroute-result-mutant", "module": "Protocol50MultiRoute.tla", "config": "Protocol50MultiRouteResultMutant.cfg", "outcome": "expected-failure", "invariant": "ResultDoesNotRetireCache", "marker": "== multiroute-result-mutant ("},
+        {"id": "incarnation-mutant", "module": "Protocol50IncarnationBridge.tla", "config": "Protocol50IncarnationMutant.cfg", "outcome": "expected-failure", "invariant": "ReplacementPreservesRetryIdentity", "marker": "== incarnation-mutant ("},
+        {"id": "incarnation-ownership-mutant", "module": "Protocol50IncarnationBridge.tla", "config": "Protocol50IncarnationOwnershipMutant.cfg", "outcome": "expected-failure", "invariant": "AuthorizedCompilerOwnsIndependentInput", "marker": "== incarnation-ownership-mutant ("},
+        {"id": "assignment-mixed-compat", "module": "Protocol50Assignment.tla", "config": "Protocol50AssignmentMixedCompat.cfg", "outcome": "expected-failure", "invariant": "EnforcingCompatClaimsExact", "marker": "== assignment-mixed-compat ("},
+        {"id": "assignment-strict-legacy-mutant", "module": "Protocol50Assignment.tla", "config": "Protocol50AssignmentStrictLegacyMutant.cfg", "outcome": "expected-failure", "invariant": "StrictClaimsExact", "marker": "== assignment-strict-legacy-mutant ("},
+        {"id": "assignment-ready-mutant", "module": "Protocol50Assignment.tla", "config": "Protocol50AssignmentReadyMutant.cfg", "outcome": "expected-failure", "invariant": "ReadyGate", "marker": "== assignment-ready-mutant ("},
+        {"id": "assignment-cancelled-publish-mutant", "module": "Protocol50Assignment.tla", "config": "Protocol50AssignmentCancelledPublishMutant.cfg", "outcome": "expected-failure", "invariant": "ReadyGate", "marker": "== assignment-cancelled-publish-mutant ("},
+        {"id": "assignment-release-mutant", "module": "Protocol50Assignment.tla", "config": "Protocol50AssignmentReleaseMutant.cfg", "outcome": "expected-failure", "invariant": "ReleaseHasRevocationProof", "marker": "== assignment-release-mutant ("},
+        {"id": "assignment-tombstone-mutant", "module": "Protocol50Assignment.tla", "config": "Protocol50AssignmentTombstoneMutant.cfg", "outcome": "expected-failure", "invariant": "TombstoneIsNotLive", "marker": "== assignment-tombstone-mutant ("},
+        {"id": "assignment-epoch-reuse-mutant", "module": "Protocol50Assignment.tla", "config": "Protocol50AssignmentEpochReuseMutant.cfg", "outcome": "expected-failure", "invariant": "SameEpochRevocationSafety", "marker": "== assignment-epoch-reuse-mutant ("},
+        {"id": "assignment-ordering-early-cancel-witness", "module": "Protocol50AssignmentOrdering.tla", "config": "Protocol50AssignmentOrderingEarlyCancelWitness.cfg", "outcome": "expected-failure", "invariant": "NoEarlyCancelWitness", "marker": "== assignment-ordering-early-cancel-witness ("},
+        {"id": "assignment-ordering-advisory-witness", "module": "Protocol50AssignmentOrdering.tla", "config": "Protocol50AssignmentOrderingAdvisoryWitness.cfg", "outcome": "expected-failure", "invariant": "NoAdvisoryClaimBeforePrepareWitness", "marker": "== assignment-ordering-advisory-witness ("},
+        {"id": "assignment-ordering-prepare-mutant", "module": "Protocol50AssignmentOrdering.tla", "config": "Protocol50AssignmentOrderingPrepareMutant.cfg", "outcome": "expected-failure", "invariant": "ClaimNeverRegresses", "marker": "== assignment-ordering-prepare-mutant ("},
+        {"id": "assignment-ordering-ready-mutant", "module": "Protocol50AssignmentOrdering.tla", "config": "Protocol50AssignmentOrderingReadyMutant.cfg", "outcome": "expected-failure", "invariant": "CancelCutsPublication", "marker": "== assignment-ordering-ready-mutant ("},
+        {"id": "assignment-ordering-revoke-mutant", "module": "Protocol50AssignmentOrdering.tla", "config": "Protocol50AssignmentOrderingRevokeMutant.cfg", "outcome": "expected-failure", "invariant": "ClaimWinsRevoke", "marker": "== assignment-ordering-revoke-mutant ("}
+      ]
+    },
+    {
+      "id": "assignment-delivery",
+      "runner": "run_assignment_delivery_tlc.sh",
+      "timeout_seconds": 7200,
+      "rows": [
+        {"id": "delivery", "module": "Protocol50AssignmentDelivery.tla", "config": "Protocol50AssignmentDelivery.cfg", "outcome": "clean", "marker": "== delivery =="},
+        {"id": "ready-wire-mutant", "module": "Protocol50AssignmentDelivery.tla", "config": "Protocol50AssignmentReadyWireMutant.cfg", "outcome": "expected-failure", "invariant": "PublishedHasMatchingPrepare", "marker": "== ready-wire-mutant ("},
+        {"id": "revoke-request-wire-mutant", "module": "Protocol50AssignmentDelivery.tla", "config": "Protocol50AssignmentRevokeRequestWireMutant.cfg", "outcome": "expected-failure", "invariant": "RevocationTargetsSentAssignment", "marker": "== revoke-request-wire-mutant ("},
+        {"id": "revoke-result-wire-mutant", "module": "Protocol50AssignmentDelivery.tla", "config": "Protocol50AssignmentRevokeResultWireMutant.cfg", "outcome": "expected-failure", "invariant": "RevokeResultHasMatchingWorkerProof", "marker": "== revoke-result-wire-mutant ("},
+        {"id": "late-prepare-mutant", "module": "Protocol50AssignmentDelivery.tla", "config": "Protocol50AssignmentLatePrepareMutant.cfg", "outcome": "expected-failure", "invariant": "ClaimedPhaseNeverRegresses", "marker": "== late-prepare-mutant ("},
+        {"id": "revoke-claim-crossing-witness", "module": "Protocol50AssignmentDelivery.tla", "config": "Protocol50AssignmentRevokeClaimCrossingWitness.cfg", "outcome": "expected-failure", "invariant": "NoRevokeClaimCrossingWitness", "marker": "== revoke-claim-crossing-witness ("},
+        {"id": "stale-revoke-result-witness", "module": "Protocol50AssignmentDelivery.tla", "config": "Protocol50AssignmentStaleRevokeResultWitness.cfg", "outcome": "expected-failure", "invariant": "NoStaleNonceResultWitness", "marker": "== stale-revoke-result-witness ("}
+      ]
+    },
+    {
+      "id": "assignment-identity",
+      "runner": "run_assignment_identity_tlc.sh",
+      "timeout_seconds": 7200,
+      "rows": [
+        {"id": "identity", "module": "Protocol50AssignmentIdentity.tla", "config": "Protocol50AssignmentIdentity.cfg", "outcome": "clean", "marker": "== identity =="},
+        {"id": "cell-43-43-43", "module": "Protocol50AssignmentIdentity.tla", "config": "Protocol50AssignmentIdentityCell43_43_43.cfg", "outcome": "expected-failure", "invariant": "NoExpectedCellOutcome", "marker": "== cell-43-43-43 ("},
+        {"id": "cell-43-43-50", "module": "Protocol50AssignmentIdentity.tla", "config": "Protocol50AssignmentIdentityCell43_43_50.cfg", "outcome": "expected-failure", "invariant": "NoExpectedCellOutcome", "marker": "== cell-43-43-50 ("},
+        {"id": "cell-43-50-43", "module": "Protocol50AssignmentIdentity.tla", "config": "Protocol50AssignmentIdentityCell43_50_43.cfg", "outcome": "expected-failure", "invariant": "NoExpectedCellOutcome", "marker": "== cell-43-50-43 ("},
+        {"id": "cell-43-50-50", "module": "Protocol50AssignmentIdentity.tla", "config": "Protocol50AssignmentIdentityCell43_50_50.cfg", "outcome": "expected-failure", "invariant": "NoExpectedCellOutcome", "marker": "== cell-43-50-50 ("},
+        {"id": "cell-50-43-43", "module": "Protocol50AssignmentIdentity.tla", "config": "Protocol50AssignmentIdentityCell50_43_43.cfg", "outcome": "expected-failure", "invariant": "NoExpectedCellOutcome", "marker": "== cell-50-43-43 ("},
+        {"id": "cell-50-43-50", "module": "Protocol50AssignmentIdentity.tla", "config": "Protocol50AssignmentIdentityCell50_43_50.cfg", "outcome": "expected-failure", "invariant": "NoExpectedCellOutcome", "marker": "== cell-50-43-50 ("},
+        {"id": "cell-50-50-43", "module": "Protocol50AssignmentIdentity.tla", "config": "Protocol50AssignmentIdentityCell50_50_43.cfg", "outcome": "expected-failure", "invariant": "NoExpectedCellOutcome", "marker": "== cell-50-50-43 ("},
+        {"id": "cell-50-50-50", "module": "Protocol50AssignmentIdentity.tla", "config": "Protocol50AssignmentIdentityCell50_50_50.cfg", "outcome": "expected-failure", "invariant": "NoExpectedCellOutcome", "marker": "== cell-50-50-50 ("},
+        {"id": "strict-exact-witness", "module": "Protocol50AssignmentIdentity.tla", "config": "Protocol50AssignmentIdentityStrictWitness.cfg", "outcome": "expected-failure", "invariant": "NoStrictExactClaimWitness", "marker": "== strict-exact-witness ("},
+        {"id": "strict-mixed-refusal-witness", "module": "Protocol50AssignmentIdentity.tla", "config": "Protocol50AssignmentIdentityStrictMixedWitness.cfg", "outcome": "expected-failure", "invariant": "NoStrictMixedRefusalWitness", "marker": "== strict-mixed-refusal-witness ("},
+        {"id": "local-exemption-witness", "module": "Protocol50AssignmentIdentity.tla", "config": "Protocol50AssignmentIdentityLocalWitness.cfg", "outcome": "expected-failure", "invariant": "NoLocalExemptionWitness", "marker": "== local-exemption-witness ("},
+        {"id": "reconnect-exact-witness", "module": "Protocol50AssignmentIdentity.tla", "config": "Protocol50AssignmentIdentityReconnectWitness.cfg", "outcome": "expected-failure", "invariant": "NoReconnectExactClaimWitness", "marker": "== reconnect-exact-witness ("},
+        {"id": "revoked-release-witness", "module": "Protocol50AssignmentIdentity.tla", "config": "Protocol50AssignmentIdentityRevokedWitness.cfg", "outcome": "expected-failure", "invariant": "NoRevokedReleaseWitness", "marker": "== revoked-release-witness ("},
+        {"id": "claimed-settlement-witness", "module": "Protocol50AssignmentIdentity.tla", "config": "Protocol50AssignmentIdentitySettlementWitness.cfg", "outcome": "expected-failure", "invariant": "NoClaimedOrdinarySettlementWitness", "marker": "== claimed-settlement-witness ("},
+        {"id": "reject-stale-epoch-witness", "module": "Protocol50AssignmentIdentity.tla", "config": "Protocol50AssignmentIdentityRejectStaleEpochWitness.cfg", "outcome": "expected-failure", "invariant": "NoRejectedInvalidIdentityWitness", "marker": "== reject-stale-epoch-witness ("},
+        {"id": "reject-stale-wire-witness", "module": "Protocol50AssignmentIdentity.tla", "config": "Protocol50AssignmentIdentityRejectStaleWireWitness.cfg", "outcome": "expected-failure", "invariant": "NoRejectedInvalidIdentityWitness", "marker": "== reject-stale-wire-witness ("},
+        {"id": "reject-stale-nonce-witness", "module": "Protocol50AssignmentIdentity.tla", "config": "Protocol50AssignmentIdentityRejectStaleNonceWitness.cfg", "outcome": "expected-failure", "invariant": "NoRejectedInvalidIdentityWitness", "marker": "== reject-stale-nonce-witness ("},
+        {"id": "reject-epoch-only-witness", "module": "Protocol50AssignmentIdentity.tla", "config": "Protocol50AssignmentIdentityRejectEpochOnlyWitness.cfg", "outcome": "expected-failure", "invariant": "NoRejectedInvalidIdentityWitness", "marker": "== reject-epoch-only-witness ("},
+        {"id": "reject-nonce-only-witness", "module": "Protocol50AssignmentIdentity.tla", "config": "Protocol50AssignmentIdentityRejectNonceOnlyWitness.cfg", "outcome": "expected-failure", "invariant": "NoRejectedInvalidIdentityWitness", "marker": "== reject-nonce-only-witness ("},
+        {"id": "stale-epoch-mutant", "module": "Protocol50AssignmentIdentity.tla", "config": "Protocol50AssignmentIdentityStaleEpochMutant.cfg", "outcome": "expected-failure", "invariant": "StaleIdentityRejected", "marker": "== stale-epoch-mutant ("},
+        {"id": "stale-wire-mutant", "module": "Protocol50AssignmentIdentity.tla", "config": "Protocol50AssignmentIdentityStaleWireMutant.cfg", "outcome": "expected-failure", "invariant": "StaleIdentityRejected", "marker": "== stale-wire-mutant ("},
+        {"id": "stale-nonce-mutant", "module": "Protocol50AssignmentIdentity.tla", "config": "Protocol50AssignmentIdentityStaleNonceMutant.cfg", "outcome": "expected-failure", "invariant": "StaleIdentityRejected", "marker": "== stale-nonce-mutant ("},
+        {"id": "epoch-only-mutant", "module": "Protocol50AssignmentIdentity.tla", "config": "Protocol50AssignmentIdentityEpochOnlyMutant.cfg", "outcome": "expected-failure", "invariant": "PartialIdentityRejected", "marker": "== epoch-only-mutant ("},
+        {"id": "nonce-only-mutant", "module": "Protocol50AssignmentIdentity.tla", "config": "Protocol50AssignmentIdentityNonceOnlyMutant.cfg", "outcome": "expected-failure", "invariant": "PartialIdentityRejected", "marker": "== nonce-only-mutant ("},
+        {"id": "dropped-p50-identity-mutant", "module": "Protocol50AssignmentIdentity.tla", "config": "Protocol50AssignmentIdentityDropMutant.cfg", "outcome": "expected-failure", "invariant": "P50PathPreservesIdentity", "marker": "== dropped-p50-identity-mutant ("},
+        {"id": "strict-absent-mutant", "module": "Protocol50AssignmentIdentity.tla", "config": "Protocol50AssignmentIdentityStrictAbsentMutant.cfg", "outcome": "expected-failure", "invariant": "StrictClaimsExact", "marker": "== strict-absent-mutant ("},
+        {"id": "reconnect-drop-mutant", "module": "Protocol50AssignmentIdentity.tla", "config": "Protocol50AssignmentIdentityReconnectDropMutant.cfg", "outcome": "expected-failure", "invariant": "ReconnectPreservesIdentity", "marker": "== reconnect-drop-mutant ("},
+        {"id": "release-claimed-mutant", "module": "Protocol50AssignmentIdentity.tla", "config": "Protocol50AssignmentIdentityReleaseClaimedMutant.cfg", "outcome": "expected-failure", "invariant": "ClaimedResultRetains", "marker": "== release-claimed-mutant ("}
+      ]
+    },
+    {
+      "id": "global",
+      "runner": "run_global_tlc.sh",
+      "timeout_seconds": 7200,
+      "rows": [
+        {"id": "safety", "module": "Protocol50Global.tla", "config": "Protocol50Global.cfg", "outcome": "clean", "marker": "== global safety =="},
+        {"id": "aggregate", "module": "Protocol50Global.tla", "config": "Protocol50GlobalAggregateCapMutant.cfg", "outcome": "expected-failure", "invariant": "NoMutantFaults", "marker": "== global aggregate ("},
+        {"id": "namespace-cap", "module": "Protocol50Global.tla", "config": "Protocol50GlobalNamespaceCapMutant.cfg", "outcome": "expected-failure", "invariant": "NoMutantFaults", "marker": "== global namespace-cap ("},
+        {"id": "slot", "module": "Protocol50Global.tla", "config": "Protocol50GlobalSlotMutant.cfg", "outcome": "expected-failure", "invariant": "InstallingOwnsExactlyOneSlot", "marker": "== global slot ("},
+        {"id": "lru", "module": "Protocol50Global.tla", "config": "Protocol50GlobalLruMutant.cfg", "outcome": "expected-failure", "invariant": "NoMutantFaults", "marker": "== global lru ("},
+        {"id": "generation", "module": "Protocol50Global.tla", "config": "Protocol50GlobalGenerationWrapMutant.cfg", "outcome": "expected-failure", "invariant": "NoMutantFaults", "marker": "== global generation ("},
+        {"id": "admission", "module": "Protocol50Global.tla", "config": "Protocol50GlobalAdmissionMutant.cfg", "outcome": "expected-failure", "invariant": "NoMutantFaults", "marker": "== global admission ("},
+        {"id": "conflict", "module": "Protocol50Global.tla", "config": "Protocol50GlobalConflictMutant.cfg", "outcome": "expected-failure", "invariant": "ConflictIsFatal", "marker": "== global conflict ("},
+        {"id": "crash", "module": "Protocol50Global.tla", "config": "Protocol50GlobalCrashMutant.cfg", "outcome": "expected-failure", "invariant": "NoMutantFaults", "marker": "== global crash ("},
+        {"id": "reverse-slot", "module": "Protocol50Global.tla", "config": "Protocol50GlobalReverseSlotMutant.cfg", "outcome": "expected-failure", "invariant": "EveryOwnedSlotHasInstallingArena", "marker": "== global reverse-slot ("},
+        {"id": "content", "module": "Protocol50Global.tla", "config": "Protocol50GlobalContentMutant.cfg", "outcome": "expected-failure", "invariant": "ImmutableArenaContent", "marker": "== global content ("},
+        {"id": "stall", "module": "Protocol50Global.tla", "config": "Protocol50GlobalStallMutant.cfg", "outcome": "expected-failure", "invariant": "WatchdogNoStall", "marker": "== global stall ("},
+        {"id": "local-lru", "module": "Protocol50Global.tla", "config": "Protocol50GlobalLocalLruMutant.cfg", "outcome": "expected-failure", "invariant": "LruOrderingWitness", "marker": "== global local-lru ("},
+        {"id": "lifecycle-reset", "module": "Protocol50Global.tla", "config": "Protocol50GlobalLifecycleResetMutant.cfg", "outcome": "expected-failure", "invariant": "FreshAdmissionReady", "marker": "== global lifecycle-reset ("},
+        {"id": "cross-guid", "module": "Protocol50Global.tla", "config": "Protocol50GlobalCrossGuidMutant.cfg", "outcome": "expected-failure", "invariant": "CrossNamespaceGuidIsolation", "marker": "== global cross-guid ("},
+        {"id": "staging-cap", "module": "Protocol50Global.tla", "config": "Protocol50GlobalStagingCapMutant.cfg", "outcome": "expected-failure", "invariant": "StagingByteCap", "marker": "== global staging-cap ("},
+        {"id": "total-cap", "module": "Protocol50Global.tla", "config": "Protocol50GlobalTotalCapMutant.cfg", "outcome": "expected-failure", "invariant": "TotalSimultaneousByteCap", "marker": "== global total-cap ("}
+      ]
+    },
+    {
+      "id": "zstd-route-finput",
+      "runner": "run_zstd_route_finput_composition_tlc.sh",
+      "selection_authority": "s6_mutation_manifest.jsonl",
+      "extra_inputs": [
+        "PORTABLE_EXECUTION_AUTHORITY.md",
+        "Protocol50ZstdRouteFInputInterface.tla",
+        "s6_mutation_manifest.jsonl"
+      ],
+      "environment": {
+        "S6_PORTABLE_EXECUTION": "1",
+        "ROW_TIMEOUT_SECONDS": "300",
+        "RUNNER_SELF_CONTROLS": "1",
+        "TLC_SEARCH_MODE": "bfs"
+      },
+      "result_contract": "zstd-selected-jsonl",
+      "timeout_seconds": 3600,
+      "rows": [
+        {"id": "core-05", "module": "Protocol50ZstdRoute.tla", "config": "Protocol50ZstdRouteProcessLossMutant.cfg", "outcome": "expected-failure", "invariant": "ContextLossFencesOldRoute"},
+        {"id": "core-18", "module": "Protocol50ZstdRoute.tla", "config": "Protocol50ZstdRouteCollapsedTUMutant.cfg", "outcome": "expected-failure", "invariant": "DistinctOperationTUs"},
+        {"id": "core-19", "module": "Protocol50ZstdRoute.tla", "config": "Protocol50ZstdRouteSingleByteAlphabetMutant.cfg", "outcome": "expected-failure", "invariant": "ByteAlphabetHasTwoValues"},
+        {"id": "composition-general-safety", "module": "Protocol50ZstdRouteFInputComposition.tla", "config": "Protocol50ZstdRouteFInputComposition.cfg", "outcome": "clean"},
+        {"id": "composition-safety-terminal-identity", "module": "Protocol50ZstdRouteFInputComposition.tla", "config": "Protocol50ZstdRouteFInputCoreTerminalIdentityDeletionMutant.cfg", "outcome": "expected-failure", "invariant": "CoreTerminalIdentityExact"},
+        {"id": "composition-safety-event-identity", "module": "Protocol50ZstdRouteFInputComposition.tla", "config": "Protocol50ZstdRouteFInputCoreEventIdentityDeletionMutant.cfg", "outcome": "expected-failure", "invariant": "CoreEventIdentityExact"},
+        {"id": "composition-safety-settlement-ledger", "module": "Protocol50ZstdRouteFInputComposition.tla", "config": "Protocol50ZstdRouteFInputCoreSettlementLedgerDeletionMutant.cfg", "outcome": "expected-failure", "invariant": "CoreSettlementLedgerExact"},
+        {"id": "composition-safety-resource-bounds", "module": "Protocol50ZstdRouteFInputComposition.tla", "config": "Protocol50ZstdRouteFInputCoreResourceBoundsDeletionMutant.cfg", "outcome": "expected-failure", "invariant": "CoreResourceBounds"},
+        {"id": "composition-safety-payload-release", "module": "Protocol50ZstdRouteFInputComposition.tla", "config": "Protocol50ZstdRouteFInputCorePayloadReleasedOnSettlementDeletionMutant.cfg", "outcome": "expected-failure", "invariant": "CorePayloadReleasedOnSettlement"}
+      ]
+    }
+  ]
+}

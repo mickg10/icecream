@@ -303,7 +303,9 @@ reconnect, revoke, and ordinary-settlement suffix. See
 
 ## Running TLC
 
-Use a pinned TLA+ tools version and record the exact version and jar hash. The canonical command is:
+Use the pinned TLA+ tools artifact whose SHA-256 is declared in
+`formal_aggregate_manifest.json`.  The canonical, source-release-portable
+command is:
 
 ```sh
 TLA2TOOLS_JAR=/path/to/tla2tools.jar \
@@ -311,7 +313,24 @@ TLC_WORKERS=1 \
 make protocol50-formal
 ```
 
-`run_tlc.sh` prints the jar/module/config hashes and exact Java command for every row. It requires complete safety runs for the cache, job, reconnect, multi-route, and incarnation models plus both scoped progress rows. It also requires directly named invariant failure for:
+The target runs the core, assignment-delivery, assignment-identity, global,
+and bounded ZSTD_ROUTE/FInput lanes selected by that manifest.  It allocates a
+unique retained directory below `P50_FORMAL_RESULTS_ROOT` (or
+`$ICEFARM_TMPDIR/icecream-formal`), authenticates the shared jar before any
+lane starts, hashes every selected input, and records commands, logs, state
+counts, and a machine-readable aggregate verdict.  Missing dependencies,
+timeouts, missing row markers, and `SKIP` are never PASS.
+
+The ZSTD_ROUTE/FInput selection uses the packaged portable execution
+authority and does not claim the complete 87-row historical matrix.  Direct
+historical review still invokes `run_zstd_route_finput_composition_tlc.sh`
+without `S6_PORTABLE_EXECUTION=1`, retaining its correction-spec, Git
+ancestry, single-parent, and clean-worktree gates.
+
+The core `run_tlc.sh` lane prints the jar/module/config hashes and exact Java
+command for every row. It requires complete safety runs for the cache, job,
+reconnect, multi-route, and incarnation models plus both scoped progress rows.
+It also requires directly named invariant failure for:
 
 - abort after durable commit;
 - begin at terminal `REL_SEQ`;

@@ -119,4 +119,5 @@ test-strict: install
 protocol50-formal:
 	@test -n "$$TLA2TOOLS_JAR" || { \
 		echo "set TLA2TOOLS_JAR to a pinned tla2tools.jar" >&2; exit 2; }
-	sh $(srcdir)/cache/formal/run_tlc.sh
+	$(ICEFARM_TMP_ENV) $(ICEFARM_PYTHON) \
+		$(srcdir)/cache/formal/run_formal_aggregate.py
