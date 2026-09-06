@@ -75,6 +75,131 @@ def _load_manifest(path: Path) -> dict[str, Any]:
     return manifest
 
 
+def _load_selection_authority(path: Path, lane_id: str) -> dict[str, dict[str, Any]]:
+    rows: dict[str, dict[str, Any]] = {}
+    try:
+        lines = path.read_text().splitlines()
+    except OSError as exc:
+        raise Refusal(f"cannot read lane {lane_id} selection authority: {exc}") from exc
+    for line_number, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise Refusal(
+                f"lane {lane_id} selection authority line {line_number} is invalid JSON"
+            ) from exc
+        row_id = row.get("id") if isinstance(row, dict) else None
+        if not isinstance(row_id, str) or not row_id:
+            raise Refusal(
+                f"lane {lane_id} selection authority line {line_number} lacks an ID"
+            )
+        if row_id in rows:
+            raise Refusal(f"lane {lane_id} selection authority duplicates ID {row_id}")
+        rows[row_id] = row
+    if not rows:
+        raise Refusal(f"lane {lane_id} selection authority has no rows")
+    return rows
+
+
+def _authority_outcome(
+    lane_id: str, row_id: str, row: dict[str, Any]
+) -> tuple[str, str | None]:
+    expected_exit = row.get("expected_exit")
+    expected_wait = row.get("expected_wait")
+    expected_phase = row.get("expected_phase")
+    expected = row.get("expected")
+    if (
+        expected_exit == 0
+        and expected_wait == "zero"
+        and expected_phase == "clean"
+        and isinstance(expected, str)
+        and expected
+    ):
+        return "clean", None
+    if (
+        isinstance(expected_exit, int)
+        and not isinstance(expected_exit, bool)
+        and expected_exit != 0
+        and expected_wait == "nonzero"
+        and expected_phase == "invariant"
+        and isinstance(expected, str)
+        and expected
+    ):
+        return "expected-failure", expected
+    if (
+        isinstance(expected_exit, int)
+        and not isinstance(expected_exit, bool)
+        and expected_exit != 0
+        and expected_wait == "nonzero"
+        and expected_phase == "initial-invariant"
+        and isinstance(expected, str)
+        and expected.startswith("initial:")
+        and expected != "initial:"
+    ):
+        return "expected-failure", expected.removeprefix("initial:")
+    raise Refusal(
+        f"lane {lane_id}/{row_id} has an unsupported selection-authority outcome"
+    )
+
+
+def _bind_authority_row(
+    formal_root: Path,
+    lane_id: str,
+    row_id: str,
+    declaration: dict[str, Any],
+    authority: dict[str, Any],
+) -> dict[str, Any]:
+    module_name = declaration["module"]
+    config_name = declaration["config"]
+    outcome = declaration["outcome"]
+    invariant = declaration.get("invariant")
+    authority_outcome, authority_invariant = _authority_outcome(
+        lane_id, row_id, authority
+    )
+    claimed = {
+        "module": module_name,
+        "config": config_name,
+        "outcome": outcome,
+        "invariant": invariant,
+    }
+    authoritative = {
+        "module": authority.get("module"),
+        "config": authority.get("config"),
+        "outcome": authority_outcome,
+        "invariant": authority_invariant,
+    }
+    for field in claimed:
+        if claimed[field] != authoritative[field]:
+            raise Refusal(
+                f"lane {lane_id}/{row_id} {field} does not match its selection authority"
+            )
+    for field, name in (("module_sha256", module_name), ("config_sha256", config_name)):
+        expected_digest = authority.get(field)
+        if not isinstance(expected_digest, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", expected_digest
+        ):
+            raise Refusal(f"lane {lane_id}/{row_id} has an invalid authority {field}")
+        if _sha256(formal_root / name) != expected_digest:
+            raise Refusal(
+                f"lane {lane_id}/{row_id} {field} does not match the selected file"
+            )
+    row_digest = authority.get("row_sha256")
+    if not isinstance(row_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", row_digest):
+        raise Refusal(f"lane {lane_id}/{row_id} has an invalid authority row_sha256")
+    calculated = hashlib.sha256(
+        json.dumps(
+            {key: value for key, value in authority.items() if key != "row_sha256"},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    if calculated != row_digest:
+        raise Refusal(f"lane {lane_id}/{row_id} authority row digest does not match")
+    return authority
+
+
 def _prepare_lane(formal_root: Path, lane: dict[str, Any]) -> dict[str, Any]:
     lane_id = lane.get("id")
     if not isinstance(lane_id, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", lane_id):
@@ -89,11 +214,16 @@ def _prepare_lane(formal_root: Path, lane: dict[str, Any]) -> dict[str, Any]:
     rows = lane.get("rows")
     if not isinstance(rows, list) or not rows:
         raise Refusal(f"lane {lane_id} selects no rows")
+    contract = lane.get("result_contract", "log-markers")
+    if contract not in {"log-markers", "zstd-selected-jsonl"}:
+        raise Refusal(f"lane {lane_id} has an unknown result contract")
     runner_text = runner.read_text(errors="replace")
     binding_text = runner_text
     prepared_rows: list[dict[str, str]] = []
+    authority_bindings: dict[str, dict[str, Any]] = {}
     input_paths: dict[str, Path] = {str(runner.relative_to(formal_root)): runner}
     selection_authority_value = lane.get("selection_authority")
+    selection_rows: dict[str, dict[str, Any]] | None = None
     if selection_authority_value is not None:
         selection_authority = _relative_file(
             formal_root,
@@ -102,6 +232,9 @@ def _prepare_lane(formal_root: Path, lane: dict[str, Any]) -> dict[str, Any]:
         )
         input_paths[str(selection_authority.relative_to(formal_root))] = selection_authority
         binding_text += "\n" + selection_authority.read_text(errors="replace")
+        selection_rows = _load_selection_authority(selection_authority, lane_id)
+    if contract == "zstd-selected-jsonl" and selection_rows is None:
+        raise Refusal(f"lane {lane_id} requires a row selection authority")
     row_ids: set[str] = set()
     for index, raw in enumerate(rows):
         if not isinstance(raw, dict):
@@ -129,16 +262,24 @@ def _prepare_lane(formal_root: Path, lane: dict[str, Any]) -> dict[str, Any]:
             raise Refusal(f"lane {lane_id}/{row_id} is not selected by its runner")
         if invariant is not None and str(invariant) not in binding_text:
             raise Refusal(f"lane {lane_id}/{row_id} invariant is not bound by its runner")
-        prepared_rows.append(
-            {
-                "id": row_id,
-                "module": str(module_name),
-                "config": str(config_name),
-                "outcome": outcome,
-                **({"invariant": invariant} if invariant is not None else {}),
-                **({"marker": marker} if marker is not None else {}),
-            }
-        )
+        prepared = {
+            "id": row_id,
+            "module": str(module_name),
+            "config": str(config_name),
+            "outcome": outcome,
+            **({"invariant": invariant} if invariant is not None else {}),
+            **({"marker": marker} if marker is not None else {}),
+        }
+        prepared_rows.append(prepared)
+        if selection_rows is not None:
+            authority = selection_rows.get(row_id)
+            if authority is None:
+                raise Refusal(
+                    f"lane {lane_id}/{row_id} is absent from its selection authority"
+                )
+            authority_bindings[row_id] = _bind_authority_row(
+                formal_root, lane_id, row_id, prepared, authority
+            )
     extras = lane.get("extra_inputs", [])
     if not isinstance(extras, list):
         raise Refusal(f"lane {lane_id} extra_inputs is not a list")
@@ -151,9 +292,6 @@ def _prepare_lane(formal_root: Path, lane: dict[str, Any]) -> dict[str, Any]:
         for key, value in environment.items()
     ):
         raise Refusal(f"lane {lane_id} environment must contain string pairs")
-    contract = lane.get("result_contract", "log-markers")
-    if contract not in {"log-markers", "zstd-selected-jsonl"}:
-        raise Refusal(f"lane {lane_id} has an unknown result contract")
     return {
         "id": lane_id,
         "runner": runner,
@@ -162,6 +300,7 @@ def _prepare_lane(formal_root: Path, lane: dict[str, Any]) -> dict[str, Any]:
         "inputs": input_paths,
         "environment": environment,
         "result_contract": contract,
+        "authority_bindings": authority_bindings,
     }
 
 
@@ -194,7 +333,9 @@ def _terminate(process: subprocess.Popen[bytes]) -> None:
         process.wait()
 
 
-def _check_zstd_contract(state_root: Path, expected_ids: set[str]) -> list[str]:
+def _check_zstd_contract(
+    state_root: Path, expected_rows: dict[str, dict[str, Any]]
+) -> list[str]:
     problems: list[str] = []
     rows_path = state_root / "results.jsonl"
     summary_path = state_root / "suite-summary.json"
@@ -207,12 +348,31 @@ def _check_zstd_contract(state_root: Path, expected_ids: set[str]) -> list[str]:
         summary = json.loads(summary_path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
         return [f"cannot parse selected-row result contract: {exc}"]
-    observed = {row.get("id"): row for row in rows if row.get("status") != "not-started"}
+    selected = [row for row in rows if row.get("status") != "not-started"]
+    selected_ids = [row.get("id") for row in selected]
+    if len(selected_ids) != len(set(selected_ids)):
+        problems.append("selected-row result ledger contains duplicate identities")
+    observed = {row.get("id"): row for row in selected}
+    expected_ids = set(expected_rows)
     if set(observed) != expected_ids:
         problems.append("selected-row identities differ from the aggregate manifest")
     for row_id in sorted(expected_ids):
-        if observed.get(row_id, {}).get("status") != "pass":
+        result = observed.get(row_id, {})
+        if result.get("status") != "pass":
             problems.append(f"selected row did not pass: {row_id}")
+        for field in (
+            "module",
+            "config",
+            "module_sha256",
+            "config_sha256",
+            "expected_exit",
+            "expected_wait",
+            "expected_phase",
+            "expected",
+            "row_sha256",
+        ):
+            if result.get(field) != expected_rows[row_id].get(field):
+                problems.append(f"selected row authority mismatch: {row_id}/{field}")
     if summary.get("sany_status") != "pass":
         problems.append("SANY did not pass")
     if summary.get("selected_rows") != len(expected_ids):
@@ -292,7 +452,7 @@ def _run_lane(
                 problems.append(f"missing row marker: {row['id']}")
     else:
         problems.extend(
-            _check_zstd_contract(state_root, {row["id"] for row in lane["rows"]})
+            _check_zstd_contract(state_root, lane["authority_bindings"])
         )
     result = {
         "id": lane["id"],

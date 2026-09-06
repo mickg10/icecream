@@ -11,7 +11,7 @@ case "$PORTABLE" in 0|1) ;; *) echo 'FAIL: S6_PORTABLE_EXECUTION must be 0 or 1'
 SPEC=$(printenv S6_V5_SPEC_PATH 2>/dev/null || true)
 if test "$PORTABLE" = 1; then
   test -n "$SPEC" || SPEC=$D/PORTABLE_EXECUTION_AUTHORITY.md
-  SPEC_SHA=3e4db896b0d119aa63088495017c476cf987c4da50f556bf4e009b29f27012f6
+  SPEC_SHA=65224f139984f4dbb453f2f94f833c86c56257a3f8b01767f047c91a642e79da
   EXECUTION_MODE=portable-source
 else
   test -n "$SPEC" || SPEC=/tmp/s6-zstd-route-finput-v5-correction-spec-20260828.md

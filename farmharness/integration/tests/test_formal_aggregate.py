@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
 import json
@@ -7,6 +8,8 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -123,6 +126,45 @@ def test_packaged_manifest_selects_every_formal_lane_and_preflights() -> None:
         make_text = (ROOT / makefile).read_text()
         target = make_text.split("protocol50-formal:", 1)[1]
         assert "run_formal_aggregate.py" in target
+
+
+def test_zstd_declaration_must_match_its_same_id_authority_row() -> None:
+    runner = _load_runner()
+    manifest = runner._load_manifest(FORMAL / "formal_aggregate_manifest.json")
+    lane = copy.deepcopy(manifest["lanes"][-1])
+    lane["rows"][0]["config"] = "Protocol50ZstdRouteCollapsedTUMutant.cfg"
+    lane["rows"][0]["invariant"] = "DistinctOperationTUs"
+    with pytest.raises(
+        runner.Refusal, match="core-05 config does not match its selection authority"
+    ):
+        runner._prepare_lane(FORMAL, lane)
+
+
+def test_zstd_returned_row_must_match_the_bound_authority(tmp_path: Path) -> None:
+    runner = _load_runner()
+    state = tmp_path / "state"
+    state.mkdir()
+    expected = {
+        "row-1": {
+            "id": "row-1",
+            "module": "Model.tla",
+            "config": "Expected.cfg",
+            "module_sha256": "1" * 64,
+            "config_sha256": "2" * 64,
+            "expected_exit": 12,
+            "expected_wait": "nonzero",
+            "expected_phase": "invariant",
+            "expected": "ExpectedInvariant",
+            "row_sha256": "3" * 64,
+        }
+    }
+    returned = {**expected["row-1"], "status": "pass", "config": "Other.cfg"}
+    (state / "results.jsonl").write_text(json.dumps(returned) + "\n")
+    (state / "suite-summary.json").write_text(
+        json.dumps({"sany_status": "pass", "selected_rows": 1}) + "\n"
+    )
+    problems = runner._check_zstd_contract(state, expected)
+    assert "selected row authority mismatch: row-1/config" in problems
 
 
 def test_aggregate_retains_authenticated_unique_success_bundles(tmp_path: Path) -> None:

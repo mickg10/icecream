@@ -33,6 +33,14 @@ cannot be presented as a complete 87-row matrix.  Every selected row must be
 `pass`; a partial, held, timed-out, missing, or skipped selected row fails the
 aggregate target.
 
+Each selected aggregate declaration is bound to the authority entry with the
+same row ID before any lane starts.  Module, configuration, normalized
+clean/expected-failure outcome, invariant (including the authority's
+`initial:` encoding), file digests, and canonical row digest must agree.  The
+returned selected-row ledger is checked again against the bound module,
+configuration, digests, expected exit/wait/phase/diagnostic, and row digest;
+an ID-only or cross-row match cannot pass.
+
 Historical S6 review still uses the original default mode, pinned correction
 specification digest, Git ancestry, single-parent, and clean-worktree checks.
 Portable execution is enabled only by the aggregate runner through
