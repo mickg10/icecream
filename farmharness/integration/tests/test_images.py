@@ -36,6 +36,10 @@ INTEGRATION = Path(__file__).resolve().parents[1]
 REPO = INTEGRATION.parents[1]
 GOOD_ID = "sha256:" + "1" * 64
 BAD_ID = "sha256:" + "2" * 64
+REQUIRES_GIT_HISTORY = pytest.mark.skipif(
+    not (REPO / ".git").exists(),
+    reason="requires a Git checkout to verify historical source-archive authority",
+)
 
 
 def _inspect_json(native_id: str, marker: str = "same") -> str:
@@ -146,6 +150,7 @@ def _farm():
     "label",
     ("p43-1.4.0", "p50-4c994915", "p50s2-624702e9"),
 )
+@REQUIRES_GIT_HISTORY
 def test_each_source_archive_matches_immutable_authority(
     label: str, tmp_path: Path
 ) -> None:
@@ -181,6 +186,7 @@ def test_role_entrypoints_use_the_foundation_portable_runtime_account() -> None:
         assert '-u "$runtime_user"' in entrypoint
 
 
+@REQUIRES_GIT_HISTORY
 def test_archive_hash_mismatch_is_removed_and_refused(tmp_path: Path) -> None:
     binding = image_bindings(_farm(), ["p50s2-624702e9"])[0]
     bad = dataclasses.replace(binding, archive_sha256="f" * 64)
@@ -319,13 +325,25 @@ def test_authority_bound_cached_product_image_skips_rebuild(tmp_path: Path) -> N
     ]
 
 
-def test_uncaptured_candidate_product_image_is_always_rebuilt(tmp_path: Path) -> None:
+def test_uncaptured_candidate_product_image_is_always_rebuilt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     farm = load_farm_spec(INTEGRATION / "farm.example.json")
     binding = image_bindings(
         farm, ["p50s30-f-refusal-mutant-candidate"]
     )[0]
     assert binding.expected_closure is None
     recorder = RecordingTransport(ScriptedRecorder())
+    prepared: list[tuple[Path, object, Path]] = []
+
+    def prepare(repo: Path, selected: object, context: Path) -> None:
+        prepared.append((repo, selected, context))
+        context.mkdir(parents=True)
+        (context / "source.tar").write_bytes(b"source-archive-fixture")
+
+    monkeypatch.setattr(
+        "farmharness.integration.images.prepare_build_context", prepare
+    )
 
     _observed, built = ensure_product_image(
         farm,
@@ -338,6 +356,7 @@ def test_uncaptured_candidate_product_image_is_always_rebuilt(tmp_path: Path) ->
     )
 
     assert built is True
+    assert prepared == [(REPO, binding, tmp_path / "candidate-context")]
     assert (tmp_path / "candidate-context" / "source.tar").is_file()
     assert any(command.phase == "images.build" for command in recorder.commands)
     assert all(
