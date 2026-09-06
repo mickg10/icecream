@@ -3481,9 +3481,27 @@ static bool handle_job_done(CompileServer *cs, Msg *_m)
         return true;
     }
 
-    if (m->assignmentEpoch() != j->assignmentEpoch()
-        || m->assignmentNonce() != j->assignmentNonce()
-        || m->cGuid() != j->cGuid() || m->tuSeq() != j->tuSeq()) {
+    const bool assignment_identity_matches =
+        m->assignmentEpoch() == j->assignmentEpoch() &&
+        m->assignmentNonce() == j->assignmentNonce();
+    const bool compile_identity_matches =
+        m->cGuid() == j->cGuid() && m->tuSeq() == j->tuSeq();
+    /* A selected protocol-50 F can fail after claiming the exact fenced
+       assignment but before CompileFile reaches it (for example, a bounded
+       cache-session refusal or source-arm deadline).  At that boundary F
+       owns {job, epoch, nonce}, but has never received {C_GUID, TU_SEQ}.
+       Accept a wholly-absent compile identity only for that non-success
+       worker terminal while the scheduler still has no JobBegin.  The
+       selected-worker authority check immediately below remains mandatory;
+       successes, submitter terminals, begun compiles, partial identities,
+       and every assignment mismatch still fail closed. */
+    const bool exact_precompile_worker_failure =
+        assignment_identity_matches && m->is_from_server() &&
+        m->exitcode != 0 && j->assignmentFenced() &&
+        j->state() == Job::WAITINGFORCS && j->cGuid() != 0 &&
+        m->cGuid() == 0 && m->tuSeq() == 0;
+    if (!assignment_identity_matches ||
+        (!compile_identity_matches && !exact_precompile_worker_failure)) {
         log_info() << "terminal assignment/compile identity mismatch for job "
                    << m->job_id << endl;
         handle_end(cs, nullptr);

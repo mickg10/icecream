@@ -519,6 +519,82 @@ static JobDoneMsg job_done_for(const UseCSMsg &use, int exitcode,
                       use.cGuid(), use.tuSeq());
 }
 
+static void run_precompile_worker_terminal(const std::string &binary,
+                                           const std::string &directory)
+{
+    const int port = reserve_port_pair();
+    const std::string log = directory + "/precompile-worker-terminal.log";
+    pid_t scheduler = start_scheduler(
+        binary, port, "enforcing-compat", log);
+    REQUIRE(port != 0 && scheduler > 0,
+            "pre-compile worker-terminal scheduler process launched");
+
+    int worker_port = 0;
+    int worker_listener = bind_port(0, &worker_port);
+    if (worker_listener >= 0) listen(worker_listener, 16);
+    ConfCSMsg *worker_conf = nullptr;
+    MsgChannel *worker = login_host(port, "precompile-worker", true,
+                                    worker_port, &worker_conf);
+    delete worker_conf;
+    ConfCSMsg *submitter_conf = nullptr;
+    MsgChannel *submitter = login_host(port, "precompile-submit", false, 0,
+                                       &submitter_conf);
+    delete submitter_conf;
+    REQUIRE(worker && submitter && request_job(submitter, 9901),
+            "pre-compile failure assignment requested");
+
+    AssignPrepareMsg *first = wait_prepare(worker);
+    if (first) {
+        worker->send_msg(AssignReadyMsg(first->epoch(), first->wire_id,
+                                        first->nonce()));
+    }
+    UseCSMsg *first_use = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(first && first_use && first_use->job_id == first->wire_id &&
+                first_use->cGuid() != 0,
+            "pre-compile failure has an exposed fenced assignment");
+
+    if (first_use) {
+        worker->send_msg(JobDoneMsg(
+            first_use->job_id, 149, JobDoneMsg::FROM_SERVER, 0,
+            first_use->assignmentEpoch(), first_use->assignmentNonce(), 0, 0));
+    }
+    usleep(100 * 1000);
+    REQUIRE(submitter && request_job(submitter, 9902),
+            "assignment requested after exact pre-compile worker failure");
+    AssignPrepareMsg *second = wait_prepare(worker);
+    REQUIRE(first && second && second->wire_id == first->wire_id &&
+                second->nonce() != first->nonce(),
+            "pre-compile worker failure preserves F and releases the job id");
+
+    if (second) {
+        worker->send_msg(AssignReadyMsg(second->epoch(), second->wire_id,
+                                        second->nonce()));
+    }
+    UseCSMsg *second_use = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(second && second_use && second_use->job_id == second->wire_id,
+            "post-failure assignment reaches the preserved worker");
+    if (second_use) {
+        worker->send_msg(JobBeginMsg(second_use->job_id, 0));
+        worker->send_msg(JobDoneMsg(
+            second_use->job_id, 149, JobDoneMsg::FROM_SERVER, 0,
+            second_use->assignmentEpoch(), second_use->assignmentNonce(), 0, 0));
+    }
+    REQUIRE(wait_eof(worker, 3000),
+            "a begun compile still rejects an absent compile identity");
+
+    delete second_use;
+    delete second;
+    delete first_use;
+    delete first;
+    delete submitter;
+    delete worker;
+    if (worker_listener >= 0) close(worker_listener);
+    REQUIRE(stop_scheduler(scheduler),
+            "pre-compile worker-terminal scheduler stopped cleanly");
+}
+
 static void run_enforcing(const std::string &binary,
                           const std::string &directory)
 {
@@ -1873,6 +1949,7 @@ int main(int argc, char **argv)
     if (!directory) return 2;
     std::fprintf(stderr, "retained work directory: %s\n", directory);
     signal(SIGPIPE, SIG_IGN);
+    run_precompile_worker_terminal(argv[1], directory);
     run_enforcing(argv[1], directory);
     run_prepare_credit(argv[1], directory);
     run_ready_nested_teardown(argv[1], directory);
