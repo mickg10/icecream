@@ -6,6 +6,8 @@ import subprocess
 
 import pytest
 
+from farmharness.integration.tests import farm_fixture
+
 from farmharness.integration import farmtest
 from farmharness.integration.farm_spec import load_farm_spec
 from farmharness.integration.images import RecordingTransport
@@ -28,7 +30,7 @@ INTEGRATION = Path(__file__).resolve().parents[1]
 
 
 def _farm_scenario_plan(tmp_path: Path):
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path)
     scenario = load_scenario_spec(INTEGRATION / "scenarios" / "S00-smoke.json", farm)
     plan = farmtest.build_plan(farm, scenario, run_id="workload-unit")
@@ -217,7 +219,7 @@ def test_checkpoint_writer_accepts_only_exact_result_identity(tmp_path: Path) ->
 def test_control_workload_disables_strict_mode_to_observe_the_fault(
     tmp_path: Path,
 ) -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path)
     scenario = load_scenario_spec(
         INTEGRATION / "scenarios" / "H2-client-kill-switch.json", farm
@@ -241,7 +243,7 @@ def test_control_workload_disables_strict_mode_to_observe_the_fault(
 def test_h4_passes_one_typed_object_corruption_fault_in_driver_argv(
     tmp_path: Path,
 ) -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path)
     scenario = load_scenario_spec(
         INTEGRATION / "scenarios" / "H4-corrupt-object.json", farm
@@ -275,7 +277,7 @@ def test_workload_requires_authenticated_up_receipt(tmp_path: Path) -> None:
 
 
 def test_single_manifest_refuses_an_undefined_turn(tmp_path: Path) -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     scenario = json.loads((INTEGRATION / "scenarios" / "S00-smoke.json").read_text())
     scenario["workload"]["turns"] = ["B"]
     path = tmp_path / "scenario.json"
@@ -304,7 +306,7 @@ def test_ssh_transport_keeps_driver_values_inside_encoded_argv(tmp_path: Path) -
 def test_paired_workload_materializes_only_b_between_sequential_turns(
     tmp_path: Path,
 ) -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path)
     scenario = load_scenario_spec(
         INTEGRATION / "scenarios" / "S40-full-newgen-engagement.json", farm
@@ -343,7 +345,7 @@ def test_paired_workload_materializes_only_b_between_sequential_turns(
 def test_s50_runs_old_and_new_clients_concurrently_in_one_turn(
     tmp_path: Path,
 ) -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path)
     scenario = load_scenario_spec(
         INTEGRATION / "scenarios" / "S50-mixed-pool-fmt.json", farm

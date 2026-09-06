@@ -253,6 +253,12 @@ EXTRA_DIST = \
 	../vendor/grouprlz/grz2g.cpp \
 	formal/README.md
 
+# The historical explicit list above remains compatible, while this reviewed
+# manifest closes omissions as new formal lanes and mutant configs are added.
+P50_FORMAL_DIST_MANIFEST = $(srcdir)/formal/DISTFILES
+P50_FORMAL_DIST_FILES = $(shell sed -e '/^[[:space:]]*$$/d' "$(P50_FORMAL_DIST_MANIFEST)")
+EXTRA_DIST += formal/DISTFILES $(P50_FORMAL_DIST_FILES)
+
 check-local:
 	python3 $(srcdir)/key_layout_census.py \
 		--root $(top_srcdir) --check $(srcdir)/KEY_LAYOUT_V1_CENSUS.md

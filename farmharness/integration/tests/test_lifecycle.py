@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from farmharness.integration.tests import farm_fixture
+
 from farmharness.integration import farmtest
 from farmharness.integration.farm_spec import load_farm_spec
 from farmharness.integration.images import (
@@ -66,7 +68,7 @@ def _inspect_document(farm, label: str) -> dict[str, object]:
 
 
 def test_mutant_image_labels_bind_base_source_and_mutant_recipe() -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     authority = farm.data["authority"]["images"]["p50s4-h3-tail-mutant"]
 
     assert _expected_image_labels(authority) == {
@@ -78,7 +80,7 @@ def test_mutant_image_labels_bind_base_source_and_mutant_recipe() -> None:
 
 
 def _farm_scenario_plan(tmp_path: Path, *, up_s: int = 5):
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path)
     scenario = load_scenario_spec(INTEGRATION / "scenarios" / "S00-smoke.json", farm)
     label = scenario.data["images"]["new"]

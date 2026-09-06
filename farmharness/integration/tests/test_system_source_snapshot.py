@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from farmharness.integration.tests import farm_fixture
+
 from farmharness.integration import farmtest
 from farmharness.integration.farm_spec import FarmSpec, FarmSpecError, load_farm_spec
 from farmharness.integration.scenario_spec import ScenarioSpec, load_scenario_spec
@@ -33,7 +35,7 @@ INTEGRATION = Path(__file__).resolve().parents[1]
 
 
 def _snapshot_farm() -> FarmSpec:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     data = copy.deepcopy(farm.data)
     data["system_source_snapshots"] = {
         "stable-f-source": {

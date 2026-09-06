@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from farmharness.integration.tests import farm_fixture
+
 from farmharness import newgen_farm_env
 from farmharness.integration.farm_spec import load_farm_spec
 
@@ -14,7 +16,7 @@ INTEGRATION = Path(__file__).resolve().parents[1]
 
 
 def _inputs():
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     instances = [
         {
             "name": "S1",

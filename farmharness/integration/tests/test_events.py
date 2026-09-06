@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from farmharness.integration.tests import farm_fixture
+
 from farmharness.integration import farmtest
 from farmharness.integration.collect import CollectError, _event_log
 from farmharness.integration.events import (
@@ -48,7 +50,7 @@ INTEGRATION = Path(__file__).resolve().parents[1]
 
 
 def _fixture(tmp_path: Path):
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path)
     scenario = load_scenario_spec(INTEGRATION / "scenarios" / "S00-smoke.json", farm)
     plan = farmtest.build_plan(farm, scenario, run_id="event-unit")
@@ -444,7 +446,7 @@ class HeaderEditRecorder(EventRecorder):
 def test_header_edit_is_scoped_drained_and_rejoined_with_fingerprint_receipt(
     tmp_path: Path,
 ) -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path)
     scenario = load_scenario_spec(
         INTEGRATION / "scenarios" / "S40-engagement-fmt.json", farm
@@ -656,7 +658,7 @@ def test_event_gate_pause_drains_then_resume_is_atomic(tmp_path: Path) -> None:
 
 
 def test_scheduler_restart_pauses_drains_reauthenticates_and_resumes(tmp_path: Path) -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path)
     scenario = load_scenario_spec(
         INTEGRATION / "scenarios" / "S20-scheduler-first.json", farm
@@ -808,7 +810,7 @@ def test_scheduler_restart_pauses_drains_reauthenticates_and_resumes(tmp_path: P
 def test_scheduler_restart_failure_aborts_every_paused_client(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path)
     scenario = load_scenario_spec(
         INTEGRATION / "scenarios" / "S20-scheduler-first.json", farm
@@ -875,7 +877,7 @@ def test_scheduler_restart_failure_aborts_every_paused_client(
 def test_worker_restart_stays_live_and_emits_collectable_rejoin_receipt(
     tmp_path: Path,
 ) -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path)
     scenario = load_scenario_spec(
         INTEGRATION / "scenarios" / "S70-b4-worker-bounces.json", farm
@@ -1017,7 +1019,7 @@ def test_worker_restart_stays_live_and_emits_collectable_rejoin_receipt(
 
 
 def test_upgrade_and_downgrade_direction_is_fail_closed(tmp_path: Path) -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path)
     scenario = load_scenario_spec(INTEGRATION / "scenarios" / "S20-scheduler-first.json", farm)
     plan = farmtest.build_plan(farm, scenario, run_id="event-unit")
@@ -1045,7 +1047,7 @@ def test_client_generation_transition_owns_explicit_mode(
     target_alias: str,
     expected_env: dict[str, str],
 ) -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     scenario = load_scenario_spec(
         INTEGRATION / "scenarios" / f"{scenario_id}.json", farm
     )
@@ -1084,7 +1086,7 @@ def test_client_generation_transition_owns_explicit_mode(
 def test_collector_independently_rejects_non_directional_transition_receipt(
     tmp_path: Path, action: str, initial_alias: str, target_alias: str
 ) -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path)
     scenario = load_scenario_spec(
         INTEGRATION / "scenarios" / "S20-scheduler-first.json", farm
@@ -1924,7 +1926,7 @@ class CoordinatedTransitionRecorder(TransitionRecorder):
 
 
 def test_s_f_transition_pauses_rejoins_and_resumes_with_strict_receipt(tmp_path: Path) -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path)
     scenario = load_scenario_spec(INTEGRATION / "scenarios" / "S20-scheduler-first.json", farm)
     scenario.data["timeline"] = [
@@ -1974,7 +1976,7 @@ def test_s_f_transition_pauses_rejoins_and_resumes_with_strict_receipt(tmp_path:
 
 
 def test_scheduler_transition_requires_fresh_workers_and_all_clients(tmp_path: Path) -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path)
     scenario = load_scenario_spec(INTEGRATION / "scenarios" / "S20-scheduler-first.json", farm)
     old_scheduler = next(item for item in scenario.data["instances"] if item["name"] == "S1")
@@ -2081,7 +2083,7 @@ def test_daemon_transition_aborts_paused_clients_on_missing_rejoin(tmp_path: Pat
                 )
             return super().invoke(command)
 
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path)
     scenario = load_scenario_spec(INTEGRATION / "scenarios" / "S20-scheduler-first.json", farm)
     scenario.data["timeline"] = [
@@ -2120,7 +2122,7 @@ def test_daemon_transition_aborts_paused_clients_on_missing_rejoin(tmp_path: Pat
 
 
 def test_upgrade_materializes_target_and_restarts_exact_container_with_receipt(tmp_path: Path) -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path)
     scenario = load_scenario_spec(INTEGRATION / "scenarios" / "S20-scheduler-first.json", farm)
     scenario.data["timeline"] = [
@@ -2262,7 +2264,7 @@ def test_scheduler_kill_switch_cycle_preserves_exact_state_chain(tmp_path: Path)
 def test_b6_delayed_poll_requires_a_new_dispatch_before_restore(
     tmp_path: Path,
 ) -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path)
     scenario = load_scenario_spec(
         INTEGRATION / "scenarios" / "S70-b6-kill-switch.json", farm
@@ -2426,7 +2428,7 @@ def test_same_host_same_label_preflight_is_scoped_by_role(tmp_path: Path) -> Non
 def test_transition_receipt_tampering_is_rejected(
     tmp_path: Path, action: str, side: str, key: str
 ) -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path)
     scenario = load_scenario_spec(INTEGRATION / "scenarios" / "S20-scheduler-first.json", farm)
     if action == "downgrade":
@@ -2627,7 +2629,7 @@ def _b5_row(
 def test_job_triggered_client_fault_uses_checkpoint_path_and_passes_b5_verdict(
     tmp_path: Path,
 ) -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path)
     scenario = load_scenario_spec(
         INTEGRATION / "scenarios" / "S70-b5-interner-failure.json", farm
@@ -2769,7 +2771,7 @@ def test_job_triggered_client_fault_uses_checkpoint_path_and_passes_b5_verdict(
 def test_job_triggered_client_env_set_requires_callbacks_and_is_unique(
     tmp_path: Path,
 ) -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path)
     scenario = load_scenario_spec(
         INTEGRATION / "scenarios" / "S70-b5-interner-failure.json", farm

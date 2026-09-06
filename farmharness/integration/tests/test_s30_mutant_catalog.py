@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from farmharness.integration.tests import farm_fixture
+
 from farmharness.integration import farmtest
 from farmharness.integration.farm_spec import load_farm_spec
 from farmharness.integration.scenario_spec import load_scenario_spec
@@ -30,7 +32,7 @@ def test_s30_mutant_f_refusal_is_a_checked_in_single_cell() -> None:
 
 
 def test_s30_mutant_f_resolves_the_hash_bound_unpromoted_candidate() -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     path = INTEGRATION / "scenarios" / "S30-mutant-f-refusal.json"
     scenario = load_scenario_spec(path, farm)
     plan = farmtest.build_plan(farm, scenario, run_id="s30-mutant-dry-plan")

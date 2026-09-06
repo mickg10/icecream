@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from farmharness.integration.tests import farm_fixture
+
 from farmharness.integration import farmtest
 from farmharness.integration.farm_spec import load_farm_spec
 from farmharness.integration.lifecycle import PreflightRefusal
@@ -20,7 +22,7 @@ INTEGRATION = Path(__file__).resolve().parents[1]
 
 
 def _cell(tmp_path: Path):
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path)
     scenario = load_scenario_spec(INTEGRATION / "scenarios" / "S00-smoke.json", farm)
     plan = farmtest.build_plan(farm, scenario, run_id="scenario-unit")

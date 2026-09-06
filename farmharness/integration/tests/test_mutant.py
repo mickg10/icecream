@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from farmharness.integration.tests import farm_fixture
+
 from farmharness.integration import farmtest
 from farmharness.integration.collect import _h3_control_failure_observations
 from farmharness.integration.farm_spec import FarmSpecError, load_farm_spec
@@ -27,7 +29,7 @@ INTEGRATION = Path(__file__).resolve().parents[1]
 
 
 def _farm():
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     # Static plan/collector tests need a resolved current-F image but must not
     # claim that the not-yet-built successor has a measured live closure.
     farm.data["authority"]["images"]["p50s4-89917385"]["closure_sha256"] = "a" * 64
@@ -101,7 +103,7 @@ def test_s90_revision_two_recipe_is_exactly_derived_from_sealed_b42() -> None:
 
 
 def test_daemon_mutant_candidate_is_build_selectable_without_runtime_authority() -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     [binding] = image_bindings(farm, ["p50s30-f-refusal-mutant-candidate"])
     assert binding.kind == "daemon-mutant"
     assert binding.base_commit == "8991738525d2d34aaafeabeb6ef6790daa79fdfe"
@@ -137,7 +139,7 @@ def test_daemon_mutant_uses_only_authority_bound_daemon_role_override() -> None:
 
 
 def test_farm_refuses_tampered_mutant_recipe(tmp_path: Path) -> None:
-    document = json.loads((INTEGRATION / "farm.example.json").read_text())
+    document = json.loads((farm_fixture.example_farm_path()).read_text())
     document["authority"]["images"]["p50s4-h3-tail-mutant"]["patch_sha256"] = "0" * 64
     path = tmp_path / "farm.json"
     path.write_text(json.dumps(document), encoding="utf-8")
@@ -146,7 +148,7 @@ def test_farm_refuses_tampered_mutant_recipe(tmp_path: Path) -> None:
 
 
 def test_farm_refuses_malformed_mutant_role_override(tmp_path: Path) -> None:
-    document = json.loads((INTEGRATION / "farm.example.json").read_text())
+    document = json.loads((farm_fixture.example_farm_path()).read_text())
     document["authority"]["images"]["p50s4-h3-tail-mutant"]["role_overrides"] = {
         "scheduler": {"sha256": "not-a-digest"}
     }

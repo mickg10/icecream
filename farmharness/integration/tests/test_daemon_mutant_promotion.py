@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from farmharness.integration.tests import farm_fixture
+
 from farmharness.integration.daemon_mutant_promotion import (
     DaemonMutantPromotionError,
     promote_daemon_mutant,
@@ -32,7 +34,7 @@ ROLE_SHA = "d" * 64
 
 
 def _farm():
-    return load_farm_spec(INTEGRATION / "farm.example.json")
+    return load_farm_spec(farm_fixture.example_farm_path())
 
 
 def _receipt(farm, label: str = LABEL):
@@ -193,7 +195,7 @@ def test_promoted_document_discards_stale_capture_without_mutating_input(tmp_pat
 
 
 def test_promotion_cli_writes_valid_uncaptured_output_once(tmp_path: Path) -> None:
-    farm_path = INTEGRATION / "farm.example.json"
+    farm_path = farm_fixture.example_farm_path()
     farm = load_farm_spec(farm_path)
     receipt_path = tmp_path / "images.json"
     receipt_path.write_text(json.dumps(_receipt(farm)), encoding="utf-8")
@@ -216,7 +218,7 @@ def test_promotion_cli_writes_valid_uncaptured_output_once(tmp_path: Path) -> No
 def test_promotion_cli_refuses_non_object_receipt(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    farm_path = INTEGRATION / "farm.example.json"
+    farm_path = farm_fixture.example_farm_path()
     receipt_path = tmp_path / "images.json"
     receipt_path.write_text("[]", encoding="utf-8")
     output = tmp_path / "farm-promoted.json"
@@ -232,7 +234,7 @@ def test_promotion_cli_refuses_non_object_receipt(
 def test_promotion_cli_refuses_dangling_symlink_output(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    farm_path = INTEGRATION / "farm.example.json"
+    farm_path = farm_fixture.example_farm_path()
     farm = load_farm_spec(farm_path)
     receipt_path = tmp_path / "images.json"
     receipt_path.write_text(json.dumps(_receipt(farm)), encoding="utf-8")
@@ -250,7 +252,7 @@ def test_promotion_cli_refuses_dangling_symlink_output(
 def test_promotion_cli_refuses_destination_created_after_initial_check(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    farm_path = INTEGRATION / "farm.example.json"
+    farm_path = farm_fixture.example_farm_path()
     farm = load_farm_spec(farm_path)
     receipt_path = tmp_path / "images.json"
     receipt_path.write_text(json.dumps(_receipt(farm)), encoding="utf-8")

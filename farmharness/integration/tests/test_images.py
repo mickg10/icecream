@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from farmharness.integration.tests import farm_fixture
+
 from farmharness.integration import farmtest
 from farmharness.integration.farm_spec import load_farm_spec
 from farmharness.integration.images import (
@@ -140,7 +142,7 @@ class ScriptedRecorder:
 
 
 def _farm():
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     for image in farm.data["authority"]["images"].values():
         image["closure_sha256"] = GOOD_IDENTITY.closure_sha256
     return farm
@@ -328,7 +330,7 @@ def test_authority_bound_cached_product_image_skips_rebuild(tmp_path: Path) -> N
 def test_uncaptured_candidate_product_image_is_always_rebuilt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     binding = image_bindings(
         farm, ["p50s30-f-refusal-mutant-candidate"]
     )[0]
@@ -494,7 +496,7 @@ def test_farmtest_images_cli_selects_only_requested_authority_labels(
         [
             "images",
             "--farm",
-            str(INTEGRATION / "farm.example.json"),
+            str(farm_fixture.example_farm_path()),
             "--labels",
             "p43-1.4.0,p50s2-624702e9",
             "--repo",
@@ -674,7 +676,7 @@ def test_farmtest_foundations_cli_uses_scenario_specific_targets(
         [
             "images",
             "--farm",
-            str(INTEGRATION / "farm.example.json"),
+            str(farm_fixture.example_farm_path()),
             "--foundations",
             "--scenario",
             str(INTEGRATION / "scenarios" / "S00-smoke.json"),

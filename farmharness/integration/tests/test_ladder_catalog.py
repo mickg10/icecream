@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from farmharness.integration.tests import farm_fixture
+
 from farmharness.integration import farmtest
 from farmharness.integration.events import EventProducer
 from farmharness.integration.farm_spec import load_farm_spec
@@ -27,7 +29,7 @@ def test_checked_in_harness_gate_suites_are_exact_and_complete() -> None:
 
 
 def test_s20_scheduler_first_is_a_real_restart_cell() -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     scenario = load_scenario_spec(
         INTEGRATION / "scenarios" / "S20-scheduler-first.json", farm
     )
@@ -58,7 +60,7 @@ def test_s20_scheduler_first_is_a_real_restart_cell() -> None:
 
 
 def test_s20_suite_runs_fmt_then_three_fresh_firefox_restart_pairs() -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     smoke = load_scenario_spec(
         INTEGRATION / "scenarios" / "S20-scheduler-first-smoke.json", farm
     )
@@ -77,7 +79,7 @@ def test_s20_suite_runs_fmt_then_three_fresh_firefox_restart_pairs() -> None:
 
 
 def test_s30_old_f_suite_is_legacy_for_new_client_and_runs_three_pairs() -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     for scenario_id, corpus, turns in (
         ("S30-old-f-smoke", "fmt-100", ["A"]),
         ("S30-old-f-firefox", "firefox-1000", ["A", "B"]),
@@ -106,7 +108,7 @@ def test_s30_old_f_suite_is_legacy_for_new_client_and_runs_three_pairs() -> None
 
 
 def test_s30_client_route_owner_restart_is_a_real_midbuild_legacy_cell() -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     scenario = load_scenario_spec(
         INTEGRATION / "scenarios" / "S30-old-f-client-restart.json", farm
     )
@@ -133,7 +135,7 @@ def test_s30_client_route_owner_restart_is_a_real_midbuild_legacy_cell() -> None
 
 
 def test_s10_firefox_baseline_is_the_two_turn_legacy_pair() -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     scenario = load_scenario_spec(
         INTEGRATION / "scenarios" / "S10-baseline-firefox.json", farm
     )
@@ -161,7 +163,7 @@ def test_s10_suite_runs_fmt_then_three_fresh_firefox_pairs() -> None:
 
 
 def test_s70_b5_is_a_serial_one_shot_interner_failure_cell() -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     scenario = load_scenario_spec(
         INTEGRATION / "scenarios" / "S70-b5-interner-failure.json", farm
     )
@@ -190,7 +192,7 @@ def test_s70_b5_is_a_serial_one_shot_interner_failure_cell() -> None:
 
 
 def test_s70_b4_scheduler_restart_is_midbuild_and_inflight() -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     scenario = load_scenario_spec(
         INTEGRATION / "scenarios" / "S70-b4-scheduler-restart.json", farm
     )
@@ -207,7 +209,7 @@ def test_s70_b4_scheduler_restart_is_midbuild_and_inflight() -> None:
 
 
 def test_s70_b4_client_restart_is_serial_and_warm_before_the_event() -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     scenario = load_scenario_spec(
         INTEGRATION / "scenarios" / "S70-b4-client-route-restart.json", farm
     )
@@ -226,7 +228,7 @@ def test_s70_b4_client_restart_is_serial_and_warm_before_the_event() -> None:
 
 
 def test_s70_b4_worker_bounce_runs_three_30_second_flaps() -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     scenario = load_scenario_spec(
         INTEGRATION / "scenarios" / "S70-b4-worker-bounces.json", farm
     )
@@ -245,7 +247,7 @@ def test_s70_b4_worker_bounce_runs_three_30_second_flaps() -> None:
 
 
 def test_s70_b6_is_a_serial_scheduler_kill_switch_cycle() -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     scenario = load_scenario_spec(
         INTEGRATION / "scenarios" / "S70-b6-kill-switch.json", farm
     )
@@ -281,7 +283,7 @@ def test_s70_b6_is_a_serial_scheduler_kill_switch_cycle() -> None:
 
 
 def test_s70_b7_is_an_ordered_rollback_then_rollforward_pair() -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     expected = {
         "S70-b7-rollback": (
             "s70-b7-rollback",
@@ -337,7 +339,7 @@ def test_s70_b7_is_an_ordered_rollback_then_rollforward_pair() -> None:
 
 
 def test_s90_revision_skew_resolves_one_compatible_and_one_legacy_pair() -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     scenario = load_scenario_spec(
         INTEGRATION / "scenarios" / "S90-revision-skew.json", farm
     )
@@ -372,7 +374,7 @@ def test_s90_revision_skew_resolves_one_compatible_and_one_legacy_pair() -> None
 
 
 def test_s95_disk_fill_mount_is_bounded_and_only_replaces_the_target_cache() -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     scenario = load_scenario_spec(
         INTEGRATION / "scenarios" / "S95-cache-disk-full.json", farm
     )

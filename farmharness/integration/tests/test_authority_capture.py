@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from farmharness.integration.tests import farm_fixture
+
 from farmharness.integration import authority, farmtest
 from farmharness.integration.farm_spec import FarmSpecError, load_farm_spec
 from farmharness.integration.remote import CommandResult, decode_ssh_payload
@@ -27,7 +29,7 @@ DOCKER_INFO = {
 
 
 def _farm(tmp_path: Path):
-    document = json.loads((INTEGRATION / "farm.example.json").read_text(encoding="utf-8"))
+    document = json.loads((farm_fixture.example_farm_path()).read_text(encoding="utf-8"))
     path = tmp_path / "farm-template.json"
     path.write_bytes(canonical_bytes(document))
     return path, load_farm_spec(path)

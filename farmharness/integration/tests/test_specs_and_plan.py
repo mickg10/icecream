@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from farmharness.integration.tests import farm_fixture
+
 from farmharness.integration import farmtest
 from farmharness.integration.farm_spec import FarmSpecError, load_farm_spec
 from farmharness.integration.remote import (
@@ -28,7 +30,7 @@ INTEGRATION = Path(__file__).resolve().parents[1]
 
 
 def _documents() -> tuple[dict[str, object], dict[str, object]]:
-    farm = json.loads((INTEGRATION / "farm.example.json").read_text())
+    farm = json.loads((farm_fixture.example_farm_path()).read_text())
     scenario = json.loads((INTEGRATION / "scenarios" / "S00-smoke.json").read_text())
     return farm, scenario
 
@@ -50,7 +52,7 @@ def _load(tmp_path: Path, farm: dict[str, object], scenario: dict[str, object]):
 
 
 def test_committed_examples_validate_and_plan_is_stable() -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     scenario = load_scenario_spec(INTEGRATION / "scenarios" / "S00-smoke.json", farm)
     first = farmtest.build_plan(farm, scenario)
     second = farmtest.build_plan(farm, scenario)
@@ -65,7 +67,7 @@ def test_committed_examples_validate_and_plan_is_stable() -> None:
 
 
 def test_committed_s50_mixed_pool_resolves_every_pair_stably() -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     scenario = load_scenario_spec(
         INTEGRATION / "scenarios" / "S50-mixed-pool-fmt.json", farm
     )
@@ -340,7 +342,7 @@ def test_plan_output_equals_fake_up_output_byte_for_byte(
 ) -> None:
     common = [
         "--farm",
-        str(INTEGRATION / "farm.example.json"),
+        str(farm_fixture.example_farm_path()),
         "--scenario",
         str(INTEGRATION / "scenarios" / "S00-smoke.json"),
         "--run-id",
@@ -356,7 +358,7 @@ def test_plan_output_equals_fake_up_output_byte_for_byte(
 
 
 def test_plan_commands_are_argv_only_and_label_scoped() -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     scenario = load_scenario_spec(INTEGRATION / "scenarios" / "S00-smoke.json", farm)
     plan = farmtest.build_plan(farm, scenario, run_id="argv-check")
     assert plan["commands"]
@@ -374,7 +376,7 @@ def test_plan_commands_are_argv_only_and_label_scoped() -> None:
 
 
 def test_container_temporaries_use_the_instance_scratch_bind() -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     scenario = load_scenario_spec(INTEGRATION / "scenarios" / "S00-smoke.json", farm)
     plan = farmtest.build_plan(farm, scenario, run_id="scratch-temp-check")
     starts = [
@@ -392,7 +394,7 @@ def test_container_temporaries_use_the_instance_scratch_bind() -> None:
 
 
 def test_client_start_uses_hash_bound_harness_entrypoint() -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     scenario = load_scenario_spec(INTEGRATION / "scenarios" / "S00-smoke.json", farm)
     plan = farmtest.build_plan(farm, scenario, run_id="client-entry-check")
     prepare = next(
@@ -449,7 +451,7 @@ def test_scheduler_fence_follows_resolved_relationship_law() -> None:
         == "strict-nonce"
     )
 
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     scenario = load_scenario_spec(INTEGRATION / "scenarios" / "S00-smoke.json", farm)
     plan = farmtest.build_plan(farm, scenario, run_id="strict-fence")
     scheduler = next(
@@ -668,7 +670,7 @@ def test_input_documents_are_not_mutated(tmp_path: Path) -> None:
     "run_id", (".", "..", "slash/not-allowed", "space not allowed")
 )
 def test_unsafe_run_id_is_refused(run_id: str) -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     scenario = load_scenario_spec(INTEGRATION / "scenarios" / "S00-smoke.json", farm)
     with pytest.raises(farmtest.PlanError, match="run id"):
         farmtest.build_plan(farm, scenario, run_id=run_id)

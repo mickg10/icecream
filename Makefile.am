@@ -23,6 +23,13 @@ EXTRA_DIST = README.md \
 	distro_probe.sh \
 	S1B_EXIT_MANIFEST.md
 
+# Keep the farm tooling distributable without recursively copying private or
+# generated files from the working tree.  The reviewed manifest contains only
+# tracked paths; its test rejects farm.local.json, results, caches and symlinks.
+ICEFARM_DIST_MANIFEST = $(srcdir)/farmharness/DISTFILES
+ICEFARM_DIST_FILES = $(shell sed -e '/^[[:space:]]*$$/d' "$(ICEFARM_DIST_MANIFEST)")
+EXTRA_DIST += farmharness/DISTFILES $(ICEFARM_DIST_FILES)
+
 ACLOCAL_AMFLAGS = -I m4
 AM_LIBTOOLFLAGS = --silent
 

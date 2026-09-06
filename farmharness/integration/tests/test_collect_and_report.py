@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from farmharness.integration.tests import farm_fixture
+
 from farmharness.integration import farmtest, report
 from farmharness.integration.collect import (
     CollectError,
@@ -268,7 +270,7 @@ def _write_jsonl(path: Path, values: list[dict[str, object]]) -> None:
 
 
 def _raw_collection(tmp_path: Path):
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path)
     farm.data["corpora"]["fmt-100"]["tus"] = 1
     farm.data["corpora"]["fmt-100"]["repeat"] = 1
@@ -925,7 +927,7 @@ def test_control_observations_do_not_self_attest_named_controls(
 def test_h4_observation_authenticates_before_and_after_job_digests(
     tmp_path: Path,
 ) -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     scenario = load_scenario_spec(
         INTEGRATION / "scenarios" / "H4-corrupt-object.json", farm
     )
@@ -1456,7 +1458,7 @@ def test_role_logs_are_bound_to_the_exact_instance_on_a_shared_host(
 
 
 def test_event_log_must_cover_and_bind_the_declared_timeline(tmp_path: Path) -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     scenario = load_scenario_spec(INTEGRATION / "scenarios" / "S00-smoke.json", farm)
     scenario.data["timeline"] = [
         {"action": "restart", "instance": "F1", "trigger": "job 2"}

@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from farmharness.integration.tests import farm_fixture
+
 from farmharness.integration import farmtest
 from farmharness.integration.farm_spec import load_farm_spec
 from farmharness.integration.performance import (
@@ -272,7 +274,7 @@ def test_nested_casefold_collision_refuses_before_any_result_tree(
 
 def test_checked_in_ladder_is_fixed_order_and_keeps_s50_as_a_child_gate() -> None:
     suite = load_suite_spec(INTEGRATION / "suites" / "ladder.json")
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
 
     assert suite.is_composite
     assert suite.data["suites"] == [
@@ -308,7 +310,7 @@ def test_execution_digest_binds_leaf_scenario_contents(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = _suite_tree(tmp_path, ["S00-smoke"])
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     monkeypatch.setattr(farmtest, "new_run_id", lambda: "stable-cell")
     before = farmtest._prepare_execution(
         farm,
@@ -334,7 +336,7 @@ def test_generic_partial_execution_manifest_remains_replay_admissible(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = _suite_tree(tmp_path, ["S10-baseline-smoke", "S40-engagement-fmt"])
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     monkeypatch.setattr(farmtest, "new_run_id", lambda: "partial-cell")
 
     manifest = farmtest._prepare_execution(
@@ -356,7 +358,7 @@ def test_prepared_atomic_run_never_reopens_a_changed_scenario(
 ) -> None:
     path = _suite_tree(tmp_path, ["S00-smoke"])
     suite = load_suite_spec(path)
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path / "results")
     monkeypatch.setattr(farmtest, "new_run_id", lambda: "prepared-cell")
     prepared = farmtest._prepare_execution(
@@ -392,7 +394,7 @@ def test_suite_replay_authenticates_manifest_plan_and_aggregate_status(
 ) -> None:
     path = _suite_tree(tmp_path, ["S10-baseline-smoke", "S40-engagement-fmt"])
     suite = load_suite_spec(path)
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path / "results")
     run_ids = iter(("replay-cell-1", "replay-cell-2"))
     monkeypatch.setattr(farmtest, "new_run_id", lambda: next(run_ids))
@@ -530,7 +532,7 @@ def test_nested_execution_manifest_retains_complete_suite_digest_catalogue(
 ) -> None:
     path = _composite_suite_tree(tmp_path)
     suite = load_suite_spec(path)
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     sequence = count(1)
     monkeypatch.setattr(farmtest, "new_run_id", lambda: f"nested-{next(sequence)}")
 
@@ -563,7 +565,7 @@ def test_nested_execution_manifest_retains_complete_suite_digest_catalogue(
 def test_malformed_execution_manifests_refuse_with_report_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     sequence = count(1)
     monkeypatch.setattr(farmtest, "new_run_id", lambda: f"malformed-{next(sequence)}")
     composite = farmtest._prepare_execution(
@@ -639,7 +641,7 @@ def test_suite_replay_enforces_bound_stop_on_fail_prefixes() -> None:
 
 def test_checked_in_full_suite_preserves_every_specialized_gate_and_preflights() -> None:
     suite = load_suite_spec(INTEGRATION / "suites" / "full.json")
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
 
     assert suite.data["suites"] == [
         "smoke",
@@ -666,7 +668,7 @@ def test_full_only_routes_s40_and_s60_through_ladder_without_other_rungs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     suite = load_suite_spec(INTEGRATION / "suites" / "full.json")
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path / "results")
     original = farmtest.run_suite
     observed: list[str] = []
@@ -730,7 +732,7 @@ def test_generic_suite_runs_each_repetition_with_a_fresh_plan(
     document["repetitions"] = {"S10-baseline-firefox": 3}
     path.write_text(json.dumps(document), encoding="utf-8")
     suite = load_suite_spec(path)
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path / "results")
     run_ids = iter(f"s10-cell-{index}" for index in range(1, 5))
     monkeypatch.setattr(farmtest, "new_run_id", lambda: next(run_ids))
@@ -773,7 +775,7 @@ def test_s50_suite_persists_matched_fairness_result_offline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     suite = load_suite_spec(INTEGRATION / "suites" / "s50.json")
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path / "results")
     run_ids = iter(f"s50-cell-{index}" for index in range(1, 6))
     monkeypatch.setattr(farmtest, "new_run_id", lambda: next(run_ids))
@@ -907,7 +909,7 @@ def test_harness_gate_suite_refuses_partial_only_before_running(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
 ) -> None:
     suite = load_suite_spec(_control_suite_tree(tmp_path, kind=kind))
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     monkeypatch.setattr(
         farmtest,
         "run_scenario",
@@ -920,7 +922,7 @@ def test_harness_gate_suite_refuses_partial_only_before_running(
 
 def test_checked_in_twobuild_suite_authenticates_all_four_arms() -> None:
     suite = load_suite_spec(INTEGRATION / "suites" / "twobuild.json")
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
 
     for arm, scenario_id in suite.data["performance"]["arms"].items():
         scenario = load_scenario_spec(suite.scenario_path(scenario_id), farm)
@@ -928,7 +930,7 @@ def test_checked_in_twobuild_suite_authenticates_all_four_arms() -> None:
 
 
 def test_checked_in_h1_uses_an_authorized_stale_runtime_as_the_wrong_hash() -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     scenario = load_scenario_spec(
         INTEGRATION / "scenarios" / "H1-role-hash-refusal.json", farm
     )
@@ -945,7 +947,7 @@ def test_checked_in_h1_uses_an_authorized_stale_runtime_as_the_wrong_hash() -> N
 
 
 def test_checked_in_h5_kills_one_of_two_workers_after_a_bounded_job_trigger() -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     scenario = load_scenario_spec(
         INTEGRATION / "scenarios" / "H5-worker-kill.json", farm
     )
@@ -981,7 +983,7 @@ def test_s80_refuses_noncomparable_arm_scenarios_before_running(
     scenario["workload"]["jobs"] += 1
     scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
     suite = load_suite_spec(path)
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     monkeypatch.setattr(
         farmtest,
         "run_scenario",
@@ -996,7 +998,7 @@ def test_s80_runs_twelve_fresh_cells_and_retains_score(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     suite = load_suite_spec(_s80_suite_tree(tmp_path))
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path / "results")
     run_ids = iter(f"s80-cell-{index}" for index in range(1, 13))
     monkeypatch.setattr(farmtest, "new_run_id", lambda: next(run_ids))
@@ -1134,7 +1136,7 @@ def test_s80_refuses_partial_only_selection_before_running(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     suite = load_suite_spec(_s80_suite_tree(tmp_path))
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     monkeypatch.setattr(
         farmtest,
         "run_scenario",
@@ -1149,7 +1151,7 @@ def test_s50_refuses_a_partial_selection_that_contains_every_scored_cell(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     suite = load_suite_spec(INTEGRATION / "suites" / "s50.json")
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     monkeypatch.setattr(
         farmtest,
         "run_scenario",
@@ -1174,7 +1176,7 @@ def test_suite_runs_in_fixed_order_and_stops_on_verdict_failure(
 ) -> None:
     ids = ["S00-smoke", "S10-baseline-smoke", "S40-engagement-fmt"]
     suite = load_suite_spec(_suite_tree(tmp_path, ids))
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path / "results")
     run_ids = iter(("cell-1", "cell-2", "cell-3"))
     monkeypatch.setattr(farmtest, "new_run_id", lambda: next(run_ids))
@@ -1214,7 +1216,7 @@ def test_suite_uses_control_verdict_as_the_meta_outcome(
     scenario["controls"] = ["H2"]
     scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
     suite = load_suite_spec(path)
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path / "results")
     monkeypatch.setattr(farmtest, "new_run_id", lambda: "control-cell")
     monkeypatch.setattr(
@@ -1243,7 +1245,7 @@ def test_suite_only_refuses_unknown_ids_before_running(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     suite = load_suite_spec(_suite_tree(tmp_path, ["S00-smoke"]))
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path / "results")
     monkeypatch.setattr(
         farmtest,
@@ -1265,7 +1267,7 @@ def test_suite_resolves_every_plan_before_the_first_cell_runs(
 ) -> None:
     ids = ["S00-smoke", "S10-baseline-smoke"]
     suite = load_suite_spec(_suite_tree(tmp_path, ids))
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path / "results")
     original = farmtest.build_plan
 
@@ -1293,7 +1295,7 @@ def test_composite_preflights_every_child_before_creating_results_or_running(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     suite = load_suite_spec(_composite_suite_tree(tmp_path))
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path / "results")
     original = farmtest.build_plan
 
@@ -1319,7 +1321,7 @@ def test_composite_uses_prepared_later_leaf_after_first_child_mutates_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     suite = load_suite_spec(_composite_suite_tree(tmp_path))
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path / "results")
     later_path = suite.path.parent.parent / "scenarios" / "S10-baseline-smoke.json"
     original_later = json.loads(later_path.read_text(encoding="utf-8"))
@@ -1362,7 +1364,7 @@ def test_prepared_tree_refuses_duplicate_run_ids_globally_before_results(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     suite = load_suite_spec(_composite_suite_tree(tmp_path))
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path / "results")
     monkeypatch.setattr(farmtest, "new_run_id", lambda: "duplicate-run")
     monkeypatch.setattr(
@@ -1381,7 +1383,7 @@ def test_composite_preserves_child_gate_results_and_continues_in_order(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     suite = load_suite_spec(_composite_suite_tree(tmp_path))
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path / "results")
     original = farmtest.run_suite
     observed: list[str] = []
@@ -1417,7 +1419,7 @@ def test_composite_suite_replay_recurses_through_child_results(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     suite = load_suite_spec(_composite_suite_tree(tmp_path))
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path / "results")
     sequence = count(1)
     monkeypatch.setattr(farmtest, "new_run_id", lambda: f"recurse-{next(sequence)}")
@@ -1515,7 +1517,7 @@ def test_composite_stop_and_only_operate_at_case_insensitive_suite_boundaries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     suite = load_suite_spec(_composite_suite_tree(tmp_path))
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path / "results")
     original = farmtest.run_suite
     observed: list[str] = []

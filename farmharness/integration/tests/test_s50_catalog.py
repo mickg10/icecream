@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from farmharness.integration.tests import farm_fixture
+
 from farmharness.integration import farmtest
 from farmharness.integration.farm_spec import load_farm_spec
 from farmharness.integration.scenario_spec import load_scenario_spec
@@ -12,7 +14,7 @@ INTEGRATION = Path(__file__).resolve().parents[1]
 
 
 def test_s50_catalogue_has_exact_worker_fractions_and_safe_placements() -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     expected = {
         "S50-mixed-pool-1of9": 1,
         "S50-mixed-pool-5of9": 5,
@@ -85,7 +87,7 @@ def test_s50_suite_is_fixed_cheap_to_expensive_and_disjoint_from_s80() -> None:
 
 
 def test_s50_all_new_workers_mixed_clients_is_explicit_and_exact() -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     scenario = load_scenario_spec(
         INTEGRATION / "scenarios" / "S50-all-f-new-mixed-c.json", farm
     )

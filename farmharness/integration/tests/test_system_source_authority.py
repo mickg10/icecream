@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from farmharness.integration.tests import farm_fixture
+
 from farmharness.integration import farmtest
 from farmharness.integration.farm_spec import FarmSpec, load_farm_spec
 from farmharness.integration.remote import CommandResult
@@ -27,7 +29,7 @@ INTEGRATION = Path(__file__).resolve().parents[1]
 
 
 def _farm():
-    return load_farm_spec(INTEGRATION / "farm.example.json")
+    return load_farm_spec(farm_fixture.example_farm_path())
 
 
 def _source(tmp_path: Path, *, identity: dict | None = None) -> Path:

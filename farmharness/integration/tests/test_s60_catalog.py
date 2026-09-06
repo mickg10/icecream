@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from farmharness.integration.tests import farm_fixture
+
 from farmharness.integration import farmtest
 from farmharness.integration.farm_spec import load_farm_spec
 from farmharness.integration.scenario_spec import load_scenario_spec
@@ -40,7 +42,7 @@ def test_s60_suite_is_exactly_ordered_and_fresh() -> None:
 
 
 def test_s60_edges_have_one_directional_instance_change_and_resolve() -> None:
-    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm = load_farm_spec(farm_fixture.example_farm_path())
     for index, (scenario_id, edge) in enumerate(zip(S60_SCENARIO_IDS, _EDGES), start=1):
         target, action, image, before, after = edge
         scenario = load_scenario_spec(
@@ -74,11 +76,11 @@ def test_s60_edges_have_one_directional_instance_change_and_resolve() -> None:
 def test_s60_explicit_all_f_new_mixed_c_and_warm_pairs() -> None:
     all_f_new = load_scenario_spec(
         INTEGRATION / "scenarios" / "S60-04-c1-up.json",
-        load_farm_spec(INTEGRATION / "farm.example.json"),
+        load_farm_spec(farm_fixture.example_farm_path()),
     )
     mixed_c = load_scenario_spec(
         INTEGRATION / "scenarios" / "S60-05-c2-up.json",
-        load_farm_spec(INTEGRATION / "farm.example.json"),
+        load_farm_spec(farm_fixture.example_farm_path()),
     )
     assert all(item["image"] == "new" for item in all_f_new.data["instances"] if item["role"] == "F")
     assert {item["image"] for item in mixed_c.data["instances"] if item["role"] == "C"} == {"old", "new"}
@@ -87,14 +89,14 @@ def test_s60_explicit_all_f_new_mixed_c_and_warm_pairs() -> None:
     assert all(
         load_scenario_spec(
             INTEGRATION / "scenarios" / scenario_id,
-            load_farm_spec(INTEGRATION / "farm.example.json"),
+            load_farm_spec(farm_fixture.example_farm_path()),
         ).data["workload"]["jobs"] >= 24
         for scenario_id in ("S60-06-c2-down.json", "S60-11-warm-f2-down.json", "S60-13-warm-s-down.json")
     )
     for scenario_id in ("S60-12-warm-f2-up.json", "S60-14-warm-s-up.json"):
         scenario = load_scenario_spec(
             INTEGRATION / "scenarios" / scenario_id,
-            load_farm_spec(INTEGRATION / "farm.example.json"),
+            load_farm_spec(farm_fixture.example_farm_path()),
         )
         assert scenario.data["expect"]["reuse"] == "none-when-legacy"
         assert "reuse_pairs" not in scenario.data["expect"]
