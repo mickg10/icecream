@@ -597,6 +597,72 @@ inline constexpr uint32_t CACHE_DECLARED_PROFILE_MASK =
 inline constexpr uint32_t CACHE_ADVERTISABLE_PROFILE_MASK =
     CACHE_DECLARED_PROFILE_MASK;
 
+/* C->S capability request carried by GET_CS at protocol 50.  This is
+   deliberately distinct from F's Login advertisement: C states which
+   CacheWire revision/profiles it can consume, and may attach one soft warm
+   route hint.  Canonical absence keeps every older/disabled path legacy. */
+inline constexpr size_t P50_CACHE_AFFINITY_HOST_MAX = 255;
+
+struct P50CacheClientCapability
+{
+    uint32_t protocol = 0;
+    uint32_t profile_mask = 0;
+
+    auto operator<=>(const P50CacheClientCapability &) const = default;
+};
+
+inline bool p50_cache_client_request_is_wholly_absent(
+    uint32_t protocol, uint32_t profile_mask,
+    uint32_t affinity_profile_mask, uint32_t affinity_port,
+    std::string_view affinity_host) noexcept
+{
+    return protocol == 0 && profile_mask == 0 &&
+           affinity_profile_mask == 0 && affinity_port == 0 &&
+           affinity_host.empty();
+}
+
+inline bool p50_cache_client_request_is_valid(
+    uint32_t protocol, uint32_t profile_mask,
+    uint32_t affinity_profile_mask, uint32_t affinity_port,
+    std::string_view affinity_host) noexcept
+{
+    if (p50_cache_client_request_is_wholly_absent(
+            protocol, profile_mask, affinity_profile_mask, affinity_port,
+            affinity_host))
+        return true;
+    if (protocol != CACHE_WIRE_REVISION || profile_mask == 0 ||
+        (profile_mask & ~CACHE_ADVERTISABLE_PROFILE_MASK) != 0 ||
+        (affinity_profile_mask & ~profile_mask) != 0 ||
+        affinity_port > UINT16_MAX ||
+        affinity_host.size() > P50_CACHE_AFFINITY_HOST_MAX ||
+        affinity_host.find('\0') != std::string_view::npos)
+        return false;
+    const bool affinity_present = affinity_profile_mask != 0;
+    return affinity_present == (affinity_port != 0) &&
+           affinity_present == !affinity_host.empty();
+}
+
+/* The C daemon, not a wrapper-authored GET_CS payload, owns the kill switch.
+   Protocol-50 clients run the retained revision-one profiles by default;
+   exact `off` is the kill switch.  An explicit value other than `on`/`off`
+   is malformed and fails closed rather than guessing operator intent. */
+inline P50CacheClientCapability p50_cache_client_capability_from_mode(
+    const char *mode, int wrapper_protocol) noexcept
+{
+    if (wrapper_protocol < PROTOCOL_VERSION_CACHE_ADVERTISEMENT)
+        return {};
+    if (mode != nullptr && std::string_view(mode) != "on")
+        return {};
+    return {CACHE_WIRE_REVISION, CACHE_ADVERTISABLE_PROFILE_MASK};
+}
+
+inline P50CacheClientCapability p50_cache_client_capability_from_env(
+    int wrapper_protocol) noexcept
+{
+    return p50_cache_client_capability_from_mode(
+        std::getenv("ICECC_P50_MODE"), wrapper_protocol);
+}
+
 /* An optional scheduler-local request chooses the one source profile carried
    in each assignment. An explicit request never falls back to another profile. */
 enum class P50CacheProfileRequest : uint8_t {
@@ -659,6 +725,24 @@ inline constexpr uint32_t p50_select_cache_profile(
         return 0;
     }
     return 0;
+}
+
+/* One pair can use a profile only when C and F advertise the same supported
+   CacheWire revision.  S's profile request is then applied to their exact
+   intersection; an unavailable explicit request never substitutes. */
+inline constexpr uint32_t p50_select_pair_cache_profile(
+    uint32_t client_protocol, uint32_t client_profiles,
+    uint32_t server_protocol, uint32_t server_profiles,
+    P50CacheProfileRequest request) noexcept
+{
+    if (client_protocol != CACHE_WIRE_REVISION ||
+        server_protocol != CACHE_WIRE_REVISION ||
+        client_profiles == 0 || server_profiles == 0 ||
+        (client_profiles & ~CACHE_ADVERTISABLE_PROFILE_MASK) != 0 ||
+        (server_profiles & ~CACHE_ADVERTISABLE_PROFILE_MASK) != 0)
+        return 0;
+    return p50_select_cache_profile(client_profiles & server_profiles,
+                                    request);
 }
 
 /* Source-arm mode values are deliberately closed to the runnable source
@@ -727,11 +811,9 @@ struct P50CacheControlIdentity
 };
 
 /* Shared absent-or-present law for a three-word CacheWire advertisement.
-   LoginMsg's Login-only capability tail (M0/M1) and UseCSMsg's
-   assignment-bound S->C cache-endpoint handoff tail (S2) both project
-   through this exact pair of predicates: a snapshot is either wholly zero
-   or a single runnable, in-range, in-mask endpoint.  Nothing partially or
-   incorrectly advertised is ever legal on either wire shape. */
+   LoginMsg may advertise a runnable capability set.  A UseCS assignment is
+   narrower: cache_assignment_is_valid_present additionally requires the one
+   concrete profile selected for that assignment. */
 inline bool cache_advertisement_is_wholly_absent(uint32_t port, uint32_t protocol,
                                                   uint32_t profile_mask)
 {
@@ -752,6 +834,14 @@ inline bool cache_advertisement_is_valid_present(uint32_t port,
     return cache_advertisement_is_well_formed_present(port, protocol,
                                                        profile_mask)
         && protocol == CACHE_WIRE_REVISION;
+}
+
+inline bool cache_assignment_is_valid_present(uint32_t port,
+                                               uint32_t protocol,
+                                               uint32_t profile_mask)
+{
+    return cache_advertisement_is_valid_present(port, protocol, profile_mask)
+        && p50_source_profile_selection_valid(profile_mask);
 }
 
 /* WIRE-AUDIT (three-bucket field classification, BigOracle, owner-ruling
@@ -926,6 +1016,7 @@ public:
     }
     bool set_p50_legacy_wire_identity(
         const P50LegacyWireIdentity &identity) noexcept;
+    bool p50_legacy_wire_prepare_trace() noexcept;
     bool p50_legacy_wire_complete() noexcept;
 
     // Consume the one terminal STATUS_TEXT, if any, that set_error() fetched
@@ -1097,6 +1188,7 @@ protected:
     P50LegacyWireIdentity p50_legacy_wire_identity{};
     bool p50_legacy_wire_identity_set = false;
     bool p50_legacy_wire_completed = false;
+    int p50_legacy_wire_trace_fd = -1;
     uint64_t p50_legacy_c_to_f_sent = 0;
     uint64_t p50_legacy_c_to_f_received = 0;
     uint64_t p50_legacy_f_to_c_sent = 0;
@@ -1572,6 +1664,11 @@ public:
         , client_id(0)
         , client_count(0)
         , niceness(0)
+        , cache_protocol(0)
+        , cache_profile_mask(0)
+        , cache_affinity_profile_mask(0)
+        , cache_affinity_port(0)
+        , cache_request_tail_valid(true)
         {}
 
     GetCSMsg(const Environments &envs, const std::string &f,
@@ -1585,6 +1682,7 @@ public:
 
     virtual void fill_from_channel(MsgChannel *c);
     virtual void send_to_channel(MsgChannel *c) const;
+    bool valid_payload() const override;
 
     Environments versions;
     std::string filename;
@@ -1599,6 +1697,14 @@ public:
     uint32_t client_count; // number of CS -> C connections at the moment
     uint32_t niceness; // nice priority (0-20)
     std::string command_summary;
+    uint32_t cache_protocol; // C-supported CacheWire revision, or 0
+    uint32_t cache_profile_mask; // all profiles C can consume, or 0
+    uint32_t cache_affinity_profile_mask; // warm profiles at the hinted F
+    uint32_t cache_affinity_port; // exact ordinary F port; zero iff no hint
+    std::string cache_affinity_host; // exact F address; empty iff no hint
+
+private:
+    bool cache_request_tail_valid;
 };
 
 class UseCSMsg : public Msg
@@ -1756,7 +1862,7 @@ inline bool usecs_cache_handoff_admissible(const UseCSMsg &msg)
 {
     return msg.job_id != 0 && msg.hasAssignmentIdentity()
         && msg.hasCacheAdvertisement()
-        && cache_advertisement_is_valid_present(
+        && cache_assignment_is_valid_present(
                msg.cache_endpoint_port, msg.cache_protocol,
                msg.cache_profile_mask);
 }
@@ -2124,7 +2230,23 @@ public:
 
     // other flags
     enum {
-        UnknownJobId = (1 << 1)
+        UnknownJobId = (1 << 1),
+        /* Local protocol-50 C-wrapper -> C-daemon observation only.  The
+           daemon consumes this message and never forwards it to S: the F
+           daemon remains the sole scheduler completion authority for a
+           remotely compiled job. */
+        P50CacheRouteObservation = (1 << 2),
+        /* Set only on a failed local cache-route observation when the C
+           sidecar proved that the selected P29V1 implementation cannot be
+           initialized for this exact READY lease.  This is deliberately not
+           a generic transfer-error bit: the daemon may suppress P29V1 until
+           lease replacement only for this typed condition. */
+        P50PermanentLocalCapabilityFailure = (1 << 3),
+        /* The authenticated C sidecar completed the local control reply but
+           its retained C/F route is no longer safe for a distinct request.
+           The C daemon consumes this local-only fact and requests a cold
+           sidecar replacement after the reply/Goodbye exchange. */
+        P50LocalSidecarReplacementRequired = (1 << 4)
     };
 
     JobDoneMsg(int job_id = 0, int exitcode = -1, unsigned int flags = FROM_SERVER,
@@ -2137,9 +2259,14 @@ public:
         flags |= (uint32_t)from;
     }
 
-    bool is_from_server()
+    bool is_from_server() const
     {
         return (flags & FROM_SUBMITTER) == 0;
+    }
+
+    bool is_p50_cache_route_observation() const
+    {
+        return (flags & P50CacheRouteObservation) != 0;
     }
 
     void set_unknown_job_client_id( uint32_t clientId );
@@ -2191,6 +2318,69 @@ public:
     uint32_t c_guid_hi, c_guid_lo;
     uint32_t tu_seq_hi, tu_seq_lo;
 };
+
+enum class P50CacheRouteObservationKind : uint8_t {
+    Invalid = 0,
+    Success,
+    Failure,
+    PermanentLocalProfileFailure,
+    LocalSidecarReplacementRequired,
+};
+
+/* Classify only the wrapper's local-only observation for one exact UseCS.
+   Ordinary JobDone settlement is never accepted here.  All five assignment
+   identity components are checked; TU sequence zero remains a valid first
+   sequence.  A permanent observation is meaningful only for the singleton
+   P29V1 profile and a nonzero failure exit code. */
+inline P50CacheRouteObservationKind p50_cache_route_observation_kind(
+    const JobDoneMsg& completion, uint32_t expected_job_id,
+    uint64_t expected_epoch, uint64_t expected_nonce,
+    uint64_t expected_c_guid, uint64_t expected_tu_seq,
+    uint32_t expected_profile_mask) noexcept
+{
+    const uint32_t base_flags =
+        static_cast<uint32_t>(JobDoneMsg::FROM_SUBMITTER) |
+        static_cast<uint32_t>(JobDoneMsg::P50CacheRouteObservation);
+    const uint32_t permanent_flags =
+        base_flags |
+        static_cast<uint32_t>(
+            JobDoneMsg::P50PermanentLocalCapabilityFailure);
+    const uint32_t replacement_flags =
+        base_flags |
+        static_cast<uint32_t>(
+            JobDoneMsg::P50LocalSidecarReplacementRequired);
+    if (expected_job_id == 0 || expected_epoch == 0 ||
+        expected_nonce == 0 || expected_c_guid == 0 ||
+        completion.job_id != expected_job_id ||
+        completion.assignmentEpoch() != expected_epoch ||
+        completion.assignmentNonce() != expected_nonce ||
+        completion.cGuid() != expected_c_guid ||
+        completion.tuSeq() != expected_tu_seq)
+        return P50CacheRouteObservationKind::Invalid;
+    if (completion.flags == base_flags) {
+        return completion.exitcode == 0
+            ? P50CacheRouteObservationKind::Success
+            : P50CacheRouteObservationKind::Failure;
+    }
+    if (completion.flags == permanent_flags && completion.exitcode != 0 &&
+        expected_profile_mask == CACHE_PROFILE_P29V1)
+        return P50CacheRouteObservationKind::PermanentLocalProfileFailure;
+    if (completion.flags == replacement_flags && completion.exitcode != 0)
+        return P50CacheRouteObservationKind::LocalSidecarReplacementRequired;
+    return P50CacheRouteObservationKind::Invalid;
+}
+
+inline bool p50_cache_handoff_completion_matches(
+    const JobDoneMsg& completion, uint32_t expected_job_id,
+    uint64_t expected_epoch, uint64_t expected_nonce,
+    uint64_t expected_c_guid, uint64_t expected_tu_seq,
+    uint32_t expected_profile_mask) noexcept
+{
+    return p50_cache_route_observation_kind(
+               completion, expected_job_id, expected_epoch, expected_nonce,
+               expected_c_guid, expected_tu_seq, expected_profile_mask) ==
+           P50CacheRouteObservationKind::Success;
+}
 
 class JobLocalBeginMsg : public Msg
 {

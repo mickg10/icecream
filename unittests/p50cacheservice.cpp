@@ -728,6 +728,162 @@ service::RuntimeConfig test_runtime_config() {
     return config;
 }
 
+void test_p29_fault_environment_is_exact() {
+    P29InternerFaultInjection parsed = P29InternerFaultInjection::FailOnce;
+    CHECK(service::parse_p29_interner_fault_injection(nullptr, parsed));
+    CHECK(parsed == P29InternerFaultInjection::Disabled);
+    CHECK(service::parse_p29_interner_fault_injection(
+        "P29_INTERNER_FAIL_ONCE", parsed));
+    CHECK(parsed == P29InternerFaultInjection::FailOnce);
+    CHECK(!service::parse_p29_interner_fault_injection("", parsed));
+    CHECK(parsed == P29InternerFaultInjection::Disabled);
+    CHECK(!service::parse_p29_interner_fault_injection(
+        "P29_INTERNER_FAIL_ALWAYS", parsed));
+    CHECK(parsed == P29InternerFaultInjection::Disabled);
+}
+
+SidecarLaunchIdentity test_sidecar_launch(StoreIdentityRoot root) {
+    SidecarLaunchIdentity launch;
+    launch.identity = {7, 1};
+    launch.store_generation = 9;
+    launch.store_root = root;
+    launch.c_store_guid = c_store_guid_for_root(root);
+    launch.f_store_guid = f_store_guid_for_root(root);
+    CHECK(launch.valid());
+    return launch;
+}
+
+void test_route_endpoint_cap_refuses_before_f_open() {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 9;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.max_route_endpoint_identities = 1;
+    service::SidecarRuntime runtime(std::move(config));
+
+    StoreIdentityRoot retained_remote_root{};
+    retained_remote_root.bytes[14] = 0x51;
+    CHECK(runtime.seed_route_endpoint_identity_for_test(
+        "127.0.0.2", 31001, f_store_guid_for_root(retained_remote_root), 1));
+
+    uint16_t novel_port = 0;
+    const int listener = loopback_listener(novel_port);
+    const int listener_flags = ::fcntl(listener, F_GETFL);
+    CHECK(listener_flags >= 0);
+    CHECK(::fcntl(listener, F_SETFL, listener_flags | O_NONBLOCK) == 0);
+
+    char source_path[] = "/tmp/p50-route-endpoint-cap-XXXXXX";
+    const int source_fd = ::mkstemp(source_path);
+    CHECK(source_fd >= 0);
+    const std::array<uint8_t, 4> source{'c', 'a', 'p', '\n'};
+    CHECK(write_all(source_fd, source));
+    CHECK(::unlink(source_path) == 0);
+
+    local::P50SourceTransferRequest request;
+    request.wire_job_id = 71;
+    request.assignment_epoch = 72;
+    request.assignment_nonce = 73;
+    request.selected_f_host = "127.0.0.1";
+    request.selected_f_ordinary_port = novel_port;
+    request.selected_f_cache_port = novel_port;
+    request.cache_protocol = CACHE_WIRE_REVISION;
+    request.cache_profile = CACHE_PROFILE_ZSTD_TU;
+    request.logical_job = 74;
+    request.compiler_attempt = 75;
+    request.source_request_id = 76;
+    request.source_mode = P50_SOURCE_MODE_ZSTD_TU;
+    CHECK(request.valid());
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+        std::chrono::steady_clock::now() + std::chrono::seconds(2),
+        clock.clock_domain_id, clock.time_namespace_id);
+    const auto started = std::chrono::steady_clock::now();
+    const local::P50SourceTransferResult result = runtime.transfer_source_on_owner(
+        request, deadline, local::HandoffFd(source_fd));
+    CHECK(result.code == local::SourceTransferResultCode::Error);
+    CHECK(result.error_code == static_cast<uint16_t>(
+        local::SourceTransferErrorCode::RouteReplacementRequired));
+    CHECK(result.attempts == 0);
+    CHECK(std::chrono::steady_clock::now() - started <
+          std::chrono::milliseconds(250));
+
+    errno = 0;
+    const int unexpected = ::accept(listener, nullptr, nullptr);
+    CHECK(unexpected < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+    CHECK(::close(listener) == 0);
+}
+
+void test_known_endpoint_relationship_cap_refuses_before_f_open() {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 9;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+
+    uint16_t port = 0;
+    const int listener = loopback_listener(port);
+    const int listener_flags = ::fcntl(listener, F_GETFL);
+    CHECK(listener_flags >= 0);
+    CHECK(::fcntl(listener, F_SETFL, listener_flags | O_NONBLOCK) == 0);
+
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.max_route_relationships = 1;
+    service::SidecarRuntime runtime(std::move(config));
+
+    StoreIdentityRoot retained_remote_root{};
+    retained_remote_root.bytes[14] = 0x52;
+    const FStoreGuid retained_remote_guid =
+        f_store_guid_for_root(retained_remote_root);
+    CHECK(runtime.seed_route_relationship_for_test(
+        "127.0.0.1", port, retained_remote_guid, 1, ProfileId::P29V1));
+
+    char source_path[] = "/tmp/p50-route-relationship-cap-XXXXXX";
+    const int source_fd = ::mkstemp(source_path);
+    CHECK(source_fd >= 0);
+    const std::array<uint8_t, 4> source{'c', 'a', 'p', '\n'};
+    CHECK(write_all(source_fd, source));
+    CHECK(::unlink(source_path) == 0);
+
+    local::P50SourceTransferRequest request;
+    request.wire_job_id = 81;
+    request.assignment_epoch = 82;
+    request.assignment_nonce = 83;
+    request.selected_f_host = "127.0.0.1";
+    request.selected_f_ordinary_port = port;
+    request.selected_f_cache_port = port;
+    request.cache_protocol = CACHE_WIRE_REVISION;
+    request.cache_profile = CACHE_PROFILE_ZSTD_TU;
+    request.logical_job = 84;
+    request.compiler_attempt = 85;
+    request.source_request_id = 86;
+    request.source_mode = P50_SOURCE_MODE_ZSTD_TU;
+    CHECK(request.valid());
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+        std::chrono::steady_clock::now() + std::chrono::seconds(2),
+        clock.clock_domain_id, clock.time_namespace_id);
+    const auto started = std::chrono::steady_clock::now();
+    const local::P50SourceTransferResult result = runtime.transfer_source_on_owner(
+        request, deadline, local::HandoffFd(source_fd));
+    CHECK(result.code == local::SourceTransferResultCode::Error);
+    CHECK(result.error_code == static_cast<uint16_t>(
+        local::SourceTransferErrorCode::RouteReplacementRequired));
+    CHECK(result.attempts == 0);
+    CHECK(std::chrono::steady_clock::now() - started <
+          std::chrono::milliseconds(250));
+
+    errno = 0;
+    const int unexpected = ::accept(listener, nullptr, nullptr);
+    CHECK(unexpected < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+    CHECK(::close(listener) == 0);
+}
+
 void structured_c_guid_is_strict() {
     service::RuntimeConfig config;
     config.f_store_guid = Id128::from_u64(9001);
@@ -1195,6 +1351,230 @@ int loopback_listener(uint16_t& port) {
     CHECK(::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &length) == 0);
     port = ntohs(address.sin_port);
     return listener;
+}
+
+struct SourceArmServerObservation {
+    bool accepted = false;
+    bool protocol_50 = false;
+    bool arm_received = false;
+    bool armed_sent = false;
+    bool cache_session_received = false;
+    bool ready_sent = false;
+    bool eof_without_cachewire = false;
+};
+
+void serve_one_source_arm(int listener, FStoreGuid f_store_guid,
+                          uint64_t f_store_generation,
+                          SourceArmServerObservation& observation) noexcept {
+    try {
+        sockaddr_in peer{};
+        socklen_t peer_size = sizeof(peer);
+        const int accepted = ::accept(
+            listener, reinterpret_cast<sockaddr*>(&peer), &peer_size);
+        (void)::close(listener);
+        if (accepted < 0)
+            return;
+        observation.accepted = true;
+        std::unique_ptr<MsgChannel> channel(Service::createChannel(
+            accepted, reinterpret_cast<sockaddr*>(&peer), peer_size));
+        if (!channel)
+            return;
+        observation.protocol_50 = channel->protocol == PROTOCOL_VERSION;
+        std::unique_ptr<Msg> arm_message(channel->get_msg(3, true));
+        const auto* arm = arm_message != nullptr
+                              ? dynamic_cast<P50SourceArmMsg*>(arm_message.get())
+                              : nullptr;
+        if (arm == nullptr || !arm->valid_payload())
+            return;
+        observation.arm_received = true;
+        ClaimAttemptCapability128 capability_1;
+        ClaimAttemptCapability128 capability_2;
+        capability_1.bytes.fill(0xc1);
+        capability_2.bytes.fill(0xc2);
+        const P50SourceArmedMsg acknowledgement(
+            arm->arm, 91, 92, f_store_generation, f_store_guid.bytes,
+            kStoreIdentityDerivationVersion, 93, 2500,
+            capability_1, capability_2);
+        if (!channel->send_msg(acknowledgement))
+            return;
+        observation.armed_sent = true;
+        std::unique_ptr<Msg> cache_message(channel->get_msg(3, true));
+        if (cache_message == nullptr || *cache_message != Msg::CACHE_SESSION)
+            return;
+        observation.cache_session_received = true;
+        const int raw_fd = channel->release_fd_if_input_empty();
+        if (raw_fd < 0)
+            return;
+        observation.ready_sent = send_cache_session_ready(
+            raw_fd, std::chrono::steady_clock::now() + std::chrono::seconds(2));
+        if (observation.ready_sent) {
+            pollfd descriptor{raw_fd, POLLIN | POLLHUP | POLLERR, 0};
+            int ready = -1;
+            do {
+                ready = ::poll(&descriptor, 1, 2000);
+            } while (ready < 0 && errno == EINTR);
+            uint8_t byte = 0;
+            const ssize_t count = ready > 0 ? ::recv(raw_fd, &byte, 1, 0) : -1;
+            observation.eof_without_cachewire = count == 0;
+        }
+        (void)::close(raw_fd);
+    } catch (...) {
+        (void)::close(listener);
+    }
+}
+
+local::P50SourceTransferRequest source_transfer_request(
+    uint16_t port, uint64_t identity, uint32_t profile) {
+    local::P50SourceTransferRequest request;
+    request.wire_job_id = static_cast<uint32_t>(identity);
+    request.assignment_epoch = identity + 1;
+    request.assignment_nonce = identity + 2;
+    request.selected_f_host = "127.0.0.1";
+    request.selected_f_ordinary_port = port;
+    request.selected_f_cache_port = port;
+    request.cache_protocol = CACHE_WIRE_REVISION;
+    request.cache_profile = profile;
+    request.logical_job = identity + 3;
+    request.compiler_attempt = identity + 4;
+    request.source_request_id = identity + 5;
+    if (profile == CACHE_PROFILE_P29V1)
+        request.source_mode = P50_SOURCE_MODE_P29V1;
+    else if (profile == CACHE_PROFILE_ZSTD_ROUTE)
+        request.source_mode = P50_SOURCE_MODE_ZSTD_ROUTE;
+    else
+        request.source_mode = P50_SOURCE_MODE_ZSTD_TU;
+    CHECK(request.valid());
+    return request;
+}
+
+void test_route_poison_latches_before_successor_f_open() {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 9;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.before_route_prepare_for_test = [] {
+        throw P50RoutePoisoned("injected SidecarRuntime route poison");
+    };
+    service::SidecarRuntime runtime(std::move(config));
+
+    StoreIdentityRoot remote_root{};
+    remote_root.bytes[14] = 0x53;
+    const FStoreGuid remote_guid = f_store_guid_for_root(remote_root);
+    uint16_t first_port = 0;
+    const int first_listener = loopback_listener(first_port);
+    SourceArmServerObservation first_observation;
+    std::thread first_server([&] {
+        serve_one_source_arm(first_listener, remote_guid, 11,
+                             first_observation);
+    });
+
+    char first_source_path[] = "/tmp/p50-route-poison-first-XXXXXX";
+    const int first_source_fd = ::mkstemp(first_source_path);
+    CHECK(first_source_fd >= 0);
+    const std::array<uint8_t, 6> first_source{'p', 'o', 'i', 's', 'o', 'n'};
+    CHECK(write_all(first_source_fd, first_source));
+    CHECK(::unlink(first_source_path) == 0);
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto first_deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+        std::chrono::steady_clock::now() + std::chrono::seconds(4),
+        clock.clock_domain_id, clock.time_namespace_id);
+    const local::P50SourceTransferResult first = runtime.transfer_source_on_owner(
+        source_transfer_request(first_port, 91, CACHE_PROFILE_P29V1),
+        first_deadline, local::HandoffFd(first_source_fd));
+    first_server.join();
+    CHECK(first.code == local::SourceTransferResultCode::Error);
+    CHECK(first.error_code == static_cast<uint16_t>(
+        local::SourceTransferErrorCode::RouteReplacementRequired));
+    CHECK(first_observation.accepted && first_observation.protocol_50 &&
+          first_observation.arm_received && first_observation.armed_sent &&
+          first_observation.cache_session_received && first_observation.ready_sent &&
+          first_observation.eof_without_cachewire);
+
+    uint16_t successor_port = 0;
+    const int successor_listener = loopback_listener(successor_port);
+    const int listener_flags = ::fcntl(successor_listener, F_GETFL);
+    CHECK(listener_flags >= 0);
+    CHECK(::fcntl(successor_listener, F_SETFL,
+                  listener_flags | O_NONBLOCK) == 0);
+    char successor_source_path[] = "/tmp/p50-route-poison-successor-XXXXXX";
+    const int successor_source_fd = ::mkstemp(successor_source_path);
+    CHECK(successor_source_fd >= 0);
+    const std::array<uint8_t, 4> successor_source{'n', 'e', 'x', 't'};
+    CHECK(write_all(successor_source_fd, successor_source));
+    CHECK(::unlink(successor_source_path) == 0);
+    const auto successor_deadline =
+        sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            std::chrono::steady_clock::now() + std::chrono::seconds(2),
+            clock.clock_domain_id, clock.time_namespace_id);
+    const auto started = std::chrono::steady_clock::now();
+    const local::P50SourceTransferResult successor =
+        runtime.transfer_source_on_owner(
+            source_transfer_request(successor_port, 101,
+                                    CACHE_PROFILE_ZSTD_TU),
+            successor_deadline, local::HandoffFd(successor_source_fd));
+    CHECK(successor.code == local::SourceTransferResultCode::Error);
+    CHECK(successor.error_code == static_cast<uint16_t>(
+        local::SourceTransferErrorCode::RouteReplacementRequired));
+    CHECK(successor.attempts == 0);
+    CHECK(std::chrono::steady_clock::now() - started <
+          std::chrono::milliseconds(250));
+    errno = 0;
+    const int unexpected = ::accept(successor_listener, nullptr, nullptr);
+    CHECK(unexpected < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+    CHECK(::close(successor_listener) == 0);
+}
+
+void test_interner_fault_returns_permanent_profile_unavailable() {
+    StoreIdentityRoot local_root{};
+    local_root.bytes[15] = 9;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+    service::RuntimeConfig config = test_runtime_config();
+    config.c_store_guid = launch.c_store_guid;
+    config.f_store_guid = launch.f_store_guid;
+    config.f_store_generation = launch.store_generation;
+    config.sidecar_launch = launch;
+    config.p29_interner_fault_injection =
+        P29InternerFaultInjection::FailOnce;
+    service::SidecarRuntime runtime(std::move(config));
+
+    StoreIdentityRoot remote_root{};
+    remote_root.bytes[14] = 0x54;
+    const FStoreGuid remote_guid = f_store_guid_for_root(remote_root);
+    uint16_t port = 0;
+    const int listener = loopback_listener(port);
+    SourceArmServerObservation observation;
+    std::thread server([&] {
+        serve_one_source_arm(listener, remote_guid, 12, observation);
+    });
+
+    char source_path[] = "/tmp/p50-interner-fault-XXXXXX";
+    const int source_fd = ::mkstemp(source_path);
+    CHECK(source_fd >= 0);
+    const std::array<uint8_t, 12> source{
+        'p', '2', '9', '-', 'f', 'a', 'u', 'l', 't', '\n', 'x', '\n'};
+    CHECK(write_all(source_fd, source));
+    CHECK(::unlink(source_path) == 0);
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+        std::chrono::steady_clock::now() + std::chrono::seconds(4),
+        clock.clock_domain_id, clock.time_namespace_id);
+    const local::P50SourceTransferResult result =
+        runtime.transfer_source_on_owner(
+            source_transfer_request(port, 111, CACHE_PROFILE_P29V1),
+            deadline, local::HandoffFd(source_fd));
+    server.join();
+
+    CHECK(result.code == local::SourceTransferResultCode::Error);
+    CHECK(result.error_code == static_cast<uint16_t>(
+        local::SourceTransferErrorCode::PermanentLocalProfileUnavailable));
+    CHECK(observation.accepted && observation.protocol_50 &&
+          observation.arm_received && observation.armed_sent &&
+          observation.cache_session_received && observation.ready_sent &&
+          observation.eof_without_cachewire);
 }
 
 int connect_after_sidecar_ready(uint16_t port) {
@@ -1702,6 +2082,11 @@ int main() {
         slowloris_deadline_is_total_and_listener_recovers();
         frame_header_and_payload_share_one_deadline();
         test_runtime_store_identity_is_explicit_and_role_tagged();
+        test_route_endpoint_cap_refuses_before_f_open();
+        test_known_endpoint_relationship_cap_refuses_before_f_open();
+        test_route_poison_latches_before_successor_f_open();
+        test_interner_fault_returns_permanent_profile_unavailable();
+        test_p29_fault_environment_is_exact();
         structured_launch_is_complete_and_fail_closed();
         structured_c_guid_is_strict();
         test_runtime_identity_disconnect_and_endpoint_failure();

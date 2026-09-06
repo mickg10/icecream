@@ -43,8 +43,14 @@ for pair in \
     "$impl|ICECC_CACHE_SERVICE_EXPECTED_DERIVATION_VERSION" \
     "$header|RuntimeConfig" \
     "$header|std::timed_mutex source_transfer_mutex_" \
+    "$header|seed_route_endpoint_identity_for_test" \
+    "$header|seed_route_relationship_for_test" \
     "$test_file|legacy_store_identity_launches" \
     "$test_file|test_runtime_store_identity_is_explicit_and_role_tagged" \
+    "$test_file|test_route_endpoint_cap_refuses_before_f_open" \
+    "$test_file|test_known_endpoint_relationship_cap_refuses_before_f_open" \
+    "$test_file|test_route_poison_latches_before_successor_f_open" \
+    "$test_file|first_observation.eof_without_cachewire" \
     "$test_file|authenticated_control_farm_accepts_twenty_and_stops" \
     "$test_file|kConnectionCount = 20" \
     "$test_file|receive_until(acknowledgement, deadline)" \
@@ -58,6 +64,30 @@ for pair in \
     file=${pair%%|*}; pattern=${pair#*|}
     require "$file" "$pattern"
 done
+
+endpoint_cap_line=$(grep -n -F \
+    'route_endpoint_identities_.size() >=' "$impl" | head -n 1 | cut -d: -f1)
+source_read_line=$(grep -n -F 'const auto source_bytes = read_source_fd(' \
+    "$impl" | head -n 1 | cut -d: -f1)
+f_open_line=$(grep -n -F 'const int first_fd = open_armed(' \
+    "$impl" | head -n 1 | cut -d: -f1)
+if test -z "$endpoint_cap_line" || test -z "$source_read_line" || \
+        test -z "$f_open_line" || test "$endpoint_cap_line" -ge "$source_read_line" || \
+        test "$endpoint_cap_line" -ge "$f_open_line"; then
+    echo 'FAIL: endpoint-map capacity must refuse before source read and F open' >&2
+    exit 1
+fi
+echo 'ok - endpoint-map capacity refusal precedes source read and F open'
+
+relationship_cap_line=$(grep -n -F \
+    'route_owner_->owner_count() >=' "$impl" | head -n 1 | cut -d: -f1)
+if test -z "$relationship_cap_line" || \
+        test "$relationship_cap_line" -ge "$source_read_line" || \
+        test "$relationship_cap_line" -ge "$f_open_line"; then
+    echo 'FAIL: known relationship capacity must refuse before source read and F open' >&2
+    exit 1
+fi
+echo 'ok - known relationship capacity refusal precedes source read and F open'
 
 if sed -n '/^icecc_cache_service_CPPFLAGS =/,/^icecc_cache_service_CXXFLAGS =/p' \
     "$product_makefile" | grep -Fq 'ICECC_P50_ENDPOINT_TEST_HOOKS'; then

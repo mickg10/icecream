@@ -154,8 +154,11 @@ int main(int argc, char **argv)
         return 2;
     }
     signal(SIGPIPE, SIG_IGN);
-    char temp_template[] = "/tmp/icecream-p49-daemon.XXXXXX";
-    char *temp = mkdtemp(temp_template);
+    const char *temporary_root = std::getenv("TMPDIR");
+    std::string temp_template =
+        std::string(temporary_root && temporary_root[0] ? temporary_root : "/tmp")
+        + "/icecream-p49-daemon.XXXXXX";
+    char *temp = mkdtemp(&temp_template[0]);
     if (!temp) return 2;
     const std::string work(temp);
     const std::string envdir = work + "/envs";

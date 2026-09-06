@@ -11,6 +11,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -359,6 +360,7 @@ std::string action_jsonl(const ActionRecord& record) {
     std::ostringstream out;
     out << "{\"action\":\"" << action_name(record.action)
         << "\",\"actor\":\"" << actor_name(record.actor)
+        << "\",\"profile\":\"" << profile_name(record.profile)
         << "\",\"c_store_guid\":\"" << bytes_hex(record.c_store_guid.bytes)
         << "\",\"f_store_guid\":\"" << bytes_hex(record.f_store_guid.bytes)
         << "\",\"previous_f_store_guid\":\""
@@ -395,18 +397,24 @@ void write_action_trace(const ActionTrace& trace, const std::string& path) {
 }
 
 std::optional<std::string> check_action_trace(std::span<const ActionRecord> records) {
-    using RelationshipKey = std::pair<CStoreGuid, FStoreGuid>;
+    using RelationshipKey = std::tuple<CStoreGuid, FStoreGuid, ProfileId>;
     std::map<RelationshipKey, RelationshipCheckerState> relationships;
     for (size_t index = 0; index != records.size(); ++index) {
         const ActionRecord& record = records[index];
+        if (profile_bit(record.profile) == 0 ||
+            (profile_bit(record.profile) & kOperationalProfileMask) == 0)
+            return "action " + std::to_string(index) +
+                   ": profile is not operational";
         RelationshipCheckerState& relationship =
-            relationships[{record.c_store_guid, record.f_store_guid}];
+            relationships[{record.c_store_guid, record.f_store_guid,
+                           record.profile}];
         CCheckerState& c = relationship.c;
         FCheckerState& f = relationship.f;
         const auto error = [&](std::string_view detail) -> std::optional<std::string> {
             return "action " + std::to_string(index) + " (" +
                    std::string(actor_name(record.actor)) + "/" +
-                   std::string(action_name(record.action)) + "): " +
+                   std::string(action_name(record.action)) + "/" +
+                   std::string(profile_name(record.profile)) + "): " +
                    std::string(detail);
         };
         const auto current_f_session = [&] {
@@ -415,23 +423,44 @@ std::optional<std::string> check_action_trace(std::span<const ActionRecord> reco
         };
         switch (record.action) {
         case ActionType::SESSION_OPENED:
-        case ActionType::SESSION_REPLACED:
+        case ActionType::SESSION_REPLACED: {
             if (record.actor != ActorSide::F)
                 return error("session transition was not emitted by F");
             if (record.session_serial == 0) return error("session serial is zero");
-            if (f.connected != (record.action == ActionType::SESSION_REPLACED))
+
+            FCheckerState* connected = nullptr;
+            uint64_t last_session_serial = 0;
+            for (auto& [key, candidate] : relationships) {
+                if (std::get<0>(key) != record.c_store_guid ||
+                    std::get<1>(key) != record.f_store_guid)
+                    continue;
+                last_session_serial =
+                    std::max(last_session_serial,
+                             candidate.f.last_session_serial);
+                if (candidate.f.connected) {
+                    if (connected != nullptr)
+                        return error("multiple profile sessions were live");
+                    connected = &candidate.f;
+                }
+            }
+            if ((connected != nullptr) !=
+                (record.action == ActionType::SESSION_REPLACED))
                 return error("open/replace does not match the current F session");
-            if (record.session_serial <= f.last_session_serial)
+            if (record.session_serial <= last_session_serial)
                 return error("session serial was reused or did not increase");
-            if (record.action == ActionType::SESSION_REPLACED &&
-                f.commit_unacknowledged)
-                f.commit_disconnected = true;
+            if (connected != nullptr) {
+                if (connected->commit_unacknowledged)
+                    connected->commit_disconnected = true;
+                connected->connected = false;
+                clear_f_pending(*connected);
+            }
             f.connected = true;
             f.session_serial = record.session_serial;
             f.last_session_serial = record.session_serial;
             f.reset_used_in_session = false;
             clear_f_pending(f);
             break;
+        }
         case ActionType::SESSION_DISCONNECTED:
             if (!current_f_session())
                 return error("disconnect does not name the current session");
@@ -445,7 +474,8 @@ std::optional<std::string> check_action_trace(std::span<const ActionRecord> reco
                 record.previous_f_store_guid == record.f_store_guid)
                 return error("incarnation replacement lacks distinct old/new F identities");
             const auto old_position = relationships.find(
-                {record.c_store_guid, record.previous_f_store_guid});
+                {record.c_store_guid, record.previous_f_store_guid,
+                 record.profile});
             if (old_position == relationships.end() ||
                 !old_position->second.c.active ||
                 *old_position->second.c.active != tx_identity(record))

@@ -43,7 +43,7 @@ public:
             if (c_guid_ == CStoreGuid{})
                 c_guid_ = c_guid_from_begin(value);
             if (!session_) {
-                session_ = store_.connect(c_guid_);
+                session_ = store_.connect(c_guid_, ProfileId::P29V1);
                 const SessionState route = store_.resume(*session_);
                 if (!route.route_present)
                     store_.start_route(*session_, value.history_nonce,

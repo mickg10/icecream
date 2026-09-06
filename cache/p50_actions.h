@@ -37,6 +37,9 @@ std::string_view actor_name(ActorSide actor);
 struct ActionRecord {
     ActionType action = ActionType::SESSION_OPENED;
     ActorSide actor = ActorSide::F;
+    // Route identity is (C store, F store, profile).  A single C/F pair may
+    // retain independent P29V1, ZSTD_TU, and ZSTD_ROUTE cursors.
+    ProfileId profile = ProfileId::P29V1;
     CStoreGuid c_store_guid{};
     FStoreGuid f_store_guid{};
     FStoreGuid previous_f_store_guid{};

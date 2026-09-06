@@ -90,6 +90,22 @@ void test_source_transfer_operation_wire() {
     CHECK(local::decode_control_operation(reply_wire, decoded));
     CHECK(decoded.source_result.has_value());
     CHECK(decoded.source_result->tu_seq == 0);
+
+    local::P50SourceTransferResult replacement;
+    replacement.code = local::SourceTransferResultCode::Error;
+    replacement.error_code = static_cast<uint16_t>(
+        local::SourceTransferErrorCode::RouteReplacementRequired);
+    replacement.attempts = 2;
+    const auto replacement_reply =
+        local::make_source_transfer_reply_operation(request, replacement);
+    const auto replacement_wire = local::encode_control_operation(replacement_reply);
+    CHECK(replacement_wire.size() == local::kSourceTransferOperationBytes);
+    CHECK(local::decode_control_operation(replacement_wire, decoded));
+    CHECK(decoded.source_result.has_value());
+    CHECK(decoded.source_result->code == local::SourceTransferResultCode::Error);
+    CHECK(decoded.source_result->error_code == static_cast<uint16_t>(
+        local::SourceTransferErrorCode::RouteReplacementRequired));
+    CHECK(decoded.source_result->attempts == 2);
 }
 
 ZstdSourceTransferResult route_call(
@@ -391,14 +407,17 @@ void test_long_lived_relationship_owner() {
     CHECK(third_result.status == ZstdSourceTransferStatus::Committed);
     CHECK(third_result.committed_input->tu_seq.value == 2);
 
-    // A bounded connection failure is retried with the same preparation; it
-    // cannot consume TU3 before a later exact retry commits.
+    // A bounded connection failure poisons only its own relationship owner.
+    // The exact retired F incarnation cannot be reset while its uncommitted
+    // preparation is live, and no later wrapper may reopen F through it.
+    P50CRouteOwner failed_owner(config());
+    const auto failed_route = relationship(111, 211, 1);
     context.restart();
     unsigned failed_connections = 0;
     auto failed = asio::co_spawn(
         context,
-        owner.transfer(
-            first_route, {7001, 4},
+        failed_owner.transfer(
+            failed_route, {7011, 1},
             ConnectedFdFactory{[&failed_connections](auto) {
                 ++failed_connections;
                 return -1;
@@ -407,8 +426,48 @@ void test_long_lived_relationship_owner() {
             std::span<const uint8_t>(third)),
         asio::use_future);
     context.run();
-    CHECK(failed.get().status == ZstdSourceTransferStatus::RetryExhausted);
+    const auto failed_result = failed.get();
+    CHECK(failed_result.status == ZstdSourceTransferStatus::RetryExhausted);
+    CHECK(failed_result.replacement_required);
     CHECK(failed_connections == 2);
+    unsigned poisoned_connections = 0;
+    const auto other_failed_route = relationship(111, 212, 1);
+    context.restart();
+    auto poisoned = asio::co_spawn(
+        context,
+        failed_owner.transfer(
+            other_failed_route, {7012, 1},
+            ConnectedFdFactory{[&poisoned_connections](auto) {
+                ++poisoned_connections;
+                return -1;
+            }},
+            std::chrono::steady_clock::now() + std::chrono::seconds(10),
+            std::span<const uint8_t>(third)),
+        asio::use_future);
+    context.run();
+    const auto poisoned_result = poisoned.get();
+    CHECK(poisoned_result.status == ZstdSourceTransferStatus::Unavailable);
+    CHECK(poisoned_result.replacement_required);
+    CHECK(poisoned_connections == 0);
+    CHECK(failed_owner.owner_count() == 1 && !failed_owner.owns(other_failed_route));
+    context.restart();
+    auto sticky = asio::co_spawn(
+        context,
+        failed_owner.transfer(
+            other_failed_route, {7012, 2},
+            ConnectedFdFactory{[&poisoned_connections](auto) {
+                ++poisoned_connections;
+                return -1;
+            }},
+            std::chrono::steady_clock::now() + std::chrono::seconds(10),
+            std::span<const uint8_t>(third)),
+        asio::use_future);
+    context.run();
+    CHECK(sticky.get().replacement_required);
+    CHECK(poisoned_connections == 0);
+    CHECK(!failed_owner.reset_f_store_exact(Id128::from_u64(211), 1));
+
+    // The healthy relationship is independent and advances normally to TU3.
     auto fourth_result = route_call(context, owner, server, acceptor, first_route,
                                     {7001, 4}, third);
     CHECK(fourth_result.status == ZstdSourceTransferStatus::Committed);
@@ -475,7 +534,9 @@ void test_long_lived_relationship_owner() {
 
     // Explicit F generation reset drops old route history; the replacement
     // route does not rewind the C-wide allocator.
-    owner.reset_f_store(Id128::from_u64(201), 2);
+    CHECK(owner.reset_f_store_exact(Id128::from_u64(201), 2));
+    CHECK(owner.owns(first_route));
+    CHECK(owner.reset_f_store_exact(Id128::from_u64(201), 1));
     CHECK(!owner.owns(first_route) && owner.owner_count() == 2);
     const auto replacement_route = relationship(101, 201, 2);
     server.reset_store(Id128::from_u64(201));
@@ -528,13 +589,15 @@ void test_p29v1_retry_and_reset_owner() {
     CHECK(second.status == ZstdSourceTransferStatus::Committed);
     CHECK(second.committed_input->tu_seq.value == 1);
 
-    // A failed route attempt leaves the exact prepared request available for
-    // the bounded retry path and cannot consume the next TU sequence.
+    // A failed route attempt makes its isolated owner demand replacement;
+    // the healthy owner remains available and allocates its next TU normally.
+    P50CRouteOwner failed_owner(config(ProfileId::P29V1));
+    const auto failed_route = relationship(151, 251, 1, ProfileId::P29V1);
     unsigned failed_connections = 0;
     context.restart();
     auto failed = asio::co_spawn(
         context,
-        owner.transfer(route, {7101, 3},
+        failed_owner.transfer(failed_route, {7151, 1},
                        ConnectedFdFactory{[&failed_connections](auto) {
                            ++failed_connections;
                            return -1;
@@ -543,11 +606,14 @@ void test_p29v1_retry_and_reset_owner() {
                        repeated),
         asio::use_future);
     context.run();
-    CHECK(failed.get().status == ZstdSourceTransferStatus::RetryExhausted);
+    const auto failed_result = failed.get();
+    CHECK(failed_result.status == ZstdSourceTransferStatus::RetryExhausted);
+    CHECK(failed_result.replacement_required);
     CHECK(failed_connections == 2);
-    auto retried = route_call(context, owner, server, acceptor, route, {7101, 3}, repeated);
-    CHECK(retried.status == ZstdSourceTransferStatus::Committed);
-    CHECK(retried.committed_input->tu_seq.value == 2);
+    CHECK(!failed_owner.reset_f_store_exact(Id128::from_u64(251), 1));
+    auto third = route_call(context, owner, server, acceptor, route, {7101, 3}, repeated);
+    CHECK(third.status == ZstdSourceTransferStatus::Committed);
+    CHECK(third.committed_input->tu_seq.value == 2);
 
     // A different F relationship in the same C store has an independent route
     // but shares TU_SEQ; an unsupported profile fails closed without allocating
@@ -570,7 +636,9 @@ void test_p29v1_retry_and_reset_owner() {
 
     // Resetting the F generation drops both P29V1 route views; the replacement
     // starts fresh route history without rewinding TU_SEQ.
-    owner.reset_f_store(Id128::from_u64(241), 2);
+    CHECK(owner.reset_f_store_exact(Id128::from_u64(241), 2));
+    CHECK(owner.owns(route));
+    CHECK(owner.reset_f_store_exact(Id128::from_u64(241), 1));
     CHECK(owner.owner_count() == 1);
     server.reset_store(Id128::from_u64(243));
     const auto replacement = relationship(141, 243, 2, ProfileId::P29V1);
@@ -578,6 +646,107 @@ void test_p29v1_retry_and_reset_owner() {
                             {7104, 1}, repeated);
     CHECK(reset.status == ZstdSourceTransferStatus::Committed);
     CHECK(reset.committed_input->tu_seq.value == 4);
+}
+
+void test_relationship_table_cap_requests_replacement() {
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    EndpointCaps server_caps;
+    server_caps.profile = ProfileId::ZSTD_ROUTE;
+    server_caps.supported_profiles = kOperationalProfileMask;
+    server_caps.zstd = config().endpoint_caps.zstd;
+    P50ServerEndpoint server(
+        Id128::from_u64(271), server_caps, nullptr, nullptr,
+        P50ServerEndpointConfig{
+            .input_job_state = [](CStoreGuid, const TxBegin&, const TxCommit&,
+                                  std::span<const uint8_t>) {
+                return InputJobState::Open;
+            }});
+    P50RouteOwnerConfig bounded = config();
+    bounded.max_relationships = 1;
+    P50CRouteOwner owner(bounded);
+    const std::vector<uint8_t> source{'c', 'a', 'p'};
+    const auto first_route = relationship(171, 271, 1);
+    const auto first = route_call(context, owner, server, acceptor, first_route,
+                                  {7401, 1}, source);
+    CHECK(first.status == ZstdSourceTransferStatus::Committed);
+    CHECK(owner.owner_count() == 1);
+
+    unsigned connections = 0;
+    context.restart();
+    auto capped = asio::co_spawn(
+        context,
+        owner.transfer(
+            relationship(171, 272, 1), {7402, 1},
+            ConnectedFdFactory{[&connections](auto) {
+                ++connections;
+                return -1;
+            }},
+            std::chrono::steady_clock::now() + std::chrono::seconds(10), source),
+        asio::use_future);
+    context.run();
+    const auto capped_result = capped.get();
+    CHECK(capped_result.status == ZstdSourceTransferStatus::Unavailable);
+    CHECK(capped_result.replacement_required);
+    CHECK(connections == 0);
+    CHECK(owner.owner_count() == 1 && owner.owns(first_route));
+}
+
+void test_typed_poison_catch_is_owner_wide() {
+    P50RouteOwnerConfig injected = config(ProfileId::P29V1);
+    unsigned injections = 0;
+    injected.before_prepare_for_route_for_test = [&injections]() {
+        ++injections;
+        throw P50RoutePoisoned("injected begin_v1 terminalization");
+    };
+    P50CRouteOwner owner(std::move(injected));
+    const auto first_route = relationship(181, 281, 1, ProfileId::P29V1);
+    const std::vector<uint8_t> source{'p', 'o', 'i', 's', 'o', 'n'};
+
+    unsigned first_connections = 0;
+    asio::io_context context;
+    auto first = asio::co_spawn(
+        context,
+        owner.transfer(
+            first_route, {7501, 1},
+            ConnectedFdFactory{[&first_connections](auto) {
+                ++first_connections;
+                return -1;
+            }},
+            std::chrono::steady_clock::now() + std::chrono::seconds(10), source),
+        asio::use_future);
+    context.run();
+    const auto first_result = first.get();
+    CHECK(first_result.status == ZstdSourceTransferStatus::TerminalError);
+    CHECK(first_result.replacement_required);
+    CHECK(injections == 1);
+    CHECK(first_connections == 0);
+    CHECK(owner.owner_count() == 1 && owner.owns(first_route));
+
+    // The seam injects the typed result at the sender's prepare boundary; it
+    // does not claim to exercise begin_v1's internal terminalization.  The
+    // contract of P50RoutePoisoned says that terminalization already happened,
+    // so its first observer must poison the whole C owner and refuse another F
+    // before sender construction, preparation, or connection.
+    unsigned successor_connections = 0;
+    context.restart();
+    auto successor = asio::co_spawn(
+        context,
+        owner.transfer(
+            relationship(181, 282, 1, ProfileId::P29V1), {7502, 1},
+            ConnectedFdFactory{[&successor_connections](auto) {
+                ++successor_connections;
+                return -1;
+            }},
+            std::chrono::steady_clock::now() + std::chrono::seconds(10), source),
+        asio::use_future);
+    context.run();
+    const auto successor_result = successor.get();
+    CHECK(successor_result.status == ZstdSourceTransferStatus::Unavailable);
+    CHECK(successor_result.replacement_required);
+    CHECK(injections == 1);
+    CHECK(successor_connections == 0);
+    CHECK(owner.owner_count() == 1);
 }
 
 void test_p29v1_relationship_owner() {
@@ -623,6 +792,44 @@ void test_p29v1_relationship_owner() {
     CHECK(owner.owner_count() == 1 && owner.owns(route));
 }
 
+void test_interner_fault_is_sticky_only_for_p29v1() {
+    P50RouteOwnerConfig owner_config = config(ProfileId::P29V1);
+    P50PreparationAuthority authority(
+        Id128::from_u64(191), owner_config.endpoint_caps.zstd,
+        owner_config.authority_limits, owner_config.compression_level,
+        ProfileId::P29V1, TuSeq{}, P29InternerFaultInjection::FailOnce);
+    const PreparationRouteKey p29_route{
+        Id128::from_u64(291), 1, ProfileId::P29V1};
+    const std::vector<uint8_t> source{
+        '#', ' ', '1', ' ', '"', 'f', 'a', 'u', 'l', 't', '"', '\n',
+        's', 'a', 'm', 'e', '\n', 's', 'a', 'm', 'e', '\n'};
+
+    bool first_typed = false;
+    try {
+        (void)authority.prepare_for_route(p29_route, {7601, 1}, source);
+    } catch (const P29V1CapabilityUnavailable&) {
+        first_typed = true;
+    }
+    CHECK(first_typed);
+
+    bool second_typed = false;
+    try {
+        (void)authority.prepare_for_route(p29_route, {7601, 2}, source);
+    } catch (const P29V1CapabilityUnavailable&) {
+        second_typed = true;
+    }
+    CHECK(second_typed);
+
+    const PreparationRouteKey zstd_route{
+        Id128::from_u64(292), 1, ProfileId::ZSTD_TU};
+    const PreparedTuHandle zstd =
+        authority.prepare_for_route(zstd_route, {7601, 3}, source);
+    CHECK(authority.prepared_profile(zstd) == ProfileId::ZSTD_TU);
+    CHECK(authority.prepared_tu_seq(zstd) == TuSeq{0});
+    authority.commit(zstd);
+    CHECK(authority.release(zstd) == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -634,4 +841,7 @@ int main() {
     test_relationship_validation();
     test_p29v1_retry_and_reset_owner();
     test_p29v1_relationship_owner();
+    test_relationship_table_cap_requests_replacement();
+    test_typed_poison_catch_is_owner_wide();
+    test_interner_fault_is_sticky_only_for_p29v1();
 }

@@ -316,6 +316,11 @@ void test_p50_legacy_compile_file_conservation()
             "F rejects attaching a decoded CompileFile to another job");
     REQUIRE(pair.receiver->set_p50_legacy_wire_identity(identity),
             "F binds the exact decoded CompileFile identity");
+    REQUIRE(pair.receiver->p50_legacy_wire_prepare_trace(),
+            "F opens its evidence destination before environment entry");
+    const std::string moved_f_path = std::string(f_path) + ".inside";
+    REQUIRE(rename(f_path, moved_f_path.c_str()) == 0,
+            "F trace test hides the original pathname after preparation");
     send_chunk(pair.sender, "legacy-source");
     REQUIRE(pair.sender->send_msg(EndMsg()),
             "C sends the source terminator after CompileFile");
@@ -335,7 +340,7 @@ void test_p50_legacy_compile_file_conservation()
             "C completes after all legacy frames arrive");
 
     std::ifstream c_input(c_path);
-    std::ifstream f_input(f_path);
+    std::ifstream f_input(moved_f_path);
     std::string c_line, f_line;
     std::getline(c_input, c_line);
     std::getline(f_input, f_line);
@@ -386,6 +391,7 @@ void test_p50_legacy_compile_file_conservation()
     unsetenv("ICECC_P50_F_LEGACY_WIRE_TRACE");
     unlink(c_path);
     unlink(f_path);
+    unlink(moved_f_path.c_str());
 }
 
 void test_pre_p50_compile_file_remains_legacy()

@@ -102,6 +102,17 @@ void validate_caps(const EndpointCaps& caps) {
         throw std::invalid_argument("endpoint profile is not supported");
 }
 
+ProfileId require_single_route_profile(uint32_t mask) {
+    if (mask == profile_bit(ProfileId::P29V1))
+        return ProfileId::P29V1;
+    if (mask == profile_bit(ProfileId::ZSTD_TU))
+        return ProfileId::ZSTD_TU;
+    if (mask == profile_bit(ProfileId::ZSTD_ROUTE))
+        return ProfileId::ZSTD_ROUTE;
+    throw std::invalid_argument(
+        "one CacheWire session must select exactly one route profile");
+}
+
 GlobalResourceLimits global_resource_limits(const P50ServerOwnerLimits& limits) {
     if (limits.max_retained_input_bytes >
             std::numeric_limits<uint64_t>::max() / 2 ||
@@ -818,11 +829,13 @@ template <class T> T decode_as(const Frame& frame) {
 }
 
 ActionRecord action_record(ActionType action, ActorSide actor, CStoreGuid c_guid, FStoreGuid f_guid,
-                           uint64_t session_serial, const TxBegin* begin, HistoryNonce nonce,
+                           ProfileId profile, uint64_t session_serial,
+                           const TxBegin* begin, HistoryNonce nonce,
                            RelSeq rel, Digest128 state_digest) {
     ActionRecord record;
     record.action = action;
     record.actor = actor;
+    record.profile = profile;
     record.c_store_guid = c_guid;
     record.f_store_guid = f_guid;
     record.session_serial = session_serial;
@@ -909,7 +922,8 @@ struct P50PreparationAuthority::Impl {
 
     Impl(CStoreGuid c_store_guid_value, ZstdTuLimits zstd_limits_value,
          PreparationAuthorityLimits authority_limits_value, int compression_level,
-         ProfileId profile_value, TuSeq first_tu_seq)
+         ProfileId profile_value, TuSeq first_tu_seq,
+         P29InternerFaultInjection fault_injection)
         : c_guid(c_store_guid_value), zstd_limits(zstd_limits_value),
           authority_limits(authority_limits_value), codec(compression_level),
           identity(std::make_shared<const uint8_t>(0)), route_codec(3),
@@ -927,7 +941,8 @@ struct P50PreparationAuthority::Impl {
             profile != ProfileId::ZSTD_ROUTE)
             throw std::invalid_argument("preparation authority profile is unsupported");
         p29_authority = std::make_unique<CAuthority>(
-            c_guid, p29::OnlineS1::Config{}, first_tu_seq);
+            c_guid, p29::OnlineS1::Config{}, first_tu_seq,
+            fault_injection);
         if (profile == ProfileId::P29V1)
             ensure_p29v1();
     }
@@ -935,9 +950,13 @@ struct P50PreparationAuthority::Impl {
     void ensure_p29v1() {
         if (p29v1_enabled)
             return;
-        p29_authority->enable_p29v1(
-            authority_limits.max_interner_reserved_bytes,
-            zstd_limits.max_raw_bytes);
+        try {
+            p29_authority->enable_p29v1(
+                authority_limits.max_interner_reserved_bytes,
+                zstd_limits.max_raw_bytes);
+        } catch (const std::length_error& error) {
+            throw P29V1CapabilityUnavailable(error.what());
+        }
         p29v1_enabled = true;
     }
 
@@ -1009,8 +1028,18 @@ P50PreparationAuthority::P50PreparationAuthority(
     CStoreGuid c_store_guid, ZstdTuLimits zstd_limits,
     PreparationAuthorityLimits authority_limits, int compression_level,
     ProfileId profile, TuSeq first_tu_seq)
+    : P50PreparationAuthority(
+          c_store_guid, zstd_limits, authority_limits, compression_level,
+          profile, first_tu_seq, P29InternerFaultInjection::Disabled) {}
+
+P50PreparationAuthority::P50PreparationAuthority(
+    CStoreGuid c_store_guid, ZstdTuLimits zstd_limits,
+    PreparationAuthorityLimits authority_limits, int compression_level,
+    ProfileId profile, TuSeq first_tu_seq,
+    P29InternerFaultInjection fault_injection)
     : impl_(std::make_unique<Impl>(c_store_guid, zstd_limits, authority_limits,
-                                   compression_level, profile, first_tu_seq)) {}
+                                   compression_level, profile, first_tu_seq,
+                                   fault_injection)) {}
 
 P50PreparationAuthority::~P50PreparationAuthority() = default;
 
@@ -1095,9 +1124,21 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
                 PreparedInputEnvelope{envelope.begin, envelope.body});
         } else if (route.profile == ProfileId::P29V1) {
             if (!shared->p29_source) {
-                shared->p29_source =
-                    impl_->p29_authority->prepare_p29v1_at_seq(
-                        exact_input, shared->tu_seq, shared->raw_digest);
+                try {
+                    shared->p29_source =
+                        impl_->p29_authority->prepare_p29v1_at_seq(
+                            exact_input, shared->tu_seq, shared->raw_digest);
+                } catch (...) {
+                    /* The interner marks itself permanently non-runnable for
+                       any failure after processing begins.  Translate only
+                       that owner state; the per-TU size check happens before
+                       the interner's guarded region and remains an ordinary
+                       length_error. */
+                    if (!impl_->p29_authority->p29v1_runnable())
+                        throw P29V1CapabilityUnavailable(
+                            "P29V1 interner is not runnable until READY lease replacement");
+                    throw;
+                }
             }
             if (shared->p29_source->tu_seq != tu_seq)
                 throw std::logic_error("P29V1 shared TU identity changed");
@@ -1681,8 +1722,10 @@ struct P50ClientEndpoint::Impl {
                 Digest128 state_digest) {
         if (!actions || !f_guid)
             return;
-        actions->record(action_record(action, ActorSide::C, c_guid, *f_guid, serial, &begin,
-                                      begin.history_nonce, begin.rel_seq, state_digest));
+        actions->record(action_record(action, ActorSide::C, c_guid, *f_guid,
+                                      begin.profile, serial, &begin,
+                                      begin.history_nonce, begin.rel_seq,
+                                      state_digest));
     }
 
     void record_incarnation_replaced(FStoreGuid previous, FStoreGuid replacement,
@@ -1690,7 +1733,8 @@ struct P50ClientEndpoint::Impl {
         if (!actions)
             return;
         ActionRecord value = action_record(ActionType::F_STORE_INCAR_REPLACED, ActorSide::C,
-                                           c_guid, replacement, serial, &retained,
+                                           c_guid, replacement, retained.profile,
+                                           serial, &retained,
                                            retained.history_nonce, retained.rel_seq,
                                            retained.pre_state_digest);
         value.previous_f_store_guid = previous;
@@ -1820,8 +1864,10 @@ struct P50ServerEndpoint::Impl {
         bool established = false;
         uint64_t active_session = 0;
         uint64_t last_touch = 0;
-        std::optional<HistoryNonce> nonce_high_water;
-        std::optional<Route> route;
+        // A codec is part of route identity.  Histories and persistent
+        // dialogues for one C/F pair therefore remain disjoint by profile.
+        std::map<ProfileId, HistoryNonce> nonce_high_water;
+        std::map<ProfileId, Route> routes;
         std::optional<InputRecordKey> last_input;
         std::vector<Key64> p29v1_segments;
     };
@@ -1836,6 +1882,7 @@ struct P50ServerEndpoint::Impl {
         std::optional<daemon::P50FSessionOperationId> operation;
         std::optional<sidecar::AbsoluteMonotonicDeadline> deadline;
         std::optional<CStoreGuid> c_guid;
+        std::optional<ProfileId> profile;
         uint64_t candidate_revision = 0;
         HistoryNonce candidate_nonce{};
         RelSeq candidate_rel{};
@@ -1850,6 +1897,7 @@ struct P50ServerEndpoint::Impl {
         std::optional<daemon::P50FSessionOperationId> operation;
         std::optional<sidecar::AbsoluteMonotonicDeadline> deadline;
         std::optional<CStoreGuid> c_guid;
+        std::optional<ProfileId> profile;
         uint64_t candidate_revision = 0;
         Digest128 candidate_c_fingerprint{};
         Digest128 candidate_f_fingerprint{};
@@ -1915,6 +1963,7 @@ struct P50ServerEndpoint::Impl {
                                 .operation = operation,
                                 .deadline = deadline,
                                 .c_guid = std::nullopt,
+                                .profile = std::nullopt,
                                 .candidate_revision = 0,
                                 .candidate_nonce = HistoryNonce{},
                                 .candidate_rel = RelSeq{},
@@ -1926,6 +1975,7 @@ struct P50ServerEndpoint::Impl {
                        .operation = operation,
                        .deadline = deadline,
                        .c_guid = std::nullopt,
+                       .profile = std::nullopt,
                        .candidate_revision = 0,
                        .candidate_state = std::nullopt,
                        .activated = false};
@@ -1991,6 +2041,16 @@ struct P50ServerEndpoint::Impl {
         return *key;
     }
 
+    static Route* find_route(Namespace& space, ProfileId profile) {
+        const auto position = space.routes.find(profile);
+        return position == space.routes.end() ? nullptr : &position->second;
+    }
+
+    static const Route* find_route(const Namespace& space, ProfileId profile) {
+        const auto position = space.routes.find(profile);
+        return position == space.routes.end() ? nullptr : &position->second;
+    }
+
     void release_p29v1_segments(CStoreGuid c_guid, Namespace& space) {
         for (const Key64 key : space.p29v1_segments)
             global_resources->release(c_guid, key);
@@ -1998,16 +2058,17 @@ struct P50ServerEndpoint::Impl {
     }
 
     void invalidate_p29v1_codec(CStoreGuid c_guid, Namespace& space) {
-        if (!space.route ||
-            space.route->dialogue_profile != ProfileId::P29V1)
+        Route* const route = find_route(space, ProfileId::P29V1);
+        if (route == nullptr ||
+            route->dialogue_profile != ProfileId::P29V1)
             return;
         release_p29v1_segments(c_guid, space);
-        if (space.route->dialogue) {
-            space.route->dialogue->reset();
-            space.route->dialogue.reset();
+        if (route->dialogue) {
+            route->dialogue->reset();
+            route->dialogue.reset();
         }
-        space.route->dialogue_profile.reset();
-        space.route->codec_history_reset_required = true;
+        route->dialogue_profile.reset();
+        route->codec_history_reset_required = true;
     }
 
     void finish_global_pending(Pending& pending, bool crash) {
@@ -2055,10 +2116,14 @@ struct P50ServerEndpoint::Impl {
         if (position == namespaces.end())
             return false;
         const Namespace& space = position->second;
+        const bool routes_quiescent = std::all_of(
+            space.routes.begin(), space.routes.end(),
+            [](const auto& item) {
+                return !item.second.pending && !item.second.interrupted;
+            });
         return space.active_session == 0 &&
                !namespace_has_live_session(c_guid) &&
-               (!space.route ||
-                (!space.route->pending && !space.route->interrupted)) &&
+               routes_quiescent &&
                input_records.namespace_evictable(c_guid);
     }
 
@@ -2208,6 +2273,26 @@ struct P50ServerEndpoint::Impl {
         return position->second;
     }
 
+    Route& require_route(const Session& session) {
+        Namespace& space = require(session);
+        if (!session.profile)
+            throw StaleCompletion();
+        Route* const route = find_route(space, *session.profile);
+        if (route == nullptr)
+            throw std::logic_error("F profile route has not been established");
+        return *route;
+    }
+
+    const Route& require_route(const Session& session) const {
+        const Namespace& space = require(session);
+        if (!session.profile)
+            throw StaleCompletion();
+        const Route* const route = find_route(space, *session.profile);
+        if (route == nullptr)
+            throw std::logic_error("F profile route has not been established");
+        return *route;
+    }
+
     CompletionStamp stamp(const Session& session, AsyncOperationKind operation,
                           const TxBegin* explicit_begin = nullptr) const {
         CompletionStamp result;
@@ -2219,10 +2304,14 @@ struct P50ServerEndpoint::Impl {
         result.absolute_deadline = session.deadline;
         result.session_serial = session.serial;
         const TxBegin* begin = explicit_begin;
-        if (!begin && session.activated && session.c_guid) {
+        if (!begin && session.activated && session.c_guid && session.profile) {
             const auto position = namespaces.find(*session.c_guid);
-            if (position != namespaces.end() && position->second.route) {
-                const Route& route = *position->second.route;
+            if (position != namespaces.end()) {
+                const Route* const selected =
+                    find_route(position->second, *session.profile);
+                if (selected == nullptr)
+                    return result;
+                const Route& route = *selected;
                 result.history_nonce = route.nonce;
                 result.rel_seq = route.next_rel;
                 if (route.pending)
@@ -2270,12 +2359,11 @@ struct P50ServerEndpoint::Impl {
             result.rel_seq = current.candidate_rel;
             return result;
         }
-        if (!session.c_guid || *session.c_guid != *current.c_guid || !session.activated)
+        if (!session.c_guid || *session.c_guid != *current.c_guid ||
+            !session.profile || session.profile != current.profile ||
+            !session.activated)
             throw StaleCompletion();
-        const Namespace& space = require(session);
-        if (!space.route)
-            return result;
-        const Route& route = *space.route;
+        const Route& route = require_route(session);
         result.history_nonce = route.nonce;
         result.rel_seq = route.next_rel;
         if (route.pending) {
@@ -2288,20 +2376,25 @@ struct P50ServerEndpoint::Impl {
 
     void record(ActionType action, const Session& session, const TxBegin* begin = nullptr,
                 Digest128 state_override = {}) {
-        if (!actions || !session.c_guid)
+        if (!actions || !session.c_guid || !session.profile)
             return;
         HistoryNonce nonce{};
         RelSeq rel{};
         Digest128 state_value = state_override;
         const auto position = namespaces.find(*session.c_guid);
-        if (position != namespaces.end() && position->second.route) {
-            nonce = position->second.route->nonce;
-            rel = position->second.route->next_rel;
-            if (state_value == Digest128{})
-                state_value = position->second.route->state;
+        if (position != namespaces.end() && session.profile) {
+            const Route* const selected =
+                find_route(position->second, *session.profile);
+            if (selected != nullptr) {
+                nonce = selected->nonce;
+                rel = selected->next_rel;
+                if (state_value == Digest128{})
+                    state_value = selected->state;
+            }
         }
         ActionRecord value = action_record(action, ActorSide::F, *session.c_guid, f_guid,
-                                           session.serial, begin, nonce, rel, state_value);
+                                           *session.profile, session.serial,
+                                           begin, nonce, rel, state_value);
         if (action == ActionType::NEED_RECORDED) {
             value.need_keys.clear();
             value.remaining_need = 0;
@@ -2356,6 +2449,8 @@ struct P50ServerEndpoint::Impl {
 
     SessionState snapshot(const SessionHello& hello,
                           SessionSelection selection) const {
+        const ProfileId profile =
+            require_single_route_profile(selection.negotiated_profiles);
         SessionState result;
         result.wire_revision = selection.wire_revision;
         result.negotiated_profiles = selection.negotiated_profiles;
@@ -2366,20 +2461,21 @@ struct P50ServerEndpoint::Impl {
         if (position == namespaces.end())
             return result;
         const Namespace& space = position->second;
+        const Route* const route = find_route(space, profile);
         result.namespace_present = space.established;
-        result.route_present = space.route.has_value() &&
-                               !space.route->codec_history_reset_required;
+        result.route_present = route != nullptr &&
+                               !route->codec_history_reset_required;
         if (result.route_present) {
             if (hello.system_source_fingerprint !=
-                space.route->c_system_source_fingerprint)
+                route->c_system_source_fingerprint)
                 throw std::logic_error(
                     "SESSION_HELLO fingerprint changed on an existing route");
             result.system_source_fingerprint =
-                space.route->f_system_source_fingerprint;
-            result.history_nonce = space.route->nonce;
-            result.next_rel_seq = space.route->next_rel;
-            result.state_digest = space.route->state;
-            result.last_commit = space.route->last_commit;
+                route->f_system_source_fingerprint;
+            result.history_nonce = route->nonce;
+            result.next_rel_seq = route->next_rel;
+            result.state_digest = route->state;
+            result.last_commit = route->last_commit;
         }
         return result;
     }
@@ -2389,15 +2485,19 @@ struct P50ServerEndpoint::Impl {
         require_incarnation(session);
         if (hello.c_store_guid == CStoreGuid{})
             throw std::invalid_argument("SESSION_HELLO C_STORE_GUID zero is reserved");
+        const ProfileId profile =
+            require_single_route_profile(selection.negotiated_profiles);
         const uint64_t revision = current_revision(hello.c_store_guid);
         SessionState state = snapshot(hello, selection);
         session.c_guid = hello.c_store_guid;
+        session.profile = profile;
         session.candidate_revision = revision;
         session.candidate_c_fingerprint = hello.system_source_fingerprint;
         session.candidate_f_fingerprint = state.system_source_fingerprint;
         session.candidate_state = state;
         LiveSession& live = live_sessions.at(session.serial);
         live.c_guid = hello.c_store_guid;
+        live.profile = profile;
         live.candidate_revision = revision;
         live.candidate_c_fingerprint = hello.system_source_fingerprint;
         live.candidate_f_fingerprint = state.system_source_fingerprint;
@@ -2410,10 +2510,12 @@ struct P50ServerEndpoint::Impl {
 
     void activate(Session& session) {
         require_incarnation(session);
-        if (!session.c_guid || !session.candidate_state || session.activated)
+        if (!session.c_guid || !session.profile || !session.candidate_state ||
+            session.activated)
             throw std::logic_error("F endpoint candidate cannot activate");
         LiveSession& live = live_sessions.at(session.serial);
-        if (!live.c_guid || *live.c_guid != *session.c_guid || live.activated)
+        if (!live.c_guid || *live.c_guid != *session.c_guid ||
+            live.profile != session.profile || live.activated)
             throw StaleCompletion();
         const uint64_t touch = reserve_namespace_touch();
         const bool new_namespace = !namespaces.contains(*session.c_guid);
@@ -2460,12 +2562,19 @@ struct P50ServerEndpoint::Impl {
 
         Namespace& space = position->second;
         const bool replaced = !namespace_inserted && space.active_session != 0;
-        if (space.route && space.route->pending) {
-            space.route->interrupted = space.route->pending->begin;
-            if (space.route->pending->dialogue)
-                space.route->pending->dialogue->discard_tentative();
-            release_pending(*space.route->pending);
-            space.route->pending.reset();
+        Route* replaced_route = nullptr;
+        if (replaced) {
+            const auto previous = live_sessions.find(space.active_session);
+            if (previous != live_sessions.end() && previous->second.profile)
+                replaced_route = find_route(
+                    space, *previous->second.profile);
+        }
+        if (replaced_route != nullptr && replaced_route->pending) {
+            replaced_route->interrupted = replaced_route->pending->begin;
+            if (replaced_route->pending->dialogue)
+                replaced_route->pending->dialogue->discard_tentative();
+            release_pending(*replaced_route->pending);
+            replaced_route->pending.reset();
         }
         space.active_session = session.serial;
         space.last_touch = touch;
@@ -2477,24 +2586,26 @@ struct P50ServerEndpoint::Impl {
     }
 
     void disconnect(const Session& session, bool retain_interrupted) {
-        if (!session.c_guid)
+        if (!session.c_guid || !session.profile)
             return;
         auto position = namespaces.find(*session.c_guid);
         if (position == namespaces.end() || position->second.active_session != session.serial)
             return;
         Namespace& space = position->second;
-        if (space.route && space.route->pending) {
+        Route* const route = find_route(space, *session.profile);
+        if (route != nullptr && route->pending) {
             if (retain_interrupted)
-                space.route->interrupted = space.route->pending->begin;
+                route->interrupted = route->pending->begin;
             else
-                space.route->interrupted.reset();
-            if (space.route->pending->dialogue)
-                space.route->pending->dialogue->discard_tentative();
-            release_pending(*space.route->pending);
-            space.route->pending.reset();
+                route->interrupted.reset();
+            if (route->pending->dialogue)
+                route->pending->dialogue->discard_tentative();
+            release_pending(*route->pending);
+            route->pending.reset();
         }
-        if (space.route && space.route->dialogue_profile == ProfileId::P29V1 &&
-            space.route->dialogue && space.route->dialogue->terminal())
+        if (route != nullptr && *session.profile == ProfileId::P29V1 &&
+            route->dialogue_profile == ProfileId::P29V1 &&
+            route->dialogue && route->dialogue->terminal())
             invalidate_p29v1_codec(*session.c_guid, space);
         record(ActionType::SESSION_DISCONNECTED, session);
         space.active_session = 0;
@@ -2504,6 +2615,11 @@ struct P50ServerEndpoint::Impl {
 
     SessionState session_state(const Session& session, SessionSelection selection) const {
         const Namespace& space = require(session);
+        if (!session.profile ||
+            *session.profile !=
+                require_single_route_profile(selection.negotiated_profiles))
+            throw StaleCompletion();
+        const Route* const route = find_route(space, *session.profile);
         SessionState result;
         result.wire_revision = selection.wire_revision;
         result.negotiated_profiles = selection.negotiated_profiles;
@@ -2511,51 +2627,63 @@ struct P50ServerEndpoint::Impl {
         result.f_store_guid = f_guid;
         result.system_source_fingerprint = p29_system_source_fingerprint();
         result.namespace_present = space.established;
-        result.route_present = space.route.has_value() &&
-                               !space.route->codec_history_reset_required;
+        result.route_present = route != nullptr &&
+                               !route->codec_history_reset_required;
         if (result.route_present) {
             result.system_source_fingerprint =
-                space.route->f_system_source_fingerprint;
-            result.history_nonce = space.route->nonce;
-            result.next_rel_seq = space.route->next_rel;
-            result.state_digest = space.route->state;
-            result.last_commit = space.route->last_commit;
+                route->f_system_source_fingerprint;
+            result.history_nonce = route->nonce;
+            result.next_rel_seq = route->next_rel;
+            result.state_digest = route->state;
+            result.last_commit = route->last_commit;
         }
         return result;
     }
 
-    void validate_history_reset(CStoreGuid c_guid, const Namespace* space,
+    void validate_history_reset(CStoreGuid c_guid, ProfileId profile,
+                                const Namespace* space,
                                 const HistoryReset& reset) const {
-        if (space && space->route &&
-            (space->route->pending || space->route->interrupted))
+        const Route* const route =
+            space == nullptr ? nullptr : find_route(*space, profile);
+        if (route != nullptr && (route->pending || route->interrupted))
             throw std::logic_error(
                 "HISTORY_RESET arrived while F retained transaction identity");
         if (reset.initial_state_digest !=
             initial_route_digest(c_guid, reset.history_nonce))
             throw std::invalid_argument("HISTORY_RESET digest was not derived locally");
-        if (space && space->nonce_high_water &&
-            reset.history_nonce.value <= space->nonce_high_water->value)
-            throw std::invalid_argument("HISTORY_RESET nonce did not advance monotonically");
+        if (space != nullptr) {
+            const auto high_water = space->nonce_high_water.find(profile);
+            if (high_water != space->nonce_high_water.end() &&
+                reset.history_nonce.value <= high_water->second.value)
+                throw std::invalid_argument(
+                    "HISTORY_RESET nonce did not advance monotonically for profile");
+        }
     }
 
     void validate_history_reset_candidate(const Session& session,
                                           const HistoryReset& reset) const {
         require_incarnation(session);
-        if (!session.c_guid || session.activated)
+        if (!session.c_guid || !session.profile || session.activated)
             throw StaleCompletion();
         const auto position = namespaces.find(*session.c_guid);
-        validate_history_reset(*session.c_guid,
+        validate_history_reset(*session.c_guid, *session.profile,
                                position == namespaces.end() ? nullptr : &position->second,
                                reset);
     }
 
     void reset_history(const Session& session, const HistoryReset& reset) {
         Namespace& space = require(session);
-        validate_history_reset(*session.c_guid, &space, reset);
-        invalidate_p29v1_codec(*session.c_guid, space);
+        if (!session.profile)
+            throw StaleCompletion();
+        validate_history_reset(*session.c_guid, *session.profile, &space,
+                               reset);
+        if (*session.profile == ProfileId::P29V1)
+            invalidate_p29v1_codec(*session.c_guid, space);
         space.established = true;
-        space.nonce_high_water = reset.history_nonce;
-        space.route = Route{.nonce = reset.history_nonce,
+        space.nonce_high_water[*session.profile] = reset.history_nonce;
+        space.routes.insert_or_assign(
+            *session.profile,
+            Route{.nonce = reset.history_nonce,
                             .next_rel = RelSeq{0},
                             .state = reset.initial_state_digest,
                             .c_system_source_fingerprint =
@@ -2571,16 +2699,14 @@ struct P50ServerEndpoint::Impl {
                             .pending = std::nullopt,
                             .dialogue = nullptr,
                             .dialogue_profile = std::nullopt,
-                            .codec_history_reset_required = false};
+                            .codec_history_reset_required = false});
         record(ActionType::HISTORY_RESET, session);
     }
 
-    PreparedBegin prepare_begin(const Namespace& space, const TxBegin& begin,
+    PreparedBegin prepare_begin(const Route& route, ProfileId route_profile,
+                                const TxBegin& begin,
                                 uint32_t negotiated_profiles,
                                 CStoreGuid c_store_guid) const {
-        if (!space.route)
-            throw std::logic_error("TX_BEGIN arrived before HISTORY_RESET");
-        const Route& route = *space.route;
         if (route.codec_history_reset_required)
             throw std::logic_error(
                 "TX_BEGIN arrived before required codec HISTORY_RESET");
@@ -2593,6 +2719,9 @@ struct P50ServerEndpoint::Impl {
         if (transaction_profile_bit == 0 ||
             (transaction_profile_bit & negotiated_profiles) != transaction_profile_bit)
             throw std::invalid_argument("TX_BEGIN profile was not negotiated");
+        if (begin.profile != route_profile)
+            throw std::invalid_argument(
+                "TX_BEGIN profile differs from its negotiated F route");
         if (route.pending)
             throw std::logic_error("F endpoint already has one active transaction");
         if (route.interrupted && *route.interrupted != begin)
@@ -2621,17 +2750,21 @@ struct P50ServerEndpoint::Impl {
     PreparedBegin prepare_begin_candidate(const Session& session, const TxBegin& begin,
                                           uint32_t negotiated_profiles) const {
         require_incarnation(session);
-        if (!session.c_guid || session.activated)
+        if (!session.c_guid || !session.profile || session.activated)
             throw StaleCompletion();
         const auto position = namespaces.find(*session.c_guid);
         if (position == namespaces.end())
             throw std::logic_error("TX_BEGIN arrived before HISTORY_RESET");
-        return prepare_begin(position->second, begin, negotiated_profiles, *session.c_guid);
+        const Route* const route =
+            find_route(position->second, *session.profile);
+        if (route == nullptr)
+            throw std::logic_error("TX_BEGIN arrived before HISTORY_RESET");
+        return prepare_begin(*route, *session.profile, begin,
+                             negotiated_profiles, *session.c_guid);
     }
 
     bool install_begin(const Session& session, PreparedBegin prepared) {
-        Namespace& space = require(session);
-        Route& route = *space.route;
+        Route& route = require_route(session);
         if (route.pending)
             throw std::logic_error("F endpoint already has one active transaction");
         if (route.interrupted && route.interrupted != prepared.pending.begin)
@@ -2680,34 +2813,34 @@ struct P50ServerEndpoint::Impl {
 
     bool begin(const Session& session, const TxBegin& begin,
                uint32_t negotiated_profiles) {
-        const Namespace& space = require(session);
-        return install_begin(session,
-                             prepare_begin(space, begin, negotiated_profiles,
-                                           *session.c_guid));
+        const Route& route = require_route(session);
+        return install_begin(
+            session, prepare_begin(route, *session.profile, begin,
+                                   negotiated_profiles, *session.c_guid));
     }
 
     void append_body(const Session& session, BodyMessage message) {
-        Namespace& space = require(session);
-        if (!space.route || !space.route->pending)
+        Route& route = require_route(session);
+        if (!route.pending)
             throw std::logic_error("BODY has no F active transaction");
-        Pending& pending = *space.route->pending;
+        Pending& pending = *route.pending;
         pending.dialogue->append_body(message);
         if (pending.dialogue->state() == ProfileDialogueState::BodyClosed)
             record(ActionType::BODY_COMPLETE, session, &pending.begin);
     }
 
     void receive_need(const Session& session, const NeedMessage& message) {
-        Namespace& space = require(session);
-        if (!space.route || !space.route->pending)
+        Route& route = require_route(session);
+        if (!route.pending)
             throw std::logic_error("NEED has no F active transaction");
-        space.route->pending->dialogue->receive_need(message);
+        route.pending->dialogue->receive_need(message);
     }
 
     void receive_fill(const Session& session, const FillMessage& message) {
-        Namespace& space = require(session);
-        if (!space.route || !space.route->pending)
+        Route& route = require_route(session);
+        if (!route.pending)
             throw std::logic_error("FILL has no F active transaction");
-        Pending& pending = *space.route->pending;
+        Pending& pending = *route.pending;
         const auto started = std::chrono::steady_clock::now();
         pending.dialogue->receive_fill(message);
         add_saturating(pending.fill_apply_ns,
@@ -2715,19 +2848,19 @@ struct P50ServerEndpoint::Impl {
     }
 
     bool body_complete(const Session& session) const {
-        const Namespace& space = require(session);
-        if (!space.route || !space.route->pending)
+        const Route& route = require_route(session);
+        if (!route.pending)
             throw std::logic_error("BODY has no F active transaction");
-        return space.route->pending->dialogue->state() ==
+        return route.pending->dialogue->state() ==
                ProfileDialogueState::BodyClosed;
     }
 
     ServerMaterializationJob begin_materialization(
         const Session& session, std::function<void()> before_materialize) {
-        Namespace& space = require(session);
-        if (!space.route || !space.route->pending)
+        Route& route = require_route(session);
+        if (!route.pending)
             throw std::logic_error("F endpoint has no active transaction");
-        Pending& pending = *space.route->pending;
+        Pending& pending = *route.pending;
         if (pending.materializing || !pending.dialogue ||
             pending.dialogue->state() != ProfileDialogueState::BodyClosed)
             throw std::logic_error("input cannot materialize before BODY closure");
@@ -2757,9 +2890,10 @@ struct P50ServerEndpoint::Impl {
         const Session& session,
         ServerMaterializationCompletion completion) {
         Namespace& space = require(session);
-        if (!space.route || !space.route->pending)
+        Route& route = require_route(session);
+        if (!route.pending)
             throw StaleCompletion();
-        Pending& pending = *space.route->pending;
+        Pending& pending = *route.pending;
         if (!pending.materializing || !pending.dialogue ||
             pending.begin != completion.begin)
             throw StaleCompletion();
@@ -2820,10 +2954,10 @@ struct P50ServerEndpoint::Impl {
 
     InputJobState select_materialized_job_state(
         const Session& session, const MaterializedInput& materialized) {
-        Namespace& space = require(session);
-        if (!space.route || !space.route->pending)
+        const Route& route = require_route(session);
+        if (!route.pending)
             throw std::logic_error("F endpoint has no active transaction");
-        const Pending& pending = *space.route->pending;
+        const Pending& pending = *route.pending;
         if (pending.materializing || !pending.dialogue ||
             pending.dialogue->state() != ProfileDialogueState::Materialized ||
             pending.begin != materialized.begin ||
@@ -2844,9 +2978,9 @@ struct P50ServerEndpoint::Impl {
         std::optional<InputRecordKey>& completed_input,
         std::optional<InputRecordKey>& committed_input) {
         Namespace& space = require(session);
-        if (!space.route || !space.route->pending)
+        Route& route = require_route(session);
+        if (!route.pending)
             throw std::logic_error("F endpoint has no active transaction");
-        Route& route = *space.route;
         Pending& pending = *route.pending;
         if (pending.materializing || !pending.dialogue ||
             pending.dialogue->state() != ProfileDialogueState::Materialized ||
@@ -3953,8 +4087,7 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
             case MessageType::BODY:
                 impl_->append_body(session, decode_as<BodyMessage>(component));
                 {
-                    auto& pending = *impl_->namespaces.at(*session.c_guid)
-                                         .route->pending;
+                    auto& pending = *impl_->require_route(session).pending;
                     const std::vector<NeedMessage> needs =
                         pending.dialogue->need_messages(
                             selection.limits.max_frame_payload);
@@ -4097,18 +4230,25 @@ void P50ServerEndpoint::reset_store(FStoreGuid new_guid) {
     if (new_guid == impl_->f_guid)
         throw std::invalid_argument("F store reset requires a fresh GUID");
     for (auto& [guid, space] : impl_->namespaces) {
-        if (space.route && space.route->pending) {
-            if (space.route->pending->dialogue)
-                space.route->pending->dialogue->discard_tentative();
-            impl_->release_pending(*space.route->pending);
+        for (auto& [profile, route] : space.routes) {
+            (void)profile;
+            if (!route.pending)
+                continue;
+            if (route.pending->dialogue)
+                route.pending->dialogue->discard_tentative();
+            impl_->release_pending(*route.pending);
         }
         impl_->invalidate_p29v1_codec(guid, space);
         if (space.active_session != 0) {
+            const auto live = impl_->live_sessions.find(space.active_session);
             Impl::Session invalidated{.serial = space.active_session,
                                       .f_guid = impl_->f_guid,
                                       .operation = std::nullopt,
                                       .deadline = std::nullopt,
                                       .c_guid = guid,
+                                      .profile = live == impl_->live_sessions.end()
+                                                     ? std::nullopt
+                                                     : live->second.profile,
                                       .candidate_revision = 0,
                                       .candidate_state = std::nullopt,
                                       .activated = true};

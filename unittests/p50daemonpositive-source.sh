@@ -43,6 +43,9 @@ require "$runtime_test" 'initial Login is canonical cache absence before ConfCS/
 require "$runtime_test" 'LOGIN_ATTEMPT cannot dispatch cache while scheduler is inactive'
 require "$runtime_test" 'source-arm owner is acknowledged before CACHE_SESSION'
 require "$runtime_test" 'authenticated one-shot handoff keeps the adopted session live'
+require "$runtime_test" 'kAuthoritativeSessionCount = 65'
+require "$runtime_test" 'more than 64 sequential authoritative CacheSessions remain accepted'
+require "$runtime_test" 'authoritative CacheSessions leave no retained P5FS descriptors'
 require "$runtime_test" 'accepted handoff keeps the READY advertisement stable'
 require "$runtime_test" 'orderly shutdown withdraws before scheduler teardown'
 
@@ -56,6 +59,18 @@ if grep -F 'cache_adapter->start(' "$daemon" >/dev/null \
         || grep -F 'cache_adapter->shutdown(' "$daemon" >/dev/null \
         || grep -F 'advance_cache_adapter_shutdown_turn' "$daemon" >/dev/null; then
     echo 'FAIL: synchronous/secondary sidecar adapter path survived production wiring' >&2
+    exit 1
+fi
+
+# handle_cache_session has one authoritative fd handoff.  It must not mint or
+# retain the removed second P5FS operation/control relationship per session.
+cache_session_block=$(sed -n \
+    '/^bool Daemon::handle_cache_session/,/^bool Daemon::handle_p50_source_arm/p' \
+    "$daemon")
+if printf '%s\n' "$cache_session_block" | \
+        grep -E 'DaemonFSessionOperation|fsession_op|fsession_control_fd|connect_unix_until' \
+        >/dev/null; then
+    echo 'FAIL: CACHE_SESSION production path recreated a shadow P5FS owner' >&2
     exit 1
 fi
 

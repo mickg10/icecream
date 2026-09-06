@@ -1,6 +1,12 @@
 bin_PROGRAMS = icecc
 bin_SCRIPTS = icecc-create-env icecc-test-env
 
+# The completion-flow integration gate needs to force one real Accepted-send
+# failure after all output bytes arrive.  Keep that fault injector out of the
+# shipped wrapper: this check-only binary recompiles remote.cpp under the
+# dedicated test macro and otherwise links the ordinary client library.
+check_PROGRAMS = icecc-p50-completion-test
+
 noinst_LIBRARIES = libclient.a libp50zstdsender.a
 libclient_a_SOURCES = \
         arg.cpp \
@@ -28,6 +34,21 @@ icecc_LDADD = \
 icecc_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 icecc_CXXFLAGS = -pthread
 icecc_LDFLAGS = $(BOOST_LDFLAGS) -pthread
+
+icecc_p50_completion_test_SOURCES = main.cpp remote.cpp
+icecc_p50_completion_test_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS) \
+	-DICECC_P50_COMPLETION_TEST_HOOKS
+icecc_p50_completion_test_CXXFLAGS = -pthread
+icecc_p50_completion_test_LDFLAGS = $(BOOST_LDFLAGS) -pthread
+icecc_p50_completion_test_LDADD = \
+	libclient.a \
+	../cache/libp50localtransport.a \
+	libp50zstdsender.a \
+	../cache/libp50endpoint.a \
+	../cache/libp50adoptedoutcomewriter.a \
+	../cache/libprotocol50.a \
+	../services/libicecc.la \
+	$(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 
 noinst_HEADERS = \
 	argv.h \

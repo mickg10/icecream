@@ -58,6 +58,14 @@ enum class SourceTransferResultCode : uint16_t {
     Error = 2,
 };
 
+/* Typed sub-errors carried in P50SourceTransferResult::error_code.  Values
+   remain inside the existing uint16 wire field; adding this name does not
+   change the fixed control-operation layout. */
+enum class SourceTransferErrorCode : uint16_t {
+    PermanentLocalProfileUnavailable = 0x5001,
+    RouteReplacementRequired = 0x5002,
+};
+
 // The daemon asks the supervised sidecar to transfer one source using the
 // selected assignment.  C-side store/control identity is deliberately absent:
 // the sidecar supplies its current launch identity when it arms F.

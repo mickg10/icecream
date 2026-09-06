@@ -237,7 +237,7 @@ void test_route_completed_ledger_releases_live_entry() {
                              server_config);
     ZstdSourceTransferConfig bounded = route_config();
     bounded.authority_limits.max_live_entries = 1;
-    bounded.max_completed_requests = 8;
+    bounded.max_completed_requests = 2;
     P50ZstdSourceSender sender(Id128::from_u64(7061), PrepareRequestKey{106, 1},
                                bounded);
     const PrepareRequestKey first_request{9001, 1};
@@ -304,9 +304,44 @@ void test_route_completed_ledger_releases_live_entry() {
     context.run();
     CHECK(conflicting.get().status == ZstdSourceTransferStatus::InvalidRequest);
     CHECK(replay_connections == 0);
+
+    // A distinct third identity cannot exceed the bounded replay ledger.  It
+    // requests a cold sidecar replacement before opening F, while a completed
+    // exact replay remains authoritative and connection-free after the cap.
+    unsigned cap_connections = 0;
+    context.restart();
+    auto capped = asio::co_spawn(
+        context,
+        sender.transfer_route(
+            ConnectedFdFactory{[&cap_connections](auto) {
+                ++cap_connections;
+                return -1;
+            }}, PrepareRequestKey{9001, 3},
+            std::chrono::steady_clock::now() + std::chrono::seconds(10), second),
+        asio::use_future);
+    context.run();
+    const auto capped_result = capped.get();
+    CHECK(capped_result.status == ZstdSourceTransferStatus::Unavailable);
+    CHECK(capped_result.replacement_required);
+    CHECK(capped_result.attempts == 0);
+    CHECK(cap_connections == 0);
+
+    context.restart();
+    auto replay_after_cap = asio::co_spawn(
+        context,
+        sender.transfer_route(
+            ConnectedFdFactory{[&cap_connections](auto) {
+                ++cap_connections;
+                return -1;
+            }}, first_request,
+            std::chrono::steady_clock::now() + std::chrono::seconds(10), first),
+        asio::use_future);
+    context.run();
+    CHECK(replay_after_cap.get().status == ZstdSourceTransferStatus::Committed);
+    CHECK(cap_connections == 0);
 }
 
-void test_route_failed_transfer_is_not_completed() {
+void test_route_failure_requires_cold_replacement() {
     ZstdSourceTransferConfig bounded = route_config();
     bounded.authority_limits.max_live_entries = 1;
     P50ZstdSourceSender sender(Id128::from_u64(7071), PrepareRequestKey{107, 1},
@@ -325,9 +360,33 @@ void test_route_failed_transfer_is_not_completed() {
             std::chrono::steady_clock::now() + std::chrono::seconds(10), source),
         asio::use_future);
     failed_context.run();
-    CHECK(failed.get().status == ZstdSourceTransferStatus::RetryExhausted);
+    const auto failed_result = failed.get();
+    CHECK(failed_result.status == ZstdSourceTransferStatus::RetryExhausted);
+    CHECK(failed_result.replacement_required);
     CHECK(failed_connections == 2);
 
+    // The ambiguous preparation is sticky.  A later wrapper cannot reuse the
+    // old sender and must not open another F connection.
+    unsigned poisoned_connections = 0;
+    asio::io_context poisoned_context;
+    auto poisoned = asio::co_spawn(
+        poisoned_context,
+        sender.transfer_route(
+            ConnectedFdFactory{[&poisoned_connections](auto) {
+                ++poisoned_connections;
+                return -1;
+            }}, request,
+            std::chrono::steady_clock::now() + std::chrono::seconds(10), source),
+        asio::use_future);
+    poisoned_context.run();
+    const auto poisoned_result = poisoned.get();
+    CHECK(poisoned_result.status == ZstdSourceTransferStatus::Unavailable);
+    CHECK(poisoned_result.replacement_required);
+    CHECK(poisoned_result.attempts == 0);
+    CHECK(poisoned_connections == 0);
+
+    // Whole-sidecar replacement creates a new C store and authority.  That
+    // cold owner can admit the assignment and begins at TU0.
     asio::io_context context;
     tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
     EndpointCaps caps;
@@ -341,13 +400,15 @@ void test_route_failed_transfer_is_not_completed() {
     };
     P50ServerEndpoint server(Id128::from_u64(7072), caps, nullptr, nullptr,
                              server_config);
+    P50ZstdSourceSender replacement(
+        Id128::from_u64(7073), PrepareRequestKey{108, 1}, bounded);
     auto server_run = asio::co_spawn(context, server.accept_one(acceptor),
                                       asio::use_future);
     auto retry = asio::co_spawn(
         context,
-        sender.transfer_route(acceptor.local_endpoint(), request,
-                              std::chrono::steady_clock::now() +
-                                  std::chrono::seconds(10), source),
+        replacement.transfer_route(
+            acceptor.local_endpoint(), request,
+            std::chrono::steady_clock::now() + std::chrono::seconds(10), source),
         asio::use_future);
     context.run();
     CHECK(server_run.get().status == ServerRunStatus::Completed);
@@ -468,7 +529,7 @@ void test_explicit_route_operations_bind_request_and_deadline() {
     CHECK(tu_second_result.committed_input->tu_seq.value == 1);
 }
 
-void test_explicit_route_retry_preserves_exact_preparation() {
+void test_explicit_route_retry_is_bounded_then_replaced() {
     ZstdSourceTransferConfig persistent_config = route_config();
     persistent_config.deadline =
         std::chrono::steady_clock::now() - std::chrono::seconds(1);
@@ -492,32 +553,29 @@ void test_explicit_route_retry_preserves_exact_preparation() {
     failed_context.run();
     const auto failed_result = failed.get();
     CHECK(failed_result.status == ZstdSourceTransferStatus::RetryExhausted);
+    CHECK(failed_result.replacement_required);
     CHECK(failed_result.attempts == 2);
     CHECK(failed_connections == 2);
 
-    asio::io_context out_of_order_context;
-    auto out_of_order = asio::co_spawn(
-        out_of_order_context,
+    // Once both same-operation attempts fail, neither the exact request nor a
+    // successor may touch F through this retained sender.
+    unsigned poisoned_connections = 0;
+    asio::io_context poisoned_context;
+    auto poisoned = asio::co_spawn(
+        poisoned_context,
         sender.transfer_route(
-            ConnectedFdFactory{[](auto) { return -1; }},
+            ConnectedFdFactory{[&poisoned_connections](auto) {
+                ++poisoned_connections;
+                return -1;
+            }},
             PrepareRequestKey{8002, 178},
             std::chrono::steady_clock::now() + std::chrono::seconds(10), source),
         asio::use_future);
-    out_of_order_context.run();
-    CHECK(out_of_order.get().status == ZstdSourceTransferStatus::InvalidRequest);
-
-    // The retained request is deterministic across a wrapper retry and still
-    // refuses different bytes.
-    asio::io_context wrong_context;
-    const std::vector<uint8_t> wrong{'d', 'i', 'f', 'f'};
-    auto wrong_result = asio::co_spawn(
-        wrong_context,
-        sender.transfer_route(
-            ConnectedFdFactory{[](auto) { return -1; }}, request,
-            std::chrono::steady_clock::now() + std::chrono::seconds(10), wrong),
-        asio::use_future);
-    wrong_context.run();
-    CHECK(wrong_result.get().status == ZstdSourceTransferStatus::InvalidRequest);
+    poisoned_context.run();
+    const auto poisoned_result = poisoned.get();
+    CHECK(poisoned_result.status == ZstdSourceTransferStatus::Unavailable);
+    CHECK(poisoned_result.replacement_required);
+    CHECK(poisoned_connections == 0);
 
     asio::io_context context;
     tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
@@ -532,14 +590,15 @@ void test_explicit_route_retry_preserves_exact_preparation() {
     };
     P50ServerEndpoint server(Id128::from_u64(7042), caps, nullptr, nullptr,
                              server_config);
+    P50ZstdSourceSender replacement(
+        Id128::from_u64(7043), PrepareRequestKey{7043, 1}, persistent_config);
     auto retry_server = asio::co_spawn(context, server.accept_one(acceptor),
                                         asio::use_future);
     auto retry = asio::co_spawn(
         context,
-        sender.transfer_route(acceptor.local_endpoint(), request,
-                              std::chrono::steady_clock::now() +
-                                  std::chrono::seconds(10),
-                              source),
+        replacement.transfer_route(
+            acceptor.local_endpoint(), request,
+            std::chrono::steady_clock::now() + std::chrono::seconds(10), source),
         asio::use_future);
     context.run();
     const auto retry_result = retry.get();
@@ -548,19 +607,17 @@ void test_explicit_route_retry_preserves_exact_preparation() {
     CHECK(retry_result.committed_input.has_value());
     CHECK(retry_result.committed_input->tu_seq.value == 0);
 
-    // A new exact assignment can follow only after the retained predecessor
-    // committed; it observes that predecessor as route history and gets TU1.
+    // The replacement owner retains ordinary route history after its first
+    // exact commit, so the successor advances to TU1.
     context.restart();
     const std::vector<uint8_t> successor{'s', 'u', 'c', 'c', 'e', 's', 's'};
     auto successor_server = asio::co_spawn(context, server.accept_one(acceptor),
                                             asio::use_future);
     auto successor_transfer = asio::co_spawn(
         context,
-        sender.transfer_route(acceptor.local_endpoint(),
-                              PrepareRequestKey{8002, 178},
-                              std::chrono::steady_clock::now() +
-                                  std::chrono::seconds(10),
-                              successor),
+        replacement.transfer_route(
+            acceptor.local_endpoint(), PrepareRequestKey{8002, 178},
+            std::chrono::steady_clock::now() + std::chrono::seconds(10), successor),
         asio::use_future);
     context.run();
     const auto successor_result = successor_transfer.get();
@@ -646,9 +703,9 @@ int main() {
     test_exact_network_transfer();
     test_route_sender_reuses_relationship_for_two_transfers();
     test_route_completed_ledger_releases_live_entry();
-    test_route_failed_transfer_is_not_completed();
+    test_route_failure_requires_cold_replacement();
     test_explicit_route_operations_bind_request_and_deadline();
-    test_explicit_route_retry_preserves_exact_preparation();
+    test_explicit_route_retry_is_bounded_then_replaced();
     test_owned_fd_and_fail_closed_validation();
     test_adopted_fd_factory_exact_transfer();
     test_absolute_deadline_is_required();

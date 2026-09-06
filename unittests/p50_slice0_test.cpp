@@ -261,6 +261,48 @@ void test_f_store_session_and_route_fencing() {
             "F session transitions did not emit canonical actions");
 }
 
+void test_f_store_routes_are_isolated_by_profile() {
+    const CStoreGuid c_guid = CStoreGuid::from_u64(44);
+    FStore store(FStoreGuid::from_u64(45));
+
+    const SessionHandle p29 = store.connect(c_guid, ProfileId::P29V1);
+    const HistoryNonce p29_nonce{46};
+    store.start_route(p29, p29_nonce,
+                      initial_route_digest(c_guid, p29_nonce));
+    store.disconnect(p29);
+
+    const SessionHandle zstd = store.connect(c_guid, ProfileId::ZSTD_TU);
+    require(store.resume(zstd).namespace_present &&
+                !store.resume(zstd).route_present,
+            "a route from another profile leaked into ZSTD_TU resume");
+    const HistoryNonce zstd_nonce{47};
+    store.start_route(zstd, zstd_nonce,
+                      initial_route_digest(c_guid, zstd_nonce));
+    store.disconnect(zstd);
+
+    const SessionHandle p29_again =
+        store.connect(c_guid, ProfileId::P29V1);
+    const SessionState retained_p29 = store.resume(p29_again);
+    require(retained_p29.route_present &&
+                retained_p29.history_nonce == p29_nonce,
+            "ZSTD_TU replaced the retained P29V1 route");
+    store.forget_route(p29_again);
+    store.disconnect(p29_again);
+
+    const SessionHandle zstd_again =
+        store.connect(c_guid, ProfileId::ZSTD_TU);
+    const SessionState retained_zstd = store.resume(zstd_again);
+    require(retained_zstd.route_present &&
+                retained_zstd.history_nonce == zstd_nonce,
+            "forgetting P29V1 removed the retained ZSTD_TU route");
+
+    SessionHandle wrong_profile = zstd_again;
+    wrong_profile.profile = ProfileId::ZSTD_ROUTE;
+    require_throws<std::logic_error>(
+        [&] { (void)store.resume(wrong_profile); },
+        "an active F session accepted a different profile identity");
+}
+
 void test_authority_and_route_fail_closed_before_enablement() {
     CAuthority authority(CStoreGuid::from_u64(50));
     require(authority.guid() == CStoreGuid::from_u64(50) &&
@@ -304,6 +346,7 @@ int main() {
     test_atomic_p29v1_pair_preflight();
     test_global_reverse_invariants_catch_mutants();
     test_f_store_session_and_route_fencing();
+    test_f_store_routes_are_isolated_by_profile();
     test_authority_and_route_fail_closed_before_enablement();
     test_terminal_session_serial();
     return 0;

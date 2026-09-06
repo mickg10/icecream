@@ -219,6 +219,25 @@ public:
     int niceness() const;
     void setNiceness( int niceness );
 
+    void setCacheRequest(uint32_t protocol, uint32_t profile_mask,
+                         uint32_t affinity_profile_mask,
+                         uint32_t affinity_port,
+                         const std::string &affinity_host)
+    {
+        m_cacheProtocol = protocol;
+        m_cacheProfileMask = profile_mask;
+        m_cacheAffinityProfileMask = affinity_profile_mask;
+        m_cacheAffinityPort = affinity_port;
+        m_cacheAffinityHost = affinity_host;
+    }
+    uint32_t cacheProtocol() const { return m_cacheProtocol; }
+    uint32_t cacheProfileMask() const { return m_cacheProfileMask; }
+    uint32_t cacheAffinityProfileMask() const
+    { return m_cacheAffinityProfileMask; }
+    uint32_t cacheAffinityPort() const { return m_cacheAffinityPort; }
+    const std::string &cacheAffinityHost() const
+    { return m_cacheAffinityHost; }
+
 private:
     const unsigned int m_id;
     unsigned int m_localClientId;
@@ -267,6 +286,11 @@ private:
     int m_minimalHostVersion; // minimal version required for the the remote server
     unsigned int m_requiredFeatures; // flags the job requires on the remote server
     int m_niceness; // nice priority (0-20)
+    uint32_t m_cacheProtocol = 0;
+    uint32_t m_cacheProfileMask = 0;
+    uint32_t m_cacheAffinityProfileMask = 0;
+    uint32_t m_cacheAffinityPort = 0;
+    std::string m_cacheAffinityHost;
 };
 
 #endif

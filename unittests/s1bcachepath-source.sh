@@ -2,7 +2,11 @@
 set -eu
 
 top_src=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
-tmp_root=$(mktemp -d "${TMPDIR:-/tmp}/s1bcachepath-source.XXXXXX")
+# S1B_APT_CACHE intentionally rejects every symlink component.  The global
+# test TMPDIR may be the short /tmp/i socket alias, so place this filesystem
+# fixture beneath its physical directory rather than weakening that check.
+tmp_parent=$(CDPATH= cd -- "${TMPDIR:-/tmp}" && pwd -P)
+tmp_root=$(mktemp -d "$tmp_parent/s1bcachepath-source.XXXXXX")
 cleanup() {
     rm -rf -- "$tmp_root"
 }

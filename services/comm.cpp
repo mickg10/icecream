@@ -123,6 +123,25 @@ bool append_p50_legacy_wire_trace(const char *path, const std::string &line) noe
     return ::close(fd) == 0;
 }
 
+bool append_p50_legacy_wire_trace(int fd, const std::string &line) noexcept
+{
+    if (fd < 0)
+        return false;
+    size_t offset = 0;
+    while (offset != line.size()) {
+        const ssize_t written = ::write(fd, line.data() + offset,
+                                        line.size() - offset);
+        if (written > 0) {
+            offset += static_cast<size_t>(written);
+            continue;
+        }
+        if (written < 0 && errno == EINTR)
+            continue;
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 namespace {
@@ -1684,6 +1703,11 @@ MsgChannel::MsgChannel(int _fd, struct sockaddr *_a, socklen_t _l, bool text)
 
 MsgChannel::~MsgChannel()
 {
+    if (p50_legacy_wire_trace_fd >= 0) {
+        (void)close(p50_legacy_wire_trace_fd);
+        p50_legacy_wire_trace_fd = -1;
+    }
+
     if (fd >= 0) {
         if ((-1 == close(fd)) && (errno != EBADF)){
             log_perror("close failed");
@@ -1743,6 +1767,20 @@ bool MsgChannel::set_p50_legacy_wire_identity(
         p50_legacy_pending_compile_file.reset();
     }
     return true;
+}
+
+bool MsgChannel::p50_legacy_wire_prepare_trace() noexcept
+{
+    if (!p50_legacy_wire_identity_set || p50_legacy_wire_completed)
+        return false;
+    if (p50_legacy_wire_trace_fd >= 0)
+        return true;
+    const char *path = p50_legacy_wire_trace_path(p50_legacy_wire_role);
+    if (path == nullptr)
+        return true;
+    p50_legacy_wire_trace_fd = ::open(
+        path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0600);
+    return p50_legacy_wire_trace_fd >= 0;
 }
 
 void MsgChannel::p50_legacy_note_received(Msg::Value type,
@@ -1819,6 +1857,9 @@ bool MsgChannel::p50_legacy_wire_complete() noexcept
         static_cast<unsigned long long>(p50_legacy_f_to_c_received));
     if (length <= 0 || static_cast<size_t>(length) >= sizeof(line))
         return false;
+    if (p50_legacy_wire_trace_fd >= 0)
+        return append_p50_legacy_wire_trace(
+            p50_legacy_wire_trace_fd, std::string(line, length));
     return append_p50_legacy_wire_trace(path, std::string(line, length));
 }
 
@@ -4154,6 +4195,11 @@ GetCSMsg::GetCSMsg(const Environments &envs, const std::string &f,
     , client_count(_client_count)
     , niceness(_niceness)
     , command_summary(_command_summary)
+    , cache_protocol(0)
+    , cache_profile_mask(0)
+    , cache_affinity_profile_mask(0)
+    , cache_affinity_port(0)
+    , cache_request_tail_valid(true)
 {
     // These have been introduced in protocol version 42.
     if( required_features & ( NODE_FEATURE_ENV_XZ | NODE_FEATURE_ENV_ZSTD ))
@@ -4213,6 +4259,31 @@ void GetCSMsg::fill_from_channel(MsgChannel *c)
     } else {
         command_summary.clear();
     }
+
+    cache_protocol = 0;
+    cache_profile_mask = 0;
+    cache_affinity_profile_mask = 0;
+    cache_affinity_port = 0;
+    cache_affinity_host.clear();
+    cache_request_tail_valid = true;
+    if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, c)) {
+        /* The protocol-50 request tail is mandatory.  Its string makes the
+           byte count variable, so bound it before reading and require exact
+           frame exhaustion afterwards. */
+        if (c->current_message_bytes_remaining() <
+            5 * sizeof(uint32_t) + 1) {
+            cache_request_tail_valid = false;
+            return;
+        }
+        *c >> cache_protocol;
+        *c >> cache_profile_mask;
+        *c >> cache_affinity_profile_mask;
+        *c >> cache_affinity_port;
+        cache_request_tail_valid = c->read_bounded_string(
+            cache_affinity_host, P50_CACHE_AFFINITY_HOST_MAX);
+        if (c->current_message_bytes_remaining() != 0)
+            cache_request_tail_valid = false;
+    }
 }
 
 void GetCSMsg::send_to_channel(MsgChannel *c) const
@@ -4257,6 +4328,22 @@ void GetCSMsg::send_to_channel(MsgChannel *c) const
     if (IS_PROTOCOL_VERSION(46, c)) {
         *c << command_summary;
     }
+    if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, c)) {
+        *c << cache_protocol;
+        *c << cache_profile_mask;
+        *c << cache_affinity_profile_mask;
+        *c << cache_affinity_port;
+        *c << cache_affinity_host;
+    }
+}
+
+bool GetCSMsg::valid_payload() const
+{
+    return cache_request_tail_valid &&
+        p50_cache_client_request_is_valid(
+            cache_protocol, cache_profile_mask,
+            cache_affinity_profile_mask, cache_affinity_port,
+            cache_affinity_host);
 }
 
 void UseCSMsg::fill_from_channel(MsgChannel *c)
@@ -4369,7 +4456,7 @@ bool UseCSMsg::valid_payload() const
     const bool assignment_complete = job_id != 0 && epoch_present && nonce_present;
     const bool cache_absent = cache_advertisement_is_wholly_absent(
         cache_endpoint_port, cache_protocol, cache_profile_mask);
-    const bool cache_present = cache_advertisement_is_valid_present(
+    const bool cache_present = cache_assignment_is_valid_present(
         cache_endpoint_port, cache_protocol, cache_profile_mask);
     return cache_tail_valid
         && (assignment_absent || assignment_complete)

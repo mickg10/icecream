@@ -549,6 +549,10 @@ public:
         uint32_t cachePort;
         uint32_t cacheProtocol;
         uint32_t cacheProfileMask;
+        uint64_t cGuid;
+        uint64_t tuSeq;
+        uint64_t routeStateGeneration;
+        std::optional<icecc::p50::sidecar::ReadyLease> readyLease;
     };
 
     enum class P50InputLeaseState : uint8_t {
@@ -590,6 +594,9 @@ public:
         getcs_published = false;
         getcs_outstanding = false;
         getcs_generation = 0;
+        cache_offer_generation = 0;
+        cache_offer = {};
+        cache_offer_lease.reset();
         local_owner_generation = 0;
         getcs_expected = 0;
         getcs_delivered = 0;
@@ -724,6 +731,9 @@ public:
     bool getcs_published;       // G4 (17:20#1): true only once a GetCS for this client has been sent to S (which then owns it by client_id); a held request is PRIVATE until then
     bool getcs_outstanding;     // G4 (bigoracle 18:45 P0): a GetCS occupies this client from accept until client destruction; a second GetCS in ANY non-terminal state is rejected (not just while WAITFORCS)
     uint64_t getcs_generation;  // G4 (bigoracle 18:45 P0): the session generation the request was published under (0 = unpublished); a scheduler reply is honored only when it matches the current ACTIVE generation
+    uint64_t cache_offer_generation;  // exact active scheduler generation that owns cache_offer
+    P50CacheClientCapability cache_offer;  // exact post-intersection GetCS offer, including canonical absence
+    std::optional<icecc::p50::sidecar::ReadyLease> cache_offer_lease;
     uint64_t local_owner_generation;  // G4 (18:21): session generation that owns a started LOCAL assignment (0 = UNOWNED_LOCAL, started during LOGIN_ATTEMPT/offline); only an ACTIVE_SESSION(g)-owned job emits JobLocalBegin/JobLocalDone to S
     // G4 (local-oracle 21:19): count>1 -> BATCH_LEDGER mode.  count<=1 keeps the
     // scalar SCALAR_ONE path untouched.  A request selects one immutable mode at
@@ -1406,6 +1416,15 @@ struct Daemon {
     uint64_t next_p50_arm_observation_id;
     icecc::p50::advertisement::Snapshot scheduler_cache_snapshot;
     bool scheduler_cache_snapshot_valid;
+    // Last successful cache-capable remote assignment on this C daemon.
+    // It is a soft scheduling hint only; every new assignment still performs
+    // the complete authenticated CacheWire handshake.
+    std::string cache_affinity_host;
+    uint32_t cache_affinity_profile_mask;
+    uint32_t cache_affinity_port;
+    uint32_t cache_unavailable_profile_mask;
+    uint64_t cache_route_state_generation;
+    std::optional<icecc::p50::sidecar::ReadyLease> cache_route_state_lease;
     // Positive sidecar operation is opt-in until the installed service path
     // and its private runtime directory are supplied together.  There is no
     // PATH lookup and no implicit shared socket location.
@@ -1455,6 +1474,12 @@ struct Daemon {
         next_p50_arm_observation_id = 1;
         scheduler_cache_snapshot = {};
         scheduler_cache_snapshot_valid = false;
+        cache_affinity_host.clear();
+        cache_affinity_profile_mask = 0;
+        cache_affinity_port = 0;
+        cache_unavailable_profile_mask = 0;
+        cache_route_state_generation = 1;
+        cache_route_state_lease.reset();
         noremote = false;
         custom_nodename = false;
         icecream_load = 0;
@@ -1503,6 +1528,9 @@ struct Daemon {
         const icecc::p50::advertisement::Snapshot *cache_transition = nullptr)
         __attribute_warn_unused_result__;
     icecc::p50::advertisement::Snapshot cache_advertisement_snapshot() const noexcept;
+    void reconcile_cache_route_state() noexcept;
+    bool cache_client_sidecar_ready() noexcept;
+    bool cache_client_service_ready() noexcept;
     bool configure_cache_adapter() noexcept;
     void poll_cache_adapter() noexcept;
     void shutdown_cache_adapter() noexcept;
@@ -4463,6 +4491,62 @@ Daemon::cache_advertisement_snapshot() const noexcept
         : icecc::p50::advertisement::Snapshot{};
 }
 
+void Daemon::reconcile_cache_route_state() noexcept
+{
+    const icecc::p50::sidecar::ReadyLease *current = nullptr;
+    /* Route state belongs to the authenticated C-sidecar incarnation.  An S
+       disconnect suppresses publication, but must not discard a still-live
+       sidecar's warm affinity or permanent local capability facts. */
+    if (cache_adapter != nullptr && cache_adapter->authenticated()) {
+        const auto& observed = cache_adapter->outer_current_ready_lease();
+        if (observed.has_value() && observed->valid())
+            current = &*observed;
+    }
+
+    const bool same_owner = current != nullptr &&
+        cache_route_state_lease.has_value() &&
+        icecc::p50::daemon::p50_ready_lease_observation_equal(
+            *cache_route_state_lease, *current);
+    if (same_owner)
+        return;
+
+    cache_affinity_host.clear();
+    cache_affinity_profile_mask = 0;
+    cache_affinity_port = 0;
+    cache_unavailable_profile_mask = 0;
+    cache_route_state_lease.reset();
+    if (current != nullptr)
+        cache_route_state_lease = *current;
+    if (cache_route_state_generation !=
+        std::numeric_limits<uint64_t>::max())
+        ++cache_route_state_generation;
+}
+
+bool Daemon::cache_client_sidecar_ready() noexcept
+{
+    /* C capability belongs to the authenticated local sidecar lease, not to
+       the F advertisement.  A submitter-only (--no-remote) daemon has a
+       deliberately absent public snapshot while its local CacheWire control
+       service is fully usable. */
+    reconcile_cache_route_state();
+    if (cache_adapter == nullptr || !cache_adapter->authenticated() ||
+        !cache_route_state_lease.has_value()) {
+        return false;
+    }
+    const auto& ready_lease = cache_adapter->outer_current_ready_lease();
+    return ready_lease.has_value() && ready_lease->valid() &&
+        icecc::p50::daemon::p50_ready_lease_observation_equal(
+            *cache_route_state_lease, *ready_lease);
+}
+
+bool Daemon::cache_client_service_ready() noexcept
+{
+    /* Scheduler ownership gates publication and assignment use, while the
+       authenticated sidecar lease itself may survive a scheduler bounce. */
+    return scheduler_session_active && scheduler != nullptr &&
+           cache_client_sidecar_ready();
+}
+
 bool Daemon::reannounce_environments(
     const icecc::p50::advertisement::Snapshot *cache_transition)
 {
@@ -4550,7 +4634,8 @@ static bool test_poison_cache_handoff_if_armed(Client *c, const char *site)
         true, UINT32_C(0xdeadbeef),
         UINT64_C(0x1111111111111111), UINT64_C(0x2222222222222222),
         "poison-host", UINT32_C(3333),
-        UINT32_C(0x0000cafe), UINT32_C(9), UINT32_C(7)};
+        UINT32_C(0x0000cafe), UINT32_C(9), UINT32_C(7),
+        UINT64_C(0), UINT64_C(0), UINT64_C(0), std::nullopt};
     /* BigOracle blueprint (Gap 3 "Focused test"): also preload a STALE
        usecsmsg with a nonzero cache tail, standing in for whatever a
        reused Client might already carry.
@@ -5020,6 +5105,7 @@ void Daemon::close_scheduler(bool orderly_shutdown)
     scheduler_session_active = false;
     scheduler_login_pending = false;
     scheduler_login_deadline_msec = 0;
+    reconcile_cache_route_state();
     delete discover;
     discover = nullptr;
     next_scheduler_connect = time(nullptr) + 20 + (rand() & 31);
@@ -5156,11 +5242,14 @@ bool Daemon::expire_p50_source_waiters()
 
 bool Daemon::invalidate_p50_source_waiters_for_lease()
 {
-    bool current_ready = scheduler_session_active && scheduler != nullptr &&
-                         cache_adapter != nullptr &&
-                         cache_advertisement_snapshot().present() &&
-                         cache_adapter->outer_current_ready_lease().has_value() &&
-                         cache_adapter->outer_current_ready_lease()->valid();
+    /* An armed input transfer is owned by its exact authenticated sidecar
+       lease, not by the scheduler session that selected the pair.  Existing
+       work may finish across an S bounce; only a real sidecar lease
+       withdrawal/replacement invalidates it. */
+    const bool current_ready = cache_adapter != nullptr &&
+        cache_adapter->authenticated() &&
+        cache_adapter->outer_current_ready_lease().has_value() &&
+        cache_adapter->outer_current_ready_lease()->valid();
     const icecc::p50::sidecar::ReadyLease *current_lease = nullptr;
     if (current_ready) {
         current_lease = &*cache_adapter->outer_current_ready_lease();
@@ -5203,25 +5292,23 @@ void Daemon::poll_cache_adapter() noexcept
     if (cache_adapter == nullptr)
         return;
 
+    reconcile_cache_route_state();
+
     const bool listener_bound = daemon_port > 0 && daemon_port <= UINT16_MAX
         && exact_public_tcp_listener(tcp_listen_fd,
                                      static_cast<uint32_t>(daemon_port));
     cache_adapter->observe_public_listener(
         listener_bound, listener_bound ? static_cast<uint32_t>(daemon_port) : 0);
 
-    // Never start a service, authenticate a private relationship, or publish
-    // presence during a mere scheduler LOGIN_ATTEMPT.  Keep the scheduler
-    // session and adapter ownership in one production predicate so a stale
-    // snapshot cannot be used by an absent outer owner.
+    // Never start a service or publish presence during a mere scheduler
+    // LOGIN_ATTEMPT.  Once a sidecar is authenticated, however, its lease is
+    // C-local route ownership and survives an S disconnect.  Scheduler loss
+    // withdraws publication and assignment waiters; it is not itself a
+    // sidecar/runtime failure and therefore is not a replacement request.
     const bool scheduler_cache_owner =
         scheduler_session_active && cache_adapter != nullptr;
     if (!scheduler_cache_owner || scheduler == nullptr) {
         cache_adapter->outer_set_scheduler_owner(false);
-        // An established-session loss is an allocator/lifecycle replacement
-        // request.  Route it through the same outer reducer; do not tear down
-        // the sidecar synchronously or let a later reconnect reuse A.
-        if (cache_adapter_start_attempted)
-            cache_adapter->outer_request_replacement();
         if (invalidate_p50_source_waiters_for_lease()) {
             return;
         }
@@ -5304,6 +5391,7 @@ void Daemon::poll_cache_adapter() noexcept
             ++assignment_ready_replies;
         }
     }
+    reconcile_cache_route_state();
 }
 
 void Daemon::shutdown_cache_adapter() noexcept
@@ -6499,12 +6587,37 @@ int Daemon::scheduler_use_cs(UseCSMsg *msg)
     // credentials may retain a cache handoff.  TCP and failed-credential
     // wrappers still use the ordinary legacy compile path, but their client
     // projection is canonically cache-absent.
-    const bool wrapper_cache_eligible = c->connection_provenance.cache_eligible();
+    const P50CacheClientCapability current_client_cache_capability =
+        p50_cache_client_capability_from_env(
+            c->channel != nullptr ? c->channel->protocol : 0);
+    const bool cache_service_ready = cache_client_service_ready();
+    const auto *const current_ready_lease = cache_adapter != nullptr
+        ? &cache_adapter->outer_current_ready_lease() : nullptr;
+    const bool exact_offer_current =
+        c->cache_offer_generation == c->getcs_generation &&
+        c->cache_offer_generation == scheduler_session_generation &&
+        c->cache_offer.protocol != 0 && c->cache_offer.profile_mask != 0 &&
+        c->cache_offer_lease.has_value() &&
+        current_ready_lease != nullptr && current_ready_lease->has_value() &&
+        (*current_ready_lease)->valid() &&
+        icecc::p50::daemon::p50_ready_lease_observation_equal(
+            *c->cache_offer_lease, **current_ready_lease);
+    const bool wrapper_cache_eligible =
+        c->connection_provenance.cache_eligible() &&
+        cache_service_ready && exact_offer_current &&
+        c->cache_offer.protocol == msg->cache_protocol &&
+        (msg->cache_profile_mask & ~c->cache_offer.profile_mask) == 0 &&
+        current_client_cache_capability.protocol == msg->cache_protocol &&
+        (msg->cache_profile_mask &
+         ~current_client_cache_capability.profile_mask) == 0 &&
+        (msg->cache_profile_mask & cache_unavailable_profile_mask) == 0;
     if (wrapper_cache_eligible && usecs_cache_handoff_admissible(*msg)) {
         c->cacheHandoff = Client::CacheHandoff{
             true, msg->job_id, msg->assignmentEpoch(), msg->assignmentNonce(),
             msg->hostname, msg->port,
-            msg->cache_endpoint_port, msg->cache_protocol, msg->cache_profile_mask};
+            msg->cache_endpoint_port, msg->cache_protocol,
+            msg->cache_profile_mask, msg->cGuid(), msg->tuSeq(),
+            cache_route_state_generation, *c->cache_offer_lease};
     }
     /* Both relay projections below carry this SAME validated triple (or
        canonical 0/0/0 when c->cacheHandoff.valid is false) -- otherwise a
@@ -7174,6 +7287,106 @@ bool Daemon::create_env_finished(string env_key)
 
 bool Daemon::handle_job_done(Client *cl, JobDoneMsg *m)
 {
+    /* A remote wrapper reports cache-route success on its existing local
+       protocol-50 connection.  This is an observation, never a scheduler
+       settlement: consume it here before ordinary JobDone accounting and
+       forwarding.  Exact assignment identity, successful result, dedicated
+       submitter-origin flag set, immutable wrapper provenance, and the
+       retained handoff all have to agree before advancing affinity. */
+    if (m->is_p50_cache_route_observation()) {
+        reconcile_cache_route_state();
+        const bool exact_handoff = cl->channel != nullptr &&
+            IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT,
+                                cl->channel) &&
+            cl->connection_provenance.cache_eligible() &&
+            cl->cacheHandoff.valid &&
+            p50_source_profile_selection_valid(
+                cl->cacheHandoff.cacheProfileMask) &&
+            cl->cacheHandoff.cGuid != 0 &&
+            cl->cacheHandoff.readyLease.has_value() &&
+            cache_route_state_lease.has_value() &&
+            icecc::p50::daemon::p50_ready_lease_observation_equal(
+                *cl->cacheHandoff.readyLease, *cache_route_state_lease) &&
+            cl->cacheHandoff.ordinaryPort != 0 &&
+            cl->cacheHandoff.ordinaryPort <= UINT16_MAX &&
+            cl->cacheHandoff.host.size() <= P50_CACHE_AFFINITY_HOST_MAX &&
+            cl->cacheHandoff.host.find('\0') == string::npos;
+        const P50CacheRouteObservationKind observation = exact_handoff
+            ? p50_cache_route_observation_kind(
+                  *m, cl->cacheHandoff.wireJobId,
+                  cl->cacheHandoff.assignmentEpoch,
+                  cl->cacheHandoff.assignmentNonce,
+                  cl->cacheHandoff.cGuid, cl->cacheHandoff.tuSeq,
+                  cl->cacheHandoff.cacheProfileMask)
+            : P50CacheRouteObservationKind::Invalid;
+        const bool generation_current =
+            cl->cacheHandoff.routeStateGeneration ==
+            cache_route_state_generation;
+        const bool exact_current_affinity =
+            generation_current &&
+            cache_affinity_host == cl->cacheHandoff.host &&
+            cache_affinity_port == cl->cacheHandoff.ordinaryPort &&
+            cache_affinity_profile_mask ==
+                cl->cacheHandoff.cacheProfileMask;
+        if (observation == P50CacheRouteObservationKind::Success &&
+            generation_current &&
+            (cache_unavailable_profile_mask &
+             cl->cacheHandoff.cacheProfileMask) == 0) {
+            cache_affinity_host = cl->cacheHandoff.host;
+            cache_affinity_profile_mask = cl->cacheHandoff.cacheProfileMask;
+            cache_affinity_port = cl->cacheHandoff.ordinaryPort;
+            if (cache_route_state_generation !=
+                std::numeric_limits<uint64_t>::max())
+                ++cache_route_state_generation;
+        } else if (observation == P50CacheRouteObservationKind::Failure) {
+            /* A late failed attempt must not erase a newer success.  Clear
+               only the exact route whose generation was current when this
+               assignment was dispatched. */
+            if (exact_current_affinity) {
+                cache_affinity_host.clear();
+                cache_affinity_profile_mask = 0;
+                cache_affinity_port = 0;
+                if (cache_route_state_generation !=
+                    std::numeric_limits<uint64_t>::max())
+                    ++cache_route_state_generation;
+            }
+        } else if (observation ==
+                   P50CacheRouteObservationKind::
+                       PermanentLocalProfileFailure) {
+            /* This typed fact is lease-wide, not one transport attempt.  It
+               suppresses only P29V1.  Preserve a newer non-P29 affinity, but
+               never retain a contradictory P29 hint. */
+            bool changed =
+                (cache_unavailable_profile_mask & CACHE_PROFILE_P29V1) == 0;
+            cache_unavailable_profile_mask |= CACHE_PROFILE_P29V1;
+            if (cache_affinity_profile_mask == CACHE_PROFILE_P29V1) {
+                cache_affinity_host.clear();
+                cache_affinity_profile_mask = 0;
+                cache_affinity_port = 0;
+                changed = true;
+            }
+            if (changed && cache_route_state_generation !=
+                std::numeric_limits<uint64_t>::max())
+                ++cache_route_state_generation;
+        } else if (observation ==
+                   P50CacheRouteObservationKind::
+                       LocalSidecarReplacementRequired) {
+            /* The sidecar sends this typed result only after its response was
+               ACKed, so lifecycle retirement cannot cut off the reply in
+               flight.  Replacement clears every possibly ambiguous route
+               and bounded replay ledger under the exact current READY lease. */
+            if (cache_adapter != nullptr) {
+                cache_adapter->outer_request_replacement();
+                reconcile_cache_route_state();
+            }
+        } else {
+            log_warning()
+                << "ignored invalid or stale P50 cache-route observation for job "
+                << m->job_id << endl;
+        }
+        return true;
+    }
+
     if (cl->getcs_expected > 1) {
         /* G4 BATCH: the client reports one of its N decisions done.  Match by
            the EXACT job id and drop that entry -- do NOT assert against the
@@ -7261,6 +7474,52 @@ void Daemon::handle_old_request()
             }
             GetCSMsg *g = c->deferred_getcs;
             c->deferred_getcs = nullptr;
+            /* The request may have arrived during a reconnecting S session.
+               Re-admit only the capability that the wrapper originally
+               offered, and only while its exact authenticated READY lease is
+               still current.  This can narrow but never widen the held
+               request.  Recompute affinity at the send boundary so a lease
+               change cannot leak a stale route hint. */
+            P50CacheClientCapability revalidated{};
+            if (c->cache_offer.protocol != 0 &&
+                c->cache_offer.profile_mask != 0 &&
+                c->cache_offer_lease.has_value() &&
+                cache_client_service_ready() &&
+                cache_route_state_lease.has_value() &&
+                icecc::p50::daemon::p50_ready_lease_observation_equal(
+                    *c->cache_offer_lease, *cache_route_state_lease)) {
+                const P50CacheClientCapability current =
+                    p50_cache_client_capability_from_env(
+                        c->channel != nullptr ? c->channel->protocol : 0);
+                if (current.protocol == c->cache_offer.protocol) {
+                    revalidated.protocol = current.protocol;
+                    revalidated.profile_mask =
+                        c->cache_offer.profile_mask & current.profile_mask &
+                        ~cache_unavailable_profile_mask;
+                    if (revalidated.profile_mask == 0)
+                        revalidated = {};
+                }
+            }
+            c->cache_offer = revalidated;
+            if (revalidated.profile_mask == 0)
+                c->cache_offer_lease.reset();
+            g->cache_protocol = revalidated.protocol;
+            g->cache_profile_mask = revalidated.profile_mask;
+            g->cache_affinity_profile_mask = 0;
+            g->cache_affinity_port = 0;
+            g->cache_affinity_host.clear();
+            if (revalidated.profile_mask != 0 &&
+                cache_affinity_profile_mask != 0 &&
+                (cache_affinity_profile_mask &
+                 ~revalidated.profile_mask) == 0 &&
+                cache_affinity_port != 0 &&
+                cache_affinity_port <= UINT16_MAX &&
+                !cache_affinity_host.empty()) {
+                g->cache_affinity_profile_mask =
+                    cache_affinity_profile_mask;
+                g->cache_affinity_port = cache_affinity_port;
+                g->cache_affinity_host = cache_affinity_host;
+            }
             g->client_count = clients.size();
             g->command_summary.clear();
             const bool sent = send_scheduler(*g);
@@ -7270,6 +7529,7 @@ void Daemon::handle_old_request()
             }
             c->getcs_published = true;   /* G4 (17:20#1): re-driven held GetCS is now published to S */
             c->getcs_generation = scheduler_session_generation;   /* G4 (18:45 P0): under the current ACTIVE generation */
+            c->cache_offer_generation = scheduler_session_generation;
             c->set_status(Client::WAITFORCS, "handle_old_request: re-driven held GetCS");
         }
     }
@@ -7953,6 +8213,10 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
 
     client->job = job;
     if (!job->usesP50Input() && client->channel->protocol >= PROTOCOL_VERSION) {
+        trace() << "legacy CompileFile admitted canonical input for job "
+                << job->jobID() << " epoch " << job->assignmentEpoch()
+                << " nonce " << job->assignmentNonce() << " c_guid "
+                << job->cGuid() << " tu_seq " << job->tuSeq() << endl;
         const P50LegacyWireIdentity identity{
             job->jobID(), job->assignmentEpoch(), job->assignmentNonce(),
             job->cGuid(), job->tuSeq()};
@@ -8443,6 +8707,53 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
         handle_end(client, 120);
         return false;
     }
+
+    /* The local C daemon is the authority for cache capability and the C
+       kill switch.  A new wrapper may only narrow that authority: canonical
+       absence opts this job out (the bounded legacy retry), while a present
+       request is intersected with the daemon-authorized profiles.  Thus an
+       old/disabled wrapper cannot be upgraded by the daemon and a wrapper can
+       never enable a profile the daemon disabled. */
+    P50CacheClientCapability cache_capability{};
+    if (umsg->count == 1 && client->connection_provenance.cache_eligible() &&
+        cache_client_sidecar_ready()) {
+        cache_capability = p50_cache_client_capability_from_env(
+            client->channel != nullptr ? client->channel->protocol : 0);
+        if (umsg->cache_protocol != cache_capability.protocol) {
+            cache_capability = {};
+        } else {
+            cache_capability.profile_mask &= umsg->cache_profile_mask;
+            if (cache_capability.profile_mask == 0)
+                cache_capability = {};
+        }
+        if (cache_capability.profile_mask != 0) {
+            cache_capability.profile_mask &=
+                ~cache_unavailable_profile_mask;
+            if (cache_capability.profile_mask == 0)
+                cache_capability = {};
+        }
+    }
+    client->cache_offer = cache_capability;
+    client->cache_offer_generation = 0;
+    client->cache_offer_lease.reset();
+    if (cache_capability.profile_mask != 0 &&
+        cache_route_state_lease.has_value()) {
+        client->cache_offer_lease = *cache_route_state_lease;
+    }
+    umsg->cache_protocol = cache_capability.protocol;
+    umsg->cache_profile_mask = cache_capability.profile_mask;
+    umsg->cache_affinity_profile_mask = 0;
+    umsg->cache_affinity_port = 0;
+    umsg->cache_affinity_host.clear();
+    if (cache_capability.profile_mask != 0 &&
+        (cache_affinity_profile_mask & ~cache_capability.profile_mask) == 0 &&
+        cache_affinity_profile_mask != 0 &&
+        cache_affinity_port != 0 && cache_affinity_port <= UINT16_MAX &&
+        !cache_affinity_host.empty()) {
+        umsg->cache_affinity_profile_mask = cache_affinity_profile_mask;
+        umsg->cache_affinity_port = cache_affinity_port;
+        umsg->cache_affinity_host = cache_affinity_host;
+    }
     if (!umsg->command_summary.empty()) {
         client->command_line = umsg->command_summary;
     } else if (client->command_line.empty() && client->channel) {
@@ -8522,6 +8833,7 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
        generation may later authorize the client (see scheduler_use_cs). */
     client->getcs_published = true;
     client->getcs_generation = scheduler_session_generation;
+    client->cache_offer_generation = scheduler_session_generation;
     return true;
 }
 
@@ -8829,6 +9141,10 @@ bool Daemon::handle_p50_cache_session_fd_request(
     const auto ready_lease = cache_adapter->outer_current_ready_lease();
     if (!ready_lease.has_value() || !ready_lease->valid())
         return refuse("supervised cache service has no current READY lease");
+    if (!handoff.readyLease.has_value() ||
+        !icecc::p50::daemon::p50_ready_lease_observation_equal(
+            *handoff.readyLease, *ready_lease))
+        return refuse("retained UseCS belongs to another READY lease");
 
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
@@ -8907,12 +9223,10 @@ bool Daemon::handle_cache_session(Client *client, Msg *msg)
         return false;
     }
 
-    /* S2 F-session bridge: dispatch the exact clean-boundary descriptor to
-       the authenticated sidecar (bounded, one absolute deadline), then mint
-       the daemon half of the distributed F-session operation from the REAL
-       owner facts and stage its identity-complete frames on a dedicated
-       second relationship to the same incarnation. */
-    namespace fsn = icecc::p50::fsession;
+    /* Dispatch the exact clean-boundary descriptor to the authenticated
+       sidecar under the authoritative CacheSession handoff.  That handoff
+       starts the endpoint itself; no second shadow P5FS relationship is
+       created for the same operation. */
     if (client->status != Client::WAITP50INPUT ||
         !client->p50_source_arm_fields.has_value() || cache_adapter == nullptr ||
         !cache_adapter->authenticated() ||
@@ -8928,7 +9242,6 @@ bool Daemon::handle_cache_session(Client *client, Msg *msg)
         handle_end(client, 121);
         return false;
     }
-    const P50SourceArmFields& arm = *client->p50_source_arm_fields;
     const auto outcome = cache_adapter->dispatcher()->dispatch(
         *client->channel, client->channel->protocol,
         static_cast<uint32_t>(Msg::CACHE_SESSION));
@@ -8947,122 +9260,6 @@ bool Daemon::handle_cache_session(Client *client, Msg *msg)
         return false;
     }
 
-    // The public descriptor is transferred; from here the sidecar owns the
-    // CacheWire stream. Mint the daemon F-session half from real owner facts.
-    fsn::FSessionOperationIdentity op_identity;
-    op_identity.daemon_launch_generation = daemon_generation;
-    op_identity.control_connection_generation = outcome.request.request_id;
-    op_identity.operation.sidecar_launch = {ready_lease->identity.generation,
-                                            ready_lease->identity.attempt};
-    op_identity.operation.role =
-        icecc::p50::daemon::P50SessionOperationRole::FSession;
-    op_identity.operation.operation_sequence = outcome.request.request_id;
-    op_identity.c_store_guid = {ready_lease->c_store_guid.bytes};
-    op_identity.f_store_guid = {ready_lease->f_store_guid.bytes};
-    op_identity.assignment_job = arm.wire_job_id;
-    op_identity.assignment_epoch = arm.assignment_epoch;
-    op_identity.assignment_nonce = arm.assignment_nonce;
-    op_identity.arm_observation = arm.source_request_id;
-    {
-        const auto clock = icecc::p50::sidecar::process_monotonic_clock_identity();
-        timespec now_ts{};
-        (void)::clock_gettime(CLOCK_MONOTONIC, &now_ts);
-        const int64_t now_ns =
-            int64_t(now_ts.tv_sec) * 1'000'000'000 + now_ts.tv_nsec;
-        const uint64_t remaining_msec =
-            client->p50_source_deadline_msec > monotonic_msec()
-                ? client->p50_source_deadline_msec - monotonic_msec()
-                : 1;
-        op_identity.deadline = {now_ns + int64_t(remaining_msec) * 1'000'000,
-                                clock.clock_domain_id, clock.time_namespace_id};
-    }
-    fsn::DaemonWaitLease::Facts wait_facts;
-    wait_facts.client_connection_generation =
-        client->connection_provenance.lease.connection_sequence;
-    wait_facts.compile_file_lease =
-        client->connection_provenance.lease.daemon_generation;
-    wait_facts.assignment_job = arm.wire_job_id;
-    wait_facts.assignment_epoch = arm.assignment_epoch;
-    wait_facts.assignment_nonce = arm.assignment_nonce;
-    wait_facts.arm_observation = arm.source_request_id;
-    wait_facts.wait_reservation = arm.source_request_id;
-    wait_facts.consumed_claim_capability = arm.logical_job != 0
-                                               ? arm.logical_job
-                                               : arm.wire_job_id;
-    wait_facts.deadline = op_identity.deadline;
-    auto fsession_op = fsn::DaemonFSessionOperation::mint(
-        op_identity, fsn::DaemonWaitLease(wait_facts));
-    if (!fsession_op.has_value()) {
-        log_warning() << "CACHE_SESSION F-session mint refused" << endl;
-        handle_end(client, 121);
-        return false;
-    }
-
-    // Dedicated control relationship: authenticated HELLO, then raw P5FS
-    // frames (the sidecar discriminates on the envelope magic post-HELLO).
-    const auto control_deadline =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
-    icecc::p50::local::Status connect_status = icecc::p50::local::Status::Ok;
-    icecc::p50::local::Connection control =
-        icecc::p50::local::connect_unix_until(ready_lease->socket_path,
-                                              control_deadline, &connect_status);
-    bool control_ok = control.valid();
-    if (control_ok) {
-        const icecc::p50::local::Identity control_identity{
-            ready_lease->identity.generation, ready_lease->identity.attempt};
-        icecc::p50::local::CredentialExpectation expect_peer;
-        expect_peer.uid = ::geteuid();
-        expect_peer.gid = ::getegid();
-        control_ok =
-            control.verify_peer_credentials(expect_peer) ==
-                icecc::p50::local::Status::Ok &&
-            control.send_until(
-                icecc::p50::local::make_hello(
-                    icecc::p50::local::PeerRole::Daemon, control_identity),
-                control_deadline) == icecc::p50::local::Status::Ok;
-        if (control_ok) {
-            icecc::p50::local::Frame acknowledgement;
-            control_ok =
-                control.receive_until(acknowledgement, control_deadline) ==
-                    icecc::p50::local::Status::Ok &&
-                icecc::p50::local::validate_handshake(
-                    acknowledgement, icecc::p50::local::MessageType::HelloAck,
-                    icecc::p50::local::PeerRole::Sidecar, control_identity) ==
-                    icecc::p50::local::Status::Ok;
-        }
-    }
-    if (!control_ok) {
-        log_warning() << "CACHE_SESSION F-session control connect failed" << endl;
-        handle_end(client, 121);
-        return false;
-    }
-    // Flush every staged frame (OperationOffer now; more as the op advances).
-    bool frames_ok = true;
-    for (uint64_t seq : fsession_op->outbound().pending_sequences()) {
-        const auto* slot = fsession_op->outbound().find(seq);
-        size_t off = slot->write_offset;
-        while (frames_ok && off < slot->canonical_bytes.size()) {
-            const ssize_t wrote =
-                ::send(control.native_handle(), slot->canonical_bytes.data() + off,
-                       slot->canonical_bytes.size() - off, MSG_NOSIGNAL);
-            if (wrote <= 0) {
-                if (wrote < 0 && errno == EINTR)
-                    continue;
-                frames_ok = false;
-                break;
-            }
-            off += size_t(wrote);
-            (void)fsession_op->outbound().record_written(seq, size_t(wrote));
-        }
-    }
-    if (!frames_ok) {
-        log_warning() << "CACHE_SESSION F-session offer flush failed" << endl;
-        handle_end(client, 121);
-        return false;
-    }
-    client->fsession_control_fd = ::dup(control.native_handle());
-    client->fsession_op = std::make_unique<fsn::DaemonFSessionOperation>(
-        std::move(*fsession_op));
     // The handoff consumed the public descriptor. Remove only its stale
     // poll-map entry: the Client and its exact source-arm claim remain in
     // `clients` for the later ordinary CompileFile connection and for
@@ -9072,9 +9269,7 @@ bool Daemon::handle_cache_session(Client *client, Msg *msg)
     const auto fd_entry = fd2client.find(old_fd);
     if (fd_entry != fd2client.end() && fd_entry->second == client)
         fd2client.erase(fd_entry);
-    trace() << "CACHE_SESSION dispatched: F-session operation "
-            << op_identity.operation.operation_sequence
-            << " offered to sidecar (gen "
+    trace() << "CACHE_SESSION dispatched to authoritative sidecar endpoint (gen "
             << ready_lease->identity.generation << "/"
             << ready_lease->identity.attempt << ")" << endl;
     return true;
@@ -9738,6 +9933,7 @@ void Daemon::answer_client_requests()
         }
         if (invalidate_p50_source_waiters_for_lease())
             return;
+        reconcile_cache_route_state();
     }
     // Keep exact child status delivery after the lifecycle turn.  The central
     // registry remains the only wait-status consumer; this ordering prevents
@@ -9772,6 +9968,7 @@ void Daemon::answer_client_requests()
             if (event.has_value())
                 (void)cache_adapter->outer_observe_child_reaped(*event);
         }
+        reconcile_cache_route_state();
     }
     // Reset debug if needed, but only if we aren't waiting for any child processes to finish,
     // otherwise their debug output could end up reset in the middle (and flush log marks used

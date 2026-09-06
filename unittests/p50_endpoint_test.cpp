@@ -467,10 +467,11 @@ struct TestClient {
     explicit TestClient(CStoreGuid c_store_guid, EndpointCaps caps = {},
                         HistoryNonce first_history_nonce = HistoryNonce{1},
                         CompletionLog* completions = nullptr, ActionTrace* actions = nullptr,
-                        PreparationAuthorityLimits authority_limits = {})
+                        PreparationAuthorityLimits authority_limits = {},
+                        TuSeq first_tu_seq = {})
         : authority(std::make_shared<P50PreparationAuthority>(
               c_store_guid, caps.zstd, authority_limits, 1,
-              caps.profile)),
+              caps.profile, first_tu_seq)),
           endpoint(authority, caps, first_history_nonce, completions, actions) {}
 
     operator P50ClientEndpoint&() { return endpoint; }
@@ -655,6 +656,55 @@ void test_zstd_route_authority_bounded_history() {
                     authority.retained_encoded_bytes() == 0,
                 "route authority did not release the committed preparation");
     }
+}
+
+void test_server_routes_are_isolated_by_profile() {
+    const P5coStoreGuids guids = p5co_store_guids(212);
+    EndpointCaps server_caps;
+    server_caps.supported_profiles = kOperationalProfileMask;
+    ActionTrace actions;
+    P50ServerEndpoint server(guids.f, server_caps, nullptr, &actions);
+
+    EndpointCaps p29_caps;
+    p29_caps.profile = ProfileId::P29V1;
+    EndpointCaps zstd_caps;
+    zstd_caps.profile = ProfileId::ZSTD_TU;
+    TestClient p29(guids.c, p29_caps, HistoryNonce{1}, nullptr, &actions);
+    // Both clients deliberately represent the same C store.  Give the second
+    // preparation authority a disjoint C-wide TU sequence so this test probes
+    // route identity rather than duplicate input-record admission.
+    TestClient zstd(guids.c, zstd_caps, HistoryNonce{100}, nullptr, &actions,
+                    {}, TuSeq{100});
+
+    const PairResult first_p29 =
+        run_pair(p29, server, admit(p29, bytes("profile-isolated p29 first\n")));
+    const PairResult first_zstd =
+        run_pair(zstd, server, admit(zstd, bytes("profile-isolated zstd\n")));
+    const PairResult second_p29 =
+        run_pair(p29, server, admit(p29, bytes("profile-isolated p29 second\n")));
+
+    require(first_p29.client.status == ClientRunStatus::Committed &&
+                first_p29.server.status == ServerRunStatus::Completed &&
+                first_zstd.client.status == ClientRunStatus::Committed &&
+                first_zstd.server.status == ServerRunStatus::Completed &&
+                second_p29.client.status == ClientRunStatus::Committed &&
+                second_p29.server.status == ServerRunStatus::Completed &&
+                second_p29.client.reconnect ==
+                    EndpointReconnectOutcome::ExactMatch,
+            "a second profile replaced the retained route for the first profile");
+    if (const auto error = check_action_trace(actions.records()))
+        fail("P29V1/ZSTD_TU/P29V1 profile-isolation trace: " + *error);
+    const auto zstd_action = std::find_if(
+        actions.records().begin(), actions.records().end(),
+        [](const ActionRecord& record) {
+            return record.profile == ProfileId::ZSTD_TU;
+        });
+    require(zstd_action != actions.records().end(),
+            "mixed-profile action trace omitted every ZSTD_TU record");
+    const std::string zstd_json = zstd_action == actions.records().end()
+        ? std::string() : action_jsonl(*zstd_action);
+    require(zstd_json.find("\"profile\":\"zstd_tu\"") != std::string::npos,
+            "action JSON omitted the exact route profile");
 }
 
 void test_p29v1_endpoint_route_dialogue_lifetime() {
@@ -6241,6 +6291,7 @@ int main(int argc, char** argv) {
     test_two_client_one_server_isolation();
     test_zstd_route_endpoint_continuation_and_retry();
     test_zstd_route_authority_bounded_history();
+    test_server_routes_are_isolated_by_profile();
     test_p29v1_endpoint_route_dialogue_lifetime();
     test_live_global_resource_trace();
     test_automatic_action_trace_is_complete_past_1024_records();

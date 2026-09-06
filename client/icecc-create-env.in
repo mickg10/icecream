@@ -447,7 +447,20 @@ if test -n "$compress_program"; then
     fi
 fi
 
-tempdir=$(mktemp -d /tmp/iceccenvXXXXXX)
+configured_temporary_root=${TMPDIR:-/tmp}
+temporary_root=$(cd "$configured_temporary_root" 2>/dev/null && pwd -P) || {
+    echo "Cannot use temporary directory '$configured_temporary_root'."
+    exit 1
+}
+tempdir=$(mktemp -d "$temporary_root/iceccenvXXXXXX") || exit 1
+tmp_ld_so_conf=
+
+cleanup_temporary_files()
+{
+    test -z "$tempdir" || rm -rf -- "$tempdir"
+    test -z "$tmp_ld_so_conf" || rm -f -- "$tmp_ld_so_conf"
+}
+trap cleanup_temporary_files EXIT
 
 # for testing the environment is usable at all
 bintrue=/bin/true
@@ -545,7 +558,7 @@ fi
 # for ldconfig -r to work, ld.so.conf must not contain relative paths
 # in include directives. Make them absolute.
 if test -f /etc/ld.so.conf; then
-  tmp_ld_so_conf=$(mktemp /tmp/icecc_ld_so_confXXXXXX)
+  tmp_ld_so_conf=$(mktemp "$temporary_root/icecc_ld_so_confXXXXXX") || exit 1
   while read directive path; do
     if [ "$directive" = "include" -a "${path:0:1}" != "/" ]; then
       path="/etc/$path"
@@ -614,8 +627,6 @@ tar -ch --numeric-owner -f - $target_files | "$compress_program" $compress_args 
 }
 mv "$md5".tar"$compress_ext" "$mydir"/
 cd ..
-rm -rf $tempdir
-rm -f $tmp_ld_so_conf
 
 # Print the tarball name to fd 5 (if it's open, created by whatever has invoked this)
 ( echo $md5.tar"$compress_ext" >&5 ) 2>/dev/null

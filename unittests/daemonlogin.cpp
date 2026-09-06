@@ -245,8 +245,11 @@ int main(int argc, char **argv)
     }
     signal(SIGPIPE, SIG_IGN);
 
-    char temp_template[] = "/tmp/icecream-g4-login.XXXXXX";
-    char *temp = mkdtemp(temp_template);
+    const char *temporary_root = std::getenv("TMPDIR");
+    std::string temp_template =
+        std::string(temporary_root && temporary_root[0] ? temporary_root : "/tmp")
+        + "/icecream-g4-login.XXXXXX";
+    char *temp = mkdtemp(&temp_template[0]);
     if (!temp) {
         perror("mkdtemp");
         return 2;
