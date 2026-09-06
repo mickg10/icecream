@@ -102,6 +102,8 @@ def test_manifest_driver_is_one_fixed_program_with_all_spec_values_in_argv(
     assert len(scripted.commands) == 1
     argv = scripted.commands[0].argv
     assert MANIFEST_DRIVER in argv
+    driver_index = argv.index(MANIFEST_DRIVER)
+    assert argv[driver_index + 12] == "1"
     assert argv[-4:] == ("A", "", "", "0")
     assert "/usr/bin/g++" in argv
     assert argv[-6:-4] == ("-O2", "-fdiagnostics-color=never")
@@ -134,6 +136,28 @@ def test_manifest_driver_is_one_fixed_program_with_all_spec_values_in_argv(
         (tmp_path / "results" / "workload-unit" / "workload.json").read_text()
     )
     assert persisted == receipt
+
+
+def test_s30_mutant_workload_enables_the_legacy_recovery_under_test(
+    tmp_path: Path,
+) -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    farm.data["hub"]["results_root"] = str(tmp_path)
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / "S30-mutant-f-refusal.json", farm
+    )
+    plan = farmtest.build_plan(farm, scenario, run_id="s30-mutant-workload-unit")
+    scripted = WorkloadRecorder()
+    run_workload(
+        farm,
+        scenario,
+        plan,
+        recorder=RecordingTransport(scripted),
+        require_up=False,
+    )
+    argv = scripted.commands[0].argv
+    driver_index = argv.index(MANIFEST_DRIVER)
+    assert argv[driver_index + 12] == "0"
 
 
 def test_manifest_driver_shell_is_syntactically_valid() -> None:

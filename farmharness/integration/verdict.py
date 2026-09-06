@@ -2622,7 +2622,11 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
             if (
                 row["tail_profile"] != expected
                 and not authenticated_recovery_legacy(row)
-                and not (s30_mutant and row["session_outcome"] == "fallback")
+                and not (
+                    s30_mutant
+                    and row["tail_present"] is False
+                    and row["session_outcome"] in {"fallback", "none"}
+                )
             ):
                 engagement_bad.add(_job_id(row["job_id"], "@row"))
     elif engagement_mode == S70_B4_WORKER_ENGAGEMENT:
@@ -3959,7 +3963,10 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
     if s30_mutant:
         s30 = observations.get("s30_mutant_f")
         records = s30.get("records") if isinstance(s30, Mapping) else None
-        canary_records = s30.get("canary_records") if isinstance(s30, Mapping) else None
+        record_count = len(records) if isinstance(records, list) else None
+        canary_records = (
+            s30.get("canary_records") if isinstance(s30, Mapping) else None
+        )
         fallback_ids = {
             _job_id(row["job_id"], "@row")
             for row in valid_rows
@@ -3968,7 +3975,11 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
         trace_bad: set[str] = set()
         if not isinstance(s30, Mapping) or s30.get("schema") != "icefarm-s30-mutant-f-refusal-v1":
             trace_bad.add("@observations:s30_mutant_f")
-        if not isinstance(records, list) or len(records) != len(valid_rows):
+        if (
+            not isinstance(records, list)
+            or not records
+            or len(records) > len(fallback_ids)
+        ):
             trace_bad.add("@observations:s30_mutant_f.records")
         else:
             for index, record in enumerate(records):
@@ -3999,12 +4010,16 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
             )
         ):
             trace_bad.add("@observations:s30_mutant_f.canary_records")
-        if not isinstance(s30, Mapping) or s30.get("refusal_count") != len(valid_rows):
+        if (
+            not isinstance(s30, Mapping)
+            or s30.get("refusal_count") != record_count
+        ):
             trace_bad.add("@observations:s30_mutant_f.refusal_count")
         if (
             not isinstance(s30, Mapping)
             or set(s30.get("fallback_job_ids", ())) != fallback_ids
-            or s30.get("fresh_legacy_assignment_count") != len(valid_rows)
+            or not fallback_ids
+            or s30.get("fresh_legacy_assignment_count") != len(fallback_ids)
             or s30.get("local_fallback_job_ids") != []
         ):
             trace_bad.add("@observations:s30_mutant_f.binding")
@@ -4019,7 +4034,7 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
             not isinstance(legacy, Mapping)
             or legacy.get("record_count") != len(valid_rows)
             or not isinstance(legacy_records, list)
-            or legacy_ids != fallback_ids
+            or legacy_ids != set(identifiers)
             or any(
                 not isinstance(item, Mapping)
                 or item.get("c_to_f_bytes", 0) <= 0
@@ -4032,15 +4047,17 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
             _clause(
                 "s30.mutant-refusal-evidence",
                 not trace_bad,
-                "one authenticated post-hello refusal and one conserved legacy retry per workload row",
+                "authenticated post-hello refusal(s) bind bounded conserved legacy retries",
                 trace_bad,
             )
         )
         s30_rows_bad = {
             _job_id(row["job_id"], "@row")
             for row in valid_rows
-            if row["session_outcome"] != "fallback"
-            or row["retries"] != 1
+            if not (
+                (row["session_outcome"] == "fallback" and row["retries"] == 1)
+                or (row["session_outcome"] == "none" and row["retries"] == 0)
+            )
             or row["tail_present"] is not False
             or row["tail_profile"] is not None
             or row["exact"] is not True
@@ -4051,7 +4068,7 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
             _clause(
                 "s30.one-refusal-one-retry",
                 not s30_rows_bad,
-                "S30 has exactly one refused P50 attempt followed by one fresh legacy assignment",
+                "each affected S30 job has exactly one refused P50 attempt and one fresh legacy assignment",
                 s30_rows_bad,
             )
         )

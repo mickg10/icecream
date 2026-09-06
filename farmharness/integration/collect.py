@@ -3260,7 +3260,11 @@ def _parse_rows(
                     }
                 )
                 if scenario.data.get("id") == "S30-mutant-f-refusal":
-                    outcome = "fallback"
+                    # A refused P50 assignment is followed by one fresh
+                    # legacy assignment.  Once the route owner requests
+                    # replacement, later jobs may correctly arrive as
+                    # ordinary first-assignment legacy work.
+                    outcome = "fallback" if raw["retries"] == 1 else "none"
             if raw["compile_rc"] != 0:
                 compile_failures.append(job_id)
             if raw["remote"] != 1:
@@ -3296,9 +3300,9 @@ def _parse_rows(
         raise CollectError(f"acceptance job ids are not unique: {sorted(duplicates)!r}")
     if scenario.data.get("id") == "S30-mutant-f-refusal":
         fallback_rows = [row for row in rows if row["session_outcome"] == "fallback"]
-        if len(s30_refusals) != len(fallback_rows):
+        if not s30_refusals or len(s30_refusals) > len(fallback_rows):
             raise CollectError(
-                "S30 mutant refusal count does not equal fallback workload rows"
+                "S30 mutant refusals do not bind at least one bounded fallback row"
             )
     return rows, {
         "compile_failure_job_ids": sorted(compile_failures),
@@ -4071,26 +4075,54 @@ def _observations(
     if scenario.data.get("id") == "S30-mutant-f-refusal":
         refusal = row_facts.get("s30_mutant_f")
         fallback_rows = [row for row in rows if row["session_outcome"] == "fallback"]
+        direct_legacy_rows = [row for row in rows if row["session_outcome"] == "none"]
         refusal_count = refusal.get("refusal_count") if isinstance(refusal, Mapping) else None
-        if refusal_count != len(fallback_rows) or any(
-            row["retries"] != 1
-            or row["tail_present"]
-            or row["tail_profile"] is not None
-            or row["session_outcome"] != "fallback"
-            for row in rows
+        if (
+            not fallback_rows
+            or not isinstance(refusal_count, int)
+            or refusal_count < 1
+            or refusal_count > len(fallback_rows)
+            or len(fallback_rows) + len(direct_legacy_rows) != len(rows)
+            or any(
+                row["retries"] != 1
+                or row["tail_present"]
+                or row["tail_profile"] is not None
+                for row in fallback_rows
+            )
+            or any(
+                row["retries"] != 0
+                or row["tail_present"]
+                or row["tail_profile"] is not None
+                for row in direct_legacy_rows
+            )
         ):
-            raise CollectError("S30 mutant rows do not prove exactly one P50 refusal and one legacy retry")
+            raise CollectError(
+                "S30 mutant rows do not prove bounded P50 refusal recovery"
+            )
         if row_facts.get("local_fallback_job_ids"):
             raise CollectError("S30 mutant has a local fallback")
         for raw in raw_jobs:
             attempts = raw["assignment_claims"]
-            if len(attempts) != 2:
-                raise CollectError("S30 mutant workload did not make exactly one fresh retry")
-            first, final = attempts
-            if first["scheduler_record"].get("terminal") == "completion":
-                raise CollectError("S30 first P50 assignment has no refusal terminal")
-            if final["scheduler_record"].get("terminal") != "completion":
-                raise CollectError("S30 fresh legacy assignment lacks a completion terminal")
+            row = row_by_identity[raw["row_job_id"]]
+            if row["session_outcome"] == "fallback":
+                if len(attempts) != 2:
+                    raise CollectError(
+                        "S30 affected workload did not make exactly one fresh retry"
+                    )
+                first, final = attempts
+                if first["scheduler_record"].get("terminal") == "completion":
+                    raise CollectError("S30 first P50 assignment has no refusal terminal")
+                if final["scheduler_record"].get("terminal") != "completion":
+                    raise CollectError(
+                        "S30 fresh legacy assignment lacks a completion terminal"
+                    )
+            elif (
+                len(attempts) != 1
+                or attempts[0]["scheduler_record"].get("terminal") != "completion"
+            ):
+                raise CollectError(
+                    "S30 direct legacy workload is not one completed assignment"
+                )
         row_facts["s30_mutant_f"]["fallback_job_ids"] = sorted(
             row["job_id"] for row in fallback_rows
         )

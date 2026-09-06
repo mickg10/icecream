@@ -735,6 +735,10 @@ def _driver_command(
         scenario.data["shape"] == "S'C'F'"
         and all(item["version"] == 50 for item in plan["topology"]["instances"])
         and not scenario.data["controls"]
+        # This is deliberately a recovery control: its mutant F refuses the
+        # P50 session so the wrapper can prove one bounded fresh legacy
+        # assignment.  Marking it strict disables the behavior under test.
+        and scenario.data.get("id") != "S30-mutant-f-refusal"
     )
     container = f"icefarm-{plan['run_id']}-{client['name']}"
     fault = scenario.data.get("fault", {})

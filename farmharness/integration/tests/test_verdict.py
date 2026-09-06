@@ -2310,20 +2310,41 @@ def _s30_fixture() -> dict[str, object]:
             tail=False,
             profile=None,
             outcome="fallback",
-        )
+        ),
+        _row(
+            2,
+            client_version=50,
+            worker_version=50,
+            tail=False,
+            profile=None,
+            outcome="none",
+        ),
+        _row(
+            3,
+            client_version=50,
+            worker_version=50,
+            tail=False,
+            profile=None,
+            outcome="fallback",
+        ),
     ]
     rows[0]["retries"] = 1
+    rows[2]["retries"] = 1
     scenario = _scenario("S'C'F'", client_versions=(50,), worker_versions=(50,))
     scenario["id"] = "S30-mutant-f-refusal"
     scenario["expect"]["reuse"] = "none-when-legacy"
-    scenario["expect"]["error106_max"] = 1
+    scenario["expect"]["error106_max"] = 2
     observations = _observations(rows, revisions={"C1": 1, "F1": 1})
     observations["sidecars"]["C1"]["sessions"] = 1
     observations["sidecars"]["F1"]["sessions"] = 1
-    observations["error106_job_ids"] = ["1"]
+    observations["error106_job_ids"] = ["1", "3"]
     observations["legacy_wire"] = {
-        "record_count": 1,
-        "records": [{"job_id": "1", "c_to_f_bytes": 1024, "f_to_c_bytes": 512}],
+        "record_count": 3,
+        "records": [
+            {"job_id": "1", "c_to_f_bytes": 1024, "f_to_c_bytes": 512},
+            {"job_id": "2", "c_to_f_bytes": 1024, "f_to_c_bytes": 512},
+            {"job_id": "3", "c_to_f_bytes": 1024, "f_to_c_bytes": 512},
+        ],
     }
     observations["s30_mutant_f"] = {
         "canary_records": [
@@ -2345,8 +2366,8 @@ def _s30_fixture() -> dict[str, object]:
             }
         ],
         "refusal_count": 1,
-        "fallback_job_ids": ["1"],
-        "fresh_legacy_assignment_count": 1,
+        "fallback_job_ids": ["1", "3"],
+        "fresh_legacy_assignment_count": 2,
         "local_fallback_job_ids": [],
     }
     return _bundle(scenario, rows, observations)
@@ -2361,6 +2382,13 @@ def test_s30_mutant_requires_one_refusal_and_one_fresh_legacy_retry() -> None:
     assert evaluate_bundle(fixture)["status"] == "FAIL"
     fixture = _s30_fixture()
     fixture["rows"][0]["retries"] = 2
+    assert evaluate_bundle(fixture)["status"] == "FAIL"
+    fixture = _s30_fixture()
+    fixture["rows"][1]["retries"] = 1
+    assert evaluate_bundle(fixture)["status"] == "FAIL"
+    fixture = _s30_fixture()
+    fixture["observations"]["s30_mutant_f"]["records"] = []
+    fixture["observations"]["s30_mutant_f"]["refusal_count"] = 0
     assert evaluate_bundle(fixture)["status"] == "FAIL"
     fixture = _s30_fixture()
     fixture["observations"]["s30_mutant_f"]["canary_records"] = []
