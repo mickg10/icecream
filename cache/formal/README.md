@@ -309,7 +309,6 @@ command is:
 
 ```sh
 TLA2TOOLS_JAR=/path/to/tla2tools.jar \
-TLC_WORKERS=1 \
 make protocol50-formal
 ```
 
@@ -320,6 +319,12 @@ unique retained directory below `P50_FORMAL_RESULTS_ROOT` (or
 lane starts, hashes every selected input, and records commands, logs, state
 counts, and a machine-readable aggregate verdict.  Missing dependencies,
 timeouts, missing row markers, and `SKIP` are never PASS.
+
+The authenticated manifest defaults the aggregate to eight TLC workers.  The
+selected V6 composition graph does not drain inside its 300-second row bound
+with one worker, but completes at depth 87 with eight.  `TLC_WORKERS` remains
+an explicit override for constrained or larger hosts, and its exact value is
+retained in the evidence bundle; too little execution capacity fails closed.
 
 The ZSTD_ROUTE/FInput selection uses the packaged portable execution
 authority and does not claim the complete 87-row historical matrix.  Direct

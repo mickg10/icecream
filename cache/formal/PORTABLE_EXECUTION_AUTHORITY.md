@@ -14,6 +14,15 @@ input, allocates a unique retained state directory, records exact commands and
 bounded TLC state counts, and refuses missing inputs, missing row markers,
 timeouts, unexpected exits, and any output containing `SKIP`.
 
+The manifest declares eight TLC workers as the portable aggregate default.
+This is an execution-resource requirement, not a semantic assumption: the
+selected V6 composition safety row has a complete graph of 592,434 generated
+and 264,535 distinct states at depth 87.  One worker reproducibly reaches the
+300-second row bound before draining that graph, while eight workers complete
+it inside the same bound.  A caller may still override `TLC_WORKERS`; the
+chosen value is retained in the aggregate authority and every lane command,
+and an under-provisioned run remains fail-closed on timeout.
+
 The portable ZSTD_ROUTE/FInput lane remains bound to
 `s6_mutation_manifest.jsonl`.  That manifest authenticates all 87 declared
 rows and their model/configuration bytes.  The aggregate target selects the

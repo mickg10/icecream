@@ -55,6 +55,14 @@ def _load_manifest(path: Path) -> dict[str, Any]:
         raise Refusal(f"cannot read aggregate manifest: {exc}") from exc
     if not isinstance(manifest, dict) or manifest.get("schema") != "icecream-p50-formal-aggregate-v1":
         raise Refusal("aggregate manifest has the wrong schema")
+    default_workers = manifest.get("default_workers")
+    if (
+        not isinstance(default_workers, int)
+        or isinstance(default_workers, bool)
+        or default_workers < 1
+        or default_workers > 64
+    ):
+        raise Refusal("aggregate manifest default_workers is outside 1..64")
     tool = manifest.get("tool")
     if not isinstance(tool, dict) or not re.fullmatch(r"[0-9a-f]{64}", str(tool.get("sha256", ""))):
         raise Refusal("aggregate manifest lacks a valid pinned tool SHA-256")
@@ -333,7 +341,7 @@ def main(argv: list[str] | None = None) -> int:
             raise Refusal("TLA2TOOLS_JAR does not match the aggregate manifest digest")
         if shutil.which("java") is None:
             raise Refusal("java is required for every selected formal lane")
-        workers = os.environ.get("TLC_WORKERS", "1")
+        workers = os.environ.get("TLC_WORKERS", str(manifest["default_workers"]))
         if not re.fullmatch(r"[1-9][0-9]*", workers):
             raise Refusal("TLC_WORKERS must be a positive integer")
         prepared = [_prepare_lane(formal_root, lane) for lane in manifest["lanes"]]

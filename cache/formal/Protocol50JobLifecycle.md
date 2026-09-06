@@ -138,7 +138,7 @@ other's state.
 ## Run
 
 ```sh
-TLA2TOOLS_JAR=/path/to/tla2tools.jar TLC_WORKERS=1 make protocol50-formal
+TLA2TOOLS_JAR=/path/to/tla2tools.jar make protocol50-formal
 ```
 
 The exact branch head requires a retained TLC run and independent reproduction before merge. Publishing the model is not a pass result.

@@ -42,6 +42,7 @@ def _fake_formal_tree(tmp_path: Path, output: str = "== clean ==") -> tuple[Path
     manifest = {
         "schema": "icecream-p50-formal-aggregate-v1",
         "tool": {"name": "tla2tools.jar", "sha256": _digest(jar)},
+        "default_workers": 8,
         "lanes": [
             {
                 "id": "fake",
@@ -64,10 +65,19 @@ def _fake_formal_tree(tmp_path: Path, output: str = "== clean ==") -> tuple[Path
     return manifest_path, jar
 
 
-def _run_fake(manifest: Path, jar: Path, results: Path) -> subprocess.CompletedProcess[str]:
+def _run_fake(
+    manifest: Path,
+    jar: Path,
+    results: Path,
+    *,
+    workers: str | None = "1",
+) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     environment["TLA2TOOLS_JAR"] = str(jar)
-    environment["TLC_WORKERS"] = "1"
+    if workers is None:
+        environment.pop("TLC_WORKERS", None)
+    else:
+        environment["TLC_WORKERS"] = workers
     return subprocess.run(
         [
             sys.executable,
@@ -101,6 +111,7 @@ def test_packaged_manifest_selects_every_formal_lane_and_preflights() -> None:
     assert manifest["tool"]["sha256"] == (
         "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
     )
+    assert manifest["default_workers"] == 8
     zstd = prepared[-1]
     assert zstd["environment"]["S6_PORTABLE_EXECUTION"] == "1"
     assert zstd["result_contract"] == "zstd-selected-jsonl"
@@ -136,6 +147,30 @@ def test_aggregate_retains_authenticated_unique_success_bundles(tmp_path: Path) 
         assert authority["inputs"]["Model.cfg"]["sha256"] == _digest(
             manifest.parent / "Model.cfg"
         )
+
+
+def test_aggregate_uses_authenticated_default_workers(tmp_path: Path) -> None:
+    manifest, jar = _fake_formal_tree(tmp_path)
+    results = tmp_path / "results"
+    completed = _run_fake(manifest, jar, results, workers=None)
+    assert completed.returncode == 0
+    bundle = next(results.glob("aggregate-*"))
+    authority = json.loads((bundle / "authority.json").read_text())
+    assert authority["workers"] == 8
+
+
+def test_aggregate_refuses_invalid_default_workers_before_starting_a_lane(
+    tmp_path: Path,
+) -> None:
+    manifest, jar = _fake_formal_tree(tmp_path)
+    value = json.loads(manifest.read_text())
+    value["default_workers"] = 0
+    manifest.write_text(json.dumps(value))
+    results = tmp_path / "results"
+    completed = _run_fake(manifest, jar, results, workers=None)
+    assert completed.returncode == 2
+    assert "default_workers is outside 1..64" in completed.stderr
+    assert not results.exists()
 
 
 def test_aggregate_never_promotes_skip_to_pass(tmp_path: Path) -> None:
