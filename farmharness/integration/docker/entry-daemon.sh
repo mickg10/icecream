@@ -46,9 +46,12 @@ test -n "$port"
 test -n "$slots"
 test -n "$node_name"
 
+runtime_user=nobody
+runtime_uid=$(id -u "$runtime_user")
+runtime_gid=$(id -g "$runtime_user")
 install -d -m 1777 /var/cache/icecream/envs /var/log/icecream
-install -d -m 0700 -o icecc -g icecc /var/cache/icecream/p50-runtime
-chown -R icecc:icecc /var/cache/icecream
+install -d -m 0700 -o "$runtime_uid" -g "$runtime_gid" /var/cache/icecream/p50-runtime
+chown -R "$runtime_uid:$runtime_gid" /var/cache/icecream
 
 set -- \
     -s "$scheduler" \
@@ -56,7 +59,7 @@ set -- \
     -p "$port" \
     -m "$slots" \
     -N "$node_name" \
-    -u icecc \
+    -u "$runtime_user" \
     -b /var/cache/icecream/envs \
     -l /var/log/icecream/iceccd.log \
     -vvv

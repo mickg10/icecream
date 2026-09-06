@@ -1,0 +1,63 @@
+FROM ubuntu:22.04 AS build
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG BUILD_JOBS=8
+ARG SOURCE_ARCHIVE_SHA256
+ARG SOURCE_COMMIT
+ARG MUTANT_RECIPE_SHA256
+ARG MUTANT_PATCH_SHA256
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        autoconf automake build-essential ca-certificates cmake g++-11 gcc-11 git \
+        libarchive-dev libboost-dev libcap-ng-dev liblzo2-dev libtool \
+        libxxhash-dev libzstd-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY source.tar /tmp/source.tar
+COPY daemon-mutant.patch /tmp/daemon-mutant.patch
+RUN printf '%s  %s\n' "${SOURCE_ARCHIVE_SHA256}" /tmp/source.tar | sha256sum --check --strict \
+    && printf '%s  %s\n' "${MUTANT_PATCH_SHA256}" /tmp/daemon-mutant.patch | sha256sum --check --strict \
+    && mkdir -p /build/source \
+    && tar -xf /tmp/source.tar -C /build/source \
+    && cd /build/source \
+    && git apply --check /tmp/daemon-mutant.patch \
+    && git apply /tmp/daemon-mutant.patch \
+    && rm -f /tmp/source.tar /tmp/daemon-mutant.patch
+
+WORKDIR /build/source
+RUN CC=gcc-11 CXX=g++-11 ./autogen.sh \
+    && CC=gcc-11 CXX=g++-11 ./configure --prefix=/opt/icecream --without-man \
+    && make -j"${BUILD_JOBS}" \
+    && make install
+
+FROM ubuntu:22.04 AS runtime
+
+ARG SOURCE_ARCHIVE_SHA256
+ARG SOURCE_COMMIT
+ARG MUTANT_RECIPE_SHA256
+ARG MUTANT_PATCH_SHA256
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates cmake file g++-11 gcc-11 gzip \
+        libarchive13 libboost-system1.74.0 libcap-ng0 libgomp1 liblzo2-2 \
+        libstdc++6 libxxhash0 libzstd1 xz-utils \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system icecc \
+    && useradd --system --gid icecc --home-dir /var/cache/icecream --shell /usr/sbin/nologin icecc \
+    && install -d -m 0755 -o icecc -g icecc /var/cache/icecream \
+    && install -d -m 1777 /var/log/icecream /results
+
+COPY --from=build /opt/icecream /opt/icecream
+COPY entry-scheduler.sh entry-daemon.sh entry-client.sh /opt/icecream/
+RUN chmod 0755 /opt/icecream/entry-scheduler.sh /opt/icecream/entry-daemon.sh /opt/icecream/entry-client.sh
+
+LABEL icefarm.source.commit="${SOURCE_COMMIT}" \
+      icefarm.source.archive_sha256="${SOURCE_ARCHIVE_SHA256}" \
+      icefarm.mutant.patch_sha256="${MUTANT_PATCH_SHA256}" \
+      icefarm.mutant.recipe_sha256="${MUTANT_RECIPE_SHA256}" \
+      icefarm.mutant.kind="daemon-mutant"
+
+ENV PATH="/opt/icecream/bin:/opt/icecream/sbin:${PATH}"
+WORKDIR /work

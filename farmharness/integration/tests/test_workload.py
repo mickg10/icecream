@@ -2,18 +2,24 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
 
 import pytest
 
 from farmharness.integration import farmtest
 from farmharness.integration.farm_spec import load_farm_spec
 from farmharness.integration.images import RecordingTransport
-from farmharness.integration.remote import CommandResult, PlannedCommand, decode_ssh_payload
+from farmharness.integration.remote import (
+    CommandResult,
+    PlannedCommand,
+    decode_ssh_payload,
+)
 from farmharness.integration.scenario_spec import ScenarioSpecError, load_scenario_spec
 from farmharness.integration.workload import (
     MANIFEST_DRIVER,
     WORKLOAD_SCHEMA,
     WorkloadError,
+    _parse_summary,
     run_workload,
 )
 
@@ -30,12 +36,26 @@ def _farm_scenario_plan(tmp_path: Path):
 
 
 class WorkloadRecorder:
-    def __init__(self, stdout: str = "ICEFARM_WORKLOAD jobs=100 failures=0 samples=3\n") -> None:
+    def __init__(
+        self, stdout: str = "ICEFARM_WORKLOAD jobs=100 failures=0 samples=3\n"
+    ) -> None:
         self.stdout = stdout
         self.commands: list[PlannedCommand] = []
 
     def invoke(self, command: PlannedCommand) -> CommandResult:
         self.commands.append(command)
+        return CommandResult(0, self.stdout, "")
+
+
+class PairedWorkloadRecorder(WorkloadRecorder):
+    def invoke(self, command: PlannedCommand) -> CommandResult:
+        self.commands.append(command)
+        if command.phase == "run.corpus-clear":
+            return CommandResult(0, f"cleared {command.argv[-1]}\n", "")
+        if command.phase == "run.corpus-materialize":
+            return CommandResult(0, "materialized /icefarm-corpus-cache/active\n", "")
+        if command.phase == "run.corpus-activate":
+            return CommandResult(0, f"activated {command.argv[-5]}\n", "")
         return CommandResult(0, self.stdout, "")
 
 
@@ -45,12 +65,12 @@ def test_plan_mounts_authenticated_corpus_read_only_and_closure_scoped_oracle(
     _farm, _scenario, plan = _farm_scenario_plan(tmp_path)
     client = next(item for item in plan["commands"] if item["phase"] == "up.start-c")
     argv = client["argv"]
-    corpus_mount = next(
-        item for item in argv if item.endswith("dst=/corpus,readonly")
-    )
+    corpus_mount = next(item for item in argv if item.endswith("dst=/corpus,readonly"))
     oracle_mount = next(item for item in argv if item.endswith("dst=/oracle"))
-    assert "/corpora/fmt-100," in corpus_mount
-    assert plan["topology"]["instances"][1]["image"]["closure_sha256"] in oracle_mount
+    assert "/workload-unit/C1/input," in corpus_mount
+    client = next(item for item in plan["topology"]["instances"] if item["role"] == "C")
+    assert client["container_image"]["closure_sha256"] not in oracle_mount
+    assert "/oracle/fmt-100/" in oracle_mount
     for environment in (
         "ICECC_P50_COMPILE_IDENTITY_TRACE=/results/compile-identity.jsonl",
         "ICECC_P50_C_ACTION_TRACE=/results/c-action.jsonl",
@@ -80,13 +100,48 @@ def test_manifest_driver_is_one_fixed_program_with_all_spec_values_in_argv(
     assert len(scripted.commands) == 1
     argv = scripted.commands[0].argv
     assert MANIFEST_DRIVER in argv
-    assert argv[-2:] == ("0", "A") or argv[-2:] == ("1", "A")
+    assert argv[-4:] == ("A", "", "", "0")
+    assert "/usr/bin/g++" in argv
+    assert argv[-6:-4] == ("-O2", "-fdiagnostics-color=never")
     assert "fmt-100" not in MANIFEST_DRIVER
-    assert "oracle_command='g++-11 -O2 -fdiagnostics-color=never -c'" in MANIFEST_DRIVER
+    assert "/usr/bin/g++-11" not in MANIFEST_DRIVER
+    assert "oracle_recipe=icecream-clang-remote-v1" in MANIFEST_DRIVER
+    assert '-Xclang -main-file-name -Xclang "$source"' in MANIFEST_DRIVER
+    assert '-Xclang -fdebug-compilation-dir -Xclang "$PWD"' in MANIFEST_DRIVER
+    assert '-c -target "$compiler_target" - -o "$object"' in MANIFEST_DRIVER
+    assert '"$compiler" "${oracle_compiler_args[@]}" -c "$source"' in MANIFEST_DRIVER
+    assert MANIFEST_DRIVER.count('oracle_compile "$source" "$object"') == 2
     assert "'building myself, but telling localhost'" in MANIFEST_DRIVER
     assert '"$remote" -eq 1' in MANIFEST_DRIVER
-    persisted = json.loads((tmp_path / "results" / "workload-unit" / "workload.json").read_text())
+    assert "printf 'OPEN\\t0\\n' >\"$gate_state\"" in MANIFEST_DRIVER
+    assert 'flock -x 8' in MANIFEST_DRIVER
+    assert 'mv -- "$temporary_marker" "$marker"' in MANIFEST_DRIVER
+    assert 'case "$gate_mode" in' in MANIFEST_DRIVER
+    assert 'QUIESCE)' in MANIFEST_DRIVER
+    assert 'write_checkpoint' in MANIFEST_DRIVER
+    assert 'checkpoint_sha256' in MANIFEST_DRIVER
+    assert 'resume_mode' in MANIFEST_DRIVER
+    assert 'event gate aborted at epoch $gate_epoch' in MANIFEST_DRIVER
+    assert 'rm -f -- "$marker"' in MANIFEST_DRIVER
+    assert 'xargs -0 -r -n 3 -P "$jobs"' in MANIFEST_DRIVER
+    assert 'object="$oracle_root/.build-$key-$BASHPID.o"' in MANIFEST_DRIVER
+    assert MANIFEST_DRIVER.index("xargs -0 -r -n 3") < MANIFEST_DRIVER.index(
+        'printf \'%s\\n\' "$oracle_identity"'
+    )
+    persisted = json.loads(
+        (tmp_path / "results" / "workload-unit" / "workload.json").read_text()
+    )
     assert persisted == receipt
+
+
+def test_manifest_driver_shell_is_syntactically_valid() -> None:
+    subprocess.run(
+        ["/bin/bash", "-n"],
+        input=MANIFEST_DRIVER,
+        text=True,
+        check=True,
+        capture_output=True,
+    )
 
 
 def test_workload_summary_is_fail_closed(tmp_path: Path) -> None:
@@ -100,6 +155,112 @@ def test_workload_summary_is_fail_closed(tmp_path: Path) -> None:
             recorder=transport,
             require_up=False,
         )
+
+
+def test_nonzero_workload_result_cannot_be_accepted_with_forged_summary() -> None:
+    with pytest.raises(WorkloadError, match=r"failed rc=7: compiler root cause"):
+        _parse_summary(
+            CommandResult(7, "ICEFARM_WORKLOAD jobs=100 failures=0 samples=3\n", "compiler root cause"),
+            "C1",
+        )
+
+
+def _checkpoint_writer_python() -> str:
+    marker = 'python3 - "$checkpoint_tmp" "$result_root" "$worklist" "$client_name" "$turn" "$expected_jobs" <<\'PY\'\n'
+    start = MANIFEST_DRIVER.index(marker) + len(marker)
+    end = MANIFEST_DRIVER.index("\nPY\n", start)
+    return MANIFEST_DRIVER[start:end]
+
+
+def _run_checkpoint_writer(tmp_path: Path, relative: str, *, symlink: bool = False):
+    result_root = tmp_path / "results"
+    jobs = result_root / "jobs"
+    jobs.mkdir(parents=True)
+    worklist = tmp_path / "worklist"
+    worklist.write_text("work\n", encoding="utf-8")
+    path = result_root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if symlink:
+        target = tmp_path / "outside.tsv"
+        target.write_text("1\tA\tx\tx\tx\tx\tx\tx\t0\tx\tx\t1\t1\tx\n", encoding="utf-8")
+        path.symlink_to(target)
+    else:
+        path.write_text("1\tA\tx\tx\tx\tx\tx\tx\t0\tx\tx\t1\t1\tx\n", encoding="utf-8")
+    output = result_root / "checkpoint.json"
+    result = subprocess.run(
+        ["python3", "-c", _checkpoint_writer_python(), str(output), str(result_root), str(worklist), "C1", "A", "1"],
+        text=True,
+        capture_output=True,
+    )
+    return result, output
+
+
+@pytest.mark.parametrize(
+    ("relative", "symlink"),
+    (("jobs/evil/result.tsv", False), ("jobs/000001/result.tsv", True)),
+)
+def test_checkpoint_writer_refuses_malicious_result_identity(
+    tmp_path: Path, relative: str, symlink: bool
+) -> None:
+    result, output = _run_checkpoint_writer(tmp_path, relative, symlink=symlink)
+    assert result.returncode != 0
+    assert not output.exists()
+
+
+def test_checkpoint_writer_accepts_only_exact_result_identity(tmp_path: Path) -> None:
+    result, output = _run_checkpoint_writer(tmp_path, "jobs/000001/result.tsv")
+    assert result.returncode == 0, result.stderr
+    document = json.loads(output.read_text(encoding="utf-8"))
+    assert document["completed_rows"][0]["path"] == "jobs/000001/result.tsv"
+
+
+def test_control_workload_disables_strict_mode_to_observe_the_fault(
+    tmp_path: Path,
+) -> None:
+    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm.data["hub"]["results_root"] = str(tmp_path)
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / "H2-client-kill-switch.json", farm
+    )
+    plan = farmtest.build_plan(farm, scenario, run_id="control-workload-unit")
+    scripted = WorkloadRecorder()
+
+    run_workload(
+        farm,
+        scenario,
+        plan,
+        recorder=RecordingTransport(scripted),
+        require_up=False,
+    )
+
+    argv = scripted.commands[0].argv
+    driver_argv0 = argv.index("icefarm-manifest-driver")
+    assert argv[driver_argv0 + 11] == "0"
+
+
+def test_h4_passes_one_typed_object_corruption_fault_in_driver_argv(
+    tmp_path: Path,
+) -> None:
+    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm.data["hub"]["results_root"] = str(tmp_path)
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / "H4-corrupt-object.json", farm
+    )
+    plan = farmtest.build_plan(farm, scenario, run_id="h4-workload-unit")
+    scripted = WorkloadRecorder("ICEFARM_WORKLOAD jobs=100 failures=1 samples=3\n")
+
+    receipt = run_workload(
+        farm,
+        scenario,
+        plan,
+        recorder=RecordingTransport(scripted),
+        require_up=False,
+    )
+
+    assert receipt["status"] == "COMPLETE_WITH_JOB_FAILURES"
+    assert scripted.commands[0].argv[-4:] == ("A", "corrupt-object", "C1", "1")
+    assert "before_sha=$(sha256sum" in MANIFEST_DRIVER
+    assert "icefarm-h4-object-fault-v1" in MANIFEST_DRIVER
 
 
 def test_workload_requires_authenticated_up_receipt(tmp_path: Path) -> None:
@@ -138,3 +299,71 @@ def test_ssh_transport_keeps_driver_values_inside_encoded_argv(tmp_path: Path) -
     decoded = decode_ssh_payload(scripted.commands[0].argv)
     assert decoded[:3] == ("docker", "exec", "--user")
     assert MANIFEST_DRIVER in decoded
+
+
+def test_paired_workload_materializes_only_b_between_sequential_turns(
+    tmp_path: Path,
+) -> None:
+    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm.data["hub"]["results_root"] = str(tmp_path)
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / "S40-full-newgen-engagement.json", farm
+    )
+    plan = farmtest.build_plan(farm, scenario, run_id="paired-unit")
+    scripted = PairedWorkloadRecorder()
+    receipt = run_workload(
+        farm,
+        scenario,
+        plan,
+        recorder=RecordingTransport(scripted),
+        require_up=False,
+    )
+    assert receipt["clients"] == [
+        {"client": "C1", "failures": 0, "jobs": 200, "samples": 6}
+    ]
+    assert [item["turn"] for item in receipt["turns"]] == ["A", "B"]
+    assert [command.phase for command in scripted.commands] == [
+        "run.workload",
+        "run.corpus-input-mkdir",
+        "run.corpus-clear",
+        "run.corpus-materialize",
+        "run.corpus-activate",
+        "run.workload",
+    ]
+    drivers = [
+        command for command in scripted.commands if command.phase == "run.workload"
+    ]
+    assert drivers[0].argv[-4] == "A"
+    assert drivers[1].argv[-4] == "B"
+    assert "/results/workload/A" in drivers[0].argv
+    assert "/results/workload/B" in drivers[1].argv
+    assert 'printf \'%s\\n%s\\n\' "$digest" "$relative"' in MANIFEST_DRIVER
+
+
+def test_s50_runs_old_and_new_clients_concurrently_in_one_turn(
+    tmp_path: Path,
+) -> None:
+    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    farm.data["hub"]["results_root"] = str(tmp_path)
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / "S50-mixed-pool-fmt.json", farm
+    )
+    plan = farmtest.build_plan(farm, scenario, run_id="s50-workload-unit")
+    scripted = WorkloadRecorder()
+    receipt = run_workload(
+        farm,
+        scenario,
+        plan,
+        recorder=RecordingTransport(scripted),
+        require_up=False,
+    )
+    assert receipt["clients"] == [
+        {"client": "C1", "failures": 0, "jobs": 100, "samples": 3},
+        {"client": "C2", "failures": 0, "jobs": 100, "samples": 3},
+    ]
+    commands = [
+        command for command in scripted.commands if command.phase == "run.workload"
+    ]
+    assert len(commands) == 2
+    assert {command.instance for command in commands} == {"C1", "C2"}
+    assert all(command.argv[-4] == "A" for command in commands)

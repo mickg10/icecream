@@ -1,0 +1,68 @@
+{
+  "schema": "icefarm-scenario-v1",
+  "id": "H3-mutant-scheduler",
+  "shape": "mixed",
+  "images": {
+    "mutant": "p50s4-h3-tail-mutant",
+    "new": "p50s4-89917385",
+    "old": "p43-1.4.0"
+  },
+  "instances": [
+    {
+      "name": "S1",
+      "role": "S",
+      "host": "tt-quietbox3",
+      "image": "mutant",
+      "env": {
+        "ICECC_P50_PROFILE": "P29V1"
+      }
+    },
+    {
+      "name": "F1",
+      "role": "F",
+      "host": "tt-quietbox2",
+      "image": "new",
+      "slots": 24
+    },
+    {
+      "name": "C1",
+      "role": "C",
+      "host": "tt-quietbox3",
+      "image": "old",
+      "client_environment": "debian-gcc",
+      "env": {
+        "ICECC_P50_MODE": "on"
+      }
+    }
+  ],
+  "workload": {
+    "driver": "tu-manifest",
+    "corpus": "fmt-100",
+    "turns": ["A"],
+    "jobs": 24,
+    "clients": ["C1"],
+    "repeat": 1,
+    "oracle": "local-sha"
+  },
+  "network": {
+    "shaping": []
+  },
+  "timeline": [],
+  "expect": {
+    "exact": "all",
+    "engagement": "expected(c,f)",
+    "wedges": 0,
+    "error106_max": 0,
+    "tail_to_incapable": 0,
+    "reuse": "none-when-legacy",
+    "wall_s_max": null
+  },
+  "controls": ["H3"],
+  "timeouts": {
+    "images_s": 1800,
+    "up_s": 300,
+    "turn_s": 1800,
+    "collect_s": 600,
+    "down_s": 300
+  }
+}

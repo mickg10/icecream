@@ -1,0 +1,14 @@
+{
+  "schema": "icefarm-suite-v1",
+  "id": "ladder",
+  "kind": "composite",
+  "suites": [
+    "s10",
+    "s20",
+    "s30",
+    "s30-mutant-f",
+    "s40",
+    "s50",
+    "s60"
+  ]
+}

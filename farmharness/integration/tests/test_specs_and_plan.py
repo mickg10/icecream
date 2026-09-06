@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import base64
 import copy
+import hashlib
 import json
+import signal
 import subprocess
 from pathlib import Path
 
@@ -30,7 +33,9 @@ def _documents() -> tuple[dict[str, object], dict[str, object]]:
     return farm, scenario
 
 
-def _write(tmp_path: Path, farm: dict[str, object], scenario: dict[str, object]) -> tuple[Path, Path]:
+def _write(
+    tmp_path: Path, farm: dict[str, object], scenario: dict[str, object]
+) -> tuple[Path, Path]:
     farm_path = tmp_path / "farm.json"
     scenario_path = tmp_path / "scenario.json"
     farm_path.write_text(json.dumps(farm), encoding="utf-8")
@@ -57,6 +62,34 @@ def test_committed_examples_validate_and_plan_is_stable() -> None:
     assert "ICEFARM_INSTANCES" in first["icefarm_env"]
     assert "ICEFARM_IMAGE" not in first["icefarm_env"]
     assert "ICEFARM_S" not in first["icefarm_env"]
+
+
+def test_committed_s50_mixed_pool_resolves_every_pair_stably() -> None:
+    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / "S50-mixed-pool-fmt.json", farm
+    )
+    first = farmtest.build_plan(farm, scenario)
+    second = farmtest.build_plan(farm, scenario)
+    assert first == second
+    assert first["topology"]["topology"] == "C2F2"
+    instances = first["topology"]["instances"]
+    assert {(item["role"], item["name"], item["version"]) for item in instances} == {
+        ("S", "S1", 50),
+        ("F", "F1", 43),
+        ("F", "F2", 50),
+        ("C", "C1", 43),
+        ("C", "C2", 50),
+    }
+    assert {
+        (item["c"], item["f"], item["state"], item["cache_expected"])
+        for item in first["topology"]["relationships"]
+    } == {
+        ("C1", "F1", "s50-c43-f43", False),
+        ("C2", "F1", "s50-c50-f43", False),
+        ("C1", "F2", "s50-c43-f50", False),
+        ("C2", "F2", "s50-c50-f50", True),
+    }
 
 
 def test_missing_scratch_root_is_refused(tmp_path: Path) -> None:
@@ -101,6 +134,89 @@ def test_empty_protected_pattern_is_refused(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("mutation", "error"),
     [
+        (lambda corpus: corpus.pop("compression"), "compression"),
+        (lambda corpus: corpus["compression"].update(level=3), "must equal 19"),
+        (lambda corpus: corpus["compression"].update(threads=0), "must equal 8"),
+        (
+            lambda corpus: corpus["compression"].update(checksum=False),
+            "must equal True",
+        ),
+        (lambda corpus: corpus.pop("archives"), "archives"),
+        (
+            lambda corpus: corpus["archives"]["files"].update(
+                authority_sha256="f" * 64
+            ),
+            "does not bind",
+        ),
+    ],
+)
+def test_corpus_archive_authority_is_mandatory(
+    tmp_path: Path, mutation, error: str
+) -> None:
+    farm, scenario = _documents()
+    mutation(farm["corpora"]["fmt-100"])
+    farm_path, _ = _write(tmp_path, farm, scenario)
+    with pytest.raises(FarmSpecError, match=error):
+        load_farm_spec(farm_path)
+
+
+def test_paired_corpus_requires_compile_valid_authority_receipt(
+    tmp_path: Path,
+) -> None:
+    farm, scenario = _documents()
+    farm["corpora"]["firefox-1000"].pop("authority_receipt")
+    farm_path, _ = _write(tmp_path, farm, scenario)
+
+    with pytest.raises(FarmSpecError, match="compile-valid authority receipt"):
+        load_farm_spec(farm_path)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda farm: farm.pop("image_transport"),
+        lambda farm: farm["image_transport"].update(level=3),
+        lambda farm: farm["image_transport"].update(long=27),
+        lambda farm: farm["image_transport"].update(threads=0),
+        lambda farm: farm["image_transport"].update(checksum=False),
+    ],
+)
+def test_image_transport_is_pinned_to_zstd19_long31(tmp_path: Path, mutation) -> None:
+    farm, scenario = _documents()
+    mutation(farm)
+    farm_path, _ = _write(tmp_path, farm, scenario)
+    with pytest.raises(FarmSpecError):
+        load_farm_spec(farm_path)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda toolchain: toolchain.pop("archive_bytes"),
+        lambda toolchain: toolchain.update(archive_bytes=0),
+        lambda toolchain: toolchain.pop("compression"),
+        lambda toolchain: toolchain["compression"].update(level=3),
+        lambda toolchain: toolchain["compression"].update(long=27),
+        lambda toolchain: toolchain["compression"].update(threads=0),
+        lambda toolchain: toolchain["compression"].update(checksum=False),
+    ],
+)
+def test_toolchain_transport_is_pinned_to_zstd19_long31_threads8(
+    tmp_path: Path, mutation
+) -> None:
+    farm, scenario = _documents()
+    toolchain = farm["corpora"]["firefox-1000"]["compiler_recipes"][
+        "fedora-clang-libcxx"
+    ]["toolchain"]
+    mutation(toolchain)
+    farm_path, _ = _write(tmp_path, farm, scenario)
+    with pytest.raises(FarmSpecError):
+        load_farm_spec(farm_path)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
         (lambda farm, _scenario: farm.update(schema="wrong"), "must equal"),
         (lambda farm, _scenario: farm.update(unexpected=True), "additional property"),
         (lambda farm, _scenario: farm.update(port_range=[23000]), "at least 2"),
@@ -118,7 +234,11 @@ def test_schema_violations_are_refused(tmp_path: Path, mutation, error: str) -> 
     farm, scenario = _documents()
     mutation(farm, scenario)
     farm_path, scenario_path = _write(tmp_path, farm, scenario)
-    if farm.get("schema") != "icefarm-farm-v1" or "unexpected" in farm or len(farm["port_range"]) != 2:
+    if (
+        farm.get("schema") != "icefarm-farm-v1"
+        or "unexpected" in farm
+        or len(farm["port_range"]) != 2
+    ):
         with pytest.raises(FarmSpecError, match=error):
             load_farm_spec(farm_path)
     else:
@@ -186,10 +306,15 @@ def test_authority_execution_fields_reject_final_newline(
 def test_optional_s8_capture_is_provenance_only(tmp_path: Path) -> None:
     farm, scenario = _documents()
     loaded_farm, loaded_scenario = _load(tmp_path, farm, scenario)
-    baseline = farmtest.resolve_topology(loaded_farm, loaded_scenario)["topology_digest"]
+    baseline = farmtest.resolve_topology(loaded_farm, loaded_scenario)[
+        "topology_digest"
+    ]
     farm["s8_capture"] = {"schema": "unvalidated-old-capture", "arbitrary": [1, 2, 3]}
     loaded_farm, loaded_scenario = _load(tmp_path, farm, scenario)
-    assert farmtest.resolve_topology(loaded_farm, loaded_scenario)["topology_digest"] == baseline
+    assert (
+        farmtest.resolve_topology(loaded_farm, loaded_scenario)["topology_digest"]
+        == baseline
+    )
 
 
 def test_unicode_surrogate_is_refused_before_hashing(tmp_path: Path) -> None:
@@ -210,7 +335,9 @@ def test_unimplemented_schema_keyword_is_never_silently_ignored(tmp_path: Path) 
         validate("forbidden", schema_path)
 
 
-def test_plan_output_equals_fake_up_output_byte_for_byte(capsys: pytest.CaptureFixture[str]) -> None:
+def test_plan_output_equals_fake_up_output_byte_for_byte(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     common = [
         "--farm",
         str(INTEGRATION / "farm.example.json"),
@@ -235,33 +362,92 @@ def test_plan_commands_are_argv_only_and_label_scoped() -> None:
     assert plan["commands"]
     for command in plan["commands"]:
         assert isinstance(command["argv"], list)
-        assert all(isinstance(item, str) and "\0" not in item for item in command["argv"])
+        assert all(
+            isinstance(item, str) and "\0" not in item for item in command["argv"]
+        )
         assert "sh" not in command["argv"]
         assert "bash" not in command["argv"]
-    starts = [item for item in plan["commands"] if item["phase"].startswith("up.start-")]
+    starts = [
+        item for item in plan["commands"] if item["phase"].startswith("up.start-")
+    ]
     assert all("icefarm.run=argv-check" in item["argv"] for item in starts)
 
 
+def test_container_temporaries_use_the_instance_scratch_bind() -> None:
+    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    scenario = load_scenario_spec(INTEGRATION / "scenarios" / "S00-smoke.json", farm)
+    plan = farmtest.build_plan(farm, scenario, run_id="scratch-temp-check")
+    starts = [
+        item for item in plan["commands"] if item["phase"].startswith("up.start-")
+    ]
+
+    assert starts
+    for command in starts:
+        argv = command["argv"]
+        for key in ("TEMP", "TEMPDIR", "TMP", "TMPDIR"):
+            assert f"{key}=/tmp/icefarm" in argv
+        assert any(value.endswith("dst=/tmp/icefarm") for value in argv)
+        socket = next(value for value in argv if value.startswith("ICECC_TEST_SOCKET="))
+        assert socket.startswith("ICECC_TEST_SOCKET=/tmp/icefarm/")
+
+
+def test_client_start_uses_hash_bound_harness_entrypoint() -> None:
+    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    scenario = load_scenario_spec(INTEGRATION / "scenarios" / "S00-smoke.json", farm)
+    plan = farmtest.build_plan(farm, scenario, run_id="client-entry-check")
+    prepare = next(
+        item
+        for item in plan["commands"]
+        if item["phase"] == "up.prepare" and item["instance"] == "C1"
+    )
+    remote = decode_ssh_payload(prepare["argv"])
+    entry = (INTEGRATION / "docker" / "entry-client.sh").read_bytes()
+    assert base64.urlsafe_b64decode(remote[-2]) == entry
+    assert remote[-1] == hashlib.sha256(entry).hexdigest()
+
+    start = next(
+        item
+        for item in plan["commands"]
+        if item["phase"] == "up.start-c" and item["instance"] == "C1"
+    )
+    assert start["argv"][start["argv"].index("--entrypoint") + 1] == (
+        "/icefarm-entry-client.sh"
+    )
+    assert any(
+        value.endswith(
+            "/C1/entry-client.sh,dst=/icefarm-entry-client.sh,readonly"
+        )
+        for value in start["argv"]
+    )
+
+
 def test_scheduler_fence_follows_resolved_relationship_law() -> None:
-    assert farmtest._assignment_fence_mode(
-        {"relationships": [{"cache_expected": False}]}
-    ) is None
-    assert farmtest._assignment_fence_mode(
-        {
-            "relationships": [
-                {"cache_expected": True},
-                {"cache_expected": False},
-            ]
-        }
-    ) == "enforcing-compat"
-    assert farmtest._assignment_fence_mode(
-        {
-            "relationships": [
-                {"cache_expected": True},
-                {"cache_expected": True},
-            ]
-        }
-    ) == "strict-nonce"
+    assert (
+        farmtest._assignment_fence_mode({"relationships": [{"cache_expected": False}]})
+        is None
+    )
+    assert (
+        farmtest._assignment_fence_mode(
+            {
+                "relationships": [
+                    {"cache_expected": True},
+                    {"cache_expected": False},
+                ]
+            }
+        )
+        == "enforcing-compat"
+    )
+    assert (
+        farmtest._assignment_fence_mode(
+            {
+                "relationships": [
+                    {"cache_expected": True},
+                    {"cache_expected": True},
+                ]
+            }
+        )
+        == "strict-nonce"
+    )
 
     farm = load_farm_spec(INTEGRATION / "farm.example.json")
     scenario = load_scenario_spec(INTEGRATION / "scenarios" / "S00-smoke.json", farm)
@@ -282,7 +468,7 @@ def test_owner_kept_profiles_resolve(profile: str, tmp_path: Path) -> None:
     assert plan["icefarm_env"]["ICEFARM_PROFILE"] == profile
 
 
-@pytest.mark.parametrize("removed_profile", ("GRZ_RESIDUAL", "OFF"))
+@pytest.mark.parametrize("removed_profile", ("GRZ_RESIDUAL", "P29"))
 def test_removed_or_nonproduct_profile_is_refused(
     removed_profile: str, tmp_path: Path
 ) -> None:
@@ -292,8 +478,38 @@ def test_removed_or_nonproduct_profile_is_refused(
         _load(tmp_path, farm, scenario)
 
 
-@pytest.mark.parametrize("reserved", ("ICECC_NETNAME", "ICECC_SCHEDULER", "ICECC_TEST_SOCKET", "ICECC_VERSION"))
-def test_scenario_cannot_override_runner_environment(reserved: str, tmp_path: Path) -> None:
+def test_explicit_scheduler_off_resolves_a_legacy_relationship(tmp_path: Path) -> None:
+    farm, scenario = _documents()
+    scenario["instances"][0]["env"]["ICECC_P50_PROFILE"] = "OFF"
+    scenario["expect"]["reuse"] = "none-when-legacy"
+    loaded_farm, loaded_scenario = _load(tmp_path, farm, scenario)
+
+    plan = farmtest.build_plan(loaded_farm, loaded_scenario, run_id="legacy-off")
+
+    assert plan["icefarm_env"]["ICEFARM_PROFILE"] == "OFF"
+    assert plan["topology"]["profile"] == "OFF"
+    assert all(
+        relationship["cache_expected"] is False and relationship["profile"] is None
+        for relationship in plan["topology"]["relationships"]
+    )
+
+
+@pytest.mark.parametrize(
+    "reserved",
+    (
+        "ICECC_NETNAME",
+        "ICECC_SCHEDULER",
+        "ICECC_TEST_SOCKET",
+        "ICECC_VERSION",
+        "TEMP",
+        "TEMPDIR",
+        "TMP",
+        "TMPDIR",
+    ),
+)
+def test_scenario_cannot_override_runner_environment(
+    reserved: str, tmp_path: Path
+) -> None:
     farm, scenario = _documents()
     scenario["instances"][1]["env"] = {reserved: "attacker-controlled"}
     with pytest.raises(ScenarioSpecError, match="runner-owned environment"):
@@ -315,7 +531,9 @@ def test_unix_socket_path_limit_is_enforced(tmp_path: Path) -> None:
         farmtest.build_plan(loaded_farm, loaded_scenario, run_id="r" * 80)
 
 
-def test_ssh_docker_fallback_is_one_argv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_ssh_docker_fallback_is_one_argv(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     farm, scenario = _documents()
     del farm["hosts"][1]["docker_context"]
     loaded_farm, loaded_scenario = _load(tmp_path, farm, scenario)
@@ -326,7 +544,9 @@ def test_ssh_docker_fallback_is_one_argv(monkeypatch: pytest.MonkeyPatch, tmp_pa
     assert decode_ssh_payload(f_start["argv"])[0] == "docker"
 
 
-def test_ssh_wrapper_never_embeds_spec_values_in_remote_shell_text(tmp_path: Path) -> None:
+def test_ssh_wrapper_never_embeds_spec_values_in_remote_shell_text(
+    tmp_path: Path,
+) -> None:
     farm, scenario = _documents()
     del farm["hosts"][1]["docker_context"]
     scenario["instances"][1]["env"] = {"UNTRUSTED": "$(touch /tmp/forbidden); a b ' c"}
@@ -339,7 +559,9 @@ def test_ssh_wrapper_never_embeds_spec_values_in_remote_shell_text(tmp_path: Pat
     assert "UNTRUSTED=$(touch /tmp/forbidden); a b ' c" in decoded
 
 
-def test_fake_recorder_never_invokes_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fake_recorder_never_invokes_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     invoked = False
 
     def forbidden(*_args, **_kwargs):
@@ -376,38 +598,61 @@ def test_real_up_is_fail_closed_before_transport(
     assert "no captured runtime closure" in output.err
 
 
-def test_subprocess_transport_declares_shell_false(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_subprocess_transport_declares_shell_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     observed: dict[str, object] = {}
 
-    class Completed:
+    class Process:
+        pid = 42
         returncode = 0
-        stdout = "ok"
-        stderr = ""
 
-    def fake_run(argv, **kwargs):
+        def communicate(self, *, timeout):
+            observed["timeout"] = timeout
+            return "ok", ""
+
+    def fake_popen(argv, **kwargs):
         observed["argv"] = argv
         observed.update(kwargs)
-        return Completed()
+        return Process()
 
-    monkeypatch.setattr("subprocess.run", fake_run)
-    command = PlannedCommand(0, "probe", "host", None, "local", 7, ("printf", "%s", "a b"))
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    command = PlannedCommand(
+        0, "probe", "host", None, "local", 7, ("printf", "%s", "a b")
+    )
     result = SubprocessTransport().invoke(command)
     assert result.stdout == "ok"
     assert observed["argv"] == ["printf", "%s", "a b"]
     assert observed["encoding"] == "utf-8"
     assert observed["errors"] == "replace"
     assert observed["shell"] is False
+    assert observed["start_new_session"] is True
     assert observed["timeout"] == 7
 
 
-def test_subprocess_transport_timeout_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fake_run(argv, **_kwargs):
-        raise subprocess.TimeoutExpired(argv, 7)
+def test_subprocess_transport_timeout_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    signals: list[int] = []
 
-    monkeypatch.setattr("subprocess.run", fake_run)
+    class Process:
+        pid = 42
+        returncode = -15
+        attempts = 0
+
+        def communicate(self, *, timeout):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise subprocess.TimeoutExpired(("sleep", "99"), timeout)
+            return "", ""
+
+    monkeypatch.setattr("subprocess.Popen", lambda *_args, **_kwargs: Process())
+    monkeypatch.setattr("os.killpg", lambda _pid, sig: signals.append(sig))
+
     command = PlannedCommand(4, "probe", "host", None, "local", 7, ("sleep", "99"))
     with pytest.raises(RemoteError, match="command 4 timed out after 7s on host"):
         SubprocessTransport().invoke(command)
+    assert signals == [signal.SIGTERM]
 
 
 def test_input_documents_are_not_mutated(tmp_path: Path) -> None:
@@ -419,7 +664,9 @@ def test_input_documents_are_not_mutated(tmp_path: Path) -> None:
     assert scenario == before_scenario
 
 
-@pytest.mark.parametrize("run_id", (".", "..", "slash/not-allowed", "space not allowed"))
+@pytest.mark.parametrize(
+    "run_id", (".", "..", "slash/not-allowed", "space not allowed")
+)
 def test_unsafe_run_id_is_refused(run_id: str) -> None:
     farm = load_farm_spec(INTEGRATION / "farm.example.json")
     scenario = load_scenario_spec(INTEGRATION / "scenarios" / "S00-smoke.json", farm)
@@ -443,7 +690,9 @@ def test_control_character_in_scratch_path_is_refused(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("root_alias", ("/.", "//"))
-def test_root_equivalent_scratch_path_is_refused(tmp_path: Path, root_alias: str) -> None:
+def test_root_equivalent_scratch_path_is_refused(
+    tmp_path: Path, root_alias: str
+) -> None:
     farm, scenario = _documents()
     farm["hosts"][0]["scratch_root"] = root_alias
     farm_path, _ = _write(tmp_path, farm, scenario)
@@ -472,7 +721,9 @@ def test_nul_in_environment_is_refused(tmp_path: Path) -> None:
         lambda farm, _scenario: farm["hosts"][0].update(name="q3\n"),
         lambda farm, _scenario: farm["hosts"][0].update(ssh="mickg10@q3\n"),
         lambda farm, _scenario: farm["hosts"][0].update(docker_context="q3\n"),
-        lambda farm, _scenario: farm["protected"].update(process_patterns=["bigfarm\n"]),
+        lambda farm, _scenario: farm["protected"].update(
+            process_patterns=["bigfarm\n"]
+        ),
     ],
 )
 def test_farm_execution_identifiers_reject_final_newline(
@@ -490,7 +741,9 @@ def test_farm_execution_identifiers_reject_final_newline(
     [
         lambda _farm, scenario: scenario.update(id="S00-smoke\n"),
         lambda _farm, scenario: scenario["instances"][1].update(name="F1\n"),
-        lambda _farm, scenario: scenario["instances"][1].update(env={"SAFE\n": "value"}),
+        lambda _farm, scenario: scenario["instances"][1].update(
+            env={"SAFE\n": "value"}
+        ),
         lambda _farm, scenario: scenario["network"].update(
             shaping=[{"instance": "F1", "rate": "100mbit\n", "delay_ms": 2}]
         ),
@@ -501,17 +754,30 @@ def test_scenario_execution_identifiers_reject_final_newline(
 ) -> None:
     farm, scenario = _documents()
     mutation(farm, scenario)
-    with pytest.raises(ScenarioSpecError, match="safe non-dot name|unsafe environment|invalid rate"):
+    with pytest.raises(
+        ScenarioSpecError, match="safe non-dot name|unsafe environment|invalid rate"
+    ):
         _load(tmp_path, farm, scenario)
 
 
 @pytest.mark.parametrize(
     ("event", "error"),
     [
-        ({"trigger": "job 1", "action": "upgrade", "instance": "F1"}, "requires fields.*image"),
-        ({"trigger": "job 1", "action": "env_set", "instance": "C1"}, "requires fields.*env"),
         (
-            {"trigger": "job 1", "action": "netem_set", "instance": "C1", "rate": "100mbit"},
+            {"trigger": "job 1", "action": "upgrade", "instance": "F1"},
+            "requires fields.*image",
+        ),
+        (
+            {"trigger": "job 1", "action": "env_set", "instance": "C1"},
+            "requires fields.*env",
+        ),
+        (
+            {
+                "trigger": "job 1",
+                "action": "netem_set",
+                "instance": "C1",
+                "rate": "100mbit",
+            },
             "requires fields.*delay_ms",
         ),
         ({"trigger": "job 1", "action": "restart"}, "instance: required"),
@@ -587,6 +853,14 @@ def test_timeline_action_unsafe_or_ambiguous_fields_are_refused(
         },
         {
             "trigger": "job 1",
+            "action": "env_set",
+            "instance": "C1",
+            "env": {
+                "ICECC_P50_FAULT_INJECTION": "P29_INTERNER_FAIL_ONCE"
+            },
+        },
+        {
+            "trigger": "job 1",
             "action": "netem_set",
             "instance": "C1",
             "rate": "100mbit",
@@ -609,17 +883,36 @@ def test_each_timeline_action_has_one_unambiguous_valid_form(
     _load(tmp_path, farm, scenario)
 
 
+def test_multiple_disk_fill_events_are_refused_as_unbounded(tmp_path: Path) -> None:
+    farm, scenario = _documents()
+    scenario["timeline"] = [
+        {"trigger": "job 1", "action": "disk_fill", "instance": "F1"},
+        {"trigger": "job 2", "action": "disk_fill", "instance": "F1"},
+    ]
+    with pytest.raises(ScenarioSpecError, match="at most one bounded disk_fill"):
+        _load(tmp_path, farm, scenario)
+
+
 def _add_instance(
     scenario: dict[str, object], *, name: str, role: str, host: str, image: str
 ) -> None:
-    instance: dict[str, object] = {"name": name, "role": role, "host": host, "image": image}
+    instance: dict[str, object] = {
+        "name": name,
+        "role": role,
+        "host": host,
+        "image": image,
+    }
     if role == "F":
         instance["slots"] = 1
+    elif role == "C":
+        instance["client_environment"] = "debian-gcc"
     scenario["instances"].append(instance)
 
 
 @pytest.mark.parametrize("shape", ("SCF", "S'CF", "S'FC'", "S'C'F'"))
-def test_simple_shape_must_match_instance_generations(shape: str, tmp_path: Path) -> None:
+def test_simple_shape_must_match_instance_generations(
+    shape: str, tmp_path: Path
+) -> None:
     farm, scenario = _documents()
     scenario["shape"] = shape
     scenario["images"]["old"] = "p43-1.4.0"
@@ -638,7 +931,9 @@ def test_simple_shape_must_match_instance_generations(shape: str, tmp_path: Path
         _load(tmp_path, farm, scenario)
 
 
-def test_mixed_pool_shape_requires_old_and_new_workers_and_clients(tmp_path: Path) -> None:
+def test_mixed_pool_shape_requires_old_and_new_workers_and_clients(
+    tmp_path: Path,
+) -> None:
     farm, scenario = _documents()
     scenario["shape"] = "S'[FF'][CC']"
     scenario["images"]["old"] = "p43-1.4.0"
@@ -666,17 +961,21 @@ def test_mixed_pool_workload_must_run_both_client_generations(tmp_path: Path) ->
         _load(tmp_path, farm, scenario)
 
 
-def test_revision_skew_shape_requires_two_distinct_p50_worker_images(tmp_path: Path) -> None:
+def test_revision_skew_shape_requires_two_distinct_p50_worker_images(
+    tmp_path: Path,
+) -> None:
     farm, scenario = _documents()
     scenario["shape"] = "S'[F'F''][C']"
     scenario["images"] = {"r1": "p50s1-aaaaaaaa", "r2": "p50s2-bbbbbbbb"}
     farm["authority"]["images"]["p50s1-aaaaaaaa"] = {
         "commit": "a" * 40,
         "archive_sha256": "a" * 64,
+        "cache_wire_revision": 1,
     }
     farm["authority"]["images"]["p50s2-bbbbbbbb"] = {
         "commit": "b" * 40,
         "archive_sha256": "b" * 64,
+        "cache_wire_revision": 2,
     }
     for instance in scenario["instances"]:
         instance["image"] = "r1"
@@ -760,6 +1059,7 @@ def test_timeline_accepts_only_documented_p50_switch_forms(
         ("S1", {"ICECC_P50_MODE": "off"}),
         ("C1", {"PATH": "/tmp"}),
         ("C1", {"ICECC_P50_MODE": "invalid"}),
+        ("C1", {"ICECC_P50_FAULT_INJECTION": "P29_INTERNER_FAIL_ALWAYS"}),
     ],
 )
 def test_timeline_rejects_ambiguous_or_wrong_p50_switch_forms(
@@ -767,7 +1067,15 @@ def test_timeline_rejects_ambiguous_or_wrong_p50_switch_forms(
 ) -> None:
     farm, scenario = _documents()
     scenario["timeline"] = [
-        {"trigger": "job 1", "action": "env_set", "instance": instance, "env": environment}
+        {
+            "trigger": "job 1",
+            "action": "env_set",
+            "instance": instance,
+            "env": environment,
+        }
     ]
-    with pytest.raises(ScenarioSpecError, match="env_set|must be 'on' or 'off'"):
+    with pytest.raises(
+        ScenarioSpecError,
+        match="env_set|must be 'on' or 'off'|P29_INTERNER_FAIL_ONCE",
+    ):
         _load(tmp_path, farm, scenario)

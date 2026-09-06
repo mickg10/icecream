@@ -1,0 +1,21 @@
+{
+  "schema": "icefarm-suite-v1",
+  "id": "s50-mixed-pool",
+  "kind": "s50-fairness",
+  "scenarios": [
+    "S50-all-legacy-control",
+    "S50-mixed-pool-1of9",
+    "S50-mixed-pool-5of9",
+    "S50-mixed-pool-8of9",
+    "S50-all-f-new-mixed-c"
+  ],
+  "fairness": {
+    "control": "S50-all-legacy-control",
+    "mixed": [
+      "S50-mixed-pool-1of9",
+      "S50-mixed-pool-5of9",
+      "S50-mixed-pool-8of9"
+    ],
+    "ratio_limit": 1.05
+  }
+}

@@ -1,0 +1,46 @@
+FROM ubuntu:22.04@sha256:3b06811b2afd352be909dd088a004166d665dc76d38b13eada33522a9d915c6f
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+LABEL org.icecream.farm.image-class="daemon-runtime" \
+      org.icecream.farm.base="ubuntu-22.04" \
+      org.icecream.farm.compiler="gcc-11" \
+      org.icecream.farm.boost="1.74"
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        autoconf \
+        automake \
+        build-essential \
+        bzip2 \
+        ca-certificates \
+        file \
+        g++-11 \
+        gcc-11 \
+        libarchive-dev \
+        libboost-dev \
+        libcap-ng-dev \
+        liblzo2-dev \
+        libtool \
+        libxxhash-dev \
+        libzstd-dev \
+        netcat-openbsd \
+        pkg-config \
+        procps \
+        python3 \
+        tar \
+        xz-utils \
+        zstd \
+    && test "$(gcc-11 -dumpfullversion -dumpversion)" = "11.4.0" \
+    && grep -q '^#define BOOST_LIB_VERSION "1_74"' /usr/include/boost/version.hpp \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CC=gcc-11 \
+    CXX=g++-11 \
+    ICE_CXX_STANDARD_FLAG=-std=c++2b \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
+
+WORKDIR /workspace
+
+CMD ["/bin/bash"]

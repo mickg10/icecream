@@ -1,0 +1,8 @@
+{
+  "schema": "icefarm-suite-v1",
+  "id": "s95-disk-full",
+  "scenarios": [
+    "H5-worker-kill",
+    "S95-cache-disk-full"
+  ]
+}

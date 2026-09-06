@@ -16,13 +16,21 @@ import math
 import os
 import re
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, NoReturn
 
 try:
-    from .integration.schema_validation import ValidationError, canonical_bytes, load_json
+    from .integration.schema_validation import (
+        ValidationError,
+        canonical_bytes,
+        load_json,
+    )
 except ImportError:  # Executed directly from farmharness/.
-    from integration.schema_validation import ValidationError, canonical_bytes, load_json
+    from integration.schema_validation import (
+        ValidationError,
+        canonical_bytes,
+        load_json,
+    )
 
 
 SCHEMA_V1 = "icecream-newgen-farm-topology-v1"
@@ -33,6 +41,7 @@ FARM_SCHEMA = "icefarm-farm-v1"
 ROLE_BINARY = {"S": "scheduler", "C": "client", "F": "daemon"}
 ROLE_ORDER = {"S": 0, "C": 1, "F": 2}
 PROFILES = ("P29V1", "ZSTD_TU", "ZSTD_ROUTE")
+V2_PROFILES = (*PROFILES, "OFF")
 V1_PROFILES = ("P29", "P29V1", "ZSTD_TU", "ZSTD_ROUTE", "GRZ_RESIDUAL", "RAW_II")
 REGIMES = ("cold", "warm", "touched")
 ROLE_RE = re.compile(r"^(43|44|50)@([A-Za-z0-9._-]+)$")
@@ -42,7 +51,9 @@ IMAGE_RE = re.compile(r"^p(43|44|50)(?:s[0-9]+)?(?:-|$)", re.IGNORECASE)
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 IMAGE_ID_RE = re.compile(r"sha256:[0-9a-f]{64}")
-RUNNER_ENV = frozenset(("ICECC_NETNAME", "ICECC_SCHEDULER", "ICECC_TEST_SOCKET", "ICECC_VERSION"))
+RUNNER_ENV = frozenset(
+    ("ICECC_NETNAME", "ICECC_SCHEDULER", "ICECC_TEST_SOCKET", "ICECC_VERSION")
+)
 
 
 class ResolutionError(ValueError):
@@ -90,7 +101,11 @@ def _strict_json(text: str, name: str) -> Any:
 
 
 def _safe_name(value: Any, field: str) -> str:
-    if not isinstance(value, str) or NAME_RE.fullmatch(value) is None or value in (".", ".."):
+    if (
+        not isinstance(value, str)
+        or NAME_RE.fullmatch(value) is None
+        or value in (".", "..")
+    ):
         _refuse(f"{field} is not a safe non-dot name")
     return value
 
@@ -105,7 +120,15 @@ def _parse_link_rates(text: str) -> list[int]:
     return rates
 
 
-def _authority_parts(path: str | Path) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any] | None]:
+def _authority_parts(
+    path: str | Path,
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+]:
     try:
         value = load_json(Path(path))
     except ValidationError as exc:
@@ -116,21 +139,34 @@ def _authority_parts(path: str | Path) -> tuple[dict[str, Any], dict[str, Any] |
         authority = value.get("authority")
         hosts = value.get("hosts")
         corpora = value.get("corpora")
-        if not isinstance(authority, dict) or not isinstance(hosts, list) or not isinstance(corpora, dict):
-            _refuse("farm document lacks authority, hosts, or corpora")
+        runtime_image = value.get("runtime_image")
+        client_environments = value.get("client_environments")
+        if (
+            not isinstance(authority, dict)
+            or not isinstance(hosts, list)
+            or not isinstance(corpora, dict)
+            or not isinstance(runtime_image, dict)
+            or not isinstance(client_environments, dict)
+        ):
+            _refuse(
+                "farm document lacks authority, hosts, corpora, runtime image, "
+                "or client environments"
+            )
         policies = {
             host["name"]: host
             for host in hosts
             if isinstance(host, dict) and isinstance(host.get("name"), str)
         }
-        return authority, policies, corpora
-    return value, None, None
+        return authority, policies, corpora, runtime_image, client_environments
+    return value, None, None, None, None
 
 
 def load_authority(path: str | Path) -> dict[str, Any]:
     """Load only the authority object, accepting an authority or farm file."""
 
-    authority, _policies, _corpora = _authority_parts(path)
+    authority, _policies, _corpora, _runtime_image, _client_environments = (
+        _authority_parts(path)
+    )
     _validate_authority_shape(authority)
     return authority
 
@@ -143,7 +179,29 @@ def _validate_authority_shape(authority: Mapping[str, Any]) -> None:
             _refuse(f"authority lacks {key}")
 
 
-def _binary_hash(authority: Mapping[str, Any], version: int, role: str) -> str:
+def _binary_hash(
+    authority: Mapping[str, Any],
+    version: int,
+    role: str,
+    image: Mapping[str, Any] | None = None,
+) -> str:
+    mutant_role = None
+    if isinstance(image, Mapping):
+        if image.get("kind") == "scheduler-mutant":
+            mutant_role = "S"
+        elif image.get("kind") == "daemon-mutant":
+            mutant_role = "F"
+    if role == mutant_role:
+        overrides = image.get("role_overrides")
+        role_key = "scheduler" if role == "S" else "daemon"
+        override = overrides.get(role_key) if isinstance(overrides, Mapping) else None
+        digest = override.get("sha256") if isinstance(override, Mapping) else None
+        if override is not None and (
+            not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None
+        ):
+            _refuse(f"{image.get('kind')} role_overrides.{role_key}.sha256 is invalid")
+        if isinstance(digest, str):
+            return digest
     store = authority["role_stores"].get(str(version))
     entry = store.get(ROLE_BINARY[role]) if isinstance(store, dict) else None
     digest = entry.get("sha256") if isinstance(entry, dict) else None
@@ -196,9 +254,54 @@ def _pinned_image(authority: Mapping[str, Any], label: str) -> dict[str, Any]:
         "id": image_id,
         "label": label,
     }
+    wire_revision = entry.get("cache_wire_revision")
+    if wire_revision is not None:
+        if type(wire_revision) is not int or not (1 <= wire_revision <= 0xFFFF):
+            _refuse(f"image {label!r} has an invalid cache wire revision")
+        result["cache_wire_revision"] = wire_revision
     if closure is not None:
         result["closure_sha256"] = closure
+    if entry.get("kind") in ("scheduler-mutant", "daemon-mutant"):
+        recipe = entry.get("recipe_sha256")
+        if not isinstance(recipe, str) or SHA256_RE.fullmatch(recipe) is None:
+            _refuse(f"image {label!r} has no authenticated mutant recipe")
+        result["kind"] = entry["kind"]
+        result["recipe_sha256"] = recipe
+        if "role_overrides" in entry:
+            result["role_overrides"] = entry["role_overrides"]
     return result
+
+
+def _pinned_container_image(entry: Any, subject: str) -> dict[str, Any]:
+    if not isinstance(entry, Mapping):
+        _refuse(f"{subject} is absent from the authority (rule 1)")
+    required = ("reference", "id", "closure_sha256")
+    for field in required:
+        if not isinstance(entry.get(field), str):
+            _refuse(f"{subject} has no {field} (rule 1)")
+    if IMAGE_ID_RE.fullmatch(entry["id"]) is None:
+        _refuse(f"{subject} has an invalid config id")
+    if SHA256_RE.fullmatch(entry["closure_sha256"]) is None:
+        _refuse(f"{subject} has an invalid portable closure")
+    reference = entry["reference"]
+    if not reference or "\0" in reference:
+        _refuse(f"{subject} has an unsafe image reference")
+    return {
+        "closure_sha256": entry["closure_sha256"],
+        "reference": reference,
+    }
+
+
+def _safe_absolute_path(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    path = PurePosixPath(value)
+    return (
+        path.is_absolute()
+        and value not in ("/", "//")
+        and ".." not in path.parts
+        and not any(ord(character) < 32 or ord(character) == 127 for character in value)
+    )
 
 
 def _corpus_binding(corpus: Mapping[str, Any]) -> dict[str, Any]:
@@ -213,6 +316,126 @@ def _corpus_binding(corpus: Mapping[str, Any]) -> dict[str, Any]:
             result[key] = value
     if not any(key.endswith("_sha256") for key in result):
         _refuse("corpus authority has no authenticated manifest hash")
+    compression = corpus.get("compression")
+    if compression != {
+        "checksum": True,
+        "codec": "zstd",
+        "level": 19,
+        "long": 31,
+        "threads": 8,
+    }:
+        _refuse(
+            "corpus compression must be zstd level 19 with long window 31, "
+            "eight threads, and checksum"
+        )
+    result["compression"] = dict(compression)
+    archives = corpus.get("archives")
+    if not isinstance(archives, Mapping) or not archives:
+        _refuse("corpus has no compressed archives")
+    result["archives"] = {}
+    for group, archive in sorted(archives.items()):
+        if not isinstance(group, str) or not isinstance(archive, Mapping):
+            _refuse("corpus archive authority is invalid")
+        required_archive_fields = (
+            "archive",
+            "archive_bytes",
+            "archive_sha256",
+            "authority_sha256",
+            "files",
+            "manifest_sha256",
+            "unpacked_bytes",
+        )
+        if (
+            any(field not in archive for field in required_archive_fields)
+            or not _safe_absolute_path(archive["archive"])
+            or any(
+                not isinstance(archive[field], str)
+                or SHA256_RE.fullmatch(archive[field]) is None
+                for field in ("archive_sha256", "authority_sha256", "manifest_sha256")
+            )
+            or any(
+                isinstance(archive[field], bool)
+                or not isinstance(archive[field], int)
+                or archive[field] < 1
+                for field in ("archive_bytes", "files", "unpacked_bytes")
+            )
+        ):
+            _refuse("corpus archive authority is invalid")
+        result["archives"][group] = {
+            field: archive[field] for field in required_archive_fields
+        }
+    recipes = corpus.get("compiler_recipes")
+    if not isinstance(recipes, Mapping) or not recipes:
+        _refuse("corpus has no compiler recipes")
+    result["compiler_recipes"] = {}
+    for environment_name, recipe in sorted(recipes.items()):
+        if (
+            not isinstance(environment_name, str)
+            or not isinstance(recipe, Mapping)
+            or not _safe_absolute_path(recipe.get("executable"))
+            or not isinstance(recipe.get("binary_sha256"), str)
+            or SHA256_RE.fullmatch(recipe["binary_sha256"]) is None
+            or not isinstance(recipe.get("configuration_sha256"), str)
+            or SHA256_RE.fullmatch(recipe["configuration_sha256"]) is None
+            or not isinstance(recipe.get("version"), str)
+            or not recipe["version"]
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in recipe["version"]
+            )
+            or not isinstance(recipe.get("arguments"), list)
+            or not recipe["arguments"]
+            or any(
+                not isinstance(argument, str)
+                or not argument
+                or any(
+                    ord(character) < 32 or ord(character) == 127
+                    for character in argument
+                )
+                for argument in recipe["arguments"]
+            )
+        ):
+            _refuse("corpus compiler recipe authority is invalid")
+        binding = {
+            "arguments": list(recipe["arguments"]),
+            "binary_sha256": recipe["binary_sha256"],
+            "configuration_sha256": recipe["configuration_sha256"],
+            "executable": recipe["executable"],
+            "version": recipe["version"],
+        }
+        toolchain = recipe.get("toolchain")
+        if toolchain is not None:
+            if (
+                not isinstance(toolchain, Mapping)
+                or not _safe_absolute_path(toolchain.get("archive"))
+                or not isinstance(toolchain.get("archive_sha256"), str)
+                or SHA256_RE.fullmatch(toolchain["archive_sha256"]) is None
+                or isinstance(toolchain.get("archive_bytes"), bool)
+                or not isinstance(toolchain.get("archive_bytes"), int)
+                or toolchain["archive_bytes"] < 1
+                or toolchain.get("compression")
+                != {
+                    "checksum": True,
+                    "codec": "zstd",
+                    "level": 19,
+                    "long": 31,
+                    "threads": 8,
+                }
+                or not _safe_absolute_path(toolchain.get("mount"))
+                or isinstance(toolchain.get("unpacked_bytes"), bool)
+                or not isinstance(toolchain.get("unpacked_bytes"), int)
+                or toolchain["unpacked_bytes"] < 1
+            ):
+                _refuse("corpus compiler toolchain authority is invalid")
+            binding["toolchain"] = {
+                "archive": toolchain["archive"],
+                "archive_bytes": toolchain["archive_bytes"],
+                "archive_sha256": toolchain["archive_sha256"],
+                "compression": dict(toolchain["compression"]),
+                "mount": toolchain["mount"],
+                "unpacked_bytes": toolchain["unpacked_bytes"],
+            }
+        result["compiler_recipes"][environment_name] = binding
     return result
 
 
@@ -223,7 +446,16 @@ def _parse_v2_instances(text: str) -> list[dict[str, Any]]:
     instances: list[dict[str, Any]] = []
     names: set[str] = set()
     counts = {"S": 0, "C": 0, "F": 0}
-    allowed_fields = {"name", "role", "host", "image", "env", "slots"}
+    allowed_fields = {
+        "name",
+        "role",
+        "host",
+        "image",
+        "client_environment",
+        "system_source_snapshot",
+        "env",
+        "slots",
+    }
     for index, raw in enumerate(value):
         field = f"ICEFARM_INSTANCES[{index}]"
         if not isinstance(raw, dict):
@@ -278,14 +510,30 @@ def _parse_v2_instances(text: str) -> list[dict[str, Any]]:
                 _refuse(f"{field}.slots must be a positive integer for F")
         elif "slots" in raw:
             _refuse(f"{field}.slots is valid only for F")
+        client_environment = raw.get("client_environment")
+        if role == "C":
+            client_environment = _safe_name(
+                client_environment, f"{field}.client_environment"
+            )
+        elif "client_environment" in raw:
+            _refuse(f"{field}.client_environment is valid only for C")
+        system_source_snapshot = raw.get("system_source_snapshot")
+        if system_source_snapshot is not None:
+            if role != "C":
+                _refuse(f"{field}.system_source_snapshot is valid only for C")
+            system_source_snapshot = _safe_name(
+                system_source_snapshot, f"{field}.system_source_snapshot"
+            )
         instances.append(
             {
+                "client_environment": client_environment,
                 "env": dict(sorted(environment.items())),
                 "host": host,
                 "image": image,
                 "name": name,
                 "role": role,
                 "slots": slots,
+                "system_source_snapshot": system_source_snapshot,
             }
         )
     if counts["S"] != 1 or counts["C"] < 1 or counts["F"] < 1:
@@ -294,7 +542,9 @@ def _parse_v2_instances(text: str) -> list[dict[str, Any]]:
 
 
 def _normalized_environment(
-    env: Mapping[str, str], authority: Mapping[str, Any], instances: Iterable[Mapping[str, Any]]
+    env: Mapping[str, str],
+    authority: Mapping[str, Any],
+    instances: Iterable[Mapping[str, Any]],
 ) -> dict[str, str]:
     mapping = {
         key: value
@@ -315,6 +565,8 @@ def _resolve_v2(
     authority: Mapping[str, Any],
     host_policies: Mapping[str, Mapping[str, Any]] | None,
     corpus_authorities: Mapping[str, Mapping[str, Any]] | None,
+    runtime_image: Mapping[str, Any] | None,
+    client_environments: Mapping[str, Mapping[str, Any]] | None,
 ) -> dict[str, Any]:
     if host_policies is None:
         _refuse("v2 resolution requires farm host policies for roles_allowed")
@@ -339,18 +591,24 @@ def _resolve_v2(
         _refuse("ICEFARM_DRY_RUN must be 0 or 1")
     profile = env.get("ICEFARM_PROFILE")
     versions = [_version_from_image(item["image"]) for item in requested]
-    if any(version == 50 for version in versions) and profile not in PROFILES:
+    if any(version == 50 for version in versions) and profile not in V2_PROFILES:
         _refuse(
             "ICEFARM_PROFILE is required for version-50 roles and must be one of "
-            + ",".join(PROFILES)
+            + ",".join(V2_PROFILES)
         )
     instance_profiles = {
         item["env"]["ICECC_P50_PROFILE"]
         for item in requested
         if "ICECC_P50_PROFILE" in item["env"]
     }
-    if len(instance_profiles) > 1 or (instance_profiles and instance_profiles != {profile}):
+    if len(instance_profiles) > 1 or (
+        instance_profiles and instance_profiles != {profile}
+    ):
         _refuse("S ICECC_P50_PROFILE conflicts with ICEFARM_PROFILE")
+
+    runtime_container = _pinned_container_image(runtime_image, "farm runtime image")
+    if not isinstance(client_environments, Mapping) or not client_environments:
+        _refuse("farm lacks client environments")
 
     resolved: list[dict[str, Any]] = []
     for item, version in zip(requested, versions):
@@ -364,23 +622,41 @@ def _resolve_v2(
             )
         host = _authority_host(authority, item["host"])
         if "lan_ip" in policy and policy["lan_ip"] != host["address"]:
-            _refuse(f"host {item['host']!r} farm address differs from authority (rule 1)")
+            _refuse(
+                f"host {item['host']!r} farm address differs from authority (rule 1)"
+            )
         image = _pinned_image(authority, item["image"])
-        resolved.append(
-            {
-                "address": host["address"],
-                "binary": ROLE_BINARY[item["role"]],
-                "env": item["env"],
-                "host": item["host"],
-                "image": image,
-                "name": item["name"],
-                "profile": profile if version == 50 else None,
-                "role": item["role"],
-                "sha256": _binary_hash(authority, version, item["role"]),
-                "slots": item["slots"],
-                "version": version,
-            }
-        )
+        client_environment = item["client_environment"]
+        container_image = runtime_container
+        if item["role"] == "C":
+            container_image = _pinned_container_image(
+                client_environments.get(client_environment),
+                f"client environment {client_environment!r}",
+            )
+        resolved_instance = {
+            "address": host["address"],
+            "binary": ROLE_BINARY[item["role"]],
+            "container_image": container_image,
+            "env": item["env"],
+            "host": item["host"],
+            "image": image,
+            "name": item["name"],
+            "profile": profile if version == 50 else None,
+            "role": item["role"],
+            "sha256": _binary_hash(authority, version, item["role"], image),
+            "slots": item["slots"],
+            "version": version,
+        }
+        if version == 50:
+            # Revision 1 predates this explicit authority field.  Preserve
+            # replay of those sealed images while requiring every successor
+            # revision to identify itself in the authority map.
+            resolved_instance["cache_wire_revision"] = image.get(
+                "cache_wire_revision", 1
+            )
+        if item["role"] == "C":
+            resolved_instance["client_environment"] = client_environment
+        resolved.append(resolved_instance)
     resolved.sort(key=lambda item: (ROLE_ORDER[item["role"]], item["name"]))
 
     schedulers = [item for item in resolved if item["role"] == "S"]
@@ -393,12 +669,24 @@ def _resolve_v2(
             state = (
                 f"s{schedulers[0]['version']}-c{client['version']}-f{worker['version']}"
             )
+            revisions_match = (
+                client.get("cache_wire_revision") is not None
+                and client.get("cache_wire_revision")
+                == worker.get("cache_wire_revision")
+            )
+            cache_expected = (
+                state == "s50-c50-f50"
+                and profile != "OFF"
+                and revisions_match
+            )
             relationships.append(
                 {
                     "c": client["name"],
-                    "cache_expected": state == "s50-c50-f50",
+                    "cache_expected": cache_expected,
                     "f": worker["name"],
-                    "profile": profile if state == "s50-c50-f50" else None,
+                    "profile": (
+                        profile if cache_expected else None
+                    ),
                     "relationship": relationship_id,
                     "state": state,
                 }
@@ -412,17 +700,32 @@ def _resolve_v2(
         if not isinstance(corpus, Mapping):
             _refuse(f"corpus {corpus_name!r} is absent from the farm authority")
         corpus_binding = _corpus_binding(corpus)
+        recipes = corpus_binding["compiler_recipes"]
+        for client in clients:
+            if client["client_environment"] not in recipes:
+                _refuse(
+                    f"corpus {corpus_name!r} has no compiler recipe for "
+                    f"C environment {client['client_environment']!r}"
+                )
+            client["compiler_recipe"] = recipes[client["client_environment"]]
 
     normalized_requested = [
         {
             "env": item["env"],
             "host": item["host"],
             "image": item["image"],
+            **(
+                {"client_environment": item["client_environment"]}
+                if item["role"] == "C"
+                else {}
+            ),
             "name": item["name"],
             "role": item["role"],
             **({"slots": item["slots"]} if item["role"] == "F" else {}),
         }
-        for item in sorted(requested, key=lambda item: (ROLE_ORDER[item["role"]], item["name"]))
+        for item in sorted(
+            requested, key=lambda item: (ROLE_ORDER[item["role"]], item["name"])
+        )
     ]
     environment = _normalized_environment(env, authority, normalized_requested)
     placement_digest = hashlib.sha256(canonical_bytes(resolved)).hexdigest()
@@ -477,7 +780,9 @@ def _resolve_v1(env: Mapping[str, str], authority: Mapping[str, Any]) -> dict[st
         )
     image_ref = _need(env, "ICEFARM_IMAGE")
     image = authority["images"].get(image_ref)
-    if not isinstance(image, dict) or not str(image.get("id", "")).startswith("sha256:"):
+    if not isinstance(image, dict) or not str(image.get("id", "")).startswith(
+        "sha256:"
+    ):
         _refuse("ICEFARM_IMAGE is not a pinned image id in the authority")
     regime = env.get("ICEFARM_REGIME", "cold")
     if regime not in REGIMES:
@@ -519,17 +824,26 @@ def _resolve_v1(env: Mapping[str, str], authority: Mapping[str, Any]) -> dict[st
             "host": item["host"],
             "address": host["address"],
             "binary": ROLE_BINARY[kind],
-            "sha256": _binary_hash(authority, item["version"], kind),
+            "sha256": _binary_hash(
+                authority,
+                item["version"],
+                kind,
+                image,
+            ),
             "profile": profile if item["version"] == 50 else None,
         }
 
-    roles = [role("S", s_roles[0])] + [role("C", item) for item in c_roles] + [
-        role("F", item) for item in f_roles
-    ]
+    roles = (
+        [role("S", s_roles[0])]
+        + [role("C", item) for item in c_roles]
+        + [role("F", item) for item in f_roles]
+    )
     relationships: list[dict[str, Any]] = []
     for index, worker in enumerate(f_roles):
         for client in c_roles:
-            state = f"s{s_roles[0]['version']}-c{client['version']}-f{worker['version']}"
+            state = (
+                f"s{s_roles[0]['version']}-c{client['version']}-f{worker['version']}"
+            )
             relationships.append(
                 {
                     "relationship": index,
@@ -540,8 +854,12 @@ def _resolve_v1(env: Mapping[str, str], authority: Mapping[str, Any]) -> dict[st
                     "profile": profile if state == "s50-c50-f50" else None,
                 }
             )
-    mapping = {key: value for key, value in sorted(env.items()) if key.startswith("ICEFARM_")}
-    placement_digest = hashlib.sha256(json.dumps(roles, sort_keys=True).encode()).hexdigest()
+    mapping = {
+        key: value for key, value in sorted(env.items()) if key.startswith("ICEFARM_")
+    }
+    placement_digest = hashlib.sha256(
+        json.dumps(roles, sort_keys=True).encode()
+    ).hexdigest()
     body: dict[str, Any] = {
         "schema": SCHEMA_V1,
         "topology": topology_id,
@@ -570,22 +888,44 @@ def resolve(
     *,
     host_policies: Mapping[str, Mapping[str, Any]] | None = None,
     corpus_authorities: Mapping[str, Mapping[str, Any]] | None = None,
+    runtime_image: Mapping[str, Any] | None = None,
+    client_environments: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Resolve v2 when ``ICEFARM_INSTANCES`` exists, otherwise replay v1."""
 
     if authority is None:
-        authority, loaded_policies, loaded_corpora = _authority_parts(
-            _need(env, "ICEFARM_AUTHORITY")
-        )
+        (
+            authority,
+            loaded_policies,
+            loaded_corpora,
+            loaded_runtime_image,
+            loaded_client_environments,
+        ) = _authority_parts(_need(env, "ICEFARM_AUTHORITY"))
         if host_policies is None:
             host_policies = loaded_policies
         if corpus_authorities is None:
             corpus_authorities = loaded_corpora
+        if runtime_image is None:
+            runtime_image = loaded_runtime_image
+        if client_environments is None:
+            client_environments = loaded_client_environments
     _validate_authority_shape(authority)
     if "ICEFARM_INSTANCES" in env:
-        if any(name in env for name in ("ICEFARM_S", "ICEFARM_C", "ICEFARM_F", "ICEFARM_IMAGE")):
-            _refuse("v2 ICEFARM_INSTANCES cannot be mixed with v1 flat role/image inputs")
-        return _resolve_v2(env, authority, host_policies, corpus_authorities)
+        if any(
+            name in env
+            for name in ("ICEFARM_S", "ICEFARM_C", "ICEFARM_F", "ICEFARM_IMAGE")
+        ):
+            _refuse(
+                "v2 ICEFARM_INSTANCES cannot be mixed with v1 flat role/image inputs"
+            )
+        return _resolve_v2(
+            env,
+            authority,
+            host_policies,
+            corpus_authorities,
+            runtime_image,
+            client_environments,
+        )
     return _resolve_v1(env, authority)
 
 
@@ -595,6 +935,8 @@ def explain(
     *,
     host_policies: Mapping[str, Mapping[str, Any]] | None = None,
     corpus_authorities: Mapping[str, Mapping[str, Any]] | None = None,
+    runtime_image: Mapping[str, Any] | None = None,
+    client_environments: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> str:
     try:
         body = resolve(
@@ -602,6 +944,8 @@ def explain(
             authority,
             host_policies=host_policies,
             corpus_authorities=corpus_authorities,
+            runtime_image=runtime_image,
+            client_environments=client_environments,
         )
     except ResolutionError as error:
         return f"REFUSED: {error}"

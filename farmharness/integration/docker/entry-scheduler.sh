@@ -38,10 +38,11 @@ do
 done
 test -n "$port"
 test -n "$netname"
+runtime_user=nobody
 set -- \
     -p "$port" \
     -n "$netname" \
-    -u icecc \
+    -u "$runtime_user" \
     -l /var/log/icecream/scheduler.log \
     -vvv
 if test -n "$assignment_fence_mode"

@@ -8,10 +8,13 @@
     "schema",
     "hub",
     "registry",
+    "image_transport",
     "netname_prefix",
     "port_range",
     "hosts",
     "corpora",
+    "runtime_image",
+    "client_environments",
     "protected",
     "authority"
   ],
@@ -35,6 +38,7 @@
         "mode": {"enum": ["registry", "save-load", "auto"]}
       }
     },
+    "image_transport": {"$ref": "#/$defs/image_transport"},
     "netname_prefix": {"$ref": "#/$defs/name"},
     "port_range": {
       "type": "array",
@@ -57,6 +61,18 @@
       "propertyNames": {"$ref": "#/$defs/name"},
       "additionalProperties": {"$ref": "#/$defs/corpus"}
     },
+    "runtime_image": {"$ref": "#/$defs/runtime_image"},
+    "client_environments": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {"$ref": "#/$defs/name"},
+      "additionalProperties": {"$ref": "#/$defs/client_environment"}
+    },
+    "system_source_snapshots": {
+      "type": "object",
+      "propertyNames": {"$ref": "#/$defs/name"},
+      "additionalProperties": {"$ref": "#/$defs/system_source_snapshot"}
+    },
     "protected": {
       "type": "object",
       "additionalProperties": false,
@@ -72,6 +88,7 @@
       }
     },
     "authority": {"$ref": "#/$defs/authority"},
+    "authority_capture": {"$ref": "#/$defs/authority_capture"},
     "s8_capture": {"type": "object"}
   },
   "$defs": {
@@ -130,7 +147,7 @@
     "corpus": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["kind", "tus"],
+      "required": ["kind", "tus", "compression", "archives"],
       "properties": {
         "kind": {"enum": ["cmake-project", "ii-manifest", "tu-manifest"]},
         "hub_path": {"type": "string", "pattern": "^/", "minLength": 2},
@@ -144,7 +161,21 @@
         "turn_a_manifest": {"type": "string", "pattern": "^/", "minLength": 2},
         "turn_b_manifest": {"type": "string", "pattern": "^/", "minLength": 2},
         "normalized_manifest_sha256": {"$ref": "#/$defs/sha256"},
-        "pair_index_sha256": {"$ref": "#/$defs/sha256"}
+        "pair_index_sha256": {"$ref": "#/$defs/sha256"},
+        "authority_receipt": {"$ref": "#/$defs/corpus_authority_receipt"},
+        "compression": {"$ref": "#/$defs/corpus_compression"},
+        "archives": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {"$ref": "#/$defs/name"},
+          "additionalProperties": {"$ref": "#/$defs/corpus_archive"}
+        },
+        "compiler_recipes": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {"$ref": "#/$defs/name"},
+          "additionalProperties": {"$ref": "#/$defs/compiler_recipe"}
+        }
       },
       "allOf": [
         {
@@ -165,6 +196,10 @@
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
     },
+    "image_id": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
     "image_label": {
       "type": "string",
       "minLength": 1,
@@ -174,7 +209,13 @@
     "authority": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schema", "hosts", "role_stores", "images", "topologies"],
+      "required": [
+        "schema",
+        "hosts",
+        "role_stores",
+        "images",
+        "topologies"
+      ],
       "properties": {
         "schema": {"const": "icecream-newgen-farm-authority-v1"},
         "hosts": {
@@ -212,6 +253,71 @@
         "address": {"type": "string", "minLength": 1, "maxLength": 255}
       }
     },
+    "authority_capture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "authority_sha256", "captured_at", "hosts"],
+      "properties": {
+        "schema": {"const": "icecream-newgen-authority-capture-v2"},
+        "authority_sha256": {"$ref": "#/$defs/sha256"},
+        "captured_at": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+        },
+        "hosts": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {"$ref": "#/$defs/name"},
+          "additionalProperties": {"$ref": "#/$defs/authority_capture_host"}
+        }
+      }
+    },
+    "authority_capture_host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "address",
+        "arch",
+        "boot_id_sha256",
+        "captured_at",
+        "cpu_count",
+        "docker",
+        "hostname",
+        "machine_id_sha256",
+        "mem_bytes",
+        "nic_identity_sha256",
+        "physical_host_sha256"
+      ],
+      "properties": {
+        "address": {"type": "string", "minLength": 3, "maxLength": 64},
+        "arch": {"type": "string", "minLength": 1, "maxLength": 32},
+        "boot_id_sha256": {"$ref": "#/$defs/sha256"},
+        "captured_at": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+        },
+        "cpu_count": {"type": "integer", "minimum": 1},
+        "docker": {"$ref": "#/$defs/authority_capture_docker"},
+        "hostname": {"type": "string", "minLength": 1, "maxLength": 255},
+        "machine_id_sha256": {"$ref": "#/$defs/sha256"},
+        "mem_bytes": {"type": "integer", "minimum": 1},
+        "nic_identity_sha256": {"$ref": "#/$defs/sha256"},
+        "physical_host_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "authority_capture_docker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["arch", "mem_bytes", "name", "os", "root_dir", "server_version"],
+      "properties": {
+        "arch": {"type": "string", "minLength": 1, "maxLength": 32},
+        "mem_bytes": {"type": "integer", "minimum": 1},
+        "name": {"type": "string", "minLength": 1, "maxLength": 255},
+        "os": {"const": "linux"},
+        "root_dir": {"type": "string", "pattern": "^/", "minLength": 2},
+        "server_version": {"type": "string", "minLength": 1, "maxLength": 80}
+      }
+    },
     "role_store": {
       "type": "object",
       "additionalProperties": false,
@@ -233,10 +339,208 @@
       "additionalProperties": false,
       "required": ["commit", "archive_sha256"],
       "properties": {
+        "kind": {"enum": ["scheduler-mutant", "daemon-mutant"]},
+        "base_image": {"$ref": "#/$defs/image_label"},
+        "base_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "base_archive_sha256": {"$ref": "#/$defs/sha256"},
         "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
         "archive_sha256": {"$ref": "#/$defs/sha256"},
+        "cache_wire_revision": {"type": "integer", "minimum": 1, "maximum": 65535},
         "closure_sha256": {"$ref": "#/$defs/sha256"},
-        "id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+        "id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "patch_path": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "patch_sha256": {"$ref": "#/$defs/sha256"},
+        "recipe_schema": {"enum": ["icefarm-scheduler-mutant-recipe-v1", "icefarm-daemon-mutant-recipe-v1"]},
+        "recipe_sha256": {"$ref": "#/$defs/sha256"},
+        "role_overrides": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "scheduler": {"$ref": "#/$defs/role_binary"},
+            "daemon": {"$ref": "#/$defs/role_binary"}
+          }
+        }
+      }
+    },
+    "compiler_recipe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "executable",
+        "binary_sha256",
+        "configuration_sha256",
+        "version",
+        "arguments"
+      ],
+      "properties": {
+        "executable": {"type": "string", "pattern": "^/", "minLength": 2, "maxLength": 4096},
+        "binary_sha256": {"$ref": "#/$defs/sha256"},
+        "configuration_sha256": {"$ref": "#/$defs/sha256"},
+        "version": {"type": "string", "minLength": 1, "maxLength": 512},
+        "arguments": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1, "maxLength": 4096}
+        },
+        "toolchain": {"$ref": "#/$defs/toolchain"}
+      }
+    },
+    "corpus_compression": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["codec", "level", "long", "threads", "checksum"],
+      "properties": {
+        "codec": {"const": "zstd"},
+        "level": {"const": 19},
+        "long": {"const": 31},
+        "threads": {"const": 8},
+        "checksum": {"const": true}
+      }
+    },
+    "image_transport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["codec", "level", "long", "threads", "checksum"],
+      "properties": {
+        "codec": {"const": "zstd"},
+        "level": {"const": 19},
+        "long": {"const": 31},
+        "threads": {"const": 8},
+        "checksum": {"const": true}
+      }
+    },
+    "corpus_archive": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "archive",
+        "archive_bytes",
+        "archive_sha256",
+        "authority_sha256",
+        "files",
+        "manifest_sha256",
+        "unpacked_bytes"
+      ],
+      "properties": {
+        "archive": {"type": "string", "pattern": "^/", "minLength": 2, "maxLength": 4096},
+        "archive_bytes": {"type": "integer", "minimum": 1},
+        "archive_sha256": {"$ref": "#/$defs/sha256"},
+        "authority_sha256": {"$ref": "#/$defs/sha256"},
+        "files": {"type": "integer", "minimum": 1},
+        "manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "unpacked_bytes": {"type": "integer", "minimum": 1}
+      }
+    },
+    "corpus_authority_receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string", "pattern": "^/", "minLength": 2, "maxLength": 4096},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "toolchain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "archive",
+        "archive_bytes",
+        "archive_sha256",
+        "compression",
+        "mount",
+        "unpacked_bytes"
+      ],
+      "properties": {
+        "archive": {"type": "string", "pattern": "^/", "minLength": 2},
+        "archive_bytes": {"type": "integer", "minimum": 1},
+        "archive_sha256": {"$ref": "#/$defs/sha256"},
+        "compression": {"$ref": "#/$defs/corpus_compression"},
+        "mount": {"type": "string", "pattern": "^/", "minLength": 2, "maxLength": 4096},
+        "unpacked_bytes": {"type": "integer", "minimum": 1}
+      }
+    },
+    "runtime_image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reference", "id", "closure_sha256", "dockerfile"],
+      "properties": {
+        "reference": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/@:+-]*$"
+        },
+        "id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "closure_sha256": {"$ref": "#/$defs/sha256"},
+        "dockerfile": {"type": "string", "minLength": 1, "maxLength": 4096}
+      }
+    },
+    "client_environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reference", "id", "closure_sha256", "dockerfile"],
+      "properties": {
+        "reference": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/@:+-]*$"
+        },
+        "id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "closure_sha256": {"$ref": "#/$defs/sha256"},
+        "dockerfile": {"type": "string", "minLength": 1, "maxLength": 4096}
+      }
+    },
+    "system_source_snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "source", "source_runtime_reference", "source_runtime_id", "source_runtime_closure_sha256", "manifest_sha256", "file_count", "enumeration", "archive"],
+      "properties": {
+        "schema": {"const": "icefarm-system-source-snapshot-v1"},
+        "source": {"const": "runtime"},
+        "source_runtime_reference": {"type": "string", "minLength": 1, "maxLength": 255},
+        "source_runtime_id": {"$ref": "#/$defs/image_id"},
+        "source_runtime_closure_sha256": {"$ref": "#/$defs/sha256"},
+        "manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "file_count": {"type": "integer", "minimum": 1},
+        "enumeration": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schema", "roots", "symlink_policy"],
+          "properties": {
+            "schema": {"const": "icefarm-system-source-manifest-v1"},
+            "roots": {
+              "const": ["/usr/include", "/usr/lib/gcc", "/usr/local/include"]
+            },
+            "symlink_policy": {
+              "const": "no-directory-follow;regular-file-symlinks-regularized"
+            }
+          }
+        },
+        "archive": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "sha256", "archive_bytes", "unpacked_bytes", "compression"],
+          "properties": {
+            "path": {"type": "string", "pattern": "^/", "minLength": 2},
+            "sha256": {"$ref": "#/$defs/sha256"},
+            "archive_bytes": {"type": "integer", "minimum": 1},
+            "unpacked_bytes": {"type": "integer", "minimum": 1},
+            "compression": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["codec", "level", "long", "threads", "checksum"],
+              "properties": {
+                "codec": {"const": "zstd"},
+                "level": {"const": 19},
+                "long": {"const": 31},
+                "threads": {"const": 8},
+                "checksum": {"const": true}
+              }
+            }
+          }
+        }
       }
     },
     "topology": {

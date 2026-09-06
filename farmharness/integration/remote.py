@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import shlex
+import signal
 import subprocess
 from dataclasses import dataclass
 from typing import Any, Iterable, Protocol
@@ -81,24 +83,40 @@ class SubprocessTransport:
     """Execute a fully resolved argv with no shell and a hard timeout."""
 
     def invoke(self, command: PlannedCommand) -> CommandResult:
+        process: subprocess.Popen[str] | None = None
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 list(command.argv),
-                check=False,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 encoding="utf-8",
                 errors="replace",
                 text=True,
-                timeout=command.timeout_s,
                 shell=False,
+                start_new_session=True,
             )
+            stdout, stderr = process.communicate(timeout=command.timeout_s)
         except subprocess.TimeoutExpired as exc:
+            if process is not None:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.communicate()
             raise RemoteError(
                 f"command {command.sequence} timed out after {command.timeout_s}s on {command.host}"
             ) from exc
         except OSError as exc:
             raise RemoteError(f"command {command.sequence} could not start: {exc}") from exc
-        result = CommandResult(completed.returncode, completed.stdout, completed.stderr)
+        assert process is not None
+        result = CommandResult(process.returncode, stdout, stderr)
         if result.returncode != 0:
             raise RemoteError(
                 f"command {command.sequence} failed rc={result.returncode} on {command.host}: "

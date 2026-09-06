@@ -1,0 +1,8 @@
+{
+  "schema": "icefarm-suite-v1",
+  "id": "s10-baseline",
+  "scenarios": ["S10-baseline-smoke", "S10-baseline-firefox"],
+  "repetitions": {
+    "S10-baseline-firefox": 3
+  }
+}

@@ -1,0 +1,75 @@
+{
+  "schema": "icefarm-scenario-v1",
+  "id": "S20-scheduler-first",
+  "shape": "S'CF",
+  "images": {
+    "new": "p50s4-89917385",
+    "old": "p43-1.4.0"
+  },
+  "instances": [
+    {
+      "name": "S1",
+      "role": "S",
+      "host": "tt-quietbox3",
+      "image": "new",
+      "env": {
+        "ICECC_P50_PROFILE": "P29V1"
+      }
+    },
+    {
+      "name": "F1",
+      "role": "F",
+      "host": "tt-quietbox2",
+      "image": "old",
+      "slots": 24
+    },
+    {
+      "name": "C1",
+      "role": "C",
+      "host": "tt-quietbox3",
+      "image": "old",
+      "client_environment": "fedora-clang-libcxx"
+    }
+  ],
+  "workload": {
+    "driver": "tu-manifest",
+    "corpus": "firefox-1000",
+    "turns": [
+      "A",
+      "B"
+    ],
+    "jobs": 24,
+    "clients": [
+      "C1"
+    ],
+    "repeat": 1,
+    "oracle": "local-sha"
+  },
+  "network": {
+    "shaping": []
+  },
+  "timeline": [
+    {
+      "trigger": "job 100",
+      "action": "restart",
+      "instance": "S1"
+    }
+  ],
+  "expect": {
+    "exact": "all",
+    "engagement": "expected(c,f)",
+    "wedges": 0,
+    "error106_max": 0,
+    "tail_to_incapable": 0,
+    "reuse": "none-when-legacy",
+    "wall_s_max": null
+  },
+  "controls": [],
+  "timeouts": {
+    "images_s": 1800,
+    "up_s": 300,
+    "turn_s": 1800,
+    "collect_s": 600,
+    "down_s": 300
+  }
+}

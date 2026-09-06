@@ -1,0 +1,87 @@
+{
+  "schema": "icefarm-scenario-v1",
+  "id": "S60-01-s-up",
+  "shape": "SCF",
+  "images": {
+    "old": "p43-1.4.0",
+    "new": "p50s4-89917385"
+  },
+  "instances": [
+    {
+      "name": "S1",
+      "role": "S",
+      "host": "tt-quietbox3",
+      "image": "old"
+    },
+    {
+      "name": "F1",
+      "role": "F",
+      "host": "tt-quietbox2",
+      "image": "old",
+      "slots": 24
+    },
+    {
+      "name": "F2",
+      "role": "F",
+      "host": "research6",
+      "image": "old",
+      "slots": 12
+    },
+    {
+      "name": "C1",
+      "role": "C",
+      "host": "tt-quietbox2",
+      "image": "old",
+      "client_environment": "debian-gcc"
+    },
+    {
+      "name": "C2",
+      "role": "C",
+      "host": "tt-quietbox3",
+      "image": "old",
+      "client_environment": "debian-gcc"
+    }
+  ],
+  "workload": {
+    "driver": "tu-manifest",
+    "corpus": "fmt-100",
+    "turns": [
+      "A"
+    ],
+    "jobs": 48,
+    "clients": [
+      "C1",
+      "C2"
+    ],
+    "repeat": 1,
+    "oracle": "local-sha"
+  },
+  "network": {
+    "shaping": []
+  },
+  "timeline": [
+    {
+      "trigger": "job 24",
+      "action": "upgrade",
+      "instance": "S1",
+      "image": "new"
+    }
+  ],
+  "expect": {
+    "exact": "all",
+    "engagement": "expected(c,f)",
+    "wedges": 0,
+    "error106_max": 0,
+    "tail_to_incapable": 0,
+    "reuse": "none-when-legacy",
+    "wall_s_max": null
+  },
+  "controls": [],
+  "timeouts": {
+    "images_s": 1800,
+    "up_s": 300,
+    "turn_s": 1800,
+    "collect_s": 600,
+    "down_s": 300
+  }
+}

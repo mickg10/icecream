@@ -1,5 +1,48 @@
 .DEFAULT_GOAL := all
 
+FARM ?= $(CURDIR)/farmharness/integration/farm.local.json
+ICEFARM_PYTHON ?= python3
+ICEFARM_TMPDIR ?= /tmp/i
+ICEFARM_TMP_ENV = env ICEFARM_TMPDIR="$(ICEFARM_TMPDIR)" \
+	TMPDIR="$(ICEFARM_TMPDIR)" TMP="$(ICEFARM_TMPDIR)" \
+	TEMP="$(ICEFARM_TMPDIR)" TEMPDIR="$(ICEFARM_TMPDIR)"
+ICEFARM_SEALED_LABELS = p43-1.4.0,p50s2-5b2e5801,p50s4-89917385,p50s4-b42d65e8,p50s4-h3-tail-mutant
+ICEFARM_IMAGE_RECEIPT_DIR ?=
+
+.PHONY: integration_images integration_smoke integration_controls \
+	integration_ladder integration_twobuild integration_full
+integration_images:
+	@$(ICEFARM_TMP_ENV) $(ICEFARM_PYTHON) -m farmharness.integration.farmtest images \
+		--farm "$(FARM)" --foundations --repo "$(CURDIR)" \
+		$(if $(strip $(ICEFARM_IMAGE_RECEIPT_DIR)),--output "$(ICEFARM_IMAGE_RECEIPT_DIR)/foundations.json")
+	@$(ICEFARM_TMP_ENV) $(ICEFARM_PYTHON) -m farmharness.integration.farmtest images \
+		--farm "$(FARM)" --labels "$(if $(strip $(LABELS)),$(strip $(LABELS)),$(ICEFARM_SEALED_LABELS))" \
+		--repo "$(CURDIR)" \
+		$(if $(strip $(ICEFARM_IMAGE_RECEIPT_DIR)),--output "$(ICEFARM_IMAGE_RECEIPT_DIR)/sealed-products.json")
+
+integration_smoke:
+	@$(ICEFARM_TMP_ENV) $(ICEFARM_PYTHON) -m farmharness.integration.farmtest suite \
+		--farm "$(FARM)" --suite farmharness/integration/suites/smoke.json
+
+integration_controls:
+	@$(ICEFARM_TMP_ENV) $(ICEFARM_PYTHON) -m farmharness.integration.farmtest suite \
+		--farm "$(FARM)" --suite farmharness/integration/suites/controls.json
+
+integration_ladder:
+	@$(ICEFARM_TMP_ENV) $(ICEFARM_PYTHON) -m farmharness.integration.farmtest suite \
+		--farm "$(FARM)" --suite farmharness/integration/suites/ladder.json \
+		--stop-on-fail
+
+integration_twobuild:
+	@$(ICEFARM_TMP_ENV) $(ICEFARM_PYTHON) -m farmharness.integration.farmtest suite \
+		--farm "$(FARM)" --suite farmharness/integration/suites/twobuild.json \
+		--stop-on-fail
+
+integration_full:
+	@$(ICEFARM_TMP_ENV) $(ICEFARM_PYTHON) -m farmharness.integration.farmtest suite \
+		--farm "$(FARM)" --suite farmharness/integration/suites/full.json \
+		--stop-on-fail
+
 .PHONY: docker_build docker_test
 docker_build:
 	@cd package_builder/ubuntu22.04 && docker compose run --rm --build deb

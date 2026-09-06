@@ -1,0 +1,8 @@
+{
+  "schema": "icefarm-suite-v1",
+  "id": "s40-engagement",
+  "scenarios": [
+    "S40-engagement-fmt",
+    "S40-full-newgen-engagement"
+  ]
+}

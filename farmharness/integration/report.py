@@ -11,14 +11,15 @@ from typing import Any
 try:
     from .collect import CollectError, load_verified_bundle
     from .schema_validation import canonical_bytes
-    from .verdict import evaluate_bundle
+    from .verdict import evaluate_bundle, evaluate_control
 except ImportError:  # Direct execution from this directory.
     from collect import CollectError, load_verified_bundle
     from schema_validation import canonical_bytes
-    from verdict import evaluate_bundle
+    from verdict import evaluate_bundle, evaluate_control
 
 
 WITNESS_SCHEMA = "icefarm-witness-v1"
+CONTROLS_VERDICT_SCHEMA = "icefarm-controls-verdict-v1"
 
 
 class ReportError(RuntimeError):
@@ -64,11 +65,68 @@ def verify_bundle(root: Path | str) -> dict[str, Any]:
     return verdict
 
 
+def verify_control_bundle(root: Path | str) -> dict[str, Any]:
+    """Recompute every control explicitly bound into one immutable scenario."""
+
+    path = Path(root)
+    try:
+        bundle = load_verified_bundle(path)
+    except CollectError as exc:
+        raise ReportError(str(exc)) from exc
+    requested = bundle.get("scenario", {}).get("controls", [])
+    if not isinstance(requested, list) or not requested:
+        raise ReportError("bundle scenario declares no H1-H5 controls")
+    controls = [evaluate_control(control_id, bundle) for control_id in requested]
+    verdict = {
+        "controls": controls,
+        "schema": CONTROLS_VERDICT_SCHEMA,
+        "status": "PASS"
+        if all(item["status"] == "PASS" for item in controls)
+        else "FAIL",
+    }
+    _atomic_json(path / "control-verdict.json", verdict)
+    return verdict
+
+
+def _nearest_rank(values: list[int], percentile: int) -> int:
+    ordered = sorted(values)
+    index = max(0, (len(ordered) * percentile + 99) // 100 - 1)
+    return ordered[index]
+
+
 def _cell_summary(bundle: dict[str, Any]) -> list[str]:
+    if bundle.get("mode") == "preflight-refusal":
+        refusal = bundle["observations"]["preflight_refusal"]
+        return [
+            "- Workload: not started; jobs started: 0.",
+            f"- Preflight refusal: `{refusal['reason_code']}` — {refusal['error']}.",
+        ]
+    if bundle.get("mode") == "control-failure":
+        failure = bundle["observations"]["h3_control_failure"]
+        return [
+            "- H3 workload: started and failed as designed; product rows: 0.",
+            f"- Scheduler emissions: {len(failure['emission']['records'])}; "
+            f"legacy unread-tail rejections: {len(failure['rejections'])}.",
+        ]
     rows = bundle["rows"]
     profiles = Counter(row["tail_profile"] or "legacy" for row in rows)
     outcomes = Counter(row["session_outcome"] for row in rows)
+    worker_walls: dict[str, list[int]] = {}
+    for row in rows:
+        worker_walls.setdefault(row["cs"], []).append(row["wall_ms"])
     observations = bundle["observations"]
+    source_mutex = observations.get(
+        "source_mutex",
+        {
+            "record_count": 0,
+            "service_total_ns": 0,
+            "wait_max_ns": 0,
+            "wait_total_ns": 0,
+        },
+    )
+    warm_overrides = observations.get(
+        "warm_hint_overrides", {"count": 0, "job_ids": []}
+    )
     return [
         f"- Jobs: {len(rows)}; exact: {sum(row['exact'] is True for row in rows)}; "
         f"compile failures: {len(observations['compile_failure_job_ids'])}; "
@@ -79,11 +137,26 @@ def _cell_summary(bundle: dict[str, Any]) -> list[str]:
         "- Session outcomes: "
         + ", ".join(f"{name}={count}" for name, count in sorted(outcomes.items()))
         + ".",
+        "- Worker distribution: "
+        + ", ".join(
+            f"{worker}={len(walls)} (p95={_nearest_rank(walls, 95)} ms; "
+            f"p99={_nearest_rank(walls, 99)} ms)"
+            for worker, walls in sorted(worker_walls.items())
+        )
+        + ".",
         f"- Cell wall: {observations['cell_wall_ms']} ms; "
         f"C→F bytes: {sum(row['c_to_f_bytes'] for row in rows)}; "
         f"F→C bytes: {sum(row['f_to_c_bytes'] for row in rows)}.",
+        f"- Source mutex: records={source_mutex['record_count']}; "
+        f"wait={source_mutex['wait_total_ns'] / 1_000_000:.3f} ms total "
+        f"({source_mutex['wait_max_ns'] / 1_000_000:.3f} ms max); "
+        f"service={source_mutex['service_total_ns'] / 1_000_000:.3f} ms total.",
         f"- Oracle samples: {observations['oracle']['sample_total']}; "
         f"mismatches: {len(observations['oracle']['sample_mismatch_job_ids'])}.",
+        f"- Warm affinity overrides of idle compatible workers: "
+        f"{warm_overrides['count']}; jobs: "
+        + (", ".join(str(item) for item in warm_overrides["job_ids"]) or "none")
+        + ".",
     ]
 
 
@@ -130,8 +203,12 @@ def render_report(bundle: dict[str, Any], verdict: dict[str, Any]) -> str:
     )
     for clause in verdict["clauses"]:
         detail = str(clause["detail"]).replace("|", "\\|").replace("\n", " ")
-        offenders = ", ".join(f"`{item}`" for item in clause["offending_job_ids"]) or "—"
-        lines.append(f"| `{clause['id']}` | {clause['status']} | {offenders} | {detail} |")
+        offenders = (
+            ", ".join(f"`{item}`" for item in clause["offending_job_ids"]) or "—"
+        )
+        lines.append(
+            f"| `{clause['id']}` | {clause['status']} | {offenders} | {detail} |"
+        )
     lines.extend(
         [
             "",

@@ -11,8 +11,18 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 try:
+    from .firefox_corpus_promotion import (
+        FirefoxCorpusPromotionError,
+        validate_corpus_promotion,
+    )
+    from .mutant import MutantError, file_sha256, validate_mutant_authority
     from .schema_validation import ValidationError, canonical_bytes, load_json, validate
 except ImportError:  # Direct execution from this directory.
+    from firefox_corpus_promotion import (
+        FirefoxCorpusPromotionError,
+        validate_corpus_promotion,
+    )
+    from mutant import MutantError, file_sha256, validate_mutant_authority
     from schema_validation import ValidationError, canonical_bytes, load_json, validate
 
 
@@ -165,14 +175,91 @@ def load_farm_spec(path: str | Path) -> FarmSpec:
                     raise FarmSpecError(
                         f"$.corpora.{name}.manifest_sha256: required for manifest"
                     )
-            elif not {"turn_a_manifest", "turn_b_manifest", "normalized_manifest_sha256", "pair_index_sha256"} <= set(corpus):
+            elif not {
+                "turn_a_manifest",
+                "turn_b_manifest",
+                "normalized_manifest_sha256",
+                "pair_index_sha256",
+                "authority_receipt",
+            } <= set(corpus):
                 raise FarmSpecError(
                     f"$.corpora.{name}: paired tu-manifest requires both manifests and "
-                    "their normalized/pair authority hashes"
+                    "their normalized/pair hashes and compile-valid authority receipt"
                 )
+            else:
+                receipt = corpus["authority_receipt"]
+                _absolute_safe_path(
+                    receipt["path"], f"$.corpora.{name}.authority_receipt.path"
+                )
+                _exact_digest(
+                    receipt["sha256"],
+                    f"$.corpora.{name}.authority_receipt.sha256",
+                    SHA256_RE,
+                )
+                try:
+                    validate_corpus_promotion(corpus)
+                except FirefoxCorpusPromotionError as exc:
+                    raise FarmSpecError(
+                        f"$.corpora.{name}.authority_receipt: {exc}"
+                    ) from exc
         for field, item in corpus.items():
             if field.endswith("_sha256"):
                 _exact_digest(item, f"$.corpora.{name}.{field}", SHA256_RE)
+        archives = corpus.get("archives")
+        expected_groups = {"files"} if "manifest" in corpus else {"A", "B"}
+        if not isinstance(archives, dict) or set(archives) != expected_groups:
+            raise FarmSpecError(
+                f"$.corpora.{name}.archives: expected exactly "
+                + ", ".join(sorted(expected_groups))
+            )
+        source_authority = {
+            key: item
+            for key, item in corpus.items()
+            if key not in ("archives", "compression")
+        }
+        source_authority_sha256 = hashlib.sha256(
+            canonical_bytes(source_authority)
+        ).hexdigest()
+        for group, archive in archives.items():
+            _safe_name(group, f"$.corpora.{name}.archives.<key:{group!r}>")
+            _absolute_safe_path(
+                archive["archive"], f"$.corpora.{name}.archives.{group}.archive"
+            )
+            for field in ("archive_sha256", "authority_sha256", "manifest_sha256"):
+                _exact_digest(
+                    archive[field],
+                    f"$.corpora.{name}.archives.{group}.{field}",
+                    SHA256_RE,
+                )
+            if archive["files"] != corpus["tus"]:
+                raise FarmSpecError(
+                    f"$.corpora.{name}.archives.{group}.files: expected {corpus['tus']}"
+                )
+            expected_authority = hashlib.sha256(
+                canonical_bytes(
+                    {
+                        "corpus_authority_sha256": source_authority_sha256,
+                        "group": group,
+                        "manifest_sha256": archive["manifest_sha256"],
+                    }
+                )
+            ).hexdigest()
+            if archive["authority_sha256"] != expected_authority:
+                raise FarmSpecError(
+                    f"$.corpora.{name}.archives.{group}.authority_sha256: "
+                    "does not bind the corpus source authority and manifest"
+                )
+        for environment_name, recipe in corpus.get("compiler_recipes", {}).items():
+            _safe_name(
+                environment_name,
+                f"$.corpora.{name}.compiler_recipes.<key:{environment_name!r}>",
+            )
+            for index, argument in enumerate(recipe["arguments"]):
+                if any(ord(character) < 32 or ord(character) == 127 for character in argument):
+                    raise FarmSpecError(
+                        f"$.corpora.{name}.compiler_recipes.{environment_name}."
+                        f"arguments[{index}]: control characters are forbidden"
+                    )
 
     authority = value["authority"]
     if authority["schema"] != "icecream-newgen-farm-authority-v1":
@@ -208,6 +295,145 @@ def load_farm_spec(path: str | Path) -> FarmSpec:
                 f"$.authority.role_stores.{version}.{role}.sha256",
                 SHA256_RE,
             )
+    runtime_image = value["runtime_image"]
+    _exact_digest(runtime_image["id"], "$.runtime_image.id", IMAGE_ID_RE)
+    _exact_digest(
+        runtime_image["closure_sha256"],
+        "$.runtime_image.closure_sha256",
+        SHA256_RE,
+    )
+    _relative_safe_path(runtime_image["dockerfile"], "$.runtime_image.dockerfile")
+    if any(
+        ord(character) < 32 or ord(character) == 127
+        for character in runtime_image["reference"]
+    ):
+        raise FarmSpecError("$.runtime_image.reference: control characters are forbidden")
+
+    client_environments = value["client_environments"]
+    expected_client_environments = {
+        "conan-gcc": "ice-ii/conan-gcc:v2-p50",
+        "debian-gcc": "ice-ii/debian-gcc:v2-p50",
+        "fedora-clang-libcxx": "ice-ii/fedora-clang-libcxx:v2-p50",
+        "linuxbrew": "ice-ii/linuxbrew:v2-p50",
+    }
+    if set(client_environments) != set(expected_client_environments):
+        raise FarmSpecError(
+            "$.client_environments: exactly conan-gcc, debian-gcc, "
+            "fedora-clang-libcxx, and linuxbrew are required"
+        )
+    client_references: set[str] = set()
+    for name, environment in client_environments.items():
+        _safe_name(name, f"$.client_environments.<key:{name!r}>")
+        _exact_digest(
+            environment["id"],
+            f"$.client_environments.{name}.id",
+            IMAGE_ID_RE,
+        )
+        _exact_digest(
+            environment["closure_sha256"],
+            f"$.client_environments.{name}.closure_sha256",
+            SHA256_RE,
+        )
+        _relative_safe_path(
+            environment["dockerfile"],
+            f"$.client_environments.{name}.dockerfile",
+        )
+        if any(
+            ord(character) < 32 or ord(character) == 127
+            for character in environment["reference"]
+        ):
+            raise FarmSpecError(
+                f"$.client_environments.{name}.reference: "
+                "control characters are forbidden"
+            )
+        if environment["reference"] != expected_client_environments[name]:
+            raise FarmSpecError(
+                f"$.client_environments.{name}.reference: expected "
+                f"{expected_client_environments[name]!r}"
+            )
+        if environment["reference"] == runtime_image["reference"]:
+            raise FarmSpecError(
+                f"$.client_environments.{name}.reference: "
+                "C and S/F runtime images must be distinct"
+            )
+        if environment["reference"] in client_references:
+            raise FarmSpecError(
+                f"$.client_environments.{name}.reference: "
+                "duplicate C image reference"
+            )
+        client_references.add(environment["reference"])
+    snapshots = value.get("system_source_snapshots", {})
+    for name, snapshot in snapshots.items():
+        _safe_name(name, f"$.system_source_snapshots.<key:{name!r}>")
+        if snapshot["source_runtime_reference"] != runtime_image["reference"]:
+            raise FarmSpecError(
+                f"$.system_source_snapshots.{name}.source_runtime_reference: differs from runtime image"
+            )
+        if snapshot["source_runtime_id"] != runtime_image["id"]:
+            raise FarmSpecError(
+                f"$.system_source_snapshots.{name}.source_runtime_id: differs from runtime image"
+            )
+        if snapshot["source_runtime_closure_sha256"] != runtime_image["closure_sha256"]:
+            raise FarmSpecError(
+                f"$.system_source_snapshots.{name}.source_runtime_closure_sha256: differs from runtime image"
+            )
+        archive = snapshot["archive"]
+        _absolute_safe_path(
+            archive["path"], f"$.system_source_snapshots.{name}.archive.path"
+        )
+        if snapshot["enumeration"]["roots"] != [
+            "/usr/include", "/usr/lib/gcc", "/usr/local/include"
+        ]:
+            raise FarmSpecError(
+                f"$.system_source_snapshots.{name}.enumeration.roots: unsupported roots"
+            )
+    for name, corpus in value["corpora"].items():
+        for environment_name, recipe in corpus.get("compiler_recipes", {}).items():
+            if environment_name not in client_environments:
+                raise FarmSpecError(
+                    f"$.corpora.{name}.compiler_recipes.{environment_name}: "
+                    "absent from client environments"
+                )
+            _absolute_safe_path(
+                recipe["executable"],
+                f"$.corpora.{name}.compiler_recipes.{environment_name}.executable",
+            )
+            _exact_digest(
+                recipe["binary_sha256"],
+                f"$.corpora.{name}.compiler_recipes.{environment_name}.binary_sha256",
+                SHA256_RE,
+            )
+            _exact_digest(
+                recipe["configuration_sha256"],
+                f"$.corpora.{name}.compiler_recipes.{environment_name}.configuration_sha256",
+                SHA256_RE,
+            )
+            if any(
+                ord(character) < 32 or ord(character) == 127
+                for character in recipe["version"]
+            ):
+                raise FarmSpecError(
+                    f"$.corpora.{name}.compiler_recipes.{environment_name}.version: "
+                    "control characters are forbidden"
+                )
+            toolchain = recipe.get("toolchain")
+            if toolchain is not None:
+                _absolute_safe_path(
+                    toolchain["archive"],
+                    f"$.corpora.{name}.compiler_recipes.{environment_name}."
+                    "toolchain.archive",
+                )
+                _exact_digest(
+                    toolchain["archive_sha256"],
+                    f"$.corpora.{name}.compiler_recipes.{environment_name}."
+                    "toolchain.archive_sha256",
+                    SHA256_RE,
+                )
+                _absolute_safe_path(
+                    toolchain["mount"],
+                    f"$.corpora.{name}.compiler_recipes.{environment_name}."
+                    "toolchain.mount",
+                )
     for label, image in authority["images"].items():
         if IMAGE_LABEL_RE.fullmatch(label) is None:
             raise FarmSpecError(
@@ -219,6 +445,14 @@ def load_farm_spec(path: str | Path) -> FarmSpec:
             f"$.authority.images.{label}.archive_sha256",
             SHA256_RE,
         )
+        revision = image.get("cache_wire_revision")
+        if revision is not None and (
+            type(revision) is not int or not (1 <= revision <= 0xFFFF)
+        ):
+            raise FarmSpecError(
+                f"$.authority.images.{label}.cache_wire_revision: "
+                "must be an integer in 1..65535"
+            )
         if "closure_sha256" in image:
             _exact_digest(
                 image["closure_sha256"],
@@ -227,7 +461,86 @@ def load_farm_spec(path: str | Path) -> FarmSpec:
             )
         if "id" in image:
             _exact_digest(image["id"], f"$.authority.images.{label}.id", IMAGE_ID_RE)
+        if image.get("kind") in ("scheduler-mutant", "daemon-mutant"):
+            try:
+                validate_mutant_authority(label, image, authority["images"])
+                patch_reference = image["patch_path"]
+                patch_path = Path(resolved.parent, patch_reference).resolve()
+                if not patch_path.is_file() or patch_path.is_symlink():
+                    # Test and staging copies of farm.example.json retain the
+                    # checked-in recipe path; authority still binds the bytes
+                    # to this harness support file, never to the copied farm.
+                    patch_path = (Path(__file__).parent / patch_reference).resolve()
+                if not patch_path.is_file() or patch_path.is_symlink():
+                    raise MutantError(f"{label}: mutant patch is absent or unsafe")
+                if file_sha256(patch_path) != image["patch_sha256"]:
+                    raise MutantError(f"{label}: mutant patch hash does not match authority")
+                overrides = image.get("role_overrides")
+                if overrides is not None:
+                    role_key = "scheduler" if image.get("kind") == "scheduler-mutant" else "daemon"
+                    role_override = overrides.get(role_key) if isinstance(overrides, dict) else None
+                    digest = role_override.get("sha256") if isinstance(role_override, dict) else None
+                    if not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None:
+                        raise MutantError(
+                            f"{label}: {role_key} role override hash is invalid"
+                        )
+            except (KeyError, MutantError) as exc:
+                raise FarmSpecError(f"$.authority.images.{label}: {exc}") from exc
     for name in authority["topologies"]:
         _safe_name(name, f"$.authority.topologies.<key:{name!r}>")
+
+    capture = value.get("authority_capture")
+    if capture is not None:
+        expected_authority_sha256 = hashlib.sha256(canonical_bytes(authority)).hexdigest()
+        if capture["authority_sha256"] != expected_authority_sha256:
+            raise FarmSpecError(
+                "$.authority_capture.authority_sha256: does not bind $.authority"
+            )
+        if set(capture["hosts"]) != names:
+            raise FarmSpecError(
+                "$.authority_capture.hosts: must exactly match the declared farm hosts"
+            )
+        physical_hosts: set[str] = set()
+        for index, host in enumerate(value["hosts"]):
+            descriptor = capture["hosts"][host["name"]]
+            if descriptor["address"] != host["lan_ip"]:
+                raise FarmSpecError(
+                    f"$.authority_capture.hosts.{host['name']}.address: "
+                    "does not match the declared LAN address"
+                )
+            if descriptor["arch"] != host["arch"] or descriptor["cpu_count"] != host["cores"]:
+                raise FarmSpecError(
+                    f"$.authority_capture.hosts.{host['name']}: CPU identity differs "
+                    f"from $.hosts[{index}]"
+                )
+            physical = descriptor["physical_host_sha256"]
+            expected_physical = hashlib.sha256(
+                canonical_bytes(
+                    {
+                        "machine_id_sha256": descriptor["machine_id_sha256"],
+                        "nic_identity_sha256": descriptor["nic_identity_sha256"],
+                    }
+                )
+            ).hexdigest()
+            if physical != expected_physical:
+                raise FarmSpecError(
+                    f"$.authority_capture.hosts.{host['name']}.physical_host_sha256: "
+                    "does not bind machine and NIC identity"
+                )
+            if physical in physical_hosts:
+                raise FarmSpecError(
+                    "$.authority_capture.hosts: duplicate physical host identity"
+                )
+            physical_hosts.add(physical)
+            docker = descriptor["docker"]
+            if docker["os"] != "linux":
+                raise FarmSpecError(
+                    f"$.authority_capture.hosts.{host['name']}.docker.os: "
+                    "a Linux Docker daemon is required"
+                )
+            _absolute_safe_path(
+                docker["root_dir"],
+                f"$.authority_capture.hosts.{host['name']}.docker.root_dir",
+            )
 
     return FarmSpec(path=resolved, data=copy.deepcopy(value))

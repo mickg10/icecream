@@ -1,0 +1,11 @@
+{
+  "schema": "icefarm-suite-v1",
+  "id": "s20-scheduler-first",
+  "scenarios": [
+    "S20-scheduler-first-smoke",
+    "S20-scheduler-first"
+  ],
+  "repetitions": {
+    "S20-scheduler-first": 3
+  }
+}

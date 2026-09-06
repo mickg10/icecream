@@ -1,0 +1,12 @@
+{
+  "schema": "icefarm-suite-v1",
+  "id": "s30-old-f",
+  "scenarios": [
+    "S30-old-f-smoke",
+    "S30-old-f-firefox",
+    "S30-old-f-client-restart"
+  ],
+  "repetitions": {
+    "S30-old-f-firefox": 3
+  }
+}

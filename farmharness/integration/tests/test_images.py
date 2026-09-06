@@ -15,12 +15,21 @@ from farmharness.integration.images import (
     RecordingTransport,
     _image_identity,
     build_and_distribute,
+    build_and_distribute_foundations,
     build_image,
     create_source_archive,
     distribute_image,
+    ensure_product_image,
+    foundation_targets_for_farm,
+    foundation_targets_for_scenario,
     image_bindings,
 )
-from farmharness.integration.remote import CommandResult, PlannedCommand, RemoteError
+from farmharness.integration.remote import (
+    CommandResult,
+    PlannedCommand,
+    RemoteError,
+    decode_ssh_payload,
+)
 
 
 INTEGRATION = Path(__file__).resolve().parents[1]
@@ -54,25 +63,70 @@ class ScriptedRecorder:
         host_ids: dict[str, list[str]] | None = None,
         host_closures: dict[str, list[str]] | None = None,
         push_fails: bool = False,
+        warm_hosts: set[str] | None = None,
     ) -> None:
         self.hub_id = hub_id
         self.host_ids = host_ids or {}
         self.host_closures = host_closures or {}
         self.push_fails = push_fails
+        self.warm_hosts = warm_hosts or set()
         self.commands: list[PlannedCommand] = []
 
     def invoke(self, command: PlannedCommand) -> CommandResult:
         self.commands.append(command)
         if command.phase == "images.push" and self.push_fails:
             raise RemoteError("registry unavailable")
-        if command.phase == "images.inspect-hub":
+        if command.phase in (
+            "images.inspect-hub",
+            "images.inspect-hub-cached",
+            "images.inspect-transport-hub",
+            "images.foundation-inspect-cached",
+            "images.foundation-inspect-candidate",
+            "images.foundation-inspect-final",
+        ):
             return CommandResult(0, _inspect_json(self.hub_id) + "\n", "")
         if command.phase == "images.inspect-repodigests":
             reference = command.argv[-1].rsplit(":", 1)[0]
             return CommandResult(0, f'["{reference}@sha256:{"3" * 64}"]\n', "")
-        if command.phase == "images.save":
-            Path(command.argv[-2]).write_bytes(b"saved-image")
-        if command.phase == "images.inspect-host":
+        if command.phase == "images.save-compressed":
+            archive = Path(command.argv[-1])
+            archive.parent.mkdir(parents=True, exist_ok=True)
+            compressed = b"saved-image-zstd19-long31"
+            raw = b"saved-image-raw-stream"
+            archive.write_bytes(compressed)
+            return CommandResult(
+                0,
+                json.dumps(
+                    {
+                        "compressed_bytes": len(compressed),
+                        "compressed_sha256": hashlib.sha256(compressed).hexdigest(),
+                        "raw_bytes": len(raw),
+                        "raw_sha256": hashlib.sha256(raw).hexdigest(),
+                        "zstd": {
+                            "check": True,
+                            "level": 19,
+                            "long": 31,
+                            "threads": 8,
+                            "version": "*** Zstandard CLI (64-bit) v1.5.7",
+                        },
+                    }
+                )
+                + "\n",
+                "",
+            )
+        if command.phase == "images.verify-compressed":
+            remote = decode_ssh_payload(command.argv)
+            path, size, sha256 = remote[-3:]
+            return CommandResult(
+                0,
+                json.dumps({"bytes": int(size), "path": path, "sha256": sha256}) + "\n",
+                "",
+            )
+        if command.phase == "images.inspect-host-cached":
+            if command.host not in self.warm_hosts:
+                raise RemoteError("image is not cached on this host")
+            return CommandResult(0, _inspect_json(GOOD_ID) + "\n", "")
+        if command.phase in ("images.inspect-host", "images.inspect-transport-host"):
             values = self.host_ids.setdefault(command.host, [GOOD_ID])
             value = values.pop(0) if len(values) > 1 else values[0]
             markers = self.host_closures.setdefault(command.host, ["same"])
@@ -92,7 +146,9 @@ def _farm():
     "label",
     ("p43-1.4.0", "p50-4c994915", "p50s2-624702e9"),
 )
-def test_each_source_archive_matches_immutable_authority(label: str, tmp_path: Path) -> None:
+def test_each_source_archive_matches_immutable_authority(
+    label: str, tmp_path: Path
+) -> None:
     farm = _farm()
     binding = image_bindings(farm, [label])[0]
     archive = tmp_path / f"{label}.tar"
@@ -105,6 +161,24 @@ def test_scheduler_entrypoint_accepts_only_named_assignment_fence_modes() -> Non
     assert "--assignment-fence-mode" in entrypoint
     assert "legacy|advisory|enforcing-compat|strict-nonce" in entrypoint
     assert 'set -- "$@" --assignment-fence-mode "$assignment_fence_mode"' in entrypoint
+
+
+def test_role_entrypoints_use_the_foundation_portable_runtime_account() -> None:
+    """Product runtimes must not depend on users from their build image.
+
+    The product's ``/opt/icecream`` tree is mounted read-only into the stable
+    S/F image or one of four heterogeneous C images.  Those foundations all
+    provide the standard non-root ``nobody`` account, whereas the product-only
+    ``icecc`` account is deliberately not part of their identity.
+    """
+
+    for name in ("entry-scheduler.sh", "entry-daemon.sh", "entry-client.sh"):
+        entrypoint = (INTEGRATION / "docker" / name).read_text()
+        assert "runtime_user=nobody" in entrypoint
+        assert "-u icecc" not in entrypoint
+        assert "-o icecc" not in entrypoint
+        assert "chown -R icecc:icecc" not in entrypoint
+        assert '-u "$runtime_user"' in entrypoint
 
 
 def test_archive_hash_mismatch_is_removed_and_refused(tmp_path: Path) -> None:
@@ -124,7 +198,9 @@ def test_unknown_or_duplicate_labels_are_refused() -> None:
         image_bindings(farm, ["p43-1.4.0", "p43-1.4.0"])
 
 
-def test_build_uses_commit_not_display_label_and_binds_runtime_closure(tmp_path: Path) -> None:
+def test_build_uses_commit_not_display_label_and_binds_runtime_closure(
+    tmp_path: Path,
+) -> None:
     farm = _farm()
     binding = image_bindings(farm, ["p50s2-624702e9"])[0]
     scripted = ScriptedRecorder()
@@ -143,26 +219,43 @@ def test_build_uses_commit_not_display_label_and_binds_runtime_closure(tmp_path:
     assert f"SOURCE_COMMIT={binding.commit}" in build.argv
     assert f"SOURCE_ARCHIVE_SHA256={binding.archive_sha256}" in build.argv
     assert binding.label not in build.argv[build.argv.index("--build-arg") + 1]
-    assert all("sh" not in command.argv and "bash" not in command.argv for command in recorder.commands)
+    assert all(
+        "sh" not in command.argv and "bash" not in command.argv
+        for command in recorder.commands
+    )
 
 
 def test_receipt_binds_saved_transport_archive(tmp_path: Path) -> None:
     farm = _farm()
     farm.data["registry"]["mode"] = "save-load"
     output = tmp_path / "images.json"
+    recorder = RecordingTransport(ScriptedRecorder())
     receipt = build_and_distribute(
         farm,
         ["p50s2-624702e9"],
         repo=REPO,
         output=output,
-        recorder=RecordingTransport(ScriptedRecorder()),
+        recorder=recorder,
     )
     image = receipt["images"]["p50s2-624702e9"]
+    assert image["built"] is False
+    assert all(command.phase != "images.build" for command in recorder.commands)
     assert image["closure_schema"] == "docker-inspect-runtime-closure-v1"
-    assert image["transport_archive"] == {
-        "bytes": len(b"saved-image"),
-        "sha256": hashlib.sha256(b"saved-image").hexdigest(),
+    transport = image["transport_archive"]
+    assert transport["schema"] == "icefarm-docker-save-zstd-v1"
+    assert transport["format"] == "docker-save-tar-zstd"
+    assert transport["artifact"] == {
+        "bytes": len(b"saved-image-zstd19-long31"),
+        "sha256": hashlib.sha256(b"saved-image-zstd19-long31").hexdigest(),
     }
+    assert transport["zstd"] == {
+        "check": True,
+        "level": 19,
+        "long": 31,
+        "threads": 8,
+        "version": "*** Zstandard CLI (64-bit) v1.5.7",
+    }
+    assert transport["path"].endswith(".docker.tar.zst")
     assert json.loads(output.read_text()) == receipt
 
 
@@ -200,6 +293,59 @@ def test_preexisting_expected_hub_closure_mismatch_is_refused(tmp_path: Path) ->
         )
 
 
+def test_authority_bound_cached_product_image_skips_rebuild(tmp_path: Path) -> None:
+    farm = _farm()
+    binding = dataclasses.replace(
+        image_bindings(farm, ["p50s2-624702e9"])[0], expected_id=GOOD_ID
+    )
+    recorder = RecordingTransport(ScriptedRecorder())
+
+    observed, built = ensure_product_image(
+        farm,
+        binding,
+        REPO,
+        tmp_path / "unused-context",
+        recorder,
+        CommandFactory(),
+        timeout_s=10,
+    )
+
+    assert observed.native_id == GOOD_ID
+    assert observed.closure_sha256 == binding.expected_closure
+    assert built is False
+    assert not (tmp_path / "unused-context").exists()
+    assert [command.phase for command in recorder.commands] == [
+        "images.inspect-hub-cached"
+    ]
+
+
+def test_uncaptured_candidate_product_image_is_always_rebuilt(tmp_path: Path) -> None:
+    farm = load_farm_spec(INTEGRATION / "farm.example.json")
+    binding = image_bindings(
+        farm, ["p50s30-f-refusal-mutant-candidate"]
+    )[0]
+    assert binding.expected_closure is None
+    recorder = RecordingTransport(ScriptedRecorder())
+
+    _observed, built = ensure_product_image(
+        farm,
+        binding,
+        REPO,
+        tmp_path / "candidate-context",
+        recorder,
+        CommandFactory(),
+        timeout_s=10,
+    )
+
+    assert built is True
+    assert (tmp_path / "candidate-context" / "source.tar").is_file()
+    assert any(command.phase == "images.build" for command in recorder.commands)
+    assert all(
+        command.phase != "images.inspect-hub-cached"
+        for command in recorder.commands
+    )
+
+
 def test_auto_registry_failure_falls_back_to_one_save_and_load_per_host(
     tmp_path: Path,
 ) -> None:
@@ -219,8 +365,17 @@ def test_auto_registry_failure_falls_back_to_one_save_and_load_per_host(
     )
     assert set(result) == set(farm.hosts)
     assert {item["mode"] for item in result.values()} == {"save-load"}
-    assert sum(command.phase == "images.save" for command in recorder.commands) == 1
-    assert sum(command.phase == "images.load" for command in recorder.commands) == len(farm.hosts)
+    assert (
+        sum(command.phase == "images.save-compressed" for command in recorder.commands)
+        == 1
+    )
+    assert sum(
+        command.phase == "images.load-compressed" for command in recorder.commands
+    ) == len(farm.hosts)
+    assert all(
+        item["transport_archive"]["path"].endswith(".docker.tar.zst")
+        for item in result.values()
+    )
 
 
 def test_registry_id_mismatch_falls_back_in_auto_mode(tmp_path: Path) -> None:
@@ -334,3 +489,188 @@ def test_farmtest_images_cli_selects_only_requested_authority_labels(
     assert observed["repo"] == REPO
     assert observed["output"] == tmp_path / "images.json"
     assert '"schema": "icefarm-images-v1"' in capsys.readouterr().out
+
+
+def test_foundation_packager_keeps_four_clients_distinct_and_targets_only_selected_host(
+    tmp_path: Path,
+) -> None:
+    farm = _farm()
+    farm.data["runtime_image"]["id"] = GOOD_ID
+    farm.data["runtime_image"]["closure_sha256"] = GOOD_IDENTITY.closure_sha256
+    for environment in farm.data["client_environments"].values():
+        environment["id"] = GOOD_ID
+        environment["closure_sha256"] = GOOD_IDENTITY.closure_sha256
+    assert sorted(farm.data["client_environments"]) == [
+        "conan-gcc",
+        "debian-gcc",
+        "fedora-clang-libcxx",
+        "linuxbrew",
+    ]
+    target = next(
+        name for name, host in farm.hosts.items() if "C" in host["roles_allowed"]
+    )
+    recorder = RecordingTransport(ScriptedRecorder())
+    receipt = build_and_distribute_foundations(
+        farm,
+        repo=REPO,
+        output=tmp_path / "foundations.json",
+        target_hosts={"linuxbrew": [target]},
+        recorder=recorder,
+    )
+    assert receipt["schema"] == "icefarm-foundation-images-v1"
+    assert set(receipt["images"]) == {"linuxbrew"}
+    image = receipt["images"]["linuxbrew"]
+    assert image["built"] is False
+    assert set(image["hosts"]) == {target}
+    assert image["transport_archive"]["zstd"]["level"] == 19
+    assert image["transport_archive"]["zstd"]["long"] == 31
+    assert image["transport_archive"]["path"].endswith(".docker.tar.zst")
+    assert (
+        sum(command.phase == "images.save-compressed" for command in recorder.commands)
+        == 1
+    )
+    assert (
+        sum(command.phase == "images.sync-compressed" for command in recorder.commands)
+        == 1
+    )
+    assert all(
+        command.phase != "images.foundation-build" for command in recorder.commands
+    )
+
+
+def test_foundation_distribution_skips_transfer_and_load_for_authenticated_warm_host(
+    tmp_path: Path,
+) -> None:
+    farm = _farm()
+    farm.data["runtime_image"]["id"] = GOOD_ID
+    farm.data["runtime_image"]["closure_sha256"] = GOOD_IDENTITY.closure_sha256
+    target = next(
+        name for name, host in farm.hosts.items() if "F" in host["roles_allowed"]
+    )
+    recorder = RecordingTransport(ScriptedRecorder(warm_hosts={target}))
+    receipt = build_and_distribute_foundations(
+        farm,
+        repo=REPO,
+        output=tmp_path / "foundations.json",
+        target_hosts={"runtime": [target]},
+        recorder=recorder,
+    )
+    assert receipt["images"]["runtime"]["hosts"][target]["closure_sha256"] == (
+        GOOD_IDENTITY.closure_sha256
+    )
+    assert (
+        sum(
+            command.phase == "images.inspect-host-cached"
+            for command in recorder.commands
+        )
+        == 1
+    )
+    assert all(
+        command.phase not in {"images.sync-compressed", "images.load-compressed"}
+        for command in recorder.commands
+    )
+
+
+def test_foundation_cached_native_id_may_differ_when_portable_closure_matches(
+    tmp_path: Path,
+) -> None:
+    farm = _farm()
+    farm.data["runtime_image"]["id"] = GOOD_ID
+    farm.data["runtime_image"]["closure_sha256"] = GOOD_IDENTITY.closure_sha256
+    recorder = RecordingTransport(ScriptedRecorder(hub_id=BAD_ID))
+
+    receipt = build_and_distribute_foundations(
+        farm,
+        repo=REPO,
+        output=tmp_path / "foundations.json",
+        target_hosts={"runtime": []},
+        recorder=recorder,
+    )
+
+    assert receipt["images"]["runtime"]["hub_id"] == BAD_ID
+    assert receipt["images"]["runtime"]["built"] is False
+    assert all(
+        command.phase != "images.foundation-build" for command in recorder.commands
+    )
+
+
+def test_foundation_targets_select_runtime_for_sf_and_one_environment_per_c() -> None:
+    targets = foundation_targets_for_scenario(
+        {
+            "instances": [
+                {"name": "S1", "role": "S", "host": "q3"},
+                {"name": "F1", "role": "F", "host": "q2"},
+                {
+                    "name": "C1",
+                    "role": "C",
+                    "host": "q3",
+                    "client_environment": "conan-gcc",
+                },
+                {
+                    "name": "C2",
+                    "role": "C",
+                    "host": "q2",
+                    "client_environment": "linuxbrew",
+                },
+            ]
+        }
+    )
+    assert targets == {
+        "conan-gcc": ["q3"],
+        "linuxbrew": ["q2"],
+        "runtime": ["q2", "q3"],
+    }
+
+
+def test_default_foundation_targets_cover_stable_runtime_and_all_four_clients() -> None:
+    farm = _farm()
+
+    targets = foundation_targets_for_farm(farm)
+
+    runtime_hosts = sorted(
+        name
+        for name, host in farm.hosts.items()
+        if set(host["roles_allowed"]).intersection(("S", "F"))
+    )
+    client_hosts = sorted(
+        name for name, host in farm.hosts.items() if "C" in host["roles_allowed"]
+    )
+    assert targets["runtime"] == runtime_hosts
+    assert set(targets) == {"runtime", *farm.data["client_environments"]}
+    assert all(targets[key] == client_hosts for key in farm.data["client_environments"])
+
+
+def test_farmtest_foundations_cli_uses_scenario_specific_targets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_build(farm, *, repo, output, target_hosts):
+        observed.update(repo=repo, output=output, target_hosts=target_hosts)
+        return {"schema": "icefarm-foundation-images-v1", "images": {}}
+
+    monkeypatch.setattr(farmtest, "build_and_distribute_foundations", fake_build)
+    output = tmp_path / "foundations.json"
+    rc = farmtest.main(
+        [
+            "images",
+            "--farm",
+            str(INTEGRATION / "farm.example.json"),
+            "--foundations",
+            "--scenario",
+            str(INTEGRATION / "scenarios" / "S00-smoke.json"),
+            "--repo",
+            str(REPO),
+            "--output",
+            str(output),
+        ]
+    )
+    assert rc == 0
+    assert observed == {
+        "output": output,
+        "repo": REPO,
+        "target_hosts": {
+            "debian-gcc": ["tt-quietbox3"],
+            "runtime": ["tt-quietbox2", "tt-quietbox3"],
+        },
+    }

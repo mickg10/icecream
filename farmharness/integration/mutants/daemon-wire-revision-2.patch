@@ -1,0 +1,26 @@
+diff --git a/cache/protocol50.h b/cache/protocol50.h
+index 15cf111..75d1759 100644
+--- a/cache/protocol50.h
++++ b/cache/protocol50.h
+@@ -107,7 +107,7 @@ struct Digest128Hash {
+
+ // CacheWire has its own revision space.  The ordinary Icecream connection
+ // remains protocol 50; revision 1 is the first deployable CacheWire shape.
+-constexpr uint16_t kP50WireRevision = 1;
++constexpr uint16_t kP50WireRevision = 2;
+ constexpr uint32_t kInitialMaxFramePayload = 1U << 20;
+ // TX_BEGIN is the largest fixed-size mandatory V1 control payload.
+ constexpr uint32_t kMandatoryControlFramePayload = 116;
+diff --git a/services/comm.h b/services/comm.h
+index f4933df..ec4283e 100644
+--- a/services/comm.h
++++ b/services/comm.h
+@@ -567,7 +567,7 @@ const int NODE_FEATURE_ENV_ZSTD = ( 1 << 1 );
+ /* CacheWire has a revision space independent of the ordinary Icecream link.
+    Revision 1 is the first deployable shape; ordinary peers still negotiate
+    Icecream protocol 50 before these fields are present. */
+-inline constexpr uint32_t CACHE_WIRE_REVISION = 1;
++inline constexpr uint32_t CACHE_WIRE_REVISION = 2;
+
+ /* Raw four-byte transition witness sent by the F sidecar only after it has
+    accepted ownership of the detached ordinary socket.  This is not an

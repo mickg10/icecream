@@ -1,0 +1,14 @@
+{
+  "schema": "icefarm-suite-v1",
+  "id": "twobuild",
+  "scenarios": ["S80-p29v1", "S80-zstd-tu", "S80-zstd-route", "S80-legacy"],
+  "performance": {
+    "kind": "s80",
+    "arms": {
+      "P29V1": "S80-p29v1",
+      "ZSTD_TU": "S80-zstd-tu",
+      "ZSTD_ROUTE": "S80-zstd-route",
+      "legacy": "S80-legacy"
+    }
+  }
+}

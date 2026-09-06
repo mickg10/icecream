@@ -1,0 +1,41 @@
+diff --git a/cache/p50_endpoint.cpp b/cache/p50_endpoint.cpp
+index 0000000..0000000 100644
+--- a/cache/p50_endpoint.cpp
++++ b/cache/p50_endpoint.cpp
+@@ -20,6 +20,7 @@
+ #include <array>
+ #include <atomic>
+ #include <cerrno>
++#include <cstdlib>
+ #include <chrono>
+ #include <fcntl.h>
+ #include <limits>
+@@ -4022,11 +4022,28 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
+         Frame hello_frame = co_await async_read_frame(
+             socket, impl_->caps.wire.max_frame_payload,
+             impl_->stamp(session, AsyncOperationKind::ReadHeader), impl_->completions, verify);
+         SessionHello hello = decode_as<SessionHello>(hello_frame);
+         if (expected_c_store_guid.has_value() &&
+             hello.c_store_guid != *expected_c_store_guid)
+             throw std::invalid_argument(
+                 "SESSION_HELLO differs from the adopted P5CO claim");
++        // S30 integration mutant: retain the normal LOGIN advertisement, then
++        // refuse every authenticated P50 session after receiving SESSION_HELLO.
++        if (const char* trace_path = std::getenv("ICECC_P50_S30_MUTANT_TRACE");
++            trace_path != nullptr && *trace_path != '\0') {
++            const std::string record =
++                "{\"schema\":\"icefarm-s30-mutant-f-refusal-v1\","
++                "\"refusal\":\"p50-session-refused\","
++                "\"wire_revision\":" + std::to_string(hello.wire_revision) +
++                ",\"supported_profiles\":" +
++                std::to_string(hello.supported_profiles) + "}\n";
++            const int fd = ::open(trace_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
++            if (fd >= 0) {
++                (void)::write(fd, record.data(), record.size());
++                (void)::close(fd);
++            }
++        }
++        throw std::invalid_argument("S30 mutant F refuses P50 session");
+         result.c_store_guid = hello.c_store_guid;
+         reply_cap = std::min(reply_cap, hello.limits.max_frame_payload);
+         const SessionSelection selection =

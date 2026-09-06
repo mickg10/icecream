@@ -6,7 +6,14 @@
   "registry": {
     "host": "tt-quietbox3",
     "port": 5000,
-    "mode": "auto"
+    "mode": "save-load"
+  },
+  "image_transport": {
+    "codec": "zstd",
+    "level": 19,
+    "long": 31,
+    "threads": 8,
+    "checksum": true
   },
   "netname_prefix": "icefarm",
   "port_range": [23000, 23999],
@@ -61,16 +68,134 @@
       "repeat": 2,
       "manifest": "/tanksmall/scratch/ictmp/corpus7/manifest.txt",
       "manifest_sha256": "c362761c3a7e45af984ffd561c772783ab4f27efda7eb6f24afd84223e8233d0",
-      "root": "/tanksmall/scratch/ictmp/corpus7/CMakeFiles"
+      "root": "/tanksmall/scratch/ictmp/corpus7/CMakeFiles",
+      "compression": {"codec": "zstd", "level": 19, "long": 31, "threads": 8, "checksum": true},
+      "archives": {
+        "files": {
+          "archive": "/tanksmall/scratch/ictmp/experiments/icecream/integration/corpora/fmt-100-files-zstd19-long31-v1.tar.zst",
+          "archive_bytes": 744162,
+          "archive_sha256": "522456e2fadbd0262732281e7beb49ad7bc4ef51c55a238295fcb324ef72d971",
+          "authority_sha256": "acfaca997e1fc7db4b040d2858ba54dc0c5fc15e433a2762ada0e80ff2ec43d3",
+          "files": 50,
+          "manifest_sha256": "52d163000a558dad8e9f893809e2b3c3ade347bf6705dee7e61ad78299b8b39d",
+          "unpacked_bytes": 136350082
+        }
+      },
+      "compiler_recipes": {
+        "debian-gcc": {
+          "executable": "/usr/bin/g++",
+          "binary_sha256": "dd91977c184e327710578363ad93ebb175c3a457b6236b874fd3911b7c055c65",
+          "configuration_sha256": "30d282954b70763ea287fcefdd07dae11ebe12b056d56605f8d59fa732d40991",
+          "version": "g++ (Debian 12.2.0-14+deb12u1) 12.2.0",
+          "arguments": ["-O2", "-fdiagnostics-color=never"]
+        }
+      }
     },
     "firefox-1000": {
       "kind": "tu-manifest",
       "tus": 1000,
-      "turn_a_manifest": "/tanksmall/scratch/ictmp/experiments/icecream/p29v1-final-matrix-root-20260903/turnA.manifest",
-      "turn_b_manifest": "/tanksmall/scratch/ictmp/experiments/icecream/p29v1-final-matrix-root-20260903/turnB.manifest",
-      "normalized_manifest_sha256": "fa5db2c4609ddcbeaa22f4f3dc471d6870be165dae6427ea7dffb058a676404e",
-      "pair_index_sha256": "6c97c19991cc2ff78cfb0d52272e4ef5d8fc6c1455952e35bc44a05c2d069c44",
-      "root": "/tanksmall/scratch/ictmp/src3/gecko-dev"
+      "turn_a_manifest": "/tanksmall/scratch/ictmp/experiments/icecream/integration/corpora/firefox-compile-valid-1000-20260905T100313Z/turnA.manifest",
+      "turn_b_manifest": "/tanksmall/scratch/ictmp/experiments/icecream/integration/corpora/firefox-compile-valid-1000-20260905T100313Z/turnB.manifest",
+      "normalized_manifest_sha256": "4e8ef6e7c4dd70a0f5918f3a6e3e17e20c20f10eeca78f118fd78a965984ccc3",
+      "pair_index_sha256": "6c1f69a411c4d3260b43d66060b1f987010a01f2f6887ed073b51e47d6d36619",
+      "authority_receipt": {
+        "path": "/tanksmall/scratch/ictmp/experiments/icecream/integration/corpora/firefox-compile-valid-1000-20260905T100313Z/authority.json",
+        "sha256": "b43b5e72bcc23f744fd881dcc64cd71e7d10721af9e1b32fdcb1764f8fed2f0d"
+      },
+      "root": "/tanksmall/scratch/ictmp/src3/gecko-dev",
+      "compression": {"codec": "zstd", "level": 19, "long": 31, "threads": 8, "checksum": true},
+      "archives": {
+        "A": {
+          "archive": "/tanksmall/scratch/ictmp/experiments/icecream/integration/corpora/firefox-compile-valid-1000-archives-20260905T1025Z/firefox-1000-A-zstd19-long31-v1.tar.zst",
+          "archive_bytes": 12537423,
+          "archive_sha256": "33316d5cc37f6c6b9414550fc375dab10cc99f59b29506eb7a92e807298a9255",
+          "authority_sha256": "ef8f64ac4dd7a0d7468c958bdb7fa0d830ac64b1294acb6e5f06e034d7f02882",
+          "files": 1000,
+          "manifest_sha256": "f6ed09699d187bf499d6fd28eb5947eba252101877cd88776c61427726f29f3d",
+          "unpacked_bytes": 4375268540
+        },
+        "B": {
+          "archive": "/tanksmall/scratch/ictmp/experiments/icecream/integration/corpora/firefox-compile-valid-1000-archives-20260905T1025Z/firefox-1000-B-zstd19-long31-v1.tar.zst",
+          "archive_bytes": 12535229,
+          "archive_sha256": "5c13b613238c57a90ce213dfae62dc1270c3bdf194e34e026422b7b0359ae429",
+          "authority_sha256": "1bd6403b9f5f4553783ad67c028cc46abe34783abd1647fa46d97b21f2415608",
+          "files": 1000,
+          "manifest_sha256": "9393a5198514464c0171565195f7e416824a40af74f18ff842e2bca423ee415f",
+          "unpacked_bytes": 4375269157
+        }
+      },
+      "compiler_recipes": {
+        "fedora-clang-libcxx": {
+          "executable": "/tanksmall/MICKG2/mickg/miniconda3/envs/clang21/bin/clang++",
+          "binary_sha256": "dd5bb93311545d121dae93e31b3958aba449e97415d02c35a3391c0e4662bf93",
+          "configuration_sha256": "72e2012f05218d8237ed2a6fe284d873feae7b69b1dfdc0c0b9d56d950a320bb",
+          "version": "clang version 21.1.8 (https://github.com/conda-forge/clangdev-feedstock 9a0c00c7abbcade892ea988cb6239816cc91d7fc)",
+          "arguments": ["-O2", "-fdiagnostics-color=never"],
+          "toolchain": {
+            "archive": "/tanksmall/scratch/ictmp/experiments/icecream/integration/toolchains/clang21-conda-21.1.8-full-zstd19-long31-v1.tar.zst",
+            "archive_bytes": 264898201,
+            "archive_sha256": "f3f93d9b31d3df3f3261063ce9d9a80f1c2d9319904f5bd6f64fca011877cd1b",
+            "compression": {"codec": "zstd", "level": 19, "long": 31, "threads": 8, "checksum": true},
+            "mount": "/tanksmall/MICKG2/mickg/miniconda3/envs/clang21",
+            "unpacked_bytes": 2718868255
+          }
+        }
+      }
+    }
+  },
+  "runtime_image": {
+    "reference": "icecream/farm-node:ubuntu22-gcc11-boost174",
+    "id": "sha256:fe001a6138f017608b8846b43bf268a76a9d7a5b66c3364ba3f881da2ff0c54b",
+    "closure_sha256": "4d7755577d3dba476eae03cb51f278fe87ea10e775f410bdf330227c480d4cab",
+    "dockerfile": "farmharness/integration/docker/Dockerfile.node"
+  },
+  "system_source_snapshots": {
+    "stable-f-source": {
+      "schema": "icefarm-system-source-snapshot-v1",
+      "source": "runtime",
+      "source_runtime_reference": "icecream/farm-node:ubuntu22-gcc11-boost174",
+      "source_runtime_id": "sha256:fe001a6138f017608b8846b43bf268a76a9d7a5b66c3364ba3f881da2ff0c54b",
+      "source_runtime_closure_sha256": "4d7755577d3dba476eae03cb51f278fe87ea10e775f410bdf330227c480d4cab",
+      "manifest_sha256": "be0d9026e7fc6235382a628a13f0ecc1f5e9c4f4e0d18eea9ab750df08cdb66c",
+      "file_count": 16819,
+      "enumeration": {
+        "schema": "icefarm-system-source-manifest-v1",
+        "roots": ["/usr/include", "/usr/lib/gcc", "/usr/local/include"],
+        "symlink_policy": "no-directory-follow;regular-file-symlinks-regularized"
+      },
+      "archive": {
+        "path": "/tanksmall/scratch/tmp/system-source-capture-tAkYk3/archives/system-source-be0d9026e7fc6235382a628a13f0ecc1f5e9c4f4e0d18eea9ab750df08cdb66c.tar.zst",
+        "sha256": "ee52009cded8fcbe9ca9490dc50942b00fc43c786f2113001de5f1c62094a5f6",
+        "archive_bytes": 42426888,
+        "unpacked_bytes": 277530174,
+        "compression": {"codec": "zstd", "level": 19, "long": 31, "threads": 8, "checksum": true}
+      }
+    }
+  },
+  "client_environments": {
+    "conan-gcc": {
+      "reference": "ice-ii/conan-gcc:v2-p50",
+      "id": "sha256:73c0d2615acbdac51a124ca3a2a80c844e77383e67c497c7c2dd4c04fa74c60c",
+      "closure_sha256": "4d726c7c69086eda12d8d26bfbb262521590aa391de9a7f71c1fc99e273cd797",
+      "dockerfile": "farmharness/integration/docker/environments/Dockerfile.conan-gcc-p50"
+    },
+    "debian-gcc": {
+      "reference": "ice-ii/debian-gcc:v2-p50",
+      "id": "sha256:bf56e3397c20fc68260df088edaeaf9974c08bea93c2a1f48d266736663607e2",
+      "closure_sha256": "87a5cfd71a4e14fffcf3ff360252cb72c4935ce406659e7e1df68ebdea800fd2",
+      "dockerfile": "farmharness/integration/docker/environments/Dockerfile.debian-gcc-p50"
+    },
+    "fedora-clang-libcxx": {
+      "reference": "ice-ii/fedora-clang-libcxx:v2-p50",
+      "id": "sha256:eb4a1219832900a5b9d7e5189dbfa277699550906c6b70b26020c7dbfabf5f96",
+      "closure_sha256": "abb21108e4ef9fc9ee6251d4f1eff6ffa04d7240f7e5a5a56eb464664bd01da5",
+      "dockerfile": "farmharness/integration/docker/environments/Dockerfile.fedora-clang-libcxx-p50"
+    },
+    "linuxbrew": {
+      "reference": "ice-ii/linuxbrew:v2-p50",
+      "id": "sha256:372ce4991b5f35082fff0fbfe7711718572410120a2d35adf91248092399c84d",
+      "closure_sha256": "c678308d5674fbab9efbd23e8280b82c8f1e48534a5b912e370ece00f213f41a",
+      "dockerfile": "farmharness/integration/docker/environments/Dockerfile.linuxbrew-p50"
     }
   },
   "protected": {
@@ -86,21 +211,21 @@
     },
     "role_stores": {
       "43": {
-        "scheduler": {"sha256": "0000000000000000000000000000000000000000000000000000000000000000"},
-        "client": {"sha256": "0000000000000000000000000000000000000000000000000000000000000000"},
-        "daemon": {"sha256": "0000000000000000000000000000000000000000000000000000000000000000"}
+        "scheduler": {"sha256": "5e85c16a12e33cc27900dab351a997fa49f801b89612272ffae9710e26372fb7"},
+        "client": {"sha256": "02b66cc29cd9431b410b443e1f5c1650d93f9ac7407e52cdd399c7c4e5bd34b3"},
+        "daemon": {"sha256": "d784931378fbba8464541a11fd4557aa47fff528159482350b4b5e27be3741ab"}
       },
       "50": {
-        "scheduler": {"sha256": "0000000000000000000000000000000000000000000000000000000000000000"},
-        "client": {"sha256": "7fbf55c83e9ff94ea80996e153f16f539b5d186cd51b119877d8013aca89d983"},
-        "daemon": {"sha256": "0000000000000000000000000000000000000000000000000000000000000000"}
+        "scheduler": {"sha256": "66538ee622fa4cea4684f4f38e816ad2458cf2f77b32a2a9a306998cd195cef6"},
+        "client": {"sha256": "e6412e9e7c68b60575f82934e421656a4cdff94e79b1b22ee817c56ef68730c7"},
+        "daemon": {"sha256": "4cc93666e5418e33a6a4c18353b8988af4d99f7913165fa72e405a01aada6493"}
       }
     },
     "images": {
       "p43-1.4.0": {
         "commit": "cd74801e0fa4e83e3ae254ca1d7fe98642f36b89",
         "archive_sha256": "c0f95d5f3729972acb6522746c847aa88419a0021f43f6cc1de7ba71bbe02ccd",
-        "closure_sha256": "dfda517d43efa92b1045113e308e780937b96d9cd9db1044c3e5bb1864bb59ff"
+        "closure_sha256": "472537d8f88ed3c0b79722087cf9013e84468cc9be3bede30cac0f7e2884c3d7"
       },
       "p50-4c994915": {
         "commit": "4c99491560709e16860e346762aa297316412648",
@@ -117,15 +242,85 @@
         "archive_sha256": "692e83d3fdbff23d006d2ced3e9e71d3bdd54ec213cdbcd2f8d855033e0c7389",
         "closure_sha256": "645215ca0bcb76af5a991dd5632936bbc11cb7a7845c13ed5a97b0a06b4c9471"
       },
+      "p50s2-5b2e5801": {
+        "commit": "5b2e58018e1c044b37438e8fe823538847faacc6",
+        "archive_sha256": "690877d3b00307dc428d3e24f503a28fb694c801864c8f232dfe2ffdd42b315d",
+        "closure_sha256": "34a07a4fe090c3e58812785e7d207e5f1d597e95a6828090b7751e56339defb5"
+      },
       "p50s2-6d38d448": {
         "commit": "6d38d448abfcaab2ff8877f74e19e8bfe9061b3d",
         "archive_sha256": "59162154e8996ad9fbf82bf3baea4101d382e8e2a0b6b7512509140df6a77f75",
         "closure_sha256": "23108e97dbc5b786b39e6c6c28220af454cd2cf5bc67728f52590ea93e50a855"
+      },
+      "p50s4-0a4ab0c0": {
+        "commit": "0a4ab0c0781167b9c362239f156390b026932c11",
+        "archive_sha256": "1a2d00c8732f9ecbee9aa6bdf31302c66962364649024a29f5f5adfaeee82788",
+        "closure_sha256": "c765a877023db5eb46278a5b650956aedd2edbf7dbae7fe8fa1d90d5bae14b5b",
+        "id": "sha256:b4663698234f1de242817b4ac887f6e1c402f9343b011a1c0a812b3ba9bbf1b0"
+      },
+      "p50s4-89917385": {
+        "commit": "8991738525d2d34aaafeabeb6ef6790daa79fdfe",
+        "archive_sha256": "1304508377aa9e61484085925b75823acfe52d0b3bbc6921e0de3f84a7973287",
+        "closure_sha256": "b9518e23f56ce9ea4d0ce33a8c3e486c07f10803d096e0848aeb01cecd3dd380",
+        "id": "sha256:8970739d0550b2a26a651e814f5e05dd5629e8f4ce49f84a8eed036665e1b293"
+      },
+      "p50s4-b42d65e8": {
+        "commit": "b42d65e8ac9e90e05ee6d3a19cd371a40dad3277",
+        "archive_sha256": "cf40a12d679d3e8b06e8df8b2f336127f69a4e1b46995e4bb8546de0ec742b98",
+        "cache_wire_revision": 1,
+        "closure_sha256": "795c01eb6689428c55a54c11b369260d3b9fa614b6d21cc610170c691fc4b924",
+        "id": "sha256:a165c221bd7fb920286d60e2d7a1167018784469c9afc7134eebb3dfc5bd2298"
+      },
+      "p50s90-f-revision-2-candidate": {
+        "kind": "daemon-mutant",
+        "base_image": "p50s4-b42d65e8",
+        "base_commit": "b42d65e8ac9e90e05ee6d3a19cd371a40dad3277",
+        "base_archive_sha256": "cf40a12d679d3e8b06e8df8b2f336127f69a4e1b46995e4bb8546de0ec742b98",
+        "commit": "b42d65e8ac9e90e05ee6d3a19cd371a40dad3277",
+        "archive_sha256": "a53a3313e4602bd0959d469edd498bfdc5e5138fca725996748d314869a5c2cd",
+        "cache_wire_revision": 2,
+        "patch_path": "mutants/daemon-wire-revision-2.patch",
+        "patch_sha256": "76fbed8c13d3836253444130502511949bc359f0c5228c241d318a1a125461e7",
+        "recipe_schema": "icefarm-daemon-mutant-recipe-v1",
+        "recipe_sha256": "a53a3313e4602bd0959d469edd498bfdc5e5138fca725996748d314869a5c2cd"
+      },
+      "p50s30-f-refusal-mutant-candidate": {
+        "kind": "daemon-mutant",
+        "base_image": "p50s4-89917385",
+        "base_commit": "8991738525d2d34aaafeabeb6ef6790daa79fdfe",
+        "base_archive_sha256": "1304508377aa9e61484085925b75823acfe52d0b3bbc6921e0de3f84a7973287",
+        "commit": "8991738525d2d34aaafeabeb6ef6790daa79fdfe",
+        "archive_sha256": "ccce2ac2cded430786714d324908ff9374afcd695d625e4fbc61d69184294e56",
+        "patch_path": "mutants/daemon-session-refuse.patch",
+        "patch_sha256": "4b1963c4081e2d0f20800db53363940c1ebea128ccdb3665691b270224a7306c",
+        "recipe_schema": "icefarm-daemon-mutant-recipe-v1",
+        "recipe_sha256": "ccce2ac2cded430786714d324908ff9374afcd695d625e4fbc61d69184294e56"
+      },
+      "p50s4-h3-tail-mutant": {
+        "kind": "scheduler-mutant",
+        "base_image": "p50s4-89917385",
+        "base_commit": "8991738525d2d34aaafeabeb6ef6790daa79fdfe",
+        "base_archive_sha256": "1304508377aa9e61484085925b75823acfe52d0b3bbc6921e0de3f84a7973287",
+        "commit": "8991738525d2d34aaafeabeb6ef6790daa79fdfe",
+        "archive_sha256": "72e6684a98ba3dc68d7938ec0e8ca4ac8a1baf556a1d261279b3bb4568ad3cd5",
+        "closure_sha256": "88f255ab69b8854adf63d384667dbc011600f5c71e9ca66ac27d9e342ee10f68",
+        "id": "sha256:c4635b19f9b763c644a7fe216374330001555684b9f70b921c572c940a483770",
+        "patch_path": "mutants/scheduler-tail.patch",
+        "patch_sha256": "f927430b26f76dd6a23c0045eb8abdd93b0e1a69ca11588ab46346ade0804ebd",
+        "recipe_schema": "icefarm-scheduler-mutant-recipe-v1",
+        "recipe_sha256": "72e6684a98ba3dc68d7938ec0e8ca4ac8a1baf556a1d261279b3bb4568ad3cd5",
+        "role_overrides": {
+          "scheduler": {
+            "sha256": "1b451a18a9ff6b0ed6dc4e4ef2551b4482c71352def2cfb819d01f107bc20fa0"
+          }
+        }
       }
     },
     "topologies": {
       "C1F1": {"f_relationships": 1, "slots_per_f": 24},
-      "C1F2": {"f_relationships": 2, "slots_per_f": 24}
+      "C1F2": {"f_relationships": 2, "slots_per_f": 24},
+      "C2F2": {"f_relationships": 2, "slots_per_f": 24},
+      "C2F9": {"f_relationships": 9, "slots_per_f": 4}
     }
   }
 }

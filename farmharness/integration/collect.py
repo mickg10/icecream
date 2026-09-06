@@ -9,6 +9,7 @@ import re
 import shutil
 from collections import Counter, defaultdict
 from collections.abc import Mapping
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,13 @@ try:
     from .farm_spec import FarmSpec
     from .images import CommandFactory, RecordingTransport
     from .lifecycle import bundle_root, collect_diagnostics
+    from .layout import instance_root
+    from .mutant import (
+        MUTANT_TRACE_PATH,
+        MutantError,
+        parse_h3_client_rejections,
+        validate_h3_trace,
+    )
     from .remote import PlannedCommand, RemoteError, docker_argv
     from .scenario_spec import ScenarioSpec
     from .schema_validation import canonical_bytes
@@ -24,6 +32,13 @@ except ImportError:  # Direct execution from this directory.
     from farm_spec import FarmSpec
     from images import CommandFactory, RecordingTransport
     from lifecycle import bundle_root, collect_diagnostics
+    from layout import instance_root
+    from mutant import (
+        MUTANT_TRACE_PATH,
+        MutantError,
+        parse_h3_client_rejections,
+        validate_h3_trace,
+    )
     from remote import PlannedCommand, RemoteError, docker_argv
     from scenario_spec import ScenarioSpec
     from schema_validation import canonical_bytes
@@ -31,6 +46,29 @@ except ImportError:  # Direct execution from this directory.
 
 
 SOURCE_RESULT_SCHEMA = "icecream-p50-source-result-v1"
+P29_INTERNER_FAULT_SCHEMA = "icecream-p50-fault-v1"
+P29_INTERNER_FAULT = "p29-interner-fail-once"
+P29_INTERNER_FAULT_OUTCOME = "fired"
+P29_INTERNER_FAULT_FIELDS = frozenset(("schema", "fault", "outcome"))
+LEGACY_WIRE_SCHEMA = "icecream-p50-legacy-wire-v1"
+LEGACY_WIRE_FIELDS = frozenset(
+    {
+        "schema",
+        "role",
+        "job_id",
+        "assignment_epoch",
+        "assignment_nonce",
+        "c_guid",
+        "tu_seq",
+        "c_to_f_sent_bytes",
+        "c_to_f_received_bytes",
+        "f_to_c_sent_bytes",
+        "f_to_c_received_bytes",
+    }
+)
+COMPILE_IDENTITY_FIELDS = frozenset(
+    {"record", "job_id", "assignment_epoch", "assignment_nonce", "c_guid", "tu_seq"}
+)
 COLLECT_SCHEMA = "icefarm-collect-v1"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 PROFILE_RE = re.compile(
@@ -41,10 +79,36 @@ ATTACH_RE = re.compile(
     r"\bP50 CompileFile attached exact (P29V1|ZSTD_TU|ZSTD_ROUTE) input for job ([0-9]+)\b"
 )
 LOGIN_RE = re.compile(r"\bRELOGIN ([A-Za-z0-9][A-Za-z0-9._-]*)\([^)]*\):.*$")
+ROLE_LOGIN_RE = re.compile(
+    r"\blogin\s+([A-Za-z0-9][A-Za-z0-9._-]*)\s+protocol\s+version:\s*([0-9]+)\b"
+)
 CACHE_LOGIN_RE = re.compile(
     r"\bcache=([^ ]+) cache_wire=v([0-9]+) cache_protocol=([0-9]+) "
     r"cache_profiles=([a-z0-9_ ]+)\s*$"
 )
+WARM_HINT_OVERRIDE_RE = re.compile(
+    r"\bP50_WARM_HINT_OVERRIDE job=([0-9]+) warm=([0-9]+) "
+    r"compatible_free=([0-9]+) idle_excluded=([0-9]+)$"
+)
+CLIENT_ASSIGNMENT_RE = re.compile(r"\bHave to use host ([^ ]+) - Job ID: ([0-9]+)\b")
+LOG_TIMESTAMP_RE = re.compile(
+    r"\b([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}):"
+)
+SCHEDULER_LINE_RE = re.compile(
+    r"^\[[^]\r\n]+\]\s+"
+    r"([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}):\s+(.*)$"
+)
+SCHEDULER_START_RE = re.compile(r"^ICECREAM scheduler .* starting up, port [0-9]+$")
+DAEMON_START_RE = re.compile(r"ICECREAM daemon .* starting up")
+READINESS_SCHEDULER_RE = re.compile(r"ICECREAM scheduler .* starting up, port [0-9]+")
+CACHE_READY_RE = re.compile(r"cache sidecar adapter state=2 lifecycle=3")
+SCHEDULER_NEW_RE = re.compile(r"^NEW ([0-9]+) client=([A-Za-z0-9][A-Za-z0-9._-]*)\b")
+SCHEDULER_DISPATCH_RE = re.compile(
+    r"^put ([0-9]+) in joblist of ([A-Za-z0-9][A-Za-z0-9._-]*)\b"
+)
+SCHEDULER_BEGIN_RE = re.compile(r"^BEGIN: ([0-9]+)\b")
+SCHEDULER_END_RE = re.compile(r"^END ([0-9]+) status=(-?[0-9]+)\b")
+SCHEDULER_STOP_RE = re.compile(r"^STOP \((WAITFORCS|DAEMON|DAEMON2)\) FOR ([0-9]+)\b")
 SOURCE_RESULT_FIELDS = frozenset(
     {
         "schema",
@@ -58,8 +122,11 @@ SOURCE_RESULT_FIELDS = frozenset(
         "attempts",
         "tu_seq",
         "raw_bytes",
+        "raw_digest",
         "c_to_f_bytes",
         "f_to_c_bytes",
+        "source_mutex_wait_ns",
+        "source_mutex_service_ns",
         "system_source_reuse",
     }
 )
@@ -69,8 +136,30 @@ PROFILE_LABELS = {
     "zstd_route": "ZSTD_ROUTE",
 }
 GENERATED_ROOT_FILES = frozenset(
-    ("bundle.json", "SHA256SUMS", "verdict.json", "EVIDENCE.md", "witness.json", "down.json")
+    (
+        "bundle.json",
+        "SHA256SUMS",
+        "verdict.json",
+        "control-verdict.json",
+        "EVIDENCE.md",
+        "witness.json",
+        "down.json",
+    )
 )
+REFUSAL_MODE = "preflight-refusal"
+CONTROL_FAILURE_MODE = "control-failure"
+EVENT_GATE_SCHEMA = "icefarm-event-gate-v1"
+SCHEDULER_RESTART_SCHEMA = "icefarm-scheduler-restart-v1"
+CLIENT_ROUTE_RESTART_SCHEMA = "icefarm-client-route-restart-v1"
+WORKER_RESTART_SCHEMA = "icefarm-worker-restart-v1"
+CLIENT_ROUTE_SIGNAL_SCHEMA = "icefarm-client-route-signal-v1"
+HEADER_EDIT_SCHEMA = "icefarm-header-edit-v1"
+DISK_FILL_SCHEMA = "icefarm-disk-fill-v1"
+CACHE_DISK_FAULT_PATH = "/var/cache/icecream"
+CACHE_DISK_FAULT_FILE = "/var/cache/icecream/.icefarm-disk-fill"
+CACHE_DISK_FAULT_BYTES = 128 * 1024 * 1024
+CACHE_DISK_FAULT_MIN_HEADROOM_BYTES = 8 * 1024 * 1024
+DISK_FILL_WATCHDOG_S = 30
 
 
 class CollectError(RuntimeError):
@@ -149,7 +238,9 @@ def _copy_tree(source: Path, destination: Path) -> None:
     if not source.is_dir() or source.is_symlink():
         raise CollectError(f"evidence directory is absent or unsafe: {source}")
     if destination.exists():
-        raise CollectError(f"immutable evidence destination already exists: {destination}")
+        raise CollectError(
+            f"immutable evidence destination already exists: {destination}"
+        )
     try:
         shutil.copytree(source, destination, symlinks=True)
     except OSError as exc:
@@ -185,7 +276,11 @@ def _command(
 
 
 def _docker_transport(farm: FarmSpec, host_name: str) -> str:
-    return "docker-context" if farm.hosts[host_name].get("docker_context") else "ssh-docker"
+    return (
+        "docker-context"
+        if farm.hosts[host_name].get("docker_context")
+        else "ssh-docker"
+    )
 
 
 def _snapshot_live_evidence(
@@ -193,6 +288,8 @@ def _snapshot_live_evidence(
     plan: dict[str, Any],
     destination: Path,
     recorder: RecordingTransport,
+    *,
+    stopped_instances: frozenset[str] = frozenset(),
 ) -> None:
     factory = CommandFactory()
     diagnostics = destination / "diagnostics"
@@ -229,10 +326,26 @@ def _snapshot_live_evidence(
                 or not isinstance(container_id, str)
                 or re.fullmatch(r"[0-9a-f]{64}", container_id) is None
             ):
-                raise CollectError(f"container identity is unauthenticated: {host}:{name}")
+                raise CollectError(
+                    f"container identity is unauthenticated: {host}:{name}"
+                )
             container_ids[name] = container_id
             host_diagnostics = diagnostics / host
             host_diagnostics.mkdir(parents=True, exist_ok=True)
+            running = document.get("State", {}).get("Running")
+            if name in stopped_instances:
+                if running is not False:
+                    raise CollectError(
+                        f"event-killed container is unexpectedly running: {host}:{name}"
+                    )
+                _atomic_bytes(host_diagnostics / f"{name}.top", b"")
+                _atomic_json(
+                    host_diagnostics / f"{name}.stats",
+                    {"container_running": False, "reason": "authenticated-kill-event"},
+                )
+                continue
+            if running is False:
+                raise CollectError(f"container stopped without a kill event: {host}:{name}")
             for kind, args in (
                 ("top", ("container", "top", container_id, "-eo", "pid,comm,args")),
                 (
@@ -276,6 +389,8 @@ def _snapshot_live_evidence(
     ):
         host = instance["host"]
         name = instance["name"]
+        if name in stopped_instances:
+            continue
         try:
             recorder.invoke(
                 _command(
@@ -334,7 +449,9 @@ def _snapshot_live_evidence(
             raise CollectError(f"cannot collect {host}:{name}: {exc}") from exc
 
 
-def _snapshot_existing_evidence(root: Path, destination: Path, plan: dict[str, Any]) -> None:
+def _snapshot_existing_evidence(
+    root: Path, destination: Path, plan: dict[str, Any]
+) -> None:
     diagnostics = root / "diagnostics"
     if diagnostics.is_dir():
         _copy_tree(diagnostics, destination / "diagnostics")
@@ -370,9 +487,13 @@ def _load_receipts(root: Path, plan: dict[str, Any]) -> dict[str, dict[str, Any]
     if result["lifecycle"].get("status") != "UP":
         down = root / "down.json"
         if not down.exists() or _read_json(down).get("status") != "DOWN":
-            raise CollectError("collection requires an authenticated UP or completed DOWN run")
+            raise CollectError(
+                "collection requires an authenticated UP or completed DOWN run"
+            )
     if result["lifecycle"].get("plan") != plan:
-        raise CollectError("lifecycle receipt plan differs from the current immutable plan")
+        raise CollectError(
+            "lifecycle receipt plan differs from the current immutable plan"
+        )
     if not str(result["workload"].get("status", "")).startswith("COMPLETE"):
         raise CollectError("workload receipt is not terminal")
     return result
@@ -397,9 +518,22 @@ def _stage_evidence(
         raise CollectError(f"stale collection staging directory exists: {temporary}")
     temporary.mkdir(parents=True)
     try:
+        event_source = root / "events"
+        if event_source.exists():
+            _copy_tree(event_source, temporary / "events")
+        elif scenario.data["timeline"]:
+            raise CollectError("timeline run has no event evidence")
+        events = _event_log(temporary, scenario, farm=farm, plan=plan)
+        stopped_instances = frozenset(
+            event["instance"] for event in events if event["action"] == "kill -9"
+        )
         if sync_remote:
             _snapshot_live_evidence(
-                farm, plan, temporary, recorder or RecordingTransport()
+                farm,
+                plan,
+                temporary,
+                recorder or RecordingTransport(),
+                stopped_instances=stopped_instances,
             )
         else:
             _snapshot_existing_evidence(root, temporary, plan)
@@ -426,10 +560,42 @@ def _instance_results(evidence: Path, name: str) -> Path:
     return result
 
 
-def _source_results(path: Path) -> dict[int, dict[str, Any]]:
-    records: dict[int, dict[str, Any]] = {}
+def _checkpoint_result_path(
+    evidence: Path, client: str, turn: str, relative: str
+) -> Path | None:
+    """Resolve a checkpoint result without traversing symlinked ancestors."""
+
+    parts = relative.split("/")
+    if len(parts) != 3 or parts[0] != "jobs" or parts[2] != "result.tsv":
+        return None
+    if evidence.is_symlink() or not evidence.is_dir():
+        return None
+    current = evidence
+    for component in (
+        "instances",
+        client,
+        "results",
+        "workload",
+        turn,
+        "jobs",
+        parts[1],
+    ):
+        current = current / component
+        if current.is_symlink() or not current.is_dir():
+            return None
+    path = current / "result.tsv"
+    if path.is_symlink() or not path.is_file():
+        return None
+    return path
+
+
+def _source_results(path: Path) -> dict[tuple[int, int, int], dict[str, Any]]:
+    records: dict[tuple[int, int, int], dict[str, Any]] = {}
     for index, item in enumerate(_read_jsonl(path), start=1):
-        if frozenset(item) != SOURCE_RESULT_FIELDS or item.get("schema") != SOURCE_RESULT_SCHEMA:
+        if (
+            frozenset(item) != SOURCE_RESULT_FIELDS
+            or item.get("schema") != SOURCE_RESULT_SCHEMA
+        ):
             raise CollectError(f"{path}:{index}: source-result schema mismatch")
         integers = (
             "wire_job_id",
@@ -442,37 +608,165 @@ def _source_results(path: Path) -> dict[int, dict[str, Any]]:
             "raw_bytes",
             "c_to_f_bytes",
             "f_to_c_bytes",
+            "source_mutex_wait_ns",
+            "source_mutex_service_ns",
         )
-        if any(type(item.get(field)) is not int or item[field] < 0 for field in integers):
+        if any(
+            type(item.get(field)) is not int or item[field] < 0 for field in integers
+        ):
             raise CollectError(f"{path}:{index}: source-result integer is invalid")
         if item["wire_job_id"] == 0 or item["logical_job"] == 0:
             raise CollectError(f"{path}:{index}: source-result job identity is zero")
         if item["status"] > 7 or item["attempts"] > 2:
-            raise CollectError(f"{path}:{index}: source-result status/attempt count is invalid")
+            raise CollectError(
+                f"{path}:{index}: source-result status/attempt count is invalid"
+            )
         if item.get("profile") not in PROFILE_LABELS.values():
             raise CollectError(f"{path}:{index}: source-result profile is invalid")
-        if not isinstance(item.get("c_store_guid"), str) or re.fullmatch(
-            r"[0-9a-f]{32}", item["c_store_guid"]
-        ) is None or item["c_store_guid"] == "0" * 32:
+        if (
+            not isinstance(item.get("c_store_guid"), str)
+            or re.fullmatch(r"[0-9a-f]{32}", item["c_store_guid"]) is None
+            or item["c_store_guid"] == "0" * 32
+        ):
             raise CollectError(f"{path}:{index}: source-result C GUID is invalid")
+        if (
+            not isinstance(item.get("raw_digest"), str)
+            or re.fullmatch(r"[0-9a-f]{32}", item["raw_digest"]) is None
+        ):
+            raise CollectError(f"{path}:{index}: source-result raw digest is invalid")
         reuse = item.get("system_source_reuse")
         if reuse is not None and type(reuse) is not bool:
             raise CollectError(f"{path}:{index}: source-result reuse is invalid")
         if item["profile"] != "P29V1" and reuse is not None:
-            raise CollectError(f"{path}:{index}: non-P29V1 source-result has reuse evidence")
+            raise CollectError(
+                f"{path}:{index}: non-P29V1 source-result has reuse evidence"
+            )
         if item["status"] == 0:
             if item["attempts"] == 0:
-                raise CollectError(f"{path}:{index}: committed source-result has no attempt")
+                raise CollectError(
+                    f"{path}:{index}: committed source-result has no attempt"
+                )
+            if item["raw_digest"] == "0" * 32:
+                raise CollectError(
+                    f"{path}:{index}: committed source-result has no raw digest"
+                )
+            if item["source_mutex_service_ns"] == 0:
+                raise CollectError(
+                    f"{path}:{index}: committed source-result has no mutex service time"
+                )
             if item["c_to_f_bytes"] == 0 or item["f_to_c_bytes"] == 0:
-                raise CollectError(f"{path}:{index}: committed source-result has no wire bytes")
+                raise CollectError(
+                    f"{path}:{index}: committed source-result has no wire bytes"
+                )
             if item["profile"] == "P29V1" and type(reuse) is not bool:
                 raise CollectError(
                     f"{path}:{index}: committed P29V1 result has no reuse witness"
                 )
-        key = item["wire_job_id"]
+        key = (
+            item["wire_job_id"],
+            item["assignment_epoch"],
+            item["assignment_nonce"],
+        )
         if key in records:
-            raise CollectError(f"{path}: duplicate source result for scheduler job {key}")
+            raise CollectError(f"{path}: duplicate source result for assignment {key}")
         records[key] = item
+    return records
+
+
+def _compile_identities(path: Path) -> dict[tuple[int, int, int], dict[str, Any]]:
+    records: dict[tuple[int, int, int], dict[str, Any]] = {}
+    for index, item in enumerate(_read_jsonl(path), start=1):
+        if (
+            frozenset(item) != COMPILE_IDENTITY_FIELDS
+            or item.get("record") != "compile-result-identity"
+        ):
+            raise CollectError(f"{path}:{index}: compile-identity schema mismatch")
+        positive = ("job_id", "assignment_epoch", "assignment_nonce", "c_guid")
+        if any(
+            type(item.get(field)) is not int or item[field] <= 0 for field in positive
+        ):
+            raise CollectError(f"{path}:{index}: compile-identity value is invalid")
+        if type(item.get("tu_seq")) is not int or item["tu_seq"] < 0:
+            raise CollectError(
+                f"{path}:{index}: compile-identity TU sequence is invalid"
+            )
+        key = (item["job_id"], item["assignment_epoch"], item["assignment_nonce"])
+        if key in records:
+            raise CollectError(
+                f"{path}: duplicate compile identity for assignment {key}"
+            )
+        records[key] = item
+    return records
+
+
+def _legacy_wire_results(
+    path: Path, role: str
+) -> dict[tuple[int, int, int], dict[str, Any]]:
+    if role not in ("C", "F"):
+        raise ValueError(f"invalid legacy-wire role {role!r}")
+    records: dict[tuple[int, int, int], dict[str, Any]] = {}
+    for index, item in enumerate(_read_jsonl(path), start=1):
+        if (
+            frozenset(item) != LEGACY_WIRE_FIELDS
+            or item.get("schema") != LEGACY_WIRE_SCHEMA
+            or item.get("role") != role
+        ):
+            raise CollectError(f"{path}:{index}: legacy-wire schema/role mismatch")
+        positive = ("job_id", "assignment_epoch", "assignment_nonce", "c_guid")
+        counters = (
+            "c_to_f_sent_bytes",
+            "c_to_f_received_bytes",
+            "f_to_c_sent_bytes",
+            "f_to_c_received_bytes",
+        )
+        if any(
+            type(item.get(field)) is not int or item[field] <= 0 for field in positive
+        ):
+            raise CollectError(f"{path}:{index}: legacy-wire identity is invalid")
+        if type(item.get("tu_seq")) is not int or item["tu_seq"] < 0:
+            raise CollectError(f"{path}:{index}: legacy-wire TU sequence is invalid")
+        if any(
+            type(item.get(field)) is not int or item[field] < 0 for field in counters
+        ):
+            raise CollectError(f"{path}:{index}: legacy-wire byte count is invalid")
+        sent_field = "c_to_f_sent_bytes" if role == "C" else "f_to_c_sent_bytes"
+        received_field = (
+            "f_to_c_received_bytes" if role == "C" else "c_to_f_received_bytes"
+        )
+        if item[sent_field] == 0 or item[received_field] == 0:
+            raise CollectError(f"{path}:{index}: legacy-wire transfer is incomplete")
+        key = (item["job_id"], item["assignment_epoch"], item["assignment_nonce"])
+        if key in records:
+            raise CollectError(f"{path}: duplicate legacy-wire result for {key}")
+        records[key] = item
+    return records
+
+
+S30_MUTANT_TRACE_SCHEMA = "icefarm-s30-mutant-f-refusal-v1"
+
+
+def _s30_mutant_refusals(path: Path) -> list[dict[str, Any]]:
+    """Read only the daemon's post-hello refusal witness.
+
+    The witness proves that the mutant reached a decoded SessionHello.  Job,
+    assignment, and wire conservation remain independently authenticated by
+    the scheduler/client/F traces below; this file is never accepted on its
+    own as a workload result.
+    """
+
+    fields = {"schema", "refusal", "wire_revision", "supported_profiles"}
+    records = _read_jsonl(path, required=True)
+    for index, item in enumerate(records, start=1):
+        if (
+            set(item) != fields
+            or item.get("schema") != S30_MUTANT_TRACE_SCHEMA
+            or item.get("refusal") != "p50-session-refused"
+            or type(item.get("wire_revision")) is not int
+            or item["wire_revision"] <= 0
+            or type(item.get("supported_profiles")) is not int
+            or item["supported_profiles"] <= 0
+        ):
+            raise CollectError(f"{path}:{index}: invalid S30 refusal witness")
     return records
 
 
@@ -498,11 +792,98 @@ def _one_role_log(evidence: Path, instance: Mapping[str, Any]) -> Path | None:
     role_leaf = {"S": "scheduler.log", "C": "client-daemon.log", "F": "iceccd.log"}[
         str(instance["role"])
     ]
-    root = evidence / "diagnostics" / str(instance["host"])
-    matches = [path for path in root.rglob(role_leaf) if path.is_file() and not path.is_symlink()]
-    if len(matches) > 1:
-        raise CollectError(f"ambiguous {instance['name']} log: {matches!r}")
-    return matches[0] if matches else None
+    path = (
+        evidence
+        / "diagnostics"
+        / str(instance["host"])
+        / f"{instance['name']}.log"
+        / role_leaf
+    )
+    if path.is_symlink():
+        raise CollectError(f"unsafe {instance['name']} log: {path}")
+    if not path.exists():
+        return None
+    if not path.is_file():
+        raise CollectError(f"non-regular {instance['name']} log: {path}")
+    return path
+
+
+def _retained_log_witness(
+    evidence: Path | None,
+    instance: Mapping[str, Any],
+    offset: Any,
+    line: Any,
+) -> bool:
+    """Bind a producer readiness claim to the retained post-offset log bytes."""
+
+    if evidence is None or not (evidence / "diagnostics").is_dir():
+        return True
+    if type(offset) is not int or offset < 0 or not isinstance(line, str):
+        return False
+    path = _one_role_log(evidence, instance)
+    if path is None:
+        return False
+    try:
+        payload = path.read_bytes()
+    except OSError:
+        return False
+    if offset > len(payload):
+        return False
+    return line in payload[offset:].decode("utf-8", "replace").splitlines()
+
+
+def _p29_interner_faults(
+    evidence: Path, topology: list[dict[str, Any]]
+) -> list[dict[str, str]]:
+    """Read exact one-shot P29 fault witnesses from authenticated C logs."""
+
+    records: list[dict[str, str]] = []
+    needle = f'"schema":"{P29_INTERNER_FAULT_SCHEMA}"'
+    for instance in topology:
+        if instance.get("role") != "C":
+            continue
+        path = (
+            evidence
+            / "diagnostics"
+            / str(instance["host"])
+            / f"{instance['name']}.logs"
+        )
+        if path.is_symlink():
+            raise CollectError(f"unsafe {instance['name']} container log: {path}")
+        if not path.exists():
+            continue
+        if not path.is_file():
+            raise CollectError(f"non-regular {instance['name']} container log: {path}")
+        for line_number, line in enumerate(
+            _text(path).splitlines(), start=1
+        ):
+            if P29_INTERNER_FAULT_SCHEMA not in line:
+                continue
+            if needle not in line:
+                raise CollectError(
+                    f"{path}:{line_number}: malformed P29 interner fault witness"
+                )
+            candidate = _strict_object(line, f"{path}:{line_number}")
+            if (
+                not isinstance(candidate, dict)
+                or set(candidate) != P29_INTERNER_FAULT_FIELDS
+                or candidate.get("schema") != P29_INTERNER_FAULT_SCHEMA
+                or candidate.get("fault") != P29_INTERNER_FAULT
+                or candidate.get("outcome") != P29_INTERNER_FAULT_OUTCOME
+            ):
+                raise CollectError(
+                    f"{path}:{line_number}: invalid P29 interner fault witness"
+                )
+            records.append(
+                {
+                    "client_instance": str(instance["name"]),
+                    **candidate,
+                }
+            )
+    identities = [record["client_instance"] for record in records]
+    if len(identities) != len(set(identities)):
+        raise CollectError("duplicate P29 interner fault witness for one client")
+    return sorted(records, key=lambda item: item["client_instance"])
 
 
 def _text(path: Path | None) -> str:
@@ -512,6 +893,183 @@ def _text(path: Path | None) -> str:
         return path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         raise CollectError(f"cannot read {path}: {exc}") from exc
+
+
+def _timestamp_ms(raw: str, source: str) -> int:
+    try:
+        value = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError as exc:
+        raise CollectError(f"{source}: invalid log timestamp {raw!r}") from exc
+    return int(value.timestamp()) * 1000
+
+
+def _client_assignments(text: str, source: str) -> list[dict[str, Any]]:
+    """Parse every scheduler assignment observed by one compiler wrapper."""
+
+    result: list[dict[str, Any]] = []
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        match = CLIENT_ASSIGNMENT_RE.search(line)
+        if match is None:
+            continue
+        timestamp = LOG_TIMESTAMP_RE.search(line)
+        if timestamp is None:
+            raise CollectError(
+                f"{source}:{line_number}: assignment lacks an authenticated timestamp"
+            )
+        result.append(
+            {
+                "endpoint": match.group(1),
+                "line": line_number,
+                "observed_ms": _timestamp_ms(
+                    timestamp.group(1), f"{source}:{line_number}"
+                ),
+                "scheduler_job": int(match.group(2)),
+            }
+        )
+    return result
+
+
+def _scheduler_jobs(evidence: Path, plan: dict[str, Any]) -> list[dict[str, Any]]:
+    """Parse scheduler-owned dispatch and terminal transitions from its log."""
+
+    scheduler = next(
+        item for item in plan["topology"]["instances"] if item["role"] == "S"
+    )
+    path = _one_role_log(evidence, scheduler)
+    if path is None:
+        raise CollectError("scheduler lifecycle log is absent")
+    generation = 0
+    jobs: dict[tuple[int, int], dict[str, Any]] = {}
+    dispatches: list[dict[str, Any]] = []
+    for line_number, line in enumerate(_text(path).splitlines(), start=1):
+        framed = SCHEDULER_LINE_RE.fullmatch(line)
+        if framed is None:
+            if any(
+                marker in line
+                for marker in (
+                    "ICECREAM scheduler",
+                    "NEW ",
+                    "put ",
+                    "BEGIN:",
+                    "END ",
+                    "STOP (",
+                )
+            ):
+                raise CollectError(
+                    f"scheduler lifecycle line {line_number} lacks the exact timestamp frame"
+                )
+            continue
+        timestamp_ms = _timestamp_ms(framed.group(1), f"{path}:{line_number}")
+        message = framed.group(2)
+        if SCHEDULER_START_RE.fullmatch(message):
+            generation += 1
+            continue
+        matched = SCHEDULER_NEW_RE.match(message)
+        if matched is not None:
+            if generation == 0:
+                raise CollectError(
+                    "scheduler job appears before a scheduler start record"
+                )
+            key = (generation, int(matched.group(1)))
+            if key in jobs:
+                raise CollectError(f"duplicate scheduler NEW record for {key}")
+            jobs[key] = {
+                "client": matched.group(2),
+                "generation": generation,
+                "line": line_number,
+                "new_ms": timestamp_ms,
+                "scheduler_job": key[1],
+            }
+            continue
+        matched = SCHEDULER_DISPATCH_RE.match(message)
+        if matched is not None:
+            key = (generation, int(matched.group(1)))
+            job = jobs.get(key)
+            if job is None:
+                raise CollectError(f"scheduler dispatch has no NEW record for {key}")
+            if "dispatch_ms" in job:
+                raise CollectError(f"duplicate scheduler dispatch for {key}")
+            job.update(
+                {
+                    "dispatch_line": line_number,
+                    "dispatch_ms": timestamp_ms,
+                    "worker": matched.group(2),
+                }
+            )
+            dispatches.append(job)
+            continue
+        matched = SCHEDULER_BEGIN_RE.match(message)
+        if matched is not None:
+            key = (generation, int(matched.group(1)))
+            job = jobs.get(key)
+            if job is None or "dispatch_ms" not in job:
+                raise CollectError(f"scheduler BEGIN has no dispatch for {key}")
+            if "begin_ms" in job:
+                raise CollectError(f"duplicate scheduler BEGIN for {key}")
+            job["begin_ms"] = timestamp_ms
+            continue
+        matched = SCHEDULER_END_RE.match(message)
+        if matched is not None:
+            key = (generation, int(matched.group(1)))
+            job = jobs.get(key)
+            if job is None or "dispatch_ms" not in job:
+                raise CollectError(f"scheduler END has no dispatch for {key}")
+            if "terminal_ms" in job:
+                raise CollectError(f"duplicate scheduler terminal for {key}")
+            status = int(matched.group(2))
+            job.update(
+                {
+                    "status": status,
+                    "terminal": "completion" if status == 0 else "cancellation",
+                    "terminal_line": line_number,
+                    "terminal_ms": timestamp_ms,
+                }
+            )
+            continue
+        matched = SCHEDULER_STOP_RE.match(message)
+        if matched is not None:
+            key = (generation, int(matched.group(2)))
+            job = jobs.get(key)
+            if job is None:
+                raise CollectError(f"scheduler STOP has no NEW record for {key}")
+            if "dispatch_ms" not in job:
+                continue
+            if "terminal_ms" in job:
+                raise CollectError(f"duplicate scheduler terminal for {key}")
+            reason = matched.group(1)
+            job.update(
+                {
+                    "status": None,
+                    "terminal": (
+                        "cancellation"
+                        if reason == "WAITFORCS"
+                        else "process-loss-recovery"
+                    ),
+                    "terminal_line": line_number,
+                    "terminal_ms": timestamp_ms,
+                }
+            )
+    if generation == 0:
+        raise CollectError("scheduler log has no startup generation")
+    for job in dispatches:
+        if "terminal_ms" not in job:
+            raise CollectError(
+                "scheduler dispatch has no terminal: "
+                f"generation={job['generation']} job={job['scheduler_job']}"
+            )
+        if (
+            job["new_ms"] > job["dispatch_ms"]
+            or job["dispatch_ms"] > job["terminal_ms"]
+            or (
+                "begin_ms" in job
+                and not job["dispatch_ms"] <= job["begin_ms"] <= job["terminal_ms"]
+            )
+        ):
+            raise CollectError(
+                "scheduler lifecycle timestamps are not monotonic for "
+                f"generation={job['generation']} job={job['scheduler_job']}"
+            )
+    return dispatches
 
 
 def _worker_attachments(
@@ -529,26 +1087,1827 @@ def _worker_attachments(
     return result
 
 
-def _event_log(evidence: Path) -> list[dict[str, Any]]:
+def _event_log(
+    evidence: Path,
+    scenario: ScenarioSpec,
+    *,
+    farm: FarmSpec | None = None,
+    plan: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     path = evidence / "events" / "events.json"
+    failure_path = evidence / "events" / "failure.json"
+    if failure_path.exists():
+        failure = _read_json(failure_path)
+        if not isinstance(failure, Mapping) or failure.get("schema") != "icefarm-event-failure-v1":
+            raise CollectError("event failure descriptor is malformed")
+        raise CollectError(
+            "timeline event failed before a complete receipt: "
+            + str(failure.get("exception", "unknown event failure"))
+        )
     if not path.exists():
+        if scenario.data["timeline"]:
+            raise CollectError("timeline run has no events.json")
         return []
     value = _read_json(path)
     events = value.get("events")
     if not isinstance(events, list):
         raise CollectError("events.json has no event list")
+    expected = scenario.data["timeline"]
+    if len(events) != len(expected):
+        raise CollectError("events.json does not cover the complete scenario timeline")
     previous = -1
+    continuity: dict[str, dict[str, Any]] = {}
     for index, event in enumerate(events):
-        if not isinstance(event, dict) or type(event.get("fired_ms")) is not int:
+        fields = {
+            "action",
+            "event_epoch",
+            "event_index",
+            "fired_ms",
+            "instance",
+            "last_dispatched_job",
+            "trigger",
+            "workload_dispatch_count",
+        }
+        if not isinstance(event, dict) or not fields.issubset(event):
+            raise CollectError(f"events.json event {index} has the wrong fields")
+        transition = event.get("action") in {"upgrade", "downgrade", "env_set"}
+        header_edit = event.get("action") == "header_edit"
+        disk_fill = event.get("action") == "disk_fill"
+        scheduler_restart = False
+        client_route_restart = False
+        worker_restart = False
+        client_checkpoint_transition = False
+        if event.get("action") == "restart" and plan is not None:
+            target = next(
+                (
+                    item
+                    for item in plan["topology"]["instances"]
+                    if item["name"] == event.get("instance")
+                ),
+                None,
+            )
+            scheduler_restart = (
+                isinstance(target, Mapping)
+                and target.get("role") == "S"
+                and isinstance(event.get("trigger"), str)
+                and re.fullmatch(r"job [1-9][0-9]*", event["trigger"]) is not None
+            )
+            client_route_restart = (
+                isinstance(target, Mapping)
+                and target.get("role") == "C"
+                and isinstance(event.get("trigger"), str)
+                and re.fullmatch(r"job [1-9][0-9]*", event["trigger"]) is not None
+            )
+            worker_restart = (
+                isinstance(target, Mapping)
+                and target.get("role") == "F"
+                and scenario.data.get("expect", {}).get("engagement")
+                == "s70-b4-worker-bounces"
+            )
+            client_checkpoint_transition = (
+                isinstance(target, Mapping)
+                and target.get("role") == "C"
+                and event.get("action") in {"restart", "upgrade", "downgrade"}
+                and isinstance(event.get("trigger"), str)
+                and re.fullmatch(r"job [1-9][0-9]*", event["trigger"]) is not None
+                and isinstance(event.get("receipt"), Mapping)
+                and event["receipt"].get("schema") == "icefarm-client-transition-v1"
+            )
+            if client_checkpoint_transition:
+                client_route_restart = False
+        expected_fields = fields | (
+            {"receipt"}
+            if transition
+            or header_edit
+            or disk_fill
+            or scheduler_restart
+            or client_route_restart
+            or worker_restart
+            or client_checkpoint_transition
+            else set()
+        )
+        if set(event) != expected_fields:
+            raise CollectError(f"events.json event {index} has the wrong fields")
+        if (
+            type(event.get("fired_ms")) is not int
+            or event["fired_ms"] < 0
+            or type(event.get("event_epoch")) is not int
+            or event["event_epoch"] != index + 1
+            or type(event.get("event_index")) is not int
+            or event["event_index"] != index
+            or event.get("action") != expected[index]["action"]
+            or event.get("instance") != expected[index]["instance"]
+            or event.get("trigger") != expected[index]["trigger"]
+            or type(event.get("workload_dispatch_count")) is not int
+            or event["workload_dispatch_count"] < 0
+            or (
+                event.get("last_dispatched_job") is not None
+                and (
+                    type(event["last_dispatched_job"]) is not int
+                    or event["last_dispatched_job"] < 0
+                )
+            )
+        ):
             raise CollectError(f"events.json event {index} is invalid")
         if event["fired_ms"] < previous:
             raise CollectError("events.json is not chronological")
+        if transition or client_checkpoint_transition:
+            _validate_transition_receipt(
+                event["receipt"],
+                event,
+                scenario,
+                index,
+                farm=farm,
+                plan=plan,
+                continuity=continuity,
+                evidence=evidence,
+            )
+        elif header_edit:
+            _validate_header_edit_receipt(
+                event["receipt"], event, scenario, index, farm=farm, plan=plan
+            )
+        elif disk_fill:
+            _validate_disk_fill_receipt(
+                event["receipt"], event, scenario, index, plan=plan
+            )
+        elif scheduler_restart:
+            _validate_scheduler_restart_receipt(
+                event["receipt"], event, scenario, index, farm=farm, plan=plan
+            )
+        elif client_route_restart:
+            _validate_client_route_restart_receipt(
+                event["receipt"], event, scenario, index, farm=farm, plan=plan
+            )
+        elif worker_restart:
+            _validate_worker_restart_receipt(
+                event["receipt"], event, scenario, index, farm=farm, plan=plan
+            )
         previous = event["fired_ms"]
     return events
 
 
+def _validate_disk_fill_receipt(
+    receipt: Any,
+    event: Mapping[str, Any],
+    scenario: ScenarioSpec,
+    index: int,
+    *,
+    plan: dict[str, Any] | None,
+) -> None:
+    prefix = f"events.json event {index} disk_fill"
+    if plan is None:
+        raise CollectError(f"{prefix} needs plan authority")
+    target = next(
+        (
+            item
+            for item in plan.get("topology", {}).get("instances", [])
+            if isinstance(item, Mapping) and item.get("name") == event.get("instance")
+        ),
+        None,
+    )
+    if not isinstance(target, Mapping) or target.get("role") != "F":
+        raise CollectError(f"{prefix} does not target a planned F instance")
+    if scenario.data["timeline"][index] != {
+        "action": "disk_fill",
+        "instance": event.get("instance"),
+        "trigger": event.get("trigger"),
+    }:
+        raise CollectError(f"{prefix} is not the exact declared fault")
+    if not isinstance(receipt, Mapping) or set(receipt) != {
+        "action",
+        "after",
+        "before",
+        "event_epoch",
+        "fill",
+        "instance",
+        "schema",
+    }:
+        raise CollectError(f"{prefix} has invalid receipt fields")
+    if (
+        receipt.get("schema") != DISK_FILL_SCHEMA
+        or receipt.get("action") != "disk_fill"
+        or receipt.get("action") != event.get("action")
+        or receipt.get("instance") != event.get("instance")
+        or receipt.get("event_epoch") != event.get("event_epoch")
+    ):
+        raise CollectError(f"{prefix} is not bound to the timeline")
+    expected_mount = {
+        "destination": CACHE_DISK_FAULT_PATH,
+        "size_bytes": CACHE_DISK_FAULT_BYTES,
+        "type": "tmpfs",
+    }
+    snapshots: dict[str, Mapping[str, Any]] = {}
+    for side in ("before", "after"):
+        value = receipt.get(side)
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != {"container_id", "mount", "running", "started_at"}
+            or not isinstance(value.get("container_id"), str)
+            or SHA256_RE.fullmatch(value["container_id"]) is None
+            or value.get("mount") != expected_mount
+            or value.get("running") is not True
+            or not isinstance(value.get("started_at"), str)
+            or not value["started_at"]
+        ):
+            raise CollectError(f"{prefix} has invalid {side} snapshot")
+        snapshots[side] = value
+    if snapshots["before"] != snapshots["after"]:
+        raise CollectError(f"{prefix} does not preserve the target container identity")
+    fill = receipt.get("fill")
+    if (
+        not isinstance(fill, Mapping)
+        or set(fill)
+        != {
+            "available_after",
+            "available_before",
+            "directory_gid",
+            "directory_mode",
+            "directory_uid",
+            "elapsed_ms",
+            "errno",
+            "filler_bytes",
+            "filler_path",
+            "limit_bytes",
+            "minimum_headroom_bytes",
+            "schema",
+            "watchdog_s",
+        }
+        or fill.get("schema") != "icefarm-disk-fill-operation-v1"
+        or fill.get("errno") != 28
+        or fill.get("filler_path") != CACHE_DISK_FAULT_FILE
+        or fill.get("limit_bytes") != CACHE_DISK_FAULT_BYTES
+        or type(fill.get("filler_bytes")) is not int
+        or not 0 < fill["filler_bytes"] <= CACHE_DISK_FAULT_BYTES
+        or type(fill.get("available_before")) is not int
+        or not CACHE_DISK_FAULT_MIN_HEADROOM_BYTES
+        <= fill["available_before"]
+        <= CACHE_DISK_FAULT_BYTES
+        or fill["filler_bytes"] > fill["available_before"]
+        or type(fill.get("available_after")) is not int
+        or not 0 <= fill["available_after"] < 1024 * 1024
+        or fill["available_after"] >= fill["available_before"]
+        or fill.get("directory_uid") != 65534
+        or fill.get("directory_gid") != 65534
+        or fill.get("directory_mode") != 0o700
+        or type(fill.get("elapsed_ms")) is not int
+        or not 0 <= fill["elapsed_ms"] <= DISK_FILL_WATCHDOG_S * 1000
+        or fill.get("minimum_headroom_bytes")
+        != CACHE_DISK_FAULT_MIN_HEADROOM_BYTES
+        or fill.get("watchdog_s") != DISK_FILL_WATCHDOG_S
+    ):
+        raise CollectError(f"{prefix} does not prove bounded ENOSPC")
+
+
+def _validate_header_edit_receipt(
+    receipt: Any,
+    event: Mapping[str, Any],
+    scenario: ScenarioSpec,
+    index: int,
+    *,
+    farm: FarmSpec | None,
+    plan: dict[str, Any] | None,
+) -> None:
+    prefix = f"events.json event {index} header_edit"
+    if farm is None or plan is None:
+        raise CollectError(f"{prefix} needs farm and plan authority")
+    if not isinstance(receipt, Mapping) or set(receipt) != {
+        "action",
+        "after",
+        "before",
+        "cache_invalidation",
+        "coordination",
+        "event_epoch",
+        "instance",
+        "schema",
+        "turn",
+    }:
+        raise CollectError(f"{prefix} has invalid receipt fields")
+    if (
+        receipt.get("schema") != HEADER_EDIT_SCHEMA
+        or receipt.get("action") != "header_edit"
+        or receipt.get("action") != event.get("action")
+        or receipt.get("instance") != event.get("instance")
+        or receipt.get("event_epoch") != event.get("event_epoch")
+        or receipt.get("turn") not in scenario.data["workload"]["turns"]
+    ):
+        raise CollectError(f"{prefix} is not bound to the timeline")
+    expected = scenario.data["timeline"][index]
+    expected_path = expected.get("path")
+    if not isinstance(expected_path, str):
+        raise CollectError(f"{prefix} has no declared header path")
+    snapshot_fields = {
+        "container_id",
+        "header_path",
+        "header_sha256",
+        "p29_cache_files",
+        "running",
+        "started_at",
+    }
+    snapshots: dict[str, Mapping[str, Any]] = {}
+    managed = {
+        "p29-system-source-fingerprint-v1.cache",
+        "p29-system-source-fingerprint-v1.lock",
+    }
+    for side in ("before", "after"):
+        value = receipt.get(side)
+        if not isinstance(value, Mapping) or set(value) != snapshot_fields:
+            raise CollectError(f"{prefix} has invalid {side} snapshot")
+        cache_files = value.get("p29_cache_files")
+        if (
+            not isinstance(value.get("container_id"), str)
+            or SHA256_RE.fullmatch(value["container_id"]) is None
+            or not isinstance(value.get("started_at"), str)
+            or not value["started_at"]
+            or value.get("running") is not True
+            or value.get("header_path") != expected_path
+            or not isinstance(value.get("header_sha256"), str)
+            or SHA256_RE.fullmatch(value["header_sha256"]) is None
+            or not isinstance(cache_files, list)
+            or any(item not in managed for item in cache_files)
+            or len(set(cache_files)) != len(cache_files)
+            or (
+                side == "before"
+                and cache_files
+                != [
+                    "p29-system-source-fingerprint-v1.cache",
+                    "p29-system-source-fingerprint-v1.lock",
+                ]
+            )
+        ):
+            raise CollectError(f"{prefix} has malformed {side} snapshot")
+        snapshots[side] = value
+    if (
+        snapshots["before"]["container_id"] != snapshots["after"]["container_id"]
+        or snapshots["before"]["started_at"] == snapshots["after"]["started_at"]
+        or snapshots["before"]["header_sha256"] == snapshots["after"]["header_sha256"]
+        or snapshots["after"]["p29_cache_files"]
+    ):
+        raise CollectError(f"{prefix} does not prove a fresh changed F state")
+    invalidation = receipt.get("cache_invalidation")
+    if (
+        not isinstance(invalidation, Mapping)
+        or set(invalidation) != {"directory", "files", "removed"}
+        or invalidation.get("directory") != "/var/cache/icecream/p50-runtime"
+        or invalidation.get("files")
+        != [
+            "p29-system-source-fingerprint-v1.cache",
+            "p29-system-source-fingerprint-v1.lock",
+        ]
+        or invalidation.get("removed") != snapshots["before"]["p29_cache_files"]
+        or any(item not in managed for item in invalidation.get("removed", []))
+        or invalidation.get("removed")
+        != [
+            "p29-system-source-fingerprint-v1.cache",
+            "p29-system-source-fingerprint-v1.lock",
+        ]
+    ):
+        raise CollectError(f"{prefix} has invalid scoped cache invalidation")
+    coordination = receipt.get("coordination")
+    if not isinstance(coordination, Mapping) or set(coordination) != {
+        "clients",
+        "ready_ms",
+        "readiness",
+        "resume",
+        "scheduler_rejoin",
+    }:
+        raise CollectError(f"{prefix} has invalid coordination")
+    ready_ms = coordination.get("ready_ms")
+    if type(ready_ms) is not int or ready_ms < 0 or ready_ms != event.get("fired_ms"):
+        raise CollectError(f"{prefix} readiness is not bound to the event epoch")
+    expected_clients = set(scenario.data["workload"]["clients"])
+    pauses = coordination.get("clients")
+    resumes = coordination.get("resume")
+    if (
+        not expected_clients
+        or not isinstance(pauses, Mapping)
+        or not isinstance(resumes, Mapping)
+        or set(pauses) != expected_clients
+        or set(resumes) != expected_clients
+    ):
+        raise CollectError(f"{prefix} does not cover every workload client")
+    gate_fields = {
+        "action",
+        "active_after",
+        "active_before",
+        "client",
+        "epoch",
+        "finished_ms",
+        "schema",
+        "started_ms",
+        "status",
+        "turn",
+    }
+    for name in sorted(expected_clients):
+        for action, status, value in (
+            ("pause", "PAUSED", pauses[name]),
+            ("resume", "OPEN", resumes[name]),
+        ):
+            if (
+                not isinstance(value, Mapping)
+                or set(value) != gate_fields
+                or value.get("schema") != EVENT_GATE_SCHEMA
+                or value.get("action") != action
+                or value.get("status") != status
+                or value.get("client") != name
+                or value.get("turn") != receipt["turn"]
+                or value.get("epoch") != receipt["event_epoch"]
+                or any(
+                    type(value.get(field)) is not int or value[field] < 0
+                    for field in ("active_after", "active_before", "finished_ms", "started_ms")
+                )
+                or value["finished_ms"] < value["started_ms"]
+            ):
+                raise CollectError(f"{prefix} has invalid {action} receipt for {name}")
+        if pauses[name]["active_after"] != 0:
+            raise CollectError(f"{prefix} has invalid drain/readiness ordering")
+    target = next(
+        (item for item in plan["topology"]["instances"] if item["name"] == event["instance"]),
+        None,
+    )
+    if not isinstance(target, Mapping) or target.get("role") != "F":
+        raise CollectError(f"{prefix} target is not a planned F")
+    scheduler = next(
+        (item for item in plan["topology"]["instances"] if item["role"] == "S"),
+        None,
+    )
+    if not isinstance(scheduler, Mapping):
+        raise CollectError(f"{prefix} has no planned scheduler")
+    expected_host, expected_log = _transition_readiness_path(farm, plan, target)
+    readiness = coordination.get("readiness")
+    if (
+        not isinstance(readiness, Mapping)
+        or set(readiness) != {"cache_line", "host", "line", "log_path", "offset", "role"}
+        or readiness.get("host") != expected_host
+        or readiness.get("log_path") != expected_log
+        or readiness.get("role") != "F"
+        or not isinstance(readiness.get("line"), str)
+        or "ICECREAM daemon " not in readiness["line"]
+        or not isinstance(readiness.get("cache_line"), str)
+        or CACHE_READY_RE.search(readiness["cache_line"]) is None
+        or type(readiness.get("offset")) is not int
+        or readiness["offset"] < 0
+    ):
+        raise CollectError(f"{prefix} has invalid fresh F/cache READY evidence")
+    expected_scheduler_host, expected_scheduler_log = _transition_readiness_path(
+        farm, plan, scheduler
+    )
+    expected_profile = scheduler.get("env", {}).get("ICECC_P50_PROFILE")
+    rejoin = coordination.get("scheduler_rejoin")
+    rejoin_fields = {
+        "cache_line",
+        "cache_protocol",
+        "host",
+        "login_line",
+        "log_path",
+        "offset",
+        "profile",
+        "role_protocol",
+        "scheduler",
+        "target",
+    }
+    login_line = rejoin.get("login_line") if isinstance(rejoin, Mapping) else None
+    cache_line = rejoin.get("cache_line") if isinstance(rejoin, Mapping) else None
+    role_login = ROLE_LOGIN_RE.search(login_line) if isinstance(login_line, str) else None
+    cache_relogin = LOGIN_RE.search(cache_line) if isinstance(cache_line, str) else None
+    cache_login = CACHE_LOGIN_RE.search(cache_line) if isinstance(cache_line, str) else None
+    profile_token = expected_profile.lower() if isinstance(expected_profile, str) else None
+    advertised = cache_login.group(4).split() if cache_login is not None else []
+    if (
+        not isinstance(rejoin, Mapping)
+        or set(rejoin) != rejoin_fields
+        or rejoin.get("host") != expected_scheduler_host
+        or rejoin.get("log_path") != expected_scheduler_log
+        or rejoin.get("scheduler") != scheduler["name"]
+        or rejoin.get("target") != target["name"]
+        or rejoin.get("profile") != expected_profile
+        or rejoin.get("role_protocol") != 50
+        or rejoin.get("cache_protocol") != 1
+        or type(rejoin.get("offset")) is not int
+        or rejoin["offset"] < 0
+        or role_login is None
+        or role_login.group(1) != target["name"]
+        or role_login.group(2) != "50"
+        or cache_relogin is None
+        or cache_relogin.group(1) != target["name"]
+        or cache_login is None
+        or cache_login.group(2) != "1"
+        or cache_login.group(3) != "1"
+        or profile_token is None
+        or profile_token not in advertised
+    ):
+        raise CollectError(f"{prefix} has invalid fresh scheduler rejoin evidence")
+
+
+def _valid_route_process(value: Any, executable: str) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and set(value)
+        == {"argv", "exe", "exe_evidence", "pid", "ppid", "start_ticks", "uid"}
+        and value.get("exe") == executable
+        and value.get("exe_evidence")
+        in {"proc-exe", "argv0-after-proc-exe-eacces"}
+        and isinstance(value.get("argv"), list)
+        and bool(value["argv"])
+        and value["argv"][0] == executable
+        and all(isinstance(item, str) and "\0" not in item for item in value["argv"])
+        and all(
+            type(value.get(field)) is int and value[field] >= minimum
+            for field, minimum in (
+                ("pid", 1),
+                ("ppid", 0),
+                ("start_ticks", 1),
+                ("uid", 0),
+            )
+        )
+    )
+
+
+def _validate_client_route_restart_receipt(
+    receipt: Any,
+    event: Mapping[str, Any],
+    scenario: ScenarioSpec,
+    index: int,
+    *,
+    farm: FarmSpec | None,
+    plan: dict[str, Any] | None,
+) -> None:
+    prefix = f"events.json event {index} client route-owner restart"
+    if farm is None or plan is None:
+        raise CollectError(f"{prefix} needs farm and plan authority")
+    if not isinstance(receipt, Mapping) or set(receipt) != {
+        "action",
+        "after",
+        "before",
+        "coordination",
+        "event_epoch",
+        "instance",
+        "schema",
+        "turn",
+    }:
+        raise CollectError(f"{prefix} has an invalid receipt")
+    if (
+        receipt.get("schema") != CLIENT_ROUTE_RESTART_SCHEMA
+        or receipt.get("action") != "restart"
+        or receipt.get("action") != event.get("action")
+        or receipt.get("instance") != event.get("instance")
+        or receipt.get("event_epoch") != event.get("event_epoch")
+        or receipt.get("turn") not in scenario.data["workload"]["turns"]
+    ):
+        raise CollectError(f"{prefix} receipt is not bound")
+    target = next(
+        (
+            item
+            for item in plan["topology"]["instances"]
+            if item["name"] == receipt["instance"]
+        ),
+        None,
+    )
+    if not isinstance(target, Mapping) or target.get("role") != "C":
+        raise CollectError(f"{prefix} does not target a client")
+
+    snapshots: dict[str, Mapping[str, Any]] = {}
+    snapshot_fields = {
+        "container_id",
+        "container_started_at",
+        "daemon",
+        "route_owner",
+    }
+    for side in ("before", "after"):
+        value = receipt.get(side)
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != snapshot_fields
+            or not isinstance(value.get("container_id"), str)
+            or SHA256_RE.fullmatch(value["container_id"]) is None
+            or not isinstance(value.get("container_started_at"), str)
+            or not value["container_started_at"]
+            or not _valid_route_process(
+                value.get("daemon"), "/opt/icecream/sbin/iceccd"
+            )
+            or not _valid_route_process(
+                value.get("route_owner"),
+                "/opt/icecream/sbin/icecc-cache-service",
+            )
+            or value["route_owner"]["pid"] <= 1
+            or value["route_owner"]["ppid"] != value["daemon"]["pid"]
+            or value["route_owner"]["uid"] != value["daemon"]["uid"]
+        ):
+            raise CollectError(f"{prefix} has an invalid {side} snapshot")
+        snapshots[side] = value
+    if (
+        snapshots["before"]["container_id"] != snapshots["after"]["container_id"]
+        or snapshots["before"]["container_started_at"]
+        != snapshots["after"]["container_started_at"]
+        or snapshots["before"]["daemon"] != snapshots["after"]["daemon"]
+        or (
+            snapshots["before"]["route_owner"]["pid"],
+            snapshots["before"]["route_owner"]["start_ticks"],
+        )
+        == (
+            snapshots["after"]["route_owner"]["pid"],
+            snapshots["after"]["route_owner"]["start_ticks"],
+        )
+        or snapshots["before"]["route_owner"]["uid"]
+        != snapshots["after"]["route_owner"]["uid"]
+    ):
+        raise CollectError(f"{prefix} does not prove only a fresh route owner")
+
+    coordination = receipt.get("coordination")
+    if not isinstance(coordination, Mapping) or set(coordination) != {
+        "clients",
+        "ready_ms",
+        "readiness",
+        "resume",
+        "signal",
+    }:
+        raise CollectError(f"{prefix} has invalid coordination")
+    ready_ms = coordination.get("ready_ms")
+    if type(ready_ms) is not int or ready_ms < 0 or ready_ms != event.get("fired_ms"):
+        raise CollectError(f"{prefix} readiness is not epoch-bound")
+    expected_clients = set(scenario.data["workload"]["clients"])
+    pauses = coordination.get("clients")
+    resumes = coordination.get("resume")
+    if (
+        not expected_clients
+        or receipt["instance"] not in expected_clients
+        or not isinstance(pauses, Mapping)
+        or not isinstance(resumes, Mapping)
+        or set(pauses) != expected_clients
+        or set(resumes) != expected_clients
+    ):
+        raise CollectError(f"{prefix} does not cover every workload client")
+    gate_fields = {
+        "action",
+        "active_after",
+        "active_before",
+        "client",
+        "epoch",
+        "finished_ms",
+        "schema",
+        "started_ms",
+        "status",
+        "turn",
+    }
+    for name in sorted(expected_clients):
+        for action, status, value in (
+            ("pause", "PAUSED", pauses[name]),
+            ("resume", "OPEN", resumes[name]),
+        ):
+            if (
+                not isinstance(value, Mapping)
+                or set(value) != gate_fields
+                or value.get("schema") != EVENT_GATE_SCHEMA
+                or value.get("action") != action
+                or value.get("status") != status
+                or value.get("client") != name
+                or value.get("turn") != receipt["turn"]
+                or value.get("epoch") != receipt["event_epoch"]
+                or any(
+                    type(value.get(field)) is not int or value[field] < 0
+                    for field in (
+                        "active_after",
+                        "active_before",
+                        "finished_ms",
+                        "started_ms",
+                    )
+                )
+                or value["finished_ms"] < value["started_ms"]
+            ):
+                raise CollectError(f"{prefix} has invalid {action} receipt for {name}")
+        if pauses[name]["active_after"] != 0:
+            raise CollectError(f"{prefix} has invalid drain/readiness ordering")
+
+    signal_receipt = coordination.get("signal")
+    if (
+        not isinstance(signal_receipt, Mapping)
+        or set(signal_receipt)
+        != {"daemon", "mechanism", "route_owner", "schema", "sent_ms", "signal"}
+        or signal_receipt.get("schema") != CLIENT_ROUTE_SIGNAL_SCHEMA
+        or signal_receipt.get("mechanism") != "pidfd_send_signal"
+        or signal_receipt.get("signal") != 9
+        or type(signal_receipt.get("sent_ms")) is not int
+        or signal_receipt["sent_ms"] < 0
+        or signal_receipt.get("daemon") != snapshots["before"]["daemon"]
+        or signal_receipt.get("route_owner") != snapshots["before"]["route_owner"]
+        or any(
+            pauses[name]["finished_ms"] > signal_receipt["sent_ms"]
+            for name in expected_clients
+        )
+        or signal_receipt["sent_ms"] > ready_ms
+    ):
+        raise CollectError(f"{prefix} has an invalid exact signal receipt")
+
+    readiness = coordination.get("readiness")
+    expected_host, expected_path = _transition_readiness_path(farm, plan, target)
+    if (
+        not isinstance(readiness, Mapping)
+        or set(readiness)
+        != {"host", "lifecycle", "line", "log_path", "offset", "state"}
+        or readiness.get("host") != expected_host
+        or readiness.get("log_path") != expected_path
+        or type(readiness.get("offset")) is not int
+        or readiness["offset"] < 0
+        or readiness.get("state") != 2
+        or readiness.get("lifecycle") != 3
+        or not isinstance(readiness.get("line"), str)
+        or CACHE_READY_RE.search(readiness["line"]) is None
+    ):
+        raise CollectError(f"{prefix} has invalid fresh READY evidence")
+
+
+def _validate_scheduler_restart_receipt(
+    receipt: Any,
+    event: Mapping[str, Any],
+    scenario: ScenarioSpec,
+    index: int,
+    *,
+    farm: FarmSpec | None,
+    plan: dict[str, Any] | None,
+) -> None:
+    if farm is None or plan is None:
+        raise CollectError(
+            f"events.json event {index} scheduler restart needs farm and plan authority"
+        )
+    if not isinstance(receipt, dict) or set(receipt) != {
+        "action",
+        "after",
+        "before",
+        "coordination",
+        "event_epoch",
+        "instance",
+        "schema",
+        "turn",
+    }:
+        raise CollectError(f"events.json event {index} has invalid scheduler-restart receipt")
+    if (
+        receipt.get("schema") != SCHEDULER_RESTART_SCHEMA
+        or receipt.get("action") != "restart"
+        or receipt.get("action") != event.get("action")
+        or receipt.get("instance") != event.get("instance")
+        or receipt.get("event_epoch") != event.get("event_epoch")
+        or receipt.get("turn") not in scenario.data["workload"]["turns"]
+    ):
+        raise CollectError(f"events.json event {index} scheduler-restart receipt is not bound")
+    snapshots: dict[str, Mapping[str, Any]] = {}
+    for side in ("before", "after"):
+        snapshot = receipt.get(side)
+        if (
+            not isinstance(snapshot, Mapping)
+            or set(snapshot) != {"container_id", "started_at"}
+            or not isinstance(snapshot.get("container_id"), str)
+            or SHA256_RE.fullmatch(snapshot["container_id"]) is None
+            or not isinstance(snapshot.get("started_at"), str)
+            or not snapshot["started_at"]
+        ):
+            raise CollectError(
+                f"events.json event {index} has invalid scheduler {side} snapshot"
+            )
+        snapshots[side] = snapshot
+    if (
+        snapshots["before"]["container_id"] != snapshots["after"]["container_id"]
+        or snapshots["before"]["started_at"] == snapshots["after"]["started_at"]
+    ):
+        raise CollectError(
+            f"events.json event {index} does not prove an in-place scheduler restart"
+        )
+
+    coordination = receipt.get("coordination")
+    required = {
+        "client_readiness",
+        "clients",
+        "ready_ms",
+        "resume",
+        "scheduler_snapshot",
+        "scheduler_startup",
+        "workers",
+        "worker_snapshot",
+    }
+    if not isinstance(coordination, Mapping) or set(coordination) != required:
+        raise CollectError(
+            f"events.json event {index} has invalid restart coordination"
+        )
+    ready_ms = coordination.get("ready_ms")
+    if type(ready_ms) is not int or ready_ms < 0 or event.get("fired_ms") != ready_ms:
+        raise CollectError(
+            f"events.json event {index} restart readiness is not epoch-bound"
+        )
+    expected_clients = set(scenario.data["workload"]["clients"])
+    pauses = coordination.get("clients")
+    resumes = coordination.get("resume")
+    client_readiness = coordination.get("client_readiness")
+    if (
+        not isinstance(pauses, Mapping)
+        or not isinstance(resumes, Mapping)
+        or not isinstance(client_readiness, Mapping)
+        or set(pauses) != expected_clients
+        or set(resumes) != expected_clients
+        or set(client_readiness) != expected_clients
+        or not expected_clients
+    ):
+        raise CollectError(
+            f"events.json event {index} restart does not cover every workload client"
+        )
+    gate_fields = {
+        "action",
+        "active_after",
+        "active_before",
+        "client",
+        "epoch",
+        "finished_ms",
+        "schema",
+        "started_ms",
+        "status",
+        "turn",
+    }
+    for name in sorted(expected_clients):
+        for action, status, value in (
+            ("pause", "PAUSED", pauses[name]),
+            ("resume", "OPEN", resumes[name]),
+        ):
+            if (
+                not isinstance(value, Mapping)
+                or set(value) != gate_fields
+                or value.get("schema") != EVENT_GATE_SCHEMA
+                or value.get("action") != action
+                or value.get("status") != status
+                or value.get("client") != name
+                or value.get("turn") != receipt["turn"]
+                or value.get("epoch") != receipt["event_epoch"]
+                or any(
+                    type(value.get(field)) is not int or value[field] < 0
+                    for field in (
+                        "active_after",
+                        "active_before",
+                        "finished_ms",
+                        "started_ms",
+                    )
+                )
+                or value["finished_ms"] < value["started_ms"]
+            ):
+                raise CollectError(
+                    f"events.json event {index} has invalid {action} receipt for {name}"
+                )
+        if pauses[name]["active_after"] != 0:
+            raise CollectError(
+                f"events.json event {index} resumed {name} before active jobs drained"
+            )
+        client = next(
+            item
+            for item in plan["topology"]["instances"]
+            if item["name"] == name
+        )
+        witness = client_readiness[name]
+        expected_host, expected_path = _transition_readiness_path(farm, plan, client)
+        cache_required = (
+            client.get("version") == 50
+            and client.get("env", {}).get("ICECC_P50_MODE") == "on"
+        )
+        if (
+            not isinstance(witness, Mapping)
+            or set(witness)
+            != {
+                "cache_line",
+                "cache_required",
+                "connected_line",
+                "host",
+                "log_path",
+                "offset",
+            }
+            or witness.get("host") != expected_host
+            or witness.get("log_path") != expected_path
+            or type(witness.get("offset")) is not int
+            or witness["offset"] < 0
+            or witness.get("cache_required") is not cache_required
+            or not isinstance(witness.get("connected_line"), str)
+            or "Connected to scheduler (I am known as "
+            not in witness["connected_line"]
+            or (
+                cache_required
+                and (
+                    not isinstance(witness.get("cache_line"), str)
+                    or CACHE_READY_RE.search(witness["cache_line"]) is None
+                )
+            )
+            or (not cache_required and witness.get("cache_line") is not None)
+        ):
+            raise CollectError(
+                f"events.json event {index} has invalid fresh scheduler readiness for {name}"
+            )
+
+    scheduler = next(
+        item for item in plan["topology"]["instances"] if item["role"] == "S"
+    )
+    startup = coordination.get("scheduler_startup")
+    expected_host, expected_path = _transition_readiness_path(farm, plan, scheduler)
+    if (
+        not isinstance(startup, Mapping)
+        or set(startup) != {"host", "line", "log_path", "offset", "role"}
+        or startup.get("host") != expected_host
+        or startup.get("log_path") != expected_path
+        or startup.get("role") != "S"
+        or type(startup.get("offset")) is not int
+        or startup["offset"] < 0
+        or not isinstance(startup.get("line"), str)
+        or READINESS_SCHEDULER_RE.search(startup["line"]) is None
+    ):
+        raise CollectError(
+            f"events.json event {index} has invalid fresh scheduler readiness"
+        )
+    expected_workers = sorted(
+        item["name"] for item in plan["topology"]["instances"] if item["role"] == "F"
+    )
+    scheduler_snapshot = coordination.get("scheduler_snapshot")
+    worker_snapshot = coordination.get("worker_snapshot")
+    if (
+        coordination.get("workers") != expected_workers
+        or not isinstance(scheduler_snapshot, str)
+        or not scheduler_snapshot
+        or not isinstance(worker_snapshot, str)
+        or not worker_snapshot
+        or any(
+            re.search(rf"(^|\s){re.escape(name)}(\s|$)", worker_snapshot, re.MULTILINE)
+            is None
+            for name in expected_workers
+        )
+    ):
+        raise CollectError(
+            f"events.json event {index} does not prove every planned worker rejoined"
+        )
+
+
+def _validate_worker_restart_receipt(
+    receipt: Any,
+    event: Mapping[str, Any],
+    scenario: ScenarioSpec,
+    index: int,
+    *,
+    farm: FarmSpec | None,
+    plan: dict[str, Any] | None,
+) -> None:
+    prefix = f"events.json event {index} worker restart"
+    if farm is None or plan is None:
+        raise CollectError(f"{prefix} needs farm and plan authority")
+    if not isinstance(receipt, Mapping) or set(receipt) != {
+        "action",
+        "after",
+        "before",
+        "coordination",
+        "event_epoch",
+        "instance",
+        "schema",
+        "turn",
+    }:
+        raise CollectError(f"{prefix} has an invalid receipt")
+    if (
+        receipt.get("schema") != WORKER_RESTART_SCHEMA
+        or receipt.get("action") != "restart"
+        or receipt.get("action") != event.get("action")
+        or receipt.get("instance") != event.get("instance")
+        or receipt.get("event_epoch") != event.get("event_epoch")
+        or receipt.get("turn") not in scenario.data["workload"]["turns"]
+    ):
+        raise CollectError(f"{prefix} receipt is not bound")
+    target = next(
+        (
+            item
+            for item in plan["topology"]["instances"]
+            if item["name"] == receipt["instance"]
+        ),
+        None,
+    )
+    if not isinstance(target, Mapping) or target.get("role") != "F":
+        raise CollectError(f"{prefix} target is not a planned F")
+    snapshots: dict[str, Mapping[str, Any]] = {}
+    for side in ("before", "after"):
+        snapshot = receipt.get(side)
+        if (
+            not isinstance(snapshot, Mapping)
+            or set(snapshot) != {"container_id", "started_at"}
+            or not isinstance(snapshot.get("container_id"), str)
+            or SHA256_RE.fullmatch(snapshot["container_id"]) is None
+            or not isinstance(snapshot.get("started_at"), str)
+            or not snapshot["started_at"]
+        ):
+            raise CollectError(f"{prefix} has an invalid {side} snapshot")
+        snapshots[side] = snapshot
+    if (
+        snapshots["before"]["container_id"]
+        != snapshots["after"]["container_id"]
+        or snapshots["before"]["started_at"] == snapshots["after"]["started_at"]
+    ):
+        raise CollectError(f"{prefix} does not prove an in-place fresh restart")
+
+    coordination = receipt.get("coordination")
+    if not isinstance(coordination, Mapping) or set(coordination) != {
+        "ready_ms",
+        "readiness",
+        "scheduler_rejoin",
+        "worker_snapshot",
+        "workers",
+    }:
+        raise CollectError(f"{prefix} has invalid coordination")
+    ready_ms = coordination.get("ready_ms")
+    if type(ready_ms) is not int or ready_ms < 0 or ready_ms != event.get("fired_ms"):
+        raise CollectError(f"{prefix} readiness is not epoch-bound")
+    expected_workers = sorted(
+        item["name"]
+        for item in plan["topology"]["instances"]
+        if item["role"] == "F"
+    )
+    worker_snapshot = coordination.get("worker_snapshot")
+    if (
+        coordination.get("workers") != expected_workers
+        or not isinstance(worker_snapshot, str)
+        or not worker_snapshot
+        or any(
+            re.search(
+                rf"(^|\s){re.escape(name)}(\s|$)",
+                worker_snapshot,
+                re.MULTILINE,
+            )
+            is None
+            for name in expected_workers
+        )
+    ):
+        raise CollectError(f"{prefix} does not prove every worker ready")
+
+    expected_host, expected_log = _transition_readiness_path(farm, plan, target)
+    readiness = coordination.get("readiness")
+    if (
+        not isinstance(readiness, Mapping)
+        or set(readiness)
+        != {"cache_line", "host", "line", "log_path", "offset", "role"}
+        or readiness.get("host") != expected_host
+        or readiness.get("log_path") != expected_log
+        or readiness.get("role") != "F"
+        or not isinstance(readiness.get("line"), str)
+        or DAEMON_START_RE.search(readiness["line"]) is None
+        or not isinstance(readiness.get("cache_line"), str)
+        or CACHE_READY_RE.search(readiness["cache_line"]) is None
+        or type(readiness.get("offset")) is not int
+        or readiness["offset"] < 0
+    ):
+        raise CollectError(f"{prefix} has invalid fresh F/cache readiness")
+
+    scheduler = next(
+        item for item in plan["topology"]["instances"] if item["role"] == "S"
+    )
+    expected_scheduler_host, expected_scheduler_log = _transition_readiness_path(
+        farm, plan, scheduler
+    )
+    expected_profile = scheduler.get("env", {}).get("ICECC_P50_PROFILE")
+    rejoin = coordination.get("scheduler_rejoin")
+    login_line = rejoin.get("login_line") if isinstance(rejoin, Mapping) else None
+    cache_line = rejoin.get("cache_line") if isinstance(rejoin, Mapping) else None
+    role_login = (
+        ROLE_LOGIN_RE.search(login_line) if isinstance(login_line, str) else None
+    )
+    cache_relogin = LOGIN_RE.search(cache_line) if isinstance(cache_line, str) else None
+    cache_login = (
+        CACHE_LOGIN_RE.search(cache_line) if isinstance(cache_line, str) else None
+    )
+    advertised = cache_login.group(4).split() if cache_login is not None else []
+    profile_token = (
+        expected_profile.lower() if isinstance(expected_profile, str) else None
+    )
+    if (
+        not isinstance(rejoin, Mapping)
+        or set(rejoin)
+        != {
+            "cache_line",
+            "cache_protocol",
+            "host",
+            "login_line",
+            "log_path",
+            "loss_job_ids",
+            "offset",
+            "profile",
+            "role_protocol",
+            "scheduler",
+            "target",
+        }
+        or rejoin.get("host") != expected_scheduler_host
+        or rejoin.get("log_path") != expected_scheduler_log
+        or rejoin.get("scheduler") != scheduler["name"]
+        or rejoin.get("target") != target["name"]
+        or rejoin.get("profile") != expected_profile
+        or rejoin.get("role_protocol") != 50
+        or rejoin.get("cache_protocol") != 1
+        or type(rejoin.get("offset")) is not int
+        or rejoin["offset"] < 0
+        or role_login is None
+        or role_login.group(1) != target["name"]
+        or role_login.group(2) != "50"
+        or cache_relogin is None
+        or cache_relogin.group(1) != target["name"]
+        or cache_login is None
+        or cache_login.group(2) != "1"
+        or cache_login.group(3) != "1"
+        or profile_token is None
+        or profile_token not in advertised
+        or not isinstance(rejoin.get("loss_job_ids"), list)
+        or len(rejoin["loss_job_ids"]) != len(set(rejoin["loss_job_ids"]))
+        or any(type(item) is not int or item < 1 for item in rejoin["loss_job_ids"])
+    ):
+        raise CollectError(f"{prefix} has invalid fresh scheduler rejoin")
+
+
+def _event_role_hash(farm: FarmSpec, label: str, role: str) -> str:
+    match = re.match(r"^p(43|44|50)(?:s[0-9]+)?(?:-|$)", label.rsplit(":", 1)[-1], re.IGNORECASE)
+    if match is None:
+        raise CollectError(f"image {label!r} has no protocol generation")
+    authority = farm.data["authority"]["images"].get(label)
+    if not isinstance(authority, dict):
+        raise CollectError(f"image {label!r} is absent from the authority")
+    role_key = {"S": "scheduler", "C": "client", "F": "daemon"}[role]
+    if authority.get("kind") == "scheduler-mutant" and role == "S":
+        override = authority.get("role_overrides", {}).get("scheduler")
+        digest = override.get("sha256") if isinstance(override, dict) else None
+    elif authority.get("kind") == "daemon-mutant" and role == "F":
+        override = authority.get("role_overrides", {}).get("daemon")
+        digest = override.get("sha256") if isinstance(override, dict) else None
+    else:
+        store = farm.data["authority"]["role_stores"].get(match.group(1), {})
+        entry = store.get(role_key) if isinstance(store, dict) else None
+        digest = entry.get("sha256") if isinstance(entry, dict) else None
+    if not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None:
+        raise CollectError(f"image {label!r} has no authenticated {role_key} hash")
+    return digest
+
+
+def _event_image_version(label: str) -> int:
+    match = re.match(r"^p(43|44|50)(?:s[0-9]+)?(?:-|$)", label.rsplit(":", 1)[-1], re.IGNORECASE)
+    if match is None:
+        raise CollectError(f"image {label!r} has no protocol generation")
+    return int(match.group(1))
+
+
+def _transition_target_env(
+    before: Mapping[str, Any], event: Mapping[str, Any], role: str, target_label: str
+) -> dict[str, str]:
+    result = dict(before["env"])
+    if event["action"] == "env_set":
+        update = event.get("env")
+        if not isinstance(update, dict) or any(
+            type(key) is not str or type(value) is not str for key, value in update.items()
+        ):
+            raise CollectError("env_set timeline has malformed environment")
+        result.update(update)
+        return result
+    version = _event_image_version(target_label)
+    if role == "S":
+        if version == 50:
+            result.setdefault("ICECC_P50_PROFILE", "P29V1")
+        else:
+            result.pop("ICECC_P50_PROFILE", None)
+    elif role == "C":
+        if version == 50:
+            result.setdefault("ICECC_P50_MODE", "on")
+        else:
+            result.pop("ICECC_P50_MODE", None)
+            result.pop("ICECC_P50_FAULT_INJECTION", None)
+    return result
+
+
+def _transition_readiness_path(
+    farm: FarmSpec, plan: dict[str, Any], instance: Mapping[str, Any]
+) -> tuple[str, str]:
+    leaf = {"S": "scheduler.log", "C": "client-daemon.log", "F": "iceccd.log"}[instance["role"]]
+    return instance["host"], str(
+        instance_root(farm, instance["host"], plan["run_id"], instance["name"])
+        / "log"
+        / leaf
+    )
+
+
+def _validate_transition_coordination(
+    coordination: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+    event: Mapping[str, Any],
+    instance: Mapping[str, Any],
+    scenario: ScenarioSpec,
+    farm: FarmSpec,
+    plan: dict[str, Any],
+    evidence: Path | None,
+) -> bool:
+    role = instance["role"]
+    common = {
+        "clients",
+        "ready_ms",
+        "resume",
+        "scheduler_snapshot",
+        "worker_snapshot",
+        "workers",
+    }
+    role_fields = (
+        {"client_readiness", "scheduler_startup"}
+        if role == "S"
+        else {"scheduler_worker_rejoin"}
+    )
+    if set(coordination) != common | role_fields:
+        return False
+    ready_ms = coordination.get("ready_ms")
+    if type(ready_ms) is not int or ready_ms < 0 or ready_ms != event.get("fired_ms"):
+        return False
+    expected_workers = sorted(
+        item["name"] for item in plan["topology"]["instances"] if item["role"] == "F"
+    )
+    if (
+        coordination.get("workers") != expected_workers
+        or not isinstance(coordination.get("scheduler_snapshot"), str)
+        or not coordination["scheduler_snapshot"]
+        or not isinstance(coordination.get("worker_snapshot"), str)
+        or any(
+            re.search(rf"(^|\s){re.escape(name)}(\s|$)", coordination["worker_snapshot"], re.MULTILINE)
+            is None
+            for name in expected_workers
+        )
+    ):
+        return False
+    expected_clients = set(scenario.data["workload"]["clients"]) if receipt.get("turn") else set()
+    pauses = coordination.get("clients")
+    resumes = coordination.get("resume")
+    if (
+        not isinstance(pauses, Mapping)
+        or not isinstance(resumes, Mapping)
+        or set(pauses) != expected_clients
+        or set(resumes) != expected_clients
+    ):
+        return False
+    gate_fields = {
+        "action", "active_after", "active_before", "client", "epoch",
+        "finished_ms", "schema", "started_ms", "status", "turn",
+    }
+    for name in sorted(expected_clients):
+        for action, status, value in (
+            ("pause", "PAUSED", pauses[name]),
+            ("resume", "OPEN", resumes[name]),
+        ):
+            if (
+                not isinstance(value, Mapping)
+                or set(value) != gate_fields
+                or value.get("schema") != "icefarm-event-gate-v1"
+                or value.get("action") != action
+                or value.get("status") != status
+                or value.get("client") != name
+                or value.get("turn") != receipt.get("turn")
+                or value.get("epoch") != receipt.get("event_epoch")
+                or any(type(value.get(field)) is not int or value[field] < 0 for field in (
+                    "active_after", "active_before", "finished_ms", "started_ms"
+                ))
+                or value["finished_ms"] < value["started_ms"]
+            ):
+                return False
+        if pauses[name]["active_after"] != 0:
+            return False
+
+    readiness = receipt.get("readiness")
+    expected_host, expected_path = _transition_readiness_path(farm, plan, instance)
+    if (
+        not isinstance(readiness, Mapping)
+        or readiness.get("host") != expected_host
+        or readiness.get("log_path") != expected_path
+        or readiness.get("role") != role
+        or not isinstance(readiness.get("offset"), int)
+        or readiness["offset"] < 0
+        or not isinstance(readiness.get("line"), str)
+    ):
+        return False
+    if role == "S":
+        if READINESS_SCHEDULER_RE.search(readiness["line"]) is None:
+            return False
+        startup = coordination.get("scheduler_startup")
+        clients = coordination.get("client_readiness")
+        if startup != readiness or not isinstance(clients, Mapping) or set(clients) != expected_clients:
+            return False
+        for name in sorted(expected_clients):
+            client = next((item for item in plan["topology"]["instances"] if item["name"] == name), None)
+            witness = clients[name]
+            required_cache = isinstance(client, Mapping) and client.get("env", {}).get("ICECC_P50_MODE") == "on"
+            if (
+                not isinstance(client, Mapping)
+                or client.get("role") != "C"
+                or not isinstance(witness, Mapping)
+                or set(witness) != {"cache_line", "cache_required", "connected_line", "host", "log_path", "offset"}
+                or witness.get("host") != client.get("host")
+                or witness.get("cache_required") is not required_cache
+                or not isinstance(witness.get("log_path"), str)
+                or not witness["log_path"].endswith(f"/{name}/log/client-daemon.log")
+                or not isinstance(witness.get("offset"), int)
+                or not isinstance(witness.get("connected_line"), str)
+                or "Connected to scheduler (I am known as " not in witness["connected_line"]
+                or (required_cache and (not isinstance(witness.get("cache_line"), str) or CACHE_READY_RE.search(witness["cache_line"]) is None))
+                or (not required_cache and witness.get("cache_line") is not None)
+                or not _retained_log_witness(
+                    evidence,
+                    client,
+                    witness.get("offset"),
+                    witness.get("connected_line"),
+                )
+                or (
+                    required_cache
+                    and not _retained_log_witness(
+                        evidence,
+                        client,
+                        witness.get("offset"),
+                        witness.get("cache_line"),
+                    )
+                )
+            ):
+                return False
+    else:
+        if DAEMON_START_RE.search(readiness["line"]) is None:
+            return False
+        rejoin = coordination.get("scheduler_worker_rejoin")
+        scheduler = next((item for item in plan["topology"]["instances"] if item["role"] == "S"), None)
+        event_index = event.get("event_index")
+        target_alias = (
+            scenario.data["timeline"][event_index].get("image")
+            if type(event_index) is int and 0 <= event_index < len(scenario.data["timeline"])
+            else None
+        )
+        target_label = scenario.data["images"].get(target_alias) if isinstance(target_alias, str) else None
+        target_protocol = _event_image_version(target_label) if isinstance(target_label, str) else None
+        if (
+            not isinstance(scheduler, Mapping)
+            or not isinstance(rejoin, Mapping)
+            or set(rejoin) != {"bytes", "host", "line", "log_path", "offset", "role_protocol", "target"}
+            or rejoin.get("host") != scheduler.get("host")
+            or not rejoin["log_path"].endswith(f"/{scheduler['name']}/log/scheduler.log")
+            or rejoin.get("target") != instance.get("name")
+            or rejoin.get("role_protocol") != target_protocol
+            or not isinstance(rejoin.get("offset"), int)
+            or not isinstance(rejoin.get("line"), str)
+            or re.search(rf"\blogin\s+{re.escape(instance['name'])}\s+protocol\s+version:\s*{target_protocol}\b", rejoin["line"]) is None
+            or not _retained_log_witness(
+                evidence,
+                scheduler,
+                rejoin.get("offset"),
+                rejoin.get("line"),
+            )
+        ):
+            return False
+    return True
+
+
+def _validate_client_transition_coordination(
+    coordination: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+    event: Mapping[str, Any],
+    instance: Mapping[str, Any],
+    scenario: ScenarioSpec,
+    farm: FarmSpec,
+    plan: dict[str, Any],
+    evidence: Path | None,
+) -> bool:
+    expected_clients = set(scenario.data["workload"]["clients"])
+    if set(coordination) != {"clients", "ready_ms", "relaunch", "resume"}:
+        return False
+    ready_ms = coordination.get("ready_ms")
+    if type(ready_ms) is not int or ready_ms < 0 or ready_ms != event.get("fired_ms"):
+        return False
+    pauses = coordination.get("clients")
+    resumes = coordination.get("resume")
+    if (
+        not isinstance(pauses, Mapping)
+        or not isinstance(resumes, Mapping)
+        or set(pauses) != expected_clients
+        or set(resumes) != expected_clients
+    ):
+        return False
+    gate_fields = {
+        "action", "active_after", "active_before", "client", "epoch",
+        "finished_ms", "schema", "started_ms", "status", "turn",
+    }
+    for name in sorted(expected_clients):
+        pause = pauses[name]
+        resume = resumes[name]
+        if (
+            not isinstance(pause, Mapping)
+            or not isinstance(resume, Mapping)
+            or set(pause) != gate_fields
+            or set(resume) != gate_fields
+            or pause.get("schema") != "icefarm-event-gate-v1"
+            or resume.get("schema") != "icefarm-event-gate-v1"
+            or pause.get("action") != "quiesce"
+            or pause.get("status") != "QUIESCED"
+            or resume.get("action") != "resume"
+            or resume.get("status") != "OPEN"
+            or pause.get("client") != name
+            or resume.get("client") != name
+            or pause.get("turn") != receipt.get("turn")
+            or resume.get("turn") != receipt.get("turn")
+            or pause.get("epoch") != receipt.get("event_epoch")
+            or resume.get("epoch") != receipt.get("event_epoch")
+            or pause.get("active_after") != 0
+            or any(
+                type(value.get(field)) is not int or value[field] < 0
+                for value in (pause, resume)
+                for field in ("active_after", "active_before", "finished_ms", "started_ms", "epoch")
+            )
+        ):
+            return False
+    checkpoints = receipt.get("checkpoints")
+    if not isinstance(checkpoints, Mapping) or set(checkpoints) != expected_clients:
+        return False
+    checkpoint_fields = {
+        "checkpoint_sha256", "client", "completed_rows", "completed_rows_sha256",
+        "expected_jobs", "schema", "status", "turn", "worklist_sha256",
+    }
+    for name in sorted(expected_clients):
+        checkpoint = checkpoints[name]
+        if (
+            not isinstance(checkpoint, Mapping)
+            or set(checkpoint) != checkpoint_fields
+            or checkpoint.get("schema") != "icefarm-workload-checkpoint-v1"
+            or checkpoint.get("status") != "QUIESCED"
+            or checkpoint.get("client") != name
+            or checkpoint.get("turn") != receipt.get("turn")
+            or type(checkpoint.get("expected_jobs")) is not int
+            or checkpoint["expected_jobs"] < 1
+            or not SHA256_RE.fullmatch(str(checkpoint.get("checkpoint_sha256")))
+            or not SHA256_RE.fullmatch(str(checkpoint.get("completed_rows_sha256")))
+            or not SHA256_RE.fullmatch(str(checkpoint.get("worklist_sha256")))
+            or not isinstance(checkpoint.get("completed_rows"), list)
+            or not checkpoint["completed_rows"]
+        ):
+            return False
+        rows = checkpoint["completed_rows"]
+        seen: set[int] = set()
+        for row in rows:
+            if (
+                not isinstance(row, Mapping)
+                or set(row) != {"index", "path", "sha256"}
+                or type(row.get("index")) is not int
+                or not 1 <= row["index"] <= checkpoint["expected_jobs"]
+                or row["index"] in seen
+                or not isinstance(row.get("path"), str)
+                or row["path"] != f"jobs/{row['index']:06d}/result.tsv"
+                or not isinstance(row.get("sha256"), str)
+                or SHA256_RE.fullmatch(row["sha256"]) is None
+            ):
+                return False
+            seen.add(row["index"])
+            if evidence is not None:
+                path = _checkpoint_result_path(
+                    evidence, name, receipt["turn"], row["path"]
+                )
+                if path is None:
+                    return False
+                if hashlib.sha256(path.read_bytes()).hexdigest() != row["sha256"]:
+                    return False
+        canonical = json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()
+        body = dict(checkpoint)
+        digest = body.pop("checkpoint_sha256")
+        if (
+            checkpoint["completed_rows_sha256"] != hashlib.sha256(canonical).hexdigest()
+            or digest
+            != hashlib.sha256(
+                json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+        ):
+            return False
+    relaunch = coordination.get("relaunch")
+    if not isinstance(relaunch, Mapping) or set(relaunch) != expected_clients:
+        return False
+    for name in sorted(expected_clients):
+        value = relaunch[name]
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != {"client", "expected_jobs", "failures", "jobs", "status"}
+            or value.get("client") != name
+            or value.get("status") != "COMPLETE"
+            or type(value.get("expected_jobs")) is not int
+            or type(value.get("jobs")) is not int
+            or type(value.get("failures")) is not int
+            or value["expected_jobs"] != checkpoints[name]["expected_jobs"]
+            or value["jobs"] != value["expected_jobs"]
+            or value["failures"] != 0
+        ):
+            return False
+    return True
+
+
+def _validate_transition_receipt(
+    receipt: Any,
+    event: Mapping[str, Any],
+    scenario: ScenarioSpec,
+    index: int,
+    *,
+    farm: FarmSpec | None = None,
+    plan: dict[str, Any] | None = None,
+    continuity: dict[str, dict[str, Any]] | None = None,
+    evidence: Path | None = None,
+) -> None:
+    coordinated = isinstance(receipt, dict) and receipt.get("schema") in {
+        "icefarm-transition-v2",
+        "icefarm-client-transition-v1",
+    }
+    client_coordinated = isinstance(receipt, dict) and receipt.get("schema") == "icefarm-client-transition-v1"
+    expected_fields = {
+        "action",
+        "instance",
+        "before",
+        "after",
+        "preflight",
+        "readiness",
+    }
+    if coordinated:
+        expected_fields |= {"coordination", "event_epoch", "schema", "turn"}
+    if client_coordinated:
+        expected_fields |= {"checkpoints", "client_readiness"}
+    if not isinstance(receipt, dict) or set(receipt) != expected_fields:
+        raise CollectError(f"events.json event {index} has invalid transition receipt")
+    if receipt["action"] != event["action"] or receipt["instance"] != event["instance"]:
+        raise CollectError(f"events.json event {index} transition receipt is not bound")
+    instance = None
+    if coordinated:
+        if receipt.get("event_epoch") != event.get("event_epoch"):
+            raise CollectError(f"events.json event {index} transition epoch is not bound")
+        if farm is None or plan is None:
+            raise CollectError(f"events.json event {index} coordinated transition needs farm and plan")
+        instance = next(
+            (item for item in plan["topology"]["instances"] if item["name"] == event["instance"]),
+            None,
+        )
+        expected_roles = {"C"} if client_coordinated else {"S", "F"}
+        if not isinstance(instance, Mapping) or instance.get("role") not in expected_roles:
+            raise CollectError(f"events.json event {index} coordinated transition has unsupported role")
+        coordination = receipt.get("coordination")
+        valid_coordination = (
+            _validate_client_transition_coordination(
+                coordination, receipt, event, instance, scenario, farm, plan, evidence
+            )
+            if client_coordinated
+            else _validate_transition_coordination(
+                coordination,
+                receipt,
+                event,
+                instance,
+                scenario,
+                farm,
+                plan,
+                evidence,
+            )
+        )
+        if not isinstance(coordination, Mapping) or not valid_coordination:
+            raise CollectError(f"events.json event {index} has invalid transition coordination")
+    preflight = receipt["preflight"]
+    if not isinstance(preflight, dict) or set(preflight) != {
+        "image_closure_sha256",
+        "role_sha256",
+        "runtime_path",
+    }:
+        raise CollectError(f"events.json event {index} has invalid preflight receipt")
+    for key in ("image_closure_sha256", "role_sha256"):
+        value = preflight[key]
+        if (
+            type(value) is not str
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise CollectError(f"events.json event {index} has invalid preflight digest")
+    if (
+        type(preflight["runtime_path"]) is not str
+        or not preflight["runtime_path"].startswith("/")
+        or ".." in preflight["runtime_path"].split("/")
+    ):
+        raise CollectError(f"events.json event {index} has invalid runtime path")
+    readiness = receipt["readiness"]
+    if not isinstance(readiness, dict) or set(readiness) != {
+        "host",
+        "line",
+        "log_path",
+        "offset",
+        "role",
+    }:
+        raise CollectError(f"events.json event {index} has invalid readiness receipt")
+    if (
+        type(readiness["host"]) is not str
+        or not readiness["host"]
+        or type(readiness["line"]) is not str
+        or not readiness["line"]
+        or type(readiness["log_path"]) is not str
+        or not readiness["log_path"].startswith("/")
+        or type(readiness["offset"]) is not int
+        or readiness["offset"] < 0
+        or readiness["role"] not in {"S", "C", "F"}
+    ):
+        raise CollectError(f"events.json event {index} has malformed readiness receipt")
+    if client_coordinated:
+        target_host, target_path = _transition_readiness_path(farm, plan, instance)
+        if (
+            readiness["role"] != "C"
+            or readiness["host"] != target_host
+            or readiness["log_path"] != target_path
+        ):
+            raise CollectError(
+                f"events.json event {index} readiness witness is not bound to the client"
+            )
+        client_readiness = receipt.get("client_readiness")
+        after_snapshot = receipt.get("after")
+        if (
+            not isinstance(after_snapshot, Mapping)
+            or not isinstance(after_snapshot.get("image"), str)
+            or not isinstance(after_snapshot.get("env"), Mapping)
+        ):
+            raise CollectError(f"events.json event {index} has invalid client after state")
+        try:
+            after_version = _event_image_version(after_snapshot["image"])
+        except CollectError as exc:
+            raise CollectError(
+                f"events.json event {index} has invalid client image version"
+            ) from exc
+        cache_required = (
+            after_version == 50
+            and after_snapshot["env"].get("ICECC_P50_MODE") == "on"
+        )
+        if (
+            not isinstance(client_readiness, Mapping)
+            or set(client_readiness) != {
+                "cache_line", "cache_required", "connected_line", "host", "log_path", "offset"
+            }
+            or client_readiness.get("host") != target_host
+            or client_readiness.get("log_path") != target_path
+            or type(client_readiness.get("offset")) is not int
+            or client_readiness["offset"] < 0
+            or client_readiness["offset"] != readiness["offset"]
+            or not isinstance(client_readiness.get("connected_line"), str)
+            or "Connected to scheduler (I am known as " not in client_readiness["connected_line"]
+            or type(client_readiness.get("cache_required")) is not bool
+            or client_readiness["cache_required"] is not cache_required
+            or (
+                cache_required
+                and (
+                    not isinstance(client_readiness.get("cache_line"), str)
+                    or CACHE_READY_RE.search(client_readiness["cache_line"]) is None
+                )
+            )
+            or (not cache_required and client_readiness.get("cache_line") is not None)
+            or not _retained_log_witness(
+                evidence,
+                instance,
+                client_readiness.get("offset"),
+                client_readiness.get("connected_line"),
+            )
+            or (
+                cache_required
+                and not _retained_log_witness(
+                    evidence,
+                    instance,
+                    client_readiness.get("offset"),
+                    client_readiness.get("cache_line"),
+                )
+            )
+        ):
+            raise CollectError(f"events.json event {index} has invalid client readiness")
+    readiness_pattern = (
+        READINESS_SCHEDULER_RE if readiness["role"] == "S" else DAEMON_START_RE
+    )
+    if readiness_pattern.search(readiness["line"]) is None:
+        raise CollectError(f"events.json event {index} readiness witness is not a startup observation")
+    snapshot_fields = {"container_id", "closure_sha256", "env", "image", "role_sha256"}
+    for side in ("before", "after"):
+        snapshot = receipt[side]
+        if not isinstance(snapshot, dict) or set(snapshot) != snapshot_fields:
+            raise CollectError(f"events.json event {index} has invalid {side} snapshot")
+        for key in ("closure_sha256", "role_sha256"):
+            value = snapshot[key]
+            if (
+                type(value) is not str
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise CollectError(f"events.json event {index} has invalid {side} digest")
+        if (
+            type(snapshot["container_id"]) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", snapshot["container_id"]) is None
+            or type(snapshot["image"]) is not str
+            or not snapshot["image"]
+            or type(snapshot["env"]) is not dict
+            or any(type(key) is not str or type(value) is not str for key, value in snapshot["env"].items())
+        ):
+            raise CollectError(f"events.json event {index} has invalid {side} snapshot")
+    before = receipt["before"]
+    after = receipt["after"]
+    if (
+        preflight["image_closure_sha256"] != after["closure_sha256"]
+        or preflight["role_sha256"] != after["role_sha256"]
+        or not preflight["runtime_path"].endswith(
+            f"/runtimes/{after['closure_sha256']}/root"
+        )
+    ):
+        raise CollectError(f"events.json event {index} preflight receipt is not bound to after state")
+    if event["action"] in {"upgrade", "downgrade"}:
+        image_alias = scenario.data["timeline"][index].get("image")
+        if not isinstance(image_alias, str):
+            raise CollectError(f"events.json event {index} lacks an image alias")
+        expected_label = scenario.data["images"].get(image_alias)
+        if after["image"] != expected_label:
+            raise CollectError(f"events.json event {index} after image is not bound to the timeline")
+        before_version = _event_image_version(before["image"])
+        after_version = _event_image_version(after["image"])
+        if event["action"] == "upgrade" and after_version <= before_version:
+            raise CollectError(f"events.json event {index} upgrade did not increase protocol generation")
+        if event["action"] == "downgrade" and after_version >= before_version:
+            raise CollectError(f"events.json event {index} downgrade did not decrease protocol generation")
+    elif event["action"] == "env_set":
+        update = scenario.data["timeline"][index].get("env")
+        if (
+            before["image"] != after["image"]
+            or before["closure_sha256"] != after["closure_sha256"]
+            or before["role_sha256"] != after["role_sha256"]
+            or not isinstance(update, dict)
+            or any(after["env"].get(key) != value for key, value in update.items())
+        ):
+            raise CollectError(f"events.json event {index} env_set receipt is not bound")
+    if farm is None or plan is None or continuity is None:
+        return
+    if instance is None:
+        instance = next(
+            (item for item in plan["topology"]["instances"] if item["name"] == event["instance"]),
+            None,
+        )
+    if instance is None:
+        raise CollectError(f"events.json event {index} targets an unknown planned instance")
+    expected_ready_host, expected_ready_path = _transition_readiness_path(farm, plan, instance)
+    if (
+        readiness["role"] != instance["role"]
+        or readiness["host"] != expected_ready_host
+        or readiness["log_path"] != expected_ready_path
+        or not _retained_log_witness(
+            evidence,
+            instance,
+            readiness["offset"],
+            readiness["line"],
+        )
+    ):
+        raise CollectError(f"events.json event {index} readiness witness is not bound to the instance")
+    previous = continuity.get(event["instance"])
+    if previous is None:
+        expected_before = {
+            "closure_sha256": instance["image"]["closure_sha256"],
+            "env": dict(instance.get("env", {})),
+            "image": instance["image"]["label"],
+            "role_sha256": instance["sha256"],
+        }
+        if any(before[key] != value for key, value in expected_before.items()):
+            raise CollectError(f"events.json event {index} before snapshot differs from the planned instance")
+    elif any(before[key] != previous[key] for key in ("closure_sha256", "env", "image", "role_sha256", "container_id")):
+        raise CollectError(f"events.json event {index} before snapshot breaks transition continuity")
+    if after["container_id"] == before["container_id"]:
+        raise CollectError(f"events.json event {index} did not create a fresh container")
+    if event["action"] in {"upgrade", "downgrade"}:
+        label = scenario.data["images"][scenario.data["timeline"][index]["image"]]
+    else:
+        label = before["image"]
+    authority = farm.data["authority"]["images"].get(label)
+    if not isinstance(authority, dict) or after["closure_sha256"] != authority.get("closure_sha256"):
+        raise CollectError(f"events.json event {index} after closure is not authority-bound")
+    if after["role_sha256"] != _event_role_hash(farm, label, instance["role"]):
+        raise CollectError(f"events.json event {index} after role hash is not authority-bound")
+    if event["action"] == "env_set" and after["image"] != before["image"]:
+        raise CollectError(f"events.json event {index} env_set changed the image identity")
+    if after["env"] != _transition_target_env(before, scenario.data["timeline"][index], instance["role"], label):
+        raise CollectError(f"events.json event {index} after environment is not bound to the transition")
+    continuity[event["instance"]] = after
+
+
 def _epoch_at(events: list[dict[str, Any]], dispatch_ms: int) -> int:
     return sum(event["fired_ms"] <= dispatch_ms for event in events)
+
+
+def _instance_version_at(
+    instance: Mapping[str, Any],
+    events: list[dict[str, Any]],
+    dispatch_ms: int,
+) -> int:
+    """Resolve one endpoint generation at an authenticated dispatch boundary."""
+
+    version = instance.get("version")
+    if type(version) is not int or version < 1:
+        raise CollectError("planned instance has no valid protocol generation")
+    name = instance.get("name")
+    for event in events:
+        fired_ms = event.get("fired_ms")
+        if type(fired_ms) is not int:
+            raise CollectError("event has no valid fired timestamp")
+        if fired_ms > dispatch_ms:
+            break
+        if (
+            event.get("instance") != name
+            or event.get("action") not in {"upgrade", "downgrade"}
+        ):
+            continue
+        receipt = event.get("receipt")
+        after = receipt.get("after") if isinstance(receipt, Mapping) else None
+        label = after.get("image") if isinstance(after, Mapping) else None
+        if not isinstance(label, str):
+            raise CollectError(
+                f"transition for {name!r} has no authenticated after image"
+            )
+        version = _event_image_version(label)
+    return version
 
 
 def _job_result(path: Path) -> dict[str, Any]:
@@ -595,7 +2954,10 @@ def _job_result(path: Path) -> dict[str, Any]:
         raise CollectError(f"{path}: job index/timestamps are invalid")
     if integers["exact"] not in (0, 1) or integers["remote"] not in (0, 1):
         raise CollectError(f"{path}: exact/remote flag is invalid")
-    if SHA256_RE.fullmatch(remote_sha) is None or SHA256_RE.fullmatch(local_sha) is None:
+    if (
+        SHA256_RE.fullmatch(remote_sha) is None
+        or SHA256_RE.fullmatch(local_sha) is None
+    ):
         raise CollectError(f"{path}: object digest is invalid")
     recomputed_exact = integers["compile_rc"] == 0 and remote_sha == local_sha
     if bool(integers["exact"]) != recomputed_exact:
@@ -613,15 +2975,28 @@ def _job_result(path: Path) -> dict[str, Any]:
     }
 
 
-def _profile_marker(job_dir: Path) -> tuple[str, int, int] | None:
-    content = _text(job_dir / "client-debug.log") + "\n" + _text(
-        job_dir / "client-output.log"
+def _profile_marker(job_dir: Path) -> dict[str, Any] | None:
+    content = (
+        _text(job_dir / "client-debug.log")
+        + "\n"
+        + _text(job_dir / "client-output.log")
     )
-    matches = PROFILE_RE.findall(content)
-    unique = {(profile, int(raw), int(tu)) for profile, raw, tu in matches}
+    matches = list(PROFILE_RE.finditer(content))
+    unique = {
+        (match.group(1), int(match.group(2)), int(match.group(3)))
+        for match in matches
+    }
     if len(unique) > 1:
         raise CollectError(f"{job_dir}: conflicting P50 commit markers")
-    return next(iter(unique)) if unique else None
+    if not matches:
+        return None
+    profile, raw_bytes, tu_seq = next(iter(unique))
+    return {
+        "line": content.count("\n", 0, matches[0].start()) + 1,
+        "profile": profile,
+        "raw_bytes": raw_bytes,
+        "tu_seq": tu_seq,
+    }
 
 
 def _endpoint_workers(plan: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -629,7 +3004,9 @@ def _endpoint_workers(plan: dict[str, Any]) -> dict[str, dict[str, Any]]:
     for instance in plan["topology"]["instances"]:
         if instance["role"] != "F":
             continue
-        endpoint = f"{instance['address']}:{plan['ports']['instances'][instance['name']]}"
+        endpoint = (
+            f"{instance['address']}:{plan['ports']['instances'][instance['name']]}"
+        )
         if endpoint in result:
             raise CollectError(f"duplicate worker endpoint {endpoint}")
         result[endpoint] = instance
@@ -654,43 +3031,168 @@ def _parse_rows(
         for item in topology
         if item["role"] == "F"
     }
+    f_legacy_wires = {
+        item["name"]: _legacy_wire_results(
+            _instance_results(evidence, item["name"]) / "f-legacy-wire.jsonl", "F"
+        )
+        for item in topology
+        if item["role"] == "F"
+    }
     rows: list[dict[str, Any]] = []
     raw_jobs: list[dict[str, Any]] = []
+    assignment_claims: list[dict[str, Any]] = []
     compile_failures: list[str] = []
     local_fallbacks: list[str] = []
     error106: list[str] = []
+    source_mutex_records: list[dict[str, Any]] = []
+    legacy_wire_records: list[dict[str, Any]] = []
+    s30_refusals: list[dict[str, Any]] = []
+    s30_canary_refusals: list[dict[str, Any]] = []
+    if scenario.data.get("id") == "S30-mutant-f-refusal":
+        for item in topology:
+            if item["role"] == "F" and item["image"].get("kind") == "daemon-mutant":
+                s30_refusals.extend(
+                    _s30_mutant_refusals(
+                        _instance_results(evidence, item["name"])
+                        / "s30-mutant-f.jsonl"
+                    )
+                )
+                s30_canary_refusals.extend(
+                    _s30_mutant_refusals(
+                        _instance_results(evidence, item["name"])
+                        / "s30-mutant-f-canary.jsonl"
+                    )
+                )
+        expected_canary_refusals = len(scenario.data["workload"]["clients"]) * sum(
+            item["role"] == "F" and item["image"].get("kind") == "daemon-mutant"
+            for item in topology
+        )
+        if len(s30_canary_refusals) != expected_canary_refusals:
+            raise CollectError(
+                "S30 mutant canary refusal count does not match client/worker readiness pairs"
+            )
 
     for client_name in scenario.data["workload"]["clients"]:
         client = by_name[client_name]
         results = _instance_results(evidence, client_name)
         source_results = _source_results(results / "source-result.jsonl")
+        compile_identities = _compile_identities(results / "compile-identity.jsonl")
+        c_legacy_wires = _legacy_wire_results(results / "c-legacy-wire.jsonl", "C")
         c_commits = _action_commits(
             results / "c-action.jsonl",
             frozenset(("COMMIT_ACCEPTED", "LOST_COMMIT_ACCEPTED")),
         )
-        job_paths = sorted((results / "workload" / "jobs").glob("*/result.tsv"))
+        workload_root = results / "workload"
+        job_paths = sorted(
+            [
+                *workload_root.glob("jobs/*/result.tsv"),
+                *workload_root.glob("*/jobs/*/result.tsv"),
+            ]
+        )
         if not job_paths:
             raise CollectError(f"client {client_name} has no workload job rows")
         for path in job_paths:
             raw = _job_result(path)
-            raw_jobs.append({"client": client_name, **raw})
             if not raw["scheduler_job"].isdigit():
                 raise CollectError(f"{path}: scheduler job id is not numeric")
             scheduler_job = int(raw["scheduler_job"])
             worker = workers.get(raw["worker"])
             if worker is None:
-                raise CollectError(f"{path}: assignment names unknown worker {raw['worker']!r}")
-            job_id = f"{client_name}:{scheduler_job}"
-            job_dir = path.parent
-            log_text = _text(job_dir / "client-debug.log") + "\n" + _text(
-                job_dir / "client-output.log"
-            )
-            marker = _profile_marker(job_dir)
-            source = source_results.get(scheduler_job)
-            if marker is not None and source is None:
                 raise CollectError(
-                    f"{job_id}: P50 commit marker has no exact source-result witness"
+                    f"{path}: assignment names unknown worker {raw['worker']!r}"
                 )
+            job_id = f"{client_name}:{raw['turn']}:{raw['index']}:{scheduler_job}"
+            job_dir = path.parent
+            log_text = (
+                _text(job_dir / "client-debug.log")
+                + "\n"
+                + _text(job_dir / "client-output.log")
+            )
+            assignments = _client_assignments(log_text, str(job_dir))
+            if len(assignments) != raw["retries"] + 1:
+                raise CollectError(
+                    f"{job_id}: wrapper retry count does not match assignment evidence"
+                )
+            for attempt_index, assignment in enumerate(assignments):
+                assigned_worker = workers.get(assignment["endpoint"])
+                if assigned_worker is None:
+                    raise CollectError(
+                        f"{job_id}: assignment names unknown worker "
+                        f"{assignment['endpoint']!r}"
+                    )
+                assignment.update(
+                    {
+                        "attempt_index": attempt_index,
+                        "client": client_name,
+                        "kind": "workload",
+                        "row_job_id": job_id,
+                        "turn": raw["turn"],
+                        "worker": assigned_worker["name"],
+                    }
+                )
+                assignment_claims.append(assignment)
+            final_assignment = assignments[-1]
+            if (
+                final_assignment["scheduler_job"] != scheduler_job
+                or final_assignment["endpoint"] != raw["worker"]
+            ):
+                raise CollectError(
+                    f"{job_id}: result row does not name its final assignment"
+                )
+            raw_job = {
+                "assignment_claims": assignments,
+                "client": client_name,
+                "row_job_id": job_id,
+                **raw,
+            }
+            raw_jobs.append(raw_job)
+            marker = _profile_marker(job_dir)
+            candidates = [
+                (key, source)
+                for key, source in source_results.items()
+                if key[0] == scheduler_job
+            ]
+            authenticated = []
+            if marker is not None:
+                authenticated = [
+                    source
+                    for key, source in candidates
+                    if key in compile_identities
+                    and source["profile"] == marker["profile"]
+                    and source["raw_bytes"] == marker["raw_bytes"]
+                    and source["tu_seq"] == marker["tu_seq"]
+                ]
+            if len(authenticated) > 1 or (marker is None and len(candidates) > 1):
+                raise CollectError(f"{job_id}: source-result assignment is ambiguous")
+            source = (
+                authenticated[0]
+                if marker is not None and len(authenticated) == 1
+                else candidates[0][1]
+                if marker is None and len(candidates) == 1
+                else None
+            )
+            legacy_candidates = [
+                (key, wire)
+                for key, wire in c_legacy_wires.items()
+                if key[0] == scheduler_job
+                and key in compile_identities
+                and compile_identities[key]["c_guid"] == wire["c_guid"]
+                and compile_identities[key]["tu_seq"] == wire["tu_seq"]
+            ]
+            if len(legacy_candidates) > 1:
+                raise CollectError(f"{job_id}: legacy-wire assignment is ambiguous")
+            legacy_key, legacy_wire = (
+                legacy_candidates[0] if legacy_candidates else (None, None)
+            )
+            if source is not None and legacy_wire is not None:
+                raise CollectError(f"{job_id}: source and legacy-wire evidence overlap")
+            if marker is not None and source is None:
+                if legacy_wire is None:
+                    raise CollectError(
+                        f"{job_id}: P50 commit marker has no full-identity "
+                        "source-result witness"
+                    )
+                raw_job["orphan_recovery_marker"] = marker
             tail_present = source is not None
             profile = source["profile"] if source is not None else None
             outcome = "none"
@@ -702,15 +3204,14 @@ def _parse_rows(
                 if marker is None:
                     outcome = "refused"
                 else:
-                    marker_profile, marker_raw, marker_tu = marker
                     key = (source["c_store_guid"], source["tu_seq"])
                     attached = attachments.get((worker["name"], scheduler_job))
                     committed = (
                         source["status"] == 0
                         and source["attempts"] >= 1
-                        and marker_profile == profile
-                        and marker_raw == source["raw_bytes"]
-                        and marker_tu == source["tu_seq"]
+                        and marker["profile"] == profile
+                        and marker["raw_bytes"] == source["raw_bytes"]
+                        and marker["tu_seq"] == source["tu_seq"]
                         and key in c_commits
                         and key in f_commits[worker["name"]]
                         and attached == profile
@@ -720,6 +3221,46 @@ def _parse_rows(
                 c_to_f = source["c_to_f_bytes"]
                 f_to_c = source["f_to_c_bytes"]
                 transfer_retries = max(0, source["attempts"] - 1)
+                source_mutex_records.append(
+                    {
+                        "client_instance": client_name,
+                        "job_id": job_id,
+                        "outcome": outcome,
+                        "profile": profile,
+                        "service_ns": source["source_mutex_service_ns"],
+                        "turn": raw["turn"],
+                        "wait_ns": source["source_mutex_wait_ns"],
+                    }
+                )
+            elif legacy_wire is not None:
+                f_wire = f_legacy_wires[worker["name"]].get(legacy_key)
+                if f_wire is None:
+                    raise CollectError(f"{job_id}: C legacy-wire result has no F peer")
+                if (
+                    f_wire["c_guid"] != legacy_wire["c_guid"]
+                    or f_wire["tu_seq"] != legacy_wire["tu_seq"]
+                    or legacy_wire["c_to_f_sent_bytes"]
+                    != f_wire["c_to_f_received_bytes"]
+                    or legacy_wire["f_to_c_received_bytes"]
+                    != f_wire["f_to_c_sent_bytes"]
+                ):
+                    raise CollectError(
+                        f"{job_id}: legacy-wire bytes/identity do not conserve"
+                    )
+                c_to_f = legacy_wire["c_to_f_sent_bytes"]
+                f_to_c = legacy_wire["f_to_c_received_bytes"]
+                legacy_wire_records.append(
+                    {
+                        "c_to_f_bytes": c_to_f,
+                        "client_instance": client_name,
+                        "f_to_c_bytes": f_to_c,
+                        "job_id": job_id,
+                        "turn": raw["turn"],
+                        "worker_instance": worker["name"],
+                    }
+                )
+                if scenario.data.get("id") == "S30-mutant-f-refusal":
+                    outcome = "fallback"
             if raw["compile_rc"] != 0:
                 compile_failures.append(job_id)
             if raw["remote"] != 1:
@@ -753,11 +3294,324 @@ def _parse_rows(
     duplicates = [job for job, count in Counter(identifiers).items() if count > 1]
     if duplicates:
         raise CollectError(f"acceptance job ids are not unique: {sorted(duplicates)!r}")
+    if scenario.data.get("id") == "S30-mutant-f-refusal":
+        fallback_rows = [row for row in rows if row["session_outcome"] == "fallback"]
+        if len(s30_refusals) != len(fallback_rows):
+            raise CollectError(
+                "S30 mutant refusal count does not equal fallback workload rows"
+            )
     return rows, {
         "compile_failure_job_ids": sorted(compile_failures),
         "error106_job_ids": sorted(error106),
         "local_fallback_job_ids": sorted(local_fallbacks),
+        "legacy_wire": {
+            "records": sorted(legacy_wire_records, key=lambda item: item["job_id"]),
+            "record_count": len(legacy_wire_records),
+        },
+        "source_mutex": {
+            "records": sorted(source_mutex_records, key=lambda item: item["job_id"]),
+            "record_count": len(source_mutex_records),
+            "service_total_ns": sum(
+                item["service_ns"] for item in source_mutex_records
+            ),
+            "wait_max_ns": max(
+                (item["wait_ns"] for item in source_mutex_records), default=0
+            ),
+            "wait_total_ns": sum(item["wait_ns"] for item in source_mutex_records),
+        },
+        "assignment_claims": assignment_claims,
         "raw_jobs": raw_jobs,
+        "s30_mutant_f": {
+            "canary_records": s30_canary_refusals,
+            "canary_refusal_count": len(s30_canary_refusals),
+            "schema": S30_MUTANT_TRACE_SCHEMA,
+            "records": s30_refusals,
+            "refusal_count": len(s30_refusals),
+        },
+    }
+
+
+def _canary_assignment_claims(
+    scenario: ScenarioSpec,
+    plan: dict[str, Any],
+    evidence: Path,
+) -> list[dict[str, Any]]:
+    """Authenticate the readiness dispatches which precede every workload."""
+
+    workers = _endpoint_workers(plan)
+    claims: list[dict[str, Any]] = []
+    worker_instances = sorted(
+        (item for item in plan["topology"]["instances"] if item["role"] == "F"),
+        key=lambda item: item["name"],
+    )
+    for client_name in sorted(scenario.data["workload"]["clients"]):
+        root = _instance_results(evidence, client_name) / "canary"
+        for worker in worker_instances:
+            pair = f"{client_name}->{worker['name']}"
+            debug_path = root / f"{worker['name']}.client.log"
+            output_path = root / f"{worker['name']}.stdout.log"
+            if not debug_path.is_file() or debug_path.is_symlink():
+                raise CollectError(
+                    f"readiness canary assignment log is absent for {pair}"
+                )
+            text = (
+                _text(debug_path)
+                + "\n"
+                + _text(
+                    output_path
+                    if output_path.is_file() and not output_path.is_symlink()
+                    else None
+                )
+            )
+            assignments = _client_assignments(text, str(debug_path))
+            if not assignments:
+                raise CollectError(
+                    f"readiness canary has no assignment evidence for {pair}"
+                )
+            for attempt_index, assignment in enumerate(assignments):
+                assigned_worker = workers.get(assignment["endpoint"])
+                if assigned_worker is None:
+                    raise CollectError(
+                        "readiness canary names unknown worker "
+                        f"{assignment['endpoint']!r}"
+                    )
+                assignment.update(
+                    {
+                        "attempt_index": attempt_index,
+                        "client": client_name,
+                        "kind": "canary",
+                        "row_job_id": None,
+                        "turn": None,
+                        "worker": assigned_worker["name"],
+                    }
+                )
+                claims.append(assignment)
+            if assignments[-1]["worker"] != worker["name"]:
+                raise CollectError(
+                    f"readiness canary for {pair} completed on "
+                    f"{assignments[-1]['worker']}"
+                )
+    return claims
+
+
+def _reconcile_scheduler_dispatches(
+    evidence: Path,
+    plan: dict[str, Any],
+    claims: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Require an exact scheduler-dispatch/assignment/terminal bijection."""
+
+    dispatches = _scheduler_jobs(evidence, plan)
+    scheduler_groups: dict[tuple[int, str, str], list[dict[str, Any]]] = defaultdict(
+        list
+    )
+    claim_groups: dict[tuple[int, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for dispatch in dispatches:
+        key = (dispatch["scheduler_job"], dispatch["client"], dispatch["worker"])
+        scheduler_groups[key].append(dispatch)
+    for claim in claims:
+        key = (claim["scheduler_job"], claim["client"], claim["worker"])
+        claim_groups[key].append(claim)
+    if set(scheduler_groups) != set(claim_groups):
+        missing = sorted(set(claim_groups) - set(scheduler_groups))
+        extra = sorted(set(scheduler_groups) - set(claim_groups))
+        raise CollectError(
+            f"scheduler dispatch/assignment keys differ missing={missing!r} extra={extra!r}"
+        )
+    for key in sorted(scheduler_groups):
+        observed = scheduler_groups[key]
+        asserted = claim_groups[key]
+        if len(observed) != len(asserted):
+            raise CollectError(
+                "scheduler dispatch/assignment multiplicity differs for "
+                f"{key}: scheduler={len(observed)} assignments={len(asserted)}"
+            )
+        if len(asserted) > 1:
+            claim_times = [item["observed_ms"] for item in asserted]
+            if len(set(claim_times)) != len(claim_times):
+                raise CollectError(
+                    f"scheduler generation is ambiguous for repeated assignment {key}"
+                )
+        for claim, dispatch in zip(
+            sorted(asserted, key=lambda item: item["observed_ms"]),
+            sorted(observed, key=lambda item: item["dispatch_line"]),
+            strict=True,
+        ):
+            claim["scheduler_record"] = dispatch
+    canary_count = sum(claim["kind"] == "canary" for claim in claims)
+    workload_count = len(claims) - canary_count
+    return {
+        "canary_dispatches": canary_count,
+        "generations": max(item["generation"] for item in dispatches),
+        "scheduler_dispatches": len(dispatches),
+        "workload_dispatches": workload_count,
+    }
+
+
+def _assignment_preference(
+    scenario: ScenarioSpec,
+    plan: dict[str, Any],
+    claims: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Replay compatible-free preference from reconciled assignment claims.
+
+    Readiness canaries are intentionally excluded.  Every workload claim must
+    already carry its authenticated scheduler record from reconciliation; this
+    function only derives occupancy and the preference decision from that
+    record and the resolved topology.
+    """
+
+    topology = plan.get("topology")
+    if not isinstance(topology, Mapping):
+        raise CollectError("assignment preference has no resolved topology")
+    instances = topology.get("instances")
+    relationships = topology.get("relationships")
+    if not isinstance(instances, list) or not isinstance(relationships, list):
+        raise CollectError("assignment preference topology is malformed")
+    workers = [
+        item
+        for item in instances
+        if isinstance(item, Mapping) and item.get("role") == "F"
+    ]
+    worker_names = [item.get("name") for item in workers]
+    if any(not isinstance(name, str) or not name for name in worker_names):
+        raise CollectError("assignment preference has an unnamed worker")
+    if len(set(worker_names)) != len(worker_names):
+        raise CollectError("assignment preference has duplicate workers")
+    slots: dict[str, int] = {}
+    for worker in workers:
+        name = worker["name"]
+        value = worker.get("slots")
+        if type(value) is not int or value <= 0:
+            raise CollectError(f"assignment preference has invalid slots for {name!r}")
+        slots[name] = value
+    clients = {
+        item.get("name")
+        for item in instances
+        if isinstance(item, Mapping) and item.get("role") == "C"
+    }
+    workload_clients = scenario.data["workload"]["clients"]
+    if not isinstance(workload_clients, list) or any(
+        not isinstance(name, str) or name not in clients for name in workload_clients
+    ):
+        raise CollectError("assignment preference has invalid workload clients")
+    compatibility: dict[str, list[str]] = {name: [] for name in workload_clients}
+    seen_pairs: set[tuple[str, str]] = set()
+    for relationship in relationships:
+        if not isinstance(relationship, Mapping):
+            raise CollectError("assignment preference relationship is malformed")
+        client = relationship.get("c")
+        worker = relationship.get("f")
+        if (
+            not isinstance(client, str)
+            or client not in clients
+            or not isinstance(worker, str)
+            or worker not in slots
+            or type(relationship.get("cache_expected")) is not bool
+        ):
+            raise CollectError("assignment preference relationship is unbound")
+        pair = (client, worker)
+        if pair in seen_pairs:
+            raise CollectError(f"assignment preference duplicates relationship {pair!r}")
+        seen_pairs.add(pair)
+        if relationship["cache_expected"] and client in compatibility:
+            compatibility[client].append(worker)
+    expected_pairs = {(client, worker) for client in clients for worker in worker_names}
+    if seen_pairs != expected_pairs:
+        raise CollectError("assignment preference relationship matrix is incomplete")
+    for compatible_workers in compatibility.values():
+        compatible_workers.sort()
+    workload_claims: list[dict[str, Any]] = []
+    for claim in claims:
+        if not isinstance(claim, Mapping):
+            raise CollectError("assignment preference claim is malformed")
+        kind = claim.get("kind")
+        if kind == "canary":
+            continue
+        if kind != "workload":
+            raise CollectError("assignment preference claim has an unknown kind")
+        client = claim.get("client")
+        worker = claim.get("worker")
+        record = claim.get("scheduler_record")
+        if (
+            not isinstance(client, str)
+            or client not in compatibility
+            or not isinstance(worker, str)
+            or worker not in slots
+            or not isinstance(record, Mapping)
+        ):
+            raise CollectError("assignment preference workload claim is malformed")
+        dispatch_line = record.get("dispatch_line")
+        terminal_line = record.get("terminal_line")
+        if (
+            type(dispatch_line) is not int
+            or dispatch_line <= 0
+            or type(terminal_line) is not int
+            or terminal_line <= dispatch_line
+            or type(record.get("scheduler_job")) is not int
+            or record["scheduler_job"] <= 0
+            or record.get("client") != client
+            or record.get("worker") != worker
+            or not isinstance(claim.get("row_job_id"), str)
+            or not claim["row_job_id"]
+        ):
+            raise CollectError("assignment preference scheduler record is malformed")
+        workload_claims.append(claim)
+    workload_claims.sort(key=lambda item: item["scheduler_record"]["dispatch_line"])
+    dispatch_lines = [item["scheduler_record"]["dispatch_line"] for item in workload_claims]
+    if len(set(dispatch_lines)) != len(dispatch_lines):
+        raise CollectError("assignment preference has duplicate dispatch lines")
+    decisions: list[dict[str, Any]] = []
+    violations: list[str] = []
+    for index, claim in enumerate(workload_claims):
+        record = claim["scheduler_record"]
+        dispatch_line = record["dispatch_line"]
+        occupancy = {worker: 0 for worker in worker_names}
+        for prior in workload_claims[:index]:
+            prior_record = prior["scheduler_record"]
+            if (
+                prior_record["dispatch_line"] < dispatch_line
+                and dispatch_line < prior_record["terminal_line"]
+            ):
+                occupancy[prior["worker"]] += 1
+        compatible = compatibility[claim["client"]]
+        compatible_free = [
+            worker for worker in compatible if occupancy[worker] < slots[worker]
+        ]
+        escape = not compatible_free
+        preferred = bool(compatible_free and claim["worker"] in compatible_free)
+        if compatible_free and not preferred:
+            violations.append(claim["row_job_id"])
+        decisions.append(
+            {
+                "client": claim["client"],
+                "compatible_free_workers": compatible_free,
+                "compatible_workers": compatible,
+                "dispatch_line": dispatch_line,
+                "escape": escape,
+                "occupancy": occupancy,
+                "preferred": preferred,
+                "row_job_id": claim["row_job_id"],
+                "scheduler_job": record.get("scheduler_job"),
+                "worker": claim["worker"],
+            }
+        )
+    preferred_count = sum(item["preferred"] for item in decisions)
+    escape_count = sum(item["escape"] for item in decisions)
+    return {
+        "compatibility": {
+            client: sorted(compatibility[client]) for client in sorted(compatibility)
+        },
+        "counts": {
+            "checks": len(decisions),
+            "escapes": escape_count,
+            "preferred": preferred_count,
+            "violations": len(violations),
+        },
+        "decisions": decisions,
+        "schema": "icefarm-assignment-preference-v1",
+        "workers": {worker: slots[worker] for worker in sorted(slots)},
+        "violations": violations,
     }
 
 
@@ -794,7 +3648,7 @@ def _parse_logins(
                     },
                 )
             continue
-        endpoint, revision, _cache_protocol, profile_text = cache.groups()
+        endpoint, advertisement_format, cache_protocol, profile_text = cache.groups()
         profiles = []
         for raw in profile_text.split():
             profile = PROFILE_LABELS.get(raw)
@@ -802,16 +3656,66 @@ def _parse_logins(
                 raise CollectError(f"scheduler login names unknown profile {raw!r}")
             profiles.append(profile)
         latest[name] = {
+            "cache_protocol": int(cache_protocol),
             "cache_profiles": profiles,
             "instance": name,
             "protocol": instance["version"],
         }
-        revisions[name] = int(revision)
+        # `cache_wire=vN` names the stable three-word advertisement encoding.
+        # Pair compatibility is governed by the separately advertised
+        # cache_protocol value.
+        if int(advertisement_format) != 1:
+            raise CollectError(
+                f"scheduler login uses unsupported cache advertisement format "
+                f"v{advertisement_format}"
+            )
+        revisions[name] = int(cache_protocol)
         port_text = endpoint.rsplit(":", 1)[-1]
         if not port_text.isdigit() or not (1 <= int(port_text) <= 65535):
-            raise CollectError(f"scheduler login has invalid cache endpoint {endpoint!r}")
+            raise CollectError(
+                f"scheduler login has invalid cache endpoint {endpoint!r}"
+            )
         ports[name] = [int(port_text)]
     return [latest[name] for name in sorted(latest)], revisions, dict(ports)
+
+
+def _warm_hint_overrides(evidence: Path, plan: dict[str, Any]) -> dict[str, Any]:
+    topology = plan["topology"]["instances"]
+    scheduler = next(item for item in topology if item["role"] == "S")
+    worker_count = sum(item["role"] == "F" for item in topology)
+    log = _text(_one_role_log(evidence, scheduler))
+    events: list[dict[str, Any]] = []
+    for line_number, line in enumerate(log.splitlines(), start=1):
+        if "P50_WARM_HINT_OVERRIDE" not in line:
+            continue
+        match = WARM_HINT_OVERRIDE_RE.search(line)
+        if match is None:
+            raise CollectError(
+                f"scheduler warm-hint diagnostic is malformed at line {line_number}"
+            )
+        job, warm, compatible_free, idle_excluded = map(int, match.groups())
+        if not (
+            job >= 1
+            and 1 <= warm < compatible_free <= worker_count
+            and 1 <= idle_excluded <= compatible_free - warm
+        ):
+            raise CollectError(
+                f"scheduler warm-hint diagnostic is inconsistent at line {line_number}"
+            )
+        events.append(
+            {
+                "compatible_free": compatible_free,
+                "idle_excluded": idle_excluded,
+                "job_id": job,
+                "line": line_number,
+                "warm": warm,
+            }
+        )
+    return {
+        "count": len(events),
+        "events": events,
+        "job_ids": sorted({item["job_id"] for item in events}),
+    }
 
 
 def _oracle(evidence: Path, scenario: ScenarioSpec) -> dict[str, Any]:
@@ -819,56 +3723,147 @@ def _oracle(evidence: Path, scenario: ScenarioSpec) -> dict[str, Any]:
     mismatches: list[str] = []
     for client in scenario.data["workload"]["clients"]:
         root = _instance_results(evidence, client) / "workload"
-        summary: dict[str, int] = {}
-        try:
-            lines = (root / "oracle-summary.tsv").read_text(encoding="utf-8").splitlines()
-        except OSError as exc:
-            raise CollectError(f"cannot read oracle summary for {client}: {exc}") from exc
-        for line in lines:
-            fields = line.split("\t")
-            if len(fields) != 2 or not fields[1].isdigit() or fields[0] in summary:
-                raise CollectError(f"oracle summary for {client} is malformed")
-            summary[fields[0]] = int(fields[1])
-        if set(summary) != {"sample_total", "sample_mismatches"}:
-            raise CollectError(f"oracle summary for {client} has the wrong fields")
-        sample_total += summary["sample_total"]
-        try:
-            samples = (root / "oracle-samples.tsv").read_text(encoding="utf-8").splitlines()
-        except OSError as exc:
-            raise CollectError(f"cannot read oracle samples for {client}: {exc}") from exc
-        observed_mismatches = 0
-        for index, line in enumerate(samples, start=1):
-            fields = line.split("\t")
+        turn_roots = (
+            [root]
+            if (root / "oracle-summary.tsv").is_file()
+            else [root / turn for turn in scenario.data["workload"]["turns"]]
+        )
+        for turn_root in turn_roots:
+            summary: dict[str, int] = {}
+            try:
+                lines = (
+                    (turn_root / "oracle-summary.tsv")
+                    .read_text(encoding="utf-8")
+                    .splitlines()
+                )
+            except OSError as exc:
+                raise CollectError(
+                    f"cannot read oracle summary for {client}/{turn_root.name}: {exc}"
+                ) from exc
+            for line in lines:
+                fields = line.split("\t")
+                if len(fields) != 2 or not fields[1].isdigit() or fields[0] in summary:
+                    raise CollectError(f"oracle summary for {client} is malformed")
+                summary[fields[0]] = int(fields[1])
+            if set(summary) != {"sample_total", "sample_mismatches"}:
+                raise CollectError(f"oracle summary for {client} has the wrong fields")
+            sample_total += summary["sample_total"]
+            try:
+                samples = (
+                    (turn_root / "oracle-samples.tsv")
+                    .read_text(encoding="utf-8")
+                    .splitlines()
+                )
+            except OSError as exc:
+                raise CollectError(
+                    f"cannot read oracle samples for {client}/{turn_root.name}: {exc}"
+                ) from exc
+            observed_mismatches = 0
+            for index, line in enumerate(samples, start=1):
+                fields = line.split("\t")
+                if (
+                    len(fields) != 4
+                    or SHA256_RE.fullmatch(fields[1]) is None
+                    or SHA256_RE.fullmatch(fields[2]) is None
+                    or fields[3] not in ("0", "1")
+                ):
+                    raise CollectError(f"oracle sample {client}:{index} is malformed")
+                exact = fields[1] == fields[2]
+                if (fields[3] == "1") != exact:
+                    raise CollectError(
+                        f"oracle sample {client}:{index} exact flag disagrees"
+                    )
+                if not exact:
+                    observed_mismatches += 1
+                    mismatches.append(f"oracle:{client}:{fields[0]}")
             if (
-                len(fields) != 4
-                or SHA256_RE.fullmatch(fields[1]) is None
-                or SHA256_RE.fullmatch(fields[2]) is None
-                or fields[3] not in ("0", "1")
+                len(samples) != summary["sample_total"]
+                or observed_mismatches != summary["sample_mismatches"]
             ):
-                raise CollectError(f"oracle sample {client}:{index} is malformed")
-            exact = fields[1] == fields[2]
-            if (fields[3] == "1") != exact:
-                raise CollectError(f"oracle sample {client}:{index} exact flag disagrees")
-            if not exact:
-                observed_mismatches += 1
-                mismatches.append(f"oracle:{client}:{fields[0]}")
-        if len(samples) != summary["sample_total"] or observed_mismatches != summary["sample_mismatches"]:
-            raise CollectError(f"oracle summary for {client} disagrees with samples")
+                raise CollectError(
+                    f"oracle summary for {client} disagrees with samples"
+                )
     return {"sample_mismatch_job_ids": sorted(mismatches), "sample_total": sample_total}
 
 
 def _turn_completeness(
-    scenario: ScenarioSpec, plan: dict[str, Any], raw_jobs: list[dict[str, Any]]
+    scenario: ScenarioSpec,
+    plan: dict[str, Any],
+    evidence: Path,
+    raw_jobs: list[dict[str, Any]],
 ) -> list[str]:
     authority = plan["topology"]["corpus_authority"]
-    per_turn = authority["tus"] * authority.get("repeat", 1) * scenario.data["workload"]["repeat"]
-    observed = Counter((item["client"], item["turn"]) for item in raw_jobs)
+    repetitions = authority.get("repeat", 1) * scenario.data["workload"]["repeat"]
     incomplete: list[str] = []
     for client in scenario.data["workload"]["clients"]:
         for turn in scenario.data["workload"]["turns"]:
-            if observed[(client, turn)] != per_turn:
-                incomplete.append(f"{client}:{turn}")
-    extras = set(observed) - {
+            workload_root = _instance_results(evidence, client) / "workload"
+            turn_root = workload_root / turn
+            if not turn_root.is_dir():
+                turn_root = workload_root
+            manifest = turn_root / "corpus-manifest.sha256"
+            group = "files" if "files" in authority["archives"] else turn
+            archive = authority["archives"].get(group)
+            if archive is None:
+                raise CollectError(f"{client}:{turn}: corpus archive group is absent")
+            if not manifest.is_file() or manifest.is_symlink():
+                raise CollectError(
+                    f"{client}:{turn}: authenticated corpus manifest is absent"
+                )
+            if _sha256(manifest) != archive["manifest_sha256"]:
+                raise CollectError(f"{client}:{turn}: corpus manifest digest mismatch")
+            try:
+                lines = manifest.read_text(encoding="ascii").splitlines()
+            except (OSError, UnicodeError) as exc:
+                raise CollectError(
+                    f"{client}:{turn}: cannot read corpus manifest: {exc}"
+                ) from exc
+            relatives: list[str] = []
+            prefix = group + "/"
+            for line_number, line in enumerate(lines, start=1):
+                fields = line.split("  ", 1)
+                if (
+                    len(fields) != 2
+                    or SHA256_RE.fullmatch(fields[0]) is None
+                    or not fields[1].startswith(prefix)
+                ):
+                    raise CollectError(
+                        f"{client}:{turn}: malformed corpus manifest line {line_number}"
+                    )
+                relative = fields[1]
+                parts = Path(relative).parts
+                if (
+                    not relative
+                    or Path(relative).is_absolute()
+                    or any(part in ("", ".", "..") for part in parts)
+                ):
+                    raise CollectError(
+                        f"{client}:{turn}: unsafe corpus manifest line {line_number}"
+                    )
+                relatives.append(relative)
+            if len(relatives) != authority["tus"] or len(set(relatives)) != len(
+                relatives
+            ):
+                raise CollectError(
+                    f"{client}:{turn}: corpus manifest TU set is invalid"
+                )
+            expected = Counter(
+                (occurrence, relative)
+                for occurrence in range(repetitions)
+                for relative in relatives
+            )
+            selected = [
+                item
+                for item in raw_jobs
+                if item["client"] == client and item["turn"] == turn
+            ]
+            observed = Counter(
+                (item["occurrence"], item["relative"]) for item in selected
+            )
+            indexes = Counter(item["index"] for item in selected)
+            if observed != expected or indexes != Counter(range(1, len(expected) + 1)):
+                incomplete.append(f"{client}:{turn}:authenticated-tu-multiset")
+    extras = {(item["client"], item["turn"]) for item in raw_jobs} - {
         (client, turn)
         for client in scenario.data["workload"]["clients"]
         for turn in scenario.data["workload"]["turns"]
@@ -897,6 +3892,80 @@ def _process_count(evidence: Path, instance: Mapping[str, Any], sessions: int) -
     return 1 if sessions > 0 else 0
 
 
+def _validate_orphan_recovery_markers(
+    raw_jobs: list[dict[str, Any]], events: list[dict[str, Any]]
+) -> None:
+    """Admit a stale P50 marker only when a killed assignment was retried legacy."""
+
+    kill_events: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    restart_losses: set[tuple[str, int]] = set()
+    for event in events:
+        if event.get("action") == "kill -9":
+            kill_events[event["instance"]].append(event)
+        receipt = event.get("receipt")
+        coordination = (
+            receipt.get("coordination") if isinstance(receipt, Mapping) else None
+        )
+        rejoin = (
+            coordination.get("scheduler_rejoin")
+            if isinstance(coordination, Mapping)
+            else None
+        )
+        if (
+            event.get("action") == "restart"
+            and isinstance(receipt, Mapping)
+            and receipt.get("schema") == WORKER_RESTART_SCHEMA
+            and isinstance(event.get("instance"), str)
+            and isinstance(rejoin, Mapping)
+            and isinstance(rejoin.get("loss_job_ids"), list)
+        ):
+            restart_losses.update(
+                (event["instance"], item)
+                for item in rejoin["loss_job_ids"]
+                if type(item) is int and item > 0
+            )
+    for raw in raw_jobs:
+        marker = raw.get("orphan_recovery_marker")
+        if marker is None:
+            continue
+        claims = raw["assignment_claims"]
+        marker_line = marker["line"]
+        preceding = [claim for claim in claims if claim["line"] < marker_line]
+        following = [claim for claim in claims if claim["line"] > marker_line]
+        owner = preceding[-1] if preceding else None
+        final = claims[-1]
+        matching_kills = (
+            [
+                event
+                for event in kill_events.get(owner["worker"], [])
+                if raw["started"] <= event["fired_ms"] <= raw["finished"]
+            ]
+            if owner is not None
+            else []
+        )
+        matching_restart = (
+            owner is not None
+            and (owner.get("worker"), owner.get("scheduler_job")) in restart_losses
+        )
+        authenticated = (
+            raw["retries"] >= 1
+            and len(claims) >= 2
+            and owner is not None
+            and owner is not final
+            and bool(following)
+            and owner["scheduler_record"]["terminal"]
+            == "process-loss-recovery"
+            and final["scheduler_record"]["terminal"] == "completion"
+            and final["worker"] != owner["worker"]
+            and (bool(matching_kills) or matching_restart)
+        )
+        if not authenticated:
+            raise CollectError(
+                f"{raw['row_job_id']}: P50 commit marker has no full-identity "
+                "source-result witness or authenticated killed-assignment retry"
+            )
+
+
 def _observations(
     farm: FarmSpec,
     scenario: ScenarioSpec,
@@ -904,9 +3973,12 @@ def _observations(
     evidence: Path,
     rows: list[dict[str, Any]],
     row_facts: dict[str, Any],
+    events: list[dict[str, Any]],
 ) -> dict[str, Any]:
     logins, revisions, cache_ports = _parse_logins(evidence, plan)
     topology = plan["topology"]["instances"]
+    by_name = {item["name"]: item for item in topology}
+    p29_interner_faults = _p29_interner_faults(evidence, topology)
     for row in rows:
         if row["tail_present"]:
             worker_revision = revisions.get(row["cs"])
@@ -931,38 +4003,282 @@ def _observations(
             "sessions": sessions,
         }
     raw_jobs = row_facts.pop("raw_jobs")
+    assignment_claims = row_facts.pop("assignment_claims")
+    canary_claims = _canary_assignment_claims(scenario, plan, evidence)
+    reconciliation = _reconcile_scheduler_dispatches(
+        evidence, plan, [*canary_claims, *assignment_claims]
+    )
+    assignment_preference = _assignment_preference(
+        scenario, plan, [*canary_claims, *assignment_claims]
+    )
+    _validate_orphan_recovery_markers(raw_jobs, events)
+    control_observations = _control_observations(
+        scenario, evidence, raw_jobs, events, farm=farm, plan=plan
+    )
     lifecycle = []
-    row_by_identity = {
-        (row["client_instance"], row["job_id"].split(":", 1)[1]): row for row in rows
-    }
+    row_by_identity = {row["job_id"]: row for row in rows}
     for raw in raw_jobs:
-        row = row_by_identity[(raw["client"], raw["scheduler_job"])]
-        terminal = "completion" if raw["compile_rc"] == 0 else "cancellation"
+        row = row_by_identity[raw["row_job_id"]]
+        attempts = raw["assignment_claims"]
+        records = [item["scheduler_record"] for item in attempts]
+        if any(
+            current["dispatch_line"] >= following["dispatch_line"]
+            for current, following in zip(records, records[1:])
+        ):
+            raise CollectError(f"{row['job_id']}: retry dispatch order is inconsistent")
+        first = records[0]
+        final = records[-1]
+        if (raw["compile_rc"] == 0) != (final["terminal"] == "completion"):
+            raise CollectError(
+                f"{row['job_id']}: wrapper status disagrees with scheduler terminal"
+            )
+        if (
+            scenario.data.get("expect", {}).get("engagement")
+            == "s70-b6-drained-kill-switch-cycle"
+        ):
+            row["event_epoch"] = final["generation"] - 1
+        else:
+            row["event_epoch"] = _epoch_at(events, final["dispatch_ms"])
+        row["client_version"] = _instance_version_at(
+            by_name[row["client_instance"]], events, final["dispatch_ms"]
+        )
+        row["cs_version"] = _instance_version_at(
+            by_name[row["cs"]], events, final["dispatch_ms"]
+        )
         lifecycle.append(
             {
-                "deadline_ms": raw["started"] + scenario.data["timeouts"]["turn_s"] * 1000,
-                "dispatch_ms": raw["started"],
+                "deadline_ms": first["dispatch_ms"]
+                + scenario.data["timeouts"]["turn_s"] * 1000,
+                "client_instance": row["client_instance"],
+                "dispatch_ms": first["dispatch_ms"],
+                "final_dispatch_ms": final["dispatch_ms"],
+                "first_dispatch_ms": first["dispatch_ms"],
                 "job_id": row["job_id"],
-                "terminal": terminal,
-                "terminal_ms": raw["finished"],
+                "scheduler_dispatch_line": final["dispatch_line"],
+                "scheduler_generation": final["generation"],
+                "terminal": final["terminal"],
+                "terminal_ms": final["terminal_ms"],
                 "turn": raw["turn"],
             }
         )
+    source_mutex = row_facts["source_mutex"]
+    if scenario.data.get("id") == "S30-mutant-f-refusal":
+        refusal = row_facts.get("s30_mutant_f")
+        fallback_rows = [row for row in rows if row["session_outcome"] == "fallback"]
+        refusal_count = refusal.get("refusal_count") if isinstance(refusal, Mapping) else None
+        if refusal_count != len(fallback_rows) or any(
+            row["retries"] != 1
+            or row["tail_present"]
+            or row["tail_profile"] is not None
+            or row["session_outcome"] != "fallback"
+            for row in rows
+        ):
+            raise CollectError("S30 mutant rows do not prove exactly one P50 refusal and one legacy retry")
+        if row_facts.get("local_fallback_job_ids"):
+            raise CollectError("S30 mutant has a local fallback")
+        for raw in raw_jobs:
+            attempts = raw["assignment_claims"]
+            if len(attempts) != 2:
+                raise CollectError("S30 mutant workload did not make exactly one fresh retry")
+            first, final = attempts
+            if first["scheduler_record"].get("terminal") == "completion":
+                raise CollectError("S30 first P50 assignment has no refusal terminal")
+            if final["scheduler_record"].get("terminal") != "completion":
+                raise CollectError("S30 fresh legacy assignment lacks a completion terminal")
+        row_facts["s30_mutant_f"]["fallback_job_ids"] = sorted(
+            row["job_id"] for row in fallback_rows
+        )
+        row_facts["s30_mutant_f"]["fresh_legacy_assignment_count"] = len(fallback_rows)
+        row_facts["s30_mutant_f"]["local_fallback_job_ids"] = []
+    turn_observations: dict[str, dict[str, Any]] = {}
+    client_turn_observations: dict[str, dict[str, dict[str, int]]] = {}
+    for turn in scenario.data["workload"]["turns"]:
+        turn_lifecycle = [item for item in lifecycle if item["turn"] == turn]
+        turn_raw = [item for item in raw_jobs if item["turn"] == turn]
+        turn_rows = [row_by_identity[item["row_job_id"]] for item in turn_raw]
+        if not turn_lifecycle or not turn_raw or len(turn_lifecycle) != len(turn_rows):
+            raise CollectError(f"turn {turn!r} has incomplete timing evidence")
+        terminal_times = [item["terminal_ms"] for item in turn_lifecycle]
+        if any(type(value) is not int for value in terminal_times):
+            raise CollectError(f"turn {turn!r} has no terminal timestamp")
+        turn_mutex = [item for item in source_mutex["records"] if item["turn"] == turn]
+        first_dispatch_ms = min(item["dispatch_ms"] for item in turn_lifecycle)
+        last_terminal_ms = max(terminal_times)
+        turn_observations[turn] = {
+            "c_to_f_bytes": sum(row["c_to_f_bytes"] for row in turn_rows),
+            "exact_objects": sum(row["exact"] is True for row in turn_rows),
+            "f_to_c_bytes": sum(row["f_to_c_bytes"] for row in turn_rows),
+            "first_dispatch_ms": first_dispatch_ms,
+            "jobs": len(turn_rows),
+            "last_terminal_ms": last_terminal_ms,
+            "source_mutex_records": len(turn_mutex),
+            "source_mutex_service_ns": sum(item["service_ns"] for item in turn_mutex),
+            "source_mutex_wait_max_ns": max(
+                (item["wait_ns"] for item in turn_mutex), default=0
+            ),
+            "source_mutex_wait_ns": sum(item["wait_ns"] for item in turn_mutex),
+            "wall_ms": last_terminal_ms - first_dispatch_ms,
+            "wrapper_wall_ms": max(item["finished"] for item in turn_raw)
+            - min(item["started"] for item in turn_raw),
+        }
+        client_turn_observations[turn] = {}
+        for client in scenario.data["workload"]["clients"]:
+            client_lifecycle = [
+                item
+                for item in turn_lifecycle
+                if item["client_instance"] == client
+            ]
+            client_raw = [item for item in turn_raw if item["client"] == client]
+            if not client_lifecycle or len(client_lifecycle) != len(client_raw):
+                raise CollectError(
+                    f"turn {turn!r} has incomplete timing for client {client!r}"
+                )
+            client_turn_observations[turn][client] = {
+                "exact_objects": sum(
+                    row_by_identity[item["row_job_id"]]["exact"]
+                    for item in client_raw
+                ),
+                "jobs": len(client_raw),
+                "wall_ms": max(item["terminal_ms"] for item in client_lifecycle)
+                - min(item["dispatch_ms"] for item in client_lifecycle),
+            }
     starts = [item["started"] for item in raw_jobs]
     finishes = [item["finished"] for item in raw_jobs]
     preflight = _read_json(evidence / "receipts" / "preflight.json")
     return {
+        "assignment_preference": assignment_preference,
         "cell_wall_ms": max(finishes) - min(starts),
+        "client_turns": client_turn_observations,
         **row_facts,
-        "incomplete_turns": _turn_completeness(scenario, plan, raw_jobs),
+        **control_observations,
+        "incomplete_turns": _turn_completeness(scenario, plan, evidence, raw_jobs),
         "job_lifecycle": lifecycle,
         "logins": logins,
         "oracle": _oracle(evidence, scenario),
+        "p29_interner_faults": p29_interner_faults,
         "protected_before": {
-            host: facts.get("protected", {}) for host, facts in preflight["hosts"].items()
+            host: facts.get("protected", {})
+            for host, facts in preflight["hosts"].items()
         },
+        "scheduler_reconciliation": reconciliation,
         "sidecars": sidecars,
+        "turns": turn_observations,
+        "warm_hint_overrides": _warm_hint_overrides(evidence, plan),
         "wire_revisions": revisions,
+    }
+
+
+def _control_observations(
+    scenario: ScenarioSpec,
+    evidence: Path,
+    raw_jobs: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    *,
+    farm: FarmSpec | None = None,
+    plan: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Derive control facts only from resolved settings and scheduler evidence."""
+
+    controls = set(scenario.data["controls"])
+    fault: dict[str, Any] = {}
+    if "H2" in controls:
+        clients = set(scenario.data["workload"]["clients"])
+        fault["client_kill_switch"] = any(
+            instance["role"] == "C"
+            and instance["name"] in clients
+            and instance.get("env", {}).get("ICECC_P50_MODE") == "off"
+            for instance in scenario.data["instances"]
+        )
+
+    object_corruption: dict[str, Any] | None = None
+    if "H4" in controls:
+        descriptor = scenario.data.get("fault", {})
+        client = descriptor.get("client")
+        target = descriptor.get("job")
+        path = (
+            _instance_results(evidence, client)
+            / "workload"
+            / scenario.data["workload"]["turns"][0]
+            / "fault"
+            / "h4.tsv"
+        )
+        if path.is_file() and not path.is_symlink():
+            try:
+                lines = path.read_text(encoding="ascii").splitlines()
+            except (OSError, UnicodeError) as exc:
+                raise CollectError(f"cannot read H4 mutation receipt: {exc}") from exc
+            if len(lines) != 1:
+                raise CollectError("H4 mutation receipt must contain exactly one row")
+            fields = lines[0].split("\t")
+            if len(fields) != 6 or fields[0] != "icefarm-h4-object-fault-v1":
+                raise CollectError("H4 mutation receipt schema is invalid")
+            _schema, observed_client, index_text, before, after, relative = fields
+            if (
+                observed_client != client
+                or not index_text.isdigit()
+                or int(index_text) != target
+                or SHA256_RE.fullmatch(before) is None
+                or SHA256_RE.fullmatch(after) is None
+                or before == after
+                or relative != f"jobs/{target:06d}/remote.o"
+            ):
+                raise CollectError("H4 mutation receipt identity is invalid")
+            matches = [
+                raw
+                for raw in raw_jobs
+                if raw["client"] == client
+                and raw["index"] == target
+                and raw["turn"] == scenario.data["workload"]["turns"][0]
+            ]
+            if len(matches) != 1:
+                raise CollectError("H4 mutation does not bind one workload job")
+            raw = matches[0]
+            if (
+                raw["compile_rc"] != 0
+                or raw["local_sha"] != before
+                or raw["remote_sha"] != after
+                or raw["exact"] != 0
+            ):
+                raise CollectError("H4 mutation digests differ from the workload row")
+            object_corruption = {
+                "after_sha256": after,
+                "before_sha256": before,
+                "client": client,
+                "job": target,
+                "row_job_id": raw["row_job_id"],
+            }
+        fault["corrupt_object"] = object_corruption is not None
+
+    killed_workers = {
+        event["instance"] for event in events if event.get("action") == "kill -9"
+    }
+    recovered: set[str] = set()
+    killed_recovered: set[str] = set()
+    recovery_bindings: list[dict[str, Any]] = []
+    for raw in raw_jobs:
+        for attempt_index, attempt in enumerate(raw["assignment_claims"]):
+            record = attempt["scheduler_record"]
+            if record["terminal"] != "process-loss-recovery":
+                continue
+            recovered.add(raw["row_job_id"])
+            recovery_bindings.append(
+                {
+                    "attempt_index": attempt_index,
+                    "job_id": raw["row_job_id"],
+                    "scheduler_job": record["scheduler_job"],
+                    "worker": record["worker"],
+                }
+            )
+            if record["worker"] in killed_workers:
+                killed_recovered.add(raw["row_job_id"])
+    if "H5" in controls:
+        fault["worker_killed_job_ids"] = sorted(killed_recovered)
+
+    return {
+        "fault": fault,
+        "object_corruption": object_corruption,
+        "process_loss_recovery_bindings": recovery_bindings,
+        "process_loss_recovery_job_ids": sorted(recovered),
     }
 
 
@@ -1001,7 +4317,9 @@ def _evidence_artifacts(root: Path) -> dict[str, str]:
 
 
 def _write_checksums(root: Path, artifacts: Mapping[str, str]) -> str:
-    content = "".join(f"{digest}  {path}\n" for path, digest in sorted(artifacts.items()))
+    content = "".join(
+        f"{digest}  {path}\n" for path, digest in sorted(artifacts.items())
+    )
     _atomic_bytes(root / "SHA256SUMS", content.encode("utf-8"))
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
@@ -1037,9 +4355,18 @@ def collect_bundle(
         recorder=recorder,
         sync_remote=sync_remote,
     )
-    events = _event_log(evidence)
-    rows, row_facts = _parse_rows(scenario, plan, evidence, events)
-    observations = _observations(farm, scenario, plan, evidence, rows, row_facts)
+    events = _event_log(evidence, scenario, farm=farm, plan=plan)
+    if scenario.data["controls"] == ["H3"]:
+        rows = []
+        row_facts = {}
+        observations = _h3_control_failure_observations(
+            farm, scenario, plan, evidence, receipts, events
+        )
+    else:
+        rows, row_facts = _parse_rows(scenario, plan, evidence, events)
+        observations = _observations(
+            farm, scenario, plan, evidence, rows, row_facts, events
+        )
     _write_derived(evidence, rows, observations, events)
     artifacts = _evidence_artifacts(root)
     sums_sha = _write_checksums(root, artifacts)
@@ -1055,9 +4382,246 @@ def collect_bundle(
         "farm_digest": farm.digest,
         "images": preflight["images"],
         "instances": plan["topology"]["instances"],
+        **({"mode": CONTROL_FAILURE_MODE} if scenario.data["controls"] == ["H3"] else {}),
         "observations": observations,
         "plan": plan,
         "rows": rows,
+        "run_id": plan["run_id"],
+        "scenario": scenario.data,
+        "scenario_digest": scenario.digest,
+        "schema": BUNDLE_SCHEMA,
+        "topology": plan["topology"],
+        "topology_digest": plan["topology_digest"],
+    }
+    _atomic_json(root / "bundle.json", bundle)
+    return load_verified_bundle(root)
+
+
+def _h3_control_failure_observations(
+    farm: FarmSpec,
+    scenario: ScenarioSpec,
+    plan: dict[str, Any],
+    evidence: Path,
+    receipts: Mapping[str, Mapping[str, Any]],
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Collect H3's malformed-frame failure without parsing fake product rows."""
+
+    if events:
+        raise CollectError("H3 control failure does not permit timeline mutations")
+    workload = receipts["workload"]
+    summaries = workload.get("clients")
+    if (
+        workload.get("status") != "COMPLETE_WITH_JOB_FAILURES"
+        or not isinstance(summaries, list)
+        or len(summaries) != 1
+        or type(summaries[0].get("jobs")) is not int
+        or summaries[0]["jobs"] <= 0
+        or type(summaries[0].get("failures")) is not int
+        or summaries[0]["failures"] <= 0
+        or summaries[0]["failures"] != summaries[0]["jobs"]
+    ):
+        raise CollectError("H3 workload receipt does not prove started failed work")
+
+    topology = plan["topology"]["instances"]
+    clients = [item for item in topology if item["role"] == "C"]
+    workers = [item for item in topology if item["role"] == "F"]
+    selected_clients = {
+        item["name"]
+        for item in clients
+        if item["name"] in scenario.data["workload"]["clients"]
+        and item["version"] < 50
+    }
+    selected_workers = {
+        item["name"] for item in workers if item["version"] == 50
+    }
+    if selected_clients != set(scenario.data["workload"]["clients"]):
+        raise CollectError("H3 control failure lacks an old selected client")
+    if not selected_workers:
+        raise CollectError("H3 control failure lacks a current P50 worker")
+    scheduler = next(item for item in topology if item["role"] == "S")
+    authority_image = farm.data["authority"]["images"].get(
+        scheduler["image"]["label"]
+    )
+    if not isinstance(authority_image, Mapping) or authority_image.get("kind") != "scheduler-mutant":
+        raise CollectError("H3 scheduler image is not an authority-bound mutant")
+    trace_path = _instance_results(evidence, scheduler["name"]) / Path(
+        MUTANT_TRACE_PATH
+    ).relative_to("/results")
+    trace_records = _read_jsonl(trace_path, required=True)
+    scheduler_jobs = _scheduler_jobs(evidence, plan)
+    if any(
+        job["client"] not in selected_clients or job["worker"] not in selected_workers
+        for job in scheduler_jobs
+    ):
+        raise CollectError("H3 scheduler dispatch is not old-client/current-worker bound")
+    try:
+        emission = validate_h3_trace(
+            trace_records,
+            client_instances=selected_clients,
+            scheduler_instance=scheduler["name"],
+            jobs=scheduler_jobs,
+            worker_instances=selected_workers,
+        )
+        client = next(item for item in clients if item["name"] in selected_clients)
+        client_log = _one_role_log(evidence, client)
+        rejection_records = parse_h3_client_rejections(
+            _text(client_log), client_instance=client["name"]
+        )
+    except MutantError as exc:
+        raise CollectError(f"invalid H3 independent rejection evidence: {exc}") from exc
+    if len(rejection_records) != emission["record_count"]:
+        raise CollectError("H3 emission/rejection counts do not match")
+    if len(scheduler_jobs) != emission["record_count"]:
+        raise CollectError("H3 scheduler dispatch/emission counts do not match")
+    result_paths = sorted(
+        _instance_results(evidence, client["name"])
+        .joinpath("workload")
+        .glob("*/jobs/*/result.tsv")
+    )
+    if len(result_paths) != summaries[0]["jobs"]:
+        raise CollectError("H3 workload result count is incomplete")
+    failed_results = []
+    for path in result_paths:
+        row = _job_result(path)
+        if row["remote"] != 0:
+            raise CollectError("H3 control failure contains a successful remote row")
+        missing_assignment = (
+            row["scheduler_job"].startswith("missing-") and row["worker"] == "UNKNOWN"
+        )
+        local_assignment = (
+            row["scheduler_job"].isdigit()
+            and int(row["scheduler_job"]) > 0
+            and row["worker"] == "127.0.0.1:0"
+        )
+        if not (missing_assignment or local_assignment):
+            raise CollectError("H3 failure row unexpectedly self-reports an assignment")
+        failed_results.append(
+            {
+                "compile_rc": row["compile_rc"],
+                "exact": bool(row["exact"]),
+                "index": row["index"],
+                "remote": False,
+                "scheduler_job": row["scheduler_job"],
+                "turn": row["turn"],
+                "worker": row["worker"],
+            }
+        )
+    return {
+        "fault": {"mutant_scheduler": True},
+        "h3_control_failure": {
+            "authenticated": True,
+            "dispatches": scheduler_jobs,
+            "emission": emission,
+            "failed_jobs": failed_results,
+            "rejections": rejection_records,
+            "schema": "icefarm-h3-control-failure-v1",
+            "scheduler_dispatch_count": len(scheduler_jobs),
+            "successful_product_rows": 0,
+            "workload_failure_count": summaries[0]["failures"],
+            "workload_failed": True,
+            "workload_job_count": summaries[0]["jobs"],
+            "workload_started": True,
+        },
+    }
+
+
+def collect_refusal_bundle(
+    farm: FarmSpec,
+    scenario: ScenarioSpec,
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    """Seal an H1 preflight refusal without inventing workload evidence."""
+
+    root = bundle_root(farm, plan["run_id"])
+    root.mkdir(parents=True, exist_ok=True)
+    if scenario.data.get("controls") != ["H1"]:
+        raise CollectError(
+            "preflight-refusal bundles are restricted to exact H1 controls"
+        )
+    if (root / "bundle.json").exists():
+        bundle = load_verified_bundle(root)
+        if bundle.get("mode") != REFUSAL_MODE:
+            raise CollectError("existing immutable bundle is not an H1 refusal")
+        return bundle
+
+    refusal = _read_json(root / "preflight-refusal.json")
+    lifecycle = _read_json(root / "lifecycle.json")
+    expected = {
+        "farm_digest": plan["farm_digest"],
+        "run_id": plan["run_id"],
+        "scenario_digest": plan["scenario_digest"],
+        "topology_digest": plan["topology_digest"],
+    }
+    for name, receipt in (("preflight-refusal", refusal), ("lifecycle", lifecycle)):
+        for field, value in expected.items():
+            if receipt.get(field) != value:
+                raise CollectError(f"{name}.json does not bind {field}")
+    if (
+        refusal.get("schema") != "icefarm-preflight-refusal-v1"
+        or refusal.get("reason_code") != "role-hash-mismatch"
+        or refusal.get("jobs_started") != 0
+        or refusal.get("persistent_start_attempted") is not False
+    ):
+        raise CollectError("H1 refusal is not a zero-job role-hash mismatch")
+    if lifecycle.get("status") != "FAILED" or lifecycle.get("plan") != plan:
+        raise CollectError("H1 lifecycle is not the failed immutable plan")
+
+    workload = {
+        **expected,
+        "jobs_started": 0,
+        "reason": "preflight-refused",
+        "schema": "icefarm-workload-v1",
+        "status": "NOT_STARTED",
+    }
+    _atomic_json(root / "workload.json", workload)
+    evidence = root / "evidence"
+    if evidence.exists():
+        raise CollectError("H1 refusal evidence already exists without a bundle")
+    temporary = root / f".evidence.tmp-{os.getpid()}"
+    if temporary.exists():
+        raise CollectError(f"stale collection staging directory exists: {temporary}")
+    temporary.mkdir(parents=True)
+    try:
+        specs = temporary / "specs"
+        _atomic_json(specs / "farm.json", farm.data)
+        _atomic_json(specs / "scenario.json", scenario.data)
+        _atomic_json(specs / "plan.json", plan)
+        _atomic_json(specs / "topology.json", plan["topology"])
+        receipts = temporary / "receipts"
+        _atomic_json(receipts / "preflight-refusal.json", refusal)
+        _atomic_json(receipts / "lifecycle.json", lifecycle)
+        _atomic_json(receipts / "workload.json", workload)
+        observations = {
+            "fault": {},
+            "job_lifecycle": [],
+            "preflight_refusal": refusal,
+            "process_loss_recovery_job_ids": [],
+        }
+        _write_derived(temporary, [], observations, [])
+        _validate_regular_tree(temporary)
+        os.replace(temporary, evidence)
+    except Exception:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+
+    artifacts = _evidence_artifacts(root)
+    sums_sha = _write_checksums(root, artifacts)
+    bundle = {
+        "artifacts": artifacts,
+        "checksum_policy": {
+            "root": "evidence/",
+            "sha256sums_sha256": sums_sha,
+        },
+        "event_log": [],
+        "farm": farm.data,
+        "farm_digest": farm.digest,
+        "images": {},
+        "instances": plan["topology"]["instances"],
+        "mode": REFUSAL_MODE,
+        "observations": observations,
+        "plan": plan,
+        "rows": [],
         "run_id": plan["run_id"],
         "scenario": scenario.data,
         "scenario_digest": scenario.digest,
@@ -1102,7 +4666,9 @@ def load_verified_bundle(root: Path | str) -> dict[str, Any]:
         missing = sorted(set(artifacts) - set(observed))
         extra = sorted(set(observed) - set(artifacts))
         changed = sorted(
-            item for item in set(artifacts) & set(observed) if artifacts[item] != observed[item]
+            item
+            for item in set(artifacts) & set(observed)
+            if artifacts[item] != observed[item]
         )
         raise CollectError(
             f"bundle checksum mismatch missing={missing!r} extra={extra!r} changed={changed!r}"
@@ -1141,26 +4707,64 @@ def load_verified_bundle(root: Path | str) -> dict[str, Any]:
         raise CollectError("bundle topology digest differs from its topology")
     if bundle.get("instances") != topology.get("instances"):
         raise CollectError("bundle instances differ from its immutable topology")
+    refusal_mode = bundle.get("mode") == REFUSAL_MODE
+    control_failure_mode = bundle.get("mode") == CONTROL_FAILURE_MODE
     receipt_bindings = {
-        "preflight": _read_json(path / "evidence" / "receipts" / "preflight.json"),
         "lifecycle": _read_json(path / "evidence" / "receipts" / "lifecycle.json"),
         "workload": _read_json(path / "evidence" / "receipts" / "workload.json"),
     }
+    if refusal_mode:
+        receipt_bindings["preflight-refusal"] = _read_json(
+            path / "evidence" / "receipts" / "preflight-refusal.json"
+        )
+    else:
+        receipt_bindings["preflight"] = _read_json(
+            path / "evidence" / "receipts" / "preflight.json"
+        )
     for name, receipt in receipt_bindings.items():
         for field, expected in plan_bindings.items():
             if receipt.get(field) != expected:
                 raise CollectError(f"{name} receipt does not bind bundle {field}")
     if receipt_bindings["lifecycle"].get("plan") != plan:
         raise CollectError("lifecycle receipt plan differs from the immutable plan")
-    if bundle.get("images") != receipt_bindings["preflight"].get("images"):
+    if refusal_mode:
+        refusal = receipt_bindings["preflight-refusal"]
+        if (
+            bundle.get("images") != {}
+            or refusal.get("schema") != "icefarm-preflight-refusal-v1"
+            or refusal.get("reason_code") != "role-hash-mismatch"
+            or refusal.get("jobs_started") != 0
+            or refusal.get("persistent_start_attempted") is not False
+            or receipt_bindings["lifecycle"].get("status") != "FAILED"
+            or receipt_bindings["workload"].get("status") != "NOT_STARTED"
+            or receipt_bindings["workload"].get("jobs_started") != 0
+            or bundle.get("observations", {}).get("preflight_refusal") != refusal
+        ):
+            raise CollectError(
+                "preflight-refusal bundle is not a bound zero-job H1 refusal"
+            )
+    elif control_failure_mode:
+        if (
+            bundle.get("scenario", {}).get("controls") != ["H3"]
+            or bundle.get("images") != receipt_bindings["preflight"].get("images")
+        ):
+            raise CollectError("control-failure bundle is not bound to H3")
+    elif bundle.get("mode") is not None:
+        raise CollectError("bundle mode is unsupported")
+    elif bundle.get("images") != receipt_bindings["preflight"].get("images"):
         raise CollectError("bundle images differ from the immutable preflight receipt")
-    if hashlib.sha256(canonical_bytes(bundle["farm"])).hexdigest() != bundle.get("farm_digest"):
+    if hashlib.sha256(canonical_bytes(bundle["farm"])).hexdigest() != bundle.get(
+        "farm_digest"
+    ):
         raise CollectError("bundle farm digest is not reproducible")
     if hashlib.sha256(canonical_bytes(bundle["scenario"])).hexdigest() != bundle.get(
         "scenario_digest"
     ):
         raise CollectError("bundle scenario digest is not reproducible")
-    rows = _read_jsonl(path / "evidence" / "derived" / "rows.jsonl", required=True)
+    rows = _read_jsonl(
+        path / "evidence" / "derived" / "rows.jsonl",
+        required=not (refusal_mode or control_failure_mode),
+    )
     observations = _read_json(path / "evidence" / "derived" / "observations.json")
     events = _read_json(path / "evidence" / "derived" / "events.json").get("events")
     if bundle.get("rows") != rows or bundle.get("observations") != observations:

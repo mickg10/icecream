@@ -23,7 +23,8 @@
       "name": "C1",
       "role": "C",
       "host": "tt-quietbox3",
-      "image": "old"
+      "image": "old",
+      "client_environment": "debian-gcc"
     }
   ],
   "workload": {

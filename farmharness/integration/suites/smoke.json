@@ -1,0 +1,13 @@
+{
+  "schema": "icefarm-suite-v1",
+  "id": "smoke",
+  "kind": "smoke",
+  "scenarios": [
+    "H1-role-hash-refusal",
+    "H2-client-kill-switch",
+    "H3-mutant-scheduler",
+    "H4-corrupt-object",
+    "H5-worker-kill",
+    "S00-smoke"
+  ]
+}

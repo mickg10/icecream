@@ -1,0 +1,29 @@
+ARG BASE_IMAGE=ice-ii/linuxbrew:v2
+FROM ${BASE_IMAGE}
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+USER root
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libarchive-dev \
+        libboost-dev \
+        libcap-ng-dev \
+        liblzo2-dev \
+        libxxhash-dev \
+        libzstd-dev \
+        pkg-config \
+    && test "$(sed -n 's/^#define BOOST_VERSION //p' /usr/include/boost/version.hpp)" -ge 107400 \
+    && pkg-config --atleast-version=0.8.0 libxxhash \
+    && pkg-config --atleast-version=1.4.0 libzstd \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV BOOST_ROOT=/usr \
+    LDFLAGS="-L/usr/lib/x86_64-linux-gnu -Wl,-rpath-link,/usr/lib/x86_64-linux-gnu" \
+    PKG_CONFIG=/usr/bin/pkg-config \
+    PKG_CONFIG_LIBDIR=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+
+USER linuxbrew
+
+LABEL org.icecream.farm.p50-dependencies="boost-xxhash-zstd-lzo-archive-cap-ng"

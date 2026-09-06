@@ -1,0 +1,21 @@
+{
+  "schema": "icefarm-suite-v1",
+  "id": "s60-transitions",
+  "kind": "s60-transitions",
+  "scenarios": [
+    "S60-01-s-up",
+    "S60-02-f1-up",
+    "S60-03-f2-up",
+    "S60-04-c1-up",
+    "S60-05-c2-up",
+    "S60-06-c2-down",
+    "S60-07-c1-down",
+    "S60-08-f2-down",
+    "S60-09-f1-down",
+    "S60-10-s-down",
+    "S60-11-warm-f2-down",
+    "S60-12-warm-f2-up",
+    "S60-13-warm-s-down",
+    "S60-14-warm-s-up"
+  ]
+}

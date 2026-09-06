@@ -1,0 +1,14 @@
+{
+  "schema": "icefarm-suite-v1",
+  "id": "s70-resilience",
+  "kind": "s70-resilience",
+  "scenarios": [
+    "S70-b4-worker-bounces",
+    "S70-b4-scheduler-restart",
+    "S70-b4-client-route-restart",
+    "S70-b5-interner-failure",
+    "S70-b6-kill-switch",
+    "S70-b7-rollback",
+    "S70-b7-rollforward"
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "schema": "icefarm-suite-v1",
+  "id": "full",
+  "kind": "composite",
+  "suites": [
+    "smoke",
+    "ladder",
+    "s70",
+    "twobuild",
+    "s90",
+    "s95-disk-full"
+  ]
+}

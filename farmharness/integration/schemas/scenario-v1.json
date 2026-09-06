@@ -65,7 +65,19 @@
         "wedges": {"type": "integer", "minimum": 0},
         "error106_max": {"type": "integer", "minimum": 0},
         "tail_to_incapable": {"type": "integer", "minimum": 0},
-        "reuse": {"type": "string", "minLength": 1},
+        "reuse": {
+          "enum": [
+            "all-true-when-p29v1",
+            "all-false-when-p29v1",
+            "none-when-legacy"
+          ]
+        },
+        "reuse_pairs": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {"pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$"},
+          "additionalProperties": {"type": "boolean"}
+        },
         "wall_s_max": {"type": ["number", "null"], "exclusiveMinimum": 0}
       }
     },
@@ -74,6 +86,7 @@
       "uniqueItems": true,
       "items": {"type": "string", "pattern": "^H[1-5]$"}
     },
+    "fault": {"$ref": "#/$defs/fault"},
     "timeouts": {
       "type": "object",
       "additionalProperties": false,
@@ -108,6 +121,8 @@
         "role": {"enum": ["S", "F", "C"]},
         "host": {"$ref": "#/$defs/name"},
         "image": {"$ref": "#/$defs/name"},
+        "client_environment": {"$ref": "#/$defs/name"},
+        "system_source_snapshot": {"$ref": "#/$defs/name"},
         "env": {"$ref": "#/$defs/environment"},
         "slots": {"type": "integer", "minimum": 1}
       },
@@ -115,6 +130,10 @@
         {
           "if": {"properties": {"role": {"const": "F"}}},
           "then": {"required": ["slots"]}
+        },
+        {
+          "if": {"properties": {"role": {"const": "C"}}},
+          "then": {"required": ["client_environment"]}
         }
       ]
     },
@@ -165,6 +184,16 @@
         "rate": {"type": "string", "pattern": "^[1-9][0-9]*(kbit|mbit|gbit)$"},
         "delay_ms": {"type": "integer", "minimum": 0, "maximum": 60000},
         "path": {"type": "string", "minLength": 1, "maxLength": 4096}
+      }
+    },
+    "fault": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "client", "job"],
+      "properties": {
+        "kind": {"const": "corrupt-object"},
+        "client": {"$ref": "#/$defs/name"},
+        "job": {"type": "integer", "minimum": 1}
       }
     }
   }
