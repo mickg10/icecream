@@ -335,6 +335,59 @@ def test_source_release_inventory_corruption_is_removed_and_refused(
     assert not destination.exists()
 
 
+def test_source_release_existing_destination_is_preserved(tmp_path: Path) -> None:
+    payload = b"exact-authority-bound-source-archive"
+    digest = hashlib.sha256(payload).hexdigest()
+    binding = dataclasses.replace(
+        image_bindings(_farm(), ["p50s2-624702e9"])[0],
+        commit="a" * 40,
+        archive_sha256=digest,
+    )
+    inventory = _write_source_inventory(tmp_path / "inventory", binding, payload)
+    destination = tmp_path / "source.tar"
+    sentinel = b"pre-existing-sentinel"
+    destination.write_bytes(sentinel)
+
+    with pytest.raises(ImageError, match="cannot copy source archive"):
+        create_source_archive(
+            tmp_path / "no-git-repository",
+            binding,
+            destination,
+            source_archive_dir=inventory,
+        )
+
+    assert destination.read_bytes() == sentinel
+
+
+def test_source_release_symlink_destination_and_target_are_preserved(
+    tmp_path: Path,
+) -> None:
+    payload = b"exact-authority-bound-source-archive"
+    digest = hashlib.sha256(payload).hexdigest()
+    binding = dataclasses.replace(
+        image_bindings(_farm(), ["p50s2-624702e9"])[0],
+        commit="a" * 40,
+        archive_sha256=digest,
+    )
+    inventory = _write_source_inventory(tmp_path / "inventory", binding, payload)
+    target = tmp_path / "sentinel-target.tar"
+    sentinel = b"symlink-target-sentinel"
+    target.write_bytes(sentinel)
+    destination = tmp_path / "source.tar"
+    destination.symlink_to(target)
+
+    with pytest.raises(ImageError, match="cannot copy source archive"):
+        create_source_archive(
+            tmp_path / "no-git-repository",
+            binding,
+            destination,
+            source_archive_dir=inventory,
+        )
+
+    assert destination.is_symlink()
+    assert target.read_bytes() == sentinel
+
+
 def test_source_release_decoder_cannot_exceed_declared_size(tmp_path: Path) -> None:
     expected = b"e" * 128
     oversized = b"o" * 4096

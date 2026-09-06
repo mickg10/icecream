@@ -415,6 +415,7 @@ def _materialize_inventory_source_archive(
     source, artifact = _inventory_source_archive(source_archive_dir, binding)
     _source_commit, expected_sha256 = _source_archive_identity(binding)
     compressed_digest = hashlib.sha256()
+    destination_created = False
     try:
         descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
         try:
@@ -428,6 +429,7 @@ def _materialize_inventory_source_archive(
                 )
             with os.fdopen(descriptor, "rb", closefd=False) as source_stream:
                 with destination.open("xb") as destination_stream:
+                    destination_created = True
                     for block in iter(
                         lambda: source_stream.read(1024 * 1024), b""
                     ):
@@ -476,7 +478,8 @@ def _materialize_inventory_source_archive(
         finally:
             os.close(descriptor)
     except (OSError, subprocess.SubprocessError, ImageError) as exc:
-        destination.unlink(missing_ok=True)
+        if destination_created:
+            destination.unlink(missing_ok=True)
         if isinstance(exc, ImageError):
             raise
         raise ImageError(
@@ -512,13 +515,17 @@ def create_source_archive(
     """Materialize the exact authority-bound Git archive for one image."""
 
     repo = repo.resolve()
-    destination = destination.resolve()
+    try:
+        destination = destination.parent.resolve(strict=True) / destination.name
+    except OSError as exc:
+        raise ImageError(f"source archive destination parent is invalid: {exc}") from exc
     source_commit, source_archive_sha256 = _source_archive_identity(binding)
     if source_archive_dir is not None:
         _materialize_inventory_source_archive(
             source_archive_dir, binding, destination
         )
         return
+    destination_created = False
     try:
         subprocess.run(
             ["git", "cat-file", "-e", f"{source_commit}^{{commit}}"],
@@ -527,7 +534,8 @@ def create_source_archive(
             capture_output=True,
             shell=False,
         )
-        with destination.open("wb") as output:
+        with destination.open("xb") as output:
+            destination_created = True
             subprocess.run(
                 ["git", "archive", "--format=tar", source_commit],
                 cwd=repo,
@@ -537,7 +545,8 @@ def create_source_archive(
                 shell=False,
             )
     except (OSError, subprocess.CalledProcessError) as exc:
-        destination.unlink(missing_ok=True)
+        if destination_created:
+            destination.unlink(missing_ok=True)
         raise ImageError(
             f"cannot archive immutable commit {source_commit}: {exc}"
         ) from exc
