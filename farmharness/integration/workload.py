@@ -393,6 +393,10 @@ sample_bucket=$((16#$(printf '%s' "$client_name:$manifest_digest" | sha256sum | 
 sample_total=0
 sample_mismatches=0
 unique_index=0
+sample_file="$result_root/oracle-samples.tsv"
+sample_temporary="$sample_file.tmp-$BASHPID"
+rm -f -- "$sample_temporary"
+: >"$sample_temporary"
 while IFS=$'\t' read -r digest relative source
 do
     unique_index=$((unique_index + 1))
@@ -410,10 +414,11 @@ do
     exact=0
     test "$observed" = "$expected" && exact=1 || sample_mismatches=$((sample_mismatches + 1))
     printf '%s\t%s\t%s\t%s\n' "$relative" "$observed" "$expected" "$exact" \
-        >>"$result_root/oracle-samples.tsv"
+        >>"$sample_temporary"
     rm -f -- "$object"
 done <"$unique"
 test "$sample_total" -ge 1
+mv -f -- "$sample_temporary" "$sample_file"
 printf 'sample_total\t%s\nsample_mismatches\t%s\n' "$sample_total" "$sample_mismatches" \
     >"$result_root/oracle-summary.tsv"
 flock -u 9

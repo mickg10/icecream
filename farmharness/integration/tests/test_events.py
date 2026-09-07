@@ -3193,6 +3193,7 @@ def test_job_triggered_client_fault_uses_checkpoint_path_and_passes_b5_verdict(
     ).hexdigest()
     _resign_checkpoint(checkpoint)
     callback_calls: list[str] = []
+    clock_ms = [1000]
 
     def quiesce(turn, clients):
         callback_calls.append("quiesce:" + turn)
@@ -3202,6 +3203,7 @@ def test_job_triggered_client_fault_uses_checkpoint_path_and_passes_b5_verdict(
     def relaunch(turn, checkpoints):
         callback_calls.append("relaunch:" + turn)
         assert checkpoints == {"C1": checkpoint}
+        clock_ms[0] = 9000
         return {
             "C1": {
                 "client": "C1",
@@ -3223,7 +3225,7 @@ def test_job_triggered_client_fault_uses_checkpoint_path_and_passes_b5_verdict(
         event_path=tmp_path / "events" / "events.json",
         deadline_s=2,
         poll_interval_s=0.01,
-        wall_ms=lambda: 1000,
+        wall_ms=lambda: clock_ms[0],
         quiesce_workload=quiesce,
         relaunch_workload=relaunch,
     )
@@ -3236,6 +3238,7 @@ def test_job_triggered_client_fault_uses_checkpoint_path_and_passes_b5_verdict(
     assert len(producer.records) == 1
     event = producer.records[0].as_dict()
     assert event["receipt"]["schema"] == CLIENT_TRANSITION_SCHEMA
+    assert event["receipt"]["coordination"]["ready_ms"] == 1000
     assert event["receipt"]["after"]["env"] == {
         "ICECC_P50_FAULT_INJECTION": "P29_INTERNER_FAIL_ONCE",
         "ICECC_P50_MODE": "on",

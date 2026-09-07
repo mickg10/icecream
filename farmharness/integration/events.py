@@ -2609,6 +2609,7 @@ class EventProducer:
         relaunch: Mapping[str, Any] | None = None
         readiness: dict[str, Any] | None = None
         client_readiness: dict[str, Any] | None = None
+        ready_ms: int | None = None
         after: dict[str, Any] | None = None
         primary: BaseException | None = None
         drain_timeout = self._command_timeout(int(self.scenario.data["timeouts"]["turn_s"]))
@@ -2669,6 +2670,11 @@ class EventProducer:
             client_readiness = self._wait_scheduler_client_readiness(
                 target, client_baselines[event.instance]
             )
+            # This is the authenticated transition boundary.  Workload
+            # release and relaunch are deliberately downstream of it and can
+            # take arbitrarily long; never move the event timestamp past
+            # either operation.
+            ready_ms = int(self.wall_ms())
             for client in clients:
                 resumes[client["name"]] = self._gate_control(
                     client,
@@ -2715,7 +2721,12 @@ class EventProducer:
                         pass
             if primary is not None:
                 raise EventError(f"checkpointed C transition failed: {primary}") from primary
-        assert after is not None and readiness is not None and client_readiness is not None
+        assert (
+            after is not None
+            and readiness is not None
+            and client_readiness is not None
+            and ready_ms is not None
+        )
         assert checkpoints is not None and relaunch is not None
         self._state[event.instance] = {
             "image": dict(target["image"]),
@@ -2739,7 +2750,7 @@ class EventProducer:
             "client_readiness": client_readiness,
             "coordination": {
                 "clients": pauses,
-                "ready_ms": int(self.wall_ms()),
+                "ready_ms": ready_ms,
                 "relaunch": relaunch,
                 "resume": resumes,
             },

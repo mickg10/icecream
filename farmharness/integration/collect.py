@@ -784,7 +784,7 @@ def _legacy_wire_results(
             or item.get("role") != role
         ):
             raise CollectError(f"{path}:{index}: legacy-wire schema/role mismatch")
-        positive = ("job_id", "assignment_epoch", "assignment_nonce", "c_guid")
+        positive = ("job_id", "c_guid")
         counters = (
             "c_to_f_sent_bytes",
             "c_to_f_received_bytes",
@@ -793,6 +793,21 @@ def _legacy_wire_results(
         )
         if any(
             type(item.get(field)) is not int or item[field] <= 0 for field in positive
+        ):
+            raise CollectError(f"{path}:{index}: legacy-wire identity is invalid")
+        assignment_epoch = item.get("assignment_epoch")
+        assignment_nonce = item.get("assignment_nonce")
+        # Mirror P50LegacyWireIdentity::valid(): a scheduler-wide legacy
+        # fence deliberately carries no assignment identity, while a fenced
+        # legacy transfer must carry both words.  A half-present identity is
+        # never valid.
+        if (
+            type(assignment_epoch) is not int
+            or type(assignment_nonce) is not int
+            or not (
+                (assignment_epoch == 0 and assignment_nonce == 0)
+                or (assignment_epoch > 0 and assignment_nonce > 0)
+            )
         ):
             raise CollectError(f"{path}:{index}: legacy-wire identity is invalid")
         if type(item.get("tu_seq")) is not int or item["tu_seq"] < 0:
@@ -3589,9 +3604,14 @@ def _parse_rows(
                 (key, wire)
                 for key, wire in c_legacy_wires.items()
                 if key[0] == scheduler_job
-                and key in compile_identities
-                and compile_identities[key]["c_guid"] == wire["c_guid"]
-                and compile_identities[key]["tu_seq"] == wire["tu_seq"]
+                and (
+                    (key[1] == 0 and key[2] == 0)
+                    or (
+                        key in compile_identities
+                        and compile_identities[key]["c_guid"] == wire["c_guid"]
+                        and compile_identities[key]["tu_seq"] == wire["tu_seq"]
+                    )
+                )
             ]
             if len(legacy_candidates) > 1:
                 raise CollectError(f"{job_id}: legacy-wire assignment is ambiguous")

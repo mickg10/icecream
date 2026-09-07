@@ -1507,6 +1507,45 @@ def test_collection_conserves_identity_bound_legacy_wire_bytes(tmp_path: Path) -
     assert bundle["observations"]["turns"]["A"]["f_to_c_bytes"] == 200
 
 
+def test_collection_conserves_absent_assignment_legacy_wire_bytes(
+    tmp_path: Path,
+) -> None:
+    farm, scenario, plan, root = _raw_collection(tmp_path)
+    _make_legacy_wire_fixture(root)
+    (root / "C1.results" / "compile-identity.jsonl").unlink()
+    for path in (
+        root / "C1.results" / "c-legacy-wire.jsonl",
+        root / "F1.results" / "f-legacy-wire.jsonl",
+    ):
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record["assignment_epoch"] = 0
+        record["assignment_nonce"] = 0
+        _write_jsonl(path, [record])
+
+    bundle = collect_bundle(farm, scenario, plan, sync_remote=False)
+
+    assert bundle["rows"][0]["tail_present"] is False
+    assert bundle["rows"][0]["c_to_f_bytes"] == 400
+    assert bundle["rows"][0]["f_to_c_bytes"] == 200
+    assert bundle["observations"]["legacy_wire"]["record_count"] == 1
+
+
+@pytest.mark.parametrize(("epoch", "nonce"), ((0, 1), (1, 0)))
+def test_collection_refuses_partial_assignment_legacy_wire_identity(
+    tmp_path: Path, epoch: int, nonce: int
+) -> None:
+    farm, scenario, plan, root = _raw_collection(tmp_path)
+    _make_legacy_wire_fixture(root)
+    path = root / "C1.results" / "c-legacy-wire.jsonl"
+    record = json.loads(path.read_text(encoding="utf-8"))
+    record["assignment_epoch"] = epoch
+    record["assignment_nonce"] = nonce
+    _write_jsonl(path, [record])
+
+    with pytest.raises(CollectError, match="legacy-wire identity is invalid"):
+        collect_bundle(farm, scenario, plan, sync_remote=False)
+
+
 def test_collection_refuses_nonconserving_legacy_wire_bytes(tmp_path: Path) -> None:
     farm, scenario, plan, root = _raw_collection(tmp_path)
     _make_legacy_wire_fixture(root)

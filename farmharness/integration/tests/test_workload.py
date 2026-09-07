@@ -212,6 +212,69 @@ def test_manifest_driver_shell_is_syntactically_valid() -> None:
     assert "scenario.data" not in MANIFEST_DRIVER
 
 
+def test_manifest_driver_relaunch_replaces_oracle_samples_atomically(
+    tmp_path: Path,
+) -> None:
+    start = MANIFEST_DRIVER.index("sample_bucket=$((16#")
+    end = MANIFEST_DRIVER.index("\nflock -u 9", start)
+    sample_program = MANIFEST_DRIVER[start:end]
+    result_root = tmp_path / "results"
+    oracle_root = tmp_path / "oracle"
+    result_root.mkdir()
+    (result_root / "oracle-samples").mkdir()
+    oracle_root.mkdir()
+    source = tmp_path / "source.ii"
+    source.write_bytes(b"canonical object bytes\n")
+    relative = "files/source.ii"
+    digest = "a" * 64
+    unique = tmp_path / "unique.tsv"
+    unique.write_text(
+        f"{digest}\t{relative}\t{source}\n",
+        encoding="utf-8",
+    )
+    key = subprocess.run(
+        ["sha256sum"],
+        input=f"{digest}\n{relative}\n",
+        text=True,
+        check=True,
+        capture_output=True,
+    ).stdout.split()[0]
+    observed = subprocess.run(
+        ["sha256sum", str(source)],
+        text=True,
+        check=True,
+        capture_output=True,
+    ).stdout.split()[0]
+    (oracle_root / f"{key}.sha256").write_text(observed + "\n", encoding="ascii")
+    prefix = f"""
+set -eu
+client_name=C1
+manifest_digest={'b' * 64}
+result_root={result_root}
+oracle_root={oracle_root}
+unique={unique}
+oracle_compile() {{ cp -- "$1" "$2"; }}
+"""
+
+    for _ in range(2):
+        subprocess.run(
+            ["/bin/bash"],
+            input=prefix + sample_program,
+            text=True,
+            check=True,
+            capture_output=True,
+        )
+
+    samples = (result_root / "oracle-samples.tsv").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert len(samples) == 1
+    assert samples[0].split("\t") == [relative, observed, observed, "1"]
+    assert (result_root / "oracle-summary.tsv").read_text(encoding="utf-8") == (
+        "sample_total\t1\nsample_mismatches\t0\n"
+    )
+
+
 def test_workload_summary_is_fail_closed(tmp_path: Path) -> None:
     farm, scenario, plan = _farm_scenario_plan(tmp_path)
     transport = RecordingTransport(WorkloadRecorder("not a summary\n"))
