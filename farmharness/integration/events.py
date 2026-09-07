@@ -2083,8 +2083,12 @@ class EventProducer:
             self._start + self.deadline_s,
             self.monotonic() + float(self.scenario.data["timeouts"]["up_s"]),
         )
+        image = client.get("image")
+        label = image.get("label") if isinstance(image, Mapping) else None
+        if not isinstance(label, str):
+            raise EventError("client scheduler readiness has no target image generation")
         cache_required = (
-            client.get("version") == 50
+            self._image_version(label) == 50
             and client.get("env", {}).get("ICECC_P50_MODE") == "on"
         )
         while self.monotonic() < deadline:

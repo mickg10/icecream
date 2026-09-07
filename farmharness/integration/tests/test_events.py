@@ -14,7 +14,7 @@ import pytest
 from farmharness.integration.tests import farm_fixture
 
 from farmharness.integration import farmtest
-from farmharness.integration.collect import CollectError, _event_log
+from farmharness.integration.collect import CollectError, _event_log, _stage_evidence
 from farmharness.integration.events import (
     CACHE_DISK_FAULT_BYTES,
     CACHE_DISK_FAULT_FILE,
@@ -3069,6 +3069,8 @@ def _resign_checkpoint(value: dict[str, object]) -> dict[str, object]:
 
 
 class CheckpointClientTransitionRecorder(TransitionRecorder):
+    client_cache_required = True
+
     def invoke(self, command: PlannedCommand) -> CommandResult:
         result = super().invoke(command)
         if command.phase in {
@@ -3106,8 +3108,12 @@ class CheckpointClientTransitionRecorder(TransitionRecorder):
                 json.dumps(
                     {
                         "bytes": 100,
-                        "cache_line": "cache sidecar adapter state=2 lifecycle=3",
-                        "cache_required": True,
+                        "cache_line": (
+                            "cache sidecar adapter state=2 lifecycle=3"
+                            if self.client_cache_required
+                            else None
+                        ),
+                        "cache_required": self.client_cache_required,
                         "connected_line": (
                             "Connected to scheduler (I am known as 10.0.0.1)"
                         ),
@@ -3236,6 +3242,63 @@ def test_job_triggered_client_fault_uses_checkpoint_path_and_passes_b5_verdict(
     }
     assert _event_log(tmp_path, scenario, farm=farm, plan=plan) == [event]
 
+    # Collection must authenticate the event structure before it knows which
+    # instances to snapshot, but the checkpoint row can only be authenticated
+    # after the result trees have been copied into staging.  Exercise that
+    # exact two-pass path with a partial checkpoint (one of two jobs).
+    (tmp_path / "diagnostics").mkdir()
+    for item in plan["topology"]["instances"]:
+        if item["name"] != "C1":
+            (tmp_path / f"{item['name']}.results").mkdir()
+    client = next(
+        item for item in plan["topology"]["instances"] if item["name"] == "C1"
+    )
+    witness = event["receipt"]["client_readiness"]
+    client_log = (
+        tmp_path
+        / "diagnostics"
+        / client["host"]
+        / "C1.log"
+        / "client-daemon.log"
+    )
+    client_log.parent.mkdir(parents=True)
+    client_log.write_bytes(
+        b"x" * witness["offset"]
+        + (
+            event["receipt"]["readiness"]["line"]
+            + "\n"
+            + witness["connected_line"]
+            + "\n"
+            + witness["cache_line"]
+            + "\n"
+        ).encode()
+    )
+    evidence = _stage_evidence(
+        farm,
+        scenario,
+        plan,
+        tmp_path,
+        {},
+        recorder=None,
+        sync_remote=False,
+    )
+    staged_checkpoint = (
+        evidence
+        / "instances"
+        / "C1"
+        / "results"
+        / "workload"
+        / "A"
+        / "jobs"
+        / "000001"
+        / "result.tsv"
+    )
+    assert staged_checkpoint.read_bytes() == checkpoint_payload
+    assert _event_log(evidence, scenario, farm=farm, plan=plan) == [event]
+    staged_checkpoint.unlink()
+    with pytest.raises(CollectError, match="invalid transition coordination"):
+        _event_log(evidence, scenario, farm=farm, plan=plan)
+
     rows = [
         _b5_row(1, epoch=0, profile="P29V1"),
         _b5_row(2, epoch=1, profile=None, retries=1),
@@ -3291,6 +3354,84 @@ def test_job_triggered_client_fault_uses_checkpoint_path_and_passes_b5_verdict(
         "schema": BUNDLE_SCHEMA,
     }
     assert evaluate_bundle(bundle)["status"] == "PASS"
+
+
+@pytest.mark.parametrize(
+    ("scenario_name", "cache_required"),
+    (("S60-04-c1-up.json", True), ("S60-07-c1-down.json", False)),
+)
+def test_client_transition_readiness_uses_target_image_generation(
+    tmp_path: Path, scenario_name: str, cache_required: bool
+) -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    farm.data["hub"]["results_root"] = str(tmp_path)
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / scenario_name, farm
+    )
+    target_alias = scenario.data["timeline"][0]["image"]
+    label = scenario.data["images"][target_alias]
+    document = _transition_image_document(farm, label)
+    identity = _image_identity(
+        CommandResult(0, json.dumps(document), ""), "client-transition"
+    )
+    farm.data["authority"]["images"][label][
+        "closure_sha256"
+    ] = identity.closure_sha256
+    plan = farmtest.build_plan(farm, scenario, run_id="event-unit")
+    checkpoints = {
+        name: _checkpoint_fixture(name)
+        for name in scenario.data["workload"]["clients"]
+    }
+
+    def quiesce(turn, clients):
+        assert turn == "A"
+        assert [item["name"] for item in clients] == ["C1", "C2"]
+        return checkpoints
+
+    def relaunch(turn, received):
+        assert turn == "A"
+        assert received == checkpoints
+        return {
+            name: {
+                "client": name,
+                "expected_jobs": 2,
+                "failures": 0,
+                "jobs": 2,
+                "status": "COMPLETE",
+            }
+            for name in checkpoints
+        }
+
+    recorder = CheckpointClientTransitionRecorder(farm, plan)
+    recorder.client_cache_required = cache_required
+    dispatched = "".join(
+        f"put {index} in joblist of F1\n" for index in range(1, 25)
+    )
+    reads = iter(("", dispatched))
+    producer = EventProducer(
+        farm,
+        scenario,
+        plan,
+        recorder=RecordingTransport(recorder),
+        job_reader=lambda: next(reads, dispatched),
+        event_path=tmp_path / "events" / "events.json",
+        deadline_s=2,
+        poll_interval_s=0.01,
+        wall_ms=lambda: 1000,
+        quiesce_workload=quiesce,
+        relaunch_workload=relaunch,
+    )
+    producer.signal_turn_start("A")
+    producer.start()
+    producer.wait()
+    producer.stop()
+
+    assert len(producer.records) == 1
+    readiness = producer.records[0].receipt["client_readiness"]
+    assert readiness["cache_required"] is cache_required
+    assert readiness["cache_line"] == (
+        "cache sidecar adapter state=2 lifecycle=3" if cache_required else None
+    )
 
 
 def test_job_triggered_client_env_set_requires_callbacks_and_is_unique(

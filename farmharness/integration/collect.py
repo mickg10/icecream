@@ -565,7 +565,18 @@ def _stage_evidence(
             _copy_tree(event_source, temporary / "events")
         elif scenario.data["timeline"]:
             raise CollectError("timeline run has no event evidence")
-        events = _event_log(temporary, scenario, farm=farm, plan=plan)
+        # A checkpointed client transition binds rows that live in the result
+        # trees we have not copied yet.  Authenticate the event structure first
+        # so kill events can safely determine the snapshot set, then perform a
+        # second, full validation after every result tree has been frozen and
+        # copied into staging.
+        events = _event_log(
+            temporary,
+            scenario,
+            farm=farm,
+            plan=plan,
+            validate_client_evidence=False,
+        )
         stopped_instances = frozenset(
             event["instance"] for event in events if event["action"] == "kill -9"
         )
@@ -579,6 +590,7 @@ def _stage_evidence(
             )
         else:
             _snapshot_existing_evidence(root, temporary, plan)
+        _event_log(temporary, scenario, farm=farm, plan=plan)
         specs = temporary / "specs"
         _atomic_json(specs / "farm.json", farm.data)
         _atomic_json(specs / "scenario.json", scenario.data)
@@ -1228,6 +1240,7 @@ def _event_log(
     *,
     farm: FarmSpec | None = None,
     plan: dict[str, Any] | None = None,
+    validate_client_evidence: bool = True,
 ) -> list[dict[str, Any]]:
     path = evidence / "events" / "events.json"
     failure_path = evidence / "events" / "failure.json"
@@ -1366,7 +1379,13 @@ def _event_log(
                 farm=farm,
                 plan=plan,
                 continuity=continuity,
-                evidence=evidence,
+                evidence=(
+                    evidence
+                    if validate_client_evidence
+                    or event["receipt"].get("schema")
+                    != "icefarm-client-transition-v1"
+                    else None
+                ),
             )
         elif header_edit:
             _validate_header_edit_receipt(
