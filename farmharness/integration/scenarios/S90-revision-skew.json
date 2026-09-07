@@ -3,8 +3,8 @@
   "id": "S90-revision-skew",
   "shape": "S'[F'F''][C']",
   "images": {
-    "r1": "p50s4-b42d65e8",
-    "r2": "p50s90-f-revision-2-candidate"
+    "r1": "p50s4-57a1e336",
+    "r2": "p50s90-f-revision-2-57a1e336"
   },
   "instances": [
     {

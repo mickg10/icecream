@@ -687,7 +687,7 @@ def test_scheduler_mutant_cannot_fall_back_to_normal_role_store(
 ) -> None:
     farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path)
-    mutant = farm.data["authority"]["images"]["p50s4-h3-tail-mutant"]
+    mutant = farm.data["authority"]["images"]["p50s4-h3-tail-57a1e336"]
     farm.data["runtime_image"]["closure_sha256"] = mutant["closure_sha256"]
     mutant.pop("role_overrides")
     scenario = load_scenario_spec(

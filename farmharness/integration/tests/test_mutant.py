@@ -89,6 +89,26 @@ def test_final_lineage_mutant_recipes_are_exactly_derived() -> None:
     assert s90["recipe_sha256"] == (
         "76dc368f6109e20374d9cf5d6e412273b9978496c10569c25eb8c609d8c7aa14"
     )
+    measured = {
+        "p50s4-h3-tail-57a1e336": {
+            "closure_sha256": "ab2d32a92c21e57ad2bcb9c2084334ecab444587a7b07fa56e1dfc6f225b7a92",
+            "id": "sha256:a83db62e34459ba64adcdf48c8bdf1968e1d50b62853ec0529c07bda309a26eb",
+            "role_overrides": {
+                "scheduler": {
+                    "sha256": "fb40971b2be536a4e4bfd23825534879816526a014f8ea1a94b753d1d7e3ae50"
+                }
+            },
+        },
+        "p50s90-f-revision-2-57a1e336": {
+            "closure_sha256": "adf183b2875eefa5947b73cc4989f62692e4961a68ec94eab0da6422efdb1549",
+            "id": "sha256:6cc0a56c22e8cb5363b107ccc06826a5e1f5259553ff11e8291789b42bd7a3ad",
+            "role_overrides": {
+                "daemon": {
+                    "sha256": "73ce56d1603746151b1ac73a87ba8d4d78a51701517efff7f8b8be6f65cd1608"
+                }
+            },
+        },
+    }
     for label, derived in (
         ("p50s4-h3-tail-57a1e336", h3),
         ("p50s90-f-revision-2-57a1e336", s90),
@@ -101,9 +121,10 @@ def test_final_lineage_mutant_recipes_are_exactly_derived() -> None:
             **derived,
             "patch_path": candidate["patch_path"],
         }
-        assert not {"closure_sha256", "id", "role_overrides"}.intersection(
-            candidate
-        )
+        assert {
+            key: candidate[key]
+            for key in ("closure_sha256", "id", "role_overrides")
+        } == measured[label]
     assert images["p50s90-f-revision-2-57a1e336"]["cache_wire_revision"] == 2
 
 
