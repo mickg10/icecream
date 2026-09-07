@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import copy
 import re
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from farmharness.integration.lifecycle import PreflightRefusal
 from farmharness.integration.report import ReportError, verify_control_bundle
 from farmharness.integration.scenario_spec import load_scenario_spec
 from farmharness.integration.schema_validation import canonical_bytes
+from farmharness.integration.verdict import evaluate_bundle
 from farmharness.integration.workload import WorkloadError
 
 
@@ -79,6 +81,9 @@ def _historical_bundle() -> dict[str, object]:
     return {
         "farm": {"schema": "icefarm-farm-v1"},
         "plan": {
+            "commands": [
+                {"argv": ["docker", "run", "old-f"], "phase": "up.start-f"}
+            ],
             "icefarm_env": {
                 "ICEFARM_INSTANCES": json.dumps(
                     [{"name": "C1", "role": "C", "host": "q3", "image": "p50"}]
@@ -90,6 +95,25 @@ def _historical_bundle() -> dict[str, object]:
         "topology": topology,
         "topology_digest": topology["topology_digest"],
     }
+
+
+def test_replay_preserves_pre_f_init_bundle_and_archived_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    retained = _historical_bundle()
+    retained.update({"observations": {}, "rows": [], "schema": "icefarm-bundle-v1"})
+    before = copy.deepcopy(retained)
+    archived_verdict = evaluate_bundle(retained)
+    (tmp_path / "verdict.json").write_text(
+        json.dumps(archived_verdict), encoding="utf-8"
+    )
+    monkeypatch.setattr(farmtest, "load_verified_bundle", lambda _root: retained)
+
+    receipt = farmtest.replay_bundle(tmp_path)
+
+    assert retained == before
+    assert receipt["verdict"] == archived_verdict
+    assert "f_init" not in retained["observations"]
 
 
 def test_replay_labels_the_narrow_historical_v2_digest_path(

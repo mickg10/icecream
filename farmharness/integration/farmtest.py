@@ -90,7 +90,7 @@ try:
     )
     from .suite_spec import SCHEMA_PATH as SUITE_SCHEMA_PATH
     from .suite_spec import SuiteSpec, SuiteSpecError, load_suite_spec
-    from .verdict import evaluate_bundle, evaluate_control
+    from .verdict import F_INIT_LAUNCH_CONTRACT, evaluate_bundle, evaluate_control
     from .workload import WorkloadError, run_workload
 except ImportError:  # Executed as ./farmtest.py.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -164,7 +164,7 @@ except ImportError:  # Executed as ./farmtest.py.
     from s50_fairness import S50FairnessError, render_fairness_report, score_s50_fairness
     from suite_spec import SCHEMA_PATH as SUITE_SCHEMA_PATH
     from suite_spec import SuiteSpec, SuiteSpecError, load_suite_spec
-    from verdict import evaluate_bundle, evaluate_control
+    from verdict import F_INIT_LAUNCH_CONTRACT, evaluate_bundle, evaluate_control
     from workload import WorkloadError, run_workload
 
 
@@ -810,6 +810,7 @@ def build_plan(
         "farm": str(farm.path),
         "farm_digest": farm.digest,
         "icefarm_env": _resolver_environment(farm, scenario),
+        "launch_contract": F_INIT_LAUNCH_CONTRACT,
         "ports": ports,
         "network_shaping": {
             "bindings": [binding.as_dict() for binding in netem_bindings],

@@ -4993,6 +4993,7 @@ def collect_bundle(
         "farm_digest": farm.digest,
         "images": preflight["images"],
         "instances": plan["topology"]["instances"],
+        "launch_contract": plan.get("launch_contract"),
         **({"mode": CONTROL_FAILURE_MODE} if scenario.data["controls"] == ["H3"] else {}),
         "observations": observations,
         "plan": plan,
@@ -5231,6 +5232,7 @@ def collect_refusal_bundle(
         "farm_digest": farm.digest,
         "images": {},
         "instances": plan["topology"]["instances"],
+        "launch_contract": plan.get("launch_contract"),
         "mode": REFUSAL_MODE,
         "observations": observations,
         "plan": plan,
@@ -5316,6 +5318,8 @@ def load_verified_bundle(root: Path | str) -> dict[str, Any]:
             raise CollectError(f"bundle {field} differs from its immutable plan")
     if plan.get("topology") != topology:
         raise CollectError("bundle topology differs from its immutable plan")
+    if bundle.get("launch_contract") != plan.get("launch_contract"):
+        raise CollectError("bundle launch contract differs from its immutable plan")
     if topology.get("topology_digest") != bundle.get("topology_digest"):
         raise CollectError("bundle topology digest differs from its topology")
     if bundle.get("instances") != topology.get("instances"):

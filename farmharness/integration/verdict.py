@@ -34,6 +34,8 @@ CACHE_DISK_FAULT_MIN_HEADROOM_BYTES = 8 * 1024 * 1024
 DISK_FILL_WATCHDOG_S = 30
 STALL_LIMIT_MS = 120_000
 F_INIT_SCHEMA = "icefarm-f-init-v1"
+F_INIT_LAUNCH_CONTRACT = "icefarm-f-init-launch-v1"
+HISTORICAL_LAUNCH_CONTRACT = "icefarm-pre-f-init-v0"
 
 ROW_FIELDS = frozenset(
     {
@@ -2949,6 +2951,40 @@ def _f_init_errors(bundle: Mapping[str, Any]) -> set[str]:
     return errors
 
 
+def _launch_contract(bundle: Mapping[str, Any]) -> tuple[str, str | None]:
+    """Select the authenticated current contract or the exact old boundary."""
+
+    plan = bundle.get("plan")
+    if not isinstance(plan, Mapping):
+        # Small pure-verdict fixtures have no launch plan; their topology is
+        # already an explicit current-contract fixture.
+        return F_INIT_LAUNCH_CONTRACT, None
+    declared = plan.get("launch_contract")
+    bundle_declared = bundle.get("launch_contract")
+    if declared == F_INIT_LAUNCH_CONTRACT and bundle_declared == F_INIT_LAUNCH_CONTRACT:
+        return F_INIT_LAUNCH_CONTRACT, None
+    if declared is not None or bundle_declared is not None:
+        return F_INIT_LAUNCH_CONTRACT, "launch contract marker is invalid"
+    commands = plan.get("commands")
+    if not isinstance(commands, list):
+        return F_INIT_LAUNCH_CONTRACT, "launch command contract is absent"
+    f_starts = [
+        command
+        for command in commands
+        if isinstance(command, Mapping)
+        and command.get("phase") == "up.start-f"
+    ]
+    if f_starts and all(
+        isinstance(command.get("argv"), list)
+        and "--init" not in command["argv"]
+        for command in f_starts
+    ):
+        return HISTORICAL_LAUNCH_CONTRACT, None
+    if not f_starts:
+        return HISTORICAL_LAUNCH_CONTRACT, None
+    return F_INIT_LAUNCH_CONTRACT, "unmarked F launch contract is ambiguous"
+
+
 def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
     """Evaluate an already-loaded bundle without consulting external state."""
 
@@ -2978,8 +3014,21 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
     if not bundle_ok:
         return _finish(clauses)
 
-    f_init_errors = _f_init_errors(bundle)
-    if isinstance(bundle.get("topology"), Mapping) or isinstance(bundle.get("plan"), Mapping):
+    launch_contract, launch_contract_error = _launch_contract(bundle)
+    has_launch_data = isinstance(bundle.get("topology"), Mapping) or isinstance(
+        bundle.get("plan"), Mapping
+    )
+    if has_launch_data and launch_contract == F_INIT_LAUNCH_CONTRACT:
+        clauses.append(
+            _clause(
+                "launch.contract",
+                launch_contract_error is None,
+                "current F Docker --init launch contract is authenticated",
+                () if launch_contract_error is None else {"@plan:launch_contract"},
+            )
+        )
+    if has_launch_data and launch_contract == F_INIT_LAUNCH_CONTRACT:
+        f_init_errors = _f_init_errors(bundle)
         clauses.append(
             _clause(
                 "launch.f-init",

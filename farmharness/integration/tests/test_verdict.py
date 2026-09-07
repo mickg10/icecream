@@ -9,6 +9,7 @@ import pytest
 from farmharness.integration.verdict import (
     BUNDLE_SCHEMA,
     CONTROL_VERDICT_SCHEMA,
+    F_INIT_LAUNCH_CONTRACT,
     ROW_SCHEMA,
     VERDICT_SCHEMA,
     _scenario_profile_at_epoch,
@@ -497,6 +498,13 @@ def test_verdict_requires_authenticated_f_init_witness() -> None:
     bundle["topology"] = {
         "instances": [{"host": "h1", "name": "F1", "role": "F"}]
     }
+    bundle["plan"] = {
+        "commands": [
+            {"argv": ["docker", "run", "--init"], "phase": "up.start-f"}
+        ],
+        "launch_contract": F_INIT_LAUNCH_CONTRACT,
+    }
+    bundle["launch_contract"] = F_INIT_LAUNCH_CONTRACT
     observations["f_init"] = {
         "instances": [
             {
@@ -514,15 +522,19 @@ def test_verdict_requires_authenticated_f_init_witness() -> None:
         if clause["id"] == "launch.f-init"
     )
     assert launch["status"] == "PASS"
+    missing = copy.deepcopy(bundle)
+    del missing["observations"]["f_init"]
     for bad in (
+        None,
         {**observations["f_init"], "instances": []},
         {
             **observations["f_init"],
             "instances": [{**observations["f_init"]["instances"][0], "init": False}],
         },
     ):
-        tampered = copy.deepcopy(bundle)
-        tampered["observations"]["f_init"] = bad
+        tampered = missing if bad is None else copy.deepcopy(bundle)
+        if bad is not None:
+            tampered["observations"]["f_init"] = bad
         launch = next(
             clause
             for clause in evaluate_bundle(tampered)["clauses"]
