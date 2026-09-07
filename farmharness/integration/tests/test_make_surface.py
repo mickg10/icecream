@@ -77,7 +77,9 @@ def test_image_make_target_is_scratch_routed() -> None:
         '--labels "p43-1.4.0,p50s2-5b2e5801,p50s4-89917385,'
         'p50s4-b42d65e8,p50s4-0c820e79,p50s4-2deb91d6,'
         'p50s4-57a1e336,p50s4-h3-tail-57a1e336,p50s4-a82d72d8,'
-        'p50s90-f-revision-2-a82d72d8,p50s90-f-hidden-skew-a82d72d8"'
+        'p50s90-f-revision-2-a82d72d8,p50s90-f-hidden-skew-a82d72d8,'
+        'p50s4-f9648cc1,p50s90-f-revision-2-f9648cc1,'
+        'p50s90-f-hidden-skew-f9648cc1"'
     ) in result.stdout
     assert "p50s30-f-refusal-mutant-candidate" not in result.stdout
     assert "p50s30-f-refusal-0c820e79" not in result.stdout
@@ -147,6 +149,8 @@ def test_source_archive_make_target_is_explicit_and_scratch_routed() -> None:
         'p50s4-b42d65e8,p50s4-0c820e79,p50s4-2deb91d6,'
         'p50s4-57a1e336,p50s4-h3-tail-57a1e336,p50s4-a82d72d8,'
         'p50s90-f-revision-2-a82d72d8,p50s90-f-hidden-skew-a82d72d8,'
+        'p50s4-f9648cc1,p50s90-f-revision-2-f9648cc1,'
+        'p50s90-f-hidden-skew-f9648cc1,'
         'p50s30-f-refusal-mutant-candidate,'
         'p50s30-f-refusal-0c820e79,'
         'p50s30-f-refusal-2deb91d6,'

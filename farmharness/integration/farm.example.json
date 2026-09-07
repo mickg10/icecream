@@ -202,73 +202,6 @@
     "process_patterns": ["bigfarm"],
     "never_touch_labels_other_than": "icefarm.*"
   },
-  "authority_capture": {
-    "authority_sha256": "a0e48c07938fba1e58dfb9ae8e35eaea9a348c22bde151ff111925ab59ac630b",
-    "captured_at": "2026-09-07T10:14:11Z",
-    "hosts": {
-      "research6": {
-        "address": "10.0.27.56",
-        "arch": "x86_64",
-        "boot_id_sha256": "9ed66979e363fdfa274e7405495a42092c43772dedd10072da2205bcd8ba0705",
-        "captured_at": "2026-09-07T10:14:12Z",
-        "cpu_count": 20,
-        "docker": {
-          "arch": "x86_64",
-          "mem_bytes": 405749002240,
-          "name": "research6",
-          "os": "linux",
-          "root_dir": "/var/snap/docker/common/var-lib-docker",
-          "server_version": "29.6.1"
-        },
-        "hostname": "research6",
-        "machine_id_sha256": "40c9e9150b141c036dfa61f0f869e0864b85a1cbf61054d510ceff91bbfc03d0",
-        "mem_bytes": 405749002240,
-        "nic_identity_sha256": "491922909009948ab72c637b047cc9eab35a2764efa4333223a1e1f9c948a59b",
-        "physical_host_sha256": "c8a1f70a521cad8228deb989cc4c6ebb87376b787b616ec8fd50e142e6ac732f"
-      },
-      "tt-quietbox2": {
-        "address": "10.0.27.212",
-        "arch": "x86_64",
-        "boot_id_sha256": "e71ff0fcc471b87a45bdf12beafd67386cbe9e8bc8be5a4637f1ddab6271cacf",
-        "captured_at": "2026-09-07T10:14:13Z",
-        "cpu_count": 32,
-        "docker": {
-          "arch": "x86_64",
-          "mem_bytes": 540574842880,
-          "name": "tt-quietbox2",
-          "os": "linux",
-          "root_dir": "/var/lib/docker",
-          "server_version": "29.6.2"
-        },
-        "hostname": "tt-quietbox2",
-        "machine_id_sha256": "14607f85ad2fbb536211a7343f29dbdf8db1f9bd0f948010600b31d420e7166d",
-        "mem_bytes": 540574842880,
-        "nic_identity_sha256": "50bec5f670a9b0c1ccece7b896e28fd9f6aad73383be70391bad9206616f5728",
-        "physical_host_sha256": "a29542e01bb2ce4539bd8f08b5b6f182bf4a9a0a97457f2453b8316c4972d963"
-      },
-      "tt-quietbox3": {
-        "address": "10.0.27.101",
-        "arch": "x86_64",
-        "boot_id_sha256": "6059ce6e7f5d321269104432d1316c3915cd83dad19ad79454fe374d92ca034d",
-        "captured_at": "2026-09-07T10:14:13Z",
-        "cpu_count": 32,
-        "docker": {
-          "arch": "x86_64",
-          "mem_bytes": 540574855168,
-          "name": "tt-quietbox3",
-          "os": "linux",
-          "root_dir": "/var/lib/docker",
-          "server_version": "29.7.2"
-        },
-        "hostname": "tt-quietbox3",
-        "machine_id_sha256": "5d57a5169adc5814555ca3412deb891065c6dcf7d064c70ed4b5e88cd2587e79",
-        "mem_bytes": 540574855168,
-        "nic_identity_sha256": "5a02617b19ed4222f039df0f20ca2df6677b0ca6ce0d432fa756d89fa39a9308",
-        "physical_host_sha256": "61b1ba9c5524f4e975046b8cf7ec125a7ab67c8b53719ce95772b090ffca667a"
-      }
-    },
-    "schema": "icecream-newgen-authority-capture-v2"
-  },
   "authority": {
     "schema": "icecream-newgen-farm-authority-v1",
     "hosts": {
@@ -354,6 +287,12 @@
         "archive_sha256": "de8543d3a93ff459fa7ed1653dc3a8247b428846d0ee303b9048f526876c651e",
         "closure_sha256": "0a312136e7a84132ce41d425cdd1c3f90dd0f84339a34de375bab09c72d9c602",
         "id": "sha256:f48dd6e6abbf647adde280c30e1e36e95c57bfddbc8a92871b7b9b4d8ceac836"
+      },
+      "p50s4-f9648cc1": {
+        "archive_sha256": "5c19afb4377644dd882eb1ff9ad8f30d581b4b85c3cec06dd59ed2c985331521",
+        "closure_sha256": "3037ccc46a122e08e580bbb614cc558da466af5fd9617d4928613af7f3dd3685",
+        "commit": "f9648cc14db01717050dbfd43fb6d7e9e5b6b5b5",
+        "id": "sha256:a0e9260ba13e12b06f8ab4020761bf56099aae8fba56bc65afbe3c04b3d3e46a"
       },
       "p50s4-b42d65e8": {
         "commit": "b42d65e8ac9e90e05ee6d3a19cd371a40dad3277",
@@ -445,6 +384,46 @@
         "role_overrides": {
           "daemon": {
             "sha256": "78c54e3320024a10872f8e902296dc14c2400fcba43e84b559f5835297c1fbef"
+          }
+        }
+      },
+      "p50s90-f-revision-2-f9648cc1": {
+        "archive_sha256": "e1abfa470eb9e86dabd0da13c80dcc34a696cf9497c2a894266131ac4badc3fa",
+        "base_archive_sha256": "5c19afb4377644dd882eb1ff9ad8f30d581b4b85c3cec06dd59ed2c985331521",
+        "base_commit": "f9648cc14db01717050dbfd43fb6d7e9e5b6b5b5",
+        "base_image": "p50s4-f9648cc1",
+        "cache_wire_revision": 2,
+        "closure_sha256": "ef42f663019cf1d6e029aedfdb5f879e34458ddf61ed947b2e01fbdc56f06277",
+        "commit": "f9648cc14db01717050dbfd43fb6d7e9e5b6b5b5",
+        "id": "sha256:9b9bf390d2f3e536dfc768dcceee77a9fd507ddef51845457f58fb64fe5e1d7f",
+        "kind": "daemon-mutant",
+        "patch_path": "mutants/daemon-wire-revision-2.patch",
+        "patch_sha256": "76fbed8c13d3836253444130502511949bc359f0c5228c241d318a1a125461e7",
+        "recipe_schema": "icefarm-daemon-mutant-recipe-v1",
+        "recipe_sha256": "e1abfa470eb9e86dabd0da13c80dcc34a696cf9497c2a894266131ac4badc3fa",
+        "role_overrides": {
+          "daemon": {
+            "sha256": "d568caba16864cd6ecffcc2f1d88e017e64761b23b2c2eb79974b84f0df44f89"
+          }
+        }
+      },
+      "p50s90-f-hidden-skew-f9648cc1": {
+        "archive_sha256": "307dc07de5a3b1608dd974e0a4a530339d5bd31c9038f666031ad3a390a14b8e",
+        "base_archive_sha256": "5c19afb4377644dd882eb1ff9ad8f30d581b4b85c3cec06dd59ed2c985331521",
+        "base_commit": "f9648cc14db01717050dbfd43fb6d7e9e5b6b5b5",
+        "base_image": "p50s4-f9648cc1",
+        "cache_wire_revision": 1,
+        "closure_sha256": "d40f216c18207e1aca4710c1f256670dbd06ba7360cf69bb673945ee6e0571f1",
+        "commit": "f9648cc14db01717050dbfd43fb6d7e9e5b6b5b5",
+        "id": "sha256:a0d0b8edec0cf75be721820a4106a2dca5cdf928a8cb00c016f8896f0a9c0724",
+        "kind": "daemon-mutant",
+        "patch_path": "mutants/daemon-hidden-wire-skew.patch",
+        "patch_sha256": "dacae42499a23db64c76ea56694735153f9dea2faefa7eee22506828f2f2654f",
+        "recipe_schema": "icefarm-daemon-mutant-recipe-v1",
+        "recipe_sha256": "307dc07de5a3b1608dd974e0a4a530339d5bd31c9038f666031ad3a390a14b8e",
+        "role_overrides": {
+          "daemon": {
+            "sha256": "f124ac4c87a78127fbeb563cc49af55dce8fd2a5fb9eb5d40efe25d004b11986"
           }
         }
       },

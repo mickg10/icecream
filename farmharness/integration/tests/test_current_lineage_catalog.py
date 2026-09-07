@@ -5,10 +5,10 @@ from pathlib import Path
 INTEGRATION = Path(__file__).parents[1]
 SCENARIOS = INTEGRATION / "scenarios"
 HISTORICAL_PRODUCT = "p50s4-57a1e336"
-FINAL_PRODUCT = "p50s4-a82d72d8"
+FINAL_PRODUCT = "p50s4-f9648cc1"
 FINAL_MUTANTS = {
-    "p50s90-f-revision-2-a82d72d8",
-    "p50s90-f-hidden-skew-a82d72d8",
+    "p50s90-f-revision-2-f9648cc1",
+    "p50s90-f-hidden-skew-f9648cc1",
 }
 RETIRED_PRODUCTS = {"p50s4-89917385", "p50s4-b42d65e8"}
 REQUALIFIED_PREFIXES = ("S50-", "S60-", "S70-", "S80-", "S90-", "S95-")
@@ -36,10 +36,10 @@ def test_mutant_scenarios_use_the_final_product_lineage() -> None:
         },
         "S90-revision-skew.json": {
             "r1": FINAL_PRODUCT,
-            "r2": "p50s90-f-revision-2-a82d72d8",
+            "r2": "p50s90-f-revision-2-f9648cc1",
         },
         "S90-revision-refusal-retry.json": {
-            "mutant": "p50s90-f-hidden-skew-a82d72d8",
+            "mutant": "p50s90-f-hidden-skew-f9648cc1",
             "new": FINAL_PRODUCT,
         },
     }
