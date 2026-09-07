@@ -732,6 +732,7 @@ def _strict_p50_required(scenario: ScenarioSpec, plan: dict[str, Any]) -> bool:
         scenario.data["shape"] != "S'C'F'"
         or scenario.data["controls"]
         or scenario.data.get("id") == "S30-mutant-f-refusal"
+        or scenario.data.get("id") == "S95-cache-disk-full"
         or not all(
             item.get("version") == 50
             for item in plan.get("topology", {}).get("instances", [])
