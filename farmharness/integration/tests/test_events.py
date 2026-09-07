@@ -1933,11 +1933,11 @@ def test_s_f_transition_pauses_rejoins_and_resumes_with_strict_receipt(tmp_path:
         {"trigger": "job 1", "action": "upgrade", "instance": "F1", "image": "new"}
     ]
     old_document = _transition_image_document(farm, "p43-1.4.0")
-    new_document = _transition_image_document(farm, "p50s4-89917385")
+    new_document = _transition_image_document(farm, "p50s4-57a1e336")
     farm.data["authority"]["images"]["p43-1.4.0"]["closure_sha256"] = _image_identity(
         CommandResult(0, json.dumps(old_document), ""), "old"
     ).closure_sha256
-    farm.data["authority"]["images"]["p50s4-89917385"]["closure_sha256"] = _image_identity(
+    farm.data["authority"]["images"]["p50s4-57a1e336"]["closure_sha256"] = _image_identity(
         CommandResult(0, json.dumps(new_document), ""), "new"
     ).closure_sha256
     plan = farmtest.build_plan(farm, scenario, run_id="event-unit")
@@ -1986,10 +1986,10 @@ def test_scheduler_transition_requires_fresh_workers_and_all_clients(tmp_path: P
         {"trigger": "job 1", "action": "upgrade", "instance": "S1", "image": "new"}
     ]
     old_document = _transition_image_document(farm, "p43-1.4.0")
-    new_document = _transition_image_document(farm, "p50s4-89917385")
+    new_document = _transition_image_document(farm, "p50s4-57a1e336")
     for label, document, alias in (
         ("p43-1.4.0", old_document, "old"),
-        ("p50s4-89917385", new_document, "new"),
+        ("p50s4-57a1e336", new_document, "new"),
     ):
         farm.data["authority"]["images"][label]["closure_sha256"] = _image_identity(
             CommandResult(0, json.dumps(document), ""), alias
@@ -2090,10 +2090,10 @@ def test_daemon_transition_aborts_paused_clients_on_missing_rejoin(tmp_path: Pat
         {"trigger": "job 1", "action": "upgrade", "instance": "F1", "image": "new"}
     ]
     old_document = _transition_image_document(farm, "p43-1.4.0")
-    new_document = _transition_image_document(farm, "p50s4-89917385")
+    new_document = _transition_image_document(farm, "p50s4-57a1e336")
     for label, document, alias in (
         ("p43-1.4.0", old_document, "old"),
-        ("p50s4-89917385", new_document, "new"),
+        ("p50s4-57a1e336", new_document, "new"),
     ):
         farm.data["authority"]["images"][label]["closure_sha256"] = _image_identity(
             CommandResult(0, json.dumps(document), ""), alias
@@ -2130,11 +2130,11 @@ def test_upgrade_materializes_target_and_restarts_exact_container_with_receipt(t
         {"trigger": "t+0", "action": "downgrade", "instance": "F1", "image": "old"},
     ]
     old_document = _transition_image_document(farm, "p43-1.4.0")
-    new_document = _transition_image_document(farm, "p50s4-89917385")
+    new_document = _transition_image_document(farm, "p50s4-57a1e336")
     old_identity = _image_identity(CommandResult(0, json.dumps(old_document), ""), "old")
     new_identity = _image_identity(CommandResult(0, json.dumps(new_document), ""), "new")
     farm.data["authority"]["images"]["p43-1.4.0"]["closure_sha256"] = old_identity.closure_sha256
-    farm.data["authority"]["images"]["p50s4-89917385"]["closure_sha256"] = new_identity.closure_sha256
+    farm.data["authority"]["images"]["p50s4-57a1e336"]["closure_sha256"] = new_identity.closure_sha256
     plan = farmtest.build_plan(farm, scenario, run_id="event-unit")
     recorder = TransitionRecorder(farm, plan)
     records = run_events(
@@ -2148,8 +2148,8 @@ def test_upgrade_materializes_target_and_restarts_exact_container_with_receipt(t
     assert records[0].receipt is not None
     receipt = records[0].receipt
     assert receipt["before"]["image"] == "p43-1.4.0"
-    assert receipt["after"]["image"] == "p50s4-89917385"
-    assert records[1].receipt["before"]["image"] == "p50s4-89917385"
+    assert receipt["after"]["image"] == "p50s4-57a1e336"
+    assert records[1].receipt["before"]["image"] == "p50s4-57a1e336"
     assert records[1].receipt["after"]["image"] == "p43-1.4.0"
     phases = [command.phase for command in recorder.commands]
     assert phases[:3] == ["preflight.image", "preflight.runtime-mkdir", "preflight.runtime-materialize"]
@@ -2180,9 +2180,9 @@ def test_upgrade_materializes_target_and_restarts_exact_container_with_receipt(t
 
 def test_env_set_is_limited_to_authorized_setting_and_receipts_are_immutable(tmp_path: Path) -> None:
     farm, scenario, plan = _fixture(tmp_path)
-    document = _transition_image_document(farm, "p50s4-89917385")
+    document = _transition_image_document(farm, "p50s4-57a1e336")
     identity = _image_identity(CommandResult(0, json.dumps(document), ""), "env")
-    farm.data["authority"]["images"]["p50s4-89917385"]["closure_sha256"] = identity.closure_sha256
+    farm.data["authority"]["images"]["p50s4-57a1e336"]["closure_sha256"] = identity.closure_sha256
     plan = farmtest.build_plan(farm, scenario, run_id="event-unit")
     scenario.data["timeline"] = [
         {
@@ -2210,9 +2210,9 @@ def test_env_set_is_limited_to_authorized_setting_and_receipts_are_immutable(tmp
 
 def test_scheduler_kill_switch_cycle_preserves_exact_state_chain(tmp_path: Path) -> None:
     farm, scenario, plan = _fixture(tmp_path)
-    document = _transition_image_document(farm, "p50s4-89917385")
+    document = _transition_image_document(farm, "p50s4-57a1e336")
     identity = _image_identity(CommandResult(0, json.dumps(document), ""), "cycle")
-    farm.data["authority"]["images"]["p50s4-89917385"][
+    farm.data["authority"]["images"]["p50s4-57a1e336"][
         "closure_sha256"
     ] = identity.closure_sha256
     plan = farmtest.build_plan(farm, scenario, run_id="event-unit")
@@ -2336,9 +2336,9 @@ def test_b6_delayed_poll_requires_a_new_dispatch_before_restore(
 
 def test_client_fault_env_set_is_exact_and_preserves_mode(tmp_path: Path) -> None:
     farm, scenario, plan = _fixture(tmp_path)
-    document = _transition_image_document(farm, "p50s4-89917385")
+    document = _transition_image_document(farm, "p50s4-57a1e336")
     identity = _image_identity(CommandResult(0, json.dumps(document), ""), "fault-env")
-    farm.data["authority"]["images"]["p50s4-89917385"][
+    farm.data["authority"]["images"]["p50s4-57a1e336"][
         "closure_sha256"
     ] = identity.closure_sha256
     plan = farmtest.build_plan(farm, scenario, run_id="event-unit")
@@ -2382,10 +2382,10 @@ def test_client_fault_env_set_is_exact_and_preserves_mode(tmp_path: Path) -> Non
 def test_same_host_same_label_preflight_is_scoped_by_role(tmp_path: Path) -> None:
     farm, scenario, plan = _fixture(tmp_path)
     identity = _image_identity(
-        CommandResult(0, json.dumps(_transition_image_document(farm, "p50s4-89917385")), ""),
+        CommandResult(0, json.dumps(_transition_image_document(farm, "p50s4-57a1e336")), ""),
         "same-role",
     )
-    farm.data["authority"]["images"]["p50s4-89917385"]["closure_sha256"] = identity.closure_sha256
+    farm.data["authority"]["images"]["p50s4-57a1e336"]["closure_sha256"] = identity.closure_sha256
     plan = farmtest.build_plan(farm, scenario, run_id="event-unit")
     scenario.data["timeline"] = [
         {"trigger": "t+0", "action": "env_set", "instance": "S1", "env": {"ICECC_P50_PROFILE": "OFF"}},
@@ -2442,11 +2442,11 @@ def test_transition_receipt_tampering_is_rejected(
         }
     ]
     old_document = _transition_image_document(farm, "p43-1.4.0")
-    new_document = _transition_image_document(farm, "p50s4-89917385")
+    new_document = _transition_image_document(farm, "p50s4-57a1e336")
     farm.data["authority"]["images"]["p43-1.4.0"]["closure_sha256"] = _image_identity(
         CommandResult(0, json.dumps(old_document), ""), "old"
     ).closure_sha256
-    farm.data["authority"]["images"]["p50s4-89917385"]["closure_sha256"] = _image_identity(
+    farm.data["authority"]["images"]["p50s4-57a1e336"]["closure_sha256"] = _image_identity(
         CommandResult(0, json.dumps(new_document), ""), "new"
     ).closure_sha256
     plan = farmtest.build_plan(farm, scenario, run_id="event-unit")
@@ -2485,10 +2485,10 @@ def test_transition_receipt_tampering_is_rejected(
 def test_post_start_inspect_and_running_are_required(tmp_path: Path, attribute: str) -> None:
     farm, scenario, plan = _fixture(tmp_path)
     identity = _image_identity(
-        CommandResult(0, json.dumps(_transition_image_document(farm, "p50s4-89917385")), ""),
+        CommandResult(0, json.dumps(_transition_image_document(farm, "p50s4-57a1e336")), ""),
         "inspect",
     )
-    farm.data["authority"]["images"]["p50s4-89917385"]["closure_sha256"] = identity.closure_sha256
+    farm.data["authority"]["images"]["p50s4-57a1e336"]["closure_sha256"] = identity.closure_sha256
     plan = farmtest.build_plan(farm, scenario, run_id="event-unit")
     scenario.data["timeline"] = [
         {"trigger": "t+0", "action": "env_set", "instance": "S1", "env": {"ICECC_P50_PROFILE": "OFF"}}

@@ -119,6 +119,7 @@ farmharness/integration/tests/fixtures/test-compiler.sh
 farmharness/integration/tests/test_authority_capture.py
 farmharness/integration/tests/test_collect_and_report.py
 farmharness/integration/tests/test_corpus_archive.py
+farmharness/integration/tests/test_current_lineage_catalog.py
 farmharness/integration/tests/test_daemon_mutant_promotion.py
 farmharness/integration/tests/test_distribution_manifest.py
 farmharness/integration/tests/test_events.py
