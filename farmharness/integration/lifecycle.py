@@ -3262,6 +3262,7 @@ def _remove_netem_bridges(
     if not bindings:
         return receipts, problems
     expected: dict[str, str] = {}
+    receipt_error: str | None = None
     lifecycle_path = bundle_root(farm, plan["run_id"]) / "lifecycle.json"
     try:
         document = json.loads(lifecycle_path.read_text(encoding="utf-8"))
@@ -3290,10 +3291,14 @@ def _remove_netem_bridges(
                     and re.fullmatch(r"[0-9a-f]{64}", network_id)
                 ):
                     expected[instance] = network_id
-    except (OSError, json.JSONDecodeError, AttributeError):
+    except (OSError, json.JSONDecodeError, AttributeError, LifecycleError) as exc:
         expected = {}
+        receipt_error = str(exc) or type(exc).__name__
 
     for binding in bindings:
+        if receipt_error is not None:
+            problems.append(f"{binding.instance}:network-receipt:{receipt_error}")
+            continue
         try:
             list_command = _command(
                 factory,
@@ -3384,7 +3389,7 @@ def _remove_netem_bridges(
             )
             if result.returncode != 0:
                 problems.append(f"{binding.instance}:bridge-remove:rc={result.returncode}")
-        except (RemoteError, LifecycleError) as exc:
+        except (RemoteError, LifecycleError, NetemPlanError) as exc:
             problems.append(f"{binding.instance}:network-identity:{exc}")
     return receipts, problems
 

@@ -366,15 +366,99 @@ def test_netem_teardown_refuses_unlabelled_bridge_name_collision(tmp_path: Path)
 
 
 def test_netem_teardown_refuses_foreign_container_name_collision(tmp_path: Path) -> None:
-    _farm, _scenario, plan = _shaped_plan(tmp_path)
+    farm, _scenario, plan = _shaped_plan(tmp_path)
     binding = lifecycle._netem_bindings(plan)[0]
+    _write_creation_receipt(tmp_path, farm, plan, "a" * 64)
     recorder = _NetworkRecorder("")
     receipts, problems = lifecycle._remove_netem_bridges(
-        _farm, plan, (binding,), recorder, CommandFactory(), 30
+        farm, plan, (binding,), recorder, CommandFactory(), 30
     )
     assert not problems
     assert receipts[0]["status"] == "SKIPPED_NO_AUTHENTICATED_NETWORK"
     assert not any("tc" in argument for command in recorder.commands for argument in command.argv)
+
+
+def test_netem_teardown_rejects_malformed_partial_receipt_without_removal(
+    tmp_path: Path,
+) -> None:
+    farm, _scenario, plan = _shaped_plan(tmp_path)
+    binding = lifecycle._netem_bindings(plan)[0]
+    root = Path(farm.data["hub"]["results_root"]) / "results" / plan["run_id"]
+    root.mkdir(parents=True)
+    (root / "lifecycle.json").write_text(
+        json.dumps(
+            {
+                "network_shaping": {
+                    "bindings": [],
+                    "schema": "icefarm-netem-receipt-v1",
+                    "status": "CREATED",
+                    "scenario_digest": "0" * 64,
+                    "topology_digest": "0" * 64,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    network_id = "a" * 64
+    recorder = _NetworkRecorder(
+        network_id, _network_document(binding, plan["run_id"], network_id, plan)
+    )
+    receipts, problems = lifecycle._remove_netem_bridges(
+        farm, plan, (binding,), recorder, CommandFactory(), 30
+    )
+    assert not receipts
+    assert any("network-receipt" in problem for problem in problems)
+    assert not any(command.phase == "down.network-remove" for command in recorder.commands)
+
+
+def test_netem_teardown_rejects_invalid_fresh_inspect_without_removal(
+    tmp_path: Path,
+) -> None:
+    farm, _scenario, plan = _shaped_plan(tmp_path)
+    binding = lifecycle._netem_bindings(plan)[0]
+    network_id = "a" * 64
+    _write_creation_receipt(tmp_path, farm, plan, network_id)
+    invalid = _network_document(binding, plan["run_id"], network_id, plan)
+    invalid["Driver"] = "host"
+    recorder = _NetworkRecorder(network_id, invalid)
+    receipts, problems = lifecycle._remove_netem_bridges(
+        farm, plan, (binding,), recorder, CommandFactory(), 30
+    )
+    assert not receipts
+    assert any("network-identity" in problem for problem in problems)
+    assert not any(command.phase == "down.network-remove" for command in recorder.commands)
+
+
+def test_teardown_continues_independent_cleanup_after_netem_receipt_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    farm, _scenario, plan = _shaped_plan(tmp_path)
+    root = Path(farm.data["hub"]["results_root"]) / "results" / plan["run_id"]
+    root.mkdir(parents=True)
+    (root / "lifecycle.json").write_text("{malformed", encoding="utf-8")
+    used_hosts = {item["host"] for item in plan["topology"]["instances"]}
+    protected_checks: list[str] = []
+    monkeypatch.setattr(lifecycle, "_remove_run_containers", lambda *args, **kwargs: [])
+
+    def facts(*args, **kwargs):
+        protected_checks.append(args[1])
+        return {"protected": {}}
+
+    monkeypatch.setattr(lifecycle, "_host_facts", facts)
+    recorder = _NetworkRecorder("")
+    with pytest.raises(LifecycleError, match="network-receipt"):
+        lifecycle.tear_down(
+            farm,
+            plan,
+            recorder,
+            CommandFactory(),
+            protected_before={host: {} for host in used_hosts},
+        )
+    assert sum(command.phase == "down.remove-scratch" for command in recorder.commands) == len(
+        plan["topology"]["instances"]
+    )
+    assert set(protected_checks) == used_hosts
+    assert not any(command.phase == "down.network-remove" for command in recorder.commands)
 
 
 def test_netem_teardown_refuses_owned_name_replaced_by_different_id(tmp_path: Path) -> None:
