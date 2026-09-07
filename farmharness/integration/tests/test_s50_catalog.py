@@ -11,6 +11,17 @@ from farmharness.integration.suite_spec import load_suite_spec
 
 
 INTEGRATION = Path(__file__).resolve().parents[1]
+S50_WORKER_HOSTS = {
+    "F1": "tt-quietbox2",
+    "F2": "tt-quietbox2",
+    "F3": "tt-quietbox2",
+    "F4": "research6",
+    "F5": "research6",
+    "F6": "tt-quietbox2",
+    "F7": "tt-quietbox3",
+    "F8": "tt-quietbox3",
+    "F9": "tt-quietbox3",
+}
 
 
 def test_s50_catalogue_has_exact_worker_fractions_and_safe_placements() -> None:
@@ -35,6 +46,7 @@ def test_s50_catalogue_has_exact_worker_fractions_and_safe_placements() -> None:
             "tt-quietbox3",
             "research6",
         }
+        assert {item["name"]: item["host"] for item in workers} == S50_WORKER_HOSTS
         assert {item["name"] for item in clients} == {"C1", "C2"}
         assert {item["image"] for item in clients} == {"old", "new"}
         assert all(
@@ -92,6 +104,10 @@ def test_s50_suite_is_fixed_cheap_to_expensive_and_disjoint_from_s80() -> None:
             INTEGRATION / "scenarios" / f"{scenario_id}.json", farm
         )
         assert scenario.data["workload"]["jobs"] == 18
+        workers = [
+            item for item in scenario.data["instances"] if item["role"] == "F"
+        ]
+        assert {item["name"]: item["host"] for item in workers} == S50_WORKER_HOSTS
     s80 = load_suite_spec(INTEGRATION / "suites" / "twobuild.json")
     assert set(suite.data["scenarios"]).isdisjoint(s80.data["scenarios"])
 
@@ -107,6 +123,7 @@ def test_s50_all_new_workers_mixed_clients_is_explicit_and_exact() -> None:
     assert len(workers) == 9
     assert all(item["image"] == "new" for item in workers)
     assert sum(item["slots"] for item in workers) == 36
+    assert {item["name"]: item["host"] for item in workers} == S50_WORKER_HOSTS
     assert {item["image"] for item in clients} == {"old", "new"}
     assert scenario.data["workload"]["jobs"] == 100
     assert scenario.data["workload"]["clients"] == ["C1", "C2"]
