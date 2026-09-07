@@ -15,7 +15,7 @@ S50_WORKER_HOSTS = {
     "F1": "tt-quietbox2",
     "F2": "tt-quietbox2",
     "F3": "tt-quietbox2",
-    "F4": "research6",
+    "F4": "tt-quietbox3",
     "F5": "tt-quietbox2",
     "F6": "tt-quietbox3",
     "F7": "tt-quietbox3",
@@ -41,11 +41,16 @@ def test_s50_catalogue_has_exact_worker_fractions_and_safe_placements() -> None:
         assert len(workers) == 9
         assert sum(item["image"] == "new" for item in workers) == new_count
         assert sum(item["slots"] for item in workers) == 36
+        # S50's strict 5% old-client fairness comparison uses the two
+        # CPU-homogeneous quietboxes.  research6 remains in Farm E and in
+        # the compatibility/resilience/performance catalogue, but its
+        # exact-TU GCC throughput is about 20% lower and is therefore not a
+        # comparable S50 timing worker.
         assert {item["host"] for item in workers} == {
             "tt-quietbox2",
             "tt-quietbox3",
-            "research6",
         }
+        assert "research6" in farm.hosts
         assert {item["name"]: item["host"] for item in workers} == S50_WORKER_HOSTS
         assert {item["name"] for item in clients} == {"C1", "C2"}
         assert {item["image"] for item in clients} == {"old", "new"}

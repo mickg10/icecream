@@ -8,7 +8,7 @@
     {"name": "F1", "role": "F", "host": "tt-quietbox2", "image": "new", "slots": 4},
     {"name": "F2", "role": "F", "host": "tt-quietbox2", "image": "new", "slots": 4},
     {"name": "F3", "role": "F", "host": "tt-quietbox2", "image": "new", "slots": 4},
-    {"name": "F4", "role": "F", "host": "research6", "image": "new", "slots": 4},
+    {"name": "F4", "role": "F", "host": "tt-quietbox3", "image": "new", "slots": 4},
     {"name": "F5", "role": "F", "host": "tt-quietbox2", "image": "new", "slots": 4},
     {"name": "F6", "role": "F", "host": "tt-quietbox3", "image": "old", "slots": 4},
     {"name": "F7", "role": "F", "host": "tt-quietbox3", "image": "old", "slots": 4},
