@@ -629,6 +629,60 @@ int main(int argc, char **argv)
             "copy");
     delete client_c_wire;
 
+    /* Install a second assignment before C reports success, so both handoffs
+       retain the same route-state generation.  C's success below advances
+       that generation; the second wrapper's exact failure is therefore stale
+       for affinity mutation but remains authoritative for withdrawing its
+       own scheduler assignment. */
+    MsgChannel *client_stale = connect_unix_bounded(socket_path, 5000);
+    REQUIRE(client_stale != nullptr,
+            "second remote client connected before route generation advances");
+    GetCSMsg request_stale(Environments(), "stale-route-failure.cpp",
+                           CompileJob::Lang_CXX, 1, "x86_64", 0,
+                           std::string(), 0, 0, 0);
+    request_stale.cache_protocol = CACHE_WIRE_REVISION;
+    request_stale.cache_profile_mask = CACHE_ADVERTISABLE_PROFILE_MASK;
+    REQUIRE(client_stale && client_stale->send_msg(request_stale),
+            "second remote client requested an assignment");
+
+    Msg *forwarded_stale_wire = scheduler
+        ? wait_for_type(scheduler, Msg::GET_CS, 5000) : nullptr;
+    GetCSMsg *forwarded_stale = forwarded_stale_wire
+        ? dynamic_cast<GetCSMsg *>(forwarded_stale_wire) : nullptr;
+    REQUIRE(forwarded_stale != nullptr,
+            "fake scheduler received the second remote GetCS");
+    const uint32_t stale_wire_job_id = UINT32_C(0x00005204);
+    const uint64_t stale_assignment_epoch = UINT64_C(0x5200000000000004);
+    const uint64_t stale_assignment_nonce = UINT64_C(0x0123456789abcdef);
+    const uint64_t stale_c_guid = UINT64_C(0x52000000000000c4);
+    const uint64_t stale_tu_seq = UINT64_C(38);
+    const uint32_t stale_forwarded_id = forwarded_stale
+        ? forwarded_stale->client_id : 0;
+    UseCSMsg reply_stale(
+        "x86_64", remote_f_host, remote_f_port, stale_wire_job_id, true,
+        stale_forwarded_id, UINT32_C(0x00000038), stale_assignment_epoch,
+        stale_assignment_nonce, remote_cache_port, CACHE_WIRE_REVISION,
+        CACHE_PROFILE_ZSTD_TU);
+    reply_stale.setCompileIdentity(stale_c_guid, stale_tu_seq);
+    if (scheduler && forwarded_stale) {
+        REQUIRE(scheduler->send_msg(reply_stale),
+                "fake scheduler sent the second remote cache assignment");
+    }
+    delete forwarded_stale_wire;
+
+    Msg *client_stale_wire = client_stale
+        ? wait_for_type(client_stale, Msg::USE_CS, 5000) : nullptr;
+    UseCSMsg *client_stale_use = client_stale_wire
+        ? dynamic_cast<UseCSMsg *>(client_stale_wire) : nullptr;
+    REQUIRE(client_stale_use != nullptr &&
+                client_stale_use->job_id == stale_wire_job_id &&
+                client_stale_use->assignmentEpoch() == stale_assignment_epoch &&
+                client_stale_use->assignmentNonce() == stale_assignment_nonce &&
+                client_stale_use->cGuid() == stale_c_guid &&
+                client_stale_use->tuSeq() == stale_tu_seq,
+            "second remote client received its exact assignment binding");
+    delete client_stale_wire;
+
     JobDoneMsg remote_successful_observation(
         remote_wire_job_id, 0,
         static_cast<uint32_t>(JobDoneMsg::FROM_SUBMITTER) |
@@ -639,6 +693,34 @@ int main(int argc, char **argv)
             "remote client C reports an exact successful cache-route observation");
     REQUIRE(client_c && !request_internals(client_c, 5000).empty(),
             "a same-channel status round trip orders the successful observation before the scheduler bounce");
+
+    const int stale_failure_exitcode = 106;
+    JobDoneMsg stale_failed_observation(
+        stale_wire_job_id, stale_failure_exitcode,
+        static_cast<uint32_t>(JobDoneMsg::FROM_SUBMITTER) |
+            static_cast<uint32_t>(JobDoneMsg::P50CacheRouteObservation), 0,
+        stale_assignment_epoch, stale_assignment_nonce,
+        stale_c_guid, stale_tu_seq);
+    REQUIRE(client_stale && client_stale->send_msg(stale_failed_observation),
+            "second remote client reports an exact now-stale route failure");
+    REQUIRE(client_stale && !request_internals(client_stale, 5000).empty(),
+            "same-channel status orders the stale failure observation");
+
+    Msg *stale_withdrawal_wire = scheduler
+        ? wait_for_type(scheduler, Msg::JOB_DONE, 5000) : nullptr;
+    JobDoneMsg *stale_withdrawal = stale_withdrawal_wire
+        ? dynamic_cast<JobDoneMsg *>(stale_withdrawal_wire) : nullptr;
+    REQUIRE(stale_withdrawal != nullptr &&
+                stale_withdrawal->job_id == stale_wire_job_id &&
+                stale_withdrawal->exitcode == stale_failure_exitcode &&
+                stale_withdrawal->flags == JobDoneMsg::FROM_SUBMITTER &&
+                stale_withdrawal->assignmentEpoch() == stale_assignment_epoch &&
+                stale_withdrawal->assignmentNonce() == stale_assignment_nonce &&
+                stale_withdrawal->cGuid() == stale_c_guid &&
+                stale_withdrawal->tuSeq() == stale_tu_seq,
+            "exact stale route failure becomes one clean scheduler withdrawal");
+    delete stale_withdrawal_wire;
+    delete client_stale;
     delete client_c;
 
     /* A real compiler wrapper can disconnect after receiving UseCS but before

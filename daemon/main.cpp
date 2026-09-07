@@ -7287,15 +7287,20 @@ bool Daemon::create_env_finished(string env_key)
 
 bool Daemon::handle_job_done(Client *cl, JobDoneMsg *m)
 {
-    /* A remote wrapper reports cache-route success on its existing local
-       protocol-50 connection.  This is an observation, never a scheduler
-       settlement: consume it here before ordinary JobDone accounting and
-       forwarding.  Exact assignment identity, successful result, dedicated
-       submitter-origin flag set, immutable wrapper provenance, and the
-       retained handoff all have to agree before advancing affinity. */
+    /* A remote wrapper reports its cache-route result on its existing local
+       protocol-50 connection.  The observation flags are local-only and are
+       never forwarded to S.  A success remains telemetry only.  An exact
+       failure also requests withdrawal of that assignment: emit a separate,
+       clean FROM_SUBMITTER JobDone so S can order RevokeBeforeStart against F
+       and decide whether the source arm was reserved or already claimed. */
     if (m->is_p50_cache_route_observation()) {
         reconcile_cache_route_state();
-        const bool exact_handoff = cl->channel != nullptr &&
+        /* Assignment identity outlives route affinity.  A different request's
+           success or a sidecar replacement can advance the route generation/
+           READY lease while this wrapper still owns its retained UseCS.  Such
+           an observation is stale for route mutation, but an exact failure
+           must still withdraw its own scheduler assignment. */
+        const bool assignment_bound = cl->channel != nullptr &&
             IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT,
                                 cl->channel) &&
             cl->connection_provenance.cache_eligible() &&
@@ -7304,20 +7309,25 @@ bool Daemon::handle_job_done(Client *cl, JobDoneMsg *m)
                 cl->cacheHandoff.cacheProfileMask) &&
             cl->cacheHandoff.cGuid != 0 &&
             cl->cacheHandoff.readyLease.has_value() &&
-            cache_route_state_lease.has_value() &&
-            icecc::p50::daemon::p50_ready_lease_observation_equal(
-                *cl->cacheHandoff.readyLease, *cache_route_state_lease) &&
             cl->cacheHandoff.ordinaryPort != 0 &&
             cl->cacheHandoff.ordinaryPort <= UINT16_MAX &&
             cl->cacheHandoff.host.size() <= P50_CACHE_AFFINITY_HOST_MAX &&
             cl->cacheHandoff.host.find('\0') == string::npos;
-        const P50CacheRouteObservationKind observation = exact_handoff
+        const P50CacheRouteObservationKind assignment_observation =
+            assignment_bound
             ? p50_cache_route_observation_kind(
                   *m, cl->cacheHandoff.wireJobId,
                   cl->cacheHandoff.assignmentEpoch,
                   cl->cacheHandoff.assignmentNonce,
                   cl->cacheHandoff.cGuid, cl->cacheHandoff.tuSeq,
                   cl->cacheHandoff.cacheProfileMask)
+            : P50CacheRouteObservationKind::Invalid;
+        const bool exact_handoff = assignment_bound &&
+            cache_route_state_lease.has_value() &&
+            icecc::p50::daemon::p50_ready_lease_observation_equal(
+                *cl->cacheHandoff.readyLease, *cache_route_state_lease);
+        const P50CacheRouteObservationKind observation = exact_handoff
+            ? assignment_observation
             : P50CacheRouteObservationKind::Invalid;
         const bool generation_current =
             cl->cacheHandoff.routeStateGeneration ==
@@ -7383,6 +7393,29 @@ bool Daemon::handle_job_done(Client *cl, JobDoneMsg *m)
             log_warning()
                 << "ignored invalid or stale P50 cache-route observation for job "
                 << m->job_id << endl;
+        }
+
+        const bool failed_assignment =
+            assignment_observation == P50CacheRouteObservationKind::Failure ||
+            assignment_observation ==
+                P50CacheRouteObservationKind::PermanentLocalProfileFailure ||
+            assignment_observation ==
+                P50CacheRouteObservationKind::LocalSidecarReplacementRequired;
+        if (failed_assignment &&
+            cl->job_id == cl->cacheHandoff.wireJobId &&
+            scheduler_owns_getcs_assignment(cl)) {
+            JobDoneMsg withdrawal(
+                cl->cacheHandoff.wireJobId, m->exitcode,
+                JobDoneMsg::FROM_SUBMITTER, clients.size(),
+                cl->cacheHandoff.assignmentEpoch,
+                cl->cacheHandoff.assignmentNonce,
+                cl->cacheHandoff.cGuid, cl->cacheHandoff.tuSeq);
+            if (!send_scheduler(withdrawal)) {
+                return false;
+            }
+            /* last_known_job_id deliberately remains as the audit identity;
+               zeroing the active id makes the later End/HUP idempotent. */
+            cl->job_id = 0;
         }
         return true;
     }

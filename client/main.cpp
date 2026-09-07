@@ -689,8 +689,11 @@ int main(int argc, char **argv)
                     if (error.errorCode != 106 || p50_legacy_retry || strict_p50)
                         throw;
 
-                    /* The failed cache assignment has already been closed by
-                       F with its exact terminal JobDone.  End the submitter
+                    /* The failed cache attempt has already published its exact
+                       local observation.  C converts that failure into an
+                       ordered scheduler withdrawal; S then revokes an
+                       unclaimed F reservation or waits for F's authoritative
+                       terminal if F already claimed it.  End this submitter
                        proxy without emitting a duplicate settlement, then use
                        a new wrapper connection/client id for a genuinely fresh
                        GetCS.  Its cache request is canonical absence, so the C
