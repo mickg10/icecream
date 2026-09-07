@@ -2801,10 +2801,13 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
     /* The policy is frozen per assignment before either peer can observe it.
        STRICT_NONCE additionally requires the complete P50 path, S->C and
        S->F; local decisions use neither a worker assignment nor this carrier. */
-    const bool strict_path_eligible = assignment_fence_mode != ConfCSMsg::StrictNonce
-        || (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY, use_cs)
-            && IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY,
-                                   job->submitter()));
+    const bool identity_path_eligible =
+        IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY, use_cs)
+        && IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY,
+                               job->submitter());
+    const bool strict_path_eligible =
+        assignment_fence_mode != ConfCSMsg::StrictNonce
+        || identity_path_eligible;
     if (!local_decision && !strict_path_eligible) {
         /* Selection filters make this unreachable in normal operation.  If a
            future selector violates that invariant, close the request instead
@@ -2817,6 +2820,12 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
     const bool prepared_assignment = !local_decision
         && assignment_mode_prepares()
         && IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_FENCE, use_cs)
+        /* The identity must survive S -> C -> F -> S.  A legacy C cannot
+           carry it in UseCS/CompileFile, so preparing only the new F leaves
+           S expecting a nonce that F can never echo.  Enforcing/advisory
+           mixed-peer traffic therefore uses the existing zero-identity
+           legacy path; strict mode already rejects it above. */
+        && identity_path_eligible
         && strict_path_eligible;
     if (prepared_assignment) {
         switch (assignment_fence_mode) {
@@ -2854,9 +2863,7 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
         job->setAssignmentPhase(Job::ASSIGNMENT_NONE);
     }
 
-    const bool p50_assignment =
-        IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY, job->submitter())
-        && IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY, use_cs);
+    const bool p50_assignment = identity_path_eligible;
     if (p50_assignment) {
         assert(next_tu_seq != UINT64_MAX);
         job->setCompileIdentity(scheduler_assignment_epoch, next_tu_seq++);

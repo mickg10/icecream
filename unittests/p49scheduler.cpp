@@ -2071,6 +2071,65 @@ static void run_old_peer(const std::string &binary, const std::string &directory
     REQUIRE(stop_scheduler(scheduler), "old-peer scheduler stopped cleanly");
 }
 
+static void run_old_submitter_to_new_worker(const std::string &binary,
+                                             const std::string &directory)
+{
+    const int port = reserve_port_pair();
+    const std::string log = directory + "/p48-submit-p50-worker.log";
+    pid_t scheduler = start_scheduler(
+        binary, port, "enforcing-compat", log);
+    REQUIRE(port != 0 && scheduler > 0,
+            "mixed-peer EnforcingCompat scheduler launched");
+
+    int worker_port = 0;
+    int worker_listener = bind_port(0, &worker_port);
+    if (worker_listener >= 0) listen(worker_listener, 16);
+    ConfCSMsg *worker_conf = nullptr;
+    MsgChannel *worker = login_host(port, "p50-worker-for-p48-submit", true,
+                                    worker_port, &worker_conf);
+    REQUIRE(worker && worker_conf &&
+                worker_conf->fence_mode == ConfCSMsg::EnforcingCompat,
+            "new worker receives EnforcingCompat policy");
+    delete worker_conf;
+
+    int proxy_port = 0;
+    pid_t proxy = start_p48_proxy(port, &proxy_port);
+    MsgChannel *p48_channel = connect_scheduler(proxy_port);
+    REQUIRE(proxy > 0 && p48_channel && p48_channel->protocol == 48,
+            "submitter link genuinely negotiated protocol 48");
+    ConfCSMsg *submitter_conf = nullptr;
+    MsgChannel *submitter = login_host(
+        port, "p48-submit-to-p50", false, 0, &submitter_conf, p48_channel);
+    REQUIRE(submitter && submitter_conf && submitter_conf->epoch() == 0 &&
+                submitter_conf->fence_mode == ConfCSMsg::Legacy,
+            "old submitter sees legacy ConfCS projection");
+    delete submitter_conf;
+
+    REQUIRE(submitter && request_job(submitter, 3002),
+            "legacy assignment from old submitter to new worker requested");
+    UseCSMsg *use = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(use && use->port == static_cast<uint32_t>(worker_port) &&
+                !use->hasAssignmentIdentity() &&
+                !use->hasCacheAdvertisement(),
+            "mixed C48/F-current dispatch remains wholly legacy");
+    REQUIRE(no_type(worker, Msg::ASSIGN_PREPARE, 300),
+            "new worker receives no uncarryable assignment fence for old C");
+
+    if (use) {
+        worker->send_msg(JobBeginMsg(use->job_id, 0));
+        worker->send_msg(job_done_for(*use, 0, JobDoneMsg::FROM_SERVER));
+    }
+    delete use;
+    delete submitter;
+    delete worker;
+    if (worker_listener >= 0) close(worker_listener);
+    REQUIRE(stop_scheduler(proxy),
+            "old-submitter protocol-48 relay stopped cleanly");
+    REQUIRE(stop_scheduler(scheduler),
+            "old-submitter/new-worker scheduler stopped cleanly");
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 2) {
@@ -2101,6 +2160,7 @@ int main(int argc, char **argv)
     run_legacy_cache_routing_neutrality(argv[1], directory);
     run_cache_handoff_below_p50(argv[1], directory);
     run_old_peer(argv[1], directory);
+    run_old_submitter_to_new_worker(argv[1], directory);
     std::fprintf(stderr, "%s: %d failure(s)\n",
                  failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;

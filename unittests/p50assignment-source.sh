@@ -47,7 +47,7 @@ require_count 2 'usecs->applyAssignmentTo(&job)' client/remote.cpp \
     'client remote/local-via-daemon paths copy the production UseCS identity'
 require_count 1 'crmsg->compileIdentityMatches(job)' client/remote.cpp \
     'client validates assignment and compile identity on the real result path'
-require_count 1 'm->assignmentEpoch() != j->assignmentEpoch()' scheduler/scheduler.cpp \
+require_count 1 'm->assignmentEpoch() == j->assignmentEpoch()' scheduler/scheduler.cpp \
     'scheduler validates assignment identity on the real terminal path'
 require_count 1 'record.key.epoch == job.assignmentEpoch()' daemon/main.cpp \
     'fulfillment admission compares the complete epoch'
