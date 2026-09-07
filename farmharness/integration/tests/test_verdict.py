@@ -114,22 +114,41 @@ def test_pure_verdict_transition_receipt_requires_fresh_f_rejoin() -> None:
 
 
 def test_active_loss_verdict_rejects_reused_compiler_identity() -> None:
-    scenario = {"workload": {"turns": ["A"]}}
-    event = {"action": "scheduler-loss-active", "instance": "S1"}
+    scenario = {"workload": {"turns": ["A"], "clients": ["C1"]}}
+    event = {"action": "scheduler-loss-active", "instance": "S1", "last_dispatched_job": 2}
     receipt = {
         "schema": "icefarm-scheduler-active-loss-v1",
         "action": "scheduler-loss-active",
         "instance": "S1",
+        "event_epoch": 1,
+        "lost_scheduler_job": 2,
+        "pre_fault": {"scheduler_log": {}, "worker_log": {}},
         "compiler": {
             "leader": {"pid": 41, "pgid": 41, "start_ticks": 9},
             "stopped": {"pid": 41, "pgid": 41, "start_ticks": 9},
             "group_gone": {"gone": True},
+            "worker_before": {"container_id": "b" * 64, "started_at": "f"},
+            "worker_after": {"container_id": "b" * 64, "started_at": "f"},
         },
-        "quiescence": {"client_readiness": {"C1": {}}},
+        "quiescence": {
+            "client_readiness": {"C1": {}},
+            "scheduler_snapshot": "S1",
+            "scheduler_startup": {"line": "ICECREAM scheduler starting"},
+            "worker_snapshot": "F1",
+        },
+        "before": {"container_id": "a" * 64, "started_at": "old"},
+        "after": {"container_id": "a" * 64, "started_at": "new"},
+        "turn": "A",
     }
     assert not _scheduler_active_loss_receipt_errors(receipt, event, scenario)
     tampered = copy.deepcopy(receipt)
     tampered["compiler"]["stopped"]["start_ticks"] = 10
+    assert _scheduler_active_loss_receipt_errors(tampered, event, scenario)
+    tampered = copy.deepcopy(receipt)
+    tampered["compiler"]["worker_after"]["container_id"] = "c" * 64
+    assert _scheduler_active_loss_receipt_errors(tampered, event, scenario)
+    tampered = copy.deepcopy(receipt)
+    tampered["quiescence"].pop("worker_snapshot")
     assert _scheduler_active_loss_receipt_errors(tampered, event, scenario)
 
 

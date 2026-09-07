@@ -152,10 +152,24 @@ def test_active_scheduler_loss_scripts_are_exact_identity_bound() -> None:
     assert "len(daemons) != 1" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "len(candidates) != 1" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "p[\"pid\"] == p[\"pgid\"]" in ACTIVE_COMPILER_STOP_SCRIPT
+    assert '"--generation" not in p["argv"]' in ACTIVE_COMPILER_STOP_SCRIPT
     assert "before[\"start_ticks\"]" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "os.killpg(before[\"pgid\"], signal.SIGSTOP)" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "compiler PID was reused" in ACTIVE_COMPILER_WAIT_SCRIPT
     assert "value[0] == pgid" in ACTIVE_COMPILER_WAIT_SCRIPT
+
+
+def test_active_compiler_selector_rejects_sidecar_and_statewriter_shapes() -> None:
+    daemon = {"pid": 10, "pgid": 10, "ppid": 1, "exe": "/opt/icecream/sbin/iceccd", "argv": []}
+    statewriter = {"pid": 11, "pgid": 10, "ppid": 10, "exe": daemon["exe"], "argv": []}
+    sidecar = {"pid": 12, "pgid": 12, "ppid": 10, "exe": daemon["exe"], "argv": ["iceccd", "--generation", "7"]}
+    compiler = {"pid": 13, "pgid": 13, "ppid": 10, "exe": daemon["exe"], "argv": ["iceccd"]}
+    candidates = [
+        item for item in (statewriter, sidecar, compiler)
+        if item["ppid"] == daemon["pid"] and item["pid"] == item["pgid"]
+        and "--generation" not in item["argv"]
+    ]
+    assert candidates == [compiler]
 
 
 def test_active_scheduler_loss_scenario_is_not_the_drained_restart(tmp_path: Path) -> None:
@@ -195,11 +209,19 @@ def test_active_scheduler_loss_collection_binds_post_offset_product_witness(
             "leader": {"pid": 41, "pgid": 41, "start_ticks": 9, "state": "R"},
             "stopped": {"pid": 41, "pgid": 41, "start_ticks": 9, "state": "T"},
             "group_gone": {"gone": True},
+            "worker_before": {"container_id": "b" * 64, "started_at": "f"},
+            "worker_after": {"container_id": "b" * 64, "started_at": "f"},
         },
         "event_epoch": 1,
         "instance": "S1",
+        "lost_scheduler_job": 2,
         "pre_fault": {"scheduler_log": {"offset": 0}, "worker_log": {"offset": 0}},
-        "quiescence": {},
+        "quiescence": {
+            "client_readiness": {"C1": {}},
+            "scheduler_snapshot": "S1",
+            "scheduler_startup": {"line": "ICECREAM scheduler starting"},
+            "worker_snapshot": "F1",
+        },
         "schema": "icefarm-scheduler-active-loss-v1",
         "turn": "A",
     }

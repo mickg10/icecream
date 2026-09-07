@@ -1272,20 +1272,50 @@ def _scheduler_active_loss_receipt_errors(
     receipt: Any, event: Mapping[str, Any], scenario: Mapping[str, Any]
 ) -> set[str]:
     marker = "@event:scheduler-active-loss"
-    if not isinstance(receipt, Mapping) or receipt.get("schema") != "icefarm-scheduler-active-loss-v1":
+    required = {"action", "after", "before", "compiler", "event_epoch", "instance", "lost_scheduler_job", "pre_fault", "quiescence", "schema", "turn"}
+    if not isinstance(receipt, Mapping) or set(receipt) != required or receipt.get("schema") != "icefarm-scheduler-active-loss-v1":
         return {marker}
     compiler = receipt.get("compiler")
     leader = compiler.get("leader") if isinstance(compiler, Mapping) else None
     stopped = compiler.get("stopped") if isinstance(compiler, Mapping) else None
     if (receipt.get("action") != event.get("action")
             or receipt.get("instance") != event.get("instance")
+            or not _is_int(receipt.get("lost_scheduler_job"), minimum=1)
+            or receipt.get("lost_scheduler_job") != event.get("last_dispatched_job")
             or not isinstance(leader, Mapping) or not isinstance(stopped, Mapping)
             or leader.get("pid") != leader.get("pgid")
             or leader.get("pid") != stopped.get("pid")
             or leader.get("start_ticks") != stopped.get("start_ticks")
             or compiler.get("group_gone", {}).get("gone") is not True
+            or not isinstance(compiler.get("worker_before"), Mapping)
+            or not isinstance(compiler.get("worker_after"), Mapping)
+            or set(compiler["worker_before"]) != {"container_id", "started_at"}
+            or set(compiler["worker_after"]) != {"container_id", "started_at"}
+            or compiler["worker_before"] != compiler["worker_after"]
+            or not isinstance(compiler["worker_before"].get("container_id"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", compiler["worker_before"]["container_id"]) is None
             or not isinstance(receipt.get("quiescence"), Mapping)
-            or not receipt["quiescence"].get("client_readiness")):
+            or set(receipt["quiescence"]) != {"client_readiness", "scheduler_snapshot", "scheduler_startup", "worker_snapshot"}
+            or not isinstance(receipt["quiescence"].get("scheduler_startup"), Mapping)
+            or not isinstance(receipt["quiescence"]["scheduler_startup"].get("line"), str)
+            or not isinstance(receipt["quiescence"].get("scheduler_snapshot"), str)
+            or not isinstance(receipt["quiescence"].get("worker_snapshot"), str)
+            or not receipt["quiescence"]["scheduler_snapshot"].strip()
+            or not receipt["quiescence"]["worker_snapshot"].strip()
+            or set(receipt["quiescence"].get("client_readiness", {}))
+            != set(scenario.get("workload", {}).get("clients", []))):
+        return {marker}
+    for side in ("before", "after"):
+        snapshot = receipt.get(side)
+        if (not isinstance(snapshot, Mapping)
+                or set(snapshot) != {"container_id", "started_at"}
+                or not isinstance(snapshot.get("container_id"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", snapshot["container_id"]) is None
+                or not isinstance(snapshot.get("started_at"), str)
+                or not snapshot["started_at"]):
+            return {marker}
+    if (receipt["before"]["container_id"] != receipt["after"]["container_id"]
+            or receipt["before"]["started_at"] == receipt["after"]["started_at"]):
         return {marker}
     return set()
 
@@ -3227,7 +3257,7 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
         if not epochs[0] or not epochs[1]:
             engagement_bad.update({"@rows:pre-active-loss", "@rows:post-active-loss"})
         for row in valid_rows:
-            if row["event_epoch"] not in epochs or row["tail_present"] is not True or row["tail_profile"] != "P29V1" or row["session_outcome"] != "committed" or row["retries"] != 0:
+            if row["event_epoch"] not in epochs or row["tail_present"] is not True or row["tail_profile"] != "P29V1" or row["session_outcome"] != "committed" or row["retries"] not in {0, 1}:
                 engagement_bad.add(_job_id(row["job_id"], "@row"))
         if observations.get("local_fallback_job_ids") != []:
             engagement_bad.add("@observations:local_fallback_job_ids")
@@ -3954,6 +3984,27 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
             active_bad.add("@rows:post-rejoin-dispatch")
         if observations.get("local_fallback_job_ids") != []:
             active_bad.add("@observations:local_fallback_job_ids")
+        lifecycle = observations.get("assignment_lifecycle")
+        lost_job = receipt.get("lost_scheduler_job") if isinstance(receipt, Mapping) else None
+        affected = [
+            item for item in lifecycle
+            if isinstance(item, Mapping)
+            and isinstance(item.get("attempts"), list)
+            and item["attempts"]
+            and item["attempts"][0].get("scheduler_job") == lost_job
+        ] if isinstance(lifecycle, list) else []
+        if len(affected) != 1 or len(affected[0]["attempts"]) != 2:
+            active_bad.add("@retry:active-loss-boundary")
+        elif (affected[0]["attempts"][0].get("terminal") != "scheduler-loss"
+              or affected[0]["attempts"][1].get("terminal") != "completion"):
+            active_bad.add("@retry:active-loss-terminals")
+        if isinstance(lifecycle, list):
+            for item in lifecycle:
+                if affected and item is affected[0]:
+                    continue
+                attempts = item.get("attempts") if isinstance(item, Mapping) else None
+                if not isinstance(attempts, list) or len(attempts) != 1 or attempts[0].get("terminal") != "completion":
+                    active_bad.add("@retry:unexpected-additional-retry")
         clauses.append(_clause(
             "s70.b4-scheduler-active-loss",
             not active_bad,

@@ -118,7 +118,7 @@ CACHE_DISK_FAULT_BYTES = 128 * 1024 * 1024
 CACHE_DISK_FAULT_MIN_HEADROOM_BYTES = 8 * 1024 * 1024
 DISK_FILL_WATCHDOG_S = 30
 ACTIVE_COMPILER_STOP_SCRIPT = r'''
-import json, os, pathlib, signal, time
+import json, os, pathlib, signal, sys, time
 
 def snap(pid):
     root = pathlib.Path("/proc") / str(pid)
@@ -140,27 +140,34 @@ def processes():
             pass
     return result
 
-items = processes()
-daemons = [p for p in items if pathlib.Path(p["exe"]).name == "iceccd"]
-if len(daemons) != 1:
-    raise SystemExit("expected exactly one authenticated iceccd parent")
-daemon = daemons[0]
-candidates = [p for p in items if p["ppid"] == daemon["pid"] and
-              p["pid"] == p["pgid"] and p["state"] not in {"Z", "X"} and
-              pathlib.Path(p["exe"]).name != "iceccd"]
-if len(candidates) != 1:
-    raise SystemExit(f"expected exactly one direct compiler group leader, found {len(candidates)}")
-leader = candidates[0]
-before = snap(leader["pid"])
-if before != leader or before["ppid"] != daemon["pid"] or before["pid"] != before["pgid"]:
-    raise SystemExit("compiler identity changed before SIGSTOP")
-os.killpg(before["pgid"], signal.SIGSTOP)
-stopped = snap(before["pid"])
-if stopped["start_ticks"] != before["start_ticks"] or stopped["pgid"] != before["pgid"] or stopped["state"] not in {"T", "t"}:
-    raise SystemExit("compiler group did not stop with its authenticated identity")
-print(json.dumps({"daemon": daemon, "leader": before,
-                  "schema": "icefarm-compiler-group-stop-v1", "stopped": stopped,
-                  "stopped_ms": time.time_ns() // 1000000}, sort_keys=True, separators=(",", ":")))
+deadline = time.monotonic() + int(sys.argv[1])
+while time.monotonic() < deadline:
+    items = processes()
+    daemons = [p for p in items if pathlib.Path(p["exe"]).name == "iceccd"]
+    if len(daemons) != 1:
+        time.sleep(0.05)
+        continue
+    daemon = daemons[0]
+    candidates = [p for p in items if p["ppid"] == daemon["pid"] and
+                  p["pid"] == p["pgid"] and p["state"] not in {"Z", "X"} and
+                  "--generation" not in p["argv"]]
+    if len(candidates) != 1:
+        time.sleep(0.05)
+        continue
+    leader = candidates[0]
+    before = snap(leader["pid"])
+    if before != leader or before["ppid"] != daemon["pid"] or before["pid"] != before["pgid"]:
+        time.sleep(0.05)
+        continue
+    os.killpg(before["pgid"], signal.SIGSTOP)
+    stopped = snap(before["pid"])
+    if stopped["start_ticks"] != before["start_ticks"] or stopped["pgid"] != before["pgid"] or stopped["state"] not in {"T", "t"}:
+        raise SystemExit("compiler group did not stop with its authenticated identity")
+    print(json.dumps({"daemon": daemon, "leader": before,
+                      "schema": "icefarm-compiler-group-stop-v1", "stopped": stopped,
+                      "stopped_ms": time.time_ns() // 1000000}, sort_keys=True, separators=(",", ":")))
+    raise SystemExit(0)
+raise SystemExit("no unique direct compiler group leader became observable within bound")
 '''.strip()
 
 ACTIVE_COMPILER_WAIT_SCRIPT = r'''
@@ -2570,7 +2577,7 @@ class EventProducer:
             host=worker["host"], instance=worker["name"], transport=_docker_transport(self.farm, worker["host"]),
             timeout_s=self._command_timeout(),
             argv=docker_argv(self.farm, worker["host"],
-                ("exec", "--user", "0", worker_before["name"], "python3", "-c", ACTIVE_COMPILER_STOP_SCRIPT)),
+                ("exec", "--user", "0", worker_before["name"], "python3", "-c", ACTIVE_COMPILER_STOP_SCRIPT, "20")),
         ))
         try:
             compiler = json.loads(result.stdout.strip())
@@ -2616,6 +2623,11 @@ class EventProducer:
             raise EventError("compiler-group disappearance returned malformed JSON") from exc
         if not isinstance(group_gone, dict) or group_gone.get("schema") != "icefarm-compiler-group-gone-v1" or group_gone.get("gone") is not True:
             raise EventError("compiler group did not disappear with authenticated identity")
+        worker_after = self._inspect(worker["name"])
+        if (worker_after.get("id") != worker_before.get("id")
+                or worker_after.get("started_at") != worker_before.get("started_at")
+                or worker_after.get("running") is not True):
+            raise EventError("F container identity changed across scheduler loss")
         startup = self._readiness_witness(instance, scheduler_log)
         scheduler_snapshot = _wait_scheduler(self.farm, self.plan, self.recorder, self.factory,
             deadline=min(self._start + self.deadline_s, self.monotonic() + float(self.scenario.data["timeouts"]["up_s"])),
@@ -2632,8 +2644,14 @@ class EventProducer:
         return {
             "action": event.action, "after": {"container_id": after["id"], "started_at": after["started_at"]},
             "before": {"container_id": before["id"], "started_at": before["started_at"]},
-            "compiler": {"container_id": worker_before["id"], "leader": leader, "stopped": stopped, "group_gone": group_gone},
+            "compiler": {
+                "container_id": worker_before["id"], "leader": leader,
+                "stopped": stopped, "group_gone": group_gone,
+                "worker_before": {"container_id": worker_before["id"], "started_at": worker_before["started_at"]},
+                "worker_after": {"container_id": worker_after["id"], "started_at": worker_after["started_at"]},
+            },
             "event_epoch": epoch, "instance": event.instance,
+            "lost_scheduler_job": self._last_job,
             "pre_fault": {"scheduler_log": scheduler_log, "worker_log": worker_log},
             "quiescence": {"scheduler_startup": startup, "scheduler_snapshot": scheduler_snapshot, "worker_snapshot": worker_snapshot, "client_readiness": client_readiness},
             "schema": SCHEDULER_ACTIVE_LOSS_SCHEMA, "turn": turn,
