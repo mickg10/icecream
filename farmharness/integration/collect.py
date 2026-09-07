@@ -1466,7 +1466,7 @@ def _validate_scheduler_active_loss_receipt(
         raise CollectError(f"{prefix} has invalid F log offset")
     quiescence = receipt["quiescence"]
     if (not isinstance(quiescence, Mapping)
-            or set(quiescence) != {"client_readiness", "scheduler_snapshot", "scheduler_startup", "worker_snapshot"}
+            or set(quiescence) != {"client_readiness", "client_routes", "scheduler_snapshot", "scheduler_startup", "worker_snapshot"}
             or not isinstance(quiescence.get("scheduler_startup"), Mapping)
             or not isinstance(quiescence["scheduler_startup"].get("line"), str)
             or "ICECREAM scheduler" not in quiescence["scheduler_startup"]["line"]
@@ -1487,6 +1487,25 @@ def _validate_scheduler_active_loss_receipt(
                 or not isinstance(witness.get("log_path"), str) or not witness["log_path"].startswith("/")
                 or type(witness.get("offset")) is not int or witness["offset"] < 0
                 for witness in quiescence.get("client_readiness", {}).values()
+            )
+            or not isinstance(quiescence.get("client_routes"), Mapping)
+            or set(quiescence["client_routes"]) != set(scenario.data["workload"]["clients"])
+            or any(
+                not isinstance(pair, Mapping) or set(pair) != {"before", "after"}
+                or not isinstance(pair["before"], Mapping) or not isinstance(pair["after"], Mapping)
+                or set(pair["before"]) != {"daemon", "route_owner"}
+                or set(pair["after"]) != {"daemon", "route_owner"}
+                or pair["before"] != pair["after"]
+                or any(
+                    not isinstance(proc, Mapping)
+                    or not isinstance(proc.get("pid"), int) or proc["pid"] <= 1
+                    or not isinstance(proc.get("ppid"), int) or proc["ppid"] < 1
+                    or not isinstance(proc.get("start_ticks"), int) or proc["start_ticks"] < 1
+                    or not isinstance(proc.get("exe"), str) or not proc["exe"].startswith("/")
+                    for proc in (pair["before"].get("daemon"), pair["before"].get("route_owner"))
+                )
+                or pair["before"]["route_owner"].get("ppid") != pair["before"]["daemon"].get("pid")
+                for pair in quiescence["client_routes"].values()
             )
             or not isinstance(quiescence.get("scheduler_snapshot"), str)
             or not any(
@@ -4507,7 +4526,14 @@ def _observations(
         if len(affected) != 1 or affected[0]["retries"] != 1:
             raise CollectError("active scheduler loss does not bind exactly one fresh retry")
         first = affected[0]["assignment_claims"][0]
-        if first.get("scheduler_record", {}).get("terminal") != "scheduler-loss":
+        first_record = first.get("scheduler_record", {})
+        active_event = next(
+            event for event in events if event.get("action") == "scheduler-loss-active"
+        )
+        active_receipt = active_event["receipt"]
+        if (first_record.get("terminal") != "scheduler-loss"
+                or first_record.get("generation") != active_receipt.get("lost_scheduler_generation")
+                or first_record.get("scheduler_job") != active_receipt.get("lost_scheduler_job")):
             raise CollectError("active scheduler loss lacks its explicit scheduler boundary")
         if any(raw["retries"] != 0 for raw in raw_jobs if raw is not affected[0]):
             raise CollectError("active scheduler loss permits more than one retry")

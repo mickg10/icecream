@@ -134,6 +134,7 @@ def test_active_loss_verdict_rejects_reused_compiler_identity() -> None:
         },
         "quiescence": {
                 "client_readiness": {"C1": {"bytes": 1, "cache_line": None, "cache_required": False, "connected_line": "Connected to scheduler (I am known as C1)", "host": "tt-quietbox2", "log_path": "/scratch/C1/log/client-daemon.log", "offset": 0}},
+                "client_routes": {"C1": {"before": {"daemon": {"pid": 10, "ppid": 1, "start_ticks": 1, "exe": "/opt/icecream/sbin/iceccd"}, "route_owner": {"pid": 11, "ppid": 10, "start_ticks": 2, "exe": "/opt/icecream/sbin/icecc-cache-service"}}, "after": {"daemon": {"pid": 10, "ppid": 1, "start_ticks": 1, "exe": "/opt/icecream/sbin/iceccd"}, "route_owner": {"pid": 11, "ppid": 10, "start_ticks": 2, "exe": "/opt/icecream/sbin/icecc-cache-service"}}}},
             "scheduler_snapshot": "S1",
             "scheduler_startup": {"line": "ICECREAM scheduler starting"},
             "worker_snapshot": "F1",

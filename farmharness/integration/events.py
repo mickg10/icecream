@@ -151,6 +151,7 @@ while time.monotonic() < deadline:
         (parent, child) for child in items
         for parent in (parents.get(child["ppid"]),)
         if parent is not None and parent["pid"] == child["ppid"] and child["pid"] == child["pgid"]
+        and pathlib.Path(child["exe"]).name == "iceccd"
         and child["state"] not in {"Z", "X"}
         and "--generation" not in child["argv"]
     ]
@@ -2585,6 +2586,13 @@ class EventProducer:
         client_baselines = {
             client["name"]: self._readiness_baseline(client) for client in clients
         }
+        # Authenticate both boundaries before any faulting operation.  The
+        # generation must come from the pre-kill log, before numeric IDs can
+        # be reused by the restarted scheduler.
+        lost_generation = self._scheduler_generation_for_job(self._last_job)
+        client_routes_before = {
+            client["name"]: self._client_route_snapshot(client) for client in clients
+        }
         result = self._invoke(self.factory.make(
             phase="event.scheduler-loss-authenticate-compiler",
             host=worker["host"], instance=worker["name"], transport=_docker_transport(self.farm, worker["host"]),
@@ -2660,7 +2668,9 @@ class EventProducer:
             )
             for client in clients
         }
-        lost_generation = self._scheduler_generation_for_job(self._last_job)
+        client_routes_after = {
+            client["name"]: self._client_route_snapshot(client) for client in clients
+        }
         return {
             "action": event.action, "after": {"container_id": after["id"], "started_at": after["started_at"]},
             "before": {"container_id": before["id"], "started_at": before["started_at"]},
@@ -2674,7 +2684,7 @@ class EventProducer:
             "lost_scheduler_generation": lost_generation,
             "lost_scheduler_job": self._last_job,
             "pre_fault": {"scheduler_log": scheduler_log, "worker_log": worker_log},
-            "quiescence": {"scheduler_startup": startup, "scheduler_snapshot": scheduler_snapshot, "worker_snapshot": worker_snapshot, "client_readiness": client_readiness},
+            "quiescence": {"scheduler_startup": startup, "scheduler_snapshot": scheduler_snapshot, "worker_snapshot": worker_snapshot, "client_readiness": client_readiness, "client_routes": {name: {"before": client_routes_before[name], "after": client_routes_after[name]} for name in client_routes_before}},
             "schema": SCHEDULER_ACTIVE_LOSS_SCHEMA, "turn": turn,
         }
 
@@ -2951,6 +2961,38 @@ class EventProducer:
         except BaseException as exc:
             self._mark_failure("event.client-route-process-ready", exc)
             raise
+
+    def _client_route_snapshot(self, instance: Mapping[str, Any]) -> dict[str, Any]:
+        """Read-only authenticated daemon/cache-owner identity for a C."""
+        container = f"icefarm-{self.plan['run_id']}-{instance['name']}"
+        result = self._invoke(self.factory.make(
+            phase="event.scheduler-loss-client-route-snapshot",
+            host=instance["host"], instance=instance["name"],
+            transport=_docker_transport(self.farm, instance["host"]),
+            timeout_s=self._command_timeout(),
+            argv=docker_argv(self.farm, instance["host"], (
+                "exec", "--user", "0", container, "python3", "-c",
+                CLIENT_ROUTE_SNAPSHOT_SCRIPT,
+                "/opt/icecream/sbin/iceccd",
+                "/opt/icecream/sbin/icecc-cache-service",
+            )),
+        ))
+        try:
+            snapshot = json.loads(result.stdout.strip())
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise EventError("client route snapshot returned malformed JSON") from exc
+        if (not isinstance(snapshot, dict)
+                or set(snapshot) != {"daemon", "daemon_count", "ready", "route_owner", "route_owner_count", "schema"}
+                or snapshot.get("schema") != "icefarm-client-route-snapshot-v1"
+                or snapshot.get("ready") is not True
+                or snapshot.get("daemon_count") != 1
+                or snapshot.get("route_owner_count") != 1
+                or not self._valid_process_snapshot(snapshot.get("daemon"), "/opt/icecream/sbin/iceccd")
+                or not self._valid_process_snapshot(snapshot.get("route_owner"), "/opt/icecream/sbin/icecc-cache-service")
+                or snapshot["route_owner"]["ppid"] != snapshot["daemon"]["pid"]
+                or snapshot["route_owner"]["uid"] != snapshot["daemon"]["uid"]):
+            raise EventError("client route snapshot lacks one authenticated daemon/owner pair")
+        return {"daemon": snapshot["daemon"], "route_owner": snapshot["route_owner"]}
 
     def _wait_client_route_owner_impl(
         self,

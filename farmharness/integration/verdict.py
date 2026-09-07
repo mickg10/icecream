@@ -1302,7 +1302,7 @@ def _scheduler_active_loss_receipt_errors(
             or not isinstance(compiler["worker_before"].get("container_id"), str)
             or re.fullmatch(r"[0-9a-f]{64}", compiler["worker_before"]["container_id"]) is None
             or not isinstance(receipt.get("quiescence"), Mapping)
-            or set(receipt["quiescence"]) != {"client_readiness", "scheduler_snapshot", "scheduler_startup", "worker_snapshot"}
+            or set(receipt["quiescence"]) != {"client_readiness", "client_routes", "scheduler_snapshot", "scheduler_startup", "worker_snapshot"}
             or not isinstance(receipt["quiescence"].get("scheduler_startup"), Mapping)
             or not isinstance(receipt["quiescence"]["scheduler_startup"].get("line"), str)
             or not isinstance(receipt["quiescence"].get("scheduler_snapshot"), str)
@@ -1322,6 +1322,17 @@ def _scheduler_active_loss_receipt_errors(
                 or not isinstance(witness.get("log_path"), str) or not witness["log_path"].startswith("/")
                 or not _is_int(witness.get("offset"), minimum=0)
                 for witness in receipt["quiescence"].get("client_readiness", {}).values()
+            )
+            or not isinstance(receipt["quiescence"].get("client_routes"), Mapping)
+            or set(receipt["quiescence"]["client_routes"]) != set(scenario.get("workload", {}).get("clients", []))
+            or any(
+                not isinstance(pair, Mapping) or set(pair) != {"before", "after"}
+                or not isinstance(pair["before"], Mapping) or not isinstance(pair["after"], Mapping)
+                or set(pair["before"]) != {"daemon", "route_owner"}
+                or set(pair["after"]) != {"daemon", "route_owner"}
+                or pair["before"] != pair["after"]
+                or pair["before"]["route_owner"].get("ppid") != pair["before"]["daemon"].get("pid")
+                for pair in receipt["quiescence"]["client_routes"].values()
             )):
         return {marker}
     for side in ("before", "after"):
@@ -4014,7 +4025,9 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
         ] if isinstance(lifecycle, list) else []
         if len(affected) != 1 or len(affected[0]["attempts"]) != 2:
             active_bad.add("@retry:active-loss-boundary")
-        elif (affected[0]["attempts"][0].get("terminal") != "scheduler-loss"
+        elif (affected[0]["attempts"][0].get("scheduler_job") != lost_job
+              or affected[0]["attempts"][0].get("generation") != receipt.get("lost_scheduler_generation")
+              or affected[0]["attempts"][0].get("terminal") != "scheduler-loss"
               or affected[0]["attempts"][1].get("terminal") != "completion"):
             active_bad.add("@retry:active-loss-terminals")
         if isinstance(lifecycle, list):
