@@ -358,7 +358,7 @@ class HeaderEditRecorder(EventRecorder):
                     {
                         "action": action,
                         "active_after": 0,
-                        "active_before": 0,
+                        "active_before": 1 if action == "pause" else 0,
                         "client": client,
                         "epoch": 1,
                         "finished_ms": 100 if action == "pause" else 1001,
@@ -1878,7 +1878,7 @@ class CoordinatedTransitionRecorder(TransitionRecorder):
                     {
                         "action": action[0],
                         "active_after": 0,
-                        "active_before": 0,
+                        "active_before": 1 if action[0] == "pause" else 0,
                         "client": command.instance,
                         "epoch": 1,
                         "finished_ms": action[2],

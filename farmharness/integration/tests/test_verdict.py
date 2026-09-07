@@ -32,7 +32,7 @@ def _coordinated_transition_event() -> tuple[dict[str, object], dict[str, object
     gate = {
         "action": "pause",
         "active_after": 0,
-        "active_before": 0,
+        "active_before": 1,
         "client": "C1",
         "epoch": 1,
         "finished_ms": 100,
@@ -579,7 +579,15 @@ def test_s70_b5_interner_fault_downgrades_later_rows_to_zstd_tu() -> None:
 
 @pytest.mark.parametrize(
     "mutation",
-    ("missing_fault", "duplicate_fault", "wrong_client", "p29_after", "error_tail", "explicit_profile"),
+    (
+        "missing_fault",
+        "duplicate_fault",
+        "wrong_client",
+        "p29_after",
+        "error_tail",
+        "explicit_profile",
+        "pause_not_active",
+    ),
 )
 def test_s70_b5_fault_evidence_and_row_law_fail_closed(mutation: str) -> None:
     fixture = _s70_b5_bundle()
@@ -599,6 +607,10 @@ def test_s70_b5_fault_evidence_and_row_law_fail_closed(mutation: str) -> None:
         fixture["rows"][1]["tail_profile"] = "P29V1"
         fixture["rows"][1]["session_outcome"] = "committed"
         fixture["rows"][1]["reuse"] = True
+    elif mutation == "pause_not_active":
+        fixture["event_log"][0]["receipt"]["coordination"]["clients"]["C1"][
+            "active_before"
+        ] = 0
     else:
         scheduler = next(
             item
@@ -1026,6 +1038,7 @@ def _worker_restart_event(
                         "cache_protocol=1 cache_profiles=p29v1 zstd_tu zstd_route"
                     ),
                     "cache_protocol": 1,
+                    "bytes": 1,
                     "host": "h1",
                     "login_line": "login F1 protocol version: 50",
                     "log_path": "/run/S1/log/scheduler.log",
@@ -1735,6 +1748,7 @@ def test_s70_b6_gate_clock_skew_is_diagnostic_only(
         "no_post_off_dispatch",
         "dispatch_out_of_epoch",
         "parallel_workload",
+        "pause_not_active",
     ),
 )
 def test_s70_b6_cycle_and_epoch_evidence_fail_closed(mutation: str) -> None:
@@ -1761,8 +1775,12 @@ def test_s70_b6_cycle_and_epoch_evidence_fail_closed(mutation: str) -> None:
         ]["workload_dispatch_count"]
     elif mutation == "dispatch_out_of_epoch":
         fixture["observations"]["job_lifecycle"][1]["scheduler_generation"] = 1
-    else:
+    elif mutation == "parallel_workload":
         fixture["scenario"]["workload"]["jobs"] = 2
+    else:
+        fixture["event_log"][0]["receipt"]["coordination"]["clients"]["C1"][
+            "active_before"
+        ] = 0
     verdict = evaluate_bundle(fixture)
     assert verdict["status"] == "FAIL"
     failed = {item["id"] for item in verdict["clauses"] if item["status"] == "FAIL"}

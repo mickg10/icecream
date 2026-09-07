@@ -22,6 +22,7 @@ from farmharness.integration.collect import (
     _one_role_log,
     _p29_interner_faults,
     _retained_log_witness,
+    _retained_log_witness_exact,
     _parse_logins,
     _snapshot_live_evidence,
     _source_results,
@@ -160,6 +161,12 @@ def test_retained_readiness_witness_is_bound_to_exact_post_offset_log_line(
         tmp_path, {"host": "h1", "name": "F1", "role": "F"}, 0, fresh
     )
     assert not _retained_log_witness(tmp_path, scheduler, len(prefix), "absent")
+    assert _retained_log_witness_exact(
+        tmp_path, scheduler, len(prefix), fresh, len((fresh + "\n").encode())
+    )
+    assert not _retained_log_witness_exact(
+        tmp_path, scheduler, len(prefix), fresh, len((fresh + "\n").encode()) - 1
+    )
 
 
 def _preference_fixture(*, selected: str = "F2", saturated: bool = False):

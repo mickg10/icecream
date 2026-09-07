@@ -1628,6 +1628,7 @@ class EventProducer:
                     "target": target["name"],
                 }
                 if include_loss:
+                    result["bytes"] = witness["bytes"]
                     result["loss_job_ids"] = witness["loss_job_ids"]
                 return result
             self._wake.wait(
@@ -1748,7 +1749,13 @@ class EventProducer:
                 for field in ("active_after", "active_before", "finished_ms", "started_ms")
             )
             or receipt["finished_ms"] < receipt["started_ms"]
-            or (action in {"pause", "quiesce"} and receipt["active_after"] != 0)
+            or (
+                action in {"pause", "quiesce"}
+                and (
+                    receipt["active_before"] < 1
+                    or receipt["active_after"] != 0
+                )
+            )
         ):
             raise EventError(f"event gate {action} returned an invalid receipt")
         self._failure_evidence["gate_receipts"][f"{turn}/{client['name']}/{action}"] = receipt

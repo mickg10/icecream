@@ -829,28 +829,65 @@ def _one_role_log(evidence: Path, instance: Mapping[str, Any]) -> Path | None:
     return path
 
 
+def _retained_log_payload(
+    evidence: Path | None,
+    instance: Mapping[str, Any],
+    offset: Any,
+)-> tuple[bool, bytes | None]:
+    """Return whether a retained role log exists and its authenticated tail."""
+    if evidence is None or not (evidence / "diagnostics").is_dir():
+        return False, None
+    if type(offset) is not int or offset < 0:
+        return True, None
+    path = _one_role_log(evidence, instance)
+    if path is None:
+        return True, None
+    try:
+        payload = path.read_bytes()
+    except OSError:
+        return True, None
+    if offset > len(payload):
+        return True, None
+    return True, payload[offset:]
+
+
 def _retained_log_witness(
     evidence: Path | None,
     instance: Mapping[str, Any],
     offset: Any,
     line: Any,
 ) -> bool:
-    """Bind a producer readiness claim to the retained post-offset log bytes."""
+    """Bind a producer readiness claim to retained post-offset log bytes."""
 
-    if evidence is None or not (evidence / "diagnostics").is_dir():
+    present, payload = _retained_log_payload(evidence, instance, offset)
+    if not present:
         return True
-    if type(offset) is not int or offset < 0 or not isinstance(line, str):
-        return False
-    path = _one_role_log(evidence, instance)
-    if path is None:
-        return False
-    try:
-        payload = path.read_bytes()
-    except OSError:
-        return False
-    if offset > len(payload):
-        return False
-    return line in payload[offset:].decode("utf-8", "replace").splitlines()
+    return (
+        payload is not None
+        and isinstance(line, str)
+        and line in payload.decode("utf-8", "replace").splitlines()
+    )
+
+
+def _retained_log_witness_exact(
+    evidence: Path | None,
+    instance: Mapping[str, Any],
+    offset: Any,
+    line: Any,
+    byte_count: Any,
+) -> bool:
+    """Bind a line and its exact retained post-offset byte count."""
+
+    present, payload = _retained_log_payload(evidence, instance, offset)
+    if not present:
+        return True
+    return (
+        payload is not None
+        and type(byte_count) is int
+        and byte_count == len(payload)
+        and isinstance(line, str)
+        and line in payload.decode("utf-8", "replace").splitlines()
+    )
 
 
 def _p29_interner_faults(
@@ -1253,15 +1290,18 @@ def _event_log(
             )
         elif scheduler_restart:
             _validate_scheduler_restart_receipt(
-                event["receipt"], event, scenario, index, farm=farm, plan=plan
+                event["receipt"], event, scenario, index,
+                farm=farm, plan=plan, evidence=evidence,
             )
         elif client_route_restart:
             _validate_client_route_restart_receipt(
-                event["receipt"], event, scenario, index, farm=farm, plan=plan
+                event["receipt"], event, scenario, index,
+                farm=farm, plan=plan, evidence=evidence,
             )
         elif worker_restart:
             _validate_worker_restart_receipt(
-                event["receipt"], event, scenario, index, farm=farm, plan=plan
+                event["receipt"], event, scenario, index,
+                farm=farm, plan=plan, evidence=evidence,
             )
         previous = event["fired_ms"]
     return events
@@ -1536,6 +1576,10 @@ def _validate_header_edit_receipt(
                     type(value.get(field)) is not int or value[field] < 0
                     for field in ("active_after", "active_before", "finished_ms", "started_ms")
                 )
+                or (
+                    action in {"pause", "quiesce"}
+                    and value.get("active_before", 0) < 1
+                )
                 or value["finished_ms"] < value["started_ms"]
             ):
                 raise CollectError(f"{prefix} has invalid {action} receipt for {name}")
@@ -1651,6 +1695,7 @@ def _validate_client_route_restart_receipt(
     *,
     farm: FarmSpec | None,
     plan: dict[str, Any] | None,
+    evidence: Path | None,
 ) -> None:
     prefix = f"events.json event {index} client route-owner restart"
     if farm is None or plan is None:
@@ -1792,6 +1837,10 @@ def _validate_client_route_restart_receipt(
                         "started_ms",
                     )
                 )
+                or (
+                    action in {"pause", "quiesce"}
+                    and value.get("active_before", 0) < 1
+                )
                 or value["finished_ms"] < value["started_ms"]
             ):
                 raise CollectError(f"{prefix} has invalid {action} receipt for {name}")
@@ -1832,6 +1881,9 @@ def _validate_client_route_restart_receipt(
         or readiness.get("lifecycle") != 3
         or not isinstance(readiness.get("line"), str)
         or CACHE_READY_RE.search(readiness["line"]) is None
+        or not _retained_log_witness(
+            evidence, target, readiness["offset"], readiness["line"]
+        )
     ):
         raise CollectError(f"{prefix} has invalid fresh READY evidence")
 
@@ -1844,6 +1896,7 @@ def _validate_scheduler_restart_receipt(
     *,
     farm: FarmSpec | None,
     plan: dict[str, Any] | None,
+    evidence: Path | None,
 ) -> None:
     if farm is None or plan is None:
         raise CollectError(
@@ -1963,6 +2016,10 @@ def _validate_scheduler_restart_receipt(
                         "started_ms",
                     )
                 )
+                or (
+                    action in {"pause", "quiesce"}
+                    and value.get("active_before", 0) < 1
+                )
                 or value["finished_ms"] < value["started_ms"]
             ):
                 raise CollectError(
@@ -2010,6 +2067,15 @@ def _validate_scheduler_restart_receipt(
                 )
             )
             or (not cache_required and witness.get("cache_line") is not None)
+            or not _retained_log_witness(
+                evidence, client, witness.get("offset"), witness.get("connected_line")
+            )
+            or (
+                cache_required
+                and not _retained_log_witness(
+                    evidence, client, witness.get("offset"), witness.get("cache_line")
+                )
+            )
         ):
             raise CollectError(
                 f"events.json event {index} has invalid fresh scheduler readiness for {name}"
@@ -2030,6 +2096,9 @@ def _validate_scheduler_restart_receipt(
         or startup["offset"] < 0
         or not isinstance(startup.get("line"), str)
         or READINESS_SCHEDULER_RE.search(startup["line"]) is None
+        or not _retained_log_witness(
+            evidence, scheduler, startup["offset"], startup["line"]
+        )
     ):
         raise CollectError(
             f"events.json event {index} has invalid fresh scheduler readiness"
@@ -2064,6 +2133,7 @@ def _validate_worker_restart_receipt(
     *,
     farm: FarmSpec | None,
     plan: dict[str, Any] | None,
+    evidence: Path | None,
 ) -> None:
     prefix = f"events.json event {index} worker restart"
     if farm is None or plan is None:
@@ -2197,6 +2267,7 @@ def _validate_worker_restart_receipt(
         != {
             "cache_line",
             "cache_protocol",
+            "bytes",
             "host",
             "login_line",
             "log_path",
@@ -2216,6 +2287,8 @@ def _validate_worker_restart_receipt(
         or rejoin.get("cache_protocol") != 1
         or type(rejoin.get("offset")) is not int
         or rejoin["offset"] < 0
+        or type(rejoin.get("bytes")) is not int
+        or rejoin["bytes"] < 1
         or role_login is None
         or role_login.group(1) != target["name"]
         or role_login.group(2) != "50"
@@ -2229,6 +2302,22 @@ def _validate_worker_restart_receipt(
         or not isinstance(rejoin.get("loss_job_ids"), list)
         or len(rejoin["loss_job_ids"]) != len(set(rejoin["loss_job_ids"]))
         or any(type(item) is not int or item < 1 for item in rejoin["loss_job_ids"])
+        or not _retained_log_witness(
+            evidence, target, readiness["offset"], readiness["line"]
+        )
+        or not _retained_log_witness(
+            evidence, target, readiness["offset"], readiness["cache_line"]
+        )
+        or not _retained_log_witness_exact(
+            evidence,
+            scheduler,
+            rejoin["offset"],
+            rejoin["login_line"],
+            rejoin["bytes"],
+        )
+        or not _retained_log_witness(
+            evidence, scheduler, rejoin["offset"], rejoin["cache_line"]
+        )
     ):
         raise CollectError(f"{prefix} has invalid fresh scheduler rejoin")
 
@@ -2376,6 +2465,10 @@ def _validate_transition_coordination(
                 or any(type(value.get(field)) is not int or value[field] < 0 for field in (
                     "active_after", "active_before", "finished_ms", "started_ms"
                 ))
+                or (
+                    action in {"pause", "quiesce"}
+                    and value.get("active_before", 0) < 1
+                )
                 or value["finished_ms"] < value["started_ms"]
             ):
                 return False
@@ -2526,6 +2619,7 @@ def _validate_client_transition_coordination(
                 for value in (pause, resume)
                 for field in ("active_after", "active_before", "finished_ms", "started_ms", "epoch")
             )
+            or pause.get("active_before", 0) < 1
         ):
             return False
     checkpoints = receipt.get("checkpoints")

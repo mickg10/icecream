@@ -850,6 +850,7 @@ def _header_edit_receipt_errors(
                     not _is_int(value.get(field))
                     for field in ("active_after", "active_before", "finished_ms", "started_ms")
                 )
+                or (action in {"pause", "quiesce"} and not _is_int(value.get("active_before"), minimum=1))
                 or value["finished_ms"] < value["started_ms"]
             ):
                 return {f"{marker}:gate:{name}"}
@@ -1133,6 +1134,7 @@ def _scheduler_restart_receipt_errors(
                         "started_ms",
                     )
                 )
+                or (action in {"pause", "quiesce"} and not _is_int(value.get("active_before"), minimum=1))
                 or value["finished_ms"] < value["started_ms"]
             ):
                 return {marker}
@@ -1373,6 +1375,7 @@ def _worker_restart_receipt_errors(
         != {
             "cache_line",
             "cache_protocol",
+            "bytes",
             "host",
             "login_line",
             "log_path",
@@ -1395,6 +1398,7 @@ def _worker_restart_receipt_errors(
         or rejoin.get("role_protocol") != 50
         or rejoin.get("cache_protocol") != 1
         or not _is_int(rejoin.get("offset"))
+        or not _is_int(rejoin.get("bytes"), minimum=1)
         or not isinstance(login_line, str)
         or re.search(
             rf"\blogin\s+{re.escape(str(target['name']))}\s+protocol\s+version:\s*50\b",
@@ -1579,6 +1583,7 @@ def _client_route_restart_receipt_errors(
                         "started_ms",
                     )
                 )
+                or (action in {"pause", "quiesce"} and not _is_int(value.get("active_before"), minimum=1))
                 or value["finished_ms"] < value["started_ms"]
             ):
                 return {marker}
@@ -1730,6 +1735,7 @@ def _client_transition_receipt_errors(
             or pause.get("turn") != receipt.get("turn") or resume.get("turn") != receipt.get("turn")
             or pause.get("epoch") != receipt.get("event_epoch") or resume.get("epoch") != receipt.get("event_epoch")
             or pause.get("active_after") != 0
+            or not _is_int(pause.get("active_before"), minimum=1)
             or any(not _is_int(value.get(field)) for value in (pause, resume) for field in ("active_after", "active_before", "finished_ms", "started_ms", "epoch"))
         ):
             return {marker}
@@ -1964,6 +1970,7 @@ def _transition_receipt_errors(
             or pause.get("client") != name
             or resume.get("client") != name
             or pause.get("active_after") != 0
+            or not _is_int(pause.get("active_before"), minimum=1)
             or not all(_is_int(value) for value in (pause.get("finished_ms"), resume.get("started_ms")))
         ):
             return {marker}
