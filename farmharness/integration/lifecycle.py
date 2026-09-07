@@ -3205,6 +3205,22 @@ def collect_diagnostics(
                         argv=docker_argv(farm, host_name, args),
                     )
                 )
+                if kind == "inspect" and instance["role"] == "F":
+                    try:
+                        document = _json_result(
+                            result,
+                            f"container inspect for {host_name}:{instance['name']}",
+                        )
+                    except LifecycleError as exc:
+                        problems.append(
+                            f"{host_name}:{instance['name']}:inspect:{exc}"
+                        )
+                    else:
+                        host_config = document.get("HostConfig")
+                        if not isinstance(host_config, Mapping) or host_config.get("Init") is not True:
+                            problems.append(
+                                f"{host_name}:{instance['name']}:inspect lacks Docker Init=true"
+                            )
                 (host_dir / f"{instance['name']}.{kind}").write_text(
                     result.stdout + result.stderr, encoding="utf-8"
                 )

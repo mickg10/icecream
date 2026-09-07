@@ -569,6 +569,8 @@ def _planned_commands(
             "--network",
             "host",
         ]
+        if instance["role"] == "F":
+            args.append("--init")
         binding = netem_by_instance.get(instance["name"])
         if binding is not None:
             # Only this worker leaves host networking.  The scheduler and

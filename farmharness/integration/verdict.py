@@ -33,6 +33,7 @@ CACHE_DISK_FAULT_BYTES = 128 * 1024 * 1024
 CACHE_DISK_FAULT_MIN_HEADROOM_BYTES = 8 * 1024 * 1024
 DISK_FILL_WATCHDOG_S = 30
 STALL_LIMIT_MS = 120_000
+F_INIT_SCHEMA = "icefarm-f-init-v1"
 
 ROW_FIELDS = frozenset(
     {
@@ -2805,6 +2806,57 @@ def _network_shaping_errors(
     return set()
 
 
+def _f_init_errors(bundle: Mapping[str, Any]) -> set[str]:
+    """Require retained, typed Init=true inspection evidence for every F."""
+
+    if bundle.get("mode") == "preflight-refusal":
+        return set()
+    topology = bundle.get("topology")
+    if not isinstance(topology, Mapping):
+        plan = bundle.get("plan")
+        topology = plan.get("topology") if isinstance(plan, Mapping) else None
+    instances = topology.get("instances") if isinstance(topology, Mapping) else None
+    if not isinstance(instances, list):
+        return set()
+    expected = {
+        item.get("name"): item.get("host")
+        for item in instances
+        if isinstance(item, Mapping) and item.get("role") == "F"
+    }
+    raw = bundle.get("observations", {}).get("f_init")
+    if not isinstance(raw, Mapping) or set(raw) != {"instances", "schema"}:
+        return {"@observations:f_init"}
+    if raw.get("schema") != F_INIT_SCHEMA or not isinstance(raw.get("instances"), list):
+        return {"@observations:f_init"}
+    errors: set[str] = set()
+    seen: set[str] = set()
+    for item in raw["instances"]:
+        if not isinstance(item, Mapping) or set(item) != {
+            "host",
+            "init",
+            "inspect_sha256",
+            "instance",
+        }:
+            errors.add("@observations:f_init")
+            continue
+        name = item.get("instance")
+        if (
+            not isinstance(name, str)
+            or name in seen
+            or name not in expected
+            or item.get("host") != expected.get(name)
+            or item.get("init") is not True
+            or not isinstance(item.get("inspect_sha256"), str)
+            or SHA256_RE.fullmatch(item["inspect_sha256"]) is None
+        ):
+            errors.add(f"@observations:f_init:{name or 'unknown'}")
+        else:
+            seen.add(name)
+    if seen != set(expected):
+        errors.add("@observations:f_init")
+    return errors
+
+
 def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
     """Evaluate an already-loaded bundle without consulting external state."""
 
@@ -2833,6 +2885,17 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
     )
     if not bundle_ok:
         return _finish(clauses)
+
+    f_init_errors = _f_init_errors(bundle)
+    if isinstance(bundle.get("topology"), Mapping) or isinstance(bundle.get("plan"), Mapping):
+        clauses.append(
+            _clause(
+                "launch.f-init",
+                not f_init_errors,
+                "every F retained Docker inspect proves HostConfig.Init=true",
+                f_init_errors,
+            )
+        )
 
     network_relevant = bool(scenario.get("network", {}).get("shaping")) or (
         "network_shaping" in observations

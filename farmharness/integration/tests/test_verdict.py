@@ -435,6 +435,47 @@ def _bundle(
     }
 
 
+def test_verdict_requires_authenticated_f_init_witness() -> None:
+    rows = [_row(1)]
+    observations = _observations(rows)
+    bundle = _bundle(_scenario("base"), rows, observations)
+    bundle["topology"] = {
+        "instances": [{"host": "h1", "name": "F1", "role": "F"}]
+    }
+    observations["f_init"] = {
+        "instances": [
+            {
+                "host": "h1",
+                "init": True,
+                "inspect_sha256": "a" * 64,
+                "instance": "F1",
+            }
+        ],
+        "schema": "icefarm-f-init-v1",
+    }
+    launch = next(
+        clause
+        for clause in evaluate_bundle(bundle)["clauses"]
+        if clause["id"] == "launch.f-init"
+    )
+    assert launch["status"] == "PASS"
+    for bad in (
+        {**observations["f_init"], "instances": []},
+        {
+            **observations["f_init"],
+            "instances": [{**observations["f_init"]["instances"][0], "init": False}],
+        },
+    ):
+        tampered = copy.deepcopy(bundle)
+        tampered["observations"]["f_init"] = bad
+        launch = next(
+            clause
+            for clause in evaluate_bundle(tampered)["clauses"]
+            if clause["id"] == "launch.f-init"
+        )
+        assert launch["status"] == "FAIL"
+
+
 @pytest.mark.parametrize(
     ("initial_version", "action", "expected_profiles"),
     (
@@ -1941,13 +1982,30 @@ def _shape_fixtures() -> dict[str, dict[str, object]]:
         "instances": [
             {"cache_wire_revision": 1, "name": "S1", "role": "S"},
             {"cache_wire_revision": 1, "name": "C1", "role": "C"},
-            {"cache_wire_revision": 1, "name": "F1", "role": "F"},
-            {"cache_wire_revision": 2, "name": "F2", "role": "F"},
+            {"cache_wire_revision": 1, "host": "h1", "name": "F1", "role": "F"},
+            {"cache_wire_revision": 2, "host": "h1", "name": "F2", "role": "F"},
         ],
         "relationships": [
             {"c": "C1", "cache_expected": True, "f": "F1"},
             {"c": "C1", "cache_expected": False, "f": "F2"},
         ],
+    }
+    skew_bundle["observations"]["f_init"] = {
+        "instances": [
+            {
+                "host": "h1",
+                "init": True,
+                "inspect_sha256": "a" * 64,
+                "instance": "F1",
+            },
+            {
+                "host": "h1",
+                "init": True,
+                "inspect_sha256": "b" * 64,
+                "instance": "F2",
+            },
+        ],
+        "schema": "icefarm-f-init-v1",
     }
     return {
         "SCF": _bundle(

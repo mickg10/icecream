@@ -220,6 +220,38 @@ def _read_json(path: Path) -> dict[str, Any]:
         raise CollectError(f"cannot read {path}: {exc}") from exc
 
 
+def _f_init_observation(plan: Mapping[str, Any], evidence: Path) -> dict[str, Any]:
+    """Bind every F to its retained Docker inspect Init=true witness."""
+
+    records: list[dict[str, Any]] = []
+    topology = plan.get("topology", {}).get("instances", [])
+    if not isinstance(topology, list):
+        raise CollectError("plan topology is not a list")
+    for instance in topology:
+        if not isinstance(instance, Mapping) or instance.get("role") != "F":
+            continue
+        name = instance.get("name")
+        host = instance.get("host")
+        if not isinstance(name, str) or not isinstance(host, str):
+            raise CollectError("F init witness has invalid instance identity")
+        path = evidence / "diagnostics" / host / f"{name}.inspect"
+        document = _read_json(path)
+        host_config = document.get("HostConfig")
+        if not isinstance(host_config, Mapping) or host_config.get("Init") is not True:
+            raise CollectError(f"F container {host}:{name} lacks Docker Init=true")
+        records.append(
+            {
+                "host": host,
+                "init": True,
+                "inspect_sha256": _sha256(path),
+                "instance": name,
+            }
+        )
+    if not records:
+        raise CollectError("plan has no F Init witnesses")
+    return {"instances": records, "schema": "icefarm-f-init-v1"}
+
+
 def _read_jsonl(path: Path, *, required: bool = False) -> list[dict[str, Any]]:
     if not path.exists():
         if required:
@@ -333,6 +365,10 @@ def _snapshot_live_evidence(
                 raise CollectError(
                     f"container identity is unauthenticated: {host}:{name}"
                 )
+            if instance["role"] == "F":
+                host_config = document.get("HostConfig")
+                if not isinstance(host_config, Mapping) or host_config.get("Init") is not True:
+                    raise CollectError(f"F container {host}:{name} lacks Docker Init=true")
             container_ids[name] = container_id
             host_diagnostics = diagnostics / host
             host_diagnostics.mkdir(parents=True, exist_ok=True)
@@ -4456,6 +4492,7 @@ def _observations(
     finishes = [item["finished"] for item in raw_jobs]
     preflight = _read_json(evidence / "receipts" / "preflight.json")
     network_shaping = _network_shaping_observation(scenario, plan, evidence)
+    f_init = _f_init_observation(plan, evidence)
     return {
         "assignment_preference": assignment_preference,
         "assignment_lifecycle": assignment_lifecycle,
@@ -4464,6 +4501,7 @@ def _observations(
         **row_facts,
         **control_observations,
         "incomplete_turns": _turn_completeness(scenario, plan, evidence, raw_jobs),
+        "f_init": f_init,
         "job_lifecycle": lifecycle,
         "logins": logins,
         **(
@@ -4824,7 +4862,9 @@ def _h3_control_failure_observations(
                 "worker": row["worker"],
             }
         )
+    f_init = _f_init_observation(plan, evidence)
     return {
+        "f_init": f_init,
         "fault": {"mutant_scheduler": True},
         "h3_control_failure": {
             "authenticated": True,

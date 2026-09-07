@@ -425,6 +425,10 @@ def _raw_collection(tmp_path: Path):
         "P50 CompileFile attached exact P29V1 input for job 2\n",
         encoding="utf-8",
     )
+    _write_json(
+        diagnostics / worker["host"] / "F1.inspect",
+        {"HostConfig": {"Init": True}},
+    )
 
     client_results = root / "C1.results"
     canary = client_results / "canary"
@@ -650,6 +654,25 @@ def test_collection_verdict_report_and_replay_are_reproducible(tmp_path: Path) -
     assert replay["topology_digest"] == plan["topology_digest"]
     assert replay["resolver_mode"] == "current-v2-resolver"
     assert replay["verdict"] == verdict
+
+
+@pytest.mark.parametrize("value", (False, None))
+def test_collection_refuses_false_or_missing_f_docker_init(
+    tmp_path: Path, value: bool | None
+) -> None:
+    farm, scenario, plan, root = _raw_collection(tmp_path)
+    host = next(
+        item["host"]
+        for item in plan["topology"]["instances"]
+        if item["name"] == "F1"
+    )
+    inspect = root / "diagnostics" / host / "F1.inspect"
+    if value is None:
+        inspect.unlink()
+    else:
+        _write_json(inspect, {"HostConfig": {"Init": value}})
+    with pytest.raises(CollectError, match="Init=true|F Init witnesses|cannot read"):
+        collect_bundle(farm, scenario, plan, sync_remote=False)
 
 
 def test_verified_bundle_refuses_mutated_evidence(tmp_path: Path) -> None:
@@ -1670,10 +1693,12 @@ class _LiveCollection:
         source_root: Path,
         *,
         stopped: frozenset[str] = frozenset(),
+        f_init: bool | None = True,
     ) -> None:
         self.plan = plan
         self.source_root = source_root
         self.stopped = stopped
+        self.f_init = f_init
         topology = plan["topology"]
         assert isinstance(topology, dict)
         instances = topology["instances"]
@@ -1709,6 +1734,11 @@ class _LiveCollection:
                             }
                         },
                         "Id": self.ids[name],
+                        "HostConfig": (
+                            {"Init": self.f_init}
+                            if name == "F1" and self.f_init is not None
+                            else {}
+                        ),
                         "State": {"Running": name not in self.stopped},
                     }
                 ),
@@ -1728,7 +1758,20 @@ class _LiveCollection:
             assert self._name_from_argv(command) not in self.stopped
             return CommandResult(0, self._name_from_argv(command) + "\n", "")
         if command.phase == "diagnostics.inspect":
-            return CommandResult(0, "[]\n", "")
+            name = self._name_from_argv(command)
+            return CommandResult(
+                0,
+                json.dumps(
+                    {
+                        "HostConfig": (
+                            {"Init": self.f_init}
+                            if name == "F1" and self.f_init is not None
+                            else {}
+                        )
+                    }
+                ),
+                "",
+            )
         if command.phase == "diagnostics.logs":
             return CommandResult(0, "container output\n", "")
         if command.phase == "diagnostics.sync-log":
@@ -1776,6 +1819,16 @@ def test_live_collection_authenticates_samples_then_freezes_before_copy(
         if command.phase == "collect.stop"
     ]
     assert stopped == ["C1", "F1", "S1"]
+
+
+@pytest.mark.parametrize("f_init", (False, None))
+def test_live_collection_refuses_false_or_missing_f_init(
+    tmp_path: Path, f_init: bool | None
+) -> None:
+    farm, scenario, plan, root = _raw_collection(tmp_path)
+    delegate = _LiveCollection(plan, root, f_init=f_init)
+    with pytest.raises(CollectError, match="Init=true"):
+        collect_bundle(farm, scenario, plan, recorder=RecordingTransport(delegate))
 
 
 def test_live_collection_accepts_only_event_authenticated_stopped_instance(

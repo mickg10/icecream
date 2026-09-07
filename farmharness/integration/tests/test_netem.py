@@ -100,6 +100,7 @@ def test_shaped_worker_uses_private_bridge_and_container_tc_only(tmp_path: Path)
     assert "--publish" in start_f["argv"]
     assert f"{binding['host_port']}:{binding['container_port']}" in start_f["argv"]
     assert start_f["argv"].count("NET_ADMIN") == 1
+    assert "--init" in start_f["argv"]
     assert "host" not in start_f["argv"]
     create = next(
         item

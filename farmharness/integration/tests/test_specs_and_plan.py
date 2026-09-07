@@ -543,7 +543,17 @@ def test_ssh_docker_fallback_is_one_argv(
     f_start = next(item for item in plan["commands"] if item["phase"] == "up.start-f")
     assert f_start["transport"] == "ssh-docker"
     assert f_start["argv"][:2] == ["ssh", "-o"]
+    assert "--init" in decode_ssh_payload(f_start["argv"])
     assert decode_ssh_payload(f_start["argv"])[0] == "docker"
+    for role in ("s", "c"):
+        command = next(
+            item for item in plan["commands"] if item["phase"] == f"up.start-{role}"
+        )
+        assert "--init" not in (
+            decode_ssh_payload(command["argv"])
+            if command["transport"] == "ssh-docker"
+            else tuple(command["argv"])
+        )
 
 
 def test_ssh_wrapper_never_embeds_spec_values_in_remote_shell_text(
