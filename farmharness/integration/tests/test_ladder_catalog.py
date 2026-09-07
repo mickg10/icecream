@@ -191,21 +191,49 @@ def test_s70_b5_is_a_serial_one_shot_interner_failure_cell() -> None:
     assert {item["version"] for item in plan["topology"]["instances"]} == {50}
 
 
-def test_s70_b4_scheduler_restart_is_midbuild_and_inflight() -> None:
+def test_s70_b4_scheduler_active_loss_is_the_single_f_job2_cell() -> None:
     farm = load_farm_spec(farm_fixture.example_farm_path())
     scenario = load_scenario_spec(
-        INTEGRATION / "scenarios" / "S70-b4-scheduler-restart.json", farm
+        INTEGRATION / "scenarios" / "S70-b4-scheduler-active-loss.json", farm
     )
-    plan = farmtest.build_plan(farm, scenario, run_id="s70-b4-s-dry-plan")
+    plan = farmtest.build_plan(farm, scenario, run_id="s70-b4-active-loss-dry")
 
+    assert scenario.data["id"] == "S70-b4-scheduler-active-loss"
     assert scenario.data["shape"] == "S'C'F'"
+
+    instances = {item["name"]: item for item in scenario.data["instances"]}
+    assert set(instances) == {"S1", "F1", "C1"}
+    assert sum(item["role"] == "F" for item in instances.values()) == 1
+    assert instances["F1"]["role"] == "F"
+    assert instances["F1"]["slots"] == 1
+
     assert scenario.data["workload"]["corpus"] == "fmt-100"
-    assert scenario.data["workload"]["jobs"] == 24
-    assert scenario.data["expect"]["engagement"] == "s70-b4-scheduler-restart"
+    assert scenario.data["workload"]["jobs"] == 6
+    assert scenario.data["workload"]["clients"] == ["C1"]
+
     assert scenario.data["timeline"] == [
-        {"action": "restart", "instance": "S1", "trigger": "job 50"}
+        {
+            "action": "scheduler-loss-active",
+            "instance": "S1",
+            "trigger": "job 2",
+        }
     ]
+    assert scenario.data["expect"]["engagement"] == (
+        "s70-b4-scheduler-active-loss"
+    )
     assert {item["version"] for item in plan["topology"]["instances"]} == {50}
+
+    producer = EventProducer(
+        farm,
+        scenario,
+        plan,
+        recorder=RecordingTransport(),
+        job_reader=lambda: 0,
+    )
+    assert [
+        (event.action, event.instance, event.trigger.kind, event.trigger.value)
+        for event in producer.events
+    ] == [("scheduler-loss-active", "S1", "job", 2)]
 
 
 def test_s70_b4_client_restart_is_serial_and_warm_before_the_event() -> None:
