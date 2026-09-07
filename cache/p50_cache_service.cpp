@@ -2699,17 +2699,18 @@ int run(const Options& options) noexcept {
     if (prebound && !prove_prebound_listener_after_drop(listener_owner.fd,
                                                         effective_options.socket_path))
         return 2;
-    // Start the system-source digest after the credential transition but
-    // before READY.  The worker is deliberately asynchronous: early P29V1
-    // relationships observe a zero fingerprint and disable reuse rather than
-    // delaying the first cache request.  Structured launches persist their
-    // per-file digest cache in the daemon-owned runtime directory, one level
-    // above the per-incarnation attempt leaf.
+    // Start the system-source digest after the credential transition and
+    // complete it before READY.  Route state pins its fingerprint at first
+    // admission, so publishing READY while the digest is still zero would
+    // disable reuse for that relationship's lifetime.  Structured launches
+    // persist their per-file digest cache in the daemon-owned runtime
+    // directory, one level above the per-incarnation attempt leaf.
     start_p29_system_source_fingerprint(
         structured_launch.active
             ? daemon_cache_directory_from_socket(
                   effective_options.socket_path)
             : std::string{});
+    wait_p29_system_source_fingerprint();
     if (!prebound) {
         const int listener = local::listen_unix(effective_options.socket_path,
                                                 effective_options.backlog, &listen_status);

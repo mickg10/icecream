@@ -37,6 +37,8 @@ using namespace icecc::p50;
 
 namespace {
 
+constexpr int kStartupReadyTimeoutMilliseconds = 5000;
+
 void check(bool condition, const char* expression) {
     if (!condition)
         throw std::runtime_error(expression);
@@ -117,7 +119,7 @@ std::string read_bounded_to_eof(int fd) {
     std::string result;
     for (;;) {
         struct pollfd descriptor{fd, POLLIN | POLLHUP | POLLERR, 0};
-        CHECK(::poll(&descriptor, 1, 2000) > 0);
+        CHECK(::poll(&descriptor, 1, kStartupReadyTimeoutMilliseconds) > 0);
         char bytes[256]{};
         const ssize_t count = ::read(fd, bytes, sizeof(bytes));
         if (count == 0)
@@ -193,7 +195,7 @@ void expect_exact_ready_then_eof(int fd) {
     size_t received = 0;
     while (received != message.size()) {
         struct pollfd descriptor{fd, POLLIN | POLLHUP, 0};
-        CHECK(::poll(&descriptor, 1, 1000) > 0);
+        CHECK(::poll(&descriptor, 1, kStartupReadyTimeoutMilliseconds) > 0);
         const ssize_t result =
             ::read(fd, message.data() + received, message.size() - received);
         CHECK(result > 0);

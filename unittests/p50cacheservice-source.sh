@@ -40,6 +40,7 @@ for pair in \
     "$impl|guid != f_store_guid_for_root(root)" \
     "$impl|fresh_store_identity_root(legacy_root)" \
     "$impl|runtime_config.f_store_guid = structured_launch.active" \
+    "$impl|wait_p29_system_source_fingerprint();" \
     "$impl|ICECC_CACHE_SERVICE_EXPECTED_DERIVATION_VERSION" \
     "$header|RuntimeConfig" \
     "$header|std::timed_mutex source_transfer_mutex_" \
@@ -64,6 +65,21 @@ for pair in \
     file=${pair%%|*}; pattern=${pair#*|}
     require "$file" "$pattern"
 done
+
+fingerprint_start_line=$(grep -n -F \
+    'start_p29_system_source_fingerprint(' "$impl" | tail -n 1 | cut -d: -f1)
+fingerprint_wait_line=$(grep -n -F \
+    'wait_p29_system_source_fingerprint();' "$impl" | tail -n 1 | cut -d: -f1)
+ready_line=$(grep -n -F \
+    'structured_ready ? write_ready_lease' "$impl" | tail -n 1 | cut -d: -f1)
+if test -z "$fingerprint_start_line" || test -z "$fingerprint_wait_line" || \
+        test -z "$ready_line" || \
+        test "$fingerprint_start_line" -ge "$fingerprint_wait_line" || \
+        test "$fingerprint_wait_line" -ge "$ready_line"; then
+    echo 'FAIL: P29 fingerprint must complete before cache-service READY' >&2
+    exit 1
+fi
+echo 'ok - P29 fingerprint completes before cache-service READY'
 
 endpoint_cap_line=$(grep -n -F \
     'route_endpoint_identities_.size() >=' "$impl" | head -n 1 | cut -d: -f1)

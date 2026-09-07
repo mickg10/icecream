@@ -435,21 +435,20 @@ private:
 };
 
 // Start the process-wide P29V1 system-source fingerprint worker.  Product
-// startup calls this before advertising readiness; it never waits for the
-// filesystem scan.  An absolute cache directory enables the persistent
-// metadata-keyed digest cache.  Empty/invalid paths retain safe uncached
-// operation.
+// startup calls this before advertising readiness and waits for completion so
+// a first route never permanently pins a transient zero digest.  An absolute
+// cache directory enables the persistent metadata-keyed digest cache.
+// Empty/invalid paths retain safe uncached operation.
 void start_p29_system_source_fingerprint(
     std::string cache_directory = {}) noexcept;
 
-// Simulator-only synchronization: product request paths never call this.
-// It returns immediately when no worker was started.
+// Startup/simulator synchronization.  It returns immediately when no worker
+// was started.
 void wait_p29_system_source_fingerprint() noexcept;
 
-// Nonblocking snapshot used only by the P29V1 profile guard.  Until the
-// background worker publishes a complete result this returns zero and turns
-// source reuse off.  Enumeration/hash failures likewise publish zero without
-// making any other profile unavailable.
+// Nonblocking snapshot used only by the P29V1 profile guard.  Enumeration/hash
+// failures publish zero and safely turn source reuse off without making any
+// other profile unavailable.
 [[nodiscard]] Digest128 p29_system_source_fingerprint() noexcept;
 
 }  // namespace icecc::p50
