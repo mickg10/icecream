@@ -24,6 +24,7 @@ try:
         parse_h3_client_rejections,
         validate_h3_trace,
     )
+    from .netem import NetemPlanError, validate_receipt as validate_netem_receipt
     from .remote import PlannedCommand, RemoteError, docker_argv
     from .scenario_spec import ScenarioSpec
     from .schema_validation import canonical_bytes
@@ -39,6 +40,7 @@ except ImportError:  # Direct execution from this directory.
         parse_h3_client_rejections,
         validate_h3_trace,
     )
+    from netem import NetemPlanError, validate_receipt as validate_netem_receipt
     from remote import PlannedCommand, RemoteError, docker_argv
     from scenario_spec import ScenarioSpec
     from schema_validation import canonical_bytes
@@ -4213,6 +4215,21 @@ def _validate_orphan_recovery_markers(
             )
 
 
+def _network_shaping_observation(
+    scenario: ScenarioSpec, plan: Mapping[str, Any], evidence: Path
+) -> dict[str, Any] | None:
+    requests = scenario.data.get("network", {}).get("shaping")
+    if not requests:
+        return None
+    lifecycle = _read_json(evidence / "receipts" / "lifecycle.json")
+    try:
+        return validate_netem_receipt(
+            scenario.data, plan, lifecycle.get("network_shaping")
+        )
+    except NetemPlanError as exc:
+        raise CollectError(f"network shaping evidence is invalid: {exc}") from exc
+
+
 def _observations(
     farm: FarmSpec,
     scenario: ScenarioSpec,
@@ -4438,6 +4455,7 @@ def _observations(
     starts = [item["started"] for item in raw_jobs]
     finishes = [item["finished"] for item in raw_jobs]
     preflight = _read_json(evidence / "receipts" / "preflight.json")
+    network_shaping = _network_shaping_observation(scenario, plan, evidence)
     return {
         "assignment_preference": assignment_preference,
         "assignment_lifecycle": assignment_lifecycle,
@@ -4448,6 +4466,11 @@ def _observations(
         "incomplete_turns": _turn_completeness(scenario, plan, evidence, raw_jobs),
         "job_lifecycle": lifecycle,
         "logins": logins,
+        **(
+            {"network_shaping": network_shaping}
+            if network_shaping is not None
+            else {}
+        ),
         "oracle": _oracle(evidence, scenario),
         "p29_interner_faults": p29_interner_faults,
         "protected_before": {

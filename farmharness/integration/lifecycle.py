@@ -607,6 +607,7 @@ def _command(
     *,
     phase: str,
     host: str,
+    instance: str | None = None,
     transport: str,
     timeout_s: int,
     argv: Iterable[str],
@@ -614,6 +615,7 @@ def _command(
     return factory.make(
         phase=phase,
         host=host,
+        instance=instance,
         transport=transport,
         timeout_s=max(1, timeout_s),
         argv=argv,
@@ -2619,6 +2621,11 @@ def _netem_up_receipt(
     ):
         if created.returncode != 0 or applied.returncode != 0 or observed.returncode != 0:
             raise LifecycleError(f"netem command failed for {binding.instance}")
+        network_id = created.stdout.strip()
+        if re.fullmatch(r"[0-9a-f]{64}", network_id) is None:
+            raise LifecycleError(
+                f"netem bridge creation returned no exact network id for {binding.instance}"
+            )
         witness = validate_qdisc(binding, observed.stdout)
         records.append(
             {
@@ -2628,8 +2635,8 @@ def _netem_up_receipt(
                 },
                 "bridge": {
                     "argv": list(create.argv),
+                    "network_id": network_id,
                     "returncode": created.returncode,
-                    "stdout": created.stdout,
                 },
                 "container": binding.container,
                 "instance": binding.instance,
@@ -3189,12 +3196,7 @@ def _remove_netem(
     receipts: list[dict[str, Any]] = []
     problems: list[str] = []
     for binding in bindings:
-        observed_commands = getattr(recorder, "commands", [])
-        started = any(
-            command.phase == "up.start-f" and command.instance == binding.instance
-            for command in observed_commands
-        )
-        if not started:
+        try:
             present = [
                 item
                 for item in _labelled_containers(
@@ -3203,8 +3205,10 @@ def _remove_netem(
                 if item["run_id"] == plan["run_id"]
                 and item["name"] == binding.container
             ]
-            started = bool(present)
-        if not started:
+        except (RemoteError, LifecycleError) as exc:
+            problems.append(f"{binding.instance}:qdisc-identity:{exc}")
+            continue
+        if not present:
             receipts.append(
                 {
                     "instance": binding.instance,
@@ -3212,6 +3216,10 @@ def _remove_netem(
                 }
             )
             continue
+        if len(present) != 1:
+            problems.append(f"{binding.instance}:qdisc-identity:ambiguous-container")
+            continue
+        container_id = present[0]["id"]
         try:
             command = _command(
                 factory,
@@ -3220,12 +3228,15 @@ def _remove_netem(
                 instance=binding.instance,
                 transport=_docker_transport(farm, binding.host),
                 timeout_s=timeout_s,
-                argv=docker_argv(farm, binding.host, remove_args(binding)),
+                argv=docker_argv(
+                    farm, binding.host, remove_args(binding, container_id)
+                ),
             )
             result = recorder.invoke(command)
             receipts.append(
                 {
                     "argv": list(command.argv),
+                    "container_id": container_id,
                     "instance": binding.instance,
                     "returncode": result.returncode,
                     "stderr": result.stderr,

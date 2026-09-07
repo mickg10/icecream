@@ -9,9 +9,15 @@ argv in their immutable plan/receipts.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 from typing import Any, Mapping
+
+try:
+    from .remote import decode_ssh_payload
+except ImportError:  # Direct execution from this directory.
+    from remote import decode_ssh_payload
 
 
 NETEM_PLAN_SCHEMA = "icefarm-netem-plan-v1"
@@ -107,6 +113,24 @@ def resolve_bindings(
         raise NetemPlanError(f"shaped worker host {host_name!r} is absent") from exc
     if host.get("netem") is not True:
         raise NetemPlanError(f"shaped worker host {host_name!r} lacks netem authority")
+    client_names = scenario.get("workload", {}).get("clients")
+    clients = [
+        item
+        for item in instances
+        if isinstance(item, Mapping)
+        and item.get("role") == "C"
+        and isinstance(client_names, list)
+        and item.get("name") in client_names
+    ]
+    if (
+        not isinstance(client_names, list)
+        or len(client_names) != 1
+        or len(clients) != 1
+        or clients[0].get("host") != host_name
+    ):
+        raise NetemPlanError(
+            "a shaped bridge worker requires its one workload client on the same host"
+        )
     instance_ports = ports.get("instances")
     port = instance_ports.get(instance_name) if isinstance(instance_ports, Mapping) else None
     if type(port) is not int or not (1 <= port <= 65535):
@@ -181,12 +205,17 @@ def observe_args(binding: NetemBinding) -> tuple[str, ...]:
     )
 
 
-def remove_args(binding: NetemBinding) -> tuple[str, ...]:
+def remove_args(
+    binding: NetemBinding, container: str | None = None
+) -> tuple[str, ...]:
+    target = binding.container if container is None else container
+    if target != binding.container and re.fullmatch(r"[0-9a-f]{12,64}", target) is None:
+        raise NetemPlanError("netem removal target is not an authenticated container id")
     return (
         "exec",
         "--user",
         "0",
-        binding.container,
+        target,
         "tc",
         "qdisc",
         "del",
@@ -250,3 +279,245 @@ def validate_plan(value: object) -> tuple[dict[str, Any], ...]:
     if len(result) > 1:
         raise NetemPlanError("netem plan has multiple bindings")
     return tuple(result)
+
+
+def _binding_from_plan(
+    scenario: Mapping[str, Any], plan: Mapping[str, Any]
+) -> NetemBinding:
+    bindings = validate_plan(plan.get("network_shaping"))
+    requests = scenario.get("network", {}).get("shaping")
+    if (
+        not isinstance(requests, list)
+        or len(requests) != 1
+        or not isinstance(requests[0], Mapping)
+        or set(requests[0]) != {"delay_ms", "instance", "rate"}
+    ):
+        raise NetemPlanError("shaped evidence requires one exact scenario request")
+    if len(bindings) != 1:
+        raise NetemPlanError("shaped evidence requires one exact plan binding")
+    value = bindings[0]
+    request = requests[0]
+    if any(request.get(field) != value[field] for field in request):
+        raise NetemPlanError("scenario shaping request differs from the plan binding")
+
+    topology = plan.get("topology", {}).get("instances")
+    if not isinstance(topology, list):
+        raise NetemPlanError("shaped plan has no topology instances")
+    targets = [
+        item
+        for item in topology
+        if isinstance(item, Mapping) and item.get("name") == value["instance"]
+    ]
+    if (
+        len(targets) != 1
+        or targets[0].get("role") != "F"
+        or targets[0].get("host") != value["host"]
+    ):
+        raise NetemPlanError("shaped plan target is not the bound worker")
+    client_names = scenario.get("workload", {}).get("clients")
+    clients = [
+        item
+        for item in topology
+        if isinstance(item, Mapping)
+        and item.get("role") == "C"
+        and isinstance(client_names, list)
+        and item.get("name") in client_names
+    ]
+    if (
+        not isinstance(client_names, list)
+        or len(client_names) != 1
+        or len(clients) != 1
+        or clients[0].get("host") != value["host"]
+    ):
+        raise NetemPlanError("shaped plan client cannot route the private bridge worker")
+    ports = plan.get("ports", {}).get("instances")
+    if (
+        not isinstance(ports, Mapping)
+        or ports.get(value["instance"]) != value["container_port"]
+        or value["host_port"] != value["container_port"]
+    ):
+        raise NetemPlanError("shaped plan port differs from the binding")
+    run_id = plan.get("run_id")
+    if not isinstance(run_id, str):
+        raise NetemPlanError("shaped plan has no run id")
+    _safe_run_id(run_id)
+    if (
+        value["container"] != f"icefarm-{run_id}-{value['instance']}"
+        or value["bridge"] != f"icefarm-{run_id}-{value['instance']}-netem"
+    ):
+        raise NetemPlanError("shaped plan object identity differs from the run")
+    return NetemBinding(**value)
+
+
+def _planned_command(
+    plan: Mapping[str, Any], binding: NetemBinding, phase: str
+) -> Mapping[str, Any]:
+    commands = plan.get("commands")
+    if not isinstance(commands, list):
+        raise NetemPlanError("shaped plan commands are absent")
+    matches = [
+        item
+        for item in commands
+        if isinstance(item, Mapping)
+        and item.get("phase") == phase
+        and item.get("instance") == binding.instance
+    ]
+    if len(matches) != 1 or matches[0].get("host") != binding.host:
+        raise NetemPlanError(f"shaped plan has no unique {phase} command")
+    command = matches[0]
+    argv = command.get("argv")
+    if not isinstance(argv, list) or not argv or any(not isinstance(v, str) for v in argv):
+        raise NetemPlanError(f"shaped plan {phase} argv is invalid")
+    return command
+
+
+def _planned_argv(
+    plan: Mapping[str, Any], binding: NetemBinding, phase: str
+) -> list[str]:
+    return list(_planned_command(plan, binding, phase)["argv"])
+
+
+def _planned_docker_args(
+    plan: Mapping[str, Any], binding: NetemBinding, phase: str
+) -> tuple[str, ...]:
+    command = _planned_command(plan, binding, phase)
+    argv = tuple(command["argv"])
+    transport = command.get("transport")
+    if transport == "docker-context":
+        if len(argv) < 4 or argv[:2] != ("docker", "--context") or not argv[2]:
+            raise NetemPlanError(f"shaped plan {phase} docker wrapper is invalid")
+        return argv[3:]
+    if transport == "ssh-docker":
+        try:
+            decoded = decode_ssh_payload(argv)
+        except ValueError as exc:
+            raise NetemPlanError(
+                f"shaped plan {phase} SSH wrapper is invalid"
+            ) from exc
+        if len(decoded) < 2 or decoded[0] != "docker":
+            raise NetemPlanError(f"shaped plan {phase} is not a Docker command")
+        return decoded[1:]
+    raise NetemPlanError(f"shaped plan {phase} transport is invalid")
+
+
+def validate_receipt(
+    scenario: Mapping[str, Any], plan: Mapping[str, Any], value: object
+) -> dict[str, Any]:
+    """Validate and normalize the immutable applied-qdisc evidence."""
+
+    binding = _binding_from_plan(scenario, plan)
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"bindings", "schema", "status"}
+        or value.get("schema") != NETEM_RECEIPT_SCHEMA
+        or value.get("status") != "APPLIED"
+    ):
+        raise NetemPlanError("netem receipt envelope is invalid")
+    records = value.get("bindings")
+    if not isinstance(records, list) or len(records) != 1:
+        raise NetemPlanError("netem receipt requires one exact binding")
+    record = records[0]
+    if not isinstance(record, Mapping) or set(record) != {
+        "application",
+        "bridge",
+        "container",
+        "instance",
+        "observation",
+        "removal",
+        "request",
+    }:
+        raise NetemPlanError("netem receipt binding fields are invalid")
+    if (
+        record.get("instance") != binding.instance
+        or record.get("container") != binding.container
+        or record.get("request") != binding.as_dict()
+    ):
+        raise NetemPlanError("netem receipt identity differs from the plan")
+
+    bridge = record.get("bridge")
+    application = record.get("application")
+    observation = record.get("observation")
+    removal = record.get("removal")
+    if not isinstance(bridge, Mapping) or set(bridge) != {
+        "argv",
+        "network_id",
+        "returncode",
+    }:
+        raise NetemPlanError("netem bridge receipt is invalid")
+    if not isinstance(application, Mapping) or set(application) != {
+        "argv",
+        "returncode",
+    }:
+        raise NetemPlanError("netem application receipt is invalid")
+    if not isinstance(observation, Mapping) or set(observation) != {
+        "argv",
+        "returncode",
+        "sha256",
+        "witness",
+    }:
+        raise NetemPlanError("netem observation receipt is invalid")
+    if not isinstance(removal, Mapping) or set(removal) != {
+        "container_argv",
+        "network_argv",
+    }:
+        raise NetemPlanError("netem removal receipt is invalid")
+    network_id = bridge.get("network_id")
+    returncodes = (
+        bridge.get("returncode"),
+        application.get("returncode"),
+        observation.get("returncode"),
+    )
+    if (
+        any(type(returncode) is not int or returncode != 0 for returncode in returncodes)
+        or not isinstance(network_id, str)
+        or re.fullmatch(r"[0-9a-f]{64}", network_id) is None
+    ):
+        raise NetemPlanError("netem receipt does not prove successful application")
+    if bridge.get("argv") != _planned_argv(plan, binding, "up.network-create"):
+        raise NetemPlanError("netem bridge argv differs from the immutable plan")
+    if application.get("argv") != _planned_argv(plan, binding, "up.netem-apply"):
+        raise NetemPlanError("netem application argv differs from the immutable plan")
+    if observation.get("argv") != _planned_argv(plan, binding, "up.netem-observe"):
+        raise NetemPlanError("netem observation argv differs from the immutable plan")
+    run_id = plan["run_id"]
+    semantic_commands = (
+        ("up.network-create", create_args(binding, run_id)),
+        ("up.netem-apply", apply_args(binding)),
+        ("up.netem-observe", observe_args(binding)),
+    )
+    for phase, expected in semantic_commands:
+        if _planned_docker_args(plan, binding, phase) != expected:
+            raise NetemPlanError(f"netem {phase} command differs from the safe seam")
+    if removal.get("container_argv") != list(remove_args(binding)) or removal.get(
+        "network_argv"
+    ) != list(network_remove_args(binding)):
+        raise NetemPlanError("netem removal argv differs from the plan binding")
+    witness = observation.get("witness")
+    if not isinstance(witness, Mapping) or set(witness) != {"delay_ms", "rate", "text"}:
+        raise NetemPlanError("netem qdisc witness fields are invalid")
+    text = witness.get("text")
+    if not isinstance(text, str):
+        raise NetemPlanError("netem qdisc witness text is invalid")
+    expected_witness = validate_qdisc(binding, text)
+    if dict(witness) != expected_witness or observation.get("sha256") != hashlib.sha256(
+        text.encode()
+    ).hexdigest():
+        raise NetemPlanError("netem qdisc witness digest or values are invalid")
+    return {
+        "bindings": [
+            {
+                "application": dict(application),
+                "bridge": dict(bridge),
+                "container": binding.container,
+                "instance": binding.instance,
+                "observation": {
+                    **dict(observation),
+                    "witness": expected_witness,
+                },
+                "removal": dict(removal),
+                "request": binding.as_dict(),
+            }
+        ],
+        "schema": NETEM_RECEIPT_SCHEMA,
+        "status": "APPLIED",
+    }

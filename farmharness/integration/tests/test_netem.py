@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import copy
+import json
 from pathlib import Path
 
 import pytest
 
-from farmharness.integration import farmtest
+from farmharness.integration import farmtest, lifecycle
+from farmharness.integration.collect import _network_shaping_observation
+from farmharness.integration.images import CommandFactory
 from farmharness.integration.lifecycle import LifecycleError
 from farmharness.integration.lifecycle import _netem_up_receipt
 from farmharness.integration.remote import CommandResult, PlannedCommand
@@ -14,8 +18,10 @@ from farmharness.integration.netem import (
     observe_args,
     remove_args,
     resolve_bindings,
+    validate_receipt,
     validate_qdisc,
 )
+from farmharness.integration.verdict import _network_shaping_errors
 from farmharness.integration.tests.test_lifecycle import _farm_scenario_plan
 
 
@@ -23,10 +29,42 @@ def _shaped_plan(tmp_path: Path):
     farm, scenario, _unused = _farm_scenario_plan(tmp_path)
     worker = next(item for item in scenario.data["instances"] if item["name"] == "F1")
     worker["host"] = "tt-quietbox3"
+    client = next(item for item in scenario.data["instances"] if item["name"] == "C1")
+    client["host"] = "tt-quietbox3"
     scenario.data["network"]["shaping"] = [
         {"instance": "F1", "rate": "100mbit", "delay_ms": 2}
     ]
     return farm, scenario, farmtest.build_plan(farm, scenario, run_id="shaped-run")
+
+
+def _applied_receipt(scenario, plan):
+    binding = lifecycle._netem_bindings(plan)[0]
+
+    def command(phase: str) -> PlannedCommand:
+        item = next(
+            value
+            for value in plan["commands"]
+            if value["phase"] == phase and value["instance"] == binding.instance
+        )
+        return PlannedCommand(
+            sequence=item["sequence"],
+            phase=item["phase"],
+            host=item["host"],
+            instance=item["instance"],
+            transport=item["transport"],
+            timeout_s=item["timeout_s"],
+            argv=tuple(item["argv"]),
+        )
+
+    return _netem_up_receipt(
+        (binding,),
+        [CommandResult(0, "a" * 64 + "\n", "")],
+        [CommandResult(0, "", "")],
+        [CommandResult(0, "qdisc netem 8001: root delay 2.0ms rate 100Mbit\n", "")],
+        [command("up.network-create")],
+        [command("up.netem-apply")],
+        [command("up.netem-observe")],
+    )
 
 
 def test_shaped_worker_uses_private_bridge_and_container_tc_only(tmp_path: Path) -> None:
@@ -72,9 +110,23 @@ def test_shaped_worker_uses_private_bridge_and_container_tc_only(tmp_path: Path)
 
 def test_netem_witness_is_authenticated_and_tamper_fails() -> None:
     binding = resolve_bindings(
-        type("Farm", (), {"hosts": {"q3": {"netem": True}}})(),
-        {"network": {"shaping": [{"instance": "F1", "rate": "100mbit", "delay_ms": 2}]}},
-        {"instances": [{"name": "F1", "role": "F", "host": "q3"}]},
+        type(
+            "Farm",
+            (),
+            {"hosts": {"q2": {"netem": False}, "q3": {"netem": True}}},
+        )(),
+        {
+            "network": {
+                "shaping": [{"instance": "F1", "rate": "100mbit", "delay_ms": 2}]
+            },
+            "workload": {"clients": ["C1"]},
+        },
+        {
+            "instances": [
+                {"name": "F1", "role": "F", "host": "q3"},
+                {"name": "C1", "role": "C", "host": "q3"},
+            ]
+        },
         {"instances": {"F1": 23102}},
         "run",
     )[0]
@@ -121,9 +173,23 @@ def test_netem_plan_rejects_tampered_identity() -> None:
 
 def test_netem_lifecycle_receipt_binds_application_witness_and_removal() -> None:
     binding = resolve_bindings(
-        type("Farm", (), {"hosts": {"q3": {"netem": True}}})(),
-        {"network": {"shaping": [{"instance": "F1", "rate": "100mbit", "delay_ms": 2}]}},
-        {"instances": [{"name": "F1", "role": "F", "host": "q3"}]},
+        type(
+            "Farm",
+            (),
+            {"hosts": {"q2": {"netem": False}, "q3": {"netem": True}}},
+        )(),
+        {
+            "network": {
+                "shaping": [{"instance": "F1", "rate": "100mbit", "delay_ms": 2}]
+            },
+            "workload": {"clients": ["C1"]},
+        },
+        {
+            "instances": [
+                {"name": "F1", "role": "F", "host": "q3"},
+                {"name": "C1", "role": "C", "host": "q3"},
+            ]
+        },
         {"instances": {"F1": 23102}},
         "run",
     )[0]
@@ -133,7 +199,7 @@ def test_netem_lifecycle_receipt_binds_application_witness_and_removal() -> None
 
     receipt = _netem_up_receipt(
         (binding,),
-        [CommandResult(0, "network-id\n", "")],
+        [CommandResult(0, "a" * 64 + "\n", "")],
         [CommandResult(0, "", "")],
         [CommandResult(0, "qdisc netem 8001: root delay 2.0ms rate 100Mbit\n", "")],
         [command("up.network-create", ("docker", "network", "create"))],
@@ -145,6 +211,115 @@ def test_netem_lifecycle_receipt_binds_application_witness_and_removal() -> None
     assert record["request"]["rate"] == "100mbit"
     assert record["removal"]["container_argv"] == list(remove_args(binding))
     assert record["observation"]["witness"]["delay_ms"] == 2
+
+
+def test_netem_applied_receipt_is_bound_by_collector_and_pure_verdict(
+    tmp_path: Path,
+) -> None:
+    _farm, scenario, plan = _shaped_plan(tmp_path)
+    receipt = _applied_receipt(scenario, plan)
+    assert validate_receipt(scenario.data, plan, receipt) == receipt
+    evidence = tmp_path / "evidence"
+    (evidence / "receipts").mkdir(parents=True)
+    (evidence / "receipts" / "lifecycle.json").write_text(
+        json.dumps({"network_shaping": receipt}), encoding="utf-8"
+    )
+    observation = _network_shaping_observation(scenario, plan, evidence)
+    assert observation == receipt
+    assert not _network_shaping_errors(
+        scenario.data, {"network_shaping": observation}, plan
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda value: value["bindings"][0]["bridge"].__setitem__(
+            "network_id", "bad"
+        ),
+        lambda value: value["bindings"][0]["application"]["argv"].append("extra"),
+        lambda value: value["bindings"][0]["observation"].__setitem__(
+            "sha256", "0" * 64
+        ),
+        lambda value: value["bindings"][0]["observation"]["witness"].__setitem__(
+            "rate", "25mbit"
+        ),
+        lambda value: value["bindings"][0]["removal"]["container_argv"].append(
+            "extra"
+        ),
+    ),
+)
+def test_netem_receipt_tampering_fails_closed(tmp_path: Path, mutation) -> None:
+    _farm, scenario, plan = _shaped_plan(tmp_path)
+    receipt = _applied_receipt(scenario, plan)
+    mutation(receipt)
+    with pytest.raises(NetemPlanError):
+        validate_receipt(scenario.data, plan, receipt)
+    assert _network_shaping_errors(
+        scenario.data, {"network_shaping": receipt}, plan
+    ) == {"@observations:network_shaping"}
+
+
+def test_netem_coherent_plan_and_receipt_command_tamper_fails_closed(
+    tmp_path: Path,
+) -> None:
+    _farm, scenario, original_plan = _shaped_plan(tmp_path)
+    plan = copy.deepcopy(original_plan)
+    receipt = _applied_receipt(scenario, plan)
+    command = next(
+        item for item in plan["commands"] if item["phase"] == "up.netem-apply"
+    )
+    command["argv"].append("unsafe-extra")
+    receipt["bindings"][0]["application"]["argv"].append("unsafe-extra")
+
+    with pytest.raises(NetemPlanError, match="safe seam"):
+        validate_receipt(scenario.data, plan, receipt)
+
+
+def test_netem_teardown_reauthenticates_and_targets_container_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    farm, _scenario, plan = _shaped_plan(tmp_path)
+    binding = lifecycle._netem_bindings(plan)[0]
+    container_id = "b" * 64
+    monkeypatch.setattr(
+        lifecycle,
+        "_labelled_containers",
+        lambda *_args, **_kwargs: [
+            {
+                "created": "2026-09-07T00:00:00Z",
+                "id": container_id,
+                "name": binding.container,
+                "run_id": plan["run_id"],
+            }
+        ],
+    )
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.commands = []
+
+        def invoke(self, command: PlannedCommand) -> CommandResult:
+            self.commands.append(command)
+            return CommandResult(0, "", "")
+
+    recorder = Recorder()
+    receipts, problems = lifecycle._remove_netem(
+        farm, plan, (binding,), recorder, CommandFactory(), 30
+    )
+    assert not problems
+    assert receipts[0]["container_id"] == container_id
+    command = recorder.commands[-1]
+    assert command.phase == "down.netem-remove"
+    assert container_id in command.argv
+    assert binding.container not in command.argv
+
+
+def test_netem_removal_refuses_an_unauthenticated_target(tmp_path: Path) -> None:
+    _farm, _scenario, plan = _shaped_plan(tmp_path)
+    binding = lifecycle._netem_bindings(plan)[0]
+    with pytest.raises(NetemPlanError, match="authenticated container id"):
+        remove_args(binding, "other-container")
 
 
 @pytest.mark.parametrize(
@@ -162,7 +337,11 @@ def test_netem_lifecycle_receipt_binds_application_witness_and_removal() -> None
     ],
 )
 def test_netem_scope_is_fail_closed(shapes, message: str) -> None:
-    farm = type("Farm", (), {"hosts": {"q3": {"netem": True}}})()
+    farm = type(
+        "Farm",
+        (),
+        {"hosts": {"q2": {"netem": False}, "q3": {"netem": True}}},
+    )()
     topology = {
         "instances": [
             {"name": "F1", "role": "F", "host": "q3"},
@@ -173,8 +352,36 @@ def test_netem_scope_is_fail_closed(shapes, message: str) -> None:
     with pytest.raises(NetemPlanError, match=message):
         resolve_bindings(
             farm,
-            {"network": {"shaping": shapes}},
+            {"network": {"shaping": shapes}, "workload": {"clients": ["C1"]}},
             topology,
             {"instances": {"F1": 23102, "F2": 23103, "C1": 23104}},
+            "run",
+        )
+
+
+def test_netem_refuses_cross_host_client_that_cannot_route_bridge_ip() -> None:
+    farm = type(
+        "Farm",
+        (),
+        {"hosts": {"q2": {"netem": False}, "q3": {"netem": True}}},
+    )()
+    with pytest.raises(NetemPlanError, match="client on the same host"):
+        resolve_bindings(
+            farm,
+            {
+                "network": {
+                    "shaping": [
+                        {"instance": "F1", "rate": "100mbit", "delay_ms": 2}
+                    ]
+                },
+                "workload": {"clients": ["C1"]},
+            },
+            {
+                "instances": [
+                    {"name": "F1", "role": "F", "host": "q3"},
+                    {"name": "C1", "role": "C", "host": "q2"},
+                ]
+            },
+            {"instances": {"F1": 23102}},
             "run",
         )

@@ -15,6 +15,11 @@ from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+try:
+    from .netem import NetemPlanError, validate_receipt as validate_netem_receipt
+except ImportError:  # Direct execution from this directory.
+    from netem import NetemPlanError, validate_receipt as validate_netem_receipt
+
 
 BUNDLE_SCHEMA = "icefarm-bundle-v1"
 ROW_SCHEMA = "icecream-newgen-farm-acceptance-v1"
@@ -2778,6 +2783,28 @@ def _shape_clauses(
     return clauses
 
 
+def _network_shaping_errors(
+    scenario: Mapping[str, Any], observations: Mapping[str, Any], plan: object
+) -> set[str]:
+    requests = scenario.get("network", {}).get("shaping")
+    observed = observations.get("network_shaping")
+    plan_network = plan.get("network_shaping") if isinstance(plan, Mapping) else None
+    plan_bindings = (
+        plan_network.get("bindings") if isinstance(plan_network, Mapping) else None
+    )
+    if not requests:
+        if observed is not None or plan_bindings:
+            return {"@observations:network_shaping:unexpected"}
+        return set()
+    if not isinstance(plan, Mapping):
+        return {"@plan:network_shaping"}
+    try:
+        validate_netem_receipt(scenario, plan, observed)
+    except NetemPlanError:
+        return {"@observations:network_shaping"}
+    return set()
+
+
 def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
     """Evaluate an already-loaded bundle without consulting external state."""
 
@@ -2806,6 +2833,25 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
     )
     if not bundle_ok:
         return _finish(clauses)
+
+    network_relevant = bool(scenario.get("network", {}).get("shaping")) or (
+        "network_shaping" in observations
+    )
+    plan = bundle.get("plan")
+    if isinstance(plan, Mapping):
+        plan_network = plan.get("network_shaping")
+        if isinstance(plan_network, Mapping):
+            network_relevant = network_relevant or bool(plan_network.get("bindings"))
+    if network_relevant:
+        network_errors = _network_shaping_errors(scenario, observations, plan)
+        clauses.append(
+            _clause(
+                "network.shaping",
+                not network_errors,
+                "the shaped worker has one immutable 100mbit/2ms bridge qdisc witness",
+                network_errors,
+            )
+        )
 
     rows_present = bool(rows_raw)
     clauses.append(

@@ -656,6 +656,7 @@ def test_checked_in_full_suite_preserves_every_specialized_gate_and_preflights()
         "ladder",
         "s70",
         "twobuild",
+        "s80-shaped-100m",
         "s90",
         "s95-disk-full",
     ]
@@ -664,6 +665,9 @@ def test_checked_in_full_suite_preserves_every_specialized_gate_and_preflights()
     assert children["ladder"].data["kind"] == "composite"
     assert children["s70"].data["kind"] == "s70-resilience"
     assert children["twobuild"].data["performance"]["kind"] == "s80"
+    assert children["s80-shaped-100m"].expanded_scenario_ids() == (
+        ("S80-p29v1-shaped-100m", 1),
+    )
     assert children["s90"].expanded_scenario_ids() == (
         ("S90-revision-skew", 1),
         ("S90-revision-refusal-retry", 1),
@@ -673,6 +677,34 @@ def test_checked_in_full_suite_preserves_every_specialized_gate_and_preflights()
         ("S95-cache-disk-full", 1),
     )
     farmtest._preflight_suite(farm, suite)
+
+
+def test_checked_in_shaped_s80_is_a_separate_same_host_p29v1_pair() -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    suite = load_suite_spec(INTEGRATION / "suites" / "s80-shaped-100m.json")
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / "S80-p29v1-shaped-100m.json", farm
+    )
+    plan = farmtest.build_plan(farm, scenario, run_id="shaped-checked-in")
+
+    assert suite.expanded_scenario_ids() == (("S80-p29v1-shaped-100m", 1),)
+    assert scenario.data["workload"]["turns"] == ["A", "B"]
+    assert {
+        item["host"] for item in plan["topology"]["instances"]
+    } == {"tt-quietbox3"}
+    assert plan["network_shaping"]["bindings"] == [
+        {
+            "bridge": "icefarm-shaped-checked-in-F1-netem",
+            "container": "icefarm-shaped-checked-in-F1",
+            "container_port": plan["ports"]["instances"]["F1"],
+            "delay_ms": 2,
+            "host": "tt-quietbox3",
+            "host_port": plan["ports"]["instances"]["F1"],
+            "instance": "F1",
+            "rate": "100mbit",
+            "role": "F",
+        }
+    ]
 
 
 def test_full_only_routes_s40_and_s60_through_ladder_without_other_rungs(

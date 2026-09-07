@@ -51,6 +51,7 @@ RUN apt-get update \
         g++-11 \
         gcc-11 \
         gzip \
+        iproute2 \
         libarchive13 \
         libboost-system1.74.0 \
         libcap-ng0 \
