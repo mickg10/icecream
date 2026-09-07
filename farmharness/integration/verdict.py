@@ -2090,6 +2090,14 @@ def _shape_clauses(
                 )
             )
     if shape == "S'C'F'":
+        refusal_workers = {
+            item.get("name")
+            for item in instances
+            if scenario.get("id") == "S30-mutant-f-refusal"
+            and isinstance(item, Mapping)
+            and item.get("role") == "F"
+            and item.get("image") == "mutant"
+        }
         bad_workers = {
             str(worker)
             for worker in workers
@@ -2098,13 +2106,21 @@ def _shape_clauses(
                 selected_profile not in (item.get("cache_profiles") or [])
                 for item in login_for(worker)
             )
-            or not _is_int(sidecar(worker).get("sessions"), minimum=1)
+            or (
+                worker in refusal_workers
+                and sidecar(worker).get("sessions") != 0
+            )
+            or (
+                worker not in refusal_workers
+                and not _is_int(sidecar(worker).get("sessions"), minimum=1)
+            )
         }
         clauses.append(
             _clause(
                 "shape.full-newgen-engagement",
                 bool(workers) and not bad_workers,
-                "every new worker advertises the selected profile and records a session",
+                "every new worker advertises the selected profile; normal workers "
+                "record a session and S30 refusal workers record none",
                 {f"@instance:{name}" for name in bad_workers}
                 or ({"@scenario:workers"} if not workers else set()),
             )

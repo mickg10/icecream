@@ -2332,11 +2332,15 @@ def _s30_fixture() -> dict[str, object]:
     rows[2]["retries"] = 1
     scenario = _scenario("S'C'F'", client_versions=(50,), worker_versions=(50,))
     scenario["id"] = "S30-mutant-f-refusal"
+    scenario["images"]["mutant"] = "p50s30-f-refusal-fixture"
+    next(item for item in scenario["instances"] if item["role"] == "F")[
+        "image"
+    ] = "mutant"
     scenario["expect"]["reuse"] = "none-when-legacy"
     scenario["expect"]["error106_max"] = 2
     observations = _observations(rows, revisions={"C1": 1, "F1": 1})
     observations["sidecars"]["C1"]["sessions"] = 1
-    observations["sidecars"]["F1"]["sessions"] = 1
+    observations["sidecars"]["F1"]["sessions"] = 0
     observations["error106_job_ids"] = ["1", "3"]
     observations["legacy_wire"] = {
         "record_count": 3,
@@ -2377,6 +2381,17 @@ def test_s30_mutant_requires_one_refusal_and_one_fresh_legacy_retry() -> None:
     fixture = _s30_fixture()
     verdict = evaluate_bundle(fixture)
     assert verdict["status"] == "PASS", verdict
+    fixture = _s30_fixture()
+    fixture["observations"]["sidecars"]["F1"]["sessions"] = 1
+    assert evaluate_bundle(fixture)["status"] == "FAIL"
+    fixture = _s30_fixture()
+    fixture["observations"]["logins"][0]["cache_profiles"] = []
+    assert evaluate_bundle(fixture)["status"] == "FAIL"
+    fixture = _s30_fixture()
+    next(
+        item for item in fixture["scenario"]["instances"] if item["role"] == "F"
+    )["image"] = "new"
+    assert evaluate_bundle(fixture)["status"] == "FAIL"
     fixture = _s30_fixture()
     fixture["observations"]["s30_mutant_f"]["records"][0]["supported_profiles"] = 2
     assert evaluate_bundle(fixture)["status"] == "FAIL"
