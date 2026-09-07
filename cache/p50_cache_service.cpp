@@ -78,6 +78,10 @@ constexpr std::string_view kExpectedSocketDigestEnvironment =
 constexpr std::string_view kReadyMessage = "READY\n";
 constexpr int kPollMilliseconds = 100;
 constexpr int kHandshakeMilliseconds = 500;
+// The cache service has a five-second pre-READY budget.  Keep fingerprint
+// startup well inside it so SIGTERM cannot strand the daemon in an unbounded
+// flock/hash wait before it can retire without publishing READY.
+constexpr auto kP29FingerprintReadyBudget = std::chrono::milliseconds(2000);
 constexpr int kMaxBacklog = 16;
 // A bounded control farm keeps an authenticated idle dispatcher or an active
 // cache-wire handoff from consuming the only worker needed by compiler input.
@@ -2719,7 +2723,20 @@ int run(const Options& options) noexcept {
             ? daemon_cache_directory_from_socket(
                   effective_options.socket_path)
             : std::string{});
-    wait_p29_system_source_fingerprint();
+    const P29FingerprintOutcome fingerprint_outcome =
+        wait_p29_system_source_fingerprint_for(kP29FingerprintReadyBudget);
+    switch (fingerprint_outcome) {
+    case P29FingerprintOutcome::Completed:
+    case P29FingerprintOutcome::Unavailable:
+    case P29FingerprintOutcome::TimedOut:
+        break;
+    case P29FingerprintOutcome::Cancelled:
+        return 2;
+    }
+    if (g_stop_requested != 0) {
+        cancel_p29_system_source_fingerprint();
+        return 2;
+    }
     if (!prebound) {
         const int listener = local::listen_unix(effective_options.socket_path,
                                                 effective_options.backlog, &listen_status);

@@ -220,13 +220,25 @@ private:
     std::map<std::string, P29CachedSourceText, std::less<>> sources_;
 };
 
-Digest128 hash_regular_file(const std::filesystem::path& path) {
+using P29Cancellation = std::atomic<bool>;
+
+struct P29FingerprintCancelled final : std::exception {};
+
+void check_p29_cancellation(const P29Cancellation& cancelled) {
+    if (cancelled.load(std::memory_order_acquire))
+        throw P29FingerprintCancelled{};
+}
+
+Digest128 hash_regular_file(const std::filesystem::path& path,
+                            const P29Cancellation& cancelled) {
+    check_p29_cancellation(cancelled);
     std::ifstream input(path, std::ios::binary);
     if (!input)
         throw std::runtime_error("cannot open P29 system source");
     Digest128Builder digest;
     std::array<uint8_t, 64 * 1024> buffer{};
     while (input) {
+        check_p29_cancellation(cancelled);
         input.read(reinterpret_cast<char*>(buffer.data()), buffer.size());
         const std::streamsize count = input.gcount();
         if (count > 0)
@@ -259,6 +271,11 @@ constexpr std::string_view kP29FingerprintLockFile =
 constexpr uint64_t kP29FingerprintMaximumCacheBytes = uint64_t{128} << 20;
 constexpr uint64_t kP29FingerprintMaximumCacheEntries = uint64_t{1} << 20;
 constexpr uint64_t kP29FingerprintMaximumPathBytes = uint64_t{1} << 20;
+
+struct P29FingerprintComputation {
+    P29FingerprintOutcome outcome = P29FingerprintOutcome::Unavailable;
+    Digest128 fingerprint{};
+};
 
 struct P29OwnedFd {
     int value = -1;
@@ -343,12 +360,14 @@ P29FingerprintFile inspect_p29_source_file(const std::string& path) {
         {}};
 }
 
-std::vector<P29FingerprintFile> enumerate_p29_system_sources() {
+std::vector<P29FingerprintFile> enumerate_p29_system_sources(
+    const P29Cancellation& cancelled) {
     namespace fs = std::filesystem;
     static constexpr std::array<std::string_view, 3> roots{
         "/usr/include/", "/usr/lib/gcc/", "/usr/local/include/"};
     std::vector<P29FingerprintFile> files;
     for (const std::string_view root : roots) {
+        check_p29_cancellation(cancelled);
         std::error_code error;
         if (!fs::exists(root, error)) {
             if (error)
@@ -361,6 +380,7 @@ std::vector<P29FingerprintFile> enumerate_p29_system_sources() {
         if (error)
             throw std::runtime_error("cannot enumerate P29 system source root");
         while (current != end) {
+            check_p29_cancellation(cancelled);
             const fs::directory_entry entry = *current;
             const bool regular = entry.is_regular_file(error);
             if (error)
@@ -390,7 +410,8 @@ std::vector<P29FingerprintFile> enumerate_p29_system_sources() {
 }
 
 P29CacheLock lock_p29_fingerprint_cache(
-    const std::string& cache_directory) noexcept {
+    const std::string& cache_directory,
+    const P29Cancellation& cancelled) noexcept {
     P29CacheLock result;
     if (cache_directory.empty() || cache_directory.front() != '/' ||
         cache_directory.find('\0') != std::string::npos)
@@ -404,10 +425,21 @@ P29CacheLock lock_p29_fingerprint_cache(
         O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (result.lock.value < 0)
         return result;
-    if (::flock(result.lock.value, LOCK_EX) != 0) {
-        (void)::close(result.lock.value);
-        result.lock.value = -1;
-        return result;
+    for (;;) {
+        if (::flock(result.lock.value, LOCK_EX | LOCK_NB) == 0)
+            break;
+        if (errno != EWOULDBLOCK && errno != EINTR) {
+            (void)::close(result.lock.value);
+            result.lock.value = -1;
+            return result;
+        }
+        if (cancelled.load(std::memory_order_acquire)) {
+            (void)::close(result.lock.value);
+            result.lock.value = -1;
+            return result;
+        }
+        const timespec pause{0, 5 * 1000 * 1000};
+        (void)::nanosleep(&pause, nullptr);
     }
     return result;
 }
@@ -483,9 +515,12 @@ P29FingerprintCache read_p29_fingerprint_cache(int directory_fd) {
     return cursor == input.size() ? result : P29FingerprintCache{};
 }
 
-bool write_all(int fd, std::span<const uint8_t> bytes) noexcept {
+bool write_all(int fd, std::span<const uint8_t> bytes,
+               const P29Cancellation& cancelled) noexcept {
     size_t offset = 0;
     while (offset != bytes.size()) {
+        if (cancelled.load(std::memory_order_acquire))
+            return false;
         const ssize_t count =
             ::write(fd, bytes.data() + offset, bytes.size() - offset);
         if (count > 0) {
@@ -500,7 +535,8 @@ bool write_all(int fd, std::span<const uint8_t> bytes) noexcept {
 }
 
 void persist_p29_fingerprint_cache(
-    int directory_fd, const std::vector<P29FingerprintFile>& files) noexcept {
+    int directory_fd, const std::vector<P29FingerprintFile>& files,
+    const P29Cancellation& cancelled) noexcept {
     try {
         std::vector<uint8_t> bytes;
         size_t estimate = kP29FingerprintCacheMagic.size() + 8;
@@ -538,7 +574,8 @@ void persist_p29_fingerprint_cache(
         }
         if (output.value < 0)
             return;
-        if (!write_all(output.value, bytes) || ::fsync(output.value) != 0) {
+        if (!write_all(output.value, bytes, cancelled) ||
+            ::fsync(output.value) != 0) {
             (void)::unlinkat(directory_fd, temporary.c_str(), 0);
             return;
         }
@@ -558,24 +595,28 @@ void persist_p29_fingerprint_cache(
     }
 }
 
-Digest128 compute_p29_system_source_fingerprint(
-    const std::string& cache_directory) {
+P29FingerprintComputation compute_p29_system_source_fingerprint(
+    const std::string& cache_directory, const P29Cancellation& cancelled) {
+    check_p29_cancellation(cancelled);
     P29CacheLock cache_lock =
-        lock_p29_fingerprint_cache(cache_directory);
+        lock_p29_fingerprint_cache(cache_directory, cancelled);
+    check_p29_cancellation(cancelled);
     const P29FingerprintCache cache =
         cache_lock.valid()
             ? read_p29_fingerprint_cache(cache_lock.directory.value)
             : P29FingerprintCache{};
-    std::vector<P29FingerprintFile> files = enumerate_p29_system_sources();
+    std::vector<P29FingerprintFile> files =
+        enumerate_p29_system_sources(cancelled);
     if (files.empty())
-        return {};
+        return {P29FingerprintOutcome::Unavailable, {}};
     for (P29FingerprintFile& file : files) {
+        check_p29_cancellation(cancelled);
         bool stable = false;
         for (unsigned attempt = 0; attempt != 2 && !stable; ++attempt) {
             const auto position = cache.find(P29FingerprintCacheKey{
                 file.path, file.size, file.mtime_ns});
             file.digest = position == cache.end()
-                              ? hash_regular_file(file.path)
+                              ? hash_regular_file(file.path, cancelled)
                               : position->second;
             const P29FingerprintFile verified =
                 inspect_p29_source_file(file.path);
@@ -602,8 +643,10 @@ Digest128 compute_p29_system_source_fingerprint(
     if (result == Digest128{})
         result.bytes.back() = 1;
     if (cache_lock.valid())
-        persist_p29_fingerprint_cache(cache_lock.directory.value, files);
-    return result;
+        persist_p29_fingerprint_cache(cache_lock.directory.value, files,
+                                      cancelled);
+    check_p29_cancellation(cancelled);
+    return {P29FingerprintOutcome::Completed, result};
 }
 
 class P29FingerprintState {
@@ -612,44 +655,91 @@ public:
         std::lock_guard lock(mutex_);
         if (phase_ != Phase::Idle)
             return;
+        cancelled_.store(false, std::memory_order_release);
         phase_ = Phase::Running;
         try {
             std::thread([this, cache = std::move(cache_directory)] {
-                Digest128 result{};
+                P29FingerprintComputation result;
                 try {
-                    result = compute_p29_system_source_fingerprint(cache);
+                    result = compute_p29_system_source_fingerprint(cache,
+                                                                   cancelled_);
+                } catch (const P29FingerprintCancelled&) {
+                    return;
                 } catch (...) {
+                    result.outcome = P29FingerprintOutcome::Unavailable;
                 }
                 {
                     std::lock_guard publish(mutex_);
-                    fingerprint_ = result;
-                    phase_ = Phase::Ready;
+                    if (phase_ != Phase::Running ||
+                        cancelled_.load(std::memory_order_acquire))
+                        return;
+                    fingerprint_ = result.fingerprint;
+                    phase_ = result.outcome == P29FingerprintOutcome::Completed
+                                  ? Phase::Completed
+                                  : Phase::Unavailable;
                 }
                 ready_.notify_all();
             }).detach();
         } catch (...) {
             fingerprint_ = {};
-            phase_ = Phase::Ready;
+            phase_ = Phase::Unavailable;
             ready_.notify_all();
         }
     }
 
-    void wait() {
+    P29FingerprintOutcome wait_for(std::chrono::milliseconds timeout) {
         std::unique_lock lock(mutex_);
         if (phase_ == Phase::Idle)
+            return P29FingerprintOutcome::Unavailable;
+        if (phase_ != Phase::Running)
+            return outcome();
+        if (!ready_.wait_for(lock, timeout,
+                            [this] { return phase_ != Phase::Running; })) {
+            cancelled_.store(true, std::memory_order_release);
+            fingerprint_ = {};
+            phase_ = Phase::TimedOut;
+            ready_.notify_all();
+        }
+        return outcome();
+    }
+
+    void cancel() noexcept {
+        std::lock_guard lock(mutex_);
+        if (phase_ != Phase::Running)
             return;
-        ready_.wait(lock, [this] { return phase_ == Phase::Ready; });
+        cancelled_.store(true, std::memory_order_release);
+        fingerprint_ = {};
+        phase_ = Phase::Cancelled;
+        ready_.notify_all();
     }
 
     [[nodiscard]] Digest128 snapshot() const {
         std::lock_guard lock(mutex_);
-        return phase_ == Phase::Ready ? fingerprint_ : Digest128{};
+        return phase_ == Phase::Completed ? fingerprint_ : Digest128{};
     }
 
 private:
-    enum class Phase { Idle, Running, Ready };
+    enum class Phase { Idle, Running, Completed, Unavailable, TimedOut, Cancelled };
+
+    [[nodiscard]] P29FingerprintOutcome outcome() const noexcept {
+        switch (phase_) {
+        case Phase::Completed:
+            return P29FingerprintOutcome::Completed;
+        case Phase::TimedOut:
+            return P29FingerprintOutcome::TimedOut;
+        case Phase::Cancelled:
+            return P29FingerprintOutcome::Cancelled;
+        case Phase::Idle:
+        case Phase::Running:
+        case Phase::Unavailable:
+            return P29FingerprintOutcome::Unavailable;
+        }
+        return P29FingerprintOutcome::Unavailable;
+    }
+
     mutable std::mutex mutex_;
     std::condition_variable ready_;
+    P29Cancellation cancelled_{false};
     Phase phase_ = Phase::Idle;
     Digest128 fingerprint_{};
 };
@@ -818,9 +908,18 @@ void start_p29_system_source_fingerprint(
     }
 }
 
-void wait_p29_system_source_fingerprint() noexcept {
+P29FingerprintOutcome wait_p29_system_source_fingerprint_for(
+    std::chrono::milliseconds timeout) noexcept {
     try {
-        p29_fingerprint_state().wait();
+        return p29_fingerprint_state().wait_for(timeout);
+    } catch (...) {
+        return P29FingerprintOutcome::Unavailable;
+    }
+}
+
+void cancel_p29_system_source_fingerprint() noexcept {
+    try {
+        p29_fingerprint_state().cancel();
     } catch (...) {
     }
 }

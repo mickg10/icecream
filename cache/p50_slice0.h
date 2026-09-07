@@ -5,6 +5,7 @@
 #include "capability/grouprlz/p29_online_s1.h"
 
 #include <array>
+#include <chrono>
 #include <map>
 #include <memory>
 #include <optional>
@@ -442,9 +443,22 @@ private:
 void start_p29_system_source_fingerprint(
     std::string cache_directory = {}) noexcept;
 
-// Startup/simulator synchronization.  It returns immediately when no worker
-// was started.
-void wait_p29_system_source_fingerprint() noexcept;
+enum class P29FingerprintOutcome : uint8_t {
+    Completed,
+    Unavailable,
+    TimedOut,
+    Cancelled,
+};
+
+// Wait for a bounded startup result.  A timeout retires the worker and latches
+// zero, so a late fingerprint cannot become visible after startup has moved
+// on or cancellation has been requested.
+P29FingerprintOutcome wait_p29_system_source_fingerprint_for(
+    std::chrono::milliseconds timeout) noexcept;
+
+// Cancel a running startup worker.  Cancellation is cooperative and the
+// worker never publishes a nonzero result after this call.
+void cancel_p29_system_source_fingerprint() noexcept;
 
 // Nonblocking snapshot used only by the P29V1 profile guard.  Enumeration/hash
 // failures publish zero and safely turn source reuse off without making any

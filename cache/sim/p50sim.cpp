@@ -1241,7 +1241,8 @@ int main(int argc, char** argv) {
             // The simulator is an offline measurement harness.  Waiting here
             // keeps its P29V1 byte goldens deterministic while the product
             // daemon remains strictly zero-until-ready and nonblocking.
-            wait_p29_system_source_fingerprint();
+            (void)wait_p29_system_source_fingerprint_for(
+                std::chrono::seconds(5));
         }
         if (!arguments.batch_manifest.empty()) {
             run_batch(arguments);

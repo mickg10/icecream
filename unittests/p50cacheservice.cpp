@@ -15,6 +15,7 @@
 #include <string>
 #include <string_view>
 #include <sys/socket.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -208,6 +209,25 @@ void expect_exact_ready_then_eof(int fd) {
     CHECK(::read(fd, &trailing, 1) == 0);
 }
 
+void expect_structured_ready(int fd) {
+    std::string message;
+    for (;;) {
+        struct pollfd descriptor{fd, POLLIN | POLLHUP, 0};
+        CHECK(::poll(&descriptor, 1, kStartupReadyTimeoutMilliseconds) > 0);
+        char bytes[256]{};
+        const ssize_t result = ::read(fd, bytes, sizeof(bytes));
+        CHECK(result > 0);
+        message.append(bytes, static_cast<size_t>(result));
+        const size_t newline = message.find('\n');
+        if (newline != std::string::npos) {
+            CHECK(message.substr(0, newline + 1).rfind(
+                      "READY v2 generation=123 attempt=1 ", 0) == 0);
+            return;
+        }
+        CHECK(message.size() <= 2048);
+    }
+}
+
 Child launch(const std::string& directory, uint64_t generation = 7, uint64_t attempt = 1,
              uint64_t peer_uid = static_cast<uint64_t>(::getuid())) {
     int ready[2] = {-1, -1};
@@ -241,6 +261,107 @@ Child launch(const std::string& directory, uint64_t generation = 7, uint64_t att
     CHECK(::lstat(socket.c_str(), &socket_info) == 0 && S_ISSOCK(socket_info.st_mode));
     CHECK((socket_info.st_mode & 07777) == 0600);
     return child;
+}
+
+void fingerprint_stop_before_ready_is_bounded() {
+    char template_path[] = "/tmp/icecc-p29-fingerprint-stop-XXXXXX";
+    CHECK(::mkdtemp(template_path) != nullptr);
+    CHECK(::chmod(template_path, 0700) == 0);
+    const std::string root = template_path;
+    const std::string lease = root + "/lease";
+    CHECK(::mkdir(lease.c_str(), 0700) == 0);
+    const std::string socket = lease + "/cache.sock";
+    const std::string lock_path = root + "/p29-system-source-fingerprint-v1.lock";
+    const int held_lock = ::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    CHECK(held_lock >= 0 && ::flock(held_lock, LOCK_EX) == 0);
+
+    StoreIdentityRoot store_root{};
+    store_root.bytes[15] = 0x71;
+    const std::string f_guid = hex_id(f_store_guid_for_root(store_root));
+    const std::string c_guid = hex_id(c_store_guid_for_root(store_root));
+    const std::string socket_digest =
+        icecc::digest128_hex(icecc::digest128(socket));
+    const std::string uid = std::to_string(static_cast<uint64_t>(::getuid()));
+    const std::string gid = std::to_string(static_cast<uint64_t>(::getgid()));
+    const std::string executable = service_path();
+
+    auto launch_structured = [&](int listener, int ready_write) {
+        const pid_t pid = ::fork();
+        CHECK(pid >= 0);
+        if (pid == 0) {
+            clear_structured_launch_environment();
+            const std::string ready_fd = std::to_string(ready_write);
+            const std::string listener_fd = std::to_string(listener);
+            (void)::setenv("ICECC_CACHE_SERVICE_READY_FD", ready_fd.c_str(), 1);
+            (void)::setenv("ICECC_CACHE_SERVICE_READY_FORMAT", "2", 1);
+            (void)::setenv("ICECC_CACHE_SERVICE_EXPECTED_GENERATION", "123", 1);
+            (void)::setenv("ICECC_CACHE_SERVICE_EXPECTED_ATTEMPT", "1", 1);
+            (void)::setenv("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GENERATION", "191", 1);
+            (void)::setenv("ICECC_CACHE_SERVICE_EXPECTED_DERIVATION_VERSION", "1", 1);
+            (void)::setenv("ICECC_CACHE_SERVICE_EXPECTED_C_STORE_GUID", c_guid.c_str(), 1);
+            (void)::setenv("ICECC_CACHE_SERVICE_EXPECTED_F_STORE_GUID", f_guid.c_str(), 1);
+            (void)::setenv("ICECC_CACHE_SERVICE_EXPECTED_SOCKET", socket.c_str(), 1);
+            (void)::setenv("ICECC_CACHE_SERVICE_EXPECTED_SOCKET_DIGEST", socket_digest.c_str(), 1);
+            (void)::setenv("ICECC_CACHE_SERVICE_LISTENER_FD", listener_fd.c_str(), 1);
+            ::execl(executable.c_str(), executable.c_str(), "--socket", socket.c_str(),
+                    "--peer-uid", uid.c_str(), "--peer-gid", gid.c_str(),
+                    "--generation", "123", "--attempt", "1", "--f-store-generation",
+                    "191", "--store-derivation-version", "1", "--c-store-guid",
+                    c_guid.c_str(), "--f-store-guid", f_guid.c_str(),
+                    static_cast<char*>(nullptr));
+            _exit(127);
+        }
+        return pid;
+    };
+
+    auto launch_attempt = [&]() {
+        local::Status status = local::Status::Ok;
+        const int listener = local::listen_unix(socket, 1, &status);
+        CHECK(listener >= 0 && status == local::Status::Ok);
+        const int listener_flags = ::fcntl(listener, F_GETFD);
+        CHECK(listener_flags >= 0 &&
+              ::fcntl(listener, F_SETFD, listener_flags & ~FD_CLOEXEC) == 0);
+        int ready[2] = {-1, -1};
+        CHECK(::pipe(ready) == 0);
+        const int ready_flags = ::fcntl(ready[1], F_GETFD);
+        CHECK(ready_flags >= 0 &&
+              ::fcntl(ready[1], F_SETFD, ready_flags & ~FD_CLOEXEC) == 0);
+        const pid_t pid = launch_structured(listener, ready[1]);
+        CHECK(::close(listener) == 0);
+        CHECK(::close(ready[1]) == 0);
+        return std::pair<pid_t, int>{pid, ready[0]};
+    };
+
+    const auto first = launch_attempt();
+    const auto stop_started = std::chrono::steady_clock::now();
+    CHECK(::usleep(100000) == 0);
+    CHECK(::kill(first.first, SIGTERM) == 0);
+    int first_status = 0;
+    CHECK(::waitpid(first.first, &first_status, 0) == first.first);
+    CHECK(std::chrono::steady_clock::now() - stop_started <
+          std::chrono::milliseconds(3000));
+    CHECK(WIFEXITED(first_status) && WEXITSTATUS(first_status) != 0);
+    CHECK(read_bounded_to_eof(first.second).empty());
+    CHECK(::close(first.second) == 0);
+    CHECK(::unlink(socket.c_str()) == 0);
+
+    CHECK(::flock(held_lock, LOCK_UN) == 0);
+    CHECK(::close(held_lock) == 0);
+    const auto second = launch_attempt();
+    expect_structured_ready(second.second);
+    CHECK(::close(second.second) == 0);
+    CHECK(::kill(second.first, SIGTERM) == 0);
+    int second_status = 0;
+    CHECK(::waitpid(second.first, &second_status, 0) == second.first);
+    CHECK(WIFEXITED(second_status) && WEXITSTATUS(second_status) == 0);
+    struct stat cache_info{};
+    CHECK(::stat((root + "/p29-system-source-fingerprint-v1.cache").c_str(),
+                 &cache_info) == 0 && cache_info.st_size > 0);
+    CHECK(::unlink(socket.c_str()) == 0);
+    CHECK(::unlink((root + "/p29-system-source-fingerprint-v1.cache").c_str()) == 0);
+    CHECK(::unlink(lock_path.c_str()) == 0);
+    CHECK(::rmdir(lease.c_str()) == 0);
+    CHECK(::rmdir(root.c_str()) == 0);
 }
 
 local::Connection connect_to(const std::string& directory) {
@@ -2073,6 +2194,7 @@ void ready_requires_bind_and_replacement_is_preserved() {
 int main() {
     try {
         exercise_root_contract_then_drop_test_process();
+        fingerprint_stop_before_ready_is_bounded();
         legacy_store_identity_launches();
         signal_interrupts_control_wait(SIGTERM);
         signal_interrupts_control_wait(SIGINT);
