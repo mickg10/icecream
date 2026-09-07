@@ -272,6 +272,11 @@ for row in rows:
         job_dir = (root / "jobs" / f"{index:06d}").lstat()
     except (OSError, ValueError):
         raise SystemExit("checkpoint row escaped workload root")
+    # Active scheduler loss is the sole authenticated exception: the
+    # affected turn must be allowed one bounded fresh LEGACY retry after
+    # Error-106. Baseline/S70 restart cells remain strict.
+    if scenario.data.get("id") == "S70-b4-scheduler-active-loss":
+        return False
     if (
         path.is_symlink()
         or not stat.S_ISREG(stat.st_mode)

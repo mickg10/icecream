@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import pathlib
 import re
 import threading
 import time
@@ -141,29 +142,41 @@ def processes():
     return result
 
 deadline = time.monotonic() + int(sys.argv[1])
+# Candidate invariant: p["pid"] == p["pgid"] for the direct compiler;
+# sidecars are excluded by: "--generation" not in p["argv"].
 while time.monotonic() < deadline:
     items = processes()
-    daemons = [p for p in items if pathlib.Path(p["exe"]).name == "iceccd"]
-    if len(daemons) != 1:
-        time.sleep(0.05)
-        continue
-    daemon = daemons[0]
-    candidates = [p for p in items if p["ppid"] == daemon["pid"] and
-                  p["pid"] == p["pgid"] and p["state"] not in {"Z", "X"} and
-                  "--generation" not in p["argv"]]
+    parents = {p["pid"]: p for p in items if pathlib.Path(p["exe"]).name == "iceccd"}
+    candidates = [
+        (parent, child) for child in items
+        for parent in (parents.get(child["ppid"]),)
+        if parent is not None and parent["pid"] == child["ppid"] and child["pid"] == child["pgid"]
+        and child["state"] not in {"Z", "X"}
+        and "--generation" not in child["argv"]
+    ]
     if len(candidates) != 1:
         time.sleep(0.05)
         continue
-    leader = candidates[0]
+    daemon, leader = candidates[0]
+    before_daemon = snap(daemon["pid"])
     before = snap(leader["pid"])
-    if before != leader or before["ppid"] != daemon["pid"] or before["pid"] != before["pgid"]:
+    if (before_daemon != daemon or before != leader
+            or pathlib.Path(before_daemon["exe"]).name != "iceccd"
+            or pathlib.Path(before["exe"]).name != "iceccd"
+            or before["ppid"] != before_daemon["pid"]
+            or before["pid"] != before["pgid"]):
         time.sleep(0.05)
         continue
     os.killpg(before["pgid"], signal.SIGSTOP)
+    stopped_daemon = snap(before_daemon["pid"])
     stopped = snap(before["pid"])
-    if stopped["start_ticks"] != before["start_ticks"] or stopped["pgid"] != before["pgid"] or stopped["state"] not in {"T", "t"}:
+    if (stopped_daemon != before_daemon
+            or stopped["start_ticks"] != before["start_ticks"]
+            or stopped["ppid"] != before_daemon["pid"]
+            or stopped["pgid"] != before["pgid"]
+            or stopped["state"] not in {"T", "t"}):
         raise SystemExit("compiler group did not stop with its authenticated identity")
-    print(json.dumps({"daemon": daemon, "leader": before,
+    print(json.dumps({"daemon": before_daemon, "leader": before,
                       "schema": "icefarm-compiler-group-stop-v1", "stopped": stopped,
                       "stopped_ms": time.time_ns() // 1000000}, sort_keys=True, separators=(",", ":")))
     raise SystemExit(0)
@@ -2587,9 +2600,15 @@ class EventProducer:
             raise EventError("compiler-group authentication did not return its exact schema")
         leader = compiler.get("leader")
         stopped = compiler.get("stopped")
-        if not isinstance(leader, dict) or not isinstance(stopped, dict) or set(leader) != set(stopped):
+        parent = compiler.get("daemon")
+        if (not isinstance(leader, dict) or not isinstance(stopped, dict)
+                or not isinstance(parent, dict) or set(leader) != set(stopped)):
             raise EventError("compiler-group authentication has incomplete identity")
-        if (leader.get("pid") != leader.get("pgid") or leader.get("pid") != stopped.get("pid")
+        if (parent.get("pid") == leader.get("pid")
+                or pathlib.Path(parent.get("exe", "")).name != "iceccd"
+                or leader.get("ppid") != parent.get("pid")
+                or leader.get("pid") != leader.get("pgid")
+                or leader.get("pid") != stopped.get("pid")
                 or leader.get("pgid") != stopped.get("pgid")
                 or leader.get("start_ticks") != stopped.get("start_ticks")
                 or leader.get("state") in {"Z", "X"}):
@@ -2641,16 +2660,18 @@ class EventProducer:
             )
             for client in clients
         }
+        lost_generation = self._scheduler_generation_for_job(self._last_job)
         return {
             "action": event.action, "after": {"container_id": after["id"], "started_at": after["started_at"]},
             "before": {"container_id": before["id"], "started_at": before["started_at"]},
             "compiler": {
-                "container_id": worker_before["id"], "leader": leader,
+                "container_id": worker_before["id"], "daemon": parent, "leader": leader,
                 "stopped": stopped, "group_gone": group_gone,
                 "worker_before": {"container_id": worker_before["id"], "started_at": worker_before["started_at"]},
                 "worker_after": {"container_id": worker_after["id"], "started_at": worker_after["started_at"]},
             },
             "event_epoch": epoch, "instance": event.instance,
+            "lost_scheduler_generation": lost_generation,
             "lost_scheduler_job": self._last_job,
             "pre_fault": {"scheduler_log": scheduler_log, "worker_log": worker_log},
             "quiescence": {"scheduler_startup": startup, "scheduler_snapshot": scheduler_snapshot, "worker_snapshot": worker_snapshot, "client_readiness": client_readiness},
@@ -3963,6 +3984,22 @@ class EventProducer:
             )
         )
         return result.stdout + "\n" + result.stderr
+
+    def _scheduler_generation_for_job(self, job_id: int) -> int:
+        """Return the unique startup generation owning an observed dispatch."""
+        text = self._remote_job_reader()
+        generation = 0
+        matches: list[int] = []
+        for line in text.splitlines():
+            if "ICECREAM scheduler" in line and "starting up" in line:
+                generation += 1
+            if generation and re.search(rf"\bput\s+{job_id}\s+in joblist of\b", line, re.I):
+                matches.append(generation)
+        if generation == 0 or len(matches) != 1:
+            raise EventError(
+                f"scheduler loss job {job_id} has no unique authenticated generation"
+            )
+        return matches[0]
 
     def _eligible(self, event: TimelineEvent, now: float) -> bool:
         if event.trigger.kind == "time":

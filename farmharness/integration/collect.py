@@ -10,7 +10,7 @@ import shutil
 from collections import Counter, defaultdict
 from collections.abc import Mapping
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 try:
@@ -1035,6 +1035,7 @@ def _scheduler_jobs(
     plan: dict[str, Any],
     *,
     allow_unterminated_job_ids: set[int] | None = None,
+    allow_unterminated_generations: set[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Parse scheduler-owned dispatch and terminal transitions from its log."""
 
@@ -1158,9 +1159,25 @@ def _scheduler_jobs(
     if generation == 0:
         raise CollectError("scheduler log has no startup generation")
     allowed = allow_unterminated_job_ids or set()
+    incomplete = [job for job in dispatches if "terminal_ms" not in job]
+    # An active scheduler loss may explain exactly one dispatch.  Do not
+    # authorize every generation sharing a numeric job id.
+    if len(incomplete) > 1:
+        raise CollectError(
+            "scheduler log has multiple unterminated dispatches; refusing to "
+            "attribute scheduler loss by numeric job id"
+        )
     for job in dispatches:
         if "terminal_ms" not in job:
-            if job["scheduler_job"] in allowed:
+            if (
+                len(incomplete) == 1
+                and job is incomplete[0]
+                and job["scheduler_job"] in allowed
+                and (
+                    not allow_unterminated_generations
+                    or job["generation"] in allow_unterminated_generations
+                )
+            ):
                 job.update(
                     {
                         "status": None,
@@ -1395,12 +1412,14 @@ def _validate_scheduler_active_loss_receipt(
     prefix = f"events.json event {index} scheduler active loss"
     if farm is None or plan is None or evidence is None:
         raise CollectError(f"{prefix} needs authenticated farm, plan, and evidence")
-    required = {"action", "after", "before", "compiler", "event_epoch", "instance", "lost_scheduler_job", "pre_fault", "quiescence", "schema", "turn"}
+    required = {"action", "after", "before", "compiler", "event_epoch", "instance", "lost_scheduler_generation", "lost_scheduler_job", "pre_fault", "quiescence", "schema", "turn"}
     if not isinstance(receipt, Mapping) or set(receipt) != required or receipt.get("schema") != SCHEDULER_ACTIVE_LOSS_SCHEMA:
         raise CollectError(f"{prefix} has invalid receipt fields")
     if receipt.get("action") != event.get("action") or receipt.get("instance") != event.get("instance") or receipt.get("event_epoch") != event.get("event_epoch") or receipt.get("turn") not in scenario.data["workload"]["turns"]:
         raise CollectError(f"{prefix} is not bound to its timeline event")
-    if type(receipt.get("lost_scheduler_job")) is not int or receipt["lost_scheduler_job"] <= 0 or receipt["lost_scheduler_job"] != event.get("last_dispatched_job"):
+    if (type(receipt.get("lost_scheduler_generation")) is not int or receipt["lost_scheduler_generation"] <= 0
+            or type(receipt.get("lost_scheduler_job")) is not int or receipt["lost_scheduler_job"] <= 0
+            or receipt["lost_scheduler_job"] != event.get("last_dispatched_job")):
         raise CollectError(f"{prefix} has no exact lost scheduler job boundary")
     snapshots = {}
     for side in ("before", "after"):
@@ -1415,9 +1434,14 @@ def _validate_scheduler_active_loss_receipt(
     compiler = receipt["compiler"]
     leader = compiler.get("leader") if isinstance(compiler, Mapping) else None
     stopped = compiler.get("stopped") if isinstance(compiler, Mapping) else None
-    if (not isinstance(compiler, Mapping) or set(compiler) != {"container_id", "group_gone", "leader", "stopped", "worker_before", "worker_after"}
+    parent = compiler.get("daemon") if isinstance(compiler, Mapping) else None
+    if (not isinstance(compiler, Mapping) or set(compiler) != {"container_id", "daemon", "group_gone", "leader", "stopped", "worker_before", "worker_after"}
             or not isinstance(compiler.get("container_id"), str) or SHA256_RE.fullmatch(compiler["container_id"]) is None
             or not isinstance(leader, Mapping) or not isinstance(stopped, Mapping)
+            or not isinstance(parent, Mapping)
+            or PurePosixPath(str(parent.get("exe", ""))).name != "iceccd"
+            or parent.get("pid") == leader.get("pid")
+            or leader.get("ppid") != parent.get("pid")
             or leader.get("pid") != leader.get("pgid") or leader.get("pid") != stopped.get("pid")
             or leader.get("pgid") != stopped.get("pgid") or leader.get("start_ticks") != stopped.get("start_ticks")
             or stopped.get("state") not in {"T", "t"}
@@ -1451,7 +1475,31 @@ def _validate_scheduler_active_loss_receipt(
             or not isinstance(quiescence.get("worker_snapshot"), str)
             or not quiescence["worker_snapshot"].strip()
             or not isinstance(quiescence.get("client_readiness"), Mapping)
-            or set(quiescence["client_readiness"]) != set(scenario.data["workload"]["clients"])):
+            or set(quiescence["client_readiness"]) != set(scenario.data["workload"]["clients"])
+            or any(
+                not isinstance(witness, Mapping)
+                or set(witness) != {"bytes", "cache_line", "cache_required", "connected_line", "host", "log_path", "offset"}
+                or type(witness.get("bytes")) is not int or witness["bytes"] < 1
+                or type(witness.get("cache_required")) is not bool
+                or not isinstance(witness.get("connected_line"), str)
+                or "Connected to scheduler (I am known as " not in witness["connected_line"]
+                or not isinstance(witness.get("host"), str) or not witness["host"]
+                or not isinstance(witness.get("log_path"), str) or not witness["log_path"].startswith("/")
+                or type(witness.get("offset")) is not int or witness["offset"] < 0
+                for witness in quiescence.get("client_readiness", {}).values()
+            )
+            or not isinstance(quiescence.get("scheduler_snapshot"), str)
+            or not any(
+                isinstance(item, Mapping) and item.get("role") == "S"
+                and isinstance(item.get("name"), str)
+                and re.search(rf"(^|\\s){re.escape(item['name'])}(\\s|$)", quiescence["scheduler_snapshot"], re.MULTILINE)
+                for item in plan["topology"]["instances"]
+            )
+            or not isinstance(quiescence.get("worker_snapshot"), str)
+            or any(
+                re.search(rf"(^|\\s){re.escape(item['name'])}(\\s|$)", quiescence["worker_snapshot"], re.MULTILINE) is None
+                for item in plan["topology"]["instances"] if item.get("role") == "F"
+            )):
         raise CollectError(f"{prefix} lacks complete fresh scheduler/F/C rejoin evidence")
     log = _text(_one_role_log(evidence, worker))
     tail = log.encode("utf-8")[offset:].decode("utf-8", "replace")
@@ -3561,7 +3609,10 @@ def _parse_rows(
                         "worker_instance": worker["name"],
                     }
                 )
-                if scenario.data.get("id") == "S30-mutant-f-refusal":
+                if scenario.data.get("id") in {
+                    "S30-mutant-f-refusal",
+                    "S70-b4-scheduler-active-loss",
+                }:
                     # A refused P50 assignment is followed by one fresh
                     # legacy assignment.  Once the route owner requests
                     # replacement, later jobs may correctly arrive as
@@ -3791,11 +3842,13 @@ def _reconcile_scheduler_dispatches(
     claims: list[dict[str, Any]],
     *,
     allow_unterminated_job_ids: set[int] | None = None,
+    allow_unterminated_generations: set[int] | None = None,
 ) -> dict[str, Any]:
     """Require an exact scheduler-dispatch/assignment/terminal bijection."""
 
     dispatches = _scheduler_jobs(
-        evidence, plan, allow_unterminated_job_ids=allow_unterminated_job_ids
+        evidence, plan, allow_unterminated_job_ids=allow_unterminated_job_ids,
+        allow_unterminated_generations=allow_unterminated_generations,
     )
     scheduler_groups: dict[tuple[int, str, str], list[dict[str, Any]]] = defaultdict(
         list
@@ -4398,6 +4451,13 @@ def _observations(
         and isinstance(event.get("receipt"), Mapping)
         and type(event["receipt"].get("lost_scheduler_job")) is int
     }
+    active_loss_generations = {
+        event["receipt"]["lost_scheduler_generation"]
+        for event in events
+        if event.get("action") == "scheduler-loss-active"
+        and isinstance(event.get("receipt"), Mapping)
+        and type(event["receipt"].get("lost_scheduler_generation")) is int
+    }
     logins, revisions, cache_ports = _parse_logins(evidence, plan)
     topology = plan["topology"]["instances"]
     by_name = {item["name"]: item for item in topology}
@@ -4433,6 +4493,7 @@ def _observations(
         plan,
         [*canary_claims, *assignment_claims],
         allow_unterminated_job_ids=active_loss_jobs or None,
+        allow_unterminated_generations=active_loss_generations or None,
     )
     if active_loss_jobs:
         if len(active_loss_jobs) != 1:

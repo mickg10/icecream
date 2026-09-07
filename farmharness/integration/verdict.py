@@ -1272,17 +1272,24 @@ def _scheduler_active_loss_receipt_errors(
     receipt: Any, event: Mapping[str, Any], scenario: Mapping[str, Any]
 ) -> set[str]:
     marker = "@event:scheduler-active-loss"
-    required = {"action", "after", "before", "compiler", "event_epoch", "instance", "lost_scheduler_job", "pre_fault", "quiescence", "schema", "turn"}
+    required = {"action", "after", "before", "compiler", "event_epoch", "instance", "lost_scheduler_generation", "lost_scheduler_job", "pre_fault", "quiescence", "schema", "turn"}
     if not isinstance(receipt, Mapping) or set(receipt) != required or receipt.get("schema") != "icefarm-scheduler-active-loss-v1":
         return {marker}
     compiler = receipt.get("compiler")
+    parent = compiler.get("daemon") if isinstance(compiler, Mapping) else None
     leader = compiler.get("leader") if isinstance(compiler, Mapping) else None
     stopped = compiler.get("stopped") if isinstance(compiler, Mapping) else None
     if (receipt.get("action") != event.get("action")
             or receipt.get("instance") != event.get("instance")
+            or not _is_int(receipt.get("lost_scheduler_generation"), minimum=1)
             or not _is_int(receipt.get("lost_scheduler_job"), minimum=1)
             or receipt.get("lost_scheduler_job") != event.get("last_dispatched_job")
             or not isinstance(leader, Mapping) or not isinstance(stopped, Mapping)
+            or not isinstance(parent, Mapping)
+            or parent.get("pid") == leader.get("pid")
+            or leader.get("ppid") != parent.get("pid")
+            or not isinstance(parent.get("exe"), str)
+            or not parent["exe"].endswith("/iceccd")
             or leader.get("pid") != leader.get("pgid")
             or leader.get("pid") != stopped.get("pid")
             or leader.get("start_ticks") != stopped.get("start_ticks")
@@ -1303,7 +1310,19 @@ def _scheduler_active_loss_receipt_errors(
             or not receipt["quiescence"]["scheduler_snapshot"].strip()
             or not receipt["quiescence"]["worker_snapshot"].strip()
             or set(receipt["quiescence"].get("client_readiness", {}))
-            != set(scenario.get("workload", {}).get("clients", []))):
+            != set(scenario.get("workload", {}).get("clients", []))
+            or any(
+                not isinstance(witness, Mapping)
+                or set(witness) != {"bytes", "cache_line", "cache_required", "connected_line", "host", "log_path", "offset"}
+                or type(witness.get("bytes")) is not int or witness["bytes"] < 1
+                or type(witness.get("cache_required")) is not bool
+                or not isinstance(witness.get("connected_line"), str)
+                or "Connected to scheduler (I am known as " not in witness["connected_line"]
+                or not isinstance(witness.get("host"), str) or not witness["host"]
+                or not isinstance(witness.get("log_path"), str) or not witness["log_path"].startswith("/")
+                or not _is_int(witness.get("offset"), minimum=0)
+                for witness in receipt["quiescence"].get("client_readiness", {}).values()
+            )):
         return {marker}
     for side in ("before", "after"):
         snapshot = receipt.get(side)

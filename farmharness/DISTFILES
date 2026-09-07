@@ -81,6 +81,7 @@ farmharness/integration/scenarios/S60-12-warm-f2-up.json
 farmharness/integration/scenarios/S60-13-warm-s-down.json
 farmharness/integration/scenarios/S60-14-warm-s-up.json
 farmharness/integration/scenarios/S70-b4-client-route-restart.json
+farmharness/integration/scenarios/S70-b4-scheduler-active-loss.json
 farmharness/integration/scenarios/S70-b4-scheduler-restart.json
 farmharness/integration/scenarios/S70-b4-worker-bounces.json
 farmharness/integration/scenarios/S70-b5-interner-failure.json

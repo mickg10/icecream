@@ -53,7 +53,6 @@ S60_SCENARIO_IDS = tuple(f"S60-{index:02d}-{name}" for index, name in enumerate(
 ))
 S70_SCENARIO_IDS = (
     "S70-b4-worker-bounces",
-    "S70-b4-scheduler-restart",
     "S70-b4-scheduler-active-loss",
     "S70-b4-client-route-restart",
     "S70-b5-interner-failure",

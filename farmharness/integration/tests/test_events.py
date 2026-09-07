@@ -149,7 +149,9 @@ def test_unsupported_actions_refuse_before_workload_and_deadline_is_bounded(tmp_
 
 
 def test_active_scheduler_loss_scripts_are_exact_identity_bound() -> None:
-    assert "len(daemons) != 1" in ACTIVE_COMPILER_STOP_SCRIPT
+    assert "len(daemons) != 1" not in ACTIVE_COMPILER_STOP_SCRIPT
+    assert "parents = {p[\"pid\"]" in ACTIVE_COMPILER_STOP_SCRIPT
+    assert "parent[\"pid\"]" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "len(candidates) != 1" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "p[\"pid\"] == p[\"pgid\"]" in ACTIVE_COMPILER_STOP_SCRIPT
     assert '"--generation" not in p["argv"]' in ACTIVE_COMPILER_STOP_SCRIPT
@@ -164,12 +166,14 @@ def test_active_compiler_selector_rejects_sidecar_and_statewriter_shapes() -> No
     statewriter = {"pid": 11, "pgid": 10, "ppid": 10, "exe": daemon["exe"], "argv": []}
     sidecar = {"pid": 12, "pgid": 12, "ppid": 10, "exe": daemon["exe"], "argv": ["iceccd", "--generation", "7"]}
     compiler = {"pid": 13, "pgid": 13, "ppid": 10, "exe": daemon["exe"], "argv": ["iceccd"]}
-    candidates = [
-        item for item in (statewriter, sidecar, compiler)
-        if item["ppid"] == daemon["pid"] and item["pid"] == item["pgid"]
-        and "--generation" not in item["argv"]
+    parents = {daemon["pid"]: daemon}
+    pairs = [
+        (parent, child) for child in (statewriter, sidecar, compiler)
+        for parent in (parents.get(child["ppid"]),)
+        if parent is not None and child["pid"] == child["pgid"]
+        and "--generation" not in child["argv"]
     ]
-    assert candidates == [compiler]
+    assert pairs == [(daemon, compiler)]
 
 
 def test_active_scheduler_loss_scenario_is_not_the_drained_restart(tmp_path: Path) -> None:
@@ -206,18 +210,20 @@ def test_active_scheduler_loss_collection_binds_post_offset_product_witness(
         "before": {"container_id": "a" * 64, "started_at": "old"},
         "compiler": {
             "container_id": "b" * 64,
-            "leader": {"pid": 41, "pgid": 41, "start_ticks": 9, "state": "R"},
-            "stopped": {"pid": 41, "pgid": 41, "start_ticks": 9, "state": "T"},
+            "daemon": {"pid": 10, "pgid": 10, "ppid": 1, "exe": "/opt/icecream/sbin/iceccd"},
+            "leader": {"pid": 41, "pgid": 41, "ppid": 10, "start_ticks": 9, "state": "R"},
+            "stopped": {"pid": 41, "pgid": 41, "ppid": 10, "start_ticks": 9, "state": "T"},
             "group_gone": {"gone": True},
             "worker_before": {"container_id": "b" * 64, "started_at": "f"},
             "worker_after": {"container_id": "b" * 64, "started_at": "f"},
         },
-        "event_epoch": 1,
-        "instance": "S1",
+            "event_epoch": 1,
+            "lost_scheduler_generation": 1,
+            "instance": "S1",
         "lost_scheduler_job": 2,
         "pre_fault": {"scheduler_log": {"offset": 0}, "worker_log": {"offset": 0}},
         "quiescence": {
-            "client_readiness": {"C1": {}},
+                "client_readiness": {"C1": {"bytes": 1, "cache_line": None, "cache_required": False, "connected_line": "Connected to scheduler (I am known as C1)", "host": "tt-quietbox2", "log_path": "/scratch/C1/log/client-daemon.log", "offset": 0}},
             "scheduler_snapshot": "S1",
             "scheduler_startup": {"line": "ICECREAM scheduler starting"},
             "worker_snapshot": "F1",
