@@ -463,9 +463,15 @@ def write_state(mode):
 def markers():
     result = []
     for path in sorted(active_path.glob("job-*.tsv")):
-        require_regular(path)
         if re.fullmatch(r"job-[1-9][0-9]*-[1-9][0-9]*[.]tsv", path.name) is None:
             raise SystemExit(f"malformed event-gate marker: {path.name}")
+        try:
+            require_regular(path)
+        except FileNotFoundError:
+            # Workload completion removes its marker without the admission
+            # lock.  Vanishing after directory enumeration is therefore an
+            # ordinary drain, while every other file error remains fatal.
+            continue
         result.append(path.name)
     return result
 

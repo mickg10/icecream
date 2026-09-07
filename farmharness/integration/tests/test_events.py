@@ -828,6 +828,114 @@ def test_event_gate_pause_drains_then_resume_is_atomic(tmp_path: Path) -> None:
     assert (gate / "state.tsv").read_text() == "ABORT\t2\n"
 
 
+def test_event_gate_treats_marker_vanishing_after_enumeration_as_drained(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workload" / "A"
+    gate = root / "event-gate"
+    active = gate / "active"
+    active.mkdir(parents=True)
+    (gate / "state.tsv").write_text("OPEN\t0\n", encoding="ascii")
+    (gate / "state.lock").touch()
+    marker = active / "job-1-99.tsv"
+    marker.write_text("1\t99\t0\t1\n", encoding="ascii")
+
+    racing_glob = r'''
+import pathlib
+
+_original_glob = pathlib.Path.glob
+_glob_calls = 0
+
+def _remove_after_enumeration(path, pattern):
+    global _glob_calls
+    paths = list(_original_glob(path, pattern))
+    _glob_calls += 1
+    if _glob_calls == 2:
+        assert [candidate.name for candidate in paths] == ["job-1-99.tsv"]
+        paths[0].unlink()
+    return iter(paths)
+
+pathlib.Path.glob = _remove_after_enumeration
+'''.strip()
+    paused = subprocess.run(
+        (
+            sys.executable,
+            "-c",
+            racing_glob + "\n" + GATE_CONTROL_SCRIPT,
+            "pause",
+            str(root),
+            "C1",
+            "A",
+            "1",
+            "2",
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+
+    receipt = json.loads(paused.stdout)
+    assert receipt["status"] == "PAUSED"
+    assert receipt["active_before"] == 1
+    assert receipt["active_after"] == 0
+    assert not marker.exists()
+    assert (gate / "state.tsv").read_text() == "PAUSE\t1\n"
+
+
+@pytest.mark.parametrize(
+    ("marker_kind", "marker_name", "error"),
+    (
+        ("malformed", "job-0-2.tsv", "malformed event-gate marker"),
+        ("symlink", "job-1-2.tsv", "unsafe event-gate file"),
+        ("directory", "job-1-2.tsv", "unsafe event-gate file"),
+    ),
+)
+def test_event_gate_rejects_unsafe_or_malformed_active_markers(
+    tmp_path: Path,
+    marker_kind: str,
+    marker_name: str,
+    error: str,
+) -> None:
+    root = tmp_path / "workload" / "A"
+    gate = root / "event-gate"
+    active = gate / "active"
+    active.mkdir(parents=True)
+    (gate / "state.tsv").write_text("OPEN\t0\n", encoding="ascii")
+    (gate / "state.lock").touch()
+    marker = active / marker_name
+    if marker_kind == "symlink":
+        target = active / "target.tsv"
+        target.write_text("1\t2\t0\t1\n", encoding="ascii")
+        marker.symlink_to(target)
+    elif marker_kind == "directory":
+        marker.mkdir()
+    else:
+        marker.write_text("0\t2\t0\t1\n", encoding="ascii")
+
+    rejected = subprocess.run(
+        (
+            sys.executable,
+            "-c",
+            GATE_CONTROL_SCRIPT,
+            "pause",
+            str(root),
+            "C1",
+            "A",
+            "1",
+            "2",
+        ),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+
+    assert rejected.returncode != 0
+    assert error in rejected.stderr
+    assert (gate / "state.tsv").read_text() == "OPEN\t0\n"
+
+
 def test_scheduler_restart_pauses_drains_reauthenticates_and_resumes(tmp_path: Path) -> None:
     farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path)
