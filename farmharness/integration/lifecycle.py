@@ -2669,6 +2669,55 @@ def _netem_up_receipt(
     }
 
 
+def _netem_created_receipt(
+    run_id: str,
+    scenario_digest: str,
+    topology_digest: str,
+    bindings: tuple[NetemBinding, ...],
+    create_results: list[CommandResult],
+    create_commands: list[PlannedCommand],
+) -> dict[str, Any]:
+    """Retain successful network creation before any dependent step runs."""
+
+    if len(bindings) != len(create_results) or len(bindings) != len(create_commands):
+        raise LifecycleError("netem create command/result cardinality is inconsistent")
+    records: list[dict[str, Any]] = []
+    for binding, created, create in zip(
+        bindings, create_results, create_commands, strict=True
+    ):
+        if created.returncode != 0:
+            continue
+        network_id = created.stdout.strip()
+        if re.fullmatch(r"[0-9a-f]{64}", network_id) is None:
+            raise LifecycleError(
+                f"netem bridge creation returned no exact network id for {binding.instance}"
+            )
+        records.append(
+            {
+                "bridge": {
+                    "argv": list(create.argv),
+                    "network_id": network_id,
+                    "returncode": created.returncode,
+                },
+                "container": binding.container,
+                "instance": binding.instance,
+                "removal": {
+                    "network_inspect_argv": list(network_inspect_args(network_id)),
+                    "network_list_argv": list(network_list_args(binding, run_id)),
+                    "network_remove_argv": list(network_remove_args(network_id)),
+                },
+                "request": binding.as_dict(),
+            }
+        )
+    return {
+        "bindings": records,
+        "schema": NETEM_RECEIPT_SCHEMA,
+        "status": "CREATED" if records else "NOT_APPLIED",
+        "scenario_digest": scenario_digest,
+        "topology_digest": topology_digest,
+    }
+
+
 def _timeout_left(deadline: float, monotonic: Callable[[], float]) -> int:
     return max(1, int(deadline - monotonic() + 0.999))
 
@@ -3220,9 +3269,14 @@ def _remove_netem_bridges(
         if (
             not isinstance(network_document, Mapping)
             or network_document.get("schema") != NETEM_RECEIPT_SCHEMA
-            or network_document.get("status") != "APPLIED"
+            or network_document.get("status") not in {"CREATED", "APPLIED"}
         ):
             raise LifecycleError("netem creation receipt is not applied")
+        if network_document.get("status") == "CREATED" and (
+            network_document.get("scenario_digest") != plan["scenario_digest"]
+            or network_document.get("topology_digest") != plan["topology_digest"]
+        ):
+            raise LifecycleError("netem partial receipt is not bound to this plan")
         records = network_document.get("bindings", [])
         if isinstance(records, list):
             for record in records:
@@ -3293,6 +3347,8 @@ def _remove_netem_bridges(
             validate_network_inspect(
                 binding,
                 plan["run_id"],
+                plan["scenario_digest"],
+                plan["topology_digest"],
                 network_id,
                 _json_result(inspected, f"netem network {network_id} inspect"),
             )
@@ -3534,6 +3590,30 @@ def bring_up(
         execute(phases["up.prepare"], transport)
         execute(phases["up.prepare-persistent"], transport)
         create_results = execute(phases["up.network-create"], transport)
+        network_receipt = _netem_created_receipt(
+            plan["run_id"],
+            scenario.digest,
+            plan["topology_digest"],
+            netem_bindings,
+            create_results,
+            phases["up.network-create"],
+        )
+        if network_receipt["status"] == "CREATED":
+            _atomic_json(
+                bundle / "lifecycle.json",
+                {
+                    "farm": str(farm.path),
+                    "farm_digest": farm.digest,
+                    "network_shaping": network_receipt,
+                    "plan": plan,
+                    "run_id": plan["run_id"],
+                    "scenario": str(scenario.path),
+                    "scenario_digest": scenario.digest,
+                    "schema": LIFECYCLE_SCHEMA,
+                    "status": "STARTING",
+                    "topology_digest": plan["topology_digest"],
+                },
+            )
         execute(phases["up.start-s"], transport)
         scheduler = _wait_scheduler(
             farm,

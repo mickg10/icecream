@@ -536,7 +536,16 @@ def _planned_commands(
                     else "ssh-docker"
                 ),
                 timeout_s=timeout,
-                argv=docker_argv(farm, binding.host, create_args(binding, run_id)),
+                argv=docker_argv(
+                    farm,
+                    binding.host,
+                    create_args(
+                        binding,
+                        run_id,
+                        scenario_digest=scenario.digest,
+                        topology_digest=topology["topology_digest"],
+                    ),
+                ),
             )
         )
         sequence += 1

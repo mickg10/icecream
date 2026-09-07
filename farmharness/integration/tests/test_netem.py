@@ -9,9 +9,9 @@ import pytest
 from farmharness.integration import farmtest, lifecycle
 from farmharness.integration.collect import _network_shaping_observation
 from farmharness.integration.images import CommandFactory
-from farmharness.integration.lifecycle import LifecycleError
+from farmharness.integration.lifecycle import LifecycleError, bring_up
 from farmharness.integration.lifecycle import _netem_up_receipt
-from farmharness.integration.remote import CommandResult, PlannedCommand
+from farmharness.integration.remote import CommandResult, PlannedCommand, RemoteError
 from farmharness.integration.netem import (
     NetemPlanError,
     apply_args,
@@ -101,6 +101,13 @@ def test_shaped_worker_uses_private_bridge_and_container_tc_only(tmp_path: Path)
     assert f"{binding['host_port']}:{binding['container_port']}" in start_f["argv"]
     assert start_f["argv"].count("NET_ADMIN") == 1
     assert "host" not in start_f["argv"]
+    create = next(
+        item
+        for item in plan["commands"]
+        if item["phase"] == "up.network-create" and item["instance"] == "F1"
+    )
+    assert f"icefarm.scenario={plan['scenario_digest']}" in create["argv"]
+    assert f"icefarm.topology={plan['topology_digest']}" in create["argv"]
 
     for item in plan["commands"]:
         if item["phase"] not in {"up.netem-apply", "up.netem-observe"}:
@@ -328,7 +335,9 @@ def _write_creation_receipt(tmp_path: Path, farm, plan, network_id: str) -> None
     )
 
 
-def _network_document(binding, run_id: str, network_id: str) -> dict:
+def _network_document(binding, run_id: str, network_id: str, plan=None) -> dict:
+    scenario_digest = plan["scenario_digest"] if plan is not None else "a" * 64
+    topology_digest = plan["topology_digest"] if plan is not None else "b" * 64
     return {
         "Id": network_id,
         "Name": binding.bridge,
@@ -337,6 +346,8 @@ def _network_document(binding, run_id: str, network_id: str) -> dict:
             "icefarm.run": run_id,
             "icefarm.instance": binding.instance,
             "icefarm.netem": "icefarm-netem-plan-v1",
+            "icefarm.scenario": scenario_digest,
+            "icefarm.topology": topology_digest,
         },
     }
 
@@ -372,7 +383,9 @@ def test_netem_teardown_refuses_owned_name_replaced_by_different_id(tmp_path: Pa
     old_id = "a" * 64
     new_id = "b" * 64
     _write_creation_receipt(tmp_path, farm, plan, old_id)
-    recorder = _NetworkRecorder(new_id, _network_document(binding, plan["run_id"], new_id))
+    recorder = _NetworkRecorder(
+        new_id, _network_document(binding, plan["run_id"], new_id, plan)
+    )
     receipts, problems = lifecycle._remove_netem_bridges(
         farm, plan, (binding,), recorder, CommandFactory(), 30
     )
@@ -387,13 +400,75 @@ def test_netem_teardown_removes_exact_owned_network_id(tmp_path: Path) -> None:
     network_id = "a" * 64
     _write_creation_receipt(tmp_path, farm, plan, network_id)
     recorder = _NetworkRecorder(
-        network_id, _network_document(binding, plan["run_id"], network_id)
+        network_id, _network_document(binding, plan["run_id"], network_id, plan)
     )
     receipts, problems = lifecycle._remove_netem_bridges(
         farm, plan, (binding,), recorder, CommandFactory(), 30
     )
     assert not problems
     assert receipts[0]["status"] == "REMOVED"
+    remove = next(command for command in recorder.commands if command.phase == "down.network-remove")
+    assert network_id in remove.argv
+    assert binding.bridge not in remove.argv
+
+
+def test_bring_up_persists_network_id_before_later_start_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    farm, scenario, plan = _shaped_plan(tmp_path)
+    binding = lifecycle._netem_bindings(plan)[0]
+    network_id = "c" * 64
+    used_hosts = {
+        item["host"] for item in plan["topology"]["instances"]
+    }
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.commands: list[PlannedCommand] = []
+
+        def invoke(self, command: PlannedCommand) -> CommandResult:
+            self.commands.append(command)
+            if command.phase == "up.network-create":
+                return CommandResult(0, network_id + "\n", "")
+            if command.phase == "up.start-s":
+                raise RemoteError("injected start failure")
+            if command.phase == "down.network-list":
+                return CommandResult(0, network_id + "\n", "")
+            if command.phase == "down.network-inspect":
+                return CommandResult(
+                    0,
+                    json.dumps(_network_document(binding, plan["run_id"], network_id, plan)),
+                    "",
+                )
+            return CommandResult(0, "", "")
+
+    monkeypatch.setattr(
+        lifecycle,
+        "preflight",
+        lambda *args, **kwargs: {
+            "hosts": {host: {"protected": {}} for host in used_hosts}
+        },
+    )
+    monkeypatch.setattr(lifecycle, "collect_diagnostics", lambda *args, **kwargs: [])
+    monkeypatch.setattr(lifecycle, "_remove_run_containers", lambda *args, **kwargs: [])
+    monkeypatch.setattr(lifecycle, "_host_facts", lambda *args, **kwargs: {"protected": {}})
+    recorder = Recorder()
+
+    with pytest.raises(LifecycleError, match="injected start failure"):
+        bring_up(
+            farm,
+            scenario,
+            plan,
+            recorder=recorder,
+            probe_bytes=0,
+            sync_corpora=False,
+        )
+
+    lifecycle_path = Path(farm.data["hub"]["results_root"])
+    lifecycle_path = lifecycle_path / "results" / plan["run_id"] / "lifecycle.json"
+    failure = json.loads(lifecycle_path.read_text(encoding="utf-8"))
+    assert failure["network_shaping"]["status"] == "CREATED"
+    assert failure["network_shaping"]["bindings"][0]["bridge"]["network_id"] == network_id
     remove = next(command for command in recorder.commands if command.phase == "down.network-remove")
     assert network_id in remove.argv
     assert binding.bridge not in remove.argv
@@ -410,7 +485,13 @@ def test_network_inspect_requires_exact_authority() -> None:
             binding,
             "run",
             "a" * 64,
-            {"Id": "a" * 64, "Name": binding.bridge, "Driver": "bridge"},
+            "b" * 64,
+            "a" * 64,
+            {
+                "Id": "a" * 64,
+                "Name": binding.bridge,
+                "Driver": "bridge",
+            },
         )
 
 

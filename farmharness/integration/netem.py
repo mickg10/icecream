@@ -156,8 +156,15 @@ def resolve_bindings(
     )
 
 
-def create_args(binding: NetemBinding, run_id: str) -> tuple[str, ...]:
-    return (
+def create_args(
+    binding: NetemBinding,
+    run_id: str,
+    *,
+    scenario_digest: str | None = None,
+    topology_digest: str | None = None,
+) -> tuple[str, ...]:
+    _safe_run_id(run_id)
+    args = [
         "network",
         "create",
         "--driver",
@@ -168,8 +175,19 @@ def create_args(binding: NetemBinding, run_id: str) -> tuple[str, ...]:
         f"icefarm.instance={binding.instance}",
         "--label",
         f"icefarm.netem={NETEM_PLAN_SCHEMA}",
-        binding.bridge,
-    )
+    ]
+    if (scenario_digest is None) != (topology_digest is None):
+        raise NetemPlanError("netem authority labels must include both digests")
+    if scenario_digest is not None and topology_digest is not None:
+        for name, digest in (
+            ("scenario", scenario_digest),
+            ("topology", topology_digest),
+        ):
+            if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                raise NetemPlanError(f"netem {name} digest is not authenticated")
+            args.extend(("--label", f"icefarm.{name}={digest}"))
+    args.append(binding.bridge)
+    return tuple(args)
 
 
 def apply_args(binding: NetemBinding) -> tuple[str, ...]:
@@ -240,11 +258,19 @@ def network_remove_args(network_id: str) -> tuple[str, ...]:
 def validate_network_inspect(
     binding: NetemBinding,
     run_id: str,
+    scenario_digest: str,
+    topology_digest: str,
     network_id: str,
     value: object,
 ) -> dict[str, Any]:
     """Authenticate a freshly inspected private bridge before removing it."""
 
+    _safe_run_id(run_id)
+    if any(
+        re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        for digest in (scenario_digest, topology_digest)
+    ):
+        raise NetemPlanError("netem authority digest is not authenticated")
     if re.fullmatch(r"[0-9a-f]{64}", network_id) is None:
         raise NetemPlanError("netem network id is not authenticated")
     if not isinstance(value, Mapping):
@@ -258,6 +284,8 @@ def validate_network_inspect(
         "icefarm.run": run_id,
         "icefarm.instance": binding.instance,
         "icefarm.netem": NETEM_PLAN_SCHEMA,
+        "icefarm.scenario": scenario_digest,
+        "icefarm.topology": topology_digest,
     }
     if not isinstance(labels, Mapping) or any(labels.get(k) != v for k, v in expected.items()):
         raise NetemPlanError("netem network labels are not authenticated")
@@ -527,7 +555,15 @@ def validate_receipt(
         raise NetemPlanError("netem observation argv differs from the immutable plan")
     run_id = plan["run_id"]
     semantic_commands = (
-        ("up.network-create", create_args(binding, run_id)),
+        (
+            "up.network-create",
+            create_args(
+                binding,
+                run_id,
+                scenario_digest=plan["scenario_digest"],
+                topology_digest=plan["topology_digest"],
+            ),
+        ),
         ("up.netem-apply", apply_args(binding)),
         ("up.netem-observe", observe_args(binding)),
     )
