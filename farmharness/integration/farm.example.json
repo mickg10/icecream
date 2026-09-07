@@ -216,9 +216,9 @@
         "daemon": {"sha256": "d784931378fbba8464541a11fd4557aa47fff528159482350b4b5e27be3741ab"}
       },
       "50": {
-        "scheduler": {"sha256": "ab1e6034b51401210fcf6bce637930e3dd9fdc0043e7f6da6aae5cb60d28e882"},
-        "client": {"sha256": "533b80375e8c233e5efcda959a0f83c29ffdaafa799a67770960c57e59b191b1"},
-        "daemon": {"sha256": "0e9c1f0176f76ac7512bbabcca88a12837d2ec6d84c83ac22173e3d007e339ed"}
+        "scheduler": {"sha256": "e04be1cbf3d4bd29a47785eff31a06a8d58f1bbe11e119a0f74cf18276dfefd3"},
+        "client": {"sha256": "75c06485142f70a4fea1d35818acacc93c1ba528a7c37420eb80ba7fe3d8a672"},
+        "daemon": {"sha256": "2a252e5eb09259a39b78aa9d9277d557c57e1ecf87408057fdcd8f1056cc61e5"}
       }
     },
     "images": {
@@ -275,6 +275,12 @@
         "archive_sha256": "f6e7ca49a4458d1c69955a2224287837707a90dfd8a47d6438bab8818dd8de6e",
         "closure_sha256": "eb7a7b841e780486b9fe725c02efb52797330946197e2b34932d8652e4153ce4",
         "id": "sha256:d1078f2f65a09b209971e44df32941eaa454ed5681299f78bf5013287a37431a"
+      },
+      "p50s4-57a1e336": {
+        "commit": "57a1e33624d324e52c1d17481fcc43046eaa3139",
+        "archive_sha256": "41e543b313171d0a9684fa772e976489bccc07925326511885dcf2aaec5edcd7",
+        "closure_sha256": "b8aa267a40f2beb17bbb53de165ab1e744b13ddc2e2fe39eee1486d57947cb0a",
+        "id": "sha256:585bfe31a140a418dcfee9f0d876513f7f025eb5b7f273c095a8761f05870699"
       },
       "p50s4-b42d65e8": {
         "commit": "b42d65e8ac9e90e05ee6d3a19cd371a40dad3277",
@@ -334,6 +340,25 @@
         "role_overrides": {
           "daemon": {
             "sha256": "0e9c1f0176f76ac7512bbabcca88a12837d2ec6d84c83ac22173e3d007e339ed"
+          }
+        }
+      },
+      "p50s30-f-refusal-57a1e336": {
+        "kind": "daemon-mutant",
+        "base_image": "p50s4-57a1e336",
+        "base_commit": "57a1e33624d324e52c1d17481fcc43046eaa3139",
+        "base_archive_sha256": "41e543b313171d0a9684fa772e976489bccc07925326511885dcf2aaec5edcd7",
+        "commit": "57a1e33624d324e52c1d17481fcc43046eaa3139",
+        "archive_sha256": "df16c00bd7e2775175f0ee49919adacb98938cdcd9bb9e65c7230e4c2bb4cf6a",
+        "closure_sha256": "33e02567fdd2ae5ad4de3a55c47a759cf7d95aa7ba6c45ec056153d57ed0575f",
+        "id": "sha256:59426f028bb239adbb9311b3c320496adcf76abe6f328c5b6c99d02c956410d9",
+        "patch_path": "mutants/daemon-session-refuse.patch",
+        "patch_sha256": "4b1963c4081e2d0f20800db53363940c1ebea128ccdb3665691b270224a7306c",
+        "recipe_schema": "icefarm-daemon-mutant-recipe-v1",
+        "recipe_sha256": "df16c00bd7e2775175f0ee49919adacb98938cdcd9bb9e65c7230e4c2bb4cf6a",
+        "role_overrides": {
+          "daemon": {
+            "sha256": "2a252e5eb09259a39b78aa9d9277d557c57e1ecf87408057fdcd8f1056cc61e5"
           }
         }
       },

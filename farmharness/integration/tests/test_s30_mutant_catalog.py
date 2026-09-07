@@ -24,15 +24,15 @@ def test_s30_mutant_f_refusal_is_a_checked_in_single_cell() -> None:
         )
     )
     assert scenario["shape"] == "S'C'F'"
-    assert scenario["images"]["new"] == "p50s4-2deb91d6"
-    assert scenario["images"]["mutant"] == "p50s30-f-refusal-2deb91d6"
+    assert scenario["images"]["new"] == "p50s4-57a1e336"
+    assert scenario["images"]["mutant"] == "p50s30-f-refusal-57a1e336"
     assert scenario["expect"]["exact"] == "all"
     assert scenario["expect"]["error106_max"] == 100
     assert scenario["expect"]["reuse"] == "none-when-legacy"
     assert scenario["expect"]["tail_to_incapable"] == 0
 
 
-def test_s30_mutant_f_resolves_the_hash_bound_unpromoted_candidate() -> None:
+def test_s30_mutant_f_resolves_the_hash_bound_promoted_image() -> None:
     farm = load_farm_spec(farm_fixture.example_farm_path())
     path = INTEGRATION / "scenarios" / "S30-mutant-f-refusal.json"
     scenario = load_scenario_spec(path, farm)
@@ -41,6 +41,14 @@ def test_s30_mutant_f_resolves_the_hash_bound_unpromoted_candidate() -> None:
         item for item in plan["topology"]["instances"] if item["role"] == "F"
     )
 
-    assert worker["image"]["label"] == "p50s30-f-refusal-2deb91d6"
+    assert worker["image"]["label"] == "p50s30-f-refusal-57a1e336"
     assert worker["image"]["kind"] == "daemon-mutant"
-    assert "closure_sha256" not in worker["image"]
+    assert worker["image"]["closure_sha256"] == (
+        "33e02567fdd2ae5ad4de3a55c47a759cf7d95aa7ba6c45ec056153d57ed0575f"
+    )
+    assert worker["image"]["id"] == (
+        "sha256:59426f028bb239adbb9311b3c320496adcf76abe6f328c5b6c99d02c956410d9"
+    )
+    assert worker["image"]["role_overrides"]["daemon"]["sha256"] == (
+        "2a252e5eb09259a39b78aa9d9277d557c57e1ecf87408057fdcd8f1056cc61e5"
+    )

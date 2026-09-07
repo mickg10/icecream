@@ -76,11 +76,12 @@ def test_image_make_target_is_scratch_routed() -> None:
     assert (
         '--labels "p43-1.4.0,p50s2-5b2e5801,p50s4-89917385,'
         'p50s4-b42d65e8,p50s4-0c820e79,p50s4-2deb91d6,'
-        'p50s4-h3-tail-mutant"'
+        'p50s4-57a1e336,p50s4-h3-tail-mutant"'
     ) in result.stdout
     assert "p50s30-f-refusal-mutant-candidate" not in result.stdout
     assert "p50s30-f-refusal-0c820e79" not in result.stdout
     assert "p50s30-f-refusal-2deb91d6" not in result.stdout
+    assert "p50s30-f-refusal-57a1e336" not in result.stdout
     assert "p50s90-f-revision-2-candidate" not in result.stdout
     assert '--repo "' in result.stdout
 
@@ -142,10 +143,11 @@ def test_source_archive_make_target_is_explicit_and_scratch_routed() -> None:
     assert (
         '--labels "p43-1.4.0,p50s2-5b2e5801,p50s4-89917385,'
         'p50s4-b42d65e8,p50s4-0c820e79,p50s4-2deb91d6,'
-        'p50s4-h3-tail-mutant,'
+        'p50s4-57a1e336,p50s4-h3-tail-mutant,'
         'p50s30-f-refusal-mutant-candidate,'
         'p50s30-f-refusal-0c820e79,'
         'p50s30-f-refusal-2deb91d6,'
+        'p50s30-f-refusal-57a1e336,'
         'p50s90-f-revision-2-candidate"'
     ) in result.stdout
 
@@ -175,6 +177,7 @@ def test_autotools_source_exposes_the_same_required_targets() -> None:
     assert "ICEFARM_SOURCE_LABELS" in text
     assert "ICEFARM_SOURCE_ARCHIVE_DIR" in text
     assert "p50s30-f-refusal-mutant-candidate" not in image_target
+    assert "p50s30-f-refusal-57a1e336" not in image_target
     assert "p50s90-f-revision-2-candidate" not in image_target
     assert "foundations.json" in image_target
     assert "sealed-products.json" in image_target
