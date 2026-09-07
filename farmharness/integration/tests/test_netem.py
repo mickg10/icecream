@@ -15,11 +15,14 @@ from farmharness.integration.remote import CommandResult, PlannedCommand
 from farmharness.integration.netem import (
     NetemPlanError,
     apply_args,
+    network_inspect_args,
+    network_list_args,
+    network_remove_args,
     observe_args,
-    remove_args,
     resolve_bindings,
     validate_receipt,
     validate_qdisc,
+    validate_network_inspect,
 )
 from farmharness.integration.verdict import _network_shaping_errors
 from farmharness.integration.tests.test_lifecycle import _farm_scenario_plan
@@ -57,6 +60,7 @@ def _applied_receipt(scenario, plan):
         )
 
     return _netem_up_receipt(
+        plan["run_id"],
         (binding,),
         [CommandResult(0, "a" * 64 + "\n", "")],
         [CommandResult(0, "", "")],
@@ -75,6 +79,7 @@ def test_shaped_worker_uses_private_bridge_and_container_tc_only(tmp_path: Path)
         "container": "icefarm-shaped-run-F1",
         "container_port": plan["ports"]["instances"]["F1"],
         "delay_ms": 2,
+        "direction": "F-egress",
         "host": "tt-quietbox3",
         "host_port": plan["ports"]["instances"]["F1"],
         "instance": "F1",
@@ -138,7 +143,7 @@ def test_netem_witness_is_authenticated_and_tamper_fails() -> None:
         validate_qdisc(binding, witness.replace("2.0ms", "3.0ms"))
     assert apply_args(binding)[3] == binding.container
     assert observe_args(binding)[3] == binding.container
-    assert remove_args(binding)[3] == binding.container
+    assert network_remove_args("a" * 64)[-1] == "a" * 64
 
 
 def test_netem_plan_rejects_tampered_identity() -> None:
@@ -153,6 +158,7 @@ def test_netem_plan_rejects_tampered_identity() -> None:
                     "container": "icefarm-run-F1",
                     "container_port": 23102,
                     "delay_ms": 2,
+                    "direction": "F-egress",
                     "host": "q3",
                     "host_port": 23102,
                     "instance": "F1",
@@ -198,6 +204,7 @@ def test_netem_lifecycle_receipt_binds_application_witness_and_removal() -> None
         return PlannedCommand(1, phase, "q3", "F1", "docker-context", 30, argv)
 
     receipt = _netem_up_receipt(
+        "run",
         (binding,),
         [CommandResult(0, "a" * 64 + "\n", "")],
         [CommandResult(0, "", "")],
@@ -209,7 +216,15 @@ def test_netem_lifecycle_receipt_binds_application_witness_and_removal() -> None
     record = receipt["bindings"][0]
     assert receipt["status"] == "APPLIED"
     assert record["request"]["rate"] == "100mbit"
-    assert record["removal"]["container_argv"] == list(remove_args(binding))
+    assert record["removal"]["network_list_argv"] == list(
+        network_list_args(binding, "run")
+    )
+    assert record["removal"]["network_inspect_argv"] == list(
+        network_inspect_args("a" * 64)
+    )
+    assert record["removal"]["network_remove_argv"] == list(
+        network_remove_args("a" * 64)
+    )
     assert record["observation"]["witness"]["delay_ms"] == 2
 
 
@@ -244,7 +259,7 @@ def test_netem_applied_receipt_is_bound_by_collector_and_pure_verdict(
         lambda value: value["bindings"][0]["observation"]["witness"].__setitem__(
             "rate", "25mbit"
         ),
-        lambda value: value["bindings"][0]["removal"]["container_argv"].append(
+        lambda value: value["bindings"][0]["removal"]["network_remove_argv"].append(
             "extra"
         ),
     ),
@@ -276,50 +291,127 @@ def test_netem_coherent_plan_and_receipt_command_tamper_fails_closed(
         validate_receipt(scenario.data, plan, receipt)
 
 
-def test_netem_teardown_reauthenticates_and_targets_container_id(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    farm, _scenario, plan = _shaped_plan(tmp_path)
-    binding = lifecycle._netem_bindings(plan)[0]
-    container_id = "b" * 64
-    monkeypatch.setattr(
-        lifecycle,
-        "_labelled_containers",
-        lambda *_args, **_kwargs: [
+class _NetworkRecorder:
+    def __init__(self, network_ids: str, inspect: dict | None = None) -> None:
+        self.commands: list[PlannedCommand] = []
+        self.network_ids = network_ids
+        self.inspect = inspect
+
+    def invoke(self, command: PlannedCommand) -> CommandResult:
+        self.commands.append(command)
+        if command.phase == "down.network-list":
+            return CommandResult(0, self.network_ids, "")
+        if command.phase == "down.network-inspect":
+            return CommandResult(0, json.dumps(self.inspect), "")
+        return CommandResult(0, "", "")
+
+
+def _write_creation_receipt(tmp_path: Path, farm, plan, network_id: str) -> None:
+    root = Path(farm.data["hub"]["results_root"]) / "results" / plan["run_id"]
+    root.mkdir(parents=True)
+    (root / "lifecycle.json").write_text(
+        json.dumps(
             {
-                "created": "2026-09-07T00:00:00Z",
-                "id": container_id,
-                "name": binding.container,
-                "run_id": plan["run_id"],
+                "network_shaping": {
+                    "bindings": [
+                        {
+                            "instance": "F1",
+                            "bridge": {"network_id": network_id},
+                        }
+                    ],
+                    "schema": "icefarm-netem-receipt-v1",
+                    "status": "APPLIED",
+                }
             }
-        ],
+        ),
+        encoding="utf-8",
     )
 
-    class Recorder:
-        def __init__(self) -> None:
-            self.commands = []
 
-        def invoke(self, command: PlannedCommand) -> CommandResult:
-            self.commands.append(command)
-            return CommandResult(0, "", "")
+def _network_document(binding, run_id: str, network_id: str) -> dict:
+    return {
+        "Id": network_id,
+        "Name": binding.bridge,
+        "Driver": "bridge",
+        "Labels": {
+            "icefarm.run": run_id,
+            "icefarm.instance": binding.instance,
+            "icefarm.netem": "icefarm-netem-plan-v1",
+        },
+    }
 
-    recorder = Recorder()
-    receipts, problems = lifecycle._remove_netem(
+
+def test_netem_teardown_refuses_unlabelled_bridge_name_collision(tmp_path: Path) -> None:
+    farm, _scenario, plan = _shaped_plan(tmp_path)
+    binding = lifecycle._netem_bindings(plan)[0]
+    _write_creation_receipt(tmp_path, farm, plan, "a" * 64)
+    recorder = _NetworkRecorder("")
+    receipts, problems = lifecycle._remove_netem_bridges(
         farm, plan, (binding,), recorder, CommandFactory(), 30
     )
     assert not problems
-    assert receipts[0]["container_id"] == container_id
-    command = recorder.commands[-1]
-    assert command.phase == "down.netem-remove"
-    assert container_id in command.argv
-    assert binding.container not in command.argv
+    assert receipts[0]["status"] == "SKIPPED_NO_AUTHENTICATED_NETWORK"
+    assert not any(command.phase == "down.network-remove" for command in recorder.commands)
 
 
-def test_netem_removal_refuses_an_unauthenticated_target(tmp_path: Path) -> None:
+def test_netem_teardown_refuses_foreign_container_name_collision(tmp_path: Path) -> None:
     _farm, _scenario, plan = _shaped_plan(tmp_path)
     binding = lifecycle._netem_bindings(plan)[0]
-    with pytest.raises(NetemPlanError, match="authenticated container id"):
-        remove_args(binding, "other-container")
+    recorder = _NetworkRecorder("")
+    receipts, problems = lifecycle._remove_netem_bridges(
+        _farm, plan, (binding,), recorder, CommandFactory(), 30
+    )
+    assert not problems
+    assert receipts[0]["status"] == "SKIPPED_NO_AUTHENTICATED_NETWORK"
+    assert not any("tc" in argument for command in recorder.commands for argument in command.argv)
+
+
+def test_netem_teardown_refuses_owned_name_replaced_by_different_id(tmp_path: Path) -> None:
+    farm, _scenario, plan = _shaped_plan(tmp_path)
+    binding = lifecycle._netem_bindings(plan)[0]
+    old_id = "a" * 64
+    new_id = "b" * 64
+    _write_creation_receipt(tmp_path, farm, plan, old_id)
+    recorder = _NetworkRecorder(new_id, _network_document(binding, plan["run_id"], new_id))
+    receipts, problems = lifecycle._remove_netem_bridges(
+        farm, plan, (binding,), recorder, CommandFactory(), 30
+    )
+    assert not receipts
+    assert any("replacement-id" in problem for problem in problems)
+    assert not any(command.phase == "down.network-remove" for command in recorder.commands)
+
+
+def test_netem_teardown_removes_exact_owned_network_id(tmp_path: Path) -> None:
+    farm, _scenario, plan = _shaped_plan(tmp_path)
+    binding = lifecycle._netem_bindings(plan)[0]
+    network_id = "a" * 64
+    _write_creation_receipt(tmp_path, farm, plan, network_id)
+    recorder = _NetworkRecorder(
+        network_id, _network_document(binding, plan["run_id"], network_id)
+    )
+    receipts, problems = lifecycle._remove_netem_bridges(
+        farm, plan, (binding,), recorder, CommandFactory(), 30
+    )
+    assert not problems
+    assert receipts[0]["status"] == "REMOVED"
+    remove = next(command for command in recorder.commands if command.phase == "down.network-remove")
+    assert network_id in remove.argv
+    assert binding.bridge not in remove.argv
+
+
+def test_network_inspect_requires_exact_authority() -> None:
+    binding = type(
+        "Binding",
+        (),
+        {"bridge": "icefarm-run-F1-netem", "instance": "F1"},
+    )()
+    with pytest.raises(NetemPlanError, match="labels"):
+        validate_network_inspect(
+            binding,
+            "run",
+            "a" * 64,
+            {"Id": "a" * 64, "Name": binding.bridge, "Driver": "bridge"},
+        )
 
 
 @pytest.mark.parametrize(

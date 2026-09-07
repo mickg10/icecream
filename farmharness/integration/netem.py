@@ -23,6 +23,7 @@ except ImportError:  # Direct execution from this directory.
 NETEM_PLAN_SCHEMA = "icefarm-netem-plan-v1"
 NETEM_RECEIPT_SCHEMA = "icefarm-netem-receipt-v1"
 SUPPORTED_RATE = "100mbit"
+SHAPING_DIRECTION = "F-egress"
 _RATE_RE = re.compile(r"^(?P<amount>[1-9][0-9]*)(?P<unit>kbit|mbit|gbit)$")
 _QDISC_RE = re.compile(r"\bqdisc\s+netem\b", re.IGNORECASE)
 
@@ -42,6 +43,7 @@ class NetemBinding:
     host_port: int
     container_port: int
     container: str
+    direction: str = SHAPING_DIRECTION
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -49,6 +51,7 @@ class NetemBinding:
             "container": self.container,
             "container_port": self.container_port,
             "delay_ms": self.delay_ms,
+            "direction": self.direction,
             "host": self.host,
             "host_port": self.host_port,
             "instance": self.instance,
@@ -205,28 +208,66 @@ def observe_args(binding: NetemBinding) -> tuple[str, ...]:
     )
 
 
-def remove_args(
-    binding: NetemBinding, container: str | None = None
-) -> tuple[str, ...]:
-    target = binding.container if container is None else container
-    if target != binding.container and re.fullmatch(r"[0-9a-f]{12,64}", target) is None:
-        raise NetemPlanError("netem removal target is not an authenticated container id")
+def network_list_args(binding: NetemBinding, run_id: str) -> tuple[str, ...]:
+    _safe_run_id(run_id)
     return (
-        "exec",
-        "--user",
-        "0",
-        target,
-        "tc",
-        "qdisc",
-        "del",
-        "dev",
-        "eth0",
-        "root",
+        "network",
+        "ls",
+        "--no-trunc",
+        "--filter",
+        f"label=icefarm.run={run_id}",
+        "--filter",
+        f"label=icefarm.instance={binding.instance}",
+        "--filter",
+        f"label=icefarm.netem={NETEM_PLAN_SCHEMA}",
+        "--format",
+        "{{.ID}}",
     )
 
 
-def network_remove_args(binding: NetemBinding) -> tuple[str, ...]:
-    return ("network", "rm", binding.bridge)
+def network_inspect_args(network_id: str) -> tuple[str, ...]:
+    if re.fullmatch(r"[0-9a-f]{64}", network_id) is None:
+        raise NetemPlanError("netem network id is not authenticated")
+    return ("network", "inspect", "--format", "{{json .}}", network_id)
+
+
+def network_remove_args(network_id: str) -> tuple[str, ...]:
+    if re.fullmatch(r"[0-9a-f]{64}", network_id) is None:
+        raise NetemPlanError("netem network id is not authenticated")
+    return ("network", "rm", network_id)
+
+
+def validate_network_inspect(
+    binding: NetemBinding,
+    run_id: str,
+    network_id: str,
+    value: object,
+) -> dict[str, Any]:
+    """Authenticate a freshly inspected private bridge before removing it."""
+
+    if re.fullmatch(r"[0-9a-f]{64}", network_id) is None:
+        raise NetemPlanError("netem network id is not authenticated")
+    if not isinstance(value, Mapping):
+        raise NetemPlanError("netem network inspect is not an object")
+    if value.get("Id") != network_id or value.get("Name") != binding.bridge:
+        raise NetemPlanError("netem network identity differs from the plan")
+    if value.get("Driver") != "bridge":
+        raise NetemPlanError("netem network driver is not bridge")
+    labels = value.get("Labels")
+    expected = {
+        "icefarm.run": run_id,
+        "icefarm.instance": binding.instance,
+        "icefarm.netem": NETEM_PLAN_SCHEMA,
+    }
+    if not isinstance(labels, Mapping) or any(labels.get(k) != v for k, v in expected.items()):
+        raise NetemPlanError("netem network labels are not authenticated")
+    return {
+        "driver": "bridge",
+        "id": network_id,
+        "instance": binding.instance,
+        "labels": expected,
+        "name": binding.bridge,
+    }
 
 
 def validate_qdisc(binding: NetemBinding, output: str) -> dict[str, Any]:
@@ -258,11 +299,15 @@ def validate_plan(value: object) -> tuple[dict[str, Any], ...]:
     result: list[dict[str, Any]] = []
     for binding in bindings:
         if not isinstance(binding, Mapping) or set(binding) != {
-            "bridge", "container", "container_port", "delay_ms", "host",
-            "host_port", "instance", "rate", "role",
+            "bridge", "container", "container_port", "delay_ms", "direction",
+            "host", "host_port", "instance", "rate", "role",
         }:
             raise NetemPlanError("netem plan binding fields are invalid")
-        if binding["role"] != "F" or binding["rate"] != SUPPORTED_RATE:
+        if (
+            binding["role"] != "F"
+            or binding["rate"] != SUPPORTED_RATE
+            or binding["direction"] != SHAPING_DIRECTION
+        ):
             raise NetemPlanError("netem plan binding is outside the supported seam")
         for field in ("instance", "host", "bridge", "container"):
             if not isinstance(binding[field], str) or not binding[field]:
@@ -457,8 +502,9 @@ def validate_receipt(
     }:
         raise NetemPlanError("netem observation receipt is invalid")
     if not isinstance(removal, Mapping) or set(removal) != {
-        "container_argv",
-        "network_argv",
+        "network_inspect_argv",
+        "network_list_argv",
+        "network_remove_argv",
     }:
         raise NetemPlanError("netem removal receipt is invalid")
     network_id = bridge.get("network_id")
@@ -488,9 +534,12 @@ def validate_receipt(
     for phase, expected in semantic_commands:
         if _planned_docker_args(plan, binding, phase) != expected:
             raise NetemPlanError(f"netem {phase} command differs from the safe seam")
-    if removal.get("container_argv") != list(remove_args(binding)) or removal.get(
-        "network_argv"
-    ) != list(network_remove_args(binding)):
+    if (
+        removal.get("network_list_argv")
+        != list(network_list_args(binding, run_id))
+        or removal.get("network_inspect_argv") != list(network_inspect_args(network_id))
+        or removal.get("network_remove_argv") != list(network_remove_args(network_id))
+    ):
         raise NetemPlanError("netem removal argv differs from the plan binding")
     witness = observation.get("witness")
     if not isinstance(witness, Mapping) or set(witness) != {"delay_ms", "rate", "text"}:

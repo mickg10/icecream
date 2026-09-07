@@ -27,8 +27,10 @@ try:
         NetemPlanError,
         validate_plan as validate_netem_plan,
         validate_qdisc,
-        remove_args,
+        network_list_args,
+        network_inspect_args,
         network_remove_args,
+        validate_network_inspect,
     )
     from .remote import (
         CommandResult,
@@ -59,8 +61,10 @@ except ImportError:  # Direct execution from this directory.
         NetemPlanError,
         validate_plan as validate_netem_plan,
         validate_qdisc,
-        remove_args,
+        network_list_args,
+        network_inspect_args,
         network_remove_args,
+        validate_network_inspect,
     )
     from remote import (
         CommandResult,
@@ -2584,12 +2588,14 @@ def _netem_bindings(plan: Mapping[str, Any]) -> tuple[NetemBinding, ...]:
                 host_port=value["host_port"],
                 container_port=value["container_port"],
                 container=value["container"],
+                direction=value["direction"],
             )
         )
     return tuple(result)
 
 
 def _netem_up_receipt(
+    run_id: str,
     bindings: tuple[NetemBinding, ...],
     create_results: list[CommandResult],
     apply_results: list[CommandResult],
@@ -2642,8 +2648,11 @@ def _netem_up_receipt(
                 "instance": binding.instance,
                 "request": binding.as_dict(),
                 "removal": {
-                    "container_argv": list(remove_args(binding)),
-                    "network_argv": list(network_remove_args(binding)),
+                    "network_inspect_argv": list(network_inspect_args(network_id)),
+                    "network_list_argv": list(
+                        network_list_args(binding, run_id)
+                    ),
+                    "network_remove_argv": list(network_remove_args(network_id)),
                 },
                 "observation": {
                     "argv": list(observe.argv),
@@ -3183,7 +3192,7 @@ def collect_diagnostics(
     return problems
 
 
-def _remove_netem(
+def _remove_netem_bridges(
     farm: FarmSpec,
     plan: Mapping[str, Any],
     bindings: tuple[NetemBinding, ...],
@@ -3191,100 +3200,136 @@ def _remove_netem(
     factory: CommandFactory,
     timeout_s: int,
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Remove qdiscs from the exact shaped containers."""
+    """Remove only the freshly inspected network created for this run.
+
+    The container namespace owns the qdisc, so removing the exact labelled
+    container is sufficient to tear it down.  Network removal is separately
+    authenticated by a fresh ID lookup and inspect; a planned name is never a
+    sufficient target.
+    """
 
     receipts: list[dict[str, Any]] = []
     problems: list[str] = []
+    if not bindings:
+        return receipts, problems
+    expected: dict[str, str] = {}
+    lifecycle_path = bundle_root(farm, plan["run_id"]) / "lifecycle.json"
+    try:
+        document = json.loads(lifecycle_path.read_text(encoding="utf-8"))
+        network_document = document.get("network_shaping")
+        if (
+            not isinstance(network_document, Mapping)
+            or network_document.get("schema") != NETEM_RECEIPT_SCHEMA
+            or network_document.get("status") != "APPLIED"
+        ):
+            raise LifecycleError("netem creation receipt is not applied")
+        records = network_document.get("bindings", [])
+        if isinstance(records, list):
+            for record in records:
+                if not isinstance(record, Mapping):
+                    continue
+                instance = record.get("instance")
+                network_id = record.get("bridge", {}).get("network_id")
+                if (
+                    isinstance(instance, str)
+                    and isinstance(network_id, str)
+                    and re.fullmatch(r"[0-9a-f]{64}", network_id)
+                ):
+                    expected[instance] = network_id
+    except (OSError, json.JSONDecodeError, AttributeError):
+        expected = {}
+
     for binding in bindings:
         try:
-            present = [
-                item
-                for item in _labelled_containers(
-                    farm, binding.host, recorder, factory, timeout_s
-                )
-                if item["run_id"] == plan["run_id"]
-                and item["name"] == binding.container
-            ]
-        except (RemoteError, LifecycleError) as exc:
-            problems.append(f"{binding.instance}:qdisc-identity:{exc}")
-            continue
-        if not present:
-            receipts.append(
-                {
-                    "instance": binding.instance,
-                    "status": "SKIPPED_CONTAINER_NOT_STARTED",
-                }
-            )
-            continue
-        if len(present) != 1:
-            problems.append(f"{binding.instance}:qdisc-identity:ambiguous-container")
-            continue
-        container_id = present[0]["id"]
-        try:
-            command = _command(
+            list_command = _command(
                 factory,
-                phase="down.netem-remove",
+                phase="down.network-list",
                 host=binding.host,
                 instance=binding.instance,
                 transport=_docker_transport(farm, binding.host),
                 timeout_s=timeout_s,
                 argv=docker_argv(
-                    farm, binding.host, remove_args(binding, container_id)
+                    farm,
+                    binding.host,
+                    network_list_args(binding, plan["run_id"]),
                 ),
             )
-            result = recorder.invoke(command)
-            receipts.append(
-                {
-                    "argv": list(command.argv),
-                    "container_id": container_id,
-                    "instance": binding.instance,
-                    "returncode": result.returncode,
-                    "stderr": result.stderr,
-                    "stdout": result.stdout,
-                }
+            listed = recorder.invoke(list_command)
+            if listed.returncode != 0:
+                problems.append(f"{binding.instance}:network-list:rc={listed.returncode}")
+                continue
+            candidates = listed.stdout.split()
+            if not candidates:
+                receipts.append(
+                    {
+                        "instance": binding.instance,
+                        "status": "SKIPPED_NO_AUTHENTICATED_NETWORK",
+                        "list_argv": list(list_command.argv),
+                    }
+                )
+                continue
+            if len(candidates) != 1 or any(
+                re.fullmatch(r"[0-9a-f]{64}", value) is None for value in candidates
+            ):
+                problems.append(f"{binding.instance}:network-identity:ambiguous-or-unsafe-list")
+                continue
+            network_id = candidates[0]
+            expected_id = expected.get(binding.instance)
+            if expected_id is None:
+                problems.append(f"{binding.instance}:network-identity:missing-creation-receipt")
+                continue
+            inspect_command = _command(
+                factory,
+                phase="down.network-inspect",
+                host=binding.host,
+                instance=binding.instance,
+                transport=_docker_transport(farm, binding.host),
+                timeout_s=timeout_s,
+                argv=docker_argv(
+                    farm, binding.host, network_inspect_args(network_id)
+                ),
             )
-            if result.returncode != 0:
-                problems.append(f"{binding.instance}:qdisc-remove:rc={result.returncode}")
-        except (RemoteError, LifecycleError) as exc:
-            problems.append(f"{binding.instance}:qdisc-remove:{exc}")
-    return receipts, problems
-
-
-def _remove_netem_bridges(
-    farm: FarmSpec,
-    bindings: tuple[NetemBinding, ...],
-    recorder: Recorder,
-    factory: CommandFactory,
-    timeout_s: int,
-) -> tuple[list[dict[str, Any]], list[str]]:
-    receipts: list[dict[str, Any]] = []
-    problems: list[str] = []
-    for binding in bindings:
-        try:
-            command = _command(
+            inspected = recorder.invoke(inspect_command)
+            validate_network_inspect(
+                binding,
+                plan["run_id"],
+                network_id,
+                _json_result(inspected, f"netem network {network_id} inspect"),
+            )
+            if network_id != expected_id:
+                problems.append(
+                    f"{binding.instance}:network-identity:replacement-id:{network_id}"
+                )
+                continue
+            remove_command = _command(
                 factory,
                 phase="down.network-remove",
                 host=binding.host,
                 instance=binding.instance,
                 transport=_docker_transport(farm, binding.host),
                 timeout_s=timeout_s,
-                argv=docker_argv(farm, binding.host, network_remove_args(binding)),
+                argv=docker_argv(
+                    farm, binding.host, network_remove_args(network_id)
+                ),
             )
-            result = recorder.invoke(command)
+            result = recorder.invoke(remove_command)
             receipts.append(
                 {
-                    "argv": list(command.argv),
-                    "bridge": binding.bridge,
+                    "inspect_argv": list(inspect_command.argv),
                     "instance": binding.instance,
+                    "list_argv": list(list_command.argv),
+                    "network_id": network_id,
+                    "remove_argv": list(remove_command.argv),
                     "returncode": result.returncode,
                     "stderr": result.stderr,
                     "stdout": result.stdout,
+                    "status": "REMOVED" if result.returncode == 0 else "REMOVE_FAILED",
                 }
             )
             if result.returncode != 0:
                 problems.append(f"{binding.instance}:bridge-remove:rc={result.returncode}")
         except (RemoteError, LifecycleError) as exc:
-            problems.append(f"{binding.instance}:bridge-remove:{exc}")
+            problems.append(f"{binding.instance}:network-identity:{exc}")
     return receipts, problems
 
 
@@ -3347,15 +3392,11 @@ def tear_down(
 ) -> dict[str, Any]:
     timeout_s = plan.get("timeouts", {}).get("down_s", 300)
     bindings = _netem_bindings(plan)
-    network_receipts, network_problems = _remove_netem(
+    problems = _remove_run_containers(farm, plan, recorder, factory, timeout_s)
+    network_receipts, network_problems = _remove_netem_bridges(
         farm, plan, bindings, recorder, factory, timeout_s
     )
-    problems = _remove_run_containers(farm, plan, recorder, factory, timeout_s)
-    bridge_receipts, bridge_problems = _remove_netem_bridges(
-        farm, bindings, recorder, factory, timeout_s
-    )
-    network_receipts.extend(bridge_receipts)
-    problems = [*network_problems, *problems, *bridge_problems]
+    problems = [*problems, *network_problems]
     for instance in plan["topology"]["instances"]:
         root = instance_root(farm, instance["host"], plan["run_id"], instance["name"])
         reference = instance["container_image"]["reference"]
@@ -3507,6 +3548,7 @@ def bring_up(
         apply_results = execute(phases["up.netem-apply"], transport)
         observe_results = execute(phases["up.netem-observe"], transport)
         network_receipt = _netem_up_receipt(
+            plan["run_id"],
             netem_bindings,
             create_results,
             apply_results,

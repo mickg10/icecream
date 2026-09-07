@@ -698,6 +698,7 @@ def test_checked_in_shaped_s80_is_a_separate_same_host_p29v1_pair() -> None:
             "container": "icefarm-shaped-checked-in-F1",
             "container_port": plan["ports"]["instances"]["F1"],
             "delay_ms": 2,
+            "direction": "F-egress",
             "host": "tt-quietbox3",
             "host_port": plan["ports"]["instances"]["F1"],
             "instance": "F1",

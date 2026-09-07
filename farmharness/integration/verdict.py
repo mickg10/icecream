@@ -2848,7 +2848,7 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
             _clause(
                 "network.shaping",
                 not network_errors,
-                "the shaped worker has one immutable 100mbit/2ms bridge qdisc witness",
+                "the shaped F has one immutable F-egress 100mbit/2ms bridge qdisc witness",
                 network_errors,
             )
         )
