@@ -13,6 +13,7 @@ from farmharness.integration.verdict import (
     ROW_SCHEMA,
     VERDICT_SCHEMA,
     _scenario_profile_at_epoch,
+    _shape_clauses,
     _s60_transition_epoch_errors,
     evaluate_bundle,
     evaluate_control,
@@ -112,6 +113,143 @@ def test_pure_verdict_transition_receipt_requires_fresh_f_rejoin() -> None:
     tampered = copy.deepcopy(observed)
     tampered["receipt"]["coordination"]["scheduler_worker_rejoin"]["line"] = "stale login"
     assert _transition_receipt_errors(tampered, scenario["timeline"][0], scenario)
+
+
+def test_s60_worker_upgrade_keeps_only_untouched_workers_under_legacy_surface() -> None:
+    scenario, observed, receipt = _coordinated_transition_event()
+    scenario["id"] = "S60-02-f1-up"
+    scenario["instances"].insert(2, _instance("F2", "F", 43))
+    receipt["coordination"]["workers"] = ["F1", "F2"]
+    receipt["coordination"]["worker_snapshot"] = "F1\nF2\n"
+    rows = [
+        _row(1, client_version=43, worker_version=43, tail=False, outcome="none"),
+        _row(
+            2,
+            client_version=43,
+            worker_version=50,
+            tail=False,
+            outcome="none",
+        ),
+        _row(
+            3,
+            client_version=43,
+            worker="F2",
+            worker_version=43,
+            tail=False,
+            outcome="none",
+        ),
+    ]
+    rows[1]["event_epoch"] = 1
+    rows[2]["event_epoch"] = 1
+    observations = _observations(rows, old_workers={"F2"})
+
+    clauses = _shape_clauses(
+        scenario, rows, observations, "P29V1", [observed]
+    )
+    assert next(
+        item for item in clauses if item["id"] == "event.transition-0"
+    )["status"] == "PASS"
+    assert next(
+        item for item in clauses if item["id"] == "shape.legacy-surface"
+    )["status"] == "PASS"
+    assert not any(
+        item["id"] == "shape.scheduler-first-restart" for item in clauses
+    )
+
+    unsafe_target = copy.deepcopy(observed)
+    unsafe_target["receipt"]["after"]["container_id"] = unsafe_target["receipt"][
+        "before"
+    ]["container_id"]
+    clauses = _shape_clauses(
+        scenario, rows, observations, "P29V1", [unsafe_target]
+    )
+    assert next(
+        item for item in clauses if item["id"] == "event.transition-0"
+    )["status"] == "FAIL"
+    assert next(
+        item for item in clauses if item["id"] == "shape.legacy-surface"
+    )["status"] == "FAIL"
+
+    broken_other = copy.deepcopy(observations)
+    broken_other["sidecars"]["F2"]["process_count"] = 1
+    clauses = _shape_clauses(
+        scenario, rows, broken_other, "P29V1", [observed]
+    )
+    legacy = next(
+        item for item in clauses if item["id"] == "shape.legacy-surface"
+    )
+    assert legacy["status"] == "FAIL"
+    assert legacy["offending_job_ids"] == ["@instance:F2"]
+
+
+def test_s60_worker_downgrade_keeps_untouched_new_worker_surface() -> None:
+    scenario, observed, receipt = _coordinated_transition_event()
+    scenario["id"] = "S60-11-warm-f2-down"
+    scenario["shape"] = "S'C'F'"
+    scenario["instances"][1]["image"] = "new"
+    scenario["instances"].insert(2, _instance("F2", "F", 50))
+    scenario["timeline"] = [
+        {"trigger": "job 1", "action": "downgrade", "instance": "F2", "image": "old"}
+    ]
+    observed["action"] = "downgrade"
+    observed["instance"] = "F2"
+    receipt["action"] = "downgrade"
+    receipt["instance"] = "F2"
+    receipt["before"]["image"] = "p50s4-fixture"
+    receipt["after"]["image"] = "p43-fixture"
+    receipt["coordination"]["workers"] = ["F1", "F2"]
+    receipt["coordination"]["worker_snapshot"] = "F1\nF2\n"
+    receipt["coordination"]["scheduler_worker_rejoin"].update(
+        {"line": "login F2 protocol version: 43", "role_protocol": 43, "target": "F2"}
+    )
+    rows = [
+        _row(1, worker="F2"),
+        _row(2, worker="F2", worker_version=43, tail=False, outcome="none"),
+        _row(3, worker="F1"),
+    ]
+    rows[1]["event_epoch"] = 1
+    rows[2]["event_epoch"] = 1
+    observations = _observations(rows, old_workers={"F2"})
+
+    clauses = _shape_clauses(
+        scenario, rows, observations, "P29V1", [observed]
+    )
+    assert next(
+        item for item in clauses if item["id"] == "event.transition-0"
+    )["status"] == "PASS"
+    assert next(
+        item for item in clauses if item["id"] == "shape.full-newgen-engagement"
+    )["status"] == "PASS"
+
+    unsafe_target = copy.deepcopy(observed)
+    unsafe_target["receipt"]["after"]["container_id"] = unsafe_target["receipt"][
+        "before"
+    ]["container_id"]
+    clauses = _shape_clauses(
+        scenario, rows, observations, "P29V1", [unsafe_target]
+    )
+    assert next(
+        item for item in clauses if item["id"] == "event.transition-0"
+    )["status"] == "FAIL"
+    full_newgen = next(
+        item for item in clauses if item["id"] == "shape.full-newgen-engagement"
+    )
+    assert full_newgen["status"] == "FAIL"
+    assert full_newgen["offending_job_ids"] == ["@instance:F2"]
+
+    broken_other = copy.deepcopy(observations)
+    next(
+        item for item in broken_other["logins"] if item["instance"] == "F1"
+    )["cache_profiles"] = []
+    clause = next(
+        item
+        for item in _shape_clauses(
+            scenario, rows, broken_other, "P29V1", [observed]
+        )
+        if item["id"] == "shape.full-newgen-engagement"
+    )
+    assert clause["status"] == "FAIL"
+    assert clause["offending_job_ids"] == ["@instance:F1"]
 
 
 def test_active_loss_verdict_rejects_reused_compiler_identity() -> None:

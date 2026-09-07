@@ -2254,6 +2254,38 @@ def _shape_clauses(
                     transition_bad,
                 )
             )
+    authenticated_worker_transition: tuple[str, str] | None = None
+    if (
+        isinstance(timeline, list)
+        and len(timeline) == 1
+        and isinstance(timeline[0], Mapping)
+        and timeline[0].get("action") in {"upgrade", "downgrade"}
+        and isinstance(event_log, list)
+        and len(event_log) == 1
+        and isinstance(event_log[0], Mapping)
+    ):
+        expected_event = timeline[0]
+        target = next(
+            (
+                item
+                for item in instances
+                if isinstance(item, Mapping)
+                and item.get("name") == expected_event.get("instance")
+            ),
+            None,
+        )
+        if (
+            isinstance(target, Mapping)
+            and target.get("role") == "F"
+            and isinstance(target.get("name"), str)
+            and not _transition_receipt_errors(
+                event_log[0], expected_event, scenario
+            )
+        ):
+            authenticated_worker_transition = (
+                target["name"],
+                expected_event["action"],
+            )
     logins = observations.get("logins")
     sidecars = observations.get("sidecars")
     logins = logins if isinstance(logins, list) else []
@@ -2276,9 +2308,15 @@ def _shape_clauses(
             for row in rows
             if row.get("tail_present") is True
         }
+        legacy_workers = set(workers)
+        if (
+            authenticated_worker_transition is not None
+            and authenticated_worker_transition[1] == "upgrade"
+        ):
+            legacy_workers.discard(authenticated_worker_transition[0])
         bad_workers = {
             str(worker)
-            for worker in workers
+            for worker in legacy_workers
             if not login_for(worker)
             or any(
                 item.get("cache_profiles") not in ([], None)
@@ -2312,7 +2350,14 @@ def _shape_clauses(
                 bad_logins or ({"@observations:logins"} if not logins else set()),
             )
         )
-    if shape == "S'CF" and scenario.get("timeline"):
+    if (
+        shape == "S'CF"
+        and isinstance(timeline, list)
+        and len(timeline) == 1
+        and isinstance(timeline[0], Mapping)
+        and timeline[0].get("action") == "restart"
+        and timeline[0].get("instance") in schedulers
+    ):
         timeline = scenario.get("timeline")
         expected_event = (
             timeline[0]
@@ -2439,9 +2484,15 @@ def _shape_clauses(
             and item.get("role") == "F"
             and item.get("image") == "mutant"
         }
+        new_workers = set(workers)
+        if (
+            authenticated_worker_transition is not None
+            and authenticated_worker_transition[1] == "downgrade"
+        ):
+            new_workers.discard(authenticated_worker_transition[0])
         bad_workers = {
             str(worker)
-            for worker in workers
+            for worker in new_workers
             if not login_for(worker)
             or any(
                 selected_profile not in (item.get("cache_profiles") or [])
@@ -2459,11 +2510,11 @@ def _shape_clauses(
         clauses.append(
             _clause(
                 "shape.full-newgen-engagement",
-                bool(workers) and not bad_workers,
+                bool(new_workers) and not bad_workers,
                 "every new worker advertises the selected profile; normal workers "
                 "record a session and S30 refusal workers record none",
                 {f"@instance:{name}" for name in bad_workers}
-                or ({"@scenario:workers"} if not workers else set()),
+                or ({"@scenario:workers"} if not new_workers else set()),
             )
         )
         timeline = scenario.get("timeline")
