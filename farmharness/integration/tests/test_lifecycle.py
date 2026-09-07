@@ -682,6 +682,33 @@ def test_runtime_role_hash_mismatch_is_refused_before_persistent_start(
     assert lifecycle["topology_digest"] == plan["topology_digest"]
 
 
+def test_scheduler_mutant_cannot_fall_back_to_normal_role_store(
+    tmp_path: Path,
+) -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    farm.data["hub"]["results_root"] = str(tmp_path)
+    mutant = farm.data["authority"]["images"]["p50s4-h3-tail-mutant"]
+    farm.data["runtime_image"]["closure_sha256"] = mutant["closure_sha256"]
+    mutant.pop("role_overrides")
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / "H3-mutant-scheduler.json", farm
+    )
+    plan = farmtest.build_plan(farm, scenario, run_id="missing-mutant-role")
+    transport = RecordingTransport(ScriptedLifecycle(farm))
+    with pytest.raises(PreflightRefusal, match="lacks an observed scheduler role hash"):
+        bring_up(
+            farm,
+            scenario,
+            plan,
+            recorder=transport,
+            probe_bytes=0,
+            sync_corpora=False,
+        )
+    assert not any(
+        command.phase.startswith("up.start-") for command in transport.commands
+    )
+
+
 def test_down_removes_containers_before_reporting_protected_count_change(
     tmp_path: Path,
 ) -> None:

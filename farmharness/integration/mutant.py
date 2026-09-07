@@ -149,12 +149,21 @@ def validate_mutant_authority(
         raise MutantError(f"{label}: base commit is not bound to authority")
     if image.get("base_archive_sha256") != base.get("archive_sha256"):
         raise MutantError(f"{label}: base archive is not bound to authority")
+    if image.get("commit") != base.get("commit"):
+        raise MutantError(f"{label}: commit is not bound to base image")
     patch = image.get("patch_sha256")
     recipe = image.get("recipe_sha256")
     if not isinstance(patch, str) or SHA256_RE.fullmatch(patch) is None:
         raise MutantError(f"{label}: patch hash is invalid")
     if not isinstance(recipe, str) or SHA256_RE.fullmatch(recipe) is None:
         raise MutantError(f"{label}: recipe hash is invalid")
+    expected_schema = (
+        MUTANT_RECIPE_SCHEMA
+        if kind == MUTANT_KIND
+        else DAEMON_MUTANT_RECIPE_SCHEMA
+    )
+    if image.get("recipe_schema") != expected_schema:
+        raise MutantError(f"{label}: recipe schema does not match mutant kind")
     expected = hashlib.sha256(
         canonical_bytes(
             {
@@ -162,16 +171,25 @@ def validate_mutant_authority(
                 "base_commit": image["base_commit"],
                 "base_label": image["base_image"],
                 "patch_sha256": patch,
-                "schema": (
-                    MUTANT_RECIPE_SCHEMA
-                    if kind == MUTANT_KIND
-                    else DAEMON_MUTANT_RECIPE_SCHEMA
-                ),
+                "schema": expected_schema,
             }
         )
     ).hexdigest()
     if recipe != expected or image.get("archive_sha256") != expected:
         raise MutantError(f"{label}: recipe digest does not bind base and patch")
+    overrides = image.get("role_overrides")
+    if overrides is not None:
+        role = "scheduler" if kind == MUTANT_KIND else "daemon"
+        if not isinstance(overrides, Mapping) or set(overrides) != {role}:
+            raise MutantError(f"{label}: role overrides do not match mutant kind")
+        override = overrides[role]
+        if (
+            not isinstance(override, Mapping)
+            or set(override) != {"sha256"}
+            or not isinstance(override.get("sha256"), str)
+            or SHA256_RE.fullmatch(override["sha256"]) is None
+        ):
+            raise MutantError(f"{label}: {role} role override hash is invalid")
 
 
 def validate_h3_trace(

@@ -69,6 +69,28 @@ def test_mutant_recipe_is_deterministic_and_hash_bound() -> None:
     assert first["base_archive_sha256"] == _base()["archive_sha256"]
 
 
+def test_final_lineage_mutant_recipes_are_exactly_derived() -> None:
+    images = _farm().data["authority"]["images"]
+    base = images["p50s4-57a1e336"]
+    h3 = derive_scheduler_mutant(
+        "p50s4-57a1e336",
+        base,
+        label="p50s4-h3-tail-57a1e336",
+    )
+    s90 = derive_daemon_mutant(
+        "p50s4-57a1e336",
+        base,
+        INTEGRATION / "mutants" / "daemon-wire-revision-2.patch",
+        label="p50s90-f-revision-2-57a1e336",
+    )
+    assert h3["recipe_sha256"] == (
+        "754da050d4a8ba33bf654efb48124e7067a18189a85340ee66c468d0f67eea98"
+    )
+    assert s90["recipe_sha256"] == (
+        "76dc368f6109e20374d9cf5d6e412273b9978496c10569c25eb8c609d8c7aa14"
+    )
+
+
 def test_daemon_mutant_recipe_binds_sealed_p50_base_and_patch() -> None:
     first = derive_daemon_mutant("p50s4-89917385", _base())
     second = derive_daemon_mutant("p50s4-89917385", _base())
@@ -144,6 +166,34 @@ def test_farm_refuses_tampered_mutant_recipe(tmp_path: Path) -> None:
     path = tmp_path / "farm.json"
     path.write_text(json.dumps(document), encoding="utf-8")
     with pytest.raises(FarmSpecError, match="mutant"):
+        load_farm_spec(path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("commit", "0" * 40),
+        ("recipe_schema", DAEMON_MUTANT_RECIPE_SCHEMA),
+        ("role_overrides", {"daemon": {"sha256": "d" * 64}}),
+        (
+            "role_overrides",
+            {
+                "scheduler": {
+                    "sha256": "d" * 64,
+                    "unbound": "forbidden",
+                }
+            },
+        ),
+    ),
+)
+def test_farm_refuses_mutant_identity_and_role_shape_tampering(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    document = json.loads((farm_fixture.example_farm_path()).read_text())
+    document["authority"]["images"]["p50s4-h3-tail-mutant"][field] = value
+    path = tmp_path / "farm.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(FarmSpecError, match="mutant|recipe|role override"):
         load_farm_spec(path)
 
 
