@@ -1384,6 +1384,7 @@ def _worker_restart_receipt_errors(
             "profile",
             "role_protocol",
             "scheduler",
+            "sha256",
             "target",
         }
         or rejoin.get("host") != scheduler.get("host")
@@ -1399,6 +1400,8 @@ def _worker_restart_receipt_errors(
         or rejoin.get("cache_protocol") != 1
         or not _is_int(rejoin.get("offset"))
         or not _is_int(rejoin.get("bytes"), minimum=1)
+        or not isinstance(rejoin.get("sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", rejoin["sha256"]) is None
         or not isinstance(login_line, str)
         or re.search(
             rf"\blogin\s+{re.escape(str(target['name']))}\s+protocol\s+version:\s*50\b",

@@ -193,7 +193,7 @@ print(json.dumps({
 }, sort_keys=True))
 '''.strip()
 SCHEDULER_HEADER_RELOGIN_SCRIPT = r'''
-import json, pathlib, re, sys
+import hashlib, json, pathlib, re, sys
 
 path = pathlib.Path(sys.argv[1])
 offset = int(sys.argv[2])
@@ -239,6 +239,7 @@ document = {
     "profile": profile,
     "ready": role_line is not None and cache_line is not None,
     "role_protocol": 50 if role_line is not None else None,
+    "sha256": hashlib.sha256(payload).hexdigest(),
     "target": target,
 }
 if include_loss:
@@ -1582,6 +1583,7 @@ class EventProducer:
                     "profile",
                     "ready",
                     "role_protocol",
+                    "sha256",
                     "target",
                 }
                 | ({"loss_job_ids"} if include_loss else set())
@@ -1591,6 +1593,8 @@ class EventProducer:
                 and witness.get("target") == target["name"]
                 and witness.get("profile") == profile.lower()
                 and witness.get("role_protocol") == 50
+                and isinstance(witness.get("sha256"), str)
+                and re.fullmatch(r"[0-9a-f]{64}", witness["sha256"]) is not None
                 and witness.get("cache_protocol") == 1
                 and isinstance(witness.get("login_line"), str)
                 and re.search(
@@ -1630,6 +1634,7 @@ class EventProducer:
                 if include_loss:
                     result["bytes"] = witness["bytes"]
                     result["loss_job_ids"] = witness["loss_job_ids"]
+                    result["sha256"] = witness["sha256"]
                 return result
             self._wake.wait(
                 timeout=min(

@@ -152,7 +152,8 @@ def test_retained_readiness_witness_is_bound_to_exact_post_offset_log_line(
     stale = "[1] stale startup"
     fresh = "[2] ICECREAM scheduler 1.5.90 starting up, port 23000"
     prefix = (stale + "\n").encode()
-    path.write_bytes(prefix + (fresh + "\n").encode())
+    captured = (fresh + "\n").encode()
+    path.write_bytes(prefix + captured + b"[3] later scheduler activity\n")
 
     assert _retained_log_witness(tmp_path, scheduler, len(prefix), fresh)
     assert not _retained_log_witness(tmp_path, scheduler, len(prefix), stale)
@@ -162,10 +163,23 @@ def test_retained_readiness_witness_is_bound_to_exact_post_offset_log_line(
     )
     assert not _retained_log_witness(tmp_path, scheduler, len(prefix), "absent")
     assert _retained_log_witness_exact(
-        tmp_path, scheduler, len(prefix), fresh, len((fresh + "\n").encode())
+        tmp_path,
+        scheduler,
+        len(prefix),
+        fresh,
+        len(captured),
+        hashlib.sha256(captured).hexdigest(),
     )
     assert not _retained_log_witness_exact(
-        tmp_path, scheduler, len(prefix), fresh, len((fresh + "\n").encode()) - 1
+        tmp_path,
+        scheduler,
+        len(prefix),
+        fresh,
+        len(captured) - 1,
+        hashlib.sha256(captured).hexdigest(),
+    )
+    assert not _retained_log_witness_exact(
+        tmp_path, scheduler, len(prefix), fresh, len(captured), "0" * 64
     )
 
 

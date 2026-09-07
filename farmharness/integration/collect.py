@@ -875,8 +875,9 @@ def _retained_log_witness_exact(
     offset: Any,
     line: Any,
     byte_count: Any,
+    sha256: Any,
 ) -> bool:
-    """Bind a line and its exact retained post-offset byte count."""
+    """Bind the captured post-offset prefix while permitting later appends."""
 
     present, payload = _retained_log_payload(evidence, instance, offset)
     if not present:
@@ -884,9 +885,12 @@ def _retained_log_witness_exact(
     return (
         payload is not None
         and type(byte_count) is int
-        and byte_count == len(payload)
+        and 0 < byte_count <= len(payload)
+        and isinstance(sha256, str)
+        and SHA256_RE.fullmatch(sha256) is not None
+        and hashlib.sha256(payload[:byte_count]).hexdigest() == sha256
         and isinstance(line, str)
-        and line in payload.decode("utf-8", "replace").splitlines()
+        and line in payload[:byte_count].decode("utf-8", "replace").splitlines()
     )
 
 
@@ -2276,6 +2280,7 @@ def _validate_worker_restart_receipt(
             "profile",
             "role_protocol",
             "scheduler",
+            "sha256",
             "target",
         }
         or rejoin.get("host") != expected_scheduler_host
@@ -2289,6 +2294,8 @@ def _validate_worker_restart_receipt(
         or rejoin["offset"] < 0
         or type(rejoin.get("bytes")) is not int
         or rejoin["bytes"] < 1
+        or not isinstance(rejoin.get("sha256"), str)
+        or SHA256_RE.fullmatch(rejoin["sha256"]) is None
         or role_login is None
         or role_login.group(1) != target["name"]
         or role_login.group(2) != "50"
@@ -2314,6 +2321,7 @@ def _validate_worker_restart_receipt(
             rejoin["offset"],
             rejoin["login_line"],
             rejoin["bytes"],
+            rejoin["sha256"],
         )
         or not _retained_log_witness(
             evidence, scheduler, rejoin["offset"], rejoin["cache_line"]

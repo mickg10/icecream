@@ -1047,6 +1047,7 @@ def _worker_restart_event(
                     "profile": "P29V1",
                     "role_protocol": 50,
                     "scheduler": "S1",
+                    "sha256": "a" * 64,
                     "target": "F1",
                 },
                 "worker_snapshot": "F1\nF2\n",

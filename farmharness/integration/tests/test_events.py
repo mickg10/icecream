@@ -400,6 +400,7 @@ class HeaderEditRecorder(EventRecorder):
                         "profile": "p29v1",
                         "role_protocol": 50,
                         "ready": True,
+                        "sha256": "a" * 64,
                         "target": "F2",
                     }
                 ),
@@ -964,6 +965,7 @@ def test_worker_restart_stays_live_and_emits_collectable_rejoin_receipt(
                             "profile": "p29v1",
                             "ready": True,
                             "role_protocol": 50,
+                            "sha256": "a" * 64,
                             "target": "F1",
                         }
                     ),
