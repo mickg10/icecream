@@ -60,6 +60,7 @@ S70_B5_ENGAGEMENT = "s70-b5-interner-downgrade"
 S70_B6_ENGAGEMENT = "s70-b6-drained-kill-switch-cycle"
 S70_B7_ROLLBACK_ENGAGEMENT = "s70-b7-rollback"
 S70_B7_ROLLFORWARD_ENGAGEMENT = "s70-b7-rollforward"
+S90_REVISION_REFUSAL_ENGAGEMENT = "s90-revision-refusal-retry"
 S95_DISK_FILL_ENGAGEMENT = "s95-cache-disk-full"
 P29_FAULT_ENV = "ICECC_P50_FAULT_INJECTION"
 P29_FAULT_ENV_VALUE = "P29_INTERNER_FAIL_ONCE"
@@ -2578,6 +2579,155 @@ def _shape_clauses(
                 bad,
             )
         )
+    if scenario.get("id") == "S90-revision-refusal-retry":
+        bad: set[str] = set()
+        workload = scenario.get("workload")
+        named = {
+            item.get("name"): item
+            for item in instances
+            if isinstance(item, Mapping) and isinstance(item.get("name"), str)
+        }
+        if (
+            shape != "S'[F~][C']"
+            or schedulers != {"S1"}
+            or workers != {"F1"}
+            or clients != {"C1"}
+            or set(named) != {"S1", "F1", "C1"}
+            or named["F1"].get("image") != "mutant"
+            or named["F1"].get("slots") != 1
+            or named["F1"].get("env", {}).get(
+                "ICECC_P50_S90_ENDPOINT_WIRE_REVISION"
+            )
+            != "2"
+            or scenario.get("timeline") != []
+            or not isinstance(workload, Mapping)
+            or workload.get("driver") != "tu-manifest"
+            or workload.get("corpus") != "fmt-100"
+            or workload.get("turns") != ["A"]
+            or workload.get("jobs") != 1
+            or workload.get("clients") != ["C1"]
+            or workload.get("repeat") != 1
+            or scenario.get("expect", {}).get("engagement")
+            != S90_REVISION_REFUSAL_ENGAGEMENT
+        ):
+            bad.add("@scenario:s90-revision-refusal")
+        f_logins = login_for("F1")
+        revisions = observations.get("wire_revisions")
+        if (
+            len(f_logins) != 1
+            or f_logins[0].get("cache_protocol") != 1
+            or selected_profile not in (f_logins[0].get("cache_profiles") or [])
+            or not isinstance(revisions, Mapping)
+            or revisions.get("F1") != 1
+            or revisions.get("C1") != 1
+            or sidecar("F1").get("sessions") != 0
+        ):
+            bad.add("@instance:F1")
+        mismatch_raw = observations.get("wire_revision_mismatches")
+        mismatch_ids: set[str] = set()
+        required_record_fields = {
+            "advertised_worker_wire_revision",
+            "client_instance",
+            "client_wire_revision",
+            "endpoint_wire_revision",
+            "error",
+            "error_code",
+            "first_assignment",
+            "retry_assignment",
+            "row_job_id",
+            "schema",
+            "worker_instance",
+        }
+        if not isinstance(mismatch_raw, list) or not mismatch_raw:
+            bad.add("@observations:wire_revision_mismatches")
+        else:
+            for index, record in enumerate(mismatch_raw):
+                marker = f"@revision-mismatch:{index}"
+                if not isinstance(record, Mapping) or set(record) != required_record_fields:
+                    bad.add(marker)
+                    continue
+                first = record.get("first_assignment")
+                retry = record.get("retry_assignment")
+                identity_fields = {
+                    "assignment_epoch", "assignment_nonce", "scheduler_job"
+                }
+                if (
+                    record.get("schema") != "icefarm-wire-revision-mismatch-v1"
+                    or record.get("error") != "WIRE_REVISION_MISMATCH"
+                    or record.get("error_code") != 4
+                    or record.get("client_instance") != "C1"
+                    or record.get("worker_instance") != "F1"
+                    or record.get("client_wire_revision") != 1
+                    or record.get("advertised_worker_wire_revision") != 1
+                    or record.get("endpoint_wire_revision") != 2
+                    or not isinstance(first, Mapping)
+                    or set(first) != identity_fields
+                    or not isinstance(retry, Mapping)
+                    or set(retry) != identity_fields
+                    or any(
+                        not _is_int(identity.get(field), minimum=1)
+                        for identity in (first, retry)
+                        for field in identity_fields
+                    )
+                    or first.get("scheduler_job") == retry.get("scheduler_job")
+                    or (
+                        first.get("assignment_epoch"),
+                        first.get("assignment_nonce"),
+                    )
+                    == (
+                        retry.get("assignment_epoch"),
+                        retry.get("assignment_nonce"),
+                    )
+                    or not isinstance(record.get("row_job_id"), str)
+                    or not record["row_job_id"]
+                ):
+                    bad.add(marker)
+                    continue
+                mismatch_ids.add(_job_id(record["row_job_id"], marker))
+        row_ids = {_job_id(row.get("job_id"), "@row") for row in rows}
+        fallback_ids = {
+            _job_id(row.get("job_id"), "@row")
+            for row in rows
+            if row.get("session_outcome") == "fallback"
+        }
+        error106_raw = observations.get("error106_job_ids")
+        local_raw = observations.get("local_fallback_job_ids")
+        legacy = observations.get("legacy_wire")
+        legacy_records = legacy.get("records") if isinstance(legacy, Mapping) else None
+        legacy_ids = {
+            _job_id(item.get("job_id"), "@legacy")
+            for item in legacy_records
+            if isinstance(item, Mapping)
+        } if isinstance(legacy_records, list) else set()
+        if mismatch_ids != fallback_ids or not mismatch_ids or mismatch_ids - row_ids:
+            bad.add("@observations:wire_revision_mismatch_binding")
+        error106_ids = (
+            {_job_id(item, "@error106") for item in error106_raw}
+            if isinstance(error106_raw, list)
+            else set()
+        )
+        if (
+            not isinstance(error106_raw, list)
+            or len(error106_ids) != len(error106_raw)
+            or error106_ids != mismatch_ids
+        ):
+            bad.add("@observations:error106_job_ids")
+        if local_raw != []:
+            bad.add("@observations:local_fallback_job_ids")
+        if (
+            not isinstance(legacy, Mapping)
+            or legacy.get("record_count") != len(rows)
+            or legacy_ids != row_ids
+        ):
+            bad.add("@observations:legacy_wire")
+        clauses.append(
+            _clause(
+                "s90.named-refusal-fresh-remote-retry",
+                not bad,
+                "a real wire-revision mismatch names error 4 and each affected tail receives one distinct remote legacy assignment",
+                bad,
+            )
+        )
     return clauses
 
 
@@ -3149,6 +3299,42 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
                 (error106_ids - fallback_ids)
                 or {"@observations:s95-fallback-bound"}
             )
+    elif engagement_mode == S90_REVISION_REFUSAL_ENGAGEMENT:
+        mismatch_raw = observations.get("wire_revision_mismatches")
+        mismatch_ids = {
+            _job_id(item.get("row_job_id"), "@revision-mismatch")
+            for item in mismatch_raw
+            if isinstance(item, Mapping)
+        } if isinstance(mismatch_raw, list) else set()
+        if not mismatch_ids:
+            engagement_bad.add("@observations:wire_revision_mismatches")
+        for row in valid_rows:
+            identifier = _job_id(row["job_id"], "@row")
+            expected_outcome = "fallback" if identifier in mismatch_ids else "none"
+            expected_retries = 1 if identifier in mismatch_ids else 0
+            if (
+                row["tail_present"] is not False
+                or row["tail_profile"] is not None
+                or row["session_outcome"] != expected_outcome
+                or row["reuse"] is not None
+                or row["retries"] != expected_retries
+                or row["exact"] is not True
+            ):
+                engagement_bad.add(identifier)
+        error106_raw = observations.get("error106_job_ids")
+        error106_ids = (
+            {_job_id(item, "@error106") for item in error106_raw}
+            if isinstance(error106_raw, list)
+            else set()
+        )
+        if (
+            not isinstance(error106_raw, list)
+            or len(error106_ids) != len(error106_raw)
+            or error106_ids != mismatch_ids
+        ):
+            engagement_bad.add("@observations:error106_job_ids")
+        if observations.get("local_fallback_job_ids") != []:
+            engagement_bad.add("@observations:local_fallback_job_ids")
     else:
         engagement_bad.add("@expect:engagement")
     clauses.append(
@@ -4153,7 +4339,11 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
         1
         if bounce
         or s30_mutant
-        or engagement_mode in {S70_B5_ENGAGEMENT, S95_DISK_FILL_ENGAGEMENT}
+        or engagement_mode in {
+            S70_B5_ENGAGEMENT,
+            S90_REVISION_REFUSAL_ENGAGEMENT,
+            S95_DISK_FILL_ENGAGEMENT,
+        }
         else 0
     )
     retry_bad = {

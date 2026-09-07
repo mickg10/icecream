@@ -45,7 +45,7 @@ except ImportError:  # Direct execution from this directory.
     from verdict import BUNDLE_SCHEMA, ROW_SCHEMA
 
 
-SOURCE_RESULT_SCHEMA = "icecream-p50-source-result-v1"
+SOURCE_RESULT_SCHEMA = "icecream-p50-source-result-v2"
 P29_INTERNER_FAULT_SCHEMA = "icecream-p50-fault-v1"
 P29_INTERNER_FAULT = "p29-interner-fail-once"
 P29_INTERNER_FAULT_OUTCOME = "fired"
@@ -127,6 +127,8 @@ SOURCE_RESULT_FIELDS = frozenset(
         "f_to_c_bytes",
         "source_mutex_wait_ns",
         "source_mutex_service_ns",
+        "terminal_error_code",
+        "terminal_error_name",
         "system_source_reuse",
     }
 )
@@ -610,6 +612,7 @@ def _source_results(path: Path) -> dict[tuple[int, int, int], dict[str, Any]]:
             "f_to_c_bytes",
             "source_mutex_wait_ns",
             "source_mutex_service_ns",
+            "terminal_error_code",
         )
         if any(
             type(item.get(field)) is not int or item[field] < 0 for field in integers
@@ -620,6 +623,19 @@ def _source_results(path: Path) -> dict[tuple[int, int, int], dict[str, Any]]:
         if item["status"] > 7 or item["attempts"] > 2:
             raise CollectError(
                 f"{path}:{index}: source-result status/attempt count is invalid"
+            )
+        terminal_name = item.get("terminal_error_name")
+        if terminal_name not in (None, "WIRE_REVISION_MISMATCH"):
+            raise CollectError(f"{path}:{index}: source-result terminal error is invalid")
+        if (item["terminal_error_code"] == 4) != (
+            terminal_name == "WIRE_REVISION_MISMATCH"
+        ):
+            raise CollectError(
+                f"{path}:{index}: source-result terminal error code/name disagree"
+            )
+        if item["terminal_error_code"] > 0xFFFF:
+            raise CollectError(
+                f"{path}:{index}: source-result terminal error code is invalid"
             )
         if item.get("profile") not in PROFILE_LABELS.values():
             raise CollectError(f"{path}:{index}: source-result profile is invalid")
@@ -642,6 +658,10 @@ def _source_results(path: Path) -> dict[tuple[int, int, int], dict[str, Any]]:
                 f"{path}:{index}: non-P29V1 source-result has reuse evidence"
             )
         if item["status"] == 0:
+            if item["terminal_error_code"] != 0 or terminal_name is not None:
+                raise CollectError(
+                    f"{path}:{index}: committed source-result has a terminal error"
+                )
             if item["attempts"] == 0:
                 raise CollectError(
                     f"{path}:{index}: committed source-result has no attempt"
@@ -743,6 +763,7 @@ def _legacy_wire_results(
 
 
 S30_MUTANT_TRACE_SCHEMA = "icefarm-s30-mutant-f-refusal-v1"
+S90_REVISION_MISMATCH_SCHEMA = "icefarm-wire-revision-mismatch-v1"
 
 
 def _s30_mutant_refusals(path: Path) -> list[dict[str, Any]]:
@@ -3046,6 +3067,7 @@ def _parse_rows(
     error106: list[str] = []
     source_mutex_records: list[dict[str, Any]] = []
     legacy_wire_records: list[dict[str, Any]] = []
+    wire_revision_mismatches: list[dict[str, Any]] = []
     s30_refusals: list[dict[str, Any]] = []
     s30_canary_refusals: list[dict[str, Any]] = []
     if scenario.data.get("id") == "S30-mutant-f-refusal":
@@ -3265,6 +3287,88 @@ def _parse_rows(
                     # replacement, later jobs may correctly arrive as
                     # ordinary first-assignment legacy work.
                     outcome = "fallback" if raw["retries"] == 1 else "none"
+            if scenario.data.get("id") == "S90-revision-refusal-retry":
+                attempt_sources = [
+                    (key, source)
+                    for assignment in assignments
+                    for key, source in source_results.items()
+                    if key[0] == assignment["scheduler_job"]
+                ]
+                if raw["retries"] == 1:
+                    if (
+                        len(assignments) != 2
+                        or len(attempt_sources) != 1
+                        or legacy_key is None
+                        or legacy_wire is None
+                    ):
+                        raise CollectError(
+                            f"{job_id}: revision mismatch lacks one fresh legacy retry"
+                        )
+                    first_assignment, retry_assignment = assignments
+                    first_key, refused = attempt_sources[0]
+                    first_worker = workers[first_assignment["endpoint"]]
+                    first_scenario_instance = next(
+                        (
+                            item
+                            for item in scenario.data["instances"]
+                            if item.get("name") == first_worker["name"]
+                        ),
+                        None,
+                    )
+                    endpoint_revision = (
+                        first_scenario_instance.get("env", {}).get(
+                            "ICECC_P50_S90_ENDPOINT_WIRE_REVISION"
+                        )
+                        if isinstance(first_scenario_instance, Mapping)
+                        else None
+                    )
+                    if (
+                        first_key[0] != first_assignment["scheduler_job"]
+                        or legacy_key[0] != retry_assignment["scheduler_job"]
+                        or first_key == legacy_key
+                        or refused.get("profile") != "P29V1"
+                        or refused.get("status") != 4
+                        or refused.get("attempts") != 1
+                        or refused.get("terminal_error_code") != 4
+                        or refused.get("terminal_error_name")
+                        != "WIRE_REVISION_MISMATCH"
+                        or first_worker.get("cache_wire_revision") != 1
+                        or first_worker.get("image", {}).get("kind")
+                        != "daemon-mutant"
+                        or endpoint_revision != "2"
+                        or by_name[client_name].get("cache_wire_revision") != 1
+                    ):
+                        raise CollectError(
+                            f"{job_id}: revision mismatch identity is not authenticated"
+                        )
+                    outcome = "fallback"
+                    wire_revision_mismatches.append(
+                        {
+                            "advertised_worker_wire_revision": 1,
+                            "client_instance": client_name,
+                            "client_wire_revision": 1,
+                            "endpoint_wire_revision": 2,
+                            "error": "WIRE_REVISION_MISMATCH",
+                            "error_code": 4,
+                            "first_assignment": {
+                                "assignment_epoch": first_key[1],
+                                "assignment_nonce": first_key[2],
+                                "scheduler_job": first_key[0],
+                            },
+                            "retry_assignment": {
+                                "assignment_epoch": legacy_key[1],
+                                "assignment_nonce": legacy_key[2],
+                                "scheduler_job": legacy_key[0],
+                            },
+                            "row_job_id": job_id,
+                            "schema": S90_REVISION_MISMATCH_SCHEMA,
+                            "worker_instance": first_worker["name"],
+                        }
+                    )
+                elif raw["retries"] != 0 or attempt_sources:
+                    raise CollectError(
+                        f"{job_id}: direct S90 legacy row has mismatch evidence"
+                    )
             if raw["compile_rc"] != 0:
                 compile_failures.append(job_id)
             if raw["remote"] != 1:
@@ -3332,6 +3436,9 @@ def _parse_rows(
             "records": s30_refusals,
             "refusal_count": len(s30_refusals),
         },
+        "wire_revision_mismatches": sorted(
+            wire_revision_mismatches, key=lambda item: item["row_job_id"]
+        ),
     }
 
 

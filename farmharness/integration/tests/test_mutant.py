@@ -161,6 +161,23 @@ def test_s90_revision_two_recipe_is_exactly_derived_from_sealed_b42() -> None:
     }
 
 
+def test_s90_hidden_skew_recipe_is_exactly_derived_from_sealed_final() -> None:
+    farm = _farm()
+    images = farm.data["authority"]["images"]
+    candidate = images["p50s90-f-hidden-skew-candidate"]
+    derived = derive_daemon_mutant(
+        "p50s4-57a1e336",
+        images["p50s4-57a1e336"],
+        INTEGRATION / "mutants" / "daemon-hidden-wire-skew.patch",
+        label="p50s90-f-hidden-skew-candidate",
+    )
+    assert candidate["cache_wire_revision"] == 1
+    assert {key: candidate[key] for key in derived} == {
+        **derived,
+        "patch_path": "mutants/daemon-hidden-wire-skew.patch",
+    }
+
+
 def test_daemon_mutant_candidate_is_build_selectable_without_runtime_authority() -> None:
     farm = load_farm_spec(farm_fixture.example_farm_path())
     [binding] = image_bindings(farm, ["p50s30-f-refusal-mutant-candidate"])

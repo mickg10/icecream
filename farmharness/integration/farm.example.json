@@ -322,6 +322,19 @@
           }
         }
       },
+      "p50s90-f-hidden-skew-candidate": {
+        "kind": "daemon-mutant",
+        "base_image": "p50s4-57a1e336",
+        "base_commit": "57a1e33624d324e52c1d17481fcc43046eaa3139",
+        "base_archive_sha256": "41e543b313171d0a9684fa772e976489bccc07925326511885dcf2aaec5edcd7",
+        "commit": "57a1e33624d324e52c1d17481fcc43046eaa3139",
+        "archive_sha256": "b6f9965a6dbd9a09488b45515aaa08a4f6da44d76ab0c607c5d33a9cd8a3eff5",
+        "cache_wire_revision": 1,
+        "patch_path": "mutants/daemon-hidden-wire-skew.patch",
+        "patch_sha256": "dacae42499a23db64c76ea56694735153f9dea2faefa7eee22506828f2f2654f",
+        "recipe_schema": "icefarm-daemon-mutant-recipe-v1",
+        "recipe_sha256": "b6f9965a6dbd9a09488b45515aaa08a4f6da44d76ab0c607c5d33a9cd8a3eff5"
+      },
       "p50s30-f-refusal-mutant-candidate": {
         "kind": "daemon-mutant",
         "base_image": "p50s4-89917385",

@@ -437,6 +437,7 @@ def _planned_commands(
             and (
                 ("H3" in scenario.data["controls"] and authority_image.get("kind") == "scheduler-mutant")
                 or (scenario.data.get("id") == "S30-mutant-f-refusal" and authority_image.get("kind") == "daemon-mutant")
+                or (scenario.data.get("id") == "S90-revision-refusal-retry" and authority_image.get("kind") == "daemon-mutant")
                 or (
                     scenario.data.get("shape") == "S'[F'F''][C']"
                     and authority_image.get("kind") == "daemon-mutant"

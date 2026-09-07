@@ -35,6 +35,10 @@ def test_mutant_scenarios_use_the_final_product_lineage() -> None:
             "r1": FINAL_PRODUCT,
             "r2": "p50s90-f-revision-2-57a1e336",
         },
+        "S90-revision-refusal-retry.json": {
+            "mutant": "p50s90-f-hidden-skew-candidate",
+            "new": FINAL_PRODUCT,
+        },
     }
     for name, images in expected.items():
         scenario = json.loads((SCENARIOS / name).read_text(encoding="utf-8"))

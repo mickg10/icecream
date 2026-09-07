@@ -2116,6 +2116,136 @@ def test_s90_rejects_a_consistently_reported_extra_preference_violation() -> Non
     assert clause["offending_job_ids"] == ["3"]
 
 
+def _s90_refusal_bundle() -> dict[str, object]:
+    scenario = _scenario("S'[F~][C']")
+    scenario["id"] = "S90-revision-refusal-retry"
+    scenario["images"]["mutant"] = "p50s90-f-hidden-skew-fixture"
+    worker = next(
+        item for item in scenario["instances"] if item["name"] == "F1"
+    )
+    worker["image"] = "mutant"
+    worker["env"] = {"ICECC_P50_S90_ENDPOINT_WIRE_REVISION": "2"}
+    scenario["workload"].update(
+        {
+            "clients": ["C1"],
+            "corpus": "fmt-100",
+            "driver": "tu-manifest",
+            "jobs": 1,
+            "repeat": 1,
+            "turns": ["A"],
+        }
+    )
+    scenario["expect"].update(
+        {
+            "engagement": "s90-revision-refusal-retry",
+            "error106_max": 100,
+            "reuse": "none-when-legacy",
+        }
+    )
+    affected = _row(1, tail=False, outcome="fallback")
+    affected["retries"] = 1
+    direct = _row(2, tail=False, outcome="none")
+    rows = [affected, direct]
+    observations = _observations(rows, revisions={"C1": 1, "F1": 1})
+    observations["logins"][0]["cache_protocol"] = 1
+    observations["error106_job_ids"] = ["1"]
+    observations["legacy_wire"] = {
+        "record_count": 2,
+        "records": [
+            {
+                "c_to_f_bytes": row["c_to_f_bytes"],
+                "client_instance": "C1",
+                "f_to_c_bytes": row["f_to_c_bytes"],
+                "job_id": row["job_id"],
+                "turn": "A",
+                "worker_instance": "F1",
+            }
+            for row in rows
+        ],
+    }
+    observations["wire_revision_mismatches"] = [
+        {
+            "advertised_worker_wire_revision": 1,
+            "client_instance": "C1",
+            "client_wire_revision": 1,
+            "endpoint_wire_revision": 2,
+            "error": "WIRE_REVISION_MISMATCH",
+            "error_code": 4,
+            "first_assignment": {
+                "assignment_epoch": 7,
+                "assignment_nonce": 11,
+                "scheduler_job": 41,
+            },
+            "retry_assignment": {
+                "assignment_epoch": 7,
+                "assignment_nonce": 12,
+                "scheduler_job": 42,
+            },
+            "row_job_id": "1",
+            "schema": "icefarm-wire-revision-mismatch-v1",
+            "worker_instance": "F1",
+        }
+    ]
+    return _bundle(scenario, rows, observations)
+
+
+def test_s90_named_revision_refusal_and_fresh_remote_retry_passes() -> None:
+    verdict = evaluate_bundle(_s90_refusal_bundle())
+    assert verdict["status"] == "PASS", verdict
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing_mismatch",
+        "wrong_error",
+        "same_scheduler_job",
+        "same_assignment_identity",
+        "missing_error106",
+        "local_fallback",
+        "retry_tail",
+        "unbound_row",
+        "wrong_endpoint_revision",
+    ),
+)
+def test_s90_named_revision_refusal_fails_closed(mutation: str) -> None:
+    fixture = _s90_refusal_bundle()
+    mismatch = fixture["observations"]["wire_revision_mismatches"][0]
+    if mutation == "missing_mismatch":
+        fixture["observations"]["wire_revision_mismatches"] = []
+    elif mutation == "wrong_error":
+        mismatch["error_code"] = 3
+    elif mutation == "same_scheduler_job":
+        mismatch["retry_assignment"]["scheduler_job"] = 41
+    elif mutation == "same_assignment_identity":
+        mismatch["retry_assignment"].update(
+            assignment_epoch=7, assignment_nonce=11
+        )
+    elif mutation == "missing_error106":
+        fixture["observations"]["error106_job_ids"] = []
+    elif mutation == "local_fallback":
+        fixture["observations"]["local_fallback_job_ids"] = ["1"]
+    elif mutation == "retry_tail":
+        fixture["rows"][0].update(
+            tail_present=True,
+            tail_profile="P29V1",
+            session_outcome="committed",
+            reuse=False,
+        )
+    elif mutation == "unbound_row":
+        mismatch["row_job_id"] = "2"
+    else:
+        mismatch["endpoint_wire_revision"] = 1
+    verdict = evaluate_bundle(fixture)
+    clause = next(
+        item
+        for item in verdict["clauses"]
+        if item["id"] == "s90.named-refusal-fresh-remote-retry"
+    )
+    assert verdict["status"] == "FAIL"
+    assert clause["status"] == "FAIL"
+
+
 def _s95_disk_fill_bundle() -> dict[str, object]:
     scenario = _scenario("S'C'F'", worker_versions=(50, 50))
     scenario["id"] = "S95-cache-disk-full"

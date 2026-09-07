@@ -147,6 +147,15 @@ def _validate_shape(
             and bool(worker_revisions & client_revisions)
             and bool(worker_revisions - client_revisions)
         )
+    elif shape == "S'[F~][C']":
+        matches = (
+            len(by_role["S"]) == 1
+            and len(by_role["C"]) == 1
+            and len(by_role["F"]) == 1
+            and all_new("S")
+            and all_new("C")
+            and all_new("F")
+        )
 
     if not matches:
         raise ScenarioSpecError(

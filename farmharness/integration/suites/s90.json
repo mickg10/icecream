@@ -1,5 +1,5 @@
 {
   "schema": "icefarm-suite-v1",
   "id": "s90-revision-skew",
-  "scenarios": ["S90-revision-skew"]
+  "scenarios": ["S90-revision-skew", "S90-revision-refusal-retry"]
 }

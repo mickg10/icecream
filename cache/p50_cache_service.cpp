@@ -147,13 +147,19 @@ void append_source_result_trace(
     const char* reuse = "null";
     if (transfer.system_source_reuse.has_value())
         reuse = *transfer.system_source_reuse ? "true" : "false";
+    const uint16_t terminal_error_code =
+        transfer.terminal_error.has_value() ? transfer.terminal_error->code : 0;
+    const char* terminal_error_name =
+        terminal_error_code == static_cast<uint16_t>(ErrorCode::WIRE_REVISION_MISMATCH)
+            ? "\"WIRE_REVISION_MISMATCH\""
+            : "null";
     const std::string c_guid = bytes_hex(std::span<const uint8_t>(
         c_store_guid.bytes.data(), c_store_guid.bytes.size()));
     const std::string raw_digest = icecc::digest128_hex(transfer.raw_digest);
     char line[1024];
     const int length = std::snprintf(
         line, sizeof(line),
-        "{\"schema\":\"icecream-p50-source-result-v1\","
+        "{\"schema\":\"icecream-p50-source-result-v2\","
         "\"wire_job_id\":%llu,\"logical_job\":%llu,"
         "\"assignment_epoch\":%llu,\"assignment_nonce\":%llu,"
         "\"c_store_guid\":\"%s\","
@@ -163,6 +169,8 @@ void append_source_result_trace(
         "\"c_to_f_bytes\":%llu,\"f_to_c_bytes\":%llu,"
         "\"source_mutex_wait_ns\":%llu,"
         "\"source_mutex_service_ns\":%llu,"
+        "\"terminal_error_code\":%u,"
+        "\"terminal_error_name\":%s,"
         "\"system_source_reuse\":%s}\n",
         static_cast<unsigned long long>(request.wire_job_id),
         static_cast<unsigned long long>(request.logical_job),
@@ -181,7 +189,8 @@ void append_source_result_trace(
         static_cast<unsigned long long>(transfer.c_to_f_bytes),
         static_cast<unsigned long long>(transfer.f_to_c_bytes),
         static_cast<unsigned long long>(source_mutex_wait_ns),
-        static_cast<unsigned long long>(source_mutex_service_ns), reuse);
+        static_cast<unsigned long long>(source_mutex_service_ns),
+        static_cast<unsigned>(terminal_error_code), terminal_error_name, reuse);
     if (length <= 0 || static_cast<size_t>(length) >= sizeof(line))
         return;
     const int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC |

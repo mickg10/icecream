@@ -24,6 +24,7 @@ from farmharness.integration.collect import (
     _retained_log_witness,
     _parse_logins,
     _snapshot_live_evidence,
+    _source_results,
     _transition_target_env,
     _validate_orphan_recovery_markers,
     _warm_hint_overrides,
@@ -43,6 +44,60 @@ from farmharness.integration.verdict import _assignment_preference_errors
 INTEGRATION = Path(__file__).resolve().parents[1]
 SHA = "a" * 64
 C_GUID = "1" * 32
+
+
+def _source_result_record() -> dict[str, object]:
+    return {
+        "assignment_epoch": 1,
+        "assignment_nonce": 1,
+        "attempts": 1,
+        "c_store_guid": C_GUID,
+        "c_to_f_bytes": 0,
+        "f_to_c_bytes": 0,
+        "logical_job": 2,
+        "profile": "P29V1",
+        "raw_bytes": 0,
+        "raw_digest": "0" * 32,
+        "schema": "icecream-p50-source-result-v2",
+        "source_mutex_service_ns": 1,
+        "source_mutex_wait_ns": 0,
+        "status": 4,
+        "system_source_reuse": None,
+        "terminal_error_code": 4,
+        "terminal_error_name": "WIRE_REVISION_MISMATCH",
+        "tu_seq": 0,
+        "wire_job_id": 2,
+    }
+
+
+def test_source_result_authenticates_named_wire_revision_mismatch(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "source-result.jsonl"
+    record = _source_result_record()
+    _write_jsonl(path, [record])
+    assert _source_results(path) == {(2, 1, 1): record}
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("terminal_error_code", 0),
+        ("terminal_error_code", 65536),
+        ("terminal_error_name", None),
+        ("terminal_error_name", "OTHER"),
+        ("status", 0),
+    ),
+)
+def test_source_result_refuses_forged_terminal_error(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    path = tmp_path / "source-result.jsonl"
+    record = _source_result_record()
+    record[field] = value
+    _write_jsonl(path, [record])
+    with pytest.raises(CollectError):
+        _source_results(path)
 
 
 def test_p29_interner_fault_witness_is_exact_and_bound_to_client(
@@ -413,11 +468,13 @@ def _raw_collection(tmp_path: Path):
                 "profile": "P29V1",
                 "raw_bytes": 100,
                 "raw_digest": "2" * 32,
-                "schema": "icecream-p50-source-result-v1",
+                "schema": "icecream-p50-source-result-v2",
                 "source_mutex_service_ns": 2_000_000,
                 "source_mutex_wait_ns": 1_000,
                 "status": 0,
                 "system_source_reuse": False,
+                "terminal_error_code": 0,
+                "terminal_error_name": None,
                 "tu_seq": 1,
                 "wire_job_id": 2,
             }

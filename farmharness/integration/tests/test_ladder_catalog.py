@@ -370,7 +370,22 @@ def test_s90_revision_skew_resolves_one_compatible_and_one_legacy_pair() -> None
     }
     assert load_suite_spec(
         INTEGRATION / "suites" / "s90.json"
-    ).expanded_scenario_ids() == (("S90-revision-skew", 1),)
+    ).expanded_scenario_ids() == (
+        ("S90-revision-skew", 1),
+        ("S90-revision-refusal-retry", 1),
+    )
+
+    refusal = load_scenario_spec(
+        INTEGRATION / "scenarios" / "S90-revision-refusal-retry.json", farm
+    )
+    refusal_plan = farmtest.build_plan(farm, refusal, run_id="s90-refusal-dry-plan")
+    assert refusal.data["shape"] == "S'[F~][C']"
+    assert refusal.data["workload"]["jobs"] == 1
+    target = next(
+        item for item in refusal_plan["topology"]["instances"] if item["name"] == "F1"
+    )
+    assert target["cache_wire_revision"] == 1
+    assert target["image"]["kind"] == "daemon-mutant"
 
 
 def test_s95_disk_fill_mount_is_bounded_and_only_replaces_the_target_cache() -> None:

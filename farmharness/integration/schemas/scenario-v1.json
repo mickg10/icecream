@@ -21,7 +21,7 @@
     "schema": {"const": "icefarm-scenario-v1"},
     "id": {"$ref": "#/$defs/name"},
     "shape": {
-      "enum": ["-", "SCF", "S'CF", "S'FC'", "S'C'F'", "S'[FF'][CC']", "S'[F'F''][C']", "all", "mixed"]
+      "enum": ["-", "SCF", "S'CF", "S'FC'", "S'C'F'", "S'[FF'][CC']", "S'[F'F''][C']", "S'[F~][C']", "all", "mixed"]
     },
     "images": {
       "type": "object",

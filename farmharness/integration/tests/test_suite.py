@@ -664,7 +664,10 @@ def test_checked_in_full_suite_preserves_every_specialized_gate_and_preflights()
     assert children["ladder"].data["kind"] == "composite"
     assert children["s70"].data["kind"] == "s70-resilience"
     assert children["twobuild"].data["performance"]["kind"] == "s80"
-    assert children["s90"].expanded_scenario_ids() == (("S90-revision-skew", 1),)
+    assert children["s90"].expanded_scenario_ids() == (
+        ("S90-revision-skew", 1),
+        ("S90-revision-refusal-retry", 1),
+    )
     assert children["s95-disk-full"].expanded_scenario_ids() == (
         ("H5-worker-kill", 1),
         ("S95-cache-disk-full", 1),

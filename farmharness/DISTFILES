@@ -35,6 +35,7 @@ farmharness/integration/lifecycle.py
 farmharness/integration/live_lock.py
 farmharness/integration/mutant.py
 farmharness/integration/mutants/daemon-session-refuse.patch
+farmharness/integration/mutants/daemon-hidden-wire-skew.patch
 farmharness/integration/mutants/daemon-wire-revision-2.patch
 farmharness/integration/mutants/scheduler-tail.patch
 farmharness/integration/performance.py
@@ -90,6 +91,7 @@ farmharness/integration/scenarios/S80-p29v1.json
 farmharness/integration/scenarios/S80-zstd-route.json
 farmharness/integration/scenarios/S80-zstd-tu.json
 farmharness/integration/scenarios/S90-revision-skew.json
+farmharness/integration/scenarios/S90-revision-refusal-retry.json
 farmharness/integration/scenarios/S95-cache-disk-full.json
 farmharness/integration/schema_validation.py
 farmharness/integration/schemas/farm-v1.json

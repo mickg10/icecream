@@ -233,7 +233,10 @@ def check_cache_service(source: str) -> None:
     for token in ("transfer.raw_digest", "digest128_hex",
                   '"raw_digest\\\":\\\"%s',
                   '"source_mutex_wait_ns\\\":%llu',
-                  '"source_mutex_service_ns\\\":%llu'):
+                  '"source_mutex_service_ns\\\":%llu',
+                  '"terminal_error_code\\\":%u',
+                  '"terminal_error_name\\\":%s',
+                  "ErrorCode::WIRE_REVISION_MISMATCH"):
         require(token in source_trace,
                 f"C-side source-result trace omits {token}")
     transfer = section(source, "SidecarRuntime::transfer_source_on_owner(",
