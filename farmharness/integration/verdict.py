@@ -650,11 +650,10 @@ def _assignment_preference_errors(
             or len(set(free)) != len(free)
             or not isinstance(occupancy, Mapping)
             or set(occupancy) != set(expected_workers)
-            or any(
-                not _is_int(value)
-                or value > expected_workers[worker]
-                for worker, value in occupancy.items()
-            )
+            # Scheduler preload may legally queue more assignments than a
+            # worker has execution slots.  Slot saturation is therefore
+            # ``occupancy >= slots``; an above-slot count is not malformed.
+            or any(not _is_int(value) for value in occupancy.values())
             or decision.get("client") not in expected_clients
             or decision.get("worker") not in expected_workers
             or not isinstance(decision.get("row_job_id"), str)

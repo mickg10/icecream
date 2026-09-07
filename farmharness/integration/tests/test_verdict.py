@@ -2264,6 +2264,22 @@ def test_mixed_assignment_preference_clause_is_recomputed_fail_closed() -> None:
         if item["id"] == "shape.compatible-free-preference"
     )["status"] == "PASS"
 
+    preloaded = copy.deepcopy(fixture)
+    preference = preloaded["observations"]["assignment_preference"]
+    preference["decisions"][1]["worker"] = "F1"
+    preference["decisions"][2].update(
+        client="C1",
+        compatible_free_workers=[],
+        compatible_workers=["F1"],
+        occupancy={"F1": 2, "F2": 0},
+        worker="F2",
+    )
+    assert next(
+        item
+        for item in evaluate_bundle(preloaded)["clauses"]
+        if item["id"] == "shape.compatible-free-preference"
+    )["status"] == "PASS"
+
     malformed = copy.deepcopy(fixture)
     malformed["observations"]["assignment_preference"]["decisions"][0].pop("occupancy")
     assert evaluate_bundle(malformed)["status"] == "FAIL"
