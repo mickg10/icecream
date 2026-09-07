@@ -5621,8 +5621,14 @@ static bool quiesce_session_compilers(uint64_t generation,
                     icecc::daemon_child::send_term_if_owned(
                         rec.signal, rec.pid, rec.pgid,
                         child_signal_operations);
-                if (result.invoked && rec.signal.active)
-                    rec.state = ChildRecord::TERM_SENT;
+                if (result.invoked) {
+                    log_info() << "session quiescence TERM compiler pid="
+                               << rec.pid << " pgid=" << rec.pgid
+                               << " generation=" << rec.session_generation
+                               << " errno=" << result.error << endl;
+                    if (rec.signal.active)
+                        rec.state = ChildRecord::TERM_SENT;
+                }
             }
             pending.push_back(rec.pid);
         }
@@ -5635,6 +5641,9 @@ static bool quiesce_session_compilers(uint64_t generation,
                     rec.signal, rec.pid, rec.pgid,
                     child_signal_operations)) {
             rec.state = ChildRecord::REAPED;
+            log_info() << "session quiescence settled compiler pid="
+                       << rec.pid << " pgid=" << rec.pgid
+                       << " generation=" << rec.session_generation << endl;
             ++fsession_compilers_quiesced;
             ++quiesced_now;
             child_registry.erase(*pit);
@@ -5682,6 +5691,10 @@ static bool quiesce_session_compilers(uint64_t generation,
         if (result.invoked) {
             ++fsession_kill_escalations;
             rec.state = ChildRecord::KILL_SENT;
+            log_info() << "session quiescence KILL compiler pid="
+                       << rec.pid << " pgid=" << rec.pgid
+                       << " generation=" << rec.session_generation
+                       << " errno=" << result.error << endl;
         }
     }
 

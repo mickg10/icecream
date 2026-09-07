@@ -221,7 +221,10 @@ def check_compiler_quiescence(source: str, helper: str, makefile: str) -> None:
     require('#include "compiler_group_signal.h"' in source,
             "daemon does not use the shared compiler signal-authority primitive")
     for token in ("send_term_if_owned(", "observe_owned_anchor(",
-                  "send_final_if_owned(", "settle_retired("):
+                  "send_final_if_owned(", "settle_retired(",
+                  '"session quiescence TERM compiler pid="',
+                  '"session quiescence KILL compiler pid="',
+                  '"session quiescence settled compiler pid="'):
         require(token in flow, f"quiescence omits shared primitive {token}")
     require("kill(-rec.pgid" not in flow and "kill(rec.pid" not in flow,
             "quiescence bypasses exact child-anchor signal authority")
@@ -463,6 +466,8 @@ def deletion_mutants(files: dict[str, str]) -> None:
         ("main", "legacy CompileFile admitted canonical input for job", "TRACE_DELETED"),
         ("main", "icecc::daemon_child::send_final_if_owned(",
          "final_signal_deleted("),
+        ("main", '"session quiescence KILL compiler pid="',
+         '"session quiescence KILL deleted pid="'),
         ("compiler_signal", "WEXITED | WNOHANG | WNOWAIT",
          "WEXITED | WNOHANG"),
         ("compiler_signal",
