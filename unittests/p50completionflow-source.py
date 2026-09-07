@@ -166,11 +166,16 @@ def check_parent(source: str) -> None:
     child_completion = section(source, "static bool complete_child_registration(",
                                "/* The exact quiescence barrier")
     require("waitpid(" not in child_completion and
-            "ChildRecord::COMPLETION_OBSERVED" in child_completion and
+            "record->second.completion_observed" in child_completion and
+            "record->second.completion_observed = true;" in child_completion and
+            "record->second.state" not in child_completion and
             "record->second.kind != ChildRecord::COMPILER" in child_completion and
             "release_slot_once(record->second.slot)" in child_completion,
-            "normal completion consumes its anchor, drops noncompiler completion, "
+            "normal completion is not a monotonic fact independent of OS cleanup, "
             "or omits once-only compiler slot release")
+    require("bool completion_observed;" in source and
+            "ChildRecord::COMPLETION_OBSERVED" not in source,
+            "compiler completion is still encoded in the mutable signal phase")
     require("!p50_input &&\n        read(client->pipe_from_child" in flow,
             "legacy parent read is not isolated from the P50 record")
     require("p50_observation.valid()" in flow,
@@ -218,8 +223,8 @@ def check_parent(source: str) -> None:
             "set_p50_legacy_wire_identity(identity)")
 
 
-def check_compiler_quiescence(source: str, helper: str, makefile: str,
-                              daemon_makefile: str) -> None:
+def check_compiler_quiescence(source: str, helper: str, test_source: str,
+                              makefile: str, daemon_makefile: str) -> None:
     flow = section(source, "/* The exact quiescence barrier",
                    "void Daemon::handle_old_request")
     require('#include "compiler_group_signal.h"' in source,
@@ -234,8 +239,11 @@ def check_compiler_quiescence(source: str, helper: str, makefile: str,
             "quiescence bypasses exact child-anchor signal authority")
     reaper = section(source, "if (!child_registry.empty()) {",
                      "/* Push queued state records")
-    require("observe_owned_anchor(" in reaper,
-            "generic reaper consumes an unfinished compiler leader anchor")
+    require("const bool lifecycle_complete =\n"
+            "                iterator->second.completion_observed;" in reaper,
+            "generic reaper does not preserve monotonic completion across signals")
+    require(reaper.count("advance_exited_group_cleanup(") == 2,
+            "generic unfinished/completed cleanup does not share the two-turn helper")
     for token in ("orphaned compiler cleanup KILL pid=",
                   "completed compiler cleanup KILL pid=",
                   "completed compiler cleanup settled pid=",
@@ -259,6 +267,23 @@ def check_compiler_quiescence(source: str, helper: str, makefile: str,
         require(token in helper, f"signal-authority helper omits {token}")
     require("release_slot_once(SlotAccounting& accounting)" in helper,
             "compiler slot accounting is not a shared once-only primitive")
+    cleanup_helper = section(
+        helper,
+        "CleanupAdvance advance_exited_group_cleanup(",
+        "\n}\n\n}  // namespace icecc::daemon_child")
+    ordered(cleanup_helper,
+            "if (authority.active)",
+            "observe_owned_anchor(authority, leader, operations)",
+            "AnchorObservation::ExitedWaitable",
+            "send_final_if_owned(",
+            "if (!authority.active)",
+            "settle_retired(")
+    require(test_source.count(
+                "test_completed_cleanup_settles_on_a_later_event_loop_turn") == 2 and
+            test_source.count("advance_exited_group_cleanup(") >= 3 and
+            "!second.final_signal.invoked && second.settled" in test_source and
+            "later cleanup turn released the completed slot twice" in test_source,
+            "compiled regression does not exercise later-turn production cleanup")
     ordered(helper,
             "authority.final_sent = true;",
             "authority.active = false;",
@@ -448,7 +473,8 @@ def check_all(files: dict[str, str]) -> None:
     check_worker(files["serve"], files["record_h"] + files["record_cpp"])
     check_parent(files["main"])
     check_compiler_quiescence(files["main"], files["compiler_signal"],
-                              files["unit_make"], files["daemon_make"])
+                              files["compiler_test"], files["unit_make"],
+                              files["daemon_make"])
     check_record(files["record_h"], files["record_cpp"])
     check_cache_service(files["cache_service"])
     check_runtime_gate(files["runtime_gate"])
@@ -482,6 +508,14 @@ def deletion_mutants(files: dict[str, str]) -> None:
         ("main", "cache_adapter->outer_immediate_turn_required()", "false"),
         ("main", "ICECC_P50_TEST_POST_TERMINAL_ATTACH", "PROBE_DELETED"),
         ("main", "legacy CompileFile admitted canonical input for job", "TRACE_DELETED"),
+        ("main", "record->second.completion_observed = true;",
+         "completion_observed_deleted();"),
+        ("main",
+         "const bool lifecycle_complete =\n"
+         "                iterator->second.completion_observed;",
+         "const bool lifecycle_complete = false;"),
+        ("main", "icecc::daemon_child::advance_exited_group_cleanup(",
+         "cleanup_advance_deleted("),
         ("main", "icecc::daemon_child::send_final_if_owned(",
          "final_signal_deleted("),
         ("main", '"session quiescence KILL compiler pid="',
@@ -495,11 +529,15 @@ def deletion_mutants(files: dict[str, str]) -> None:
          "pollfd_is_set(pollfds, client->pipe_from_child, POLLIN)"),
         ("compiler_signal", "release_slot_once(SlotAccounting& accounting)",
          "release_slot_deleted(SlotAccounting& accounting)"),
+        ("compiler_signal", "CleanupAdvance advance_exited_group_cleanup(",
+         "CleanupAdvance cleanup_advance_deleted("),
         ("compiler_signal", "WEXITED | WNOHANG | WNOWAIT",
          "WEXITED | WNOHANG"),
         ("compiler_signal",
          "authority.final_sent = true;\n    authority.active = false;",
          "authority.final_sent = true;"),
+        ("compiler_test",
+         "test_completed_cleanup_settles_on_a_later_event_loop_turn();", ""),
         ("record_h", "static_assert(kLegacyCompletionStatsWireSize == 32", "static_assert(true"),
         ("record_cpp", "flags | O_NONBLOCK", "flags"),
         ("record_cpp", "if (count != 0)", "if (false)"),
@@ -563,6 +601,7 @@ def main() -> int:
         "serve": (ROOT / "daemon/serve.cpp").read_text(),
         "main": (ROOT / "daemon/main.cpp").read_text(),
         "compiler_signal": (ROOT / "daemon/compiler_group_signal.h").read_text(),
+        "compiler_test": (ROOT / "unittests/p50_compiler_quiescence_test.cpp").read_text(),
         "unit_make": (ROOT / "unittests/Makefile.am").read_text(),
         "daemon_make": (ROOT / "daemon/Makefile.am").read_text(),
         "record_h": (ROOT / "daemon/p50_completion_record.h").read_text(),

@@ -44,6 +44,12 @@ struct SlotAccounting {
     bool active = true;
 };
 
+struct CleanupAdvance {
+    AnchorObservation anchor = AnchorObservation::Unprovable;
+    SignalResult final_signal;
+    bool settled = false;
+};
+
 inline bool release_slot_once(SlotAccounting& accounting) noexcept
 {
     if (!accounting.active)
@@ -207,6 +213,32 @@ bool settle_retired(SignalAuthority& authority,
             return false;
     }
     return true;
+}
+
+/* One ordinary event-loop turn for a compiler group whose direct leader may
+   have exited.  Completion/slot accounting deliberately lives outside this
+   helper: a final signal retires only OS signal authority, never the logical
+   completion fact.  Later turns continue settle_retired() without restoring
+   authority or emitting another signal. */
+template <typename Operations>
+CleanupAdvance advance_exited_group_cleanup(SignalAuthority& authority,
+                                             pid_t leader,
+                                             pid_t pgid,
+                                             Operations& operations) noexcept
+{
+    CleanupAdvance result;
+    if (authority.active) {
+        result.anchor = observe_owned_anchor(authority, leader, operations);
+        if (result.anchor == AnchorObservation::ExitedWaitable) {
+            result.final_signal = send_final_if_owned(
+                authority, leader, pgid, operations);
+        }
+    }
+    if (!authority.active) {
+        result.settled = settle_retired(
+            authority, leader, pgid, operations);
+    }
+    return result;
 }
 
 }  // namespace icecc::daemon_child

@@ -175,6 +175,40 @@ void test_completed_and_active_slots_release_exactly_once()
             "completed A plus active B left incorrect capacity accounting");
 }
 
+void test_completed_cleanup_settles_on_a_later_event_loop_turn()
+{
+    FakeOperations operations;
+    operations.anchors = {
+        child::AnchorObservation::ExitedWaitable,
+        child::AnchorObservation::ExitedWaitable,
+    };
+    operations.consumes = {child::ConsumeObservation::Consumed};
+    operations.groups = {
+        child::GroupObservation::Present,
+        child::GroupObservation::Absent,
+    };
+    child::SignalAuthority authority;
+    child::SlotAccounting slot;
+
+    require(child::release_slot_once(slot),
+            "completion did not release its logical slot");
+    const child::CleanupAdvance first =
+        child::advance_exited_group_cleanup(authority, 46, 46, operations);
+    require(first.final_signal.invoked && !first.settled,
+            "first cleanup turn did not signal once and retain present residue");
+    require(!authority.active && authority.final_sent,
+            "first cleanup turn did not retire signal authority");
+
+    const child::CleanupAdvance second =
+        child::advance_exited_group_cleanup(authority, 46, 46, operations);
+    require(!second.final_signal.invoked && second.settled,
+            "later cleanup turn did not settle without another signal");
+    require(!child::release_slot_once(slot),
+            "later cleanup turn released the completed slot twice");
+    require(operations.signals == std::vector<int>({SIGKILL}),
+            "multi-turn completion cleanup emitted more than one final signal");
+}
+
 void test_group_disappearance_at_term_is_terminal()
 {
     FakeOperations operations;
@@ -374,9 +408,11 @@ void test_real_waitable_leader_anchors_descendant_kill()
             "TERM leader did not become a retained waitable anchor");
     require(::kill(owned.descendant, 0) == 0,
             "TERM-ignoring descendant did not survive the grace phase");
-    require(child::send_final_if_owned(
-                owned.authority, owned.leader, owned.leader,
-                owned.operations).invoked,
+    const child::CleanupAdvance first_cleanup =
+        child::advance_exited_group_cleanup(
+            owned.authority, owned.leader, owned.leader,
+            owned.operations);
+    require(first_cleanup.final_signal.invoked && !first_cleanup.settled,
             "waitable leader did not authorize real final group KILL");
     require(!owned.authority.active && owned.authority.final_sent,
             "real final signal did not retire authority");
@@ -388,9 +424,11 @@ void test_real_waitable_leader_anchors_descendant_kill()
     owned.descendant = -1;
     require(WIFSIGNALED(descendant_status) && WTERMSIG(descendant_status) == SIGKILL,
             "descendant was not killed by the final group signal");
-    require(child::settle_retired(
-                owned.authority, owned.leader, owned.leader,
-                owned.operations),
+    const child::CleanupAdvance final_cleanup =
+        child::advance_exited_group_cleanup(
+            owned.authority, owned.leader, owned.leader,
+            owned.operations);
+    require(!final_cleanup.final_signal.invoked && final_cleanup.settled,
             "real leader/group did not settle after exact reaps");
     require(owned.authority.leader_consumed && owned.authority.group_absent,
             "real settlement omitted leader consumption or group absence");
@@ -411,6 +449,7 @@ int main()
         test_lost_anchor_never_authorizes_a_numeric_signal();
         test_malformed_group_identity_fails_before_syscalls();
         test_completed_and_active_slots_release_exactly_once();
+        test_completed_cleanup_settles_on_a_later_event_loop_turn();
         test_group_disappearance_at_term_is_terminal();
         test_lost_after_term_fails_closed_without_reauthorization();
 #if defined(__linux__)
