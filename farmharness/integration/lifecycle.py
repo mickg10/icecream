@@ -3172,7 +3172,16 @@ def collect_diagnostics(
             else container
         )
         diagnostics = [
-            ("inspect", ("container", "inspect", container_target)),
+            (
+                "inspect",
+                (
+                    "container",
+                    "inspect",
+                    "--format",
+                    "{{json .}}",
+                    container_target,
+                ),
+            ),
             ("logs", ("container", "logs", container_target)),
         ]
         if instance["name"] in shaped_names:

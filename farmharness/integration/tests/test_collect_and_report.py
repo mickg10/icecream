@@ -35,7 +35,11 @@ from farmharness.integration.collect import (
 from farmharness.integration.farm_spec import load_farm_spec
 from farmharness.integration.images import RecordingTransport
 from farmharness.integration.lifecycle import bundle_root
-from farmharness.integration.remote import CommandResult, PlannedCommand
+from farmharness.integration.remote import (
+    CommandResult,
+    PlannedCommand,
+    decode_ssh_payload,
+)
 from farmharness.integration.report import ReportError, report_bundle, verify_bundle
 from farmharness.integration.scenario_spec import load_scenario_spec
 from farmharness.integration.schema_validation import canonical_bytes
@@ -1759,19 +1763,27 @@ class _LiveCollection:
             return CommandResult(0, self._name_from_argv(command) + "\n", "")
         if command.phase == "diagnostics.inspect":
             name = self._name_from_argv(command)
-            return CommandResult(
-                0,
-                json.dumps(
-                    {
-                        "HostConfig": (
-                            {"Init": self.f_init}
-                            if name == "F1" and self.f_init is not None
-                            else {}
-                        )
-                    }
-                ),
-                "",
+            document = {
+                "HostConfig": (
+                    {"Init": self.f_init}
+                    if name == "F1" and self.f_init is not None
+                    else {}
+                )
+            }
+            argv = (
+                decode_ssh_payload(command.argv)
+                if command.argv and command.argv[0] == "ssh"
+                else command.argv
             )
+            if argv[-5:] != (
+                "container",
+                "inspect",
+                "--format",
+                "{{json .}}",
+                self.ids[name],
+            ):
+                return CommandResult(0, json.dumps([document]), "")
+            return CommandResult(0, json.dumps(document), "")
         if command.phase == "diagnostics.logs":
             return CommandResult(0, "container output\n", "")
         if command.phase == "diagnostics.sync-log":
@@ -1819,6 +1831,24 @@ def test_live_collection_authenticates_samples_then_freezes_before_copy(
         if command.phase == "collect.stop"
     ]
     assert stopped == ["C1", "F1", "S1"]
+    f_inspect = next(
+        command
+        for command in recorder.commands
+        if command.phase == "diagnostics.inspect"
+        and delegate._name_from_argv(command) == "F1"
+    )
+    inspect_argv = (
+        decode_ssh_payload(f_inspect.argv)
+        if f_inspect.argv[0] == "ssh"
+        else f_inspect.argv
+    )
+    assert inspect_argv[-5:] == (
+        "container",
+        "inspect",
+        "--format",
+        "{{json .}}",
+        delegate.ids["F1"],
+    )
 
 
 @pytest.mark.parametrize("f_init", (False, None))
