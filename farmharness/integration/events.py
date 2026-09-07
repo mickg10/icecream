@@ -17,6 +17,7 @@ import pathlib
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Mapping
@@ -1062,7 +1063,6 @@ class EventProducer:
                 "log_ready": {"state": "NOT_STARTED", "receipt": None},
             },
         }
-        self._current_gate_key: str | None = None
         self._state = {
             item["name"]: {
                 "image": dict(item["image"]),
@@ -1410,12 +1410,6 @@ class EventProducer:
                 "error": f"{type(exc).__name__}: {exc}",
                 "receipt": None,
             }
-        if self._current_gate_key is not None:
-            self._failure_evidence["gate_attempts"][self._current_gate_key] = {
-                "state": "FAILED",
-                "error": f"{type(exc).__name__}: {exc}",
-            }
-
     def _reset_failure_evidence(self) -> None:
         self._failure_evidence = {
             "gate_receipts": {},
@@ -1426,7 +1420,6 @@ class EventProducer:
                 "log_ready": {"state": "NOT_STARTED", "receipt": None},
             },
         }
-        self._current_gate_key = None
         self._current_phase = None
 
     def _persist_failure(self, exc: BaseException) -> None:
@@ -1837,16 +1830,143 @@ class EventProducer:
         timeout_s: int,
     ) -> dict[str, Any]:
         key = f"{turn}/{client['name']}/{action}"
-        self._current_gate_key = key
         try:
             return self._gate_control_impl(
                 client, action=action, turn=turn, epoch=epoch, timeout_s=timeout_s
             )
         except BaseException as exc:
-            self._mark_failure(self._current_phase, exc)
+            phase = {
+                "pause": "event.pause-drain",
+                "quiesce": "event.quiesce-drain",
+                "resume": "event.resume",
+                "abort": "event.abort-resume",
+            }[action]
+            self._mark_failure(phase, exc)
+            attempt = dict(self._failure_evidence["gate_attempts"].get(key, {}))
+            attempt.update(
+                {
+                    "state": "FAILED",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            self._failure_evidence["gate_attempts"][key] = attempt
             raise
-        finally:
-            self._current_gate_key = None
+
+    def _gate_command(
+        self,
+        client: Mapping[str, Any],
+        *,
+        action: str,
+        turn: str,
+        epoch: int,
+        timeout_s: int,
+    ) -> Any:
+        container = f"icefarm-{self.plan['run_id']}-{client['name']}"
+        return self.factory.make(
+            phase={
+                "pause": "event.pause-drain",
+                "quiesce": "event.quiesce-drain",
+                "resume": "event.resume",
+                "abort": "event.abort-resume",
+            }[action],
+            host=client["host"],
+            instance=client["name"],
+            transport=_docker_transport(self.farm, client["host"]),
+            timeout_s=timeout_s,
+            argv=docker_argv(
+                self.farm,
+                client["host"],
+                (
+                    "exec",
+                    "--user",
+                    "0",
+                    container,
+                    "python3",
+                    "-c",
+                    GATE_CONTROL_SCRIPT,
+                    action,
+                    f"/results/workload/{turn}",
+                    client["name"],
+                    turn,
+                    str(epoch),
+                    str(max(1, timeout_s - 1)),
+                ),
+            ),
+        )
+
+    def _gate_controls(
+        self,
+        clients: Iterable[Mapping[str, Any]],
+        *,
+        action: str,
+        turn: str,
+        epoch: int,
+        timeout_s: int,
+        receipts: dict[str, dict[str, Any]],
+    ) -> None:
+        """Close every client gate before waiting for any one drain.
+
+        A serial pause lets the first client's long drain consume the entire
+        workload on a later client.  Commands are allocated in stable client
+        order, then executed concurrently and joined within their individual
+        hard timeouts.  This preserves the per-client positive-active witness
+        while creating one bounded multi-client transition barrier.
+        """
+
+        ordered = tuple(clients)
+        if not ordered:
+            return
+        commands = tuple(
+            self._gate_command(
+                client,
+                action=action,
+                turn=turn,
+                epoch=epoch,
+                timeout_s=timeout_s,
+            )
+            for client in ordered
+        )
+        failures: list[tuple[str, BaseException]] = []
+        with ThreadPoolExecutor(max_workers=len(ordered)) as executor:
+            futures = tuple(
+                executor.submit(
+                    self._gate_control_impl,
+                    client,
+                    action=action,
+                    turn=turn,
+                    epoch=epoch,
+                    timeout_s=timeout_s,
+                    command=command,
+                )
+                for client, command in zip(ordered, commands, strict=True)
+            )
+            for client, future in zip(ordered, futures, strict=True):
+                key = f"{turn}/{client['name']}/{action}"
+                try:
+                    receipts[client["name"]] = future.result()
+                except BaseException as exc:
+                    attempt = dict(
+                        self._failure_evidence["gate_attempts"].get(key, {})
+                    )
+                    attempt.update(
+                        {
+                            "state": "FAILED",
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+                    self._failure_evidence["gate_attempts"][key] = attempt
+                    failures.append((client["name"], exc))
+        if failures:
+            phase = {
+                "pause": "event.pause-drain",
+                "quiesce": "event.quiesce-drain",
+                "resume": "event.resume",
+                "abort": "event.abort-resume",
+            }[action]
+            primary = failures[0][1]
+            self._mark_failure(phase, primary)
+            detail = "; ".join(f"{name}: {exc}" for name, exc in failures)
+            raise EventError(f"coordinated event gate {action} failed: {detail}") from primary
 
     def _gate_control_impl(
         self,
@@ -1856,42 +1976,19 @@ class EventProducer:
         turn: str,
         epoch: int,
         timeout_s: int,
+        command: Any | None = None,
     ) -> dict[str, Any]:
-        container = f"icefarm-{self.plan['run_id']}-{client['name']}"
         key = f"{turn}/{client['name']}/{action}"
         self._failure_evidence["gate_attempts"][key] = {"state": "ATTEMPTED"}
         try:
             result = self._invoke(
-                self.factory.make(
-                phase={
-                    "pause": "event.pause-drain",
-                    "quiesce": "event.quiesce-drain",
-                    "resume": "event.resume",
-                    "abort": "event.abort-resume",
-                }[action],
-                host=client["host"],
-                instance=client["name"],
-                transport=_docker_transport(self.farm, client["host"]),
-                timeout_s=timeout_s,
-                argv=docker_argv(
-                    self.farm,
-                    client["host"],
-                    (
-                        "exec",
-                        "--user",
-                        "0",
-                        container,
-                        "python3",
-                        "-c",
-                        GATE_CONTROL_SCRIPT,
-                        action,
-                        f"/results/workload/{turn}",
-                        client["name"],
-                        turn,
-                        str(epoch),
-                        str(max(1, timeout_s - 1)),
-                    ),
-                ),
+                command
+                or self._gate_command(
+                    client,
+                    action=action,
+                    turn=turn,
+                    epoch=epoch,
+                    timeout_s=timeout_s,
                 )
             )
         except BaseException as exc:
@@ -1903,6 +2000,15 @@ class EventProducer:
         try:
             receipt = json.loads(result.stdout.strip())
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            self._failure_evidence["gate_attempts"][key] = {
+                "state": "FAILED",
+                "error": f"EventError: event gate {action} returned malformed JSON",
+                "raw_result": {
+                    "returncode": result.returncode,
+                    "stderr": result.stderr,
+                    "stdout": result.stdout,
+                },
+            }
             raise EventError(f"event gate {action} returned malformed JSON") from exc
         fields = {
             "action",
@@ -1944,6 +2050,16 @@ class EventProducer:
                 )
             )
         ):
+            self._failure_evidence["gate_attempts"][key] = {
+                "state": "FAILED",
+                "error": f"EventError: event gate {action} returned an invalid receipt",
+                "receipt": receipt,
+                "raw_result": {
+                    "returncode": result.returncode,
+                    "stderr": result.stderr,
+                    "stdout": result.stdout,
+                },
+            }
             raise EventError(f"event gate {action} returned an invalid receipt")
         self._failure_evidence["gate_receipts"][f"{turn}/{client['name']}/{action}"] = receipt
         self._failure_evidence["gate_attempts"][key] = {
@@ -2161,7 +2277,6 @@ class EventProducer:
         start_argv = self._start_argv(event, target)
         pauses: dict[str, dict[str, Any]] = {}
         resumes: dict[str, dict[str, Any]] = {}
-        paused: list[Mapping[str, Any]] = []
         primary: BaseException | None = None
         after: dict[str, Any] | None = None
         readiness: dict[str, Any] | None = None
@@ -2176,15 +2291,14 @@ class EventProducer:
             item for item in self.plan["topology"]["instances"] if item["role"] == "S"
         )
         try:
-            for client in clients:
-                pauses[client["name"]] = self._gate_control(
-                    client,
-                    action="pause",
-                    turn=turn,
-                    epoch=epoch,
-                    timeout_s=drain_timeout,
-                )
-                paused.append(client)
+            self._gate_controls(
+                clients,
+                action="pause",
+                turn=turn,
+                epoch=epoch,
+                timeout_s=drain_timeout,
+                receipts=pauses,
+            )
             client_baselines = {
                 client["name"]: self._readiness_baseline(client) for client in clients
             }
@@ -2289,7 +2403,7 @@ class EventProducer:
         finally:
             release = "abort" if primary is not None else "resume"
             release_errors: list[str] = []
-            for client in paused:
+            for client in clients:
                 try:
                     resumes[client["name"]] = self._gate_control(
                         client,
@@ -2489,14 +2603,14 @@ class EventProducer:
         primary: BaseException | None = None
         drain_timeout = self._command_timeout(int(self.scenario.data["timeouts"]["turn_s"]))
         try:
-            for client in clients:
-                pauses[client["name"]] = self._gate_control(
-                    client,
-                    action="quiesce",
-                    turn=turn,
-                    epoch=epoch,
-                    timeout_s=drain_timeout,
-                )
+            self._gate_controls(
+                clients,
+                action="quiesce",
+                turn=turn,
+                epoch=epoch,
+                timeout_s=drain_timeout,
+                receipts=pauses,
+            )
             raw_checkpoints = self.quiesce_workload(turn, clients)
             if not isinstance(raw_checkpoints, Mapping) or set(raw_checkpoints) != {
                 item["name"] for item in clients
@@ -2819,14 +2933,14 @@ class EventProducer:
             int(self.scenario.data["timeouts"]["turn_s"])
         )
         try:
-            for client in clients:
-                pause_receipts[client["name"]] = self._gate_control(
-                    client,
-                    action="pause",
-                    turn=turn,
-                    epoch=epoch,
-                    timeout_s=drain_timeout,
-                )
+            self._gate_controls(
+                clients,
+                action="pause",
+                turn=turn,
+                epoch=epoch,
+                timeout_s=drain_timeout,
+                receipts=pause_receipts,
+            )
             client_baselines = {
                 client["name"]: self._readiness_baseline(client)
                 for client in clients
@@ -3325,14 +3439,14 @@ class EventProducer:
             int(self.scenario.data["timeouts"]["turn_s"])
         )
         try:
-            for client in clients:
-                pauses[client["name"]] = self._gate_control(
-                    client,
-                    action="pause",
-                    turn=turn,
-                    epoch=epoch,
-                    timeout_s=drain_timeout,
-                )
+            self._gate_controls(
+                clients,
+                action="pause",
+                turn=turn,
+                epoch=epoch,
+                timeout_s=drain_timeout,
+                receipts=pauses,
+            )
             baseline = self._readiness_baseline(instance)
             signal_receipt = self._signal_client_route_owner(instance)
             after_processes = self._wait_client_route_owner(instance, signal_receipt)
@@ -3561,14 +3675,14 @@ class EventProducer:
             int(self.scenario.data["timeouts"]["turn_s"])
         )
         try:
-            for client in clients:
-                pauses[client["name"]] = self._gate_control(
-                    client,
-                    action="pause",
-                    turn=turn,
-                    epoch=epoch,
-                    timeout_s=drain_timeout,
-                )
+            self._gate_controls(
+                clients,
+                action="pause",
+                turn=turn,
+                epoch=epoch,
+                timeout_s=drain_timeout,
+                receipts=pauses,
+            )
             baseline = self._readiness_baseline(instance)
             result = self._invoke(
                 self.factory.make(

@@ -1008,7 +1008,7 @@ def test_scheduler_restart_failure_aborts_every_paused_client(
         },
     )
 
-    def gate_control(_client, *, action, turn, epoch, timeout_s):
+    def gate_receipt(_client, *, action, turn, epoch):
         actions.append(action)
         return {
             "action": action,
@@ -1023,7 +1023,21 @@ def test_scheduler_restart_failure_aborts_every_paused_client(
             "turn": turn,
         }
 
-    monkeypatch.setattr(producer, "_gate_control", gate_control)
+    def gate_controls(clients, *, action, turn, epoch, timeout_s, receipts):
+        del timeout_s
+        for client in clients:
+            receipts[client["name"]] = gate_receipt(
+                client, action=action, turn=turn, epoch=epoch
+            )
+
+    monkeypatch.setattr(producer, "_gate_controls", gate_controls)
+    monkeypatch.setattr(
+        producer,
+        "_gate_control",
+        lambda client, *, action, turn, epoch, timeout_s: gate_receipt(
+            client, action=action, turn=turn, epoch=epoch
+        ),
+    )
     monkeypatch.setattr(
         producer,
         "_readiness_baseline",
@@ -1043,6 +1057,237 @@ def test_scheduler_restart_failure_aborts_every_paused_client(
     with pytest.raises(EventError, match="restart refused"):
         producer._coordinated_scheduler_restart(event, scheduler, "1" * 64)
     assert actions == ["pause", "abort"]
+
+
+def test_multi_client_gate_starts_every_pause_before_any_drain_completes(
+    tmp_path: Path,
+) -> None:
+    farm, scenario, plan = _fixture(tmp_path)
+    delegate = EventRecorder()
+    started = {"C1": threading.Event(), "C2": threading.Event()}
+
+    class ConcurrentGateRecorder:
+        def invoke(self, command: PlannedCommand) -> CommandResult:
+            if command.phase != "event.pause-drain":
+                return delegate.invoke(command)
+            delegate.commands.append(command)
+            assert command.instance in started
+            other = "C2" if command.instance == "C1" else "C1"
+            started[command.instance].set()
+            assert started[other].wait(timeout=1)
+            receipt = {
+                "action": "pause",
+                "active_after": 0,
+                "active_before": 48,
+                "client": command.instance,
+                "epoch": 1,
+                "finished_ms": 101,
+                "schema": "icefarm-event-gate-v1",
+                "started_ms": 100,
+                "status": "PAUSED",
+                "turn": "A",
+            }
+            return CommandResult(0, json.dumps(receipt), "")
+
+    producer = EventProducer(
+        farm,
+        scenario,
+        plan,
+        recorder=RecordingTransport(ConcurrentGateRecorder()),
+        deadline_s=2,
+    )
+    c1 = next(
+        item for item in plan["topology"]["instances"] if item["name"] == "C1"
+    )
+    c2 = dict(c1, name="C2", host="tt-quietbox3")
+    receipts: dict[str, dict[str, object]] = {}
+    producer._gate_controls(
+        (c1, c2),
+        action="pause",
+        turn="A",
+        epoch=1,
+        timeout_s=2,
+        receipts=receipts,
+    )
+    assert set(receipts) == {"C1", "C2"}
+    pauses = [
+        command for command in delegate.commands if command.phase == "event.pause-drain"
+    ]
+    assert [command.instance for command in sorted(pauses, key=lambda item: item.sequence)] == [
+        "C1",
+        "C2",
+    ]
+
+
+def test_empty_gate_barrier_is_a_noop(tmp_path: Path) -> None:
+    farm, scenario, plan = _fixture(tmp_path)
+    delegate = EventRecorder()
+    producer = EventProducer(
+        farm,
+        scenario,
+        plan,
+        recorder=RecordingTransport(delegate),
+        deadline_s=2,
+    )
+    receipts: dict[str, dict[str, object]] = {}
+    producer._gate_controls(
+        (),
+        action="pause",
+        turn="A",
+        epoch=1,
+        timeout_s=2,
+        receipts=receipts,
+    )
+    assert receipts == {}
+    assert delegate.commands == []
+
+
+def test_multi_client_gate_retains_the_invalid_raw_receipt(tmp_path: Path) -> None:
+    farm, scenario, plan = _fixture(tmp_path)
+    delegate = EventRecorder()
+    started = {"C1": threading.Event(), "C2": threading.Event()}
+
+    class InvalidSecondGateRecorder:
+        def invoke(self, command: PlannedCommand) -> CommandResult:
+            if command.phase != "event.pause-drain":
+                return delegate.invoke(command)
+            delegate.commands.append(command)
+            assert command.instance in started
+            other = "C2" if command.instance == "C1" else "C1"
+            started[command.instance].set()
+            assert started[other].wait(timeout=1)
+            receipt = {
+                "action": "pause",
+                "active_after": 0,
+                "active_before": 48 if command.instance == "C1" else 0,
+                "client": command.instance,
+                "epoch": 1,
+                "finished_ms": 101,
+                "schema": "icefarm-event-gate-v1",
+                "started_ms": 100,
+                "status": "PAUSED",
+                "turn": "A",
+            }
+            return CommandResult(0, json.dumps(receipt), "")
+
+    producer = EventProducer(
+        farm,
+        scenario,
+        plan,
+        recorder=RecordingTransport(InvalidSecondGateRecorder()),
+        deadline_s=2,
+    )
+    c1 = next(
+        item for item in plan["topology"]["instances"] if item["name"] == "C1"
+    )
+    c2 = dict(c1, name="C2", host="tt-quietbox3")
+    receipts: dict[str, dict[str, object]] = {}
+    with pytest.raises(EventError, match="C2: event gate pause returned an invalid receipt"):
+        producer._gate_controls(
+            (c1, c2),
+            action="pause",
+            turn="A",
+            epoch=1,
+            timeout_s=2,
+            receipts=receipts,
+        )
+    assert receipts["C1"]["active_before"] == 48
+    attempt = producer._failure_evidence["gate_attempts"]["A/C2/pause"]
+    assert attempt["state"] == "FAILED"
+    assert attempt["receipt"]["active_before"] == 0
+    assert json.loads(attempt["raw_result"]["stdout"])["active_before"] == 0
+
+
+def test_partial_multi_client_pause_failure_aborts_all_before_scheduler_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    farm, scenario, plan = _fixture(tmp_path)
+    scenario.data["workload"]["clients"] = ["C1", "C2"]
+    c1 = next(
+        item for item in plan["topology"]["instances"] if item["name"] == "C1"
+    )
+    plan["topology"]["instances"].append(
+        dict(c1, name="C2", host="tt-quietbox3")
+    )
+
+    class PartialBarrierRecorder:
+        def __init__(self) -> None:
+            self.commands: list[PlannedCommand] = []
+
+        def invoke(self, command: PlannedCommand) -> CommandResult:
+            self.commands.append(command)
+            if command.phase == "event.restart":
+                raise AssertionError("scheduler transition ran after a failed pause barrier")
+            if command.phase not in {"event.pause-drain", "event.abort-resume"}:
+                return CommandResult(0, "", "")
+            action = "pause" if command.phase == "event.pause-drain" else "abort"
+            receipt = {
+                "action": action,
+                "active_after": 0,
+                "active_before": (
+                    48
+                    if action == "pause" and command.instance == "C1"
+                    else 0
+                ),
+                "client": command.instance,
+                "epoch": 1,
+                "finished_ms": 101,
+                "schema": "icefarm-event-gate-v1",
+                "started_ms": 100,
+                "status": "PAUSED" if action == "pause" else "ABORT",
+                "turn": "A",
+            }
+            return CommandResult(0, json.dumps(receipt), "")
+
+    delegate = PartialBarrierRecorder()
+    producer = EventProducer(
+        farm,
+        scenario,
+        plan,
+        recorder=RecordingTransport(delegate),
+        deadline_s=2,
+    )
+    producer.signal_turn_start("A")
+    producer._start = producer.monotonic()
+    monkeypatch.setattr(
+        producer,
+        "_inspect",
+        lambda _name: {
+            "id": "1" * 64,
+            "running": True,
+            "started_at": "2026-09-05T12:59:50Z",
+        },
+    )
+    event = TimelineEvent.from_dict(
+        0, {"trigger": "job 24", "action": "restart", "instance": "S1"}
+    )
+    scheduler = next(
+        item for item in plan["topology"]["instances"] if item["role"] == "S"
+    )
+
+    with pytest.raises(
+        EventError,
+        match="C2: event gate pause returned an invalid receipt",
+    ):
+        producer._coordinated_scheduler_restart(event, scheduler, "1" * 64)
+
+    assert not any(command.phase == "event.restart" for command in delegate.commands)
+    assert sorted(
+        command.instance
+        for command in delegate.commands
+        if command.phase == "event.abort-resume"
+    ) == ["C1", "C2"]
+    assert producer._failure_evidence["root_phase"] == "event.pause-drain"
+    assert producer._failure_evidence["gate_receipts"]["A/C1/pause"][
+        "active_before"
+    ] == 48
+    assert producer._failure_evidence["gate_attempts"]["A/C2/pause"]["receipt"][
+        "active_before"
+    ] == 0
+    assert {
+        producer._failure_evidence["gate_receipts"][f"A/{client}/abort"]["status"]
+        for client in ("C1", "C2")
+    } == {"ABORT"}
 
 
 def test_worker_restart_stays_live_and_emits_collectable_rejoin_receipt(
