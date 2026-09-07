@@ -61,6 +61,7 @@ def test_s50_catalogue_has_exact_worker_fractions_and_safe_placements() -> None:
         assert scenario.data["expect"]["engagement"] == "expected(c,f)"
         assert scenario.data["expect"]["exact"] == "all"
         assert scenario.data["expect"]["wedges"] == 0
+        assert scenario.data["workload"]["jobs"] == 18
 
 
 def test_s50_suite_is_fixed_cheap_to_expensive_and_disjoint_from_s80() -> None:
@@ -82,6 +83,15 @@ def test_s50_suite_is_fixed_cheap_to_expensive_and_disjoint_from_s80() -> None:
         ],
         "ratio_limit": 1.05,
     }
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    for scenario_id in (
+        suite.data["fairness"]["control"],
+        *suite.data["fairness"]["mixed"],
+    ):
+        scenario = load_scenario_spec(
+            INTEGRATION / "scenarios" / f"{scenario_id}.json", farm
+        )
+        assert scenario.data["workload"]["jobs"] == 18
     s80 = load_suite_spec(INTEGRATION / "suites" / "twobuild.json")
     assert set(suite.data["scenarios"]).isdisjoint(s80.data["scenarios"])
 
