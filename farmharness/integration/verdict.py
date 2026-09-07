@@ -935,7 +935,7 @@ def _header_edit_receipt_errors(
 
 
 def _disk_fill_receipt_errors(
-    receipt: Any, event: Mapping[str, Any]
+    receipt: Any, event: Mapping[str, Any], topology: Any = None, run_id: Any = None
 ) -> set[str]:
     marker = "@event:disk-fill"
     if not isinstance(receipt, Mapping) or set(receipt) != {
@@ -961,16 +961,51 @@ def _disk_fill_receipt_errors(
         "size_bytes": CACHE_DISK_FAULT_BYTES,
         "type": "tmpfs",
     }
+    snapshot_fields = {
+        "container_id", "container_name", "host", "image_closure_sha256",
+        "image_id", "labels", "mount", "running", "runtime_path", "started_at",
+    }
+    target = next(
+        (
+            item for item in topology.get("instances", [])
+            if isinstance(item, Mapping) and item.get("name") == event.get("instance")
+        ),
+        None,
+    ) if isinstance(topology, Mapping) else None
+    expected_host = target.get("host") if isinstance(target, Mapping) else None
+    expected_closure = (
+        target.get("image", {}).get("closure_sha256")
+        if isinstance(target, Mapping) else None
+    )
+    expected_run = run_id if isinstance(run_id, str) else None
+    expected_name = (
+        f"icefarm-{expected_run}-{event['instance']}"
+        if isinstance(expected_run, str) and expected_run else None
+    )
     snapshots: dict[str, Mapping[str, Any]] = {}
     for side in ("before", "after"):
         value = receipt.get(side)
         if (
             not isinstance(value, Mapping)
-            or set(value) != {"container_id", "mount", "running", "started_at"}
+            or set(value) != snapshot_fields
             or not isinstance(value.get("container_id"), str)
             or SHA256_RE.fullmatch(value["container_id"]) is None
+            or not isinstance(value.get("container_name"), str)
+            or (expected_name is not None and value.get("container_name") != f"/{expected_name}")
+            or not isinstance(value.get("host"), str)
+            or (expected_host is not None and value.get("host") != expected_host)
+            or not isinstance(value.get("image_closure_sha256"), str)
+            or SHA256_RE.fullmatch(value["image_closure_sha256"]) is None
+            or (expected_closure is not None and value.get("image_closure_sha256") != expected_closure)
+            or not isinstance(value.get("image_id"), str)
+            or SHA256_RE.fullmatch(value["image_id"]) is None
+            or not isinstance(value.get("labels"), Mapping)
+            or value["labels"].get("icefarm.instance") != event.get("instance")
+            or (expected_run is not None and value["labels"].get("icefarm.run") != expected_run)
             or value.get("mount") != expected_mount
             or value.get("running") is not True
+            or not isinstance(value.get("runtime_path"), str)
+            or not value["runtime_path"].startswith("/")
             or not isinstance(value.get("started_at"), str)
             or not value["started_at"]
         ):
@@ -2046,6 +2081,7 @@ def _shape_clauses(
     selected_profile: str | None,
     event_log: Any,
     topology: Any = None,
+    run_id: Any = None,
 ) -> list[dict[str, Any]]:
     shape = scenario.get("shape")
     clauses: list[dict[str, Any]] = []
@@ -2378,10 +2414,13 @@ def _shape_clauses(
                 or not _is_int(
                     observed_event.get("last_dispatched_job"), minimum=1
                 )
+                or observed_event.get("workload_dispatch_count") != 12
+                or observed_event.get("last_dispatched_job") != 12
             ):
                 disk_bad.add("@event:disk-fill")
             elif _disk_fill_receipt_errors(
-                observed_event.get("receipt"), observed_event
+                observed_event.get("receipt"), observed_event, topology,
+                run_id,
             ):
                 disk_bad.add("@event:disk-fill")
             if observations.get("local_fallback_job_ids") != []:
@@ -3299,14 +3338,44 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
             if isinstance(error106_raw, list)
             else {"@observations:error106_job_ids"}
         )
+        assignment_raw = observations.get("assignment_lifecycle")
+        assignment_by_job = {
+            item.get("job_id"): item
+            for item in assignment_raw
+            if isinstance(item, Mapping)
+        } if isinstance(assignment_raw, list) else {}
+        assignment_bad: set[str] = set()
+        for row in post_event:
+            identifier = _job_id(row["job_id"], "@row")
+            record = assignment_by_job.get(row["job_id"])
+            attempts = record.get("attempts") if isinstance(record, Mapping) else None
+            if (
+                not isinstance(attempts, list)
+                or len(attempts) != row["retries"] + 1
+                or any(
+                    not isinstance(attempt, Mapping)
+                    or set(attempt) != {"generation", "scheduler_job", "terminal", "worker"}
+                    or not _is_int(attempt.get("generation"), minimum=1)
+                    or not _is_int(attempt.get("scheduler_job"), minimum=1)
+                    or not isinstance(attempt.get("terminal"), str)
+                    or not isinstance(attempt.get("worker"), str)
+                    for attempt in (attempts if isinstance(attempts, list) else [])
+                )
+                or len({(item["generation"], item["scheduler_job"]) for item in attempts})
+                != len(attempts)
+            ):
+                assignment_bad.add(identifier)
         if (
-            not isinstance(error106_raw, list)
-            or len(error106_ids) != len(error106_raw)
-            or not error106_ids <= fallback_ids
-            or len(fallback_ids) > len(post_event)
+                not isinstance(error106_raw, list)
+                or len(error106_ids) != len(error106_raw)
+                or error106_ids != fallback_ids
+                or len(fallback_ids) > len(post_event)
+                or len(assignment_by_job) != len(assignment_raw or [])
+                or assignment_bad
         ):
             engagement_bad.update(
-                (error106_ids - fallback_ids)
+                assignment_bad
+                or (error106_ids - fallback_ids)
                 or {"@observations:s95-fallback-bound"}
             )
     elif engagement_mode == S90_REVISION_REFUSAL_ENGAGEMENT:
@@ -4711,6 +4780,7 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
             selected_profile,
             bundle.get("event_log"),
             bundle.get("topology"),
+            bundle.get("run_id"),
         )
     )
     return _finish(clauses)

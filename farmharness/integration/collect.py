@@ -1362,15 +1362,33 @@ def _validate_disk_fill_receipt(
         "type": "tmpfs",
     }
     snapshots: dict[str, Mapping[str, Any]] = {}
+    snapshot_fields = {
+        "container_id", "container_name", "host", "image_closure_sha256",
+        "image_id", "labels", "mount", "running", "runtime_path", "started_at",
+    }
+    expected_name = f"icefarm-{plan['run_id']}-{event['instance']}"
+    expected_closure = target.get("image", {}).get("closure_sha256")
+    if not isinstance(expected_closure, str) or SHA256_RE.fullmatch(expected_closure) is None:
+        raise CollectError(f"{prefix} has no planned image closure")
     for side in ("before", "after"):
         value = receipt.get(side)
         if (
             not isinstance(value, Mapping)
-            or set(value) != {"container_id", "mount", "running", "started_at"}
+            or set(value) != snapshot_fields
             or not isinstance(value.get("container_id"), str)
             or SHA256_RE.fullmatch(value["container_id"]) is None
+            or value.get("container_name") != f"/{expected_name}"
+            or value.get("host") != target.get("host")
+            or value.get("image_closure_sha256") != expected_closure
+            or not isinstance(value.get("image_id"), str)
+            or SHA256_RE.fullmatch(value["image_id"]) is None
+            or not isinstance(value.get("labels"), Mapping)
+            or value["labels"].get("icefarm.run") != plan["run_id"]
+            or value["labels"].get("icefarm.instance") != event["instance"]
             or value.get("mount") != expected_mount
             or value.get("running") is not True
+            or not isinstance(value.get("runtime_path"), str)
+            or not value["runtime_path"].startswith("/")
             or not isinstance(value.get("started_at"), str)
             or not value["started_at"]
         ):
@@ -1419,8 +1437,16 @@ def _validate_disk_fill_receipt(
         or fill.get("minimum_headroom_bytes")
         != CACHE_DISK_FAULT_MIN_HEADROOM_BYTES
         or fill.get("watchdog_s") != DISK_FILL_WATCHDOG_S
+        ):
+            raise CollectError(f"{prefix} does not prove bounded ENOSPC")
+    if (
+        scenario.data.get("id") == "S95-cache-disk-full"
+        and (
+            event.get("workload_dispatch_count") != 12
+            or event.get("last_dispatched_job") != 12
+        )
     ):
-        raise CollectError(f"{prefix} does not prove bounded ENOSPC")
+        raise CollectError(f"{prefix} did not fire on the exact twelfth dispatch")
 
 
 def _validate_header_edit_receipt(
@@ -4235,6 +4261,7 @@ def _observations(
         scenario, evidence, raw_jobs, events, farm=farm, plan=plan
     )
     lifecycle = []
+    assignment_lifecycle = []
     row_by_identity = {row["job_id"]: row for row in rows}
     for raw in raw_jobs:
         row = row_by_identity[raw["row_job_id"]]
@@ -4278,6 +4305,20 @@ def _observations(
                 "terminal": final["terminal"],
                 "terminal_ms": final["terminal_ms"],
                 "turn": raw["turn"],
+            }
+        )
+        assignment_lifecycle.append(
+            {
+                "attempts": [
+                    {
+                        "generation": attempt["scheduler_record"]["generation"],
+                        "scheduler_job": attempt["scheduler_record"]["scheduler_job"],
+                        "terminal": attempt["scheduler_record"]["terminal"],
+                        "worker": attempt["worker"],
+                    }
+                    for attempt in attempts
+                ],
+                "job_id": row["job_id"],
             }
         )
     source_mutex = row_facts["source_mutex"]
@@ -4397,6 +4438,7 @@ def _observations(
     preflight = _read_json(evidence / "receipts" / "preflight.json")
     return {
         "assignment_preference": assignment_preference,
+        "assignment_lifecycle": assignment_lifecycle,
         "cell_wall_ms": max(finishes) - min(starts),
         "client_turns": client_turn_observations,
         **row_facts,

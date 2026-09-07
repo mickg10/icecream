@@ -185,12 +185,19 @@ class DiskFillRecorder(EventRecorder):
                 json.dumps(
                     {
                         "Id": "3" * 64,
+                        "Image": "4" * 64,
                         "Name": "/icefarm-event-unit-F1",
                         "State": {
                             "Running": True,
                             "StartedAt": "2026-09-06T12:00:00Z",
                         },
                         "Mounts": [
+                            {
+                                "Destination": "/opt/icecream",
+                                "RW": False,
+                                "Source": "/runtime/" + ("b8aa267a40f2beb17bbb53de165ab1e744b13ddc2e2fe39eee1486d57947cb0a"),
+                                "Type": "bind",
+                            },
                             {
                                 "Destination": CACHE_DISK_FAULT_PATH,
                                 "RW": True,

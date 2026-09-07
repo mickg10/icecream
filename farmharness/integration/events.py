@@ -1306,6 +1306,7 @@ class EventProducer:
             document = json.loads(result.stdout.strip())
             labels = document["Config"]["Labels"]
             identifier = document["Id"]
+            image_id = document.get("Image")
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise EventError(f"container {name!r} authentication output is malformed") from exc
         if (
@@ -1388,6 +1389,11 @@ class EventProducer:
                     raise EventError(f"container {name!r} has unauthenticated {key} after transition")
         return {
             "id": identifier,
+            "image_id": (
+                image_id.removeprefix("sha256:")
+                if isinstance(image_id, str)
+                else None
+            ),
             "name": document.get("Name", f"/{container}"),
             "labels": dict(labels),
             "running": state.get("Running") if isinstance(state, dict) else None,
@@ -3462,8 +3468,14 @@ class EventProducer:
         def snapshot(value: Mapping[str, Any]) -> dict[str, Any]:
             return {
                 "container_id": value["id"],
+                "container_name": value["name"],
+                "host": instance["host"],
+                "image_closure_sha256": instance["image"]["closure_sha256"],
+                "image_id": value["image_id"],
+                "labels": value["labels"],
                 "mount": value["cache_fault_mount"],
                 "running": value["running"],
+                "runtime_path": value["runtime_path"],
                 "started_at": value["started_at"],
             }
 

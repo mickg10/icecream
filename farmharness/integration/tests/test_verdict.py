@@ -364,6 +364,21 @@ def _observations(
             }
             for index, row in enumerate(rows)
         ],
+        "assignment_lifecycle": [
+            {
+                "job_id": row["job_id"],
+                "attempts": [
+                    {
+                        "generation": 1,
+                        "scheduler_job": int(row["job_id"]) + attempt,
+                        "terminal": "completion",
+                        "worker": row["cs"],
+                    }
+                    for attempt in range(2 if row["retries"] == 1 else 1)
+                ],
+            }
+            for row in rows
+        ],
         "logins": [
             {
                 "cache_profiles": []
@@ -2306,8 +2321,14 @@ def _s95_disk_fill_bundle() -> dict[str, object]:
     }
     snapshot = {
         "container_id": SHA_A,
+        "container_name": "/icefarm-test-run-F1",
+        "host": "h1",
+        "image_closure_sha256": SHA_A,
+        "image_id": SHA_B,
+        "labels": {"icefarm.run": "test-run", "icefarm.instance": "F1"},
         "mount": mount,
         "running": True,
+        "runtime_path": "/runtime/" + SHA_A,
         "started_at": "2026-09-06T12:00:00Z",
     }
     event = {
@@ -2368,6 +2389,9 @@ def test_s95_disk_fill_accepts_one_bounded_remote_fallback() -> None:
         "no_affected_post",
         "local_fallback",
         "unbound_error106",
+        "late_dispatch",
+        "missing_assignment_identity",
+        "lineage_tamper",
         "wrong_shape",
     ),
 )
@@ -2390,6 +2414,16 @@ def test_s95_disk_fill_evidence_fails_closed(mutation: str) -> None:
         fixture["observations"]["local_fallback_job_ids"] = ["3"]
     elif mutation == "unbound_error106":
         fixture["observations"]["error106_job_ids"] = ["4"]
+    elif mutation == "late_dispatch":
+        fixture["event_log"][0]["workload_dispatch_count"] = 13
+    elif mutation == "missing_assignment_identity":
+        fixture["observations"]["assignment_lifecycle"][2]["attempts"][1][
+            "scheduler_job"
+        ] = fixture["observations"]["assignment_lifecycle"][2]["attempts"][0][
+            "scheduler_job"
+        ]
+    elif mutation == "lineage_tamper":
+        fixture["event_log"][0]["receipt"]["before"]["host"] = "wrong-host"
     else:
         fixture["scenario"]["workload"]["jobs"] = 1
 
@@ -2400,6 +2434,7 @@ def test_s95_disk_fill_evidence_fails_closed(mutation: str) -> None:
     )["status"] == "FAIL" or mutation in {
         "no_affected_post",
         "unbound_error106",
+        "missing_assignment_identity",
     }
 
 
