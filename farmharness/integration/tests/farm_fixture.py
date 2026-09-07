@@ -241,6 +241,10 @@ def example_farm_path() -> Path:
     document = json.loads(
         (INTEGRATION / "farm.example.json").read_text(encoding="utf-8")
     )
+    # The committed operator example may carry a live, immutable authority
+    # capture.  Unit tests mutate authority entries, so their hermetic fixture
+    # must remain an explicitly uncaptured document.
+    document.pop("authority_capture", None)
     document["corpora"]["firefox-1000"] = corpus
     farm = root / "farm.json"
     farm.write_bytes(canonical_bytes(document))
