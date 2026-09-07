@@ -239,8 +239,9 @@ def test_active_scheduler_loss_collection_binds_post_offset_product_witness(
         "action": "scheduler-loss-active",
         "after": {"container_id": "a" * 64, "started_at": "new"},
         "before": {"container_id": "a" * 64, "started_at": "old"},
-        "compiler": {
-            "container_id": "b" * 64,
+            "compiler": {
+                "container_id": "b" * 64,
+                "assignment": {"schema": "icefarm-compiler-assignment-v1", "child": {"pid": 41, "pgid": 41, "generation": 1, "owning_client_id": 7}, "client": {"client_id": 7, "scheduler_job_id": 2, "job_id": 2}, "listener": {"host": "127.0.0.1", "port": 8765}},
             "daemon": {"pid": 10, "pgid": 10, "ppid": 1, "exe": "/opt/icecream/sbin/iceccd"},
             "leader": {"pid": 41, "pgid": 41, "ppid": 10, "start_ticks": 9, "state": "R"},
             "stopped": {"pid": 41, "pgid": 41, "ppid": 10, "start_ticks": 9, "state": "T"},

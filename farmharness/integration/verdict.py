@@ -1279,6 +1279,7 @@ def _scheduler_active_loss_receipt_errors(
     if not isinstance(receipt, Mapping) or set(receipt) != required or receipt.get("schema") != "icefarm-scheduler-active-loss-v1":
         return {marker}
     compiler = receipt.get("compiler")
+    assignment = compiler.get("assignment") if isinstance(compiler, Mapping) else None
     parent = compiler.get("daemon") if isinstance(compiler, Mapping) else None
     leader = compiler.get("leader") if isinstance(compiler, Mapping) else None
     stopped = compiler.get("stopped") if isinstance(compiler, Mapping) else None
@@ -1304,6 +1305,15 @@ def _scheduler_active_loss_receipt_errors(
             or compiler["worker_before"] != compiler["worker_after"]
             or not isinstance(compiler["worker_before"].get("container_id"), str)
             or re.fullmatch(r"[0-9a-f]{64}", compiler["worker_before"]["container_id"]) is None
+            or not isinstance(assignment, Mapping)
+            or set(assignment) != {"child", "client", "listener", "schema"}
+            or assignment.get("schema") != "icefarm-compiler-assignment-v1"
+            or assignment.get("child", {}).get("pid") != leader.get("pid")
+            or assignment.get("child", {}).get("pgid") != leader.get("pgid")
+            or assignment.get("child", {}).get("generation") != receipt.get("lost_scheduler_generation")
+            or assignment.get("client", {}).get("scheduler_job_id") != receipt.get("lost_scheduler_job")
+            or assignment.get("client", {}).get("job_id") != receipt.get("lost_scheduler_job")
+            or assignment.get("listener") != {"host": "127.0.0.1", "port": 8765}
             or not isinstance(receipt.get("quiescence"), Mapping)
             or set(receipt["quiescence"]) != {"client_readiness", "client_routes", "scheduler_snapshot", "scheduler_startup", "worker_snapshot"}
             or not isinstance(receipt["quiescence"].get("scheduler_startup"), Mapping)

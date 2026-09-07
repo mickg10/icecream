@@ -1436,7 +1436,8 @@ def _validate_scheduler_active_loss_receipt(
     leader = compiler.get("leader") if isinstance(compiler, Mapping) else None
     stopped = compiler.get("stopped") if isinstance(compiler, Mapping) else None
     parent = compiler.get("daemon") if isinstance(compiler, Mapping) else None
-    if (not isinstance(compiler, Mapping) or set(compiler) != {"container_id", "daemon", "group_gone", "leader", "stopped", "worker_before", "worker_after"}
+    assignment = compiler.get("assignment") if isinstance(compiler, Mapping) else None
+    if (not isinstance(compiler, Mapping) or set(compiler) != {"assignment", "container_id", "daemon", "group_gone", "leader", "stopped", "worker_before", "worker_after"}
             or not isinstance(compiler.get("container_id"), str) or SHA256_RE.fullmatch(compiler["container_id"]) is None
             or not isinstance(leader, Mapping) or not isinstance(stopped, Mapping)
             or not isinstance(parent, Mapping)
@@ -1454,7 +1455,16 @@ def _validate_scheduler_active_loss_receipt(
             or set(compiler["worker_after"]) != {"container_id", "started_at"}
             or compiler["worker_before"] != compiler["worker_after"]
             or not isinstance(compiler["worker_before"].get("container_id"), str)
-            or SHA256_RE.fullmatch(compiler["worker_before"]["container_id"]) is None):
+            or SHA256_RE.fullmatch(compiler["worker_before"]["container_id"]) is None
+            or not isinstance(assignment, Mapping)
+            or set(assignment) != {"child", "client", "listener", "schema"}
+            or assignment.get("schema") != "icefarm-compiler-assignment-v1"
+            or assignment.get("child", {}).get("pid") != leader.get("pid")
+            or assignment.get("child", {}).get("pgid") != leader.get("pgid")
+            or assignment.get("child", {}).get("generation") != receipt.get("lost_scheduler_generation")
+            or assignment.get("client", {}).get("scheduler_job_id") != receipt.get("lost_scheduler_job")
+            or assignment.get("client", {}).get("job_id") != receipt.get("lost_scheduler_job")
+            or assignment.get("listener") != {"host": "127.0.0.1", "port": 8765}):
         raise CollectError(f"{prefix} has no exact stopped compiler-group identity")
     pre = receipt["pre_fault"]
     if (not isinstance(pre, Mapping) or set(pre) != {"scheduler_log", "worker_log"}):

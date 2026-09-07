@@ -223,6 +223,29 @@ while time.monotonic() < deadline:
 raise SystemExit("no unique direct compiler group leader became observable within bound")
 '''.strip()
 
+ACTIVE_COMPILER_ASSIGNMENT_SCRIPT = r'''
+import json, re, sys, urllib.request
+pid, pgid, generation, scheduler_job, port = map(int, sys.argv[1:])
+def get(path):
+    with urllib.request.urlopen("http://127.0.0.1:%d%s" % (port, path), timeout=5) as response:
+        return response.read().decode("utf-8")
+internals = get("/api/internals")
+match = re.search(r"Child: pid=(\d+) pgid=(\d+) kind=\d+ gen=(\d+) client=(\d+) ", internals)
+if not match or tuple(map(int, match.groups()[:3])) != (pid, pgid, generation):
+    raise SystemExit("stopped compiler has no exact Child generation/identity witness")
+client_id = int(match.group(4))
+document = json.loads(get("/api/clients"))
+clients = document.get("clients") if isinstance(document, dict) else None
+rows = [row for row in clients if isinstance(row, dict) and row.get("client_id") == client_id]
+if len(rows) != 1:
+    raise SystemExit("Child owning client is absent or ambiguous")
+row = rows[0]
+job = row.get("job")
+if row.get("scheduler_job_id") != scheduler_job or not isinstance(job, dict) or job.get("job_id") != scheduler_job:
+    raise SystemExit("Child owning client does not bind exact scheduler job")
+print(json.dumps({"schema": "icefarm-compiler-assignment-v1", "child": {"pid": pid, "pgid": pgid, "generation": generation, "owning_client_id": client_id}, "client": {"client_id": client_id, "scheduler_job_id": row["scheduler_job_id"], "job_id": job["job_id"]}, "listener": {"host": "127.0.0.1", "port": port}}, sort_keys=True, separators=(",", ":")))
+'''.strip()
+
 ACTIVE_COMPILER_WAIT_SCRIPT = r'''
 import json, pathlib, sys, time
 pid, pgid, start_ticks, timeout_s = map(int, sys.argv[1:])
@@ -2660,6 +2683,28 @@ class EventProducer:
                 or leader.get("start_ticks") != stopped.get("start_ticks")
                 or leader.get("state") in {"Z", "X"}):
             raise EventError("compiler-group stop identity changed")
+        assignment_result = self._invoke(self.factory.make(
+            phase="event.scheduler-loss-authenticate-assignment",
+            host=worker["host"], instance=worker["name"], transport=_docker_transport(self.farm, worker["host"]),
+            timeout_s=self._command_timeout(),
+            argv=docker_argv(self.farm, worker["host"], (
+                "exec", "--user", "0", worker_before["name"], "python3", "-c",
+                ACTIVE_COMPILER_ASSIGNMENT_SCRIPT, str(leader["pid"]), str(leader["pgid"]),
+                str(lost_generation), str(self._last_job), "8765",
+            )),
+        ))
+        try:
+            assignment = json.loads(assignment_result.stdout.strip())
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise EventError("compiler assignment witness returned malformed JSON") from exc
+        if (not isinstance(assignment, dict)
+                or set(assignment) != {"child", "client", "listener", "schema"}
+                or assignment.get("schema") != "icefarm-compiler-assignment-v1"
+                or assignment["child"].get("generation") != lost_generation
+                or assignment["client"].get("scheduler_job_id") != self._last_job
+                or assignment["client"].get("job_id") != self._last_job
+                or assignment["listener"] != {"host": "127.0.0.1", "port": 8765}):
+            raise EventError("compiler assignment witness does not bind exact lost job")
         self._invoke(self.factory.make(
             phase="event.scheduler-loss-kill",
             host=instance["host"], instance=event.instance, transport=_docker_transport(self.farm, instance["host"]),
@@ -2716,6 +2761,7 @@ class EventProducer:
             "compiler": {
                 "container_id": worker_before["id"], "daemon": parent, "leader": leader,
                 "stopped": stopped, "group_gone": group_gone,
+                "assignment": assignment,
                 "worker_before": {"container_id": worker_before["id"], "started_at": worker_before["started_at"]},
                 "worker_after": {"container_id": worker_after["id"], "started_at": worker_after["started_at"]},
             },

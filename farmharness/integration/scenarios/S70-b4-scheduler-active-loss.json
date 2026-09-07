@@ -5,7 +5,7 @@
   "images": {"new": "p50s4-a82d72d8"},
   "instances": [
     {"name": "S1", "role": "S", "host": "tt-quietbox3", "image": "new", "env": {"ICECC_P50_PROFILE": "P29V1"}},
-    {"name": "F1", "role": "F", "host": "tt-quietbox3", "image": "new", "slots": 1},
+    {"name": "F1", "role": "F", "host": "tt-quietbox3", "image": "new", "slots": 1, "env": {"ICECC_WEB_HOSTPORT": "127.0.0.1:8765"}},
     {"name": "C1", "role": "C", "host": "tt-quietbox2", "image": "new", "client_environment": "debian-gcc", "env": {"ICECC_P50_MODE": "on"}}
   ],
   "workload": {"driver": "tu-manifest", "corpus": "fmt-100", "turns": ["A"], "jobs": 6, "clients": ["C1"], "repeat": 1, "oracle": "local-sha"},
