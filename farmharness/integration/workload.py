@@ -267,14 +267,14 @@ for row in rows:
     path = root / row["path"]
     try:
         path.relative_to(root)
-        stat = path.lstat()
+        stat_info = path.lstat()
         jobs_dir = (root / "jobs").lstat()
         job_dir = (root / "jobs" / f"{index:06d}").lstat()
     except (OSError, ValueError):
         raise SystemExit("checkpoint row escaped workload root")
     if (
         path.is_symlink()
-        or not stat.S_ISREG(stat.st_mode)
+        or not stat.S_ISREG(stat_info.st_mode)
         or not stat.S_ISDIR(jobs_dir.st_mode)
         or not stat.S_ISDIR(job_dir.st_mode)
         or (root / "jobs").is_symlink()

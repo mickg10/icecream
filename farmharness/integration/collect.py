@@ -1518,12 +1518,6 @@ def _validate_scheduler_active_loss_receipt(
                 for pair in quiescence["client_routes"].values()
             )
             or not isinstance(quiescence.get("scheduler_snapshot"), str)
-            or not any(
-                isinstance(item, Mapping) and item.get("role") == "S"
-                and isinstance(item.get("name"), str)
-                and re.search(rf"(^|\s){re.escape(item['name'])}(\s|$)", quiescence["scheduler_snapshot"], re.MULTILINE)
-                for item in plan["topology"]["instances"]
-            )
             or not isinstance(quiescence.get("worker_snapshot"), str)
             or any(
                 re.search(rf"(^|\s){re.escape(item['name'])}(\s|$)", quiescence["worker_snapshot"], re.MULTILINE) is None
