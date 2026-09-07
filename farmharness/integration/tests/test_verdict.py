@@ -153,6 +153,18 @@ def test_active_loss_verdict_rejects_reused_compiler_identity() -> None:
     tampered = copy.deepcopy(receipt)
     tampered["quiescence"].pop("worker_snapshot")
     assert _scheduler_active_loss_receipt_errors(tampered, event, scenario)
+    for path in (
+        ("quiescence", "client_routes", "C1", "before", "container", "container_id"),
+        ("quiescence", "client_routes", "C1", "before", "container", "started_at"),
+        ("quiescence", "client_routes", "C1", "before", "daemon", "pid"),
+        ("quiescence", "client_routes", "C1", "before", "route_owner", "start_ticks"),
+    ):
+        tampered = copy.deepcopy(receipt)
+        cursor = tampered
+        for key in path[:-1]:
+            cursor = cursor[key]
+        cursor[path[-1]] = "bad" if path[-1] in {"container_id", "started_at"} else 999
+        assert _scheduler_active_loss_receipt_errors(tampered, event, scenario)
 
 
 def _client_transition_event() -> tuple[dict[str, object], dict[str, object]]:
