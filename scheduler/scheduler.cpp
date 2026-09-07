@@ -3257,6 +3257,11 @@ static bool handle_assignment_terminal(CompileServer *cs, Msg *_m)
 
     ++assignment_terminal_accepted;
     job->setAssignmentPhase(Job::ASSIGNMENT_TERMINAL);
+    /* This accepted Revoked result is the scheduler's authoritative terminal
+       boundary for a reservation that never started.  Keep it in the same
+       textual END grammar as ordinary JobDone so strict evidence collectors
+       can prove every dispatch has exactly one terminal. */
+    trace() << "END " << job->id() << " status=255" << endl;
     if (job->server()) {
         job->server()->removeJob(job);
     }
@@ -3564,6 +3569,21 @@ static bool handle_job_done(CompileServer *cs, Msg *_m)
                its teardown is the terminal boundary for all its jobs. */
             handle_end(worker, nullptr);
         }
+        return true;
+    }
+
+    /* If JobBegin won before the submitter's exact withdrawal, the selected
+       remote worker is already the only terminal authority.  Detach C just
+       as the submitter-disconnect path does, but retain the job, worker slot,
+       and wire id until that exact F reports completion (or its session is
+       torn down).  Falling through would treat C's failure as completion,
+       free live F capacity, and strand F's later authoritative JobDone. */
+    if (!m->is_from_server() && j->assignmentFenced()
+            && j->state() == Job::COMPILING
+            && j->server() && j->server() != cs) {
+        trace() << "submitter withdrew after fenced begin for job "
+                << j->id() << "; retaining for worker completion" << endl;
+        j->detachSubmitter();
         return true;
     }
 

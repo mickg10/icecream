@@ -470,6 +470,19 @@ static bool file_contains(const std::string &path, const std::string &needle)
     return text.str().find(needle) != std::string::npos;
 }
 
+static bool wait_file_contains(const std::string &path,
+                               const std::string &needle,
+                               int timeout_msec)
+{
+    const auto deadline = Clock::now()
+        + std::chrono::milliseconds(timeout_msec);
+    while (Clock::now() < deadline) {
+        if (file_contains(path, needle)) return true;
+        usleep(20 * 1000);
+    }
+    return file_contains(path, needle);
+}
+
 static std::string control_text(int port, const char *command)
 {
     const auto deadline = Clock::now() + std::chrono::seconds(5);
@@ -593,6 +606,125 @@ static void run_precompile_worker_terminal(const std::string &binary,
     if (worker_listener >= 0) close(worker_listener);
     REQUIRE(stop_scheduler(scheduler),
             "pre-compile worker-terminal scheduler stopped cleanly");
+}
+
+static void run_post_begin_submitter_withdrawal(const std::string &binary,
+                                                const std::string &directory)
+{
+    const int port = reserve_port_pair();
+    const std::string log = directory + "/post-begin-withdrawal.log";
+    pid_t scheduler = start_scheduler(
+        binary, port, "enforcing-compat", log, 16, 1);
+    REQUIRE(port != 0 && scheduler > 0,
+            "post-Begin withdrawal scheduler process launched");
+
+    int worker_port = 0;
+    int worker_listener = bind_port(0, &worker_port);
+    if (worker_listener >= 0) listen(worker_listener, 16);
+    ConfCSMsg *worker_conf = nullptr;
+    MsgChannel *worker = login_host(port, "post-begin-worker", true,
+                                    worker_port, &worker_conf);
+    delete worker_conf;
+    ConfCSMsg *submitter_conf = nullptr;
+    MsgChannel *submitter = login_host(port, "post-begin-submit", false, 0,
+                                       &submitter_conf);
+    delete submitter_conf;
+    REQUIRE(worker && submitter && request_job(submitter, 9951),
+            "post-Begin withdrawal assignment requested");
+
+    AssignPrepareMsg *first = wait_prepare(worker);
+    if (first) {
+        worker->send_msg(AssignReadyMsg(first->epoch(), first->wire_id,
+                                        first->nonce()));
+    }
+    UseCSMsg *first_use = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(first && first_use && first_use->job_id == first->wire_id,
+            "post-Begin withdrawal receives the fenced assignment");
+    if (first_use) {
+        worker->send_msg(JobBeginMsg(first_use->job_id, 0));
+        usleep(100 * 1000);
+        submitter->send_msg(job_done_for(*first_use, 106,
+                                         JobDoneMsg::FROM_SUBMITTER));
+        submitter->send_msg(job_done_for(*first_use, 106,
+                                         JobDoneMsg::FROM_SUBMITTER));
+    }
+
+    ConfCSMsg *probe_conf = nullptr;
+    MsgChannel *probe = login_host(port, "post-begin-probe", false, 0,
+                                   &probe_conf);
+    delete probe_conf;
+    REQUIRE(probe && request_job(probe, 9952),
+            "capacity probe submitted while begun F work is outstanding");
+    AssignPrepareMsg *preloaded = wait_prepare(worker);
+    REQUIRE(first && preloaded && preloaded->wire_id != first->wire_id,
+            "post-Begin withdrawal retains the old id while one preload is admitted");
+
+    ConfCSMsg *second_probe_conf = nullptr;
+    MsgChannel *second_probe = login_host(
+        port, "post-begin-second-probe", false, 0, &second_probe_conf);
+    delete second_probe_conf;
+    REQUIRE(second_probe && request_job(second_probe, 9953),
+            "second capacity probe submitted beyond the preload slot");
+    REQUIRE(no_type(worker, Msg::ASSIGN_PREPARE, 500),
+            "submitter withdrawal after Begin does not release live F capacity");
+    REQUIRE(first_use && !file_contains(
+                log, "END " + std::to_string(first_use->job_id)
+                     + " status=106"),
+            "submitter withdrawal after Begin emits no premature END");
+
+    if (first_use) {
+        worker->send_msg(job_done_for(*first_use, 0,
+                                      JobDoneMsg::FROM_SERVER));
+    }
+    AssignPrepareMsg *after_terminal = wait_prepare(worker);
+    REQUIRE(first && preloaded && after_terminal
+                && after_terminal->wire_id != preloaded->wire_id
+                && after_terminal->nonce() != first->nonce(),
+            "exact worker terminal releases retained capacity exactly once");
+    if (preloaded) {
+        worker->send_msg(AssignReadyMsg(preloaded->epoch(), preloaded->wire_id,
+                                        preloaded->nonce()));
+    }
+    UseCSMsg *preloaded_use = dynamic_cast<UseCSMsg *>(
+        wait_type(probe, Msg::USE_CS, 3000));
+    REQUIRE(preloaded && preloaded_use
+                && preloaded_use->job_id == preloaded->wire_id,
+            "retained worker exposes the queued preload after its terminal");
+    if (preloaded_use) {
+        worker->send_msg(JobBeginMsg(preloaded_use->job_id, 0));
+        worker->send_msg(job_done_for(*preloaded_use, 0,
+                                      JobDoneMsg::FROM_SERVER));
+    }
+    if (after_terminal) {
+        worker->send_msg(AssignReadyMsg(
+            after_terminal->epoch(), after_terminal->wire_id,
+            after_terminal->nonce()));
+    }
+    UseCSMsg *after_terminal_use = dynamic_cast<UseCSMsg *>(
+        wait_type(second_probe, Msg::USE_CS, 3000));
+    REQUIRE(after_terminal && after_terminal_use
+                && after_terminal_use->job_id == after_terminal->wire_id,
+            "released worker capacity serves the second queued probe");
+    if (after_terminal_use) {
+        worker->send_msg(JobBeginMsg(after_terminal_use->job_id, 0));
+        worker->send_msg(job_done_for(*after_terminal_use, 0,
+                                      JobDoneMsg::FROM_SERVER));
+    }
+
+    delete after_terminal_use;
+    delete after_terminal;
+    delete preloaded_use;
+    delete preloaded;
+    delete first_use;
+    delete first;
+    delete second_probe;
+    delete probe;
+    delete submitter;
+    delete worker;
+    if (worker_listener >= 0) close(worker_listener);
+    REQUIRE(stop_scheduler(scheduler),
+            "post-Begin withdrawal scheduler stopped cleanly");
 }
 
 static void run_enforcing(const std::string &binary,
@@ -906,6 +1038,10 @@ static void run_prepare_credit(const std::string &binary,
     AssignPrepareMsg *second = wait_prepare(worker);
     REQUIRE(second && (!first || second->wire_id != first->wire_id),
             "cancellation returns credit while the old id remains owned");
+    REQUIRE(first && wait_file_contains(
+                log, "END " + std::to_string(first->wire_id)
+                     + " status=255", 2000),
+            "accepted Revoked release emits collector terminal evidence");
 
     delete first_submitter;
     first_submitter = nullptr;
@@ -1950,6 +2086,7 @@ int main(int argc, char **argv)
     std::fprintf(stderr, "retained work directory: %s\n", directory);
     signal(SIGPIPE, SIG_IGN);
     run_precompile_worker_terminal(argv[1], directory);
+    run_post_begin_submitter_withdrawal(argv[1], directory);
     run_enforcing(argv[1], directory);
     run_prepare_credit(argv[1], directory);
     run_ready_nested_teardown(argv[1], directory);
