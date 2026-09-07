@@ -4742,6 +4742,7 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
         or s30_mutant
         or engagement_mode in {
             S70_B5_ENGAGEMENT,
+            S70_B4_ACTIVE_LOSS_ENGAGEMENT,
             S90_REVISION_REFUSAL_ENGAGEMENT,
             S95_DISK_FILL_ENGAGEMENT,
         }

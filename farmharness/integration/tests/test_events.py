@@ -157,6 +157,11 @@ def test_active_scheduler_loss_scripts_are_exact_identity_bound() -> None:
     assert "len(candidates) != 1" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "p[\"pid\"] == p[\"pgid\"]" in ACTIVE_COMPILER_STOP_SCRIPT
     assert '"--generation" not in p["argv"]' in ACTIVE_COMPILER_STOP_SCRIPT
+    parent = {"pid": 10, "ppid": 1, "pgid": 10, "exe": "/opt/icecream/sbin/iceccd", "state": "S", "argv": []}
+    compiler = {"pid": 11, "ppid": 10, "pgid": 11, "exe": "/opt/icecream/sbin/iceccd", "state": "R", "argv": []}
+    other = compiler | {"pid": 12, "pgid": 12, "exe": "/usr/bin/other"}
+    assert select_direct_compiler_pairs([parent, compiler]) == [(parent, compiler)]
+    assert select_direct_compiler_pairs([parent, other]) == []
 
 
 def test_scheduler_generation_parser_requires_framed_unique_generation() -> None:

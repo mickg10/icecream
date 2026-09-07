@@ -2091,6 +2091,76 @@ def _shape_fixtures() -> dict[str, dict[str, object]]:
 SHAPE_FIXTURES = _shape_fixtures()
 
 
+def _s70_active_loss_bundle() -> dict[str, object]:
+    """Small authenticated bundle exercising the active-loss row law."""
+    bundle = copy.deepcopy(SHAPE_FIXTURES["S'C'F'"])
+    scenario = bundle["scenario"]
+    scenario["expect"]["engagement"] = "s70-b4-scheduler-active-loss"
+    scenario["timeline"] = [{"action": "scheduler-loss-active", "instance": "S1", "trigger": "job 2"}]
+    fallback = _row(1, tail=False, profile=None, outcome="fallback") | {"retries": 1, "event_epoch": 0}
+    later = _row(2, tail=True, profile="P29V1", outcome="committed") | {"event_epoch": 1}
+    bundle["rows"] = [fallback, later]
+    observations = bundle["observations"]
+    observations["assignment_lifecycle"] = [
+        {"job_id": "1", "attempts": [
+            {"generation": 1, "scheduler_job": 2, "terminal": "scheduler-loss", "worker": "F1"},
+            {"generation": 2, "scheduler_job": 3, "terminal": "completion", "worker": "F1"},
+        ]},
+        {"job_id": "2", "attempts": [
+            {"generation": 2, "scheduler_job": 4, "terminal": "completion", "worker": "F1"},
+        ]},
+    ]
+    observations["job_lifecycle"] = [
+        {"deadline_ms": 10000, "dispatch_ms": 100, "job_id": "1", "terminal": "completion", "terminal_ms": 125, "turn": "A"},
+        {"deadline_ms": 10000, "dispatch_ms": 200, "job_id": "2", "terminal": "completion", "terminal_ms": 225, "turn": "A"},
+    ]
+    observations["local_fallback_job_ids"] = []
+    receipt = {
+        "action": "scheduler-loss-active", "event_epoch": 1, "instance": "S1",
+        "lost_scheduler_generation": 1, "lost_scheduler_job": 2,
+        "before": {"container_id": "a" * 64, "started_at": "old"},
+        "after": {"container_id": "a" * 64, "started_at": "new"},
+        "compiler": {"container_id": "b" * 64, "daemon": {"pid": 10, "exe": "/opt/icecream/sbin/iceccd"},
+                     "leader": {"pid": 41, "pgid": 41, "ppid": 10, "start_ticks": 9},
+                     "stopped": {"pid": 41, "pgid": 41, "ppid": 10, "start_ticks": 9},
+                     "group_gone": {"gone": True}, "worker_before": {"container_id": "b" * 64, "started_at": "f"},
+                     "worker_after": {"container_id": "b" * 64, "started_at": "f"}},
+        "pre_fault": {"scheduler_log": {}, "worker_log": {}},
+        "quiescence": {"client_readiness": {"C1": {"bytes": 1, "cache_line": None, "cache_required": False, "connected_line": "Connected to scheduler (I am known as C1)", "host": "h1", "log_path": "/x/C1/log/client-daemon.log", "offset": 0}}, "client_routes": {"C1": {"before": {"container": {"container_id": "c" * 64, "started_at": "same", "running": True}, "daemon": {"argv": ["/opt/icecream/sbin/iceccd"], "exe": "/opt/icecream/sbin/iceccd", "exe_evidence": "proc-exe", "pid": 10, "ppid": 1, "start_ticks": 1, "uid": 0}, "route_owner": {"argv": ["/opt/icecream/sbin/icecc-cache-service"], "exe": "/opt/icecream/sbin/icecc-cache-service", "exe_evidence": "proc-exe", "pid": 11, "ppid": 10, "start_ticks": 2, "uid": 0}}, "after": {"container": {"container_id": "c" * 64, "started_at": "same", "running": True}, "daemon": {"argv": ["/opt/icecream/sbin/iceccd"], "exe": "/opt/icecream/sbin/iceccd", "exe_evidence": "proc-exe", "pid": 10, "ppid": 1, "start_ticks": 1, "uid": 0}, "route_owner": {"argv": ["/opt/icecream/sbin/icecc-cache-service"], "exe": "/opt/icecream/sbin/icecc-cache-service", "exe_evidence": "proc-exe", "pid": 11, "ppid": 10, "start_ticks": 2, "uid": 0}}}},
+                        "scheduler_snapshot": "S1", "scheduler_startup": {"line": "ICECREAM scheduler x starting up, port 23000"}, "worker_snapshot": "F1"},
+        "schema": "icefarm-scheduler-active-loss-v1", "turn": "A",
+    }
+    bundle["event_log"] = [{"action": "scheduler-loss-active", "event_epoch": 1, "event_index": 0,
+                             "fired_ms": 100, "instance": "S1", "last_dispatched_job": 2,
+                             "trigger": "job 2", "workload_dispatch_count": 2, "receipt": receipt}]
+    return bundle
+
+
+def test_s70_active_loss_evaluate_bundle_requires_exact_fallback_and_later_p29() -> None:
+    bundle = _s70_active_loss_bundle()
+    verdict = evaluate_bundle(bundle)
+    assert verdict["status"] == "PASS", verdict
+    for mutation in ("wrong_job", "wrong_generation", "zero_fallback", "two_fallback", "wrong_row", "no_later_p29", "local_fallback"):
+        tampered = copy.deepcopy(bundle)
+        if mutation == "wrong_job":
+            tampered["event_log"][0]["receipt"]["lost_scheduler_job"] = 99
+        elif mutation == "wrong_generation":
+            tampered["event_log"][0]["receipt"]["lost_scheduler_generation"] = 9
+        elif mutation == "zero_fallback":
+            tampered["rows"][0]["session_outcome"] = "committed"
+        elif mutation == "two_fallback":
+            tampered["rows"].append(copy.deepcopy(tampered["rows"][0]) | {"job_id": "3"})
+        elif mutation == "wrong_row":
+            tampered["rows"][0]["job_id"] = "99"
+        elif mutation == "no_later_p29":
+            tampered["rows"][1]["tail_present"] = False
+            tampered["rows"][1]["tail_profile"] = None
+            tampered["rows"][1]["session_outcome"] = "fallback"
+        else:
+            tampered["observations"]["local_fallback_job_ids"] = ["1"]
+        assert evaluate_bundle(tampered)["status"] == "FAIL"
+
+
 @pytest.mark.parametrize("shape", sorted(SHAPE_FIXTURES))
 def test_one_fixture_bundle_per_shape_passes(shape: str) -> None:
     verdict = evaluate_bundle(SHAPE_FIXTURES[shape])
