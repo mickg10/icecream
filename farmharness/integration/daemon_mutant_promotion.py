@@ -1,4 +1,4 @@
-"""Pure promotion of an observed daemon-mutant image receipt."""
+"""Pure promotion of observed daemon- and scheduler-mutant image receipts."""
 
 from __future__ import annotations
 
@@ -13,9 +13,16 @@ from .images import (
     DAEMON_ROLE_PATH,
     DAEMON_ROLE_PROBE_LABEL,
     IMAGE_RECEIPT_SCHEMA,
+    SCHEDULER_ROLE_PATH,
+    SCHEDULER_ROLE_PROBE_LABEL,
     _runtime_reference,
 )
-from .mutant import DAEMON_MUTANT_KIND, MutantError, validate_mutant_authority
+from .mutant import (
+    DAEMON_MUTANT_KIND,
+    MUTANT_KIND,
+    MutantError,
+    validate_mutant_authority,
+)
 from .schema_validation import canonical_bytes
 
 
@@ -24,7 +31,23 @@ IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class DaemonMutantPromotionError(ValueError):
-    """The candidate or observed image receipt is not promotable."""
+    """A mutant candidate or observed image receipt is not promotable."""
+
+
+PROMOTION_SPECS = {
+    DAEMON_MUTANT_KIND: {
+        "receipt_field": "daemon_role_sha256",
+        "role": "daemon",
+        "path": DAEMON_ROLE_PATH,
+        "probe_label": DAEMON_ROLE_PROBE_LABEL,
+    },
+    MUTANT_KIND: {
+        "receipt_field": "scheduler_role_sha256",
+        "role": "scheduler",
+        "path": SCHEDULER_ROLE_PATH,
+        "probe_label": SCHEDULER_ROLE_PROBE_LABEL,
+    },
+}
 
 
 def _digest(value: Any, field: str) -> str:
@@ -39,8 +62,12 @@ def _image_id(value: Any, field: str) -> str:
     return value
 
 
-def promote_daemon_mutant(
-    farm: FarmSpec, label: str, receipt: Mapping[str, Any]
+def _promote_mutant(
+    farm: FarmSpec,
+    label: str,
+    receipt: Mapping[str, Any],
+    *,
+    expected_kind: str,
 ) -> dict[str, Any]:
     """Return a promoted copy without writing the farm.
 
@@ -55,8 +82,11 @@ def promote_daemon_mutant(
     document = farm.data
     images = document.get("authority", {}).get("images", {})
     candidate = images.get(label)
-    if not isinstance(candidate, Mapping) or candidate.get("kind") != DAEMON_MUTANT_KIND:
-        raise DaemonMutantPromotionError(f"{label}: daemon-mutant candidate is absent")
+    if not isinstance(candidate, Mapping) or candidate.get("kind") != expected_kind:
+        raise DaemonMutantPromotionError(
+            f"{label}: {expected_kind} candidate is absent"
+        )
+    promotion_spec = PROMOTION_SPECS[expected_kind]
     if any(key in candidate for key in ("closure_sha256", "id", "role_overrides")):
         raise DaemonMutantPromotionError(f"{label}: candidate is already promoted or overwritten")
     try:
@@ -102,11 +132,12 @@ def promote_daemon_mutant(
     probe_commands = [
         command for command in commands
         if isinstance(command, Mapping)
-        and command.get("phase") == "images.probe-daemon-role"
+        and command.get("phase") == f"images.probe-{promotion_spec['role']}-role"
     ]
     if len(probe_commands) != 1:
         raise DaemonMutantPromotionError(
-            "image receipt must contain exactly one daemon role probe"
+            "image receipt must contain exactly one "
+            f"{promotion_spec['role']} role probe"
         )
     probe = probe_commands[0]
     if (
@@ -118,21 +149,26 @@ def promote_daemon_mutant(
         or type(probe.get("sequence")) is not int
         or probe["sequence"] < 0
     ):
-        raise DaemonMutantPromotionError("daemon role probe command identity is unsafe")
+        raise DaemonMutantPromotionError(
+            f"{promotion_spec['role']} role probe command identity is unsafe"
+        )
     expected_argv = (
         "docker", "run", "--rm", "--pull=never", "--network", "none",
         "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only",
-        "--label", DAEMON_ROLE_PROBE_LABEL, "--entrypoint", "/usr/bin/sha256sum",
-        expected_reference, DAEMON_ROLE_PATH,
+        "--label", promotion_spec["probe_label"], "--entrypoint", "/usr/bin/sha256sum",
+        expected_reference, promotion_spec["path"],
     )
     argv = probe.get("argv")
     if not isinstance(argv, (list, tuple)) or not all(
         isinstance(item, str) for item in argv
     ) or tuple(argv) != expected_argv:
-        raise DaemonMutantPromotionError("daemon role probe argv is unsafe")
+        raise DaemonMutantPromotionError(
+            f"{promotion_spec['role']} role probe argv is unsafe"
+        )
     hub_id = _image_id(observed.get("hub_id"), f"{label}.hub_id")
     closure = _digest(observed.get("closure_sha256"), f"{label}.closure_sha256")
-    daemon_sha = _digest(observed.get("daemon_role_sha256"), f"{label}.daemon_role_sha256")
+    role_field = promotion_spec["receipt_field"]
+    role_sha = _digest(observed.get(role_field), f"{label}.{role_field}")
     if observed.get("closure_schema") != "docker-inspect-runtime-closure-v1":
         raise DaemonMutantPromotionError("receipt closure schema is unsupported")
     hosts = observed.get("hosts")
@@ -149,7 +185,9 @@ def promote_daemon_mutant(
     promoted_candidate = promoted["authority"]["images"][label]
     promoted_candidate["closure_sha256"] = closure
     promoted_candidate["id"] = hub_id
-    promoted_candidate["role_overrides"] = {"daemon": {"sha256": daemon_sha}}
+    promoted_candidate["role_overrides"] = {
+        promotion_spec["role"]: {"sha256": role_sha}
+    }
     try:
         validate_mutant_authority(
             label, promoted_candidate, promoted["authority"]["images"]
@@ -165,3 +203,21 @@ def promote_daemon_mutant(
     ).hexdigest():
         raise DaemonMutantPromotionError("promotion did not change authority")
     return promoted
+
+
+def promote_daemon_mutant(
+    farm: FarmSpec, label: str, receipt: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Promote a daemon mutant from its exact build/distribution receipt."""
+
+    return _promote_mutant(
+        farm, label, receipt, expected_kind=DAEMON_MUTANT_KIND
+    )
+
+
+def promote_scheduler_mutant(
+    farm: FarmSpec, label: str, receipt: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Promote a scheduler mutant from its exact build/distribution receipt."""
+
+    return _promote_mutant(farm, label, receipt, expected_kind=MUTANT_KIND)

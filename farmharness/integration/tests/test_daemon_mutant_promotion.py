@@ -11,6 +11,7 @@ from farmharness.integration.tests import farm_fixture
 from farmharness.integration.daemon_mutant_promotion import (
     DaemonMutantPromotionError,
     promote_daemon_mutant,
+    promote_scheduler_mutant,
 )
 from farmharness.integration import farmtest
 from farmharness.integration.farm_spec import load_farm_spec
@@ -20,16 +21,21 @@ from farmharness.integration.images import (
     DAEMON_ROLE_PROBE_LABEL,
     ImageError,
     ImageIdentity,
+    SCHEDULER_ROLE_PATH,
+    SCHEDULER_ROLE_PROBE_LABEL,
     build_and_distribute,
     _probe_daemon_role_hash,
+    _probe_scheduler_role_hash,
     image_bindings,
 )
+from farmharness.integration.mutant import derive_scheduler_mutant
 from farmharness.integration.remote import CommandResult
 
 
 INTEGRATION = Path(__file__).resolve().parents[1]
 LABEL = "p50s30-f-refusal-mutant-candidate"
 S90_LABEL = "p50s90-f-revision-2-candidate"
+H3_LABEL = "p50s4-h3-tail-candidate"
 ROLE_SHA = "d" * 64
 
 
@@ -37,22 +43,28 @@ def _farm():
     return load_farm_spec(farm_fixture.example_farm_path())
 
 
-def _receipt(farm, label: str = LABEL):
+def _receipt(farm, label: str = LABEL, *, role: str = "daemon"):
     binding = image_bindings(farm, [label])[0]
     closure = "a" * 64
     reference = binding.reference
+    role_path = DAEMON_ROLE_PATH if role == "daemon" else SCHEDULER_ROLE_PATH
+    probe_label = (
+        DAEMON_ROLE_PROBE_LABEL
+        if role == "daemon"
+        else SCHEDULER_ROLE_PROBE_LABEL
+    )
     probe_argv = [
         "docker", "run", "--rm", "--pull=never", "--network", "none",
         "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only",
-        "--label", DAEMON_ROLE_PROBE_LABEL, "--entrypoint", "/usr/bin/sha256sum",
-        reference, DAEMON_ROLE_PATH,
+        "--label", probe_label, "--entrypoint", "/usr/bin/sha256sum",
+        reference, role_path,
     ]
     observed = {
         "archive_sha256": binding.archive_sha256,
         "closure_schema": "docker-inspect-runtime-closure-v1",
         "closure_sha256": closure,
         "commit": binding.commit,
-        "daemon_role_sha256": ROLE_SHA,
+        f"{role}_role_sha256": ROLE_SHA,
         "hosts": {
             host: {"closure_sha256": closure, "id": "sha256:" + "b" * 64}
             for host in farm.hosts
@@ -64,7 +76,7 @@ def _receipt(farm, label: str = LABEL):
         "argv": probe_argv,
         "host": "hub",
         "instance": None,
-        "phase": "images.probe-daemon-role",
+        "phase": f"images.probe-{role}-role",
         "sequence": 2,
         "timeout_s": 1800,
         "transport": "local-docker",
@@ -80,6 +92,17 @@ def _receipt(farm, label: str = LABEL):
         "images": {label: observed},
         "schema": "icefarm-images-v1",
     }
+
+
+def _scheduler_candidate_farm():
+    farm = _farm()
+    images = farm.data["authority"]["images"]
+    images[H3_LABEL] = derive_scheduler_mutant(
+        "p50s4-57a1e336",
+        images["p50s4-57a1e336"],
+        label=H3_LABEL,
+    )
+    return farm
 
 
 class ProbeRecorder:
@@ -120,6 +143,21 @@ def test_daemon_probe_refuses_ambiguous_output() -> None:
         _probe_daemon_role_hash(binding, recorder, CommandFactory(), timeout_s=10)
 
 
+def test_scheduler_probe_is_bounded_and_strictly_authenticated() -> None:
+    farm = _scheduler_candidate_farm()
+    binding = image_bindings(farm, [H3_LABEL])[0]
+    recorder = ProbeRecorder(f"{ROLE_SHA}  {SCHEDULER_ROLE_PATH}\n")
+    observed = _probe_scheduler_role_hash(
+        binding, recorder, CommandFactory(), timeout_s=19
+    )
+    assert observed == ROLE_SHA
+    command = recorder.commands[0]
+    assert command.phase == "images.probe-scheduler-role"
+    assert command.timeout_s == 19
+    assert command.argv[-1] == SCHEDULER_ROLE_PATH
+    assert SCHEDULER_ROLE_PROBE_LABEL in command.argv
+
+
 def test_daemon_candidate_promotes_only_from_matching_receipt() -> None:
     farm = _farm()
     receipt = _receipt(farm)
@@ -130,6 +168,25 @@ def test_daemon_candidate_promotes_only_from_matching_receipt() -> None:
     assert candidate["role_overrides"] == {"daemon": {"sha256": ROLE_SHA}}
     assert "closure_sha256" not in farm.data["authority"]["images"][LABEL]
     assert "role_overrides" not in farm.data["authority"]["images"][LABEL]
+
+
+def test_scheduler_candidate_promotes_only_from_authenticated_role_probe() -> None:
+    farm = _scheduler_candidate_farm()
+    promoted = promote_scheduler_mutant(
+        farm, H3_LABEL, _receipt(farm, H3_LABEL, role="scheduler")
+    )
+    candidate = promoted["authority"]["images"][H3_LABEL]
+    assert candidate["closure_sha256"] == "a" * 64
+    assert candidate["id"] == "sha256:" + "c" * 64
+    assert candidate["role_overrides"] == {
+        "scheduler": {"sha256": ROLE_SHA}
+    }
+
+
+def test_scheduler_promotion_refuses_a_daemon_role_probe() -> None:
+    farm = _scheduler_candidate_farm()
+    with pytest.raises(DaemonMutantPromotionError, match="scheduler role probe"):
+        promote_scheduler_mutant(farm, H3_LABEL, _receipt(farm, H3_LABEL))
 
 
 def test_two_daemon_promotions_require_fresh_sequential_farm_digest() -> None:
@@ -213,6 +270,29 @@ def test_promotion_cli_writes_valid_uncaptured_output_once(tmp_path: Path) -> No
         "--farm", str(farm_path), "--receipt", str(receipt_path),
         "--label", LABEL, "--output", str(output),
     ]) == 3
+
+
+def test_scheduler_promotion_cli_writes_valid_uncaptured_output_once(
+    tmp_path: Path,
+) -> None:
+    farm = _scheduler_candidate_farm()
+    farm_path = tmp_path / "farm.json"
+    farm_path.write_text(json.dumps(farm.data), encoding="utf-8")
+    receipt_path = tmp_path / "images.json"
+    receipt_path.write_text(
+        json.dumps(_receipt(farm, H3_LABEL, role="scheduler")),
+        encoding="utf-8",
+    )
+    output = tmp_path / "farm-promoted.json"
+    assert farmtest.main([
+        "authority", "promote-scheduler-mutant",
+        "--farm", str(farm_path), "--receipt", str(receipt_path),
+        "--label", H3_LABEL, "--output", str(output),
+    ]) == 0
+    loaded = load_farm_spec(output)
+    assert loaded.data["authority"]["images"][H3_LABEL]["role_overrides"] == {
+        "scheduler": {"sha256": ROLE_SHA}
+    }
 
 
 def test_promotion_cli_refuses_non_object_receipt(
@@ -310,6 +390,49 @@ def test_daemon_image_receipt_retains_observed_role_hash(tmp_path: Path, monkeyp
         output=tmp_path / "images.json",
     )
     assert receipt["images"][LABEL]["daemon_role_sha256"] == ROLE_SHA
+
+
+def test_scheduler_image_receipt_retains_observed_role_hash(
+    tmp_path: Path, monkeypatch
+) -> None:
+    farm = _scheduler_candidate_farm()
+    closure = "a" * 64
+    monkeypatch.setattr(
+        "farmharness.integration.images.prepare_build_context",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "farmharness.integration.images.build_image",
+        lambda *_args, **_kwargs: ImageIdentity("sha256:" + "c" * 64, closure),
+    )
+    monkeypatch.setattr(
+        "farmharness.integration.images._probe_scheduler_role_hash",
+        lambda *_args, **_kwargs: ROLE_SHA,
+    )
+    monkeypatch.setattr(
+        "farmharness.integration.images._save_once",
+        lambda *_args, **_kwargs: {
+            "artifact": {"bytes": 1, "sha256": "e" * 64},
+            "format": "docker-save-tar-zstd",
+            "reference": "icefarm-transport:" + closure,
+            "schema": "icefarm-docker-save-zstd-v1",
+            "zstd": {"check": True, "level": 19, "long": 31, "threads": 8},
+        },
+    )
+    monkeypatch.setattr(
+        "farmharness.integration.images.distribute_image",
+        lambda *_args, **_kwargs: {
+            host: {"closure_sha256": closure, "id": "sha256:" + "b" * 64}
+            for host in farm.hosts
+        },
+    )
+    receipt = build_and_distribute(
+        farm,
+        [H3_LABEL],
+        repo=tmp_path,
+        output=tmp_path / "images.json",
+    )
+    assert receipt["images"][H3_LABEL]["scheduler_role_sha256"] == ROLE_SHA
 
 
 @pytest.mark.parametrize("tamper", ("farm_digest", "commit", "closure", "host", "role"))

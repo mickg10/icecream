@@ -180,20 +180,26 @@ class ImageIdentity:
 
 DAEMON_ROLE_PATH = "/opt/icecream/sbin/iceccd"
 DAEMON_ROLE_PROBE_LABEL = "icefarm.probe=daemon-role-sha256-v1"
+SCHEDULER_ROLE_PATH = "/opt/icecream/sbin/icecc-scheduler"
+SCHEDULER_ROLE_PROBE_LABEL = "icefarm.probe=scheduler-role-sha256-v1"
 
 
-def _probe_daemon_role_hash(
+def _probe_role_hash(
     binding: ImageBinding,
     recorder: Recorder,
     commands: CommandFactory,
     *,
+    role: str,
+    path: str,
+    probe_label: str,
     timeout_s: int,
 ) -> str:
-    """Measure the mutant daemon binary in one bounded, isolated hub probe."""
+    """Measure one mutant role binary in a bounded, isolated hub probe."""
 
+    phase = f"images.probe-{role}-role"
     result = recorder.invoke(
         commands.make(
-            phase="images.probe-daemon-role",
+            phase=phase,
             host="hub",
             transport="local-docker",
             timeout_s=timeout_s,
@@ -208,27 +214,69 @@ def _probe_daemon_role_hash(
                 "--security-opt=no-new-privileges",
                 "--read-only",
                 "--label",
-                DAEMON_ROLE_PROBE_LABEL,
+                probe_label,
                 "--entrypoint",
                 "/usr/bin/sha256sum",
                 binding.reference,
-                DAEMON_ROLE_PATH,
+                path,
             ),
         )
     )
     lines = result.stdout.splitlines()
     if result.returncode != 0 or len(lines) != 1:
         raise ImageError(
-            f"daemon role probe for {binding.label} returned malformed output"
+            f"{role} role probe for {binding.label} returned malformed output"
         )
     fields = lines[0].split()
     if (
         len(fields) != 2
         or re.fullmatch(r"[0-9a-f]{64}", fields[0]) is None
-        or fields[1] != DAEMON_ROLE_PATH
+        or fields[1] != path
     ):
-        raise ImageError(f"daemon role probe for {binding.label} is not authenticated")
+        raise ImageError(
+            f"{role} role probe for {binding.label} is not authenticated"
+        )
     return fields[0]
+
+
+def _probe_daemon_role_hash(
+    binding: ImageBinding,
+    recorder: Recorder,
+    commands: CommandFactory,
+    *,
+    timeout_s: int,
+) -> str:
+    """Measure the mutant daemon binary in one bounded, isolated hub probe."""
+
+    return _probe_role_hash(
+        binding,
+        recorder,
+        commands,
+        role="daemon",
+        path=DAEMON_ROLE_PATH,
+        probe_label=DAEMON_ROLE_PROBE_LABEL,
+        timeout_s=timeout_s,
+    )
+
+
+def _probe_scheduler_role_hash(
+    binding: ImageBinding,
+    recorder: Recorder,
+    commands: CommandFactory,
+    *,
+    timeout_s: int,
+) -> str:
+    """Measure the mutant scheduler binary in one bounded, isolated hub probe."""
+
+    return _probe_role_hash(
+        binding,
+        recorder,
+        commands,
+        role="scheduler",
+        path=SCHEDULER_ROLE_PATH,
+        probe_label=SCHEDULER_ROLE_PROBE_LABEL,
+        timeout_s=timeout_s,
+    )
 
 
 @dataclass(frozen=True)
@@ -1834,9 +1882,13 @@ def build_and_distribute(
                 timeout_s=timeout_s,
                 source_archive_dir=source_archive_dir,
             )
-            daemon_role_sha256 = None
+            role_hashes: dict[str, str] = {}
             if binding.kind == "daemon-mutant":
-                daemon_role_sha256 = _probe_daemon_role_hash(
+                role_hashes["daemon_role_sha256"] = _probe_daemon_role_hash(
+                    binding, transport, commands, timeout_s=timeout_s
+                )
+            elif binding.kind == "scheduler-mutant":
+                role_hashes["scheduler_role_sha256"] = _probe_scheduler_role_hash(
                     binding, transport, commands, timeout_s=timeout_s
                 )
             image_archive = (
@@ -1874,11 +1926,7 @@ def build_and_distribute(
                     **transport_metadata,
                     "path": str(image_archive),
                 },
-                **(
-                    {"daemon_role_sha256": daemon_role_sha256}
-                    if daemon_role_sha256 is not None
-                    else {}
-                ),
+                **role_hashes,
             }
     receipt = {
         "commands": [command.as_dict() for command in transport.commands],

@@ -29,6 +29,7 @@ try:
     from .daemon_mutant_promotion import (
         DaemonMutantPromotionError,
         promote_daemon_mutant,
+        promote_scheduler_mutant,
     )
     from .farm_spec import FarmSpec, FarmSpecError, load_farm_spec
     from .images import (
@@ -94,7 +95,11 @@ except ImportError:  # Executed as ./farmtest.py.
         collect_refusal_bundle,
         load_verified_bundle,
     )
-    from daemon_mutant_promotion import DaemonMutantPromotionError, promote_daemon_mutant
+    from daemon_mutant_promotion import (
+        DaemonMutantPromotionError,
+        promote_daemon_mutant,
+        promote_scheduler_mutant,
+    )
     from farm_spec import FarmSpec, FarmSpecError, load_farm_spec
     from images import (
         ImageError,
@@ -820,8 +825,10 @@ def promote_daemon_mutant_file(
     receipt_path: Path,
     label: str,
     output: Path,
+    *,
+    promoter=promote_daemon_mutant,
 ) -> dict[str, Any]:
-    """Promote once, validate the new uncaptured farm, and never overwrite."""
+    """Promote one mutant, validate the uncaptured farm, and never overwrite."""
 
     output = Path(output)
     if os.path.lexists(output):
@@ -832,7 +839,7 @@ def promote_daemon_mutant_file(
         raise DaemonMutantPromotionError(
             f"cannot read image receipt {receipt_path}: {exc}"
         ) from exc
-    promoted = promote_daemon_mutant(farm, label, receipt)
+    promoted = promoter(farm, label, receipt)
     temporary = output.with_name(output.name + f".tmp-{os.getpid()}")
     try:
         temporary.parent.mkdir(parents=True, exist_ok=True)
@@ -875,6 +882,23 @@ def promote_daemon_mutant_file(
     finally:
         temporary.unlink(missing_ok=True)
     return {"label": label, "output": str(output), "status": "PROMOTED"}
+
+
+def promote_scheduler_mutant_file(
+    farm: FarmSpec,
+    receipt_path: Path,
+    label: str,
+    output: Path,
+) -> dict[str, Any]:
+    """Promote one scheduler mutant through the same fail-closed write path."""
+
+    return promote_daemon_mutant_file(
+        farm,
+        receipt_path,
+        label,
+        output,
+        promoter=promote_scheduler_mutant,
+    )
 
 
 def _render_suite(result: dict[str, Any]) -> str:
@@ -2323,6 +2347,13 @@ def _parser() -> argparse.ArgumentParser:
     authority_promote.add_argument("--receipt", required=True)
     authority_promote.add_argument("--label", required=True)
     authority_promote.add_argument("--output", required=True)
+    authority_promote_scheduler = authority_commands.add_parser(
+        "promote-scheduler-mutant"
+    )
+    authority_promote_scheduler.add_argument("--farm", required=True)
+    authority_promote_scheduler.add_argument("--receipt", required=True)
+    authority_promote_scheduler.add_argument("--label", required=True)
+    authority_promote_scheduler.add_argument("--output", required=True)
     authority_snapshot = authority_commands.add_parser("capture-system-source")
     authority_snapshot.add_argument("--farm", required=True)
     authority_snapshot.add_argument("--output", required=True)
@@ -2404,6 +2435,15 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             if args.authority_command == "promote-daemon-mutant":
                 receipt = promote_daemon_mutant_file(
+                    farm,
+                    Path(args.receipt),
+                    args.label,
+                    Path(args.output),
+                )
+                print(json.dumps(receipt, indent=2, sort_keys=True))
+                return 0
+            if args.authority_command == "promote-scheduler-mutant":
+                receipt = promote_scheduler_mutant_file(
                     farm,
                     Path(args.receipt),
                     args.label,
