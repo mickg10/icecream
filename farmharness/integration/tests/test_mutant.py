@@ -69,25 +69,35 @@ def test_mutant_recipe_is_deterministic_and_hash_bound() -> None:
     assert first["base_archive_sha256"] == _base()["archive_sha256"]
 
 
-def test_final_lineage_mutant_recipes_are_exactly_derived() -> None:
+def test_historical_h3_and_final_s90_mutant_recipes_are_exactly_derived() -> None:
     images = _farm().data["authority"]["images"]
-    base = images["p50s4-57a1e336"]
+    historical_base = images["p50s4-57a1e336"]
+    final_base = images["p50s4-a82d72d8"]
     h3 = derive_scheduler_mutant(
         "p50s4-57a1e336",
-        base,
+        historical_base,
         label="p50s4-h3-tail-57a1e336",
     )
     s90 = derive_daemon_mutant(
-        "p50s4-57a1e336",
-        base,
+        "p50s4-a82d72d8",
+        final_base,
         INTEGRATION / "mutants" / "daemon-wire-revision-2.patch",
-        label="p50s90-f-revision-2-57a1e336",
+        label="p50s90-f-revision-2-a82d72d8",
+    )
+    hidden = derive_daemon_mutant(
+        "p50s4-a82d72d8",
+        final_base,
+        INTEGRATION / "mutants" / "daemon-hidden-wire-skew.patch",
+        label="p50s90-f-hidden-skew-a82d72d8",
     )
     assert h3["recipe_sha256"] == (
         "754da050d4a8ba33bf654efb48124e7067a18189a85340ee66c468d0f67eea98"
     )
     assert s90["recipe_sha256"] == (
-        "76dc368f6109e20374d9cf5d6e412273b9978496c10569c25eb8c609d8c7aa14"
+        "2f5fe5f937d2932d593b2cfd2b86c6de9dd9f1b9f350f3407305bdd15a35255b"
+    )
+    assert hidden["recipe_sha256"] == (
+        "3e0b220705b82d298e8637d41ebcd371b5e586c29de368374e7f27d07d056c80"
     )
     measured = {
         "p50s4-h3-tail-57a1e336": {
@@ -99,19 +109,29 @@ def test_final_lineage_mutant_recipes_are_exactly_derived() -> None:
                 }
             },
         },
-        "p50s90-f-revision-2-57a1e336": {
-            "closure_sha256": "adf183b2875eefa5947b73cc4989f62692e4961a68ec94eab0da6422efdb1549",
-            "id": "sha256:6cc0a56c22e8cb5363b107ccc06826a5e1f5259553ff11e8291789b42bd7a3ad",
+        "p50s90-f-revision-2-a82d72d8": {
+            "closure_sha256": "e2c5402dec5416e0d7e357812fd799ce5d42155ed962f6b3aea2bf85415b8638",
+            "id": "sha256:a275d56c96cc9199ceb4a6df49e53ac3fc6060b529e740e4ec0d2c9c72e184d6",
             "role_overrides": {
                 "daemon": {
-                    "sha256": "73ce56d1603746151b1ac73a87ba8d4d78a51701517efff7f8b8be6f65cd1608"
+                    "sha256": "14218939b09415d86c247de811819057e6b3e1ae439e4a4e89e6002eff4a5cb5"
+                }
+            },
+        },
+        "p50s90-f-hidden-skew-a82d72d8": {
+            "closure_sha256": "ce0f2dbf982c9d16603bdcb6ccfb86b76c20170777a4130e4ccf0e28057389e7",
+            "id": "sha256:8e4f09f6d00f2cae9a13d7552f2d5c5db775f5d0d05e7f045857484824c4d540",
+            "role_overrides": {
+                "daemon": {
+                    "sha256": "78c54e3320024a10872f8e902296dc14c2400fcba43e84b559f5835297c1fbef"
                 }
             },
         },
     }
     for label, derived in (
         ("p50s4-h3-tail-57a1e336", h3),
-        ("p50s90-f-revision-2-57a1e336", s90),
+        ("p50s90-f-revision-2-a82d72d8", s90),
+        ("p50s90-f-hidden-skew-a82d72d8", hidden),
     ):
         candidate = images[label]
         assert {
@@ -125,7 +145,8 @@ def test_final_lineage_mutant_recipes_are_exactly_derived() -> None:
             key: candidate[key]
             for key in ("closure_sha256", "id", "role_overrides")
         } == measured[label]
-    assert images["p50s90-f-revision-2-57a1e336"]["cache_wire_revision"] == 2
+    assert images["p50s90-f-revision-2-a82d72d8"]["cache_wire_revision"] == 2
+    assert images["p50s90-f-hidden-skew-a82d72d8"]["cache_wire_revision"] == 1
 
 
 def test_daemon_mutant_recipe_binds_sealed_p50_base_and_patch() -> None:
@@ -164,12 +185,12 @@ def test_s90_revision_two_recipe_is_exactly_derived_from_sealed_b42() -> None:
 def test_s90_hidden_skew_recipe_is_exactly_derived_from_sealed_final() -> None:
     farm = _farm()
     images = farm.data["authority"]["images"]
-    candidate = images["p50s90-f-hidden-skew-candidate"]
+    candidate = images["p50s90-f-hidden-skew-a82d72d8"]
     derived = derive_daemon_mutant(
-        "p50s4-57a1e336",
-        images["p50s4-57a1e336"],
+        "p50s4-a82d72d8",
+        images["p50s4-a82d72d8"],
         INTEGRATION / "mutants" / "daemon-hidden-wire-skew.patch",
-        label="p50s90-f-hidden-skew-candidate",
+        label="p50s90-f-hidden-skew-a82d72d8",
     )
     assert candidate["cache_wire_revision"] == 1
     assert {key: candidate[key] for key in derived} == {

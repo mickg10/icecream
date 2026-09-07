@@ -216,9 +216,9 @@
         "daemon": {"sha256": "d784931378fbba8464541a11fd4557aa47fff528159482350b4b5e27be3741ab"}
       },
       "50": {
-        "scheduler": {"sha256": "e04be1cbf3d4bd29a47785eff31a06a8d58f1bbe11e119a0f74cf18276dfefd3"},
-        "client": {"sha256": "75c06485142f70a4fea1d35818acacc93c1ba528a7c37420eb80ba7fe3d8a672"},
-        "daemon": {"sha256": "2a252e5eb09259a39b78aa9d9277d557c57e1ecf87408057fdcd8f1056cc61e5"}
+        "scheduler": {"sha256": "a54fb0a4f705d216c61639395a5e6ad70c23a7333f4fa62a24333f1dc88ce799"},
+        "client": {"sha256": "c35eb8acecfc8da9bd00103c2866c7e193f6a956285775122192b8c21e0d24d1"},
+        "daemon": {"sha256": "78c54e3320024a10872f8e902296dc14c2400fcba43e84b559f5835297c1fbef"}
       }
     },
     "images": {
@@ -282,6 +282,12 @@
         "closure_sha256": "b8aa267a40f2beb17bbb53de165ab1e744b13ddc2e2fe39eee1486d57947cb0a",
         "id": "sha256:585bfe31a140a418dcfee9f0d876513f7f025eb5b7f273c095a8761f05870699"
       },
+      "p50s4-a82d72d8": {
+        "commit": "a82d72d8b0c90cb5fd8a4ac4118dbc2cdf4d8fa9",
+        "archive_sha256": "de8543d3a93ff459fa7ed1653dc3a8247b428846d0ee303b9048f526876c651e",
+        "closure_sha256": "0a312136e7a84132ce41d425cdd1c3f90dd0f84339a34de375bab09c72d9c602",
+        "id": "sha256:f48dd6e6abbf647adde280c30e1e36e95c57bfddbc8a92871b7b9b4d8ceac836"
+      },
       "p50s4-b42d65e8": {
         "commit": "b42d65e8ac9e90e05ee6d3a19cd371a40dad3277",
         "archive_sha256": "cf40a12d679d3e8b06e8df8b2f336127f69a4e1b46995e4bb8546de0ec742b98",
@@ -334,6 +340,46 @@
         "patch_sha256": "dacae42499a23db64c76ea56694735153f9dea2faefa7eee22506828f2f2654f",
         "recipe_schema": "icefarm-daemon-mutant-recipe-v1",
         "recipe_sha256": "b6f9965a6dbd9a09488b45515aaa08a4f6da44d76ab0c607c5d33a9cd8a3eff5"
+      },
+      "p50s90-f-revision-2-a82d72d8": {
+        "kind": "daemon-mutant",
+        "base_image": "p50s4-a82d72d8",
+        "base_commit": "a82d72d8b0c90cb5fd8a4ac4118dbc2cdf4d8fa9",
+        "base_archive_sha256": "de8543d3a93ff459fa7ed1653dc3a8247b428846d0ee303b9048f526876c651e",
+        "commit": "a82d72d8b0c90cb5fd8a4ac4118dbc2cdf4d8fa9",
+        "archive_sha256": "2f5fe5f937d2932d593b2cfd2b86c6de9dd9f1b9f350f3407305bdd15a35255b",
+        "cache_wire_revision": 2,
+        "closure_sha256": "e2c5402dec5416e0d7e357812fd799ce5d42155ed962f6b3aea2bf85415b8638",
+        "id": "sha256:a275d56c96cc9199ceb4a6df49e53ac3fc6060b529e740e4ec0d2c9c72e184d6",
+        "patch_path": "mutants/daemon-wire-revision-2.patch",
+        "patch_sha256": "76fbed8c13d3836253444130502511949bc359f0c5228c241d318a1a125461e7",
+        "recipe_schema": "icefarm-daemon-mutant-recipe-v1",
+        "recipe_sha256": "2f5fe5f937d2932d593b2cfd2b86c6de9dd9f1b9f350f3407305bdd15a35255b",
+        "role_overrides": {
+          "daemon": {
+            "sha256": "14218939b09415d86c247de811819057e6b3e1ae439e4a4e89e6002eff4a5cb5"
+          }
+        }
+      },
+      "p50s90-f-hidden-skew-a82d72d8": {
+        "kind": "daemon-mutant",
+        "base_image": "p50s4-a82d72d8",
+        "base_commit": "a82d72d8b0c90cb5fd8a4ac4118dbc2cdf4d8fa9",
+        "base_archive_sha256": "de8543d3a93ff459fa7ed1653dc3a8247b428846d0ee303b9048f526876c651e",
+        "commit": "a82d72d8b0c90cb5fd8a4ac4118dbc2cdf4d8fa9",
+        "archive_sha256": "3e0b220705b82d298e8637d41ebcd371b5e586c29de368374e7f27d07d056c80",
+        "cache_wire_revision": 1,
+        "closure_sha256": "ce0f2dbf982c9d16603bdcb6ccfb86b76c20170777a4130e4ccf0e28057389e7",
+        "id": "sha256:8e4f09f6d00f2cae9a13d7552f2d5c5db775f5d0d05e7f045857484824c4d540",
+        "patch_path": "mutants/daemon-hidden-wire-skew.patch",
+        "patch_sha256": "dacae42499a23db64c76ea56694735153f9dea2faefa7eee22506828f2f2654f",
+        "recipe_schema": "icefarm-daemon-mutant-recipe-v1",
+        "recipe_sha256": "3e0b220705b82d298e8637d41ebcd371b5e586c29de368374e7f27d07d056c80",
+        "role_overrides": {
+          "daemon": {
+            "sha256": "78c54e3320024a10872f8e902296dc14c2400fcba43e84b559f5835297c1fbef"
+          }
+        }
       },
       "p50s30-f-refusal-mutant-candidate": {
         "kind": "daemon-mutant",
