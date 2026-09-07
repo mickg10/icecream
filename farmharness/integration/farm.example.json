@@ -202,6 +202,73 @@
     "process_patterns": ["bigfarm"],
     "never_touch_labels_other_than": "icefarm.*"
   },
+  "authority_capture": {
+    "authority_sha256": "a0e48c07938fba1e58dfb9ae8e35eaea9a348c22bde151ff111925ab59ac630b",
+    "captured_at": "2026-09-07T10:14:11Z",
+    "hosts": {
+      "research6": {
+        "address": "10.0.27.56",
+        "arch": "x86_64",
+        "boot_id_sha256": "9ed66979e363fdfa274e7405495a42092c43772dedd10072da2205bcd8ba0705",
+        "captured_at": "2026-09-07T10:14:12Z",
+        "cpu_count": 20,
+        "docker": {
+          "arch": "x86_64",
+          "mem_bytes": 405749002240,
+          "name": "research6",
+          "os": "linux",
+          "root_dir": "/var/snap/docker/common/var-lib-docker",
+          "server_version": "29.6.1"
+        },
+        "hostname": "research6",
+        "machine_id_sha256": "40c9e9150b141c036dfa61f0f869e0864b85a1cbf61054d510ceff91bbfc03d0",
+        "mem_bytes": 405749002240,
+        "nic_identity_sha256": "491922909009948ab72c637b047cc9eab35a2764efa4333223a1e1f9c948a59b",
+        "physical_host_sha256": "c8a1f70a521cad8228deb989cc4c6ebb87376b787b616ec8fd50e142e6ac732f"
+      },
+      "tt-quietbox2": {
+        "address": "10.0.27.212",
+        "arch": "x86_64",
+        "boot_id_sha256": "e71ff0fcc471b87a45bdf12beafd67386cbe9e8bc8be5a4637f1ddab6271cacf",
+        "captured_at": "2026-09-07T10:14:13Z",
+        "cpu_count": 32,
+        "docker": {
+          "arch": "x86_64",
+          "mem_bytes": 540574842880,
+          "name": "tt-quietbox2",
+          "os": "linux",
+          "root_dir": "/var/lib/docker",
+          "server_version": "29.6.2"
+        },
+        "hostname": "tt-quietbox2",
+        "machine_id_sha256": "14607f85ad2fbb536211a7343f29dbdf8db1f9bd0f948010600b31d420e7166d",
+        "mem_bytes": 540574842880,
+        "nic_identity_sha256": "50bec5f670a9b0c1ccece7b896e28fd9f6aad73383be70391bad9206616f5728",
+        "physical_host_sha256": "a29542e01bb2ce4539bd8f08b5b6f182bf4a9a0a97457f2453b8316c4972d963"
+      },
+      "tt-quietbox3": {
+        "address": "10.0.27.101",
+        "arch": "x86_64",
+        "boot_id_sha256": "6059ce6e7f5d321269104432d1316c3915cd83dad19ad79454fe374d92ca034d",
+        "captured_at": "2026-09-07T10:14:13Z",
+        "cpu_count": 32,
+        "docker": {
+          "arch": "x86_64",
+          "mem_bytes": 540574855168,
+          "name": "tt-quietbox3",
+          "os": "linux",
+          "root_dir": "/var/lib/docker",
+          "server_version": "29.7.2"
+        },
+        "hostname": "tt-quietbox3",
+        "machine_id_sha256": "5d57a5169adc5814555ca3412deb891065c6dcf7d064c70ed4b5e88cd2587e79",
+        "mem_bytes": 540574855168,
+        "nic_identity_sha256": "5a02617b19ed4222f039df0f20ca2df6677b0ca6ce0d432fa756d89fa39a9308",
+        "physical_host_sha256": "61b1ba9c5524f4e975046b8cf7ec125a7ab67c8b53719ce95772b090ffca667a"
+      }
+    },
+    "schema": "icecream-newgen-authority-capture-v2"
+  },
   "authority": {
     "schema": "icecream-newgen-farm-authority-v1",
     "hosts": {
