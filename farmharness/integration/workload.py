@@ -6,6 +6,7 @@ import json
 import os
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -941,15 +942,45 @@ def run_workload(
         for client in clients
     }
     turn_receipts: list[dict[str, Any]] = []
-    turn_context: dict[str, Any] = {"turn": None, "futures": [], "commands": []}
+    turn_context: dict[str, Any] = {
+        "turn": None,
+        "futures": [],
+        "commands": [],
+        "ready": None,
+    }
     turn_overrides: dict[str, list[CommandResult]] = {}
-    transition_waiters: dict[str, threading.Event] = {}
+    checkpointed_client_events = [
+        event
+        for event in scenario.data.get("timeline", [])
+        if event.get("trigger", "").startswith("job ")
+        and event.get("action") in {"upgrade", "downgrade", "env_set"}
+        and any(
+            item.get("name") == event.get("instance") and item.get("role") == "C"
+            for item in scenario.data["instances"]
+        )
+    ]
+    if checkpointed_client_events and len(scenario.data["workload"]["turns"]) != 1:
+        raise WorkloadError(
+            "checkpointed C transitions require one unambiguous workload turn"
+        )
+    transition_waiters: dict[str, threading.Event] = (
+        {scenario.data["workload"]["turns"][0]: threading.Event()}
+        if checkpointed_client_events
+        else {}
+    )
 
     def _checkpoint_documents(
         turn: str, workload_clients: tuple[dict[str, Any], ...]
     ) -> dict[str, Any]:
         if turn_context["turn"] != turn:
             raise WorkloadError("checkpoint requested for an inactive workload turn")
+        ready = turn_context["ready"]
+        if not isinstance(ready, threading.Event) or not ready.wait(
+            timeout=max(1.0, scenario.data["timeouts"]["turn_s"])
+        ):
+            raise WorkloadError("checkpoint requested before workload dispatch was reserved")
+        if turn_context["turn"] != turn:
+            raise WorkloadError("checkpoint workload turn changed during dispatch")
         for future in turn_context["futures"]:
             future.result()
         documents: dict[str, Any] = {}
@@ -981,7 +1012,8 @@ def run_workload(
                 documents[client["name"]] = json.loads(result.stdout)
             except (TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise WorkloadError(f"client {client['name']} checkpoint is malformed") from exc
-        transition_waiters.setdefault(turn, threading.Event())
+        if turn not in transition_waiters:
+            raise WorkloadError("checkpoint requested without a reserved transition turn")
         return documents
 
     def _relaunch_from_checkpoint(
@@ -1021,7 +1053,9 @@ def run_workload(
                 "status": "COMPLETE",
             }
         turn_overrides[turn] = results
-        transition_waiters.setdefault(turn, threading.Event()).set()
+        if turn not in transition_waiters:
+            raise WorkloadError("checkpoint relaunch has no reserved transition turn")
+        transition_waiters[turn].set()
         return evidence
 
     # Validate all actions before dispatching a workload command.  The event
@@ -1061,22 +1095,40 @@ def run_workload(
                 for client in clients
             ]
             executor = ThreadPoolExecutor(max_workers=len(commands))
+            dispatch_ready = threading.Event()
+            futures = []
             try:
-                turn_context.update({"turn": turn, "futures": [], "commands": commands})
-                futures = [
-                    executor.submit(transport.invoke, command) for command in commands
-                ]
-                turn_context["futures"] = futures
+                turn_context.update(
+                    {
+                        "turn": turn,
+                        "futures": futures,
+                        "commands": commands,
+                        "ready": dispatch_ready,
+                    }
+                )
+                for command in commands:
+                    futures.append(executor.submit(transport.invoke, command))
+                dispatch_ready.set()
                 results = [future.result() for future in futures]
             finally:
+                dispatch_ready.set()
                 executor.shutdown(wait=True, cancel_futures=True)
             waiter = transition_waiters.get(turn)
-            if waiter is not None and not waiter.wait(
-                timeout=max(1.0, scenario.data["timeouts"]["turn_s"])
-            ):
-                raise WorkloadError("checkpointed C transition did not relaunch the workload")
+            if waiter is not None:
+                deadline = time.monotonic() + max(
+                    1.0, scenario.data["timeouts"]["turn_s"]
+                )
+                while not waiter.wait(timeout=0.05):
+                    events.raise_if_failed()
+                    if time.monotonic() >= deadline:
+                        raise WorkloadError(
+                            "checkpointed C transition did not relaunch the workload"
+                        )
+                events.raise_if_failed()
             results = turn_overrides.pop(turn, results)
-            turn_context.update({"turn": None, "futures": [], "commands": []})
+            turn_context.update(
+                {"turn": None, "futures": [], "commands": [], "ready": None}
+            )
             summaries = [
                 _parse_summary(result, client["name"])
                 for result, client in zip(results, clients, strict=True)

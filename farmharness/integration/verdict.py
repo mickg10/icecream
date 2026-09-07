@@ -282,6 +282,188 @@ def expected_profile(
     return None
 
 
+def _authoritative_endpoint_revisions(
+    bundle: Mapping[str, Any], event_epoch: object
+) -> tuple[dict[str, int | None] | None, set[str]]:
+    """Resolve effective C/F wire capability without consulting successful tails."""
+
+    topology = bundle.get("topology")
+    farm = bundle.get("farm")
+    event_log = bundle.get("event_log")
+    # Small pure-verdict fixtures intentionally omit launch authority and use
+    # their explicit observation map. Every retained bundle has all three.
+    if (
+        not isinstance(topology, Mapping)
+        or not isinstance(farm, Mapping)
+        or not isinstance(event_log, list)
+    ):
+        return None, set()
+    instances = topology.get("instances")
+    scenario = bundle.get("scenario")
+    if (
+        not _is_int(event_epoch)
+        or not isinstance(instances, list)
+        or not isinstance(scenario, Mapping)
+        or not isinstance(scenario.get("timeline"), list)
+    ):
+        return {}, {"@capability:authority"}
+    timeline = scenario["timeline"]
+    if event_epoch > len(timeline) or len(event_log) != len(timeline):
+        return {}, {"@capability:epoch"}
+
+    authority = farm.get("authority")
+    images = authority.get("images") if isinstance(authority, Mapping) else None
+    role_stores = (
+        authority.get("role_stores") if isinstance(authority, Mapping) else None
+    )
+
+    def image_binding(
+        label: object, role: object
+    ) -> tuple[int, int | None, str, str] | None:
+        version = _transition_protocol(label)
+        image_authority = images.get(label) if isinstance(images, Mapping) else None
+        if (
+            version is None
+            or role not in {"C", "F"}
+            or not isinstance(image_authority, Mapping)
+            or not isinstance(image_authority.get("archive_sha256"), str)
+            or SHA256_RE.fullmatch(image_authority["archive_sha256"]) is None
+            or not isinstance(image_authority.get("closure_sha256"), str)
+            or SHA256_RE.fullmatch(image_authority["closure_sha256"]) is None
+            or not isinstance(image_authority.get("commit"), str)
+            or re.fullmatch(r"[0-9a-f]{40}", image_authority["commit"]) is None
+        ):
+            return None
+        role_key = "client" if role == "C" else "daemon"
+        if image_authority.get("kind") == "daemon-mutant" and role == "F":
+            override = image_authority.get("role_overrides", {}).get("daemon")
+            role_sha256 = override.get("sha256") if isinstance(override, Mapping) else None
+        else:
+            store = role_stores.get(str(version)) if isinstance(role_stores, Mapping) else None
+            entry = store.get(role_key) if isinstance(store, Mapping) else None
+            role_sha256 = entry.get("sha256") if isinstance(entry, Mapping) else None
+        if not isinstance(role_sha256, str) or SHA256_RE.fullmatch(role_sha256) is None:
+            return None
+        revision = image_authority.get(
+            "cache_wire_revision", 1 if version == 50 else None
+        )
+        if version == 50 and not _is_int(revision, minimum=1):
+            return None
+        if version != 50 and revision is not None:
+            return None
+        return version, revision, image_authority["closure_sha256"], role_sha256
+
+    states: dict[str, dict[str, Any]] = {}
+    errors: set[str] = set()
+    for item in instances:
+        if not isinstance(item, Mapping) or item.get("role") not in {"C", "F"}:
+            continue
+        name = item.get("name")
+        version = item.get("version")
+        environment = item.get("env", {})
+        image = item.get("image")
+        label = image.get("label") if isinstance(image, Mapping) else None
+        binding = image_binding(label, item.get("role"))
+        if (
+            not isinstance(name, str)
+            or name in states
+            or not _is_int(version, minimum=1)
+            or not isinstance(environment, Mapping)
+            or binding is None
+            or version != binding[0]
+            or item.get("cache_wire_revision") != binding[1]
+            or image.get("closure_sha256") != binding[2]
+            or item.get("sha256") != binding[3]
+        ):
+            errors.add(f"@instance:{name or 'unknown'}")
+            continue
+        states[name] = {
+            "env": dict(environment),
+            "revision": item.get("cache_wire_revision"),
+            "role": item["role"],
+            "version": version,
+        }
+
+    scenario_images = scenario.get("images")
+    for index in range(event_epoch):
+        expected_event = timeline[index]
+        observed_event = event_log[index]
+        if not isinstance(expected_event, Mapping) or not isinstance(
+            observed_event, Mapping
+        ):
+            errors.add(f"@capability:event-{index}")
+            continue
+        if (
+            observed_event.get("event_epoch") != index + 1
+            or observed_event.get("event_index") != index
+            or observed_event.get("action") != expected_event.get("action")
+            or observed_event.get("instance") != expected_event.get("instance")
+        ):
+            errors.add(f"@capability:event-{index}")
+            continue
+        name = expected_event.get("instance")
+        action = expected_event.get("action")
+        if name not in states or action not in {"upgrade", "downgrade", "env_set"}:
+            continue
+        receipt = observed_event.get("receipt")
+        after = receipt.get("after") if isinstance(receipt, Mapping) else None
+        label = after.get("image") if isinstance(after, Mapping) else None
+        environment = after.get("env") if isinstance(after, Mapping) else None
+        if not isinstance(label, str) or not isinstance(environment, Mapping):
+            errors.add(f"@capability:event-{index}")
+            continue
+        state = states[str(name)]
+        expected_environment = dict(state["env"])
+        if action in {"upgrade", "downgrade"}:
+            alias = expected_event.get("image")
+            expected_label = (
+                scenario_images.get(alias)
+                if isinstance(scenario_images, Mapping) and isinstance(alias, str)
+                else None
+            )
+            binding = image_binding(label, state["role"])
+            if (
+                label != expected_label
+                or binding is None
+                or after.get("closure_sha256") != binding[2]
+                or after.get("role_sha256") != binding[3]
+            ):
+                errors.add(f"@capability:event-{index}")
+                continue
+            version = binding[0]
+            state["version"] = version
+            state["revision"] = binding[1]
+            if state["role"] == "C":
+                if version == 50:
+                    expected_environment.setdefault("ICECC_P50_MODE", "on")
+                else:
+                    expected_environment.pop("ICECC_P50_MODE", None)
+                    expected_environment.pop(P29_FAULT_ENV, None)
+        else:
+            update = expected_event.get("env")
+            if not isinstance(update, Mapping):
+                errors.add(f"@capability:event-{index}")
+                continue
+            expected_environment.update(update)
+        if dict(environment) != expected_environment:
+            errors.add(f"@capability:event-{index}")
+        state["env"] = expected_environment
+
+    revisions: dict[str, int | None] = {}
+    for name, state in states.items():
+        capable = state["version"] == 50 and (
+            state["role"] != "C"
+            or state["env"].get("ICECC_P50_MODE", "on") == "on"
+        )
+        revision = state["revision"]
+        if capable and not _is_int(revision, minimum=1):
+            errors.add(f"@instance:{name}")
+            revisions[name] = None
+        else:
+            revisions[name] = int(revision) if capable else None
+    return revisions, errors
+
+
 def _s60_transition_epoch_errors(
     scenario: Mapping[str, Any],
     rows: Sequence[Mapping[str, Any]],
@@ -3343,18 +3525,26 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
 
     engagement_mode = expect.get("engagement")
     engagement_bad: set[str] = set()
+    capability_bad: set[str] = set()
     if engagement_mode == "expected(c,f)" and profile_error is None:
         for row in valid_rows:
             row_profile, row_profile_error = _scenario_profile_at_epoch(
                 scenario, row["event_epoch"]
             )
+            authoritative_revisions, capability_errors = (
+                _authoritative_endpoint_revisions(bundle, row["event_epoch"])
+            )
+            capability_bad.update(capability_errors)
             expected = expected_profile(
                 row,
                 row_profile,
-                revisions if isinstance(revisions, Mapping) else {},
+                authoritative_revisions
+                if authoritative_revisions is not None
+                else revisions if isinstance(revisions, Mapping) else {},
             )
             if (
                 row_profile_error is not None
+                or capability_errors
                 or row["tail_profile"] != expected
                 and not authenticated_recovery_legacy(row)
                 and not (
@@ -3816,6 +4006,14 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
             engagement_bad.add("@observations:local_fallback_job_ids")
     else:
         engagement_bad.add("@expect:engagement")
+    clauses.append(
+        _clause(
+            "engagement.capability-authority",
+            not capability_bad,
+            "endpoint capability is bound to topology, image authority, and event epoch",
+            capability_bad,
+        )
+    )
     clauses.append(
         _clause(
             "engagement.expected",

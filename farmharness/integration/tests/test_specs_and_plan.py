@@ -462,6 +462,50 @@ def test_scheduler_fence_follows_resolved_relationship_law() -> None:
     assert scheduler["argv"][index + 1] == "strict-nonce"
 
 
+@pytest.mark.parametrize(
+    ("scenario_id", "expected_mode"),
+    (
+        ("S60-01-s-up", None),
+        ("S60-02-f1-up", None),
+        ("S60-03-f2-up", None),
+        ("S60-04-c1-up", "enforcing-compat"),
+        ("S60-05-c2-up", "enforcing-compat"),
+        ("S60-06-c2-down", "enforcing-compat"),
+        ("S60-07-c1-down", "enforcing-compat"),
+        ("S60-08-f2-down", None),
+        ("S60-09-f1-down", None),
+        ("S60-10-s-down", None),
+        ("S60-11-warm-f2-down", "enforcing-compat"),
+        ("S60-12-warm-f2-up", "enforcing-compat"),
+        ("S60-13-warm-s-down", "enforcing-compat"),
+        ("S60-14-warm-s-up", "enforcing-compat"),
+    ),
+)
+def test_transition_plan_uses_expected_fence_across_all_epochs(
+    scenario_id: str, expected_mode: str | None
+) -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / f"{scenario_id}.json", farm
+    )
+    plan = farmtest.build_plan(farm, scenario, run_id=f"fence-{scenario_id}")
+
+    assert plan["assignment_fence_mode"] == expected_mode
+    scheduler = next(
+        command for command in plan["commands"] if command["phase"] == "up.start-s"
+    )
+    scheduler_version = next(
+        item["version"]
+        for item in plan["topology"]["instances"]
+        if item["role"] == "S"
+    )
+    if scheduler_version == 50 and expected_mode is not None:
+        index = scheduler["argv"].index("--assignment-fence-mode")
+        assert scheduler["argv"][index + 1] == expected_mode
+    else:
+        assert "--assignment-fence-mode" not in scheduler["argv"]
+
+
 @pytest.mark.parametrize("profile", ("P29V1", "ZSTD_TU", "ZSTD_ROUTE"))
 def test_owner_kept_profiles_resolve(profile: str, tmp_path: Path) -> None:
     farm, scenario = _documents()

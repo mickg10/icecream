@@ -817,6 +817,135 @@ def test_scheduler_transition_profile_is_resolved_per_event_epoch(
     )
 
 
+def test_c_upgrade_missing_tail_cannot_erase_its_capability_expectation() -> None:
+    scenario = _scenario("mixed", client_versions=(43,), worker_versions=(50,))
+    scenario["id"] = "S60-04-c1-up"
+    scenario["timeline"] = [
+        {
+            "trigger": "job 24",
+            "action": "upgrade",
+            "instance": "C1",
+            "image": "new",
+        }
+    ]
+    row = _row(1)
+    row["event_epoch"] = 1
+    observations = _observations([row])
+    bundle = _bundle(scenario, [row], observations)
+    bundle["farm"] = {
+        "authority": {
+            "images": {
+                "p43-fixture": {
+                    "archive_sha256": SHA_A,
+                    "closure_sha256": SHA_A,
+                    "commit": "a" * 40,
+                },
+                "p50s4-fixture": {
+                    "archive_sha256": SHA_B,
+                    "cache_wire_revision": 1,
+                    "closure_sha256": SHA_B,
+                    "commit": "b" * 40,
+                },
+            },
+            "role_stores": {
+                "43": {"client": {"sha256": SHA_A}, "daemon": {"sha256": SHA_A}},
+                "50": {"client": {"sha256": SHA_C}, "daemon": {"sha256": SHA_B}},
+            },
+        }
+    }
+    bundle["topology"] = {
+        "instances": [
+            {
+                **copy.deepcopy(instance),
+                "cache_wire_revision": 1 if instance["image"] == "new" else None,
+                "image": {
+                    "closure_sha256": SHA_B if instance["image"] == "new" else SHA_A,
+                    "label": "p50s4-fixture" if instance["image"] == "new" else "p43-fixture",
+                },
+                "sha256": (
+                    SHA_C
+                    if instance["role"] == "C" and instance["image"] == "new"
+                    else SHA_B
+                    if instance["role"] == "F" and instance["image"] == "new"
+                    else SHA_A
+                ),
+                "version": 50 if instance["image"] == "new" else 43,
+            }
+            for instance in scenario["instances"]
+        ]
+    }
+    bundle["event_log"] = [
+        {
+            "action": "upgrade",
+            "event_epoch": 1,
+            "event_index": 0,
+            "fired_ms": 1000,
+            "instance": "C1",
+            "receipt": {
+                "after": {
+                    "closure_sha256": SHA_B,
+                    "env": {"ICECC_P50_MODE": "on"},
+                    "image": "p50s4-fixture",
+                    "role_sha256": SHA_C,
+                }
+            },
+            "trigger": "job 24",
+        }
+    ]
+
+    positive = evaluate_bundle(bundle)
+    assert next(
+        clause
+        for clause in positive["clauses"]
+        if clause["id"] == "engagement.capability-authority"
+    )["status"] == "PASS"
+    assert next(
+        clause
+        for clause in positive["clauses"]
+        if clause["id"] == "engagement.expected"
+    )["status"] == "PASS"
+
+    for mutation in ("closure", "role", "authority"):
+        tampered = copy.deepcopy(bundle)
+        if mutation == "closure":
+            tampered["event_log"][0]["receipt"]["after"]["closure_sha256"] = SHA_C
+        elif mutation == "role":
+            tampered["event_log"][0]["receipt"]["after"]["role_sha256"] = SHA_A
+        else:
+            tampered["farm"]["authority"]["images"]["p50s4-fixture"].pop(
+                "archive_sha256"
+            )
+        capability = next(
+            clause
+            for clause in evaluate_bundle(tampered)["clauses"]
+            if clause["id"] == "engagement.capability-authority"
+        )
+        assert capability["status"] == "FAIL"
+
+    missing = copy.deepcopy(bundle)
+    missing["rows"][0].update(
+        reuse=None,
+        session_outcome="none",
+        tail_present=False,
+        tail_profile=None,
+    )
+    missing["observations"]["wire_revisions"].pop("C1")
+    missing["observations"]["sidecars"]["F1"]["sessions"] = 0
+    verdict = evaluate_bundle(missing)
+    assert next(
+        clause
+        for clause in verdict["clauses"]
+        if clause["id"] == "engagement.capability-authority"
+    )["status"] == "PASS"
+    engagement = next(
+        clause
+        for clause in verdict["clauses"]
+        if clause["id"] == "engagement.expected"
+    )
+    assert engagement["status"] == "FAIL"
+    assert engagement["offending_job_ids"] == ["1"]
+
+
 def _s70_b5_bundle() -> dict[str, object]:
     scenario, observed = _client_transition_event()
     scenario["shape"] = "S'C'F'"

@@ -4088,6 +4088,9 @@ class EventProducer:
         rewritten: list[str] = []
         index = 0
         while index < len(argv):
+            if argv[index] == "--assignment-fence-mode" and index + 1 < len(argv):
+                index += 2
+                continue
             if argv[index] == "--env" and index + 1 < len(argv):
                 key = argv[index + 1].partition("=")[0]
                 if key in managed:
@@ -4106,6 +4109,12 @@ class EventProducer:
         for key in sorted(managed.intersection(target["env"])):
             managed_args.extend(("--env", f"{key}={target['env'][key]}"))
         rewritten[insertion:insertion] = managed_args
+        if target["role"] == "S" and self._image_version(target["image"]["label"]) == 50:
+            fence_mode = self.plan.get("assignment_fence_mode")
+            if fence_mode not in {None, "strict-nonce", "enforcing-compat"}:
+                raise EventError("P50 scheduler transition has no valid assignment fence")
+            if fence_mode is not None:
+                rewritten.extend(("--assignment-fence-mode", fence_mode))
         return tuple(rewritten)
 
     @staticmethod

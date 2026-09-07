@@ -410,12 +410,80 @@ def _env_args(environment: dict[str, str]) -> list[str]:
     return result
 
 
-def _assignment_fence_mode(topology: dict[str, Any]) -> str | None:
-    """Select the scheduler fence from the resolved relationship law."""
+def _assignment_fence_mode(
+    topology: dict[str, Any],
+    scenario: ScenarioSpec | None = None,
+    farm: FarmSpec | None = None,
+) -> str | None:
+    """Select one fence that safely spans every declared rollout epoch."""
 
     cache_expected = [
         relationship["cache_expected"] for relationship in topology["relationships"]
     ]
+    if scenario is not None:
+        if farm is None:
+            raise PlanError("timeline-aware assignment fencing requires farm authority")
+        states = {
+            item["name"]: {
+                "env": dict(item.get("env", {})),
+                "revision": item.get("cache_wire_revision"),
+                "role": item["role"],
+                "version": item["version"],
+            }
+            for item in topology["instances"]
+        }
+
+        def append_epoch() -> None:
+            scheduler = next(
+                state for state in states.values() if state["role"] == "S"
+            )
+            selected = scheduler["env"].get("ICECC_P50_PROFILE", "P29V1")
+            for relationship in topology["relationships"]:
+                client = states[relationship["c"]]
+                worker = states[relationship["f"]]
+                cache_expected.append(
+                    scheduler["version"] == 50
+                    and selected != "OFF"
+                    and client["version"] == 50
+                    and client["env"].get("ICECC_P50_MODE", "on") == "on"
+                    and worker["version"] == 50
+                    and isinstance(client["revision"], int)
+                    and not isinstance(client["revision"], bool)
+                    and client["revision"] == worker["revision"]
+                )
+
+        for event in scenario.data.get("timeline", []):
+            state = states[event["instance"]]
+            if event["action"] in {"upgrade", "downgrade"}:
+                label = scenario.data["images"][event["image"]]
+                match = re.match(
+                    r"^p(43|44|50)(?:s[0-9]+)?(?:-|$)",
+                    label.rsplit(":", 1)[-1],
+                    re.IGNORECASE,
+                )
+                if match is None:
+                    raise PlanError(f"timeline image {label!r} has no protocol generation")
+                version = int(match.group(1))
+                authority = farm.data["authority"]["images"].get(label)
+                if not isinstance(authority, dict):
+                    raise PlanError(f"timeline image {label!r} is absent from authority")
+                state["version"] = version
+                state["revision"] = authority.get(
+                    "cache_wire_revision", 1 if version == 50 else None
+                )
+                if state["role"] == "S":
+                    if version == 50:
+                        state["env"].setdefault("ICECC_P50_PROFILE", "P29V1")
+                    else:
+                        state["env"].pop("ICECC_P50_PROFILE", None)
+                elif state["role"] == "C":
+                    if version == 50:
+                        state["env"].setdefault("ICECC_P50_MODE", "on")
+                    else:
+                        state["env"].pop("ICECC_P50_MODE", None)
+            elif event["action"] == "env_set":
+                state["env"].update(event["env"])
+            append_epoch()
     if not any(cache_expected):
         return None
     if all(cache_expected):
@@ -430,6 +498,7 @@ def _planned_commands(
     ports: dict[str, Any],
     run_id: str,
     netem_bindings: tuple[NetemBinding, ...] = (),
+    assignment_fence_mode: str | None = None,
 ) -> list[PlannedCommand]:
     commands: list[PlannedCommand] = []
     timeout = scenario.data["timeouts"]["up_s"]
@@ -715,9 +784,8 @@ def _planned_commands(
         )
         if instance["role"] == "S":
             args.extend(("--port", str(scheduler_port), "--netname", netname))
-            fence_mode = _assignment_fence_mode(topology)
-            if fence_mode is not None:
-                args.extend(("--assignment-fence-mode", fence_mode))
+            if instance["version"] == 50 and assignment_fence_mode is not None:
+                args.extend(("--assignment-fence-mode", assignment_fence_mode))
         elif instance["role"] == "F":
             args.extend(
                 (
@@ -802,10 +870,13 @@ def build_plan(
         )
     except NetemPlanError as exc:
         raise PlanError(str(exc)) from exc
+    assignment_fence_mode = _assignment_fence_mode(topology, scenario, farm)
     commands = _planned_commands(
-        farm, scenario, topology, ports, selected_run_id, netem_bindings
+        farm, scenario, topology, ports, selected_run_id, netem_bindings,
+        assignment_fence_mode,
     )
     return {
+        "assignment_fence_mode": assignment_fence_mode,
         "commands": [command.as_dict() for command in commands],
         "farm": str(farm.path),
         "farm_digest": farm.digest,

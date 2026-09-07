@@ -1605,6 +1605,53 @@ def test_client_generation_transition_owns_explicit_mode(
 
 
 @pytest.mark.parametrize(
+    ("scenario_id", "expected_mode"),
+    (
+        ("S60-13-warm-s-down", None),
+        ("S60-14-warm-s-up", "enforcing-compat"),
+    ),
+)
+def test_scheduler_replacement_rewrites_fence_for_target_generation(
+    scenario_id: str, expected_mode: str | None
+) -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / f"{scenario_id}.json", farm
+    )
+    plan = farmtest.build_plan(farm, scenario, run_id=f"scheduler-fence-{scenario_id}")
+    scheduler = next(
+        item for item in plan["topology"]["instances"] if item["name"] == "S1"
+    )
+    start = next(
+        item
+        for item in plan["commands"]
+        if item["phase"] == "up.start-s" and item["instance"] == "S1"
+    )
+    producer = object.__new__(EventProducer)
+    producer.farm = farm
+    producer.scenario = scenario
+    producer.plan = plan
+    producer._state = {
+        "S1": {
+            "env": dict(scheduler.get("env", {})),
+            "image": dict(scheduler["image"]),
+            "sha256": scheduler["sha256"],
+        }
+    }
+    producer._start_argvs = {"S1": tuple(start["argv"])}
+    event = TimelineEvent.from_dict(0, scenario.data["timeline"][0])
+    target = producer._target_instance(event)
+
+    argv = producer._start_argv(event, target)
+    if expected_mode is None:
+        assert "--assignment-fence-mode" not in argv
+    else:
+        index = argv.index("--assignment-fence-mode")
+        assert argv[index + 1] == expected_mode
+        assert argv.count("--assignment-fence-mode") == 1
+
+
+@pytest.mark.parametrize(
     "action,initial_alias,target_alias",
     (("upgrade", "old", "new"), ("downgrade", "new", "old")),
 )

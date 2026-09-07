@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import subprocess
+import threading
+import time
 
 import pytest
 
 from farmharness.integration.tests import farm_fixture
 
-from farmharness.integration import farmtest
+from farmharness.integration import farmtest, workload as workload_module
 from farmharness.integration.farm_spec import load_farm_spec
 from farmharness.integration.images import RecordingTransport
 from farmharness.integration.remote import (
@@ -498,3 +500,187 @@ def test_s50_runs_old_and_new_clients_concurrently_in_one_turn(
     assert len(commands) == 2
     assert {command.instance for command in commands} == {"C1", "C2"}
     assert all(command.argv[-4] == "A" for command in commands)
+
+
+@pytest.mark.parametrize("failure", (False, True))
+def test_checkpointed_turn_stays_active_after_initial_futures_finish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: bool
+) -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    farm.data["hub"]["results_root"] = str(tmp_path)
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / "S60-06-c2-down.json", farm
+    )
+    plan = farmtest.build_plan(farm, scenario, run_id="checkpoint-turn-lease")
+
+    class RaceRecorder(WorkloadRecorder):
+        def __init__(self) -> None:
+            super().__init__()
+            self.initial = 0
+            self.initial_done = threading.Event()
+            self.lock = threading.Lock()
+
+        def invoke(self, command: PlannedCommand) -> CommandResult:
+            self.commands.append(command)
+            if command.phase == "event.checkpoint":
+                return CommandResult(
+                    0,
+                    json.dumps(
+                        {
+                            "checkpoint_sha256": "a" * 64,
+                            "expected_jobs": 100,
+                        }
+                    ),
+                    "",
+                )
+            if command.phase == "run.workload":
+                with self.lock:
+                    if not self.initial_done.is_set():
+                        self.initial += 1
+                        if self.initial == 2:
+                            self.initial_done.set()
+                return CommandResult(
+                    0, "ICEFARM_WORKLOAD jobs=100 failures=0 samples=3\n", ""
+                )
+            return CommandResult(0, "", "")
+
+    recorder = RaceRecorder()
+
+    class DelayedCheckpointProducer:
+        def __init__(self, _farm, _scenario, event_plan, **kwargs) -> None:
+            self.plan = event_plan
+            self.quiesce = kwargs["quiesce_workload"]
+            self.relaunch = kwargs["relaunch_workload"]
+            self.error: BaseException | None = None
+            self.thread: threading.Thread | None = None
+
+        def start(self) -> None:
+            return None
+
+        def signal_turn_start(self, turn: str) -> None:
+            clients = tuple(
+                item
+                for item in self.plan["topology"]["instances"]
+                if item["role"] == "C"
+            )
+
+            def delayed() -> None:
+                try:
+                    assert recorder.initial_done.wait(timeout=1)
+                    # Reproduce A6's ordering: workload futures have become
+                    # terminal while the event callback is still delayed.
+                    time.sleep(0.05)
+                    checkpoints = self.quiesce(turn, clients)
+                    if failure:
+                        raise WorkloadError("injected delayed checkpoint failure")
+                    self.relaunch(turn, checkpoints)
+                except BaseException as exc:
+                    self.error = exc
+
+            self.thread = threading.Thread(target=delayed)
+            self.thread.start()
+
+        def signal_turn_complete(self, _turn: str) -> None:
+            return None
+
+        def raise_if_failed(self) -> None:
+            if self.error is not None:
+                raise self.error
+
+        def wait(self) -> None:
+            assert self.thread is not None
+            self.thread.join(timeout=2)
+            assert not self.thread.is_alive()
+            self.raise_if_failed()
+
+        def stop(self) -> None:
+            if self.thread is not None:
+                self.thread.join(timeout=2)
+                assert not self.thread.is_alive()
+            self.raise_if_failed()
+
+    monkeypatch.setattr(workload_module, "EventProducer", DelayedCheckpointProducer)
+    if failure:
+        with pytest.raises(WorkloadError, match="injected delayed checkpoint failure"):
+            run_workload(
+                farm,
+                scenario,
+                plan,
+                recorder=RecordingTransport(recorder),
+                require_up=False,
+            )
+        return
+
+    receipt = run_workload(
+        farm, scenario, plan, recorder=RecordingTransport(recorder), require_up=False
+    )
+    assert receipt["status"] == "COMPLETE"
+    assert [item["client"] for item in receipt["clients"]] == ["C1", "C2"]
+    assert sum(command.phase == "event.checkpoint" for command in recorder.commands) == 2
+
+
+def test_checkpointed_client_transition_refuses_ambiguous_multiple_turns(
+    tmp_path: Path,
+) -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    farm.data["hub"]["results_root"] = str(tmp_path)
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / "S60-06-c2-down.json", farm
+    )
+    plan = farmtest.build_plan(farm, scenario, run_id="checkpoint-multiple-turns")
+    scenario.data["workload"]["turns"] = ["A", "B"]
+
+    with pytest.raises(WorkloadError, match="one unambiguous workload turn"):
+        run_workload(
+            farm,
+            scenario,
+            plan,
+            recorder=RecordingTransport(WorkloadRecorder()),
+            require_up=False,
+        )
+
+
+def test_checkpointed_client_transition_missing_trigger_times_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    farm.data["hub"]["results_root"] = str(tmp_path)
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / "S60-06-c2-down.json", farm
+    )
+    scenario.data["timeouts"]["turn_s"] = 1
+    plan = farmtest.build_plan(farm, scenario, run_id="checkpoint-missing-trigger")
+
+    class NeverTriggeredProducer:
+        def __init__(self, *_args, **_kwargs) -> None:
+            return None
+
+        def start(self) -> None:
+            return None
+
+        def signal_turn_start(self, _turn: str) -> None:
+            return None
+
+        def signal_turn_complete(self, _turn: str) -> None:
+            return None
+
+        def raise_if_failed(self) -> None:
+            return None
+
+        def wait(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    monkeypatch.setattr(workload_module, "EventProducer", NeverTriggeredProducer)
+    with pytest.raises(
+        WorkloadError, match="checkpointed C transition did not relaunch"
+    ):
+        run_workload(
+            farm,
+            scenario,
+            plan,
+            recorder=RecordingTransport(WorkloadRecorder()),
+            require_up=False,
+        )
