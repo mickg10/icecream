@@ -4985,7 +4985,8 @@ static bool bind_source_assignment_for_settlement(
            record.claimant == claimant;
 }
 
-static bool authorize_assignment_claim(const CompileJob &job, uint32_t claimant)
+static bool authorize_assignment_claim(const CompileJob &job, uint32_t claimant,
+                                       int claimant_protocol)
 {
     const uint32_t wire_id = job.jobID();
     /* A remote claim never has authority without the scheduler-assigned wire
@@ -5039,6 +5040,25 @@ static bool authorize_assignment_claim(const CompileJob &job, uint32_t claimant)
         return false;
     }
     if (assignment_mode_enforces_prepare(assignment_fence_mode)) {
+        /* ENFORCING_COMPAT deliberately keeps a real pre-v50 C interoperable
+           with a current F.  Such a peer cannot receive or carry the v50
+           assignment identity, so S correctly sends no PREPARE and its
+           CompileFile is wholly nonce-less.  Admit only that directly
+           negotiated legacy wire shape.  A v50 peer with a missing identity,
+           an identity-bearing unknown claim, and every STRICT_NONCE claim
+           remain fail-closed.  This is the historical legacy admission path,
+           not an ADVISORY placeholder: no late PREPARE can exist for it. */
+        const bool negotiated_legacy_claim =
+            assignment_fence_mode == ConfCSMsg::EnforcingCompat &&
+            claimant_protocol > 0 &&
+            claimant_protocol < PROTOCOL_VERSION_ASSIGNMENT_IDENTITY &&
+            !job.hasAssignmentIdentity();
+        if (negotiated_legacy_claim) {
+            trace() << "admitting negotiated legacy assignment claim "
+                    << wire_id << " from protocol " << claimant_protocol
+                    << endl;
+            return true;
+        }
         ++assignment_claim_rejects;
         return false;
     }
@@ -8150,8 +8170,9 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
         const bool exact_claim = current_lease &&
             current_store_generation &&
             client->source_arm_matches_compile_claim(*job) &&
-            authorize_assignment_claim(*job,
-                                        static_cast<uint32_t>(client->client_id));
+            authorize_assignment_claim(
+                *job, static_cast<uint32_t>(client->client_id),
+                client->channel != nullptr ? client->channel->protocol : 0);
         if (!exact_claim || client->job != nullptr ||
             client->p50_source_compile_pending) {
             log_warning() << "P50 CompileFile did not match one live source owner for job "
@@ -8241,7 +8262,9 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
     }
 
     if (client->status != Client::CLIENTWORK
-            && !authorize_assignment_claim(*job, client->client_id)) {
+            && !authorize_assignment_claim(
+                *job, client->client_id,
+                client->channel != nullptr ? client->channel->protocol : 0)) {
         /* Authorization is resolved before the job is attached to a client,
            queued, touches an environment, or can start a compiler. */
         trace() << "rejecting unprepared/revoked assignment claim "

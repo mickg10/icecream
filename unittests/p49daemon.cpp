@@ -10,6 +10,7 @@
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -98,6 +99,121 @@ static MsgChannel *connect_daemon(const std::string &path)
         usleep(20 * 1000);
     }
     return nullptr;
+}
+
+static bool read_exact(int fd, void *buffer, size_t size)
+{
+    char *out = static_cast<char *>(buffer);
+    while (size) {
+        const ssize_t count = read(fd, out, size);
+        if (count <= 0) return false;
+        out += count;
+        size -= static_cast<size_t>(count);
+    }
+    return true;
+}
+
+static bool write_exact(int fd, const void *buffer, size_t size)
+{
+    const char *in = static_cast<const char *>(buffer);
+    while (size) {
+        const ssize_t count = write(fd, in, size);
+        if (count <= 0) return false;
+        in += count;
+        size -= static_cast<size_t>(count);
+    }
+    return true;
+}
+
+static int connect_unix_raw(const std::string &path)
+{
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    sockaddr_un address {};
+    address.sun_family = AF_UNIX;
+    if (path.size() >= sizeof(address.sun_path)) {
+        close(fd);
+        return -1;
+    }
+    std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
+    if (connect(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* Negotiate a genuine protocol-48 C->F connection while relaying every
+   production frame byte-for-byte.  This exercises the real daemon admission
+   decision, rather than merely constructing a v48-shaped CompileFile on a
+   channel the daemon still knows is current. */
+static pid_t start_p48_unix_proxy(const std::string &daemon_path,
+                                  const std::string &proxy_path)
+{
+    int listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    sockaddr_un address {};
+    address.sun_family = AF_UNIX;
+    if (listener < 0 || proxy_path.size() >= sizeof(address.sun_path)) {
+        if (listener >= 0) close(listener);
+        return -1;
+    }
+    std::memcpy(address.sun_path, proxy_path.c_str(), proxy_path.size() + 1);
+    unlink(proxy_path.c_str());
+    if (bind(listener, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0
+            || listen(listener, 1) != 0) {
+        close(listener);
+        unlink(proxy_path.c_str());
+        return -1;
+    }
+    pid_t child = fork();
+    if (child != 0) {
+        close(listener);
+        return child;
+    }
+    int downstream = accept(listener, nullptr, nullptr);
+    close(listener);
+    int upstream = -1;
+    const auto deadline = Clock::now() + std::chrono::seconds(5);
+    while (upstream < 0 && Clock::now() < deadline) {
+        upstream = connect_unix_raw(daemon_path);
+        if (upstream < 0) usleep(20 * 1000);
+    }
+    unsigned char down_version[4] {};
+    unsigned char up_version[4] {};
+    const unsigned char p48[4] { 48, 0, 0, 0 };
+    if (downstream < 0 || upstream < 0
+            || !read_exact(downstream, down_version, sizeof(down_version))
+            || !read_exact(upstream, up_version, sizeof(up_version))
+            || !write_exact(downstream, p48, sizeof(p48))
+            || !write_exact(upstream, p48, sizeof(p48))
+            || !read_exact(downstream, down_version, sizeof(down_version))
+            || !read_exact(upstream, up_version, sizeof(up_version))
+            || !write_exact(downstream, up_version, sizeof(up_version))
+            || !write_exact(upstream, down_version, sizeof(down_version))) {
+        if (downstream >= 0) close(downstream);
+        if (upstream >= 0) close(upstream);
+        _exit(2);
+    }
+    for (;;) {
+        pollfd descriptors[2] {
+            { downstream, POLLIN, 0 }, { upstream, POLLIN, 0 }
+        };
+        if (poll(descriptors, 2, -1) <= 0) continue;
+        char bytes[8192];
+        for (int index = 0; index != 2; ++index) {
+            if (!(descriptors[index].revents & (POLLIN | POLLHUP | POLLERR)))
+                continue;
+            const int source = index == 0 ? downstream : upstream;
+            const int destination = index == 0 ? upstream : downstream;
+            const ssize_t count = read(source, bytes, sizeof(bytes));
+            if (count <= 0 || !write_exact(
+                    destination, bytes, static_cast<size_t>(count))) {
+                close(downstream);
+                close(upstream);
+                _exit(0);
+            }
+        }
+    }
 }
 
 static bool send_claim(MsgChannel *client, uint32_t wire_id,
@@ -317,6 +433,51 @@ int main(int argc, char **argv)
     delete unknown;
     REQUIRE(no_type(scheduler, Msg::JOB_BEGIN, 400),
             "unknown claim creates no compiler begin");
+
+    /* S50's old-C/new-F quadrant has no possible PREPARE: protocol 48 cannot
+       carry the identity from UseCS into CompileFile.  EnforcingCompat must
+       admit that exact negotiated legacy connection while retaining the
+       fail-closed current-peer check immediately above. */
+    const std::string p48_proxy_path = work + "/p48-client.sock";
+    pid_t p48_proxy = start_p48_unix_proxy(socket_path, p48_proxy_path);
+    MsgChannel *legacy_unknown = connect_daemon(p48_proxy_path);
+    REQUIRE(p48_proxy > 0 && legacy_unknown && legacy_unknown->protocol == 48,
+            "legacy claim connection genuinely negotiated protocol 48");
+    const uint32_t legacy_unknown_id = 1701;
+    REQUIRE(legacy_unknown && send_claim(legacy_unknown, legacy_unknown_id),
+            "unprepared negotiated-legacy EnforcingCompat claim sent");
+    Msg *legacy_begin = wait_type(scheduler, Msg::JOB_BEGIN, 3000);
+    JobBeginMsg *legacy_begin_typed =
+        dynamic_cast<JobBeginMsg *>(legacy_begin);
+    REQUIRE(legacy_begin_typed
+                && legacy_begin_typed->job_id == legacy_unknown_id,
+            "EnforcingCompat admits only the genuinely old unprepared claim");
+    delete legacy_begin;
+    delete legacy_unknown;
+    REQUIRE(wait_child(p48_proxy, 3000),
+            "protocol-48 claim relay stopped cleanly");
+    unlink(p48_proxy_path.c_str());
+
+    const std::string p48_second_path = work + "/p48-client-second.sock";
+    pid_t p48_second_proxy =
+        start_p48_unix_proxy(socket_path, p48_second_path);
+    MsgChannel *legacy_second = connect_daemon(p48_second_path);
+    REQUIRE(p48_second_proxy > 0 && legacy_second
+                && legacy_second->protocol == 48,
+            "second legacy claim genuinely negotiated protocol 48");
+    const uint32_t legacy_second_id = 1702;
+    REQUIRE(legacy_second && send_claim(legacy_second, legacy_second_id),
+            "second unprepared negotiated-legacy claim sent");
+    legacy_begin = wait_type(scheduler, Msg::JOB_BEGIN, 3000);
+    legacy_begin_typed = dynamic_cast<JobBeginMsg *>(legacy_begin);
+    REQUIRE(legacy_begin_typed
+                && legacy_begin_typed->job_id == legacy_second_id,
+            "EnforcingCompat admits a successive old-client assignment");
+    delete legacy_begin;
+    delete legacy_second;
+    REQUIRE(wait_child(p48_second_proxy, 3000),
+            "second protocol-48 claim relay stopped cleanly");
+    unlink(p48_second_path.c_str());
 
     const uint32_t loss_id = 888;
     const uint64_t loss_nonce = UINT64_C(0x9990000000000888);
