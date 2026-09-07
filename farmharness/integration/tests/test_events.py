@@ -192,8 +192,8 @@ def test_direct_compiler_selector_rejects_non_iceccd_group_child() -> None:
 def test_assignment_script_executes_multi_child_http_join() -> None:
     from farmharness.integration.events import ACTIVE_COMPILER_ASSIGNMENT_SCRIPT
     payloads = {
-        "/api/internals": "Child: pid=41 pgid=41 kind=1 gen=7 client=9 state=1\nChild: pid=42 pgid=42 kind=1 gen=7 client=10 state=1\n",
-        "/api/clients": json.dumps({"type": "iceccd_clients", "ts": 1, "mono_msec": 1, "total": 1, "clients": [{"client_id": 9, "status": "CLIENTWORK", "age_msec": 1, "why": "", "local_job": False, "local_job_kind": "", "local_reason": "", "cmdline": "", "scheduler_job_id": 12, "last_waitforcs_msec": 0, "env_bytes_received": 0, "job": {"job_id": 12, "target": "", "env": ""}, "usecs": None, "outfile": "", "channel": ""}]})
+        "/api/internals": "Child: pid=41 pgid=41 kind=0 gen=7 client=9 state=1\nChild: pid=42 pgid=42 kind=1 gen=7 client=10 state=1\n",
+        "/api/clients": json.dumps({"type": "iceccd_clients", "ts": 1, "mono_msec": 1, "total": 1, "clients": [{"client_id": 9, "status": "WAITFORCHILD", "age_msec": 1, "why": "", "local_job": False, "local_job_kind": "", "local_reason": "", "cmdline": "", "scheduler_job_id": 12, "last_waitforcs_msec": 0, "env_bytes_received": 0, "job": {"job_id": 12, "target": "", "env": ""}, "usecs": None, "outfile": "", "channel": ""}]})
     }
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
@@ -211,7 +211,7 @@ def test_assignment_script_executes_multi_child_http_join() -> None:
         result = subprocess.run(["python3", "-c", ACTIVE_COMPILER_ASSIGNMENT_SCRIPT, "41", "41", "7", "12", str(port)], capture_output=True, text=True, timeout=5)
         assert result.returncode == 0, result.stderr
         assert json.loads(result.stdout)["client"]["client_id"] == 9
-        payloads["/api/internals"] += "Child: pid=41 pgid=41 kind=1 gen=7 client=11 state=1\n"
+        payloads["/api/internals"] += "Child: pid=41 pgid=41 kind=0 gen=7 client=11 state=1\n"
         bad = subprocess.run(["python3", "-c", ACTIVE_COMPILER_ASSIGNMENT_SCRIPT, "41", "41", "7", "12", str(port)], capture_output=True, text=True, timeout=5)
         assert bad.returncode != 0
     finally:
@@ -273,7 +273,7 @@ def test_active_scheduler_loss_collection_binds_post_offset_product_witness(
         "before": {"container_id": "a" * 64, "started_at": "old"},
             "compiler": {
                 "container_id": "b" * 64,
-                "assignment": {"schema": "icefarm-compiler-assignment-v1", "child": {"pid": 41, "pgid": 41, "generation": 1, "owning_client_id": 7}, "client": {"client_id": 7, "scheduler_job_id": 2, "job_id": 2}, "listener": {"host": "127.0.0.1", "port": 8765}},
+                "assignment": {"schema": "icefarm-compiler-assignment-v1", "child": {"pid": 41, "pgid": 41, "generation": 1, "kind": 0, "owning_client_id": 7}, "client": {"client_id": 7, "scheduler_job_id": 2, "job_id": 2}, "listener": {"host": "127.0.0.1", "port": 8765}},
             "daemon": {"pid": 10, "pgid": 10, "ppid": 1, "exe": "/opt/icecream/sbin/iceccd"},
             "leader": {"pid": 41, "pgid": 41, "ppid": 10, "start_ticks": 9, "state": "R"},
             "stopped": {"pid": 41, "pgid": 41, "ppid": 10, "start_ticks": 9, "state": "T"},

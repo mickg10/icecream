@@ -230,25 +230,25 @@ def get(path):
     with urllib.request.urlopen("http://127.0.0.1:%d%s" % (port, path), timeout=5) as response:
         return response.read().decode("utf-8")
 internals = get("/api/internals")
-matches = [tuple(map(int, item)) for item in re.findall(r"Child: pid=(\d+) pgid=(\d+) kind=\d+ gen=(\d+) client=(\d+) ", internals)]
+matches = [tuple(map(int, item)) for item in re.findall(r"Child: pid=(\d+) pgid=(\d+) kind=(\d+) gen=(\d+) client=(\d+) ", internals)]
 matches = [item for item in matches if item[:2] == (pid, pgid)]
-if len(matches) != 1 or matches[0][2] != generation:
+if len(matches) != 1 or matches[0][2] != 0 or matches[0][3] != generation:
     raise SystemExit("stopped compiler has no exact Child generation/identity witness")
-client_id = matches[0][3]
+client_id = matches[0][4]
 document = json.loads(get("/api/clients"))
-if not isinstance(document, dict) or set(document) - {"type", "ts", "mono_msec", "total", "clients"} or document.get("type") != "iceccd_clients" or not isinstance(document.get("clients"), list):
+if not isinstance(document, dict) or set(document) != {"type", "ts", "mono_msec", "total", "clients"} or document.get("type") != "iceccd_clients" or not isinstance(document.get("ts"), int) or not isinstance(document.get("mono_msec"), int) or not isinstance(document.get("total"), int) or not isinstance(document.get("clients"), list) or document["total"] != len(document["clients"]):
     raise SystemExit("malformed clients document")
 clients = document["clients"]
 rows = [row for row in clients if isinstance(row, dict) and row.get("client_id") == client_id]
 if len(rows) != 1:
     raise SystemExit("Child owning client is absent or ambiguous")
 row = rows[0]
-if not isinstance(row.get("client_id"), int) or row["client_id"] <= 0 or not isinstance(row.get("scheduler_job_id"), int) or row["scheduler_job_id"] <= 0 or set(row.get("job", {})) != {"job_id", "target", "env"}:
+if row.get("status") != "WAITFORCHILD" or not isinstance(row.get("client_id"), int) or row["client_id"] <= 0 or not isinstance(row.get("scheduler_job_id"), int) or row["scheduler_job_id"] <= 0 or set(row.get("job", {})) != {"job_id", "target", "env"}:
     raise SystemExit("malformed client assignment")
 job = row.get("job")
 if row.get("scheduler_job_id") != scheduler_job or not isinstance(job, dict) or job.get("job_id") != scheduler_job:
     raise SystemExit("Child owning client does not bind exact scheduler job")
-print(json.dumps({"schema": "icefarm-compiler-assignment-v1", "child": {"pid": pid, "pgid": pgid, "generation": generation, "owning_client_id": client_id}, "client": {"client_id": client_id, "scheduler_job_id": row["scheduler_job_id"], "job_id": job["job_id"]}, "listener": {"host": "127.0.0.1", "port": port}}, sort_keys=True, separators=(",", ":")))
+print(json.dumps({"schema": "icefarm-compiler-assignment-v1", "child": {"kind": 0, "pid": pid, "pgid": pgid, "generation": generation, "owning_client_id": client_id}, "client": {"client_id": client_id, "scheduler_job_id": row["scheduler_job_id"], "job_id": job["job_id"]}, "listener": {"host": "127.0.0.1", "port": port}}, sort_keys=True, separators=(",", ":")))
 '''.strip()
 
 ACTIVE_COMPILER_WAIT_SCRIPT = r'''
@@ -2706,6 +2706,7 @@ class EventProducer:
                 or set(assignment) != {"child", "client", "listener", "schema"}
                 or assignment.get("schema") != "icefarm-compiler-assignment-v1"
                 or assignment["child"].get("generation") != lost_generation
+                or assignment["child"].get("kind") != 0
                 or assignment["client"].get("scheduler_job_id") != self._last_job
                 or assignment["client"].get("job_id") != self._last_job
                 or assignment["listener"] != {"host": "127.0.0.1", "port": 8765}):

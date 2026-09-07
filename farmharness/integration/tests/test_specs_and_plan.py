@@ -594,6 +594,7 @@ def test_real_up_is_fail_closed_before_transport(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     farm, _scenario = _documents()
+    farm.pop("authority_capture", None)
     label = _scenario["images"]["new"]
     del farm["authority"]["images"][label]["closure_sha256"]
     farm_path = tmp_path / "farm-without-runtime-closure.json"
@@ -670,6 +671,7 @@ def test_subprocess_transport_timeout_fails_closed(
 
 def test_input_documents_are_not_mutated(tmp_path: Path) -> None:
     farm, scenario = _documents()
+    farm.pop("authority_capture", None)
     before_farm = copy.deepcopy(farm)
     before_scenario = copy.deepcopy(scenario)
     _load(tmp_path, farm, scenario)
@@ -978,6 +980,7 @@ def test_revision_skew_shape_requires_two_distinct_p50_worker_images(
     tmp_path: Path,
 ) -> None:
     farm, scenario = _documents()
+    farm.pop("authority_capture", None)
     scenario["shape"] = "S'[F'F''][C']"
     scenario["images"] = {"r1": "p50s1-aaaaaaaa", "r2": "p50s2-bbbbbbbb"}
     farm["authority"]["images"]["p50s1-aaaaaaaa"] = {

@@ -127,7 +127,7 @@ def test_active_loss_verdict_rejects_reused_compiler_identity() -> None:
         "pre_fault": {"scheduler_log": {}, "worker_log": {}},
             "compiler": {
                 "daemon": {"pid": 10, "pgid": 10, "ppid": 1, "exe": "/opt/icecream/sbin/iceccd"},
-                "assignment": {"schema": "icefarm-compiler-assignment-v1", "child": {"pid": 41, "pgid": 41, "generation": 1, "owning_client_id": 7}, "client": {"client_id": 7, "scheduler_job_id": 2, "job_id": 2}, "listener": {"host": "127.0.0.1", "port": 8765}},
+                "assignment": {"schema": "icefarm-compiler-assignment-v1", "child": {"pid": 41, "pgid": 41, "generation": 1, "kind": 0, "owning_client_id": 7}, "client": {"client_id": 7, "scheduler_job_id": 2, "job_id": 2}, "listener": {"host": "127.0.0.1", "port": 8765}},
             "leader": {"pid": 41, "pgid": 41, "ppid": 10, "start_ticks": 9},
             "stopped": {"pid": 41, "pgid": 41, "ppid": 10, "start_ticks": 9},
             "group_gone": {"gone": True},
@@ -2174,7 +2174,7 @@ def _s70_active_loss_bundle() -> dict[str, object]:
         "lost_scheduler_generation": 1, "lost_scheduler_job": 2,
         "before": {"container_id": "a" * 64, "started_at": "old"},
         "after": {"container_id": "a" * 64, "started_at": "new"},
-        "compiler": {"container_id": "b" * 64, "assignment": {"schema": "icefarm-compiler-assignment-v1", "child": {"pid": 41, "pgid": 41, "generation": 1, "owning_client_id": 7}, "client": {"client_id": 7, "scheduler_job_id": 2, "job_id": 2}, "listener": {"host": "127.0.0.1", "port": 8765}}, "daemon": {"pid": 10, "exe": "/opt/icecream/sbin/iceccd"},
+        "compiler": {"container_id": "b" * 64, "assignment": {"schema": "icefarm-compiler-assignment-v1", "child": {"pid": 41, "pgid": 41, "generation": 1, "kind": 0, "owning_client_id": 7}, "client": {"client_id": 7, "scheduler_job_id": 2, "job_id": 2}, "listener": {"host": "127.0.0.1", "port": 8765}}, "daemon": {"pid": 10, "exe": "/opt/icecream/sbin/iceccd"},
                      "leader": {"pid": 41, "pgid": 41, "ppid": 10, "start_ticks": 9},
                      "stopped": {"pid": 41, "pgid": 41, "ppid": 10, "start_ticks": 9},
                      "group_gone": {"gone": True}, "worker_before": {"container_id": "b" * 64, "started_at": "f"},
