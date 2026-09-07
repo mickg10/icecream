@@ -17,7 +17,7 @@ try:
     from .layout import compiler_identity_digest
     from .lifecycle import LifecycleError, activate_corpus_turn, bundle_root
     from .remote import CommandResult, PlannedCommand, RemoteError, docker_argv
-    from .scenario_spec import ScenarioSpec
+    from .scenario_spec import PROFILES, ScenarioSpec
     from .schema_validation import canonical_bytes
 except ImportError:  # Direct execution from this directory.
     from events import EventError, EventProducer, JobReader
@@ -26,7 +26,7 @@ except ImportError:  # Direct execution from this directory.
     from layout import compiler_identity_digest
     from lifecycle import LifecycleError, activate_corpus_turn, bundle_root
     from remote import CommandResult, PlannedCommand, RemoteError, docker_argv
-    from scenario_spec import ScenarioSpec
+    from scenario_spec import PROFILES, ScenarioSpec
     from schema_validation import canonical_bytes
 
 
@@ -34,6 +34,9 @@ WORKLOAD_SCHEMA = "icefarm-workload-v1"
 SUMMARY_RE = re.compile(
     r"^ICEFARM_WORKLOAD jobs=([0-9]+) failures=([0-9]+) samples=([0-9]+)$",
     re.MULTILINE,
+)
+IMAGE_GENERATION_RE = re.compile(
+    r"^p(43|44|50)(?:s[0-9]+)?(?:-|$)", re.IGNORECASE
 )
 
 
@@ -716,6 +719,91 @@ def _assert_up(farm: FarmSpec, scenario: ScenarioSpec, plan: dict[str, Any]) -> 
         raise WorkloadError("lifecycle receipt does not authenticate this UP run")
 
 
+def _strict_p50_required(scenario: ScenarioSpec, plan: dict[str, Any]) -> bool:
+    """Require P50 only when every phase of this workload requires it.
+
+    The client wrapper is fixed for a complete turn, so a scenario that starts
+    with P50 disabled, or disables it during the turn, must retain the remote
+    legacy path.  Remote-only execution is enforced independently by the
+    workload and verdict layers.
+    """
+
+    if (
+        scenario.data["shape"] != "S'C'F'"
+        or scenario.data["controls"]
+        or scenario.data.get("id") == "S30-mutant-f-refusal"
+        or not all(
+            item.get("version") == 50
+            for item in plan.get("topology", {}).get("instances", [])
+        )
+    ):
+        return False
+
+    schedulers = [
+        item
+        for item in scenario.data["instances"]
+        if item.get("role") == "S"
+    ]
+    if len(schedulers) != 1:
+        raise WorkloadError("strict P50 requires exactly one scheduler")
+    scheduler = schedulers[0]
+    scheduler_name = scheduler.get("name")
+    named_instances = {
+        item.get("name"): item
+        for item in scenario.data["instances"]
+        if isinstance(item, dict)
+    }
+    environment = scheduler.get("env", {})
+    if not isinstance(environment, dict):
+        raise WorkloadError("strict P50 scheduler environment is invalid")
+    profile = environment.get("ICECC_P50_PROFILE", "P29V1")
+    if profile == "OFF":
+        return False
+    if profile not in PROFILES:
+        raise WorkloadError(f"strict P50 scheduler profile is invalid: {profile!r}")
+
+    timeline = scenario.data.get("timeline", [])
+    if not isinstance(timeline, list):
+        raise WorkloadError("strict P50 timeline is invalid")
+    for event in timeline:
+        if not isinstance(event, dict):
+            raise WorkloadError("strict P50 timeline event is invalid")
+        action = event.get("action")
+        target = named_instances.get(event.get("instance"))
+        if action in {"upgrade", "downgrade"}:
+            alias = event.get("image")
+            label = scenario.data.get("images", {}).get(alias)
+            generation = (
+                IMAGE_GENERATION_RE.match(label.rsplit(":", 1)[-1])
+                if isinstance(label, str)
+                else None
+            )
+            if generation is None:
+                raise WorkloadError("strict P50 transition image is invalid")
+            if int(generation.group(1)) != 50:
+                return False
+            continue
+        if action != "env_set":
+            continue
+        update = event.get("env")
+        if not isinstance(update, dict):
+            raise WorkloadError("strict P50 env_set is invalid")
+        if isinstance(target, dict) and target.get("role") == "C":
+            if update.get("ICECC_P50_MODE") == "off":
+                return False
+            continue
+        if event.get("instance") != scheduler_name:
+            continue
+        event_profile = update.get("ICECC_P50_PROFILE")
+        if event_profile == "OFF":
+            return False
+        if event_profile not in PROFILES:
+            raise WorkloadError(
+                f"strict P50 scheduler env_set profile is invalid: {event_profile!r}"
+            )
+    return True
+
+
 def _driver_command(
     farm: FarmSpec,
     scenario: ScenarioSpec,
@@ -731,15 +819,7 @@ def _driver_command(
     corpus = farm.data["corpora"][workload["corpus"]]
     layout = "single" if "manifest" in corpus else "paired"
     corpus_repeat = corpus.get("repeat", 1)
-    strict_p50 = int(
-        scenario.data["shape"] == "S'C'F'"
-        and all(item["version"] == 50 for item in plan["topology"]["instances"])
-        and not scenario.data["controls"]
-        # This is deliberately a recovery control: its mutant F refuses the
-        # P50 session so the wrapper can prove one bounded fresh legacy
-        # assignment.  Marking it strict disables the behavior under test.
-        and scenario.data.get("id") != "S30-mutant-f-refusal"
-    )
+    strict_p50 = int(_strict_p50_required(scenario, plan))
     container = f"icefarm-{plan['run_id']}-{client['name']}"
     fault = scenario.data.get("fault", {})
     timeout_s = scenario.data["timeouts"]["turn_s"] + 300

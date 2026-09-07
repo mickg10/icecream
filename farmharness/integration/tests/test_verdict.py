@@ -11,6 +11,8 @@ from farmharness.integration.verdict import (
     CONTROL_VERDICT_SCHEMA,
     ROW_SCHEMA,
     VERDICT_SCHEMA,
+    _scenario_profile_at_epoch,
+    _s60_transition_epoch_errors,
     evaluate_bundle,
     evaluate_control,
     _transition_receipt_errors,
@@ -416,6 +418,100 @@ def _bundle(
         "scenario": scenario,
         "schema": BUNDLE_SCHEMA,
     }
+
+
+@pytest.mark.parametrize(
+    ("initial_version", "action", "expected_profiles"),
+    (
+        (50, "downgrade", ("P29V1", None)),
+        (43, "upgrade", (None, "P29V1")),
+    ),
+)
+def test_scheduler_transition_profile_is_resolved_per_event_epoch(
+    initial_version: int,
+    action: str,
+    expected_profiles: tuple[str | None, str | None],
+) -> None:
+    scenario = _scenario("mixed")
+    scenario["id"] = (
+        "S60-13-warm-s-down" if action == "downgrade" else "S60-14-warm-s-up"
+    )
+    scheduler = next(
+        item for item in scenario["instances"] if item["role"] == "S"
+    )
+    scheduler["image"] = "new" if initial_version == 50 else "old"
+    scheduler["env"] = (
+        {"ICECC_P50_PROFILE": "P29V1"} if initial_version == 50 else {}
+    )
+    scenario["timeline"] = [
+        {
+            "trigger": "job 24",
+            "action": action,
+            "instance": "S1",
+            "image": "old" if action == "downgrade" else "new",
+        }
+    ]
+
+    assert _scenario_profile_at_epoch(scenario, 0) == (expected_profiles[0], None)
+    assert _scenario_profile_at_epoch(scenario, 1) == (expected_profiles[1], None)
+
+    rows = [
+        _row(
+            1,
+            tail=expected_profiles[0] is not None,
+            profile=expected_profiles[0],
+            outcome="committed" if expected_profiles[0] else "none",
+        ),
+        _row(
+            2,
+            tail=expected_profiles[1] is not None,
+            profile=expected_profiles[1],
+            outcome="committed" if expected_profiles[1] else "none",
+        ),
+    ]
+    rows[1]["event_epoch"] = 1
+    observations = _observations(rows)
+    observations["job_lifecycle"][0]["final_dispatch_ms"] = 900
+    observations["job_lifecycle"][1]["final_dispatch_ms"] = 1100
+    event_log = [
+        {
+            "action": action,
+            "event_epoch": 1,
+            "fired_ms": 1000,
+            "instance": "S1",
+            "trigger": "job 24",
+        }
+    ]
+    fixture = _bundle(scenario, rows, observations)
+    fixture["event_log"] = event_log
+    assert not _s60_transition_epoch_errors(
+        scenario, rows, observations, event_log
+    )
+    engagement = next(
+        item
+        for item in evaluate_bundle(fixture)["clauses"]
+        if item["id"] == "engagement.expected"
+    )
+    assert engagement["status"] == "PASS", engagement
+
+    wrong = copy.deepcopy(fixture)
+    post = wrong["rows"][1]
+    post["tail_present"] = expected_profiles[0] is not None
+    post["tail_profile"] = expected_profiles[0]
+    post["session_outcome"] = "committed" if expected_profiles[0] else "none"
+    post["reuse"] = True if expected_profiles[0] == "P29V1" else None
+    engagement = next(
+        item
+        for item in evaluate_bundle(wrong)["clauses"]
+        if item["id"] == "engagement.expected"
+    )
+    assert engagement["status"] == "FAIL"
+
+    wrong_epoch = copy.deepcopy(rows)
+    wrong_epoch[0]["event_epoch"] = 1
+    assert _s60_transition_epoch_errors(
+        scenario, wrong_epoch, observations, event_log
+    )
 
 
 def _s70_b5_bundle() -> dict[str, object]:

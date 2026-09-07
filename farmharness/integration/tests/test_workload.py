@@ -22,6 +22,7 @@ from farmharness.integration.workload import (
     WORKLOAD_SCHEMA,
     WorkloadError,
     _parse_summary,
+    _strict_p50_required,
     run_workload,
 )
 
@@ -158,6 +159,43 @@ def test_s30_mutant_workload_enables_the_legacy_recovery_under_test(
     argv = scripted.commands[0].argv
     driver_index = argv.index(MANIFEST_DRIVER)
     assert argv[driver_index + 12] == "0"
+
+
+@pytest.mark.parametrize(
+    ("scenario_id", "expected"),
+    (
+        ("S80-legacy", False),
+        ("S80-p29v1", True),
+        ("S70-b6-kill-switch", False),
+        ("S70-b5-interner-failure", True),
+        ("S40-full-newgen-engagement", True),
+        ("S60-11-warm-f2-down", False),
+        ("S60-13-warm-s-down", False),
+        ("H2-client-kill-switch", False),
+    ),
+)
+def test_strict_p50_tracks_whole_run_engagement_contract(
+    tmp_path: Path, scenario_id: str, expected: bool
+) -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    farm.data["hub"]["results_root"] = str(tmp_path)
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / f"{scenario_id}.json", farm
+    )
+    plan = farmtest.build_plan(farm, scenario, run_id=f"strict-{scenario_id}")
+
+    assert _strict_p50_required(scenario, plan) is expected
+
+
+def test_strict_p50_requires_the_s70_b6_off_transition() -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / "S70-b6-kill-switch.json", farm
+    )
+    plan = farmtest.build_plan(farm, scenario, run_id="strict-b6-mutation")
+    scenario.data["timeline"][0]["env"]["ICECC_P50_PROFILE"] = "P29V1"
+
+    assert _strict_p50_required(scenario, plan) is True
 
 
 def test_manifest_driver_shell_is_syntactically_valid() -> None:

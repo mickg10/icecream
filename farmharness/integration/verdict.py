@@ -155,31 +155,94 @@ def _row_errors(row: object) -> list[str]:
     return errors
 
 
-def _scenario_profile(scenario: Mapping[str, Any]) -> tuple[str | None, str | None]:
-    profiles: set[str] = set()
+def _instance_protocol(
+    instance: Mapping[str, Any], scenario: Mapping[str, Any]
+) -> int | None:
+    version = instance.get("version")
+    if _is_int(version, minimum=1):
+        return version
+    alias = instance.get("image")
+    images = scenario.get("images")
+    label = images.get(alias) if isinstance(images, Mapping) else alias
+    return _transition_protocol(label)
+
+
+def _scenario_profile_at_epoch(
+    scenario: Mapping[str, Any], event_epoch: object
+) -> tuple[str | None, str | None]:
+    """Resolve the scheduler profile after exactly ``event_epoch`` events."""
+
+    if not _is_int(event_epoch) or not isinstance(scenario.get("timeline"), list):
+        return None, "scenario has an invalid event epoch or timeline"
+    timeline = scenario["timeline"]
+    if event_epoch > len(timeline):
+        return None, f"event epoch {event_epoch} exceeds timeline length {len(timeline)}"
     instances = scenario.get("instances")
     if not isinstance(instances, list):
         return None, "scenario.instances is absent or invalid"
-    for instance in instances:
-        if not isinstance(instance, Mapping) or instance.get("role") != "S":
+    schedulers = [
+        instance
+        for instance in instances
+        if isinstance(instance, Mapping) and instance.get("role") == "S"
+    ]
+    if len(schedulers) != 1:
+        return None, f"scenario must resolve one scheduler, got {len(schedulers)}"
+    scheduler = schedulers[0]
+    scheduler_name = scheduler.get("name")
+    protocol = _instance_protocol(scheduler, scenario)
+    if protocol is None:
+        return None, "scheduler image has no protocol generation"
+    raw_environment = scheduler.get("env", {})
+    if not isinstance(raw_environment, Mapping):
+        return None, "scheduler environment is invalid"
+    environment = dict(raw_environment)
+
+    for index, event in enumerate(timeline[:event_epoch]):
+        if not isinstance(event, Mapping):
+            return None, f"timeline event {index} is invalid"
+        if event.get("instance") != scheduler_name:
             continue
-        environment = instance.get("env", {})
-        if not isinstance(environment, Mapping):
-            return None, "scheduler environment is invalid"
-        selected = environment.get("ICECC_P50_PROFILE", "P29V1")
-        if selected == "OFF":
-            profiles.add("OFF")
-        elif selected in PROFILES:
-            profiles.add(selected)
-        else:
-            return None, f"scheduler selected unknown profile {selected!r}"
-    if len(profiles) != 1:
-        return (
-            None,
-            f"scenario must resolve one scheduler profile, got {sorted(profiles)!r}",
-        )
-    profile = next(iter(profiles))
-    return (None if profile == "OFF" else profile), None
+        action = event.get("action")
+        if action in {"upgrade", "downgrade"}:
+            alias = event.get("image")
+            images = scenario.get("images")
+            label = images.get(alias) if isinstance(images, Mapping) else None
+            target_protocol = _transition_protocol(label)
+            if target_protocol is None:
+                return None, f"scheduler transition {index} has no protocol generation"
+            protocol = target_protocol
+            if protocol == 50:
+                environment.setdefault("ICECC_P50_PROFILE", "P29V1")
+            else:
+                environment.pop("ICECC_P50_PROFILE", None)
+        elif action == "env_set":
+            update = event.get("env")
+            if not isinstance(update, Mapping):
+                return None, f"scheduler env_set {index} is invalid"
+            environment.update(update)
+
+    if protocol != 50:
+        return None, None
+    selected = environment.get("ICECC_P50_PROFILE", "P29V1")
+    if selected == "OFF":
+        return None, None
+    if selected not in PROFILES:
+        return None, f"scheduler selected unknown profile {selected!r}"
+    return str(selected), None
+
+
+def _scenario_profile(scenario: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    timeline = scenario.get("timeline")
+    if not isinstance(timeline, list):
+        return None, "scenario.timeline is absent or invalid"
+    initial, error = _scenario_profile_at_epoch(scenario, 0)
+    if error is not None:
+        return None, error
+    for epoch in range(1, len(timeline) + 1):
+        _profile, error = _scenario_profile_at_epoch(scenario, epoch)
+        if error is not None:
+            return None, error
+    return initial, None
 
 
 def expected_profile(
@@ -206,6 +269,121 @@ def expected_profile(
     ):
         return selected_profile
     return None
+
+
+def _s60_transition_epoch_errors(
+    scenario: Mapping[str, Any],
+    rows: Sequence[Mapping[str, Any]],
+    observations: Mapping[str, Any],
+    event_log: object,
+) -> set[str]:
+    """Bind S60 pair-law rows to the authenticated transition boundary."""
+
+    scenario_id = scenario.get("id")
+    if not isinstance(scenario_id, str) or not scenario_id.startswith("S60-"):
+        return set()
+    marker = "@s60:transition-epoch"
+    timeline = scenario.get("timeline")
+    if (
+        not isinstance(timeline, list)
+        or len(timeline) != 1
+        or not isinstance(timeline[0], Mapping)
+        or timeline[0].get("action") not in {"upgrade", "downgrade"}
+        or not isinstance(event_log, list)
+        or len(event_log) != 1
+        or not isinstance(event_log[0], Mapping)
+    ):
+        return {marker}
+    expected_event = timeline[0]
+    observed_event = event_log[0]
+    fired_ms = observed_event.get("fired_ms")
+    if (
+        not _is_int(fired_ms)
+        or observed_event.get("event_epoch") != 1
+        or observed_event.get("action") != expected_event.get("action")
+        or observed_event.get("instance") != expected_event.get("instance")
+        or observed_event.get("trigger") != expected_event.get("trigger")
+    ):
+        return {marker}
+
+    instances = scenario.get("instances")
+    if not isinstance(instances, list):
+        return {marker}
+    named = {
+        item.get("name"): item
+        for item in instances
+        if isinstance(item, Mapping) and isinstance(item.get("name"), str)
+    }
+    target = named.get(expected_event.get("instance"))
+    images = scenario.get("images")
+    target_label = (
+        images.get(expected_event.get("image"))
+        if isinstance(images, Mapping)
+        else None
+    )
+    target_protocol = _transition_protocol(target_label)
+    if not isinstance(target, Mapping) or target_protocol is None:
+        return {marker}
+
+    lifecycle = observations.get("job_lifecycle")
+    if not isinstance(lifecycle, list):
+        return {marker}
+    lifecycle_by_job: dict[str, Mapping[str, Any]] = {}
+    for item in lifecycle:
+        if not isinstance(item, Mapping) or not isinstance(item.get("job_id"), str):
+            return {marker}
+        job_id = item["job_id"]
+        if job_id in lifecycle_by_job:
+            return {marker}
+        lifecycle_by_job[job_id] = item
+
+    bad: set[str] = set()
+    epochs: set[int] = set()
+    target_epochs: set[int] = set()
+    for row in rows:
+        identifier = _job_id(row.get("job_id"), "@row")
+        epoch = row.get("event_epoch")
+        life = lifecycle_by_job.get(str(row.get("job_id")))
+        dispatch_ms = life.get("final_dispatch_ms") if isinstance(life, Mapping) else None
+        if epoch not in {0, 1} or not _is_int(dispatch_ms):
+            bad.add(identifier)
+            continue
+        expected_epoch = int(dispatch_ms >= fired_ms)
+        if epoch != expected_epoch:
+            bad.add(identifier)
+        epochs.add(epoch)
+
+        for role, name_field, version_field in (
+            ("C", "client_instance", "client_version"),
+            ("F", "cs", "cs_version"),
+        ):
+            instance = named.get(row.get(name_field))
+            initial = (
+                _instance_protocol(instance, scenario)
+                if isinstance(instance, Mapping) and instance.get("role") == role
+                else None
+            )
+            expected_version = (
+                target_protocol
+                if target.get("role") == role
+                and row.get(name_field) == target.get("name")
+                and epoch == 1
+                else initial
+            )
+            if expected_version is None or row.get(version_field) != expected_version:
+                bad.add(identifier)
+        if target.get("role") == "S" or (
+            target.get("role") == "C"
+            and row.get("client_instance") == target.get("name")
+        ) or (
+            target.get("role") == "F" and row.get("cs") == target.get("name")
+        ):
+            target_epochs.add(epoch)
+    if set(lifecycle_by_job) != {str(row.get("job_id")) for row in rows}:
+        bad.add(marker)
+    if epochs != {0, 1} or target_epochs != {0, 1}:
+        bad.add(marker)
+    return bad
 
 
 def _lifecycle_wedges(
@@ -2630,13 +2808,17 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
     engagement_bad: set[str] = set()
     if engagement_mode == "expected(c,f)" and profile_error is None:
         for row in valid_rows:
+            row_profile, row_profile_error = _scenario_profile_at_epoch(
+                scenario, row["event_epoch"]
+            )
             expected = expected_profile(
                 row,
-                selected_profile,
+                row_profile,
                 revisions if isinstance(revisions, Mapping) else {},
             )
             if (
-                row["tail_profile"] != expected
+                row_profile_error is not None
+                or row["tail_profile"] != expected
                 and not authenticated_recovery_legacy(row)
                 and not (
                     s30_mutant
@@ -2977,6 +3159,18 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
             engagement_bad,
         )
     )
+    s60_epoch_bad = _s60_transition_epoch_errors(
+        scenario, valid_rows, observations, bundle.get("event_log")
+    )
+    if isinstance(scenario.get("id"), str) and scenario["id"].startswith("S60-"):
+        clauses.append(
+            _clause(
+                "s60.transition-pair-law",
+                not s60_epoch_bad,
+                "S60 rows cross the authenticated dispatch boundary and only the transitioned endpoint changes generation",
+                s60_epoch_bad,
+            )
+        )
 
     if engagement_mode == S70_B4_WORKER_ENGAGEMENT:
         b4_bad: set[str] = set()
