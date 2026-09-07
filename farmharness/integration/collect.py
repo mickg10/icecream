@@ -1521,12 +1521,12 @@ def _validate_scheduler_active_loss_receipt(
             or not any(
                 isinstance(item, Mapping) and item.get("role") == "S"
                 and isinstance(item.get("name"), str)
-                and re.search(rf"(^|\\s){re.escape(item['name'])}(\\s|$)", quiescence["scheduler_snapshot"], re.MULTILINE)
+                and re.search(rf"(^|\s){re.escape(item['name'])}(\s|$)", quiescence["scheduler_snapshot"], re.MULTILINE)
                 for item in plan["topology"]["instances"]
             )
             or not isinstance(quiescence.get("worker_snapshot"), str)
             or any(
-                re.search(rf"(^|\\s){re.escape(item['name'])}(\\s|$)", quiescence["worker_snapshot"], re.MULTILINE) is None
+                re.search(rf"(^|\s){re.escape(item['name'])}(\s|$)", quiescence["worker_snapshot"], re.MULTILINE) is None
                 for item in plan["topology"]["instances"] if item.get("role") == "F"
             )):
         raise CollectError(f"{prefix} lacks complete fresh scheduler/F/C rejoin evidence")
@@ -4540,6 +4540,8 @@ def _observations(
             raw for raw in raw_jobs
             if raw["assignment_claims"]
             and raw["assignment_claims"][0]["scheduler_job"] == lost_job
+            and raw["assignment_claims"][0].get("scheduler_record", {}).get("generation")
+            == next(iter(active_loss_generations), None)
         ]
         if len(affected) != 1 or affected[0]["retries"] != 1:
             raise CollectError("active scheduler loss does not bind exactly one fresh retry")
