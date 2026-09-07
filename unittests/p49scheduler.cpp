@@ -2116,10 +2116,40 @@ static void run_old_submitter_to_new_worker(const std::string &binary,
     REQUIRE(no_type(worker, Msg::ASSIGN_PREPARE, 300),
             "new worker receives no uncarryable assignment fence for old C");
 
+    uint32_t first_job_id = 0;
     if (use) {
+        first_job_id = use->job_id;
         worker->send_msg(JobBeginMsg(use->job_id, 0));
         worker->send_msg(job_done_for(*use, 0, JobDoneMsg::FROM_SERVER));
     }
+    const std::string first_end =
+        "END " + std::to_string(first_job_id) + " status=0";
+    REQUIRE(first_job_id != 0 && wait_file_contains(log, first_end, 3000),
+            "scheduler accepts the legacy mixed-peer terminal");
+    const std::string after_first = control_text(port, "listcs");
+    REQUIRE(after_first.find("p50-worker-for-p48-submit") != std::string::npos
+                && after_first.find("jobs=0/1") != std::string::npos,
+            "accepted mixed-peer terminal preserves F and releases capacity");
+
+    REQUIRE(submitter && request_job(submitter, 3003),
+            "old submitter requests another assignment on the surviving F");
+    UseCSMsg *second = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(second && second->port == static_cast<uint32_t>(worker_port)
+                && !second->hasAssignmentIdentity()
+                && !second->hasCacheAdvertisement(),
+            "surviving F accepts a second wholly-legacy mixed assignment");
+    REQUIRE(no_type(worker, Msg::ASSIGN_PREPARE, 300),
+            "second mixed assignment also avoids an uncarryable fence");
+    if (second) {
+        worker->send_msg(JobBeginMsg(second->job_id, 0));
+        worker->send_msg(job_done_for(*second, 0, JobDoneMsg::FROM_SERVER));
+    }
+    const std::string second_end = "END "
+        + std::to_string(second ? second->job_id : 0) + " status=0";
+    REQUIRE(second && wait_file_contains(log, second_end, 3000),
+            "scheduler accepts the second legacy mixed-peer terminal");
+    delete second;
     delete use;
     delete submitter;
     delete worker;
