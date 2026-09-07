@@ -1464,6 +1464,11 @@ def _validate_scheduler_active_loss_receipt(
             or assignment.get("child", {}).get("generation") != receipt.get("lost_scheduler_generation")
             or assignment.get("client", {}).get("scheduler_job_id") != receipt.get("lost_scheduler_job")
             or assignment.get("client", {}).get("job_id") != receipt.get("lost_scheduler_job")
+            or assignment.get("child", {}).get("owning_client_id") != assignment.get("client", {}).get("client_id")
+            or set(assignment.get("child", {})) != {"generation", "owning_client_id", "pgid", "pid"}
+            or set(assignment.get("client", {})) != {"client_id", "job_id", "scheduler_job_id"}
+            or not all(isinstance(assignment.get("child", {}).get(key), int) and assignment["child"][key] > 0 for key in ("generation", "owning_client_id", "pgid", "pid"))
+            or not all(isinstance(assignment.get("client", {}).get(key), int) and assignment["client"][key] > 0 for key in ("client_id", "job_id", "scheduler_job_id"))
             or assignment.get("listener") != {"host": "127.0.0.1", "port": 8765}):
         raise CollectError(f"{prefix} has no exact stopped compiler-group identity")
     pre = receipt["pre_fault"]

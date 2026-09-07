@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import http.server
 import json
 import subprocess
 import sys
@@ -186,6 +187,37 @@ def test_direct_compiler_selector_rejects_non_iceccd_group_child() -> None:
     other = {"pid": 12, "ppid": 10, "pgid": 12, "exe": "/usr/bin/other", "state": "R", "argv": []}
     assert select_direct_compiler_pairs([parent, compiler]) == [(parent, compiler)]
     assert select_direct_compiler_pairs([parent, other]) == []
+
+
+def test_assignment_script_executes_multi_child_http_join() -> None:
+    from farmharness.integration.events import ACTIVE_COMPILER_ASSIGNMENT_SCRIPT
+    payloads = {
+        "/api/internals": "Child: pid=41 pgid=41 kind=1 gen=7 client=9 state=1\nChild: pid=42 pgid=42 kind=1 gen=7 client=10 state=1\n",
+        "/api/clients": json.dumps({"type": "iceccd_clients", "ts": 1, "mono_msec": 1, "total": 1, "clients": [{"client_id": 9, "status": "CLIENTWORK", "age_msec": 1, "why": "", "local_job": False, "local_job_kind": "", "local_reason": "", "cmdline": "", "scheduler_job_id": 12, "last_waitforcs_msec": 0, "env_bytes_received": 0, "job": {"job_id": 12, "target": "", "env": ""}, "usecs": None, "outfile": "", "channel": ""}]})
+    }
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = payloads[self.path].encode()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(body)
+        def log_message(self, *_args):
+            pass
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        result = subprocess.run(["python3", "-c", ACTIVE_COMPILER_ASSIGNMENT_SCRIPT, "41", "41", "7", "12", str(port)], capture_output=True, text=True, timeout=5)
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout)["client"]["client_id"] == 9
+        payloads["/api/internals"] += "Child: pid=41 pgid=41 kind=1 gen=7 client=11 state=1\n"
+        bad = subprocess.run(["python3", "-c", ACTIVE_COMPILER_ASSIGNMENT_SCRIPT, "41", "41", "7", "12", str(port)], capture_output=True, text=True, timeout=5)
+        assert bad.returncode != 0
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
     assert "before[\"start_ticks\"]" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "os.killpg(before[\"pgid\"], signal.SIGSTOP)" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "compiler PID was reused" in ACTIVE_COMPILER_WAIT_SCRIPT

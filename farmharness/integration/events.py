@@ -230,16 +230,21 @@ def get(path):
     with urllib.request.urlopen("http://127.0.0.1:%d%s" % (port, path), timeout=5) as response:
         return response.read().decode("utf-8")
 internals = get("/api/internals")
-match = re.search(r"Child: pid=(\d+) pgid=(\d+) kind=\d+ gen=(\d+) client=(\d+) ", internals)
-if not match or tuple(map(int, match.groups()[:3])) != (pid, pgid, generation):
+matches = [tuple(map(int, item)) for item in re.findall(r"Child: pid=(\d+) pgid=(\d+) kind=\d+ gen=(\d+) client=(\d+) ", internals)]
+matches = [item for item in matches if item[:2] == (pid, pgid)]
+if len(matches) != 1 or matches[0][2] != generation:
     raise SystemExit("stopped compiler has no exact Child generation/identity witness")
-client_id = int(match.group(4))
+client_id = matches[0][3]
 document = json.loads(get("/api/clients"))
-clients = document.get("clients") if isinstance(document, dict) else None
+if not isinstance(document, dict) or set(document) - {"type", "ts", "mono_msec", "total", "clients"} or document.get("type") != "iceccd_clients" or not isinstance(document.get("clients"), list):
+    raise SystemExit("malformed clients document")
+clients = document["clients"]
 rows = [row for row in clients if isinstance(row, dict) and row.get("client_id") == client_id]
 if len(rows) != 1:
     raise SystemExit("Child owning client is absent or ambiguous")
 row = rows[0]
+if not isinstance(row.get("client_id"), int) or row["client_id"] <= 0 or not isinstance(row.get("scheduler_job_id"), int) or row["scheduler_job_id"] <= 0 or set(row.get("job", {})) != {"job_id", "target", "env"}:
+    raise SystemExit("malformed client assignment")
 job = row.get("job")
 if row.get("scheduler_job_id") != scheduler_job or not isinstance(job, dict) or job.get("job_id") != scheduler_job:
     raise SystemExit("Child owning client does not bind exact scheduler job")
