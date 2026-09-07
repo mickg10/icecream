@@ -36,6 +36,7 @@ STALL_LIMIT_MS = 120_000
 F_INIT_SCHEMA = "icefarm-f-init-v1"
 F_INIT_LAUNCH_CONTRACT = "icefarm-f-init-launch-v1"
 HISTORICAL_LAUNCH_CONTRACT = "icefarm-pre-f-init-v0"
+TRANSITION_LAUNCH_CONTRACT = "icefarm-f-init-transition-v0"
 
 ROW_FIELDS = frozenset(
     {
@@ -2952,7 +2953,7 @@ def _f_init_errors(bundle: Mapping[str, Any]) -> set[str]:
 
 
 def _launch_contract(bundle: Mapping[str, Any]) -> tuple[str, str | None]:
-    """Select the authenticated current contract or the exact old boundary."""
+    """Select current, transition, or the exact pre-init launch boundary."""
 
     plan = bundle.get("plan")
     if not isinstance(plan, Mapping):
@@ -2982,7 +2983,24 @@ def _launch_contract(bundle: Mapping[str, Any]) -> tuple[str, str | None]:
         return HISTORICAL_LAUNCH_CONTRACT, None
     if not f_starts:
         return HISTORICAL_LAUNCH_CONTRACT, None
-    return F_INIT_LAUNCH_CONTRACT, "unmarked F launch contract is ambiguous"
+    if all(
+        isinstance(command.get("argv"), list)
+        and "--init" in command["argv"]
+        for command in f_starts
+    ):
+        return TRANSITION_LAUNCH_CONTRACT, None
+    return TRANSITION_LAUNCH_CONTRACT, "mixed F launch contract is ambiguous"
+
+
+def _has_authenticated_f(bundle: Mapping[str, Any]) -> bool:
+    topology = bundle.get("topology")
+    if not isinstance(topology, Mapping):
+        plan = bundle.get("plan")
+        topology = plan.get("topology") if isinstance(plan, Mapping) else None
+    instances = topology.get("instances") if isinstance(topology, Mapping) else None
+    return isinstance(instances, list) and any(
+        isinstance(item, Mapping) and item.get("role") == "F" for item in instances
+    )
 
 
 def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
@@ -3018,7 +3036,10 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
     has_launch_data = isinstance(bundle.get("topology"), Mapping) or isinstance(
         bundle.get("plan"), Mapping
     )
-    if has_launch_data and launch_contract == F_INIT_LAUNCH_CONTRACT:
+    if has_launch_data and (
+        launch_contract == F_INIT_LAUNCH_CONTRACT
+        or launch_contract_error is not None
+    ):
         clauses.append(
             _clause(
                 "launch.contract",
@@ -3027,7 +3048,10 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
                 () if launch_contract_error is None else {"@plan:launch_contract"},
             )
         )
-    if has_launch_data and launch_contract == F_INIT_LAUNCH_CONTRACT:
+    if has_launch_data and launch_contract in (
+        F_INIT_LAUNCH_CONTRACT,
+        TRANSITION_LAUNCH_CONTRACT,
+    ) and _has_authenticated_f(bundle):
         f_init_errors = _f_init_errors(bundle)
         clauses.append(
             _clause(

@@ -522,6 +522,47 @@ def test_verdict_requires_authenticated_f_init_witness() -> None:
         if clause["id"] == "launch.f-init"
     )
     assert launch["status"] == "PASS"
+    launch_ids = {
+        clause["id"]
+        for clause in evaluate_bundle(bundle)["clauses"]
+        if clause["id"].startswith("launch.")
+    }
+    assert launch_ids == {"launch.contract", "launch.f-init"}
+    transition = copy.deepcopy(bundle)
+    del transition["plan"]["launch_contract"]
+    del transition["launch_contract"]
+    transition_ids = {
+        clause["id"]
+        for clause in evaluate_bundle(transition)["clauses"]
+        if clause["id"].startswith("launch.")
+    }
+    assert transition_ids == {"launch.f-init"}
+    historical = copy.deepcopy(transition)
+    historical["plan"]["commands"][0]["argv"].remove("--init")
+    historical_ids = {
+        clause["id"]
+        for clause in evaluate_bundle(historical)["clauses"]
+        if clause["id"].startswith("launch.")
+    }
+    assert historical_ids == set()
+    mixed = copy.deepcopy(transition)
+    mixed["plan"]["commands"].append(
+        {"argv": ["docker", "run"], "phase": "up.start-f"}
+    )
+    mixed_contract = next(
+        clause
+        for clause in evaluate_bundle(mixed)["clauses"]
+        if clause["id"] == "launch.contract"
+    )
+    assert mixed_contract["status"] == "FAIL"
+    no_f = copy.deepcopy(bundle)
+    no_f["topology"]["instances"] = []
+    no_f_ids = {
+        clause["id"]
+        for clause in evaluate_bundle(no_f)["clauses"]
+        if clause["id"].startswith("launch.")
+    }
+    assert no_f_ids == {"launch.contract"}
     missing = copy.deepcopy(bundle)
     del missing["observations"]["f_init"]
     for bad in (
