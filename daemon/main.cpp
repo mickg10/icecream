@@ -117,6 +117,7 @@
 #include "p50_input_wait.h"
 #include "connection_provenance.h"
 #include "p50_source_arm_wait_lease.h"
+#include "compiler_group_signal.h"
 
 static std::string pidFilePath;
 static volatile sig_atomic_t exit_main_loop = 0;
@@ -5544,8 +5545,14 @@ struct ChildRecord {
     uint64_t session_generation;
     unsigned int owning_client_id;
     enum State { RUNNING, COMPLETION_OBSERVED, TERM_SENT, KILL_SENT, REAPED } state;
+    /* Compiler group signals are authorized only while the exact, unreaped
+       leader remains our child.  The authority is monotonic: after the final
+       group signal or any ECHILD/lost-anchor observation it is never restored.
+       A retired record may only consume its leader status and poll absence. */
+    icecc::daemon_child::SignalAuthority signal;
 };
 static std::map<pid_t, ChildRecord> child_registry;
+static icecc::daemon_child::PosixSignalOperations child_signal_operations;
 static bool child_ownership_failed = false;
 
 static void register_child(pid_t pid, pid_t pgid, ChildRecord::Kind kind,
@@ -5558,6 +5565,7 @@ static void register_child(pid_t pid, pid_t pgid, ChildRecord::Kind kind,
     rec.session_generation = scheduler_session_generation;
     rec.owning_client_id = owning_client_id;
     rec.state = ChildRecord::RUNNING;
+    rec.signal = icecc::daemon_child::SignalAuthority{};
     child_registry[pid] = rec;
 }
 
@@ -5589,13 +5597,13 @@ static void complete_child_registration(pid_t pid)
 }
 
 /* The exact quiescence barrier for one lost scheduler session:
-   1. SIGTERM to ALL old-generation compiler groups first;
-   2. wait the exact leader pids CONCURRENTLY under ONE whole-session
-      grace deadline;
-   3. escalate ALL remaining groups once, under ONE kill deadline;
-   4. ECHILD proves quiescence only when kill(-pgid, 0) says the GROUP is
-      gone (ESRCH);
-   5. any residue fails CLOSED (child_ownership_failed blocks reconnect)
+   1. retain each exact compiler leader waitable and signal its group TERM;
+   2. observe leaders with WNOWAIT under ONE whole-session grace deadline;
+   3. issue the final group KILL while the exact leader anchor is still owned,
+      then retire signal authority monotonically;
+   4. consume the exact leader status and poll group absence without signals;
+   5. lost authority means absence-only checks, never numeric best effort;
+   6. any residue fails CLOSED (child_ownership_failed blocks reconnect)
       and the exact records stay exposed in dump_internals.  */
 static bool quiesce_session_compilers(uint64_t generation,
                                       unsigned int *quiesced_out)
@@ -5607,65 +5615,88 @@ static bool quiesce_session_compilers(uint64_t generation,
         ChildRecord &rec = it->second;
         if (rec.kind == ChildRecord::COMPILER
                 && rec.session_generation <= generation) {
-            /* G3: terminate the process GROUP unconditionally -- old-session
-               descendants can outlive a leader an anonymous child sweep
-               already reaped, and a REAPED leader is only a pid observation,
-               not proof the group is gone.  Previously REAPED records were
-               excluded here, so a stolen reap left the group's absence never
-               verified.  A REAPED leader is still queued for the group-absence
-               check below; only do NOT re-signal its pid (it may be recycled). */
-            kill(-rec.pgid, SIGTERM);
-            if (rec.state != ChildRecord::REAPED) {
-                kill(rec.pid, SIGTERM);
-                rec.state = ChildRecord::TERM_SENT;
+            if (rec.signal.active && !rec.signal.term_sent
+                    && !rec.signal.final_sent) {
+                const icecc::daemon_child::SignalResult result =
+                    icecc::daemon_child::send_term_if_owned(
+                        rec.signal, rec.pid, rec.pgid,
+                        child_signal_operations);
+                if (result.invoked && rec.signal.active)
+                    rec.state = ChildRecord::TERM_SENT;
             }
             pending.push_back(rec.pid);
         }
     }
-    auto group_gone = [](const ChildRecord &rec) {
-        return kill(-rec.pgid, 0) < 0 && errno == ESRCH;
-    };
-    auto wait_round = [&](uint64_t deadline_ms) {
-        const uint64_t t0 = monotonic_msec();
-        while (!pending.empty() && monotonic_msec() - t0 < deadline_ms) {
-            for (std::vector<pid_t>::iterator pit = pending.begin();
-                    pit != pending.end();) {
-                ChildRecord &rec = child_registry[*pit];
-                int status;
-                const pid_t r = waitpid(*pit, &status, WNOHANG);
-                bool done = false;
-                if (r == *pit) {
-                    done = group_gone(rec);
-                } else if (r < 0 && errno == ECHILD) {
-                    /* already reaped elsewhere: only the GROUP's absence
-                       proves quiescence */
-                    done = group_gone(rec);
-                }
-                if (done) {
-                    rec.state = ChildRecord::REAPED;
-                    ++fsession_compilers_quiesced;
-                    ++quiesced_now;
-                    child_registry.erase(*pit);
-                    pit = pending.erase(pit);
-                } else {
-                    ++pit;
-                }
-            }
-            if (!pending.empty()) {
-                usleep(50 * 1000);
-            }
+
+    auto erase_quiesced = [&](std::vector<pid_t>::iterator &pit) {
+        ChildRecord &rec = child_registry[*pit];
+        if (!rec.signal.active
+                && icecc::daemon_child::settle_retired(
+                    rec.signal, rec.pid, rec.pgid,
+                    child_signal_operations)) {
+            rec.state = ChildRecord::REAPED;
+            ++fsession_compilers_quiesced;
+            ++quiesced_now;
+            child_registry.erase(*pit);
+            pit = pending.erase(pit);
+            return true;
         }
+        return false;
     };
-    wait_round(5000);   /* ONE whole-session grace deadline */
-    if (!pending.empty()) {
-        for (const pid_t pid : pending) {
-            ChildRecord &rec = child_registry[pid];
+
+    /* TERM grace observes but never consumes an owned leader.  As soon as all
+       owned leaders are waitable, the final signal can be issued safely. */
+    const uint64_t grace_start = monotonic_msec();
+    bool grace_needed = true;
+    while (!pending.empty() && grace_needed
+            && monotonic_msec() - grace_start < 5000) {
+        grace_needed = false;
+        for (std::vector<pid_t>::iterator pit = pending.begin();
+                pit != pending.end();) {
+            ChildRecord &rec = child_registry[*pit];
+            if (erase_quiesced(pit))
+                continue;
+            if (rec.signal.active
+                    && icecc::daemon_child::observe_owned_anchor(
+                        rec.signal, rec.pid,
+                        child_signal_operations)
+                        == icecc::daemon_child::AnchorObservation::Running)
+                grace_needed = true;
+            ++pit;
+        }
+        if (grace_needed && !pending.empty())
+            usleep(50 * 1000);
+    }
+
+    /* This is the last nonzero signal permitted for each record.  Validate the
+       exact waitable/running child immediately before addressing the group,
+       then retire authority regardless of signal delivery outcome. */
+    for (const pid_t pid : pending) {
+        ChildRecord &rec = child_registry[pid];
+        if (!rec.signal.active || rec.signal.final_sent)
+            continue;
+        const icecc::daemon_child::SignalResult result =
+            icecc::daemon_child::send_final_if_owned(
+                rec.signal, rec.pid, rec.pgid,
+                child_signal_operations);
+        if (result.invoked) {
             ++fsession_kill_escalations;
-            kill(-rec.pgid, SIGKILL);
-            kill(rec.pid, SIGKILL);
             rec.state = ChildRecord::KILL_SENT;
         }
-        wait_round(5000);   /* ONE whole-session kill deadline */
+    }
+
+    /* No path below this point is authorized to signal.  Repeated barriers see
+       the same retired state and can only consume/poll it. */
+    const uint64_t reap_start = monotonic_msec();
+    while (!pending.empty() && monotonic_msec() - reap_start < 5000) {
+        for (std::vector<pid_t>::iterator pit = pending.begin();
+                pit != pending.end();) {
+            if (erase_quiesced(pit))
+                continue;
+            ++pit;
+        }
+        if (!pending.empty())
+            usleep(50 * 1000);
     }
     if (quiesced_out) {
         *quiesced_out = quiesced_now;
@@ -5739,11 +5770,16 @@ string Daemon::dump_internals() const
         for (std::map<pid_t, ChildRecord>::const_iterator cit = child_registry.begin();
                 cit != child_registry.end(); ++cit) {
             snprintf(handoff, sizeof(handoff),
-                     "  Child: pid=%d pgid=%d kind=%d gen=%llu client=%u state=%d\n",
+                     "  Child: pid=%d pgid=%d kind=%d gen=%llu client=%u state=%d authority=%d term=%d final=%d consumed=%d absent=%d\n",
                      (int)cit->second.pid, (int)cit->second.pgid,
                      (int)cit->second.kind,
                      (unsigned long long)cit->second.session_generation,
-                     cit->second.owning_client_id, (int)cit->second.state);
+                     cit->second.owning_client_id, (int)cit->second.state,
+                     cit->second.signal.active ? 1 : 0,
+                     cit->second.signal.term_sent ? 1 : 0,
+                     cit->second.signal.final_sent ? 1 : 0,
+                     cit->second.signal.leader_consumed ? 1 : 0,
+                     cit->second.signal.group_absent ? 1 : 0);
             result += handoff;
         }
     }
@@ -8690,16 +8726,19 @@ void Daemon::clear_children()
     unsigned int quiesced = 0;
     const bool clean = quiesce_session_compilers(scheduler_session_generation,
                                                  &quiesced);
-    if (quiesced > current_kids) {
-        current_kids = 0;
-    } else {
+    const bool accounting_clean = quiesced <= current_kids;
+    if (accounting_clean) {
         current_kids -= quiesced;
     }
 
-    if (!clean) {
+    if (!clean || !accounting_clean) {
         /* FAIL CLOSED: reconnect() refuses while child_ownership_failed
            stands; the surviving records remain visible in
            dump_internals.  Capacity is NOT re-advertised.  */
+        if (!accounting_clean)
+            log_error() << "clear_children: quiesced child count exceeds"
+                        << " current_kids; failing closed" << endl;
+        child_ownership_failed = true;
         return;
     }
 
@@ -9630,17 +9669,27 @@ void Daemon::answer_client_requests()
             auto iterator = child_registry.begin();
             std::advance(iterator, static_cast<long>(child_reap_cursor));
             const pid_t registered_pid = iterator->first;
-            int status = 0;
             const bool lifecycle_complete =
                 iterator->second.state == ChildRecord::COMPLETION_OBSERVED;
-            const pid_t result = waitpid(registered_pid, &status, WNOHANG);
             bool erased = false;
-            if (result == registered_pid ||
-                (result < 0 && errno == ECHILD && lifecycle_complete)) {
-                if (lifecycle_complete) {
+            if (iterator->second.kind == ChildRecord::COMPILER
+                    && !lifecycle_complete) {
+                /* Preserve the exact leader waitable.  Scheduler-loss
+                   quiescence may still need this anchor to authorize the
+                   final process-group signal. */
+                (void)icecc::daemon_child::observe_owned_anchor(
+                    iterator->second.signal, iterator->second.pid,
+                    child_signal_operations);
+            } else {
+                int status = 0;
+                const pid_t result = waitpid(registered_pid, &status, WNOHANG);
+                if (result == registered_pid ||
+                        (result < 0 && errno == ECHILD && lifecycle_complete)) {
                     child_registry.erase(iterator);
                     erased = true;
-                } else {
+                } else if (result < 0 && errno == ECHILD) {
+                    iterator->second.signal.active = false;
+                    iterator->second.signal.leader_consumed = true;
                     iterator->second.state = ChildRecord::REAPED;
                 }
             }
@@ -10343,8 +10392,15 @@ bool Daemon::reconnect()
         /* The previous session's compilers are not provably quiescent:
            retry the exact barrier and stay offline until it is clean.  */
         unsigned int quiesced = 0;
-        if (!quiesce_session_compilers(scheduler_session_generation, &quiesced)
+        const bool clean = quiesce_session_compilers(
+            scheduler_session_generation, &quiesced);
+        const bool accounting_clean = quiesced <= current_kids;
+        if (accounting_clean)
+            current_kids -= quiesced;
+        if (!clean || !accounting_clean || current_kids != 0
                 || child_ownership_failed) {
+            if (!accounting_clean || (clean && current_kids != 0))
+                child_ownership_failed = true;
             log_warning() << "reconnect blocked: prior-session compilers"
                           << " not quiescent" << endl;
             return false;

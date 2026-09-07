@@ -215,6 +215,43 @@ def check_parent(source: str) -> None:
             "set_p50_legacy_wire_identity(identity)")
 
 
+def check_compiler_quiescence(source: str, helper: str, makefile: str) -> None:
+    flow = section(source, "/* The exact quiescence barrier",
+                   "void Daemon::handle_old_request")
+    require('#include "compiler_group_signal.h"' in source,
+            "daemon does not use the shared compiler signal-authority primitive")
+    for token in ("send_term_if_owned(", "observe_owned_anchor(",
+                  "send_final_if_owned(", "settle_retired("):
+        require(token in flow, f"quiescence omits shared primitive {token}")
+    require("kill(-rec.pgid" not in flow and "kill(rec.pid" not in flow,
+            "quiescence bypasses exact child-anchor signal authority")
+    reaper = section(source, "if (!child_registry.empty()) {",
+                     "/* Push queued state records")
+    require("observe_owned_anchor(" in reaper,
+            "generic reaper consumes an unfinished compiler leader anchor")
+
+    for token in (
+            "WEXITED | WNOHANG | WNOWAIT",
+            "if (!authority.active || authority.term_sent || authority.final_sent",
+            "if (!authority.active || authority.final_sent",
+            "if (leader <= 0 || pgid <= 0 || leader != pgid)",
+            "authority.final_sent = true;\n    authority.active = false;",
+            "if (authority.active)\n        return false;",
+            "operations.consume_anchor(leader)",
+            "operations.observe_group(pgid)"):
+        require(token in helper, f"signal-authority helper omits {token}")
+    ordered(helper,
+            "authority.final_sent = true;",
+            "authority.active = false;",
+            "bool settle_retired(",
+            "operations.consume_anchor(leader)",
+            "operations.observe_group(pgid)")
+    require("check_PROGRAMS += p50compilerquiescence" in makefile and
+            "TESTS += p50compilerquiescence" in makefile and
+            "p50_compiler_quiescence_test.cpp" in makefile,
+            "shared signal authority lacks a compiled runtime test")
+
+
 def check_cache_service(source: str) -> None:
     ready_trace = section(source, "void append_ready_test_trace(",
                           "void append_terminal_lifecycle_test_trace(")
@@ -389,6 +426,8 @@ def check_all(files: dict[str, str]) -> None:
     check_client(files["client"], files["client_make"])
     check_worker(files["serve"], files["record_h"] + files["record_cpp"])
     check_parent(files["main"])
+    check_compiler_quiescence(files["main"], files["compiler_signal"],
+                              files["unit_make"])
     check_record(files["record_h"], files["record_cpp"])
     check_cache_service(files["cache_service"])
     check_runtime_gate(files["runtime_gate"])
@@ -422,6 +461,13 @@ def deletion_mutants(files: dict[str, str]) -> None:
         ("main", "cache_adapter->outer_immediate_turn_required()", "false"),
         ("main", "ICECC_P50_TEST_POST_TERMINAL_ATTACH", "PROBE_DELETED"),
         ("main", "legacy CompileFile admitted canonical input for job", "TRACE_DELETED"),
+        ("main", "icecc::daemon_child::send_final_if_owned(",
+         "final_signal_deleted("),
+        ("compiler_signal", "WEXITED | WNOHANG | WNOWAIT",
+         "WEXITED | WNOHANG"),
+        ("compiler_signal",
+         "authority.final_sent = true;\n    authority.active = false;",
+         "authority.final_sent = true;"),
         ("record_h", "static_assert(kLegacyCompletionStatsWireSize == 32", "static_assert(true"),
         ("record_cpp", "flags | O_NONBLOCK", "flags"),
         ("record_cpp", "if (count != 0)", "if (false)"),
@@ -484,6 +530,8 @@ def main() -> int:
         "client_make": (ROOT / "client/Makefile.am").read_text(),
         "serve": (ROOT / "daemon/serve.cpp").read_text(),
         "main": (ROOT / "daemon/main.cpp").read_text(),
+        "compiler_signal": (ROOT / "daemon/compiler_group_signal.h").read_text(),
+        "unit_make": (ROOT / "unittests/Makefile.am").read_text(),
         "record_h": (ROOT / "daemon/p50_completion_record.h").read_text(),
         "record_cpp": (ROOT / "daemon/p50_completion_record.cpp").read_text(),
         "cache_service": (ROOT / "cache/p50_cache_service.cpp").read_text(),
