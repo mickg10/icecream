@@ -163,11 +163,14 @@ def check_parent(source: str) -> None:
             "P50CompletionPumpResult::Pending",
             "return true;",
             "complete_child_registration(client->child_pid)")
-    child_completion = section(source, "static void complete_child_registration(",
+    child_completion = section(source, "static bool complete_child_registration(",
                                "/* The exact quiescence barrier")
-    require("waitpid(pid, &status, WNOHANG)" in child_completion and
-            "ChildRecord::COMPLETION_OBSERVED" in child_completion,
-            "normal completion does not retain the child for exact reaping")
+    require("waitpid(" not in child_completion and
+            "ChildRecord::COMPLETION_OBSERVED" in child_completion and
+            "record->second.kind != ChildRecord::COMPILER" in child_completion and
+            "release_slot_once(record->second.slot)" in child_completion,
+            "normal completion consumes its anchor, drops noncompiler completion, "
+            "or omits once-only compiler slot release")
     require("!p50_input &&\n        read(client->pipe_from_child" in flow,
             "legacy parent read is not isolated from the P50 record")
     require("p50_observation.valid()" in flow,
@@ -215,7 +218,8 @@ def check_parent(source: str) -> None:
             "set_p50_legacy_wire_identity(identity)")
 
 
-def check_compiler_quiescence(source: str, helper: str, makefile: str) -> None:
+def check_compiler_quiescence(source: str, helper: str, makefile: str,
+                              daemon_makefile: str) -> None:
     flow = section(source, "/* The exact quiescence barrier",
                    "void Daemon::handle_old_request")
     require('#include "compiler_group_signal.h"' in source,
@@ -232,6 +236,16 @@ def check_compiler_quiescence(source: str, helper: str, makefile: str) -> None:
                      "/* Push queued state records")
     require("observe_owned_anchor(" in reaper,
             "generic reaper consumes an unfinished compiler leader anchor")
+    for token in ("orphaned compiler cleanup KILL pid=",
+                  "completed compiler cleanup KILL pid=",
+                  "completed compiler cleanup settled pid=",
+                  "release_slot_once(rec.slot)"):
+        require(token in source, f"compiler lifecycle omits {token}")
+    compiler_pipe_events = (
+        "pollfd_is_set(pollfds, client->pipe_from_child,\n"
+        "                                         POLLIN | POLLHUP | POLLERR)")
+    require(compiler_pipe_events in source,
+            "compiler completion ignores EOF/HUP and can strand descendants")
 
     for token in (
             "WEXITED | WNOHANG | WNOWAIT",
@@ -243,6 +257,8 @@ def check_compiler_quiescence(source: str, helper: str, makefile: str) -> None:
             "operations.consume_anchor(leader)",
             "operations.observe_group(pgid)"):
         require(token in helper, f"signal-authority helper omits {token}")
+    require("release_slot_once(SlotAccounting& accounting)" in helper,
+            "compiler slot accounting is not a shared once-only primitive")
     ordered(helper,
             "authority.final_sent = true;",
             "authority.active = false;",
@@ -253,6 +269,8 @@ def check_compiler_quiescence(source: str, helper: str, makefile: str) -> None:
             "TESTS += p50compilerquiescence" in makefile and
             "p50_compiler_quiescence_test.cpp" in makefile,
             "shared signal authority lacks a compiled runtime test")
+    require("compiler_group_signal.h" in daemon_makefile,
+            "compiler signal-authority header is absent from daemon distribution")
 
 
 def check_cache_service(source: str) -> None:
@@ -430,7 +448,7 @@ def check_all(files: dict[str, str]) -> None:
     check_worker(files["serve"], files["record_h"] + files["record_cpp"])
     check_parent(files["main"])
     check_compiler_quiescence(files["main"], files["compiler_signal"],
-                              files["unit_make"])
+                              files["unit_make"], files["daemon_make"])
     check_record(files["record_h"], files["record_cpp"])
     check_cache_service(files["cache_service"])
     check_runtime_gate(files["runtime_gate"])
@@ -468,6 +486,15 @@ def deletion_mutants(files: dict[str, str]) -> None:
          "final_signal_deleted("),
         ("main", '"session quiescence KILL compiler pid="',
          '"session quiescence KILL deleted pid="'),
+        ("main", '"orphaned compiler cleanup KILL pid="',
+         '"orphaned compiler cleanup deleted pid="'),
+        ("main", "release_slot_once(rec.slot)", "release_slot_deleted(rec.slot)"),
+        ("main",
+         "pollfd_is_set(pollfds, client->pipe_from_child,\n"
+         "                                         POLLIN | POLLHUP | POLLERR)",
+         "pollfd_is_set(pollfds, client->pipe_from_child, POLLIN)"),
+        ("compiler_signal", "release_slot_once(SlotAccounting& accounting)",
+         "release_slot_deleted(SlotAccounting& accounting)"),
         ("compiler_signal", "WEXITED | WNOHANG | WNOWAIT",
          "WEXITED | WNOHANG"),
         ("compiler_signal",
@@ -537,6 +564,7 @@ def main() -> int:
         "main": (ROOT / "daemon/main.cpp").read_text(),
         "compiler_signal": (ROOT / "daemon/compiler_group_signal.h").read_text(),
         "unit_make": (ROOT / "unittests/Makefile.am").read_text(),
+        "daemon_make": (ROOT / "daemon/Makefile.am").read_text(),
         "record_h": (ROOT / "daemon/p50_completion_record.h").read_text(),
         "record_cpp": (ROOT / "daemon/p50_completion_record.cpp").read_text(),
         "cache_service": (ROOT / "cache/p50_cache_service.cpp").read_text(),

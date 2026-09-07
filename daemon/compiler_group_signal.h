@@ -40,6 +40,18 @@ struct SignalAuthority {
     bool group_absent = false;
 };
 
+struct SlotAccounting {
+    bool active = true;
+};
+
+inline bool release_slot_once(SlotAccounting& accounting) noexcept
+{
+    if (!accounting.active)
+        return false;
+    accounting.active = false;
+    return true;
+}
+
 class PosixSignalOperations {
 public:
     AnchorObservation observe_anchor(pid_t leader) const noexcept

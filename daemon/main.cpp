@@ -5550,6 +5550,9 @@ struct ChildRecord {
        group signal or any ECHILD/lost-anchor observation it is never restored.
        A retired record may only consume its leader status and poll absence. */
     icecc::daemon_child::SignalAuthority signal;
+    /* Logical capacity and OS cleanup are distinct.  Completion releases a
+       slot once while the waitable leader can remain as signal authority. */
+    icecc::daemon_child::SlotAccounting slot;
 };
 static std::map<pid_t, ChildRecord> child_registry;
 static icecc::daemon_child::PosixSignalOperations child_signal_operations;
@@ -5566,6 +5569,9 @@ static void register_child(pid_t pid, pid_t pgid, ChildRecord::Kind kind,
     rec.owning_client_id = owning_client_id;
     rec.state = ChildRecord::RUNNING;
     rec.signal = icecc::daemon_child::SignalAuthority{};
+    rec.slot = icecc::daemon_child::SlotAccounting{
+        kind == ChildRecord::COMPILER
+    };
     child_registry[pid] = rec;
 }
 
@@ -5578,22 +5584,16 @@ static void unregister_child(pid_t pid)
    exact PID registered until its wait status is consumed; erasing it first
    leaves an unreapable zombie because anonymous waitpid is intentionally not
    used beside the sidecar's exact reaper. */
-static void complete_child_registration(pid_t pid)
+static bool complete_child_registration(pid_t pid)
 {
     auto record = child_registry.find(pid);
-    if (record == child_registry.end())
-        return;
-    if (record->second.state == ChildRecord::REAPED) {
-        child_registry.erase(record);
-        return;
-    }
-    int status = 0;
-    const pid_t result = waitpid(pid, &status, WNOHANG);
-    if (result == pid || (result < 0 && errno == ECHILD)) {
-        child_registry.erase(record);
-        return;
-    }
+    if (record == child_registry.end()
+            || record->second.state == ChildRecord::COMPLETION_OBSERVED)
+        return false;
     record->second.state = ChildRecord::COMPLETION_OBSERVED;
+    if (record->second.kind != ChildRecord::COMPILER)
+        return true;
+    return icecc::daemon_child::release_slot_once(record->second.slot);
 }
 
 /* The exact quiescence barrier for one lost scheduler session:
@@ -5645,7 +5645,8 @@ static bool quiesce_session_compilers(uint64_t generation,
                        << rec.pid << " pgid=" << rec.pgid
                        << " generation=" << rec.session_generation << endl;
             ++fsession_compilers_quiesced;
-            ++quiesced_now;
+            if (icecc::daemon_child::release_slot_once(rec.slot))
+                ++quiesced_now;
             child_registry.erase(*pit);
             pit = pending.erase(pit);
             return true;
@@ -5783,11 +5784,12 @@ string Daemon::dump_internals() const
         for (std::map<pid_t, ChildRecord>::const_iterator cit = child_registry.begin();
                 cit != child_registry.end(); ++cit) {
             snprintf(handoff, sizeof(handoff),
-                     "  Child: pid=%d pgid=%d kind=%d gen=%llu client=%u state=%d authority=%d term=%d final=%d consumed=%d absent=%d\n",
+                     "  Child: pid=%d pgid=%d kind=%d gen=%llu client=%u state=%d slot=%d authority=%d term=%d final=%d consumed=%d absent=%d\n",
                      (int)cit->second.pid, (int)cit->second.pgid,
                      (int)cit->second.kind,
                      (unsigned long long)cit->second.session_generation,
                      cit->second.owning_client_id, (int)cit->second.state,
+                     cit->second.slot.active ? 1 : 0,
                      cit->second.signal.active ? 1 : 0,
                      cit->second.signal.term_sent ? 1 : 0,
                      cit->second.signal.final_sent ? 1 : 0,
@@ -7926,9 +7928,14 @@ bool Daemon::handle_compile_done(Client *client)
                                      client->job->assignmentNonce(), client->job->cGuid(),
                                      client->job->tuSeq());
     assert(msg);
-    complete_child_registration(client->child_pid);
-    assert(current_kids > 0);
-    current_kids--;
+    const bool slot_released = complete_child_registration(client->child_pid);
+    if (!slot_released || current_kids == 0) {
+        log_error() << "compiler completion has no exactly-once capacity slot for pid "
+                    << client->child_pid << "; failing closed" << endl;
+        child_ownership_failed = true;
+    } else {
+        --current_kids;
+    }
 
     unsigned int job_stat[8];
     int end_status = 151;
@@ -9685,14 +9692,72 @@ void Daemon::answer_client_requests()
             const bool lifecycle_complete =
                 iterator->second.state == ChildRecord::COMPLETION_OBSERVED;
             bool erased = false;
-            if (iterator->second.kind == ChildRecord::COMPILER
-                    && !lifecycle_complete) {
-                /* Preserve the exact leader waitable.  Scheduler-loss
-                   quiescence may still need this anchor to authorize the
-                   final process-group signal. */
-                (void)icecc::daemon_child::observe_owned_anchor(
-                    iterator->second.signal, iterator->second.pid,
-                    child_signal_operations);
+            if (iterator->second.kind == ChildRecord::COMPILER) {
+                ChildRecord &record = iterator->second;
+                if (!lifecycle_complete) {
+                    /* Preserve the exact leader waitable.  Scheduler-loss
+                       quiescence may still need this anchor.  If the leader
+                       has already crashed, use that retained anchor now to
+                       kill any descendant that could otherwise keep the
+                       completion pipe open forever. */
+                    const icecc::daemon_child::AnchorObservation anchor =
+                        icecc::daemon_child::observe_owned_anchor(
+                            record.signal, record.pid,
+                            child_signal_operations);
+                    if (anchor
+                            == icecc::daemon_child::AnchorObservation::ExitedWaitable) {
+                        const icecc::daemon_child::SignalResult result =
+                            icecc::daemon_child::send_final_if_owned(
+                                record.signal, record.pid, record.pgid,
+                                child_signal_operations);
+                        if (result.invoked) {
+                            record.state = ChildRecord::KILL_SENT;
+                            log_info()
+                                << "orphaned compiler cleanup KILL pid="
+                                << record.pid << " pgid=" << record.pgid
+                                << " generation=" << record.session_generation
+                                << " errno=" << result.error << endl;
+                        }
+                    }
+                } else if (record.slot.active) {
+                    /* Completion and slot release must be one transaction.
+                       Never erase cleanup ownership for an unaccounted slot. */
+                    log_error() << "completed compiler pid " << record.pid
+                                << " retains a capacity slot; failing closed"
+                                << endl;
+                    child_ownership_failed = true;
+                } else {
+                    const icecc::daemon_child::AnchorObservation anchor =
+                        icecc::daemon_child::observe_owned_anchor(
+                            record.signal, record.pid,
+                            child_signal_operations);
+                    if (anchor
+                            == icecc::daemon_child::AnchorObservation::ExitedWaitable) {
+                        const icecc::daemon_child::SignalResult result =
+                            icecc::daemon_child::send_final_if_owned(
+                                record.signal, record.pid, record.pgid,
+                                child_signal_operations);
+                        if (result.invoked) {
+                            record.state = ChildRecord::KILL_SENT;
+                            log_info()
+                                << "completed compiler cleanup KILL pid="
+                                << record.pid << " pgid=" << record.pgid
+                                << " generation=" << record.session_generation
+                                << " errno=" << result.error << endl;
+                        }
+                    }
+                    if (!record.signal.active
+                            && icecc::daemon_child::settle_retired(
+                                record.signal, record.pid, record.pgid,
+                                child_signal_operations)) {
+                        log_info() << "completed compiler cleanup settled pid="
+                                   << record.pid << " pgid=" << record.pgid
+                                   << " generation=" << record.session_generation
+                                   << endl;
+                        child_registry.erase(iterator);
+                        erased = true;
+                    }
+                }
             } else {
                 int status = 0;
                 const pid_t result = waitpid(registered_pid, &status, WNOHANG);
@@ -10262,7 +10327,8 @@ void Daemon::answer_client_requests()
 
                 if (client->status == Client::WAITFORCHILD
                         && client->pipe_from_child >= 0
-                        && pollfd_is_set(pollfds, client->pipe_from_child, POLLIN)) {
+                        && pollfd_is_set(pollfds, client->pipe_from_child,
+                                         POLLIN | POLLHUP | POLLERR)) {
                     if (!handle_compile_done(client)) {
                         finish_scheduler_loss_if_needed();
                         return;
