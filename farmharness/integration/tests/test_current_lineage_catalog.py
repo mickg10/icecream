@@ -10,6 +10,11 @@ FINAL_MUTANTS = {
     "p50s90-f-revision-2-f9648cc1",
     "p50s90-f-hidden-skew-f9648cc1",
 }
+FINAL_ROLE_HASHES = {
+    "scheduler": "a54fb0a4f705d216c61639395a5e6ad70c23a7333f4fa62a24333f1dc88ce799",
+    "client": "c35eb8acecfc8da9bd00103c2866c7e193f6a956285775122192b8c21e0d24d1",
+    "daemon": "f124ac4c87a78127fbeb563cc49af55dce8fd2a5fb9eb5d40efe25d004b11986",
+}
 RETIRED_PRODUCTS = {"p50s4-89917385", "p50s4-b42d65e8"}
 REQUALIFIED_PREFIXES = ("S50-", "S60-", "S70-", "S80-", "S90-", "S95-")
 
@@ -46,3 +51,12 @@ def test_mutant_scenarios_use_the_final_product_lineage() -> None:
     for name, images in expected.items():
         scenario = json.loads((SCENARIOS / name).read_text(encoding="utf-8"))
         assert scenario["images"] == images
+
+
+def test_final_product_role_store_uses_measured_f964_binaries() -> None:
+    farm = json.loads((INTEGRATION / "farm.example.json").read_text(encoding="utf-8"))
+    observed = {
+        role: binding["sha256"]
+        for role, binding in farm["authority"]["role_stores"]["50"].items()
+    }
+    assert observed == FINAL_ROLE_HASHES
