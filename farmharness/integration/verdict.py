@@ -1328,10 +1328,19 @@ def _scheduler_active_loss_receipt_errors(
             or any(
                 not isinstance(pair, Mapping) or set(pair) != {"before", "after"}
                 or not isinstance(pair["before"], Mapping) or not isinstance(pair["after"], Mapping)
-                or set(pair["before"]) != {"daemon", "route_owner"}
-                or set(pair["after"]) != {"daemon", "route_owner"}
+                or set(pair["before"]) != {"container", "daemon", "route_owner"}
+                or set(pair["after"]) != {"container", "daemon", "route_owner"}
                 or pair["before"] != pair["after"]
+                or not isinstance(pair["before"].get("container"), Mapping)
+                or set(pair["before"]["container"]) != {"container_id", "started_at", "running"}
+                or not SHA256_RE.fullmatch(str(pair["before"]["container"].get("container_id", "")))
+                or not isinstance(pair["before"]["container"].get("started_at"), str)
+                or not pair["before"]["container"]["started_at"]
+                or pair["before"]["container"].get("running") is not True
+                or not _valid_route_process(pair["before"].get("daemon"), "/opt/icecream/sbin/iceccd")
+                or not _valid_route_process(pair["before"].get("route_owner"), "/opt/icecream/sbin/icecc-cache-service")
                 or pair["before"]["route_owner"].get("ppid") != pair["before"]["daemon"].get("pid")
+                or pair["before"]["route_owner"].get("uid") != pair["before"]["daemon"].get("uid")
                 for pair in receipt["quiescence"]["client_routes"].values()
             )):
         return {marker}

@@ -81,6 +81,12 @@ P29_FAULT_ENV = "ICECC_P50_FAULT_INJECTION"
 P29_FAULT_VALUE = "P29_INTERNER_FAIL_ONCE"
 IMAGE_LABEL_RE = re.compile(r"^p(43|44|50)(?:s[0-9]+)?(?:-|$)", re.IGNORECASE)
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+SCHEDULER_FRAME_RE = re.compile(
+    r"^\[[^]\r\n]+\]\s+[0-9]{4}-[0-9]{2}-[0-9]{2} "
+    r"[0-9]{2}:[0-9]{2}:[0-9]{2}:\s+(.*)$"
+)
+SCHEDULER_START_EXACT_RE = re.compile(r"^ICECREAM scheduler .* starting up, port [0-9]+$")
+SCHEDULER_DISPATCH_EXACT_RE = re.compile(r"^put ([0-9]+) in joblist of .+$")
 READINESS_SCRIPT = r'''
 import json, pathlib, re, sys
 
@@ -2591,7 +2597,10 @@ class EventProducer:
         # be reused by the restarted scheduler.
         lost_generation = self._scheduler_generation_for_job(self._last_job)
         client_routes_before = {
-            client["name"]: self._client_route_snapshot(client) for client in clients
+            client["name"]: {
+                "container": self._route_container_identity(client["name"]),
+                **self._client_route_snapshot(client),
+            } for client in clients
         }
         result = self._invoke(self.factory.make(
             phase="event.scheduler-loss-authenticate-compiler",
@@ -2669,7 +2678,10 @@ class EventProducer:
             for client in clients
         }
         client_routes_after = {
-            client["name"]: self._client_route_snapshot(client) for client in clients
+            client["name"]: {
+                "container": self._route_container_identity(client["name"]),
+                **self._client_route_snapshot(client),
+            } for client in clients
         }
         return {
             "action": event.action, "after": {"container_id": after["id"], "started_at": after["started_at"]},
@@ -2993,6 +3005,14 @@ class EventProducer:
                 or snapshot["route_owner"]["uid"] != snapshot["daemon"]["uid"]):
             raise EventError("client route snapshot lacks one authenticated daemon/owner pair")
         return {"daemon": snapshot["daemon"], "route_owner": snapshot["route_owner"]}
+
+    def _route_container_identity(self, name: str) -> dict[str, Any]:
+        value = self._inspect(name)
+        if (not isinstance(value.get("id"), str) or not SHA256_RE.fullmatch(value["id"])
+                or not isinstance(value.get("started_at"), str) or not value["started_at"]
+                or value.get("running") is not True):
+            raise EventError(f"client {name!r} lacks authenticated running container identity")
+        return {"container_id": value["id"], "started_at": value["started_at"], "running": True}
 
     def _wait_client_route_owner_impl(
         self,
@@ -4033,9 +4053,16 @@ class EventProducer:
         generation = 0
         matches: list[int] = []
         for line in text.splitlines():
-            if "ICECREAM scheduler" in line and "starting up" in line:
+            framed = SCHEDULER_FRAME_RE.fullmatch(line)
+            if framed is None:
+                continue
+            message = framed.group(1)
+            if SCHEDULER_START_EXACT_RE.fullmatch(message):
                 generation += 1
-            if generation and re.search(rf"\bput\s+{job_id}\s+in joblist of\b", line, re.I):
+            if generation and (
+                (match := SCHEDULER_DISPATCH_EXACT_RE.fullmatch(message)) is not None
+                and int(match.group(1)) == job_id
+            ):
                 matches.append(generation)
         if generation == 0 or len(matches) != 1:
             raise EventError(
