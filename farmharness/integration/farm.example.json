@@ -302,6 +302,19 @@
         "recipe_schema": "icefarm-daemon-mutant-recipe-v1",
         "recipe_sha256": "a53a3313e4602bd0959d469edd498bfdc5e5138fca725996748d314869a5c2cd"
       },
+      "p50s90-f-revision-2-57a1e336": {
+        "kind": "daemon-mutant",
+        "base_image": "p50s4-57a1e336",
+        "base_commit": "57a1e33624d324e52c1d17481fcc43046eaa3139",
+        "base_archive_sha256": "41e543b313171d0a9684fa772e976489bccc07925326511885dcf2aaec5edcd7",
+        "commit": "57a1e33624d324e52c1d17481fcc43046eaa3139",
+        "archive_sha256": "76dc368f6109e20374d9cf5d6e412273b9978496c10569c25eb8c609d8c7aa14",
+        "cache_wire_revision": 2,
+        "patch_path": "mutants/daemon-wire-revision-2.patch",
+        "patch_sha256": "76fbed8c13d3836253444130502511949bc359f0c5228c241d318a1a125461e7",
+        "recipe_schema": "icefarm-daemon-mutant-recipe-v1",
+        "recipe_sha256": "76dc368f6109e20374d9cf5d6e412273b9978496c10569c25eb8c609d8c7aa14"
+      },
       "p50s30-f-refusal-mutant-candidate": {
         "kind": "daemon-mutant",
         "base_image": "p50s4-89917385",
@@ -380,6 +393,18 @@
             "sha256": "1b451a18a9ff6b0ed6dc4e4ef2551b4482c71352def2cfb819d01f107bc20fa0"
           }
         }
+      },
+      "p50s4-h3-tail-57a1e336": {
+        "kind": "scheduler-mutant",
+        "base_image": "p50s4-57a1e336",
+        "base_commit": "57a1e33624d324e52c1d17481fcc43046eaa3139",
+        "base_archive_sha256": "41e543b313171d0a9684fa772e976489bccc07925326511885dcf2aaec5edcd7",
+        "commit": "57a1e33624d324e52c1d17481fcc43046eaa3139",
+        "archive_sha256": "754da050d4a8ba33bf654efb48124e7067a18189a85340ee66c468d0f67eea98",
+        "patch_path": "mutants/scheduler-tail.patch",
+        "patch_sha256": "f927430b26f76dd6a23c0045eb8abdd93b0e1a69ca11588ab46346ade0804ebd",
+        "recipe_schema": "icefarm-scheduler-mutant-recipe-v1",
+        "recipe_sha256": "754da050d4a8ba33bf654efb48124e7067a18189a85340ee66c468d0f67eea98"
       }
     },
     "topologies": {

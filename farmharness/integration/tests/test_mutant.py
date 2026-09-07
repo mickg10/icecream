@@ -89,6 +89,22 @@ def test_final_lineage_mutant_recipes_are_exactly_derived() -> None:
     assert s90["recipe_sha256"] == (
         "76dc368f6109e20374d9cf5d6e412273b9978496c10569c25eb8c609d8c7aa14"
     )
+    for label, derived in (
+        ("p50s4-h3-tail-57a1e336", h3),
+        ("p50s90-f-revision-2-57a1e336", s90),
+    ):
+        candidate = images[label]
+        assert {
+            key: candidate[key]
+            for key in derived
+        } == {
+            **derived,
+            "patch_path": candidate["patch_path"],
+        }
+        assert not {"closure_sha256", "id", "role_overrides"}.intersection(
+            candidate
+        )
+    assert images["p50s90-f-revision-2-57a1e336"]["cache_wire_revision"] == 2
 
 
 def test_daemon_mutant_recipe_binds_sealed_p50_base_and_patch() -> None:
