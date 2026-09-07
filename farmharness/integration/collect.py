@@ -93,6 +93,7 @@ WARM_HINT_OVERRIDE_RE = re.compile(
     r"compatible_free=([0-9]+) idle_excluded=([0-9]+)$"
 )
 CLIENT_ASSIGNMENT_RE = re.compile(r"\bHave to use host ([^ ]+) - Job ID: ([0-9]+)\b")
+LOCAL_BUILD_MARKERS = ("<building_local>", "building myself, but telling localhost")
 LOG_TIMESTAMP_RE = re.compile(
     r"\b([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}):"
 )
@@ -3486,6 +3487,11 @@ def _parse_rows(
                 + "\n"
                 + _text(job_dir / "client-output.log")
             )
+            local_build = any(marker in log_text for marker in LOCAL_BUILD_MARKERS)
+            if raw["compile_rc"] == 0 and bool(raw["remote"]) == local_build:
+                raise CollectError(
+                    f"{job_id}: remote flag disagrees with authenticated local-build evidence"
+                )
             assignments = _client_assignments(log_text, str(job_dir))
             if len(assignments) != raw["retries"] + 1:
                 raise CollectError(
@@ -3520,6 +3526,7 @@ def _parse_rows(
             raw_job = {
                 "assignment_claims": assignments,
                 "client": client_name,
+                "local_build": local_build,
                 "row_job_id": job_id,
                 **raw,
             }
@@ -3833,6 +3840,8 @@ def _canary_assignment_claims(
                     else None
                 )
             )
+            if any(marker in text for marker in LOCAL_BUILD_MARKERS):
+                raise CollectError(f"readiness canary compiled locally for {pair}")
             assignments = _client_assignments(text, str(debug_path))
             if not assignments:
                 raise CollectError(
@@ -4567,7 +4576,16 @@ def _observations(
             raise CollectError(f"{row['job_id']}: retry dispatch order is inconsistent")
         first = records[0]
         final = records[-1]
-        if (raw["compile_rc"] == 0) != (final["terminal"] == "completion"):
+        local_fallback_completion = (
+            raw["compile_rc"] == 0
+            and raw["remote"] == 0
+            and raw["local_build"]
+            and final["terminal"] == "cancellation"
+        )
+        if (
+            (raw["compile_rc"] == 0) != (final["terminal"] == "completion")
+            and not local_fallback_completion
+        ):
             raise CollectError(
                 f"{row['job_id']}: wrapper status disagrees with scheduler terminal"
             )

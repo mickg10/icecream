@@ -521,6 +521,16 @@ ICECC_LOGFILE="$result_root/canary/$preferred.client.log" \
     /opt/icecream/bin/icecc "$compiler" "${compiler_args[@]}" -std=c++17 \
         -c "$source_file" -o "$remote_object" \
         >"$result_root/canary/$preferred.stdout.log" 2>&1
+if grep -qF '<building_local>' \
+        "$result_root/canary/$preferred.client.log" \
+        "$result_root/canary/$preferred.stdout.log" 2>/dev/null \
+    || grep -qF 'building myself, but telling localhost' \
+        "$result_root/canary/$preferred.client.log" \
+        "$result_root/canary/$preferred.stdout.log" 2>/dev/null
+then
+    echo "readiness canary compiled locally for $preferred" >&2
+    exit 70
+fi
 cmp "$local_object" "$remote_object"
 sha256sum "$local_object" "$remote_object"
 """.strip()

@@ -814,6 +814,91 @@ def test_collection_refuses_missing_canary_assignment_evidence(tmp_path: Path) -
         collect_bundle(farm, scenario, plan, sync_remote=False)
 
 
+def test_collection_refuses_retained_canary_local_fallback(tmp_path: Path) -> None:
+    farm, scenario, plan, root = _raw_collection(tmp_path)
+    path = root / "C1.results" / "canary" / "F1.client.log"
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + "ICECC[1] 2026-09-07 10:28:41: got exception Error 15 - write to host failed\n"
+        + "ICECC[1] 2026-09-07 10:28:41: <building_local>\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(CollectError, match="readiness canary compiled locally"):
+        collect_bundle(farm, scenario, plan, sync_remote=False)
+
+
+def test_collection_records_authenticated_local_fallback_as_verdict_failure(
+    tmp_path: Path,
+) -> None:
+    farm, scenario, plan, root = _raw_collection(tmp_path)
+    job = root / "C1.results" / "workload" / "jobs" / "000001"
+    result = job / "result.tsv"
+    fields = result.read_text(encoding="utf-8").rstrip("\n").split("\t")
+    fields[-2] = "0"
+    result.write_text("\t".join(fields) + "\n", encoding="utf-8")
+    (job / "client-debug.log").write_text(
+        "ICECC[2] 2026-09-05 01:00:04: Have to use host "
+        + fields[5]
+        + " - Job ID: 2 - env: x86_64\n"
+        + "ICECC[2] 2026-09-05 01:00:04: got exception Error 15 - write to host failed\n"
+        + "ICECC[2] 2026-09-05 01:00:04: <building_local>\n",
+        encoding="utf-8",
+    )
+    scheduler = next(
+        item for item in plan["topology"]["instances"] if item["role"] == "S"
+    )
+    scheduler_log = (
+        root / "diagnostics" / scheduler["host"] / "S1.log" / "scheduler.log"
+    )
+    scheduler_text = scheduler_log.read_text(encoding="utf-8")
+    scheduler_text = scheduler_text.replace(
+        "[1] 2026-09-05 01:00:04: BEGIN: 2 client=C1(x86_64) server=F1(x86_64)\n",
+        "",
+    ).replace("END 2 status=0 server=F1", "END 2 status=118")
+    scheduler_log.write_text(scheduler_text, encoding="utf-8")
+    for name in ("source-result.jsonl", "compile-identity.jsonl", "c-action.jsonl"):
+        (root / "C1.results" / name).write_text("", encoding="utf-8")
+    (root / "F1.results" / "f-action.jsonl").write_text(
+        '{"action":"SESSION_OPENED"}\n', encoding="utf-8"
+    )
+    worker = next(
+        item for item in plan["topology"]["instances"] if item["name"] == "F1"
+    )
+    (
+        root / "diagnostics" / worker["host"] / "F1.log" / "iceccd.log"
+    ).write_text("", encoding="utf-8")
+
+    bundle = collect_bundle(farm, scenario, plan, sync_remote=False)
+    assert bundle["observations"]["local_fallback_job_ids"] == ["C1:A:1:2"]
+    verdict = verify_bundle(root)
+    assert verdict["status"] == "FAIL"
+    assert next(
+        clause for clause in verdict["clauses"] if clause["id"] == "jobs.remote-only"
+    )["status"] == "FAIL"
+
+
+def test_collection_refuses_remote_flag_over_local_build_evidence(
+    tmp_path: Path,
+) -> None:
+    farm, scenario, plan, root = _raw_collection(tmp_path)
+    path = (
+        root
+        / "C1.results"
+        / "workload"
+        / "jobs"
+        / "000001"
+        / "client-debug.log"
+    )
+    path.write_text(
+        path.read_text(encoding="utf-8") + "<building_local>\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(CollectError, match="remote flag disagrees"):
+        collect_bundle(farm, scenario, plan, sync_remote=False)
+
+
 def test_canary_evidence_covers_every_workload_client_worker_pair(
     tmp_path: Path,
 ) -> None:

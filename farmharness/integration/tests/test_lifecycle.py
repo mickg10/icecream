@@ -16,6 +16,7 @@ from farmharness.integration.images import (
     _image_identity,
 )
 from farmharness.integration.lifecycle import (
+    CANARY_SCRIPT,
     LifecycleError,
     MIN_FREE_BYTES,
     PreflightRefusal,
@@ -325,6 +326,8 @@ def test_successful_up_executes_exact_planned_starts_and_proves_canary(
     assert len(scripted.containers) == 3
     phases = [command.phase for command in transport.commands]
     assert phases.index("readiness.client-cache") < phases.index("readiness.canary")
+    assert "'<building_local>'" in CANARY_SCRIPT
+    assert "readiness canary compiled locally" in CANARY_SCRIPT
 
 
 def test_readiness_canaries_cover_every_workload_client_worker_pair(

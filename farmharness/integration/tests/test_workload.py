@@ -117,6 +117,7 @@ def test_manifest_driver_is_one_fixed_program_with_all_spec_values_in_argv(
     assert '"$compiler" "${oracle_compiler_args[@]}" -c "$source"' in MANIFEST_DRIVER
     assert MANIFEST_DRIVER.count('oracle_compile "$source" "$object"') == 2
     assert "'building myself, but telling localhost'" in MANIFEST_DRIVER
+    assert "'<building_local>'" in MANIFEST_DRIVER
     assert '"$remote" -eq 1' in MANIFEST_DRIVER
     assert "printf 'OPEN\\t0\\n' >\"$gate_state\"" in MANIFEST_DRIVER
     assert 'flock -x 8' in MANIFEST_DRIVER

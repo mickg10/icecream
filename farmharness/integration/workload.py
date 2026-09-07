@@ -623,10 +623,15 @@ compile_one() {
         worker=UNKNOWN
         scheduler_job="missing-$index"
     fi
-    remote=1
-    if test -z "$selected" \
+    local_fallback=0
+    if grep -qF '<building_local>' "$debug_log" "$output_log" 2>/dev/null \
         || grep -qF 'building myself, but telling localhost' \
             "$debug_log" "$output_log" 2>/dev/null
+    then
+        local_fallback=1
+    fi
+    remote=1
+    if test -z "$selected" -o "$local_fallback" -eq 1
     then
         remote=0
     fi
