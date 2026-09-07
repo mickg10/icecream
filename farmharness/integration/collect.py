@@ -1442,11 +1442,13 @@ def _validate_disk_fill_receipt(
     if (
         scenario.data.get("id") == "S95-cache-disk-full"
         and (
-            event.get("workload_dispatch_count") != 12
-            or event.get("last_dispatched_job") != 12
+            type(event.get("workload_dispatch_count")) is not int
+            or event["workload_dispatch_count"] < 12
+            or type(event.get("last_dispatched_job")) is not int
+            or event["last_dispatched_job"] < 1
         )
     ):
-        raise CollectError(f"{prefix} did not fire on the exact twelfth dispatch")
+        raise CollectError(f"{prefix} fired before the twelfth dispatch threshold")
 
 
 def _validate_header_edit_receipt(

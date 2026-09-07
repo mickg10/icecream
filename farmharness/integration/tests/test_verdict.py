@@ -370,7 +370,7 @@ def _observations(
                 "attempts": [
                     {
                         "generation": 1,
-                        "scheduler_job": int(row["job_id"]) + attempt,
+                        "scheduler_job": int(row["job_id"]) * 10 + attempt,
                         "terminal": "completion",
                         "worker": row["cs"],
                     }
@@ -2314,6 +2314,9 @@ def _s95_disk_fill_bundle() -> dict[str, object]:
             row["reuse"] = False
     observations = _observations(rows)
     observations["error106_job_ids"] = ["3"]
+    observations["assignment_lifecycle"][2]["attempts"][0][
+        "terminal"
+    ] = "cancellation"
     mount = {
         "destination": "/var/cache/icecream",
         "size_bytes": 128 * 1024 * 1024,
@@ -2389,8 +2392,12 @@ def test_s95_disk_fill_accepts_one_bounded_remote_fallback() -> None:
         "no_affected_post",
         "local_fallback",
         "unbound_error106",
-        "late_dispatch",
+        "early_dispatch",
         "missing_assignment_identity",
+        "first_assignment_completed",
+        "final_assignment_cancelled",
+        "final_worker_tamper",
+        "extra_assignment_record",
         "lineage_tamper",
         "wrong_shape",
     ),
@@ -2414,14 +2421,30 @@ def test_s95_disk_fill_evidence_fails_closed(mutation: str) -> None:
         fixture["observations"]["local_fallback_job_ids"] = ["3"]
     elif mutation == "unbound_error106":
         fixture["observations"]["error106_job_ids"] = ["4"]
-    elif mutation == "late_dispatch":
-        fixture["event_log"][0]["workload_dispatch_count"] = 13
+    elif mutation == "early_dispatch":
+        fixture["event_log"][0]["workload_dispatch_count"] = 11
     elif mutation == "missing_assignment_identity":
         fixture["observations"]["assignment_lifecycle"][2]["attempts"][1][
             "scheduler_job"
         ] = fixture["observations"]["assignment_lifecycle"][2]["attempts"][0][
             "scheduler_job"
         ]
+    elif mutation == "first_assignment_completed":
+        fixture["observations"]["assignment_lifecycle"][2]["attempts"][0][
+            "terminal"
+        ] = "completion"
+    elif mutation == "final_assignment_cancelled":
+        fixture["observations"]["assignment_lifecycle"][2]["attempts"][1][
+            "terminal"
+        ] = "cancellation"
+    elif mutation == "final_worker_tamper":
+        fixture["observations"]["assignment_lifecycle"][2]["attempts"][1][
+            "worker"
+        ] = "F2"
+    elif mutation == "extra_assignment_record":
+        fixture["observations"]["assignment_lifecycle"].append(
+            {"attempts": [], "job_id": "999"}
+        )
     elif mutation == "lineage_tamper":
         fixture["event_log"][0]["receipt"]["before"]["host"] = "wrong-host"
     else:
@@ -2435,7 +2458,18 @@ def test_s95_disk_fill_evidence_fails_closed(mutation: str) -> None:
         "no_affected_post",
         "unbound_error106",
         "missing_assignment_identity",
+        "first_assignment_completed",
+        "final_assignment_cancelled",
+        "final_worker_tamper",
+        "extra_assignment_record",
     }
+
+
+def test_s95_disk_fill_allows_polling_to_observe_past_trigger_threshold() -> None:
+    fixture = _s95_disk_fill_bundle()
+    fixture["event_log"][0]["workload_dispatch_count"] = 13
+    fixture["event_log"][0]["last_dispatched_job"] = 14
+    assert evaluate_bundle(fixture)["status"] == "PASS"
 
 
 def test_s40_pair_scoped_reuse_expectation_is_independent_per_worker() -> None:

@@ -2414,8 +2414,6 @@ def _shape_clauses(
                 or not _is_int(
                     observed_event.get("last_dispatched_job"), minimum=1
                 )
-                or observed_event.get("workload_dispatch_count") != 12
-                or observed_event.get("last_dispatched_job") != 12
             ):
                 disk_bad.add("@event:disk-fill")
             elif _disk_fill_receipt_errors(
@@ -3345,11 +3343,13 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
             if isinstance(item, Mapping)
         } if isinstance(assignment_raw, list) else {}
         assignment_bad: set[str] = set()
-        for row in post_event:
+        row_job_ids = {row["job_id"] for row in valid_rows}
+        assignment_identities: list[tuple[int, int]] = []
+        for row in valid_rows:
             identifier = _job_id(row["job_id"], "@row")
             record = assignment_by_job.get(row["job_id"])
             attempts = record.get("attempts") if isinstance(record, Mapping) else None
-            if (
+            malformed = (
                 not isinstance(attempts, list)
                 or len(attempts) != row["retries"] + 1
                 or any(
@@ -3363,15 +3363,39 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
                 )
                 or len({(item["generation"], item["scheduler_job"]) for item in attempts})
                 != len(attempts)
+            )
+            if malformed:
+                assignment_bad.add(identifier)
+                continue
+            assignment_identities.extend(
+                (attempt["generation"], attempt["scheduler_job"])
+                for attempt in attempts
+            )
+            if (
+                attempts[-1]["terminal"] != "completion"
+                or attempts[-1]["worker"] != row["cs"]
+                or (
+                    row["retries"] == 0
+                    and attempts[0]["terminal"] != "completion"
+                )
+                or (
+                    row["retries"] == 1
+                    and (
+                        attempts[0]["terminal"] != "cancellation"
+                        or attempts[1]["terminal"] != "completion"
+                    )
+                )
             ):
                 assignment_bad.add(identifier)
         if (
-                not isinstance(error106_raw, list)
-                or len(error106_ids) != len(error106_raw)
-                or error106_ids != fallback_ids
-                or len(fallback_ids) > len(post_event)
-                or len(assignment_by_job) != len(assignment_raw or [])
-                or assignment_bad
+            not isinstance(error106_raw, list)
+            or len(error106_ids) != len(error106_raw)
+            or error106_ids != fallback_ids
+            or len(fallback_ids) > len(post_event)
+            or len(assignment_by_job) != len(assignment_raw or [])
+            or set(assignment_by_job) != row_job_ids
+            or len(set(assignment_identities)) != len(assignment_identities)
+            or assignment_bad
         ):
             engagement_bad.update(
                 assignment_bad
