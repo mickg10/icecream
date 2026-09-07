@@ -177,7 +177,7 @@
       "required": ["trigger", "action"],
       "properties": {
         "trigger": {"type": "string", "minLength": 1, "maxLength": 100},
-        "action": {"enum": ["upgrade", "downgrade", "restart", "kill -9", "env_set", "netem_set", "disk_fill", "header_edit"]},
+        "action": {"enum": ["upgrade", "downgrade", "restart", "scheduler-loss-active", "kill -9", "env_set", "netem_set", "disk_fill", "header_edit"]},
         "instance": {"$ref": "#/$defs/name"},
         "image": {"$ref": "#/$defs/name"},
         "env": {"$ref": "#/$defs/environment"},

@@ -443,6 +443,7 @@ def load_scenario_spec(path: str | Path, farm: FarmSpec) -> ScenarioSpec:
             "upgrade": frozenset(("image",)),
             "downgrade": frozenset(("image",)),
             "restart": frozenset(),
+            "scheduler-loss-active": frozenset(),
             "kill -9": frozenset(),
             "env_set": frozenset(("env",)),
             "netem_set": frozenset(("rate", "delay_ms")),
@@ -506,6 +507,15 @@ def load_scenario_spec(path: str | Path, farm: FarmSpec) -> ScenarioSpec:
                 raise ScenarioSpecError(f"{field}: netem host lacks authority")
         if action in ("disk_fill", "header_edit") and instance["role"] != "F":
             raise ScenarioSpecError(f"{field}: {action} may target only F instances")
+        if action == "scheduler-loss-active":
+            if instance["role"] != "S" or not re.fullmatch(r"job [1-9][0-9]*", event["trigger"]):
+                raise ScenarioSpecError(
+                    f"{field}: scheduler-loss-active requires a job-triggered S instance"
+                )
+            if sum(item["role"] == "F" for item in value["instances"]) != 1:
+                raise ScenarioSpecError(
+                    f"{field}: scheduler-loss-active requires exactly one F instance"
+                )
         if action == "header_edit":
             _validate_container_path(event["path"], f"{field}.path")
 

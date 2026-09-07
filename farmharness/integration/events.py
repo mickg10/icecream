@@ -64,6 +64,7 @@ JOB_PATTERNS = (
 SUPPORTED_ACTIONS = frozenset(
     (
         "restart",
+        "scheduler-loss-active",
         "kill -9",
         "upgrade",
         "downgrade",
@@ -104,6 +105,7 @@ print(json.dumps({
 '''.strip()
 GATE_SCHEMA = "icefarm-event-gate-v1"
 SCHEDULER_RESTART_SCHEMA = "icefarm-scheduler-restart-v1"
+SCHEDULER_ACTIVE_LOSS_SCHEMA = "icefarm-scheduler-active-loss-v1"
 CLIENT_ROUTE_RESTART_SCHEMA = "icefarm-client-route-restart-v1"
 WORKER_RESTART_SCHEMA = "icefarm-worker-restart-v1"
 CLIENT_ROUTE_SIGNAL_SCHEMA = "icefarm-client-route-signal-v1"
@@ -115,6 +117,82 @@ CACHE_DISK_FAULT_FILE = "/var/cache/icecream/.icefarm-disk-fill"
 CACHE_DISK_FAULT_BYTES = 128 * 1024 * 1024
 CACHE_DISK_FAULT_MIN_HEADROOM_BYTES = 8 * 1024 * 1024
 DISK_FILL_WATCHDOG_S = 30
+ACTIVE_COMPILER_STOP_SCRIPT = r'''
+import json, os, pathlib, signal, time
+
+def snap(pid):
+    root = pathlib.Path("/proc") / str(pid)
+    raw = (root / "stat").read_text(encoding="ascii")
+    fields = raw.rsplit(") ", 1)[1].split()
+    argv = [v.decode("utf-8", "surrogateescape") for v in (root / "cmdline").read_bytes().split(b"\0") if v]
+    return {"argv": argv, "exe": os.readlink(root / "exe"), "pid": pid,
+            "ppid": int(fields[1]), "pgid": int(fields[2]), "state": fields[0],
+            "start_ticks": int(fields[19])}
+
+def processes():
+    result = []
+    for entry in pathlib.Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            result.append(snap(int(entry.name)))
+        except (FileNotFoundError, PermissionError, ProcessLookupError, OSError, ValueError):
+            pass
+    return result
+
+items = processes()
+daemons = [p for p in items if pathlib.Path(p["exe"]).name == "iceccd"]
+if len(daemons) != 1:
+    raise SystemExit("expected exactly one authenticated iceccd parent")
+daemon = daemons[0]
+candidates = [p for p in items if p["ppid"] == daemon["pid"] and
+              p["pid"] == p["pgid"] and p["state"] not in {"Z", "X"} and
+              pathlib.Path(p["exe"]).name != "iceccd"]
+if len(candidates) != 1:
+    raise SystemExit(f"expected exactly one direct compiler group leader, found {len(candidates)}")
+leader = candidates[0]
+before = snap(leader["pid"])
+if before != leader or before["ppid"] != daemon["pid"] or before["pid"] != before["pgid"]:
+    raise SystemExit("compiler identity changed before SIGSTOP")
+os.killpg(before["pgid"], signal.SIGSTOP)
+stopped = snap(before["pid"])
+if stopped["start_ticks"] != before["start_ticks"] or stopped["pgid"] != before["pgid"] or stopped["state"] not in {"T", "t"}:
+    raise SystemExit("compiler group did not stop with its authenticated identity")
+print(json.dumps({"daemon": daemon, "leader": before,
+                  "schema": "icefarm-compiler-group-stop-v1", "stopped": stopped,
+                  "stopped_ms": time.time_ns() // 1000000}, sort_keys=True, separators=(",", ":")))
+'''.strip()
+
+ACTIVE_COMPILER_WAIT_SCRIPT = r'''
+import json, pathlib, sys, time
+pid, pgid, start_ticks, timeout_s = map(int, sys.argv[1:])
+deadline = time.monotonic() + timeout_s
+def stat(pid):
+    try:
+        raw = (pathlib.Path("/proc") / str(pid) / "stat").read_text(encoding="ascii")
+        fields = raw.rsplit(") ", 1)[1].split()
+        return int(fields[2]), int(fields[19])
+    except (FileNotFoundError, PermissionError, ProcessLookupError, OSError, ValueError):
+        return None
+while time.monotonic() < deadline:
+    leader = stat(pid)
+    members = []
+    for entry in pathlib.Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        value = stat(int(entry.name))
+        if value is not None and value[0] == pgid:
+            members.append(int(entry.name))
+    if leader is None and not members:
+        print(json.dumps({"gone": True, "leader": None, "members": [],
+                          "schema": "icefarm-compiler-group-gone-v1"}, sort_keys=True, separators=(",", ":")))
+        raise SystemExit(0)
+    if leader is not None and leader[1] != start_ticks:
+        raise SystemExit("compiler PID was reused before its group disappeared")
+    time.sleep(0.05)
+raise SystemExit("authenticated compiler group did not disappear within bound")
+'''.strip()
+
 DISK_FILL_SCRIPT = r'''
 import errno, json, os, pathlib, signal, stat, sys, time
 
@@ -1026,6 +1104,16 @@ class EventProducer:
                 if not isinstance(start, Mapping) or expected_mount not in start.get("argv", []):
                     raise UnsupportedEvent(
                         "disk_fill requires the fixed bounded cache tmpfs; refusing before workload"
+                    )
+            elif event.action == "scheduler-loss-active":
+                if (
+                    instances[event.instance]["role"] != "S"
+                    or event.trigger.kind != "job"
+                    or event.fields
+                    or sum(item.get("role") == "F" for item in instances.values()) != 1
+                ):
+                    raise UnsupportedEvent(
+                        "scheduler-loss-active requires one job-triggered S event and exactly one F"
                     )
             if event.trigger.kind == "time" and float(event.trigger.value) > self.deadline_s:
                 raise EventTimeout(
@@ -2455,6 +2543,102 @@ class EventProducer:
             "turn": turn,
         }
 
+    def _authenticated_scheduler_active_loss(
+        self, event: TimelineEvent, instance: Mapping[str, Any], identifier: str
+    ) -> dict[str, Any]:
+        with self._lock:
+            turn = self._active_turn
+            epoch = len(self._records) + 1
+        if event.trigger.kind != "job" or turn is None or instance.get("role") != "S":
+            raise EventError("active scheduler loss must be job-triggered on the scheduler")
+        workers = [item for item in self.plan["topology"]["instances"] if item["role"] == "F"]
+        clients = [item for item in self.plan["topology"]["instances"] if item["role"] == "C"]
+        if len(workers) != 1 or not clients:
+            raise EventError("active scheduler loss requires exactly one F and at least one C")
+        worker = workers[0]
+        before = self._inspect(event.instance)
+        if before.get("id") != identifier or before.get("running") is not True:
+            raise EventError("scheduler container identity changed before active loss")
+        worker_before = self._inspect(worker["name"])
+        scheduler_log = self._readiness_baseline(instance)
+        worker_log = self._readiness_baseline(worker)
+        client_baselines = {
+            client["name"]: self._readiness_baseline(client) for client in clients
+        }
+        result = self._invoke(self.factory.make(
+            phase="event.scheduler-loss-authenticate-compiler",
+            host=worker["host"], instance=worker["name"], transport=_docker_transport(self.farm, worker["host"]),
+            timeout_s=self._command_timeout(),
+            argv=docker_argv(self.farm, worker["host"],
+                ("exec", "--user", "0", worker_before["name"], "python3", "-c", ACTIVE_COMPILER_STOP_SCRIPT)),
+        ))
+        try:
+            compiler = json.loads(result.stdout.strip())
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise EventError("compiler-group authentication returned malformed JSON") from exc
+        if not isinstance(compiler, dict) or compiler.get("schema") != "icefarm-compiler-group-stop-v1":
+            raise EventError("compiler-group authentication did not return its exact schema")
+        leader = compiler.get("leader")
+        stopped = compiler.get("stopped")
+        if not isinstance(leader, dict) or not isinstance(stopped, dict) or set(leader) != set(stopped):
+            raise EventError("compiler-group authentication has incomplete identity")
+        if (leader.get("pid") != leader.get("pgid") or leader.get("pid") != stopped.get("pid")
+                or leader.get("pgid") != stopped.get("pgid")
+                or leader.get("start_ticks") != stopped.get("start_ticks")
+                or leader.get("state") in {"Z", "X"}):
+            raise EventError("compiler-group stop identity changed")
+        self._invoke(self.factory.make(
+            phase="event.scheduler-loss-kill",
+            host=instance["host"], instance=event.instance, transport=_docker_transport(self.farm, instance["host"]),
+            timeout_s=self._command_timeout(),
+            argv=docker_argv(self.farm, instance["host"], ("container", "kill", "--signal", "KILL", identifier)),
+        ))
+        self._invoke(self.factory.make(
+            phase="event.scheduler-loss-start",
+            host=instance["host"], instance=event.instance, transport=_docker_transport(self.farm, instance["host"]),
+            timeout_s=self._command_timeout(),
+            argv=docker_argv(self.farm, instance["host"], ("container", "start", identifier)),
+        ))
+        after = self._inspect(event.instance)
+        if after.get("id") != identifier or after.get("running") is not True or after.get("started_at") == before.get("started_at"):
+            raise EventError("scheduler active-loss restart did not preserve container identity")
+        wait = self._invoke(self.factory.make(
+            phase="event.scheduler-loss-wait-compiler-group",
+            host=worker["host"], instance=worker["name"], transport=_docker_transport(self.farm, worker["host"]),
+            timeout_s=self._command_timeout(maximum=40),
+            argv=docker_argv(self.farm, worker["host"],
+                ("exec", "--user", "0", worker_before["name"], "python3", "-c", ACTIVE_COMPILER_WAIT_SCRIPT,
+                 str(leader["pid"]), str(leader["pgid"]), str(leader["start_ticks"]), "30")),
+        ))
+        try:
+            group_gone = json.loads(wait.stdout.strip())
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise EventError("compiler-group disappearance returned malformed JSON") from exc
+        if not isinstance(group_gone, dict) or group_gone.get("schema") != "icefarm-compiler-group-gone-v1" or group_gone.get("gone") is not True:
+            raise EventError("compiler group did not disappear with authenticated identity")
+        startup = self._readiness_witness(instance, scheduler_log)
+        scheduler_snapshot = _wait_scheduler(self.farm, self.plan, self.recorder, self.factory,
+            deadline=min(self._start + self.deadline_s, self.monotonic() + float(self.scenario.data["timeouts"]["up_s"])),
+            monotonic=self.monotonic, sleeper=time.sleep)
+        worker_snapshot = _wait_workers(self.farm, self.plan, self.recorder, self.factory,
+            deadline=min(self._start + self.deadline_s, self.monotonic() + float(self.scenario.data["timeouts"]["up_s"])),
+            monotonic=self.monotonic, sleeper=time.sleep)
+        client_readiness = {
+            client["name"]: self._wait_scheduler_client_readiness(
+                client, client_baselines[client["name"]]
+            )
+            for client in clients
+        }
+        return {
+            "action": event.action, "after": {"container_id": after["id"], "started_at": after["started_at"]},
+            "before": {"container_id": before["id"], "started_at": before["started_at"]},
+            "compiler": {"container_id": worker_before["id"], "leader": leader, "stopped": stopped, "group_gone": group_gone},
+            "event_epoch": epoch, "instance": event.instance,
+            "pre_fault": {"scheduler_log": scheduler_log, "worker_log": worker_log},
+            "quiescence": {"scheduler_startup": startup, "scheduler_snapshot": scheduler_snapshot, "worker_snapshot": worker_snapshot, "client_readiness": client_readiness},
+            "schema": SCHEDULER_ACTIVE_LOSS_SCHEMA, "turn": turn,
+        }
+
     def _coordinated_scheduler_restart(
         self, event: TimelineEvent, instance: Mapping[str, Any], identifier: str
     ) -> dict[str, Any]:
@@ -3508,6 +3692,10 @@ class EventProducer:
             return self._authenticated_worker_restart(event, instance, before)
         before = self._inspect(event.instance)
         identifier = before["id"]
+        if event.action == "scheduler-loss-active":
+            if instance["role"] != "S":
+                raise UnsupportedEvent("scheduler-loss-active is only safe for an S instance")
+            return self._authenticated_scheduler_active_loss(event, instance, identifier)
         if event.action == "kill -9":
             operation = ("container", "kill", "--signal", "KILL", identifier)
         elif event.action == "disk_fill":

@@ -101,6 +101,7 @@ SCHEDULER_LINE_RE = re.compile(
     r"([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}):\s+(.*)$"
 )
 SCHEDULER_START_RE = re.compile(r"^ICECREAM scheduler .* starting up, port [0-9]+$")
+SCHEDULER_ACTIVE_LOSS_SCHEMA = "icefarm-scheduler-active-loss-v1"
 DAEMON_START_RE = re.compile(r"ICECREAM daemon .* starting up")
 READINESS_SCHEDULER_RE = re.compile(r"ICECREAM scheduler .* starting up, port [0-9]+")
 CACHE_READY_RE = re.compile(r"cache sidecar adapter state=2 lifecycle=3")
@@ -1234,10 +1235,11 @@ def _event_log(
         header_edit = event.get("action") == "header_edit"
         disk_fill = event.get("action") == "disk_fill"
         scheduler_restart = False
+        scheduler_active_loss = False
         client_route_restart = False
         worker_restart = False
         client_checkpoint_transition = False
-        if event.get("action") == "restart" and plan is not None:
+        if event.get("action") in {"restart", "scheduler-loss-active"} and plan is not None:
             target = next(
                 (
                     item
@@ -1249,12 +1251,21 @@ def _event_log(
             scheduler_restart = (
                 isinstance(target, Mapping)
                 and target.get("role") == "S"
+                and event.get("action") == "restart"
+                and isinstance(event.get("trigger"), str)
+                and re.fullmatch(r"job [1-9][0-9]*", event["trigger"]) is not None
+            )
+            scheduler_active_loss = (
+                isinstance(target, Mapping)
+                and target.get("role") == "S"
+                and event.get("action") == "scheduler-loss-active"
                 and isinstance(event.get("trigger"), str)
                 and re.fullmatch(r"job [1-9][0-9]*", event["trigger"]) is not None
             )
             client_route_restart = (
                 isinstance(target, Mapping)
                 and target.get("role") == "C"
+                and event.get("action") == "restart"
                 and isinstance(event.get("trigger"), str)
                 and re.fullmatch(r"job [1-9][0-9]*", event["trigger"]) is not None
             )
@@ -1281,6 +1292,7 @@ def _event_log(
             or header_edit
             or disk_fill
             or scheduler_restart
+            or scheduler_active_loss
             or client_route_restart
             or worker_restart
             or client_checkpoint_transition
@@ -1335,6 +1347,11 @@ def _event_log(
                 event["receipt"], event, scenario, index,
                 farm=farm, plan=plan, evidence=evidence,
             )
+        elif scheduler_active_loss:
+            _validate_scheduler_active_loss_receipt(
+                event["receipt"], event, scenario, index,
+                farm=farm, plan=plan, evidence=evidence,
+            )
         elif client_route_restart:
             _validate_client_route_restart_receipt(
                 event["receipt"], event, scenario, index,
@@ -1347,6 +1364,63 @@ def _event_log(
             )
         previous = event["fired_ms"]
     return events
+
+
+def _validate_scheduler_active_loss_receipt(
+    receipt: Any,
+    event: Mapping[str, Any],
+    scenario: ScenarioSpec,
+    index: int,
+    *,
+    farm: FarmSpec | None,
+    plan: dict[str, Any] | None,
+    evidence: Path | None,
+) -> None:
+    prefix = f"events.json event {index} scheduler active loss"
+    if farm is None or plan is None or evidence is None:
+        raise CollectError(f"{prefix} needs authenticated farm, plan, and evidence")
+    required = {"action", "after", "before", "compiler", "event_epoch", "instance", "pre_fault", "quiescence", "schema", "turn"}
+    if not isinstance(receipt, Mapping) or set(receipt) != required or receipt.get("schema") != SCHEDULER_ACTIVE_LOSS_SCHEMA:
+        raise CollectError(f"{prefix} has invalid receipt fields")
+    if receipt.get("action") != event.get("action") or receipt.get("instance") != event.get("instance") or receipt.get("event_epoch") != event.get("event_epoch") or receipt.get("turn") not in scenario.data["workload"]["turns"]:
+        raise CollectError(f"{prefix} is not bound to its timeline event")
+    snapshots = {}
+    for side in ("before", "after"):
+        value = receipt.get(side)
+        if (not isinstance(value, Mapping) or set(value) != {"container_id", "started_at"}
+                or not isinstance(value.get("container_id"), str) or SHA256_RE.fullmatch(value["container_id"]) is None
+                or not isinstance(value.get("started_at"), str) or not value["started_at"]):
+            raise CollectError(f"{prefix} has invalid scheduler {side} identity")
+        snapshots[side] = value
+    if snapshots["before"]["container_id"] != snapshots["after"]["container_id"] or snapshots["before"]["started_at"] == snapshots["after"]["started_at"]:
+        raise CollectError(f"{prefix} does not prove same-container restart")
+    compiler = receipt["compiler"]
+    leader = compiler.get("leader") if isinstance(compiler, Mapping) else None
+    stopped = compiler.get("stopped") if isinstance(compiler, Mapping) else None
+    if (not isinstance(compiler, Mapping) or set(compiler) != {"container_id", "group_gone", "leader", "stopped"}
+            or not isinstance(compiler.get("container_id"), str) or SHA256_RE.fullmatch(compiler["container_id"]) is None
+            or not isinstance(leader, Mapping) or not isinstance(stopped, Mapping)
+            or leader.get("pid") != leader.get("pgid") or leader.get("pid") != stopped.get("pid")
+            or leader.get("pgid") != stopped.get("pgid") or leader.get("start_ticks") != stopped.get("start_ticks")
+            or stopped.get("state") not in {"T", "t"}
+            or not isinstance(compiler.get("group_gone"), Mapping)
+            or compiler["group_gone"].get("gone") is not True):
+        raise CollectError(f"{prefix} has no exact stopped compiler-group identity")
+    pre = receipt["pre_fault"]
+    if (not isinstance(pre, Mapping) or set(pre) != {"scheduler_log", "worker_log"}):
+        raise CollectError(f"{prefix} has invalid pre-fault log offsets")
+    worker = next((item for item in plan["topology"]["instances"] if item.get("role") == "F"), None)
+    if not isinstance(worker, Mapping):
+        raise CollectError(f"{prefix} has no authenticated F")
+    offset = pre["worker_log"].get("offset") if isinstance(pre["worker_log"], Mapping) else None
+    if type(offset) is not int or offset < 0:
+        raise CollectError(f"{prefix} has invalid F log offset")
+    log = _text(_one_role_log(evidence, worker))
+    tail = log.encode("utf-8")[offset:].decode("utf-8", "replace")
+    pid, pgid = leader.get("pid"), leader.get("pgid")
+    for phase in ("TERM", "KILL", "settled"):
+        if not re.search(rf"session quiescence {phase} compiler pid={pid} pgid={pgid} generation=[0-9]+", tail):
+            raise CollectError(f"{prefix} lacks post-offset F {phase} witness")
 
 
 def _validate_disk_fill_receipt(

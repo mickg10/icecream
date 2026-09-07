@@ -19,6 +19,8 @@ from farmharness.integration.events import (
     CACHE_DISK_FAULT_FILE,
     CACHE_DISK_FAULT_PATH,
     DISK_FILL_SCHEMA,
+    ACTIVE_COMPILER_STOP_SCRIPT,
+    ACTIVE_COMPILER_WAIT_SCRIPT,
     EventError,
     EventProducer,
     EventTimeout,
@@ -144,6 +146,74 @@ def test_unsupported_actions_refuse_before_workload_and_deadline_is_bounded(tmp_
     ]
     with pytest.raises(UnsupportedEvent, match="refusing before workload"):
         EventProducer(farm, scenario, plan, recorder=RecordingTransport(EventRecorder()))
+
+
+def test_active_scheduler_loss_scripts_are_exact_identity_bound() -> None:
+    assert "len(daemons) != 1" in ACTIVE_COMPILER_STOP_SCRIPT
+    assert "len(candidates) != 1" in ACTIVE_COMPILER_STOP_SCRIPT
+    assert "p[\"pid\"] == p[\"pgid\"]" in ACTIVE_COMPILER_STOP_SCRIPT
+    assert "before[\"start_ticks\"]" in ACTIVE_COMPILER_STOP_SCRIPT
+    assert "os.killpg(before[\"pgid\"], signal.SIGSTOP)" in ACTIVE_COMPILER_STOP_SCRIPT
+    assert "compiler PID was reused" in ACTIVE_COMPILER_WAIT_SCRIPT
+    assert "value[0] == pgid" in ACTIVE_COMPILER_WAIT_SCRIPT
+
+
+def test_active_scheduler_loss_scenario_is_not_the_drained_restart(tmp_path: Path) -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    farm.data["hub"]["results_root"] = str(tmp_path)
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / "S70-b4-scheduler-active-loss.json", farm
+    )
+    plan = farmtest.build_plan(farm, scenario, run_id="active-loss-unit")
+    producer = EventProducer(farm, scenario, plan, recorder=RecordingTransport(EventRecorder()))
+    assert producer.events[0].action == "scheduler-loss-active"
+    assert producer.events[0].trigger.kind == "job"
+
+
+def test_active_scheduler_loss_collection_binds_post_offset_product_witness(
+    tmp_path: Path,
+) -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    farm.data["hub"]["results_root"] = str(tmp_path)
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / "S70-b4-scheduler-active-loss.json", farm
+    )
+    plan = farmtest.build_plan(farm, scenario, run_id="active-loss-collect")
+    log = tmp_path / "diagnostics" / "tt-quietbox3" / "F1.log" / "iceccd.log"
+    log.parent.mkdir(parents=True)
+    log.write_text(
+        "session quiescence TERM compiler pid=41 pgid=41 generation=7\n"
+        "session quiescence KILL compiler pid=41 pgid=41 generation=7\n"
+        "session quiescence settled compiler pid=41 pgid=41 generation=7\n"
+    )
+    receipt = {
+        "action": "scheduler-loss-active",
+        "after": {"container_id": "a" * 64, "started_at": "new"},
+        "before": {"container_id": "a" * 64, "started_at": "old"},
+        "compiler": {
+            "container_id": "b" * 64,
+            "leader": {"pid": 41, "pgid": 41, "start_ticks": 9, "state": "R"},
+            "stopped": {"pid": 41, "pgid": 41, "start_ticks": 9, "state": "T"},
+            "group_gone": {"gone": True},
+        },
+        "event_epoch": 1,
+        "instance": "S1",
+        "pre_fault": {"scheduler_log": {"offset": 0}, "worker_log": {"offset": 0}},
+        "quiescence": {},
+        "schema": "icefarm-scheduler-active-loss-v1",
+        "turn": "A",
+    }
+    event = {
+        "action": "scheduler-loss-active", "event_epoch": 1, "event_index": 0,
+        "fired_ms": 10, "instance": "S1", "last_dispatched_job": 2,
+        "trigger": "job 2", "workload_dispatch_count": 2, "receipt": receipt,
+    }
+    (tmp_path / "events").mkdir()
+    (tmp_path / "events" / "events.json").write_text(json.dumps({"events": [event]}))
+    assert _event_log(tmp_path, scenario, farm=farm, plan=plan) == [event]
+    log.write_text(log.read_text().replace("pgid=41", "pgid=42"))
+    with pytest.raises(CollectError, match="post-offset F TERM witness"):
+        _event_log(tmp_path, scenario, farm=farm, plan=plan)
 
     scenario.data["timeline"] = [
         {"trigger": "t+2", "action": "restart", "instance": "F1"}

@@ -60,6 +60,7 @@ ROW_FIELDS = frozenset(
 )
 PROFILES = frozenset(("P29V1", "ZSTD_TU", "ZSTD_ROUTE"))
 S70_B4_SCHEDULER_ENGAGEMENT = "s70-b4-scheduler-restart"
+S70_B4_ACTIVE_LOSS_ENGAGEMENT = "s70-b4-scheduler-active-loss"
 S70_B4_CLIENT_ENGAGEMENT = "s70-b4-client-route-restart"
 S70_B4_WORKER_ENGAGEMENT = "s70-b4-worker-bounces"
 S70_B5_ENGAGEMENT = "s70-b5-interner-downgrade"
@@ -1263,6 +1264,28 @@ def _scheduler_restart_receipt_errors(
         )
         is None
     ):
+        return {marker}
+    return set()
+
+
+def _scheduler_active_loss_receipt_errors(
+    receipt: Any, event: Mapping[str, Any], scenario: Mapping[str, Any]
+) -> set[str]:
+    marker = "@event:scheduler-active-loss"
+    if not isinstance(receipt, Mapping) or receipt.get("schema") != "icefarm-scheduler-active-loss-v1":
+        return {marker}
+    compiler = receipt.get("compiler")
+    leader = compiler.get("leader") if isinstance(compiler, Mapping) else None
+    stopped = compiler.get("stopped") if isinstance(compiler, Mapping) else None
+    if (receipt.get("action") != event.get("action")
+            or receipt.get("instance") != event.get("instance")
+            or not isinstance(leader, Mapping) or not isinstance(stopped, Mapping)
+            or leader.get("pid") != leader.get("pgid")
+            or leader.get("pid") != stopped.get("pid")
+            or leader.get("start_ticks") != stopped.get("start_ticks")
+            or compiler.get("group_gone", {}).get("gone") is not True
+            or not isinstance(receipt.get("quiescence"), Mapping)
+            or not receipt["quiescence"].get("client_readiness")):
         return {marker}
     return set()
 
@@ -3199,6 +3222,15 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
         error106_raw = observations.get("error106_job_ids")
         if not isinstance(error106_raw, list) or error106_raw:
             engagement_bad.add("@observations:error106_job_ids")
+    elif engagement_mode == S70_B4_ACTIVE_LOSS_ENGAGEMENT:
+        epochs = {epoch: [row for row in valid_rows if row["event_epoch"] == epoch] for epoch in (0, 1)}
+        if not epochs[0] or not epochs[1]:
+            engagement_bad.update({"@rows:pre-active-loss", "@rows:post-active-loss"})
+        for row in valid_rows:
+            if row["event_epoch"] not in epochs or row["tail_present"] is not True or row["tail_profile"] != "P29V1" or row["session_outcome"] != "committed" or row["retries"] != 0:
+                engagement_bad.add(_job_id(row["job_id"], "@row"))
+        if observations.get("local_fallback_job_ids") != []:
+            engagement_bad.add("@observations:local_fallback_job_ids")
     elif engagement_mode == S70_B4_CLIENT_ENGAGEMENT:
         epochs = {
             epoch: [row for row in valid_rows if row["event_epoch"] == epoch]
@@ -3890,6 +3922,44 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
                 b4_bad,
             )
         )
+
+    if engagement_mode == S70_B4_ACTIVE_LOSS_ENGAGEMENT:
+        active_bad: set[str] = set()
+        instances = scenario.get("instances") if isinstance(scenario.get("instances"), list) else []
+        schedulers = [item for item in instances if isinstance(item, Mapping) and item.get("role") == "S"]
+        scheduler_name = schedulers[0].get("name") if len(schedulers) == 1 else None
+        timeline = scenario.get("timeline")
+        expected = timeline[0] if isinstance(timeline, list) and len(timeline) == 1 else None
+        observed = event_log[0] if isinstance(event_log, list) and len(event_log) == 1 else None
+        if (scheduler_name is None or not isinstance(expected, Mapping)
+                or expected.get("action") != "scheduler-loss-active"
+                or expected.get("instance") != scheduler_name
+                or not isinstance(observed, Mapping)
+                or observed.get("action") != "scheduler-loss-active"
+                or observed.get("instance") != scheduler_name
+                or observed.get("event_index") != 0
+                or observed.get("event_epoch") != 1
+                or not _is_int(observed.get("workload_dispatch_count"), minimum=2)):
+            active_bad.add("@event:s70-b4-scheduler-active-loss")
+        else:
+            receipt = observed.get("receipt")
+            if (_scheduler_active_loss_receipt_errors(receipt, observed, scenario)
+                    or not isinstance(receipt, Mapping)
+                    or not isinstance(receipt.get("before"), Mapping)
+                    or not isinstance(receipt.get("after"), Mapping)
+                    or receipt["before"].get("container_id") != receipt["after"].get("container_id")
+                    or receipt["before"].get("started_at") == receipt["after"].get("started_at")):
+                active_bad.add("@event:s70-b4-active-loss-receipt")
+        if not any(row.get("event_epoch") == 1 for row in valid_rows):
+            active_bad.add("@rows:post-rejoin-dispatch")
+        if observations.get("local_fallback_job_ids") != []:
+            active_bad.add("@observations:local_fallback_job_ids")
+        clauses.append(_clause(
+            "s70.b4-scheduler-active-loss",
+            not active_bad,
+            "an active compiler group is authenticated, scheduler loss/restart re-joins all peers, and later exact work remains remote",
+            active_bad,
+        ))
 
     if engagement_mode == S70_B4_CLIENT_ENGAGEMENT:
         b4_bad: set[str] = set()

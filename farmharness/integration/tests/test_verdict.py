@@ -16,6 +16,7 @@ from farmharness.integration.verdict import (
     evaluate_bundle,
     evaluate_control,
     _transition_receipt_errors,
+    _scheduler_active_loss_receipt_errors,
 )
 
 
@@ -110,6 +111,26 @@ def test_pure_verdict_transition_receipt_requires_fresh_f_rejoin() -> None:
     tampered = copy.deepcopy(observed)
     tampered["receipt"]["coordination"]["scheduler_worker_rejoin"]["line"] = "stale login"
     assert _transition_receipt_errors(tampered, scenario["timeline"][0], scenario)
+
+
+def test_active_loss_verdict_rejects_reused_compiler_identity() -> None:
+    scenario = {"workload": {"turns": ["A"]}}
+    event = {"action": "scheduler-loss-active", "instance": "S1"}
+    receipt = {
+        "schema": "icefarm-scheduler-active-loss-v1",
+        "action": "scheduler-loss-active",
+        "instance": "S1",
+        "compiler": {
+            "leader": {"pid": 41, "pgid": 41, "start_ticks": 9},
+            "stopped": {"pid": 41, "pgid": 41, "start_ticks": 9},
+            "group_gone": {"gone": True},
+        },
+        "quiescence": {"client_readiness": {"C1": {}}},
+    }
+    assert not _scheduler_active_loss_receipt_errors(receipt, event, scenario)
+    tampered = copy.deepcopy(receipt)
+    tampered["compiler"]["stopped"]["start_ticks"] = 10
+    assert _scheduler_active_loss_receipt_errors(tampered, event, scenario)
 
 
 def _client_transition_event() -> tuple[dict[str, object], dict[str, object]]:
