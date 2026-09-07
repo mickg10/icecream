@@ -3292,11 +3292,38 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(error106_raw, list) or error106_raw:
             engagement_bad.add("@observations:error106_job_ids")
     elif engagement_mode == S70_B4_ACTIVE_LOSS_ENGAGEMENT:
-        epochs = {epoch: [row for row in valid_rows if row["event_epoch"] == epoch] for epoch in (0, 1)}
-        if not epochs[0] or not epochs[1]:
-            engagement_bad.update({"@rows:pre-active-loss", "@rows:post-active-loss"})
+        lifecycle = observations.get("assignment_lifecycle")
+        event_log = bundle.get("event_log")
+        receipt = event_log[0].get("receipt") if isinstance(event_log, list) and event_log else None
+        lost_job = receipt.get("lost_scheduler_job") if isinstance(receipt, Mapping) else None
+        lost_generation = receipt.get("lost_scheduler_generation") if isinstance(receipt, Mapping) else None
+        affected_ids = {
+            item.get("job_id") for item in lifecycle
+            if isinstance(item, Mapping) and isinstance(item.get("attempts"), list)
+            and item["attempts"]
+            and item["attempts"][0].get("scheduler_job") == lost_job
+            and item["attempts"][0].get("generation") == lost_generation
+        } if isinstance(lifecycle, list) else set()
+        fallback = [
+            row for row in valid_rows
+            if row["session_outcome"] == "fallback"
+            and row["tail_present"] is False and row["tail_profile"] is None
+            and row["retries"] == 1 and row["exact"] is True
+            and row["job_id"] in affected_ids
+        ]
+        if len(affected_ids) != 1 or len(fallback) != 1:
+            engagement_bad.add("@rows:exactly-one-active-loss-fallback")
+        if not any(
+            row["event_epoch"] == 1 and row["tail_present"] is True
+            and row["tail_profile"] == "P29V1" and row["session_outcome"] == "committed"
+            and row["retries"] == 0 for row in valid_rows
+        ):
+            engagement_bad.add("@rows:post-active-loss-p29")
         for row in valid_rows:
-            if row["event_epoch"] not in epochs or row["tail_present"] is not True or row["tail_profile"] != "P29V1" or row["session_outcome"] != "committed" or row["retries"] not in {0, 1}:
+            if row in fallback:
+                continue
+            if not (row["tail_present"] is True and row["tail_profile"] == "P29V1"
+                    and row["session_outcome"] == "committed" and row["retries"] == 0):
                 engagement_bad.add(_job_id(row["job_id"], "@row"))
         if observations.get("local_fallback_job_ids") != []:
             engagement_bad.add("@observations:local_fallback_job_ids")

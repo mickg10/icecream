@@ -87,6 +87,39 @@ SCHEDULER_FRAME_RE = re.compile(
 )
 SCHEDULER_START_EXACT_RE = re.compile(r"^ICECREAM scheduler .* starting up, port [0-9]+$")
 SCHEDULER_DISPATCH_EXACT_RE = re.compile(r"^put ([0-9]+) in joblist of .+$")
+
+
+def scheduler_generation_for_job_text(text: str, job_id: int) -> int:
+    """Parse only framed scheduler lines and bind a job to one generation."""
+    generation = 0
+    matches: list[int] = []
+    for line in text.splitlines():
+        framed = SCHEDULER_FRAME_RE.fullmatch(line)
+        if framed is None:
+            continue
+        message = framed.group(1)
+        if SCHEDULER_START_EXACT_RE.fullmatch(message):
+            generation += 1
+        match = SCHEDULER_DISPATCH_EXACT_RE.fullmatch(message)
+        if generation and match is not None and int(match.group(1)) == job_id:
+            matches.append(generation)
+    if generation == 0 or len(matches) != 1:
+        raise ValueError(f"scheduler job {job_id} has no unique authenticated generation")
+    return matches[0]
+
+
+def select_direct_compiler_pairs(items: list[dict[str, Any]]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """Pure model of the STOP script's same-exe parent/child selector."""
+    parents = {p["pid"]: p for p in items if PurePosixPath(p["exe"]).name == "iceccd"}
+    return [
+        (parent, child) for child in items
+        for parent in (parents.get(child.get("ppid")),)
+        if parent is not None
+        and PurePosixPath(child["exe"]).name == "iceccd"
+        and child.get("pid") == child.get("pgid")
+        and child.get("state") not in {"Z", "X"}
+        and "--generation" not in child.get("argv", [])
+    ]
 READINESS_SCRIPT = r'''
 import json, pathlib, re, sys
 
@@ -2597,10 +2630,7 @@ class EventProducer:
         # be reused by the restarted scheduler.
         lost_generation = self._scheduler_generation_for_job(self._last_job)
         client_routes_before = {
-            client["name"]: {
-                "container": self._route_container_identity(client["name"]),
-                **self._client_route_snapshot(client),
-            } for client in clients
+            client["name"]: self._client_route_state(client) for client in clients
         }
         result = self._invoke(self.factory.make(
             phase="event.scheduler-loss-authenticate-compiler",
@@ -2678,10 +2708,7 @@ class EventProducer:
             for client in clients
         }
         client_routes_after = {
-            client["name"]: {
-                "container": self._route_container_identity(client["name"]),
-                **self._client_route_snapshot(client),
-            } for client in clients
+            client["name"]: self._client_route_state(client) for client in clients
         }
         return {
             "action": event.action, "after": {"container_id": after["id"], "started_at": after["started_at"]},
@@ -2974,9 +3001,9 @@ class EventProducer:
             self._mark_failure("event.client-route-process-ready", exc)
             raise
 
-    def _client_route_snapshot(self, instance: Mapping[str, Any]) -> dict[str, Any]:
+    def _client_route_snapshot(self, instance: Mapping[str, Any], container_id: str) -> dict[str, Any]:
         """Read-only authenticated daemon/cache-owner identity for a C."""
-        container = f"icefarm-{self.plan['run_id']}-{instance['name']}"
+        container = container_id
         result = self._invoke(self.factory.make(
             phase="event.scheduler-loss-client-route-snapshot",
             host=instance["host"], instance=instance["name"],
@@ -3006,13 +3033,25 @@ class EventProducer:
             raise EventError("client route snapshot lacks one authenticated daemon/owner pair")
         return {"daemon": snapshot["daemon"], "route_owner": snapshot["route_owner"]}
 
-    def _route_container_identity(self, name: str) -> dict[str, Any]:
-        value = self._inspect(name)
-        if (not isinstance(value.get("id"), str) or not SHA256_RE.fullmatch(value["id"])
-                or not isinstance(value.get("started_at"), str) or not value["started_at"]
-                or value.get("running") is not True):
-            raise EventError(f"client {name!r} lacks authenticated running container identity")
-        return {"container_id": value["id"], "started_at": value["started_at"], "running": True}
+    def _client_route_state(self, client: Mapping[str, Any]) -> dict[str, Any]:
+        """Atomically authenticate C identity around an exact-ID process read."""
+        before = self._inspect(client["name"])
+        if (not isinstance(before.get("id"), str) or not SHA256_RE.fullmatch(before["id"])
+                or before.get("running") is not True
+                or not isinstance(before.get("started_at"), str) or not before["started_at"]):
+            raise EventError(f"client {client['name']!r} lacks authenticated running container identity")
+        processes = self._client_route_snapshot(client, before["id"])
+        after = self._inspect(client["name"])
+        if (after.get("id") != before["id"]
+                or after.get("started_at") != before["started_at"]
+                or after.get("running") is not True):
+            raise EventError(f"client {client['name']!r} changed during route snapshot")
+        value = {
+            "container_id": before["id"],
+            "started_at": before["started_at"],
+            "running": True,
+        }
+        return {"container": value, **processes}
 
     def _wait_client_route_owner_impl(
         self,
@@ -4050,25 +4089,10 @@ class EventProducer:
     def _scheduler_generation_for_job(self, job_id: int) -> int:
         """Return the unique startup generation owning an observed dispatch."""
         text = self._remote_job_reader()
-        generation = 0
-        matches: list[int] = []
-        for line in text.splitlines():
-            framed = SCHEDULER_FRAME_RE.fullmatch(line)
-            if framed is None:
-                continue
-            message = framed.group(1)
-            if SCHEDULER_START_EXACT_RE.fullmatch(message):
-                generation += 1
-            if generation and (
-                (match := SCHEDULER_DISPATCH_EXACT_RE.fullmatch(message)) is not None
-                and int(match.group(1)) == job_id
-            ):
-                matches.append(generation)
-        if generation == 0 or len(matches) != 1:
-            raise EventError(
-                f"scheduler loss job {job_id} has no unique authenticated generation"
-            )
-        return matches[0]
+        try:
+            return scheduler_generation_for_job_text(text, job_id)
+        except ValueError as exc:
+            raise EventError(str(exc)) from exc
 
     def _eligible(self, event: TimelineEvent, now: float) -> bool:
         if event.trigger.kind == "time":

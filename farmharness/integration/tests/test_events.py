@@ -31,6 +31,8 @@ from farmharness.integration.events import (
     TRANSITION_SCHEMA,
     TimelineEvent,
     UnsupportedEvent,
+    scheduler_generation_for_job_text,
+    select_direct_compiler_pairs,
     run_events,
 )
 from farmharness.integration.farm_spec import load_farm_spec
@@ -155,6 +157,30 @@ def test_active_scheduler_loss_scripts_are_exact_identity_bound() -> None:
     assert "len(candidates) != 1" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "p[\"pid\"] == p[\"pgid\"]" in ACTIVE_COMPILER_STOP_SCRIPT
     assert '"--generation" not in p["argv"]' in ACTIVE_COMPILER_STOP_SCRIPT
+
+
+def test_scheduler_generation_parser_requires_framed_unique_generation() -> None:
+    framed = (
+        "[S1] 2026-09-07 00:00:00: ICECREAM scheduler x starting up, port 23000\n"
+        "[S1] 2026-09-07 00:00:01: put 2 in joblist of F1\n"
+    )
+    assert scheduler_generation_for_job_text(framed, 2) == 1
+    with pytest.raises(ValueError):
+        scheduler_generation_for_job_text("ICECREAM scheduler x starting up, port 23000\nput 2 in joblist of F1", 2)
+    reused = framed + (
+        "[S1] 2026-09-07 00:01:00: ICECREAM scheduler x starting up, port 23000\n"
+        "[S1] 2026-09-07 00:01:01: put 2 in joblist of F1\n"
+    )
+    with pytest.raises(ValueError):
+        scheduler_generation_for_job_text(reused, 2)
+
+
+def test_direct_compiler_selector_rejects_non_iceccd_group_child() -> None:
+    parent = {"pid": 10, "ppid": 1, "pgid": 10, "exe": "/opt/icecream/sbin/iceccd", "state": "S", "argv": []}
+    compiler = {"pid": 11, "ppid": 10, "pgid": 11, "exe": "/opt/icecream/sbin/iceccd", "state": "R", "argv": []}
+    other = {"pid": 12, "ppid": 10, "pgid": 12, "exe": "/usr/bin/other", "state": "R", "argv": []}
+    assert select_direct_compiler_pairs([parent, compiler]) == [(parent, compiler)]
+    assert select_direct_compiler_pairs([parent, other]) == []
     assert "before[\"start_ticks\"]" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "os.killpg(before[\"pgid\"], signal.SIGSTOP)" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "compiler PID was reused" in ACTIVE_COMPILER_WAIT_SCRIPT

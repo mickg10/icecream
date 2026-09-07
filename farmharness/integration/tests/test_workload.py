@@ -173,6 +173,7 @@ def test_s30_mutant_workload_enables_the_legacy_recovery_under_test(
         ("S60-11-warm-f2-down", False),
         ("S60-13-warm-s-down", False),
         ("H2-client-kill-switch", False),
+        ("S70-b4-scheduler-active-loss", False),
     ),
 )
 def test_strict_p50_tracks_whole_run_engagement_contract(
@@ -207,6 +208,7 @@ def test_manifest_driver_shell_is_syntactically_valid() -> None:
         check=True,
         capture_output=True,
     )
+    assert "scenario.data" not in MANIFEST_DRIVER
 
 
 def test_workload_summary_is_fail_closed(tmp_path: Path) -> None:
