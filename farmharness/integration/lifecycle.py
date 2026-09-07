@@ -21,6 +21,15 @@ try:
     )
     from .images import CommandFactory, ImageError, RecordingTransport, _image_identity
     from .layout import instance_root, runtime_root, toolchain_root
+    from .netem import (
+        NETEM_RECEIPT_SCHEMA,
+        NetemBinding,
+        NetemPlanError,
+        validate_plan as validate_netem_plan,
+        validate_qdisc,
+        remove_args,
+        network_remove_args,
+    )
     from .remote import (
         CommandResult,
         PlannedCommand,
@@ -44,6 +53,15 @@ except ImportError:  # Direct execution from this directory.
     )
     from images import CommandFactory, ImageError, RecordingTransport, _image_identity
     from layout import instance_root, runtime_root, toolchain_root
+    from netem import (
+        NETEM_RECEIPT_SCHEMA,
+        NetemBinding,
+        NetemPlanError,
+        validate_plan as validate_netem_plan,
+        validate_qdisc,
+        remove_args,
+        network_remove_args,
+    )
     from remote import (
         CommandResult,
         PlannedCommand,
@@ -2062,6 +2080,60 @@ def _probe_chroot(
     )
 
 
+def _probe_netem_tool(
+    farm: FarmSpec,
+    instance: Mapping[str, Any],
+    run_id: str,
+    recorder: Recorder,
+    factory: CommandFactory,
+    timeout_s: int,
+) -> None:
+    """Refuse before ``up`` when the sealed worker image lacks ``tc``."""
+
+    reference = instance["container_image"]["reference"]
+    try:
+        result = recorder.invoke(
+            _command(
+                factory,
+                phase="preflight.netem-tool",
+                host=instance["host"],
+                instance=instance["name"],
+                transport=_docker_transport(farm, instance["host"]),
+                timeout_s=timeout_s,
+                argv=docker_argv(
+                    farm,
+                    instance["host"],
+                    (
+                        "run",
+                        "--rm",
+                        "--pull=never",
+                        "--network",
+                        "none",
+                        "--cap-drop",
+                        "ALL",
+                        "--entrypoint",
+                        "/usr/sbin/tc",
+                        reference,
+                        "qdisc",
+                        "show",
+                        "dev",
+                        "lo",
+                    ),
+                ),
+            )
+        )
+    except RemoteError as exc:
+        raise PreflightRefusal(
+            f"shaped worker {instance['name']} image lacks a usable /usr/sbin/tc",
+            reason_code="netem-tool-missing",
+        ) from exc
+    if result.returncode != 0:
+        raise PreflightRefusal(
+            f"shaped worker {instance['name']} image lacks a usable /usr/sbin/tc",
+            reason_code="netem-tool-missing",
+        )
+
+
 def _probe_role_hashes(
     farm: FarmSpec,
     host_name: str,
@@ -2147,6 +2219,7 @@ def preflight(
     topology = plan["topology"]
     hosts = _used_hosts(farm, topology)
     timeout_s = scenario.data["timeouts"]["up_s"]
+    netem_targets = {binding.instance for binding in _netem_bindings(plan)}
     for instance in topology["instances"]:
         authority = farm.data["authority"]["images"][instance["image"]["label"]]
         if authority.get("kind") in ("scheduler-mutant", "daemon-mutant"):
@@ -2172,6 +2245,15 @@ def preflight(
             raise PreflightRefusal(
                 f"image {instance['image']['label']} has no captured runtime closure "
                 "in the execution authority"
+            )
+        if instance["name"] in netem_targets:
+            _probe_netem_tool(
+                farm,
+                instance,
+                plan["run_id"],
+                recorder,
+                factory,
+                timeout_s,
             )
     verified_snapshots: dict[tuple[str, str], dict[str, Any]] = {}
     for instance in topology["instances"]:
@@ -2460,6 +2542,115 @@ def _plan_commands(plan: dict[str, Any]) -> list[PlannedCommand]:
 def _recorded_commands(recorder: Recorder) -> list[dict[str, Any]]:
     commands = getattr(recorder, "commands", [])
     return [command.as_dict() for command in commands]
+
+
+def _netem_bindings(plan: Mapping[str, Any]) -> tuple[NetemBinding, ...]:
+    """Authenticate the immutable plan before using any netem argv."""
+
+    document = plan.get("network_shaping")
+    if document is None:
+        return ()
+    try:
+        values = validate_netem_plan(document)
+    except NetemPlanError as exc:
+        raise LifecycleError(f"netem plan is invalid: {exc}") from exc
+    topology = plan.get("topology", {}).get("instances", [])
+    by_name = {item.get("name"): item for item in topology if isinstance(item, Mapping)}
+    ports = plan.get("ports", {}).get("instances", {})
+    result: list[NetemBinding] = []
+    for value in values:
+        name = value["instance"]
+        instance = by_name.get(name)
+        if not isinstance(instance, Mapping) or instance.get("role") != "F":
+            raise LifecycleError(f"netem plan target {name!r} is not the planned F")
+        if instance.get("host") != value["host"]:
+            raise LifecycleError(f"netem plan host mismatch for {name!r}")
+        if ports.get(name) != value["container_port"] or value["host_port"] != ports.get(name):
+            raise LifecycleError(f"netem plan port mismatch for {name!r}")
+        expected_container = f"icefarm-{plan['run_id']}-{name}"
+        expected_bridge = f"icefarm-{plan['run_id']}-{name}-netem"
+        if value["container"] != expected_container or value["bridge"] != expected_bridge:
+            raise LifecycleError(f"netem plan identity mismatch for {name!r}")
+        result.append(
+            NetemBinding(
+                instance=name,
+                role="F",
+                host=value["host"],
+                bridge=value["bridge"],
+                rate=value["rate"],
+                delay_ms=value["delay_ms"],
+                host_port=value["host_port"],
+                container_port=value["container_port"],
+                container=value["container"],
+            )
+        )
+    return tuple(result)
+
+
+def _netem_up_receipt(
+    bindings: tuple[NetemBinding, ...],
+    create_results: list[CommandResult],
+    apply_results: list[CommandResult],
+    observe_results: list[CommandResult],
+    create_commands: list[PlannedCommand],
+    apply_commands: list[PlannedCommand],
+    observe_commands: list[PlannedCommand],
+) -> dict[str, Any]:
+    if not (
+        len(bindings)
+        == len(create_results)
+        == len(apply_results)
+        == len(observe_results)
+        == len(create_commands)
+        == len(apply_commands)
+        == len(observe_commands)
+    ):
+        raise LifecycleError("netem command/result cardinality is inconsistent")
+    records: list[dict[str, Any]] = []
+    for binding, created, applied, observed, create, apply, observe in zip(
+        bindings,
+        create_results,
+        apply_results,
+        observe_results,
+        create_commands,
+        apply_commands,
+        observe_commands,
+        strict=True,
+    ):
+        if created.returncode != 0 or applied.returncode != 0 or observed.returncode != 0:
+            raise LifecycleError(f"netem command failed for {binding.instance}")
+        witness = validate_qdisc(binding, observed.stdout)
+        records.append(
+            {
+                "application": {
+                    "argv": list(apply.argv),
+                    "returncode": applied.returncode,
+                },
+                "bridge": {
+                    "argv": list(create.argv),
+                    "returncode": created.returncode,
+                    "stdout": created.stdout,
+                },
+                "container": binding.container,
+                "instance": binding.instance,
+                "request": binding.as_dict(),
+                "removal": {
+                    "container_argv": list(remove_args(binding)),
+                    "network_argv": list(network_remove_args(binding)),
+                },
+                "observation": {
+                    "argv": list(observe.argv),
+                    "returncode": observed.returncode,
+                    "sha256": hashlib.sha256(observed.stdout.encode()).hexdigest(),
+                    "witness": witness,
+                },
+            }
+        )
+    return {
+        "bindings": records,
+        "schema": NETEM_RECEIPT_SCHEMA,
+        "status": "APPLIED" if records else "DISABLED",
+    }
 
 
 def _timeout_left(deadline: float, monotonic: Callable[[], float]) -> int:
@@ -2902,6 +3093,9 @@ def collect_diagnostics(
 
     problems: list[str] = []
     destination.mkdir(parents=True, exist_ok=True)
+    shaped_names = {
+        binding.instance for binding in _netem_bindings(plan)
+    }
     for instance in plan["topology"]["instances"]:
         host_name = instance["host"]
         host_dir = destination / host_name
@@ -2912,10 +3106,29 @@ def collect_diagnostics(
             if container_ids is not None
             else container
         )
-        for kind, args in (
+        diagnostics = [
             ("inspect", ("container", "inspect", container_target)),
             ("logs", ("container", "logs", container_target)),
-        ):
+        ]
+        if instance["name"] in shaped_names:
+            diagnostics.append(
+                (
+                    "tc",
+                    (
+                        "exec",
+                        "--user",
+                        "0",
+                        container_target,
+                        "tc",
+                        "-s",
+                        "qdisc",
+                        "show",
+                        "dev",
+                        "eth0",
+                    ),
+                )
+            )
+        for kind, args in diagnostics:
             try:
                 result = recorder.invoke(
                     _command(
@@ -2961,6 +3174,107 @@ def collect_diagnostics(
         except RemoteError as exc:
             problems.append(f"{host_name}:{instance['name']}:sync-log:{exc}")
     return problems
+
+
+def _remove_netem(
+    farm: FarmSpec,
+    plan: Mapping[str, Any],
+    bindings: tuple[NetemBinding, ...],
+    recorder: Recorder,
+    factory: CommandFactory,
+    timeout_s: int,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Remove qdiscs from the exact shaped containers."""
+
+    receipts: list[dict[str, Any]] = []
+    problems: list[str] = []
+    for binding in bindings:
+        observed_commands = getattr(recorder, "commands", [])
+        started = any(
+            command.phase == "up.start-f" and command.instance == binding.instance
+            for command in observed_commands
+        )
+        if not started:
+            present = [
+                item
+                for item in _labelled_containers(
+                    farm, binding.host, recorder, factory, timeout_s
+                )
+                if item["run_id"] == plan["run_id"]
+                and item["name"] == binding.container
+            ]
+            started = bool(present)
+        if not started:
+            receipts.append(
+                {
+                    "instance": binding.instance,
+                    "status": "SKIPPED_CONTAINER_NOT_STARTED",
+                }
+            )
+            continue
+        try:
+            command = _command(
+                factory,
+                phase="down.netem-remove",
+                host=binding.host,
+                instance=binding.instance,
+                transport=_docker_transport(farm, binding.host),
+                timeout_s=timeout_s,
+                argv=docker_argv(farm, binding.host, remove_args(binding)),
+            )
+            result = recorder.invoke(command)
+            receipts.append(
+                {
+                    "argv": list(command.argv),
+                    "instance": binding.instance,
+                    "returncode": result.returncode,
+                    "stderr": result.stderr,
+                    "stdout": result.stdout,
+                }
+            )
+            if result.returncode != 0:
+                problems.append(f"{binding.instance}:qdisc-remove:rc={result.returncode}")
+        except (RemoteError, LifecycleError) as exc:
+            problems.append(f"{binding.instance}:qdisc-remove:{exc}")
+    return receipts, problems
+
+
+def _remove_netem_bridges(
+    farm: FarmSpec,
+    bindings: tuple[NetemBinding, ...],
+    recorder: Recorder,
+    factory: CommandFactory,
+    timeout_s: int,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    receipts: list[dict[str, Any]] = []
+    problems: list[str] = []
+    for binding in bindings:
+        try:
+            command = _command(
+                factory,
+                phase="down.network-remove",
+                host=binding.host,
+                instance=binding.instance,
+                transport=_docker_transport(farm, binding.host),
+                timeout_s=timeout_s,
+                argv=docker_argv(farm, binding.host, network_remove_args(binding)),
+            )
+            result = recorder.invoke(command)
+            receipts.append(
+                {
+                    "argv": list(command.argv),
+                    "bridge": binding.bridge,
+                    "instance": binding.instance,
+                    "returncode": result.returncode,
+                    "stderr": result.stderr,
+                    "stdout": result.stdout,
+                }
+            )
+            if result.returncode != 0:
+                problems.append(f"{binding.instance}:bridge-remove:rc={result.returncode}")
+        except (RemoteError, LifecycleError) as exc:
+            problems.append(f"{binding.instance}:bridge-remove:{exc}")
+    return receipts, problems
 
 
 def _remove_run_containers(
@@ -3021,7 +3335,16 @@ def tear_down(
     protected_before: dict[str, dict[str, int]] | None = None,
 ) -> dict[str, Any]:
     timeout_s = plan.get("timeouts", {}).get("down_s", 300)
+    bindings = _netem_bindings(plan)
+    network_receipts, network_problems = _remove_netem(
+        farm, plan, bindings, recorder, factory, timeout_s
+    )
     problems = _remove_run_containers(farm, plan, recorder, factory, timeout_s)
+    bridge_receipts, bridge_problems = _remove_netem_bridges(
+        farm, bindings, recorder, factory, timeout_s
+    )
+    network_receipts.extend(bridge_receipts)
+    problems = [*network_problems, *problems, *bridge_problems]
     for instance in plan["topology"]["instances"]:
         root = instance_root(farm, instance["host"], plan["run_id"], instance["name"])
         reference = instance["container_image"]["reference"]
@@ -3088,6 +3411,11 @@ def tear_down(
             except (RemoteError, LifecycleError) as exc:
                 problems.append(f"{host_name}:protected-check:{exc}")
     receipt = {
+        "network_shaping": {
+            "bindings": network_receipts,
+            "schema": NETEM_RECEIPT_SCHEMA,
+            "status": "REMOVED" if not network_problems else "REMOVE_FAILED",
+        },
         "problems": problems,
         "protected_after": protected_after,
         "run_id": plan["run_id"],
@@ -3118,6 +3446,11 @@ def bring_up(
     bundle = bundle_root(farm, plan["run_id"])
     bundle.mkdir(parents=True, exist_ok=True)
     preflight_receipt: dict[str, Any] | None = None
+    network_receipt: dict[str, Any] = {
+        "bindings": [],
+        "schema": NETEM_RECEIPT_SCHEMA,
+        "status": "NOT_APPLIED",
+    }
     try:
         preflight_receipt = preflight(
             farm,
@@ -3132,18 +3465,23 @@ def bring_up(
         _atomic_json(bundle / "preflight.json", preflight_receipt)
         deadline = monotonic() + scenario.data["timeouts"]["up_s"]
         planned = _plan_commands(plan)
+        netem_bindings = _netem_bindings(plan)
         phases = {
             phase: [command for command in planned if command.phase == phase]
             for phase in (
                 "up.prepare",
                 "up.prepare-persistent",
+                "up.network-create",
                 "up.start-s",
                 "up.start-f",
                 "up.start-c",
+                "up.netem-apply",
+                "up.netem-observe",
             )
         }
         execute(phases["up.prepare"], transport)
         execute(phases["up.prepare-persistent"], transport)
+        create_results = execute(phases["up.network-create"], transport)
         execute(phases["up.start-s"], transport)
         scheduler = _wait_scheduler(
             farm,
@@ -3155,6 +3493,17 @@ def bring_up(
             sleeper=sleeper,
         )
         execute(phases["up.start-f"], transport)
+        apply_results = execute(phases["up.netem-apply"], transport)
+        observe_results = execute(phases["up.netem-observe"], transport)
+        network_receipt = _netem_up_receipt(
+            netem_bindings,
+            create_results,
+            apply_results,
+            observe_results,
+            phases["up.network-create"],
+            phases["up.netem-apply"],
+            phases["up.netem-observe"],
+        )
         workers = _wait_workers(
             farm,
             plan,
@@ -3207,6 +3556,7 @@ def bring_up(
             "environment_readiness": environments,
             "farm": str(farm.path),
             "farm_digest": farm.digest,
+            "network_shaping": network_receipt,
             "plan": plan,
             "run_id": plan["run_id"],
             "scenario": str(scenario.path),
@@ -3225,6 +3575,8 @@ def bring_up(
         prepared_or_started = any(
             command.phase.startswith("up.prepare")
             or command.phase.startswith("up.start-")
+            or command.phase.startswith("up.network-")
+            or command.phase.startswith("up.netem-")
             for command in observed_commands
         )
         preflight_container_possible = any(
@@ -3279,6 +3631,7 @@ def bring_up(
             "diagnostic_errors": diagnostics,
             "error": str(exc) or type(exc).__name__,
             "farm_digest": farm.digest,
+            "network_shaping": network_receipt,
             "plan": plan,
             "run_id": plan["run_id"],
             "scenario_digest": scenario.digest,

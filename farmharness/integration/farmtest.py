@@ -42,6 +42,15 @@ try:
     from .layout import instance_root, oracle_root, runtime_root, toolchain_root
     from .live_lock import LiveRunLockError, live_run_lock
     from .mutant import MUTANT_TRACE_PATH
+    from .netem import (
+        NETEM_PLAN_SCHEMA,
+        NetemBinding,
+        NetemPlanError,
+        apply_args,
+        create_args,
+        observe_args,
+        resolve_bindings,
+    )
     from .lifecycle import (
         LifecycleError,
         PreflightRefusal,
@@ -111,6 +120,15 @@ except ImportError:  # Executed as ./farmtest.py.
     from layout import instance_root, oracle_root, runtime_root, toolchain_root
     from live_lock import LiveRunLockError, live_run_lock
     from mutant import MUTANT_TRACE_PATH
+    from netem import (
+        NETEM_PLAN_SCHEMA,
+        NetemBinding,
+        NetemPlanError,
+        apply_args,
+        create_args,
+        observe_args,
+        resolve_bindings,
+    )
     from lifecycle import (
         LifecycleError,
         PreflightRefusal,
@@ -411,10 +429,12 @@ def _planned_commands(
     topology: dict[str, Any],
     ports: dict[str, Any],
     run_id: str,
+    netem_bindings: tuple[NetemBinding, ...] = (),
 ) -> list[PlannedCommand]:
     commands: list[PlannedCommand] = []
     timeout = scenario.data["timeouts"]["up_s"]
     sequence = 0
+    netem_by_instance = {binding.instance: binding for binding in netem_bindings}
 
     scheduler = next(item for item in topology["instances"] if item["role"] == "S")
     scheduler_port = ports["scheduler"]
@@ -500,6 +520,27 @@ def _planned_commands(
             )
             sequence += 1
 
+    # A shaped worker gets a dedicated bridge on its own Docker host.  The
+    # bridge is labelled before any container starts, so a later teardown can
+    # remove only this run's network object.
+    for binding in netem_bindings:
+        commands.append(
+            PlannedCommand(
+                sequence=sequence,
+                phase="up.network-create",
+                host=binding.host,
+                instance=binding.instance,
+                transport=(
+                    "docker-context"
+                    if farm.hosts[binding.host].get("docker_context")
+                    else "ssh-docker"
+                ),
+                timeout_s=timeout,
+                argv=docker_argv(farm, binding.host, create_args(binding, run_id)),
+            )
+        )
+        sequence += 1
+
     role_order = {"S": 0, "F": 1, "C": 2}
     for instance in sorted(
         topology["instances"], key=lambda item: (role_order[item["role"]], item["name"])
@@ -519,6 +560,12 @@ def _planned_commands(
             "--network",
             "host",
         ]
+        binding = netem_by_instance.get(instance["name"])
+        if binding is not None:
+            # Only this worker leaves host networking.  The scheduler and
+            # clients remain on their normal farm LAN; the published worker
+            # port is the sole cross-namespace ingress.
+            args[args.index("host")] = binding.bridge
         environment = {
             **instance["env"],
             "ICECC_NETNAME": netname,
@@ -567,6 +614,15 @@ def _planned_commands(
             )
         if instance["role"] == "F":
             args.extend(("--user", "0", "--cap-add", "SYS_CHROOT"))
+            if binding is not None:
+                args.extend(
+                    (
+                        "--cap-add",
+                        "NET_ADMIN",
+                        "--publish",
+                        f"{binding.host_port}:{binding.container_port}",
+                    )
+                )
         elif instance["role"] == "C":
             args.extend(("--user", "0"))
         for source, target in (
@@ -693,6 +749,31 @@ def _planned_commands(
             )
         )
         sequence += 1
+
+    # These commands are part of the immutable plan and are executed before
+    # worker readiness.  ``tc`` is always reached through docker exec, never
+    # as a host command or an SSH shell command.
+    for binding in netem_bindings:
+        for phase, argv in (
+            ("up.netem-apply", apply_args(binding)),
+            ("up.netem-observe", observe_args(binding)),
+        ):
+            commands.append(
+                PlannedCommand(
+                    sequence=sequence,
+                    phase=phase,
+                    host=binding.host,
+                    instance=binding.instance,
+                    transport=(
+                        "docker-context"
+                        if farm.hosts[binding.host].get("docker_context")
+                        else "ssh-docker"
+                    ),
+                    timeout_s=timeout,
+                    argv=docker_argv(farm, binding.host, argv),
+                )
+            )
+            sequence += 1
     return commands
 
 
@@ -704,13 +785,25 @@ def build_plan(
     selected_run_id = run_id or f"plan-{topology['topology_digest'][:12]}"
     if RUN_ID_RE.fullmatch(selected_run_id) is None or selected_run_id in (".", ".."):
         raise PlanError("run id must be 1-80 safe, non-dot filename/label characters")
-    commands = _planned_commands(farm, scenario, topology, ports, selected_run_id)
+    try:
+        netem_bindings = resolve_bindings(
+            farm, scenario.data, topology, ports, selected_run_id
+        )
+    except NetemPlanError as exc:
+        raise PlanError(str(exc)) from exc
+    commands = _planned_commands(
+        farm, scenario, topology, ports, selected_run_id, netem_bindings
+    )
     return {
         "commands": [command.as_dict() for command in commands],
         "farm": str(farm.path),
         "farm_digest": farm.digest,
         "icefarm_env": _resolver_environment(farm, scenario),
         "ports": ports,
+        "network_shaping": {
+            "bindings": [binding.as_dict() for binding in netem_bindings],
+            "schema": NETEM_PLAN_SCHEMA,
+        },
         "run_id": selected_run_id,
         "scenario": str(scenario.path),
         "schema": PLAN_SCHEMA,

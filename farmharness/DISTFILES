@@ -38,6 +38,7 @@ farmharness/integration/mutants/daemon-session-refuse.patch
 farmharness/integration/mutants/daemon-hidden-wire-skew.patch
 farmharness/integration/mutants/daemon-wire-revision-2.patch
 farmharness/integration/mutants/scheduler-tail.patch
+farmharness/integration/netem.py
 farmharness/integration/performance.py
 farmharness/integration/remote.py
 farmharness/integration/report.py
@@ -136,6 +137,7 @@ farmharness/integration/tests/test_lifecycle.py
 farmharness/integration/tests/test_live_lock.py
 farmharness/integration/tests/test_make_surface.py
 farmharness/integration/tests/test_mutant.py
+farmharness/integration/tests/test_netem.py
 farmharness/integration/tests/test_orchestration.py
 farmharness/integration/tests/test_performance.py
 farmharness/integration/tests/test_resolver_v2.py
