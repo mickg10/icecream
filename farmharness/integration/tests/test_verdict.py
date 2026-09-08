@@ -307,6 +307,235 @@ def test_active_loss_verdict_rejects_reused_compiler_identity() -> None:
         assert _scheduler_active_loss_receipt_errors(tampered, event, scenario)
 
 
+def _active_loss_v2_fixture():
+    route = {
+        "container": {
+            "container_id": "c" * 64,
+            "running": True,
+            "started_at": "client-start",
+        },
+        "daemon": {
+            "argv": ["/opt/icecream/sbin/iceccd"],
+            "exe": "/opt/icecream/sbin/iceccd",
+            "exe_evidence": "proc-exe",
+            "pid": 20,
+            "ppid": 1,
+            "start_ticks": 5,
+            "uid": 0,
+        },
+        "route_owner": {
+            "argv": ["/opt/icecream/sbin/icecc-cache-service"],
+            "exe": "/opt/icecream/sbin/icecc-cache-service",
+            "exe_evidence": "proc-exe",
+            "pid": 21,
+            "ppid": 20,
+            "start_ticks": 6,
+            "uid": 0,
+        },
+    }
+    route_pair = {"after": route, "before": route}
+    readiness = {
+        "bytes": 200,
+        "cache_expected": True,
+        "cache_fresh": True,
+        "cache_lifecycle": 3,
+        "cache_line": "cache sidecar adapter state=2 lifecycle=3",
+        "cache_line_offset": 100,
+        "cache_state": 2,
+        "connected_line": "Connected to scheduler (I am known as C1)",
+        "connected_line_offset": 10,
+        "host": "tt-quietbox2",
+        "log_path": "/farm/icefarm/run/C1/log/client-daemon.log",
+        "offset": 0,
+        "post_sha256": "f" * 64,
+        "route": route_pair,
+        "schema": "icefarm-client-scheduler-readiness-v2",
+    }
+    closure = "d" * 64
+    image_id = "e" * 64
+    runtime_path = f"/farm/icefarm/runtimes/{closure}/root"
+    worker_identity = {
+        "container_id": "b" * 64,
+        "env": {"ICECC_WEB_HOSTPORT": "127.0.0.1:23004"},
+        "image_id": image_id,
+        "running": True,
+        "runtime_path": runtime_path,
+        "started_at": "worker-start",
+    }
+    scenario = {
+        "images": {"new": "p50s4-current"},
+        "instances": [
+            {
+                "env": {"ICECC_P50_MODE": "on"},
+                "host": "tt-quietbox2",
+                "image": "new",
+                "name": "C1",
+                "role": "C",
+            }
+        ],
+        "timeline": [
+            {
+                "action": "scheduler-loss-active",
+                "instance": "S1",
+                "trigger": "job 2",
+            }
+        ],
+        "workload": {"clients": ["C1"], "turns": ["A"]},
+    }
+    event = {
+        "action": "scheduler-loss-active",
+        "event_epoch": 1,
+        "instance": "S1",
+        "last_dispatched_job": 2,
+    }
+    plan = {
+        "ports": {"web": {"F1": 23004}},
+        "topology": {
+            "instances": [
+                {
+                    "env": {},
+                    "host": "tt-quietbox3",
+                    "image": {"closure_sha256": closure},
+                    "name": "F1",
+                    "role": "F",
+                }
+            ]
+        },
+    }
+    farm = {
+        "hosts": [{"name": "tt-quietbox3", "scratch_root": "/farm"}],
+        "runtime_image": {"id": f"sha256:{image_id}"},
+    }
+    receipt = {
+        "action": "scheduler-loss-active",
+        "after": {"container_id": "a" * 64, "started_at": "new"},
+        "before": {"container_id": "a" * 64, "started_at": "old"},
+        "compiler": {
+            "assignment": {
+                "child": {
+                    "generation": 1,
+                    "kind": 0,
+                    "owning_client_id": 7,
+                    "pgid": 41,
+                    "pid": 41,
+                },
+                "client": {
+                    "client_id": 7,
+                    "job_id": 2,
+                    "scheduler_job_id": 2,
+                },
+                "listener": {"host": "127.0.0.1", "port": 23004},
+                "schema": "icefarm-compiler-assignment-v1",
+            },
+            "container_id": "b" * 64,
+            "daemon": {
+                "argv": ["/opt/icecream/sbin/iceccd"],
+                "exe": "/opt/icecream/sbin/iceccd",
+                "pgid": 10,
+                "pid": 10,
+                "ppid": 1,
+                "start_ticks": 3,
+                "state": "S",
+            },
+            "group_gone": {
+                "gone": True,
+                "leader": None,
+                "members": [],
+                "schema": "icefarm-compiler-group-gone-v1",
+            },
+            "leader": {
+                "argv": ["/opt/icecream/sbin/iceccd"],
+                "exe": "/opt/icecream/sbin/iceccd",
+                "pgid": 41,
+                "pid": 41,
+                "ppid": 10,
+                "start_ticks": 9,
+                "state": "R",
+            },
+            "listener": {
+                "daemon_pid": 10,
+                "daemon_start_ticks": 3,
+                "host": "127.0.0.1",
+                "port": 23004,
+                "socket_inode": "12345",
+            },
+            "stopped": {
+                "argv": ["/opt/icecream/sbin/iceccd"],
+                "exe": "/opt/icecream/sbin/iceccd",
+                "pgid": 41,
+                "pid": 41,
+                "ppid": 10,
+                "start_ticks": 9,
+                "state": "T",
+            },
+            "worker_after": worker_identity,
+            "worker_before": worker_identity,
+        },
+        "event_epoch": 1,
+        "instance": "S1",
+        "lost_scheduler_generation": 1,
+        "lost_scheduler_job": 2,
+        "pre_fault": {"scheduler_log": {}, "worker_log": {}},
+        "quiescence": {
+            "client_readiness": {
+                "C1": {"ready": True, "witness": readiness}
+            },
+            "client_routes": {"C1": route_pair},
+            "scheduler_snapshot": "S1",
+            "scheduler_startup": {"line": "ICECREAM scheduler starting"},
+            "worker_snapshot": "F1",
+        },
+        "schema": "icefarm-scheduler-active-loss-v2",
+        "turn": "A",
+    }
+    return receipt, event, scenario, plan, farm
+
+
+def test_active_loss_v2_binds_listener_worker_authority_and_readiness() -> None:
+    receipt, event, scenario, plan, farm = _active_loss_v2_fixture()
+    kwargs = {"readiness_v2": True, "plan": plan, "farm": farm}
+    assert not _scheduler_active_loss_receipt_errors(
+        receipt, event, scenario, **kwargs
+    )
+    paths = (
+        ("compiler", "listener", "socket_inode"),
+        ("compiler", "listener", "daemon_start_ticks"),
+        ("compiler", "daemon", "start_ticks"),
+        ("compiler", "stopped", "exe"),
+        ("compiler", "worker_before", "container_id"),
+        ("compiler", "worker_before", "runtime_path"),
+        ("compiler", "worker_before", "image_id"),
+        ("compiler", "worker_before", "env", "ICECC_WEB_HOSTPORT"),
+        ("quiescence", "client_readiness", "C1", "ready"),
+    )
+    for path in paths:
+        tampered = copy.deepcopy(receipt)
+        cursor = tampered
+        for key in path[:-1]:
+            cursor = cursor[key]
+        cursor[path[-1]] = False if path[-1] == "ready" else "tampered"
+        assert _scheduler_active_loss_receipt_errors(
+            tampered, event, scenario, **kwargs
+        ), path
+
+    tampered = copy.deepcopy(receipt)
+    tampered["compiler"]["group_gone"]["members"] = [41]
+    assert _scheduler_active_loss_receipt_errors(
+        tampered, event, scenario, **kwargs
+    )
+
+    tampered_plan = copy.deepcopy(plan)
+    tampered_plan["ports"]["web"]["F1"] += 1
+    assert _scheduler_active_loss_receipt_errors(
+        receipt,
+        event,
+        scenario,
+        readiness_v2=True,
+        plan=tampered_plan,
+        farm=farm,
+    )
+
+
 def _client_transition_event() -> tuple[dict[str, object], dict[str, object]]:
     scenario = _scenario("S'CF", client_versions=(50,), worker_versions=(43,))
     scenario["timeline"] = [

@@ -387,21 +387,42 @@ def _container_name(run_id: str, instance: str) -> str:
     return f"icefarm-{run_id}-{instance}"
 
 
-def _allocated_ports(farm: FarmSpec, topology: dict[str, Any]) -> dict[str, Any]:
+def _allocated_ports(
+    farm: FarmSpec,
+    topology: dict[str, Any],
+    scenario: ScenarioSpec,
+) -> dict[str, Any]:
     start, end = farm.data["port_range"]
     peers = sorted(
         item["name"] for item in topology["instances"] if item["role"] != "S"
     )
-    last = start + 1 + len(peers)
+    web_workers = (
+        sorted(
+            item["name"]
+            for item in topology["instances"]
+            if item["role"] == "F"
+        )
+        if scenario.data.get("id") == "S70-b4-scheduler-active-loss"
+        else []
+    )
+    last = start + 1 + len(peers) + len(web_workers)
     if last > end:
         raise PlanError(
-            f"port_range needs {2 + len(peers)} ports for scheduler/control and instances"
+            "port_range needs "
+            f"{2 + len(peers) + len(web_workers)} ports for scheduler/control, "
+            "instances, and active-loss worker listeners"
         )
-    return {
+    ports = {
         "instances": {name: start + 2 + index for index, name in enumerate(peers)},
         "scheduler": start,
         "scheduler_control": start + 1,
     }
+    if web_workers:
+        ports["web"] = {
+            name: start + 2 + len(peers) + index
+            for index, name in enumerate(web_workers)
+        }
+    return ports
 
 
 def _env_args(environment: dict[str, str]) -> list[str]:
@@ -658,6 +679,16 @@ def _planned_commands(
             "TMP": CONTAINER_TEMP_ROOT,
             "TMPDIR": CONTAINER_TEMP_ROOT,
         }
+        if (
+            scenario.data.get("id") == "S70-b4-scheduler-active-loss"
+            and instance["role"] == "F"
+        ):
+            web_port = ports.get("web", {}).get(instance["name"])
+            if type(web_port) is not int:
+                raise PlanError(
+                    f"active-loss worker {instance['name']!r} has no allocated web port"
+                )
+            environment["ICECC_WEB_HOSTPORT"] = f"127.0.0.1:{web_port}"
         if "H3" in scenario.data["controls"] and instance["role"] == "S":
             environment.update(
                 {
@@ -861,7 +892,7 @@ def build_plan(
     farm: FarmSpec, scenario: ScenarioSpec, *, run_id: str | None = None
 ) -> dict[str, Any]:
     topology = resolve_topology(farm, scenario)
-    ports = _allocated_ports(farm, topology)
+    ports = _allocated_ports(farm, topology, scenario)
     selected_run_id = run_id or f"plan-{topology['topology_digest'][:12]}"
     if RUN_ID_RE.fullmatch(selected_run_id) is None or selected_run_id in (".", ".."):
         raise PlanError("run id must be 1-80 safe, non-dot filename/label characters")

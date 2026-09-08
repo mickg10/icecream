@@ -82,6 +82,8 @@ TERMINAL_KINDS = frozenset(
 )
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 CLIENT_SCHEDULER_READINESS_SCHEMA = "icefarm-client-scheduler-readiness-v2"
+SCHEDULER_ACTIVE_LOSS_SCHEMA_V1 = "icefarm-scheduler-active-loss-v1"
+SCHEDULER_ACTIVE_LOSS_SCHEMA = "icefarm-scheduler-active-loss-v2"
 CLIENT_SCHEDULER_READINESS_FIELDS = frozenset(
     {
         "bytes",
@@ -1632,11 +1634,51 @@ def _scheduler_active_loss_receipt_errors(
     scenario: Mapping[str, Any],
     *,
     readiness_v2: bool = False,
+    plan: Mapping[str, Any] | None = None,
+    farm: Mapping[str, Any] | None = None,
 ) -> set[str]:
     marker = "@event:scheduler-active-loss"
     required = {"action", "after", "before", "compiler", "event_epoch", "instance", "lost_scheduler_generation", "lost_scheduler_job", "pre_fault", "quiescence", "schema", "turn"}
-    if not isinstance(receipt, Mapping) or set(receipt) != required or receipt.get("schema") != "icefarm-scheduler-active-loss-v1":
+    if (
+        not isinstance(receipt, Mapping)
+        or set(receipt) != required
+        or receipt.get("schema")
+        not in {SCHEDULER_ACTIVE_LOSS_SCHEMA_V1, SCHEDULER_ACTIVE_LOSS_SCHEMA}
+    ):
         return {marker}
+    strict = receipt.get("schema") == SCHEDULER_ACTIVE_LOSS_SCHEMA
+    plan_instances = (
+        plan.get("topology", {}).get("instances")
+        if isinstance(plan, Mapping)
+        else None
+    )
+    worker = next(
+        (
+            item
+            for item in plan_instances
+            if isinstance(item, Mapping) and item.get("role") == "F"
+        ),
+        None,
+    ) if isinstance(plan_instances, list) else None
+    web_ports = plan.get("ports", {}).get("web") if isinstance(plan, Mapping) else None
+    planned_web_port = (
+        web_ports.get(worker.get("name"))
+        if isinstance(web_ports, Mapping) and isinstance(worker, Mapping)
+        else None
+    )
+    if strict:
+        if (
+            not isinstance(worker, Mapping)
+            or type(planned_web_port) is not int
+            or not (1 <= planned_web_port <= 65535)
+            or not isinstance(farm, Mapping)
+        ):
+            return {marker}
+        expected_web_port = planned_web_port
+    else:
+        if planned_web_port is not None:
+            return {marker}
+        expected_web_port = 8765
     compiler = receipt.get("compiler")
     assignment = compiler.get("assignment") if isinstance(compiler, Mapping) else None
     parent = compiler.get("daemon") if isinstance(compiler, Mapping) else None
@@ -1658,6 +1700,8 @@ def _scheduler_active_loss_receipt_errors(
         and isinstance(client_routes, Mapping)
         and set(client_routes) == set(client_names)
     )
+    if strict and not readiness_v2:
+        client_evidence_valid = False
     if client_evidence_valid and readiness_v2:
         instances = scenario.get("instances")
         if not isinstance(instances, list):
@@ -1686,7 +1730,19 @@ def _scheduler_active_loss_receipt_errors(
                     if isinstance(client, Mapping)
                     else None
                 )
-                witness = client_readiness[name]
+                readiness = client_readiness[name]
+                if strict:
+                    if (
+                        not isinstance(readiness, Mapping)
+                        or set(readiness) != {"ready", "witness"}
+                        or readiness.get("ready") is not True
+                        or not isinstance(readiness.get("witness"), Mapping)
+                    ):
+                        client_evidence_valid = False
+                        break
+                    witness = readiness["witness"]
+                else:
+                    witness = readiness
                 pair = client_routes[name]
                 if (
                     not isinstance(client, Mapping)
@@ -1728,11 +1784,161 @@ def _scheduler_active_loss_receipt_errors(
             and _valid_client_route_state(pair.get("before"))
             for pair in client_routes.values()
         )
+    compiler_fields = {
+        "assignment",
+        "container_id",
+        "daemon",
+        "group_gone",
+        "leader",
+        "stopped",
+        "worker_before",
+        "worker_after",
+    }
+    if strict:
+        compiler_fields.add("listener")
+    worker_fields = (
+        {
+            "container_id",
+            "env",
+            "image_id",
+            "running",
+            "runtime_path",
+            "started_at",
+        }
+        if strict
+        else {"container_id", "started_at"}
+    )
+    listener = compiler.get("listener") if isinstance(compiler, Mapping) else None
+    process_fields = {
+        "argv",
+        "exe",
+        "pgid",
+        "pid",
+        "ppid",
+        "start_ticks",
+        "state",
+    }
+
+    def valid_process(value: Any) -> bool:
+        return (
+            isinstance(value, Mapping)
+            and set(value) == process_fields
+            and isinstance(value.get("argv"), list)
+            and all(isinstance(item, str) for item in value["argv"])
+            and isinstance(value.get("exe"), str)
+            and value["exe"].startswith("/")
+            and all(
+                _is_int(value.get(field), minimum=minimum)
+                for field, minimum in (
+                    ("pgid", 1),
+                    ("pid", 1),
+                    ("ppid", 0),
+                    ("start_ticks", 1),
+                )
+            )
+            and isinstance(value.get("state"), str)
+            and len(value["state"]) == 1
+        )
+
+    group_gone = compiler.get("group_gone") if isinstance(compiler, Mapping) else None
+    strict_process_valid = (
+        not strict
+        or (
+            valid_process(parent)
+            and valid_process(leader)
+            and valid_process(stopped)
+            and all(
+                leader.get(field) == stopped.get(field)
+                for field in process_fields - {"state"}
+            )
+            and leader.get("state") not in {"T", "t", "Z", "X"}
+            and stopped.get("state") in {"T", "t"}
+            and isinstance(group_gone, Mapping)
+            and set(group_gone) == {"gone", "leader", "members", "schema"}
+            and group_gone.get("schema") == "icefarm-compiler-group-gone-v1"
+            and group_gone.get("gone") is True
+            and group_gone.get("leader") is None
+            and group_gone.get("members") == []
+        )
+    )
+    listener_valid = not strict
+    worker_authority_valid = not strict
+    if strict and isinstance(worker, Mapping) and isinstance(farm, Mapping):
+        hosts = farm.get("hosts")
+        host = next(
+            (
+                item
+                for item in hosts
+                if isinstance(item, Mapping)
+                and item.get("name") == worker.get("host")
+            ),
+            None,
+        ) if isinstance(hosts, list) else None
+        runtime_image = farm.get("runtime_image")
+        worker_env = worker.get("env")
+        worker_image = worker.get("image")
+        worker_before = (
+            compiler.get("worker_before")
+            if isinstance(compiler, Mapping)
+            else None
+        )
+        expected_runtime = (
+            f"{str(host['scratch_root']).rstrip('/')}/icefarm/runtimes/"
+            f"{worker_image.get('closure_sha256')}/root"
+            if isinstance(host, Mapping)
+            and isinstance(host.get("scratch_root"), str)
+            and isinstance(worker_image, Mapping)
+            and isinstance(worker_image.get("closure_sha256"), str)
+            else None
+        )
+        expected_image_id = (
+            runtime_image.get("id", "").removeprefix("sha256:")
+            if isinstance(runtime_image, Mapping)
+            and isinstance(runtime_image.get("id"), str)
+            else None
+        )
+        expected_env = (
+            {
+                **worker_env,
+                "ICECC_WEB_HOSTPORT": f"127.0.0.1:{expected_web_port}",
+            }
+            if isinstance(worker_env, Mapping)
+            else None
+        )
+        listener_valid = (
+            isinstance(listener, Mapping)
+            and isinstance(parent, Mapping)
+            and set(listener)
+            == {
+                "daemon_pid",
+                "daemon_start_ticks",
+                "host",
+                "port",
+                "socket_inode",
+            }
+            and listener.get("daemon_pid") == parent.get("pid")
+            and listener.get("daemon_start_ticks") == parent.get("start_ticks")
+            and listener.get("host") == "127.0.0.1"
+            and listener.get("port") == expected_web_port
+            and isinstance(listener.get("socket_inode"), str)
+            and re.fullmatch(r"[1-9][0-9]*", listener["socket_inode"])
+            is not None
+        )
+        worker_authority_valid = (
+            isinstance(worker_before, Mapping)
+            and worker_before.get("running") is True
+            and worker_before.get("image_id") == expected_image_id
+            and worker_before.get("runtime_path") == expected_runtime
+            and expected_env is not None
+            and worker_before.get("env") == expected_env
+        )
     if (receipt.get("action") != event.get("action")
             or receipt.get("instance") != event.get("instance")
             or not _is_int(receipt.get("lost_scheduler_generation"), minimum=1)
             or not _is_int(receipt.get("lost_scheduler_job"), minimum=1)
             or receipt.get("lost_scheduler_job") != event.get("last_dispatched_job")
+            or not isinstance(compiler, Mapping)
+            or (strict and set(compiler) != compiler_fields)
             or not isinstance(leader, Mapping) or not isinstance(stopped, Mapping)
             or not isinstance(parent, Mapping)
             or parent.get("pid") == leader.get("pid")
@@ -1743,13 +1949,27 @@ def _scheduler_active_loss_receipt_errors(
             or leader.get("pid") != stopped.get("pid")
             or leader.get("start_ticks") != stopped.get("start_ticks")
             or compiler.get("group_gone", {}).get("gone") is not True
+            or not strict_process_valid
             or not isinstance(compiler.get("worker_before"), Mapping)
             or not isinstance(compiler.get("worker_after"), Mapping)
-            or set(compiler["worker_before"]) != {"container_id", "started_at"}
-            or set(compiler["worker_after"]) != {"container_id", "started_at"}
+            or set(compiler["worker_before"]) != worker_fields
+            or set(compiler["worker_after"]) != worker_fields
             or compiler["worker_before"] != compiler["worker_after"]
             or not isinstance(compiler["worker_before"].get("container_id"), str)
             or re.fullmatch(r"[0-9a-f]{64}", compiler["worker_before"]["container_id"]) is None
+            or (
+                strict
+                and (
+                    compiler.get("container_id")
+                    != compiler["worker_before"]["container_id"]
+                    or not isinstance(
+                        compiler["worker_before"].get("started_at"), str
+                    )
+                    or not compiler["worker_before"]["started_at"]
+                    or not listener_valid
+                    or not worker_authority_valid
+                )
+            )
             or not isinstance(assignment, Mapping)
             or set(assignment) != {"child", "client", "listener", "schema"}
             or assignment.get("schema") != "icefarm-compiler-assignment-v1"
@@ -1764,7 +1984,8 @@ def _scheduler_active_loss_receipt_errors(
             or set(assignment.get("client", {})) != {"client_id", "job_id", "scheduler_job_id"}
             or not all(_is_int(assignment.get("child", {}).get(key), minimum=1) for key in ("generation", "owning_client_id", "pgid", "pid"))
             or not all(_is_int(assignment.get("client", {}).get(key), minimum=1) for key in ("client_id", "job_id", "scheduler_job_id"))
-            or assignment.get("listener") != {"host": "127.0.0.1", "port": 8765}
+            or assignment.get("listener")
+            != {"host": "127.0.0.1", "port": expected_web_port}
             or not isinstance(quiescence, Mapping)
             or set(quiescence) != {"client_readiness", "client_routes", "scheduler_snapshot", "scheduler_startup", "worker_snapshot"}
             or not isinstance(quiescence.get("scheduler_startup"), Mapping)
@@ -4801,7 +5022,15 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
         else:
             receipt = observed.get("receipt")
             if (_scheduler_active_loss_receipt_errors(
-                    receipt, observed, scenario, readiness_v2=readiness_v2)
+                    receipt,
+                    observed,
+                    scenario,
+                    readiness_v2=readiness_v2,
+                    plan=plan if isinstance(plan, Mapping) else None,
+                    farm=bundle.get("farm")
+                    if isinstance(bundle.get("farm"), Mapping)
+                    else None,
+                )
                     or not isinstance(receipt, Mapping)
                     or not isinstance(receipt.get("before"), Mapping)
                     or not isinstance(receipt.get("after"), Mapping)

@@ -14,7 +14,12 @@ import pytest
 from farmharness.integration.tests import farm_fixture
 
 from farmharness.integration import farmtest
-from farmharness.integration.collect import CollectError, _event_log, _stage_evidence
+from farmharness.integration.collect import (
+    CollectError,
+    _event_log,
+    _stage_evidence,
+    _validate_scheduler_active_loss_receipt,
+)
 from farmharness.integration.events import (
     CACHE_DISK_FAULT_BYTES,
     CACHE_DISK_FAULT_FILE,
@@ -42,7 +47,7 @@ from farmharness.integration.farm_spec import load_farm_spec
 from farmharness.integration.images import RecordingTransport
 from farmharness.integration.images import _image_identity
 from farmharness.integration.lifecycle import _expected_image_labels
-from farmharness.integration.layout import runtime_root
+from farmharness.integration.layout import instance_root, runtime_root
 from farmharness.integration.remote import (
     CommandResult,
     PlannedCommand,
@@ -345,6 +350,11 @@ def test_active_scheduler_loss_scripts_are_exact_identity_bound() -> None:
     assert "len(candidates) != 1" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "p[\"pid\"] == p[\"pgid\"]" in ACTIVE_COMPILER_STOP_SCRIPT
     assert '"--generation" not in p["argv"]' in ACTIVE_COMPILER_STOP_SCRIPT
+    assert "socket.create_connection" in ACTIVE_COMPILER_STOP_SCRIPT
+    assert "while True:" in ACTIVE_COMPILER_STOP_SCRIPT
+    assert "size > 4 * 1024 * 1024" in ACTIVE_COMPILER_STOP_SCRIPT
+    assert 'fields[1] == wanted and fields[3] == "0A"' in ACTIVE_COMPILER_STOP_SCRIPT
+    assert 'owned.add(target[8:-1])' in ACTIVE_COMPILER_STOP_SCRIPT
     parent = {"pid": 10, "ppid": 1, "pgid": 10, "exe": "/opt/icecream/sbin/iceccd", "state": "S", "argv": []}
     compiler = {"pid": 11, "ppid": 10, "pgid": 11, "exe": "/opt/icecream/sbin/iceccd", "state": "R", "argv": []}
     other = compiler | {"pid": 12, "pgid": 12, "exe": "/usr/bin/other"}
@@ -405,7 +415,8 @@ def test_assignment_script_executes_multi_child_http_join() -> None:
         server.shutdown()
         thread.join(timeout=5)
         server.server_close()
-    assert "before[\"start_ticks\"]" in ACTIVE_COMPILER_STOP_SCRIPT
+    assert "same_identity(stopped, before)" in ACTIVE_COMPILER_STOP_SCRIPT
+    assert "stop_deadline = time.monotonic() + 2" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "os.killpg(before[\"pgid\"], signal.SIGSTOP)" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "compiler PID was reused" in ACTIVE_COMPILER_WAIT_SCRIPT
     assert "value[0] == pgid" in ACTIVE_COMPILER_WAIT_SCRIPT
@@ -436,6 +447,18 @@ def test_active_scheduler_loss_scenario_is_not_the_drained_restart(tmp_path: Pat
     producer = EventProducer(farm, scenario, plan, recorder=RecordingTransport(EventRecorder()))
     assert producer.events[0].action == "scheduler-loss-active"
     assert producer.events[0].trigger.kind == "job"
+    web_port = plan["ports"]["web"]["F1"]
+    assert web_port not in {
+        plan["ports"]["scheduler"],
+        plan["ports"]["scheduler_control"],
+        *plan["ports"]["instances"].values(),
+    }
+    start = next(
+        command for command in farmtest.fake_up(plan)
+        if command["phase"] == "up.start-f"
+    )
+    assert f"ICECC_WEB_HOSTPORT=127.0.0.1:{web_port}" in start["argv"]
+    assert all("ICECC_WEB_HOSTPORT" not in item.get("env", {}) for item in scenario.data["instances"])
 
 
 def test_active_scheduler_loss_collection_binds_post_offset_product_witness(
@@ -450,6 +473,7 @@ def test_active_scheduler_loss_collection_binds_post_offset_product_witness(
     # This fixture exercises retained pre-v2 active-loss evidence.  Current
     # plans use the stronger incarnation-bound readiness receipt below.
     plan.pop("client_scheduler_readiness_contract")
+    plan["ports"].pop("web")
     log = tmp_path / "diagnostics" / "tt-quietbox3" / "F1.log" / "iceccd.log"
     log.parent.mkdir(parents=True)
     log.write_text(
@@ -508,6 +532,121 @@ def test_active_scheduler_loss_collection_binds_post_offset_product_witness(
             plan,
             recorder=RecordingTransport(EventRecorder()),
             deadline_s=1,
+        )
+
+
+def test_active_scheduler_loss_v2_collector_recomputes_bound_evidence(
+    tmp_path: Path,
+) -> None:
+    from farmharness.integration.tests.test_verdict import _active_loss_v2_fixture
+
+    receipt, event, _scenario_data, _plan_data, _farm_data = (
+        _active_loss_v2_fixture()
+    )
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / "S70-b4-scheduler-active-loss.json", farm
+    )
+    plan = farmtest.build_plan(farm, scenario, run_id="active-loss-v2-collect")
+    worker = next(
+        item for item in plan["topology"]["instances"] if item["role"] == "F"
+    )
+    client = next(
+        item for item in plan["topology"]["instances"] if item["role"] == "C"
+    )
+    web_port = plan["ports"]["web"][worker["name"]]
+    worker_identity = {
+        "container_id": "b" * 64,
+        "env": {"ICECC_WEB_HOSTPORT": f"127.0.0.1:{web_port}"},
+        "image_id": farm.data["runtime_image"]["id"].removeprefix("sha256:"),
+        "running": True,
+        "runtime_path": str(runtime_root(farm, worker)),
+        "started_at": "worker-start",
+    }
+    receipt["compiler"]["worker_before"] = worker_identity
+    receipt["compiler"]["worker_after"] = worker_identity
+    receipt["compiler"]["stopped"]["state"] = "T"
+    receipt["compiler"]["assignment"]["listener"]["port"] = web_port
+    receipt["compiler"]["listener"]["port"] = web_port
+
+    connected = "Connected to scheduler (I am known as C1)"
+    cache = "cache sidecar adapter state=2 lifecycle=3"
+    payload = f"{connected}\n{cache}\n".encode()
+    witness = receipt["quiescence"]["client_readiness"]["C1"]["witness"]
+    witness.update(
+        {
+            "bytes": len(payload),
+            "cache_line": cache,
+            "cache_line_offset": len(f"{connected}\n".encode()),
+            "connected_line": connected,
+            "connected_line_offset": 0,
+            "host": client["host"],
+            "log_path": str(
+                instance_root(farm, client["host"], plan["run_id"], client["name"])
+                / "log"
+                / "client-daemon.log"
+            ),
+            "post_sha256": hashlib.sha256(payload).hexdigest(),
+        }
+    )
+    client_log = (
+        tmp_path
+        / "diagnostics"
+        / client["host"]
+        / f"{client['name']}.log"
+        / "client-daemon.log"
+    )
+    client_log.parent.mkdir(parents=True)
+    client_log.write_bytes(payload)
+    worker_log = (
+        tmp_path
+        / "diagnostics"
+        / worker["host"]
+        / f"{worker['name']}.log"
+        / "iceccd.log"
+    )
+    worker_log.parent.mkdir(parents=True)
+    worker_log.write_text(
+        "session quiescence TERM compiler pid=41 pgid=41 generation=7\n"
+        "session quiescence KILL compiler pid=41 pgid=41 generation=7\n"
+        "session quiescence settled compiler pid=41 pgid=41 generation=7\n"
+    )
+    receipt["pre_fault"]["worker_log"] = {"offset": 0}
+
+    _validate_scheduler_active_loss_receipt(
+        receipt,
+        event,
+        scenario,
+        0,
+        farm=farm,
+        plan=plan,
+        evidence=tmp_path,
+    )
+
+    tampered = json.loads(json.dumps(receipt))
+    tampered["compiler"]["listener"]["socket_inode"] = "0"
+    with pytest.raises(CollectError, match="listener/runtime authority"):
+        _validate_scheduler_active_loss_receipt(
+            tampered,
+            event,
+            scenario,
+            0,
+            farm=farm,
+            plan=plan,
+            evidence=tmp_path,
+        )
+
+    tampered = json.loads(json.dumps(receipt))
+    tampered["quiescence"]["client_readiness"]["C1"]["ready"] = False
+    with pytest.raises(CollectError, match="fresh scheduler/F/C rejoin"):
+        _validate_scheduler_active_loss_receipt(
+            tampered,
+            event,
+            scenario,
+            0,
+            farm=farm,
+            plan=plan,
+            evidence=tmp_path,
         )
 
 

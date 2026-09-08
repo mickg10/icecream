@@ -164,7 +164,7 @@ print(json.dumps({
 '''.strip()
 GATE_SCHEMA = "icefarm-event-gate-v1"
 SCHEDULER_RESTART_SCHEMA = "icefarm-scheduler-restart-v1"
-SCHEDULER_ACTIVE_LOSS_SCHEMA = "icefarm-scheduler-active-loss-v1"
+SCHEDULER_ACTIVE_LOSS_SCHEMA = "icefarm-scheduler-active-loss-v2"
 CLIENT_ROUTE_RESTART_SCHEMA = "icefarm-client-route-restart-v1"
 WORKER_RESTART_SCHEMA = "icefarm-worker-restart-v1"
 CLIENT_ROUTE_SIGNAL_SCHEMA = "icefarm-client-route-signal-v1"
@@ -177,7 +177,7 @@ CACHE_DISK_FAULT_BYTES = 128 * 1024 * 1024
 CACHE_DISK_FAULT_MIN_HEADROOM_BYTES = 8 * 1024 * 1024
 DISK_FILL_WATCHDOG_S = 30
 ACTIVE_COMPILER_STOP_SCRIPT = r'''
-import json, os, pathlib, signal, sys, time
+import json, os, pathlib, signal, socket, sys, time
 
 def snap(pid):
     root = pathlib.Path("/proc") / str(pid)
@@ -199,7 +199,55 @@ def processes():
             pass
     return result
 
+def same_identity(left, right):
+    return all(left.get(key) == right.get(key) for key in
+               ("pid", "ppid", "pgid", "start_ticks", "exe", "argv"))
+
+def listener_probe(port, daemon):
+    request = b"GET /api/internals HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    chunks = []
+    size = 0
+    with socket.create_connection(("127.0.0.1", port), timeout=2) as connection:
+        connection.settimeout(2)
+        connection.sendall(request)
+        while True:
+            chunk = connection.recv(65536)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > 4 * 1024 * 1024:
+                raise RuntimeError("web listener response exceeds bound")
+            chunks.append(chunk)
+    response = b"".join(chunks)
+    head, separator, body = response.partition(b"\r\n\r\n")
+    first = head.split(b"\r\n", 1)[0]
+    if not separator or not first.startswith(b"HTTP/1.") or b" 200 " not in first:
+        raise RuntimeError("web listener did not return a complete HTTP 200 response")
+    if b"Child:" not in body:
+        raise RuntimeError("web listener returned no compiler-child witness")
+    wanted = "0100007F:" + format(port, "04X")
+    inodes = set()
+    for line in pathlib.Path("/proc/net/tcp").read_text(encoding="ascii").splitlines()[1:]:
+        fields = line.split()
+        if len(fields) >= 10 and fields[1] == wanted and fields[3] == "0A":
+            inodes.add(fields[9])
+    owned = set()
+    for fd in (pathlib.Path("/proc") / str(daemon["pid"]) / "fd").iterdir():
+        try:
+            target = os.readlink(fd)
+        except (FileNotFoundError, PermissionError, OSError):
+            continue
+        if target.startswith("socket:[") and target.endswith("]"):
+            owned.add(target[8:-1])
+    matches = sorted(inodes & owned)
+    if len(matches) != 1 or not matches[0].isdigit() or int(matches[0]) <= 0:
+        raise RuntimeError("web listener is not uniquely owned by the authenticated daemon")
+    return {"daemon_pid": daemon["pid"],
+            "daemon_start_ticks": daemon["start_ticks"],
+            "host": "127.0.0.1", "port": port, "socket_inode": matches[0]}
+
 deadline = time.monotonic() + int(sys.argv[1])
+web_port = int(sys.argv[2])
 # Candidate invariant: p["pid"] == p["pgid"] for the direct compiler;
 # sidecars are excluded by: "--generation" not in p["argv"].
 while time.monotonic() < deadline:
@@ -226,16 +274,25 @@ while time.monotonic() < deadline:
             or before["pid"] != before["pgid"]):
         time.sleep(0.05)
         continue
+    listener = listener_probe(web_port, before_daemon)
     os.killpg(before["pgid"], signal.SIGSTOP)
-    stopped_daemon = snap(before_daemon["pid"])
-    stopped = snap(before["pid"])
-    if (stopped_daemon != before_daemon
-            or stopped["start_ticks"] != before["start_ticks"]
-            or stopped["ppid"] != before_daemon["pid"]
-            or stopped["pgid"] != before["pgid"]
+    stopped_daemon = None
+    stopped = None
+    stop_deadline = time.monotonic() + 2
+    while time.monotonic() < stop_deadline:
+        stopped_daemon = snap(before_daemon["pid"])
+        stopped = snap(before["pid"])
+        if (same_identity(stopped_daemon, before_daemon)
+                and same_identity(stopped, before)
+                and stopped["state"] in {"T", "t"}):
+            break
+        time.sleep(0.02)
+    if (stopped_daemon is None or stopped is None
+            or not same_identity(stopped_daemon, before_daemon)
+            or not same_identity(stopped, before)
             or stopped["state"] not in {"T", "t"}):
         raise SystemExit("compiler group did not stop with its authenticated identity")
-    print(json.dumps({"daemon": before_daemon, "leader": before,
+    print(json.dumps({"daemon": before_daemon, "leader": before, "listener": listener,
                       "schema": "icefarm-compiler-group-stop-v1", "stopped": stopped,
                       "stopped_ms": time.time_ns() // 1000000}, sort_keys=True, separators=(",", ":")))
     raise SystemExit(0)
@@ -1494,6 +1551,7 @@ class EventProducer:
         self,
         name: str,
         *,
+        expected_image_id: str | None = None,
         expected_runtime: str | None = None,
         expected_env: Mapping[str, str] | None = None,
         previous_id: str | None = None,
@@ -1532,6 +1590,21 @@ class EventProducer:
         state = document.get("State")
         if previous_id is not None and identifier == previous_id:
             raise EventError(f"container {name!r} did not receive a fresh container ID")
+        normalized_image_id = (
+            image_id.removeprefix("sha256:")
+            if isinstance(image_id, str)
+            else None
+        )
+        normalized_expected_image_id = (
+            expected_image_id.removeprefix("sha256:")
+            if isinstance(expected_image_id, str)
+            else None
+        )
+        if (
+            expected_image_id is not None
+            and normalized_image_id != normalized_expected_image_id
+        ):
+            raise EventError(f"container {name!r} has an unauthenticated runtime image")
         mounts = document.get("Mounts")
         runtime_mount = next(
             (
@@ -1592,7 +1665,12 @@ class EventProducer:
             for item in config_env
             if isinstance(item, str) and "=" in item
         }
-        managed = {"ICECC_P50_PROFILE", "ICECC_P50_MODE", P29_FAULT_ENV}
+        managed = {
+            "ICECC_P50_PROFILE",
+            "ICECC_P50_MODE",
+            P29_FAULT_ENV,
+            *(expected_env or {}),
+        }
         managed_env = {key: observed_env[key] for key in managed if key in observed_env}
         if expected_env is not None:
             for key in managed:
@@ -1600,11 +1678,7 @@ class EventProducer:
                     raise EventError(f"container {name!r} has unauthenticated {key} after transition")
         return {
             "id": identifier,
-            "image_id": (
-                image_id.removeprefix("sha256:")
-                if isinstance(image_id, str)
-                else None
-            ),
+            "image_id": normalized_image_id,
             "name": document.get("Name", f"/{container}"),
             "labels": dict(labels),
             "running": state.get("Running") if isinstance(state, dict) else None,
@@ -2889,10 +2963,28 @@ class EventProducer:
         if len(workers) != 1 or not clients:
             raise EventError("active scheduler loss requires exactly one F and at least one C")
         worker = workers[0]
+        web_port = self.plan.get("ports", {}).get("web", {}).get(worker["name"])
+        if type(web_port) is not int or not (1 <= web_port <= 65535):
+            raise EventError("active scheduler loss has no bounded planned F web port")
+        worker_env = {
+            **worker.get("env", {}),
+            "ICECC_WEB_HOSTPORT": f"127.0.0.1:{web_port}",
+        }
         before = self._inspect(event.instance)
         if before.get("id") != identifier or before.get("running") is not True:
             raise EventError("scheduler container identity changed before active loss")
-        worker_before = self._inspect(worker["name"])
+        worker_before = self._inspect(
+            worker["name"],
+            expected_image_id=self.farm.data["runtime_image"]["id"],
+            expected_runtime=str(runtime_root(self.farm, worker)),
+            expected_env=worker_env,
+        )
+        if (
+            worker_before.get("running") is not True
+            or not isinstance(worker_before.get("started_at"), str)
+            or not worker_before["started_at"]
+        ):
+            raise EventError("active scheduler loss has no authenticated running F")
         scheduler_log = self._readiness_baseline(instance)
         worker_log = self._readiness_baseline(worker)
         client_baselines = {
@@ -2915,7 +3007,8 @@ class EventProducer:
             host=worker["host"], instance=worker["name"], transport=_docker_transport(self.farm, worker["host"]),
             timeout_s=self._command_timeout(),
             argv=docker_argv(self.farm, worker["host"],
-                ("exec", "--user", "0", worker_before["name"], "python3", "-c", ACTIVE_COMPILER_STOP_SCRIPT, "20")),
+                ("exec", "--user", "0", worker_before["id"], "python3", "-c",
+                 ACTIVE_COMPILER_STOP_SCRIPT, "20", str(web_port))),
         ))
         try:
             compiler = json.loads(result.stdout.strip())
@@ -2926,8 +3019,10 @@ class EventProducer:
         leader = compiler.get("leader")
         stopped = compiler.get("stopped")
         parent = compiler.get("daemon")
+        listener = compiler.get("listener")
         if (not isinstance(leader, dict) or not isinstance(stopped, dict)
-                or not isinstance(parent, dict) or set(leader) != set(stopped)):
+                or not isinstance(parent, dict) or not isinstance(listener, dict)
+                or set(leader) != set(stopped)):
             raise EventError("compiler-group authentication has incomplete identity")
         if (parent.get("pid") == leader.get("pid")
                 or pathlib.Path(parent.get("exe", "")).name != "iceccd"
@@ -2938,14 +3033,32 @@ class EventProducer:
                 or leader.get("start_ticks") != stopped.get("start_ticks")
                 or leader.get("state") in {"Z", "X"}):
             raise EventError("compiler-group stop identity changed")
+        if (
+            set(listener)
+            != {
+                "daemon_pid",
+                "daemon_start_ticks",
+                "host",
+                "port",
+                "socket_inode",
+            }
+            or listener.get("daemon_pid") != parent.get("pid")
+            or listener.get("daemon_start_ticks") != parent.get("start_ticks")
+            or listener.get("host") != "127.0.0.1"
+            or listener.get("port") != web_port
+            or not isinstance(listener.get("socket_inode"), str)
+            or not listener["socket_inode"].isdigit()
+            or int(listener["socket_inode"]) <= 0
+        ):
+            raise EventError("compiler listener is not bound to the authenticated F daemon")
         assignment_result = self._invoke(self.factory.make(
             phase="event.scheduler-loss-authenticate-assignment",
             host=worker["host"], instance=worker["name"], transport=_docker_transport(self.farm, worker["host"]),
             timeout_s=self._command_timeout(),
             argv=docker_argv(self.farm, worker["host"], (
-                "exec", "--user", "0", worker_before["name"], "python3", "-c",
+                "exec", "--user", "0", worker_before["id"], "python3", "-c",
                 ACTIVE_COMPILER_ASSIGNMENT_SCRIPT, str(leader["pid"]), str(leader["pgid"]),
-                str(lost_generation), str(self._last_job), "8765",
+                str(lost_generation), str(self._last_job), str(web_port),
             )),
         ))
         try:
@@ -2959,7 +3072,8 @@ class EventProducer:
                 or assignment["child"].get("kind") != 0
                 or assignment["client"].get("scheduler_job_id") != self._last_job
                 or assignment["client"].get("job_id") != self._last_job
-                or assignment["listener"] != {"host": "127.0.0.1", "port": 8765}):
+                or assignment["listener"]
+                != {"host": "127.0.0.1", "port": web_port}):
             raise EventError("compiler assignment witness does not bind exact lost job")
         self._invoke(self.factory.make(
             phase="event.scheduler-loss-kill",
@@ -2981,7 +3095,7 @@ class EventProducer:
             host=worker["host"], instance=worker["name"], transport=_docker_transport(self.farm, worker["host"]),
             timeout_s=self._command_timeout(maximum=40),
             argv=docker_argv(self.farm, worker["host"],
-                ("exec", "--user", "0", worker_before["name"], "python3", "-c", ACTIVE_COMPILER_WAIT_SCRIPT,
+                ("exec", "--user", "0", worker_before["id"], "python3", "-c", ACTIVE_COMPILER_WAIT_SCRIPT,
                  str(leader["pid"]), str(leader["pgid"]), str(leader["start_ticks"]), "30")),
         ))
         try:
@@ -2990,7 +3104,12 @@ class EventProducer:
             raise EventError("compiler-group disappearance returned malformed JSON") from exc
         if not isinstance(group_gone, dict) or group_gone.get("schema") != "icefarm-compiler-group-gone-v1" or group_gone.get("gone") is not True:
             raise EventError("compiler group did not disappear with authenticated identity")
-        worker_after = self._inspect(worker["name"])
+        worker_after = self._inspect(
+            worker["name"],
+            expected_image_id=self.farm.data["runtime_image"]["id"],
+            expected_runtime=str(runtime_root(self.farm, worker)),
+            expected_env=worker_env,
+        )
         if (worker_after.get("id") != worker_before.get("id")
                 or worker_after.get("started_at") != worker_before.get("started_at")
                 or worker_after.get("running") is not True):
@@ -3002,31 +3121,78 @@ class EventProducer:
         worker_snapshot = _wait_workers(self.farm, self.plan, self.recorder, self.factory,
             deadline=min(self._start + self.deadline_s, self.monotonic() + float(self.scenario.data["timeouts"]["up_s"])),
             monotonic=self.monotonic, sleeper=time.sleep)
-        client_readiness = {
-            client["name"]: self._wait_scheduler_client_readiness(
+        client_readiness = {}
+        for client in clients:
+            witness = self._wait_scheduler_client_readiness(
                 client,
                 client_baselines[client["name"]],
                 route_before=client_routes_before[client["name"]],
             )
-            for client in clients
-        }
+            client_readiness[client["name"]] = {
+                "ready": True,
+                "witness": witness,
+            }
         client_routes_after = {
             client["name"]: (
-                client_readiness[client["name"]]["route"]["after"]
+                client_readiness[client["name"]]["witness"]["route"]["after"]
                 if self._client_cache_expected(client)
                 else None
             )
             for client in clients
         }
+        if not isinstance(scheduler_snapshot, str) or not scheduler_snapshot.strip():
+            raise EventError("scheduler active-loss rejoin has no scheduler snapshot")
+        if not isinstance(worker_snapshot, str) or not worker_snapshot.strip():
+            raise EventError("scheduler active-loss rejoin has no worker snapshot")
+        if any(
+            re.search(
+                rf"(^|\s){re.escape(item['name'])}(\s|$)",
+                worker_snapshot,
+                re.MULTILINE,
+            )
+            is None
+            for item in workers
+        ):
+            raise EventError("scheduler active-loss rejoin omits a planned F")
+        for client in clients:
+            readiness = client_readiness[client["name"]]
+            witness = readiness["witness"]
+            if (
+                readiness.get("ready") is not True
+                or witness.get("schema") != CLIENT_SCHEDULER_READINESS_SCHEMA
+                or witness.get("cache_expected")
+                is not self._client_cache_expected(client)
+            ):
+                raise EventError(
+                    f"client {client['name']!r} lacks authenticated post-loss readiness"
+                )
+        worker_identity = {
+            "container_id": worker_before["id"],
+            "env": worker_before["env"],
+            "image_id": worker_before["image_id"],
+            "running": worker_before["running"],
+            "runtime_path": worker_before["runtime_path"],
+            "started_at": worker_before["started_at"],
+        }
+        worker_after_identity = {
+            "container_id": worker_after["id"],
+            "env": worker_after["env"],
+            "image_id": worker_after["image_id"],
+            "running": worker_after["running"],
+            "runtime_path": worker_after["runtime_path"],
+            "started_at": worker_after["started_at"],
+        }
+        if worker_identity != worker_after_identity:
+            raise EventError("F authority changed across scheduler active loss")
         return {
             "action": event.action, "after": {"container_id": after["id"], "started_at": after["started_at"]},
             "before": {"container_id": before["id"], "started_at": before["started_at"]},
             "compiler": {
                 "container_id": worker_before["id"], "daemon": parent, "leader": leader,
                 "stopped": stopped, "group_gone": group_gone,
-                "assignment": assignment,
-                "worker_before": {"container_id": worker_before["id"], "started_at": worker_before["started_at"]},
-                "worker_after": {"container_id": worker_after["id"], "started_at": worker_after["started_at"]},
+                "assignment": assignment, "listener": listener,
+                "worker_before": worker_identity,
+                "worker_after": worker_after_identity,
             },
             "event_epoch": epoch, "instance": event.instance,
             "lost_scheduler_generation": lost_generation,
