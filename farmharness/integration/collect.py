@@ -797,6 +797,39 @@ def _p50_assignment_identity_marker(
     return next(iter(identities)) if identities else None
 
 
+def _legacy_wire_candidates_for_assignment(
+    legacy_wires: Mapping[tuple[int, int, int, int, int], dict[str, Any]],
+    scheduler_job: int,
+    binding_marker: tuple[int, int, int, int, int] | None,
+    compile_identities: Mapping[tuple[int, int, int], dict[str, Any]],
+) -> list[tuple[tuple[int, int, int, int, int], dict[str, Any]]]:
+    """Return only legacy-wire evidence bound by this job's own log.
+
+    Scheduler job numbers restart at scheduler replacement.  In particular,
+    a zero-epoch legacy scheduler record can reuse the number of an earlier
+    P50 source transfer.  The current client emits the complete five-field
+    binding marker before every instrumented legacy transfer, so matching by
+    job number alone is both unnecessary and unsafe.
+    """
+
+    if binding_marker is None:
+        return []
+    return [
+        (key, wire)
+        for key, wire in legacy_wires.items()
+        if key[0] == scheduler_job
+        and key == binding_marker
+        and (
+            (key[1] == 0 and key[2] == 0)
+            or (
+                key[:3] in compile_identities
+                and compile_identities[key[:3]]["c_guid"] == wire["c_guid"]
+                and compile_identities[key[:3]]["tu_seq"] == wire["tu_seq"]
+            )
+        )
+    ]
+
+
 def _compile_identities(path: Path) -> dict[tuple[int, int, int], dict[str, Any]]:
     records: dict[tuple[int, int, int], dict[str, Any]] = {}
     for index, item in enumerate(_read_jsonl(path), start=1):
@@ -4077,25 +4110,21 @@ def _parse_rows(
                 if marker is None and len(candidates) == 1
                 else None
             )
-            legacy_candidates = [
-                (key, wire)
-                for key, wire in c_legacy_wires.items()
-                if key[0] == scheduler_job
-                and (legacy_marker is None or key == legacy_marker)
-                and (
-                    (key[1] == 0 and key[2] == 0)
-                    or (
-                        key[:3] in compile_identities
-                        and compile_identities[key[:3]]["c_guid"] == wire["c_guid"]
-                        and compile_identities[key[:3]]["tu_seq"] == wire["tu_seq"]
-                    )
-                )
-            ]
+            legacy_candidates = _legacy_wire_candidates_for_assignment(
+                c_legacy_wires,
+                scheduler_job,
+                legacy_marker,
+                compile_identities,
+            )
             if len(legacy_candidates) > 1:
                 raise CollectError(f"{job_id}: legacy-wire assignment is ambiguous")
             legacy_key, legacy_wire = (
                 legacy_candidates[0] if legacy_candidates else (None, None)
             )
+            if legacy_marker is not None and legacy_wire is None:
+                raise CollectError(
+                    f"{job_id}: legacy-wire binding marker has no exact result witness"
+                )
             if source is not None and legacy_wire is not None:
                 raise CollectError(f"{job_id}: source and legacy-wire evidence overlap")
             if marker is not None and source is None:

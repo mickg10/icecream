@@ -20,6 +20,7 @@ from farmharness.integration.collect import (
     _event_log,
     _instance_version_at,
     _legacy_wire_binding_marker,
+    _legacy_wire_candidates_for_assignment,
     _legacy_wire_results,
     _one_role_log,
     _p29_interner_faults,
@@ -1423,6 +1424,39 @@ def test_source_attribution_binds_reused_current_scheduler_job_to_exact_epoch() 
     ) == [((2, 7, 8), second)]
 
 
+def test_legacy_wire_attribution_requires_exact_job_local_binding_marker() -> None:
+    stale = {
+        "assignment_epoch": 0,
+        "assignment_nonce": 0,
+        "c_guid": 202,
+        "tu_seq": 0,
+    }
+    records = {(24, 0, 0, 202, 0): stale}
+
+    # A pre-restart P50 source job with the same numeric scheduler ID has no
+    # legacy binding marker and must not inherit the post-restart record.
+    assert _legacy_wire_candidates_for_assignment(records, 24, None, {}) == []
+    assert _legacy_wire_candidates_for_assignment(
+        records, 24, (24, 0, 0, 202, 0), {}
+    ) == [((24, 0, 0, 202, 0), stale)]
+
+
+def test_legacy_wire_attribution_rejects_marker_without_exact_result(
+    tmp_path: Path,
+) -> None:
+    farm, scenario, plan, root = _raw_collection(tmp_path)
+    job = next((root / "C1.results" / "workload").glob("jobs/*/client-debug.log"))
+    job.write_text(
+        job.read_text(encoding="utf-8")
+        + "legacy wire identity bound for job 2 epoch 0 nonce 0 "
+        "c_guid 202 tu_seq 0 origin client-local\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(CollectError, match="binding marker has no exact result witness"):
+        collect_bundle(farm, scenario, plan, sync_remote=False)
+
+
 def test_collection_refuses_a_commit_without_exact_wire_byte_counts(
     tmp_path: Path,
 ) -> None:
@@ -1470,7 +1504,9 @@ def _make_legacy_wire_fixture(root: Path) -> None:
         if "source committed for P50 CompileFile" not in line
     ]
     debug.write_text(
-        "\n".join(debug_lines) + "\n",
+        "\n".join(debug_lines)
+        + "\nlegacy wire identity bound for job 2 epoch 1 nonce 1 "
+        "c_guid 1 tu_seq 99 origin scheduler\n",
         encoding="utf-8",
     )
     worker_log = next((root / "diagnostics").glob("*/F1.log/iceccd.log"))
@@ -1550,7 +1586,18 @@ def test_collection_conserves_absent_assignment_legacy_wire_bytes(
         record = json.loads(path.read_text(encoding="utf-8"))
         record["assignment_epoch"] = 0
         record["assignment_nonce"] = 0
+        record["tu_seq"] = 0
         _write_jsonl(path, [record])
+    debug = next(
+        (root / "C1.results" / "workload").glob("jobs/*/client-debug.log")
+    )
+    debug.write_text(
+        debug.read_text(encoding="utf-8").replace(
+            "epoch 1 nonce 1 c_guid 1 tu_seq 99 origin scheduler",
+            "epoch 0 nonce 0 c_guid 1 tu_seq 0 origin client-local",
+        ),
+        encoding="utf-8",
+    )
 
     bundle = collect_bundle(farm, scenario, plan, sync_remote=False)
 
