@@ -79,6 +79,8 @@ UNSUPPORTED_ACTIONS = frozenset(("netem_set",))
 TRANSITION_ACTIONS = frozenset(("upgrade", "downgrade", "env_set"))
 TRANSITION_SCHEMA = "icefarm-transition-v2"
 CLIENT_SCHEDULER_READINESS_SCHEMA = "icefarm-client-scheduler-readiness-v2"
+S70_B4_WORKER_ENGAGEMENT = "s70-b4-worker-bounces"
+WORKLOAD_TIME_ORIGIN_POLL_S = 1.0
 P29_FAULT_ENV = "ICECC_P50_FAULT_INJECTION"
 P29_FAULT_VALUE = "P29_INTERNER_FAIL_ONCE"
 IMAGE_LABEL_RE = re.compile(r"^p(43|44|50)(?:s[0-9]+)?(?:-|$)", re.IGNORECASE)
@@ -1149,6 +1151,13 @@ class EventProducer:
         self._baseline_dispatches: tuple[int, ...] = ()
         self._dispatch_count = 0
         self._job_trigger_floor = 0
+        self._workload_time_origin: float | None = None
+        self._next_workload_time_origin_poll = 0.0
+        self._anchor_time_to_workload = (
+            scenario.data.get("expect", {}).get("engagement")
+            == S70_B4_WORKER_ENGAGEMENT
+            and any(event.trigger.kind == "time" for event in self.events)
+        )
         self._lock = threading.Lock()
         self._active_turn: str | None = None
         self._current_event: TimelineEvent | None = None
@@ -4627,19 +4636,42 @@ class EventProducer:
         except ValueError as exc:
             raise EventError(str(exc)) from exc
 
+    def _workload_dispatches(self) -> tuple[int, ...]:
+        reader = self.job_reader or self._remote_job_reader
+        observed = parse_scheduler_dispatches(reader())
+        baseline_size = len(self._baseline_dispatches)
+        if observed[:baseline_size] != self._baseline_dispatches:
+            raise EventError("scheduler dispatch log changed beneath the timeline watcher")
+        workload_dispatches = observed[baseline_size:]
+        self._dispatch_count = len(workload_dispatches)
+        if workload_dispatches:
+            self._last_job = workload_dispatches[-1]
+        return workload_dispatches
+
     def _eligible(self, event: TimelineEvent, now: float) -> bool:
         if event.trigger.kind == "time":
-            return now - self._start >= float(event.trigger.value)
+            if not self._anchor_time_to_workload:
+                return now - self._start >= float(event.trigger.value)
+            if self._workload_time_origin is None:
+                if now < self._next_workload_time_origin_poll:
+                    return False
+                self._next_workload_time_origin_poll = (
+                    now + WORKLOAD_TIME_ORIGIN_POLL_S
+                )
+                if not self._workload_dispatches():
+                    return False
+                # The worker-bounce clock starts only when the first actual
+                # post-baseline workload dispatch is visible.  Client-side
+                # worklist/oracle preparation can otherwise consume every
+                # t+30/60/90 event before a single compile enters the farm.
+                self._workload_time_origin = now
+                return float(event.trigger.value) == 0.0
+            if now - self._workload_time_origin < float(event.trigger.value):
+                return False
+            self._workload_dispatches()
+            return True
         if event.trigger.kind == "job":
-            reader = self.job_reader or self._remote_job_reader
-            observed = parse_scheduler_dispatches(reader())
-            baseline_size = len(self._baseline_dispatches)
-            if observed[:baseline_size] != self._baseline_dispatches:
-                raise EventError("scheduler dispatch log changed beneath the timeline watcher")
-            workload_dispatches = observed[baseline_size:]
-            self._dispatch_count = len(workload_dispatches)
-            if workload_dispatches:
-                self._last_job = workload_dispatches[-1]
+            self._workload_dispatches()
             required = max(
                 int(event.trigger.value),
                 self._job_trigger_floor + 1,
@@ -4722,7 +4754,9 @@ class EventProducer:
         self._start = self.monotonic()
         if not self._pending:
             return
-        if any(event.trigger.kind == "job" for event in self._pending):
+        if self._anchor_time_to_workload or any(
+            event.trigger.kind == "job" for event in self._pending
+        ):
             reader = self.job_reader or self._remote_job_reader
             self._baseline_dispatches = parse_scheduler_dispatches(reader())
         self._thread = threading.Thread(target=self._run, name="icefarm-events")

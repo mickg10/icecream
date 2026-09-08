@@ -38,6 +38,7 @@ from farmharness.integration.events import (
     TRANSITION_SCHEMA,
     TimelineEvent,
     UnsupportedEvent,
+    parse_scheduler_dispatches,
     scheduler_generation_for_job_text,
     select_direct_compiler_pairs,
     client_scheduler_readiness_route_admissible,
@@ -1820,11 +1821,19 @@ def test_worker_restart_stays_live_and_emits_collectable_rejoin_receipt(
             return CommandResult(0, "", "")
 
     recorder = WorkerRestartRecorder()
+    scheduler_samples = ["", "put 1 in joblist of F1\n"]
+
+    def read_scheduler() -> str:
+        if len(scheduler_samples) > 1:
+            return scheduler_samples.pop(0)
+        return scheduler_samples[0]
+
     producer = EventProducer(
         farm,
         scenario,
         plan,
         recorder=RecordingTransport(recorder),
+        job_reader=read_scheduler,
         event_path=tmp_path / "events" / "events.json",
         deadline_s=2,
         poll_interval_s=0.01,
@@ -2058,6 +2067,52 @@ def test_job_trigger_counts_only_dispatches_after_the_workload_baseline(
     )
     assert records[0].last_dispatched_job == 43
     assert records[0].workload_dispatch_count == 2
+
+
+def test_worker_bounce_time_origin_waits_for_first_workload_dispatch(
+    tmp_path: Path,
+) -> None:
+    farm, scenario, plan = _fixture(tmp_path)
+    scenario.data["expect"]["engagement"] = "s70-b4-worker-bounces"
+    scenario.data["timeline"] = [
+        {"trigger": "t+30", "action": "restart", "instance": "F1"}
+    ]
+    samples = [
+        "put 41 in joblist of F1\n",
+        "put 41 in joblist of F1\n",
+        "put 41 in joblist of F1\nput 42 in joblist of F2\n",
+        "put 41 in joblist of F1\nput 42 in joblist of F2\n"
+        "put 43 in joblist of F1\n",
+    ]
+
+    def read_jobs() -> str:
+        if len(samples) > 1:
+            return samples.pop(0)
+        return samples[0]
+
+    producer = EventProducer(
+        farm,
+        scenario,
+        plan,
+        recorder=RecordingTransport(EventRecorder()),
+        job_reader=read_jobs,
+        event_path=tmp_path / "events" / "events.json",
+        deadline_s=200,
+    )
+    event = producer.events[0]
+    producer._start = 0.0
+    producer._baseline_dispatches = parse_scheduler_dispatches(read_jobs())
+
+    # The producer has been alive for far longer than 30 seconds, but client
+    # preparation has not yet dispatched any workload, so the event stays put.
+    assert producer._eligible(event, 100.0) is False
+    # Seeing the first post-baseline dispatch establishes, rather than
+    # retroactively exceeds, the workload-relative time origin.
+    assert producer._eligible(event, 120.0) is False
+    assert producer._eligible(event, 149.999) is False
+    assert producer._eligible(event, 150.0) is True
+    assert producer.last_dispatched_job == 43
+    assert producer._dispatch_count == 2
 
 
 def test_job_trigger_excludes_late_environment_canary(tmp_path: Path) -> None:
