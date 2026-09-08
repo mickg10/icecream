@@ -169,6 +169,7 @@ except ImportError:  # Executed as ./farmtest.py.
 
 
 PLAN_SCHEMA = "icefarm-plan-v1"
+CLIENT_SCHEDULER_READINESS_CONTRACT = "icefarm-client-scheduler-readiness-v2"
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 CONTAINER_TEMP_ROOT = "/tmp/icefarm"
 CACHE_DISK_FAULT_PATH = "/var/cache/icecream"
@@ -877,6 +878,7 @@ def build_plan(
     )
     return {
         "assignment_fence_mode": assignment_fence_mode,
+        "client_scheduler_readiness_contract": CLIENT_SCHEDULER_READINESS_CONTRACT,
         "commands": [command.as_dict() for command in commands],
         "farm": str(farm.path),
         "farm_digest": farm.digest,

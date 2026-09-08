@@ -18,6 +18,30 @@ bool nonzero(CStoreGuid value) noexcept {
                        [](uint8_t byte) { return byte != 0; });
 }
 
+bool bind_local_legacy_wire_identity_from_capabilities(
+    CompileJob& job, const ClaimAttemptCapability128& first,
+    const ClaimAttemptCapability128& second) noexcept {
+    if (job.jobID() == 0 || !job.assignmentIdentityValid() ||
+        job.hasAssignmentIdentity() || !job.compileIdentityValid() ||
+        job.hasCompileIdentity() || !first.valid() || !second.valid() ||
+        first == second)
+        return false;
+
+    icecc::Digest128Builder digest;
+    digest.append(std::string_view{"icecc-p50-local-legacy-wire-guid-v1"});
+    digest.append(first.bytes);
+    digest.append(second.bytes);
+    digest.append_u32(job.jobID());
+    const icecc::Digest128 value = digest.finish();
+    uint64_t wire_guid = 0;
+    for (size_t index = 0; index != sizeof(wire_guid); ++index)
+        wire_guid = (wire_guid << 8) | value.bytes[index];
+    if (wire_guid == 0)
+        return false;
+    job.setCompileIdentity(wire_guid, 0);
+    return true;
+}
+
 }  // namespace
 
 bool p50_zstd_compile_admissible(const UseCSMsg& assignment,
@@ -66,6 +90,31 @@ CStoreGuid derive_compile_c_store_guid(const CompileJob& job,
 
 PrepareRequestKey compile_prepare_request(const CompileJob& job) noexcept {
     return PrepareRequestKey{job.assignmentEpoch(), job.assignmentNonce()};
+}
+
+bool bind_local_legacy_wire_identity_with_provider(
+    CompileJob& job, ClaimAttemptEntropyProvider provider) noexcept {
+    if (job.jobID() == 0 || !job.assignmentIdentityValid() ||
+        job.hasAssignmentIdentity() || !job.compileIdentityValid() ||
+        job.hasCompileIdentity())
+        return false;
+
+    ClaimAttemptCapability128 first;
+    ClaimAttemptCapability128 second;
+    if (!fresh_claim_attempt_capabilities_with_provider(first, second, provider))
+        return false;
+    return bind_local_legacy_wire_identity_from_capabilities(job, first, second);
+}
+
+bool bind_local_legacy_wire_identity(CompileJob& job) noexcept {
+    ClaimAttemptCapability128 first;
+    ClaimAttemptCapability128 second;
+    // Use the same bounded OS-entropy contract as the ordinary P50 attempt
+    // capabilities.  The public provider seam above exists only for exact
+    // failure/zero/short-read tests.
+    if (!fresh_claim_attempt_capabilities(first, second))
+        return false;
+    return bind_local_legacy_wire_identity_from_capabilities(job, first, second);
 }
 
 std::optional<CompileInputIdentity> bind_compile_input(

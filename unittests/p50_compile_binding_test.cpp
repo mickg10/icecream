@@ -1,7 +1,14 @@
 #include "client/p50_compile_binding.h"
 
+#include <cerrno>
+#include <cstring>
 #include <cstdlib>
 #include <stdexcept>
+#include <thread>
+
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
 
 using namespace icecc::p50;
 
@@ -13,6 +20,58 @@ void check(bool value, const char* expression) {
 }
 
 #define CHECK(expression) check((expression), #expression)
+
+struct ChannelPair {
+    MsgChannel* client = nullptr;
+    MsgChannel* worker = nullptr;
+};
+
+ChannelPair make_channel_pair() {
+    int fds[2];
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    ChannelPair pair;
+    std::thread client([&] {
+        pair.client = Service::createChannel(
+            fds[0], reinterpret_cast<sockaddr*>(&address), sizeof(address));
+    });
+    std::thread worker([&] {
+        pair.worker = Service::createChannel(
+            fds[1], reinterpret_cast<sockaddr*>(&address), sizeof(address));
+    });
+    client.join();
+    worker.join();
+    CHECK(pair.client != nullptr && pair.worker != nullptr);
+    pair.client->protocol = PROTOCOL_VERSION_CACHE_ADVERTISEMENT;
+    pair.worker->protocol = PROTOCOL_VERSION_CACHE_ADVERTISEMENT;
+    return pair;
+}
+
+enum class LegacyEntropyMode { Distinct, Interrupted, Zero, Short, Error };
+
+LegacyEntropyMode legacy_entropy_mode = LegacyEntropyMode::Distinct;
+unsigned legacy_entropy_calls = 0;
+
+ssize_t legacy_entropy(void* buffer, size_t size, unsigned) noexcept {
+    ++legacy_entropy_calls;
+    if (legacy_entropy_mode == LegacyEntropyMode::Interrupted &&
+        legacy_entropy_calls == 1) {
+        errno = EINTR;
+        return -1;
+    }
+    if (legacy_entropy_mode == LegacyEntropyMode::Short)
+        return size == 0 ? 0 : static_cast<ssize_t>(size - 1);
+    if (legacy_entropy_mode == LegacyEntropyMode::Error) {
+        errno = EIO;
+        return -1;
+    }
+    const unsigned char fill = legacy_entropy_mode == LegacyEntropyMode::Zero
+        ? 0
+        : static_cast<unsigned char>(legacy_entropy_calls);
+    std::memset(buffer, fill, size);
+    return static_cast<ssize_t>(size);
+}
 
 CompileJob assigned_job(uint64_t epoch = 101, uint64_t nonce = 202) {
     CompileJob job;
@@ -134,6 +193,109 @@ void test_namespace_and_request_are_assignment_bound() {
     CHECK(compile_prepare_request(first) == (PrepareRequestKey{101, 202}));
 }
 
+void test_old_scheduler_gets_only_a_local_wire_identity() {
+    CompileJob legacy;
+    legacy.setJobID(33);
+    legacy_entropy_mode = LegacyEntropyMode::Distinct;
+    legacy_entropy_calls = 0;
+    CHECK(bind_local_legacy_wire_identity_with_provider(legacy, legacy_entropy));
+    CHECK(!legacy.hasAssignmentIdentity());
+    CHECK(legacy.assignmentEpoch() == 0 && legacy.assignmentNonce() == 0);
+    CHECK(legacy.hasCompileIdentity() && legacy.cGuid() != 0 && legacy.tuSeq() == 0);
+
+    const uint64_t first_guid = legacy.cGuid();
+    CompileJob another;
+    another.setJobID(33);
+    CHECK(bind_local_legacy_wire_identity_with_provider(another, legacy_entropy));
+    CHECK(another.cGuid() != 0 && another.cGuid() != first_guid);
+
+    CompileJob scheduler_owned;
+    scheduler_owned.setJobID(33);
+    scheduler_owned.setCompileIdentity(101, 7);
+    CHECK(!bind_local_legacy_wire_identity_with_provider(
+        scheduler_owned, legacy_entropy));
+    CHECK(scheduler_owned.cGuid() == 101 && scheduler_owned.tuSeq() == 7);
+
+    CompileJob fenced;
+    fenced.setJobID(33);
+    fenced.setAssignmentIdentity(101, 202);
+    CHECK(!bind_local_legacy_wire_identity_with_provider(fenced, legacy_entropy));
+    CHECK(!fenced.hasCompileIdentity());
+
+    CompileJob partial;
+    partial.setJobID(33);
+    partial.setAssignmentIdentity(101, 0);
+    CHECK(!bind_local_legacy_wire_identity_with_provider(partial, legacy_entropy));
+    CHECK(!partial.hasCompileIdentity());
+
+    legacy_entropy_mode = LegacyEntropyMode::Interrupted;
+    legacy_entropy_calls = 0;
+    CompileJob interrupted;
+    interrupted.setJobID(34);
+    CHECK(bind_local_legacy_wire_identity_with_provider(
+        interrupted, legacy_entropy));
+    CHECK(interrupted.hasCompileIdentity());
+
+    for (const LegacyEntropyMode mode : {
+             LegacyEntropyMode::Zero,
+             LegacyEntropyMode::Short,
+             LegacyEntropyMode::Error,
+         }) {
+        legacy_entropy_mode = mode;
+        legacy_entropy_calls = 0;
+        CompileJob rejected;
+        rejected.setJobID(35);
+        CHECK(!bind_local_legacy_wire_identity_with_provider(
+            rejected, legacy_entropy));
+        CHECK(!rejected.hasCompileIdentity());
+    }
+}
+
+void test_old_scheduler_current_client_worker_compilefile_round_trip() {
+    CompileJob legacy;
+    legacy.setJobID(91);
+    legacy.setCompilerName("g++");
+    legacy.setLanguage(CompileJob::Lang_CXX);
+    legacy.setEnvironmentVersion("legacy-scheduler-env");
+    legacy.setTargetPlatform("x86_64");
+    legacy.setInputFile("legacy.ii");
+    legacy.setOutputFile("legacy.o");
+    legacy_entropy_mode = LegacyEntropyMode::Distinct;
+    legacy_entropy_calls = 0;
+    CHECK(bind_local_legacy_wire_identity_with_provider(legacy, legacy_entropy));
+    CHECK(!legacy.hasAssignmentIdentity());
+
+    const P50LegacyWireIdentity client_identity{
+        legacy.jobID(), legacy.assignmentEpoch(), legacy.assignmentNonce(),
+        legacy.cGuid(), legacy.tuSeq()};
+    CHECK(client_identity.valid());
+    ChannelPair pair = make_channel_pair();
+    pair.client->set_p50_legacy_wire_role(P50LegacyWireRole::C);
+    pair.worker->set_p50_legacy_wire_role(P50LegacyWireRole::F);
+    CHECK(pair.client->set_p50_legacy_wire_identity(client_identity));
+
+    CompileFileMsg outbound(&legacy);
+    CHECK(pair.client->send_msg(outbound));
+    Msg* wire = pair.worker->get_msg(5, true);
+    auto* inbound = dynamic_cast<CompileFileMsg*>(wire);
+    CHECK(inbound != nullptr);
+    P50LegacyWireIdentity worker_identity;
+    CHECK(inbound != nullptr && inbound->legacy_wire_identity(worker_identity));
+    CompileJob* decoded = inbound != nullptr ? inbound->takeJob() : nullptr;
+    CHECK(decoded != nullptr);
+    CHECK(decoded->jobID() == legacy.jobID());
+    CHECK(!decoded->hasAssignmentIdentity());
+    CHECK(decoded->hasCompileIdentity());
+    CHECK(decoded->cGuid() == legacy.cGuid() && decoded->tuSeq() == 0);
+    CHECK(worker_identity == client_identity);
+    CHECK(pair.worker->set_p50_legacy_wire_identity(worker_identity));
+
+    delete decoded;
+    delete wire;
+    delete pair.client;
+    delete pair.worker;
+}
+
 void test_only_exact_commit_binds_compile_selector() {
     const CompileJob job = assigned_job();
     const CStoreGuid guid = derive_compile_c_store_guid(job, 7, 8);
@@ -211,6 +373,8 @@ int main() {
     test_exact_mode_admission();
     test_explicit_profile_selection();
     test_namespace_and_request_are_assignment_bound();
+    test_old_scheduler_gets_only_a_local_wire_identity();
+    test_old_scheduler_current_client_worker_compilefile_round_trip();
     test_only_exact_commit_binds_compile_selector();
     test_authenticated_sidecar_result_binds_real_identity();
 }

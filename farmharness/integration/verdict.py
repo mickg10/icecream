@@ -81,6 +81,26 @@ TERMINAL_KINDS = frozenset(
     ("completion", "fallback", "cancellation", "process-loss-recovery")
 )
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+CLIENT_SCHEDULER_READINESS_SCHEMA = "icefarm-client-scheduler-readiness-v2"
+CLIENT_SCHEDULER_READINESS_FIELDS = frozenset(
+    {
+        "bytes",
+        "cache_expected",
+        "cache_fresh",
+        "cache_lifecycle",
+        "cache_line",
+        "cache_line_offset",
+        "cache_state",
+        "connected_line",
+        "connected_line_offset",
+        "host",
+        "log_path",
+        "offset",
+        "post_sha256",
+        "route",
+        "schema",
+    }
+)
 
 
 def _is_int(value: object, *, minimum: int = 0) -> bool:
@@ -97,6 +117,16 @@ def _job_id(value: object, fallback: str) -> str:
 
 def _sorted_ids(values: Sequence[str] | set[str]) -> list[str]:
     return sorted(set(values), key=lambda item: (len(item), item))
+
+
+def _contains_client_scheduler_readiness_v2(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        return value.get("schema") == CLIENT_SCHEDULER_READINESS_SCHEMA or any(
+            _contains_client_scheduler_readiness_v2(item) for item in value.values()
+        )
+    if isinstance(value, list):
+        return any(_contains_client_scheduler_readiness_v2(item) for item in value)
+    return False
 
 
 def _transition_protocol(label: object) -> int | None:
@@ -143,6 +173,67 @@ def _scenario_instance_protocol_at_epoch(
         if protocol is None:
             return None
     return protocol
+
+
+def _scenario_instance_env_at_epoch(
+    scenario: Mapping[str, Any],
+    instance: Mapping[str, Any],
+    event_epoch: object,
+) -> dict[str, str] | None:
+    timeline = scenario.get("timeline")
+    images = scenario.get("images")
+    alias = instance.get("image")
+    name = instance.get("name")
+    role = instance.get("role")
+    env = instance.get("env", {})
+    if (
+        not _is_int(event_epoch)
+        or not isinstance(timeline, list)
+        or event_epoch > len(timeline)
+        or not isinstance(images, Mapping)
+        or not isinstance(alias, str)
+        or not isinstance(name, str)
+        or role not in {"S", "C", "F"}
+        or not isinstance(env, Mapping)
+        or any(type(key) is not str or type(value) is not str for key, value in env.items())
+    ):
+        return None
+    label = images.get(alias)
+    if not isinstance(label, str):
+        return None
+    result = dict(env)
+    for event in timeline[:event_epoch]:
+        if not isinstance(event, Mapping) or event.get("instance") != name:
+            continue
+        action = event.get("action")
+        if action in {"upgrade", "downgrade"}:
+            target_alias = event.get("image")
+            label = images.get(target_alias) if isinstance(target_alias, str) else None
+            if not isinstance(label, str):
+                return None
+            protocol = _transition_protocol(label)
+            if protocol is None:
+                return None
+            if role == "S":
+                if protocol == 50:
+                    result.setdefault("ICECC_P50_PROFILE", "P29V1")
+                else:
+                    result.pop("ICECC_P50_PROFILE", None)
+            elif role == "C":
+                if protocol == 50:
+                    result.setdefault("ICECC_P50_MODE", "on")
+                else:
+                    result.pop("ICECC_P50_MODE", None)
+                    result.pop("ICECC_P50_FAULT_INJECTION", None)
+        elif action == "env_set":
+            update = event.get("env")
+            if not isinstance(update, Mapping) or any(
+                type(key) is not str or type(value) is not str
+                for key, value in update.items()
+            ):
+                return None
+            result.update(update)
+    return result
 
 
 def _clause(
@@ -1289,7 +1380,11 @@ def _disk_fill_receipt_errors(
 
 
 def _scheduler_restart_receipt_errors(
-    receipt: Any, event: Mapping[str, Any], scenario: Mapping[str, Any]
+    receipt: Any,
+    event: Mapping[str, Any],
+    scenario: Mapping[str, Any],
+    *,
+    readiness_v2: bool = False,
 ) -> set[str]:
     marker = "@event:scheduler-restart-coordination"
     if not isinstance(receipt, Mapping) or set(receipt) != {
@@ -1430,16 +1525,36 @@ def _scheduler_restart_receipt_errors(
         )
         witness = client_readiness[name]
         log_path = witness.get("log_path") if isinstance(witness, Mapping) else None
-        cache_required = (
-            scheduler_cache_capable
-            and isinstance(client, Mapping)
-            and _scenario_instance_protocol_at_epoch(
+        client_protocol = (
+            _scenario_instance_protocol_at_epoch(
                 scenario, client, receipt.get("event_epoch")
             )
-            == 50
-            and isinstance(client.get("env"), Mapping)
-            and client["env"].get("ICECC_P50_MODE") == "on"
+            if isinstance(client, Mapping)
+            else None
         )
+        client_env = (
+            _scenario_instance_env_at_epoch(
+                scenario, client, receipt.get("event_epoch")
+            )
+            if isinstance(client, Mapping)
+            else None
+        )
+        cache_expected = (
+            client_protocol == 50
+            and isinstance(client_env, Mapping)
+            and client_env.get("ICECC_P50_MODE") == "on"
+        )
+        if readiness_v2:
+            if (
+                not isinstance(client, Mapping)
+                or client.get("role") != "C"
+                or not _valid_client_scheduler_readiness_v2(
+                    witness, client, cache_expected=cache_expected
+                )
+            ):
+                return {marker}
+            continue
+        cache_required = scheduler_cache_capable and cache_expected
         if (
             not isinstance(client, Mapping)
             or client.get("role") != "C"
@@ -1512,7 +1627,11 @@ def _scheduler_restart_receipt_errors(
 
 
 def _scheduler_active_loss_receipt_errors(
-    receipt: Any, event: Mapping[str, Any], scenario: Mapping[str, Any]
+    receipt: Any,
+    event: Mapping[str, Any],
+    scenario: Mapping[str, Any],
+    *,
+    readiness_v2: bool = False,
 ) -> set[str]:
     marker = "@event:scheduler-active-loss"
     required = {"action", "after", "before", "compiler", "event_epoch", "instance", "lost_scheduler_generation", "lost_scheduler_job", "pre_fault", "quiescence", "schema", "turn"}
@@ -1523,6 +1642,92 @@ def _scheduler_active_loss_receipt_errors(
     parent = compiler.get("daemon") if isinstance(compiler, Mapping) else None
     leader = compiler.get("leader") if isinstance(compiler, Mapping) else None
     stopped = compiler.get("stopped") if isinstance(compiler, Mapping) else None
+    quiescence = receipt.get("quiescence")
+    client_names = scenario.get("workload", {}).get("clients", [])
+    client_readiness = (
+        quiescence.get("client_readiness") if isinstance(quiescence, Mapping) else None
+    )
+    client_routes = (
+        quiescence.get("client_routes") if isinstance(quiescence, Mapping) else None
+    )
+    client_evidence_valid = (
+        isinstance(client_names, list)
+        and bool(client_names)
+        and isinstance(client_readiness, Mapping)
+        and set(client_readiness) == set(client_names)
+        and isinstance(client_routes, Mapping)
+        and set(client_routes) == set(client_names)
+    )
+    if client_evidence_valid and readiness_v2:
+        instances = scenario.get("instances")
+        if not isinstance(instances, list):
+            client_evidence_valid = False
+        else:
+            for name in client_names:
+                client = next(
+                    (
+                        item
+                        for item in instances
+                        if isinstance(item, Mapping) and item.get("name") == name
+                    ),
+                    None,
+                )
+                protocol = (
+                    _scenario_instance_protocol_at_epoch(
+                        scenario, client, receipt.get("event_epoch")
+                    )
+                    if isinstance(client, Mapping)
+                    else None
+                )
+                env = (
+                    _scenario_instance_env_at_epoch(
+                        scenario, client, receipt.get("event_epoch")
+                    )
+                    if isinstance(client, Mapping)
+                    else None
+                )
+                witness = client_readiness[name]
+                pair = client_routes[name]
+                if (
+                    not isinstance(client, Mapping)
+                    or not _valid_client_scheduler_readiness_v2(
+                        witness,
+                        client,
+                        cache_expected=(
+                            protocol == 50
+                            and isinstance(env, Mapping)
+                            and env.get("ICECC_P50_MODE") == "on"
+                        ),
+                    )
+                    or not isinstance(pair, Mapping)
+                    or set(pair) != {"after", "before"}
+                    or pair.get("before") != pair.get("after")
+                    or witness.get("route") != pair
+                ):
+                    client_evidence_valid = False
+                    break
+    elif client_evidence_valid:
+        client_evidence_valid = all(
+            isinstance(witness, Mapping)
+            and set(witness)
+            == {"bytes", "cache_line", "cache_required", "connected_line", "host", "log_path", "offset"}
+            and _is_int(witness.get("bytes"), minimum=1)
+            and type(witness.get("cache_required")) is bool
+            and isinstance(witness.get("connected_line"), str)
+            and "Connected to scheduler (I am known as " in witness["connected_line"]
+            and isinstance(witness.get("host"), str)
+            and bool(witness["host"])
+            and isinstance(witness.get("log_path"), str)
+            and witness["log_path"].startswith("/")
+            and _is_int(witness.get("offset"))
+            for witness in client_readiness.values()
+        ) and all(
+            isinstance(pair, Mapping)
+            and set(pair) == {"after", "before"}
+            and pair.get("before") == pair.get("after")
+            and _valid_client_route_state(pair.get("before"))
+            for pair in client_routes.values()
+        )
     if (receipt.get("action") != event.get("action")
             or receipt.get("instance") != event.get("instance")
             or not _is_int(receipt.get("lost_scheduler_generation"), minimum=1)
@@ -1560,48 +1765,15 @@ def _scheduler_active_loss_receipt_errors(
             or not all(_is_int(assignment.get("child", {}).get(key), minimum=1) for key in ("generation", "owning_client_id", "pgid", "pid"))
             or not all(_is_int(assignment.get("client", {}).get(key), minimum=1) for key in ("client_id", "job_id", "scheduler_job_id"))
             or assignment.get("listener") != {"host": "127.0.0.1", "port": 8765}
-            or not isinstance(receipt.get("quiescence"), Mapping)
-            or set(receipt["quiescence"]) != {"client_readiness", "client_routes", "scheduler_snapshot", "scheduler_startup", "worker_snapshot"}
-            or not isinstance(receipt["quiescence"].get("scheduler_startup"), Mapping)
-            or not isinstance(receipt["quiescence"]["scheduler_startup"].get("line"), str)
-            or not isinstance(receipt["quiescence"].get("scheduler_snapshot"), str)
-            or not isinstance(receipt["quiescence"].get("worker_snapshot"), str)
-            or not receipt["quiescence"]["scheduler_snapshot"].strip()
-            or not receipt["quiescence"]["worker_snapshot"].strip()
-            or set(receipt["quiescence"].get("client_readiness", {}))
-            != set(scenario.get("workload", {}).get("clients", []))
-            or any(
-                not isinstance(witness, Mapping)
-                or set(witness) != {"bytes", "cache_line", "cache_required", "connected_line", "host", "log_path", "offset"}
-                or type(witness.get("bytes")) is not int or witness["bytes"] < 1
-                or type(witness.get("cache_required")) is not bool
-                or not isinstance(witness.get("connected_line"), str)
-                or "Connected to scheduler (I am known as " not in witness["connected_line"]
-                or not isinstance(witness.get("host"), str) or not witness["host"]
-                or not isinstance(witness.get("log_path"), str) or not witness["log_path"].startswith("/")
-                or not _is_int(witness.get("offset"), minimum=0)
-                for witness in receipt["quiescence"].get("client_readiness", {}).values()
-            )
-            or not isinstance(receipt["quiescence"].get("client_routes"), Mapping)
-            or set(receipt["quiescence"]["client_routes"]) != set(scenario.get("workload", {}).get("clients", []))
-            or any(
-                not isinstance(pair, Mapping) or set(pair) != {"before", "after"}
-                or not isinstance(pair["before"], Mapping) or not isinstance(pair["after"], Mapping)
-                or set(pair["before"]) != {"container", "daemon", "route_owner"}
-                or set(pair["after"]) != {"container", "daemon", "route_owner"}
-                or pair["before"] != pair["after"]
-                or not isinstance(pair["before"].get("container"), Mapping)
-                or set(pair["before"]["container"]) != {"container_id", "started_at", "running"}
-                or not SHA256_RE.fullmatch(str(pair["before"]["container"].get("container_id", "")))
-                or not isinstance(pair["before"]["container"].get("started_at"), str)
-                or not pair["before"]["container"]["started_at"]
-                or pair["before"]["container"].get("running") is not True
-                or not _valid_route_process(pair["before"].get("daemon"), "/opt/icecream/sbin/iceccd")
-                or not _valid_route_process(pair["before"].get("route_owner"), "/opt/icecream/sbin/icecc-cache-service")
-                or pair["before"]["route_owner"].get("ppid") != pair["before"]["daemon"].get("pid")
-                or pair["before"]["route_owner"].get("uid") != pair["before"]["daemon"].get("uid")
-                for pair in receipt["quiescence"]["client_routes"].values()
-            )):
+            or not isinstance(quiescence, Mapping)
+            or set(quiescence) != {"client_readiness", "client_routes", "scheduler_snapshot", "scheduler_startup", "worker_snapshot"}
+            or not isinstance(quiescence.get("scheduler_startup"), Mapping)
+            or not isinstance(quiescence["scheduler_startup"].get("line"), str)
+            or not isinstance(quiescence.get("scheduler_snapshot"), str)
+            or not isinstance(quiescence.get("worker_snapshot"), str)
+            or not quiescence["scheduler_snapshot"].strip()
+            or not quiescence["worker_snapshot"].strip()
+            or not client_evidence_valid):
         return {marker}
     for side in ("before", "after"):
         snapshot = receipt.get(side)
@@ -1835,6 +2007,105 @@ def _valid_route_process(value: Any, executable: str) -> bool:
     )
 
 
+def _valid_client_route_state(value: Any) -> bool:
+    if not isinstance(value, Mapping) or set(value) != {
+        "container",
+        "daemon",
+        "route_owner",
+    }:
+        return False
+    container = value.get("container")
+    daemon = value.get("daemon")
+    owner = value.get("route_owner")
+    return (
+        isinstance(container, Mapping)
+        and set(container) == {"container_id", "running", "started_at"}
+        and isinstance(container.get("container_id"), str)
+        and SHA256_RE.fullmatch(container["container_id"]) is not None
+        and container.get("running") is True
+        and isinstance(container.get("started_at"), str)
+        and bool(container["started_at"])
+        and _valid_route_process(daemon, "/opt/icecream/sbin/iceccd")
+        and _valid_route_process(owner, "/opt/icecream/sbin/icecc-cache-service")
+        and owner["ppid"] == daemon["pid"]
+        and owner["uid"] == daemon["uid"]
+    )
+
+
+def _valid_client_scheduler_readiness_v2(
+    witness: Any,
+    client: Mapping[str, Any],
+    *,
+    cache_expected: bool,
+) -> bool:
+    if (
+        not isinstance(witness, Mapping)
+        or set(witness) != CLIENT_SCHEDULER_READINESS_FIELDS
+        or witness.get("schema") != CLIENT_SCHEDULER_READINESS_SCHEMA
+        or witness.get("host") != client.get("host")
+        or not isinstance(witness.get("log_path"), str)
+        or not witness["log_path"].startswith("/")
+        or not witness["log_path"].endswith(
+            f"/{client.get('name')}/log/client-daemon.log"
+        )
+        or not _is_int(witness.get("offset"))
+        or not _is_int(witness.get("bytes"), minimum=1)
+        or not isinstance(witness.get("post_sha256"), str)
+        or SHA256_RE.fullmatch(witness["post_sha256"]) is None
+        or witness.get("cache_expected") is not cache_expected
+        or type(witness.get("cache_fresh")) is not bool
+        or not isinstance(witness.get("connected_line"), str)
+        or "Connected to scheduler (I am known as " not in witness["connected_line"]
+        or not _is_int(
+            witness.get("connected_line_offset"), minimum=witness["offset"]
+        )
+    ):
+        return False
+    line = witness.get("cache_line")
+    if line is None:
+        cache_consistent = all(
+            witness.get(field) is None
+            for field in ("cache_lifecycle", "cache_line_offset", "cache_state")
+        ) and witness.get("cache_fresh") is False
+    else:
+        match = (
+            re.search(
+                r"cache sidecar adapter state=([0-9]+) lifecycle=([0-9]+)", line
+            )
+            if isinstance(line, str)
+            else None
+        )
+        cache_consistent = (
+            match is not None
+            and _is_int(witness.get("cache_line_offset"))
+            and witness["cache_line_offset"]
+            < witness["offset"] + witness["bytes"]
+            and _is_int(witness.get("cache_state"))
+            and _is_int(witness.get("cache_lifecycle"))
+            and int(match.group(1)) == witness["cache_state"]
+            and int(match.group(2)) == witness["cache_lifecycle"]
+            and witness["cache_fresh"]
+            is (witness["cache_line_offset"] >= witness["offset"])
+        )
+    if not cache_consistent:
+        return False
+    route = witness.get("route")
+    if cache_expected:
+        return (
+            witness.get("cache_state") == 2
+            and witness.get("cache_lifecycle") == 3
+            and isinstance(route, Mapping)
+            and set(route) == {"after", "before"}
+            and (route["before"] is None or _valid_client_route_state(route["before"]))
+            and _valid_client_route_state(route["after"])
+            and (
+                route["before"] == route["after"]
+                or witness.get("cache_fresh") is True
+            )
+        )
+    return route is None
+
+
 def _client_route_restart_receipt_errors(
     receipt: Any, event: Mapping[str, Any], scenario: Mapping[str, Any]
 ) -> set[str]:
@@ -2031,6 +2302,8 @@ def _client_transition_receipt_errors(
     observed: Mapping[str, Any],
     expected: Mapping[str, Any],
     scenario: Mapping[str, Any],
+    *,
+    readiness_v2: bool = False,
 ) -> set[str]:
     marker = "@event:transition-coordination"
     receipt = observed.get("receipt")
@@ -2187,10 +2460,22 @@ def _client_transition_receipt_errors(
     after_version = _transition_protocol(snapshots["after"]["image"])
     if after_version is None:
         return {marker}
-    cache_required = (
+    cache_expected = (
         after_version == 50
         and snapshots["after"]["env"].get("ICECC_P50_MODE") == "on"
-        and any(
+    )
+    readiness_log_path = (
+        readiness.get("log_path") if isinstance(readiness, Mapping) else None
+    )
+    readiness_offset = (
+        readiness.get("offset") if isinstance(readiness, Mapping) else None
+    )
+    if readiness_v2:
+        client_readiness_valid = _valid_client_scheduler_readiness_v2(
+            client_readiness, target, cache_expected=cache_expected
+        )
+    else:
+        legacy_cache_required = cache_expected and any(
             isinstance(item, Mapping)
             and item.get("role") == "S"
             and _scenario_instance_protocol_at_epoch(
@@ -2199,7 +2484,34 @@ def _client_transition_receipt_errors(
             == 50
             for item in scenario.get("instances", [])
         )
-    )
+        client_readiness_valid = (
+            isinstance(client_readiness, Mapping)
+            and set(client_readiness)
+            == {"cache_line", "cache_required", "connected_line", "host", "log_path", "offset"}
+            and client_readiness.get("host") == target.get("host")
+            and client_readiness.get("log_path") == readiness_log_path
+            and isinstance(client_readiness.get("log_path"), str)
+            and client_readiness["log_path"].startswith("/")
+            and client_readiness["log_path"].split("/")[-3:]
+            == [receipt["instance"], "log", "client-daemon.log"]
+            and isinstance(client_readiness.get("connected_line"), str)
+            and "Connected to scheduler (I am known as " in client_readiness["connected_line"]
+            and _is_int(client_readiness.get("offset"), minimum=0)
+            and client_readiness["offset"] == readiness_offset
+            and client_readiness.get("cache_required") is legacy_cache_required
+            and (
+                not legacy_cache_required
+                or (
+                    isinstance(client_readiness.get("cache_line"), str)
+                    and re.search(
+                        r"cache sidecar adapter state=2 lifecycle=3",
+                        client_readiness["cache_line"],
+                    )
+                    is not None
+                )
+            )
+            and (legacy_cache_required or client_readiness.get("cache_line") is None)
+        )
     if (
         not isinstance(readiness, Mapping) or set(readiness) != {"host", "line", "log_path", "offset", "role"}
         or readiness.get("role") != "C"
@@ -2211,31 +2523,8 @@ def _client_transition_receipt_errors(
         or not isinstance(readiness.get("line"), str)
         or re.search(r"ICECREAM daemon .* starting up", readiness["line"]) is None
         or not _is_int(readiness.get("offset"), minimum=0)
-        or not isinstance(client_readiness, Mapping)
-        or set(client_readiness) != {"cache_line", "cache_required", "connected_line", "host", "log_path", "offset"}
-        or client_readiness.get("host") != target.get("host")
-        or client_readiness.get("log_path") != readiness.get("log_path")
-        or not isinstance(client_readiness.get("log_path"), str)
-        or not client_readiness["log_path"].startswith("/")
-        or client_readiness["log_path"].split("/")[-3:]
-        != [receipt["instance"], "log", "client-daemon.log"]
-        or not isinstance(client_readiness.get("connected_line"), str)
-        or "Connected to scheduler (I am known as " not in client_readiness["connected_line"]
-        or not _is_int(client_readiness.get("offset"), minimum=0)
-        or client_readiness["offset"] != readiness["offset"]
-        or client_readiness.get("cache_required") is not cache_required
-        or (
-            cache_required
-            and (
-                not isinstance(client_readiness.get("cache_line"), str)
-                or re.search(
-                    r"cache sidecar adapter state=2 lifecycle=3",
-                    client_readiness["cache_line"],
-                )
-                is None
-            )
-        )
-        or (not cache_required and client_readiness.get("cache_line") is not None)
+        or not client_readiness_valid
+        or client_readiness.get("offset") != readiness_offset
     ):
         return {marker}
     return set()
@@ -2245,13 +2534,17 @@ def _transition_receipt_errors(
     observed: Mapping[str, Any] | None,
     expected: Mapping[str, Any],
     scenario: Mapping[str, Any],
+    *,
+    readiness_v2: bool = False,
 ) -> set[str]:
     marker = "@event:transition-coordination"
     if not isinstance(observed, Mapping) or observed.get("action") != expected.get("action"):
         return {marker}
     receipt = observed.get("receipt")
     if isinstance(receipt, Mapping) and receipt.get("schema") == "icefarm-client-transition-v1":
-        return _client_transition_receipt_errors(observed, expected, scenario)
+        return _client_transition_receipt_errors(
+            observed, expected, scenario, readiness_v2=readiness_v2
+        )
     if not isinstance(receipt, Mapping) or set(receipt) != {
         "action", "after", "before", "coordination", "event_epoch", "instance",
         "preflight", "readiness", "schema", "turn",
@@ -2400,15 +2693,35 @@ def _transition_receipt_errors(
         for name in expected_clients:
             witness = client_readiness[name]
             client = next((item for item in instances if isinstance(item, Mapping) and item.get("name") == name), None)
-            cache_required = (
-                after_protocol == 50
-                and isinstance(client, Mapping)
-                and _scenario_instance_protocol_at_epoch(
+            client_protocol = (
+                _scenario_instance_protocol_at_epoch(
                     scenario, client, receipt.get("event_epoch")
                 )
-                == 50
-                and client.get("env", {}).get("ICECC_P50_MODE") == "on"
+                if isinstance(client, Mapping)
+                else None
             )
+            client_env = (
+                _scenario_instance_env_at_epoch(
+                    scenario, client, receipt.get("event_epoch")
+                )
+                if isinstance(client, Mapping)
+                else None
+            )
+            cache_expected = (
+                client_protocol == 50
+                and isinstance(client_env, Mapping)
+                and client_env.get("ICECC_P50_MODE") == "on"
+            )
+            if readiness_v2:
+                if (
+                    not isinstance(client, Mapping)
+                    or not _valid_client_scheduler_readiness_v2(
+                        witness, client, cache_expected=cache_expected
+                    )
+                ):
+                    return {marker}
+                continue
+            cache_required = after_protocol == 50 and cache_expected
             if (
                 not isinstance(witness, Mapping)
                 or witness.get("cache_required") is not cache_required
@@ -2456,6 +2769,7 @@ def _shape_clauses(
     event_log: Any,
     topology: Any = None,
     run_id: Any = None,
+    readiness_v2: bool = False,
 ) -> list[dict[str, Any]]:
     shape = scenario.get("shape")
     clauses: list[dict[str, Any]] = []
@@ -2502,7 +2816,10 @@ def _shape_clauses(
                 else None
             )
             transition_bad = _transition_receipt_errors(
-                observed_event, expected_event, scenario
+                observed_event,
+                expected_event,
+                scenario,
+                readiness_v2=readiness_v2,
             )
             clauses.append(
                 _clause(
@@ -2537,7 +2854,10 @@ def _shape_clauses(
             and target.get("role") == "F"
             and isinstance(target.get("name"), str)
             and not _transition_receipt_errors(
-                event_log[0], expected_event, scenario
+                event_log[0],
+                expected_event,
+                scenario,
+                readiness_v2=readiness_v2,
             )
         ):
             authenticated_worker_transition = (
@@ -2635,7 +2955,10 @@ def _shape_clauses(
         required_dispatches = int(trigger_match.group(1)) if trigger_match else None
         coordination_bad = (
             _scheduler_restart_receipt_errors(
-                observed_event.get("receipt"), observed_event, scenario
+                observed_event.get("receipt"),
+                observed_event,
+                scenario,
+                readiness_v2=readiness_v2,
             )
             if isinstance(observed_event, Mapping)
             else {"@event:scheduler-restart-coordination"}
@@ -3390,6 +3713,28 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
         "network_shaping" in observations
     )
     plan = bundle.get("plan")
+    readiness_contract = (
+        plan.get("client_scheduler_readiness_contract")
+        if isinstance(plan, Mapping)
+        else None
+    )
+    readiness_contract_valid = readiness_contract in {
+        None,
+        CLIENT_SCHEDULER_READINESS_SCHEMA,
+    }
+    readiness_v2 = readiness_contract == CLIENT_SCHEDULER_READINESS_SCHEMA or (
+        not isinstance(plan, Mapping)
+        and _contains_client_scheduler_readiness_v2(bundle.get("event_log"))
+    )
+    if readiness_contract is not None:
+        clauses.append(
+            _clause(
+                "readiness.contract",
+                readiness_contract_valid,
+                "client scheduler readiness uses the authenticated v2 level/edge contract",
+                () if readiness_contract_valid else {"@plan:client-scheduler-readiness"},
+            )
+        )
     if isinstance(plan, Mapping):
         plan_network = plan.get("network_shaping")
         if isinstance(plan_network, Mapping):
@@ -4373,7 +4718,10 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
                 observed_event.get("workload_dispatch_count"), minimum=50
             )
             or _scheduler_restart_receipt_errors(
-                observed_event.get("receipt"), observed_event, scenario
+                observed_event.get("receipt"),
+                observed_event,
+                scenario,
+                readiness_v2=readiness_v2,
             )
         ):
             b4_bad.add("@event:s70-b4-scheduler")
@@ -4452,7 +4800,8 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
             active_bad.add("@event:s70-b4-scheduler-active-loss")
         else:
             receipt = observed.get("receipt")
-            if (_scheduler_active_loss_receipt_errors(receipt, observed, scenario)
+            if (_scheduler_active_loss_receipt_errors(
+                    receipt, observed, scenario, readiness_v2=readiness_v2)
                     or not isinstance(receipt, Mapping)
                     or not isinstance(receipt.get("before"), Mapping)
                     or not isinstance(receipt.get("after"), Mapping)
@@ -4717,7 +5066,12 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
             or observed_event.get("trigger") != expected_event.get("trigger")
             or observed_event.get("event_index") != 0
             or observed_event.get("event_epoch") != 1
-            or _transition_receipt_errors(observed_event, expected_event, scenario)
+            or _transition_receipt_errors(
+                observed_event,
+                expected_event,
+                scenario,
+                readiness_v2=readiness_v2,
+            )
         ):
             b5_bad.add("@event:s70-b5")
         else:
@@ -4827,7 +5181,10 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
                         minimum=dispatch_number,
                     )
                     or _transition_receipt_errors(
-                        observed_event, expected_event, scenario
+                        observed_event,
+                        expected_event,
+                        scenario,
+                        readiness_v2=readiness_v2,
                     )
                 ):
                     b6_bad.add(f"@event:s70-b6-{index}")
@@ -4998,7 +5355,10 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
                         minimum=trigger,
                     )
                     or _transition_receipt_errors(
-                        observed_event, expected_event, scenario
+                        observed_event,
+                        expected_event,
+                        scenario,
+                        readiness_v2=readiness_v2,
                     )
                 ):
                     b7_bad.add(f"@event:{clause_id}-{index}")
@@ -5517,6 +5877,7 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
             bundle.get("event_log"),
             bundle.get("topology"),
             bundle.get("run_id"),
+            readiness_v2=readiness_v2,
         )
     )
     return _finish(clauses)

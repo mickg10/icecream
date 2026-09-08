@@ -301,8 +301,12 @@ public:
                 && m_id != 0);
     }
 
-    /* C_GUID names the scheduler incarnation.  TU_SEQ is zero-based and
-       monotonic within that incarnation, so zero is the first valid value. */
+    /* A scheduler-supplied C_GUID names the scheduler incarnation and TU_SEQ
+       is zero-based within it.  A pre-v50 scheduler supplies neither field;
+       on a v50 C<->F legacy stream only, C may instead attach one fresh local
+       wire GUID with TU_SEQ zero.  That projection never becomes scheduler
+       epoch/nonce authority and exists solely to bind the exact CompileFile
+       stream at both capable peers. */
     void setCompileIdentity(uint64_t c_guid, uint64_t tu_seq)
     {
         m_c_guid = c_guid;

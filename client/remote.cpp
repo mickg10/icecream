@@ -802,6 +802,12 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
     if (!usecs->applyAssignmentTo(&job)) {
         throw client_error(9, "Error 9 - malformed assignment identity");
     }
+    if (job.hasAssignmentIdentity()) {
+        trace() << "P50 assignment identity bound for job " << job.jobID()
+                << " epoch " << job.assignmentEpoch() << " nonce "
+                << job.assignmentNonce() << " c_guid " << job.cGuid()
+                << " tu_seq " << job.tuSeq() << endl;
+    }
     job.setEnvironmentVersion(environment);   // hoping on the scheduler's wisdom
     trace() << "Have to use host " << hostname << ":" << port << " - Job ID: "
             << job.jobID() << " - env: " << usecs->host_platform
@@ -1140,6 +1146,16 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
             } else {
                 job.clearCompileInputIdentity();
                 if (cserver->protocol >= PROTOCOL_VERSION) {
+                    bool local_legacy_wire_identity = false;
+                    if (!job.hasCompileIdentity()) {
+                        local_legacy_wire_identity =
+                            icecc::p50::bind_local_legacy_wire_identity(job);
+                        if (!local_legacy_wire_identity) {
+                            throw client_error(
+                                106,
+                                "Error 106 - local legacy wire identity could not be minted");
+                        }
+                    }
                     const P50LegacyWireIdentity identity{
                         job.jobID(), job.assignmentEpoch(), job.assignmentNonce(),
                         job.cGuid(), job.tuSeq()};
@@ -1148,6 +1164,13 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
                             106,
                             "Error 106 - legacy wire identity could not be bound");
                     }
+                    trace() << "legacy wire identity bound for job "
+                            << job.jobID() << " epoch " << job.assignmentEpoch()
+                            << " nonce " << job.assignmentNonce() << " c_guid "
+                            << job.cGuid() << " tu_seq " << job.tuSeq()
+                            << " origin "
+                            << (local_legacy_wire_identity ? "client-local" : "scheduler")
+                            << endl;
                 }
             }
 

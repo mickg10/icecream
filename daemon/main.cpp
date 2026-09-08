@@ -5333,6 +5333,17 @@ void Daemon::poll_cache_adapter() noexcept
         if (invalidate_p50_source_waiters_for_lease()) {
             return;
         }
+        // A surviving sidecar remains C-local state while S is absent, but
+        // its already-admitted lifecycle/input work still needs one bounded
+        // reducer turn.  Without opening that turn here,
+        // outer_immediate_turn_required() pins answer_client_requests() to
+        // poll(..., 0) while reconnect() floods one delay line per spin.
+        // Starting a new incarnation remains impossible because scheduler
+        // ownership is false; this only drains finite work for A.
+        if (cache_adapter_start_attempted) {
+            (void)cache_adapter->outer_begin_turn(
+                std::chrono::steady_clock::now(), nullptr);
+        }
         return;
     }
 

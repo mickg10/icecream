@@ -501,6 +501,11 @@ void structured_actual_service_publishes_prebound_ready() {
     auto allocator = std::make_shared<LaunchIdentityAllocator>(73, 1);
     Config config = structured_config("unused", root, allocator, 0);
     config.executable = service_path;
+    // Unlike the in-process fake children, the real service performs the
+    // bounded cold system-source fingerprint before publishing READY.  Use
+    // the same finite launch budget as production iceccd; 150 ms is a fake-
+    // child scheduling budget and is not a valid cold-service contract.
+    config.readiness_timeout = std::chrono::milliseconds(5000);
     const std::string stale_socket = root + "/stale.sock";
     // Supervisor owns the structured socket, generation, attempt, and
     // StoreIdentity arguments.  The service-specific peer credentials remain

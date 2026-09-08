@@ -78,6 +78,7 @@ SUPPORTED_ACTIONS = frozenset(
 UNSUPPORTED_ACTIONS = frozenset(("netem_set",))
 TRANSITION_ACTIONS = frozenset(("upgrade", "downgrade", "env_set"))
 TRANSITION_SCHEMA = "icefarm-transition-v2"
+CLIENT_SCHEDULER_READINESS_SCHEMA = "icefarm-client-scheduler-readiness-v2"
 P29_FAULT_ENV = "ICECC_P50_FAULT_INJECTION"
 P29_FAULT_VALUE = "P29_INTERNER_FAIL_ONCE"
 IMAGE_LABEL_RE = re.compile(r"^p(43|44|50)(?:s[0-9]+)?(?:-|$)", re.IGNORECASE)
@@ -121,6 +122,23 @@ def select_direct_compiler_pairs(items: list[dict[str, Any]]) -> list[tuple[dict
         and child.get("state") not in {"Z", "X"}
         and "--generation" not in child.get("argv", [])
     ]
+
+
+def client_scheduler_readiness_route_admissible(
+    *,
+    cache_expected: bool,
+    route_before: Mapping[str, Any] | None,
+    route_after: Mapping[str, Any] | None,
+    cache_fresh: bool,
+) -> bool:
+    """Require a fresh READY edge only when the C-local route changed."""
+
+    if not cache_expected:
+        return route_before is None and route_after is None
+    return (
+        route_after is not None
+        and (route_before == route_after or cache_fresh)
+    )
 READINESS_SCRIPT = r'''
 import json, pathlib, re, sys
 
@@ -710,28 +728,46 @@ print(json.dumps({
 '''.strip()
 
 CLIENT_SCHEDULER_READINESS_SCRIPT = r'''
-import json, pathlib, re, sys
+import hashlib, json, pathlib, re, sys
 
 path = pathlib.Path(sys.argv[1])
 offset = int(sys.argv[2])
-cache_required = sys.argv[3] == "1"
+cache_expected = sys.argv[3] == "1"
 try:
-    payload = path.read_bytes()[offset:]
+    raw = path.read_bytes()
 except FileNotFoundError:
-    payload = b""
-lines = payload.decode("utf-8", "replace").splitlines()
-connected = [line for line in lines if "Connected to scheduler (I am known as " in line]
+    raw = b""
+if offset < 0 or offset > len(raw):
+    raise SystemExit("invalid readiness baseline")
+payload = raw[offset:]
+lines = []
+position = 0
+for chunk in raw.splitlines(keepends=True):
+    line = chunk.rstrip(b"\r\n").decode("utf-8", "replace")
+    lines.append((position, line))
+    position += len(chunk)
+connected = [item for item in lines if item[0] >= offset and "Connected to scheduler (I am known as " in item[1]]
+pattern = re.compile(r"cache sidecar adapter state=([0-9]+) lifecycle=([0-9]+)")
 cache = [
-    line
-    for line in lines
-    if re.search(r"cache sidecar adapter state=2 lifecycle=3", line)
+    (position, line, int(match.group(1)), int(match.group(2)))
+    for position, line in lines
+    if (match := pattern.search(line)) is not None
 ]
+latest = cache[-1] if cache else None
+cache_ready = latest is not None and latest[2:] == (2, 3)
 print(json.dumps({
     "bytes": len(payload),
-    "cache_line": cache[-1] if cache else None,
-    "cache_required": cache_required,
-    "connected_line": connected[-1] if connected else None,
-    "ready": bool(connected) and (not cache_required or bool(cache)),
+    "cache_expected": cache_expected,
+    "cache_fresh": latest is not None and latest[0] >= offset,
+    "cache_lifecycle": latest[3] if latest is not None else None,
+    "cache_line": latest[1] if latest is not None else None,
+    "cache_line_offset": latest[0] if latest is not None else None,
+    "cache_state": latest[2] if latest is not None else None,
+    "connected_line": connected[-1][1] if connected else None,
+    "connected_line_offset": connected[-1][0] if connected else None,
+    "post_sha256": hashlib.sha256(payload).hexdigest(),
+    "ready": bool(connected) and (not cache_expected or cache_ready),
+    "schema": "icefarm-client-scheduler-readiness-v2",
 }, sort_keys=True))
 '''.strip()
 
@@ -2074,12 +2110,22 @@ class EventProducer:
         }
         return receipt
 
+    def _client_cache_expected(self, client: Mapping[str, Any]) -> bool:
+        image = client.get("image")
+        label = image.get("label") if isinstance(image, Mapping) else None
+        if not isinstance(label, str):
+            raise EventError("client cache readiness has no image generation")
+        return (
+            self._image_version(label) == 50
+            and client.get("env", {}).get("ICECC_P50_MODE") == "on"
+        )
+
     def _wait_scheduler_client_readiness(
         self,
         client: Mapping[str, Any],
         baseline: Mapping[str, Any],
         *,
-        scheduler_cache_capable: bool,
+        route_before: Mapping[str, Any] | None,
     ) -> dict[str, Any]:
         deadline = min(
             self._start + self.deadline_s,
@@ -2089,13 +2135,9 @@ class EventProducer:
         label = image.get("label") if isinstance(image, Mapping) else None
         if not isinstance(label, str):
             raise EventError("client scheduler readiness has no target image generation")
-        if type(scheduler_cache_capable) is not bool:
-            raise EventError("client scheduler readiness has no scheduler capability")
-        cache_required = (
-            scheduler_cache_capable
-            and self._image_version(label) == 50
-            and client.get("env", {}).get("ICECC_P50_MODE") == "on"
-        )
+        cache_expected = self._client_cache_expected(client)
+        if cache_expected and route_before is not None and not isinstance(route_before, Mapping):
+            raise EventError("client scheduler readiness has an invalid prior route")
         while self.monotonic() < deadline:
             result = self._invoke(
                 self.factory.make(
@@ -2113,7 +2155,7 @@ class EventProducer:
                             CLIENT_SCHEDULER_READINESS_SCRIPT,
                             baseline["path"],
                             str(baseline["offset"]),
-                            "1" if cache_required else "0",
+                            "1" if cache_expected else "0",
                         ),
                     ),
                 )
@@ -2124,23 +2166,35 @@ class EventProducer:
                 raise EventError("client scheduler readiness returned malformed JSON") from exc
             if not isinstance(witness, dict) or set(witness) != {
                 "bytes",
+                "cache_expected",
+                "cache_fresh",
+                "cache_lifecycle",
                 "cache_line",
-                "cache_required",
+                "cache_line_offset",
+                "cache_state",
                 "connected_line",
+                "connected_line_offset",
+                "post_sha256",
                 "ready",
+                "schema",
             }:
                 raise EventError("client scheduler readiness returned an invalid witness")
             if witness.get("ready") is True:
                 connected = witness.get("connected_line")
                 cache_line = witness.get("cache_line")
                 if (
-                    witness.get("cache_required") is not cache_required
+                    witness.get("schema") != CLIENT_SCHEDULER_READINESS_SCHEMA
+                    or witness.get("cache_expected") is not cache_expected
                     or type(witness.get("bytes")) is not int
                     or witness["bytes"] < 1
+                    or not isinstance(witness.get("post_sha256"), str)
+                    or SHA256_RE.fullmatch(witness["post_sha256"]) is None
                     or not isinstance(connected, str)
                     or "Connected to scheduler (I am known as " not in connected
+                    or type(witness.get("connected_line_offset")) is not int
+                    or witness["connected_line_offset"] < baseline["offset"]
                     or (
-                        cache_required
+                        cache_expected
                         and (
                             not isinstance(cache_line, str)
                             or re.search(
@@ -2148,18 +2202,49 @@ class EventProducer:
                                 cache_line,
                             )
                             is None
+                            or witness.get("cache_state") != 2
+                            or witness.get("cache_lifecycle") != 3
+                            or type(witness.get("cache_line_offset")) is not int
+                            or witness["cache_line_offset"] < 0
+                            or type(witness.get("cache_fresh")) is not bool
                         )
                     )
-                    or (not cache_required and cache_line is not None)
                 ):
                     raise EventError("client scheduler readiness is inconsistent")
+                route = None
+                if cache_expected:
+                    route_after = self._client_route_state(client)
+                    if not client_scheduler_readiness_route_admissible(
+                        cache_expected=True,
+                        route_before=route_before,
+                        route_after=route_after,
+                        cache_fresh=witness.get("cache_fresh") is True,
+                    ):
+                        self._wake.wait(
+                            timeout=min(
+                                self.poll_interval_s,
+                                max(0.001, deadline - self.monotonic()),
+                            )
+                        )
+                        self._wake.clear()
+                        continue
+                    route = {"after": route_after, "before": route_before}
                 return {
+                    "bytes": witness["bytes"],
+                    "cache_expected": cache_expected,
+                    "cache_fresh": witness["cache_fresh"],
+                    "cache_lifecycle": witness["cache_lifecycle"],
                     "cache_line": cache_line,
-                    "cache_required": cache_required,
+                    "cache_line_offset": witness["cache_line_offset"],
+                    "cache_state": witness["cache_state"],
                     "connected_line": connected,
+                    "connected_line_offset": witness["connected_line_offset"],
                     "host": baseline["host"],
                     "log_path": baseline["path"],
                     "offset": baseline["offset"],
+                    "post_sha256": witness["post_sha256"],
+                    "route": route,
+                    "schema": CLIENT_SCHEDULER_READINESS_SCHEMA,
                 }
             self._wake.wait(
                 timeout=min(
@@ -2300,6 +2385,7 @@ class EventProducer:
         scheduler_startup: dict[str, Any] | None = None
         scheduler_worker_rejoin: dict[str, Any] | None = None
         client_readiness: dict[str, dict[str, Any]] = {}
+        client_routes_before: dict[str, Mapping[str, Any] | None] = {}
         ready_ms: int | None = None
         drain_timeout = self._command_timeout(int(self.scenario.data["timeouts"]["turn_s"]))
         scheduler = next(
@@ -2317,6 +2403,15 @@ class EventProducer:
             client_baselines = {
                 client["name"]: self._readiness_baseline(client) for client in clients
             }
+            if instance["role"] == "S":
+                client_routes_before = {
+                    client["name"]: (
+                        self._client_route_state(client)
+                        if self._client_cache_expected(client)
+                        else None
+                    )
+                    for client in clients
+                }
             target_baseline = self._readiness_baseline(instance)
             scheduler_baseline = (
                 self._readiness_baseline(scheduler) if instance["role"] == "F" else None
@@ -2391,9 +2486,7 @@ class EventProducer:
                     client["name"]: self._wait_scheduler_client_readiness(
                         client,
                         client_baselines[client["name"]],
-                        scheduler_cache_capable=(
-                            self._image_version(target["image"]["label"]) == 50
-                        ),
+                        route_before=client_routes_before[client["name"]],
                     )
                     for client in clients
                 }
@@ -2618,6 +2711,7 @@ class EventProducer:
         relaunch: Mapping[str, Any] | None = None
         readiness: dict[str, Any] | None = None
         client_readiness: dict[str, Any] | None = None
+        route_before: Mapping[str, Any] | None = None
         ready_ms: int | None = None
         after: dict[str, Any] | None = None
         primary: BaseException | None = None
@@ -2643,6 +2737,11 @@ class EventProducer:
             self._failure_evidence["checkpoint_clients"] = sorted(checkpoints)
             if event.instance not in checkpoints:
                 raise EventError("target C has no authenticated checkpoint")
+            current_client = {**instance, **before_state}
+            if self._client_cache_expected(current_client):
+                route_before = self._client_route_state_from_inspect(
+                    current_client, before
+                )
             for operation, args in (
                 ("stop", ("container", "stop", "--time", "10", before_id)),
                 ("remove", ("container", "rm", "--force", before_id)),
@@ -2676,20 +2775,10 @@ class EventProducer:
             if after.get("running") is not True:
                 raise EventError("C transition did not produce a running container")
             readiness = self._readiness_witness(instance, client_baselines[event.instance])
-            scheduler = next(
-                item
-                for item in self.plan["topology"]["instances"]
-                if item["role"] == "S"
-            )
             client_readiness = self._wait_scheduler_client_readiness(
                 target,
                 client_baselines[event.instance],
-                scheduler_cache_capable=(
-                    self._image_version(
-                        self._state[scheduler["name"]]["image"]["label"]
-                    )
-                    == 50
-                ),
+                route_before=route_before,
             )
             # This is the authenticated transition boundary.  Workload
             # release and relaunch are deliberately downstream of it and can
@@ -2814,7 +2903,12 @@ class EventProducer:
         # be reused by the restarted scheduler.
         lost_generation = self._scheduler_generation_for_job(self._last_job)
         client_routes_before = {
-            client["name"]: self._client_route_state(client) for client in clients
+            client["name"]: (
+                self._client_route_state(client)
+                if self._client_cache_expected(client)
+                else None
+            )
+            for client in clients
         }
         result = self._invoke(self.factory.make(
             phase="event.scheduler-loss-authenticate-compiler",
@@ -2912,17 +3006,17 @@ class EventProducer:
             client["name"]: self._wait_scheduler_client_readiness(
                 client,
                 client_baselines[client["name"]],
-                scheduler_cache_capable=(
-                    self._image_version(
-                        self._state[instance["name"]]["image"]["label"]
-                    )
-                    == 50
-                ),
+                route_before=client_routes_before[client["name"]],
             )
             for client in clients
         }
         client_routes_after = {
-            client["name"]: self._client_route_state(client) for client in clients
+            client["name"]: (
+                client_readiness[client["name"]]["route"]["after"]
+                if self._client_cache_expected(client)
+                else None
+            )
+            for client in clients
         }
         return {
             "action": event.action, "after": {"container_id": after["id"], "started_at": after["started_at"]},
@@ -2976,6 +3070,7 @@ class EventProducer:
         scheduler_snapshot: str | None = None
         worker_snapshot: str | None = None
         client_readiness: dict[str, dict[str, Any]] = {}
+        client_routes_before: dict[str, Mapping[str, Any] | None] = {}
         after: dict[str, Any] | None = None
         ready_ms: int | None = None
         drain_timeout = self._command_timeout(
@@ -2992,6 +3087,14 @@ class EventProducer:
             )
             client_baselines = {
                 client["name"]: self._readiness_baseline(client)
+                for client in clients
+            }
+            client_routes_before = {
+                client["name"]: (
+                    self._client_route_state(client)
+                    if self._client_cache_expected(client)
+                    else None
+                )
                 for client in clients
             }
             readiness_baseline = self._readiness_baseline(instance)
@@ -3046,12 +3149,7 @@ class EventProducer:
                 client["name"]: self._wait_scheduler_client_readiness(
                     client,
                     client_baselines[client["name"]],
-                    scheduler_cache_capable=(
-                        self._image_version(
-                            self._state[instance["name"]]["image"]["label"]
-                        )
-                        == 50
-                    ),
+                    route_before=client_routes_before[client["name"]],
                 )
                 for client in clients
             }
@@ -3274,6 +3372,44 @@ class EventProducer:
             "running": True,
         }
         return {"container": value, **processes}
+
+    def _client_route_state_from_inspect(
+        self,
+        client: Mapping[str, Any],
+        before: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Bind a route snapshot to an already-authenticated C inspection."""
+
+        identifier = before.get("id")
+        started_at = before.get("started_at")
+        if (
+            not isinstance(identifier, str)
+            or SHA256_RE.fullmatch(identifier) is None
+            or before.get("running") is not True
+            or not isinstance(started_at, str)
+            or not started_at
+        ):
+            raise EventError(
+                f"client {client['name']!r} lacks authenticated prior container identity"
+            )
+        processes = self._client_route_snapshot(client, identifier)
+        after = self._inspect(client["name"])
+        if (
+            after.get("id") != identifier
+            or after.get("started_at") != started_at
+            or after.get("running") is not True
+        ):
+            raise EventError(
+                f"client {client['name']!r} changed during prior route snapshot"
+            )
+        return {
+            "container": {
+                "container_id": identifier,
+                "running": True,
+                "started_at": started_at,
+            },
+            **processes,
+        }
 
     def _wait_client_route_owner_impl(
         self,

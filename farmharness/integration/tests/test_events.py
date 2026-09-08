@@ -26,6 +26,7 @@ from farmharness.integration.events import (
     EventProducer,
     EventTimeout,
     CLIENT_ROUTE_SIGNAL_SCRIPT,
+    CLIENT_SCHEDULER_READINESS_SCRIPT,
     CLIENT_TRANSITION_SCHEMA,
     GATE_CONTROL_SCRIPT,
     HEADER_EDIT_SCHEMA,
@@ -34,6 +35,7 @@ from farmharness.integration.events import (
     UnsupportedEvent,
     scheduler_generation_for_job_text,
     select_direct_compiler_pairs,
+    client_scheduler_readiness_route_admissible,
     run_events,
 )
 from farmharness.integration.farm_spec import load_farm_spec
@@ -54,12 +56,197 @@ from farmharness.integration.workload import run_workload
 INTEGRATION = Path(__file__).resolve().parents[1]
 
 
+def _client_scheduler_readiness_result(
+    command: PlannedCommand,
+    *,
+    cache_ready: bool = True,
+    cache_fresh: bool = True,
+    prior_lines: tuple[str, ...] = (),
+    cache_after_connected: bool = False,
+) -> CommandResult:
+    argv = decode_ssh_payload(command.argv)
+    offset = int(argv[-2])
+    cache_expected = argv[-1] == "1"
+    cache_line = (
+        "cache sidecar adapter state=2 lifecycle=3" if cache_ready else None
+    )
+    cache_offset = (
+        (offset + 1 if cache_fresh else max(0, offset - 1))
+        if cache_line is not None
+        else None
+    )
+    connected_line = "Connected to scheduler (I am known as C1)"
+    post_lines = list(prior_lines)
+    if cache_line is not None and cache_fresh and not cache_after_connected:
+        post_lines.append(cache_line)
+    post_lines.append(connected_line)
+    if cache_line is not None and cache_fresh and cache_after_connected:
+        post_lines.append(cache_line)
+    post_payload = ("\n".join(post_lines) + "\n").encode()
+    connected_offset = offset + sum(
+        len((line + "\n").encode())
+        for line in post_lines[: post_lines.index(connected_line)]
+    )
+    if cache_line is not None and cache_fresh:
+        cache_offset = offset + sum(
+            len((line + "\n").encode())
+            for line in post_lines[: post_lines.index(cache_line)]
+        )
+    return CommandResult(
+        0,
+        json.dumps(
+            {
+                "bytes": len(post_payload),
+                "cache_expected": cache_expected,
+                "cache_fresh": cache_line is not None and cache_fresh,
+                "cache_lifecycle": 3 if cache_line is not None else None,
+                "cache_line": cache_line,
+                "cache_line_offset": cache_offset,
+                "cache_state": 2 if cache_line is not None else None,
+                "connected_line": connected_line,
+                "connected_line_offset": connected_offset,
+                "post_sha256": hashlib.sha256(post_payload).hexdigest(),
+                "ready": bool(not cache_expected or cache_ready),
+                "schema": "icefarm-client-scheduler-readiness-v2",
+            }
+        ),
+        "",
+    )
+
+
+def _client_route_snapshot_result() -> CommandResult:
+    daemon = {
+        "argv": ["/opt/icecream/sbin/iceccd"],
+        "exe": "/opt/icecream/sbin/iceccd",
+        "exe_evidence": "proc-exe",
+        "pid": 10,
+        "ppid": 1,
+        "start_ticks": 100,
+        "uid": 0,
+    }
+    owner = {
+        "argv": ["/opt/icecream/sbin/icecc-cache-service"],
+        "exe": "/opt/icecream/sbin/icecc-cache-service",
+        "exe_evidence": "proc-exe",
+        "pid": 11,
+        "ppid": 10,
+        "start_ticks": 101,
+        "uid": 0,
+    }
+    return CommandResult(
+        0,
+        json.dumps(
+            {
+                "daemon": daemon,
+                "daemon_count": 1,
+                "ready": True,
+                "route_owner": owner,
+                "route_owner_count": 1,
+                "schema": "icefarm-client-route-snapshot-v1",
+            }
+        ),
+        "",
+    )
+
+
 def _fixture(tmp_path: Path):
     farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path)
     scenario = load_scenario_spec(INTEGRATION / "scenarios" / "S00-smoke.json", farm)
     plan = farmtest.build_plan(farm, scenario, run_id="event-unit")
     return farm, scenario, plan
+
+
+def _run_client_scheduler_readiness_script(
+    tmp_path: Path, raw: bytes, offset: int, *, cache_expected: bool = True
+) -> dict[str, object]:
+    path = tmp_path / "client-daemon.log"
+    path.write_bytes(raw)
+    result = subprocess.run(
+        (
+            sys.executable,
+            "-c",
+            CLIENT_SCHEDULER_READINESS_SCRIPT,
+            str(path),
+            str(offset),
+            "1" if cache_expected else "0",
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(result.stdout)
+
+
+def test_client_scheduler_readiness_reuses_same_route_ready_level(
+    tmp_path: Path,
+) -> None:
+    prefix = b"cache sidecar adapter state=2 lifecycle=3\n"
+    witness = _run_client_scheduler_readiness_script(
+        tmp_path,
+        prefix + b"Connected to scheduler (I am known as C1)\n",
+        len(prefix),
+    )
+    route = {"incarnation": "same"}
+
+    assert witness["ready"] is True
+    assert witness["cache_fresh"] is False
+    assert client_scheduler_readiness_route_admissible(
+        cache_expected=True,
+        route_before=route,
+        route_after=route,
+        cache_fresh=False,
+    )
+
+
+def test_client_scheduler_readiness_rejects_newer_nonready_level(
+    tmp_path: Path,
+) -> None:
+    prefix = b"cache sidecar adapter state=2 lifecycle=3\n"
+    witness = _run_client_scheduler_readiness_script(
+        tmp_path,
+        prefix
+        + b"Connected to scheduler (I am known as C1)\n"
+        + b"cache sidecar adapter state=1 lifecycle=2\n",
+        len(prefix),
+    )
+
+    assert witness["ready"] is False
+    assert witness["cache_state"] == 1
+    assert witness["cache_lifecycle"] == 2
+
+
+def test_client_scheduler_readiness_changed_route_needs_fresh_ready() -> None:
+    assert not client_scheduler_readiness_route_admissible(
+        cache_expected=True,
+        route_before={"incarnation": "old"},
+        route_after={"incarnation": "new"},
+        cache_fresh=False,
+    )
+    assert client_scheduler_readiness_route_admissible(
+        cache_expected=True,
+        route_before={"incarnation": "old"},
+        route_after={"incarnation": "new"},
+        cache_fresh=True,
+    )
+
+
+def test_client_scheduler_readiness_does_not_forbid_ready_under_old_scheduler(
+    tmp_path: Path,
+) -> None:
+    # The script deliberately receives no scheduler generation: cache level
+    # state belongs to C and remains valid while connected to a legacy S.
+    prefix = b"old scheduler boundary\n"
+    witness = _run_client_scheduler_readiness_script(
+        tmp_path,
+        prefix
+        + b"Connected to scheduler (I am known as C1)\n"
+        + b"cache sidecar adapter state=2 lifecycle=3\n",
+        len(prefix),
+    )
+
+    assert witness["ready"] is True
+    assert witness["cache_fresh"] is True
 
 
 class EventRecorder:
@@ -260,6 +447,9 @@ def test_active_scheduler_loss_collection_binds_post_offset_product_witness(
         INTEGRATION / "scenarios" / "S70-b4-scheduler-active-loss.json", farm
     )
     plan = farmtest.build_plan(farm, scenario, run_id="active-loss-collect")
+    # This fixture exercises retained pre-v2 active-loss evidence.  Current
+    # plans use the stronger incarnation-bound readiness receipt below.
+    plan.pop("client_scheduler_readiness_contract")
     log = tmp_path / "diagnostics" / "tt-quietbox3" / "F1.log" / "iceccd.log"
     log.parent.mkdir(parents=True)
     log.write_text(
@@ -1023,21 +1213,7 @@ def test_scheduler_restart_pauses_drains_reauthenticates_and_resumes(tmp_path: P
                     "",
                 )
             if command.phase == "event.client-scheduler-ready":
-                return CommandResult(
-                    0,
-                    json.dumps(
-                        {
-                            "bytes": 80,
-                            "cache_line": None,
-                            "cache_required": False,
-                            "connected_line": (
-                                "[1] Connected to scheduler (I am known as 10.0.0.1)"
-                            ),
-                            "ready": True,
-                        }
-                    ),
-                    "",
-                )
+                return _client_scheduler_readiness_result(command)
             if command.phase == "readiness.container":
                 return CommandResult(0, json.dumps({"Running": True}), "")
             if command.phase == "readiness.listcs":
@@ -2320,6 +2496,7 @@ class TransitionRecorder(EventRecorder):
         self.omit_current_env = False
         self.omit_target_mount = False
         self.omit_target_env = False
+        self.route_auth_hold: set[str] = set()
 
     def invoke(self, command: PlannedCommand) -> CommandResult:
         self.commands.append(command)
@@ -2350,7 +2527,10 @@ class TransitionRecorder(EventRecorder):
         if command.phase == "event.authenticate":
             self.auth_count += 1
             name = command.instance or "?"
-            self.instance_auth_counts[name] = self.instance_auth_counts.get(name, 0) + 1
+            if name in self.route_auth_hold:
+                self.route_auth_hold.remove(name)
+            else:
+                self.instance_auth_counts[name] = self.instance_auth_counts.get(name, 0) + 1
             if name not in self.current_ids:
                 self.current_ids[name] = "1" * 64
             elif self.instance_auth_counts[name] % 2 == 0:
@@ -2382,7 +2562,12 @@ class TransitionRecorder(EventRecorder):
                         "Id": self.current_ids[name],
                         "Name": f"/icefarm-event-unit-{name}",
                         "State": {
-                            "Running": self.after_running if is_after else self.before_running
+                            "Running": self.after_running if is_after else self.before_running,
+                            "StartedAt": (
+                                "2026-09-05T00:01:00Z"
+                                if is_after
+                                else "2026-09-05T00:00:00Z"
+                            ),
                         },
                         "Mounts": mounts,
                         "Config": {
@@ -2396,6 +2581,9 @@ class TransitionRecorder(EventRecorder):
                 ),
                 "",
             )
+        if command.phase == "event.scheduler-loss-client-route-snapshot":
+            self.route_auth_hold.add(command.instance or "?")
+            return _client_route_snapshot_result()
         if command.phase.endswith(".start") and command.phase.startswith("event."):
             self.next_mounts = []
             self.next_env = []
@@ -2486,24 +2674,7 @@ class CoordinatedTransitionRecorder(TransitionRecorder):
                 "",
             )
         if command.phase == "event.client-scheduler-ready":
-            cache_required = decode_ssh_payload(command.argv)[-1] == "1"
-            return CommandResult(
-                0,
-                json.dumps(
-                    {
-                        "bytes": 100,
-                        "cache_line": (
-                            "cache sidecar adapter state=2 lifecycle=3"
-                            if cache_required
-                            else None
-                        ),
-                        "cache_required": cache_required,
-                        "connected_line": "Connected to scheduler (I am known as C1)",
-                        "ready": True,
-                    }
-                ),
-                "",
-            )
+            return _client_scheduler_readiness_result(command)
         return result
 
 
@@ -2628,10 +2799,17 @@ def test_scheduler_transition_requires_fresh_workers_and_all_clients(tmp_path: P
         / "client-daemon.log"
     )
     client_log.parent.mkdir(parents=True)
-    connected = receipt["coordination"]["client_readiness"]["C1"][
-        "connected_line"
-    ]
-    client_log.write_bytes(b"0123456789" + (connected + "\n").encode())
+    client_witness = receipt["coordination"]["client_readiness"]["C1"]
+    client_lines = []
+    if client_witness["cache_fresh"]:
+        client_lines.append(client_witness["cache_line"])
+    client_lines.append(client_witness["connected_line"])
+    client_payload = ("\n".join(client_lines) + "\n").encode()
+    assert len(client_payload) == client_witness["bytes"]
+    assert hashlib.sha256(client_payload).hexdigest() == client_witness["post_sha256"]
+    client_log.write_bytes(
+        b"0" * (client_witness["offset"] - 1) + b"\n" + client_payload
+    )
     assert _event_log(tmp_path, scenario, farm=farm, plan=plan)[0]["receipt"] == receipt
 
     persisted = json.loads((tmp_path / "events" / "events.json").read_text())
@@ -2646,16 +2824,16 @@ def test_scheduler_transition_requires_fresh_workers_and_all_clients(tmp_path: P
 
 
 @pytest.mark.parametrize(
-    ("scenario_id", "cache_required"),
+    ("scenario_id", "cache_expected"),
     (
-        ("S60-13-warm-s-down", False),
+        ("S60-13-warm-s-down", True),
         ("S60-14-warm-s-up", True),
     ),
 )
-def test_scheduler_transition_client_cache_readiness_uses_target_scheduler_generation(
+def test_scheduler_transition_client_cache_readiness_is_client_local(
     tmp_path: Path,
     scenario_id: str,
-    cache_required: bool,
+    cache_expected: bool,
 ) -> None:
     farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path)
@@ -2694,11 +2872,11 @@ def test_scheduler_transition_client_cache_readiness_uses_target_scheduler_gener
     witnesses = receipt["coordination"]["client_readiness"]
     assert set(witnesses) == {"C1", "C2"}
     assert {
-        witness["cache_required"] for witness in witnesses.values()
-    } == {cache_required}
+        witness["cache_expected"] for witness in witnesses.values()
+    } == {cache_expected}
     assert {witness["cache_line"] for witness in witnesses.values()} == {
         "cache sidecar adapter state=2 lifecycle=3"
-        if cache_required
+        if cache_expected
         else None
     }
     assert all(
@@ -2713,15 +2891,32 @@ def test_scheduler_transition_client_cache_readiness_uses_target_scheduler_gener
     assert len(readiness_commands) == 2
     assert {
         decode_ssh_payload(command.argv)[-1] for command in readiness_commands
-    } == {"1" if cache_required else "0"}
+    } == {"1" if cache_expected else "0"}
     assert _event_log(tmp_path, scenario, farm=farm, plan=plan)[0]["receipt"] == receipt
+
+    original_document = json.loads(
+        (tmp_path / "events" / "events.json").read_text()
+    )
+    changed_route = json.loads(json.dumps(original_document))
+    changed = changed_route["events"][0]["receipt"]["coordination"][
+        "client_readiness"
+    ]["C1"]
+    changed["route"]["after"]["container"]["container_id"] = "f" * 64
+    changed["cache_fresh"] = False
+    changed["cache_line_offset"] = max(0, changed["offset"] - 1)
+    (tmp_path / "events" / "events.json").write_text(json.dumps(changed_route))
+    with pytest.raises(CollectError, match="transition coordination"):
+        _event_log(tmp_path, scenario, farm=farm, plan=plan)
+    (tmp_path / "events" / "events.json").write_text(
+        json.dumps(original_document)
+    )
 
     persisted = json.loads((tmp_path / "events" / "events.json").read_text())
     witness = persisted["events"][0]["receipt"]["coordination"][
         "client_readiness"
     ]["C1"]
-    if cache_required:
-        witness["cache_required"] = False
+    if cache_expected:
+        witness["cache_expected"] = False
         witness["cache_line"] = None
     else:
         witness["cache_line"] = "cache sidecar adapter state=2 lifecycle=3"
@@ -2958,21 +3153,7 @@ def test_b6_delayed_poll_requires_a_new_dispatch_before_restore(
                 document["epoch"] = int(command.argv[-2])
                 return CommandResult(0, json.dumps(document), result.stderr)
             if command.phase == "event.client-scheduler-ready":
-                return CommandResult(
-                    0,
-                    json.dumps(
-                        {
-                            "bytes": 100,
-                            "cache_line": "cache sidecar adapter state=2 lifecycle=3",
-                            "cache_required": True,
-                            "connected_line": (
-                                "Connected to scheduler (I am known as C1)"
-                            ),
-                            "ready": True,
-                        }
-                    ),
-                    "",
-                )
+                return _client_scheduler_readiness_result(command)
             return result
 
     four = "\n".join(f"put {job} in joblist of F1" for job in range(1, 5))
@@ -3211,7 +3392,7 @@ def _resign_checkpoint(value: dict[str, object]) -> dict[str, object]:
 
 
 class CheckpointClientTransitionRecorder(TransitionRecorder):
-    client_cache_required = True
+    client_cache_expected = True
 
     def invoke(self, command: PlannedCommand) -> CommandResult:
         result = super().invoke(command)
@@ -3245,24 +3426,11 @@ class CheckpointClientTransitionRecorder(TransitionRecorder):
                 "",
             )
         if command.phase == "event.client-scheduler-ready":
-            return CommandResult(
-                0,
-                json.dumps(
-                    {
-                        "bytes": 100,
-                        "cache_line": (
-                            "cache sidecar adapter state=2 lifecycle=3"
-                            if self.client_cache_required
-                            else None
-                        ),
-                        "cache_required": self.client_cache_required,
-                        "connected_line": (
-                            "Connected to scheduler (I am known as 10.0.0.1)"
-                        ),
-                        "ready": True,
-                    }
-                ),
-                "",
+            return _client_scheduler_readiness_result(
+                command,
+                cache_ready=self.client_cache_expected,
+                prior_lines=("ICECREAM daemon test starting up (nice level 5)",),
+                cache_after_connected=True,
             )
         return result
 
@@ -3408,7 +3576,8 @@ def test_job_triggered_client_fault_uses_checkpoint_path_and_passes_b5_verdict(
     )
     client_log.parent.mkdir(parents=True)
     client_log.write_bytes(
-        b"x" * witness["offset"]
+        b"x" * (witness["offset"] - 1)
+        + b"\n"
         + (
             event["receipt"]["readiness"]["line"]
             + "\n"
@@ -3499,14 +3668,21 @@ def test_job_triggered_client_fault_uses_checkpoint_path_and_passes_b5_verdict(
         "schema": BUNDLE_SCHEMA,
     }
     assert evaluate_bundle(bundle)["status"] == "PASS"
+    stale_replacement = json.loads(json.dumps(bundle))
+    stale_witness = stale_replacement["event_log"][0]["receipt"][
+        "client_readiness"
+    ]
+    stale_witness["cache_fresh"] = False
+    stale_witness["cache_line_offset"] = max(0, stale_witness["offset"] - 1)
+    assert evaluate_bundle(stale_replacement)["status"] == "FAIL"
 
 
 @pytest.mark.parametrize(
-    ("scenario_name", "cache_required"),
+    ("scenario_name", "cache_expected"),
     (("S60-04-c1-up.json", True), ("S60-07-c1-down.json", False)),
 )
 def test_client_transition_readiness_uses_target_image_generation(
-    tmp_path: Path, scenario_name: str, cache_required: bool
+    tmp_path: Path, scenario_name: str, cache_expected: bool
 ) -> None:
     farm = load_farm_spec(farm_fixture.example_farm_path())
     farm.data["hub"]["results_root"] = str(tmp_path)
@@ -3548,7 +3724,7 @@ def test_client_transition_readiness_uses_target_image_generation(
         }
 
     recorder = CheckpointClientTransitionRecorder(farm, plan)
-    recorder.client_cache_required = cache_required
+    recorder.client_cache_expected = cache_expected
     dispatched = "".join(
         f"put {index} in joblist of F1\n" for index in range(1, 25)
     )
@@ -3573,9 +3749,9 @@ def test_client_transition_readiness_uses_target_image_generation(
 
     assert len(producer.records) == 1
     readiness = producer.records[0].receipt["client_readiness"]
-    assert readiness["cache_required"] is cache_required
+    assert readiness["cache_expected"] is cache_expected
     assert readiness["cache_line"] == (
-        "cache sidecar adapter state=2 lifecycle=3" if cache_required else None
+        "cache sidecar adapter state=2 lifecycle=3" if cache_expected else None
     )
 
 

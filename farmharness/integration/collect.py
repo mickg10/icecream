@@ -80,6 +80,11 @@ PROFILE_RE = re.compile(
 ATTACH_RE = re.compile(
     r"\bP50 CompileFile attached exact (P29V1|ZSTD_TU|ZSTD_ROUTE) input for job ([0-9]+)\b"
 )
+LEGACY_WIRE_BIND_RE = re.compile(
+    r"\blegacy wire identity bound for job ([0-9]+) epoch ([0-9]+) "
+    r"nonce ([0-9]+) c_guid ([0-9]+) tu_seq ([0-9]+) "
+    r"origin (client-local|scheduler)\b"
+)
 LOGIN_RE = re.compile(r"\bRELOGIN ([A-Za-z0-9][A-Za-z0-9._-]*)\([^)]*\):.*$")
 ROLE_LOGIN_RE = re.compile(
     r"\blogin\s+([A-Za-z0-9][A-Za-z0-9._-]*)\s+protocol\s+version:\s*([0-9]+)\b"
@@ -93,6 +98,10 @@ WARM_HINT_OVERRIDE_RE = re.compile(
     r"compatible_free=([0-9]+) idle_excluded=([0-9]+)$"
 )
 CLIENT_ASSIGNMENT_RE = re.compile(r"\bHave to use host ([^ ]+) - Job ID: ([0-9]+)\b")
+P50_ASSIGNMENT_IDENTITY_RE = re.compile(
+    r"\bP50 assignment identity bound for job ([0-9]+) epoch ([0-9]+) "
+    r"nonce ([0-9]+) c_guid ([0-9]+) tu_seq ([0-9]+)\b"
+)
 LOCAL_BUILD_MARKERS = ("<building_local>", "building myself, but telling localhost")
 LOG_TIMESTAMP_RE = re.compile(
     r"\b([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}):"
@@ -106,6 +115,8 @@ SCHEDULER_ACTIVE_LOSS_SCHEMA = "icefarm-scheduler-active-loss-v1"
 DAEMON_START_RE = re.compile(r"ICECREAM daemon .* starting up")
 READINESS_SCHEDULER_RE = re.compile(r"ICECREAM scheduler .* starting up, port [0-9]+")
 CACHE_READY_RE = re.compile(r"cache sidecar adapter state=2 lifecycle=3")
+CACHE_STATE_RE = re.compile(r"cache sidecar adapter state=([0-9]+) lifecycle=([0-9]+)")
+CLIENT_SCHEDULER_READINESS_SCHEMA = "icefarm-client-scheduler-readiness-v2"
 SCHEDULER_NEW_RE = re.compile(r"^NEW ([0-9]+) client=([A-Za-z0-9][A-Za-z0-9._-]*)\b")
 SCHEDULER_DISPATCH_RE = re.compile(
     r"^put ([0-9]+) in joblist of ([A-Za-z0-9][A-Za-z0-9._-]*)\b"
@@ -745,6 +756,47 @@ def _source_results(path: Path) -> dict[tuple[int, int, int], dict[str, Any]]:
     return records
 
 
+def _source_candidates_for_assignment(
+    source_results: Mapping[tuple[int, int, int], dict[str, Any]],
+    scheduler_job: int,
+    scheduler_version: int,
+    assignment_identity: tuple[int, int, int] | None = None,
+) -> list[tuple[tuple[int, int, int], dict[str, Any]]]:
+    """Return only source evidence the assignment's S could have selected.
+
+    Scheduler job numbers restart after replacement.  A pre-v50 scheduler can
+    never emit a P50 cache tail, so a same-number source record from an older
+    capable scheduler is historical rather than a candidate for this row.
+    """
+
+    if scheduler_version < 50:
+        return []
+    return [
+        (key, source)
+        for key, source in source_results.items()
+        if key[0] == scheduler_job
+        and (assignment_identity is None or key == assignment_identity)
+    ]
+
+
+def _p50_assignment_identity_marker(
+    text: str, scheduler_job: int
+) -> tuple[int, int, int] | None:
+    """Return one exact scheduler assignment identity from a job-local log."""
+
+    identities = set()
+    for match in P50_ASSIGNMENT_IDENTITY_RE.finditer(text):
+        values = tuple(int(match.group(index)) for index in range(1, 6))
+        if values[0] != scheduler_job:
+            continue
+        if any(value <= 0 for value in values[:4]) or values[4] < 0:
+            raise CollectError("client P50 assignment identity marker is invalid")
+        identities.add(values[:3])
+    if len(identities) > 1:
+        raise CollectError("client P50 assignment identity marker is ambiguous")
+    return next(iter(identities)) if identities else None
+
+
 def _compile_identities(path: Path) -> dict[tuple[int, int, int], dict[str, Any]]:
     records: dict[tuple[int, int, int], dict[str, Any]] = {}
     for index, item in enumerate(_read_jsonl(path), start=1):
@@ -773,10 +825,10 @@ def _compile_identities(path: Path) -> dict[tuple[int, int, int], dict[str, Any]
 
 def _legacy_wire_results(
     path: Path, role: str
-) -> dict[tuple[int, int, int], dict[str, Any]]:
+) -> dict[tuple[int, int, int, int, int], dict[str, Any]]:
     if role not in ("C", "F"):
         raise ValueError(f"invalid legacy-wire role {role!r}")
-    records: dict[tuple[int, int, int], dict[str, Any]] = {}
+    records: dict[tuple[int, int, int, int, int], dict[str, Any]] = {}
     for index, item in enumerate(_read_jsonl(path), start=1):
         if (
             frozenset(item) != LEGACY_WIRE_FIELDS
@@ -822,7 +874,13 @@ def _legacy_wire_results(
         )
         if item[sent_field] == 0 or item[received_field] == 0:
             raise CollectError(f"{path}:{index}: legacy-wire transfer is incomplete")
-        key = (item["job_id"], item["assignment_epoch"], item["assignment_nonce"])
+        key = (
+            item["job_id"],
+            item["assignment_epoch"],
+            item["assignment_nonce"],
+            item["c_guid"],
+            item["tu_seq"],
+        )
         if key in records:
             raise CollectError(f"{path}: duplicate legacy-wire result for {key}")
         records[key] = item
@@ -959,6 +1017,205 @@ def _retained_log_witness_exact(
         and isinstance(line, str)
         and line in payload[:byte_count].decode("utf-8", "replace").splitlines()
     )
+
+
+CLIENT_SCHEDULER_READINESS_FIELDS = frozenset(
+    {
+        "bytes",
+        "cache_expected",
+        "cache_fresh",
+        "cache_lifecycle",
+        "cache_line",
+        "cache_line_offset",
+        "cache_state",
+        "connected_line",
+        "connected_line_offset",
+        "host",
+        "log_path",
+        "offset",
+        "post_sha256",
+        "route",
+        "schema",
+    }
+)
+
+
+def _valid_client_route_state(value: Any) -> bool:
+    if not isinstance(value, Mapping) or set(value) != {
+        "container",
+        "daemon",
+        "route_owner",
+    }:
+        return False
+    container = value.get("container")
+    daemon = value.get("daemon")
+    owner = value.get("route_owner")
+    return (
+        isinstance(container, Mapping)
+        and set(container) == {"container_id", "running", "started_at"}
+        and isinstance(container.get("container_id"), str)
+        and SHA256_RE.fullmatch(container["container_id"]) is not None
+        and container.get("running") is True
+        and isinstance(container.get("started_at"), str)
+        and bool(container["started_at"])
+        and _valid_route_process(daemon, "/opt/icecream/sbin/iceccd")
+        and _valid_route_process(owner, "/opt/icecream/sbin/icecc-cache-service")
+        and owner["ppid"] == daemon["pid"]
+        and owner["uid"] == daemon["uid"]
+    )
+
+
+def _retained_client_scheduler_readiness_v2(
+    evidence: Path | None,
+    instance: Mapping[str, Any],
+    witness: Mapping[str, Any],
+) -> bool:
+    """Recompute the producer's exact readiness view from its retained prefix."""
+
+    if evidence is None or not (evidence / "diagnostics").is_dir():
+        return True
+    path = _one_role_log(evidence, instance)
+    if path is None:
+        return False
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return False
+    offset = witness.get("offset")
+    byte_count = witness.get("bytes")
+    if (
+        type(offset) is not int
+        or offset < 0
+        or type(byte_count) is not int
+        or byte_count < 1
+        or offset + byte_count > len(raw)
+        or hashlib.sha256(raw[offset : offset + byte_count]).hexdigest()
+        != witness.get("post_sha256")
+    ):
+        return False
+    endpoint = offset + byte_count
+    lines: list[tuple[int, str]] = []
+    position = 0
+    for chunk in raw[:endpoint].splitlines(keepends=True):
+        line = chunk.rstrip(b"\r\n").decode("utf-8", "replace")
+        lines.append((position, line))
+        position += len(chunk)
+    connected = [
+        item
+        for item in lines
+        if item[0] >= offset
+        and "Connected to scheduler (I am known as " in item[1]
+    ]
+    if not connected or connected[-1] != (
+        witness.get("connected_line_offset"),
+        witness.get("connected_line"),
+    ):
+        return False
+    cache = []
+    for line_offset, line in lines:
+        match = CACHE_STATE_RE.search(line)
+        if match is not None:
+            cache.append(
+                (line_offset, line, int(match.group(1)), int(match.group(2)))
+            )
+    if not cache:
+        return all(
+            witness.get(field) is None
+            for field in (
+                "cache_lifecycle",
+                "cache_line",
+                "cache_line_offset",
+                "cache_state",
+            )
+        ) and witness.get("cache_fresh") is False
+    latest = cache[-1]
+    return (
+        latest
+        == (
+            witness.get("cache_line_offset"),
+            witness.get("cache_line"),
+            witness.get("cache_state"),
+            witness.get("cache_lifecycle"),
+        )
+        and witness.get("cache_fresh") is (latest[0] >= offset)
+    )
+
+
+def _valid_client_scheduler_readiness_v2(
+    witness: Any,
+    client: Mapping[str, Any],
+    *,
+    cache_expected: bool,
+    expected_host: str,
+    expected_path: str,
+    evidence: Path | None,
+) -> bool:
+    if (
+        not isinstance(witness, Mapping)
+        or set(witness) != CLIENT_SCHEDULER_READINESS_FIELDS
+        or witness.get("schema") != CLIENT_SCHEDULER_READINESS_SCHEMA
+        or witness.get("host") != expected_host
+        or witness.get("log_path") != expected_path
+        or type(witness.get("offset")) is not int
+        or witness["offset"] < 0
+        or type(witness.get("bytes")) is not int
+        or witness["bytes"] < 1
+        or not isinstance(witness.get("post_sha256"), str)
+        or SHA256_RE.fullmatch(witness["post_sha256"]) is None
+        or witness.get("cache_expected") is not cache_expected
+        or type(witness.get("cache_fresh")) is not bool
+        or not isinstance(witness.get("connected_line"), str)
+        or "Connected to scheduler (I am known as " not in witness["connected_line"]
+        or type(witness.get("connected_line_offset")) is not int
+        or witness["connected_line_offset"] < witness["offset"]
+    ):
+        return False
+    cache_line = witness.get("cache_line")
+    if cache_line is None:
+        cache_consistent = all(
+            witness.get(field) is None
+            for field in ("cache_lifecycle", "cache_line_offset", "cache_state")
+        ) and witness.get("cache_fresh") is False
+    else:
+        match = CACHE_STATE_RE.search(cache_line) if isinstance(cache_line, str) else None
+        cache_consistent = (
+            match is not None
+            and type(witness.get("cache_line_offset")) is int
+            and 0 <= witness["cache_line_offset"] < witness["offset"] + witness["bytes"]
+            and type(witness.get("cache_state")) is int
+            and type(witness.get("cache_lifecycle")) is int
+            and int(match.group(1)) == witness["cache_state"]
+            and int(match.group(2)) == witness["cache_lifecycle"]
+            and witness["cache_fresh"] is (
+                witness["cache_line_offset"] >= witness["offset"]
+            )
+        )
+    if not cache_consistent:
+        return False
+    route = witness.get("route")
+    if cache_expected:
+        if (
+            witness.get("cache_state") != 2
+            or witness.get("cache_lifecycle") != 3
+            or not isinstance(route, Mapping)
+            or set(route) != {"after", "before"}
+            or (route["before"] is not None and not _valid_client_route_state(route["before"]))
+            or not _valid_client_route_state(route["after"])
+            or (route["before"] != route["after"] and witness.get("cache_fresh") is not True)
+        ):
+            return False
+    elif route is not None:
+        return False
+    return _retained_client_scheduler_readiness_v2(evidence, client, witness)
+
+
+def _requires_client_scheduler_readiness_v2(plan: Mapping[str, Any]) -> bool:
+    contract = plan.get("client_scheduler_readiness_contract")
+    if contract is None:
+        return False
+    if contract != CLIENT_SCHEDULER_READINESS_SCHEMA:
+        raise CollectError("plan has an unknown client scheduler readiness contract")
+    return True
 
 
 def _p29_interner_faults(
@@ -1516,6 +1773,79 @@ def _validate_scheduler_active_loss_receipt(
     if type(offset) is not int or offset < 0:
         raise CollectError(f"{prefix} has invalid F log offset")
     quiescence = receipt["quiescence"]
+    readiness_v2 = _requires_client_scheduler_readiness_v2(plan)
+    client_readiness = (
+        quiescence.get("client_readiness") if isinstance(quiescence, Mapping) else None
+    )
+    client_routes = (
+        quiescence.get("client_routes") if isinstance(quiescence, Mapping) else None
+    )
+    client_evidence_valid = (
+        isinstance(client_readiness, Mapping)
+        and set(client_readiness) == set(scenario.data["workload"]["clients"])
+        and isinstance(client_routes, Mapping)
+        and set(client_routes) == set(scenario.data["workload"]["clients"])
+    )
+    if client_evidence_valid and readiness_v2:
+        for name in scenario.data["workload"]["clients"]:
+            client = next(
+                item for item in plan["topology"]["instances"] if item["name"] == name
+            )
+            version = _planned_instance_version_at_epoch(
+                scenario, client, receipt.get("event_epoch")
+            )
+            env = _planned_instance_env_at_epoch(
+                scenario, client, receipt.get("event_epoch")
+            )
+            expected_host, expected_path = _transition_readiness_path(
+                farm, plan, client
+            )
+            witness = client_readiness[name]
+            pair = client_routes[name]
+            if (
+                not _valid_client_scheduler_readiness_v2(
+                    witness,
+                    client,
+                    cache_expected=(
+                        version == 50 and env.get("ICECC_P50_MODE") == "on"
+                    ),
+                    expected_host=expected_host,
+                    expected_path=expected_path,
+                    evidence=evidence,
+                )
+                or not isinstance(pair, Mapping)
+                or set(pair) != {"after", "before"}
+                or pair.get("before") != pair.get("after")
+                or witness.get("route") != pair
+            ):
+                client_evidence_valid = False
+                break
+    elif client_evidence_valid:
+        client_evidence_valid = all(
+            isinstance(witness, Mapping)
+            and set(witness)
+            == {"bytes", "cache_line", "cache_required", "connected_line", "host", "log_path", "offset"}
+            and type(witness.get("bytes")) is int
+            and witness["bytes"] >= 1
+            and type(witness.get("cache_required")) is bool
+            and isinstance(witness.get("connected_line"), str)
+            and "Connected to scheduler (I am known as " in witness["connected_line"]
+            and isinstance(witness.get("host"), str)
+            and bool(witness["host"])
+            and isinstance(witness.get("log_path"), str)
+            and witness["log_path"].startswith("/")
+            and type(witness.get("offset")) is int
+            and witness["offset"] >= 0
+            for witness in client_readiness.values()
+        ) and all(
+            isinstance(pair, Mapping)
+            and set(pair) == {"before", "after"}
+            and isinstance(pair["before"], Mapping)
+            and isinstance(pair["after"], Mapping)
+            and pair["before"] == pair["after"]
+            and _valid_client_route_state(pair["before"])
+            for pair in client_routes.values()
+        )
     if (not isinstance(quiescence, Mapping)
             or set(quiescence) != {"client_readiness", "client_routes", "scheduler_snapshot", "scheduler_startup", "worker_snapshot"}
             or not isinstance(quiescence.get("scheduler_startup"), Mapping)
@@ -1525,48 +1855,7 @@ def _validate_scheduler_active_loss_receipt(
             or not quiescence["scheduler_snapshot"].strip()
             or not isinstance(quiescence.get("worker_snapshot"), str)
             or not quiescence["worker_snapshot"].strip()
-            or not isinstance(quiescence.get("client_readiness"), Mapping)
-            or set(quiescence["client_readiness"]) != set(scenario.data["workload"]["clients"])
-            or any(
-                not isinstance(witness, Mapping)
-                or set(witness) != {"bytes", "cache_line", "cache_required", "connected_line", "host", "log_path", "offset"}
-                or type(witness.get("bytes")) is not int or witness["bytes"] < 1
-                or type(witness.get("cache_required")) is not bool
-                or not isinstance(witness.get("connected_line"), str)
-                or "Connected to scheduler (I am known as " not in witness["connected_line"]
-                or not isinstance(witness.get("host"), str) or not witness["host"]
-                or not isinstance(witness.get("log_path"), str) or not witness["log_path"].startswith("/")
-                or type(witness.get("offset")) is not int or witness["offset"] < 0
-                for witness in quiescence.get("client_readiness", {}).values()
-            )
-            or not isinstance(quiescence.get("client_routes"), Mapping)
-            or set(quiescence["client_routes"]) != set(scenario.data["workload"]["clients"])
-            or any(
-                not isinstance(pair, Mapping) or set(pair) != {"before", "after"}
-                or not isinstance(pair["before"], Mapping) or not isinstance(pair["after"], Mapping)
-                or set(pair["before"]) != {"container", "daemon", "route_owner"}
-                or set(pair["after"]) != {"container", "daemon", "route_owner"}
-                or pair["before"] != pair["after"]
-                or not isinstance(pair["before"].get("container"), Mapping)
-                or set(pair["before"]["container"]) != {"container_id", "started_at", "running"}
-                or not SHA256_RE.fullmatch(str(pair["before"]["container"].get("container_id", "")))
-                or not isinstance(pair["before"]["container"].get("started_at"), str)
-                or not pair["before"]["container"]["started_at"]
-                or pair["before"]["container"].get("running") is not True
-                or not _valid_route_process(pair["before"].get("daemon"), "/opt/icecream/sbin/iceccd")
-                or not _valid_route_process(pair["before"].get("route_owner"), "/opt/icecream/sbin/icecc-cache-service")
-                or any(
-                    not isinstance(proc, Mapping)
-                    or not isinstance(proc.get("pid"), int) or proc["pid"] <= 1
-                    or not isinstance(proc.get("ppid"), int) or proc["ppid"] < 1
-                    or not isinstance(proc.get("start_ticks"), int) or proc["start_ticks"] < 1
-                    or not isinstance(proc.get("exe"), str) or not proc["exe"].startswith("/")
-                    for proc in (pair["before"].get("daemon"), pair["before"].get("route_owner"))
-                )
-                or pair["before"]["route_owner"].get("ppid") != pair["before"]["daemon"].get("pid")
-                or pair["before"]["route_owner"].get("uid") != pair["before"]["daemon"].get("uid")
-                for pair in quiescence["client_routes"].values()
-            )
+            or not client_evidence_valid
             or not isinstance(quiescence.get("scheduler_snapshot"), str)
             or not isinstance(quiescence.get("worker_snapshot"), str)
             or any(
@@ -2293,6 +2582,7 @@ def _validate_scheduler_restart_receipt(
         )
         == 50
     )
+    readiness_v2 = _requires_client_scheduler_readiness_v2(plan)
     gate_fields = {
         "action",
         "active_after",
@@ -2348,48 +2638,57 @@ def _validate_scheduler_restart_receipt(
         )
         witness = client_readiness[name]
         expected_host, expected_path = _transition_readiness_path(farm, plan, client)
-        cache_required = (
-            scheduler_cache_capable
-            and client.get("version") == 50
-            and client.get("env", {}).get("ICECC_P50_MODE") == "on"
+        client_version = _planned_instance_version_at_epoch(
+            scenario, client, receipt.get("event_epoch")
         )
-        if (
-            not isinstance(witness, Mapping)
-            or set(witness)
-            != {
-                "cache_line",
-                "cache_required",
-                "connected_line",
-                "host",
-                "log_path",
-                "offset",
+        client_env = _planned_instance_env_at_epoch(
+            scenario, client, receipt.get("event_epoch")
+        )
+        cache_expected = (
+            client_version == 50 and client_env.get("ICECC_P50_MODE") == "on"
+        )
+        valid_readiness = _valid_client_scheduler_readiness_v2(
+            witness,
+            client,
+            cache_expected=cache_expected,
+            expected_host=expected_host,
+            expected_path=expected_path,
+            evidence=evidence,
+        ) if readiness_v2 else (
+            isinstance(witness, Mapping)
+            and set(witness) == {
+                "cache_line", "cache_required", "connected_line", "host", "log_path", "offset"
             }
-            or witness.get("host") != expected_host
-            or witness.get("log_path") != expected_path
-            or type(witness.get("offset")) is not int
-            or witness["offset"] < 0
-            or witness.get("cache_required") is not cache_required
-            or not isinstance(witness.get("connected_line"), str)
-            or "Connected to scheduler (I am known as "
-            not in witness["connected_line"]
-            or (
-                cache_required
-                and (
-                    not isinstance(witness.get("cache_line"), str)
-                    or CACHE_READY_RE.search(witness["cache_line"]) is None
+            and witness.get("host") == expected_host
+            and witness.get("log_path") == expected_path
+            and type(witness.get("offset")) is int
+            and witness["offset"] >= 0
+            and witness.get("cache_required")
+            is (scheduler_cache_capable and cache_expected)
+            and isinstance(witness.get("connected_line"), str)
+            and "Connected to scheduler (I am known as " in witness["connected_line"]
+            and (
+                not (scheduler_cache_capable and cache_expected)
+                or (
+                    isinstance(witness.get("cache_line"), str)
+                    and CACHE_READY_RE.search(witness["cache_line"]) is not None
                 )
             )
-            or (not cache_required and witness.get("cache_line") is not None)
-            or not _retained_log_witness(
+            and (
+                (scheduler_cache_capable and cache_expected)
+                or witness.get("cache_line") is None
+            )
+            and _retained_log_witness(
                 evidence, client, witness.get("offset"), witness.get("connected_line")
             )
-            or (
-                cache_required
-                and not _retained_log_witness(
+            and (
+                not (scheduler_cache_capable and cache_expected)
+                or _retained_log_witness(
                     evidence, client, witness.get("offset"), witness.get("cache_line")
                 )
             )
-        ):
+        )
+        if not valid_readiness:
             raise CollectError(
                 f"events.json event {index} has invalid fresh scheduler readiness for {name}"
             )
@@ -2703,6 +3002,53 @@ def _planned_instance_version_at_epoch(
     return version
 
 
+def _planned_instance_env_at_epoch(
+    scenario: ScenarioSpec,
+    instance: Mapping[str, Any],
+    event_epoch: object,
+) -> dict[str, str]:
+    """Resolve a planned endpoint environment after an authenticated epoch."""
+
+    env = instance.get("env")
+    timeline = scenario.data.get("timeline")
+    images = scenario.data.get("images")
+    name = instance.get("name")
+    role = instance.get("role")
+    image = instance.get("image")
+    label = image.get("label") if isinstance(image, Mapping) else None
+    if (
+        not isinstance(env, Mapping)
+        or any(type(key) is not str or type(value) is not str for key, value in env.items())
+        or type(event_epoch) is not int
+        or event_epoch < 0
+        or not isinstance(timeline, list)
+        or event_epoch > len(timeline)
+        or not isinstance(images, Mapping)
+        or not isinstance(name, str)
+        or role not in {"S", "C", "F"}
+        or not isinstance(label, str)
+    ):
+        raise CollectError("cannot resolve planned instance environment at event epoch")
+    result = dict(env)
+    current_label = label
+    for event in timeline[:event_epoch]:
+        if not isinstance(event, Mapping) or event.get("instance") != name:
+            continue
+        action = event.get("action")
+        if action not in {"upgrade", "downgrade", "env_set"}:
+            continue
+        if action in {"upgrade", "downgrade"}:
+            alias = event.get("image")
+            target_label = images.get(alias) if isinstance(alias, str) else None
+            if not isinstance(target_label, str):
+                raise CollectError("timeline environment transition has no image authority")
+            current_label = target_label
+        result = _transition_target_env(
+            {"env": result}, event, str(role), current_label
+        )
+    return result
+
+
 def _transition_target_env(
     before: Mapping[str, Any], event: Mapping[str, Any], role: str, target_label: str
 ) -> dict[str, str]:
@@ -2752,6 +3098,7 @@ def _validate_transition_coordination(
     evidence: Path | None,
 ) -> bool:
     role = instance["role"]
+    readiness_v2 = _requires_client_scheduler_readiness_v2(plan)
     scheduler_cache_capable = False
     if role == "S":
         after = receipt.get("after")
@@ -2857,43 +3204,54 @@ def _validate_transition_coordination(
         for name in sorted(expected_clients):
             client = next((item for item in plan["topology"]["instances"] if item["name"] == name), None)
             witness = clients[name]
-            required_cache = (
-                scheduler_cache_capable
-                and isinstance(client, Mapping)
-                and client.get("version") == 50
-                and client.get("env", {}).get("ICECC_P50_MODE") == "on"
-            )
-            if (
-                not isinstance(client, Mapping)
-                or client.get("role") != "C"
-                or not isinstance(witness, Mapping)
-                or set(witness) != {"cache_line", "cache_required", "connected_line", "host", "log_path", "offset"}
-                or witness.get("host") != client.get("host")
-                or witness.get("cache_required") is not required_cache
-                or not isinstance(witness.get("log_path"), str)
-                or not witness["log_path"].endswith(f"/{name}/log/client-daemon.log")
-                or not isinstance(witness.get("offset"), int)
-                or not isinstance(witness.get("connected_line"), str)
-                or "Connected to scheduler (I am known as " not in witness["connected_line"]
-                or (required_cache and (not isinstance(witness.get("cache_line"), str) or CACHE_READY_RE.search(witness["cache_line"]) is None))
-                or (not required_cache and witness.get("cache_line") is not None)
-                or not _retained_log_witness(
-                    evidence,
-                    client,
-                    witness.get("offset"),
-                    witness.get("connected_line"),
-                )
-                or (
-                    required_cache
-                    and not _retained_log_witness(
-                        evidence,
-                        client,
-                        witness.get("offset"),
-                        witness.get("cache_line"),
-                    )
-                )
-            ):
+            if not isinstance(client, Mapping) or client.get("role") != "C":
                 return False
+            expected_client_host, expected_client_path = _transition_readiness_path(
+                farm, plan, client
+            )
+            client_version = _planned_instance_version_at_epoch(
+                scenario, client, receipt.get("event_epoch")
+            )
+            client_env = _planned_instance_env_at_epoch(
+                scenario, client, receipt.get("event_epoch")
+            )
+            cache_expected = (
+                client_version == 50 and client_env.get("ICECC_P50_MODE") == "on"
+            )
+            if readiness_v2:
+                if not _valid_client_scheduler_readiness_v2(
+                    witness,
+                    client,
+                    cache_expected=cache_expected,
+                    expected_host=expected_client_host,
+                    expected_path=expected_client_path,
+                    evidence=evidence,
+                ):
+                    return False
+            else:
+                required_cache = scheduler_cache_capable and cache_expected
+                if (
+                    not isinstance(witness, Mapping)
+                    or set(witness) != {"cache_line", "cache_required", "connected_line", "host", "log_path", "offset"}
+                    or witness.get("host") != expected_client_host
+                    or witness.get("cache_required") is not required_cache
+                    or witness.get("log_path") != expected_client_path
+                    or not isinstance(witness.get("offset"), int)
+                    or not isinstance(witness.get("connected_line"), str)
+                    or "Connected to scheduler (I am known as " not in witness["connected_line"]
+                    or (required_cache and (not isinstance(witness.get("cache_line"), str) or CACHE_READY_RE.search(witness["cache_line"]) is None))
+                    or (not required_cache and witness.get("cache_line") is not None)
+                    or not _retained_log_witness(
+                        evidence, client, witness.get("offset"), witness.get("connected_line")
+                    )
+                    or (
+                        required_cache
+                        and not _retained_log_witness(
+                            evidence, client, witness.get("offset"), witness.get("cache_line")
+                        )
+                    )
+                ):
+                    return False
     else:
         if DAEMON_START_RE.search(readiness["line"]) is None:
             return False
@@ -3198,58 +3556,65 @@ def _validate_transition_receipt(
             raise CollectError(
                 f"events.json event {index} has invalid client image version"
             ) from exc
-        cache_required = (
+        cache_expected = (
             after_version == 50
             and after_snapshot["env"].get("ICECC_P50_MODE") == "on"
-            and _planned_instance_version_at_epoch(
-                scenario,
-                next(
-                    item
-                    for item in plan["topology"]["instances"]
-                    if item["role"] == "S"
-                ),
-                receipt.get("event_epoch"),
-            )
-            == 50
         )
-        if (
-            not isinstance(client_readiness, Mapping)
-            or set(client_readiness) != {
-                "cache_line", "cache_required", "connected_line", "host", "log_path", "offset"
-            }
-            or client_readiness.get("host") != target_host
-            or client_readiness.get("log_path") != target_path
-            or type(client_readiness.get("offset")) is not int
-            or client_readiness["offset"] < 0
-            or client_readiness["offset"] != readiness["offset"]
-            or not isinstance(client_readiness.get("connected_line"), str)
-            or "Connected to scheduler (I am known as " not in client_readiness["connected_line"]
-            or type(client_readiness.get("cache_required")) is not bool
-            or client_readiness["cache_required"] is not cache_required
-            or (
-                cache_required
-                and (
-                    not isinstance(client_readiness.get("cache_line"), str)
-                    or CACHE_READY_RE.search(client_readiness["cache_line"]) is None
-                )
-            )
-            or (not cache_required and client_readiness.get("cache_line") is not None)
-            or not _retained_log_witness(
-                evidence,
+        if _requires_client_scheduler_readiness_v2(plan):
+            valid_client_readiness = _valid_client_scheduler_readiness_v2(
+                client_readiness,
                 instance,
-                client_readiness.get("offset"),
-                client_readiness.get("connected_line"),
+                cache_expected=cache_expected,
+                expected_host=target_host,
+                expected_path=target_path,
+                evidence=evidence,
+            ) and client_readiness.get("offset") == readiness["offset"]
+        else:
+            legacy_cache_required = (
+                cache_expected
+                and _planned_instance_version_at_epoch(
+                    scenario,
+                    next(
+                        item
+                        for item in plan["topology"]["instances"]
+                        if item["role"] == "S"
+                    ),
+                    receipt.get("event_epoch"),
+                )
+                == 50
             )
-            or (
-                cache_required
-                and not _retained_log_witness(
-                    evidence,
-                    instance,
-                    client_readiness.get("offset"),
-                    client_readiness.get("cache_line"),
+            valid_client_readiness = (
+                isinstance(client_readiness, Mapping)
+                and set(client_readiness) == {
+                    "cache_line", "cache_required", "connected_line", "host", "log_path", "offset"
+                }
+                and client_readiness.get("host") == target_host
+                and client_readiness.get("log_path") == target_path
+                and type(client_readiness.get("offset")) is int
+                and client_readiness["offset"] >= 0
+                and client_readiness["offset"] == readiness["offset"]
+                and isinstance(client_readiness.get("connected_line"), str)
+                and "Connected to scheduler (I am known as " in client_readiness["connected_line"]
+                and client_readiness.get("cache_required") is legacy_cache_required
+                and (
+                    not legacy_cache_required
+                    or (
+                        isinstance(client_readiness.get("cache_line"), str)
+                        and CACHE_READY_RE.search(client_readiness["cache_line"]) is not None
+                    )
+                )
+                and (legacy_cache_required or client_readiness.get("cache_line") is None)
+                and _retained_log_witness(
+                    evidence, instance, client_readiness.get("offset"), client_readiness.get("connected_line")
+                )
+                and (
+                    not legacy_cache_required
+                    or _retained_log_witness(
+                        evidence, instance, client_readiness.get("offset"), client_readiness.get("cache_line")
+                    )
                 )
             )
-        ):
+        if not valid_client_readiness:
             raise CollectError(f"events.json event {index} has invalid client readiness")
     readiness_pattern = (
         READINESS_SCHEDULER_RE if readiness["role"] == "S" else DAEMON_START_RE
@@ -3489,6 +3854,39 @@ def _profile_marker(job_dir: Path) -> dict[str, Any] | None:
     }
 
 
+def _legacy_wire_binding_marker(
+    text: str, scheduler_job: int
+) -> tuple[int, int, int, int, int] | None:
+    """Resolve the exact C-local/fenced wire identity from one job log."""
+
+    matches = []
+    for match in LEGACY_WIRE_BIND_RE.finditer(text):
+        values = tuple(int(match.group(index)) for index in range(1, 6))
+        if values[0] != scheduler_job:
+            continue
+        origin = match.group(6)
+        assignment_absent = values[1] == 0 and values[2] == 0
+        assignment_complete = values[1] > 0 and values[2] > 0
+        if (
+            values[0] <= 0
+            or values[3] <= 0
+            or not (assignment_absent or assignment_complete)
+            # A current scheduler in enforcing-compat mode can mint the
+            # compile GUID while deliberately withholding epoch/nonce from a
+            # relationship that is not assignment-fence eligible.  Only a
+            # C-local GUID proves absence of scheduler assignment authority;
+            # scheduler origin is valid in either canonical zero/zero or
+            # complete/complete form.
+            or (origin == "client-local" and not assignment_absent)
+        ):
+            raise CollectError("client legacy-wire binding marker is invalid")
+        matches.append(values)
+    unique = set(matches)
+    if len(unique) > 1:
+        raise CollectError("client legacy-wire binding marker is ambiguous")
+    return next(iter(unique)) if unique else None
+
+
 def _endpoint_workers(plan: dict[str, Any]) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
     for instance in plan["topology"]["instances"]:
@@ -3644,11 +4042,22 @@ def _parse_rows(
             }
             raw_jobs.append(raw_job)
             marker = _profile_marker(job_dir)
-            candidates = [
-                (key, source)
-                for key, source in source_results.items()
-                if key[0] == scheduler_job
-            ]
+            legacy_marker = _legacy_wire_binding_marker(log_text, scheduler_job)
+            assignment_identity = _p50_assignment_identity_marker(
+                log_text, scheduler_job
+            )
+            scheduler = next(
+                item for item in topology if item["role"] == "S"
+            )
+            assignment_scheduler_version = _instance_version_at(
+                scheduler, events, final_assignment["observed_ms"]
+            )
+            candidates = _source_candidates_for_assignment(
+                source_results,
+                scheduler_job,
+                assignment_scheduler_version,
+                assignment_identity,
+            )
             authenticated = []
             if marker is not None:
                 authenticated = [
@@ -3672,12 +4081,13 @@ def _parse_rows(
                 (key, wire)
                 for key, wire in c_legacy_wires.items()
                 if key[0] == scheduler_job
+                and (legacy_marker is None or key == legacy_marker)
                 and (
                     (key[1] == 0 and key[2] == 0)
                     or (
-                        key in compile_identities
-                        and compile_identities[key]["c_guid"] == wire["c_guid"]
-                        and compile_identities[key]["tu_seq"] == wire["tu_seq"]
+                        key[:3] in compile_identities
+                        and compile_identities[key[:3]]["c_guid"] == wire["c_guid"]
+                        and compile_identities[key[:3]]["tu_seq"] == wire["tu_seq"]
                     )
                 )
             ]

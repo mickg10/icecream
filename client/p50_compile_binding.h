@@ -35,6 +35,15 @@ namespace icecc::p50 {
 [[nodiscard]] PrepareRequestKey compile_prepare_request(
     const CompileJob& job) noexcept;
 
+// A pre-v50 scheduler cannot mint the compile identity carried only on the
+// v50 C<->F link.  When both assignment words and the compile identity are
+// wholly absent, mint one fresh C-local wire namespace and attach it to the
+// legacy CompileFile.  This never fabricates scheduler epoch/nonce authority.
+// Partial or scheduler-supplied identities are always refused or preserved.
+[[nodiscard]] bool bind_local_legacy_wire_identity_with_provider(
+    CompileJob& job, ClaimAttemptEntropyProvider provider) noexcept;
+[[nodiscard]] bool bind_local_legacy_wire_identity(CompileJob& job) noexcept;
+
 // Converts only an exact committed sender result into the P50 CompileFile
 // selector.  ATTEMPT_ID remains compiler-owner metadata and never enters the
 // InputRecordKey; REQUEST_ID is the nonzero assignment-bound local attachment

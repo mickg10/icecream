@@ -184,6 +184,19 @@ def check_parent(source: str) -> None:
             "parent does not bind terminal disposition to its retained lease")
     require("cache_adapter->outer_immediate_turn_required()" in source,
             "daemon poll owner can sleep through finite sidecar work")
+    schedulerless = section(
+        source,
+        "if (!scheduler_cache_owner || scheduler == nullptr) {",
+        "icecc::p50::advertisement::Update update;",
+    )
+    ordered(
+        schedulerless,
+        "cache_adapter->outer_set_scheduler_owner(false);",
+        "invalidate_p50_source_waiters_for_lease()",
+        "if (cache_adapter_start_attempted)",
+        "cache_adapter->outer_begin_turn(",
+        "return;",
+    )
     ordered(flow,
             "p50_completion_matches_retained_lease(",
             "InputLifecycleAction::CloseAcceptedJob",

@@ -19,12 +19,16 @@ from farmharness.integration.collect import (
     _control_observations,
     _event_log,
     _instance_version_at,
+    _legacy_wire_binding_marker,
+    _legacy_wire_results,
     _one_role_log,
     _p29_interner_faults,
+    _p50_assignment_identity_marker,
     _retained_log_witness,
     _retained_log_witness_exact,
     _parse_logins,
     _snapshot_live_evidence,
+    _source_candidates_for_assignment,
     _source_results,
     _transition_target_env,
     _validate_orphan_recovery_markers,
@@ -1393,6 +1397,32 @@ def test_collection_joins_source_result_by_full_assignment_identity(
         collect_bundle(farm, scenario, plan, sync_remote=False)
 
 
+def test_source_attribution_does_not_reuse_a_job_id_after_legacy_s_restart() -> None:
+    stale = _source_result_record()
+    source_results = {(2, 1, 1): stale}
+
+    assert _source_candidates_for_assignment(source_results, 2, 43) == []
+    assert _source_candidates_for_assignment(source_results, 2, 50) == [
+        ((2, 1, 1), stale)
+    ]
+
+
+def test_source_attribution_binds_reused_current_scheduler_job_to_exact_epoch() -> None:
+    first = _source_result_record()
+    second = {**first, "assignment_epoch": 7, "assignment_nonce": 8}
+    source_results = {(2, 1, 1): first, (2, 7, 8): second}
+    log = (
+        "P50 assignment identity bound for job 2 epoch 7 nonce 8 "
+        "c_guid 99 tu_seq 0"
+    )
+    identity = _p50_assignment_identity_marker(log, 2)
+
+    assert identity == (2, 7, 8)
+    assert _source_candidates_for_assignment(
+        source_results, 2, 50, identity
+    ) == [((2, 7, 8), second)]
+
+
 def test_collection_refuses_a_commit_without_exact_wire_byte_counts(
     tmp_path: Path,
 ) -> None:
@@ -1528,6 +1558,59 @@ def test_collection_conserves_absent_assignment_legacy_wire_bytes(
     assert bundle["rows"][0]["c_to_f_bytes"] == 400
     assert bundle["rows"][0]["f_to_c_bytes"] == 200
     assert bundle["observations"]["legacy_wire"]["record_count"] == 1
+
+
+def test_absent_assignment_legacy_wire_keys_include_local_guid(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "c-legacy-wire.jsonl"
+    records = []
+    for guid in (101, 202):
+        records.append(
+            {
+                "assignment_epoch": 0,
+                "assignment_nonce": 0,
+                "c_guid": guid,
+                "c_to_f_received_bytes": 0,
+                "c_to_f_sent_bytes": 400,
+                "f_to_c_received_bytes": 200,
+                "f_to_c_sent_bytes": 0,
+                "job_id": 2,
+                "role": "C",
+                "schema": "icecream-p50-legacy-wire-v1",
+                "tu_seq": 0,
+            }
+        )
+    _write_jsonl(path, records)
+
+    parsed = _legacy_wire_results(path, "C")
+
+    assert set(parsed) == {(2, 0, 0, 101, 0), (2, 0, 0, 202, 0)}
+    text = (
+        "legacy wire identity bound for job 2 epoch 0 nonce 0 "
+        "c_guid 202 tu_seq 0 origin client-local"
+    )
+    assert _legacy_wire_binding_marker(text, 2) == (2, 0, 0, 202, 0)
+    scheduler_compat = (
+        "legacy wire identity bound for job 2 epoch 0 nonce 0 "
+        "c_guid 101 tu_seq 0 origin scheduler"
+    )
+    assert _legacy_wire_binding_marker(scheduler_compat, 2) == (
+        2,
+        0,
+        0,
+        101,
+        0,
+    )
+
+
+def test_legacy_wire_binding_marker_rejects_origin_authority_mismatch() -> None:
+    with pytest.raises(CollectError, match="binding marker is invalid"):
+        _legacy_wire_binding_marker(
+            "legacy wire identity bound for job 2 epoch 7 nonce 8 "
+            "c_guid 202 tu_seq 0 origin client-local",
+            2,
+        )
 
 
 @pytest.mark.parametrize(("epoch", "nonce"), ((0, 1), (1, 0)))
