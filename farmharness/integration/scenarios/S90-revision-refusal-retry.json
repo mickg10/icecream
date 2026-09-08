@@ -3,7 +3,7 @@
   "id": "S90-revision-refusal-retry",
   "shape": "S'[F~][C']",
   "images": {
-    "new": "p50s4-c1edd359",
+    "new": "p50s4-64334538",
     "mutant": "p50s90-f-hidden-skew-f9648cc1"
   },
   "instances": [
