@@ -1162,6 +1162,11 @@ static void dcc_daemon_terminate(int whichsig)
      * Don't call printf. and especially don't call the log_*() functions.
      */
 
+    /* sig_atomic_t assignment is the only new operation here.  A forked
+       compile worker uses its private copy to require that the compiler's
+       terminating signal exactly match this owned worker shutdown. */
+    workit_daemon_shutdown_signal = whichsig;
+
     if (exit_main_loop > 1) {
         // The > 1 is because we get one more signal from the kill(0,...) below.
         // hmm, we got killed already twice. try better

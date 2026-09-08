@@ -60,13 +60,27 @@ fi
 # Keep the socket namespace below sockaddr_un.sun_path even when the caller's
 # TMPDIR is a long out-of-tree build path.
 work=$(mktemp -d /tmp/p5c.XXXXXX)
+# A root scheduler changes to its service account before opening the requested
+# log.  Keep only the private root traversable and pre-create that log as
+# writable; HOME and cache runtime directories below remain mode 0700.
+chmod 0711 "$work"
+: >"$work/scheduler.log"
+chmod 0666 "$work/scheduler.log"
 cleanup() {
-    for pid in "${retry_wrapper_pid:-}" "${service_pid:-}" "${client_service_pid:-}" "${client_pid:-}" "${worker_pid:-}" "${sched_pid:-}"; do
+    for pid in "${bounded_wrapper_pid:-}" "${inflight_wrapper_pid:-}" \
+        "${inflight_replacement_worker_pid:-}" "${strict_retry_wrapper_pid:-}" \
+        "${retry_wrapper_pid:-}" "${strict_first_worker_pid:-}" \
+        "${service_pid:-}" "${client_service_pid:-}" "${client_pid:-}" \
+        "${worker_pid:-}" "${sched_pid:-}"; do
         test -n "$pid" && kill "$pid" 2>/dev/null || :
     done
     for _ in $(seq 1 50); do
         live=0
-        for pid in "${retry_wrapper_pid:-}" "${service_pid:-}" "${client_service_pid:-}" "${client_pid:-}" "${worker_pid:-}" "${sched_pid:-}"; do
+        for pid in "${bounded_wrapper_pid:-}" "${inflight_wrapper_pid:-}" \
+            "${inflight_replacement_worker_pid:-}" "${strict_retry_wrapper_pid:-}" \
+            "${retry_wrapper_pid:-}" "${strict_first_worker_pid:-}" \
+            "${service_pid:-}" "${client_service_pid:-}" "${client_pid:-}" \
+            "${worker_pid:-}" "${sched_pid:-}"; do
             if test -n "$pid" && kill -0 "$pid" 2>/dev/null; then
                 live=1
             fi
@@ -74,10 +88,19 @@ cleanup() {
         test "$live" -eq 0 && break
         sleep 0.1
     done
-    for pid in "${retry_wrapper_pid:-}" "${service_pid:-}" "${client_service_pid:-}" "${client_pid:-}" "${worker_pid:-}" "${sched_pid:-}"; do
+    for pid in "${bounded_wrapper_pid:-}" "${inflight_wrapper_pid:-}" \
+        "${inflight_replacement_worker_pid:-}" "${strict_retry_wrapper_pid:-}" \
+        "${retry_wrapper_pid:-}" "${strict_first_worker_pid:-}" \
+        "${service_pid:-}" "${client_service_pid:-}" "${client_pid:-}" \
+        "${worker_pid:-}" "${sched_pid:-}"; do
         test -n "$pid" && kill -9 "$pid" 2>/dev/null || :
     done
+    wait "${bounded_wrapper_pid:-}" 2>/dev/null || :
+    wait "${inflight_wrapper_pid:-}" 2>/dev/null || :
+    wait "${inflight_replacement_worker_pid:-}" 2>/dev/null || :
+    wait "${strict_retry_wrapper_pid:-}" 2>/dev/null || :
     wait "${retry_wrapper_pid:-}" 2>/dev/null || :
+    wait "${strict_first_worker_pid:-}" 2>/dev/null || :
     wait "${client_pid:-}" 2>/dev/null || :
     wait "${worker_pid:-}" 2>/dev/null || :
     wait "${sched_pid:-}" 2>/dev/null || :
@@ -91,19 +114,28 @@ trap cleanup EXIT HUP INT TERM
 
 mkdir -p "$work/envs-f" "$work/envs-c" "$work/toolchain" "$work/src" \
     "$work/out" "$work/cache-runtime-f" "$work/cache-runtime-c" "$work/home" \
-    "$work/evidence" "$work/bin"
+    "$work/evidence" "$work/bin" "$work/envs-f-strict1" \
+    "$work/envs-f-strict2" "$work/envs-f-strict3" \
+    "$work/cache-runtime-f-strict1" "$work/cache-runtime-f-strict2" \
+    "$work/cache-runtime-f-strict3"
 ln -s "$build/client/icecc-p50-completion-test" "$work/bin/icecc"
 test "$(readlink -f "$work/bin/icecc")" = \
     "$(readlink -f "$build/client/icecc-p50-completion-test")" || {
     echo "FAIL: check-only icecc symlink does not resolve to the isolated test wrapper" >&2
     exit 1
 }
-chmod 1777 "$work/envs-f" "$work/envs-c"
-chmod 0700 "$work/cache-runtime-f" "$work/cache-runtime-c" "$work/home"
+chmod 1777 "$work/envs-f" "$work/envs-c" "$work/envs-f-strict1" \
+    "$work/envs-f-strict2" "$work/envs-f-strict3"
+chmod 0700 "$work/cache-runtime-f" "$work/cache-runtime-c" "$work/home" \
+    "$work/cache-runtime-f-strict1" "$work/cache-runtime-f-strict2" \
+    "$work/cache-runtime-f-strict3"
 HOME="$work/home"
 export HOME
 port_sched=$((24000 + ($$ % 1000)))
 port_worker=$((25000 + ($$ % 1000)))
+port_worker_strict1=$((26000 + ($$ % 1000)))
+port_worker_strict2=$((27000 + ($$ % 1000)))
+port_worker_strict3=$((28000 + ($$ % 1000)))
 network="p50completion-$$"
 experiment_id=${ICECC_P50_EXPERIMENT_ID:-p50completionflow}
 
@@ -134,6 +166,29 @@ printf '%s\n' \
     'int p50_fresh_local_retry_translation_unit() {' \
     '    return static_cast<int>(UINT32_C(54));' \
     '}' >"$work/src/fresh-local-retry.cpp"
+printf '%s\n' \
+    '#include <cstdint>' \
+    'int p50_fresh_strict_retry_translation_unit() {' \
+    '    return static_cast<int>(UINT32_C(55));' \
+    '}' >"$work/src/fresh-strict-retry.cpp"
+printf '%s\n' \
+    '#include <cstdint>' \
+    'int p50_bounded_strict_retry_translation_unit() {' \
+    '    return static_cast<int>(UINT32_C(56));' \
+    '}' >"$work/src/bounded-strict-retry.cpp"
+printf '%s\n' \
+    '#include <cstdint>' \
+    'template<int N> struct P50WorkerLossSpin {' \
+    '    __attribute__((noinline)) static std::uint32_t run(std::uint32_t value) {' \
+    '        return P50WorkerLossSpin<N - 1>::run(value * UINT32_C(1664525) + N) ^ (value >> (N % 7));' \
+    '    }' \
+    '};' \
+    'template<> struct P50WorkerLossSpin<0> {' \
+    '    __attribute__((noinline)) static std::uint32_t run(std::uint32_t value) { return value; }' \
+    '};' \
+    'std::uint32_t p50_inflight_worker_loss_translation_unit(std::uint32_t value) {' \
+    '    return P50WorkerLossSpin<3000>::run(value);' \
+    '}' >"$work/src/inflight-worker-loss.cpp"
 
 (cd "$work/toolchain" && timeout "$timeout_s" \
     bash "$build/client/icecc-create-env" "$(command -v g++)" \
@@ -715,4 +770,554 @@ fi
 worker_pid=
 service_pid=
 
-echo "PASS: real P50 terminal lifecycle plus 107/106 fresh scheduler-local retry"
+# Start a fresh first worker incarnation for the strict-P50 retry cells.  The
+# first strict assignment will be failed at the real post-output disposition
+# boundary, then this incarnation is removed before the retry is released.
+strict_ready_before=$(grep -E -c \
+    'RELOGIN p50-f.*cache=.*cache_profiles=.*zstd_tu' \
+    "$work/scheduler.log" 2>/dev/null || true)
+ICECC_TEST_SOCKET="$work/worker-strict1.sock" ICECC_P50_C1F1_REQUIRED=1 \
+    ICECC_P50_TEST_LIFECYCLE_TRACE="$work/lifecycle-strict1.trace" \
+    ICECC_P50_TEST_READY_TRACE="$work/ready-strict1.trace" \
+    "$build/daemon/iceccd" "$@" -p "$port_worker_strict1" -m 1 \
+    -s "$worker_scheduler_host:$port_sched" -n "$network" -N p50-f \
+    -b "$work/envs-f-strict1" -l "$work/f-strict1.log" -vvv \
+    --cache-service "$build/cache/icecc-cache-service" \
+    --cache-runtime-dir "$work/cache-runtime-f-strict1" &
+worker_pid=$!
+
+strict_first_ready=0
+for _ in $(seq 1 300); do
+    strict_ready_now=$(grep -E -c \
+        'RELOGIN p50-f.*cache=.*cache_profiles=.*zstd_tu' \
+        "$work/scheduler.log" 2>/dev/null || true)
+    if test "${strict_ready_now:-0}" -gt "${strict_ready_before:-0}"; then
+        strict_first_ready=1
+        break
+    fi
+    kill -0 "$worker_pid" 2>/dev/null || break
+    sleep 0.1
+done
+test "$strict_first_ready" -eq 1 || {
+    echo "FAIL: first strict-retry worker did not advertise READY" >&2
+    exit 1
+}
+service_pid=
+for _ in $(seq 1 300); do
+    service_pid=$(find_service_pid)
+    test -n "$service_pid" && break
+    sleep 0.1
+done
+test -n "$service_pid" || {
+    echo "FAIL: first strict-retry worker has no cache sidecar" >&2
+    exit 1
+}
+
+strict_retry_marker="$work/fresh-strict-retry.barrier"
+strict_retry_release="$strict_retry_marker.release"
+strict_retry_identity="$work/fresh-strict-retry-compile-identity.jsonl"
+strict_retry_client_log="$work/fresh-strict-retry-client.log"
+strict_retry_remote_obj="$work/out/fresh-strict-retry-remote.o"
+strict_retry_local_obj="$work/out/fresh-strict-retry-local.o"
+
+ICECC_TEST_SOCKET="$work/client.sock" ICECC_TEST_REMOTEBUILD=1 \
+    ICECC_VERSION="$envtar" ICECC_PREFERRED_HOST=p50-f \
+    ICECC_CARET_WORKAROUND=0 ICECC_P50_C1F1_REQUIRED=1 \
+    ICECC_P50_TEST_FRESH_STRICT_RETRY=1 \
+    ICECC_P50_TEST_DISPOSITION=accepted-send-fail \
+    ICECC_P50_TEST_FRESH_LEGACY_RETRY_BARRIER="$strict_retry_marker" \
+    ICECC_P50_COMPILE_IDENTITY_TRACE="$strict_retry_identity" \
+    ICECC_DEBUG=debug ICECC_LOGFILE="$strict_retry_client_log" \
+    timeout "$timeout_s" "$work/bin/icecc" \
+    g++ -std=c++17 -O2 -Wall -c "$work/src/fresh-strict-retry.cpp" \
+    -o "$strict_retry_remote_obj" >"$work/fresh-strict-retry.out" 2>&1 &
+strict_retry_wrapper_pid=$!
+
+strict_retry_armed=0
+for _ in $(seq 1 300); do
+    if test -s "$strict_retry_marker"; then
+        strict_retry_armed=1
+        break
+    fi
+    kill -0 "$strict_retry_wrapper_pid" 2>/dev/null || break
+    sleep 0.1
+done
+test "$strict_retry_armed" -eq 1 || {
+    echo "FAIL: strict retry did not reach its first post-output barrier" >&2
+    exit 1
+}
+strict_first_job=$(python3 - "$strict_retry_marker" <<'PY'
+import json
+import sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["job_id"])
+PY
+)
+test -n "$strict_first_job"
+test -s "$strict_retry_remote_obj" || {
+    echo "FAIL: first strict P50 attempt produced no complete object" >&2
+    exit 1
+}
+rm -f -- "$strict_retry_remote_obj"
+wait_for_count 1 'action 1 status applied reason handle_end' \
+    "$work/f-strict1.log"
+wait_for_count 1 "END $strict_first_job status=0 .* server=p50-f" \
+    "$work/scheduler.log"
+
+strict_remove_before=$(grep -c 'remove daemon p50-f' \
+    "$work/scheduler.log" 2>/dev/null || true)
+strict_first_worker_pid=$worker_pid
+strict_first_service_pid=$service_pid
+kill -TERM "$strict_first_worker_pid" 2>/dev/null || :
+for _ in $(seq 1 100); do
+    kill -0 "$strict_first_worker_pid" 2>/dev/null || break
+    sleep 0.1
+done
+if kill -0 "$strict_first_worker_pid" 2>/dev/null; then
+    kill -KILL "$strict_first_worker_pid" 2>/dev/null || :
+fi
+wait "$strict_first_worker_pid" 2>/dev/null || :
+worker_pid=
+service_pid=
+strict_removed=0
+for _ in $(seq 1 100); do
+    strict_remove_now=$(grep -c 'remove daemon p50-f' \
+        "$work/scheduler.log" 2>/dev/null || true)
+    if test "${strict_remove_now:-0}" -gt "${strict_remove_before:-0}"; then
+        strict_removed=1
+        break
+    fi
+    sleep 0.1
+done
+test "$strict_removed" -eq 1 || {
+    echo "FAIL: scheduler did not consume first strict worker removal" >&2
+    exit 1
+}
+if kill -0 "$strict_first_service_pid" 2>/dev/null; then
+    echo "FAIL: first strict worker left its sidecar live" >&2
+    exit 1
+fi
+strict_first_worker_pid=
+
+# The replacement has the same logical node name but a new process, ordinary
+# endpoint and cache-sidecar incarnation.  Only its fresh advertisement may
+# satisfy the released strict retry.
+strict_ready_before=$(grep -E -c \
+    'RELOGIN p50-f.*cache=.*cache_profiles=.*zstd_tu' \
+    "$work/scheduler.log" 2>/dev/null || true)
+ICECC_TEST_SOCKET="$work/worker-strict2.sock" ICECC_P50_C1F1_REQUIRED=1 \
+    ICECC_P50_TEST_LIFECYCLE_TRACE="$work/lifecycle-strict2.trace" \
+    ICECC_P50_TEST_READY_TRACE="$work/ready-strict2.trace" \
+    "$build/daemon/iceccd" "$@" -p "$port_worker_strict2" -m 1 \
+    -s "$worker_scheduler_host:$port_sched" -n "$network" -N p50-f \
+    -b "$work/envs-f-strict2" -l "$work/f-strict2.log" -vvv \
+    --cache-service "$build/cache/icecc-cache-service" \
+    --cache-runtime-dir "$work/cache-runtime-f-strict2" &
+worker_pid=$!
+
+strict_second_ready=0
+for _ in $(seq 1 300); do
+    strict_ready_now=$(grep -E -c \
+        'RELOGIN p50-f.*cache=.*cache_profiles=.*zstd_tu' \
+        "$work/scheduler.log" 2>/dev/null || true)
+    if test "${strict_ready_now:-0}" -gt "${strict_ready_before:-0}"; then
+        strict_second_ready=1
+        break
+    fi
+    kill -0 "$worker_pid" 2>/dev/null || break
+    sleep 0.1
+done
+test "$strict_second_ready" -eq 1 || {
+    echo "FAIL: replacement strict-retry worker did not advertise READY" >&2
+    exit 1
+}
+service_pid=
+for _ in $(seq 1 300); do
+    service_pid=$(find_service_pid)
+    test -n "$service_pid" && break
+    sleep 0.1
+done
+test -n "$service_pid" || {
+    echo "FAIL: replacement strict-retry worker has no cache sidecar" >&2
+    exit 1
+}
+
+: >"$strict_retry_release"
+set +e
+wait "$strict_retry_wrapper_pid"
+strict_retry_rc=$?
+set -e
+strict_retry_wrapper_pid=
+test "$strict_retry_rc" -eq 0 || {
+    echo "FAIL: fresh strict-P50 retry exited $strict_retry_rc" >&2
+    exit 1
+}
+test -s "$strict_retry_remote_obj" || {
+    echo "FAIL: fresh strict-P50 retry did not recreate the object" >&2
+    exit 1
+}
+g++ -std=c++17 -O2 -Wall -c "$work/src/fresh-strict-retry.cpp" \
+    -o "$strict_retry_local_obj" 2>"$work/fresh-strict-retry-local.err"
+cmp -s "$strict_retry_remote_obj" "$strict_retry_local_obj" || {
+    echo "FAIL: fresh strict-P50 retry differs from exact local reference" >&2
+    exit 1
+}
+test "$(grep -F -c \
+    'P50 assignment failed; requesting one fresh strict-P50 remote assignment' \
+    "$strict_retry_client_log")" -eq 1
+if grep -E 'requesting one fresh legacy|building myself, but telling localhost|strict all-P50 run refuses' \
+    "$strict_retry_client_log" >/dev/null 2>&1; then
+    echo "FAIL: successful strict retry crossed a legacy/local/refusal path" >&2
+    exit 1
+fi
+wait_for_count 1 'action 2 status applied reason submitter accepted complete result' \
+    "$work/f-strict2.log"
+
+python3 - "$strict_retry_marker" "$strict_retry_identity" \
+    "$work/source-result.jsonl" "$work/scheduler.log" <<'PY'
+import json
+import re
+import sys
+
+marker_path, identity_path, source_path, scheduler_path = sys.argv[1:]
+first = json.load(open(marker_path, encoding="utf-8"))
+identities = [json.loads(line) for line in open(identity_path, encoding="utf-8") if line.strip()]
+if len(identities) != 2:
+    raise SystemExit(f"FAIL: strict retry has {len(identities)} compile-result identities, expected 2")
+for field in ("job_id", "assignment_epoch", "assignment_nonce", "c_guid", "tu_seq"):
+    if identities[0].get(field) != first.get(field):
+        raise SystemExit(f"FAIL: strict first result/marker mismatch for {field}")
+if identities[1]["job_id"] == identities[0]["job_id"]:
+    raise SystemExit("FAIL: strict retry reused the first scheduler job")
+if identities[1]["assignment_nonce"] == identities[0]["assignment_nonce"]:
+    raise SystemExit("FAIL: strict retry reused the first assignment nonce")
+if (identities[1]["c_guid"], identities[1]["tu_seq"]) == \
+        (identities[0]["c_guid"], identities[0]["tu_seq"]):
+    raise SystemExit("FAIL: strict retry reused the first compile identity")
+
+sources = [json.loads(line) for line in open(source_path, encoding="utf-8") if line.strip()]
+for identity in identities:
+    matches = [row for row in sources
+               if row.get("logical_job") == identity["job_id"]
+               and row.get("assignment_epoch") == identity["assignment_epoch"]
+               and row.get("assignment_nonce") == identity["assignment_nonce"]]
+    if len(matches) != 1 or matches[0].get("status") != 0 or \
+            matches[0].get("profile") != "P29V1" or \
+            matches[0].get("raw_bytes", 0) <= 0 or \
+            not re.fullmatch(r"[0-9a-f]{32}", matches[0].get("raw_digest", "")):
+        raise SystemExit(f"FAIL: strict assignment lacks one exact P29V1 source witness: {identity} {matches}")
+
+scheduler = "\n".join(
+    re.sub(r"^\[\d+\] \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}: ", "", line)
+    for line in open(scheduler_path, encoding="utf-8"))
+new_ids = [int(value) for value in re.findall(
+    r"^NEW (\d+) .*fresh-strict-retry\.cpp", scheduler, re.M)]
+if new_ids != [row["job_id"] for row in identities]:
+    raise SystemExit(f"FAIL: strict scheduler pair differs from compile identities: {new_ids} {identities}")
+for identity in identities:
+    if not re.search(rf"^END {identity['job_id']} status=0 .* server=p50-f$", scheduler, re.M):
+        raise SystemExit(f"FAIL: strict scheduler terminal missing for {identity['job_id']}")
+PY
+
+# Exercise the producer-side worker-loss discriminator through work_it and the
+# shipped retry policy.  The isolated wrapper only pauses after production has
+# normalized the real result-stream loss; it injects no disposition fault.
+# Kill p50-f after its compiler has emitted final arguments, replace it with a
+# new process using the same logical node name, then release the fresh GetCS.
+inflight_identity="$work/inflight-worker-loss-compile-identity.jsonl"
+inflight_retry_barrier="$work/inflight-worker-loss-retry.barrier"
+inflight_retry_release="$inflight_retry_barrier.release"
+inflight_client_log="$work/inflight-worker-loss-client.log"
+inflight_remote_obj="$work/out/inflight-worker-loss-remote.o"
+inflight_local_obj="$work/out/inflight-worker-loss-local.o"
+inflight_log_offset=$(stat -c %s "$work/f-strict2.log")
+inflight_remove_before=$(grep -c 'remove daemon p50-f' \
+    "$work/scheduler.log" 2>/dev/null || true)
+
+ICECC_TEST_SOCKET="$work/client.sock" ICECC_TEST_REMOTEBUILD=1 \
+    ICECC_VERSION="$envtar" ICECC_PREFERRED_HOST=p50-f \
+    ICECC_CARET_WORKAROUND=0 ICECC_P50_C1F1_REQUIRED=1 \
+    ICECC_P50_TEST_STRICT_RETRY_BEFORE_GETCS_BARRIER="$inflight_retry_barrier" \
+    ICECC_P50_COMPILE_IDENTITY_TRACE="$inflight_identity" \
+    ICECC_DEBUG=debug ICECC_LOGFILE="$inflight_client_log" \
+    timeout "$timeout_s" "$work/bin/icecc" \
+    g++ -std=c++17 -O2 -Wall -ftemplate-depth=4096 -c \
+    "$work/src/inflight-worker-loss.cpp" \
+    -o "$inflight_remote_obj" >"$work/inflight-worker-loss.out" 2>&1 &
+inflight_wrapper_pid=$!
+
+inflight_compiler_started=0
+for _ in $(seq 1 500); do
+    if tail -c +$((inflight_log_offset + 1)) "$work/f-strict2.log" | \
+        grep -F 'final arguments:' >/dev/null 2>&1; then
+        inflight_compiler_started=1
+        break
+    fi
+    kill -0 "$inflight_wrapper_pid" 2>/dev/null || break
+    sleep 0.01
+done
+test "$inflight_compiler_started" -eq 1 || {
+    echo "FAIL: in-flight-loss compiler was not observed before completion" >&2
+    exit 1
+}
+
+inflight_first_worker_pid=$worker_pid
+inflight_first_service_pid=$service_pid
+kill -TERM "$inflight_first_worker_pid"
+for _ in $(seq 1 200); do
+    kill -0 "$inflight_first_worker_pid" 2>/dev/null || break
+    sleep 0.1
+done
+if kill -0 "$inflight_first_worker_pid" 2>/dev/null; then
+    echo "FAIL: in-flight-loss worker did not honor bounded TERM shutdown" >&2
+    exit 1
+fi
+wait "$inflight_first_worker_pid" 2>/dev/null || :
+
+inflight_retry_armed=0
+for _ in $(seq 1 300); do
+    if test -s "$inflight_retry_barrier"; then
+        inflight_retry_armed=1
+        break
+    fi
+    kill -0 "$inflight_wrapper_pid" 2>/dev/null || break
+    sleep 0.1
+done
+test "$inflight_retry_armed" -eq 1 || {
+    echo "FAIL: real worker loss did not reach the pre-GetCS retry barrier" >&2
+    exit 1
+}
+
+inflight_removed=0
+for _ in $(seq 1 100); do
+    inflight_remove_now=$(grep -c 'remove daemon p50-f' \
+        "$work/scheduler.log" 2>/dev/null || true)
+    if test "${inflight_remove_now:-0}" -gt "${inflight_remove_before:-0}"; then
+        inflight_removed=1
+        break
+    fi
+    sleep 0.1
+done
+test "$inflight_removed" -eq 1 || {
+    echo "FAIL: scheduler did not consume in-flight worker removal" >&2
+    exit 1
+}
+if kill -0 "$inflight_first_service_pid" 2>/dev/null; then
+    echo "FAIL: in-flight-loss worker left its cache sidecar live" >&2
+    exit 1
+fi
+
+inflight_ready_before=$(grep -E -c \
+    'RELOGIN p50-f.*cache=.*cache_profiles=.*zstd_tu' \
+    "$work/scheduler.log" 2>/dev/null || true)
+ICECC_TEST_SOCKET="$work/worker-strict3.sock" ICECC_P50_C1F1_REQUIRED=1 \
+    ICECC_P50_TEST_LIFECYCLE_TRACE="$work/lifecycle-strict3.trace" \
+    ICECC_P50_TEST_READY_TRACE="$work/ready-strict3.trace" \
+    "$build/daemon/iceccd" "$@" -p "$port_worker_strict3" -m 1 \
+    -s "$worker_scheduler_host:$port_sched" -n "$network" -N p50-f \
+    -b "$work/envs-f-strict3" -l "$work/f-strict3.log" -vvv \
+    --cache-service "$build/cache/icecc-cache-service" \
+    --cache-runtime-dir "$work/cache-runtime-f-strict3" &
+inflight_replacement_worker_pid=$!
+
+inflight_replacement_ready=0
+for _ in $(seq 1 300); do
+    inflight_ready_now=$(grep -E -c \
+        'RELOGIN p50-f.*cache=.*cache_profiles=.*zstd_tu' \
+        "$work/scheduler.log" 2>/dev/null || true)
+    if test "${inflight_ready_now:-0}" -gt "${inflight_ready_before:-0}"; then
+        inflight_replacement_ready=1
+        break
+    fi
+    kill -0 "$inflight_replacement_worker_pid" 2>/dev/null || break
+    sleep 0.1
+done
+test "$inflight_replacement_ready" -eq 1 || {
+    echo "FAIL: in-flight-loss replacement worker did not advertise READY" >&2
+    exit 1
+}
+inflight_replacement_service_pid=
+for _ in $(seq 1 300); do
+    inflight_replacement_service_pid=$(ps -eo pid=,ppid=,args= | \
+        awk -v parent="$inflight_replacement_worker_pid" \
+            -v exe="$build/cache/icecc-cache-service" \
+            '$2 == parent && index($0, exe) > 0 { print $1; exit }')
+    test -n "$inflight_replacement_service_pid" && break
+    sleep 0.1
+done
+test -n "$inflight_replacement_service_pid" || {
+    echo "FAIL: in-flight-loss replacement worker has no cache sidecar" >&2
+    exit 1
+}
+worker_pid=$inflight_replacement_worker_pid
+service_pid=$inflight_replacement_service_pid
+inflight_replacement_worker_pid=
+: >"$inflight_retry_release"
+
+set +e
+wait "$inflight_wrapper_pid"
+inflight_rc=$?
+set -e
+inflight_wrapper_pid=
+test "$inflight_rc" -eq 0 || {
+    echo "FAIL: production in-flight strict retry exited $inflight_rc" >&2
+    exit 1
+}
+test -s "$inflight_remote_obj" || {
+    echo "FAIL: production in-flight strict retry produced no object" >&2
+    exit 1
+}
+g++ -std=c++17 -O2 -Wall -ftemplate-depth=4096 -c \
+    "$work/src/inflight-worker-loss.cpp" -o "$inflight_local_obj" \
+    2>"$work/inflight-worker-loss-local.err"
+cmp -s "$inflight_remote_obj" "$inflight_local_obj" || {
+    echo "FAIL: production in-flight strict retry differs from exact local reference" >&2
+    exit 1
+}
+grep -F 'worker shutdown interrupted remote compiler; closing result stream' \
+    "$work/f-strict2.log" >/dev/null || {
+    echo "FAIL: work_it did not classify the matching shutdown signal as worker loss" >&2
+    exit 1
+}
+test "$(grep -F -c \
+    'P50 assignment failed; requesting one fresh strict-P50 remote assignment' \
+    "$inflight_client_log")" -eq 1
+if grep -E 'requesting one fresh legacy|building myself, but telling localhost|strict all-P50 run refuses' \
+    "$inflight_client_log" >/dev/null 2>&1; then
+    echo "FAIL: production in-flight strict retry crossed a forbidden path" >&2
+    exit 1
+fi
+wait_for_count 1 'action 2 status applied reason submitter accepted complete result' \
+    "$work/f-strict3.log"
+
+python3 - "$inflight_identity" "$work/source-result.jsonl" \
+    "$work/scheduler.log" <<'PY'
+import json
+import re
+import sys
+
+identity_path, source_path, scheduler_path = sys.argv[1:]
+identities = [json.loads(line) for line in open(identity_path, encoding="utf-8") if line.strip()]
+if len(identities) != 1:
+    raise SystemExit(f"FAIL: in-flight recovery has {len(identities)} final result identities")
+final_identity = identities[0]
+scheduler = "\n".join(
+    re.sub(r"^\[\d+\] \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}: ", "", line)
+    for line in open(scheduler_path, encoding="utf-8"))
+job_ids = [int(value) for value in re.findall(
+    r"^NEW (\d+) .*inflight-worker-loss\.cpp", scheduler, re.M)]
+if len(job_ids) != 2 or job_ids[0] == job_ids[1]:
+    raise SystemExit(f"FAIL: in-flight recovery did not use exactly two fresh scheduler jobs: {job_ids}")
+if final_identity.get("job_id") != job_ids[1]:
+    raise SystemExit(f"FAIL: final compile result is not bound to retry job: {final_identity} {job_ids}")
+if not re.search(rf"^END {job_ids[1]} status=0 .* server=p50-f$", scheduler, re.M):
+    raise SystemExit("FAIL: replacement worker has no exact successful terminal")
+sources = [json.loads(line) for line in open(source_path, encoding="utf-8") if line.strip()]
+matched = [row for row in sources if row.get("logical_job") in job_ids]
+if len(matched) != 2 or {row.get("logical_job") for row in matched} != set(job_ids):
+    raise SystemExit(f"FAIL: in-flight recovery source witnesses are not exact: {matched}")
+for row in matched:
+    if row.get("status") != 0 or row.get("profile") != "P29V1" or \
+            row.get("raw_bytes", 0) <= 0 or \
+            not re.fullmatch(r"[0-9a-f]{32}", row.get("raw_digest", "")):
+        raise SystemExit(f"FAIL: in-flight recovery source witness is incomplete: {row}")
+first = next(row for row in matched if row["logical_job"] == job_ids[0])
+second = next(row for row in matched if row["logical_job"] == job_ids[1])
+if (first.get("assignment_nonce"), first.get("c_guid"), first.get("tu_seq")) == \
+        (second.get("assignment_nonce"), second.get("c_guid"), second.get("tu_seq")):
+    raise SystemExit("FAIL: in-flight strict retry reused its first assignment/input identity")
+PY
+
+# A second Error106 must escape instead of creating a third assignment.  The
+# check-only hook closes both completed P50 result channels; production retry
+# policy remains responsible for bounding the loop and refusing local work.
+bounded_marker="$work/bounded-strict-retry.barrier"
+bounded_release="$bounded_marker.release"
+bounded_identity="$work/bounded-strict-retry-compile-identity.jsonl"
+bounded_client_log="$work/bounded-strict-retry-client.log"
+bounded_remote_obj="$work/out/bounded-strict-retry-remote.o"
+
+ICECC_TEST_SOCKET="$work/client.sock" ICECC_TEST_REMOTEBUILD=1 \
+    ICECC_VERSION="$envtar" ICECC_PREFERRED_HOST=p50-f \
+    ICECC_CARET_WORKAROUND=0 ICECC_P50_C1F1_REQUIRED=1 \
+    ICECC_P50_TEST_FRESH_STRICT_RETRY=1 \
+    ICECC_P50_TEST_FRESH_STRICT_RETRY_SECOND_FAILURE=1 \
+    ICECC_P50_TEST_DISPOSITION=accepted-send-fail \
+    ICECC_P50_TEST_FRESH_LEGACY_RETRY_BARRIER="$bounded_marker" \
+    ICECC_P50_COMPILE_IDENTITY_TRACE="$bounded_identity" \
+    ICECC_DEBUG=debug ICECC_LOGFILE="$bounded_client_log" \
+    timeout "$timeout_s" "$work/bin/icecc" \
+    g++ -std=c++17 -O2 -Wall -c "$work/src/bounded-strict-retry.cpp" \
+    -o "$bounded_remote_obj" >"$work/bounded-strict-retry.out" 2>&1 &
+bounded_wrapper_pid=$!
+
+bounded_armed=0
+for _ in $(seq 1 300); do
+    if test -s "$bounded_marker"; then
+        bounded_armed=1
+        break
+    fi
+    kill -0 "$bounded_wrapper_pid" 2>/dev/null || break
+    sleep 0.1
+done
+test "$bounded_armed" -eq 1 || {
+    echo "FAIL: bounded strict retry did not reach its first barrier" >&2
+    exit 1
+}
+rm -f -- "$bounded_remote_obj"
+: >"$bounded_release"
+set +e
+wait "$bounded_wrapper_pid"
+bounded_rc=$?
+set -e
+bounded_wrapper_pid=
+test "$bounded_rc" -eq 100 || {
+    echo "FAIL: twice-failed strict retry exited $bounded_rc instead of 100" >&2
+    exit 1
+}
+test "$(grep -F -c \
+    'P50 terminal test forcing Accepted send failure' \
+    "$bounded_client_log")" -eq 2
+test "$(grep -F -c \
+    'P50 assignment failed; requesting one fresh strict-P50 remote assignment' \
+    "$bounded_client_log")" -eq 1
+grep -F 'strict all-P50 run refuses local retry' \
+    "$bounded_client_log" >/dev/null
+if grep -E 'requesting one fresh legacy|building myself, but telling localhost' \
+    "$bounded_client_log" >/dev/null 2>&1; then
+    echo "FAIL: twice-failed strict retry crossed a legacy/local path" >&2
+    exit 1
+fi
+test "$(wc -l <"$bounded_identity")" -eq 2 || {
+    echo "FAIL: bounded strict retry did not stop after two P50 results" >&2
+    exit 1
+}
+bounded_new_count=$(grep -E -c \
+    '^\[[0-9]+\] .* NEW [0-9]+ .*bounded-strict-retry\.cpp' \
+    "$work/scheduler.log" 2>/dev/null || true)
+test "${bounded_new_count:-0}" -eq 2 || {
+    echo "FAIL: bounded strict retry minted ${bounded_new_count:-0} scheduler jobs" >&2
+    exit 1
+}
+
+# The fault/barrier seams remain absent from the shipped wrapper.
+for selector in \
+    ICECC_P50_TEST_FRESH_STRICT_RETRY \
+    ICECC_P50_TEST_STRICT_RETRY_BEFORE_GETCS_BARRIER
+do
+    if strings "$build/client/icecc" | grep -F "$selector" >/dev/null; then
+        echo "FAIL: strict retry test seam leaked into production client: $selector" >&2
+        exit 1
+    fi
+done
+for selector in \
+    ICECC_P50_TEST_FRESH_STRICT_RETRY_SECOND_FAILURE \
+    ICECC_P50_TEST_STRICT_RETRY_BEFORE_GETCS_BARRIER
+do
+    strings "$build/client/icecc-p50-completion-test" | \
+        grep -F "$selector" >/dev/null || {
+        echo "FAIL: check-only client lacks strict retry test seam: $selector" >&2
+        exit 1
+    }
+done
+
+echo "PASS: real P50 terminal lifecycle plus worker-loss and bounded retries"

@@ -836,12 +836,12 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
            not a codec double, to observe malformed and disconnected first
            witnesses.  Arm those two faults only under the existing explicit
            C1F1-required test environment and only where production would send
-           Accepted after receiving every output byte.  The fresh legacy retry
-           gate is necessarily separate: strict C1F1 correctly refuses that
-           retry.  It closes the same real result channel, publishes a bounded
-           test barrier, and returns the actual send-failure result so the
-           production 107 -> 106 normalization and retry loop remain under
-           test rather than being simulated by the harness. */
+           Accepted after receiving every output byte.  The fresh-retry gate
+           is separate and selects either the legacy or strict production
+           policy explicitly.  It closes the same real result channel once,
+           publishes a bounded test barrier, and returns the actual send-
+           failure result so the production 107 -> 106 normalization and retry
+           loop remain under test rather than being simulated by the harness. */
         const char *required = getenv("ICECC_P50_C1F1_REQUIRED");
         const char *test_hook = getenv("ICECC_P50_TEST_DISPOSITION");
         if (disposition == ResultDispositionMsg::Accepted &&
@@ -865,19 +865,43 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
         }
         const char *retry_gate =
             getenv("ICECC_P50_TEST_FRESH_LEGACY_RETRY");
+        const char *strict_retry_gate =
+            getenv("ICECC_P50_TEST_FRESH_STRICT_RETRY");
         const char *retry_barrier =
             getenv("ICECC_P50_TEST_FRESH_LEGACY_RETRY_BARRIER");
+        const char *strict_second_failure =
+            getenv("ICECC_P50_TEST_FRESH_STRICT_RETRY_SECOND_FAILURE");
+        const bool legacy_retry_fault =
+            required == nullptr && retry_gate != nullptr &&
+            string(retry_gate) == "1";
+        const bool strict_retry_fault =
+            required != nullptr && string(required) == "1" &&
+            strict_retry_gate != nullptr &&
+            string(strict_retry_gate) == "1";
+        const bool barrier_exists =
+            retry_barrier != nullptr && *retry_barrier != '\0' &&
+            ::access(retry_barrier, F_OK) == 0;
+        const bool repeat_strict_failure =
+            strict_retry_fault && barrier_exists &&
+            strict_second_failure != nullptr &&
+            string(strict_second_failure) == "1";
         if (disposition == ResultDispositionMsg::Accepted &&
             status == 0 && p50_result_received &&
-            job.compileInputIdentity().validPresent() && required == nullptr &&
-            retry_gate != nullptr &&
-            string(retry_gate) == "1" && test_hook != nullptr &&
+            job.compileInputIdentity().validPresent() &&
+            (legacy_retry_fault || strict_retry_fault) &&
+            test_hook != nullptr &&
             string(test_hook) == "accepted-send-fail" &&
-            retry_barrier != nullptr && *retry_barrier != '\0') {
+            retry_barrier != nullptr && *retry_barrier != '\0' &&
+            (!barrier_exists || repeat_strict_failure)) {
             trace() << "P50 terminal test forcing Accepted send failure for job "
                     << job.jobID() << "\n";
             delete cserver;
             cserver = nullptr;
+
+            if (repeat_strict_failure) {
+                p50_disposition_sent = false;
+                return false;
+            }
 
             const CompileInputIdentity &input = job.compileInputIdentity();
             icecc::Digest128 input_guid;
@@ -938,7 +962,7 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
             }
             if (::access(release_path.c_str(), F_OK) != 0) {
                 log_warning()
-                    << "P50 fresh legacy retry test barrier timed out for job "
+                    << "P50 fresh retry test barrier timed out for job "
                     << job.jobID() << endl;
             }
             p50_disposition_sent = false;
@@ -1537,8 +1561,8 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon,
     srand(time(nullptr) + getpid());
 
     /* Each build_remote() call owns one fresh scheduler assignment attempt.
-       The bounded legacy retry deliberately reuses the wrapper's CompileJob,
-       so discard any P50 InputRecord identity committed by its predecessor
+       The bounded retry deliberately reuses the wrapper's CompileJob, so
+       discard any P50 InputRecord identity committed by its predecessor
        before either the scheduler-local or ordinary remote path can inspect
        and serialize the job.  A newly selected P50 path binds its own exact
        identity later in build_remote_int(). */
@@ -1623,6 +1647,17 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon,
         invocation_timing_mark_start(usecs->hostname == "127.0.0.1"
                                      ? string("local_via_scheduler")
                                      : string("remote"));
+        /* maybe_build_local() precedes the remote handoff checks below.  A
+           strict P50 request must reject a scheduler-local or legacy UseCS
+           here, before either path can compile and create a false success. */
+        if (request_p50 &&
+            getenv("ICECC_P50_C1F1_REQUIRED") != nullptr &&
+            !usecs->hasCacheAdvertisement()) {
+            delete usecs;
+            throw remote_error(
+                105,
+                "Error 105 - strict all-P50 assignment has no cache handoff");
+        }
         int ret;
         P50RemoteAttemptObservation p50_observation;
         bool p50_observation_published = false;

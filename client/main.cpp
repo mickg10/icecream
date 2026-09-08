@@ -67,6 +67,46 @@ using namespace std;
 
 extern const char *rs_program_name;
 
+#ifdef ICECC_P50_COMPLETION_TEST_HOOKS
+/* Pause only the isolated completion-flow wrapper after production has
+   normalized a real strict-P50 loss and reconnected, but before its fresh
+   GetCS.  The worker-loss gate can then replace the dead logical F without
+   racing the scheduler-local sentinel.  No error is injected here. */
+static bool p50_completion_test_wait_before_retry_getcs(const char *barrier)
+{
+    if (barrier == nullptr || *barrier == '\0')
+        return true;
+    const int marker_fd = ::open(
+        barrier, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (marker_fd < 0)
+        return false;
+    static const char marker[] = "real-worker-loss-normalized\n";
+    size_t offset = 0;
+    while (offset < sizeof(marker) - 1) {
+        const ssize_t written = ::write(
+            marker_fd, marker + offset, sizeof(marker) - 1 - offset);
+        if (written > 0) {
+            offset += static_cast<size_t>(written);
+            continue;
+        }
+        if (written < 0 && errno == EINTR)
+            continue;
+        (void)::close(marker_fd);
+        return false;
+    }
+    if (::close(marker_fd) != 0)
+        return false;
+
+    const string release = string(barrier) + ".release";
+    for (int attempt = 0; attempt < 2400; ++attempt) {
+        if (::access(release.c_str(), F_OK) == 0)
+            return true;
+        ::usleep(100000);
+    }
+    return false;
+}
+#endif
+
 /* REQUIREMENT, not a discretionary optimisation: preprocess-only (-E)
    invocations run at the lowest scheduling priority.
 
@@ -677,16 +717,16 @@ int main(int argc, char **argv)
             int rate = s ? atoi(s) : 0;
 
             invocation_timing_mark_enqueue("remote");
-            bool p50_legacy_retry = false;
+            const bool strict_p50 =
+                getenv("ICECC_P50_C1F1_REQUIRED") != nullptr;
+            bool p50_retry_attempted = false;
             for (;;) {
                 try {
                     ret = build_remote(job, local_daemon, envs, rate,
-                                       !p50_legacy_retry);
+                                       !p50_retry_attempted || strict_p50);
                     break;
                 } catch (const remote_error &error) {
-                    const bool strict_p50 =
-                        getenv("ICECC_P50_C1F1_REQUIRED") != nullptr;
-                    if (error.errorCode != 106 || p50_legacy_retry || strict_p50)
+                    if (error.errorCode != 106 || p50_retry_attempted)
                         throw;
 
                     /* The failed cache attempt has already published its exact
@@ -696,21 +736,36 @@ int main(int argc, char **argv)
                        terminal if F already claimed it.  End this submitter
                        proxy without emitting a duplicate settlement, then use
                        a new wrapper connection/client id for a genuinely fresh
-                       GetCS.  Its cache request is canonical absence, so the C
-                       daemon and scheduler can only select a legacy assignment.
-                       A failure of this second assignment escapes the loop and
-                       follows the existing one-time local fallback below. */
-                    log_warning()
-                        << "P50 assignment failed; requesting one fresh legacy remote assignment"
-                        << endl;
+                       GetCS.  A strict run requests P50 again and will accept
+                       neither a legacy nor a local assignment.  A normal run
+                       preserves the existing canonical-absence legacy retry.
+                       Any failure of the second assignment escapes the loop;
+                       the outer strict path still forbids local fallback. */
+                    if (strict_p50) {
+                        log_warning()
+                            << "P50 assignment failed; requesting one fresh strict-P50 remote assignment"
+                            << endl;
+                    } else {
+                        log_warning()
+                            << "P50 assignment failed; requesting one fresh legacy remote assignment"
+                            << endl;
+                    }
                     (void)local_daemon->send_msg(EndMsg());
                     delete local_daemon;
                     local_daemon = get_local_daemon();
                     if (!local_daemon)
                         throw client_error(
                             24,
-                            "Error 24 - unable to reconnect for P50 legacy retry");
-                    p50_legacy_retry = true;
+                            "Error 24 - unable to reconnect for P50 retry");
+                    p50_retry_attempted = true;
+#ifdef ICECC_P50_COMPLETION_TEST_HOOKS
+                    if (strict_p50 &&
+                        !p50_completion_test_wait_before_retry_getcs(
+                            getenv("ICECC_P50_TEST_STRICT_RETRY_BEFORE_GETCS_BARRIER")))
+                        throw client_error(
+                            28,
+                            "Error 28 - strict retry test barrier failed");
+#endif
                 }
             }
             invocation_timing_mark_finish(ret);

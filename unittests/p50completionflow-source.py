@@ -90,9 +90,16 @@ def check_client(source: str, makefile: str) -> None:
             "cserver->send_msg(EndMsg())",
             'selected == "disconnect"',
             'string(test_hook) == "accepted-send-fail"',
+            'const bool legacy_retry_fault =',
+            'const bool strict_retry_fault =',
             'string(retry_gate) == "1"',
+            'string(strict_retry_gate) == "1"',
             "status == 0 && p50_result_received",
             "job.compileInputIdentity().validPresent()",
+            'getenv("ICECC_P50_TEST_FRESH_STRICT_RETRY_SECOND_FAILURE")',
+            "const bool barrier_exists =",
+            "const bool repeat_strict_failure =",
+            "(!barrier_exists || repeat_strict_failure)",
             "delete cserver;",
             "cserver = nullptr;",
             '"input_present\\\":1',
@@ -116,6 +123,55 @@ def check_client(source: str, makefile: str) -> None:
     require("normalizing P50 client error " in source and
             "error.errorCode == 107" in source,
             "107 is not observably normalized into the bounded retry class")
+
+
+def check_wrapper_retry(main_source: str, remote_source: str) -> None:
+    retry = section(
+        main_source,
+        'invocation_timing_mark_enqueue("remote");',
+        "invocation_timing_mark_finish(ret);")
+    ordered(
+        retry,
+        'const bool strict_p50 =',
+        'getenv("ICECC_P50_C1F1_REQUIRED") != nullptr',
+        "bool p50_retry_attempted = false;",
+        "build_remote(job, local_daemon, envs, rate,",
+        "!p50_retry_attempted || strict_p50",
+        "error.errorCode != 106 || p50_retry_attempted",
+        "if (strict_p50)",
+        '"P50 assignment failed; requesting one fresh strict-P50 remote assignment"',
+        '"P50 assignment failed; requesting one fresh legacy remote assignment"',
+        "local_daemon->send_msg(EndMsg())",
+        "delete local_daemon;",
+        "local_daemon = get_local_daemon();",
+        "p50_retry_attempted = true;")
+    require(retry.count("p50_retry_attempted = true;") == 1,
+            "wrapper does not bound P50 reassignment to one attempt")
+    require("p50_legacy_retry" not in retry,
+            "wrapper retained the strict-refusing legacy-only retry state")
+    require("p50_completion_test_wait_before_retry_getcs(" in main_source and
+            'getenv("ICECC_P50_TEST_STRICT_RETRY_BEFORE_GETCS_BARRIER")' in
+                retry and
+            "Error 28 - strict retry test barrier failed" in retry,
+            "check-only wrapper cannot deterministically pause a real loss before fresh GetCS")
+
+    remote_start = remote_source.find("int build_remote(")
+    require(remote_start >= 0, "missing build_remote for strict retry check")
+    remote = remote_source[remote_start:]
+    reject = section(
+        remote,
+        "/* maybe_build_local() precedes the remote handoff checks below.",
+        "int ret;")
+    ordered(
+        reject,
+        "request_p50",
+        'getenv("ICECC_P50_C1F1_REQUIRED") != nullptr',
+        "!usecs->hasCacheAdvertisement()",
+        "delete usecs;",
+        "throw remote_error(",
+        '"Error 105 - strict all-P50 assignment has no cache handoff"')
+    require(remote.find(reject) < remote.find("maybe_build_local("),
+            "strict no-cache assignment is rejected after local compilation")
 
 
 def check_worker(serve: str, record: str) -> None:
@@ -237,6 +293,7 @@ def check_parent(source: str) -> None:
 
 
 def check_compiler_quiescence(source: str, helper: str, test_source: str,
+                              workit: str, workit_header: str,
                               makefile: str, daemon_makefile: str) -> None:
     flow = section(source, "/* The exact quiescence barrier",
                    "void Daemon::handle_old_request")
@@ -280,6 +337,26 @@ def check_compiler_quiescence(source: str, helper: str, test_source: str,
         require(token in helper, f"signal-authority helper omits {token}")
     require("release_slot_once(SlotAccounting& accounting)" in helper,
             "compiler slot accounting is not a shared once-only primitive")
+    require("compiler_wait_status_is_worker_process_loss(" in helper and
+            "if (!WIFSIGNALED(wait_status))" in helper and
+            "case SIGTERM:" in helper and "case SIGINT:" in helper and
+            "case SIGALRM:" in helper and
+            "return WTERMSIG(wait_status) == daemon_shutdown_signal;" in helper,
+            "worker-loss classifier does not require an exact caught shutdown signal")
+    require("extern volatile sig_atomic_t workit_daemon_shutdown_signal" in
+            workit_header and
+            "workit_daemon_shutdown_signal = whichsig;" in source,
+            "exact daemon termination signal is not carried into its compile worker")
+    workit_loss = section(
+        workit,
+        "compiler_wait_status_is_worker_process_loss(",
+        "if (shell_exit_status(status) != 0)")
+    ordered(
+        workit_loss,
+        "status, workit_daemon_shutdown_signal",
+        "rmsg.status = EXIT_GONE;",
+        "job_stat[JobStatistics::exit_code] = EXIT_GONE;",
+        "return EXIT_GONE;")
     cleanup_helper = section(
         helper,
         "CleanupAdvance advance_exited_group_cleanup(",
@@ -297,6 +374,17 @@ def check_compiler_quiescence(source: str, helper: str, test_source: str,
             "!second.final_signal.invoked && second.settled" in test_source and
             "later cleanup turn released the completed slot twice" in test_source,
             "compiled regression does not exercise later-turn production cleanup")
+    require(test_source.count(
+                "test_worker_process_loss_requires_both_shutdown_and_signal") == 2 and
+            test_source.count(
+                "compiler_wait_status_is_worker_process_loss(") >= 9 and
+            "coincident compiler crash became retryable process loss" in
+                test_source and
+            "unaccompanied compiler KILL became retryable process loss" in
+                test_source and
+            "genuine numeric compiler exit 105 became retryable process loss" in
+                test_source,
+            "compiled regression does not distinguish exact shutdown loss from crashes or rc=105")
     ordered(helper,
             "authority.final_sent = true;",
             "authority.active = false;",
@@ -393,6 +481,34 @@ def check_runtime_gate(source: str) -> None:
     require("ICECC_P50_C1F1_REQUIRED" not in retry_launch,
             "fresh retry wrapper is strict and cannot exercise the 107/106 legacy retry")
 
+    strict_retry_launch = section(
+        source,
+        'strict_retry_marker="$work/fresh-strict-retry.barrier"',
+        "strict_retry_wrapper_pid=$!")
+    require("ICECC_P50_C1F1_REQUIRED=1" in strict_retry_launch and
+            "ICECC_P50_TEST_FRESH_STRICT_RETRY=1" in strict_retry_launch,
+            "fresh strict retry wrapper does not exercise the strict policy")
+    bounded_retry_launch = section(
+        source,
+        'bounded_marker="$work/bounded-strict-retry.barrier"',
+        "bounded_wrapper_pid=$!")
+    require("ICECC_P50_C1F1_REQUIRED=1" in bounded_retry_launch and
+            "ICECC_P50_TEST_FRESH_STRICT_RETRY_SECOND_FAILURE=1" in
+                bounded_retry_launch,
+            "twice-failed strict wrapper does not exercise the bounded policy")
+    require('test "${bounded_new_count:-0}" -eq 2' in source,
+            "twice-failed strict wrapper does not reject a third assignment")
+    inflight_launch = section(
+        source,
+        'inflight_identity="$work/inflight-worker-loss-compile-identity.jsonl"',
+        "inflight_wrapper_pid=$!")
+    require("ICECC_P50_C1F1_REQUIRED=1" in inflight_launch and
+            'timeout "$timeout_s" "$work/bin/icecc"' in inflight_launch and
+            "ICECC_P50_TEST_STRICT_RETRY_BEFORE_GETCS_BARRIER" in
+                inflight_launch and
+            "ICECC_P50_TEST_DISPOSITION" not in inflight_launch,
+            "in-flight worker-loss cell does not exercise real strict policy before its test barrier")
+
     injected_fault_launch = section(
         source,
         "    malformed|disconnect)",
@@ -445,7 +561,24 @@ def check_runtime_gate(source: str) -> None:
                   '\\d{2}:\\d{2}:\\d{2}: ", "", line)',
                   "legacy CompileFile admitted canonical input for job",
                   'strings "$build/client/icecc"',
-                  'strings "$build/client/icecc-p50-completion-test"'):
+                  'strings "$build/client/icecc-p50-completion-test"',
+                  'ICECC_P50_TEST_FRESH_STRICT_RETRY=1',
+                  'ICECC_P50_TEST_FRESH_STRICT_RETRY_SECOND_FAILURE=1',
+                  'rm -f -- "$strict_retry_remote_obj"',
+                  'P50 assignment failed; requesting one fresh strict-P50 remote assignment',
+                  'strict retry reused the first assignment nonce',
+                  'strict assignment lacks one exact P29V1 source witness',
+                  'ICECC_P50_TEST_STRICT_RETRY_BEFORE_GETCS_BARRIER',
+                  "inflight_retry_armed=1",
+                  ': >"$inflight_retry_release"',
+                  "inflight_compiler_started=1",
+                  "grep -F 'final arguments:'",
+                  'kill -TERM "$inflight_first_worker_pid"',
+                  'worker shutdown interrupted remote compiler; closing result stream',
+                  "len(job_ids) != 2",
+                  "production in-flight strict retry differs from exact local reference",
+                  'twice-failed strict retry exited $bounded_rc instead of 100',
+                  'bounded strict retry minted ${bounded_new_count:-0} scheduler jobs'):
         require(token in source, f"real terminal/reclaim matrix omits {token}")
     ordered(source,
             "run_remote_cell malformed malformed",
@@ -459,7 +592,18 @@ def check_runtime_gate(source: str) -> None:
             'kill -TERM "$old_worker_pid"',
             'wait_for_count 1 \'remove daemon p50-f\'',
             ': >"$retry_release"',
-            "PASS: real P50 terminal lifecycle plus 107/106 fresh scheduler-local retry")
+            'strict_retry_marker="$work/fresh-strict-retry.barrier"',
+            'kill -TERM "$strict_first_worker_pid"',
+            ': >"$strict_retry_release"',
+            'inflight_identity="$work/inflight-worker-loss-compile-identity.jsonl"',
+            "inflight_compiler_started=1",
+            'kill -TERM "$inflight_first_worker_pid"',
+            'worker shutdown interrupted remote compiler; closing result stream',
+            "len(job_ids) != 2",
+            'bounded_marker="$work/bounded-strict-retry.barrier"',
+            'ICECC_P50_TEST_FRESH_STRICT_RETRY_SECOND_FAILURE=1',
+            ': >"$bounded_release"',
+            "PASS: real P50 terminal lifecycle plus worker-loss and bounded retries")
 
 
 def check_record(header: str, source: str) -> None:
@@ -483,10 +627,12 @@ def check_record(header: str, source: str) -> None:
 
 def check_all(files: dict[str, str]) -> None:
     check_client(files["client"], files["client_make"])
+    check_wrapper_retry(files["client_main"], files["client"])
     check_worker(files["serve"], files["record_h"] + files["record_cpp"])
     check_parent(files["main"])
     check_compiler_quiescence(files["main"], files["compiler_signal"],
-                              files["compiler_test"], files["unit_make"],
+                              files["compiler_test"], files["workit"],
+                              files["workit_h"], files["unit_make"],
                               files["daemon_make"])
     check_record(files["record_h"], files["record_cpp"])
     check_cache_service(files["cache_service"])
@@ -495,6 +641,13 @@ def check_all(files: dict[str, str]) -> None:
 
 def deletion_mutants(files: dict[str, str]) -> None:
     mutations = (
+        ("client_main", "!p50_retry_attempted || strict_p50",
+         "!p50_retry_attempted"),
+        ("client_main", "error.errorCode != 106 || p50_retry_attempted",
+         "error.errorCode != 106"),
+        ("client", "!usecs->hasCacheAdvertisement()", "false"),
+        ("client", "(!barrier_exists || repeat_strict_failure)",
+         "(!barrier_exists)"),
         ("client", "p50_disposition_attempted = true;", ""),
         ("client", "send_p50_disposition(ResultDispositionMsg::Accepted)",
          "send_deleted(ResultDispositionMsg::Accepted)"),
@@ -536,6 +689,18 @@ def deletion_mutants(files: dict[str, str]) -> None:
         ("main", '"orphaned compiler cleanup KILL pid="',
          '"orphaned compiler cleanup deleted pid="'),
         ("main", "release_slot_once(rec.slot)", "release_slot_deleted(rec.slot)"),
+        ("main", "workit_daemon_shutdown_signal = whichsig;", ""),
+        ("client_main",
+         'getenv("ICECC_P50_TEST_STRICT_RETRY_BEFORE_GETCS_BARRIER")',
+         'getenv("ICECC_P50_TEST_STRICT_RETRY_BARRIER_DELETED")'),
+        ("workit",
+         "status, workit_daemon_shutdown_signal",
+         "status, 0"),
+        ("workit", "return EXIT_GONE;", "return 0;"),
+        ("compiler_signal",
+         "return WTERMSIG(wait_status) == daemon_shutdown_signal;",
+         "return true;"),
+        ("compiler_signal", "case SIGALRM:", "case SIGSEGV:"),
         ("main",
          "pollfd_is_set(pollfds, client->pipe_from_child,\n"
          "                                         POLLIN | POLLHUP | POLLERR)",
@@ -586,6 +751,22 @@ def deletion_mutants(files: dict[str, str]) -> None:
         ("runtime_gate", "--identity-trace \"$work/compile-identity.jsonl\"", ""),
         ("runtime_gate", "run_remote_cell disconnect disconnect", "disconnect_deleted"),
         ("runtime_gate", 'rm -f -- "$retry_remote_obj"', ""),
+        ("runtime_gate", 'ICECC_P50_TEST_FRESH_STRICT_RETRY=1', ""),
+        ("runtime_gate",
+         'ICECC_P50_TEST_FRESH_STRICT_RETRY_SECOND_FAILURE=1', ""),
+        ("runtime_gate", 'rm -f -- "$strict_retry_remote_obj"', ""),
+        ("runtime_gate",
+         "ICECC_P50_TEST_STRICT_RETRY_BEFORE_GETCS_BARRIER",
+         "ICECC_P50_TEST_STRICT_RETRY_BARRIER_DELETED"),
+        ("runtime_gate", "inflight_compiler_started=1", "inflight_compiler_started=0"),
+        ("runtime_gate", 'kill -TERM "$inflight_first_worker_pid"', "kill_deleted"),
+        ("runtime_gate",
+         "worker shutdown interrupted remote compiler; closing result stream",
+         "worker shutdown classification deleted"),
+        ("runtime_gate", "len(job_ids) != 2", "len(job_ids) < 2"),
+        ("runtime_gate",
+         'test "${bounded_new_count:-0}" -eq 2',
+         'test "${bounded_new_count:-0}" -ge 2'),
         ("runtime_gate", 'source.get("raw_digest") != first["raw_digest"]',
          "False"),
         ("runtime_gate",
@@ -610,11 +791,14 @@ def deletion_mutants(files: dict[str, str]) -> None:
 def main() -> int:
     files = {
         "client": (ROOT / "client/remote.cpp").read_text(),
+        "client_main": (ROOT / "client/main.cpp").read_text(),
         "client_make": (ROOT / "client/Makefile.am").read_text(),
         "serve": (ROOT / "daemon/serve.cpp").read_text(),
         "main": (ROOT / "daemon/main.cpp").read_text(),
         "compiler_signal": (ROOT / "daemon/compiler_group_signal.h").read_text(),
         "compiler_test": (ROOT / "unittests/p50_compiler_quiescence_test.cpp").read_text(),
+        "workit": (ROOT / "daemon/workit.cpp").read_text(),
+        "workit_h": (ROOT / "daemon/workit.h").read_text(),
         "unit_make": (ROOT / "unittests/Makefile.am").read_text(),
         "daemon_make": (ROOT / "daemon/Makefile.am").read_text(),
         "record_h": (ROOT / "daemon/p50_completion_record.h").read_text(),

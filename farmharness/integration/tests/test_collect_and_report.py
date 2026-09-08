@@ -22,6 +22,7 @@ from farmharness.integration.collect import (
     _legacy_wire_binding_marker,
     _legacy_wire_candidates_for_assignment,
     _legacy_wire_results,
+    _missing_compile_result_identity_reason,
     _one_role_log,
     _p29_interner_faults,
     _p50_assignment_identity_marker,
@@ -1273,6 +1274,304 @@ def test_collection_refuses_a_marker_without_exact_source_result(
     with pytest.raises(
         CollectError, match="has no full-identity source-result witness"
     ):
+        collect_bundle(farm, scenario, plan, sync_remote=False)
+
+
+def _make_failed_p50_transport_fixture(root: Path) -> None:
+    results = root / "C1.results"
+    identity = results / "compile-identity.jsonl"
+    identity.write_text("", encoding="utf-8")
+    job = results / "workload" / "jobs" / "000001"
+    debug = job / "client-debug.log"
+    debug.write_text(
+        "P50 assignment identity bound for job 2 epoch 1 nonce 1 "
+        "c_guid 1 tu_seq 99\n"
+        + debug.read_text(encoding="utf-8")
+        + "normalizing P50 client error 14 to Error 106 for a fresh assignment\n",
+        encoding="utf-8",
+    )
+    result = job / "result.tsv"
+    fields = result.read_text(encoding="utf-8").rstrip("\n").split("\t")
+    fields[8] = "100"
+    fields[9] = "b" * 64
+    fields[11] = "0"
+    result.write_text("\t".join(fields) + "\n", encoding="utf-8")
+    workload = results / "workload"
+    (workload / "oracle-summary.tsv").write_text(
+        "sample_total\t1\nsample_mismatches\t1\n", encoding="utf-8"
+    )
+    (workload / "oracle-samples.tsv").write_text(
+        f"files/x.ii\t{SHA}\t{'b' * 64}\t0\n", encoding="utf-8"
+    )
+
+
+def test_failed_transport_without_result_identity_collects_as_fail(
+    tmp_path: Path,
+) -> None:
+    farm, scenario, plan, root = _raw_collection(tmp_path)
+    _make_failed_p50_transport_fixture(root)
+    scheduler = next(
+        item for item in plan["topology"]["instances"] if item["role"] == "S"
+    )
+    scheduler_log = (
+        root / "diagnostics" / scheduler["host"] / "S1.log" / "scheduler.log"
+    )
+    scheduler_log.write_text(
+        scheduler_log.read_text(encoding="utf-8").replace(
+            "END 2 status=0 server=F1", "END 2 status=151"
+        ),
+        encoding="utf-8",
+    )
+
+    bundle = collect_bundle(farm, scenario, plan, sync_remote=False)
+
+    assert bundle["rows"][0]["exact"] is False
+    assert bundle["rows"][0]["session_outcome"] == "failed"
+    assert bundle["observations"]["compile_failure_job_ids"] == ["C1:A:1:2"]
+    assert bundle["observations"]["failed_p50_result_identities"] == {
+        "record_count": 1,
+        "records": [
+            {
+                "assignment_epoch": 1,
+                "assignment_nonce": 1,
+                "attempt_index": 0,
+                "reason": "result-stream-loss",
+                "result_identity_present": False,
+                "row_job_id": "C1:A:1:2",
+                "scheduler_job": 2,
+                "worker": "F1",
+            }
+        ],
+    }
+    assert verify_bundle(root)["status"] == "FAIL"
+
+
+@pytest.mark.parametrize(
+    "mutation", ("successful", "wrong-nonce", "wrong-digest", "no-error106")
+)
+def test_missing_result_identity_never_authenticates_ambiguous_or_successful_row(
+    tmp_path: Path, mutation: str
+) -> None:
+    farm, scenario, plan, root = _raw_collection(tmp_path)
+    _make_failed_p50_transport_fixture(root)
+    job = root / "C1.results" / "workload" / "jobs" / "000001"
+    if mutation == "successful":
+        result = job / "result.tsv"
+        fields = result.read_text(encoding="utf-8").rstrip("\n").split("\t")
+        fields[8] = "0"
+        fields[9] = SHA
+        fields[11] = "1"
+        result.write_text("\t".join(fields) + "\n", encoding="utf-8")
+    elif mutation == "wrong-nonce":
+        debug = job / "client-debug.log"
+        debug.write_text(
+            debug.read_text(encoding="utf-8").replace("nonce 1", "nonce 2"),
+            encoding="utf-8",
+        )
+    elif mutation == "wrong-digest":
+        source_path = root / "C1.results" / "source-result.jsonl"
+        source = json.loads(source_path.read_text(encoding="utf-8"))
+        source["raw_bytes"] = 101
+        _write_jsonl(source_path, [source])
+    else:
+        debug = job / "client-debug.log"
+        debug.write_text(
+            debug.read_text(encoding="utf-8").replace(
+                "normalizing P50 client error 14 to Error 106 for a fresh assignment\n",
+                "",
+            ),
+            encoding="utf-8",
+        )
+
+    with pytest.raises(CollectError, match="full-identity source-result witness"):
+        collect_bundle(farm, scenario, plan, sync_remote=False)
+
+
+def test_worker_restart_loss_is_the_only_restart_identity_exception() -> None:
+    source = {
+        **_source_result_record(),
+        "logical_job": 17,
+        "wire_job_id": 17,
+        "raw_bytes": 100,
+        "raw_digest": "2" * 32,
+        "status": 0,
+        "terminal_error_code": 0,
+        "terminal_error_name": None,
+        "c_to_f_bytes": 321,
+        "f_to_c_bytes": 123,
+        "source_mutex_service_ns": 2_000_000,
+        "system_source_reuse": False,
+        "tu_seq": 1,
+    }
+    marker = {"line": 3, "profile": "P29V1", "raw_bytes": 100, "tu_seq": 1}
+    kwargs = {
+        "raw": {"compile_rc": 105, "remote": 1},
+        "final_attempt": True,
+        "local_build": False,
+        "log_text": "",
+        "events": [_worker_restart_loss_event(scheduler_job=17)],
+        "assignment": {"scheduler_job": 17, "worker": "F1"},
+        "assignment_identity": (17, 1, 1),
+        "source_key": (17, 1, 1),
+        "source": source,
+        "marker": marker,
+        "c_commits": {(C_GUID, 1)},
+        "f_commits": {"F1": {(C_GUID, 1)}},
+    }
+    assert _missing_compile_result_identity_reason(**kwargs) == "worker-restart-loss"
+    kwargs["events"] = [_worker_restart_loss_event(scheduler_job=18)]
+    assert _missing_compile_result_identity_reason(**kwargs) is None
+
+
+def _make_fresh_p50_retry_fixture(plan: dict[str, object], root: Path) -> None:
+    scheduler = next(
+        item for item in plan["topology"]["instances"] if item["role"] == "S"
+    )
+    scheduler_log = (
+        root / "diagnostics" / scheduler["host"] / "S1.log" / "scheduler.log"
+    )
+    scheduler_log.write_text(
+        scheduler_log.read_text(encoding="utf-8").replace(
+            "[1] 2026-09-05 01:00:06: RELOGIN F1(x86_64): cache=off\n",
+            "[1] 2026-09-05 01:00:06: NEW 3 client=C1 versions=[] "
+            "/corpus/files/x.ii C++ 0\n"
+            "[1] 2026-09-05 01:00:06: put 3 in joblist of F1\n"
+            "[1] 2026-09-05 01:00:06: BEGIN: 3 client=C1(x86_64) "
+            "server=F1(x86_64)\n"
+            "[1] 2026-09-05 01:00:07: END 3 status=0 server=F1\n"
+            "[1] 2026-09-05 01:00:08: RELOGIN F1(x86_64): cache=off\n",
+        ),
+        encoding="utf-8",
+    )
+    results = root / "C1.results"
+    job = results / "workload" / "jobs" / "000001"
+    endpoint = next(
+        f"{item['address']}:{plan['ports']['instances'][item['name']]}"
+        for item in plan["topology"]["instances"]
+        if item["name"] == "F1"
+    )
+    (job / "client-debug.log").write_text(
+        "P50 assignment identity bound for job 2 epoch 1 nonce 1 "
+        "c_guid 1 tu_seq 1\n"
+        f"ICECC[2] 2026-09-05 01:00:04: Have to use host {endpoint} "
+        "- Job ID: 2 - env: x86_64\n"
+        "P29V1 source committed for P50 CompileFile: 100 exact bytes, "
+        "TU sequence 1\n"
+        "normalizing P50 client error 14 to Error 106 for a fresh assignment\n"
+        "P50 assignment identity bound for job 3 epoch 1 nonce 2 "
+        "c_guid 1 tu_seq 2\n"
+        f"ICECC[3] 2026-09-05 01:00:06: Have to use host {endpoint} "
+        "- Job ID: 3 - env: x86_64\n"
+        "P29V1 source committed for P50 CompileFile: 100 exact bytes, "
+        "TU sequence 2\n",
+        encoding="utf-8",
+    )
+    result_path = job / "result.tsv"
+    fields = result_path.read_text(encoding="utf-8").rstrip("\n").split("\t")
+    fields[4] = "3"
+    fields[-1] = "1"
+    result_path.write_text("\t".join(fields) + "\n", encoding="utf-8")
+
+    sources = [json.loads((results / "source-result.jsonl").read_text())]
+    sources.append(
+        {
+            **sources[0],
+            "assignment_nonce": 2,
+            "logical_job": 3,
+            "tu_seq": 2,
+            "wire_job_id": 3,
+        }
+    )
+    _write_jsonl(results / "source-result.jsonl", sources)
+    _write_jsonl(
+        results / "compile-identity.jsonl",
+        [
+            {
+                "assignment_epoch": 1,
+                "assignment_nonce": 2,
+                "c_guid": 1,
+                "job_id": 3,
+                "record": "compile-result-identity",
+                "tu_seq": 99,
+            }
+        ],
+    )
+    actions = [
+        {"action": "COMMIT_ACCEPTED", "c_store_guid": C_GUID, "tu_seq": tu_seq}
+        for tu_seq in (1, 2)
+    ]
+    _write_jsonl(results / "c-action.jsonl", actions)
+    _write_jsonl(
+        root / "F1.results" / "f-action.jsonl",
+        [
+            {"action": "SESSION_OPENED"},
+            *[
+                {
+                    "action": "INPUT_COMMITTED",
+                    "c_store_guid": C_GUID,
+                    "tu_seq": tu_seq,
+                }
+                for tu_seq in (1, 2)
+            ],
+        ],
+    )
+    worker = next(
+        item for item in plan["topology"]["instances"] if item["name"] == "F1"
+    )
+    (
+        root / "diagnostics" / worker["host"] / "F1.log" / "iceccd.log"
+    ).write_text(
+        "P50 CompileFile attached exact P29V1 input for job 2\n"
+        "P50 CompileFile attached exact P29V1 input for job 3\n",
+        encoding="utf-8",
+    )
+
+
+def test_fresh_p50_retry_binds_only_the_final_result_identity(
+    tmp_path: Path,
+) -> None:
+    farm, scenario, plan, root = _raw_collection(tmp_path)
+    _make_fresh_p50_retry_fixture(plan, root)
+
+    bundle = collect_bundle(farm, scenario, plan, sync_remote=False)
+
+    assert bundle["rows"][0]["session_outcome"] == "committed"
+    assert bundle["rows"][0]["exact"] is True
+    assert bundle["rows"][0]["retries"] == 1
+    assert bundle["observations"]["failed_p50_result_identities"] == {
+        "record_count": 1,
+        "records": [
+            {
+                "assignment_epoch": 1,
+                "assignment_nonce": 1,
+                "attempt_index": 0,
+                "reason": "result-stream-loss",
+                "result_identity_present": False,
+                "row_job_id": "C1:A:1:3",
+                "scheduler_job": 2,
+                "worker": "F1",
+            }
+        ],
+    }
+    assert bundle["observations"]["compile_failure_job_ids"] == []
+
+
+def test_retry_loss_witness_must_be_in_the_same_attempt_window(
+    tmp_path: Path,
+) -> None:
+    farm, scenario, plan, root = _raw_collection(tmp_path)
+    # Build the valid two-attempt fixture, then move Error106 after assignment
+    # 2. The final attempt's log cannot excuse attempt 1's missing result.
+    _make_fresh_p50_retry_fixture(plan, root)
+    job = root / "C1.results" / "workload" / "jobs" / "000001"
+    debug = job / "client-debug.log"
+    lines = debug.read_text(encoding="utf-8").splitlines()
+    error = next(line for line in lines if "normalizing P50 client error" in line)
+    lines.remove(error)
+    lines.append(error)
+    debug.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(CollectError, match="no result identity or exact loss witness"):
         collect_bundle(farm, scenario, plan, sync_remote=False)
 
 

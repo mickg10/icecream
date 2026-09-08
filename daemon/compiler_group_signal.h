@@ -44,6 +44,26 @@ struct SlotAccounting {
     bool active = true;
 };
 
+/* A compiler signal is retryable process loss only when it exactly matches a
+   termination signal caught by the owning daemon.  WIFSIGNALED alone also
+   covers genuine compiler crashes; a merely concurrent daemon shutdown must
+   not turn SIGSEGV/SIGABRT into retryable process loss.  Numeric statuses
+   (including 105) remain genuine compiler exits. */
+inline bool compiler_wait_status_is_worker_process_loss(
+    int wait_status, int daemon_shutdown_signal) noexcept
+{
+    if (!WIFSIGNALED(wait_status))
+        return false;
+    switch (daemon_shutdown_signal) {
+    case SIGTERM:
+    case SIGINT:
+    case SIGALRM:
+        return WTERMSIG(wait_status) == daemon_shutdown_signal;
+    default:
+        return false;
+    }
+}
+
 struct CleanupAdvance {
     AnchorObservation anchor = AnchorObservation::Unprovable;
     SignalResult final_signal;

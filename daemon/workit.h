@@ -25,6 +25,7 @@
 #define ICECREAM_WORKIT_H
 
 #include <job.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <string>
 
@@ -32,6 +33,11 @@
 
 class MsgChannel;
 class CompileResultMsg;
+
+/* Set only from the daemon's termination-signal handler.  Each forked compile
+   worker owns its post-fork copy, so a compiler crash cannot manufacture this
+   fact and an ordinary numeric exit code cannot alias worker process loss. */
+extern volatile sig_atomic_t workit_daemon_shutdown_signal;
 
 // No icecream ;(
 class myexception : public std::exception

@@ -102,6 +102,9 @@ P50_ASSIGNMENT_IDENTITY_RE = re.compile(
     r"\bP50 assignment identity bound for job ([0-9]+) epoch ([0-9]+) "
     r"nonce ([0-9]+) c_guid ([0-9]+) tu_seq ([0-9]+)\b"
 )
+P50_NORMALIZED_ERROR106_RE = re.compile(
+    r"\bnormalizing P50 client error [0-9]+ to Error 106 for a fresh assignment\b"
+)
 LOCAL_BUILD_MARKERS = ("<building_local>", "building myself, but telling localhost")
 LOG_TIMESTAMP_RE = re.compile(
     r"\b([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}):"
@@ -794,12 +797,23 @@ def _source_candidates_for_assignment(
 
 
 def _p50_assignment_identity_marker(
-    text: str, scheduler_job: int
+    text: str,
+    scheduler_job: int,
+    *,
+    after_line: int = 0,
+    before_line: int | None = None,
 ) -> tuple[int, int, int] | None:
     """Return one exact scheduler assignment identity from a job-local log."""
 
     identities = set()
-    for match in P50_ASSIGNMENT_IDENTITY_RE.finditer(text):
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        if line_number <= after_line or (
+            before_line is not None and line_number >= before_line
+        ):
+            continue
+        match = P50_ASSIGNMENT_IDENTITY_RE.search(line)
+        if match is None:
+            continue
         values = tuple(int(match.group(index)) for index in range(1, 6))
         if values[0] != scheduler_job:
             continue
@@ -4104,28 +4118,147 @@ def _job_result(path: Path) -> dict[str, Any]:
     }
 
 
-def _profile_marker(job_dir: Path) -> dict[str, Any] | None:
+def _profile_markers(job_dir: Path) -> list[dict[str, Any]]:
     content = (
         _text(job_dir / "client-debug.log")
         + "\n"
         + _text(job_dir / "client-output.log")
     )
     matches = list(PROFILE_RE.finditer(content))
-    unique = {
-        (match.group(1), int(match.group(2)), int(match.group(3)))
-        for match in matches
-    }
-    if len(unique) > 1:
-        raise CollectError(f"{job_dir}: conflicting P50 commit markers")
-    if not matches:
+    unique: dict[tuple[str, int, int], dict[str, Any]] = {}
+    for match in matches:
+        key = (match.group(1), int(match.group(2)), int(match.group(3)))
+        unique.setdefault(
+            key,
+            {
+                "line": content.count("\n", 0, match.start()) + 1,
+                "profile": key[0],
+                "raw_bytes": key[1],
+                "tu_seq": key[2],
+            },
+        )
+    return sorted(unique.values(), key=lambda item: item["line"])
+
+
+def _profile_markers_by_assignment(
+    markers: list[dict[str, Any]],
+    assignments: list[dict[str, Any]],
+    source: str,
+) -> list[dict[str, Any] | None]:
+    """Bind each commit marker to its immediately preceding assignment."""
+
+    bound: list[list[dict[str, Any]]] = [[] for _ in assignments]
+    for marker in markers:
+        owners = [
+            index
+            for index, assignment in enumerate(assignments)
+            if assignment["line"] < marker["line"]
+        ]
+        if not owners:
+            raise CollectError(f"{source}: P50 commit marker precedes every assignment")
+        bound[owners[-1]].append(marker)
+    if any(len(items) > 1 for items in bound):
+        raise CollectError(f"{source}: assignment has conflicting P50 commit markers")
+    return [items[0] if items else None for items in bound]
+
+
+def _source_transfer_is_exact(
+    source: Mapping[str, Any],
+    marker: Mapping[str, Any],
+    *,
+    worker_name: str,
+    c_commits: set[tuple[str, int]],
+    f_commits: Mapping[str, set[tuple[str, int]]],
+) -> bool:
+    key = (source["c_store_guid"], source["tu_seq"])
+    return (
+        source["status"] == 0
+        and source["attempts"] >= 1
+        and marker["profile"] == source["profile"]
+        and marker["raw_bytes"] == source["raw_bytes"]
+        and marker["tu_seq"] == source["tu_seq"]
+        and key in c_commits
+        and key in f_commits[worker_name]
+    )
+
+
+def _source_commit_is_exact(
+    source: Mapping[str, Any],
+    marker: Mapping[str, Any],
+    *,
+    worker_name: str,
+    scheduler_job: int,
+    c_commits: set[tuple[str, int]],
+    f_commits: Mapping[str, set[tuple[str, int]]],
+    attachments: Mapping[tuple[str, int], str],
+) -> bool:
+    return _source_transfer_is_exact(
+        source,
+        marker,
+        worker_name=worker_name,
+        c_commits=c_commits,
+        f_commits=f_commits,
+    ) and attachments.get((worker_name, scheduler_job)) == source["profile"]
+
+
+def _missing_compile_result_identity_reason(
+    *,
+    raw: Mapping[str, Any],
+    final_attempt: bool,
+    local_build: bool,
+    log_text: str,
+    events: list[dict[str, Any]],
+    assignment: Mapping[str, Any],
+    assignment_identity: tuple[int, int, int] | None,
+    source_key: tuple[int, int, int],
+    source: Mapping[str, Any],
+    marker: Mapping[str, Any],
+    c_commits: set[tuple[str, int]],
+    f_commits: Mapping[str, set[tuple[str, int]]],
+) -> str | None:
+    """Classify a committed P50 attempt for which no result frame exists.
+
+    This never authenticates success.  It admits only an explicitly failed
+    row (or a failed prior retry attempt) whose assignment, source commit and
+    loss witness are all exact; the caller must retain it as failed evidence.
+    """
+
+    if (
+        assignment_identity is None
+        or source_key != assignment_identity
+        or local_build
+        or raw["remote"] != 1
+        or (final_attempt and raw["compile_rc"] == 0)
+        or not _source_transfer_is_exact(
+            source,
+            marker,
+            worker_name=str(assignment["worker"]),
+            c_commits=c_commits,
+            f_commits=f_commits,
+        )
+    ):
         return None
-    profile, raw_bytes, tu_seq = next(iter(unique))
-    return {
-        "line": content.count("\n", 0, matches[0].start()) + 1,
-        "profile": profile,
-        "raw_bytes": raw_bytes,
-        "tu_seq": tu_seq,
+
+    restart_losses = {
+        (event.get("instance"), scheduler_job)
+        for event in events
+        if event.get("action") == "restart"
+        and isinstance(event.get("receipt"), Mapping)
+        and event["receipt"].get("schema") == WORKER_RESTART_SCHEMA
+        and isinstance(
+            event["receipt"].get("coordination", {}).get("scheduler_rejoin"),
+            Mapping,
+        )
+        for scheduler_job in event["receipt"]["coordination"][
+            "scheduler_rejoin"
+        ].get("loss_job_ids", [])
+        if type(scheduler_job) is int and scheduler_job > 0
     }
+    if (assignment["worker"], assignment["scheduler_job"]) in restart_losses:
+        return "worker-restart-loss"
+    if P50_NORMALIZED_ERROR106_RE.search(log_text) is not None:
+        return "result-stream-loss"
+    return None
 
 
 def _legacy_wire_binding_marker(
@@ -4207,6 +4340,7 @@ def _parse_rows(
     local_fallbacks: list[str] = []
     error106: list[str] = []
     source_mutex_records: list[dict[str, Any]] = []
+    failed_result_identity_records: list[dict[str, Any]] = []
     legacy_wire_records: list[dict[str, Any]] = []
     wire_revision_mismatches: list[dict[str, Any]] = []
     s30_refusals: list[dict[str, Any]] = []
@@ -4315,14 +4449,107 @@ def _parse_rows(
                 **raw,
             }
             raw_jobs.append(raw_job)
-            marker = _profile_marker(job_dir)
-            legacy_marker = _legacy_wire_binding_marker(log_text, scheduler_job)
-            assignment_identity = _p50_assignment_identity_marker(
-                log_text, scheduler_job
+            attempt_markers = _profile_markers_by_assignment(
+                _profile_markers(job_dir), assignments, str(job_dir)
             )
+            attempt_identities = [
+                _p50_assignment_identity_marker(
+                    log_text,
+                    assignment["scheduler_job"],
+                    after_line=(assignments[index - 1]["line"] if index else 0),
+                    before_line=assignment["line"] + 1,
+                )
+                for index, assignment in enumerate(assignments)
+            ]
+            log_lines = log_text.splitlines()
+            attempt_log_texts = [
+                "\n".join(
+                    log_lines[
+                        assignment["line"] : (
+                            assignments[index + 1]["line"] - 1
+                            if index + 1 < len(assignments)
+                            else len(log_lines)
+                        )
+                    ]
+                )
+                for index, assignment in enumerate(assignments)
+            ]
+            marker = attempt_markers[-1]
+            legacy_marker = _legacy_wire_binding_marker(log_text, scheduler_job)
+            assignment_identity = attempt_identities[-1]
             scheduler = next(
                 item for item in topology if item["role"] == "S"
             )
+
+            missing_result_identities: list[dict[str, Any]] = []
+            for attempt_index, (
+                assignment,
+                attempt_marker,
+                attempt_identity,
+                attempt_log_text,
+            ) in enumerate(
+                zip(
+                    assignments[:-1],
+                    attempt_markers[:-1],
+                    attempt_identities[:-1],
+                    attempt_log_texts[:-1],
+                )
+            ):
+                if attempt_marker is None:
+                    continue
+                attempt_candidates = _source_candidates_for_assignment(
+                    source_results,
+                    assignment["scheduler_job"],
+                    _instance_version_at(
+                        scheduler, events, assignment["observed_ms"]
+                    ),
+                    attempt_identity,
+                )
+                matching = [
+                    (key, candidate)
+                    for key, candidate in attempt_candidates
+                    if candidate["profile"] == attempt_marker["profile"]
+                    and candidate["raw_bytes"] == attempt_marker["raw_bytes"]
+                    and candidate["tu_seq"] == attempt_marker["tu_seq"]
+                ]
+                if len(matching) != 1:
+                    raise CollectError(
+                        f"{job_id}: prior P50 assignment lacks one exact source result"
+                    )
+                attempt_key, attempt_source = matching[0]
+                if attempt_key in compile_identities:
+                    continue
+                reason = _missing_compile_result_identity_reason(
+                    raw=raw,
+                    final_attempt=False,
+                    local_build=local_build,
+                    log_text=attempt_log_text,
+                    events=events,
+                    assignment=assignment,
+                    assignment_identity=attempt_identity,
+                    source_key=attempt_key,
+                    source=attempt_source,
+                    marker=attempt_marker,
+                    c_commits=c_commits,
+                    f_commits=f_commits,
+                )
+                if reason is None:
+                    raise CollectError(
+                        f"{job_id}: prior P50 commit has no result identity or exact loss witness"
+                    )
+                missing_result_identities.append(
+                    {
+                        "assignment_epoch": attempt_identity[1],
+                        "assignment_nonce": attempt_identity[2],
+                        "attempt_index": attempt_index,
+                        "reason": reason,
+                        "result_identity_present": False,
+                        "row_job_id": job_id,
+                        "scheduler_job": assignment["scheduler_job"],
+                        "worker": assignment["worker"],
+                    }
+                )
+
             assignment_scheduler_version = _instance_version_at(
                 scheduler, events, final_assignment["observed_ms"]
             )
@@ -4332,10 +4559,10 @@ def _parse_rows(
                 assignment_scheduler_version,
                 assignment_identity,
             )
-            authenticated = []
+            authenticated: list[tuple[tuple[int, int, int], dict[str, Any]]] = []
             if marker is not None:
                 authenticated = [
-                    source
+                    (key, source)
                     for key, source in candidates
                     if key in compile_identities
                     and source["profile"] == marker["profile"]
@@ -4345,12 +4572,51 @@ def _parse_rows(
             if len(authenticated) > 1 or (marker is None and len(candidates) > 1):
                 raise CollectError(f"{job_id}: source-result assignment is ambiguous")
             source = (
-                authenticated[0]
+                authenticated[0][1]
                 if marker is not None and len(authenticated) == 1
                 else candidates[0][1]
                 if marker is None and len(candidates) == 1
                 else None
             )
+            failed_result_identity_reason = None
+            if marker is not None and source is None and len(candidates) == 1:
+                candidate_key, candidate_source = candidates[0]
+                if candidate_key not in compile_identities:
+                    failed_result_identity_reason = (
+                        _missing_compile_result_identity_reason(
+                            raw=raw,
+                            final_attempt=True,
+                            local_build=local_build,
+                            log_text=attempt_log_texts[-1],
+                            events=events,
+                            assignment=final_assignment,
+                            assignment_identity=assignment_identity,
+                            source_key=candidate_key,
+                            source=candidate_source,
+                            marker=marker,
+                            c_commits=c_commits,
+                            f_commits=f_commits,
+                        )
+                    )
+                    if failed_result_identity_reason is not None:
+                        source = candidate_source
+                        missing_result_identities.append(
+                            {
+                                "assignment_epoch": assignment_identity[1],
+                                "assignment_nonce": assignment_identity[2],
+                                "attempt_index": len(assignments) - 1,
+                                "reason": failed_result_identity_reason,
+                                "result_identity_present": False,
+                                "row_job_id": job_id,
+                                "scheduler_job": final_assignment["scheduler_job"],
+                                "worker": final_assignment["worker"],
+                            }
+                        )
+            if missing_result_identities:
+                raw_job["missing_compile_result_identities"] = (
+                    missing_result_identities
+                )
+                failed_result_identity_records.extend(missing_result_identities)
             legacy_candidates = _legacy_wire_candidates_for_assignment(
                 c_legacy_wires,
                 scheduler_job,
@@ -4386,19 +4652,22 @@ def _parse_rows(
                 if marker is None:
                     outcome = "refused"
                 else:
-                    key = (source["c_store_guid"], source["tu_seq"])
-                    attached = attachments.get((worker["name"], scheduler_job))
-                    committed = (
-                        source["status"] == 0
-                        and source["attempts"] >= 1
-                        and marker["profile"] == profile
-                        and marker["raw_bytes"] == source["raw_bytes"]
-                        and marker["tu_seq"] == source["tu_seq"]
-                        and key in c_commits
-                        and key in f_commits[worker["name"]]
-                        and attached == profile
+                    committed = _source_commit_is_exact(
+                        source,
+                        marker,
+                        worker_name=worker["name"],
+                        scheduler_job=scheduler_job,
+                        c_commits=c_commits,
+                        f_commits=f_commits,
+                        attachments=attachments,
                     )
-                    outcome = "committed" if committed else "refused"
+                    outcome = (
+                        "failed"
+                        if failed_result_identity_reason is not None
+                        else "committed"
+                        if committed
+                        else "refused"
+                    )
                 reuse = source["system_source_reuse"] if profile == "P29V1" else None
                 c_to_f = source["c_to_f_bytes"]
                 f_to_c = source["f_to_c_bytes"]
@@ -4574,6 +4843,13 @@ def _parse_rows(
     return rows, {
         "compile_failure_job_ids": sorted(compile_failures),
         "error106_job_ids": sorted(error106),
+        "failed_p50_result_identities": {
+            "record_count": len(failed_result_identity_records),
+            "records": sorted(
+                failed_result_identity_records,
+                key=lambda item: (item["row_job_id"], item["attempt_index"]),
+            ),
+        },
         "local_fallback_job_ids": sorted(local_fallbacks),
         "legacy_wire": {
             "records": sorted(legacy_wire_records, key=lambda item: item["job_id"]),
@@ -5378,6 +5654,26 @@ def _observations(
         row = row_by_identity[raw["row_job_id"]]
         attempts = raw["assignment_claims"]
         records = [item["scheduler_record"] for item in attempts]
+        missing_result_identities = raw.get(
+            "missing_compile_result_identities", []
+        )
+        for missing in missing_result_identities:
+            attempt_index = missing["attempt_index"]
+            if not 0 <= attempt_index < len(records):
+                raise CollectError(
+                    f"{row['job_id']}: missing result identity names an invalid attempt"
+                )
+            terminal = records[attempt_index]["terminal"]
+            expected_terminals = (
+                {"process-loss-recovery"}
+                if missing["reason"] == "worker-restart-loss"
+                else {"cancellation", "completion"}
+            )
+            if terminal not in expected_terminals:
+                raise CollectError(
+                    f"{row['job_id']}: missing result identity loss witness "
+                    "disagrees with scheduler terminal"
+                )
         if any(
             current["dispatch_line"] >= following["dispatch_line"]
             for current, following in zip(records, records[1:])
@@ -5391,9 +5687,15 @@ def _observations(
             and raw["local_build"]
             and final["terminal"] == "cancellation"
         )
+        failed_result_stream_completion = any(
+            missing["attempt_index"] == len(attempts) - 1
+            and missing["reason"] == "result-stream-loss"
+            for missing in missing_result_identities
+        )
         if (
             (raw["compile_rc"] == 0) != (final["terminal"] == "completion")
             and not local_fallback_completion
+            and not failed_result_stream_completion
         ):
             raise CollectError(
                 f"{row['job_id']}: wrapper status disagrees with scheduler terminal"

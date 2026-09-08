@@ -219,9 +219,15 @@ require_count 1 'cache_capability.profile_mask &= umsg->cache_profile_mask;' dae
 require_count 1 'getcs.cache_profile_mask = CACHE_ADVERTISABLE_PROFILE_MASK;' client/remote.cpp \
     'a new wrapper explicitly opts an ordinary scalar request into retained profiles'
 require_count 1 'ret = build_remote(job, local_daemon, envs, rate,' client/main.cpp \
-    'the wrapper owns one bounded P50-to-legacy reassignment loop'
-require_count 1 '!p50_legacy_retry);' client/main.cpp \
-    'the fresh retry sends canonical cache-capability absence'
+    'the wrapper owns one bounded P50 reassignment loop'
+require_count 1 'bool p50_retry_attempted = false;' client/main.cpp \
+    'the fresh P50 reassignment has one wrapper-global retry budget'
+require_count 1 'error.errorCode != 106 || p50_retry_attempted' client/main.cpp \
+    'only the first authenticated P50 loss can request reassignment'
+require_count 1 '!p50_retry_attempted || strict_p50);' client/main.cpp \
+    'a normal retry sends canonical absence while a strict retry requests P50 again'
+require_count 1 'p50_retry_attempted = true;' client/main.cpp \
+    'the retry budget is consumed before the fresh GetCS'
 require_count 1 'Each build_remote() call owns one fresh scheduler assignment attempt.' \
     client/remote.cpp \
     'every fresh assignment attempt canonicalizes reused CompileJob input state'

@@ -23,6 +23,7 @@
 
 #include "config.h"
 #include "workit.h"
+#include "compiler_group_signal.h"
 #include "compiler_input.h"
 #include "tempfile.h"
 #include "assert.h"
@@ -74,6 +75,8 @@
 #include "util.h"
 
 using namespace std;
+
+volatile sig_atomic_t workit_daemon_shutdown_signal = 0;
 
 static int death_pipe[2];
 
@@ -681,6 +684,24 @@ int work_it(CompileJob &j, unsigned int job_stat[], MsgChannel *client, CompileR
                     // this should never happen
                     assert(false);
                     return EXIT_DISTCC_FAILED;
+                }
+
+                if (icecc::daemon_child::
+                        compiler_wait_status_is_worker_process_loss(
+                            status, workit_daemon_shutdown_signal)) {
+                    /* The parent daemon's exact owned-group shutdown reached
+                       this compile worker and the compiler died by signal.
+                       Do not send a synthetic CompileResult (historically 105,
+                       indistinguishable from a compiler exit).  EXIT_GONE
+                       takes serve.cpp's exception/close path, so a P50 client
+                       observes authenticated assignment-channel loss and may
+                       request one fresh assignment. */
+                    rmsg.status = EXIT_GONE;
+                    job_stat[JobStatistics::exit_code] = EXIT_GONE;
+                    log_warning()
+                        << "worker shutdown interrupted remote compiler; closing result stream"
+                        << endl;
+                    return EXIT_GONE;
                 }
 
                 if (shell_exit_status(status) != 0) {

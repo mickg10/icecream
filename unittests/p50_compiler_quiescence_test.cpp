@@ -175,6 +175,73 @@ void test_completed_and_active_slots_release_exactly_once()
             "completed A plus active B left incorrect capacity accounting");
 }
 
+void test_worker_process_loss_requires_both_shutdown_and_signal()
+{
+    const auto wait_for_signal = [](int signal_number) {
+        pid_t child_pid = ::fork();
+        require(child_pid >= 0, "could not fork signaled compiler fixture");
+        if (child_pid == 0) {
+            for (;;)
+                ::pause();
+        }
+        require(::kill(child_pid, signal_number) == 0,
+                "could not signal compiler fixture");
+        int status = 0;
+        require(::waitpid(child_pid, &status, 0) == child_pid,
+                "could not reap signaled compiler fixture");
+        return status;
+    };
+
+    const int signaled_status = wait_for_signal(SIGTERM);
+    require(child::compiler_wait_status_is_worker_process_loss(
+                signaled_status, SIGTERM),
+            "owned daemon shutdown plus compiler signal was not process loss");
+    require(!child::compiler_wait_status_is_worker_process_loss(
+                signaled_status, 0),
+            "compiler signal without daemon shutdown became process loss");
+    require(!child::compiler_wait_status_is_worker_process_loss(
+                signaled_status, SIGINT),
+            "mismatched daemon shutdown signal became process loss");
+
+    for (int crash_signal : {SIGSEGV, SIGABRT}) {
+        const int crash_status = wait_for_signal(crash_signal);
+        require(!child::compiler_wait_status_is_worker_process_loss(
+                    crash_status, SIGTERM),
+                "coincident compiler crash became retryable process loss");
+        require(!child::compiler_wait_status_is_worker_process_loss(
+                    crash_status, crash_signal),
+                "compiler crash signal was admitted as a shutdown signal");
+    }
+
+    const int killed_status = wait_for_signal(SIGKILL);
+    require(!child::compiler_wait_status_is_worker_process_loss(
+                killed_status, 0),
+            "unaccompanied compiler KILL became retryable process loss");
+    require(!child::compiler_wait_status_is_worker_process_loss(
+                killed_status, SIGTERM),
+            "compiler KILL mismatched to daemon TERM became process loss");
+
+    for (int shutdown_signal : {SIGINT, SIGALRM}) {
+        const int shutdown_status = wait_for_signal(shutdown_signal);
+        require(child::compiler_wait_status_is_worker_process_loss(
+                    shutdown_status, shutdown_signal),
+                "matching caught daemon shutdown signal was not process loss");
+    }
+
+    pid_t numeric_105 = ::fork();
+    require(numeric_105 >= 0, "could not fork numeric-105 compiler fixture");
+    if (numeric_105 == 0)
+        _exit(105);
+    int numeric_status = 0;
+    require(::waitpid(numeric_105, &numeric_status, 0) == numeric_105,
+            "could not reap numeric-105 compiler fixture");
+    require(WIFEXITED(numeric_status) && WEXITSTATUS(numeric_status) == 105,
+            "numeric-105 fixture did not retain its compiler exit");
+    require(!child::compiler_wait_status_is_worker_process_loss(
+                numeric_status, SIGTERM),
+            "genuine numeric compiler exit 105 became retryable process loss");
+}
+
 void test_completed_cleanup_settles_on_a_later_event_loop_turn()
 {
     FakeOperations operations;
@@ -449,6 +516,7 @@ int main()
         test_lost_anchor_never_authorizes_a_numeric_signal();
         test_malformed_group_identity_fails_before_syscalls();
         test_completed_and_active_slots_release_exactly_once();
+        test_worker_process_loss_requires_both_shutdown_and_signal();
         test_completed_cleanup_settles_on_a_later_event_loop_turn();
         test_group_disappearance_at_term_is_terminal();
         test_lost_after_term_fails_closed_without_reauthorization();
