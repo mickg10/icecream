@@ -11,6 +11,7 @@ from farmharness.integration.verdict import (
     CONTROL_VERDICT_SCHEMA,
     F_INIT_LAUNCH_CONTRACT,
     ROW_SCHEMA,
+    SCHEDULER_DISPATCH_EPOCH_CONTRACT,
     VERDICT_SCHEMA,
     _scenario_profile_at_epoch,
     _shape_clauses,
@@ -1004,7 +1005,9 @@ def test_scheduler_transition_profile_is_resolved_per_event_epoch(
     rows[1]["event_epoch"] = 1
     observations = _observations(rows)
     observations["job_lifecycle"][0]["final_dispatch_ms"] = 900
+    observations["job_lifecycle"][0]["scheduler_generation"] = 1
     observations["job_lifecycle"][1]["final_dispatch_ms"] = 1100
+    observations["job_lifecycle"][1]["scheduler_generation"] = 2
     event_log = [
         {
             "action": action,
@@ -1044,6 +1047,94 @@ def test_scheduler_transition_profile_is_resolved_per_event_epoch(
     assert _s60_transition_epoch_errors(
         scenario, wrong_epoch, observations, event_log
     )
+
+
+def test_scheduler_transition_epoch_uses_exact_generation_within_same_second() -> None:
+    scenario = _scenario("mixed")
+    scenario["id"] = "S60-14-warm-s-up"
+    scheduler = next(
+        item for item in scenario["instances"] if item["role"] == "S"
+    )
+    scheduler["image"] = "old"
+    scheduler["env"] = {}
+    scenario["timeline"] = [
+        {
+            "trigger": "job 24",
+            "action": "upgrade",
+            "instance": "S1",
+            "image": "new",
+        }
+    ]
+    rows = [
+        _row(1, tail=False, profile=None, outcome="none"),
+        _row(2, tail=True, profile="P29V1", outcome="committed"),
+    ]
+    rows[1]["event_epoch"] = 1
+    observations = _observations(rows)
+    observations["job_lifecycle"][0].update(
+        final_dispatch_ms=900,
+        scheduler_generation=1,
+    )
+    observations["job_lifecycle"][1].update(
+        final_dispatch_ms=1000,
+        scheduler_generation=2,
+    )
+    event_log = [
+        {
+            "action": "upgrade",
+            "event_epoch": 1,
+            "fired_ms": 1260,
+            "instance": "S1",
+            "trigger": "job 24",
+        }
+    ]
+    fixture = _bundle(scenario, rows, observations)
+    fixture["event_log"] = event_log
+    fixture["plan"] = {
+        "scheduler_dispatch_epoch_contract": SCHEDULER_DISPATCH_EPOCH_CONTRACT
+    }
+
+    assert not _s60_transition_epoch_errors(
+        scenario, rows, observations, event_log, generation_epoch=True
+    )
+    engagement = next(
+        item
+        for item in evaluate_bundle(fixture)["clauses"]
+        if item["id"] == "engagement.expected"
+    )
+    assert engagement["status"] == "PASS", engagement
+
+    stale_generation = copy.deepcopy(observations)
+    stale_generation["job_lifecycle"][1]["scheduler_generation"] = 1
+    assert _s60_transition_epoch_errors(
+        scenario, rows, stale_generation, event_log, generation_epoch=True
+    )
+    far_timestamp = copy.deepcopy(observations)
+    far_timestamp["job_lifecycle"][1]["final_dispatch_ms"] = 0
+    assert _s60_transition_epoch_errors(
+        scenario, rows, far_timestamp, event_log, generation_epoch=True
+    )
+
+
+@pytest.mark.parametrize(
+    "contract",
+    ("unreviewed-dispatch-law", {"schema": "unreviewed"}),
+)
+def test_unknown_scheduler_dispatch_epoch_contract_fails_closed(
+    contract: object,
+) -> None:
+    fixture = copy.deepcopy(SHAPE_FIXTURES["S'C'F'"])
+    fixture["plan"] = {"scheduler_dispatch_epoch_contract": contract}
+
+    verdict = evaluate_bundle(fixture)
+    clause = next(
+        item
+        for item in verdict["clauses"]
+        if item["id"] == "dispatch-epoch.contract"
+    )
+    assert verdict["status"] == "FAIL"
+    assert clause["status"] == "FAIL"
+    assert clause["offending_job_ids"] == ["@plan:scheduler-dispatch-epoch"]
 
 
 def test_c_upgrade_missing_tail_cannot_erase_its_capability_expectation() -> None:
@@ -1422,10 +1513,18 @@ def _s70_b4_scheduler_bundle() -> dict[str, object]:
     rows[2]["event_epoch"] = 1
     rows[3]["event_epoch"] = 1
     observations = _observations(rows)
-    for lifecycle, dispatch_ms in zip(
-        observations["job_lifecycle"], (0, 200, 300, 400), strict=True
+    for dispatch_line, (lifecycle, dispatch_ms, generation) in enumerate(
+        zip(
+            observations["job_lifecycle"],
+            (0, 200, 300, 400),
+            (1, 1, 2, 2),
+            strict=True,
+        ),
+        start=10,
     ):
         lifecycle["dispatch_ms"] = dispatch_ms
+        lifecycle["scheduler_dispatch_line"] = dispatch_line
+        lifecycle["scheduler_generation"] = generation
         lifecycle["terminal_ms"] = dispatch_ms + 25
         lifecycle["deadline_ms"] = dispatch_ms + 120_000
     bundle = _bundle(scenario, rows, observations)
@@ -2243,10 +2342,15 @@ def _s70_b7_bundle(*, rollback: bool) -> dict[str, object]:
             dispatches.append(epoch * 1000 + position * 100)
             job += 1
     observations = _observations(rows)
-    for lifecycle, dispatch_ms in zip(
-        observations["job_lifecycle"], dispatches, strict=True
+    for dispatch_line, (lifecycle, dispatch_ms, row) in enumerate(
+        zip(observations["job_lifecycle"], dispatches, rows, strict=True),
+        start=10,
     ):
         lifecycle["dispatch_ms"] = dispatch_ms
+        lifecycle["scheduler_dispatch_line"] = dispatch_line
+        lifecycle["scheduler_generation"] = (
+            1 if row["event_epoch"] == 0 else 2
+        )
         lifecycle["terminal_ms"] = dispatch_ms + 25
         lifecycle["deadline_ms"] = dispatch_ms + 120_000
     before_version, after_version = ((50, 43) if rollback else (43, 50))

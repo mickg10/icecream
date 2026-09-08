@@ -84,6 +84,10 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 CLIENT_SCHEDULER_READINESS_SCHEMA = "icefarm-client-scheduler-readiness-v2"
 SCHEDULER_ACTIVE_LOSS_SCHEMA_V1 = "icefarm-scheduler-active-loss-v1"
 SCHEDULER_ACTIVE_LOSS_SCHEMA = "icefarm-scheduler-active-loss-v2"
+SCHEDULER_GENERATION_ACTIONS = frozenset(
+    {"upgrade", "downgrade", "restart", "env_set", "scheduler-loss-active"}
+)
+SCHEDULER_DISPATCH_EPOCH_CONTRACT = "icefarm-scheduler-generation-epoch-v1"
 CLIENT_SCHEDULER_READINESS_FIELDS = frozenset(
     {
         "bytes",
@@ -601,6 +605,8 @@ def _s60_transition_epoch_errors(
     rows: Sequence[Mapping[str, Any]],
     observations: Mapping[str, Any],
     event_log: object,
+    *,
+    generation_epoch: bool = False,
 ) -> set[str]:
     """Bind S60 pair-law rows to the authenticated transition boundary."""
 
@@ -673,7 +679,18 @@ def _s60_transition_epoch_errors(
         if epoch not in {0, 1} or not _is_int(dispatch_ms):
             bad.add(identifier)
             continue
-        expected_epoch = int(dispatch_ms >= fired_ms)
+        expected_epoch = (
+            _scheduler_dispatch_epoch(
+                scenario,
+                event_log,
+                dispatch_ms,
+                life.get("scheduler_generation")
+                if isinstance(life, Mapping)
+                else None,
+            )
+            if generation_epoch
+            else int(dispatch_ms >= fired_ms)
+        )
         if epoch != expected_epoch:
             bad.add(identifier)
         epochs.add(epoch)
@@ -709,6 +726,69 @@ def _s60_transition_epoch_errors(
     if epochs != {0, 1} or target_epochs != {0, 1}:
         bad.add(marker)
     return bad
+
+
+def _scheduler_dispatch_epoch(
+    scenario: Mapping[str, Any],
+    event_log: object,
+    dispatch_ms: object,
+    scheduler_generation: object,
+) -> int | None:
+    """Independently bind a row epoch to its exact scheduler incarnation."""
+
+    instances = scenario.get("instances")
+    if not isinstance(instances, list):
+        return None
+    schedulers = [
+        item
+        for item in instances
+        if isinstance(item, Mapping) and item.get("role") == "S"
+    ]
+    if (
+        len(schedulers) != 1
+        or not isinstance(schedulers[0].get("name"), str)
+        or not isinstance(event_log, list)
+        or not _is_int(dispatch_ms)
+        or not _is_int(scheduler_generation, minimum=1)
+    ):
+        return None
+    scheduler_name = schedulers[0]["name"]
+    replacement_epochs: list[int] = []
+    for index, event in enumerate(event_log):
+        if not isinstance(event, Mapping) or not _is_int(event.get("fired_ms")):
+            return None
+        if (
+            event.get("instance") == scheduler_name
+            and event.get("action") in SCHEDULER_GENERATION_ACTIONS
+        ):
+            replacement_epochs.append(index + 1)
+
+    if not replacement_epochs:
+        return sum(event["fired_ms"] <= dispatch_ms for event in event_log)
+
+    generation_index = scheduler_generation - 1
+    if generation_index > len(replacement_epochs):
+        return None
+    lower_epoch = (
+        replacement_epochs[generation_index - 1] if generation_index else 0
+    )
+    upper_epoch = (
+        replacement_epochs[generation_index] - 1
+        if generation_index < len(replacement_epochs)
+        else len(event_log)
+    )
+    epoch = sum(event["fired_ms"] <= dispatch_ms for event in event_log)
+    if epoch < lower_epoch:
+        skipped = event_log[epoch:lower_epoch]
+        if not skipped or any(
+            event["fired_ms"] // 1000 != dispatch_ms // 1000
+            for event in skipped
+        ):
+            return None
+        epoch = lower_epoch
+    if epoch > upper_epoch:
+        return None
+    return epoch
 
 
 def _lifecycle_wedges(
@@ -3939,6 +4019,11 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(plan, Mapping)
         else None
     )
+    epoch_contract = (
+        plan.get("scheduler_dispatch_epoch_contract")
+        if isinstance(plan, Mapping)
+        else None
+    )
     readiness_contract_valid = readiness_contract in {
         None,
         CLIENT_SCHEDULER_READINESS_SCHEMA,
@@ -3947,6 +4032,11 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
         not isinstance(plan, Mapping)
         and _contains_client_scheduler_readiness_v2(bundle.get("event_log"))
     )
+    epoch_contract_valid = (
+        epoch_contract is None
+        or epoch_contract == SCHEDULER_DISPATCH_EPOCH_CONTRACT
+    )
+    generation_epoch = epoch_contract == SCHEDULER_DISPATCH_EPOCH_CONTRACT
     if readiness_contract is not None:
         clauses.append(
             _clause(
@@ -3954,6 +4044,15 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
                 readiness_contract_valid,
                 "client scheduler readiness uses the authenticated v2 level/edge contract",
                 () if readiness_contract_valid else {"@plan:client-scheduler-readiness"},
+            )
+        )
+    if epoch_contract is not None:
+        clauses.append(
+            _clause(
+                "dispatch-epoch.contract",
+                epoch_contract_valid,
+                "dispatch epochs use authenticated scheduler generations",
+                () if epoch_contract_valid else {"@plan:scheduler-dispatch-epoch"},
             )
         )
     if isinstance(plan, Mapping):
@@ -4665,7 +4764,11 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
         )
     )
     s60_epoch_bad = _s60_transition_epoch_errors(
-        scenario, valid_rows, observations, bundle.get("event_log")
+        scenario,
+        valid_rows,
+        observations,
+        bundle.get("event_log"),
+        generation_epoch=generation_epoch,
     )
     if isinstance(scenario.get("id"), str) and scenario["id"].startswith("S60-"):
         clauses.append(
@@ -4975,22 +5078,34 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
 
             fired_ms = observed_event.get("fired_ms")
             lifecycle = observations.get("job_lifecycle")
-            dispatch_by_job = {
-                _job_id(item.get("job_id"), "@lifecycle"): _lifecycle_final_dispatch_ms(item)
+            lifecycle_by_job = {
+                _job_id(item.get("job_id"), "@lifecycle"): item
                 for item in lifecycle
                 if isinstance(item, Mapping)
             } if isinstance(lifecycle, list) else {}
             for row in valid_rows:
                 identifier = _job_id(row["job_id"], "@row")
-                dispatch_ms = dispatch_by_job.get(identifier)
-                if not (
-                    _is_int(fired_ms)
-                    and _is_int(dispatch_ms)
-                    and (
-                        (row["event_epoch"] == 0 and dispatch_ms < fired_ms)
-                        or (row["event_epoch"] == 1 and dispatch_ms >= fired_ms)
+                lifecycle_row = lifecycle_by_job.get(identifier)
+                dispatch_ms = (
+                    _lifecycle_final_dispatch_ms(lifecycle_row)
+                    if isinstance(lifecycle_row, Mapping)
+                    else None
+                )
+                expected_epoch = (
+                    _scheduler_dispatch_epoch(
+                        scenario,
+                        event_log,
+                        dispatch_ms,
+                        lifecycle_row.get("scheduler_generation")
+                        if isinstance(lifecycle_row, Mapping)
+                        else None,
                     )
-                ):
+                    if generation_epoch
+                    else int(dispatch_ms >= fired_ms)
+                    if _is_int(dispatch_ms) and _is_int(fired_ms)
+                    else None
+                )
+                if expected_epoch != row["event_epoch"]:
                     b4_bad.add(identifier)
         clauses.append(
             _clause(
@@ -5647,8 +5762,8 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
                 b7_bad.add(f"@event:{clause_id}-order")
 
         lifecycle = observations.get("job_lifecycle")
-        dispatch_by_job = {
-            _job_id(item.get("job_id"), "@lifecycle"): _lifecycle_final_dispatch_ms(item)
+        lifecycle_by_job = {
+            _job_id(item.get("job_id"), "@lifecycle"): item
             for item in lifecycle
             if isinstance(item, Mapping)
         } if isinstance(lifecycle, list) else {}
@@ -5656,9 +5771,23 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
         if len(fired) == 3:
             for row in valid_rows:
                 identifier = _job_id(row["job_id"], "@row")
-                dispatch_ms = dispatch_by_job.get(identifier)
+                lifecycle_row = lifecycle_by_job.get(identifier)
+                dispatch_ms = (
+                    _lifecycle_final_dispatch_ms(lifecycle_row)
+                    if isinstance(lifecycle_row, Mapping)
+                    else None
+                )
                 expected_epoch = (
-                    sum(boundary <= dispatch_ms for boundary in fired)
+                    _scheduler_dispatch_epoch(
+                        scenario,
+                        event_log,
+                        dispatch_ms,
+                        lifecycle_row.get("scheduler_generation")
+                        if isinstance(lifecycle_row, Mapping)
+                        else None,
+                    )
+                    if generation_epoch
+                    else sum(boundary <= dispatch_ms for boundary in fired)
                     if _is_int(dispatch_ms)
                     else None
                 )

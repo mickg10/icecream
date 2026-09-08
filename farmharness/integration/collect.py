@@ -125,6 +125,10 @@ SCHEDULER_DISPATCH_RE = re.compile(
 SCHEDULER_BEGIN_RE = re.compile(r"^BEGIN: ([0-9]+)\b")
 SCHEDULER_END_RE = re.compile(r"^END ([0-9]+) status=(-?[0-9]+)\b")
 SCHEDULER_STOP_RE = re.compile(r"^STOP \((WAITFORCS|DAEMON|DAEMON2)\) FOR ([0-9]+)\b")
+SCHEDULER_GENERATION_ACTIONS = frozenset(
+    {"upgrade", "downgrade", "restart", "env_set", "scheduler-loss-active"}
+)
+SCHEDULER_DISPATCH_EPOCH_CONTRACT = "icefarm-scheduler-generation-epoch-v1"
 SOURCE_RESULT_FIELDS = frozenset(
     {
         "schema",
@@ -3932,6 +3936,76 @@ def _epoch_at(events: list[dict[str, Any]], dispatch_ms: int) -> int:
     return sum(event["fired_ms"] <= dispatch_ms for event in events)
 
 
+def _scheduler_dispatch_epoch(
+    events: list[dict[str, Any]],
+    scheduler_name: str,
+    dispatch_ms: int,
+    scheduler_generation: int,
+) -> int:
+    """Resolve a dispatch epoch using the scheduler's exact incarnation.
+
+    Scheduler logs have whole-second timestamps while transition receipts have
+    millisecond timestamps.  A dispatch from a freshly started scheduler can
+    therefore appear a few milliseconds before the event that started it.
+    Only the exact scheduler-log generation may resolve that same-second
+    ambiguity; larger timestamp disagreements and impossible generations fail
+    closed.
+    """
+
+    if (
+        not isinstance(scheduler_name, str)
+        or not scheduler_name
+        or type(dispatch_ms) is not int
+        or dispatch_ms < 0
+        or type(scheduler_generation) is not int
+        or scheduler_generation < 1
+    ):
+        raise CollectError("scheduler dispatch epoch has invalid identity")
+    replacement_epochs: list[int] = []
+    for index, event in enumerate(events):
+        fired_ms = event.get("fired_ms")
+        if type(fired_ms) is not int or fired_ms < 0:
+            raise CollectError("event has no valid fired timestamp")
+        if (
+            event.get("instance") == scheduler_name
+            and event.get("action") in SCHEDULER_GENERATION_ACTIONS
+        ):
+            replacement_epochs.append(index + 1)
+
+    if not replacement_epochs:
+        return _epoch_at(events, dispatch_ms)
+
+    generation_index = scheduler_generation - 1
+    if generation_index > len(replacement_epochs):
+        raise CollectError(
+            "scheduler log generation exceeds declared scheduler transitions"
+        )
+    lower_epoch = (
+        replacement_epochs[generation_index - 1] if generation_index else 0
+    )
+    upper_epoch = (
+        replacement_epochs[generation_index] - 1
+        if generation_index < len(replacement_epochs)
+        else len(events)
+    )
+    epoch = _epoch_at(events, dispatch_ms)
+    if epoch < lower_epoch:
+        skipped = events[epoch:lower_epoch]
+        if not skipped or any(
+            event["fired_ms"] // 1000 != dispatch_ms // 1000
+            for event in skipped
+        ):
+            raise CollectError(
+                "scheduler generation disagrees with the dispatch timestamp"
+            )
+        epoch = lower_epoch
+    if epoch > upper_epoch:
+        raise CollectError(
+            "scheduler generation precedes the dispatch event epoch"
+        )
+    return epoch
+
+
 def _instance_version_at(
     instance: Mapping[str, Any],
     events: list[dict[str, Any]],
@@ -5221,6 +5295,16 @@ def _observations(
     logins, revisions, cache_ports = _parse_logins(evidence, plan)
     topology = plan["topology"]["instances"]
     by_name = {item["name"]: item for item in topology}
+    schedulers = [item for item in topology if item.get("role") == "S"]
+    if len(schedulers) != 1 or not isinstance(schedulers[0].get("name"), str):
+        raise CollectError("topology must resolve exactly one scheduler")
+    scheduler_name = schedulers[0]["name"]
+    epoch_contract = plan.get("scheduler_dispatch_epoch_contract")
+    if (
+        epoch_contract is not None
+        and epoch_contract != SCHEDULER_DISPATCH_EPOCH_CONTRACT
+    ):
+        raise CollectError("plan has an unknown scheduler dispatch epoch contract")
     p29_interner_faults = _p29_interner_faults(evidence, topology)
     for row in rows:
         if row["tail_present"]:
@@ -5314,19 +5398,35 @@ def _observations(
             raise CollectError(
                 f"{row['job_id']}: wrapper status disagrees with scheduler terminal"
             )
-        if (
+        if epoch_contract == SCHEDULER_DISPATCH_EPOCH_CONTRACT:
+            event_epoch = _scheduler_dispatch_epoch(
+                events,
+                scheduler_name,
+                final["dispatch_ms"],
+                final["generation"],
+            )
+        elif (
             scenario.data.get("expect", {}).get("engagement")
             == "s70-b6-drained-kill-switch-cycle"
         ):
-            row["event_epoch"] = final["generation"] - 1
+            event_epoch = final["generation"] - 1
         else:
-            row["event_epoch"] = _epoch_at(events, final["dispatch_ms"])
-        row["client_version"] = _instance_version_at(
-            by_name[row["client_instance"]], events, final["dispatch_ms"]
-        )
-        row["cs_version"] = _instance_version_at(
-            by_name[row["cs"]], events, final["dispatch_ms"]
-        )
+            event_epoch = _epoch_at(events, final["dispatch_ms"])
+        row["event_epoch"] = event_epoch
+        if epoch_contract == SCHEDULER_DISPATCH_EPOCH_CONTRACT:
+            row["client_version"] = _planned_instance_version_at_epoch(
+                scenario, by_name[row["client_instance"]], event_epoch
+            )
+            row["cs_version"] = _planned_instance_version_at_epoch(
+                scenario, by_name[row["cs"]], event_epoch
+            )
+        else:
+            row["client_version"] = _instance_version_at(
+                by_name[row["client_instance"]], events, final["dispatch_ms"]
+            )
+            row["cs_version"] = _instance_version_at(
+                by_name[row["cs"]], events, final["dispatch_ms"]
+            )
         lifecycle.append(
             {
                 "deadline_ms": first["dispatch_ms"]

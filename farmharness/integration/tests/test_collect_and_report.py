@@ -28,6 +28,7 @@ from farmharness.integration.collect import (
     _retained_log_witness,
     _retained_log_witness_exact,
     _parse_logins,
+    _scheduler_dispatch_epoch,
     _snapshot_live_evidence,
     _source_candidates_for_assignment,
     _source_results,
@@ -1924,6 +1925,37 @@ def test_endpoint_version_is_resolved_at_dispatch_from_transition_receipts() -> 
     malformed[1]["receipt"] = {"after": {}}
     with pytest.raises(CollectError, match="after image"):
         _instance_version_at(instance, malformed, 1000)
+
+
+def test_scheduler_generation_resolves_same_second_transition_epoch() -> None:
+    events = [
+        {
+            "action": "upgrade",
+            "fired_ms": 1260,
+            "instance": "S1",
+        }
+    ]
+
+    assert _scheduler_dispatch_epoch(events, "S1", 1000, 1) == 0
+    assert _scheduler_dispatch_epoch(events, "S1", 1000, 2) == 1
+    assert _scheduler_dispatch_epoch(events, "S1", 1260, 2) == 1
+
+
+def test_scheduler_generation_epoch_fails_closed_beyond_same_second() -> None:
+    events = [
+        {
+            "action": "upgrade",
+            "fired_ms": 2260,
+            "instance": "S1",
+        }
+    ]
+
+    with pytest.raises(CollectError, match="disagrees with the dispatch timestamp"):
+        _scheduler_dispatch_epoch(events, "S1", 1000, 2)
+    with pytest.raises(CollectError, match="exceeds declared"):
+        _scheduler_dispatch_epoch(events, "S1", 1000, 3)
+    with pytest.raises(CollectError, match="precedes the dispatch event epoch"):
+        _scheduler_dispatch_epoch(events, "S1", 3000, 1)
 
 
 def test_client_transition_environment_adds_and_removes_explicit_mode() -> None:

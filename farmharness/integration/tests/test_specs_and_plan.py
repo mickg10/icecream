@@ -61,6 +61,10 @@ def test_committed_examples_validate_and_plan_is_stable() -> None:
     assert len(first["topology_digest"]) == 64
     assert first["run_id"] == f"plan-{first['topology_digest'][:12]}"
     assert first["launch_contract"] == "icefarm-f-init-launch-v1"
+    assert (
+        first["scheduler_dispatch_epoch_contract"]
+        == "icefarm-scheduler-generation-epoch-v1"
+    )
     assert first["topology"]["schema"] == "icecream-newgen-farm-topology-v2"
     assert "ICEFARM_INSTANCES" in first["icefarm_env"]
     assert "ICEFARM_IMAGE" not in first["icefarm_env"]
