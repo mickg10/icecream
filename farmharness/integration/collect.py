@@ -772,6 +772,7 @@ def _source_candidates_for_assignment(
     scheduler_job: int,
     scheduler_version: int,
     assignment_identity: tuple[int, int, int] | None = None,
+    legacy_binding_marker: tuple[int, int, int, int, int] | None = None,
 ) -> list[tuple[tuple[int, int, int], dict[str, Any]]]:
     """Return only source evidence the assignment's S could have selected.
 
@@ -787,8 +788,22 @@ def _source_candidates_for_assignment(
     on the wire, and the caller additionally requires the same full identity
     in both the source-result and compile-result traces.  Permit only that
     exact candidate when the coarse timestamp and the wire identity disagree.
+
+    An exact client-local legacy binding is likewise stronger than the coarse
+    scheduler-version timestamp.  Its zero epoch/nonce proves that this
+    assignment has no P50 scheduler identity, so a positive-identity source
+    result with the same scheduler job number belongs to another scheduler
+    generation.  Retain the overlap check when a job-local P50 assignment
+    identity is also present: that combination can represent a real duplicate
+    transport and must fail closed.
     """
 
+    if (
+        assignment_identity is None
+        and legacy_binding_marker is not None
+        and legacy_binding_marker[1:3] == (0, 0)
+    ):
+        return []
     if scheduler_version < 50 and assignment_identity is None:
         return []
     return [
@@ -4561,6 +4576,7 @@ def _parse_rows(
                 scheduler_job,
                 assignment_scheduler_version,
                 assignment_identity,
+                legacy_binding_marker=legacy_marker,
             )
             authenticated: list[tuple[tuple[int, int, int], dict[str, Any]]] = []
             if marker is not None:

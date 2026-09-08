@@ -1708,6 +1708,133 @@ def test_source_attribution_does_not_reuse_a_job_id_after_legacy_s_restart() -> 
     ]
 
 
+def test_source_attribution_prefers_exact_client_local_legacy_identity() -> None:
+    """A coarse current-S timestamp must not alias an older P50 job number."""
+
+    stale = _source_result_record()
+    source_results = {(2, 1, 1): stale}
+    client_local_legacy = (2, 0, 0, 202, 0)
+
+    assert (
+        _source_candidates_for_assignment(
+            source_results,
+            2,
+            50,
+            None,
+            client_local_legacy,
+        )
+        == []
+    )
+    # If the same job-local log also carries a full P50 assignment identity,
+    # retain the source candidate so the caller's overlap check fails closed.
+    assert _source_candidates_for_assignment(
+        source_results,
+        2,
+        50,
+        (2, 1, 1),
+        client_local_legacy,
+    ) == [((2, 1, 1), stale)]
+
+
+def test_collection_attributes_client_local_legacy_after_reused_job_id(
+    tmp_path: Path,
+) -> None:
+    """A replacement S may reuse an old P50 job number for legacy work."""
+
+    farm, scenario, plan, root = _raw_collection(tmp_path)
+    scheduler = next(
+        item for item in plan["topology"]["instances"] if item["role"] == "S"
+    )
+    scheduler_log = (
+        root / "diagnostics" / scheduler["host"] / "S1.log" / "scheduler.log"
+    )
+    scheduler_log.write_text(
+        scheduler_log.read_text(encoding="utf-8").replace(
+            "[1] 2026-09-05 01:00:06: RELOGIN F1(x86_64): cache=off\n",
+            "[1] 2026-09-05 01:00:06: ICECREAM scheduler 1.4.0 "
+            "starting up, port 23000\n"
+            "[1] 2026-09-05 01:00:07: NEW 2 client=C1 versions=[] "
+            "/corpus/files/x.ii C++ 0\n"
+            "[1] 2026-09-05 01:00:07: put 2 in joblist of F1\n"
+            "[1] 2026-09-05 01:00:07: BEGIN: 2 client=C1(x86_64) "
+            "server=F1(x86_64)\n"
+            "[1] 2026-09-05 01:00:08: END 2 status=0 server=F1\n"
+            "[1] 2026-09-05 01:00:09: RELOGIN F1(x86_64): cache=off\n",
+        ),
+        encoding="utf-8",
+    )
+    results = root / "C1.results"
+    job = results / "workload" / "jobs" / "000001"
+    endpoint = next(
+        f"{item['address']}:{plan['ports']['instances'][item['name']]}"
+        for item in plan["topology"]["instances"]
+        if item["name"] == "F1"
+    )
+    debug = job / "client-debug.log"
+    debug.write_text(
+        "P50 assignment identity bound for job 2 epoch 1 nonce 1 "
+        "c_guid 1 tu_seq 99\n"
+        + debug.read_text(encoding="utf-8")
+        + "normalizing P50 client error 14 to Error 106 for a fresh assignment\n"
+        + f"ICECC[3] 2026-09-05 01:00:07: Have to use host {endpoint} "
+        "- Job ID: 2 - env: x86_64\n"
+        + "legacy wire identity bound for job 2 epoch 0 nonce 0 "
+        "c_guid 202 tu_seq 0 origin client-local\n",
+        encoding="utf-8",
+    )
+    result = job / "result.tsv"
+    fields = result.read_text(encoding="utf-8").rstrip("\n").split("\t")
+    fields[-1] = "1"
+    result.write_text("\t".join(fields) + "\n", encoding="utf-8")
+    (results / "compile-identity.jsonl").write_text("", encoding="utf-8")
+    common = {
+        "assignment_epoch": 0,
+        "assignment_nonce": 0,
+        "c_guid": 202,
+        "job_id": 2,
+        "schema": "icecream-p50-legacy-wire-v1",
+        "tu_seq": 0,
+    }
+    _write_jsonl(
+        results / "c-legacy-wire.jsonl",
+        [
+            {
+                **common,
+                "c_to_f_received_bytes": 0,
+                "c_to_f_sent_bytes": 400,
+                "f_to_c_received_bytes": 200,
+                "f_to_c_sent_bytes": 0,
+                "role": "C",
+            }
+        ],
+    )
+    _write_jsonl(
+        root / "F1.results" / "f-legacy-wire.jsonl",
+        [
+            {
+                **common,
+                "c_to_f_received_bytes": 400,
+                "c_to_f_sent_bytes": 0,
+                "f_to_c_received_bytes": 0,
+                "f_to_c_sent_bytes": 200,
+                "role": "F",
+            }
+        ],
+    )
+
+    bundle = collect_bundle(farm, scenario, plan, sync_remote=False)
+
+    row = bundle["rows"][0]
+    assert row["tail_present"] is False
+    assert row["c_to_f_bytes"] == 400
+    assert row["f_to_c_bytes"] == 200
+    assert bundle["observations"]["legacy_wire"]["record_count"] == 1
+    assert bundle["observations"]["scheduler_reconciliation"]["generations"] == 2
+    assert bundle["observations"]["failed_p50_result_identities"]["records"][0][
+        "reason"
+    ] == "result-stream-loss"
+
+
 def test_source_attribution_binds_reused_current_scheduler_job_to_exact_epoch() -> None:
     first = _source_result_record()
     second = {**first, "assignment_epoch": 7, "assignment_nonce": 8}
