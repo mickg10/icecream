@@ -5,15 +5,15 @@ from pathlib import Path
 INTEGRATION = Path(__file__).parents[1]
 SCENARIOS = INTEGRATION / "scenarios"
 HISTORICAL_PRODUCT = "p50s4-57a1e336"
-FINAL_PRODUCT = "p50s4-f9648cc1"
+FINAL_PRODUCT = "p50s4-c1edd359"
 FINAL_MUTANTS = {
     "p50s90-f-revision-2-f9648cc1",
     "p50s90-f-hidden-skew-f9648cc1",
 }
 FINAL_ROLE_HASHES = {
-    "scheduler": "a54fb0a4f705d216c61639395a5e6ad70c23a7333f4fa62a24333f1dc88ce799",
-    "client": "c35eb8acecfc8da9bd00103c2866c7e193f6a956285775122192b8c21e0d24d1",
-    "daemon": "f124ac4c87a78127fbeb563cc49af55dce8fd2a5fb9eb5d40efe25d004b11986",
+    "scheduler": "cf1a4a05103736c201ac79384e58e7d825e62343bf33608a4962c5dbf3f7eadc",
+    "client": "93304dbb975460a2276b216018313d0230a00b3f98cccda2293e0cbb0337020e",
+    "daemon": "26e442037f283abafe85750e0c81dff042e8a2e896b0e3760fb5bdf750b4d413",
 }
 RETIRED_PRODUCTS = {"p50s4-89917385", "p50s4-b42d65e8"}
 REQUALIFIED_PREFIXES = ("S50-", "S60-", "S70-", "S80-", "S90-", "S95-")
@@ -53,7 +53,7 @@ def test_mutant_scenarios_use_the_final_product_lineage() -> None:
         assert scenario["images"] == images
 
 
-def test_final_product_role_store_uses_measured_f964_binaries() -> None:
+def test_final_product_role_store_uses_measured_current_binaries() -> None:
     farm = json.loads((INTEGRATION / "farm.example.json").read_text(encoding="utf-8"))
     observed = {
         role: binding["sha256"]
