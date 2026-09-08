@@ -1888,7 +1888,12 @@ def _b7_transition_event(
         initial_client = next(
             item for item in scenario["instances"] if item["name"] == "C1"
         )
-        cache_required = initial_client.get("env", {}).get("ICECC_P50_MODE") == "on"
+        client_label = scenario["images"][initial_client["image"]]
+        cache_required = (
+            after_version == 50
+            and client_label.startswith("p50")
+            and initial_client.get("env", {}).get("ICECC_P50_MODE") == "on"
+        )
         coordination.update(
             client_readiness={
                 "C1": {
@@ -2033,6 +2038,64 @@ def _s70_b7_bundle(*, rollback: bool) -> dict[str, object]:
         )
     ]
     return bundle
+
+
+@pytest.mark.parametrize(
+    ("action", "before_version", "after_version", "cache_required"),
+    (
+        ("downgrade", 50, 43, False),
+        ("upgrade", 43, 50, True),
+    ),
+)
+def test_scheduler_transition_verdict_binds_cache_to_scheduler_generation(
+    action: str,
+    before_version: int,
+    after_version: int,
+    cache_required: bool,
+) -> None:
+    scenario = _scenario("mixed", client_versions=(50,), worker_versions=(50,))
+    scheduler = next(
+        item for item in scenario["instances"] if item["role"] == "S"
+    )
+    scheduler["image"] = "new" if before_version == 50 else "old"
+    scheduler["env"] = (
+        {"ICECC_P50_PROFILE": "P29V1"} if before_version == 50 else {}
+    )
+    target_alias = "new" if after_version == 50 else "old"
+    scenario["timeline"] = [
+        {
+            "trigger": "job 24",
+            "action": action,
+            "instance": "S1",
+            "image": target_alias,
+        }
+    ]
+    observed = _b7_transition_event(
+        scenario,
+        index=0,
+        trigger=24,
+        role="S",
+        action=action,
+        before_version=before_version,
+        after_version=after_version,
+        fired_ms=1000,
+    )
+    witness = observed["receipt"]["coordination"]["client_readiness"]["C1"]
+    assert witness["cache_required"] is cache_required
+    assert not _transition_receipt_errors(
+        observed, scenario["timeline"][0], scenario
+    )
+
+    tampered = copy.deepcopy(observed)
+    bad = tampered["receipt"]["coordination"]["client_readiness"]["C1"]
+    if cache_required:
+        bad["cache_required"] = False
+        bad["cache_line"] = None
+    else:
+        bad["cache_line"] = "cache sidecar adapter state=2 lifecycle=3"
+    assert _transition_receipt_errors(
+        tampered, scenario["timeline"][0], scenario
+    ) == {"@event:transition-coordination"}
 
 
 @pytest.mark.parametrize("rollback", (True, False))

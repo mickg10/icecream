@@ -2284,6 +2284,15 @@ def _validate_scheduler_restart_receipt(
         raise CollectError(
             f"events.json event {index} restart does not cover every workload client"
         )
+    scheduler = next(
+        item for item in plan["topology"]["instances"] if item["role"] == "S"
+    )
+    scheduler_cache_capable = (
+        _planned_instance_version_at_epoch(
+            scenario, scheduler, receipt.get("event_epoch")
+        )
+        == 50
+    )
     gate_fields = {
         "action",
         "active_after",
@@ -2340,7 +2349,8 @@ def _validate_scheduler_restart_receipt(
         witness = client_readiness[name]
         expected_host, expected_path = _transition_readiness_path(farm, plan, client)
         cache_required = (
-            client.get("version") == 50
+            scheduler_cache_capable
+            and client.get("version") == 50
             and client.get("env", {}).get("ICECC_P50_MODE") == "on"
         )
         if (
@@ -2384,9 +2394,6 @@ def _validate_scheduler_restart_receipt(
                 f"events.json event {index} has invalid fresh scheduler readiness for {name}"
             )
 
-    scheduler = next(
-        item for item in plan["topology"]["instances"] if item["role"] == "S"
-    )
     startup = coordination.get("scheduler_startup")
     expected_host, expected_path = _transition_readiness_path(farm, plan, scheduler)
     if (
@@ -2659,6 +2666,43 @@ def _event_image_version(label: str) -> int:
     return int(match.group(1))
 
 
+def _planned_instance_version_at_epoch(
+    scenario: ScenarioSpec,
+    instance: Mapping[str, Any],
+    event_epoch: object,
+) -> int:
+    """Resolve a planned endpoint generation after an authenticated event epoch."""
+
+    version = instance.get("version")
+    timeline = scenario.data.get("timeline")
+    images = scenario.data.get("images")
+    name = instance.get("name")
+    if (
+        type(version) is not int
+        or version < 1
+        or type(event_epoch) is not int
+        or event_epoch < 0
+        or not isinstance(timeline, list)
+        or event_epoch > len(timeline)
+        or not isinstance(images, Mapping)
+        or not isinstance(name, str)
+    ):
+        raise CollectError("cannot resolve planned instance generation at event epoch")
+    for event in timeline[:event_epoch]:
+        if (
+            not isinstance(event, Mapping)
+            or event.get("instance") != name
+            or event.get("action") not in {"upgrade", "downgrade"}
+        ):
+            continue
+        alias = event.get("image")
+        label = images.get(alias) if isinstance(alias, str) else None
+        if not isinstance(label, str):
+            raise CollectError("timeline generation transition has no image authority")
+        version = _event_image_version(label)
+    return version
+
+
 def _transition_target_env(
     before: Mapping[str, Any], event: Mapping[str, Any], role: str, target_label: str
 ) -> dict[str, str]:
@@ -2708,6 +2752,15 @@ def _validate_transition_coordination(
     evidence: Path | None,
 ) -> bool:
     role = instance["role"]
+    scheduler_cache_capable = False
+    if role == "S":
+        after = receipt.get("after")
+        if not isinstance(after, Mapping) or not isinstance(after.get("image"), str):
+            return False
+        try:
+            scheduler_cache_capable = _event_image_version(after["image"]) == 50
+        except CollectError:
+            return False
     common = {
         "clients",
         "ready_ms",
@@ -2804,7 +2857,12 @@ def _validate_transition_coordination(
         for name in sorted(expected_clients):
             client = next((item for item in plan["topology"]["instances"] if item["name"] == name), None)
             witness = clients[name]
-            required_cache = isinstance(client, Mapping) and client.get("env", {}).get("ICECC_P50_MODE") == "on"
+            required_cache = (
+                scheduler_cache_capable
+                and isinstance(client, Mapping)
+                and client.get("version") == 50
+                and client.get("env", {}).get("ICECC_P50_MODE") == "on"
+            )
             if (
                 not isinstance(client, Mapping)
                 or client.get("role") != "C"
@@ -3143,6 +3201,16 @@ def _validate_transition_receipt(
         cache_required = (
             after_version == 50
             and after_snapshot["env"].get("ICECC_P50_MODE") == "on"
+            and _planned_instance_version_at_epoch(
+                scenario,
+                next(
+                    item
+                    for item in plan["topology"]["instances"]
+                    if item["role"] == "S"
+                ),
+                receipt.get("event_epoch"),
+            )
+            == 50
         )
         if (
             not isinstance(client_readiness, Mapping)

@@ -2078,6 +2078,8 @@ class EventProducer:
         self,
         client: Mapping[str, Any],
         baseline: Mapping[str, Any],
+        *,
+        scheduler_cache_capable: bool,
     ) -> dict[str, Any]:
         deadline = min(
             self._start + self.deadline_s,
@@ -2087,8 +2089,11 @@ class EventProducer:
         label = image.get("label") if isinstance(image, Mapping) else None
         if not isinstance(label, str):
             raise EventError("client scheduler readiness has no target image generation")
+        if type(scheduler_cache_capable) is not bool:
+            raise EventError("client scheduler readiness has no scheduler capability")
         cache_required = (
-            self._image_version(label) == 50
+            scheduler_cache_capable
+            and self._image_version(label) == 50
             and client.get("env", {}).get("ICECC_P50_MODE") == "on"
         )
         while self.monotonic() < deadline:
@@ -2384,7 +2389,11 @@ class EventProducer:
                 )
                 client_readiness = {
                     client["name"]: self._wait_scheduler_client_readiness(
-                        client, client_baselines[client["name"]]
+                        client,
+                        client_baselines[client["name"]],
+                        scheduler_cache_capable=(
+                            self._image_version(target["image"]["label"]) == 50
+                        ),
                     )
                     for client in clients
                 }
@@ -2667,8 +2676,20 @@ class EventProducer:
             if after.get("running") is not True:
                 raise EventError("C transition did not produce a running container")
             readiness = self._readiness_witness(instance, client_baselines[event.instance])
+            scheduler = next(
+                item
+                for item in self.plan["topology"]["instances"]
+                if item["role"] == "S"
+            )
             client_readiness = self._wait_scheduler_client_readiness(
-                target, client_baselines[event.instance]
+                target,
+                client_baselines[event.instance],
+                scheduler_cache_capable=(
+                    self._image_version(
+                        self._state[scheduler["name"]]["image"]["label"]
+                    )
+                    == 50
+                ),
             )
             # This is the authenticated transition boundary.  Workload
             # release and relaunch are deliberately downstream of it and can
@@ -2889,7 +2910,14 @@ class EventProducer:
             monotonic=self.monotonic, sleeper=time.sleep)
         client_readiness = {
             client["name"]: self._wait_scheduler_client_readiness(
-                client, client_baselines[client["name"]]
+                client,
+                client_baselines[client["name"]],
+                scheduler_cache_capable=(
+                    self._image_version(
+                        self._state[instance["name"]]["image"]["label"]
+                    )
+                    == 50
+                ),
             )
             for client in clients
         }
@@ -3016,7 +3044,14 @@ class EventProducer:
             )
             client_readiness = {
                 client["name"]: self._wait_scheduler_client_readiness(
-                    client, client_baselines[client["name"]]
+                    client,
+                    client_baselines[client["name"]],
+                    scheduler_cache_capable=(
+                        self._image_version(
+                            self._state[instance["name"]]["image"]["label"]
+                        )
+                        == 50
+                    ),
                 )
                 for client in clients
             }

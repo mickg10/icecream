@@ -2465,7 +2465,12 @@ class CoordinatedTransitionRecorder(TransitionRecorder):
         if command.phase == "readiness.container":
             return CommandResult(0, '{"Running": true}\n', "")
         if command.phase == "readiness.listcs":
-            return CommandResult(0, "F1\n", "")
+            workers = sorted(
+                item["name"]
+                for item in self.plan["topology"]["instances"]
+                if item["role"] == "F"
+            )
+            return CommandResult(0, "\n".join(workers) + "\n", "")
         if command.phase == "event.scheduler-worker-rejoin":
             return CommandResult(
                 0,
@@ -2481,13 +2486,18 @@ class CoordinatedTransitionRecorder(TransitionRecorder):
                 "",
             )
         if command.phase == "event.client-scheduler-ready":
+            cache_required = decode_ssh_payload(command.argv)[-1] == "1"
             return CommandResult(
                 0,
                 json.dumps(
                     {
                         "bytes": 100,
-                        "cache_line": None,
-                        "cache_required": False,
+                        "cache_line": (
+                            "cache sidecar adapter state=2 lifecycle=3"
+                            if cache_required
+                            else None
+                        ),
+                        "cache_required": cache_required,
                         "connected_line": "Connected to scheduler (I am known as C1)",
                         "ready": True,
                     }
@@ -2632,6 +2642,91 @@ def test_scheduler_transition_requires_fresh_workers_and_all_clients(tmp_path: P
     ] = nonexistent
     (tmp_path / "events" / "events.json").write_text(json.dumps(persisted))
     with pytest.raises(CollectError, match="readiness witness is not bound"):
+        _event_log(tmp_path, scenario, farm=farm, plan=plan)
+
+
+@pytest.mark.parametrize(
+    ("scenario_id", "cache_required"),
+    (
+        ("S60-13-warm-s-down", False),
+        ("S60-14-warm-s-up", True),
+    ),
+)
+def test_scheduler_transition_client_cache_readiness_uses_target_scheduler_generation(
+    tmp_path: Path,
+    scenario_id: str,
+    cache_required: bool,
+) -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    farm.data["hub"]["results_root"] = str(tmp_path)
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / f"{scenario_id}.json", farm
+    )
+    for label in scenario.data["images"].values():
+        document = _transition_image_document(farm, label)
+        farm.data["authority"]["images"][label]["closure_sha256"] = _image_identity(
+            CommandResult(0, json.dumps(document), ""), label
+        ).closure_sha256
+    plan = farmtest.build_plan(farm, scenario, run_id="event-unit")
+    recorder = CoordinatedTransitionRecorder(farm, plan)
+    dispatched = "".join(
+        f"put {index} in joblist of F1\n" for index in range(1, 25)
+    )
+    reads = iter(("", dispatched))
+    producer = EventProducer(
+        farm,
+        scenario,
+        plan,
+        recorder=RecordingTransport(recorder),
+        job_reader=lambda: next(reads, dispatched),
+        event_path=tmp_path / "events" / "events.json",
+        deadline_s=2,
+        poll_interval_s=0.01,
+        wall_ms=lambda: 1000,
+    )
+    producer.signal_turn_start("A")
+    producer.start()
+    producer.wait()
+    producer.stop()
+
+    receipt = producer.records[0].receipt
+    assert receipt is not None
+    witnesses = receipt["coordination"]["client_readiness"]
+    assert set(witnesses) == {"C1", "C2"}
+    assert {
+        witness["cache_required"] for witness in witnesses.values()
+    } == {cache_required}
+    assert {witness["cache_line"] for witness in witnesses.values()} == {
+        "cache sidecar adapter state=2 lifecycle=3"
+        if cache_required
+        else None
+    }
+    assert all(
+        "Connected to scheduler (I am known as " in witness["connected_line"]
+        for witness in witnesses.values()
+    )
+    readiness_commands = [
+        command
+        for command in recorder.commands
+        if command.phase == "event.client-scheduler-ready"
+    ]
+    assert len(readiness_commands) == 2
+    assert {
+        decode_ssh_payload(command.argv)[-1] for command in readiness_commands
+    } == {"1" if cache_required else "0"}
+    assert _event_log(tmp_path, scenario, farm=farm, plan=plan)[0]["receipt"] == receipt
+
+    persisted = json.loads((tmp_path / "events" / "events.json").read_text())
+    witness = persisted["events"][0]["receipt"]["coordination"][
+        "client_readiness"
+    ]["C1"]
+    if cache_required:
+        witness["cache_required"] = False
+        witness["cache_line"] = None
+    else:
+        witness["cache_line"] = "cache sidecar adapter state=2 lifecycle=3"
+    (tmp_path / "events" / "events.json").write_text(json.dumps(persisted))
+    with pytest.raises(CollectError, match="transition coordination"):
         _event_log(tmp_path, scenario, farm=farm, plan=plan)
 
 

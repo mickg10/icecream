@@ -106,6 +106,45 @@ def _transition_protocol(label: object) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def _scenario_instance_protocol_at_epoch(
+    scenario: Mapping[str, Any],
+    instance: Mapping[str, Any],
+    event_epoch: object,
+) -> int | None:
+    """Resolve an endpoint generation after exactly ``event_epoch`` events."""
+
+    timeline = scenario.get("timeline")
+    images = scenario.get("images")
+    alias = instance.get("image")
+    name = instance.get("name")
+    if (
+        not _is_int(event_epoch)
+        or not isinstance(timeline, list)
+        or event_epoch > len(timeline)
+        or not isinstance(images, Mapping)
+        or not isinstance(alias, str)
+        or not isinstance(name, str)
+    ):
+        return None
+    protocol = _transition_protocol(images.get(alias))
+    if protocol is None:
+        return None
+    for event in timeline[:event_epoch]:
+        if (
+            not isinstance(event, Mapping)
+            or event.get("instance") != name
+            or event.get("action") not in {"upgrade", "downgrade"}
+        ):
+            continue
+        target_alias = event.get("image")
+        if not isinstance(target_alias, str):
+            return None
+        protocol = _transition_protocol(images.get(target_alias))
+        if protocol is None:
+            return None
+    return protocol
+
+
 def _clause(
     identifier: str,
     passed: bool,
@@ -1316,6 +1355,21 @@ def _scheduler_restart_receipt_errors(
     resumes = coordination.get("resume")
     client_readiness = coordination.get("client_readiness")
     expected_clients = set(client_names)
+    scheduler = next(
+        (
+            item
+            for item in instances
+            if isinstance(item, Mapping) and item.get("role") == "S"
+        ),
+        None,
+    )
+    scheduler_cache_capable = (
+        isinstance(scheduler, Mapping)
+        and _scenario_instance_protocol_at_epoch(
+            scenario, scheduler, receipt.get("event_epoch")
+        )
+        == 50
+    )
     if (
         not isinstance(pauses, Mapping)
         or not isinstance(resumes, Mapping)
@@ -1377,7 +1431,12 @@ def _scheduler_restart_receipt_errors(
         witness = client_readiness[name]
         log_path = witness.get("log_path") if isinstance(witness, Mapping) else None
         cache_required = (
-            isinstance(client, Mapping)
+            scheduler_cache_capable
+            and isinstance(client, Mapping)
+            and _scenario_instance_protocol_at_epoch(
+                scenario, client, receipt.get("event_epoch")
+            )
+            == 50
             and isinstance(client.get("env"), Mapping)
             and client["env"].get("ICECC_P50_MODE") == "on"
         )
@@ -2131,6 +2190,15 @@ def _client_transition_receipt_errors(
     cache_required = (
         after_version == 50
         and snapshots["after"]["env"].get("ICECC_P50_MODE") == "on"
+        and any(
+            isinstance(item, Mapping)
+            and item.get("role") == "S"
+            and _scenario_instance_protocol_at_epoch(
+                scenario, item, receipt.get("event_epoch")
+            )
+            == 50
+            for item in scenario.get("instances", [])
+        )
     )
     if (
         not isinstance(readiness, Mapping) or set(readiness) != {"host", "line", "log_path", "offset", "role"}
@@ -2332,7 +2400,15 @@ def _transition_receipt_errors(
         for name in expected_clients:
             witness = client_readiness[name]
             client = next((item for item in instances if isinstance(item, Mapping) and item.get("name") == name), None)
-            cache_required = isinstance(client, Mapping) and client.get("env", {}).get("ICECC_P50_MODE") == "on"
+            cache_required = (
+                after_protocol == 50
+                and isinstance(client, Mapping)
+                and _scenario_instance_protocol_at_epoch(
+                    scenario, client, receipt.get("event_epoch")
+                )
+                == 50
+                and client.get("env", {}).get("ICECC_P50_MODE") == "on"
+            )
             if (
                 not isinstance(witness, Mapping)
                 or witness.get("cache_required") is not cache_required
