@@ -768,9 +768,18 @@ def _source_candidates_for_assignment(
     Scheduler job numbers restart after replacement.  A pre-v50 scheduler can
     never emit a P50 cache tail, so a same-number source record from an older
     capable scheduler is historical rather than a candidate for this row.
+
+    Client log timestamps have only one-second resolution while transition
+    receipts use milliseconds.  At an upgrade boundary the timestamp-derived
+    scheduler version can therefore still name the old scheduler even though
+    the assignment happened after replacement.  A job-local P50 assignment
+    identity is stronger evidence: legacy schedulers cannot put that identity
+    on the wire, and the caller additionally requires the same full identity
+    in both the source-result and compile-result traces.  Permit only that
+    exact candidate when the coarse timestamp and the wire identity disagree.
     """
 
-    if scheduler_version < 50:
+    if scheduler_version < 50 and assignment_identity is None:
         return []
     return [
         (key, source)

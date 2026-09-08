@@ -1424,6 +1424,39 @@ def test_source_attribution_binds_reused_current_scheduler_job_to_exact_epoch() 
     ) == [((2, 7, 8), second)]
 
 
+def test_source_attribution_prefers_full_wire_identity_at_subsecond_s_upgrade() -> None:
+    """A whole-second client timestamp must not beat a P50 wire identity."""
+
+    source = _source_result_record()
+    source["assignment_epoch"] = 7
+    source["assignment_nonce"] = 8
+    source_results = {(2, 7, 8): source}
+    identity = _p50_assignment_identity_marker(
+        "P50 assignment identity bound for job 2 epoch 7 nonce 8 "
+        "c_guid 99 tu_seq 5",
+        2,
+    )
+
+    # The assignment line says HH:MM:SS.000 while the transition receipt can
+    # say HH:MM:SS.260.  The old version is consequently only a coarse-time
+    # classification; the exact P50 identity proves the post-upgrade S.
+    assert _source_candidates_for_assignment(
+        source_results, 2, 43, identity
+    ) == [((2, 7, 8), source)]
+
+
+def test_source_attribution_never_uses_job_number_only_at_subsecond_s_upgrade() -> None:
+    stale = _source_result_record()
+    source_results = {(2, 1, 1): stale}
+
+    # Without a job-local wire identity an apparent legacy assignment must
+    # not inherit a same-number P50 result from another scheduler generation.
+    assert _source_candidates_for_assignment(source_results, 2, 43, None) == []
+    assert _source_candidates_for_assignment(
+        source_results, 2, 43, (2, 7, 8)
+    ) == []
+
+
 def test_legacy_wire_attribution_requires_exact_job_local_binding_marker() -> None:
     stale = {
         "assignment_epoch": 0,
