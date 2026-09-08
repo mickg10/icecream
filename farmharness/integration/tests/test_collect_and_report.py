@@ -2449,6 +2449,18 @@ def test_live_collection_authenticates_samples_then_freezes_before_copy(
         if command.phase == "collect.stop"
     ]
     assert stopped == ["C1", "F1", "S1"]
+    stop_commands = [
+        command for command in recorder.commands if command.phase == "collect.stop"
+    ]
+    assert plan["timeouts"]["collect_s"] > 30
+    assert all(
+        command.timeout_s == plan["timeouts"]["collect_s"]
+        for command in stop_commands
+    )
+    assert all(
+        command.argv[-5:-1] == ("container", "stop", "--time", "10")
+        for command in stop_commands
+    )
     f_inspect = next(
         command
         for command in recorder.commands

@@ -459,7 +459,10 @@ def _snapshot_live_evidence(
                     phase="collect.stop",
                     host=host,
                     transport=_docker_transport(farm, host),
-                    timeout_s=min(timeout_s, 30),
+                    # The container gets only ten seconds of graceful shutdown,
+                    # but a remote Docker context needs the declared collection
+                    # budget to return that bounded operation reliably.
+                    timeout_s=timeout_s,
                     argv=docker_argv(
                         farm,
                         host,
