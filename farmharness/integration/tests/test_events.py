@@ -3199,7 +3199,7 @@ def test_upgrade_materializes_target_and_restarts_exact_container_with_receipt(t
         plan,
         recorder=RecordingTransport(recorder),
         event_path=tmp_path / "events" / "events.json",
-        deadline_s=2,
+        deadline_s=300,
     )
     assert records[0].receipt is not None
     receipt = records[0].receipt
@@ -3222,6 +3222,10 @@ def test_upgrade_materializes_target_and_restarts_exact_container_with_receipt(t
     remove = next(command for command in recorder.commands if command.phase == "event.upgrade.remove")
     start = next(command for command in recorder.commands if command.phase == "event.upgrade.start")
     assert stop.argv[-1] == remove.argv[-1] == "1" * 64
+    assert stop.argv[-5:-1] == ("container", "stop", "--time", "10")
+    assert stop.timeout_s > 30
+    assert remove.timeout_s > 30
+    assert start.timeout_s > 30
     assert start.argv[start.argv.index("--name") + 1] == "icefarm-event-unit-F1"
     assert any(value.endswith("/runtimes/" + new_identity.closure_sha256 + "/root,dst=/opt/icecream,readonly") for value in start.argv)
     assert start.timeout_s >= 1

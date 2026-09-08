@@ -1697,7 +1697,9 @@ class EventProducer:
             "env": managed_env,
         }
 
-    def _command_timeout(self, maximum: int = 30) -> int:
+    def _command_timeout(self, maximum: int | None = None) -> int:
+        if maximum is None:
+            maximum = int(self.scenario.data["timeouts"]["up_s"])
         remaining = max(0.001, self.deadline_s - (self.monotonic() - self._start))
         return max(1, min(maximum, int(math.ceil(remaining))))
 
