@@ -351,16 +351,18 @@ def test_active_scheduler_loss_scripts_are_exact_identity_bound() -> None:
     assert "len(candidates) != 1" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "p[\"pid\"] == p[\"pgid\"]" in ACTIVE_COMPILER_STOP_SCRIPT
     assert '"--generation" not in p["argv"]' in ACTIVE_COMPILER_STOP_SCRIPT
+    assert 'pathlib.Path(child["exe"]).name == "iceccd"' not in ACTIVE_COMPILER_STOP_SCRIPT
+    assert 'pathlib.Path(before["exe"]).name != "iceccd"' not in ACTIVE_COMPILER_STOP_SCRIPT
+    assert 'pathlib.Path(before_daemon["exe"]).name != "iceccd"' in ACTIVE_COMPILER_STOP_SCRIPT
     assert "socket.create_connection" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "while True:" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "size > 4 * 1024 * 1024" in ACTIVE_COMPILER_STOP_SCRIPT
     assert 'fields[1] == wanted and fields[3] == "0A"' in ACTIVE_COMPILER_STOP_SCRIPT
     assert 'owned.add(target[8:-1])' in ACTIVE_COMPILER_STOP_SCRIPT
     parent = {"pid": 10, "ppid": 1, "pgid": 10, "exe": "/opt/icecream/sbin/iceccd", "state": "S", "argv": []}
-    compiler = {"pid": 11, "ppid": 10, "pgid": 11, "exe": "/opt/icecream/sbin/iceccd", "state": "R", "argv": []}
-    other = compiler | {"pid": 12, "pgid": 12, "exe": "/usr/bin/other"}
+    compiler = {"pid": 11, "ppid": 10, "pgid": 11, "exe": "/usr/bin/g++", "state": "R", "argv": ["/usr/bin/g++", "-c", "unit.cc"]}
+    assert Path(compiler["exe"]).name != "iceccd"  # The deleted selector law rejected the real post-exec shape.
     assert select_direct_compiler_pairs([parent, compiler]) == [(parent, compiler)]
-    assert select_direct_compiler_pairs([parent, other]) == []
 
 
 def test_scheduler_generation_parser_requires_framed_unique_generation() -> None:
@@ -379,12 +381,19 @@ def test_scheduler_generation_parser_requires_framed_unique_generation() -> None
         scheduler_generation_for_job_text(reused, 2)
 
 
-def test_direct_compiler_selector_rejects_non_iceccd_group_child() -> None:
-    parent = {"pid": 10, "ppid": 1, "pgid": 10, "exe": "/opt/icecream/sbin/iceccd", "state": "S", "argv": []}
-    compiler = {"pid": 11, "ppid": 10, "pgid": 11, "exe": "/opt/icecream/sbin/iceccd", "state": "R", "argv": []}
-    other = {"pid": 12, "ppid": 10, "pgid": 12, "exe": "/usr/bin/other", "state": "R", "argv": []}
-    assert select_direct_compiler_pairs([parent, compiler]) == [(parent, compiler)]
-    assert select_direct_compiler_pairs([parent, other]) == []
+def test_direct_compiler_selector_accepts_execed_compiler_and_rejects_invalid_shapes() -> None:
+    daemon = {"pid": 10, "ppid": 1, "pgid": 10, "exe": "/opt/icecream/sbin/iceccd", "state": "S", "argv": []}
+    compiler = {"pid": 11, "ppid": 10, "pgid": 11, "exe": "/usr/bin/g++", "state": "R", "argv": ["/usr/bin/g++", "-c", "unit.cc"]}
+    statewriter = {"pid": 12, "ppid": 10, "pgid": 10, "exe": daemon["exe"], "state": "S", "argv": ["iceccd"]}
+    sidecar = {"pid": 13, "ppid": 10, "pgid": 13, "exe": daemon["exe"], "state": "S", "argv": ["iceccd", "--generation", "7"]}
+    zombie = {"pid": 14, "ppid": 10, "pgid": 14, "exe": "/usr/bin/g++", "state": "Z", "argv": ["/usr/bin/g++"]}
+    follower = {"pid": 15, "ppid": 10, "pgid": 11, "exe": "/usr/bin/as", "state": "S", "argv": ["/usr/bin/as"]}
+    other_parent = {"pid": 20, "ppid": 1, "pgid": 20, "exe": "/usr/bin/python3", "state": "S", "argv": ["python3"]}
+    other_child = {"pid": 21, "ppid": 20, "pgid": 21, "exe": "/usr/bin/g++", "state": "R", "argv": ["/usr/bin/g++"]}
+    items = [daemon, compiler, statewriter, sidecar, zombie, follower, other_parent, other_child]
+    assert select_direct_compiler_pairs(items) == [(daemon, compiler)]
+    second = compiler | {"pid": 16, "pgid": 16}
+    assert len(select_direct_compiler_pairs(items + [second])) == 2
 
 
 def test_assignment_script_executes_multi_child_http_join() -> None:
@@ -424,18 +433,11 @@ def test_assignment_script_executes_multi_child_http_join() -> None:
 
 
 def test_active_compiler_selector_rejects_sidecar_and_statewriter_shapes() -> None:
-    daemon = {"pid": 10, "pgid": 10, "ppid": 1, "exe": "/opt/icecream/sbin/iceccd", "argv": []}
-    statewriter = {"pid": 11, "pgid": 10, "ppid": 10, "exe": daemon["exe"], "argv": []}
-    sidecar = {"pid": 12, "pgid": 12, "ppid": 10, "exe": daemon["exe"], "argv": ["iceccd", "--generation", "7"]}
-    compiler = {"pid": 13, "pgid": 13, "ppid": 10, "exe": daemon["exe"], "argv": ["iceccd"]}
-    parents = {daemon["pid"]: daemon}
-    pairs = [
-        (parent, child) for child in (statewriter, sidecar, compiler)
-        for parent in (parents.get(child["ppid"]),)
-        if parent is not None and child["pid"] == child["pgid"]
-        and "--generation" not in child["argv"]
-    ]
-    assert pairs == [(daemon, compiler)]
+    daemon = {"pid": 10, "pgid": 10, "ppid": 1, "exe": "/opt/icecream/sbin/iceccd", "state": "S", "argv": []}
+    statewriter = {"pid": 11, "pgid": 10, "ppid": 10, "exe": daemon["exe"], "state": "S", "argv": []}
+    sidecar = {"pid": 12, "pgid": 12, "ppid": 10, "exe": daemon["exe"], "state": "S", "argv": ["iceccd", "--generation", "7"]}
+    compiler = {"pid": 13, "pgid": 13, "ppid": 10, "exe": "/usr/bin/g++", "state": "R", "argv": ["/usr/bin/g++", "-c", "unit.cc"]}
+    assert select_direct_compiler_pairs([daemon, statewriter, sidecar, compiler]) == [(daemon, compiler)]
 
 
 def test_active_scheduler_loss_scenario_is_not_the_drained_restart(tmp_path: Path) -> None:

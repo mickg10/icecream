@@ -113,13 +113,12 @@ def scheduler_generation_for_job_text(text: str, job_id: int) -> int:
 
 
 def select_direct_compiler_pairs(items: list[dict[str, Any]]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
-    """Pure model of the STOP script's same-exe parent/child selector."""
+    """Pure model of the STOP script's exec-safe direct-child selector."""
     parents = {p["pid"]: p for p in items if PurePosixPath(p["exe"]).name == "iceccd"}
     return [
         (parent, child) for child in items
         for parent in (parents.get(child.get("ppid")),)
         if parent is not None
-        and PurePosixPath(child["exe"]).name == "iceccd"
         and child.get("pid") == child.get("pgid")
         and child.get("state") not in {"Z", "X"}
         and "--generation" not in child.get("argv", [])
@@ -251,7 +250,8 @@ def listener_probe(port, daemon):
 deadline = time.monotonic() + int(sys.argv[1])
 web_port = int(sys.argv[2])
 # Candidate invariant: p["pid"] == p["pgid"] for the direct compiler;
-# sidecars are excluded by: "--generation" not in p["argv"].
+# the compiler may already have exec'd the toolchain.  Sidecars are excluded
+# by: "--generation" not in p["argv"].
 while time.monotonic() < deadline:
     items = processes()
     parents = {p["pid"]: p for p in items if pathlib.Path(p["exe"]).name == "iceccd"}
@@ -259,7 +259,6 @@ while time.monotonic() < deadline:
         (parent, child) for child in items
         for parent in (parents.get(child["ppid"]),)
         if parent is not None and parent["pid"] == child["ppid"] and child["pid"] == child["pgid"]
-        and pathlib.Path(child["exe"]).name == "iceccd"
         and child["state"] not in {"Z", "X"}
         and "--generation" not in child["argv"]
     ]
@@ -271,7 +270,6 @@ while time.monotonic() < deadline:
     before = snap(leader["pid"])
     if (before_daemon != daemon or before != leader
             or pathlib.Path(before_daemon["exe"]).name != "iceccd"
-            or pathlib.Path(before["exe"]).name != "iceccd"
             or before["ppid"] != before_daemon["pid"]
             or before["pid"] != before["pgid"]):
         time.sleep(0.05)
