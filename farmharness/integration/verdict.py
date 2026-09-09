@@ -2291,12 +2291,15 @@ def _scheduler_active_loss_receipt_errors(
     listener = compiler.get("listener") if isinstance(compiler, Mapping) else None
     process_fields = {
         "argv",
+        "comm",
         "exe",
+        "exe_evidence",
         "pgid",
         "pid",
         "ppid",
         "start_ticks",
         "state",
+        "uids",
     }
 
     def valid_process(value: Any) -> bool:
@@ -2305,8 +2308,12 @@ def _scheduler_active_loss_receipt_errors(
             and set(value) == process_fields
             and isinstance(value.get("argv"), list)
             and all(isinstance(item, str) for item in value["argv"])
-            and isinstance(value.get("exe"), str)
-            and value["exe"].startswith("/")
+            and bool(value["argv"])
+            and value.get("comm") == "iceccd"
+            and value.get("exe") == "/opt/icecream/sbin/iceccd"
+            and value["argv"][0] == value["exe"]
+            and value.get("exe_evidence") == "proc-cmdline+comm"
+            and value.get("uids") == [65534, 65534, 65534, 65534]
             and all(
                 _is_int(value.get(field), minimum=minimum)
                 for field, minimum in (
@@ -2454,6 +2461,7 @@ def _scheduler_active_loss_receipt_errors(
             or leader.get("ppid") != parent.get("pid")
             or not isinstance(parent.get("exe"), str)
             or not parent["exe"].endswith("/iceccd")
+            or parent.get("argv") != leader.get("argv")
             or leader.get("pid") != leader.get("pgid")
             or leader.get("pid") != stopped.get("pid")
             or leader.get("start_ticks") != stopped.get("start_ticks")

@@ -1961,12 +1961,15 @@ def _validate_scheduler_active_loss_receipt(
     listener = compiler.get("listener") if isinstance(compiler, Mapping) else None
     process_fields = {
         "argv",
+        "comm",
         "exe",
+        "exe_evidence",
         "pgid",
         "pid",
         "ppid",
         "start_ticks",
         "state",
+        "uids",
     }
 
     def valid_process(value: Any) -> bool:
@@ -1975,8 +1978,12 @@ def _validate_scheduler_active_loss_receipt(
             and set(value) == process_fields
             and isinstance(value.get("argv"), list)
             and all(isinstance(item, str) for item in value["argv"])
-            and isinstance(value.get("exe"), str)
-            and PurePosixPath(value["exe"]).is_absolute()
+            and bool(value["argv"])
+            and value.get("comm") == "iceccd"
+            and value.get("exe") == "/opt/icecream/sbin/iceccd"
+            and value["argv"][0] == value["exe"]
+            and value.get("exe_evidence") == "proc-cmdline+comm"
+            and value.get("uids") == [65534, 65534, 65534, 65534]
             and all(
                 type(value.get(field)) is int and value[field] >= minimum
                 for field, minimum in (
@@ -2018,6 +2025,7 @@ def _validate_scheduler_active_loss_receipt(
             or PurePosixPath(str(parent.get("exe", ""))).name != "iceccd"
             or parent.get("pid") == leader.get("pid")
             or leader.get("ppid") != parent.get("pid")
+            or parent.get("argv") != leader.get("argv")
             or leader.get("pid") != leader.get("pgid") or leader.get("pid") != stopped.get("pid")
             or leader.get("pgid") != stopped.get("pgid") or leader.get("start_ticks") != stopped.get("start_ticks")
             or stopped.get("state") not in {"T", "t"}

@@ -13,7 +13,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import pathlib
 import re
 import threading
 import time
@@ -113,13 +112,24 @@ def scheduler_generation_for_job_text(text: str, job_id: int) -> int:
 
 
 def select_direct_compiler_pairs(items: list[dict[str, Any]]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
-    """Pure model of the STOP script's same-exe parent/child selector."""
-    parents = {p["pid"]: p for p in items if PurePosixPath(p["exe"]).name == "iceccd"}
+    """Pure model of the STOP script's cmdline/comm parent-child selector."""
+
+    def is_iceccd(item: Mapping[str, Any]) -> bool:
+        argv = item.get("argv")
+        return (
+            item.get("comm") == "iceccd"
+            and item.get("uids") == [65534, 65534, 65534, 65534]
+            and isinstance(argv, list)
+            and bool(argv)
+            and argv[0] == "/opt/icecream/sbin/iceccd"
+        )
+
+    parents = {p["pid"]: p for p in items if is_iceccd(p)}
     return [
         (parent, child) for child in items
         for parent in (parents.get(child.get("ppid")),)
         if parent is not None
-        and PurePosixPath(child["exe"]).name == "iceccd"
+        and is_iceccd(child)
         and child.get("pid") == child.get("pgid")
         and child.get("state") not in {"Z", "X"}
         and "--generation" not in child.get("argv", [])
@@ -188,9 +198,16 @@ def snap(pid):
     raw = (root / "stat").read_text(encoding="ascii")
     fields = raw.rsplit(") ", 1)[1].split()
     argv = [v.decode("utf-8", "surrogateescape") for v in (root / "cmdline").read_bytes().split(b"\0") if v]
-    return {"argv": argv, "exe": os.readlink(root / "exe"), "pid": pid,
+    comm = (root / "comm").read_text(encoding="utf-8").rstrip("\n")
+    uid_line = next(line for line in (root / "status").read_text(encoding="ascii").splitlines()
+                    if line.startswith("Uid:"))
+    uids = [int(value) for value in uid_line.split()[1:]]
+    if not argv or len(uids) != 4:
+        raise ValueError("process has no stable cmdline/UID identity")
+    return {"argv": argv, "comm": comm, "exe": argv[0],
+            "exe_evidence": "proc-cmdline+comm", "pid": pid,
             "ppid": int(fields[1]), "pgid": int(fields[2]), "state": fields[0],
-            "start_ticks": int(fields[19])}
+            "start_ticks": int(fields[19]), "uids": uids}
 
 def processes():
     result = []
@@ -199,13 +216,22 @@ def processes():
             continue
         try:
             result.append(snap(int(entry.name)))
-        except (FileNotFoundError, PermissionError, ProcessLookupError, OSError, ValueError):
+        except (FileNotFoundError, PermissionError, ProcessLookupError, OSError, ValueError, StopIteration):
             pass
     return result
 
 def same_identity(left, right):
     return all(left.get(key) == right.get(key) for key in
-               ("pid", "ppid", "pgid", "start_ticks", "exe", "argv"))
+               ("pid", "ppid", "pgid", "start_ticks", "comm", "exe",
+                "exe_evidence", "uids", "argv"))
+
+def is_iceccd(item):
+    return (item.get("comm") == "iceccd"
+            and item.get("uids") == [65534, 65534, 65534, 65534]
+            and item.get("exe_evidence") == "proc-cmdline+comm"
+            and item.get("exe") == "/opt/icecream/sbin/iceccd"
+            and item.get("argv")
+            and item["argv"][0] == item["exe"])
 
 def listener_probe(port, daemon):
     request = b"GET /api/internals HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n"
@@ -253,16 +279,17 @@ def listener_probe(port, daemon):
 deadline = time.monotonic() + int(sys.argv[1])
 web_port = int(sys.argv[2])
 # Candidate invariant: p["pid"] == p["pgid"] for the direct compiler;
-# sidecars are excluded by: "--generation" not in p["argv"].  The direct
-# group leader remains iceccd and owns the exec'd toolchain child in its PGID.
+# sidecars are excluded by: "--generation" not in p["argv"].  Process
+# identity uses readable kernel comm + cmdline + all four UIDs because the
+# privilege-dropped daemon deliberately makes /proc/<pid>/exe unreadable.
 while time.monotonic() < deadline:
     items = processes()
-    parents = {p["pid"]: p for p in items if pathlib.Path(p["exe"]).name == "iceccd"}
+    parents = {p["pid"]: p for p in items if is_iceccd(p)}
     candidates = [
         (parent, child) for child in items
         for parent in (parents.get(child["ppid"]),)
         if parent is not None and parent["pid"] == child["ppid"] and child["pid"] == child["pgid"]
-        and pathlib.Path(child["exe"]).name == "iceccd"
+        and is_iceccd(child)
         and child["state"] not in {"Z", "X"}
         and "--generation" not in child["argv"]
     ]
@@ -273,8 +300,9 @@ while time.monotonic() < deadline:
     before_daemon = snap(daemon["pid"])
     before = snap(leader["pid"])
     if (before_daemon != daemon or before != leader
-            or pathlib.Path(before_daemon["exe"]).name != "iceccd"
-            or pathlib.Path(before["exe"]).name != "iceccd"
+            or not is_iceccd(before_daemon)
+            or not is_iceccd(before)
+            or before["argv"] != before_daemon["argv"]
             or before["ppid"] != before_daemon["pid"]
             or before["pid"] != before["pgid"]):
         time.sleep(0.05)
@@ -3103,7 +3131,15 @@ class EventProducer:
                 or set(leader) != set(stopped)):
             raise EventError("compiler-group authentication has incomplete identity")
         if (parent.get("pid") == leader.get("pid")
-                or pathlib.Path(parent.get("exe", "")).name != "iceccd"
+                or parent.get("comm") != "iceccd"
+                or leader.get("comm") != "iceccd"
+                or parent.get("uids") != [65534, 65534, 65534, 65534]
+                or leader.get("uids") != [65534, 65534, 65534, 65534]
+                or parent.get("exe_evidence") != "proc-cmdline+comm"
+                or leader.get("exe_evidence") != "proc-cmdline+comm"
+                or parent.get("exe") != "/opt/icecream/sbin/iceccd"
+                or leader.get("exe") != "/opt/icecream/sbin/iceccd"
+                or parent.get("argv") != leader.get("argv")
                 or leader.get("ppid") != parent.get("pid")
                 or leader.get("pid") != leader.get("pgid")
                 or leader.get("pid") != stopped.get("pid")
