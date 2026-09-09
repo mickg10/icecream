@@ -113,12 +113,13 @@ def scheduler_generation_for_job_text(text: str, job_id: int) -> int:
 
 
 def select_direct_compiler_pairs(items: list[dict[str, Any]]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
-    """Pure model of the STOP script's exec-safe direct-child selector."""
+    """Pure model of the STOP script's same-exe parent/child selector."""
     parents = {p["pid"]: p for p in items if PurePosixPath(p["exe"]).name == "iceccd"}
     return [
         (parent, child) for child in items
         for parent in (parents.get(child.get("ppid")),)
         if parent is not None
+        and PurePosixPath(child["exe"]).name == "iceccd"
         and child.get("pid") == child.get("pgid")
         and child.get("state") not in {"Z", "X"}
         and "--generation" not in child.get("argv", [])
@@ -177,6 +178,8 @@ CACHE_DISK_FAULT_FILE = "/var/cache/icecream/.icefarm-disk-fill"
 CACHE_DISK_FAULT_BYTES = 128 * 1024 * 1024
 CACHE_DISK_FAULT_MIN_HEADROOM_BYTES = 8 * 1024 * 1024
 DISK_FILL_WATCHDOG_S = 30
+ACTIVE_COMPILER_OBSERVE_S = 240
+ACTIVE_COMPILER_COMMAND_GRACE_S = 30
 ACTIVE_COMPILER_STOP_SCRIPT = r'''
 import json, os, pathlib, signal, socket, sys, time
 
@@ -250,8 +253,8 @@ def listener_probe(port, daemon):
 deadline = time.monotonic() + int(sys.argv[1])
 web_port = int(sys.argv[2])
 # Candidate invariant: p["pid"] == p["pgid"] for the direct compiler;
-# the compiler may already have exec'd the toolchain.  Sidecars are excluded
-# by: "--generation" not in p["argv"].
+# sidecars are excluded by: "--generation" not in p["argv"].  The direct
+# group leader remains iceccd and owns the exec'd toolchain child in its PGID.
 while time.monotonic() < deadline:
     items = processes()
     parents = {p["pid"]: p for p in items if pathlib.Path(p["exe"]).name == "iceccd"}
@@ -259,6 +262,7 @@ while time.monotonic() < deadline:
         (parent, child) for child in items
         for parent in (parents.get(child["ppid"]),)
         if parent is not None and parent["pid"] == child["ppid"] and child["pid"] == child["pgid"]
+        and pathlib.Path(child["exe"]).name == "iceccd"
         and child["state"] not in {"Z", "X"}
         and "--generation" not in child["argv"]
     ]
@@ -270,6 +274,7 @@ while time.monotonic() < deadline:
     before = snap(leader["pid"])
     if (before_daemon != daemon or before != leader
             or pathlib.Path(before_daemon["exe"]).name != "iceccd"
+            or pathlib.Path(before["exe"]).name != "iceccd"
             or before["ppid"] != before_daemon["pid"]
             or before["pid"] != before["pgid"]):
         time.sleep(0.05)
@@ -3073,10 +3078,15 @@ class EventProducer:
         result = self._invoke(self.factory.make(
             phase="event.scheduler-loss-authenticate-compiler",
             host=worker["host"], instance=worker["name"], transport=_docker_transport(self.farm, worker["host"]),
-            timeout_s=self._command_timeout(),
+            timeout_s=self._command_timeout(
+                maximum=(
+                    ACTIVE_COMPILER_OBSERVE_S
+                    + ACTIVE_COMPILER_COMMAND_GRACE_S
+                )
+            ),
             argv=docker_argv(self.farm, worker["host"],
                 ("exec", "--user", "0", worker_before["id"], "python3", "-c",
-                 ACTIVE_COMPILER_STOP_SCRIPT, "20", str(web_port))),
+                 ACTIVE_COMPILER_STOP_SCRIPT, str(ACTIVE_COMPILER_OBSERVE_S), str(web_port))),
         ))
         try:
             compiler = json.loads(result.stdout.strip())

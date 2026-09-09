@@ -21,6 +21,8 @@ from farmharness.integration.collect import (
     _validate_scheduler_active_loss_receipt,
 )
 from farmharness.integration.events import (
+    ACTIVE_COMPILER_COMMAND_GRACE_S,
+    ACTIVE_COMPILER_OBSERVE_S,
     CACHE_DISK_FAULT_BYTES,
     CACHE_DISK_FAULT_FILE,
     CACHE_DISK_FAULT_PATH,
@@ -351,18 +353,26 @@ def test_active_scheduler_loss_scripts_are_exact_identity_bound() -> None:
     assert "len(candidates) != 1" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "p[\"pid\"] == p[\"pgid\"]" in ACTIVE_COMPILER_STOP_SCRIPT
     assert '"--generation" not in p["argv"]' in ACTIVE_COMPILER_STOP_SCRIPT
-    assert 'pathlib.Path(child["exe"]).name == "iceccd"' not in ACTIVE_COMPILER_STOP_SCRIPT
-    assert 'pathlib.Path(before["exe"]).name != "iceccd"' not in ACTIVE_COMPILER_STOP_SCRIPT
+    assert 'pathlib.Path(child["exe"]).name == "iceccd"' in ACTIVE_COMPILER_STOP_SCRIPT
+    assert 'pathlib.Path(before["exe"]).name != "iceccd"' in ACTIVE_COMPILER_STOP_SCRIPT
     assert 'pathlib.Path(before_daemon["exe"]).name != "iceccd"' in ACTIVE_COMPILER_STOP_SCRIPT
     assert "socket.create_connection" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "while True:" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "size > 4 * 1024 * 1024" in ACTIVE_COMPILER_STOP_SCRIPT
     assert 'fields[1] == wanted and fields[3] == "0A"' in ACTIVE_COMPILER_STOP_SCRIPT
     assert 'owned.add(target[8:-1])' in ACTIVE_COMPILER_STOP_SCRIPT
+    assert ACTIVE_COMPILER_OBSERVE_S == 240
+    assert ACTIVE_COMPILER_COMMAND_GRACE_S == 30
+    source = (INTEGRATION / "events.py").read_text(encoding="utf-8")
+    assert "ACTIVE_COMPILER_STOP_SCRIPT, str(ACTIVE_COMPILER_OBSERVE_S), str(web_port)" in source
+    assert "ACTIVE_COMPILER_STOP_SCRIPT, \"20\", str(web_port)" not in source
+    assert "ACTIVE_COMPILER_OBSERVE_S\n                    + ACTIVE_COMPILER_COMMAND_GRACE_S" in source
     parent = {"pid": 10, "ppid": 1, "pgid": 10, "exe": "/opt/icecream/sbin/iceccd", "state": "S", "argv": []}
-    compiler = {"pid": 11, "ppid": 10, "pgid": 11, "exe": "/usr/bin/g++", "state": "R", "argv": ["/usr/bin/g++", "-c", "unit.cc"]}
-    assert Path(compiler["exe"]).name != "iceccd"  # The deleted selector law rejected the real post-exec shape.
+    compiler = {"pid": 11, "ppid": 10, "pgid": 11, "exe": "/opt/icecream/sbin/iceccd", "state": "S", "argv": parent["argv"]}
+    toolchain = {"pid": 12, "ppid": 11, "pgid": 11, "exe": "/usr/bin/g++", "state": "R", "argv": ["/usr/bin/g++", "-c", "unit.cc"]}
+    assert Path(toolchain["exe"]).name == "g++"
     assert select_direct_compiler_pairs([parent, compiler]) == [(parent, compiler)]
+    assert select_direct_compiler_pairs([parent, compiler, toolchain]) == [(parent, compiler)]
 
 
 def test_scheduler_generation_parser_requires_framed_unique_generation() -> None:
@@ -381,16 +391,18 @@ def test_scheduler_generation_parser_requires_framed_unique_generation() -> None
         scheduler_generation_for_job_text(reused, 2)
 
 
-def test_direct_compiler_selector_accepts_execed_compiler_and_rejects_invalid_shapes() -> None:
+def test_direct_compiler_selector_models_real_group_leader_and_rejects_invalid_shapes() -> None:
     daemon = {"pid": 10, "ppid": 1, "pgid": 10, "exe": "/opt/icecream/sbin/iceccd", "state": "S", "argv": []}
-    compiler = {"pid": 11, "ppid": 10, "pgid": 11, "exe": "/usr/bin/g++", "state": "R", "argv": ["/usr/bin/g++", "-c", "unit.cc"]}
+    compiler = {"pid": 11, "ppid": 10, "pgid": 11, "exe": daemon["exe"], "state": "S", "argv": daemon["argv"]}
+    toolchain = {"pid": 17, "ppid": 11, "pgid": 11, "exe": "/usr/bin/g++", "state": "R", "argv": ["/usr/bin/g++", "-c", "unit.cc"]}
     statewriter = {"pid": 12, "ppid": 10, "pgid": 10, "exe": daemon["exe"], "state": "S", "argv": ["iceccd"]}
     sidecar = {"pid": 13, "ppid": 10, "pgid": 13, "exe": daemon["exe"], "state": "S", "argv": ["iceccd", "--generation", "7"]}
-    zombie = {"pid": 14, "ppid": 10, "pgid": 14, "exe": "/usr/bin/g++", "state": "Z", "argv": ["/usr/bin/g++"]}
-    follower = {"pid": 15, "ppid": 10, "pgid": 11, "exe": "/usr/bin/as", "state": "S", "argv": ["/usr/bin/as"]}
+    zombie = {"pid": 14, "ppid": 10, "pgid": 14, "exe": daemon["exe"], "state": "Z", "argv": ["iceccd"]}
+    follower = {"pid": 15, "ppid": 10, "pgid": 11, "exe": daemon["exe"], "state": "S", "argv": ["iceccd"]}
     other_parent = {"pid": 20, "ppid": 1, "pgid": 20, "exe": "/usr/bin/python3", "state": "S", "argv": ["python3"]}
-    other_child = {"pid": 21, "ppid": 20, "pgid": 21, "exe": "/usr/bin/g++", "state": "R", "argv": ["/usr/bin/g++"]}
-    items = [daemon, compiler, statewriter, sidecar, zombie, follower, other_parent, other_child]
+    other_child = {"pid": 21, "ppid": 20, "pgid": 21, "exe": daemon["exe"], "state": "S", "argv": ["iceccd"]}
+    execed_direct_child = {"pid": 22, "ppid": 10, "pgid": 22, "exe": "/usr/bin/g++", "state": "R", "argv": ["/usr/bin/g++"]}
+    items = [daemon, compiler, toolchain, statewriter, sidecar, zombie, follower, other_parent, other_child, execed_direct_child]
     assert select_direct_compiler_pairs(items) == [(daemon, compiler)]
     second = compiler | {"pid": 16, "pgid": 16}
     assert len(select_direct_compiler_pairs(items + [second])) == 2
@@ -436,7 +448,7 @@ def test_active_compiler_selector_rejects_sidecar_and_statewriter_shapes() -> No
     daemon = {"pid": 10, "pgid": 10, "ppid": 1, "exe": "/opt/icecream/sbin/iceccd", "state": "S", "argv": []}
     statewriter = {"pid": 11, "pgid": 10, "ppid": 10, "exe": daemon["exe"], "state": "S", "argv": []}
     sidecar = {"pid": 12, "pgid": 12, "ppid": 10, "exe": daemon["exe"], "state": "S", "argv": ["iceccd", "--generation", "7"]}
-    compiler = {"pid": 13, "pgid": 13, "ppid": 10, "exe": "/usr/bin/g++", "state": "R", "argv": ["/usr/bin/g++", "-c", "unit.cc"]}
+    compiler = {"pid": 13, "pgid": 13, "ppid": 10, "exe": daemon["exe"], "state": "S", "argv": ["iceccd"]}
     assert select_direct_compiler_pairs([daemon, statewriter, sidecar, compiler]) == [(daemon, compiler)]
 
 
