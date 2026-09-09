@@ -47,7 +47,7 @@ from farmharness.integration.events import (
 from farmharness.integration.farm_spec import load_farm_spec
 from farmharness.integration.images import RecordingTransport
 from farmharness.integration.images import _image_identity
-from farmharness.integration.lifecycle import _expected_image_labels
+from farmharness.integration.lifecycle import _expected_image_labels, bundle_root
 from farmharness.integration.layout import instance_root, runtime_root
 from farmharness.integration.remote import (
     CommandResult,
@@ -462,6 +462,55 @@ def test_active_scheduler_loss_scenario_is_not_the_drained_restart(tmp_path: Pat
     assert all("ICECC_WEB_HOSTPORT" not in item.get("env", {}) for item in scenario.data["instances"])
 
 
+def test_active_scheduler_loss_uses_preflight_host_native_container_image(
+    tmp_path: Path,
+) -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    farm.data["hub"]["results_root"] = str(tmp_path)
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / "S70-b4-scheduler-active-loss.json", farm
+    )
+    plan = farmtest.build_plan(farm, scenario, run_id="active-loss-image-unit")
+    worker = next(
+        item for item in plan["topology"]["instances"] if item["role"] == "F"
+    )
+    container = worker["container_image"]
+    container_id = "e" * 64
+    preflight = {
+        "farm_digest": plan["farm_digest"],
+        "images": {
+            f"container:{worker['host']}:{container['reference']}": {
+                "closure_sha256": container["closure_sha256"],
+                "id": f"sha256:{container_id}",
+                "reference": container["reference"],
+            }
+        },
+        "run_id": plan["run_id"],
+        "scenario_digest": plan["scenario_digest"],
+        "schema": "icefarm-preflight-v1",
+        "topology_digest": plan["topology_digest"],
+    }
+    root = bundle_root(farm, plan["run_id"])
+    root.mkdir(parents=True)
+    (root / "preflight.json").write_text(json.dumps(preflight))
+
+    producer = EventProducer(
+        farm,
+        scenario,
+        plan,
+        recorder=RecordingTransport(EventRecorder()),
+    )
+    assert producer._preflight_container_image_id(worker) == f"sha256:{container_id}"
+    assert container_id != farm.data["runtime_image"]["id"].removeprefix("sha256:")
+
+    preflight["images"][
+        f"container:{worker['host']}:{container['reference']}"
+    ]["closure_sha256"] = "0" * 64
+    (root / "preflight.json").write_text(json.dumps(preflight))
+    with pytest.raises(EventError, match="exact container-image identity"):
+        producer._preflight_container_image_id(worker)
+
+
 def test_active_scheduler_loss_collection_binds_post_offset_product_witness(
     tmp_path: Path,
 ) -> None:
@@ -541,7 +590,7 @@ def test_active_scheduler_loss_v2_collector_recomputes_bound_evidence(
 ) -> None:
     from farmharness.integration.tests.test_verdict import _active_loss_v2_fixture
 
-    receipt, event, _scenario_data, _plan_data, _farm_data = (
+    receipt, event, _scenario_data, _plan_data, _farm_data, _images = (
         _active_loss_v2_fixture()
     )
     farm = load_farm_spec(farm_fixture.example_farm_path())
@@ -556,10 +605,26 @@ def test_active_scheduler_loss_v2_collector_recomputes_bound_evidence(
         item for item in plan["topology"]["instances"] if item["role"] == "C"
     )
     web_port = plan["ports"]["web"][worker["name"]]
+    container_image_id = "e" * 64
+    container_image = worker["container_image"]
+    preflight = {
+        "farm_digest": plan["farm_digest"],
+        "images": {
+            f"container:{worker['host']}:{container_image['reference']}": {
+                "closure_sha256": container_image["closure_sha256"],
+                "id": f"sha256:{container_image_id}",
+                "reference": container_image["reference"],
+            }
+        },
+        "run_id": plan["run_id"],
+        "scenario_digest": plan["scenario_digest"],
+        "schema": "icefarm-preflight-v1",
+        "topology_digest": plan["topology_digest"],
+    }
     worker_identity = {
         "container_id": "b" * 64,
         "env": {"ICECC_WEB_HOSTPORT": f"127.0.0.1:{web_port}"},
-        "image_id": farm.data["runtime_image"]["id"].removeprefix("sha256:"),
+        "image_id": container_image_id,
         "running": True,
         "runtime_path": str(runtime_root(farm, worker)),
         "started_at": "worker-start",
@@ -621,8 +686,39 @@ def test_active_scheduler_loss_v2_collector_recomputes_bound_evidence(
         0,
         farm=farm,
         plan=plan,
+        preflight=preflight,
         evidence=tmp_path,
     )
+
+    authority_identity = json.loads(json.dumps(receipt))
+    authority_image_id = farm.data["runtime_image"]["id"].removeprefix("sha256:")
+    authority_identity["compiler"]["worker_before"]["image_id"] = authority_image_id
+    authority_identity["compiler"]["worker_after"]["image_id"] = authority_image_id
+    with pytest.raises(CollectError, match="listener/runtime authority"):
+        _validate_scheduler_active_loss_receipt(
+            authority_identity,
+            event,
+            scenario,
+            0,
+            farm=farm,
+            plan=plan,
+            preflight=preflight,
+            evidence=tmp_path,
+        )
+
+    tampered_preflight = json.loads(json.dumps(preflight))
+    next(iter(tampered_preflight["images"].values()))["closure_sha256"] = "0" * 64
+    with pytest.raises(CollectError, match="listener/runtime authority"):
+        _validate_scheduler_active_loss_receipt(
+            receipt,
+            event,
+            scenario,
+            0,
+            farm=farm,
+            plan=plan,
+            preflight=tampered_preflight,
+            evidence=tmp_path,
+        )
 
     tampered = json.loads(json.dumps(receipt))
     tampered["compiler"]["listener"]["socket_inode"] = "0"
@@ -634,6 +730,7 @@ def test_active_scheduler_loss_v2_collector_recomputes_bound_evidence(
             0,
             farm=farm,
             plan=plan,
+            preflight=preflight,
             evidence=tmp_path,
         )
 
@@ -647,6 +744,7 @@ def test_active_scheduler_loss_v2_collector_recomputes_bound_evidence(
             0,
             farm=farm,
             plan=plan,
+            preflight=preflight,
             evidence=tmp_path,
         )
 

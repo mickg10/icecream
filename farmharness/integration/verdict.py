@@ -2115,6 +2115,7 @@ def _scheduler_active_loss_receipt_errors(
     readiness_v2: bool = False,
     plan: Mapping[str, Any] | None = None,
     farm: Mapping[str, Any] | None = None,
+    images: Mapping[str, Any] | None = None,
 ) -> set[str]:
     marker = "@event:scheduler-active-loss"
     required = {"action", "after", "before", "compiler", "event_epoch", "instance", "lost_scheduler_generation", "lost_scheduler_job", "pre_fault", "quiescence", "schema", "turn"}
@@ -2353,9 +2354,9 @@ def _scheduler_active_loss_receipt_errors(
             ),
             None,
         ) if isinstance(hosts, list) else None
-        runtime_image = farm.get("runtime_image")
         worker_env = worker.get("env")
         worker_image = worker.get("image")
+        container_image = worker.get("container_image")
         worker_before = (
             compiler.get("worker_before")
             if isinstance(compiler, Mapping)
@@ -2370,11 +2371,39 @@ def _scheduler_active_loss_receipt_errors(
             and isinstance(worker_image.get("closure_sha256"), str)
             else None
         )
-        expected_image_id = (
-            runtime_image.get("id", "").removeprefix("sha256:")
-            if isinstance(runtime_image, Mapping)
-            and isinstance(runtime_image.get("id"), str)
+        container_reference = (
+            container_image.get("reference")
+            if isinstance(container_image, Mapping)
             else None
+        )
+        container_closure = (
+            container_image.get("closure_sha256")
+            if isinstance(container_image, Mapping)
+            else None
+        )
+        container_receipt = (
+            images.get(
+                f"container:{worker.get('host')}:{container_reference}"
+            )
+            if isinstance(images, Mapping)
+            else None
+        )
+        native_image_id = (
+            container_receipt.get("id")
+            if isinstance(container_receipt, Mapping)
+            else None
+        )
+        expected_image_id = (
+            native_image_id.removeprefix("sha256:")
+            if isinstance(native_image_id, str)
+            else None
+        )
+        container_authority_valid = (
+            isinstance(container_receipt, Mapping)
+            and container_receipt.get("reference") == container_reference
+            and container_receipt.get("closure_sha256") == container_closure
+            and isinstance(expected_image_id, str)
+            and SHA256_RE.fullmatch(expected_image_id) is not None
         )
         expected_env = (
             {
@@ -2404,7 +2433,8 @@ def _scheduler_active_loss_receipt_errors(
             is not None
         )
         worker_authority_valid = (
-            isinstance(worker_before, Mapping)
+            container_authority_valid
+            and isinstance(worker_before, Mapping)
             and worker_before.get("running") is True
             and worker_before.get("image_id") == expected_image_id
             and worker_before.get("runtime_path") == expected_runtime
@@ -5782,6 +5812,9 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
                     plan=plan if isinstance(plan, Mapping) else None,
                     farm=bundle.get("farm")
                     if isinstance(bundle.get("farm"), Mapping)
+                    else None,
+                    images=bundle.get("images")
+                    if isinstance(bundle.get("images"), Mapping)
                     else None,
                 )
                     or not isinstance(receipt, Mapping)

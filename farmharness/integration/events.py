@@ -1474,6 +1474,64 @@ class EventProducer:
         instance = next(item for item in self.plan["topology"]["instances"] if item["name"] == name)
         return f"icefarm-{self.plan['run_id']}-{name}", instance
 
+    def _preflight_container_image_id(self, instance: Mapping[str, Any]) -> str:
+        """Return the native base-image ID pinned by this run's preflight.
+
+        The product image is materialized as the authenticated read-only
+        ``/opt/icecream`` runtime mount.  Docker's container ``Image`` field
+        instead identifies the separately pinned foundation image.  Active
+        scheduler-loss evidence must bind both identities without conflating
+        them.
+        """
+
+        path = bundle_root(self.farm, self.plan["run_id"]) / "preflight.json"
+        try:
+            preflight = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise EventError(
+                "active scheduler loss cannot load its authenticated preflight"
+            ) from exc
+        expected_bindings = {
+            "farm_digest": self.plan["farm_digest"],
+            "run_id": self.plan["run_id"],
+            "scenario_digest": self.plan["scenario_digest"],
+            "topology_digest": self.plan["topology_digest"],
+        }
+        if (
+            not isinstance(preflight, Mapping)
+            or preflight.get("schema") != "icefarm-preflight-v1"
+            or any(preflight.get(key) != value for key, value in expected_bindings.items())
+        ):
+            raise EventError(
+                "active scheduler loss preflight is not bound to this exact run"
+            )
+        container_image = instance.get("container_image")
+        images = preflight.get("images")
+        if not isinstance(container_image, Mapping) or not isinstance(images, Mapping):
+            raise EventError(
+                "active scheduler loss preflight lacks container-image authority"
+            )
+        reference = container_image.get("reference")
+        closure = container_image.get("closure_sha256")
+        receipt = images.get(f"container:{instance.get('host')}:{reference}")
+        native_id = receipt.get("id") if isinstance(receipt, Mapping) else None
+        normalized = (
+            native_id.removeprefix("sha256:")
+            if isinstance(native_id, str)
+            else None
+        )
+        if (
+            not isinstance(receipt, Mapping)
+            or receipt.get("reference") != reference
+            or receipt.get("closure_sha256") != closure
+            or normalized is None
+            or SHA256_RE.fullmatch(normalized) is None
+        ):
+            raise EventError(
+                "active scheduler loss preflight has no exact container-image identity"
+            )
+        return native_id
+
     def _invoke(self, command: Any) -> Any:
         self._current_phase = command.phase
         route_phase = {
@@ -2981,12 +3039,13 @@ class EventProducer:
             **worker.get("env", {}),
             "ICECC_WEB_HOSTPORT": f"127.0.0.1:{web_port}",
         }
+        expected_worker_image_id = self._preflight_container_image_id(worker)
         before = self._inspect(event.instance)
         if before.get("id") != identifier or before.get("running") is not True:
             raise EventError("scheduler container identity changed before active loss")
         worker_before = self._inspect(
             worker["name"],
-            expected_image_id=self.farm.data["runtime_image"]["id"],
+            expected_image_id=expected_worker_image_id,
             expected_runtime=str(runtime_root(self.farm, worker)),
             expected_env=worker_env,
         )
@@ -3117,7 +3176,7 @@ class EventProducer:
             raise EventError("compiler group did not disappear with authenticated identity")
         worker_after = self._inspect(
             worker["name"],
-            expected_image_id=self.farm.data["runtime_image"]["id"],
+            expected_image_id=expected_worker_image_id,
             expected_runtime=str(runtime_root(self.farm, worker)),
             expected_env=worker_env,
         )

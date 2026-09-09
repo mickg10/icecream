@@ -601,6 +601,7 @@ def _stage_evidence(
             scenario,
             farm=farm,
             plan=plan,
+            preflight=receipts.get("preflight"),
             validate_client_evidence=False,
         )
         stopped_instances = frozenset(
@@ -616,7 +617,13 @@ def _stage_evidence(
             )
         else:
             _snapshot_existing_evidence(root, temporary, plan)
-        _event_log(temporary, scenario, farm=farm, plan=plan)
+        _event_log(
+            temporary,
+            scenario,
+            farm=farm,
+            plan=plan,
+            preflight=receipts.get("preflight"),
+        )
         specs = temporary / "specs"
         _atomic_json(specs / "farm.json", farm.data)
         _atomic_json(specs / "scenario.json", scenario.data)
@@ -1684,6 +1691,7 @@ def _event_log(
     *,
     farm: FarmSpec | None = None,
     plan: dict[str, Any] | None = None,
+    preflight: Mapping[str, Any] | None = None,
     validate_client_evidence: bool = True,
 ) -> list[dict[str, Any]]:
     path = evidence / "events" / "events.json"
@@ -1847,7 +1855,7 @@ def _event_log(
         elif scheduler_active_loss:
             _validate_scheduler_active_loss_receipt(
                 event["receipt"], event, scenario, index,
-                farm=farm, plan=plan, evidence=evidence,
+                farm=farm, plan=plan, preflight=preflight, evidence=evidence,
             )
         elif client_route_restart:
             _validate_client_route_restart_receipt(
@@ -1871,6 +1879,7 @@ def _validate_scheduler_active_loss_receipt(
     *,
     farm: FarmSpec | None,
     plan: dict[str, Any] | None,
+    preflight: Mapping[str, Any] | None = None,
     evidence: Path | None,
 ) -> None:
     prefix = f"events.json event {index} scheduler active loss"
@@ -2056,8 +2065,53 @@ def _validate_scheduler_active_loss_receipt(
             "ICECC_WEB_HOSTPORT": f"127.0.0.1:{expected_web_port}",
         }
         expected_runtime = str(runtime_root(farm, dict(worker)))
-        expected_image_id = farm.data["runtime_image"]["id"].removeprefix(
-            "sha256:"
+        container_image = worker.get("container_image")
+        images = preflight.get("images") if isinstance(preflight, Mapping) else None
+        preflight_binding_valid = (
+            isinstance(preflight, Mapping)
+            and preflight.get("schema") == "icefarm-preflight-v1"
+            and all(
+                preflight.get(field) == plan.get(field)
+                for field in (
+                    "farm_digest",
+                    "run_id",
+                    "scenario_digest",
+                    "topology_digest",
+                )
+            )
+        )
+        reference = (
+            container_image.get("reference")
+            if isinstance(container_image, Mapping)
+            else None
+        )
+        closure = (
+            container_image.get("closure_sha256")
+            if isinstance(container_image, Mapping)
+            else None
+        )
+        image_receipt = (
+            images.get(f"container:{worker.get('host')}:{reference}")
+            if isinstance(images, Mapping)
+            else None
+        )
+        native_image_id = (
+            image_receipt.get("id")
+            if isinstance(image_receipt, Mapping)
+            else None
+        )
+        expected_image_id = (
+            native_image_id.removeprefix("sha256:")
+            if isinstance(native_image_id, str)
+            else None
+        )
+        container_image_authority_valid = (
+            preflight_binding_valid
+            and isinstance(image_receipt, Mapping)
+            and image_receipt.get("reference") == reference
+            and image_receipt.get("closure_sha256") == closure
+            and isinstance(expected_image_id, str)
+            and SHA256_RE.fullmatch(expected_image_id) is not None
         )
         if (
             not isinstance(listener, Mapping)
@@ -2075,6 +2129,7 @@ def _validate_scheduler_active_loss_receipt(
             or listener.get("port") != expected_web_port
             or not isinstance(listener.get("socket_inode"), str)
             or re.fullmatch(r"[1-9][0-9]*", listener["socket_inode"]) is None
+            or not container_image_authority_valid
             or compiler["worker_before"].get("running") is not True
             or compiler["worker_before"].get("image_id") != expected_image_id
             or compiler["worker_before"].get("runtime_path") != expected_runtime
@@ -6517,7 +6572,13 @@ def collect_bundle(
         recorder=recorder,
         sync_remote=sync_remote,
     )
-    events = _event_log(evidence, scenario, farm=farm, plan=plan)
+    events = _event_log(
+        evidence,
+        scenario,
+        farm=farm,
+        plan=plan,
+        preflight=receipts["preflight"],
+    )
     if scenario.data["controls"] == ["H3"]:
         rows = []
         row_facts = {}

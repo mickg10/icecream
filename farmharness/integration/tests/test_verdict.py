@@ -353,12 +353,15 @@ def _active_loss_v2_fixture():
         "schema": "icefarm-client-scheduler-readiness-v2",
     }
     closure = "d" * 64
-    image_id = "e" * 64
+    container_closure = "f" * 64
+    container_image_id = "e" * 64
+    authority_native_image_id = "9" * 64
+    container_reference = "icecream/farm-node:test"
     runtime_path = f"/farm/icefarm/runtimes/{closure}/root"
     worker_identity = {
         "container_id": "b" * 64,
         "env": {"ICECC_WEB_HOSTPORT": "127.0.0.1:23004"},
-        "image_id": image_id,
+        "image_id": container_image_id,
         "running": True,
         "runtime_path": runtime_path,
         "started_at": "worker-start",
@@ -397,6 +400,10 @@ def _active_loss_v2_fixture():
                     "env": {},
                     "host": "tt-quietbox3",
                     "image": {"closure_sha256": closure},
+                    "container_image": {
+                        "closure_sha256": container_closure,
+                        "reference": container_reference,
+                    },
                     "name": "F1",
                     "role": "F",
                 }
@@ -405,7 +412,14 @@ def _active_loss_v2_fixture():
     }
     farm = {
         "hosts": [{"name": "tt-quietbox3", "scratch_root": "/farm"}],
-        "runtime_image": {"id": f"sha256:{image_id}"},
+        "runtime_image": {"id": f"sha256:{authority_native_image_id}"},
+    }
+    images = {
+        f"container:tt-quietbox3:{container_reference}": {
+            "closure_sha256": container_closure,
+            "id": f"sha256:{container_image_id}",
+            "reference": container_reference,
+        }
     }
     receipt = {
         "action": "scheduler-loss-active",
@@ -489,12 +503,17 @@ def _active_loss_v2_fixture():
         "schema": "icefarm-scheduler-active-loss-v2",
         "turn": "A",
     }
-    return receipt, event, scenario, plan, farm
+    return receipt, event, scenario, plan, farm, images
 
 
 def test_active_loss_v2_binds_listener_worker_authority_and_readiness() -> None:
-    receipt, event, scenario, plan, farm = _active_loss_v2_fixture()
-    kwargs = {"readiness_v2": True, "plan": plan, "farm": farm}
+    receipt, event, scenario, plan, farm, images = _active_loss_v2_fixture()
+    kwargs = {
+        "readiness_v2": True,
+        "plan": plan,
+        "farm": farm,
+        "images": images,
+    }
     assert not _scheduler_active_loss_receipt_errors(
         receipt, event, scenario, **kwargs
     )
@@ -523,6 +542,33 @@ def test_active_loss_v2_binds_listener_worker_authority_and_readiness() -> None:
     tampered["compiler"]["group_gone"]["members"] = [41]
     assert _scheduler_active_loss_receipt_errors(
         tampered, event, scenario, **kwargs
+    )
+
+    # Native Docker IDs can differ by host even when their portable closure is
+    # identical.  The event must use this run's remote preflight ID, not the
+    # farm authority's capture-host ID.
+    tampered = copy.deepcopy(receipt)
+    tampered["compiler"]["worker_before"]["image_id"] = farm[
+        "runtime_image"
+    ]["id"].removeprefix("sha256:")
+    tampered["compiler"]["worker_after"]["image_id"] = tampered["compiler"][
+        "worker_before"
+    ]["image_id"]
+    assert _scheduler_active_loss_receipt_errors(
+        tampered, event, scenario, **kwargs
+    )
+
+    tampered_images = copy.deepcopy(images)
+    only_receipt = next(iter(tampered_images.values()))
+    only_receipt["closure_sha256"] = "0" * 64
+    assert _scheduler_active_loss_receipt_errors(
+        receipt,
+        event,
+        scenario,
+        readiness_v2=True,
+        plan=plan,
+        farm=farm,
+        images=tampered_images,
     )
 
     tampered_plan = copy.deepcopy(plan)
