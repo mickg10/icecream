@@ -29,11 +29,14 @@ from farmharness.integration.collect import (
     _retained_log_witness,
     _retained_log_witness_exact,
     _parse_logins,
+    _reconcile_scheduler_dispatches,
+    _scheduler_jobs,
     _scheduler_dispatch_epoch,
     _snapshot_live_evidence,
     _source_candidates_for_assignment,
     _source_results,
     _transition_target_env,
+    _validate_preexposure_redispatches,
     _validate_orphan_recovery_markers,
     _warm_hint_overrides,
     collect_bundle,
@@ -285,6 +288,45 @@ def test_assignment_preference_replays_occupancy_and_excludes_canaries() -> None
     scenario, plan, claims = _preference_fixture(saturated=True)
     result = _assignment_preference(scenario, plan, claims)
     assert result["counts"] == {"checks": 3, "escapes": 1, "preferred": 2, "violations": 0}
+    assert result["decisions"][-1]["compatible_free_workers"] == []
+
+
+def test_assignment_preference_counts_preexposure_reservation_until_loss() -> None:
+    scenario, plan, claims = _preference_fixture(selected="F2")
+    current = claims[-1]
+    current["scheduler_record"]["preexposure_redispatches"] = [
+        {
+            "lost_dispatch_line": 5,
+            "lost_worker": "F1",
+            "marker_line": 15,
+        }
+    ]
+    claims.insert(
+        -1,
+        {
+            "client": "C1",
+            "kind": "workload",
+            "row_job_id": "0",
+            "scheduler_record": {
+                "client": "C1",
+                "dispatch_line": 4,
+                "scheduler_job": 2,
+                "terminal_line": 20,
+                "worker": "F2",
+            },
+            "worker": "F2",
+        },
+    )
+
+    result = _assignment_preference(scenario, plan, claims)
+
+    assert result["counts"] == {
+        "checks": 2,
+        "escapes": 1,
+        "preferred": 1,
+        "violations": 0,
+    }
+    assert result["decisions"][-1]["occupancy"] == {"F1": 1, "F2": 1}
     assert result["decisions"][-1]["compatible_free_workers"] == []
 
 
@@ -637,6 +679,7 @@ def test_collection_verdict_report_and_replay_are_reproducible(tmp_path: Path) -
     assert bundle["observations"]["scheduler_reconciliation"] == {
         "canary_dispatches": 1,
         "generations": 1,
+        "preexposure_redispatches": [],
         "scheduler_dispatches": 2,
         "workload_dispatches": 1,
     }
@@ -789,6 +832,205 @@ def test_collection_refuses_a_scheduler_dispatch_without_terminal(
 
     with pytest.raises(CollectError, match="dispatch has no terminal"):
         collect_bundle(farm, scenario, plan, sync_remote=False)
+
+
+def _preexposure_scheduler_fixture(
+    tmp_path: Path,
+) -> tuple[Path, dict[str, object], list[dict[str, object]], Path]:
+    evidence = tmp_path / "evidence"
+    scheduler_log = evidence / "diagnostics" / "h1" / "S1.log" / "scheduler.log"
+    scheduler_log.parent.mkdir(parents=True)
+    scheduler_log.write_text(
+        "[1] 2026-09-09 08:01:20: ICECREAM scheduler 1.5.90 starting up, port 23000\n"
+        "[1] 2026-09-09 08:01:21: NEW 7 client=C1 versions=[] /x.ii C++ 0\n"
+        "[1] 2026-09-09 08:01:22: put 7 in joblist of F1\n"
+        "[1] 2026-09-09 08:01:23: redispatch unexposed assignment 7 after worker loss F1\n"
+        "[1] 2026-09-09 08:01:24: put 7 in joblist of F2\n"
+        "[1] 2026-09-09 08:01:25: BEGIN: 7 client=C1(x86_64) server=F2(x86_64)\n"
+        "[1] 2026-09-09 08:01:26: END 7 status=0 server=F2\n",
+        encoding="utf-8",
+    )
+    plan: dict[str, object] = {
+        "topology": {
+            "instances": [
+                {"host": "h1", "name": "S1", "role": "S"},
+                {"host": "h1", "name": "F1", "role": "F"},
+                {"host": "h2", "name": "F2", "role": "F"},
+            ]
+        }
+    }
+    claims: list[dict[str, object]] = [
+        {
+            "attempt_index": 0,
+            "client": "C1",
+            "kind": "workload",
+            "observed_ms": 1_788_940_884_000,
+            "row_job_id": "C1:A:1:7",
+            "scheduler_job": 7,
+            "worker": "F2",
+        }
+    ]
+    return evidence, plan, claims, scheduler_log
+
+
+def test_collection_authenticates_preexposure_redispatch_before_usecs(
+    tmp_path: Path,
+) -> None:
+    evidence, plan, claims, _scheduler_log = _preexposure_scheduler_fixture(tmp_path)
+
+    result = _reconcile_scheduler_dispatches(evidence, plan, claims)
+
+    record = claims[0]["scheduler_record"]
+    assert isinstance(record, dict)
+    assert record["worker"] == "F2"
+    assert record["dispatch_line"] == 5
+    assert record["terminal"] == "completion"
+    assert result == {
+        "canary_dispatches": 0,
+        "generations": 1,
+        "preexposure_redispatches": [
+            {
+                "attempt_index": 0,
+                "client": "C1",
+                "generation": 1,
+                "lost_dispatch_line": 3,
+                "lost_dispatch_ms": 1_788_940_882_000,
+                "lost_worker": "F1",
+                "marker_line": 4,
+                "marker_ms": 1_788_940_883_000,
+                "replacement_dispatch_line": 5,
+                "replacement_dispatch_ms": 1_788_940_884_000,
+                "replacement_worker": "F2",
+                "row_job_id": "C1:A:1:7",
+                "scheduler_job": 7,
+            }
+        ],
+        "scheduler_dispatches": 1,
+        "workload_dispatches": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing-marker",
+        "wrong-lost-worker",
+        "same-replacement-worker",
+        "marker-after-begin",
+        "dangling-marker",
+        "malformed-marker",
+    ),
+)
+def test_collection_refuses_unauthenticated_preexposure_redispatch(
+    tmp_path: Path, mutation: str
+) -> None:
+    evidence, plan, _claims, scheduler_log = _preexposure_scheduler_fixture(tmp_path)
+    text = scheduler_log.read_text(encoding="utf-8")
+    marker = (
+        "[1] 2026-09-09 08:01:23: redispatch unexposed assignment 7 "
+        "after worker loss F1\n"
+    )
+    replacement = "[1] 2026-09-09 08:01:24: put 7 in joblist of F2\n"
+    begin = (
+        "[1] 2026-09-09 08:01:25: BEGIN: 7 client=C1(x86_64) "
+        "server=F2(x86_64)\n"
+    )
+    terminal = "[1] 2026-09-09 08:01:26: END 7 status=0 server=F2\n"
+    if mutation == "missing-marker":
+        text = text.replace(marker, "")
+    elif mutation == "wrong-lost-worker":
+        text = text.replace("worker loss F1", "worker loss F9")
+    elif mutation == "same-replacement-worker":
+        text = text.replace("joblist of F2", "joblist of F1")
+    elif mutation == "marker-after-begin":
+        text = text.replace(marker + replacement + begin, replacement + begin + marker)
+    elif mutation == "dangling-marker":
+        text = text.replace(replacement + begin + terminal, "")
+    else:
+        text = text.replace("after worker loss F1", "after loss F1")
+    scheduler_log.write_text(text, encoding="utf-8")
+
+    with pytest.raises(CollectError):
+        _scheduler_jobs(evidence, plan)
+
+
+def test_collection_refuses_preexposure_redispatch_for_a_canary(
+    tmp_path: Path,
+) -> None:
+    evidence, plan, claims, _scheduler_log = _preexposure_scheduler_fixture(tmp_path)
+    claims[0].update(kind="canary", row_job_id=None)
+
+    with pytest.raises(CollectError, match="does not bind a workload assignment"):
+        _reconcile_scheduler_dispatches(evidence, plan, claims)
+
+
+@pytest.mark.parametrize("mutation", ("outside-gate", "missing-event", "late"))
+def test_collection_binds_preexposure_redispatch_to_worker_restart(
+    tmp_path: Path, mutation: str
+) -> None:
+    evidence, plan, claims, _scheduler_log = _preexposure_scheduler_fixture(tmp_path)
+    result = _reconcile_scheduler_dispatches(evidence, plan, claims)
+    scenario = type(
+        "Scenario",
+        (),
+        {
+            "data": {
+                "expect": {"engagement": "s70-b4-worker-bounces"},
+                "workload": {"clients": ["C1"]},
+            }
+        },
+    )()
+    events = [
+        {
+            "action": "restart",
+            "fired_ms": 1_788_940_890_000,
+            "instance": "F1",
+        }
+    ]
+    if mutation == "outside-gate":
+        scenario.data["expect"]["engagement"] = "baseline"
+    elif mutation == "missing-event":
+        events.clear()
+    else:
+        events[0]["fired_ms"] = 1_788_940_882_500
+
+    with pytest.raises(CollectError):
+        _validate_preexposure_redispatches(
+            scenario,
+            plan,
+            events,
+            result["preexposure_redispatches"],
+        )
+
+
+def test_collection_accepts_restart_bound_preexposure_redispatch(
+    tmp_path: Path,
+) -> None:
+    evidence, plan, claims, _scheduler_log = _preexposure_scheduler_fixture(tmp_path)
+    result = _reconcile_scheduler_dispatches(evidence, plan, claims)
+    scenario = type(
+        "Scenario",
+        (),
+        {
+            "data": {
+                "expect": {"engagement": "s70-b4-worker-bounces"},
+                "workload": {"clients": ["C1"]},
+            }
+        },
+    )()
+
+    _validate_preexposure_redispatches(
+        scenario,
+        plan,
+        [
+            {
+                "action": "restart",
+                "fired_ms": 1_788_940_890_000,
+                "instance": "F1",
+            }
+        ],
+        result["preexposure_redispatches"],
+    )
 
 
 def test_collection_refuses_a_wrapper_assignment_without_scheduler_dispatch(
@@ -997,6 +1239,7 @@ def test_collection_reconciles_every_scheduler_retry_attempt(tmp_path: Path) -> 
     assert bundle["observations"]["scheduler_reconciliation"] == {
         "canary_dispatches": 1,
         "generations": 1,
+        "preexposure_redispatches": [],
         "scheduler_dispatches": 3,
         "workload_dispatches": 2,
     }
@@ -1231,6 +1474,7 @@ def test_collection_reconciles_reused_job_id_after_scheduler_restart(
     assert bundle["observations"]["scheduler_reconciliation"] == {
         "canary_dispatches": 1,
         "generations": 2,
+        "preexposure_redispatches": [],
         "scheduler_dispatches": 3,
         "workload_dispatches": 2,
     }
@@ -1553,6 +1797,23 @@ def test_fresh_p50_retry_binds_only_the_final_result_identity(
             }
         ],
     }
+    assert bundle["observations"]["successful_strict_p50_retry_bindings"] == [
+        {
+            "failure_reason": "result-stream-loss",
+            "final_dispatch_ms": 1_788_570_006_000,
+            "final_generation": 1,
+            "final_scheduler_job": 3,
+            "final_terminal_ms": 1_788_570_007_000,
+            "final_worker": "F1",
+            "first_dispatch_ms": 1_788_570_004_000,
+            "first_generation": 1,
+            "first_scheduler_job": 2,
+            "first_terminal": "completion",
+            "first_terminal_ms": 1_788_570_005_000,
+            "first_worker": "F1",
+            "job_id": "C1:A:1:3",
+        }
+    ]
     assert bundle["observations"]["compile_failure_job_ids"] == []
 
 

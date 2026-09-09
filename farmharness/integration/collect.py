@@ -125,6 +125,10 @@ SCHEDULER_NEW_RE = re.compile(r"^NEW ([0-9]+) client=([A-Za-z0-9][A-Za-z0-9._-]*
 SCHEDULER_DISPATCH_RE = re.compile(
     r"^put ([0-9]+) in joblist of ([A-Za-z0-9][A-Za-z0-9._-]*)\b"
 )
+SCHEDULER_PREEXPOSURE_REDISPATCH_RE = re.compile(
+    r"^redispatch unexposed assignment ([0-9]+) after worker loss "
+    r"([A-Za-z0-9][A-Za-z0-9._-]*)$"
+)
 SCHEDULER_BEGIN_RE = re.compile(r"^BEGIN: ([0-9]+)\b")
 SCHEDULER_END_RE = re.compile(r"^END ([0-9]+) status=(-?[0-9]+)\b")
 SCHEDULER_STOP_RE = re.compile(r"^STOP \((WAITFORCS|DAEMON|DAEMON2)\) FOR ([0-9]+)\b")
@@ -1421,6 +1425,7 @@ def _scheduler_jobs(
                     "ICECREAM scheduler",
                     "NEW ",
                     "put ",
+                    "redispatch unexposed assignment",
                     "BEGIN:",
                     "END ",
                     "STOP (",
@@ -1452,6 +1457,46 @@ def _scheduler_jobs(
                 "scheduler_job": key[1],
             }
             continue
+        matched = SCHEDULER_PREEXPOSURE_REDISPATCH_RE.fullmatch(message)
+        if matched is not None:
+            key = (generation, int(matched.group(1)))
+            job = jobs.get(key)
+            lost_worker = matched.group(2)
+            if job is None or "dispatch_ms" not in job:
+                raise CollectError(
+                    f"pre-exposure redispatch has no dispatch for {key}"
+                )
+            if (
+                "terminal_ms" in job
+                or "begin_ms" in job
+                or "_pending_preexposure_redispatch" in job
+            ):
+                raise CollectError(
+                    f"pre-exposure redispatch is not an unexposed live dispatch for {key}"
+                )
+            if job["worker"] != lost_worker:
+                raise CollectError(
+                    f"pre-exposure redispatch worker mismatch for {key}"
+                )
+            if timestamp_ms < job["dispatch_ms"]:
+                raise CollectError(
+                    f"pre-exposure redispatch timestamp precedes dispatch for {key}"
+                )
+            job["_pending_preexposure_redispatch"] = {
+                "client": job["client"],
+                "generation": generation,
+                "lost_dispatch_line": job["dispatch_line"],
+                "lost_dispatch_ms": job["dispatch_ms"],
+                "lost_worker": lost_worker,
+                "marker_line": line_number,
+                "marker_ms": timestamp_ms,
+                "scheduler_job": key[1],
+            }
+            continue
+        if "redispatch unexposed assignment" in message:
+            raise CollectError(
+                f"malformed pre-exposure redispatch record at scheduler line {line_number}"
+            )
         matched = SCHEDULER_DISPATCH_RE.match(message)
         if matched is not None:
             key = (generation, int(matched.group(1)))
@@ -1459,7 +1504,34 @@ def _scheduler_jobs(
             if job is None:
                 raise CollectError(f"scheduler dispatch has no NEW record for {key}")
             if "dispatch_ms" in job:
-                raise CollectError(f"duplicate scheduler dispatch for {key}")
+                pending = job.pop("_pending_preexposure_redispatch", None)
+                if pending is None:
+                    raise CollectError(f"duplicate scheduler dispatch for {key}")
+                replacement_worker = matched.group(2)
+                if replacement_worker == pending["lost_worker"]:
+                    raise CollectError(
+                        f"pre-exposure redispatch reused lost worker for {key}"
+                    )
+                if timestamp_ms < pending["marker_ms"]:
+                    raise CollectError(
+                        f"pre-exposure replacement precedes its marker for {key}"
+                    )
+                pending.update(
+                    {
+                        "replacement_dispatch_line": line_number,
+                        "replacement_dispatch_ms": timestamp_ms,
+                        "replacement_worker": replacement_worker,
+                    }
+                )
+                job.setdefault("preexposure_redispatches", []).append(pending)
+                job.update(
+                    {
+                        "dispatch_line": line_number,
+                        "dispatch_ms": timestamp_ms,
+                        "worker": replacement_worker,
+                    }
+                )
+                continue
             job.update(
                 {
                     "dispatch_line": line_number,
@@ -1475,6 +1547,10 @@ def _scheduler_jobs(
             job = jobs.get(key)
             if job is None or "dispatch_ms" not in job:
                 raise CollectError(f"scheduler BEGIN has no dispatch for {key}")
+            if "_pending_preexposure_redispatch" in job:
+                raise CollectError(
+                    f"pre-exposure redispatch has no replacement dispatch for {key}"
+                )
             if "begin_ms" in job:
                 raise CollectError(f"duplicate scheduler BEGIN for {key}")
             job["begin_ms"] = timestamp_ms
@@ -1485,6 +1561,10 @@ def _scheduler_jobs(
             job = jobs.get(key)
             if job is None or "dispatch_ms" not in job:
                 raise CollectError(f"scheduler END has no dispatch for {key}")
+            if "_pending_preexposure_redispatch" in job:
+                raise CollectError(
+                    f"pre-exposure redispatch has no replacement dispatch for {key}"
+                )
             if "terminal_ms" in job:
                 raise CollectError(f"duplicate scheduler terminal for {key}")
             status = int(matched.group(2))
@@ -1505,6 +1585,10 @@ def _scheduler_jobs(
                 raise CollectError(f"scheduler STOP has no NEW record for {key}")
             if "dispatch_ms" not in job:
                 continue
+            if "_pending_preexposure_redispatch" in job:
+                raise CollectError(
+                    f"pre-exposure redispatch has no replacement dispatch for {key}"
+                )
             if "terminal_ms" in job:
                 raise CollectError(f"duplicate scheduler terminal for {key}")
             reason = matched.group(1)
@@ -1522,6 +1606,15 @@ def _scheduler_jobs(
             )
     if generation == 0:
         raise CollectError("scheduler log has no startup generation")
+    pending = [
+        (job["generation"], job["scheduler_job"])
+        for job in jobs.values()
+        if "_pending_preexposure_redispatch" in job
+    ]
+    if pending:
+        raise CollectError(
+            f"pre-exposure redispatch has no replacement dispatch for {pending[0]}"
+        )
     allowed = allow_unterminated_job_ids or set()
     incomplete = [job for job in dispatches if "terminal_ms" not in job]
     # An active scheduler loss may explain exactly one dispatch.  Do not
@@ -4995,6 +5088,7 @@ def _reconcile_scheduler_dispatches(
         raise CollectError(
             f"scheduler dispatch/assignment keys differ missing={missing!r} extra={extra!r}"
         )
+    preexposure_redispatches: list[dict[str, Any]] = []
     for key in sorted(scheduler_groups):
         observed = scheduler_groups[key]
         asserted = claim_groups[key]
@@ -5015,14 +5109,132 @@ def _reconcile_scheduler_dispatches(
             strict=True,
         ):
             claim["scheduler_record"] = dispatch
+            histories = dispatch.get("preexposure_redispatches", [])
+            if not isinstance(histories, list):
+                raise CollectError(
+                    "scheduler pre-exposure redispatch history is malformed"
+                )
+            if histories and (
+                claim.get("kind") != "workload"
+                or not isinstance(claim.get("row_job_id"), str)
+                or not claim["row_job_id"]
+                or type(claim.get("attempt_index")) is not int
+                or claim["attempt_index"] < 0
+            ):
+                raise CollectError(
+                    "pre-exposure redispatch does not bind a workload assignment"
+                )
+            for history in histories:
+                if not isinstance(history, Mapping):
+                    raise CollectError(
+                        "scheduler pre-exposure redispatch history is malformed"
+                    )
+                preexposure_redispatches.append(
+                    {
+                        **history,
+                        "attempt_index": claim["attempt_index"],
+                        "row_job_id": claim["row_job_id"],
+                    }
+                )
     canary_count = sum(claim["kind"] == "canary" for claim in claims)
     workload_count = len(claims) - canary_count
     return {
         "canary_dispatches": canary_count,
         "generations": max(item["generation"] for item in dispatches),
+        "preexposure_redispatches": sorted(
+            preexposure_redispatches,
+            key=lambda item: item["marker_line"],
+        ),
         "scheduler_dispatches": len(dispatches),
         "workload_dispatches": workload_count,
     }
+
+
+def _validate_preexposure_redispatches(
+    scenario: ScenarioSpec,
+    plan: Mapping[str, Any],
+    events: list[dict[str, Any]],
+    records: Any,
+) -> None:
+    """Bind transparent scheduler redispatches to declared worker restarts."""
+
+    if not isinstance(records, list):
+        raise CollectError("pre-exposure redispatch observations are malformed")
+    if not records:
+        return
+    if (
+        scenario.data.get("expect", {}).get("engagement")
+        != "s70-b4-worker-bounces"
+    ):
+        raise CollectError(
+            "pre-exposure redispatch is outside the worker-bounce acceptance gate"
+        )
+    topology = plan.get("topology")
+    instances = topology.get("instances") if isinstance(topology, Mapping) else None
+    workers = {
+        item.get("name")
+        for item in instances
+        if isinstance(item, Mapping) and item.get("role") == "F"
+    } if isinstance(instances, list) else set()
+    clients = set(scenario.data.get("workload", {}).get("clients", []))
+    restart_events = [
+        event
+        for event in events
+        if event.get("action") == "restart"
+        and event.get("instance") in workers
+        and type(event.get("fired_ms")) is int
+    ]
+    for record in records:
+        if (
+            not isinstance(record, Mapping)
+            or record.get("lost_worker") not in workers
+            or record.get("replacement_worker") not in workers
+            or record["replacement_worker"] == record["lost_worker"]
+            or record.get("client") not in clients
+            or type(record.get("lost_dispatch_line")) is not int
+            or type(record.get("marker_line")) is not int
+            or type(record.get("replacement_dispatch_line")) is not int
+            or type(record.get("lost_dispatch_ms")) is not int
+            or type(record.get("marker_ms")) is not int
+            or type(record.get("replacement_dispatch_ms")) is not int
+            or not (
+                record["lost_dispatch_line"]
+                < record["marker_line"]
+                < record["replacement_dispatch_line"]
+            )
+            or not (
+                record["lost_dispatch_ms"]
+                <= record["marker_ms"]
+                <= record["replacement_dispatch_ms"]
+            )
+        ):
+            raise CollectError("pre-exposure redispatch observation is malformed")
+        matching_index = next(
+            (
+                index
+                for index, event in enumerate(restart_events)
+                if event["instance"] == record["lost_worker"]
+                and record["marker_ms"] <= event["fired_ms"]
+                and (
+                    index == 0
+                    or restart_events[index - 1]["fired_ms"] < record["marker_ms"]
+                )
+            ),
+            None,
+        )
+        if (
+            matching_index is None
+            or record["replacement_dispatch_ms"]
+            > restart_events[matching_index]["fired_ms"]
+            or (
+                matching_index > 0
+                and record["lost_dispatch_ms"]
+                < restart_events[matching_index - 1]["fired_ms"]
+            )
+        ):
+            raise CollectError(
+                "pre-exposure redispatch is not bound to one worker restart"
+            )
 
 
 def _assignment_preference(
@@ -5138,6 +5350,32 @@ def _assignment_preference(
     dispatch_lines = [item["scheduler_record"]["dispatch_line"] for item in workload_claims]
     if len(set(dispatch_lines)) != len(dispatch_lines):
         raise CollectError("assignment preference has duplicate dispatch lines")
+    preexposure_intervals: list[tuple[int, int, str]] = []
+    for claim in workload_claims:
+        histories = claim["scheduler_record"].get("preexposure_redispatches", [])
+        if not isinstance(histories, list):
+            raise CollectError(
+                "assignment preference has malformed pre-exposure history"
+            )
+        for history in histories:
+            if (
+                not isinstance(history, Mapping)
+                or type(history.get("lost_dispatch_line")) is not int
+                or type(history.get("marker_line")) is not int
+                or history["lost_dispatch_line"] <= 0
+                or history["marker_line"] <= history["lost_dispatch_line"]
+                or history.get("lost_worker") not in slots
+            ):
+                raise CollectError(
+                    "assignment preference has malformed pre-exposure history"
+                )
+            preexposure_intervals.append(
+                (
+                    history["lost_dispatch_line"],
+                    history["marker_line"],
+                    history["lost_worker"],
+                )
+            )
     decisions: list[dict[str, Any]] = []
     violations: list[str] = []
     for index, claim in enumerate(workload_claims):
@@ -5151,6 +5389,9 @@ def _assignment_preference(
                 and dispatch_line < prior_record["terminal_line"]
             ):
                 occupancy[prior["worker"]] += 1
+        for start_line, stop_line, worker in preexposure_intervals:
+            if start_line < dispatch_line < stop_line:
+                occupancy[worker] += 1
         compatible = compatibility[claim["client"]]
         compatible_free = [
             worker for worker in compatible if occupancy[worker] < slots[worker]
@@ -5634,6 +5875,12 @@ def _observations(
         allow_unterminated_job_ids=active_loss_jobs or None,
         allow_unterminated_generations=active_loss_generations or None,
     )
+    _validate_preexposure_redispatches(
+        scenario,
+        plan,
+        events,
+        reconciliation.get("preexposure_redispatches"),
+    )
     if active_loss_jobs:
         if len(active_loss_jobs) != 1:
             raise CollectError("active scheduler loss has multiple lost-job boundaries")
@@ -5668,6 +5915,7 @@ def _observations(
     )
     lifecycle = []
     assignment_lifecycle = []
+    successful_strict_p50_retry_bindings = []
     row_by_identity = {row["job_id"]: row for row in rows}
     for raw in raw_jobs:
         row = row_by_identity[raw["row_job_id"]]
@@ -5778,6 +6026,46 @@ def _observations(
                 "job_id": row["job_id"],
             }
         )
+        retry_failure_reason = (
+            missing_result_identities[0]["reason"]
+            if len(missing_result_identities) == 1
+            and missing_result_identities[0]["attempt_index"] == 0
+            else "worker-restart-loss"
+            if not missing_result_identities
+            and first["terminal"] == "process-loss-recovery"
+            else None
+        )
+        if (
+            raw["compile_rc"] == 0
+            and raw["exact"] == 1
+            and raw["remote"] == 1
+            and raw["local_build"] is False
+            and row["exact"] is True
+            and row["retries"] == 1
+            and row["tail_present"] is True
+            and row["tail_profile"] == "P29V1"
+            and row["session_outcome"] == "committed"
+            and len(records) == 2
+            and final["terminal"] == "completion"
+            and retry_failure_reason is not None
+        ):
+            successful_strict_p50_retry_bindings.append(
+                {
+                    "failure_reason": retry_failure_reason,
+                    "final_dispatch_ms": final["dispatch_ms"],
+                    "final_generation": final["generation"],
+                    "final_scheduler_job": final["scheduler_job"],
+                    "final_terminal_ms": final["terminal_ms"],
+                    "final_worker": final["worker"],
+                    "first_dispatch_ms": first["dispatch_ms"],
+                    "first_generation": first["generation"],
+                    "first_scheduler_job": first["scheduler_job"],
+                    "first_terminal": first["terminal"],
+                    "first_terminal_ms": first["terminal_ms"],
+                    "first_worker": first["worker"],
+                    "job_id": row["job_id"],
+                }
+            )
     source_mutex = row_facts["source_mutex"]
     if scenario.data.get("id") == "S30-mutant-f-refusal":
         refusal = row_facts.get("s30_mutant_f")
@@ -5919,6 +6207,10 @@ def _observations(
         },
         "scheduler_reconciliation": reconciliation,
         "sidecars": sidecars,
+        "successful_strict_p50_retry_bindings": sorted(
+            successful_strict_p50_retry_bindings,
+            key=lambda item: item["job_id"],
+        ),
         "turns": turn_observations,
         "warm_hint_overrides": _warm_hint_overrides(evidence, plan),
         "wire_revisions": revisions,

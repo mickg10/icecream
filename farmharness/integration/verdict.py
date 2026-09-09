@@ -903,6 +903,229 @@ def _lifecycle_final_dispatch_ms(item: Mapping[str, Any]) -> Any:
     return item.get("final_dispatch_ms", item.get("dispatch_ms"))
 
 
+def _authenticated_strict_p50_retry_ids(
+    observations: Mapping[str, Any], rows: Sequence[Mapping[str, Any]]
+) -> tuple[set[str], set[str]]:
+    """Validate successful strict-P50 retries against independent witnesses."""
+
+    field = "successful_strict_p50_retry_bindings"
+    raw = observations.get(field)
+    if not isinstance(raw, list):
+        return set(), {f"@observations:{field}"}
+    row_by_id = {
+        _job_id(row.get("job_id"), "@row"): row
+        for row in rows
+        if isinstance(row, Mapping)
+    }
+    assignment_raw = observations.get("assignment_lifecycle")
+    assignments = {
+        _job_id(item.get("job_id"), "@assignment-lifecycle"): item
+        for item in assignment_raw
+        if isinstance(item, Mapping)
+    } if isinstance(assignment_raw, list) else {}
+    lifecycle_raw = observations.get("job_lifecycle")
+    lifecycles = {
+        _job_id(item.get("job_id"), "@lifecycle"): item
+        for item in lifecycle_raw
+        if isinstance(item, Mapping)
+    } if isinstance(lifecycle_raw, list) else {}
+    failed = observations.get("failed_p50_result_identities")
+    failed_raw = failed.get("records") if isinstance(failed, Mapping) else None
+    failed_by_attempt: dict[tuple[str, int], Mapping[str, Any]] = {}
+    failed_duplicates: set[tuple[str, int]] = set()
+    invalid_failed = False
+    failed_fields = {
+        "assignment_epoch",
+        "assignment_nonce",
+        "attempt_index",
+        "reason",
+        "result_identity_present",
+        "row_job_id",
+        "scheduler_job",
+        "worker",
+    }
+    if isinstance(failed_raw, list):
+        for item in failed_raw:
+            if (
+                not isinstance(item, Mapping)
+                or set(item) != failed_fields
+                or not _is_int(item.get("assignment_epoch"), minimum=1)
+                or not _is_int(item.get("assignment_nonce"), minimum=1)
+                or not _is_int(item.get("attempt_index"))
+                or item.get("reason")
+                not in {"worker-restart-loss", "result-stream-loss"}
+                or item.get("result_identity_present") is not False
+                or not isinstance(item.get("row_job_id"), str)
+                or not item["row_job_id"]
+                or not _is_int(item.get("scheduler_job"), minimum=1)
+                or not isinstance(item.get("worker"), str)
+                or not item["worker"]
+            ):
+                invalid_failed = True
+                continue
+            attempt_index = item.get("attempt_index")
+            identity = (
+                _job_id(item.get("row_job_id"), "@failed-result-identity"),
+                attempt_index,
+            )
+            if identity in failed_by_attempt:
+                failed_duplicates.add(identity)
+                continue
+            failed_by_attempt[identity] = item
+
+    process_raw = observations.get("process_loss_recovery_bindings")
+    process_bindings: set[tuple[str, int, int, str]] = set()
+    if isinstance(process_raw, list):
+        for item in process_raw:
+            if (
+                isinstance(item, Mapping)
+                and set(item)
+                == {"attempt_index", "job_id", "scheduler_job", "worker"}
+                and _is_int(item.get("attempt_index"))
+                and _is_int(item.get("scheduler_job"), minimum=1)
+                and isinstance(item.get("worker"), str)
+                and item["worker"]
+            ):
+                process_bindings.add(
+                    (
+                        _job_id(item.get("job_id"), "@process-loss-recovery"),
+                        item["attempt_index"],
+                        item["scheduler_job"],
+                        item["worker"],
+                    )
+                )
+
+    fields = {
+        "failure_reason",
+        "final_dispatch_ms",
+        "final_generation",
+        "final_scheduler_job",
+        "final_terminal_ms",
+        "final_worker",
+        "first_dispatch_ms",
+        "first_generation",
+        "first_scheduler_job",
+        "first_terminal",
+        "first_terminal_ms",
+        "first_worker",
+        "job_id",
+    }
+    authenticated: set[str] = set()
+    bad: set[str] = set()
+    for index, binding in enumerate(raw):
+        marker = f"@observations:{field}:{index}"
+        if not isinstance(binding, Mapping) or set(binding) != fields:
+            bad.add(marker)
+            continue
+        job_id = _job_id(binding.get("job_id"), marker)
+        row = row_by_id.get(job_id)
+        assignment = assignments.get(job_id)
+        lifecycle = lifecycles.get(job_id)
+        attempts = assignment.get("attempts") if isinstance(assignment, Mapping) else None
+        missing = failed_by_attempt.get((job_id, 0))
+        reason = binding.get("failure_reason")
+        expected_first_terminals = (
+            {"process-loss-recovery"}
+            if reason == "worker-restart-loss"
+            else {"cancellation", "completion"}
+            if reason == "result-stream-loss"
+            else set()
+        )
+        first = attempts[0] if isinstance(attempts, list) and len(attempts) == 2 else None
+        final = attempts[1] if isinstance(attempts, list) and len(attempts) == 2 else None
+        missing_valid = (
+            isinstance(missing, Mapping)
+            and missing.get("attempt_index") == 0
+            and missing.get("reason") == reason
+            and missing.get("result_identity_present") is False
+            and missing.get("row_job_id") == job_id
+            and missing.get("scheduler_job") == binding.get("first_scheduler_job")
+            and missing.get("worker") == binding.get("first_worker")
+            and _is_int(missing.get("assignment_epoch"), minimum=1)
+            and _is_int(missing.get("assignment_nonce"), minimum=1)
+        )
+        process_loss_valid = (
+            reason == "worker-restart-loss"
+            and _is_int(binding.get("first_scheduler_job"), minimum=1)
+            and isinstance(binding.get("first_worker"), str)
+            and (
+                job_id,
+                0,
+                binding.get("first_scheduler_job"),
+                binding.get("first_worker"),
+            )
+            in process_bindings
+        )
+        integers = (
+            "final_dispatch_ms",
+            "final_generation",
+            "final_scheduler_job",
+            "final_terminal_ms",
+            "first_dispatch_ms",
+            "first_generation",
+            "first_scheduler_job",
+            "first_terminal_ms",
+        )
+        valid = (
+            job_id not in authenticated
+            and isinstance(row, Mapping)
+            and isinstance(first, Mapping)
+            and isinstance(final, Mapping)
+            and isinstance(lifecycle, Mapping)
+            and (job_id, 0) not in failed_duplicates
+            and (missing_valid or process_loss_valid)
+            and all(_is_int(binding.get(name), minimum=1) for name in integers)
+            and isinstance(binding.get("first_worker"), str)
+            and bool(binding["first_worker"])
+            and isinstance(binding.get("final_worker"), str)
+            and bool(binding["final_worker"])
+            and binding.get("first_terminal") in expected_first_terminals
+            and binding["first_dispatch_ms"] <= binding["first_terminal_ms"]
+            and binding["first_terminal_ms"] <= binding["final_dispatch_ms"]
+            and binding["final_dispatch_ms"] <= binding["final_terminal_ms"]
+            and row.get("retries") == 1
+            and row.get("exact") is True
+            and row.get("tail_present") is True
+            and row.get("tail_profile") == "P29V1"
+            and row.get("session_outcome") == "committed"
+            and row.get("cs") == binding.get("final_worker")
+            and first
+            == {
+                "generation": binding.get("first_generation"),
+                "scheduler_job": binding.get("first_scheduler_job"),
+                "terminal": binding.get("first_terminal"),
+                "worker": binding.get("first_worker"),
+            }
+            and final
+            == {
+                "generation": binding.get("final_generation"),
+                "scheduler_job": binding.get("final_scheduler_job"),
+                "terminal": "completion",
+                "worker": binding.get("final_worker"),
+            }
+            and lifecycle.get("first_dispatch_ms", lifecycle.get("dispatch_ms"))
+            == binding.get("first_dispatch_ms")
+            and _lifecycle_final_dispatch_ms(lifecycle)
+            == binding.get("final_dispatch_ms")
+            and lifecycle.get("terminal") == "completion"
+            and lifecycle.get("terminal_ms") == binding.get("final_terminal_ms")
+        )
+        if valid:
+            authenticated.add(job_id)
+        else:
+            bad.add(marker)
+    if invalid_failed or (
+        isinstance(failed, Mapping)
+        and (
+            failed.get("record_count") != len(failed_raw)
+            if isinstance(failed_raw, list)
+            else True
+        )
+    ):
+        bad.add("@observations:failed_p50_result_identities")
+    return authenticated, bad
+
+
 def _assignment_preference_errors(
     observation: Any,
     scenario: Mapping[str, Any],
@@ -4265,6 +4488,21 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
         )
 
     engagement_mode = expect.get("engagement")
+    strict_retry_ids, strict_retry_bad = _authenticated_strict_p50_retry_ids(
+        observations, valid_rows
+    )
+    if (
+        "successful_strict_p50_retry_bindings" in observations
+        or engagement_mode == S70_B4_WORKER_ENGAGEMENT
+    ):
+        clauses.append(
+            _clause(
+                "retry.strict-p50-bindings",
+                not strict_retry_bad,
+                "each declared successful strict-P50 retry binds its failed and final assignments",
+                strict_retry_bad,
+            )
+        )
     engagement_bad: set[str] = set()
     capability_bad: set[str] = set()
     if engagement_mode == "expected(c,f)" and profile_error is None:
@@ -4314,14 +4552,24 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
             or len(recovered_raw) != len(recovered)
         ):
             engagement_bad.add("@observations:process_loss_recovery_job_ids")
+        expected_strict_retries = {
+            _job_id(row["job_id"], "@row")
+            for row in valid_rows
+            if row["retries"] == 1
+        }
+        if strict_retry_bad or strict_retry_ids != expected_strict_retries:
+            engagement_bad.update(
+                strict_retry_bad
+                | (strict_retry_ids ^ expected_strict_retries)
+                | {"@observations:successful_strict_p50_retry_bindings"}
+            )
         for row in valid_rows:
             identifier = _job_id(row["job_id"], "@row")
-            if identifier in recovered:
+            if identifier in strict_retry_ids:
                 valid = (
-                    row["tail_present"] is False
-                    and row["tail_profile"] is None
-                    and row["session_outcome"] in {"none", "fallback"}
-                    and row["reuse"] is None
+                    row["tail_present"] is True
+                    and row["tail_profile"] == "P29V1"
+                    and row["session_outcome"] == "committed"
                     and row["retries"] == 1
                 )
             else:
@@ -4339,8 +4587,8 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
             if isinstance(error106_raw, list)
             else {"@observations:error106_job_ids"}
         )
-        if not isinstance(error106_raw, list) or not error106_ids <= recovered:
-            engagement_bad.update(error106_ids - recovered)
+        if not isinstance(error106_raw, list) or not error106_ids <= strict_retry_ids:
+            engagement_bad.update(error106_ids - strict_retry_ids)
     elif engagement_mode == S70_B4_SCHEDULER_ENGAGEMENT:
         epochs = {
             epoch: [row for row in valid_rows if row["event_epoch"] == epoch]
@@ -4916,12 +5164,189 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
                 bound_jobs.add(job_id)
             if bound_jobs != recovered:
                 b4_bad.add("@observations:process-loss-recovery-bindings")
+        strict_bindings = observations.get(
+            "successful_strict_p50_retry_bindings"
+        )
+        strict_bound_jobs: set[str] = set()
+        error106_raw = observations.get("error106_job_ids")
+        error106_ids = (
+            {_job_id(item, "@error106") for item in error106_raw}
+            if isinstance(error106_raw, list)
+            else set()
+        )
+        if not isinstance(strict_bindings, list) or strict_retry_bad:
+            b4_bad.add("@observations:successful-strict-p50-retry-bindings")
+        else:
+            for index, binding in enumerate(strict_bindings):
+                marker = f"@observations:successful-strict-p50-retry-{index}"
+                if not isinstance(binding, Mapping):
+                    b4_bad.add(marker)
+                    continue
+                job_id = _job_id(binding.get("job_id"), marker)
+                matching_restart = next(
+                    (
+                        event_index
+                        for event_index, boundary in enumerate(fired)
+                        if binding.get("first_terminal_ms", boundary + 1) <= boundary
+                        and (
+                            event_index == 0
+                            or fired[event_index - 1]
+                            < binding.get("first_terminal_ms", 0)
+                        )
+                    ),
+                    None,
+                )
+                if (
+                    job_id not in strict_retry_ids
+                    or job_id in strict_bound_jobs
+                    or binding.get("first_worker") != "F1"
+                    or binding.get("final_worker") not in other_workers
+                    or matching_restart is None
+                    or (
+                        binding.get("failure_reason") == "result-stream-loss"
+                        and job_id not in error106_ids
+                    )
+                ):
+                    b4_bad.add(marker)
+                strict_bound_jobs.add(job_id)
+            if strict_bound_jobs != strict_retry_ids:
+                b4_bad.add(
+                    "@observations:successful-strict-p50-retry-bindings"
+                )
+        reconciliation = observations.get("scheduler_reconciliation")
+        preexposure_raw = (
+            reconciliation.get("preexposure_redispatches")
+            if isinstance(reconciliation, Mapping)
+            else None
+        )
+        rows_by_id = {
+            _job_id(row.get("job_id"), "@row"): row
+            for row in valid_rows
+            if isinstance(row, Mapping)
+        }
+        lifecycle_by_id = {
+            _job_id(item.get("job_id"), "@lifecycle"): item
+            for item in lifecycle
+            if isinstance(item, Mapping)
+        } if isinstance(lifecycle, list) else {}
+        preexposure_jobs: set[str] = set()
+        seen_preexposure: set[tuple[int, int, int, str]] = set()
+        preexposure_fields = {
+            "attempt_index",
+            "client",
+            "generation",
+            "lost_dispatch_line",
+            "lost_dispatch_ms",
+            "lost_worker",
+            "marker_line",
+            "marker_ms",
+            "replacement_dispatch_line",
+            "replacement_dispatch_ms",
+            "replacement_worker",
+            "row_job_id",
+            "scheduler_job",
+        }
+        if not isinstance(preexposure_raw, list):
+            b4_bad.add("@observations:preexposure-redispatches")
+        else:
+            for index, redispatch in enumerate(preexposure_raw):
+                marker = f"@observations:preexposure-redispatch-{index}"
+                if (
+                    not isinstance(redispatch, Mapping)
+                    or set(redispatch) != preexposure_fields
+                    or not _is_int(redispatch.get("attempt_index"))
+                    or not _is_int(redispatch.get("generation"), minimum=1)
+                    or not _is_int(redispatch.get("scheduler_job"), minimum=1)
+                    or not all(
+                        _is_int(redispatch.get(field), minimum=1)
+                        for field in (
+                            "lost_dispatch_line",
+                            "lost_dispatch_ms",
+                            "marker_line",
+                            "marker_ms",
+                            "replacement_dispatch_line",
+                            "replacement_dispatch_ms",
+                        )
+                    )
+                    or redispatch.get("lost_worker") != "F1"
+                    or redispatch.get("replacement_worker") not in other_workers
+                    or not isinstance(redispatch.get("client"), str)
+                ):
+                    b4_bad.add(marker)
+                    continue
+                job_id = _job_id(redispatch.get("row_job_id"), marker)
+                row = rows_by_id.get(job_id)
+                job_lifecycle = lifecycle_by_id.get(job_id)
+                identity = (
+                    redispatch["generation"],
+                    redispatch["scheduler_job"],
+                    redispatch["marker_line"],
+                    job_id,
+                )
+                matching_restart = next(
+                    (
+                        event_index
+                        for event_index, boundary in enumerate(fired)
+                        if redispatch["marker_ms"] <= boundary
+                        and (
+                            event_index == 0
+                            or fired[event_index - 1] < redispatch["marker_ms"]
+                        )
+                    ),
+                    None,
+                )
+                lower_boundary = (
+                    fired[matching_restart - 1]
+                    if matching_restart is not None and matching_restart > 0
+                    else None
+                )
+                if (
+                    identity in seen_preexposure
+                    or job_id in preexposure_jobs
+                    or not isinstance(row, Mapping)
+                    or not isinstance(job_lifecycle, Mapping)
+                    or row.get("client_instance") != redispatch["client"]
+                    or row.get("cs") != redispatch["replacement_worker"]
+                    or row.get("retries", -1) < redispatch["attempt_index"]
+                    or row.get("exact") is not True
+                    or row.get("session_outcome") != "committed"
+                    or _lifecycle_final_dispatch_ms(job_lifecycle)
+                    != redispatch["replacement_dispatch_ms"]
+                    or not (
+                        redispatch["lost_dispatch_line"]
+                        < redispatch["marker_line"]
+                        < redispatch["replacement_dispatch_line"]
+                    )
+                    or not (
+                        redispatch["lost_dispatch_ms"]
+                        <= redispatch["marker_ms"]
+                        <= redispatch["replacement_dispatch_ms"]
+                    )
+                    or matching_restart is None
+                    or redispatch["replacement_dispatch_ms"]
+                    > fired[matching_restart]
+                    or (
+                        lower_boundary is not None
+                        and redispatch["lost_dispatch_ms"] < lower_boundary
+                    )
+                ):
+                    b4_bad.add(marker)
+                seen_preexposure.add(identity)
+                preexposure_jobs.add(job_id)
         epoch_rows: dict[int, list[Mapping[str, Any]]] = defaultdict(list)
-        ordered_target: dict[int, list[tuple[int, Mapping[str, Any]]]] = defaultdict(list)
+        ordered_target: dict[
+            int, list[tuple[int, int, Mapping[str, Any]]]
+        ] = defaultdict(list)
         if len(fired) == 3:
             for row in valid_rows:
                 identifier = _job_id(row["job_id"], "@row")
                 dispatch_ms = dispatch_by_job.get(identifier)
+                job_lifecycle = lifecycle_by_id.get(identifier)
+                dispatch_line = (
+                    job_lifecycle.get("scheduler_dispatch_line")
+                    if isinstance(job_lifecycle, Mapping)
+                    else None
+                )
                 epoch = row["event_epoch"]
                 expected_epoch = (
                     sum(boundary <= dispatch_ms for boundary in fired)
@@ -4933,7 +5358,12 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
                     continue
                 epoch_rows[epoch].append(row)
                 if row["cs"] == "F1" and row["session_outcome"] == "committed":
-                    ordered_target[epoch].append((dispatch_ms, row))
+                    if not _is_int(dispatch_line, minimum=1):
+                        b4_bad.add(identifier)
+                    else:
+                        ordered_target[epoch].append(
+                            (dispatch_ms, dispatch_line, row)
+                        )
 
         for epoch in range(4):
             if not epoch_rows[epoch]:
@@ -4948,37 +5378,38 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
                 ):
                     b4_bad.add(f"@worker:{worker}:epoch-{epoch}")
 
-        target_history: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
-        for row in epoch_rows[0]:
-            if row["cs"] == "F1" and row["session_outcome"] == "committed":
-                target_history[str(row["tu"])].append(row)
-        warm_route = any(
-            len(rows) >= 2
-            and min(row["c_to_f_bytes"] for row in rows)
-            < max(row["c_to_f_bytes"] for row in rows)
-            for rows in target_history.values()
-        )
-        if not warm_route:
-            b4_bad.add("@rows:s70-b4-worker-warm-precondition")
+        target_history: dict[
+            str, list[tuple[int, int, Mapping[str, Any]]]
+        ] = defaultdict(list)
+        for epoch in range(4):
+            for dispatch_ms, dispatch_line, row in ordered_target[epoch]:
+                target_history[str(row["tu"])].append(
+                    (dispatch_ms, dispatch_line, row)
+                )
         for epoch in (1, 2, 3):
             candidates = ordered_target[epoch]
             if not candidates:
                 b4_bad.add(f"@worker:F1:epoch-{epoch}")
                 continue
-            first = min(candidates, key=lambda item: item[0])[1]
-            references = target_history.get(str(first["tu"]), [])
-            cold_bytes = max(
-                (
-                    (row["c_to_f_bytes"], row["f_to_c_bytes"])
-                    for row in references
-                ),
-                default=None,
+            first_dispatch_ms, first_dispatch_line, first = min(
+                candidates, key=lambda item: (item[0], item[1])
             )
-            if cold_bytes != (first["c_to_f_bytes"], first["f_to_c_bytes"]):
+            references = target_history.get(str(first["tu"]), [])
+            cold_bytes = (
+                max(row["c_to_f_bytes"] for _ms, _line, row in references),
+                max(row["f_to_c_bytes"] for _ms, _line, row in references),
+            )
+            later_warm = any(
+                (dispatch_ms, dispatch_line)
+                > (first_dispatch_ms, first_dispatch_line)
+                and row["c_to_f_bytes"] < first["c_to_f_bytes"]
+                for dispatch_ms, dispatch_line, row in references
+            )
+            if (
+                cold_bytes != (first["c_to_f_bytes"], first["f_to_c_bytes"])
+                or not later_warm
+            ):
                 b4_bad.add(_job_id(first["job_id"], "@row"))
-            for row in epoch_rows[epoch]:
-                if row["cs"] == "F1" and row["session_outcome"] == "committed":
-                    target_history[str(row["tu"])].append(row)
         clauses.append(
             _clause(
                 "s70.b4-worker-bounces",
@@ -6034,7 +6465,10 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(error106, list)
         else {"@observations:error106_job_ids"}
     )
-    unrecovered_error106_ids = error106_ids - recovered_ids
+    authenticated_recovery_ids = recovered_ids | (
+        strict_retry_ids if not strict_retry_bad else set()
+    )
+    unrecovered_error106_ids = error106_ids - authenticated_recovery_ids
     error106_max = expect.get("error106_max")
     error106_ok = (
         isinstance(error106, list)

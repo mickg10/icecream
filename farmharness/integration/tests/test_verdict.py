@@ -777,6 +777,7 @@ def _observations(
         "cell_wall_ms": 100,
         "compile_failure_job_ids": [],
         "error106_job_ids": [],
+        "failed_p50_result_identities": {"record_count": 0, "records": []},
         "incomplete_turns": [],
         "job_lifecycle": [
             {
@@ -829,6 +830,7 @@ def _observations(
             for worker in workers
         }
         | {client: {"sessions": 0} for client in clients},
+        "successful_strict_p50_retry_bindings": [],
         "wire_revisions": revisions
         if revisions is not None
         else {
@@ -1718,7 +1720,7 @@ def test_s70_b4_client_route_restart_makes_next_tu_cold() -> None:
     "mutation",
     (
         "next_tu_warm",
-        "no_warm_precondition",
+        "no_later_warm_witness",
         "same_route_owner",
         "changed_daemon",
         "dispatch_out_of_epoch",
@@ -1857,6 +1859,27 @@ def _s70_b4_worker_bundle() -> dict[str, object]:
         lifecycle["dispatch_ms"] = dispatch_ms
         lifecycle["terminal_ms"] = dispatch_ms + 25
         lifecycle["deadline_ms"] = dispatch_ms + 120_000
+        lifecycle["scheduler_dispatch_line"] = job
+        lifecycle["scheduler_generation"] = 1
+    observations["scheduler_reconciliation"] = {
+        "preexposure_redispatches": [
+            {
+                "attempt_index": 0,
+                "client": "C1",
+                "generation": 1,
+                "lost_dispatch_line": 98,
+                "lost_dispatch_ms": 9_800,
+                "lost_worker": "F1",
+                "marker_line": 99,
+                "marker_ms": 9_900,
+                "replacement_dispatch_line": 100,
+                "replacement_dispatch_ms": 9_900,
+                "replacement_worker": "F2",
+                "row_job_id": rows[99]["job_id"],
+                "scheduler_job": 1_000,
+            }
+        ]
+    }
     bundle = _bundle(scenario, rows, observations)
     bundle["event_log"] = [
         _worker_restart_event(
@@ -1887,16 +1910,85 @@ def test_s70_b4_worker_bounces_are_cold_while_other_worker_continues() -> None:
     assert verdict["status"] == "PASS", verdict
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "wrong-lost-worker",
+        "same-worker",
+        "unbound-row",
+        "wrong-final-worker",
+        "outside-restart-window",
+        "nonmonotonic-lines",
+        "duplicate-row",
+    ),
+)
+def test_s70_b4_worker_preexposure_redispatch_fails_closed(mutation: str) -> None:
+    fixture = _s70_b4_worker_bundle()
+    records = fixture["observations"]["scheduler_reconciliation"][
+        "preexposure_redispatches"
+    ]
+    record = records[0]
+    if mutation == "wrong-lost-worker":
+        record["lost_worker"] = "F2"
+    elif mutation == "same-worker":
+        record["replacement_worker"] = "F1"
+    elif mutation == "unbound-row":
+        record["row_job_id"] = "missing"
+    elif mutation == "wrong-final-worker":
+        record["replacement_worker"] = "F9"
+    elif mutation == "outside-restart-window":
+        record["marker_ms"] = 30_001
+        record["replacement_dispatch_ms"] = 30_001
+    elif mutation == "nonmonotonic-lines":
+        record["marker_line"] = record["replacement_dispatch_line"]
+    else:
+        records.append(copy.deepcopy(record))
+
+    verdict = evaluate_bundle(fixture)
+    assert verdict["status"] == "FAIL"
+    failed = {item["id"] for item in verdict["clauses"] if item["status"] == "FAIL"}
+    assert "s70.b4-worker-bounces" in failed
+
+
+def test_s70_b4_worker_does_not_require_a_nondeterministic_preexposure_race() -> None:
+    fixture = _s70_b4_worker_bundle()
+    fixture["observations"]["scheduler_reconciliation"][
+        "preexposure_redispatches"
+    ] = []
+    verdict = evaluate_bundle(fixture)
+    assert verdict["status"] == "PASS", verdict
+
+
+def test_s70_b4_worker_uses_scheduler_line_to_order_same_second_dispatches() -> None:
+    fixture = _s70_b4_worker_bundle()
+    lifecycle = fixture["observations"]["job_lifecycle"]
+    # Jobs 101 and 103 are both F1 rows in epoch 1.  Scheduler timestamps are
+    # only second-granular, so the dispatch line is the authoritative tie-break.
+    lifecycle[102]["dispatch_ms"] = lifecycle[100]["dispatch_ms"]
+    lifecycle[102]["terminal_ms"] = lifecycle[100]["terminal_ms"]
+    lifecycle[102]["deadline_ms"] = lifecycle[100]["deadline_ms"]
+    fixture["rows"][102]["c_to_f_bytes"] = 103
+    fixture["rows"][152]["c_to_f_bytes"] = 50
+
+    assert evaluate_bundle(fixture)["status"] == "PASS"
+
+    lifecycle[102]["scheduler_dispatch_line"] = 100
+    verdict = evaluate_bundle(fixture)
+    assert verdict["status"] == "FAIL"
+    failed = {item["id"] for item in verdict["clauses"] if item["status"] == "FAIL"}
+    assert "s70.b4-worker-bounces" in failed
+
+
 def _s70_b4_worker_recovery_bundle() -> dict[str, object]:
     fixture = _s70_b4_worker_bundle()
     row = fixture["rows"][100]
     row.update(
         cs="F2",
         retries=1,
-        reuse=None,
-        session_outcome="none",
-        tail_present=False,
-        tail_profile=None,
+        reuse=False,
+        session_outcome="committed",
+        tail_present=True,
+        tail_profile="P29V1",
     )
     lifecycle = fixture["observations"]["job_lifecycle"][100]
     lifecycle.update(
@@ -1906,6 +1998,20 @@ def _s70_b4_worker_recovery_bundle() -> dict[str, object]:
         terminal_ms=10_075,
         deadline_ms=129_900,
     )
+    fixture["observations"]["assignment_lifecycle"][100]["attempts"] = [
+        {
+            "generation": 1,
+            "scheduler_job": 701,
+            "terminal": "process-loss-recovery",
+            "worker": "F1",
+        },
+        {
+            "generation": 1,
+            "scheduler_job": 702,
+            "terminal": "completion",
+            "worker": "F2",
+        },
+    ]
     fixture["event_log"][0]["receipt"]["coordination"]["scheduler_rejoin"][
         "loss_job_ids"
     ] = [701]
@@ -1918,6 +2024,38 @@ def _s70_b4_worker_recovery_bundle() -> dict[str, object]:
             "worker": "F1",
         }
     ]
+    fixture["observations"]["failed_p50_result_identities"] = {
+        "record_count": 1,
+        "records": [
+            {
+                "assignment_epoch": 1,
+                "assignment_nonce": 1,
+                "attempt_index": 0,
+                "reason": "worker-restart-loss",
+                "result_identity_present": False,
+                "row_job_id": row["job_id"],
+                "scheduler_job": 701,
+                "worker": "F1",
+            }
+        ],
+    }
+    fixture["observations"]["successful_strict_p50_retry_bindings"] = [
+        {
+            "failure_reason": "worker-restart-loss",
+            "final_dispatch_ms": 10_050,
+            "final_generation": 1,
+            "final_scheduler_job": 702,
+            "final_terminal_ms": 10_075,
+            "final_worker": "F2",
+            "first_dispatch_ms": 9_900,
+            "first_generation": 1,
+            "first_scheduler_job": 701,
+            "first_terminal": "process-loss-recovery",
+            "first_terminal_ms": 10_000,
+            "first_worker": "F1",
+            "job_id": row["job_id"],
+        }
+    ]
     return fixture
 
 
@@ -1925,6 +2063,75 @@ def test_s70_b4_worker_recovery_uses_final_dispatch_epoch_and_loss_receipt() -> 
     fixture = _s70_b4_worker_recovery_bundle()
     verdict = evaluate_bundle(fixture)
     assert verdict["status"] == "PASS", verdict
+
+
+def _s70_b4_worker_result_stream_recovery_bundle() -> dict[str, object]:
+    fixture = _s70_b4_worker_recovery_bundle()
+    row = fixture["rows"][100]
+    fixture["event_log"][0]["receipt"]["coordination"]["scheduler_rejoin"][
+        "loss_job_ids"
+    ] = []
+    fixture["observations"]["process_loss_recovery_job_ids"] = []
+    fixture["observations"]["process_loss_recovery_bindings"] = []
+    fixture["observations"]["error106_job_ids"] = [row["job_id"]]
+    fixture["observations"]["assignment_lifecycle"][100]["attempts"][0][
+        "terminal"
+    ] = "cancellation"
+    fixture["observations"]["failed_p50_result_identities"]["records"][0][
+        "reason"
+    ] = "result-stream-loss"
+    binding = fixture["observations"][
+        "successful_strict_p50_retry_bindings"
+    ][0]
+    binding["failure_reason"] = "result-stream-loss"
+    binding["first_terminal"] = "cancellation"
+    return fixture
+
+
+def test_s70_b4_result_stream_error106_is_recovered_by_exact_strict_retry() -> None:
+    fixture = _s70_b4_worker_result_stream_recovery_bundle()
+    verdict = evaluate_bundle(fixture)
+    assert verdict["status"] == "PASS", verdict
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing-binding",
+        "wrong-final-job",
+        "wrong-final-worker",
+        "missing-failed-identity",
+        "outside-restart-window",
+    ),
+)
+def test_s70_b4_strict_retry_binding_fails_closed(mutation: str) -> None:
+    fixture = _s70_b4_worker_result_stream_recovery_bundle()
+    bindings = fixture["observations"][
+        "successful_strict_p50_retry_bindings"
+    ]
+    if mutation == "missing-binding":
+        bindings.clear()
+    elif mutation == "wrong-final-job":
+        bindings[0]["final_scheduler_job"] += 1
+    elif mutation == "wrong-final-worker":
+        bindings[0]["final_worker"] = "F1"
+    elif mutation == "missing-failed-identity":
+        fixture["observations"]["failed_p50_result_identities"] = {
+            "record_count": 0,
+            "records": [],
+        }
+    else:
+        bindings[0]["first_terminal_ms"] = 30_001
+
+    verdict = evaluate_bundle(fixture)
+    assert verdict["status"] == "FAIL"
+    failed = {item["id"] for item in verdict["clauses"] if item["status"] == "FAIL"}
+    assert failed & {
+        "engagement.expected",
+        "error106.max",
+        "retry.strict-p50-bindings",
+        "s70.b4-worker-bounces",
+    }
 
 
 @pytest.mark.parametrize(
@@ -1999,9 +2206,9 @@ def test_s70_b4_worker_bounce_evidence_fails_closed(mutation: str) -> None:
             if row["event_epoch"] == 1 and row["cs"] == "F1"
         )
         first["c_to_f_bytes"] = 101
-    elif mutation == "no_warm_precondition":
+    elif mutation == "no_later_warm_witness":
         for row in fixture["rows"]:
-            if row["event_epoch"] == 0 and row["cs"] == "F1":
+            if row["event_epoch"] > 0 and row["cs"] == "F1":
                 tu_index = int(
                     str(row["tu"]).removesuffix(".ii").rsplit("-", 1)[1]
                 )
