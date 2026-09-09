@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import http.server
 import json
+import os
+import signal
 import subprocess
 import sys
 import threading
@@ -24,6 +26,7 @@ from farmharness.integration.events import (
     ACTIVE_COMPILER_ASSIGNMENT_SCRIPT,
     ACTIVE_COMPILER_COMMAND_GRACE_S,
     ACTIVE_COMPILER_OBSERVE_S,
+    ACTIVE_COMPILER_RELEASE_SCRIPT,
     CACHE_DISK_FAULT_BYTES,
     CACHE_DISK_FAULT_FILE,
     CACHE_DISK_FAULT_PATH,
@@ -395,6 +398,10 @@ def test_active_scheduler_loss_scripts_are_exact_identity_bound() -> None:
     assert '/ "fd"' not in ACTIVE_COMPILER_STOP_SCRIPT
     assert "os.readlink" not in ACTIVE_COMPILER_STOP_SCRIPT
     assert "listeners != [(socket_inode, socket_uid)]" in ACTIVE_COMPILER_ASSIGNMENT_SCRIPT
+    assert 'row.get("status") != "waitforchild"' in ACTIVE_COMPILER_ASSIGNMENT_SCRIPT
+    assert '"icefarm-compiler-assignment-v2"' in ACTIVE_COMPILER_ASSIGNMENT_SCRIPT
+    assert "os.killpg(expected[\"pgid\"], signal.SIGCONT)" in ACTIVE_COMPILER_RELEASE_SCRIPT
+    assert '"icefarm-compiler-group-release-v1"' in ACTIVE_COMPILER_RELEASE_SCRIPT
     assert ACTIVE_COMPILER_OBSERVE_S == 240
     assert ACTIVE_COMPILER_COMMAND_GRACE_S == 30
     source = (INTEGRATION / "events.py").read_text(encoding="utf-8")
@@ -450,11 +457,11 @@ def test_direct_compiler_selector_models_real_group_leader_and_rejects_invalid_s
     assert len(select_direct_compiler_pairs(items + [second])) == 2
 
 
-def test_assignment_script_executes_multi_child_http_join() -> None:
+def test_assignment_script_selects_active_child_below_newer_queued_job() -> None:
     from farmharness.integration.events import ACTIVE_COMPILER_ASSIGNMENT_SCRIPT
     payloads = {
         "/api/internals": "Child: pid=41 pgid=41 kind=0 gen=7 client=9 state=1\nChild: pid=42 pgid=42 kind=1 gen=7 client=10 state=1\n",
-        "/api/clients": json.dumps({"type": "iceccd_clients", "ts": 1, "mono_msec": 1, "total": 1, "clients": [{"client_id": 9, "status": "WAITFORCHILD", "age_msec": 1, "why": "", "local_job": False, "local_job_kind": "", "local_reason": "", "cmdline": "", "scheduler_job_id": 12, "last_waitforcs_msec": 0, "env_bytes_received": 0, "job": {"job_id": 12, "target": "", "env": ""}, "usecs": None, "outfile": "", "channel": ""}]})
+        "/api/clients": json.dumps({"type": "iceccd_clients", "ts": 1, "mono_msec": 1, "total": 2, "clients": [{"client_id": 9, "status": "waitforchild", "age_msec": 1, "why": "", "local_job": False, "local_job_kind": "", "local_reason": "", "cmdline": "", "scheduler_job_id": 12, "last_waitforcs_msec": 0, "env_bytes_received": 0, "job": {"job_id": 12, "target": "", "env": ""}, "usecs": None, "outfile": "", "channel": ""}, {"client_id": 10, "status": "tocompile", "age_msec": 1, "why": "", "local_job": False, "local_job_kind": "", "local_reason": "", "cmdline": "", "scheduler_job_id": 13, "last_waitforcs_msec": 0, "env_bytes_received": 0, "job": {"job_id": 13, "target": "", "env": ""}, "usecs": None, "outfile": "", "channel": ""}]})
     }
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
@@ -482,12 +489,15 @@ def test_assignment_script_executes_multi_child_http_join() -> None:
         socket_uid = listener_rows[0][7]
         argv = [
             "python3", "-c", ACTIVE_COMPILER_ASSIGNMENT_SCRIPT,
-            "41", "41", "7", "12", str(port), socket_inode, socket_uid,
+            "41", "41", str(port), socket_inode, socket_uid,
         ]
         result = subprocess.run(argv, capture_output=True, text=True, timeout=5)
         assert result.returncode == 0, result.stderr
         document = json.loads(result.stdout)
+        assert document["schema"] == "icefarm-compiler-assignment-v2"
+        assert document["child"]["generation"] == 7
         assert document["client"]["client_id"] == 9
+        assert document["client"]["scheduler_job_id"] == 12
         assert document["listener"] == {
             "binding_evidence": "container-env+netns-listener-uid+http-child",
             "host": "127.0.0.1",
@@ -502,6 +512,13 @@ def test_assignment_script_executes_multi_child_http_join() -> None:
             timeout=5,
         )
         assert bad_inode.returncode != 0
+        uppercase = json.loads(payloads["/api/clients"])
+        uppercase["clients"][0]["status"] = "WAITFORCHILD"
+        payloads["/api/clients"] = json.dumps(uppercase)
+        bad_status = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+        assert bad_status.returncode != 0
+        uppercase["clients"][0]["status"] = "waitforchild"
+        payloads["/api/clients"] = json.dumps(uppercase)
         payloads["/api/internals"] += "Child: pid=41 pgid=41 kind=0 gen=7 client=11 state=1\n"
         bad = subprocess.run(argv, capture_output=True, text=True, timeout=5)
         assert bad.returncode != 0
@@ -509,6 +526,78 @@ def test_assignment_script_executes_multi_child_http_join() -> None:
         server.shutdown()
         thread.join(timeout=5)
         server.server_close()
+
+
+def test_release_script_resumes_only_the_exact_stopped_group() -> None:
+    def snapshot(pid: int) -> dict[str, object]:
+        root = Path("/proc") / str(pid)
+        fields = (root / "stat").read_text(encoding="ascii").rsplit(") ", 1)[1].split()
+        argv = [
+            value.decode("utf-8", "surrogateescape")
+            for value in (root / "cmdline").read_bytes().split(b"\0")
+            if value
+        ]
+        uid_line = next(
+            line
+            for line in (root / "status").read_text(encoding="ascii").splitlines()
+            if line.startswith("Uid:")
+        )
+        return {
+            "argv": argv,
+            "comm": (root / "comm").read_text(encoding="utf-8").rstrip("\n"),
+            "exe": argv[0],
+            "exe_evidence": "proc-cmdline+comm",
+            "pgid": int(fields[2]),
+            "pid": pid,
+            "ppid": int(fields[1]),
+            "start_ticks": int(fields[19]),
+            "state": fields[0],
+            "uids": [int(value) for value in uid_line.split()[1:]],
+        }
+
+    process = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        os.killpg(process.pid, signal.SIGSTOP)
+        deadline = time.monotonic() + 2
+        expected = snapshot(process.pid)
+        while expected["state"] not in {"T", "t"} and time.monotonic() < deadline:
+            time.sleep(0.01)
+            expected = snapshot(process.pid)
+        assert expected["state"] in {"T", "t"}
+
+        tampered = expected | {"start_ticks": int(expected["start_ticks"]) + 1}
+        refused = subprocess.run(
+            ["python3", "-c", ACTIVE_COMPILER_RELEASE_SCRIPT, json.dumps(tampered)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        assert refused.returncode != 0
+        assert snapshot(process.pid)["state"] in {"T", "t"}
+
+        released = subprocess.run(
+            ["python3", "-c", ACTIVE_COMPILER_RELEASE_SCRIPT, json.dumps(expected)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        assert released.returncode == 0, released.stderr
+        receipt = json.loads(released.stdout)
+        assert receipt["schema"] == "icefarm-compiler-group-release-v1"
+        assert receipt["signal"] == "CONT"
+        assert receipt["before"] == expected
+        assert receipt["after"]["state"] not in {"T", "t", "Z", "X"}
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGCONT)
+        except ProcessLookupError:
+            pass
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
     assert "same_identity(stopped, before)" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "stop_deadline = time.monotonic() + 2" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "os.killpg(before[\"pgid\"], signal.SIGSTOP)" in ACTIVE_COMPILER_STOP_SCRIPT
@@ -778,6 +867,58 @@ def test_active_scheduler_loss_v3_collector_recomputes_bound_evidence(
         preflight=preflight,
         evidence=tmp_path,
     )
+
+    current = json.loads(json.dumps(receipt))
+    current["schema"] = "icefarm-scheduler-active-loss-v4"
+    current["selection_last_dispatched_job"] = 5
+    current["compiler"]["assignment"]["schema"] = (
+        "icefarm-compiler-assignment-v2"
+    )
+    current_event = json.loads(json.dumps(event))
+    current_event["last_dispatched_job"] = 5
+    _validate_scheduler_active_loss_receipt(
+        current,
+        current_event,
+        scenario,
+        0,
+        farm=farm,
+        plan=plan,
+        preflight=preflight,
+        evidence=tmp_path,
+    )
+    for field, value in (
+        ("lost_scheduler_job", 6),
+        ("selection_last_dispatched_job", 4),
+    ):
+        tampered_current = json.loads(json.dumps(current))
+        tampered_current[field] = value
+        with pytest.raises(CollectError, match="lost scheduler job boundary"):
+            _validate_scheduler_active_loss_receipt(
+                tampered_current,
+                current_event,
+                scenario,
+                0,
+                farm=farm,
+                plan=plan,
+                preflight=preflight,
+                evidence=tmp_path,
+            )
+
+    tampered_current = json.loads(json.dumps(current))
+    tampered_current["compiler"]["assignment"]["client"][
+        "scheduler_job_id"
+    ] = 3
+    with pytest.raises(CollectError, match="stopped compiler-group identity"):
+        _validate_scheduler_active_loss_receipt(
+            tampered_current,
+            current_event,
+            scenario,
+            0,
+            farm=farm,
+            plan=plan,
+            preflight=preflight,
+            evidence=tmp_path,
+        )
 
     replay_v2 = json.loads(json.dumps(receipt))
     replay_v2["schema"] = "icefarm-scheduler-active-loss-v2"

@@ -176,7 +176,7 @@ print(json.dumps({
 '''.strip()
 GATE_SCHEMA = "icefarm-event-gate-v1"
 SCHEDULER_RESTART_SCHEMA = "icefarm-scheduler-restart-v1"
-SCHEDULER_ACTIVE_LOSS_SCHEMA = "icefarm-scheduler-active-loss-v3"
+SCHEDULER_ACTIVE_LOSS_SCHEMA = "icefarm-scheduler-active-loss-v4"
 LISTENER_BINDING_EVIDENCE = "container-env+netns-listener-uid+http-child"
 CLIENT_ROUTE_RESTART_SCHEMA = "icefarm-client-route-restart-v1"
 WORKER_RESTART_SCHEMA = "icefarm-worker-restart-v1"
@@ -310,40 +310,65 @@ while time.monotonic() < deadline:
         continue
     listener = listener_probe(web_port, before_daemon)
     os.killpg(before["pgid"], signal.SIGSTOP)
-    stopped_daemon = None
-    stopped = None
-    stop_deadline = time.monotonic() + 2
-    while time.monotonic() < stop_deadline:
-        stopped_daemon = snap(before_daemon["pid"])
-        stopped = snap(before["pid"])
-        if (same_identity(stopped_daemon, before_daemon)
-                and same_identity(stopped, before)
-                and stopped["state"] in {"T", "t"}):
-            break
-        time.sleep(0.02)
-    if (stopped_daemon is None or stopped is None
-            or not same_identity(stopped_daemon, before_daemon)
-            or not same_identity(stopped, before)
-            or stopped["state"] not in {"T", "t"}):
-        raise SystemExit("compiler group did not stop with its authenticated identity")
-    print(json.dumps({"daemon": before_daemon, "leader": before, "listener": listener,
-                      "schema": "icefarm-compiler-group-stop-v1", "stopped": stopped,
-                      "stopped_ms": time.time_ns() // 1000000}, sort_keys=True, separators=(",", ":")))
+    stopped_owned = True
+    try:
+        stopped_daemon = None
+        stopped = None
+        stop_deadline = time.monotonic() + 2
+        while time.monotonic() < stop_deadline:
+            stopped_daemon = snap(before_daemon["pid"])
+            stopped = snap(before["pid"])
+            if (same_identity(stopped_daemon, before_daemon)
+                    and same_identity(stopped, before)
+                    and stopped["state"] in {"T", "t"}):
+                break
+            time.sleep(0.02)
+        if (stopped_daemon is None or stopped is None
+                or not same_identity(stopped_daemon, before_daemon)
+                or not same_identity(stopped, before)
+                or stopped["state"] not in {"T", "t"}):
+            raise SystemExit("compiler group did not stop with its authenticated identity")
+        print(json.dumps({"daemon": before_daemon, "leader": before, "listener": listener,
+                          "schema": "icefarm-compiler-group-stop-v1", "stopped": stopped,
+                          "stopped_ms": time.time_ns() // 1000000}, sort_keys=True, separators=(",", ":")),
+              flush=True)
+        stopped_owned = False
+    except BaseException as stop_exc:
+        try:
+            current = snap(before["pid"])
+            if not same_identity(current, before) or current["state"] not in {"T", "t"}:
+                raise RuntimeError("compiler identity changed before fail-safe release")
+            os.killpg(before["pgid"], signal.SIGCONT)
+            release_deadline = time.monotonic() + 2
+            while time.monotonic() < release_deadline:
+                current = snap(before["pid"])
+                if same_identity(current, before) and current["state"] not in {"T", "t"}:
+                    stopped_owned = False
+                    break
+                time.sleep(0.02)
+            if stopped_owned:
+                raise RuntimeError("compiler group did not resume after fail-safe release")
+        except BaseException as release_exc:
+            raise SystemExit(
+                f"{stop_exc}; compiler group fail-safe release failed: {release_exc}"
+            ) from release_exc
+        raise
     raise SystemExit(0)
 raise SystemExit("no unique direct compiler group leader became observable within bound")
 '''.strip()
 
 ACTIVE_COMPILER_ASSIGNMENT_SCRIPT = r'''
 import json, pathlib, re, sys, urllib.request
-pid, pgid, generation, scheduler_job, port, socket_inode, socket_uid = map(int, sys.argv[1:])
+pid, pgid, port, socket_inode, socket_uid = map(int, sys.argv[1:])
 def get(path):
     with urllib.request.urlopen("http://127.0.0.1:%d%s" % (port, path), timeout=5) as response:
         return response.read().decode("utf-8")
 internals = get("/api/internals")
 matches = [tuple(map(int, item)) for item in re.findall(r"Child: pid=(\d+) pgid=(\d+) kind=(\d+) gen=(\d+) client=(\d+) ", internals)]
 matches = [item for item in matches if item[:2] == (pid, pgid)]
-if len(matches) != 1 or matches[0][2] != 0 or matches[0][3] != generation:
+if len(matches) != 1 or matches[0][2] != 0 or matches[0][3] <= 0:
     raise SystemExit("stopped compiler has no exact Child generation/identity witness")
+generation = matches[0][3]
 client_id = matches[0][4]
 document = json.loads(get("/api/clients"))
 if not isinstance(document, dict) or set(document) != {"type", "ts", "mono_msec", "total", "clients"} or document.get("type") != "iceccd_clients" or not isinstance(document.get("ts"), int) or not isinstance(document.get("mono_msec"), int) or not isinstance(document.get("total"), int) or not isinstance(document.get("clients"), list) or document["total"] != len(document["clients"]):
@@ -353,10 +378,10 @@ rows = [row for row in clients if isinstance(row, dict) and row.get("client_id")
 if len(rows) != 1:
     raise SystemExit("Child owning client is absent or ambiguous")
 row = rows[0]
-if row.get("status") != "WAITFORCHILD" or not isinstance(row.get("client_id"), int) or row["client_id"] <= 0 or not isinstance(row.get("scheduler_job_id"), int) or row["scheduler_job_id"] <= 0 or set(row.get("job", {})) != {"job_id", "target", "env"}:
+if row.get("status") != "waitforchild" or not isinstance(row.get("client_id"), int) or row["client_id"] <= 0 or not isinstance(row.get("scheduler_job_id"), int) or row["scheduler_job_id"] <= 0 or set(row.get("job", {})) != {"job_id", "target", "env"}:
     raise SystemExit("malformed client assignment")
 job = row.get("job")
-if row.get("scheduler_job_id") != scheduler_job or not isinstance(job, dict) or job.get("job_id") != scheduler_job:
+if not isinstance(job, dict) or job.get("job_id") != row.get("scheduler_job_id"):
     raise SystemExit("Child owning client does not bind exact scheduler job")
 wanted = "0100007F:" + format(port, "04X")
 listeners = []
@@ -369,7 +394,56 @@ for line in pathlib.Path("/proc/net/tcp").read_text(encoding="ascii").splitlines
             raise SystemExit("web listener has malformed kernel identity")
 if listeners != [(socket_inode, socket_uid)]:
     raise SystemExit("compiler assignment did not use the authenticated listener")
-print(json.dumps({"schema": "icefarm-compiler-assignment-v1", "child": {"kind": 0, "pid": pid, "pgid": pgid, "generation": generation, "owning_client_id": client_id}, "client": {"client_id": client_id, "scheduler_job_id": row["scheduler_job_id"], "job_id": job["job_id"]}, "listener": {"binding_evidence": "container-env+netns-listener-uid+http-child", "host": "127.0.0.1", "port": port, "socket_inode": str(socket_inode), "socket_uid": socket_uid}}, sort_keys=True, separators=(",", ":")))
+print(json.dumps({"schema": "icefarm-compiler-assignment-v2", "child": {"kind": 0, "pid": pid, "pgid": pgid, "generation": generation, "owning_client_id": client_id}, "client": {"client_id": client_id, "scheduler_job_id": row["scheduler_job_id"], "job_id": job["job_id"]}, "listener": {"binding_evidence": "container-env+netns-listener-uid+http-child", "host": "127.0.0.1", "port": port, "socket_inode": str(socket_inode), "socket_uid": socket_uid}}, sort_keys=True, separators=(",", ":")))
+'''.strip()
+
+ACTIVE_COMPILER_RELEASE_SCRIPT = r'''
+import json, os, pathlib, signal, sys, time
+
+PROCESS_FIELDS = {"argv", "comm", "exe", "exe_evidence", "pgid", "pid", "ppid", "start_ticks", "state", "uids"}
+IDENTITY_FIELDS = PROCESS_FIELDS - {"state"}
+
+def snap(pid):
+    root = pathlib.Path("/proc") / str(pid)
+    raw = (root / "stat").read_text(encoding="ascii")
+    fields = raw.rsplit(") ", 1)[1].split()
+    argv = [v.decode("utf-8", "surrogateescape") for v in (root / "cmdline").read_bytes().split(b"\0") if v]
+    comm = (root / "comm").read_text(encoding="utf-8").rstrip("\n")
+    uid_line = next(line for line in (root / "status").read_text(encoding="ascii").splitlines()
+                    if line.startswith("Uid:"))
+    uids = [int(value) for value in uid_line.split()[1:]]
+    if not argv or len(uids) != 4:
+        raise ValueError("process has no stable cmdline/UID identity")
+    return {"argv": argv, "comm": comm, "exe": argv[0],
+            "exe_evidence": "proc-cmdline+comm", "pid": pid,
+            "ppid": int(fields[1]), "pgid": int(fields[2]), "state": fields[0],
+            "start_ticks": int(fields[19]), "uids": uids}
+
+def same_identity(left, right):
+    return all(left.get(key) == right.get(key) for key in IDENTITY_FIELDS)
+
+expected = json.loads(sys.argv[1])
+if (not isinstance(expected, dict) or set(expected) != PROCESS_FIELDS
+        or expected.get("state") not in {"T", "t"}
+        or not isinstance(expected.get("pid"), int) or expected["pid"] <= 0
+        or expected.get("pgid") != expected["pid"]):
+    raise SystemExit("release identity is malformed")
+before = snap(expected["pid"])
+if not same_identity(before, expected) or before["state"] not in {"T", "t"}:
+    raise SystemExit("compiler identity changed before abort release")
+os.killpg(expected["pgid"], signal.SIGCONT)
+deadline = time.monotonic() + 2
+after = None
+while time.monotonic() < deadline:
+    after = snap(expected["pid"])
+    if same_identity(after, expected) and after["state"] not in {"T", "t", "Z", "X"}:
+        break
+    time.sleep(0.02)
+if (after is None or not same_identity(after, expected)
+        or after["state"] in {"T", "t", "Z", "X"}):
+    raise SystemExit("compiler group did not resume with its authenticated identity")
+print(json.dumps({"after": after, "before": before, "schema": "icefarm-compiler-group-release-v1",
+                  "signal": "CONT"}, sort_keys=True, separators=(",", ":")))
 '''.strip()
 
 ACTIVE_COMPILER_WAIT_SCRIPT = r'''
@@ -3103,10 +3177,15 @@ class EventProducer:
         client_baselines = {
             client["name"]: self._readiness_baseline(client) for client in clients
         }
-        # Authenticate both boundaries before any faulting operation.  The
-        # generation must come from the pre-kill log, before numeric IDs can
-        # be reused by the restarted scheduler.
-        lost_generation = self._scheduler_generation_for_job(self._last_job)
+        # Freeze the authenticated trigger boundary before selecting the
+        # currently executing Child.  A newer job may already be queued, so
+        # the active Child's job may be lower than this dispatch ceiling.
+        selection_last_dispatched_job = self._last_job
+        if (
+            type(selection_last_dispatched_job) is not int
+            or selection_last_dispatched_job <= 0
+        ):
+            raise EventError("active scheduler loss has no positive dispatch ceiling")
         client_routes_before = {
             client["name"]: (
                 self._client_route_state(client)
@@ -3128,21 +3207,43 @@ class EventProducer:
                 ("exec", "--user", "0", worker_before["id"], "python3", "-c",
                  ACTIVE_COMPILER_STOP_SCRIPT, str(ACTIVE_COMPILER_OBSERVE_S), str(web_port))),
         ))
+        compiler: dict[str, Any] | None = None
+        stopped_identity: dict[str, Any] | None = None
+        scheduler_kill_committed = False
         try:
-            compiler = json.loads(result.stdout.strip())
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise EventError("compiler-group authentication returned malformed JSON") from exc
-        if not isinstance(compiler, dict) or compiler.get("schema") != "icefarm-compiler-group-stop-v1":
-            raise EventError("compiler-group authentication did not return its exact schema")
-        leader = compiler.get("leader")
-        stopped = compiler.get("stopped")
-        parent = compiler.get("daemon")
-        listener = compiler.get("listener")
-        if (not isinstance(leader, dict) or not isinstance(stopped, dict)
-                or not isinstance(parent, dict) or not isinstance(listener, dict)
-                or set(leader) != set(stopped)):
-            raise EventError("compiler-group authentication has incomplete identity")
-        if (parent.get("pid") == leader.get("pid")
+            try:
+                compiler = json.loads(result.stdout.strip())
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise EventError(
+                    "compiler-group authentication returned malformed JSON"
+                ) from exc
+            stopped_identity = (
+                compiler.get("stopped")
+                if isinstance(compiler, dict)
+                and isinstance(compiler.get("stopped"), dict)
+                else None
+            )
+            if (
+                not isinstance(compiler, dict)
+                or compiler.get("schema") != "icefarm-compiler-group-stop-v1"
+            ):
+                raise EventError(
+                    "compiler-group authentication did not return its exact schema"
+                )
+            leader = compiler.get("leader")
+            stopped = compiler.get("stopped")
+            parent = compiler.get("daemon")
+            listener = compiler.get("listener")
+            if (
+                not isinstance(leader, dict)
+                or not isinstance(stopped, dict)
+                or not isinstance(parent, dict)
+                or not isinstance(listener, dict)
+                or set(leader) != set(stopped)
+            ):
+                raise EventError("compiler-group authentication has incomplete identity")
+            if (
+                parent.get("pid") == leader.get("pid")
                 or parent.get("comm") != "iceccd"
                 or leader.get("comm") != "iceccd"
                 or parent.get("uids") != [65534, 65534, 65534, 65534]
@@ -3157,52 +3258,105 @@ class EventProducer:
                 or leader.get("pid") != stopped.get("pid")
                 or leader.get("pgid") != stopped.get("pgid")
                 or leader.get("start_ticks") != stopped.get("start_ticks")
-                or leader.get("state") in {"Z", "X"}):
-            raise EventError("compiler-group stop identity changed")
-        if (
-            set(listener)
-            != {
-                "binding_evidence",
-                "daemon_pid",
-                "daemon_start_ticks",
-                "host",
-                "port",
-                "socket_inode",
-                "socket_uid",
-            }
-            or listener.get("binding_evidence") != LISTENER_BINDING_EVIDENCE
-            or listener.get("daemon_pid") != parent.get("pid")
-            or listener.get("daemon_start_ticks") != parent.get("start_ticks")
-            or listener.get("host") != "127.0.0.1"
-            or listener.get("port") != web_port
-            or not isinstance(listener.get("socket_inode"), str)
-            or not listener["socket_inode"].isdigit()
-            or int(listener["socket_inode"]) <= 0
-            or listener.get("socket_uid") != parent.get("uids", [None, None])[1]
-        ):
-            raise EventError("compiler listener is not bound to the authenticated F runtime")
-        assignment_result = self._invoke(self.factory.make(
-            phase="event.scheduler-loss-authenticate-assignment",
-            host=worker["host"], instance=worker["name"], transport=_docker_transport(self.farm, worker["host"]),
-            timeout_s=self._command_timeout(),
-            argv=docker_argv(self.farm, worker["host"], (
-                "exec", "--user", "0", worker_before["id"], "python3", "-c",
-                ACTIVE_COMPILER_ASSIGNMENT_SCRIPT, str(leader["pid"]), str(leader["pgid"]),
-                str(lost_generation), str(self._last_job), str(web_port),
-                listener["socket_inode"], str(listener["socket_uid"]),
-            )),
-        ))
-        try:
-            assignment = json.loads(assignment_result.stdout.strip())
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise EventError("compiler assignment witness returned malformed JSON") from exc
-        if (not isinstance(assignment, dict)
-                or set(assignment) != {"child", "client", "listener", "schema"}
-                or assignment.get("schema") != "icefarm-compiler-assignment-v1"
-                or assignment["child"].get("generation") != lost_generation
+                or leader.get("state") in {"Z", "X"}
+                or stopped.get("state") not in {"T", "t"}
+            ):
+                raise EventError("compiler-group stop identity changed")
+            if (
+                set(listener)
+                != {
+                    "binding_evidence",
+                    "daemon_pid",
+                    "daemon_start_ticks",
+                    "host",
+                    "port",
+                    "socket_inode",
+                    "socket_uid",
+                }
+                or listener.get("binding_evidence") != LISTENER_BINDING_EVIDENCE
+                or listener.get("daemon_pid") != parent.get("pid")
+                or listener.get("daemon_start_ticks") != parent.get("start_ticks")
+                or listener.get("host") != "127.0.0.1"
+                or listener.get("port") != web_port
+                or not isinstance(listener.get("socket_inode"), str)
+                or not listener["socket_inode"].isdigit()
+                or int(listener["socket_inode"]) <= 0
+                or listener.get("socket_uid")
+                != parent.get("uids", [None, None])[1]
+            ):
+                raise EventError(
+                    "compiler listener is not bound to the authenticated F runtime"
+                )
+            assignment_result = self._invoke(
+                self.factory.make(
+                    phase="event.scheduler-loss-authenticate-assignment",
+                    host=worker["host"],
+                    instance=worker["name"],
+                    transport=_docker_transport(self.farm, worker["host"]),
+                    timeout_s=self._command_timeout(),
+                    argv=docker_argv(
+                        self.farm,
+                        worker["host"],
+                        (
+                            "exec",
+                            "--user",
+                            "0",
+                            worker_before["id"],
+                            "python3",
+                            "-c",
+                            ACTIVE_COMPILER_ASSIGNMENT_SCRIPT,
+                            str(leader["pid"]),
+                            str(leader["pgid"]),
+                            str(web_port),
+                            listener["socket_inode"],
+                            str(listener["socket_uid"]),
+                        ),
+                    ),
+                )
+            )
+            try:
+                assignment = json.loads(assignment_result.stdout.strip())
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise EventError(
+                    "compiler assignment witness returned malformed JSON"
+                ) from exc
+            if not isinstance(assignment, dict):
+                raise EventError("compiler assignment witness is not a JSON object")
+            lost_scheduler_job = assignment.get("client", {}).get(
+                "scheduler_job_id"
+            )
+            child_generation = assignment.get("child", {}).get("generation")
+            if (
+                set(assignment) != {"child", "client", "listener", "schema"}
+                or assignment.get("schema") != "icefarm-compiler-assignment-v2"
+                or type(lost_scheduler_job) is not int
+                or lost_scheduler_job <= 0
+                or lost_scheduler_job > selection_last_dispatched_job
+                or set(assignment.get("child", {}))
+                != {"generation", "kind", "owning_client_id", "pgid", "pid"}
+                or set(assignment.get("client", {}))
+                != {"client_id", "job_id", "scheduler_job_id"}
+                or assignment["child"].get("pid") != leader.get("pid")
+                or assignment["child"].get("pgid") != leader.get("pgid")
                 or assignment["child"].get("kind") != 0
-                or assignment["client"].get("scheduler_job_id") != self._last_job
-                or assignment["client"].get("job_id") != self._last_job
+                or assignment["child"].get("owning_client_id")
+                != assignment["client"].get("client_id")
+                or any(
+                    type(assignment["child"].get(field)) is not int
+                    or assignment["child"][field] <= 0
+                    for field in (
+                        "generation",
+                        "owning_client_id",
+                        "pgid",
+                        "pid",
+                    )
+                )
+                or any(
+                    type(assignment["client"].get(field)) is not int
+                    or assignment["client"][field] <= 0
+                    for field in ("client_id", "job_id", "scheduler_job_id")
+                )
+                or assignment["client"].get("job_id") != lost_scheduler_job
                 or assignment["listener"]
                 != {
                     "binding_evidence": LISTENER_BINDING_EVIDENCE,
@@ -3210,14 +3364,114 @@ class EventProducer:
                     "port": web_port,
                     "socket_inode": listener["socket_inode"],
                     "socket_uid": listener["socket_uid"],
-                }):
-            raise EventError("compiler assignment witness does not bind exact lost job")
-        self._invoke(self.factory.make(
-            phase="event.scheduler-loss-kill",
-            host=instance["host"], instance=event.instance, transport=_docker_transport(self.farm, instance["host"]),
-            timeout_s=self._command_timeout(),
-            argv=docker_argv(self.farm, instance["host"], ("container", "kill", "--signal", "KILL", identifier)),
-        ))
+                }
+            ):
+                raise EventError(
+                    "compiler assignment witness exceeds or does not bind the dispatch ceiling"
+                )
+            # Resolve the generation independently from the pre-kill scheduler
+            # log after the active Child has selected its exact positive job.
+            lost_generation = self._scheduler_generation_for_job(
+                lost_scheduler_job
+            )
+            if child_generation != lost_generation:
+                raise EventError(
+                    "compiler assignment generation disagrees with scheduler history"
+                )
+            self._invoke(
+                self.factory.make(
+                    phase="event.scheduler-loss-kill",
+                    host=instance["host"],
+                    instance=event.instance,
+                    transport=_docker_transport(self.farm, instance["host"]),
+                    timeout_s=self._command_timeout(),
+                    argv=docker_argv(
+                        self.farm,
+                        instance["host"],
+                        (
+                            "container",
+                            "kill",
+                            "--signal",
+                            "KILL",
+                            identifier,
+                        ),
+                    ),
+                )
+            )
+            scheduler_kill_committed = True
+        except BaseException as exc:
+            original_phase = self._current_phase
+            self._mark_failure(original_phase, exc)
+            if stopped_identity is not None and not scheduler_kill_committed:
+                self._failure_evidence["compiler_release"] = {
+                    "receipt": None,
+                    "state": "ATTEMPTED",
+                }
+                try:
+                    release_result = self._invoke(
+                        self.factory.make(
+                            phase="event.scheduler-loss-release-compiler-group",
+                            host=worker["host"],
+                            instance=worker["name"],
+                            transport=_docker_transport(
+                                self.farm, worker["host"]
+                            ),
+                            timeout_s=self._command_timeout(maximum=10),
+                            argv=docker_argv(
+                                self.farm,
+                                worker["host"],
+                                (
+                                    "exec",
+                                    "--user",
+                                    "0",
+                                    worker_before["id"],
+                                    "python3",
+                                    "-c",
+                                    ACTIVE_COMPILER_RELEASE_SCRIPT,
+                                    json.dumps(
+                                        stopped_identity,
+                                        sort_keys=True,
+                                        separators=(",", ":"),
+                                    ),
+                                ),
+                            ),
+                        )
+                    )
+                    release = json.loads(release_result.stdout.strip())
+                    if (
+                        not isinstance(release, dict)
+                        or set(release)
+                        != {"after", "before", "schema", "signal"}
+                        or release.get("schema")
+                        != "icefarm-compiler-group-release-v1"
+                        or release.get("signal") != "CONT"
+                        or release.get("before") != stopped_identity
+                        or release.get("after", {}).get("state")
+                        in {"T", "t", "Z", "X"}
+                        or any(
+                            release.get("after", {}).get(field)
+                            != stopped_identity.get(field)
+                            for field in set(stopped_identity) - {"state"}
+                        )
+                    ):
+                        raise EventError(
+                            "compiler abort release returned an invalid identity receipt"
+                        )
+                    self._failure_evidence["compiler_release"] = {
+                        "receipt": release,
+                        "state": "COMPLETE",
+                    }
+                    self._current_phase = original_phase
+                except BaseException as release_exc:
+                    self._failure_evidence["compiler_release"] = {
+                        "error": f"{type(release_exc).__name__}: {release_exc}",
+                        "receipt": None,
+                        "state": "FAILED",
+                    }
+                    raise EventError(
+                        f"{exc}; compiler abort release failed: {release_exc}"
+                    ) from release_exc
+            raise
         self._invoke(self.factory.make(
             phase="event.scheduler-loss-start",
             host=instance["host"], instance=event.instance, transport=_docker_transport(self.farm, instance["host"]),
@@ -3333,9 +3587,10 @@ class EventProducer:
             },
             "event_epoch": epoch, "instance": event.instance,
             "lost_scheduler_generation": lost_generation,
-            "lost_scheduler_job": self._last_job,
+            "lost_scheduler_job": lost_scheduler_job,
             "pre_fault": {"scheduler_log": scheduler_log, "worker_log": worker_log},
             "quiescence": {"scheduler_startup": startup, "scheduler_snapshot": scheduler_snapshot, "worker_snapshot": worker_snapshot, "client_readiness": client_readiness, "client_routes": {name: {"before": client_routes_before[name], "after": client_routes_after[name]} for name in client_routes_before}},
+            "selection_last_dispatched_job": selection_last_dispatched_job,
             "schema": SCHEDULER_ACTIVE_LOSS_SCHEMA, "turn": turn,
         }
 

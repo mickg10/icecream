@@ -620,6 +620,46 @@ def test_active_loss_v3_binds_listener_worker_authority_and_readiness() -> None:
     )
 
 
+def test_active_loss_v4_binds_active_job_below_dispatch_ceiling() -> None:
+    receipt, event, scenario, plan, farm, images = _active_loss_v3_fixture()
+    receipt["schema"] = "icefarm-scheduler-active-loss-v4"
+    receipt["selection_last_dispatched_job"] = 5
+    receipt["compiler"]["assignment"]["schema"] = (
+        "icefarm-compiler-assignment-v2"
+    )
+    event["last_dispatched_job"] = 5
+    kwargs = {
+        "readiness_v2": True,
+        "plan": plan,
+        "farm": farm,
+        "images": images,
+    }
+    assert not _scheduler_active_loss_receipt_errors(
+        receipt, event, scenario, **kwargs
+    )
+
+    for path, value in (
+        (("lost_scheduler_job",), 6),
+        (("selection_last_dispatched_job",), 4),
+        (("compiler", "assignment", "client", "scheduler_job_id"), 3),
+        (("compiler", "assignment", "child", "generation"), 2),
+    ):
+        tampered = copy.deepcopy(receipt)
+        cursor = tampered
+        for key in path[:-1]:
+            cursor = cursor[key]
+        cursor[path[-1]] = value
+        assert _scheduler_active_loss_receipt_errors(
+            tampered, event, scenario, **kwargs
+        ), path
+
+    mismatched_event = copy.deepcopy(event)
+    mismatched_event["last_dispatched_job"] = 4
+    assert _scheduler_active_loss_receipt_errors(
+        receipt, mismatched_event, scenario, **kwargs
+    )
+
+
 def _client_transition_event() -> tuple[dict[str, object], dict[str, object]]:
     scenario = _scenario("S'CF", client_versions=(50,), worker_versions=(43,))
     scenario["timeline"] = [

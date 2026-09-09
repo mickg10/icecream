@@ -84,7 +84,8 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 CLIENT_SCHEDULER_READINESS_SCHEMA = "icefarm-client-scheduler-readiness-v2"
 SCHEDULER_ACTIVE_LOSS_SCHEMA_V1 = "icefarm-scheduler-active-loss-v1"
 SCHEDULER_ACTIVE_LOSS_SCHEMA_V2 = "icefarm-scheduler-active-loss-v2"
-SCHEDULER_ACTIVE_LOSS_SCHEMA = "icefarm-scheduler-active-loss-v3"
+SCHEDULER_ACTIVE_LOSS_SCHEMA_V3 = "icefarm-scheduler-active-loss-v3"
+SCHEDULER_ACTIVE_LOSS_SCHEMA = "icefarm-scheduler-active-loss-v4"
 LISTENER_BINDING_EVIDENCE = "container-env+netns-listener-uid+http-child"
 SCHEDULER_GENERATION_ACTIONS = frozenset(
     {"upgrade", "downgrade", "restart", "env_set", "scheduler-loss-active"}
@@ -2121,6 +2122,9 @@ def _scheduler_active_loss_receipt_errors(
 ) -> set[str]:
     marker = "@event:scheduler-active-loss"
     required = {"action", "after", "before", "compiler", "event_epoch", "instance", "lost_scheduler_generation", "lost_scheduler_job", "pre_fault", "quiescence", "schema", "turn"}
+    schema = receipt.get("schema") if isinstance(receipt, Mapping) else None
+    if schema == SCHEDULER_ACTIVE_LOSS_SCHEMA:
+        required.add("selection_last_dispatched_job")
     if (
         not isinstance(receipt, Mapping)
         or set(receipt) != required
@@ -2128,12 +2132,16 @@ def _scheduler_active_loss_receipt_errors(
         not in {
             SCHEDULER_ACTIVE_LOSS_SCHEMA_V1,
             SCHEDULER_ACTIVE_LOSS_SCHEMA_V2,
+            SCHEDULER_ACTIVE_LOSS_SCHEMA_V3,
             SCHEDULER_ACTIVE_LOSS_SCHEMA,
         }
     ):
         return {marker}
     strict = receipt.get("schema") != SCHEDULER_ACTIVE_LOSS_SCHEMA_V1
-    listener_v3 = receipt.get("schema") == SCHEDULER_ACTIVE_LOSS_SCHEMA
+    listener_v3 = receipt.get("schema") in {
+        SCHEDULER_ACTIVE_LOSS_SCHEMA_V3,
+        SCHEDULER_ACTIVE_LOSS_SCHEMA,
+    }
     plan_instances = (
         plan.get("topology", {}).get("instances")
         if isinstance(plan, Mapping)
@@ -2476,11 +2484,24 @@ def _scheduler_active_loss_receipt_errors(
             and expected_env is not None
             and worker_before.get("env") == expected_env
         )
+    v4_boundary_valid = (
+        receipt.get("schema") == SCHEDULER_ACTIVE_LOSS_SCHEMA
+        and _is_int(receipt.get("selection_last_dispatched_job"), minimum=1)
+        and receipt.get("selection_last_dispatched_job")
+        == event.get("last_dispatched_job")
+        and _is_int(receipt.get("lost_scheduler_job"), minimum=1)
+        and receipt["lost_scheduler_job"]
+        <= receipt["selection_last_dispatched_job"]
+    )
+    legacy_boundary_valid = (
+        receipt.get("schema") != SCHEDULER_ACTIVE_LOSS_SCHEMA
+        and receipt.get("lost_scheduler_job") == event.get("last_dispatched_job")
+    )
     if (receipt.get("action") != event.get("action")
             or receipt.get("instance") != event.get("instance")
             or not _is_int(receipt.get("lost_scheduler_generation"), minimum=1)
             or not _is_int(receipt.get("lost_scheduler_job"), minimum=1)
-            or receipt.get("lost_scheduler_job") != event.get("last_dispatched_job")
+            or not (v4_boundary_valid or legacy_boundary_valid)
             or not isinstance(compiler, Mapping)
             or (strict and set(compiler) != compiler_fields)
             or not isinstance(leader, Mapping) or not isinstance(stopped, Mapping)
@@ -2517,7 +2538,12 @@ def _scheduler_active_loss_receipt_errors(
             )
             or not isinstance(assignment, Mapping)
             or set(assignment) != {"child", "client", "listener", "schema"}
-            or assignment.get("schema") != "icefarm-compiler-assignment-v1"
+            or assignment.get("schema")
+            != (
+                "icefarm-compiler-assignment-v2"
+                if receipt.get("schema") == SCHEDULER_ACTIVE_LOSS_SCHEMA
+                else "icefarm-compiler-assignment-v1"
+            )
             or assignment.get("child", {}).get("pid") != leader.get("pid")
             or assignment.get("child", {}).get("pgid") != leader.get("pgid")
             or assignment.get("child", {}).get("generation") != receipt.get("lost_scheduler_generation")

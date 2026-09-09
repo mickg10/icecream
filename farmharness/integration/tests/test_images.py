@@ -459,10 +459,9 @@ def test_source_release_hung_decoder_is_killed_and_reaped(
     fake_bin.mkdir()
     decoder = fake_bin / "zstd"
     decoder.write_text(
-        "#!/usr/bin/python3\n"
-        "import os, pathlib, time\n"
-        "pathlib.Path(os.environ['ICEFARM_TEST_DECODER_PID']).write_text(str(os.getpid()))\n"
-        "time.sleep(30)\n",
+        "#!/bin/sh\n"
+        "printf '%s' \"$$\" >\"$ICEFARM_TEST_DECODER_PID\"\n"
+        "exec /bin/sleep 30\n",
         encoding="utf-8",
     )
     decoder.chmod(0o755)

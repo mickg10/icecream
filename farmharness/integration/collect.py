@@ -116,7 +116,8 @@ SCHEDULER_LINE_RE = re.compile(
 SCHEDULER_START_RE = re.compile(r"^ICECREAM scheduler .* starting up, port [0-9]+$")
 SCHEDULER_ACTIVE_LOSS_SCHEMA_V1 = "icefarm-scheduler-active-loss-v1"
 SCHEDULER_ACTIVE_LOSS_SCHEMA_V2 = "icefarm-scheduler-active-loss-v2"
-SCHEDULER_ACTIVE_LOSS_SCHEMA = "icefarm-scheduler-active-loss-v3"
+SCHEDULER_ACTIVE_LOSS_SCHEMA_V3 = "icefarm-scheduler-active-loss-v3"
+SCHEDULER_ACTIVE_LOSS_SCHEMA = "icefarm-scheduler-active-loss-v4"
 LISTENER_BINDING_EVIDENCE = "container-env+netns-listener-uid+http-child"
 DAEMON_START_RE = re.compile(r"ICECREAM daemon .* starting up")
 READINESS_SCHEDULER_RE = re.compile(r"ICECREAM scheduler .* starting up, port [0-9]+")
@@ -1888,6 +1889,9 @@ def _validate_scheduler_active_loss_receipt(
     if farm is None or plan is None or evidence is None:
         raise CollectError(f"{prefix} needs authenticated farm, plan, and evidence")
     required = {"action", "after", "before", "compiler", "event_epoch", "instance", "lost_scheduler_generation", "lost_scheduler_job", "pre_fault", "quiescence", "schema", "turn"}
+    schema = receipt.get("schema") if isinstance(receipt, Mapping) else None
+    if schema == SCHEDULER_ACTIVE_LOSS_SCHEMA:
+        required.add("selection_last_dispatched_job")
     if (
         not isinstance(receipt, Mapping)
         or set(receipt) != required
@@ -1895,17 +1899,36 @@ def _validate_scheduler_active_loss_receipt(
         not in {
             SCHEDULER_ACTIVE_LOSS_SCHEMA_V1,
             SCHEDULER_ACTIVE_LOSS_SCHEMA_V2,
+            SCHEDULER_ACTIVE_LOSS_SCHEMA_V3,
             SCHEDULER_ACTIVE_LOSS_SCHEMA,
         }
     ):
         raise CollectError(f"{prefix} has invalid receipt fields")
     strict = receipt.get("schema") != SCHEDULER_ACTIVE_LOSS_SCHEMA_V1
-    listener_v3 = receipt.get("schema") == SCHEDULER_ACTIVE_LOSS_SCHEMA
+    listener_v3 = receipt.get("schema") in {
+        SCHEDULER_ACTIVE_LOSS_SCHEMA_V3,
+        SCHEDULER_ACTIVE_LOSS_SCHEMA,
+    }
     if receipt.get("action") != event.get("action") or receipt.get("instance") != event.get("instance") or receipt.get("event_epoch") != event.get("event_epoch") or receipt.get("turn") not in scenario.data["workload"]["turns"]:
         raise CollectError(f"{prefix} is not bound to its timeline event")
+    v4_boundary_valid = (
+        receipt.get("schema") == SCHEDULER_ACTIVE_LOSS_SCHEMA
+        and type(receipt.get("selection_last_dispatched_job")) is int
+        and receipt["selection_last_dispatched_job"] > 0
+        and receipt["selection_last_dispatched_job"]
+        == event.get("last_dispatched_job")
+        and type(receipt.get("lost_scheduler_job")) is int
+        and receipt["lost_scheduler_job"] > 0
+        and receipt.get("lost_scheduler_job")
+        <= receipt["selection_last_dispatched_job"]
+    )
+    legacy_boundary_valid = (
+        receipt.get("schema") != SCHEDULER_ACTIVE_LOSS_SCHEMA
+        and receipt.get("lost_scheduler_job") == event.get("last_dispatched_job")
+    )
     if (type(receipt.get("lost_scheduler_generation")) is not int or receipt["lost_scheduler_generation"] <= 0
             or type(receipt.get("lost_scheduler_job")) is not int or receipt["lost_scheduler_job"] <= 0
-            or receipt["lost_scheduler_job"] != event.get("last_dispatched_job")):
+            or not (v4_boundary_valid or legacy_boundary_valid)):
         raise CollectError(f"{prefix} has no exact lost scheduler job boundary")
     snapshots = {}
     for side in ("before", "after"):
@@ -2071,7 +2094,12 @@ def _validate_scheduler_active_loss_receipt(
             )
             or not isinstance(assignment, Mapping)
             or set(assignment) != {"child", "client", "listener", "schema"}
-            or assignment.get("schema") != "icefarm-compiler-assignment-v1"
+            or assignment.get("schema")
+            != (
+                "icefarm-compiler-assignment-v2"
+                if receipt.get("schema") == SCHEDULER_ACTIVE_LOSS_SCHEMA
+                else "icefarm-compiler-assignment-v1"
+            )
             or assignment.get("child", {}).get("pid") != leader.get("pid")
             or assignment.get("child", {}).get("pgid") != leader.get("pgid")
             or assignment.get("child", {}).get("generation") != receipt.get("lost_scheduler_generation")
