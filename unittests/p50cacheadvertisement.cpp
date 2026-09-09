@@ -367,14 +367,16 @@ static void test_getcs_cache_request_wire_and_laws()
                 && decoded->cache_profile_mask == 0
                 && decoded->cache_affinity_profile_mask == 0
                 && decoded->cache_affinity_port == 0
-                && decoded->cache_affinity_host.empty(),
+                && decoded->cache_affinity_host.empty()
+                && decoded->cache_retry_avoid_port == 0
+                && decoded->cache_retry_avoid_host.empty(),
             "P49 GetCS decoder receives canonical client capability absence");
     delete wire;
 
     const Bytes p50_absent = encode_getcs_frame(50, absent);
     REQUIRE(p50_absent.size() == p49_absent_object.size()
-                + 5 * sizeof(uint32_t) + 1,
-            "P50 GetCS appends four words and one bounded empty string");
+                + 7 * sizeof(uint32_t) + 2,
+            "P50 GetCS appends five words and two bounded empty strings");
 
     Pair pair = make_pair(50);
     REQUIRE(pair.left->send_msg(request),
@@ -385,8 +387,31 @@ static void test_getcs_cache_request_wire_and_laws()
                 && decoded->cache_profile_mask == CACHE_ADVERTISABLE_PROFILE_MASK
                 && decoded->cache_affinity_profile_mask == CACHE_PROFILE_P29V1
                 && decoded->cache_affinity_port == UINT32_C(10245)
-                && decoded->cache_affinity_host == "warm-cache-worker",
+                && decoded->cache_affinity_host == "warm-cache-worker"
+                && decoded->cache_retry_avoid_port == 0
+                && decoded->cache_retry_avoid_host.empty(),
             "P50 GetCS round-trips the exact capability and warm hint");
+    delete wire;
+
+    GetCSMsg retry_avoid = request;
+    retry_avoid.cache_affinity_profile_mask = 0;
+    retry_avoid.cache_affinity_port = 0;
+    retry_avoid.cache_affinity_host.clear();
+    retry_avoid.cache_retry_avoid_port = UINT32_C(10246);
+    retry_avoid.cache_retry_avoid_host = "failed-cache-worker";
+    Pair retry_pair = make_pair(50);
+    REQUIRE(retry_pair.left->send_msg(retry_avoid),
+            "P50 GetCS carries one exact request-local retry exclusion");
+    wire = retry_pair.right->get_msg(2, true);
+    decoded = dynamic_cast<GetCSMsg *>(wire);
+    REQUIRE(decoded && decoded->cache_protocol == CACHE_WIRE_REVISION
+                && decoded->cache_profile_mask == CACHE_ADVERTISABLE_PROFILE_MASK
+                && decoded->cache_affinity_profile_mask == 0
+                && decoded->cache_affinity_port == 0
+                && decoded->cache_affinity_host.empty()
+                && decoded->cache_retry_avoid_port == UINT32_C(10246)
+                && decoded->cache_retry_avoid_host == "failed-cache-worker",
+            "P50 GetCS round-trips retry exclusion independently of warm affinity");
     delete wire;
 
     Pair absent_pair = make_pair(50);
@@ -398,7 +423,9 @@ static void test_getcs_cache_request_wire_and_laws()
                 && decoded->cache_profile_mask == 0
                 && decoded->cache_affinity_profile_mask == 0
                 && decoded->cache_affinity_port == 0
-                && decoded->cache_affinity_host.empty(),
+                && decoded->cache_affinity_host.empty()
+                && decoded->cache_retry_avoid_port == 0
+                && decoded->cache_retry_avoid_host.empty(),
             "P50 absent client capability remains wholly canonical");
     delete wire;
 
@@ -442,10 +469,30 @@ static void test_getcs_cache_request_wire_and_laws()
         REQUIRE(!send_pair.left->send_msg(malformed), label);
     }
 
-    REQUIRE(getcs_decoder_rejects(remove_tail_bytes(p50_absent, 21)),
+    GetCSMsg malformed_retry = absent;
+    malformed_retry.cache_protocol = CACHE_WIRE_REVISION;
+    malformed_retry.cache_profile_mask = CACHE_ADVERTISABLE_PROFILE_MASK;
+    malformed_retry.cache_retry_avoid_port = UINT32_C(10246);
+    REQUIRE(!make_pair(50).left->send_msg(malformed_retry),
+            "GetCS encoder rejects retry-exclusion port without host");
+    malformed_retry.cache_retry_avoid_port = 0;
+    malformed_retry.cache_retry_avoid_host = "failed-cache-worker";
+    REQUIRE(!make_pair(50).left->send_msg(malformed_retry),
+            "GetCS encoder rejects retry-exclusion host without port");
+    malformed_retry.cache_retry_avoid_port = UINT32_C(70000);
+    REQUIRE(!make_pair(50).left->send_msg(malformed_retry),
+            "GetCS encoder rejects retry-exclusion port outside TCP range");
+
+    GetCSMsg retry_without_capability = absent;
+    retry_without_capability.cache_retry_avoid_port = UINT32_C(10246);
+    retry_without_capability.cache_retry_avoid_host = "failed-cache-worker";
+    REQUIRE(!make_pair(50).left->send_msg(retry_without_capability),
+            "GetCS encoder rejects retry exclusion without P50 capability");
+
+    REQUIRE(getcs_decoder_rejects(remove_tail_bytes(p50_absent, 30)),
             "P50 GetCS decoder rejects a wholly omitted capability tail");
     REQUIRE(getcs_decoder_rejects(remove_tail_bytes(p50_absent, 1)),
-            "P50 GetCS decoder rejects a truncated affinity string");
+            "P50 GetCS decoder rejects a truncated retry-exclusion string");
     REQUIRE(getcs_decoder_rejects(append_word(p50_absent, UINT32_C(0))),
             "P50 GetCS decoder rejects bytes after the exact request tail");
 

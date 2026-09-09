@@ -136,7 +136,9 @@ extern bool compiler_get_arch_flags(const CompileJob& job, bool march, bool mcpu
 /* In remote.cpp - permill is the probability it will be compiled three times */
 extern int build_remote(CompileJob &job, MsgChannel *scheduler,
                         const Environments &envs, int permill,
-                        bool request_p50 = true);
+                        bool request_p50 = true,
+                        const std::string &retry_avoid_host = std::string(),
+                        uint32_t retry_avoid_port = 0);
 
 /* safeguard.cpp */
 // We allow several recursions if icerun is involved, just in case icerun is e.g. used to invoke a script
@@ -171,7 +173,25 @@ class remote_error : public client_error
     public:
     remote_error(int code, const std::string& what)
     : client_error(code, what)
+    , retryAvoidPort(0)
     {}
+
+    remote_error(int code, const std::string& what,
+                 std::string retry_avoid_host,
+                 uint32_t retry_avoid_port)
+    : client_error(code, what)
+    , retryAvoidHost(std::move(retry_avoid_host))
+    , retryAvoidPort(retry_avoid_port)
+    {}
+
+    [[nodiscard]] bool hasRetryAvoidEndpoint() const noexcept
+    {
+        return p50_cache_retry_avoid_is_present(
+            retryAvoidPort, retryAvoidHost);
+    }
+
+    const std::string retryAvoidHost;
+    const uint32_t retryAvoidPort;
 };
 
 

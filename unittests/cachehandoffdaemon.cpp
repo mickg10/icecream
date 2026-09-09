@@ -305,6 +305,27 @@ static std::string read_file_contents(const std::string &path)
     return contents.str();
 }
 
+static pid_t find_child_with_command(pid_t parent,
+                                     const std::string &command_fragment)
+{
+    std::ifstream children("/proc/" + std::to_string(parent) +
+                           "/task/" + std::to_string(parent) + "/children");
+    pid_t child = 0;
+    while (children >> child) {
+        std::ifstream command("/proc/" + std::to_string(child) + "/cmdline",
+                              std::ios::binary);
+        std::ostringstream bytes;
+        bytes << command.rdbuf();
+        std::string value = bytes.str();
+        for (char &byte : value) {
+            if (byte == '\0') byte = ' ';
+        }
+        if (value.find(command_fragment) != std::string::npos)
+            return child;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 3) {
@@ -441,6 +462,10 @@ int main(int argc, char **argv)
                      1, "x86_64", 0, std::string(), 0, 0, 0);
     request.cache_protocol = CACHE_WIRE_REVISION;
     request.cache_profile_mask = CACHE_ADVERTISABLE_PROFILE_MASK;
+    const std::string direct_retry_avoid_host = "192.0.2.88";
+    const uint32_t direct_retry_avoid_port = UINT32_C(54444);
+    request.cache_retry_avoid_host = direct_retry_avoid_host;
+    request.cache_retry_avoid_port = direct_retry_avoid_port;
     REQUIRE(client && client->send_msg(request),
             "local client A requested one assignment");
 
@@ -454,8 +479,13 @@ int main(int argc, char **argv)
                     CACHE_ADVERTISABLE_PROFILE_MASK
                 && forwarded->cache_affinity_profile_mask == 0
                 && forwarded->cache_affinity_port == 0
-                && forwarded->cache_affinity_host.empty(),
-            "C daemon authors enabled capabilities and starts without a warm hint");
+                && forwarded->cache_affinity_host.empty()
+                && forwarded->cache_retry_avoid_host ==
+                    direct_retry_avoid_host
+                && forwarded->cache_retry_avoid_port ==
+                    direct_retry_avoid_port,
+            "C daemon authors enabled capabilities and preserves the wrapper's "
+            "exact request-local retry exclusion ahead of any warm hint");
     REQUIRE(forwarded && forwarded->client_id != UINT32_C(1),
             "S2 Gap 5: client A's real daemon-assigned client_id is NOT "
             "1 -- the throwaway connection above did its job, so a "
@@ -551,6 +581,8 @@ int main(int argc, char **argv)
                 forwarded_c->cache_protocol == CACHE_WIRE_REVISION &&
                 forwarded_c->cache_profile_mask ==
                     CACHE_ADVERTISABLE_PROFILE_MASK &&
+                forwarded_c->cache_retry_avoid_port == 0 &&
+                forwarded_c->cache_retry_avoid_host.empty() &&
                 (self_endpoint_is_schedulable
                      ? forwarded_c->cache_affinity_profile_mask ==
                            CACHE_PROFILE_ZSTD_TU &&
@@ -768,6 +800,10 @@ int main(int argc, char **argv)
                             std::string(), 0, 0, 0);
     request_bounce.cache_protocol = CACHE_WIRE_REVISION;
     request_bounce.cache_profile_mask = CACHE_ADVERTISABLE_PROFILE_MASK;
+    const std::string deferred_retry_avoid_host = "198.51.100.23";
+    const uint32_t deferred_retry_avoid_port = UINT32_C(54422);
+    request_bounce.cache_retry_avoid_host = deferred_retry_avoid_host;
+    request_bounce.cache_retry_avoid_port = deferred_retry_avoid_port;
     REQUIRE(client_bounce && client_bounce->send_msg(request_bounce),
             "post-bounce client submitted a P50-capable GetCS before ConfCS");
 
@@ -785,11 +821,16 @@ int main(int argc, char **argv)
                 forwarded_bounce->cache_protocol == CACHE_WIRE_REVISION &&
                 forwarded_bounce->cache_profile_mask ==
                     CACHE_ADVERTISABLE_PROFILE_MASK &&
-                forwarded_bounce->cache_affinity_profile_mask ==
-                    CACHE_PROFILE_ZSTD_TU &&
-                forwarded_bounce->cache_affinity_port == remote_f_port &&
-                forwarded_bounce->cache_affinity_host == remote_f_host,
-            "same READY lease preserves capability and exact warm affinity across an S bounce");
+                forwarded_bounce->cache_affinity_profile_mask == 0 &&
+                forwarded_bounce->cache_affinity_port == 0 &&
+                forwarded_bounce->cache_affinity_host.empty() &&
+                forwarded_bounce->cache_retry_avoid_host ==
+                    deferred_retry_avoid_host &&
+                forwarded_bounce->cache_retry_avoid_port ==
+                    deferred_retry_avoid_port,
+            "same READY lease preserves capability and the exact retry "
+            "exclusion across deferred scheduler reconnect without reviving "
+            "the lower-priority warm hint");
     REQUIRE(read_file_contents(ready_trace) == initial_ready_witness,
             "S bounce preserved the exact sidecar PID, ReadyLease, and C/F store identities");
 
@@ -806,6 +847,87 @@ int main(int argc, char **argv)
             "post-bounce probe received its bounded local fallback");
     delete client_bounce_wire;
     delete client_bounce;
+
+    /* A held GetCS owns the exact C-sidecar READY lease observed when the
+       wrapper offered P50.  Unlike the scheduler-only bounce above, replacing
+       that sidecar invalidates the capability before deferred publication.
+       The wrapper's failed-F exclusion narrows only a live P50 request, so it
+       must be canonicalized away with the capability rather than survive as
+       unversioned routing state. */
+    delete scheduler;
+    scheduler = nullptr;
+    Msg *changed_relogin_wire = nullptr;
+    scheduler = accept_login_channel(listener, 15000, &changed_relogin_wire);
+    LoginMsg *changed_relogin = changed_relogin_wire
+        ? dynamic_cast<LoginMsg *>(changed_relogin_wire) : nullptr;
+    REQUIRE(scheduler != nullptr && changed_relogin != nullptr,
+            "iceccd began another scheduler LOGIN_ATTEMPT for lease-change test");
+    delete changed_relogin_wire;
+
+    MsgChannel *client_changed_lease =
+        connect_unix_bounded(socket_path, 5000);
+    REQUIRE(client_changed_lease != nullptr,
+            "lease-change client connected during scheduler LOGIN_ATTEMPT");
+    GetCSMsg request_changed_lease(
+        Environments(), "s-changed-lease.cpp", CompileJob::Lang_CXX,
+        1, "x86_64", 0, std::string(), 0, 0, 0);
+    request_changed_lease.cache_protocol = CACHE_WIRE_REVISION;
+    request_changed_lease.cache_profile_mask =
+        CACHE_ADVERTISABLE_PROFILE_MASK;
+    const std::string changed_retry_avoid_host = "203.0.113.44";
+    const uint32_t changed_retry_avoid_port = UINT32_C(54411);
+    request_changed_lease.cache_retry_avoid_host =
+        changed_retry_avoid_host;
+    request_changed_lease.cache_retry_avoid_port =
+        changed_retry_avoid_port;
+    REQUIRE(client_changed_lease &&
+                client_changed_lease->send_msg(request_changed_lease),
+            "lease-change client submitted a P50 retry before ConfCS");
+    REQUIRE(client_changed_lease &&
+                !request_internals(client_changed_lease, 5000).empty(),
+            "same-channel status orders the held GetCS before lease replacement");
+
+    const pid_t old_sidecar = find_child_with_command(daemon_pid, argv[2]);
+    REQUIRE(old_sidecar > 0,
+            "current authenticated C-sidecar PID was identified exactly");
+    REQUIRE(old_sidecar > 0 && kill(old_sidecar, SIGKILL) == 0,
+            "current C-sidecar incarnation was killed to invalidate its lease");
+    /* A replacement is intentionally not launched while S is still only a
+       LOGIN_ATTEMPT.  Give the daemon several event-loop turns to observe
+       child loss, then activate S well inside its 30-second deadline. */
+    usleep(500 * 1000);
+
+    const ConfCSMsg changed_lease_config(UINT64_C(0x5200000000000004),
+                                         ConfCSMsg::Advisory);
+    REQUIRE(scheduler && scheduler->send_msg(changed_lease_config),
+            "fake S activated only after the C-sidecar lease was lost");
+    Msg *forwarded_changed_wire = scheduler
+        ? wait_for_type(scheduler, Msg::GET_CS, 5000) : nullptr;
+    GetCSMsg *forwarded_changed = forwarded_changed_wire
+        ? dynamic_cast<GetCSMsg *>(forwarded_changed_wire) : nullptr;
+    REQUIRE(forwarded_changed != nullptr,
+            "held changed-lease GetCS was re-driven after ConfCS");
+    REQUIRE(forwarded_changed &&
+                forwarded_changed->cache_protocol == 0 &&
+                forwarded_changed->cache_profile_mask == 0 &&
+                forwarded_changed->cache_affinity_profile_mask == 0 &&
+                forwarded_changed->cache_affinity_port == 0 &&
+                forwarded_changed->cache_affinity_host.empty() &&
+                forwarded_changed->cache_retry_avoid_port == 0 &&
+                forwarded_changed->cache_retry_avoid_host.empty(),
+            "lost READY lease canonicalizes capability, warm hint, and retry exclusion away");
+    if (scheduler && forwarded_changed) {
+        REQUIRE(scheduler->send_msg(NoCSMsg(
+                    UINT32_C(0x00005206), forwarded_changed->client_id)),
+                "fake S resolved the changed-lease request with NoCS");
+    }
+    delete forwarded_changed_wire;
+    Msg *changed_client_wire = client_changed_lease
+        ? wait_for_type(client_changed_lease, Msg::USE_CS, 5000) : nullptr;
+    REQUIRE(changed_client_wire != nullptr,
+            "changed-lease request completed through canonical local fallback");
+    delete changed_client_wire;
+    delete client_changed_lease;
 
     /* Client D (BigOracle d23d9c5d HOLD, Gap 3 -- reused-client clearing,
        doubling as the blueprint's "Focused test"): Daemon::scheduler_no_cs
@@ -853,8 +975,11 @@ int main(int argc, char **argv)
                 && forwarded_d->cache_profile_mask == 0
                 && forwarded_d->cache_affinity_profile_mask == 0
                 && forwarded_d->cache_affinity_port == 0
-                && forwarded_d->cache_affinity_host.empty(),
-            "canonical wrapper absence is a per-job downward opt-out even when the C daemon is enabled and has a warm hint");
+                && forwarded_d->cache_affinity_host.empty()
+                && forwarded_d->cache_retry_avoid_port == 0
+                && forwarded_d->cache_retry_avoid_host.empty(),
+            "canonical wrapper absence is a per-job downward opt-out and the "
+            "prior retry exclusion cannot leak to a later request");
 
     if (scheduler && forwarded_d) {
         NoCSMsg no_cs_reply(UINT32_C(0x00005204), forwarded_d->client_id);

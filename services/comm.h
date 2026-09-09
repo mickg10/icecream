@@ -603,6 +603,27 @@ inline constexpr uint32_t CACHE_ADVERTISABLE_PROFILE_MASK =
    route hint.  Canonical absence keeps every older/disabled path legacy. */
 inline constexpr size_t P50_CACHE_AFFINITY_HOST_MAX = 255;
 
+/* One strict-P50 reassignment may ask S not to return to the ordinary F
+   endpoint that just failed.  This is a request-local exclusion, not a
+   blacklist and not cache state: it is carried beside the soft warm hint so
+   queueing can wait for another compatible F without poisoning later jobs. */
+inline bool p50_cache_retry_avoid_is_valid(
+    uint32_t port, std::string_view host) noexcept
+{
+    const bool absent = port == 0 && host.empty();
+    const bool present = port != 0 && port <= UINT16_MAX && !host.empty() &&
+        host.size() <= P50_CACHE_AFFINITY_HOST_MAX &&
+        host.find('\0') == std::string_view::npos;
+    return absent || present;
+}
+
+inline bool p50_cache_retry_avoid_is_present(
+    uint32_t port, std::string_view host) noexcept
+{
+    return port != 0 && !host.empty() &&
+        p50_cache_retry_avoid_is_valid(port, host);
+}
+
 struct P50CacheClientCapability
 {
     uint32_t protocol = 0;
@@ -1668,6 +1689,7 @@ public:
         , cache_profile_mask(0)
         , cache_affinity_profile_mask(0)
         , cache_affinity_port(0)
+        , cache_retry_avoid_port(0)
         , cache_request_tail_valid(true)
         {}
 
@@ -1702,6 +1724,8 @@ public:
     uint32_t cache_affinity_profile_mask; // warm profiles at the hinted F
     uint32_t cache_affinity_port; // exact ordinary F port; zero iff no hint
     std::string cache_affinity_host; // exact F address; empty iff no hint
+    uint32_t cache_retry_avoid_port; // failed ordinary F port; zero iff absent
+    std::string cache_retry_avoid_host; // failed exact F address; empty iff absent
 
 private:
     bool cache_request_tail_valid;

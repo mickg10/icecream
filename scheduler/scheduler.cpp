@@ -1792,7 +1792,9 @@ static AdmitResult admit_request_jobs(CompileServer *submitter, PendingExpansion
         job->setCacheRequest(m.cache_protocol, m.cache_profile_mask,
                              m.cache_affinity_profile_mask,
                              m.cache_affinity_port,
-                             m.cache_affinity_host);
+                             m.cache_affinity_host,
+                             m.cache_retry_avoid_port,
+                             m.cache_retry_avoid_host);
         req.staged.push_back(job);
         std::ostream &dbg = log_info();
         dbg << "NEW " << job->id() << " client="
@@ -2064,31 +2066,98 @@ static uint32_t selected_cache_profile(const Job *job,
         cs->cacheProtocol(), cs->cacheProfileMask(), request);
 }
 
+static bool is_cache_retry_avoided_endpoint(const Job *job,
+                                            const CompileServer *cs)
+{
+    return job != nullptr && cs != nullptr &&
+        p50_cache_retry_avoid_is_present(
+            job->cacheRetryAvoidPort(), job->cacheRetryAvoidHost()) &&
+        cs->name == job->cacheRetryAvoidHost() &&
+        cs->remotePort() == job->cacheRetryAvoidPort();
+}
+
+/* This is deliberately an "ever", not a "now", predicate.  A strict P50
+   retry must wait when another live, request-authorized and cache-compatible
+   F is merely saturated, load-blocked, installing, or carrying deferred
+   PREPARE output.  Those transient conditions still govern actual selection
+   through filter_ineligible_servers(); they must not make the failed endpoint
+   look like the only possible recovery target. */
+static bool cache_retry_has_compatible_alternative(
+    const Job *job, P50CacheProfileRequest request)
+{
+    if (job == nullptr ||
+        !p50_cache_retry_avoid_is_present(
+            job->cacheRetryAvoidPort(), job->cacheRetryAvoidHost()))
+        return false;
+
+    return std::any_of(css.begin(), css.end(), [&](CompileServer *cs) {
+        if (cs == nullptr || cs == job->submitter() ||
+            is_cache_retry_avoided_endpoint(job, cs) ||
+            !cs->is_eligible_ever(job))
+            return false;
+        if (assignment_fence_mode == ConfCSMsg::StrictNonce &&
+            (!IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY, cs) ||
+             !IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY,
+                                  job->submitter())))
+            return false;
+        return selected_cache_profile(job, cs, request) != 0;
+    });
+}
+
 /* Soft rollout preference with a hard liveness escape.  Restrict selection
    to cache-compatible new workers only while at least one such worker has a
    real compile slot free (preload capacity does not count).  Once all are
    full, retain the entire legacy eligible set, so an old/incompatible worker
    can make progress rather than a request waiting for cache capacity.  A
-   compatible warm-host hint is applied only inside that same free set. */
-static void prefer_cache_compatible_servers(
-    const Job *job, list<CompileServer *> &eligible)
+   compatible warm-host hint is applied only inside that same free set.
+
+   Return true only for a strict retry whose compatible alternative exists
+   but is not selectable now.  empty_queue() uses that disposition to skip
+   submitter-local fallback for this request while continuing to scan later
+   queued work. */
+static bool prefer_cache_compatible_servers(
+    const Job *job, list<CompileServer *> &eligible,
+    bool retry_alternative_exists)
 {
     // Cache routing is an assignment-bound P50 policy.  Legacy dispatch has
     // no epoch/nonce with which to bind a handoff, so it must retain both the
     // cost and the ordering semantics of the historical selector.
     if (!assignment_mode_prepares())
-        return;
+        return false;
 
     const P50CacheProfileRequest request =
         p50_cache_profile_request_from_env();
     list<CompileServer *> compatible_free;
     for (CompileServer *const cs : eligible) {
-        if (cs->currentJobCount() < cs->maxJobs() &&
-            selected_cache_profile(job, cs, request) != 0)
-            compatible_free.push_back(cs);
+        if (selected_cache_profile(job, cs, request) != 0) {
+            if (cs->currentJobCount() < cs->maxJobs())
+                compatible_free.push_back(cs);
+        }
+    }
+
+    const string &avoid_host = job->cacheRetryAvoidHost();
+    const uint32_t avoid_port = job->cacheRetryAvoidPort();
+    if (retry_alternative_exists) {
+        compatible_free.remove_if(
+            [&](const CompileServer *cs) {
+                return is_cache_retry_avoided_endpoint(job, cs);
+            });
+        if (compatible_free.empty()) {
+            /* Another compatible F exists but is only transiently blocked.
+               This exact retry waits instead of racing back to the failed
+               endpoint or falling back to its locally-capable submitter. */
+            trace() << "P50_RETRY_AVOID_WAIT job=" << job->id()
+                    << " endpoint=" << avoid_host << ":" << avoid_port
+                    << endl;
+            eligible.clear();
+            return true;
+        }
+        trace() << "P50_RETRY_AVOID_APPLIED job=" << job->id()
+                << " endpoint=" << avoid_host << ":" << avoid_port
+                << " alternatives=" << compatible_free.size() << endl;
     }
     if (compatible_free.empty())
-        return;
+        return false;
 
     const string &affinity_host = job->cacheAffinityHost();
     list<CompileServer *> warm;
@@ -2119,6 +2188,7 @@ static void prefer_cache_compatible_servers(
                 << " idle_excluded=" << idle_compatible_excluded << endl;
     }
     eligible.swap(warm.empty() ? compatible_free : warm);
+    return false;
 }
 
 static CompileServer *pick_server_random(list<CompileServer *> &eligible)
@@ -2322,8 +2392,11 @@ static CompileServer *pick_server_fastest(Job *job, list<CompileServer *> &eligi
     return bestpre;
 }
 
-static CompileServer *pick_server(Job *job, SchedulerAlgorithmName schedulerAlgorithm)
+static CompileServer *pick_server(Job *job,
+                                  SchedulerAlgorithmName schedulerAlgorithm,
+                                  bool &cache_retry_wait)
 {
+    cache_retry_wait = false;
 #if DEBUG_SCHEDULER > 0
     /* consistency checking for now */
     for (list<CompileServer *>::iterator it = css.begin(); it != css.end(); ++it) {
@@ -2347,6 +2420,12 @@ static CompileServer *pick_server(Job *job, SchedulerAlgorithmName schedulerAlgo
     }
 #endif
 
+    const P50CacheProfileRequest cache_request =
+        p50_cache_profile_request_from_env();
+    const bool retry_alternative_exists =
+        assignment_mode_prepares() &&
+        cache_retry_has_compatible_alternative(job, cache_request);
+
     // Ignore ineligible servers
     list<CompileServer *> eligible = filter_ineligible_servers(job);
 
@@ -2355,7 +2434,7 @@ static CompileServer *pick_server(Job *job, SchedulerAlgorithmName schedulerAlgo
 #endif
 
     /* if the user wants to test/prefer one specific daemon, we return it if available */
-    if (!job->preferredHost().empty()) {
+    if (!job->preferredHost().empty() && !retry_alternative_exists) {
         for (CompileServer* const cs : css) {
             const bool prepare_backlogged = cs != job->submitter()
                 && assignment_mode_prepares()
@@ -2378,7 +2457,10 @@ static CompileServer *pick_server(Job *job, SchedulerAlgorithmName schedulerAlgo
         return nullptr;
     }
 
-    prefer_cache_compatible_servers(job, eligible);
+    cache_retry_wait = prefer_cache_compatible_servers(
+        job, eligible, retry_alternative_exists);
+    if (cache_retry_wait)
+        return nullptr;
 
     // Don't bother running an algorithm if we don't need to.
     if ( eligible.size() == 0 ) {
@@ -2685,7 +2767,8 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
     Job* job = jobPosition.job;
 
     while (true) {
-        use_cs = pick_server(job, schedulerAlgorithm);
+        bool cache_retry_wait = false;
+        use_cs = pick_server(job, schedulerAlgorithm, cache_retry_wait);
 
         if (use_cs) {
             break;
@@ -2693,12 +2776,14 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
 
         /* Ignore the load on the submitter itself if no other host could
            be found.  We only obey to its max job number.  */
-        use_cs = job->submitter();
-        if ((use_cs->currentJobCount() < use_cs->maxJobs())
-                && job->preferredHost().empty()
-                /* This should be trivially true.  */
-                && use_cs->can_install(job).size()) {
-            break;
+        if (!cache_retry_wait) {
+            use_cs = job->submitter();
+            if ((use_cs->currentJobCount() < use_cs->maxJobs())
+                    && job->preferredHost().empty()
+                    /* This should be trivially true.  */
+                    && use_cs->can_install(job).size()) {
+                break;
+            }
         }
 
         jobPosition = get_next_job_request( jobPosition, walkStart );

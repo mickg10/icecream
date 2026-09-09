@@ -1546,6 +1546,9 @@ struct Daemon {
     bool finish_transfer_env(Client *client, bool cancel = false);
     bool handle_get_native_env(Client *client, GetNativeEnvMsg *msg) __attribute_warn_unused_result__;
     bool finish_get_native_env(Client *client, string env_key);
+    void project_getcs_cache_route(
+        GetCSMsg *request,
+        P50CacheClientCapability capability);
     void handle_old_request();
     bool handle_compile_file(Client *client, Msg *msg) __attribute_warn_unused_result__;
     bool handle_p50_source_arm(Client *client, P50SourceArmMsg *msg)
@@ -7577,6 +7580,51 @@ bool Daemon::handle_job_done(Client *cl, JobDoneMsg *m)
     return send_scheduler(*msg);
 }
 
+void Daemon::project_getcs_cache_route(
+    GetCSMsg *request, P50CacheClientCapability capability)
+{
+    assert(request != nullptr);
+
+    /* The wrapper may contribute exactly one routing restriction: a failed
+       ordinary F endpoint for its bounded strict retry.  C still owns the
+       capability/kill-switch decision.  Preserve the restriction only when
+       that decision remains P50-capable; unlike the daemon-wide warm hint it
+       narrows selection and can never grant a profile or endpoint. */
+    const uint32_t requested_avoid_port = request->cache_retry_avoid_port;
+    const string requested_avoid_host = request->cache_retry_avoid_host;
+    const bool preserve_retry_avoid = capability.protocol != 0 &&
+        capability.profile_mask != 0 &&
+        p50_cache_retry_avoid_is_present(
+            requested_avoid_port, requested_avoid_host);
+
+    request->cache_protocol = capability.protocol;
+    request->cache_profile_mask = capability.profile_mask;
+    request->cache_affinity_profile_mask = 0;
+    request->cache_affinity_port = 0;
+    request->cache_affinity_host.clear();
+    request->cache_retry_avoid_port = 0;
+    request->cache_retry_avoid_host.clear();
+
+    if (preserve_retry_avoid) {
+        request->cache_retry_avoid_port = requested_avoid_port;
+        request->cache_retry_avoid_host = requested_avoid_host;
+        trace() << "P50 retry exclusion forwarded endpoint="
+                << requested_avoid_host << ":" << requested_avoid_port
+                << endl;
+        return;
+    }
+
+    if (capability.profile_mask != 0 &&
+        cache_affinity_profile_mask != 0 &&
+        (cache_affinity_profile_mask & ~capability.profile_mask) == 0 &&
+        cache_affinity_port != 0 && cache_affinity_port <= UINT16_MAX &&
+        !cache_affinity_host.empty()) {
+        request->cache_affinity_profile_mask = cache_affinity_profile_mask;
+        request->cache_affinity_port = cache_affinity_port;
+        request->cache_affinity_host = cache_affinity_host;
+    }
+}
+
 void Daemon::handle_old_request()
 {
     const unsigned int compile_limit = std::max((unsigned int)1, max_kids);
@@ -7627,23 +7675,7 @@ void Daemon::handle_old_request()
             c->cache_offer = revalidated;
             if (revalidated.profile_mask == 0)
                 c->cache_offer_lease.reset();
-            g->cache_protocol = revalidated.protocol;
-            g->cache_profile_mask = revalidated.profile_mask;
-            g->cache_affinity_profile_mask = 0;
-            g->cache_affinity_port = 0;
-            g->cache_affinity_host.clear();
-            if (revalidated.profile_mask != 0 &&
-                cache_affinity_profile_mask != 0 &&
-                (cache_affinity_profile_mask &
-                 ~revalidated.profile_mask) == 0 &&
-                cache_affinity_port != 0 &&
-                cache_affinity_port <= UINT16_MAX &&
-                !cache_affinity_host.empty()) {
-                g->cache_affinity_profile_mask =
-                    cache_affinity_profile_mask;
-                g->cache_affinity_port = cache_affinity_port;
-                g->cache_affinity_host = cache_affinity_host;
-            }
+            project_getcs_cache_route(g, revalidated);
             g->client_count = clients.size();
             g->command_summary.clear();
             const bool sent = send_scheduler(*g);
@@ -8889,20 +8921,7 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
         cache_route_state_lease.has_value()) {
         client->cache_offer_lease = *cache_route_state_lease;
     }
-    umsg->cache_protocol = cache_capability.protocol;
-    umsg->cache_profile_mask = cache_capability.profile_mask;
-    umsg->cache_affinity_profile_mask = 0;
-    umsg->cache_affinity_port = 0;
-    umsg->cache_affinity_host.clear();
-    if (cache_capability.profile_mask != 0 &&
-        (cache_affinity_profile_mask & ~cache_capability.profile_mask) == 0 &&
-        cache_affinity_profile_mask != 0 &&
-        cache_affinity_port != 0 && cache_affinity_port <= UINT16_MAX &&
-        !cache_affinity_host.empty()) {
-        umsg->cache_affinity_profile_mask = cache_affinity_profile_mask;
-        umsg->cache_affinity_port = cache_affinity_port;
-        umsg->cache_affinity_host = cache_affinity_host;
-    }
+    project_getcs_cache_route(umsg, cache_capability);
     if (!umsg->command_summary.empty()) {
         client->command_line = umsg->command_summary;
     } else if (client->command_line.empty() && client->channel) {

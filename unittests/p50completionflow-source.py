@@ -125,7 +125,8 @@ def check_client(source: str, makefile: str) -> None:
             "107 is not observably normalized into the bounded retry class")
 
 
-def check_wrapper_retry(main_source: str, remote_source: str) -> None:
+def check_wrapper_retry(main_source: str, remote_source: str,
+                        client_header: str) -> None:
     retry = section(
         main_source,
         'invocation_timing_mark_enqueue("remote");',
@@ -135,15 +136,21 @@ def check_wrapper_retry(main_source: str, remote_source: str) -> None:
         'const bool strict_p50 =',
         'getenv("ICECC_P50_C1F1_REQUIRED") != nullptr',
         "bool p50_retry_attempted = false;",
+        "string p50_retry_avoid_host;",
+        "uint32_t p50_retry_avoid_port = 0;",
         "build_remote(job, local_daemon, envs, rate,",
         "!p50_retry_attempted || strict_p50",
+        "p50_retry_avoid_host,",
+        "p50_retry_avoid_port",
         "error.errorCode != 106 || p50_retry_attempted",
-        "if (strict_p50)",
-        '"P50 assignment failed; requesting one fresh strict-P50 remote assignment"',
+        "strict_p50 && !error.hasRetryAvoidEndpoint()",
+        '"P50 assignment failed; requesting one fresh strict-P50 remote assignment; avoiding failed endpoint "',
         '"P50 assignment failed; requesting one fresh legacy remote assignment"',
         "local_daemon->send_msg(EndMsg())",
         "delete local_daemon;",
         "local_daemon = get_local_daemon();",
+        "p50_retry_avoid_host = error.retryAvoidHost;",
+        "p50_retry_avoid_port = error.retryAvoidPort;",
         "p50_retry_attempted = true;")
     require(retry.count("p50_retry_attempted = true;") == 1,
             "wrapper does not bound P50 reassignment to one attempt")
@@ -155,9 +162,52 @@ def check_wrapper_retry(main_source: str, remote_source: str) -> None:
             "Error 28 - strict retry test barrier failed" in retry,
             "check-only wrapper cannot deterministically pause a real loss before fresh GetCS")
 
+    require("const std::string retryAvoidHost;" in client_header and
+            "const uint32_t retryAvoidPort;" in client_header and
+            "hasRetryAvoidEndpoint() const noexcept" in client_header and
+            "p50_cache_retry_avoid_is_present(" in client_header,
+            "remote_error does not carry one immutable validated failed endpoint")
+
     remote_start = remote_source.find("int build_remote(")
     require(remote_start >= 0, "missing build_remote for strict retry check")
     remote = remote_source[remote_start:]
+    ordered(
+        remote,
+        "bool request_p50,",
+        "const std::string &retry_avoid_host,",
+        "uint32_t retry_avoid_port)",
+        "job.clearCompileInputIdentity();",
+        "p50_cache_retry_avoid_is_present(",
+        "retry_avoid_port, retry_avoid_host",
+        "getcs.cache_retry_avoid_port = retry_avoid_port;",
+        "getcs.cache_retry_avoid_host = retry_avoid_host;",
+        "local_daemon->send_msg(getcs)")
+    remote_error_catch = section(
+        remote, "} catch (const remote_error &error) {",
+        "} catch (const client_error &error) {")
+    ordered(
+        remote_error_catch,
+        "const bool p50_assignment = usecs->hasCacheAdvertisement();",
+        "const string failed_host = usecs->hostname;",
+        "const uint32_t failed_port = usecs->port;",
+        "publish_p50_observation();",
+        "delete usecs;",
+        "error.errorCode == 106 && p50_assignment",
+        "p50_cache_retry_avoid_is_present(",
+        "failed_port, failed_host",
+        "error.errorCode, error.what(), failed_host, failed_port")
+    transport_catch = section(
+        remote, "} catch (const client_error &error) {", "} catch(...) {")
+    ordered(
+        transport_catch,
+        "const bool p50_assignment = usecs->hasCacheAdvertisement();",
+        "const string failed_host = usecs->hostname;",
+        "const uint32_t failed_port = usecs->port;",
+        "publish_p50_observation();",
+        "delete usecs;",
+        "if (p50_assignment && p50_transport_failure)",
+        "106,",
+        "failed_host, failed_port")
     reject = section(
         remote,
         "/* maybe_build_local() precedes the remote handoff checks below.",
@@ -565,7 +615,7 @@ def check_runtime_gate(source: str) -> None:
                   'ICECC_P50_TEST_FRESH_STRICT_RETRY=1',
                   'ICECC_P50_TEST_FRESH_STRICT_RETRY_SECOND_FAILURE=1',
                   'rm -f -- "$strict_retry_remote_obj"',
-                  'P50 assignment failed; requesting one fresh strict-P50 remote assignment',
+                  'P50 assignment failed; requesting one fresh strict-P50 remote assignment; avoiding failed endpoint',
                   'strict retry reused the first assignment nonce',
                   'strict assignment lacks one exact P29V1 source witness',
                   'ICECC_P50_TEST_STRICT_RETRY_BEFORE_GETCS_BARRIER',
@@ -627,7 +677,7 @@ def check_record(header: str, source: str) -> None:
 
 def check_all(files: dict[str, str]) -> None:
     check_client(files["client"], files["client_make"])
-    check_wrapper_retry(files["client_main"], files["client"])
+    check_wrapper_retry(files["client_main"], files["client"], files["client_h"])
     check_worker(files["serve"], files["record_h"] + files["record_cpp"])
     check_parent(files["main"])
     check_compiler_quiescence(files["main"], files["compiler_signal"],
@@ -645,6 +695,12 @@ def deletion_mutants(files: dict[str, str]) -> None:
          "!p50_retry_attempted"),
         ("client_main", "error.errorCode != 106 || p50_retry_attempted",
          "error.errorCode != 106"),
+        ("client_main", "strict_p50 && !error.hasRetryAvoidEndpoint()",
+         "false"),
+        ("client_main", "p50_retry_avoid_host = error.retryAvoidHost;", ""),
+        ("client", "getcs.cache_retry_avoid_port = retry_avoid_port;", ""),
+        ("client", "error.errorCode, error.what(), failed_host, failed_port",
+         "error.errorCode, error.what()"),
         ("client", "!usecs->hasCacheAdvertisement()", "false"),
         ("client", "(!barrier_exists || repeat_strict_failure)",
          "(!barrier_exists)"),
@@ -791,6 +847,7 @@ def deletion_mutants(files: dict[str, str]) -> None:
 def main() -> int:
     files = {
         "client": (ROOT / "client/remote.cpp").read_text(),
+        "client_h": (ROOT / "client/client.h").read_text(),
         "client_main": (ROOT / "client/main.cpp").read_text(),
         "client_make": (ROOT / "client/Makefile.am").read_text(),
         "serve": (ROOT / "daemon/serve.cpp").read_text(),

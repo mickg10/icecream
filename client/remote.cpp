@@ -1556,7 +1556,9 @@ static unsigned int requiredRemoteFeatures()
 
 int build_remote(CompileJob &job, MsgChannel *local_daemon,
                  const Environments &_envs, int permill,
-                 bool request_p50)
+                 bool request_p50,
+                 const std::string &retry_avoid_host,
+                 uint32_t retry_avoid_port)
 {
     srand(time(nullptr) + getpid());
 
@@ -1628,6 +1630,11 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon,
                                 local_daemon)) {
             getcs.cache_protocol = CACHE_WIRE_REVISION;
             getcs.cache_profile_mask = CACHE_ADVERTISABLE_PROFILE_MASK;
+            if (p50_cache_retry_avoid_is_present(
+                    retry_avoid_port, retry_avoid_host)) {
+                getcs.cache_retry_avoid_port = retry_avoid_port;
+                getcs.cache_retry_avoid_host = retry_avoid_host;
+            }
         }
 
         trace() << "asking for host to use" << endl;
@@ -1701,9 +1708,18 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon,
                                        versionfile_map[usecs->host_platform],
                                        nullptr, true, &p50_observation);
             }
-        } catch (const remote_error &) {
+        } catch (const remote_error &error) {
+            const bool p50_assignment = usecs->hasCacheAdvertisement();
+            const string failed_host = usecs->hostname;
+            const uint32_t failed_port = usecs->port;
             publish_p50_observation();
             delete usecs;
+            if (error.errorCode == 106 && p50_assignment &&
+                p50_cache_retry_avoid_is_present(
+                    failed_port, failed_host)) {
+                throw remote_error(
+                    error.errorCode, error.what(), failed_host, failed_port);
+            }
             throw;
         } catch (const client_error &error) {
             /* Once a cache-selected F closes or corrupts the ordinary result
@@ -1713,6 +1729,8 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon,
                Local input/output errors retain their historical local-fallback
                behavior. */
             const bool p50_assignment = usecs->hasCacheAdvertisement();
+            const string failed_host = usecs->hostname;
+            const uint32_t failed_port = usecs->port;
             const bool p50_transport_failure =
                 error.errorCode == 2 || error.errorCode == 6 ||
                 error.errorCode == 8 || error.errorCode == 9 ||
@@ -1727,7 +1745,8 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon,
                               << endl;
                 throw remote_error(
                     106,
-                    "Error 106 - P50 worker transport failed before exact completion");
+                    "Error 106 - P50 worker transport failed before exact completion",
+                    failed_host, failed_port);
             }
             throw;
         } catch(...) {

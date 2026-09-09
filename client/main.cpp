@@ -720,14 +720,27 @@ int main(int argc, char **argv)
             const bool strict_p50 =
                 getenv("ICECC_P50_C1F1_REQUIRED") != nullptr;
             bool p50_retry_attempted = false;
+            string p50_retry_avoid_host;
+            uint32_t p50_retry_avoid_port = 0;
             for (;;) {
                 try {
                     ret = build_remote(job, local_daemon, envs, rate,
-                                       !p50_retry_attempted || strict_p50);
+                                       !p50_retry_attempted || strict_p50,
+                                       p50_retry_avoid_host,
+                                       p50_retry_avoid_port);
                     break;
                 } catch (const remote_error &error) {
                     if (error.errorCode != 106 || p50_retry_attempted)
                         throw;
+
+                    /* A strict retry may remain P50 only when its failed F
+                       endpoint is exact.  Without that value a second GetCS
+                       could return to the same worker and merely replay the
+                       loss; fail closed instead.  The normal legacy retry has
+                       no P50 selection input and does not consume the value. */
+                    if (strict_p50 && !error.hasRetryAvoidEndpoint()) {
+                        throw;
+                    }
 
                     /* The failed cache attempt has already published its exact
                        local observation.  C converts that failure into an
@@ -743,7 +756,9 @@ int main(int argc, char **argv)
                        the outer strict path still forbids local fallback. */
                     if (strict_p50) {
                         log_warning()
-                            << "P50 assignment failed; requesting one fresh strict-P50 remote assignment"
+                            << "P50 assignment failed; requesting one fresh strict-P50 remote assignment; avoiding failed endpoint "
+                            << error.retryAvoidHost << ":"
+                            << error.retryAvoidPort
                             << endl;
                     } else {
                         log_warning()
@@ -757,6 +772,10 @@ int main(int argc, char **argv)
                         throw client_error(
                             24,
                             "Error 24 - unable to reconnect for P50 retry");
+                    if (strict_p50) {
+                        p50_retry_avoid_host = error.retryAvoidHost;
+                        p50_retry_avoid_port = error.retryAvoidPort;
+                    }
                     p50_retry_attempted = true;
 #ifdef ICECC_P50_COMPLETION_TEST_HOOKS
                     if (strict_p50 &&

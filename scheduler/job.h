@@ -222,13 +222,17 @@ public:
     void setCacheRequest(uint32_t protocol, uint32_t profile_mask,
                          uint32_t affinity_profile_mask,
                          uint32_t affinity_port,
-                         const std::string &affinity_host)
+                         const std::string &affinity_host,
+                         uint32_t retry_avoid_port,
+                         const std::string &retry_avoid_host)
     {
         m_cacheProtocol = protocol;
         m_cacheProfileMask = profile_mask;
         m_cacheAffinityProfileMask = affinity_profile_mask;
         m_cacheAffinityPort = affinity_port;
         m_cacheAffinityHost = affinity_host;
+        m_cacheRetryAvoidPort = retry_avoid_port;
+        m_cacheRetryAvoidHost = retry_avoid_host;
     }
     uint32_t cacheProtocol() const { return m_cacheProtocol; }
     uint32_t cacheProfileMask() const { return m_cacheProfileMask; }
@@ -237,6 +241,9 @@ public:
     uint32_t cacheAffinityPort() const { return m_cacheAffinityPort; }
     const std::string &cacheAffinityHost() const
     { return m_cacheAffinityHost; }
+    uint32_t cacheRetryAvoidPort() const { return m_cacheRetryAvoidPort; }
+    const std::string &cacheRetryAvoidHost() const
+    { return m_cacheRetryAvoidHost; }
 
 private:
     const unsigned int m_id;
@@ -291,6 +298,8 @@ private:
     uint32_t m_cacheAffinityProfileMask = 0;
     uint32_t m_cacheAffinityPort = 0;
     std::string m_cacheAffinityHost;
+    uint32_t m_cacheRetryAvoidPort = 0;
+    std::string m_cacheRetryAvoidHost;
 };
 
 #endif

@@ -52,22 +52,56 @@ static int bind_port(int requested, int *actual)
     return fd;
 }
 
+static int bind_scheduler_port(int type, int requested, int *actual)
+{
+    const int fd = socket(AF_INET, type, 0);
+    if (fd < 0) return -1;
+    if (type == SOCK_STREAM) {
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    }
+    sockaddr_in address {};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_ANY);
+    address.sin_port = htons(static_cast<uint16_t>(requested));
+    if (bind(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0) {
+        close(fd);
+        return -1;
+    }
+    socklen_t length = sizeof(address);
+    if (getsockname(fd, reinterpret_cast<sockaddr *>(&address), &length) != 0) {
+        close(fd);
+        return -1;
+    }
+    *actual = ntohs(address.sin_port);
+    return fd;
+}
+
 static int reserve_port_pair()
 {
+    /* A scheduler binds wildcard TCP on port/port+1 and wildcard UDP on
+       port.  Reserving only loopback TCP can falsely pass while another
+       scheduler owns UDP, producing a late bind failure after fork.  Hold all
+       three exact sockets through selection and release them together just
+       before the child starts. */
     for (int attempt = 0; attempt != 100; ++attempt) {
         int port = 0;
-        int first = bind_port(0, &port);
+        int first = bind_scheduler_port(SOCK_STREAM, 0, &port);
         if (first < 0 || port >= 65535) {
             if (first >= 0) close(first);
             continue;
         }
         int ignored = 0;
-        int second = bind_port(port + 1, &ignored);
-        if (second >= 0) {
+        int second = bind_scheduler_port(SOCK_STREAM, port + 1, &ignored);
+        int broadcast = bind_scheduler_port(SOCK_DGRAM, port, &ignored);
+        if (second >= 0 && broadcast >= 0) {
+            close(broadcast);
             close(second);
             close(first);
             return port;
         }
+        if (broadcast >= 0) close(broadcast);
+        if (second >= 0) close(second);
         close(first);
     }
     return 0;
@@ -428,7 +462,9 @@ static bool request_job(MsgChannel *submitter, uint32_t client_id,
 static bool request_cache_job(MsgChannel *submitter, uint32_t client_id,
                               const std::string &affinity_host = std::string(),
                               uint32_t affinity_port = 0,
-                              uint32_t affinity_profiles = 0)
+                              uint32_t affinity_profiles = 0,
+                              const std::string &retry_avoid_host = std::string(),
+                              uint32_t retry_avoid_port = 0)
 {
     GetCSMsg request(
         Environments { std::make_pair(std::string("x86_64"),
@@ -441,6 +477,8 @@ static bool request_cache_job(MsgChannel *submitter, uint32_t client_id,
     request.cache_affinity_profile_mask = affinity_profiles;
     request.cache_affinity_port = affinity_port;
     request.cache_affinity_host = affinity_host;
+    request.cache_retry_avoid_port = retry_avoid_port;
+    request.cache_retry_avoid_host = retry_avoid_host;
     return submitter->send_msg(request);
 }
 
@@ -449,7 +487,9 @@ static bool request_cache_job(MsgChannel *submitter, uint32_t client_id,
    Login nodename or the numeric peer address, so the nodename passed to
    login_host works here. */
 static bool request_job_preferring(MsgChannel *submitter, uint32_t client_id,
-                                   const std::string &preferred_host)
+                                   const std::string &preferred_host,
+                                   const std::string &retry_avoid_host = std::string(),
+                                   uint32_t retry_avoid_port = 0)
 {
     GetCSMsg request(
         Environments { std::make_pair(std::string("x86_64"),
@@ -459,7 +499,20 @@ static bool request_job_preferring(MsgChannel *submitter, uint32_t client_id,
     request.client_id = client_id;
     request.cache_protocol = CACHE_WIRE_REVISION;
     request.cache_profile_mask = CACHE_ADVERTISABLE_PROFILE_MASK;
+    request.cache_retry_avoid_host = retry_avoid_host;
+    request.cache_retry_avoid_port = retry_avoid_port;
     return submitter->send_msg(request);
+}
+
+static bool set_worker_load(MsgChannel *worker, uint32_t load)
+{
+    StatsMsg stats;
+    stats.load = load;
+    stats.loadAvg1 = 0;
+    stats.loadAvg5 = 0;
+    stats.loadAvg10 = 0;
+    stats.freeMem = 0;
+    return worker && worker->send_msg(stats);
 }
 
 static bool file_contains(const std::string &path, const std::string &needle)
@@ -1661,6 +1714,60 @@ static void run_cache_routing_preference(const std::string &binary,
                 cache_a_sentinel >= 0 && cache_b_sentinel >= 0,
             "two compatible workers and one legacy worker join the mixed pool");
 
+    /* Reproduce the S70 ordering: the failed endpoint A is free (or rejoins)
+       before compatible B has capacity.  The retry must remain queued until
+       B frees; deleting retry exclusion makes the immediate A checks below
+       receive both PREPARE and UseCS. */
+    REQUIRE(submitter && request_job_preferring(
+                submitter, 6097, "cache-route-b"),
+            "compatible alternative B is occupied before the retry probe");
+    AssignPrepareMsg *busy_b_prepare = wait_prepare(worker_b);
+    UseCSMsg *busy_b_use = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(busy_b_prepare && busy_b_use &&
+                busy_b_use->port == static_cast<uint32_t>(worker_b_port),
+            "setup consumes B's only real slot");
+    if (busy_b_use)
+        worker_b->send_msg(JobBeginMsg(busy_b_use->job_id, 0));
+
+    REQUIRE(submitter && request_cache_job(
+                submitter, 6098, std::string(), 0, 0,
+                "127.0.0.1", static_cast<uint32_t>(worker_a_port)),
+            "strict retry requests exact failed endpoint A exclusion");
+    AssignPrepareMsg *forbidden_a_prepare = dynamic_cast<AssignPrepareMsg *>(
+        wait_type(worker_a, Msg::ASSIGN_PREPARE, 300));
+    UseCSMsg *premature_retry_use = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 300));
+    REQUIRE(!forbidden_a_prepare && !premature_retry_use,
+            "retry waits instead of returning to free failed endpoint A while B is busy");
+    delete forbidden_a_prepare;
+    delete premature_retry_use;
+
+    if (busy_b_use)
+        worker_b->send_msg(job_done_for(
+            *busy_b_use, 0, JobDoneMsg::FROM_SERVER));
+    AssignPrepareMsg *retry_b_prepare = wait_prepare(worker_b);
+    UseCSMsg *retry_b_use = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(retry_b_prepare && retry_b_use &&
+                retry_b_use->port == static_cast<uint32_t>(worker_b_port),
+            "queued retry selects B immediately after alternative capacity frees");
+    if (retry_b_use) {
+        worker_b->send_msg(JobBeginMsg(retry_b_use->job_id, 0));
+        worker_b->send_msg(job_done_for(
+            *retry_b_use, 0, JobDoneMsg::FROM_SERVER));
+    }
+    if (retry_b_use) {
+        const std::string terminal =
+            "END " + std::to_string(retry_b_use->job_id) + " ";
+        REQUIRE(wait_file_contains(log, terminal, 3000),
+                "retry exclusion is request-local and releases B before later jobs");
+    }
+    delete retry_b_use;
+    delete retry_b_prepare;
+    delete busy_b_use;
+    delete busy_b_prepare;
+
     REQUIRE(submitter && request_cache_job(
                 submitter, 6099, "127.0.0.1",
                 static_cast<uint32_t>(cache_a_port), CACHE_PROFILE_P29V1),
@@ -1679,6 +1786,10 @@ static void run_cache_routing_preference(const std::string &binary,
         stale_port_worker->send_msg(JobBeginMsg(stale_port_use->job_id, 0));
         stale_port_worker->send_msg(job_done_for(
             *stale_port_use, 0, JobDoneMsg::FROM_SERVER));
+        const std::string terminal =
+            "END " + std::to_string(stale_port_use->job_id) + " ";
+        REQUIRE(wait_file_contains(log, terminal, 3000),
+                "stale-hint control releases its selected worker");
     }
     delete stale_port_use;
     delete stale_port_prepare;
@@ -1700,6 +1811,10 @@ static void run_cache_routing_preference(const std::string &binary,
         wrong_profile_worker->send_msg(JobBeginMsg(wrong_profile_use->job_id, 0));
         wrong_profile_worker->send_msg(job_done_for(
             *wrong_profile_use, 0, JobDoneMsg::FROM_SERVER));
+        const std::string terminal =
+            "END " + std::to_string(wrong_profile_use->job_id) + " ";
+        REQUIRE(wait_file_contains(log, terminal, 3000),
+                "profile-mismatch control releases its selected worker");
     }
     delete wrong_profile_use;
     delete wrong_profile_prepare;
@@ -1776,6 +1891,324 @@ static void run_cache_routing_preference(const std::string &binary,
     REQUIRE(file_contains(log, "P50_WARM_HINT_OVERRIDE job=") &&
                 file_contains(log, "warm=1 compatible_free=2 idle_excluded=1"),
             "warm affinity overriding an idle compatible worker emits an S80 diagnostic");
+}
+
+static void run_cache_retry_pressure_and_preferred(
+    const std::string &binary, const std::string &directory)
+{
+    const int port = reserve_port_pair();
+    const std::string log = directory + "/cache-retry-pressure.log";
+    pid_t scheduler = start_cache_routing_scheduler(binary, port, log);
+    REQUIRE(port != 0 && scheduler > 0,
+            "retry-pressure scheduler process launched");
+
+    int worker_a_port = 0;
+    int worker_a_listener = bind_port(0, &worker_a_port);
+    if (worker_a_listener >= 0) listen(worker_a_listener, 16);
+    int cache_a_port = 0;
+    int cache_a_sentinel = bind_port(0, &cache_a_port);
+    if (cache_a_sentinel >= 0) listen(cache_a_sentinel, 4);
+
+    int worker_b_port = 0;
+    int worker_b_listener = bind_port(0, &worker_b_port);
+    if (worker_b_listener >= 0) listen(worker_b_listener, 16);
+    int cache_b_port = 0;
+    int cache_b_sentinel = bind_port(0, &cache_b_port);
+    if (cache_b_sentinel >= 0) listen(cache_b_sentinel, 4);
+
+    int local_port = 0;
+    int local_listener = bind_port(0, &local_port);
+    if (local_listener >= 0) listen(local_listener, 16);
+
+    ConfCSMsg *configuration = nullptr;
+    MsgChannel *worker_a = login_host(
+        port, "retry-pressure-a", true, worker_a_port, &configuration,
+        nullptr, 1, 0, static_cast<uint32_t>(cache_a_port),
+        CACHE_WIRE_REVISION, CACHE_PROFILE_P29V1);
+    delete configuration;
+    configuration = nullptr;
+    MsgChannel *worker_b = login_host(
+        port, "retry-pressure-b", true, worker_b_port, &configuration,
+        nullptr, 1, 0, static_cast<uint32_t>(cache_b_port),
+        CACHE_WIRE_REVISION, CACHE_PROFILE_P29V1);
+    delete configuration;
+    configuration = nullptr;
+    /* This C is deliberately also locally capable.  A wait disposition that
+       merely clears the remote list would otherwise fall through to it. */
+    MsgChannel *submitter = login_host(
+        port, "retry-pressure-submit", true, local_port, &configuration);
+    delete configuration;
+    configuration = nullptr;
+    MsgChannel *other_submitter = login_host(
+        port, "retry-pressure-other", false, 0, &configuration);
+    delete configuration;
+    REQUIRE(worker_a && worker_b && submitter && other_submitter,
+            "two compatible F workers and a locally capable C join");
+
+    REQUIRE(request_job_preferring(submitter, 6201, "retry-pressure-b"),
+            "first job occupies B's real slot");
+    AssignPrepareMsg *busy_b1_prepare = wait_prepare(worker_b);
+    UseCSMsg *busy_b1 = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(busy_b1_prepare && busy_b1 &&
+                busy_b1->port == static_cast<uint32_t>(worker_b_port),
+            "B's single real slot is occupied");
+    if (busy_b1) worker_b->send_msg(JobBeginMsg(busy_b1->job_id, 0));
+
+    REQUIRE(request_job_preferring(submitter, 6202, "retry-pressure-b"),
+            "second forced job occupies B's sole preload allowance");
+    AssignPrepareMsg *busy_b2_prepare = wait_prepare(worker_b);
+    UseCSMsg *busy_b2 = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(busy_b2_prepare && busy_b2 &&
+                busy_b2->port == static_cast<uint32_t>(worker_b_port),
+            "B reaches maxJobs plus maxPreloadCount saturation");
+    if (busy_b2) worker_b->send_msg(JobBeginMsg(busy_b2->job_id, 0));
+
+    REQUIRE(request_cache_job(
+                submitter, 6203, std::string(), 0, 0, "127.0.0.1",
+                static_cast<uint32_t>(worker_a_port)),
+            "retry excludes free A while compatible B is preload-saturated");
+    AssignPrepareMsg *forbidden_a = dynamic_cast<AssignPrepareMsg *>(
+        wait_type(worker_a, Msg::ASSIGN_PREPARE, 300));
+    UseCSMsg *forbidden_local = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 300));
+    REQUIRE(!forbidden_a && !forbidden_local,
+            "saturated B keeps retry queued without A or local-C fallback");
+    delete forbidden_a;
+    delete forbidden_local;
+
+    REQUIRE(request_job_preferring(
+                other_submitter, 6204, "retry-pressure-a"),
+            "ordinary work is queued behind the waiting retry");
+    AssignPrepareMsg *other_prepare = wait_prepare(worker_a);
+    UseCSMsg *other_use = dynamic_cast<UseCSMsg *>(
+        wait_type(other_submitter, Msg::USE_CS, 3000));
+    REQUIRE(other_prepare && other_use &&
+                other_use->port == static_cast<uint32_t>(worker_a_port),
+            "retry wait does not wedge later schedulable work");
+    if (other_use) {
+        worker_a->send_msg(JobBeginMsg(other_use->job_id, 0));
+        worker_a->send_msg(job_done_for(
+            *other_use, 0, JobDoneMsg::FROM_SERVER));
+    }
+    delete other_use;
+    delete other_prepare;
+
+    if (busy_b1)
+        worker_b->send_msg(job_done_for(
+            *busy_b1, 0, JobDoneMsg::FROM_SERVER));
+    forbidden_a = dynamic_cast<AssignPrepareMsg *>(
+        wait_type(worker_a, Msg::ASSIGN_PREPARE, 300));
+    forbidden_local = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 300));
+    REQUIRE(!forbidden_a && !forbidden_local,
+            "freeing only B's preload leaves no real slot and still waits");
+    delete forbidden_a;
+    delete forbidden_local;
+
+    if (busy_b2)
+        worker_b->send_msg(job_done_for(
+            *busy_b2, 0, JobDoneMsg::FROM_SERVER));
+    AssignPrepareMsg *retry_b_prepare = wait_prepare(worker_b);
+    UseCSMsg *retry_b = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(retry_b_prepare && retry_b &&
+                retry_b->port == static_cast<uint32_t>(worker_b_port),
+            "preload-saturated alternative receives retry at its first real slot");
+    if (retry_b) {
+        worker_b->send_msg(JobBeginMsg(retry_b->job_id, 0));
+        worker_b->send_msg(job_done_for(
+            *retry_b, 0, JobDoneMsg::FROM_SERVER));
+    }
+    delete retry_b;
+    delete retry_b_prepare;
+    delete busy_b2;
+    delete busy_b2_prepare;
+    delete busy_b1;
+    delete busy_b1_prepare;
+
+    REQUIRE(set_worker_load(worker_b, 1000),
+            "B publishes the absolute do-not-schedule load boundary");
+    usleep(100 * 1000);
+    REQUIRE(request_cache_job(
+                submitter, 6205, std::string(), 0, 0, "127.0.0.1",
+                static_cast<uint32_t>(worker_a_port)),
+            "retry excludes A while compatible B is load=1000");
+    forbidden_a = dynamic_cast<AssignPrepareMsg *>(
+        wait_type(worker_a, Msg::ASSIGN_PREPARE, 300));
+    forbidden_local = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 300));
+    REQUIRE(!forbidden_a && !forbidden_local,
+            "load-blocked B keeps retry queued without A or local-C fallback");
+    delete forbidden_a;
+    delete forbidden_local;
+    REQUIRE(set_worker_load(worker_b, 0), "B clears its load boundary");
+    retry_b_prepare = wait_prepare(worker_b);
+    retry_b = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(retry_b_prepare && retry_b &&
+                retry_b->port == static_cast<uint32_t>(worker_b_port),
+            "load recovery releases the queued retry to B");
+    if (retry_b) {
+        worker_b->send_msg(JobBeginMsg(retry_b->job_id, 0));
+        worker_b->send_msg(job_done_for(
+            *retry_b, 0, JobDoneMsg::FROM_SERVER));
+    }
+    delete retry_b;
+    delete retry_b_prepare;
+
+    REQUIRE(request_job_preferring(
+                submitter, 6206, "retry-pressure-a", "127.0.0.1",
+                static_cast<uint32_t>(worker_a_port)),
+            "retry carries a preferredHost that names its failed A endpoint");
+    retry_b_prepare = wait_prepare(worker_b);
+    retry_b = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    forbidden_a = dynamic_cast<AssignPrepareMsg *>(
+        wait_type(worker_a, Msg::ASSIGN_PREPARE, 300));
+    REQUIRE(retry_b_prepare && retry_b && !forbidden_a &&
+                retry_b->port == static_cast<uint32_t>(worker_b_port),
+            "retry exclusion outranks preferredHost and selects B");
+    delete forbidden_a;
+    if (retry_b) {
+        worker_b->send_msg(JobBeginMsg(retry_b->job_id, 0));
+        worker_b->send_msg(job_done_for(
+            *retry_b, 0, JobDoneMsg::FROM_SERVER));
+    }
+    delete retry_b;
+    delete retry_b_prepare;
+
+    REQUIRE(set_worker_load(worker_b, 1000),
+            "B becomes transiently blocked before capability-loss probe");
+    usleep(100 * 1000);
+    REQUIRE(request_cache_job(
+                submitter, 6207, std::string(), 0, 0, "127.0.0.1",
+                static_cast<uint32_t>(worker_a_port)),
+            "retry initially waits for the blocked compatible B");
+    forbidden_a = dynamic_cast<AssignPrepareMsg *>(
+        wait_type(worker_a, Msg::ASSIGN_PREPARE, 300));
+    forbidden_local = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 300));
+    REQUIRE(!forbidden_a && !forbidden_local,
+            "retry is waiting before B withdraws cache capability");
+    delete forbidden_a;
+    delete forbidden_local;
+
+    LoginMsg b_without_cache(static_cast<uint32_t>(worker_b_port),
+                             "retry-pressure-b", "x86_64", 0);
+    b_without_cache.envs.push_back(std::make_pair(
+        std::string("x86_64"), std::string("p49-test-env")));
+    b_without_cache.max_kids = 1;
+    b_without_cache.noremote = false;
+    b_without_cache.chroot_possible = true;
+    b_without_cache.setCacheAdvertisement(0, 0, 0);
+    REQUIRE(worker_b->send_msg(b_without_cache),
+            "B withdraws the compatible cache capability while retry waits");
+    delete wait_type(worker_b, Msg::CS_CONF, 3000);
+    AssignPrepareMsg *same_a_prepare = wait_prepare(worker_a);
+    UseCSMsg *same_a = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(same_a_prepare && same_a &&
+                same_a->port == static_cast<uint32_t>(worker_a_port),
+            "capability disappearance restores lawful same-endpoint recovery");
+    if (same_a) {
+        worker_a->send_msg(JobBeginMsg(same_a->job_id, 0));
+        worker_a->send_msg(job_done_for(
+            *same_a, 0, JobDoneMsg::FROM_SERVER));
+    }
+    delete same_a;
+    delete same_a_prepare;
+
+    REQUIRE(request_job_preferring(
+                submitter, 6208, "retry-pressure-a"),
+            "later ordinary request carries no retry exclusion");
+    same_a_prepare = wait_prepare(worker_a);
+    same_a = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(same_a_prepare && same_a &&
+                same_a->port == static_cast<uint32_t>(worker_a_port),
+            "retry exclusion does not leak to the next logical job");
+    if (same_a) {
+        worker_a->send_msg(JobBeginMsg(same_a->job_id, 0));
+        worker_a->send_msg(job_done_for(
+            *same_a, 0, JobDoneMsg::FROM_SERVER));
+    }
+    delete same_a;
+    delete same_a_prepare;
+
+    REQUIRE(file_contains(log, "P50_RETRY_AVOID_WAIT job=") &&
+                file_contains(log, "P50_RETRY_AVOID_APPLIED job="),
+            "pressure paths emit explicit retry WAIT and APPLIED evidence");
+
+    delete other_submitter;
+    delete submitter;
+    delete worker_a;
+    delete worker_b;
+    if (local_listener >= 0) close(local_listener);
+    if (worker_a_listener >= 0) close(worker_a_listener);
+    if (worker_b_listener >= 0) close(worker_b_listener);
+    if (cache_a_sentinel >= 0) close(cache_a_sentinel);
+    if (cache_b_sentinel >= 0) close(cache_b_sentinel);
+    REQUIRE(stop_scheduler(scheduler),
+            "retry-pressure scheduler stopped cleanly");
+}
+
+static void run_cache_retry_single_worker(const std::string &binary,
+                                          const std::string &directory)
+{
+    const int port = reserve_port_pair();
+    const std::string log = directory + "/cache-retry-single-worker.log";
+    pid_t scheduler = start_cache_routing_scheduler(binary, port, log);
+    REQUIRE(port != 0 && scheduler > 0,
+            "single-worker retry scheduler process launched");
+
+    int worker_port = 0;
+    int worker_listener = bind_port(0, &worker_port);
+    if (worker_listener >= 0) listen(worker_listener, 16);
+    int cache_port = 0;
+    int cache_sentinel = bind_port(0, &cache_port);
+    if (cache_sentinel >= 0) listen(cache_sentinel, 4);
+    int local_port = 0;
+    int local_listener = bind_port(0, &local_port);
+    if (local_listener >= 0) listen(local_listener, 16);
+
+    ConfCSMsg *configuration = nullptr;
+    MsgChannel *worker = login_host(
+        port, "retry-single-worker", true, worker_port, &configuration,
+        nullptr, 1, 0, static_cast<uint32_t>(cache_port),
+        CACHE_WIRE_REVISION, CACHE_PROFILE_P29V1);
+    delete configuration;
+    configuration = nullptr;
+    MsgChannel *submitter = login_host(
+        port, "retry-single-submit", true, local_port, &configuration);
+    delete configuration;
+    REQUIRE(worker && submitter && request_cache_job(
+                submitter, 6210, std::string(), 0, 0, "127.0.0.1",
+                static_cast<uint32_t>(worker_port)),
+            "single-worker retry requests its previous exact endpoint");
+    AssignPrepareMsg *prepare = wait_prepare(worker);
+    UseCSMsg *use = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(prepare && use &&
+                use->port == static_cast<uint32_t>(worker_port),
+            "no compatible alternative permits same-endpoint replacement recovery");
+    REQUIRE(!file_contains(log, "P50_RETRY_AVOID_WAIT job=") &&
+                !file_contains(log, "P50_RETRY_AVOID_APPLIED job="),
+            "single-worker fallback is not mislabeled as exclusion waiting");
+    if (use) {
+        worker->send_msg(JobBeginMsg(use->job_id, 0));
+        worker->send_msg(job_done_for(*use, 0, JobDoneMsg::FROM_SERVER));
+    }
+    delete use;
+    delete prepare;
+    delete submitter;
+    delete worker;
+    if (local_listener >= 0) close(local_listener);
+    if (worker_listener >= 0) close(worker_listener);
+    if (cache_sentinel >= 0) close(cache_sentinel);
+    REQUIRE(stop_scheduler(scheduler),
+            "single-worker retry scheduler stopped cleanly");
 }
 
 static void run_cache_affinity_uses_exact_serialized_host(
@@ -2174,6 +2607,13 @@ int main(int argc, char **argv)
     if (!directory) return 2;
     std::fprintf(stderr, "retained work directory: %s\n", directory);
     signal(SIGPIPE, SIG_IGN);
+    if (std::getenv("ICECC_TEST_CACHE_RETRY_ONLY") != nullptr) {
+        run_cache_retry_pressure_and_preferred(argv[1], directory);
+        run_cache_retry_single_worker(argv[1], directory);
+        std::fprintf(stderr, "%s: %d failure(s)\n",
+                     failures ? "FAIL" : "PASS", failures);
+        return failures ? 1 : 0;
+    }
     run_precompile_worker_terminal(argv[1], directory);
     run_post_begin_submitter_withdrawal(argv[1], directory);
     run_enforcing(argv[1], directory);
@@ -2186,6 +2626,8 @@ int main(int argc, char **argv)
     run_cache_advertisement(argv[1], directory);
     run_cache_handoff_identity_bound(argv[1], directory);
     run_cache_routing_preference(argv[1], directory);
+    run_cache_retry_pressure_and_preferred(argv[1], directory);
+    run_cache_retry_single_worker(argv[1], directory);
     run_cache_affinity_uses_exact_serialized_host(argv[1], directory);
     run_legacy_cache_routing_neutrality(argv[1], directory);
     run_cache_handoff_below_p50(argv[1], directory);

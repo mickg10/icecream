@@ -62,6 +62,12 @@ require_count 1 'if (remaining != 3 * sizeof(uint32_t)) {' services/comm.cpp \
     'UseCS decode requires exactly the three-word tail, matching Login'
 require_count 1 'cache_request_tail_valid = c->read_bounded_string(' \
     services/comm.cpp 'GetCS decodes its warm host through the bounded string reader'
+require_count 1 '7 * sizeof(uint32_t) + 2' services/comm.cpp \
+    'GetCS requires the complete five-word/two-string P50 request tail'
+require_count 1 'cache_retry_avoid_host, P50_CACHE_AFFINITY_HOST_MAX);' \
+    services/comm.cpp 'GetCS decodes the retry endpoint host with the same bound'
+require_count 1 'p50_cache_retry_avoid_is_valid(' services/comm.cpp \
+    'GetCS validates canonical absent-or-exact retry endpoint fields'
 require_count 1 'p50_cache_client_request_is_valid(' services/comm.cpp \
     'GetCS payload validation uses the canonical client-request law'
 require_count 1 'const bool absent = cache_endpoint_port == 0' \
@@ -86,16 +92,30 @@ require_count 1 'ZSTD_ROUTE = 3' cache/protocol50.h \
 # worker is preferred; when none exists the original eligible set is retained.
 require_count 1 'static uint32_t selected_cache_profile(' scheduler/scheduler.cpp \
     'scheduler has one canonical C/F profile-intersection helper'
-require_count 1 'static void prefer_cache_compatible_servers(' scheduler/scheduler.cpp \
+require_count 1 'static bool prefer_cache_compatible_servers(' scheduler/scheduler.cpp \
     'scheduler has one bounded cache preference layer'
 require_count 1 'if (!assignment_mode_prepares())' scheduler/scheduler.cpp \
     'legacy assignment mode bypasses cache-aware selection completely'
-require_count 1 'cs->currentJobCount() < cs->maxJobs() &&' scheduler/scheduler.cpp \
-    'cache preference requires a genuine free slot rather than preload capacity'
-require_count 1 'if (compatible_free.empty())' scheduler/scheduler.cpp \
-    'absence of compatible free capacity preserves the legacy eligible set'
-require_count 1 'prefer_cache_compatible_servers(job, eligible);' scheduler/scheduler.cpp \
+require_count 1 'compatible_free.push_back(cs);' scheduler/scheduler.cpp \
+    'cache preference builds one genuine-free compatible selection set'
+require_count 1 'static bool cache_retry_has_compatible_alternative(' scheduler/scheduler.cpp \
+    'retry routing has one static-compatible alternative predicate'
+require_count 1 '!cs->is_eligible_ever(job)' scheduler/scheduler.cpp \
+    'alternative existence ignores transient load and capacity while retaining authorization'
+require_count 1 'if (retry_alternative_exists) {' scheduler/scheduler.cpp \
+    'exact endpoint exclusion is conditional on a genuine compatible alternative'
+require_count 1 'return is_cache_retry_avoided_endpoint(job, cs);' scheduler/scheduler.cpp \
+    'currently admissible failed endpoint is removed from retry selection'
+require_count 1 'P50_RETRY_AVOID_WAIT job=' scheduler/scheduler.cpp \
+    'transient alternative pressure emits an explicit wait disposition'
+require_count 1 '!job->preferredHost().empty() && !retry_alternative_exists' \
+    scheduler/scheduler.cpp \
+    'retry exclusion outranks the ordinary preferred-host shortcut'
+require_count 1 'cache_retry_wait = prefer_cache_compatible_servers(' \
+    scheduler/scheduler.cpp \
     'server selection applies the bounded preference exactly once'
+require_count 1 'if (!cache_retry_wait) {' scheduler/scheduler.cpp \
+    'retry wait suppresses submitter-local fallback without blocking queue scanning'
 require_count 1 'job->setCacheRequest(m.cache_protocol, m.cache_profile_mask,' \
     scheduler/scheduler.cpp 'decoded C capabilities are retained on every admitted job'
 require_count 1 'cs->remotePort() == job->cacheAffinityPort() &&' \
@@ -216,16 +236,34 @@ require_count 1 'client_cache_capability.protocol == msg->cache_protocol' daemon
     'the C kill switch also gates a scheduler-supplied handoff at relay time'
 require_count 1 'cache_capability.profile_mask &= umsg->cache_profile_mask;' daemon/main.cpp \
     'the C daemon authorizes only the wrapper-requested capability intersection'
+require_count 4 'project_getcs_cache_route(' daemon/main.cpp \
+    'one projection helper serves direct and deferred GetCS boundaries'
+require_count 1 'const bool preserve_retry_avoid = capability.protocol != 0 &&' \
+    daemon/main.cpp 'C preserves retry exclusion only under live P50 capability'
+require_count 1 'request->cache_retry_avoid_port = 0;' daemon/main.cpp \
+    'C canonicalizes retry endpoint state before each projection'
+require_count 1 'request->cache_retry_avoid_port = requested_avoid_port;' \
+    daemon/main.cpp 'C restores only the exact validated request-local exclusion'
 require_count 1 'getcs.cache_profile_mask = CACHE_ADVERTISABLE_PROFILE_MASK;' client/remote.cpp \
     'a new wrapper explicitly opts an ordinary scalar request into retained profiles'
+require_count 1 'getcs.cache_retry_avoid_port = retry_avoid_port;' client/remote.cpp \
+    'strict retry serializes its exact failed ordinary F port on fresh GetCS'
+require_count 1 'getcs.cache_retry_avoid_host = retry_avoid_host;' client/remote.cpp \
+    'strict retry serializes its exact failed F host on fresh GetCS'
 require_count 1 'ret = build_remote(job, local_daemon, envs, rate,' client/main.cpp \
     'the wrapper owns one bounded P50 reassignment loop'
 require_count 1 'bool p50_retry_attempted = false;' client/main.cpp \
     'the fresh P50 reassignment has one wrapper-global retry budget'
 require_count 1 'error.errorCode != 106 || p50_retry_attempted' client/main.cpp \
     'only the first authenticated P50 loss can request reassignment'
-require_count 1 '!p50_retry_attempted || strict_p50);' client/main.cpp \
+require_count 1 '!p50_retry_attempted || strict_p50,' client/main.cpp \
     'a normal retry sends canonical absence while a strict retry requests P50 again'
+require_count 1 'strict_p50 && !error.hasRetryAvoidEndpoint()' client/main.cpp \
+    'strict Error106 without an exact failed endpoint fails closed'
+require_count 1 'p50_retry_avoid_host = error.retryAvoidHost;' client/main.cpp \
+    'wrapper carries the failed host only into its one fresh assignment'
+require_count 1 'p50_retry_avoid_port = error.retryAvoidPort;' client/main.cpp \
+    'wrapper carries the failed port only into its one fresh assignment'
 require_count 1 'p50_retry_attempted = true;' client/main.cpp \
     'the retry budget is consumed before the fresh GetCS'
 require_count 1 'Each build_remote() call owns one fresh scheduler assignment attempt.' \

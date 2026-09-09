@@ -962,8 +962,22 @@ cmp -s "$strict_retry_remote_obj" "$strict_retry_local_obj" || {
     exit 1
 }
 test "$(grep -F -c \
-    'P50 assignment failed; requesting one fresh strict-P50 remote assignment' \
+    "P50 assignment failed; requesting one fresh strict-P50 remote assignment; avoiding failed endpoint $worker_scheduler_host:$port_worker_strict1" \
     "$strict_retry_client_log")" -eq 1
+test "$(grep -F -c \
+    "P50 retry exclusion forwarded endpoint=$worker_scheduler_host:$port_worker_strict1" \
+    "$work/c.log")" -eq 1
+grep -F "P50_RETRY_AVOID_APPLIED job= endpoint=$worker_scheduler_host:$port_worker_strict1" \
+    "$work/scheduler.log" >/dev/null 2>&1 && {
+    echo "FAIL: scheduler retry trace lost its job id" >&2
+    exit 1
+}
+grep -E \
+    "P50_RETRY_AVOID_APPLIED job=[0-9]+ endpoint=$worker_scheduler_host:$port_worker_strict1 alternatives=[1-9][0-9]*" \
+    "$work/scheduler.log" >/dev/null || {
+    echo "FAIL: replacement strict retry did not apply the exact failed endpoint exclusion" >&2
+    exit 1
+}
 if grep -E 'requesting one fresh legacy|building myself, but telling localhost|strict all-P50 run refuses' \
     "$strict_retry_client_log" >/dev/null 2>&1; then
     echo "FAIL: successful strict retry crossed a legacy/local/refusal path" >&2
@@ -1179,8 +1193,17 @@ grep -F 'worker shutdown interrupted remote compiler; closing result stream' \
     exit 1
 }
 test "$(grep -F -c \
-    'P50 assignment failed; requesting one fresh strict-P50 remote assignment' \
+    "P50 assignment failed; requesting one fresh strict-P50 remote assignment; avoiding failed endpoint $worker_scheduler_host:$port_worker_strict2" \
     "$inflight_client_log")" -eq 1
+test "$(grep -F -c \
+    "P50 retry exclusion forwarded endpoint=$worker_scheduler_host:$port_worker_strict2" \
+    "$work/c.log")" -eq 1
+grep -E \
+    "P50_RETRY_AVOID_APPLIED job=[0-9]+ endpoint=$worker_scheduler_host:$port_worker_strict2 alternatives=[1-9][0-9]*" \
+    "$work/scheduler.log" >/dev/null || {
+    echo "FAIL: in-flight replacement did not apply its exact failed endpoint exclusion" >&2
+    exit 1
+}
 if grep -E 'requesting one fresh legacy|building myself, but telling localhost|strict all-P50 run refuses' \
     "$inflight_client_log" >/dev/null 2>&1; then
     echo "FAIL: production in-flight strict retry crossed a forbidden path" >&2
@@ -1278,8 +1301,11 @@ test "$(grep -F -c \
     'P50 terminal test forcing Accepted send failure' \
     "$bounded_client_log")" -eq 2
 test "$(grep -F -c \
-    'P50 assignment failed; requesting one fresh strict-P50 remote assignment' \
+    "P50 assignment failed; requesting one fresh strict-P50 remote assignment; avoiding failed endpoint $worker_scheduler_host:$port_worker_strict3" \
     "$bounded_client_log")" -eq 1
+test "$(grep -F -c \
+    "P50 retry exclusion forwarded endpoint=$worker_scheduler_host:$port_worker_strict3" \
+    "$work/c.log")" -eq 1
 grep -F 'strict all-P50 run refuses local retry' \
     "$bounded_client_log" >/dev/null
 if grep -E 'requesting one fresh legacy|building myself, but telling localhost' \
@@ -1298,6 +1324,24 @@ test "${bounded_new_count:-0}" -eq 2 || {
     echo "FAIL: bounded strict retry minted ${bounded_new_count:-0} scheduler jobs" >&2
     exit 1
 }
+
+python3 - "$work/scheduler.log" <<'PY'
+import re
+import sys
+
+scheduler = "\n".join(
+    re.sub(r"^\[\d+\] \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}: ", "", line)
+    for line in open(sys.argv[1], encoding="utf-8"))
+job_ids = [int(value) for value in re.findall(
+    r"^NEW (\d+) .*bounded-strict-retry\.cpp", scheduler, re.M)]
+if len(job_ids) != 2:
+    raise SystemExit(f"FAIL: bounded retry job pair unavailable: {job_ids}")
+retry_route = re.findall(
+    rf"^P50_RETRY_AVOID_(?:WAIT|APPLIED) job={job_ids[1]} ", scheduler, re.M)
+if retry_route:
+    raise SystemExit(
+        "FAIL: sole-worker same-endpoint retry was treated as if an alternative existed")
+PY
 
 # The fault/barrier seams remain absent from the shipped wrapper.
 for selector in \
