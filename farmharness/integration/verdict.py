@@ -1126,6 +1126,182 @@ def _authenticated_strict_p50_retry_ids(
     return authenticated, bad
 
 
+def _authenticated_strict_p50_late_result_ids(
+    bundle: Mapping[str, Any],
+    observations: Mapping[str, Any],
+    rows: Sequence[Mapping[str, Any]],
+    scenario: Mapping[str, Any],
+) -> tuple[set[str], set[str]]:
+    """Validate exact successes delivered across a declared worker loss."""
+
+    field = "successful_strict_p50_late_result_bindings"
+    raw = observations.get(field)
+    if not isinstance(raw, list):
+        return set(), {f"@observations:{field}"}
+    row_records: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in rows:
+        if isinstance(row, Mapping):
+            row_records[_job_id(row.get("job_id"), "@row")].append(row)
+    assignment_records: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    assignment_raw = observations.get("assignment_lifecycle")
+    if isinstance(assignment_raw, list):
+        for item in assignment_raw:
+            if isinstance(item, Mapping):
+                assignment_records[
+                    _job_id(item.get("job_id"), "@assignment-lifecycle")
+                ].append(item)
+    lifecycle_records: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    lifecycle_raw = observations.get("job_lifecycle")
+    if isinstance(lifecycle_raw, list):
+        for item in lifecycle_raw:
+            if isinstance(item, Mapping):
+                lifecycle_records[
+                    _job_id(item.get("job_id"), "@lifecycle")
+                ].append(item)
+
+    process_raw = observations.get("process_loss_recovery_bindings")
+    process_bindings: Counter[tuple[str, int, int, str]] = Counter()
+    if isinstance(process_raw, list):
+        for item in process_raw:
+            if (
+                isinstance(item, Mapping)
+                and set(item)
+                == {"attempt_index", "job_id", "scheduler_job", "worker"}
+                and _is_int(item.get("attempt_index"))
+                and _is_int(item.get("scheduler_job"), minimum=1)
+                and isinstance(item.get("worker"), str)
+                and item["worker"]
+            ):
+                process_bindings[
+                    (
+                        _job_id(item.get("job_id"), "@process-loss-recovery"),
+                        item["attempt_index"],
+                        item["scheduler_job"],
+                        item["worker"],
+                    )
+                ] += 1
+
+    events_raw = bundle.get("event_log")
+    events = events_raw if isinstance(events_raw, list) else []
+    fields = {
+        "attempt_index",
+        "dispatch_ms",
+        "generation",
+        "job_id",
+        "restart_event_index",
+        "restart_fired_ms",
+        "scheduler_job",
+        "terminal_ms",
+        "worker",
+    }
+    authenticated: set[str] = set()
+    identities: set[tuple[int, int, str]] = set()
+    bad: set[str] = set()
+    for index, binding in enumerate(raw):
+        marker = f"@observations:{field}:{index}"
+        if not isinstance(binding, Mapping) or set(binding) != fields:
+            bad.add(marker)
+            continue
+        job_id = _job_id(binding.get("job_id"), marker)
+        event_index = binding.get("restart_event_index")
+        event = (
+            events[event_index]
+            if _is_int(event_index) and event_index < len(events)
+            else None
+        )
+        receipt = event.get("receipt") if isinstance(event, Mapping) else None
+        coordination = (
+            receipt.get("coordination") if isinstance(receipt, Mapping) else None
+        )
+        rejoin = (
+            coordination.get("scheduler_rejoin")
+            if isinstance(coordination, Mapping)
+            else None
+        )
+        previous = events[event_index - 1] if _is_int(event_index, minimum=1) else None
+        previous_fired_ms = (
+            previous.get("fired_ms") if isinstance(previous, Mapping) else None
+        )
+        rows_for_job = row_records.get(job_id, [])
+        assignments_for_job = assignment_records.get(job_id, [])
+        lifecycles_for_job = lifecycle_records.get(job_id, [])
+        row = rows_for_job[0] if len(rows_for_job) == 1 else None
+        assignment = (
+            assignments_for_job[0] if len(assignments_for_job) == 1 else None
+        )
+        lifecycle = lifecycles_for_job[0] if len(lifecycles_for_job) == 1 else None
+        attempts = assignment.get("attempts") if isinstance(assignment, Mapping) else None
+        attempt = attempts[0] if isinstance(attempts, list) and len(attempts) == 1 else None
+        identity = (
+            binding.get("generation"),
+            binding.get("scheduler_job"),
+            binding.get("worker"),
+        )
+        process_identity = (
+            job_id,
+            binding.get("attempt_index"),
+            binding.get("scheduler_job"),
+            binding.get("worker"),
+        )
+        valid = (
+            job_id not in authenticated
+            and identity not in identities
+            and binding.get("attempt_index") == 0
+            and _is_int(binding.get("dispatch_ms"), minimum=1)
+            and _is_int(binding.get("generation"), minimum=1)
+            and _is_int(binding.get("scheduler_job"), minimum=1)
+            and _is_int(binding.get("terminal_ms"), minimum=1)
+            and _is_int(binding.get("restart_fired_ms"), minimum=1)
+            and isinstance(binding.get("worker"), str)
+            and bool(binding["worker"])
+            and binding["dispatch_ms"] <= binding["terminal_ms"]
+            and binding["terminal_ms"] <= binding["restart_fired_ms"]
+            and (
+                event_index == 0
+                or _is_int(previous_fired_ms, minimum=1)
+                and previous_fired_ms < binding["terminal_ms"]
+            )
+            and isinstance(row, Mapping)
+            and row.get("retries") == 0
+            and row.get("exact") is True
+            and row.get("tail_present") is True
+            and row.get("tail_profile") == "P29V1"
+            and row.get("session_outcome") == "committed"
+            and row.get("cs") == binding.get("worker")
+            and isinstance(attempt, Mapping)
+            and attempt
+            == {
+                "generation": binding.get("generation"),
+                "scheduler_job": binding.get("scheduler_job"),
+                "terminal": "process-loss-recovery",
+                "worker": binding.get("worker"),
+            }
+            and isinstance(lifecycle, Mapping)
+            and lifecycle.get("dispatch_ms") == binding.get("dispatch_ms")
+            and _lifecycle_final_dispatch_ms(lifecycle) == binding.get("dispatch_ms")
+            and lifecycle.get("scheduler_generation") == binding.get("generation")
+            and lifecycle.get("terminal") == "process-loss-recovery"
+            and lifecycle.get("terminal_ms") == binding.get("terminal_ms")
+            and process_bindings[process_identity] == 1
+            and isinstance(event, Mapping)
+            and event.get("event_index") == event_index
+            and event.get("action") == "restart"
+            and event.get("instance") == binding.get("worker")
+            and event.get("fired_ms") == binding.get("restart_fired_ms")
+            and not _worker_restart_receipt_errors(receipt, event, scenario)
+            and isinstance(rejoin, Mapping)
+            and rejoin.get("target") == binding.get("worker")
+            and isinstance(rejoin.get("loss_job_ids"), list)
+            and binding.get("scheduler_job") in rejoin["loss_job_ids"]
+        )
+        identities.add(identity)
+        if valid:
+            authenticated.add(job_id)
+        else:
+            bad.add(marker)
+    return authenticated, bad
+
+
 def _assignment_preference_errors(
     observation: Any,
     scenario: Mapping[str, Any],
@@ -4491,6 +4667,9 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
     strict_retry_ids, strict_retry_bad = _authenticated_strict_p50_retry_ids(
         observations, valid_rows
     )
+    late_result_ids, late_result_bad = _authenticated_strict_p50_late_result_ids(
+        bundle, observations, valid_rows, scenario
+    )
     if (
         "successful_strict_p50_retry_bindings" in observations
         or engagement_mode == S70_B4_WORKER_ENGAGEMENT
@@ -4501,6 +4680,14 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
                 not strict_retry_bad,
                 "each declared successful strict-P50 retry binds its failed and final assignments",
                 strict_retry_bad,
+            )
+        )
+        clauses.append(
+            _clause(
+                "recovery.strict-p50-late-result-bindings",
+                not late_result_bad,
+                "each declared exact late result binds its single lost assignment and restart receipt",
+                late_result_bad,
             )
         )
     engagement_bad: set[str] = set()
@@ -4563,6 +4750,15 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
                 | (strict_retry_ids ^ expected_strict_retries)
                 | {"@observations:successful_strict_p50_retry_bindings"}
             )
+        expected_late_results = recovered - strict_retry_ids
+        if late_result_bad or late_result_ids != expected_late_results:
+            engagement_bad.update(
+                late_result_bad
+                | (late_result_ids ^ expected_late_results)
+                | {
+                    "@observations:successful_strict_p50_late_result_bindings"
+                }
+            )
         for row in valid_rows:
             identifier = _job_id(row["job_id"], "@row")
             if identifier in strict_retry_ids:
@@ -4571,6 +4767,13 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
                     and row["tail_profile"] == "P29V1"
                     and row["session_outcome"] == "committed"
                     and row["retries"] == 1
+                )
+            elif identifier in late_result_ids:
+                valid = (
+                    row["tail_present"] is True
+                    and row["tail_profile"] == "P29V1"
+                    and row["session_outcome"] == "committed"
+                    and row["retries"] == 0
                 )
             else:
                 valid = (
@@ -5164,6 +5367,10 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
                 bound_jobs.add(job_id)
             if bound_jobs != recovered:
                 b4_bad.add("@observations:process-loss-recovery-bindings")
+        if late_result_bad or late_result_ids != recovered - strict_retry_ids:
+            b4_bad.add(
+                "@observations:successful-strict-p50-late-result-bindings"
+            )
         strict_bindings = observations.get(
             "successful_strict_p50_retry_bindings"
         )

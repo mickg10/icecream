@@ -4419,6 +4419,104 @@ def _endpoint_workers(plan: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return result
 
 
+def _successful_strict_p50_late_result_binding(
+    scenario: ScenarioSpec,
+    row: Mapping[str, Any],
+    raw: Mapping[str, Any],
+    records: list[Mapping[str, Any]],
+    events: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Bind one exact successful result to its declared worker-loss boundary.
+
+    A worker may deliver an exact result to the submitter immediately before
+    disappearing, while the scheduler observes only the process loss.  This
+    narrow S70 witness is the only successful-wrapper exception for that
+    race: the parsed P50 identities and commits must already be exact, and an
+    authenticated worker-restart receipt must name the same scheduler job.
+    """
+
+    if (
+        scenario.data.get("id") != "S70-b4-worker-bounces"
+        or scenario.data.get("expect", {}).get("engagement")
+        != "s70-b4-worker-bounces"
+        or len(records) != 1
+        or raw.get("compile_rc") != 0
+        or raw.get("exact") != 1
+        or raw.get("remote") != 1
+        or raw.get("local_build") is not False
+        or row.get("exact") is not True
+        or row.get("retries") != 0
+        or row.get("tail_present") is not True
+        or row.get("tail_profile") != "P29V1"
+        or row.get("session_outcome") != "committed"
+    ):
+        return None
+    record = records[0]
+    if (
+        record.get("terminal") != "process-loss-recovery"
+        or row.get("cs") != record.get("worker")
+        or type(record.get("scheduler_job")) is not int
+        or record["scheduler_job"] < 1
+        or type(record.get("generation")) is not int
+        or record["generation"] < 1
+        or type(record.get("dispatch_ms")) is not int
+        or type(record.get("terminal_ms")) is not int
+        or record["dispatch_ms"] > record["terminal_ms"]
+    ):
+        return None
+
+    matching: list[dict[str, Any]] = []
+    for event_index, event in enumerate(events):
+        receipt = event.get("receipt")
+        coordination = (
+            receipt.get("coordination") if isinstance(receipt, Mapping) else None
+        )
+        rejoin = (
+            coordination.get("scheduler_rejoin")
+            if isinstance(coordination, Mapping)
+            else None
+        )
+        fired_ms = event.get("fired_ms")
+        prior_fired_ms = (
+            events[event_index - 1].get("fired_ms") if event_index else None
+        )
+        if (
+            event.get("action") != "restart"
+            or event.get("instance") != record.get("worker")
+            or event.get("event_index") != event_index
+            or not isinstance(receipt, Mapping)
+            or receipt.get("schema") != WORKER_RESTART_SCHEMA
+            or not isinstance(rejoin, Mapping)
+            or rejoin.get("target") != record.get("worker")
+            or not isinstance(rejoin.get("loss_job_ids"), list)
+            or record["scheduler_job"] not in rejoin["loss_job_ids"]
+            or type(fired_ms) is not int
+            or record["terminal_ms"] > fired_ms
+            or (
+                event_index
+                and (
+                    type(prior_fired_ms) is not int
+                    or record["terminal_ms"] <= prior_fired_ms
+                )
+            )
+        ):
+            continue
+        matching.append(
+            {
+                "attempt_index": 0,
+                "dispatch_ms": record["dispatch_ms"],
+                "generation": record["generation"],
+                "job_id": row["job_id"],
+                "restart_event_index": event_index,
+                "restart_fired_ms": fired_ms,
+                "scheduler_job": record["scheduler_job"],
+                "terminal_ms": record["terminal_ms"],
+                "worker": record["worker"],
+            }
+        )
+    return matching[0] if len(matching) == 1 else None
+
+
 def _parse_rows(
     scenario: ScenarioSpec,
     plan: dict[str, Any],
@@ -5916,6 +6014,7 @@ def _observations(
     lifecycle = []
     assignment_lifecycle = []
     successful_strict_p50_retry_bindings = []
+    successful_strict_p50_late_result_bindings = []
     row_by_identity = {row["job_id"]: row for row in rows}
     for raw in raw_jobs:
         row = row_by_identity[raw["row_job_id"]]
@@ -5959,10 +6058,16 @@ def _observations(
             and missing["reason"] == "result-stream-loss"
             for missing in missing_result_identities
         )
+        strict_p50_late_result_binding = (
+            _successful_strict_p50_late_result_binding(
+                scenario, row, raw, records, events
+            )
+        )
         if (
             (raw["compile_rc"] == 0) != (final["terminal"] == "completion")
             and not local_fallback_completion
             and not failed_result_stream_completion
+            and strict_p50_late_result_binding is None
         ):
             raise CollectError(
                 f"{row['job_id']}: wrapper status disagrees with scheduler terminal"
@@ -6065,6 +6170,10 @@ def _observations(
                     "first_worker": first["worker"],
                     "job_id": row["job_id"],
                 }
+            )
+        if strict_p50_late_result_binding is not None:
+            successful_strict_p50_late_result_bindings.append(
+                strict_p50_late_result_binding
             )
     source_mutex = row_facts["source_mutex"]
     if scenario.data.get("id") == "S30-mutant-f-refusal":
@@ -6209,6 +6318,10 @@ def _observations(
         "sidecars": sidecars,
         "successful_strict_p50_retry_bindings": sorted(
             successful_strict_p50_retry_bindings,
+            key=lambda item: item["job_id"],
+        ),
+        "successful_strict_p50_late_result_bindings": sorted(
+            successful_strict_p50_late_result_bindings,
             key=lambda item: item["job_id"],
         ),
         "turns": turn_observations,

@@ -35,6 +35,7 @@ from farmharness.integration.collect import (
     _snapshot_live_evidence,
     _source_candidates_for_assignment,
     _source_results,
+    _successful_strict_p50_late_result_binding,
     _transition_target_env,
     _validate_preexposure_redispatches,
     _validate_orphan_recovery_markers,
@@ -1276,6 +1277,146 @@ def test_scheduler_stop_is_a_real_process_loss_terminal(tmp_path: Path) -> None:
     lifecycle = bundle["observations"]["job_lifecycle"][0]
     assert lifecycle["terminal"] == "process-loss-recovery"
     assert lifecycle["terminal_ms"] == 1_788_570_005_000
+
+
+def _late_result_binding_fixture(tmp_path: Path):
+    _farm, scenario, _plan, _root = _raw_collection(tmp_path)
+    scenario.data["id"] = "S70-b4-worker-bounces"
+    scenario.data["expect"]["engagement"] = "s70-b4-worker-bounces"
+    row = {
+        "cs": "F1",
+        "exact": True,
+        "job_id": "C1:A:1:2",
+        "retries": 0,
+        "session_outcome": "committed",
+        "tail_present": True,
+        "tail_profile": "P29V1",
+    }
+    raw = {
+        "compile_rc": 0,
+        "exact": 1,
+        "local_build": False,
+        "remote": 1,
+    }
+    records = [
+        {
+            "dispatch_ms": 9_000,
+            "generation": 1,
+            "scheduler_job": 2,
+            "terminal": "process-loss-recovery",
+            "terminal_ms": 9_500,
+            "worker": "F1",
+        }
+    ]
+    events = [
+        {
+            "action": "restart",
+            "event_index": 0,
+            "fired_ms": 10_000,
+            "instance": "F1",
+            "receipt": {
+                "schema": "icefarm-worker-restart-v1",
+                "coordination": {
+                    "scheduler_rejoin": {
+                        "loss_job_ids": [2],
+                        "target": "F1",
+                    }
+                },
+            },
+        }
+    ]
+    return scenario, row, raw, records, events
+
+
+def test_strict_p50_late_result_binds_exact_declared_worker_loss(
+    tmp_path: Path,
+) -> None:
+    scenario, row, raw, records, events = _late_result_binding_fixture(tmp_path)
+    assert _successful_strict_p50_late_result_binding(
+        scenario, row, raw, records, events
+    ) == {
+        "attempt_index": 0,
+        "dispatch_ms": 9_000,
+        "generation": 1,
+        "job_id": "C1:A:1:2",
+        "restart_event_index": 0,
+        "restart_fired_ms": 10_000,
+        "scheduler_job": 2,
+        "terminal_ms": 9_500,
+        "worker": "F1",
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "other-scenario",
+        "not-exact",
+        "retry",
+        "not-p29",
+        "not-committed",
+        "local-build",
+        "completion-terminal",
+        "wrong-worker",
+        "missing-loss-job",
+        "outside-boundary",
+    ),
+)
+def test_strict_p50_late_result_binding_fails_closed(
+    tmp_path: Path, mutation: str
+) -> None:
+    scenario, row, raw, records, events = _late_result_binding_fixture(tmp_path)
+    if mutation == "other-scenario":
+        scenario.data["id"] = "S00-smoke"
+    elif mutation == "not-exact":
+        row["exact"] = False
+    elif mutation == "retry":
+        row["retries"] = 1
+    elif mutation == "not-p29":
+        row["tail_profile"] = "ZSTD_TU"
+    elif mutation == "not-committed":
+        row["session_outcome"] = "fallback"
+    elif mutation == "local-build":
+        raw["local_build"] = True
+    elif mutation == "completion-terminal":
+        records[0]["terminal"] = "completion"
+    elif mutation == "wrong-worker":
+        events[0]["instance"] = "F2"
+    elif mutation == "missing-loss-job":
+        events[0]["receipt"]["coordination"]["scheduler_rejoin"][
+            "loss_job_ids"
+        ] = []
+    else:
+        records[0]["terminal_ms"] = 10_001
+
+    assert (
+        _successful_strict_p50_late_result_binding(
+            scenario, row, raw, records, events
+        )
+        is None
+    )
+
+
+def test_collection_refuses_unbound_successful_wrapper_process_loss(
+    tmp_path: Path,
+) -> None:
+    farm, scenario, plan, root = _raw_collection(tmp_path)
+    scheduler = next(
+        item for item in plan["topology"]["instances"] if item["role"] == "S"
+    )
+    scheduler_log = (
+        root / "diagnostics" / scheduler["host"] / "S1.log" / "scheduler.log"
+    )
+    scheduler_log.write_text(
+        scheduler_log.read_text(encoding="utf-8").replace(
+            "[1] 2026-09-05 01:00:05: END 2 status=0 server=F1\n",
+            "[1] 2026-09-05 01:00:05: STOP (DAEMON2) FOR 2\n",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(CollectError, match="wrapper status disagrees"):
+        collect_bundle(farm, scenario, plan, sync_remote=False)
 
 
 def test_control_observations_require_actual_kill_switch_and_process_loss(

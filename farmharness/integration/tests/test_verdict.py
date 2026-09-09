@@ -831,6 +831,7 @@ def _observations(
         }
         | {client: {"sessions": 0} for client in clients},
         "successful_strict_p50_retry_bindings": [],
+        "successful_strict_p50_late_result_bindings": [],
         "wire_revisions": revisions
         if revisions is not None
         else {
@@ -2063,6 +2064,127 @@ def test_s70_b4_worker_recovery_uses_final_dispatch_epoch_and_loss_receipt() -> 
     fixture = _s70_b4_worker_recovery_bundle()
     verdict = evaluate_bundle(fixture)
     assert verdict["status"] == "PASS", verdict
+
+
+def _s70_b4_worker_late_result_bundle() -> dict[str, object]:
+    fixture = _s70_b4_worker_bundle()
+    row = fixture["rows"][100]
+    lifecycle = fixture["observations"]["job_lifecycle"][100]
+    lifecycle.update(
+        dispatch_ms=10_000,
+        final_dispatch_ms=10_000,
+        first_dispatch_ms=10_000,
+        terminal="process-loss-recovery",
+        terminal_ms=10_000,
+        deadline_ms=130_000,
+        scheduler_generation=1,
+    )
+    fixture["observations"]["assignment_lifecycle"][100]["attempts"] = [
+        {
+            "generation": 1,
+            "scheduler_job": 701,
+            "terminal": "process-loss-recovery",
+            "worker": "F1",
+        }
+    ]
+    fixture["event_log"][0]["receipt"]["coordination"]["scheduler_rejoin"][
+        "loss_job_ids"
+    ] = [701]
+    fixture["observations"]["process_loss_recovery_job_ids"] = [row["job_id"]]
+    fixture["observations"]["process_loss_recovery_bindings"] = [
+        {
+            "attempt_index": 0,
+            "job_id": row["job_id"],
+            "scheduler_job": 701,
+            "worker": "F1",
+        }
+    ]
+    fixture["observations"]["successful_strict_p50_late_result_bindings"] = [
+        {
+            "attempt_index": 0,
+            "dispatch_ms": 10_000,
+            "generation": 1,
+            "job_id": row["job_id"],
+            "restart_event_index": 0,
+            "restart_fired_ms": 10_000,
+            "scheduler_job": 701,
+            "terminal_ms": 10_000,
+            "worker": "F1",
+        }
+    ]
+    return fixture
+
+
+def test_s70_b4_exact_late_result_is_bound_to_declared_worker_loss() -> None:
+    fixture = _s70_b4_worker_late_result_bundle()
+    verdict = evaluate_bundle(fixture)
+    assert verdict["status"] == "PASS", verdict
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing-binding",
+        "wrong-job",
+        "wrong-worker",
+        "wrong-generation",
+        "wrong-event",
+        "wrong-fired-time",
+        "missing-loss-job",
+        "retry",
+        "not-exact",
+        "not-committed",
+        "not-p29",
+        "completion-terminal",
+        "missing-process-binding",
+    ),
+)
+def test_s70_b4_late_result_binding_fails_closed(mutation: str) -> None:
+    fixture = _s70_b4_worker_late_result_bundle()
+    bindings = fixture["observations"][
+        "successful_strict_p50_late_result_bindings"
+    ]
+    binding = bindings[0]
+    row = fixture["rows"][100]
+    if mutation == "missing-binding":
+        bindings.clear()
+    elif mutation == "wrong-job":
+        binding["scheduler_job"] = 702
+    elif mutation == "wrong-worker":
+        binding["worker"] = "F2"
+    elif mutation == "wrong-generation":
+        binding["generation"] = 2
+    elif mutation == "wrong-event":
+        binding["restart_event_index"] = 1
+    elif mutation == "wrong-fired-time":
+        binding["restart_fired_ms"] = 10_001
+    elif mutation == "missing-loss-job":
+        fixture["event_log"][0]["receipt"]["coordination"][
+            "scheduler_rejoin"
+        ]["loss_job_ids"] = []
+    elif mutation == "retry":
+        row["retries"] = 1
+    elif mutation == "not-exact":
+        row["exact"] = False
+    elif mutation == "not-committed":
+        row["session_outcome"] = "fallback"
+    elif mutation == "not-p29":
+        row["tail_profile"] = "ZSTD_TU"
+    elif mutation == "completion-terminal":
+        fixture["observations"]["assignment_lifecycle"][100]["attempts"][0][
+            "terminal"
+        ] = "completion"
+    else:
+        fixture["observations"]["process_loss_recovery_bindings"] = []
+
+    verdict = evaluate_bundle(fixture)
+    assert verdict["status"] == "FAIL"
+    failed = {item["id"] for item in verdict["clauses"] if item["status"] == "FAIL"}
+    assert failed & {
+        "engagement.expected",
+        "recovery.strict-p50-late-result-bindings",
+        "s70.b4-worker-bounces",
+    }
 
 
 def _s70_b4_worker_result_stream_recovery_bundle() -> dict[str, object]:
