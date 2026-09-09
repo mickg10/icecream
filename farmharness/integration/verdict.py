@@ -83,7 +83,9 @@ TERMINAL_KINDS = frozenset(
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 CLIENT_SCHEDULER_READINESS_SCHEMA = "icefarm-client-scheduler-readiness-v2"
 SCHEDULER_ACTIVE_LOSS_SCHEMA_V1 = "icefarm-scheduler-active-loss-v1"
-SCHEDULER_ACTIVE_LOSS_SCHEMA = "icefarm-scheduler-active-loss-v2"
+SCHEDULER_ACTIVE_LOSS_SCHEMA_V2 = "icefarm-scheduler-active-loss-v2"
+SCHEDULER_ACTIVE_LOSS_SCHEMA = "icefarm-scheduler-active-loss-v3"
+LISTENER_BINDING_EVIDENCE = "container-env+netns-listener-uid+http-child"
 SCHEDULER_GENERATION_ACTIONS = frozenset(
     {"upgrade", "downgrade", "restart", "env_set", "scheduler-loss-active"}
 )
@@ -2123,10 +2125,15 @@ def _scheduler_active_loss_receipt_errors(
         not isinstance(receipt, Mapping)
         or set(receipt) != required
         or receipt.get("schema")
-        not in {SCHEDULER_ACTIVE_LOSS_SCHEMA_V1, SCHEDULER_ACTIVE_LOSS_SCHEMA}
+        not in {
+            SCHEDULER_ACTIVE_LOSS_SCHEMA_V1,
+            SCHEDULER_ACTIVE_LOSS_SCHEMA_V2,
+            SCHEDULER_ACTIVE_LOSS_SCHEMA,
+        }
     ):
         return {marker}
-    strict = receipt.get("schema") == SCHEDULER_ACTIVE_LOSS_SCHEMA
+    strict = receipt.get("schema") != SCHEDULER_ACTIVE_LOSS_SCHEMA_V1
+    listener_v3 = receipt.get("schema") == SCHEDULER_ACTIVE_LOSS_SCHEMA
     plan_instances = (
         plan.get("topology", {}).get("instances")
         if isinstance(plan, Mapping)
@@ -2289,6 +2296,18 @@ def _scheduler_active_loss_receipt_errors(
         else {"container_id", "started_at"}
     )
     listener = compiler.get("listener") if isinstance(compiler, Mapping) else None
+    expected_assignment_listener = {
+        "host": "127.0.0.1",
+        "port": expected_web_port,
+    }
+    if listener_v3 and isinstance(listener, Mapping):
+        expected_assignment_listener.update(
+            {
+                "binding_evidence": LISTENER_BINDING_EVIDENCE,
+                "socket_inode": listener.get("socket_inode"),
+                "socket_uid": listener.get("socket_uid"),
+            }
+        )
     process_fields = {
         "argv",
         "comm",
@@ -2420,17 +2439,19 @@ def _scheduler_active_loss_receipt_errors(
             if isinstance(worker_env, Mapping)
             else None
         )
+        listener_fields = {
+            "daemon_pid",
+            "daemon_start_ticks",
+            "host",
+            "port",
+            "socket_inode",
+        }
+        if listener_v3:
+            listener_fields.update({"binding_evidence", "socket_uid"})
         listener_valid = (
             isinstance(listener, Mapping)
             and isinstance(parent, Mapping)
-            and set(listener)
-            == {
-                "daemon_pid",
-                "daemon_start_ticks",
-                "host",
-                "port",
-                "socket_inode",
-            }
+            and set(listener) == listener_fields
             and listener.get("daemon_pid") == parent.get("pid")
             and listener.get("daemon_start_ticks") == parent.get("start_ticks")
             and listener.get("host") == "127.0.0.1"
@@ -2439,6 +2460,13 @@ def _scheduler_active_loss_receipt_errors(
             and re.fullmatch(r"[1-9][0-9]*", listener["socket_inode"])
             is not None
         )
+        if listener_v3:
+            listener_valid = (
+                listener_valid
+                and listener.get("binding_evidence") == LISTENER_BINDING_EVIDENCE
+                and listener.get("socket_uid") == parent.get("uids", [None, None])[1]
+                and listener.get("socket_uid") == 65534
+            )
         worker_authority_valid = (
             container_authority_valid
             and isinstance(worker_before, Mapping)
@@ -2501,8 +2529,7 @@ def _scheduler_active_loss_receipt_errors(
             or set(assignment.get("client", {})) != {"client_id", "job_id", "scheduler_job_id"}
             or not all(_is_int(assignment.get("child", {}).get(key), minimum=1) for key in ("generation", "owning_client_id", "pgid", "pid"))
             or not all(_is_int(assignment.get("client", {}).get(key), minimum=1) for key in ("client_id", "job_id", "scheduler_job_id"))
-            or assignment.get("listener")
-            != {"host": "127.0.0.1", "port": expected_web_port}
+            or assignment.get("listener") != expected_assignment_listener
             or not isinstance(quiescence, Mapping)
             or set(quiescence) != {"client_readiness", "client_routes", "scheduler_snapshot", "scheduler_startup", "worker_snapshot"}
             or not isinstance(quiescence.get("scheduler_startup"), Mapping)

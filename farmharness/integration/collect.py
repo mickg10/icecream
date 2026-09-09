@@ -115,7 +115,9 @@ SCHEDULER_LINE_RE = re.compile(
 )
 SCHEDULER_START_RE = re.compile(r"^ICECREAM scheduler .* starting up, port [0-9]+$")
 SCHEDULER_ACTIVE_LOSS_SCHEMA_V1 = "icefarm-scheduler-active-loss-v1"
-SCHEDULER_ACTIVE_LOSS_SCHEMA = "icefarm-scheduler-active-loss-v2"
+SCHEDULER_ACTIVE_LOSS_SCHEMA_V2 = "icefarm-scheduler-active-loss-v2"
+SCHEDULER_ACTIVE_LOSS_SCHEMA = "icefarm-scheduler-active-loss-v3"
+LISTENER_BINDING_EVIDENCE = "container-env+netns-listener-uid+http-child"
 DAEMON_START_RE = re.compile(r"ICECREAM daemon .* starting up")
 READINESS_SCHEDULER_RE = re.compile(r"ICECREAM scheduler .* starting up, port [0-9]+")
 CACHE_READY_RE = re.compile(r"cache sidecar adapter state=2 lifecycle=3")
@@ -1890,10 +1892,15 @@ def _validate_scheduler_active_loss_receipt(
         not isinstance(receipt, Mapping)
         or set(receipt) != required
         or receipt.get("schema")
-        not in {SCHEDULER_ACTIVE_LOSS_SCHEMA_V1, SCHEDULER_ACTIVE_LOSS_SCHEMA}
+        not in {
+            SCHEDULER_ACTIVE_LOSS_SCHEMA_V1,
+            SCHEDULER_ACTIVE_LOSS_SCHEMA_V2,
+            SCHEDULER_ACTIVE_LOSS_SCHEMA,
+        }
     ):
         raise CollectError(f"{prefix} has invalid receipt fields")
-    strict = receipt.get("schema") == SCHEDULER_ACTIVE_LOSS_SCHEMA
+    strict = receipt.get("schema") != SCHEDULER_ACTIVE_LOSS_SCHEMA_V1
+    listener_v3 = receipt.get("schema") == SCHEDULER_ACTIVE_LOSS_SCHEMA
     if receipt.get("action") != event.get("action") or receipt.get("instance") != event.get("instance") or receipt.get("event_epoch") != event.get("event_epoch") or receipt.get("turn") not in scenario.data["workload"]["turns"]:
         raise CollectError(f"{prefix} is not bound to its timeline event")
     if (type(receipt.get("lost_scheduler_generation")) is not int or receipt["lost_scheduler_generation"] <= 0
@@ -1959,6 +1966,18 @@ def _validate_scheduler_active_loss_receipt(
         else {"container_id", "started_at"}
     )
     listener = compiler.get("listener") if isinstance(compiler, Mapping) else None
+    expected_assignment_listener = {
+        "host": "127.0.0.1",
+        "port": expected_web_port,
+    }
+    if listener_v3 and isinstance(listener, Mapping):
+        expected_assignment_listener.update(
+            {
+                "binding_evidence": LISTENER_BINDING_EVIDENCE,
+                "socket_inode": listener.get("socket_inode"),
+                "socket_uid": listener.get("socket_uid"),
+            }
+        )
     process_fields = {
         "argv",
         "comm",
@@ -2064,8 +2083,7 @@ def _validate_scheduler_active_loss_receipt(
             or set(assignment.get("client", {})) != {"client_id", "job_id", "scheduler_job_id"}
             or not all(isinstance(assignment.get("child", {}).get(key), int) and assignment["child"][key] > 0 for key in ("generation", "owning_client_id", "pgid", "pid"))
             or not all(isinstance(assignment.get("client", {}).get(key), int) and assignment["client"][key] > 0 for key in ("client_id", "job_id", "scheduler_job_id"))
-            or assignment.get("listener")
-            != {"host": "127.0.0.1", "port": expected_web_port}):
+            or assignment.get("listener") != expected_assignment_listener):
         raise CollectError(f"{prefix} has no exact stopped compiler-group identity")
     if strict:
         expected_env = {
@@ -2121,22 +2139,35 @@ def _validate_scheduler_active_loss_receipt(
             and isinstance(expected_image_id, str)
             and SHA256_RE.fullmatch(expected_image_id) is not None
         )
+        listener_fields = {
+            "daemon_pid",
+            "daemon_start_ticks",
+            "host",
+            "port",
+            "socket_inode",
+        }
+        if listener_v3:
+            listener_fields.update({"binding_evidence", "socket_uid"})
+        listener_valid = (
+            isinstance(listener, Mapping)
+            and set(listener) == listener_fields
+            and listener.get("daemon_pid") == parent.get("pid")
+            and listener.get("daemon_start_ticks") == parent.get("start_ticks")
+            and listener.get("host") == "127.0.0.1"
+            and listener.get("port") == expected_web_port
+            and isinstance(listener.get("socket_inode"), str)
+            and re.fullmatch(r"[1-9][0-9]*", listener["socket_inode"])
+            is not None
+        )
+        if listener_v3:
+            listener_valid = (
+                listener_valid
+                and listener.get("binding_evidence") == LISTENER_BINDING_EVIDENCE
+                and listener.get("socket_uid") == parent.get("uids", [None, None])[1]
+                and listener.get("socket_uid") == 65534
+            )
         if (
-            not isinstance(listener, Mapping)
-            or set(listener)
-            != {
-                "daemon_pid",
-                "daemon_start_ticks",
-                "host",
-                "port",
-                "socket_inode",
-            }
-            or listener.get("daemon_pid") != parent.get("pid")
-            or listener.get("daemon_start_ticks") != parent.get("start_ticks")
-            or listener.get("host") != "127.0.0.1"
-            or listener.get("port") != expected_web_port
-            or not isinstance(listener.get("socket_inode"), str)
-            or re.fullmatch(r"[1-9][0-9]*", listener["socket_inode"]) is None
+            not listener_valid
             or not container_image_authority_valid
             or compiler["worker_before"].get("running") is not True
             or compiler["worker_before"].get("image_id") != expected_image_id

@@ -21,6 +21,7 @@ from farmharness.integration.collect import (
     _validate_scheduler_active_loss_receipt,
 )
 from farmharness.integration.events import (
+    ACTIVE_COMPILER_ASSIGNMENT_SCRIPT,
     ACTIVE_COMPILER_COMMAND_GRACE_S,
     ACTIVE_COMPILER_OBSERVE_S,
     CACHE_DISK_FAULT_BYTES,
@@ -387,7 +388,13 @@ def test_active_scheduler_loss_scripts_are_exact_identity_bound() -> None:
     assert "while True:" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "size > 4 * 1024 * 1024" in ACTIVE_COMPILER_STOP_SCRIPT
     assert 'fields[1] == wanted and fields[3] == "0A"' in ACTIVE_COMPILER_STOP_SCRIPT
-    assert 'owned.add(target[8:-1])' in ACTIVE_COMPILER_STOP_SCRIPT
+    assert 'listeners.append((fields[9], int(fields[7])))' in ACTIVE_COMPILER_STOP_SCRIPT
+    assert "len(listeners) != 1" in ACTIVE_COMPILER_STOP_SCRIPT
+    assert 'listeners[0][1] != daemon["uids"][1]' in ACTIVE_COMPILER_STOP_SCRIPT
+    assert 'container-env+netns-listener-uid+http-child' in ACTIVE_COMPILER_STOP_SCRIPT
+    assert '/ "fd"' not in ACTIVE_COMPILER_STOP_SCRIPT
+    assert "os.readlink" not in ACTIVE_COMPILER_STOP_SCRIPT
+    assert "listeners != [(socket_inode, socket_uid)]" in ACTIVE_COMPILER_ASSIGNMENT_SCRIPT
     assert ACTIVE_COMPILER_OBSERVE_S == 240
     assert ACTIVE_COMPILER_COMMAND_GRACE_S == 30
     source = (INTEGRATION / "events.py").read_text(encoding="utf-8")
@@ -462,11 +469,41 @@ def test_assignment_script_executes_multi_child_http_join() -> None:
     thread.start()
     try:
         port = server.server_address[1]
-        result = subprocess.run(["python3", "-c", ACTIVE_COMPILER_ASSIGNMENT_SCRIPT, "41", "41", "7", "12", str(port)], capture_output=True, text=True, timeout=5)
+        wanted = "0100007F:" + format(port, "04X")
+        listener_rows = [
+            line.split()
+            for line in Path("/proc/net/tcp").read_text(encoding="ascii").splitlines()[1:]
+            if len(line.split()) >= 10
+            and line.split()[1] == wanted
+            and line.split()[3] == "0A"
+        ]
+        assert len(listener_rows) == 1
+        socket_inode = listener_rows[0][9]
+        socket_uid = listener_rows[0][7]
+        argv = [
+            "python3", "-c", ACTIVE_COMPILER_ASSIGNMENT_SCRIPT,
+            "41", "41", "7", "12", str(port), socket_inode, socket_uid,
+        ]
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=5)
         assert result.returncode == 0, result.stderr
-        assert json.loads(result.stdout)["client"]["client_id"] == 9
+        document = json.loads(result.stdout)
+        assert document["client"]["client_id"] == 9
+        assert document["listener"] == {
+            "binding_evidence": "container-env+netns-listener-uid+http-child",
+            "host": "127.0.0.1",
+            "port": port,
+            "socket_inode": socket_inode,
+            "socket_uid": int(socket_uid),
+        }
+        bad_inode = subprocess.run(
+            [*argv[:-2], str(int(socket_inode) + 1), socket_uid],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        assert bad_inode.returncode != 0
         payloads["/api/internals"] += "Child: pid=41 pgid=41 kind=0 gen=7 client=11 state=1\n"
-        bad = subprocess.run(["python3", "-c", ACTIVE_COMPILER_ASSIGNMENT_SCRIPT, "41", "41", "7", "12", str(port)], capture_output=True, text=True, timeout=5)
+        bad = subprocess.run(argv, capture_output=True, text=True, timeout=5)
         assert bad.returncode != 0
     finally:
         server.shutdown()
@@ -637,13 +674,13 @@ def test_active_scheduler_loss_collection_binds_post_offset_product_witness(
         )
 
 
-def test_active_scheduler_loss_v2_collector_recomputes_bound_evidence(
+def test_active_scheduler_loss_v3_collector_recomputes_bound_evidence(
     tmp_path: Path,
 ) -> None:
-    from farmharness.integration.tests.test_verdict import _active_loss_v2_fixture
+    from farmharness.integration.tests.test_verdict import _active_loss_v3_fixture
 
     receipt, event, _scenario_data, _plan_data, _farm_data, _images = (
-        _active_loss_v2_fixture()
+        _active_loss_v3_fixture()
     )
     farm = load_farm_spec(farm_fixture.example_farm_path())
     scenario = load_scenario_spec(
@@ -742,6 +779,25 @@ def test_active_scheduler_loss_v2_collector_recomputes_bound_evidence(
         evidence=tmp_path,
     )
 
+    replay_v2 = json.loads(json.dumps(receipt))
+    replay_v2["schema"] = "icefarm-scheduler-active-loss-v2"
+    replay_v2["compiler"]["assignment"]["listener"] = {
+        "host": "127.0.0.1",
+        "port": web_port,
+    }
+    replay_v2["compiler"]["listener"].pop("binding_evidence")
+    replay_v2["compiler"]["listener"].pop("socket_uid")
+    _validate_scheduler_active_loss_receipt(
+        replay_v2,
+        event,
+        scenario,
+        0,
+        farm=farm,
+        plan=plan,
+        preflight=preflight,
+        evidence=tmp_path,
+    )
+
     authority_identity = json.loads(json.dumps(receipt))
     authority_image_id = farm.data["runtime_image"]["id"].removeprefix("sha256:")
     authority_identity["compiler"]["worker_before"]["image_id"] = authority_image_id
@@ -774,7 +830,7 @@ def test_active_scheduler_loss_v2_collector_recomputes_bound_evidence(
 
     tampered = json.loads(json.dumps(receipt))
     tampered["compiler"]["listener"]["socket_inode"] = "0"
-    with pytest.raises(CollectError, match="listener/runtime authority"):
+    with pytest.raises(CollectError):
         _validate_scheduler_active_loss_receipt(
             tampered,
             event,
@@ -785,6 +841,29 @@ def test_active_scheduler_loss_v2_collector_recomputes_bound_evidence(
             preflight=preflight,
             evidence=tmp_path,
         )
+
+    for target, key, value in (
+        ("listener", "socket_uid", 0),
+        ("listener", "binding_evidence", "tampered"),
+        ("assignment", "socket_inode", "999"),
+        ("assignment", "socket_uid", 0),
+    ):
+        tampered = json.loads(json.dumps(receipt))
+        if target == "listener":
+            tampered["compiler"]["listener"][key] = value
+        else:
+            tampered["compiler"]["assignment"]["listener"][key] = value
+        with pytest.raises(CollectError):
+            _validate_scheduler_active_loss_receipt(
+                tampered,
+                event,
+                scenario,
+                0,
+                farm=farm,
+                plan=plan,
+                preflight=preflight,
+                evidence=tmp_path,
+            )
 
     tampered = json.loads(json.dumps(receipt))
     tampered["quiescence"]["client_readiness"]["C1"]["ready"] = False

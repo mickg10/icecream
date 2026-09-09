@@ -308,7 +308,7 @@ def test_active_loss_verdict_rejects_reused_compiler_identity() -> None:
         assert _scheduler_active_loss_receipt_errors(tampered, event, scenario)
 
 
-def _active_loss_v2_fixture():
+def _active_loss_v3_fixture():
     route = {
         "container": {
             "container_id": "c" * 64,
@@ -439,7 +439,13 @@ def _active_loss_v2_fixture():
                     "job_id": 2,
                     "scheduler_job_id": 2,
                 },
-                "listener": {"host": "127.0.0.1", "port": 23004},
+                "listener": {
+                    "binding_evidence": "container-env+netns-listener-uid+http-child",
+                    "host": "127.0.0.1",
+                    "port": 23004,
+                    "socket_inode": "12345",
+                    "socket_uid": 65534,
+                },
                 "schema": "icefarm-compiler-assignment-v1",
             },
             "container_id": "b" * 64,
@@ -474,11 +480,13 @@ def _active_loss_v2_fixture():
                 "uids": [65534, 65534, 65534, 65534],
             },
             "listener": {
+                "binding_evidence": "container-env+netns-listener-uid+http-child",
                 "daemon_pid": 10,
                 "daemon_start_ticks": 3,
                 "host": "127.0.0.1",
                 "port": 23004,
                 "socket_inode": "12345",
+                "socket_uid": 65534,
             },
             "stopped": {
                 "argv": ["/opt/icecream/sbin/iceccd"],
@@ -509,14 +517,14 @@ def _active_loss_v2_fixture():
             "scheduler_startup": {"line": "ICECREAM scheduler starting"},
             "worker_snapshot": "F1",
         },
-        "schema": "icefarm-scheduler-active-loss-v2",
+        "schema": "icefarm-scheduler-active-loss-v3",
         "turn": "A",
     }
     return receipt, event, scenario, plan, farm, images
 
 
-def test_active_loss_v2_binds_listener_worker_authority_and_readiness() -> None:
-    receipt, event, scenario, plan, farm, images = _active_loss_v2_fixture()
+def test_active_loss_v3_binds_listener_worker_authority_and_readiness() -> None:
+    receipt, event, scenario, plan, farm, images = _active_loss_v3_fixture()
     kwargs = {
         "readiness_v2": True,
         "plan": plan,
@@ -528,7 +536,12 @@ def test_active_loss_v2_binds_listener_worker_authority_and_readiness() -> None:
     )
     paths = (
         ("compiler", "listener", "socket_inode"),
+        ("compiler", "listener", "socket_uid"),
+        ("compiler", "listener", "binding_evidence"),
         ("compiler", "listener", "daemon_start_ticks"),
+        ("compiler", "assignment", "listener", "socket_inode"),
+        ("compiler", "assignment", "listener", "socket_uid"),
+        ("compiler", "assignment", "listener", "binding_evidence"),
         ("compiler", "daemon", "start_ticks"),
         ("compiler", "stopped", "exe"),
         ("compiler", "stopped", "comm"),
@@ -581,6 +594,18 @@ def test_active_loss_v2_binds_listener_worker_authority_and_readiness() -> None:
         plan=plan,
         farm=farm,
         images=tampered_images,
+    )
+
+    replay_v2 = copy.deepcopy(receipt)
+    replay_v2["schema"] = "icefarm-scheduler-active-loss-v2"
+    replay_v2["compiler"]["assignment"]["listener"] = {
+        "host": "127.0.0.1",
+        "port": 23004,
+    }
+    replay_v2["compiler"]["listener"].pop("binding_evidence")
+    replay_v2["compiler"]["listener"].pop("socket_uid")
+    assert not _scheduler_active_loss_receipt_errors(
+        replay_v2, event, scenario, **kwargs
     )
 
     tampered_plan = copy.deepcopy(plan)

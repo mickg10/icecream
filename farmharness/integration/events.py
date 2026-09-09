@@ -176,7 +176,8 @@ print(json.dumps({
 '''.strip()
 GATE_SCHEMA = "icefarm-event-gate-v1"
 SCHEDULER_RESTART_SCHEMA = "icefarm-scheduler-restart-v1"
-SCHEDULER_ACTIVE_LOSS_SCHEMA = "icefarm-scheduler-active-loss-v2"
+SCHEDULER_ACTIVE_LOSS_SCHEMA = "icefarm-scheduler-active-loss-v3"
+LISTENER_BINDING_EVIDENCE = "container-env+netns-listener-uid+http-child"
 CLIENT_ROUTE_RESTART_SCHEMA = "icefarm-client-route-restart-v1"
 WORKER_RESTART_SCHEMA = "icefarm-worker-restart-v1"
 CLIENT_ROUTE_SIGNAL_SCHEMA = "icefarm-client-route-signal-v1"
@@ -256,25 +257,25 @@ def listener_probe(port, daemon):
     if b"Child:" not in body:
         raise RuntimeError("web listener returned no compiler-child witness")
     wanted = "0100007F:" + format(port, "04X")
-    inodes = set()
+    listeners = []
     for line in pathlib.Path("/proc/net/tcp").read_text(encoding="ascii").splitlines()[1:]:
         fields = line.split()
         if len(fields) >= 10 and fields[1] == wanted and fields[3] == "0A":
-            inodes.add(fields[9])
-    owned = set()
-    for fd in (pathlib.Path("/proc") / str(daemon["pid"]) / "fd").iterdir():
-        try:
-            target = os.readlink(fd)
-        except (FileNotFoundError, PermissionError, OSError):
-            continue
-        if target.startswith("socket:[") and target.endswith("]"):
-            owned.add(target[8:-1])
-    matches = sorted(inodes & owned)
-    if len(matches) != 1 or not matches[0].isdigit() or int(matches[0]) <= 0:
-        raise RuntimeError("web listener is not uniquely owned by the authenticated daemon")
+            try:
+                listeners.append((fields[9], int(fields[7])))
+            except (IndexError, ValueError):
+                raise RuntimeError("web listener has malformed kernel identity")
+    if (len(listeners) != 1
+            or not listeners[0][0].isdigit()
+            or int(listeners[0][0]) <= 0
+            or listeners[0][1] != daemon["uids"][1]):
+        raise RuntimeError("web listener is not uniquely bound to the authenticated container runtime")
+    inode, uid = listeners[0]
     return {"daemon_pid": daemon["pid"],
             "daemon_start_ticks": daemon["start_ticks"],
-            "host": "127.0.0.1", "port": port, "socket_inode": matches[0]}
+            "binding_evidence": "container-env+netns-listener-uid+http-child",
+            "host": "127.0.0.1", "port": port,
+            "socket_inode": inode, "socket_uid": uid}
 
 deadline = time.monotonic() + int(sys.argv[1])
 web_port = int(sys.argv[2])
@@ -333,8 +334,8 @@ raise SystemExit("no unique direct compiler group leader became observable withi
 '''.strip()
 
 ACTIVE_COMPILER_ASSIGNMENT_SCRIPT = r'''
-import json, re, sys, urllib.request
-pid, pgid, generation, scheduler_job, port = map(int, sys.argv[1:])
+import json, pathlib, re, sys, urllib.request
+pid, pgid, generation, scheduler_job, port, socket_inode, socket_uid = map(int, sys.argv[1:])
 def get(path):
     with urllib.request.urlopen("http://127.0.0.1:%d%s" % (port, path), timeout=5) as response:
         return response.read().decode("utf-8")
@@ -357,7 +358,18 @@ if row.get("status") != "WAITFORCHILD" or not isinstance(row.get("client_id"), i
 job = row.get("job")
 if row.get("scheduler_job_id") != scheduler_job or not isinstance(job, dict) or job.get("job_id") != scheduler_job:
     raise SystemExit("Child owning client does not bind exact scheduler job")
-print(json.dumps({"schema": "icefarm-compiler-assignment-v1", "child": {"kind": 0, "pid": pid, "pgid": pgid, "generation": generation, "owning_client_id": client_id}, "client": {"client_id": client_id, "scheduler_job_id": row["scheduler_job_id"], "job_id": job["job_id"]}, "listener": {"host": "127.0.0.1", "port": port}}, sort_keys=True, separators=(",", ":")))
+wanted = "0100007F:" + format(port, "04X")
+listeners = []
+for line in pathlib.Path("/proc/net/tcp").read_text(encoding="ascii").splitlines()[1:]:
+    fields = line.split()
+    if len(fields) >= 10 and fields[1] == wanted and fields[3] == "0A":
+        try:
+            listeners.append((int(fields[9]), int(fields[7])))
+        except (IndexError, ValueError):
+            raise SystemExit("web listener has malformed kernel identity")
+if listeners != [(socket_inode, socket_uid)]:
+    raise SystemExit("compiler assignment did not use the authenticated listener")
+print(json.dumps({"schema": "icefarm-compiler-assignment-v1", "child": {"kind": 0, "pid": pid, "pgid": pgid, "generation": generation, "owning_client_id": client_id}, "client": {"client_id": client_id, "scheduler_job_id": row["scheduler_job_id"], "job_id": job["job_id"]}, "listener": {"binding_evidence": "container-env+netns-listener-uid+http-child", "host": "127.0.0.1", "port": port, "socket_inode": str(socket_inode), "socket_uid": socket_uid}}, sort_keys=True, separators=(",", ":")))
 '''.strip()
 
 ACTIVE_COMPILER_WAIT_SCRIPT = r'''
@@ -3150,12 +3162,15 @@ class EventProducer:
         if (
             set(listener)
             != {
+                "binding_evidence",
                 "daemon_pid",
                 "daemon_start_ticks",
                 "host",
                 "port",
                 "socket_inode",
+                "socket_uid",
             }
+            or listener.get("binding_evidence") != LISTENER_BINDING_EVIDENCE
             or listener.get("daemon_pid") != parent.get("pid")
             or listener.get("daemon_start_ticks") != parent.get("start_ticks")
             or listener.get("host") != "127.0.0.1"
@@ -3163,8 +3178,9 @@ class EventProducer:
             or not isinstance(listener.get("socket_inode"), str)
             or not listener["socket_inode"].isdigit()
             or int(listener["socket_inode"]) <= 0
+            or listener.get("socket_uid") != parent.get("uids", [None, None])[1]
         ):
-            raise EventError("compiler listener is not bound to the authenticated F daemon")
+            raise EventError("compiler listener is not bound to the authenticated F runtime")
         assignment_result = self._invoke(self.factory.make(
             phase="event.scheduler-loss-authenticate-assignment",
             host=worker["host"], instance=worker["name"], transport=_docker_transport(self.farm, worker["host"]),
@@ -3173,6 +3189,7 @@ class EventProducer:
                 "exec", "--user", "0", worker_before["id"], "python3", "-c",
                 ACTIVE_COMPILER_ASSIGNMENT_SCRIPT, str(leader["pid"]), str(leader["pgid"]),
                 str(lost_generation), str(self._last_job), str(web_port),
+                listener["socket_inode"], str(listener["socket_uid"]),
             )),
         ))
         try:
@@ -3187,7 +3204,13 @@ class EventProducer:
                 or assignment["client"].get("scheduler_job_id") != self._last_job
                 or assignment["client"].get("job_id") != self._last_job
                 or assignment["listener"]
-                != {"host": "127.0.0.1", "port": web_port}):
+                != {
+                    "binding_evidence": LISTENER_BINDING_EVIDENCE,
+                    "host": "127.0.0.1",
+                    "port": web_port,
+                    "socket_inode": listener["socket_inode"],
+                    "socket_uid": listener["socket_uid"],
+                }):
             raise EventError("compiler assignment witness does not bind exact lost job")
         self._invoke(self.factory.make(
             phase="event.scheduler-loss-kill",
