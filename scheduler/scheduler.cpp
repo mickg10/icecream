@@ -1500,6 +1500,50 @@ static bool submitter_accepts_dispatch(CompileServer *submitter)
         && submitter->outstandingDispatches() < effective_dispatch_credit();
 }
 
+/* A READY-gated fenced assignment is still wholly scheduler-owned until its
+   UseCS has been accepted by the submitter channel.  If that exact worker
+   session disappears first, its session teardown is the terminal boundary
+   for the old PREPARE/READY nonce.  Retire that identity and put the original
+   request back in the ordinary queue: C has observed neither the wire job id
+   nor the failed endpoint, so asking the wrapper to perform a retry is
+   impossible and deleting the job would strand it in WAITFORCS forever.
+
+   This deliberately excludes every exposed assignment.  Once ReplySent is
+   true, delivery is uncertain and the existing C/client worker-loss path owns
+   any one-shot retry; scheduler redispatch there could run the same compile
+   twice. */
+static bool redispatch_unexposed_assignment(Job *job,
+                                             CompileServer *lost_worker)
+{
+    if (!job || !lost_worker || job->server() != lost_worker ||
+            !job->submitter() || job->submitter() == lost_worker ||
+            job->state() != Job::WAITINGFORCS ||
+            !job->assignmentFenced() || !job->assignmentReadyGated() ||
+            job->assignmentReplySent() ||
+            (job->assignmentPhase() != Job::ASSIGNMENT_PREPARED &&
+             job->assignmentPhase() != Job::ASSIGNMENT_READY)) {
+        return false;
+    }
+
+    trace() << "redispatch unexposed assignment " << job->id()
+            << " after worker loss " << lost_worker->nodeName() << endl;
+    lost_worker->removeJob(job);
+    credit_dispatch_credit(job);
+    unindex_fenced_assignment(job);
+    job->setServer(nullptr);
+    job->setState(Job::PENDING);
+    job->setAssignmentPolicy(Job::ASSIGNMENT_LEGACY);
+    job->setAssignmentPhase(Job::ASSIGNMENT_NONE);
+    job->setAssignmentIdentity(0, 0);
+    job->setCompileIdentity(0, 0);
+    job->setAssignmentReplySent(false);
+    job->setPreExposureRedispatch(true);
+    job->setDispatchProjection(std::string(), false, 0);
+    job->setSelectedEnvironment(std::string());
+    enqueue_job_request(job);
+    return true;
+}
+
 enum AdmitResult { ADMIT_COMPLETE, ADMIT_YIELDED, ADMIT_FATAL_EXHAUSTION };
 static AdmitResult admit_request_jobs(CompileServer *submitter, PendingExpansion &req);
 
@@ -1998,6 +2042,9 @@ static list<CompileServer *> filter_ineligible_servers(Job *job)
         css.end(),
         std::back_inserter(eligible),
         [=](CompileServer* cs) {
+            if (job->preExposureRedispatch() && cs == job->submitter()) {
+                return false;
+            }
             if (cs != job->submitter()
                     && assignment_fence_mode == ConfCSMsg::StrictNonce
                     && (!IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY, cs)
@@ -2436,6 +2483,8 @@ static CompileServer *pick_server(Job *job,
     /* if the user wants to test/prefer one specific daemon, we return it if available */
     if (!job->preferredHost().empty() && !retry_alternative_exists) {
         for (CompileServer* const cs : css) {
+            const bool redispatch_local =
+                job->preExposureRedispatch() && cs == job->submitter();
             const bool prepare_backlogged = cs != job->submitter()
                 && assignment_mode_prepares()
                 && IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_FENCE, cs)
@@ -2445,7 +2494,8 @@ static CompileServer *pick_server(Job *job,
                 && (!IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY, cs)
                     || !IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_IDENTITY,
                                             job->submitter()));
-            if (cs->matches(job->preferredHost()) && cs->is_eligible_now(job)
+            if (!redispatch_local && cs->matches(job->preferredHost())
+                    && cs->is_eligible_now(job)
                     && !prepare_backlogged && !strict_incompatible) {
 #if DEBUG_SCHEDULER > 1
                 trace() << "taking preferred " << cs->nodeName() << " " <<  server_speed(cs, job, true) << endl;
@@ -2776,7 +2826,7 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
 
         /* Ignore the load on the submitter itself if no other host could
            be found.  We only obey to its max job number.  */
-        if (!cache_retry_wait) {
+        if (!cache_retry_wait && !job->preExposureRedispatch()) {
             use_cs = job->submitter();
             if ((use_cs->currentJobCount() < use_cs->maxJobs())
                     && job->preferredHost().empty()
@@ -2804,6 +2854,11 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
         if (!jobPosition.isValid()) { // every live candidate was tested once
             jobPosition = walkStart;
             job = jobPosition.job;
+            if (job->preExposureRedispatch()) {
+                trace() << "No suitable remote host found for unexposed "
+                        << "redispatch, delaying job " << job->id() << endl;
+                return false;
+            }
             for (CompileServer * const cs : css) {
                 if(!job->preferredHost().empty() && !cs->matches(job->preferredHost()))
                     continue;
@@ -2822,6 +2877,10 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
 
     remove_job_request( jobPosition );
 
+    if (job->preExposureRedispatch()) {
+        assert(use_cs != job->submitter());
+        job->setPreExposureRedispatch(false);
+    }
     job->setState(Job::WAITINGFORCS);
     job->setServer(use_cs);
 
@@ -4472,6 +4531,11 @@ static bool handle_end(CompileServer *toremove, Msg *m)
             Job *job = mit->second;
 
             if (job->server() == toremove || job->submitter() == toremove) {
+                if (job->server() == toremove &&
+                        redispatch_unexposed_assignment(job, toremove)) {
+                    ++mit;
+                    continue;
+                }
                 /* Prepared P49 closes the dispatched-not-claimed gap: when the
                    submitter disappears, keep the assignment owned, queue an
                    ordered revoke, and release only on its matching result.

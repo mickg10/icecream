@@ -114,8 +114,14 @@ require_count 1 '!job->preferredHost().empty() && !retry_alternative_exists' \
 require_count 1 'cache_retry_wait = prefer_cache_compatible_servers(' \
     scheduler/scheduler.cpp \
     'server selection applies the bounded preference exactly once'
-require_count 1 'if (!cache_retry_wait) {' scheduler/scheduler.cpp \
-    'retry wait suppresses submitter-local fallback without blocking queue scanning'
+require_count 1 'if (!cache_retry_wait && !job->preExposureRedispatch()) {' \
+    scheduler/scheduler.cpp \
+    'retry wait and unexposed redispatch both suppress submitter-local fallback'
+require_count 1 'if (job->preExposureRedispatch() && cs == job->submitter()) {' \
+    scheduler/scheduler.cpp \
+    'ordinary selection excludes the local submitter during unexposed redispatch'
+require_count 1 'const bool redispatch_local =' scheduler/scheduler.cpp \
+    'preferred-host selection independently excludes the redispatch submitter'
 require_count 1 'job->setCacheRequest(m.cache_protocol, m.cache_profile_mask,' \
     scheduler/scheduler.cpp 'decoded C capabilities are retained on every admitted job'
 require_count 1 'cs->remotePort() == job->cacheAffinityPort() &&' \

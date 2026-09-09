@@ -523,6 +523,23 @@ static bool file_contains(const std::string &path, const std::string &needle)
     return text.str().find(needle) != std::string::npos;
 }
 
+static size_t file_occurrence_count(const std::string &path,
+                                    const std::string &needle)
+{
+    if (needle.empty()) return 0;
+    std::ifstream input(path);
+    std::ostringstream stream;
+    stream << input.rdbuf();
+    const std::string text = stream.str();
+    size_t count = 0;
+    std::string::size_type position = 0;
+    while ((position = text.find(needle, position)) != std::string::npos) {
+        ++count;
+        position += needle.size();
+    }
+    return count;
+}
+
 static bool wait_file_contains(const std::string &path,
                                const std::string &needle,
                                int timeout_msec)
@@ -1381,6 +1398,324 @@ static void run_strict_nonce(const std::string &binary,
     if (old_worker_listener >= 0) close(old_worker_listener);
     REQUIRE(stop_scheduler(proxy), "protocol-48 strict relay stopped cleanly");
     REQUIRE(stop_scheduler(scheduler), "STRICT_NONCE scheduler stopped cleanly");
+}
+
+static void run_pre_exposure_worker_loss_redispatch(
+    const std::string &binary, const std::string &directory)
+{
+    const int port = reserve_port_pair();
+    const std::string log = directory + "/pre-exposure-worker-loss.log";
+    pid_t scheduler = start_cache_routing_scheduler(
+        binary, port, log, "strict-nonce");
+    REQUIRE(port != 0 && scheduler > 0,
+            "pre-exposure worker-loss scheduler launched");
+
+    int worker_a_port = 0;
+    int worker_a_listener = bind_port(0, &worker_a_port);
+    if (worker_a_listener >= 0) listen(worker_a_listener, 16);
+    int cache_a_port = 0;
+    int cache_a_sentinel = bind_port(0, &cache_a_port);
+    if (cache_a_sentinel >= 0) listen(cache_a_sentinel, 4);
+    int worker_b_port = 0;
+    int worker_b_listener = bind_port(0, &worker_b_port);
+    if (worker_b_listener >= 0) listen(worker_b_listener, 16);
+    int cache_b_port = 0;
+    int cache_b_sentinel = bind_port(0, &cache_b_port);
+    if (cache_b_sentinel >= 0) listen(cache_b_sentinel, 4);
+    int local_port = 0;
+    int local_listener = bind_port(0, &local_port);
+    if (local_listener >= 0) listen(local_listener, 16);
+    int local_cache_port = 0;
+    int local_cache_sentinel = bind_port(0, &local_cache_port);
+    if (local_cache_sentinel >= 0) listen(local_cache_sentinel, 4);
+
+    ConfCSMsg *configuration = nullptr;
+    MsgChannel *worker_a = login_host(
+        port, "pre-exposure-a", true, worker_a_port, &configuration,
+        nullptr, 1, 0, static_cast<uint32_t>(cache_a_port),
+        CACHE_WIRE_REVISION, CACHE_PROFILE_P29V1);
+    delete configuration;
+    configuration = nullptr;
+    MsgChannel *worker_b = login_host(
+        port, "pre-exposure-b", true, worker_b_port, &configuration,
+        nullptr, 1, 0, static_cast<uint32_t>(cache_b_port),
+        CACHE_WIRE_REVISION, CACHE_PROFILE_P29V1);
+    delete configuration;
+    configuration = nullptr;
+    MsgChannel *occupier = login_host(
+        port, "pre-exposure-occupier", false, 0, &configuration);
+    delete configuration;
+    configuration = nullptr;
+    /* The submitting C is deliberately also a one-slot compile server.  A
+       redispatch that escapes either the preferred-host shortcut or ordinary
+       eligibility filter would otherwise turn into a local NoCS decision. */
+    MsgChannel *submitter = login_host(
+        port, "pre-exposure-submit", true, local_port, &configuration,
+        nullptr, 1, 0, static_cast<uint32_t>(local_cache_port),
+        CACHE_WIRE_REVISION, CACHE_PROFILE_P29V1);
+    delete configuration;
+    REQUIRE(worker_a && worker_b && occupier && submitter,
+            "two strict workers, one submitter, and a mixed-role C joined");
+
+    REQUIRE(occupier && request_job_preferring(
+                occupier, 6250, "pre-exposure-b"),
+            "setup request occupies B's only real slot");
+    AssignPrepareMsg *busy_prepare = wait_prepare(worker_b);
+    if (busy_prepare) {
+        worker_b->send_msg(AssignReadyMsg(
+            busy_prepare->epoch(), busy_prepare->wire_id,
+            busy_prepare->nonce()));
+    }
+    UseCSMsg *busy_use = dynamic_cast<UseCSMsg *>(
+        wait_type(occupier, Msg::USE_CS, 3000));
+    REQUIRE(busy_prepare && busy_use &&
+                busy_use->port == static_cast<uint32_t>(worker_b_port),
+            "setup request holds B while the target selects A");
+    if (busy_use)
+        worker_b->send_msg(JobBeginMsg(busy_use->job_id, 0));
+
+    REQUIRE(submitter && request_job_preferring(
+                submitter, 6251, "127.0.0.1"),
+            "target strict request takes first matching A while B is full");
+    AssignPrepareMsg *first_prepare = wait_prepare(worker_a);
+    REQUIRE(first_prepare && first_prepare->wire_id != 0 &&
+                first_prepare->nonce() != 0,
+            "target request is prepared on A");
+    Msg *premature_decision = next_message(submitter, 300);
+    REQUIRE(!premature_decision,
+            "target has no assignment decision before A's READY");
+    delete premature_decision;
+    const uint32_t target_job = first_prepare ? first_prepare->wire_id : 0;
+    const uint64_t first_epoch = first_prepare ? first_prepare->epoch() : 0;
+    const uint64_t first_nonce = first_prepare ? first_prepare->nonce() : 0;
+
+    delete worker_a;
+    worker_a = nullptr;
+    REQUIRE(wait_file_contains(log, "remove daemon pre-exposure-a", 3000),
+            "scheduler observes A loss before assignment exposure");
+    premature_decision = next_message(submitter, 500);
+    REQUIRE(!premature_decision,
+            "preferred-host redispatch cannot fall through to its local C");
+    delete premature_decision;
+
+    if (busy_use)
+        worker_b->send_msg(job_done_for(
+            *busy_use, 0, JobDoneMsg::FROM_SERVER));
+    AssignPrepareMsg *second_prepare = wait_prepare(worker_b);
+    REQUIRE(second_prepare && second_prepare->wire_id == target_job &&
+                second_prepare->epoch() == first_epoch &&
+                second_prepare->nonce() != first_nonce,
+            "worker loss redispatches the same request to B with a fresh nonce");
+
+    if (first_prepare) {
+        worker_b->send_msg(AssignReadyMsg(
+            first_prepare->epoch(), first_prepare->wire_id,
+            first_prepare->nonce()));
+    }
+    REQUIRE(no_type(submitter, Msg::USE_CS, 300),
+            "stale READY for A's retired nonce cannot expose the request");
+    if (second_prepare) {
+        worker_b->send_msg(AssignReadyMsg(
+            second_prepare->epoch(), second_prepare->wire_id,
+            second_prepare->nonce()));
+    }
+    UseCSMsg *target_use = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(target_use && second_prepare &&
+                target_use->job_id == second_prepare->wire_id &&
+                target_use->assignmentNonce() == second_prepare->nonce() &&
+                target_use->port == static_cast<uint32_t>(worker_b_port),
+            "only B's fresh prepared assignment is exposed");
+    if (target_use) {
+        worker_b->send_msg(JobBeginMsg(target_use->job_id, 0));
+        worker_b->send_msg(job_done_for(
+            *target_use, 0, JobDoneMsg::FROM_SERVER));
+    }
+    const std::string target_terminal = target_use
+        ? "END " + std::to_string(target_use->job_id) + " status=0"
+        : std::string();
+    REQUIRE(target_use && wait_file_contains(log, target_terminal, 3000) &&
+                file_occurrence_count(log, target_terminal) == 1,
+            "redispatched request reaches exactly one successful terminal");
+    REQUIRE(file_contains(log, "redispatch unexposed assignment"),
+            "scheduler records the pre-exposure redispatch transition");
+
+    REQUIRE(occupier && request_job_preferring(
+                occupier, 6252, "pre-exposure-submit"),
+            "first setup job occupies mixed-role C's real slot");
+    AssignPrepareMsg *local_busy1_prepare = wait_prepare(submitter);
+    if (local_busy1_prepare) {
+        submitter->send_msg(AssignReadyMsg(
+            local_busy1_prepare->epoch(), local_busy1_prepare->wire_id,
+            local_busy1_prepare->nonce()));
+    }
+    UseCSMsg *local_busy1 = dynamic_cast<UseCSMsg *>(
+        wait_type(occupier, Msg::USE_CS, 3000));
+    REQUIRE(local_busy1_prepare && local_busy1 &&
+                local_busy1->port == static_cast<uint32_t>(local_port),
+            "mixed-role C's real slot is held");
+    if (local_busy1)
+        submitter->send_msg(JobBeginMsg(local_busy1->job_id, 0));
+
+    REQUIRE(occupier && request_job_preferring(
+                occupier, 6253, "pre-exposure-submit"),
+            "second setup job occupies mixed-role C's preload allowance");
+    AssignPrepareMsg *local_busy2_prepare = wait_prepare(submitter);
+    if (local_busy2_prepare) {
+        submitter->send_msg(AssignReadyMsg(
+            local_busy2_prepare->epoch(), local_busy2_prepare->wire_id,
+            local_busy2_prepare->nonce()));
+    }
+    UseCSMsg *local_busy2 = dynamic_cast<UseCSMsg *>(
+        wait_type(occupier, Msg::USE_CS, 3000));
+    REQUIRE(local_busy2_prepare && local_busy2 &&
+                local_busy2->port == static_cast<uint32_t>(local_port),
+            "mixed-role C is saturated at maxJobs plus preload");
+    if (local_busy2)
+        submitter->send_msg(JobBeginMsg(local_busy2->job_id, 0));
+
+    REQUIRE(submitter && request_cache_job(submitter, 6254),
+            "second target request selects the sole surviving B");
+    AssignPrepareMsg *sole_prepare = wait_prepare(worker_b);
+    REQUIRE(sole_prepare && sole_prepare->wire_id != 0 &&
+                sole_prepare->nonce() != 0,
+            "second target is prepared before sole-worker loss");
+    REQUIRE(no_type(submitter, Msg::USE_CS, 300),
+            "second target remains unexposed before B's READY");
+    const uint32_t sole_job = sole_prepare ? sole_prepare->wire_id : 0;
+    const uint64_t sole_epoch = sole_prepare ? sole_prepare->epoch() : 0;
+    const uint64_t sole_nonce = sole_prepare ? sole_prepare->nonce() : 0;
+
+    delete worker_b;
+    worker_b = nullptr;
+    REQUIRE(wait_file_contains(log, "remove daemon pre-exposure-b", 3000),
+            "scheduler observes sole B loss before assignment exposure");
+    if (local_busy1)
+        submitter->send_msg(job_done_for(
+            *local_busy1, 0, JobDoneMsg::FROM_SERVER));
+    if (local_busy2)
+        submitter->send_msg(job_done_for(
+            *local_busy2, 0, JobDoneMsg::FROM_SERVER));
+    premature_decision = next_message(submitter, 700);
+    REQUIRE(!premature_decision,
+            "ordinary redispatch filter rejects newly free local C");
+    delete premature_decision;
+
+    int worker_c_port = 0;
+    int worker_c_listener = bind_port(0, &worker_c_port);
+    if (worker_c_listener >= 0) listen(worker_c_listener, 16);
+    int cache_c_port = 0;
+    int cache_c_sentinel = bind_port(0, &cache_c_port);
+    if (cache_c_sentinel >= 0) listen(cache_c_sentinel, 4);
+    configuration = nullptr;
+    MsgChannel *worker_c = login_host(
+        port, "pre-exposure-c", true, worker_c_port, &configuration,
+        nullptr, 1, 0, static_cast<uint32_t>(cache_c_port),
+        CACHE_WIRE_REVISION, CACHE_PROFILE_P29V1);
+    delete configuration;
+    AssignPrepareMsg *replacement_prepare = wait_prepare(worker_c);
+    REQUIRE(worker_c && replacement_prepare &&
+                replacement_prepare->wire_id == sole_job &&
+                replacement_prepare->epoch() == sole_epoch &&
+                replacement_prepare->nonce() != sole_nonce,
+            "a later replacement F receives the same request with a fresh nonce");
+    if (replacement_prepare) {
+        worker_c->send_msg(AssignReadyMsg(
+            replacement_prepare->epoch(), replacement_prepare->wire_id,
+            replacement_prepare->nonce()));
+    }
+    UseCSMsg *replacement_use = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(replacement_use && replacement_prepare &&
+                replacement_use->job_id == replacement_prepare->wire_id &&
+                replacement_use->assignmentNonce() ==
+                    replacement_prepare->nonce() &&
+                replacement_use->port == static_cast<uint32_t>(worker_c_port),
+            "replacement F is exposed without an intervening local decision");
+    if (replacement_use) {
+        worker_c->send_msg(JobBeginMsg(replacement_use->job_id, 0));
+        worker_c->send_msg(job_done_for(
+            *replacement_use, 0, JobDoneMsg::FROM_SERVER));
+    }
+    const std::string replacement_terminal = replacement_use
+        ? "END " + std::to_string(replacement_use->job_id) + " status=0"
+        : std::string();
+    REQUIRE(replacement_use && wait_file_contains(
+                log, replacement_terminal, 3000) &&
+                file_occurrence_count(log, replacement_terminal) == 1,
+            "sole-worker-loss redispatch reaches exactly one successful terminal");
+
+    REQUIRE(submitter && request_job_preferring(
+                submitter, 6255, "pre-exposure-c"),
+            "negative control assigns a fresh request to replacement C");
+    AssignPrepareMsg *exposed_prepare = wait_prepare(worker_c);
+    if (exposed_prepare) {
+        worker_c->send_msg(AssignReadyMsg(
+            exposed_prepare->epoch(), exposed_prepare->wire_id,
+            exposed_prepare->nonce()));
+    }
+    UseCSMsg *exposed_use = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(exposed_prepare && exposed_use &&
+                exposed_use->job_id == exposed_prepare->wire_id &&
+                exposed_use->assignmentNonce() == exposed_prepare->nonce(),
+            "negative-control assignment is exposed before worker loss");
+    const uint32_t exposed_job = exposed_use ? exposed_use->job_id : 0;
+
+    delete worker_c;
+    worker_c = nullptr;
+    REQUIRE(wait_file_contains(log, "remove daemon pre-exposure-c", 3000),
+            "scheduler observes exposed worker loss");
+
+    int worker_d_port = 0;
+    int worker_d_listener = bind_port(0, &worker_d_port);
+    if (worker_d_listener >= 0) listen(worker_d_listener, 16);
+    int cache_d_port = 0;
+    int cache_d_sentinel = bind_port(0, &cache_d_port);
+    if (cache_d_sentinel >= 0) listen(cache_d_sentinel, 4);
+    configuration = nullptr;
+    MsgChannel *worker_d = login_host(
+        port, "pre-exposure-d", true, worker_d_port, &configuration,
+        nullptr, 1, 0, static_cast<uint32_t>(cache_d_port),
+        CACHE_WIRE_REVISION, CACHE_PROFILE_P29V1);
+    delete configuration;
+    AssignPrepareMsg *duplicate_prepare = wait_prepare(worker_d);
+    REQUIRE(worker_d && !duplicate_prepare && exposed_job != 0 &&
+                file_occurrence_count(
+                    log, "redispatch unexposed assignment " +
+                         std::to_string(exposed_job)) == 0,
+            "already-exposed assignment is never scheduler-redispatched");
+
+    delete duplicate_prepare;
+    delete exposed_use;
+    delete exposed_prepare;
+    delete replacement_use;
+    delete replacement_prepare;
+    delete sole_prepare;
+    delete target_use;
+    delete second_prepare;
+    delete first_prepare;
+    delete local_busy2;
+    delete local_busy2_prepare;
+    delete local_busy1;
+    delete local_busy1_prepare;
+    delete busy_use;
+    delete busy_prepare;
+    delete submitter;
+    delete occupier;
+    delete worker_d;
+    if (worker_a_listener >= 0) close(worker_a_listener);
+    if (worker_b_listener >= 0) close(worker_b_listener);
+    if (worker_c_listener >= 0) close(worker_c_listener);
+    if (worker_d_listener >= 0) close(worker_d_listener);
+    if (local_listener >= 0) close(local_listener);
+    if (local_cache_sentinel >= 0) close(local_cache_sentinel);
+    if (cache_a_sentinel >= 0) close(cache_a_sentinel);
+    if (cache_b_sentinel >= 0) close(cache_b_sentinel);
+    if (cache_c_sentinel >= 0) close(cache_c_sentinel);
+    if (cache_d_sentinel >= 0) close(cache_d_sentinel);
+    REQUIRE(stop_scheduler(scheduler),
+            "pre-exposure worker-loss scheduler stopped cleanly");
 }
 
 static void run_disabled(const std::string &binary, const std::string &directory)
@@ -2607,6 +2942,12 @@ int main(int argc, char **argv)
     if (!directory) return 2;
     std::fprintf(stderr, "retained work directory: %s\n", directory);
     signal(SIGPIPE, SIG_IGN);
+    if (std::getenv("ICECC_TEST_PRE_EXPOSURE_LOSS_ONLY") != nullptr) {
+        run_pre_exposure_worker_loss_redispatch(argv[1], directory);
+        std::fprintf(stderr, "%s: %d failure(s)\n",
+                     failures ? "FAIL" : "PASS", failures);
+        return failures ? 1 : 0;
+    }
     if (std::getenv("ICECC_TEST_CACHE_RETRY_ONLY") != nullptr) {
         run_cache_retry_pressure_and_preferred(argv[1], directory);
         run_cache_retry_single_worker(argv[1], directory);
@@ -2622,6 +2963,7 @@ int main(int argc, char **argv)
     run_advisory(argv[1], directory);
     run_prepare_backlog(argv[1], directory);
     run_strict_nonce(argv[1], directory);
+    run_pre_exposure_worker_loss_redispatch(argv[1], directory);
     run_disabled(argv[1], directory);
     run_cache_advertisement(argv[1], directory);
     run_cache_handoff_identity_bound(argv[1], directory);
