@@ -3177,15 +3177,6 @@ class EventProducer:
         client_baselines = {
             client["name"]: self._readiness_baseline(client) for client in clients
         }
-        # Freeze the authenticated trigger boundary before selecting the
-        # currently executing Child.  A newer job may already be queued, so
-        # the active Child's job may be lower than this dispatch ceiling.
-        selection_last_dispatched_job = self._last_job
-        if (
-            type(selection_last_dispatched_job) is not int
-            or selection_last_dispatched_job <= 0
-        ):
-            raise EventError("active scheduler loss has no positive dispatch ceiling")
         client_routes_before = {
             client["name"]: (
                 self._client_route_state(client)
@@ -3326,6 +3317,18 @@ class EventProducer:
                 "scheduler_job_id"
             )
             child_generation = assignment.get("child", {}).get("generation")
+            # The authenticated STOP/assignment probe may outlive the job that
+            # originally triggered the event. Refresh the scheduler log only
+            # after the exact active Child is stopped, and still before the
+            # scheduler kill, so the ceiling proves that selected Child was
+            # dispatched by this live scheduler without incorrectly binding it
+            # to an earlier, already-completed trigger job.
+            selection_last_dispatched_job = self._selection_dispatch_ceiling()
+            self._failure_evidence["compiler_assignment"] = {
+                "receipt": assignment,
+                "selection_last_dispatched_job": selection_last_dispatched_job,
+                "state": "OBSERVED",
+            }
             if (
                 set(assignment) != {"child", "client", "listener", "schema"}
                 or assignment.get("schema") != "icefarm-compiler-assignment-v2"
@@ -5018,6 +5021,14 @@ class EventProducer:
             return scheduler_generation_for_job_text(text, job_id)
         except ValueError as exc:
             raise EventError(str(exc)) from exc
+
+    def _selection_dispatch_ceiling(self) -> int:
+        """Refresh and return the positive pre-kill scheduler selection bound."""
+        self._workload_dispatches()
+        value = self._last_job
+        if type(value) is not int or value <= 0:
+            raise EventError("active scheduler loss has no positive dispatch ceiling")
+        return value
 
     def _workload_dispatches(self) -> tuple[int, ...]:
         reader = self.job_reader or self._remote_job_reader

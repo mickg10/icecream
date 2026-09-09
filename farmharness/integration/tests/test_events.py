@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import http.server
+import inspect
 import json
 import os
 import signal
@@ -638,6 +639,40 @@ def test_active_scheduler_loss_scenario_is_not_the_drained_restart(tmp_path: Pat
     )
     assert f"ICECC_WEB_HOSTPORT=127.0.0.1:{web_port}" in start["argv"]
     assert all("ICECC_WEB_HOSTPORT" not in item.get("env", {}) for item in scenario.data["instances"])
+
+
+def test_active_scheduler_loss_refreshes_selection_ceiling_after_assignment(
+    tmp_path: Path,
+) -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    farm.data["hub"]["results_root"] = str(tmp_path)
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / "S70-b4-scheduler-active-loss.json", farm
+    )
+    plan = farmtest.build_plan(farm, scenario, run_id="active-loss-ceiling-unit")
+    producer = EventProducer(
+        farm,
+        scenario,
+        plan,
+        recorder=RecordingTransport(EventRecorder()),
+        job_reader=lambda: (
+            "put 1 in joblist of F1\n"
+            "put 2 in joblist of F1\n"
+            "put 3 in joblist of F1\n"
+            "put 4 in joblist of F1\n"
+        ),
+    )
+    producer._last_job = 2
+    assert producer._selection_dispatch_ceiling() == 4
+    assert producer.last_dispatched_job == 4
+
+    source = inspect.getsource(EventProducer._authenticated_scheduler_active_loss)
+    assignment = source.index("lost_scheduler_job = assignment.get")
+    refreshed = source.index(
+        "selection_last_dispatched_job = self._selection_dispatch_ceiling()"
+    )
+    scheduler_kill = source.index('phase="event.scheduler-loss-kill"')
+    assert assignment < refreshed < scheduler_kill
 
 
 def test_active_scheduler_loss_uses_preflight_host_native_container_image(
