@@ -217,7 +217,7 @@
       },
       "50": {
         "scheduler": {"sha256": "c4ba01e4238842ccfd51698dcdcb4ac87c8ee3775ccc0384665e64e811a3668f"},
-        "client": {"sha256": "ce71c70a0a300a71efbb27b2bef533d13c78231cd350e5b7e61dd5b50e1090df"},
+        "client": {"sha256": "7c0c6ec713cf5860fc7a320d33328c18e5303ccb803c0d423e429d414ee848c9"},
         "daemon": {"sha256": "94f7194d94a05ceb34d96916bf87af597b7128e35a84bd0e2569fb9f799797b6"}
       }
     },
@@ -323,6 +323,12 @@
         "closure_sha256": "c4743a7967ac85154711c2472e6284d838755598d648ff089ba272a7aacb30ae",
         "commit": "f8a69218603f20a8a1f0c67ee4780eac5d48f13a",
         "id": "sha256:af343033f6a9dec6100f8ad4f0a6974d498e765ff43291bb6132ea509cc0da42"
+      },
+      "p50s4-08697459": {
+        "archive_sha256": "6e2ee80a4369e0b29f5e8db1d49c33aa5b25d5a1d1f48def6cfccf15211f5a8a",
+        "closure_sha256": "aa09eaed18e4b7dd0522c7bbc79dca71e9d65604fa9b3384e394c375876b3465",
+        "commit": "086974599158a6cc4c00536465fbf38b9ae50e70",
+        "id": "sha256:d7f4551a53958562fa1ee62dedb391d1e3d1432e68a9cf67af134dfd4cadec31"
       },
       "p50s4-b42d65e8": {
         "commit": "b42d65e8ac9e90e05ee6d3a19cd371a40dad3277",
