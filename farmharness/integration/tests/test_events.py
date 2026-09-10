@@ -569,6 +569,23 @@ def test_release_script_resumes_only_the_exact_stopped_group() -> None:
 
     process = subprocess.Popen(["sleep", "30"], start_new_session=True)
     try:
+        deadline = time.monotonic() + 2
+        expected: dict[str, object] | None = None
+        while time.monotonic() < deadline:
+            try:
+                candidate = snapshot(process.pid)
+            except (FileNotFoundError, IndexError, ProcessLookupError):
+                candidate = None
+            if (
+                candidate is not None
+                and candidate["comm"] == "sleep"
+                and candidate["argv"]
+            ):
+                expected = candidate
+                break
+            time.sleep(0.01)
+        assert expected is not None
+
         os.killpg(process.pid, signal.SIGSTOP)
         deadline = time.monotonic() + 2
         expected = snapshot(process.pid)

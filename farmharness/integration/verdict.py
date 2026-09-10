@@ -13,6 +13,7 @@ import re
 import struct
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from typing import Any
 
 try:
@@ -733,6 +734,37 @@ def _s60_transition_epoch_errors(
     return bad
 
 
+def _active_scheduler_started_ms(event: Mapping[str, Any]) -> int | None:
+    """Independently derive the active-loss replacement start boundary."""
+
+    if event.get("action") != "scheduler-loss-active":
+        return None
+    receipt = event.get("receipt")
+    after = receipt.get("after") if isinstance(receipt, Mapping) else None
+    started_at = after.get("started_at") if isinstance(after, Mapping) else None
+    fired_ms = event.get("fired_ms")
+    if not isinstance(started_at, str) or not _is_int(fired_ms):
+        return None
+    try:
+        parsed = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    started_ms = int(parsed.timestamp() * 1000)
+    return started_ms if 0 <= started_ms <= fired_ms else None
+
+
+def _scheduler_transition_allows_early_dispatch(
+    event: Mapping[str, Any], dispatch_ms: int
+) -> bool:
+    fired_ms = event["fired_ms"]
+    if fired_ms // 1000 == dispatch_ms // 1000:
+        return True
+    started_ms = _active_scheduler_started_ms(event)
+    return started_ms is not None and started_ms <= dispatch_ms < fired_ms
+
+
 def _scheduler_dispatch_epoch(
     scenario: Mapping[str, Any],
     event_log: object,
@@ -786,7 +818,7 @@ def _scheduler_dispatch_epoch(
     if epoch < lower_epoch:
         skipped = event_log[epoch:lower_epoch]
         if not skipped or any(
-            event["fired_ms"] // 1000 != dispatch_ms // 1000
+            not _scheduler_transition_allows_early_dispatch(event, dispatch_ms)
             for event in skipped
         ):
             return None
@@ -1132,6 +1164,16 @@ def _authenticated_strict_p50_retry_ids(
                     )
                 )
 
+    active_loss_boundaries = {
+        (receipt.get("lost_scheduler_job"), receipt.get("lost_scheduler_generation"))
+        for event in bundle.get("event_log", [])
+        if isinstance(event, Mapping)
+        and event.get("action") == "scheduler-loss-active"
+        and isinstance((receipt := event.get("receipt")), Mapping)
+        and _is_int(receipt.get("lost_scheduler_job"), minimum=1)
+        and _is_int(receipt.get("lost_scheduler_generation"), minimum=1)
+    } if isinstance(bundle.get("event_log"), list) else set()
+
     fields = {
         "failure_reason",
         "final_dispatch_ms",
@@ -1165,7 +1207,15 @@ def _authenticated_strict_p50_retry_ids(
         expected_first_terminals = (
             {"process-loss-recovery"}
             if reason == "worker-restart-loss"
-            else {"cancellation", "completion"}
+            else (
+                {"cancellation", "completion", "scheduler-loss"}
+                if (
+                    binding.get("first_scheduler_job"),
+                    binding.get("first_generation"),
+                )
+                in active_loss_boundaries
+                else {"cancellation", "completion"}
+            )
             if reason == "result-stream-loss"
             else {"cancellation"}
             if reason == "source-transfer-loss"
@@ -1291,6 +1341,127 @@ def _authenticated_strict_p50_retry_ids(
     ):
         bad.add("@observations:failed_p50_source_transfers")
     return authenticated, bad
+
+
+def _authenticated_active_loss_fallback_ids(
+    bundle: Mapping[str, Any],
+    observations: Mapping[str, Any],
+    rows: Sequence[Mapping[str, Any]],
+) -> tuple[set[str], set[str]]:
+    """Bind the one active-scheduler-loss legacy recovery independently.
+
+    The active-loss contract intentionally allows the interrupted strict-P50
+    request to recover once through an exact remote legacy fallback.  That
+    fallback counts as Error-106 recovery only when its first assignment and
+    failed result identity name the exact lost scheduler incarnation.
+    """
+
+    marker = "@retry:active-loss-fallback"
+    scenario = bundle.get("scenario")
+    expect = scenario.get("expect") if isinstance(scenario, Mapping) else None
+    if (
+        not isinstance(expect, Mapping)
+        or expect.get("engagement") != S70_B4_ACTIVE_LOSS_ENGAGEMENT
+    ):
+        return set(), set()
+    event_log = bundle.get("event_log")
+    if (
+        not isinstance(event_log, list)
+        or len(event_log) != 1
+        or not isinstance(event_log[0], Mapping)
+        or event_log[0].get("action") != "scheduler-loss-active"
+        or not isinstance(event_log[0].get("receipt"), Mapping)
+    ):
+        return set(), {marker}
+    receipt = event_log[0]["receipt"]
+    lost_job = receipt.get("lost_scheduler_job")
+    lost_generation = receipt.get("lost_scheduler_generation")
+    if not _is_int(lost_job, minimum=1) or not _is_int(
+        lost_generation, minimum=1
+    ):
+        return set(), {marker}
+
+    lifecycle = observations.get("assignment_lifecycle")
+    affected = [
+        item
+        for item in lifecycle
+        if isinstance(item, Mapping)
+        and isinstance(item.get("attempts"), list)
+        and item["attempts"]
+        and isinstance(item["attempts"][0], Mapping)
+        and item["attempts"][0].get("scheduler_job") == lost_job
+        and item["attempts"][0].get("generation") == lost_generation
+    ] if isinstance(lifecycle, list) else []
+    if len(affected) != 1 or len(affected[0]["attempts"]) != 2:
+        return set(), {marker}
+    first, final = affected[0]["attempts"]
+    if (
+        not isinstance(first, Mapping)
+        or not isinstance(final, Mapping)
+        or first.get("terminal") != "scheduler-loss"
+        or final.get("terminal") != "completion"
+        or final.get("generation") != lost_generation + 1
+        or not _is_int(final.get("scheduler_job"), minimum=1)
+        or not isinstance(first.get("worker"), str)
+        or not first["worker"]
+    ):
+        return set(), {marker}
+    job_id = _job_id(affected[0].get("job_id"), marker)
+    matching_rows = [
+        row
+        for row in rows
+        if isinstance(row, Mapping)
+        and _job_id(row.get("job_id"), "@row") == job_id
+    ]
+    if len(matching_rows) != 1:
+        return set(), {marker}
+    row = matching_rows[0]
+    if not (
+        row.get("exact") is True
+        and row.get("retries") == 1
+        and row.get("tail_present") is False
+        and row.get("tail_profile") is None
+        and row.get("session_outcome") == "fallback"
+    ):
+        return set(), {marker}
+
+    failed = observations.get("failed_p50_result_identities")
+    records = failed.get("records") if isinstance(failed, Mapping) else None
+    matching_failures = [
+        item
+        for item in records
+        if isinstance(item, Mapping)
+        and item.get("row_job_id") == job_id
+        and item.get("attempt_index") == 0
+    ] if isinstance(records, list) else []
+    if (
+        len(matching_failures) != 1
+        or failed.get("record_count") != len(records)
+        or set(matching_failures[0])
+        != {
+            "assignment_epoch",
+            "assignment_nonce",
+            "attempt_index",
+            "reason",
+            "result_identity_present",
+            "row_job_id",
+            "scheduler_job",
+            "worker",
+        }
+        or not _is_int(matching_failures[0].get("assignment_epoch"), minimum=1)
+        or not _is_int(matching_failures[0].get("assignment_nonce"), minimum=1)
+        or matching_failures[0].get("reason") != "result-stream-loss"
+        or matching_failures[0].get("result_identity_present") is not False
+        or matching_failures[0].get("scheduler_job") != lost_job
+        or matching_failures[0].get("worker") != first.get("worker")
+    ):
+        return set(), {marker}
+    local_fallbacks = observations.get("local_fallback_job_ids")
+    if not isinstance(local_fallbacks, list) or job_id in {
+        _job_id(item, "@local-fallback") for item in local_fallbacks
+    }:
+        return set(), {marker}
+    return {job_id}, set()
 
 
 def _authenticated_strict_p50_late_result_ids(
@@ -4985,6 +5156,9 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
     late_result_ids, late_result_bad = _authenticated_strict_p50_late_result_ids(
         bundle, observations, valid_rows, scenario
     )
+    active_loss_fallback_ids, active_loss_fallback_bad = (
+        _authenticated_active_loss_fallback_ids(bundle, observations, valid_rows)
+    )
     if (
         "successful_strict_p50_retry_bindings" in observations
         or engagement_mode == S70_B4_WORKER_ENGAGEMENT
@@ -5147,7 +5321,13 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
             and row["retries"] == 1 and row["exact"] is True
             and row["job_id"] in affected_ids
         ]
-        if len(affected_ids) != 1 or len(fallback) != 1:
+        if (
+            active_loss_fallback_bad
+            or len(affected_ids) != 1
+            or len(fallback) != 1
+            or active_loss_fallback_ids != affected_ids
+        ):
+            engagement_bad.update(active_loss_fallback_bad)
             engagement_bad.add("@rows:exactly-one-active-loss-fallback")
         if not any(
             row["event_epoch"] == 1 and row["tail_present"] is True
@@ -6114,12 +6294,18 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
             active_bad.add("@observations:local_fallback_job_ids")
         lifecycle = observations.get("assignment_lifecycle")
         lost_job = receipt.get("lost_scheduler_job") if isinstance(receipt, Mapping) else None
+        lost_generation = (
+            receipt.get("lost_scheduler_generation")
+            if isinstance(receipt, Mapping)
+            else None
+        )
         affected = [
             item for item in lifecycle
             if isinstance(item, Mapping)
             and isinstance(item.get("attempts"), list)
             and item["attempts"]
             and item["attempts"][0].get("scheduler_job") == lost_job
+            and item["attempts"][0].get("generation") == lost_generation
         ] if isinstance(lifecycle, list) else []
         if len(affected) != 1 or len(affected[0]["attempts"]) != 2:
             active_bad.add("@retry:active-loss-boundary")
@@ -6135,6 +6321,11 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
                 attempts = item.get("attempts") if isinstance(item, Mapping) else None
                 if not isinstance(attempts, list) or len(attempts) != 1 or attempts[0].get("terminal") != "completion":
                     active_bad.add("@retry:unexpected-additional-retry")
+        if active_loss_fallback_bad or active_loss_fallback_ids != {
+            item.get("job_id") for item in affected
+        }:
+            active_bad.update(active_loss_fallback_bad)
+            active_bad.add("@retry:active-loss-fallback")
         clauses.append(_clause(
             "s70.b4-scheduler-active-loss",
             not active_bad,
@@ -6990,8 +7181,14 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(error106, list)
         else {"@observations:error106_job_ids"}
     )
-    authenticated_recovery_ids = recovered_ids | (
-        strict_retry_ids if not strict_retry_bad else set()
+    authenticated_recovery_ids = (
+        recovered_ids
+        | (strict_retry_ids if not strict_retry_bad else set())
+        | (
+            active_loss_fallback_ids
+            if not active_loss_fallback_bad
+            else set()
+        )
     )
     unrecovered_error106_ids = error106_ids - authenticated_recovery_ids
     error106_max = expect.get("error106_max")

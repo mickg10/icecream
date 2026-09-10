@@ -1468,6 +1468,7 @@ def _scheduler_jobs(
     if path is None:
         raise CollectError("scheduler lifecycle log is absent")
     generation = 0
+    generation_starts: dict[int, tuple[int, int]] = {}
     jobs: dict[tuple[int, int], dict[str, Any]] = {}
     dispatches: list[dict[str, Any]] = []
     for line_number, line in enumerate(_text(path).splitlines(), start=1):
@@ -1493,6 +1494,7 @@ def _scheduler_jobs(
         message = framed.group(2)
         if SCHEDULER_START_RE.fullmatch(message):
             generation += 1
+            generation_starts[generation] = (line_number, timestamp_ms)
             continue
         matched = SCHEDULER_NEW_RE.match(message)
         if matched is not None:
@@ -1689,12 +1691,28 @@ def _scheduler_jobs(
                     or job["generation"] in allow_unterminated_generations
                 )
             ):
+                successor = generation_starts.get(job["generation"] + 1)
+                if (
+                    successor is None
+                    or successor[0] <= job["dispatch_line"]
+                    or successor[1] < job["dispatch_ms"]
+                ):
+                    raise CollectError(
+                        "scheduler-loss dispatch has no authenticated successor "
+                        "scheduler generation"
+                    )
                 job.update(
                     {
                         "status": None,
                         "terminal": "scheduler-loss",
-                        "terminal_line": None,
-                        "terminal_ms": job["dispatch_ms"],
+                        # The exact next scheduler startup is the only retained
+                        # log boundary at which this old-generation assignment
+                        # is known to have ceased occupying its F slot.  Binding
+                        # the synthetic loss terminal to that line preserves
+                        # assignment-preference occupancy without inventing an
+                        # END/STOP record.
+                        "terminal_line": successor[0],
+                        "terminal_ms": successor[1],
                     }
                 )
                 continue
@@ -4293,6 +4311,43 @@ def _epoch_at(events: list[dict[str, Any]], dispatch_ms: int) -> int:
     return sum(event["fired_ms"] <= dispatch_ms for event in events)
 
 
+def _active_scheduler_started_ms(event: Mapping[str, Any]) -> int | None:
+    """Return the authenticated replacement start bound for an active loss.
+
+    ``fired_ms`` records completion of the active-loss event, after scheduler
+    restart, readiness, and admission release.  A retry may therefore be
+    dispatched by the replacement scheduler before that completion timestamp.
+    Docker's retained ``after.started_at`` identity is the exact earlier bound.
+    """
+
+    if event.get("action") != "scheduler-loss-active":
+        return None
+    receipt = event.get("receipt")
+    after = receipt.get("after") if isinstance(receipt, Mapping) else None
+    started_at = after.get("started_at") if isinstance(after, Mapping) else None
+    fired_ms = event.get("fired_ms")
+    if not isinstance(started_at, str) or type(fired_ms) is not int:
+        return None
+    try:
+        parsed = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    started_ms = int(parsed.timestamp() * 1000)
+    return started_ms if 0 <= started_ms <= fired_ms else None
+
+
+def _scheduler_transition_allows_early_dispatch(
+    event: Mapping[str, Any], dispatch_ms: int
+) -> bool:
+    fired_ms = event["fired_ms"]
+    if fired_ms // 1000 == dispatch_ms // 1000:
+        return True
+    started_ms = _active_scheduler_started_ms(event)
+    return started_ms is not None and started_ms <= dispatch_ms < fired_ms
+
+
 def _scheduler_dispatch_epoch(
     events: list[dict[str, Any]],
     scheduler_name: str,
@@ -4305,8 +4360,9 @@ def _scheduler_dispatch_epoch(
     millisecond timestamps.  A dispatch from a freshly started scheduler can
     therefore appear a few milliseconds before the event that started it.
     Only the exact scheduler-log generation may resolve that same-second
-    ambiguity; larger timestamp disagreements and impossible generations fail
-    closed.
+    ambiguity.  Active-loss completion is additionally allowed to lag a retry
+    dispatch, but only back to the retained replacement-container start.
+    Larger timestamp disagreements and impossible generations fail closed.
     """
 
     if (
@@ -4349,7 +4405,7 @@ def _scheduler_dispatch_epoch(
     if epoch < lower_epoch:
         skipped = events[epoch:lower_epoch]
         if not skipped or any(
-            event["fired_ms"] // 1000 != dispatch_ms // 1000
+            not _scheduler_transition_allows_early_dispatch(event, dispatch_ms)
             for event in skipped
         ):
             raise CollectError(
@@ -6452,13 +6508,20 @@ def _observations(
                 raise CollectError(
                     f"{row['job_id']}: missing result identity names an invalid attempt"
                 )
-            terminal = records[attempt_index]["terminal"]
+            record = records[attempt_index]
+            terminal = record["terminal"]
             expected_terminals = (
                 {"process-loss-recovery"}
                 if missing["reason"] == "worker-restart-loss"
                 else {"cancellation", "completion"}
             )
-            if terminal not in expected_terminals:
+            exact_active_scheduler_loss = (
+                missing["reason"] == "result-stream-loss"
+                and terminal == "scheduler-loss"
+                and record.get("scheduler_job") in active_loss_jobs
+                and record.get("generation") in active_loss_generations
+            )
+            if terminal not in expected_terminals and not exact_active_scheduler_loss:
                 raise CollectError(
                     f"{row['job_id']}: missing result identity loss witness "
                     "disagrees with scheduler terminal"

@@ -838,6 +838,69 @@ def test_collection_refuses_a_scheduler_dispatch_without_terminal(
         collect_bundle(farm, scenario, plan, sync_remote=False)
 
 
+def _scheduler_loss_log_fixture(tmp_path: Path) -> tuple[Path, dict[str, object]]:
+    evidence = tmp_path / "evidence"
+    scheduler_log = evidence / "diagnostics" / "h1" / "S1.log" / "scheduler.log"
+    scheduler_log.parent.mkdir(parents=True)
+    scheduler_log.write_text(
+        "[1] 2026-09-10 12:00:00: ICECREAM scheduler 1.5.90 starting up, port 23000\n"
+        "[1] 2026-09-10 12:00:01: NEW 3 client=C1 versions=[] /lost.ii C++ 0\n"
+        "[1] 2026-09-10 12:00:01: put 3 in joblist of F1\n"
+        "[1] 2026-09-10 12:00:01: BEGIN: 3 client=C1(x86_64) server=F1(x86_64)\n"
+        "[1] 2026-09-10 12:00:06: ICECREAM scheduler 1.5.90 starting up, port 23000\n"
+        "[1] 2026-09-10 12:00:07: NEW 1 client=C1 versions=[] /retry.ii C++ 0\n"
+        "[1] 2026-09-10 12:00:07: put 1 in joblist of F1\n"
+        "[1] 2026-09-10 12:00:08: END 1 status=0 server=F1\n",
+        encoding="utf-8",
+    )
+    plan: dict[str, object] = {
+        "topology": {
+            "instances": [
+                {"host": "h1", "name": "S1", "role": "S"},
+            ]
+        }
+    }
+    return evidence, plan
+
+
+def test_scheduler_loss_terminal_binds_the_successor_generation_start(
+    tmp_path: Path,
+) -> None:
+    evidence, plan = _scheduler_loss_log_fixture(tmp_path)
+
+    jobs = _scheduler_jobs(
+        evidence,
+        plan,
+        allow_unterminated_job_ids={3},
+        allow_unterminated_generations={1},
+    )
+
+    lost = jobs[0]
+    assert lost["terminal"] == "scheduler-loss"
+    assert lost["terminal_line"] == 5
+    assert lost["terminal_ms"] == 1_789_041_606_000
+
+
+def test_scheduler_loss_terminal_requires_a_successor_generation(
+    tmp_path: Path,
+) -> None:
+    evidence, plan = _scheduler_loss_log_fixture(tmp_path)
+    scheduler_log = evidence / "diagnostics" / "h1" / "S1.log" / "scheduler.log"
+    scheduler_log.write_text(
+        "\n".join(scheduler_log.read_text(encoding="utf-8").splitlines()[:4])
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(CollectError, match="no authenticated successor"):
+        _scheduler_jobs(
+            evidence,
+            plan,
+            allow_unterminated_job_ids={3},
+            allow_unterminated_generations={1},
+        )
+
+
 def _preexposure_scheduler_fixture(
     tmp_path: Path,
 ) -> tuple[Path, dict[str, object], list[dict[str, object]], Path]:
@@ -2897,6 +2960,27 @@ def test_scheduler_generation_epoch_fails_closed_beyond_same_second() -> None:
         _scheduler_dispatch_epoch(events, "S1", 1000, 3)
     with pytest.raises(CollectError, match="precedes the dispatch event epoch"):
         _scheduler_dispatch_epoch(events, "S1", 3000, 1)
+
+
+def test_active_scheduler_generation_uses_replacement_start_boundary() -> None:
+    events = [
+        {
+            "action": "scheduler-loss-active",
+            "fired_ms": 1_789_042_945_000,
+            "instance": "S1",
+            "receipt": {
+                "after": {"started_at": "2026-09-10T12:21:36.251650806Z"}
+            },
+        }
+    ]
+
+    assert _scheduler_dispatch_epoch(events, "S1", 1_789_042_942_000, 2) == 1
+    with pytest.raises(CollectError, match="disagrees with the dispatch timestamp"):
+        _scheduler_dispatch_epoch(events, "S1", 1_789_042_896_000, 2)
+
+    events[0]["receipt"]["after"]["started_at"] = "not-a-timestamp"
+    with pytest.raises(CollectError, match="disagrees with the dispatch timestamp"):
+        _scheduler_dispatch_epoch(events, "S1", 1_789_042_942_000, 2)
 
 
 def test_client_transition_environment_adds_and_removes_explicit_mode() -> None:

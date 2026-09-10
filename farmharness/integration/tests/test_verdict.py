@@ -13,7 +13,10 @@ from farmharness.integration.verdict import (
     ROW_SCHEMA,
     SCHEDULER_DISPATCH_EPOCH_CONTRACT,
     VERDICT_SCHEMA,
+    _authenticated_active_loss_fallback_ids,
+    _authenticated_strict_p50_retry_ids,
     _scenario_profile_at_epoch,
+    _scheduler_dispatch_epoch,
     _shape_clauses,
     _s60_transition_epoch_errors,
     evaluate_bundle,
@@ -2403,6 +2406,65 @@ def test_s70_b4_result_stream_error106_is_recovered_by_exact_strict_retry() -> N
     assert verdict["status"] == "PASS", verdict
 
 
+def test_result_stream_retry_accepts_only_its_exact_active_scheduler_loss() -> None:
+    fixture = _s70_b4_worker_result_stream_recovery_bundle()
+    binding = fixture["observations"]["successful_strict_p50_retry_bindings"][0]
+    assignment = fixture["observations"]["assignment_lifecycle"][100]
+    binding["first_terminal"] = "scheduler-loss"
+    assignment["attempts"][0]["terminal"] = "scheduler-loss"
+    fixture["event_log"] = [
+        {
+            "action": "scheduler-loss-active",
+            "receipt": {
+                "lost_scheduler_generation": binding["first_generation"],
+                "lost_scheduler_job": binding["first_scheduler_job"],
+            },
+        }
+    ]
+
+    authenticated, bad = _authenticated_strict_p50_retry_ids(
+        fixture,
+        fixture["observations"],
+        fixture["rows"],
+    )
+    assert authenticated == {binding["job_id"]}
+    assert bad == set()
+
+    fixture["event_log"][0]["receipt"]["lost_scheduler_job"] += 1
+    authenticated, bad = _authenticated_strict_p50_retry_ids(
+        fixture,
+        fixture["observations"],
+        fixture["rows"],
+    )
+    assert authenticated == set()
+    assert bad
+
+
+def test_verdict_active_scheduler_epoch_uses_exact_replacement_start() -> None:
+    scenario = {"instances": [{"name": "S1", "role": "S"}]}
+    events = [
+        {
+            "action": "scheduler-loss-active",
+            "fired_ms": 1_789_042_945_000,
+            "instance": "S1",
+            "receipt": {
+                "after": {"started_at": "2026-09-10T12:21:36.251650806Z"}
+            },
+        }
+    ]
+
+    assert (
+        _scheduler_dispatch_epoch(
+            scenario, events, 1_789_042_942_000, 2
+        )
+        == 1
+    )
+    assert _scheduler_dispatch_epoch(scenario, events, 1_789_042_896_000, 2) is None
+
+    events[0]["receipt"]["after"]["started_at"] = "not-a-timestamp"
+    assert _scheduler_dispatch_epoch(scenario, events, 1_789_042_942_000, 2) is None
+
+
 def _s70_b4_worker_source_transfer_recovery_bundle() -> dict[str, object]:
     fixture = _s70_b4_worker_result_stream_recovery_bundle()
     fixture["plan"] = {
@@ -3515,7 +3577,9 @@ def _s70_active_loss_bundle() -> dict[str, object]:
             {"generation": 2, "scheduler_job": 3, "terminal": "completion", "worker": "F1"},
         ]},
         {"job_id": "2", "attempts": [
-            {"generation": 2, "scheduler_job": 4, "terminal": "completion", "worker": "F1"},
+            # Scheduler job numbers restart with the new incarnation.  Reusing
+            # the lost numeric id must not make this later row look affected.
+            {"generation": 2, "scheduler_job": 2, "terminal": "completion", "worker": "F1"},
         ]},
     ]
     observations["job_lifecycle"] = [
@@ -3523,6 +3587,22 @@ def _s70_active_loss_bundle() -> dict[str, object]:
         {"deadline_ms": 10000, "dispatch_ms": 200, "job_id": "2", "terminal": "completion", "terminal_ms": 225, "turn": "A"},
     ]
     observations["local_fallback_job_ids"] = []
+    observations["error106_job_ids"] = ["1"]
+    observations["failed_p50_result_identities"] = {
+        "record_count": 1,
+        "records": [
+            {
+                "assignment_epoch": 7,
+                "assignment_nonce": 9,
+                "attempt_index": 0,
+                "reason": "result-stream-loss",
+                "result_identity_present": False,
+                "row_job_id": "1",
+                "scheduler_job": 2,
+                "worker": "F1",
+            }
+        ],
+    }
     receipt = {
         "action": "scheduler-loss-active", "event_epoch": 1, "instance": "S1",
         "lost_scheduler_generation": 1, "lost_scheduler_job": 2,
@@ -3567,6 +3647,24 @@ def test_s70_active_loss_evaluate_bundle_requires_exact_fallback_and_later_p29()
         else:
             tampered["observations"]["local_fallback_job_ids"] = ["1"]
         assert evaluate_bundle(tampered)["status"] == "FAIL"
+
+
+def test_active_loss_fallback_recovery_requires_exact_failed_result_binding() -> None:
+    bundle = _s70_active_loss_bundle()
+    authenticated, bad = _authenticated_active_loss_fallback_ids(
+        bundle, bundle["observations"], bundle["rows"]
+    )
+    assert authenticated == {"1"}
+    assert bad == set()
+
+    bundle["observations"]["failed_p50_result_identities"]["records"][0][
+        "scheduler_job"
+    ] = 99
+    authenticated, bad = _authenticated_active_loss_fallback_ids(
+        bundle, bundle["observations"], bundle["rows"]
+    )
+    assert authenticated == set()
+    assert bad
 
 
 @pytest.mark.parametrize("shape", sorted(SHAPE_FIXTURES))
