@@ -330,6 +330,20 @@ int main(int argc, char **argv)
             "(poisoned) handoff back to canonical absence -- valid, port, "
             "protocol, and mask all zero");
 
+    MsgChannel *client_remote = connect_unix_bounded(socket_path, 5000);
+    REQUIRE(client_remote != nullptr,
+            "remote-required client connected while schedulerless");
+    GetCSMsg remote_request(
+        Environments(), "remote-required.cpp", CompileJob::Lang_CXX,
+        1, "x86_64", 0, std::string(), 50, 0, 0);
+    remote_request.remote_required = 1;
+    REQUIRE(client_remote && client_remote->send_msg(remote_request),
+            "remote-required client requested one assignment");
+    Msg *forbidden_local = wait_for_type(client_remote, Msg::USE_CS, 1000);
+    REQUIRE(forbidden_local == nullptr && client_remote && !client_remote->at_eof(),
+            "schedulerless remote-required request stayed held without local reply");
+    delete forbidden_local;
+
     int bound_port = 0;
     const int listener = listen_on_port(scheduler_port, &bound_port);
     REQUIRE(listener >= 0 && bound_port == scheduler_port,
@@ -417,6 +431,11 @@ int main(int argc, char **argv)
         REQUIRE(active->send_msg(legacy_config),
                 "replacement scheduler sent a duplicate ConfCS");
     }
+    Msg *redriven_wire = wait_for_type(active, Msg::GET_CS, 5000);
+    GetCSMsg *redriven = dynamic_cast<GetCSMsg *>(redriven_wire);
+    REQUIRE(redriven && redriven->remote_required == 1,
+            "replacement scheduler received the held remote-required request");
+    delete redriven_wire;
     usleep(100 * 1000);
     const std::string active_state = request_internals(client_a, 5000);
     REQUIRE(active_state.find("ownership_failed=0 gen=1") != std::string::npos,
@@ -428,6 +447,8 @@ int main(int argc, char **argv)
             "active-session loss cleaned the original local client");
     REQUIRE(wait_eof(client_b, 5000),
             "active-session loss cleaned the pending client");
+    REQUIRE(wait_eof(client_remote, 5000),
+            "active-session loss cleaned the remote-required client");
     MsgChannel *client_c = connect_unix_bounded(socket_path, 5000);
     REQUIRE(client_c != nullptr,
             "fresh observer connected after active-session cleanup");
@@ -448,6 +469,7 @@ int main(int argc, char **argv)
 
     delete client_a;
     delete client_b;
+    delete client_remote;
     delete client_c;
     close(listener);
 

@@ -4200,6 +4200,7 @@ GetCSMsg::GetCSMsg(const Environments &envs, const std::string &f,
     , cache_affinity_profile_mask(0)
     , cache_affinity_port(0)
     , cache_retry_avoid_port(0)
+    , remote_required(0)
     , cache_request_tail_valid(true)
 {
     // These have been introduced in protocol version 42.
@@ -4268,6 +4269,7 @@ void GetCSMsg::fill_from_channel(MsgChannel *c)
     cache_affinity_host.clear();
     cache_retry_avoid_port = 0;
     cache_retry_avoid_host.clear();
+    remote_required = 0;
     cache_request_tail_valid = true;
     if (IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT, c)) {
         /* The protocol-50 request tail is mandatory.  Its string makes the
@@ -4277,7 +4279,7 @@ void GetCSMsg::fill_from_channel(MsgChannel *c)
            legacy protocol version.  Bound both strings and require exact
            frame exhaustion afterwards. */
         if (c->current_message_bytes_remaining() <
-            7 * sizeof(uint32_t) + 2) {
+            8 * sizeof(uint32_t) + 2) {
             cache_request_tail_valid = false;
             return;
         }
@@ -4291,6 +4293,7 @@ void GetCSMsg::fill_from_channel(MsgChannel *c)
         cache_request_tail_valid = cache_request_tail_valid &&
             c->read_bounded_string(
                 cache_retry_avoid_host, P50_CACHE_AFFINITY_HOST_MAX);
+        *c >> remote_required;
         if (c->current_message_bytes_remaining() != 0)
             cache_request_tail_valid = false;
     }
@@ -4346,6 +4349,7 @@ void GetCSMsg::send_to_channel(MsgChannel *c) const
         *c << cache_affinity_host;
         *c << cache_retry_avoid_port;
         *c << cache_retry_avoid_host;
+        *c << remote_required;
     }
 }
 
@@ -4358,6 +4362,7 @@ bool GetCSMsg::valid_payload() const
             cache_affinity_host) &&
         p50_cache_retry_avoid_is_valid(
             cache_retry_avoid_port, cache_retry_avoid_host) &&
+        remote_required <= 1 &&
         (!p50_cache_retry_avoid_is_present(
              cache_retry_avoid_port, cache_retry_avoid_host) ||
          cache_protocol == CACHE_WIRE_REVISION);

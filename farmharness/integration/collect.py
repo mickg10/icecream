@@ -117,7 +117,9 @@ SCHEDULER_START_RE = re.compile(r"^ICECREAM scheduler .* starting up, port [0-9]
 SCHEDULER_ACTIVE_LOSS_SCHEMA_V1 = "icefarm-scheduler-active-loss-v1"
 SCHEDULER_ACTIVE_LOSS_SCHEMA_V2 = "icefarm-scheduler-active-loss-v2"
 SCHEDULER_ACTIVE_LOSS_SCHEMA_V3 = "icefarm-scheduler-active-loss-v3"
-SCHEDULER_ACTIVE_LOSS_SCHEMA = "icefarm-scheduler-active-loss-v4"
+SCHEDULER_ACTIVE_LOSS_SCHEMA_V4 = "icefarm-scheduler-active-loss-v4"
+SCHEDULER_ACTIVE_LOSS_SCHEMA = "icefarm-scheduler-active-loss-v5"
+SCHEDULER_ACTIVE_LOSS_ADMISSION_SCHEMA = "icefarm-active-loss-admission-v1"
 LISTENER_BINDING_EVIDENCE = "container-env+netns-listener-uid+http-child"
 DAEMON_START_RE = re.compile(r"ICECREAM daemon .* starting up")
 READINESS_SCHEDULER_RE = re.compile(r"ICECREAM scheduler .* starting up, port [0-9]+")
@@ -1895,8 +1897,10 @@ def _validate_scheduler_active_loss_receipt(
         raise CollectError(f"{prefix} needs authenticated farm, plan, and evidence")
     required = {"action", "after", "before", "compiler", "event_epoch", "instance", "lost_scheduler_generation", "lost_scheduler_job", "pre_fault", "quiescence", "schema", "turn"}
     schema = receipt.get("schema") if isinstance(receipt, Mapping) else None
-    if schema == SCHEDULER_ACTIVE_LOSS_SCHEMA:
+    if schema in {SCHEDULER_ACTIVE_LOSS_SCHEMA_V4, SCHEDULER_ACTIVE_LOSS_SCHEMA}:
         required.add("selection_last_dispatched_job")
+    if schema == SCHEDULER_ACTIVE_LOSS_SCHEMA:
+        required.add("admission_release")
     if (
         not isinstance(receipt, Mapping)
         or set(receipt) != required
@@ -1905,6 +1909,7 @@ def _validate_scheduler_active_loss_receipt(
             SCHEDULER_ACTIVE_LOSS_SCHEMA_V1,
             SCHEDULER_ACTIVE_LOSS_SCHEMA_V2,
             SCHEDULER_ACTIVE_LOSS_SCHEMA_V3,
+            SCHEDULER_ACTIVE_LOSS_SCHEMA_V4,
             SCHEDULER_ACTIVE_LOSS_SCHEMA,
         }
     ):
@@ -1912,12 +1917,67 @@ def _validate_scheduler_active_loss_receipt(
     strict = receipt.get("schema") != SCHEDULER_ACTIVE_LOSS_SCHEMA_V1
     listener_v3 = receipt.get("schema") in {
         SCHEDULER_ACTIVE_LOSS_SCHEMA_V3,
+        SCHEDULER_ACTIVE_LOSS_SCHEMA_V4,
         SCHEDULER_ACTIVE_LOSS_SCHEMA,
     }
     if receipt.get("action") != event.get("action") or receipt.get("instance") != event.get("instance") or receipt.get("event_epoch") != event.get("event_epoch") or receipt.get("turn") not in scenario.data["workload"]["turns"]:
         raise CollectError(f"{prefix} is not bound to its timeline event")
+    if schema == SCHEDULER_ACTIVE_LOSS_SCHEMA:
+        admission = receipt.get("admission_release")
+        expected_clients = scenario.data["workload"].get("clients")
+        trigger = re.fullmatch(r"job ([1-9][0-9]*)", str(event.get("trigger", "")))
+        clients = admission.get("clients") if isinstance(admission, Mapping) else None
+        gate_fields = {
+            "action",
+            "active_after",
+            "active_before",
+            "client",
+            "epoch",
+            "finished_ms",
+            "schema",
+            "started_ms",
+            "status",
+            "turn",
+        }
+        admission_valid = (
+            isinstance(admission, Mapping)
+            and set(admission) == {"clients", "schema", "serial_through"}
+            and admission.get("schema") == SCHEDULER_ACTIVE_LOSS_ADMISSION_SCHEMA
+            and trigger is not None
+            and admission.get("serial_through") == int(trigger.group(1))
+            and isinstance(expected_clients, list)
+            and len(expected_clients) == 1
+            and isinstance(expected_clients[0], str)
+            and isinstance(clients, Mapping)
+            and set(clients) == set(expected_clients)
+        )
+        if admission_valid:
+            for name in expected_clients:
+                value = clients[name]
+                if (
+                    not isinstance(value, Mapping)
+                    or set(value) != gate_fields
+                    or value.get("schema") != EVENT_GATE_SCHEMA
+                    or value.get("action") != "resume"
+                    or value.get("status") != "OPEN"
+                    or value.get("client") != name
+                    or value.get("turn") != receipt.get("turn")
+                    or value.get("epoch") != receipt.get("event_epoch")
+                    or value.get("active_before") != 1
+                    or value.get("active_after") != 1
+                    or any(
+                        type(value.get(field)) is not int or value[field] < 0
+                        for field in ("finished_ms", "started_ms")
+                    )
+                    or value["finished_ms"] < value["started_ms"]
+                ):
+                    admission_valid = False
+                    break
+        if not admission_valid:
+            raise CollectError(f"{prefix} has no exact serialized admission release")
     v4_boundary_valid = (
-        receipt.get("schema") == SCHEDULER_ACTIVE_LOSS_SCHEMA
+        receipt.get("schema")
+        in {SCHEDULER_ACTIVE_LOSS_SCHEMA_V4, SCHEDULER_ACTIVE_LOSS_SCHEMA}
         and type(receipt.get("selection_last_dispatched_job")) is int
         and receipt["selection_last_dispatched_job"] > 0
         and receipt["selection_last_dispatched_job"]
@@ -1928,7 +1988,8 @@ def _validate_scheduler_active_loss_receipt(
         <= receipt["selection_last_dispatched_job"]
     )
     legacy_boundary_valid = (
-        receipt.get("schema") != SCHEDULER_ACTIVE_LOSS_SCHEMA
+        receipt.get("schema")
+        not in {SCHEDULER_ACTIVE_LOSS_SCHEMA_V4, SCHEDULER_ACTIVE_LOSS_SCHEMA}
         and receipt.get("lost_scheduler_job") == event.get("last_dispatched_job")
     )
     if (type(receipt.get("lost_scheduler_generation")) is not int or receipt["lost_scheduler_generation"] <= 0
@@ -2102,7 +2163,8 @@ def _validate_scheduler_active_loss_receipt(
             or assignment.get("schema")
             != (
                 "icefarm-compiler-assignment-v2"
-                if receipt.get("schema") == SCHEDULER_ACTIVE_LOSS_SCHEMA
+                if receipt.get("schema")
+                in {SCHEDULER_ACTIVE_LOSS_SCHEMA_V4, SCHEDULER_ACTIVE_LOSS_SCHEMA}
                 else "icefarm-compiler-assignment-v1"
             )
             or assignment.get("child", {}).get("pid") != leader.get("pid")

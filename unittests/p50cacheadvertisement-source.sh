@@ -62,8 +62,8 @@ require_count 1 'if (remaining != 3 * sizeof(uint32_t)) {' services/comm.cpp \
     'UseCS decode requires exactly the three-word tail, matching Login'
 require_count 1 'cache_request_tail_valid = c->read_bounded_string(' \
     services/comm.cpp 'GetCS decodes its warm host through the bounded string reader'
-require_count 1 '7 * sizeof(uint32_t) + 2' services/comm.cpp \
-    'GetCS requires the complete five-word/two-string P50 request tail'
+require_count 1 '8 * sizeof(uint32_t) + 2' services/comm.cpp \
+    'GetCS requires the complete six-field/two-string P50 request tail'
 require_count 1 'cache_retry_avoid_host, P50_CACHE_AFFINITY_HOST_MAX);' \
     services/comm.cpp 'GetCS decodes the retry endpoint host with the same bound'
 require_count 1 'p50_cache_retry_avoid_is_valid(' services/comm.cpp \
@@ -114,14 +114,44 @@ require_count 1 '!job->preferredHost().empty() && !retry_alternative_exists' \
 require_count 1 'cache_retry_wait = prefer_cache_compatible_servers(' \
     scheduler/scheduler.cpp \
     'server selection applies the bounded preference exactly once'
-require_count 1 'if (!cache_retry_wait && !job->preExposureRedispatch()) {' \
+require_count 1 'if (!cache_retry_wait && !job->preExposureRedispatch() &&' \
     scheduler/scheduler.cpp \
-    'retry wait and unexposed redispatch both suppress submitter-local fallback'
+    'retry wait, unexposed redispatch, and remote-required policy suppress submitter-local fallback'
 require_count 1 'if (job->preExposureRedispatch() && cs == job->submitter()) {' \
     scheduler/scheduler.cpp \
     'ordinary selection excludes the local submitter during unexposed redispatch'
 require_count 1 'const bool redispatch_local =' scheduler/scheduler.cpp \
     'preferred-host selection independently excludes the redispatch submitter'
+require_count 1 '*c << remote_required;' services/comm.cpp \
+    'GetCS writes the remote-required policy exactly once'
+require_count 1 '*c >> remote_required;' services/comm.cpp \
+    'GetCS reads the remote-required policy exactly once'
+require_count 1 'remote_required <= 1' services/comm.cpp \
+    'GetCS rejects a non-boolean remote-required policy'
+require_count 1 'holding remote-required request for scheduler' daemon/main.cpp \
+    'C holds a remote-required request instead of synthesizing localhost'
+require_count 1 'No suitable remote host found for remote-required job' \
+    scheduler/scheduler.cpp \
+    'S queues a remote-required request until a remote worker is eligible'
+require_count 1 'job->remoteRequired() && cs == job->submitter()' \
+    scheduler/scheduler.cpp \
+    'ordinary S selection excludes the submitter for remote-required work'
+require_count 3 'remote-only policy refuses' client/main.cpp \
+    'wrapper fallback exits are independently fail-closed for remote-only work'
+require_count 1 'remote-required run has no local daemon transport' \
+    client/main.cpp \
+    'wrapper refuses remote-required work before a daemon transport exists'
+require_count 1 'remote-required run refuses scheduler-selected localhost' \
+    client/remote.cpp \
+    'wrapper refuses the scheduler-local fast path for remote-required work'
+require_count 1 'remote-required assignment needs protocol 50' \
+    client/remote.cpp \
+    'wrapper refuses policy loss through an older daemon protocol'
+require_count 1 'if (g->remote_required == 1) {' daemon/main.cpp \
+    'C preserves the remote-required hold after a failed login attempt'
+require_count 1 'job->setRemoteRequired(m.remote_required == 1);' \
+    scheduler/scheduler.cpp \
+    'S retains the decoded policy on the admitted job'
 require_count 1 'job->setCacheRequest(m.cache_protocol, m.cache_profile_mask,' \
     scheduler/scheduler.cpp 'decoded C capabilities are retained on every admitted job'
 require_count 1 'cs->remotePort() == job->cacheAffinityPort() &&' \

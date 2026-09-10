@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import http.server
 import inspect
@@ -642,6 +643,70 @@ def test_active_scheduler_loss_scenario_is_not_the_drained_restart(tmp_path: Pat
     assert all("ICECC_WEB_HOSTPORT" not in item.get("env", {}) for item in scenario.data["instances"])
 
 
+def test_active_scheduler_loss_releases_serial_admission_after_rejoin(
+    tmp_path: Path,
+) -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    farm.data["hub"]["results_root"] = str(tmp_path)
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / "S70-b4-scheduler-active-loss.json", farm
+    )
+    plan = farmtest.build_plan(farm, scenario, run_id="active-loss-release-unit")
+    producer = EventProducer(
+        farm,
+        scenario,
+        plan,
+        recorder=RecordingTransport(EventRecorder()),
+    )
+    producer._active_turn = "A"
+    scheduler = next(
+        item for item in plan["topology"]["instances"] if item["role"] == "S"
+    )
+    producer._container = lambda _name: ("container", scheduler)
+    producer._inspect = lambda _name: {"id": "a" * 64}
+    producer._authenticated_scheduler_active_loss = (
+        lambda _event, _instance, _identifier: {
+            "schema": "icefarm-scheduler-active-loss-v5"
+        }
+    )
+
+    def gate_controls(clients, *, action, turn, epoch, timeout_s, receipts):
+        del timeout_s
+        assert [client["name"] for client in clients] == ["C1"]
+        assert (action, turn, epoch) == ("resume", "A", 1)
+        receipts["C1"] = {
+            "action": "resume",
+            "active_after": 1,
+            "active_before": 1,
+            "client": "C1",
+            "epoch": 1,
+            "finished_ms": 101,
+            "schema": "icefarm-event-gate-v1",
+            "started_ms": 100,
+            "status": "OPEN",
+            "turn": "A",
+        }
+
+    producer._gate_controls = gate_controls
+    receipt = producer._dispatch(producer.events[0])
+    assert receipt["admission_release"] == {
+        "clients": {"C1": {
+            "action": "resume",
+            "active_after": 1,
+            "active_before": 1,
+            "client": "C1",
+            "epoch": 1,
+            "finished_ms": 101,
+            "schema": "icefarm-event-gate-v1",
+            "started_ms": 100,
+            "status": "OPEN",
+            "turn": "A",
+        }},
+        "schema": "icefarm-active-loss-admission-v1",
+        "serial_through": 2,
+    }
+
+
 def test_active_scheduler_loss_refreshes_selection_ceiling_after_assignment(
     tmp_path: Path,
 ) -> None:
@@ -976,6 +1041,59 @@ def test_active_scheduler_loss_v3_collector_recomputes_bound_evidence(
             preflight=preflight,
             evidence=tmp_path,
         )
+
+    current_v5 = json.loads(json.dumps(current))
+    current_v5["schema"] = "icefarm-scheduler-active-loss-v5"
+    current_v5["admission_release"] = {
+        "clients": {
+            "C1": {
+                "action": "resume",
+                "active_after": 1,
+                "active_before": 1,
+                "client": "C1",
+                "epoch": 1,
+                "finished_ms": 101,
+                "schema": "icefarm-event-gate-v1",
+                "started_ms": 100,
+                "status": "OPEN",
+                "turn": "A",
+            }
+        },
+        "schema": "icefarm-active-loss-admission-v1",
+        "serial_through": 2,
+    }
+    current_event["trigger"] = "job 2"
+    _validate_scheduler_active_loss_receipt(
+        current_v5,
+        current_event,
+        scenario,
+        0,
+        farm=farm,
+        plan=plan,
+        preflight=preflight,
+        evidence=tmp_path,
+    )
+    for path, value in (
+        (("serial_through",), 3),
+        (("clients", "C1", "active_before"), 0),
+        (("clients", "C1", "active_after"), 0),
+    ):
+        tampered_v5 = json.loads(json.dumps(current_v5))
+        cursor = tampered_v5["admission_release"]
+        for key in path[:-1]:
+            cursor = cursor[key]
+        cursor[path[-1]] = value
+        with pytest.raises(CollectError, match="serialized admission release"):
+            _validate_scheduler_active_loss_receipt(
+                tampered_v5,
+                current_event,
+                scenario,
+                0,
+                farm=farm,
+                plan=plan,
+                preflight=preflight,
+                evidence=tmp_path,
+            )
 
     replay_v2 = json.loads(json.dumps(receipt))
     replay_v2["schema"] = "icefarm-scheduler-active-loss-v2"
@@ -1583,6 +1701,61 @@ def test_event_gate_pause_drains_then_resume_is_atomic(tmp_path: Path) -> None:
     )
     assert json.loads(aborted.stdout)["status"] == "ABORT"
     assert (gate / "state.tsv").read_text() == "ABORT\t2\n"
+
+
+def test_event_gate_resume_snapshots_boundary_marker_before_wrapper_release(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workload" / "A"
+    gate = root / "event-gate"
+    active = gate / "active"
+    active.mkdir(parents=True)
+    state = gate / "state.tsv"
+    lock_path = gate / "state.lock"
+    state.write_text("OPEN\t0\n", encoding="ascii")
+    lock_path.touch()
+    marker = active / "job-2-99.tsv"
+    marker.write_text("2\t99\t0\t1\n", encoding="ascii")
+
+    def boundary_wrapper() -> None:
+        deadline = time.monotonic() + 2
+        with lock_path.open("r+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            while time.monotonic() < deadline:
+                if state.read_text(encoding="ascii") == "OPEN\t1\n":
+                    marker.unlink()
+                    return
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                time.sleep(0.005)
+                fcntl.flock(lock, fcntl.LOCK_EX)
+        raise AssertionError("event gate did not release epoch 1")
+
+    wrapper = threading.Thread(target=boundary_wrapper)
+    wrapper.start()
+    resumed = subprocess.run(
+        (
+            sys.executable,
+            "-c",
+            GATE_CONTROL_SCRIPT,
+            "resume",
+            str(root),
+            "C1",
+            "A",
+            "1",
+            "2",
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+    wrapper.join(timeout=1)
+    assert not wrapper.is_alive()
+    receipt = json.loads(resumed.stdout)
+    assert receipt["active_before"] == 1
+    assert receipt["active_after"] == 1
+    assert not marker.exists()
+    assert state.read_text(encoding="ascii") == "OPEN\t1\n"
 
 
 def test_event_gate_treats_marker_vanishing_after_enumeration_as_drained(

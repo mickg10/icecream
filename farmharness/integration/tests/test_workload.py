@@ -12,7 +12,7 @@ from farmharness.integration.tests import farm_fixture
 
 from farmharness.integration import farmtest, workload as workload_module
 from farmharness.integration.farm_spec import load_farm_spec
-from farmharness.integration.images import RecordingTransport
+from farmharness.integration.images import CommandFactory, RecordingTransport
 from farmharness.integration.remote import (
     CommandResult,
     PlannedCommand,
@@ -23,6 +23,8 @@ from farmharness.integration.workload import (
     MANIFEST_DRIVER,
     WORKLOAD_SCHEMA,
     WorkloadError,
+    _active_loss_serial_through,
+    _driver_command,
     _parse_summary,
     _strict_p50_required,
     run_workload,
@@ -131,6 +133,14 @@ def test_manifest_driver_is_one_fixed_program_with_all_spec_values_in_argv(
     assert 'resume_mode' in MANIFEST_DRIVER
     assert 'event gate aborted at epoch $gate_epoch' in MANIFEST_DRIVER
     assert 'rm -f -- "$marker"' in MANIFEST_DRIVER
+    assert "event_serial_through=${ICEFARM_EVENT_SERIAL_THROUGH:-0}" in MANIFEST_DRIVER
+    assert 'predecessor_ready=0' in MANIFEST_DRIVER
+    assert 'active_count=$(find "$gate_active"' in MANIFEST_DRIVER
+    assert 'serial_boundary_released=0' in MANIFEST_DRIVER
+    assert 'event release wait expired for serial boundary job' in MANIFEST_DRIVER
+    assert MANIFEST_DRIVER.index('serial_boundary_released=0') < MANIFEST_DRIVER.index(
+        '>"$job_dir/result.tsv"'
+    )
     assert 'xargs -0 -r -n 3 -P "$jobs"' in MANIFEST_DRIVER
     assert 'object="$oracle_root/.build-$key-$BASHPID.o"' in MANIFEST_DRIVER
     assert MANIFEST_DRIVER.index("xargs -0 -r -n 3") < MANIFEST_DRIVER.index(
@@ -201,6 +211,38 @@ def test_strict_p50_requires_the_s70_b6_off_transition() -> None:
     scenario.data["timeline"][0]["env"]["ICECC_P50_PROFILE"] = "P29V1"
 
     assert _strict_p50_required(scenario, plan) is True
+
+
+def test_active_loss_serializes_exact_trigger_prefix_and_requires_remote(
+    tmp_path: Path,
+) -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    farm.data["hub"]["results_root"] = str(tmp_path)
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / "S70-b4-scheduler-active-loss.json", farm
+    )
+    plan = farmtest.build_plan(farm, scenario, run_id="active-loss-workload-unit")
+    assert _active_loss_serial_through(scenario) == 2
+
+    client = next(
+        item for item in plan["topology"]["instances"] if item["role"] == "C"
+    )
+    command = _driver_command(
+        farm,
+        scenario,
+        plan,
+        client,
+        "A",
+        CommandFactory(),
+    )
+    argv = command.argv
+    assert "ICEFARM_EVENT_SERIAL_THROUGH=2" in argv
+    assert "ICECC_REMOTE_REQUIRED=1" in argv
+
+    ordinary = load_scenario_spec(
+        INTEGRATION / "scenarios" / "S00-smoke.json", farm
+    )
+    assert _active_loss_serial_through(ordinary) == 0
 
 
 def test_manifest_driver_shell_is_syntactically_valid() -> None:

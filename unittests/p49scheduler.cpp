@@ -291,6 +291,25 @@ static bool no_type(MsgChannel *channel, Msg::Value unwanted, int timeout_msec)
     return true;
 }
 
+static bool no_assignment_reply(MsgChannel *channel, int timeout_msec)
+{
+    const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_msec);
+    while (channel && Clock::now() < deadline) {
+        const int left = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - Clock::now()).count());
+        if (left <= 0) break;
+        Msg *msg = next_message(channel, left > 50 ? 50 : left);
+        if (msg) {
+            const bool assignment = *msg == Msg::USE_CS || *msg == Msg::NO_CS;
+            delete msg;
+            if (assignment) return false;
+        }
+        if (channel->at_eof()) break;
+    }
+    return true;
+}
+
 static bool wait_eof(MsgChannel *channel, int timeout_msec)
 {
     const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_msec);
@@ -459,6 +478,19 @@ static bool request_job(MsgChannel *submitter, uint32_t client_id,
     return submitter->send_msg(request);
 }
 
+static bool request_remote_required_job(MsgChannel *submitter,
+                                        uint32_t client_id)
+{
+    GetCSMsg request(
+        Environments { std::make_pair(std::string("x86_64"),
+                                      std::string("p49-test-env")) },
+        "remote-required.cpp", CompileJob::Lang_CXX, 1, "x86_64", 0,
+        std::string(), 50, 0, 0);
+    request.client_id = client_id;
+    request.remote_required = 1;
+    return submitter->send_msg(request);
+}
+
 static bool request_cache_job(MsgChannel *submitter, uint32_t client_id,
                               const std::string &affinity_host = std::string(),
                               uint32_t affinity_port = 0,
@@ -551,6 +583,51 @@ static bool wait_file_contains(const std::string &path,
         usleep(20 * 1000);
     }
     return file_contains(path, needle);
+}
+
+static JobDoneMsg job_done_for(const UseCSMsg &use, int exitcode,
+                               unsigned int flags);
+
+static void run_remote_required_waits_for_worker(
+    const std::string &binary, const std::string &directory)
+{
+    const int port = reserve_port_pair();
+    const std::string log = directory + "/remote-required.log";
+    pid_t scheduler = start_scheduler(binary, port, nullptr, log);
+    REQUIRE(port != 0 && scheduler > 0,
+            "remote-required scheduler process launched");
+
+    ConfCSMsg *submitter_conf = nullptr;
+    MsgChannel *submitter = login_host(
+        port, "remote-required-submit", false, 0, &submitter_conf);
+    delete submitter_conf;
+    REQUIRE(submitter && request_remote_required_job(submitter, 9971),
+            "remote-required assignment requested without a worker");
+    REQUIRE(no_assignment_reply(submitter, 500),
+            "remote-required job remains queued instead of selecting submitter");
+
+    int worker_port = 0;
+    int worker_listener = bind_port(0, &worker_port);
+    if (worker_listener >= 0) listen(worker_listener, 16);
+    ConfCSMsg *worker_conf = nullptr;
+    MsgChannel *worker = login_host(
+        port, "remote-required-worker", true, worker_port, &worker_conf);
+    delete worker_conf;
+    UseCSMsg *use = dynamic_cast<UseCSMsg *>(
+        wait_type(submitter, Msg::USE_CS, 3000));
+    REQUIRE(worker && use,
+            "queued remote-required job selects the newly available worker");
+    if (worker && use) {
+        worker->send_msg(JobBeginMsg(use->job_id, 0));
+        worker->send_msg(job_done_for(*use, 0, JobDoneMsg::FROM_SERVER));
+    }
+
+    delete use;
+    delete submitter;
+    delete worker;
+    if (worker_listener >= 0) close(worker_listener);
+    REQUIRE(stop_scheduler(scheduler),
+            "remote-required scheduler stopped cleanly");
 }
 
 static std::string control_text(int port, const char *command)
@@ -2955,6 +3032,13 @@ int main(int argc, char **argv)
                      failures ? "FAIL" : "PASS", failures);
         return failures ? 1 : 0;
     }
+    if (std::getenv("ICECC_TEST_REMOTE_REQUIRED_ONLY") != nullptr) {
+        run_remote_required_waits_for_worker(argv[1], directory);
+        std::fprintf(stderr, "%s: %d failure(s)\n",
+                     failures ? "FAIL" : "PASS", failures);
+        return failures ? 1 : 0;
+    }
+    run_remote_required_waits_for_worker(argv[1], directory);
     run_precompile_worker_terminal(argv[1], directory);
     run_post_begin_submitter_withdrawal(argv[1], directory);
     run_enforcing(argv[1], directory);

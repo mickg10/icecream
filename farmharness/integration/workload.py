@@ -101,6 +101,10 @@ test "$jobs" -ge 1
 test "$per_job_timeout" -ge 1
 test "$layout" = single -o "$layout" = paired
 test "$strict_p50" = 0 -o "$strict_p50" = 1
+event_serial_through=${ICEFARM_EVENT_SERIAL_THROUGH:-0}
+case "$event_serial_through" in
+    ''|*[!0-9]*) echo "invalid event serial boundary" >&2; exit 65 ;;
+esac
 test "$compiler_arg_count" -ge 1
 test -x "$compiler"
 test "$(sha256sum "$compiler" | awk '{print $1}')" = "$expected_compiler_digest"
@@ -534,12 +538,44 @@ compile_one() {
         IFS=$'\t' read -r gate_mode gate_epoch <"$gate_state"
         case "$gate_mode" in
             OPEN)
-                temporary_marker="$gate_active/.job-$index-$BASHPID.tmp"
-                printf '%s\t%s\t%s\t%s\n' \
-                    "$index" "$BASHPID" "$gate_epoch" "$(date +%s%3N)" \
-                    >"$temporary_marker"
-                mv -- "$temporary_marker" "$marker"
-                admitted=1
+                admit_now=0
+                if test "$event_serial_through" -eq 0 \
+                    -o "$gate_epoch" -ge 1
+                then
+                    admit_now=1
+                elif test "$index" -le "$event_serial_through"
+                then
+                    # Before active scheduler loss, admit the exact prefix in
+                    # numeric order and with at most one live compiler.  The
+                    # event's Nth dispatch therefore has exactly one exposed
+                    # workload request; later jobs remain behind epoch zero.
+                    predecessor_ready=0
+                    if test "$index" -eq 1
+                    then
+                        predecessor_ready=1
+                    else
+                        predecessor=$(printf '%s/jobs/%06d/result.tsv' \
+                            "$result_root" "$((index - 1))")
+                        test -f "$predecessor" -a ! -L "$predecessor" \
+                            && predecessor_ready=1 || :
+                    fi
+                    active_count=$(find "$gate_active" -mindepth 1 -maxdepth 1 \
+                        -name 'job-*.tsv' -type f | wc -l)
+                    if test "$predecessor_ready" -eq 1 \
+                        -a "$active_count" -eq 0
+                    then
+                        admit_now=1
+                    fi
+                fi
+                if test "$admit_now" -eq 1
+                then
+                    temporary_marker="$gate_active/.job-$index-$BASHPID.tmp"
+                    printf '%s\t%s\t%s\t%s\n' \
+                        "$index" "$BASHPID" "$gate_epoch" "$(date +%s%3N)" \
+                        >"$temporary_marker"
+                    mv -- "$temporary_marker" "$marker"
+                    admitted=1
+                fi
                 ;;
             PAUSE) ;;
             QUIESCE)
@@ -642,6 +678,55 @@ compile_one() {
         remote=0
     fi
     retries=$((assignment_count > 0 ? assignment_count - 1 : 0))
+    if test "$event_serial_through" -gt 0 \
+        -a "$index" -eq "$event_serial_through"
+    then
+        # Keep the sole exposed boundary marker alive until the event owner
+        # has authenticated full S/F/C rejoin and atomically opened epoch 1.
+        # The remote compile may already have completed by then; retaining the
+        # wrapper marker prevents a fast retry from racing the v5 1->1 release
+        # receipt.  ABORT remains a bounded fail-safe for every error path.
+        serial_boundary_released=0
+        serial_release_deadline=$((SECONDS + per_job_timeout))
+        while test "$serial_boundary_released" -eq 0
+        do
+            exec 8>"$gate_lock"
+            flock -x 8
+            IFS=$'\t' read -r gate_mode gate_epoch <"$gate_state"
+            case "$gate_mode" in
+                OPEN)
+                    if test "$gate_epoch" -ge 1
+                    then
+                        serial_boundary_released=1
+                    fi
+                    ;;
+                PAUSE) ;;
+                QUIESCE|ABORT)
+                    echo "event gate $gate_mode at epoch $gate_epoch for serial boundary job $index" >&2
+                    flock -u 8
+                    exec 8>&-
+                    return 75
+                    ;;
+                *)
+                    echo "invalid event gate state: $gate_mode $gate_epoch" >&2
+                    flock -u 8
+                    exec 8>&-
+                    return 75
+                    ;;
+            esac
+            flock -u 8
+            exec 8>&-
+            if test "$serial_boundary_released" -eq 0
+            then
+                if test "$SECONDS" -ge "$serial_release_deadline"
+                then
+                    echo "event release wait expired for serial boundary job $index" >&2
+                    return 75
+                fi
+                sleep 0.05
+            fi
+        done
+    fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$index" "$turn" "$occurrence" "$relative" "$scheduler_job" "$worker" \
         "$started" "$finished" "$compile_rc" "$remote_sha" "$local_sha" "$exact" "$remote" \
@@ -655,7 +740,7 @@ compile_one() {
 export -f compile_one
 export result_root corpus_root oracle_root environment per_job_timeout strict_p50 compiler compiler_arg_count
 export client_name fault_kind fault_client fault_job
-export gate_state gate_lock gate_active
+export gate_state gate_lock gate_active event_serial_through
 export resume_mode resume_indices
 
 set +e
@@ -820,6 +905,26 @@ def _strict_p50_required(scenario: ScenarioSpec, plan: dict[str, Any]) -> bool:
     return True
 
 
+def _active_loss_serial_through(scenario: ScenarioSpec) -> int:
+    """Return the ordered job prefix serialized before active scheduler loss."""
+
+    if scenario.data.get("id") != "S70-b4-scheduler-active-loss":
+        return 0
+    events = [
+        event
+        for event in scenario.data.get("timeline", [])
+        if isinstance(event, dict)
+        and event.get("action") == "scheduler-loss-active"
+    ]
+    if len(events) != 1:
+        raise WorkloadError("active scheduler loss needs one serial admission event")
+    trigger = events[0].get("trigger")
+    match = re.fullmatch(r"job ([1-9][0-9]*)", trigger or "")
+    if match is None:
+        raise WorkloadError("active scheduler loss needs a positive serial job boundary")
+    return int(match.group(1))
+
+
 def _driver_command(
     farm: FarmSpec,
     scenario: ScenarioSpec,
@@ -836,6 +941,7 @@ def _driver_command(
     layout = "single" if "manifest" in corpus else "paired"
     corpus_repeat = corpus.get("repeat", 1)
     strict_p50 = int(_strict_p50_required(scenario, plan))
+    active_loss_serial_through = _active_loss_serial_through(scenario)
     container = f"icefarm-{plan['run_id']}-{client['name']}"
     fault = scenario.data.get("fault", {})
     timeout_s = scenario.data["timeouts"]["turn_s"] + 300
@@ -846,6 +952,16 @@ def _driver_command(
             "exec",
             "--user",
             "65534:65534",
+            *(
+                (
+                    "--env",
+                    f"ICEFARM_EVENT_SERIAL_THROUGH={active_loss_serial_through}",
+                    "--env",
+                    "ICECC_REMOTE_REQUIRED=1",
+                )
+                if active_loss_serial_through
+                else ()
+            ),
             container,
             "/bin/bash",
             "-c",

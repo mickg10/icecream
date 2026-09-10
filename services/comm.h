@@ -1690,6 +1690,7 @@ public:
         , cache_affinity_profile_mask(0)
         , cache_affinity_port(0)
         , cache_retry_avoid_port(0)
+        , remote_required(0)
         , cache_request_tail_valid(true)
         {}
 
@@ -1726,6 +1727,7 @@ public:
     std::string cache_affinity_host; // exact F address; empty iff no hint
     uint32_t cache_retry_avoid_port; // failed ordinary F port; zero iff absent
     std::string cache_retry_avoid_host; // failed exact F address; empty iff absent
+    uint32_t remote_required; // one iff submitter-local selection is forbidden
 
 private:
     bool cache_request_tail_valid;

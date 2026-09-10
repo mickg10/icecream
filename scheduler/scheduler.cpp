@@ -1839,6 +1839,7 @@ static AdmitResult admit_request_jobs(CompileServer *submitter, PendingExpansion
                              m.cache_affinity_host,
                              m.cache_retry_avoid_port,
                              m.cache_retry_avoid_host);
+        job->setRemoteRequired(m.remote_required == 1);
         req.staged.push_back(job);
         std::ostream &dbg = log_info();
         dbg << "NEW " << job->id() << " client="
@@ -2042,6 +2043,9 @@ static list<CompileServer *> filter_ineligible_servers(Job *job)
         css.end(),
         std::back_inserter(eligible),
         [=](CompileServer* cs) {
+            if (job->remoteRequired() && cs == job->submitter()) {
+                return false;
+            }
             if (job->preExposureRedispatch() && cs == job->submitter()) {
                 return false;
             }
@@ -2484,7 +2488,8 @@ static CompileServer *pick_server(Job *job,
     if (!job->preferredHost().empty() && !retry_alternative_exists) {
         for (CompileServer* const cs : css) {
             const bool redispatch_local =
-                job->preExposureRedispatch() && cs == job->submitter();
+                (job->preExposureRedispatch() || job->remoteRequired()) &&
+                cs == job->submitter();
             const bool prepare_backlogged = cs != job->submitter()
                 && assignment_mode_prepares()
                 && IS_PROTOCOL_VERSION(PROTOCOL_VERSION_ASSIGNMENT_FENCE, cs)
@@ -2826,7 +2831,8 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
 
         /* Ignore the load on the submitter itself if no other host could
            be found.  We only obey to its max job number.  */
-        if (!cache_retry_wait && !job->preExposureRedispatch()) {
+        if (!cache_retry_wait && !job->preExposureRedispatch() &&
+            !job->remoteRequired()) {
             use_cs = job->submitter();
             if ((use_cs->currentJobCount() < use_cs->maxJobs())
                     && job->preferredHost().empty()
@@ -2859,6 +2865,11 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
                         << "redispatch, delaying job " << job->id() << endl;
                 return false;
             }
+            if (job->remoteRequired()) {
+                trace() << "No suitable remote host found for remote-required job "
+                        << job->id() << ", delaying" << endl;
+                return false;
+            }
             for (CompileServer * const cs : css) {
                 if(!job->preferredHost().empty() && !cs->matches(job->preferredHost()))
                     continue;
@@ -2880,6 +2891,9 @@ static bool empty_queue(SchedulerAlgorithmName schedulerAlgorithm)
     if (job->preExposureRedispatch()) {
         assert(use_cs != job->submitter());
         job->setPreExposureRedispatch(false);
+    }
+    if (job->remoteRequired()) {
+        assert(use_cs != job->submitter());
     }
     job->setState(Job::WAITINGFORCS);
     job->setServer(use_cs);

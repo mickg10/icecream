@@ -601,6 +601,11 @@ int main(int argc, char **argv)
 
     if (!local_daemon) {
         log_warning() << "no local daemon found" << endl;
+        if (getenv("ICECC_REMOTE_REQUIRED") != nullptr) {
+            log_error() << "remote-required run has no local daemon transport"
+                        << endl;
+            return EXIT_DISTCC_FAILED;
+        }
         return build_local(job, nullptr);
     }
 
@@ -805,8 +810,9 @@ int main(int argc, char **argv)
                 log_error() << "local build forced by remote exception: " << error.what() << endl;
             else
                 log_warning() << "local build forced by remote exception: " << error.what() << endl;
-            if (getenv("ICECC_P50_C1F1_REQUIRED") != nullptr) {
-                log_error() << "strict all-P50 run refuses local retry" << endl;
+            if (getenv("ICECC_P50_C1F1_REQUIRED") != nullptr ||
+                getenv("ICECC_REMOTE_REQUIRED") != nullptr) {
+                log_error() << "remote-only policy refuses local retry" << endl;
                 delete local_daemon;
                 return EXIT_DISTCC_FAILED;
             }
@@ -822,8 +828,9 @@ int main(int argc, char **argv)
                             endl;
             }
 
-            if (getenv("ICECC_P50_C1F1_REQUIRED") != nullptr) {
-                log_error() << "strict all-P50 run refuses client-error fallback" << endl;
+            if (getenv("ICECC_P50_C1F1_REQUIRED") != nullptr ||
+                getenv("ICECC_REMOTE_REQUIRED") != nullptr) {
+                log_error() << "remote-only policy refuses client-error fallback" << endl;
                 delete local_daemon;
                 return EXIT_DISTCC_FAILED;
             }
@@ -852,8 +859,9 @@ int main(int argc, char **argv)
     }
 
     if (local) {
-        if (getenv("ICECC_P50_C1F1_REQUIRED") != nullptr) {
-            log_error() << "strict all-P50 run refuses a local-only selection" << endl;
+        if (getenv("ICECC_P50_C1F1_REQUIRED") != nullptr ||
+            getenv("ICECC_REMOTE_REQUIRED") != nullptr) {
+            log_error() << "remote-only policy refuses a local-only selection" << endl;
             delete local_daemon;
             return EXIT_DISTCC_FAILED;
         }

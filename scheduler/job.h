@@ -246,6 +246,8 @@ public:
     uint32_t cacheRetryAvoidPort() const { return m_cacheRetryAvoidPort; }
     const std::string &cacheRetryAvoidHost() const
     { return m_cacheRetryAvoidHost; }
+    void setRemoteRequired(bool value) { m_remoteRequired = value; }
+    bool remoteRequired() const { return m_remoteRequired; }
 
 private:
     const unsigned int m_id;
@@ -303,6 +305,7 @@ private:
     std::string m_cacheAffinityHost;
     uint32_t m_cacheRetryAvoidPort = 0;
     std::string m_cacheRetryAvoidHost;
+    bool m_remoteRequired = false;
 };
 
 #endif

@@ -7705,6 +7705,12 @@ void Daemon::handle_old_request()
         }
         for (Client *c : stranded) {
             GetCSMsg *g = c->deferred_getcs;
+            if (g->remote_required == 1) {
+                /* An explicit remote-only request remains private while no
+                   scheduler session is active.  reconnect() keeps advancing;
+                   the ACTIVE branch above revalidates and publishes it. */
+                continue;
+            }
             if (g->count <= 1) {
                 /* S2: schedulerless local fallback, no worker snapshot --
                    canonical cache-absent (see scheduler_no_cs).
@@ -8954,6 +8960,13 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
     }
 
     if (!scheduler) {
+        if (umsg->remote_required == 1) {
+            client->deferred_getcs = new GetCSMsg(*umsg);
+            client->set_status(
+                Client::WAITFORCS,
+                "handle_get_cs: holding remote-required request for scheduler");
+            return true;
+        }
         /* No scheduler -> resolve locally, preserving reply cardinality
            (G4 20:13:59): count<=1 gets the one synthetic local UseCS; count>1
            (which one local UseCS cannot satisfy) closes only this client so its

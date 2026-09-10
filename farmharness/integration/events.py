@@ -176,7 +176,8 @@ print(json.dumps({
 '''.strip()
 GATE_SCHEMA = "icefarm-event-gate-v1"
 SCHEDULER_RESTART_SCHEMA = "icefarm-scheduler-restart-v1"
-SCHEDULER_ACTIVE_LOSS_SCHEMA = "icefarm-scheduler-active-loss-v4"
+SCHEDULER_ACTIVE_LOSS_SCHEMA = "icefarm-scheduler-active-loss-v5"
+SCHEDULER_ACTIVE_LOSS_ADMISSION_SCHEMA = "icefarm-active-loss-admission-v1"
 LISTENER_BINDING_EVIDENCE = "container-env+netns-listener-uid+http-child"
 CLIENT_ROUTE_RESTART_SCHEMA = "icefarm-client-route-restart-v1"
 WORKER_RESTART_SCHEMA = "icefarm-worker-restart-v1"
@@ -703,6 +704,10 @@ with lock_path.open("r+") as lock:
             raise SystemExit(
                 f"event-gate {action} expected PAUSE/{epoch}, got {before_mode}/{before_epoch}"
             )
+        # Snapshot after the state transition but before releasing the lock.
+        # A serialized boundary wrapper also takes this lock before observing
+        # epoch 1, so its marker cannot disappear before this exact receipt.
+        release_snapshot = markers()
 deadline = time.monotonic() + timeout_s
 if action in {"pause", "quiesce"}:
     current = initial
@@ -715,7 +720,7 @@ if action in {"pause", "quiesce"}:
         current = markers()
     status = "PAUSED" if action == "pause" else "QUIESCED"
 else:
-    current = markers()
+    current = release_snapshot
     status = target_mode
 finished_ms = time.time_ns() // 1_000_000
 print(json.dumps({
@@ -4754,7 +4759,58 @@ class EventProducer:
         if event.action == "scheduler-loss-active":
             if instance["role"] != "S":
                 raise UnsupportedEvent("scheduler-loss-active is only safe for an S instance")
-            return self._authenticated_scheduler_active_loss(event, instance, identifier)
+            with self._lock:
+                turn = self._active_turn
+                epoch = len(self._records) + 1
+            if turn is None or event.trigger.kind != "job":
+                raise EventError(
+                    "active scheduler loss has no live job-triggered admission boundary"
+                )
+            clients = sorted(
+                (
+                    item
+                    for item in self.plan["topology"]["instances"]
+                    if item["role"] == "C"
+                    and item["name"]
+                    in set(self.scenario.data["workload"]["clients"])
+                ),
+                key=lambda item: item["name"],
+            )
+            release: dict[str, dict[str, Any]] = {}
+            try:
+                receipt = self._authenticated_scheduler_active_loss(
+                    event, instance, identifier
+                )
+                self._gate_controls(
+                    clients,
+                    action="resume",
+                    turn=turn,
+                    epoch=epoch,
+                    timeout_s=self._command_timeout(),
+                    receipts=release,
+                )
+            except BaseException as primary:
+                abort: dict[str, dict[str, Any]] = {}
+                try:
+                    self._gate_controls(
+                        clients,
+                        action="abort",
+                        turn=turn,
+                        epoch=epoch,
+                        timeout_s=self._command_timeout(),
+                        receipts=abort,
+                    )
+                except BaseException as abort_exc:
+                    raise EventError(
+                        f"{primary}; active-loss admission abort failed: {abort_exc}"
+                    ) from abort_exc
+                raise
+            receipt["admission_release"] = {
+                "clients": release,
+                "serial_through": int(event.trigger.value),
+                "schema": SCHEDULER_ACTIVE_LOSS_ADMISSION_SCHEMA,
+            }
+            return receipt
         if event.action == "kill -9":
             operation = ("container", "kill", "--signal", "KILL", identifier)
         elif event.action == "disk_fill":

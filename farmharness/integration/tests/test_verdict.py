@@ -660,6 +660,68 @@ def test_active_loss_v4_binds_active_job_below_dispatch_ceiling() -> None:
     )
 
 
+def test_active_loss_v5_binds_serial_admission_release() -> None:
+    receipt, event, scenario, plan, farm, images = _active_loss_v3_fixture()
+    receipt["schema"] = "icefarm-scheduler-active-loss-v5"
+    receipt["selection_last_dispatched_job"] = 5
+    receipt["compiler"]["assignment"]["schema"] = (
+        "icefarm-compiler-assignment-v2"
+    )
+    receipt["admission_release"] = {
+        "clients": {
+            "C1": {
+                "action": "resume",
+                "active_after": 1,
+                "active_before": 1,
+                "client": "C1",
+                "epoch": 1,
+                "finished_ms": 101,
+                "schema": "icefarm-event-gate-v1",
+                "started_ms": 100,
+                "status": "OPEN",
+                "turn": "A",
+            }
+        },
+        "schema": "icefarm-active-loss-admission-v1",
+        "serial_through": 2,
+    }
+    event["last_dispatched_job"] = 5
+    event["trigger"] = "job 2"
+    kwargs = {
+        "readiness_v2": True,
+        "plan": plan,
+        "farm": farm,
+        "images": images,
+    }
+    assert not _scheduler_active_loss_receipt_errors(
+        receipt, event, scenario, **kwargs
+    )
+
+    mutations = (
+        (("admission_release", "serial_through"), 3),
+        (("admission_release", "schema"), "wrong"),
+        (("admission_release", "clients", "C1", "active_before"), 0),
+        (("admission_release", "clients", "C1", "active_after"), 0),
+        (("admission_release", "clients", "C1", "epoch"), 2),
+        (("admission_release", "clients", "C1", "status"), "ABORT"),
+    )
+    for path, value in mutations:
+        tampered = copy.deepcopy(receipt)
+        cursor = tampered
+        for key in path[:-1]:
+            cursor = cursor[key]
+        cursor[path[-1]] = value
+        assert _scheduler_active_loss_receipt_errors(
+            tampered, event, scenario, **kwargs
+        ), path
+
+    missing = copy.deepcopy(receipt)
+    del missing["admission_release"]
+    assert _scheduler_active_loss_receipt_errors(
+        missing, event, scenario, **kwargs
+    )
+
+
 def _client_transition_event() -> tuple[dict[str, object], dict[str, object]]:
     scenario = _scenario("S'CF", client_versions=(50,), worker_versions=(43,))
     scenario["timeline"] = [

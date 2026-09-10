@@ -369,14 +369,15 @@ static void test_getcs_cache_request_wire_and_laws()
                 && decoded->cache_affinity_port == 0
                 && decoded->cache_affinity_host.empty()
                 && decoded->cache_retry_avoid_port == 0
-                && decoded->cache_retry_avoid_host.empty(),
+                && decoded->cache_retry_avoid_host.empty()
+                && decoded->remote_required == 0,
             "P49 GetCS decoder receives canonical client capability absence");
     delete wire;
 
     const Bytes p50_absent = encode_getcs_frame(50, absent);
     REQUIRE(p50_absent.size() == p49_absent_object.size()
-                + 7 * sizeof(uint32_t) + 2,
-            "P50 GetCS appends five words and two bounded empty strings");
+                + 8 * sizeof(uint32_t) + 2,
+            "P50 GetCS appends its six fields and two bounded empty strings");
 
     Pair pair = make_pair(50);
     REQUIRE(pair.left->send_msg(request),
@@ -389,7 +390,8 @@ static void test_getcs_cache_request_wire_and_laws()
                 && decoded->cache_affinity_port == UINT32_C(10245)
                 && decoded->cache_affinity_host == "warm-cache-worker"
                 && decoded->cache_retry_avoid_port == 0
-                && decoded->cache_retry_avoid_host.empty(),
+                && decoded->cache_retry_avoid_host.empty()
+                && decoded->remote_required == 0,
             "P50 GetCS round-trips the exact capability and warm hint");
     delete wire;
 
@@ -410,7 +412,8 @@ static void test_getcs_cache_request_wire_and_laws()
                 && decoded->cache_affinity_port == 0
                 && decoded->cache_affinity_host.empty()
                 && decoded->cache_retry_avoid_port == UINT32_C(10246)
-                && decoded->cache_retry_avoid_host == "failed-cache-worker",
+                && decoded->cache_retry_avoid_host == "failed-cache-worker"
+                && decoded->remote_required == 0,
             "P50 GetCS round-trips retry exclusion independently of warm affinity");
     delete wire;
 
@@ -425,9 +428,26 @@ static void test_getcs_cache_request_wire_and_laws()
                 && decoded->cache_affinity_port == 0
                 && decoded->cache_affinity_host.empty()
                 && decoded->cache_retry_avoid_port == 0
-                && decoded->cache_retry_avoid_host.empty(),
+                && decoded->cache_retry_avoid_host.empty()
+                && decoded->remote_required == 0,
             "P50 absent client capability remains wholly canonical");
     delete wire;
+
+    GetCSMsg remote_required = absent;
+    remote_required.remote_required = 1;
+    Pair remote_required_pair = make_pair(50);
+    REQUIRE(remote_required_pair.left->send_msg(remote_required),
+            "P50 GetCS carries the explicit remote-required bit");
+    wire = remote_required_pair.right->get_msg(2, true);
+    decoded = dynamic_cast<GetCSMsg *>(wire);
+    REQUIRE(decoded && decoded->remote_required == 1,
+            "P50 GetCS round-trips the exact remote-required policy");
+    delete wire;
+
+    GetCSMsg invalid_remote_required = absent;
+    invalid_remote_required.remote_required = 2;
+    REQUIRE(!make_pair(50).left->send_msg(invalid_remote_required),
+            "GetCS encoder rejects a non-boolean remote-required value");
 
     const struct Invalid {
         uint32_t protocol;
@@ -489,7 +509,7 @@ static void test_getcs_cache_request_wire_and_laws()
     REQUIRE(!make_pair(50).left->send_msg(retry_without_capability),
             "GetCS encoder rejects retry exclusion without P50 capability");
 
-    REQUIRE(getcs_decoder_rejects(remove_tail_bytes(p50_absent, 30)),
+    REQUIRE(getcs_decoder_rejects(remove_tail_bytes(p50_absent, 34)),
             "P50 GetCS decoder rejects a wholly omitted capability tail");
     REQUIRE(getcs_decoder_rejects(remove_tail_bytes(p50_absent, 1)),
             "P50 GetCS decoder rejects a truncated retry-exclusion string");

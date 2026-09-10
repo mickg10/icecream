@@ -1454,6 +1454,12 @@ maybe_build_local(MsgChannel *local_daemon, UseCSMsg *usecs, CompileJob &job,
     remote_daemon = usecs->hostname;
 
     if (usecs->hostname == "127.0.0.1") {
+        if (getenv("ICECC_REMOTE_REQUIRED") != nullptr) {
+            log_error() << "remote-required run refuses scheduler-selected localhost"
+                        << endl;
+            ret = EXIT_DISTCC_FAILED;
+            return true;
+        }
         // The scheduler-local fast path lives inside build_remote(), so the
         // outer fallback guards in main.cpp never see it.  A strict all-P50
         // cell must reject this selection before creating a local object.
@@ -1562,6 +1568,15 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon,
 {
     srand(time(nullptr) + getpid());
 
+    const bool remote_required = getenv("ICECC_REMOTE_REQUIRED") != nullptr;
+    if (remote_required &&
+        !IS_PROTOCOL_VERSION(PROTOCOL_VERSION_CACHE_ADVERTISEMENT,
+                             local_daemon)) {
+        throw client_error(
+            22,
+            "Error 22 - remote-required assignment needs protocol 50");
+    }
+
     /* Each build_remote() call owns one fresh scheduler assignment attempt.
        The bounded retry deliberately reuses the wrapper's CompileJob, so
        discard any P50 InputRecord identity committed by its predecessor
@@ -1618,6 +1633,7 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon,
                        preferred_host ? preferred_host : string(),
                        minimalRemoteVersion(job), requiredRemoteFeatures(),
                        get_niceness(), 0, invocation_cmdline);
+        getcs.remote_required = remote_required ? 1U : 0U;
 
         /* A new protocol-50 wrapper explicitly opts into the cache profiles it
            understands.  Canonical absence is reserved for the one bounded
@@ -1802,6 +1818,7 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon,
                        preferred_host ? preferred_host : string(),
                        minimalRemoteVersion(job), 0, get_niceness(), 0,
                        invocation_cmdline);
+        getcs.remote_required = remote_required ? 1U : 0U;
 
 
         if (!local_daemon->send_msg(getcs)) {
