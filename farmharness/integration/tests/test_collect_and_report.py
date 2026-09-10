@@ -13,6 +13,7 @@ from farmharness.integration.tests import farm_fixture
 from farmharness.integration import farmtest, report
 from farmharness.integration.collect import (
     CollectError,
+    _abandoned_p50_retry_request_observation,
     _client_assignments,
     _canary_assignment_claims,
     _checkpoint_result_path,
@@ -38,8 +39,10 @@ from farmharness.integration.collect import (
     _source_candidates_for_assignment,
     _source_results,
     _source_transfer_failure_observation,
+    _uncommitted_transport_failure_observation,
     _successful_strict_p50_late_result_binding,
     _transition_target_env,
+    _unassigned_p50_failure_observation,
     _validate_preexposure_redispatches,
     _validate_orphan_recovery_markers,
     _warm_hint_overrides,
@@ -993,6 +996,74 @@ def test_collection_authenticates_preexposure_redispatch_before_usecs(
         "scheduler_dispatches": 1,
         "workload_dispatches": 1,
     }
+
+
+def test_reconciliation_records_exact_failed_request_dispatch(
+    tmp_path: Path,
+) -> None:
+    evidence, plan, claims, scheduler_log = _preexposure_scheduler_fixture(tmp_path)
+    scheduler_log.write_text(
+        scheduler_log.read_text(encoding="utf-8")
+        + "[1] 2026-09-09 08:01:27: NEW 8 client=C1 versions=[] /ghost.ii C++ 0\n"
+        + "[1] 2026-09-09 08:01:27: put 8 in joblist of F1\n"
+        + "[1] 2026-09-09 08:01:28: END 8 status=255\n",
+        encoding="utf-8",
+    )
+    requests = [
+        {
+            "client_instance": "C1",
+            "request_finished_ms": 1_788_940_888_000,
+            "request_started_ms": 1_788_940_887_000,
+            "row_job_id": "C1:A:2:missing-2",
+        }
+    ]
+
+    result = _reconcile_scheduler_dispatches(
+        evidence, plan, claims, unclaimed_requests=requests
+    )
+
+    assert result["scheduler_dispatches"] == 2
+    assert result["workload_dispatches"] == 2
+    assert result["unclaimed_dispatches"] == [
+        {
+            "client": "C1",
+            "dispatch_line": 9,
+            "generation": 1,
+            "scheduler_job": 8,
+            "terminal": "cancellation",
+            "worker": "F1",
+        }
+    ]
+
+
+@pytest.mark.parametrize("mutation", ("wrong-client", "wrong-time", "duplicate"))
+def test_reconciliation_rejects_unbound_failed_request_dispatch(
+    tmp_path: Path, mutation: str
+) -> None:
+    evidence, plan, claims, scheduler_log = _preexposure_scheduler_fixture(tmp_path)
+    scheduler_log.write_text(
+        scheduler_log.read_text(encoding="utf-8")
+        + "[1] 2026-09-09 08:01:27: NEW 8 client=C1 versions=[] /ghost.ii C++ 0\n"
+        + "[1] 2026-09-09 08:01:27: put 8 in joblist of F1\n"
+        + "[1] 2026-09-09 08:01:28: END 8 status=255\n",
+        encoding="utf-8",
+    )
+    request = {
+        "client_instance": "C2" if mutation == "wrong-client" else "C1",
+        "request_finished_ms": (
+            1_788_940_800_000 if mutation == "wrong-time" else 1_788_940_888_000
+        ),
+        "request_started_ms": (
+            1_788_940_799_000 if mutation == "wrong-time" else 1_788_940_887_000
+        ),
+        "row_job_id": "C1:A:2:missing-2",
+    }
+    requests = [request, dict(request)] if mutation == "duplicate" else [request]
+
+    with pytest.raises(CollectError, match="unclaimed scheduler dispatches"):
+        _reconcile_scheduler_dispatches(
+            evidence, plan, claims, unclaimed_requests=requests
+        )
 
 
 @pytest.mark.parametrize(
@@ -2103,6 +2174,337 @@ def test_source_transfer_failure_authentication_fails_closed(mutation: str) -> N
     with pytest.raises(CollectError, match="source-transfer loss"):
         _source_transfer_failure_observation(
             **_source_transfer_failure_kwargs(mutation=mutation)
+        )
+
+
+def _uncommitted_transport_failure_kwargs(
+    *, mutation: str | None = None
+) -> dict[str, object]:
+    first_endpoint = "10.0.27.56:23004"
+    retry_endpoint = (
+        first_endpoint if mutation == "same-endpoint" else "10.0.27.101:23003"
+    )
+    normalized = (
+        "normalizing P50 client error 2 to Error 106 for a fresh assignment"
+    )
+    retry = (
+        "P50 assignment failed; requesting one fresh strict-P50 remote assignment; "
+        f"avoiding failed endpoint {first_endpoint}"
+    )
+    if mutation == "unsupported-error":
+        normalized = normalized.replace("error 2", "error 3")
+    elif mutation == "malformed-normalization":
+        normalized = normalized.replace("Error 106", "Error 105")
+    elif mutation == "duplicate-normalization":
+        normalized += "\n" + normalized
+    elif mutation == "missing-retry":
+        retry = "retry marker absent"
+    elif mutation == "wrong-failed-endpoint":
+        retry = retry.replace(first_endpoint, "10.0.27.99:23999")
+    elif mutation == "reversed-markers":
+        normalized, retry = retry, normalized
+    retry_identity_job = 4 if mutation == "wrong-retry-identity" else 3
+    first_identity = (
+        "P50 assignment identity bound for job 2 epoch 1 nonce 1 "
+        "c_guid 1 tu_seq 9\n"
+    )
+    if mutation == "duplicate-first-identity":
+        first_identity += first_identity
+    profile = (
+        "\nP29V1 source committed for P50 CompileFile: 100 exact bytes, "
+        "TU sequence 9"
+        if mutation == "profile-commit"
+        else ""
+    )
+    log = (
+        first_identity
+        + f"ICECC[2] 2026-09-05 01:00:04: Have to use host {first_endpoint} "
+        "- Job ID: 2 - env: x86_64\n"
+        f"{normalized}{profile}\n"
+        f"{retry}\n"
+        f"P50 assignment identity bound for job {retry_identity_job} epoch 1 "
+        "nonce 2 c_guid 1 tu_seq 10\n"
+        f"ICECC[3] 2026-09-05 01:00:06: Have to use host {retry_endpoint} "
+        "- Job ID: 3 - env: x86_64\n"
+    )
+    assignments = _client_assignments(log, "transport-loss-fixture")
+    assignments[0]["worker"] = "F2"
+    assignments[1]["worker"] = "F1" if retry_endpoint != first_endpoint else "F2"
+    identities = [
+        _p50_assignment_identity_evidence(
+            log,
+            assignment["scheduler_job"],
+            after_line=(assignments[index - 1]["line"] if index else 0),
+            before_line=assignment["line"] + 1,
+        )
+        for index, assignment in enumerate(assignments)
+    ]
+    source_results = {(2, 1, 1): {}} if mutation == "source-result" else {}
+    compile_identities = (
+        {(2, 1, 1): {}} if mutation == "compile-identity" else {}
+    )
+    return {
+        "assignment": assignments[0],
+        "assignment_identity": identities[0],
+        "attempt_index": 0,
+        "compile_identities": compile_identities,
+        "log_text": log,
+        "retry_assignment": assignments[1],
+        "retry_identity": identities[1],
+        "row_job_id": "C1:A:121:179",
+        "source_results": source_results,
+    }
+
+
+def test_uncommitted_transport_failure_binds_exact_retry_window() -> None:
+    record = _uncommitted_transport_failure_observation(
+        **_uncommitted_transport_failure_kwargs()
+    )
+
+    assert record is not None
+    assert record["scheduler_job"] == 2
+    assert record["retry_scheduler_job"] == 3
+    assert record["worker"] == "F2"
+    assert record["failed_endpoint"] == "10.0.27.56:23004"
+    assert record["retry_endpoint"] == "10.0.27.101:23003"
+    assert record["retry_c_guid"] == record["c_guid"] == 1
+    assert record["original_error"] == 2
+    assert record["normalized_error"] == 106
+    assert record["profile_commit_present"] is False
+    assert record["source_result_present"] is False
+    assert record["compile_identity_present"] is False
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "unsupported-error",
+        "malformed-normalization",
+        "duplicate-normalization",
+        "missing-retry",
+        "wrong-failed-endpoint",
+        "reversed-markers",
+        "same-endpoint",
+        "wrong-retry-identity",
+        "duplicate-first-identity",
+        "source-result",
+        "compile-identity",
+        "profile-commit",
+    ),
+)
+def test_uncommitted_transport_failure_authentication_fails_closed(
+    mutation: str,
+) -> None:
+    with pytest.raises(CollectError, match="transport.loss"):
+        _uncommitted_transport_failure_observation(
+            **_uncommitted_transport_failure_kwargs(mutation=mutation)
+        )
+
+
+def test_uncommitted_transport_parser_defers_non_transport_retry() -> None:
+    kwargs = _uncommitted_transport_failure_kwargs()
+    kwargs["log_text"] = str(kwargs["log_text"]).replace(
+        "normalizing P50 client error 2 to Error 106 for a fresh assignment",
+        "P29V1 cache source transfer failed closed (status 2, error 4, attempts 0)",
+    )
+
+    assert _uncommitted_transport_failure_observation(**kwargs) is None
+
+
+def _unassigned_p50_failure_kwargs(
+    *, mutation: str | None = None
+) -> dict[str, object]:
+    raw: dict[str, object] = {
+        "compile_rc": 100,
+        "exact": 0,
+        "index": 5369,
+        "remote": 0,
+        "remote_sha": "0" * 64,
+        "retries": 0,
+        "scheduler_job": "missing-5369",
+        "started": 0,
+        "finished": 0,
+        "turn": "A",
+        "worker": "UNKNOWN",
+    }
+    lines = [
+        "ICECC[1] asking for host to use",
+        "ICECC[1] local build forced by remote exception: "
+        "Error 105 - strict all-P50 assignment has no cache handoff",
+        "ICECC[1] remote-only policy refuses local retry",
+    ]
+    if mutation == "successful":
+        raw["compile_rc"] = 0
+    elif mutation == "wrong-missing-id":
+        raw["scheduler_job"] = "missing-999"
+    elif mutation == "remote":
+        raw["remote"] = 1
+    elif mutation == "retry":
+        raw["retries"] = 1
+    elif mutation == "wrong-worker":
+        raw["worker"] = "F1"
+    elif mutation == "wrong-error":
+        lines[1] = lines[1].replace("Error 105", "Error 106")
+    elif mutation == "missing-refusal":
+        lines.pop()
+    elif mutation == "duplicate-request":
+        lines.insert(1, lines[0])
+    elif mutation == "reversed":
+        lines[1], lines[2] = lines[2], lines[1]
+    elif mutation == "assignment":
+        lines.insert(
+            1,
+            "ICECC[1] Have to use host 10.0.27.56:23004 - Job ID: 1 - "
+            "env: x86_64",
+        )
+    elif mutation == "identity":
+        lines.insert(
+            1,
+            "P50 assignment identity bound for job 1 epoch 1 nonce 1 "
+            "c_guid 1 tu_seq 1",
+        )
+    elif mutation == "profile":
+        lines.insert(
+            1,
+            "P29V1 source committed for P50 CompileFile: 100 exact bytes, "
+            "TU sequence 1",
+        )
+    return {
+        "log_text": "\n".join(lines) + "\n",
+        "raw": raw,
+        "row_job_id": "C1:A:5369:missing-5369",
+    }
+
+
+def test_unassigned_p50_failure_binds_exact_remote_only_refusal() -> None:
+    record = _unassigned_p50_failure_observation(
+        **_unassigned_p50_failure_kwargs()
+    )
+
+    assert record == {
+        "client_instance": "C1",
+        "compile_rc": 100,
+        "failure_line": 2,
+        "index": 5369,
+        "remote_only_refusal_line": 3,
+        "request_line": 1,
+        "request_finished_ms": 0,
+        "request_started_ms": 0,
+        "row_job_id": "C1:A:5369:missing-5369",
+        "scheduler_job": "missing-5369",
+        "turn": "A",
+        "worker": "UNKNOWN",
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "successful",
+        "wrong-missing-id",
+        "remote",
+        "retry",
+        "wrong-worker",
+        "wrong-error",
+        "missing-refusal",
+        "duplicate-request",
+        "reversed",
+        "assignment",
+        "identity",
+        "profile",
+    ),
+)
+def test_unassigned_p50_failure_authentication_fails_closed(mutation: str) -> None:
+    with pytest.raises(CollectError, match="missing assignment"):
+        _unassigned_p50_failure_observation(
+            **_unassigned_p50_failure_kwargs(mutation=mutation)
+        )
+
+
+def _abandoned_p50_retry_kwargs(
+    *, mutation: str | None = None
+) -> dict[str, object]:
+    endpoint = "10.0.27.101:23003"
+    log = (
+        "P50 assignment identity bound for job 5407 epoch 1 nonce 2 "
+        "c_guid 1 tu_seq 3\n"
+        f"ICECC[1] 2026-09-10 20:52:24: Have to use host {endpoint} "
+        "- Job ID: 5407 - env: x86_64\n"
+        "P29V1 cache source transfer failed closed "
+        "(status 2, error 7, attempts 0)\n"
+        "P50 assignment failed; requesting one fresh strict-P50 remote "
+        f"assignment; avoiding failed endpoint {endpoint}\n"
+        "ICECC[1] local build forced by remote exception: "
+        "Error 105 - strict all-P50 assignment has no cache handoff\n"
+        "ICECC[1] remote-only policy refuses local retry\n"
+    )
+    if mutation == "successful":
+        compile_rc = 0
+    else:
+        compile_rc = 100
+    if mutation == "second-assignment":
+        log += (
+            "ICECC[1] 2026-09-10 20:52:34: Have to use host "
+            "10.0.27.56:23004 - Job ID: 5408 - env: x86_64\n"
+        )
+    elif mutation == "profile":
+        log += (
+            "P29V1 source committed for P50 CompileFile: 100 exact bytes, "
+            "TU sequence 3\n"
+        )
+    elif mutation == "wrong-endpoint":
+        log = log.replace(
+            f"avoiding failed endpoint {endpoint}",
+            "avoiding failed endpoint 10.0.27.99:23999",
+        )
+    elif mutation == "missing-refusal":
+        log = log.replace("ICECC[1] remote-only policy refuses local retry\n", "")
+    assignments = _client_assignments(log, "abandoned-retry-fixture")
+    assignments[0]["worker"] = "F1"
+    identity = _p50_assignment_identity_evidence(
+        log,
+        assignments[0]["scheduler_job"],
+        after_line=0,
+        before_line=assignments[0]["line"] + 1,
+    )
+    return {
+        "assignment": assignments[0],
+        "assignment_identity": identity,
+        "log_text": log,
+        "raw": {
+            "compile_rc": compile_rc,
+            "exact": 0,
+            "finished": 20,
+            "remote": 1,
+            "remote_sha": "0" * 64,
+            "retries": 0,
+            "started": 10,
+        },
+        "row_job_id": "C1:A:5338:5407",
+    }
+
+
+def test_abandoned_p50_retry_binds_failed_request_without_usecs() -> None:
+    record = _abandoned_p50_retry_request_observation(
+        **_abandoned_p50_retry_kwargs()
+    )
+
+    assert record is not None
+    assert record["scheduler_job"] == 5407
+    assert record["failed_endpoint"] == "10.0.27.101:23003"
+    assert record["status"] == 2
+    assert record["transfer_error"] == 7
+    assert record["request_started_ms"] == 10
+    assert record["request_finished_ms"] == 20
+
+
+@pytest.mark.parametrize(
+    "mutation", ("successful", "second-assignment", "profile", "wrong-endpoint", "missing-refusal")
+)
+def test_abandoned_p50_retry_authentication_fails_closed(mutation: str) -> None:
+    with pytest.raises(CollectError, match="abandoned strict-P50 retry"):
+        _abandoned_p50_retry_request_observation(
+            **_abandoned_p50_retry_kwargs(mutation=mutation)
         )
 
 

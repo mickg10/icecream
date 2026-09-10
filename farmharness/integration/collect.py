@@ -103,8 +103,9 @@ P50_ASSIGNMENT_IDENTITY_RE = re.compile(
     r"nonce ([0-9]+) c_guid ([0-9]+) tu_seq ([0-9]+)\b"
 )
 P50_NORMALIZED_ERROR106_RE = re.compile(
-    r"\bnormalizing P50 client error [0-9]+ to Error 106 for a fresh assignment\b"
+    r"\bnormalizing P50 client error ([0-9]+) to Error 106 for a fresh assignment\b"
 )
+P50_RETRYABLE_TRANSPORT_ERRORS = frozenset((2, 6, 8, 9, 13, 14, 19, 20, 23, 107))
 P50_SOURCE_TRANSFER_FAILED_RE = re.compile(
     r"\b(P29V1|ZSTD_TU|ZSTD_ROUTE) cache source transfer failed closed "
     r"\(status ([0-9]+), error ([0-9]+), attempts ([0-9]+)\)\s*$"
@@ -113,6 +114,11 @@ P50_STRICT_RETRY_REQUEST_RE = re.compile(
     r"\bP50 assignment failed; requesting one fresh strict-P50 remote "
     r"assignment; avoiding failed endpoint ([^ ]+)\s*$"
 )
+P50_NO_CACHE_HANDOFF_RE = re.compile(
+    r"\blocal build forced by remote exception: "
+    r"Error 105 - strict all-P50 assignment has no cache handoff\s*$"
+)
+REMOTE_ONLY_REFUSAL_RE = re.compile(r"\bremote-only policy refuses local retry\s*$")
 LOCAL_BUILD_MARKERS = ("<building_local>", "building myself, but telling localhost")
 LOG_TIMESTAMP_RE = re.compile(
     r"\b([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}):"
@@ -4716,6 +4722,314 @@ def _source_transfer_failure_observation(
     }
 
 
+def _uncommitted_transport_failure_observation(
+    *,
+    log_text: str,
+    assignment: Mapping[str, Any],
+    retry_assignment: Mapping[str, Any],
+    assignment_identity: Mapping[str, int] | None,
+    retry_identity: Mapping[str, int] | None,
+    source_results: Mapping[tuple[int, int, int], Mapping[str, Any]],
+    compile_identities: Mapping[tuple[int, int, int], Mapping[str, Any]],
+    row_job_id: str,
+    attempt_index: int,
+) -> dict[str, Any] | None:
+    """Authenticate a strict retry after a pre-commit P50 transport loss.
+
+    This is intentionally separate from a cache source-transfer failure: the
+    client may lose an ordinary worker connection before it has emitted a P50
+    profile commit marker or any source/compile result.  Only the producer's
+    exact transport normalization set is accepted, and every identity and
+    endpoint transition remains fail closed.
+    """
+
+    assignment_line = assignment.get("line")
+    retry_assignment_line = retry_assignment.get("line")
+    if type(assignment_line) is not int or type(retry_assignment_line) is not int:
+        raise CollectError(f"{row_job_id}: transport-loss assignment line is invalid")
+    scoped_lines = [
+        (line_number, line)
+        for line_number, line in enumerate(log_text.splitlines(), start=1)
+        if assignment_line < line_number < retry_assignment_line
+    ]
+    has_normalized_claim = any(
+        "normalizing P50 client error" in line
+        and "for a fresh assignment" in line
+        for _, line in scoped_lines
+    )
+    if not has_normalized_claim:
+        return None
+    normalized = [
+        (line_number, match)
+        for line_number, line in scoped_lines
+        if (match := P50_NORMALIZED_ERROR106_RE.search(line)) is not None
+    ]
+    retries = [
+        (line_number, match)
+        for line_number, line in scoped_lines
+        if (match := P50_STRICT_RETRY_REQUEST_RE.search(line)) is not None
+    ]
+    if len(normalized) != 1 or len(retries) != 1:
+        raise CollectError(
+            f"{row_job_id}: uncommitted transport-loss markers are malformed or ambiguous"
+        )
+    if assignment_identity is None or retry_identity is None:
+        raise CollectError(
+            f"{row_job_id}: uncommitted transport loss lacks exact assignment identities"
+        )
+
+    def identity_occurrences(evidence: Mapping[str, int]) -> int:
+        expected = (
+            evidence["scheduler_job"],
+            evidence["assignment_epoch"],
+            evidence["assignment_nonce"],
+            evidence["c_guid"],
+            evidence["tu_seq"],
+        )
+        return sum(
+            tuple(int(match.group(index)) for index in range(1, 6)) == expected
+            for match in P50_ASSIGNMENT_IDENTITY_RE.finditer(log_text)
+        )
+
+    if (
+        identity_occurrences(assignment_identity) != 1
+        or identity_occurrences(retry_identity) != 1
+    ):
+        raise CollectError(
+            f"{row_job_id}: uncommitted transport-loss assignment identity is ambiguous"
+        )
+
+    normalized_line, normalized_match = normalized[0]
+    retry_line, retry_match = retries[0]
+    original_error = int(normalized_match.group(1))
+    failed_endpoint = retry_match.group(1)
+    identity_line = assignment_identity["line"]
+    retry_identity_line = retry_identity["line"]
+    identity = (
+        assignment_identity["scheduler_job"],
+        assignment_identity["assignment_epoch"],
+        assignment_identity["assignment_nonce"],
+    )
+    retry_key = (
+        retry_identity["scheduler_job"],
+        retry_identity["assignment_epoch"],
+        retry_identity["assignment_nonce"],
+    )
+    worker = str(assignment.get("worker", ""))
+    if (
+        assignment_identity["scheduler_job"] != assignment.get("scheduler_job")
+        or retry_identity["scheduler_job"] != retry_assignment.get("scheduler_job")
+        or retry_identity["c_guid"] != assignment_identity["c_guid"]
+        or retry_key == identity
+        or original_error not in P50_RETRYABLE_TRANSPORT_ERRORS
+        or not (
+            identity_line
+            < assignment_line
+            < normalized_line
+            < retry_line
+            < retry_identity_line
+            < retry_assignment_line
+        )
+        or failed_endpoint != assignment.get("endpoint")
+        or retry_assignment.get("endpoint") == failed_endpoint
+        or not worker
+        or identity in source_results
+        or identity in compile_identities
+        or any(PROFILE_RE.search(line) is not None for _, line in scoped_lines)
+    ):
+        raise CollectError(
+            f"{row_job_id}: uncommitted transport loss does not bind one exact "
+            "failed assignment to a distinct strict retry"
+        )
+    return {
+        "assignment_epoch": assignment_identity["assignment_epoch"],
+        "assignment_identity_line": identity_line,
+        "assignment_line": assignment_line,
+        "assignment_nonce": assignment_identity["assignment_nonce"],
+        "attempt_index": attempt_index,
+        "c_guid": assignment_identity["c_guid"],
+        "compile_identity_present": False,
+        "failed_endpoint": failed_endpoint,
+        "normalized_error": 106,
+        "normalized_line": normalized_line,
+        "original_error": original_error,
+        "profile_commit_present": False,
+        "retry_assignment_epoch": retry_identity["assignment_epoch"],
+        "retry_assignment_identity_line": retry_identity_line,
+        "retry_assignment_line": retry_assignment_line,
+        "retry_assignment_nonce": retry_identity["assignment_nonce"],
+        "retry_c_guid": retry_identity["c_guid"],
+        "retry_endpoint": retry_assignment["endpoint"],
+        "retry_line": retry_line,
+        "retry_scheduler_job": retry_assignment["scheduler_job"],
+        "retry_tu_seq": retry_identity["tu_seq"],
+        "row_job_id": row_job_id,
+        "scheduler_job": assignment["scheduler_job"],
+        "source_result_present": False,
+        "tu_seq": assignment_identity["tu_seq"],
+        "worker": worker,
+    }
+
+
+def _unassigned_p50_failure_observation(
+    *, log_text: str, raw: Mapping[str, Any], row_job_id: str
+) -> dict[str, Any]:
+    """Authenticate a remote-only P50 request rejected before assignment."""
+
+    lines = list(enumerate(log_text.splitlines(), start=1))
+    requests = [
+        line_number
+        for line_number, line in lines
+        if "asking for host to use" in line
+    ]
+    failures = [
+        line_number
+        for line_number, line in lines
+        if P50_NO_CACHE_HANDOFF_RE.search(line) is not None
+    ]
+    refusals = [
+        line_number
+        for line_number, line in lines
+        if REMOTE_ONLY_REFUSAL_RE.search(line) is not None
+    ]
+    expected_scheduler_job = f"missing-{raw.get('index')}"
+    if (
+        raw.get("scheduler_job") != expected_scheduler_job
+        or raw.get("worker") != "UNKNOWN"
+        or type(raw.get("compile_rc")) is not int
+        or raw["compile_rc"] == 0
+        or raw.get("exact") != 0
+        or raw.get("remote") != 0
+        or raw.get("retries") != 0
+        or raw.get("remote_sha") != "0" * 64
+        or len(requests) != 1
+        or len(failures) != 1
+        or len(refusals) != 1
+        or not requests[0] < failures[0] < refusals[0]
+        or CLIENT_ASSIGNMENT_RE.search(log_text) is not None
+        or P50_ASSIGNMENT_IDENTITY_RE.search(log_text) is not None
+        or PROFILE_RE.search(log_text) is not None
+        or P50_SOURCE_TRANSFER_FAILED_RE.search(log_text) is not None
+        or P50_NORMALIZED_ERROR106_RE.search(log_text) is not None
+        or P50_STRICT_RETRY_REQUEST_RE.search(log_text) is not None
+        or any(marker in log_text for marker in LOCAL_BUILD_MARKERS)
+    ):
+        raise CollectError(
+            f"{row_job_id}: missing assignment is not one exact remote-only "
+            "P50 cache-handoff refusal"
+        )
+    return {
+        "client_instance": row_job_id.split(":", 1)[0],
+        "compile_rc": raw["compile_rc"],
+        "failure_line": failures[0],
+        "index": raw["index"],
+        "remote_only_refusal_line": refusals[0],
+        "request_line": requests[0],
+        "request_finished_ms": raw["finished"],
+        "request_started_ms": raw["started"],
+        "row_job_id": row_job_id,
+        "scheduler_job": raw["scheduler_job"],
+        "turn": raw["turn"],
+        "worker": raw["worker"],
+    }
+
+
+def _abandoned_p50_retry_request_observation(
+    *,
+    log_text: str,
+    raw: Mapping[str, Any],
+    assignment: Mapping[str, Any],
+    assignment_identity: Mapping[str, int] | None,
+    row_job_id: str,
+) -> dict[str, Any] | None:
+    """Authenticate a strict retry request rejected before its UseCS arrived."""
+
+    lines = list(enumerate(log_text.splitlines(), start=1))
+    no_cache = [
+        line_number
+        for line_number, line in lines
+        if P50_NO_CACHE_HANDOFF_RE.search(line) is not None
+    ]
+    if not no_cache:
+        return None
+    transfers = [
+        (line_number, match)
+        for line_number, line in lines
+        if (match := P50_SOURCE_TRANSFER_FAILED_RE.search(line)) is not None
+    ]
+    retries = [
+        (line_number, match)
+        for line_number, line in lines
+        if (match := P50_STRICT_RETRY_REQUEST_RE.search(line)) is not None
+    ]
+    refusals = [
+        line_number
+        for line_number, line in lines
+        if REMOTE_ONLY_REFUSAL_RE.search(line) is not None
+    ]
+    assignments = list(CLIENT_ASSIGNMENT_RE.finditer(log_text))
+    identities = list(P50_ASSIGNMENT_IDENTITY_RE.finditer(log_text))
+    if (
+        assignment_identity is None
+        or len(assignments) != 1
+        or len(identities) != 1
+        or len(transfers) != 1
+        or len(retries) != 1
+        or len(no_cache) != 1
+        or len(refusals) != 1
+    ):
+        raise CollectError(
+            f"{row_job_id}: abandoned strict-P50 retry markers are absent or ambiguous"
+        )
+    transfer_line, transfer = transfers[0]
+    retry_line, retry = retries[0]
+    assignment_line = assignment.get("line")
+    identity_line = assignment_identity.get("line")
+    if (
+        type(assignment_line) is not int
+        or type(identity_line) is not int
+        or assignment_identity.get("scheduler_job")
+        != assignment.get("scheduler_job")
+        or retry.group(1) != assignment.get("endpoint")
+        or raw.get("compile_rc") == 0
+        or raw.get("exact") != 0
+        or raw.get("remote") != 1
+        or raw.get("retries") != 0
+        or raw.get("remote_sha") != "0" * 64
+        or int(transfer.group(2)) < 1
+        or int(transfer.group(3)) < 1
+        or not (
+            identity_line
+            < assignment_line
+            < transfer_line
+            < retry_line
+            < no_cache[0]
+            < refusals[0]
+        )
+        or PROFILE_RE.search(log_text) is not None
+        or P50_NORMALIZED_ERROR106_RE.search(log_text) is not None
+    ):
+        raise CollectError(
+            f"{row_job_id}: abandoned strict-P50 retry is not an exact failed request"
+        )
+    return {
+        "client_instance": row_job_id.split(":", 1)[0],
+        "compile_rc": raw["compile_rc"],
+        "failed_endpoint": retry.group(1),
+        "failure_line": transfer_line,
+        "profile": transfer.group(1),
+        "request_finished_ms": raw["finished"],
+        "request_started_ms": raw["started"],
+        "retry_line": retry_line,
+        "row_job_id": row_job_id,
+        "scheduler_job": assignment["scheduler_job"],
+        "status": int(transfer.group(2)),
+        "transfer_error": int(transfer.group(3)),
+        "transfer_attempts": int(transfer.group(4)),
+        "worker": assignment["worker"],
+    }
+
+
 def _source_transfer_is_exact(
     source: Mapping[str, Any],
     marker: Mapping[str, Any],
@@ -4995,6 +5309,9 @@ def _parse_rows(
     source_route_records: list[dict[str, Any]] = []
     failed_result_identity_records: list[dict[str, Any]] = []
     failed_source_transfer_records: list[dict[str, Any]] = []
+    failed_uncommitted_transport_records: list[dict[str, Any]] = []
+    failed_unassigned_request_records: list[dict[str, Any]] = []
+    abandoned_retry_request_records: list[dict[str, Any]] = []
     legacy_wire_records: list[dict[str, Any]] = []
     wire_revision_mismatches: list[dict[str, Any]] = []
     s30_refusals: list[dict[str, Any]] = []
@@ -5044,8 +5361,57 @@ def _parse_rows(
             raise CollectError(f"client {client_name} has no workload job rows")
         for path in job_paths:
             raw = _job_result(path)
+            job_dir = path.parent
+            log_text = (
+                _text(job_dir / "client-debug.log")
+                + "\n"
+                + _text(job_dir / "client-output.log")
+            )
             if not raw["scheduler_job"].isdigit():
-                raise CollectError(f"{path}: scheduler job id is not numeric")
+                job_id = (
+                    f"{client_name}:{raw['turn']}:{raw['index']}:"
+                    f"{raw['scheduler_job']}"
+                )
+                observation = _unassigned_p50_failure_observation(
+                    log_text=log_text, raw=raw, row_job_id=job_id
+                )
+                raw_jobs.append(
+                    {
+                        "assignment_claims": [],
+                        "client": client_name,
+                        "local_build": False,
+                        "row_job_id": job_id,
+                        "unassigned_p50_failure": observation,
+                        **raw,
+                    }
+                )
+                failed_unassigned_request_records.append(observation)
+                compile_failures.append(job_id)
+                local_fallbacks.append(job_id)
+                rows.append(
+                    {
+                        "c_to_f_bytes": 0,
+                        "client_instance": client_name,
+                        "client_version": client["version"],
+                        "cs": "UNKNOWN",
+                        "cs_version": 0,
+                        "event_epoch": _epoch_at(events, raw["started"]),
+                        "exact": False,
+                        "f_to_c_bytes": 0,
+                        "job_id": job_id,
+                        "object_sha_local": raw["local_sha"],
+                        "object_sha_remote": raw["remote_sha"],
+                        "retries": 0,
+                        "reuse": None,
+                        "schema": ROW_SCHEMA,
+                        "session_outcome": "failed",
+                        "tail_present": False,
+                        "tail_profile": None,
+                        "tu": raw["relative"],
+                        "wall_ms": raw["finished"] - raw["started"],
+                    }
+                )
+                continue
             scheduler_job = int(raw["scheduler_job"])
             worker = workers.get(raw["worker"])
             if worker is None:
@@ -5053,12 +5419,6 @@ def _parse_rows(
                     f"{path}: assignment names unknown worker {raw['worker']!r}"
                 )
             job_id = f"{client_name}:{raw['turn']}:{raw['index']}:{scheduler_job}"
-            job_dir = path.parent
-            log_text = (
-                _text(job_dir / "client-debug.log")
-                + "\n"
-                + _text(job_dir / "client-output.log")
-            )
             local_build = any(marker in log_text for marker in LOCAL_BUILD_MARKERS)
             if raw["compile_rc"] == 0 and bool(raw["remote"]) == local_build:
                 raise CollectError(
@@ -5141,12 +5501,23 @@ def _parse_rows(
             marker = attempt_markers[-1]
             legacy_marker = _legacy_wire_binding_marker(log_text, scheduler_job)
             assignment_identity = attempt_identities[-1]
+            abandoned_retry_request = _abandoned_p50_retry_request_observation(
+                log_text=log_text,
+                raw=raw,
+                assignment=final_assignment,
+                assignment_identity=attempt_identity_evidence[-1],
+                row_job_id=job_id,
+            )
+            if abandoned_retry_request is not None:
+                raw_job["abandoned_p50_retry_request"] = abandoned_retry_request
+                abandoned_retry_request_records.append(abandoned_retry_request)
             scheduler = next(
                 item for item in topology if item["role"] == "S"
             )
 
             missing_result_identities: list[dict[str, Any]] = []
             source_transfer_failures: list[dict[str, Any]] = []
+            uncommitted_transport_failures: list[dict[str, Any]] = []
             for attempt_index, (
                 assignment,
                 attempt_marker,
@@ -5161,6 +5532,20 @@ def _parse_rows(
                 )
             ):
                 if attempt_marker is None:
+                    transport_failure = _uncommitted_transport_failure_observation(
+                        log_text=log_text,
+                        assignment=assignment,
+                        retry_assignment=assignments[attempt_index + 1],
+                        assignment_identity=attempt_identity_evidence[attempt_index],
+                        retry_identity=attempt_identity_evidence[attempt_index + 1],
+                        source_results=source_results,
+                        compile_identities=compile_identities,
+                        row_job_id=job_id,
+                        attempt_index=attempt_index,
+                    )
+                    if transport_failure is not None:
+                        uncommitted_transport_failures.append(transport_failure)
+                        continue
                     failure = _source_transfer_failure_observation(
                         log_text=log_text,
                         assignment=assignment,
@@ -5299,6 +5684,13 @@ def _parse_rows(
             if source_transfer_failures:
                 raw_job["failed_p50_source_transfers"] = source_transfer_failures
                 failed_source_transfer_records.extend(source_transfer_failures)
+            if uncommitted_transport_failures:
+                raw_job["failed_p50_uncommitted_transports"] = (
+                    uncommitted_transport_failures
+                )
+                failed_uncommitted_transport_records.extend(
+                    uncommitted_transport_failures
+                )
             legacy_candidates = _legacy_wire_candidates_for_assignment(
                 c_legacy_wires,
                 scheduler_job,
@@ -5554,6 +5946,27 @@ def _parse_rows(
                 key=lambda item: (item["row_job_id"], item["attempt_index"]),
             ),
         },
+        "failed_p50_uncommitted_transports": {
+            "record_count": len(failed_uncommitted_transport_records),
+            "records": sorted(
+                failed_uncommitted_transport_records,
+                key=lambda item: (item["row_job_id"], item["attempt_index"]),
+            ),
+        },
+        "failed_unassigned_p50_requests": {
+            "record_count": len(failed_unassigned_request_records),
+            "records": sorted(
+                failed_unassigned_request_records,
+                key=lambda item: item["row_job_id"],
+            ),
+        },
+        "abandoned_p50_retry_requests": {
+            "record_count": len(abandoned_retry_request_records),
+            "records": sorted(
+                abandoned_retry_request_records,
+                key=lambda item: item["row_job_id"],
+            ),
+        },
         "local_fallback_job_ids": sorted(local_fallbacks),
         "legacy_wire": {
             "records": sorted(legacy_wire_records, key=lambda item: item["job_id"]),
@@ -5661,6 +6074,7 @@ def _reconcile_scheduler_dispatches(
     *,
     allow_unterminated_job_ids: set[int] | None = None,
     allow_unterminated_generations: set[int] | None = None,
+    unclaimed_requests: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Require an exact scheduler-dispatch/assignment/terminal bijection."""
 
@@ -5678,14 +6092,56 @@ def _reconcile_scheduler_dispatches(
     for claim in claims:
         key = (claim["scheduler_job"], claim["client"], claim["worker"])
         claim_groups[key].append(claim)
-    if set(scheduler_groups) != set(claim_groups):
-        missing = sorted(set(claim_groups) - set(scheduler_groups))
-        extra = sorted(set(scheduler_groups) - set(claim_groups))
+    missing = sorted(set(claim_groups) - set(scheduler_groups))
+    extra = sorted(set(scheduler_groups) - set(claim_groups))
+    if missing:
         raise CollectError(
             f"scheduler dispatch/assignment keys differ missing={missing!r} extra={extra!r}"
         )
+    unclaimed_dispatches = [
+        dispatch
+        for key in extra
+        for dispatch in scheduler_groups[key]
+    ]
+    requests = unclaimed_requests or []
+    if extra and not requests:
+        raise CollectError(
+            f"scheduler dispatch/assignment keys differ missing={missing!r} extra={extra!r}"
+        )
+    if unclaimed_dispatches or requests:
+        request_clients = Counter(item.get("client_instance") for item in requests)
+        dispatch_clients = Counter(item.get("client") for item in unclaimed_dispatches)
+        request_rows = [item.get("row_job_id") for item in requests]
+        if (
+            not unclaimed_dispatches
+            or not requests
+            or len(unclaimed_dispatches) != len(requests)
+            or request_clients != dispatch_clients
+            or any(not isinstance(item, str) or not item for item in request_rows)
+            or len(set(request_rows)) != len(request_rows)
+            or any(
+                type(item.get("request_started_ms")) is not int
+                or type(item.get("request_finished_ms")) is not int
+                or item["request_finished_ms"] < item["request_started_ms"]
+                for item in requests
+            )
+            or any(
+                dispatch["dispatch_ms"]
+                < min(item["request_started_ms"] for item in requests) - 1000
+                or dispatch["dispatch_ms"]
+                > max(item["request_finished_ms"] for item in requests) + 1000
+                for dispatch in unclaimed_dispatches
+            )
+            or any(len(scheduler_groups[key]) != 1 for key in extra)
+        ):
+            raise CollectError(
+                "unclaimed scheduler dispatches do not bind exactly to "
+                "authenticated failed P50 requests"
+            )
     preexposure_redispatches: list[dict[str, Any]] = []
     for key in sorted(scheduler_groups):
+        if key in extra:
+            continue
         observed = scheduler_groups[key]
         asserted = claim_groups[key]
         if len(observed) != len(asserted):
@@ -5733,8 +6189,7 @@ def _reconcile_scheduler_dispatches(
                     }
                 )
     canary_count = sum(claim["kind"] == "canary" for claim in claims)
-    workload_count = len(claims) - canary_count
-    return {
+    result = {
         "canary_dispatches": canary_count,
         "generations": max(item["generation"] for item in dispatches),
         "preexposure_redispatches": sorted(
@@ -5742,8 +6197,23 @@ def _reconcile_scheduler_dispatches(
             key=lambda item: item["marker_line"],
         ),
         "scheduler_dispatches": len(dispatches),
-        "workload_dispatches": workload_count,
+        "workload_dispatches": len(dispatches) - canary_count,
     }
+    if unclaimed_dispatches:
+        result["unclaimed_dispatches"] = [
+            {
+                "client": item["client"],
+                "dispatch_line": item["dispatch_line"],
+                "generation": item["generation"],
+                "scheduler_job": item["scheduler_job"],
+                "terminal": item["terminal"],
+                "worker": item["worker"],
+            }
+            for item in sorted(
+                unclaimed_dispatches, key=lambda item: item["dispatch_line"]
+            )
+        ]
+    return result
 
 
 def _validate_preexposure_redispatches(
@@ -6470,6 +6940,10 @@ def _observations(
         [*canary_claims, *assignment_claims],
         allow_unterminated_job_ids=active_loss_jobs or None,
         allow_unterminated_generations=active_loss_generations or None,
+        unclaimed_requests=[
+            *row_facts["failed_unassigned_p50_requests"]["records"],
+            *row_facts["abandoned_p50_retry_requests"]["records"],
+        ],
     )
     _validate_preexposure_redispatches(
         scenario,
@@ -6517,11 +6991,39 @@ def _observations(
     for raw in raw_jobs:
         row = row_by_identity[raw["row_job_id"]]
         attempts = raw["assignment_claims"]
+        if not attempts:
+            if raw.get("unassigned_p50_failure") is None:
+                raise CollectError(
+                    f"{row['job_id']}: assignment lifecycle is unexpectedly empty"
+                )
+            lifecycle.append(
+                {
+                    "deadline_ms": raw["started"]
+                    + scenario.data["timeouts"]["turn_s"] * 1000,
+                    "client_instance": row["client_instance"],
+                    "dispatch_ms": raw["started"],
+                    "final_dispatch_ms": raw["started"],
+                    "first_dispatch_ms": raw["started"],
+                    "job_id": row["job_id"],
+                    "scheduler_dispatch_line": 0,
+                    "scheduler_generation": 0,
+                    "terminal": "unassigned-p50-failure",
+                    "terminal_ms": raw["finished"],
+                    "turn": raw["turn"],
+                }
+            )
+            assignment_lifecycle.append(
+                {"attempts": [], "job_id": row["job_id"]}
+            )
+            continue
         records = [item["scheduler_record"] for item in attempts]
         missing_result_identities = raw.get(
             "missing_compile_result_identities", []
         )
         source_transfer_failures = raw.get("failed_p50_source_transfers", [])
+        uncommitted_transport_failures = raw.get(
+            "failed_p50_uncommitted_transports", []
+        )
         for missing in missing_result_identities:
             attempt_index = missing["attempt_index"]
             if not 0 <= attempt_index < len(records):
@@ -6558,6 +7060,20 @@ def _observations(
             }:
                 raise CollectError(
                     f"{row['job_id']}: source-transfer loss disagrees with the "
+                    "scheduler terminal"
+                )
+        for failure in uncommitted_transport_failures:
+            attempt_index = failure["attempt_index"]
+            if not 0 <= attempt_index < len(records):
+                raise CollectError(
+                    f"{row['job_id']}: uncommitted transport loss names an invalid attempt"
+                )
+            if records[attempt_index]["terminal"] not in {
+                "cancellation",
+                "process-loss-recovery",
+            }:
+                raise CollectError(
+                    f"{row['job_id']}: uncommitted transport loss disagrees with the "
                     "scheduler terminal"
                 )
         if any(
@@ -6656,11 +7172,19 @@ def _observations(
             if len(missing_result_identities) == 1
             and missing_result_identities[0]["attempt_index"] == 0
             and not source_transfer_failures
+            and not uncommitted_transport_failures
             else "source-transfer-loss"
             if not missing_result_identities
             and len(source_transfer_failures) == 1
             and source_transfer_failures[0]["attempt_index"] == 0
             and first["terminal"] == "cancellation"
+            and not uncommitted_transport_failures
+            else "uncommitted-transport-loss"
+            if not missing_result_identities
+            and not source_transfer_failures
+            and len(uncommitted_transport_failures) == 1
+            and uncommitted_transport_failures[0]["attempt_index"] == 0
+            and first["terminal"] in {"cancellation", "process-loss-recovery"}
             else "worker-restart-loss"
             if not missing_result_identities
             and first["terminal"] == "process-loss-recovery"
@@ -6680,7 +7204,8 @@ def _observations(
             and final["terminal"] == "completion"
             and retry_failure_reason is not None
             and (
-                retry_failure_reason != "source-transfer-loss"
+                retry_failure_reason
+                not in {"source-transfer-loss", "uncommitted-transport-loss"}
                 or first["worker"] != final["worker"]
             )
         ):
