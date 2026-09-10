@@ -1824,10 +1824,12 @@ def test_event_gate_pause_drains_then_resume_is_atomic(tmp_path: Path) -> None:
     marker = active / "job-1-99.tsv"
     marker.write_text("1\t99\t0\t1\n", encoding="ascii")
 
-    def remove_after_pause() -> None:
+    def remove_after_pause(expected_epoch: int = 1) -> None:
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
-            if (gate / "state.tsv").read_text(encoding="ascii") == "PAUSE\t1\n":
+            if (gate / "state.tsv").read_text(encoding="ascii") == (
+                f"PAUSE\t{expected_epoch}\n"
+            ):
                 marker.unlink()
                 return
             time.sleep(0.005)
@@ -1879,6 +1881,10 @@ def test_event_gate_pause_drains_then_resume_is_atomic(tmp_path: Path) -> None:
     assert json.loads(resumed.stdout)["status"] == "OPEN"
     assert (gate / "state.tsv").read_text() == "OPEN\t1\n"
 
+    marker = active / "job-2-99.tsv"
+    marker.write_text("2\t99\t1\t1\n", encoding="ascii")
+    remover = threading.Thread(target=remove_after_pause, args=(2,))
+    remover.start()
     subprocess.run(
         (
             sys.executable,
@@ -1896,6 +1902,8 @@ def test_event_gate_pause_drains_then_resume_is_atomic(tmp_path: Path) -> None:
         text=True,
         timeout=3,
     )
+    remover.join(timeout=1)
+    assert not remover.is_alive()
     aborted = subprocess.run(
         (
             sys.executable,
@@ -1915,6 +1923,90 @@ def test_event_gate_pause_drains_then_resume_is_atomic(tmp_path: Path) -> None:
     )
     assert json.loads(aborted.stdout)["status"] == "ABORT"
     assert (gate / "state.tsv").read_text() == "ABORT\t2\n"
+
+
+def test_event_gate_pause_waits_for_first_active_marker_before_closing(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workload" / "A"
+    gate = root / "event-gate"
+    active = gate / "active"
+    active.mkdir(parents=True)
+    state = gate / "state.tsv"
+    state.write_text("OPEN\t0\n", encoding="ascii")
+    (gate / "state.lock").touch()
+
+    paused = subprocess.Popen(
+        (
+            sys.executable,
+            "-c",
+            GATE_CONTROL_SCRIPT,
+            "pause",
+            str(root),
+            "C1",
+            "A",
+            "1",
+            "2",
+        ),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    time.sleep(0.1)
+    assert paused.poll() is None
+    assert state.read_text(encoding="ascii") == "OPEN\t0\n"
+
+    marker = active / "job-1-99.tsv"
+    marker.write_text("1\t99\t0\t1\n", encoding="ascii")
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if state.read_text(encoding="ascii") == "PAUSE\t1\n":
+            marker.unlink()
+            break
+        time.sleep(0.005)
+    else:
+        paused.kill()
+        raise AssertionError("event gate did not close after the active marker appeared")
+
+    stdout, stderr = paused.communicate(timeout=2)
+    assert paused.returncode == 0, stderr
+    receipt = json.loads(stdout)
+    assert receipt["active_before"] == 1
+    assert receipt["active_after"] == 0
+    assert receipt["status"] == "PAUSED"
+
+
+def test_event_gate_pause_timeout_without_active_work_leaves_gate_open(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workload" / "A"
+    gate = root / "event-gate"
+    (gate / "active").mkdir(parents=True)
+    state = gate / "state.tsv"
+    state.write_text("OPEN\t0\n", encoding="ascii")
+    (gate / "state.lock").touch()
+
+    paused = subprocess.run(
+        (
+            sys.executable,
+            "-c",
+            GATE_CONTROL_SCRIPT,
+            "pause",
+            str(root),
+            "C1",
+            "A",
+            "1",
+            "0.1",
+        ),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+
+    assert paused.returncode != 0
+    assert "admission timeout waiting for an active marker" in paused.stderr
+    assert state.read_text(encoding="ascii") == "OPEN\t0\n"
 
 
 def test_event_gate_resume_snapshots_boundary_marker_before_wrapper_release(

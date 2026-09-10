@@ -754,25 +754,42 @@ def markers():
     return result
 
 started_ms = time.time_ns() // 1_000_000
-with lock_path.open("r+") as lock:
-    fcntl.flock(lock, fcntl.LOCK_EX)
-    before_mode, before_epoch = read_state()
-    # Workload admission takes this same lock before creating an active
-    # marker.  Snapshot the pre-transition set while holding it, before a
-    # fast completion can observe PAUSE and remove the last marker.
-    initial = markers()
-    if action in {"pause", "quiesce"}:
-        if before_mode == "OPEN" and before_epoch < epoch:
-            write_state("PAUSE" if action == "pause" else "QUIESCE")
-        elif (before_mode, before_epoch) not in {
-            ("PAUSE", epoch),
-            ("QUIESCE", epoch),
-        }:
+deadline = time.monotonic() + timeout_s
+if action in {"pause", "quiesce"}:
+    target_mode = "PAUSE" if action == "pause" else "QUIESCE"
+    while True:
+        with lock_path.open("r+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            before_mode, before_epoch = read_state()
+            # Workload admission takes this same lock before creating an
+            # active marker.  Do not close an OPEN gate until this client has
+            # contributed a positive in-flight witness.  Multi-client job
+            # triggers are global, so one client's driver can legitimately
+            # reach the trigger while a peer is still doing startup work.
+            initial = markers()
+            if before_mode == "OPEN" and before_epoch < epoch:
+                if initial:
+                    write_state(target_mode)
+                    break
+            elif (before_mode, before_epoch) in {
+                ("PAUSE", epoch),
+                ("QUIESCE", epoch),
+            }:
+                break
+            else:
+                raise SystemExit(
+                    f"event-gate {action} expected an earlier OPEN epoch, got {before_mode}/{before_epoch}"
+                )
+        if time.monotonic() >= deadline:
             raise SystemExit(
-                f"event-gate {action} expected an earlier OPEN epoch, got {before_mode}/{before_epoch}"
+                f"event-gate {action} admission timeout waiting for an active marker"
             )
-        target_mode = "PAUSE" if action == "pause" else "QUIESCE"
-    else:
+        time.sleep(min(0.05, max(0.001, deadline - time.monotonic())))
+else:
+    with lock_path.open("r+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        before_mode, before_epoch = read_state()
+        initial = markers()
         target_mode = "OPEN" if action == "resume" else "ABORT"
         if (before_mode, before_epoch) in {
             ("PAUSE", epoch),
@@ -791,7 +808,6 @@ with lock_path.open("r+") as lock:
         # A serialized boundary wrapper also takes this lock before observing
         # epoch 1, so its marker cannot disappear before this exact receipt.
         release_snapshot = markers()
-deadline = time.monotonic() + timeout_s
 if action in {"pause", "quiesce"}:
     current = initial
     while current:
