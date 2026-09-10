@@ -2,7 +2,7 @@
   "schema": "icefarm-scenario-v1",
   "id": "S80-zstd-route",
   "shape": "S'C'F'",
-  "images": {"new": "p50s4-1374a980"},
+  "images": {"new": "p50s4-f8a69218"},
   "instances": [
     {"name": "S1", "role": "S", "host": "tt-quietbox3", "image": "new", "env": {"ICECC_P50_PROFILE": "ZSTD_ROUTE"}},
     {"name": "F1", "role": "F", "host": "tt-quietbox3", "image": "new", "slots": 24},
