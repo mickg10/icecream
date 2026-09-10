@@ -1858,7 +1858,11 @@ def _event_log(
         elif scheduler_active_loss:
             _validate_scheduler_active_loss_receipt(
                 event["receipt"], event, scenario, index,
-                farm=farm, plan=plan, preflight=preflight, evidence=evidence,
+                farm=farm,
+                plan=plan,
+                preflight=preflight,
+                evidence=evidence,
+                validate_retained_evidence=validate_client_evidence,
             )
         elif client_route_restart:
             _validate_client_route_restart_receipt(
@@ -1884,6 +1888,7 @@ def _validate_scheduler_active_loss_receipt(
     plan: dict[str, Any] | None,
     preflight: Mapping[str, Any] | None = None,
     evidence: Path | None,
+    validate_retained_evidence: bool = True,
 ) -> None:
     prefix = f"events.json event {index} scheduler active loss"
     if farm is None or plan is None or evidence is None:
@@ -2314,12 +2319,13 @@ def _validate_scheduler_active_loss_receipt(
                 for item in plan["topology"]["instances"] if item.get("role") == "F"
             )):
         raise CollectError(f"{prefix} lacks complete fresh scheduler/F/C rejoin evidence")
-    log = _text(_one_role_log(evidence, worker))
-    tail = log.encode("utf-8")[offset:].decode("utf-8", "replace")
-    pid, pgid = leader.get("pid"), leader.get("pgid")
-    for phase in ("TERM", "KILL", "settled"):
-        if not re.search(rf"session quiescence {phase} compiler pid={pid} pgid={pgid} generation=[0-9]+", tail):
-            raise CollectError(f"{prefix} lacks post-offset F {phase} witness")
+    if validate_retained_evidence:
+        log = _text(_one_role_log(evidence, worker))
+        tail = log.encode("utf-8")[offset:].decode("utf-8", "replace")
+        pid, pgid = leader.get("pid"), leader.get("pgid")
+        for phase in ("TERM", "KILL", "settled"):
+            if not re.search(rf"session quiescence {phase} compiler pid={pid} pgid={pgid} generation=[0-9]+", tail):
+                raise CollectError(f"{prefix} lacks post-offset F {phase} witness")
 
 
 def _validate_disk_fill_receipt(

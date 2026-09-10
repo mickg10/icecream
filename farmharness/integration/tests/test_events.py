@@ -5,6 +5,7 @@ import http.server
 import inspect
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -781,6 +782,27 @@ def test_active_scheduler_loss_collection_binds_post_offset_product_witness(
     (tmp_path / "events").mkdir()
     (tmp_path / "events" / "events.json").write_text(json.dumps({"events": [event]}))
     assert _event_log(tmp_path, scenario, farm=farm, plan=plan) == [event]
+
+    # The first phase of live collection authenticates the event receipt before
+    # it freezes containers and copies their logs.  It must defer only the
+    # retained-log witness checks; the second phase below remains fail-closed.
+    shutil.rmtree(tmp_path / "diagnostics")
+    assert _event_log(
+        tmp_path,
+        scenario,
+        farm=farm,
+        plan=plan,
+        validate_client_evidence=False,
+    ) == [event]
+    with pytest.raises(CollectError, match="post-offset F TERM witness"):
+        _event_log(tmp_path, scenario, farm=farm, plan=plan)
+
+    log.parent.mkdir(parents=True)
+    log.write_text(
+        "session quiescence TERM compiler pid=41 pgid=41 generation=7\n"
+        "session quiescence KILL compiler pid=41 pgid=41 generation=7\n"
+        "session quiescence settled compiler pid=41 pgid=41 generation=7\n"
+    )
     log.write_text(log.read_text().replace("pgid=41", "pgid=42"))
     with pytest.raises(CollectError, match="post-offset F TERM witness"):
         _event_log(tmp_path, scenario, farm=farm, plan=plan)
