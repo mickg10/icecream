@@ -120,6 +120,21 @@ void test_owned_fd_and_fail_closed_validation() {
     CHECK(::unlink(path) == 0);
 }
 
+void test_owned_fd_release_transfers_single_ownership() {
+    char path[] = "/tanksmall/scratch/ictmp/p50-owned-source-release-XXXXXX";
+    const int fd = ::mkstemp(path);
+    CHECK(fd >= 0);
+    CHECK(::unlink(path) == 0);
+    {
+        OwnedSourceFd source(fd);
+        CHECK(source.get() == fd);
+        CHECK(source.release() == fd);
+        CHECK(!source);
+    }
+    CHECK(::fcntl(fd, F_GETFD) >= 0);
+    CHECK(::close(fd) == 0);
+}
+
 void test_adopted_fd_factory_exact_transfer() {
     asio::io_context context;
     tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
@@ -707,6 +722,7 @@ int main() {
     test_explicit_route_operations_bind_request_and_deadline();
     test_explicit_route_retry_is_bounded_then_replaced();
     test_owned_fd_and_fail_closed_validation();
+    test_owned_fd_release_transfers_single_ownership();
     test_adopted_fd_factory_exact_transfer();
     test_absolute_deadline_is_required();
     test_disconnected_retry_is_bounded_and_exactly_once();

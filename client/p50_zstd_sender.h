@@ -30,6 +30,11 @@ public:
     OwnedSourceFd& operator=(OwnedSourceFd&& other) noexcept;
 
     [[nodiscard]] int get() const noexcept { return fd_; }
+    [[nodiscard]] int release() noexcept {
+        const int result = fd_;
+        fd_ = -1;
+        return result;
+    }
     [[nodiscard]] explicit operator bool() const noexcept { return fd_ >= 0; }
 
 private:

@@ -61,7 +61,7 @@ contract() {
     require_text "$root/client/remote.cpp" 'receive_p50_cache_fd_reply' || return 1
     require_text "$root/client/remote.cpp" 'begin_authenticated' || return 1
     require_text "$root/client/remote.cpp" 'make_source_transfer_operation' || return 1
-    require_text "$root/client/remote.cpp" 'F_DUPFD_CLOEXEC' || return 1
+    require_text "$root/client/remote.cpp" 'source.release()' || return 1
     require_text "$root/client/remote.cpp" 'control.advance' || return 1
     for field in wire_job_id assignment_epoch assignment_nonce selected_f_host \
         selected_f_ordinary_port selected_f_cache_port cache_protocol cache_profile \
@@ -173,7 +173,7 @@ for pair in \
     "client/remote.cpp|receive_p50_cache_fd_reply" \
     "client/remote.cpp|begin_authenticated" \
     "client/remote.cpp|make_source_transfer_operation" \
-    "client/remote.cpp|F_DUPFD_CLOEXEC" \
+    "client/remote.cpp|source.release()" \
     "client/Makefile.am|libp50localtransport.a" \
     "client/remote.cpp|std::chrono::seconds(120)" \
     "client/remote.cpp|ICECC_P50_PREPROCESSED_CAPTURE" \

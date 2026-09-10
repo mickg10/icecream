@@ -401,12 +401,6 @@ icecc::p50::local::P50SourceTransferResult transfer_p50_source(
         return p50_transfer_error(3);
     }
 
-    const int source_dup = ::fcntl(source.get(), F_DUPFD_CLOEXEC, 0);
-    if (source_dup < 0) {
-        ::close(control_fd);
-        return p50_transfer_error(4);
-    }
-
     P50SourceTransferRequest request;
     request.wire_job_id = assignment.job_id;
     request.assignment_epoch = assignment.assignmentEpoch();
@@ -421,7 +415,6 @@ icecc::p50::local::P50SourceTransferResult transfer_p50_source(
     request.source_request_id = assignment.assignmentNonce();
     request.source_mode = *source_mode;
     if (!request.valid()) {
-        ::close(source_dup);
         ::close(control_fd);
         return p50_transfer_error(5);
     }
@@ -437,8 +430,14 @@ icecc::p50::local::P50SourceTransferResult transfer_p50_source(
     credentials.gid = control_identity.peer_gid;
 
     DaemonControlOperation control;
+    // The complete source is already an owned O_CLOEXEC descriptor.  Move
+    // that ownership directly into the authenticated operation: duplicating
+    // it here added a needless transient failure/FD-pressure boundary before
+    // any P50 transfer could start. begin_authenticated consumes the supplied
+    // descriptor on every return path.
+    const int source_fd = source.release();
     const DaemonControlStatus started = control.begin_authenticated(
-        control_fd, operation, source_dup, credentials, identity, deadline,
+        control_fd, operation, source_fd, credentials, identity, deadline,
         DaemonControlLimits{}, DaemonControlFdOwnership::Owned);
     if (started != DaemonControlStatus::InProgress)
         return p50_transfer_error(6);
