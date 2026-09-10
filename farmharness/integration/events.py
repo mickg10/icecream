@@ -309,7 +309,6 @@ while time.monotonic() < deadline:
             or before["pid"] != before["pgid"]):
         time.sleep(0.05)
         continue
-    listener = listener_probe(web_port, before_daemon)
     os.killpg(before["pgid"], signal.SIGSTOP)
     stopped_owned = True
     try:
@@ -329,6 +328,11 @@ while time.monotonic() < deadline:
                 or not same_identity(stopped, before)
                 or stopped["state"] not in {"T", "t"}):
             raise SystemExit("compiler group did not stop with its authenticated identity")
+        # Bind the listener/API witness after SIGSTOP.  The exact direct
+        # compiler can otherwise complete during this comparatively slow
+        # HTTP + kernel-socket probe.  Any probe failure remains inside the
+        # fail-safe block and resumes only the unchanged stopped group.
+        listener = listener_probe(web_port, before_daemon)
         print(json.dumps({"daemon": before_daemon, "leader": before, "listener": listener,
                           "schema": "icefarm-compiler-group-stop-v1", "stopped": stopped,
                           "stopped_ms": time.time_ns() // 1000000}, sort_keys=True, separators=(",", ":")),
@@ -3142,7 +3146,10 @@ class EventProducer:
         }
 
     def _authenticated_scheduler_active_loss(
-        self, event: TimelineEvent, instance: Mapping[str, Any], identifier: str
+        self,
+        event: TimelineEvent,
+        instance: Mapping[str, Any],
+        scheduler_before: Mapping[str, Any],
     ) -> dict[str, Any]:
         with self._lock:
             turn = self._active_turn
@@ -3162,8 +3169,14 @@ class EventProducer:
             "ICECC_WEB_HOSTPORT": f"127.0.0.1:{web_port}",
         }
         expected_worker_image_id = self._preflight_container_image_id(worker)
-        before = self._inspect(event.instance)
-        if before.get("id") != identifier or before.get("running") is not True:
+        identifier = scheduler_before.get("id")
+        if (
+            not isinstance(identifier, str)
+            or SHA256_RE.fullmatch(identifier) is None
+            or scheduler_before.get("running") is not True
+            or not isinstance(scheduler_before.get("started_at"), str)
+            or not scheduler_before["started_at"]
+        ):
             raise EventError("scheduler container identity changed before active loss")
         worker_before = self._inspect(
             worker["name"],
@@ -3177,19 +3190,10 @@ class EventProducer:
             or not worker_before["started_at"]
         ):
             raise EventError("active scheduler loss has no authenticated running F")
-        scheduler_log = self._readiness_baseline(instance)
-        worker_log = self._readiness_baseline(worker)
-        client_baselines = {
-            client["name"]: self._readiness_baseline(client) for client in clients
-        }
-        client_routes_before = {
-            client["name"]: (
-                self._client_route_state(client)
-                if self._client_cache_expected(client)
-                else None
-            )
-            for client in clients
-        }
+        # The active compiler can legitimately finish in roughly one second.
+        # Capture and STOP it immediately after the minimum S/F incarnation
+        # authentication.  Slower log baselines and C route snapshots are
+        # collected below while this exact process group is safely stopped.
         result = self._invoke(self.factory.make(
             phase="event.scheduler-loss-authenticate-compiler",
             host=worker["host"], instance=worker["name"], transport=_docker_transport(self.farm, worker["host"]),
@@ -3283,6 +3287,20 @@ class EventProducer:
                 raise EventError(
                     "compiler listener is not bound to the authenticated F runtime"
                 )
+            scheduler_log = self._readiness_baseline(instance)
+            worker_log = self._readiness_baseline(worker)
+            client_baselines = {
+                client["name"]: self._readiness_baseline(client)
+                for client in clients
+            }
+            client_routes_before = {
+                client["name"]: (
+                    self._client_route_state(client)
+                    if self._client_cache_expected(client)
+                    else None
+                )
+                for client in clients
+            }
             assignment_result = self._invoke(
                 self.factory.make(
                     phase="event.scheduler-loss-authenticate-assignment",
@@ -3386,6 +3404,16 @@ class EventProducer:
                 raise EventError(
                     "compiler assignment generation disagrees with scheduler history"
                 )
+            scheduler_pre_kill = self._inspect(event.instance)
+            if (
+                scheduler_pre_kill.get("id") != identifier
+                or scheduler_pre_kill.get("running") is not True
+                or scheduler_pre_kill.get("started_at")
+                != scheduler_before.get("started_at")
+            ):
+                raise EventError(
+                    "scheduler container incarnation changed before active loss"
+                )
             self._invoke(
                 self.factory.make(
                     phase="event.scheduler-loss-kill",
@@ -3487,7 +3515,7 @@ class EventProducer:
             argv=docker_argv(self.farm, instance["host"], ("container", "start", identifier)),
         ))
         after = self._inspect(event.instance)
-        if after.get("id") != identifier or after.get("running") is not True or after.get("started_at") == before.get("started_at"):
+        if after.get("id") != identifier or after.get("running") is not True or after.get("started_at") == scheduler_before.get("started_at"):
             raise EventError("scheduler active-loss restart did not preserve container identity")
         wait = self._invoke(self.factory.make(
             phase="event.scheduler-loss-wait-compiler-group",
@@ -3585,7 +3613,7 @@ class EventProducer:
             raise EventError("F authority changed across scheduler active loss")
         return {
             "action": event.action, "after": {"container_id": after["id"], "started_at": after["started_at"]},
-            "before": {"container_id": before["id"], "started_at": before["started_at"]},
+            "before": {"container_id": scheduler_before["id"], "started_at": scheduler_before["started_at"]},
             "compiler": {
                 "container_id": worker_before["id"], "daemon": parent, "leader": leader,
                 "stopped": stopped, "group_gone": group_gone,
@@ -4779,7 +4807,7 @@ class EventProducer:
             release: dict[str, dict[str, Any]] = {}
             try:
                 receipt = self._authenticated_scheduler_active_loss(
-                    event, instance, identifier
+                    event, instance, before
                 )
                 self._gate_controls(
                     clients,

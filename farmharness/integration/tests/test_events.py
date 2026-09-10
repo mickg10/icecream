@@ -604,6 +604,11 @@ def test_release_script_resumes_only_the_exact_stopped_group() -> None:
     assert "same_identity(stopped, before)" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "stop_deadline = time.monotonic() + 2" in ACTIVE_COMPILER_STOP_SCRIPT
     assert "os.killpg(before[\"pgid\"], signal.SIGSTOP)" in ACTIVE_COMPILER_STOP_SCRIPT
+    assert ACTIVE_COMPILER_STOP_SCRIPT.index(
+        'os.killpg(before["pgid"], signal.SIGSTOP)'
+    ) < ACTIVE_COMPILER_STOP_SCRIPT.index(
+        "listener = listener_probe(web_port, before_daemon)"
+    )
     assert "compiler PID was reused" in ACTIVE_COMPILER_WAIT_SCRIPT
     assert "value[0] == pgid" in ACTIVE_COMPILER_WAIT_SCRIPT
 
@@ -665,7 +670,7 @@ def test_active_scheduler_loss_releases_serial_admission_after_rejoin(
     producer._container = lambda _name: ("container", scheduler)
     producer._inspect = lambda _name: {"id": "a" * 64}
     producer._authenticated_scheduler_active_loss = (
-        lambda _event, _instance, _identifier: {
+        lambda _event, _instance, _before: {
             "schema": "icefarm-scheduler-active-loss-v5"
         }
     )
@@ -739,6 +744,28 @@ def test_active_scheduler_loss_refreshes_selection_ceiling_after_assignment(
     )
     scheduler_kill = source.index('phase="event.scheduler-loss-kill"')
     assert assignment < refreshed < scheduler_kill
+
+
+def test_active_scheduler_loss_stops_compiler_before_slow_evidence_reads() -> None:
+    source = inspect.getsource(EventProducer._authenticated_scheduler_active_loss)
+    worker_identity = source.index("worker_before = self._inspect")
+    compiler_stop = source.index(
+        'phase="event.scheduler-loss-authenticate-compiler"'
+    )
+    scheduler_baseline = source.index(
+        "scheduler_log = self._readiness_baseline(instance)"
+    )
+    client_route = source.index("client_routes_before =")
+    assignment = source.index(
+        'phase="event.scheduler-loss-authenticate-assignment"'
+    )
+    scheduler_kill = source.index('phase="event.scheduler-loss-kill"')
+    scheduler_reinspect = source.index("self._inspect(event.instance)")
+
+    assert worker_identity < compiler_stop
+    assert compiler_stop < scheduler_baseline < client_route < assignment
+    assert assignment < scheduler_reinspect < scheduler_kill
+    assert source.count("self._inspect(event.instance)") == 2
 
 
 def test_active_scheduler_loss_uses_preflight_host_native_container_image(
