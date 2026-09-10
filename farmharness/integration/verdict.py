@@ -909,7 +909,9 @@ def _lifecycle_final_dispatch_ms(item: Mapping[str, Any]) -> Any:
 
 
 def _authenticated_strict_p50_retry_ids(
-    observations: Mapping[str, Any], rows: Sequence[Mapping[str, Any]]
+    bundle: Mapping[str, Any],
+    observations: Mapping[str, Any],
+    rows: Sequence[Mapping[str, Any]],
 ) -> tuple[set[str], set[str]]:
     """Validate successful strict-P50 retries against independent witnesses."""
 
@@ -978,6 +980,136 @@ def _authenticated_strict_p50_retry_ids(
                 continue
             failed_by_attempt[identity] = item
 
+    source_transfers = observations.get("failed_p50_source_transfers")
+    source_transfer_raw = (
+        source_transfers.get("records")
+        if isinstance(source_transfers, Mapping)
+        else None
+    )
+    source_transfer_by_attempt: dict[tuple[str, int], Mapping[str, Any]] = {}
+    source_transfer_duplicates: set[tuple[str, int]] = set()
+    invalid_source_transfer = False
+    source_transfer_fields = {
+        "assignment_epoch",
+        "assignment_identity_line",
+        "assignment_line",
+        "assignment_nonce",
+        "attempt_index",
+        "c_guid",
+        "compile_identity_present",
+        "error",
+        "failed_endpoint",
+        "failure_line",
+        "profile",
+        "retry_assignment_epoch",
+        "retry_assignment_identity_line",
+        "retry_assignment_line",
+        "retry_assignment_nonce",
+        "retry_c_guid",
+        "retry_endpoint",
+        "retry_line",
+        "retry_scheduler_job",
+        "retry_tu_seq",
+        "row_job_id",
+        "scheduler_job",
+        "source_result_present",
+        "status",
+        "transfer_attempts",
+        "tu_seq",
+        "worker",
+    }
+    if isinstance(source_transfer_raw, list):
+        for item in source_transfer_raw:
+            ordered_lines = (
+                "assignment_identity_line",
+                "assignment_line",
+                "failure_line",
+                "retry_line",
+                "retry_assignment_identity_line",
+                "retry_assignment_line",
+            )
+            if (
+                not isinstance(item, Mapping)
+                or set(item) != source_transfer_fields
+                or not _is_int(item.get("assignment_epoch"), minimum=1)
+                or not _is_int(item.get("assignment_nonce"), minimum=1)
+                or not _is_int(item.get("attempt_index"))
+                or item.get("attempt_index") != 0
+                or not _is_int(item.get("c_guid"), minimum=1)
+                or item.get("compile_identity_present") is not False
+                or not _is_int(item.get("error"), minimum=1)
+                or not isinstance(item.get("failed_endpoint"), str)
+                or not item["failed_endpoint"]
+                or item.get("profile") != "P29V1"
+                or not _is_int(item.get("retry_assignment_epoch"), minimum=1)
+                or not _is_int(item.get("retry_assignment_nonce"), minimum=1)
+                or not _is_int(item.get("retry_c_guid"), minimum=1)
+                or item.get("retry_c_guid") != item.get("c_guid")
+                or not isinstance(item.get("retry_endpoint"), str)
+                or not item["retry_endpoint"]
+                or item.get("retry_endpoint") == item.get("failed_endpoint")
+                or not _is_int(item.get("retry_scheduler_job"), minimum=1)
+                or not _is_int(item.get("retry_tu_seq"))
+                or (
+                    item.get("retry_scheduler_job"),
+                    item.get("retry_assignment_epoch"),
+                    item.get("retry_assignment_nonce"),
+                )
+                == (
+                    item.get("scheduler_job"),
+                    item.get("assignment_epoch"),
+                    item.get("assignment_nonce"),
+                )
+                or not isinstance(item.get("row_job_id"), str)
+                or not item["row_job_id"]
+                or not _is_int(item.get("scheduler_job"), minimum=1)
+                or item.get("source_result_present") is not False
+                or not _is_int(item.get("status"), minimum=1)
+                or not _is_int(item.get("transfer_attempts"))
+                or not _is_int(item.get("tu_seq"))
+                or not isinstance(item.get("worker"), str)
+                or not item["worker"]
+                or not all(
+                    _is_int(item.get(name), minimum=1) for name in ordered_lines
+                )
+                or list(map(item.get, ordered_lines))
+                != sorted(map(item.get, ordered_lines))
+                or len(set(map(item.get, ordered_lines))) != len(ordered_lines)
+            ):
+                invalid_source_transfer = True
+                continue
+            identity = (
+                _job_id(item.get("row_job_id"), "@failed-source-transfer"),
+                item["attempt_index"],
+            )
+            if identity in source_transfer_by_attempt:
+                source_transfer_duplicates.add(identity)
+                continue
+            source_transfer_by_attempt[identity] = item
+
+    planned_worker_endpoints: dict[str, str] = {}
+    plan = bundle.get("plan")
+    topology = plan.get("topology") if isinstance(plan, Mapping) else None
+    instances = topology.get("instances") if isinstance(topology, Mapping) else None
+    ports = plan.get("ports") if isinstance(plan, Mapping) else None
+    instance_ports = ports.get("instances") if isinstance(ports, Mapping) else None
+    if isinstance(instances, list) and isinstance(instance_ports, Mapping):
+        for instance in instances:
+            if not isinstance(instance, Mapping) or instance.get("role") != "F":
+                continue
+            name = instance.get("name")
+            address = instance.get("address")
+            port = instance_ports.get(name) if isinstance(name, str) else None
+            if (
+                isinstance(name, str)
+                and name
+                and isinstance(address, str)
+                and address
+                and _is_int(port, minimum=1)
+                and name not in planned_worker_endpoints
+            ):
+                planned_worker_endpoints[name] = f"{address}:{port}"
+
     process_raw = observations.get("process_loss_recovery_bindings")
     process_bindings: set[tuple[str, int, int, str]] = set()
     if isinstance(process_raw, list):
@@ -1028,12 +1160,15 @@ def _authenticated_strict_p50_retry_ids(
         lifecycle = lifecycles.get(job_id)
         attempts = assignment.get("attempts") if isinstance(assignment, Mapping) else None
         missing = failed_by_attempt.get((job_id, 0))
+        source_transfer = source_transfer_by_attempt.get((job_id, 0))
         reason = binding.get("failure_reason")
         expected_first_terminals = (
             {"process-loss-recovery"}
             if reason == "worker-restart-loss"
             else {"cancellation", "completion"}
             if reason == "result-stream-loss"
+            else {"cancellation"}
+            if reason == "source-transfer-loss"
             else set()
         )
         first = attempts[0] if isinstance(attempts, list) and len(attempts) == 2 else None
@@ -1061,6 +1196,23 @@ def _authenticated_strict_p50_retry_ids(
             )
             in process_bindings
         )
+        source_transfer_valid = (
+            reason == "source-transfer-loss"
+            and isinstance(source_transfer, Mapping)
+            and missing is None
+            and source_transfer.get("attempt_index") == 0
+            and source_transfer.get("row_job_id") == job_id
+            and source_transfer.get("scheduler_job")
+            == binding.get("first_scheduler_job")
+            and source_transfer.get("retry_scheduler_job")
+            == binding.get("final_scheduler_job")
+            and source_transfer.get("worker") == binding.get("first_worker")
+            and binding.get("first_worker") != binding.get("final_worker")
+            and source_transfer.get("failed_endpoint")
+            == planned_worker_endpoints.get(binding.get("first_worker"))
+            and source_transfer.get("retry_endpoint")
+            == planned_worker_endpoints.get(binding.get("final_worker"))
+        )
         integers = (
             "final_dispatch_ms",
             "final_generation",
@@ -1078,7 +1230,8 @@ def _authenticated_strict_p50_retry_ids(
             and isinstance(final, Mapping)
             and isinstance(lifecycle, Mapping)
             and (job_id, 0) not in failed_duplicates
-            and (missing_valid or process_loss_valid)
+            and (job_id, 0) not in source_transfer_duplicates
+            and (missing_valid or process_loss_valid or source_transfer_valid)
             and all(_is_int(binding.get(name), minimum=1) for name in integers)
             and isinstance(binding.get("first_worker"), str)
             and bool(binding["first_worker"])
@@ -1128,6 +1281,15 @@ def _authenticated_strict_p50_retry_ids(
         )
     ):
         bad.add("@observations:failed_p50_result_identities")
+    if invalid_source_transfer or source_transfer_duplicates or (
+        source_transfers is not None
+        and (
+            not isinstance(source_transfers, Mapping)
+            or not isinstance(source_transfer_raw, list)
+            or source_transfers.get("record_count") != len(source_transfer_raw)
+        )
+    ):
+        bad.add("@observations:failed_p50_source_transfers")
     return authenticated, bad
 
 
@@ -4818,7 +4980,7 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
 
     engagement_mode = expect.get("engagement")
     strict_retry_ids, strict_retry_bad = _authenticated_strict_p50_retry_ids(
-        observations, valid_rows
+        bundle, observations, valid_rows
     )
     late_result_ids, late_result_bad = _authenticated_strict_p50_late_result_ids(
         bundle, observations, valid_rows, scenario

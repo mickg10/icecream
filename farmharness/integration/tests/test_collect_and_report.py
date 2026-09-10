@@ -13,6 +13,7 @@ from farmharness.integration.tests import farm_fixture
 from farmharness.integration import farmtest, report
 from farmharness.integration.collect import (
     CollectError,
+    _client_assignments,
     _canary_assignment_claims,
     _checkpoint_result_path,
     _assignment_preference,
@@ -26,6 +27,7 @@ from farmharness.integration.collect import (
     _one_role_log,
     _p29_interner_faults,
     _p50_assignment_identity_marker,
+    _p50_assignment_identity_evidence,
     _retained_log_witness,
     _retained_log_witness_exact,
     _parse_logins,
@@ -35,6 +37,7 @@ from farmharness.integration.collect import (
     _snapshot_live_evidence,
     _source_candidates_for_assignment,
     _source_results,
+    _source_transfer_failure_observation,
     _successful_strict_p50_late_result_binding,
     _transition_target_env,
     _validate_preexposure_redispatches,
@@ -1910,6 +1913,116 @@ def _make_fresh_p50_retry_fixture(plan: dict[str, object], root: Path) -> None:
         "P50 CompileFile attached exact P29V1 input for job 3\n",
         encoding="utf-8",
     )
+
+
+def _source_transfer_failure_kwargs(
+    *, mutation: str | None = None
+) -> dict[str, object]:
+    first_endpoint = "10.0.27.101:23003"
+    retry_endpoint = (
+        first_endpoint if mutation == "same-endpoint" else "10.0.27.56:23004"
+    )
+    failure = (
+        "P29V1 cache source transfer failed closed (status 2, error 4, attempts 0)"
+    )
+    retry = (
+        "P50 assignment failed; requesting one fresh strict-P50 remote assignment; "
+        f"avoiding failed endpoint {first_endpoint}"
+    )
+    if mutation == "wrong-failed-endpoint":
+        retry = retry.replace(first_endpoint, "10.0.27.99:23999")
+    elif mutation == "status-zero":
+        failure = failure.replace("status 2", "status 0")
+    elif mutation == "missing-retry":
+        retry = "retry marker absent"
+    elif mutation == "duplicate-failure":
+        failure += "\n" + failure
+    elif mutation == "reversed-markers":
+        failure, retry = retry, failure
+    retry_identity_job = 4 if mutation == "wrong-retry-identity" else 3
+    first_identity = (
+        "P50 assignment identity bound for job 2 epoch 1 nonce 1 "
+        "c_guid 1 tu_seq 9\n"
+    )
+    if mutation == "duplicate-first-identity":
+        first_identity += first_identity
+    log = (
+        first_identity
+        + f"ICECC[2] 2026-09-05 01:00:04: Have to use host {first_endpoint} "
+        "- Job ID: 2 - env: x86_64\n"
+        f"{failure}\n"
+        f"{retry}\n"
+        f"P50 assignment identity bound for job {retry_identity_job} epoch 1 "
+        "nonce 2 c_guid 1 tu_seq 10\n"
+        f"ICECC[3] 2026-09-05 01:00:06: Have to use host {retry_endpoint} "
+        "- Job ID: 3 - env: x86_64\n"
+    )
+    assignments = _client_assignments(log, "source-transfer-fixture")
+    assignments[0]["worker"] = "F1"
+    assignments[1]["worker"] = "F2" if retry_endpoint != first_endpoint else "F1"
+    identities = [
+        _p50_assignment_identity_evidence(
+            log,
+            assignment["scheduler_job"],
+            after_line=(assignments[index - 1]["line"] if index else 0),
+            before_line=assignment["line"] + 1,
+        )
+        for index, assignment in enumerate(assignments)
+    ]
+    source_results = {(2, 1, 1): {}} if mutation == "source-result" else {}
+    return {
+        "assignment": assignments[0],
+        "assignment_identity": identities[0],
+        "attempt_index": 0,
+        "compile_identities": {},
+        "log_text": log,
+        "retry_assignment": assignments[1],
+        "retry_identity": identities[1],
+        "row_job_id": "C1:A:1:3",
+        "source_results": source_results,
+    }
+
+
+def test_source_transfer_failure_binds_exact_uncommitted_retry_window() -> None:
+    record = _source_transfer_failure_observation(
+        **_source_transfer_failure_kwargs()
+    )
+
+    assert record is not None
+    assert record["scheduler_job"] == 2
+    assert record["retry_scheduler_job"] == 3
+    assert record["worker"] == "F1"
+    assert record["failed_endpoint"] == "10.0.27.101:23003"
+    assert record["retry_endpoint"] == "10.0.27.56:23004"
+    assert record["retry_c_guid"] == record["c_guid"] == 1
+    assert record["retry_tu_seq"] == 10
+    assert record["profile"] == "P29V1"
+    assert record["status"] == 2
+    assert record["error"] == 4
+    assert record["transfer_attempts"] == 0
+    assert record["source_result_present"] is False
+    assert record["compile_identity_present"] is False
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "wrong-failed-endpoint",
+        "status-zero",
+        "missing-retry",
+        "duplicate-failure",
+        "reversed-markers",
+        "same-endpoint",
+        "wrong-retry-identity",
+        "duplicate-first-identity",
+        "source-result",
+    ),
+)
+def test_source_transfer_failure_authentication_fails_closed(mutation: str) -> None:
+    with pytest.raises(CollectError, match="source-transfer loss"):
+        _source_transfer_failure_observation(
+            **_source_transfer_failure_kwargs(mutation=mutation)
+        )
 
 
 def test_fresh_p50_retry_binds_only_the_final_result_identity(

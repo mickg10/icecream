@@ -105,6 +105,14 @@ P50_ASSIGNMENT_IDENTITY_RE = re.compile(
 P50_NORMALIZED_ERROR106_RE = re.compile(
     r"\bnormalizing P50 client error [0-9]+ to Error 106 for a fresh assignment\b"
 )
+P50_SOURCE_TRANSFER_FAILED_RE = re.compile(
+    r"\b(P29V1|ZSTD_TU|ZSTD_ROUTE) cache source transfer failed closed "
+    r"\(status ([0-9]+), error ([0-9]+), attempts ([0-9]+)\)\s*$"
+)
+P50_STRICT_RETRY_REQUEST_RE = re.compile(
+    r"\bP50 assignment failed; requesting one fresh strict-P50 remote "
+    r"assignment; avoiding failed endpoint ([^ ]+)\s*$"
+)
 LOCAL_BUILD_MARKERS = ("<building_local>", "building myself, but telling localhost")
 LOG_TIMESTAMP_RE = re.compile(
     r"\b([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}):"
@@ -830,16 +838,16 @@ def _source_candidates_for_assignment(
     ]
 
 
-def _p50_assignment_identity_marker(
+def _p50_assignment_identity_evidence(
     text: str,
     scheduler_job: int,
     *,
     after_line: int = 0,
     before_line: int | None = None,
-) -> tuple[int, int, int] | None:
-    """Return one exact scheduler assignment identity from a job-local log."""
+) -> dict[str, int] | None:
+    """Return one exact, line-bound scheduler identity from a job-local log."""
 
-    identities = set()
+    identities: dict[tuple[int, int, int, int, int], int] = {}
     for line_number, line in enumerate(text.splitlines(), start=1):
         if line_number <= after_line or (
             before_line is not None and line_number >= before_line
@@ -853,10 +861,44 @@ def _p50_assignment_identity_marker(
             continue
         if any(value <= 0 for value in values[:4]) or values[4] < 0:
             raise CollectError("client P50 assignment identity marker is invalid")
-        identities.add(values[:3])
+        identities.setdefault(values, line_number)
     if len(identities) > 1:
         raise CollectError("client P50 assignment identity marker is ambiguous")
-    return next(iter(identities)) if identities else None
+    if not identities:
+        return None
+    values, line_number = next(iter(identities.items()))
+    return {
+        "assignment_epoch": values[1],
+        "assignment_nonce": values[2],
+        "c_guid": values[3],
+        "line": line_number,
+        "scheduler_job": values[0],
+        "tu_seq": values[4],
+    }
+
+
+def _p50_assignment_identity_marker(
+    text: str,
+    scheduler_job: int,
+    *,
+    after_line: int = 0,
+    before_line: int | None = None,
+) -> tuple[int, int, int] | None:
+    """Return one exact scheduler assignment identity from a job-local log."""
+
+    evidence = _p50_assignment_identity_evidence(
+        text,
+        scheduler_job,
+        after_line=after_line,
+        before_line=before_line,
+    )
+    if evidence is None:
+        return None
+    return (
+        evidence["scheduler_job"],
+        evidence["assignment_epoch"],
+        evidence["assignment_nonce"],
+    )
 
 
 def _legacy_wire_candidates_for_assignment(
@@ -4463,6 +4505,161 @@ def _profile_markers_by_assignment(
     return [items[0] if items else None for items in bound]
 
 
+def _source_transfer_failure_observation(
+    *,
+    log_text: str,
+    assignment: Mapping[str, Any],
+    retry_assignment: Mapping[str, Any],
+    assignment_identity: Mapping[str, int] | None,
+    retry_identity: Mapping[str, int] | None,
+    source_results: Mapping[tuple[int, int, int], Mapping[str, Any]],
+    compile_identities: Mapping[tuple[int, int, int], Mapping[str, Any]],
+    row_job_id: str,
+    attempt_index: int,
+) -> dict[str, Any] | None:
+    """Authenticate a strict retry caused before a P50 source result exists.
+
+    The producer's fail-closed transfer line and wrapper retry request must be
+    unique and ordered inside one exact assignment window.  The failed
+    identity must have produced no source-result or compile-result evidence,
+    and the retry must avoid the failed endpoint.  Cache action commits are
+    deliberately not constrained: a lost acknowledgement can fail the client
+    closed after the remote cache has already committed the input.
+    """
+
+    assignment_line = assignment.get("line")
+    retry_assignment_line = retry_assignment.get("line")
+    if type(assignment_line) is not int or type(retry_assignment_line) is not int:
+        raise CollectError(f"{row_job_id}: source-transfer assignment line is invalid")
+    scoped_lines = [
+        (line_number, line)
+        for line_number, line in enumerate(log_text.splitlines(), start=1)
+        if assignment_line < line_number < retry_assignment_line
+    ]
+    failures = [
+        (line_number, match)
+        for line_number, line in scoped_lines
+        if (match := P50_SOURCE_TRANSFER_FAILED_RE.search(line)) is not None
+    ]
+    retries = [
+        (line_number, match)
+        for line_number, line in scoped_lines
+        if (match := P50_STRICT_RETRY_REQUEST_RE.search(line)) is not None
+    ]
+    has_failure_claim = any(
+        "cache source transfer failed closed" in line for _, line in scoped_lines
+    )
+    has_retry_claim = any(
+        "requesting one fresh strict-P50 remote assignment" in line
+        for _, line in scoped_lines
+    )
+    if not has_failure_claim and not has_retry_claim:
+        return None
+    if len(failures) != 1 or len(retries) != 1:
+        raise CollectError(
+            f"{row_job_id}: source-transfer loss markers are absent, malformed, or ambiguous"
+        )
+    if assignment_identity is None or retry_identity is None:
+        raise CollectError(
+            f"{row_job_id}: source-transfer loss lacks exact assignment identities"
+        )
+
+    def identity_occurrences(evidence: Mapping[str, int]) -> int:
+        expected = (
+            evidence["scheduler_job"],
+            evidence["assignment_epoch"],
+            evidence["assignment_nonce"],
+            evidence["c_guid"],
+            evidence["tu_seq"],
+        )
+        return sum(
+            tuple(int(match.group(index)) for index in range(1, 6)) == expected
+            for match in P50_ASSIGNMENT_IDENTITY_RE.finditer(log_text)
+        )
+
+    if (
+        identity_occurrences(assignment_identity) != 1
+        or identity_occurrences(retry_identity) != 1
+    ):
+        raise CollectError(
+            f"{row_job_id}: source-transfer loss assignment identity is ambiguous"
+        )
+
+    failure_line, failure = failures[0]
+    retry_line, retry = retries[0]
+    identity_line = assignment_identity["line"]
+    retry_identity_line = retry_identity["line"]
+    status = int(failure.group(2))
+    error = int(failure.group(3))
+    transfer_attempts = int(failure.group(4))
+    failed_endpoint = retry.group(1)
+    identity = (
+        assignment_identity["scheduler_job"],
+        assignment_identity["assignment_epoch"],
+        assignment_identity["assignment_nonce"],
+    )
+    worker = str(assignment.get("worker", ""))
+    if (
+        assignment_identity["scheduler_job"] != assignment.get("scheduler_job")
+        or retry_identity["scheduler_job"] != retry_assignment.get("scheduler_job")
+        or retry_identity["c_guid"] != assignment_identity["c_guid"]
+        or (
+            retry_identity["scheduler_job"],
+            retry_identity["assignment_epoch"],
+            retry_identity["assignment_nonce"],
+        )
+        == identity
+        or status < 1
+        or error < 1
+        or not (
+            identity_line
+            < assignment_line
+            < failure_line
+            < retry_line
+            < retry_identity_line
+            < retry_assignment_line
+        )
+        or failed_endpoint != assignment.get("endpoint")
+        or retry_assignment.get("endpoint") == failed_endpoint
+        or not worker
+        or identity in source_results
+        or identity in compile_identities
+    ):
+        raise CollectError(
+            f"{row_job_id}: source-transfer loss does not bind one uncommitted "
+            "failed assignment to a distinct strict retry"
+        )
+    return {
+        "assignment_epoch": assignment_identity["assignment_epoch"],
+        "assignment_identity_line": identity_line,
+        "assignment_line": assignment_line,
+        "assignment_nonce": assignment_identity["assignment_nonce"],
+        "attempt_index": attempt_index,
+        "c_guid": assignment_identity["c_guid"],
+        "compile_identity_present": False,
+        "error": error,
+        "failed_endpoint": failed_endpoint,
+        "failure_line": failure_line,
+        "profile": failure.group(1),
+        "retry_assignment_epoch": retry_identity["assignment_epoch"],
+        "retry_assignment_identity_line": retry_identity_line,
+        "retry_assignment_line": retry_assignment_line,
+        "retry_assignment_nonce": retry_identity["assignment_nonce"],
+        "retry_c_guid": retry_identity["c_guid"],
+        "retry_endpoint": retry_assignment["endpoint"],
+        "retry_line": retry_line,
+        "retry_scheduler_job": retry_assignment["scheduler_job"],
+        "retry_tu_seq": retry_identity["tu_seq"],
+        "row_job_id": row_job_id,
+        "scheduler_job": assignment["scheduler_job"],
+        "source_result_present": False,
+        "status": status,
+        "transfer_attempts": transfer_attempts,
+        "tu_seq": assignment_identity["tu_seq"],
+        "worker": worker,
+    }
+
+
 def _source_transfer_is_exact(
     source: Mapping[str, Any],
     marker: Mapping[str, Any],
@@ -4740,6 +4937,7 @@ def _parse_rows(
     error106: list[str] = []
     source_mutex_records: list[dict[str, Any]] = []
     failed_result_identity_records: list[dict[str, Any]] = []
+    failed_source_transfer_records: list[dict[str, Any]] = []
     legacy_wire_records: list[dict[str, Any]] = []
     wire_revision_mismatches: list[dict[str, Any]] = []
     s30_refusals: list[dict[str, Any]] = []
@@ -4851,14 +5049,24 @@ def _parse_rows(
             attempt_markers = _profile_markers_by_assignment(
                 _profile_markers(job_dir), assignments, str(job_dir)
             )
-            attempt_identities = [
-                _p50_assignment_identity_marker(
+            attempt_identity_evidence = [
+                _p50_assignment_identity_evidence(
                     log_text,
                     assignment["scheduler_job"],
                     after_line=(assignments[index - 1]["line"] if index else 0),
                     before_line=assignment["line"] + 1,
                 )
                 for index, assignment in enumerate(assignments)
+            ]
+            attempt_identities = [
+                (
+                    evidence["scheduler_job"],
+                    evidence["assignment_epoch"],
+                    evidence["assignment_nonce"],
+                )
+                if evidence is not None
+                else None
+                for evidence in attempt_identity_evidence
             ]
             log_lines = log_text.splitlines()
             attempt_log_texts = [
@@ -4881,6 +5089,7 @@ def _parse_rows(
             )
 
             missing_result_identities: list[dict[str, Any]] = []
+            source_transfer_failures: list[dict[str, Any]] = []
             for attempt_index, (
                 assignment,
                 attempt_marker,
@@ -4895,6 +5104,19 @@ def _parse_rows(
                 )
             ):
                 if attempt_marker is None:
+                    failure = _source_transfer_failure_observation(
+                        log_text=log_text,
+                        assignment=assignment,
+                        retry_assignment=assignments[attempt_index + 1],
+                        assignment_identity=attempt_identity_evidence[attempt_index],
+                        retry_identity=attempt_identity_evidence[attempt_index + 1],
+                        source_results=source_results,
+                        compile_identities=compile_identities,
+                        row_job_id=job_id,
+                        attempt_index=attempt_index,
+                    )
+                    if failure is not None:
+                        source_transfer_failures.append(failure)
                     continue
                 attempt_candidates = _source_candidates_for_assignment(
                     source_results,
@@ -5017,6 +5239,9 @@ def _parse_rows(
                     missing_result_identities
                 )
                 failed_result_identity_records.extend(missing_result_identities)
+            if source_transfer_failures:
+                raw_job["failed_p50_source_transfers"] = source_transfer_failures
+                failed_source_transfer_records.extend(source_transfer_failures)
             legacy_candidates = _legacy_wire_candidates_for_assignment(
                 c_legacy_wires,
                 scheduler_job,
@@ -5247,6 +5472,13 @@ def _parse_rows(
             "record_count": len(failed_result_identity_records),
             "records": sorted(
                 failed_result_identity_records,
+                key=lambda item: (item["row_job_id"], item["attempt_index"]),
+            ),
+        },
+        "failed_p50_source_transfers": {
+            "record_count": len(failed_source_transfer_records),
+            "records": sorted(
+                failed_source_transfer_records,
                 key=lambda item: (item["row_job_id"], item["attempt_index"]),
             ),
         },
@@ -6213,6 +6445,7 @@ def _observations(
         missing_result_identities = raw.get(
             "missing_compile_result_identities", []
         )
+        source_transfer_failures = raw.get("failed_p50_source_transfers", [])
         for missing in missing_result_identities:
             attempt_index = missing["attempt_index"]
             if not 0 <= attempt_index < len(records):
@@ -6229,6 +6462,20 @@ def _observations(
                 raise CollectError(
                     f"{row['job_id']}: missing result identity loss witness "
                     "disagrees with scheduler terminal"
+                )
+        for failure in source_transfer_failures:
+            attempt_index = failure["attempt_index"]
+            if not 0 <= attempt_index < len(records):
+                raise CollectError(
+                    f"{row['job_id']}: source-transfer loss names an invalid attempt"
+                )
+            if records[attempt_index]["terminal"] not in {
+                "cancellation",
+                "process-loss-recovery",
+            }:
+                raise CollectError(
+                    f"{row['job_id']}: source-transfer loss disagrees with the "
+                    "scheduler terminal"
                 )
         if any(
             current["dispatch_line"] >= following["dispatch_line"]
@@ -6325,6 +6572,12 @@ def _observations(
             missing_result_identities[0]["reason"]
             if len(missing_result_identities) == 1
             and missing_result_identities[0]["attempt_index"] == 0
+            and not source_transfer_failures
+            else "source-transfer-loss"
+            if not missing_result_identities
+            and len(source_transfer_failures) == 1
+            and source_transfer_failures[0]["attempt_index"] == 0
+            and first["terminal"] == "cancellation"
             else "worker-restart-loss"
             if not missing_result_identities
             and first["terminal"] == "process-loss-recovery"
@@ -6343,6 +6596,10 @@ def _observations(
             and len(records) == 2
             and final["terminal"] == "completion"
             and retry_failure_reason is not None
+            and (
+                retry_failure_reason != "source-transfer-loss"
+                or first["worker"] != final["worker"]
+            )
         ):
             successful_strict_p50_retry_bindings.append(
                 {

@@ -963,6 +963,7 @@ def _observations(
         "compile_failure_job_ids": [],
         "error106_job_ids": [],
         "failed_p50_result_identities": {"record_count": 0, "records": []},
+        "failed_p50_source_transfers": {"record_count": 0, "records": []},
         "incomplete_turns": [],
         "job_lifecycle": [
             {
@@ -2312,6 +2313,7 @@ def test_s70_b4_exact_late_result_is_bound_to_declared_worker_loss() -> None:
         "missing-binding",
         "wrong-job",
         "wrong-worker",
+        "wrong-retry-c-guid",
         "wrong-generation",
         "wrong-event",
         "wrong-fired-time",
@@ -2399,6 +2401,181 @@ def test_s70_b4_result_stream_error106_is_recovered_by_exact_strict_retry() -> N
     fixture = _s70_b4_worker_result_stream_recovery_bundle()
     verdict = evaluate_bundle(fixture)
     assert verdict["status"] == "PASS", verdict
+
+
+def _s70_b4_worker_source_transfer_recovery_bundle() -> dict[str, object]:
+    fixture = _s70_b4_worker_result_stream_recovery_bundle()
+    fixture["plan"] = {
+        "launch_contract": "icefarm-f-init-launch-v1",
+        "ports": {"instances": {"F1": 23003, "F2": 23004}},
+        "topology": {
+            "instances": [
+                {
+                    "address": "10.0.27.101",
+                    "host": "h1",
+                    "name": "F1",
+                    "role": "F",
+                },
+                {
+                    "address": "10.0.27.56",
+                    "host": "h2",
+                    "name": "F2",
+                    "role": "F",
+                },
+            ]
+        },
+    }
+    fixture["launch_contract"] = "icefarm-f-init-launch-v1"
+    fixture["observations"]["f_init"] = {
+        "instances": [
+            {
+                "host": "h1",
+                "init": True,
+                "inspect_sha256": SHA_A,
+                "instance": "F1",
+            },
+            {
+                "host": "h2",
+                "init": True,
+                "inspect_sha256": SHA_A,
+                "instance": "F2",
+            },
+        ],
+        "schema": "icefarm-f-init-v1",
+    }
+    row = fixture["rows"][100]
+    fixture["observations"]["error106_job_ids"] = []
+    fixture["observations"]["failed_p50_result_identities"] = {
+        "record_count": 0,
+        "records": [],
+    }
+    fixture["observations"]["failed_p50_source_transfers"] = {
+        "record_count": 1,
+        "records": [
+            {
+                "assignment_epoch": 11,
+                "assignment_identity_line": 6,
+                "assignment_line": 7,
+                "assignment_nonce": 21,
+                "attempt_index": 0,
+                "c_guid": 31,
+                "compile_identity_present": False,
+                "error": 4,
+                "failed_endpoint": "10.0.27.101:23003",
+                "failure_line": 11,
+                "profile": "P29V1",
+                "retry_assignment_epoch": 11,
+                "retry_assignment_identity_line": 16,
+                "retry_assignment_line": 17,
+                "retry_assignment_nonce": 22,
+                "retry_c_guid": 31,
+                "retry_endpoint": "10.0.27.56:23004",
+                "retry_line": 12,
+                "retry_scheduler_job": 702,
+                "retry_tu_seq": 42,
+                "row_job_id": row["job_id"],
+                "scheduler_job": 701,
+                "source_result_present": False,
+                "status": 2,
+                "transfer_attempts": 0,
+                "tu_seq": 41,
+                "worker": "F1",
+            }
+        ],
+    }
+    fixture["observations"]["successful_strict_p50_retry_bindings"][0][
+        "failure_reason"
+    ] = "source-transfer-loss"
+    return fixture
+
+
+def test_s70_b4_source_transfer_loss_is_recovered_by_exact_strict_retry() -> None:
+    fixture = _s70_b4_worker_source_transfer_recovery_bundle()
+    verdict = evaluate_bundle(fixture)
+    assert verdict["status"] == "PASS", verdict
+
+
+def test_source_transfer_marker_keeps_stronger_process_loss_reason() -> None:
+    fixture = _s70_b4_worker_recovery_bundle()
+    source_fixture = _s70_b4_worker_source_transfer_recovery_bundle()
+    fixture["observations"]["failed_p50_result_identities"] = {
+        "record_count": 0,
+        "records": [],
+    }
+    fixture["observations"]["failed_p50_source_transfers"] = copy.deepcopy(
+        source_fixture["observations"]["failed_p50_source_transfers"]
+    )
+
+    verdict = evaluate_bundle(fixture)
+    assert verdict["status"] == "PASS", verdict
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing-observation",
+        "wrong-first-job",
+        "wrong-retry-job",
+        "wrong-worker",
+        "wrong-failed-endpoint",
+        "wrong-retry-endpoint",
+        "same-endpoint",
+        "wrong-profile",
+        "zero-status",
+        "source-result-present",
+        "bad-line-order",
+        "completion-terminal",
+        "duplicate-observation",
+    ),
+)
+def test_s70_b4_source_transfer_retry_binding_fails_closed(mutation: str) -> None:
+    fixture = _s70_b4_worker_source_transfer_recovery_bundle()
+    source = fixture["observations"]["failed_p50_source_transfers"]
+    record = source["records"][0]
+    if mutation == "missing-observation":
+        source["record_count"] = 0
+        source["records"] = []
+    elif mutation == "wrong-first-job":
+        record["scheduler_job"] = 799
+    elif mutation == "wrong-retry-job":
+        record["retry_scheduler_job"] = 799
+    elif mutation == "wrong-worker":
+        record["worker"] = "F2"
+    elif mutation == "wrong-retry-c-guid":
+        record["retry_c_guid"] += 1
+    elif mutation == "wrong-failed-endpoint":
+        record["failed_endpoint"] = "10.0.27.99:23999"
+    elif mutation == "wrong-retry-endpoint":
+        record["retry_endpoint"] = "10.0.27.98:23998"
+    elif mutation == "same-endpoint":
+        record["retry_endpoint"] = record["failed_endpoint"]
+    elif mutation == "wrong-profile":
+        record["profile"] = "ZSTD_TU"
+    elif mutation == "zero-status":
+        record["status"] = 0
+    elif mutation == "source-result-present":
+        record["source_result_present"] = True
+    elif mutation == "bad-line-order":
+        record["retry_line"] = record["failure_line"]
+    elif mutation == "completion-terminal":
+        fixture["observations"]["assignment_lifecycle"][100]["attempts"][0][
+            "terminal"
+        ] = "completion"
+        fixture["observations"]["successful_strict_p50_retry_bindings"][0][
+            "first_terminal"
+        ] = "completion"
+    else:
+        source["records"].append(copy.deepcopy(record))
+        source["record_count"] = 2
+
+    verdict = evaluate_bundle(fixture)
+    assert verdict["status"] == "FAIL"
+    failed = {item["id"] for item in verdict["clauses"] if item["status"] == "FAIL"}
+    assert failed & {
+        "engagement.expected",
+        "retry.strict-p50-bindings",
+        "s70.b4-worker-bounces",
+    }
 
 
 @pytest.mark.parametrize(
