@@ -644,6 +644,24 @@ def test_collection_verdict_report_and_replay_are_reproducible(tmp_path: Path) -
         "wait_max_ns": 1_000,
         "wait_total_ns": 1_000,
     }
+    assert bundle["observations"]["p50_source_routes"] == {
+        "record_count": 1,
+        "records": [
+            {
+                "c_store_guid": C_GUID,
+                "c_to_f_bytes": 321,
+                "client_instance": "C1",
+                "f_to_c_bytes": 123,
+                "job_id": "C1:A:1:2",
+                "profile": "P29V1",
+                "raw_bytes": 100,
+                "raw_digest": "2" * 32,
+                "schema": "icefarm-p50-source-route-v1",
+                "tu_seq": 1,
+                "worker_instance": "F1",
+            }
+        ],
+    }
     turn = bundle["observations"]["turns"]["A"]
     assert {
         key: turn[key]

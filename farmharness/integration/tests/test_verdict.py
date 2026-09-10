@@ -1770,10 +1770,15 @@ def test_s70_b4_scheduler_restart_evidence_fails_closed(mutation: str) -> None:
 
 
 def _route_process(
-    executable: str, *, pid: int, ppid: int, start_ticks: int
+    executable: str,
+    *,
+    pid: int,
+    ppid: int,
+    start_ticks: int,
+    argv: tuple[str, ...] = (),
 ) -> dict[str, object]:
     return {
-        "argv": [executable, "--fixture"],
+        "argv": [executable, *argv],
         "exe": executable,
         "exe_evidence": "argv0-after-proc-exe-eacces",
         "pid": pid,
@@ -1801,12 +1806,14 @@ def _s70_b4_client_bundle() -> dict[str, object]:
         pid=10,
         ppid=1,
         start_ticks=10,
+        argv=("--c-store-guid", "1" * 32),
     )
     after_owner = _route_process(
         "/opt/icecream/sbin/icecc-cache-service",
         pid=11,
         ppid=1,
         start_ticks=20,
+        argv=("--c-store-guid", "2" * 32),
     )
     pause = {
         "action": "pause",
@@ -1889,7 +1896,30 @@ def _s70_b4_client_bundle() -> dict[str, object]:
         )
         row["f_to_c_bytes"] = 500 + tu_index
         rows.append(row)
+    # The first occurrence of TU 26 is not an empty-store reference: 25
+    # earlier TUs have already populated the content-addressed route.  A fresh
+    # route therefore transfers more bytes for the same TU after the restart.
+    rows[25]["c_to_f_bytes"] = 900 + 26
     observations = _observations(rows)
+    observations["p50_source_routes"] = {
+        "record_count": len(rows),
+        "records": [
+            {
+                "c_store_guid": "1" * 32 if row["event_epoch"] == 0 else "2" * 32,
+                "c_to_f_bytes": row["c_to_f_bytes"],
+                "client_instance": row["client_instance"],
+                "f_to_c_bytes": row["f_to_c_bytes"],
+                "job_id": row["job_id"],
+                "profile": "P29V1",
+                "raw_bytes": 4096,
+                "raw_digest": "3" * 32,
+                "schema": "icefarm-p50-source-route-v1",
+                "tu_seq": job - 1 if job <= 75 else job - 76,
+                "worker_instance": row["cs"],
+            }
+            for job, row in enumerate(rows, start=1)
+        ],
+    }
     for job, lifecycle in enumerate(observations["job_lifecycle"], start=1):
         dispatch_ms = (job - 1) * 100
         lifecycle["dispatch_ms"] = dispatch_ms
@@ -1910,10 +1940,14 @@ def test_s70_b4_client_route_restart_makes_next_tu_cold() -> None:
     "mutation",
     (
         "next_tu_warm",
-        "no_later_warm_witness",
+        "no_warm_precondition",
         "same_route_owner",
         "changed_daemon",
         "dispatch_out_of_epoch",
+        "missing_source_routes",
+        "stale_source_guid",
+        "no_source_sequence_reset",
+        "missing_route_guid",
         "legacy_after",
         "error106",
         "parallel_workload",
@@ -1935,6 +1969,16 @@ def test_s70_b4_client_route_restart_evidence_fails_closed(mutation: str) -> Non
         fixture["event_log"][0]["receipt"]["after"]["daemon"]["start_ticks"] = 6
     elif mutation == "dispatch_out_of_epoch":
         fixture["observations"]["job_lifecycle"][75]["dispatch_ms"] = 7400
+    elif mutation == "missing_source_routes":
+        del fixture["observations"]["p50_source_routes"]
+    elif mutation == "stale_source_guid":
+        fixture["observations"]["p50_source_routes"]["records"][75][
+            "c_store_guid"
+        ] = "1" * 32
+    elif mutation == "no_source_sequence_reset":
+        fixture["observations"]["p50_source_routes"]["records"][75]["tu_seq"] = 76
+    elif mutation == "missing_route_guid":
+        fixture["event_log"][0]["receipt"]["after"]["route_owner"]["argv"] = []
     elif mutation == "legacy_after":
         fixture["rows"][75].update(
             reuse=None,

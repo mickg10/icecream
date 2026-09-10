@@ -3484,6 +3484,19 @@ def _client_route_restart_receipt_errors(
     return set()
 
 
+def _process_argv_option(process: Any, name: str) -> str | None:
+    if not isinstance(process, Mapping):
+        return None
+    argv = process.get("argv")
+    if not isinstance(argv, list) or any(not isinstance(item, str) for item in argv):
+        return None
+    positions = [index for index, item in enumerate(argv) if item == name]
+    if len(positions) != 1 or positions[0] + 1 >= len(argv):
+        return None
+    value = argv[positions[0] + 1]
+    return value if value and not value.startswith("--") else None
+
+
 def _client_transition_receipt_errors(
     observed: Mapping[str, Any],
     expected: Mapping[str, Any],
@@ -6413,6 +6426,21 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
             ):
                 b4_bad.add("@event:s70-b4-client-inflight")
 
+            before_guid = _process_argv_option(
+                receipt.get("before", {}).get("route_owner"), "--c-store-guid"
+            )
+            after_guid = _process_argv_option(
+                receipt.get("after", {}).get("route_owner"), "--c-store-guid"
+            )
+            if (
+                not isinstance(before_guid, str)
+                or re.fullmatch(r"[0-9a-f]{32}", before_guid) is None
+                or not isinstance(after_guid, str)
+                or re.fullmatch(r"[0-9a-f]{32}", after_guid) is None
+                or before_guid == after_guid
+            ):
+                b4_bad.add("@event:s70-b4-client-store-generation")
+
             lifecycle = observations.get("job_lifecycle")
             dispatch_by_job = {
                 _job_id(item.get("job_id"), "@lifecycle"): _lifecycle_final_dispatch_ms(item)
@@ -6453,20 +6481,123 @@ def evaluate_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
             else:
                 first_post = min(ordered_rows, key=lambda item: item[0])[1]
                 reference_rows = pre_by_tu.get(str(first_post["tu"]), [])
-                cold_bytes = (
-                    max(
-                        (
-                            (row["c_to_f_bytes"], row["f_to_c_bytes"])
-                            for row in reference_rows
-                        ),
-                        default=None,
-                    )
+                source_routes = observations.get("p50_source_routes")
+                source_records = (
+                    source_routes.get("records")
+                    if isinstance(source_routes, Mapping)
+                    else None
                 )
-                if cold_bytes != (
-                    first_post["c_to_f_bytes"],
-                    first_post["f_to_c_bytes"],
+                expected_route_rows = {
+                    _job_id(row["job_id"], "@row"): row
+                    for row in valid_rows
+                    if row["tail_profile"] == "P29V1"
+                    and row["session_outcome"] == "committed"
+                }
+                routes_by_job: dict[str, Mapping[str, Any]] = {}
+                source_records_valid = (
+                    isinstance(source_routes, Mapping)
+                    and set(source_routes) == {"record_count", "records"}
+                    and _is_int(source_routes.get("record_count"))
+                    and isinstance(source_records, list)
+                    and source_routes["record_count"] == len(source_records)
+                )
+                if source_records_valid:
+                    for record in source_records:
+                        identifier = (
+                            _job_id(record.get("job_id"), "@source-route")
+                            if isinstance(record, Mapping)
+                            else "@source-route"
+                        )
+                        row = expected_route_rows.get(identifier)
+                        if (
+                            not isinstance(record, Mapping)
+                            or set(record)
+                            != {
+                                "c_store_guid",
+                                "c_to_f_bytes",
+                                "client_instance",
+                                "f_to_c_bytes",
+                                "job_id",
+                                "profile",
+                                "raw_bytes",
+                                "raw_digest",
+                                "schema",
+                                "tu_seq",
+                                "worker_instance",
+                            }
+                            or record.get("schema") != "icefarm-p50-source-route-v1"
+                            or not isinstance(record.get("c_store_guid"), str)
+                            or re.fullmatch(r"[0-9a-f]{32}", record["c_store_guid"])
+                            is None
+                            or record.get("profile") != "P29V1"
+                            or not _is_int(record.get("raw_bytes"), minimum=1)
+                            or not isinstance(record.get("raw_digest"), str)
+                            or re.fullmatch(r"[0-9a-f]{32}", record["raw_digest"])
+                            is None
+                            or not _is_int(record.get("tu_seq"))
+                            or row is None
+                            or record.get("client_instance") != row["client_instance"]
+                            or record.get("worker_instance") != row["cs"]
+                            or record.get("c_to_f_bytes") != row["c_to_f_bytes"]
+                            or record.get("f_to_c_bytes") != row["f_to_c_bytes"]
+                            or identifier in routes_by_job
+                        ):
+                            source_records_valid = False
+                            break
+                        routes_by_job[identifier] = record
+                if (
+                    not source_records_valid
+                    or set(routes_by_job) != set(expected_route_rows)
                 ):
-                    b4_bad.add(_job_id(first_post["job_id"], "@row"))
+                    b4_bad.add("@rows:s70-b4-client-source-routes")
+                else:
+                    ordered_source = [
+                        routes_by_job[_job_id(row["job_id"], "@row")]
+                        for _dispatch_ms, row in sorted(
+                            ordered_rows, key=lambda item: item[0]
+                        )
+                    ]
+                    first_source = ordered_source[0]
+                    reference_sources = [
+                        routes_by_job[_job_id(row["job_id"], "@row")]
+                        for row in reference_rows
+                    ]
+                    previous_bytes = (
+                        max(record["c_to_f_bytes"] for record in reference_sources),
+                        max(record["f_to_c_bytes"] for record in reference_sources),
+                    ) if reference_sources else None
+                    first_bytes = (
+                        first_source["c_to_f_bytes"],
+                        first_source["f_to_c_bytes"],
+                    )
+                    post_sequences = [record["tu_seq"] for record in ordered_source]
+                    if (
+                        not reference_sources
+                        or any(
+                            routes_by_job[_job_id(row["job_id"], "@row")][
+                                "c_store_guid"
+                            ]
+                            != before_guid
+                            for row in valid_rows
+                            if row["event_epoch"] == 0
+                        )
+                        or any(
+                            record["c_store_guid"] != after_guid
+                            for record in ordered_source
+                        )
+                        or post_sequences != list(range(len(post_sequences)))
+                        or previous_bytes is None
+                        or first_bytes[0] < previous_bytes[0]
+                        or first_bytes[1] < previous_bytes[1]
+                        or (
+                            first_bytes == previous_bytes
+                            and all(
+                                record["tu_seq"] != 0
+                                for record in reference_sources
+                            )
+                        )
+                    ):
+                        b4_bad.add(_job_id(first_post["job_id"], "@row"))
         clauses.append(
             _clause(
                 "s70.b4-client-route-restart",

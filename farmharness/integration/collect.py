@@ -4992,6 +4992,7 @@ def _parse_rows(
     local_fallbacks: list[str] = []
     error106: list[str] = []
     source_mutex_records: list[dict[str, Any]] = []
+    source_route_records: list[dict[str, Any]] = []
     failed_result_identity_records: list[dict[str, Any]] = []
     failed_source_transfer_records: list[dict[str, Any]] = []
     legacy_wire_records: list[dict[str, Any]] = []
@@ -5364,6 +5365,21 @@ def _parse_rows(
                         "wait_ns": source["source_mutex_wait_ns"],
                     }
                 )
+                source_route_records.append(
+                    {
+                        "c_store_guid": source["c_store_guid"],
+                        "c_to_f_bytes": c_to_f,
+                        "client_instance": client_name,
+                        "f_to_c_bytes": f_to_c,
+                        "job_id": job_id,
+                        "profile": profile,
+                        "raw_bytes": source["raw_bytes"],
+                        "raw_digest": source["raw_digest"],
+                        "schema": "icefarm-p50-source-route-v1",
+                        "tu_seq": source["tu_seq"],
+                        "worker_instance": worker["name"],
+                    }
+                )
             elif legacy_wire is not None:
                 f_wire = f_legacy_wires[worker["name"]].get(legacy_key)
                 if f_wire is None:
@@ -5553,6 +5569,10 @@ def _parse_rows(
                 (item["wait_ns"] for item in source_mutex_records), default=0
             ),
             "wait_total_ns": sum(item["wait_ns"] for item in source_mutex_records),
+        },
+        "p50_source_routes": {
+            "record_count": len(source_route_records),
+            "records": sorted(source_route_records, key=lambda item: item["job_id"]),
         },
         "assignment_claims": assignment_claims,
         "raw_jobs": raw_jobs,
