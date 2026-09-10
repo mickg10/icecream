@@ -28,7 +28,14 @@ contract() {
     require "$candidate" 'cache_child_reaper.reap_one' &&
     require "$candidate" 'cache_adapter->outer_observe_child_reaped' &&
     require "$candidate" 'apply_cache_advertisement(lmsg, absent)' &&
-    require "$candidate" 'scheduler_cache_snapshot_valid = false'
+    require "$candidate" 'scheduler_cache_snapshot_valid = false' &&
+    require "$candidate" 'client_accept_batch_limit' &&
+    require "$candidate" 'accepted_count < client_accept_batch_limit' &&
+    require "$candidate" 'O_NONBLOCK' &&
+    require "$candidate" 'Accept readiness never suppresses' &&
+    require "$candidate" 'cache_sidecar_recovery_in_progress' &&
+    require "$candidate" 'deferred_getcs_waits_for_cache' &&
+    require "$candidate" 'holding strict remote request for cache recovery'
 }
 
 contract "$daemon" || {
@@ -97,7 +104,14 @@ for needle in \
     'cache_child_reaper.reap_one' \
     'cache_adapter->outer_observe_child_reaped' \
     'apply_cache_advertisement(lmsg, absent)' \
-    'scheduler_cache_snapshot_valid = false'; do
+    'scheduler_cache_snapshot_valid = false' \
+    'client_accept_batch_limit' \
+    'accepted_count < client_accept_batch_limit' \
+    'O_NONBLOCK' \
+    'Accept readiness never suppresses' \
+    'cache_sidecar_recovery_in_progress' \
+    'deferred_getcs_waits_for_cache' \
+    'holding strict remote request for cache recovery'; do
     mutant="$mutant_dir/main.cpp"
     awk -v removed="$needle" 'index($0, removed) == 0' "$daemon" >"$mutant"
     if contract "$mutant"; then

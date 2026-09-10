@@ -592,6 +592,7 @@ public:
         cacheHandoff = CacheHandoff{};
         usecsmsg = nullptr;
         deferred_getcs = nullptr;
+        deferred_getcs_waits_for_cache = false;
         getcs_published = false;
         getcs_outstanding = false;
         getcs_generation = 0;
@@ -729,6 +730,7 @@ public:
     MsgChannel *channel;
     UseCSMsg *usecsmsg;
     GetCSMsg *deferred_getcs;   // G4: GetCS held during LOGIN_ATTEMPT, re-driven on ConfCS
+    bool deferred_getcs_waits_for_cache;  // strict remote request held only across a bounded in-progress sidecar replacement
     bool getcs_published;       // G4 (17:20#1): true only once a GetCS for this client has been sent to S (which then owns it by client_id); a held request is PRIVATE until then
     bool getcs_outstanding;     // G4 (bigoracle 18:45 P0): a GetCS occupies this client from accept until client destruction; a second GetCS in ANY non-terminal state is rejected (not just while WAITFORCS)
     uint64_t getcs_generation;  // G4 (bigoracle 18:45 P0): the session generation the request was published under (0 = unpublished); a scheduler reply is honored only when it matches the current ACTIVE generation
@@ -1345,6 +1347,9 @@ struct WebConnection {
 // share one misbehaving or forgotten client can take from the single
 // event loop.
 static const size_t web_max_connections = 64;
+// Drain enough ordinary accepts to cover one fully occupied large worker,
+// while returning to already-established clients/children every turn.
+static const size_t client_accept_batch_limit = 64;
 static const uint64_t web_idle_deadline_msec = 30 * 1000;
 static const uint64_t web_lifetime_deadline_msec = 300 * 1000;
 
@@ -1398,6 +1403,7 @@ struct Daemon {
     uint64_t accept_emfile_errors;
     int last_accept_errno;
     time_t last_accept_errno_ts;
+    size_t client_accept_cursor;
 
     // Optional periodic dumps for production debugging.
     std::string state_jsonl_path;
@@ -1504,6 +1510,7 @@ struct Daemon {
         accept_emfile_errors = 0;
         last_accept_errno = 0;
         last_accept_errno_ts = 0;
+        client_accept_cursor = 0;
         state_dump_interval_s = 0;
         state_dump_log = false;
         next_state_dump_msec = 0;
@@ -1537,6 +1544,7 @@ struct Daemon {
     void reconcile_cache_route_state() noexcept;
     bool cache_client_sidecar_ready() noexcept;
     bool cache_client_service_ready() noexcept;
+    bool cache_sidecar_recovery_in_progress() noexcept;
     bool configure_cache_adapter() noexcept;
     void poll_cache_adapter() noexcept;
     void shutdown_cache_adapter() noexcept;
@@ -1707,6 +1715,11 @@ bool Daemon::setup_listen_tcp_fd( int& fd, const string& interface )
     }
 
     fcntl(fd, F_SETFD, FD_CLOEXEC);
+    const int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        log_perror("Failed to make TCP listen socket nonblocking");
+        return false;
+    }
     return true;
 }
 
@@ -1795,6 +1808,12 @@ bool Daemon::setup_listen_unix_fd()
     }
 
     fcntl(unix_listen_fd, F_SETFD, FD_CLOEXEC);
+    const int flags = fcntl(unix_listen_fd, F_GETFL, 0);
+    if (flags < 0 ||
+        fcntl(unix_listen_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        log_perror("Failed to make Unix listen socket nonblocking");
+        return false;
+    }
 
     return true;
 }
@@ -4554,6 +4573,35 @@ bool Daemon::cache_client_service_ready() noexcept
        authenticated sidecar lease itself may survive a scheduler bounce. */
     return scheduler_session_active && scheduler != nullptr &&
            cache_client_sidecar_ready();
+}
+
+bool Daemon::cache_sidecar_recovery_in_progress() noexcept
+{
+    if (cache_adapter == nullptr || !cache_adapter_start_attempted)
+        return false;
+    if (cache_adapter->state() == icecc::p50::daemon::AdapterState::Ready ||
+        cache_adapter->state() == icecc::p50::daemon::AdapterState::Stopped ||
+        cache_adapter->state() == icecc::p50::daemon::AdapterState::Failed ||
+        cache_adapter->state() == icecc::p50::daemon::AdapterState::ShuttingDown)
+        return false;
+    if (cache_adapter->outer_launch_plan_active())
+        return true;
+    using LifecycleState = icecc::p50::sidecar::LifecycleState;
+    switch (cache_adapter->outer_lifecycle_state()) {
+    case LifecycleState::LaunchPrepared:
+    case LifecycleState::ForkedAwaitExecAndReady:
+    case LifecycleState::Ready:
+    case LifecycleState::TerminatingGrace:
+    case LifecycleState::TerminatingKill:
+    case LifecycleState::ReapAndGroupCheck:
+    case LifecycleState::RetryEligible:
+        return true;
+    case LifecycleState::Stopped:
+    case LifecycleState::DegradedLegacy:
+    case LifecycleState::FailedClosed:
+        return false;
+    }
+    return false;
 }
 
 bool Daemon::reannounce_environments(
@@ -7645,6 +7693,14 @@ void Daemon::handle_old_request()
                 continue;
             }
             GetCSMsg *g = c->deferred_getcs;
+            const bool waiting_for_cache =
+                c->deferred_getcs_waits_for_cache;
+            const bool cache_ready =
+                waiting_for_cache && cache_client_sidecar_ready();
+            if (waiting_for_cache && !cache_ready &&
+                cache_sidecar_recovery_in_progress()) {
+                continue;
+            }
             c->deferred_getcs = nullptr;
             /* The request may have arrived during a reconnecting S session.
                Re-admit only the capability that the wrapper originally
@@ -7653,7 +7709,24 @@ void Daemon::handle_old_request()
                request.  Recompute affinity at the send boundary so a lease
                change cannot leak a stale route hint. */
             P50CacheClientCapability revalidated{};
-            if (c->cache_offer.protocol != 0 &&
+            if (waiting_for_cache && cache_ready &&
+                c->connection_provenance.cache_eligible()) {
+                const P50CacheClientCapability current =
+                    p50_cache_client_capability_from_env(
+                        c->channel != nullptr ? c->channel->protocol : 0);
+                if (g->cache_protocol == current.protocol) {
+                    revalidated.protocol = current.protocol;
+                    revalidated.profile_mask =
+                        g->cache_profile_mask & current.profile_mask &
+                        ~cache_unavailable_profile_mask;
+                    if (revalidated.profile_mask == 0)
+                        revalidated = {};
+                }
+                if (revalidated.profile_mask != 0 &&
+                    cache_route_state_lease.has_value()) {
+                    c->cache_offer_lease = *cache_route_state_lease;
+                }
+            } else if (!waiting_for_cache && c->cache_offer.protocol != 0 &&
                 c->cache_offer.profile_mask != 0 &&
                 c->cache_offer_lease.has_value() &&
                 cache_client_service_ready() &&
@@ -7675,6 +7748,7 @@ void Daemon::handle_old_request()
             c->cache_offer = revalidated;
             if (revalidated.profile_mask == 0)
                 c->cache_offer_lease.reset();
+            c->deferred_getcs_waits_for_cache = false;
             project_getcs_cache_route(g, revalidated);
             g->client_count = clients.size();
             g->command_summary.clear();
@@ -7736,9 +7810,11 @@ void Daemon::handle_old_request()
                 c->last_known_job_id = c->client_id;
                 delete c->deferred_getcs;
                 c->deferred_getcs = nullptr;
+                c->deferred_getcs_waits_for_cache = false;
             } else {
                 delete c->deferred_getcs;
                 c->deferred_getcs = nullptr;
+                c->deferred_getcs_waits_for_cache = false;
                 handle_end(c, 111);   /* multi-reply: close this client so its own local fallback runs */
             }
         }
@@ -8901,24 +8977,30 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
        request is intersected with the daemon-authorized profiles.  Thus an
        old/disabled wrapper cannot be upgraded by the daemon and a wrapper can
        never enable a profile the daemon disabled. */
-    P50CacheClientCapability cache_capability{};
-    if (umsg->count == 1 && client->connection_provenance.cache_eligible() &&
-        cache_client_sidecar_ready()) {
-        cache_capability = p50_cache_client_capability_from_env(
+    P50CacheClientCapability requested_cache_capability{};
+    if (umsg->count == 1 && client->connection_provenance.cache_eligible()) {
+        requested_cache_capability = p50_cache_client_capability_from_env(
             client->channel != nullptr ? client->channel->protocol : 0);
-        if (umsg->cache_protocol != cache_capability.protocol) {
-            cache_capability = {};
+        if (umsg->cache_protocol != requested_cache_capability.protocol) {
+            requested_cache_capability = {};
         } else {
-            cache_capability.profile_mask &= umsg->cache_profile_mask;
-            if (cache_capability.profile_mask == 0)
-                cache_capability = {};
+            requested_cache_capability.profile_mask &= umsg->cache_profile_mask;
+            if (requested_cache_capability.profile_mask == 0)
+                requested_cache_capability = {};
         }
-        if (cache_capability.profile_mask != 0) {
-            cache_capability.profile_mask &=
-                ~cache_unavailable_profile_mask;
-            if (cache_capability.profile_mask == 0)
-                cache_capability = {};
-        }
+    }
+    const bool sidecar_ready = cache_client_sidecar_ready();
+    const bool wait_for_cache_recovery =
+        umsg->remote_required == 1 &&
+        requested_cache_capability.profile_mask != 0 &&
+        !sidecar_ready && cache_sidecar_recovery_in_progress();
+    P50CacheClientCapability cache_capability =
+        sidecar_ready ? requested_cache_capability
+                      : P50CacheClientCapability{};
+    if (cache_capability.profile_mask != 0) {
+        cache_capability.profile_mask &= ~cache_unavailable_profile_mask;
+        if (cache_capability.profile_mask == 0)
+            cache_capability = {};
     }
     client->cache_offer = cache_capability;
     client->cache_offer_generation = 0;
@@ -8927,7 +9009,6 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
         cache_route_state_lease.has_value()) {
         client->cache_offer_lease = *cache_route_state_lease;
     }
-    project_getcs_cache_route(umsg, cache_capability);
     if (!umsg->command_summary.empty()) {
         client->command_line = umsg->command_summary;
     } else if (client->command_line.empty() && client->channel) {
@@ -8945,6 +9026,23 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
     client->getcs_batch_jobids.clear();
     trace() << "handle_get_cs " << umsg->client_id << endl;
 
+    if (wait_for_cache_recovery) {
+        /* Keep the wrapper's original narrowing request private while the
+           already-supervised sidecar replacement is making finite lifecycle
+           progress.  handle_old_request revalidates it against the successor
+           READY lease before publication.  A terminal recovery state falls
+           through there as canonical absence; this is never an unbounded or
+           authority-widening wait. */
+        client->deferred_getcs = new GetCSMsg(*umsg);
+        client->deferred_getcs_waits_for_cache = true;
+        client->set_status(
+            Client::WAITFORCS,
+            "handle_get_cs: holding strict remote request for cache recovery");
+        return true;
+    }
+
+    project_getcs_cache_route(umsg, cache_capability);
+
     if (scheduler && !scheduler_session_active) {
         /* G4 LOGIN_ATTEMPT: the channel is up but the session is not committed
            (no ConfCS yet).  Hold this request -- do NOT forward it on the
@@ -8955,6 +9053,7 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
            guaranteed null here: a client that still had one was rejected by the
            single-outstanding check above.) */
         client->deferred_getcs = new GetCSMsg(*umsg);
+        client->deferred_getcs_waits_for_cache = false;
         client->set_status(Client::WAITFORCS, "handle_get_cs: holding for session activation");
         return true;
     }
@@ -8962,6 +9061,7 @@ bool Daemon::handle_get_cs(Client *client, Msg *msg)
     if (!scheduler) {
         if (umsg->remote_required == 1) {
             client->deferred_getcs = new GetCSMsg(*umsg);
+            client->deferred_getcs_waits_for_cache = false;
             client->set_status(
                 Client::WAITFORCS,
                 "handle_get_cs: holding remote-required request for scheduler");
@@ -10300,28 +10400,60 @@ void Daemon::answer_client_requests()
             }
         }
 
-        int listen_fd = -1;
+        int ready_listeners[3];
+        size_t ready_listener_count = 0;
+        if (tcp_listen_fd != -1 &&
+            pollfd_is_set(pollfds, tcp_listen_fd, POLLIN)) {
+            ready_listeners[ready_listener_count++] = tcp_listen_fd;
+        }
+        if (tcp_listen_local_fd != -1 &&
+            pollfd_is_set(pollfds, tcp_listen_local_fd, POLLIN)) {
+            ready_listeners[ready_listener_count++] = tcp_listen_local_fd;
+        }
+        if (unix_listen_fd != -1 &&
+            pollfd_is_set(pollfds, unix_listen_fd, POLLIN)) {
+            ready_listeners[ready_listener_count++] = unix_listen_fd;
+        }
 
-        if (tcp_listen_fd != -1 && pollfd_is_set(pollfds, tcp_listen_fd, POLLIN)) {
-            listen_fd = tcp_listen_fd;
-        }
-        if (tcp_listen_local_fd != -1 && pollfd_is_set(pollfds, tcp_listen_local_fd, POLLIN)) {
-            listen_fd = tcp_listen_local_fd;
-        }
-        if (pollfd_is_set(pollfds, unix_listen_fd, POLLIN)) {
-            listen_fd = unix_listen_fd;
-        }
-
-        if (listen_fd != -1) {
+        /* One accept per outer turn lets a full compile burst spend seconds
+           in the kernel listen queue while this same thread performs input
+           settlement.  CacheWire source arms inherit the ordinary socket's
+           transport deadline, so that queueing can destroy a valid assignment
+           before application admission.  All ordinary listeners are
+           nonblocking; drain a bounded batch, round-robin across listeners,
+           then always service the established-client poll snapshot below. */
+        bool listener_exhausted[3] = { false, false, false };
+        size_t exhausted_count = 0;
+        size_t accepted_count = 0;
+        size_t accept_attempt_count = 0;
+        while (ready_listener_count != 0 &&
+               exhausted_count < ready_listener_count &&
+               accepted_count < client_accept_batch_limit &&
+               accept_attempt_count <
+                   client_accept_batch_limit + ready_listener_count) {
+            const size_t listener_index =
+                client_accept_cursor % ready_listener_count;
+            client_accept_cursor =
+                (client_accept_cursor + 1) % ready_listener_count;
+            if (listener_exhausted[listener_index])
+                continue;
+            const int listen_fd = ready_listeners[listener_index];
             struct sockaddr cli_addr;
             socklen_t cli_len = sizeof cli_addr;
+            ++accept_attempt_count;
             int acc_fd = accept(listen_fd, &cli_addr, &cli_len);
 
             if (acc_fd < 0) {
-                if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    listener_exhausted[listener_index] = true;
+                    ++exhausted_count;
+                } else if (errno != EINTR) {
                     note_accept_error("client", errno);
+                    listener_exhausted[listener_index] = true;
+                    ++exhausted_count;
                 }
             } else {
+                ++accepted_count;
                 // Capture AF_UNIX credentials before any wrapper/channel
                 // setup can run.  TCP and a credential failure remain valid
                 // legacy clients; their provenance simply cannot authorize a
@@ -10375,7 +10507,11 @@ void Daemon::answer_client_requests()
                     }
                 }
             }
-        } else {
+        }
+
+        /* Accept readiness never suppresses already-established client or
+           child readiness from the same poll snapshot. */
+        {
             for (auto it = fd2client.begin(); it != fd2client.end();)  {
                 int i = it->first;
                 Client *client = it->second;

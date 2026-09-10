@@ -240,8 +240,8 @@ require_count 4 'cache_client_service_ready()' daemon/main.cpp \
     'one declaration/definition and both wire boundaries use current C-side readiness'
 require_count 1 'bool Daemon::cache_client_sidecar_ready() noexcept' daemon/main.cpp \
     'daemon separates C-sidecar lease health from scheduler publication readiness'
-require_count 4 'cache_client_sidecar_ready()' daemon/main.cpp \
-    'sidecar lease health is used by its declaration, definition, scheduler gate, and held-request admission'
+require_count 5 'cache_client_sidecar_ready()' daemon/main.cpp \
+    'sidecar lease health is used by its declaration, definition, scheduler gate, initial admission, and recovery re-admission'
 reconcile_slice=$(sed -n '/^void Daemon::reconcile_cache_route_state()/,/^}/p' \
     "$src/daemon/main.cpp")
 if printf '%s\n' "$reconcile_slice" | grep -E \
@@ -266,11 +266,11 @@ if printf '%s\n' "$waiter_lease_slice" | grep -E \
     exit 1
 fi
 echo 'ok - armed input ownership is invalidated only by C-sidecar ReadyLease change'
-require_count 1 'umsg->count == 1 && client->connection_provenance.cache_eligible() &&' daemon/main.cpp \
+require_count 1 'if (umsg->count == 1 && client->connection_provenance.cache_eligible()) {' daemon/main.cpp \
     'only a provenance-authenticated singleton request may publish C capability'
 require_count 1 'client_cache_capability.protocol == msg->cache_protocol' daemon/main.cpp \
     'the C kill switch also gates a scheduler-supplied handoff at relay time'
-require_count 1 'cache_capability.profile_mask &= umsg->cache_profile_mask;' daemon/main.cpp \
+require_count 1 'requested_cache_capability.profile_mask &= umsg->cache_profile_mask;' daemon/main.cpp \
     'the C daemon authorizes only the wrapper-requested capability intersection'
 require_count 4 'project_getcs_cache_route(' daemon/main.cpp \
     'one projection helper serves direct and deferred GetCS boundaries'
