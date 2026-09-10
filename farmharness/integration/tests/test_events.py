@@ -408,9 +408,18 @@ def test_active_scheduler_loss_scripts_are_exact_identity_bound() -> None:
     assert ACTIVE_COMPILER_OBSERVE_S == 240
     assert ACTIVE_COMPILER_COMMAND_GRACE_S == 30
     source = (INTEGRATION / "events.py").read_text(encoding="utf-8")
-    assert "ACTIVE_COMPILER_STOP_SCRIPT, str(ACTIVE_COMPILER_OBSERVE_S), str(web_port)" in source
-    assert "ACTIVE_COMPILER_STOP_SCRIPT, \"20\", str(web_port)" not in source
-    assert "ACTIVE_COMPILER_OBSERVE_S\n                    + ACTIVE_COMPILER_COMMAND_GRACE_S" in source
+    assert 'str(trigger - 1),' in source
+    assert 'armed_path,' in source
+    assert 'cancel_path,' in source
+    assert 'self._prepare_active_compiler_capture()' in source
+    assert 'result, worker_before = self._take_active_compiler_capture(event, worker)' in source
+    assert 'active-compiler capture cannot arm over a pre-existing compiler' in ACTIVE_COMPILER_STOP_SCRIPT
+    assert 'identity = (leader["pid"], leader["start_ticks"])' in ACTIVE_COMPILER_STOP_SCRIPT
+    assert 'if identity in seen:' in ACTIVE_COMPILER_STOP_SCRIPT
+    assert 'if skip:' in ACTIVE_COMPILER_STOP_SCRIPT
+    assert 'skip -= 1' in ACTIVE_COMPILER_STOP_SCRIPT
+    assert 'if cancel_path.exists():' in ACTIVE_COMPILER_STOP_SCRIPT
+    assert "maximum=ACTIVE_COMPILER_OBSERVE_S + ACTIVE_COMPILER_COMMAND_GRACE_S" in source
     parent = _active_iceccd(10, 1, 10)
     compiler = _active_iceccd(11, 10, 11, argv=parent["argv"])
     toolchain = {"pid": 12, "ppid": 11, "pgid": 11, "exe": "/usr/bin/g++", "state": "R", "argv": ["/usr/bin/g++", "-c", "unit.cc"]}
@@ -648,6 +657,165 @@ def test_active_scheduler_loss_scenario_is_not_the_drained_restart(tmp_path: Pat
     assert all("ICECC_WEB_HOSTPORT" not in item.get("env", {}) for item in scenario.data["instances"])
 
 
+def test_active_scheduler_loss_capture_is_armed_before_workload_and_skips_one(
+    tmp_path: Path,
+) -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    farm.data["hub"]["results_root"] = str(tmp_path)
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / "S70-b4-scheduler-active-loss.json", farm
+    )
+    plan = farmtest.build_plan(farm, scenario, run_id="active-loss-prearm-unit")
+    worker = next(item for item in plan["topology"]["instances"] if item["role"] == "F")
+    web_port = plan["ports"]["web"]["F1"]
+    worker_before = {
+        "env": {**worker.get("env", {}), "ICECC_WEB_HOSTPORT": f"127.0.0.1:{web_port}"},
+        "id": "3" * 64,
+        "image_id": "sha256:" + "4" * 64,
+        "labels": {"icefarm.run": plan["run_id"], "icefarm.instance": "F1"},
+        "running": True,
+        "runtime_path": str(runtime_root(farm, worker)),
+        "started_at": "2026-09-10T00:00:00Z",
+    }
+    stopped = _active_iceccd(31, 7, 31, state="T")
+
+    class PrearmRecorder:
+        def __init__(self) -> None:
+            self.commands: list[PlannedCommand] = []
+
+        def invoke(self, command: PlannedCommand) -> CommandResult:
+            self.commands.append(command)
+            if command.phase == "event.scheduler-loss-prearm-compiler":
+                return CommandResult(
+                    0,
+                    json.dumps(
+                        {
+                            "daemon": _active_iceccd(7, 1, 7),
+                            "leader": {**stopped, "state": "S"},
+                            "listener": {},
+                            "schema": "icefarm-compiler-group-stop-v1",
+                            "stopped": stopped,
+                            "stopped_ms": 1,
+                        }
+                    ),
+                    "",
+                )
+            if command.phase == "event.scheduler-loss-prearm-ready":
+                return CommandResult(
+                    0,
+                    json.dumps(
+                        {
+                            "pid": 99,
+                            "schema": "icefarm-compiler-capture-arm-v1",
+                            "skip": 1,
+                        }
+                    ),
+                    "",
+                )
+            raise AssertionError(command.phase)
+
+    delegate = PrearmRecorder()
+    producer = EventProducer(
+        farm,
+        scenario,
+        plan,
+        recorder=RecordingTransport(delegate),
+    )
+    producer._inspect = lambda _name, **_kwargs: dict(worker_before)
+    producer._preflight_container_image_id = lambda _worker: worker_before["image_id"]
+    producer._prepare_active_compiler_capture()
+    result, captured_before = producer._take_active_compiler_capture(
+        producer.events[0], worker
+    )
+    assert result.returncode == 0
+    assert captured_before == worker_before
+    phases = [item.phase for item in producer.recorder.commands]
+    assert phases == [
+        "event.scheduler-loss-prearm-compiler",
+        "event.scheduler-loss-prearm-ready",
+    ]
+    capture_argv = producer.recorder.commands[0].argv
+    assert capture_argv[-3] == "1"
+    assert capture_argv[-2].endswith(".armed.json")
+    assert capture_argv[-1].endswith(".cancel")
+    producer._active_capture_claimed = True
+    producer._close_active_compiler_capture()
+
+
+def test_unclaimed_active_scheduler_capture_is_cancelled_and_joined(
+    tmp_path: Path,
+) -> None:
+    farm = load_farm_spec(farm_fixture.example_farm_path())
+    farm.data["hub"]["results_root"] = str(tmp_path)
+    scenario = load_scenario_spec(
+        INTEGRATION / "scenarios" / "S70-b4-scheduler-active-loss.json", farm
+    )
+    plan = farmtest.build_plan(farm, scenario, run_id="active-loss-cancel-unit")
+    worker = next(item for item in plan["topology"]["instances"] if item["role"] == "F")
+    web_port = plan["ports"]["web"]["F1"]
+    worker_before = {
+        "env": {**worker.get("env", {}), "ICECC_WEB_HOSTPORT": f"127.0.0.1:{web_port}"},
+        "id": "3" * 64,
+        "image_id": "sha256:" + "4" * 64,
+        "labels": {"icefarm.run": plan["run_id"], "icefarm.instance": "F1"},
+        "running": True,
+        "runtime_path": str(runtime_root(farm, worker)),
+        "started_at": "2026-09-10T00:00:00Z",
+    }
+    cancelled = threading.Event()
+
+    class CancelRecorder:
+        def __init__(self) -> None:
+            self.commands: list[PlannedCommand] = []
+
+        def invoke(self, command: PlannedCommand) -> CommandResult:
+            self.commands.append(command)
+            if command.phase == "event.scheduler-loss-prearm-compiler":
+                assert cancelled.wait(timeout=5)
+                return CommandResult(
+                    0,
+                    json.dumps({"schema": "icefarm-compiler-capture-cancel-v1"}),
+                    "",
+                )
+            if command.phase == "event.scheduler-loss-prearm-ready":
+                return CommandResult(
+                    0,
+                    json.dumps(
+                        {
+                            "pid": 99,
+                            "schema": "icefarm-compiler-capture-arm-v1",
+                            "skip": 1,
+                        }
+                    ),
+                    "",
+                )
+            if command.phase == "event.scheduler-loss-cancel-prearmed-compiler":
+                cancelled.set()
+                return CommandResult(
+                    0,
+                    json.dumps({"schema": "icefarm-compiler-capture-cancel-v1"}),
+                    "",
+                )
+            raise AssertionError(command.phase)
+
+    producer = EventProducer(
+        farm,
+        scenario,
+        plan,
+        recorder=RecordingTransport(CancelRecorder()),
+    )
+    producer._inspect = lambda _name, **_kwargs: dict(worker_before)
+    producer._preflight_container_image_id = lambda _worker: worker_before["image_id"]
+    producer._prepare_active_compiler_capture()
+    producer._close_active_compiler_capture()
+    assert cancelled.is_set()
+    assert [item.phase for item in producer.recorder.commands] == [
+        "event.scheduler-loss-prearm-compiler",
+        "event.scheduler-loss-prearm-ready",
+        "event.scheduler-loss-cancel-prearmed-compiler",
+    ]
+
+
 def test_active_scheduler_loss_releases_serial_admission_after_rejoin(
     tmp_path: Path,
 ) -> None:
@@ -747,11 +915,13 @@ def test_active_scheduler_loss_refreshes_selection_ceiling_after_assignment(
 
 
 def test_active_scheduler_loss_stops_compiler_before_slow_evidence_reads() -> None:
+    prepare = inspect.getsource(EventProducer._prepare_active_compiler_capture)
     source = inspect.getsource(EventProducer._authenticated_scheduler_active_loss)
-    worker_identity = source.index("worker_before = self._inspect")
-    compiler_stop = source.index(
-        'phase="event.scheduler-loss-authenticate-compiler"'
-    )
+    worker_identity = prepare.index("worker_before = self._inspect")
+    compiler_stop = prepare.index('phase="event.scheduler-loss-prearm-compiler"')
+    arm_wait = prepare.index('phase="event.scheduler-loss-prearm-ready"')
+    take = source.index("result, worker_before = self._take_active_compiler_capture")
+    worker_reinspect = source.index("worker_current = self._inspect")
     scheduler_baseline = source.index(
         "scheduler_log = self._readiness_baseline(instance)"
     )
@@ -762,8 +932,8 @@ def test_active_scheduler_loss_stops_compiler_before_slow_evidence_reads() -> No
     scheduler_kill = source.index('phase="event.scheduler-loss-kill"')
     scheduler_reinspect = source.index("self._inspect(event.instance)")
 
-    assert worker_identity < compiler_stop
-    assert compiler_stop < scheduler_baseline < client_route < assignment
+    assert worker_identity < compiler_stop < arm_wait
+    assert take < worker_reinspect < scheduler_baseline < client_route < assignment
     assert assignment < scheduler_reinspect < scheduler_kill
     assert source.count("self._inspect(event.instance)") == 2
 

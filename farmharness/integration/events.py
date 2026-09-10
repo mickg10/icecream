@@ -16,7 +16,7 @@ import math
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Mapping
@@ -192,6 +192,8 @@ CACHE_DISK_FAULT_MIN_HEADROOM_BYTES = 8 * 1024 * 1024
 DISK_FILL_WATCHDOG_S = 30
 ACTIVE_COMPILER_OBSERVE_S = 240
 ACTIVE_COMPILER_COMMAND_GRACE_S = 30
+ACTIVE_COMPILER_ARM_SCHEMA = "icefarm-compiler-capture-arm-v1"
+ACTIVE_COMPILER_CANCEL_SCHEMA = "icefarm-compiler-capture-cancel-v1"
 ACTIVE_COMPILER_STOP_SCRIPT = r'''
 import json, os, pathlib, signal, socket, sys, time
 
@@ -280,11 +282,42 @@ def listener_probe(port, daemon):
 
 deadline = time.monotonic() + int(sys.argv[1])
 web_port = int(sys.argv[2])
+skip = int(sys.argv[3])
+armed_path = pathlib.Path(sys.argv[4])
+cancel_path = pathlib.Path(sys.argv[5])
+if skip < 0 or not armed_path.is_absolute() or not cancel_path.is_absolute():
+    raise SystemExit("invalid active-compiler capture controls")
+if armed_path.exists() or armed_path.is_symlink() or cancel_path.is_symlink():
+    raise SystemExit("active-compiler capture controls already exist or are symlinks")
 # Candidate invariant: p["pid"] == p["pgid"] for the direct compiler;
 # sidecars are excluded by: "--generation" not in p["argv"].  Process
 # identity uses readable kernel comm + cmdline + all four UIDs because the
 # privilege-dropped daemon deliberately makes /proc/<pid>/exe unreadable.
+initial_items = processes()
+initial_parents = {p["pid"]: p for p in initial_items if is_iceccd(p)}
+initial_candidates = [
+    (parent, child) for child in initial_items
+    for parent in (initial_parents.get(child["ppid"]),)
+    if parent is not None and parent["pid"] == child["ppid"] and child["pid"] == child["pgid"]
+    and is_iceccd(child)
+    and child["state"] not in {"Z", "X"}
+    and "--generation" not in child["argv"]
+]
+if initial_candidates:
+    raise SystemExit("active-compiler capture cannot arm over a pre-existing compiler")
+armed = {"pid": os.getpid(), "schema": "icefarm-compiler-capture-arm-v1", "skip": skip}
+descriptor = os.open(armed_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+try:
+    os.write(descriptor, (json.dumps(armed, sort_keys=True, separators=(",", ":")) + "\n").encode())
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+seen = set()
 while time.monotonic() < deadline:
+    if cancel_path.exists():
+        print(json.dumps({"schema": "icefarm-compiler-capture-cancel-v1"},
+                         sort_keys=True, separators=(",", ":")), flush=True)
+        raise SystemExit(0)
     items = processes()
     parents = {p["pid"]: p for p in items if is_iceccd(p)}
     candidates = [
@@ -299,6 +332,15 @@ while time.monotonic() < deadline:
         time.sleep(0.05)
         continue
     daemon, leader = candidates[0]
+    identity = (leader["pid"], leader["start_ticks"])
+    if identity in seen:
+        time.sleep(0.05)
+        continue
+    seen.add(identity)
+    if skip:
+        skip -= 1
+        time.sleep(0.05)
+        continue
     before_daemon = snap(daemon["pid"])
     before = snap(leader["pid"])
     if (before_daemon != daemon or before != leader
@@ -360,6 +402,43 @@ while time.monotonic() < deadline:
         raise
     raise SystemExit(0)
 raise SystemExit("no unique direct compiler group leader became observable within bound")
+'''.strip()
+
+ACTIVE_COMPILER_ARM_WAIT_SCRIPT = r'''
+import json, pathlib, sys, time
+path = pathlib.Path(sys.argv[1])
+expected_skip = int(sys.argv[2])
+deadline = time.monotonic() + int(sys.argv[3])
+while time.monotonic() < deadline:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        time.sleep(0.02)
+        continue
+    if (not isinstance(value, dict)
+            or set(value) != {"pid", "schema", "skip"}
+            or value.get("schema") != "icefarm-compiler-capture-arm-v1"
+            or type(value.get("pid")) is not int or value["pid"] <= 0
+            or value.get("skip") != expected_skip):
+        raise SystemExit("active-compiler capture arm receipt is invalid")
+    print(json.dumps(value, sort_keys=True, separators=(",", ":")), flush=True)
+    raise SystemExit(0)
+raise SystemExit("active-compiler capture did not arm within bound")
+'''.strip()
+
+ACTIVE_COMPILER_CANCEL_SCRIPT = r'''
+import json, os, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+if not path.is_absolute() or path.is_symlink():
+    raise SystemExit("invalid active-compiler cancel path")
+try:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+except FileExistsError:
+    pass
+else:
+    os.close(descriptor)
+print(json.dumps({"schema": "icefarm-compiler-capture-cancel-v1"},
+                 sort_keys=True, separators=(",", ":")), flush=True)
 '''.strip()
 
 ACTIVE_COMPILER_ASSIGNMENT_SCRIPT = r'''
@@ -1314,6 +1393,15 @@ class EventProducer:
             name: tuple(item["argv"]) for name, item in self._start_commands.items()
         }
         self._target_preflight: dict[tuple[str, str, str], dict[str, Any]] = {}
+        self._active_capture_executor: ThreadPoolExecutor | None = None
+        self._active_capture_future: Future[Any] | None = None
+        self._active_capture_event: TimelineEvent | None = None
+        self._active_capture_worker: dict[str, Any] | None = None
+        self._active_capture_worker_before: dict[str, Any] | None = None
+        self._active_capture_armed_path: str | None = None
+        self._active_capture_cancel_path: str | None = None
+        self._active_capture_claimed = False
+        self._active_capture_arm_receipt: dict[str, Any] | None = None
         self._preflight_transition_targets()
 
     @property
@@ -1712,6 +1800,11 @@ class EventProducer:
                 "log_ready": {"state": "NOT_STARTED", "receipt": None},
             },
         }
+        if self._active_capture_arm_receipt is not None:
+            self._failure_evidence["compiler_capture_arm"] = {
+                "receipt": self._active_capture_arm_receipt,
+                "state": "ARMED",
+            }
         self._current_phase = None
 
     def _persist_failure(self, exc: BaseException) -> None:
@@ -3145,6 +3238,302 @@ class EventProducer:
             "turn": turn,
         }
 
+    def _prepare_active_compiler_capture(self) -> None:
+        active = [
+            event
+            for event in self.events
+            if event.action == "scheduler-loss-active"
+        ]
+        if not active:
+            return
+        if len(active) != 1 or active[0].trigger.kind != "job":
+            raise EventError("active scheduler loss capture requires one job event")
+        event = active[0]
+        trigger = int(event.trigger.value)
+        if trigger < 2:
+            raise EventError(
+                "active scheduler loss capture requires a trigger after one warm workload job"
+            )
+        workers = [
+            item
+            for item in self.plan["topology"]["instances"]
+            if item["role"] == "F"
+        ]
+        if len(workers) != 1:
+            raise EventError("active scheduler loss capture requires exactly one F")
+        worker = workers[0]
+        web_port = self.plan.get("ports", {}).get("web", {}).get(worker["name"])
+        if type(web_port) is not int or not (1 <= web_port <= 65535):
+            raise EventError("active scheduler loss capture has no planned F web port")
+        worker_env = {
+            **worker.get("env", {}),
+            "ICECC_WEB_HOSTPORT": f"127.0.0.1:{web_port}",
+        }
+        worker_before = self._inspect(
+            worker["name"],
+            expected_image_id=self._preflight_container_image_id(worker),
+            expected_runtime=str(runtime_root(self.farm, worker)),
+            expected_env=worker_env,
+        )
+        if (
+            worker_before.get("running") is not True
+            or not isinstance(worker_before.get("started_at"), str)
+            or not worker_before["started_at"]
+        ):
+            raise EventError("active scheduler loss capture has no authenticated running F")
+        prefix = f"/tmp/icefarm-active-loss-{self.plan['run_id']}-{event.index}"
+        armed_path = prefix + ".armed.json"
+        cancel_path = prefix + ".cancel"
+        capture = self.factory.make(
+            phase="event.scheduler-loss-prearm-compiler",
+            host=worker["host"],
+            instance=worker["name"],
+            transport=_docker_transport(self.farm, worker["host"]),
+            timeout_s=self._command_timeout(
+                maximum=ACTIVE_COMPILER_OBSERVE_S + ACTIVE_COMPILER_COMMAND_GRACE_S
+            ),
+            argv=docker_argv(
+                self.farm,
+                worker["host"],
+                (
+                    "exec",
+                    "--user",
+                    "0",
+                    worker_before["id"],
+                    "python3",
+                    "-c",
+                    ACTIVE_COMPILER_STOP_SCRIPT,
+                    str(ACTIVE_COMPILER_OBSERVE_S),
+                    str(web_port),
+                    str(trigger - 1),
+                    armed_path,
+                    cancel_path,
+                ),
+            ),
+        )
+        # Record before submitting so the immutable command list remains in
+        # sequence order even though this one intentionally blocks while the
+        # workload starts in another thread.
+        self.recorder.commands.append(capture)
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(self.recorder.delegate.invoke, capture)
+        self._active_capture_executor = executor
+        self._active_capture_future = future
+        self._active_capture_event = event
+        self._active_capture_worker = dict(worker)
+        self._active_capture_worker_before = dict(worker_before)
+        self._active_capture_armed_path = armed_path
+        self._active_capture_cancel_path = cancel_path
+        arm = self._invoke(
+            self.factory.make(
+                phase="event.scheduler-loss-prearm-ready",
+                host=worker["host"],
+                instance=worker["name"],
+                transport=_docker_transport(self.farm, worker["host"]),
+                timeout_s=self._command_timeout(maximum=10),
+                argv=docker_argv(
+                    self.farm,
+                    worker["host"],
+                    (
+                        "exec",
+                        "--user",
+                        "0",
+                        worker_before["id"],
+                        "python3",
+                        "-c",
+                        ACTIVE_COMPILER_ARM_WAIT_SCRIPT,
+                        armed_path,
+                        str(trigger - 1),
+                        "8",
+                    ),
+                ),
+            )
+        )
+        try:
+            receipt = json.loads(arm.stdout.strip())
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise EventError("active compiler capture returned malformed arm receipt") from exc
+        if (
+            not isinstance(receipt, dict)
+            or set(receipt) != {"pid", "schema", "skip"}
+            or receipt.get("schema") != ACTIVE_COMPILER_ARM_SCHEMA
+            or type(receipt.get("pid")) is not int
+            or receipt["pid"] <= 0
+            or receipt.get("skip") != trigger - 1
+        ):
+            raise EventError("active compiler capture returned invalid arm receipt")
+        self._active_capture_arm_receipt = dict(receipt)
+        self._failure_evidence["compiler_capture_arm"] = {
+            "receipt": receipt,
+            "state": "ARMED",
+        }
+
+    def _take_active_compiler_capture(
+        self,
+        event: TimelineEvent,
+        worker: Mapping[str, Any],
+    ) -> tuple[Any, dict[str, Any]]:
+        if (
+            self._active_capture_future is None
+            or self._active_capture_event != event
+            or self._active_capture_worker is None
+            or self._active_capture_worker.get("name") != worker.get("name")
+            or self._active_capture_worker_before is None
+        ):
+            raise EventError("active compiler capture was not armed for this event")
+        self._current_phase = "event.scheduler-loss-take-prearmed-compiler"
+        try:
+            result = self._active_capture_future.result(
+                timeout=ACTIVE_COMPILER_OBSERVE_S + ACTIVE_COMPILER_COMMAND_GRACE_S
+            )
+        except FutureTimeoutError as exc:
+            raise EventTimeout("prearmed active compiler capture exceeded its bound") from exc
+        if result.returncode != 0:
+            raise EventError(
+                "prearmed active compiler capture failed with "
+                f"rc={result.returncode}: {result.stderr.strip()}"
+            )
+        # The event path now owns this completed receipt and any exact process
+        # group named by it.  Shutdown must not parse and release it a second
+        # time if later authentication rejects the receipt.
+        self._active_capture_claimed = True
+        return result, dict(self._active_capture_worker_before)
+
+    def _release_active_compiler_group(
+        self,
+        worker: Mapping[str, Any],
+        worker_before: Mapping[str, Any],
+        stopped_identity: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        release_result = self._invoke(
+            self.factory.make(
+                phase="event.scheduler-loss-release-compiler-group",
+                host=worker["host"],
+                instance=worker["name"],
+                transport=_docker_transport(self.farm, worker["host"]),
+                timeout_s=self._command_timeout(maximum=10),
+                argv=docker_argv(
+                    self.farm,
+                    worker["host"],
+                    (
+                        "exec",
+                        "--user",
+                        "0",
+                        worker_before["id"],
+                        "python3",
+                        "-c",
+                        ACTIVE_COMPILER_RELEASE_SCRIPT,
+                        json.dumps(
+                            dict(stopped_identity),
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    ),
+                ),
+            )
+        )
+        try:
+            release = json.loads(release_result.stdout.strip())
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise EventError("compiler abort release returned malformed JSON") from exc
+        if (
+            not isinstance(release, dict)
+            or set(release) != {"after", "before", "schema", "signal"}
+            or release.get("schema") != "icefarm-compiler-group-release-v1"
+            or release.get("signal") != "CONT"
+            or release.get("before") != dict(stopped_identity)
+            or release.get("after", {}).get("state") in {"T", "t", "Z", "X"}
+            or any(
+                release.get("after", {}).get(field) != stopped_identity.get(field)
+                for field in set(stopped_identity) - {"state"}
+            )
+        ):
+            raise EventError("compiler abort release returned an invalid identity receipt")
+        return release
+
+    def _close_active_compiler_capture(self) -> None:
+        future = self._active_capture_future
+        executor = self._active_capture_executor
+        if future is None:
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=True)
+            return
+        try:
+            if self._active_capture_claimed:
+                future.result(timeout=10)
+                return
+            worker = self._active_capture_worker
+            worker_before = self._active_capture_worker_before
+            cancel_path = self._active_capture_cancel_path
+            if worker is None or worker_before is None or cancel_path is None:
+                raise EventError("unclaimed active compiler capture has incomplete state")
+            if not future.done():
+                cancel = self._invoke(
+                    self.factory.make(
+                        phase="event.scheduler-loss-cancel-prearmed-compiler",
+                        host=worker["host"],
+                        instance=worker["name"],
+                        transport=_docker_transport(self.farm, worker["host"]),
+                        timeout_s=self._command_timeout(maximum=10),
+                        argv=docker_argv(
+                            self.farm,
+                            worker["host"],
+                            (
+                                "exec",
+                                "--user",
+                                "0",
+                                worker_before["id"],
+                                "python3",
+                                "-c",
+                                ACTIVE_COMPILER_CANCEL_SCRIPT,
+                                cancel_path,
+                            ),
+                        ),
+                    )
+                )
+                try:
+                    cancel_receipt = json.loads(cancel.stdout.strip())
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise EventError(
+                        "active compiler capture returned malformed cancel receipt"
+                    ) from exc
+                if cancel_receipt != {"schema": ACTIVE_COMPILER_CANCEL_SCHEMA}:
+                    raise EventError("active compiler capture returned invalid cancel receipt")
+            try:
+                result = future.result(timeout=10)
+            except FutureTimeoutError as exc:
+                raise EventTimeout("active compiler capture did not cancel within bound") from exc
+            if result.returncode != 0:
+                raise EventError(
+                    "unclaimed active compiler capture failed with "
+                    f"rc={result.returncode}: {result.stderr.strip()}"
+                )
+            try:
+                receipt = json.loads(result.stdout.strip())
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise EventError(
+                    "unclaimed active compiler capture returned malformed JSON"
+                ) from exc
+            if receipt == {"schema": ACTIVE_COMPILER_CANCEL_SCHEMA}:
+                return
+            stopped = receipt.get("stopped") if isinstance(receipt, dict) else None
+            if (
+                not isinstance(receipt, dict)
+                or receipt.get("schema") != "icefarm-compiler-group-stop-v1"
+                or not isinstance(stopped, dict)
+            ):
+                raise EventError("unclaimed active compiler capture has invalid receipt")
+            release = self._release_active_compiler_group(
+                worker, worker_before, stopped
+            )
+            self._failure_evidence["compiler_capture_cleanup"] = {
+                "receipt": release,
+                "state": "COMPLETE",
+            }
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=True)
+
     def _authenticated_scheduler_active_loss(
         self,
         event: TimelineEvent,
@@ -3178,35 +3567,13 @@ class EventProducer:
             or not scheduler_before["started_at"]
         ):
             raise EventError("scheduler container identity changed before active loss")
-        worker_before = self._inspect(
-            worker["name"],
-            expected_image_id=expected_worker_image_id,
-            expected_runtime=str(runtime_root(self.farm, worker)),
-            expected_env=worker_env,
-        )
-        if (
-            worker_before.get("running") is not True
-            or not isinstance(worker_before.get("started_at"), str)
-            or not worker_before["started_at"]
-        ):
-            raise EventError("active scheduler loss has no authenticated running F")
-        # The active compiler can legitimately finish in roughly one second.
-        # Capture and STOP it immediately after the minimum S/F incarnation
-        # authentication.  Slower log baselines and C route snapshots are
-        # collected below while this exact process group is safely stopped.
-        result = self._invoke(self.factory.make(
-            phase="event.scheduler-loss-authenticate-compiler",
-            host=worker["host"], instance=worker["name"], transport=_docker_transport(self.farm, worker["host"]),
-            timeout_s=self._command_timeout(
-                maximum=(
-                    ACTIVE_COMPILER_OBSERVE_S
-                    + ACTIVE_COMPILER_COMMAND_GRACE_S
-                )
-            ),
-            argv=docker_argv(self.farm, worker["host"],
-                ("exec", "--user", "0", worker_before["id"], "python3", "-c",
-                 ACTIVE_COMPILER_STOP_SCRIPT, str(ACTIVE_COMPILER_OBSERVE_S), str(web_port))),
-        ))
+        # This selector was synchronously armed before the workload command was
+        # allowed to start.  It ignored exactly trigger-1 distinct workload
+        # compiler identities and stopped the trigger compiler locally inside
+        # F's PID namespace.  Taking that already-stopped result after the
+        # scheduler log exposes job N removes the impossible post-trigger SSH
+        # race without weakening the requirement for a real active compiler.
+        result, worker_before = self._take_active_compiler_capture(event, worker)
         compiler: dict[str, Any] | None = None
         stopped_identity: dict[str, Any] | None = None
         scheduler_kill_committed = False
@@ -3230,6 +3597,24 @@ class EventProducer:
                 raise EventError(
                     "compiler-group authentication did not return its exact schema"
                 )
+            worker_current = self._inspect(
+                worker["name"],
+                expected_image_id=expected_worker_image_id,
+                expected_runtime=str(runtime_root(self.farm, worker)),
+                expected_env=worker_env,
+            )
+            if any(
+                worker_current.get(field) != worker_before.get(field)
+                for field in (
+                    "env",
+                    "id",
+                    "image_id",
+                    "labels",
+                    "runtime_path",
+                    "started_at",
+                )
+            ) or worker_current.get("running") is not True:
+                raise EventError("prearmed F incarnation changed before active loss")
             leader = compiler.get("leader")
             stopped = compiler.get("stopped")
             parent = compiler.get("daemon")
@@ -3444,55 +3829,9 @@ class EventProducer:
                     "state": "ATTEMPTED",
                 }
                 try:
-                    release_result = self._invoke(
-                        self.factory.make(
-                            phase="event.scheduler-loss-release-compiler-group",
-                            host=worker["host"],
-                            instance=worker["name"],
-                            transport=_docker_transport(
-                                self.farm, worker["host"]
-                            ),
-                            timeout_s=self._command_timeout(maximum=10),
-                            argv=docker_argv(
-                                self.farm,
-                                worker["host"],
-                                (
-                                    "exec",
-                                    "--user",
-                                    "0",
-                                    worker_before["id"],
-                                    "python3",
-                                    "-c",
-                                    ACTIVE_COMPILER_RELEASE_SCRIPT,
-                                    json.dumps(
-                                        stopped_identity,
-                                        sort_keys=True,
-                                        separators=(",", ":"),
-                                    ),
-                                ),
-                            ),
-                        )
+                    release = self._release_active_compiler_group(
+                        worker, worker_before, stopped_identity
                     )
-                    release = json.loads(release_result.stdout.strip())
-                    if (
-                        not isinstance(release, dict)
-                        or set(release)
-                        != {"after", "before", "schema", "signal"}
-                        or release.get("schema")
-                        != "icefarm-compiler-group-release-v1"
-                        or release.get("signal") != "CONT"
-                        or release.get("before") != stopped_identity
-                        or release.get("after", {}).get("state")
-                        in {"T", "t", "Z", "X"}
-                        or any(
-                            release.get("after", {}).get(field)
-                            != stopped_identity.get(field)
-                            for field in set(stopped_identity) - {"state"}
-                        )
-                    ):
-                        raise EventError(
-                            "compiler abort release returned an invalid identity receipt"
-                        )
                     self._failure_evidence["compiler_release"] = {
                         "receipt": release,
                         "state": "COMPLETE",
@@ -5237,6 +5576,7 @@ class EventProducer:
         ):
             reader = self.job_reader or self._remote_job_reader
             self._baseline_dispatches = parse_scheduler_dispatches(reader())
+        self._prepare_active_compiler_capture()
         self._thread = threading.Thread(target=self._run, name="icefarm-events")
         self._thread.start()
 
@@ -5267,11 +5607,32 @@ class EventProducer:
     def stop(self) -> None:
         self._stop.set()
         self._wake.set()
-        if self._thread is not None:
-            remaining = max(0.1, self.deadline_s - (self.monotonic() - self._start) + 1.0)
-            self._thread.join(timeout=remaining)
-            if self._thread.is_alive():
-                raise EventTimeout("timeline worker did not stop before its deadline")
+        join_error: BaseException | None = None
+        try:
+            if self._thread is not None:
+                remaining = max(
+                    0.1,
+                    self.deadline_s - (self.monotonic() - self._start) + 1.0,
+                )
+                self._thread.join(timeout=remaining)
+                if self._thread.is_alive():
+                    raise EventTimeout("timeline worker did not stop before its deadline")
+        except BaseException as exc:
+            join_error = exc
+        close_error: BaseException | None = None
+        try:
+            self._close_active_compiler_capture()
+        except BaseException as exc:
+            close_error = exc
+        if join_error is not None and close_error is not None:
+            raise EventError(
+                f"timeline join failed: {join_error}; "
+                f"active compiler capture cleanup failed: {close_error}"
+            ) from close_error
+        if join_error is not None:
+            raise join_error
+        if close_error is not None:
+            raise close_error
         self.raise_if_failed()
 
     def wait(self) -> None:
