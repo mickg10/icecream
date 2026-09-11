@@ -1304,7 +1304,9 @@ class Service
 public:
     static MsgChannel *createChannel(const std::string &host, unsigned short p, int timeout);
     // Absolute-deadline variant used by the P50 CACHE_SESSION factory.  The
-    // connect and ordinary protocol negotiation share one unchanged budget.
+    // connect and ordinary protocol negotiation share one unchanged budget;
+    // on TCP, the kernel user timeout is moved just past that budget so it
+    // cannot pre-empt the application owner.
     static MsgChannel *createChannelUntil(
         const std::string &host, unsigned short p,
         std::chrono::steady_clock::time_point deadline);

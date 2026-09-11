@@ -3,6 +3,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -377,6 +378,66 @@ static void test_absolute_deadline_protocol_negotiation()
     stalled_peer.join();
 }
 
+static void test_absolute_deadline_owns_tcp_user_timeout()
+{
+    const int listener = socket(AF_INET, SOCK_STREAM, 0);
+    if (listener < 0) std::exit(2);
+    int reuse = 1;
+    setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    if (bind(listener, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0 ||
+        listen(listener, 1) != 0)
+        std::exit(2);
+    socklen_t address_size = sizeof(address);
+    if (getsockname(listener, reinterpret_cast<sockaddr *>(&address),
+                    &address_size) != 0)
+        std::exit(2);
+
+    std::thread peer([listener] {
+        sockaddr_in remote{};
+        socklen_t remote_size = sizeof(remote);
+        const int accepted = accept(
+            listener, reinterpret_cast<sockaddr *>(&remote), &remote_size);
+        MsgChannel *channel = accepted >= 0
+                                  ? Service::createChannel(
+                                        accepted,
+                                        reinterpret_cast<sockaddr *>(&remote),
+                                        remote_size)
+                                  : nullptr;
+        delete channel;
+        close(listener);
+    });
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    MsgChannel *channel = Service::createChannelUntil(
+        "127.0.0.1", ntohs(address.sin_port), deadline);
+    REQUIRE(channel != nullptr,
+            "absolute-deadline TCP channel completes protocol negotiation");
+#ifdef TCP_USER_TIMEOUT
+    int timeout_msec = 0;
+    socklen_t timeout_size = sizeof(timeout_msec);
+    const bool timeout_read =
+        channel != nullptr &&
+        getsockopt(channel->fd, IPPROTO_TCP, TCP_USER_TIMEOUT,
+                   &timeout_msec, &timeout_size) == 0;
+    const auto remaining_msec = std::chrono::duration_cast<
+        std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now())
+                                    .count();
+    REQUIRE(timeout_read && timeout_msec > remaining_msec &&
+                timeout_msec > 15000,
+            "absolute deadline cannot be pre-empted by the ordinary TCP user timeout");
+#else
+    REQUIRE(channel != nullptr,
+            "platform without TCP_USER_TIMEOUT retains the absolute application deadline");
+#endif
+    delete channel;
+    peer.join();
+}
+
 static void test_other_message_refusal_and_arm_clear()
 {
     Pair pair = make_pair(50);
@@ -595,6 +656,7 @@ int main()
     test_outbound_release_barriers();
     test_ready_wire_and_failure_boundaries();
     test_absolute_deadline_protocol_negotiation();
+    test_absolute_deadline_owns_tcp_user_timeout();
     test_other_message_refusal_and_arm_clear();
     test_protocol_gate_and_legacy_bytes();
     test_split_frame_reads();

@@ -1460,6 +1460,35 @@ static bool connect_until(int remote_fd, struct sockaddr *remote_addr,
     return true;
 }
 
+static bool set_tcp_user_timeout_past_deadline(
+    int fd, std::chrono::steady_clock::time_point deadline)
+{
+#ifdef TCP_USER_TIMEOUT
+    const int remaining_msec = poll_milliseconds_until(deadline);
+    if (remaining_msec == 0)
+        return false;
+
+    // MsgChannel's ordinary nine-second transport bound is deliberately
+    // shorter than several legacy application waits.  It must not, however,
+    // pre-empt a caller that already owns one exact absolute deadline: doing
+    // so can tear down a P50 source arm after F has claimed the assignment but
+    // before C receives the acknowledgement.  Keep the application deadline
+    // authoritative and add only a scheduling guard; every wait and the
+    // eventual descriptor owner still closes at the original deadline.
+    constexpr int deadline_guard_msec = 1000;
+    const int timeout_msec =
+        remaining_msec > std::numeric_limits<int>::max() - deadline_guard_msec
+            ? std::numeric_limits<int>::max()
+            : remaining_msec + deadline_guard_msec;
+    return setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT,
+                      reinterpret_cast<const char *>(&timeout_msec),
+                      sizeof(timeout_msec)) == 0;
+#else
+    (void)fd;
+    return std::chrono::steady_clock::now() < deadline;
+#endif
+}
+
 MsgChannel *Service::createChannel(const string &hostname, unsigned short p, int timeout)
 {
     int remote_fd;
@@ -1508,7 +1537,8 @@ MsgChannel *Service::createChannelUntil(
     MsgChannel *channel = new MsgChannel(
         remote_fd, reinterpret_cast<struct sockaddr *>(&remote_addr),
         sizeof(remote_addr), false);
-    if (!channel->wait_for_protocol_until(deadline)) {
+    if (!set_tcp_user_timeout_past_deadline(channel->fd, deadline) ||
+        !channel->wait_for_protocol_until(deadline)) {
         delete channel;
         channel = nullptr;
     }

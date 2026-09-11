@@ -48,6 +48,9 @@ require_count 1 'const bool armed = cache_session_send_release_armed;' services/
 require_count 1 'channel->release_fd_after_cache_session_ready(limit)' \
     cache/p50_cache_service.cpp \
     'production source transfer waits for sidecar ownership before CacheWire'
+require_count 1 'set_tcp_user_timeout_past_deadline(channel->fd, deadline)' \
+    services/comm.cpp \
+    'absolute-deadline channel prevents the ordinary TCP timeout from pre-empting its owner'
 require_count 2 'send_cache_session_ready(adopted.get(), deadline)' \
     cache/p50_cache_service.cpp 'production sidecar publishes READY on the adopted descriptor'
 
