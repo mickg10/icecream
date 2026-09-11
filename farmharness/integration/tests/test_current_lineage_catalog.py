@@ -5,14 +5,14 @@ from pathlib import Path
 INTEGRATION = Path(__file__).parents[1]
 SCENARIOS = INTEGRATION / "scenarios"
 HISTORICAL_PRODUCT = "p50s4-57a1e336"
-FINAL_PRODUCT = "p50s4-00e9a21e-r2"
+FINAL_PRODUCT = "p50s4-94ba8f33"
 FINAL_MUTANTS = {
     "p50s90-f-revision-2-f9648cc1",
     "p50s90-f-hidden-skew-f9648cc1",
 }
 FINAL_ROLE_HASHES = {
     "scheduler": "8bae030255611b6d6e83872468027fa2bec7ebd321d639071d939295a917c39a",
-    "client": "504aece37c48d9248bc769cc921f7508c38684d760fd44c0a88c6f4b00f3b75d",
+    "client": "d41980abc87068014007b5b7e2ab0b55b1de7bbfc760ebfb541e07f33ffbe6e0",
     "daemon": "89a0941fe98fb5ce7aa44c527eed6a88a282229adbfc9622cb5aecc72d751b12",
 }
 RETIRED_PRODUCTS = {"p50s4-89917385", "p50s4-b42d65e8"}
